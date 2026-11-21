@@ -67,8 +67,8 @@ pub fn to_s3_request(mut req: Request) -> Result<Incoming, IngressError> {
     })
 }
 
-/// The most one body read asks for, and so the size of the one runtime
-/// buffer every read reuses. The default reader hands a deployed request
+/// The most one body fill gathers, and so the size of the one runtime
+/// buffer every fill reuses. The default reader hands a deployed request
 /// body out in 4 KiB items, each a new array crossing into wasm on its
 /// own task; a BYOB read fills up to this much at once. It is one plain
 /// chunk, inside the item allowance of a streamed upload's charge
@@ -109,53 +109,82 @@ extern "C" {
     ) -> Result<ByobReader, worker::wasm_bindgen::JsValue>;
     #[wasm_bindgen(method, catch)]
     fn cancel(this: &ByobReader) -> Result<worker::js_sys::Promise, worker::wasm_bindgen::JsValue>;
-    #[wasm_bindgen(method, catch)]
-    fn read(
-        this: &ByobReader,
-        view: &worker::js_sys::Uint8Array,
-    ) -> Result<worker::js_sys::Promise, worker::wasm_bindgen::JsValue>;
-    /// What a read resolves to.
-    type ReadResult;
-    #[wasm_bindgen(method, getter)]
-    fn done(this: &ReadResult) -> bool;
-    #[wasm_bindgen(method, getter)]
-    fn value(this: &ReadResult) -> Option<worker::js_sys::Uint8Array>;
 }
 
-/// What one BYOB read gave, from its `done` flag and the length of the
-/// view it handed back (`None`: no view).
+#[worker::wasm_bindgen::prelude::wasm_bindgen(
+    wasm_bindgen = worker::wasm_bindgen,
+    inline_js = "export async function fillBody(reader, buf) {
+  const cap = buf.byteLength;
+  let off = 0;
+  for (;;) {
+    const r = await reader.read(new Uint8Array(buf, off, cap - off));
+    if (r.value === undefined) throw new Error('body canceled');
+    buf = r.value.buffer;
+    if (r.done) return { buf, n: off, done: true };
+    if (r.value.byteLength === 0) throw new Error('empty read');
+    off += r.value.byteLength;
+    if (off === cap) return { buf, n: off, done: false };
+  }
+}"
+)]
+extern "C" {
+    /// Reads the body into `buf` until it is full or the body ended, in
+    /// JS: a deployed request body gives at most 8 KiB per read (measured:
+    /// 2,060 reads per 16 MiB part into a 64 KiB view), and each read that
+    /// came back into wasm cost a task and a wake. Rejects when the body
+    /// failed or was canceled (a done read without a view).
+    #[wasm_bindgen(catch, js_name = fillBody)]
+    fn fill_body(
+        reader: &ByobReader,
+        buf: worker::js_sys::ArrayBuffer,
+    ) -> Result<worker::js_sys::Promise, worker::wasm_bindgen::JsValue>;
+    /// What `fill_body` resolves to.
+    type Filled;
+    #[wasm_bindgen(method, getter)]
+    fn buf(this: &Filled) -> worker::js_sys::ArrayBuffer;
+    #[wasm_bindgen(method, getter)]
+    fn n(this: &Filled) -> u32;
+    #[wasm_bindgen(method, getter)]
+    fn done(this: &Filled) -> bool;
+}
+
+/// What one fill gave, from the bytes it filled and whether the body
+/// ended.
 #[cfg_attr(test, derive(Debug, PartialEq, Eq))]
-enum ReadGave {
-    /// The end of the body.
+enum FillGave {
+    /// The end of the body, nothing more.
     End,
-    /// A piece of this many bytes.
+    /// A piece, and more may follow.
     Piece,
-    /// A failed or canceled body, or a read that gave nothing.
+    /// The last piece of the body.
+    LastPiece,
+    /// A fill that neither ended nor filled anything.
     Failed,
 }
 
 /// At the end a read says done and hands the (empty) view back (workerd
 /// from compatibility date 2024-05-13, `internal_stream_byob_return_view`;
-/// ours is later). A canceled body says done with no view: that is not
-/// an end. A read that is not the end fills at least one byte.
-fn read_gave(done: bool, view_len: Option<u32>) -> ReadGave {
-    match (done, view_len) {
-        (_, None) => ReadGave::Failed,
-        (true, Some(_)) => ReadGave::End,
-        (false, Some(0)) => ReadGave::Failed,
-        (false, Some(_)) => ReadGave::Piece,
+/// ours is later); a fill that is not the end has filled its buffer.
+fn fill_gave(filled: u32, done: bool) -> FillGave {
+    match (filled, done) {
+        (0, true) => FillGave::End,
+        (0, false) => FillGave::Failed,
+        (_, true) => FillGave::LastPiece,
+        (_, false) => FillGave::Piece,
     }
 }
 
 /// A request body read with a BYOB reader into one runtime buffer; each
-/// read is copied once, into a piece of its own length.
+/// full buffer is copied once into a piece.
 struct ByobReads {
     reader: ByobReader,
-    /// The runtime buffer; a read transfers it and hands it back. `None`
-    /// after the end or a failure, and while a read is under way.
+    /// The runtime buffer; a fill transfers it and hands it back. `None`
+    /// after the end or a failure, and while a fill is under way.
     buffer: Option<worker::js_sys::ArrayBuffer>,
     /// The body ended or failed: there is nothing left to cancel.
     settled: bool,
+    /// The last piece was given: the next read is the end.
+    ended: bool,
 }
 
 impl ByobReads {
@@ -171,6 +200,7 @@ impl ByobReads {
                 .ok()?,
             buffer: Some(worker::js_sys::ArrayBuffer::new(BODY_READ)),
             settled: false,
+            ended: false,
         })
     }
 }
@@ -189,36 +219,42 @@ impl PieceReads for ByobReads {
     async fn next_piece(&mut self) -> Result<Option<Vec<u8>>, BridgeError> {
         use worker::wasm_bindgen::JsCast;
         let failed = || BridgeError::Invalid("request body stream");
-        let buffer = self.buffer.take().ok_or_else(failed)?;
-        // A read that fails or ends leaves nothing to cancel; a piece
-        // sets this back.
+        // No buffer: the body ended with the last piece, or failed.
+        let Some(buffer) = self.buffer.take() else {
+            return if self.ended { Ok(None) } else { Err(failed()) };
+        };
+        // A fill that fails or ends leaves nothing to cancel; a piece
+        // that is not the last sets this back.
         self.settled = true;
-        let view = worker::js_sys::Uint8Array::new(&buffer);
-        let promise = self.reader.read(&view).map_err(|_| failed())?;
-        let result: ReadResult = worker::wasm_bindgen_futures::JsFuture::from(promise)
+        let promise = fill_body(&self.reader, buffer).map_err(|_| failed())?;
+        let filled: Filled = worker::wasm_bindgen_futures::JsFuture::from(promise)
             .await
             .map_err(|_| failed())?
             .unchecked_into();
-        let filled = result.value();
-        match read_gave(result.done(), filled.as_ref().map(|v| v.length())) {
-            ReadGave::End => Ok(None),
-            ReadGave::Failed => Err(failed()),
-            ReadGave::Piece => {
-                let filled = filled.ok_or_else(failed)?;
-                let piece = filled.to_vec();
-                // The runtime hands the whole buffer back; one that came
-                // back smaller would cap every later read, so it is
-                // replaced.
-                let back = filled.buffer();
-                self.buffer = Some(if back.byte_length() < BODY_READ {
-                    worker::js_sys::ArrayBuffer::new(BODY_READ)
-                } else {
-                    back
-                });
-                self.settled = false;
-                Ok(Some(piece))
-            }
+        let n = filled.n();
+        let back = filled.buf();
+        let gave = fill_gave(n, filled.done());
+        if matches!(gave, FillGave::End) {
+            return Ok(None);
         }
+        if matches!(gave, FillGave::Failed) || n > back.byte_length() {
+            return Err(failed());
+        }
+        let piece =
+            worker::js_sys::Uint8Array::new_with_byte_offset_and_length(&back, 0, n).to_vec();
+        if matches!(gave, FillGave::Piece) {
+            // The runtime hands the whole buffer back; one that came back
+            // smaller would cap every later fill, so it is replaced.
+            self.buffer = Some(if back.byte_length() < BODY_READ {
+                worker::js_sys::ArrayBuffer::new(BODY_READ)
+            } else {
+                back
+            });
+            self.settled = false;
+        } else {
+            self.ended = true;
+        }
+        Ok(Some(piece))
     }
 }
 
@@ -380,13 +416,12 @@ mod tests {
     }
 
     #[test]
-    fn a_read_ends_gives_a_piece_or_fails() {
-        assert_eq!(read_gave(true, Some(0)), ReadGave::End);
-        assert_eq!(read_gave(true, None), ReadGave::Failed, "canceled");
-        assert_eq!(read_gave(false, None), ReadGave::Failed);
-        assert_eq!(read_gave(false, Some(0)), ReadGave::Failed, "empty read");
-        assert_eq!(read_gave(false, Some(1)), ReadGave::Piece);
-        assert_eq!(read_gave(false, Some(BODY_READ)), ReadGave::Piece);
+    fn a_fill_ends_gives_a_piece_or_fails() {
+        assert_eq!(fill_gave(0, true), FillGave::End);
+        assert_eq!(fill_gave(0, false), FillGave::Failed, "nothing filled");
+        assert_eq!(fill_gave(1, true), FillGave::LastPiece);
+        assert_eq!(fill_gave(BODY_READ, true), FillGave::LastPiece);
+        assert_eq!(fill_gave(BODY_READ, false), FillGave::Piece);
     }
 
     #[test]
