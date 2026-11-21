@@ -374,6 +374,12 @@ jobs:
           # The strip found a `name` section and kept the copy that
           # deploy-build uploads; fails here, not after the merge.
           test -s symbols/index_bg.unstripped.wasm
+          # bundle.sh remapped the registry source paths of panic
+          # locations to `crates.io/..`; none is left.
+          if grep -a -q '/registry/src/' build/index_bg.wasm; then
+            echo "index_bg.wasm still names a registry source path"
+            exit 1
+          fi
           size=$(stat -c %s build/index_bg.wasm)
           echo "index_bg.wasm: ${size} bytes (budget 4000000)"
           test "$size" -lt 4000000
