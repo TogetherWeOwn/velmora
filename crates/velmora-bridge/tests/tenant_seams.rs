@@ -119,12 +119,14 @@ fn a_scope_is_made_only_at_the_listed_places() {
             // twice), and whether a unit job names tenant 0, which has no
             // unit (one, compared by id; no scope is made from it).
             ("bridge/jobmsg.rs", 4),
-            // The queue consumer.
-            ("worker/lib.rs", 1),
+            // The queue sink: the tenant its messages name.
+            ("worker/env.rs", 1),
         ],
     );
-    // The consumer does make one: the job path has its scope from it.
-    assert_eq!(found.get("worker/lib.rs"), Some(&1));
+    // The reader of a message makes the scope of the job path, and the
+    // consumer takes it from there: it makes none of its own.
+    assert_eq!(found.get("bridge/jobmsg.rs"), Some(&4));
+    assert_eq!(found.get("worker/lib.rs"), None);
 }
 
 /// One constructor, no `Default`, nothing that reads one from bytes.
