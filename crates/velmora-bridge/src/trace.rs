@@ -189,3 +189,194 @@ pub(crate) fn cold_read(line: impl FnOnce() -> String) {
         to(&line());
     }
 }
+
+// ---------------------------------------------------------------------------
+// Phase timings of a write request
+// ---------------------------------------------------------------------------
+
+/// What a write request was doing during a stretch of its time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Phase {
+    /// Authentication: the key, bucket and grant lookups and the
+    /// signature check.
+    Auth,
+    /// Waiting for room in the isolate's byte budget.
+    Wait,
+    /// Taking in the body: waiting for each piece and the work on the
+    /// one before it (copying it into wasm, decoding, hashing). The
+    /// clock moves as each piece arrives, so the work on a piece shows
+    /// in the wait for the next.
+    Read,
+    /// The end of the body: the work on the last piece and the final
+    /// digest and signature checks.
+    Hash,
+    /// Encrypting and hashing an extent.
+    Seal,
+    /// Storing an extent's ciphertext in the safety store.
+    R2,
+    /// Catalogue statements, and the stamp raise (a statement and a
+    /// small object written to the safety store).
+    D1,
+    /// Everything else: the recovery record, the job message, choosing
+    /// ids, copying a source.
+    Other,
+}
+
+const PHASES: usize = 8;
+
+/// A future that lets the runtime's clock catch up, or nothing.
+pub type Tick = fn() -> futures_util::future::LocalBoxFuture<'static, ()>;
+
+/// Where the lines go, and the tick.
+type WriteLog = (fn(&str), Tick);
+
+thread_local! {
+    static WRITES: std::cell::Cell<Option<WriteLog>> = const { std::cell::Cell::new(None) };
+}
+
+/// Sends one line to `to` for each PutObject and UploadPart, with the
+/// milliseconds the request spent in each [`Phase`]. No key, bucket or
+/// id. Off unless called: a drill measurement, not a production log.
+///
+/// A Worker's clock does not move while code runs, only when the
+/// isolate waits on something: a phase that only computes (the seal)
+/// would read as 0 ms and its time would land in the next phase that
+/// waits. So at each phase boundary the trace awaits `tick` (a timer of
+/// 1 ms in a Worker; one of 0 ms did not move the clock) before it reads
+/// the clock. That costs the request one timer per boundary, about
+/// 1 ms each, while it is on.
+pub fn log_writes(to: fn(&str), tick: Tick) {
+    WRITES.with(|log| log.set(Some((to, tick))));
+}
+
+/// Where a write request's time went. Each stretch of time from the
+/// start to the last mark is in exactly one phase, so the phases add up
+/// to `wall_ms`. Logs its line when dropped, so a request that fails
+/// is logged too; in such a line the call that failed is counted in
+/// `other_ms`, as it returned before its phase was closed.
+pub(crate) struct WriteTrace<'a> {
+    on: Option<(WriteLog, &'a dyn crate::ports::Clock)>,
+    kind: &'static str,
+    ok: bool,
+    bytes: u64,
+    extents: u32,
+    pieces: u32,
+    ticks: u32,
+    ms: [i64; PHASES],
+    start: i64,
+    last: i64,
+}
+
+impl<'a> WriteTrace<'a> {
+    /// A trace of a request of `kind`, started now, if writes are logged.
+    pub(crate) fn begin(kind: &'static str, clock: &'a dyn crate::ports::Clock) -> Self {
+        let on = WRITES.with(std::cell::Cell::get);
+        let now = if on.is_some() { clock.now().0 } else { 0 };
+        WriteTrace {
+            on: on.map(|log| (log, clock)),
+            kind,
+            ok: false,
+            bytes: 0,
+            extents: 0,
+            pieces: 0,
+            ticks: 0,
+            ms: [0; PHASES],
+            start: now,
+            last: now,
+        }
+    }
+
+    /// A trace that records nothing.
+    pub(crate) fn off() -> Self {
+        WriteTrace {
+            on: None,
+            kind: "",
+            ok: false,
+            bytes: 0,
+            extents: 0,
+            pieces: 0,
+            ticks: 0,
+            ms: [0; PHASES],
+            start: 0,
+            last: 0,
+        }
+    }
+
+    pub(crate) fn kind(&mut self, kind: &'static str) {
+        self.kind = kind;
+    }
+
+    /// The body is `bytes` long (decoded) and is stored as `extents`.
+    pub(crate) fn body(&mut self, bytes: u64, extents: u32) {
+        self.bytes = bytes;
+        self.extents = extents;
+    }
+
+    /// The request is answered with a success.
+    pub(crate) fn ok(&mut self) {
+        self.ok = true;
+    }
+
+    /// The time since the last mark was spent in `phase`. Reads the
+    /// clock as it is: right after an await on I/O it is current.
+    pub(crate) fn mark(&mut self, phase: Phase) {
+        if let Some((_, clock)) = self.on {
+            self.note(phase, clock.now().0);
+        }
+    }
+
+    /// As [`Self::mark`], after letting the clock catch up with the code
+    /// that ran since the last await.
+    pub(crate) async fn lap(&mut self, phase: Phase) {
+        if let Some(((_, tick), clock)) = self.on {
+            tick().await;
+            self.ticks = self.ticks.saturating_add(1);
+            self.note(phase, clock.now().0);
+        }
+    }
+
+    /// One piece of the body was taken in. Counted only: a tick per
+    /// piece would cost a timer for every few KiB of the body.
+    pub(crate) fn piece(&mut self) {
+        self.pieces = self.pieces.saturating_add(1);
+    }
+
+    fn note(&mut self, phase: Phase, now: i64) {
+        self.ms[phase as usize] += now.saturating_sub(self.last).max(0);
+        self.last = self.last.max(now);
+    }
+
+    /// The line, after the time since the last mark went to `Other`.
+    fn line(&mut self, now: i64) -> String {
+        self.note(Phase::Other, now);
+        let m = &self.ms;
+        format!(
+            "kind={} outcome={} bytes={} extents={} auth_ms={} wait_ms={} read_ms={} \
+             hash_ms={} seal_ms={} r2_ms={} d1_ms={} other_ms={} wall_ms={} pieces={} ticks={}",
+            self.kind,
+            if self.ok { "ok" } else { "error" },
+            self.bytes,
+            self.extents,
+            m[Phase::Auth as usize],
+            m[Phase::Wait as usize],
+            m[Phase::Read as usize],
+            m[Phase::Hash as usize],
+            m[Phase::Seal as usize],
+            m[Phase::R2 as usize],
+            m[Phase::D1 as usize],
+            m[Phase::Other as usize],
+            self.last - self.start,
+            self.pieces,
+            self.ticks,
+        )
+    }
+}
+
+impl Drop for WriteTrace<'_> {
+    fn drop(&mut self) {
+        if let Some(((to, _), clock)) = self.on {
+            let line = self.line(clock.now().0);
+            to(&line);
+        }
+    }
+}
