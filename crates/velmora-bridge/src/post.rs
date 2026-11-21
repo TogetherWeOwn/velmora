@@ -636,9 +636,18 @@ where
             }
         };
         let asked = self.clock.now();
-        let (mut held, _) = self
-            .open_sessions(first_tier, &holder, todo, &probing)
-            .await?;
+        // Every slot of the tier taken: one is waited for under the
+        // claim for a bounded time ([`crate::jobs::SLOT_WAIT_MS`]),
+        // before the extent is read. The tier is the one the job found:
+        // a cooldown that begins meanwhile is met as by a job at work.
+        let mut held = loop {
+            let (held, _) = self
+                .open_sessions(first_tier, &holder, todo, &probing)
+                .await?;
+            if !held.is_empty() || !self.slot_wait(lease).await {
+                break held;
+            }
+        };
         let permits_ms = self.clock.now().0 - asked.0;
         crate::trace::note(&lease.extent, |t| {
             t.permits_ms = permits_ms;

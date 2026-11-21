@@ -33,6 +33,7 @@
 use crate::config::{GcMode, Maintenance, ORPHAN_GRACE_MS};
 use crate::ports::{
     BlobStore, Bridge, Catalog, Clock, JobSink, Kek, Lease, NntpConnector, MAX_QUEUE_DELAY_SECS,
+    PERMIT_SECS,
 };
 use crate::post::{settle, Stop, POST_SOCKET_BYTES};
 use crate::recovery::delete_blob;
@@ -198,6 +199,29 @@ pub fn parity_job_bytes(cipher_size: u64, parity: usize) -> u64 {
 pub fn low_watermark(cap: u64) -> u64 {
     cap - cap / 10
 }
+
+/// How long after its claim a job that finds no provider slot still
+/// waits for one, where it used to give its row back at once and be
+/// delivered again 15 to 60 s later (a claim, a put-off and a queue
+/// delivery each time).
+///
+/// One permit lifetime: a slot whose holder is gone without releasing
+/// it frees when its permit expires, so by then every slot has been
+/// released, renewed by a job that is still at work, or freed. A job
+/// that has seen none come free in that time gives its row back as
+/// before. Counted from the claim, so it bounds the waits of one job
+/// together, whatever the number of backbones it asks: with the
+/// longest invocation that succeeded in a day of production (393 s) the
+/// job still ends well before its invocation gives it up
+/// ([`JOB_WAIT_MS`](crate::jobtable::JOB_WAIT_MS)).
+pub const SLOT_WAIT_MS: i64 = PERMIT_SECS as i64 * 1000;
+const _: () = assert!(SLOT_WAIT_MS + 393_000 < crate::jobtable::JOB_WAIT_MS);
+/// How long a job that waits for a slot sleeps before it asks again. A
+/// slot is held for a second or more by the shortest job there is (a
+/// connect, a login and one pass of a light check), so asking more
+/// often than this finds little; each ask is one read of the pool and
+/// one refused call per provider.
+pub const SLOT_POLL_MS: u32 = 2_000;
 
 pub(crate) const RETRY: JobOutcome = JobOutcome::Retry {
     delay_secs: INFRA_RETRY_SECS,
@@ -378,6 +402,23 @@ where
             OutboxStage::Post => self.post_stage(lease, &row).await,
             OutboxStage::Verify => self.verify_stage(lease, &row).await,
             _ => self.release_stage(lease, &row).await,
+        }
+    }
+
+    /// For a job that just found no slot: sleeps [`SLOT_POLL_MS`] and
+    /// says the job may ask again, while its claim is younger than
+    /// [`SLOT_WAIT_MS`]. `false`, with nothing awaited, once it is not,
+    /// and on a host without a timer: the job is put off as before.
+    /// The lease is not renewed here: a job that connects after a wait
+    /// renews it first, as after any wait ([`Lease::fresh_at`]).
+    pub(crate) async fn slot_wait(&self, lease: &Lease) -> bool {
+        let age = self.clock.now().0 - lease.claimed_at.0;
+        match self.budget.sleeper() {
+            Some(sleep) if (0..SLOT_WAIT_MS).contains(&age) => {
+                sleep(SLOT_POLL_MS).await;
+                true
+            }
+            _ => false,
         }
     }
 

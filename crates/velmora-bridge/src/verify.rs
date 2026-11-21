@@ -455,54 +455,66 @@ where
         if fresh.is_empty() {
             fresh = expired;
         }
-        let pool = Pool::load(&self.catalog, &self.cfg.providers, now).await?;
-        let usable = pool.order(fresh.clone(), PermitClass::Background);
-        if usable.is_empty() {
-            if let Some(until) = pool.cooling_until(&fresh) {
-                return Err(Stop::Cooling(until));
+        loop {
+            // The pool as it is now: a wait may have outlasted a cooldown,
+            // or seen one begin.
+            let at = self.clock.now();
+            let pool = Pool::load(&self.catalog, &self.cfg.providers, at).await?;
+            let usable = pool.order(fresh.clone(), PermitClass::Background);
+            if usable.is_empty() {
+                return Err(match pool.cooling_until(&fresh) {
+                    Some(until) => Stop::Cooling(until),
+                    None => Stop::NoPermit,
+                });
+            }
+            let mut refused = false;
+            for provider in usable {
+                let Some(mut session) = ProviderSession::open(
+                    &self.catalog,
+                    &self.nntp,
+                    &self.clock,
+                    provider,
+                    PermitClass::Background,
+                    &holder,
+                )
+                .await?
+                else {
+                    continue;
+                };
+                let tally = match kind {
+                    VerifyKind::Body | VerifyKind::Sampled => {
+                        read_articles(&mut session, Some(lease), &rows, |_, _| {}).await
+                    }
+                    // Under the light check the articles of an extent are
+                    // asked for together; under `body` one by one, as before.
+                    VerifyKind::Stat if together => {
+                        ask_articles_together(&mut session, Some(lease), &rows, None).await
+                    }
+                    VerifyKind::Stat => stat_articles(&mut session, Some(lease), &rows).await,
+                    VerifyKind::Size => {
+                        let how = self.cfg.verify.size_command(&provider.id);
+                        ask_articles_together(&mut session, Some(lease), &rows, how).await
+                    }
+                };
+                session.close().await;
+                match tally {
+                    // The provider refused the account: the next one of the
+                    // backbone is asked.
+                    Err(Stop::Refused) => refused = true,
+                    tally => return Ok((provider, tally?)),
+                }
+            }
+            if refused {
+                return Err(Stop::Refused);
+            }
+            // No slot on this backbone. It is waited for under the claim
+            // for a bounded time ([`crate::jobs::SLOT_WAIT_MS`]): the
+            // row is not given back and delivered again for a slot
+            // that comes free in seconds.
+            if !self.slot_wait(lease).await {
+                return Err(Stop::NoPermit);
             }
         }
-        let mut refused = false;
-        for provider in usable {
-            let Some(mut session) = ProviderSession::open(
-                &self.catalog,
-                &self.nntp,
-                &self.clock,
-                provider,
-                PermitClass::Background,
-                &holder,
-            )
-            .await?
-            else {
-                continue;
-            };
-            let tally = match kind {
-                VerifyKind::Body | VerifyKind::Sampled => {
-                    read_articles(&mut session, Some(lease), &rows, |_, _| {}).await
-                }
-                // Under the light check the articles of an extent are
-                // asked for together; under `body` one by one, as before.
-                VerifyKind::Stat if together => {
-                    ask_articles_together(&mut session, Some(lease), &rows, None).await
-                }
-                VerifyKind::Stat => stat_articles(&mut session, Some(lease), &rows).await,
-                VerifyKind::Size => {
-                    let how = self.cfg.verify.size_command(&provider.id);
-                    ask_articles_together(&mut session, Some(lease), &rows, how).await
-                }
-            };
-            session.close().await;
-            match tally {
-                // The provider refused the account: the next one of the
-                // backbone is asked.
-                Err(Stop::Refused) => refused = true,
-                tally => return Ok((provider, tally?)),
-            }
-        }
-        Err(match refused {
-            true => Stop::Refused,
-            false => Stop::NoPermit,
-        })
     }
 
     async fn record(

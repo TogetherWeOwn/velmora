@@ -697,6 +697,52 @@ async fn a_job_without_a_slot_does_not_load_the_extent() {
     assert!(all_posted_by(&rig.plan(&s).await, "p0"));
 }
 
+/// The same with a timer on the host: the job waits under its claim.
+/// The slots free when their permits expire, half a permit lifetime
+/// after the claim; the job then loads the extent and posts it, in the
+/// run that claimed it. Slots that stay taken put it off after one
+/// permit lifetime, with no attempt spent and nothing loaded.
+#[tokio::test]
+async fn a_job_without_a_slot_waits_for_one_under_its_claim() {
+    let mut rig = rig(&[spec("bb0", 5), spec("bb1", 5)]).await;
+    rig.bridge.cfg.providers[1].priority = 1;
+    rig.with_timer();
+    let (gone, kept) = (
+        rig.seed(1, &marked_plaintext(PLAIN_LEN)).await,
+        rig.seed(2, &marked_plaintext(PLAIN_LEN)).await,
+    );
+    let now = rig.bridge.clock.now();
+    let half = i64::from(PERMIT_SECS) * 500;
+    rig.take_slots(0, now.plus_ms(-half)).await;
+
+    assert_eq!(rig.run_post(&gone).await, JobOutcome::Ack);
+
+    let waited = rig.bridge.clock.now().0 - now.0;
+    assert!((half..jobs::SLOT_WAIT_MS).contains(&waited), "{waited}");
+    assert!(all_posted_by(&rig.plan(&gone).await, "p0"));
+    assert_eq!(rig.bridge.nntp.live(), 0);
+
+    let now = rig.bridge.clock.now();
+    rig.take_slots(0, now.plus_secs(30)).await;
+    let reads = rig.bridge.safety.gets();
+
+    assert!(matches!(
+        rig.run_post(&kept).await,
+        JobOutcome::Retry { .. }
+    ));
+
+    let waited = rig.bridge.clock.now().0 - now.0;
+    let poll = i64::from(jobs::SLOT_POLL_MS);
+    assert!(
+        (jobs::SLOT_WAIT_MS..jobs::SLOT_WAIT_MS + poll).contains(&waited),
+        "{waited}"
+    );
+    assert_eq!(rig.bridge.safety.gets(), reads);
+    assert!(rig.plan(&kept).await.is_empty());
+    assert_eq!(rig.bridge.catalog.outbox(&kept.extent).attempts, 0);
+    assert_eq!(rig.servers[1].posted_count().await, 0);
+}
+
 /// Two sockets. While one has a POST in flight, the permits are taken
 /// over and the other socket's renewal finds them gone. The first socket
 /// makes no call after its POST returns. Nothing is recorded (a plan is
