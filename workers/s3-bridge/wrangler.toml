@@ -14,6 +14,20 @@ command = "cargo install -q --locked worker-build@0.8.7 && bash bundle.sh"
 [limits]
 cpu_ms = 300000              # crypto-heavy fetch + queue handlers; measure, then lower
 
+# Run the fetch handler next to the catalogue and the buckets. The
+# production D1 and both R2 buckets are in ENAM; aws:us-east-1 serves
+# from IAD. A request is mostly D1 and R2 round trips, so this cuts its
+# time for a client anywhere. Placement moves fetch handlers only:
+# queue consumers, cron and the Durable Object are where they were.
+# Measured on a throwaway deployment with an ENAM D1, placed against
+# unplaced (client in Europe): PutObject 1 MiB p50 -30%, hot GET TTFB
+# -25%, cold GET MiB/s +82%, cold 1 MiB TTFB -71%. Rollback: remove
+# this table (or set mode = "off") and deploy; a version without it
+# runs unplaced again.
+[placement]
+mode = "targeted"
+region = "aws:us-east-1"
+
 [vars]
 ENVIRONMENT = "prod"
 S3_HOST = "velmora-s3.<account>.workers.dev"
@@ -460,6 +474,10 @@ crons = ["*/5 * * * *"]
 [env.dev]
 vars = { ENVIRONMENT = "dev", S3_HOST = "127.0.0.1:8787", REQUIRED_BACKBONES = "1", SAFETY_MIN_AGE_SECS = "0", VERIFY_DELAY_SECS = "1", DEV_TRUST_HTTP = "1", NEWSGROUPS = "alt.binaries.test", MAX_EXTENT_BYTES = "16777216", S3_REGION = "auto", VELMORA_KEK_ACTIVE = "1", INFLIGHT_BUDGET_BYTES = "50331648", GC_MODE = "disposable", MAINTENANCE = "off", SERVER_SIDE_COPY = "on", PACKED_PLANS = "on", MAX_PUT_BYTES = "103809024", INTENT_SWEEP = "on", GET_FANOUT_BYTES = "8388608", PERMITS = "d1" }
 # dev secrets come from workers/s3-bridge/.dev.vars (gitignored; see .dev.vars.example).
+
+# An environment inherits [placement]; dev runs where it is called.
+[env.dev.placement]
+mode = "off"
 # Environments do not inherit bindings, so dev repeats them all, under
 # its own resource names (-dev) so a dev run can never touch prod data.
 

@@ -2946,3 +2946,28 @@ fn production_declares_and_binds_the_gate_with_permits_d1() {
         assert!(env.iter().any(|t| t == table), "dev lacks [{table}]");
     }
 }
+
+/// Production runs its fetch handler next to its D1 and R2 (both ENAM):
+/// one `[placement]` table, region `aws:us-east-1`, nowhere else in the
+/// production section, and no inline `placement =` key at the root. An
+/// environment inherits `[placement]`, so dev says `off` for itself.
+#[test]
+fn production_places_the_fetch_handler_in_us_east_1_and_dev_does_not() {
+    let (prod, env, root) = wrangler_tables();
+    let placed: Vec<&String> = prod.iter().filter(|t| t.starts_with("placement")).collect();
+    assert_eq!(placed, ["placement"], "one production [placement] table");
+    assert!(
+        !root.iter().any(|k| k.starts_with("placement")),
+        "an inline placement key at the root"
+    );
+    assert_eq!(
+        table_body("[placement]"),
+        ["mode=targeted", "region=aws:us-east-1"]
+    );
+    let dev: Vec<&String> = env
+        .iter()
+        .filter(|t| t.starts_with("env.dev.placement"))
+        .collect();
+    assert_eq!(dev, ["env.dev.placement"], "dev states its own placement");
+    assert_eq!(table_body("[env.dev.placement]"), ["mode=off"]);
+}
