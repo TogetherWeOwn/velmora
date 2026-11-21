@@ -139,16 +139,17 @@ impl AlarmRules {
     };
 
     /// Positive waits, a cap not below the first wait, and a stamp period
-    /// of at most half the lease term.
-    pub const fn valid(&self) -> bool {
+    /// of at most half the term of `lease`, the lease rules the unit runs
+    /// with.
+    pub const fn valid(&self, lease: &LeaseRules) -> bool {
         self.renew_retry_ms > 0
             && self.renew_retry_max_ms >= self.renew_retry_ms
             && self.stamp_period_ms > 0
-            && self.stamp_period_ms <= LeaseRules::DEFAULT.term_ms / 2
+            && self.stamp_period_ms <= lease.term_ms / 2
     }
 }
 
-const _: () = assert!(AlarmRules::DEFAULT.valid());
+const _: () = assert!(AlarmRules::DEFAULT.valid(&LeaseRules::DEFAULT));
 
 /// What one alarm run does.
 #[derive(Clone, Debug, PartialEq, Eq)]

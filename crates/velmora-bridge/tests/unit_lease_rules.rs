@@ -528,7 +528,22 @@ fn stamp_raise_follows_first_write_by_half_a_term() {
         stamp_period_ms: LEASE_RULES.term_ms,
         ..ALARM_RULES
     }
-    .valid());
+    .valid(&LEASE_RULES));
+    // The cap follows the lease the unit runs with.
+    let short = LeaseRules {
+        term_ms: 4 * 60 * 1000,
+        ..LEASE_RULES
+    };
+    let long = LeaseRules {
+        term_ms: 12 * 60 * 1000,
+        ..LEASE_RULES
+    };
+    assert!(!ALARM_RULES.valid(&short));
+    let six = AlarmRules {
+        stamp_period_ms: 6 * 60 * 1000,
+        ..ALARM_RULES
+    };
+    assert!(six.valid(&long));
 }
 
 /// A unit stamp ID carries its tenant and unit number in its displayed form.
@@ -734,17 +749,17 @@ fn a_stale_retry_never_arms_in_the_past() {
         ),
         Some(at(MIN_ALARM_GAP_MS))
     );
-    assert!(AlarmRules::DEFAULT.valid());
+    assert!(AlarmRules::DEFAULT.valid(&LEASE_RULES));
     assert!(!AlarmRules {
         renew_retry_ms: 0,
         ..AlarmRules::DEFAULT
     }
-    .valid());
+    .valid(&LEASE_RULES));
     assert!(!AlarmRules {
         renew_retry_max_ms: 1,
         ..AlarmRules::DEFAULT
     }
-    .valid());
+    .valid(&LEASE_RULES));
 }
 
 /// A duty that keeps failing on a fresh lease backs off like a renewal:
