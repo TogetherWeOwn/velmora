@@ -217,6 +217,9 @@ if [[ -n ${LITMUS_ROOT:-} ]]; then
   for s in "${SECRETS[@]}"; do sed -i "s|$s|<redacted>|g" "$T/litmus.log"; done
   cat "$T/litmus.log"
   grep -E '^<- summary' "$T/litmus.log" | sed 's/^/litmus /'
+  # Every group ran and none failed.
+  clean=$(grep -cE "^<- summary for \`(basic|copymove|props|locks|http)': of [0-9]+ tests run: [0-9]+ passed, 0 failed" "$T/litmus.log" || true)
+  check "litmus groups with 0 failures" 5 "$clean"
 else
   echo "skip litmus (LITMUS_ROOT unset)"
 fi

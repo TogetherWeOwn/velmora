@@ -538,7 +538,8 @@ jobs:
     needs: changes
     if: needs.changes.outputs.bridge == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    # One slice run and the WebDAV run, each with its own wrangler dev.
+    timeout-minutes: 55
     strategy:
       fail-fast: false
       matrix:
@@ -608,6 +609,19 @@ jobs:
             export E2E_PERMITS="$SLICE_PERMITS"
           fi
           bash e2e/slice.sh "$SLICE_URL"
+      # The WebDAV gateway and the S3 Worker under wrangler dev, bound
+      # through the DavEntry entrypoint: the kind binding, litmus (every
+      # group must pass with 0 failures) and rclone's webdav backend.
+      - name: Install litmus and rclone (WebDAV end to end)
+        if: steps.script.outputs.present == 'true'
+        run: sudo apt-get update && sudo apt-get install -y litmus rclone
+      - name: Run the WebDAV end to end (litmus, rclone)
+        if: steps.script.outputs.present == 'true'
+        env:
+          FAKESRV_BIN: ${{ github.workspace }}/target/debug/fakesrv
+          WRANGLER_SEND_METRICS: "false"
+          LITMUS_ROOT: /
+        run: bash workers/webdav/e2e/dav.sh
 
   # The console Worker (apps/console): plain JavaScript, no dependencies,
   # tested with the Node test runner. Cheap, so it runs on every event.
