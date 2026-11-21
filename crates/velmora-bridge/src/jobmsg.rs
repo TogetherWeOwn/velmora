@@ -356,9 +356,9 @@ fn body_version(job: &Job) -> u8 {
 }
 
 /// How many deliveries of each format a consumer read, said in a log
-/// line at the isolate's first delivery, at once for a kind not yet
-/// counted, and otherwise at most once every [`FormatCount::EVERY_MS`]. It is the check
-/// line of the switch (both formats are read after step 1; no `v` 1
+/// line at the isolate's first delivery, at once for a kind not seen in
+/// the current minute, and otherwise at most once every
+/// [`FormatCount::EVERY_MS`]. It is the check line of the switch (both formats are read after step 1; no `v` 1
 /// message is left before step 3) and costs no storage.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct FormatCount {
