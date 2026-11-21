@@ -32,7 +32,8 @@
 //! 5. no part of an open upload names it (`upload_parts`,
 //!    `upload_part_extents`): an upload in progress keeps every part it
 //!    lists, however old;
-//! 6. no replay is under way and no rollback is waiting for one;
+//! 6. no replay is under way, no rollback is waiting for one, and no
+//!    replay ended less than `ORPHAN_GRACE_MS` ago (below);
 //! 7. no recovery record that a replay could make the live object of
 //!    its key names it. A CompleteMultipartUpload stores its record,
 //!    which names every part it was given, before its batch runs. When
@@ -46,7 +47,9 @@
 //!    publish that record, and its object must read. Without it every
 //!    record of the key lies under an acknowledged one, and a replay,
 //!    which folds the records of a key in id order, never leaves such
-//!    a record live.
+//!    a record live. Where the catalogue no longer knows the upload of
+//!    the part, no key of its bucket that an upload was ever begun on
+//!    may carry the mark (below).
 //!
 //! Once 1 and 3 to 5 hold they keep holding while requests and jobs
 //! run, which is why the scan may read them first and the claim later.
@@ -68,6 +71,39 @@
 //! `ORPHAN_GRACE_MS` exceeds many times over: by the time 2 holds, every
 //! record that names the part is stored and its mark is set or was
 //! taken away by an acknowledged record above it.
+//!
+//! For a part whose upload is not known, the marks of the bucket are
+//! not read by the claim itself. Reading them is a read of every row of
+//! `uploads`, so it is done once for a bucket and its answer is kept
+//! for `ORPHAN_VERDICT_MS` (a row of `scan_cursors`, written by the
+//! statement that reads them). The claim proves in its own batch that
+//! the bucket was found free of marks no longer ago than that. This is
+//! as good as reading them in the batch: the answer is at most a day
+//! old, the part was dropped 31 days ago, and the marks that matter to
+//! the part were all raised within one request of its drop, so they
+//! were there to be found, or were already taken away for good. A mark
+//! raised after the answer was written is of a record that was stored
+//! then, from a part list the part had long left.
+//!
+//! # After a replay
+//!
+//! 2 is enough on one history of the database: no state it can be taken
+//! back to (30 days, D1 Time Travel) lists a part that was dropped 31
+//! days ago. A restore that is undone later leaves a second history:
+//! the states between the restore and its undoing can be returned to
+//! for 30 days more, and they are states of before the restore point,
+//! in which a part dropped just after it is listed by its upload. So a
+//! claim is also refused until `ORPHAN_GRACE_MS` after the last replay
+//! ended (`restore_state.finished_at`): a catalogue that was taken back
+//! takes no write and collects nothing before a replay has run to its
+//! end, the replay ends after the restore it follows, and 31 days after
+//! it every state of a history that was left before it is out of reach.
+//!
+//! What this cannot see: a restore that was undone before a replay ended
+//! on it. The history it leaves is one the service never wrote on, so
+//! the catalogue that is brought back holds no trace of it and nothing
+//! tells it that it was away. The ops notes keep the rule for that case
+//! (the switch stays off for 31 days after any restore).
 //!
 //! What the mark does not cover: a record stored before the catalogue
 //! had `key_floors` (migration 0007). Such a record names only parts
@@ -115,15 +151,29 @@ macro_rules! no_stale_record_of_upload {
 // Point 7 for the extents whose upload is not known. A part that was
 // uploaded again lost its `upload_parts` row to its successor, and the
 // further extents of a sliced part lost theirs when the part was
-// dropped. For those every key an upload of the bucket (`?1`) was ever
+// dropped. For those every key an upload of the bucket (`?2`) was ever
 // made on must be free of the mark. `uploads` has no index that serves
 // this and no row of it is ever deleted, so the statement reads every
-// upload of the catalogue: it is a guard of its own, run once for all
-// the claims of a batch and never once per extent.
-const GUARD_NO_STALE_RECORD_IN_BUCKET: &str = "INSERT INTO tx_guard(ok) SELECT 0 WHERE EXISTS \
-       (SELECT 1 FROM uploads su WHERE su.bucket_id = ?1 AND EXISTS \
+// upload of the catalogue. It is therefore not part of a claim: it
+// writes what it found, with the time (`?3` when a key is marked, `?4`
+// when none is), to the row `?1` of `scan_cursors`, and the claims of
+// the next `ORPHAN_VERDICT_MS` are made behind that row.
+const BUCKET_VERDICT: &str = "INSERT INTO scan_cursors(k, v) VALUES (?1, CASE WHEN EXISTS \
+       (SELECT 1 FROM uploads su WHERE su.bucket_id = ?2 AND EXISTS \
           (SELECT 1 FROM key_floors sf WHERE sf.bucket_id = su.bucket_id \
-              AND sf.key = su.key AND sf.unpublished <> 0))";
+              AND sf.key = su.key AND sf.unpublished <> 0)) THEN ?3 ELSE ?4 END) \
+     ON CONFLICT(k) DO UPDATE SET v = excluded.v";
+
+// The claims of such extents hold only behind this: the row `?1` says
+// that the bucket was found free of marks, later than `?2`.
+const GUARD_BUCKET_FOUND_CLEAN: &str = "INSERT INTO tx_guard(ok) SELECT 0 WHERE NOT EXISTS \
+       (SELECT 1 FROM scan_cursors WHERE k = ?1 AND v GLOB 'clean:[0-9]*' \
+          AND CAST(substr(v, 7) AS INTEGER) > ?2)";
+
+// Point 6, its last part: no replay ended after `?1`. A row that says
+// `complete` without the time it ended is read by the time it began.
+const GUARD_NO_REPLAY_SINCE: &str = "INSERT INTO tx_guard(ok) SELECT 0 WHERE EXISTS \
+       (SELECT 1 FROM restore_state WHERE id = 1 AND COALESCE(finished_at, started_at) > ?1)";
 
 // One claim: points 1 to 5 and the first half of 7 for the row `?2` of
 // the extent `?1`, due at or before `?3`, and the record that the copy
@@ -156,8 +206,8 @@ const CLAIM_OF_UPLOAD: &str =
     claim!("EXISTS (SELECT 1 FROM upload_parts kp WHERE kp.extent_id = ?1)");
 
 // It is not known: the claim holds only in a batch that carries
-// `GUARD_NO_STALE_RECORD_IN_BUCKET` for the bucket `?4`, which must be
-// the extent's own.
+// `GUARD_BUCKET_FOUND_CLEAN` for the bucket `?4`, which must be the
+// extent's own.
 const CLAIM_IN_BUCKET: &str = claim!("extents.bucket_id = ?4");
 
 use super::replay::guard_no_replay;
@@ -173,9 +223,19 @@ const SKIP_RETRY_MS: i64 = 60 * 60 * 1000;
 
 /// After a pass over every due row, the scan for orphaned parts starts
 /// the next one this much later. A part waits `ORPHAN_GRACE_MS` before
-/// it may go, so an hour more changes nothing, and a catalogue with
+/// it may go, so a day more changes nothing, and a catalogue with
 /// nothing to collect costs one row read per dispatcher run in between.
-const ORPHAN_REST_MS: i64 = 60 * 60 * 1000;
+/// A pass reads every open row that is old enough, also the rows of
+/// deleted objects, which stay open for good while `GC_MODE` is off:
+/// once a day bounds what those cost.
+const ORPHAN_REST_MS: i64 = 24 * 60 * 60 * 1000;
+
+/// How long the answer of `BUCKET_VERDICT` is used: the uploads of a
+/// bucket are read once in this time, however many jobs claim parts of
+/// it, and a bucket with a marked key is asked again only after it.
+/// It must stay far below `ORPHAN_GRACE_MS` less the life of a request
+/// (module doc, point 7).
+const ORPHAN_VERDICT_MS: i64 = 24 * 60 * 60 * 1000;
 
 /// True while the extent `?1` must not be touched: a live generation
 /// references it (its own, or a copy), or an open upload does.
@@ -507,6 +567,41 @@ pub(super) async fn gc_orphans<S: Sql>(
     Ok(out)
 }
 
+/// What `BUCKET_VERDICT` last wrote for a bucket.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Verdict {
+    /// No key an upload was begun on carried the mark at this time.
+    Clean(i64),
+    /// One did.
+    Marked(i64),
+}
+
+impl Verdict {
+    /// The row of the bucket in `scan_cursors`.
+    fn key(bucket: &str) -> String {
+        format!("orphans:bucket:{bucket}")
+    }
+
+    /// A value this code did not write reads as no answer: the bucket
+    /// is asked again.
+    fn parse(v: &str) -> Option<Verdict> {
+        let (what, at) = v.split_once(':')?;
+        let at = at.parse::<i64>().ok()?;
+        match what {
+            "clean" => Some(Verdict::Clean(at)),
+            "marked" => Some(Verdict::Marked(at)),
+            _ => None,
+        }
+    }
+
+    fn encode(self) -> String {
+        match self {
+            Verdict::Clean(at) => format!("clean:{at}"),
+            Verdict::Marked(at) => format!("marked:{at}"),
+        }
+    }
+}
+
 /// The decision, for the rows of one window; the answers are in the
 /// order of `rows`. Each batch proves the whole rule of the module doc
 /// for every row it grants and records that the copy is gone; `false` =
@@ -516,20 +611,39 @@ pub(super) async fn gc_orphans<S: Sql>(
 ///
 /// The rows are claimed in groups, so that what a claim costs does not
 /// grow with the number of rows: the extents whose upload is known in
-/// one batch, and the others in one batch per bucket, behind the one
-/// statement that reads the uploads (`GUARD_NO_STALE_RECORD_IN_BUCKET`).
-/// The read that sorts them is a hint and proves nothing. An extent
+/// one batch, and the others in one batch per bucket, behind the answer
+/// of the one statement that reads the uploads (`BUCKET_VERDICT`),
+/// which runs when the bucket has no answer younger than
+/// `ORPHAN_VERDICT_MS`. A bucket whose answer of that age is that a key
+/// is marked costs nothing more: its rows are refused unread.
+/// The read that sorts the rows is a hint and proves nothing. An extent
 /// never gains an `upload_parts` row after the batch that inserted it;
 /// one that lost its row since the read is refused here and sorted
 /// right by the next pass.
+///
+/// An error ends the claims. The answers up to it stand, and what they
+/// grant is recorded: the caller deletes those copies whatever the
+/// second value says.
 pub(super) async fn gc_orphan_claim<S: Sql>(
     c: &SqlCatalog<S>,
     rows: &[GcRow],
+    now: UnixMs,
     cutoff: UnixMs,
-) -> Result<Vec<bool>> {
+) -> (Vec<bool>, Result<()>) {
     let mut granted = vec![false; rows.len()];
+    let claimed = orphan_claims(c, rows, now, cutoff, &mut granted).await;
+    (granted, claimed)
+}
+
+async fn orphan_claims<S: Sql>(
+    c: &SqlCatalog<S>,
+    rows: &[GcRow],
+    now: UnixMs,
+    cutoff: UnixMs,
+    granted: &mut [bool],
+) -> Result<()> {
     if rows.is_empty() {
-        return Ok(granted);
+        return Ok(());
     }
     let ids: Vec<&str> = rows.iter().map(|r| r.extent_id.as_str()).collect();
     let ids = serde_json::to_string(&ids)
@@ -538,16 +652,21 @@ pub(super) async fn gc_orphan_claim<S: Sql>(
         .sql
         .query(
             "SELECT e.id, e.bucket_id, \
-               EXISTS (SELECT 1 FROM upload_parts kp WHERE kp.extent_id = e.id) \
+               EXISTS (SELECT 1 FROM upload_parts kp WHERE kp.extent_id = e.id), \
+               (SELECT v FROM scan_cursors WHERE k = 'orphans:bucket:' || e.bucket_id) \
              FROM extents e WHERE e.id IN (SELECT value FROM json_each(?1))",
             &[text(&ids)],
         )
         .await?;
     // Extent id -> its bucket, or `None` when its upload is known.
     let mut hint: BTreeMap<String, Option<String>> = BTreeMap::new();
+    let mut verdicts: BTreeMap<String, Verdict> = BTreeMap::new();
     for row in found {
         let mut r = Cols::new(row);
         let (id, bucket, known) = (r.text()?, r.text()?, r.num::<i64>()? != 0);
+        if let Some(verdict) = r.opt_text()?.as_deref().and_then(Verdict::parse) {
+            verdicts.insert(bucket.clone(), verdict);
+        }
         hint.insert(id, (!known).then_some(bucket));
     }
     // `None`: the group of the known uploads. An extent that does not
@@ -558,10 +677,46 @@ pub(super) async fn gc_orphan_claim<S: Sql>(
             groups.entry(bucket.as_deref()).or_default().push(i);
         }
     }
+    // An answer about a bucket counts when it is younger than this,
+    // and not from a time that is still to come (a clock that was set
+    // back): such a one is asked for again.
+    let fresh = now.plus_ms(-ORPHAN_VERDICT_MS).0;
+    let young = |at: i64| fresh < at && at <= now.0;
+    // Point 6, in every batch.
+    let replay_guards = || vec![guard_no_replay(), (GUARD_NO_REPLAY_SINCE, vec![ms(cutoff)])];
     for (bucket, members) in groups {
-        let mut stmts: Vec<Stmt> = vec![guard_no_replay()];
+        let mut stmts: Vec<Stmt> = replay_guards();
         if let Some(bucket) = bucket {
-            stmts.push((GUARD_NO_STALE_RECORD_IN_BUCKET, vec![text(bucket)]));
+            let row = Verdict::key(bucket);
+            match verdicts.get(bucket) {
+                // Asked within the day, and a key was marked: refused,
+                // at the cost of nothing.
+                Some(Verdict::Marked(at)) if young(*at) => continue,
+                Some(Verdict::Clean(at)) if young(*at) => {}
+                // The uploads are read, once, and the answer is kept.
+                // What it is, the batch below finds out for itself.
+                _ => {
+                    let mut ask = replay_guards();
+                    ask.push((
+                        BUCKET_VERDICT,
+                        vec![
+                            text(&row),
+                            text(bucket),
+                            text(&Verdict::Marked(now.0).encode()),
+                            text(&Verdict::Clean(now.0).encode()),
+                        ],
+                    ));
+                    match c.sql.batch(ask).await {
+                        Ok(_) => {}
+                        Err(BridgeError::GuardFailed) => continue,
+                        Err(e) => return Err(e),
+                    }
+                }
+            }
+            stmts.push((
+                GUARD_BUCKET_FOUND_CLEAN,
+                vec![text(&row), SqlValue::Int(fresh)],
+            ));
         }
         let guards = stmts.len();
         // The catalogue says the copy is gone before it goes, never
@@ -585,8 +740,9 @@ pub(super) async fn gc_orphan_claim<S: Sql>(
         }
         let changed = match c.sql.batch(stmts).await {
             Ok(changed) => changed,
-            // A replay or a rollback, or a marked key in the bucket:
-            // the batch wrote nothing and every row of it is refused.
+            // A replay, a rollback, or a replay that ended too short a
+            // time ago; or a marked key in the bucket: the batch wrote
+            // nothing and every row of it is refused.
             Err(BridgeError::GuardFailed) => continue,
             Err(e) => return Err(e),
         };
@@ -594,7 +750,7 @@ pub(super) async fn gc_orphan_claim<S: Sql>(
             granted[*i] = *n != 0;
         }
     }
-    Ok(granted)
+    Ok(())
 }
 
 /// Closes the row of a part whose safety copy is deleted.

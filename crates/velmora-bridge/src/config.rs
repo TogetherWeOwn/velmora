@@ -130,11 +130,14 @@ pub enum GcMode {
 /// recovery record, or never will, long before the wait is over.
 ///
 /// What it assumes: the database stayed on one history for that long.
-/// A restore leaves a history that Time Travel can still return to for
-/// 30 days and that may date the drop later, or not have it. After any
-/// restore the switch is to stay off for this long: that is a rule for
-/// the operator (ops notes, "After a restore"), not one the collector
-/// enforces.
+/// A restore that is undone leaves a second history that Time Travel
+/// can still return to for 30 days, with states of before the restore
+/// point in it. So the collector waits the same time once more after
+/// every replay: no claim is granted until this long after the last
+/// one ended (`sql/gc.rs`, "After a replay"). A restore that was undone
+/// before a replay ended on it leaves nothing in the catalogue to tell
+/// by: for that one the ops notes keep the rule that the switch stays
+/// off for this long ("After a restore").
 pub const ORPHAN_GRACE_MS: i64 = 31 * 24 * 60 * 60 * 1000;
 
 /// `MAINTENANCE`.

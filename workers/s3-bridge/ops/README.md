@@ -849,8 +849,9 @@ extent goes when all of this holds in one batch of the catalogue:
    copy reads it;
 5. no part of an open upload names it. An upload in progress keeps
    every part it lists, however old it is;
-6. no replay is under way and the catalogue is not behind its rollback
-   stamp;
+6. no replay is under way, the catalogue is not behind its rollback
+   stamp, and the last replay ended 31 days ago or more ("After a
+   restore" below);
 7. no key that could still get an object made of the part has a write
    whose outcome is not known (below).
 
@@ -875,7 +876,13 @@ the key of an upload is marked, the collector leaves the parts of that
 upload. For a part that was uploaded again, and for the slices after
 the first of a part above one extent, the catalogue no longer knows
 the upload: those wait until no key of their bucket that an upload was
-ever begun on is marked. The marked keys:
+ever begun on is marked. The catalogue asks that of a bucket once a
+day at most and keeps the answer for that day (`scan_cursors`, key
+`orphans:bucket:<bucket id>`, value `clean:<time>` or `marked:<time>`
+in milliseconds). A key that is marked after a bucket was found clean
+holds nothing back that day, and need not: its record was stored then,
+from a part list that a part dropped 31 days earlier is not in. The
+marked keys:
 
 ```
 npx wrangler d1 execute <db> --remote --command \
@@ -884,7 +891,19 @@ npx wrangler d1 execute <db> --remote --command \
 
 To let the parts go, settle the key: PUT the object again, or DELETE
 the key (a delete of a marked key stores a tombstone also when the key
-has no object). The parts go with the pass after that.
+has no object). The parts of that key's upload go with the pass after
+that. The others go with the first pass after the answer about their
+bucket is a day old. What holds a bucket's parts back now:
+
+```
+npx wrangler d1 execute <db> --remote --command \
+  "SELECT k, v FROM scan_cursors WHERE k LIKE 'orphans%'"
+```
+
+`orphans:bucket:<bucket id>` = `marked:<time>` means the parts of
+unknown uploads in that bucket wait for a marked key, as found at that
+time. `orphans` is the position of the scan (`rest:<time>`: the next
+pass starts then).
 
 **Before turning it on.**
 
@@ -894,8 +913,13 @@ has no object). The parts go with the pass after that.
 
    ```
    npx wrangler d1 execute <db> --remote --command \
-     "SELECT COUNT(*) FROM extents WHERE state = 'staged' AND created_at < (SELECT CAST(strftime('%s', applied_at) AS INTEGER) * 1000 FROM d1_migrations WHERE name = '0007_key_floors.sql')"
+     "SELECT COUNT(*) FROM extents WHERE state = 'staged' AND created_at < COALESCE((SELECT CAST(strftime('%s', applied_at) AS INTEGER) * 1000 FROM d1_migrations WHERE name = '0007_key_floors.sql'), 9007199254740991)"
    ```
+
+   A database with no row for that migration in `d1_migrations` (it
+   was applied by hand, or the database was imported) counts every
+   staged extent: put the time the migration was applied in place of
+   the subquery.
 
    The Worker version that came with that migration is the first one
    that sets the mark. A version from before it may have served for a
@@ -919,18 +943,29 @@ pass reads the open `gc` rows in windows of 500, oldest first, and a
 job takes at most 100 parts; each part is one delete in `SAFETY` and
 three rows written (the extent, the usage counter, the `gc` row), plus
 one row per job for the position of the scan. After a pass over every
-due row the next one starts an hour later. The parts of a job whose
-upload is no longer known (point 7) are claimed behind one statement
-per bucket that reads every row of `uploads`, about two rows read per
-upload ever begun; it runs once per job and bucket, not once per part.
-While a marked key holds such parts back, that statement refuses them
-at that same cost in every job of every pass.
+due row the next one starts a day later. With `GC_MODE` off the rows
+of deleted and replaced objects stay open, and every pass reads them
+again: one row read for each, plus one for its extent, once a day. The
+parts whose upload is no longer known (point 7) need one statement per
+bucket that reads every row of `uploads`, about two rows read per
+upload ever begun. It runs once a day per bucket at most, whatever the
+number of parts and jobs, and also while a marked key holds such parts
+back: those are then refused for the rest of the day without another
+read of the uploads.
 
 **After a restore.** Time Travel cannot reach back past the 31 days on
 the history the database is on. It can return to a state of a history
 that an earlier restore left, for 30 days after that restore, and such
 a state may list in an open upload a part that was dropped, and since
-collected, on the history that was kept. So after every Time Travel
+collected, on the history that was kept. So the collector deletes
+nothing until 31 days after the last replay ended
+(`SELECT state, finished_at FROM restore_state`): a catalogue that was
+taken back takes no write before a replay has run to its end, and by
+then every state of a history left before it is out of reach.
+
+It cannot see a restore that was undone before the replay after it
+ended: the catalogue that is brought back holds no trace of the time
+it was away. So the rule stays as well: after every Time Travel
 restore, also one that undoes another, set `GC_ORPHANS` to off and
 leave it off for 31 days.
 
