@@ -355,57 +355,67 @@ fn body_version(job: &Job) -> u8 {
     }
 }
 
-/// How many messages of each format a consumer read, said in one log
-/// line at the isolate's first message and then at most once every
-/// [`FormatCount::EVERY_MS`]. It is the check
+/// How many deliveries of each format a consumer read, said in a log
+/// line at the isolate's first delivery, at once for a kind not yet
+/// counted, and otherwise at most once every [`FormatCount::EVERY_MS`]. It is the check
 /// line of the switch (both formats are read after step 1; no `v` 1
 /// message is left before step 3) and costs no storage.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct FormatCount {
-    plain: u64,
-    tenant: u64,
-    refused: u64,
-    /// When the last line was said; `None` before the first.
-    since: Option<crate::types::UnixMs>,
+    /// Deliveries since the last line: `v1`, `v2`, refused.
+    counts: [u64; 3],
+    /// The kinds seen since the window began.
+    seen: [bool; 3],
+    /// When the window began: the isolate's first delivery, then each
+    /// line said because a minute had passed.
+    window: Option<crate::types::UnixMs>,
+    /// When the last line was said.
+    last: Option<crate::types::UnixMs>,
 }
 
 impl FormatCount {
-    /// The shortest time between two lines.
+    /// The shortest time between two lines, but for a kind not yet seen.
     pub const EVERY_MS: i64 = 60_000;
 
-    /// Counts one admission at `now`. Returns the line to log: for the
-    /// first message an isolate reads (so that every isolate says which
-    /// formats it sees), then once [`FormatCount::EVERY_MS`] has passed
-    /// since the last line. A line counts the messages since the last
-    /// one, this one included. A malformed message is not counted: it has
-    /// no format.
+    /// Counts one delivery at `now`. Returns the line to log: for the
+    /// first delivery an isolate reads (so that every isolate says which
+    /// formats it sees), at once for a kind (`v1`, `v2`, refused) that has
+    /// not been seen in the current minute, and otherwise once
+    /// [`FormatCount::EVERY_MS`] has passed. So a kind that is delivered
+    /// at all is said within a delivery, and the absence of a kind in the
+    /// lines is its absence in the deliveries. A line counts the
+    /// deliveries since the last line, this one included; a message
+    /// handed back counts once per delivery. A malformed message is not
+    /// counted: it has no format.
     pub fn count(&mut self, admission: &Admission, now: crate::types::UnixMs) -> Option<String> {
-        match admission {
-            Admission::Run { tenant: None, .. } => self.plain += 1,
+        let kind = match admission {
+            Admission::Run { tenant: None, .. } => 0,
             Admission::Run {
                 tenant: Some(_), ..
-            } => self.tenant += 1,
-            Admission::Refused(_) => self.refused += 1,
+            } => 1,
+            Admission::Refused(_) => 2,
             Admission::Malformed => return None,
-        }
-        let over = match self.since {
-            None => 0,
-            Some(last) if now.0.saturating_sub(last.0) >= Self::EVERY_MS => {
-                now.0.saturating_sub(last.0)
-            }
-            Some(_) => return None,
         };
+        self.counts[kind] += 1;
+        let new_window = match self.window {
+            None => true,
+            Some(start) => now.0.saturating_sub(start.0) >= Self::EVERY_MS,
+        };
+        if new_window {
+            self.window = Some(now);
+            self.seen = [false; 3];
+        } else if self.seen[kind] {
+            return None;
+        }
+        self.seen[kind] = true;
+        let over = self.last.map_or(0, |last| now.0.saturating_sub(last.0));
+        let [plain, tenant, refused] = self.counts;
         let line = format!(
-            "job message formats: v1={} v2={} refused={} over {} s",
-            self.plain,
-            self.tenant,
-            self.refused,
+            "job message formats: v1={plain} v2={tenant} refused={refused} over {} s",
             over / 1000
         );
-        *self = FormatCount {
-            since: Some(now),
-            ..FormatCount::default()
-        };
+        self.counts = [0; 3];
+        self.last = Some(now);
         Some(line)
     }
 }
@@ -608,23 +618,25 @@ mod tests {
             }
         ));
         let refused = Admission::Refused(Refusal::NoTenant);
-        assert_eq!(
-            count.count(&plain, t(0)).as_deref(),
-            Some("job message formats: v1=1 v2=0 refused=0 over 0 s")
-        );
-        assert_eq!(count.count(&tenant, t(1)), None);
+        let line = |v1: u64, v2: u64, refused: u64, over: i64| {
+            Some(format!(
+                "job message formats: v1={v1} v2={v2} refused={refused} over {over} s"
+            ))
+        };
+        // The isolate's first delivery is said at once.
+        assert_eq!(count.count(&plain, t(0)), line(1, 0, 0, 0));
+        assert_eq!(count.count(&plain, t(1)), None);
+        // A kind not seen in this minute is said at once.
+        assert_eq!(count.count(&tenant, t(2)), line(1, 1, 0, 0));
+        assert_eq!(count.count(&tenant, t(3)), None);
         assert_eq!(count.count(&Admission::Malformed, t(70_000)), None);
-        assert_eq!(count.count(&refused, t(59_999)), None);
-        assert_eq!(
-            count.count(&tenant, t(60_000)).as_deref(),
-            Some("job message formats: v1=0 v2=2 refused=1 over 60 s")
-        );
-        assert_eq!(count.count(&plain, t(60_001)), None);
-        assert_eq!(count.count(&plain, t(119_999)), None);
-        assert_eq!(
-            count.count(&plain, t(120_000)).as_deref(),
-            Some("job message formats: v1=3 v2=0 refused=0 over 60 s")
-        );
+        assert_eq!(count.count(&refused, t(59_999)), line(0, 1, 1, 59));
+        // A new minute: the next delivery is said, whatever its kind.
+        assert_eq!(count.count(&refused, t(60_000)), line(0, 0, 1, 0));
+        assert_eq!(count.count(&refused, t(119_999)), None);
+        assert_eq!(count.count(&plain, t(120_000)), line(1, 0, 1, 60));
+        assert_eq!(count.count(&plain, t(179_999)), None);
+        assert_eq!(count.count(&plain, t(180_000)), line(2, 0, 0, 60));
     }
 
     #[test]
