@@ -749,9 +749,9 @@ Why these values:
   At 95 MiB rclone reaches its cutoff and goes multipart, so that row
   is six parts of 16 MiB, not twelve slices.
 
-- **Concurrency.** One UploadPart of 16 MiB takes 2.4 to 3.6 s through
-  the Worker at 4 at once: it is received whole, encrypted, then
-  stored. A small PutObject takes about 1.4 s, most of it round trips.
+- **Concurrency.** One UploadPart of 16 MiB takes 2.0 to 2.3 s through
+  the Worker at 4 at once: it is encrypted and stored while it
+  arrives. A small PutObject takes about 1.1 s, most of it round trips.
   Both gain from more requests at once. Measured on a test deployment
   from one client host, 256 MiB in 16 MiB parts and 40 PutObjects of
   1 MiB (MiB/s; three deployments for the first and last columns, two
@@ -763,14 +763,21 @@ Why these values:
   | 8 | 20.5 to 27.1 | | | 10.7, 16.4 | 4.5 to 5.3 |
   | 16 | 19.6 to 27.8 | 24.0, 28.7 | 32.1, 27.8 | 7.5 to 15.0 | 8.1 to 9.3 |
 
-  No answer was a 5xx, and no client retried.
+  No answer was a 5xx, and no client retried. The table is from
+  before uploads were stored while they arrive. With that, the S3 test
+  client measured on one deployment (three runs each; the other
+  columns were not measured again): 24.2 to 29.2 MiB/s at 4 at once
+  (1 GiB, five runs), 30.5 to 39.4 at 8, 39.0 to 43.3 at 16, and 3.3
+  to 3.7 and 10.2 to 11.3 MiB/s for the 1 MiB PutObjects at 4 and 16.
   - Big parts gain less than small files: the parts in one Worker
-    isolate share its CPU and its in-flight byte budget, so one part
-    takes about 5.3 s at 16 at once. A 16 MiB part counts 32 MiB
-    (plaintext and ciphertext) against an isolate's 48 MiB
-    `INFLIGHT_BUDGET_BYTES`, so one isolate stores one such part at a
-    time; another waits up to 20 s for budget, then gets 503
-    `SlowDown`, which clients retry. None was refused in these runs.
+    isolate share its CPU, so one part takes about 4.3 s at 16 at
+    once. An upload of at most one extent holds a window of a few
+    chunks and counts 512 KiB against an isolate's 48 MiB
+    `INFLIGHT_BUDGET_BYTES` whatever its length, so the budget does
+    not hold such parts back. A slice of a longer upload, a copied
+    part and a download count what they hold; one that finds no
+    budget waits up to 20 s, then gets 503 `SlowDown`, which clients
+    retry. None was refused in these runs.
   - rclone sends all its requests to one host over a single HTTP/2
     connection, and that one connection carries 7 to 16 MiB/s at any
     concurrency. `--disable-http2` gives each request its own
