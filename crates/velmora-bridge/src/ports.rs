@@ -1127,15 +1127,17 @@ pub trait Catalog {
     /// orphaned upload part, no replay or rollback is being handled,
     /// and none ended after `cutoff`. One answer per row, in order;
     /// `false`: nothing was written for it and its blob must stay.
-    /// The second value is the error that ended the claims early: the
-    /// answers before it stand, and the blobs they grant must go.
+    /// The second value is the first error that left rows undecided
+    /// (answered `false`): every answer stands all the same, and the
+    /// blobs they grant must go.
     async fn gc_orphan_claim(
         &self,
         rows: &[GcRow],
         now: UnixMs,
         cutoff: UnixMs,
     ) -> (Vec<bool>, Result<()>);
-    /// Closes the row after the blob delete that a claim allowed.
+    /// Closes the row after the blob delete that a claim allowed. A row
+    /// whose extent the catalogue does not say is deleted stays open.
     async fn gc_orphan_done(&self, id: i64, now: UnixMs) -> Result<()>;
 
     // recovery replay (DESIGN §A.8); every call is idempotent

@@ -1674,15 +1674,18 @@ impl Sql for FailsABatch<'_> {
     }
 }
 
-/// The rows of a window are claimed in more than one batch. When a
-/// later one fails, the claims that went through are answered as
-/// granted, with the error: the catalogue says those copies are gone,
-/// so they must go now and not wait for a pass that finds them again.
+/// The rows of a window are claimed in more than one batch. When one
+/// fails, the claims of the others, before it and after it, are still
+/// decided and answered as granted, with the error: the catalogue says
+/// those copies are gone, so they must go now and not wait for a pass
+/// that finds them again; and a group whose batch fails does not hold
+/// up the groups after it.
 #[tokio::test(flavor = "current_thread")]
 async fn a_claim_that_an_error_cuts_short_keeps_what_it_granted() {
-    // The batch that fails: the one that asks about the bucket, then
-    // the one that claims behind the answer.
-    for pass in [1, 2] {
+    // The batch that fails: the one of the known uploads (the first),
+    // the one that asks about the bucket, then the one that claims
+    // behind the answer. The rows: of an unknown upload, of a known.
+    for (pass, expect) in [(0, [true, false]), (1, [false, true]), (2, [false, true])] {
         let t = setup().await;
         // A part of a known upload, and one of an unknown.
         let before = t.blobs();
@@ -1702,15 +1705,44 @@ async fn a_claim_that_an_error_cuts_short_keeps_what_it_granted() {
         let (granted, claimed) = catalog.gc_orphan_claim(&rows, now, cutoff).await;
         assert!(matches!(claimed, Err(BridgeError::Sql(_))), "{claimed:?}");
         assert!(catalog.sql.pass.get().is_none());
-        assert_eq!(granted, [false, true], "batch {pass}");
+        assert_eq!(granted, expect, "batch {pass}");
         assert_eq!(
             t.count("SELECT COUNT(*) FROM extents WHERE safety_state = 'deleted'"),
             1
         );
-        // The row that was not reached goes with a later claim.
+        // The row that was not decided goes with a later claim.
         assert_eq!(t.collect_all(&rows, cutoff).await, [true, true]);
     }
 }
+
+/// A bucket that cannot be asked about does not hold up the next one:
+/// whichever of two comes first, the parts of the other are decided.
+#[tokio::test(flavor = "current_thread")]
+async fn a_bucket_whose_batch_fails_does_not_hold_up_the_next() {
+    for down in [BUCKET, "other"] {
+        let t = setup().await;
+        let other = t.rig.bucket("other", false).await;
+        t.rig.grant(AKID, &other, Perm::Rw).await;
+        let mut blobs = Vec::new();
+        for bucket in [BUCKET, "other"] {
+            t.bucket.set(bucket);
+            blobs.push(replaced_part(&t, "k", 1).await);
+        }
+        t.advance(ORPHAN_GRACE_MS);
+        let (now, cutoff) = (t.now(), t.cutoff());
+        let rows = [row_of(&t, &blobs[0]), row_of(&t, &blobs[1])];
+        t.sql(&format!(
+            "CREATE TRIGGER down BEFORE INSERT ON scan_cursors \
+             WHEN NEW.k = 'orphans:bucket:' || (SELECT id FROM buckets WHERE name = '{down}') \
+             BEGIN SELECT RAISE(ABORT, 'database down'); END;"
+        ));
+        let (granted, claimed) = t.catalog().gc_orphan_claim(&rows, now, cutoff).await;
+        assert!(matches!(claimed, Err(BridgeError::Sql(_))), "{claimed:?}");
+        assert_eq!(granted, [down != BUCKET, down == BUCKET], "{down}");
+        assert_eq!(t.verdicts(), [format!("clean:{}", now.0)]);
+    }
+}
+
 /// The same through the job. It deletes the copies that its claim was
 /// granted, closes their rows, and asks to run again.
 #[tokio::test(flavor = "current_thread")]
@@ -1761,6 +1793,50 @@ async fn a_job_whose_claim_an_error_cuts_short_deletes_what_was_granted() {
     let mut left = kept.clone();
     assert!(left.remove(&unknown));
     assert_eq!(t.blobs(), left);
+}
+
+/// A row is closed only where the catalogue says the copy is gone. A
+/// database taken back, between the claim of a job and its last step,
+/// to before that claim says `held`: the row stays open there, and the
+/// next claim sets the state and the usage right and closes it.
+#[tokio::test(flavor = "current_thread")]
+async fn a_row_is_closed_only_where_the_catalogue_says_the_copy_is_gone() {
+    let t = setup().await;
+    let blob = replaced_part(&t, "a", 1).await;
+    t.advance(ORPHAN_GRACE_MS);
+    let row = row_of(&t, &blob);
+    let (now, cutoff) = (t.now(), t.cutoff());
+    let state = || {
+        t.catalog().sql.with_conn(|c| {
+            c.query_row(
+                "SELECT e.safety_state, g.done_at IS NULL FROM gc g \
+                   JOIN extents e ON e.id = g.extent_id WHERE g.id = ?1",
+                [row.id],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, bool>(1)?)),
+            )
+            .unwrap()
+        })
+    };
+    let usage = || t.count("SELECT unreleased_bytes FROM usage_global WHERE id = 1");
+    let pinned = usage();
+    t.bookmark("before");
+
+    let rows = std::slice::from_ref(&row);
+    assert_eq!(claim_rows(t.catalog(), rows, now, cutoff).await, [true]);
+    assert_eq!(state(), ("deleted".to_string(), true));
+    let after = usage();
+    assert!(after < pinned, "{after} {pinned}");
+    t.time_travel("before");
+    let safety = &t.rig.bridge.safety;
+    safety.delete(&row.extent_id.safety_key()).await.unwrap();
+    t.catalog().gc_orphan_done(row.id, now).await.unwrap();
+    assert!(!t.blobs().contains(&blob));
+    assert_eq!(state(), ("held".to_string(), true));
+    assert_eq!(usage(), pinned);
+
+    assert!(t.collect(&row, cutoff).await);
+    assert_eq!(state(), ("deleted".to_string(), false));
+    assert_eq!(usage(), after);
 }
 
 #[tokio::test(flavor = "current_thread")]
