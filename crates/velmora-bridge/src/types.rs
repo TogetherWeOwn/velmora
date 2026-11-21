@@ -1411,6 +1411,11 @@ pub enum Job {
         pass: UnixMs,
         cursor: String,
     },
+    /// One run of the scrub (`crate::scrub`): the run takes the scrub's
+    /// lease, so a duplicate does nothing.
+    Scrub {
+        v: u8,
+    },
 }
 
 impl Job {
@@ -1493,6 +1498,125 @@ pub struct DispatchReport {
     pub recount_drift: Option<u64>,
     /// The recount step failed; the rest of the run went on without it.
     pub recount_failed: bool,
+    /// A scrub run was sent (`SCRUB=on` and no run holds the lease).
+    pub scrub_enqueued: bool,
+    /// The scrub check failed; the rest of the run went on without it.
+    pub scrub_failed: bool,
+}
+
+/// What the scrub found when it last checked an extent
+/// (`extents.scrub_result`, [`crate::scrub`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScrubResult {
+    /// Every article was read intact, and every backbone that counts
+    /// toward a release said it holds every article.
+    Ok,
+    /// A loss was seen for the first time: checked again after
+    /// `SCRUB_CONFIRM_SECS`, and repaired only if it is still there.
+    Suspect,
+    /// The loss was confirmed and the extent re-pinned: its safety copy
+    /// is back, and the verify stage posts what a backbone lacks.
+    Repairing,
+    /// Still re-pinned when the repair should have ended.
+    Stalled,
+    /// The loss was confirmed and no copy anywhere is intact.
+    Unrecoverable,
+}
+
+impl ScrubResult {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ScrubResult::Ok => "ok",
+            ScrubResult::Suspect => "suspect",
+            ScrubResult::Repairing => "repairing",
+            ScrubResult::Stalled => "stalled",
+            ScrubResult::Unrecoverable => "unrecoverable",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<ScrubResult> {
+        Some(match s {
+            "ok" => ScrubResult::Ok,
+            "suspect" => ScrubResult::Suspect,
+            "repairing" => ScrubResult::Repairing,
+            "stalled" => ScrubResult::Stalled,
+            "unrecoverable" => ScrubResult::Unrecoverable,
+            _ => return None,
+        })
+    }
+}
+
+/// An extent the scrub is due to check, with what it found last time.
+#[derive(Clone, Debug)]
+pub struct ScrubCandidate {
+    pub extent: ExtentRow,
+    /// `None` = never checked, or a value this version does not know.
+    pub last: Option<ScrubResult>,
+    pub last_scrubbed_at: Option<UnixMs>,
+}
+
+/// The totals of one scrub run, added to `scrub_state` when it ends.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct ScrubRun {
+    pub checked: u32,
+    pub ok: u32,
+    pub suspect: u32,
+    /// Re-pinned in this run.
+    pub repaired: u32,
+    pub unrecoverable: u32,
+    pub stalled: u32,
+    /// The breaker tripped in this run: the label of the backbone and
+    /// the extents that lacked articles there among those checked.
+    pub incident: Option<String>,
+    /// Ciphertext bytes read from Usenet.
+    pub bytes_read: u64,
+    /// Articles a provider did not serve intact that another one did,
+    /// where no backbone said it lacks them: a copy that answers `STAT`
+    /// and serves other bytes, or a read that broke off.
+    pub refetched: u32,
+    /// Why the run ended.
+    pub ended: ScrubEnd,
+}
+
+/// Why a scrub run ended.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScrubEnd {
+    /// Nothing more was due.
+    #[default]
+    Idle,
+    /// `SCRUB_EXTENTS_PER_RUN` extents were checked.
+    Quota,
+    /// `SCRUB_RUN_SECS` were up.
+    Time,
+    /// A provider had no free slot: the rest waits for the next run.
+    Busy,
+    /// The breaker tripped.
+    Incident,
+    /// The lease was lost (a later run took it) or the catalogue failed.
+    Stopped,
+}
+
+/// The scrub's totals and lease (`scrub_state`).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct ScrubState {
+    /// Moves on with every take of the lease.
+    pub lease_token: u64,
+    pub lease_until: Option<UnixMs>,
+    pub runs: u64,
+    pub checked: u64,
+    pub ok: u64,
+    pub suspect: u64,
+    pub repaired: u64,
+    pub unrecoverable: u64,
+    pub stalled: u64,
+    pub incidents: u64,
+    pub bytes_read: u64,
+    pub last_run_at: Option<UnixMs>,
+    pub last_unrecoverable_at: Option<UnixMs>,
+    pub last_incident_at: Option<UnixMs>,
+    pub last_incident: Option<String>,
 }
 
 /// The oldest message that waits in the queues of one kind, as far as

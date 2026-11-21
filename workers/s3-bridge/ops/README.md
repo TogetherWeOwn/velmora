@@ -1581,6 +1581,33 @@ range from Usenet at 1.3 MiB/s, and one such GET lost its provider
 connection in the second sub-range and broke after 1,152 MiB; a
 connection lost now is opened again.
 
+## Scrub
+
+The scrub reads released extents back from Usenet alone and repairs what it finds lost (`src/scrub.rs` in the bridge crate, migration 0023). Off by default (`SCRUB`; the settings are listed in `wrangler.toml`).
+
+**Turning it on.** Set `SCRUB = "on"` in a deploy of its own, after the deploy that applied migration 0023. Nothing else changes: the first check of an extent is due 30 days after its last verification, so a catalogue of recently verified extents starts slowly. A rollback to a Worker from before the switch is safe: that Worker drops the scrub's queue messages as unknown, never reads the new columns, and a re-pinned extent is to it an extent held in verify, which it verifies and releases as any other.
+
+**What it costs.** About 38 ms of CPU per MiB read (cold read, measured) and 2 rows written per extent checked (the result and its index entry). Nothing else for a healthy extent: no R2 operation, no `verifications` row. A repair adds one R2 write of the extent and the verify and release rows of the stage it goes through.
+
+**Watching it.** One row:
+
+```sql
+SELECT runs, checked, ok, suspect, repaired, unrecoverable, stalled, incidents, bytes_read,
+       last_run_at, last_unrecoverable_at, last_incident_at, last_incident, lease_until
+  FROM scrub_state;
+```
+
+Each run logs one `scrub: checked=... ended=...` line beside the cold-read lines. `ended=busy` means a provider had no free slot (an operator drill holds the drill connections, or verify holds the background slots): the run stops and the next one goes on.
+
+**Alert lines** (`alert:` in the Worker logs; no key, bucket, message-id or host):
+
+| Line | Meaning | What to do |
+|---|---|---|
+| `scrub-repair <extent> source=<usenet\|parity\|cache\|safety> lacking=[<backbones>]` | A loss seen twice; the extent is held again and its outbox row is in verify. | Nothing: verify posts what a backbone lacks and the release follows. |
+| `scrub-incident <backbone> <lost>/<checked>` | More than 12 % (and at least 8) of a run's extents lack articles on one backbone. No loss there is repaired until a run checks enough extents without tripping again. | Look at the provider: an outage, a purge, throttling that answers 430. `last_incident` names the backbone until it clears. |
+| `scrub-stalled <extent> ...` | A re-pinned extent is still held when its repair should have ended (minimum age + every verify wait + one confirm interval). Its safety copy is made sure of. | Look at the extent's outbox row: no provider that posts to the backbone that lacks the article, or a backbone that refuses the stored message-id. The copy stays pinned in R2 meanwhile. |
+| `scrub-unrecoverable <extent> ...` | Lost on every backbone, and neither cache nor safety copy is intact. Checked again every `SCRUB_CONFIRM_SECS`. | The object's bytes in this extent cannot be read. Restore from another copy if one exists outside velmora. |
+
 ## Usage counters and metrics
 
 The catalogue keeps running totals so that the status and dashboard

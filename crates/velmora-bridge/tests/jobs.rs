@@ -295,6 +295,7 @@ impl Fx {
             catalogue_id: "main".to_string(),
             dev_trust_http: false,
             verify: Default::default(),
+            scrub: Default::default(),
             providers,
             admin_token: Secret::new("admin-token-fixture-admin-token-fixture".to_string()),
         };
@@ -1250,6 +1251,8 @@ async fn dispatch_does_no_blob_or_nntp_io() {
             recount_rows: 0,
             recount_drift: None,
             recount_failed: false,
+            scrub_enqueued: false,
+            scrub_failed: false,
         }
     );
     let sent: Vec<Job> = fx.bridge.jobs.take().into_iter().map(|s| s.job).collect();

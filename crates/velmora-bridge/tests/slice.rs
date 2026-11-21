@@ -3573,8 +3573,10 @@ async fn rows_written_per_extent() {
     // 48, not 46, while `extents_safety` and the two indexes it replaces
     // exist side by side: its entry at the upload and at the start of
     // the release. The drops give both back and three more.
+    // 49 with the scrub's due index (migration 0023): a released extent
+    // has an entry there, written once by the release.
     assert!(
-        uncounted.0 <= 48,
+        uncounted.0 <= 49,
         "rows written per packed extent: {}",
         uncounted.0
     );
@@ -3616,8 +3618,9 @@ async fn rows_written_per_extent() {
 #[tokio::test(flavor = "current_thread")]
 async fn rows_written_per_extent_after_the_index_drops() {
     let packed = rows_written("on", false, true).await;
+    // 44 with the scrub's due index entry of a released extent.
     assert!(
-        packed.0 <= 43,
+        packed.0 <= 44,
         "rows written per packed extent: {}",
         packed.0
     );

@@ -1219,6 +1219,13 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ColdReader<'a, C, N, T> {
         Some(u32::try_from(left.clamp(0, life)).unwrap_or(0))
     }
 
+    /// The permit holder of every slot the reader takes. A caller that
+    /// opens sessions of its own in the same invocation passes it, so a
+    /// provider with `max_ips` counts the invocation once.
+    pub(crate) fn holder(&self) -> &str {
+        &self.holder
+    }
+
     /// What the reader did so far.
     pub(crate) fn stats(&self) -> ColdStats {
         self.stats.borrow().clone()

@@ -1950,6 +1950,7 @@ pub async fn rig(specs: &[Spec]) -> Rig {
         catalogue_id: "main".to_string(),
         dev_trust_http: false,
         verify: Default::default(),
+        scrub: Default::default(),
         providers,
         admin_token: Secret::new("admin-token-fixture-admin-token-fixture".to_string()),
         admin_read_token: None,

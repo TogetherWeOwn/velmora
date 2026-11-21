@@ -30,6 +30,7 @@ pub mod probe;
 pub mod recovery;
 pub mod remote;
 pub mod replay;
+pub mod scrub;
 pub mod service;
 pub mod sql;
 pub mod stamp;

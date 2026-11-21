@@ -28,8 +28,8 @@ use crate::types::{
     VerifyEscalation, WriteId,
 };
 use crate::types::{
-    BridgeError, BucketUsage, ByteStream, RecountState, RecountStep, UsageCounters, UsageRecount,
-    UsageSnapshot,
+    BridgeError, BucketUsage, ByteStream, RecountState, RecountStep, ScrubCandidate, ScrubResult,
+    ScrubRun, ScrubState, UsageCounters, UsageRecount, UsageSnapshot,
 };
 
 // ---------------------------------------------------------------------------
@@ -1456,6 +1456,58 @@ pub trait Catalog {
     async fn usage_recounts(&self) -> Result<(RecountState, Option<UsageRecount>)>;
     /// Switches the counters off: their triggers write nothing again.
     async fn usage_off(&self) -> Result<()>;
+
+    // scrub (`crate::scrub`); a catalogue without it has none
+    /// Takes the scrub's lease until `until` if no run holds it at `now`.
+    /// `Some(token)`: the token that fences this run's writes.
+    async fn scrub_take(&self, _now: UnixMs, _until: UnixMs) -> Result<Option<u64>> {
+        Err(BridgeError::Invalid("this catalogue has no scrub"))
+    }
+    /// The scrub's lease and running totals.
+    async fn scrub_state(&self) -> Result<ScrubState> {
+        Err(BridgeError::Invalid("this catalogue has no scrub"))
+    }
+    /// Up to `limit` extents due for a check at `now`, the one due
+    /// longest first. Released extents, and those the scrub has put a
+    /// due time on (a re-pinned one is held).
+    async fn scrub_due(&self, _now: UnixMs, _limit: u32) -> Result<Vec<ScrubCandidate>> {
+        Err(BridgeError::Invalid("this catalogue has no scrub"))
+    }
+    /// Records a check of a released or held extent, if the run of
+    /// `token` still holds the lease. `false`: nothing was written.
+    async fn scrub_record(
+        &self,
+        _token: u64,
+        _extent: &ExtentId,
+        _result: ScrubResult,
+        _now: UnixMs,
+        _next_at: UnixMs,
+    ) -> Result<bool> {
+        Err(BridgeError::Invalid("this catalogue has no scrub"))
+    }
+    /// Takes an extent the scrub cannot check off its due list.
+    async fn scrub_drop(&self, _token: u64, _extent: &ExtentId) -> Result<bool> {
+        Err(BridgeError::Invalid("this catalogue has no scrub"))
+    }
+    /// Re-pins a released extent in one guarded batch: `held` again, its
+    /// outbox row from `done` back to `verify` (due at `now`), the result
+    /// `repairing`, due again at `next_at`. Only if the run of `token`
+    /// holds the lease, the extent is released, its posting is done and
+    /// a live generation references it; `false`: nothing was written.
+    async fn scrub_repin(
+        &self,
+        _token: u64,
+        _extent: &ExtentId,
+        _now: UnixMs,
+        _next_at: UnixMs,
+    ) -> Result<bool> {
+        Err(BridgeError::Invalid("this catalogue has no scrub"))
+    }
+    /// Adds a run's totals and frees the lease, if the run of `token`
+    /// still holds it.
+    async fn scrub_end(&self, _token: u64, _run: &ScrubRun, _now: UnixMs) -> Result<bool> {
+        Err(BridgeError::Invalid("this catalogue has no scrub"))
+    }
 
     // hot tier
     /// Pinned and evictable byte totals (`GET /_admin/status`).
