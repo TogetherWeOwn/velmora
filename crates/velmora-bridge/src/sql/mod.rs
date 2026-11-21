@@ -90,8 +90,8 @@ use std::rc::Rc;
 use crate::gate::PermitGate;
 use crate::plan::{PackReport, StoredPlan};
 use crate::ports::{
-    Catalog, GrantPut, Guard, KeyHead, Lease, Permit, PermitClass, PublishOutcome, Sql, SqlValue,
-    UploadTarget,
+    Catalog, GrantPut, Guard, KeyHead, Lease, Permit, PermitClass, PublishOutcome, SlotWait, Sql,
+    SqlValue, UploadTarget,
 };
 use crate::recovery::Recorded;
 use crate::replay::{ReplayExtent, ReplayMark, ReplayProbe, ReplayPublish, RestoreProgress};
@@ -852,6 +852,18 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
         match self.gate_of(p.class) {
             Some(gate) => gate.release(p).await,
             None => permits::release_permit(self, p).await,
+        }
+    }
+    async fn await_permit(
+        &self,
+        providers: &[&ProviderConfig],
+        holder: &str,
+        ms: i64,
+        sleep: &crate::ingress::Sleeper,
+    ) -> Result<SlotWait> {
+        match self.gate_of(PermitClass::Background) {
+            Some(gate) => gate.wait(providers, holder, ms, sleep).await,
+            None => Ok(SlotWait::Unsupported),
         }
     }
     fn forget_permit(&self, p: &Permit) {

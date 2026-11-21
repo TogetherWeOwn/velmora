@@ -177,13 +177,51 @@ impl PermitGate {
         }
     }
 
-    /// The end of a session's socket, however it came.
+    /// The end of a session's socket, however it came. What it held
+    /// goes to the line.
     async fn ended(&self, ws: &WebSocket) {
         let Some(session) = attached(ws) else {
             return;
         };
         if let Ok(gate) = self.ready(Some(session.id)).await {
             gate.close(session.id);
+            gate.settle(WorkerClock.now()).await;
+            self.deliver(gate).await;
+        }
+    }
+
+    /// Sends the sessions that waited in the line the slots they were
+    /// handed, each kept with its socket first. A session that cannot
+    /// be sent to has ended: its slot goes to the next in the line.
+    async fn deliver(&self, gate: &Gate<D1Sql, DoStore>) {
+        loop {
+            let pushes = gate.pushes();
+            if pushes.is_empty() {
+                return;
+            }
+            let sockets = self.state.get_websockets();
+            let mut lost = false;
+            for (id, reply) in pushes {
+                let ws = sockets
+                    .iter()
+                    .find(|ws| attached(ws).is_some_and(|s| s.id == id));
+                let sent = ws.is_some_and(|ws| {
+                    attach(ws, &gate.session(id, WorkerClock.now()))
+                        && serde_json::to_string(&reply)
+                            .is_ok_and(|raw| ws.send_with_str(&raw).is_ok())
+                });
+                if !sent {
+                    gate.close(id);
+                    if let Some(ws) = ws {
+                        let _ = ws.close(Some(1011), Some("gate: session not kept"));
+                    }
+                    lost = true;
+                }
+            }
+            if !lost {
+                return;
+            }
+            gate.settle(WorkerClock.now()).await;
         }
     }
 }
@@ -228,7 +266,9 @@ impl DurableObject for PermitGate {
         let refused = |e: BridgeError| Response::error(format!("gate: {e}"), 500);
         let now = WorkerClock.now();
         if !upgrade {
-            return match gate.handle(None, request, now).await {
+            let reply = gate.handle(None, request, now).await;
+            self.deliver(gate).await;
+            return match reply {
                 Ok(reply) => match serde_json::to_string(&reply) {
                     Ok(raw) => Response::ok(raw),
                     Err(_) => Response::error("gate: reply encode failed", 500),
@@ -244,6 +284,8 @@ impl DurableObject for PermitGate {
             Ok(reply) => reply,
             Err(e) => {
                 gate.close(id);
+                gate.settle(WorkerClock.now()).await;
+                self.deliver(gate).await;
                 return refused(e);
             }
         };
@@ -263,12 +305,15 @@ impl DurableObject for PermitGate {
             }
             Response::from_websocket(pair.client).ok()
         })();
+        if accepted.is_none() {
+            gate.close(id);
+            gate.settle(WorkerClock.now()).await;
+        }
+        // What this request freed for the line, or found run out.
+        self.deliver(gate).await;
         match accepted {
             Some(response) => Ok(response),
-            None => {
-                gate.close(id);
-                Response::error("gate: session not opened", 500)
-            }
+            None => Response::error("gate: session not opened", 500),
         }
     }
 
@@ -315,7 +360,9 @@ impl DurableObject for PermitGate {
         if !sent {
             gate.close(session.id);
             end(1011, "gate: session not kept");
+            gate.settle(WorkerClock.now()).await;
         }
+        self.deliver(gate).await;
         Ok(())
     }
 
@@ -465,6 +512,10 @@ impl DoSession {
 }
 
 impl GateSession for DoSession {
+    async fn pushed(&self, id: u64) -> Result<GateReply> {
+        self.reply(id).await
+    }
+
     async fn call(&self, request: GateRequest) -> Result<GateReply> {
         if self.closed.get() || self.inbox.borrow().closed {
             return Err(failed("session ended"));

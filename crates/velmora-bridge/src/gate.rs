@@ -106,11 +106,12 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 
-use futures_util::future::{join_all, LocalBoxFuture};
+use futures_util::future::{join_all, select, select_all, Either, LocalBoxFuture};
 use futures_util::lock::Mutex as AsyncMutex;
 use serde::{Deserialize, Serialize};
 
-use crate::ports::{Permit, PermitClass, Sql, SqlValue, PERMIT_SECS, READ_PERMIT_SECS};
+use crate::ingress::Sleeper;
+use crate::ports::{Permit, PermitClass, SlotWait, Sql, SqlValue, PERMIT_SECS, READ_PERMIT_SECS};
 use crate::types::{BridgeError, ProviderConfig, Result, UnixMs};
 
 /// Prefix of the holder a gate writes on the slot rows it seizes.
@@ -360,6 +361,16 @@ pub enum GateOp {
     Release {
         permits: Vec<GatePermit>,
     },
+    /// One job slot for `holder` on the first of `wants` that has one.
+    /// With none, the session waits in the gate's line for up to `ms`:
+    /// the reply says so ([`GateReply::waiting`]), and the slot is sent
+    /// on the session when it is this session's turn, as a second reply
+    /// under the same id. Asked on a session that holds nothing.
+    Wait {
+        wants: Vec<GateWant>,
+        holder: String,
+        ms: i64,
+    },
     /// What is held, per provider.
     Load,
     /// The gate is in charge of `providers`: seize what is free.
@@ -369,6 +380,14 @@ pub enum GateOp {
     /// The catalogue is in charge again: hand out nothing more and free
     /// the seized rows once nothing is held.
     Retire,
+}
+
+/// An account a waiting job can use, with the other accounts of its
+/// pool: what [`GateOp::Acquire`] names.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GateWant {
+    pub provider: GateProvider,
+    pub peers: Vec<GateProvider>,
 }
 
 /// The answer to the [`GateOp`] at the same place of the request.
@@ -418,6 +437,17 @@ pub struct GateReply {
     /// held on it has changed: the caller may ask again.
     #[serde(default)]
     pub failed: bool,
+    /// The session is in the gate's line ([`GateOp::Wait`]): a reply
+    /// with its slot follows under the id of the request that asked.
+    #[serde(default)]
+    pub waiting: bool,
+    /// With `waiting`: in how many milliseconds a slot can next run out
+    /// with no word to the gate (a holder that stopped renewing, the
+    /// wait after a restart). The caller asks again then, with a
+    /// request of no questions; a gate that has left memory wakes for
+    /// nothing else.
+    #[serde(default)]
+    pub wake: Option<i64>,
 }
 
 impl GateReply {
@@ -429,6 +459,8 @@ impl GateReply {
             load: Vec::new(),
             unowned: false,
             failed: true,
+            waiting: false,
+            wake: None,
         }
     }
 }
@@ -472,6 +504,21 @@ impl Held {
     }
 }
 
+/// A session in the line of a gate: a job that found no slot and waits
+/// for one on its open session.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Waiter {
+    /// The request that asked: its slot is sent under this id.
+    id: u64,
+    holder: String,
+    wants: Vec<GateWant>,
+    /// Its place in the line: a number of this gate, as a token is.
+    /// The lower one came first.
+    place: u64,
+    /// Until when its caller waits.
+    until: i64,
+}
+
 /// A session and the slots taken on it: what the host keeps with the
 /// session's connection, so that the slots outlive the object's memory
 /// for as long as the connection does.
@@ -481,13 +528,38 @@ pub struct SessionState {
     /// When the session last asked.
     pub seen: i64,
     pub held: Vec<Held>,
+    /// What it waits for in the gate's line, if it does: the line
+    /// outlives the object's memory as the slots do.
+    #[serde(default)]
+    pub wait: Option<Waiter>,
 }
 
 impl SessionState {
-    /// Whether the host should close the session: nothing live on it
-    /// and no question for [`SESSION_IDLE_MS`].
+    /// Whether the host should close the session: nothing live on it,
+    /// and for [`SESSION_IDLE_MS`] no question and no wait in the line
+    /// that its caller still sits out. A caller that waits is silent
+    /// by design, and ends its session itself when its time is over:
+    /// it is given that long to do so.
     pub fn stale(&self, now: UnixMs) -> bool {
-        self.held.iter().all(|h| h.until < now.0) && now.0 - self.seen >= SESSION_IDLE_MS
+        let quiet = self
+            .wait
+            .as_ref()
+            .map_or(self.seen, |w| w.until.max(self.seen));
+        let idle = now.0 - quiet >= SESSION_IDLE_MS;
+        idle && self.held.iter().all(|h| h.until < now.0)
+    }
+
+    /// Whether the host can keep this with the session's connection.
+    /// The host's limit is on the stored form, which may take two bytes
+    /// for each unit of a text that is not all ASCII.
+    fn fits(&self) -> bool {
+        serde_json::to_string(self).is_ok_and(|s| {
+            let stored = match s.is_ascii() {
+                true => s.len(),
+                false => 2 * s.encode_utf16().count(),
+            };
+            stored <= SESSION_STATE_MAX
+        })
     }
 }
 
@@ -507,6 +579,8 @@ pub enum Warm {
 #[derive(Debug)]
 pub struct Core {
     held: Vec<Held>,
+    /// The sessions that wait for a job slot, each with its session.
+    line: Vec<(u64, Waiter)>,
     next_token: u64,
     uses: BTreeMap<String, u64>,
 }
@@ -526,10 +600,17 @@ impl Core {
             .iter()
             .flat_map(|s| s.held.iter().filter(|h| h.session == s.id).cloned())
             .collect();
+        let line: Vec<(u64, Waiter)> = sessions
+            .iter()
+            .filter_map(|s| s.wait.clone().map(|w| (s.id, w)))
+            .collect();
         let from_time = u64::try_from(started.0).unwrap_or(0) << 20;
-        let seen = ids.chain(held.iter().map(|h| h.token)).max().unwrap_or(0);
+        let numbers = held.iter().map(|h| h.token);
+        let numbers = numbers.chain(line.iter().map(|(_, w)| w.place));
+        let seen = ids.chain(numbers).max().unwrap_or(0);
         Core {
             held,
+            line,
             next_token: from_time.max(seen),
             uses: BTreeMap::new(),
         }
@@ -548,9 +629,57 @@ impl Core {
         mine.cloned().collect()
     }
 
-    /// Frees every slot taken on `session`.
+    /// Frees every slot taken on `session`, and its place in the line.
     pub fn close(&mut self, session: u64) {
         self.held.retain(|h| h.session != session);
+        self.line.retain(|(s, _)| *s != session);
+    }
+
+    /// Puts `session` in the line for a job slot on one of `wants`,
+    /// behind every session that waits already. One that waits already
+    /// keeps its place and waits for what it asks now. `id`: the
+    /// request that asks.
+    pub fn enlist(&mut self, session: u64, id: u64, holder: &str, wants: &[GateWant], until: i64) {
+        let place = match self.unlist(session) {
+            Some(before) => before.place,
+            None => self.next(),
+        };
+        let waiter = Waiter {
+            id,
+            holder: holder.to_string(),
+            wants: wants.to_vec(),
+            place,
+            until,
+        };
+        self.line.push((session, waiter));
+    }
+
+    /// Takes `session` out of the line.
+    pub fn unlist(&mut self, session: u64) -> Option<Waiter> {
+        let at = self.line.iter().position(|(s, _)| *s == session)?;
+        Some(self.line.swap_remove(at).1)
+    }
+
+    /// What `session` waits for, if it is in the line.
+    pub fn waiter(&self, session: u64) -> Option<&Waiter> {
+        let mut line = self.line.iter();
+        line.find(|(s, _)| *s == session).map(|(_, w)| w)
+    }
+
+    /// The line at `now`, first come first. A session whose caller has
+    /// stopped waiting is out of it.
+    pub fn line(&mut self, now: i64) -> Vec<(u64, Waiter)> {
+        self.line.retain(|(_, w)| w.until >= now);
+        let mut line = self.line.clone();
+        line.sort_by_key(|(_, w)| w.place);
+        line
+    }
+
+    /// When the first slot that is live at `now` runs out if it is
+    /// not renewed.
+    fn next_expiry(&self, now: i64) -> Option<i64> {
+        let live = self.held.iter().filter(|h| h.until >= now);
+        live.map(|h| h.until + 1).min()
     }
 
     fn prune(&mut self, now: i64) {
@@ -788,6 +917,9 @@ struct Inner {
     /// The record as the last finished save left it.
     saved: GateRecord,
     seize_tried: BTreeMap<String, i64>,
+    /// Replies to sessions that waited in the line, for the host to
+    /// send: each with its session.
+    pushes: Vec<(u64, GateReply)>,
 }
 
 /// One gate: [`Core`] plus what makes a restart and a rollout safe.
@@ -804,6 +936,9 @@ pub struct Gate<S: Sql, D: GateStore> {
     /// One change of who owns slot rows at a time: a seizure and the
     /// freeing of a retirement never overlap.
     owning: AsyncMutex<()>,
+    /// One pass over the line at a time: an event that comes during a
+    /// pass has one of its own after it.
+    serving: AsyncMutex<()>,
 }
 
 const SEED: &str = "INSERT OR IGNORE INTO provider_permits(provider_id, slot) \
@@ -869,6 +1004,7 @@ impl<S: Sql, D: GateStore> Gate<S, D> {
             sql,
             store,
             boot: boot.into(),
+            serving: AsyncMutex::new(()),
             inner: RefCell::new(None),
             saving: AsyncMutex::new(()),
             owning: AsyncMutex::new(()),
@@ -938,6 +1074,7 @@ impl<S: Sql, D: GateStore> Gate<S, D> {
                 saved,
                 record,
                 seize_tried: BTreeMap::new(),
+                pushes: Vec::new(),
             });
         }
         // Before anything is promised under the new code.
@@ -958,20 +1095,113 @@ impl<S: Sql, D: GateStore> Gate<S, D> {
             true => self.with(|i| i.core.of_session(id, now.0)),
             false => Vec::new(),
         };
+        let wait = match self.started() {
+            true => self.with(|i| i.core.waiter(id).cloned()),
+            false => None,
+        };
         SessionState {
             id,
             seen: now.0,
             held,
+            wait,
         }
     }
 
     /// The session's connection has ended: its slots are free. The
     /// holder's own connections ended with its invocation, or it learns
     /// at its next renewal that it holds nothing.
+    /// The host serves the line next ([`Self::settle`]).
     pub fn close(&self, id: u64) {
         if self.started() {
-            self.with(|i| i.core.close(id));
+            self.with(|i| {
+                i.core.close(id);
+                i.pushes.retain(|(session, _)| *session != id);
+            });
         }
+    }
+
+    /// Serves the line after an event that is no request: the end of a
+    /// session ([`Self::close`]). The host sends what [`Self::pushes`]
+    /// then has.
+    pub async fn settle(&self, now: UnixMs) {
+        self.serve(now).await;
+    }
+
+    /// The replies to sessions that waited, each with its session, for
+    /// the host to send after it has kept the session with its
+    /// connection ([`Self::session`]). A session it cannot send to has
+    /// ended ([`Self::close`], then [`Self::settle`]).
+    pub fn pushes(&self) -> Vec<(u64, GateReply)> {
+        match self.started() {
+            true => self.with(|i| core::mem::take(&mut i.pushes)),
+            false => Vec::new(),
+        }
+    }
+
+    /// Hands what is free to the line, first come first: after every
+    /// change that can free a slot, and before a request's own
+    /// questions, so that no slot a waiting job can take goes to one
+    /// that came later.
+    async fn serve(&self, now: UnixMs) {
+        if !self.started() || self.with(|i| i.core.line.is_empty()) {
+            return;
+        }
+        let _one = self.serving.lock().await;
+        for (session, waiter) in self.with(|i| i.core.line(now.0)) {
+            for want in &waiter.wants {
+                // Its session ended, or it was served, while an
+                // earlier one was.
+                let listed = |i: &mut Inner| {
+                    let now = i.core.waiter(session);
+                    now.is_some_and(|w| w.place == waiter.place && w.id == waiter.id)
+                };
+                if !self.with(listed) {
+                    break;
+                }
+                let (provider, peers) = (&want.provider, &want.peers);
+                let asked = self.acquire(provider, peers, true, &waiter.holder, session, now);
+                let (permit, unowned) = match asked.await {
+                    Ok(Ok(Some(permit))) => (Some(permit), false),
+                    Ok(Ok(None)) => continue,
+                    // Not in charge any more: the caller is told, and
+                    // asks where the slots are now.
+                    Ok(Err(Unowned)) => (None, true),
+                    // Storage or the catalogue failed: the line stands
+                    // and is served at the next event.
+                    Err(_) => return,
+                };
+                self.with(|i| match (listed(i), permit) {
+                    (true, permit) => {
+                        i.core.unlist(session);
+                        let reply = GateReply {
+                            id: waiter.id,
+                            answers: vec![GateAnswer::Acquired(permit)],
+                            load: i.core.load(now),
+                            unowned,
+                            failed: false,
+                            waiting: false,
+                            wake: None,
+                        };
+                        i.pushes.push((session, reply));
+                    }
+                    // Its session ended while the slot was taken.
+                    (false, Some(permit)) => i.core.release(&permit, session),
+                    (false, None) => {}
+                });
+                break;
+            }
+        }
+    }
+
+    /// In how many milliseconds a job slot can next come free with no
+    /// event at the gate: the first slot that runs out unrenewed, or
+    /// the end of the wait for jobs after a restart.
+    fn wake(&self, now: UnixMs) -> Option<i64> {
+        self.with(|i| {
+            let warm = Some(i.record.warm_jobs).filter(|until| *until > now.0);
+            let next = i.core.next_expiry(now.0).into_iter().chain(warm).min();
+            next.map(|at| (at - now.0).max(1))
+        })
     }
 
     /// Stores the record as it should be now.
@@ -1180,17 +1410,9 @@ impl<S: Sql, D: GateStore> Gate<S, D> {
                 id: session,
                 seen: now.0,
                 held: i.core.of_session(session, now.0),
+                wait: None,
             };
-            // The host's limit is on the stored form, which may take
-            // two bytes for each unit of a text that is not all ASCII.
-            let fits = serde_json::to_string(&state).is_ok_and(|s| {
-                let stored = match s.is_ascii() {
-                    true => s.len(),
-                    false => 2 * s.encode_utf16().count(),
-                };
-                stored <= SESSION_STATE_MAX
-            });
-            if !fits {
+            if !state.fits() {
                 i.core.release(&permit, session);
                 return Ok(None);
             }
@@ -1305,31 +1527,61 @@ impl<S: Sql, D: GateStore> Gate<S, D> {
         if self.with(|i| i.name.as_deref() != Some(request.gate.as_str())) {
             return Err(BridgeError::Invalid("gate asked under another name"));
         }
+        // What ran out since the last event goes to the line first.
+        self.serve(now).await;
         let (mut taken, mut unowned) = (Vec::new(), false);
-        let answers = self
-            .answer(session, &request.ops, now, &mut taken, &mut unowned)
-            .await;
+        let asked = (session, request.id, request.ops.as_slice());
+        let answers = self.answer(asked, now, &mut taken, &mut unowned).await;
         if let (Err(_), Some(session)) = (&answers, session) {
-            // The caller learns of none of them.
-            self.with(|i| taken.iter().for_each(|p| i.core.release(p, session)));
+            // The caller learns of none of them, nor that it waits.
+            self.with(|i| {
+                taken.iter().for_each(|p| i.core.release(p, session));
+                if i.core.waiter(session).is_some_and(|w| w.id == request.id) {
+                    i.core.unlist(session);
+                }
+            });
+            // What a request that went on beside this one waits for
+            // may be what was just undone.
+            self.serve(now).await;
         }
+        let answers = answers?;
+        // Its own turn in the line came with this request (it asked
+        // again while it waited): that reply is this one.
+        let served = session.and_then(|session| {
+            self.with(|i| {
+                let mine = |(s, r): &(u64, GateReply)| *s == session && r.id == request.id;
+                let at = i.pushes.iter().position(mine)?;
+                Some(i.pushes.remove(at).1)
+            })
+        });
+        if let Some(reply) = served {
+            return Ok(reply);
+        }
+        let waiting =
+            session.is_some_and(|session| self.with(|i| i.core.waiter(session).is_some()));
         Ok(GateReply {
             id: request.id,
-            answers: answers?,
+            answers,
             load: self.with(|i| i.core.load(now)),
             unowned,
             failed: false,
+            waiting,
+            wake: match waiting {
+                true => self.wake(now),
+                false => None,
+            },
         })
     }
 
+    /// `asked`: the session, the id of the request and its questions.
     async fn answer(
         &self,
-        session: Option<u64>,
-        ops: &[GateOp],
+        asked: (Option<u64>, u64, &[GateOp]),
         now: UnixMs,
         taken: &mut Vec<GatePermit>,
         unowned: &mut bool,
     ) -> Result<Vec<GateAnswer>> {
+        let (session, id, ops) = asked;
         let mut answers = Vec::with_capacity(ops.len());
         for op in ops {
             answers.push(match op {
@@ -1359,8 +1611,56 @@ impl<S: Sql, D: GateStore> Gate<S, D> {
                 GateOp::Release { permits } => {
                     if let Some(session) = session {
                         self.with(|i| permits.iter().for_each(|p| i.core.release(p, session)));
+                        // Before a later question of this request can
+                        // take what it gave back.
+                        self.serve(now).await;
                     }
                     GateAnswer::Released
+                }
+                GateOp::Wait { wants, holder, ms } => {
+                    let session = session
+                        .ok_or(BridgeError::Invalid("gate asked for a slot on no session"))?;
+                    let (mut permit, mut mine) = (None, true);
+                    for want in wants {
+                        let (provider, peers) = (&want.provider, &want.peers);
+                        let asked = self.acquire(provider, peers, true, holder, session, now);
+                        match asked.await? {
+                            Ok(Some(taken)) => {
+                                permit = Some(taken);
+                                break;
+                            }
+                            Ok(None) => {}
+                            Err(Unowned) => {
+                                *unowned = true;
+                                mine = false;
+                            }
+                        }
+                    }
+                    taken.extend(permit.clone());
+                    // No caller waits longer than its invocation lives.
+                    let until = now.0 + (*ms).clamp(0, crate::jobtable::JOB_WAIT_MS);
+                    self.with(|i| {
+                        // Nothing is waited for at a gate that is not in
+                        // charge of every account asked: the rollout
+                        // step is due, and the caller asks the old way.
+                        if permit.is_some() || !mine || wants.is_empty() {
+                            i.core.unlist(session);
+                            return;
+                        }
+                        i.core.enlist(session, id, holder, wants, until);
+                        // A wait the host cannot keep with the session
+                        // is not begun.
+                        let state = SessionState {
+                            id: session,
+                            seen: now.0,
+                            held: i.core.of_session(session, now.0),
+                            wait: i.core.waiter(session).cloned(),
+                        };
+                        if !state.fits() {
+                            i.core.unlist(session);
+                        }
+                    });
+                    GateAnswer::Acquired(permit)
                 }
                 GateOp::Load => GateAnswer::Load(self.with(|i| i.core.load(now))),
                 GateOp::Activate { providers } => {
@@ -1444,6 +1744,18 @@ pub fn shards_from_var(raw: Option<&str>) -> core::result::Result<u32, String> {
     }
 }
 
+/// `SLOT_WAIT`: `poll` (also when unset) or `push`. `true` for `push`:
+/// a job that finds no slot waits in the line of its gates
+/// ([`PermitGate::wait`]). It changes nothing where the permits are
+/// the catalogue's (`PERMITS = "d1"`).
+pub fn slot_wait_from_var(raw: Option<&str>) -> core::result::Result<bool, String> {
+    match raw.map(str::trim) {
+        None | Some("") | Some("poll") => Ok(false),
+        Some("push") => Ok(true),
+        Some(_) => Err("SLOT_WAIT must be poll or push".to_string()),
+    }
+}
+
 impl GateSharding {
     /// `PERMIT_GATES`: `account` (also when unset) or `one`.
     pub fn from_var(raw: Option<&str>) -> core::result::Result<Self, String> {
@@ -1496,6 +1808,12 @@ pub const LINK_IDLE_MS: i64 = PERMIT_SECS as i64 * 1000 + 30_000;
 pub trait GateSession {
     /// One request and its reply. An error ends the session.
     async fn call(&self, request: GateRequest) -> Result<GateReply>;
+    /// The next reply the gate sends under `id`, the id of a request
+    /// it has answered already with [`GateReply::waiting`]. A session
+    /// that cannot be sent to says so at once.
+    async fn pushed(&self, _id: u64) -> Result<GateReply> {
+        Err(BridgeError::Sql("gate: no reply follows".into()))
+    }
     /// Ends the session. Nothing is awaited.
     fn close(&self);
 }
@@ -1525,6 +1843,21 @@ pub trait PermitGate {
     ) -> LocalBoxFuture<'a, Result<Option<Permit>>>;
     fn renew<'a>(&'a self, permits: &'a [Permit]) -> LocalBoxFuture<'a, Result<Vec<bool>>>;
     fn release<'a>(&'a self, permit: &'a Permit) -> LocalBoxFuture<'a, Result<()>>;
+    /// Waits up to `ms` in the lines of the gates of `providers` for a
+    /// job slot for `holder`, which holds none there.
+    /// [`SlotWait::Granted`]: one came, and the next
+    /// [`Self::acquire`] of `holder` on its provider returns it.
+    /// Dropped or out of time, nothing is held and no line has the
+    /// caller. [`SlotWait::Unsupported`]: no line is kept (the switch
+    /// is off, or a gate could not), and the caller asks again later
+    /// as it did before.
+    fn wait<'a>(
+        &'a self,
+        providers: &'a [&'a ProviderConfig],
+        holder: &'a str,
+        ms: i64,
+        sleep: &'a Sleeper,
+    ) -> LocalBoxFuture<'a, Result<SlotWait>>;
     /// The holder of `permit` is gone without having released it (its
     /// job was abandoned). Nothing is awaited: the session is closed
     /// if this was the last slot on it, and the gate frees what was
@@ -1619,6 +1952,40 @@ pub struct GateClient<T: GateTransport> {
     hints: RefCell<BTreeMap<String, (i64, Vec<GateLoad>)>>,
     unowned: core::cell::Cell<bool>,
     next_id: core::cell::Cell<u64>,
+    /// Jobs wait in the gates' lines ([`PermitGate::wait`]).
+    push: bool,
+    /// Slots that came from a line and were not asked for yet: each
+    /// with its holder and the time it came.
+    pocket: RefCell<Vec<(String, Permit, i64)>>,
+}
+
+/// A session in a gate's line. Dropped before its slot came (the
+/// caller's time ran out, or its job was abandoned), it ends the
+/// session: the gate takes it out of the line and frees a slot that
+/// was on its way.
+struct Queued<'a, T: GateTransport> {
+    client: &'a GateClient<T>,
+    key: (String, String),
+    session: Option<Rc<T::Session>>,
+}
+
+impl<T: GateTransport> Drop for Queued<'_, T> {
+    fn drop(&mut self) {
+        if let Some(session) = self.session.take() {
+            session.close();
+        }
+        // The link is this call's to remove, as in `converse`: not
+        // while another call waits for its turn on it.
+        let Ok(mut links) = self.client.links.try_borrow_mut() else {
+            return;
+        };
+        let idle = |link: &Link<T::Session>| {
+            link.session.is_none() && link.tokens.is_empty() && Rc::strong_count(&link.turn) <= 2
+        };
+        if links.get(&self.key).is_some_and(idle) {
+            links.remove(&self.key);
+        }
+    }
 }
 
 /// Returns `Pending` once, so that calls started together are all in
@@ -1696,12 +2063,21 @@ impl<T: GateTransport> GateClient<T> {
             hints: RefCell::new(BTreeMap::new()),
             unowned: core::cell::Cell::new(false),
             next_id: core::cell::Cell::new(0),
+            push: false,
+            pocket: RefCell::new(Vec::new()),
             mode,
             sharding,
             shards: shards.clamp(1, MAX_GATE_SHARDS),
             providers: providers.iter().map(GateProvider::from).collect(),
             queue: RefCell::new(BTreeMap::new()),
         }
+    }
+
+    /// `SLOT_WAIT`: with `true` (`push`) a job that finds no slot
+    /// waits in the gates' lines ([`PermitGate::wait`]).
+    pub fn with_push(mut self, push: bool) -> Self {
+        self.push = push;
+        self
     }
 
     pub fn into_gate(self) -> Rc<dyn PermitGate>
@@ -1937,6 +2313,151 @@ impl<T: GateTransport> GateClient<T> {
         Ok(answers)
     }
 
+    /// The other accounts of the pool of `p`.
+    fn pool_of(&self, p: &GateProvider) -> Vec<&GateProvider> {
+        match p.pool_limit() {
+            Some((pool, _)) => {
+                let same = |q: &&GateProvider| {
+                    q.id != p.id && q.pool_limit().is_some_and(|(name, _)| name == pool)
+                };
+                self.providers.iter().filter(same).collect()
+            }
+            None => Vec::new(),
+        }
+    }
+
+    /// The slot that came to `holder` from a line of `provider` and
+    /// was not asked for yet, renewed now: who takes it counts it as
+    /// taken at this time. What has lain for the lifetime of a slot is
+    /// given up.
+    async fn pocketed(&self, provider: &str, holder: &str) -> Option<Permit> {
+        if self.pocket.borrow().is_empty() {
+            return None;
+        }
+        let now = (self.clock)().0;
+        let (mut found, mut old) = (None, Vec::new());
+        self.pocket.borrow_mut().retain(|(by, permit, at)| {
+            if !(0..ttl_ms(true)).contains(&(now - at)) {
+                old.push(permit.clone());
+                return false;
+            }
+            let mine = found.is_none() && by == holder && permit.provider == provider;
+            if mine {
+                found = Some(permit.clone());
+            }
+            !mine
+        });
+        old.iter().for_each(|permit| self.forget(permit));
+        let permit = found?;
+        let held = self.renew(core::slice::from_ref(&permit)).await;
+        match held.ok()?.first() {
+            Some(true) => Some(permit),
+            _ => None,
+        }
+    }
+
+    /// Waits in the line of `gate` on a session of its own. `true`: a
+    /// slot came and is in the pocket. `false`: this gate keeps no line
+    /// for the caller. It does not return while it waits: the caller
+    /// bounds the wait and drops it.
+    async fn wait_on(
+        &self,
+        gate: String,
+        holder: &str,
+        wants: Vec<GateWant>,
+        ms: i64,
+        sleep: &Sleeper,
+    ) -> Result<bool> {
+        let key = (gate.clone(), holder.to_string());
+        let now = (self.clock)().0;
+        let turn = {
+            let mut links = self.links.borrow_mut();
+            links.retain(|k, link| *k == key || (0..LINK_IDLE_MS).contains(&(now - link.used)));
+            let link = links.entry(key.clone()).or_insert_with(|| Link {
+                session: None,
+                tokens: BTreeSet::new(),
+                used: now,
+                turn: Rc::new(AsyncMutex::new(())),
+            });
+            link.used = now;
+            Rc::clone(&link.turn)
+        };
+        let _turn = turn.lock().await;
+        let mut queued = Queued {
+            client: self,
+            key: key.clone(),
+            session: None,
+        };
+        // Only on a session that holds nothing: the wait is ended by
+        // ending the session.
+        let held = |link: &Link<T::Session>| link.session.is_some() || !link.tokens.is_empty();
+        if self.links.borrow().get(&key).is_some_and(held) {
+            return Ok(false);
+        }
+        let wait = GateOp::Wait {
+            wants,
+            holder: holder.to_string(),
+            ms,
+        };
+        let request = self.request(&gate, vec![wait]);
+        let id = request.id;
+        let (session, mut reply) = self.transport.open(request).await?;
+        let session = Rc::new(session);
+        queued.session = Some(Rc::clone(&session));
+        loop {
+            if reply.failed {
+                return Ok(false);
+            }
+            self.heard(&gate, &reply);
+            if let Some(GateAnswer::Acquired(Some(slot))) = reply.answers.first() {
+                let now = (self.clock)().0;
+                let mut links = self.links.borrow_mut();
+                let link = links.entry(key).or_insert_with(|| Link {
+                    session: None,
+                    tokens: BTreeSet::new(),
+                    used: now,
+                    turn: Rc::clone(&turn),
+                });
+                link.session = queued.session.take();
+                link.tokens.insert(slot.token);
+                link.used = now;
+                let permit = Permit {
+                    provider: slot.provider.clone(),
+                    slot: slot.slot,
+                    token: slot.token,
+                    class: PermitClass::Background,
+                };
+                let mut pocket = self.pocket.borrow_mut();
+                pocket.push((holder.to_string(), permit, now));
+                return Ok(true);
+            }
+            if !reply.waiting {
+                return Ok(false);
+            }
+            if let Some(link) = self.links.borrow_mut().get_mut(&queued.key) {
+                link.used = (self.clock)().0;
+            }
+            let again = GateRequest {
+                id,
+                gate: gate.clone(),
+                ops: Vec::new(),
+            };
+            reply = match reply.wake {
+                None => session.pushed(id).await?,
+                Some(ms) => {
+                    let nap = sleep(u32::try_from(ms).unwrap_or(u32::MAX));
+                    match select(Box::pin(session.pushed(id)), nap).await {
+                        Either::Left((reply, _)) => reply?,
+                        // A slot may have run out with no word to the
+                        // gate: it looks, and answers under the same
+                        // id, with the slot if this is its turn.
+                        Either::Right(_) => session.call(again).await?,
+                    }
+                }
+            };
+        }
+    }
+
     /// Queues `op` for `gate` and sends the queue once every call that
     /// started with this one has joined it.
     async fn ask(&self, gate: &Channel, op: GateOp) -> Result<GateAnswer> {
@@ -2004,18 +2525,14 @@ impl<T: GateTransport> PermitGate for GateClient<T> {
         holder: &'a str,
     ) -> LocalBoxFuture<'a, Result<Option<Permit>>> {
         Box::pin(async move {
+            if class == PermitClass::Background {
+                if let Some(permit) = self.pocketed(&p.id, holder).await {
+                    return Ok(Some(permit));
+                }
+            }
             let whole = GateProvider::from(p);
             let (unit, shards) = (self.sharding.unit_of(&whole), self.shards_of(&whole));
-            let pool: Vec<&GateProvider> = match whole.pool_limit() {
-                Some((pool, _)) => self
-                    .providers
-                    .iter()
-                    .filter(|q| {
-                        q.id != p.id && q.pool_limit().is_some_and(|(name, _)| name == pool)
-                    })
-                    .collect(),
-                None => Vec::new(),
-            };
+            let pool = self.pool_of(&whole);
             // The holder's own gate first, then the others in turn: a
             // gate that has nothing left is no reason to wait while
             // another has. Asked twice, a holder counts as an address
@@ -2083,13 +2600,85 @@ impl<T: GateTransport> PermitGate for GateClient<T> {
             let Some((gate, holder)) = self.link_of(permit) else {
                 return Ok(());
             };
-            let op = GateOp::Release {
-                permits: vec![GatePermit::from(permit)],
+            // A slot that came to this holder from a line and that it
+            // never asked for (it found one elsewhere first) goes back
+            // with the first slot it gives back: sent together, so one
+            // request for each gate. One that cannot be given back
+            // runs out.
+            let mut left: Vec<Permit> = Vec::new();
+            self.pocket.borrow_mut().retain(|(by, slot, _)| {
+                let mine = *by == holder;
+                if mine {
+                    left.push(slot.clone());
+                }
+                !mine
+            });
+            let back = |slot: &Permit| GateOp::Release {
+                permits: vec![GatePermit::from(slot)],
             };
-            match self.ask(&(gate, Some(holder)), op).await? {
+            let extras = left.iter().filter_map(|slot| {
+                let (gate, holder) = self.link_of(slot)?;
+                let channel = (gate, Some(holder));
+                Some(async move { self.ask(&channel, back(slot)).await })
+            });
+            let own = (gate, Some(holder.clone()));
+            let (own, _) =
+                futures_util::future::join(self.ask(&own, back(permit)), join_all(extras)).await;
+            match own? {
                 GateAnswer::Released => Ok(()),
                 _ => Err(unexpected()),
             }
+        })
+    }
+
+    fn wait<'a>(
+        &'a self,
+        providers: &'a [&'a ProviderConfig],
+        holder: &'a str,
+        ms: i64,
+        sleep: &'a Sleeper,
+    ) -> LocalBoxFuture<'a, Result<SlotWait>> {
+        Box::pin(async move {
+            if !self.push || self.mode != PermitMode::Gate || ms <= 0 {
+                return Ok(SlotWait::Unsupported);
+            }
+            let mut by_gate: BTreeMap<String, Vec<GateWant>> = BTreeMap::new();
+            for p in providers {
+                let whole = GateProvider::from(*p);
+                let (unit, shards) = (self.sharding.unit_of(&whole), self.shards_of(&whole));
+                let pool = self.pool_of(&whole);
+                for shard in 0..shards {
+                    let want = GateWant {
+                        provider: whole.part(shard, shards),
+                        peers: pool.iter().map(|q| q.part(shard, shards)).collect(),
+                    };
+                    let line = by_gate.entry(gate_name(&unit, shard)).or_default();
+                    line.push(want);
+                }
+            }
+            let lines = by_gate.into_iter().map(|(gate, wants)| {
+                let line: LocalBoxFuture<'_, Result<bool>> =
+                    Box::pin(self.wait_on(gate, holder, wants, ms, sleep));
+                line
+            });
+            let lines: Vec<_> = lines.collect();
+            if lines.is_empty() {
+                return Ok(SlotWait::Unsupported);
+            }
+            // The first slot that comes: the other lines are left, by
+            // ending their sessions. A gate that keeps no line for the
+            // caller ends them all: it asks every gate the old way.
+            let first = async {
+                match select_all(lines).await.0 {
+                    Ok(true) => SlotWait::Granted,
+                    Ok(false) | Err(_) => SlotWait::Unsupported,
+                }
+            };
+            let timer = sleep(u32::try_from(ms).unwrap_or(u32::MAX));
+            Ok(match select(Box::pin(first), timer).await {
+                Either::Left((out, _)) => out,
+                Either::Right(_) => SlotWait::Elapsed,
+            })
         })
     }
 

@@ -29,6 +29,9 @@ use velmora_test_nntp::{ServerConfig, TestNntpServer, UserConfig};
 pub const T0: UnixMs = UnixMs(1_800_000_000_000);
 pub use velmora_bridge::LEASE_SECS;
 
+/// How long a job waits in a [`MemCatalog`] line before its slot comes.
+pub const LINE_MS: u32 = 7_300;
+
 thread_local! {
     /// What the job did, in the order it began: `connect`, `post`,
     /// `plan` (the plan stored in the catalogue) and `acquire` (a slot
@@ -404,6 +407,17 @@ pub struct MemCatalog {
     pub permit_refusals: Cell<u32>,
     /// Permits another holder gives back right after the next refusal.
     pub free_after_refusal: RefCell<Vec<Permit>>,
+    /// How a wait in the line for a slot ends (`await_permit`), where
+    /// the catalogue keeps one: a slot comes after [`LINE_MS`]
+    /// (`line_frees` are given back then), or the time runs out.
+    /// `None`: no line is kept.
+    pub line: Cell<Option<SlotWait>>,
+    /// Permits another holder gives back to the job that waits in the
+    /// line.
+    pub line_frees: RefCell<Vec<Permit>>,
+    /// Each wait in the line: the holder, its providers and the time
+    /// it had.
+    pub line_waits: RefCell<Vec<(String, Vec<String>, i64)>>,
     /// Each slot request waits for the runtime once before it is
     /// answered, as a catalogue round trip does, so that requests made
     /// together are seen in flight together (`acquire_peak`).
@@ -1341,6 +1355,34 @@ impl Catalog for MemCatalog {
             slot.until = 0;
         }
         Ok(())
+    }
+
+    async fn await_permit(
+        &self,
+        providers: &[&ProviderConfig],
+        holder: &str,
+        ms: i64,
+        sleep: &velmora_bridge::ingress::Sleeper,
+    ) -> Result<SlotWait> {
+        let Some(end) = self.line.get() else {
+            return Ok(SlotWait::Unsupported);
+        };
+        let ids = providers.iter().map(|p| p.id.clone()).collect();
+        self.line_waits
+            .borrow_mut()
+            .push((holder.to_string(), ids, ms));
+        match end {
+            SlotWait::Granted => {
+                sleep(LINE_MS).await;
+                let freed: Vec<Permit> = self.line_frees.borrow_mut().drain(..).collect();
+                for permit in freed {
+                    self.release_permit(&permit).await?;
+                }
+            }
+            SlotWait::Elapsed => sleep(u32::try_from(ms).expect("a wait in ms")).await,
+            SlotWait::Unsupported => {}
+        }
+        Ok(end)
     }
 
     // Not used by the post, verify, release or cold-read paths.

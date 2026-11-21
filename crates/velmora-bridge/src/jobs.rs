@@ -31,16 +31,18 @@
 //!   `x/<extent>` and `c/<extent>`.
 
 use crate::config::{GcMode, Maintenance, ORPHAN_GRACE_MS};
+use crate::fetch::job_holder;
 use crate::ports::{
-    BlobStore, Bridge, Catalog, Clock, JobSink, Kek, Lease, NntpConnector, MAX_QUEUE_DELAY_SECS,
-    PERMIT_SECS,
+    BlobStore, Bridge, Catalog, Clock, JobSink, Kek, Lease, NntpConnector, SlotWait,
+    MAX_QUEUE_DELAY_SECS, PERMIT_SECS,
 };
 use crate::post::{settle, Stop, POST_SOCKET_BYTES};
 use crate::recovery::delete_blob;
 use crate::stamp::Advance;
 use crate::types::{
     BlobStoreKind, DispatchReport, EvictCandidate, ExtentId, FailClass, GcRow, GcStep,
-    GenerationId, Job, JobOutcome, Oldest, OutboxStage, Resend, Result, UnixMs, JOB_VERSION,
+    GenerationId, Job, JobOutcome, Oldest, OutboxStage, ProviderConfig, Resend, Result, UnixMs,
+    JOB_VERSION,
 };
 use crate::verify::release_labels;
 
@@ -425,21 +427,34 @@ where
         }
     }
 
-    /// For a job that just found no slot on `providers` providers:
-    /// sleeps [`slot_poll_ms`] and says the job may ask again, while its
-    /// claim is younger than [`SLOT_WAIT_MS`]. `false`, with nothing
-    /// awaited, once it is not, and on a host without a timer: the job
-    /// is put off as before. The lease is not renewed here: a job that
-    /// connects after a wait renews it first, as after any wait
-    /// ([`Lease::fresh_at`]).
-    pub(crate) async fn slot_wait(&self, lease: &Lease, providers: usize) -> bool {
+    /// For a job that just found no slot on `providers`: waits for one
+    /// and says the job may ask again, while its claim is younger than
+    /// [`SLOT_WAIT_MS`]. `false`, with nothing awaited, once it is not,
+    /// and on a host without a timer: the job is put off as before.
+    ///
+    /// Where the slots have a line ([`Catalog::await_permit`]) the job
+    /// stands in it for the rest of that time, with no call and no
+    /// sleep of its own, and asks again when a slot is its own; the
+    /// time over, it is put off. Elsewhere it sleeps [`slot_poll_ms`]:
+    /// longer the more providers it asks.
+    /// The lease is not renewed here: a job that connects after a wait
+    /// renews it first, as after any wait ([`Lease::fresh_at`]).
+    pub(crate) async fn slot_wait(&self, lease: &Lease, providers: &[&ProviderConfig]) -> bool {
         let age = self.clock.now().0 - lease.claimed_at.0;
-        match self.budget.sleeper() {
-            Some(sleep) if (0..SLOT_WAIT_MS).contains(&age) => {
-                sleep(slot_poll_ms(providers)).await;
+        let sleep = match self.budget.sleeper() {
+            Some(sleep) if (0..SLOT_WAIT_MS).contains(&age) => sleep,
+            _ => return false,
+        };
+        let (holder, left) = (job_holder(lease), SLOT_WAIT_MS - age);
+        let line = self.catalog.await_permit(providers, &holder, left, sleep);
+        match line.await {
+            Ok(SlotWait::Granted) => true,
+            Ok(SlotWait::Elapsed) => false,
+            // No line here, or it could not be stood in: as before.
+            Ok(SlotWait::Unsupported) | Err(_) => {
+                sleep(slot_poll_ms(providers.len())).await;
                 true
             }
-            _ => false,
         }
     }
 

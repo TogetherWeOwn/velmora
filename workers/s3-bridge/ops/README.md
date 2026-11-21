@@ -1447,6 +1447,41 @@ At the list prices of late 2026 that is $3.2 to $3.4 per TB posted in
 gate mode against $3.3 with slot rows: about the same bill, with the
 slot rows out of the catalogue's write path.
 
+### The line (`SLOT_WAIT`)
+
+`SLOT_WAIT = "poll"` (the default): a post, verify or release job that
+finds every slot it could use taken keeps its claim and asks again
+every two seconds or more, for up to two minutes from its claim, and is
+then put off and delivered again.
+
+`SLOT_WAIT = "push"` with `PERMITS = "do"`: the job asks once to wait.
+The gate keeps a line of the sessions that wait, first come first, and
+at every event that can free a slot (a release, the end of a session,
+a slot that ran out) it gives the slot to the first in the line that
+can use it and sends that session the reply. The job then takes its
+slot with its next question and goes on in the same run.
+
+- A job that waits sends nothing and holds no slot. Its wait is one
+  session (one billed request) and the reply; if a slot runs out with
+  no event, the first in the line asks once (a message, a twentieth of
+  a request).
+- The line lives with the sessions, not in the gate's storage: it is
+  there when the gate leaves memory and comes back. A waiter whose
+  invocation died leaves the line when its connection ends, and a slot
+  that was sent to it comes back the same way.
+- After a deploy of the Worker the gate starts again without sessions:
+  every waiter is told its session ended and asks the old way.
+- Reads never wait in the line, and the slot kept for reads is never
+  given to it.
+- A job that cannot stand in the line (`PERMITS = "d1"`, a gate from
+  before the line, a gate that is not in charge of the account, a
+  session that failed) asks again as with `poll`.
+- A job that waits holds one of its queue's consumers for the time of
+  the wait, as it does with `poll`.
+
+Change it in a deploy of its own. Going back to `poll` needs nothing
+else: the waits in flight end with their invocations.
+
 ## The route
 
 `POST /_admin/restore` (admin bearer; 409 unless `MAINTENANCE=restore`)
