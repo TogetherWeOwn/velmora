@@ -90,6 +90,22 @@ it after the signature verifies. A missing bucket is answered with the key
 row too: a missing bucket and a missing grant both answer `AccessDenied`,
 after the signature.
 
+## Restore gate
+
+A restored unit stays closed until the gate lifts it, and the gate lifts only
+on a whole, clean replay (`unit::gate`): no damaged generation, no held row
+whose safety copy is gone and that a servable generation names, and no
+unreadable, unpublishable, damaged-unpublished, twin or other-bucket record.
+While the replay is not whole, every held row without a copy counts as live.
+A lift may accept a blocker only by naming each of its ids in the lift
+record.
+
+**The stored plan of an extent never changes.** `plan_rev` is 0 or 1;
+`tests/plan_rev_contract.rs` holds the list of every statement that writes
+it, and `plan_rev::bound` refuses a bound value above 1. A change that would
+write a higher revision needs its own design first and lifts that test on
+purpose.
+
 ## The database of a unit
 
 `DoSql` (`workers/unit/src/do_sql.rs`) is the catalogue's `Sql` port over a

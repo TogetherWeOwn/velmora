@@ -10,11 +10,13 @@
 //! - [`call`]: the call and its answer, as JSON.
 //! - [`object`]: the unit itself (rules 1 to 7 and 11).
 //! - [`schema`]: what a unit is born with.
+//! - [`gate`]: the restore gate's lift decision.
 //!
 //! Nothing here holds a key or reaches the network (rules 3 and 4).
 
 pub mod birth;
 pub mod call;
+pub mod gate;
 pub mod identity;
 pub mod name;
 pub mod object;
