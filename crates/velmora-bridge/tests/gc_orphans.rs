@@ -13,7 +13,8 @@
 //! of every history the catalogue is lost and rebuilt from the records.
 //!
 //! Everything runs as production does: `GC_MODE=off`, a bucket that is
-//! not disposable.
+//! not disposable. One test turns both collectors on in a disposable
+//! bucket.
 
 mod service_support;
 
@@ -26,6 +27,7 @@ use service_support::*;
 use velmora_bridge::config::{BridgeConfig, GcMode, ORPHAN_GRACE_MS};
 use velmora_bridge::jobs::{ORPHAN_BATCH, ORPHAN_SCAN};
 use velmora_bridge::replay::{ReplayCursor, ReplayLimits, ReplayReport};
+use velmora_bridge::sql::SqlCatalog;
 use velmora_bridge::testkit::NEXT_DROP_SUPERSEDED_INDEXES;
 use velmora_bridge::*;
 
@@ -304,20 +306,27 @@ impl T {
 
     /// What the GC job does with one row, through the catalogue.
     async fn collect(&self, row: &GcRow, cutoff: UnixMs) -> bool {
-        if !self.catalog().gc_orphan_claim(row, cutoff).await.unwrap() {
-            return false;
+        self.collect_all(std::slice::from_ref(row), cutoff).await[0]
+    }
+
+    /// What the GC job does with the rows of a window, through the
+    /// catalogue: one claim for all of them, then the blobs it granted.
+    async fn collect_all(&self, rows: &[GcRow], cutoff: UnixMs) -> Vec<bool> {
+        let granted = self.catalog().gc_orphan_claim(rows, cutoff).await.unwrap();
+        assert_eq!(granted.len(), rows.len());
+        for (row, _) in rows.iter().zip(&granted).filter(|(_, granted)| **granted) {
+            self.rig
+                .bridge
+                .safety
+                .delete(&row.extent_id.safety_key())
+                .await
+                .unwrap();
+            self.catalog()
+                .gc_orphan_done(row.id, self.now())
+                .await
+                .unwrap();
         }
-        self.rig
-            .bridge
-            .safety
-            .delete(&row.extent_id.safety_key())
-            .await
-            .unwrap();
-        self.catalog()
-            .gc_orphan_done(row.id, self.now())
-            .await
-            .unwrap();
-        true
+        granted
     }
 
     /// The generation records in the safety store.
@@ -702,11 +711,11 @@ async fn a_completion_racing_the_collector_loses_nothing() {
             for extent in &listed {
                 let claimed = bridge
                     .catalog
-                    .gc_orphan_claim(&gc_row(orphan_row.id, extent), cutoff)
+                    .gc_orphan_claim(&[gc_row(orphan_row.id, extent)], cutoff)
                     .now_or_never()
                     .expect("the catalogue answers at once")
                     .unwrap();
-                assert!(!claimed, "a listed part was claimed");
+                assert_eq!(claimed, [false], "a listed part was claimed");
             }
             let job = Job::Gc { v: 1 };
             let outcome = bridge.run_job(&job).now_or_never();
@@ -923,7 +932,7 @@ async fn a_claim_proves_its_row_again() {
     let catalog = t.catalog();
     let claim = |id: i64, extent: &str, cutoff: UnixMs| {
         let row = gc_row(id, extent);
-        async move { catalog.gc_orphan_claim(&row, cutoff).await.unwrap() }
+        async move { catalog.gc_orphan_claim(&[row], cutoff).await.unwrap()[0] }
     };
 
     // Too young by a millisecond; the row of another action; a row that
@@ -1003,7 +1012,10 @@ async fn a_claim_proves_its_row_again() {
     );
     assert_eq!(t.blobs().len(), 4);
 
-    // The claim itself, and again: the second one changes nothing.
+    // The claim itself, and again: the second one is granted too and
+    // leaves the copy `deleted`. It bumps the eviction fence once more,
+    // as every statement that sets `safety_state` must, and a bump only
+    // refuses an eviction listing taken before it.
     assert!(claim(safety.id, &orphan, cutoff).await);
     let seq = t.count(&format!(
         "SELECT evict_seq FROM extents WHERE id = '{orphan}'"
@@ -1014,8 +1026,165 @@ async fn a_claim_proves_its_row_again() {
             "SELECT evict_seq FROM extents WHERE id = '{orphan}' AND safety_state = 'deleted' \
                AND hot_safety_bytes = 0"
         )),
-        seq
+        seq + 1
     );
+}
+
+/// The catalogue of a test, with a change that is committed right after
+/// the first read through it: between the read that sorts the rows of
+/// a claim and the batch that decides them.
+struct ChangedAfterRead<'a> {
+    inner: &'a FailSql,
+    change: Cell<Option<String>>,
+}
+
+impl Sql for ChangedAfterRead<'_> {
+    async fn query(&self, sql: &str, params: &[SqlValue]) -> Result<Vec<Row>> {
+        let rows = self.inner.query(sql, params).await;
+        if let Some(change) = self.change.take() {
+            self.inner.with_conn(|c| c.execute_batch(&change).unwrap());
+        }
+        rows
+    }
+    async fn exec(&self, sql: &str, params: &[SqlValue]) -> Result<u64> {
+        self.inner.exec(sql, params).await
+    }
+    async fn batch(&self, stmts: Vec<(&'static str, Vec<SqlValue>)>) -> Result<Vec<u64>> {
+        self.inner.batch(stmts).await
+    }
+}
+
+/// The read that sorts the rows of a claim proves nothing: a claim
+/// whose extent is not what that read said is refused by its batch.
+/// Neither change happens in the service (an extent keeps its bucket,
+/// and the part row of a dropped part stays), so both are made by hand:
+/// what is shown is that the batch does not lean on the read.
+#[tokio::test(flavor = "current_thread")]
+async fn the_read_that_sorts_the_rows_of_a_claim_proves_nothing() {
+    let t = setup().await;
+    let other = t.rig.bucket("other", false).await;
+    // A part of an aborted upload: its upload is known.
+    let a = t.create("a").await;
+    t.part("a", &a, 1, &pattern(1, 100)).await;
+    t.abort("a", &a).await;
+    // The older bytes of a part of an upload that goes on: not known.
+    let b = t.create("b").await;
+    t.part("b", &b, 1, &pattern(2, 100)).await;
+    t.part("b", &b, 1, &pattern(3, 100)).await;
+    t.advance(ORPHAN_GRACE_MS);
+    let (now, cutoff) = (t.now(), t.cutoff());
+    let rows = t
+        .catalog()
+        .gc_orphans(now, cutoff, ORPHAN_SCAN, ORPHAN_BATCH)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 2);
+    let known = |row: &GcRow| {
+        t.count(&format!(
+            "SELECT COUNT(*) FROM upload_parts WHERE extent_id = '{}'",
+            row.extent_id.as_str()
+        )) == 1
+    };
+    let (of_upload, in_bucket) = match (known(&rows[0]), known(&rows[1])) {
+        (true, false) => (&rows[0], &rows[1]),
+        (false, true) => (&rows[1], &rows[0]),
+        both => panic!("{both:?}"),
+    };
+    let (sql, all) = (&t.catalog().sql, &rows);
+    let claim = |change: String| async move {
+        let catalog = SqlCatalog::new(ChangedAfterRead {
+            inner: sql,
+            change: Cell::new(Some(change)),
+        });
+        let granted = catalog.gc_orphan_claim(all, cutoff).await.unwrap();
+        assert!(catalog.sql.change.take().is_none());
+        granted
+    };
+    let held = || t.count("SELECT COUNT(*) FROM extents WHERE safety_state = 'held'");
+    assert_eq!(held(), 3);
+
+    // The part row is gone after the read, and the key of the upload it
+    // led to carries a mark: the claim that was sorted as one of a
+    // known upload is refused. So is the other one, by the mark itself.
+    t.sql("CREATE TABLE put_back AS SELECT * FROM upload_parts");
+    let granted = claim(format!(
+        "DELETE FROM upload_parts WHERE extent_id = '{of_upload}'; \
+         INSERT INTO key_floors(bucket_id, key, floor_id, unpublished) \
+         SELECT bucket_id, 'a', 'g_0', 1 FROM extents WHERE id = '{of_upload}'",
+        of_upload = of_upload.extent_id.as_str()
+    ))
+    .await;
+    assert_eq!(granted, vec![false, false]);
+    assert_eq!(held(), 3);
+    t.sql(
+        "DELETE FROM key_floors; \
+         INSERT INTO upload_parts SELECT * FROM put_back WHERE extent_id NOT IN \
+           (SELECT extent_id FROM upload_parts); \
+         DROP TABLE put_back",
+    );
+
+    // The extent is in another bucket after the read, one with a marked
+    // key that an upload was begun on: the claim that was sorted into
+    // the first bucket is refused, behind a guard that passed.
+    let granted = claim(format!(
+        "UPDATE extents SET bucket_id = '{other}' WHERE id = '{in_bucket}'; \
+         INSERT INTO uploads(id, bucket_id, key, content_json, user_meta_json, state, \
+                             initiated_at) \
+         VALUES ('u_elsewhere', '{other}', 'c', '{{}}', '{{}}', 'aborted', 1); \
+         INSERT INTO key_floors(bucket_id, key, floor_id, unpublished) \
+         VALUES ('{other}', 'c', 'g_0', 1)",
+        other = other.id.as_str(),
+        in_bucket = in_bucket.extent_id.as_str()
+    ))
+    .await;
+    let expect: Vec<bool> = rows.iter().map(|r| r.id == of_upload.id).collect();
+    assert_eq!(granted, expect);
+    assert_eq!(held(), 2);
+    assert_eq!(t.blobs().len(), 3);
+}
+
+/// The parts whose upload is not known wait while a key of their bucket
+/// carries the mark. Those of another bucket, claimed in the same
+/// call, do not wait with them, whichever bucket comes first.
+#[tokio::test(flavor = "current_thread")]
+async fn a_marked_key_holds_back_the_parts_of_its_own_bucket_only() {
+    for marked in [BUCKET, "other"] {
+        let t = setup().await;
+        let other = t.rig.bucket("other", false).await;
+        t.rig.grant(AKID, &other, Perm::Rw).await;
+        // In each bucket, the older bytes of a part that was uploaded again.
+        for bucket in [BUCKET, "other"] {
+            t.bucket.set(bucket);
+            let id = t.create("k").await;
+            t.part("k", &id, 1, &pattern(1, 100)).await;
+            t.part("k", &id, 1, &pattern(2, 100)).await;
+        }
+        t.sql(&format!(
+            "INSERT INTO key_floors(bucket_id, key, floor_id, unpublished) \
+             SELECT id, 'k', 'g_0', 1 FROM buckets WHERE name = '{marked}'"
+        ));
+        t.advance(ORPHAN_GRACE_MS);
+        let (now, cutoff) = (t.now(), t.cutoff());
+        let rows = t
+            .catalog()
+            .gc_orphans(now, cutoff, ORPHAN_SCAN, ORPHAN_BATCH)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        let granted = t.collect_all(&rows, cutoff).await;
+        let expect: Vec<bool> = rows
+            .iter()
+            .map(|row| {
+                t.count(&format!(
+                    "SELECT COUNT(*) FROM extents e JOIN buckets b ON b.id = e.bucket_id \
+                     WHERE e.id = '{}' AND b.name <> '{marked}'",
+                    row.extent_id.as_str()
+                )) == 1
+            })
+            .collect();
+        assert_eq!(granted, expect, "{marked}");
+        assert_eq!(granted.iter().filter(|g| **g).count(), 1);
+    }
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -1232,9 +1401,170 @@ async fn a_job_takes_a_bounded_number_of_parts() {
     );
 }
 
+/// `GC_MODE=disposable` and `GC_ORPHANS=on` together, in a disposable
+/// bucket, where a dropped part has a row that both collectors take.
+/// Whichever gets to a row first, and wherever the other one comes in,
+/// the copy goes once, the row is closed once, and a row that is closed
+/// is not claimed again.
+#[tokio::test(flavor = "current_thread")]
+async fn both_collectors_on_one_row() {
+    let t = setup_with(|cfg| cfg.gc_mode = GcMode::Disposable).await;
+    let scratch = t.rig.bucket("scratch", true).await;
+    t.rig.grant(AKID, &scratch, Perm::Rw).await;
+    t.bucket.set("scratch");
+    let id = t.create("k").await;
+    for n in 1..=4 {
+        t.part("k", &id, n, &[n as u8]).await;
+    }
+    t.abort("k", &id).await;
+    assert_eq!(t.blobs().len(), 4);
+    t.advance(ORPHAN_GRACE_MS);
+    let (now, cutoff) = (t.now(), t.cutoff());
+    let rows: Vec<GcRow> = t
+        .queued()
+        .iter()
+        .filter(|q| q.action == "delete_safety")
+        .map(|q| gc_row(q.id, &q.extent))
+        .collect();
+    assert_eq!(rows.len(), 4);
+    let catalog = t.catalog();
+    let claim = |row: &GcRow| {
+        let row = row.clone();
+        async move { catalog.gc_orphan_claim(&[row], cutoff).await.unwrap()[0] }
+    };
+    let begins = |row: &GcRow| {
+        let row = row.clone();
+        async move {
+            let step = catalog.gc_begin(&row, now).await.unwrap();
+            let blob = row.extent_id.safety_key();
+            matches!(step, GcStep::DeleteBlob { store: BlobStoreKind::Safety, key } if key == blob)
+        }
+    };
+    let state = |row: &GcRow| -> (String, i64) {
+        catalog.sql.with_conn(|c| {
+            c.query_row(
+                "SELECT e.safety_state, (SELECT done_at IS NOT NULL FROM gc WHERE id = ?2) \
+                   FROM extents e WHERE e.id = ?1",
+                rusqlite::params![row.extent_id.as_str(), row.id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap()
+        })
+    };
+
+    // 0: this collector claimed, and its job ended before the delete.
+    // The other one takes the row from there.
+    assert!(claim(&rows[0]).await);
+    assert_eq!(state(&rows[0]), ("deleted".to_string(), 0));
+    assert!(begins(&rows[0]).await);
+    // 1: the other one was told to delete, and this one claims before
+    // it did; then both finish, this one first.
+    assert!(begins(&rows[1]).await);
+    assert!(claim(&rows[1]).await);
+    catalog.gc_orphan_done(rows[1].id, now).await.unwrap();
+    catalog.gc_done(rows[1].id, now).await.unwrap();
+    assert_eq!(state(&rows[1]), ("deleted".to_string(), 1));
+    assert!(!claim(&rows[1]).await);
+    assert!(!begins(&rows[1]).await);
+    // 2: the same, and the other one finishes first.
+    assert!(begins(&rows[2]).await);
+    assert!(claim(&rows[2]).await);
+    catalog.gc_done(rows[2].id, now).await.unwrap();
+    catalog.gc_orphan_done(rows[2].id, now).await.unwrap();
+    assert_eq!(state(&rows[2]), ("deleted".to_string(), 1));
+    assert!(!claim(&rows[2]).await);
+    // No blob was deleted yet. The jobs delete those of 0 and 3; the
+    // rows of 1 and 2 were closed above by hand, without a delete, and
+    // a closed row is nobody's any more.
+    assert_eq!(t.blobs().len(), 4);
+    t.pass().await;
+    t.advance(REST);
+    t.pass().await;
+    assert_eq!(
+        t.blobs(),
+        [&rows[1], &rows[2]]
+            .map(|r| r.extent_id.safety_key())
+            .into_iter()
+            .collect()
+    );
+    for row in &rows {
+        assert_eq!(state(row), ("deleted".to_string(), 1));
+        assert!(!claim(row).await);
+    }
+    assert_eq!(
+        t.count("SELECT COUNT(*) FROM gc WHERE done_at IS NULL AND action = 'delete_safety'"),
+        0
+    );
+}
+
 // ---------------------------------------------------------------------------
-// Rows written
+// Rows read and written
 // ---------------------------------------------------------------------------
+
+/// The parts whose upload is not known (here: each uploaded twice) need
+/// the one statement that reads every upload of the catalogue. A window
+/// runs it once, however many such parts it holds: with a thousand more
+/// uploads in the catalogue, its claims cost a few steps per upload
+/// more, and not that for every part.
+#[tokio::test(flavor = "current_thread")]
+async fn the_uploads_are_read_once_for_a_window_and_not_once_for_a_part() {
+    const PARTS: u16 = 40;
+    const UPLOADS: u64 = 1000;
+    let mut cost = Vec::new();
+    for (uploads, one_by_one) in [(0, false), (UPLOADS, false), (UPLOADS, true)] {
+        let t = setup().await;
+        let id = t.create("k").await;
+        for n in 1..=PARTS {
+            t.part("k", &id, n, &[1, n as u8]).await;
+            t.part("k", &id, n, &[2, n as u8]).await;
+        }
+        // Uploads of other keys, long over.
+        t.sql(&format!(
+            "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < {uploads}) \
+             INSERT INTO uploads(id, bucket_id, key, content_json, user_meta_json, state, \
+                                 initiated_at) \
+             SELECT printf('u_%032x', i), (SELECT id FROM buckets WHERE name = '{BUCKET}'), \
+                    printf('old/%d', i), '{{}}', '{{}}', 'aborted', 1 FROM n WHERE {uploads} > 0"
+        ));
+        t.advance(ORPHAN_GRACE_MS);
+        let (now, cutoff) = (t.now(), t.cutoff());
+        let rows = t
+            .catalog()
+            .gc_orphans(now, cutoff, ORPHAN_SCAN, ORPHAN_BATCH)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), usize::from(PARTS));
+        let sql = &t.catalog().sql;
+        sql.reset_read_stats();
+        sql.reset_write_steps();
+        let granted = if one_by_one {
+            let mut granted = Vec::new();
+            for row in &rows {
+                let row = std::slice::from_ref(row);
+                granted.extend(t.catalog().gc_orphan_claim(row, cutoff).await.unwrap());
+            }
+            granted
+        } else {
+            let granted = t.catalog().gc_orphan_claim(&rows, cutoff).await.unwrap();
+            // One read sorts the rows, and one batch claims them.
+            assert_eq!(sql.read_stats().queries, 1);
+            granted
+        };
+        assert_eq!(granted, vec![true; rows.len()]);
+        cost.push(sql.write_steps());
+    }
+    let [few, many, one_by_one] = cost[..] else {
+        unreachable!()
+    };
+    println!(
+        "steps of the claims of {PARTS} parts: {few} with 1 upload, {many} with {UPLOADS} more, \
+         {one_by_one} for those when each part is claimed in a call of its own"
+    );
+    let per_upload = (many - few) / UPLOADS;
+    assert!((1..=30).contains(&per_upload), "{few} {many}");
+    // What it must not cost: a read of the uploads for every part.
+    assert!(one_by_one - few > u64::from(PARTS) / 2 * (many - few));
+}
 
 /// What D1 bills for one collected part, on the schema of today and on
 /// the one after the superseded indexes are dropped: three rows. The
@@ -1729,19 +2059,37 @@ impl Model {
                 let open_due = queued.iter().filter(|q| {
                     !q.done && q.action == "delete_safety" && due.contains(&blob_of(&q.extent))
                 });
+                // (the row, the row it was made of, whether it is crossed)
+                let mut asked: Vec<(GcRow, &Queued, bool)> = Vec::new();
                 for row in open_due.take(3) {
                     for _ in 0..6 {
                         let extent = dice.pick(&left).trim_start_matches("x/");
                         if extent != row.extent {
-                            assert!(!t.collect(&gc_row(row.id, extent), cutoff).await);
-                            self.refused += 1;
+                            asked.push((gc_row(row.id, extent), row, true));
                         }
                     }
                 }
-                for q in &queued {
+                asked.extend(queued.iter().map(|q| (gc_row(q.id, &q.extent), q, false)));
+                // One call for each row, or one for all of them as the
+                // job makes it: the answers must be the same.
+                let answers = if dice.roll(2) == 0 {
+                    let rows: Vec<GcRow> = asked.iter().map(|(row, ..)| row.clone()).collect();
+                    t.collect_all(&rows, cutoff).await
+                } else {
+                    let mut answers = Vec::new();
+                    for (row, ..) in &asked {
+                        answers.push(t.collect(row, cutoff).await);
+                    }
+                    answers
+                };
+                for ((_, q, crossed), did) in asked.iter().zip(answers) {
+                    if *crossed {
+                        assert!(!did, "an extent went under the row of another: {q:?}");
+                        self.refused += 1;
+                        continue;
+                    }
                     let blob = blob_of(&q.extent);
                     let open = !q.done && q.action == "delete_safety";
-                    let did = t.collect(&gc_row(q.id, &q.extent), cutoff).await;
                     assert_eq!(did, open && due.contains(&blob), "{q:?}");
                     if did {
                         self.collected.insert(blob);

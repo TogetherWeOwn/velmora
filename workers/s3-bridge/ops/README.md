@@ -856,7 +856,8 @@ back: its extent id is never issued again, and only an open upload
 that lists an extent can publish it. A database taken back to before
 the drop does list it. Time Travel reaches 30 days, so a part that was
 dropped longer ago is dropped in every state the database can return
-to; the 31st day is the margin between the clocks. A database taken
+to, as long as it was not restored in that time ("After a restore"
+below); the 31st day is the margin between the clocks. A database taken
 back to before a part was collected still has the part dropped with
 its row open, and the collector deletes the absent copy once more.
 
@@ -893,8 +894,14 @@ has no object). The parts go with the pass after that.
      "SELECT COUNT(*) FROM extents WHERE state = 'staged' AND created_at < (SELECT CAST(strftime('%s', applied_at) AS INTEGER) * 1000 FROM d1_migrations WHERE name = '0007_key_floors.sql')"
    ```
 
+   The Worker version that came with that migration is the first one
+   that sets the mark. A version from before it may have served for a
+   while after the migration was applied, and serves again after a
+   Worker rollback: put the time from which only versions with the
+   mark have served in place of `applied_at` when it is the later one.
+
    If it does not, leave the switch off until every key that had an
-   upload before that migration has been written again: PUT an object
+   upload before that time has been written again: PUT an object
    to it, and DELETE that object after if the key should hold none. A
    DELETE alone is not enough there: such a key carries no mark, and
    on a key with no object and no mark a delete stores nothing, so the
@@ -909,15 +916,26 @@ pass reads the open `gc` rows in windows of 500, oldest first, and a
 job takes at most 100 parts; each part is one delete in `SAFETY` and
 three rows written (the extent, the usage counter, the `gc` row), plus
 one row per job for the position of the scan. After a pass over every
-due row the next one starts an hour later. A claim for a part whose
-upload is no longer known (point 7) reads the uploads of its bucket.
+due row the next one starts an hour later. The parts of a job whose
+upload is no longer known (point 7) are claimed behind one statement
+per bucket that reads every row of `uploads`, about two rows read per
+upload ever begun; it runs once per job and bucket, not once per part.
+While a marked key holds such parts back, that statement refuses them
+at that same cost in every job of every pass.
 
-**After a restore.** Time Travel cannot reach back past the 31 days. A
-database loaded from an export file that is older than that can list,
-in an open upload, a part whose copy was collected since. The replay
-counts such rows in `held_missing_total`; abort the uploads they belong
-to. A catalogue rebuilt from the records alone does not know the parts
-that were not collected yet: their copies stay in `SAFETY`.
+**After a restore.** Time Travel cannot reach back past the 31 days on
+the history the database is on. It can return to a state of a history
+that an earlier restore left, for 30 days after that restore, and such
+a state may list in an open upload a part that was dropped, and since
+collected, on the history that was kept. So after every Time Travel
+restore, also one that undoes another, set `GC_ORPHANS` to off and
+leave it off for 31 days.
+
+A database loaded from an export file that is older than 31 days can
+list, in an open upload, a part whose copy was collected since. The
+replay counts such rows in `held_missing_total`; abort the uploads they
+belong to. A catalogue rebuilt from the records alone does not know the
+parts that were not collected yet: their copies stay in `SAFETY`.
 
 With the switch off nothing is deleted, and the rows stay for a later
 run with the switch on.

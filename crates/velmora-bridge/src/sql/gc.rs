@@ -94,42 +94,78 @@ macro_rules! orphan {
     };
 }
 
-// Point 7 of the rule, for the extent id expression `$x`. The first
-// extent of a part that an abort or a completion dropped is still named
-// by its `upload_parts` row, which is never deleted: the key is that
-// upload's, and the check is one row of `key_floors`. A part that was
-// uploaded again lost that row to its successor, and the further
-// extents of a sliced part lost theirs when the part was dropped: for
-// those the key is not known, and every key an upload of the bucket was
-// ever made on must be free of the mark. That reads the uploads of the
-// catalogue once per claim, which is why the scan leaves this point to
-// the claim.
-macro_rules! no_stale_record {
+// Point 7 of the rule for an extent whose upload is known, for the
+// extent id expression `$x`. The first extent of a part that an abort
+// or a completion dropped is still named by its `upload_parts` row,
+// which is never deleted: the key is that upload's, and the check is
+// one row of `key_floors`.
+macro_rules! no_stale_record_of_upload {
     ($x:literal) => {
         concat!(
-            "(NOT EXISTS (SELECT 1 FROM upload_parts sp \
+            "NOT EXISTS (SELECT 1 FROM upload_parts sp \
                JOIN uploads su ON su.id = sp.upload_id \
                JOIN key_floors sf ON sf.bucket_id = su.bucket_id AND sf.key = su.key \
                WHERE sp.extent_id = ",
             $x,
-            " AND sf.unpublished <> 0) \
-             AND (EXISTS (SELECT 1 FROM upload_parts sp WHERE sp.extent_id = ",
-            $x,
-            ") OR NOT EXISTS (SELECT 1 FROM uploads su \
-               WHERE su.bucket_id = (SELECT se.bucket_id FROM extents se WHERE se.id = ",
-            $x,
-            ") AND EXISTS (SELECT 1 FROM key_floors sf \
-                 WHERE sf.bucket_id = su.bucket_id AND sf.key = su.key \
-                   AND sf.unpublished <> 0))))"
+            " AND sf.unpublished <> 0)"
         )
     };
 }
+
+// Point 7 for the extents whose upload is not known. A part that was
+// uploaded again lost its `upload_parts` row to its successor, and the
+// further extents of a sliced part lost theirs when the part was
+// dropped. For those every key an upload of the bucket (`?1`) was ever
+// made on must be free of the mark. `uploads` has no index that serves
+// this and no row of it is ever deleted, so the statement reads every
+// upload of the catalogue: it is a guard of its own, run once for all
+// the claims of a batch and never once per extent.
+const GUARD_NO_STALE_RECORD_IN_BUCKET: &str = "INSERT INTO tx_guard(ok) SELECT 0 WHERE EXISTS \
+       (SELECT 1 FROM uploads su WHERE su.bucket_id = ?1 AND EXISTS \
+          (SELECT 1 FROM key_floors sf WHERE sf.bucket_id = su.bucket_id \
+              AND sf.key = su.key AND sf.unpublished <> 0))";
+
+// One claim: points 1 to 5 and the first half of 7 for the row `?2` of
+// the extent `?1`, due at or before `?3`, and the record that the copy
+// is gone. It changes one row or none, and the count is the answer.
+// `deleted` is written again over itself for that reason: a claim that
+// is repeated after its blob delete failed must read as granted. The
+// repeat bumps the eviction fence again, which only refuses an eviction
+// listing taken before it.
+macro_rules! claim {
+    ($upload:literal) => {
+        concat!(
+            "UPDATE extents SET safety_state = 'deleted', hot_safety_bytes = 0, \
+               evict_seq = evict_seq + 1 \
+             WHERE id = ?1 AND EXISTS \
+               (SELECT 1 FROM gc WHERE id = ?2 AND extent_id = ?1 \
+                  AND action = 'delete_safety' AND done_at IS NULL AND due_at <= ?3) AND ",
+            orphan!("?1"),
+            " AND ",
+            no_stale_record_of_upload!("?1"),
+            " AND ",
+            $upload
+        )
+    };
+}
+
+// The upload of the extent is known: its `upload_parts` row is there,
+// and the key that row leads to is the only one a record that names
+// the extent can be of.
+const CLAIM_OF_UPLOAD: &str =
+    claim!("EXISTS (SELECT 1 FROM upload_parts kp WHERE kp.extent_id = ?1)");
+
+// It is not known: the claim holds only in a batch that carries
+// `GUARD_NO_STALE_RECORD_IN_BUCKET` for the bucket `?4`, which must be
+// the extent's own.
+const CLAIM_IN_BUCKET: &str = claim!("extents.bucket_id = ?4");
 
 use super::replay::guard_no_replay;
 use super::uploads::{guarded, ms, text, Cols, Stmt};
 use super::SqlCatalog;
 use crate::ports::{Guard, Sql, SqlValue, MAX_SQL_INT};
-use crate::types::{BlobStoreKind, ExtentId, GcAction, GcRow, GcStep, Result, UnixMs};
+use crate::types::{BlobStoreKind, BridgeError, ExtentId, GcAction, GcRow, GcStep, Result, UnixMs};
+use std::collections::BTreeMap;
 
 /// A refused row is looked at again after this long, so it cannot keep
 /// newer work out of the bounded `gc_due` window.
@@ -471,41 +507,94 @@ pub(super) async fn gc_orphans<S: Sql>(
     Ok(out)
 }
 
-/// The decision. One batch proves the whole rule of the module doc for
-/// the row and records that the copy is gone; `false` = refused, and
-/// nothing was written. The caller's copy of the row is not trusted:
-/// the id, the extent and the action must be those of one open row.
+/// The decision, for the rows of one window; the answers are in the
+/// order of `rows`. Each batch proves the whole rule of the module doc
+/// for every row it grants and records that the copy is gone; `false` =
+/// refused, and nothing was written for that row. The caller's copy of
+/// a row is not trusted: the id, the extent and the action must be those
+/// of one open row.
+///
+/// The rows are claimed in groups, so that what a claim costs does not
+/// grow with the number of rows: the extents whose upload is known in
+/// one batch, and the others in one batch per bucket, behind the one
+/// statement that reads the uploads (`GUARD_NO_STALE_RECORD_IN_BUCKET`).
+/// The read that sorts them is a hint and proves nothing. An extent
+/// never gains an `upload_parts` row after the batch that inserted it;
+/// one that lost its row since the read is refused here and sorted
+/// right by the next pass.
 pub(super) async fn gc_orphan_claim<S: Sql>(
     c: &SqlCatalog<S>,
-    row: &GcRow,
+    rows: &[GcRow],
     cutoff: UnixMs,
-) -> Result<bool> {
-    let extent = || text(row.extent_id.as_str());
-    let stmts: Vec<Stmt> = vec![
-        guard_no_replay(),
-        (
-            concat!(
-                "INSERT INTO tx_guard(ok) SELECT 0 WHERE NOT (EXISTS \
-                   (SELECT 1 FROM gc WHERE id = ?2 AND extent_id = ?1 \
-                      AND action = 'delete_safety' AND done_at IS NULL AND due_at <= ?3) AND ",
-                orphan!("?1"),
-                " AND ",
-                no_stale_record!("?1"),
-                ")"
-            ),
-            vec![extent(), SqlValue::Int(row.id), ms(cutoff)],
-        ),
+) -> Result<Vec<bool>> {
+    let mut granted = vec![false; rows.len()];
+    if rows.is_empty() {
+        return Ok(granted);
+    }
+    let ids: Vec<&str> = rows.iter().map(|r| r.extent_id.as_str()).collect();
+    let ids = serde_json::to_string(&ids)
+        .map_err(|_| BridgeError::Sql("gc_orphan_claim: encode".into()))?;
+    let found = c
+        .sql
+        .query(
+            "SELECT e.id, e.bucket_id, \
+               EXISTS (SELECT 1 FROM upload_parts kp WHERE kp.extent_id = e.id) \
+             FROM extents e WHERE e.id IN (SELECT value FROM json_each(?1))",
+            &[text(&ids)],
+        )
+        .await?;
+    // Extent id -> its bucket, or `None` when its upload is known.
+    let mut hint: BTreeMap<String, Option<String>> = BTreeMap::new();
+    for row in found {
+        let mut r = Cols::new(row);
+        let (id, bucket, known) = (r.text()?, r.text()?, r.num::<i64>()? != 0);
+        hint.insert(id, (!known).then_some(bucket));
+    }
+    // `None`: the group of the known uploads. An extent that does not
+    // exist is in no group and stays refused.
+    let mut groups: BTreeMap<Option<&str>, Vec<usize>> = BTreeMap::new();
+    for (i, row) in rows.iter().enumerate() {
+        if let Some(bucket) = hint.get(row.extent_id.as_str()) {
+            groups.entry(bucket.as_deref()).or_default().push(i);
+        }
+    }
+    for (bucket, members) in groups {
+        let mut stmts: Vec<Stmt> = vec![guard_no_replay()];
+        if let Some(bucket) = bucket {
+            stmts.push((GUARD_NO_STALE_RECORD_IN_BUCKET, vec![text(bucket)]));
+        }
+        let guards = stmts.len();
         // The catalogue says the copy is gone before it goes, never
         // after: from this batch on nothing is told that a pinned copy
         // exists. The row stays open until the delete is known to have
         // happened, so a delete that failed is repeated.
-        (
-            "UPDATE extents SET safety_state = 'deleted', hot_safety_bytes = 0, \
-               evict_seq = evict_seq + 1 WHERE id = ?1 AND safety_state = 'held'",
-            vec![extent()],
-        ),
-    ];
-    Ok(guarded(c, stmts).await? == Guard::Applied(()))
+        for i in &members {
+            let row = &rows[*i];
+            let mut params = vec![
+                text(row.extent_id.as_str()),
+                SqlValue::Int(row.id),
+                ms(cutoff),
+            ];
+            stmts.push(match bucket {
+                None => (CLAIM_OF_UPLOAD, params),
+                Some(bucket) => {
+                    params.push(text(bucket));
+                    (CLAIM_IN_BUCKET, params)
+                }
+            });
+        }
+        let changed = match c.sql.batch(stmts).await {
+            Ok(changed) => changed,
+            // A replay or a rollback, or a marked key in the bucket:
+            // the batch wrote nothing and every row of it is refused.
+            Err(BridgeError::GuardFailed) => continue,
+            Err(e) => return Err(e),
+        };
+        for (i, n) in members.iter().zip(changed.iter().skip(guards)) {
+            granted[*i] = *n != 0;
+        }
+    }
+    Ok(granted)
 }
 
 /// Closes the row of a part whose safety copy is deleted.

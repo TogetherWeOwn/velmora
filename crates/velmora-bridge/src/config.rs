@@ -128,6 +128,13 @@ pub enum GcMode {
 /// And it ends every request that could still name the part: a
 /// completion that read the part list before the drop has stored its
 /// recovery record, or never will, long before the wait is over.
+///
+/// What it assumes: the database stayed on one history for that long.
+/// A restore leaves a history that Time Travel can still return to for
+/// 30 days and that may date the drop later, or not have it. After any
+/// restore the switch is to stay off for this long: that is a rule for
+/// the operator (ops notes, "After a restore"), not one the collector
+/// enforces.
 pub const ORPHAN_GRACE_MS: i64 = 31 * 24 * 60 * 60 * 1000;
 
 /// `MAINTENANCE`.
