@@ -530,10 +530,30 @@ fn the_charge_is_a_window_and_never_more_than_a_held_body() {
     assert_eq!(STREAM_CHARGE_BYTES, 8 * (64 * 1024 + 16));
 }
 
+/// How each stream ended at the store (`true`: whole) and the bytes
+/// charged then.
+type StreamEnds = Rc<RefCell<Vec<(bool, u64)>>>;
+
+/// A rig whose budget has room for the fixed charge of one upload and
+/// no more, and what was charged each time a stream ended at the store
+/// (whole or with an error), while the store still held it.
+fn one_upload_rig() -> (Rig, StreamEnds) {
+    let budget = ByteBudget::new(STREAM_CHARGE_BYTES);
+    let rig = rig_with_budget(NoNntp, config(Vec::new()), budget);
+    let ends = Rc::new(RefCell::new(Vec::new()));
+    let (log, bridge) = (Rc::clone(&ends), Rc::downgrade(&rig.bridge));
+    *rig.bridge.safety.at_stream_end.borrow_mut() = Some(Box::new(move |whole| {
+        let bridge = bridge.upgrade().expect("the bridge of the rig");
+        log.borrow_mut().push((whole, bridge.budget.in_use()))
+    }));
+    (rig, ends)
+}
+
 /// A body item longer than the fixed charge allows for is charged beside
 /// it while it is held, whether or not the budget has room, and given
-/// back with it. Items of the size a Worker gets them in, and up to the
-/// allowance, cost nothing more.
+/// back when it is let go: before the store has the last piece, not
+/// only when the request ends. Items of the size a Worker gets them in,
+/// and up to the allowance, cost nothing more.
 #[tokio::test(flavor = "current_thread")]
 async fn a_long_body_item_is_charged_while_it_is_held() {
     let allowance = STREAM_ITEM_ALLOWANCE as usize;
@@ -555,10 +575,15 @@ async fn a_long_body_item_is_charged_while_it_is_held() {
         (MIB, MIB),
         (4 * MIB, body.len()),
     ] {
-        // Room for the fixed charge of one upload and no more.
-        let budget = ByteBudget::new(STREAM_CHARGE_BYTES);
-        let rig = rig_with_budget(NoNntp, config(Vec::new()), budget);
+        let (rig, ends) = one_upload_rig();
         let (bucket, signer) = rig.standard(BUCKET).await;
+        // What is charged at every piece the store takes.
+        let at_piece = Rc::new(RefCell::new(Vec::new()));
+        let (log, bridge) = (Rc::clone(&at_piece), Rc::downgrade(&rig.bridge));
+        *rig.bridge.safety.on_piece.borrow_mut() = Some(Box::new(move |_| {
+            let bridge = bridge.upgrade().expect("the bridge of the rig");
+            log.borrow_mut().push(bridge.budget.in_use())
+        }));
         let req = mode_req(&rig, &signer, KEY, &body, Mode::Unsigned);
         let r = send_in_pieces(&rig, req, piece).await;
         assert_eq!(r.status, 200, "pieces of {piece}: {}", r.text());
@@ -567,24 +592,81 @@ async fn a_long_body_item_is_charged_while_it_is_held() {
             STREAM_CHARGE_BYTES + 2 * longest as u64,
             "pieces of {piece}"
         );
+        // The last item was let go with the end of the body: before
+        // the store was given the final piece.
+        let at_piece = at_piece.borrow().clone();
+        assert_eq!(at_piece.len(), body.len().div_ceil(CHUNK_64K));
+        assert_eq!(at_piece.last(), Some(&STREAM_CHARGE_BYTES), "{piece}");
+        if piece > body.len() {
+            // One item, held from the first piece to the last but one.
+            let held = STREAM_CHARGE_BYTES + 2 * body.len() as u64;
+            assert!(at_piece[..at_piece.len() - 1].iter().all(|n| *n == held));
+        }
+        assert_eq!(
+            *ends.borrow(),
+            [(true, STREAM_CHARGE_BYTES)],
+            "pieces of {piece}"
+        );
         assert_eq!(rig.bridge.budget.in_use(), 0, "pieces of {piece}");
         let (_, extents) = rig.live(&bucket, KEY).await.unwrap();
         assert_eq!(extents[0].plain_sha256, digest, "pieces of {piece}");
     }
+}
 
-    // A refused body gives the charge of its item back as well.
-    let budget = ByteBudget::new(STREAM_CHARGE_BYTES);
-    let rig = rig_with_budget(NoNntp, config(Vec::new()), budget);
+/// A body that is refused, or whose store fails, while a long item is
+/// held gives the charge of that item back: at the refusal, and at the
+/// latest with the request.
+#[tokio::test(flavor = "current_thread")]
+async fn a_long_body_item_is_given_back_when_the_upload_fails() {
+    let body = pattern(13, 2 * MIB);
+    let item = 2 * MIB as u64;
+
+    // The body ends one byte short: its last item is nearly 1 MiB.
+    let (rig, ends) = one_upload_rig();
     let (_, signer) = rig.standard(BUCKET).await;
     let mut req = mode_req(&rig, &signer, KEY, &body, Mode::Unsigned);
     req.body.truncate(body.len() - 1);
     let r = send_in_pieces(&rig, req, MIB).await;
     r.expect_error(400, "IncompleteBody");
-    assert_eq!(
-        rig.bridge.budget.peak(),
-        STREAM_CHARGE_BYTES + 2 * MIB as u64
-    );
+    assert_eq!(rig.bridge.budget.peak(), STREAM_CHARGE_BYTES + item);
+    assert_eq!(*ends.borrow(), [(false, STREAM_CHARGE_BYTES)]);
     assert_eq!(rig.bridge.budget.in_use(), 0);
+
+    // The body fails after an item of 1 MiB, which is still held then.
+    let (rig, ends) = one_upload_rig();
+    let (_, signer) = rig.standard(BUCKET).await;
+    let mut request = in_pieces(mode_req(&rig, &signer, KEY, &body, Mode::Unsigned), MIB);
+    let Body::Stream {
+        declared_len,
+        stream,
+    } = request.body
+    else {
+        panic!("no body");
+    };
+    request.body = Body::Stream {
+        declared_len,
+        stream: stream
+            .take(1)
+            .chain(stream::iter([Err(BridgeError::Invalid("client gone"))]))
+            .boxed_local(),
+    };
+    let r = Resp::collect(Rc::clone(&rig.bridge).handle(request).await).await;
+    r.expect_error(400, "IncompleteBody");
+    assert_eq!(rig.bridge.budget.peak(), STREAM_CHARGE_BYTES + item);
+    assert_eq!(*ends.borrow(), [(false, STREAM_CHARGE_BYTES)]);
+    assert_eq!(rig.bridge.budget.in_use(), 0);
+
+    // The store fails after one piece, with an item of 1 MiB held.
+    let (rig, ends) = one_upload_rig();
+    let (_, signer) = rig.standard(BUCKET).await;
+    rig.bridge.safety.stop_stream_after.set(Some(1));
+    let req = mode_req(&rig, &signer, KEY, &body, Mode::Unsigned);
+    let r = send_in_pieces(&rig, req, MIB).await;
+    r.expect_error(500, "InternalError");
+    assert_eq!(rig.bridge.budget.peak(), STREAM_CHARGE_BYTES + item);
+    assert!(ends.borrow().is_empty());
+    assert_eq!(rig.bridge.budget.in_use(), 0);
+    assert!(blobs(&rig).is_empty());
 }
 
 /// Uploads of a whole extent each are under way at once in a budget

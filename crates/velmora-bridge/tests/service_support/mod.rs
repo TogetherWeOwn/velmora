@@ -261,6 +261,9 @@ pub struct Blobs {
     /// Called with the length of every piece of a stream as the store
     /// takes it.
     pub on_piece: RefCell<Option<PieceHook>>,
+    /// Called when a stream has ended (`true`) or given an error
+    /// (`false`), while the store still holds it.
+    pub at_stream_end: RefCell<Option<EndHook>>,
     /// A stream put fails once the store took this many pieces, without
     /// reading further.
     pub stop_stream_after: Cell<Option<usize>>,
@@ -270,6 +273,7 @@ pub struct Blobs {
 
 /// Told the length of a piece of a stream.
 pub type PieceHook = Box<dyn FnMut(usize)>;
+pub type EndHook = Box<dyn FnMut(bool)>;
 
 /// Makes another receipt of the true one.
 pub type ReceiptLie = fn(PutReceipt) -> PutReceipt;
@@ -361,15 +365,24 @@ impl BlobStore for Blobs {
         });
         let mut body = body;
         let mut bytes = Vec::new();
+        let ended = |whole: bool| {
+            if let Some(hook) = self.at_stream_end.borrow_mut().as_mut() {
+                hook(whole);
+            }
+        };
         loop {
             let taken = self.streams.borrow()[at].pieces.len();
             if self.stop_stream_after.get().is_some_and(|n| taken >= n) {
                 return Err(BridgeError::Blob("store down".into()));
             }
             match body.next().await {
-                None => break,
+                None => {
+                    ended(true);
+                    break;
+                }
                 Some(Err(e)) => {
                     self.streams.borrow_mut()[at].failed = true;
+                    ended(false);
                     return Err(e);
                 }
                 Some(Ok(piece)) => {
