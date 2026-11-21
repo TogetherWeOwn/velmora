@@ -116,25 +116,30 @@ impl KeyTarget for FakeTarget {
             .collect())
     }
 
-    /// As the port says: closing entries always; others only above the
-    /// held seq.
+    /// As the port says: per subject, in chain order.
     async fn apply(&self, to_seq: u64, entries: &[Entry]) -> Result<()> {
         if self.down.get() {
             return Err(BridgeError::Sql("fake: down".into()));
         }
         self.applies.set(self.applies.get() + 1);
-        let held = self.seq.get();
         let mut rows = self.rows.borrow_mut();
         for e in entries {
-            let closing = e.effective_status() != SubjectStatus::Active;
-            let reopened = rows
-                .get(&e.door.id)
-                .is_some_and(|r| r.private.is_none() && e.private.is_some());
-            if closing || e.last_seq > held || reopened {
+            let replace = match rows.get(&e.door.id) {
+                None => true,
+                Some(r) => {
+                    e.last_seq > r.last_seq
+                        || (e.last_seq == r.last_seq && r.private.is_none() && e.private.is_some())
+                }
+            };
+            if replace {
                 rows.insert(e.door.id.clone(), e.clone());
+            } else if e.door.status == SubjectStatus::Revoked {
+                if let Some(r) = rows.get_mut(&e.door.id) {
+                    r.door.status = SubjectStatus::Revoked;
+                }
             }
         }
-        self.seq.set(held.max(to_seq));
+        self.seq.set(self.seq.get().max(to_seq));
         Ok(())
     }
 }
@@ -760,6 +765,7 @@ async fn a_key_is_never_recorded_wider_than_its_principal_at_its_seq() {
                 9,
                 &p.door,
                 Some(&p.private),
+                true,
                 &mut TestRng(99),
             )
             .unwrap();
@@ -773,7 +779,9 @@ async fn a_key_is_never_recorded_wider_than_its_principal_at_its_seq() {
                     door: record.door,
                     private: record.private,
                     last_seq: 3,
+                    private_seq: 3,
                     tk_version: 1,
+                    closes: true,
                 },
             );
             w.root.seq.set(3);
@@ -1202,6 +1210,7 @@ async fn a_lost_seq_is_validated_again_at_the_new_head() {
         1,
         &door,
         e.private.as_ref(),
+        true,
         &mut TestRng(22),
     )
     .unwrap();
@@ -1276,18 +1285,18 @@ async fn a_retried_create_is_finished_not_refused() {
     }
 }
 
-/// The finisher goes to the directory first. With it down, the units
-/// get the closing entries only, and nothing is opened.
+/// The finisher brings the units up whether or not the directory
+/// answers: the stores order by subject, so no order of the two is
+/// unsafe, and a key a unit holds but the directory does not route is
+/// refused for want of a route.
 #[tokio::test(flavor = "current_thread")]
-async fn the_finisher_opens_nothing_while_the_directory_is_down() {
+async fn the_finisher_brings_the_units_up_while_the_directory_is_down() {
     let w = World::new();
     let adm = FakeAdmission::new(&w.root);
     let mut table = seed(&w, &adm).await;
     let units = w.units();
     let env = env!(w, &adm, &units);
     let mut rng = TestRng(41);
-    // A create (opening) and a disable (closing) are recorded while every
-    // store is down.
     for s in [&w.root, &w.unit2, &w.directory] {
         s.down.set(true);
     }
@@ -1304,7 +1313,6 @@ async fn the_finisher_opens_nothing_while_the_directory_is_down() {
             .unwrap(),
         KeyAnswer::Unfinished { seq: 4 }
     );
-    // The units come back; the directory does not.
     w.root.down.set(false);
     w.unit2.down.set(false);
     let report = finish_keys(&env, &mut rng).await.unwrap();
@@ -1312,20 +1320,14 @@ async fn the_finisher_opens_nothing_while_the_directory_is_down() {
     assert!(report.retry());
     for unit in [&w.root, &w.unit2] {
         assert_eq!(unit.status("AKVL0001"), Some(SubjectStatus::Disabled));
-        assert!(
-            unit.row("AKVL0002").is_none(),
-            "{} opened a key",
-            unit.label
-        );
-        assert_eq!(unit.seq.get(), 2, "keys_seq did not move");
+        assert_eq!(unit.status("AKVL0002"), Some(SubjectStatus::Active));
+        assert_eq!(unit.seq.get(), 4);
     }
+    assert!(w.directory.row("AKVL0002").is_none(), "not routed yet");
     w.directory.down.set(false);
     let report = finish_keys(&env, &mut rng).await.unwrap();
     assert!(!report.retry(), "{report:?}");
-    for store in [&w.root, &w.unit2, &w.directory] {
-        assert_eq!(store.status("AKVL0002"), Some(SubjectStatus::Active));
-        assert_eq!(store.status("AKVL0001"), Some(SubjectStatus::Disabled));
-    }
+    assert_eq!(w.directory.status("AKVL0002"), Some(SubjectStatus::Active));
     assert_eq!(w.intents.cleared.borrow().last(), Some(&4));
     assert!(w.intents.notes.borrow().is_empty(), "every row cleared");
 }
@@ -1493,49 +1495,347 @@ async fn a_checkpoint_that_cannot_be_written_stops_nothing() {
     assert_eq!(report.checkpoint, Some(256));
 }
 
-/// A disable, narrowing or re-enable of a subject whose private part is
-/// closed answers busy and writes nothing; a revoke goes through.
+/// A Worker that cannot open a subject's private part may still disable
+/// or revoke it: the record carries no private part and keeps the one
+/// before, so a later re-enable with the key restores the subject whole.
+/// A narrowing or a re-enable answers busy.
 #[tokio::test(flavor = "current_thread")]
-async fn only_a_revoke_is_recorded_without_the_private_part() {
+async fn a_close_without_the_private_part_keeps_the_one_before() {
     let w = World::new();
     let adm = FakeAdmission::new(&w.root);
-    let mut table = seed(&w, &adm).await;
-    // A Worker that holds key version 2 only: version 1's private parts
-    // stay closed for it.
+    let _ = seed(&w, &adm).await;
+    // A Worker that holds key version 2 only.
     let v2_only = OneKey(TenantKey::from_bytes(&w.t, 2, derived("tk v2")).unwrap());
     let units = w.units();
-    let env = env_with!(w, &v2_only, &adm, &units);
+    let blind = env_with!(w, &v2_only, &adm, &units);
     let mut rng = TestRng(46);
     let mut fresh = velmora_bridge::keys::record::KeyTable::empty(w.t.clone());
-    for req in [
-        disable("AKVL0001"),
-        KeyRequest::SetGrants {
-            id: "AKVL0001".into(),
-            grants: vec![grant("b_01", RO, Some("x/"))],
-            acting: None,
-        },
-    ] {
-        assert_eq!(
-            env.change(&mut fresh, "i", &req, &mut rng).await.unwrap(),
-            KeyAnswer::Busy
-        );
-    }
-    assert_eq!(w.head(), 2);
+    let narrow = KeyRequest::SetGrants {
+        id: "AKVL0001".into(),
+        grants: vec![grant("b_01", RO, Some("x/"))],
+        acting: None,
+    };
     assert_eq!(
-        env.change(&mut fresh, "r", &revoke("AKVL0001"), &mut rng)
+        blind
+            .change(&mut fresh, "n", &narrow, &mut rng)
+            .await
+            .unwrap(),
+        KeyAnswer::Busy
+    );
+    assert_eq!(
+        blind
+            .change(&mut fresh, "d", &disable("AKVL0001"), &mut rng)
             .await
             .unwrap(),
         KeyAnswer::Done { seq: 3 }
     );
-    // A reader with both versions folds the whole chain.
+    assert_eq!(
+        blind
+            .change(&mut fresh, "e", &enable("AKVL0001"), &mut rng)
+            .await
+            .unwrap(),
+        KeyAnswer::Busy
+    );
     let both = TwoKeys(
         TenantKey::from_bytes(&w.t, 1, derived("tk")).unwrap(),
         TenantKey::from_bytes(&w.t, 2, derived("tk v2")).unwrap(),
     );
     let read = read_key_chain(&w.store, &w.kek, &both, &w.t).await.unwrap();
+    let e = read.table.get("AKVL0001").unwrap();
+    assert_eq!(e.door.status, SubjectStatus::Disabled);
+    assert_eq!((e.last_seq, e.private_seq, e.tk_version), (3, 2, 1));
+    assert!(e.private.as_ref().unwrap().secret_wrapped.is_some());
+    // With every key, the re-enable restores it whole.
+    let full = env_with!(w, &both, &adm, &units);
+    let mut table = read.table.clone();
     assert_eq!(
-        read.table.get("AKVL0001").unwrap().door.status,
-        SubjectStatus::Revoked
+        full.change(&mut table, "e2", &enable("AKVL0001"), &mut rng)
+            .await
+            .unwrap(),
+        KeyAnswer::Done { seq: 4 }
     );
-    let _ = &mut table;
+    let row = w.root.row("AKVL0001").unwrap();
+    assert_eq!(row.effective_status(), SubjectStatus::Active);
+    assert!(row.private.unwrap().secret_wrapped.is_some());
+    // A revoke without the private part goes through too.
+    assert_eq!(
+        blind
+            .change(&mut fresh, "r", &revoke("AKVL0001"), &mut rng)
+            .await
+            .unwrap(),
+        KeyAnswer::Done { seq: 5 }
+    );
+}
+
+type HookFut<'a> = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + 'a>>;
+
+/// A store whose first `keys_seq` runs another call first (a concurrent
+/// request), then optionally fails (a timeout).
+struct Hooked<'a> {
+    inner: &'a FakeTarget,
+    hook: RefCell<Option<HookFut<'a>>>,
+    fail_after_hook: bool,
+}
+
+impl KeyTarget for Hooked<'_> {
+    fn label(&self) -> &str {
+        self.inner.label
+    }
+    async fn keys_seq(&self) -> Result<u64> {
+        let hook = self.hook.borrow_mut().take();
+        if let Some(h) = hook {
+            h.await;
+            if self.fail_after_hook {
+                return Err(BridgeError::Sql("fake: timed out".into()));
+            }
+        }
+        KeyTarget::keys_seq(self.inner).await
+    }
+    async fn closed(&self) -> Result<Vec<String>> {
+        KeyTarget::closed(self.inner).await
+    }
+    async fn apply(&self, to_seq: u64, entries: &[Entry]) -> Result<()> {
+        KeyTarget::apply(self.inner, to_seq, entries).await
+    }
+}
+
+/// A finisher whose read is stale (a disable was recorded and applied
+/// closed by a keyless finisher meanwhile) sends an older, open entry:
+/// the stores keep the newer one, and a retried disable is in force.
+#[tokio::test(flavor = "current_thread")]
+async fn a_stale_open_entry_never_replaces_a_newer_closed_one() {
+    let w = World::new();
+    let adm = FakeAdmission::new(&w.root);
+    let _ = seed(&w, &adm).await;
+    let units = w.units();
+    let both = TwoKeys(
+        TenantKey::from_bytes(&w.t, 1, derived("tk")).unwrap(),
+        TenantKey::from_bytes(&w.t, 2, derived("tk v2")).unwrap(),
+    );
+    let adm2 = FakeAdmission::new(&w.root);
+    let units2 = w.units();
+    let full2 = env_with!(w, &both, &adm2, &units2);
+    let v1 = env!(w, &adm2, &units2);
+    let mut rng2 = TestRng(93);
+    let mut t2 = velmora_bridge::keys::record::KeyTable::empty(w.t.clone());
+    let hook: HookFut<'_> = Box::pin(async {
+        for s in [&w.root, &w.unit2, &w.directory] {
+            s.down.set(true);
+        }
+        assert_eq!(
+            full2
+                .change(&mut t2, "d", &disable("AKVL0001"), &mut rng2)
+                .await
+                .unwrap(),
+            KeyAnswer::Unfinished { seq: 3 }
+        );
+        for s in [&w.root, &w.unit2, &w.directory] {
+            s.down.set(false);
+        }
+        let r = finish_keys(&v1, &mut rng2).await.unwrap();
+        assert_eq!(r.closed, vec!["AKVL0001".to_owned()]);
+        assert_eq!(w.root.status("AKVL0001"), Some(SubjectStatus::Disabled));
+    });
+    let dir = Hooked {
+        inner: &w.directory,
+        hook: RefCell::new(Some(hook)),
+        fail_after_hook: false,
+    };
+    // A full-ring finisher whose read was at seq 2; the units, then the
+    // directory (whose hook runs the other calls first).
+    let stale_units: [&FakeTarget; 0] = [];
+    let stale = KeyEnv {
+        store: &w.store,
+        kek: &w.kek,
+        ring: &both,
+        tenant: &w.t,
+        admission: &adm,
+        intents: &w.intents,
+        units: &stale_units,
+        directory: &dir,
+        clock: &w.clock,
+    };
+    let mut rng = TestRng(94);
+    let report = finish_keys(&stale, &mut rng).await.unwrap();
+    assert_eq!(report.head, 2, "the stale finisher's table");
+    // Now bring the units up from the same stale view, by hand.
+    let stale_table = {
+        let mut t = velmora_bridge::keys::record::KeyTable::empty(w.t.clone());
+        let chain = key_chain(&w.t);
+        for seq in 1..=2 {
+            let b = chain.get(&w.store, seq).await.unwrap();
+            t.apply(&open_key_record(&w.kek, &both, &w.t, seq, &b).unwrap())
+                .unwrap();
+        }
+        t
+    };
+    for unit in [&w.root, &w.unit2] {
+        let entries: Vec<Entry> = stale_table.entries().cloned().collect();
+        KeyTarget::apply(unit, 2, &entries).await.unwrap();
+        assert_eq!(
+            unit.status("AKVL0001"),
+            Some(SubjectStatus::Disabled),
+            "{}",
+            unit.label
+        );
+    }
+    // The next full run opens it as the disabled key it is.
+    let full = env_with!(w, &both, &adm, &units);
+    let report = finish_keys(&full, &mut rng).await.unwrap();
+    assert!(!report.retry(), "{report:?}");
+    let row = w.root.row("AKVL0001").unwrap();
+    assert_eq!(row.last_seq, 3);
+    assert!(row.private.is_some());
+    assert_eq!(row.effective_status(), SubjectStatus::Disabled);
+}
+
+/// A widening retried while the directory is still down is classed as
+/// the record that made it (opening): never Done before the directory.
+#[tokio::test(flavor = "current_thread")]
+async fn a_retried_widening_waits_for_the_directory() {
+    let w = World::new();
+    let adm = FakeAdmission::new(&w.root);
+    let mut table = seed(&w, &adm).await;
+    let units = w.units();
+    let env = env!(w, &adm, &units);
+    let mut rng = TestRng(70);
+    w.directory.down.set(true);
+    let wider = KeyRequest::SetGrants {
+        id: "AKVL0001".into(),
+        grants: vec![grant("b_01", RW, None)],
+        acting: None,
+    };
+    for _ in 0..2 {
+        assert_eq!(
+            env.change(&mut table, "w", &wider, &mut rng).await.unwrap(),
+            KeyAnswer::Unfinished { seq: 3 }
+        );
+    }
+    w.directory.down.set(false);
+    assert_eq!(
+        env.change(&mut table, "w", &wider, &mut rng).await.unwrap(),
+        KeyAnswer::Done { seq: 3 }
+    );
+}
+
+/// A closing change with the directory down answers Done, and leaves its
+/// pending row for the finisher.
+#[tokio::test(flavor = "current_thread")]
+async fn a_close_with_the_directory_down_keeps_its_pending_row() {
+    let w = World::new();
+    let adm = FakeAdmission::new(&w.root);
+    let mut table = seed(&w, &adm).await;
+    let units = w.units();
+    let env = env!(w, &adm, &units);
+    let mut rng = TestRng(71);
+    w.directory.down.set(true);
+    assert_eq!(
+        env.change(&mut table, "d", &disable("AKVL0001"), &mut rng)
+            .await
+            .unwrap(),
+        KeyAnswer::Done { seq: 3 }
+    );
+    assert!(w.intents.notes.borrow().iter().any(|(s, _)| *s == 3));
+    w.directory.down.set(false);
+    let report = finish_keys(&env, &mut rng).await.unwrap();
+    assert!(!report.retry());
+    assert!(w.intents.notes.borrow().is_empty());
+}
+
+/// A finisher without the key asks for a retry and keeps the rows.
+#[tokio::test(flavor = "current_thread")]
+async fn a_finisher_without_the_key_keeps_the_rows() {
+    let w = World::new();
+    let adm = FakeAdmission::new(&w.root);
+    let mut table = seed(&w, &adm).await;
+    let units = w.units();
+    let env = env!(w, &adm, &units);
+    let mut rng = TestRng(72);
+    w.root.down.set(true);
+    let key = s3_key(&w.t, "AKVL0002", "PR0001", &[grant("b_01", RO, None)]);
+    assert_eq!(
+        env.change(&mut table, "a", &KeyRequest::Create(key), &mut rng)
+            .await
+            .unwrap(),
+        KeyAnswer::Unfinished { seq: 3 }
+    );
+    w.root.down.set(false);
+    let nokeys = velmora_bridge::keys::record::NoKeys;
+    let blind = env_with!(w, &nokeys, &adm, &units);
+    let report = finish_keys(&blind, &mut rng).await.unwrap();
+    assert!(report.retry());
+    assert!(w.intents.notes.borrow().iter().any(|(s, _)| *s == 3));
+    assert_eq!(w.root.status("AKVL0002"), Some(SubjectStatus::Disabled));
+    let report = finish_keys(&env, &mut rng).await.unwrap();
+    assert!(!report.retry(), "{report:?}");
+    assert_eq!(w.root.status("AKVL0002"), Some(SubjectStatus::Active));
+    assert!(w.intents.notes.borrow().is_empty());
+}
+
+/// A cached table built while the ring missed a key opens again in the
+/// next change made with the key; a retried create with the key missing
+/// answers busy, not conflict; a create of a revoked id is refused.
+#[tokio::test(flavor = "current_thread")]
+async fn a_cached_table_opens_again_and_retries_need_the_key() {
+    let w = World::new();
+    let adm = FakeAdmission::new(&w.root);
+    let _ = seed(&w, &adm).await;
+    let units = w.units();
+    let mut rng = TestRng(73);
+    let nokeys = velmora_bridge::keys::record::NoKeys;
+    let blind = env_with!(w, &nokeys, &adm, &units);
+    let mut cached = velmora_bridge::keys::record::KeyTable::empty(w.t.clone());
+    let key = s3_key(&w.t, "AKVL0001", "PR0001", &[grant("b_01", RO, None)]);
+    assert_eq!(
+        blind
+            .change(&mut cached, "c", &KeyRequest::Create(key.clone()), &mut rng)
+            .await
+            .unwrap(),
+        KeyAnswer::Busy
+    );
+    assert!(cached.get("AKVL0001").unwrap().private.is_none());
+    let env = env!(w, &adm, &units);
+    let narrow = KeyRequest::SetGrants {
+        id: "AKVL0001".into(),
+        grants: vec![grant("b_01", RO, Some("x/"))],
+        acting: None,
+    };
+    assert_eq!(
+        env.change(&mut cached, "n", &narrow, &mut rng)
+            .await
+            .unwrap(),
+        KeyAnswer::Done { seq: 3 }
+    );
+    // The same content again, now with the key: a retry, Done.
+    let mut fresh = velmora_bridge::keys::record::KeyTable::empty(w.t.clone());
+    put_tenant_revocation(&w.store, &w.kek, &w.t, "AKVL0001", 5, &mut rng)
+        .await
+        .unwrap();
+    assert_eq!(
+        env.change(&mut fresh, "c", &KeyRequest::Create(key), &mut rng)
+            .await
+            .unwrap(),
+        KeyAnswer::Refused(Refusal::Conflict),
+        "a revoked id is never created again"
+    );
+}
+
+#[test]
+fn debug_output_shows_no_prefix_or_address() {
+    let g = Grant {
+        bucket_id: "b_01".into(),
+        access: RO,
+        expires_at: None,
+        prefix: Some("secret-folder/".into()),
+        ip_list: vec!["203.0.113.7".into()],
+    };
+    let req = KeyRequest::SetGrants {
+        id: "AKVL0001".into(),
+        grants: vec![g.clone()],
+        acting: None,
+    };
+    for shown in [format!("{g:?}"), format!("{req:?}")] {
+        assert!(!shown.contains("secret-folder"), "{shown}");
+        assert!(!shown.contains("203.0.113.7"), "{shown}");
+    }
 }

@@ -137,6 +137,8 @@ fn seal(
         10 + seq,
         &subject.door,
         Some(&subject.private),
+        // Closing statuses are classed closing, as the writer does.
+        op == KeyOp::Status && subject.door.status != SubjectStatus::Active,
         &mut rng,
     )
     .unwrap()
@@ -257,6 +259,8 @@ fn principal_record_round_trips_and_opens_door_without_tenant_key() {
             door: subject.door.clone(),
             private: Some(subject.private),
             tk_version: 1,
+            closes: false,
+            private_unchanged: false,
         }
     );
     let closed = open_key_record(&kek, &NoKeys, &t, 1, &bytes).unwrap();
@@ -293,6 +297,8 @@ fn fold(table: &mut KeyTable, op: KeyOp, subject: &Subject) {
             door: subject.door.clone(),
             private: Some(subject.private.clone()),
             tk_version: 1,
+            closes: false,
+            private_unchanged: false,
         })
         .unwrap();
 }
@@ -393,7 +399,9 @@ fn effective_status_closes_unreadable_subjects_and_preserves_revocation() {
         door: principal(PRINCIPAL, &[grant()]).door,
         private: None,
         last_seq: 1,
+        private_seq: 1,
         tk_version: 1,
+        closes: false,
     };
     assert_eq!(entry.effective_status(), SubjectStatus::Disabled);
     entry.door.status = SubjectStatus::Revoked;
@@ -631,15 +639,16 @@ async fn unreadable_newest_record_stays_closed_through_a_checkpoint() {
     assert_eq!(entry.private, None);
     assert_eq!(entry.effective_status(), SubjectStatus::Disabled);
 
-    // No checkpoint carries a closed subject: it would stay closed for
-    // every later reader, one with every key included.
+    // The checkpoint carries the subject closed, door fields only.
     let mut rng = TestRng::new("closed entry checkpoint");
-    assert!(matches!(
-        seal_checkpoint(&kek, &v1, &table, &newest, &mut rng),
-        Err(BridgeError::Invalid(
-            "key checkpoint would carry a closed subject"
-        ))
-    ));
+    let closed_cp = seal_checkpoint(&kek, &v1, &table, &newest, &mut rng).unwrap();
+    assert_eq!(
+        open_checkpoint(&kek, &v1, &t, 4, &closed_cp, &newest),
+        Some(table.clone())
+    );
+    // A reader with both versions that starts from that checkpoint opens
+    // the subject again from its own record.
+    store.plant(&checkpoint_name(&t, 4), closed_cp);
     // A reader with both versions opens it.
     struct Both(OneKey, OneKey);
     impl velmora_bridge::keys::record::TkRing for Both {
@@ -651,8 +660,14 @@ async fn unreadable_newest_record_stays_closed_through_a_checkpoint() {
         }
     }
     let both = Both(v1, v2);
-    let table = read_key_chain(&store, &kek, &both, &t).await.unwrap().table;
+    let read = read_key_chain(&store, &kek, &both, &t).await.unwrap();
+    assert_eq!(read.from_checkpoint, Some(4));
+    let table = read.table;
     assert!(table.get(KEY).unwrap().private.is_some());
+    assert_eq!(
+        table.get(KEY).unwrap().effective_status(),
+        SubjectStatus::Disabled
+    );
     let checkpoint = seal_checkpoint(&kek, &both, &table, &newest, &mut rng).unwrap();
     assert_eq!(
         open_checkpoint(&kek, &both, &t, 4, &checkpoint, &newest),
@@ -697,7 +712,8 @@ async fn a_checkpoint_with_duplicate_or_misaligned_subjects_is_skipped() {
         "seq": 512,
         "record_sha256": sha,
         "subjects": entries.iter().map(|e| serde_json::json!({
-            "door": e.door, "last_seq": e.last_seq, "tk_version": e.tk_version, "open": true
+            "door": e.door, "last_seq": e.last_seq, "private_seq": e.private_seq,
+            "tk_version": e.tk_version, "closes": e.closes, "open": true
         })).collect::<Vec<_>>(),
     });
     let privates = |dup: bool, misalign: bool| {
@@ -721,6 +737,41 @@ async fn a_checkpoint_with_duplicate_or_misaligned_subjects_is_skipped() {
         serde_json::json!({ "v": 1, "subjects": list })
     };
     let name = checkpoint_name(t, 512);
+    // A checkpoint that verifies but leaves the principal out: the records
+    // after it, made under that principal, do not fold into it, so the
+    // reader takes the one before.
+    let without_principal = serde_json::json!({
+        "v": 1,
+        "tenant": t.as_str(),
+        "seq": 512,
+        "record_sha256": door["record_sha256"].clone(),
+        "subjects": entries.iter().filter(|e| e.door.id != PRINCIPAL).map(|e| serde_json::json!({
+            "door": e.door, "last_seq": e.last_seq, "private_seq": e.private_seq,
+            "tk_version": e.tk_version, "closes": e.closes, "open": true
+        })).collect::<Vec<_>>(),
+    });
+    let without_private = serde_json::json!({
+        "v": 1,
+        "subjects": entries.iter().filter(|e| e.door.id != PRINCIPAL).map(|e| serde_json::json!({
+            "id": e.door.id, "private": e.private.clone().unwrap()
+        })).collect::<Vec<_>>(),
+    });
+    let sealed = seal_control(
+        &fixture.kek,
+        &name,
+        &ControlSealer::Managed(&fixture.ring.0),
+        &serde_json::to_vec(&without_principal).unwrap(),
+        Some(&serde_json::to_vec(&without_private).unwrap()),
+        &mut TestRng::new("crafted checkpoint 2"),
+    )
+    .unwrap();
+    fixture.store.plant(&name, sealed);
+    let read = read_key_chain(&fixture.store, &fixture.kek, &fixture.ring, t)
+        .await
+        .unwrap();
+    assert_eq!(read.from_checkpoint, Some(256));
+    assert_eq!(read.skipped_checkpoints, vec![512]);
+    assert_eq!(read.table, fixture.table);
     for (dup, misalign) in [(false, false), (true, false), (false, true)] {
         let sealed = seal_control(
             &fixture.kek,

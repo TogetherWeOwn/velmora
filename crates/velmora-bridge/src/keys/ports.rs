@@ -16,23 +16,23 @@ pub trait KeyTarget {
     fn label(&self) -> &str;
     /// The `keys_seq` this store holds.
     async fn keys_seq(&self) -> Result<u64>;
-    /// The subjects this store holds `disabled` only because their
-    /// private part was closed when they were applied
+    /// The subjects this store holds closed: applied while their private
+    /// part could not be opened, so held `disabled`
     /// ([`Entry::effective_status`]). They are sent again once the ring
-    /// opens them. The directory holds no private part and answers none.
+    /// opens them.
     async fn closed(&self) -> Result<Vec<String>>;
-    /// In one transaction:
-    /// - every entry whose status in force ([`Entry::effective_status`])
-    ///   is `disabled` or `revoked` is applied, whatever its seq: closing
-    ///   it again changes nothing;
-    /// - every other entry is applied only when its `last_seq` is above
-    ///   the store's `keys_seq`;
-    /// - the store's `keys_seq` becomes the larger of its own and
+    /// In one transaction, per subject, in the order of the chain:
+    /// - a subject the store does not hold is inserted;
+    /// - an entry replaces the subject's row only when its `last_seq` is
+    ///   above the row's; or when it is equal, the row is closed and the
+    ///   entry is not (the same record, now opened); so a stale entry
+    ///   never replaces a newer one, whichever way it closes or opens;
+    /// - a `revoked` entry sets the row `revoked` whatever its seq:
+    ///   revoked is final;
+    /// - then the store's `keys_seq` becomes the larger of its own and
     ///   `to_seq`.
     ///
-    /// An entry applied from a closed private part is remembered as such
-    /// ([`Self::closed`]) until an entry with its private part replaces
-    /// it.
+    /// The directory follows the same rule for what it holds of a key.
     async fn apply(&self, to_seq: u64, entries: &[Entry]) -> Result<()>;
 }
 
@@ -112,6 +112,9 @@ pub trait ControlIntents {
         kind: &str,
     ) -> Result<()>;
     /// Clears every row of `chain` of `tenant` at or below `seq` (step 5):
-    /// called once every store holds the chain to `seq`. Best effort.
+    /// called once every store holds the chain to `seq`. Best effort. A
+    /// row above the head that is older than its intent's delay and
+    /// retries names a change that was never recorded (refused after its
+    /// intent, or crashed); the pending sweep drops it.
     async fn clear(&self, tenant: &TenantId, chain: ControlChain, seq: u64) -> Result<()>;
 }
