@@ -164,6 +164,15 @@ impl<S: Sql> SqlCatalog<S> {
     fn active_gate(&self) -> Option<&dyn PermitGate> {
         self.gate.as_deref().filter(|g| g.active())
     }
+
+    /// The gate a permit of `class` is the business of. A drill's slots
+    /// (`drill_conns`) are never a gate's: they are rows under a name of
+    /// their own that no gate seizes, and a gate asked for one would
+    /// hand out a slot of the provider's `max_conns`, which a drill
+    /// must not take from reads and jobs.
+    fn gate_of(&self, class: PermitClass) -> Option<&dyn PermitGate> {
+        self.active_gate().filter(|_| class != PermitClass::Drill)
+    }
 }
 
 impl<S: Sql> Catalog for SqlCatalog<S> {
@@ -770,7 +779,7 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
         holder: &str,
         now: UnixMs,
     ) -> Result<Option<Permit>> {
-        let permit = match self.active_gate() {
+        let permit = match self.gate_of(class) {
             Some(gate) => gate.acquire(p, class, holder).await?,
             None => permits::acquire_permit(self, p, class, holder, now).await?,
         };
@@ -780,7 +789,8 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
         // cannot, so there nothing free is taken for it. At most once
         // per [`NUDGE_EVERY_MS`], and a failure of it is not a failure
         // of the acquire.
-        if let (None, Some(gate)) = (&permit, self.gate.as_deref()) {
+        let gate = self.gate.as_deref().filter(|_| class != PermitClass::Drill);
+        if let (None, Some(gate)) = (&permit, gate) {
             let due = match gate.active() {
                 true => gate.unowned(),
                 false => true,
@@ -793,7 +803,7 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
         Ok(permit)
     }
     async fn renew_permit(&self, p: &Permit, now: UnixMs) -> Result<bool> {
-        match self.active_gate() {
+        match self.gate_of(p.class) {
             Some(gate) => Ok(gate
                 .renew(core::slice::from_ref(p))
                 .await?
@@ -804,13 +814,13 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
         }
     }
     async fn release_permit(&self, p: &Permit) -> Result<()> {
-        match self.active_gate() {
+        match self.gate_of(p.class) {
             Some(gate) => gate.release(p).await,
             None => permits::release_permit(self, p).await,
         }
     }
     fn forget_permit(&self, p: &Permit) {
-        if let Some(gate) = self.active_gate() {
+        if let Some(gate) = self.gate_of(p.class) {
             gate.forget(p);
         }
     }
