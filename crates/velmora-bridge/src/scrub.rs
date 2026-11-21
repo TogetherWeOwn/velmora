@@ -704,10 +704,17 @@ where
             loop {
                 tries += 1;
                 let reused = kept.is_some() && tries == 1;
-                let session = match kept.filter(|_| reused) {
+                let mut session = match kept.filter(|_| reused) {
                     Some(at) => Some(stats.swap_remove(at)),
                     None => self.stat_session(provider, holder).await?,
                 };
+                if session.is_none() && !stats.is_empty() {
+                    // The slot may be one this run keeps for another
+                    // backbone (providers that share a pool): those are
+                    // ended, and the slot asked for once more.
+                    ProviderSession::close_all(core::mem::take(stats)).await;
+                    session = self.stat_session(provider, holder).await?;
+                }
                 let Some(mut session) = session else {
                     break;
                 };
@@ -947,6 +954,13 @@ where
         let bound = repair_bound_secs(self.cfg.safety_min_age_secs, cfg.confirm_secs);
         // Blob reads come first: no session sits open through them.
         Self::hang_up_all(reader, walk.stats).await;
+        // No live object holds it any more (deleted or overwritten while
+        // it was pinned): garbage collection's, not the scrub's. Nothing
+        // is read or written for it again.
+        if !self.catalog.scrub_live(&extent.id).await? {
+            self.catalog.scrub_drop(walk.token, &extent.id).await?;
+            return Ok(());
+        }
         // One charge for all this holds at once: the safety copy read
         // back, or a read from Usenet and the copy written from it.
         let bytes = cold_step_bytes(extent.cipher_size, reader.sockets());
