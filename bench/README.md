@@ -6,7 +6,7 @@ after.
 ## Layer 1: local and deterministic
 
 ```sh
-bench/run-local.sh [--ref <git ref>] [--name <name>] [--tiny <n>] [--cpu <cpu.json>]
+bench/run-local.sh [--ref <git ref>] [--name <name>] [--out <dir>] [--tiny <n>] [--cpu <cpu.json>]
 ```
 
 - Runs `crates/velmora-bridge/tests/bench_counts.rs`: the real `Bridge` over

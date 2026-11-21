@@ -29,6 +29,7 @@
 # end, so runs of the same ref may overlap.
 set -euo pipefail
 umask 022
+unset CDPATH
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 REPO=$(cd "$HERE/.." && pwd)
@@ -47,12 +48,15 @@ done
 log() { printf '[bench %s] %s\n' "$(date -u +%H:%M:%S)" "$*" >&2; }
 # The scratch directory holds the wrangler this script runs: it must be
 # ours and closed to other users, or another local user could put code
-# there that runs as us.
-mkdir -p "$WORK"
-if [[ -L $WORK || ! -O $WORK ]]; then
-  log "FAILED: $WORK is a symlink or not owned by $(id -un)"; exit 1
+# there that runs as us. A new one is made 700; an existing one that others
+# may write to is refused, not repaired (what they left there stays).
+while [[ $WORK == */ && $WORK != / ]]; do WORK=${WORK%/}; done
+if [[ ! -e $WORK ]]; then mkdir -p -- "$(dirname -- "$WORK")"; mkdir -m 700 -- "$WORK"; fi
+writable_by_others() { [[ -n $(find "$1" -maxdepth 0 -perm /022 2>/dev/null) ]]; }
+if [[ -L $WORK || ! -d $WORK || ! -O $WORK ]] || writable_by_others "$WORK"; then
+  log "FAILED: $WORK is a symlink, not a directory, not owned by $(id -un) or writable by others"; exit 1
 fi
-chmod 700 "$WORK"
+WORK=$(cd -P -- "$WORK" && pwd)
 
 SRC=$REPO
 RUN=''
@@ -97,14 +101,22 @@ OUT=${OUT:-$WORK/runs/$NAME}
 mkdir -p "$OUT"
 # The native run works in the checkout and cargo runs it from the package
 # directory: every path handed on is absolute.
-OUT=$(cd "$OUT" && pwd)
-[[ -z $CPU ]] || CPU=$(cd "$(dirname "$CPU")" && pwd)/$(basename "$CPU")
+OUT=$(cd -- "$OUT" && pwd)
+if [[ -n $CPU ]]; then
+  [[ -f $CPU ]] || { log "FAILED: --cpu $CPU: no such file"; exit 1; }
+  CPU=$(realpath -- "$CPU")
+fi
 log "measuring $NAME ($SRC) into $OUT${BENCH_VARS:+ with BENCH_VARS=$BENCH_VARS}"
 
 # Pinned wrangler (local D1 runtime), installed once. One run installs at a
 # time: two `npm ci` in one directory leave it half written.
 NODE_DIR=$WORK/node
 install_wrangler() {
+  for d in "$NODE_DIR" "$NODE_DIR/node_modules"; do
+    if [[ -e $d ]] && { [[ -L $d || ! -O $d ]] || writable_by_others "$d"; }; then
+      log "FAILED: $d is a symlink, not owned by $(id -un) or writable by others"; exit 1
+    fi
+  done
   if ! cmp -s "$REPO/workers/s3-bridge/package-lock.json" "$NODE_DIR/package-lock.json" 2>/dev/null \
     || [[ ! -x $NODE_DIR/node_modules/.bin/wrangler ]]; then
     log "installing the pinned wrangler into $NODE_DIR"

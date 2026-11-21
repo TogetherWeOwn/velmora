@@ -18,9 +18,11 @@ Cost model (list prices of prices.json, no included allowance):
 - ingest per extent = the multipart path per part (CreateMultipartUpload and
   CompleteMultipartUpload shared by the parts) + post + verify + release of a
   16 MiB extent + its eviction from the hot tier + the SAFETY storage of the
-  copy while it is held (SAFETY_MIN_AGE_SECS + VERIFY_DELAY_SECS);
-- the dispatcher (cron) runs while work is due are charged per extent (they
-  send the releases); its runs with nothing due are the fixed cost: per run
+  copy while it is held (the later of SAFETY_MIN_AGE_SECS and
+  VERIFY_DELAY_SECS: release comes at the later of the two);
+- the dispatcher (cron) runs of the release phase are charged per extent
+  (they send the releases); those of the delete phase (stage:cron_gc) are
+  shown, not priced; its runs with nothing due are the fixed cost: per run
   x 8,640 runs a month;
 - stored per TB-month: catalogue bytes per extent (dbstat) x D1 storage;
   released data is on Usenet, so R2 holds only the bounded hot tier

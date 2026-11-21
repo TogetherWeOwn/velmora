@@ -1043,7 +1043,6 @@ impl Bench {
         panic!("BENCH FAILED: outbox not drained: {}", self.outbox_dump());
     }
 
-    /// Cron ticks, each running every job it sent, until `done` says so.
     /// Cron runs (charged to `cron_label`) and the jobs they send, until
     /// `done`. The release phase charges its dispatcher runs to ingest
     /// (`stage:cron`), the delete phase to `stage:cron_gc`.

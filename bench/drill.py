@@ -16,7 +16,9 @@ Commands:
          TTFB (request sent to response headers), total, MiB/s over the
          total (request sent to last byte, as in every earlier run), SHA-256
          of the body (compared when --sha256 is given). A body shorter than
-         its Content-Length is a broken connection and is tried again
+         its Content-Length is a broken connection and is tried again; the
+         timings are then the last attempt's, so a line with retries > 0
+         is not comparable (a cold read may have filled the cache)
   list   --prefix P [--max-keys N]
          latency of each page of ListObjectsV2 until the prefix ends
   evict  --key K          POST /_admin/evict/<bucket>/<key>?include_safety=1;
@@ -177,14 +179,12 @@ def emit(**kv):
 
 
 def cmd_mpu(a, cl):
-    st, _, data, _, _, _ = cl.call("POST", a.key, [("uploads", "")])
-    if st != 200:
-        sys.exit(f"CreateMultipartUpload: {st} {data[:300]!r}")
-    upload = data.split(b"<UploadId>")[1].split(b"</UploadId>")[0].decode()
     nparts = -(-a.size // a.part)
     whole = hashlib.sha256()
     # The object goes to a temporary file first, one part at a time, so a
-    # large upload holds at most `concurrency` parts in memory.
+    # large upload holds at most `concurrency` parts in memory. It is
+    # written before the upload is created: a full disk leaves no upload
+    # open. Each part is read back (page cache) before its timer starts.
     spool = tempfile.TemporaryFile()
     for i in range(nparts):
         p = os.urandom(min(a.part, a.size - i * a.part))
@@ -192,11 +192,25 @@ def cmd_mpu(a, cl):
         spool.write(p)
     spool.flush()
     fd = spool.fileno()
+
+    def part(i):
+        want, off, out = min(a.part, a.size - i * a.part), i * a.part, bytearray()
+        while len(out) < want:
+            chunk = os.pread(fd, want - len(out), off + len(out))
+            if not chunk:
+                raise RuntimeError(f"part {i + 1}: the spool file ended at {off + len(out)}")
+            out += chunk
+        return bytes(out)
+
+    st, _, data, _, _, _ = cl.call("POST", a.key, [("uploads", "")])
+    if st != 200:
+        sys.exit(f"CreateMultipartUpload: {st} {data[:300]!r}")
+    upload = data.split(b"<UploadId>")[1].split(b"</UploadId>")[0].decode()
     etags = [None] * nparts
     lat = [0.0] * nparts
 
     def up(i):
-        body = os.pread(fd, min(a.part, a.size - i * a.part), i * a.part)
+        body = part(i)
         t = time.monotonic()
         s, etag, d, _, _, _ = cl.call("PUT", a.key, [("partNumber", str(i + 1)), ("uploadId", upload)], body)
         if s != 200:
@@ -331,7 +345,10 @@ def main():
         emit(metric="evict", key=a.key, status=st, seconds=round(t, 3), answer=answer)
         if st != 200:
             sys.exit(2)
-        if answer.get("safety_kept", 0) > 0:
+        kept = answer.get("safety_kept") if isinstance(answer, dict) else None
+        if not isinstance(kept, int):
+            sys.exit(2)
+        if kept > 0:
             sys.exit(3)
     else:
         st, body, t = admin(a.base, "GET", f"/objects/{a.bucket}/{urllib.parse.quote(a.key, safe='/')}")
