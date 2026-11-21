@@ -1032,12 +1032,32 @@ impl Catalog for MemCatalog {
             tokio::task::yield_now().await;
             self.acquire_in_flight.set(self.acquire_in_flight.get() - 1);
         }
+        if class == PermitClass::Drill {
+            // As in `sql::permits`: slots of their own, under another
+            // name, outside every count of the provider's.
+            let mut all = self.slots.borrow_mut();
+            let slots = all
+                .entry(p.drill_key())
+                .or_insert_with(|| vec![Slot::default(); p.drill_conns as usize]);
+            let Some(i) = (0..slots.len()).find(|&i| slots[i].until < now.0) else {
+                return Ok(None);
+            };
+            slots[i].token += 1;
+            slots[i].until = now.plus_secs(class.permit_secs()).0;
+            slots[i].holder = holder.to_string();
+            return Ok(Some(Permit {
+                provider: p.id.clone(),
+                slot: i as u32,
+                token: slots[i].token,
+                class,
+            }));
+        }
         self.seed_permits(core::slice::from_ref(p)).await?;
         let background = class == PermitClass::Background;
         let limit = |max: u32| max - u32::from(background && max >= 2);
         let conns = match class {
             PermitClass::Background => p.background_conns(),
-            PermitClass::Read => p.max_conns,
+            PermitClass::Read | PermitClass::Drill => p.max_conns,
         };
         let mut all = self.slots.borrow_mut();
         // Held slots of the whole pool count against its shared limit.
@@ -1235,7 +1255,7 @@ impl Catalog for MemCatalog {
             std::future::pending::<()>().await;
         }
         let mut slots = self.slots.borrow_mut();
-        let slot = &mut slots.get_mut(&p.provider).expect("seeded")[p.slot as usize];
+        let slot = &mut slots.get_mut(&slot_key(p)).expect("seeded")[p.slot as usize];
         // A freed or expired slot is not extended, as in `sql::permits`.
         if slot.token != p.token || slot.until < now.0 {
             return Ok(false);
@@ -1255,7 +1275,7 @@ impl Catalog for MemCatalog {
 
     async fn release_permit(&self, p: &Permit) -> Result<()> {
         let mut slots = self.slots.borrow_mut();
-        let slot = &mut slots.get_mut(&p.provider).expect("seeded")[p.slot as usize];
+        let slot = &mut slots.get_mut(&slot_key(p)).expect("seeded")[p.slot as usize];
         if slot.token == p.token {
             slot.until = 0;
         }
@@ -1792,6 +1812,7 @@ pub async fn rig(specs: &[Spec]) -> Rig {
             read: true,
             max_conns: spec.max_conns,
             max_ips: None,
+            drill_conns: 0,
             priority: 0,
             retention_days: None,
             pool: None,
@@ -2147,5 +2168,13 @@ impl Rig {
         ))
         .await
         .unwrap()
+    }
+}
+
+/// The name a permit's slot is kept under, as in `sql::permits`.
+fn slot_key(p: &Permit) -> String {
+    match p.class {
+        PermitClass::Drill => format!("{}{}", p.provider, velmora_bridge::types::DRILL_KEY_SUFFIX),
+        _ => p.provider.clone(),
     }
 }

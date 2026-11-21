@@ -34,13 +34,31 @@ type TestBridge =
 struct RacingSql {
     inner: RusqliteSql,
     race: RefCell<Option<&'static str>>,
+    /// The next `n` statements whose text contains the string fail, as
+    /// a catalogue that did not answer.
+    fail: RefCell<Option<(&'static str, u32)>>,
+}
+
+impl RacingSql {
+    fn injected(&self, sql: &str) -> Result<()> {
+        let mut fail = self.fail.borrow_mut();
+        match fail.as_mut() {
+            Some((part, left)) if *left > 0 && sql.contains(*part) => {
+                *left -= 1;
+                Err(BridgeError::Sql("injected: statement failed".into()))
+            }
+            _ => Ok(()),
+        }
+    }
 }
 
 impl Sql for RacingSql {
     async fn query(&self, sql: &str, params: &[SqlValue]) -> Result<Vec<Row>> {
+        self.injected(sql)?;
         self.inner.query(sql, params).await
     }
     async fn exec(&self, sql: &str, params: &[SqlValue]) -> Result<u64> {
+        self.injected(sql)?;
         if sql.starts_with("UPDATE extents SET safety_state") {
             if let Some(state) = self.race.take() {
                 let first = "UPDATE extents SET safety_state = ?1";
@@ -53,6 +71,11 @@ impl Sql for RacingSql {
         self.inner.batch(stmts).await
     }
 }
+
+/// Connections the fixture server gives its one account: enough for a
+/// drill over the drill connections of two providers beside what the
+/// providers' own slots allow.
+const SERVER_CONNS: usize = 8;
 
 struct Fx {
     bridge: Rc<TestBridge>,
@@ -135,7 +158,7 @@ impl Fx {
             USER.to_string(),
             UserConfig {
                 password: PASS.to_string(),
-                max_connections: 2,
+                max_connections: SERVER_CONNS,
             },
         );
         let server = TestNntpServer::spawn(config).await;
@@ -153,6 +176,7 @@ impl Fx {
             read: true,
             max_conns: 2,
             max_ips: None,
+            drill_conns: 0,
             priority: 0,
             retention_days: None,
             pool: None,
@@ -207,6 +231,7 @@ impl Fx {
             catalog: SqlCatalog::new(RacingSql {
                 inner: RusqliteSql::with_schema().unwrap(),
                 race: RefCell::new(None),
+                fail: RefCell::new(None),
             }),
             safety: MemBlobStore::new(),
             cache: MemBlobStore::new(),
@@ -333,75 +358,88 @@ impl Fx {
     /// What a finished PUT leaves: the sealed extent in both blob stores
     /// and one committed generation.
     async fn put(&self, bucket: &Bucket, key: &str, plain: &[u8]) -> Obj {
-        let n = self.next();
+        let mut extents = self.put_extents(bucket, key, &[plain]).await;
+        extents.remove(0)
+    }
+
+    /// [`Self::put`] for an object of several extents, one per piece.
+    async fn put_extents(&self, bucket: &Bucket, key: &str, pieces: &[&[u8]]) -> Vec<Obj> {
         let b = &self.bridge;
         let now = b.clock.now();
         let bdk = unwrap_bdk(&b.kek, bucket.kek_version, &bucket.id, &bucket.bdk_wrapped).unwrap();
-        let extent_id = ExtentId::mint([n; 13]);
-        let sealed = seal_extent(&bdk, &bucket.id, &extent_id, plain, &mut SystemRng).unwrap();
+        let size: usize = pieces.iter().map(|p| p.len()).sum();
         let generation = GenerationRow {
-            id: GenerationId::mint(now, [n; 8]),
+            id: GenerationId::mint(now, [self.next(); 8]),
             bucket_id: bucket.id.clone(),
             key: key.to_string(),
             state: GenerationState::Live,
-            size: plain.len() as u64,
+            size: size as u64,
             etag: "\"etag\"".to_string(),
             checksum_json: None,
             content_json: "{}".to_string(),
             user_meta_json: "{}".to_string(),
-            extent_count: 1,
+            extent_count: pieces.len() as u32,
             created_at: now,
             retired_at: None,
         };
-        let extent = ExtentRow {
-            id: extent_id.clone(),
-            bucket_id: bucket.id.clone(),
-            generation_id: Some(generation.id.clone()),
-            state: ExtentState::Committed,
-            seq: Some(0),
-            plain_offset: Some(0),
-            plain_size: plain.len() as u64,
-            cipher_size: sealed.ciphertext.len() as u64,
-            media_header: sealed.media_header.to_vec(),
-            key_mode: 1,
-            wrapped_file_key: Some(sealed.wrapped_file_key.to_vec()),
-            plain_md5: sealed.plain_md5,
-            plain_sha256: sealed.plain_sha256,
-            cipher_sha256: sealed.cipher_sha256,
-            safety_state: SafetyState::Held,
-            article_count: None,
-            plan_rev: 0,
-            last_verified_at: None,
-            release_evidence: None,
-            released_at: None,
-            created_at: now,
-        };
-        let meta = BlobMeta {
-            bucket: &bucket.id,
-            extent: &extent_id,
-            cipher_sha256: &sealed.cipher_sha256,
-        };
-        b.safety
-            .put(&extent_id.safety_key(), sealed.ciphertext.clone(), &meta)
-            .await
-            .unwrap();
-        b.cache
-            .put(&extent_id.cache_key(), sealed.ciphertext.clone(), &meta)
-            .await
-            .unwrap();
+        let mut extents = Vec::new();
+        let mut objs = Vec::new();
+        let mut offset = 0u64;
+        for (seq, plain) in pieces.iter().enumerate() {
+            let extent_id = ExtentId::mint([self.next(); 13]);
+            let sealed = seal_extent(&bdk, &bucket.id, &extent_id, plain, &mut SystemRng).unwrap();
+            extents.push(ExtentRow {
+                id: extent_id.clone(),
+                bucket_id: bucket.id.clone(),
+                generation_id: Some(generation.id.clone()),
+                state: ExtentState::Committed,
+                seq: Some(seq as u32),
+                plain_offset: Some(offset),
+                plain_size: plain.len() as u64,
+                cipher_size: sealed.ciphertext.len() as u64,
+                media_header: sealed.media_header.to_vec(),
+                key_mode: 1,
+                wrapped_file_key: Some(sealed.wrapped_file_key.to_vec()),
+                plain_md5: sealed.plain_md5,
+                plain_sha256: sealed.plain_sha256,
+                cipher_sha256: sealed.cipher_sha256,
+                safety_state: SafetyState::Held,
+                article_count: None,
+                plan_rev: 0,
+                last_verified_at: None,
+                release_evidence: None,
+                released_at: None,
+                created_at: now,
+            });
+            offset += plain.len() as u64;
+            let meta = BlobMeta {
+                bucket: &bucket.id,
+                extent: &extent_id,
+                cipher_sha256: &sealed.cipher_sha256,
+            };
+            b.safety
+                .put(&extent_id.safety_key(), sealed.ciphertext.clone(), &meta)
+                .await
+                .unwrap();
+            b.cache
+                .put(&extent_id.cache_key(), sealed.ciphertext.clone(), &meta)
+                .await
+                .unwrap();
+            objs.push(Obj {
+                extent: extent_id,
+                generation: generation.id.clone(),
+                plain: plain.to_vec(),
+            });
+        }
         b.catalog
             .publish(&CommitGeneration {
-                generation: generation.clone(),
-                extents: vec![extent],
+                generation,
+                extents,
                 now,
             })
             .await
             .unwrap();
-        Obj {
-            extent: extent_id,
-            generation: generation.id,
-            plain: plain.to_vec(),
-        }
+        objs
     }
 
     /// Runs the object's jobs until its outbox row is `stage`.
@@ -1148,17 +1186,41 @@ async fn object_status_evict_and_drill_after_release() {
         .collect();
     assert_eq!(taken.len(), 1, "{before} -> {after}");
     assert!(taken[0].ends_with(":0"), "{before} -> {after}");
+    let o_cipher_len: u64 = fx
+        .scalar("SELECT cipher_size FROM extents", &[])
+        .await
+        .parse()
+        .unwrap();
+    let mut v = r.json();
+    // The two that are not the same from run to run.
+    let state = v.as_object_mut().unwrap().remove("state");
+    let generation = v.as_object_mut().unwrap().remove("generation");
+    assert!(state.is_some_and(|s| s.is_string()));
+    assert_eq!(generation, Some(json!(o.generation.as_str())));
+    let digests = json!({
+        "bytes": plain.len(),
+        "sha256": hex(&sha256(&plain)),
+        "md5": hex(&md5::compute(&plain).0),
+    });
     assert_eq!(
-        r.json(),
+        v,
         json!({
             "source": "nntp",
             "provider": "p0",
+            "providers": { "p0": { "articles": 3, "bytes": o_cipher_len } },
             "articles": 3,
             "extents": 1,
             "size": plain.len(),
-            "plaintext_sha256": hex(&sha256(&plain)),
+            "range": { "first": 0, "last": plain.len() - 1 },
+            "plaintext_sha256": digests["sha256"],
+            "plaintext_md5": digests["md5"],
+            "running": digests,
             "match": true,
             "retries": 0,
+            // No provider has drill connections: one connection, taken
+            // from the provider's own, whatever the request asks for.
+            "sockets": 1,
+            "sessions": 1,
         })
     );
     assert!(
@@ -1460,6 +1522,655 @@ async fn a_drill_that_skipped_a_refusing_provider_is_never_a_mismatch() {
     assert!(r.json().get("match").is_none());
     assert_eq!(fx.bridge.nntp.dials_to("p1") - dialed, 1);
     assert_eq!(polls.get(), service::INTERRUPTED_RETRIES);
+    assert_eq!(fx.bridge.nntp.live(), 0);
+    assert_eq!(fx.bridge.budget.in_use(), 0);
+}
+
+/// Sizes of the extents of [`drill_object`].
+const PIECES: [usize; 3] = [700_001, 1_500_003, 300_007];
+
+/// An object of three extents under `scratch/k`, posted, verified and
+/// released, then evicted: it exists on Usenet only. Returns its extents
+/// and its plaintext.
+async fn drill_object(fx: &Fx) -> (Vec<Obj>, Vec<u8>) {
+    let bucket = fx.bucket("scratch").await;
+    let whole = nntp_support::marked_plaintext(PIECES.iter().sum());
+    let (a, rest) = whole.split_at(PIECES[0]);
+    let (b, c) = rest.split_at(PIECES[1]);
+    let objs = fx.put_extents(&bucket, "k", &[a, b, c]).await;
+    for o in &objs {
+        fx.drive(o, OutboxStage::Done).await;
+    }
+    let r = fx.post("/evict/scratch/k?include_safety=1").await;
+    assert_eq!((r.status, &r.json()["evicted"]), (200, &json!(3)));
+    assert_eq!(blobs(fx), 0, "cache and pinned copies are gone");
+    (objs, whole)
+}
+
+/// The blobs of extents in either store: cached ciphertext and pinned
+/// safety copies. The manifests under `m/` are not counted.
+fn blobs(fx: &Fx) -> usize {
+    let pinned = fx.bridge.safety.keys();
+    fx.bridge.cache.keys().len() + pinned.iter().filter(|k| !k.starts_with("m/")).count()
+}
+
+fn md5_hex(bytes: &[u8]) -> String {
+    hex(&md5::compute(bytes).0)
+}
+
+/// Every row a drill could have changed, as one string.
+async fn object_rows(fx: &Fx) -> String {
+    let mut out = String::new();
+    for sql in [
+        "SELECT group_concat(id || ':' || state || ':' || safety_state || ':' || plan_rev || ':' \
+           || coalesce(last_verified_at, '') || ':' || coalesce(released_at, '') || ':' \
+           || coalesce(last_read_at, ''), ',') \
+         FROM (SELECT * FROM extents ORDER BY id)",
+        "SELECT group_concat(extent_id || ':' || idx || ':' || state, ',') \
+         FROM (SELECT * FROM articles ORDER BY extent_id, idx)",
+        "SELECT group_concat(extent_id || ':' || stage || ':' || attempts, ',') \
+         FROM (SELECT * FROM outbox ORDER BY extent_id)",
+        "SELECT group_concat(id || ':' || state, ',') FROM (SELECT * FROM generations ORDER BY id)",
+    ] {
+        out.push_str(&fx.scalar(sql, &[]).await);
+        out.push('|');
+    }
+    out
+}
+
+/// A drill of a byte range reads the extents the bytes are in, whole,
+/// and hashes the bytes of the range only. It writes nothing: no blob in
+/// either store, and no row of the object.
+#[tokio::test]
+async fn a_drill_of_a_range_reads_its_extents_and_hashes_its_bytes() {
+    let fx = Fx::new().await;
+    let (objs, whole) = drill_object(&fx).await;
+    let rows = object_rows(&fx).await;
+    let articles_of = |extents: &[&Obj]| {
+        let ids: Vec<String> = extents
+            .iter()
+            .map(|o| format!("'{}'", o.extent.as_str()))
+            .collect();
+        format!(
+            "SELECT COUNT(*) FROM articles WHERE extent_id IN ({})",
+            ids.join(",")
+        )
+    };
+
+    // From inside the first extent to inside the second.
+    let (first, last) = (650_000usize, 800_000usize);
+    let r = fx
+        .post(&format!("/drill/scratch/k?range={first}-{last}"))
+        .await;
+    assert_eq!(r.status, 200, "{}", r.text());
+    let v = r.json();
+    let piece = &whole[first..=last];
+    assert_eq!(v["match"], true);
+    assert_eq!(v["range"], json!({ "first": first, "last": last }));
+    assert_eq!(v["size"], whole.len());
+    assert_eq!(v["extents"], 2);
+    let expected = fx.scalar(&articles_of(&[&objs[0], &objs[1]]), &[]).await;
+    assert_eq!(v["articles"].to_string(), expected);
+    assert_eq!(v["plaintext_sha256"], hex(&sha256(piece)));
+    assert_eq!(v["plaintext_md5"], md5_hex(piece));
+    // A range past byte 0 that was handed no state hands none on: it
+    // would stand for these bytes alone.
+    assert_eq!((&v["running"], &v["state"]), (&Value::Null, &Value::Null));
+
+    // To the end: the last extent alone. A last byte past the end is the end.
+    let from = PIECES[0] + PIECES[1];
+    for range in [format!("{from}-"), format!("{from}-99999999999")] {
+        let v = fx
+            .post(&format!("/drill/scratch/k?range={range}"))
+            .await
+            .json();
+        assert_eq!(
+            (&v["match"], &v["extents"]),
+            (&json!(true), &json!(1)),
+            "{range}"
+        );
+        assert_eq!(
+            v["range"],
+            json!({ "first": from, "last": whole.len() - 1 })
+        );
+        assert_eq!(v["plaintext_md5"], md5_hex(&whole[from..]));
+        let expected = fx.scalar(&articles_of(&[&objs[2]]), &[]).await;
+        assert_eq!(v["articles"].to_string(), expected);
+    }
+
+    // One byte, the last of an extent; and the whole object.
+    let at = PIECES[0] - 1;
+    let v = fx
+        .post(&format!("/drill/scratch/k?range={at}-{at}"))
+        .await
+        .json();
+    assert_eq!((&v["match"], &v["extents"]), (&json!(true), &json!(1)));
+    assert_eq!(v["plaintext_md5"], md5_hex(&whole[at..=at]));
+    let v = fx.post("/drill/scratch/k").await.json();
+    assert_eq!((&v["match"], &v["extents"]), (&json!(true), &json!(3)));
+    assert_eq!(v["plaintext_md5"], md5_hex(&whole));
+    assert_eq!(v["plaintext_sha256"], hex(&sha256(&whole)));
+
+    // Not a range of the object.
+    for range in ["5-4", "a-b", "-5", "7", "1-2-3", "+1-2", ""] {
+        let r = fx.post(&format!("/drill/scratch/k?range={range}")).await;
+        assert_eq!(r.status, 400, "{range}: {}", r.text());
+    }
+    let r = fx
+        .post(&format!("/drill/scratch/k?range={}-", whole.len()))
+        .await;
+    assert_eq!(r.status, 416, "{}", r.text());
+
+    // Usenet only, and read only.
+    assert_eq!(blobs(&fx), 0);
+    assert_eq!(object_rows(&fx).await, rows);
+    assert_eq!(fx.bridge.nntp.live(), 0);
+    assert_eq!(fx.bridge.budget.in_use(), 0);
+}
+
+/// Ranges read one after the other, each handed the `state` of the one
+/// before, end with the MD5 and the SHA-256 of the whole object: what
+/// the caller has from the source of the bytes.
+#[tokio::test]
+async fn ranges_handed_their_state_give_the_digests_of_the_whole() {
+    let fx = Fx::new().await;
+    let (_, whole) = drill_object(&fx).await;
+    // Cuts inside extents, not on their edges.
+    let cuts = [0, 1_000_000, 2_300_000, whole.len()];
+    let mut state: Option<String> = None;
+    let mut last = Value::Null;
+    for pair in cuts.windows(2) {
+        let (from, to) = (pair[0], pair[1]);
+        let state_arg = state.map(|s| format!("&state={s}")).unwrap_or_default();
+        let path = format!("/drill/scratch/k?range={from}-{}{state_arg}", to - 1);
+        let r = fx.post(&path).await;
+        assert_eq!(r.status, 200, "{}", r.text());
+        last = r.json();
+        assert_eq!(last["match"], true);
+        // Of this range alone, and of everything so far.
+        assert_eq!(last["plaintext_md5"], md5_hex(&whole[from..to]));
+        assert_eq!(last["running"]["bytes"], to);
+        assert_eq!(last["running"]["md5"], md5_hex(&whole[..to]));
+        state = Some(last["state"].as_str().expect("a state").to_string());
+    }
+    assert_eq!(
+        last["running"],
+        json!({ "bytes": whole.len(), "sha256": hex(&sha256(&whole)), "md5": md5_hex(&whole) })
+    );
+
+    // A state that is none is refused before anything is read.
+    let connects = fx.bridge.nntp.connects();
+    for state in ["x", "AAAA", &"A".repeat(600)] {
+        let r = fx
+            .post(&format!("/drill/scratch/k?range=0-9&state={state}"))
+            .await;
+        assert_eq!(r.status, 400, "{}", r.text());
+    }
+    assert_eq!(fx.bridge.nntp.connects(), connects);
+
+    // Nor is the state of other bytes than those before the range: the
+    // running digests would be of no object.
+    let first = fx.post("/drill/scratch/k?range=0-999999").await.json();
+    let state = first["state"].as_str().expect("a state");
+    for range in ["0-9", "999999-", "1000001-"] {
+        let r = fx
+            .post(&format!("/drill/scratch/k?range={range}&state={state}"))
+            .await;
+        assert_eq!(r.status, 400, "{range}: {}", r.text());
+    }
+    let connects = fx.bridge.nntp.connects() - connects;
+    assert_eq!(connects, 1, "only the range that gave the state was read");
+    let r = fx
+        .post(&format!("/drill/scratch/k?range=1000000-&state={state}"))
+        .await;
+    assert_eq!(r.json()["running"]["md5"], md5_hex(&whole));
+}
+
+/// A drill of many extents does not hold a request of the same isolate
+/// off until it ends: between two extents it gives its room to a charge
+/// that waits for it, and reads on after it.
+#[tokio::test]
+async fn a_drill_lets_a_waiting_request_in_between_extents() {
+    use velmora_bridge::ingress::CHARGE_POLL_MS;
+    // A wait for room is a short real one; any other sleep is a timer
+    // that watches over a call, and never fires.
+    let fx = Fx::with_sleeper(|_| {
+        Rc::new(|ms| match ms == CHARGE_POLL_MS {
+            true => Box::pin(tokio::time::sleep(std::time::Duration::from_millis(1))),
+            false => Box::pin(std::future::pending()),
+        })
+    })
+    .await;
+    let (_, whole) = drill_object(&fx).await;
+    let drilled = Cell::new(false);
+    let let_in = Cell::new(false);
+    let drill = async {
+        let r = fx.post("/drill/scratch/k").await;
+        drilled.set(true);
+        r
+    };
+    // Fits alone, and not beside the drill's charge.
+    let other = async {
+        let charge = fx.bridge.budget.charge(BUDGET - 1024).await;
+        let_in.set(charge.is_ok() && !drilled.get());
+    };
+    let (r, ()) = tokio::join!(drill, other);
+    assert!(let_in.get(), "the request waited for the whole drill");
+    assert_eq!(r.status, 200, "{}", r.text());
+    let v = r.json();
+    assert_eq!((&v["match"], &v["extents"]), (&json!(true), &json!(3)));
+    assert_eq!(v["plaintext_md5"], md5_hex(&whole));
+    assert_eq!(fx.bridge.nntp.live(), 0);
+    assert_eq!(fx.bridge.budget.in_use(), 0);
+}
+
+/// A drill logs in once and reads every extent over that session: not
+/// once per extent.
+#[tokio::test]
+async fn a_drill_keeps_its_session_from_one_extent_to_the_next() {
+    let fx = Fx::new().await;
+    let (_, whole) = drill_object(&fx).await;
+    let connects = fx.bridge.nntp.connects();
+    let r = fx.post("/drill/scratch/k").await;
+    assert_eq!(r.status, 200, "{}", r.text());
+    let v = r.json();
+    assert_eq!((&v["match"], &v["extents"]), (&json!(true), &json!(3)));
+    assert_eq!(v["plaintext_md5"], md5_hex(&whole));
+    assert_eq!(v["sessions"], 1);
+    assert_eq!(
+        fx.bridge.nntp.connects() - connects,
+        1,
+        "one login for three extents"
+    );
+    assert_eq!(fx.bridge.nntp.live(), 0);
+}
+
+/// Two readers on the fixture server, each with `drill_conns` drill
+/// connections; `p1` is of a lower tier, as a provider kept for
+/// fallback is.
+fn two_drill_providers(drill_conns: u32) -> impl FnOnce(&mut Vec<ProviderConfig>) {
+    move |providers| {
+        providers[0].drill_conns = drill_conns;
+        let mut other = providers[0].clone();
+        other.id = "p1".to_string();
+        other.post = false;
+        other.priority = 2;
+        providers.push(other);
+    }
+}
+
+const SLOTS: &str = "SELECT group_concat(provider_id || ':' || slot || ':' || token || ':' \
+                       || (lease_until > 0), ',') \
+                     FROM (SELECT * FROM provider_permits WHERE provider_id IN ('p0', 'p1') \
+                           ORDER BY provider_id, slot)";
+
+/// With drill connections the drill reads over several sockets, on the
+/// providers of every tier at once, and takes no slot a read or a job
+/// could have had: here every such slot is held by others, and the drill
+/// neither waits nor changes one.
+#[tokio::test]
+async fn a_drill_reads_over_the_drill_connections_of_every_provider() {
+    let fx = Fx::with_providers(Environment::Dev, Maintenance::Off, two_drill_providers(2)).await;
+    let (_, whole) = drill_object(&fx).await;
+    let now = fx.bridge.clock.now();
+    for p in &fx.bridge.cfg.providers {
+        let catalog = &fx.bridge.catalog;
+        while let Ok(Some(_)) = catalog
+            .acquire_permit(p, PermitClass::Read, "other", now)
+            .await
+        {}
+    }
+    let before = fx.scalar(SLOTS, &[]).await;
+    assert_eq!(before.matches(":1,").count() + 1, 4, "{before}");
+
+    let connects = fx.bridge.nntp.connects();
+    let r = fx.post("/drill/scratch/k?sockets=4").await;
+    assert_eq!(r.status, 200, "{}", r.text());
+    let v = r.json();
+    assert_eq!((&v["match"], &v["retries"]), (&json!(true), &json!(0)));
+    assert_eq!(v["plaintext_md5"], md5_hex(&whole));
+    assert_eq!(v["plaintext_sha256"], hex(&sha256(&whole)));
+    assert_eq!(v["sockets"], 4);
+    // Both providers supplied articles, whatever their tier.
+    let share = v["providers"].as_object().unwrap();
+    assert!(
+        share.contains_key("p0") && share.contains_key("p1"),
+        "{share:?}"
+    );
+    let supplied: u64 = share
+        .values()
+        .map(|p| p["articles"].as_u64().unwrap())
+        .sum();
+    assert_eq!(supplied, v["articles"].as_u64().unwrap());
+    // Never more slots than sockets, and never more logins than slots:
+    // the connections were kept from extent to extent.
+    let sessions = v["sessions"].as_u64().unwrap();
+    assert!((2..=4).contains(&sessions), "{sessions}");
+    let logins = u64::from(fx.bridge.nntp.connects() - connects);
+    assert!((2..=sessions).contains(&logins), "{logins} of {sessions}");
+
+    // The slots of reads and jobs: not one taken, renewed or freed.
+    assert_eq!(fx.scalar(SLOTS, &[]).await, before);
+    // The drill's own: at most `drill_conns` per provider, all free again.
+    let drill = "SELECT provider_id || ':' || COUNT(*) || ':' || SUM(lease_until > 0) \
+                 FROM provider_permits WHERE provider_id LIKE '%/drill' GROUP BY provider_id \
+                 ORDER BY provider_id";
+    let rows = fx.bridge.catalog.sql.query(drill, &[]).await.unwrap();
+    let rows: Vec<String> = rows
+        .into_iter()
+        .map(|r| match &r[0] {
+            SqlValue::Text(s) => s.clone(),
+            other => panic!("{other:?}"),
+        })
+        .collect();
+    assert_eq!(rows, ["p0/drill:2:0", "p1/drill:2:0"]);
+    assert_eq!(fx.bridge.nntp.live(), 0);
+    assert_eq!(fx.bridge.budget.in_use(), 0);
+}
+
+/// `sockets` is a number from 1 to `COLD_SOCKETS`.
+#[tokio::test]
+async fn a_drill_refuses_a_socket_count_out_of_range() {
+    let fx = Fx::with_providers(Environment::Dev, Maintenance::Off, two_drill_providers(2)).await;
+    let (_, whole) = drill_object(&fx).await;
+    for sockets in ["0", "5", "-1", "x", ""] {
+        let r = fx
+            .post(&format!("/drill/scratch/k?sockets={sockets}"))
+            .await;
+        assert_eq!(r.status, 400, "{sockets}: {}", r.text());
+    }
+    let v = fx.post("/drill/scratch/k?sockets=1").await.json();
+    assert_eq!((&v["sockets"], &v["sessions"]), (&json!(1), &json!(1)));
+    assert_eq!(v["plaintext_md5"], md5_hex(&whole));
+}
+
+/// A session that a provider breaks off in the middle of a drill over
+/// several sockets costs the drill nothing but that session: the article
+/// is read again, and the digests are those of the object.
+#[tokio::test]
+async fn a_drill_over_several_sockets_outlives_a_broken_session() {
+    let polls = Rc::new(Cell::new(0u32));
+    let weak: Rc<RefCell<std::rc::Weak<TestBridge>>> = Rc::default();
+    let sleeper = drill_sleeper(polls.clone(), weak.clone(), Rc::new(|_| Box::pin(async {})));
+    let sleeper: Box<dyn FnOnce(FixedClock) -> Sleeper> = Box::new(sleeper);
+    let edit = two_drill_providers(2);
+    let fx = Fx::build(Environment::Dev, Maintenance::Off, edit, Some(sleeper)).await;
+    *weak.borrow_mut() = Rc::downgrade(&fx.bridge);
+    let (_, whole) = drill_object(&fx).await;
+    for breaks in [1, 2] {
+        fx.server.drop_next_bodies(breaks).await;
+        let r = fx.post("/drill/scratch/k?sockets=4").await;
+        assert_eq!(r.status, 200, "{}", r.text());
+        let v = r.json();
+        assert_eq!(v["match"], true, "{v}");
+        assert_eq!(v["plaintext_md5"], md5_hex(&whole));
+        assert_eq!(v["plaintext_sha256"], hex(&sha256(&whole)));
+        assert_eq!(fx.bridge.nntp.live(), 0);
+        assert_eq!(fx.bridge.budget.in_use(), 0);
+        // The slots of the sessions that broke are free as well.
+        let held = "SELECT COUNT(*) FROM provider_permits WHERE lease_until > 0";
+        assert_eq!(fx.scalar(held, &[]).await, "0");
+    }
+    assert_eq!(blobs(&fx), 0);
+}
+
+/// A catalogue statement that fails under a drill does not make the
+/// drill a `500`. During the read the extent is read again, with the
+/// tries of a broken session; a catalogue that keeps failing, there or
+/// before the read began, is answered `503` with its class, which a
+/// caller retries.
+#[tokio::test]
+async fn a_catalogue_failure_under_a_drill_is_retried_then_a_slow_down() {
+    // The article rows of an extent; the renewal of a session's slot.
+    for part in ["FROM articles", "SET lease_until = ?5"] {
+        for heals in [true, false] {
+            let polls = Rc::new(Cell::new(0u32));
+            let fx = drill_fx(&polls, |_| Rc::new(|_| Box::pin(async {}))).await;
+            let (_, whole) = drill_object(&fx).await;
+            let fail = &fx.bridge.catalog.sql.fail;
+            *fail.borrow_mut() = Some((part, if heals { 1 } else { u32::MAX }));
+            let r = fx.post("/drill/scratch/k").await;
+            let left = fail.borrow_mut().take().map(|f| f.1);
+            match heals {
+                true => {
+                    assert_eq!(r.status, 200, "{part}: {}", r.text());
+                    assert_eq!(left, Some(0), "{part}: the statement was not run");
+                    let v = r.json();
+                    assert_eq!((&v["match"], &v["retries"]), (&json!(true), &json!(1)));
+                    assert_eq!(v["plaintext_md5"], md5_hex(&whole));
+                    assert_eq!(polls.get(), 1);
+                }
+                false => {
+                    assert_eq!(r.status, 503, "{part}: {}", r.text());
+                    let v = r.json();
+                    assert_eq!(
+                        (&v["error"], &v["class"]),
+                        (&json!("SlowDown"), &json!("catalog"))
+                    );
+                    assert!(v.get("match").is_none());
+                    assert_eq!(polls.get(), service::INTERRUPTED_RETRIES);
+                }
+            }
+            assert_eq!(fx.bridge.nntp.live(), 0, "{part}");
+            assert_eq!(fx.bridge.budget.in_use(), 0, "{part}");
+        }
+    }
+
+    // A row that cannot be read is no reason to ask again: it stays a
+    // `500`, at once, so that it is seen.
+    let polls = Rc::new(Cell::new(0u32));
+    let fx = drill_fx(&polls, |_| Rc::new(|_| Box::pin(async {}))).await;
+    drill_object(&fx).await;
+    let sql = &fx.bridge.catalog.sql;
+    let n = sql.exec("UPDATE articles SET cipher_len = 'x'", &[]).await;
+    assert!(n.unwrap() > 0);
+    let r = fx.post("/drill/scratch/k").await;
+    assert_eq!(r.status, 500, "{}", r.text());
+    assert_eq!(r.json()["class"], "catalog");
+    assert_eq!(polls.get(), 0);
+    assert_eq!(fx.bridge.nntp.live(), 0);
+    assert_eq!(fx.bridge.budget.in_use(), 0);
+
+    // Before anything is read: whether a replay is pending, the bucket,
+    // the generation, the extents.
+    let fx = Fx::new().await;
+    drill_object(&fx).await;
+    for part in [
+        "FROM restore_state",
+        "FROM buckets",
+        "FROM objects o JOIN generations",
+        "FROM generation_extents",
+    ] {
+        let connects = fx.bridge.nntp.connects();
+        *fx.bridge.catalog.sql.fail.borrow_mut() = Some((part, 1));
+        let r = fx.post("/drill/scratch/k").await;
+        let left = fx.bridge.catalog.sql.fail.borrow_mut().take().map(|f| f.1);
+        assert_eq!(left, Some(0), "{part}: the statement was not run");
+        assert_eq!(r.status, 503, "{part}: {}", r.text());
+        assert_eq!(r.json()["class"], "catalog", "{part}");
+        assert_eq!(fx.bridge.nntp.connects(), connects);
+    }
+}
+
+/// An empty object has an extent on Usenet too, and the drill reads it:
+/// `match` is never said of an object nothing was asked for.
+#[tokio::test]
+async fn a_drill_of_an_empty_object_reads_its_extent() {
+    let fx = Fx::new().await;
+    let bucket = fx.bucket("scratch").await;
+    let o = fx.put(&bucket, "k", b"").await;
+    fx.drive(&o, OutboxStage::Done).await;
+    let r = fx.post("/evict/scratch/k?include_safety=1").await;
+    assert_eq!(r.status, 200, "{}", r.text());
+    let connects = fx.bridge.nntp.connects();
+
+    let r = fx.post("/drill/scratch/k").await;
+    assert_eq!(r.status, 200, "{}", r.text());
+    let v = r.json();
+    assert_eq!((&v["match"], &v["size"]), (&json!(true), &json!(0)));
+    assert_eq!((&v["extents"], &v["articles"]), (&json!(1), &json!(1)));
+    assert_eq!(v["range"], Value::Null);
+    assert_eq!(v["plaintext_md5"], md5_hex(b""));
+    assert_eq!(v["plaintext_sha256"], hex(&sha256(b"")));
+    assert_eq!(fx.bridge.nntp.connects(), connects + 1);
+
+    // Its article gone from Usenet: not a match.
+    fx.server.set_hidden(fx.server.posted_ids().await).await;
+    let v = fx.post("/drill/scratch/k").await.json();
+    assert_eq!(v["match"], false, "{v}");
+    assert_eq!(v["plaintext_md5"], Value::Null);
+}
+
+/// A drill with several drill connections on an account that refuses
+/// the login asks it once, not once per connection: one strike, and the
+/// other provider reads the object over its own.
+#[tokio::test]
+async fn a_drill_logs_in_once_before_it_opens_more_connections() {
+    let edit = |providers: &mut Vec<ProviderConfig>| {
+        providers[0].drill_conns = 4;
+        let mut wrong = providers[0].clone();
+        wrong.id = "p1".to_string();
+        wrong.pass = "not-the-password".to_string();
+        wrong.post = false;
+        providers.push(wrong);
+    };
+    let fx = Fx::with_providers(Environment::Dev, Maintenance::Off, edit).await;
+    // One extent of several articles: work for several connections.
+    let bucket = fx.bucket("scratch").await;
+    let whole = nntp_support::marked_plaintext(2_500_000);
+    let o = fx.put(&bucket, "k", &whole).await;
+    fx.drive(&o, OutboxStage::Done).await;
+    let r = fx.post("/evict/scratch/k?include_safety=1").await;
+    assert_eq!(r.status, 200, "{}", r.text());
+    // The verify jobs asked p1 too, and were refused until it cooled:
+    // past the cooldown, a clean record.
+    fx.bridge.clock.advance_secs(3600);
+    let now = fx.bridge.clock.now();
+    let p1 = &fx.bridge.cfg.providers[1];
+    fx.bridge
+        .catalog
+        .provider_recovered(&p1.id, now)
+        .await
+        .unwrap();
+    let (dialed, good) = (
+        fx.bridge.nntp.dials_to("p1"),
+        fx.bridge.nntp.connects_to("p0"),
+    );
+
+    let r = fx.post("/drill/scratch/k?sockets=4").await;
+    assert_eq!(r.status, 200, "{}", r.text());
+    let v = r.json();
+    assert_eq!((&v["match"], &v["provider"]), (&json!(true), &json!("p0")));
+    assert_eq!(v["plaintext_md5"], md5_hex(&whole));
+    assert_eq!(
+        fx.bridge.nntp.dials_to("p1") - dialed,
+        1,
+        "one refused login"
+    );
+    assert_eq!(health_of(&fx, "p1").await, (json!(false), json!(1)));
+    // The provider that took the first login was given more: as many
+    // as an extent has articles, of its four.
+    let more = fx.bridge.nntp.connects_to("p0") - good;
+    assert!((2..=4).contains(&more), "{more}");
+    assert_eq!(fx.bridge.nntp.live(), 0);
+    assert_eq!(fx.bridge.budget.in_use(), 0);
+}
+
+/// Before a drill says the bytes are gone it asks every reader, also
+/// one past the retention it states: here the reader that states enough
+/// refuses the login, and the other, two days past its one day, has
+/// every article.
+#[tokio::test]
+async fn a_drill_asks_a_reader_past_its_stated_retention() {
+    let edit = |providers: &mut Vec<ProviderConfig>| {
+        providers[0].retention_days = Some(1);
+        let mut wrong = providers[0].clone();
+        wrong.id = "p1".to_string();
+        wrong.pass = "not-the-password".to_string();
+        wrong.post = false;
+        wrong.retention_days = None;
+        providers.push(wrong);
+    };
+    let fx = Fx::with_providers(Environment::Dev, Maintenance::Off, edit).await;
+    let (_, whole) = drill_object(&fx).await;
+    fx.bridge.clock.advance_secs(2 * 24 * 3600);
+
+    let r = fx.post("/drill/scratch/k").await;
+    assert_eq!(r.status, 200, "{}", r.text());
+    let v = r.json();
+    assert_eq!((&v["match"], &v["provider"]), (&json!(true), &json!("p0")));
+    assert_eq!(v["plaintext_md5"], md5_hex(&whole));
+    assert_eq!(fx.bridge.nntp.live(), 0);
+}
+
+/// "Not on Usenet" is said of the live object only. One that was
+/// deleted while the drill read it (here during the wait after a broken
+/// read) is asked for again: its rows and articles may have been taken
+/// away under the drill. The same article gone from the object that is
+/// still live is the mismatch it is.
+#[tokio::test]
+async fn a_drill_of_an_object_replaced_under_it_is_not_a_mismatch() {
+    for replaced in [true, false] {
+        let polls = Rc::new(Cell::new(0u32));
+        let fx = drill_fx(&polls, |weak| {
+            Rc::new(move |_| {
+                let weak = weak.clone();
+                Box::pin(async move {
+                    let bridge = weak.borrow().upgrade().expect("fixture is alive");
+                    if replaced {
+                        let n = bridge.catalog.sql.exec("DELETE FROM objects", &[]).await;
+                        assert_eq!(n.unwrap(), 1);
+                    }
+                })
+            })
+        })
+        .await;
+        let bucket = fx.bucket("scratch").await;
+        let o = fx.put(&bucket, "k", &plaintext()).await;
+        fx.drive(&o, OutboxStage::Done).await;
+        let id = fx
+            .scalar("SELECT message_id FROM articles WHERE idx = 1", &[])
+            .await;
+        fx.server.hide(&id).await;
+        // The first read breaks off: the drill waits, then reads again
+        // and finds the article gone.
+        fx.server.drop_next_bodies(3).await;
+        let r = fx.post("/drill/scratch/k").await;
+        assert_eq!(polls.get(), 1);
+        match replaced {
+            true => {
+                assert_eq!(r.status, 503, "{}", r.text());
+                assert!(r.json().get("match").is_none());
+            }
+            false => {
+                assert_eq!(r.status, 200, "{}", r.text());
+                assert_eq!(r.json()["match"], false);
+            }
+        }
+        assert_eq!(fx.bridge.nntp.live(), 0);
+        assert_eq!(fx.bridge.budget.in_use(), 0);
+    }
+}
+
+/// A first login that breaks off is one of the connects a pass may
+/// spend on a provider, not one more: after three that broke, the
+/// provider is out of the pass, and the drill reads again after its
+/// wait.
+#[tokio::test]
+async fn a_drill_counts_a_broken_first_login_among_its_reconnects() {
+    let polls = Rc::new(Cell::new(0u32));
+    let fx = drill_fx(&polls, |_| Rc::new(|_| Box::pin(async {}))).await;
+    let bucket = fx.bucket("scratch").await;
+    let o = fx.put(&bucket, "k", &plaintext()).await;
+    fx.drive(&o, OutboxStage::Done).await;
+    let dialed = fx.bridge.nntp.dials_to("p0");
+    fx.server.drop_next_logins(3).await;
+    let r = fx.post("/drill/scratch/k").await;
+    assert_eq!(r.status, 200, "{}", r.text());
+    let v = r.json();
+    assert_eq!((&v["match"], &v["retries"]), (&json!(true), &json!(1)));
+    assert_eq!(polls.get(), 1);
+    assert_eq!(fx.bridge.nntp.dials_to("p0") - dialed, 4);
     assert_eq!(fx.bridge.nntp.live(), 0);
     assert_eq!(fx.bridge.budget.in_use(), 0);
 }

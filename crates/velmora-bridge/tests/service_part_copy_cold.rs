@@ -84,6 +84,7 @@ async fn a_range_that_ends_in_a_cold_full_size_extent_fits_the_budget() {
         read: true,
         max_conns: 2,
         max_ips: None,
+        drill_conns: 0,
         priority: 0,
         retention_days: None,
         pool: None,

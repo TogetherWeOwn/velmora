@@ -458,8 +458,14 @@ pub struct Permit {
 pub enum PermitClass {
     /// A queue job: post, verify, repost.
     Background,
-    /// Work done inside a request: a cold read, a drill.
+    /// Work done inside a request: a cold read, and a drill on a
+    /// provider without drill connections.
     Read,
+    /// A drill (`POST /_admin/drill`) on a provider with
+    /// [`ProviderConfig::drill_conns`]: a slot from that range, which is
+    /// apart from `max_conns`. It runs inside a request, with the
+    /// lifetime and the call bounds of [`PermitClass::Read`].
+    Drill,
 }
 
 impl PermitClass {
@@ -468,7 +474,7 @@ impl PermitClass {
     pub const fn permit_secs(self) -> u32 {
         match self {
             PermitClass::Background => PERMIT_SECS,
-            PermitClass::Read => READ_PERMIT_SECS,
+            PermitClass::Read | PermitClass::Drill => READ_PERMIT_SECS,
         }
     }
 
@@ -477,7 +483,7 @@ impl PermitClass {
     pub const fn call_secs(self) -> u32 {
         match self {
             PermitClass::Background => NNTP_CALL_SECS,
-            PermitClass::Read => READ_CALL_SECS,
+            PermitClass::Read | PermitClass::Drill => READ_CALL_SECS,
         }
     }
 
@@ -488,7 +494,7 @@ impl PermitClass {
     pub const fn renew_secs(self) -> Option<u32> {
         match self {
             PermitClass::Background => None,
-            PermitClass::Read => Some(READ_RENEW_SECS),
+            PermitClass::Read | PermitClass::Drill => Some(READ_RENEW_SECS),
         }
     }
 }
@@ -965,6 +971,9 @@ pub trait Catalog {
     /// Renews the lease and every permit in one round trip. `.0` = the
     /// lease still holds; `.1[i]` = `permits[i]` is still held. Each
     /// renewal stands on its own: a lost lease does not undo the permits.
+    /// The permits are those of a lease's job: none of
+    /// [`PermitClass::Drill`], which no lease holds and which is renewed
+    /// by [`Self::renew_permit`] alone.
     async fn renew_all(
         &self,
         l: &Lease,

@@ -14,7 +14,7 @@
 //! | `DELETE /_admin/keys/<access_key_id>/grants` | `405`: grants are not removed one by one |
 //! | `GET /_admin/objects/<bucket>/<key>` | `200` per-extent state |
 //! | `POST /_admin/evict/<bucket>/<key>[?include_safety=1]` | `200`; `403` for `include_safety` on a non-disposable bucket |
-//! | `POST /_admin/drill/<bucket>/<key>` | `200` read-back from Usenet only |
+//! | `POST /_admin/drill/<bucket>/<key>[?range=<first>-[<last>]][&sockets=<n>][&state=<token>]` | `200` read-back from Usenet only, with the SHA-256 and MD5 of the range; `503` `SlowDown` (with a `class`) when it could not be read now; `400` bad `range`, `sockets` or `state`; `416` a range past the end |
 //! | `GET /_admin/status` | `200` |
 //! | `POST /_admin/restore` `{since_ms[, margin_ms]}` or `{cursor}` | `200` with the counts of one replay step and `next`; `409` unless `MAINTENANCE=restore` |
 //! | `POST /_admin/pack-plans[?limit=<n>]` | `200` `{looked, packed, end}`: one step of packing the article plans that are still rows; `409` unless `PACKED_PLANS=on` |
@@ -60,26 +60,22 @@ use sha2::{Digest, Sha256};
 use velmora::rng::{fill_alphabet, FillRandom, SystemRng};
 use zeroize::Zeroizing;
 
-use crate::articles::article_spans;
 use crate::config::{Maintenance, REAL_DATA_READY};
 use crate::crypto::{open_range, unwrap_bdk, wrap_bdk, wrap_secret, DataKey};
-use crate::fetch::{
-    cold_poll_ms, read_articles, report_health, request_holder, ProviderSession, COLD_WAIT_MS,
-};
+use crate::fetch::{cold_poll_ms, cold_step_bytes, ColdFetch, ColdReader, COLD_WAIT_MS};
+use crate::hashstate::Running;
 use crate::ingress::{self, check_admin_bearer, IngressError};
 use crate::ports::{
-    BlobStore, Bridge, Catalog, Clock, GrantPut, Guard, JobSink, Kek, NntpConnector, PermitClass,
+    BlobStore, Bridge, Catalog, Clock, GrantPut, Guard, JobSink, Kek, NntpConnector,
 };
-use crate::post::Stop;
 use crate::recovery::{
     delete_blob, revoked_key_id, valid_key_id, write_key_revocation, REVOKED_KEY_PREFIX,
 };
 use crate::replay::ReplayCursor;
 use crate::service::INTERRUPTED_RETRIES;
 use crate::types::{
-    AccessKeyRow, ArticleRow, ArticleState, Body, BridgeError, Bucket, BucketId, ExtentRow,
-    KeyStatus, Method, OutboxStage, Perm, ProviderFault, ProviderLoad, RespBody, S3Request,
-    S3Response, SafetyState,
+    AccessKeyRow, ArticleState, Body, BridgeError, Bucket, BucketId, ExtentRow, KeyStatus, Method,
+    OutboxStage, Perm, ProviderLoad, RespBody, S3Request, S3Response, SafetyState,
 };
 
 /// Largest admin request body.
@@ -366,9 +362,11 @@ async fn route<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T
         if !post {
             return Err(wrong_method());
         }
-        mutable(bridge).await?;
+        // A catalogue that does not answer here is the drill's to ask
+        // again, as it is inside the drill.
+        mutable_or(bridge, drill_failed).await?;
         let (bucket, key) = object_target(target)?;
-        return drill(bridge, bucket, &key).await;
+        return drill(bridge, bucket, &key, &req.raw_target).await;
     }
 
     match rest {
@@ -619,6 +617,15 @@ async fn usage_recount<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K
 async fn mutable<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>(
     bridge: &Bridge<C, B, N, J, K, T>,
 ) -> Admin<()> {
+    mutable_or(bridge, internal).await
+}
+
+/// [`mutable`], with the answer for a catalogue that did not say
+/// whether a replay is pending given by `failed`.
+async fn mutable_or<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>(
+    bridge: &Bridge<C, B, N, J, K, T>,
+    failed: fn(&BridgeError) -> S3Response,
+) -> Admin<()> {
     if bridge.cfg.maintenance == Maintenance::Restore {
         return Err(fail(
             503,
@@ -626,7 +633,12 @@ async fn mutable<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek,
             "Maintenance: no changes are accepted.",
         ));
     }
-    if bridge.catalog.restore_pending().await.or_internal()? {
+    if bridge
+        .catalog
+        .restore_pending()
+        .await
+        .map_err(|e| failed(&e))?
+    {
         return Err(fail(
             503,
             "ServiceUnavailable",
@@ -1377,200 +1389,197 @@ async fn evict<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T
 // Drill
 // ---------------------------------------------------------------------------
 
-enum Drilled {
-    /// The verified ciphertext and the provider that completed it.
-    Read(Vec<u8>, String),
-    /// A provider that could have the missing articles had no free slot,
-    /// and none broke off: worth waiting for one.
-    Busy,
-    /// A provider's session broke off, or it refused the account: worth
-    /// reading the extent again after a wait.
-    Interrupted,
-    Unavailable,
+/// Whether `e` is a catalogue that did not answer: a statement the
+/// store failed or was too busy for, as its adapter says it
+/// (`<store>: statement failed`, `<store>: overloaded`), or one that
+/// failed under a cold read. Asking again may mend those. Any other
+/// catalogue error is of what was read (a row or a result that cannot
+/// be decoded): it reads the same every time, and a caller told to
+/// retry would never see it.
+fn catalogue_unanswered(e: &BridgeError) -> bool {
+    matches!(e, BridgeError::Sql(what)
+        if what.ends_with(": statement failed")
+            || what.ends_with(": overloaded")
+            || what == crate::fetch::CATALOGUE_FAILED)
 }
 
-/// Reads one extent's ciphertext from Usenet only. Neither blob store is
-/// read or written. A provider that refused the login is listed in
-/// `refused` and not asked again within the drill: each ask would be one
-/// more refused login on the account's record.
+/// A failure inside a drill. The drill writes nothing, so a catalogue
+/// that did not answer is a reason to ask again, not an error of the
+/// object or the bridge: `503`, with the class said. (Before, any one
+/// catalogue statement that failed among the many of a drill made the
+/// drill a `500`.) Every other failure stays a `500`.
+fn drill_failed(e: &BridgeError) -> S3Response {
+    match e {
+        e if catalogue_unanswered(e) => json_response(
+            503,
+            &json!({
+                "error": "SlowDown",
+                "message": "The catalogue did not answer; retry shortly.",
+                "class": "catalog",
+            }),
+        ),
+        _ => internal(e),
+    }
+}
+
+/// The plaintext bytes a drill reads: `[start, end)` of the object.
+/// `range=<first>-<last>` names them as an HTTP range does, both ends
+/// included, and `<first>-` runs to the end; a `<last>` past the end is
+/// the end. Without `range`: the whole object.
+fn drill_range(raw_target: &str, size: u64) -> Admin<(u64, u64)> {
+    let Some(range) = query_param(raw_target, "range") else {
+        return Ok((0, size));
+    };
+    let bad = || fail(400, "InvalidArgument", "Expected range=<first>-<last>.");
+    let number = |s: &str| match s.bytes().all(|b| b.is_ascii_digit()) {
+        true => s.parse::<u64>().ok(),
+        false => None,
+    };
+    let (first, last) = range.split_once('-').ok_or_else(bad)?;
+    let first = number(first).ok_or_else(bad)?;
+    let last = match last {
+        "" => None,
+        last => Some(number(last).ok_or_else(bad)?),
+    };
+    if last.is_some_and(|last| last < first) {
+        return Err(bad());
+    }
+    if first >= size {
+        return Err(fail(
+            416,
+            "InvalidRange",
+            "The range begins past the end of the object.",
+        ));
+    }
+    let end = last.map_or(size, |last| last.saturating_add(1).min(size));
+    Ok((first, end))
+}
+
+/// What a drill was asked for beside the object.
+struct DrillAsk {
+    start: u64,
+    end: u64,
+    /// The hashes of the bytes before `start`, from the drill that read
+    /// them (`state=`); new ones without it.
+    running: Running,
+}
+
+/// What a drill read.
+struct DrillRead {
+    matched: bool,
+    extents: usize,
+    articles: u64,
+    retries: u32,
+    /// Of the bytes of this drill alone.
+    range: Running,
+    /// Of those and all the bytes before them ([`DrillAsk::running`]).
+    running: Running,
+}
+
+/// Reads one extent from Usenet only with the allowance of a cold read
+/// ([`crate::service::get`]): while no provider has a free slot it tries
+/// again until [`COLD_WAIT_MS`] after the first try, and a read that a
+/// provider broke off, or during which the catalogue failed, is begun
+/// again, at most [`INTERRUPTED_RETRIES`] times within that time, after
+/// a short wait each ([`cold_poll_ms`]). Nothing is held while it waits:
+/// the sessions are ended and `charge` is given back, and taken again
+/// inside the allowance. `Ok(None)` = no provider can supply the extent
+/// intact; `Err` = the answer for the drill (`503` once the allowance is
+/// used). `retries` counts the tries after the first.
 async fn drill_extent<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>(
     bridge: &Bridge<C, B, N, J, K, T>,
+    reader: &mut ColdReader<'_, C, N, T>,
     extent: &ExtentRow,
-    plan: &[ArticleRow],
-    refused: &mut Vec<String>,
-) -> crate::types::Result<Drilled> {
-    let Ok(size) = usize::try_from(extent.cipher_size) else {
-        return Ok(Drilled::Unavailable);
-    };
-    let spans = article_spans(extent.cipher_size);
-    let planned = !plan.is_empty()
-        && plan.len() == spans.len()
-        && (0u32..).zip(plan).zip(&spans).all(|((idx, row), span)| {
-            row.idx == idx
-                && row.cipher_offset == span.start
-                && row.cipher_len == span.len
-                && row.state == ArticleState::Posted
-        });
-    if !planned {
-        return Ok(Drilled::Unavailable);
-    }
-
-    let mut cipher = vec![0u8; size];
-    let mut have = vec![false; plan.len()];
-    let mut busy = false;
-    let mut broken = false;
-    let mut skipped = false;
-    let mut last_provider = String::new();
-    let holder = request_holder("drill")?;
-    for provider in bridge.cfg.providers.iter().filter(|p| p.read && p.enabled) {
-        let wanted: Vec<&ArticleRow> = plan.iter().filter(|a| !have[a.idx as usize]).collect();
-        if wanted.is_empty() {
-            break;
-        }
-        if refused.contains(&provider.id) {
-            skipped = true;
-            continue;
-        }
-        let Some(mut session) = ProviderSession::open(
-            &bridge.catalog,
-            &bridge.nntp,
-            &bridge.clock,
-            provider,
-            // A drill runs inside a request, as a read does: the short
-            // permit and the short calls of one.
-            PermitClass::Read,
-            &holder,
-        )
-        .await?
-        .map(|s| s.with_timer(bridge.budget.sleeper())) else {
-            busy = true;
-            continue;
-        };
-        let read = read_articles(&mut session, None, &wanted, |row, payload| {
-            // Offsets and lengths were checked against the plan above.
-            let start = row.cipher_offset as usize;
-            cipher[start..start + payload.len()].copy_from_slice(&payload);
-            have[row.idx as usize] = true;
-        })
-        .await;
-        let health = session.finish().await;
-        report_health(&bridge.catalog, &bridge.clock, &provider.id, health).await;
-        if health == Some(Err(ProviderFault::LoginRefused)) {
-            refused.push(provider.id.clone());
-        }
-        match read {
-            Ok(tally) if tally.ok > 0 => last_provider.clone_from(&provider.id),
-            Ok(_) => {}
-            Err(Stop::NoPermit | Stop::Cooling(_)) => busy = true,
-            Err(Stop::Refused | Stop::Fail(..) | Stop::Session(_)) => broken = true,
-            Err(Stop::Fenced | Stop::Catalog) => {
-                return Err(BridgeError::Sql("catalogue failed during a drill".into()));
-            }
-        }
-    }
-    if have.contains(&false) {
-        // A provider that was not asked may hold what the others lack:
-        // never `Unavailable` then. One with no free slot is waited for.
-        return Ok(if broken {
-            Drilled::Interrupted
-        } else if busy {
-            Drilled::Busy
-        } else if skipped {
-            Drilled::Interrupted
-        } else {
-            Drilled::Unavailable
-        });
-    }
-    let digest: [u8; 32] = Sha256::digest(&cipher).into();
-    if digest != extent.cipher_sha256 {
-        return Ok(Drilled::Unavailable);
-    }
-    Ok(Drilled::Read(cipher, last_provider))
-}
-
-/// Reads one extent from Usenet only ([`drill_extent`]) with the
-/// allowance of a cold read ([`crate::service::get`]): while no provider
-/// has a free slot it tries again until [`COLD_WAIT_MS`] after the first
-/// try, and a read that a provider broke off is begun again, at most
-/// [`INTERRUPTED_RETRIES`] times within that time, after a short wait
-/// each ([`cold_poll_ms`]). Nothing is held while it waits: neither slots
-/// nor budget; a try after a wait, its wait for budget included, starts
-/// and ends inside the allowance. `Ok(None)` = no provider can supply the extent intact;
-/// `Err` = the answer for the drill (`503` once the allowance is used,
-/// or the catalogue failed). The second value counts the tries after
-/// the first.
-async fn drill_read<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>(
-    bridge: &Bridge<C, B, N, J, K, T>,
-    extent: &ExtentRow,
-    plan: &[ArticleRow],
-    refused: &mut Vec<String>,
-) -> Admin<(Option<(Vec<u8>, String, ingress::Charge)>, u32)> {
-    // Ciphertext and plaintext of one extent are held together.
-    let bytes = extent.cipher_size.saturating_add(extent.plain_size);
+    (charge, bytes): (&mut Option<ingress::Charge>, u64),
+    (articles, retries): (&mut u64, &mut u32),
+) -> Admin<Option<Vec<u8>>> {
     let deadline = bridge.clock.now().plus_ms(i64::from(COLD_WAIT_MS));
     let mut slept = 0u32;
     let mut interrupted = 0u32;
-    let mut retries = 0u32;
+    let mut last: Option<BridgeError>;
     loop {
-        let charge = match retries {
-            0 => bridge.budget.charge(bytes).await.map_err(|_| busy())?,
+        if charge.is_none() {
             // A try after a wait starts only inside the allowance, and
             // its wait for budget ends with it.
-            _ => {
-                let left = deadline.0 - bridge.clock.now().0;
-                let Ok(left @ 1..) = u32::try_from(left) else {
-                    return Err(busy());
-                };
-                let sleep = bridge.budget.sleeper().ok_or_else(busy)?;
-                let charge = core::pin::pin!(bridge.budget.charge(bytes));
-                let charge = match select(charge, sleep(left)).await {
-                    Either::Left((charge, _)) => charge.map_err(|_| busy())?,
-                    Either::Right(_) => return Err(busy()),
-                };
-                // Budget that came as the time ran out is given back.
-                if bridge.clock.now() >= deadline {
-                    return Err(busy());
-                }
-                charge
+            let left = deadline.0 - bridge.clock.now().0;
+            let Ok(left @ 1..) = u32::try_from(left) else {
+                return Err(busy());
+            };
+            let sleep = bridge.budget.sleeper().ok_or_else(busy)?;
+            // After a request that waited for this room before.
+            let taken = core::pin::pin!(bridge.budget.charge_in_turn(bytes));
+            let taken = match select(taken, sleep(left)).await {
+                Either::Left((taken, _)) => taken.map_err(|_| busy())?,
+                Either::Right(_) => return Err(busy()),
+            };
+            // Budget that came as the time ran out is given back.
+            if bridge.clock.now() >= deadline {
+                return Err(busy());
             }
+            *charge = Some(taken);
+        }
+        let read = match bridge.catalog.articles(&extent.id).await {
+            // An extent that is not posted in full is not on Usenet:
+            // nothing is asked for.
+            Ok(plan) if plan.iter().any(|a| a.state != ArticleState::Posted) => return Ok(None),
+            Ok(plan) => {
+                let count = plan.len() as u64;
+                reader
+                    .fetch_planned(extent, plan)
+                    .await
+                    .map(|read| (read, count))
+            }
+            Err(e) => Err(e),
         };
-        match drill_extent(bridge, extent, plan, refused)
-            .await
-            .or_internal()?
-        {
-            Drilled::Read(cipher, used) => return Ok((Some((cipher, used, charge)), retries)),
-            Drilled::Unavailable => return Ok((None, retries)),
-            Drilled::Busy => {}
-            Drilled::Interrupted if interrupted < INTERRUPTED_RETRIES => interrupted += 1,
-            Drilled::Interrupted => return Err(busy()),
+        match read {
+            Ok((ColdFetch::Filled(cipher), count)) => {
+                *articles += count;
+                return Ok(Some(cipher));
+            }
+            Ok((ColdFetch::Unavailable, _)) => return Ok(None),
+            // `last` is why the last try failed: the answer says the
+            // class of that one, not of an earlier one.
+            Ok((ColdFetch::Busy, _)) => last = None,
+            Ok((ColdFetch::Interrupted, _)) if interrupted < INTERRUPTED_RETRIES => {
+                interrupted += 1;
+                last = None;
+            }
+            Ok((ColdFetch::Interrupted, _)) => return Err(busy()),
+            // The catalogue failed under the read. What the reader
+            // holds is ended below, and the extent is read again.
+            Err(e) if catalogue_unanswered(&e) && interrupted < INTERRUPTED_RETRIES => {
+                interrupted += 1;
+                last = Some(e);
+            }
+            Err(e) => return Err(drill_failed(&e)),
         }
-        drop(charge);
-        let sleep = bridge.budget.sleeper().ok_or_else(busy)?;
+        reader.hang_up().await;
+        *charge = None;
+        let gave_up = || last.as_ref().map_or_else(busy, drill_failed);
+        let sleep = bridge.budget.sleeper().ok_or_else(gave_up)?;
         if bridge.clock.now() >= deadline || slept >= COLD_WAIT_MS {
-            return Err(busy());
+            return Err(gave_up());
         }
-        let seed = (bridge.clock.now().0 as u64) ^ u64::from(retries).rotate_left(32);
+        let seed = (bridge.clock.now().0 as u64) ^ u64::from(*retries).rotate_left(32);
         let ms = cold_poll_ms(seed);
         sleep(ms).await;
         slept = slept.saturating_add(ms);
-        retries += 1;
+        *retries += 1;
     }
 }
 
-/// Proves an object can be rebuilt from Usenet alone: every article is
-/// read, checked, decrypted and compared with the catalogued digests.
-async fn drill<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>(
+/// The extents of a drill, one after the other, over the sessions
+/// `reader` keeps from one to the next. Each is read whole, compared
+/// with the catalogue's digest of its ciphertext, opened, and compared
+/// with the digest of its plaintext; of an extent that begins before
+/// the range or ends after it, only the bytes inside are hashed.
+async fn drill_extents<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>(
     bridge: &Bridge<C, B, N, J, K, T>,
-    bucket: &str,
-    key: &str,
-) -> Admin<S3Response> {
-    let bucket = bucket_named(bridge, bucket).await?;
-    let (generation, extents) = bridge
-        .catalog
-        .live_object(&bucket.id, key)
-        .await
-        .or_internal()?
-        .ok_or_else(no_key)?;
+    reader: &mut ColdReader<'_, C, N, T>,
+    bucket: &Bucket,
+    extents: &[ExtentRow],
+    ask: DrillAsk,
+) -> Admin<DrillRead> {
     let bdk = unwrap_bdk(
         &bridge.kek,
         bucket.kek_version,
@@ -1578,48 +1587,252 @@ async fn drill<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T
         &bucket.bdk_wrapped,
     )
     .or_internal()?;
-
-    let mut whole = Sha256::new();
-    let mut articles = 0u64;
-    let mut matched = true;
-    let mut provider = String::new();
-    let mut retries = 0u32;
-    let mut refused = Vec::new();
-    for extent in &extents {
-        let plan = bridge.catalog.articles(&extent.id).await.or_internal()?;
-        let (read, tries) = drill_read(bridge, extent, &plan, &mut refused).await?;
-        retries += tries;
-        let Some((cipher, used, _charge)) = read else {
-            matched = false;
+    let mut done = DrillRead {
+        matched: true,
+        extents: extents.len(),
+        articles: 0,
+        retries: 0,
+        range: Running::default(),
+        running: ask.running,
+    };
+    // One charge for the whole drill, for its largest extent: ciphertext
+    // and plaintext of one extent are held together, and beside the
+    // ciphertext the wire text on the sockets. It is kept from extent to
+    // extent unless a request waits for the room (below).
+    let bytes = extents
+        .iter()
+        .map(|e| cold_step_bytes(e.cipher_size, reader.sockets()).max(e.cipher_size + e.plain_size))
+        .max()
+        .unwrap_or(0);
+    let mut charge = Some(bridge.budget.charge(bytes).await.map_err(|_| busy())?);
+    // Where the next extent must begin: they tile the range, or the
+    // digests would be those of other bytes.
+    let mut expect = extents.first().and_then(|e| e.plain_offset);
+    if !expect.is_some_and(|at| at <= ask.start) && ask.start < ask.end {
+        done.matched = false;
+        return Ok(done);
+    }
+    // An object has an extent, an empty one too: of no extent nothing
+    // was read, and nothing is said to match.
+    done.matched &= !extents.is_empty();
+    let mut covered = 0u64;
+    for (nth, extent) in extents.iter().enumerate() {
+        // Between extents the drill holds no buffer. A request of this
+        // isolate that waits for room the drill alone keeps it out of is
+        // let in here, or a drill of many extents would hold it off for
+        // minutes: the sessions are ended (they are not to sit open for
+        // as long as that request runs), and the charge is taken again
+        // after it, inside the allowance of the extent.
+        // The price is the drill's: it logs in again for the next
+        // extent (`sessions` in the answer counts those), which a drill
+        // on an isolate with nothing else to do never pays.
+        if nth > 0 {
+            drop(charge.take());
+            charge = bridge.budget.try_charge_in_turn(bytes);
+            if charge.is_none() {
+                reader.hang_up().await;
+            }
+        }
+        let (Some(base), Ok(plain_len)) = (expect, usize::try_from(extent.plain_size)) else {
+            done.matched = false;
             break;
         };
-        articles += plan.len() as u64;
-        provider = used;
-        let Ok(plain_len) = usize::try_from(extent.plain_size) else {
-            matched = false;
+        if extent.plain_offset != Some(base) {
+            done.matched = false;
+            break;
+        }
+        let read = drill_extent(
+            bridge,
+            reader,
+            extent,
+            (&mut charge, bytes),
+            (&mut done.articles, &mut done.retries),
+        )
+        .await?;
+        let Some(cipher) = read else {
+            done.matched = false;
             break;
         };
         let mut plain = Zeroizing::new(vec![0u8; plain_len]);
         let opened = open_range(&bdk, &bucket.id, extent, 0, &cipher, 0, &mut plain);
+        drop(cipher);
         let digest: [u8; 32] = Sha256::digest(&plain[..]).into();
         if !matches!(opened, Ok(n) if n == plain_len) || digest != extent.plain_sha256 {
-            matched = false;
+            done.matched = false;
             break;
         }
-        whole.update(&plain[..]);
+        let ext_end = base.saturating_add(extent.plain_size);
+        let from = ask.start.max(base);
+        let to = ask.end.min(ext_end);
+        if from < to {
+            // Both are offsets inside this extent's plaintext.
+            let piece = &plain[(from - base) as usize..(to - base) as usize];
+            done.range.update(piece);
+            done.running.update(piece);
+            covered += to - from;
+        }
+        expect = Some(ext_end);
     }
-    let plaintext_sha256 = matched.then(|| hex(&whole.finalize()));
+    done.matched &= covered == ask.end - ask.start;
+    Ok(done)
+}
+
+/// Proves an object, or a byte range of it, can be rebuilt from Usenet
+/// alone: every article of every extent the bytes are in is read,
+/// checked, decrypted and compared with the catalogued digests. Neither
+/// blob store is read or written, and no row of the object changes.
+///
+/// Query (all optional):
+/// - `range=<first>-<last>`: the plaintext bytes to read, both ends
+///   included (`<first>-` = to the end). An object too large for one
+///   request is read in pieces.
+/// - `sockets=<n>`: connections to read over, `1` to `COLD_SOCKETS`
+///   (the default). They come from the providers' `drill_conns`; see
+///   [`Bridge::drill_reader`].
+/// - `state=<token>`: the `state` of the answer for the bytes before
+///   this range, all of them from the first of the object (`400` for
+///   the state of any other count). The `running` digests then cover
+///   those bytes too, so the last answer of a run of ranges carries the
+///   MD5 and the SHA-256 of the object ([`crate::hashstate`]).
+async fn drill<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>(
+    bridge: &Bridge<C, B, N, J, K, T>,
+    bucket: &str,
+    key: &str,
+    raw_target: &str,
+) -> Admin<S3Response> {
+    let bad = |what: &'static str| fail(400, "InvalidArgument", what);
+    let sockets = match query_param(raw_target, "sockets") {
+        None => bridge.cfg.cold_sockets,
+        Some(n) => n
+            .parse::<u32>()
+            .ok()
+            .filter(|n| (1..=bridge.cfg.cold_sockets.max(1)).contains(n))
+            .ok_or_else(|| bad("sockets is 1 to COLD_SOCKETS."))?,
+    };
+    let state = match query_param(raw_target, "state") {
+        None => None,
+        Some(token) => Some(
+            Running::from_token(token).ok_or_else(|| bad("state is not the state of a drill."))?,
+        ),
+    };
+    let had_state = state.is_some();
+    let catalogue = |e: BridgeError| drill_failed(&e);
+    let bucket = match bridge.catalog.bucket_by_name(bucket).await {
+        Ok(found) => found.ok_or_else(no_bucket)?,
+        Err(e) => return Err(catalogue(e)),
+    };
+    let generation = bridge
+        .catalog
+        .live_generation(&bucket.id, key)
+        .await
+        .map_err(catalogue)?
+        .ok_or_else(no_key)?;
+    let (start, end) = match generation.size {
+        // No bytes to hash, but an extent to read: an empty object has
+        // one too, of ciphertext that says so.
+        0 if query_param(raw_target, "range").is_none() => (0, 0),
+        size => drill_range(raw_target, size)?,
+    };
+    let extents = match start < end {
+        true => bridge
+            .catalog
+            .extents_in(&generation.id, start, end)
+            .await
+            .map_err(catalogue)?,
+        false => {
+            let live = bridge
+                .catalog
+                .live_object(&bucket.id, key)
+                .await
+                .map_err(catalogue)?;
+            match live {
+                Some((now, extents)) if now.id == generation.id => extents,
+                // Overwritten or deleted since: ask again.
+                _ => return Err(busy()),
+            }
+        }
+    };
+
+    // A state stands for the bytes of the object before the range, all
+    // of them: `running` is then the digest of the object up to `last`.
+    if state.as_ref().is_some_and(|s| s.bytes() != start) {
+        return Err(bad("state is not of the bytes before the range."));
+    }
+    let running = state.unwrap_or_default();
+
+    let mut reader = bridge.drill_reader(sockets).or_internal()?;
+    let ask = DrillAsk {
+        start,
+        end,
+        running,
+    };
+    let read = drill_extents(bridge, &mut reader, &bucket, &extents, ask).await;
+    let stats = reader.stats();
+    let sockets = reader.sockets();
+    // Every exit ends the sessions and frees their slots.
+    reader.close().await;
+    let done = read?;
+    if !done.matched {
+        // "Not on Usenet" is said of the live object only. One that was
+        // overwritten or deleted while it was read may have had its
+        // rows and articles taken away under the drill: ask again.
+        let live = bridge
+            .catalog
+            .live_generation(&bucket.id, key)
+            .await
+            .map_err(catalogue)?;
+        if live.map(|g| g.id) != Some(generation.id.clone()) {
+            return Err(busy());
+        }
+    }
+
+    let digests = |run: &Running| {
+        let (sha256, md5) = run.digests();
+        json!({ "bytes": run.bytes(), "sha256": hex(&sha256), "md5": hex(&md5) })
+    };
+    let (sha256, md5) = done.range.digests();
+    let chained = done.matched && (start == 0 || had_state);
+    // The provider that supplied the most; `providers` has them all.
+    let provider = stats
+        .share
+        .iter()
+        .max_by_key(|(_, _, bytes)| *bytes)
+        .map_or("", |(id, _, _)| id.as_str());
+    // One insert each: collecting into the map sorts the pairs first,
+    // with a sort of its own in the Worker's wasm.
+    let mut providers = serde_json::Map::new();
+    for (id, articles, bytes) in &stats.share {
+        providers.insert(id.clone(), json!({ "articles": articles, "bytes": bytes }));
+    }
     Ok(ok(&json!({
         "source": "nntp",
         "provider": provider,
-        "articles": articles,
-        "extents": extents.len(),
+        "providers": providers,
+        "articles": done.articles,
+        "extents": done.extents,
         "size": generation.size,
-        "plaintext_sha256": plaintext_sha256,
-        "match": matched,
+        "generation": generation.id.as_str(),
+        // The plaintext bytes read: `first` to `last`, both included.
+        "range": (start < end).then(|| json!({ "first": start, "last": end - 1 })),
+        // Of the bytes of `range`.
+        "plaintext_sha256": done.matched.then(|| hex(&sha256)),
+        "plaintext_md5": done.matched.then(|| hex(&md5)),
+        // Of those and of every byte the `state` of the request stood
+        // for: the whole object after the last of a run of ranges.
+        // A range that starts past byte 0 without a `state` has neither:
+        // its state would stand for the range alone, and no later
+        // request takes that.
+        "running": chained.then(|| digests(&done.running)),
+        // For the request that reads the bytes after `range`.
+        "state": chained.then(|| done.running.token()),
+        "match": done.matched,
         // Tries of an extent after its first: waits for a slot and
         // reads begun again after a provider broke off.
-        "retries": retries,
+        "retries": done.retries,
+        "sockets": sockets,
+        // Slots taken, each at most one login: a connection is kept
+        // from one extent to the next.
+        "sessions": stats.opened,
     })))
 }
 
@@ -1747,4 +1960,37 @@ async fn status<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, 
         "last_dispatch_at": stats.last_dispatch_at,
         "providers": providers,
     })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Only a statement the store failed or was too busy for is asked
+    /// again. What the store's adapter says of a value or a result it
+    /// could not decode is of the stored row: a `500`, never a retry.
+    #[test]
+    fn only_an_unanswered_statement_is_asked_again() {
+        let sql = |what: &str| BridgeError::Sql(what.to_string());
+        for what in [
+            "d1: statement failed",
+            "d1: overloaded",
+            crate::fetch::CATALOGUE_FAILED,
+        ] {
+            assert!(catalogue_unanswered(&sql(what)), "{what}");
+        }
+        for what in [
+            "d1: non-integer or unsafe number",
+            "d1: integer outside JS safe range",
+            "d1: unexpected result shape",
+            "d1: constraint violation",
+            "d1: bind failed",
+            "row decode: cipher_len",
+        ] {
+            assert!(!catalogue_unanswered(&sql(what)), "{what}");
+        }
+        assert!(!catalogue_unanswered(&BridgeError::NotImplemented(
+            "statement failed"
+        )));
+    }
 }

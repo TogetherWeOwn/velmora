@@ -113,6 +113,8 @@ struct Spool {
     drop_bodies: usize,
     /// Remaining `STAT`s to close the connection on without a reply.
     drop_stats: usize,
+    /// Remaining logins to close the connection on without a reply.
+    drop_logins: usize,
     /// While true, `STAT` answers `430` for articles in the `POST` spool.
     stat_lag: bool,
     /// While true, `BODY` answers `430` for articles in the `POST` spool
@@ -160,6 +162,7 @@ impl Shared {
             discard_posts: 0,
             drop_bodies: 0,
             drop_stats: 0,
+            drop_logins: 0,
             stat_lag: false,
             body_gone: false,
             late_bodies: 0,
@@ -340,6 +343,12 @@ impl TestNntpServer {
         self.shared.spool.lock().await.drop_bodies = n;
     }
 
+    /// The next `n` logins get no reply: the connection closes at its
+    /// first `AUTHINFO` instead.
+    pub async fn drop_next_logins(&self, n: usize) {
+        self.shared.spool.lock().await.drop_logins = n;
+    }
+
     /// The next `n` `STAT`s get no reply: the connection closes instead.
     pub async fn drop_next_stats(&self, n: usize) {
         self.shared.spool.lock().await.drop_stats = n;
@@ -497,6 +506,13 @@ async fn handle_connection(
                 if authed.is_some() {
                     let _ = writer.write_all(b"502 Command unavailable\r\n").await;
                     continue;
+                }
+                {
+                    let mut spool = shared.spool.lock().await;
+                    if spool.drop_logins > 0 {
+                        spool.drop_logins -= 1;
+                        break;
+                    }
                 }
                 let upper = arg.to_ascii_uppercase();
                 if upper.starts_with("USER ") {

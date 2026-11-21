@@ -439,6 +439,23 @@ crons = ["*/5 * * * *"]
 # needs `max_ips` too, the number of addresses the provider allows, and
 # a `proxies` list longer than it is refused. `max_ips` goes on counting
 # invocations, which is never the looser count.
+#
+# A provider may state `drill_conns` (default 0): connections more than
+# `max_conns`, for the read-back drill (`POST /_admin/drill`) only. They
+# are slots of their own, so a drill that holds all of them takes none
+# from a read or a job, and no read or job is handed one. The provider
+# counts them like any connection: `max_conns` plus `drill_conns` must
+# stay within what the account allows at once. They are outside `pool`
+# as well: where providers share one account limit, that limit must hold
+# the pool's own and the `drill_conns` of every provider in it. Without
+# `drill_conns` on any provider a drill reads over one connection, as a
+# cold read does.
+# `drill_conns` needs `read`, and on an account with `max_ips` it needs
+# `proxies`: a direct drill connection would be one more address. Deploy
+# the Worker that knows the field before NNTP_PROVIDERS carries it: an
+# older one refuses a list with a field it does not know. A provider `id`
+# may not end in `/drill` (the name the drill's slots are kept under):
+# this Worker refuses a list with such an id, with or without the field.
 
 [env.dev]
 vars = { ENVIRONMENT = "dev", S3_HOST = "127.0.0.1:8787", REQUIRED_BACKBONES = "1", SAFETY_MIN_AGE_SECS = "0", VERIFY_DELAY_SECS = "1", DEV_TRUST_HTTP = "1", NEWSGROUPS = "alt.binaries.test", MAX_EXTENT_BYTES = "16777216", S3_REGION = "auto", VELMORA_KEK_ACTIVE = "1", INFLIGHT_BUDGET_BYTES = "50331648", GC_MODE = "disposable", MAINTENANCE = "off", SERVER_SIDE_COPY = "on", PACKED_PLANS = "on", MAX_PUT_BYTES = "103809024", INTENT_SWEEP = "on", GET_FANOUT_BYTES = "8388608", PERMITS = "d1" }

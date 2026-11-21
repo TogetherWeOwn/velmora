@@ -774,6 +774,7 @@ async fn a_restart_under_load_never_exceeds_the_limits() {
                 match class {
                     PermitClass::Read => first_read.get_or_insert(second),
                     PermitClass::Background => first_job.get_or_insert(second),
+                    PermitClass::Drill => unreachable!("no drill slot is asked for here"),
                 };
             }
         }
@@ -1767,6 +1768,49 @@ async fn an_unreachable_gate_does_not_stop_the_slot_rows_mode() {
     back.seed_permits(&providers).await.unwrap();
     assert_eq!(w.rows_of_gates("p").await, 0);
     assert!(take(&back, &w, &p, JOB, "back-job").await.is_some());
+}
+
+/// A drill's slots stay slot rows while a gate hands out the provider's
+/// own: a drill takes none of what reads and jobs have, the gate hears
+/// of no drill, and the drill slot is renewed and freed as a row.
+#[tokio::test]
+async fn a_drill_slot_is_not_the_gates() {
+    let w = World::new();
+    let mut p = provider("p", 2);
+    p.drill_conns = 1;
+    let providers = [p.clone()];
+    let c = w.catalog(PermitMode::Gate, GateSharding::One, &providers);
+    c.seed_permits(&providers).await.unwrap();
+    w.pass(JOB_MS + SKEW_MS);
+
+    let drill = take(&c, &w, &p, PermitClass::Drill, "drill").await.unwrap();
+    assert_eq!(drill.class, PermitClass::Drill);
+    assert_eq!(
+        w.held("permits:all:0", "p").await,
+        0,
+        "the gate gave nothing"
+    );
+    assert!(take(&c, &w, &p, PermitClass::Drill, "drill-2")
+        .await
+        .is_none());
+    // Everything of the provider's own is still there for production.
+    let read = take(&c, &w, &p, READ, "read").await.unwrap();
+    let job = take(&c, &w, &p, JOB, "job").await.unwrap();
+    assert_eq!(w.held("permits:all:0", "p").await, 2);
+    assert!(take(&c, &w, &p, READ, "read-2").await.is_none());
+
+    assert!(c.renew_permit(&drill, w.now()).await.unwrap());
+    c.release_permit(&drill).await.unwrap();
+    assert_eq!(
+        w.held("permits:all:0", "p").await,
+        2,
+        "not the gate's to free"
+    );
+    assert!(take(&c, &w, &p, PermitClass::Drill, "drill-3")
+        .await
+        .is_some());
+    c.release_permit(&read).await.unwrap();
+    c.release_permit(&job).await.unwrap();
 }
 
 /// A request of several questions that fails at one of them hands out

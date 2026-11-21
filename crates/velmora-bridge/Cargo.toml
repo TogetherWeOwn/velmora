@@ -32,6 +32,9 @@ hkdf = "0.13"
 hmac = { version = "0.13", features = ["zeroize"] }
 sha2 = "0.11"
 md5 = "0.8"
+# The drill hands a running MD5 from one request to the next; `md5` has no
+# state that can leave the process.
+md_5 = { package = "md-5", version = "0.11", default-features = false }
 subtle = { version = "2", default-features = false }
 zeroize = "1"
 rusqlite = { version = "0.42", features = ["bundled", "preupdate_hook"], optional = true }
