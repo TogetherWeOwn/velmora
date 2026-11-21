@@ -455,11 +455,17 @@ where
         if fresh.is_empty() {
             fresh = expired;
         }
+        let mut waited = false;
         loop {
             // The pool as it is now: a wait may have outlasted a cooldown,
             // or seen one begin.
             let at = self.clock.now();
-            let pool = Pool::load(&self.catalog, &self.cfg.providers, at).await?;
+            let pool = match Pool::load(&self.catalog, &self.cfg.providers, at).await {
+                // A later ask that cannot read the pool ends the wait as
+                // a put-off: the attempt of the claim is handed back.
+                Err(_) if waited => return Err(Stop::NoPermit),
+                pool => pool?,
+            };
             let usable = pool.order(fresh.clone(), PermitClass::Background);
             if usable.is_empty() {
                 return Err(match pool.cooling_until(&fresh) {
@@ -514,6 +520,7 @@ where
             if !self.slot_wait(lease).await {
                 return Err(Stop::NoPermit);
             }
+            waited = true;
         }
     }
 
