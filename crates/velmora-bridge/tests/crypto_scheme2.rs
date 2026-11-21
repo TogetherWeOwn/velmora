@@ -530,8 +530,21 @@ fn a_v2_record_of_another_tenant_is_refused_by_its_own_error() {
     let mut junk = sealed.clone();
     junk[4..22].copy_from_slice(b"t_ZZZZZZZZZZZZZZZZ");
     assert!(tenant_error(record_v2_header(&junk).unwrap_err()));
-    // A data record is never sealed at a bucket configuration name.
-    assert!(seal_record_v2(&key_a, "m/x/t_0000000000000001/b/b_01/1", b"x", &mut rng()).is_err());
+    // A data record is never sealed or opened at a bucket configuration
+    // name; that is not a cross-tenant record, so not its alarm error.
+    let config = "m/x/t_0000000000000001/b/b_01/1";
+    let config_error = |e: BridgeError| {
+        is_crypto(
+            &e,
+            "record name is in the tenant's bucket configuration directory",
+        )
+    };
+    assert!(config_error(
+        seal_record_v2(&key_a, config, b"x", &mut rng()).unwrap_err()
+    ));
+    assert!(config_error(
+        open_record_v2(&key_a, &a, config, &sealed).unwrap_err()
+    ));
     // A VMR2 record under tenant 0's prefix is never one of b's.
     assert!(tenant_error(
         open_record_v2(&key_b, &b, "m/x/t_0000000000000000/g_1", &sealed).unwrap_err()

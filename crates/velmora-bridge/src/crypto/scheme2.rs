@@ -158,6 +158,8 @@ const ERR_TK_CHECK: BridgeError = BridgeError::Crypto("tenant key check value mi
 const ERR_TK_OTHER: BridgeError = BridgeError::Crypto("tenant key is not the one the data names");
 const ERR_RECORD_V2: BridgeError = BridgeError::Crypto("v2 record authentication failed");
 const ERR_RECORD_TENANT: BridgeError = BridgeError::Crypto("record names another tenant");
+const ERR_RECORD_NAME: BridgeError =
+    BridgeError::Crypto("record name is in the tenant's bucket configuration directory");
 const ERR_CONTROL: BridgeError = BridgeError::Crypto("control record authentication failed");
 const ERR_CONTROL_FORMAT: BridgeError = BridgeError::Crypto("control record malformed");
 const ERR_CONTROL_KIND: BridgeError =
@@ -561,12 +563,17 @@ fn below<'a>(name: &'a str, dir: &str, tenant: &str) -> Option<&'a str> {
         .filter(|rest| !rest.is_empty())
 }
 
-/// Whether `name` is a data record of `tenant`: below `m/x/<t>/`, and
-/// not below its bucket configuration directory `m/x/<t>/b/`, which
-/// holds control records.
-fn under_tenant_dir(name: &str, tenant: &TenantId) -> bool {
-    below(name, TENANT_DIR, tenant.as_str())
-        .is_some_and(|rest| !rest.starts_with(BUCKET_CONFIG_DIR))
+/// Refuses a name that is no data record name of `tenant`. A data record
+/// lies below `m/x/<t>/`, and not below its bucket configuration
+/// directory `m/x/<t>/b/`, which holds control records. A name in that
+/// directory gets its own error; any other name the cross-tenant error
+/// that the reader alarms on.
+fn check_record_name(name: &str, tenant: &TenantId) -> Result<()> {
+    match below(name, TENANT_DIR, tenant.as_str()) {
+        Some(rest) if rest.starts_with(BUCKET_CONFIG_DIR) => Err(ERR_RECORD_NAME),
+        Some(_) => Ok(()),
+        None => Err(ERR_RECORD_TENANT),
+    }
 }
 
 /// Whether `sealed` starts like a VMR2 record. Says nothing about
@@ -608,9 +615,7 @@ pub fn seal_record_v2<R: FillRandom>(
     plaintext: &[u8],
     rng: &mut R,
 ) -> Result<Vec<u8>> {
-    if !under_tenant_dir(name, &tk.tenant) {
-        return Err(ERR_RECORD_TENANT);
-    }
+    check_record_name(name, &tk.tenant)?;
     let aad = record_v2_aad(name, &tk.tenant, tk.version)?;
     let key = tk.derive(MANIFEST_V2_DOMAIN.as_bytes());
     let wrapped = wrap_bytes_as(WRAP_VERSION, &key, aad.as_bytes(), plaintext, rng)?;
@@ -639,9 +644,10 @@ pub fn open_record_v2(
     // The raw bytes, before any parse: an envelope that names tenant 0
     // or no tenant at all is another tenant's too.
     let envelope_tenant = &sealed[4..4 + TENANT_ID_LEN];
-    if envelope_tenant != tenant.as_str().as_bytes() || !under_tenant_dir(name, tenant) {
+    if envelope_tenant != tenant.as_str().as_bytes() {
         return Err(ERR_RECORD_TENANT);
     }
+    check_record_name(name, tenant)?;
     let version = header_version(sealed);
     tk.is(tenant, version)?;
     let aad = record_v2_aad(name, tenant, version)?;
@@ -1053,14 +1059,14 @@ mod tests {
     #[test]
     fn a_name_lies_in_the_tenant_dir_only_below_it() {
         let t = TenantId::parse("t_00000000000000a1").unwrap();
-        assert!(under_tenant_dir("m/x/t_00000000000000a1/g_1", &t));
-        assert!(!under_tenant_dir("m/x/t_00000000000000a1/", &t));
-        assert!(!under_tenant_dir("m/x/t_00000000000000a1", &t));
-        assert!(!under_tenant_dir("m/x/t_00000000000000a10/g_1", &t));
-        assert!(!under_tenant_dir("m/g_1", &t));
+        assert!(check_record_name("m/x/t_00000000000000a1/g_1", &t).is_ok());
+        assert!(!check_record_name("m/x/t_00000000000000a1/", &t).is_ok());
+        assert!(!check_record_name("m/x/t_00000000000000a1", &t).is_ok());
+        assert!(!check_record_name("m/x/t_00000000000000a10/g_1", &t).is_ok());
+        assert!(!check_record_name("m/g_1", &t).is_ok());
         // The bucket configuration directory holds control records.
-        assert!(!under_tenant_dir("m/x/t_00000000000000a1/b/b_01/1", &t));
-        assert!(under_tenant_dir("m/x/t_00000000000000a1/bb", &t));
+        assert!(!check_record_name("m/x/t_00000000000000a1/b/b_01/1", &t).is_ok());
+        assert!(check_record_name("m/x/t_00000000000000a1/bb", &t).is_ok());
     }
 
     #[test]
