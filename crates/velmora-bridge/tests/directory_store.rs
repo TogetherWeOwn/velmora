@@ -1303,3 +1303,20 @@ fn a_route_moves_only_from_the_tenant_it_names() {
         assert_eq!(dir.route("AKIA3").await.unwrap().unwrap().tenant, zero);
     });
 }
+
+/// A bare `m/t/<tenant>` beside an intact chain is a stray name: the
+/// listing of tenants fails instead of skipping it.
+#[test]
+fn a_bare_tenant_name_is_a_stray() {
+    block_on(async {
+        let store = MemRecords::new();
+        let chain = TenantChain {
+            store: &store,
+            seal: &PlainSeal::new(),
+        };
+        let a = TenantId::parse(A1).unwrap();
+        active(&chain, &a).await;
+        store.plant(&format!("m/t/{A1}"), vec![1]);
+        assert!(chain_tenants(&store).await.is_err());
+    });
+}

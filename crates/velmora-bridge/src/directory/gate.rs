@@ -245,7 +245,7 @@ fn anchor_key(epoch: u64) -> String {
 
 /// The highest epoch an anchor may name: well inside the integers that
 /// every store and every JSON reader keeps exactly.
-pub const MAX_EPOCH: u64 = 1 << 53;
+pub const MAX_EPOCH: u64 = (1 << 53) - 1;
 
 /// The newest anchored epoch, 0 = none, and the number of names under
 /// the prefix that are no anchor (a stray name, or an epoch above
@@ -337,7 +337,9 @@ pub async fn chain_tenants<S: RecordStore>(store: &S) -> Result<Vec<TenantId>> {
         };
         let tenant = key
             .strip_prefix(TENANT_CHAIN_PREFIX)
-            .and_then(|rest| rest.split('/').next())
+            // A record name has a `/` after the tenant id; a bare
+            // `m/t/<tenant>` is a stray name.
+            .and_then(|rest| rest.split_once('/').map(|(tenant, _)| tenant))
             .and_then(TenantId::parse)
             .ok_or(BridgeError::Invalid("stray name under the tenant chains"))?;
         if out.last().is_some_and(|last| *last >= tenant) {
