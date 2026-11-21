@@ -6,7 +6,7 @@
 #   VELMORA_D1                    source database (default velmora-catalog)
 #   VELMORA_EXPORT_BUCKET         R2 bucket (default velmora-catalog-export)
 #   VELMORA_EXPORT_RCLONE_REMOTE  optional configured rclone remote
-#   VELMORA_IMPORT_PRODUCTION     set to yes to allow the velmora-catalog target
+#   VELMORA_IMPORT_PRODUCTION     set to yes to allow a catalogue target
 #   CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID  for wrangler
 
 set -euo pipefail
@@ -22,14 +22,15 @@ die() {
 target=$1
 since_ms=$2
 shift 2
-if [[ $target == velmora-catalog && ${VELMORA_IMPORT_PRODUCTION:-} != yes ]]; then
-  die 'refusing to load into velmora-catalog without VELMORA_IMPORT_PRODUCTION=yes'
+DB=${VELMORA_D1:-velmora-catalog}
+if [[ ${VELMORA_IMPORT_PRODUCTION:-} != yes &&
+      ( $target == velmora-catalog || $target == CATALOG || $target == "$DB" ) ]]; then
+  die "refusing to load into $target without VELMORA_IMPORT_PRODUCTION=yes"
 fi
 [[ $since_ms =~ ^[0-9]+$ ]] || die 'restore point must contain only digits'
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 cd "$HERE/.."
-DB=${VELMORA_D1:-velmora-catalog}
 BUCKET=${VELMORA_EXPORT_BUCKET:-velmora-catalog-export}
 remote=${VELMORA_EXPORT_RCLONE_REMOTE-}
 if [[ ${VELMORA_EXPORT_RCLONE_REMOTE+x} && ! $remote =~ ^[A-Za-z0-9_-]+$ ]]; then
@@ -46,10 +47,28 @@ get() {
   local key=$1 out=$2
   shift 2
   if [[ -n $remote ]]; then
-    rclone copyto "$remote:$BUCKET/$key" "$out"
+    rclone copyto "$remote:$BUCKET/$key" "$out" </dev/null
   else
-    npx wrangler r2 object get "$BUCKET/$key" --file "$out" --remote "$@"
-  fi >"$WORK/get.log" 2>&1
+    npx wrangler r2 object get "$BUCKET/$key" --file "$out" --remote "$@" </dev/null
+  fi >"$out.log" 2>&1 || return 1
+  [[ -s $out ]] || die "empty download for $key"
+}
+
+# Return 2 only when the object is missing.
+get_restore_object() {
+  local key=$1 out=$2 listing
+  shift 2
+  if [[ -n $remote ]]; then
+    listing=$(rclone lsf "$remote:$BUCKET/$key" </dev/null 2>"$out.log") || return 1
+    [[ -n $listing ]] || return 2
+  fi
+  if get "$key" "$out" "$@"; then
+    return 0
+  fi
+  if [[ -z $remote ]] && grep -qiE 'The specified key does not exist|NoSuchKey|not found' "$out.log"; then
+    return 2
+  fi
+  return 1
 }
 
 verify() {
@@ -63,7 +82,7 @@ verify() {
 prefix="d1/$DB/$since_ms"
 manifest="$prefix.manifest.json"
 sql="$WORK/catalog.sql"
-if get "$manifest" "$WORK/manifest.json" "$@"; then
+if get_restore_object "$manifest" "$WORK/manifest.json" "$@"; then
   jq -ers --arg db "$DB" --arg ms "$since_ms" --arg prefix "$prefix.sql.zst.part-" '
     def bytes: type == "number" and . >= 0 and floor == .;
     def sha256: type == "string" and test("^[0-9a-f]{64}$");
@@ -91,13 +110,25 @@ if get "$manifest" "$WORK/manifest.json" "$@"; then
   zstd -q -d "$sql.zst" -o "$sql" || die "decompression failed for $prefix.sql.zst (from $manifest)"
   verify "$sql" "$prefix.sql (from $manifest)" "$sql_bytes" "$sql_sha256"
 else
-  get "$prefix.sql" "$sql" "$@" || die "download failed for both $manifest and $prefix.sql"
+  if [[ $? != 2 ]]; then
+    tail -n 20 "$WORK/manifest.json.log" >&2
+    die "could not read $manifest"
+  fi
+  legacy="$prefix.sql"
+  if get_restore_object "$legacy" "$sql" "$@"; then
+    grep -q 'CREATE TABLE' "$sql" || die "no schema in $legacy"
+  elif [[ $? == 2 ]]; then
+    die "no export at restore point $since_ms (neither $manifest nor $legacy)"
+  else
+    tail -n 20 "$sql.log" >&2
+    die "could not read $legacy"
+  fi
   echo 'catalog-import: legacy export without a manifest; no checksum to check'
 fi
 
 npx wrangler d1 execute "$target" --remote --json \
   --command "SELECT count(*) AS n FROM sqlite_master WHERE type='table' AND substr(name, 1, 4) <> '_cf_' AND substr(name, 1, 7) <> 'sqlite_'" \
-  "$@" >"$WORK/count.json" 2>"$WORK/count.log" || {
+  "$@" </dev/null >"$WORK/count.json" 2>"$WORK/count.log" || {
   tail -n 20 "$WORK/count.log" >&2
   die "could not check whether $target is empty"
 }
@@ -105,7 +136,7 @@ count=$(jq -er '.[0].results[0].n | select(type == "number" and . >= 0 and floor
   die "could not read table count for $target"
 [[ $count == 0 ]] || die "$target is not empty"
 
-npx wrangler d1 execute "$target" --remote --yes --file "$sql" "$@" >"$WORK/load.log" 2>&1 || {
+npx wrangler d1 execute "$target" --remote --yes --file "$sql" "$@" </dev/null >"$WORK/load.log" 2>&1 || {
   tail -n 20 "$WORK/load.log" >&2
   die "load into $target failed"
 }

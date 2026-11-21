@@ -15,6 +15,7 @@ SOURCE = "fixture-catalog"
 BUCKET = "fixture-exports"
 PART_BYTES = 4096
 ARGS = ["--env", "dev"]
+MS = "1760000000123"
 
 STUB = """#!/usr/bin/env python3
 import json
@@ -27,17 +28,37 @@ args = sys.argv[1:]
 bucket = Path(os.environ["FAKE_BUCKET"])
 with open(os.environ["FAKE_LOG"], "a") as log:
     print(json.dumps([Path(sys.argv[0]).name, *args]), file=log)
+if os.fstat(0).st_rdev != os.stat("/dev/null").st_rdev or os.read(0, 1) != b"":
+    Path(os.environ["FAKE_LOG"] + ".stdin").touch()
+    sys.exit("stub stdin was not /dev/null")
+
+def download(source, dest):
+    if source.name.endswith(".manifest.json") and os.environ.get("FAKE_FAIL_GET"):
+        for line in range(25):
+            print(f"stub manifest error line {line:02d}", file=sys.stderr)
+        sys.exit(1)
+    if not source.exists():
+        sys.exit(os.environ.get("FAKE_MISSING", "The specified key does not exist"))
+    if source.name.endswith(".manifest.json") and os.environ.get("FAKE_BAD_READBACK"):
+        Path(dest).write_bytes(b"other bytes")
+    else:
+        shutil.copyfile(source, dest)
 
 if Path(sys.argv[0]).name == "rclone":
+    if args[0] == "lsf":
+        obj = bucket / args[1].removeprefix("r2x:")
+        if obj.exists():
+            print(obj.name)
+        sys.exit(0)
     assert args[0] == "copyto"
     source, dest = args[1:3]
     if source.startswith("r2x:"):
-        source = bucket / source.removeprefix("r2x:")
+        download(bucket / source.removeprefix("r2x:"), dest)
     else:
         assert dest.startswith("r2x:")
         dest = bucket / dest.removeprefix("r2x:")
         dest.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copyfile(source, dest)
+        shutil.copyfile(source, dest)
 elif args[:3] == ["wrangler", "d1", "export"]:
     shutil.copyfile(os.environ["FAKE_FIXTURE"], args[args.index("--output") + 1])
 elif args[:3] == ["wrangler", "r2", "object"]:
@@ -50,7 +71,7 @@ elif args[:3] == ["wrangler", "r2", "object"]:
         shutil.copyfile(path, obj)
     else:
         assert args[3] == "get"
-        shutil.copyfile(obj, path)
+        download(obj, path)
 elif args[:3] == ["wrangler", "d1", "execute"]:
     if "--command" in args:
         assert "--json" in args
@@ -80,6 +101,11 @@ class CatalogueScripts(unittest.TestCase):
             stub = work / name
             stub.write_text(STUB)
             stub.chmod(0o755)
+        date = work / "date"
+        date.write_text('#!/bin/sh\ncase "$1" in\n'
+                        '+%s%3N) printf "%s\\n" "${FAKE_DATE:-1760000000123}" ;;\n'
+                        '+%s) printf "%s\\n" 1760000000 ;;\nesac\n')
+        date.chmod(0o755)
         self.env = {
             "PATH": f"{work}{os.pathsep}{os.defpath}",
             "TMPDIR": str(work),
@@ -93,10 +119,17 @@ class CatalogueScripts(unittest.TestCase):
         }
 
     def run_script(self, action, *args):
-        return subprocess.run(
+        result = subprocess.run(
             [str(ROOT / "ops" / f"catalog-{action}.sh"), *args, *ARGS],
-            cwd=ROOT, env=self.env, text=True, capture_output=True,
+            cwd=ROOT, env=self.env, text=True, input="unexpected stdin\n", capture_output=True,
         )
+        for pattern in ("velmora-export.*", "velmora-import.*"):
+            self.assertEqual(list(Path(self.env["TMPDIR"]).glob(pattern)), [])
+        self.assertFalse(self.log.with_suffix(".jsonl.stdin").exists())
+        for call in self.calls():
+            if call[:2] == ["npx", "wrangler"] and call[2] in ("d1", "r2"):
+                self.assertIn("--remote", call)
+        return result
 
     def calls(self):
         if not self.log.exists():
@@ -147,7 +180,8 @@ class CatalogueScripts(unittest.TestCase):
         return ms, prefix, manifest
 
     def test_export(self):
-        _, prefix, manifest = self.check_export()
+        ms, prefix, manifest = self.check_export()
+        self.assertEqual(ms, MS)
         calls = self.calls()
         self.assertTrue(all(call[-2:] == ARGS for call in calls))
         puts = [call for call in calls if call[:5] == ["npx", "wrangler", "r2", "object", "put"]]
@@ -159,7 +193,7 @@ class CatalogueScripts(unittest.TestCase):
     def test_rclone_export_and_import(self):
         self.env["VELMORA_EXPORT_RCLONE_REMOTE"] = "r2x"
         ms, prefix, _ = self.check_export()
-        self.assertEqual(self.calls()[-1][3], f"r2x:{BUCKET}/{prefix}.manifest.json")
+        self.assertEqual(self.calls()[-1][2], f"r2x:{BUCKET}/{prefix}.manifest.json")
         result = self.run_script("import", "scratch-db", ms)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual((self.db / "scratch-db").read_bytes(), self.fixture.read_bytes())
@@ -190,6 +224,66 @@ class CatalogueScripts(unittest.TestCase):
         self.assertIn("stub upload failure", result.stderr)
         self.assertEqual(list(self.bucket.rglob("*.manifest.json")), [])
 
+    def test_failed_manifest_put(self):
+        self.env["FAKE_FAIL_PUT"] = ".manifest.json"
+        result = self.run_script("export")
+        self.assert_refused(result, f"put of d1/{SOURCE}/{MS}.manifest.json failed")
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(list(self.bucket.rglob("*.manifest.json")), [])
+
+    def test_manifest_readback_mismatch(self):
+        self.env["FAKE_BAD_READBACK"] = "yes"
+        result = self.run_script("export")
+        key = f"d1/{SOURCE}/{MS}.manifest.json"
+        self.assert_refused(result, f"the manifest read back from {BUCKET}/{key} differs")
+        self.assertEqual(result.stdout, "")
+        self.assertTrue(self.object_path(key).is_file())
+        self.assertTrue(list(self.bucket.rglob("*.part-*")))
+
+    def test_manifest_readback_failure(self):
+        self.env["FAKE_FAIL_GET"] = "yes"
+        result = self.run_script("export")
+        key = f"d1/{SOURCE}/{MS}.manifest.json"
+        self.assert_refused(result, f"the manifest read back from {BUCKET}/{key} differs")
+        self.assertEqual(result.stdout, "")
+        self.assertTrue(self.object_path(key).is_file())
+
+    def test_export_refuses_existing_manifest(self):
+        key = f"d1/{SOURCE}/{MS}.manifest.json"
+        path = self.object_path(key)
+        path.parent.mkdir(parents=True)
+        path.write_bytes(b"existing manifest")
+        for remote in (False, True):
+            with self.subTest(rclone=remote):
+                if remote:
+                    self.env["VELMORA_EXPORT_RCLONE_REMOTE"] = "r2x"
+                result = self.run_script("export")
+                self.assert_refused(result, f"an export at restore point {MS} exists already")
+                self.assertEqual(result.stdout, "")
+        self.assertEqual(path.read_bytes(), b"existing manifest")
+        self.assertEqual([call[1:3] for call in self.calls()], [["wrangler", "r2"],
+                                                               ["lsf", f"r2x:{BUCKET}/{key}"]])
+
+    def test_export_falls_back_to_seconds(self):
+        self.env["FAKE_DATE"] = "1760000000%3N"
+        self.assertEqual(self.export()[0], "1760000000000")
+
+    def test_export_part_boundaries(self):
+        compressed = subprocess.run(["zstd", "-q", "-T0", "-10", "-c", self.fixture],
+                                    capture_output=True, check=True).stdout
+        for size in (len(compressed), 1):
+            with self.subTest(part_bytes=size):
+                if size == 1:
+                    # Use a small fixture so one-byte parts stay within the suffix limit.
+                    self.fixture.write_text("CREATE TABLE fixture (value TEXT);\n")
+                    self.env["FAKE_DATE"] = "1760000000124"
+                self.env["VELMORA_EXPORT_PART_BYTES"] = str(size)
+                ms, _, manifest, _ = self.export()
+                self.assertEqual(manifest["zst_bytes"] % size, 0)
+                self.assertEqual(len(manifest["parts"]), manifest["zst_bytes"] // size)
+                self.assertTrue(all(part["bytes"] == size for part in manifest["parts"]))
+                self.assert_loaded(self.run_script("import", "scratch-db", ms), ms)
+
     def assert_loaded(self, result, ms, leading_lines=()):
         self.assertEqual(result.returncode, 0, result.stderr)
         loaded = (self.db / "scratch-db").read_bytes()
@@ -211,10 +305,10 @@ class CatalogueScripts(unittest.TestCase):
         self.assertTrue(all(call[-2:] == ARGS for call in self.calls()))
 
     def test_import_refuses_production_and_non_digit_restore_point(self):
-        self.assert_refused(
-            self.run_script("import", "velmora-catalog", "123"),
-            "catalog-import: refusing to load into velmora-catalog without VELMORA_IMPORT_PRODUCTION=yes",
-        )
+        for target in ("velmora-catalog", "CATALOG", SOURCE):
+            with self.subTest(target=target):
+                self.assert_refused(self.run_script("import", target, "123"),
+                                    f"refusing to load into {target} without VELMORA_IMPORT_PRODUCTION=yes")
         self.assert_refused(self.run_script("import", "scratch-db", "12x"), "only digits")
         self.assertEqual(self.calls(), [])
 
@@ -227,6 +321,13 @@ class CatalogueScripts(unittest.TestCase):
         path.write_bytes(data)
         self.assert_refused(self.run_script("import", "scratch-db", ms),
                             f"sha256 mismatch for {key}")
+
+    def test_missing_part(self):
+        ms, _, manifest, _ = self.export()
+        key = manifest["parts"][0]["key"]
+        self.object_path(key).unlink()
+        self.assert_refused(self.run_script("import", "scratch-db", ms),
+                            f"download failed for {key}")
 
     def test_wrong_restore_point_in_manifest(self):
         ms, prefix, manifest, _ = self.export()
@@ -259,9 +360,59 @@ class CatalogueScripts(unittest.TestCase):
         path = self.object_path(f"d1/{SOURCE}/{ms}.sql")
         path.parent.mkdir(parents=True)
         path.write_bytes(self.fixture.read_bytes())
-        self.assert_loaded(self.run_script("import", "scratch-db", ms), ms, [
-            "catalog-import: legacy export without a manifest; no checksum to check",
-        ])
+        for missing in ("The specified KEY does not exist", "NoSuchKey", "object NOT FOUND", ""):
+            with self.subTest(missing=missing):
+                self.env["FAKE_MISSING"] = missing
+                if not missing:
+                    self.env["VELMORA_EXPORT_RCLONE_REMOTE"] = "r2x"
+                self.assert_loaded(self.run_script("import", "scratch-db", ms), ms, [
+                    "catalog-import: legacy export without a manifest; no checksum to check",
+                ])
+
+    def test_import_reports_missing_export(self):
+        prefix = f"d1/{SOURCE}/{MS}"
+        self.assert_refused(self.run_script("import", "scratch-db", MS),
+                            f"no export at restore point {MS} (neither {prefix}.manifest.json nor {prefix}.sql)")
+
+    def test_manifest_get_failure_does_not_load_legacy(self):
+        prefix = f"d1/{SOURCE}/{MS}"
+        path = self.object_path(f"{prefix}.sql")
+        path.parent.mkdir(parents=True)
+        path.write_bytes(self.fixture.read_bytes())
+        self.env["FAKE_FAIL_GET"] = "yes"
+        for remote in (False, True):
+            with self.subTest(rclone=remote):
+                if remote:
+                    self.env["VELMORA_EXPORT_RCLONE_REMOTE"] = "r2x"
+                    self.object_path(f"{prefix}.manifest.json").write_text("{}")
+                before = len(self.calls())
+                result = self.run_script("import", "scratch-db", MS)
+                self.assert_refused(result, f"could not read {prefix}.manifest.json")
+                self.assertEqual(result.stderr.splitlines(), [
+                    *(f"stub manifest error line {line:02d}" for line in range(5, 25)),
+                    f"catalog-import: could not read {prefix}.manifest.json",
+                ])
+                self.assertEqual(len(self.calls()) - before, 2 if remote else 1)
+
+    def test_empty_downloads(self):
+        ms, prefix, manifest, _ = self.export()
+        part = manifest["parts"][0]["key"]
+        for key in (part, f"{prefix}.manifest.json"):
+            with self.subTest(key=key):
+                self.object_path(key).write_bytes(b"")
+                self.assert_refused(self.run_script("import", "scratch-db", ms),
+                                    f"empty download for {key}")
+        self.object_path(f"{prefix}.manifest.json").unlink()
+        self.object_path(f"{prefix}.sql").write_bytes(b"")
+        self.assert_refused(self.run_script("import", "scratch-db", ms),
+                            f"empty download for {prefix}.sql")
+
+    def test_legacy_export_without_schema(self):
+        key = f"d1/{SOURCE}/{MS}.sql"
+        path = self.object_path(key)
+        path.parent.mkdir(parents=True)
+        path.write_text("SELECT 1;\n")
+        self.assert_refused(self.run_script("import", "scratch-db", MS), f"no schema in {key}")
 
     def test_bash_syntax(self):
         for action in ("export", "import"):

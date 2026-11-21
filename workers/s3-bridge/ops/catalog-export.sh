@@ -50,9 +50,39 @@ fi
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/velmora-export.XXXXXX")
 trap 'rm -rf "$WORK"' EXIT
 
-since_ms=$(($(date +%s) * 1000))
+if ! since_ms=$(date +%s%3N) || [[ ! $since_ms =~ ^[0-9]+$ ]]; then
+  since_ms=$(($(date +%s) * 1000))
+fi
+prefix="d1/$DB/$since_ms"
+manifest="$prefix.manifest.json"
+
+get() {
+  local key=$1 out=$2
+  shift 2
+  if [[ -n $remote ]]; then
+    rclone copyto "$remote:$BUCKET/$key" "$out" </dev/null
+  else
+    npx wrangler r2 object get "$BUCKET/$key" --file "$out" --remote "$@" </dev/null
+  fi >"$WORK/get.log" 2>&1
+}
+
+if [[ -n $remote ]]; then
+  listing=$(rclone lsf "$remote:$BUCKET/$manifest" </dev/null) || {
+    echo "catalog-export: could not check $BUCKET/$manifest" >&2
+    exit 1
+  }
+elif get "$manifest" "$WORK/existing.json" "$@"; then
+  listing=$manifest
+else
+  listing=
+fi
+if [[ -n $listing ]]; then
+  echo "catalog-export: an export at restore point $since_ms exists already" >&2
+  exit 1
+fi
+
 file="$WORK/catalog.sql"
-npx wrangler d1 export "$DB" --remote --output "$file" "$@" >"$WORK/export.log" 2>&1 || {
+npx wrangler d1 export "$DB" --remote --output "$file" "$@" </dev/null >"$WORK/export.log" 2>&1 || {
   echo "catalog-export: wrangler d1 export failed:" >&2
   tail -n 20 "$WORK/export.log" >&2
   exit 1
@@ -65,10 +95,10 @@ put() {
   shift 3
   if [[ -n $remote ]]; then
     rclone copyto "$path" "$remote:$BUCKET/$key" --s3-upload-cutoff 64M \
-      --header-upload "Content-Type: $type"
+      --header-upload "Content-Type: $type" </dev/null
   else
     npx wrangler r2 object put "$BUCKET/$key" --file "$path" --remote \
-      --content-type "$type" "$@"
+      --content-type "$type" "$@" </dev/null
   fi >"$WORK/put.log" 2>&1 || {
     echo "catalog-export: put of $key failed:" >&2
     tail -n 20 "$WORK/put.log" >&2
@@ -86,7 +116,6 @@ sql_sha256=${sql_sha256%% *}
 zst_bytes=$(wc -c <"$file.zst")
 zst_sha256=$(sha256sum <"$file.zst")
 zst_sha256=${zst_sha256%% *}
-prefix="d1/$DB/$since_ms"
 parts=("$file.zst.part-"*)
 for part in "${parts[@]}"; do
   key="$prefix.sql.zst.part-${part##*-}"
@@ -97,7 +126,6 @@ for part in "${parts[@]}"; do
   put "$key" "$part" application/zstd "$@"
 done
 
-manifest="$prefix.manifest.json"
 jq -n --argjson restore_point_ms "$since_ms" --arg database "$DB" \
   --argjson sql_bytes "$sql_bytes" --arg sql_sha256 "$sql_sha256" \
   --argjson zst_bytes "$zst_bytes" --arg zst_sha256 "$zst_sha256" \
@@ -105,6 +133,11 @@ jq -n --argjson restore_point_ms "$since_ms" --arg database "$DB" \
   '{format: 1, $restore_point_ms, $database, $sql_bytes, $sql_sha256,
     $zst_bytes, $zst_sha256, $parts}' >"$WORK/manifest.json"
 put "$manifest" "$WORK/manifest.json" application/json "$@"
+if ! get "$manifest" "$WORK/readback.json" "$@" ||
+   ! cmp -s "$WORK/manifest.json" "$WORK/readback.json"; then
+  echo "catalog-export: the manifest read back from $BUCKET/$manifest differs" >&2
+  exit 1
+fi
 
 printf 'catalog-export: sql %s bytes, sha256 %s, zst %s bytes in %s part(s), manifest %s/%s\n' \
   "$sql_bytes" "$sql_sha256" "$zst_bytes" "${#parts[@]}" "$BUCKET" "$manifest"

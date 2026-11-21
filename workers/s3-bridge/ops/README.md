@@ -285,8 +285,13 @@ exists: restore it to a timestamp, then replay from that timestamp.
 2. Bring the database back, one of:
    - Time Travel: `npx wrangler d1 time-travel restore <db> --timestamp <T>`.
      The restore point is `T` in milliseconds.
-   - Export: create an empty database and run
-     `ops/catalog-import.sh <new db> <restore point>`. The export carries
+   - Export: find the newest complete export with
+     `rclone lsf <remote>:velmora-catalog-export/d1/<db>/ --include '*.manifest.json' | sort | tail -n 1`.
+     The number before `.manifest.json` is the restore point. Set
+     `VELMORA_D1` to the source database of the export. Create an empty
+     database and run `ops/catalog-import.sh <new db> <restore point>`.
+     A target that is the catalogue itself requires
+     `VELMORA_IMPORT_PRODUCTION=yes`. The export carries
      the schema and the list of applied migrations, so apply migrations
      after loading it. The script checks every checksum in the manifest and
      refuses a non-empty database. Legacy single-file exports have no
