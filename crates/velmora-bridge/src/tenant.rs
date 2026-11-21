@@ -27,7 +27,11 @@
 //! A source test (`tests/tenant_seams.rs`) holds that list. The request
 //! path and the catalogue's own delete lists still name blobs without a
 //! scope ([`crate::types::ExtentId::safety_key`]); the same test holds
-//! the list of those places, so that it can only get shorter.
+//! the list of those places, so that it can only get shorter. So does
+//! the hint the consumer sends to the recovery copy after a post job
+//! ([`crate::copy::plan_hint`]): it names the plan record in the flat
+//! layout, and the copy looks for it in tenant 0's layouts. Its message
+//! keeps the bytes it has.
 //!
 //! # Names kept free
 //!

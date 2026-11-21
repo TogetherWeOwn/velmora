@@ -233,6 +233,38 @@ fn a_blob_is_named_without_a_scope_only_at_the_listed_places() {
         assert!(all.contains_key(job_path), "{job_path} is gone");
         assert!(!found.contains_key(job_path), "{job_path}");
     }
+    // A record named in the flat layout by its free function, outside
+    // the module that defines it: only the hint of the recovery copy,
+    // which goes into a queue message whose bytes do not change.
+    let mut flat = BTreeMap::new();
+    for name in ["article_key(", "generation_key(", "tombstone_key("] {
+        for (file, text) in &all {
+            let n = text
+                .match_indices(name)
+                .filter(|(at, _)| {
+                    let before = text[..*at].chars().next_back();
+                    !before.is_some_and(|c| c == '.' || c == '_' || c.is_alphanumeric())
+                })
+                .filter(|(at, _)| !text[..*at].ends_with("fn "))
+                .count();
+            if n > 0 && file != "bridge/recovery.rs" {
+                *flat.entry(file.clone()).or_default() += n;
+            }
+        }
+    }
+    within(
+        "a record name of the flat layout",
+        &flat,
+        &[
+            // `plan_hint`.
+            ("bridge/copy.rs", 1),
+        ],
+    );
+    assert_eq!(
+        flat.get("bridge/copy.rs"),
+        Some(&1),
+        "the check sees the hint"
+    );
     // The records the job path writes are named in the layout of its
     // scope: the configured layout is never used as it was read.
     for job_path in [

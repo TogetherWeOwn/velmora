@@ -408,8 +408,10 @@ async fn names_written(records: Layout) -> (Vec<String>, Vec<String>) {
         .await
         .expect(204);
 
-    // The plan record of an extent, written as the post stage writes
-    // it: under the layout of the configuration.
+    // The plan record of an extent, written here under the layout of
+    // the configuration, as the post stage writes it for tenant 0.
+    // `nntp_post.rs` (`the_plan_record_is_named_in_the_layout_of_the_scope`)
+    // runs the post stage itself under both layouts.
     let (_, extents) = rig.live(&bucket, "copy").await.unwrap();
     let plan: Vec<ArticleRow> = Vec::new();
     write_article_plan(

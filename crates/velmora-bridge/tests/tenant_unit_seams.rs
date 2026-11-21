@@ -79,6 +79,10 @@ async fn the_directory_of_one_tenant_routes_every_key_to_tenant_zero() {
 
 /// A directory can answer "no such key", and that answer is not an
 /// error: a caller fails closed on it and never guesses a tenant.
+///
+/// This and the next test hold the shape of the port, not an adapter:
+/// the stubs are their own. They fail to compile if the port loses one
+/// of its three answers (a tenant, no such key, an error).
 #[tokio::test(flavor = "current_thread")]
 async fn a_directory_can_say_that_it_does_not_know_a_key() {
     struct Empty;
