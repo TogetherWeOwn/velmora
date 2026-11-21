@@ -172,7 +172,6 @@ fn param_json(v: &SqlValue) -> serde_json::Value {
     }
 }
 
-/// D1 behind the meter.
 /// D1 behind the meter. Cloned for the permit gates, which use the same
 /// database (the catalogue's slot rows they seize) and are metered alike.
 #[derive(Clone)]
@@ -1502,6 +1501,7 @@ async fn scenario_with(s: &Scale, trace: Option<File>, extra: &[(&str, &str)]) -
 
     // Evict everything evictable, then cold reads from Usenet, then the
     // same read again from the cache it filled.
+    b.gates.hibernate();
     b.hub.set("stage:evict");
     // The largest integer D1 takes (JavaScript's safe range).
     let all = (1u64 << 53) - 1;
@@ -1595,6 +1595,7 @@ async fn scenario_with(s: &Scale, trace: Option<File>, extra: &[(&str, &str)]) -
         let sent = b.bridge.jobs.inner.take();
         b.hub.set("stage:cron_idle");
         for s in sent {
+            b.gates.hibernate();
             b.bridge.run_job(&s.job).await;
             b.hub.add(|c| c.invocations += 1);
         }

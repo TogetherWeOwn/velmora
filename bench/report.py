@@ -202,7 +202,8 @@ def model(counts, labels, prices, cpu):
 
     cpu = cpu or {}
     missing_cpu = [k for k in ("ingest_ms_per_extent", "hot_get_ms_per_mib", "cold_get_ms_per_mib") if k not in cpu]
-    if any(c.get("do_billed", 0) for c in labels.values()) and "do_gb_s_per_request" not in cpu:
+    gate_used = any(c.get("do_billed", 0) for c in labels.values())
+    if gate_used and "do_gb_s_per_request" not in cpu:
         missing_cpu.append("do_gb_s_per_request (permit gate duration)")
     ingest_parts = {
         "s3_upload": ingest_s3,
@@ -244,7 +245,8 @@ def model(counts, labels, prices, cpu):
             "extents_per_tb": EXTENTS_PER_TB,
             "hold_days": hold_days,
             "cpu_source": (cpu.get("source", "from --cpu, no source given") if cpu else "none: CPU priced at 0")
-            + ("; not given, priced at 0: " + ", ".join(missing_cpu) if cpu and missing_cpu else ""),
+            + ("; not given, priced at 0: " + ", ".join(missing_cpu) if cpu and missing_cpu else "")
+            + ("; permit gate duration priced at 0 (no do_gb_s_per_request)" if not cpu and gate_used else ""),
             "cpu": {k: v for k, v in cpu.items() if k != "source"},
         },
         "per_extent_ingest": {k: v for k, v in ingest_parts.items()},
