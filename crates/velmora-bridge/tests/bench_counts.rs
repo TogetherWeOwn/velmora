@@ -1501,7 +1501,7 @@ async fn bench_trace_switches_the_counters_on_first() {
     std::fs::create_dir(&dir).expect("temp dir");
     let dir = Gone(dir);
     let path = dir.0.join("d1-trace.jsonl");
-    let b = Bench::new(Some(File::create(&path).expect("trace file"))).await;
+    let b = Bench::new(Some(File::create(&path).expect("trace file")), &[]).await;
     assert_eq!(
         b.sql_count("SELECT all_x AND all_o AND all_g FROM usage_global WHERE id = 1"),
         1,
