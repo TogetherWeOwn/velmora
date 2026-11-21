@@ -1460,9 +1460,23 @@ fn sanity(b: &Bench) {
 /// them on too (it starts from the migrations, which leave them off).
 #[tokio::test(flavor = "current_thread")]
 async fn bench_trace_switches_the_counters_on_first() {
-    let dir = std::env::temp_dir().join(format!("velmora-bench-arm-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("temp dir");
-    let path = dir.join("d1-trace.jsonl");
+    // A directory of its own (create_dir refuses one that is already
+    // there), removed when the test ends, also on a failed assertion.
+    struct Gone(std::path::PathBuf);
+    impl Drop for Gone {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.0).ok();
+        }
+    }
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_nanos();
+    let dir =
+        std::env::temp_dir().join(format!("velmora-bench-arm-{}-{nanos}", std::process::id()));
+    std::fs::create_dir(&dir).expect("temp dir");
+    let dir = Gone(dir);
+    let path = dir.0.join("d1-trace.jsonl");
     let b = Bench::new(Some(File::create(&path).expect("trace file"))).await;
     assert_eq!(
         b.sql_count("SELECT all_x AND all_o AND all_g FROM usage_global WHERE id = 1"),
@@ -1477,7 +1491,6 @@ async fn bench_trace_switches_the_counters_on_first() {
         .flush()
         .expect("trace flush");
     let text = std::fs::read_to_string(&path).expect("trace");
-    std::fs::remove_dir_all(&dir).ok();
     let first: serde_json::Value =
         serde_json::from_str(text.lines().next().expect("a traced call")).expect("trace line");
     assert_eq!(first["l"], "setup");

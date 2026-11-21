@@ -31,9 +31,11 @@ bench/run-local.sh [--ref <git ref>] [--name <name>] [--out <dir>] [--tiny <n>] 
   meter is compared with them label by label: `results.md` and
   `results.json` (`rows_written_check`) say whether it agrees, and where
   not. The two run the same statements from the same state, so they agree
-  exactly when both are right; the run fails when they are more than
-  `ROWS_WRITTEN_NOISE` (1, the one sampled-extent row of Repeatability
-  below) rows apart in all.
+  exactly when both are right (measured: 0 rows apart). The run fails
+  (after writing the report) when they are more than `ROWS_WRITTEN_NOISE`
+  rows apart in all, or when the replay has nothing to compare. The
+  tolerance is 1 row, set to the run-to-run noise of Repeatability below
+  (one sampled extent); it is not noise between the two.
 - The migrations leave the usage counters off (production switches them on
   with its first recount). The rig starts from the migrations and switches
   them on with the first call of the trace (`ARM_USAGE`, the recount's end
