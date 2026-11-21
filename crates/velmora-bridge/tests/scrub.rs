@@ -792,3 +792,81 @@ async fn the_due_list_is_read_from_its_index() {
         "no sort outside the index: {text}"
     );
 }
+
+/// What a healthy check costs the catalogue in rows written, as D1
+/// bills them: the result (the row and its due-index entry) per extent,
+/// and per run the lease, its totals and the provider slots of the run.
+/// The slots are a per-run cost: the sessions are kept from one extent
+/// to the next, so a run of more extents does not take more of them.
+#[tokio::test(flavor = "current_thread")]
+async fn a_healthy_check_writes_its_result_and_the_run_its_slots() {
+    let w = world().await;
+    let mut objs = Vec::new();
+    for i in 0..4u8 {
+        objs.push(w.released(&format!("k{i}"), 60 + i).await);
+    }
+    w.advance_secs(31 * DAY_SECS);
+    let db = &w.bridge().catalog.sql.inner;
+    db.meter_writes().unwrap();
+    let before = db.writes();
+    let run = w.scrub().await;
+    assert_eq!(run.ok, 4);
+    let spent = db.writes().since(&before);
+    let extents = spent.table("extents");
+    let state = spent.table("scrub_state");
+    let slots = spent.table("provider_permits") + spent.table("provider_health");
+    println!(
+        "rows written by a run of 4 healthy extents: {} (extents {extents}, scrub_state {state}, slots {slots})",
+        spent.billed()
+    );
+    for (table, tally) in &spent.by_table {
+        println!("  {table:?}: {}", tally.billed());
+    }
+    assert_eq!(extents, 4 * 2, "the result and its index entry, per extent");
+    assert_eq!(state, 2, "the lease taken, the totals added");
+    // Everything else is the run's provider slots, kept across extents.
+    assert_eq!(spent.billed(), extents + state + slots);
+    let one = {
+        let w = world().await;
+        let _ = w.released("a", 70).await;
+        w.advance_secs(31 * DAY_SECS);
+        let db = &w.bridge().catalog.sql.inner;
+        db.meter_writes().unwrap();
+        let before = db.writes();
+        assert_eq!(w.scrub().await.ok, 1);
+        let spent = db.writes().since(&before);
+        spent.table("provider_permits") + spent.table("provider_health")
+    };
+    assert_eq!(slots, one, "a run of 4 takes the slots a run of 1 does");
+}
+
+/// While an incident on a backbone stands, a confirmed loss there is not
+/// re-pinned, and a loss with no intact copy anywhere is still said to be
+/// unrecoverable.
+#[tokio::test(flavor = "current_thread")]
+async fn under_an_incident_nothing_is_re_pinned_and_unrecoverable_is_still_said() {
+    let w = world().await;
+    let kept = w.released("a", 80).await;
+    let lost = w.released("b", 81).await;
+    assert!(w.bridge().safety.lose(&lost.extent.safety_key()));
+    w.advance_secs(31 * DAY_SECS);
+    for o in [&kept, &lost] {
+        w.hide(0, o, 0).await;
+        w.hide(1, o, 0).await;
+    }
+    assert_eq!(w.scrub().await.suspect, 2);
+    w.bridge()
+        .catalog
+        .sql
+        .exec("UPDATE scrub_state SET last_incident = 'beta'", &[])
+        .await
+        .unwrap();
+    w.advance_secs(3600);
+    let run = w.scrub().await;
+    assert_eq!((run.repaired, run.unrecoverable, run.suspect), (0, 1, 1));
+    assert_eq!(w.result(&kept).await, "suspect");
+    assert_eq!(w.safety_state(&kept).await, "released");
+    assert_eq!(w.result(&lost).await, "unrecoverable");
+    // The run checked fewer extents than a trip needs: the incident stands.
+    assert_eq!(w.state().await.last_incident.as_deref(), Some("beta"));
+}

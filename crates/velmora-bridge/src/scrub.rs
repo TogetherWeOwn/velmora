@@ -435,19 +435,21 @@ where
             candidate.last,
             Some(ScrubResult::Suspect | ScrubResult::Unrecoverable)
         );
-        let held_back = walk
-            .blocked
-            .as_deref()
-            .is_some_and(|b| found.lacking.iter().any(|l| l == b))
-            || run.repaired >= cfg.repairs_per_run;
-        if !confirmed || held_back {
+        if !confirmed {
             run.suspect += 1;
             let confirm = u64::from(cfg.confirm_secs);
             return self
                 .scrub_record_one(token, extent, ScrubResult::Suspect, confirm)
                 .await;
         }
-        self.repair(token, extent, found, run).await
+        // Held back from a re-pin, not from the finding: an extent with
+        // no intact copy anywhere is still said to be unrecoverable.
+        let may_repin = !walk
+            .blocked
+            .as_deref()
+            .is_some_and(|b| found.lacking.iter().any(|l| l == b))
+            && run.repaired < cfg.repairs_per_run;
+        self.repair(token, extent, found, run, may_repin).await
     }
 
     /// `STAT` on every backbone that counts, then the whole extent read
@@ -593,6 +595,7 @@ where
         extent: &ExtentRow,
         found: Found,
         run: &mut ScrubRun,
+        may_repin: bool,
     ) -> core::result::Result<(), Halt> {
         let cfg = &self.cfg.scrub;
         let confirm = u64::from(cfg.confirm_secs);
@@ -615,6 +618,14 @@ where
                 .scrub_record_one(token, extent, ScrubResult::Unrecoverable, confirm)
                 .await;
         };
+        if !may_repin {
+            // Under an incident on a backbone it lacks, or past the run's
+            // re-pins: looked at again later.
+            run.suspect += 1;
+            return self
+                .scrub_record_one(token, extent, ScrubResult::Suspect, confirm)
+                .await;
+        }
         if source != RepairSource::Safety && !self.put_safety(extent, cipher).await {
             // The store did not take it: try again at the next look.
             run.suspect += 1;
