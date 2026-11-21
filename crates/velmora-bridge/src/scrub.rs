@@ -545,12 +545,7 @@ where
                     candidate.last,
                     Some(ScrubResult::Suspect | ScrubResult::Unrecoverable)
                 ) {
-                    let next = self
-                        .clock
-                        .now()
-                        .plus_ms(i64::try_from(confirm * 1000).unwrap_or(i64::MAX));
-                    self.catalog.scrub_defer(token, &extent.id, next).await?;
-                    return Ok(());
+                    return self.defer_seen(token, candidate, confirm).await;
                 }
                 if candidate.last == Some(ScrubResult::Deferred) {
                     crate::trace::alert(|| {
@@ -615,7 +610,7 @@ where
             if confirmed {
                 // Classified as any confirmed loss (unrecoverable when no
                 // copy is left), but not re-pinned.
-                return self.repair(reader, walk, extent, found, false).await;
+                return self.repair(reader, walk, candidate, found, false).await;
             }
             walk.run.suspect += 1;
             return self
@@ -635,7 +630,7 @@ where
         let may_repin = (!under_incident || walk.blocked_repins < BLOCKED_REPINS_PER_RUN)
             && walk.run.repaired < cfg.repairs_per_run;
         let repaired = walk.run.repaired;
-        let done = self.repair(reader, walk, extent, found, may_repin).await;
+        let done = self.repair(reader, walk, candidate, found, may_repin).await;
         if under_incident && walk.run.repaired > repaired {
             walk.blocked_repins += 1;
         }
@@ -653,6 +648,9 @@ where
     ) -> core::result::Result<Found, Halt> {
         // The reader's sessions wait while the backbones are asked.
         let holder = reader.holder().to_owned();
+        // Taken before the race: the reader's timer may end its sessions
+        // while a backbone waits for a slot one of them held.
+        let reader_held = reader.idle_ms().is_some();
         let lacking = {
             let asked = self.presence_all(&holder, walk.stats, &mut walk.refused, &plan);
             let mut asked = core::pin::pin!(asked);
@@ -673,7 +671,7 @@ where
         // with one background slot). They are ended and it is asked once
         // more.
         let asked = match lacking {
-            Err(Halt::Busy) if reader.idle_ms().is_some() => {
+            Err(Halt::Busy) if reader_held => {
                 reader.hang_up().await;
                 self.presence_all(&holder, walk.stats, &mut walk.refused, &plan)
                     .await
@@ -692,6 +690,9 @@ where
         let before = reader.stats();
         // The `STAT` sessions wait while the extent is read.
         let plan_again = plan.clone();
+        // Taken before the race, as above: the `STAT` sessions' timer may
+        // end them while the read waits for a slot one of them held.
+        let stats_held = !walk.stats.is_empty();
         let read = {
             let limit = walk.stats.iter().map(ProviderSession::idle_ms).min();
             let fetch = reader.fetch_planned(extent, plan);
@@ -712,7 +713,7 @@ where
         // and one background slot). They are ended and the read asked
         // once more.
         let read = match read {
-            Ok(ColdFetch::Busy) if !walk.stats.is_empty() => {
+            Ok(ColdFetch::Busy) if stats_held => {
                 ProviderSession::close_all(core::mem::take(walk.stats)).await;
                 reader.fetch_planned(extent, plan_again).await
             }
@@ -955,6 +956,37 @@ where
         Ok(None)
     }
 
+    /// A loss seen before (`suspect` or `unrecoverable`) whose look broke
+    /// off: looked at again after the confirm interval with its result
+    /// kept, so the next look that finds the loss confirms it. The time
+    /// of the last look that ended stays as it is: once it is more than
+    /// two confirm intervals old, the looks keep breaking off and that is
+    /// said (`scrub-deferred`) on each of them.
+    async fn defer_seen(
+        &self,
+        token: u64,
+        candidate: &ScrubCandidate,
+        confirm: u64,
+    ) -> core::result::Result<(), Halt> {
+        let now = self.clock.now();
+        let confirm_ms = i64::try_from(confirm * 1000).unwrap_or(i64::MAX);
+        let stale = candidate
+            .last_scrubbed_at
+            .is_some_and(|at| at.plus_ms(confirm_ms.saturating_mul(2)) < now);
+        if stale {
+            crate::trace::alert(|| {
+                format!(
+                    "scrub-deferred {} a loss seen before: its looks keep breaking off",
+                    candidate.extent.id.as_str()
+                )
+            });
+        }
+        self.catalog
+            .scrub_defer(token, &candidate.extent.id, now.plus_ms(confirm_ms))
+            .await?;
+        Ok(())
+    }
+
     /// Whether some enabled provider posts to the backbone `name`: only
     /// such a provider can be sent an article that backbone lacks.
     fn posts_to(&self, name: &str) -> bool {
@@ -970,10 +1002,11 @@ where
         &'s self,
         reader: &mut ColdReader<'s, C, N, T>,
         walk: &mut Walk<'_, 's, C, N, T>,
-        extent: &ExtentRow,
+        candidate: &ScrubCandidate,
         found: Found,
         may_repin: bool,
     ) -> core::result::Result<(), Halt> {
+        let extent = &candidate.extent;
         let cfg = &self.cfg.scrub;
         let token = walk.token;
         let confirm = u64::from(cfg.confirm_secs);
@@ -988,21 +1021,16 @@ where
             None => match self.stored_copy(extent).await {
                 Ok(stored) => stored,
                 // A blob store did not answer: not "no copy". Looked at
-                // again later.
-                Err(()) => {
-                    return self
-                        .scrub_record_one(reader, walk, extent, (ScrubResult::Deferred, confirm))
-                        .await;
-                }
+                // again later, the loss still on record (confirmed).
+                Err(()) => return self.defer_seen(token, candidate, confirm).await,
             },
         };
         let Some(cipher) = cipher else {
             if found.interrupted {
                 // The read broke off: Usenet may well hold it. Not
-                // unrecoverable on that.
-                return self
-                    .scrub_record_one(reader, walk, extent, (ScrubResult::Deferred, confirm))
-                    .await;
+                // unrecoverable on that, and still confirmed: the next
+                // look that finds the loss again repairs it.
+                return self.defer_seen(token, candidate, confirm).await;
             }
             walk.run.unrecoverable += 1;
             crate::trace::alert(|| {

@@ -356,7 +356,6 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ProviderSession<'a, C, N, T> {
         self.session.is_some()
     }
 
-    /// The slot this session holds.
     /// How long the session may still sit unused, in milliseconds: until
     /// its slot, last renewed at `held_from`, has only the goodbye and the
     /// slack left. A caller that waits for anything else ends it then.
@@ -375,6 +374,7 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ProviderSession<'a, C, N, T> {
         u32::try_from(left.clamp(0, life)).unwrap_or(0)
     }
 
+    /// The slot this session holds.
     pub(crate) fn permit(&self) -> &Permit {
         &self.permit
     }

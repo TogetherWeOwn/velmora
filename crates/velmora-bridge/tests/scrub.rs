@@ -1744,3 +1744,58 @@ async fn a_backbone_that_does_not_serve_what_it_says_it_holds_is_read_in_full() 
     assert_eq!(failed, "alpha");
     assert!(alerts().iter().any(|a| a.contains("lacking=[alpha]")));
 }
+
+/// A loss seen once (`suspect`) whose second look breaks off stays
+/// confirmed: the read that broke off records nothing over it, the next
+/// look that finds the loss re-pins the extent, and looks that keep
+/// breaking off are said once the last look that ended is two confirm
+/// intervals old.
+#[tokio::test(flavor = "current_thread")]
+async fn a_confirmed_loss_stays_confirmed_through_a_read_that_breaks_off() {
+    let w = world().await;
+    let o = w.released("a", 251).await;
+    // No copy in R2: the repair has to come from Usenet.
+    assert!(w.bridge().safety.lose(&o.extent.safety_key()));
+    w.advance_secs(31 * DAY_SECS);
+    w.hide(1, &o, 1).await;
+    assert_eq!(w.scrub().await.suspect, 1);
+    let seen = w.scrubbed_at(&o).await;
+    let deferred = |id: &str| {
+        alerts()
+            .iter()
+            .filter(|a| a.starts_with("scrub-deferred ") && a.contains(id))
+            .count()
+    };
+
+    // The second look breaks off (no body served anywhere).
+    w.advance_secs(3600);
+    for s in &w.servers {
+        s.drop_next_bodies(1000).await;
+    }
+    let broken = w.scrub().await;
+    assert_eq!(broken.repaired, 0);
+    assert_eq!(w.result(&o).await, "suspect", "the loss stays on record");
+    assert_eq!(w.scrubbed_at(&o).await, seen, "the last look that ended");
+    assert_eq!(deferred(o.extent.as_str()), 0, "once is not said");
+
+    // Again, more than two confirm intervals after the look that ended.
+    w.advance_secs(3700);
+    w.scrub().await;
+    assert_eq!(w.result(&o).await, "suspect");
+    assert_eq!(
+        deferred(o.extent.as_str()),
+        1,
+        "looks that keep breaking off"
+    );
+
+    // The next look that reads it confirms the loss and re-pins.
+    for s in &w.servers {
+        s.drop_next_bodies(0).await;
+    }
+    w.advance_secs(3600);
+    let run = w.scrub().await;
+    assert_eq!(run.repaired, 1, "confirmed by the look before the break");
+    assert_eq!(w.result(&o).await, "repairing");
+    assert_eq!(w.safety_state(&o).await, "held");
+    assert!(w.has_safety(&o), "the copy is back, read from alpha");
+}
