@@ -136,11 +136,25 @@ pub(super) fn from_proto(r: velmora_s3_proto::Response) -> S3Response {
     }
 }
 
-/// The protocol policy for this deployment. An upload is capped at the
-/// largest PutObject body; UploadPart has its own policy, capped at one
-/// extent.
-pub(super) fn policy(cfg: &BridgeConfig) -> Result<Policy, S3Response> {
-    policy_with(cfg, CONTROL_XML_BYTES, cfg.max_put_bytes)
+/// The protocol policy for this deployment, for requests signed for
+/// `host` (one of the configured hosts, see [`signed_host`]). An upload
+/// is capped at the largest PutObject body; UploadPart has its own
+/// policy, capped at one extent.
+pub(super) fn policy(cfg: &BridgeConfig, host: &str) -> Result<Policy, S3Response> {
+    policy_with(cfg, host, CONTROL_XML_BYTES, cfg.max_put_bytes)
+}
+
+/// The configured host a request is checked against: the one its `Host`
+/// names, or `S3_HOST` when it names none. In that case
+/// [`host_refused`] answers before the signature is judged, so the
+/// fallback is never what a request is accepted for. The value is the
+/// configured name, never the request's text.
+pub(super) fn signed_host<'a>(cfg: &'a BridgeConfig, req: &S3Request) -> &'a str {
+    req.headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("host"))
+        .and_then(|(_, value)| cfg.s3_host_for(value))
+        .map_or(cfg.s3_host.as_str(), |(name, _)| name)
 }
 
 /// [`policy`] with other caps on a control document and on a validated
@@ -148,11 +162,12 @@ pub(super) fn policy(cfg: &BridgeConfig) -> Result<Policy, S3Response> {
 /// the limits on an object body are).
 pub(super) fn policy_with(
     cfg: &BridgeConfig,
+    host: &str,
     control_xml_bytes: usize,
     upload_bytes: u64,
 ) -> Result<Policy, S3Response> {
     Policy::new(
-        cfg.s3_host.clone(),
+        host.to_owned(),
         cfg.region.clone(),
         Limits {
             target_bytes: TARGET_BYTES,
@@ -203,8 +218,8 @@ pub(super) fn header_refused(refusal: &HeaderRefusal) -> S3Response {
     )
 }
 
-/// The answer to a `Host` that is not the configured endpoint, or
-/// `None` when it is. The verifier refuses such a request whatever its
+/// The answer to a `Host` that is none of the configured endpoints
+/// (`S3_HOST` and `S3_HOSTS`), or `None` when it is one. The verifier refuses such a request whatever its
 /// signature (a request is only good for the endpoint it was signed
 /// for); this says why, before any key is looked up. The usual cause is
 /// virtual-hosted-style addressing (`<bucket>.<endpoint>`), so that case
@@ -216,11 +231,14 @@ pub(super) fn host_refused(headers: &Headers, cfg: &BridgeConfig) -> Option<S3Re
 /// [`host_refused`] for a `Host` value read off the raw request, as on a
 /// route that parses no headers.
 pub(super) fn host_value_refused(host: &str, cfg: &BridgeConfig) -> Option<S3Response> {
-    if host.eq_ignore_ascii_case(&cfg.s3_host) {
+    if cfg.s3_host_for(host).is_some() {
         return None;
     }
-    let suffix = format!(".{}", cfg.s3_host.to_ascii_lowercase());
-    let message = if host.to_ascii_lowercase().ends_with(&suffix) {
+    let lower = host.to_ascii_lowercase();
+    let virtual_hosted = cfg
+        .all_s3_hosts()
+        .any(|endpoint| lower.ends_with(&format!(".{}", endpoint.to_ascii_lowercase())));
+    let message = if virtual_hosted {
         "Virtual-hosted-style requests are not supported. Use path-style addressing: \
          the bucket goes in the path, not in the host name."
     } else {
@@ -403,7 +421,7 @@ where
     K: Kek,
     T: Clock,
 {
-    let policy = policy(&bridge.cfg)?;
+    let policy = policy(&bridge.cfg, signed_host(&bridge.cfg, req))?;
     let target = Target::parse(&req.raw_target, &policy).map_err(s3_error);
     let fields: Vec<(&str, &str)> = req
         .headers

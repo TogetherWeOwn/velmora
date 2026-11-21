@@ -346,6 +346,12 @@ jobs:
       - name: Test the production config generator
         working-directory: workers/s3-bridge
         run: python3 -I tools/test_deploy_config.py
+      - name: Test the deploy switches and rollback
+        working-directory: workers/s3-bridge
+        run: python3 -I tools/test_deploy_switches.py
+      - name: Test the migration file check
+        working-directory: workers/s3-bridge
+        run: python3 -I tools/test_migrations_check.py
       # bundle.sh: worker-build, then the `name` section is dropped. The
       # same script builds the deploy artifact and the wrangler dev bundle.
       - name: Build the Worker bundle
@@ -471,9 +477,89 @@ jobs:
         working-directory: workers/alerts
         run: node --test test/*.test.js
 
+  migrations-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Check migration files
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha || github.sha }}
+          VELMORA_CATALOGUE_MIGRATIONS: ${{ vars.VELMORA_CATALOGUE_MIGRATIONS }}
+        run: |
+          set -euo pipefail
+          python3 -I - <<'PY'
+          import os, re, subprocess, sys
+
+          base = os.environ.get("BASE_SHA", "")
+          if not base or set(base) == {"0"}:
+              print("migration check skipped: this event has no base commit")
+              sys.exit(0)
+          head = os.environ["HEAD_SHA"]
+
+          def git(*args):
+              return subprocess.check_output(["git", *args])
+
+          if os.environ["GITHUB_EVENT_NAME"] in ("pull_request", "merge_group"):
+              base = git("merge-base", base, head).decode("ascii").strip()
+
+          destructive = re.compile(
+              r"\bDROP\s+(?:TABLE|COLUMN|INDEX|TRIGGER|VIEW)\b|\bDELETE\s+FROM\b|"
+              r"\bALTER\s+TABLE\b[^;]*\b(?:DROP|RENAME)\b",
+              re.IGNORECASE,
+          )
+          filename = re.compile(r"([0-9]{4})_[a-z][a-z0-9]*(?:_[a-z0-9]+)*\.sql")
+          checked = 0
+          errors = []
+          # Only the deployed migration folders are checked. migrations-next/ is excluded.
+          for folder in ("workers/s3-bridge/migrations/", "workers/s3-bridge/migrations-directory/"):
+              # With rename detection off, a move out of a folder is a removal.
+              diff = git("diff", "--no-renames", "--name-status", "-z", base, head, "--", folder)
+              changes = diff.decode("utf-8", "surrogateescape").split("\0")
+              existing = git("ls-tree", "-r", "--name-only", "-z", base, "--", folder)
+              numbers = re.findall(rb"(?:^|/)([0-9]+)_[^/\x00]+\.sql\x00", existing)
+              highest = max(map(int, numbers), default=-1)
+              new_numbers = set()
+              for status, path in zip(changes[::2], changes[1::2]):
+                  name = path.removeprefix(folder)
+                  # The deploy job also checks the database for pending migrations.
+                  if (status == "A" and folder.endswith("/migrations/")
+                          and os.environ.get("VELMORA_CATALOGUE_MIGRATIONS") == "off"):
+                      errors.append("no new catalogue migration while VELMORA_CATALOGUE_MIGRATIONS is off")
+                      if not name.endswith(".sql"):
+                          print(f"checking migration file {path!r}")
+                          checked += 1
+                  if not name.endswith(".sql"):
+                      continue
+                  print(f"checking migration file {path!r}")
+                  checked += 1
+                  if status != "A":
+                      errors.append(f"migration {name} was changed or removed; migrations are append-only")
+                      continue
+                  match = filename.fullmatch(name)
+                  number = int(match[1]) if match else -1
+                  if not match or number <= highest or number in new_numbers:
+                      errors.append(f"migration {name} must use a unique NNNN_<snake>.sql number greater than {highest}")
+                  new_numbers.add(number)
+                  sql = git("show", f"{head}:{path}").decode("utf-8")
+                  first = sql.partition("\n")[0].removesuffix("\r")
+                  stripped = re.sub(r"--[^\r\n]*|/\*[\s\S]*?\*/", " ", sql)
+                  if ((destructive.search(stripped) or destructive.search(sql))
+                          and not re.fullmatch(r"-- contract: \S.*", first)):
+                      errors.append(f"migration {name} contains destructive SQL without a first-line contract reason")
+
+          print(f"migration check: {checked} file(s) checked, {len(errors)} error(s)")
+          if errors:
+              sys.exit("\n".join(errors))
+          PY
+
   ci-ok:
     name: ci-ok
-    needs: [rust-test, rust-wasm, rust-worker-pinned-tls, rust-msrv, cargo-deny, public-pr-security, changes, bridge-native, worker-build, worker-e2e, console-test, alerts-test]
+    needs: [rust-test, rust-wasm, rust-worker-pinned-tls, rust-msrv, cargo-deny, public-pr-security, changes, bridge-native, worker-build, worker-e2e, console-test, alerts-test, migrations-check]
     if: ${{ always() }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -532,16 +618,23 @@ jobs:
     outputs:
       fresh: ${{ steps.fresh.outputs.fresh }}
     steps:
-      # Stale-run guard: build and deploy only while this commit is still
-      # the tip of main, so an older run never replaces a newer release.
+      # Build only for the tip of main or the frozen commit.
       - id: fresh
         name: Check that this commit is still the tip of main
+        env:
+          VELMORA_DEPLOY_FREEZE: ${{ vars.VELMORA_DEPLOY_FREEZE }}
         run: |
           set -euo pipefail
           tip=$(git ls-remote "https://github.com/${GITHUB_REPOSITORY}" refs/heads/main | cut -f1)
           if [ "$tip" = "$GITHUB_SHA" ]; then
             echo "deploy: ${GITHUB_SHA} is the tip of main"
             echo "fresh=true" >> "$GITHUB_OUTPUT"
+          elif [ "${VELMORA_DEPLOY_FREEZE:-}" = "$GITHUB_SHA" ]; then
+            echo "deploy: ${GITHUB_SHA} is the frozen commit; it builds although main is at ${tip}"
+            echo "fresh=true" >> "$GITHUB_OUTPUT"
+          elif [ -n "${VELMORA_DEPLOY_FREEZE:-}" ]; then
+            echo "::error::main moved from ${GITHUB_SHA} to ${tip}; the deploy freeze is set to another commit"
+            exit 1
           else
             echo "skipped: main moved from ${GITHUB_SHA} to ${tip}; the newer run deploys"
             echo "fresh=false" >> "$GITHUB_OUTPUT"
@@ -573,13 +666,30 @@ jobs:
           size=$(stat -c %s build/index_bg.wasm)
           echo "index_bg.wasm: ${size} bytes (budget 3000000)"
           test "$size" -lt 3000000
+      - name: Write the floor level beside the bundle
+        if: steps.fresh.outputs.fresh == 'true'
+        working-directory: workers/s3-bridge
+        run: |
+          set -euo pipefail
+          python3 -I - <<'PY'
+          from pathlib import Path
+          import re, sys
+
+          source = Path("src/lib.rs").read_text(encoding="utf-8")
+          levels = re.findall(r"^pub const FLOOR_LEVEL: u32 = ([0-9]+);$", source, re.MULTILINE)
+          if len(levels) != 1:
+              sys.exit("expected exactly one FLOOR_LEVEL constant in src/lib.rs")
+          level = levels[0]
+          Path("build/floor-level").write_text(level + "\n", encoding="utf-8")
+          print(f"floor level: {level}")
+          PY
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: steps.fresh.outputs.fresh == 'true'
         with:
           name: s3-bridge-bundle
           path: workers/s3-bridge/build/
           if-no-files-found: error
-          retention-days: 1
+          retention-days: 30
       # The unstripped wasm of this release: it names the functions in a
       # production trace frame `wasm-function[N]:0xOFF` (same indices and
       # code offsets). Not deployed. See workers/s3-bridge/ops/README.md,
@@ -601,6 +711,9 @@ jobs:
     environment: production
     permissions:
       contents: read
+    outputs:
+      rollback: ${{ steps.rollback.outputs.rollback }}
+      refused: ${{ steps.fresh.outputs.refused || steps.switches.outputs.refused }}
     # One production deploy at a time; a running deploy is never cancelled.
     concurrency:
       group: deploy-production
@@ -611,12 +724,21 @@ jobs:
       # Re-check after the build and the concurrency wait.
       - id: fresh
         name: Check that this commit is still the tip of main
+        env:
+          VELMORA_DEPLOY_FREEZE: ${{ vars.VELMORA_DEPLOY_FREEZE }}
         run: |
           set -euo pipefail
           tip=$(git ls-remote "https://github.com/${GITHUB_REPOSITORY}" refs/heads/main | cut -f1)
           if [ "$tip" = "$GITHUB_SHA" ]; then
             echo "deploy: ${GITHUB_SHA} is the tip of main"
             echo "fresh=true" >> "$GITHUB_OUTPUT"
+          elif [ "${VELMORA_DEPLOY_FREEZE:-}" = "$GITHUB_SHA" ]; then
+            echo "deploy: ${GITHUB_SHA} is the frozen commit; it deploys although main is at ${tip}"
+            echo "fresh=true" >> "$GITHUB_OUTPUT"
+          elif [ -n "${VELMORA_DEPLOY_FREEZE:-}" ]; then
+            echo "::error::main moved from ${GITHUB_SHA} to ${tip}; the deploy freeze is set to another commit"
+            echo "refused=freeze" >> "$GITHUB_OUTPUT"
+            exit 1
           else
             echo "skipped: main moved from ${GITHUB_SHA} to ${tip}; the newer run deploys"
             echo "fresh=false" >> "$GITHUB_OUTPUT"
@@ -631,6 +753,66 @@ jobs:
         with:
           name: s3-bridge-bundle
           path: workers/s3-bridge/build
+      - name: Check the deploy switches
+        if: steps.fresh.outputs.fresh == 'true'
+        id: switches
+        env:
+          VELMORA_DEPLOY_FREEZE: ${{ vars.VELMORA_DEPLOY_FREEZE }}
+          VELMORA_FLOOR_MIN: ${{ vars.VELMORA_FLOOR_MIN }}
+          VELMORA_FLOOR_VERSION: ${{ vars.VELMORA_FLOOR_VERSION }}
+          VELMORA_CATALOGUE_MIGRATIONS: ${{ vars.VELMORA_CATALOGUE_MIGRATIONS }}
+          FLOOR_LEVEL_FILE: workers/s3-bridge/build/floor-level
+        run: |
+          set -euo pipefail
+          python3 -I - <<'PY'
+          from pathlib import Path
+          import os, re, sys
+
+          def refuse(message):
+              with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+                  output.write("refused=switches\n")
+              sys.exit(message)
+
+          freeze = os.environ.get("VELMORA_DEPLOY_FREEZE", "")
+          if freeze:
+              if not re.fullmatch(r"[0-9a-f]{40}", freeze):
+                  refuse("VELMORA_DEPLOY_FREEZE must be unset or a full 40-hex commit id")
+              sha = os.environ["GITHUB_SHA"]
+              if freeze != sha:
+                  refuse(f"::error::deploy frozen: only commit {freeze} may deploy; this run is {sha}")
+              print("deploy freeze: on, this commit is the one allowed")
+          else:
+              print("deploy freeze: off")
+
+          try:
+              level = Path(os.environ["FLOOR_LEVEL_FILE"]).read_bytes()
+          except OSError:
+              level = b""
+          if not re.fullmatch(rb"[0-9]+\n?", level):
+              refuse("the bundle has no valid floor level")
+          minimum = os.environ.get("VELMORA_FLOOR_MIN", "") or "0"
+          if not re.fullmatch(r"[0-9]+", minimum):
+              refuse("VELMORA_FLOOR_MIN must be unset or a whole number")
+          # Compare decimal digits without an integer conversion size limit.
+          level = level.decode("ascii").rstrip("\n").lstrip("0") or "0"
+          minimum = minimum.lstrip("0") or "0"
+          if (len(level), level) < (len(minimum), minimum):
+              refuse(f"::error::bundle floor level {level} is below VELMORA_FLOOR_MIN {minimum}; refusing to deploy")
+          print(f"floor level of this bundle: {level}; required minimum: {minimum}")
+
+          version = os.environ.get("VELMORA_FLOOR_VERSION", "")
+          uuid = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+          if version and not re.fullmatch(uuid, version):
+              refuse("VELMORA_FLOOR_VERSION must be unset or a lowercase version id (UUID)")
+          print(f"rollback floor version: {version or 'unset'}")
+
+          migrations = os.environ.get("VELMORA_CATALOGUE_MIGRATIONS", "") or "on"
+          if migrations not in ("on", "off"):
+              sys.exit("VELMORA_CATALOGUE_MIGRATIONS must be unset, on or off")
+          print(f"catalogue migrations: {migrations}")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write(f"migrations={migrations}\nfloor_version={version}\n")
+          PY
       # Pinned wrangler from the committed lockfile; no install scripts run,
       # and no credentials are in env.
       - name: Install pinned wrangler (npm ci)
@@ -684,16 +866,25 @@ jobs:
       # workers/s3-bridge/tools/test_deploy_config.py: it runs the
       # script below as it stands in this file, and it holds that the
       # step is that script and nothing else.
+      #
+      # VELMORA_S3_HOSTS adds S3 endpoint hosts as comma separated
+      # hostname=class entries. Attach each host as a Custom Domain
+      # before setting the variable. The smoke test checks every host.
       - name: Generate the production wrangler config
         if: steps.fresh.outputs.fresh == 'true'
         working-directory: workers/s3-bridge
         env:
           VELMORA_S3_HOST: ${{ vars.VELMORA_S3_HOST }}
+          VELMORA_S3_HOSTS: ${{ vars.VELMORA_S3_HOSTS }}
           VELMORA_D1_DATABASE_ID: ${{ vars.VELMORA_D1_DATABASE_ID }}
           VELMORA_RECOVERY_COPY: ${{ vars.VELMORA_RECOVERY_COPY }}
           VELMORA_RECOVERY_PREFIX: ${{ vars.VELMORA_RECOVERY_PREFIX }}
           VELMORA_VERIFY_MODE: ${{ vars.VELMORA_VERIFY_MODE }}
           VELMORA_RECORD_LAYOUT: ${{ vars.VELMORA_RECORD_LAYOUT }}
+          VELMORA_MAINTENANCE: ${{ vars.VELMORA_MAINTENANCE }}
+          VELMORA_CATALOGUE_ID: ${{ vars.VELMORA_CATALOGUE_ID }}
+          VELMORA_JOB_FORMAT: ${{ vars.VELMORA_JOB_FORMAT }}
+          VELMORA_DIRECTORY_D1_ID: ${{ vars.VELMORA_DIRECTORY_D1_ID }}
         run: |
           set -euo pipefail
           python3 -I - wrangler.toml wrangler.deploy.toml <<'PY'
@@ -701,11 +892,14 @@ jobs:
 
           src, dst = sys.argv[1], sys.argv[2]
           host = os.environ.get("VELMORA_S3_HOST", "")
+          hosts = os.environ.get("VELMORA_S3_HOSTS", "")
           dbid = os.environ.get("VELMORA_D1_DATABASE_ID", "")
           label = r"[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?"
-          if len(host) > 253 or not re.fullmatch(rf"{label}(\.{label})+", host):
+          hostname = re.compile(rf"{label}(\.{label})+")
+          if len(host) > 253 or not hostname.fullmatch(host):
               sys.exit("VELMORA_S3_HOST is missing or not a plain lowercase hostname")
-          if not re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", dbid):
+          uuid = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+          if not re.fullmatch(uuid, dbid):
               sys.exit("VELMORA_D1_DATABASE_ID is missing or not a lowercase UUID")
           copy = os.environ.get("VELMORA_RECOVERY_COPY", "") or "off"
           prefix = os.environ.get("VELMORA_RECOVERY_PREFIX", "")
@@ -724,12 +918,72 @@ jobs:
           if layout not in ("flat", "tenant"):
               sys.exit("VELMORA_RECORD_LAYOUT must be unset, flat or tenant")
 
+          maintenance = os.environ.get("VELMORA_MAINTENANCE", "") or "off"
+          if maintenance not in ("off", "restore"):
+              sys.exit("VELMORA_MAINTENANCE must be unset, off or restore")
+          catalogue = os.environ.get("VELMORA_CATALOGUE_ID", "")
+          if catalogue and not re.fullmatch(r"[a-z0-9_-]{1,32}", catalogue):
+              sys.exit("VELMORA_CATALOGUE_ID must be unset or 1 to 32 of a-z 0-9 _ -")
+          job_format = os.environ.get("VELMORA_JOB_FORMAT", "")
+          if job_format not in ("", "1", "2"):
+              sys.exit("VELMORA_JOB_FORMAT must be unset, 1 or 2")
+          directory = os.environ.get("VELMORA_DIRECTORY_D1_ID", "")
+          if directory and not re.fullmatch(uuid, directory):
+              sys.exit("VELMORA_DIRECTORY_D1_ID must be unset or a lowercase UUID")
+          if directory == dbid:
+              sys.exit("VELMORA_DIRECTORY_D1_ID must not be the catalogue database")
+
           with open(src, encoding="utf-8") as f:
               lines = f.read().split("\n")
           header = re.compile(r"\s*\[")
           # The prod section ends at the first [env.*] table header.
           end = next((i for i, l in enumerate(lines)
                       if re.match(r"\s*\[\[?env\.", l)), len(lines))
+          def count_key(value, key):
+              if isinstance(value, dict):
+                  return (key in value) + sum(count_key(item, key) for item in value.values())
+              if isinstance(value, list):
+                  return sum(count_key(item, key) for item in value)
+              return 0
+
+          def assignment(key):
+              return re.compile(rf'''\s*(?:{key}|"{key}"|'{key}')\s*[.=]''')
+
+          try:
+              shipped_prod = tomllib.loads("\n".join(lines[:end]))
+          except tomllib.TOMLDecodeError:
+              shipped_prod = {}  # The generated config is checked below.
+          for key in ("S3_HOSTS", "CATALOGUE_ID", "JOB_FORMAT"):
+              if any(assignment(key).match(line) for line in lines[:end]) or count_key(shipped_prod, key):
+                  sys.exit(f"the prod section of the shipped file sets {key}")
+
+          maintenance_line = re.compile(r'^\s*MAINTENANCE = "off"(\s+#.*)?$')
+          hits = [i for i in range(end) if maintenance_line.fullmatch(lines[i])]
+          if len(hits) != 1:
+              sys.exit('expected exactly one prod line MAINTENANCE = "off"; use VELMORA_MAINTENANCE to change the deployed setting')
+          maintenance_at = hits[0]
+          tables = [line.strip() for line in lines[:maintenance_at] if header.match(line)]
+          if tables[-1:] != ["[vars]"]:
+              sys.exit("the prod MAINTENANCE line is not in the [vars] table")
+          if (any(assignment("MAINTENANCE").match(lines[i]) for i in range(end) if i != maintenance_at)
+                  or count_key(shipped_prod, "MAINTENANCE") > 1):
+              sys.exit("the prod section sets MAINTENANCE a second time")
+
+          shipped_d1 = shipped_prod.get("d1_databases", [])
+          if (any(re.fullmatch(r'''\s*binding\s*=\s*["']DIRECTORY["']\s*(?:#.*)?''', line)
+                  for line in lines[:end])
+                  or any(db.get("binding") == "DIRECTORY" for db in shipped_d1)):
+              sys.exit("the prod section of the shipped file binds DIRECTORY")
+          entries = hosts.split(",") if hosts else []
+          seen = {host}
+          classes = []
+          for entry in entries:
+              name, _, host_class = entry.partition("=")
+              if (len(entries) > 8 or len(name) > 253 or not hostname.fullmatch(name)
+                      or host_class not in ("legacy", "customer") or name in seen):
+                  sys.exit("VELMORA_S3_HOSTS must be a comma separated list of <lowercase host>=legacy|customer, at most 8, without S3_HOST or a repeat")
+              seen.add(name)
+              classes.append(host_class)
           subs = [
               ('S3_HOST = "velmora-s3.<account>.workers.dev"', f'S3_HOST = "{host}"'),
               ('database_id = "<from wrangler d1 create>"', f'database_id = "{dbid}"'),
@@ -769,7 +1023,37 @@ jobs:
               if len(hits) != 1:
                   sys.exit(f"expected exactly one prod line {placeholder!r}, found {len(hits)}")
               i = hits[0]
-              lines[i] = lines[i][: len(lines[i]) - len(lines[i].lstrip())] + value
+              indent = lines[i][: len(lines[i]) - len(lines[i].lstrip())]
+              lines[i] = indent + value
+              if hosts and placeholder.startswith("S3_HOST "):
+                  lines[i] += f'\n{indent}S3_HOSTS = "{hosts}"'
+          lines[maintenance_at] = lines[maintenance_at].replace('MAINTENANCE = "off"', f'MAINTENANCE = "{maintenance}"', 1)
+          for key, value in (("CATALOGUE_ID", catalogue), ("JOB_FORMAT", job_format)):
+              if value:
+                  lines[maintenance_at] += f'\n{key} = "{value}"'
+
+          directory_table = []
+          if directory:
+              catalogue_tables = [
+                  i for i in range(end) if lines[i].strip() == "[[d1_databases]]"
+              ]
+              anchors = []
+              for table in catalogue_tables:
+                  stop = next((i for i in range(table + 1, end) if header.match(lines[i])), end)
+                  if any(line.strip() == 'binding = "CATALOG"' for line in lines[table + 1:stop]):
+                      anchors.extend(i for i in range(table + 1, stop)
+                                     if lines[i].strip() == 'migrations_dir = "migrations"')
+              if len(anchors) != 1:
+                  sys.exit("expected exactly one prod CATALOG migrations_dir line")
+              directory_table = [{
+                  "binding": "DIRECTORY",
+                  "database_name": "velmora-directory",
+                  "database_id": directory,
+                  "migrations_dir": "migrations-directory",
+              }]
+              lines[anchors[0]] += '\n\n[[d1_databases]]' + "".join(
+                  f'\n{key} = "{value}"' for key, value in directory_table[0].items()
+              )
           builds = [i for i in range(end) if lines[i].strip() == "[build]"]
           if len(builds) != 1:
               sys.exit(f"expected exactly one prod [build] table, found {len(builds)}")
@@ -781,15 +1065,36 @@ jobs:
           # written, before the file exists: a refusal leaves no file.
           # No RECORD_LAYOUT at all is "flat" to the Worker.
           try:
-              found = tomllib.loads(text)["vars"].get("RECORD_LAYOUT")
+              prod = tomllib.loads(text)
+              prod_vars = prod["vars"]
+              found = prod_vars.get("RECORD_LAYOUT")
           except (tomllib.TOMLDecodeError, KeyError, AttributeError):
               sys.exit("the generated config is not valid TOML with a prod [vars] table")
           if found != ("tenant" if layout == "tenant" else None):
               sys.exit("the generated config does not carry the record layout that was asked for")
+          if prod_vars.get("S3_HOSTS") != (hosts or None):
+              sys.exit("the generated config does not carry the S3 hosts that were asked for")
+          for key, value in (("MAINTENANCE", maintenance), ("CATALOGUE_ID", catalogue or None),
+                             ("JOB_FORMAT", job_format or None)):
+              if prod_vars.get(key) != value:
+                  sys.exit(f"the generated config does not carry the {key} that was asked for")
+          expected_catalogue = [{**db, "database_id": dbid} for db in shipped_d1
+                                if db.get("binding") == "CATALOG"]
+          actual_d1 = prod.get("d1_databases", [])
+          if (len(expected_catalogue) != 1
+                  or [db for db in actual_d1 if db.get("binding") == "CATALOG"] != expected_catalogue
+                  or [db for db in actual_d1 if db.get("binding") == "DIRECTORY"] != directory_table):
+              sys.exit("the generated config does not carry the expected D1 bindings")
           with open(dst, "w", encoding="utf-8") as f:
               f.write(text)
           print(f"wrangler.deploy.toml: prod placeholders substituted, prod [build] removed, recovery copy {copy}, verify mode {mode}")
+          print(f"maintenance in the generated config: {maintenance}")
+          print(f"catalogue id in the generated config: {catalogue or 'main (default)'}")
+          print(f"job format in the generated config: {job_format or '1 (default)'}")
+          print(f"directory database in the generated config: {'bound' if directory else 'none'}")
           print(f"record layout in the generated config: {layout}")
+          class_list = f" ({','.join(classes)})" if classes else ""
+          print(f"extra S3 hosts in the generated config: {len(classes)}{class_list}")
           PY
       # The version serving 100% of traffic now, the rollback target. A
       # Worker that does not exist yet (first deploy) has none; any other
@@ -820,12 +1125,40 @@ jobs:
             exit 1
           fi
       - name: Apply D1 migrations (remote)
-        if: steps.fresh.outputs.fresh == 'true'
+        if: steps.fresh.outputs.fresh == 'true' && steps.switches.outputs.migrations == 'on'
         working-directory: workers/s3-bridge
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: ./node_modules/.bin/wrangler d1 migrations apply velmora-catalog --remote -c wrangler.deploy.toml
+      - name: Check that no catalogue migration is pending
+        if: steps.fresh.outputs.fresh == 'true' && steps.switches.outputs.migrations == 'off'
+        working-directory: workers/s3-bridge
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          out="${RUNNER_TEMP}/catalogue-migrations-list.log"
+          echo "catalogue migrations skipped (VELMORA_CATALOGUE_MIGRATIONS=off)"
+          status=0
+          ./node_modules/.bin/wrangler d1 migrations list velmora-catalog --remote -c wrangler.deploy.toml > "$out" 2>&1 || status=$?
+          cat "$out"
+          if [ "$status" -ne 0 ]; then
+            echo "::error::could not list catalogue migrations; refusing to deploy"
+            exit 1
+          fi
+          if ! grep -qiF 'No migrations to apply!' "$out"; then
+            echo "::error::a catalogue migration is pending while VELMORA_CATALOGUE_MIGRATIONS is off; refusing to deploy"
+            exit 1
+          fi
+      - name: Apply directory migrations (remote)
+        if: steps.fresh.outputs.fresh == 'true' && vars.VELMORA_DIRECTORY_D1_ID != ''
+        working-directory: workers/s3-bridge
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: ./node_modules/.bin/wrangler d1 migrations apply velmora-directory --remote -c wrangler.deploy.toml
       - id: deploy
         name: Deploy the Worker
         if: steps.fresh.outputs.fresh == 'true'
@@ -845,32 +1178,53 @@ jobs:
         if: steps.fresh.outputs.fresh == 'true'
         env:
           VELMORA_S3_HOST: ${{ vars.VELMORA_S3_HOST }}
+          VELMORA_S3_HOSTS: ${{ vars.VELMORA_S3_HOSTS }}
         run: |
           set -euo pipefail
           body="${RUNNER_TEMP}/smoke-body"
-          code=none
-          for attempt in 1 2 3 4 5 6; do
-            code=$(curl -sS -o "$body" -w '%{http_code}' --connect-timeout 10 --max-time 30 \
-              "https://${VELMORA_S3_HOST}/" || true)
-            echo "attempt ${attempt}: HTTP ${code}"
-            if [ "$code" = "403" ] && grep -q '<Code>AccessDenied</Code>' "$body"; then
-              exit 0
+          hosts=("$VELMORA_S3_HOST")
+          if [ -n "$VELMORA_S3_HOSTS" ]; then
+            IFS=, read -r -a entries <<< "$VELMORA_S3_HOSTS"
+            for entry in "${entries[@]}"; do
+              hosts+=("${entry%%=*}")
+            done
+          fi
+          for i in "${!hosts[@]}"; do
+            host="${hosts[i]}"
+            index=$((i + 1))
+            if ! [[ "$host" =~ ^[a-z0-9]([a-z0-9.-]{0,251}[a-z0-9])?$ ]]; then
+              echo "smoke: invalid host at index ${index}"
+              exit 1
             fi
-            sleep 10
+            if [ "${#hosts[@]}" -gt 1 ]; then
+              echo "smoke: checking host ${index}"
+            fi
+            code=none
+            for attempt in 1 2 3 4 5 6; do
+              code=$(curl -sS -o "$body" -w '%{http_code}' --connect-timeout 10 --max-time 30 \
+                "https://${host}/" || true)
+              echo "attempt ${attempt}: HTTP ${code}"
+              if [ "$code" = "403" ] && grep -q '<Code>AccessDenied</Code>' "$body"; then
+                continue 2
+              fi
+              sleep 10
+            done
+            echo "smoke: expected HTTP 403 AccessDenied for an unsigned GET, last got ${code} (host index ${index})"
+            exit 1
           done
-          echo "smoke: expected HTTP 403 AccessDenied for an unsigned GET, last got ${code}"
-          exit 1
       # On any failure or cancellation after the rollback target was
       # recorded: roll back to that exact version, but only when the active
       # version is the one this run deployed (from the wrangler output), so
       # a deployment made outside this job is never replaced. Any other
       # state fails the step for a manual check.
-      - name: Roll back to the recorded version
+      - id: rollback
+        name: Roll back to the recorded version
         if: ${{ (failure() || cancelled()) && steps.prev.outputs.version != '' }}
         working-directory: workers/s3-bridge
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          FLOOR_VERSION: ${{ steps.switches.outputs.floor_version }}
           PREV_VERSION: ${{ steps.prev.outputs.version }}
           WRANGLER_OUTPUT_FILE_PATH: ${{ runner.temp }}/wrangler-output.ndjson
         run: |
@@ -892,13 +1246,25 @@ jobs:
             echo "rollback: active version is still ${PREV_VERSION}; nothing to roll back"
             exit 0
           fi
+          view_version() {
+            local attempt
+            for attempt in 1 2 3; do
+              if ./node_modules/.bin/wrangler versions view "$1" --json -c wrangler.deploy.toml > "$2"; then
+                return 0
+              fi
+              if [ "$attempt" -lt 3 ]; then
+                sleep 5
+              fi
+            done
+            return 1
+          }
           # wrangler writes its deploy output entry only after the trigger
           # and queue-consumer updates, so a failure or cancellation there
           # leaves no id although the new version is live. Adopt the active
           # version only if its message is exactly this run's.
           if [ -z "$deployed" ] && [ -n "$active" ]; then
             message=""
-            if ./node_modules/.bin/wrangler versions view "$active" --json -c wrangler.deploy.toml > "${RUNNER_TEMP}/active-version.json"; then
+            if view_version "$active" "${RUNNER_TEMP}/active-version.json"; then
               message=$(jq -r '.annotations["workers/message"] // empty' "${RUNNER_TEMP}/active-version.json")
             fi
             if [ "$message" = "ci ${GITHUB_RUN_ID}.${GITHUB_RUN_ATTEMPT} ${GITHUB_SHA}" ]; then
@@ -908,16 +1274,61 @@ jobs:
           fi
           if [ -z "$deployed" ]; then
             echo "::error::rollback: this run has no deployed version id and the active version is '${active:-unknown}', not ${PREV_VERSION}; not rolling back, check manually"
+            echo "rollback=manual-check" >> "$GITHUB_OUTPUT"
             exit 1
           fi
           if [ -n "$active" ] && [ "$active" != "$deployed" ]; then
             echo "::error::rollback: active version ${active} is neither ${PREV_VERSION} nor this run's ${deployed}; not rolling back, check manually"
+            echo "rollback=manual-check" >> "$GITHUB_OUTPUT"
             exit 1
           fi
           # active is this run's version, or could not be read after a
           # deploy this run made: restore the recorded version.
-          ./node_modules/.bin/wrangler rollback "$PREV_VERSION" -c wrangler.deploy.toml \
-            --message "automatic rollback: deploy job failed or was cancelled" -y
+          if [ -n "$FLOOR_VERSION" ] && [ "$FLOOR_VERSION" != "$PREV_VERSION" ]; then
+            target_json="${RUNNER_TEMP}/rollback-target.json"
+            floor_json="${RUNNER_TEMP}/rollback-floor.json"
+            comparison=2
+            if view_version "$PREV_VERSION" "$target_json" && view_version "$FLOOR_VERSION" "$floor_json"; then
+              comparison=0
+              python3 -I - "$target_json" "$floor_json" <<'PY' || comparison=$?
+          from datetime import datetime
+          import json, sys
+
+          def created_on(path):
+              with open(path, encoding="utf-8") as source:
+                  timestamp = datetime.fromisoformat(json.load(source)["metadata"]["created_on"])
+              if timestamp.tzinfo is None:
+                  raise ValueError("missing timestamp offset")
+              return timestamp
+
+          try:
+              sys.exit(created_on(sys.argv[1]) < created_on(sys.argv[2]))
+          except (OSError, KeyError, TypeError, ValueError):
+              sys.exit(2)
+          PY
+            fi
+            if [ "$comparison" -eq 0 ]; then
+              echo "rollback target meets the configured floor version"
+            elif [ "$comparison" -eq 1 ]; then
+              echo "::error::rollback refused: the recorded version ${PREV_VERSION} is older than the rollback floor version ${FLOOR_VERSION}; production stays on ${deployed}; check manually"
+              echo "rollback=refused-floor" >> "$GITHUB_OUTPUT"
+              exit 1
+            else
+              echo "::error::rollback refused: the age of the recorded version ${PREV_VERSION} against the floor version ${FLOOR_VERSION} could not be read; production stays on ${deployed}; check manually"
+              echo "rollback=refused-floor-unknown" >> "$GITHUB_OUTPUT"
+              exit 1
+            fi
+          fi
+          rollback_log="${RUNNER_TEMP}/rollback.log"
+          if ! ./node_modules/.bin/wrangler rollback "$PREV_VERSION" -c wrangler.deploy.toml \
+            --message "automatic rollback: deploy job failed or was cancelled" -y > "$rollback_log" 2>&1; then
+            cat "$rollback_log"
+            echo "::error::wrangler rollback failed (Cloudflare refused it or the call failed; see the output above); production stays on ${deployed}; check manually"
+            echo "rollback=refused" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+          cat "$rollback_log"
+          echo "rollback=done" >> "$GITHUB_OUTPUT"
           echo "Deploy failed or was cancelled; rolled back from \`${deployed}\` to Worker version \`${PREV_VERSION}\`." >> "$GITHUB_STEP_SUMMARY"
       - name: Record the Worker version id
         if: steps.fresh.outputs.fresh == 'true'
@@ -942,16 +1353,17 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
   # Emails the operator when the production deploy fails (it then rolls
-  # back) or its build fails, through the alerts Worker's report endpoint
-  # (workers/alerts). Both values live in the `production` environment:
+  # back), its build fails, or checks fail on main. The alert goes through
+  # the alerts Worker's report endpoint (workers/alerts). Both values live
+  # in the `production` environment:
   # vars.ALERTS_INGEST_URL and secrets.ALERTS_INGEST_TOKEN; without them
   # this job only writes a warning. It never fails the run itself. The
   # token reaches curl on stdin, never argv, and curl's own messages (which
   # would name the host) stay out of the public log.
   deploy-alert:
     name: deploy alert
-    needs: [deploy-build, deploy]
-    if: ${{ always() && github.event_name == 'push' && github.ref == 'refs/heads/main' && (needs.deploy-build.result == 'failure' || needs.deploy.result == 'failure' || needs.deploy.result == 'cancelled') }}
+    needs: [ci-ok, deploy-build, deploy]
+    if: ${{ always() && github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.ci-ok.result != 'cancelled' && (needs.ci-ok.result == 'failure' || needs.deploy-build.result == 'failure' || needs.deploy.result == 'failure' || needs.deploy.result == 'cancelled') }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     environment: production
@@ -962,8 +1374,11 @@ jobs:
         env:
           ALERTS_INGEST_URL: ${{ vars.ALERTS_INGEST_URL }}
           ALERTS_INGEST_TOKEN: ${{ secrets.ALERTS_INGEST_TOKEN }}
+          CI_RESULT: ${{ needs.ci-ok.result }}
           BUILD_RESULT: ${{ needs.deploy-build.result }}
           DEPLOY_RESULT: ${{ needs.deploy.result }}
+          ROLLBACK: ${{ needs.deploy.outputs.rollback }}
+          REFUSED: ${{ needs.deploy.outputs.refused }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -uo pipefail
@@ -971,11 +1386,21 @@ jobs:
             echo "::warning::deploy alert not sent: ALERTS_INGEST_URL or ALERTS_INGEST_TOKEN is not set in the production environment"
             exit 0
           fi
-          body=$(jq -n --arg sha "$GITHUB_SHA" --arg b "$BUILD_RESULT" --arg d "$DEPLOY_RESULT" --arg run "$RUN_URL" '{
-            source: "ci", key: "deploy-failed",
-            title: "Production deploy failed",
-            detail: ("Commit \($sha): deploy build \($b), deploy \($d). "
-              + (if $b == "failure" then "The build failed, so nothing was deployed; production is unchanged."
+          body=$(jq -n --arg sha "$GITHUB_SHA" --arg ci "$CI_RESULT" --arg b "$BUILD_RESULT" --arg d "$DEPLOY_RESULT" --arg run "$RUN_URL" --arg rollback "$ROLLBACK" --arg refusal "$REFUSED" '
+            ($rollback == "refused" or $rollback == "refused-floor"
+             or $rollback == "refused-floor-unknown" or $rollback == "manual-check") as $refused | {
+            source: "ci",
+            key: (if $ci == "failure" then "ci-failed" elif $refused then "deploy-rollback-refused" else "deploy-failed" end),
+            title: (if $ci == "failure" then "Checks failed on main"
+                    elif $rollback == "manual-check" then "Production deploy failed; rollback needs a manual check"
+                    elif $refused then "Production deploy failed and was not rolled back" else "Production deploy failed" end),
+            detail: ((if $rollback == "manual-check" then "The active Worker version needs a manual check. "
+                      elif $refused then "The rollback was refused (\($rollback)): production runs the version this run deployed. " else "" end)
+              + "Commit \($sha): deploy build \($b), deploy \($d). "
+              + (if $ci == "failure" then "The checks failed on main, so nothing was deployed."
+                 elif $b == "failure" then "The build failed, so nothing was deployed; production is unchanged."
+                 elif $refusal == "freeze" then "The deploy was refused by the deploy freeze; nothing was deployed."
+                 elif $refusal == "switches" then "The deploy switches refused this commit (see the \"Check the deploy switches\" step); nothing was deployed."
                  else "The deploy job rolls back to the version before it when it can; whether it did, or asks for a manual check, is in the run'"'"'s \"Roll back to the recorded version\" step." end)
               + " Run: \($run)")}')
           if printf 'Authorization: Bearer %s\n' "$ALERTS_INGEST_TOKEN" \
