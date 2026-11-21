@@ -135,10 +135,18 @@ fn take_part<'a>(rest: &mut &'a [u8]) -> Result<&'a [u8]> {
 }
 
 impl ControlSeal for PlainSeal {
-    fn seal(&self, name: &str, tenant: &TenantId, door: &[u8], private: &[u8]) -> Result<Vec<u8>> {
+    fn seal(
+        &self,
+        name: &str,
+        tenant: &TenantId,
+        key_version: u32,
+        door: &[u8],
+        private: &[u8],
+    ) -> Result<Vec<u8>> {
         let mut out = PLAIN_MAGIC.to_vec();
         push_part(&mut out, name.as_bytes());
         push_part(&mut out, tenant.as_str().as_bytes());
+        push_part(&mut out, &key_version.to_be_bytes());
         push_part(&mut out, door);
         push_part(&mut out, private);
         Ok(out)
@@ -153,6 +161,9 @@ impl ControlSeal for PlainSeal {
         if sealed_name != name.as_bytes() || sealed_tenant != tenant.as_str().as_bytes() {
             return Err(BridgeError::Crypto("plain seal binding"));
         }
+        let key_version = <[u8; 4]>::try_from(take_part(&mut rest)?)
+            .map(u32::from_be_bytes)
+            .map_err(|_| BridgeError::Crypto("plain seal"))?;
         let door = take_part(&mut rest)?.to_vec();
         let private = take_part(&mut rest)?.to_vec();
         if !rest.is_empty() {
@@ -161,6 +172,7 @@ impl ControlSeal for PlainSeal {
         Ok(OpenedParts {
             door,
             private: (!self.private_lost.get()).then(|| Zeroizing::new(private)),
+            key_version,
         })
     }
 }

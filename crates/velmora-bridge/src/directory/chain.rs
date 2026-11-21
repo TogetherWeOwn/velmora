@@ -68,7 +68,10 @@ pub trait RecordStore {
     /// `None` = absent.
     async fn get(&self, key: &str) -> BResult<Option<Vec<u8>>>;
     /// Up to `limit` keys that start with `prefix` and sort after
-    /// `start_after`, in key order. Fewer than `limit` = no more keys.
+    /// `start_after`, in key order. Fewer than `limit` = no more keys, so
+    /// an adapter over a store that can answer a short page before the
+    /// end (R2 can) pages on by itself, as the R2 `BlobStore` adapter
+    /// does.
     async fn list(&self, prefix: &str, start_after: &str, limit: u32) -> BResult<Vec<String>>;
 }
 
@@ -78,12 +81,29 @@ pub trait RecordStore {
 /// name and to each other by one header that names the key version of the
 /// private part. The keys are not this module's: an adapter in the crypto
 /// layer implements this port.
+///
+/// The private part of a tenant record is sealed under the tenant key
+/// version that the record itself names (`tk_version`), so the record
+/// that commits a new version is the first under it. A tenant other than
+/// tenant 0 has no key before its version 1: such a record has an empty
+/// private part, and `key_version` is 0. For tenant 0 the adapter seals
+/// under the KEK and names the KEK version in the header.
 pub trait ControlSeal {
-    /// Seals the two parts of the record stored under `name`.
-    fn seal(&self, name: &str, tenant: &TenantId, door: &[u8], private: &[u8]) -> BResult<Vec<u8>>;
+    /// Seals the two parts of the record stored under `name`, the private
+    /// part under tenant key version `key_version`.
+    fn seal(
+        &self,
+        name: &str,
+        tenant: &TenantId,
+        key_version: u32,
+        door: &[u8],
+        private: &[u8],
+    ) -> BResult<Vec<u8>>;
     /// Opens the record stored under `name`. The door part opens or the
-    /// call fails. The private part is `None` when its key is not there
-    /// any more (a retired version, a shredded tenant).
+    /// call fails. The private part is `None` only when its key version
+    /// is gone for good (retired, or destroyed by a shred). A failure that
+    /// may pass (a key store that does not answer) is an error, never
+    /// `None`: a head whose private part is `None` takes no next record.
     fn open(&self, name: &str, tenant: &TenantId, sealed: &[u8]) -> BResult<OpenedParts>;
 }
 
@@ -91,6 +111,8 @@ pub trait ControlSeal {
 pub struct OpenedParts {
     pub door: Vec<u8>,
     pub private: Option<Zeroizing<Vec<u8>>>,
+    /// The key version the header names for the private part.
+    pub key_version: u32,
 }
 
 /// A record as it was read: the door part always, the private part when
@@ -112,6 +134,7 @@ pub enum ChainError {
     /// what its name says. The reader fails closed and pages.
     Damaged(&'static str),
     /// The head's private part did not open, so no record can follow it.
+    /// It pages: a live tenant whose key version is gone.
     PrivateUnreadable,
     /// The store or the seal failed.
     Store(BridgeError),
@@ -165,11 +188,13 @@ impl<S: RecordStore, C: ControlSeal> TenantChain<'_, S, C> {
     /// is damage: the caller knew a record that is not there.
     pub async fn head_seq(&self, tenant: &TenantId, known: u64) -> Result<Option<u64>, ChainError> {
         let prefix = chain_prefix(tenant);
-        let mut after = match known {
+        // From the record before `known`, so that `known` itself must be
+        // listed: a known seq above the head is damage, not the head.
+        let mut last = known.saturating_sub(1);
+        let mut after = match last {
             0 => String::new(),
             n => record_key(tenant, n),
         };
-        let mut last = known;
         loop {
             let keys = self.store.list(&prefix, &after, LIST_PAGE).await?;
             for key in &keys {
@@ -187,8 +212,9 @@ impl<S: RecordStore, C: ControlSeal> TenantChain<'_, S, C> {
             }
         }
         match last {
-            0 => Ok(None),
-            n => Ok(Some(n)),
+            0 if known == 0 => Ok(None),
+            n if n >= known => Ok(Some(n)),
+            _ => Err(ChainError::Damaged("known_above_head")),
         }
     }
 
@@ -212,6 +238,9 @@ impl<S: RecordStore, C: ControlSeal> TenantChain<'_, S, C> {
             // The name and the envelope disagree: never read it as either.
             return Err(ChainError::Damaged("record_names_another"));
         }
+        if !tenant.is_zero() && opened.key_version != door.tk_version {
+            return Err(ChainError::Damaged("private_part_version"));
+        }
         let private = match opened.private {
             None => None,
             Some(bytes) => {
@@ -219,6 +248,9 @@ impl<S: RecordStore, C: ControlSeal> TenantChain<'_, S, C> {
                     .map_err(|_| ChainError::Damaged("private_part"))?;
                 if p.v != RECORD_FORMAT {
                     return Err(ChainError::Damaged("record_format"));
+                }
+                if keyless(&door) && p != empty_private() {
+                    return Err(ChainError::Damaged("private_part_without_key"));
                 }
                 Some(p)
             }
@@ -273,7 +305,12 @@ impl<S: RecordStore, C: ControlSeal> TenantChain<'_, S, C> {
             let private = Zeroizing::new(
                 serde_json::to_vec(&record.private).map_err(|_| ChainError::Damaged("encode"))?,
             );
-            let sealed = self.seal.seal(&name, tenant, &door, &private)?;
+            if keyless(&record.door) && record.private != empty_private() {
+                return Err(ChainError::Damaged("private_part_without_key"));
+            }
+            let sealed = self
+                .seal
+                .seal(&name, tenant, record.door.tk_version, &door, &private)?;
             if self.store.put_if_absent(&name, sealed).await? {
                 return Ok(Written::Wrote(record));
             }
@@ -284,16 +321,26 @@ impl<S: RecordStore, C: ControlSeal> TenantChain<'_, S, C> {
     }
 }
 
+/// A record of a tenant other than tenant 0 from before its first key
+/// version: its private part must be empty.
+fn keyless(door: &TenantDoor) -> bool {
+    !door.tenant.is_zero() && door.tk_version == 0
+}
+
+fn empty_private() -> TenantPrivate {
+    TenantPrivate {
+        v: RECORD_FORMAT,
+        external_ref: None,
+    }
+}
+
 /// The head as a record a change can follow. Its private part must have
 /// opened, or the next record could not carry it; a shredding or
 /// shredded tenant has none that matters.
 fn writable(read: &ReadRecord) -> Result<TenantRecord, ChainError> {
     let private = match (&read.private, read.door.lifecycle) {
         (Some(p), _) => p.clone(),
-        (None, Lifecycle::Shredding | Lifecycle::Shredded) => TenantPrivate {
-            v: RECORD_FORMAT,
-            external_ref: None,
-        },
+        (None, Lifecycle::Shredding | Lifecycle::Shredded) => empty_private(),
         (None, _) => return Err(ChainError::PrivateUnreadable),
     };
     Ok(TenantRecord {

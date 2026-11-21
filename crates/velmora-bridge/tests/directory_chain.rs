@@ -35,7 +35,6 @@ fn create() -> Change {
         limits: BTreeMap::new(),
         rate_json: Default::default(),
         features_json: Default::default(),
-        external_ref: Some("ws_1".into()),
     }
 }
 
@@ -64,7 +63,9 @@ async fn active(chain: &TenantChain<'_, MemRecords, PlainSeal>) {
         create(),
         Change::ClaimKeyVersion { version: 1 },
         Change::CommitKeyVersion { version: 1 },
-        Change::Activate,
+        Change::Activate {
+            external_ref: Some("ws_1".into()),
+        },
     ] {
         let w = chain
             .write(&t, &change, Actor::TenantCreation, NOW, 0)
@@ -93,7 +94,9 @@ fn competitor(
     let name = record_key(&t1(), rec.door.seq);
     let door = serde_json::to_vec(&rec.door).unwrap();
     let private = serde_json::to_vec(&rec.private).unwrap();
-    let sealed = seal.seal(&name, &t1(), &door, &private).unwrap();
+    let sealed = seal
+        .seal(&name, &t1(), rec.door.tk_version, &door, &private)
+        .unwrap();
     (name, sealed)
 }
 
@@ -269,7 +272,13 @@ fn a_writer_that_keeps_losing_answers_busy() {
         door["seq"] = serde_json::json!(seq);
         let door = serde_json::to_vec(&door).unwrap();
         let sealed = seal_for_hook
-            .seal(key, &t, &door, opened.private.as_deref().unwrap())
+            .seal(
+                key,
+                &t,
+                opened.key_version,
+                &door,
+                opened.private.as_deref().unwrap(),
+            )
             .unwrap();
         objects.insert(key.to_string(), sealed);
     });
@@ -334,7 +343,7 @@ fn a_damaged_chain_is_refused() {
         opened.door
     };
     let forged = seal
-        .seal(&record_key(&t2, 1), &t2, &door, b"{\"v\":1}")
+        .seal(&record_key(&t2, 1), &t2, 0, &door, b"{\"v\":1}")
         .unwrap();
     store.plant(&record_key(&t2, 1), forged);
     let r = block_on(chain.read(&t2, 1));
@@ -343,12 +352,24 @@ fn a_damaged_chain_is_refused() {
         "{r:?}"
     );
 
-    // A known seq above the head.
+    // A known seq above the head, also on an empty chain.
     let r = block_on(chain.head(&t1(), 9));
     assert!(
-        matches!(r, Err(ChainError::Damaged("head_missing"))),
+        matches!(r, Err(ChainError::Damaged("known_above_head"))),
         "{r:?}"
     );
+    let r = block_on(chain.head_seq(&t1(), 5));
+    assert!(
+        matches!(r, Err(ChainError::Damaged("known_above_head"))),
+        "{r:?}"
+    );
+    let r = block_on(chain.head_seq(&TenantId::parse("t_00000000000000e5").unwrap(), 7));
+    assert!(
+        matches!(r, Err(ChainError::Damaged("known_above_head"))),
+        "{r:?}"
+    );
+    // The known seq itself is the head.
+    assert_eq!(block_on(chain.head_seq(&t1(), 4)).unwrap(), Some(4));
 }
 
 #[test]

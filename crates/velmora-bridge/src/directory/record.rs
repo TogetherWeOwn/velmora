@@ -310,6 +310,9 @@ pub struct TenantDoor {
     /// An open rotation claim.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rotating_to: Option<u32>,
+    /// The highest tenant key version ever claimed, voided claims
+    /// included: a version is never claimed twice.
+    pub highest_claimed: u32,
     /// Fixed in the first record and repeated in every later one.
     pub jurisdiction: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -447,6 +450,7 @@ mod tests {
             placements: vec![],
             tk_version: 1,
             rotating_to: None,
+            highest_claimed: 1,
             jurisdiction: "us".into(),
             location_hint: None,
             tenant_zero: None,

@@ -22,7 +22,6 @@ fn create() -> Change {
         limits: BTreeMap::from([("storage_bytes".to_string(), 1_000)]),
         rate_json: Default::default(),
         features_json: Default::default(),
-        external_ref: Some("ws_1".into()),
     }
 }
 
@@ -70,7 +69,13 @@ fn active() -> TenantRecord {
         Change::CommitKeyVersion { version: 1 },
         Actor::TenantCreation,
     );
-    apply(&r, Change::Activate, Actor::TenantCreation)
+    apply(
+        &r,
+        Change::Activate {
+            external_ref: Some("ws_1".into()),
+        },
+        Actor::TenantCreation,
+    )
 }
 
 fn delete_by(actor: Actor, reason: DeletionReason, due_in: i64, key: u8) -> Change {
@@ -105,12 +110,17 @@ fn creation_runs_provisioning_claim_commit_active() {
     assert_eq!(p.door.state(), TenantState::Provisioning);
     assert_eq!(p.door.units, vec![0]);
     assert_eq!(p.door.tk_version, 0);
-    assert_eq!(p.private.external_ref.as_deref(), Some("ws_1"));
+    // No tenant key yet, so nothing private yet.
+    assert_eq!(p.private.external_ref, None);
     assert_eq!(p.door.s3_access(0), S3Access::Unavailable);
 
     // Not active before version 1 is committed.
     assert_eq!(
-        refused(&p, Change::Activate, Actor::TenantCreation),
+        refused(
+            &p,
+            Change::Activate { external_ref: None },
+            Actor::TenantCreation
+        ),
         NOT_READY
     );
     let c = apply(
@@ -119,7 +129,11 @@ fn creation_runs_provisioning_claim_commit_active() {
         Actor::TenantCreation,
     );
     assert_eq!(
-        refused(&c, Change::Activate, Actor::TenantCreation),
+        refused(
+            &c,
+            Change::Activate { external_ref: None },
+            Actor::TenantCreation
+        ),
         NOT_READY
     );
 
@@ -137,7 +151,11 @@ fn creation_runs_provisioning_claim_commit_active() {
     assert_eq!(refused(&a, create(), Actor::TenantCreation), EXISTS);
     // Nothing but a create starts a chain.
     assert_eq!(
-        step(None, Change::Activate, Actor::TenantCreation),
+        step(
+            None,
+            Change::Activate { external_ref: None },
+            Actor::TenantCreation
+        ),
         Err(NO_TENANT)
     );
 }
@@ -537,11 +555,12 @@ fn a_deletion_voids_an_open_rotation_claim() {
         ),
         WRONG_STATE
     );
-    // After the undo the rotation starts again with a new claim.
+    // After the undo the rotation starts again with a new claim, of a
+    // version that was never claimed.
     let undone = apply(&d, Change::UndoDeletion, Actor::Customer);
     apply(
         &undone,
-        Change::ClaimKeyVersion { version: 2 },
+        Change::ClaimKeyVersion { version: 3 },
         Actor::RotationJob,
     );
 }
@@ -697,7 +716,7 @@ fn what_restoring_allows_and_refuses() {
     let r = apply(&r, billing_hold(Some(HoldMode::Locked)), Actor::Billing);
     let r = apply(
         &r,
-        delete_by(Actor::Customer, DeletionReason::CustomerRequest, DAY, 1),
+        delete_by(Actor::Customer, DeletionReason::CustomerRequest, 7 * DAY, 1),
         Actor::Customer,
     );
     let r = apply(&r, Change::UndoDeletion, Actor::Customer);
@@ -748,11 +767,11 @@ fn the_shred_waits_for_its_date_the_restore_and_a_preserving_hold() {
     );
     let d = apply(
         &a,
-        delete_by(Actor::Customer, DeletionReason::CustomerRequest, DAY, 1),
+        delete_by(Actor::Customer, DeletionReason::CustomerRequest, 7 * DAY, 1),
         Actor::Customer,
     );
     assert_eq!(refused(&d, Change::StartShred, Actor::ShredJob), NOT_DUE);
-    let due = UnixMs(NOW.0 + DAY);
+    let due = UnixMs(NOW.0 + 7 * DAY);
     let shred_at = |head: &TenantRecord, actor| {
         next(
             &head.door.tenant,
@@ -809,10 +828,10 @@ fn shredding_admits_only_shredded_and_shredded_admits_nothing() {
     let a = active();
     let d = apply(
         &a,
-        delete_by(Actor::Customer, DeletionReason::CustomerRequest, DAY, 1),
+        delete_by(Actor::Customer, DeletionReason::CustomerRequest, 7 * DAY, 1),
         Actor::Customer,
     );
-    let due = UnixMs(NOW.0 + DAY);
+    let due = UnixMs(NOW.0 + 7 * DAY);
     let Ok(Outcome::Next(s)) = next(
         &a.door.tenant,
         Some(&d),
@@ -873,7 +892,7 @@ fn units_and_placements_are_checked() {
     // Not while deleting.
     let d = apply(
         &two,
-        delete_by(Actor::Customer, DeletionReason::CustomerRequest, DAY, 1),
+        delete_by(Actor::Customer, DeletionReason::CustomerRequest, 7 * DAY, 1),
         Actor::Customer,
     );
     assert_eq!(
@@ -919,7 +938,7 @@ fn limits_and_features() {
     // In deleting: limits change, features do not.
     let d = apply(
         &a,
-        delete_by(Actor::Customer, DeletionReason::CustomerRequest, DAY, 1),
+        delete_by(Actor::Customer, DeletionReason::CustomerRequest, 7 * DAY, 1),
         Actor::Customer,
     );
     apply(
@@ -988,7 +1007,7 @@ fn closing_and_opening_order() {
 
     let d = apply(
         &a,
-        delete_by(Actor::Customer, DeletionReason::CustomerRequest, DAY, 1),
+        delete_by(Actor::Customer, DeletionReason::CustomerRequest, 7 * DAY, 1),
         Actor::Customer,
     );
     assert_eq!(order(&a, &d), WriteOrder::Closing);
@@ -1057,4 +1076,250 @@ fn closing_and_opening_order() {
         Actor::Operator,
     );
     assert_eq!(order(&no_preserve, &preserve_again), WriteOrder::Closing);
+}
+
+fn tenant_zero() -> TenantRecord {
+    let Ok(Outcome::Next(z)) = next(
+        &TenantId::zero(),
+        None,
+        &Change::CreateTenantZero {
+            jurisdiction: "us".into(),
+        },
+        Actor::Operator,
+        NOW,
+    ) else {
+        panic!("tenant 0");
+    };
+    z
+}
+
+/// Tenant 0 has no tenant key: it is never deleted and never shredded.
+#[test]
+fn tenant_zero_is_never_deleted_or_shredded() {
+    let z = tenant_zero();
+    for (change, actor) in [
+        (
+            delete_by(
+                Actor::Customer,
+                DeletionReason::CustomerRequest,
+                30 * DAY,
+                1,
+            ),
+            Actor::Customer,
+        ),
+        (
+            delete_by(
+                Actor::Operator,
+                DeletionReason::Operator(OperatorReason::Other),
+                30 * DAY,
+                2,
+            ),
+            Actor::Operator,
+        ),
+    ] {
+        assert_eq!(refused(&z, change, actor), TENANT_ZERO);
+    }
+    // Not even from a head that a damaged writer left deleting.
+    let mut planted = z.clone();
+    planted.door.deletion = Some(Deletion {
+        shred_due_at: NOW,
+        reason: DeletionReason::CustomerRequest,
+        actor: ActorClass::Customer,
+        key_hash: hash(1),
+    });
+    assert_eq!(
+        refused(&planted, Change::StartShred, Actor::ShredJob),
+        TENANT_ZERO
+    );
+}
+
+#[test]
+fn every_deletion_keeps_its_minimum_hold() {
+    let a = active();
+    // The customer plane: 7 days, less the hour of tolerance.
+    let c = |ms| delete_by(Actor::Customer, DeletionReason::CustomerRequest, ms, 1);
+    assert_eq!(refused(&a, c(DAY), Actor::Customer), HOLD_PERIOD);
+    assert_eq!(
+        refused(&a, c(CUSTOMER_DELETE_MIN_MS - 1), Actor::Customer),
+        HOLD_PERIOD
+    );
+    apply(&a, c(CUSTOMER_DELETE_MIN_MS), Actor::Customer);
+    // The operator's delete-now: 1 hour, less a minute.
+    let o = |ms| {
+        delete_by(
+            Actor::Operator,
+            DeletionReason::Operator(OperatorReason::Abuse),
+            ms,
+            2,
+        )
+    };
+    assert_eq!(refused(&a, o(60_000), Actor::Operator), HOLD_PERIOD);
+    assert_eq!(
+        refused(&a, o(OPERATOR_DELETE_MIN_MS - 1), Actor::Operator),
+        HOLD_PERIOD
+    );
+    apply(&a, o(OPERATOR_DELETE_MIN_MS), Actor::Operator);
+}
+
+/// A version that a deletion voided stays claimed: it is never used again.
+#[test]
+fn a_voided_key_version_is_never_claimed_again() {
+    let a = active();
+    assert_eq!(a.door.highest_claimed, 1);
+    let c = apply(
+        &a,
+        Change::ClaimKeyVersion { version: 2 },
+        Actor::RotationJob,
+    );
+    assert_eq!(c.door.highest_claimed, 2);
+    let d = apply(
+        &c,
+        delete_by(Actor::Customer, DeletionReason::CustomerRequest, 7 * DAY, 1),
+        Actor::Customer,
+    );
+    assert_eq!((d.door.rotating_to, d.door.highest_claimed), (None, 2));
+    let undone = apply(&d, Change::UndoDeletion, Actor::Customer);
+    assert_eq!(
+        refused(
+            &undone,
+            Change::ClaimKeyVersion { version: 2 },
+            Actor::RotationJob
+        ),
+        VERSION
+    );
+    let c3 = apply(
+        &undone,
+        Change::ClaimKeyVersion { version: 3 },
+        Actor::RotationJob,
+    );
+    let done = apply(
+        &c3,
+        Change::CommitKeyVersion { version: 3 },
+        Actor::RotationJob,
+    );
+    assert_eq!((done.door.tk_version, done.door.highest_claimed), (3, 3));
+}
+
+#[test]
+fn a_bucket_moves_only_to_a_newer_epoch() {
+    let a = active();
+    let p = |unit, epoch| Placement {
+        bucket: "b".into(),
+        unit,
+        epoch,
+    };
+    let set = |placements| Change::SetUnits {
+        units: vec![0, 1],
+        placements,
+    };
+    let at5 = apply(&a, set(vec![p(0, 5)]), Actor::Operator);
+    // To another unit at the same or an older epoch: refused.
+    assert_eq!(refused(&at5, set(vec![p(1, 5)]), Actor::Operator), INVALID);
+    assert_eq!(refused(&at5, set(vec![p(1, 1)]), Actor::Operator), INVALID);
+    // In place, the epoch never goes back.
+    assert_eq!(refused(&at5, set(vec![p(0, 4)]), Actor::Operator), INVALID);
+    let moved = apply(&at5, set(vec![p(1, 6)]), Actor::Operator);
+    assert_eq!(moved.door.placements, vec![p(1, 6)]);
+}
+
+/// Who may is checked before "the head carries it": a refused actor gets
+/// its 403 for a no-op too.
+#[test]
+fn a_forbidden_no_op_is_still_forbidden() {
+    let a = active();
+    assert_eq!(refused(&a, billing_hold(None), Actor::Customer), FORBIDDEN);
+    let b = apply(&a, billing_hold(Some(HoldMode::Locked)), Actor::Billing);
+    assert_eq!(
+        refused(&b, billing_hold(Some(HoldMode::Locked)), Actor::Customer),
+        FORBIDDEN
+    );
+    // The operator places no billing hold, not even the one in force.
+    assert_eq!(
+        refused(&b, billing_hold(Some(HoldMode::Locked)), Actor::Operator),
+        FORBIDDEN
+    );
+    // Lifting one that is not there is the operator's to do: no record.
+    unchanged(&a, billing_hold(None), Actor::Operator);
+    assert_eq!(
+        refused(&a, Change::SetOperatorHold { hold: None }, Actor::Billing),
+        FORBIDDEN
+    );
+}
+
+/// A set-deletion retried after its record landed applies the head and
+/// writes nothing; another key is another request.
+#[test]
+fn a_retried_deletion_is_unchanged() {
+    let a = active();
+    let first = delete_by(Actor::Customer, DeletionReason::CustomerRequest, 7 * DAY, 1);
+    let d = apply(&a, first.clone(), Actor::Customer);
+    unchanged(&d, first, Actor::Customer);
+    assert_eq!(
+        refused(
+            &d,
+            delete_by(Actor::Customer, DeletionReason::CustomerRequest, 7 * DAY, 2),
+            Actor::Customer
+        ),
+        DELETING
+    );
+    // The same key from another plane is not a retry.
+    assert_eq!(
+        refused(
+            &d,
+            delete_by(
+                Actor::Operator,
+                DeletionReason::Operator(OperatorReason::Legal),
+                7 * DAY,
+                1
+            ),
+            Actor::Operator
+        ),
+        DELETING
+    );
+}
+
+/// Flags and tenant 0's selector cannot be ranked: any change of them is
+/// closing.
+#[test]
+fn a_flag_or_selector_change_is_closing() {
+    let a = active();
+    let mut on = serde_json::Map::new();
+    on.insert("webdav".into(), serde_json::json!(true));
+    let with = apply(
+        &a,
+        Change::SetFeatures {
+            features_json: on.clone(),
+        },
+        Actor::Operator,
+    );
+    let mut off = on.clone();
+    off.insert("webdav".into(), serde_json::json!(false));
+    let without = apply(
+        &with,
+        Change::SetFeatures { features_json: off },
+        Actor::Operator,
+    );
+    assert_eq!(
+        write_order(Some(&with.door), &without.door),
+        WriteOrder::Closing
+    );
+
+    let z = tenant_zero();
+    let mut moved = z.door.clone();
+    moved.tenant_zero = Some(TenantZero {
+        selector: Selector::Moved { to: t1() },
+        cutover_stamp: Some(1),
+        undo_stamp: None,
+        catalogue_id: None,
+    });
+    assert_eq!(write_order(Some(&z.door), &moved), WriteOrder::Closing);
+}
+
+/// The workspace is bound at activation, the first record under the
+/// tenant's own key.
+#[test]
+fn the_workspace_is_bound_at_activation() {
+    let a = active();
+    assert_eq!(a.private.external_ref.as_deref(), Some("ws_1"));
+    assert_eq!(a.door.tk_version, 1);
 }

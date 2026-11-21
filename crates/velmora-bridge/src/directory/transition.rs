@@ -37,6 +37,15 @@ use crate::types::UnixMs;
 /// less 1 hour of tolerance.
 pub const BILLING_DELETE_MIN_MS: i64 = 60 * 24 * 3_600_000 - 3_600_000;
 
+/// The shortest hold period of a deletion by the customer plane: 7 days,
+/// less 1 hour of tolerance. A shorter one is a delete-now, which is the
+/// operator's alone.
+pub const CUSTOMER_DELETE_MIN_MS: i64 = 7 * 24 * 3_600_000 - 3_600_000;
+
+/// The shortest hold period of any deletion, the operator's delete-now:
+/// 1 hour, less 1 minute of tolerance.
+pub const OPERATOR_DELETE_MIN_MS: i64 = 3_600_000 - 60_000;
+
 /// Who makes a change.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Actor {
@@ -88,7 +97,6 @@ pub enum Change {
         limits: BTreeMap<String, u64>,
         rate_json: serde_json::Map<String, serde_json::Value>,
         features_json: serde_json::Map<String, serde_json::Value>,
-        external_ref: Option<String>,
     },
     /// The first record of tenant 0: live, on today's D1, no unit.
     CreateTenantZero { jurisdiction: String },
@@ -96,8 +104,10 @@ pub enum Change {
     ClaimKeyVersion { version: u32 },
     /// Commit the open claim.
     CommitKeyVersion { version: u32 },
-    /// `provisioning` to `active`: the last step of tenant creation.
-    Activate,
+    /// `provisioning` to `active`: the last step of tenant creation. It
+    /// binds the workspace: the first record whose private part is sealed
+    /// under the tenant's own key.
+    Activate { external_ref: Option<String> },
     /// Place, change (`Some`) or lift (`None`) the `billing` hold.
     SetBillingHold { mode: Option<HoldMode> },
     /// Place, change (`Some`) or lift (`None`) the `operator` hold.
@@ -223,10 +233,13 @@ pub fn next(
             if h.rotating_to.is_some() {
                 return Err(CLAIM_OPEN);
             }
-            if Some(*version) != h.tk_version.checked_add(1) {
+            // A claimed version is never claimed again, also one that a
+            // deletion voided.
+            if Some(*version) != h.highest_claimed.checked_add(1) {
                 return Err(VERSION);
             }
             door.rotating_to = Some(*version);
+            door.highest_claimed = *version;
         }
 
         Change::CommitKeyVersion { version } => {
@@ -238,7 +251,7 @@ pub fn next(
             door.rotating_to = None;
         }
 
-        Change::Activate => {
+        Change::Activate { external_ref } => {
             if actor != Actor::TenantCreation {
                 return Err(FORBIDDEN);
             }
@@ -249,23 +262,27 @@ pub fn next(
                 return Err(NOT_READY);
             }
             door.lifecycle = Lifecycle::Live;
+            private.external_ref = external_ref.clone();
         }
 
         Change::SetBillingHold { mode } => {
             live(h)?;
             let lifting = match (h.holds.billing, mode) {
-                (None, None) => return Ok(Outcome::Unchanged),
-                (Some(old), Some(new)) if old.mode == *new => return Ok(Outcome::Unchanged),
                 (_, None) => true,
                 (Some(old), Some(new)) => *new < old.mode,
                 (None, Some(_)) => false,
             };
+            // Who may comes first: a refused actor gets its 403 also for a
+            // change the head already carries.
             match actor {
                 Actor::Billing => {}
                 // The operator lifts or eases the billing hold; it never
                 // places one.
                 Actor::Operator if lifting => {}
                 _ => return Err(FORBIDDEN),
+            }
+            if h.holds.billing.map(|b| b.mode) == *mode {
+                return Ok(Outcome::Unchanged);
             }
             door.holds.billing = mode.map(|mode| BillingHold { mode });
             if mode.is_none() {
@@ -312,19 +329,31 @@ pub fn next(
                 (Actor::Operator, DeletionReason::Operator(_)) => ActorClass::Operator,
                 _ => return Err(FORBIDDEN),
             };
-            if h.deletion.is_some() {
+            // Tenant 0 is never deleted and never shredded: it has no
+            // tenant key to destroy.
+            if tenant.is_zero() {
+                return Err(TENANT_ZERO);
+            }
+            if let Some(d) = &h.deletion {
+                // A retry of the call whose record landed: apply the head.
+                if d.key_hash == *key_hash && d.actor == class {
+                    return Ok(Outcome::Unchanged);
+                }
                 return Err(DELETING);
             }
             if h.undone_deletion.as_deref() == Some(key_hash.as_str()) {
                 return Err(REPLAYED);
             }
-            if class == ActorClass::Billing {
-                if h.holds.billing.is_none() {
-                    return Err(NO_BILLING_HOLD);
-                }
-                if shred_due_at.0.saturating_sub(now.0) < BILLING_DELETE_MIN_MS {
-                    return Err(HOLD_PERIOD);
-                }
+            let min = match class {
+                ActorClass::Customer => CUSTOMER_DELETE_MIN_MS,
+                ActorClass::Billing => BILLING_DELETE_MIN_MS,
+                ActorClass::Operator => OPERATOR_DELETE_MIN_MS,
+            };
+            if class == ActorClass::Billing && h.holds.billing.is_none() {
+                return Err(NO_BILLING_HOLD);
+            }
+            if shred_due_at.0.saturating_sub(now.0) < min {
+                return Err(HOLD_PERIOD);
             }
             door.deletion = Some(Deletion {
                 shred_due_at: *shred_due_at,
@@ -395,7 +424,7 @@ pub fn next(
             if !h.restoring.is_empty() {
                 return Err(RESTORING);
             }
-            if !valid_units(units, placements) {
+            if !valid_units(units, placements) || !epochs_advance(&h.placements, placements) {
                 return Err(INVALID);
             }
             if *units == h.units && *placements == h.placements {
@@ -443,6 +472,9 @@ pub fn next(
             }
             if h.lifecycle != Lifecycle::Live {
                 return Err(WRONG_STATE);
+            }
+            if tenant.is_zero() {
+                return Err(TENANT_ZERO);
             }
             let Some(d) = &h.deletion else {
                 return Err(NOT_DELETING);
@@ -505,6 +537,7 @@ fn first(
         placements: vec![],
         tk_version: 0,
         rotating_to: None,
+        highest_claimed: 0,
         jurisdiction: jurisdiction.to_string(),
         location_hint: None,
         tenant_zero: None,
@@ -517,7 +550,6 @@ fn first(
             limits,
             rate_json,
             features_json,
-            external_ref,
         } => {
             if actor != Actor::TenantCreation {
                 return Err(FORBIDDEN);
@@ -538,9 +570,11 @@ fn first(
             door.units = vec![0];
             Ok(Outcome::Next(TenantRecord {
                 door,
+                // No tenant key exists yet, so the private part is empty
+                // until the record that activates the tenant.
                 private: TenantPrivate {
                     v: RECORD_FORMAT,
-                    external_ref: external_ref.clone(),
+                    external_ref: None,
                 },
             }))
         }
@@ -629,6 +663,7 @@ fn shredded_stub(h: &TenantDoor) -> TenantDoor {
         placements: vec![],
         tk_version: h.tk_version,
         rotating_to: None,
+        highest_claimed: h.highest_claimed,
         jurisdiction: h.jurisdiction.clone(),
         location_hint: None,
         tenant_zero: None,
@@ -659,6 +694,17 @@ fn valid_units(units: &[u32], placements: &[Placement]) -> bool {
         && placements
             .iter()
             .all(|p| units.contains(&p.unit) && !p.bucket.is_empty())
+}
+
+/// A bucket that stays keeps or raises its move epoch, and raises it
+/// when it changes unit: the epoch is what fences a stale route.
+fn epochs_advance(old: &[Placement], new: &[Placement]) -> bool {
+    new.iter()
+        .all(|p| match old.iter().find(|o| o.bucket == p.bucket) {
+            None => true,
+            Some(o) if o.unit == p.unit => p.epoch >= o.epoch,
+            Some(o) => p.epoch > o.epoch,
+        })
 }
 
 /// The order in which a change reaches the stores.
@@ -704,7 +750,11 @@ pub fn write_order(prev: Option<&TenantDoor>, next: &TenantDoor) -> WriteOrder {
         || restoring_added
         || (prev.lifecycle != next.lifecycle
             && matches!(next.lifecycle, Lifecycle::Shredding | Lifecycle::Shredded))
-        || prev.rate_json != next.rate_json;
+        // A flag or a rate class cannot be ranked, and tenant 0's
+        // selector closes its catalogue: any change of them closes.
+        || prev.rate_json != next.rate_json
+        || prev.features_json != next.features_json
+        || prev.tenant_zero != next.tenant_zero;
     match closing {
         true => WriteOrder::Closing,
         false => WriteOrder::Opening,
