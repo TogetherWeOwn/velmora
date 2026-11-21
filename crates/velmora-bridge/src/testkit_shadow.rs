@@ -226,6 +226,17 @@ impl Shadow {
     fn check(&self, op: &str, sql: &str, params: &[SqlValue], mine: &Answer, theirs: &Answer) {
         let same = match (mine, theirs) {
             (Answer::Sql(_), Answer::Sql(_)) => true,
+            // A connection's own counters (`total_changes()`) differ
+            // between two databases; only their differences are used.
+            (Answer::Rows(_), Answer::Rows(_)) if engine_counter(sql) => true,
+            // A query plan's node ids are the engine's own; its text is
+            // what a test reads.
+            (Answer::Rows(a), Answer::Rows(b)) if is_explain(sql) => {
+                let text = |rows: &Vec<Row>| -> Vec<Option<SqlValue>> {
+                    rows.iter().map(|r| r.last().cloned()).collect()
+                };
+                text(a) == text(b)
+            }
             (a, b) => a == b,
         };
         if !same {
@@ -360,6 +371,17 @@ fn read_response(reader: &mut BufReader<TcpStream>) -> std::io::Result<String> {
         reader.read_exact(&mut body)?;
     }
     String::from_utf8(body).map_err(|_| bad("utf-8"))
+}
+
+fn is_explain(sql: &str) -> bool {
+    sql.trim_start()
+        .get(..7)
+        .is_some_and(|w| w.eq_ignore_ascii_case("explain"))
+}
+
+fn engine_counter(sql: &str) -> bool {
+    let lower = sql.to_ascii_lowercase();
+    lower.contains("total_changes()") || lower.contains("last_insert_rowid()")
 }
 
 fn error_answer(e: &BridgeError) -> Answer {
