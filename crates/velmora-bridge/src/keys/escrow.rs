@@ -361,9 +361,15 @@ pub fn restore_check<K: Kek>(
     let buckets_ok = names.len() >= 2
         && names.len() == bucket_blobs.len()
         && bucket_blobs.iter().all(|(_, b)| {
+            // A bucket copy may be wrapped under a newer KEK than the
+            // escrow copy; the wrap binds its version, so trying each
+            // version the ring holds opens it only under its own.
             tk_blob_check_value(b).is_ok_and(|k| k == copy.kcv)
-                && unwrap_tenant_key(kek, copy.kek_version, &copy.tenant, copy.version, b)
-                    .is_ok_and(|k| k.check_value() == copy.kcv)
+                && (1..=kek.active().0).rev().any(|v| {
+                    kek.version(v).is_some()
+                        && unwrap_tenant_key(kek, v, &copy.tenant, copy.version, b)
+                            .is_ok_and(|k| k.check_value() == copy.kcv)
+                })
         });
     out.push(("key_buckets", buckets_ok));
     let (chain_ok, data_ok) = match key {

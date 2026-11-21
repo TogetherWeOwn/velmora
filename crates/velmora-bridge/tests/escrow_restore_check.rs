@@ -59,10 +59,17 @@ fn the_escrow_copy_restores_the_tenant_key() {
         .unwrap_or_else(|_| panic!("escrow: mismatch (the copy does not parse)"));
 
     let vars = env_file(&kek_env);
+    // Without an active version, the newest one the file holds, so a
+    // record sealed after a KEK rotation still opens.
+    let newest = vars
+        .keys()
+        .filter_map(|k| k.strip_prefix("VELMORA_KEK_")?.parse::<u32>().ok())
+        .max()
+        .unwrap_or(copy.kek_version);
     let active = vars
         .get("VELMORA_KEK_ACTIVE")
         .and_then(|v| v.parse().ok())
-        .unwrap_or(copy.kek_version);
+        .unwrap_or(newest);
     let kek = KekRing::from_vars(active, |n| vars.get(n).cloned())
         .unwrap_or_else(|_| panic!("the KEK file does not hold a usable KEK"));
 

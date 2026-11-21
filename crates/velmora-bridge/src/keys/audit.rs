@@ -273,12 +273,13 @@ pub struct Repair {
     pub alarms: Vec<(String, String)>,
 }
 
-/// Restores the copies the audit found missing, into synchronous
-/// locations only, from a copy that opens under the KEK. Nothing is done
-/// for a name or a key version with any other finding, nor when its own
-/// listing of the synchronous locations finds a foreign name in the
-/// tenant's directory or two keys for the version. A marker that appears
-/// during a write is an alarm, and the pass goes on.
+/// Restores the copies the audit found missing, into every `active`
+/// location (an asynchronous one gets its copies here, after the
+/// commit), from a copy that opens under the KEK. Nothing is done for a
+/// name or a key version with any other finding, nor when its own
+/// listing of the active locations finds a foreign name in the tenant's
+/// directory or two keys for the version. A marker that appears during a
+/// write is an alarm, and the pass goes on.
 pub async fn repair_missing<S: RecordStore, K: Kek>(
     set: &KeyLocations,
     buckets: &KeyBuckets<'_, S>,
@@ -298,13 +299,13 @@ pub async fn repair_missing<S: RecordStore, K: Kek>(
             Finding::Missing { .. } => false,
         })
     };
-    let synchronous = set.synchronous();
+    let active = set.active();
     let mut out = Repair::default();
     for finding in &report.findings {
         let Finding::Missing { location, name } = finding else {
             continue;
         };
-        let Some(target) = synchronous.iter().find(|l| l.name == *location) else {
+        let Some(target) = active.iter().find(|l| l.name == *location) else {
             continue;
         };
         let Some((tenant, n, v)) = split_name(name) else {
@@ -321,10 +322,10 @@ pub async fn repair_missing<S: RecordStore, K: Kek>(
             continue;
         }
         // The repair's own listing: no foreign name, and every copy of the
-        // version holds the expected key, in every synchronous location.
+        // version holds the expected key, in every active location.
         let mut clean = true;
         let mut source = None;
-        for l in &synchronous {
+        for l in &active {
             let store = buckets.get(l)?;
             let Ok(blobs) = list_tenant_blobs(store, &tenant).await else {
                 clean = false;

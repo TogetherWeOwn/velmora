@@ -844,3 +844,120 @@ async fn escrow_refuses_a_foreign_name_before_writing_to_the_second_bucket() {
     assert!(stores.b.names().is_empty());
     assert_eq!(stores.b.puts(), puts);
 }
+
+/// A cached key answers only the load pinned to it: a load pinned to
+/// another check value reads the locations again.
+#[tokio::test(flavor = "current_thread")]
+async fn a_cached_key_answers_only_its_own_pin() {
+    let (stores, set, kek, clock, tenant) = (
+        Stores::default(),
+        two_in_account(),
+        kek(),
+        clock(),
+        tenant(1),
+    );
+    let buckets = stores.buckets();
+    let first = key(&tenant, 1, "first cached");
+    let (name, blob) = wrapped(&kek, &first, &mut TestRng::new("pin one"));
+    stores.plant_both(&name, &blob);
+    let cache = TkCache::default();
+    let loaded = cache
+        .load(
+            &set,
+            &buckets,
+            &kek,
+            &clock,
+            &tenant,
+            1,
+            first.check_value(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(loaded.check_value(), first.check_value());
+    // The locations now hold another key for the version (a restore).
+    let second = key(&tenant, 1, "second key");
+    let (_, other) = wrapped(&kek, &second, &mut TestRng::new("pin two"));
+    stores.a.plant(&name, other.clone());
+    stores.b.plant(&name, other);
+    let lists = stores.a.lists();
+    let reread = cache
+        .load(
+            &set,
+            &buckets,
+            &kek,
+            &clock,
+            &tenant,
+            1,
+            second.check_value(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(reread.check_value(), second.check_value());
+    assert!(
+        stores.a.lists() > lists,
+        "read again, not served from the cache"
+    );
+    assert!(cache
+        .load(
+            &set,
+            &buckets,
+            &kek,
+            &clock,
+            &tenant,
+            1,
+            first.check_value()
+        )
+        .await
+        .is_err());
+}
+
+/// An asynchronous location gets its missing copies from the repair.
+#[tokio::test(flavor = "current_thread")]
+async fn repair_fills_an_asynchronous_location() {
+    let (stores, kek) = (Stores::default(), kek());
+    let c = MemRecords::default();
+    let mut set = two_in_account();
+    set.locations.push(KeyLocation {
+        name: "KEYS_C".into(),
+        status: LocationStatus::Active,
+        arbiter: false,
+        synchronous: false,
+    });
+    set.check().unwrap();
+    let buckets = KeyBuckets {
+        by_name: vec![("KEYS_A", &stores.a), ("KEYS_B", &stores.b), ("KEYS_C", &c)],
+    };
+    let original = key(&tenant(1), 1, "async copy");
+    let (name, blob) = wrapped(&kek, &original, &mut TestRng::new("async repair"));
+    stores.plant_both(&name, &blob);
+    let report = audit(&set, &buckets, Some(&kek)).await.unwrap();
+    assert_eq!(
+        report.findings,
+        [Finding::Missing {
+            location: "KEYS_C".into(),
+            name: name.clone(),
+        }]
+    );
+    let repair = repair_missing(&set, &buckets, &kek, &report).await.unwrap();
+    assert_eq!(repair.restored, [("KEYS_C".into(), name.clone())]);
+    assert_eq!(c.raw(&name), stores.a.raw(&name));
+    assert!(audit(&set, &buckets, Some(&kek)).await.unwrap().clean());
+}
+
+/// A retired location that becomes unreachable can be marked lost.
+#[test]
+fn a_retired_location_can_become_lost() {
+    let head = retired_set();
+    let mut next = head.clone();
+    next.seq += 1;
+    for l in &mut next.locations {
+        if l.status == LocationStatus::Retired {
+            l.status = LocationStatus::Lost;
+        }
+    }
+    assert!(next
+        .locations
+        .iter()
+        .any(|l| l.status == LocationStatus::Lost));
+    head.admits(&next).unwrap();
+}

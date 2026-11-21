@@ -1395,3 +1395,26 @@ async fn an_audit_reads_past_its_first_page() {
         .count();
     assert_eq!(missing, 1001);
 }
+
+/// A bucket copy wrapped under a newer KEK than the escrow copy still
+/// counts: the check tries each version the ring holds.
+#[test]
+fn the_restore_check_opens_bucket_copies_under_a_newer_kek() {
+    let t = TenantId::parse("t_00000000000000c3").unwrap();
+    let key = TenantKey::from_bytes(&t, 1, derived("rotated")).unwrap();
+    let old = TestKek::with_versions(1, &[(1, derived("kek one"))]);
+    let both = TestKek::with_versions(2, &[(1, derived("kek one")), (2, derived("kek two"))]);
+    let (v1, blob1) = wrap_tenant_key(&old, &key, &mut TestRng(120)).unwrap();
+    let (v2, blob2) = wrap_tenant_key(&both, &key, &mut TestRng(121)).unwrap();
+    assert_eq!((v1, v2), (1, 2));
+    let copy = EscrowCopy::of_blob(&t, 1, 1, &blob1).unwrap();
+    let checks = restore_check(
+        &copy,
+        &both,
+        &[("KEYS_A", blob2.clone()), ("KEYS_B", blob2)],
+        None,
+        None,
+    );
+    assert!(checks.contains(&("open", true)), "{checks:?}");
+    assert!(checks.contains(&("key_buckets", true)), "{checks:?}");
+}

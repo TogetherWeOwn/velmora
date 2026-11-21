@@ -148,8 +148,10 @@ impl KeyLocations {
                 // A lost location that comes back is emptied, verified
                 // empty and retired; it is never used again.
                 (LocationStatus::Lost, LocationStatus::Retired) => true,
-                (LocationStatus::Lost, _) | (LocationStatus::Retired, _) => false,
+                (LocationStatus::Lost, _) => false,
+                // A retired location that becomes unreachable is lost.
                 (_, LocationStatus::Lost) => !old.arbiter,
+                (LocationStatus::Retired, _) => false,
                 _ => false,
             };
             if !forward || new.arbiter != old.arbiter || new.synchronous != old.synchronous {
