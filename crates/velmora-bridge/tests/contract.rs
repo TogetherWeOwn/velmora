@@ -838,6 +838,37 @@ fn config_rejects_invalid_and_unsafe_values() {
             }
         }
     }
+    // With parity, a cold read that lost articles holds the rebuild
+    // beside the extent: a budget without room for the read of the
+    // largest extent and the rebuild of as many articles as it has
+    // parity is refused. Without parity the same budget is taken.
+    {
+        let cfg = load(&prod).unwrap();
+        let cipher = velmora::media::ciphertext_size(cfg.max_extent_bytes).unwrap();
+        let (k, shard) = velmora_bridge::parity::stripe_of(cipher).unwrap();
+        let most = velmora_bridge::parity::parity_count(usize::from(k)) as u64;
+        assert_eq!((k, most), (24, 4));
+        let rebuild = velmora_bridge::fetch::cold_rebuild_bytes(u64::from(shard), most);
+        let both = velmora_bridge::fetch::cold_step_bytes(cipher, 1) + rebuild;
+        assert!(both <= cfg.inflight_budget_bytes);
+        let mut tuned = prod.clone();
+        tuned.insert("COLD_SOCKETS".into(), "1".into());
+        // The job budget follows the request budget.
+        tuned.remove("JOB_BUDGET_BYTES");
+        for (parity, budget, fits) in [
+            ("on", both, true),
+            ("on", both - 1, false),
+            ("off", both - 1, true),
+        ] {
+            tuned.insert("PARITY".into(), parity.into());
+            tuned.insert("INFLIGHT_BUDGET_BYTES".into(), budget.to_string());
+            let got = load(&tuned).map(|c| c.inflight_budget_bytes);
+            match fits {
+                true => assert_eq!(got, Ok(budget), "PARITY={parity}"),
+                false => assert_eq!(got, Err(invalid("INFLIGHT_BUDGET_BYTES"))),
+            }
+        }
+    }
     // The limits of the slice settings themselves are accepted, and the
     // default slice is never above one extent.
     for (put, slice, sweep) in [

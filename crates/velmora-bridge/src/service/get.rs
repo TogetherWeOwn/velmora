@@ -24,8 +24,8 @@ use super::common::{
 use crate::crypto::{cipher_span, open_range, unwrap_bdk};
 use crate::fanout::{admit, Fanout, Grant, TOKEN_TTL_MS};
 use crate::fetch::{
-    cold_fetch_bytes, cold_poll_ms, cold_read_bytes, cold_step_bytes, ColdFetch, ColdReader,
-    COLD_WAIT_MS,
+    cold_fetch_bytes, cold_poll_ms, cold_read_bytes, cold_rebuild_most, cold_step_bytes, ColdFetch,
+    ColdReader, COLD_WAIT_MS,
 };
 use crate::ingress::{ByteBudget, Charge, Spawner, CHARGE_WAIT_MS};
 use crate::ports::{BlobStore, Bridge, Catalog, Clock, JobSink, Kek, NntpConnector};
@@ -817,13 +817,18 @@ where
 {
     let todo = pieces(extents, start, len).ok_or_else(internal)?;
     // A cold extent comes back whole and needs twice its size while it
-    // does. Beside the pieces already held that can be more than the
+    // does, and more if articles of it are lost and rebuilt from its
+    // parity. Beside the pieces already held that can be more than the
     // budget has, however long the read waits. Such an extent is read
     // once on its own first: that leaves it in the cache, and the read
     // below then needs room for its piece only.
     let mut held = 0u64;
     for piece in &todo {
-        let cold = cold_read_bytes(piece.extent.cipher_size, bridge.cfg.cold_sockets);
+        let (size, sockets) = (piece.extent.cipher_size, bridge.cfg.cold_sockets);
+        // Whether the extent has parity, and lost anything, is not
+        // known before it is read: the most a rebuild of it may hold.
+        let rebuilt = cold_step_bytes(size, sockets).saturating_add(cold_rebuild_most(size));
+        let cold = cold_read_bytes(size, sockets).max(rebuilt);
         if held > 0 && held.saturating_add(cold) > bridge.budget.capacity() {
             drop(
                 read_piece(bridge, bucket, piece)
@@ -1245,13 +1250,30 @@ where
         let mut slept = 0u32;
         let mut attempt = 0u64;
         let mut interrupted = 0u32;
+        // Room for a rebuild from the extent's parity, taken for the
+        // next try after a read that found none for it. Without it a
+        // read that lost articles would be made again in full as soon
+        // as the extent alone fits, and refused its rebuild again.
+        let mut spare: Option<Charge> = None;
         loop {
             let reader = match &mut self.reader {
                 Some(reader) => reader,
-                none => none.insert(bridge.cold_reader().map_err(|_| ReadFail::Internal)?),
+                // A rebuild from parity is charged to this request.
+                none => none.insert(
+                    bridge
+                        .cold_reader()
+                        .map_err(|_| ReadFail::Internal)?
+                        .charged_to(Rc::clone(&room)),
+                ),
             };
+            if let Some(spare) = spare.take() {
+                reader.fund(spare);
+            }
             let fetched = Spent::time(&bridge.clock, &self.spent.read, reader.fetch(extent));
             let read = beside(&mut self.put, fetched).await;
+            // What a rebuild lacked, if the read ended for that: the
+            // next try waits for room for the read and for these.
+            let rebuild = reader.settle();
             match read {
                 Ok(ColdFetch::Filled(cipher)) => {
                     // One cache write at a time.
@@ -1307,6 +1329,14 @@ where
                 // again after a wait, on new connections, a few times.
                 Ok(ColdFetch::Interrupted) if interrupted < INTERRUPTED_RETRIES => interrupted += 1,
                 Ok(ColdFetch::Interrupted) => return Err(ReadFail::Busy),
+                // An extent that lost more than its parity rebuilds is
+                // as unavailable as one without parity.
+                Ok(ColdFetch::Unrecoverable) => {
+                    crate::trace::cold_read(|| {
+                        format!("extent-unrecoverable extent={}", extent.id)
+                    });
+                    return Err(ReadFail::Unavailable);
+                }
                 Ok(ColdFetch::Unavailable) => return Err(ReadFail::Unavailable),
                 Err(_) => return Err(ReadFail::Internal),
             }
@@ -1314,6 +1344,9 @@ where
             self.hang_up().await;
             drop(work);
             let sleep = bridge.budget.sleeper().ok_or(ReadFail::Busy)?;
+            // With a rebuild to come, room for both: the two are held
+            // together.
+            let both = need.saturating_add(rebuild);
             loop {
                 if bridge.clock.now() >= deadline || slept >= COLD_WAIT_MS {
                     return Err(ReadFail::Busy);
@@ -1325,7 +1358,7 @@ where
                 slept = slept.saturating_add(ms);
                 // Until there is room for the read, which is released
                 // again here: what follows takes what it needs.
-                if room.try_charge_in_turn(need).is_some() {
+                if room.try_charge_in_turn(both).is_some() {
                     break;
                 }
                 let now = bridge.clock.now();
@@ -1334,7 +1367,7 @@ where
                     return Err(ReadFail::Busy);
                 };
                 let listed = async {
-                    let listed = core::pin::pin!(room.charge_in_turn(need));
+                    let listed = core::pin::pin!(room.charge_in_turn(both));
                     match select(listed, sleep(left)).await {
                         Either::Left((found, _)) => Some(found.is_ok()),
                         Either::Right(_) => None,
@@ -1356,8 +1389,13 @@ where
             if bridge.clock.now() >= deadline {
                 return Err(ReadFail::Busy);
             }
-            // Not in the cache: read it, under a charge taken as above.
+            // Not in the cache: read it, under a charge taken as above,
+            // and with the room for its rebuild in hand if that is free
+            // still. If it is not, the rebuild asks for it itself.
             work = self.step(need, lean).await?;
+            if rebuild > 0 {
+                spare = room.try_charge(rebuild);
+            }
         }
     }
 }

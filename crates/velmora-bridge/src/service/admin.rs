@@ -1522,12 +1522,16 @@ async fn drill_extent<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K:
             }
             *charge = Some(taken);
         }
-        let read = match bridge.catalog.articles(&extent.id).await {
+        // The plan with its parity addendum: a drill rebuilds a lost
+        // article as a read does.
+        let read = match bridge.catalog.stored_plan(&extent.id).await {
             // An extent that is not posted in full is not on Usenet:
             // nothing is asked for.
-            Ok(plan) if plan.iter().any(|a| a.state != ArticleState::Posted) => return Ok(None),
+            Ok(plan) if plan.rows.iter().any(|a| a.state != ArticleState::Posted) => {
+                return Ok(None)
+            }
             Ok(plan) => {
-                let count = plan.len() as u64;
+                let count = plan.rows.len() as u64;
                 reader
                     .fetch_planned(extent, plan)
                     .await
@@ -1540,7 +1544,7 @@ async fn drill_extent<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K:
                 *articles += count;
                 return Ok(Some(cipher));
             }
-            Ok((ColdFetch::Unavailable, _)) => return Ok(None),
+            Ok((ColdFetch::Unavailable | ColdFetch::Unrecoverable, _)) => return Ok(None),
             // `last` is why the last try failed: the answer says the
             // class of that one, not of an earlier one.
             Ok((ColdFetch::Busy, _)) => last = None,
