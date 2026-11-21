@@ -30,6 +30,7 @@ pub mod chain;
 pub mod checkpoint;
 pub mod escrow;
 pub mod locations;
+pub mod moving;
 pub mod ports;
 pub mod record;
 pub mod revocations;

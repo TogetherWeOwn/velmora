@@ -1022,6 +1022,139 @@ impl OpenedControl<'_> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Moving keys between the schemes (the move of tenant 0's data)
+// ---------------------------------------------------------------------------
+//
+// Only bucket keys and S3 secrets change scheme: file-key wraps bind the
+// bucket id and the extent id and no tenant, so they stay byte for byte.
+// Each re-wrap opens the wrap it made and compares what it holds with what
+// it started from, in constant time, before it hands the new wrap out.
+// No plaintext key leaves these functions.
+
+fn same_key(a: &DataKey, b: &DataKey) -> bool {
+    bool::from(a.0[..].ct_eq(&b.0[..]))
+}
+
+const ERR_REWRAP: BridgeError = BridgeError::Crypto("re-wrapped key does not match");
+
+/// Re-wraps the scheme-1 BDK of `bucket` (under KEK version
+/// `kek_version_stored`) under `tk`, scheme 2. The row then stores
+/// `tk.version()` beside the new wrap.
+pub fn rewrap_bdk_to_v2<K: Kek, R: FillRandom>(
+    kek: &K,
+    kek_version_stored: u32,
+    bucket: &BucketId,
+    wrapped_v1: &[u8],
+    tk: &TenantKey,
+    rng: &mut R,
+) -> Result<Vec<u8>> {
+    let bdk = super::unwrap_bdk(kek, kek_version_stored, bucket, wrapped_v1)?;
+    let wrapped = wrap_bdk_v2(tk, bucket, &bdk, rng)?;
+    let back = unwrap_bdk_v2(tk, &tk.tenant, tk.version, bucket, &wrapped)?;
+    if !same_key(&bdk, &back) {
+        return Err(ERR_REWRAP);
+    }
+    Ok(wrapped)
+}
+
+/// Re-wraps the scheme-2 BDK of `bucket` of `tk`'s tenant (stored with
+/// key version `tk.version()`) under the **active** KEK, scheme 1: the
+/// reverse move, for a bucket made after the move. Returns the KEK
+/// version to store with it.
+pub fn rewrap_bdk_to_v1<K: Kek, R: FillRandom>(
+    kek: &K,
+    tk: &TenantKey,
+    bucket: &BucketId,
+    wrapped_v2: &[u8],
+    rng: &mut R,
+) -> Result<(u32, Vec<u8>)> {
+    let bdk = unwrap_bdk_v2(tk, &tk.tenant, tk.version, bucket, wrapped_v2)?;
+    let (v, wrapped) = super::wrap_bdk(kek, bucket, &bdk, rng)?;
+    let back = super::unwrap_bdk(kek, v, bucket, wrapped.as_bytes())?;
+    if !same_key(&bdk, &back) {
+        return Err(ERR_REWRAP);
+    }
+    Ok((v, wrapped.to_vec()))
+}
+
+/// Whether a scheme-1 wrap and a scheme-2 wrap of `bucket` hold the same
+/// BDK. `Err` when either does not open.
+#[allow(clippy::too_many_arguments)]
+pub fn same_bdk<K: Kek>(
+    kek: &K,
+    kek_version_v1: u32,
+    wrapped_v1: &[u8],
+    tk: &TenantKey,
+    tenant: &TenantId,
+    tk_version: u32,
+    bucket: &BucketId,
+    wrapped_v2: &[u8],
+) -> Result<bool> {
+    let one = super::unwrap_bdk(kek, kek_version_v1, bucket, wrapped_v1)?;
+    let two = unwrap_bdk_v2(tk, tenant, tk_version, bucket, wrapped_v2)?;
+    Ok(same_key(&one, &two))
+}
+
+fn same_secret_bytes(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && bool::from(a.ct_eq(b))
+}
+
+/// Re-wraps an `ak/v1` secret (under KEK version `kek_version_stored`)
+/// as `ak/v2` of `tenant`, under the active KEK. Same key id, same
+/// secret. Returns the KEK version to store with it.
+pub fn rewrap_secret_to_v2<K: Kek, R: FillRandom>(
+    kek: &K,
+    kek_version_stored: u32,
+    access_key_id: &str,
+    wrapped_v1: &[u8],
+    tenant: &TenantId,
+    rng: &mut R,
+) -> Result<(u32, Vec<u8>)> {
+    let secret = super::unwrap_secret(kek, kek_version_stored, access_key_id, wrapped_v1)?;
+    let (v, wrapped) = wrap_secret_v2(kek, tenant, access_key_id, &secret, rng)?;
+    let back = unwrap_secret_v2(kek, v, tenant, access_key_id, &wrapped)?;
+    if !same_secret_bytes(&secret, &back) {
+        return Err(ERR_REWRAP);
+    }
+    Ok((v, wrapped))
+}
+
+/// Re-wraps an `ak/v2` secret of `tenant` as `ak/v1`: the reverse move,
+/// for a key made after the move.
+pub fn rewrap_secret_to_v1<K: Kek, R: FillRandom>(
+    kek: &K,
+    kek_version_stored: u32,
+    access_key_id: &str,
+    wrapped_v2: &[u8],
+    tenant: &TenantId,
+    rng: &mut R,
+) -> Result<(u32, Vec<u8>)> {
+    let secret = unwrap_secret_v2(kek, kek_version_stored, tenant, access_key_id, wrapped_v2)?;
+    let (v, wrapped) = super::wrap_secret(kek, access_key_id, &secret, rng)?;
+    let back = super::unwrap_secret(kek, v, access_key_id, &wrapped)?;
+    if !same_secret_bytes(&secret, &back) {
+        return Err(ERR_REWRAP);
+    }
+    Ok((v, wrapped))
+}
+
+/// Whether an `ak/v1` wrap and an `ak/v2` wrap of `access_key_id` hold
+/// the same secret. `Err` when either does not open.
+pub fn same_secret<K: Kek>(
+    kek: &K,
+    kek_version_v1: u32,
+    wrapped_v1: &[u8],
+    tenant: &TenantId,
+    kek_version_v2: u32,
+    wrapped_v2: &[u8],
+    access_key_id: &str,
+) -> Result<bool> {
+    let one = super::unwrap_secret(kek, kek_version_v1, access_key_id, wrapped_v1)?;
+    let two = unwrap_secret_v2(kek, kek_version_v2, tenant, access_key_id, wrapped_v2)?;
+    Ok(same_secret_bytes(&one, &two))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
