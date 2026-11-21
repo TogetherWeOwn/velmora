@@ -68,17 +68,16 @@ pub const TURN_WAIT_MS: u32 = 5_000;
 /// charges (see [`ByteBudget`]), so eight chunks charged cover twelve
 /// held.
 ///
-/// The body item being decoded is the runtime's and is counted neither
-/// here nor for a body held whole. The six chunks of slack cover it and
-/// its copy up to [`STREAM_ITEM_ALLOWANCE`] each. A deployed Worker gets
-/// its request body in items of 4 KiB (measured: 4,097 items for a part
-/// of 16 MiB, 257 for 1 MiB). Whoever makes those items bigger, by
-/// reading the body in larger pieces, has to raise this charge with
-/// them.
+/// The body item being decoded is the runtime's. The six chunks of
+/// slack cover it and its copy up to [`STREAM_ITEM_ALLOWANCE`] each; a
+/// longer item is charged on top for as long as it is held
+/// ([`stream_item_charge`]). A deployed Worker gets its request body in
+/// items of 4 KiB (measured: 4,097 items for a part of 16 MiB, 257 for
+/// 1 MiB), so the fixed charge is all a request is charged today.
 pub const STREAM_CHARGE_BYTES: u64 = 8 * CIPHER_CHUNK_SIZE;
 
-/// The largest body item (see [`STREAM_CHARGE_BYTES`]) the charge of a
-/// streamed upload still covers, held twice: 128 KiB.
+/// The largest body item the fixed charge of a streamed upload
+/// ([`STREAM_CHARGE_BYTES`]) covers, held twice: 128 KiB.
 pub const STREAM_ITEM_ALLOWANCE: u64 = 2 * PLAIN_CHUNK_SIZE;
 // Six sealed chunks and two such items fit in what eight charged chunks
 // may hold (1.5 bytes per byte charged).
@@ -1079,6 +1078,35 @@ impl Charge {
         self.requests.saturating_add(self.jobs)
     }
 
+    /// A charge of nothing on the same budget, in the count of the same
+    /// request: the place for bytes that are charged only once they are
+    /// in memory ([`Charge::hold`]).
+    pub fn beside(&self) -> Charge {
+        Charge {
+            state: Rc::clone(&self.state),
+            requests: 0,
+            jobs: 0,
+            held: self.held.clone(),
+        }
+    }
+
+    /// Makes this charge stand for `bytes` of a request, **whether or
+    /// not the budget has room**: for bytes that are in memory already,
+    /// where waiting for room would free nothing. Room taken this way is
+    /// not there for the next charge, which waits as for any other.
+    pub fn hold(&mut self, bytes: u64) {
+        let s = &self.state;
+        self.count(self.requests, false);
+        let others = s.requests.get().saturating_sub(self.requests);
+        s.requests.set(others.saturating_add(bytes));
+        self.requests = bytes;
+        self.count(bytes, true);
+        let in_use = s.requests.get().saturating_add(s.jobs.get());
+        if in_use > s.peak.get() {
+            s.peak.set(in_use);
+        }
+    }
+
     /// Takes over what `other` holds, so that one charge stands for both.
     /// A charge against another budget is released instead.
     pub fn absorb(&mut self, mut other: Charge) {
@@ -1225,6 +1253,16 @@ pub fn stream_charge(declared_len: u64) -> u64 {
     declared_len.saturating_mul(2).min(STREAM_CHARGE_BYTES)
 }
 
+/// Bytes a streamed upload is charged on top of its fixed charge while
+/// it holds a body item of `item_len` bytes: nothing up to
+/// [`STREAM_ITEM_ALLOWANCE`], and the item and its copy above that.
+pub fn stream_item_charge(item_len: u64) -> u64 {
+    match item_len > STREAM_ITEM_ALLOWANCE {
+        true => item_len.saturating_mul(2),
+        false => 0,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // An upload sealed while it arrives
 // ---------------------------------------------------------------------------
@@ -1294,6 +1332,9 @@ struct SealPump {
     /// The body chunk being decoded, and how much of it already is.
     incoming: Vec<u8>,
     taken: usize,
+    /// What `incoming` is charged beyond the request's fixed charge
+    /// ([`stream_item_charge`]).
+    item: Charge,
     /// Decoded bytes not sealed yet: under two chunks.
     plain: Vec<u8>,
     state: Rc<RefCell<SealState>>,
@@ -1315,6 +1356,7 @@ impl SealPump {
                 self.validator = None;
                 self.sealer = None;
                 self.incoming = Vec::new();
+                self.item.hold(0);
                 self.plain = Vec::new();
                 *self.state.borrow_mut() = SealState::Refused(e);
                 Some(Err(upload_refused()))
@@ -1364,6 +1406,9 @@ impl SealPump {
                     if self.lengths.encoded.is_some_and(|n| self.received > n) {
                         return Err(IngressError::EntityTooLarge.into());
                     }
+                    // The item is in memory whatever the budget says,
+                    // so a long one is charged without waiting.
+                    self.item.hold(stream_item_charge(bytes.len() as u64));
                     self.incoming = bytes;
                     self.taken = 0;
                 }
@@ -1376,6 +1421,8 @@ impl SealPump {
     /// The body has ended: judge it, then seal and give the final chunk.
     fn end(&mut self) -> Result<Vec<u8>, UploadReadError> {
         self.body = None;
+        self.incoming = Vec::new();
+        self.item.hold(0);
         if self.lengths.encoded.is_some_and(|n| self.received != n) {
             return Err(IngressError::IncompleteBody.into());
         }
@@ -1406,7 +1453,9 @@ impl SealPump {
 /// comes ([`crate::ports::BlobStore::put_stream`]). Only a window of the
 /// body is in memory: the body chunk being decoded, under two chunks of
 /// plaintext and one sealed piece. Call it only after the budget charge
-/// ([`ByteBudget::charge_stream`]).
+/// ([`ByteBudget::charge_stream`]), and give it that `charge`: a body
+/// item longer than the charge allows for is charged beside it while it
+/// is held ([`stream_item_charge`]).
 ///
 /// The stream is read only as fast as its reader asks, and it asks the
 /// body for more only then.
@@ -1426,6 +1475,7 @@ pub fn seal_upload(
     lengths: UploadLengths,
     validator: UploadValidator,
     sealer: ExtentSealer,
+    charge: &Charge,
 ) -> Result<(ByteStream, UploadSeal), IngressError> {
     if validator.decoded_length() != lengths.decoded
         || sealer.remaining() != lengths.decoded
@@ -1445,6 +1495,7 @@ pub fn seal_upload(
         received: 0,
         incoming: Vec::new(),
         taken: 0,
+        item: charge.beside(),
         plain: Vec::new(),
         state: Rc::clone(&state),
         done: false,

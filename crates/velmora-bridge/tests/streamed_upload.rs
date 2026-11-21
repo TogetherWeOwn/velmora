@@ -12,7 +12,9 @@ use futures_util::stream::{self, StreamExt as _};
 use intent_support::*;
 use service_support::*;
 use velmora::media::{ciphertext_size, PLAIN_CHUNK_SIZE};
-use velmora_bridge::ingress::{stream_charge, ByteBudget, STREAM_CHARGE_BYTES};
+use velmora_bridge::ingress::{
+    stream_charge, stream_item_charge, ByteBudget, STREAM_CHARGE_BYTES, STREAM_ITEM_ALLOWANCE,
+};
 use velmora_bridge::*;
 
 const CHUNK_64K: usize = PLAIN_CHUNK_SIZE as usize;
@@ -112,6 +114,8 @@ async fn every_mode_and_size_is_stored_as_it_was_sent() {
                 let what = format!("{mode:?} {len} in {piece}");
 
                 let req = mode_req(&rig, &signer, KEY, &body, mode);
+                // The longest item the body arrives in.
+                let item = req.body.len().min(piece) as u64;
                 let r = send_in_pieces(&rig, req, piece).await;
                 assert_eq!(r.status, 200, "{what}: {}", r.text());
                 assert_eq!(r.header("etag"), Some(md5_etag(&body).as_str()), "{what}");
@@ -142,7 +146,11 @@ async fn every_mode_and_size_is_stored_as_it_was_sent() {
                 assert_eq!(seen.taken(), extent.cipher_size, "{what}");
                 assert_eq!(seen.pieces.len(), len.div_ceil(CHUNK_64K).max(1), "{what}");
                 assert!(seen.stored && !seen.failed, "{what}");
-                assert_eq!(rig.bridge.budget.peak(), stream_charge(len as u64));
+                assert_eq!(
+                    rig.bridge.budget.peak(),
+                    stream_charge(len as u64) + stream_item_charge(item),
+                    "{what}"
+                );
                 assert_eq!(rig.bridge.budget.in_use(), 0, "{what}");
 
                 let got = get(&rig, &signer, KEY).await;
@@ -522,9 +530,67 @@ fn the_charge_is_a_window_and_never_more_than_a_held_body() {
     assert_eq!(STREAM_CHARGE_BYTES, 8 * (64 * 1024 + 16));
 }
 
+/// A body item longer than the fixed charge allows for is charged beside
+/// it while it is held, whether or not the budget has room, and given
+/// back with it. Items of the size a Worker gets them in, and up to the
+/// allowance, cost nothing more.
+#[tokio::test(flavor = "current_thread")]
+async fn a_long_body_item_is_charged_while_it_is_held() {
+    let allowance = STREAM_ITEM_ALLOWANCE as usize;
+    assert_eq!(stream_item_charge(0), 0);
+    assert_eq!(stream_item_charge(4096), 0);
+    assert_eq!(stream_item_charge(STREAM_ITEM_ALLOWANCE), 0);
+    assert_eq!(
+        stream_item_charge(STREAM_ITEM_ALLOWANCE + 1),
+        2 * (STREAM_ITEM_ALLOWANCE + 1)
+    );
+    assert_eq!(stream_item_charge(u64::MAX), u64::MAX);
+
+    let body = pattern(12, 2 * MIB + 5);
+    let digest = sha256(&body);
+    for (piece, longest) in [
+        (4096, 0),
+        (allowance, 0),
+        (allowance + 1, allowance + 1),
+        (MIB, MIB),
+        (4 * MIB, body.len()),
+    ] {
+        // Room for the fixed charge of one upload and no more.
+        let budget = ByteBudget::new(STREAM_CHARGE_BYTES);
+        let rig = rig_with_budget(NoNntp, config(Vec::new()), budget);
+        let (bucket, signer) = rig.standard(BUCKET).await;
+        let req = mode_req(&rig, &signer, KEY, &body, Mode::Unsigned);
+        let r = send_in_pieces(&rig, req, piece).await;
+        assert_eq!(r.status, 200, "pieces of {piece}: {}", r.text());
+        assert_eq!(
+            rig.bridge.budget.peak(),
+            STREAM_CHARGE_BYTES + 2 * longest as u64,
+            "pieces of {piece}"
+        );
+        assert_eq!(rig.bridge.budget.in_use(), 0, "pieces of {piece}");
+        let (_, extents) = rig.live(&bucket, KEY).await.unwrap();
+        assert_eq!(extents[0].plain_sha256, digest, "pieces of {piece}");
+    }
+
+    // A refused body gives the charge of its item back as well.
+    let budget = ByteBudget::new(STREAM_CHARGE_BYTES);
+    let rig = rig_with_budget(NoNntp, config(Vec::new()), budget);
+    let (_, signer) = rig.standard(BUCKET).await;
+    let mut req = mode_req(&rig, &signer, KEY, &body, Mode::Unsigned);
+    req.body.truncate(body.len() - 1);
+    let r = send_in_pieces(&rig, req, MIB).await;
+    r.expect_error(400, "IncompleteBody");
+    assert_eq!(
+        rig.bridge.budget.peak(),
+        STREAM_CHARGE_BYTES + 2 * MIB as u64
+    );
+    assert_eq!(rig.bridge.budget.in_use(), 0);
+}
+
 /// Uploads of a whole extent each are under way at once in a budget
 /// that a single held body of that size would not fit, each charged its
-/// window until its store call returns.
+/// window until its store call returns. The bodies arrive in items of
+/// 4 KiB, as a deployed Worker gets them.
 #[tokio::test(flavor = "current_thread")]
 async fn whole_extents_are_stored_at_once_within_a_small_budget() {
     const AT_ONCE: u64 = 4;
@@ -536,7 +602,8 @@ async fn whole_extents_are_stored_at_once_within_a_small_budget() {
     *rig.bridge.safety.hold_put_prefix.borrow_mut() = Some("x/".into());
     let sends = (0..AT_ONCE).map(|i| {
         let req = mode_req(&rig, &signer, &format!("k{i}"), &body, Mode::Unsigned);
-        start(&rig, req)
+        let bridge = Rc::clone(&rig.bridge);
+        async move { Resp::collect(bridge.handle(in_pieces(req, 4096)).await).await }
     });
     let all = futures_util::future::join_all(sends);
     let release = async {

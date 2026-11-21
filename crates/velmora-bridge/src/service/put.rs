@@ -40,6 +40,7 @@ use crate::ingress::{upload_lengths, SealedUpload, UploadLengths, UploadReadErro
 use crate::intents::WRITER_MAX_AGE_MS;
 use crate::ports::{
     BlobStore, Bridge, Catalog, Clock, Guard, JobSink, Kek, NntpConnector, PublishOutcome,
+    StreamMeta,
 };
 use crate::recovery::{id_after, write_generation};
 use crate::types::{
@@ -145,8 +146,11 @@ async fn put<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: 
         lengths,
         validator,
         &bdk,
-        &bucket.id,
-        &extent_id,
+        StreamMeta {
+            bucket: &bucket.id,
+            extent: &extent_id,
+        },
+        &charge,
     )
     .await
     .map_err(|e| match e {

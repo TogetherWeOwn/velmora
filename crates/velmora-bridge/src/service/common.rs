@@ -17,7 +17,9 @@ use velmora_s3_proto::UploadValidator;
 
 use crate::config::{BridgeConfig, Maintenance, REAL_DATA_READY};
 use crate::crypto::{unwrap_secret, DataKey, ExtentSealer};
-use crate::ingress::{seal_upload, IngressError, SealedUpload, UploadLengths, UploadReadError};
+use crate::ingress::{
+    seal_upload, Charge, IngressError, SealedUpload, UploadLengths, UploadReadError,
+};
 use crate::ports::{BlobStore, Bridge, Catalog, Clock, JobSink, Kek, NntpConnector, StreamMeta};
 use crate::recovery::{discard_generation, revocation_recorded, Unpublished};
 use crate::replay::ReplayProbe;
@@ -899,27 +901,29 @@ pub(super) async fn send_post_jobs<C, B, N, J, K, T>(
 /// - **One attempt.** A store that fails ends the request with `500`
 ///   and the client sends the body again.
 ///
-/// `extent` must be newly minted (see [`ExtentSealer`]).
+/// The extent `blob` names must be newly minted (see [`ExtentSealer`]).
+/// `charge` is the one taken for this body.
 pub(super) async fn store_streamed<B: BlobStore>(
     safety: &B,
     body: Body,
     lengths: UploadLengths,
     validator: UploadValidator,
     bdk: &DataKey,
-    bucket: &BucketId,
-    extent: &ExtentId,
+    blob: StreamMeta<'_>,
+    charge: &Charge,
 ) -> Result<SealedUpload, UploadReadError> {
-    let sealer = ExtentSealer::begin(bdk, bucket, extent, lengths.decoded, &mut SystemRng)
-        .map_err(|_| IngressError::Internal)?;
+    let sealer = ExtentSealer::begin(
+        bdk,
+        blob.bucket,
+        blob.extent,
+        lengths.decoded,
+        &mut SystemRng,
+    )
+    .map_err(|_| IngressError::Internal)?;
     let cipher_size = sealer.cipher_size();
-    let (stream, seal) = seal_upload(body, lengths, validator, sealer)?;
+    let (stream, seal) = seal_upload(body, lengths, validator, sealer, charge)?;
     let receipt = safety
-        .put_stream(
-            &extent.safety_key(),
-            cipher_size,
-            stream,
-            &StreamMeta { bucket, extent },
-        )
+        .put_stream(&blob.extent.safety_key(), cipher_size, stream, &blob)
         .await;
     match (receipt, seal.outcome()) {
         // The body was refused: that is the answer, whatever the store

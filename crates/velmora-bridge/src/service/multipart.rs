@@ -61,7 +61,7 @@ use crate::ingress::{
 use crate::intents::WRITER_MAX_AGE_MS;
 use crate::ports::{
     BlobMeta, BlobStore, Bridge, Catalog, Clock, Guard, JobSink, Kek, NntpConnector,
-    PublishOutcome, UploadTarget,
+    PublishOutcome, StreamMeta, UploadTarget,
 };
 use crate::recovery::{id_after, write_generation};
 use crate::service::common::{
@@ -776,8 +776,11 @@ where
             lengths,
             validator,
             &bdk,
-            &a.bucket.id,
-            &extent_id,
+            StreamMeta {
+                bucket: &a.bucket.id,
+                extent: &extent_id,
+            },
+            &charge,
         )
         .await?;
         drop(charge);
