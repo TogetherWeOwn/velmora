@@ -153,15 +153,29 @@ fn resolved(r: ResolveResult<'_>) -> Result<Option<String>, XmlError> {
     }
 }
 
-/// A name without a colon (Namespaces in XML, `NCName`): a letter, `_`
-/// or a character above ASCII first, then also digits, `.` and `-`. A
-/// name that is not one would be written back as it came and break the
-/// documents of every later answer that carries it.
+/// `NameStartChar` of XML 1.0 (fifth edition), without `:`.
+fn name_start(c: char) -> bool {
+    matches!(c,
+        'A'..='Z' | '_' | 'a'..='z'
+        | '\u{C0}'..='\u{D6}' | '\u{D8}'..='\u{F6}' | '\u{F8}'..='\u{2FF}'
+        | '\u{370}'..='\u{37D}' | '\u{37F}'..='\u{1FFF}' | '\u{200C}'..='\u{200D}'
+        | '\u{2070}'..='\u{218F}' | '\u{2C00}'..='\u{2FEF}' | '\u{3001}'..='\u{D7FF}'
+        | '\u{F900}'..='\u{FDCF}' | '\u{FDF0}'..='\u{FFFD}' | '\u{10000}'..='\u{EFFFF}')
+}
+
+/// `NameChar` of XML 1.0 (fifth edition), without `:`.
+fn name_char(c: char) -> bool {
+    name_start(c)
+        || matches!(c,
+            '-' | '.' | '0'..='9' | '\u{B7}' | '\u{300}'..='\u{36F}' | '\u{203F}'..='\u{2040}')
+}
+
+/// A name without a colon (Namespaces in XML, `NCName`). A name that is
+/// not one would be written back as it came and break the documents of
+/// every later answer that carries it.
 fn ncname(s: &str) -> bool {
     let mut chars = s.chars();
-    let start = |c: char| c.is_ascii_alphabetic() || c == '_' || (!c.is_ascii() && xml_char(c));
-    matches!(chars.next(), Some(c) if start(c))
-        && chars.all(|c| start(c) || c.is_ascii_digit() || c == '.' || c == '-')
+    matches!(chars.next(), Some(c) if name_start(c)) && chars.all(name_char)
 }
 
 /// A qualified name: an `NCName`, or two joined by one colon.
@@ -384,6 +398,10 @@ mod tests {
             b"<1a/>",
             br#"<a b<c="1"/>"#,
             b"<a:b:c xmlns:a=\"urn:a\"/>",
+            "<a\u{a0}b xmlns=\"urn:z\"/>".as_bytes(),
+            "<a\u{d7} xmlns=\"urn:z\"/>".as_bytes(),
+            "<\u{2028}a xmlns=\"urn:z\"/>".as_bytes(),
+            "<a\u{3000}b xmlns=\"urn:z\"/>".as_bytes(),
         ] {
             assert_eq!(
                 parse(bad),
@@ -393,6 +411,7 @@ mod tests {
             );
         }
         assert!(parse("<caf\u{e9}.x-1 xmlns=\"urn:z\"/>".as_bytes()).is_ok());
+        assert!(parse("<\u{65e5}\u{672c}\u{b7}a xmlns=\"urn:z\"/>".as_bytes()).is_ok());
         let deep = "<a>".repeat(100) + &"</a>".repeat(100);
         assert_eq!(parse(deep.as_bytes()), Err(XmlError::TooLarge));
     }
