@@ -1587,6 +1587,17 @@ async fn slice_acceptance() {
                 .collect::<Vec<_>>()
         ),
     );
+    // The queue took the message, so the row is marked as sent: the
+    // dispatcher leaves it alone until the mark has aged.
+    let report = rig
+        .bridge
+        .dispatch()
+        .await
+        .unwrap_or_else(|e| fail(s, "Bridge::dispatch", "Ok", e));
+    expect_eq(s, "jobs sent again at once", 0, report.enqueued);
+    rig.bridge
+        .clock
+        .advance_secs(velmora_bridge::jobs::RESEND_SECS);
     let report = rig
         .bridge
         .dispatch()
@@ -2628,7 +2639,11 @@ async fn parts_completed_late_keep_their_safety_copy_for_the_minimum_age() {
         );
     }
 
-    rig.bridge.clock.set(UnixMs(last));
+    // The pump above dropped the wake-ups the verify jobs sent, so the
+    // releases are sent by the dispatcher, once their marks have aged.
+    rig.bridge
+        .clock
+        .set(UnixMs(last).plus_secs(velmora_bridge::jobs::RESEND_SECS));
     rig.tick(s).await;
     for (_, stage, .., safety) in rig.soaks() {
         expect_eq(

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # run-local.sh: layer 1 of the benchmark, one command.
 #
-#   bench/run-local.sh [--ref <git ref>] [--name <name>] [--out <dir>] [--tiny <n>] [--cpu <cpu.json>]
+#   bench/run-local.sh [--ref <git ref>] [--name <name>] [--out <dir>] [--tiny <n>] [--late-queue] [--cpu <cpu.json>]
 #
 # Runs the scenario of crates/velmora-bridge/tests/bench_counts.rs (native
 # rig, fake NNTP, the production [vars]), replays its D1 trace through the
@@ -34,13 +34,14 @@ unset CDPATH
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 REPO=$(cd "$HERE/.." && pwd)
 WORK=${BENCH_WORK:-/var/tmp/velmora-bench}
-REF='' NAME='' OUT='' TINY='' CPU=''
+REF='' NAME='' OUT='' TINY='' CPU='' LATE=''
 while (($#)); do
   case $1 in
     --ref) REF=$2; shift 2 ;;
     --name) NAME=$2; shift 2 ;;
     --out) OUT=$2; shift 2 ;;
     --tiny) TINY=$2; shift 2 ;;
+    --late-queue) LATE=1; shift ;;
     --cpu) CPU=$2; shift 2 ;;
     *) echo "unknown argument $1" >&2; exit 2 ;;
   esac
@@ -109,6 +110,10 @@ fi
 if [[ -n $TINY && $AUTO_NAME == 1 ]]; then
   NAME="${NAME:-$SHA}-tiny$TINY"
 fi
+# So is a --late-queue run.
+if [[ -n $LATE && $AUTO_NAME == 1 ]]; then
+  NAME="${NAME:-$SHA}-late"
+fi
 NAME=${NAME:-$SHA}
 OUT=${OUT:-$WORK/runs/$NAME}
 mkdir -p "$OUT"
@@ -163,7 +168,7 @@ t=$(date +%s)
 (
   cd "$SRC"
   export CARGO_TARGET_DIR=$TARGET CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0
-  export VELMORA_BENCH_OUT=$OUT ${TINY:+VELMORA_BENCH_TINY=$TINY} VELMORA_BENCH_VARS=${BENCH_VARS:-}
+  export VELMORA_BENCH_OUT=$OUT ${TINY:+VELMORA_BENCH_TINY=$TINY} ${LATE:+VELMORA_BENCH_LATE_QUEUE=1} VELMORA_BENCH_VARS=${BENCH_VARS:-}
   cargo test -q -p velmora-bridge --test bench_counts -- --ignored --exact bench_counts_full >"$OUT/cargo.log" 2>&1
 ) || { tail -n 40 "$OUT/cargo.log" >&2; log "FAILED: the native run (log: $OUT/cargo.log)"; exit 1; }
 log "native run done in $(($(date +%s) - t)) s"

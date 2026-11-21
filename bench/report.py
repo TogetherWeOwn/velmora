@@ -269,6 +269,10 @@ def render(name, counts, d1, labels, m, chk):
         "BENCH_VARS (changed for this run): "
         + (", ".join(f"{k}={v}" for k, v in counts.get("bench_vars", {}).items()) or "none"),
         "",
+    ]
+    if counts.get("late_queue_secs"):
+        L += [f"Late queue: every message delivered {counts['late_queue_secs']} s after it is due.", ""]
+    L += [
         "## Per S3 operation (per call)",
         "",
     ]
@@ -336,7 +340,9 @@ def compare(a_dir, b_dir, out):
     if va or vb:
         show = lambda v: ", ".join(f"{k}={x}" for k, x in v.items()) or "none"
         L.append(f"| BENCH_VARS | {show(va)} | {show(vb)} | |")
-    keys = ["invocations", "d1_calls", "d1_rows_read", "d1_rows_written", "r2_class_a", "r2_class_b", "queue_messages", "nntp_asks", "nntp_bodies"]
+    if ra.get("late_queue_secs") or rb.get("late_queue_secs"):
+        L.append(f"| late queue (s) | {ra.get('late_queue_secs', 0)} | {rb.get('late_queue_secs', 0)} | |")
+    keys = ["invocations", "d1_calls", "d1_rows_read", "d1_rows_written", "r2_class_a", "r2_class_b", "queue_messages", "outbox_empty_claims", "nntp_asks", "nntp_bodies"]
     for section in ("ops", "stages"):
         for label in sorted(set(ra[section]) | set(rb[section])):
             ca, cb = ra[section].get(label, {}), rb[section].get(label, {})
@@ -416,6 +422,7 @@ def main(argv):
         "name": name,
         "vars": counts["vars"],
         "bench_vars": counts.get("bench_vars", {}),
+        "late_queue_secs": counts.get("late_queue_secs", 0),
         "classes": counts["classes"],
         "replay": {"calls": d1["calls"], "disagreements": d1["disagreements"]},
         "rows_written_check": chk,
