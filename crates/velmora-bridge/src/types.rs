@@ -1521,6 +1521,10 @@ pub enum ScrubResult {
     Stalled,
     /// The loss was confirmed and no copy anywhere is intact.
     Unrecoverable,
+    /// Not checked: no live object holds the extent (deleted or
+    /// overwritten, waiting for garbage collection), or not all of its
+    /// articles are posted. Looked at again after the interval.
+    Skipped,
 }
 
 impl ScrubResult {
@@ -1531,6 +1535,7 @@ impl ScrubResult {
             ScrubResult::Repairing => "repairing",
             ScrubResult::Stalled => "stalled",
             ScrubResult::Unrecoverable => "unrecoverable",
+            ScrubResult::Skipped => "skipped",
         }
     }
 
@@ -1541,6 +1546,7 @@ impl ScrubResult {
             "repairing" => ScrubResult::Repairing,
             "stalled" => ScrubResult::Stalled,
             "unrecoverable" => ScrubResult::Unrecoverable,
+            "skipped" => ScrubResult::Skipped,
             _ => return None,
         })
     }
@@ -1565,9 +1571,12 @@ pub struct ScrubRun {
     pub repaired: u32,
     pub unrecoverable: u32,
     pub stalled: u32,
-    /// The breaker tripped in this run: the label of the backbone and
-    /// the extents that lacked articles there among those checked.
+    /// The breaker tripped in this run: the label of the backbone.
     pub incident: Option<String>,
+    /// The backbones no loss is repaired on when the run ends: those of
+    /// the incidents before it and of its own, or none once a run that
+    /// checked enough extents to trip the breaker did not.
+    pub blocked: Vec<String>,
     /// Ciphertext bytes read from Usenet.
     pub bytes_read: u64,
     /// Articles a provider did not serve intact that another one did,
@@ -1627,7 +1636,19 @@ pub struct ScrubState {
     pub last_run_at: Option<UnixMs>,
     pub last_unrecoverable_at: Option<UnixMs>,
     pub last_incident_at: Option<UnixMs>,
+    /// The backbones no loss is repaired on, as a JSON array of labels
+    /// (`scrub_state.last_incident`); `None` = none.
     pub last_incident: Option<String>,
+}
+
+impl ScrubState {
+    /// The backbones under an incident ([`Self::last_incident`]).
+    pub fn blocked(&self) -> Vec<String> {
+        match self.last_incident.as_deref() {
+            None => Vec::new(),
+            Some(text) => serde_json::from_str(text).unwrap_or_else(|_| vec![text.to_owned()]),
+        }
+    }
 }
 
 /// The oldest message that waits in the queues of one kind, as far as

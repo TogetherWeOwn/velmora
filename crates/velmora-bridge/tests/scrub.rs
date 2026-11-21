@@ -602,7 +602,7 @@ async fn a_backbone_that_lacks_many_extents_trips_the_breaker_and_nothing_is_re_
     assert!(alerts().iter().any(|a| a == "scrub-incident beta 8/8"));
     let state = w.state().await;
     assert_eq!(state.incidents, 1);
-    assert_eq!(state.last_incident.as_deref(), Some("beta"));
+    assert_eq!(state.blocked(), ["beta"]);
 
     // Confirmed an hour later, but beta is still under the incident.
     w.advance_secs(3600);
@@ -621,6 +621,7 @@ async fn a_backbone_that_lacks_many_extents_trips_the_breaker_and_nothing_is_re_
     let third = w.scrub().await;
     assert_eq!((third.checked, third.ok, third.repaired), (9, 9, 0));
     assert_eq!(w.state().await.last_incident, None);
+    assert!(w.state().await.blocked().is_empty());
 }
 
 /// A run checks at most `SCRUB_EXTENTS_PER_RUN` extents, the one
@@ -747,23 +748,33 @@ async fn a_repair_that_does_not_end_is_reported_stalled_and_its_safety_copy_kept
     assert_eq!(w.safety_state(&o).await, "released");
 }
 
-/// An extent of an object that was deleted is never brought back: the
-/// re-pin's guard refuses it.
+/// An extent of an object that was deleted is never read again and never
+/// brought back: it is skipped, with nothing written to a blob store.
 #[tokio::test(flavor = "current_thread")]
-async fn an_extent_of_a_deleted_object_is_not_re_pinned() {
+async fn an_extent_of_a_deleted_object_is_skipped_and_not_re_pinned() {
     let w = world().await;
     let o = w.released("a", 50).await;
     w.advance_secs(31 * DAY_SECS);
     w.hide(1, &o, 0).await;
-    w.scrub().await;
+    assert_eq!(w.scrub().await.suspect, 1);
     w.rig
         .call(&w.signer, Method::Delete, &path(BUCKET, "a"), &[], &[], b"")
         .await
         .expect(204);
     w.advance_secs(3600);
+    let puts = w.bridge().safety.puts.borrow().len();
     let run = w.scrub().await;
-    assert_eq!(run.repaired, 0);
-    assert_ne!(w.safety_state(&o).await, "held");
+    assert_eq!((run.checked, run.repaired, run.bytes_read), (0, 0, 0));
+    assert_eq!(w.result(&o).await, "skipped");
+    assert_eq!(w.safety_state(&o).await, "released");
+    assert_eq!(
+        w.bridge().safety.puts.borrow().len(),
+        puts,
+        "no copy written"
+    );
+    // Not looked at again before the interval.
+    w.advance_secs(3600);
+    assert_eq!(w.scrub().await.checked, 0);
 }
 
 /// The due list is read from its index, a page at a time.
@@ -868,5 +879,132 @@ async fn under_an_incident_nothing_is_re_pinned_and_unrecoverable_is_still_said(
     assert_eq!(w.safety_state(&kept).await, "released");
     assert_eq!(w.result(&lost).await, "unrecoverable");
     // The run checked fewer extents than a trip needs: the incident stands.
-    assert_eq!(w.state().await.last_incident.as_deref(), Some("beta"));
+    assert_eq!(w.state().await.blocked(), ["beta"]);
+}
+
+/// A provider whose drill connections are all the reader may take: the
+/// `STAT` session takes a background slot, so the reader is never short
+/// of its own.
+#[tokio::test(flavor = "current_thread")]
+async fn the_stat_session_never_takes_a_drill_slot_the_reader_needs() {
+    let w = world_with(|cfg| {
+        for p in &mut cfg.providers {
+            p.drill_conns = 1;
+        }
+        cfg.scrub.sockets = 1;
+    })
+    .await;
+    let o = w.released("a", 90).await;
+    w.advance_secs(31 * DAY_SECS);
+    let run = w.scrub().await;
+    assert_eq!((run.checked, run.ok, run.ended), (1, 1, ScrubEnd::Idle));
+    assert_eq!(w.result(&o).await, "ok");
+}
+
+/// A re-pinned extent whose watch found no intact copy anywhere stays
+/// watched: once Usenet has it again, its safety copy is written back.
+#[tokio::test(flavor = "current_thread")]
+async fn a_watched_repair_without_any_copy_is_watched_again_and_restored() {
+    let w = world().await;
+    let o = w.released("a", 91).await;
+    w.advance_secs(31 * DAY_SECS);
+    w.hide(1, &o, 0).await;
+    w.scrub().await;
+    w.advance_secs(3600);
+    assert_eq!(w.scrub().await.repaired, 1);
+    // The copy goes, and so does the article on the other backbone.
+    assert!(w.bridge().safety.lose(&o.extent.safety_key()));
+    w.hide(0, &o, 0).await;
+    let bound = repair_bound_secs(w.bridge().cfg.safety_min_age_secs, 3600);
+    w.advance_secs(u32::try_from(bound).unwrap());
+    assert_eq!(w.scrub().await.unrecoverable, 1);
+    assert_eq!(w.result(&o).await, "unrecoverable");
+    assert_eq!(w.safety_state(&o).await, "held");
+    // Usenet has it again: the next look writes the copy back.
+    let plan = w.plan(&o).await;
+    w.servers[0].unhide(&plan[0].message_id).await;
+    w.advance_secs(3600);
+    let run = w.scrub().await;
+    assert_eq!(run.stalled, 1);
+    assert!(w.has_safety(&o), "written back from Usenet");
+    assert_eq!(w.result(&o).await, "stalled");
+}
+
+/// A provider past its retention answers 430 for what it no longer keeps:
+/// that is no loss of its backbone. Presence is asked of a provider that
+/// retains the articles, as verify asks.
+#[tokio::test(flavor = "current_thread")]
+async fn a_provider_past_its_retention_is_not_asked_for_presence() {
+    let short = server().await;
+    let w = world_with(|cfg| {
+        // First in its backbone's order, keeps 30 days, and has nothing.
+        let mut p = provider("p0b", "alpha", &short);
+        p.retention_days = Some(30);
+        p.post = false;
+        cfg.providers[0].priority = 1;
+        cfg.providers.insert(0, p);
+    })
+    .await;
+    // Posted, then on all three servers, then verified and released.
+    let plain = pattern(92, PLAIN);
+    w.rig.put(&w.signer, BUCKET, "a", &plain).await.expect(200);
+    let (generation, extents) = w.rig.live(&w.bucket, "a").await.unwrap();
+    let o = Obj {
+        extent: extents[0].id.clone(),
+        generation: generation.id,
+        plain,
+    };
+    w.run(&o, OutboxStage::Post).await;
+    w.mirror(&o).await;
+    let addr = short.addr();
+    let mut dst = dial(&nntp_config(
+        &addr.ip().to_string(),
+        addr.port(),
+        USER,
+        PASS,
+    ))
+    .await
+    .unwrap();
+    for row in w.plan(&o).await {
+        let mut src = w.client(0).await;
+        let mut article = Vec::new();
+        src.article_to(&row.message_id, &mut article).await.unwrap();
+        dst.post_article(&row.message_id, &article).await.unwrap();
+        src.quit().await;
+    }
+    dst.quit().await;
+    w.drive(&o).await;
+    assert_eq!(w.safety_state(&o).await, "released");
+    // Past its 30 days the short account no longer has them.
+    w.advance_secs(31 * DAY_SECS);
+    for row in w.plan(&o).await {
+        short.hide(&row.message_id).await;
+    }
+    let run = w.scrub().await;
+    assert_eq!((run.checked, run.ok, run.suspect), (1, 1, 0));
+    assert_eq!(w.result(&o).await, "ok");
+}
+
+/// A trip on a second backbone keeps the first one's block: no loss on
+/// either is repaired until a clean run.
+#[tokio::test(flavor = "current_thread")]
+async fn incidents_on_two_backbones_block_both() {
+    let w = world().await;
+    let mut objs = Vec::new();
+    for i in 0..8u8 {
+        objs.push(w.released(&format!("k{i}"), 100 + i).await);
+    }
+    w.bridge()
+        .catalog
+        .sql
+        .exec("UPDATE scrub_state SET last_incident = '[\"alpha\"]'", &[])
+        .await
+        .unwrap();
+    w.advance_secs(31 * DAY_SECS);
+    for o in &objs {
+        w.hide(1, o, 0).await;
+    }
+    let run = w.scrub().await;
+    assert_eq!(run.incident.as_deref(), Some("beta"));
+    assert_eq!(w.state().await.blocked(), ["alpha", "beta"]);
 }

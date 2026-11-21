@@ -968,6 +968,9 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
     ) -> Result<bool> {
         scrub::record(self, token, extent, result, now, next_at).await
     }
+    async fn scrub_live(&self, extent: &ExtentId) -> Result<bool> {
+        scrub::live(self, extent).await
+    }
     async fn scrub_drop(&self, token: u64, extent: &ExtentId) -> Result<bool> {
         scrub::drop_due(self, token, extent).await
     }

@@ -14,7 +14,9 @@ use super::objects::{extent_row, ms, text, uint, Cols, Stmt, EXTENT_COLS};
 use super::uploads::guarded;
 use super::SqlCatalog;
 use crate::ports::{Guard, Sql, SqlValue};
-use crate::types::{ExtentId, Result, ScrubCandidate, ScrubResult, ScrubRun, ScrubState, UnixMs};
+use crate::types::{
+    BridgeError, ExtentId, Result, ScrubCandidate, ScrubResult, ScrubRun, ScrubState, UnixMs,
+};
 
 /// The due key of the index, word for word.
 macro_rules! due_key {
@@ -158,6 +160,20 @@ pub(super) async fn record<S: Sql>(
     Ok(changed == 1)
 }
 
+pub(super) async fn live<S: Sql>(c: &SqlCatalog<S>, extent: &ExtentId) -> Result<bool> {
+    let rows = c
+        .sql
+        .query(
+            concat!("SELECT ", live_ref!("?1")),
+            &[text(extent.as_str())],
+        )
+        .await?;
+    match rows.into_iter().next() {
+        Some(row) => Ok(Cols::new(row).num::<i64>()? != 0),
+        None => Ok(false),
+    }
+}
+
 pub(super) async fn drop_due<S: Sql>(
     c: &SqlCatalog<S>,
     token: u64,
@@ -218,10 +234,11 @@ pub(super) async fn repin<S: Sql>(
     Ok(guarded(c, stmts).await? == Guard::Applied(()))
 }
 
-/// Adds a run's totals and frees the lease. The backbone of an incident
-/// stays named (`last_incident`) until a run that checked enough extents
-/// to trip the breaker ends without tripping it: until then no loss on
-/// that backbone is repaired.
+/// Adds a run's totals and frees the lease, and stores the backbones no
+/// loss is repaired on (`last_incident`, a JSON array; NULL = none), as
+/// the run worked them out ([`ScrubRun::blocked`]). One run at a time
+/// holds the lease, so the read at its start and this write are not
+/// raced.
 pub(super) async fn end<S: Sql>(
     c: &SqlCatalog<S>,
     token: u64,
@@ -238,9 +255,7 @@ pub(super) async fn end<S: Sql>(
                bytes_read = bytes_read + ?10, last_run_at = ?1, \
                last_unrecoverable_at = CASE WHEN ?7 > 0 THEN ?1 ELSE last_unrecoverable_at END, \
                last_incident_at = CASE WHEN ?11 IS NOT NULL THEN ?1 ELSE last_incident_at END, \
-               last_incident = CASE WHEN ?11 IS NOT NULL THEN ?11 \
-                                    WHEN ?3 >= ?12 THEN NULL \
-                                    ELSE last_incident END \
+               last_incident = ?12 \
              WHERE id = 1 AND lease_token = ?2",
             &[
                 ms(now),
@@ -254,7 +269,13 @@ pub(super) async fn end<S: Sql>(
                 uint(u64::from(run.incident.is_some()))?,
                 uint(run.bytes_read)?,
                 run.incident.as_deref().map_or(SqlValue::Null, text),
-                uint(u64::from(crate::scrub::INCIDENT_MIN_EXTENTS))?,
+                match run.blocked.is_empty() {
+                    true => SqlValue::Null,
+                    false => text(
+                        &serde_json::to_string(&run.blocked)
+                            .map_err(|_| BridgeError::Invalid("backbone labels"))?,
+                    ),
+                },
             ],
         )
         .await?;
