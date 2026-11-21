@@ -13,6 +13,8 @@
 //! | `m/kc/<t>/<seq>` | a checkpoint: every subject as of chain record `seq` | by the finisher, beside the chain ([`checkpoint`]) |
 //! | `m/rk/<t>/<akid>` | a revocation; overrides every chain status | put once, after the intent, before the chain record ([`revocations`]) |
 //! | `m/kr/<akid>` | the route of an access key id to its tenant | put once, before the key's first chain record ([`routes`]) |
+//! | `m/tk/<t>/<n>.<v>` | tenant key version `n` under KEK version `v`, in the key buckets only | created in the arbiter, then copied ([`tk`]) |
+//! | `m/kl/<seq>` | the closed set of key locations | put once, exactly the next seq ([`locations`]) |
 //!
 //! # Why the chain decides
 //!
@@ -23,11 +25,15 @@
 //! [`writer`] does, and if a change whose record is written always
 //! reaches every copy, which is what [`writer::finish_keys`] does.
 
+pub mod audit;
 pub mod chain;
 pub mod checkpoint;
+pub mod escrow;
+pub mod locations;
 pub mod ports;
 pub mod record;
 pub mod revocations;
 pub mod routes;
 pub mod store;
+pub mod tk;
 pub mod writer;
