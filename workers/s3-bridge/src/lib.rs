@@ -30,7 +30,7 @@ use std::task::{Poll, Waker};
 
 use velmora_bridge::copy::Copier;
 use velmora_bridge::ingress;
-use velmora_bridge::jobmsg::Admission;
+use velmora_bridge::jobmsg::{Admission, Disposition, FormatCount, REFUSED_RETRY_DELAY_SECS};
 use velmora_bridge::keepalive;
 use velmora_bridge::{
     BridgeError, Job, JobOutcome, OutboxStage, RespBody, S3Response, UnixMs, JOB_VERSION,
@@ -244,6 +244,11 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
     Ok(out)
 }
 
+thread_local! {
+    /// The formats of the job messages this isolate read (`jobmsg::FormatCount`).
+    static FORMATS: std::cell::RefCell<FormatCount> = std::cell::RefCell::new(FormatCount::default());
+}
+
 #[event(queue)]
 async fn queue(batch: MessageBatch<serde_json::Value>, env: Env, _ctx: Context) -> Result<()> {
     // What an operator has to see of a job: a failed full read of a
@@ -259,29 +264,38 @@ async fn queue(batch: MessageBatch<serde_json::Value>, env: Env, _ctx: Context) 
     };
     log_budget(&bridge);
     for msg in batch.messages()? {
-        let (scope, job) = match velmora_bridge::jobmsg::admit(msg.body()) {
-            Admission::Run { scope, job, .. } => (scope, job),
-            Admission::Malformed => {
+        let admission = velmora_bridge::jobmsg::admit(msg.body());
+        let now = velmora_bridge::ports::Clock::now(&bridge.clock);
+        if let Some(line) = FORMATS.with(|count| count.borrow_mut().count(&admission, now)) {
+            console_log!("{line}");
+        }
+        match admission.disposition() {
+            Disposition::Run => {}
+            Disposition::Drop => {
                 // A job only names an outbox row; the dispatcher re-drives it.
                 console_error!("malformed job message dropped");
                 msg.ack();
                 continue;
             }
-            Admission::Refused(why) => {
+            Disposition::Refuse => {
                 // Never run, never dropped in silence: handed back until
                 // its deliveries are used up, so that it reaches the
                 // dead-letter queue, which pages.
-                console_error!(
-                    "alert: job message refused ({}): to the dead-letter queue",
-                    why.code()
-                );
+                let why = match &admission {
+                    Admission::Refused(why) => why.code(),
+                    _ => "-",
+                };
+                console_error!("alert: job message refused ({why}): to the dead-letter queue");
                 msg.retry_with_options(
                     &QueueRetryOptionsBuilder::new()
-                        .with_delay_seconds(0)
+                        .with_delay_seconds(REFUSED_RETRY_DELAY_SECS)
                         .build(),
                 );
                 continue;
             }
+        }
+        let Admission::Run { scope, job, .. } = admission else {
+            continue;
         };
         let outcome = match &job {
             // Never through `run_job`, which reads the catalogue. A job
