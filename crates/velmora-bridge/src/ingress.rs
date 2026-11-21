@@ -66,9 +66,24 @@ pub const TURN_WAIT_MS: u32 = 5_000;
 /// the store's writer has queued and not yet sent (one waiting and one
 /// under way). That is six; a request holds up to 1.5 bytes per byte it
 /// charges (see [`ByteBudget`]), so eight chunks charged cover twelve
-/// held. The body chunk being decoded is the runtime's, a few KiB, and is
-/// not counted here or for a body held whole.
+/// held.
+///
+/// The body item being decoded is the runtime's and is counted neither
+/// here nor for a body held whole. The six chunks of slack cover it and
+/// its copy up to [`STREAM_ITEM_ALLOWANCE`] each. A deployed Worker gets
+/// its request body in items of 4 KiB (measured: 4,097 items for a part
+/// of 16 MiB, 257 for 1 MiB). Whoever makes those items bigger, by
+/// reading the body in larger pieces, has to raise this charge with
+/// them.
 pub const STREAM_CHARGE_BYTES: u64 = 8 * CIPHER_CHUNK_SIZE;
+
+/// The largest body item (see [`STREAM_CHARGE_BYTES`]) the charge of a
+/// streamed upload still covers, held twice: 128 KiB.
+pub const STREAM_ITEM_ALLOWANCE: u64 = 2 * PLAIN_CHUNK_SIZE;
+// Six sealed chunks and two such items fit in what eight charged chunks
+// may hold (1.5 bytes per byte charged).
+const _: () =
+    assert!(6 * CIPHER_CHUNK_SIZE + 2 * STREAM_ITEM_ALLOWANCE <= STREAM_CHARGE_BYTES / 2 * 3);
 
 /// Longest accepted `Content-Length` value (digits). `u64::MAX` has 20.
 const MAX_LENGTH_DIGITS: usize = 20;
