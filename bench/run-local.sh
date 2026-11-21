@@ -118,11 +118,10 @@ OUT=$(cd -- "$OUT" && pwd)
 if [[ -n $CPU ]]; then
   [[ -f $CPU ]] || { log "FAILED: --cpu $CPU: no such file"; exit 1; }
   CPU=$(realpath -- "$CPU")
+  case $CPU in "$OUT/results.json" | "$OUT/results.md") log "FAILED: --cpu is this run's own report"; exit 1 ;; esac
   # Checked before the run, not after it has replaced the measurements.
   python3 -I "$HERE/report.py" --check-cpu "$CPU" || { log "FAILED: --cpu $CPU"; exit 1; }
 fi
-# A report from an earlier run here must not sit beside new measurements.
-rm -f "$OUT/results.json" "$OUT/results.md"
 log "measuring $NAME ($SRC) into $OUT${BV_KEYS:+ with BENCH_VARS keys $BV_KEYS}"
 
 # Pinned wrangler (local D1 runtime), installed once per lockfile: runs of
@@ -157,6 +156,9 @@ t=$(date +%s)
   cargo test -q -p velmora-bridge --test bench_counts -- --ignored --exact bench_counts_full >"$OUT/cargo.log" 2>&1
 ) || { tail -n 40 "$OUT/cargo.log" >&2; log "FAILED: the native run (log: $OUT/cargo.log)"; exit 1; }
 log "native run done in $(($(date +%s) - t)) s"
+# New measurements are in: a report from an earlier run here must not sit
+# beside them. (A run refused before this point leaves the old one.)
+rm -f "$OUT/results.json" "$OUT/results.md"
 
 t=$(date +%s)
 D1_WORK=$(mktemp -d "$WORK/d1.XXXXXX")
