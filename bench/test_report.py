@@ -115,7 +115,10 @@ class ReportRun(unittest.TestCase):
         out = good.parent / "compare.md"
         report.main(["--compare", str(good), str(bad), "--out", str(out)])
         text = out.read_text()
-        self.assertIn("the model totals of fixture are not valid: the rows-written check FAILED (2 rows apart, allowed 1)", text)
+        self.assertIn(
+            "the model totals of fixture (B, second column) are not valid: the rows-written check FAILED (2 rows apart, allowed 1)",
+            text,
+        )
         self.assertEqual(text.count("rows-written check FAILED"), 1)
 
 

@@ -378,9 +378,9 @@ def compare(a_dir, b_dir, out):
         va, vb = ra["model"][k], rb["model"][k]
         ch = f"{(vb - va) / va * 100:+.1f}%" if va else ("" if va == vb else "new")
         L.append(f"| model {k} | {va:.3f} | {vb:.3f} | {ch} |")
-    for r in (ra, rb):
+    for side, r in (("A, first column", ra), ("B, second column", rb)):
         if r["model"].get("not_valid"):
-            L.append(f"| note | | | the model totals of {r['name']} are not valid: {r['model']['not_valid']} |")
+            L.append(f"| note | | | the model totals of {r['name']} ({side}) are not valid: {r['model']['not_valid']} |")
     for name in stale:
         L.append(
             f"| note | | | the model totals of {name} price the native meter's rows written, "
