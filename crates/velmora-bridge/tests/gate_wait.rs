@@ -336,6 +336,21 @@ impl World {
         self.worker(owner, PermitMode::Gate, true, providers)
     }
 
+    /// The same, where the invocation that calls reads the time on a
+    /// clock as many milliseconds behind the gate's as the cell says.
+    fn behind(self: &Rc<Self>, providers: &[ProviderConfig]) -> (SqlCatalog<Db>, Rc<Cell<i64>>) {
+        let behind = Rc::new(Cell::new(0_i64));
+        let clock = {
+            let (w, behind) = (self.clone(), behind.clone());
+            move || UnixMs(w.now().0 - behind.get())
+        };
+        let (mode, one) = (PermitMode::Gate, GateSharding::One);
+        let wire = Wire(self.clone(), "isolate".to_string());
+        let client = GateClient::new(wire, clock, mode, one, 1, providers);
+        let gate = client.with_push(true).into_gate();
+        (SqlCatalog::with_gate(self.db.clone(), gate), behind)
+    }
+
     /// Slots the gate has handed out on `provider` and that are live.
     async fn held(&self, provider: &str) -> u32 {
         self.hear().await;
@@ -1260,16 +1275,7 @@ async fn a_slot_from_the_line_is_kept_from_a_call_whose_clock_is_behind() {
     for ms in [1, 40, 5_000] {
         let w = World::new();
         let p = provider("p", 3);
-        let providers = [p.clone()];
-        let behind = Rc::new(Cell::new(0_i64));
-        let clock = {
-            let (w, behind) = (w.clone(), behind.clone());
-            move || UnixMs(w.now().0 - behind.get())
-        };
-        let (mode, one) = (PermitMode::Gate, GateSharding::One);
-        let wire = Wire(w.clone(), "isolate".to_string());
-        let client = GateClient::new(wire, clock, mode, one, 1, &providers);
-        let c = SqlCatalog::with_gate(w.db.clone(), client.with_push(true).into_gate());
+        let (c, behind) = w.behind(core::slice::from_ref(&p));
         let first = take(&c, &w, &p, JOB, "job-1").await.unwrap();
         let second = take(&c, &w, &p, JOB, "job-2").await.unwrap();
         let (sleep, on) = (w.sleeper(), [&p]);
@@ -1287,6 +1293,36 @@ async fn a_slot_from_the_line_is_kept_from_a_call_whose_clock_is_behind() {
         assert_eq!((w.sessions(), w.held("p").await), (2, 2), "{ms} ms");
         c.release_permit(&got).await.unwrap();
         c.release_permit(&first).await.unwrap();
+        assert_eq!((w.sessions(), w.held("p").await), (0, 0), "{ms} ms");
+    }
+}
+
+/// A job that begins to wait with a clock that is behind leaves the
+/// sessions of the jobs that hold the slots: they renew and give back
+/// on them, and the slot given back comes to the job that waits.
+#[tokio::test]
+async fn a_wait_begun_with_a_clock_behind_leaves_the_sessions_of_others() {
+    for ms in [1, 40, 5_000] {
+        let w = World::new();
+        let p = provider("p", 3);
+        let (c, behind) = w.behind(core::slice::from_ref(&p));
+        let first = take(&c, &w, &p, JOB, "job-1").await.unwrap();
+        let second = take(&c, &w, &p, JOB, "job-2").await.unwrap();
+        let (sleep, on) = (w.sleeper(), [&p]);
+        behind.set(ms);
+        let mut waits = wait(&c, &on, "job-3", 60_000, &sleep);
+        assert_eq!(turn(&mut waits), None);
+        behind.set(0);
+        assert_eq!((w.sessions(), w.held("p").await), (3, 2), "{ms} ms");
+        assert!(c.renew_permit(&first, w.now()).await.unwrap(), "{ms} ms");
+        assert!(c.renew_permit(&second, w.now()).await.unwrap(), "{ms} ms");
+        c.release_permit(&first).await.unwrap();
+        assert_eq!(turn(&mut waits), Some(SlotWait::Granted), "{ms} ms");
+        drop(waits);
+        c.release_permit(&second).await.unwrap();
+        assert_eq!((w.sessions(), w.held("p").await), (1, 1), "{ms} ms");
+        let got = take(&c, &w, &p, JOB, "job-3").await.unwrap();
+        c.release_permit(&got).await.unwrap();
         assert_eq!((w.sessions(), w.held("p").await), (0, 0), "{ms} ms");
     }
 }
