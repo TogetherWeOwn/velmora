@@ -282,10 +282,8 @@ where
             Ok(begun) => begun,
             Err(e) => {
                 let now = self.clock.now();
-                let _ = self
-                    .catalog
-                    .scrub_end(token, &ScrubRun::default(), now)
-                    .await;
+                // The lease only: the incidents and totals stay as they are.
+                let _ = self.catalog.scrub_free(token, now).await;
                 crate::trace::scrub_run(|| "ended=stopped before the first extent".to_owned());
                 return Err(e);
             }
@@ -776,11 +774,29 @@ where
             fresh = expired;
         }
         // A kept session of another backbone that could run out of its
-        // slot while this one is asked (one call at most) is ended first.
-        let call_ms = i64::from(PermitClass::Background.call_secs()) * 1000;
+        // slot while this one is asked is ended first. This one is asked
+        // in one call of the class of its session: the one kept for it,
+        // else the class a new one would take first. Its own sessions are
+        // renewed as they are used.
+        let mine =
+            |s: &ProviderSession<'s, C, N, T>| providers.iter().any(|p| p.id == s.provider.id);
+        let class = stats
+            .iter()
+            .find(|s| mine(s))
+            .map(|s| s.permit().class)
+            .unwrap_or_else(|| {
+                match providers
+                    .iter()
+                    .any(|p| p.drill_conns > self.cfg.scrub.sockets)
+                {
+                    true => PermitClass::Drill,
+                    false => PermitClass::Background,
+                }
+            });
+        let call_ms = i64::from(class.call_secs()) * 1000;
         let (short, kept): (Vec<_>, Vec<_>) = core::mem::take(stats)
             .into_iter()
-            .partition(|s| i64::from(s.idle_ms()) <= call_ms);
+            .partition(|s| !mine(s) && i64::from(s.idle_ms()) <= call_ms);
         *stats = kept;
         ProviderSession::close_all(short).await;
         let mut order = pool.order(fresh, PermitClass::Background);

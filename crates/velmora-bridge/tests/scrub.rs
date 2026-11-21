@@ -1692,3 +1692,23 @@ async fn clean_checks_count_across_runs() {
     assert_eq!(w.scrub().await.ok, 1);
     assert!(w.state().await.blocked().is_empty(), "7 + 1 clean checks");
 }
+
+/// A run that fails before its first extent gives the lease back and
+/// leaves the incidents as they were.
+#[tokio::test(flavor = "current_thread")]
+async fn a_run_that_fails_at_its_start_keeps_the_incidents() {
+    let w = world().await;
+    w.bridge()
+        .catalog
+        .sql
+        .exec("UPDATE scrub_state SET last_incident = '[\"beta\"]'", &[])
+        .await
+        .unwrap();
+    *w.bridge().catalog.sql.fail_matching.borrow_mut() =
+        Some(("SELECT lease_token, lease_until", 0));
+    assert!(w.bridge().scrub_run().await.is_err());
+    *w.bridge().catalog.sql.fail_matching.borrow_mut() = None;
+    let state = w.state().await;
+    assert_eq!(state.blocked(), ["beta"]);
+    assert_eq!(state.lease_until, None, "the lease is free");
+}

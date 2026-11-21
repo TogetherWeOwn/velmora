@@ -196,6 +196,18 @@ pub(super) async fn drop_due<S: Sql>(
     Ok(changed == 1)
 }
 
+pub(super) async fn free<S: Sql>(c: &SqlCatalog<S>, token: u64, now: UnixMs) -> Result<bool> {
+    let changed = c
+        .sql
+        .exec(
+            "UPDATE scrub_state SET lease_until = NULL, last_run_at = ?2 \
+             WHERE id = 1 AND lease_token = ?1",
+            &[uint(token)?, ms(now)],
+        )
+        .await?;
+    Ok(changed == 1)
+}
+
 pub(super) async fn block<S: Sql>(
     c: &SqlCatalog<S>,
     token: u64,
