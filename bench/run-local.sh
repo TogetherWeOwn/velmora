@@ -61,6 +61,12 @@ fi
 if writable_by_others "$WORK"; then
   log "closing $WORK to other users (chmod go-w)"; chmod go-w -- "$WORK"
 fi
+# What another user may have left there while it was open: anything near
+# the top not owned by us is refused (the run opens paths there).
+foreign=$(find "$WORK" -mindepth 1 -maxdepth 2 ! -user "$(id -u)" -print -quit 2>/dev/null)
+if [[ -n $foreign ]]; then
+  log "FAILED: $foreign in $WORK is not owned by $(id -un)"; exit 1
+fi
 WORK=$(cd -P -- "$WORK" && pwd)
 
 SRC=$REPO
