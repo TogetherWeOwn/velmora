@@ -21,11 +21,12 @@
 #   CARGO_TARGET_DIR and the other cargo variables are passed through.
 #
 # Without arguments every test target of velmora-bridge runs
-# (`--no-fail-fast --lib --tests`). The script exits with cargo's
-# status. The summary counts the databases, the calls compared, the
-# twins rebuilt after a test changed its database behind the port
-# (`with_conn`), and the twins whose rebuild failed (desynced: compared
-# up to that point only), and names the tests of those.
+# (`--no-fail-fast --lib --tests`). The script exits non-zero when cargo
+# does, and also on any divergence, any twin it could not reach, and any
+# twin that stopped being compared for a reason other than a state with
+# broken foreign keys. The summary counts the databases, the calls
+# compared, the twins rebuilt after a test changed its database behind
+# the port (`with_conn`), and names the tests whose twin stopped.
 
 set -euo pipefail
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -118,16 +119,31 @@ VELMORA_SQL_SHADOW_LOG="$RUN/shadow.log" \
   cargo test -p velmora-bridge "$@" 2>&1 | tee "$RUN/cargo.log" || status=$?
 
 touch "$RUN/shadow.log"
+# Lines of the twin log: DIVERGENCE / UNREACHABLE (written when they
+# happen, so a panic that a test's own task swallowed still counts), and
+# one line per database: test, twin, calls compared, status (in-sync,
+# desynced:<reason>, diverged), rebuilds, plain EXPLAINs skipped.
+DB_LINES=$(grep -Ev '^(DIVERGENCE|UNREACHABLE)' "$RUN/shadow.log" || true)
+divergences=$(grep -c '^DIVERGENCE' "$RUN/shadow.log" || true)
+unreachable=$(grep -c '^UNREACHABLE' "$RUN/shadow.log" || true)
+# A twin may stop only at a state that breaks a foreign key (a state D1
+# and a Durable Object both refuse); any other stop fails the run.
+bad_desync=$(printf '%s\n' "$DB_LINES" | awk -F'\t' '$4 ~ /^desynced:/ && $4 != "desynced:fk-broken"' | wc -l)
+if [ "$divergences" -gt 0 ] || [ "$unreachable" -gt 0 ] || [ "$bad_desync" -gt 0 ]; then
+  [ "$status" -ne 0 ] || status=3
+fi
 {
   echo "UNIT SUITE SUMMARY"
   echo "workerd: $("$WORKERD" --version) x $INSTANCES; primary: $PRIMARY; args: $*"
   grep -E '^test result:' "$RUN/cargo.log" | awk '{p+=$4; f+=$6; i+=$8} END {printf "tests: %d passed, %d failed, %d ignored\n", p, f, i}'
-  awk -F'\t' '{n++; c+=$3; r+=$5} $5>0{rb++} $4=="desynced"{d++} END {printf "databases: %d; calls compared: %d; rebuilt after a change behind the port: %d databases, %d rebuilds; desynced: %d\n", n, c, rb+0, r+0, d+0}' "$RUN/shadow.log"
-  echo "divergences: $(grep -c 'SHADOW DIVERGENCE' "$RUN/cargo.log" || true)"
-  echo "tests with a desynced database:"
-  awk -F'\t' '$4=="desynced"{print "  " $1}' "$RUN/shadow.log" | sort | uniq -c
+  printf '%s\n' "$DB_LINES" | awk -F'\t' 'NF>=4 {n++; c+=$3; r+=$5; k+=$6} NF>=4 && $5>0 {rb++} END {printf "databases: %d; calls compared: %d; plain EXPLAINs skipped: %d; rebuilt after a change behind the port: %d databases, %d rebuilds\n", n, c, k, rb+0, r+0}'
+  echo "divergences: $divergences; twin unreachable: $unreachable"
+  echo "twins stopped at a state with broken foreign keys (allowed):"
+  printf '%s\n' "$DB_LINES" | awk -F'\t' '$4=="desynced:fk-broken"{print "  " $1}' | sort | uniq -c
+  echo "twins stopped for any other reason (fail the run): $bad_desync"
+  printf '%s\n' "$DB_LINES" | awk -F'\t' '$4 ~ /^desynced:/ && $4 != "desynced:fk-broken" {print "  " $1 " " $4}' | sort | uniq -c
   echo "failed tests:"
   grep -E '^test .* FAILED$' "$RUN/cargo.log" | sed 's/^/  /' || true
-  echo "cargo exit status: $status"
+  echo "exit status: $status"
 } | tee ${SUITE_REPORT:+"$SUITE_REPORT"}
 exit "$status"

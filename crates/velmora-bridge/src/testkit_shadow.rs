@@ -52,10 +52,13 @@ pub(crate) struct Shadow {
     host: String,
     path: String,
     primary_do: bool,
-    conn: RefCell<Option<BufReader<TcpStream>>>,
     compared: Cell<u64>,
+    /// Plain `EXPLAIN` answers: engine bytecode, not compared.
+    skipped: Cell<u64>,
     rebuilds: Cell<u64>,
-    desynced: Cell<bool>,
+    /// Why the twin stopped being compared, if it did.
+    desynced: RefCell<Option<String>>,
+    diverged: Cell<bool>,
     log: Option<String>,
 }
 
@@ -79,9 +82,13 @@ impl Shadow {
             .map(str::trim)
             .filter(|b| !b.is_empty())
             .collect();
+        assert!(
+            !bases.is_empty(),
+            "VELMORA_SQL_SHADOW is set but names no URL"
+        );
         let n = NEXT_ID.fetch_add(1, Ordering::Relaxed);
         // Several workerd processes share the load, one database each.
-        let base = bases.get(n as usize % bases.len().max(1))?;
+        let base = bases[n as usize % bases.len()];
         let host = base
             .trim_end_matches('/')
             .strip_prefix("http://")
@@ -100,10 +107,11 @@ impl Shadow {
             host,
             path: format!("/db/{id}"),
             primary_do: std::env::var("VELMORA_SQL_SHADOW_PRIMARY").as_deref() == Ok("do"),
-            conn: RefCell::new(None),
             compared: Cell::new(0),
+            skipped: Cell::new(0),
             rebuilds: Cell::new(0),
-            desynced: Cell::new(false),
+            desynced: RefCell::new(None),
+            diverged: Cell::new(false),
             log: std::env::var("VELMORA_SQL_SHADOW_LOG").ok(),
         })
     }
@@ -111,31 +119,42 @@ impl Shadow {
     /// Makes the twin equal to `conn` again after a change behind the
     /// port; on failure the twin is desynced.
     pub(crate) fn rebuild(&self, conn: &rusqlite::Connection) {
-        if self.desynced.get() {
+        if self.is_desynced() {
             return;
         }
         // A Durable Object cannot hold rows that break a foreign key: it
         // resets itself when its transaction ends with one. A test that
         // switched the keys off and left such rows has a state D1 and an
-        // object both refuse, and the twin stops there.
-        let Some(body) = dump(conn) else {
-            self.desynced.set(true);
-            return;
+        // object both refuse, and the twin stops there. Any other reason
+        // to stop fails the run (run-suite.sh).
+        let body = match dump(conn) {
+            Ok(body) => body,
+            Err(reason) => return self.desync(reason),
         };
-        let reply = self.post(&body.to_string()).ok();
-        let applied = reply
-            .and_then(|r| serde_json::from_str::<Value>(&r).ok())
-            .is_some_and(|v| v.get("ok").is_some());
-        if applied {
-            self.rebuilds.set(self.rebuilds.get() + 1);
-        } else {
-            *self.conn.borrow_mut() = None;
-            self.desynced.set(true);
+        let reply = match self.post(&body.to_string()) {
+            Ok(reply) => reply,
+            Err(e) => return self.desync(format!("rebuild-unreachable:{}", e.kind())),
+        };
+        match serde_json::from_str::<Value>(&reply) {
+            Ok(v) if v.get("ok").is_some() => self.rebuilds.set(self.rebuilds.get() + 1),
+            Ok(v) => self.desync(format!(
+                "rebuild-refused:{}",
+                v.get("class").and_then(Value::as_str).unwrap_or("?")
+            )),
+            Err(_) => self.desync("rebuild-unreadable".into()),
         }
     }
 
+    fn is_desynced(&self) -> bool {
+        self.desynced.borrow().is_some()
+    }
+
+    fn desync(&self, reason: String) {
+        *self.desynced.borrow_mut() = Some(reason);
+    }
+
     pub(crate) fn apply(&self, script: &str) {
-        if self.desynced.get() {
+        if self.is_desynced() {
             return;
         }
         let answer = self.call(json!({"op": "apply", "script": script}), |_| {
@@ -150,7 +169,7 @@ impl Shadow {
         params: &[SqlValue],
         local: Result<Vec<Row>>,
     ) -> Result<Vec<Row>> {
-        if self.desynced.get() {
+        if self.is_desynced() {
             return local;
         }
         let remote = self.call(
@@ -164,12 +183,13 @@ impl Shadow {
         self.check("query", sql, params, &mine, &remote);
         match (self.primary_do, remote) {
             (true, Answer::Rows(rows)) => Ok(rows),
+            (true, Answer::Sql(class)) => Err(BridgeError::Sql(class)),
             _ => local,
         }
     }
 
     pub(crate) fn exec(&self, sql: &str, params: &[SqlValue], local: Result<u64>) -> Result<u64> {
-        if self.desynced.get() {
+        if self.is_desynced() {
             return local;
         }
         let remote = self.call(
@@ -183,6 +203,7 @@ impl Shadow {
         self.check("exec", sql, params, &mine, &remote);
         match (self.primary_do, remote) {
             (true, Answer::Changed(n)) => Ok(n),
+            (true, Answer::Sql(class)) => Err(BridgeError::Sql(class)),
             _ => local,
         }
     }
@@ -192,7 +213,7 @@ impl Shadow {
         stmts: &[(&'static str, Vec<SqlValue>)],
         local: Result<Vec<u64>>,
     ) -> Result<Vec<u64>> {
-        if self.desynced.get() {
+        if self.is_desynced() {
             return local;
         }
         let list: Vec<Value> = stmts
@@ -219,16 +240,26 @@ impl Shadow {
         self.check("batch", &text, &[], &mine, &remote);
         match (self.primary_do, remote) {
             (true, Answer::Batch(n)) => Ok(n),
+            (true, Answer::Sql(class)) => Err(BridgeError::Sql(class)),
             _ => local,
         }
     }
 
     fn check(&self, op: &str, sql: &str, params: &[SqlValue], mine: &Answer, theirs: &Answer) {
         let same = match (mine, theirs) {
-            (Answer::Sql(_), Answer::Sql(_)) => true,
+            // Errors are compared by class, the class the adapters give
+            // (`<store>: constraint violation`, `<store>: statement
+            // failed`): the message text is each engine's own.
+            (Answer::Sql(a), Answer::Sql(b)) => error_class(a) == error_class(b),
             // A connection's own counters (`total_changes()`) differ
             // between two databases; only their differences are used.
             (Answer::Rows(_), Answer::Rows(_)) if engine_counter(sql) => true,
+            // A plain EXPLAIN lists the engine's bytecode, which differs
+            // between two SQLite builds: counted as skipped.
+            (Answer::Rows(_), Answer::Rows(_)) if is_bytecode_explain(sql) => {
+                self.skipped.set(self.skipped.get() + 1);
+                return;
+            }
             // A query plan's node ids are the engine's own; its text is
             // what a test reads.
             (Answer::Rows(a), Answer::Rows(b)) if is_explain(sql) => {
@@ -240,23 +271,37 @@ impl Shadow {
             (a, b) => a == b,
         };
         if !same {
-            panic!(
+            let report = format!(
                 "SHADOW DIVERGENCE ({op}) on {}\n  sql: {sql}\n  params: {params:?}\n  sqlite: {mine:?}\n  durable object: {theirs:?}",
                 self.path
             );
+            // A panic inside a task a test spawned can be swallowed, so
+            // the divergence is written down before it is raised.
+            self.diverged.set(true);
+            self.append(&format!("DIVERGENCE\t{}\n", report.replace('\n', " | ")));
+            panic!("{report}");
         }
         self.compared.set(self.compared.get() + 1);
+    }
+
+    fn append(&self, line: &str) {
+        let Some(log) = &self.log else { return };
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log)
+        {
+            let _ = f.write_all(line.as_bytes());
+        }
     }
 
     /// One request to the twin; the answer's `ok` is read with `ok`.
     fn call(&self, body: Value, ok: impl FnOnce(&Value) -> Answer) -> Answer {
         let body = body.to_string();
         let reply = self.post(&body).unwrap_or_else(|e| {
-            // One retry on a fresh connection: a kept connection may have
-            // been closed by the server.
-            *self.conn.borrow_mut() = None;
-            self.post(&body)
-                .unwrap_or_else(|_| panic!("shadow unreachable at {}: {e}", self.host))
+            self.diverged.set(true);
+            self.append(&format!("UNREACHABLE\t{}\t{e}\n", self.path));
+            panic!("shadow unreachable at {}: {e}", self.host)
         });
         let reply: Value = serde_json::from_str(&reply).expect("shadow answer is JSON");
         if let Some(v) = reply.get("ok") {
@@ -275,16 +320,28 @@ impl Shadow {
         }
     }
 
+    /// One request on a connection of its own, so that nothing is ever
+    /// sent twice: only a failed connect is tried again.
     fn post(&self, body: &str) -> std::io::Result<String> {
-        let mut slot = self.conn.borrow_mut();
-        if slot.is_none() {
-            let stream = TcpStream::connect(&self.host)?;
-            stream.set_nodelay(true)?;
-            *slot = Some(BufReader::new(stream));
-        }
-        let reader = slot.as_mut().expect("connection");
+        let mut tries = 0;
+        let stream = loop {
+            match TcpStream::connect(&self.host) {
+                Ok(stream) => break stream,
+                Err(e) if tries < 5 => {
+                    tries += 1;
+                    let _ = e;
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                }
+                Err(e) => return Err(e),
+            }
+        };
+        stream.set_nodelay(true)?;
+        let limit = Some(std::time::Duration::from_secs(120));
+        stream.set_read_timeout(limit)?;
+        stream.set_write_timeout(limit)?;
+        let mut reader = BufReader::new(stream);
         let head = format!(
-            "POST {} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+            "POST {} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
             self.path,
             self.host,
             body.len()
@@ -293,36 +350,32 @@ impl Shadow {
         stream.write_all(head.as_bytes())?;
         stream.write_all(body.as_bytes())?;
         stream.flush()?;
-        read_response(reader)
+        read_response(&mut reader)
     }
 }
 
 impl Drop for Shadow {
     fn drop(&mut self) {
-        let Some(log) = &self.log else { return };
         let test = std::thread::current()
             .name()
             .unwrap_or("unnamed")
             .to_string();
+        let status = match (self.diverged.get(), self.desynced.borrow().as_deref()) {
+            (true, _) => "diverged".to_string(),
+            (false, Some(reason)) => format!("desynced:{reason}"),
+            (false, None) => "in-sync".to_string(),
+        };
+        // test, twin, calls compared, status, rebuilds, skipped
         let line = format!(
-            "{}\t{}\t{}\t{}\t{}\n",
+            "{}\t{}\t{}\t{}\t{}\t{}\n",
             test,
             self.path,
             self.compared.get(),
-            if self.desynced.get() {
-                "desynced"
-            } else {
-                "in-sync"
-            },
-            self.rebuilds.get()
+            status,
+            self.rebuilds.get(),
+            self.skipped.get()
         );
-        if let Ok(mut f) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(log)
-        {
-            let _ = f.write_all(line.as_bytes());
-        }
+        self.append(&line);
     }
 }
 
@@ -371,6 +424,40 @@ fn read_response(reader: &mut BufReader<TcpStream>) -> std::io::Result<String> {
         reader.read_exact(&mut body)?;
     }
     String::from_utf8(body).map_err(|_| bad("utf-8"))
+}
+
+/// `EXPLAIN` without `QUERY PLAN`: the bytecode listing.
+fn is_bytecode_explain(sql: &str) -> bool {
+    let words: Vec<String> = sql
+        .split_whitespace()
+        .take(2)
+        .map(str::to_ascii_uppercase)
+        .collect();
+    words.first().is_some_and(|w| w == "EXPLAIN") && words.get(1).is_none_or(|w| w != "QUERY")
+}
+
+/// The class of an error as the adapters give it: the tx_guard is not
+/// here (it is `GuardFailed`); a constraint, any other statement
+/// failure, and the adapters' own refusals of a value by their message.
+fn error_class(message: &str) -> String {
+    let own = [
+        "too many bound parameters",
+        "bound value too large",
+        "do: integer outside JS safe range",
+        "do: number is not a safe integer",
+        "do: named parameter",
+        "do: placeholder number",
+        "do: more than one statement",
+        "do: unexpected result shape",
+    ];
+    if let Some(o) = own.iter().find(|o| message.starts_with(*o)) {
+        return (*o).to_string();
+    }
+    if message.contains("constraint failed") || message.ends_with("constraint violation") {
+        "constraint".into()
+    } else {
+        "statement".into()
+    }
 }
 
 fn is_explain(sql: &str) -> bool {
@@ -441,14 +528,18 @@ fn decode_value(v: &Value) -> SqlValue {
 /// the order they were made, their rows in rowid order (with the rowid,
 /// for a rowid table), then the indexes and the triggers. `None` if the
 /// database cannot be read.
-fn dump(conn: &rusqlite::Connection) -> Option<Value> {
+fn dump(conn: &rusqlite::Connection) -> std::result::Result<Value, String> {
+    dump_rows(conn).ok_or_else(|| "rebuild-unreadable".to_string())?
+}
+
+fn dump_rows(conn: &rusqlite::Connection) -> Option<std::result::Result<Value, String>> {
     let broken = conn
         .prepare("SELECT count(*) FROM pragma_foreign_key_check")
         .ok()?
         .query_row([], |r| r.get::<_, i64>(0))
         .ok()?;
     if broken > 0 {
-        return None;
+        return Some(Err("fk-broken".into()));
     }
     let mut objects = conn
         .prepare(
@@ -502,5 +593,5 @@ fn dump(conn: &rusqlite::Connection) -> Option<Value> {
     }
     stmts.extend(rows);
     stmts.extend(later);
-    Some(json!({"op": "rebuild", "stmts": stmts}))
+    Some(Ok(json!({"op": "rebuild", "stmts": stmts})))
 }

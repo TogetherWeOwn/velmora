@@ -68,13 +68,13 @@ export function pitrAt(storage, unixMs) {
   return storage.getBookmarkForTime(unixMs);
 }
 
-export function pitrRestoreOnNextSession(storage, bookmark) {
-  return storage.onNextSessionRestoreBookmark(bookmark);
-}
-
-// Ends the object's session once the current call has returned to the
-// runtime: `abort()` throws by design, and a throw that passes through
-// the wasm module would leave it mid-call.
-export function pitrRestart(state) {
-  queueMicrotask(() => state.abort("point-in-time restore"));
+// Arms the restore and ends the object's session in one step, so that a
+// restore is never armed without the restart that applies it. The
+// request that asks for it does not get an answer: `abort()` resets the
+// object, and the next request starts it from `bookmark`. The caller
+// takes `getCurrentBookmark()` first and keeps it outside the object:
+// that bookmark undoes the restore.
+export async function pitrRestoreNow(state, storage, bookmark) {
+  await storage.onNextSessionRestoreBookmark(bookmark);
+  state.abort("point-in-time restore");
 }

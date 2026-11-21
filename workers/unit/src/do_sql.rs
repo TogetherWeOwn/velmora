@@ -8,12 +8,13 @@
 //!
 //! Value mapping:
 //! - `Null` <-> JS `null` (`undefined` reads as `Null` too).
-//! - `Int` -> JS number, **bound through `CAST(?N AS INTEGER)`**. The
+//! - `Int` -> JS number, **bound through `+CAST(?N AS INTEGER)`**. The
 //!   runtime binds every JS number as a SQLite REAL, so an integer bound
 //!   plainly would be stored as `7.0` in a TEXT column, divide as a
 //!   fraction (`?/2` of 5 is 2.5) and print as `5.0` in `json_array`.
 //!   [`bind_text`] wraps every placeholder whose value is an `Int`, so
-//!   SQLite sees the integer that a native binding gives. Only integers
+//!   SQLite sees the integer that a native binding gives, without the
+//!   affinity a bare `CAST` would add. Only integers
 //!   in `±(2^53 - 1)` are bound; others are refused before the call.
 //! - `Int` <- JS number. A returned number that is fractional or outside
 //!   `±(2^53 - 1)` is a decode error: the runtime rounds a larger
@@ -24,8 +25,9 @@
 //!
 //! Errors: a failure whose text is the `tx_guard` CHECK
 //! ([`velmora_bridge::is_tx_guard_violation`]) is `GuardFailed`. Every
-//! other failure is `BridgeError::Sql` with a class only: no SQL text,
-//! parameter or database message leaves the adapter.
+//! other failure is `BridgeError::Sql` with a class only, the classes of
+//! the D1 adapter (`do: constraint violation`, `do: statement failed`):
+//! no SQL text, parameter or database message leaves the adapter.
 
 use std::borrow::Cow;
 
@@ -86,8 +88,13 @@ impl DoSql {
     /// Comments after the last statement are dropped first: the runtime
     /// refuses a script whose last part holds no statement ("SQL code did
     /// not contain a statement"), and migration 0017 ends in a comment.
+    /// A script of comments alone runs nothing.
     pub fn apply(&self, script: &str) -> Result<()> {
-        do_apply(&self.storage, &script[..significant_end(script)]).map_err(map_err)
+        let end = significant_end(script);
+        if end == 0 {
+            return Ok(());
+        }
+        do_apply(&self.storage, &script[..end]).map_err(map_err)
     }
 
     /// Size of the database in bytes, as the runtime reports it.
@@ -144,32 +151,44 @@ impl Sql for DoSql {
     }
 }
 
-/// The statement text the runtime is given: `sql` with every placeholder
-/// whose bound value is an [`SqlValue::Int`] wrapped in
-/// `CAST(?N AS INTEGER)`, and every bare `?` given its number. Without
-/// an `Int` parameter the text is returned as it is.
-///
-/// Placeholders are found as SQLite finds them: `?` and `?NNN`, outside
-/// string literals (`'…'`, with `x'…'` blobs), quoted identifiers
-/// (`"…"`, `` `…` ``, `[…]`) and comments (`--…` and `/*…*/`). A bare `?`
-/// takes the number one above the largest assigned before it. Named
-/// parameters (`:a`, `@a`, `$a`) are refused: no catalogue statement
-/// uses them, and their numbers would need the statement's parse.
-pub fn bind_text<'a>(sql: &'a str, params: &[SqlValue]) -> Result<Cow<'a, str>> {
-    if !params.iter().any(|p| matches!(p, SqlValue::Int(_))) {
-        return Ok(Cow::Borrowed(sql));
-    }
+/// What [`lex`] finds in a statement.
+struct Lexed {
+    /// Every placeholder: its byte range and its number.
+    placeholders: Vec<(usize, usize, usize)>,
+    /// The end of the last part that is neither white space nor a comment.
+    significant_end: usize,
+    /// A `;` outside quotes and comments with a statement after it.
+    second_statement: bool,
+}
+
+/// Bytes that may continue an identifier (SQLite: letters, digits, `_`,
+/// `$`, and every byte of a character outside ASCII).
+fn ident_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_' || b == b'$' || b >= 0x80
+}
+
+/// Reads `sql` as SQLite's tokenizer does, far enough to find its
+/// placeholders, its last significant byte and a second statement:
+/// string literals (`'…'`, with `x'…'` blobs), quoted identifiers (`"…"`,
+/// `` `…` ``, `[…]`) and comments (`--…`, `/*…*/`) hold no placeholder.
+/// A bare `?` takes the number one above the largest assigned before it.
+/// A named parameter (`:a`, `@a`, `$a`: a sigil that starts a token) is
+/// refused: no catalogue statement uses one, and its number would need
+/// the statement's parse.
+fn lex(sql: &str) -> Result<Lexed> {
     let bytes = sql.as_bytes();
-    let mut out = String::with_capacity(sql.len() + 24 * params.len());
-    let mut copied = 0;
+    let mut placeholders = Vec::new();
     let mut largest = 0usize;
+    let mut significant_end = 0;
+    let mut after_semicolon = false;
+    let mut second_statement = false;
     let mut i = 0;
     // Skips to the end of a quoted run that `close` ends; a doubled
     // `close` is an escaped one.
     let skip_quoted = |mut j: usize, close: u8, doubled: bool| -> usize {
         while j < bytes.len() {
             if bytes[j] == close {
-                if doubled && j + 1 < bytes.len() && bytes[j + 1] == close {
+                if doubled && bytes.get(j + 1) == Some(&close) {
                     j += 2;
                     continue;
                 }
@@ -180,15 +199,13 @@ pub fn bind_text<'a>(sql: &'a str, params: &[SqlValue]) -> Result<Cow<'a, str>> 
         j
     };
     while i < bytes.len() {
+        let token_start = i;
         match bytes[i] {
-            b'\'' => i = skip_quoted(i + 1, b'\'', true),
-            b'"' => i = skip_quoted(i + 1, b'"', true),
-            b'`' => i = skip_quoted(i + 1, b'`', true),
-            b'[' => i = skip_quoted(i + 1, b']', false),
             b'-' if bytes.get(i + 1) == Some(&b'-') => {
                 while i < bytes.len() && bytes[i] != b'\n' {
                     i += 1;
                 }
+                continue;
             }
             b'/' if bytes.get(i + 1) == Some(&b'*') => {
                 i += 2;
@@ -196,16 +213,29 @@ pub fn bind_text<'a>(sql: &'a str, params: &[SqlValue]) -> Result<Cow<'a, str>> 
                     i += 1;
                 }
                 i = (i + 2).min(bytes.len());
+                continue;
             }
+            c if c.is_ascii_whitespace() => {
+                i += 1;
+                continue;
+            }
+            b';' => {
+                i += 1;
+                significant_end = i;
+                after_semicolon = true;
+                continue;
+            }
+            b'\'' => i = skip_quoted(i + 1, b'\'', true),
+            b'"' => i = skip_quoted(i + 1, b'"', true),
+            b'`' => i = skip_quoted(i + 1, b'`', true),
+            b'[' => i = skip_quoted(i + 1, b']', false),
             b':' | b'@' | b'$'
-                if bytes
-                    .get(i + 1)
-                    .is_some_and(|c| c.is_ascii_alphanumeric() || *c == b'_') =>
+                if (i == 0 || !ident_byte(bytes[i - 1]))
+                    && bytes.get(i + 1).is_some_and(|c| ident_byte(*c)) =>
             {
                 return Err(BridgeError::Sql("do: named parameter".into()));
             }
             b'?' => {
-                let start = i;
                 i += 1;
                 let digits = i;
                 while i < bytes.len() && bytes[i].is_ascii_digit() {
@@ -222,69 +252,69 @@ pub fn bind_text<'a>(sql: &'a str, params: &[SqlValue]) -> Result<Cow<'a, str>> 
                     return Err(BridgeError::Sql("do: placeholder number".into()));
                 }
                 largest = largest.max(number);
-                out.push_str(&sql[copied..start]);
-                if matches!(params.get(number - 1), Some(SqlValue::Int(_))) {
-                    out.push_str(&format!("CAST(?{number} AS INTEGER)"));
-                } else {
-                    out.push_str(&format!("?{number}"));
+                placeholders.push((token_start, i, number));
+            }
+            c if ident_byte(c) => {
+                while i < bytes.len() && ident_byte(bytes[i]) {
+                    i += 1;
                 }
-                copied = i;
             }
             _ => i += 1,
         }
+        // A significant token after a `;` begins a second statement.
+        second_statement |= after_semicolon;
+        significant_end = i;
+    }
+    Ok(Lexed {
+        placeholders,
+        significant_end,
+        second_statement,
+    })
+}
+
+/// The statement text the runtime is given: `sql` without the comments
+/// after it, with every placeholder whose bound value is an
+/// [`SqlValue::Int`] written `+CAST(?N AS INTEGER)`, and every bare `?`
+/// given its number. Without an `Int` parameter the placeholders are left
+/// as they are.
+///
+/// `CAST` makes the value an integer, as a native binding is; the unary
+/// `+` takes away the INTEGER affinity that `CAST` would give it, so a
+/// comparison with a TEXT or untyped value converts nothing, as with a
+/// native binding (`'5' = ?1` with 5 is false on both). An index on the
+/// other side of the comparison is still used.
+///
+/// One statement only: a second one after a `;` is refused, as rusqlite
+/// refuses it.
+pub fn bind_text<'a>(sql: &'a str, params: &[SqlValue]) -> Result<Cow<'a, str>> {
+    let lexed = lex(sql)?;
+    if lexed.second_statement {
+        return Err(BridgeError::Sql("do: more than one statement".into()));
+    }
+    let sql = &sql[..lexed.significant_end];
+    if !params.iter().any(|p| matches!(p, SqlValue::Int(_))) {
+        return Ok(Cow::Borrowed(sql));
+    }
+    let mut out = String::with_capacity(sql.len() + 24 * params.len());
+    let mut copied = 0;
+    for (start, end, number) in lexed.placeholders {
+        out.push_str(&sql[copied..start]);
+        if matches!(params.get(number - 1), Some(SqlValue::Int(_))) {
+            out.push_str(&format!("+CAST(?{number} AS INTEGER)"));
+        } else {
+            out.push_str(&format!("?{number}"));
+        }
+        copied = end;
     }
     out.push_str(&sql[copied..]);
     Ok(Cow::Owned(out))
 }
 
 /// The end of the last part of `sql` that is neither white space nor a
-/// comment, by the lexical rules of [`bind_text`].
+/// comment, by the rules of [`bind_text`]. A script that names a
+/// parameter ends where it ends.
 pub fn significant_end(sql: &str) -> usize {
-    let bytes = sql.as_bytes();
-    let mut end = 0;
-    let mut i = 0;
-    let close_of = |c: u8| match c {
-        b'[' => b']',
-        c => c,
-    };
-    while i < bytes.len() {
-        match bytes[i] {
-            b'-' if bytes.get(i + 1) == Some(&b'-') => {
-                while i < bytes.len() && bytes[i] != b'\n' {
-                    i += 1;
-                }
-            }
-            b'/' if bytes.get(i + 1) == Some(&b'*') => {
-                i += 2;
-                while i < bytes.len() && !(bytes[i] == b'*' && bytes.get(i + 1) == Some(&b'/')) {
-                    i += 1;
-                }
-                i = (i + 2).min(bytes.len());
-            }
-            q @ (b'\'' | b'"' | b'`' | b'[') => {
-                let close = close_of(q);
-                i += 1;
-                while i < bytes.len() {
-                    if bytes[i] == close {
-                        if q != b'[' && bytes.get(i + 1) == Some(&close) {
-                            i += 2;
-                            continue;
-                        }
-                        break;
-                    }
-                    i += 1;
-                }
-                i = (i + 1).min(bytes.len());
-                end = i;
-            }
-            c if c.is_ascii_whitespace() => i += 1,
-            _ => {
-                i += 1;
-                end = i;
-            }
-        }
-    }
-    end
+    lex(sql).map_or(sql.len(), |l| l.significant_end)
 }
 
 /// Refuses what D1 refuses, with the same messages: more than
@@ -377,7 +407,7 @@ fn map_err(e: JsValue) -> BridgeError {
     if is_tx_guard_violation(&message) {
         BridgeError::GuardFailed
     } else if message.contains("constraint failed") {
-        BridgeError::Sql("do: constraint failed".into())
+        BridgeError::Sql("do: constraint violation".into())
     } else {
         BridgeError::Sql("do: statement failed".into())
     }
@@ -412,7 +442,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             out,
-            "INSERT INTO t VALUES (CAST(?1 AS INTEGER), ?2, CAST(?3 AS INTEGER))"
+            "INSERT INTO t VALUES (+CAST(?1 AS INTEGER), ?2, +CAST(?3 AS INTEGER))"
         );
     }
 
@@ -421,7 +451,7 @@ mod tests {
         let out = bind_text("SELECT ?2, ?1, ?2 + ?1", &[text("a"), int(7)]).unwrap();
         assert_eq!(
             out,
-            "SELECT CAST(?2 AS INTEGER), ?1, CAST(?2 AS INTEGER) + ?1"
+            "SELECT +CAST(?2 AS INTEGER), ?1, +CAST(?2 AS INTEGER) + ?1"
         );
     }
 
@@ -435,7 +465,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             out,
-            "SELECT CAST(?3 AS INTEGER), CAST(?4 AS INTEGER), CAST(?1 AS INTEGER), CAST(?5 AS INTEGER)"
+            "SELECT +CAST(?3 AS INTEGER), +CAST(?4 AS INTEGER), +CAST(?1 AS INTEGER), +CAST(?5 AS INTEGER)"
         );
     }
 
@@ -445,7 +475,7 @@ mod tests {
         let out = bind_text(sql, &[int(1), int(2)]).unwrap();
         assert_eq!(
             out,
-            "SELECT '?', 'it''s ?', \"col?\", `b?`, [c?], x'3F' -- ? here\n, CAST(?1 AS INTEGER) /* ? */ , CAST(?2 AS INTEGER)"
+            "SELECT '?', 'it''s ?', \"col?\", `b?`, [c?], x'3F' -- ? here\n, +CAST(?1 AS INTEGER) /* ? */ , +CAST(?2 AS INTEGER)"
         );
     }
 
@@ -455,7 +485,7 @@ mod tests {
         let out = bind_text(sql, &[text("{}"), int(1)]).unwrap();
         assert_eq!(
             out,
-            "SELECT json_extract(?1, '$.a') WHERE CAST(?2 AS INTEGER) = 1"
+            "SELECT json_extract(?1, '$.a') WHERE +CAST(?2 AS INTEGER) = 1"
         );
     }
 
@@ -472,11 +502,12 @@ mod tests {
     fn an_unclosed_literal_or_comment_ends_the_scan() {
         assert_eq!(
             bind_text("SELECT ?, 'a?", &[int(1)]).unwrap(),
-            "SELECT CAST(?1 AS INTEGER), 'a?"
+            "SELECT +CAST(?1 AS INTEGER), 'a?"
         );
+        // An unclosed comment is a trailing comment: cut.
         assert_eq!(
             bind_text("SELECT ? /* ?", &[int(1)]).unwrap(),
-            "SELECT CAST(?1 AS INTEGER) /* ?"
+            "SELECT +CAST(?1 AS INTEGER)"
         );
     }
 
@@ -491,6 +522,47 @@ mod tests {
         assert_eq!(significant_end("  -- only\n"), 0);
         assert_eq!(significant_end("SELECT 1 /* x */"), 8);
         assert_eq!(significant_end("SELECT [a b]"), 12);
+    }
+
+    #[test]
+    fn one_statement_only_and_the_comments_after_it_are_cut() {
+        for sql in [
+            "SELECT 1; SELECT 2",
+            "SELECT 1;SELECT 2;",
+            "SELECT 1; -- c\n SELECT 2",
+        ] {
+            assert!(bind_text(sql, &[]).is_err(), "{sql}");
+        }
+        assert_eq!(bind_text("SELECT 1;", &[]).unwrap(), "SELECT 1;");
+        assert_eq!(bind_text("SELECT 1; -- c", &[]).unwrap(), "SELECT 1;");
+        assert_eq!(
+            bind_text("SELECT ?; /* c */", &[int(1)]).unwrap(),
+            "SELECT +CAST(?1 AS INTEGER);"
+        );
+        // A `;` inside a literal or a comment is no end.
+        assert_eq!(
+            bind_text("SELECT ';' -- ;\n, 2", &[]).unwrap(),
+            "SELECT ';' -- ;\n, 2"
+        );
+    }
+
+    #[test]
+    fn a_sigil_inside_an_identifier_is_no_parameter() {
+        // `$` may continue an identifier; it starts no parameter there.
+        assert_eq!(
+            bind_text("SELECT a$b FROM t WHERE c = ?", &[int(1)]).unwrap(),
+            "SELECT a$b FROM t WHERE c = +CAST(?1 AS INTEGER)"
+        );
+        // A parameter named outside ASCII is still a named parameter.
+        assert!(bind_text("SELECT :\u{e9}, ?", &[int(1)]).is_err());
+        assert!(bind_text("SELECT @x, ?", &[int(1)]).is_err());
+        assert!(bind_text("SELECT $x, ?", &[int(1)]).is_err());
+    }
+
+    #[test]
+    fn a_script_of_comments_alone_has_no_end() {
+        assert_eq!(significant_end("-- only\n/* and this */"), 0);
+        assert_eq!(significant_end(""), 0);
     }
 
     #[test]

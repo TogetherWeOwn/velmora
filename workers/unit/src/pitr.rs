@@ -6,17 +6,18 @@
 //!
 //! - [`PointInTime::current`]: a bookmark for now.
 //! - [`PointInTime::at`]: the bookmark for a wall-clock time.
-//! - [`PointInTime::restore_on_next_session`]: the object is reset to a
-//!   bookmark the next time it starts. The answer is a bookmark for the
-//!   state just before the restore, which undoes it the same way.
-//!
-//! A restore takes effect only when the object restarts. The caller
-//! ends the session at once with [`PointInTime::restart`]
-//! (`ctx.abort()`, queued to run as soon as the current call has
-//! returned), so no later request is served from the old state.
+//! - [`PointInTime::restore_now`]: the object starts again from a
+//!   bookmark. Arming the restore and ending the session are one step in
+//!   the shim, so a restore is never left armed while the object goes on
+//!   taking writes (they would be lost at its next restart). **The call
+//!   does not return to its request:** `abort()` resets the object, the
+//!   request fails, and the next request finds the restored state. The
+//!   caller takes [`PointInTime::current`] first and keeps that bookmark
+//!   outside the object; restoring it undoes the restore.
 //!
 //! Bookmarks are opaque strings. A bookmark of one object means nothing
-//! to another.
+//! to another. Local workerd has no history: `at` and a restore answer
+//! that the back end "does not implement point-in-time recovery".
 
 use velmora_bridge::{BridgeError, Result};
 use worker::js_sys::Promise;
@@ -34,10 +35,9 @@ extern "C" {
         storage: &DurableObjectStorage,
         unix_ms: f64,
     ) -> std::result::Result<Promise, JsValue>;
-    #[wasm_bindgen(js_name = pitrRestart)]
-    fn pitr_restart(state: &JsValue);
-    #[wasm_bindgen(js_name = pitrRestoreOnNextSession, catch)]
-    fn pitr_restore(
+    #[wasm_bindgen(js_name = pitrRestoreNow, catch)]
+    fn pitr_restore_now(
+        state: &JsValue,
         storage: &DurableObjectStorage,
         bookmark: &str,
     ) -> std::result::Result<Promise, JsValue>;
@@ -66,24 +66,19 @@ impl PointInTime {
     }
 
     /// The bookmark for `unix_ms`, which must lie within the last 30
-    /// days.
+    /// days and after the object was made (or last emptied).
     pub async fn at(&self, unix_ms: i64) -> Result<String> {
         // Milliseconds since 1970 stay far inside a JS number.
         bookmark(pitr_at(&self.storage, unix_ms as f64)).await
     }
 
-    /// Asks for the object to start from `bookmark` at its next start.
-    /// Returns the bookmark that undoes it.
-    pub async fn restore_on_next_session(&self, bookmark_to: &str) -> Result<String> {
-        bookmark(pitr_restore(&self.storage, bookmark_to)).await
-    }
-
-    /// Ends this session of the object (`ctx.abort()`): the next request
-    /// starts it again, from the bookmark asked for, if any.
-    pub fn restart(&self) -> Result<()> {
-        // The shim calls `abort()` after this call has returned, so the
-        // throw it makes never passes through the wasm module.
-        pitr_restart(&self.state);
+    /// Restores the object to `bookmark` now: arms the restore and ends
+    /// the session in one step. Answers only if the runtime refused the
+    /// bookmark; otherwise the object is reset and this request fails.
+    pub async fn restore_now(&self, bookmark_to: &str) -> Result<()> {
+        let promise =
+            pitr_restore_now(&self.state, &self.storage, bookmark_to).map_err(pitr_err)?;
+        JsFuture::from(promise).await.map_err(pitr_err)?;
         Ok(())
     }
 }
