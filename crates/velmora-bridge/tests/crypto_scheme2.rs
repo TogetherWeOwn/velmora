@@ -100,7 +100,8 @@ fn bucket(n: u8) -> BucketId {
 }
 
 fn hkdf(ikm: &[u8; 32], info: &str) -> [u8; 32] {
-    let mut out = [0u8; 32];
+    // Every byte is overwritten by the expansion.
+    let mut out = *ikm;
     Hkdf::<Sha256>::new(None, ikm)
         .expand(info.as_bytes(), &mut out)
         .unwrap();
