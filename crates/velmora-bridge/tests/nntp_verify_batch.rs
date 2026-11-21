@@ -438,12 +438,12 @@ async fn a_long_pass_keeps_the_other_kept_slots_alive() {
     assert_eq!(shelf.parked(), 2);
     let before = rig.verify_connections();
 
-    // Every call takes 30 s: the second job's pass on bb0 alone outlasts
-    // the age at which a kept session is taken again.
-    rig.bridge.nntp.slow(&rig.bridge.clock, 30_000);
+    // Every call takes 50 s (under the 80 s bound of a call): the second
+    // job's pass on bb0 alone outlasts a background permit (120 s).
+    rig.bridge.nntp.slow(&rig.bridge.clock, 50_000);
     let started = rig.bridge.clock.now();
     assert_eq!(rig.verify_in(&second, Some(&shelf)).await, JobOutcome::Ack);
-    assert!(rig.bridge.clock.now().0 - started.0 > 60_000);
+    assert!(rig.bridge.clock.now().0 - started.0 > 120_000);
     assert!(rig.released(&second));
     assert_eq!(shelf.reused(), 2, "both kept sessions taken again");
     assert_eq!(rig.verify_connections(), before);

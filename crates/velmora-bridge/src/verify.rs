@@ -606,10 +606,9 @@ where
                 return Err(Stop::Refused);
             }
             // The batch's own kept sessions may hold the slot this
-            // backbone needs (providers that share a pool, or the
-            // address limit): they are closed and the slot asked for at
-            // once, before any wait.
-            if let Some(shelf) = shelf.filter(|s| s.parked() > 0) {
+            // backbone needs (providers that share a slot pool): they are
+            // closed and the slot asked for at once, before any wait.
+            if let Some(shelf) = shelf.filter(|s| self.shares_pool(s, &fresh)) {
                 shelf.drain(&self.catalog, &self.clock).await;
                 continue;
             }
@@ -630,6 +629,19 @@ where
             }
             waited = true;
         }
+    }
+
+    /// Whether a session `shelf` keeps holds a slot of a pool one of
+    /// `wanted` takes its slots from.
+    fn shares_pool(&self, shelf: &SessionShelf<N::Session>, wanted: &[&ProviderConfig]) -> bool {
+        let pool_of = |id: &str| {
+            let p = self.cfg.providers.iter().find(|p| p.id == id);
+            p.and_then(|p| p.pool.clone())
+        };
+        shelf.kept_providers().iter().any(|id| {
+            let pool = pool_of(id);
+            pool.is_some() && wanted.iter().any(|w| w.pool == pool)
+        })
     }
 
     /// One pass of `kind` over `rows` on `session`, under `lease`.

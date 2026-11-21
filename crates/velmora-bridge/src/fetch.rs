@@ -309,6 +309,11 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ProviderSession<'a, C, N, T> {
             Ok(true) if !late => {
                 self.kept = Some((now, lease.is_some()));
                 self.held_from = now;
+                // Once more after this session's own round trips: the
+                // call that follows starts with every kept slot fresh.
+                if let Some(shelf) = self.shelf {
+                    shelf.keep_alive(self.catalog, self.clock).await;
+                }
                 Ok(())
             }
             Ok(_) => {
@@ -702,32 +707,44 @@ impl<S: NntpSession> SessionShelf<S> {
     /// session of the batch.
     pub(crate) async fn keep_alive<C: Catalog, T: Clock>(&self, catalog: &C, clock: &T) {
         let now = clock.now();
-        let due = |p: &Parked<S>| now.0 - p.held_from.0 >= KEEP_EVERY_MS;
-        if !self.parked.borrow().iter().any(due) {
-            return;
-        }
-        let all: Vec<Parked<S>> = self.parked.borrow_mut().drain(..).collect();
-        let mut kept = Vec::with_capacity(all.len());
-        for mut parked in all {
-            if !due(&parked) {
-                kept.push(parked);
-                continue;
-            }
-            match catalog.renew_permit(&parked.permit, now).await {
-                Ok(true) => {
-                    parked.held_from = now;
-                    parked.kept_at = Some(now);
-                    kept.push(parked);
+        // The permits that are due, copied under a short borrow: the
+        // sessions stay on the shelf while their renewals are awaited, so
+        // a job given up in the middle of this drops none of them.
+        let due: Vec<Permit> = self
+            .parked
+            .borrow()
+            .iter()
+            .filter(|p| now.0 - p.held_from.0 >= KEEP_EVERY_MS)
+            .map(|p| p.permit.clone())
+            .collect();
+        for permit in due {
+            let renewed = matches!(catalog.renew_permit(&permit, now).await, Ok(true));
+            let gone = {
+                let mut parked = self.parked.borrow_mut();
+                let at = parked.iter().position(|p| p.permit == permit);
+                match (at, renewed) {
+                    (Some(at), true) => {
+                        parked[at].held_from = now;
+                        parked[at].kept_at = Some(now);
+                        None
+                    }
+                    (Some(at), false) => Some(parked.remove(at)),
+                    (None, _) => None,
                 }
-                _ => close_parked(catalog, clock, parked).await,
+            };
+            if let Some(parked) = gone {
+                close_parked(catalog, clock, parked).await;
             }
         }
-        // Whatever was kept meanwhile stays (nothing parks during this,
-        // but the order is kept either way: oldest first).
-        let mut parked = self.parked.borrow_mut();
-        let newer: Vec<Parked<S>> = parked.drain(..).collect();
-        kept.extend(newer);
-        *parked = kept;
+    }
+
+    /// The providers of the sessions kept now.
+    pub(crate) fn kept_providers(&self) -> Vec<String> {
+        self.parked
+            .borrow()
+            .iter()
+            .map(|p| p.provider_id.clone())
+            .collect()
     }
 
     /// Ends every kept session that is too old to be taken again
