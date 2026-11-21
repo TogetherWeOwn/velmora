@@ -331,7 +331,7 @@ jobs:
             exit 0
           fi
           changed=$(git diff --name-only HEAD^1 HEAD)
-          if grep -qE '^(Cargo\.toml|Cargo\.lock|deny\.toml|\.github/workflows/ci\.yml|crates/|workers/s3-bridge/)' <<< "$changed"; then
+          if grep -qE '^(Cargo\.toml|Cargo\.lock|deny\.toml|\.github/workflows/ci\.yml|crates/|workers/s3-bridge/|workers/webdav/)' <<< "$changed"; then
             echo "bridge=true" >> "$GITHUB_OUTPUT"
           else
             echo "bridge=false" >> "$GITHUB_OUTPUT"
@@ -409,6 +409,7 @@ jobs:
       - name: Install pinned worker-build 0.8.7
         run: cargo install --locked worker-build --version 0.8.7
       - run: cargo clippy --locked -p velmora-s3-bridge --target wasm32-unknown-unknown -- -D warnings
+      - run: cargo clippy --locked -p velmora-webdav --target wasm32-unknown-unknown -- -D warnings
       - name: Test the wasm section stripper
         working-directory: workers/s3-bridge
         run: python3 -I tools/test_strip_wasm.py
@@ -514,6 +515,10 @@ jobs:
           path: ${{ runner.temp }}/size.json
           if-no-files-found: error
           retention-days: 90
+      # The WebDAV gateway Worker: the same worker-build, its own bundle.
+      - name: Build the WebDAV gateway bundle
+        working-directory: workers/webdav
+        run: worker-build --release
 
   # Local end-to-end slice under `wrangler dev` with the fake NNTP server.
   # Passes with "skipped: no script" until workers/s3-bridge/e2e/slice.sh
