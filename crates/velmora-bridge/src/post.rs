@@ -807,9 +807,13 @@ where
     async fn to_verify(&self, lease: &Lease) -> core::result::Result<(), Stop> {
         let now = self.clock.now();
         let delay = self.cfg.verify_delay_secs;
+        let due = now.plus_secs(delay);
+        // The move marks the row as sent: the verify job is sent right
+        // below, and the dispatcher would only send a second one for a
+        // row that is due before the first was delivered.
         if !self
             .catalog
-            .advance(lease, OutboxStage::Verify, now.plus_secs(delay), now)
+            .advance_sent(lease, OutboxStage::Verify, due, now)
             .await?
         {
             return Err(Stop::Fenced);
@@ -820,9 +824,15 @@ where
             generation: lease.generation.clone(),
             stage: OutboxStage::Verify,
         };
-        // The outbox row is the obligation: the dispatcher re-sends a
-        // notification that is lost here.
-        let _ = self.jobs.send(&next, delay.min(MAX_QUEUE_DELAY_SECS)).await;
+        // The outbox row is the obligation. A send that fails takes the
+        // mark back, so the next dispatcher run sends the job; one that
+        // is lost after it was taken is sent again when the mark has
+        // aged. If the mark cannot be taken back either, it ages too.
+        let sent = self.jobs.send(&next, delay.min(MAX_QUEUE_DELAY_SECS)).await;
+        if sent.is_err() {
+            let row = core::slice::from_ref(&lease.extent);
+            let _ = self.catalog.unmark_sent(row, due).await;
+        }
         Ok(())
     }
 
