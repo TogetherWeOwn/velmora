@@ -52,6 +52,7 @@
 
 use std::rc::Rc;
 
+use futures_util::future::{select, Either};
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -62,7 +63,9 @@ use zeroize::Zeroizing;
 use crate::articles::article_spans;
 use crate::config::{Maintenance, REAL_DATA_READY};
 use crate::crypto::{open_range, unwrap_bdk, wrap_bdk, wrap_secret, DataKey};
-use crate::fetch::{read_articles, request_holder, ProviderSession};
+use crate::fetch::{
+    cold_poll_ms, read_articles, report_health, request_holder, ProviderSession, COLD_WAIT_MS,
+};
 use crate::ingress::{self, check_admin_bearer, IngressError};
 use crate::ports::{
     BlobStore, Bridge, Catalog, Clock, GrantPut, Guard, JobSink, Kek, NntpConnector, PermitClass,
@@ -72,10 +75,11 @@ use crate::recovery::{
     delete_blob, revoked_key_id, valid_key_id, write_key_revocation, REVOKED_KEY_PREFIX,
 };
 use crate::replay::ReplayCursor;
+use crate::service::INTERRUPTED_RETRIES;
 use crate::types::{
     AccessKeyRow, ArticleRow, ArticleState, Body, BridgeError, Bucket, BucketId, ExtentRow,
-    KeyStatus, Method, OutboxStage, Perm, ProviderLoad, RespBody, S3Request, S3Response,
-    SafetyState,
+    KeyStatus, Method, OutboxStage, Perm, ProviderFault, ProviderLoad, RespBody, S3Request,
+    S3Response, SafetyState,
 };
 
 /// Largest admin request body.
@@ -1376,16 +1380,24 @@ async fn evict<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T
 enum Drilled {
     /// The verified ciphertext and the provider that completed it.
     Read(Vec<u8>, String),
+    /// A provider that could have the missing articles had no free slot,
+    /// and none broke off: worth waiting for one.
     Busy,
+    /// A provider's session broke off, or it refused the account: worth
+    /// reading the extent again after a wait.
+    Interrupted,
     Unavailable,
 }
 
 /// Reads one extent's ciphertext from Usenet only. Neither blob store is
-/// read or written.
+/// read or written. A provider that refused the login is listed in
+/// `refused` and not asked again within the drill: each ask would be one
+/// more refused login on the account's record.
 async fn drill_extent<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>(
     bridge: &Bridge<C, B, N, J, K, T>,
     extent: &ExtentRow,
     plan: &[ArticleRow],
+    refused: &mut Vec<String>,
 ) -> crate::types::Result<Drilled> {
     let Ok(size) = usize::try_from(extent.cipher_size) else {
         return Ok(Drilled::Unavailable);
@@ -1406,12 +1418,18 @@ async fn drill_extent<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K:
     let mut cipher = vec![0u8; size];
     let mut have = vec![false; plan.len()];
     let mut busy = false;
+    let mut broken = false;
+    let mut skipped = false;
     let mut last_provider = String::new();
     let holder = request_holder("drill")?;
     for provider in bridge.cfg.providers.iter().filter(|p| p.read && p.enabled) {
         let wanted: Vec<&ArticleRow> = plan.iter().filter(|a| !have[a.idx as usize]).collect();
         if wanted.is_empty() {
             break;
+        }
+        if refused.contains(&provider.id) {
+            skipped = true;
+            continue;
         }
         let Some(mut session) = ProviderSession::open(
             &bridge.catalog,
@@ -1435,27 +1453,30 @@ async fn drill_extent<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K:
             have[row.idx as usize] = true;
         })
         .await;
-        session.close().await;
+        let health = session.finish().await;
+        report_health(&bridge.catalog, &bridge.clock, &provider.id, health).await;
+        if health == Some(Err(ProviderFault::LoginRefused)) {
+            refused.push(provider.id.clone());
+        }
         match read {
             Ok(tally) if tally.ok > 0 => last_provider.clone_from(&provider.id),
             Ok(_) => {}
-            Err(
-                Stop::NoPermit
-                | Stop::Refused
-                | Stop::Cooling(_)
-                | Stop::Fail(..)
-                | Stop::Session(_),
-            ) => {
-                busy = true;
-            }
+            Err(Stop::NoPermit | Stop::Cooling(_)) => busy = true,
+            Err(Stop::Refused | Stop::Fail(..) | Stop::Session(_)) => broken = true,
             Err(Stop::Fenced | Stop::Catalog) => {
                 return Err(BridgeError::Sql("catalogue failed during a drill".into()));
             }
         }
     }
     if have.contains(&false) {
-        return Ok(if busy {
+        // A provider that was not asked may hold what the others lack:
+        // never `Unavailable` then. One with no free slot is waited for.
+        return Ok(if broken {
+            Drilled::Interrupted
+        } else if busy {
             Drilled::Busy
+        } else if skipped {
+            Drilled::Interrupted
         } else {
             Drilled::Unavailable
         });
@@ -1465,6 +1486,75 @@ async fn drill_extent<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K:
         return Ok(Drilled::Unavailable);
     }
     Ok(Drilled::Read(cipher, last_provider))
+}
+
+/// Reads one extent from Usenet only ([`drill_extent`]) with the
+/// allowance of a cold read ([`crate::service::get`]): while no provider
+/// has a free slot it tries again until [`COLD_WAIT_MS`] after the first
+/// try, and a read that a provider broke off is begun again, at most
+/// [`INTERRUPTED_RETRIES`] times within that time, after a short wait
+/// each ([`cold_poll_ms`]). Nothing is held while it waits: neither slots
+/// nor budget; a try after a wait, its wait for budget included, starts
+/// and ends inside the allowance. `Ok(None)` = no provider can supply the extent intact;
+/// `Err` = the answer for the drill (`503` once the allowance is used,
+/// or the catalogue failed). The second value counts the tries after
+/// the first.
+async fn drill_read<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>(
+    bridge: &Bridge<C, B, N, J, K, T>,
+    extent: &ExtentRow,
+    plan: &[ArticleRow],
+    refused: &mut Vec<String>,
+) -> Admin<(Option<(Vec<u8>, String, ingress::Charge)>, u32)> {
+    // Ciphertext and plaintext of one extent are held together.
+    let bytes = extent.cipher_size.saturating_add(extent.plain_size);
+    let deadline = bridge.clock.now().plus_ms(i64::from(COLD_WAIT_MS));
+    let mut slept = 0u32;
+    let mut interrupted = 0u32;
+    let mut retries = 0u32;
+    loop {
+        let charge = match retries {
+            0 => bridge.budget.charge(bytes).await.map_err(|_| busy())?,
+            // A try after a wait starts only inside the allowance, and
+            // its wait for budget ends with it.
+            _ => {
+                let left = deadline.0 - bridge.clock.now().0;
+                let Ok(left @ 1..) = u32::try_from(left) else {
+                    return Err(busy());
+                };
+                let sleep = bridge.budget.sleeper().ok_or_else(busy)?;
+                let charge = core::pin::pin!(bridge.budget.charge(bytes));
+                let charge = match select(charge, sleep(left)).await {
+                    Either::Left((charge, _)) => charge.map_err(|_| busy())?,
+                    Either::Right(_) => return Err(busy()),
+                };
+                // Budget that came as the time ran out is given back.
+                if bridge.clock.now() >= deadline {
+                    return Err(busy());
+                }
+                charge
+            }
+        };
+        match drill_extent(bridge, extent, plan, refused)
+            .await
+            .or_internal()?
+        {
+            Drilled::Read(cipher, used) => return Ok((Some((cipher, used, charge)), retries)),
+            Drilled::Unavailable => return Ok((None, retries)),
+            Drilled::Busy => {}
+            Drilled::Interrupted if interrupted < INTERRUPTED_RETRIES => interrupted += 1,
+            Drilled::Interrupted => return Err(busy()),
+        }
+        drop(charge);
+        let sleep = bridge.budget.sleeper().ok_or_else(busy)?;
+        if bridge.clock.now() >= deadline || slept >= COLD_WAIT_MS {
+            return Err(busy());
+        }
+        let seed = (bridge.clock.now().0 as u64) ^ u64::from(retries).rotate_left(32);
+        let ms = cold_poll_ms(seed);
+        sleep(ms).await;
+        slept = slept.saturating_add(ms);
+        retries += 1;
+    }
 }
 
 /// Proves an object can be rebuilt from Usenet alone: every article is
@@ -1493,18 +1583,15 @@ async fn drill<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T
     let mut articles = 0u64;
     let mut matched = true;
     let mut provider = String::new();
+    let mut retries = 0u32;
+    let mut refused = Vec::new();
     for extent in &extents {
-        // Ciphertext and plaintext of one extent are held together.
-        let bytes = extent.cipher_size.saturating_add(extent.plain_size);
-        let _charge = bridge.budget.charge(bytes).await.map_err(|_| busy())?;
         let plan = bridge.catalog.articles(&extent.id).await.or_internal()?;
-        let (cipher, used) = match drill_extent(bridge, extent, &plan).await.or_internal()? {
-            Drilled::Read(cipher, used) => (cipher, used),
-            Drilled::Busy => return Err(busy()),
-            Drilled::Unavailable => {
-                matched = false;
-                break;
-            }
+        let (read, tries) = drill_read(bridge, extent, &plan, &mut refused).await?;
+        retries += tries;
+        let Some((cipher, used, _charge)) = read else {
+            matched = false;
+            break;
         };
         articles += plan.len() as u64;
         provider = used;
@@ -1530,6 +1617,9 @@ async fn drill<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T
         "size": generation.size,
         "plaintext_sha256": plaintext_sha256,
         "match": matched,
+        // Tries of an extent after its first: waits for a slot and
+        // reads begun again after a provider broke off.
+        "retries": retries,
     })))
 }
 

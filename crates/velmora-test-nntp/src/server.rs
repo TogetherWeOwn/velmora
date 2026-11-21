@@ -711,6 +711,14 @@ async fn handle_connection(
                     find_visible_by_number(&shared, n).await
                 };
                 let Some(article) = article else {
+                    // A dropped `STAT` is dropped whatever it asks for.
+                    if cmd.as_str() == "STAT" {
+                        let mut spool = shared.spool.lock().await;
+                        if spool.drop_stats > 0 {
+                            spool.drop_stats -= 1;
+                            break;
+                        }
+                    }
                     let _ = writer.write_all(b"430 No such article\r\n").await;
                     continue;
                 };

@@ -1213,6 +1213,17 @@ pub trait Catalog {
     /// One good session: clears failures and the cooldown history, unless
     /// the provider is cooling now.
     async fn provider_recovered(&self, provider: &str, now: UnixMs) -> Result<()>;
+    /// The providers due for a probe session ([`crate::probe`]): a
+    /// strike or a cooldown on record, not cooling at `now`, and neither
+    /// a strike nor the end of a cooldown after `quiet_since`; when the
+    /// last strike was a refused login, no strike after
+    /// `login_quiet_since`.
+    async fn providers_to_probe(
+        &self,
+        now: UnixMs,
+        quiet_since: UnixMs,
+        login_quiet_since: UnixMs,
+    ) -> Result<Vec<String>>;
     /// Sends `done` extents of live generations back to verify: safety copy still
     /// `held`, fewer than `required` of `backbones` counting. One call
     /// looks at the next `limit` held extents, in a rotation over all of

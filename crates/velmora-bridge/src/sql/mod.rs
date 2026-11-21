@@ -80,6 +80,7 @@ mod replay;
 mod uploads;
 pub mod usage;
 
+pub(crate) use health::LOGIN_REFUSED_COOLDOWN_MAX_MS;
 pub use hot::INDEX_ONLY as HOT_INDEX_ONLY;
 pub use outbox::{BURY_EXHAUSTED, EXHAUSTED_INDEX_ATTEMPTS};
 
@@ -843,6 +844,14 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
     }
     async fn provider_recovered(&self, provider: &str, now: UnixMs) -> Result<()> {
         health::provider_recovered(self, provider, now).await
+    }
+    async fn providers_to_probe(
+        &self,
+        now: UnixMs,
+        quiet_since: UnixMs,
+        login_quiet_since: UnixMs,
+    ) -> Result<Vec<String>> {
+        health::providers_to_probe(self, now, quiet_since, login_quiet_since).await
     }
     async fn redrive_underverified(
         &self,

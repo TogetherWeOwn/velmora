@@ -5,7 +5,9 @@
 //! does a single strike right after a cooldown, and each cooldown in a row
 //! doubles the next up to [`COOLDOWN_MAX_MS`], or up to
 //! [`LOGIN_REFUSED_COOLDOWN_MAX_MS`] when the strike is a refused login.
-//! One good session clears it all. Each strike is stored with why it was one, as a code
+//! One good session clears it all; a provider that nothing picks gets
+//! such a session from the cron run's probe ([`crate::probe`]), so its
+//! strikes do not stay for good. Each strike is stored with why it was one, as a code
 //! ([`ProviderFault`]); the good session clears that too. A row changes
 //! on a change of state only, and each write is a single statement
 //! guarded by the state it expects: a report that arrives while the
@@ -158,4 +160,37 @@ pub(super) async fn provider_recovered<S: Sql>(
         )
         .await?;
     Ok(())
+}
+
+pub(super) async fn providers_to_probe<S: Sql>(
+    c: &SqlCatalog<S>,
+    now: UnixMs,
+    quiet_since: UnixMs,
+    login_quiet_since: UnixMs,
+) -> Result<Vec<String>> {
+    // One row per provider that ever failed, read whole: a handful.
+    // Quiet counts from the later of the last strike and the end of the
+    // last cooldown: a probe never answers for real work right after a
+    // cooldown, and so never clears a ladder of cooldowns real work built.
+    // After a refused login it counts from the strike: the login is what
+    // a probe tries, and that quiet time is never shorter than the
+    // cooldown the strike started.
+    let rows = c
+        .sql
+        .query(
+            "SELECT provider_id FROM provider_health \
+             WHERE (failures > 0 OR cooldowns > 0) AND cooldown_until <= ?1 \
+               AND CASE WHEN last_failure_reason = ?4 \
+                 THEN COALESCE(last_failure_at, 0) <= ?3 \
+                 ELSE MAX(COALESCE(last_failure_at, 0), cooldown_until) <= ?2 END \
+             ORDER BY provider_id",
+            &[
+                ms(now),
+                ms(quiet_since),
+                ms(login_quiet_since),
+                text(ProviderFault::LoginRefused.as_str()),
+            ],
+        )
+        .await?;
+    rows.into_iter().map(|row| Cols::new(row).text()).collect()
 }

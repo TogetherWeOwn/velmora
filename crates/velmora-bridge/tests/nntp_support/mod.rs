@@ -352,6 +352,8 @@ struct Health {
     cooldowns: u32,
     until: i64,
     fault: Option<ProviderFault>,
+    /// The time of the last strike.
+    at: i64,
 }
 
 /// A takeover injected at the catalogue write that marks one article
@@ -1620,6 +1622,7 @@ impl Catalog for MemCatalog {
             return Ok(());
         }
         h.fault = Some(fault);
+        h.at = now.0;
         let (max_ms, max_steps) = match fault {
             ProviderFault::LoginRefused => (6 * 3_600_000, 9),
             _ => (900_000, 4),
@@ -1641,6 +1644,27 @@ impl Catalog for MemCatalog {
             }
         }
         Ok(())
+    }
+
+    async fn providers_to_probe(
+        &self,
+        now: UnixMs,
+        quiet_since: UnixMs,
+        login_quiet_since: UnixMs,
+    ) -> Result<Vec<String>> {
+        Ok(self
+            .health
+            .borrow()
+            .iter()
+            .filter(|(_, h)| {
+                let quiet = match h.fault {
+                    Some(ProviderFault::LoginRefused) => h.at <= login_quiet_since.0,
+                    _ => h.at.max(h.until) <= quiet_since.0,
+                };
+                (h.failures > 0 || h.cooldowns > 0) && h.until <= now.0 && quiet
+            })
+            .map(|(id, _)| id.clone())
+            .collect())
     }
 
     async fn redrive_underverified(&self, _: &[String], _: u32, _: u32, _: UnixMs) -> Result<u64> {

@@ -1,8 +1,10 @@
 //! Worker entry: `fetch` -> headers-only precheck -> `Bridge::handle` (S3
 //! and `/_admin`), `queue` -> `Bridge::run_job`, `scheduled` ->
 //! the start of a pass of the recovery copy when one is due, then
-//! `Bridge::dispatch` (the bounded dispatcher). A recovery-copy job is run
-//! here, with the recovery store, not by `Bridge::run_job`.
+//! `Bridge::dispatch` (the bounded dispatcher), then, once every 15
+//! minutes, `Bridge::probe_providers` (a provider whose strikes no session
+//! clears). A recovery-copy job is run here, with the recovery store, not
+//! by `Bridge::run_job`.
 //!
 //! The `Bridge` is built once per isolate from validated configuration.
 //! A refused configuration is a `500` with a class-only log line (fail
@@ -540,5 +542,17 @@ async fn scheduled(event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
             }
         }
         Err(e) => console_error!("dispatch failed: {}", error_class(&e)),
+    }
+    // After the dispatcher and apart from it: a provider whose strikes
+    // no session clears gets one probe session now and then.
+    if velmora_bridge::probe::probe_tick(UnixMs(event.schedule() as i64)) {
+        match bridge.probe_providers().await {
+            Ok(probed) => {
+                for (id, outcome) in probed {
+                    console_log!("provider probe: {id} {outcome}");
+                }
+            }
+            Err(e) => console_error!("provider probe failed: {}", error_class(&e)),
+        }
     }
 }
