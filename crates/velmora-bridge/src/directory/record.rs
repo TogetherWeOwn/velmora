@@ -284,6 +284,10 @@ pub struct Move {
     /// When the flip record was written.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub flipped_at: Option<UnixMs>,
+    /// The fallback undo: the stamp counter the frozen catalogue was
+    /// levelled to before it served again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub levelled_to: Option<u64>,
 }
 
 /// The fields that only tenant 0's record has.
@@ -650,6 +654,7 @@ mod tests {
                 catalogue_id_frozen: "main".into(),
                 stamp: Some(7),
                 flipped_at: Some(UnixMs(5)),
+                levelled_to: None,
             }),
             undo_stamp: None,
             catalogue_id: None,

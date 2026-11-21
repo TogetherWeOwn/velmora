@@ -195,7 +195,9 @@ pub enum Change {
     /// stamp again.
     UndoMoveOntoFrozen {
         undo_stamp: u64,
-        stamp_levelled: bool,
+        /// The stamp counter the tool levelled the frozen catalogue to:
+        /// at or above the flip's stamp.
+        levelled_to: u64,
     },
     /// Tenant 0: retired for good, 30 days after the flip.
     RetireTenantZero,
@@ -638,6 +640,7 @@ pub fn next(
                 return Ok(Outcome::Unchanged);
             }
             door.escrow_offline = true;
+            door.escrow_destroyed.clear();
         }
 
         Change::ClearEscrowOffline { destroyed } => {
@@ -689,6 +692,7 @@ pub fn next(
                 catalogue_id_frozen: catalogue_id_frozen.clone(),
                 stamp: None,
                 flipped_at: None,
+                levelled_to: None,
             });
             z.undo_stamp = None;
             if !z.frozen_catalogues.contains(catalogue_id_frozen) {
@@ -721,7 +725,8 @@ pub fn next(
             let z = move_allowed(tenant, h, actor)?;
             match z.selector {
                 Selector::Moving => {}
-                Selector::D1 if z.moved.is_none() => return Ok(Outcome::Unchanged),
+                // No window open: none yet, or the last move undone.
+                Selector::D1 if z.moved.is_none() || z.undone() => return Ok(Outcome::Unchanged),
                 _ => return Err(SELECTOR),
             }
             let mut z = z.clone();
@@ -766,7 +771,7 @@ pub fn next(
 
         Change::UndoMoveOntoFrozen {
             undo_stamp,
-            stamp_levelled,
+            levelled_to,
         } => {
             let z = move_allowed(tenant, h, actor)?;
             let m = z.moved.as_ref().ok_or(SELECTOR)?;
@@ -781,13 +786,19 @@ pub fn next(
                 Selector::Moved => {}
                 _ => return Err(SELECTOR),
             }
-            if !stamp_levelled || !m.stamp.is_some_and(|stamp| *undo_stamp > stamp) {
+            let Some(stamp) = m.stamp else {
+                return Err(SELECTOR);
+            };
+            if *undo_stamp <= stamp || *levelled_to < stamp {
                 return Err(INVALID);
             }
             let mut z = z.clone();
             z.selector = Selector::D1;
             z.undo_stamp = Some(*undo_stamp);
             z.catalogue_id = Some(frozen);
+            if let Some(m) = z.moved.as_mut() {
+                m.levelled_to = Some(*levelled_to);
+            }
             door.tenant_zero = Some(z);
         }
 

@@ -1317,6 +1317,7 @@ fn a_flag_or_selector_change_is_closing() {
             catalogue_id_frozen: "main".into(),
             stamp: None,
             flipped_at: None,
+            levelled_to: None,
         }),
         undo_stamp: None,
         catalogue_id: None,
@@ -1826,22 +1827,34 @@ fn a_move_freezes_the_catalogue_d1_means_and_an_undo_never_lands_on_a_frozen_one
 #[test]
 fn the_fallback_undo_lands_on_the_frozen_catalogue_after_its_stamp_is_levelled() {
     let f = apply(&moving(), Change::FlipMove { stamp: 9 }, Actor::MoveTool);
-    let fallback = |undo_stamp, stamp_levelled| Change::UndoMoveOntoFrozen {
+    let fallback = |undo_stamp, levelled_to| Change::UndoMoveOntoFrozen {
         undo_stamp,
-        stamp_levelled,
+        levelled_to,
     };
-    assert_eq!(refused(&f, fallback(10, false), Actor::MoveTool), INVALID);
-    assert_eq!(refused(&f, fallback(9, true), Actor::MoveTool), INVALID);
-    assert_eq!(refused(&f, fallback(10, true), Actor::Operator), FORBIDDEN);
-    let back = apply(&f, fallback(10, true), Actor::MoveTool);
+    // Levelled below the flip's stamp, or an undo stamp not above it.
+    assert_eq!(refused(&f, fallback(10, 8), Actor::MoveTool), INVALID);
+    assert_eq!(refused(&f, fallback(9, 9), Actor::MoveTool), INVALID);
+    assert_eq!(refused(&f, fallback(10, 9), Actor::Operator), FORBIDDEN);
+    let back = apply(&f, fallback(10, 9), Actor::MoveTool);
+    assert_eq!(
+        back.door
+            .tenant_zero
+            .as_ref()
+            .unwrap()
+            .moved
+            .as_ref()
+            .unwrap()
+            .levelled_to,
+        Some(9)
+    );
     let z = back.door.tenant_zero.clone().unwrap();
     assert_eq!(z.selector, Selector::D1);
     assert_eq!(z.catalogue_id.as_deref(), Some("main"));
     assert!(z.undone());
-    unchanged(&back, fallback(10, true), Actor::MoveTool);
+    unchanged(&back, fallback(10, 9), Actor::MoveTool);
     // Not before the flip.
     assert_eq!(
-        refused(&moving(), fallback(10, true), Actor::MoveTool),
+        refused(&moving(), fallback(10, 9), Actor::MoveTool),
         SELECTOR
     );
 }
@@ -1869,4 +1882,35 @@ fn clearing_the_escrow_names_every_destroyed_copy() {
     );
     assert!(!c.door.escrow_offline);
     assert_eq!(c.door.escrow_destroyed, names);
+}
+
+#[test]
+fn a_give_up_with_no_window_open_is_unchanged() {
+    // No move yet.
+    unchanged(&tenant_zero(), Change::GiveUpMove, Actor::MoveTool);
+    // The last move undone: the next window's record was never written.
+    let f = apply(&moving(), Change::FlipMove { stamp: 9 }, Actor::MoveTool);
+    let u = apply(
+        &f,
+        Change::UndoMove {
+            undo_stamp: 10,
+            catalogue_id: "main2".into(),
+        },
+        Actor::MoveTool,
+    );
+    unchanged(&u, Change::GiveUpMove, Actor::MoveTool);
+}
+
+#[test]
+fn marking_the_escrow_again_forgets_the_old_destroyed_names() {
+    let e = apply(&active(), Change::SetEscrowOffline, Actor::Operator);
+    let c = apply(
+        &e,
+        Change::ClearEscrowOffline {
+            destroyed: vec!["ab".repeat(32)],
+        },
+        Actor::Operator,
+    );
+    let again = apply(&c, Change::SetEscrowOffline, Actor::Operator);
+    assert!(again.door.escrow_destroyed.is_empty());
 }
