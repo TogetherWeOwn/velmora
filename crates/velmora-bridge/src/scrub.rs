@@ -276,9 +276,9 @@ where
         // A run that lost its lease adds nothing: the totals are another
         // run's to add.
         let _ = self.catalog.scrub_end(token, &run, now).await;
-        crate::trace::cold_read(|| {
+        crate::trace::scrub_run(|| {
             format!(
-                "scrub: checked={} ok={} suspect={} repaired={} unrecoverable={} stalled={} \
+                "checked={} ok={} suspect={} repaired={} unrecoverable={} stalled={} \
                  bytes={} refetched={} ended={:?} ms={}",
                 run.checked,
                 run.ok,

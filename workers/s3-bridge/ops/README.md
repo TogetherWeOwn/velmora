@@ -1804,7 +1804,7 @@ SELECT runs, checked, ok, suspect, repaired, unrecoverable, stalled, incidents, 
   FROM scrub_state;
 ```
 
-Each run logs one `scrub: checked=... ended=...` line beside the cold-read lines. `ended=busy` means a provider had no free slot (an operator drill holds the drill connections, or verify holds the background slots): the run stops and the next one goes on.
+Each run logs one `scrub: checked=... ended=...` line. `ended=busy` means a provider had no free slot (an operator drill holds the drill connections, or verify holds the background slots): the run stops and the next one goes on.
 
 **Alert lines** (`alert:` in the Worker logs; no key, bucket, message-id or host):
 
