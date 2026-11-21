@@ -6,6 +6,15 @@
 //! is acknowledged only after the safety copy is stored and the catalogue
 //! batch that publishes the generation has committed.
 //!
+//! A body of at most one extent is sealed and handed to the safety store
+//! while it arrives (`store_streamed`), so only a window of it is in
+//! memory. Its final sealed chunk is withheld until the validator
+//! accepted the whole body: a refused body never becomes a whole blob.
+//! The digests in the catalogue are the validator's, of the plaintext,
+//! and the sealer's, of the ciphertext, and the store's own account of
+//! what it holds is compared with the sealer's before a row names the
+//! blob.
+//!
 //! A sliced body is stored while it arrives, so its slices exist before
 //! the body is known to be valid. Each has a `write_intents` row from
 //! before its blob is stored, nothing is published before the validator
@@ -23,14 +32,14 @@ use velmora_s3_proto::{ErrorCode, StoredChecksum, UploadValidator};
 use super::common::{
     authenticate, check_precondition, checksum_json, conditional_gate, discard_before_retry,
     from_proto, hold_precondition, internal, metadata_json, restore_gate, s3_error, send_post_jobs,
-    writes_refused,
+    store_streamed, writes_refused,
 };
 use super::slices::{store_slices, SliceError, SliceSink};
-use crate::crypto::{seal_extent, unwrap_bdk};
-use crate::ingress::{read_upload, upload_lengths, UploadLengths, UploadReadError};
+use crate::crypto::unwrap_bdk;
+use crate::ingress::{upload_lengths, SealedUpload, UploadLengths, UploadReadError};
 use crate::intents::WRITER_MAX_AGE_MS;
 use crate::ports::{
-    BlobMeta, BlobStore, Bridge, Catalog, Clock, Guard, JobSink, Kek, NntpConnector, PublishOutcome,
+    BlobStore, Bridge, Catalog, Clock, Guard, JobSink, Kek, NntpConnector, PublishOutcome,
 };
 use crate::recovery::{id_after, write_generation};
 use crate::types::{
@@ -94,7 +103,7 @@ async fn put<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: 
     let lengths =
         upload_lengths(&req.headers, bridge.cfg.max_put_bytes).map_err(|e| e.response())?;
     let len = lengths.decoded;
-    let mut validator = UploadValidator::new(&authed.headers, &authed.verified, &authed.policy)
+    let validator = UploadValidator::new(&authed.headers, &authed.verified, &authed.policy)
         .map_err(s3_error)?;
     if len > bridge.cfg.max_extent_bytes {
         let upload = SlicedUpload {
@@ -108,30 +117,10 @@ async fn put<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: 
         return put_sliced(bridge, req.body, upload).await;
     }
 
-    // Nothing of the body is buffered before this charge is held.
-    let charge = bridge
-        .budget
-        .charge_body(len)
-        .await
-        .map_err(|e| e.response())?;
-    let body = read_upload(req.body, lengths, &charge, &mut validator)
-        .await
-        .map_err(|e| match e {
-            UploadReadError::Ingress(e) => e.response(),
-            UploadReadError::Proto(e) => s3_error(e),
-        })?;
-    let decoded = validator.finish().map_err(s3_error)?;
-
-    let now = bridge.clock.now();
     let mut rng = SystemRng;
     let mut extent_rand = [0u8; 13];
-    let mut generation_rand = [0u8; 8];
     rng.fill_bytes(&mut extent_rand).map_err(|_| internal())?;
-    rng.fill_bytes(&mut generation_rand)
-        .map_err(|_| internal())?;
     let extent_id = ExtentId::mint(extent_rand);
-    let generation_id = GenerationId::mint(now, generation_rand);
-
     let bdk = unwrap_bdk(
         &bridge.kek,
         bucket.kek_version,
@@ -139,11 +128,41 @@ async fn put<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: 
         &bucket.bdk_wrapped,
     )
     .map_err(|_| internal())?;
-    let sealed =
-        seal_extent(&bdk, &bucket.id, &extent_id, &body, &mut rng).map_err(|_| internal())?;
-    drop(body);
 
-    let etag = format!("\"{}\"", hex(&sealed.plain_md5));
+    // Nothing of the body is read before this charge is held. The body
+    // is sealed and stored while it arrives: the safety copy is whole
+    // only if the validator accepted the body, and it is durable before
+    // the catalogue names it. If the commit below fails, the blob is an
+    // unreferenced orphan, never a catalogue row without bytes.
+    let charge = bridge
+        .budget
+        .charge_stream(len)
+        .await
+        .map_err(|e| e.response())?;
+    let SealedUpload { decoded, sealed } = store_streamed(
+        &bridge.safety,
+        req.body,
+        lengths,
+        validator,
+        &bdk,
+        &bucket.id,
+        &extent_id,
+    )
+    .await
+    .map_err(|e| match e {
+        UploadReadError::Ingress(e) => e.response(),
+        UploadReadError::Proto(e) => s3_error(e),
+    })?;
+    // Nothing of the body is held any more.
+    drop(charge);
+
+    let now = bridge.clock.now();
+    let mut generation_rand = [0u8; 8];
+    rng.fill_bytes(&mut generation_rand)
+        .map_err(|_| internal())?;
+    let generation_id = GenerationId::mint(now, generation_rand);
+
+    let etag = format!("\"{}\"", hex(decoded.md5()));
     let checksum = decoded.checksum().cloned();
     let (content_json, user_meta_json) = metadata_json(&metadata);
     let extent = ExtentRow {
@@ -154,12 +173,12 @@ async fn put<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: 
         seq: Some(0),
         plain_offset: Some(0),
         plain_size: len,
-        cipher_size: sealed.ciphertext.len() as u64,
+        cipher_size: sealed.cipher_size,
         media_header: sealed.media_header.to_vec(),
         key_mode: KEY_MODE_RANDOM,
         wrapped_file_key: Some(sealed.wrapped_file_key.to_vec()),
-        plain_md5: sealed.plain_md5,
-        plain_sha256: sealed.plain_sha256,
+        plain_md5: *decoded.md5(),
+        plain_sha256: *decoded.sha256(),
         cipher_sha256: sealed.cipher_sha256,
         safety_state: SafetyState::Held,
         article_count: None,
@@ -184,22 +203,6 @@ async fn put<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: 
         retired_at: None,
     };
 
-    // The safety copy is durable before the catalogue names it. If the
-    // commit below fails, the blob is an unreferenced orphan, never a
-    // catalogue row without bytes.
-    bridge
-        .safety
-        .put(
-            &extent_id.safety_key(),
-            sealed.ciphertext,
-            &BlobMeta {
-                bucket: &bucket.id,
-                extent: &extent_id,
-                cipher_sha256: &sealed.cipher_sha256,
-            },
-        )
-        .await
-        .map_err(|_| internal())?;
     // The recovery record is durable before the catalogue batch: an
     // acknowledged PUT can be replayed into a restored catalogue. If this
     // write fails, nothing is published.
@@ -271,7 +274,6 @@ async fn put<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: 
         }
         commit.generation.id = id;
     };
-    drop(charge);
 
     send_post_jobs(bridge, &generation_id, vec![extent_id], commit.now).await;
 

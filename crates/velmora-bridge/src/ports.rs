@@ -8,6 +8,9 @@
 // No `Send` bound is intended (see module docs).
 #![allow(async_fn_in_trait)]
 
+use futures_util::StreamExt;
+use sha2::{Digest, Sha256};
+
 use crate::config::BridgeConfig;
 use crate::ingress::ByteBudget;
 use crate::plan::{PackReport, StoredPlan};
@@ -25,7 +28,8 @@ use crate::types::{
     VerifyEscalation, WriteId,
 };
 use crate::types::{
-    BucketUsage, RecountState, RecountStep, UsageCounters, UsageRecount, UsageSnapshot,
+    BridgeError, BucketUsage, ByteStream, RecountState, RecountStep, UsageCounters, UsageRecount,
+    UsageSnapshot,
 };
 
 // ---------------------------------------------------------------------------
@@ -151,6 +155,29 @@ pub struct BlobMeta<'a> {
     pub cipher_sha256: &'a [u8; 32],
 }
 
+/// Custom metadata of a blob whose bytes are not known when its put
+/// begins ([`BlobStore::put_stream`]): what [`BlobMeta`] names, without
+/// the digest.
+#[derive(Clone, Copy, Debug)]
+pub struct StreamMeta<'a> {
+    pub bucket: &'a BucketId,
+    pub extent: &'a ExtentId,
+}
+
+/// What the store holds after [`BlobStore::put_stream`], as the store
+/// itself reports it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PutReceipt {
+    pub size: u64,
+    /// MD5 of the stored bytes.
+    pub md5: [u8; 16],
+}
+
+/// A streamed body that did not give exactly the bytes it declared.
+fn stream_length() -> BridgeError {
+    BridgeError::Blob("stream length differs from the declared one".into())
+}
+
 /// One key of a listing with what identifies its bytes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BlobEntry {
@@ -161,10 +188,73 @@ pub struct BlobEntry {
     pub md5: String,
 }
 
+/// [`BlobStore::put_stream`] for a store that takes whole blobs only:
+/// reads `body` to its end, refuses one that fails or does not give
+/// exactly `len` bytes, and only then calls [`BlobStore::put`].
+pub async fn put_stream_whole<B: BlobStore + ?Sized>(
+    store: &B,
+    key: &str,
+    len: u64,
+    mut body: ByteStream,
+    meta: &StreamMeta<'_>,
+) -> Result<PutReceipt> {
+    let cap = usize::try_from(len).map_err(|_| stream_length())?;
+    let mut bytes = Vec::with_capacity(cap);
+    while let Some(piece) = body.next().await {
+        let piece = piece?;
+        if piece.len() > cap - bytes.len() {
+            return Err(stream_length());
+        }
+        bytes.extend_from_slice(&piece);
+    }
+    if bytes.len() != cap {
+        return Err(stream_length());
+    }
+    drop(body);
+    let stored = PutReceipt {
+        size: len,
+        md5: md5::compute(&bytes).0,
+    };
+    let cipher_sha256: [u8; 32] = Sha256::digest(&bytes).into();
+    let meta = BlobMeta {
+        bucket: meta.bucket,
+        extent: meta.extent,
+        cipher_sha256: &cipher_sha256,
+    };
+    store.put(key, bytes, &meta).await?;
+    Ok(stored)
+}
+
 /// R2 `SAFETY`/`CACHE` now; any S3-compatible store later.
 pub trait BlobStore {
-    /// H2 adds `put_stream(len)`.
     async fn put(&self, key: &str, bytes: Vec<u8>, meta: &BlobMeta<'_>) -> Result<()>;
+    /// Stores the `len` bytes that `body` gives, piece by piece, without
+    /// holding them all. The contract every adapter keeps:
+    ///
+    /// - **All or nothing.** If `body` gives an error, ends before `len`
+    ///   bytes or gives more than `len`, the call fails and no object
+    ///   exists under `key` because of it. A body may therefore be
+    ///   refused after its first bytes were handed over: the writer
+    ///   withholds its last piece until it accepts the whole.
+    /// - **The answer is the store's own account** of what it holds
+    ///   (size and MD5). The store cannot be given a digest to check the
+    ///   bytes against before it has them, so the caller compares the
+    ///   answer with what it sent and does not name the blob anywhere
+    ///   unless they agree.
+    /// - One attempt: a stream cannot be read twice.
+    ///
+    /// This default holds the whole body and hands it to
+    /// [`BlobStore::put`] ([`put_stream_whole`]); an adapter that can
+    /// store a stream overrides it.
+    async fn put_stream(
+        &self,
+        key: &str,
+        len: u64,
+        body: ByteStream,
+        meta: &StreamMeta<'_>,
+    ) -> Result<PutReceipt> {
+        put_stream_whole(self, key, len, body, meta).await
+    }
     /// `None` = absent. With a span, exactly that range.
     async fn get(&self, key: &str, span: Option<ByteSpan>) -> Result<Option<Vec<u8>>>;
     /// Object size, `None` = absent.

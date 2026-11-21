@@ -9,10 +9,14 @@
 //! 2. [`precheck`] (headers only): transport, admin bearer or S3 credential
 //!    presence, `Content-Length` shape and the declared-length cap.
 //! 3. The handler authenticates (SigV4) from headers only.
-//! 4. [`ByteBudget::charge`] reserves `2 × declared_len`, waiting a bounded
-//!    time without reading the body, then `503 SlowDown`.
+//! 4. [`ByteBudget::charge`] reserves what the request will hold, waiting
+//!    a bounded time without reading the body, then `503 SlowDown`: `2 ×
+//!    declared_len` for a body that is held whole
+//!    ([`ByteBudget::charge_body`]), a fixed window for one that is sealed
+//!    and stored while it arrives ([`ByteBudget::charge_stream`]).
 //! 5. [`read_capped`] reads at most `declared_len + 1` bytes; uploads use
-//!    [`read_upload`], which decodes as it reads.
+//!    [`read_upload`], which decodes as it reads, or [`seal_upload`],
+//!    which decodes, seals and hands on each chunk as it reads.
 //!
 //! For an `aws-chunked` upload the declared length is the **decoded** one,
 //! `x-amz-decoded-content-length`: the cap, the charge and the buffer are
@@ -33,11 +37,13 @@ use futures_util::StreamExt;
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
-use velmora_s3_proto::{is_aws_chunked, ErrorCode, UploadValidator};
+use velmora::media::{CIPHER_CHUNK_SIZE, PLAIN_CHUNK_SIZE};
+use velmora_s3_proto::{is_aws_chunked, DecodedUpload, ErrorCode, UploadValidator};
 
 use crate::config::BridgeConfig;
+use crate::crypto::{ExtentSealer, SealedStream};
 use crate::service::{classify, Route};
-use crate::types::{Body, S3Request, S3Response};
+use crate::types::{Body, BridgeError, ByteStream, S3Request, S3Response};
 
 /// How long a request may wait for budget before `503 SlowDown`.
 pub const CHARGE_WAIT_MS: u32 = 20_000;
@@ -51,6 +57,18 @@ pub const CHARGE_POLL_MS: u32 = 100;
 /// polled any more (its request is stopped, or busy elsewhere) holds
 /// the others back no longer than this.
 pub const TURN_WAIT_MS: u32 = 5_000;
+
+/// What a body that is sealed and stored while it arrives
+/// ([`seal_upload`]) is charged at most, whatever its length: eight
+/// sealed chunks (512 KiB). Counted in sealed chunks of 64 KiB, such a
+/// request holds at any moment: under two of plaintext waiting to be
+/// sealed, the piece just sealed, its copy for the store, and the pieces
+/// the store's writer has queued and not yet sent (one waiting and one
+/// under way). That is six; a request holds up to 1.5 bytes per byte it
+/// charges (see [`ByteBudget`]), so eight chunks charged cover twelve
+/// held. The body chunk being decoded is the runtime's, a few KiB, and is
+/// not counted here or for a body held whole.
+pub const STREAM_CHARGE_BYTES: u64 = 8 * CIPHER_CHUNK_SIZE;
 
 /// Longest accepted `Content-Length` value (digits). `u64::MAX` has 20.
 const MAX_LENGTH_DIGITS: usize = 20;
@@ -1009,6 +1027,14 @@ impl ByteBudget {
     pub async fn charge_body(&self, declared_len: u64) -> Result<Charge, IngressError> {
         self.charge(declared_len.saturating_mul(2)).await
     }
+
+    /// The charge for a request body of `declared_len` bytes that is
+    /// sealed and stored while it arrives ([`seal_upload`]): never more
+    /// than the same body held whole, and at most
+    /// [`STREAM_CHARGE_BYTES`], because only a window of it is in memory.
+    pub async fn charge_stream(&self, declared_len: u64) -> Result<Charge, IngressError> {
+        self.charge(stream_charge(declared_len)).await
+    }
 }
 
 /// Bytes held against a [`ByteBudget`]; released on drop.
@@ -1176,6 +1202,243 @@ pub async fn read_upload(
         return Err(IngressError::IncompleteBody.into());
     }
     Ok(out)
+}
+
+/// Bytes [`ByteBudget::charge_stream`] charges for a body of
+/// `declared_len` bytes.
+pub fn stream_charge(declared_len: u64) -> u64 {
+    declared_len.saturating_mul(2).min(STREAM_CHARGE_BYTES)
+}
+
+// ---------------------------------------------------------------------------
+// An upload sealed while it arrives
+// ---------------------------------------------------------------------------
+
+/// A body that [`seal_upload`] read to its end, the validator accepted
+/// and the sealer sealed whole.
+#[derive(Debug)]
+pub struct SealedUpload {
+    /// The validator's account of the decoded body: its length, MD5,
+    /// SHA-256 and checksum. These are the digests of the plaintext that
+    /// was sealed: every decoded byte goes from the validator, which
+    /// hashes it, straight to the sealer and nowhere else.
+    pub decoded: DecodedUpload,
+    pub sealed: SealedStream,
+}
+
+/// Where a [`seal_upload`] stream stands.
+enum SealState {
+    /// Not at its end yet. If the stream is gone, whoever read it gave up.
+    Open,
+    /// The body was refused; the stream ended with an error instead of
+    /// its last piece.
+    Refused(UploadReadError),
+    /// The last piece was given out.
+    Sealed(Box<SealedUpload>),
+}
+
+/// The caller's end of a [`seal_upload`] stream: how it ended.
+pub struct UploadSeal(Rc<RefCell<SealState>>);
+
+impl fmt::Debug for UploadSeal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("UploadSeal")
+    }
+}
+
+impl UploadSeal {
+    /// How the stream ended, asked once its reader has returned.
+    ///
+    /// - `Ok`: the body was accepted and every piece was given out.
+    /// - `Err(Some(_))`: the body was refused, with the answer for the
+    ///   client. The stream gave an error in place of its last piece.
+    /// - `Err(None)`: the reader stopped before the end (a store that
+    ///   failed). The body is neither accepted nor refused.
+    pub fn outcome(self) -> Result<SealedUpload, Option<UploadReadError>> {
+        match self.0.replace(SealState::Open) {
+            SealState::Sealed(upload) => Ok(*upload),
+            SealState::Refused(e) => Err(Some(e)),
+            SealState::Open => Err(None),
+        }
+    }
+}
+
+/// The item a refused [`seal_upload`] stream ends with. The reason is in
+/// the [`UploadSeal`]; this only stops the store.
+fn upload_refused() -> BridgeError {
+    BridgeError::Invalid("upload refused before its last piece")
+}
+
+struct SealPump {
+    body: Option<ByteStream>,
+    validator: Option<UploadValidator>,
+    sealer: Option<ExtentSealer>,
+    lengths: UploadLengths,
+    /// Encoded bytes received.
+    received: u64,
+    /// The body chunk being decoded, and how much of it already is.
+    incoming: Vec<u8>,
+    taken: usize,
+    /// Decoded bytes not sealed yet: under two chunks.
+    plain: Vec<u8>,
+    state: Rc<RefCell<SealState>>,
+    done: bool,
+}
+
+impl SealPump {
+    async fn next(&mut self) -> Option<crate::types::Result<Vec<u8>>> {
+        if self.done {
+            return None;
+        }
+        match self.piece().await {
+            Ok(piece) => Some(Ok(piece)),
+            Err(e) => {
+                self.done = true;
+                // Nothing of a refused body is kept, and its sealer is
+                // dropped without a final chunk.
+                self.body = None;
+                self.validator = None;
+                self.sealer = None;
+                self.incoming = Vec::new();
+                self.plain = Vec::new();
+                *self.state.borrow_mut() = SealState::Refused(e);
+                Some(Err(upload_refused()))
+            }
+        }
+    }
+
+    /// The next piece of the sealed stream. The final piece is given
+    /// only by [`SealPump::end`], after the validator accepted the body.
+    async fn piece(&mut self) -> Result<Vec<u8>, UploadReadError> {
+        let chunk = PLAIN_CHUNK_SIZE as usize;
+        loop {
+            let (Some(sealer), Some(validator)) = (self.sealer.as_mut(), self.validator.as_mut())
+            else {
+                return Err(IngressError::Internal.into());
+            };
+            // A whole chunk leaves at once while plaintext is due after
+            // it. The final chunk waits for the end of the body.
+            if self.plain.len() >= chunk && sealer.remaining() > PLAIN_CHUNK_SIZE {
+                let piece = sealer
+                    .seal_next(&self.plain[..chunk])
+                    .map_err(|_| IngressError::Internal)?;
+                self.plain.drain(..chunk);
+                return Ok(piece);
+            }
+            if self.taken < self.incoming.len() {
+                // At most one chunk is decoded per step, so `plain` stays
+                // under two chunks whatever size the body arrives in.
+                let end = self.incoming.len().min(self.taken.saturating_add(chunk));
+                let plain = &mut self.plain;
+                validator.push_body(&self.incoming[self.taken..end], &mut |decoded| {
+                    plain.extend_from_slice(decoded)
+                })?;
+                self.taken = end;
+                if self.plain.len() as u64 > sealer.remaining() {
+                    return Err(IngressError::EntityTooLarge.into());
+                }
+                continue;
+            }
+            let next = match self.body.as_mut() {
+                Some(body) => body.next().await,
+                None => None,
+            };
+            match next {
+                Some(Ok(bytes)) => {
+                    self.received = self.received.saturating_add(bytes.len() as u64);
+                    if self.lengths.encoded.is_some_and(|n| self.received > n) {
+                        return Err(IngressError::EntityTooLarge.into());
+                    }
+                    self.incoming = bytes;
+                    self.taken = 0;
+                }
+                Some(Err(_)) => return Err(IngressError::IncompleteBody.into()),
+                None => return self.end(),
+            }
+        }
+    }
+
+    /// The body has ended: judge it, then seal and give the final chunk.
+    fn end(&mut self) -> Result<Vec<u8>, UploadReadError> {
+        self.body = None;
+        if self.lengths.encoded.is_some_and(|n| self.received != n) {
+            return Err(IngressError::IncompleteBody.into());
+        }
+        let (Some(validator), Some(mut sealer)) = (self.validator.take(), self.sealer.take())
+        else {
+            return Err(IngressError::Internal.into());
+        };
+        // Signature chain, declared digests and decoded length.
+        let decoded = validator.finish()?;
+        if decoded.length() != self.lengths.decoded || self.plain.len() as u64 != sealer.remaining()
+        {
+            return Err(IngressError::IncompleteBody.into());
+        }
+        let piece = sealer
+            .seal_next(&self.plain)
+            .map_err(|_| IngressError::Internal)?;
+        let sealed = sealer.finish().map_err(|_| IngressError::Internal)?;
+        self.plain = Vec::new();
+        self.done = true;
+        *self.state.borrow_mut() = SealState::Sealed(Box::new(SealedUpload { decoded, sealed }));
+        Ok(piece)
+    }
+}
+
+/// Seals an upload body while it arrives: the returned stream gives the
+/// sealed extent piece by piece (what [`crate::crypto::seal_extent`]
+/// would build from the decoded body), for a store that writes it as it
+/// comes ([`crate::ports::BlobStore::put_stream`]). Only a window of the
+/// body is in memory: the body chunk being decoded, under two chunks of
+/// plaintext and one sealed piece. Call it only after the budget charge
+/// ([`ByteBudget::charge_stream`]).
+///
+/// The stream is read only as fast as its reader asks, and it asks the
+/// body for more only then.
+///
+/// **A refused body never becomes a whole stream.** The final chunk of
+/// the stream is sealed and given out only after the body has ended, its
+/// length matched (`Content-Length`, when present, and the decoded
+/// length) and `validator.finish()` accepted it (signature chain,
+/// `Content-MD5`, checksums). Until then at least the final chunk is
+/// missing, so the stream is shorter than `sealer.cipher_size()` and a
+/// store that keeps the `put_stream` contract holds no object. On a
+/// refusal (bad framing or chunk signature, wrong digest, short or long
+/// body, a body that fails) the stream gives an error and ends, and the
+/// [`UploadSeal`] names the answer.
+pub fn seal_upload(
+    body: Body,
+    lengths: UploadLengths,
+    validator: UploadValidator,
+    sealer: ExtentSealer,
+) -> Result<(ByteStream, UploadSeal), IngressError> {
+    if validator.decoded_length() != lengths.decoded
+        || sealer.remaining() != lengths.decoded
+        || sealer.is_complete()
+    {
+        return Err(IngressError::Internal);
+    }
+    let state = Rc::new(RefCell::new(SealState::Open));
+    let pump = SealPump {
+        body: match body {
+            Body::Stream { stream, .. } => Some(stream),
+            _ => None,
+        },
+        validator: Some(validator),
+        sealer: Some(sealer),
+        lengths,
+        received: 0,
+        incoming: Vec::new(),
+        taken: 0,
+        plain: Vec::new(),
+        state: Rc::clone(&state),
+        done: false,
+    };
+    let stream = futures_util::stream::unfold(pump, |mut pump| async move {
+        let item = pump.next().await?;
+        Some((item, pump))
+    });
+    Ok((stream.boxed_local(), UploadSeal(state)))
 }
 
 // ---------------------------------------------------------------------------

@@ -256,6 +256,42 @@ pub struct Blobs {
     pub hold_put_prefix: RefCell<Option<String>>,
     /// A put is waiting.
     pub held: Cell<bool>,
+    /// Every stream that was put, also one that failed.
+    pub streams: RefCell<Vec<StreamSeen>>,
+    /// Called with the length of every piece of a stream as the store
+    /// takes it.
+    pub on_piece: RefCell<Option<PieceHook>>,
+    /// A stream put fails once the store took this many pieces, without
+    /// reading further.
+    pub stop_stream_after: Cell<Option<usize>>,
+    /// What a stream put answers in place of the true receipt.
+    pub false_receipt: Cell<Option<ReceiptLie>>,
+}
+
+/// Told the length of a piece of a stream.
+pub type PieceHook = Box<dyn FnMut(usize)>;
+
+/// Makes another receipt of the true one.
+pub type ReceiptLie = fn(PutReceipt) -> PutReceipt;
+
+/// What the store saw of one stream put.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StreamSeen {
+    pub key: String,
+    /// The length the put declared.
+    pub len: u64,
+    /// The length of every piece the store took.
+    pub pieces: Vec<usize>,
+    /// The stream gave an error.
+    pub failed: bool,
+    /// The put answered `Ok`.
+    pub stored: bool,
+}
+
+impl StreamSeen {
+    pub fn taken(&self) -> u64 {
+        self.pieces.iter().map(|n| *n as u64).sum()
+    }
 }
 
 /// How long a held call waits, in turns of the executor.
@@ -303,6 +339,56 @@ impl BlobStore for Blobs {
         self.trip
             .guard(blob_down, self.inner.put(key, bytes, meta))
             .await
+    }
+    /// Takes the stream piece by piece, as a store that writes it as it
+    /// comes does, then stores it through `put` with every fault of a
+    /// put. Nothing is stored unless the stream gave exactly `len` bytes.
+    async fn put_stream(
+        &self,
+        key: &str,
+        len: u64,
+        body: ByteStream,
+        meta: &StreamMeta<'_>,
+    ) -> Result<PutReceipt> {
+        use futures_util::StreamExt as _;
+        let at = self.streams.borrow().len();
+        self.streams.borrow_mut().push(StreamSeen {
+            key: key.to_string(),
+            len,
+            pieces: Vec::new(),
+            failed: false,
+            stored: false,
+        });
+        let mut body = body;
+        let mut bytes = Vec::new();
+        loop {
+            let taken = self.streams.borrow()[at].pieces.len();
+            if self.stop_stream_after.get().is_some_and(|n| taken >= n) {
+                return Err(BridgeError::Blob("store down".into()));
+            }
+            match body.next().await {
+                None => break,
+                Some(Err(e)) => {
+                    self.streams.borrow_mut()[at].failed = true;
+                    return Err(e);
+                }
+                Some(Ok(piece)) => {
+                    self.streams.borrow_mut()[at].pieces.push(piece.len());
+                    if let Some(hook) = self.on_piece.borrow_mut().as_mut() {
+                        hook(piece.len());
+                    }
+                    bytes.extend_from_slice(&piece);
+                }
+            }
+        }
+        drop(body);
+        let whole = futures_util::stream::iter([Ok(bytes)]).boxed_local();
+        let receipt = put_stream_whole(self, key, len, whole, meta).await?;
+        self.streams.borrow_mut()[at].stored = true;
+        Ok(match self.false_receipt.get() {
+            Some(lie) => lie(receipt),
+            None => receipt,
+        })
     }
     async fn get(&self, key: &str, span: Option<ByteSpan>) -> Result<Option<Vec<u8>>> {
         self.trip.guard(blob_down, self.inner.get(key, span)).await
