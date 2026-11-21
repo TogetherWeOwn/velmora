@@ -124,6 +124,9 @@ impl KeyTarget for FakeTarget {
         self.applies.set(self.applies.get() + 1);
         let mut rows = self.rows.borrow_mut();
         for e in entries {
+            let was_revoked = rows
+                .get(&e.door.id)
+                .is_some_and(|r| r.door.status == SubjectStatus::Revoked);
             let replace = match rows.get(&e.door.id) {
                 None => true,
                 Some(r) => {
@@ -132,7 +135,11 @@ impl KeyTarget for FakeTarget {
                 }
             };
             if replace {
-                rows.insert(e.door.id.clone(), e.clone());
+                let mut row = e.clone();
+                if was_revoked {
+                    row.door.status = SubjectStatus::Revoked;
+                }
+                rows.insert(e.door.id.clone(), row);
             } else if e.door.status == SubjectStatus::Revoked {
                 if let Some(r) = rows.get_mut(&e.door.id) {
                     r.door.status = SubjectStatus::Revoked;
@@ -911,7 +918,7 @@ async fn a_reservation_that_never_matches_the_head_answers_busy() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn an_opening_change_with_the_directory_down_reaches_no_unit_until_finished() {
+async fn an_opening_change_with_the_directory_down_opens_no_unit_until_finished() {
     let w = World::new();
     let adm = FakeAdmission::new(&w.root);
     let mut table = seed(&w, &adm).await;
@@ -926,9 +933,11 @@ async fn an_opening_change_with_the_directory_down_reaches_no_unit_until_finishe
             .unwrap(),
         KeyAnswer::Unfinished { seq: 3 }
     );
-    // Directory first: with it down, no unit holds the key.
-    assert!(w.root.row("AKVL0002").is_none());
-    assert!(w.unit2.row("AKVL0002").is_none());
+    // With the directory down, the units hold the key closed.
+    for unit in [&w.root, &w.unit2] {
+        assert_eq!(unit.status("AKVL0002"), Some(SubjectStatus::Disabled));
+        assert_eq!(unit.seq.get(), 3);
+    }
     w.directory.down.set(false);
     let report = finish_keys(&env, &mut rng).await.unwrap();
     assert!(report.failed.is_empty());
@@ -1285,10 +1294,9 @@ async fn a_retried_create_is_finished_not_refused() {
     }
 }
 
-/// The finisher brings the units up whether or not the directory
-/// answers: the stores order by subject, so no order of the two is
-/// unsafe, and a key a unit holds but the directory does not route is
-/// refused for want of a route.
+/// The finisher brings the units to the head whether or not the
+/// directory answers, but opens nothing there before the directory has
+/// it: what does not close is held closed until then.
 #[tokio::test(flavor = "current_thread")]
 async fn the_finisher_brings_the_units_up_while_the_directory_is_down() {
     let w = World::new();
@@ -1320,7 +1328,7 @@ async fn the_finisher_brings_the_units_up_while_the_directory_is_down() {
     assert!(report.retry());
     for unit in [&w.root, &w.unit2] {
         assert_eq!(unit.status("AKVL0001"), Some(SubjectStatus::Disabled));
-        assert_eq!(unit.status("AKVL0002"), Some(SubjectStatus::Active));
+        assert_eq!(unit.status("AKVL0002"), Some(SubjectStatus::Disabled));
         assert_eq!(unit.seq.get(), 4);
     }
     assert!(w.directory.row("AKVL0002").is_none(), "not routed yet");
@@ -1328,6 +1336,10 @@ async fn the_finisher_brings_the_units_up_while_the_directory_is_down() {
     let report = finish_keys(&env, &mut rng).await.unwrap();
     assert!(!report.retry(), "{report:?}");
     assert_eq!(w.directory.status("AKVL0002"), Some(SubjectStatus::Active));
+    for unit in [&w.root, &w.unit2] {
+        assert_eq!(unit.status("AKVL0002"), Some(SubjectStatus::Active));
+        assert_eq!(unit.status("AKVL0001"), Some(SubjectStatus::Disabled));
+    }
     assert_eq!(w.intents.cleared.borrow().last(), Some(&4));
     assert!(w.intents.notes.borrow().is_empty(), "every row cleared");
 }
@@ -1838,4 +1850,217 @@ fn debug_output_shows_no_prefix_or_address() {
         assert!(!shown.contains("secret-folder"), "{shown}");
         assert!(!shown.contains("203.0.113.7"), "{shown}");
     }
+}
+
+// ---------------------------------------------------------------------------
+// Review, round 3
+// ---------------------------------------------------------------------------
+
+/// Revoked is final in a store: no entry, newer or reopened, makes a
+/// revoked row anything else.
+#[tokio::test(flavor = "current_thread")]
+async fn a_revoked_row_stays_revoked() {
+    let w = World::new();
+    let adm = FakeAdmission::new(&w.root);
+    let stale = seed(&w, &adm).await;
+    let units = w.units();
+    let env = env!(w, &adm, &units);
+    let mut rng = TestRng(101);
+    let mut table = stale.clone();
+    assert_eq!(
+        env.change(&mut table, "r", &revoke("AKVL0001"), &mut rng)
+            .await
+            .unwrap(),
+        KeyAnswer::Done { seq: 3 }
+    );
+    let open = stale.get("AKVL0001").unwrap().clone();
+    // A closed revoked row, then the same seq opened.
+    let mut closed = w.unit2.row("AKVL0001").unwrap();
+    closed.private = None;
+    let unit = FakeTarget::new("unit 3");
+    KeyTarget::apply(&unit, 3, std::slice::from_ref(&closed))
+        .await
+        .unwrap();
+    let mut same = open.clone();
+    same.last_seq = closed.last_seq;
+    KeyTarget::apply(&unit, 3, &[same]).await.unwrap();
+    assert_eq!(unit.status("AKVL0001"), Some(SubjectStatus::Revoked));
+    // A newer entry that is not revoked.
+    let mut newer = open;
+    newer.last_seq = 9;
+    for store in [&w.root, &unit] {
+        KeyTarget::apply(store, 9, std::slice::from_ref(&newer))
+            .await
+            .unwrap();
+        assert_eq!(store.status("AKVL0001"), Some(SubjectStatus::Revoked));
+    }
+}
+
+/// A re-enable with the directory down answers unfinished and opens no
+/// unit; the finisher opens it once the directory has it.
+#[tokio::test(flavor = "current_thread")]
+async fn a_re_enable_with_the_directory_down_opens_no_unit() {
+    let w = World::new();
+    let adm = FakeAdmission::new(&w.root);
+    let mut table = seed(&w, &adm).await;
+    let units = w.units();
+    let env = env!(w, &adm, &units);
+    let mut rng = TestRng(102);
+    assert_eq!(
+        env.change(&mut table, "d", &disable("AKVL0001"), &mut rng)
+            .await
+            .unwrap(),
+        KeyAnswer::Done { seq: 3 }
+    );
+    w.directory.down.set(true);
+    assert_eq!(
+        env.change(&mut table, "e", &enable("AKVL0001"), &mut rng)
+            .await
+            .unwrap(),
+        KeyAnswer::Unfinished { seq: 4 }
+    );
+    let report = finish_keys(&env, &mut rng).await.unwrap();
+    assert!(report.retry());
+    for unit in [&w.root, &w.unit2] {
+        assert_eq!(unit.status("AKVL0001"), Some(SubjectStatus::Disabled));
+        assert_eq!(unit.seq.get(), 4, "the unit still reaches the head");
+    }
+    w.directory.down.set(false);
+    let report = finish_keys(&env, &mut rng).await.unwrap();
+    assert!(!report.retry(), "{report:?}");
+    for store in [&w.root, &w.unit2, &w.directory] {
+        assert_eq!(store.status("AKVL0001"), Some(SubjectStatus::Active));
+    }
+}
+
+/// A widening with the directory down is not in force at any unit: the
+/// key is held closed there until the directory has the head.
+#[tokio::test(flavor = "current_thread")]
+async fn a_widening_with_the_directory_down_is_in_force_nowhere() {
+    let w = World::new();
+    let adm = FakeAdmission::new(&w.root);
+    let mut table = seed(&w, &adm).await;
+    let units = w.units();
+    let env = env!(w, &adm, &units);
+    let mut rng = TestRng(103);
+    w.directory.down.set(true);
+    let widen = KeyRequest::SetGrants {
+        id: "AKVL0001".into(),
+        grants: vec![grant("b_01", RW, None)],
+        acting: None,
+    };
+    assert_eq!(
+        env.change(&mut table, "w", &widen, &mut rng).await.unwrap(),
+        KeyAnswer::Unfinished { seq: 3 }
+    );
+    let report = finish_keys(&env, &mut rng).await.unwrap();
+    assert!(report.retry());
+    for unit in [&w.root, &w.unit2] {
+        let row = unit.row("AKVL0001").unwrap();
+        assert_eq!(
+            row.effective_status(),
+            SubjectStatus::Disabled,
+            "{}",
+            unit.label
+        );
+    }
+    w.directory.down.set(false);
+    let report = finish_keys(&env, &mut rng).await.unwrap();
+    assert!(!report.retry(), "{report:?}");
+    let row = w.root.row("AKVL0001").unwrap();
+    assert_eq!(row.effective_status(), SubjectStatus::Active);
+    assert_eq!(joined(&row), vec![grant("b_01", RW, None)]);
+}
+
+/// A create of an id that `m/rk/` revoked is refused even when the
+/// request is an exact retry of the one that made it.
+#[tokio::test(flavor = "current_thread")]
+async fn an_exact_retry_of_a_create_revoked_in_m_rk_is_refused() {
+    let w = World::new();
+    let adm = FakeAdmission::new(&w.root);
+    let mut table = seed(&w, &adm).await;
+    let units = w.units();
+    let env = env!(w, &adm, &units);
+    let mut rng = TestRng(104);
+    let key = s3_key(&w.t, "AKVL0002", "PR0001", &[grant("b_01", RO, None)]);
+    let req = KeyRequest::Create(key);
+    assert_eq!(
+        env.change(&mut table, "c", &req, &mut rng).await.unwrap(),
+        KeyAnswer::Done { seq: 3 }
+    );
+    // The revoke stopped after its `m/rk/` record.
+    put_tenant_revocation(&w.store, &w.kek, &w.t, "AKVL0002", 5, &mut rng)
+        .await
+        .unwrap();
+    assert_eq!(
+        env.change(&mut table, "c", &req, &mut rng).await.unwrap(),
+        KeyAnswer::Refused(Refusal::Conflict)
+    );
+}
+
+/// A writer whose ring leaves a subject closed answers, but keeps the
+/// pending rows: a run with the key must still open the subject.
+#[tokio::test(flavor = "current_thread")]
+async fn a_writer_with_a_closed_subject_keeps_the_rows() {
+    let w = World::new();
+    let adm = FakeAdmission::new(&w.root);
+    let _ = seed(&w, &adm).await;
+    let v2_only = OneKey(TenantKey::from_bytes(&w.t, 2, derived("tk v2")).unwrap());
+    let units = w.units();
+    let blind = env_with!(w, &v2_only, &adm, &units);
+    let mut rng = TestRng(105);
+    let mut fresh = velmora_bridge::keys::record::KeyTable::empty(w.t.clone());
+    assert_eq!(
+        blind
+            .change(&mut fresh, "d", &disable("AKVL0001"), &mut rng)
+            .await
+            .unwrap(),
+        KeyAnswer::Done { seq: 3 }
+    );
+    assert!(w.intents.notes.borrow().iter().any(|(s, _)| *s == 3));
+    let both = TwoKeys(
+        TenantKey::from_bytes(&w.t, 1, derived("tk")).unwrap(),
+        TenantKey::from_bytes(&w.t, 2, derived("tk v2")).unwrap(),
+    );
+    let full = env_with!(w, &both, &adm, &units);
+    let report = finish_keys(&full, &mut rng).await.unwrap();
+    assert!(!report.retry(), "{report:?}");
+    assert!(w.intents.notes.borrow().is_empty());
+}
+
+/// A subject closed by a record that keeps the private part before is
+/// opened again from the record that holds it (`private_seq`), not from
+/// its newest one.
+#[tokio::test(flavor = "current_thread")]
+async fn a_cached_table_reopens_from_the_record_that_holds_the_private_part() {
+    let w = World::new();
+    let adm = FakeAdmission::new(&w.root);
+    let _ = seed(&w, &adm).await;
+    let v2_only = OneKey(TenantKey::from_bytes(&w.t, 2, derived("tk v2")).unwrap());
+    let units = w.units();
+    let blind = env_with!(w, &v2_only, &adm, &units);
+    let mut rng = TestRng(106);
+    let mut cached = velmora_bridge::keys::record::KeyTable::empty(w.t.clone());
+    assert_eq!(
+        blind
+            .change(&mut cached, "d", &disable("AKVL0001"), &mut rng)
+            .await
+            .unwrap(),
+        KeyAnswer::Done { seq: 3 }
+    );
+    let e = cached.get("AKVL0001").unwrap();
+    assert!(e.private.is_none());
+    assert_eq!((e.last_seq, e.private_seq), (3, 2));
+    let both = TwoKeys(
+        TenantKey::from_bytes(&w.t, 1, derived("tk")).unwrap(),
+        TenantKey::from_bytes(&w.t, 2, derived("tk v2")).unwrap(),
+    );
+    let full = env_with!(w, &both, &adm, &units);
+    assert_eq!(
+        full.change(&mut cached, "e", &enable("AKVL0001"), &mut rng)
+            .await
+            .unwrap(),
+        KeyAnswer::Done { seq: 4 }
+    );
+    assert_eq!(w.root.status("AKVL0001"), Some(SubjectStatus::Active));
 }

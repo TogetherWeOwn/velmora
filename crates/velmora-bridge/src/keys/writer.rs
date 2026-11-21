@@ -5,8 +5,15 @@
 //!
 //! | Change | Order |
 //! |---|---|
-//! | Closing: revoke, disable, narrow | intent → (`m/rk/` for a revoke) → record → root unit → other units → directory |
-//! | Opening: create, re-enable, widen | reservation → intent → (`m/kr/` for a new key) → record → directory → root unit → other units |
+//! | Closing: revoke, disable, narrow | intent → (`m/rk/` for a revoke) → record → units → directory |
+//! | Opening: create, re-enable, widen | reservation → intent → (`m/kr/` for a new key) → record → units (held closed) → directory → units |
+//!
+//! Every bring-up runs the same three steps: the units get the head with
+//! every entry whose record does not close sent closed (held `disabled`),
+//! then the directory, then, only once the directory acknowledged, the
+//! units in full. So a closing change is in force without the directory,
+//! nothing opens at a unit before the directory has it, and a unit still
+//! reaches the head (its lease renews) while the directory is down.
 //!
 //! - **The chain decides.** The writer validates against the head and
 //!   writes exactly the next seq; a lost put reads the head again and
@@ -17,7 +24,7 @@
 //!   earlier record has already narrowed or revoked. A key's grant is
 //!   always checked against the principal it was made under.
 //! - **A call whose effect the head already carries writes no record**,
-//!   but still brings every store to the head, in the order of its class,
+//!   but still brings every store to the head, in the three steps above,
 //!   and waits for each: a retry after a crash must not answer `200` for
 //!   a key that a store still accepts, nor `409` for a key it created.
 //! - **A closing change needs no directory.** The directory step and the
@@ -40,17 +47,10 @@
 //! [`finish_keys`] is the consumer of `apply_control(tenant, keys, seq)`.
 //! It reads the head (never the message's seq), appends a revoke record
 //! for every `m/rk/` revocation that the chain does not yet carry,
-//! brings every store to the head (the units, then the directory),
-//! writes a checkpoint when one is due, and clears the `pending_ops` rows
-//! up to the head once every store holds it with every subject open. A
-//! step that fails is reported and does not stop the others.
-//!
-//! The finisher brings the units up whether or not the directory
-//! answers: a key that a unit holds and the directory does not route is
-//! refused for want of a route (or served through its route record when
-//! a directory read fails), so no order of the two is unsafe. The writer
-//! keeps the directory first for an opening change only so that it never
-//! answers `200` before the change can be used.
+//! brings every store to the head in the three steps above, writes a
+//! checkpoint when one is due, and clears the `pending_ops` rows up to
+//! the head once every store holds it with every subject open. A step
+//! that fails is reported and does not stop the others.
 
 use std::collections::BTreeSet;
 
@@ -361,6 +361,33 @@ fn entries_for(
         .collect()
 }
 
+/// Brings one unit to the table's seq before the directory acknowledged
+/// the head: an entry whose record closes is sent as it is; any other is
+/// sent closed (held `disabled` until a later run opens it), so nothing
+/// opens at a unit before the directory has it, and the unit still
+/// reaches the head.
+async fn bring_up_closing<U: KeyTarget>(
+    target: &U,
+    table: &KeyTable,
+    revoked: &BTreeSet<String>,
+) -> Result<()> {
+    let held = target.keys_seq().await?;
+    if held >= table.seq() && revoked.is_empty() {
+        return Ok(());
+    }
+    let none = BTreeSet::new();
+    let entries: Vec<Entry> = entries_for(table, held, revoked, &none)
+        .into_iter()
+        .map(|mut e| {
+            if !e.closes && e.door.status != SubjectStatus::Revoked {
+                e.private = None;
+            }
+            e
+        })
+        .collect();
+    target.apply(table.seq(), &entries).await
+}
+
 /// Brings one store to the table's seq.
 async fn bring_up<U: KeyTarget>(
     target: &U,
@@ -375,6 +402,27 @@ async fn bring_up<U: KeyTarget>(
     target
         .apply(table.seq(), &entries_for(table, held, revoked, &closed))
         .await
+}
+
+/// What the stores acknowledged.
+#[derive(Clone, Copy)]
+struct Acks {
+    /// Every unit holds the head, with what does not close held closed.
+    closed: bool,
+    /// The directory holds the head.
+    directory: bool,
+    /// Every unit holds the head in full (only after the directory).
+    units: bool,
+}
+
+/// The subjects of `table` whose private part did not open, revoked ones
+/// aside: held `disabled` wherever applied.
+fn closed_subjects(table: &KeyTable) -> Vec<String> {
+    table
+        .entries()
+        .filter(|e| e.private.is_none() && e.door.status != SubjectStatus::Revoked)
+        .map(|e| e.door.id.clone())
+        .collect()
 }
 
 impl<S, K, T, A, I, U, D, C> KeyEnv<'_, S, K, T, A, I, U, D, C>
@@ -392,47 +440,37 @@ where
         u64::try_from(self.clock.now().0).unwrap_or(0)
     }
 
-    /// Applies the head to the units, in order. `false` when one did not
-    /// acknowledge.
-    async fn apply_units(&self, table: &KeyTable, revoked: &BTreeSet<String>) -> bool {
-        let mut all = true;
+    /// Brings every store to the head: the units with what closes, then
+    /// the directory, then, once the directory acknowledged, the units
+    /// with everything. So a closing change needs no directory, and no
+    /// unit opens anything the directory does not have.
+    async fn apply_all(&self, table: &KeyTable, revoked: &BTreeSet<String>) -> Acks {
+        let mut closed = true;
         for unit in self.units {
-            all &= bring_up(unit, table, revoked).await.is_ok();
+            closed &= bring_up_closing(unit, table, revoked).await.is_ok();
         }
-        all
-    }
-
-    /// Brings every store to the head in the order of `class`. `units` is
-    /// whether every unit acknowledged, `directory` whether it did.
-    async fn apply_all(
-        &self,
-        class: Class,
-        table: &KeyTable,
-        revoked: &BTreeSet<String>,
-    ) -> (bool, bool) {
-        match class {
-            Class::Closing => {
-                let units = self.apply_units(table, revoked).await;
-                let directory = bring_up(self.directory, table, revoked).await.is_ok();
-                (units, directory)
+        let directory = bring_up(self.directory, table, revoked).await.is_ok();
+        let mut units = directory;
+        if directory {
+            for unit in self.units {
+                units &= bring_up(unit, table, revoked).await.is_ok();
             }
-            Class::Opening => {
-                let directory = bring_up(self.directory, table, revoked).await.is_ok();
-                // Directory first: with it down, no unit opens anything.
-                let units = directory && self.apply_units(table, revoked).await;
-                (units, directory)
-            }
+        }
+        Acks {
+            closed,
+            directory,
+            units,
         }
     }
 
     /// The answer once the stores were brought up. Clears the pending
-    /// rows up to `seq` when every store holds it.
-    async fn answer(&self, class: Class, seq: u64, (units, directory): (bool, bool)) -> KeyAnswer {
+    /// rows up to `seq` when every store holds it with every subject open.
+    async fn answer(&self, class: Class, table: &KeyTable, seq: u64, acks: Acks) -> KeyAnswer {
         let done = match class {
-            Class::Closing => units,
-            Class::Opening => units && directory,
+            Class::Closing => acks.closed,
+            Class::Opening => acks.units && acks.directory,
         };
-        if units && directory {
+        if acks.units && acks.directory && closed_subjects(table).is_empty() {
             let _ = self
                 .intents
                 .clear(self.tenant, ControlChain::Keys, seq)
@@ -468,8 +506,8 @@ where
                 Planned::Refused(r) => return Ok(KeyAnswer::Refused(r)),
                 Planned::Busy => return Ok(KeyAnswer::Busy),
                 Planned::InHead(class) => {
-                    let acks = self.apply_all(class, table, &revoked).await;
-                    return Ok(self.answer(class, table.seq(), acks).await);
+                    let acks = self.apply_all(table, &revoked).await;
+                    return Ok(self.answer(class, table, table.seq(), acks).await);
                 }
                 Planned::Change(p) => p,
             };
@@ -503,7 +541,7 @@ where
                             // ask again. Ahead: our copy is stale; the loop
                             // reads the head again.
                             if keys_seq < table.seq() {
-                                let _ = self.apply_units(table, &revoked).await;
+                                let _ = self.apply_all(table, &revoked).await;
                             }
                             puts += 1;
                             continue;
@@ -572,8 +610,8 @@ where
             let record = open_key_record(self.kek, self.ring, self.tenant, seq, &bytes)?;
             table.apply(&record)?;
 
-            let acks = self.apply_all(plan.class, table, &revoked).await;
-            return Ok(self.answer(plan.class, seq, acks).await);
+            let acks = self.apply_all(table, &revoked).await;
+            return Ok(self.answer(plan.class, table, seq, acks).await);
         }
         Ok(KeyAnswer::Busy)
     }
@@ -710,10 +748,11 @@ where
     }
     let _ = advance(env.store, env.kek, env.ring, &chain, &mut table).await;
 
-    // The units, then the directory: the stores order by subject, so the
-    // order of the stores does not matter for safety.
+    // The units with what closes, the directory, then the units in full
+    // once the directory has the head: nothing opens at a unit before the
+    // directory has it.
     for unit in env.units {
-        if bring_up(unit, &table, &read.revoked).await.is_err() {
+        if bring_up_closing(unit, &table, &read.revoked).await.is_err() {
             report.failed.push(unit.label().to_owned());
         }
     }
@@ -722,6 +761,14 @@ where
         .is_err()
     {
         report.failed.push(env.directory.label().to_owned());
+    } else {
+        for unit in env.units {
+            if bring_up(unit, &table, &read.revoked).await.is_err()
+                && !report.failed.iter().any(|l| l == unit.label())
+            {
+                report.failed.push(unit.label().to_owned());
+            }
+        }
     }
 
     // A checkpoint when one is due, from the newest one that verified.
@@ -748,11 +795,7 @@ where
     }
 
     report.head = table.seq();
-    report.closed = table
-        .entries()
-        .filter(|e| e.private.is_none() && e.door.status != SubjectStatus::Revoked)
-        .map(|e| e.door.id.clone())
-        .collect();
+    report.closed = closed_subjects(&table);
     if !report.retry() {
         let _ = env
             .intents
