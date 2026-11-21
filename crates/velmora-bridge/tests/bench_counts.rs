@@ -693,7 +693,10 @@ fn bytes(seed: u64, len: usize) -> Vec<u8> {
 }
 
 impl Bench {
-    async fn new(trace: Option<File>, late: bool) -> Bench {
+    /// `set`: Worker variables of this run, as `VELMORA_BENCH_VARS` gives
+    /// them to a full run (a test cannot set the environment of its
+    /// process: the tests of a binary share it).
+    async fn new(trace: Option<File>, late: bool, set: &[(&str, &str)]) -> Bench {
         let mut cfg = ServerConfig::for_test();
         cfg.group = GROUP.to_string();
         cfg.users.clear();
@@ -712,7 +715,9 @@ impl Bench {
         for (k, v) in overrides(&server) {
             vars.insert(k.to_string(), v);
         }
-        let bench_vars = parse_bench_vars(&std::env::var("VELMORA_BENCH_VARS").unwrap_or_default());
+        let mut bench_vars =
+            parse_bench_vars(&std::env::var("VELMORA_BENCH_VARS").unwrap_or_default());
+        bench_vars.extend(set.iter().map(|(k, v)| (k.to_string(), v.to_string())));
         for (k, v) in &bench_vars {
             vars.insert(k.clone(), v.clone());
         }
@@ -1197,8 +1202,8 @@ impl Bench {
 // The scenario
 // ---------------------------------------------------------------------------
 
-async fn scenario(s: &Scale, trace: Option<File>, late: bool) -> Bench {
-    let mut b = Bench::new(trace, late).await;
+async fn scenario(s: &Scale, trace: Option<File>, late: bool, set: &[(&str, &str)]) -> Bench {
+    let mut b = Bench::new(trace, late, set).await;
     let big_parts = s.part * s.parts;
 
     // Ingest. `big/`: whole extents (PutObject and a multipart upload);
@@ -1545,7 +1550,7 @@ fn sanity(b: &Bench) {
 
 #[tokio::test(flavor = "current_thread")]
 async fn bench_counts_smoke() {
-    let b = scenario(&SMOKE, None, false).await;
+    let b = scenario(&SMOKE, None, false, &[]).await;
     sanity(&b);
     let json = report(&b, "smoke");
     assert!(
@@ -1553,6 +1558,54 @@ async fn bench_counts_smoke() {
             .as_u64()
             .unwrap_or(0)
             > 0
+    );
+    // The shipped minimum age ends long after a verify round: every
+    // extent is released by a release job, which asks again.
+    let rows = &json["catalogue_rows"];
+    assert_eq!(
+        rows["verifications"].as_u64(),
+        rows["extents"].as_u64().map(|n| 4 * n)
+    );
+}
+
+/// The whole scenario on the real SQL with `RELEASE_AT_VERIFY=on` and no
+/// minimum age: every extent is released by the verify job that checked
+/// it, on the two rows of that job, and no release job runs.
+#[tokio::test(flavor = "current_thread")]
+async fn bench_counts_smoke_release_at_verify() {
+    let set = [("SAFETY_MIN_AGE_SECS", "0"), ("RELEASE_AT_VERIFY", "on")];
+    let b = scenario(&SMOKE, None, false, &set).await;
+    // No figures of a release job (`sanity`), and the scenario went on
+    // only once no outbox row was left before `done`.
+    sanity(&b);
+    assert!(b
+        .hub
+        .counts
+        .borrow()
+        .keys()
+        .all(|k| !k.ends_with(":release")));
+    assert_eq!(
+        b.sql_count("SELECT count(*) FROM outbox WHERE stage <> 'done'"),
+        0
+    );
+    // One row for each of the two backbones, of the job that released.
+    let extents = b.sql_count("SELECT count(*) FROM extents");
+    assert!(extents > 0);
+    assert_eq!(
+        b.sql_count("SELECT count(*) FROM verifications"),
+        2 * extents
+    );
+    assert_eq!(
+        b.sql_count(
+            "SELECT count(*) FROM extents e WHERE released_at IS NULL OR 2 <> \
+               (SELECT count(DISTINCT v.backbone) FROM verifications v \
+                 WHERE v.extent_id = e.id AND v.result = 'ok' \
+                   AND v.articles_total = e.article_count AND v.plan_rev = e.plan_rev \
+                   AND v.articles_total = \
+                     (CASE v.kind WHEN 'stat' THEN v.articles_present ELSE v.articles_ok END) \
+                   AND v.verified_at <= e.released_at)"
+        ),
+        0
     );
 }
 
@@ -1562,7 +1615,7 @@ async fn bench_counts_smoke() {
 /// claim that finds nothing.
 #[tokio::test(flavor = "current_thread")]
 async fn bench_counts_late_queue_smoke() {
-    let b = scenario(&SMOKE, None, true).await;
+    let b = scenario(&SMOKE, None, true, &[]).await;
     sanity(&b);
     let counts = b.hub.counts.borrow();
     let cron = &counts["stage:cron"];
@@ -1591,7 +1644,7 @@ async fn bench_counts_full() {
     // VELMORA_BENCH_LATE_QUEUE=1: every message is delivered after a
     // dispatcher run (`bench/run-local.sh --late-queue`).
     let late = std::env::var("VELMORA_BENCH_LATE_QUEUE").is_ok_and(|v| v == "1");
-    let b = scenario(&scale, Some(trace), late).await;
+    let b = scenario(&scale, Some(trace), late, &[]).await;
     sanity(&b);
     let json = report(&b, "full");
     std::fs::write(
