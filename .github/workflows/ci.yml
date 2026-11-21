@@ -744,7 +744,9 @@ jobs:
           name: s3-bridge-bundle
           path: workers/s3-bridge/build/
           if-no-files-found: error
-          retention-days: 1
+          # 7 days, not 1: deploy-build no longer re-runs with ci-ok, so a
+          # "re-run failed jobs" of a flaky test job reuses this bundle.
+          retention-days: 7
       # The unstripped wasm of this release: it names the functions in a
       # production trace frame `wasm-function[N]:0xOFF` (same indices and
       # code offsets). Not deployed. See workers/s3-bridge/ops/README.md,
@@ -1138,8 +1140,12 @@ jobs:
   # would name the host) stay out of the public log.
   deploy-alert:
     name: deploy alert
-    needs: [deploy-build, deploy]
-    if: ${{ always() && github.event_name == 'push' && github.ref == 'refs/heads/main' && (needs.deploy-build.result == 'failure' || needs.deploy.result == 'failure' || needs.deploy.result == 'cancelled') }}
+    # deploy-build runs beside the tests, so it also fails on a commit
+    # whose tests fail (a compile error fails both). That commit could
+    # never deploy, and ci-ok already shows it; as before the build moved
+    # beside the tests, a build failure is reported only when ci-ok passed.
+    needs: [ci-ok, deploy-build, deploy]
+    if: ${{ always() && github.event_name == 'push' && github.ref == 'refs/heads/main' && ((needs.deploy-build.result == 'failure' && needs.ci-ok.result == 'success') || needs.deploy.result == 'failure' || needs.deploy.result == 'cancelled') }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     environment: production
