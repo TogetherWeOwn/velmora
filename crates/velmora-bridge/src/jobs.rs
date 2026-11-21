@@ -236,7 +236,14 @@ where
         match self.catalog.restore_pending().await {
             Ok(false) => {}
             Ok(true) => return JobOutcome::Ack,
-            Err(_) => return RETRY,
+            Err(e) => {
+                // The other kinds of job show in the outbox figures; a
+                // sweep that never gets past this check shows nowhere.
+                if matches!(job, Job::Sweep { .. }) {
+                    crate::intents::job_failed(&e);
+                }
+                return RETRY;
+            }
         }
         match job {
             Job::Extent {
