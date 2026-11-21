@@ -298,10 +298,13 @@ exists: restore it to a timestamp, then replay from that timestamp.
 4. `VELMORA_ADMIN_TOKEN_FILE=<file> ops/catalog-replay.sh <base-url> <restore point>`.
    It prints the counts. Exit status 2 means damage was found: read the
    lists before going on.
-   - Use restore point `0` if the database copy is older than
-     `SAFETY_MIN_AGE_SECS`, or if the replay ends with
-     `held_missing_total` above 0. It reads every record, so it takes
-     longer; it is always correct.
+   - Replay from the copy's restore point first: its end checks every
+     `held` row against the store. Run it again from restore point `0`
+     only if it ends with `held_missing_total` above 0. That reads every
+     record, so it takes longer; it is always correct. A copy older than
+     `SAFETY_MIN_AGE_SECS` is likely to need it, and with the shipped 0 a
+     copy of any age can, because a copy may be released minutes after
+     its post.
 5. Check: `GET /_admin/status` (`replay_unfinished` must be `false`), a
    listing, and a GET of a recent object.
 6. Set `MAINTENANCE = "off"` and deploy. Issue access keys again if the
