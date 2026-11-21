@@ -311,15 +311,26 @@ impl RusqliteSql {
 
     /// Runs a multi-statement script (a migration).
     pub fn apply(&self, script: &str) -> Result<()> {
-        self.conn.borrow().execute_batch(script).map_err(map_err)?;
-        if let Some(shadow) = &self.shadow {
-            shadow.apply(script);
+        let twin = self.twin_ready();
+        let local = self.conn.borrow().execute_batch(script).map_err(map_err);
+        if let (true, Some(shadow)) = (twin, &self.shadow) {
+            shadow.apply(script, &local);
         }
-        Ok(())
+        local
+    }
+
+    /// Whether the workerd twin, if any, is to be asked this call; a
+    /// dirty twin is rebuilt first, from the state before the call.
+    fn twin_ready(&self) -> bool {
+        match &self.shadow {
+            Some(shadow) => shadow.ready(&self.conn.borrow()),
+            None => false,
+        }
     }
 
     /// Direct access for assertions. A change made here bypasses the
-    /// port, so a workerd twin is rebuilt from this database after it.
+    /// port, so a workerd twin is rebuilt from this database before the
+    /// next call.
     pub fn with_conn<R>(&self, f: impl FnOnce(&Connection) -> R) -> R {
         let conn = self.conn.borrow();
         let Some(shadow) = &self.shadow else {
@@ -334,7 +345,7 @@ impl RusqliteSql {
         let before = mark(&conn);
         let out = f(&conn);
         if mark(&conn) != before {
-            shadow.rebuild(&conn);
+            shadow.mark_dirty();
         }
         out
     }
@@ -437,26 +448,29 @@ impl RusqliteSql {
 
 impl Sql for RusqliteSql {
     async fn query(&self, sql: &str, params: &[SqlValue]) -> Result<Vec<Row>> {
+        let twin = self.twin_ready();
         let local = self.query_local(sql, params);
-        match &self.shadow {
-            Some(shadow) => shadow.query(sql, params, local),
-            None => local,
+        match (twin, &self.shadow) {
+            (true, Some(shadow)) => shadow.query(sql, params, local),
+            _ => local,
         }
     }
 
     async fn exec(&self, sql: &str, params: &[SqlValue]) -> Result<u64> {
+        let twin = self.twin_ready();
         let local = self.exec_local(sql, params);
-        match &self.shadow {
-            Some(shadow) => shadow.exec(sql, params, local),
-            None => local,
+        match (twin, &self.shadow) {
+            (true, Some(shadow)) => shadow.exec(sql, params, local),
+            _ => local,
         }
     }
 
     async fn batch(&self, stmts: Vec<(&'static str, Vec<SqlValue>)>) -> Result<Vec<u64>> {
+        let twin = self.twin_ready();
         let local = self.batch_local(&stmts);
-        match &self.shadow {
-            Some(shadow) => shadow.batch(&stmts, local),
-            None => local,
+        match (twin, &self.shadow) {
+            (true, Some(shadow)) => shadow.batch(&stmts, local),
+            _ => local,
         }
     }
 }

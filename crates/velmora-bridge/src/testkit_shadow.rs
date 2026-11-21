@@ -24,13 +24,15 @@
 //! trigger.
 //!
 //! A test that changes the database through
-//! [`super::RusqliteSql::with_conn`] bypasses the port. The twin is then
-//! **rebuilt** from the native database: the object is emptied
-//! (`deleteAll`), and the schema, every row (with its rowid) and then
-//! the indexes and triggers are written in one transaction, so no
-//! trigger fires on the copy. Comparing goes on from there. A rebuild
-//! that fails marks the twin `desynced`, and later calls run on SQLite
-//! alone. Every twin writes one line to the file named by
+//! [`super::RusqliteSql::with_conn`] bypasses the port. Before the next
+//! call the twin is then **rebuilt** from the native database: the
+//! object is emptied (`deleteAll`), and the schema, every row (with its
+//! rowid) and then the indexes and triggers are written in one
+//! transaction, so no trigger fires on the copy. Comparing goes on from
+//! there. A call that meets a state with a broken foreign key (which the
+//! object cannot hold) runs on SQLite alone and is counted; the twin is
+//! rebuilt at the next call that meets a whole state. A rebuild that
+//! fails for any other reason marks the twin `desynced`. Every twin writes one line to the file named by
 //! `VELMORA_SQL_SHADOW_LOG` when it is dropped: the test (the thread's
 //! name), the calls compared, the rebuilds, and whether it desynced.
 
@@ -57,7 +59,14 @@ pub(crate) struct Shadow {
     /// Plain `EXPLAIN` answers: engine bytecode, not compared.
     skipped: Cell<u64>,
     rebuilds: Cell<u64>,
-    /// Why the twin stopped being compared, if it did.
+    /// A test changed the database behind the port: the twin is rebuilt
+    /// before the next call.
+    dirty: Cell<bool>,
+    /// Calls that ran on SQLite alone because the state they met broke a
+    /// foreign key (a state the object cannot hold; a later call may find
+    /// it whole again, and the twin is rebuilt then).
+    uncompared: Cell<u64>,
+    /// Why the twin stopped being compared for good, if it did.
     desynced: RefCell<Option<String>>,
     diverged: Cell<bool>,
     log: Option<String>,
@@ -111,38 +120,70 @@ impl Shadow {
             compared: Cell::new(0),
             skipped: Cell::new(0),
             rebuilds: Cell::new(0),
+            dirty: Cell::new(false),
+            uncompared: Cell::new(0),
             desynced: RefCell::new(None),
             diverged: Cell::new(false),
             log: std::env::var("VELMORA_SQL_SHADOW_LOG").ok(),
         })
     }
 
-    /// Makes the twin equal to `conn` again after a change behind the
-    /// port; on failure the twin is desynced.
-    pub(crate) fn rebuild(&self, conn: &rusqlite::Connection) {
+    /// A change behind the port (`with_conn`, a rolled-back unit call):
+    /// the twin is rebuilt from the native database before the next call.
+    pub(crate) fn mark_dirty(&self) {
+        self.dirty.set(true);
+    }
+
+    /// Called before a call runs natively: whether the twin is to be asked
+    /// too. A dirty twin is rebuilt from `conn` first.
+    pub(crate) fn ready(&self, conn: &rusqlite::Connection) -> bool {
         if self.is_desynced() {
-            return;
+            return false;
+        }
+        if !self.dirty.get() {
+            return true;
         }
         // A Durable Object cannot hold rows that break a foreign key: it
         // resets itself when its transaction ends with one. A test that
-        // switched the keys off and left such rows has a state D1 and an
-        // object both refuse, and the twin stops there. Any other reason
-        // to stop fails the run (run-suite.sh).
+        // switched the keys off may pass through such a state (a table
+        // restored one at a time): that call runs on SQLite alone, and the
+        // twin is rebuilt at the next call that meets a whole state. Any
+        // other reason to stop fails the run (run-suite.sh).
         let body = match dump(conn) {
             Ok(body) => body,
-            Err(reason) => return self.desync(reason),
+            Err(reason) if reason == "fk-broken" => {
+                self.uncompared.set(self.uncompared.get() + 1);
+                return false;
+            }
+            Err(reason) => {
+                self.desync(reason);
+                return false;
+            }
         };
         let reply = match self.post(&body.to_string()) {
             Ok(reply) => reply,
-            Err(e) => return self.desync(format!("rebuild-unreachable:{}", e.kind())),
+            Err(e) => {
+                self.desync(format!("rebuild-unreachable:{}", e.kind()));
+                return false;
+            }
         };
         match serde_json::from_str::<Value>(&reply) {
-            Ok(v) if v.get("ok").is_some() => self.rebuilds.set(self.rebuilds.get() + 1),
-            Ok(v) => self.desync(format!(
-                "rebuild-refused:{}",
-                v.get("class").and_then(Value::as_str).unwrap_or("?")
-            )),
-            Err(_) => self.desync("rebuild-unreadable".into()),
+            Ok(v) if v.get("ok").is_some() => {
+                self.rebuilds.set(self.rebuilds.get() + 1);
+                self.dirty.set(false);
+                true
+            }
+            Ok(v) => {
+                self.desync(format!(
+                    "rebuild-refused:{}",
+                    v.get("class").and_then(Value::as_str).unwrap_or("?")
+                ));
+                false
+            }
+            Err(_) => {
+                self.desync("rebuild-unreadable".into());
+                false
+            }
         }
     }
 
@@ -154,14 +195,17 @@ impl Shadow {
         *self.desynced.borrow_mut() = Some(reason);
     }
 
-    pub(crate) fn apply(&self, script: &str) {
-        if self.is_desynced() {
-            return;
-        }
+    /// A script, after it ran natively with `local`; a script SQLite
+    /// refused is asked of the object too, and the error classes compared.
+    pub(crate) fn apply(&self, script: &str, local: &Result<()>) {
         let answer = self.call(json!({"op": "apply", "script": script}), |_| {
             Answer::Applied
         });
-        self.check("apply", script, &[], &Answer::Applied, &answer);
+        let mine = match local {
+            Ok(()) => Answer::Applied,
+            Err(e) => error_answer(e),
+        };
+        self.check("apply", script, &[], &mine, &answer);
     }
 
     pub(crate) fn query(
@@ -170,9 +214,6 @@ impl Shadow {
         params: &[SqlValue],
         local: Result<Vec<Row>>,
     ) -> Result<Vec<Row>> {
-        if self.is_desynced() {
-            return local;
-        }
         let remote = self.call(
             json!({"op": "query", "sql": sql, "params": encode_params(params)}),
             |v| Answer::Rows(decode_rows(v)),
@@ -189,9 +230,6 @@ impl Shadow {
     }
 
     pub(crate) fn exec(&self, sql: &str, params: &[SqlValue], local: Result<u64>) -> Result<u64> {
-        if self.is_desynced() {
-            return local;
-        }
         let remote = self.call(
             json!({"op": "exec", "sql": sql, "params": encode_params(params)}),
             |v| Answer::Changed(v.as_u64().expect("rows changed")),
@@ -212,9 +250,6 @@ impl Shadow {
         stmts: &[(&'static str, Vec<SqlValue>)],
         local: Result<Vec<u64>>,
     ) -> Result<Vec<u64>> {
-        if self.is_desynced() {
-            return local;
-        }
         let list: Vec<Value> = stmts
             .iter()
             .map(|(sql, params)| json!([sql, encode_params(params)]))
@@ -363,15 +398,17 @@ impl Drop for Shadow {
             (false, Some(reason)) => format!("desynced:{reason}"),
             (false, None) => "in-sync".to_string(),
         };
-        // test, twin, calls compared, status, rebuilds, skipped
+        // test, twin, calls compared, status, rebuilds, skipped,
+        // calls that met a state with a broken foreign key
         let line = format!(
-            "{}\t{}\t{}\t{}\t{}\t{}\n",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
             test,
             self.path,
             self.compared.get(),
             status,
             self.rebuilds.get(),
-            self.skipped.get()
+            self.skipped.get(),
+            self.uncompared.get()
         );
         self.append(&line);
     }

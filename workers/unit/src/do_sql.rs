@@ -182,12 +182,17 @@ fn lex(sql: &str) -> Result<Lexed> {
     let mut significant_end = 0;
     let mut after_semicolon = false;
     let mut second_statement = false;
-    // Inside `CREATE [TEMP] TRIGGER … BEGIN … END`, a `;` ends the
-    // statement only after the word END, as SQLite's own reader has it.
-    let mut words_in_statement = 0usize;
-    let mut first_is_create = false;
+    // Inside `CREATE [TEMP|TEMPORARY] TRIGGER … BEGIN … END`, a `;` ends
+    // the statement only as `; END ;` (SQLite's `sqlite3_complete`): the
+    // word END right after a `;` of the body, then a `;`. An `END` of a
+    // `CASE` inside the body does not end it.
+    // `create`: 0 = the statement does not start a trigger (yet), 1 =
+    // after CREATE, 2 = after CREATE TEMP; `words` counts its words.
+    let mut words = 0usize;
+    let mut create = 0u8;
     let mut in_trigger = false;
-    let mut last_word_is_end = false;
+    let mut semicolon_in_body = false;
+    let mut end_after_semicolon = false;
     let mut i = 0;
     // Skips to the end of a quoted run that `close` ends; a doubled
     // `close` is an escaped one.
@@ -225,21 +230,31 @@ fn lex(sql: &str) -> Result<Lexed> {
                 i += 1;
                 continue;
             }
-            b';' if !in_trigger || last_word_is_end => {
+            b';' if !in_trigger || end_after_semicolon => {
                 i += 1;
                 significant_end = i;
                 after_semicolon = true;
-                words_in_statement = 0;
-                first_is_create = false;
+                words = 0;
+                create = 0;
                 in_trigger = false;
-                last_word_is_end = false;
+                semicolon_in_body = false;
+                end_after_semicolon = false;
+                continue;
+            }
+            b';' => {
+                // A `;` of a trigger body.
+                i += 1;
+                second_statement |= after_semicolon;
+                significant_end = i;
+                semicolon_in_body = true;
+                end_after_semicolon = false;
                 continue;
             }
             b'\'' => i = skip_quoted(i + 1, b'\'', true),
             b'"' => i = skip_quoted(i + 1, b'"', true),
             b'`' => i = skip_quoted(i + 1, b'`', true),
             b'[' => i = skip_quoted(i + 1, b']', false),
-            b':' | b'@' | b'$'
+            b':' | b'@' | b'$' | b'#'
                 if (i == 0 || !ident_byte(bytes[i - 1]))
                     && bytes.get(i + 1).is_some_and(|c| ident_byte(*c)) =>
             {
@@ -269,24 +284,33 @@ fn lex(sql: &str) -> Result<Lexed> {
                     i += 1;
                 }
                 let word = &sql[token_start..i];
-                words_in_statement += 1;
-                if words_in_statement == 1 {
-                    first_is_create = word.eq_ignore_ascii_case("create");
-                } else if first_is_create
-                    && words_in_statement <= 3
-                    && word.eq_ignore_ascii_case("trigger")
-                {
-                    in_trigger = true;
-                }
-                last_word_is_end = word.eq_ignore_ascii_case("end");
+                words += 1;
+                let is = |w: &str| word.eq_ignore_ascii_case(w);
+                create = match (words, create) {
+                    (1, _) if is("create") => 1,
+                    (2, 1) if is("trigger") => {
+                        in_trigger = true;
+                        0
+                    }
+                    (2, 1) if is("temp") || is("temporary") => 2,
+                    (3, 2) if is("trigger") => {
+                        in_trigger = true;
+                        0
+                    }
+                    _ => 0,
+                };
+                end_after_semicolon = in_trigger && semicolon_in_body && is("end");
+                semicolon_in_body = false;
                 second_statement |= after_semicolon;
                 significant_end = i;
                 continue;
             }
             _ => i += 1,
         }
-        last_word_is_end = false;
-        words_in_statement += 1;
+        words += 1;
+        create = 0;
+        semicolon_in_body = false;
+        end_after_semicolon = false;
         // A significant token after a `;` begins a second statement.
         second_statement |= after_semicolon;
         significant_end = i;
@@ -582,8 +606,14 @@ mod tests {
         assert_eq!(bind_text(temp, &[]).unwrap(), temp);
         // After the trigger's END, a `;` ends it as any other statement.
         assert!(bind_text(&format!("{trigger}; SELECT 1"), &[]).is_err());
-        // A column named `trigger` does not make a trigger.
+        // A column or a table named `trigger` does not make a trigger.
         assert!(bind_text("SELECT a AS b, c AS trigger FROM t; SELECT 2", &[]).is_err());
+        assert!(bind_text("CREATE TABLE trigger(a); SELECT 1", &[]).is_err());
+        // The END of a CASE inside the body does not end the trigger.
+        let case = "CREATE TRIGGER t AFTER UPDATE ON a BEGIN \
+                    UPDATE b SET x = CASE WHEN NEW.n > 0 THEN 1 ELSE 0 END; END";
+        assert_eq!(bind_text(case, &[]).unwrap(), case);
+        assert!(bind_text(&format!("{case}; SELECT 1"), &[]).is_err());
         assert_eq!(
             significant_end("CREATE TRIGGER t BEGIN SELECT 1; END; -- c"),
             37
@@ -601,6 +631,7 @@ mod tests {
         assert!(bind_text("SELECT :\u{e9}, ?", &[int(1)]).is_err());
         assert!(bind_text("SELECT @x, ?", &[int(1)]).is_err());
         assert!(bind_text("SELECT $x, ?", &[int(1)]).is_err());
+        assert!(bind_text("SELECT #x, ?", &[int(1)]).is_err());
     }
 
     #[test]

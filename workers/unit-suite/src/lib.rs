@@ -24,7 +24,7 @@ use std::collections::HashMap;
 use base64::Engine as _;
 use serde_json::{json, Value};
 use velmora_bridge::{BridgeError, Row, Sql, SqlValue};
-use velmora_unit_do::DoSql;
+use velmora_unit_do::{DoSql, PointInTime};
 // The class macro names `wasm_bindgen` at the crate root.
 use worker::wasm_bindgen;
 use worker::{durable_object, event, Context, DurableObject, Env, Request, Response, State};
@@ -81,6 +81,21 @@ impl DurableObject for SuiteDb {
 }
 
 impl SuiteDb {
+    /// The point-in-time bridge where workerd has no history: a bookmark
+    /// for now, and the local refusal of a time and of a restore (on
+    /// Cloudflare both work; this checks the bridge reaches the calls).
+    async fn pitr(&self) -> Value {
+        let pitr = PointInTime::new(&self.state);
+        let current = pitr.current().await;
+        let at = pitr.at(0).await;
+        let restore = pitr.restore_now("not-a-bookmark").await;
+        json!({
+            "current": current.as_ref().map(|b| !b.is_empty()).unwrap_or(false),
+            "at": at.err().map(|e| e.to_string()),
+            "restore": restore.err().map(|e| e.to_string()),
+        })
+    }
+
     async fn run(&self, body: &Value) -> velmora_bridge::Result<Option<Value>> {
         let text = |k: &str| body.get(k).and_then(Value::as_str);
         Ok(Some(match text("op") {
@@ -103,6 +118,7 @@ impl SuiteDb {
                 };
                 json!(self.sql.exec(sql, &params).await?)
             }
+            Some("pitr") => self.pitr().await,
             Some(op @ ("batch" | "rebuild")) => {
                 let Some(list) = body.get("stmts").and_then(Value::as_array) else {
                     return Ok(None);

@@ -115,6 +115,17 @@ for i in $(seq 0 $((INSTANCES - 1))); do
   fi
 done
 
+# The point-in-time bridge reaches the runtime's calls: workerd keeps no
+# history, so a time and a restore are refused there (they work on
+# Cloudflare), and a bookmark for now is given.
+pitr=$(curl -sf -X POST "http://127.0.0.1:$PORT/db/pitr-check" -d '{"op":"pitr"}' || true)
+if ! printf '%s' "$pitr" | grep -q '"current":true' \
+    || [ "$(printf '%s' "$pitr" | grep -o 'does not implement point-in-time recovery' | wc -l)" -lt 1 ]; then
+  log "point-in-time bridge check failed: $pitr"
+  exit 1
+fi
+log "point-in-time bridge: $pitr"
+
 [ $# -gt 0 ] || set -- --no-fail-fast --lib --tests
 status=0
 log "cargo test -p velmora-bridge $* (primary: $PRIMARY)"
@@ -127,13 +138,14 @@ touch "$RUN/shadow.log"
 # Lines of the twin log: DIVERGENCE / UNREACHABLE (written when they
 # happen, so a panic that a test's own task swallowed still counts), and
 # one line per database: test, twin, calls compared, status (in-sync,
-# desynced:<reason>, diverged), rebuilds, plain EXPLAINs skipped.
+# desynced:<reason>, diverged), rebuilds, plain EXPLAINs skipped, and
+# calls that met a state with a broken foreign key (run on SQLite alone;
+# the twin is rebuilt at the next whole state).
 DB_LINES=$(grep -Ev '^(DIVERGENCE|UNREACHABLE)' "$RUN/shadow.log" || true)
 divergences=$(grep -c '^DIVERGENCE' "$RUN/shadow.log" || true)
 unreachable=$(grep -c '^UNREACHABLE' "$RUN/shadow.log" || true)
-# A twin may stop only at a state that breaks a foreign key (a state D1
-# and a Durable Object both refuse); any other stop fails the run.
-bad_desync=$(printf '%s\n' "$DB_LINES" | awk -F'\t' '$4 ~ /^desynced:/ && $4 != "desynced:fk-broken"' | wc -l)
+# A twin that stops being compared fails the run.
+bad_desync=$(printf '%s\n' "$DB_LINES" | awk -F'\t' '$4 ~ /^desynced:/' | wc -l)
 if [ "$divergences" -gt 0 ] || [ "$unreachable" -gt 0 ] || [ "$bad_desync" -gt 0 ]; then
   [ "$status" -ne 0 ] || status=3
 fi
@@ -141,12 +153,12 @@ fi
   echo "UNIT SUITE SUMMARY"
   echo "workerd: $("$WORKERD" --version) x $INSTANCES; primary: $PRIMARY; args: $*"
   grep -E '^test result:' "$RUN/cargo.log" | awk '{p+=$4; f+=$6; i+=$8} END {printf "tests: %d passed, %d failed, %d ignored\n", p, f, i}'
-  printf '%s\n' "$DB_LINES" | awk -F'\t' 'NF>=4 {n++; c+=$3; r+=$5; k+=$6} NF>=4 && $5>0 {rb++} END {printf "databases: %d; calls compared: %d; plain EXPLAINs skipped: %d; rebuilt after a change behind the port: %d databases, %d rebuilds\n", n, c, k, rb+0, r+0}'
+  printf '%s\n' "$DB_LINES" | awk -F'\t' 'NF>=4 {n++; c+=$3; r+=$5; k+=$6; u+=$7} NF>=4 && $5>0 {rb++} END {printf "databases: %d; calls compared: %d; plain EXPLAINs skipped: %d; rebuilt after a change behind the port: %d databases, %d rebuilds; calls run on SQLite alone at a state with a broken foreign key: %d\n", n, c, k, rb+0, r+0, u+0}'
   echo "divergences: $divergences; twin unreachable: $unreachable"
-  echo "twins stopped at a state with broken foreign keys (allowed):"
-  printf '%s\n' "$DB_LINES" | awk -F'\t' '$4=="desynced:fk-broken"{print "  " $1}' | sort | uniq -c
-  echo "twins stopped for any other reason (fail the run): $bad_desync"
-  printf '%s\n' "$DB_LINES" | awk -F'\t' '$4 ~ /^desynced:/ && $4 != "desynced:fk-broken" {print "  " $1 " " $4}' | sort | uniq -c
+  echo "tests with calls at a state with a broken foreign key (allowed):"
+  printf '%s\n' "$DB_LINES" | awk -F'\t' '$7>0 {u[$1]+=$7} END {for (t in u) printf "  %6d %s\n", u[t], t}' | sort -rn
+  echo "twins stopped (fail the run): $bad_desync"
+  printf '%s\n' "$DB_LINES" | awk -F'\t' '$4 ~ /^desynced:/ {print "  " $1 " " $4}' | sort | uniq -c
   echo "failed tests:"
   grep -E '^test .* FAILED$' "$RUN/cargo.log" | sed 's/^/  /' || true
   echo "exit status: $status"
