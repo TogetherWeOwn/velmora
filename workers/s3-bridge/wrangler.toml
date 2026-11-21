@@ -57,8 +57,9 @@ VERIFY_DELAY_SECS = "120"
 # is asked (STAT) before the release. The rule is the same either way:
 # REQUIRED_BACKBONES backbones that count hold every article, by checks
 # made under the claim that releases, and the full read is on record.
-# A round that ends before the minimum age is over goes to the release
-# job as before, whatever this says. The release by a verify job is one
+# A round that ends before the minimum age is over (counted from the
+# newest post, a repost included) goes to the release job as before,
+# whatever this says. The release by a verify job is one
 # write (copy released and row done together), so Workers of both values
 # and older Workers may run side by side. Its count in the release
 # totals needs migration 0023.

@@ -609,6 +609,35 @@ async fn a_release_the_catalogue_refuses_keeps_the_copy() {
     assert_eq!(rig.sent(), []);
 }
 
+/// The catalogue refuses with the lease intact (the copy is not `held`
+/// by the time of the write): nothing is released and no evidence is
+/// written, the job fails with the row still at `verify`, and it is
+/// tried again.
+#[tokio::test]
+async fn a_release_refused_under_an_intact_lease_is_tried_again() {
+    let rig = rig_on().await;
+    let (s, plan) = rig.on_two(18).await;
+    let n = plan.len();
+    rig.bridge.catalog.releasing_at_release.set(true);
+
+    let outcome = rig.logged(&s, OutboxStage::Verify, 0).await;
+    assert!(matches!(outcome, JobOutcome::Retry { .. }), "{outcome:?}");
+    // The round was made and recorded, and the release was asked for.
+    assert_eq!(rig.calls(), (n, n, 0));
+    assert_eq!(rig.rows(&s).len(), 2);
+    assert!(!rig.bridge.catalog.releasing_at_release.get());
+    let extent = rig.bridge.catalog.extent(&s.extent);
+    assert_eq!(extent.safety_state, SafetyState::Releasing);
+    assert_eq!(extent.release_evidence, None);
+    assert_eq!(extent.released_at, None);
+    assert!(rig.bridge.safety.contains(&s.extent.safety_key()));
+    let row = rig.outbox(&s);
+    assert_eq!(row.stage, OutboxStage::Verify);
+    assert_eq!(row.last_error, Some(FailClass::Internal));
+    assert_eq!(row.lease_until, None);
+    assert_eq!(rig.sent(), []);
+}
+
 /// The backbone an earlier job passed has lost an article since: the
 /// verify job that resumes finds it missing, releases nothing, records
 /// nothing for it and starts verify again, which owns the waits.

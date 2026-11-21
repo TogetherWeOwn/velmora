@@ -891,8 +891,11 @@ second round of `STAT`, its job and its writes are not made.
   backbone.
 - With a minimum age above the time a verify round takes (the shipped
   24 h), the round ends before it is over and the release job does the
-  release as before. Only a round that passes later, such as one after a
-  repost, releases at once.
+  release as before. The verify job releases only where its round passes
+  at least `SAFETY_MIN_AGE_SECS` after the newest post: a backlog of
+  that length, the waits for a missing article, a row a release job sent
+  back to verify. A repost starts the minimum age again, so the round
+  after one goes to the release job.
 - The release by a verify job is one write to the catalogue: the copy
   goes from `held` to `released` and the row from `verify` to `done`
   together, or nothing changes. A job that dies leaves the copy held and

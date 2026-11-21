@@ -2131,6 +2131,15 @@ async fn a_verify_lease_releases_on_its_own_claim_only() {
         Err(BridgeError::Invalid(_))
     ));
     assert_eq!(fx.dump().await, before);
+    // Not a copy that is `releasing`: a verify job begins no release,
+    // so such a copy is one a release job has to finish.
+    let state = "UPDATE extents SET safety_state = ?2, evict_seq = evict_seq + 1 WHERE id = ?1";
+    let id = text(o.extent.as_str());
+    assert_eq!(fx.run(state, &[id.clone(), text("releasing")]).await, 1);
+    let before = fx.dump().await;
+    assert_eq!(release(&l, at).await.unwrap(), Guard::Lost);
+    assert_eq!(fx.dump().await, before, "a copy found releasing");
+    assert_eq!(fx.run(state, &[id, text("held")]).await, 1);
 
     assert_eq!(release(&l, at).await.unwrap(), Guard::Applied(()));
     let je = fx.cat.job_extent(&o.extent, &o.generation).await;
@@ -2154,9 +2163,20 @@ async fn a_verify_lease_releases_on_its_own_claim_only() {
 async fn a_release_by_a_verify_job_leaves_the_rows_of_a_release_job() {
     let fx = Fx::new().await;
     let at = T0.plus_secs(30);
+    // Both rows have a history at verify: a round that got as far as
+    // the second backbone and failed, then the job that passes.
+    async fn again(fx: &Fx, o: &Obj, l: Lease) -> Lease {
+        assert!(fx.cat.set_cursor(&l, 8, T0).await.unwrap());
+        let failed = fx.cat.fail(&l, FailClass::MissingPending, T0, T0);
+        assert!(failed.await.unwrap());
+        assert_eq!(fx.outbox(o, "last_error").await, "missing-pending");
+        fx.claim(o, OutboxStage::Verify, T0).await.unwrap()
+    }
     // By a release job, in its two steps.
     let two = fx.publish(&fx.bucket, "two").await;
     let l = fx.posted(&two, 1, T0).await;
+    let l = again(&fx, &two, l).await;
+    assert_eq!(l.cursor, 8);
     assert!(fx.pass_of(&l, "bb-a", T0, 1).await);
     assert!(fx
         .cat
@@ -2168,14 +2188,17 @@ async fn a_release_by_a_verify_job_leaves_the_rows_of_a_release_job() {
     // By a verify job, in one.
     let one = fx.publish(&fx.bucket, "one").await;
     let v = fx.posted(&one, 1, T0).await;
+    let v = again(&fx, &one, v).await;
     assert!(fx.pass_of(&v, "bb-a", at, 1).await);
 
     // All but the fence, which counts writes: one here, two there.
     let extent_columns = "safety_state, released_at, release_evidence, hot_safety_bytes, \
                           cipher_size, last_read_at, created_at, plan_rev, article_count, \
                           last_verified_at";
-    let outbox_columns = "stage, attempts, next_at, lease_owner, lease_until, cursor, \
-                          last_error, updated_at, sent_at";
+    // All but `attempts`, which counts the claims of the stage that
+    // ended the row: the release stage's there, the verify stage's here.
+    let outbox_columns = "stage, next_at, lease_owner, lease_until, cursor, last_error, \
+                          updated_at, sent_at";
     let rows = |o: &Obj| {
         let (sql, id) = (&fx.cat.sql.0, text(o.extent.as_str()));
         async move {
@@ -2186,10 +2209,12 @@ async fn a_release_by_a_verify_job_leaves_the_rows_of_a_release_job() {
             rows
         }
     };
-    // Before, the two differ in the stage of the row and in nothing else.
+    // Before, the extents are the same, and the row of the verify job
+    // still has what its rounds left on it.
     let (before_one, before_two) = (rows(&one).await, rows(&two).await);
     assert_eq!(before_one[0], before_two[0]);
-    assert_eq!(before_one[1][1..], before_two[1][1..]);
+    assert_ne!(before_one[1], before_two[1]);
+    assert_eq!(fx.outbox(&one, "cursor").await, "8");
     let seq_one = fx.extent(&one, "evict_seq").await;
     let seq_two = fx.extent(&two, "evict_seq").await;
 
@@ -2205,6 +2230,9 @@ async fn a_release_by_a_verify_job_leaves_the_rows_of_a_release_job() {
     assert_eq!(fx.extent(&one, "hot_safety_bytes = cipher_size").await, "1");
     assert_eq!(fx.outbox(&one, "stage").await, "done");
     assert_eq!(rows(&one).await, rows(&two).await, "after");
+    // Nothing of the verify rounds stays on a row that is done.
+    assert_eq!(fx.outbox(&one, "cursor").await, "0");
+    assert_eq!(fx.outbox(&one, "last_error").await, "NULL");
     // The eviction fence moved under both, so a list of evictable
     // extents taken before either release is refused after it.
     assert_ne!(fx.extent(&one, "evict_seq").await, seq_one);

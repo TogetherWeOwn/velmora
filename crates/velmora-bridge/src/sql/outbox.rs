@@ -966,36 +966,49 @@ pub(super) async fn begin_release<S: Sql>(
     }
     let labels =
         serde_json::to_string(counting).map_err(|_| BridgeError::Invalid("backbone labels"))?;
-    let guard = concat!(
-        "INSERT INTO tx_guard(ok) SELECT 0 WHERE NOT EXISTS (SELECT 1 FROM outbox WHERE ",
-        held!(),
-        " AND lease_until >= ?6) \
+    macro_rules! release_guard {
+        ($states:literal) => {
+            concat!(
+                "INSERT INTO tx_guard(ok) SELECT 0 WHERE NOT EXISTS (SELECT 1 FROM outbox WHERE ",
+                held!(),
+                " AND lease_until >= ?6) \
          OR NOT ",
-        live_ref!("?1"),
-        " OR NOT EXISTS (SELECT 1 FROM extents WHERE id = ?1 \
-              AND safety_state IN ('held', 'releasing')) \
+                live_ref!("?1"),
+                " OR NOT EXISTS (SELECT 1 FROM extents WHERE id = ?1 \
+              AND safety_state ",
+                $states,
+                ") \
          OR (SELECT COUNT(*) FROM verifications v JOIN extents e ON e.id = v.extent_id \
               WHERE ",
-        fresh_pass!(),
-        " AND NOT (?9 = 1 \
+                fresh_pass!(),
+                " AND NOT (?9 = 1 \
                 AND EXISTS (SELECT 1 FROM verify_escalations z \
                   WHERE z.backbone = v.backbone AND z.until > e.created_at) \
                 AND NOT EXISTS (SELECT 1 FROM verifications b \
                   WHERE b.extent_id = v.extent_id AND b.backbone = v.backbone AND ",
-        body_on_record!(),
-        "))) < ?5 \
+                body_on_record!(),
+                "))) < ?5 \
          OR ((?8 = 1 OR (?9 = 1 AND EXISTS (SELECT 1 FROM verify_escalations z \
                 JOIN extents o ON o.id = ?1 \
                 WHERE z.until > o.created_at \
                   AND z.backbone IN (SELECT value FROM json_each(?7))))) \
              AND NOT EXISTS (SELECT 1 FROM verifications v \
               JOIN extents e ON e.id = v.extent_id WHERE ",
-        fresh_pass!(),
-        " AND EXISTS (SELECT 1 FROM verifications b \
+                fresh_pass!(),
+                " AND EXISTS (SELECT 1 FROM verifications b \
                 WHERE b.extent_id = v.extent_id AND b.backbone = v.backbone AND ",
-        body_on_record!(),
-        ")))"
-    );
+                body_on_record!(),
+                ")))"
+            )
+        };
+    }
+    // A release job finishes a release that a job before it began and
+    // left `releasing`. A verify job never begins one, so it meets no
+    // such copy, and its one write takes a held copy only.
+    let guard = match whole {
+        false => release_guard!("IN ('held', 'releasing')"),
+        true => release_guard!("= 'held'"),
+    };
     let mark = match whole {
         false => (
             "UPDATE extents SET safety_state = 'releasing', release_evidence = ?2, \
@@ -1031,10 +1044,12 @@ pub(super) async fn begin_release<S: Sql>(
         mark,
     ];
     if whole {
-        // The row as [`finish_release`] leaves it. Last: after this the
-        // lease no longer holds.
+        // The row as the move to the release stage and then
+        // [`finish_release`] leave it: nothing of the verify rounds (the
+        // resume point, the last error) stays on a row that is done.
+        // Last: after this the lease no longer holds.
         let done = concat!(
-            "UPDATE outbox SET stage = 'done', updated_at = ?5, ",
+            "UPDATE outbox SET stage = 'done', updated_at = ?5, cursor = 0, last_error = NULL, ",
             unlease!(),
             " WHERE ",
             held!()
