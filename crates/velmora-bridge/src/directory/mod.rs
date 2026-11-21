@@ -15,6 +15,8 @@
 //!   operations and the gate;
 //! - [`gate`]: the directory gate and the rebuild of the tenant rows from
 //!   the chains, and the read-only comparison of the two;
+//! - [`fence`]: the move's freeze of tenant 0's D1 catalogue: the cutover
+//!   marker, the freeze triggers, the legacy stamp, and the thaw;
 //! - [`tenant_zero`]: whether tenant 0 may be served from the D1
 //!   catalogue, from its record and the database's own marker, and the
 //!   route of a request when the directory cannot be read.
@@ -23,6 +25,7 @@
 //! it and no record is written by it in production.
 
 pub mod chain;
+pub mod fence;
 pub mod gate;
 pub mod record;
 pub mod store;
