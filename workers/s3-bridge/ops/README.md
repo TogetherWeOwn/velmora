@@ -607,9 +607,10 @@ requests in flight, and give rclone one connection per request:
   `--transfers` on the command line).
   - rclone sends up to `transfers x upload_concurrency` requests at
     once: one PutObject per file below the cutoff, and up to
-    `upload_concurrency` parts per file above it. `16 x 1` keeps 16
-    requests in flight whatever the file sizes, as long as 16 files
-    are being copied.
+    `upload_concurrency` parts per file above it. Both are ceilings: a
+    multipart transfer pauses between parts to read the next one. `16 x
+    1` allows up to 16 requests in flight whatever the file sizes, as
+    long as 16 files are being copied.
   - For one large file: `--transfers 1 --s3-upload-concurrency 16`.
   - More than 16 requests at once was not measured.
   - The global `--disable-http2` does the same for every remote of the
