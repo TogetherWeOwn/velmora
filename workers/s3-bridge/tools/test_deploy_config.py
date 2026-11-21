@@ -275,6 +275,73 @@ OLDER = [
 ]
 
 
+class S3HostsTest(GeneratorCase):
+    switch = "VELMORA_S3_HOSTS"
+    log = "extra S3 hosts in the generated config: "
+    first = "s3.customer.example"
+    second = "s3.legacy.example"
+
+    def test_unset_or_empty_preserves_the_baseline(self):
+        _, baseline = self.ok({})
+        for value in (None, ""):
+            out, written = self.ok({self.switch: value})
+            self.assertEqual(written, baseline)
+            self.assertNotIn(b"\nS3_HOSTS", written)
+            self.assertNotIn("S3_HOSTS", tomllib.loads(written.decode("utf-8"))["vars"])
+            self.assertEqual(out.splitlines()[-1], self.log + "0")
+            self.assertNotIn(HOST, out)
+
+    def test_set_adds_one_line_after_the_primary_host_and_logs_only_classes(self):
+        shipped_host = 'S3_HOST = "velmora-s3.<account>.workers.dev"'
+        indented = self.shipped.replace(shipped_host, "  " + shipped_host, 1)
+        _, baseline = self.ok({}, indented)
+        for value, summary in (
+            (f"{self.first}=customer", "1 (customer)"),
+            (f"{self.first}=customer,{self.second}=legacy", "2 (customer,legacy)"),
+        ):
+            with self.subTest(value=value):
+                out, written = self.ok({self.switch: value}, indented)
+                line = f'  S3_HOSTS = "{value}"'
+                expected = add_after(baseline.decode("utf-8"), f'S3_HOST = "{HOST}"', line)
+                self.assertEqual(written, expected.encode("utf-8"))
+                self.assertEqual(written.count(b"S3_HOSTS ="), 1)
+                self.assertEqual(tomllib.loads(written.decode("utf-8"))["vars"]["S3_HOSTS"], value)
+                self.assertEqual(out.splitlines()[-1], self.log + summary)
+                for host in (HOST, self.first, self.second):
+                    self.assertNotIn(host, out)
+
+    def test_invalid_lists_are_refused_before_writing(self):
+        message = (
+            "VELMORA_S3_HOSTS must be a comma separated list of <lowercase host>=legacy|customer, "
+            "at most 8, without S3_HOST or a repeat"
+        )
+        for value in (
+            "A.example=customer", "a.example:443=customer", " a.example=customer",
+            "a.example =customer", "a.example=customer\n", "a.example=Customer",
+            "a.example=public", "a.example", "a.example=", "=legacy",
+            ",a.example=customer", "a.example=customer,", "a.example=customer,,b.example=legacy",
+            "a.example=customer,a.example=legacy", f"{HOST}=customer",
+            ",".join(f"s3-{i}.example=legacy" for i in range(9)),
+        ):
+            with self.subTest(value=value):
+                self.refused({self.switch: value}, message)
+
+    def test_a_shipped_prod_host_list_is_refused_whatever_is_asked(self):
+        for anchor, line in (
+            ('VERIFY_MODE = "body"', 'S3_HOSTS = ""'),
+            ('VERIFY_MODE = "body"', '  "S3_HOSTS" = "extra.example=legacy"'),
+            ("[build]", 'S3_HOSTS = "extra.example=legacy"'),
+            ("[vars]", 'nested = { S3_HOSTS = "extra.example=legacy" }'),
+        ):
+            doctored = add_after(self.shipped, anchor, line)
+            for value in (None, "", f"{self.first}=customer", "invalid"):
+                with self.subTest(line=line, value=value):
+                    self.refused(
+                        {self.switch: value}, "the prod section of the shipped file sets S3_HOSTS",
+                        doctored,
+                    )
+
+
 class RecordLayoutTest(GeneratorCase):
     def test_the_shipped_file_names_no_layout(self):
         doc = tomllib.loads(self.shipped)
@@ -287,7 +354,7 @@ class RecordLayoutTest(GeneratorCase):
         for value in NOT_ASKED:
             out, written = self.ok({SWITCH: value})
             self.assertEqual(written, before, repr(value))
-            self.assertEqual(out.splitlines()[-1], LOG + "flat", repr(value))
+            self.assertEqual(out.splitlines()[-2], LOG + "flat", repr(value))
             self.assertNotIn(b"\nRECORD_LAYOUT", written, repr(value))
             self.assertNotIn("RECORD_LAYOUT", tomllib.loads(written.decode("utf-8"))["vars"])
 
@@ -306,7 +373,7 @@ class RecordLayoutTest(GeneratorCase):
         for older in OLDER:
             _, flat = self.ok({**older, SWITCH: "flat"})
             out, tenant = self.ok({**older, SWITCH: "tenant"})
-            self.assertEqual(out.splitlines()[-1], LOG + "tenant", older)
+            self.assertEqual(out.splitlines()[-2], LOG + "tenant", older)
             lines = flat.decode("utf-8").split("\n")
             mode = older["VELMORA_VERIFY_MODE"] or "body"
             at = [i for i, line in enumerate(lines) if line == f'VERIFY_MODE = "{mode}"']
