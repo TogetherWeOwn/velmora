@@ -1125,10 +1125,14 @@ where
         self.charge(need).await
     }
 
-    /// The piece from the cache or else the safety copy, stamped as
-    /// read. A copy that is absent, short or fails authentication is
-    /// skipped, never served: the next source is tried instead, and
-    /// `Unavailable` says that neither has it.
+    /// The piece from the cache or the safety copy, stamped as read.
+    /// The store the catalogue row says has the extent is asked first
+    /// ([`ExtentRow::safety_first`]), so a hot extent costs one store
+    /// read and not a miss before it; the other store is still asked
+    /// when the first misses, since the row is only a hint. A copy that
+    /// is absent, short or fails authentication is skipped, never
+    /// served: the next source is tried instead, and `Unavailable` says
+    /// that neither has it.
     ///
     /// The ciphertext span and the plaintext are one charge, taken
     /// before a store is asked. Beside the cache write of the extent
@@ -1157,7 +1161,11 @@ where
                 }
             }
         };
-        for from_cache in [true, false] {
+        let order = match extent.safety_first() {
+            true => [false, true],
+            false => [true, false],
+        };
+        for from_cache in order {
             loop {
                 let asked = async {
                     match from_cache {

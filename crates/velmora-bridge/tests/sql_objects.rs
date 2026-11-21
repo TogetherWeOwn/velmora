@@ -145,6 +145,7 @@ impl Fx {
                     release_evidence: None,
                     released_at: None,
                     created_at: now,
+                    hot: Default::default(),
                 }
             })
             .collect();

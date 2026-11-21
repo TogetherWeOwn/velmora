@@ -208,6 +208,7 @@ impl Fx {
             release_evidence: None,
             released_at: None,
             created_at: T0,
+            hot: Default::default(),
         };
         let part = UploadPartRow {
             upload_id: id.clone(),

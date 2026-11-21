@@ -1709,3 +1709,123 @@ async fn a_pinned_extent_is_never_granted_as_unpinned() {
     assert!(right.pinned);
     assert!(catalog.begin_evict(&right).await.unwrap());
 }
+
+// ---------------------------------------------------------------------------
+// Which store a read asks first
+// ---------------------------------------------------------------------------
+
+impl Hot {
+    /// `get` calls on (SAFETY, CACHE) so far.
+    fn store_reads(&self) -> (u64, u64) {
+        let bridge = self.bridge();
+        (bridge.safety.gets(), bridge.cache.gets())
+    }
+
+    /// The store reads and Usenet connections one GET of `key` makes,
+    /// and that it returns the object's bytes.
+    async fn read_cost(&self, key: &str) -> ((u64, u64), u64) {
+        let (safety, cache) = self.store_reads();
+        let connects = self.bridge().nntp.connects();
+        self.get_ok(key).await;
+        let (safety2, cache2) = self.store_reads();
+        (
+            (safety2 - safety, cache2 - cache),
+            (self.bridge().nntp.connects() - connects) as u64,
+        )
+    }
+
+    /// The hint the read path gets for `extent`.
+    async fn hint(&self, key: &str) -> HotCopies {
+        let (_, extents) = self.rig.live(&self.bucket, key).await.unwrap();
+        extents[0].hot
+    }
+}
+
+/// The catalogue row says where the copy is, so a hot extent costs one
+/// store read: no cache miss before a pinned or released safety copy.
+#[tokio::test(flavor = "current_thread")]
+async fn a_read_asks_the_store_the_row_names_first() {
+    let mut hot = hot_with(|cfg| cfg.hot_cap_bytes = u64::MAX / 4).await;
+    let held = hot.put("held").await;
+    hot.discard_jobs();
+    assert_eq!(hot.hint("held").await, HotCopies::default());
+    assert!(held.safety_first());
+    // Pinned: the safety copy alone.
+    assert_eq!(hot.read_cost("held").await, ((1, 0), 0));
+
+    hot.bridge().clock.advance_secs(60);
+    let x = hot.released("released").await;
+    let hint = hot.hint("released").await;
+    assert_eq!(
+        hint,
+        HotCopies {
+            safety: true,
+            cache: false
+        }
+    );
+    // Released and not evicted: the safety copy alone.
+    assert_eq!(hot.read_cost("released").await, ((1, 0), 0));
+
+    // Evicted: both stores miss, as before, then Usenet fills the cache.
+    hot.set_cap(0);
+    assert_eq!(hot.bridge().evict_batch(0).await.unwrap(), x.cipher_size);
+    assert_eq!(hot.hint("released").await, HotCopies::default());
+    hot.bridge().clock.advance_secs(120);
+    assert_eq!(hot.read_cost("released").await, ((1, 1), 1));
+    assert_eq!(
+        hot.hint("released").await,
+        HotCopies {
+            safety: false,
+            cache: true
+        }
+    );
+    // Cached: the cache alone.
+    assert_eq!(hot.read_cost("released").await, ((0, 1), 0));
+}
+
+/// The row is a hint: when the store it names has no copy, the other
+/// store is asked, then Usenet, and the bytes are the object's.
+#[tokio::test(flavor = "current_thread")]
+async fn a_wrong_hint_still_reads_through_the_other_store() {
+    let hot = hot_with(|cfg| cfg.hot_cap_bytes = u64::MAX / 4).await;
+
+    // Pinned, but its safety copy is gone and an uncounted cache blob
+    // has the bytes: safety misses, the cache serves.
+    let held = hot.put("held").await;
+    hot.discard_jobs();
+    hot.uncounted_fill(&held).await;
+    hot.bridge()
+        .safety
+        .inner
+        .delete(&held.id.safety_key())
+        .await
+        .unwrap();
+    assert!(hot.hint("held").await == HotCopies::default());
+    assert_eq!(hot.read_cost("held").await, ((1, 1), 0));
+
+    // Released, the row counts a cache fill that is gone: the cache
+    // misses, the safety copy serves.
+    hot.bridge().clock.advance_secs(60);
+    let x = hot.released("counted").await;
+    hot.sql(
+        "UPDATE extents SET hot_cache_bytes = cipher_size WHERE id = ?1",
+        &x,
+    );
+    assert!(hot.hint("counted").await.cache);
+    assert!(!hot.has_cache(&x));
+    assert_eq!(hot.read_cost("counted").await, ((1, 1), 0));
+
+    // Released, the row counts a safety copy that is gone and no cache
+    // fill: both stores miss and Usenet serves (and fills the cache).
+    let y = hot.released("gone").await;
+    hot.bridge()
+        .safety
+        .inner
+        .delete(&y.id.safety_key())
+        .await
+        .unwrap();
+    assert!(hot.hint("gone").await.safety);
+    hot.bridge().clock.advance_secs(120);
+    assert_eq!(hot.read_cost("gone").await, ((1, 1), 1));
+    assert!(hot.has_cache(&y));
+}

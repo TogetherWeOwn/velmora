@@ -219,6 +219,7 @@ impl Bench {
             release_evidence: None,
             released_at: None,
             created_at: UnixMs(0),
+            hot: Default::default(),
         };
         let total = rows.len() as u32;
         let mut articles = Vec::new();

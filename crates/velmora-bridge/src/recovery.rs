@@ -897,6 +897,7 @@ impl ExtentRecord {
             release_evidence: None,
             released_at: None,
             created_at: UnixMs(self.created_at),
+            hot: Default::default(),
         })
     }
 }

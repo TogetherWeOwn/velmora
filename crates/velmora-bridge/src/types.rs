@@ -919,6 +919,38 @@ pub struct ExtentRow {
     pub release_evidence: Option<String>,
     pub released_at: Option<UnixMs>,
     pub created_at: UnixMs,
+    /// What the row counts of the extent's copies in R2. Read by the
+    /// catalogue, never written through this struct: a row built to be
+    /// inserted carries [`HotCopies::default`].
+    pub hot: HotCopies,
+}
+
+/// Which of an extent's R2 copies its catalogue row counts:
+/// `hot_safety_bytes > 0` (a released safety copy the hot tier has not
+/// evicted) and `hot_cache_bytes > 0` (a cache fill).
+///
+/// The counts are not exact (see `sql/hot.rs`), so this only orders the
+/// stores a read asks: the first one tells where the bytes most likely
+/// are, the other is still asked when it misses, and Usenet after both.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HotCopies {
+    pub safety: bool,
+    pub cache: bool,
+}
+
+impl ExtentRow {
+    /// True when a read should ask the safety copy before the cache:
+    /// the row counts no cache fill, and the safety copy is there by the
+    /// row (pinned while `held` or `releasing`, or released and not
+    /// evicted). Otherwise the cache goes first, as before the hint: a
+    /// row that counts neither copy is most likely cold.
+    pub fn safety_first(&self) -> bool {
+        let pinned = matches!(
+            self.safety_state,
+            SafetyState::Held | SafetyState::Releasing
+        );
+        !self.hot.cache && (pinned || self.hot.safety)
+    }
 }
 
 impl fmt::Debug for ExtentRow {
@@ -943,6 +975,7 @@ impl fmt::Debug for ExtentRow {
             .field("last_verified_at", &self.last_verified_at)
             .field("released_at", &self.released_at)
             .field("created_at", &self.created_at)
+            .field("hot", &self.hot)
             .finish_non_exhaustive()
     }
 }

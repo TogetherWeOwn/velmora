@@ -117,6 +117,7 @@ fn row(bucket: &BucketId, id: &ExtentId, plain_size: usize, sealed: &SealedExten
         release_evidence: None,
         released_at: None,
         created_at: UnixMs::ZERO,
+        hot: Default::default(),
     }
 }
 

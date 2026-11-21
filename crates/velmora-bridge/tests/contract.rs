@@ -1442,6 +1442,7 @@ fn sample_extent(bucket: &BucketId) -> ExtentRow {
         release_evidence: None,
         released_at: None,
         created_at: T0,
+        hot: Default::default(),
     }
 }
 

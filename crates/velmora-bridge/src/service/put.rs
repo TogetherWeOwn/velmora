@@ -168,6 +168,7 @@ async fn put<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: 
         release_evidence: None,
         released_at: None,
         created_at: now,
+        hot: Default::default(),
     };
     let generation = GenerationRow {
         id: generation_id.clone(),
@@ -454,6 +455,7 @@ async fn put_sliced<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: K
             release_evidence: None,
             released_at: None,
             created_at: now,
+            hot: Default::default(),
         });
         offset = offset.saturating_add(slice.plain_size);
     }

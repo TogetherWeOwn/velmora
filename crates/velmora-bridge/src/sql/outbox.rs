@@ -385,6 +385,7 @@ pub(super) async fn job_extent<S: Sql>(
         release_evidence: r.opt_text()?,
         released_at: r.opt_num()?.map(UnixMs),
         created_at: UnixMs(r.num()?),
+        hot: Default::default(),
     };
     let bucket = Bucket {
         id: BucketId::new(r.text()?),

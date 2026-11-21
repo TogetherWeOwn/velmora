@@ -754,6 +754,7 @@ where
         release_evidence: None,
         released_at: None,
         created_at: now,
+        hot: Default::default(),
     };
     let safety_key = extent_id.safety_key();
     bridge
@@ -940,6 +941,7 @@ where
             release_evidence: None,
             released_at: None,
             created_at: now,
+            hot: Default::default(),
         })
         .collect();
     let Some(first) = ids.first() else {

@@ -15,9 +15,9 @@ use crate::ports::{KeyHead, PublishOutcome, Row, Sql, SqlValue};
 use crate::recovery::Recorded;
 use crate::types::{
     BackboneStatus, BridgeError, BucketId, CommitGeneration, CopyGeneration, ExtentId, ExtentRow,
-    ExtentState, ExtentStatus, GenerationId, GenerationRow, GenerationState, ListCursor, ListEntry,
-    ListPage, ListQuery, ObjectStatus, OutboxStage, Precondition, Result, SafetyState, UnixMs,
-    VerifyKind, VerifyResult, WriteId,
+    ExtentState, ExtentStatus, GenerationId, GenerationRow, GenerationState, HotCopies, ListCursor,
+    ListEntry, ListPage, ListQuery, ObjectStatus, OutboxStage, Precondition, Result, SafetyState,
+    UnixMs, VerifyKind, VerifyResult, WriteId,
 };
 
 /// A retired generation's key is shredded this long after retirement;
@@ -149,15 +149,15 @@ fn generation_row(row: Row) -> Result<GenerationRow> {
     })
 }
 
-/// The `extents` columns in schema order, with the place the extent has
-/// in the generation it was first written for.
+/// The `extents` columns of [`ExtentRow`], in its field order, with the
+/// place the extent has in the generation it was first written for.
 pub(super) const EXTENT_COLS: &str =
     "id, bucket_id, generation_id, state, seq, plain_offset, plain_size, cipher_size, \
      media_header, key_mode, wrapped_file_key, plain_md5, plain_sha256, cipher_sha256, \
      safety_state, article_count, plan_rev, last_verified_at, release_evidence, released_at, \
-     created_at";
+     created_at, hot_safety_bytes > 0, hot_cache_bytes > 0";
 
-/// One extent row: the `extents` columns in schema order.
+/// One extent row: the columns of [`EXTENT_COLS`] in that order.
 pub(super) fn extent_row(row: Row) -> Result<ExtentRow> {
     let mut c = Cols::new(row);
     Ok(ExtentRow {
@@ -182,6 +182,10 @@ pub(super) fn extent_row(row: Row) -> Result<ExtentRow> {
         release_evidence: c.opt_text()?,
         released_at: c.opt_ms()?,
         created_at: c.ms()?,
+        hot: HotCopies {
+            safety: c.num::<i64>()? != 0,
+            cache: c.num::<i64>()? != 0,
+        },
     })
 }
 
@@ -254,7 +258,8 @@ const PLACED_EXTENT_COLS: &str =
     "e.id, e.bucket_id, e.generation_id, e.state, ge.seq, ge.plain_offset, \
      e.plain_size, e.cipher_size, e.media_header, e.key_mode, e.wrapped_file_key, \
      e.plain_md5, e.plain_sha256, e.cipher_sha256, e.safety_state, e.article_count, \
-     e.plan_rev, e.last_verified_at, e.release_evidence, e.released_at, e.created_at";
+     e.plan_rev, e.last_verified_at, e.release_evidence, e.released_at, e.created_at, \
+     e.hot_safety_bytes > 0, e.hot_cache_bytes > 0";
 
 /// The last `seq` of generation `?1` whose reference begins at or
 /// before (`$cmp` is `<=`) or before (`<`) the offset `$at`, as a
@@ -363,12 +368,11 @@ pub(super) async fn live_object<S: Sql>(
     let rows = c
         .sql
         .query(
-            "SELECT e.id, e.bucket_id, e.generation_id, e.state, ge.seq, ge.plain_offset, \
-               e.plain_size, e.cipher_size, e.media_header, e.key_mode, e.wrapped_file_key, \
-               e.plain_md5, e.plain_sha256, e.cipher_sha256, e.safety_state, e.article_count, \
-               e.plan_rev, e.last_verified_at, e.release_evidence, e.released_at, e.created_at \
-             FROM generation_extents ge JOIN extents e ON e.id = ge.extent_id \
-             WHERE ge.generation_id = ?1 ORDER BY ge.seq",
+            &format!(
+                "SELECT {PLACED_EXTENT_COLS} \
+                 FROM generation_extents ge JOIN extents e ON e.id = ge.extent_id \
+                 WHERE ge.generation_id = ?1 ORDER BY ge.seq"
+            ),
             &[text(generation.id.as_str())],
         )
         .await?;

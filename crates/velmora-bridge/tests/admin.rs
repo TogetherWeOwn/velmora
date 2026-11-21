@@ -410,6 +410,7 @@ impl Fx {
                 release_evidence: None,
                 released_at: None,
                 created_at: now,
+                hot: Default::default(),
             });
             offset += plain.len() as u64;
             let meta = BlobMeta {
