@@ -938,14 +938,15 @@ pass starts then).
    collector deletes a dropped part in a bucket flagged disposable as
    soon as it is dropped, and the run would show nothing about this
    one. Abort an upload, upload a part twice and keep one upload open.
-   Wait until the row `orphans` of `scan_cursors` reads `rest:<ms>`:
-   the collector has then made a pass (the first cron run of a new
-   deployment can be a quarter of an hour away). The copies of the
-   dropped parts are still in `SAFETY` (`x/<extent id>`): the grace
-   period holds them. Then date the `gc` rows of the dropped
-   parts 31 days back, delete the row `orphans` of `scan_cursors` on
-   that environment (the scan rests a day after a pass that found
-   nothing), and wait for a cron run. Then see both: the
+   Then delete the row `orphans` of `scan_cursors` on that environment
+   (the scan rests a day after a pass, and a database used before may
+   hold a row from then) and wait until the row is back and reads
+   `rest:<ms>`: the collector has then made a pass since the parts
+   were dropped (the first cron run of a new deployment can be a
+   quarter of an hour away). The copies of the dropped parts are still
+   in `SAFETY` (`x/<extent id>`): the grace period holds them. Then
+   date the `gc` rows of the dropped parts 31 days back, delete the
+   row `orphans` again, and wait for a cron run. Then see both: the
    copies of the dropped parts are gone from `SAFETY` and their
    extents say `deleted` with the `gc` row closed, so the collector
    did run; and the open upload completes and reads back.
