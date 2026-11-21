@@ -1,0 +1,21 @@
+[package]
+name = "velmora-unit-suite"
+version = "0.1.0"
+edition = "2021"
+# The locked Worker SDK (worker 0.8.7) requires Rust 1.91.
+rust-version = "1.91"
+description = "Test Worker: runs the catalogue test suite on Durable Object SQLite in workerd through DoSql, and reads the unit probe gates; never part of the production Worker"
+license = "MIT"
+repository = "https://github.com/TogetherWeOwn/velmora"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+path = "src/lib.rs"
+
+[dependencies]
+velmora-bridge = { version = "0.1.0", path = "../../crates/velmora-bridge" }
+velmora-unit-do = { version = "0.1.0", path = "../unit" }
+worker = { version = "0.8" }
+serde_json = "1"
+base64 = "0.22"

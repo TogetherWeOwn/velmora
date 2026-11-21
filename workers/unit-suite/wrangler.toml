@@ -1,0 +1,18 @@
+# Test Worker for the unit's database adapter (tenancy ADR §8.3, P0b).
+# Local only: `wrangler dev --local` (run-suite.sh). It is never deployed
+# with this file; a probe deployment uses its own throwaway name.
+name = "velmora-unit-suite"
+main = "build/worker/shim.mjs"
+compatibility_date = "2026-11-01"
+workers_dev = false
+
+[build]
+command = "cargo install -q --locked worker-build@0.8.7 && worker-build --release"
+
+[exports.SuiteDb]
+type = "durable-object"
+storage = "sqlite"
+
+[[durable_objects.bindings]]
+name = "SUITE_DB"
+class_name = "SuiteDb"

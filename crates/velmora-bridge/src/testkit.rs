@@ -19,6 +19,8 @@ use rusqlite::{params_from_iter, Connection, StatementStatus};
 use sha2::{Digest, Sha256};
 
 use crate::meter::Meter;
+#[path = "testkit_shadow.rs"]
+mod shadow;
 pub use crate::meter::{Tally, WriteOp, WriteReport};
 use crate::ports::{
     BlobMeta, BlobStore, Catalog, Clock, Guard, JobSink, Kek, PublishOutcome, Row, Sql, SqlValue,
@@ -29,6 +31,7 @@ use crate::types::{
     BridgeError, BucketId, ByteSpan, CommitGeneration, CompleteUpload, CopyGeneration, ExtentId,
     Job, KekBytes, Precondition, Result, UnixMs,
 };
+use shadow::Shadow;
 
 /// The D1 schema, applied by [`RusqliteSql::with_schema`].
 pub const MIGRATION_0001: &str =
@@ -127,6 +130,9 @@ pub struct RusqliteSql {
     meter: RefCell<Option<Meter>>,
     /// What [`Sql::query`] has cost since the last reset.
     reads: Cell<ReadStats>,
+    /// The twin in workerd, when `VELMORA_SQL_SHADOW` is set
+    /// (`testkit_shadow.rs`).
+    shadow: Option<Shadow>,
 }
 
 /// The cost of the statements run through [`Sql::query`]: how many (one
@@ -219,6 +225,7 @@ impl RusqliteSql {
             conn: RefCell::new(conn),
             meter: RefCell::new(None),
             reads: Cell::new(ReadStats::default()),
+            shadow: Shadow::from_env(),
         })
     }
 
@@ -304,17 +311,35 @@ impl RusqliteSql {
 
     /// Runs a multi-statement script (a migration).
     pub fn apply(&self, script: &str) -> Result<()> {
-        self.conn.borrow().execute_batch(script).map_err(map_err)
+        self.conn.borrow().execute_batch(script).map_err(map_err)?;
+        if let Some(shadow) = &self.shadow {
+            shadow.apply(script);
+        }
+        Ok(())
     }
 
-    /// Direct access for assertions.
+    /// Direct access for assertions. A change made here bypasses the
+    /// port, so a workerd twin is rebuilt from this database after it.
     pub fn with_conn<R>(&self, f: impl FnOnce(&Connection) -> R) -> R {
-        f(&self.conn.borrow())
+        let conn = self.conn.borrow();
+        let Some(shadow) = &self.shadow else {
+            return f(&conn);
+        };
+        let mark = |c: &Connection| {
+            let version: i64 = c
+                .query_row("PRAGMA schema_version", [], |r| r.get(0))
+                .unwrap_or(-1);
+            (c.total_changes(), version)
+        };
+        let before = mark(&conn);
+        let out = f(&conn);
+        if mark(&conn) != before {
+            shadow.rebuild(&conn);
+        }
+        out
     }
-}
 
-impl Sql for RusqliteSql {
-    async fn query(&self, sql: &str, params: &[SqlValue]) -> Result<Vec<Row>> {
+    fn query_local(&self, sql: &str, params: &[SqlValue]) -> Result<Vec<Row>> {
         check_params(params)?;
         let conn = self.conn.borrow();
         // Whatever a failed statement left behind was rolled back.
@@ -349,7 +374,7 @@ impl Sql for RusqliteSql {
         Ok(out)
     }
 
-    async fn exec(&self, sql: &str, params: &[SqlValue]) -> Result<u64> {
+    fn exec_local(&self, sql: &str, params: &[SqlValue]) -> Result<u64> {
         let conn = self.conn.borrow();
         let mut meter = self.meter.borrow_mut();
         // What a failed query left behind was rolled back.
@@ -374,7 +399,7 @@ impl Sql for RusqliteSql {
 
     /// One transaction: the first failing statement (a guard CHECK or any
     /// other error) rolls back every statement of the batch.
-    async fn batch(&self, stmts: Vec<(&'static str, Vec<SqlValue>)>) -> Result<Vec<u64>> {
+    fn batch_local(&self, stmts: &[(&'static str, Vec<SqlValue>)]) -> Result<Vec<u64>> {
         let mut conn = self.conn.borrow_mut();
         let mut meter = self.meter.borrow_mut();
         // What a failed query left behind was rolled back.
@@ -384,7 +409,7 @@ impl Sql for RusqliteSql {
         let tx = conn.transaction().map_err(map_err)?;
         let mut changed = Vec::with_capacity(stmts.len());
         let mut priced = Vec::new();
-        for (sql, params) in &stmts {
+        for (sql, params) in stmts {
             // On error `tx` drops here, which rolls back; nothing of the
             // batch was written, so nothing of it is metered.
             match run_to_completion(&tx, sql, params) {
@@ -407,6 +432,32 @@ impl Sql for RusqliteSql {
             }
         }
         Ok(changed)
+    }
+}
+
+impl Sql for RusqliteSql {
+    async fn query(&self, sql: &str, params: &[SqlValue]) -> Result<Vec<Row>> {
+        let local = self.query_local(sql, params);
+        match &self.shadow {
+            Some(shadow) => shadow.query(sql, params, local),
+            None => local,
+        }
+    }
+
+    async fn exec(&self, sql: &str, params: &[SqlValue]) -> Result<u64> {
+        let local = self.exec_local(sql, params);
+        match &self.shadow {
+            Some(shadow) => shadow.exec(sql, params, local),
+            None => local,
+        }
+    }
+
+    async fn batch(&self, stmts: Vec<(&'static str, Vec<SqlValue>)>) -> Result<Vec<u64>> {
+        let local = self.batch_local(&stmts);
+        match &self.shadow {
+            Some(shadow) => shadow.batch(&stmts, local),
+            None => local,
+        }
     }
 }
 
