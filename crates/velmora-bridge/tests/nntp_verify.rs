@@ -1529,10 +1529,11 @@ async fn removed_backbone_does_not_count() {
     assert!(rig.safety_held(&s));
 }
 
-/// A job died between the release decision and its last step: the next job
-/// finishes the release without reading anything.
+/// A job died between the release decision and its last step: the next
+/// job does not take that decision over. It decides again, asking every
+/// backbone for every article, and then finishes the release.
 #[tokio::test]
-async fn interrupted_release_is_finished() {
+async fn interrupted_release_is_decided_again_and_finished() {
     let rig = two_backbone_rig().await;
     let (s, _) = rig.verified_on_two(13).await;
     rig.bridge.catalog.edit(&s.extent, |e| {
@@ -1541,7 +1542,7 @@ async fn interrupted_release_is_finished() {
     let connects = rig.bridge.nntp.connects();
 
     assert_eq!(rig.run(&s, OutboxStage::Release).await, JobOutcome::Ack);
-    assert_eq!(rig.bridge.nntp.connects(), connects);
+    assert!(rig.bridge.nntp.connects() > connects);
     assert!(rig.bridge.safety.contains(&s.extent.safety_key()));
     assert_eq!(
         rig.bridge.catalog.extent(&s.extent).safety_state,

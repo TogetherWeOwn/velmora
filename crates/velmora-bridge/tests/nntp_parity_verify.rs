@@ -580,3 +580,103 @@ async fn a_full_read_of_the_data_alone_is_read_in_full_again() {
     let ok = VerifyResult::Ok;
     assert_eq!(summary(last), ("bb1", VerifyKind::Body, ok, ALL, ALL));
 }
+
+impl Rig {
+    /// The extent as a job left it that died between the release
+    /// decision and its last step.
+    fn left_releasing(&self, s: &Seeded) {
+        self.bridge.catalog.edit(&s.extent, |e| {
+            e.job.extent.safety_state = SafetyState::Releasing;
+            e.job.extent.release_evidence = Some("[]".into());
+        });
+    }
+}
+
+/// A release left half-done by a version from before parity was decided
+/// on the data articles alone. The job that finds it does not finish
+/// it: the decision is withdrawn and taken again, on every article. The
+/// passes on record are of the data alone, so the extent goes back to
+/// verify with its safety copy held, and is released once every article
+/// was read.
+#[tokio::test]
+async fn a_release_left_half_done_without_the_parity_checks_is_not_finished() {
+    let rig = parity_rig(false).await;
+    let (s, _) = rig.verified_on_two(31).await;
+    rig.bridge.catalog.edit(&s.extent, |e| {
+        for v in &mut e.verifications {
+            v.articles_ok = DATA;
+            v.articles_total = DATA;
+        }
+    });
+    rig.left_releasing(&s);
+
+    assert_eq!(rig.run(&s, OutboxStage::Release).await, JobOutcome::Ack);
+    assert!(!rig.released(&s));
+    assert_eq!(rig.outbox(&s).stage, OutboxStage::Verify);
+    assert!(rig.safety_held(&s));
+
+    rig.bridge.clock.advance_secs(1);
+    assert_eq!(rig.run(&s, OutboxStage::Verify).await, JobOutcome::Ack);
+    rig.bridge.clock.advance_secs(1);
+    assert_eq!(rig.run(&s, OutboxStage::Release).await, JobOutcome::Ack);
+    assert!(rig.released(&s));
+}
+
+/// A release left half-done whose passes are gone (a replay put another
+/// addendum on the extent and dropped them): nothing on record speaks
+/// for the plan as it is, so nothing is released.
+#[tokio::test]
+async fn a_release_left_half_done_without_its_passes_is_not_finished() {
+    let rig = parity_rig(false).await;
+    let (s, _) = rig.verified_on_two(32).await;
+    rig.bridge
+        .catalog
+        .edit(&s.extent, |e| e.verifications.clear());
+    rig.left_releasing(&s);
+
+    assert_eq!(rig.run(&s, OutboxStage::Release).await, JobOutcome::Ack);
+    assert!(!rig.released(&s));
+    assert_eq!(rig.outbox(&s).stage, OutboxStage::Verify);
+    assert!(rig.safety_held(&s));
+}
+
+/// A release left half-done, and a parity article has gone from the
+/// second backbone since: the job asks for every article again, finds
+/// it missing and releases nothing.
+#[tokio::test]
+async fn a_release_left_half_done_asks_for_the_parity_articles_again() {
+    let mut rig = parity_rig(false).await;
+    rig.bridge.cfg.propagation_grace_secs = LONG_GRACE_SECS;
+    let (s, parity) = rig.verified_on_two(33).await;
+    rig.left_releasing(&s);
+    rig.servers[1].hide(&parity.articles[1].message_id).await;
+
+    assert_eq!(rig.run(&s, OutboxStage::Release).await, JobOutcome::Ack);
+    assert!(!rig.released(&s));
+    assert_eq!(rig.outbox(&s).stage, OutboxStage::Verify);
+    assert!(rig.safety_held(&s));
+}
+
+/// A release left half-done on a sound decision is taken again and goes
+/// through: every backbone is asked for every article once more, and
+/// the evidence is that of the job that finished it.
+#[tokio::test]
+async fn a_release_left_half_done_is_decided_again_and_finished() {
+    let rig = parity_rig(false).await;
+    let (s, _) = rig.verified_on_two(34).await;
+    rig.left_releasing(&s);
+    let connects = rig.bridge.nntp.connects();
+
+    assert_eq!(rig.run(&s, OutboxStage::Release).await, JobOutcome::Ack);
+    assert!(rig.bridge.nntp.connects() > connects);
+    assert!(rig.released(&s));
+    assert_eq!(rig.outbox(&s).stage, OutboxStage::Done);
+    let evidence = rig.bridge.catalog.extent(&s.extent).release_evidence;
+    let evidence: serde_json::Value = serde_json::from_str(&evidence.unwrap()).unwrap();
+    let entries = evidence.as_array().unwrap();
+    assert!(!entries.is_empty());
+    for e in entries {
+        assert_eq!(e["total"], ALL);
+        assert_eq!(e["parity"], PARITY);
+    }
+}

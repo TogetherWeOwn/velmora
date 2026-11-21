@@ -4477,7 +4477,9 @@ async fn gc_drops_the_parity_addendum_with_its_plan() {
 /// A replay that replaces a packed plan that cannot be read leaves no
 /// addendum of another plan beside the new one: the record's addendum
 /// goes in when it is one of the new plan, else the row's own when that
-/// is one, else none.
+/// is one, else none. Where the addendum is not the one the row had,
+/// the passes on record go and the claim in flight ends; where it is,
+/// both stay.
 #[tokio::test]
 async fn a_replay_keeps_no_addendum_of_another_plan() {
     use velmora_bridge::replay::ReplayExtent;
@@ -4501,6 +4503,9 @@ async fn a_replay_keeps_no_addendum_of_another_plan() {
                         parity_count = 1 WHERE id = ?1";
         let params = [text(o.extent.as_str()), SqlValue::Blob(on_row.clone())];
         assert_eq!(fx.run(set_plan, &params).await, 1);
+        // A job holds the row, and a pass of three articles is on record.
+        let l = fx.claim(&o, OutboxStage::Post, T0).await.unwrap();
+        fx.pass_of(&l, "bb-a", T0, VerifyKind::Body, 3).await;
         replay.push(ReplayExtent {
             row: extent_rows.remove(0),
             packed: Some(blob.clone()),
@@ -4508,7 +4513,7 @@ async fn a_replay_keeps_no_addendum_of_another_plan() {
             parity: (key == "record").then(|| addendum.clone()),
             safety_present: true,
         });
-        made.push((o, blob, addendum, on_row));
+        made.push((o, blob, addendum, on_row, l));
     }
     let stranded = fx
         .cat
@@ -4516,9 +4521,22 @@ async fn a_replay_keeps_no_addendum_of_another_plan() {
         .await
         .unwrap();
     assert!(stranded.is_empty(), "{stranded:?}");
-    for ((o, blob, addendum, on_row), key) in made.iter().zip(keys) {
+    for ((o, blob, addendum, on_row, l), key) in made.iter().zip(keys) {
         let stored = fx.cat.stored_plan(&o.extent).await.unwrap();
         assert_eq!(stored.packed.as_deref(), Some(&blob[..]), "{key}");
+        let kept = key == "own";
+        let sql = "SELECT COUNT(*) FROM verifications WHERE extent_id = ?1";
+        let passes = fx.cat.sql.0.query(sql, &[text(o.extent.as_str())]).await;
+        assert_eq!(
+            passes.unwrap()[0][0],
+            SqlValue::Int(i64::from(kept)),
+            "{key}"
+        );
+        assert_eq!(
+            fx.cat.renew(l, T0.plus_secs(10)).await.unwrap(),
+            kept,
+            "{key}"
+        );
         let want = match key {
             "stale" => None,
             "own" => Some(&on_row[..]),
@@ -5261,4 +5279,200 @@ async fn a_replay_survives_a_parity_count_that_is_no_number() {
         let kept = i64::from(i + 1 == made.len());
         assert_eq!(passes[0][0], SqlValue::Int(kept), "row {i}");
     }
+}
+
+/// A replay that writes another addendum on an extent ends every claim
+/// on it in the same batch. A job that read the plan before the replay
+/// asked the backbones for the articles of the old addendum: what it
+/// found is not recorded, and it releases nothing. The row is free at
+/// once for a job that reads the plan as it is now.
+#[tokio::test]
+async fn a_replay_that_replaces_an_addendum_ends_the_claims_in_flight() {
+    use velmora_bridge::replay::ReplayExtent;
+    let fx = Fx::new().await;
+    let bucket = fx.cat.bucket_by_name("scratch").await.unwrap().unwrap();
+    let counting = labels(&["bb-a", "bb-b"]);
+    let later = T0.plus_ms(HOUR_MS);
+    // The addendum on the row is damaged, the record has the sound one.
+    let replace = async |o: &Obj, key: &str, at: UnixMs| {
+        let (_, mut extent_rows) = fx.cat.live_object(&fx.bucket, key).await.unwrap().unwrap();
+        let stored = fx.cat.stored_plan(&o.extent).await.unwrap();
+        let (blob, addendum) = (stored.packed.unwrap(), stored.parity.unwrap());
+        let mut cut = addendum.clone();
+        cut.truncate(40);
+        let sql = "UPDATE extents SET parity = ?2 WHERE id = ?1";
+        let id = text(o.extent.as_str());
+        assert_eq!(fx.run(sql, &[id, SqlValue::Blob(cut)]).await, 1);
+        let replay = [ReplayExtent {
+            row: extent_rows.remove(0),
+            packed: Some(blob),
+            plan: Some(stored.rows),
+            parity: Some(addendum.clone()),
+            safety_present: true,
+        }];
+        let stranded = fx.cat.replay_extents(&bucket, &replay, at).await.unwrap();
+        assert!(stranded.is_empty());
+        let stored = fx.cat.stored_plan(&o.extent).await.unwrap();
+        assert_eq!(stored.parity, Some(addendum));
+        // Again: the claim taken since is not ended a second time.
+        replay
+    };
+    let passes = async |o: &Obj| {
+        let sql = "SELECT COUNT(*) FROM verifications WHERE extent_id = ?1";
+        let rows = fx.cat.sql.0.query(sql, &[text(o.extent.as_str())]).await;
+        rows.unwrap()[0][0].clone()
+    };
+    let pass = |l: &Lease, backbone: &str, at: UnixMs, kind: VerifyKind| VerificationRow {
+        extent_id: l.extent.clone(),
+        backbone: backbone.into(),
+        provider_id: format!("p-{backbone}"),
+        verified_at: at,
+        plan_rev: 1,
+        articles_ok: 3,
+        articles_total: 3,
+        result: VerifyResult::Ok,
+        kind,
+    };
+
+    // A verify job in flight: its full read is of the old addendum.
+    let (o, l) = fx.posted_packed("verify", true).await;
+    let replay = replace(&o, "verify", T0.plus_secs(1)).await;
+    let read = pass(&l, "bb-a", T0.plus_secs(2), VerifyKind::Body);
+    assert!(!fx.cat.record_verification(&l, &read).await.unwrap());
+    assert!(!fx
+        .cat
+        .advance(&l, OutboxStage::Release, later, T0)
+        .await
+        .unwrap());
+    assert_eq!(passes(&o).await, SqlValue::Int(0));
+    assert_eq!(fx.extent(&o, "last_verified_at").await, "NULL");
+    // The row is where it was and free: the next job has it at once.
+    let again = fx.claim(&o, OutboxStage::Verify, T0.plus_secs(2)).await;
+    let again = again.expect("the row is free");
+    assert_ne!(again.token, l.token);
+    // A second replay of the same record changes nothing: the claim
+    // taken since stands.
+    let at = T0.plus_secs(3);
+    fx.cat.replay_extents(&bucket, &replay, at).await.unwrap();
+    let read = pass(&again, "bb-a", at, VerifyKind::Body);
+    assert!(fx.cat.record_verification(&again, &read).await.unwrap());
+
+    // A release job in flight, under the light check and outside the
+    // sample: its `STAT` answers are for the old addendum.
+    let (o, l) = fx.posted_packed("release", true).await;
+    fx.pass_of(&l, "bb-a", T0, VerifyKind::Stat, 3).await;
+    fx.pass_of(&l, "bb-b", T0, VerifyKind::Stat, 3).await;
+    assert!(fx
+        .cat
+        .advance(&l, OutboxStage::Release, later, T0)
+        .await
+        .unwrap());
+    let r = fx.claim(&o, OutboxStage::Release, later).await.unwrap();
+    replace(&o, "release", later.plus_ms(1)).await;
+    for backbone in ["bb-a", "bb-b"] {
+        let found = pass(&r, backbone, later.plus_ms(2), VerifyKind::Stat);
+        assert!(!fx.cat.record_verification(&r, &found).await.unwrap());
+    }
+    let begun = fx
+        .cat
+        .begin_release_light(&r, 2, &counting, "[]", later.plus_ms(3), false)
+        .await
+        .unwrap();
+    assert_eq!(begun, Guard::Lost);
+    assert_eq!(passes(&o).await, SqlValue::Int(0));
+    assert_eq!(fx.extent(&o, "safety_state").await, "held");
+    assert_eq!(fx.extent(&o, "release_evidence").await, "NULL");
+
+    // A release decided and not yet finished: the last step is refused.
+    let (o, l) = fx.posted_packed("finish", true).await;
+    fx.pass_of(&l, "bb-a", T0, VerifyKind::Body, 3).await;
+    fx.pass_of(&l, "bb-b", T0, VerifyKind::Stat, 3).await;
+    assert!(fx
+        .cat
+        .advance(&l, OutboxStage::Release, later, T0)
+        .await
+        .unwrap());
+    let r = fx.claim(&o, OutboxStage::Release, later).await.unwrap();
+    fx.pass_of(&r, "bb-a", later.plus_ms(1), VerifyKind::Stat, 3)
+        .await;
+    fx.pass_of(&r, "bb-b", later.plus_ms(1), VerifyKind::Stat, 3)
+        .await;
+    let at = later.plus_ms(2);
+    let begun = fx
+        .cat
+        .begin_release(&r, 2, &counting, "[]", at)
+        .await
+        .unwrap();
+    assert_eq!(begun, Guard::Applied(()));
+    replace(&o, "finish", later.plus_ms(3)).await;
+    assert!(!fx.cat.finish_release(&r, later.plus_ms(4)).await.unwrap());
+    assert_eq!(fx.extent(&o, "safety_state").await, "releasing");
+    assert_eq!(fx.extent(&o, "released_at").await, "NULL");
+}
+
+/// A release that was decided and not finished is withdrawn under the
+/// release lease, which is kept: the extent is `held` again without
+/// evidence, and the same job decides again. A lease that no longer
+/// holds the row, or has run out, withdraws nothing.
+#[tokio::test]
+async fn a_release_decision_is_withdrawn_only_under_its_lease() {
+    let fx = Fx::new().await;
+    let (o, l) = fx.posted_packed("k", true).await;
+    let counting = labels(&["bb-a", "bb-b"]);
+    fx.pass_of(&l, "bb-a", T0, VerifyKind::Body, 3).await;
+    fx.pass_of(&l, "bb-b", T0, VerifyKind::Stat, 3).await;
+    let later = T0.plus_ms(HOUR_MS);
+    assert!(fx
+        .cat
+        .advance(&l, OutboxStage::Release, later, T0)
+        .await
+        .unwrap());
+    let died = fx.claim(&o, OutboxStage::Release, later).await.unwrap();
+    for backbone in ["bb-a", "bb-b"] {
+        let at = later.plus_ms(1);
+        fx.pass_of(&died, backbone, at, VerifyKind::Stat, 3).await;
+    }
+    let at = later.plus_ms(2);
+    let begun = fx.cat.begin_release(&died, 2, &counting, "[1]", at).await;
+    assert_eq!(begun.unwrap(), Guard::Applied(()));
+    assert_eq!(fx.extent(&o, "safety_state").await, "releasing");
+    let seq = fx.extent(&o, "evict_seq").await;
+
+    // The next job takes the row over once the lease has run out.
+    let next = later.plus_ms(LEASE_MS + 1);
+    let r = fx.claim(&o, OutboxStage::Release, next).await.unwrap();
+    let before = fx.dump().await;
+    assert!(!fx.cat.reopen_release(&died, next).await.unwrap());
+    let expired = next.plus_ms(LEASE_MS + 1);
+    assert!(!fx.cat.reopen_release(&r, expired).await.unwrap());
+    assert_eq!(fx.dump().await, before);
+
+    assert!(fx.cat.reopen_release(&r, next).await.unwrap());
+    assert_eq!(fx.extent(&o, "safety_state").await, "held");
+    assert_eq!(fx.extent(&o, "release_evidence").await, "NULL");
+    assert_eq!(fx.extent(&o, "released_at").await, "NULL");
+    assert_ne!(fx.extent(&o, "evict_seq").await, seq);
+    // Again: nothing to withdraw, and nothing changes.
+    let before = fx.dump().await;
+    assert!(fx.cat.reopen_release(&r, next).await.unwrap());
+    assert_eq!(fx.dump().await, before);
+
+    // The passes of the job that died are from before this claim: they
+    // release nothing. The lease was kept, so this job records its own.
+    let lost = fx
+        .cat
+        .begin_release(&r, 2, &counting, "[2]", next.plus_ms(1));
+    assert_eq!(lost.await.unwrap(), Guard::Lost);
+    assert_eq!(fx.extent(&o, "safety_state").await, "held");
+    for backbone in ["bb-a", "bb-b"] {
+        let at = next.plus_ms(2);
+        fx.pass_of(&r, backbone, at, VerifyKind::Stat, 3).await;
+    }
+    let begun = fx
+        .cat
+        .begin_release(&r, 2, &counting, "[2]", next.plus_ms(3));
+    assert_eq!(begun.await.unwrap(), Guard::Applied(()));
+    assert_eq!(fx.extent(&o, "release_evidence").await, "[2]");
+    assert!(fx.cat.finish_release(&r, next.plus_ms(4)).await.unwrap());
+    assert_eq!(fx.extent(&o, "safety_state").await, "released");
 }

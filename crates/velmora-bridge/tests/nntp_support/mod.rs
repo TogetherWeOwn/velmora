@@ -975,6 +975,17 @@ impl Catalog for MemCatalog {
             .is_some())
     }
 
+    async fn reopen_release(&self, l: &Lease, _: UnixMs) -> Result<bool> {
+        Ok(self
+            .fenced(l, |e| {
+                if e.job.extent.safety_state == SafetyState::Releasing {
+                    e.job.extent.safety_state = SafetyState::Held;
+                    e.job.extent.release_evidence = None;
+                }
+            })
+            .is_some())
+    }
+
     // The hot tier is tested on the SQL catalogue; here nothing is ever
     // evictable.
     async fn usage_counters(&self) -> Result<velmora_bridge::types::UsageCounters> {

@@ -1129,6 +1129,13 @@ pub(super) async fn verify_escalations<S: Sql>(
 /// `releasing` → `released`, row done. The safety copy stays in R2: from
 /// here on it is evictable, and counted as such. A never-read extent
 /// starts its eviction order at its upload time.
+///
+/// The guard does not look at the decision again: this is the last step
+/// of the job whose `begin_release` was applied, under the same lease.
+/// Whatever takes that decision's ground away (a replay that writes
+/// another addendum) ends the lease in its own batch, and a job that
+/// finds the extent `releasing` withdraws the decision first
+/// ([`reopen_release`]).
 pub(super) async fn finish_release<S: Sql>(
     c: &SqlCatalog<S>,
     l: &Lease,
@@ -1159,6 +1166,31 @@ pub(super) async fn finish_release<S: Sql>(
         ),
         // Last: after this the lease no longer holds.
         (done, lease_params(l, [ms(now)])?),
+    ];
+    fenced_batch(c, stmts).await
+}
+
+/// See [`crate::ports::Catalog::reopen_release`]. `releasing` → `held`
+/// under the release lease, which is kept. Both states pin the safety
+/// copy, so nothing becomes evictable and no counter moves.
+pub(super) async fn reopen_release<S: Sql>(
+    c: &SqlCatalog<S>,
+    l: &Lease,
+    now: UnixMs,
+) -> Result<bool> {
+    let guard = concat!(
+        "INSERT INTO tx_guard(ok) SELECT 0 WHERE NOT EXISTS (SELECT 1 FROM outbox WHERE ",
+        held!(),
+        " AND stage = 'release' AND lease_until >= ?5)"
+    );
+    let stmts = vec![
+        (guard, lease_params(l, [ms(now)])?),
+        (
+            "UPDATE extents SET safety_state = 'held', release_evidence = NULL, \
+               evict_seq = evict_seq + 1 \
+             WHERE id = ?1 AND safety_state = 'releasing'",
+            vec![text(l.extent.as_str())],
+        ),
     ];
     fenced_batch(c, stmts).await
 }

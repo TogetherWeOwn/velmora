@@ -1107,10 +1107,17 @@ where
         match extent.safety_state {
             SafetyState::Held => {}
             // A job died between the release decision and its last step.
-            // The plan is not read again: the decision was taken on
-            // every article of it, parity included, under the guard of
-            // the catalogue, and this step only completes it.
-            SafetyState::Releasing => return self.finish_release(lease, extent).await,
+            // That decision is not this job's, and the row does not say
+            // what it was taken on: a version from before parity decided
+            // on the data articles alone, and the passes it counted may
+            // be gone since. It is withdrawn, and the release is decided
+            // again from the start, on every article of the plan as it
+            // is now. The safety copy is pinned throughout.
+            SafetyState::Releasing => {
+                if !self.catalog.reopen_release(lease, now).await? {
+                    return Err(Stop::Fenced);
+                }
+            }
             SafetyState::Released | SafetyState::Deleted => {
                 return self.advance(lease, OutboxStage::Done, now).await;
             }
@@ -1336,8 +1343,9 @@ where
         self.advance_notify(lease, OutboxStage::Verify, due).await
     }
 
-    /// Completes the release of an extent already marked `releasing`: the
-    /// safety copy becomes evictable. Nothing is deleted here.
+    /// Completes the release this job has just decided
+    /// ([`Catalog::begin_release`] applied under `lease`): the safety
+    /// copy becomes evictable. Nothing is deleted here.
     async fn finish_release(&self, lease: &Lease, _extent: &ExtentRow) -> Staged<()> {
         match self.catalog.finish_release(lease, self.clock.now()).await? {
             true => Ok(()),

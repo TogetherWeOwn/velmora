@@ -32,6 +32,17 @@ use crate::types::{
 
 type Stmt = (&'static str, Vec<SqlValue>);
 
+/// Ends every claim on extent `?1` while its row still holds the plan
+/// `?2`, the addendum `?3` and the count whose literal is `?4`: the
+/// lease token moves on, as when a lease is given up, so every write of
+/// a job that holds the row is refused (`held!` in `sql/outbox.rs`).
+/// Run before the statement that changes those values, in its batch.
+const FENCE_CLAIMS: &str =
+    "UPDATE outbox SET lease_token = lease_token + 1, lease_owner = NULL, lease_until = NULL \
+     WHERE extent_id = ?1 \
+       AND EXISTS (SELECT 1 FROM extents WHERE id = ?1 AND plan = ?2 \
+         AND parity IS ?3 AND quote(parity_count) = ?4)";
+
 /// Statements per batch before it is sent.
 const BATCH_STATEMENTS: usize = 300;
 
@@ -386,6 +397,30 @@ pub(super) async fn replay_extents<S: Sql>(
                 (SqlValue::Null, _) => addendum_of(x, plan, u.parity.as_deref()),
                 found => found,
             };
+            // Where that writes another addendum than the row has, the
+            // passes on record and the claims in flight are of the old
+            // one: both go first, in this batch, as below.
+            let swapped = || {
+                vec![
+                    text(x.row.id.as_str()),
+                    SqlValue::Blob(u.stored.clone()),
+                    parity.clone(),
+                ]
+            };
+            stmts.push((
+                "DELETE FROM verifications WHERE extent_id = ?1 \
+                   AND EXISTS (SELECT 1 FROM extents WHERE id = ?1 AND plan = ?2 \
+                     AND parity IS NOT ?3)",
+                swapped(),
+            ));
+            stmts.push((
+                "UPDATE outbox SET lease_token = lease_token + 1, lease_owner = NULL, \
+                   lease_until = NULL \
+                 WHERE extent_id = ?1 \
+                   AND EXISTS (SELECT 1 FROM extents WHERE id = ?1 AND plan = ?2 \
+                     AND parity IS NOT ?3)",
+                swapped(),
+            ));
             stmts.push((
                 "UPDATE extents SET article_count = ?2, plan_rev = ?3, plan = ?4, \
                    parity = ?6, parity_count = ?7 \
@@ -421,6 +456,13 @@ pub(super) async fn replay_extents<S: Sql>(
                      AND parity IS ?3 AND quote(parity_count) = ?4)",
                 read(),
             ));
+            // And ends every claim on the extent: a job in flight read
+            // the plan before this batch and asks the backbones for the
+            // articles of the old addendum. Its lease is dead from here
+            // on, so what it finds is not recorded and it releases
+            // nothing; the row is free for a job that reads the plan as
+            // it is now.
+            stmts.push((FENCE_CLAIMS, read()));
             let mut params = read();
             params.extend([a.parity.clone(), a.parity_count.clone()]);
             stmts.push((
