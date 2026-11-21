@@ -91,7 +91,8 @@ pub enum RoutePut {
     /// The same route was there.
     Same,
     /// A route to another tenant or of another kind was there. A route
-    /// never changes: this is damage or a forged call, and it pages.
+    /// does not change but by [`SqlDirectory::move_route`]: this is
+    /// damage or a forged call, and it pages.
     Conflict,
     /// The tenant has no row, or is shredded: no route was stored.
     NoTenant,
