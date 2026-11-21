@@ -279,7 +279,7 @@ where
         crate::trace::scrub_run(|| {
             format!(
                 "checked={} ok={} suspect={} repaired={} unrecoverable={} stalled={} \
-                 bytes={} refetched={} ended={:?} ms={}",
+                 bytes={} refetched={} ended={} ms={}",
                 run.checked,
                 run.ok,
                 run.suspect,
@@ -288,7 +288,7 @@ where
                 run.stalled,
                 run.bytes_read,
                 run.refetched,
-                run.ended,
+                run.ended.as_str(),
                 now.0 - started.0
             )
         });
