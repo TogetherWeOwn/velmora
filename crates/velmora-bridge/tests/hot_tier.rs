@@ -1829,3 +1829,19 @@ async fn a_wrong_hint_still_reads_through_the_other_store() {
     assert_eq!(hot.read_cost("gone").await, ((1, 1), 1));
     assert!(hot.has_cache(&y));
 }
+
+/// An uncounted cache blob of an extent whose safety copy is counted is
+/// not read (the safety copy is asked first) and so stays uncounted, as
+/// `sql/hot.rs` says; the eviction of the extent deletes it all the same.
+#[tokio::test(flavor = "current_thread")]
+async fn an_uncounted_fill_behind_a_counted_safety_copy_waits_for_the_eviction() {
+    let mut hot = hot_with(|cfg| cfg.hot_cap_bytes = u64::MAX / 4).await;
+    let x = hot.released("behind").await;
+    hot.uncounted_fill(&x).await;
+    hot.bridge().clock.advance_secs(7200);
+    assert_eq!(hot.read_cost("behind").await, ((1, 0), 0));
+    assert_eq!(hot.num(&x, "hot_cache_bytes"), Some(0));
+    hot.set_cap(0);
+    hot.bridge().evict_batch(0).await.unwrap();
+    assert!(!hot.has_cache(&x) && !hot.has_safety(&x));
+}

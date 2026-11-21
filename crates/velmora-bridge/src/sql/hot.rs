@@ -39,8 +39,13 @@
 //!   collection of the same extent ran): a read served from it
 //!   counts it again (`touch_read`; an isolate asks at most once an hour
 //!   per extent), and an eviction of the extent deletes
-//!   both keys whatever the counts say. One that is never read again and
-//!   never evicted is left to the cache bucket's lifecycle rule.
+//!   both keys whatever the counts say. A read is served from it only
+//!   when the safety copy is not asked first: while the row says the
+//!   safety copy is there (pinned, or released and counted) the read
+//!   asks that copy first (`ExtentRow::safety_first`), and such a blob
+//!   stays uncounted until the extent is evicted or a read misses the
+//!   safety copy. One that is never read from and never evicted is left
+//!   to the cache bucket's lifecycle rule.
 
 use super::uploads::{int, ms, text, Cols};
 use super::SqlCatalog;
