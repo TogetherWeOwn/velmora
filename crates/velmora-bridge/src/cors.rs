@@ -7,7 +7,7 @@ const METHODS: &str = "GET, HEAD, PUT, POST, DELETE";
 const PREFLIGHT_VARY: &str =
     "Origin, Access-Control-Request-Method, Access-Control-Request-Headers";
 
-fn applies(req: &S3Request, cfg: &BridgeConfig) -> bool {
+pub(crate) fn applies(req: &S3Request, cfg: &BridgeConfig) -> bool {
     !cfg.cors_origins.is_empty()
         && req.raw_target.starts_with('/')
         && !crate::fanout::is_internal_target(&req.raw_target)
@@ -31,11 +31,13 @@ pub(crate) fn preflight(req: &S3Request, cfg: &BridgeConfig) -> Option<S3Respons
     }
     let allowed = allowed_origin(req, cfg).and_then(|origin| allow_preflight(req, origin));
     Some(allowed.unwrap_or_else(|| {
-        S3Response::error(
+        let mut resp = S3Response::error(
             403,
             "AccessForbidden",
             "CORSResponse: This CORS request is not allowed.",
-        )
+        );
+        merge_vary_origin(&mut resp);
+        resp
     }))
 }
 
@@ -80,17 +82,15 @@ fn allow_preflight(req: &S3Request, origin: &str) -> Option<S3Response> {
     Some(resp)
 }
 
-pub(crate) fn decorate(req: &S3Request, cfg: &BridgeConfig, resp: &mut S3Response) {
-    if let Some(origin) = allowed_origin(req, cfg) {
-        decorate_origin(origin, resp);
-    }
-}
-
 pub(crate) fn decorate_origin(origin: &str, resp: &mut S3Response) {
     resp.headers
         .push(("access-control-allow-origin".into(), origin.into()));
     resp.headers
         .push(("access-control-expose-headers".into(), EXPOSE.into()));
+}
+
+/// Adds Origin to the response's Vary fields.
+pub fn merge_vary_origin(resp: &mut S3Response) {
     let mut vary = resp
         .headers
         .iter_mut()
@@ -109,6 +109,29 @@ pub(crate) fn decorate_origin(origin: &str, resp: &mut S3Response) {
         }
     } else {
         resp.headers.push(("vary".into(), "Origin".into()));
+    }
+}
+
+/// Carries the CORS headers of an allowed fan-out response over to a refusal.
+pub fn carry_fanout_cors(headers: &[(String, String)], refusal: &mut S3Response) {
+    if headers
+        .iter()
+        .any(|(name, _)| name.eq_ignore_ascii_case("access-control-allow-origin"))
+    {
+        refusal.headers.extend(
+            headers
+                .iter()
+                .filter(|(name, _)| {
+                    [
+                        "access-control-allow-origin",
+                        "access-control-expose-headers",
+                        "vary",
+                    ]
+                    .iter()
+                    .any(|field| name.eq_ignore_ascii_case(field))
+                })
+                .cloned(),
+        );
     }
 }
 
@@ -175,9 +198,33 @@ mod tests {
             let mut resp = S3Response::error(403, "AccessDenied", "Denied");
             resp.headers.push(("Vary".into(), existing.into()));
             decorate_origin(ORIGIN, &mut resp);
+            merge_vary_origin(&mut resp);
             assert_eq!(value(&resp, "vary"), Some(expected));
             assert_eq!(value(&resp, "access-control-allow-origin"), Some(ORIGIN));
             assert_eq!(value(&resp, "access-control-expose-headers"), Some(EXPOSE));
         }
+    }
+    #[test]
+    fn fanout_refusal_carries_cors_headers_for_an_allowed_origin() {
+        let mut source = S3Response::error(403, "AccessDenied", "Denied");
+        decorate_origin(ORIGIN, &mut source);
+        merge_vary_origin(&mut source);
+        let cors = source.headers[source.headers.len() - 3..].to_vec();
+        source
+            .headers
+            .push(("accept-ranges".into(), "bytes".into()));
+        let mut refusal = S3Response::error(500, "InternalError", "Failed");
+        let original = refusal.headers.clone();
+
+        carry_fanout_cors(&source.headers, &mut refusal);
+        assert_eq!(&refusal.headers[..original.len()], original);
+        assert_eq!(&refusal.headers[original.len()..], cors);
+
+        source
+            .headers
+            .retain(|(name, _)| name != "access-control-allow-origin");
+        refusal.headers = original.clone();
+        carry_fanout_cors(&source.headers, &mut refusal);
+        assert_eq!(refusal.headers, original);
     }
 }

@@ -202,23 +202,15 @@ pub async fn respond(
     };
     // A failure opening the first piece is still the client's S3 response.
     let refuse = |mut resp: S3Response| {
-        if headers
-            .iter()
-            .any(|(name, _)| name == "access-control-allow-origin")
-        {
-            resp.headers.extend(
-                headers
-                    .iter()
-                    .filter(|(name, _)| {
-                        matches!(
-                            name.as_str(),
-                            "access-control-allow-origin"
-                                | "access-control-expose-headers"
-                                | "vary"
-                        )
-                    })
-                    .cloned(),
-            );
+        velmora_bridge::cors::carry_fanout_cors(&headers, &mut resp);
+        // A configured response also varies by Origin when no ACAO was sent.
+        if headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("vary")
+                && value
+                    .split(',')
+                    .any(|field| field.trim().eq_ignore_ascii_case("origin"))
+        }) {
+            velmora_bridge::cors::merge_vary_origin(&mut resp);
         }
         (
             resp.status,

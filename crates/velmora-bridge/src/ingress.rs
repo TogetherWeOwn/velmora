@@ -494,7 +494,12 @@ where
     let mut resp = match checked {
         Err(e) => {
             let mut resp = e.response();
-            crate::cors::decorate(&req, cfg, &mut resp);
+            if crate::cors::applies(&req, cfg) {
+                crate::cors::merge_vary_origin(&mut resp);
+            }
+            if let Some(origin) = crate::cors::allowed_origin(&req, cfg) {
+                crate::cors::decorate_origin(origin, &mut resp);
+            }
             resp
         }
         Ok(()) => handle(req).await,

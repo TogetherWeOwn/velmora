@@ -41,12 +41,12 @@ async fn fetch(rig: &Rig, req: Req) -> Resp {
     .await
 }
 
-fn assert_no_cors(resp: &Resp) {
+fn assert_no_cors(resp: &Resp, vary: Option<&str>) {
     assert!(!resp
         .headers
         .iter()
         .any(|(name, _)| name.starts_with("access-control-")));
-    assert_eq!(resp.header("vary"), None);
+    assert_eq!(resp.header("vary"), vary);
 }
 
 fn assert_actual_cors(resp: &Resp) {
@@ -63,19 +63,41 @@ async fn preflight_bypasses_auth_and_storage() {
     let rig = cors_rig();
     let calls = rig.trip().calls();
     rig.trip().arm(0, Trip::Fail);
-    let resp = fetch(
-        &rig,
-        req(
-            "OPTIONS",
-            TARGET,
-            &[
-                ("origin", ORIGIN),
-                ("access-control-request-method", "GET"),
-                ("access-control-request-headers", "Range, X-Amz-Date"),
-            ],
-        ),
+    let resp = fetch(&rig, preflight_request()).await;
+    assert_preflight(&resp);
+    assert_eq!(rig.trip().calls(), calls);
+    assert!(!rig.trip().tripped());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn bridge_handles_preflight_directly_without_storage() {
+    let rig = cors_rig();
+    let calls = rig.trip().calls();
+    rig.trip().arm(0, Trip::Fail);
+    let resp = Resp::collect(
+        Rc::clone(&rig.bridge)
+            .handle(preflight_request().into_request())
+            .await,
     )
     .await;
+    assert_preflight(&resp);
+    assert_eq!(rig.trip().calls(), calls);
+    assert!(!rig.trip().tripped());
+}
+
+fn preflight_request() -> Req {
+    req(
+        "OPTIONS",
+        TARGET,
+        &[
+            ("origin", ORIGIN),
+            ("access-control-request-method", "GET"),
+            ("access-control-request-headers", "Range, X-Amz-Date"),
+        ],
+    )
+}
+
+fn assert_preflight(resp: &Resp) {
     resp.expect(200);
     assert!(resp.body.is_empty());
     assert_eq!(resp.header("access-control-allow-origin"), Some(ORIGIN));
@@ -94,8 +116,6 @@ async fn preflight_bypasses_auth_and_storage() {
         Some("Origin, Access-Control-Request-Method, Access-Control-Request-Headers")
     );
     assert_eq!(resp.header("access-control-allow-credentials"), None);
-    assert_eq!(rig.trip().calls(), calls);
-    assert!(!rig.trip().tripped());
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -126,7 +146,7 @@ async fn invalid_preflights_are_refused_without_cors_headers() {
             resp.message(),
             "CORSResponse: This CORS request is not allowed."
         );
-        assert_no_cors(&resp);
+        assert_no_cors(&resp, Some("Origin"));
     }
 }
 
@@ -146,7 +166,7 @@ async fn admin_and_internal_targets_keep_their_own_responses() {
             .await;
             assert_ne!(resp.status, 200);
             assert_ne!(resp.code(), "AccessForbidden");
-            assert_no_cors(&resp);
+            assert_no_cors(&resp, None);
         }
     }
 }
@@ -170,13 +190,19 @@ async fn actual_s3_responses_include_cors_only_for_listed_origins() {
         if origin == Some(ORIGIN) {
             assert_actual_cors(&resp);
         } else {
-            assert_no_cors(&resp);
+            assert_no_cors(&resp, Some("Origin"));
         }
     }
 
     let resp = fetch(&rig, req("GET", TARGET, &[("origin", ORIGIN)])).await;
     resp.expect_error(403, "AccessDenied");
     assert_actual_cors(&resp);
+
+    for headers in [[("origin", OTHER)].as_slice(), &[]] {
+        let resp = fetch(&rig, req("GET", TARGET, headers)).await;
+        resp.expect_error(403, "AccessDenied");
+        assert_no_cors(&resp, Some("Origin"));
+    }
 
     let mut invalid = signer.sign(rig.now(), Method::Get, TARGET, &[], &[], Vec::new());
     invalid.set_header("origin", ORIGIN);
@@ -199,7 +225,7 @@ async fn empty_list_keeps_existing_options_and_get_behavior() {
     )
     .await;
     resp.expect_error(403, "AccessDenied");
-    assert_no_cors(&resp);
+    assert_no_cors(&resp, None);
 
     let (_, signer) = rig.standard(BUCKET).await;
     let mut options = signer.sign(
@@ -213,7 +239,7 @@ async fn empty_list_keeps_existing_options_and_get_behavior() {
     options.set_header("origin", ORIGIN);
     let resp = fetch(&rig, options).await;
     resp.expect_error(501, "NotImplemented");
-    assert_no_cors(&resp);
+    assert_no_cors(&resp, None);
 
     rig.put(&signer, BUCKET, "video", b"media")
         .await
@@ -222,5 +248,5 @@ async fn empty_list_keeps_existing_options_and_get_behavior() {
     get.set_header("origin", ORIGIN);
     let resp = fetch(&rig, get).await;
     resp.expect(200);
-    assert_no_cors(&resp);
+    assert_no_cors(&resp, None);
 }

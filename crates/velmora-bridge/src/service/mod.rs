@@ -255,6 +255,7 @@ where
         if let Some(resp) = crate::cors::preflight(&req, &self.cfg) {
             return resp;
         }
+        let varies_by_origin = crate::cors::applies(&req, &self.cfg);
         let origin = crate::cors::allowed_origin(&req, &self.cfg);
         let mut resp = match classify(&req.method, &target) {
             Route::Admin { rest } => return admin::handle(&self, req, rest).await,
@@ -311,6 +312,9 @@ where
                 .and_then(|(_, host)| common::host_value_refused(host, &self.cfg))
                 .unwrap_or_else(S3Response::not_implemented),
         };
+        if varies_by_origin {
+            crate::cors::merge_vary_origin(&mut resp);
+        }
         if let Some(origin) = origin {
             crate::cors::decorate_origin(origin, &mut resp);
         }

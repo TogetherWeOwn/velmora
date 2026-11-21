@@ -495,6 +495,11 @@ fn cors_origins(value: &str, dev: bool) -> Result<Vec<String>, ConfigError> {
             .strip_prefix("https://")
             .or_else(|| dev.then(|| origin.strip_prefix("http://")).flatten());
         let valid = authority.is_some_and(|authority| {
+            let default_port = if origin.starts_with("https://") {
+                443
+            } else {
+                80
+            };
             let (host, port) = authority
                 .split_once(':')
                 .map_or((authority, None), |(host, port)| (host, Some(port)));
@@ -508,8 +513,9 @@ fn cors_origins(value: &str, dev: bool) -> Result<Vec<String>, ConfigError> {
                             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
                 })
                 && port.is_none_or(|port| {
-                    port.bytes().all(|b| b.is_ascii_digit())
-                        && port.parse::<u16>().is_ok_and(|port| port != 0)
+                    !port.starts_with('0')
+                        && port.bytes().all(|b| b.is_ascii_digit())
+                        && port.parse::<u16>().is_ok_and(|port| port != default_port)
                 })
         });
         if !valid || origins.len() == 8 || origins.iter().any(|entry| entry == origin) {

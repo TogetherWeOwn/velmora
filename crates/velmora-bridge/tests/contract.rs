@@ -2019,6 +2019,10 @@ fn cors_origins_accept_only_exact_origins_for_the_environment() {
         "https://console.example.app:",
         "https://console.example.app:0",
         "https://console.example.app:65536",
+        "https://console.example.app:443",
+        "https://console.example.app:08443",
+        "http://localhost:80",
+        "http://localhost:08787",
         "https://console.example.app:+80",
         "https://console.example.app,",
         "https://console.example.app, https://console.example.app",
@@ -2030,6 +2034,14 @@ fn cors_origins_accept_only_exact_origins_for_the_environment() {
             ConfigError::Invalid("CORS_ORIGINS".into()),
             "{bad}"
         );
+        if bad != "http://localhost:8787" {
+            dev.insert("CORS_ORIGINS".into(), bad.into());
+            assert_eq!(
+                load(&dev).unwrap_err(),
+                ConfigError::Invalid("CORS_ORIGINS".into()),
+                "{bad}"
+            );
+        }
     }
 }
 
