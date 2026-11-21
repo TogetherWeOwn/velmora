@@ -18,6 +18,7 @@
 #   SUITE_PRIMARY    do (default): the tests get the object's answers;
 #                    sqlite: they get SQLite's, the object is compared only
 #   SUITE_REPORT     file for the summary (default: stdout only)
+#   SUITE_KEEP       directory to keep the logs in (cargo, twin, workerd)
 #   CARGO_TARGET_DIR and the other cargo variables are passed through.
 #
 # Without arguments every test target of velmora-bridge runs
@@ -51,6 +52,10 @@ PIDS=()
 cleanup() {
   for pid in "${PIDS[@]}"; do kill "$pid" 2>/dev/null || true; done
   for pid in "${PIDS[@]}"; do wait "$pid" 2>/dev/null || true; done
+  if [ -n "${SUITE_KEEP:-}" ]; then
+    mkdir -p "$SUITE_KEEP"
+    cp "$RUN"/*.log "$SUITE_KEEP"/ 2>/dev/null || true
+  fi
   rm -rf "$RUN"
 }
 trap cleanup EXIT
