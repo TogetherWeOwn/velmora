@@ -397,12 +397,12 @@ jobs:
       # cost (about 10.5 ms per MB on a request served by a new isolate).
       # main's measurement is the artifact of main's run for the base
       # commit, else the newest one from main.
-      - name: Size report against main (not blocking)
+      - name: Fetch main's size measurement (not blocking)
         if: github.event_name == 'pull_request' || github.event_name == 'merge_group'
         continue-on-error: true
-        working-directory: workers/s3-bridge
         env:
           GH_TOKEN: ${{ github.token }}
+        # Only gh, jq and unzip see the token; no script of the repo runs here.
         run: |
           set -euo pipefail
           base="$RUNNER_TEMP/base.json"
@@ -417,7 +417,6 @@ jobs:
                    | sort_by(.created_at) | reverse
                    | ([.[] | select(.workflow_run.head_sha == $p)] + .)
                    | .[0].id // empty') || id=""
-          # Best effort: without main's measurement the report still runs.
           if [ -n "$id" ] \
              && gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts/${id}/zip" > "$RUNNER_TEMP/base.zip" \
              && unzip -p "$RUNNER_TEMP/base.zip" size.json > "$base"; then
@@ -426,10 +425,19 @@ jobs:
             rm -f "$base"
             echo "No size measurement from main could be read; reporting without a delta."
           fi
-          python3 -I tools/bundle_size.py report "$RUNNER_TEMP/size.json" "$base" "$parent"
-      # main's measurement, for the reports of later PRs.
+      # Without a token. A failed fetch above still leaves a report.
+      - name: Size report against main (not blocking)
+        if: github.event_name == 'pull_request' || github.event_name == 'merge_group'
+        continue-on-error: true
+        working-directory: workers/s3-bridge
+        run: |
+          set -euo pipefail
+          python3 -I tools/bundle_size.py report "$RUNNER_TEMP/size.json" "$RUNNER_TEMP/base.json" "$(git rev-parse HEAD^1)"
+      # main's measurement, for the reports of later PRs. Never blocks the
+      # release: without it a later report has no delta or an older one.
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        continue-on-error: true
         with:
           name: s3-bridge-size
           path: ${{ runner.temp }}/size.json
