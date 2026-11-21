@@ -634,6 +634,11 @@ class DeployConfigSwitchesTest(GeneratorCase):
                 with self.subTest(key=key, value=value):
                     self.refused({key: value}, f"{key} {message}")
 
+    def test_shipped_restore_requires_the_production_variable(self):
+        self.refused({}, "use VELMORA_MAINTENANCE to change the deployed setting",
+                     self.shipped.replace(self.maintenance_line,
+                                          self.maintenance_line.replace('"off"', '"restore"'), 1))
+
     def test_shipped_maintenance_must_be_unique_and_in_vars(self):
         missing = self.shipped.replace(self.maintenance_line + "\n", "", 1)
         for fixture in (missing, add_after(self.shipped, self.maintenance_line, self.maintenance_line)):

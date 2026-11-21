@@ -487,8 +487,8 @@ jobs:
           persist-credentials: false
       - name: Check migration files
         env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha || github.sha }}
           VELMORA_CATALOGUE_MIGRATIONS: ${{ vars.VELMORA_CATALOGUE_MIGRATIONS }}
         run: |
           set -euo pipefail
@@ -504,13 +504,18 @@ jobs:
           def git(*args):
               return subprocess.check_output(["git", *args])
 
+          if os.environ["GITHUB_EVENT_NAME"] in ("pull_request", "merge_group"):
+              base = git("merge-base", base, head).decode("ascii").strip()
+
           destructive = re.compile(
-              r"\bDROP\s+(?:TABLE|COLUMN)\b|\bALTER\s+TABLE\b[^;]*\b(?:DROP|RENAME)\b",
+              r"\bDROP\s+(?:TABLE|COLUMN|INDEX|TRIGGER|VIEW)\b|\bDELETE\s+FROM\b|"
+              r"\bALTER\s+TABLE\b[^;]*\b(?:DROP|RENAME)\b",
               re.IGNORECASE,
           )
           filename = re.compile(r"([0-9]{4})_[a-z][a-z0-9]*(?:_[a-z0-9]+)*\.sql")
           checked = 0
           errors = []
+          # Only the deployed migration folders are checked. migrations-next/ is excluded.
           for folder in ("workers/s3-bridge/migrations/", "workers/s3-bridge/migrations-directory/"):
               # With rename detection off, a move out of a folder is a removal.
               diff = git("diff", "--no-renames", "--name-status", "-z", base, head, "--", folder)
@@ -542,7 +547,8 @@ jobs:
                   new_numbers.add(number)
                   sql = git("show", f"{head}:{path}").decode("utf-8")
                   first = sql.partition("\n")[0].removesuffix("\r")
-                  if (destructive.search(re.sub(r"--[^\r\n]*", "", sql))
+                  stripped = re.sub(r"--[^\r\n]*|/\*[\s\S]*?\*/", " ", sql)
+                  if ((destructive.search(stripped) or destructive.search(sql))
                           and not re.fullmatch(r"-- contract: \S.*", first)):
                       errors.append(f"migration {name} contains destructive SQL without a first-line contract reason")
 
@@ -710,12 +716,20 @@ jobs:
       # Re-check after the build and the concurrency wait.
       - id: fresh
         name: Check that this commit is still the tip of main
+        env:
+          VELMORA_DEPLOY_FREEZE: ${{ vars.VELMORA_DEPLOY_FREEZE }}
         run: |
           set -euo pipefail
           tip=$(git ls-remote "https://github.com/${GITHUB_REPOSITORY}" refs/heads/main | cut -f1)
           if [ "$tip" = "$GITHUB_SHA" ]; then
             echo "deploy: ${GITHUB_SHA} is the tip of main"
             echo "fresh=true" >> "$GITHUB_OUTPUT"
+          elif [ "${VELMORA_DEPLOY_FREEZE:-}" = "$GITHUB_SHA" ]; then
+            echo "deploy: ${GITHUB_SHA} is the frozen commit; it deploys although main is at ${tip}"
+            echo "fresh=true" >> "$GITHUB_OUTPUT"
+          elif [ -n "${VELMORA_DEPLOY_FREEZE:-}" ]; then
+            echo "::error::main moved from ${GITHUB_SHA} to ${tip}; the deploy freeze is set to another commit"
+            exit 1
           else
             echo "skipped: main moved from ${GITHUB_SHA} to ${tip}; the newer run deploys"
             echo "fresh=false" >> "$GITHUB_OUTPUT"
@@ -934,7 +948,7 @@ jobs:
           maintenance_line = re.compile(r'^\s*MAINTENANCE = "off"(\s+#.*)?$')
           hits = [i for i in range(end) if maintenance_line.fullmatch(lines[i])]
           if len(hits) != 1:
-              sys.exit('expected exactly one prod line MAINTENANCE = "off"')
+              sys.exit('expected exactly one prod line MAINTENANCE = "off"; use VELMORA_MAINTENANCE to change the deployed setting')
           maintenance_at = hits[0]
           tables = [line.strip() for line in lines[:maintenance_at] if header.match(line)]
           if tables[-1:] != ["[vars]"]:
@@ -1114,9 +1128,15 @@ jobs:
         run: |
           set -euo pipefail
           out="${RUNNER_TEMP}/catalogue-migrations-list.log"
-          echo "catalogue migrations skipped: selector is not d1"
-          if ! ./node_modules/.bin/wrangler d1 migrations list velmora-catalog --remote -c wrangler.deploy.toml > "$out" 2>&1 ||
-             ! grep -qiF 'No migrations to apply!' "$out"; then
+          echo "catalogue migrations skipped (VELMORA_CATALOGUE_MIGRATIONS=off)"
+          status=0
+          ./node_modules/.bin/wrangler d1 migrations list velmora-catalog --remote -c wrangler.deploy.toml > "$out" 2>&1 || status=$?
+          cat "$out"
+          if [ "$status" -ne 0 ]; then
+            echo "::error::could not list catalogue migrations; refusing to deploy"
+            exit 1
+          fi
+          if ! grep -qiF 'No migrations to apply!' "$out"; then
             echo "::error::a catalogue migration is pending while VELMORA_CATALOGUE_MIGRATIONS is off; refusing to deploy"
             exit 1
           fi
@@ -1214,13 +1234,25 @@ jobs:
             echo "rollback: active version is still ${PREV_VERSION}; nothing to roll back"
             exit 0
           fi
+          view_version() {
+            local attempt
+            for attempt in 1 2 3; do
+              if ./node_modules/.bin/wrangler versions view "$1" --json -c wrangler.deploy.toml > "$2"; then
+                return 0
+              fi
+              if [ "$attempt" -lt 3 ]; then
+                sleep 5
+              fi
+            done
+            return 1
+          }
           # wrangler writes its deploy output entry only after the trigger
           # and queue-consumer updates, so a failure or cancellation there
           # leaves no id although the new version is live. Adopt the active
           # version only if its message is exactly this run's.
           if [ -z "$deployed" ] && [ -n "$active" ]; then
             message=""
-            if ./node_modules/.bin/wrangler versions view "$active" --json -c wrangler.deploy.toml > "${RUNNER_TEMP}/active-version.json"; then
+            if view_version "$active" "${RUNNER_TEMP}/active-version.json"; then
               message=$(jq -r '.annotations["workers/message"] // empty' "${RUNNER_TEMP}/active-version.json")
             fi
             if [ "$message" = "ci ${GITHUB_RUN_ID}.${GITHUB_RUN_ATTEMPT} ${GITHUB_SHA}" ]; then
@@ -1230,10 +1262,12 @@ jobs:
           fi
           if [ -z "$deployed" ]; then
             echo "::error::rollback: this run has no deployed version id and the active version is '${active:-unknown}', not ${PREV_VERSION}; not rolling back, check manually"
+            echo "rollback=manual-check" >> "$GITHUB_OUTPUT"
             exit 1
           fi
           if [ -n "$active" ] && [ "$active" != "$deployed" ]; then
             echo "::error::rollback: active version ${active} is neither ${PREV_VERSION} nor this run's ${deployed}; not rolling back, check manually"
+            echo "rollback=manual-check" >> "$GITHUB_OUTPUT"
             exit 1
           fi
           # active is this run's version, or could not be read after a
@@ -1241,9 +1275,10 @@ jobs:
           if [ -n "$FLOOR_VERSION" ] && [ "$FLOOR_VERSION" != "$PREV_VERSION" ]; then
             target_json="${RUNNER_TEMP}/rollback-target.json"
             floor_json="${RUNNER_TEMP}/rollback-floor.json"
-            if ./node_modules/.bin/wrangler versions view "$PREV_VERSION" --json -c wrangler.deploy.toml > "$target_json" &&
-               ./node_modules/.bin/wrangler versions view "$FLOOR_VERSION" --json -c wrangler.deploy.toml > "$floor_json" &&
-               python3 -I - "$target_json" "$floor_json" <<'PY'
+            comparison=2
+            if view_version "$PREV_VERSION" "$target_json" && view_version "$FLOOR_VERSION" "$floor_json"; then
+              comparison=0
+              python3 -I - "$target_json" "$floor_json" <<'PY' || comparison=$?
           from datetime import datetime
           import json, sys
 
@@ -1257,13 +1292,18 @@ jobs:
           try:
               sys.exit(created_on(sys.argv[1]) < created_on(sys.argv[2]))
           except (OSError, KeyError, TypeError, ValueError):
-              sys.exit(1)
+              sys.exit(2)
           PY
-            then
+            fi
+            if [ "$comparison" -eq 0 ]; then
               echo "rollback target meets the configured floor version"
-            else
+            elif [ "$comparison" -eq 1 ]; then
               echo "::error::rollback refused: the recorded version ${PREV_VERSION} is older than the rollback floor version ${FLOOR_VERSION}; production stays on ${deployed}; check manually"
               echo "rollback=refused-floor" >> "$GITHUB_OUTPUT"
+              exit 1
+            else
+              echo "::error::rollback refused: the age of the recorded version ${PREV_VERSION} against the floor version ${FLOOR_VERSION} could not be read; production stays on ${deployed}; check manually"
+              echo "rollback=refused-floor-unknown" >> "$GITHUB_OUTPUT"
               exit 1
             fi
           fi
@@ -1271,7 +1311,7 @@ jobs:
           if ! ./node_modules/.bin/wrangler rollback "$PREV_VERSION" -c wrangler.deploy.toml \
             --message "automatic rollback: deploy job failed or was cancelled" -y > "$rollback_log" 2>&1; then
             cat "$rollback_log"
-            echo "::error::rollback refused by Cloudflare (see the output above); production stays on ${deployed}; check manually"
+            echo "::error::wrangler rollback failed (Cloudflare refused it or the call failed; see the output above); production stays on ${deployed}; check manually"
             echo "rollback=refused" >> "$GITHUB_OUTPUT"
             exit 1
           fi
@@ -1301,16 +1341,17 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
   # Emails the operator when the production deploy fails (it then rolls
-  # back) or its build fails, through the alerts Worker's report endpoint
-  # (workers/alerts). Both values live in the `production` environment:
+  # back), its build fails, or checks fail on main. The alert goes through
+  # the alerts Worker's report endpoint (workers/alerts). Both values live
+  # in the `production` environment:
   # vars.ALERTS_INGEST_URL and secrets.ALERTS_INGEST_TOKEN; without them
   # this job only writes a warning. It never fails the run itself. The
   # token reaches curl on stdin, never argv, and curl's own messages (which
   # would name the host) stay out of the public log.
   deploy-alert:
     name: deploy alert
-    needs: [deploy-build, deploy]
-    if: ${{ always() && github.event_name == 'push' && github.ref == 'refs/heads/main' && (needs.deploy-build.result == 'failure' || needs.deploy.result == 'failure' || needs.deploy.result == 'cancelled') }}
+    needs: [ci-ok, deploy-build, deploy]
+    if: ${{ always() && github.event_name == 'push' && github.ref == 'refs/heads/main' && (needs.ci-ok.result == 'failure' || needs.deploy-build.result == 'failure' || needs.deploy.result == 'failure' || needs.deploy.result == 'cancelled') }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     environment: production
@@ -1321,6 +1362,7 @@ jobs:
         env:
           ALERTS_INGEST_URL: ${{ vars.ALERTS_INGEST_URL }}
           ALERTS_INGEST_TOKEN: ${{ secrets.ALERTS_INGEST_TOKEN }}
+          CI_RESULT: ${{ needs.ci-ok.result }}
           BUILD_RESULT: ${{ needs.deploy-build.result }}
           DEPLOY_RESULT: ${{ needs.deploy.result }}
           ROLLBACK: ${{ needs.deploy.outputs.rollback }}
@@ -1331,14 +1373,18 @@ jobs:
             echo "::warning::deploy alert not sent: ALERTS_INGEST_URL or ALERTS_INGEST_TOKEN is not set in the production environment"
             exit 0
           fi
-          body=$(jq -n --arg sha "$GITHUB_SHA" --arg b "$BUILD_RESULT" --arg d "$DEPLOY_RESULT" --arg run "$RUN_URL" --arg rollback "$ROLLBACK" '
-            ($rollback == "refused" or $rollback == "refused-floor") as $refused | {
+          body=$(jq -n --arg sha "$GITHUB_SHA" --arg ci "$CI_RESULT" --arg b "$BUILD_RESULT" --arg d "$DEPLOY_RESULT" --arg run "$RUN_URL" --arg rollback "$ROLLBACK" '
+            ($rollback == "refused" or $rollback == "refused-floor"
+             or $rollback == "refused-floor-unknown" or $rollback == "manual-check") as $refused | {
             source: "ci",
             key: (if $refused then "deploy-rollback-refused" else "deploy-failed" end),
-            title: (if $refused then "Production deploy failed and was not rolled back" else "Production deploy failed" end),
-            detail: ((if $refused then "The rollback was refused (\($rollback)): production runs the version this run deployed. " else "" end)
+            title: (if $rollback == "manual-check" then "Production deploy failed; rollback needs a manual check"
+                    elif $refused then "Production deploy failed and was not rolled back" else "Production deploy failed" end),
+            detail: ((if $rollback == "manual-check" then "The active Worker version needs a manual check. "
+                      elif $refused then "The rollback was refused (\($rollback)): production runs the version this run deployed. " else "" end)
               + "Commit \($sha): deploy build \($b), deploy \($d). "
-              + (if $b == "failure" then "The build failed, so nothing was deployed; production is unchanged."
+              + (if $ci == "failure" then "The checks failed on main, so nothing was deployed."
+                 elif $b == "failure" then "The build failed, so nothing was deployed; production is unchanged."
                  else "The deploy job rolls back to the version before it when it can; whether it did, or asks for a manual check, is in the run'"'"'s \"Roll back to the recorded version\" step." end)
               + " Run: \($run)")}')
           if printf 'Authorization: Bearer %s\n' "$ALERTS_INGEST_TOKEN" \

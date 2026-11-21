@@ -270,8 +270,9 @@ exists: restore it to a timestamp, then replay from that timestamp.
 
 ## Restore
 
-1. Set `MAINTENANCE = "restore"` and deploy. Every write now answers 503,
-   and the jobs and the cron do nothing.
+1. Set the production variable `VELMORA_MAINTENANCE=restore` and re-run
+   the deploy job as described in [Deploy switches](#deploy-switches).
+   Every write now answers 503, and the jobs and the cron do nothing.
 2. Bring the database back, one of:
    - Time Travel: `npx wrangler d1 time-travel restore <db> --timestamp <T>`.
      The restore point is `T` in milliseconds.
@@ -304,7 +305,8 @@ exists: restore it to a timestamp, then replay from that timestamp.
      longer; it is always correct.
 5. Check: `GET /_admin/status` (`replay_unfinished` must be `false`), a
    listing, and a GET of a recent object.
-6. Set `MAINTENANCE = "off"` and deploy. Issue access keys again if the
+6. Unset the production variable `VELMORA_MAINTENANCE` or set it to
+   `off`, then re-run the deploy job. Issue access keys again if the
    database was rebuilt from the records alone. Keys revoked after the
    restore point stay revoked (`GET /_admin/keys` to check).
 
@@ -615,18 +617,25 @@ Set these GitHub configuration variables for production:
 | `VELMORA_CATALOGUE_MIGRATIONS` | `on` (default) applies catalogue migrations. `off` checks that none are pending and refuses the deploy if any are. Set this as a repository variable so PR checks and the deploy job read the same setting. |
 | `VELMORA_DIRECTORY_D1_ID` | Binds the directory D1 database by lowercase UUID and applies its migrations. Unset leaves it unbound. |
 
-For a switch deploy, set the variable and re-run the deploy jobs of the
-tip commit's push run. The bundle artifact is kept for 30 days. Within
-that window, the deploy jobs alone can be re-run. After the window,
-re-run all the jobs of that run to build the same commit again. Check
-the switch values printed in the log and confirm that the deployed
+For a switch deploy, set the variable and re-run the deploy job of the
+tip commit's push run. During a freeze, use branch protection to hold
+merges and re-run the deploy job of the frozen commit's push run.
+
+The bundle artifact is kept for 30 days. Re-runs are possible only
+within GitHub's re-run window (about 30 days, check GitHub's current
+limit). Once that window closes, a switch deploy requires a new commit
+to main that changes the bridge. `workflow_dispatch` does not deploy.
+Check the switch values printed in the log and confirm that the deployed
 commit id matches the commit serving before the switch deploy.
 
 `FLOOR_LEVEL` travels with the bundle. Raise it by one in the PR that
 ships a fence a rollback must never cross. Once that deploy is live
 and before the next merge, raise `VELMORA_FLOOR_MIN` by hand to the new
 level. Set `VELMORA_FLOOR_VERSION` to the Worker version that establishes
-the floor so automatic rollback also respects it.
+the floor so automatic rollback also respects it. The floor rule compares
+Worker version creation times. After a hand rollback or a secret change
+that re-stamps an old version, check by hand that the rollback target
+respects the floor.
 
 Create the directory database once by hand with
 `wrangler d1 create velmora-directory --location enam`. Set its id as
