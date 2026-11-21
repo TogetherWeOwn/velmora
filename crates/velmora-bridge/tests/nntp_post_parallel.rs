@@ -743,6 +743,42 @@ async fn a_job_without_a_slot_waits_for_one_under_its_claim() {
     assert_eq!(rig.servers[1].posted_count().await, 0);
 }
 
+/// A job that asks many providers asks less often, so that the asks of
+/// one wait stay within the catalogue calls a wait may make.
+#[tokio::test]
+async fn a_wait_on_many_providers_stays_within_its_catalogue_calls() {
+    assert_eq!(jobs::slot_poll_ms(1), jobs::SLOT_POLL_MS);
+    for providers in [1, 2, 5, 32] {
+        let poll = i64::from(jobs::slot_poll_ms(providers));
+        let asks = (jobs::SLOT_WAIT_MS + poll - 1) / poll;
+        let ask = 1 + 3 * providers as i64;
+        // The last sleep may begin just before the wait is over.
+        assert!((asks - 1) * ask <= jobs::SLOT_WAIT_CALLS, "{providers}");
+    }
+    let mut rig = rig(&[
+        spec("bb0", 2),
+        spec("bb0", 2),
+        spec("bb0", 2),
+        spec("bb0", 2),
+    ])
+    .await;
+    rig.with_timer();
+    let s = rig.seed(1, &marked_plaintext(PLAIN_LEN)).await;
+    let now = rig.bridge.clock.now();
+    for index in 0..4 {
+        rig.take_slots(index, now.plus_secs(30)).await;
+    }
+    let loads = rig.bridge.catalog.pool_loads();
+
+    assert!(matches!(rig.run_post(&s).await, JobOutcome::Retry { .. }));
+
+    let asks = i64::from(rig.bridge.catalog.pool_loads() - loads);
+    let poll = i64::from(jobs::slot_poll_ms(4));
+    assert_eq!(asks, 1 + (jobs::SLOT_WAIT_MS + poll - 1) / poll);
+    assert!((asks - 2) * 13 <= jobs::SLOT_WAIT_CALLS, "{asks}");
+    assert_eq!(rig.bridge.catalog.outbox(&s.extent).attempts, 0);
+}
+
 /// A cooldown of the only poster that begins while a job waits for its
 /// slot is met as by a job claimed then: the job is put off until the
 /// cooldown ends, with no attempt spent, no connect and nothing read,

@@ -203,12 +203,29 @@ pub fn low_watermark(cap: u64) -> u64 {
 /// ([`JOB_WAIT_MS`](crate::jobtable::JOB_WAIT_MS)).
 pub const SLOT_WAIT_MS: i64 = PERMIT_SECS as i64 * 1000;
 const _: () = assert!(SLOT_WAIT_MS + 393_000 < crate::jobtable::JOB_WAIT_MS);
-/// How long a job that waits for a slot sleeps before it asks again. A
-/// slot is held for a second or more by the shortest job there is (a
-/// connect, a login and one pass of a light check), so asking more
-/// often than this finds little; each ask is one read of the pool and
-/// one refused call per provider.
+/// How long a job that waits for a slot sleeps at least before it asks
+/// again. A slot is held for a second or more by the shortest job there
+/// is (a connect, a login and one pass of a light check), so asking
+/// more often than this finds little.
 pub const SLOT_POLL_MS: u32 = 2_000;
+/// Catalogue calls all the asks of one wait may make together. D1 allows
+/// 1,000 queries per invocation, and a job that ran out of them could
+/// not even hand its claim back: the wait gets half, the job's own work
+/// the rest (a drill job made 13 calls on average). One ask is a read of
+/// the pool and at most three calls per provider (the sweep of expired
+/// permits, the take, the seeding of missing slots), so a job that asks
+/// many providers sleeps longer between asks ([`slot_poll_ms`]).
+pub const SLOT_WAIT_CALLS: i64 = 500;
+
+/// The sleep before the next ask of `providers` providers: at least
+/// [`SLOT_POLL_MS`], and long enough that asks spaced like this make no
+/// more than [`SLOT_WAIT_CALLS`] calls in [`SLOT_WAIT_MS`] (and one ask
+/// more, where the last sleep begins just before the wait is over).
+pub fn slot_poll_ms(providers: usize) -> u32 {
+    let calls = 1 + 3 * providers as i64;
+    let ms = (SLOT_WAIT_MS * calls + SLOT_WAIT_CALLS - 1) / SLOT_WAIT_CALLS;
+    u32::try_from(ms).unwrap_or(u32::MAX).max(SLOT_POLL_MS)
+}
 
 pub(crate) const RETRY: JobOutcome = JobOutcome::Retry {
     delay_secs: INFRA_RETRY_SECS,
@@ -383,17 +400,18 @@ where
         }
     }
 
-    /// For a job that just found no slot: sleeps [`SLOT_POLL_MS`] and
-    /// says the job may ask again, while its claim is younger than
-    /// [`SLOT_WAIT_MS`]. `false`, with nothing awaited, once it is not,
-    /// and on a host without a timer: the job is put off as before.
-    /// The lease is not renewed here: a job that connects after a wait
-    /// renews it first, as after any wait ([`Lease::fresh_at`]).
-    pub(crate) async fn slot_wait(&self, lease: &Lease) -> bool {
+    /// For a job that just found no slot on `providers` providers:
+    /// sleeps [`slot_poll_ms`] and says the job may ask again, while its
+    /// claim is younger than [`SLOT_WAIT_MS`]. `false`, with nothing
+    /// awaited, once it is not, and on a host without a timer: the job
+    /// is put off as before. The lease is not renewed here: a job that
+    /// connects after a wait renews it first, as after any wait
+    /// ([`Lease::fresh_at`]).
+    pub(crate) async fn slot_wait(&self, lease: &Lease, providers: usize) -> bool {
         let age = self.clock.now().0 - lease.claimed_at.0;
         match self.budget.sleeper() {
             Some(sleep) if (0..SLOT_WAIT_MS).contains(&age) => {
-                sleep(SLOT_POLL_MS).await;
+                sleep(slot_poll_ms(providers)).await;
                 true
             }
             _ => false,
