@@ -38,7 +38,7 @@ use crate::types::{
     BlobStoreKind, DispatchReport, EvictCandidate, ExtentId, FailClass, GcRow, GcStep,
     GenerationId, Job, JobOutcome, Oldest, OutboxStage, Resend, Result, UnixMs, JOB_VERSION,
 };
-use crate::verify::release_labels;
+use crate::verify::{release_labels, Shelf};
 
 /// Recount steps one cron run takes: 5 chunks of 4,000 rows, about
 /// 5.7 million table rows a day.
@@ -244,6 +244,18 @@ where
 {
     /// Runs one queue job to an outcome. Never panics on a stale job.
     pub async fn run_job(&self, job: &Job) -> JobOutcome {
+        self.run_job_in(job, None).await
+    }
+
+    /// [`Self::run_job`] as one job of a queue batch: a verify or release
+    /// job takes its provider sessions from `shelf` and leaves them there
+    /// for the next job ([`crate::fetch::SessionShelf`]). Each job still
+    /// claims its own row and runs under its own lease. The caller closes
+    /// the shelf once the batch is done.
+    pub async fn run_job_in(&self, job: &Job, shelf: Shelf<'_, N>) -> JobOutcome {
+        if let Some(shelf) = shelf {
+            shelf.sweep(&self.catalog, &self.clock).await;
+        }
         if self.cfg.maintenance == Maintenance::Restore {
             // The outbox keeps the obligation; the dispatcher re-sends it
             // once maintenance ends.
@@ -274,14 +286,14 @@ where
                 extent,
                 generation,
                 stage,
-            } if *v == JOB_VERSION => self.run_extent(extent, generation, *stage).await,
+            } if *v == JOB_VERSION => self.run_extent(extent, generation, *stage, shelf).await,
             Job::Wake {
                 v,
                 extent,
                 generation,
                 stage,
                 ..
-            } if *v == JOB_VERSION => self.run_extent(extent, generation, *stage).await,
+            } if *v == JOB_VERSION => self.run_extent(extent, generation, *stage, shelf).await,
             Job::Gc { v } if *v == JOB_VERSION => self.run_gc().await,
             Job::Evict { v, remaining } if *v == JOB_VERSION => {
                 match self.evict_batch(*remaining).await {
@@ -325,6 +337,7 @@ where
         extent: &ExtentId,
         generation: &GenerationId,
         stage: OutboxStage,
+        shelf: Shelf<'_, N>,
     ) -> JobOutcome {
         if !matches!(
             stage,
@@ -346,10 +359,14 @@ where
             Err(_) => return RETRY,
         };
         if stage != OutboxStage::Post {
-            return self.run_leased(&lease, extent, generation, stage).await;
+            return self
+                .run_leased(&lease, extent, generation, stage, shelf)
+                .await;
         }
         crate::trace::begin(extent, started);
-        let outcome = self.run_leased(&lease, extent, generation, stage).await;
+        let outcome = self
+            .run_leased(&lease, extent, generation, stage, None)
+            .await;
         crate::trace::finish(extent, self.clock.now());
         outcome
     }
@@ -361,6 +378,7 @@ where
         extent: &ExtentId,
         generation: &GenerationId,
         stage: OutboxStage,
+        shelf: Shelf<'_, N>,
     ) -> JobOutcome {
         let row = match self.catalog.job_extent(extent, generation).await {
             Ok(Some(row)) => row,
@@ -397,8 +415,8 @@ where
         };
         match stage {
             OutboxStage::Post => self.post_stage(lease, &row).await,
-            OutboxStage::Verify => self.verify_stage(lease, &row).await,
-            _ => self.release_stage(lease, &row).await,
+            OutboxStage::Verify => self.verify_stage_in(lease, &row, shelf).await,
+            _ => self.release_stage_in(lease, &row, shelf).await,
         }
     }
 
@@ -409,6 +427,13 @@ where
     /// is put off as before. The lease is not renewed here: a job that
     /// connects after a wait renews it first, as after any wait
     /// ([`Lease::fresh_at`]).
+    /// Whether [`Self::slot_wait`] would wait now (a timer, and a claim
+    /// younger than [`SLOT_WAIT_MS`]), without waiting.
+    pub(crate) fn may_slot_wait(&self, lease: &Lease) -> bool {
+        let age = self.clock.now().0 - lease.claimed_at.0;
+        self.budget.sleeper().is_some() && (0..SLOT_WAIT_MS).contains(&age)
+    }
+
     pub(crate) async fn slot_wait(&self, lease: &Lease, providers: usize) -> bool {
         let age = self.clock.now().0 - lease.claimed_at.0;
         match self.budget.sleeper() {

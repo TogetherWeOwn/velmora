@@ -411,9 +411,20 @@ dead_letter_queue = "velmora-dlq"
 # past about 30 consumers verify and release jobs are put off instead of
 # running, and every put-off spends one of the message's deliveries
 # (max_retries). Under body the provider's slots already bound at six.
+# A batch of up to eight verify and release jobs runs in one invocation,
+# one job after the other, over one connection per provider: a job leaves
+# its session (slot and login kept) for the next one, and the end of the
+# batch closes them. Each job claims its own row and renews its own lease
+# before every call. Eight keeps a batch within D1's 1,000 queries per
+# invocation: one job of a batch may wait for a slot (up to 500 queries),
+# the others take about 45 each. With more per batch, lower SLOT_WAIT_CALLS.
+# Only verify and release jobs share a batch's sessions; the jobs without
+# an extent go to the aux queue, which must stay bound while this is
+# above 1. A job is not started after BATCH_START_MS (90 s) into a batch:
+# it goes back to the queue, so the batch ends within the wall time.
 [[queues.consumers]]
 queue = "velmora-verify"
-max_batch_size = 1
+max_batch_size = 8
 max_concurrency = 8
 max_retries = 20
 retry_delay = 120
@@ -421,7 +432,7 @@ dead_letter_queue = "velmora-dlq"
 
 [[queues.consumers]]
 queue = "velmora-verify2"
-max_batch_size = 1
+max_batch_size = 8
 max_concurrency = 8
 max_retries = 20
 retry_delay = 120
@@ -429,7 +440,7 @@ dead_letter_queue = "velmora-dlq"
 
 [[queues.consumers]]
 queue = "velmora-verify3"
-max_batch_size = 1
+max_batch_size = 8
 max_concurrency = 8
 max_retries = 20
 retry_delay = 120
@@ -437,7 +448,7 @@ dead_letter_queue = "velmora-dlq"
 
 [[queues.consumers]]
 queue = "velmora-verify4"
-max_batch_size = 1
+max_batch_size = 8
 max_concurrency = 8
 max_retries = 20
 retry_delay = 120
@@ -575,6 +586,8 @@ dead_letter_queue = "velmora-dlq-dev"
 
 [[env.dev.queues.consumers]]
 queue = "velmora-verify-dev"
+# One job per invocation: dev binds no aux queue, so gc, evict and sweep
+# jobs share this one and a batch could pass D1's queries per invocation.
 max_batch_size = 1
 max_concurrency = 2
 max_retries = 20

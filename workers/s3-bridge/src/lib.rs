@@ -257,13 +257,39 @@ async fn queue(batch: MessageBatch<serde_json::Value>, env: Env, _ctx: Context) 
         }
     };
     log_budget(&bridge);
-    for msg in batch.messages()? {
+    // The provider sessions of this batch: a verify or release job leaves
+    // its session for the next job, and the last one closes them all.
+    // Without a holder name (no random bytes) each job opens its own.
+    let shelf = velmora_bridge::fetch::SessionShelf::new().ok().map(Rc::new);
+    let started = worker::Date::now().as_millis() as i64;
+    let mut handed_on = 0u32;
+    for (i, msg) in batch.messages()?.into_iter().enumerate() {
         let Ok(job) = serde_json::from_value::<Job>(msg.body().clone()) else {
             // A job only names an outbox row; the dispatcher re-drives it.
             console_error!("malformed job message dropped");
             msg.ack();
             continue;
         };
+        // Only the first job of a batch may be one without an extent (a
+        // queue that takes them shares no sessions and no query budget),
+        // and no job starts so late in the batch that it could run past
+        // the invocation's wall time. Such a job is sent again as a new
+        // message, so it spends none of the deliveries its message is
+        // allowed; if the send fails, the retry is the fallback.
+        let extent_job = matches!(job, Job::Extent { .. } | Job::Wake { .. });
+        let late = worker::Date::now().as_millis() as i64 - started;
+        if i > 0 && (!extent_job || late >= velmora_bridge::jobtable::BATCH_START_MS) {
+            handed_on += 1;
+            match velmora_bridge::ports::JobSink::send(&bridge.jobs, &job, 0).await {
+                Ok(()) => msg.ack(),
+                Err(_) => msg.retry_with_options(
+                    &QueueRetryOptionsBuilder::new()
+                        .with_delay_seconds(0)
+                        .build(),
+                ),
+            }
+            continue;
+        }
         let outcome = match &job {
             // Never through `run_job`, which reads the catalogue. A job
             // of another version is dropped: the next pass does the work.
@@ -275,7 +301,7 @@ async fn queue(batch: MessageBatch<serde_json::Value>, env: Env, _ctx: Context) 
                     JobOutcome::Ack
                 }
             }
-            _ => run_in_table(&bridge, &job).await,
+            _ => run_in_table(&bridge, &job, shelf.clone()).await,
         };
         log_post_trace(&job, &outcome);
         plan_hint(&env, &bridge, &job, &outcome).await;
@@ -288,6 +314,12 @@ async fn queue(batch: MessageBatch<serde_json::Value>, env: Env, _ctx: Context) 
             ),
         }
     }
+    if let Some(shelf) = &shelf {
+        shelf.close(&bridge.catalog, &bridge.clock).await;
+    }
+    if handed_on > 0 {
+        console_log!("queue batch: {handed_on} jobs sent on as new messages");
+    }
     log_budget(&bridge);
     if let Some(line) = env::memory_line(&bridge) {
         console_log!("{line}");
@@ -295,10 +327,19 @@ async fn queue(batch: MessageBatch<serde_json::Value>, env: Env, _ctx: Context) 
     Ok(())
 }
 
+/// The session shelf of one queue batch.
+type Shelf = velmora_bridge::fetch::SessionShelf<
+    <nntp::WorkerConnector as velmora_bridge::ports::NntpConnector>::Session,
+>;
+
 /// Runs a job in the isolate's job table, where a later invocation can
 /// drop it should this one be cancelled: a cancelled invocation is not
 /// dropped, and the job would keep its bytes of the budget (`jobs`).
-async fn run_in_table(bridge: &Rc<env::WorkerBridge>, job: &Job) -> JobOutcome {
+async fn run_in_table(
+    bridge: &Rc<env::WorkerBridge>,
+    job: &Job,
+    shelf: Option<Rc<Shelf>>,
+) -> JobOutcome {
     let now = velmora_bridge::ports::Clock::now(&bridge.clock);
     // A wake that is due runs its stage too.
     let post = matches!(
@@ -312,7 +353,8 @@ async fn run_in_table(bridge: &Rc<env::WorkerBridge>, job: &Job) -> JobOutcome {
         }
     );
     let (b, j) = (Rc::clone(bridge), job.clone());
-    match jobs::run(now, post, async move { b.run_job(&j).await }).await {
+    let run = async move { b.run_job_in(&j, shelf.as_deref()).await };
+    match jobs::run(now, post, run).await {
         Some(outcome) => outcome,
         // `jobs::run` has logged it.
         None => JobOutcome::Retry {

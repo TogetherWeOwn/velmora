@@ -74,6 +74,8 @@ impl<C: Catalog, N: NntpConnector, T: Clock> Drop for ProviderSession<'_, C, N, 
 /// slot the run takes, on any provider and for any step (post, verify,
 /// repost), carries this name, and a provider with `max_ips` counts the
 /// run once. A later run of the job claims again, so it gets a new name.
+/// The verify and release jobs of one queue batch share one invocation
+/// and take the name of its [`SessionShelf`] instead.
 pub(crate) fn job_holder(lease: &Lease) -> String {
     format!(
         "job:{}:{}:{}",
@@ -431,6 +433,87 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ProviderSession<'a, C, N, T> {
         }
     }
 
+    /// Puts the session on `shelf` for the next job of the same queue
+    /// batch, slot and socket kept, instead of closing it. Only a session
+    /// that is connected and went well is kept: anything else is closed
+    /// here, as [`close`](Self::close) would. A full shelf closes its
+    /// oldest session first.
+    pub(crate) async fn park(mut self, shelf: &SessionShelf<N::Session>) {
+        let healthy = self.health.is_none_or(|h| h.is_ok());
+        if !healthy || self.session.is_none() || shelf.closed.get() {
+            return self.close().await;
+        }
+        let (catalog, clock) = (self.catalog, self.clock);
+        // Reported now, as a close would: a good session that waits on
+        // the shelf does not clear, later, strikes others record meanwhile.
+        // What the session does after it is taken again is reported when
+        // it is closed.
+        report_health(catalog, clock, &self.provider.id, self.health).await;
+        let oldest = {
+            let mut parked = shelf.parked.borrow_mut();
+            let oldest = (parked.len() >= MAX_PARKED).then(|| parked.remove(0));
+            parked.push(Parked {
+                provider_id: self.provider.id.clone(),
+                permit: self.permit.clone(),
+                session: self.session.take(),
+                health: None,
+                kept_at: self.kept.map(|(at, _)| at),
+                held_from: self.held_from,
+                broke_early: self.broke_early,
+            });
+            oldest
+        };
+        // Parked, not freed: the shelf frees the slot when it closes it.
+        self.freed = true;
+        drop(self);
+        if let Some(oldest) = oldest {
+            close_parked(catalog, clock, oldest).await;
+        }
+    }
+
+    /// The session `shelf` keeps for `provider`, if one is there and
+    /// young enough to go on with: its slot was taken or last renewed
+    /// less than [`PARK_REUSE_MS`] ago, so the renewal the next call
+    /// makes (or does not need, [`Self::keep`]) finds the slot live. One
+    /// older than that is closed. The next call renews the job's own
+    /// lease first: a kept session never vouches for another claim.
+    pub(crate) async fn unpark(
+        catalog: &'a C,
+        nntp: &'a N,
+        clock: &'a T,
+        provider: &'a ProviderConfig,
+        shelf: &SessionShelf<N::Session>,
+    ) -> Option<Self> {
+        let found = {
+            let mut parked = shelf.parked.borrow_mut();
+            let at = parked.iter().position(|p| p.provider_id == provider.id);
+            at.map(|at| parked.remove(at))
+        };
+        let parked = found?;
+        let now = clock.now();
+        if !(0..PARK_REUSE_MS).contains(&(now.0 - parked.held_from.0)) {
+            close_parked(catalog, clock, parked).await;
+            return None;
+        }
+        shelf.reused.set(shelf.reused.get() + 1);
+        Some(ProviderSession {
+            catalog,
+            nntp,
+            clock,
+            provider,
+            permit: parked.permit,
+            session: parked.session,
+            health: parked.health,
+            timer: None,
+            // Confirmed for the slot only: the next job's lease is
+            // renewed or found fresh on its own ([`Self::keep`]).
+            kept: parked.kept_at.map(|at| (at, false)),
+            held_from: parked.held_from,
+            freed: false,
+            broke_early: parked.broke_early,
+        })
+    }
+
     /// [`close`](Self::close) without the health report: ends the session,
     /// frees the slot and returns how the session went. Several sessions
     /// of one job on one provider are one strike or one recovery, which
@@ -471,6 +554,157 @@ pub(crate) async fn report_health<C: Catalog, T: Clock>(
         Some(Ok(())) => catalog.provider_recovered(id, now).await,
         None => Ok(()),
     };
+}
+
+/// Most sessions a [`SessionShelf`] keeps open at once. A Worker
+/// invocation may have six connections open: two kept and the one a job
+/// reads on are three sockets, and with `PERMITS=do` up to one gate link
+/// each beside them. Two cover the two backbones a release counts.
+pub(crate) const MAX_PARKED: usize = 2;
+
+/// How long after its slot was taken or last renewed a kept session may
+/// be used again: half of a background permit's life
+/// ([`PERMIT_SECS`](crate::ports::PERMIT_SECS)), so the renewal before
+/// its next call always finds the slot live.
+pub(crate) const PARK_REUSE_MS: i64 = crate::ports::PERMIT_SECS as i64 * 500;
+
+/// A session kept open between two jobs of one batch.
+struct Parked<S> {
+    provider_id: String,
+    permit: Permit,
+    session: Option<S>,
+    health: Health,
+    kept_at: Option<UnixMs>,
+    held_from: UnixMs,
+    broke_early: u32,
+}
+
+/// The provider sessions of one queue batch: a verify or release job
+/// leaves its session here and the next job of the batch goes on with
+/// it, so a batch of extents is checked over one connection (one slot,
+/// one login) per provider instead of one per extent and provider.
+///
+/// Every job still claims its own row and works under its own lease:
+/// before each call the session renews the lease of the job that uses it
+/// ([`ProviderSession::keep`]), so a job that lost its claim stops alone
+/// and the next job of the batch goes on. One holder name
+/// ([`Self::holder`]) for every slot of the batch: one invocation, one
+/// address. [`Self::close`] at the end of the batch frees every slot.
+/// Shared by the jobs of one invocation only, which run one after the
+/// other.
+pub struct SessionShelf<S> {
+    holder: String,
+    parked: core::cell::RefCell<Vec<Parked<S>>>,
+    /// Set by [`Self::close`]: a session returned later is closed.
+    closed: core::cell::Cell<bool>,
+    /// Sessions taken from the shelf (a count for tests and logs).
+    reused: core::cell::Cell<u32>,
+    /// The claim (outbox lease token and extent) of the one job of the
+    /// batch that may wait for a slot ([`crate::jobs::SLOT_WAIT_MS`]).
+    waiter: core::cell::RefCell<Option<(String, u64)>>,
+}
+
+impl<S: NntpSession> SessionShelf<S> {
+    /// An empty shelf for one invocation, with a holder name of its own.
+    pub fn new() -> Result<Self> {
+        Ok(Self::named(request_holder("batch")?))
+    }
+
+    /// An empty shelf whose slots carry `holder`.
+    pub fn named(holder: String) -> Self {
+        Self {
+            holder,
+            parked: core::cell::RefCell::new(Vec::new()),
+            closed: core::cell::Cell::new(false),
+            reused: core::cell::Cell::new(0),
+            waiter: core::cell::RefCell::new(None),
+        }
+    }
+
+    /// The permit holder of every slot taken in this batch.
+    pub fn holder(&self) -> &str {
+        &self.holder
+    }
+
+    /// Sessions open on the shelf now.
+    pub fn parked(&self) -> usize {
+        self.parked.borrow().len()
+    }
+
+    /// Sessions jobs took from the shelf so far.
+    pub fn reused(&self) -> u32 {
+        self.reused.get()
+    }
+
+    /// Whether the job of `lease` may wait for a slot. One job of a batch
+    /// may: the batch shares the invocation's D1 calls
+    /// ([`crate::jobs::SLOT_WAIT_CALLS`] is half of them), so a second
+    /// job that finds no slot is put off as before the wait existed.
+    pub(crate) fn may_wait(&self, lease: &Lease) -> bool {
+        let me = (lease.extent.to_string(), lease.token);
+        let mut waiter = self.waiter.borrow_mut();
+        match &*waiter {
+            Some(w) => *w == me,
+            None => {
+                *waiter = Some(me);
+                true
+            }
+        }
+    }
+
+    /// Ends every kept session and frees its slot. Later sessions are
+    /// not kept.
+    pub async fn close<C: Catalog, T: Clock>(&self, catalog: &C, clock: &T) {
+        self.closed.set(true);
+        self.drain(catalog, clock).await;
+    }
+
+    /// Ends every kept session and frees its slot; the shelf stays open.
+    /// Called before anything that may take long while they would sit
+    /// idle (a wait for a slot, a repost): a kept session is not renewed,
+    /// so it must not outlive its permit logged in ("no permit, no
+    /// socket").
+    pub async fn drain<C: Catalog, T: Clock>(&self, catalog: &C, clock: &T) {
+        let all: Vec<Parked<S>> = self.parked.borrow_mut().drain(..).collect();
+        for parked in all {
+            close_parked(catalog, clock, parked).await;
+        }
+    }
+
+    /// Ends every kept session that is too old to be taken again
+    /// ([`PARK_REUSE_MS`]). Called at the start of each job and of each
+    /// pass, so no kept session stays logged in much past that age.
+    pub async fn sweep<C: Catalog, T: Clock>(&self, catalog: &C, clock: &T) {
+        let now = clock.now();
+        let old: Vec<Parked<S>> = {
+            let mut parked = self.parked.borrow_mut();
+            let (old, young) = parked
+                .drain(..)
+                .partition(|p| !(0..PARK_REUSE_MS).contains(&(now.0 - p.held_from.0)));
+            *parked = young;
+            old
+        };
+        for parked in old {
+            close_parked(catalog, clock, parked).await;
+        }
+    }
+}
+
+/// Ends a kept session: `QUIT`, the slot freed (fenced by its token),
+/// and the session's health reported.
+async fn close_parked<C: Catalog, T: Clock, S: NntpSession>(
+    catalog: &C,
+    clock: &T,
+    mut parked: Parked<S>,
+) {
+    if let Some(session) = parked.session.take() {
+        session.quit().await;
+    }
+    // A failed release is safe: the permit expires on its own.
+    if catalog.release_permit(&parked.permit).await.is_err() {
+        catalog.forget_permit(&parked.permit);
+    }
+    report_health(catalog, clock, &parked.provider_id, parked.health).await;
 }
 
 /// Reconnects one pass over a provider may spend on broken sessions.

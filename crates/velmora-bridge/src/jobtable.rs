@@ -68,6 +68,17 @@ pub const JOB_QUIET_MS: i64 = 60_000;
 pub const JOB_WAIT_MS: i64 = 13 * 60 * 1000;
 
 const _: () = assert!(JOB_WAIT_MS < JOB_MAX_AGE_MS - 2 * 60 * 1000);
+
+/// The wall time a queue consumer invocation has: 15 minutes.
+pub const INVOCATION_WALL_MS: i64 = 15 * 60 * 1000;
+
+/// How long into a queue batch a job may still start: one that starts
+/// later could be waited for ([`JOB_WAIT_MS`]) past the invocation's
+/// wall time, cut off with the rest of the batch. A message reached
+/// after it is handed back to the queue (`retry`, at once). 90 s holds a
+/// batch of light verify jobs (6 to 7 s each) with room to spare.
+pub const BATCH_START_MS: i64 = INVOCATION_WALL_MS - JOB_WAIT_MS - 30_000;
+const _: () = assert!(BATCH_START_MS >= 60_000);
 const _: () = assert!(JOB_BEAT_MS * 4 <= JOB_QUIET_MS);
 
 /// How a job ended for the invocation that waited for it

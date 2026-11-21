@@ -138,7 +138,12 @@ use zeroize::Zeroizing;
 use crate::config::VerifyMode;
 use crate::fetch::{
     ask_articles_together, job_holder, read_articles, stat_articles, ProviderSession, ReadTally,
+    SessionShelf,
 };
+
+/// The session shelf of the queue batch a job runs in, if any
+/// ([`SessionShelf`]).
+pub type Shelf<'s, N> = Option<&'s SessionShelf<<N as NntpConnector>::Session>>;
 use crate::pool::Pool;
 use crate::ports::{
     BlobStore, Bridge, Catalog, Clock, Guard, JobSink, Kek, Lease, NntpConnector, PermitClass,
@@ -358,8 +363,20 @@ where
     /// result, so the next job does not read the ones before it again:
     /// the resume point goes with the write that gives the lease back.
     pub async fn verify_stage(&self, lease: &Lease, job: &JobExtent) -> JobOutcome {
+        self.verify_stage_in(lease, job, None).await
+    }
+
+    /// [`Self::verify_stage`] as one job of a queue batch: provider
+    /// sessions are taken from `shelf` and left there for the next job
+    /// ([`SessionShelf`]). `None` = a job of its own.
+    pub async fn verify_stage_in(
+        &self,
+        lease: &Lease,
+        job: &JobExtent,
+        shelf: Shelf<'_, N>,
+    ) -> JobOutcome {
         let mut reached = None;
-        match self.verify_extent(lease, job, &mut reached).await {
+        match self.verify_extent(lease, job, &mut reached, shelf).await {
             Ok(()) => JobOutcome::Ack,
             Err(stop) => settle_at(&self.catalog, &self.clock, lease, stop, reached).await,
         }
@@ -369,7 +386,18 @@ where
     /// that counts for every article now (`STAT`), require the full check
     /// on record from verify, then mark the safety copy evictable.
     pub async fn release_stage(&self, lease: &Lease, job: &JobExtent) -> JobOutcome {
-        match self.release_extent(lease, job).await {
+        self.release_stage_in(lease, job, None).await
+    }
+
+    /// [`Self::release_stage`] as one job of a queue batch
+    /// ([`Self::verify_stage_in`]).
+    pub async fn release_stage_in(
+        &self,
+        lease: &Lease,
+        job: &JobExtent,
+        shelf: Shelf<'_, N>,
+    ) -> JobOutcome {
+        match self.release_extent(lease, job, shelf).await {
             Ok(()) => JobOutcome::Ack,
             Err(stop) => settle(&self.catalog, &self.clock, lease, stop).await,
         }
@@ -459,8 +487,10 @@ where
         plan: &[ArticleRow],
         providers: &[&'p ProviderConfig],
         kind: VerifyKind,
+        shelf: Shelf<'_, N>,
     ) -> Staged<(&'p ProviderConfig, ReadTally)> {
-        let holder = job_holder(lease);
+        // One holder for every slot of a batch: one invocation.
+        let holder = shelf.map_or_else(|| job_holder(lease), |s| s.holder().to_string());
         let rows: Vec<&ArticleRow> = plan.iter().collect();
         let together = self.cfg.verify.mode == VerifyMode::Light;
         let now = self.clock.now();
@@ -471,6 +501,53 @@ where
             .partition(|p| p.retains(oldest, now));
         if fresh.is_empty() {
             fresh = expired;
+        }
+        // A session this batch keeps for one of these providers is used
+        // first: no new slot, no new login, and no pool read. It holds
+        // its slot already, so the pool, which counts that slot as taken,
+        // is not asked for one.
+        if let Some(shelf) = shelf {
+            // None stays logged in past the age it may be taken at.
+            shelf.sweep(&self.catalog, &self.clock).await;
+            let mut refused = None;
+            for provider in fresh.iter().copied() {
+                let kept = ProviderSession::unpark(
+                    &self.catalog,
+                    &self.nntp,
+                    &self.clock,
+                    provider,
+                    shelf,
+                )
+                .await;
+                let Some(mut session) = kept else {
+                    continue;
+                };
+                let tally = self.ask(&mut session, lease, &rows, kind, together).await;
+                match &tally {
+                    Ok(_) => session.park(shelf).await,
+                    Err(_) => session.close().await,
+                }
+                match tally {
+                    // Refused on a session that was logged in (its
+                    // reconnect): the other providers of the backbone
+                    // are asked as for a job of its own, this one not
+                    // again in this pass, as the pool path does.
+                    Err(Stop::Refused) => {
+                        refused = Some(provider.id.as_str());
+                        break;
+                    }
+                    // The kept slot is gone (it was not renewed in time):
+                    // closed above; the pool is asked for a slot.
+                    Err(Stop::NoPermit) => break,
+                    tally => return Ok((provider, tally?)),
+                }
+            }
+            if let Some(id) = refused {
+                fresh.retain(|p| p.id != id);
+                if fresh.is_empty() {
+                    return Err(Stop::Refused);
+                }
+            }
         }
         let mut waited = false;
         loop {
@@ -508,22 +585,12 @@ where
                 }) else {
                     continue;
                 };
-                let tally = match kind {
-                    VerifyKind::Body | VerifyKind::Sampled => {
-                        read_articles(&mut session, Some(lease), &rows, |_, _| {}).await
-                    }
-                    // Under the light check the articles of an extent are
-                    // asked for together; under `body` one by one, as before.
-                    VerifyKind::Stat if together => {
-                        ask_articles_together(&mut session, Some(lease), &rows, None).await
-                    }
-                    VerifyKind::Stat => stat_articles(&mut session, Some(lease), &rows).await,
-                    VerifyKind::Size => {
-                        let how = self.cfg.verify.size_command(&provider.id);
-                        ask_articles_together(&mut session, Some(lease), &rows, how).await
-                    }
-                };
-                session.close().await;
+                let tally = self.ask(&mut session, lease, &rows, kind, together).await;
+                // Kept for the next job of the batch when it went well.
+                match (shelf, &tally) {
+                    (Some(shelf), Ok(_)) => session.park(shelf).await,
+                    _ => session.close().await,
+                }
                 match tally {
                     // The provider refused the account: the next one of the
                     // backbone is asked.
@@ -537,11 +604,45 @@ where
             // No slot on this backbone. It is waited for under the claim
             // for a bounded time ([`crate::jobs::SLOT_WAIT_MS`]): the
             // row is not given back and delivered again for a slot
-            // that comes free in seconds.
+            // that comes free in seconds. In a batch only one job waits
+            // ([`SessionShelf::may_wait`]).
+            if !self.may_slot_wait(lease) || shelf.is_some_and(|s| !s.may_wait(lease)) {
+                return Err(Stop::NoPermit);
+            }
+            if let Some(shelf) = shelf {
+                // A kept session is not renewed while this job waits.
+                shelf.drain(&self.catalog, &self.clock).await;
+            }
             if !self.slot_wait(lease, asked).await {
                 return Err(Stop::NoPermit);
             }
             waited = true;
+        }
+    }
+
+    /// One pass of `kind` over `rows` on `session`, under `lease`.
+    async fn ask(
+        &self,
+        session: &mut ProviderSession<'_, C, N, T>,
+        lease: &Lease,
+        rows: &[&ArticleRow],
+        kind: VerifyKind,
+        together: bool,
+    ) -> Staged<ReadTally> {
+        match kind {
+            VerifyKind::Body | VerifyKind::Sampled => {
+                read_articles(session, Some(lease), rows, |_, _| {}).await
+            }
+            // Under the light check the articles of an extent are
+            // asked for together; under `body` one by one, as before.
+            VerifyKind::Stat if together => {
+                ask_articles_together(session, Some(lease), rows, None).await
+            }
+            VerifyKind::Stat => stat_articles(session, Some(lease), rows).await,
+            VerifyKind::Size => {
+                let how = self.cfg.verify.size_command(&session.provider.id);
+                ask_articles_together(session, Some(lease), rows, how).await
+            }
         }
     }
 
@@ -647,6 +748,7 @@ where
     /// on their own, so the backbone is only read again. Once it is over
     /// they are posted straight to a provider of this backbone, once per
     /// round, and read again; what that read finds is recorded.
+    #[allow(clippy::too_many_arguments)] // the shelf of the batch rides along
     async fn missing_wait(
         &self,
         lease: &Lease,
@@ -655,6 +757,7 @@ where
         backbone: &str,
         missing: &[u32],
         cursor: u32,
+        shelf: Shelf<'_, N>,
     ) -> Staged<Option<u32>> {
         let retries = cursor % CURSOR_STEPS;
         if retries == REPOSTED {
@@ -674,6 +777,13 @@ where
                 .iter()
                 .filter(|p| p.post && p.enabled && label(&p.backbone) == backbone)
                 .collect();
+            // The repost opens sockets and slots of its own, under the
+            // job's own holder name: the kept sessions are closed first,
+            // so the invocation stays within its connections and counts
+            // as one address.
+            if let Some(shelf) = shelf {
+                shelf.drain(&self.catalog, &self.clock).await;
+            }
             if self
                 .repost(lease, extent, plan, missing, &posters, None)
                 .await?
@@ -711,6 +821,7 @@ where
     /// That is stored with the escalation and nowhere else, so a raise
     /// that was not stored is made by the next job that fails the read,
     /// whatever the record of the reads says by then.
+    #[allow(clippy::too_many_arguments)] // the shelf of the batch rides along
     async fn sample_failed(
         &self,
         lease: &Lease,
@@ -719,6 +830,7 @@ where
         providers: &[&ProviderConfig],
         backbone: &str,
         tally: &mut ReadTally,
+        shelf: Shelf<'_, N>,
     ) -> Staged<()> {
         let raised = self
             .catalog
@@ -734,7 +846,7 @@ where
             };
             let gone = rows(&tally.missing, true);
             let (_, stat) = self
-                .read_backbone(lease, &gone, providers, VerifyKind::Stat)
+                .read_backbone(lease, &gone, providers, VerifyKind::Stat, shelf)
                 .await?;
             // Those the provider says it has, read once more.
             let listed: Vec<ArticleRow> = gone
@@ -745,7 +857,7 @@ where
                 return Ok(());
             }
             let (_, again) = self
-                .read_backbone(lease, &listed, providers, VerifyKind::Body)
+                .read_backbone(lease, &listed, providers, VerifyKind::Body, shelf)
                 .await?;
             for a in &listed {
                 if again.missing.contains(&a.idx) {
@@ -830,6 +942,7 @@ where
         lease: &Lease,
         job: &JobExtent,
         reached: &mut Option<u32>,
+        shelf: Shelf<'_, N>,
     ) -> Staged<()> {
         let extent = &job.extent;
         let plan = self.posted_plan(extent).await?;
@@ -886,13 +999,15 @@ where
             let watched = light.is_some() && kind.is_full();
             let mut asked = false;
             let began = self.clock.now();
-            let (provider, mut tally) = self.read_backbone(lease, &plan, providers, kind).await?;
+            let (provider, mut tally) = self
+                .read_backbone(lease, &plan, providers, kind, shelf)
+                .await?;
             if watched && result_of(&tally) == VerifyResult::Missing {
                 // Before the waits for a missing article, which may take
                 // hours: a provider that says with `STAT` it has what it
                 // does not serve is answering for other extents all that
                 // time. An article this reads after all is not missing.
-                self.sample_failed(lease, extent, &plan, &[provider], name, &mut tally)
+                self.sample_failed(lease, extent, &plan, &[provider], name, &mut tally, shelf)
                     .await?;
                 asked = true;
             }
@@ -900,7 +1015,7 @@ where
                 // What this stores is the resume point of this backbone.
                 let stored = reached.take();
                 let wait = self
-                    .missing_wait(lease, extent, &plan, name, &tally.missing, cursor)
+                    .missing_wait(lease, extent, &plan, name, &tally.missing, cursor, shelf)
                     .await;
                 let wait = match wait {
                     Ok(wait) => wait,
@@ -930,7 +1045,7 @@ where
                 // any other: the rows do not say which articles failed,
                 // so bytes that were bad when posted cannot be told from
                 // damage of its own.
-                self.sample_failed(lease, extent, &plan, &[provider], name, &mut tally)
+                self.sample_failed(lease, extent, &plan, &[provider], name, &mut tally, shelf)
                     .await?;
             }
             // The next backbone is read by this job, under the same
@@ -992,7 +1107,9 @@ where
                     .filter(|(began, _)| *began >= ready)
                     .map(|(_, row)| row)
                     .collect();
-                return self.release_checked(lease, extent, &plan, now, &seen).await;
+                return self
+                    .release_checked(lease, extent, &plan, now, &seen, shelf)
+                    .await;
             }
             return self.to_release(lease, ready.max(now)).await;
         }
@@ -1017,7 +1134,12 @@ where
         self.advance(lease, OutboxStage::Done, now).await
     }
 
-    async fn release_extent(&self, lease: &Lease, job: &JobExtent) -> Staged<()> {
+    async fn release_extent(
+        &self,
+        lease: &Lease,
+        job: &JobExtent,
+        shelf: Shelf<'_, N>,
+    ) -> Staged<()> {
         let extent = &job.extent;
         let now = self.clock.now();
         if job.generation_state == GenerationState::Deleted {
@@ -1062,7 +1184,8 @@ where
             }
             return Ok(());
         }
-        self.release_checked(lease, extent, &plan, now, &[]).await
+        self.release_checked(lease, extent, &plan, now, &[], shelf)
+            .await
     }
 
     /// Whether a verify job whose round passed releases the extent
@@ -1102,6 +1225,7 @@ where
         plan: &[ArticleRow],
         now: UnixMs,
         seen: &[VerificationRow],
+        shelf: Shelf<'_, N>,
     ) -> Staged<()> {
         let required = self.cfg.required_backbones;
         let groups = release_backbones(&self.cfg.providers);
@@ -1184,7 +1308,7 @@ where
                     lacking = true;
                     continue;
                 }
-                None => self.read_backbone(lease, plan, providers, VerifyKind::Stat),
+                None => self.read_backbone(lease, plan, providers, VerifyKind::Stat, shelf),
             };
             match asked.await {
                 Ok(asked) => read.push(asked),

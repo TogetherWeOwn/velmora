@@ -18,7 +18,9 @@
 //! - Queues: send calls and messages, and redeliveries of a retried job;
 //! - NNTP: connects, posts and bytes posted, STAT/size asks, bodies and
 //!   bytes read;
-//! - invocations (one per S3 request, queue message and cron run) and the
+//! - invocations (one per S3 request, queue batch and cron run; the
+//!   verify and release jobs of one verify queue run in batches of its
+//!   consumer's `max_batch_size`, over one session shelf) and the
 //!   wall time of the native run (indicative only: not the Worker's CPU).
 //!
 //! Operations run one after another and jobs run in turn, so each figure
@@ -444,6 +446,61 @@ impl NntpConnector for MeterNntp {
 
 type BenchBridge =
     Bridge<SqlCatalog<MeterSql>, MeterBlobs, MeterNntp, MeterJobs, TestKek, FixedClock>;
+type BenchShelf = velmora_bridge::fetch::SessionShelf<MeterSession>;
+
+/// The verify queues production binds (`[[queues.consumers]]` of
+/// `velmora-verify`, `velmora-verify2`, ...).
+fn verify_queues() -> usize {
+    let file = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../workers/s3-bridge/wrangler.toml"
+    );
+    let text = std::fs::read_to_string(file).expect("wrangler.toml");
+    let prod = &text[..text.find("[env.dev]").unwrap_or(text.len())];
+    let n = prod
+        .matches("[[queues.consumers]]\nqueue = \"velmora-verify")
+        .count();
+    assert!(n >= 1, "no verify queue consumer in {file}");
+    n
+}
+
+/// The verify queue of an extent: `shard` of `workers/s3-bridge/src/queues.rs`.
+fn shard(extent: &str, queues: usize) -> usize {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in extent.bytes() {
+        h = (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h ^= h >> 33;
+    h = h.wrapping_mul(0xff51_afd7_ed55_8ccd);
+    h ^= h >> 33;
+    h = h.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
+    h ^= h >> 33;
+    (h % queues.max(1) as u64) as usize
+}
+
+/// `max_batch_size` of the consumer of the first verify queue in
+/// `wrangler.toml` (production): the jobs one invocation runs together.
+fn verify_batch_size() -> usize {
+    let file = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../workers/s3-bridge/wrangler.toml"
+    );
+    let text = std::fs::read_to_string(file).expect("wrangler.toml");
+    let at = text
+        .find("[[queues.consumers]]\nqueue = \"velmora-verify\"\n")
+        .expect("the consumer of velmora-verify");
+    let rest = &text[at..];
+    let line = rest
+        .lines()
+        .find(|l| l.starts_with("max_batch_size"))
+        .expect("max_batch_size");
+    line.split('=')
+        .nth(1)
+        .unwrap()
+        .trim()
+        .parse()
+        .expect("a number")
+}
 
 // ---------------------------------------------------------------------------
 // Configuration: production's [vars], fake providers
@@ -990,19 +1047,92 @@ impl Bench {
     }
 
     async fn run_job(&self, job: &Job, redelivery: bool) -> JobOutcome {
+        self.run_job_in(job, redelivery, None, true).await
+    }
+
+    /// One job; `shelf` = the job is one of a queue batch, and `first`
+    /// says whether it is the first of it (the batch is one invocation).
+    async fn run_job_in(
+        &self,
+        job: &Job,
+        redelivery: bool,
+        shelf: Option<&BenchShelf>,
+        first: bool,
+    ) -> JobOutcome {
         let label = self.job_label(job);
         self.hub.set(&label);
         *self.hub.calls.borrow_mut().entry(label).or_default() += 1;
         let t = Instant::now();
-        let outcome = self.bridge.run_job(job).await;
+        let outcome = self.bridge.run_job_in(job, shelf).await;
         let us = t.elapsed().as_micros() as u64;
         self.hub.add(|c| {
-            c.invocations += 1;
+            c.invocations += u64::from(first);
             c.wall_us += us;
             c.queue_redeliveries += u64::from(redelivery);
         });
         self.hub.set("idle");
         outcome
+    }
+
+    /// Runs `jobs` as the queues deliver them: the jobs of the verify
+    /// queues (verify and release) in batches of `max_batch_size` of
+    /// their consumer, each batch over one session shelf, closed at its
+    /// end and charged to its last job; every other job alone. Returns
+    /// the jobs that asked to be retried, with their delay.
+    async fn run_jobs(&self, jobs: Vec<(Job, bool)>) -> Vec<(Job, u32)> {
+        let verify_lane = |job: &Job| {
+            matches!(
+                job,
+                Job::Extent {
+                    stage: OutboxStage::Verify | OutboxStage::Release,
+                    ..
+                } | Job::Wake {
+                    stage: OutboxStage::Verify | OutboxStage::Release,
+                    ..
+                }
+            )
+        };
+        let mut retried = Vec::new();
+        let (lane, other): (Vec<_>, Vec<_>) = jobs.into_iter().partition(|(j, _)| verify_lane(j));
+        for (job, redelivery) in other {
+            if let JobOutcome::Retry { delay_secs } = self.run_job(&job, redelivery).await {
+                retried.push((job, delay_secs));
+            }
+        }
+        // As production delivers them: each extent's jobs to one of the
+        // verify queues (by its id), and each queue's in batches.
+        let queues = verify_queues();
+        let mut by_queue: Vec<Vec<(Job, bool)>> = vec![Vec::new(); queues];
+        for (job, redelivery) in lane {
+            let extent = match &job {
+                Job::Extent { extent, .. } | Job::Wake { extent, .. } => {
+                    extent.as_str().to_string()
+                }
+                _ => String::new(),
+            };
+            by_queue[shard(&extent, queues)].push((job, redelivery));
+        }
+        let batch = verify_batch_size().max(1);
+        for chunk in by_queue.iter().flat_map(|q| q.chunks(batch)) {
+            let shelf = BenchShelf::new().expect("holder name");
+            let mut last = String::from("idle");
+            for (i, (job, redelivery)) in chunk.iter().enumerate() {
+                last = self.job_label(job);
+                let outcome = self
+                    .run_job_in(job, *redelivery, Some(&shelf), i == 0)
+                    .await;
+                if let JobOutcome::Retry { delay_secs } = outcome {
+                    retried.push((job.clone(), delay_secs));
+                }
+            }
+            self.hub.set(&last);
+            let t = Instant::now();
+            shelf.close(&self.bridge.catalog, &self.bridge.clock).await;
+            let us = t.elapsed().as_micros() as u64;
+            self.hub.add(|c| c.wall_us += us);
+            self.hub.set("idle");
+        }
+        retried
     }
 
     async fn cron(&self) {
@@ -1071,10 +1201,9 @@ impl Bench {
                 }
                 continue;
             }
-            for (_, job, redelivery) in due {
-                if let JobOutcome::Retry { delay_secs } = self.run_job(&job, redelivery).await {
-                    pending.push((now.plus_secs(delay_secs), job, true));
-                }
+            let due = due.into_iter().map(|(_, job, r)| (job, r)).collect();
+            for (job, delay_secs) in self.run_jobs(due).await {
+                pending.push((now.plus_secs(delay_secs), job, true));
             }
         }
         panic!("BENCH FAILED: outbox not drained: {}", self.outbox_dump());
@@ -1091,16 +1220,16 @@ impl Bench {
             // Jobs already queued (the last verify round's release wakes,
             // due after the clock jump) are delivered before the
             // dispatcher runs, so it does not send their work again.
-            for sent in self.bridge.jobs.inner.take() {
-                self.run_job(&sent.job, false).await;
-            }
+            let sent = self.bridge.jobs.inner.take();
+            self.run_jobs(sent.into_iter().map(|s| (s.job, false)).collect())
+                .await;
             if done(self) {
                 return;
             }
             self.cron_as(cron_label).await;
-            for sent in self.bridge.jobs.inner.take() {
-                self.run_job(&sent.job, false).await;
-            }
+            let sent = self.bridge.jobs.inner.take();
+            self.run_jobs(sent.into_iter().map(|s| (s.job, false)).collect())
+                .await;
             self.bridge.clock.advance_secs(CRON_SECS);
         }
         panic!("BENCH FAILED: {what} not done: {}", self.outbox_dump());
