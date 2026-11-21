@@ -27,9 +27,9 @@
 use std::collections::BTreeMap;
 
 use super::record::{
-    ActorClass, BillingHold, Deletion, DeletionReason, HoldMode, Holds, Lifecycle, OperatorHold,
-    OperatorReason, Placement, Restoring, Selector, TenantDoor, TenantId, TenantPrivate,
-    TenantRecord, TenantZero, RECORD_FORMAT,
+    ActorClass, BillingHold, BucketCreated, Deletion, DeletionReason, HoldMode, Holds, Lifecycle,
+    Move, OperatorHold, OperatorReason, Placement, Restoring, Selector, TenantDoor, TenantId,
+    TenantPrivate, TenantRecord, TenantZero, RECORD_FORMAT,
 };
 use crate::types::UnixMs;
 
@@ -46,6 +46,12 @@ pub const CUSTOMER_DELETE_MIN_MS: i64 = 7 * 24 * 3_600_000;
 /// The shortest hold period of any deletion, the operator's delete-now:
 /// 1 hour, less 1 minute of tolerance.
 pub const OPERATOR_DELETE_MIN_MS: i64 = 3_600_000 - 60_000;
+
+/// The length of a tenant key's check value, in bytes.
+pub const KEY_CHECK_LEN: usize = 8;
+
+/// How long tenant 0 stays `moved` before it can be retired: 30 days.
+pub const RETIRE_AFTER_MS: i64 = 30 * 24 * 3_600_000;
 
 /// Who makes a change.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -67,6 +73,9 @@ pub enum Actor {
     ShredJob,
     /// The restore tool, after the gate.
     RestoreTool,
+    /// The tool of the move of tenant 0's data: its window, flip,
+    /// give-up, undo and retirement.
+    MoveTool,
 }
 
 impl Actor {
@@ -106,8 +115,14 @@ pub enum Change {
     CreateTenantZero { jurisdiction: String },
     /// Claim the next tenant key version.
     ClaimKeyVersion { version: u32 },
-    /// Commit the open claim.
-    CommitKeyVersion { version: u32 },
+    /// Void the open claim `version` (its copies disagree) and claim
+    /// `version + 1` in the same record.
+    VoidKeyClaim { version: u32 },
+    /// Commit the open claim, pinning the check value of its key.
+    CommitKeyVersion {
+        version: u32,
+        kcv: [u8; KEY_CHECK_LEN],
+    },
     /// `provisioning` to `active`: the last step of tenant creation. It
     /// binds the workspace: the first record whose private part is sealed
     /// under the tenant's own key.
@@ -146,6 +161,36 @@ pub enum Change {
     /// Lift the `restoring` entry of `unit` whose `since_seq` is
     /// `since_seq`.
     LiftRestoring { unit: u32, since_seq: u64 },
+    /// Create a bucket on a unit of the tenant; the acting principal
+    /// (`creator`) gets `rw` on it in the same unit transaction.
+    CreateBucket {
+        bucket: String,
+        unit: u32,
+        creator: String,
+    },
+    /// Remove a bucket's placement.
+    DropBucket { bucket: String },
+    /// Mark the tenant's key as escrowed offline.
+    SetEscrowOffline,
+    /// Clear the offline escrow mark. The operator states that every
+    /// escrow copy was destroyed; nothing else clears it.
+    ClearEscrowOffline { escrow_destroyed: bool },
+    /// Tenant 0: open the move's window into tenant `to`.
+    StartMove {
+        to: TenantId,
+        catalogue_id_frozen: String,
+    },
+    /// Tenant 0: the flip, at the legacy stamp's counter `stamp`.
+    FlipMove { stamp: u64 },
+    /// Tenant 0: give the move up before the flip.
+    GiveUpMove,
+    /// Tenant 0: the undo of a flipped move, onto catalogue `catalogue_id`.
+    UndoMove {
+        undo_stamp: u64,
+        catalogue_id: String,
+    },
+    /// Tenant 0: retired for good, 30 days after the flip.
+    RetireTenantZero,
     /// `deleting`, due, to `shredding`.
     StartShred,
     /// `shredding` to the `shredded` stub.
@@ -199,6 +244,12 @@ const TENANT_ZERO: Refusal = refuse(409, "tenant_zero");
 const NO_BILLING_HOLD: Refusal = refuse(403, "no_billing_hold");
 const HOLD_PERIOD: Refusal = refuse(403, "hold_period_too_short");
 const INVALID: Refusal = refuse(400, "invalid_change");
+const KEY_CHECK: Refusal = refuse(409, "key_check_mismatch");
+const ESCROWED: Refusal = refuse(409, "escrow_offline");
+const RETIRED: Refusal = refuse(409, "tenant_zero_retired");
+const SELECTOR: Refusal = refuse(409, "selector_does_not_allow");
+const NOT_TENANT_ZERO: Refusal = refuse(409, "not_tenant_zero");
+const BUCKET_EXISTS: Refusal = refuse(409, "bucket_exists");
 
 /// Validates `change` against `head` and builds the record that follows.
 /// See the [module](self).
@@ -216,6 +267,10 @@ pub fn next(
         return Err(INVALID);
     }
     match head.door.lifecycle {
+        // The shred job repeats its last step after a lost answer.
+        Lifecycle::Shredded if *change == Change::FinishShred && actor == Actor::ShredJob => {
+            return Ok(Outcome::Unchanged)
+        }
         Lifecycle::Shredded => return Err(SHREDDED),
         Lifecycle::Shredding if *change != Change::FinishShred => return Err(SHREDDING),
         _ => {}
@@ -228,7 +283,18 @@ pub fn next(
     }
 
     let h = &head.door;
+    if let Some(z) = &h.tenant_zero {
+        // Retired is terminal; the tool may repeat its last step.
+        if z.selector == Selector::Retired {
+            return match (change, actor) {
+                (Change::RetireTenantZero, Actor::MoveTool) => Ok(Outcome::Unchanged),
+                _ => Err(RETIRED),
+            };
+        }
+    }
     let mut door = h.clone();
+    // Only the record that creates a bucket names it.
+    door.bucket_created = None;
     let mut private = head.private.clone();
 
     match change {
@@ -248,13 +314,33 @@ pub fn next(
             door.highest_claimed = *version;
         }
 
-        Change::CommitKeyVersion { version } => {
+        Change::VoidKeyClaim { version } => {
+            rotation_allowed(h, actor, *version)?;
+            if h.rotating_to != Some(*version) {
+                return Err(NO_CLAIM);
+            }
+            let next = version.checked_add(1).ok_or(VERSION)?;
+            door.rotating_to = Some(next);
+            door.highest_claimed = next;
+        }
+
+        Change::CommitKeyVersion { version, kcv } => {
+            let kcv = hex(kcv);
+            // A commit that already happened: the same key is unchanged,
+            // another key is refused.
+            if h.rotating_to.is_none() && h.tk_version == *version && *version > 0 {
+                return match h.key_checks.get(version) == Some(&kcv) {
+                    true => Ok(Outcome::Unchanged),
+                    false => Err(KEY_CHECK),
+                };
+            }
             rotation_allowed(h, actor, *version)?;
             if h.rotating_to != Some(*version) {
                 return Err(NO_CLAIM);
             }
             door.tk_version = *version;
             door.rotating_to = None;
+            door.key_checks.insert(*version, kcv);
         }
 
         Change::Activate { external_ref } => {
@@ -264,7 +350,10 @@ pub fn next(
             if h.lifecycle != Lifecycle::Provisioning {
                 return Err(WRONG_STATE);
             }
-            if h.tk_version == 0 || h.rotating_to.is_some() {
+            if h.tk_version == 0
+                || h.rotating_to.is_some()
+                || !h.key_checks.contains_key(&h.tk_version)
+            {
                 return Err(NOT_READY);
             }
             door.lifecycle = Lifecycle::Live;
@@ -478,6 +567,193 @@ pub fn next(
             door.restoring.retain(|r| *r != ours);
         }
 
+        Change::CreateBucket {
+            bucket,
+            unit,
+            creator,
+        } => {
+            live(h)?;
+            if !matches!(actor, Actor::Customer | Actor::Operator) {
+                return Err(FORBIDDEN);
+            }
+            if h.state() != super::record::TenantState::Active {
+                return Err(WRONG_STATE);
+            }
+            if !h.restoring.is_empty() {
+                return Err(RESTORING);
+            }
+            if !valid_name(bucket) || !valid_name(creator) {
+                return Err(INVALID);
+            }
+            if !h.units.contains(unit) {
+                return Err(UNIT_NOT_LISTED);
+            }
+            if h.placements.iter().any(|p| p.bucket == *bucket) {
+                return Err(BUCKET_EXISTS);
+            }
+            let epoch = h.max_move_epoch.checked_add(1).ok_or(INVALID)?;
+            door.placements.push(Placement {
+                bucket: bucket.clone(),
+                unit: *unit,
+                epoch,
+            });
+            door.max_move_epoch = epoch;
+            door.bucket_created = Some(BucketCreated {
+                bucket: bucket.clone(),
+                creator: creator.clone(),
+            });
+        }
+
+        Change::DropBucket { bucket } => {
+            live(h)?;
+            if !matches!(actor, Actor::Customer | Actor::Operator) {
+                return Err(FORBIDDEN);
+            }
+            if h.deletion.is_some() {
+                return Err(WRONG_STATE);
+            }
+            if !h.restoring.is_empty() {
+                return Err(RESTORING);
+            }
+            if !h.placements.iter().any(|p| p.bucket == *bucket) {
+                return Ok(Outcome::Unchanged);
+            }
+            door.placements.retain(|p| p.bucket != *bucket);
+        }
+
+        Change::SetEscrowOffline => {
+            live(h)?;
+            if actor != Actor::Operator {
+                return Err(FORBIDDEN);
+            }
+            if h.escrow_offline {
+                return Ok(Outcome::Unchanged);
+            }
+            door.escrow_offline = true;
+        }
+
+        Change::ClearEscrowOffline { escrow_destroyed } => {
+            live(h)?;
+            if actor != Actor::Operator {
+                return Err(FORBIDDEN);
+            }
+            if !h.escrow_offline {
+                return Ok(Outcome::Unchanged);
+            }
+            if !escrow_destroyed {
+                return Err(INVALID);
+            }
+            door.escrow_offline = false;
+        }
+
+        Change::StartMove {
+            to,
+            catalogue_id_frozen,
+        } => {
+            let z = move_allowed(tenant, h, actor)?;
+            if to.is_zero() || !valid_name(catalogue_id_frozen) {
+                return Err(INVALID);
+            }
+            match z.selector {
+                Selector::Moving if z.moved.as_ref().is_some_and(|m| m.to == *to) => {
+                    return Ok(Outcome::Unchanged)
+                }
+                Selector::D1 if z.moved.is_none() || z.undone() => {}
+                _ => return Err(SELECTOR),
+            }
+            if !h.restoring.is_empty() {
+                return Err(RESTORING);
+            }
+            let mut z = z.clone();
+            z.selector = Selector::Moving;
+            z.moved = Some(Move {
+                to: to.clone(),
+                catalogue_id_frozen: catalogue_id_frozen.clone(),
+                stamp: None,
+                flipped_at: None,
+            });
+            z.undo_stamp = None;
+            door.tenant_zero = Some(z);
+        }
+
+        Change::FlipMove { stamp } => {
+            let z = move_allowed(tenant, h, actor)?;
+            let m = z.moved.as_ref().ok_or(SELECTOR)?;
+            match z.selector {
+                Selector::Moved if m.stamp == Some(*stamp) => return Ok(Outcome::Unchanged),
+                Selector::Moving => {}
+                _ => return Err(SELECTOR),
+            }
+            if *stamp == 0 {
+                return Err(INVALID);
+            }
+            let mut z = z.clone();
+            z.selector = Selector::Moved;
+            if let Some(m) = z.moved.as_mut() {
+                m.stamp = Some(*stamp);
+                m.flipped_at = Some(now);
+            }
+            door.tenant_zero = Some(z);
+        }
+
+        Change::GiveUpMove => {
+            let z = move_allowed(tenant, h, actor)?;
+            match z.selector {
+                Selector::Moving => {}
+                Selector::D1 if z.moved.is_none() => return Ok(Outcome::Unchanged),
+                _ => return Err(SELECTOR),
+            }
+            let mut z = z.clone();
+            z.selector = Selector::D1;
+            z.moved = None;
+            door.tenant_zero = Some(z);
+        }
+
+        Change::UndoMove {
+            undo_stamp,
+            catalogue_id,
+        } => {
+            let z = move_allowed(tenant, h, actor)?;
+            let m = z.moved.as_ref().ok_or(SELECTOR)?;
+            match z.selector {
+                Selector::D1
+                    if z.undo_stamp == Some(*undo_stamp)
+                        && z.catalogue_id.as_deref() == Some(catalogue_id.as_str()) =>
+                {
+                    return Ok(Outcome::Unchanged)
+                }
+                Selector::Moved => {}
+                _ => return Err(SELECTOR),
+            }
+            // A fresh catalogue: never the frozen one, whose stamps mark
+            // it as rolled back.
+            if !valid_name(catalogue_id) || *catalogue_id == m.catalogue_id_frozen {
+                return Err(INVALID);
+            }
+            if !m.stamp.is_some_and(|stamp| *undo_stamp > stamp) {
+                return Err(INVALID);
+            }
+            let mut z = z.clone();
+            z.selector = Selector::D1;
+            z.undo_stamp = Some(*undo_stamp);
+            z.catalogue_id = Some(catalogue_id.clone());
+            door.tenant_zero = Some(z);
+        }
+
+        Change::RetireTenantZero => {
+            let z = move_allowed(tenant, h, actor)?;
+            let flipped = z.moved.as_ref().and_then(|m| m.flipped_at);
+            if z.selector != Selector::Moved {
+                return Err(SELECTOR);
+            }
+            if !flipped.is_some_and(|at| now.0 >= at.0.saturating_add(RETIRE_AFTER_MS)) {
+                return Err(NOT_DUE);
+            }
+            let mut z = z.clone();
+            z.selector = Selector::Retired;
+            door.tenant_zero = Some(z);
+        }
+
         Change::StartShred => {
             if actor != Actor::ShredJob {
                 return Err(FORBIDDEN);
@@ -500,6 +776,9 @@ pub fn next(
             }
             if h.holds.preserves() {
                 return Err(PRESERVED);
+            }
+            if h.escrow_offline {
+                return Err(ESCROWED);
             }
             door.lifecycle = Lifecycle::Shredding;
         }
@@ -542,13 +821,16 @@ fn first(
         undone_deletion: None,
         restoring: vec![],
         synthetic: false,
+        escrow_offline: false,
         limits: BTreeMap::new(),
         rate_json: Default::default(),
         features_json: Default::default(),
         units: vec![],
         placements: vec![],
         max_move_epoch: 0,
+        bucket_created: None,
         tk_version: 0,
+        key_checks: BTreeMap::new(),
         rotating_to: None,
         highest_claimed: 0,
         jurisdiction: jurisdiction.to_string(),
@@ -604,7 +886,7 @@ fn first(
             let mut door = base(Lifecycle::Live, jurisdiction);
             door.tenant_zero = Some(TenantZero {
                 selector: Selector::D1,
-                cutover_stamp: None,
+                moved: None,
                 undo_stamp: None,
                 catalogue_id: None,
             });
@@ -633,18 +915,18 @@ fn live(h: &TenantDoor) -> Result<(), Refusal> {
 /// A rotation claim or commit: `provisioning`, `active` or `suspended`,
 /// never with `restoring` set, never for tenant 0. Tenant creation claims
 /// and commits version 1 only.
-fn rotation_allowed(h: &TenantDoor, actor: Actor, version: u32) -> Result<(), Refusal> {
-    match actor {
-        Actor::RotationJob => {}
-        Actor::TenantCreation if version == 1 => {}
+fn rotation_allowed(h: &TenantDoor, actor: Actor, _version: u32) -> Result<(), Refusal> {
+    // Tenant creation runs the claims of a provisioning tenant (its first
+    // version, and the next ones if a claim is voided); the rotation job
+    // those of a live one.
+    match (actor, h.lifecycle) {
+        (Actor::TenantCreation, Lifecycle::Provisioning)
+        | (Actor::RotationJob, Lifecycle::Live) => {}
+        (Actor::TenantCreation | Actor::RotationJob, _) => return Err(WRONG_STATE),
         _ => return Err(FORBIDDEN),
     }
     if h.tenant.is_zero() {
         return Err(TENANT_ZERO);
-    }
-    match h.lifecycle {
-        Lifecycle::Provisioning | Lifecycle::Live => {}
-        _ => return Err(WRONG_STATE),
     }
     if h.deletion.is_some() {
         return Err(WRONG_STATE);
@@ -653,6 +935,33 @@ fn rotation_allowed(h: &TenantDoor, actor: Actor, version: u32) -> Result<(), Re
         return Err(RESTORING);
     }
     Ok(())
+}
+
+/// The move tool on tenant 0's record.
+fn move_allowed<'a>(
+    tenant: &TenantId,
+    h: &'a TenantDoor,
+    actor: Actor,
+) -> Result<&'a TenantZero, Refusal> {
+    if actor != Actor::MoveTool {
+        return Err(FORBIDDEN);
+    }
+    if !tenant.is_zero() {
+        return Err(NOT_TENANT_ZERO);
+    }
+    h.tenant_zero.as_ref().ok_or(INVALID)
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// A bucket id, a principal id or a catalogue id: 1 to 128 bytes of
+/// ASCII letters, digits, `_` and `-`.
+fn valid_name(s: &str) -> bool {
+    (1..=128).contains(&s.len())
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
 
 /// What stays of a shredded tenant: its id, seq and date, and the facts
@@ -669,13 +978,16 @@ fn shredded_stub(h: &TenantDoor) -> TenantDoor {
         undone_deletion: None,
         restoring: vec![],
         synthetic: h.synthetic,
+        escrow_offline: false,
         limits: BTreeMap::new(),
         rate_json: Default::default(),
         features_json: Default::default(),
         units: vec![],
         placements: vec![],
         max_move_epoch: h.max_move_epoch,
+        bucket_created: None,
         tk_version: h.tk_version,
+        key_checks: BTreeMap::new(),
         rotating_to: None,
         highest_claimed: h.highest_claimed,
         jurisdiction: h.jurisdiction.clone(),
@@ -710,15 +1022,15 @@ fn valid_units(units: &[u32], placements: &[Placement]) -> bool {
             .all(|p| units.contains(&p.unit) && !p.bucket.is_empty())
 }
 
-/// A bucket that stays where it is keeps or raises its move epoch; one
-/// that is placed anew or changes unit takes an epoch above every epoch
-/// the tenant ever had. The epoch is what fences a stale route, so it
-/// never comes back.
+/// A bucket that stays where it is keeps its move epoch; one that is
+/// placed anew or changes unit takes the epoch right above every epoch the
+/// tenant ever had. The epoch is what fences a stale route, so it never
+/// comes back, and no change can raise it beyond the next one.
 fn epochs_advance(old: &[Placement], max_epoch: u64, new: &[Placement]) -> bool {
     new.iter()
         .all(|p| match old.iter().find(|o| o.bucket == p.bucket) {
-            Some(o) if o.unit == p.unit => p.epoch >= o.epoch,
-            _ => p.epoch > max_epoch,
+            Some(o) if o.unit == p.unit => p.epoch == o.epoch,
+            _ => Some(p.epoch) == max_epoch.checked_add(1),
         })
 }
 

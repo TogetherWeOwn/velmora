@@ -243,14 +243,47 @@ pub struct Placement {
 }
 
 /// Which catalogue serves tenant 0. Tenant 0 stays on today's D1 until
-/// the move; then its data is another tenant's and it serves nothing.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", tag = "kind", deny_unknown_fields)]
+/// its data moves into a tenant of its own; then it serves nothing, and
+/// 30 days later it is retired for good. No unit is ever born for it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Selector {
     /// Today's D1 catalogue.
     D1,
-    /// The data moved to another tenant. Tenant 0 answers `503`.
-    Moved { to: TenantId },
+    /// The move's window: D1 is frozen and the other tenant's unit is
+    /// being filled. Reads from D1; writes are closed.
+    Moving,
+    /// The flip is done: the data is the tenant that `move.to` names.
+    Moved,
+    /// Day 30 is done. Terminal: no record follows.
+    Retired,
+}
+
+impl Selector {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Selector::D1 => "d1",
+            Selector::Moving => "moving",
+            Selector::Moved => "moved",
+            Selector::Retired => "retired",
+        }
+    }
+}
+
+/// The move of tenant 0's data into a tenant of its own.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Move {
+    /// The tenant that the data moves to.
+    pub to: TenantId,
+    /// The catalogue id of the frozen D1 (`main`).
+    pub catalogue_id_frozen: String,
+    /// The legacy stamp's counter at the flip, once it happened.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stamp: Option<u64>,
+    /// When the flip record was written.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flipped_at: Option<UnixMs>,
 }
 
 /// The fields that only tenant 0's record has.
@@ -258,15 +291,36 @@ pub enum Selector {
 #[serde(deny_unknown_fields)]
 pub struct TenantZero {
     pub selector: Selector,
-    /// The stamp of the move's flip, once it happened.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cutover_stamp: Option<u64>,
-    /// The stamp of an undo, higher than the cutover stamp.
+    /// The move, from its window on; kept as history after an undo.
+    #[serde(default, rename = "move", skip_serializing_if = "Option::is_none")]
+    pub moved: Option<Move>,
+    /// The stamp of an undo, higher than the move's stamp.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub undo_stamp: Option<u64>,
     /// After an undo: the id of the catalogue that `d1` then means.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub catalogue_id: Option<String>,
+}
+
+impl TenantZero {
+    /// Whether the newest move was undone: an undo stamp above its stamp.
+    pub fn undone(&self) -> bool {
+        match (&self.moved, self.undo_stamp) {
+            (Some(m), Some(undo)) => m.stamp.is_some_and(|stamp| undo > stamp),
+            _ => false,
+        }
+    }
+}
+
+/// The bucket that a record creates, and the principal that gets `rw` on
+/// it in the same unit transaction. Only the record that creates the
+/// bucket carries it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BucketCreated {
+    pub bucket: String,
+    /// The key-chain id of the acting principal.
+    pub creator: String,
 }
 
 /// The door part of a tenant record. See the [module](self).
@@ -290,6 +344,11 @@ pub struct TenantDoor {
     pub restoring: Vec<Restoring>,
     #[serde(default)]
     pub synthetic: bool,
+    /// The tenant's key has an offline escrow copy: a shred waits and
+    /// pages until an operator record clears this, naming the destruction
+    /// of every escrow copy.
+    #[serde(default)]
+    pub escrow_offline: bool,
     /// Limits by name, in their own unit (bytes, requests). A name that
     /// is absent has no limit.
     #[serde(default)]
@@ -309,8 +368,16 @@ pub struct TenantDoor {
     /// placed anew or moves takes an epoch above it, so an epoch never
     /// comes back, also for a placement that was dropped and added again.
     pub max_move_epoch: u64,
+    /// The bucket this record creates, with its creator (this record
+    /// only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bucket_created: Option<BucketCreated>,
     /// The tenant key version in force; 0 for tenant 0, which has none.
     pub tk_version: u32,
+    /// The key check value of every committed tenant key version, in
+    /// lowercase hex: a load takes only the key with this value.
+    #[serde(default)]
+    pub key_checks: BTreeMap<u32, String>,
     /// An open rotation claim.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rotating_to: Option<u32>,
@@ -447,13 +514,16 @@ mod tests {
             undone_deletion: None,
             restoring: vec![],
             synthetic: false,
+            escrow_offline: false,
             limits: BTreeMap::new(),
             rate_json: Default::default(),
             features_json: Default::default(),
             units: vec![0],
             placements: vec![],
             max_move_epoch: 0,
+            bucket_created: None,
             tk_version: 1,
+            key_checks: BTreeMap::from([(1, "00".repeat(16))]),
             rotating_to: None,
             highest_claimed: 1,
             jurisdiction: "us".into(),
@@ -557,10 +627,13 @@ mod tests {
     #[test]
     fn the_selector_has_a_fixed_form() {
         let z = TenantZero {
-            selector: Selector::Moved {
+            selector: Selector::Moved,
+            moved: Some(Move {
                 to: TenantId::parse("t_00000000000000a1").unwrap(),
-            },
-            cutover_stamp: Some(7),
+                catalogue_id_frozen: "main".into(),
+                stamp: Some(7),
+                flipped_at: Some(UnixMs(5)),
+            }),
             undo_stamp: None,
             catalogue_id: None,
         };
@@ -568,11 +641,31 @@ mod tests {
         assert_eq!(
             json,
             serde_json::json!({
-                "selector": {"kind": "moved", "to": "t_00000000000000a1"},
-                "cutover_stamp": 7
+                "selector": "moved",
+                "move": {"to": "t_00000000000000a1", "catalogue_id_frozen": "main", "stamp": 7, "flipped_at": 5}
             })
         );
-        let d1 = serde_json::to_value(Selector::D1).unwrap();
-        assert_eq!(d1, serde_json::json!({"kind": "d1"}));
+        assert!(!z.undone());
+        let undone = TenantZero {
+            selector: Selector::D1,
+            undo_stamp: Some(8),
+            catalogue_id: Some("main2".into()),
+            ..z.clone()
+        };
+        assert!(undone.undone());
+        let not_above = TenantZero {
+            undo_stamp: Some(7),
+            ..undone.clone()
+        };
+        assert!(!not_above.undone());
+        for (sel, name) in [
+            (Selector::D1, "d1"),
+            (Selector::Moving, "moving"),
+            (Selector::Moved, "moved"),
+            (Selector::Retired, "retired"),
+        ] {
+            assert_eq!(serde_json::to_value(sel).unwrap(), serde_json::json!(name));
+            assert_eq!(sel.as_str(), name);
+        }
     }
 }

@@ -92,8 +92,10 @@ pub trait RecordStore {
 /// tenant 0 the adapter seals under the KEK and names the KEK version in
 /// the header.
 ///
-/// The port opens with the keys it holds and does no I/O: a record that
-/// does not open is damage, and the chain reports it as such.
+/// The port opens with the keys it holds and does no I/O. A record that
+/// does not open is damage, and the chain reports it as such; a key
+/// version that the port does not hold yet is a failure that may pass
+/// ([`SealError::KeyNotHeld`]).
 pub trait ControlSeal {
     /// Seals the two parts of the record stored under `name`, the private
     /// part under tenant key version `key_version`.
@@ -109,7 +111,21 @@ pub trait ControlSeal {
     /// call fails. The private part is `None` only when its key version
     /// is gone for good (retired, or destroyed by a shred): a head whose
     /// private part is `None` takes no next record.
-    fn open(&self, name: &str, tenant: &TenantId, sealed: &[u8]) -> BResult<OpenedParts>;
+    fn open(&self, name: &str, tenant: &TenantId, sealed: &[u8]) -> Result<OpenedParts, SealError>;
+}
+
+/// Why a control record did not open.
+#[derive(Debug)]
+pub enum SealError {
+    /// It does not open: a changed byte, another name or tenant, a key
+    /// that does not match. Damage of this record.
+    Damaged,
+    /// The key version it names is not held here yet (a version
+    /// committed after this isolate loaded its keys). It may pass: load
+    /// the keys again.
+    KeyNotHeld { version: u32 },
+    /// Any other failure. It may pass.
+    Failed(BridgeError),
 }
 
 /// The plaintext of an opened control record.
@@ -138,6 +154,9 @@ pub enum ChainError {
     /// A record of the chain is missing, out of order, or does not say
     /// what its name says. The reader fails closed and pages.
     Damaged(&'static str),
+    /// The record names a key version this isolate does not hold yet.
+    /// It may pass: load the keys again.
+    KeyNotHeld { version: u32 },
     /// The head's private part did not open, so no record can follow it.
     /// It pages: a live tenant whose key version is gone.
     PrivateUnreadable,
@@ -200,8 +219,17 @@ impl<S: RecordStore, C: ControlSeal> TenantChain<'_, S, C> {
             0 => String::new(),
             n => record_key(tenant, n),
         };
+        let mut first_page = true;
         loop {
             let keys = self.store.list(&prefix, &after, LIST_PAGE).await?;
+            if first_page && keys.len() == 1 {
+                if let Some(seq) = record_seq(tenant, &keys[0]).filter(|&seq| seq > last + 1) {
+                    // A shred's purge leaves the stub alone: the one
+                    // record of the chain, with the gap below it.
+                    return self.purged_stub(tenant, seq, known).await;
+                }
+            }
+            first_page = false;
             for key in &keys {
                 match record_seq(tenant, key) {
                     Some(seq) if seq == last + 1 => last = seq,
@@ -223,6 +251,23 @@ impl<S: RecordStore, C: ControlSeal> TenantChain<'_, S, C> {
         }
     }
 
+    /// The one record left of a purged chain: it must be the `shredded`
+    /// stub, at or above `known`, or the chain is damaged.
+    async fn purged_stub(
+        &self,
+        tenant: &TenantId,
+        seq: u64,
+        known: u64,
+    ) -> Result<Option<u64>, ChainError> {
+        if seq < known {
+            return Err(ChainError::Damaged("known_above_head"));
+        }
+        match self.read(tenant, seq).await? {
+            Some(r) if r.door.lifecycle == Lifecycle::Shredded => Ok(Some(seq)),
+            _ => Err(ChainError::Damaged("chain_gap_or_stray_name")),
+        }
+    }
+
     /// Reads and checks record `seq`. `None` = no such record.
     pub async fn read(
         &self,
@@ -236,7 +281,11 @@ impl<S: RecordStore, C: ControlSeal> TenantChain<'_, S, C> {
         let opened = self
             .seal
             .open(&name, tenant, &sealed)
-            .map_err(|_| ChainError::Damaged("record_does_not_open"))?;
+            .map_err(|e| match e {
+                SealError::Damaged => ChainError::Damaged("record_does_not_open"),
+                SealError::KeyNotHeld { version } => ChainError::KeyNotHeld { version },
+                SealError::Failed(e) => ChainError::Store(e),
+            })?;
         let door: TenantDoor =
             serde_json::from_slice(&opened.door).map_err(|_| ChainError::Damaged("door_part"))?;
         if door.v != RECORD_FORMAT {

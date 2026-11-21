@@ -10,6 +10,14 @@ fn t1() -> TenantId {
     TenantId::parse("t_00000000000000a1").unwrap()
 }
 
+/// The commit of `version` with the check value of a test key.
+fn commit(version: u32) -> Change {
+    Change::CommitKeyVersion {
+        version,
+        kcv: [version as u8; KEY_CHECK_LEN],
+    }
+}
+
 fn hash(n: u8) -> String {
     format!("{n:02x}").repeat(32)
 }
@@ -64,11 +72,7 @@ fn active() -> TenantRecord {
         Change::ClaimKeyVersion { version: 1 },
         Actor::TenantCreation,
     );
-    let r = apply(
-        &r,
-        Change::CommitKeyVersion { version: 1 },
-        Actor::TenantCreation,
-    );
+    let r = apply(&r, commit(1), Actor::TenantCreation);
     apply(
         &r,
         Change::Activate {
@@ -576,14 +580,14 @@ fn rotation_claims_exactly_the_next_version_once() {
         ),
         VERSION
     );
-    // Tenant creation claims version 1 only.
+    // Tenant creation claims for a provisioning tenant only.
     assert_eq!(
         refused(
             &a,
             Change::ClaimKeyVersion { version: 2 },
             Actor::TenantCreation
         ),
-        FORBIDDEN
+        WRONG_STATE
     );
     assert_eq!(
         refused(&a, Change::ClaimKeyVersion { version: 2 }, Actor::Operator),
@@ -602,19 +606,8 @@ fn rotation_claims_exactly_the_next_version_once() {
         ),
         CLAIM_OPEN
     );
-    assert_eq!(
-        refused(
-            &c,
-            Change::CommitKeyVersion { version: 3 },
-            Actor::RotationJob
-        ),
-        NO_CLAIM
-    );
-    let done = apply(
-        &c,
-        Change::CommitKeyVersion { version: 2 },
-        Actor::RotationJob,
-    );
+    assert_eq!(refused(&c, commit(3), Actor::RotationJob), NO_CLAIM);
+    let done = apply(&c, commit(2), Actor::RotationJob);
     assert_eq!((done.door.tk_version, done.door.rotating_to), (2, None));
     // A suspended tenant rotates too.
     let s = apply(&done, billing_hold(Some(HoldMode::Locked)), Actor::Billing);
@@ -1192,16 +1185,12 @@ fn a_voided_key_version_is_never_claimed_again() {
         Change::ClaimKeyVersion { version: 3 },
         Actor::RotationJob,
     );
-    let done = apply(
-        &c3,
-        Change::CommitKeyVersion { version: 3 },
-        Actor::RotationJob,
-    );
+    let done = apply(&c3, commit(3), Actor::RotationJob);
     assert_eq!((done.door.tk_version, done.door.highest_claimed), (3, 3));
 }
 
 #[test]
-fn a_bucket_moves_only_to_a_newer_epoch() {
+fn a_bucket_moves_only_to_the_next_epoch() {
     let a = active();
     let p = |unit, epoch| Placement {
         bucket: "b".into(),
@@ -1212,31 +1201,33 @@ fn a_bucket_moves_only_to_a_newer_epoch() {
         units: vec![0, 1],
         placements,
     };
-    let at5 = apply(&a, set(vec![p(0, 5)]), Actor::Operator);
-    // To another unit at the same or an older epoch: refused.
-    assert_eq!(refused(&at5, set(vec![p(1, 5)]), Actor::Operator), INVALID);
-    assert_eq!(refused(&at5, set(vec![p(1, 1)]), Actor::Operator), INVALID);
-    // In place, the epoch never goes back.
-    assert_eq!(refused(&at5, set(vec![p(0, 4)]), Actor::Operator), INVALID);
-    let moved = apply(&at5, set(vec![p(1, 6)]), Actor::Operator);
-    assert_eq!(moved.door.placements, vec![p(1, 6)]);
-    assert_eq!(moved.door.max_move_epoch, 6);
-    // Dropped and placed again, it takes an epoch above every one before.
+    // Placed anew: exactly the epoch above every one before.
+    assert_eq!(refused(&a, set(vec![p(0, 5)]), Actor::Operator), INVALID);
+    let at1 = apply(&a, set(vec![p(0, 1)]), Actor::Operator);
+    assert_eq!(at1.door.max_move_epoch, 1);
+    // In place, the epoch neither goes back nor up.
+    assert_eq!(refused(&at1, set(vec![p(0, 0)]), Actor::Operator), INVALID);
+    assert_eq!(refused(&at1, set(vec![p(0, 9)]), Actor::Operator), INVALID);
+    unchanged(&at1, set(vec![p(0, 1)]), Actor::Operator);
+    // To another unit: the next epoch, never the same or a far one.
+    assert_eq!(refused(&at1, set(vec![p(1, 1)]), Actor::Operator), INVALID);
+    assert_eq!(
+        refused(&at1, set(vec![p(1, u64::MAX)]), Actor::Operator),
+        INVALID
+    );
+    let moved = apply(&at1, set(vec![p(1, 2)]), Actor::Operator);
+    assert_eq!(moved.door.placements, vec![p(1, 2)]);
+    assert_eq!(moved.door.max_move_epoch, 2);
+    // Dropped and placed again, it takes the epoch above every one before.
     let dropped = apply(&moved, set(vec![]), Actor::Operator);
-    assert_eq!(dropped.door.max_move_epoch, 6);
+    assert_eq!(dropped.door.max_move_epoch, 2);
     assert_eq!(
-        refused(&dropped, set(vec![p(1, 1)]), Actor::Operator),
+        refused(&dropped, set(vec![p(1, 2)]), Actor::Operator),
         INVALID
     );
-    assert_eq!(
-        refused(&dropped, set(vec![p(1, 6)]), Actor::Operator),
-        INVALID
-    );
-    apply(&dropped, set(vec![p(1, 7)]), Actor::Operator);
+    apply(&dropped, set(vec![p(1, 3)]), Actor::Operator);
 }
 
-/// Who may is checked before "the head carries it": a refused actor gets
-/// its 403 for a no-op too.
 #[test]
 fn a_forbidden_no_op_is_still_forbidden() {
     let a = active();
@@ -1320,8 +1311,13 @@ fn a_flag_or_selector_change_is_closing() {
     let z = tenant_zero();
     let mut moved = z.door.clone();
     moved.tenant_zero = Some(TenantZero {
-        selector: Selector::Moved { to: t1() },
-        cutover_stamp: Some(1),
+        selector: Selector::Moving,
+        moved: Some(Move {
+            to: t1(),
+            catalogue_id_frozen: "main".into(),
+            stamp: None,
+            flipped_at: None,
+        }),
         undo_stamp: None,
         catalogue_id: None,
     });
@@ -1335,4 +1331,408 @@ fn the_workspace_is_bound_at_activation() {
     let a = active();
     assert_eq!(a.private.external_ref.as_deref(), Some("ws_1"));
     assert_eq!(a.door.tk_version, 1);
+}
+
+#[test]
+fn a_voided_claim_moves_to_the_next_version_in_one_record() {
+    // During creation: version 1's copies disagree, so 2 is claimed.
+    let Ok(Outcome::Next(p)) = step(None, create(), Actor::TenantCreation) else {
+        panic!("create");
+    };
+    let c1 = apply(
+        &p,
+        Change::ClaimKeyVersion { version: 1 },
+        Actor::TenantCreation,
+    );
+    assert_eq!(
+        refused(
+            &c1,
+            Change::VoidKeyClaim { version: 2 },
+            Actor::TenantCreation
+        ),
+        NO_CLAIM
+    );
+    let c2 = apply(
+        &c1,
+        Change::VoidKeyClaim { version: 1 },
+        Actor::TenantCreation,
+    );
+    assert_eq!((c2.door.rotating_to, c2.door.highest_claimed), (Some(2), 2));
+    assert_eq!(refused(&c2, commit(1), Actor::TenantCreation), NO_CLAIM);
+    let done = apply(&c2, commit(2), Actor::TenantCreation);
+    let a = apply(
+        &done,
+        Change::Activate { external_ref: None },
+        Actor::TenantCreation,
+    );
+    assert_eq!(a.door.tk_version, 2);
+    assert_eq!(
+        a.door.key_checks.get(&2).map(String::as_str),
+        Some("0202020202020202")
+    );
+    // The rotation job voids on a live tenant; only the open claim.
+    assert_eq!(
+        refused(&a, Change::VoidKeyClaim { version: 2 }, Actor::RotationJob),
+        NO_CLAIM
+    );
+    let r = apply(
+        &a,
+        Change::ClaimKeyVersion { version: 3 },
+        Actor::RotationJob,
+    );
+    let r = apply(&r, Change::VoidKeyClaim { version: 3 }, Actor::RotationJob);
+    assert_eq!(r.door.rotating_to, Some(4));
+    assert_eq!(
+        refused(&r, Change::VoidKeyClaim { version: 4 }, Actor::Operator),
+        FORBIDDEN
+    );
+}
+
+#[test]
+fn a_commit_pins_the_key_check_value() {
+    let a = active();
+    assert_eq!(a.door.key_checks.len(), 1);
+    // The same commit again is unchanged; another key is refused.
+    unchanged(&a, commit(1), Actor::RotationJob);
+    unchanged(&a, commit(1), Actor::TenantCreation);
+    assert_eq!(
+        refused(
+            &a,
+            Change::CommitKeyVersion {
+                version: 1,
+                kcv: [9; KEY_CHECK_LEN]
+            },
+            Actor::RotationJob
+        ),
+        KEY_CHECK
+    );
+    let c = apply(
+        &a,
+        Change::ClaimKeyVersion { version: 2 },
+        Actor::RotationJob,
+    );
+    let done = apply(&c, commit(2), Actor::RotationJob);
+    // Every committed version keeps its value.
+    assert_eq!(done.door.key_checks.len(), 2);
+    assert_eq!(done.door.key_checks[&1], "0101010101010101");
+}
+
+fn moving() -> TenantRecord {
+    let z = tenant_zero();
+    apply(
+        &z,
+        Change::StartMove {
+            to: t1(),
+            catalogue_id_frozen: "main".into(),
+        },
+        Actor::MoveTool,
+    )
+}
+
+#[test]
+fn the_move_of_tenant_zero_runs_its_window_flip_and_retirement() {
+    let z = tenant_zero();
+    let start = Change::StartMove {
+        to: t1(),
+        catalogue_id_frozen: "main".into(),
+    };
+    // The move tool only, and on tenant 0 only.
+    assert_eq!(refused(&z, start.clone(), Actor::Operator), FORBIDDEN);
+    assert_eq!(
+        refused(&active(), start.clone(), Actor::MoveTool),
+        NOT_TENANT_ZERO
+    );
+    assert_eq!(
+        refused(
+            &z,
+            Change::StartMove {
+                to: TenantId::zero(),
+                catalogue_id_frozen: "main".into()
+            },
+            Actor::MoveTool
+        ),
+        INVALID
+    );
+    let m = moving();
+    let zm = m.door.tenant_zero.clone().unwrap();
+    assert_eq!(zm.selector, Selector::Moving);
+    assert_eq!(zm.moved.as_ref().unwrap().to, t1());
+    // A repeated window start is unchanged; another target is refused.
+    unchanged(&m, start, Actor::MoveTool);
+    assert_eq!(
+        refused(
+            &m,
+            Change::StartMove {
+                to: TenantId::parse("t_00000000000000b2").unwrap(),
+                catalogue_id_frozen: "main".into()
+            },
+            Actor::MoveTool
+        ),
+        SELECTOR
+    );
+    // No flip before the window, no flip at stamp 0.
+    assert_eq!(
+        refused(&z, Change::FlipMove { stamp: 9 }, Actor::MoveTool),
+        SELECTOR
+    );
+    assert_eq!(
+        refused(&m, Change::FlipMove { stamp: 0 }, Actor::MoveTool),
+        INVALID
+    );
+    let flipped = apply(&m, Change::FlipMove { stamp: 9 }, Actor::MoveTool);
+    let zf = flipped.door.tenant_zero.clone().unwrap();
+    assert_eq!(zf.selector, Selector::Moved);
+    assert_eq!(zf.moved.as_ref().unwrap().stamp, Some(9));
+    assert_eq!(zf.moved.as_ref().unwrap().flipped_at, Some(NOW));
+    // Step 8 runs again after a crash: unchanged.
+    unchanged(&flipped, Change::FlipMove { stamp: 9 }, Actor::MoveTool);
+    assert_eq!(
+        refused(&flipped, Change::FlipMove { stamp: 10 }, Actor::MoveTool),
+        SELECTOR
+    );
+    assert_eq!(
+        refused(&flipped, Change::GiveUpMove, Actor::MoveTool),
+        SELECTOR
+    );
+    // Retirement 30 days after the flip, and nothing after it.
+    assert_eq!(
+        refused(&flipped, Change::RetireTenantZero, Actor::MoveTool),
+        NOT_DUE
+    );
+    let later = UnixMs(NOW.0 + RETIRE_AFTER_MS);
+    let Ok(Outcome::Next(retired)) = next(
+        &TenantId::zero(),
+        Some(&flipped),
+        &Change::RetireTenantZero,
+        Actor::MoveTool,
+        later,
+    ) else {
+        panic!("retire");
+    };
+    assert_eq!(
+        retired.door.tenant_zero.as_ref().unwrap().selector,
+        Selector::Retired
+    );
+    unchanged(&retired, Change::RetireTenantZero, Actor::MoveTool);
+    for (change, actor) in [
+        (
+            operator_hold(HoldMode::Locked, OperatorReason::Other, None),
+            Actor::Operator,
+        ),
+        (Change::GiveUpMove, Actor::MoveTool),
+        (
+            Change::UndoMove {
+                undo_stamp: 99,
+                catalogue_id: "main2".into(),
+            },
+            Actor::MoveTool,
+        ),
+    ] {
+        assert_eq!(refused(&retired, change, actor), RETIRED);
+    }
+    // A d1 tenant 0 is not retired.
+    assert_eq!(
+        refused(&z, Change::RetireTenantZero, Actor::MoveTool),
+        SELECTOR
+    );
+}
+
+#[test]
+fn the_move_is_given_up_before_its_flip_and_undone_after_it() {
+    let m = moving();
+    let back = apply(&m, Change::GiveUpMove, Actor::MoveTool);
+    let zb = back.door.tenant_zero.clone().unwrap();
+    assert_eq!((zb.selector, zb.moved), (Selector::D1, None));
+    unchanged(&back, Change::GiveUpMove, Actor::MoveTool);
+    // A second window after a give-up.
+    let again = apply(
+        &back,
+        Change::StartMove {
+            to: t1(),
+            catalogue_id_frozen: "main".into(),
+        },
+        Actor::MoveTool,
+    );
+    let flipped = apply(&again, Change::FlipMove { stamp: 9 }, Actor::MoveTool);
+    let undo = |undo_stamp, id: &str| Change::UndoMove {
+        undo_stamp,
+        catalogue_id: id.into(),
+    };
+    // The undo needs a stamp above the flip's and a fresh catalogue.
+    assert_eq!(
+        refused(&flipped, undo(9, "main2"), Actor::MoveTool),
+        INVALID
+    );
+    assert_eq!(
+        refused(&flipped, undo(10, "main"), Actor::MoveTool),
+        INVALID
+    );
+    assert_eq!(
+        refused(&flipped, undo(10, "bad id"), Actor::MoveTool),
+        INVALID
+    );
+    assert_eq!(
+        refused(&again, undo(10, "main2"), Actor::MoveTool),
+        SELECTOR
+    );
+    let undone = apply(&flipped, undo(10, "main2"), Actor::MoveTool);
+    let zu = undone.door.tenant_zero.clone().unwrap();
+    assert_eq!(zu.selector, Selector::D1);
+    assert_eq!(
+        (zu.undo_stamp, zu.catalogue_id.as_deref()),
+        (Some(10), Some("main2"))
+    );
+    // The move stays as history, and the undo is plain from the record.
+    assert_eq!(zu.moved.as_ref().unwrap().stamp, Some(9));
+    assert!(zu.undone());
+    unchanged(&undone, undo(10, "main2"), Actor::MoveTool);
+    // A later move again from the undone state.
+    let third = apply(
+        &undone,
+        Change::StartMove {
+            to: t1(),
+            catalogue_id_frozen: "main2".into(),
+        },
+        Actor::MoveTool,
+    );
+    let z3 = third.door.tenant_zero.unwrap();
+    assert_eq!(z3.selector, Selector::Moving);
+    assert_eq!(z3.undo_stamp, None);
+    assert_eq!(z3.catalogue_id.as_deref(), Some("main2"));
+}
+
+#[test]
+fn an_escrowed_tenant_waits_for_its_escrow_to_be_destroyed_before_a_shred() {
+    let a = active();
+    assert_eq!(
+        refused(&a, Change::SetEscrowOffline, Actor::Customer),
+        FORBIDDEN
+    );
+    assert_eq!(
+        refused(&a, Change::SetEscrowOffline, Actor::Billing),
+        FORBIDDEN
+    );
+    let e = apply(&a, Change::SetEscrowOffline, Actor::Operator);
+    assert!(e.door.escrow_offline);
+    unchanged(&e, Change::SetEscrowOffline, Actor::Operator);
+    let d = apply(
+        &e,
+        delete_by(Actor::Customer, DeletionReason::CustomerRequest, 7 * DAY, 1),
+        Actor::Customer,
+    );
+    let due = UnixMs(NOW.0 + 7 * DAY);
+    let shred = |h: &TenantRecord| next(&t1(), Some(h), &Change::StartShred, Actor::ShredJob, due);
+    assert_eq!(shred(&d), Err(ESCROWED));
+    assert_eq!(
+        refused(
+            &d,
+            Change::ClearEscrowOffline {
+                escrow_destroyed: false
+            },
+            Actor::Operator
+        ),
+        INVALID
+    );
+    assert_eq!(
+        refused(
+            &d,
+            Change::ClearEscrowOffline {
+                escrow_destroyed: true
+            },
+            Actor::Customer
+        ),
+        FORBIDDEN
+    );
+    let cleared = apply(
+        &d,
+        Change::ClearEscrowOffline {
+            escrow_destroyed: true,
+        },
+        Actor::Operator,
+    );
+    assert!(matches!(shred(&cleared), Ok(Outcome::Next(_))));
+}
+
+#[test]
+fn a_bucket_create_names_its_creator_in_its_own_record_only() {
+    let a = active();
+    let create = |bucket: &str, unit| Change::CreateBucket {
+        bucket: bucket.into(),
+        unit,
+        creator: "p_owner".into(),
+    };
+    assert_eq!(refused(&a, create("b_1", 0), Actor::Billing), FORBIDDEN);
+    assert_eq!(
+        refused(&a, create("b_1", 3), Actor::Customer),
+        UNIT_NOT_LISTED
+    );
+    assert_eq!(refused(&a, create("", 0), Actor::Customer), INVALID);
+    let b = apply(&a, create("b_1", 0), Actor::Customer);
+    assert_eq!(
+        b.door.bucket_created,
+        Some(BucketCreated {
+            bucket: "b_1".into(),
+            creator: "p_owner".into()
+        })
+    );
+    assert_eq!(b.door.placements[0].epoch, 1);
+    assert_eq!(
+        refused(&b, create("b_1", 0), Actor::Customer),
+        BUCKET_EXISTS
+    );
+    // The next record of any kind carries no creator.
+    let next_rec = apply(&b, billing_hold(Some(HoldMode::ReadOnly)), Actor::Billing);
+    assert_eq!(next_rec.door.bucket_created, None);
+    // Not while suspended, deleting or restoring.
+    assert_eq!(
+        refused(&next_rec, create("b_2", 0), Actor::Customer),
+        WRONG_STATE
+    );
+    let r = apply(&b, Change::SetRestoring { unit: 0 }, Actor::Operator);
+    assert_eq!(refused(&r, create("b_2", 0), Actor::Operator), RESTORING);
+    // Dropping a bucket; dropping it again is unchanged.
+    let dropped = apply(
+        &b,
+        Change::DropBucket {
+            bucket: "b_1".into(),
+        },
+        Actor::Customer,
+    );
+    assert!(dropped.door.placements.is_empty());
+    unchanged(
+        &dropped,
+        Change::DropBucket {
+            bucket: "b_1".into(),
+        },
+        Actor::Customer,
+    );
+    // A bucket made again takes a newer epoch.
+    let again = apply(&dropped, create("b_1", 0), Actor::Operator);
+    assert_eq!(again.door.placements[0].epoch, 2);
+    // Tenant 0 lists no unit: no bucket is placed for it.
+    assert_eq!(
+        refused(&tenant_zero(), create("b_1", 0), Actor::Operator),
+        UNIT_NOT_LISTED
+    );
+}
+
+#[test]
+fn the_shred_jobs_last_step_can_be_repeated() {
+    let a = active();
+    let d = apply(
+        &a,
+        delete_by(Actor::Customer, DeletionReason::CustomerRequest, 7 * DAY, 1),
+        Actor::Customer,
+    );
+    let due = UnixMs(NOW.0 + 7 * DAY);
+    let Ok(Outcome::Next(s)) = next(&t1(), Some(&d), &Change::StartShred, Actor::ShredJob, due)
+    else {
+        panic!("shred")
+    };
+    let gone = apply(&s, Change::FinishShred, Actor::ShredJob);
+    unchanged(&gone, Change::FinishShred, Actor::ShredJob);
+    assert_eq!(
+        refused(&gone, Change::FinishShred, Actor::Operator),
+        SHREDDED
+    );
 }

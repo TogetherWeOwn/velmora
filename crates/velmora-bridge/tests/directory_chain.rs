@@ -10,7 +10,9 @@ use velmora_bridge::directory::chain::{
 use velmora_bridge::directory::record::DeletionReason;
 use velmora_bridge::directory::record::{HoldMode, OperatorReason, TenantId, TenantState};
 use velmora_bridge::directory::testing::{MemRecords, PlainSeal};
-use velmora_bridge::directory::transition::{next, Actor, Change, OperatorHoldRequest, Outcome};
+use velmora_bridge::directory::transition::{
+    next, Actor, Change, OperatorHoldRequest, Outcome, KEY_CHECK_LEN,
+};
 use velmora_bridge::UnixMs;
 
 const NOW: UnixMs = UnixMs(1_800_000_000_000);
@@ -62,7 +64,10 @@ async fn active(chain: &TenantChain<'_, MemRecords, PlainSeal>) {
     for change in [
         create(),
         Change::ClaimKeyVersion { version: 1 },
-        Change::CommitKeyVersion { version: 1 },
+        Change::CommitKeyVersion {
+            version: 1,
+            kcv: [1; KEY_CHECK_LEN],
+        },
         Change::Activate {
             external_ref: Some("ws_1".into()),
         },
@@ -498,4 +503,85 @@ fn a_record_that_does_not_open_is_damage() {
         matches!(r, Err(ChainError::Damaged("record_does_not_open"))),
         "{r:?}"
     );
+}
+
+/// A shred's purge leaves the stub alone, with the gap below it: the stub
+/// is the head. Any other record alone above a gap is damage.
+#[test]
+fn a_purged_chain_reads_its_stub_as_the_head() {
+    let store = MemRecords::new();
+    let seal = PlainSeal::new();
+    let chain = TenantChain {
+        store: &store,
+        seal: &seal,
+    };
+    block_on(async {
+        active(&chain).await;
+        chain
+            .write(&t1(), &delete(1), Actor::Customer, NOW, 0)
+            .await
+            .unwrap();
+        let due = UnixMs(NOW.0 + 7 * DAY);
+        chain
+            .write(&t1(), &Change::StartShred, Actor::ShredJob, due, 0)
+            .await
+            .unwrap();
+        seal.destroy_version(1);
+        chain
+            .write(&t1(), &Change::FinishShred, Actor::ShredJob, due, 0)
+            .await
+            .unwrap();
+        // The purge: every record below the stub goes.
+        for seq in 1..=6 {
+            assert!(store.lose(&record_key(&t1(), seq)));
+        }
+        for known in [0, 1, 7] {
+            assert_eq!(
+                chain.head_seq(&t1(), known).await.unwrap(),
+                Some(7),
+                "known {known}"
+            );
+        }
+        let head = chain.head(&t1(), 0).await.unwrap().unwrap();
+        assert_eq!(head.door.state(), TenantState::Shredded);
+        assert!(matches!(
+            chain.head_seq(&t1(), 8).await,
+            Err(ChainError::Damaged("known_above_head"))
+        ));
+    });
+
+    // A live record alone above a gap is damage, not a stub.
+    let store = MemRecords::new();
+    let seal = PlainSeal::new();
+    let chain = TenantChain {
+        store: &store,
+        seal: &seal,
+    };
+    block_on(active(&chain));
+    for seq in 1..=3 {
+        assert!(store.lose(&record_key(&t1(), seq)));
+    }
+    let r = block_on(chain.head_seq(&t1(), 0));
+    assert!(matches!(r, Err(ChainError::Damaged(_))), "{r:?}");
+}
+
+/// A record under a key version this isolate does not hold yet is a
+/// failure that may pass, not damage.
+#[test]
+fn a_key_version_not_held_yet_is_not_damage() {
+    let store = MemRecords::new();
+    let seal = PlainSeal::new();
+    let chain = TenantChain {
+        store: &store,
+        seal: &seal,
+    };
+    block_on(active(&chain));
+    seal.not_held(1, true);
+    let r = block_on(chain.head(&t1(), 0));
+    assert!(
+        matches!(r, Err(ChainError::KeyNotHeld { version: 1 })),
+        "{r:?}"
+    );
+    seal.not_held(1, false);
+    assert!(block_on(chain.head(&t1(), 0)).unwrap().is_some());
 }

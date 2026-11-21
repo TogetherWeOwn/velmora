@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 
 use zeroize::Zeroizing;
 
-use super::chain::{ControlSeal, OpenedParts, RecordStore};
+use super::chain::{ControlSeal, OpenedParts, RecordStore, SealError};
 use super::record::TenantId;
 use crate::types::{BridgeError, Result};
 
@@ -104,6 +104,7 @@ impl RecordStore for MemRecords {
 pub struct PlainSeal {
     private_lost: Cell<bool>,
     destroyed: RefCell<Vec<u32>>,
+    unheld: RefCell<Vec<u32>>,
 }
 
 impl PlainSeal {
@@ -113,6 +114,16 @@ impl PlainSeal {
 
     pub fn lose_private(&self, lost: bool) {
         self.private_lost.set(lost);
+    }
+
+    /// While set, key version `v` is not held: a record under it does not
+    /// open yet, as in an isolate that loaded its keys before `v`.
+    pub fn not_held(&self, v: u32, unheld: bool) {
+        let mut list = self.unheld.borrow_mut();
+        list.retain(|x| *x != v);
+        if unheld {
+            list.push(v);
+        }
     }
 
     /// Destroys tenant key version `v`, as a shred does: nothing is sealed
@@ -164,22 +175,33 @@ impl ControlSeal for PlainSeal {
         Ok(out)
     }
 
-    fn open(&self, name: &str, tenant: &TenantId, sealed: &[u8]) -> Result<OpenedParts> {
+    fn open(
+        &self,
+        name: &str,
+        tenant: &TenantId,
+        sealed: &[u8],
+    ) -> std::result::Result<OpenedParts, SealError> {
+        let bad = |_| SealError::Damaged;
         let mut rest = sealed
             .strip_prefix(PLAIN_MAGIC.as_slice())
-            .ok_or(BridgeError::Crypto("plain seal"))?;
-        let sealed_name = take_part(&mut rest)?;
-        let sealed_tenant = take_part(&mut rest)?;
+            .ok_or(SealError::Damaged)?;
+        let sealed_name = take_part(&mut rest).map_err(bad)?;
+        let sealed_tenant = take_part(&mut rest).map_err(bad)?;
         if sealed_name != name.as_bytes() || sealed_tenant != tenant.as_str().as_bytes() {
-            return Err(BridgeError::Crypto("plain seal binding"));
+            return Err(SealError::Damaged);
         }
-        let key_version = <[u8; 4]>::try_from(take_part(&mut rest)?)
+        let key_version = <[u8; 4]>::try_from(take_part(&mut rest).map_err(bad)?)
             .map(u32::from_be_bytes)
-            .map_err(|_| BridgeError::Crypto("plain seal"))?;
-        let door = take_part(&mut rest)?.to_vec();
-        let private = take_part(&mut rest)?.to_vec();
+            .map_err(|_| SealError::Damaged)?;
+        if self.unheld.borrow().contains(&key_version) {
+            return Err(SealError::KeyNotHeld {
+                version: key_version,
+            });
+        }
+        let door = take_part(&mut rest).map_err(bad)?.to_vec();
+        let private = take_part(&mut rest).map_err(bad)?.to_vec();
         if !rest.is_empty() {
-            return Err(BridgeError::Crypto("plain seal"));
+            return Err(SealError::Damaged);
         }
         Ok(OpenedParts {
             door,
