@@ -625,3 +625,26 @@ fn a_given_up_second_window_serves_reads_until_the_thaw() {
         paged("database_left_behind")
     );
 }
+
+/// The first window given up after its record: the record goes back to
+/// d1 before the marker is cleared, and in between reads are served.
+#[test]
+fn a_first_window_given_up_serves_reads_until_the_thaw() {
+    let store = MemRecords::new();
+    let seal = PlainSeal::new();
+    let chain = TenantChain {
+        store: &store,
+        seal: &seal,
+    };
+    first(&chain);
+    start(&chain, "main");
+    let back = write(&chain, Change::GiveUpMove, Actor::MoveTool, NOW);
+    assert_eq!(
+        decide(&back, &db(true, Some("main")), &mut fresh()),
+        ZeroServe::ServeReadOnly
+    );
+    assert_eq!(
+        decide(&back, &db(false, Some("main")), &mut fresh()),
+        ZeroServe::Serve
+    );
+}
