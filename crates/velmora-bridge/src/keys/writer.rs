@@ -14,26 +14,37 @@
 //! - **An opening record is bound to the reservation's `keys_seq`:** it
 //!   must be exactly that seq + 1, or the reservation is asked for again
 //!   at the new head. So no key is recorded against a grant that an
-//!   earlier record has already narrowed or revoked.
-//! - **A closing call is idempotent by the chain.** A request whose
-//!   effect the head already carries writes no record, but still applies
-//!   the head to every store and waits for each: a retry after a crash
-//!   must not answer `200` for a key that a store still accepts.
+//!   earlier record has already narrowed or revoked. A key's grant is
+//!   always checked against the principal it was made under.
+//! - **A call whose effect the head already carries writes no record**,
+//!   but still brings every store to the head, in the order of its class,
+//!   and waits for each: a retry after a crash must not answer `200` for
+//!   a key that a store still accepts, nor `409` for a key it created.
 //! - **A closing change needs no directory.** The directory step and the
 //!   `pending_ops` row are best effort; the units are the door.
-//! - **The answer.** `Done` only after the door stores acknowledged.
-//!   A record that is written while a store cannot be reached answers
+//! - **`m/rk/` wins.** A subject with a revocation takes no change but
+//!   its revoke record, whatever its chain says.
+//! - **A private part that does not open is never folded into a new
+//!   record** but a revoke's: a disable, narrowing or re-enable of such a
+//!   subject answers busy until its key can be loaded, so no record ever
+//!   drops a prefix, an IP list or a secret for good.
+//! - **The answer.** `Done` only after the door stores acknowledged. A
+//!   record that is written while a store cannot be reached answers
 //!   [`KeyAnswer::Unfinished`] (`503`); the queue message, the lease
 //!   renewal and the pending sweep finish it.
 //!
 //! [`finish_keys`] is the consumer of `apply_control(tenant, keys, seq)`.
 //! It reads the head (never the message's seq), appends a revoke record
 //! for every `m/rk/` revocation that the chain does not yet carry,
-//! applies the head to every store, writes a checkpoint when one is due,
-//! and clears the `pending_ops` row.
+//! brings every store to the head (the directory first; with the
+//! directory down, the units get the closing entries only), writes a
+//! checkpoint when one is due, and clears the `pending_ops` rows up to
+//! the head once every store holds it. A step that fails is reported and
+//! does not stop the others.
 
 use std::collections::BTreeSet;
 
+use subtle::ConstantTimeEq;
 use velmora::rng::FillRandom;
 
 use super::chain::Put;
@@ -50,7 +61,7 @@ use super::record::{
 use super::revocations::{list_tenant_revocations, put_tenant_revocation};
 use super::routes::{put_route, RoutePut};
 use super::store::RecordStore;
-use crate::crypto::scheme2::TenantId;
+use crate::crypto::scheme2::{unwrap_secret_v2, TenantId};
 use crate::ports::{Clock, Kek};
 use crate::types::Result;
 
@@ -67,7 +78,8 @@ pub enum KeyRequest {
     /// Revoke, disable or re-enable.
     SetStatus { id: String, status: SubjectStatus },
     /// Replace the grants. `acting` is the principal a widening is made
-    /// under.
+    /// under; for a key it must be the principal the key was made under
+    /// (or absent, which means that one).
     SetGrants {
         id: String,
         grants: Vec<Grant>,
@@ -83,11 +95,12 @@ pub enum KeyAnswer {
     Done { seq: u64 },
     /// Refused before any record.
     Refused(Refusal),
-    /// Lost the seq [`MAX_PUTS`] times, or the reservation's unit could
-    /// not catch up: `503` with `Retry-After`. Nothing was recorded.
+    /// `503` with `Retry-After`; nothing was recorded. The seq was lost
+    /// [`MAX_PUTS`] times, the reservation's unit could not catch up, or
+    /// the subject's private part cannot be opened now.
     Busy,
     /// The record `seq` is written, but a door store did not acknowledge:
-    /// `503`. The finishers make it take effect within their bound.
+    /// `503`. The change takes effect within the bound of the finishers.
     Unfinished { seq: u64 },
 }
 
@@ -124,14 +137,84 @@ struct Plan {
 
 enum Planned {
     Change(Box<Plan>),
-    /// The head already carries the effect.
-    InHead,
+    /// The head already carries the effect; bring the stores up in this
+    /// order.
+    InHead(Class),
     Refused(Refusal),
+    Busy,
 }
 
-fn plan(table: &KeyTable, request: &KeyRequest) -> Planned {
+/// Whether two wraps of `akid`'s secret hold the same secret. A wrap
+/// that does not open is not the same.
+fn same_secret<K: Kek>(
+    kek: &K,
+    tenant: &TenantId,
+    akid: &str,
+    a: (Option<u32>, Option<&Vec<u8>>),
+    b: (Option<u32>, Option<&Vec<u8>>),
+) -> bool {
+    match (a, b) {
+        ((None, None), (None, None)) => true,
+        ((Some(va), Some(wa)), (Some(vb), Some(wb))) => {
+            if wa == wb && va == vb {
+                return true;
+            }
+            match (
+                unwrap_secret_v2(kek, va, tenant, akid, wa),
+                unwrap_secret_v2(kek, vb, tenant, akid, wb),
+            ) {
+                (Ok(x), Ok(y)) => x.len() == y.len() && bool::from(x[..].ct_eq(&y[..])),
+                _ => false,
+            }
+        }
+        _ => false,
+    }
+}
+
+/// Whether `subject` is what the head already holds for its id: the
+/// retry of a create that was recorded.
+fn same_create<K: Kek>(kek: &K, tenant: &TenantId, entry: &Entry, subject: &Subject) -> bool {
+    let Some(private) = &entry.private else {
+        return false;
+    };
+    let mut door = subject.door.clone();
+    door.secret_kek_version = entry.door.secret_kek_version;
+    door == entry.door
+        && private.owner_ref == subject.private.owner_ref
+        && private.label == subject.private.label
+        && private.grants == subject.private.grants
+        && same_secret(
+            kek,
+            tenant,
+            &entry.door.id,
+            (
+                entry.door.secret_kek_version,
+                private.secret_wrapped.as_ref(),
+            ),
+            (
+                subject.door.secret_kek_version,
+                subject.private.secret_wrapped.as_ref(),
+            ),
+        )
+}
+
+fn plan<K: Kek>(
+    kek: &K,
+    table: &KeyTable,
+    revoked: &BTreeSet<String>,
+    request: &KeyRequest,
+) -> Planned {
     match request {
         KeyRequest::Create(subject) => {
+            if revoked.contains(&subject.door.id) {
+                return Planned::Refused(Refusal::Conflict);
+            }
+            if let Some(entry) = table.get(&subject.door.id) {
+                return match same_create(kek, table.tenant(), entry, subject) {
+                    true => Planned::InHead(Class::Opening),
+                    false => Planned::Refused(Refusal::Conflict),
+                };
+            }
             match table.admits(KeyOp::Create, &subject.door, Some(&subject.private)) {
                 Ok(()) => Planned::Change(Box::new(Plan {
                     op: KeyOp::Create,
@@ -148,16 +231,25 @@ fn plan(table: &KeyTable, request: &KeyRequest) -> Planned {
             let Some(entry) = table.get(id) else {
                 return Planned::Refused(Refusal::NotFound);
             };
-            if entry.door.status == *status {
-                return Planned::InHead;
+            let revoking = *status == SubjectStatus::Revoked;
+            // `m/rk/` wins: only the revoke record may follow it.
+            if revoked.contains(id) && !revoking {
+                return Planned::Refused(Refusal::Conflict);
             }
             let class = match status {
                 SubjectStatus::Active => Class::Opening,
                 _ => Class::Closing,
             };
-            // Re-enabling restates the private part; it must be open.
-            if class == Class::Opening && entry.private.is_none() {
-                return Planned::Refused(Refusal::Conflict);
+            if entry.door.status == *status {
+                // A re-enable of a subject that is closed is not in force.
+                return match (class, &entry.private) {
+                    (Class::Opening, None) => Planned::Busy,
+                    _ => Planned::InHead(class),
+                };
+            }
+            // Only a revoke may be recorded without the private part.
+            if entry.private.is_none() && !revoking {
+                return Planned::Busy;
             }
             let mut door = entry.door.clone();
             door.status = *status;
@@ -168,21 +260,31 @@ fn plan(table: &KeyTable, request: &KeyRequest) -> Planned {
                     private: entry.private.clone(),
                     class,
                     acting: entry.door.made_by.clone(),
-                    revoke: *status == SubjectStatus::Revoked,
+                    revoke: revoking,
                 })),
                 Err(_) => Planned::Refused(Refusal::Conflict),
             }
         }
         KeyRequest::SetGrants { id, grants, acting } => {
-            let Some(subject) = table.get(id).and_then(Entry::subject) else {
-                return Planned::Refused(match table.get(id) {
-                    None => Refusal::NotFound,
-                    Some(_) => Refusal::Conflict,
-                });
+            let Some(entry) = table.get(id) else {
+                return Planned::Refused(Refusal::NotFound);
+            };
+            if revoked.contains(id) {
+                return Planned::Refused(Refusal::Conflict);
+            }
+            let Some(subject) = entry.subject() else {
+                return Planned::Busy;
+            };
+            // A key is bounded by the principal it was made under, and by
+            // no other.
+            let acting = match (&entry.door.made_by, acting) {
+                (Some(p), Some(a)) if p != a => return Planned::Refused(Refusal::NotSubset),
+                (Some(p), _) => Some(p.clone()),
+                (None, a) => a.clone(),
             };
             let current = subject.grants();
             if current == *grants {
-                return Planned::InHead;
+                return Planned::InHead(Class::Closing);
             }
             // The class comes from the head, never from the caller.
             let class = match grants_narrow(grants, &current) {
@@ -197,7 +299,7 @@ fn plan(table: &KeyTable, request: &KeyRequest) -> Planned {
                     door: next.door,
                     private: Some(next.private),
                     class,
-                    acting: acting.clone(),
+                    acting,
                     revoke: false,
                 })),
                 Err(_) => Planned::Refused(Refusal::Conflict),
@@ -206,19 +308,29 @@ fn plan(table: &KeyTable, request: &KeyRequest) -> Planned {
     }
 }
 
-/// The entries a store at `held` needs to reach `table.seq()`, with the
-/// revocations in force.
-fn entries_for(table: &KeyTable, held: u64, revoked: &BTreeSet<String>) -> Vec<Entry> {
+/// The status in force of an entry, `m/rk/` included.
+fn in_force(e: &Entry, revoked: &BTreeSet<String>) -> Entry {
+    let mut e = e.clone();
+    if revoked.contains(&e.door.id) {
+        e.door.status = SubjectStatus::Revoked;
+    }
+    e
+}
+
+/// The entries a store at `held`, holding `closed` closed, needs to reach
+/// `table.seq()`, with the revocations in force.
+fn entries_for(
+    table: &KeyTable,
+    held: u64,
+    revoked: &BTreeSet<String>,
+    closed: &BTreeSet<String>,
+) -> Vec<Entry> {
     table
         .entries()
-        .filter(|e| e.last_seq > held || revoked.contains(&e.door.id))
-        .map(|e| {
-            let mut e = e.clone();
-            if revoked.contains(&e.door.id) {
-                e.door.status = SubjectStatus::Revoked;
-            }
-            e
+        .filter(|e| {
+            e.last_seq > held || revoked.contains(&e.door.id) || closed.contains(&e.door.id)
         })
+        .map(|e| in_force(e, revoked))
         .collect()
 }
 
@@ -229,12 +341,30 @@ async fn bring_up<U: KeyTarget>(
     revoked: &BTreeSet<String>,
 ) -> Result<()> {
     let held = target.keys_seq().await?;
-    if held >= table.seq() && revoked.is_empty() {
+    let closed: BTreeSet<String> = target.closed().await?.into_iter().collect();
+    if held >= table.seq() && revoked.is_empty() && closed.is_empty() {
         return Ok(());
     }
     target
-        .apply(table.seq(), &entries_for(table, held, revoked))
+        .apply(table.seq(), &entries_for(table, held, revoked, &closed))
         .await
+}
+
+/// Applies the closing entries of the table to one store, without moving
+/// its `keys_seq`: what a unit gets while the directory, which opening
+/// changes go to first, cannot be reached.
+async fn close_only<U: KeyTarget>(
+    target: &U,
+    table: &KeyTable,
+    revoked: &BTreeSet<String>,
+) -> Result<()> {
+    let held = target.keys_seq().await?;
+    let closing: Vec<Entry> = table
+        .entries()
+        .map(|e| in_force(e, revoked))
+        .filter(|e| e.effective_status() != SubjectStatus::Active)
+        .collect();
+    target.apply(held, &closing).await
 }
 
 impl<S, K, T, A, I, U, D, C> KeyEnv<'_, S, K, T, A, I, U, D, C>
@@ -262,6 +392,48 @@ where
         all
     }
 
+    /// Brings every store to the head in the order of `class`. `units` is
+    /// whether every unit acknowledged, `directory` whether it did.
+    async fn apply_all(
+        &self,
+        class: Class,
+        table: &KeyTable,
+        revoked: &BTreeSet<String>,
+    ) -> (bool, bool) {
+        match class {
+            Class::Closing => {
+                let units = self.apply_units(table, revoked).await;
+                let directory = bring_up(self.directory, table, revoked).await.is_ok();
+                (units, directory)
+            }
+            Class::Opening => {
+                let directory = bring_up(self.directory, table, revoked).await.is_ok();
+                // Directory first: with it down, no unit opens anything.
+                let units = directory && self.apply_units(table, revoked).await;
+                (units, directory)
+            }
+        }
+    }
+
+    /// The answer once the stores were brought up. Clears the pending
+    /// rows up to `seq` when every store holds it.
+    async fn answer(&self, class: Class, seq: u64, (units, directory): (bool, bool)) -> KeyAnswer {
+        let done = match class {
+            Class::Closing => units,
+            Class::Opening => units && directory,
+        };
+        if units && directory {
+            let _ = self
+                .intents
+                .clear(self.tenant, ControlChain::Keys, seq)
+                .await;
+        }
+        match done {
+            true => KeyAnswer::Done { seq },
+            false => KeyAnswer::Unfinished { seq },
+        }
+    }
+
     /// Runs one key change. `table` is the caller's copy of the key
     /// table (cached per isolate, any age); it is brought to the head
     /// here and left there.
@@ -280,16 +452,12 @@ where
         let mut puts = 0;
         while puts < MAX_PUTS {
             advance(self.store, self.kek, self.ring, &chain, table).await?;
-            let plan = match plan(table, request) {
+            let plan = match plan(self.kek, table, &revoked, request) {
                 Planned::Refused(r) => return Ok(KeyAnswer::Refused(r)),
-                Planned::InHead => {
-                    // The head carries it; the stores are still brought up.
-                    let seq = table.seq();
-                    if !self.apply_units(table, &revoked).await {
-                        return Ok(KeyAnswer::Unfinished { seq });
-                    }
-                    let _ = bring_up(self.directory, table, &revoked).await;
-                    return Ok(KeyAnswer::Done { seq });
+                Planned::Busy => return Ok(KeyAnswer::Busy),
+                Planned::InHead(class) => {
+                    let acks = self.apply_all(class, table, &revoked).await;
+                    return Ok(self.answer(class, table.seq(), acks).await);
                 }
                 Planned::Change(p) => p,
             };
@@ -300,7 +468,7 @@ where
                 Class::Opening => {
                     // Opening plans always carry an open private part.
                     let Some(private) = plan.private.clone() else {
-                        return Ok(KeyAnswer::Refused(Refusal::Conflict));
+                        return Ok(KeyAnswer::Busy);
                     };
                     let subject = Subject {
                         door: plan.door.clone(),
@@ -365,7 +533,8 @@ where
                 )
                 .await?;
                 if routed == RoutePut::Taken {
-                    return Ok(KeyAnswer::Refused(Refusal::Conflict));
+                    // The finisher of this intent clears its row.
+                    return Ok(KeyAnswer::Refused(Refusal::IdTaken));
                 }
             }
 
@@ -390,25 +559,8 @@ where
             let record = open_key_record(self.kek, self.ring, self.tenant, seq, &bytes)?;
             table.apply(&record)?;
 
-            let done = match plan.class {
-                Class::Closing => {
-                    let units = self.apply_units(table, &revoked).await;
-                    let _ = bring_up(self.directory, table, &revoked).await;
-                    units
-                }
-                Class::Opening => {
-                    bring_up(self.directory, table, &revoked).await.is_ok()
-                        && self.apply_units(table, &revoked).await
-                }
-            };
-            if !done {
-                return Ok(KeyAnswer::Unfinished { seq });
-            }
-            let _ = self
-                .intents
-                .clear(self.tenant, ControlChain::Keys, seq)
-                .await;
-            return Ok(KeyAnswer::Done { seq });
+            let acks = self.apply_all(plan.class, table, &revoked).await;
+            return Ok(self.answer(plan.class, seq, acks).await);
         }
         Ok(KeyAnswer::Busy)
     }
@@ -436,19 +588,34 @@ pub struct FinishReport {
     pub head: u64,
     /// Revoke records appended for `m/rk/` revocations.
     pub appended: Vec<u64>,
+    /// Revocations whose revoke record could not be appended (the tenant
+    /// key could not be loaded, a store error): they are in force in the
+    /// stores all the same, by their `m/rk/` record.
+    pub append_failed: Vec<String>,
     /// Stores that did not acknowledge, by label.
     pub failed: Vec<String>,
     /// The checkpoint written by this run.
     pub checkpoint: Option<u64>,
+    /// A checkpoint was due and was not written (closed subjects, a store
+    /// error). Nothing waits for it.
+    pub checkpoint_skipped: bool,
     /// Subjects whose private part did not open: disabled wherever
     /// applied; an attention condition.
     pub closed: Vec<String>,
 }
 
+impl FinishReport {
+    /// Whether the run must be retried by the queue.
+    pub fn retry(&self) -> bool {
+        !self.failed.is_empty() || !self.append_failed.is_empty()
+    }
+}
+
 /// Finishes every key change of `tenant` whose record is written: the
 /// consumer of `apply_control(tenant, keys, _)`, the lease renewal's
-/// catch-up and the pending sweep all call it. An `Err`, or a report
-/// with a failed store, makes the queue retry.
+/// catch-up and the pending sweep all call it. An `Err` (the chain could
+/// not be read), or a report that asks for a retry, makes the queue
+/// retry.
 pub async fn finish_keys<S, K, T, A, I, U, D, C, R>(
     env: &KeyEnv<'_, S, K, T, A, I, U, D, C>,
     rng: &mut R,
@@ -469,19 +636,31 @@ where
     let mut report = FinishReport::default();
     let mut table = read.table.clone();
 
-    // A revocation whose chain record is missing: append it.
+    // A revocation whose chain record is missing: append it. A failure
+    // here stops nothing below: the stores get the revocation from its
+    // `m/rk/` record.
     for id in read.unrecorded_revocations() {
+        let mut appended = false;
         for _ in 0..MAX_PUTS {
-            advance(env.store, env.kek, env.ring, &chain, &mut table).await?;
-            let Some(entry) = table.get(&id) else { break };
+            if advance(env.store, env.kek, env.ring, &chain, &mut table)
+                .await
+                .is_err()
+            {
+                break;
+            }
+            let Some(entry) = table.get(&id) else {
+                appended = true;
+                break;
+            };
             if entry.door.status == SubjectStatus::Revoked {
+                appended = true;
                 break;
             }
             let mut door = entry.door.clone();
             door.status = SubjectStatus::Revoked;
             let private = entry.private.clone();
             let seq = table.seq() + 1;
-            let bytes = seal_key_record(
+            let Ok(bytes) = seal_key_record(
                 env.kek,
                 env.ring,
                 env.tenant,
@@ -491,39 +670,66 @@ where
                 &door,
                 private.as_ref(),
                 rng,
-            )?;
-            if chain.put(env.store, seq, bytes.clone()).await? == Put::Written {
-                let record = open_key_record(env.kek, env.ring, env.tenant, seq, &bytes)?;
-                table.apply(&record)?;
-                report.appended.push(seq);
+            ) else {
                 break;
+            };
+            match chain.put(env.store, seq, bytes.clone()).await {
+                Ok(Put::Written) => {
+                    if let Ok(record) = open_key_record(env.kek, env.ring, env.tenant, seq, &bytes)
+                    {
+                        if table.apply(&record).is_ok() {
+                            report.appended.push(seq);
+                            appended = true;
+                        }
+                    }
+                    break;
+                }
+                Ok(Put::Lost) => {}
+                Err(_) => break,
             }
         }
+        if !appended {
+            report.append_failed.push(id);
+        }
     }
-    advance(env.store, env.kek, env.ring, &chain, &mut table).await?;
+    let _ = advance(env.store, env.kek, env.ring, &chain, &mut table).await;
 
+    // The directory first: opening entries go there before any unit.
+    let directory = bring_up(env.directory, &table, &read.revoked).await.is_ok();
+    if !directory {
+        report.failed.push(env.directory.label().to_owned());
+    }
     for unit in env.units {
-        if bring_up(unit, &table, &read.revoked).await.is_err() {
+        let applied = match directory {
+            true => bring_up(unit, &table, &read.revoked).await,
+            false => close_only(unit, &table, &read.revoked).await,
+        };
+        if applied.is_err() {
             report.failed.push(unit.label().to_owned());
         }
     }
-    if bring_up(env.directory, &table, &read.revoked)
-        .await
-        .is_err()
-    {
-        report.failed.push(env.directory.label().to_owned());
-    }
 
-    let due = read.newest_checkpoint.unwrap_or(0) + CHECKPOINT_EVERY;
+    // A checkpoint when one is due, from the newest one that verified.
+    // Best effort: nothing waits for it.
+    let due = read
+        .from_checkpoint
+        .unwrap_or(0)
+        .saturating_add(CHECKPOINT_EVERY);
     if table.seq() >= due {
-        let record = chain.get(env.store, table.seq()).await?;
-        let sealed = seal_checkpoint(env.kek, env.ring, &table, &record, rng)?;
-        // Another finisher may have written it first: same content.
-        let _ = env
-            .store
-            .put_if_absent(&checkpoint_name(env.tenant, table.seq()), sealed)
-            .await?;
-        report.checkpoint = Some(table.seq());
+        let written = async {
+            let record = chain.get(env.store, table.seq()).await?;
+            let sealed = seal_checkpoint(env.kek, env.ring, &table, &record, rng)?;
+            env.store
+                .put_if_absent(&checkpoint_name(env.tenant, table.seq()), sealed)
+                .await
+        }
+        .await;
+        match written {
+            Ok(true) => report.checkpoint = Some(table.seq()),
+            // Another finisher wrote it first.
+            Ok(false) => {}
+            Err(_) => report.checkpoint_skipped = true,
+        }
     }
 
     report.head = table.seq();
@@ -532,7 +738,7 @@ where
         .filter(|e| e.private.is_none() && e.door.status != SubjectStatus::Revoked)
         .map(|e| e.door.id.clone())
         .collect();
-    if report.failed.is_empty() {
+    if !report.retry() {
         let _ = env
             .intents
             .clear(env.tenant, ControlChain::Keys, report.head)

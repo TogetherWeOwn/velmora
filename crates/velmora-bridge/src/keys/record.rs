@@ -121,7 +121,8 @@ pub struct DoorGrant {
 }
 
 /// The private part of one grant, in the same order as the door part.
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+/// `Debug` shows its shape only.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct PrivateGrant {
     pub bucket_id: String,
@@ -178,8 +179,9 @@ pub struct Subject {
     pub private: SubjectPrivate,
 }
 
-/// One full grant, both parts joined.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// One full grant, both parts joined. `Debug` leaves the prefix and the
+/// IP list out.
+#[derive(Clone, PartialEq, Eq)]
 pub struct Grant {
     pub bucket_id: String,
     pub access: Access,
@@ -224,6 +226,38 @@ impl Subject {
             })
             .collect();
     }
+}
+
+impl std::fmt::Debug for PrivateGrant {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PrivateGrant")
+            .field("bucket_id", &self.bucket_id)
+            .field("prefix", &self.prefix.is_some())
+            .field("ips", &self.ip_list.len())
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for Grant {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Grant")
+            .field("bucket_id", &self.bucket_id)
+            .field("access", &self.access)
+            .field("expires_at", &self.expires_at)
+            .field("prefix", &self.prefix.is_some())
+            .field("ips", &self.ip_list.len())
+            .finish()
+    }
+}
+
+/// The rules of a subject's state, for a reader that builds an entry from
+/// something other than a record (a checkpoint).
+pub(super) fn check_entry(
+    tenant: &TenantId,
+    door: &SubjectDoor,
+    private: Option<&SubjectPrivate>,
+) -> Result<()> {
+    check_subject(tenant, door, private)
 }
 
 fn short(s: &str) -> bool {
@@ -531,6 +565,15 @@ impl KeyTable {
 
     pub fn is_empty(&self) -> bool {
         self.subjects.is_empty()
+    }
+
+    /// The entry of `id` with its private part now opened by `private`
+    /// (a checkpoint carried it closed; the record opens with the current
+    /// ring).
+    pub(super) fn reopen(&mut self, id: &str, private: SubjectPrivate) {
+        if let Some(e) = self.subjects.get_mut(id) {
+            e.private = Some(private);
+        }
     }
 
     /// Whether `op` with the door part `door` (and the private part

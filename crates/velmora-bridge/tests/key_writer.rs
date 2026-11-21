@@ -103,16 +103,38 @@ impl KeyTarget for FakeTarget {
         Ok(self.seq.get())
     }
 
+    async fn closed(&self) -> Result<Vec<String>> {
+        if self.down.get() {
+            return Err(BridgeError::Sql("fake: down".into()));
+        }
+        Ok(self
+            .rows
+            .borrow()
+            .values()
+            .filter(|e| e.private.is_none() && e.door.status != SubjectStatus::Revoked)
+            .map(|e| e.door.id.clone())
+            .collect())
+    }
+
+    /// As the port says: closing entries always; others only above the
+    /// held seq.
     async fn apply(&self, to_seq: u64, entries: &[Entry]) -> Result<()> {
         if self.down.get() {
             return Err(BridgeError::Sql("fake: down".into()));
         }
         self.applies.set(self.applies.get() + 1);
+        let held = self.seq.get();
         let mut rows = self.rows.borrow_mut();
         for e in entries {
-            rows.insert(e.door.id.clone(), e.clone());
+            let closing = e.effective_status() != SubjectStatus::Active;
+            let reopened = rows
+                .get(&e.door.id)
+                .is_some_and(|r| r.private.is_none() && e.private.is_some());
+            if closing || e.last_seq > held || reopened {
+                rows.insert(e.door.id.clone(), e.clone());
+            }
         }
-        self.seq.set(self.seq.get().max(to_seq));
+        self.seq.set(held.max(to_seq));
         Ok(())
     }
 }
@@ -205,7 +227,10 @@ impl FakeAdmission<'_> {
 #[derive(Default)]
 struct FakeIntents {
     sent: RefCell<Vec<u64>>,
+    /// The pending rows, as the directory would hold them.
     notes: RefCell<Vec<(u64, String)>>,
+    /// Every row ever written.
+    noted: RefCell<Vec<(u64, String)>>,
     cleared: RefCell<Vec<u64>>,
     fail_send: Cell<bool>,
     /// The directory is down: the `pending_ops` row cannot be written.
@@ -227,14 +252,17 @@ impl ControlIntents for FakeIntents {
             return Err(BridgeError::Sql("fake: directory down".into()));
         }
         self.notes.borrow_mut().push((seq, kind.to_owned()));
+        self.noted.borrow_mut().push((seq, kind.to_owned()));
         Ok(())
     }
 
+    /// Clears every row at or below `seq`.
     async fn clear(&self, _t: &TenantId, _c: ControlChain, seq: u64) -> Result<()> {
         if self.fail_note.get() {
             return Err(BridgeError::Sql("fake: directory down".into()));
         }
         self.cleared.borrow_mut().push(seq);
+        self.notes.borrow_mut().retain(|(s, _)| *s > seq);
         Ok(())
     }
 }
@@ -372,6 +400,9 @@ impl KeyTarget for &FakeTarget {
     async fn keys_seq(&self) -> Result<u64> {
         KeyTarget::keys_seq(*self).await
     }
+    async fn closed(&self) -> Result<Vec<String>> {
+        KeyTarget::closed(*self).await
+    }
     async fn apply(&self, to_seq: u64, entries: &[Entry]) -> Result<()> {
         KeyTarget::apply(*self, to_seq, entries).await
     }
@@ -458,7 +489,8 @@ async fn a_new_key_is_in_the_chain_first_and_then_in_every_store() {
     assert!(row.private.unwrap().secret_wrapped.is_some());
     assert_eq!(*w.intents.sent.borrow(), vec![1, 2]);
     assert_eq!(*w.intents.cleared.borrow(), vec![1, 2]);
-    assert_eq!(w.intents.notes.borrow()[1].1, "key.create");
+    assert_eq!(w.intents.noted.borrow()[1].1, "key.create");
+    assert!(w.intents.notes.borrow().is_empty(), "every row cleared");
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -924,7 +956,7 @@ async fn a_key_id_routed_to_another_tenant_is_refused() {
         env.change(&mut table, "i", &KeyRequest::Create(key), &mut rng)
             .await
             .unwrap(),
-        KeyAnswer::Refused(Refusal::Conflict)
+        KeyAnswer::Refused(Refusal::IdTaken)
     );
     assert_eq!(w.head(), 2);
     assert_eq!(
@@ -1025,8 +1057,9 @@ async fn changes_the_head_does_not_admit_are_refused() {
             .unwrap(),
         KeyAnswer::Refused(Refusal::NotFound)
     );
-    // The same id twice.
-    let again = s3_key(&w.t, "AKVL0001", "PR0001", &[grant("b_01", RO, None)]);
+    // The same id with other content. (The same content again is a
+    // retry: see the test of retried creates.)
+    let again = s3_key(&w.t, "AKVL0001", "PR0001", &[grant("b_01", RW, None)]);
     assert_eq!(
         env.change(&mut table, "b", &KeyRequest::Create(again), &mut rng)
             .await
@@ -1176,4 +1209,333 @@ async fn a_lost_seq_is_validated_again_at_the_new_head() {
         key_chain(&w.t).put(&w.store, 3, bytes).await.unwrap(),
         Put::Lost
     );
+}
+
+// ---------------------------------------------------------------------------
+// From the review
+// ---------------------------------------------------------------------------
+
+/// A ring with two key versions: version 2 current.
+struct TwoKeys(TenantKey, TenantKey);
+
+impl velmora_bridge::keys::record::TkRing for TwoKeys {
+    fn current(&self) -> Option<&TenantKey> {
+        Some(&self.1)
+    }
+    fn key(&self, v: u32) -> Option<&TenantKey> {
+        [&self.0, &self.1].into_iter().find(|k| k.version() == v)
+    }
+}
+
+macro_rules! env_with {
+    ($w:expr, $ring:expr, $adm:expr, $units:expr) => {
+        KeyEnv {
+            store: &$w.store,
+            kek: &$w.kek,
+            ring: $ring,
+            tenant: &$w.t,
+            admission: $adm,
+            intents: &$w.intents,
+            units: $units,
+            directory: &&$w.directory,
+            clock: &$w.clock,
+        }
+    };
+}
+
+/// A create that answered Unfinished, asked again with the same content,
+/// is finished, not refused: the caller must not make a second key.
+#[tokio::test(flavor = "current_thread")]
+async fn a_retried_create_is_finished_not_refused() {
+    let w = World::new();
+    let adm = FakeAdmission::new(&w.root);
+    let mut table = seed(&w, &adm).await;
+    let units = w.units();
+    let env = env!(w, &adm, &units);
+    let mut rng = TestRng(40);
+    w.directory.down.set(true);
+    let key = s3_key(&w.t, "AKVL0002", "PR0001", &[grant("b_01", RO, None)]);
+    let req = KeyRequest::Create(key);
+    assert_eq!(
+        env.change(&mut table, "i", &req, &mut rng).await.unwrap(),
+        KeyAnswer::Unfinished { seq: 3 }
+    );
+    // Still down: the retry answers Unfinished again, writes nothing.
+    assert_eq!(
+        env.change(&mut table, "i", &req, &mut rng).await.unwrap(),
+        KeyAnswer::Unfinished { seq: 3 }
+    );
+    w.directory.down.set(false);
+    assert_eq!(
+        env.change(&mut table, "i", &req, &mut rng).await.unwrap(),
+        KeyAnswer::Done { seq: 3 }
+    );
+    assert_eq!(w.head(), 3);
+    for store in [&w.root, &w.unit2, &w.directory] {
+        assert_eq!(store.status("AKVL0002"), Some(SubjectStatus::Active));
+    }
+}
+
+/// The finisher goes to the directory first. With it down, the units
+/// get the closing entries only, and nothing is opened.
+#[tokio::test(flavor = "current_thread")]
+async fn the_finisher_opens_nothing_while_the_directory_is_down() {
+    let w = World::new();
+    let adm = FakeAdmission::new(&w.root);
+    let mut table = seed(&w, &adm).await;
+    let units = w.units();
+    let env = env!(w, &adm, &units);
+    let mut rng = TestRng(41);
+    // A create (opening) and a disable (closing) are recorded while every
+    // store is down.
+    for s in [&w.root, &w.unit2, &w.directory] {
+        s.down.set(true);
+    }
+    let key = s3_key(&w.t, "AKVL0002", "PR0001", &[grant("b_01", RO, None)]);
+    assert_eq!(
+        env.change(&mut table, "a", &KeyRequest::Create(key), &mut rng)
+            .await
+            .unwrap(),
+        KeyAnswer::Unfinished { seq: 3 }
+    );
+    assert_eq!(
+        env.change(&mut table, "b", &disable("AKVL0001"), &mut rng)
+            .await
+            .unwrap(),
+        KeyAnswer::Unfinished { seq: 4 }
+    );
+    // The units come back; the directory does not.
+    w.root.down.set(false);
+    w.unit2.down.set(false);
+    let report = finish_keys(&env, &mut rng).await.unwrap();
+    assert_eq!(report.failed, vec!["directory".to_owned()]);
+    assert!(report.retry());
+    for unit in [&w.root, &w.unit2] {
+        assert_eq!(unit.status("AKVL0001"), Some(SubjectStatus::Disabled));
+        assert!(
+            unit.row("AKVL0002").is_none(),
+            "{} opened a key",
+            unit.label
+        );
+        assert_eq!(unit.seq.get(), 2, "keys_seq did not move");
+    }
+    w.directory.down.set(false);
+    let report = finish_keys(&env, &mut rng).await.unwrap();
+    assert!(!report.retry(), "{report:?}");
+    for store in [&w.root, &w.unit2, &w.directory] {
+        assert_eq!(store.status("AKVL0002"), Some(SubjectStatus::Active));
+        assert_eq!(store.status("AKVL0001"), Some(SubjectStatus::Disabled));
+    }
+    assert_eq!(w.intents.cleared.borrow().last(), Some(&4));
+    assert!(w.intents.notes.borrow().is_empty(), "every row cleared");
+}
+
+/// A key's grant is checked against the principal it was made under,
+/// whatever the call names.
+#[tokio::test(flavor = "current_thread")]
+async fn a_key_widening_is_bounded_by_its_own_principal() {
+    let w = World::new();
+    let adm = FakeAdmission::new(&w.root);
+    let mut table = seed(&w, &adm).await;
+    let units = w.units();
+    let env = env!(w, &adm, &units);
+    let mut rng = TestRng(42);
+    // A second principal that holds b_09.
+    let p2 = principal("PR0002", &[grant("b_09", RW, None)]);
+    assert_eq!(
+        env.change(&mut table, "p2", &KeyRequest::Create(p2), &mut rng)
+            .await
+            .unwrap(),
+        KeyAnswer::Done { seq: 3 }
+    );
+    let wider = vec![grant("b_01", RW, None), grant("b_09", RW, None)];
+    for acting in [None, Some("PR0001".to_owned()), Some("PR0002".to_owned())] {
+        let req = KeyRequest::SetGrants {
+            id: "AKVL0001".into(),
+            grants: wider.clone(),
+            acting,
+        };
+        assert_eq!(
+            env.change(&mut table, "w", &req, &mut rng).await.unwrap(),
+            KeyAnswer::Refused(Refusal::NotSubset)
+        );
+    }
+    assert_eq!(w.head(), 3);
+}
+
+/// A subject with an `m/rk/` revocation takes its revoke record and
+/// nothing else, even before the chain says so.
+#[tokio::test(flavor = "current_thread")]
+async fn a_revocation_refuses_every_other_change() {
+    let w = World::new();
+    let adm = FakeAdmission::new(&w.root);
+    let mut table = seed(&w, &adm).await;
+    let units = w.units();
+    let env = env!(w, &adm, &units);
+    let mut rng = TestRng(43);
+    put_tenant_revocation(&w.store, &w.kek, &w.t, "AKVL0001", 5, &mut rng)
+        .await
+        .unwrap();
+    for req in [
+        disable("AKVL0001"),
+        enable("AKVL0001"),
+        KeyRequest::SetGrants {
+            id: "AKVL0001".into(),
+            grants: vec![grant("b_01", RO, Some("x/"))],
+            acting: None,
+        },
+    ] {
+        assert_eq!(
+            env.change(&mut table, "i", &req, &mut rng).await.unwrap(),
+            KeyAnswer::Refused(Refusal::Conflict)
+        );
+    }
+    assert_eq!(
+        env.change(&mut table, "r", &revoke("AKVL0001"), &mut rng)
+            .await
+            .unwrap(),
+        KeyAnswer::Done { seq: 3 }
+    );
+    assert_eq!(w.root.status("AKVL0001"), Some(SubjectStatus::Revoked));
+}
+
+/// A finisher whose ring holds no key: it can seal no revoke record and
+/// opens no private part. The revocation is in force in the stores all
+/// the same; the subjects it could not open are disabled there, remembered
+/// as closed, and opened again by the next run with the key. No
+/// checkpoint carries them closed.
+#[tokio::test(flavor = "current_thread")]
+async fn a_finisher_without_the_key_closes_and_a_later_one_heals() {
+    let w = World::new();
+    let adm = FakeAdmission::new(&w.root);
+    let mut table = seed(&w, &adm).await;
+    let units = w.units();
+    let env = env!(w, &adm, &units);
+    let mut rng = TestRng(44);
+    // 254 more records, so a checkpoint is due at 256.
+    for i in 0..254u32 {
+        let req = if i % 2 == 0 {
+            disable("AKVL0001")
+        } else {
+            enable("AKVL0001")
+        };
+        env.change(&mut table, "i", &req, &mut rng).await.unwrap();
+    }
+    let other = s3_key(&w.t, "AKVL0002", "PR0001", &[grant("b_01", RO, None)]);
+    put_tenant_revocation(&w.store, &w.kek, &w.t, "AKVL0001", 5, &mut rng)
+        .await
+        .unwrap();
+    let _ = other;
+    // A store that lost everything is brought up by a keyless finisher.
+    w.unit2.reset();
+    let nokeys = velmora_bridge::keys::record::NoKeys;
+    let blind = env_with!(w, &nokeys, &adm, &units);
+    let report = finish_keys(&blind, &mut rng).await.unwrap();
+    assert_eq!(report.append_failed, vec!["AKVL0001".to_owned()]);
+    assert!(report.retry());
+    assert_eq!(
+        report.checkpoint, None,
+        "no checkpoint with closed subjects"
+    );
+    assert!(report.checkpoint_skipped);
+    assert_eq!(
+        list_checkpoints(&w.store, &w.t).await.unwrap(),
+        Vec::<u64>::new()
+    );
+    assert_eq!(w.unit2.status("AKVL0001"), Some(SubjectStatus::Revoked));
+    assert_eq!(w.unit2.status("PR0001"), Some(SubjectStatus::Disabled));
+    // The next run with the key: the revoke record is appended, the
+    // principal opens again, and the checkpoint is written.
+    let report = finish_keys(&env, &mut rng).await.unwrap();
+    assert!(!report.retry(), "{report:?}");
+    assert_eq!(report.appended, vec![257]);
+    assert_eq!(w.unit2.status("PR0001"), Some(SubjectStatus::Active));
+    assert_eq!(report.checkpoint, Some(257));
+    let read = read_key_chain(&w.store, &w.kek, &w.ring, &w.t)
+        .await
+        .unwrap();
+    assert_eq!(
+        read.table.get("PR0001").unwrap().effective_status(),
+        SubjectStatus::Active
+    );
+}
+
+/// A checkpoint that cannot be written stops nothing.
+#[tokio::test(flavor = "current_thread")]
+async fn a_checkpoint_that_cannot_be_written_stops_nothing() {
+    let w = World::new();
+    let adm = FakeAdmission::new(&w.root);
+    let mut table = seed(&w, &adm).await;
+    let units = w.units();
+    let env = env!(w, &adm, &units);
+    let mut rng = TestRng(45);
+    for i in 0..254u32 {
+        let req = if i % 2 == 0 {
+            disable("AKVL0001")
+        } else {
+            enable("AKVL0001")
+        };
+        env.change(&mut table, "i", &req, &mut rng).await.unwrap();
+    }
+    w.store.refuse(&format!("m/kc/{}/", w.t));
+    w.unit2.reset();
+    let report = finish_keys(&env, &mut rng).await.unwrap();
+    assert!(report.checkpoint_skipped);
+    assert!(!report.retry());
+    assert_eq!(w.unit2.seq.get(), 256);
+    // A planted checkpoint name far above the head breaks nothing either.
+    w.store.allow(&format!("m/kc/{}/", w.t));
+    w.store.plant(
+        &velmora_bridge::keys::checkpoint::checkpoint_name(&w.t, u64::MAX),
+        b"junk".to_vec(),
+    );
+    let report = finish_keys(&env, &mut rng).await.unwrap();
+    assert_eq!(report.checkpoint, Some(256));
+}
+
+/// A disable, narrowing or re-enable of a subject whose private part is
+/// closed answers busy and writes nothing; a revoke goes through.
+#[tokio::test(flavor = "current_thread")]
+async fn only_a_revoke_is_recorded_without_the_private_part() {
+    let w = World::new();
+    let adm = FakeAdmission::new(&w.root);
+    let mut table = seed(&w, &adm).await;
+    // A Worker that holds key version 2 only: version 1's private parts
+    // stay closed for it.
+    let v2_only = OneKey(TenantKey::from_bytes(&w.t, 2, derived("tk v2")).unwrap());
+    let units = w.units();
+    let env = env_with!(w, &v2_only, &adm, &units);
+    let mut rng = TestRng(46);
+    let mut fresh = velmora_bridge::keys::record::KeyTable::empty(w.t.clone());
+    for req in [
+        disable("AKVL0001"),
+        KeyRequest::SetGrants {
+            id: "AKVL0001".into(),
+            grants: vec![grant("b_01", RO, Some("x/"))],
+            acting: None,
+        },
+    ] {
+        assert_eq!(
+            env.change(&mut fresh, "i", &req, &mut rng).await.unwrap(),
+            KeyAnswer::Busy
+        );
+    }
+    assert_eq!(w.head(), 2);
+    assert_eq!(
+        env.change(&mut fresh, "r", &revoke("AKVL0001"), &mut rng)
+            .await
+            .unwrap(),
+        KeyAnswer::Done { seq: 3 }
+    );
+    // A reader with both versions folds the whole chain.
+    let both = TwoKeys(
+        TenantKey::from_bytes(&w.t, 1, derived("tk")).unwrap(),
+        TenantKey::from_bytes(&w.t, 2, derived("tk v2")).unwrap(),
+    );
+    let read = read_key_chain(&w.store, &w.kek, &both, &w.t).await.unwrap();
+    assert_eq!(
+        read.table.get("AKVL0001").unwrap().door.status,
+        SubjectStatus::Revoked
+    );
+    let _ = &mut table;
 }

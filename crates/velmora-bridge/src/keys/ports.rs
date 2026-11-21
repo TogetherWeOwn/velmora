@@ -16,12 +16,23 @@ pub trait KeyTarget {
     fn label(&self) -> &str;
     /// The `keys_seq` this store holds.
     async fn keys_seq(&self) -> Result<u64>;
-    /// Moves the store to `to_seq`. `entries` holds every subject whose
-    /// newest record is above the store's `keys_seq`, and every subject
-    /// revoked by `m/rk/`, each with the status in force
-    /// ([`Entry::effective_status`]). One transaction; a store already
-    /// at or above `to_seq` changes nothing but the revocations (setting
-    /// `revoked` twice changes nothing).
+    /// The subjects this store holds `disabled` only because their
+    /// private part was closed when they were applied
+    /// ([`Entry::effective_status`]). They are sent again once the ring
+    /// opens them. The directory holds no private part and answers none.
+    async fn closed(&self) -> Result<Vec<String>>;
+    /// In one transaction:
+    /// - every entry whose status in force ([`Entry::effective_status`])
+    ///   is `disabled` or `revoked` is applied, whatever its seq: closing
+    ///   it again changes nothing;
+    /// - every other entry is applied only when its `last_seq` is above
+    ///   the store's `keys_seq`;
+    /// - the store's `keys_seq` becomes the larger of its own and
+    ///   `to_seq`.
+    ///
+    /// An entry applied from a closed private part is remembered as such
+    /// ([`Self::closed`]) until an entry with its private part replaces
+    /// it.
     async fn apply(&self, to_seq: u64, entries: &[Entry]) -> Result<()>;
 }
 
@@ -36,6 +47,9 @@ pub enum Refusal {
     Conflict,
     /// No such subject: `404`.
     NotFound,
+    /// The access key id is routed to another tenant already: draw a new
+    /// id and ask again.
+    IdTaken,
 }
 
 /// The answer of the root unit's reservation call.
@@ -97,6 +111,7 @@ pub trait ControlIntents {
         seq: u64,
         kind: &str,
     ) -> Result<()>;
-    /// Clears the row (step 5). Best effort.
+    /// Clears every row of `chain` of `tenant` at or below `seq` (step 5):
+    /// called once every store holds the chain to `seq`. Best effort.
     async fn clear(&self, tenant: &TenantId, chain: ControlChain, seq: u64) -> Result<()>;
 }

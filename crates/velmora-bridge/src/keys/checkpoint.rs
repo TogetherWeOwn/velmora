@@ -28,7 +28,8 @@ use velmora::rng::FillRandom;
 
 use super::chain::{parse_seq, seq_name, Chain, LIST_PAGE};
 use super::record::{
-    key_chain, open_key_record, Entry, KeyRecord, KeyTable, SubjectDoor, SubjectPrivate, TkRing,
+    key_chain, open_key_record, Entry, KeyRecord, KeyTable, SubjectDoor, SubjectPrivate,
+    SubjectStatus, TkRing,
 };
 use super::revocations::list_tenant_revocations;
 use super::store::RecordStore;
@@ -43,6 +44,11 @@ pub const CHECKPOINT_EVERY: u64 = 256;
 
 const CHECKPOINT_VERSION: u32 = 1;
 const ERR_CHECKPOINT: BridgeError = BridgeError::Invalid("key checkpoint is malformed");
+/// A checkpoint is not written while a subject that is not revoked has
+/// a private part the ring could not open: it would carry that subject
+/// closed to every later reader, also one that holds every key.
+pub const ERR_CHECKPOINT_CLOSED: BridgeError =
+    BridgeError::Invalid("key checkpoint would carry a closed subject");
 
 /// The directory of `tenant`'s checkpoints.
 pub fn checkpoint_prefix(tenant: &TenantId) -> String {
@@ -103,6 +109,12 @@ pub fn seal_checkpoint<K: Kek, T: TkRing, R: FillRandom>(
     rng: &mut R,
 ) -> Result<Vec<u8>> {
     let tenant = table.tenant();
+    let closed = table
+        .entries()
+        .any(|e| e.private.is_none() && e.door.status != SubjectStatus::Revoked);
+    if closed {
+        return Err(ERR_CHECKPOINT_CLOSED);
+    }
     let tk = ring
         .current()
         .ok_or(BridgeError::Crypto("tenant key unavailable"))?;
@@ -178,11 +190,13 @@ pub fn open_checkpoint<K: Kek, T: TkRing>(
     if private.v != CHECKPOINT_VERSION {
         return None;
     }
-    let mut privates: BTreeMap<String, SubjectPrivate> = private
-        .subjects
-        .into_iter()
-        .map(|p| (p.id, p.private))
-        .collect();
+    let mut privates: BTreeMap<String, SubjectPrivate> = BTreeMap::new();
+    for p in private.subjects {
+        // An id twice: not a checkpoint this code wrote.
+        if privates.insert(p.id, p.private).is_some() {
+            return None;
+        }
+    }
     let mut subjects = BTreeMap::new();
     for d in door.subjects {
         let private = match d.open {
@@ -192,6 +206,8 @@ pub fn open_checkpoint<K: Kek, T: TkRing>(
         if d.last_seq == 0 || d.last_seq > seq || subjects.contains_key(&d.door.id) {
             return None;
         }
+        // The same rules as a record: grants aligned, ids, the secret.
+        super::record::check_entry(tenant, &d.door, private.as_ref()).ok()?;
         subjects.insert(
             d.door.id.clone(),
             Entry {
@@ -255,19 +271,31 @@ impl KeyRead {
             .collect()
     }
 
-    /// The table with every `m/rk/` revocation in force: what a store
-    /// applies.
-    pub fn in_force(&self) -> KeyTable {
-        let mut table = self.table.clone();
-        for id in &self.revoked {
-            table.override_revoked(id);
-        }
-        table
+    /// Every entry with the `m/rk/` revocations in force: what a store
+    /// applies. A view, not a table: no change is ever validated against
+    /// it.
+    pub fn in_force(&self) -> Vec<Entry> {
+        self.table
+            .entries()
+            .map(|e| {
+                let mut e = e.clone();
+                if self.revoked.contains(&e.door.id) {
+                    e.door.status = SubjectStatus::Revoked;
+                }
+                e
+            })
+            .collect()
     }
 }
 
 /// Reads `tenant`'s key chain to its head: from the newest checkpoint
 /// that holds, then every record after it, then the revocations.
+///
+/// A checkpoint is skipped, for the next older one and at last for seq
+/// 1, when it does not verify, does not name the chain's own record at
+/// its seq, does not open, or does not fold into the records after it.
+/// A subject that the checkpoint carries closed is opened again from its
+/// own record when the ring now holds its key.
 pub async fn read_key_chain<S: RecordStore, K: Kek, T: TkRing>(
     store: &S,
     kek: &K,
@@ -277,37 +305,86 @@ pub async fn read_key_chain<S: RecordStore, K: Kek, T: TkRing>(
     let chain = key_chain(tenant);
     let checkpoints = list_checkpoints(store, tenant).await?;
     let mut skipped = Vec::new();
-    let mut start: Option<KeyTable> = None;
-    for &seq in checkpoints.iter().rev() {
-        let (Some(bytes), Some(record)) = (
-            store.get(&checkpoint_name(tenant, seq)).await?,
-            store.get(&chain.name(seq)).await?,
-        ) else {
-            skipped.push(seq);
-            continue;
-        };
-        match open_checkpoint(kek, ring, tenant, seq, &bytes, &record) {
-            Some(table) => {
-                start = Some(table);
-                break;
+    // Candidates, newest first, then the start of the chain.
+    let mut candidates: Vec<Option<u64>> = checkpoints.iter().rev().map(|s| Some(*s)).collect();
+    candidates.push(None);
+    for candidate in candidates {
+        let mut table = match candidate {
+            None => KeyTable::empty(tenant.clone()),
+            Some(seq) => {
+                let (Some(bytes), Some(record)) = (
+                    store.get(&checkpoint_name(tenant, seq)).await?,
+                    store.get(&chain.name(seq)).await?,
+                ) else {
+                    skipped.push(seq);
+                    continue;
+                };
+                match open_checkpoint(kek, ring, tenant, seq, &bytes, &record) {
+                    Some(t) => t,
+                    None => {
+                        skipped.push(seq);
+                        continue;
+                    }
+                }
             }
-            None => skipped.push(seq),
+        };
+        reopen_closed(store, kek, ring, &chain, &mut table).await?;
+        match advance(store, kek, ring, &chain, &mut table).await {
+            Ok(_) => {
+                let revoked = list_tenant_revocations(store, tenant)
+                    .await?
+                    .into_iter()
+                    .collect();
+                return Ok(KeyRead {
+                    table,
+                    from_checkpoint: candidate,
+                    skipped_checkpoints: skipped,
+                    newest_checkpoint: checkpoints.last().copied(),
+                    revoked,
+                });
+            }
+            // A checkpoint that the records after it do not fold into is
+            // not one this code wrote: the next older one.
+            Err(e) if candidate.is_some() && is_record_error(&e) => {
+                skipped.push(candidate.unwrap_or_default());
+            }
+            Err(e) => return Err(e),
         }
     }
-    let from_checkpoint = start.as_ref().map(KeyTable::seq);
-    let mut table = start.unwrap_or_else(|| KeyTable::empty(tenant.clone()));
-    advance(store, kek, ring, &chain, &mut table).await?;
-    let revoked = list_tenant_revocations(store, tenant)
-        .await?
-        .into_iter()
+    Err(ERR_CHECKPOINT)
+}
+
+fn is_record_error(e: &BridgeError) -> bool {
+    matches!(e, BridgeError::Invalid(m) if *m == "key record is malformed")
+}
+
+/// Opens again, from its own record, every subject of `table` that is
+/// closed and not revoked, when the ring now holds its key.
+async fn reopen_closed<S: RecordStore, K: Kek, T: TkRing>(
+    store: &S,
+    kek: &K,
+    ring: &T,
+    chain: &Chain,
+    table: &mut KeyTable,
+) -> Result<()> {
+    let closed: Vec<(String, u64)> = table
+        .entries()
+        .filter(|e| e.private.is_none() && e.door.status != SubjectStatus::Revoked)
+        .filter(|e| ring.key(e.tk_version).is_some())
+        .map(|e| (e.door.id.clone(), e.last_seq))
         .collect();
-    Ok(KeyRead {
-        table,
-        from_checkpoint,
-        skipped_checkpoints: skipped,
-        newest_checkpoint: checkpoints.last().copied(),
-        revoked,
-    })
+    for (id, seq) in closed {
+        let bytes = chain.get(store, seq).await?;
+        // A record that does not open, or is another subject's, leaves
+        // the subject closed: the chain decides, not the checkpoint.
+        let Ok(record) = open_key_record(kek, ring, table.tenant(), seq, &bytes) else {
+            continue;
+        };
+        if let (true, Some(private)) = (record.door.id == id, record.private) {
+            table.reopen(&id, private);
+        }
+    }
+    Ok(())
 }
 
 /// Brings `table` to the head of its chain, record by record. Returns

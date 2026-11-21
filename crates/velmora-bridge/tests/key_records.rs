@@ -9,8 +9,8 @@ use velmora_bridge::keys::checkpoint::{
 };
 use velmora_bridge::keys::record::{
     grant_within, grants_narrow, key_chain, open_key_record, seal_key_record, Access, Entry, Grant,
-    KeyOp, KeyRecord, KeyTable, NoKeys, OneKey, Subject, SubjectDoor, SubjectKind, SubjectPrivate,
-    SubjectStatus,
+    KeyOp, KeyRecord, KeyTable, NoKeys, OneKey, PrivateGrant, Subject, SubjectDoor, SubjectKind,
+    SubjectPrivate, SubjectStatus,
 };
 use velmora_bridge::keys::revocations::{
     list_tenant_revocations, list_tenant_zero_revocations, put_tenant_revocation,
@@ -631,12 +631,122 @@ async fn unreadable_newest_record_stays_closed_through_a_checkpoint() {
     assert_eq!(entry.private, None);
     assert_eq!(entry.effective_status(), SubjectStatus::Disabled);
 
+    // No checkpoint carries a closed subject: it would stay closed for
+    // every later reader, one with every key included.
     let mut rng = TestRng::new("closed entry checkpoint");
-    let checkpoint = seal_checkpoint(&kek, &v1, &table, &newest, &mut rng).unwrap();
+    assert!(matches!(
+        seal_checkpoint(&kek, &v1, &table, &newest, &mut rng),
+        Err(BridgeError::Invalid(
+            "key checkpoint would carry a closed subject"
+        ))
+    ));
+    // A reader with both versions opens it.
+    struct Both(OneKey, OneKey);
+    impl velmora_bridge::keys::record::TkRing for Both {
+        fn current(&self) -> Option<&TenantKey> {
+            self.1.current()
+        }
+        fn key(&self, v: u32) -> Option<&TenantKey> {
+            self.0.key(v).or_else(|| self.1.key(v))
+        }
+    }
+    let both = Both(v1, v2);
+    let table = read_key_chain(&store, &kek, &both, &t).await.unwrap().table;
+    assert!(table.get(KEY).unwrap().private.is_some());
+    let checkpoint = seal_checkpoint(&kek, &both, &table, &newest, &mut rng).unwrap();
     assert_eq!(
-        open_checkpoint(&kek, &v1, &t, 4, &checkpoint, &newest),
+        open_checkpoint(&kek, &both, &t, 4, &checkpoint, &newest),
         Some(table)
     );
+}
+
+/// LOW 1 of the review: a stray name below something that is no tenant
+/// directory does not hide a tenant-0 revocation that sorts after it.
+#[tokio::test(flavor = "current_thread")]
+async fn a_stray_directory_does_not_hide_a_tenant_zero_revocation() {
+    let store = CountingBlobStore::default();
+    let bytes = vec![1];
+    let meta = BlobMeta {
+        bucket: &BucketId::mint([1; 8]),
+        extent: &ExtentId::mint([2; 13]),
+        cipher_sha256: &Sha256::digest(&bytes).into(),
+    };
+    for name in ["m/rk/AKID/x", "m/rk/AKID0", "m/rk/AKID00"] {
+        store.put(name, bytes.clone(), &meta).await.unwrap();
+    }
+    assert_eq!(collect_tenant_zero(&store, 1000).await, ["AKID0", "AKID00"]);
+    assert_eq!(collect_tenant_zero(&store, 1).await, ["AKID0", "AKID00"]);
+}
+
+/// LOW 2 of the review: a checkpoint whose private part names a subject
+/// twice, or whose grants do not line up with its door part, is skipped.
+#[tokio::test(flavor = "current_thread")]
+async fn a_checkpoint_with_duplicate_or_misaligned_subjects_is_skipped() {
+    use velmora_bridge::crypto::scheme2::{seal_control, ControlSealer};
+    let fixture = CheckpointFixture::new().await;
+    let t = &fixture.tenant;
+    let record = fixture.store.raw(&key_chain(t).name(512)).unwrap();
+    let sha: String = Sha256::digest(&record)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let entries: Vec<&Entry> = fixture.at_512.entries().collect();
+    let door = serde_json::json!({
+        "v": 1,
+        "tenant": t.as_str(),
+        "seq": 512,
+        "record_sha256": sha,
+        "subjects": entries.iter().map(|e| serde_json::json!({
+            "door": e.door, "last_seq": e.last_seq, "tk_version": e.tk_version, "open": true
+        })).collect::<Vec<_>>(),
+    });
+    let privates = |dup: bool, misalign: bool| {
+        let mut list: Vec<serde_json::Value> = entries
+            .iter()
+            .map(|e| {
+                let mut p = e.private.clone().unwrap();
+                if misalign && e.door.id == PRINCIPAL {
+                    p.grants.push(PrivateGrant {
+                        bucket_id: "b_99".into(),
+                        prefix: None,
+                        ip_list: vec![],
+                    });
+                }
+                serde_json::json!({ "id": e.door.id, "private": p })
+            })
+            .collect();
+        if dup {
+            list.push(list[0].clone());
+        }
+        serde_json::json!({ "v": 1, "subjects": list })
+    };
+    let name = checkpoint_name(t, 512);
+    for (dup, misalign) in [(false, false), (true, false), (false, true)] {
+        let sealed = seal_control(
+            &fixture.kek,
+            &name,
+            &ControlSealer::Managed(&fixture.ring.0),
+            &serde_json::to_vec(&door).unwrap(),
+            Some(&serde_json::to_vec(&privates(dup, misalign)).unwrap()),
+            &mut TestRng::new("crafted checkpoint"),
+        )
+        .unwrap();
+        fixture.store.plant(&name, sealed);
+        let read = read_key_chain(&fixture.store, &fixture.kek, &fixture.ring, t)
+            .await
+            .unwrap();
+        // The well-formed control case shows the crafting is right.
+        let expected = if dup || misalign {
+            Some(256)
+        } else {
+            Some(512)
+        };
+        assert_eq!(
+            read.from_checkpoint, expected,
+            "dup {dup} misalign {misalign}"
+        );
+        assert_eq!(read.table, fixture.table);
+    }
 }
 
 #[tokio::test(flavor = "current_thread")]
