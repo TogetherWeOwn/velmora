@@ -516,6 +516,16 @@ fn a_v2_record_of_another_tenant_is_refused_by_its_own_error() {
             open_record_v2(&key_b, &b, name_b, &bad).unwrap_err()
         ));
     }
+    // The header reader, which a reader calls first to learn the key
+    // version, gives the same alarm error for such an envelope.
+    let mut zero = sealed.clone();
+    zero[4..22].copy_from_slice(DEFAULT_TENANT.as_bytes());
+    assert!(tenant_error(record_v2_header(&zero).unwrap_err()));
+    let mut junk = sealed.clone();
+    junk[4..22].copy_from_slice(b"t_ZZZZZZZZZZZZZZZZ");
+    assert!(tenant_error(record_v2_header(&junk).unwrap_err()));
+    // A data record is never sealed at a bucket configuration name.
+    assert!(seal_record_v2(&key_a, "m/x/t_0000000000000001/b/b_01/1", b"x", &mut rng()).is_err());
     // A VMR2 record under tenant 0's prefix is never one of b's.
     assert!(tenant_error(
         open_record_v2(&key_b, &b, "m/x/t_0000000000000000/g_1", &sealed).unwrap_err()
