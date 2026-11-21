@@ -56,6 +56,16 @@ LOG = "record layout in the generated config: "
 REFUSED_READ_BACK = "the generated config does not carry the record layout that was asked for"
 REFUSED_TOML = "the generated config is not valid TOML with a prod [vars] table"
 
+# The segment writer: on when MAX_OBJECT_EXTENTS is above what one
+# recovery record holds.
+WRITER = "MAX_OBJECT_EXTENTS"
+SINGLE_RECORD_EXTENTS = 10000
+REFUSED_WRITER = (
+    f"the generated config sets MAX_OBJECT_EXTENTS above {SINGLE_RECORD_EXTENTS} "
+    "(segmented records) while the record layout is flat"
+)
+BRIDGE_SRC = os.path.join(_ROOT, "crates", "velmora-bridge", "src")
+
 
 def read(path):
     with open(path, encoding="utf-8", newline="") as f:
@@ -440,6 +450,84 @@ class RecordLayoutTest(GeneratorCase):
             self.assertNotEqual(text, self.ci, name)
             with self.assertRaises(AssertionError, msg=name):
                 Step(text)
+
+
+class SegmentWriterTest(GeneratorCase):
+    """The record layout against the segment writer: a config that lets
+    an object have more extents than one record holds is generated only
+    with the tenant layout."""
+
+    ANCHOR = 'VERIFY_MODE = "body"'
+
+    def with_extents(self, value_toml):
+        return add_after(self.shipped, self.ANCHOR, f"{WRITER} = {value_toml}")
+
+    def test_the_shipped_file_leaves_the_writer_off(self):
+        doc = tomllib.loads(self.shipped)
+        self.assertNotIn(WRITER, doc["vars"])
+
+    def test_the_number_is_the_one_of_the_bridge(self):
+        found = []
+        for name in sorted(os.listdir(BRIDGE_SRC)):
+            if name.endswith(".rs"):
+                found += re.findall(
+                    r"^pub const SINGLE_RECORD_EXTENTS: u32 = ([0-9_]+);$",
+                    read(os.path.join(BRIDGE_SRC, name)), re.M)
+        self.assertEqual([int(n.replace("_", "")) for n in found], [SINGLE_RECORD_EXTENTS])
+        self.assertIn(f"single = {SINGLE_RECORD_EXTENTS}\n", self.step.script)
+
+    def test_the_writer_on_is_refused_with_the_flat_layout(self):
+        for value in (
+            '"10001"', '"131072"', '" 10001 "', '"99999"', '"100000"', '"18446744073709551615"',
+            # Not a plain number: the Worker reads some of these as a
+            # number, the generator takes every one as on.
+            '"+10001"', '"+1"', '"10k"', '"0x2711"', '"1e5"', '"١٠٠٠١"', '"on"', '"-1"',
+            # Not a string at all.
+            "10001", "20000", "1", "true", '["10001"]',
+        ):
+            doctored = self.with_extents(value)
+            for older in (OLDER[0], OLDER[-1]):
+                for layout in NOT_ASKED:
+                    self.refused({**older, SWITCH: layout}, REFUSED_WRITER, doctored)
+
+    def test_the_writer_on_is_generated_with_the_tenant_layout(self):
+        for value in ('"10001"', '"131072"', '" 10001 "'):
+            doctored = self.with_extents(value)
+            out, written = self.ok({SWITCH: "tenant"}, doctored)
+            doc = tomllib.loads(written.decode("utf-8"))
+            self.assertEqual(doc["vars"]["RECORD_LAYOUT"], "tenant", value)
+            self.assertEqual(doc["vars"][WRITER], tomllib.loads(f"v = {value}")["v"], value)
+            self.assertEqual(out.splitlines()[-1], LOG + "tenant", value)
+
+    def test_the_writer_off_is_generated_with_either_layout(self):
+        for value in ('"10000"', '"1"', '"0"', '" 10000 "', '"09999"', '""', '"  "'):
+            doctored = self.with_extents(value)
+            _, plain = self.ok({SWITCH: "tenant"}, self.shipped)
+            for layout in (*NOT_ASKED, "tenant"):
+                _, written = self.ok({SWITCH: layout}, doctored)
+                doc = tomllib.loads(written.decode("utf-8"))
+                self.assertEqual(doc["vars"][WRITER], tomllib.loads(f"v = {value}")["v"], value)
+                self.assertEqual(doc["vars"].get("RECORD_LAYOUT"),
+                                 "tenant" if layout == "tenant" else None, value)
+
+    def test_a_writer_line_the_eye_does_not_see_is_still_read(self):
+        # A quoted key, and a key set in a later line of the prod [vars]
+        # table: the check reads the document, not the lines.
+        for line in (f'"{WRITER}" = "10001"', f"'{WRITER}' = \"131072\""):
+            doctored = add_after(self.shipped, self.ANCHOR, line)
+            self.refused({SWITCH: "flat"}, REFUSED_WRITER, doctored)
+            self.ok({SWITCH: "tenant"}, doctored)
+
+    def test_another_environment_does_not_count(self):
+        # The writer on in [env.dev] only: the prod table decides.
+        lines = self.shipped.split("\n")
+        at = [i for i, line in enumerate(lines) if line.startswith("vars = {") and i > prod_end(lines) - 1]
+        self.assertEqual(len(at), 1)
+        lines[at[0]] = lines[at[0]].replace("vars = { ", f'vars = {{ {WRITER} = "131072", ', 1)
+        doctored = "\n".join(lines)
+        self.assertEqual(tomllib.loads(doctored)["env"]["dev"]["vars"][WRITER], "131072")
+        for layout in (*NOT_ASKED, "tenant"):
+            self.ok({SWITCH: layout}, doctored)
 
 
 class OlderSwitchesTest(GeneratorCase):

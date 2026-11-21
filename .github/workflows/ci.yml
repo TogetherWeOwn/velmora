@@ -767,6 +767,15 @@ jobs:
       # the Worker has no secret named RECORD_LAYOUT: the Worker reads
       # a secret where the variable is absent, and a deploy keeps
       # secrets. This job cannot see secrets; no such secret may exist.
+      # The layout is also held against the segment writer: a prod
+      # [vars] table whose MAX_OBJECT_EXTENTS is above 10000 (an object
+      # of more extents has its recovery record written in segments)
+      # is refused unless the layout is "tenant", so no deploy of this
+      # job writes a segment under a flat name, and "flat" cannot be
+      # set again while the writer is on. A value that is not a plain
+      # number is refused the same way. With the writer off, set "flat"
+      # only when no segmented upload is open: this job cannot see the
+      # catalogue. The same holds for a secret of that name.
       # Set "tenant" only in a deploy after the one that brought this
       # switch, and read "Record layout" and "Rollback floor" in
       # workers/s3-bridge/ops/README.md first. The test of this step is
@@ -870,11 +879,25 @@ jobs:
           # written, before the file exists: a refusal leaves no file.
           # No RECORD_LAYOUT at all is "flat" to the Worker.
           try:
-              found = tomllib.loads(text)["vars"].get("RECORD_LAYOUT")
+              prod_vars = tomllib.loads(text)["vars"]
+              found = prod_vars.get("RECORD_LAYOUT")
+              extents = prod_vars.get("MAX_OBJECT_EXTENTS")
           except (tomllib.TOMLDecodeError, KeyError, AttributeError):
               sys.exit("the generated config is not valid TOML with a prod [vars] table")
           if found != ("tenant" if layout == "tenant" else None):
               sys.exit("the generated config does not carry the record layout that was asked for")
+          # The segment writer is on when one object may have more
+          # extents than one record holds. Its records must not get
+          # flat names. Absent or empty is the Worker's default, which
+          # is off; any other value that is not a plain number up to
+          # that count is taken as on.
+          single = 10000
+          word = extents.strip() if isinstance(extents, str) else None
+          writer_off = extents is None or word == "" or (
+              word is not None and re.fullmatch(r"[0-9]{1,5}", word) is not None
+              and int(word) <= single)
+          if layout != "tenant" and not writer_off:
+              sys.exit(f"the generated config sets MAX_OBJECT_EXTENTS above {single} (segmented records) while the record layout is flat")
           with open(dst, "w", encoding="utf-8") as f:
               f.write(text)
           print(f"wrangler.deploy.toml: prod placeholders substituted, prod [build] removed, recovery copy {copy}, verify mode {mode}")

@@ -411,6 +411,15 @@ each side while it holds records of the last hour, so a pass in the
 hour after the setting changed, with fresh records in both layouts, can
 cost 8 and 8.
 
+The deploy job holds one rule between the layout and segments. A
+generation record above 10,000 extents is a segmented one, so a prod
+`MAX_OBJECT_EXTENTS` above 10,000 means segments can be written. With
+that in the generated config and the layout `flat` (or
+`VELMORA_RECORD_LAYOUT` unset), the step "Generate the production
+wrangler config" fails and nothing is deployed: no segment is written
+under a flat name. A value that is not a plain number
+counts as above. `tenant` with any value passes.
+
 ## The rollback stamp
 
 It finds a catalogue that was brought back to an earlier point without
