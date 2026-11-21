@@ -390,6 +390,9 @@ pub struct TenantDoor {
     pub units: Vec<u32>,
     #[serde(default)]
     pub placements: Vec<Placement>,
+    /// Every bucket id this tenant dropped: an id is never placed again.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dropped_buckets: Vec<String>,
     /// The highest move epoch any placement ever had. A bucket that is
     /// placed anew or moves takes an epoch above it, so an epoch never
     /// comes back, also for a placement that was dropped and added again.
@@ -548,6 +551,7 @@ mod tests {
             units: vec![0],
             placements: vec![],
             max_move_epoch: 0,
+            dropped_buckets: vec![],
             bucket_created: None,
             tk_version: 1,
             key_checks: BTreeMap::from([(1, "00".repeat(16))]),

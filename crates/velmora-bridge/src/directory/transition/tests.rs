@@ -33,8 +33,23 @@ fn create() -> Change {
     }
 }
 
-fn step(head: Option<&TenantRecord>, change: Change, actor: Actor) -> Result<Outcome, Refusal> {
+/// A `base_seq` that `step` fills with the head's seq: most tests are
+/// not about a stale base.
+const ANY: u64 = u64::MAX;
+
+fn step(head: Option<&TenantRecord>, mut change: Change, actor: Actor) -> Result<Outcome, Refusal> {
     let tenant = head.map(|h| h.door.tenant.clone()).unwrap_or_else(t1);
+    if let (
+        Some(h),
+        Change::SetLimits { base_seq, .. }
+        | Change::SetFeatures { base_seq, .. }
+        | Change::SetUnits { base_seq, .. },
+    ) = (head, &mut change)
+    {
+        if *base_seq == ANY {
+            *base_seq = h.door.seq;
+        }
+    }
     next(&tenant, head, &change, actor, NOW)
 }
 
@@ -202,6 +217,7 @@ fn tenant_zero_has_its_own_first_record() {
         refused(
             &z,
             Change::SetUnits {
+                base_seq: ANY,
                 units: vec![0],
                 placements: vec![]
             },
@@ -624,6 +640,7 @@ fn restoring_is_idempotent_extendable_and_lifted_by_its_own_entry() {
     let two = apply(
         &a,
         Change::SetUnits {
+            base_seq: ANY,
             units: vec![0, 1],
             placements: vec![Placement {
                 bucket: "b_1".into(),
@@ -716,6 +733,7 @@ fn what_restoring_allows_and_refuses() {
     let r = apply(
         &r,
         Change::SetLimits {
+            base_seq: ANY,
             limits: BTreeMap::new(),
             rate_json: None,
         },
@@ -726,6 +744,7 @@ fn what_restoring_allows_and_refuses() {
         refused(
             &r,
             Change::SetUnits {
+                base_seq: ANY,
                 units: vec![0, 1],
                 placements: vec![]
             },
@@ -860,7 +879,11 @@ fn shredding_admits_only_shredded_and_shredded_admits_nothing() {
 #[test]
 fn units_and_placements_are_checked() {
     let a = active();
-    let set = |units: Vec<u32>, placements: Vec<Placement>| Change::SetUnits { units, placements };
+    let set = |units: Vec<u32>, placements: Vec<Placement>| Change::SetUnits {
+        base_seq: ANY,
+        units,
+        placements,
+    };
     let p = |bucket: &str, unit| Placement {
         bucket: bucket.into(),
         unit,
@@ -901,6 +924,7 @@ fn limits_and_features() {
     unchanged(
         &a,
         Change::SetLimits {
+            base_seq: ANY,
             limits: limits.clone(),
             rate_json: None,
         },
@@ -911,6 +935,7 @@ fn limits_and_features() {
     let r = apply(
         &a,
         Change::SetLimits {
+            base_seq: ANY,
             limits: limits.clone(),
             rate_json: Some(rate.clone()),
         },
@@ -921,6 +946,7 @@ fn limits_and_features() {
         refused(
             &a,
             Change::SetLimits {
+                base_seq: ANY,
                 limits: BTreeMap::new(),
                 rate_json: None
             },
@@ -937,6 +963,7 @@ fn limits_and_features() {
     apply(
         &d,
         Change::SetLimits {
+            base_seq: ANY,
             limits: BTreeMap::new(),
             rate_json: None,
         },
@@ -948,6 +975,7 @@ fn limits_and_features() {
         refused(
             &d,
             Change::SetFeatures {
+                base_seq: ANY,
                 features_json: f.clone()
             },
             Actor::Operator
@@ -957,6 +985,7 @@ fn limits_and_features() {
     let on = apply(
         &a,
         Change::SetFeatures {
+            base_seq: ANY,
             features_json: f.clone(),
         },
         Actor::Customer,
@@ -1010,6 +1039,7 @@ fn closing_and_opening_order() {
     let lower = apply(
         &a,
         Change::SetLimits {
+            base_seq: ANY,
             limits: BTreeMap::from([("storage_bytes".to_string(), 10)]),
             rate_json: None,
         },
@@ -1019,6 +1049,7 @@ fn closing_and_opening_order() {
     let raise = apply(
         &lower,
         Change::SetLimits {
+            base_seq: ANY,
             limits: BTreeMap::from([("storage_bytes".to_string(), 10_000)]),
             rate_json: None,
         },
@@ -1029,6 +1060,7 @@ fn closing_and_opening_order() {
     let added = apply(
         &a,
         Change::SetLimits {
+            base_seq: ANY,
             limits: BTreeMap::from([
                 ("storage_bytes".to_string(), 1_000),
                 ("upload_24h_bytes".to_string(), 5),
@@ -1198,6 +1230,7 @@ fn a_bucket_moves_only_to_the_next_epoch() {
         epoch,
     };
     let set = |placements| Change::SetUnits {
+        base_seq: ANY,
         units: vec![0, 1],
         placements,
     };
@@ -1218,14 +1251,76 @@ fn a_bucket_moves_only_to_the_next_epoch() {
     let moved = apply(&at1, set(vec![p(1, 2)]), Actor::Operator);
     assert_eq!(moved.door.placements, vec![p(1, 2)]);
     assert_eq!(moved.door.max_move_epoch, 2);
-    // Dropped and placed again, it takes the epoch above every one before.
+    // Dropped, the id never comes back; the next bucket takes the epoch
+    // above every one before.
     let dropped = apply(&moved, set(vec![]), Actor::Operator);
     assert_eq!(dropped.door.max_move_epoch, 2);
+    assert_eq!(dropped.door.dropped_buckets, ["b"]);
     assert_eq!(
         refused(&dropped, set(vec![p(1, 2)]), Actor::Operator),
         INVALID
     );
-    apply(&dropped, set(vec![p(1, 3)]), Actor::Operator);
+    assert_eq!(
+        refused(&dropped, set(vec![p(1, 3)]), Actor::Operator),
+        BUCKET_EXISTS
+    );
+    let other = Placement {
+        bucket: "c".into(),
+        unit: 1,
+        epoch: 3,
+    };
+    let placed = apply(&dropped, set(vec![other.clone()]), Actor::Operator);
+    assert_eq!(placed.door.placements, vec![other]);
+}
+
+/// A change that replaces a whole field names the head it was built from:
+/// against a newer head it is refused, so it never undoes a change it did
+/// not see.
+#[test]
+fn a_whole_field_change_on_a_stale_base_is_refused() {
+    let a = active();
+    let stale = a.door.seq - 1;
+    let changes = [
+        (
+            Change::SetLimits {
+                base_seq: stale,
+                limits: BTreeMap::new(),
+                rate_json: None,
+            },
+            Actor::Billing,
+        ),
+        (
+            Change::SetFeatures {
+                base_seq: stale,
+                features_json: Default::default(),
+            },
+            Actor::Operator,
+        ),
+        (
+            Change::SetUnits {
+                base_seq: stale,
+                units: a.door.units.clone(),
+                placements: a.door.placements.clone(),
+            },
+            Actor::Operator,
+        ),
+    ];
+    for (change, actor) in changes {
+        // Refused even where the change would be a no-op on this head.
+        assert_eq!(refused(&a, change, actor), STALE_BASE);
+    }
+    // A base newer than the head is refused too.
+    assert_eq!(
+        refused(
+            &a,
+            Change::SetFeatures {
+                base_seq: a.door.seq + 1,
+                features_json: Default::default(),
+            },
+            Actor::Operator
+        ),
+        STALE_BASE
+    );
 }
 
 #[test]
@@ -1292,6 +1387,7 @@ fn a_flag_or_selector_change_is_closing() {
     let with = apply(
         &a,
         Change::SetFeatures {
+            base_seq: ANY,
             features_json: on.clone(),
         },
         Actor::Operator,
@@ -1300,7 +1396,10 @@ fn a_flag_or_selector_change_is_closing() {
     off.insert("webdav".into(), serde_json::json!(false));
     let without = apply(
         &with,
-        Change::SetFeatures { features_json: off },
+        Change::SetFeatures {
+            base_seq: ANY,
+            features_json: off,
+        },
         Actor::Operator,
     );
     assert_eq!(
@@ -1707,9 +1806,15 @@ fn a_bucket_create_names_its_creator_in_its_own_record_only() {
         },
         Actor::Customer,
     );
-    // A bucket made again takes a newer epoch.
-    let again = apply(&dropped, create("b_1", 0), Actor::Operator);
+    // A dropped id is never made again, also not by the operator; a new
+    // bucket takes a newer epoch.
+    assert_eq!(dropped.door.dropped_buckets, ["b_1"]);
+    for actor in [Actor::Customer, Actor::Operator] {
+        assert_eq!(refused(&dropped, create("b_1", 0), actor), BUCKET_EXISTS);
+    }
+    let again = apply(&dropped, create("b_2", 0), Actor::Operator);
     assert_eq!(again.door.placements[0].epoch, 2);
+    assert_eq!(again.door.dropped_buckets, ["b_1"]);
     // Tenant 0 lists no unit: no bucket is placed for it.
     assert_eq!(
         refused(&tenant_zero(), create("b_1", 0), Actor::Operator),
@@ -1985,6 +2090,7 @@ fn a_flag_is_turned_off_but_never_on_while_restoring() {
     let with = apply(
         &a,
         Change::SetFeatures {
+            base_seq: ANY,
             features_json: on.clone(),
         },
         Actor::Operator,
@@ -1995,6 +2101,7 @@ fn a_flag_is_turned_off_but_never_on_while_restoring() {
     let turned_off = apply(
         &r,
         Change::SetFeatures {
+            base_seq: ANY,
             features_json: off.clone(),
         },
         Actor::Operator,
@@ -2003,6 +2110,7 @@ fn a_flag_is_turned_off_but_never_on_while_restoring() {
     apply(
         &r,
         Change::SetFeatures {
+            base_seq: ANY,
             features_json: serde_json::Map::new(),
         },
         Actor::Operator,
@@ -2011,6 +2119,7 @@ fn a_flag_is_turned_off_but_never_on_while_restoring() {
         refused(
             &turned_off,
             Change::SetFeatures {
+                base_seq: ANY,
                 features_json: on.clone()
             },
             Actor::Operator
@@ -2023,6 +2132,7 @@ fn a_flag_is_turned_off_but_never_on_while_restoring() {
         refused(
             &turned_off,
             Change::SetFeatures {
+                base_seq: ANY,
                 features_json: other
             },
             Actor::Operator
@@ -2041,7 +2151,10 @@ fn a_flag_is_turned_off_but_never_on_while_restoring() {
     );
     apply(
         &lifted,
-        Change::SetFeatures { features_json: on },
+        Change::SetFeatures {
+            base_seq: ANY,
+            features_json: on,
+        },
         Actor::Operator,
     );
 }

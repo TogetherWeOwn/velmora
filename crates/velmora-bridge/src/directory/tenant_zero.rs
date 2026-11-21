@@ -153,9 +153,18 @@ pub fn decide(head: &TenantDoor, db: &DatabaseFacts, seen: &mut Seen) -> ZeroSer
             ZeroServe::Moved
         }
         Selector::Moving => {
+            // The frozen catalogue, carrying this window's marker (it is
+            // written before the window's record): nothing else serves.
             let frozen = z.moved.as_ref().map(|m| m.catalogue_id_frozen.as_str());
+            let window = i64::try_from(z.flips).ok().and_then(|f| f.checked_add(1));
             match (frozen, db.catalogue_id.as_deref()) {
-                (Some(frozen), Some(bound)) if frozen == bound => ZeroServe::ServeReadOnly,
+                (Some(frozen), Some(bound)) if frozen == bound => {
+                    if window.is_some() && db.marker == window {
+                        ZeroServe::ServeReadOnly
+                    } else {
+                        unavailable("database_left_behind")
+                    }
+                }
                 _ => unavailable("database_is_not_the_frozen_one"),
             }
         }

@@ -143,16 +143,24 @@ pub enum Change {
     /// Replace the limits, and the rate class when `Some`. The floor of a
     /// limit set by the billing token (the free allowance) is a registry
     /// value, checked by the management entrypoint with the registry.
+    ///
+    /// This and the next two replace a whole field, so each names the seq
+    /// of the head it was built from (`base_seq`): against any other head
+    /// it is refused (`stale_base`), and the caller builds it again. A
+    /// lost race never writes an older field over a newer one.
     SetLimits {
+        base_seq: u64,
         limits: BTreeMap<String, u64>,
         rate_json: Option<serde_json::Map<String, serde_json::Value>>,
     },
     /// Replace the feature flags.
     SetFeatures {
+        base_seq: u64,
         features_json: serde_json::Map<String, serde_json::Value>,
     },
     /// Replace the unit list and the bucket placements.
     SetUnits {
+        base_seq: u64,
         units: Vec<u32>,
         placements: Vec<Placement>,
     },
@@ -261,6 +269,7 @@ const RETIRED: Refusal = refuse(409, "tenant_zero_retired");
 const SELECTOR: Refusal = refuse(409, "selector_does_not_allow");
 const NOT_TENANT_ZERO: Refusal = refuse(409, "not_tenant_zero");
 const BUCKET_EXISTS: Refusal = refuse(409, "bucket_exists");
+const STALE_BASE: Refusal = refuse(409, "stale_base");
 
 /// Validates `change` against `head` and builds the record that follows.
 /// See the [module](self).
@@ -489,10 +498,17 @@ pub fn next(
             door.deletion = None;
         }
 
-        Change::SetLimits { limits, rate_json } => {
+        Change::SetLimits {
+            base_seq,
+            limits,
+            rate_json,
+        } => {
             live(h)?;
             if actor.class().is_none() {
                 return Err(FORBIDDEN);
+            }
+            if h.seq != *base_seq {
+                return Err(STALE_BASE);
             }
             let rate = rate_json.as_ref().unwrap_or(&h.rate_json);
             if *limits == h.limits && *rate == h.rate_json {
@@ -502,13 +518,19 @@ pub fn next(
             door.rate_json = rate.clone();
         }
 
-        Change::SetFeatures { features_json } => {
+        Change::SetFeatures {
+            base_seq,
+            features_json,
+        } => {
             live(h)?;
             if h.deletion.is_some() {
                 return Err(WRONG_STATE);
             }
             if actor.class().is_none() {
                 return Err(FORBIDDEN);
+            }
+            if h.seq != *base_seq {
+                return Err(STALE_BASE);
             }
             if *features_json == h.features_json {
                 return Ok(Outcome::Unchanged);
@@ -521,10 +543,17 @@ pub fn next(
             door.features_json = features_json.clone();
         }
 
-        Change::SetUnits { units, placements } => {
+        Change::SetUnits {
+            base_seq,
+            units,
+            placements,
+        } => {
             live(h)?;
             if actor != Actor::Operator {
                 return Err(FORBIDDEN);
+            }
+            if h.seq != *base_seq {
+                return Err(STALE_BASE);
             }
             if tenant.is_zero() {
                 return Err(TENANT_ZERO);
@@ -540,11 +569,25 @@ pub fn next(
             {
                 return Err(INVALID);
             }
+            // A bucket id that was dropped never comes back.
+            if placements
+                .iter()
+                .any(|p| h.dropped_buckets.contains(&p.bucket))
+            {
+                return Err(BUCKET_EXISTS);
+            }
+            let dropped: Vec<String> = h
+                .placements
+                .iter()
+                .filter(|old| !placements.iter().any(|p| p.bucket == old.bucket))
+                .map(|old| old.bucket.clone())
+                .collect();
             if *units == h.units && *placements == h.placements {
                 return Ok(Outcome::Unchanged);
             }
             door.units = units.clone();
             door.placements = placements.clone();
+            door.dropped_buckets.extend(dropped);
             door.max_move_epoch = placements
                 .iter()
                 .map(|p| p.epoch)
@@ -604,7 +647,10 @@ pub fn next(
             if !h.units.contains(unit) {
                 return Err(UNIT_NOT_LISTED);
             }
-            if h.placements.iter().any(|p| p.bucket == *bucket) {
+            // An id is never reused, also not one that was dropped.
+            if h.placements.iter().any(|p| p.bucket == *bucket)
+                || h.dropped_buckets.contains(bucket)
+            {
                 return Err(BUCKET_EXISTS);
             }
             let epoch = h.max_move_epoch.checked_add(1).ok_or(INVALID)?;
@@ -640,6 +686,7 @@ pub fn next(
                 return Ok(Outcome::Unchanged);
             }
             door.placements.retain(|p| p.bucket != *bucket);
+            door.dropped_buckets.push(bucket.clone());
         }
 
         Change::SetEscrowOffline => {
@@ -904,6 +951,7 @@ fn first(
         units: vec![],
         placements: vec![],
         max_move_epoch: 0,
+        dropped_buckets: vec![],
         bucket_created: None,
         tk_version: 0,
         key_checks: BTreeMap::new(),
@@ -1086,6 +1134,7 @@ fn shredded_stub(h: &TenantDoor) -> TenantDoor {
         units: vec![],
         placements: vec![],
         max_move_epoch: h.max_move_epoch,
+        dropped_buckets: vec![],
         bucket_created: None,
         tk_version: h.tk_version,
         key_checks: BTreeMap::new(),

@@ -94,8 +94,9 @@ async fn head(chain: &Chain<'_>, tenant: &TenantId) -> TenantDoor {
     chain.head(tenant, 0).await.unwrap().unwrap().door
 }
 
-fn two_units() -> Change {
+fn two_units(base_seq: u64) -> Change {
     Change::SetUnits {
+        base_seq,
         units: vec![0, 1],
         placements: vec![Placement {
             bucket: "b_1".into(),
@@ -143,7 +144,7 @@ async fn populate_directory(chain: &Chain<'_>, dir: &Directory<'_>) -> [TenantId
     active(chain, &a).await;
     billing_hold(chain, &a, Some(HoldMode::ReadOnly), 4).await;
     active(chain, &b).await;
-    let expanded = write(chain, &b, two_units(), Actor::Operator, NOW, 4).await;
+    let expanded = write(chain, &b, two_units(4), Actor::Operator, NOW, 4).await;
     write(
         chain,
         &b,
@@ -250,7 +251,7 @@ fn unit_rows_follow_the_head() {
             unit: 1,
             restoring_since: None,
         };
-        let expanded = write(&chain, &t, two_units(), Actor::Operator, NOW, 4).await;
+        let expanded = write(&chain, &t, two_units(4), Actor::Operator, NOW, 4).await;
         assert_eq!(
             dir.apply_tenant(&expanded, NOW).await.unwrap(),
             Applied::Applied
@@ -302,6 +303,7 @@ fn unit_rows_follow_the_head() {
             &chain,
             &t,
             Change::SetUnits {
+                base_seq: lifted.seq,
                 units: vec![0],
                 placements: vec![],
             },
@@ -990,14 +992,14 @@ fn a_route_needs_a_tenant_that_is_not_shredded() {
         let db = database();
         let dir = SqlDirectory { sql: &db };
         let route = KeyRoute {
-            akid: "AKIA2".into(),
+            akid: "APVL2".into(),
             tenant: TenantId::parse(A1).unwrap(),
             kind: RouteKind::AppPassword,
             owner_ref: None,
             created_at: NOW,
         };
         assert_eq!(dir.put_route(&route).await.unwrap(), RoutePut::NoTenant);
-        assert_eq!(dir.route("AKIA2").await.unwrap(), None);
+        assert_eq!(dir.route("APVL2").await.unwrap(), None);
         let chain = TenantChain {
             store: &MemRecords::new(),
             seal: &PlainSeal::new(),
@@ -1010,7 +1012,7 @@ fn a_route_needs_a_tenant_that_is_not_shredded() {
         door.seq += 1;
         door.lifecycle = Lifecycle::Shredded;
         dir.apply_tenant(&door, NOW).await.unwrap();
-        assert_eq!(dir.route("AKIA2").await.unwrap(), None);
+        assert_eq!(dir.route("APVL2").await.unwrap(), None);
         assert_eq!(dir.put_route(&route).await.unwrap(), RoutePut::NoTenant);
     });
 }
@@ -1250,8 +1252,8 @@ fn pending_operations_are_emptied_only_by_the_run_that_holds_the_gate() {
     });
 }
 
-/// The move and its undo move a route from one tenant to the other, and
-/// only from the tenant it names.
+/// The move and its undo move a route between tenant 0 and another
+/// tenant, only from the tenant it names, and the kind stays.
 #[test]
 fn a_route_moves_only_from_the_tenant_it_names() {
     block_on(async {
@@ -1263,44 +1265,71 @@ fn a_route_moves_only_from_the_tenant_it_names() {
         };
         let zero = TenantId::zero();
         let owner = TenantId::parse(A1).unwrap();
+        let other = TenantId::parse(B2).unwrap();
         create_zero(&chain, &zero).await;
         active(&chain, &owner).await;
-        for t in [&zero, &owner] {
+        active(&chain, &other).await;
+        for t in [&zero, &owner, &other] {
             dir.apply_tenant(&head(&chain, t).await, NOW).await.unwrap();
         }
         let route = KeyRoute {
-            akid: "AKIA3".into(),
+            akid: "APVL3".into(),
             tenant: zero.clone(),
-            kind: RouteKind::S3,
+            kind: RouteKind::AppPassword,
             owner_ref: None,
             created_at: NOW,
         };
         assert_eq!(dir.put_route(&route).await.unwrap(), RoutePut::Inserted);
-        let other = TenantId::parse(B2).unwrap();
-        assert!(!dir
-            .move_route("AKIA3", &other, &owner, RouteKind::S3)
-            .await
-            .unwrap());
-        assert!(dir
-            .move_route("AKIA3", &zero, &owner, RouteKind::AppPassword)
-            .await
-            .unwrap());
-        let moved = dir.route("AKIA3").await.unwrap().unwrap();
+        assert!(!dir.move_route("APVL3", &other, &owner).await.unwrap());
+        assert!(dir.move_route("APVL3", &zero, &owner).await.unwrap());
+        let moved = dir.route("APVL3").await.unwrap().unwrap();
         assert_eq!(
             (moved.tenant, moved.kind),
             (owner.clone(), RouteKind::AppPassword)
         );
         // Again from tenant 0: it no longer names it.
-        assert!(!dir
-            .move_route("AKIA3", &zero, &owner, RouteKind::S3)
-            .await
-            .unwrap());
+        assert!(!dir.move_route("APVL3", &zero, &owner).await.unwrap());
+        // Between two tenants neither of which is tenant 0: no move.
+        assert!(!dir.move_route("APVL3", &owner, &other).await.unwrap());
+        assert_eq!(dir.route("APVL3").await.unwrap().unwrap().tenant, owner);
         // The undo moves it back.
-        assert!(dir
-            .move_route("AKIA3", &owner, &zero, RouteKind::S3)
+        assert!(dir.move_route("APVL3", &owner, &zero).await.unwrap());
+        let back = dir.route("APVL3").await.unwrap().unwrap();
+        assert_eq!((back.tenant, back.kind), (zero, RouteKind::AppPassword));
+    });
+}
+
+/// The id prefix fixes the kind: an `APVL` id is an app password, and an
+/// app password has an `APVL` id.
+#[test]
+fn a_route_kind_must_fit_its_id() {
+    block_on(async {
+        let db = database();
+        let dir = SqlDirectory { sql: &db };
+        let chain = TenantChain {
+            store: &MemRecords::new(),
+            seal: &PlainSeal::new(),
+        };
+        let owner = TenantId::parse(A1).unwrap();
+        active(&chain, &owner).await;
+        dir.apply_tenant(&head(&chain, &owner).await, NOW)
             .await
-            .unwrap());
-        assert_eq!(dir.route("AKIA3").await.unwrap().unwrap().tenant, zero);
+            .unwrap();
+        for (akid, kind) in [
+            ("AKIA5", RouteKind::AppPassword),
+            ("APVL5", RouteKind::S3),
+            ("APVL6", RouteKind::Internal),
+        ] {
+            let route = KeyRoute {
+                akid: akid.into(),
+                tenant: owner.clone(),
+                kind,
+                owner_ref: None,
+                created_at: NOW,
+            };
+            assert_eq!(dir.put_route(&route).await.unwrap(), RoutePut::WrongKind);
+            assert_eq!(dir.route(akid).await.unwrap(), None);
+        }
     });
 }
 

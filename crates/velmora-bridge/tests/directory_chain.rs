@@ -256,6 +256,70 @@ fn a_loser_that_is_no_longer_valid_is_refused() {
     });
 }
 
+/// A bucket made while an operator's unit change was built: the unit
+/// change, built on the head before the bucket, loses the put and is
+/// refused, instead of writing its placements over the new bucket's.
+#[test]
+fn a_whole_field_change_never_erases_a_concurrent_bucket() {
+    let store = MemRecords::new();
+    let seal = PlainSeal::new();
+    let chain = TenantChain {
+        store: &store,
+        seal: &seal,
+    };
+    block_on(active(&chain));
+    let base = block_on(chain.head(&t1(), 0)).unwrap().unwrap().door;
+    let (name, sealed) = competitor(
+        &store,
+        &seal,
+        Change::CreateBucket {
+            bucket: "b_new".into(),
+            unit: 0,
+            creator: "p_owner".into(),
+        },
+        Actor::Customer,
+    );
+    let mut planted = Some((name, sealed));
+    store.before_put(move |_key, objects| {
+        if let Some((name, sealed)) = planted.take() {
+            objects.insert(name, sealed);
+        }
+    });
+    // A second unit, with the placements the operator saw (none).
+    assert!(base.placements.is_empty());
+    let units = Change::SetUnits {
+        base_seq: base.seq,
+        units: vec![0, 1],
+        placements: vec![],
+    };
+    block_on(async {
+        let w = chain.write(&t1(), &units, Actor::Operator, NOW, 0).await;
+        let Err(ChainError::Refused(r)) = w else {
+            panic!("the stale unit change was not refused")
+        };
+        assert_eq!((r.status, r.code), (409, "stale_base"));
+        let head = chain.head(&t1(), 0).await.unwrap().unwrap();
+        assert_eq!(head.door.seq, base.seq + 1);
+        assert_eq!(head.door.placements.len(), 1);
+        assert_eq!(head.door.placements[0].bucket, "b_new");
+        // Built again on the new head, it keeps the bucket.
+        let again = Change::SetUnits {
+            base_seq: head.door.seq,
+            units: vec![0, 1],
+            placements: head.door.placements.clone(),
+        };
+        let w = chain
+            .write(&t1(), &again, Actor::Operator, NOW, head.door.seq)
+            .await
+            .unwrap();
+        let Written::Wrote(rec) = w else {
+            panic!("the rebuilt unit change did not write")
+        };
+        assert_eq!(rec.door.units, [0, 1]);
+        assert_eq!(rec.door.placements[0].bucket, "b_new");
+    });
+}
+
 #[test]
 fn a_writer_that_keeps_losing_answers_busy() {
     let store = MemRecords::new();

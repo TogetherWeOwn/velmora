@@ -128,6 +128,14 @@ fn the_selector_the_marker_and_the_catalogue_id_decide() {
             paged("database_is_not_the_frozen_one")
         );
     }
+    // The frozen catalogue without this window's marker (none, or one of
+    // another move): not the database the window froze.
+    for marker in [None, Some(0), Some(2)] {
+        assert_eq!(
+            decide(&moving, &db_marked(marker, Some("main")), &mut fresh()),
+            paged("database_left_behind")
+        );
+    }
     // After the flip: moved, whatever the database says.
     let moved = flip(&chain, 9);
     for facts in [db(false, None), db(true, Some("main"))] {
@@ -249,10 +257,11 @@ fn moved_stays_seen() {
         decide(&base, &db(false, Some("main2")), &mut seen),
         paged("selector_went_back")
     );
-    // A second window and its give-up keep the named catalogue.
+    // A second window (its marker is the second move's) and its give-up
+    // keep the named catalogue.
     let moving = start(&chain, "main2");
     assert_eq!(
-        decide(&moving, &db(true, Some("main2")), &mut seen),
+        decide(&moving, &db_marked(Some(2), Some("main2")), &mut seen),
         ZeroServe::ServeReadOnly
     );
     let given_up = write(&chain, Change::GiveUpMove, Actor::MoveTool, NOW);

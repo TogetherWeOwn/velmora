@@ -96,6 +96,17 @@ pub enum RoutePut {
     Conflict,
     /// The tenant has no row, or is shredded: no route was stored.
     NoTenant,
+    /// The kind does not fit the id: an `APVL…` id is an app password and
+    /// every app password has one, for life. Nothing was stored.
+    WrongKind,
+}
+
+/// The id prefix of an app password.
+pub const APP_PASSWORD_PREFIX: &str = "APVL";
+
+/// Whether `kind` fits `akid`: the prefix fixes the kind for life.
+pub fn kind_fits(akid: &str, kind: RouteKind) -> bool {
+    akid.starts_with(APP_PASSWORD_PREFIX) == (kind == RouteKind::AppPassword)
 }
 
 /// Which chain a pending operation is on.
@@ -456,8 +467,12 @@ impl<S: Sql> SqlDirectory<'_, S> {
     /// tenant or of another kind is [`RoutePut::Conflict`], and stays. A
     /// tenant with no row, or a shredded one, gets no route. The two
     /// exceptions, the move of tenant 0's data and its undo, go through
-    /// [`SqlDirectory::move_route`].
+    /// [`SqlDirectory::move_route`]. A kind that does not fit the id is
+    /// [`RoutePut::WrongKind`].
     pub async fn put_route(&self, route: &KeyRoute) -> Result<RoutePut> {
+        if !kind_fits(&route.akid, route.kind) {
+            return Ok(RoutePut::WrongKind);
+        }
         let changed = self
             .sql
             .exec(
@@ -484,26 +499,25 @@ impl<S: Sql> SqlDirectory<'_, S> {
     }
 
     /// Moves a route from tenant `from` to tenant `to`, if it names `from`:
-    /// the move of tenant 0's data and its undo, under maintenance. The
-    /// kind may change with it (a WebDAV key becomes an app password).
-    /// `false` = the route did not name `from`, and nothing changed.
-    pub async fn move_route(
-        &self,
-        akid: &str,
-        from: &TenantId,
-        to: &TenantId,
-        kind: RouteKind,
-    ) -> Result<bool> {
+    /// the move of tenant 0's data and its undo, under maintenance. So one
+    /// of the two is tenant 0 and the other is not. The kind stays: the id
+    /// fixes it for life.
+    /// `false` = the route did not name `from`, the target has no live
+    /// row, or neither or both of the two are tenant 0; nothing changed.
+    pub async fn move_route(&self, akid: &str, from: &TenantId, to: &TenantId) -> Result<bool> {
+        let zero = TenantId::zero();
+        if (*from == zero) == (*to == zero) {
+            return Ok(false);
+        }
         let changed = self
             .sql
             .exec(
-                "UPDATE key_routes SET tenant = ?3, kind = ?4 WHERE akid = ?1 AND tenant = ?2 \
+                "UPDATE key_routes SET tenant = ?3 WHERE akid = ?1 AND tenant = ?2 \
                  AND EXISTS (SELECT 1 FROM tenants WHERE id = ?3 AND state <> 'shredded')",
                 &[
                     SqlValue::Text(akid.to_string()),
                     SqlValue::Text(from.as_str().to_string()),
                     SqlValue::Text(to.as_str().to_string()),
-                    SqlValue::Text(kind.as_str().to_string()),
                 ],
             )
             .await?;
