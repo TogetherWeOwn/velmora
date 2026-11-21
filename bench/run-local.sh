@@ -102,8 +102,10 @@ NAME=${NAME:-$SHA}
 OUT=${OUT:-$WORK/runs/$NAME}
 mkdir -p "$OUT"
 # One run at a time per output directory: two would mix their traces.
+# The lock is on the directory itself (opened read-only): no file is
+# created or followed.
 if command -v flock >/dev/null; then
-  exec 8>"$OUT/.lock"
+  exec 8<"$OUT"
   flock -n 8 || { log "FAILED: another run writes $OUT"; exit 1; }
 fi
 # The native run works in the checkout and cargo runs it from the package

@@ -238,9 +238,11 @@ def cmd_mpu(a, cl):
 
     def abort(why):
         try:
-            cl.call("DELETE", a.key, [("uploadId", upload)])
-        finally:
-            sys.exit(f"{why} (upload aborted)")
+            s, _, d, _, _, _ = cl.call("DELETE", a.key, [("uploadId", upload)])
+            done = "upload aborted" if s in (200, 204) else f"abort refused: {s} {d[:200]!r}; upload {upload} may still be open"
+        except Exception as e:  # noqa: BLE001 - the reason is printed
+            done = f"abort failed: {type(e).__name__}; upload {upload} may still be open"
+        sys.exit(f"{why} ({done})")
 
     t0 = time.monotonic()
     with ThreadPoolExecutor(a.concurrency) as ex:

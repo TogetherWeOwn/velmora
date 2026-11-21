@@ -258,6 +258,10 @@ def render(name, counts, d1, labels, m, chk):
         "",
         check_line(chk),
         "",
+    ]
+    if m.get("not_valid"):
+        L += ["**Cost model not valid for this run:** " + m["not_valid"], ""]
+    L += [
         "Variables: " + ", ".join(f"{k}={v}" for k, v in counts["vars"].items()),
         "",
         "BENCH_VARS (changed for this run): "
@@ -365,15 +369,21 @@ def main(argv):
     prices = json.loads(Path(opts.get("--prices", Path(__file__).with_name("prices.json"))).read_text())
     cpu = json.loads(Path(opts["--cpu"]).read_text()) if "--cpu" in opts else None
     if cpu is not None:
-        bad = [k for k, v in cpu.items() if not isinstance(v, (int, float)) or not math.isfinite(v) or v < 0]
+        # The timings the model prices; other keys ("source") are provenance.
+        timed = ("ingest_ms_per_extent", "hot_get_ms_per_mib", "cold_get_ms_per_mib")
+        bad = [k for k in timed if k in cpu and (isinstance(cpu[k], bool) or not isinstance(cpu[k], (int, float))
+                                                  or not math.isfinite(cpu[k]) or cpu[k] < 0)]
         if bad:
             sys.exit(f"--cpu: not a finite number >= 0: {', '.join(sorted(bad))}")
     name = opts.get("--name", run.name)
     counts, d1, labels = load(run)
+    # The cost model is for 16 MiB extents (one 16 MiB part = one extent).
+    # Another size still gets its tables; the model is marked not valid.
     extent = int(str(counts["vars"].get("MAX_EXTENT_BYTES", EXTENT)).strip() or EXTENT)
-    if extent != EXTENT:
-        sys.exit(f"MAX_EXTENT_BYTES={extent}: the cost model is for {EXTENT}-byte extents (one 16 MiB part = one extent); not priced")
     m = model(counts, labels, prices, cpu)
+    if extent != EXTENT:
+        m["not_valid"] = f"MAX_EXTENT_BYTES={extent}: the cost model assumes {EXTENT}-byte extents; its $ figures do not apply"
+        print("WARNING, " + m["not_valid"], file=sys.stderr)
     chk = rows_written_check(labels)
     ops = {k[3:]: per(v, counts["calls"].get(k, 1)) for k, v in labels.items() if k.startswith("op:")}
     stages = {}
