@@ -333,6 +333,10 @@ pub async fn read_key_chain<S: RecordStore, K: Kek, T: TkRing>(
         reopen_closed(store, kek, ring, &chain, &mut table).await?;
         match advance(store, kek, ring, &chain, &mut table).await {
             Ok(_) => {
+                if let Some(seq) = candidate {
+                    reopen_from_older(store, kek, ring, tenant, &checkpoints, seq, &mut table)
+                        .await?;
+                }
                 let revoked = list_tenant_revocations(store, tenant)
                     .await?
                     .into_iter()
@@ -354,6 +358,50 @@ pub async fn read_key_chain<S: RecordStore, K: Kek, T: TkRing>(
         }
     }
     Err(ERR_CHECKPOINT)
+}
+
+/// Opens a subject that is still closed from an older checkpoint that
+/// carries its private part: the same `private_seq` is the same private
+/// part, whichever checkpoint holds it. A checkpoint written by a
+/// Worker that could not open the subject carries it door-only, while
+/// an older one, sealed under a key this ring holds, may carry it whole.
+async fn reopen_from_older<S: RecordStore, K: Kek, T: TkRing>(
+    store: &S,
+    kek: &K,
+    ring: &T,
+    tenant: &TenantId,
+    checkpoints: &[u64],
+    from: u64,
+    table: &mut KeyTable,
+) -> Result<()> {
+    let chain = key_chain(tenant);
+    for seq in checkpoints.iter().rev().filter(|s| **s < from) {
+        let closed: Vec<(String, u64)> = table
+            .entries()
+            .filter(|e| e.private.is_none() && e.door.status != SubjectStatus::Revoked)
+            .map(|e| (e.door.id.clone(), e.private_seq))
+            .collect();
+        if closed.is_empty() {
+            break;
+        }
+        let (Some(bytes), Some(record)) = (
+            store.get(&checkpoint_name(tenant, *seq)).await?,
+            store.get(&chain.name(*seq)).await?,
+        ) else {
+            continue;
+        };
+        let Some(older) = open_checkpoint(kek, ring, tenant, *seq, &bytes, &record) else {
+            continue;
+        };
+        for (id, private_seq) in closed {
+            if let Some(e) = older.get(&id) {
+                if let (true, Some(private)) = (e.private_seq == private_seq, &e.private) {
+                    table.reopen(&id, private.clone());
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn is_record_error(e: &BridgeError) -> bool {

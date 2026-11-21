@@ -2154,3 +2154,76 @@ async fn a_finisher_that_cannot_read_to_the_head_asks_for_a_retry() {
     assert!(report.failed.contains(&"chain".to_owned()), "{report:?}");
     assert!(report.retry());
 }
+
+/// A ring of any key versions, the last one current.
+struct Ring(Vec<TenantKey>);
+
+impl velmora_bridge::keys::record::TkRing for Ring {
+    fn current(&self) -> Option<&TenantKey> {
+        self.0.last()
+    }
+    fn key(&self, v: u32) -> Option<&TenantKey> {
+        self.0.iter().find(|k| k.version() == v)
+    }
+}
+
+/// A checkpoint written by a Worker that could not open a subject
+/// carries it door-only; a reader that cannot open the subject's record
+/// but holds the key of an older checkpoint that carries it whole opens
+/// it from there.
+#[tokio::test(flavor = "current_thread")]
+async fn a_subject_closed_in_a_checkpoint_opens_from_an_older_one() {
+    use velmora_bridge::keys::checkpoint::{checkpoint_name, seal_checkpoint};
+    let w = World::new();
+    let adm = FakeAdmission::new(&w.root);
+    let _ = seed(&w, &adm).await;
+    let k = |v: u32, label: &str| TenantKey::from_bytes(&w.t, v, derived(label)).unwrap();
+    let chain = key_chain(&w.t);
+    let mut rng = TestRng(130);
+    // An older checkpoint at seq 2, sealed under version 2, carrying
+    // AKVL0001 whole (its record is sealed under version 1).
+    let v12 = Ring(vec![k(1, "tk"), k(2, "tk v2")]);
+    let read = read_key_chain(&w.store, &w.kek, &v12, &w.t).await.unwrap();
+    let record2 = chain.get(&w.store, 2).await.unwrap();
+    let c1 = seal_checkpoint(&w.kek, &v12, &read.table, &record2, &mut rng).unwrap();
+    assert!(w
+        .store
+        .put_if_absent(&checkpoint_name(&w.t, 2), c1)
+        .await
+        .unwrap());
+    // A Worker holding version 3 only records another subject at seq 3
+    // and writes a checkpoint there: AKVL0001 is door-only in it.
+    let v3 = Ring(vec![k(3, "tk v3")]);
+    let units = w.units();
+    let blind = env_with!(w, &v3, &adm, &units);
+    let mut cached = velmora_bridge::keys::record::KeyTable::empty(w.t.clone());
+    assert_eq!(
+        blind
+            .change(
+                &mut cached,
+                "p",
+                &KeyRequest::Create(principal("PR0002", &[])),
+                &mut rng
+            )
+            .await
+            .unwrap(),
+        KeyAnswer::Done { seq: 3 }
+    );
+    let read3 = read_key_chain(&w.store, &w.kek, &v3, &w.t).await.unwrap();
+    assert!(read3.table.get("AKVL0001").unwrap().private.is_none());
+    let record3 = chain.get(&w.store, 3).await.unwrap();
+    let c2 = seal_checkpoint(&w.kek, &v3, &read3.table, &record3, &mut rng).unwrap();
+    assert!(w
+        .store
+        .put_if_absent(&checkpoint_name(&w.t, 3), c2)
+        .await
+        .unwrap());
+    // A reader with versions 2 and 3 starts at seq 3, cannot open the
+    // record at seq 2, and opens the subject from the checkpoint at 2.
+    let v23 = Ring(vec![k(2, "tk v2"), k(3, "tk v3")]);
+    let read = read_key_chain(&w.store, &w.kek, &v23, &w.t).await.unwrap();
+    assert_eq!(read.from_checkpoint, Some(3));
+    let e = read.table.get("AKVL0001").unwrap();
+    assert!(e.private.is_some(), "opened from the older checkpoint");
+    assert_eq!(e.effective_status(), SubjectStatus::Active);
+}
