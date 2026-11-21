@@ -1459,20 +1459,26 @@ where
             .await?
         {
             PublishOutcome::Applied => {
-                // The outbox rows are the durable obligation; a lost
-                // notification is picked up by the dispatcher.
-                let jobs: Vec<Job> = commit
-                    .placements
-                    .iter()
-                    .map(|p| Job::Extent {
-                        v: JOB_VERSION,
-                        extent: p.extent_id.clone(),
-                        generation: commit.generation.id.clone(),
-                        stage: OutboxStage::Post,
-                    })
-                    .collect();
-                for batch in jobs.chunks(JOB_BATCH) {
-                    let _ = bridge.jobs.send_many(batch).await;
+                // The outbox rows are the durable obligation, marked
+                // as sent by the commit. A batch whose send fails has
+                // its marks taken back, so the next dispatcher run
+                // sends its jobs; a notification lost after it was
+                // taken is made up for when the mark has aged.
+                for batch in commit.placements.chunks(JOB_BATCH) {
+                    let jobs: Vec<Job> = batch
+                        .iter()
+                        .map(|p| Job::Extent {
+                            v: JOB_VERSION,
+                            extent: p.extent_id.clone(),
+                            generation: commit.generation.id.clone(),
+                            stage: OutboxStage::Post,
+                        })
+                        .collect();
+                    if bridge.jobs.send_many(&jobs).await.is_err() {
+                        let rows: Vec<ExtentId> =
+                            batch.iter().map(|p| p.extent_id.clone()).collect();
+                        let _ = bridge.catalog.unmark_sent(&rows, commit.now).await;
+                    }
                 }
                 return complete_response(&a, publication.etag, now.0);
             }

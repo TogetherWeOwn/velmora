@@ -273,20 +273,20 @@ async fn put<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: 
     };
     drop(charge);
 
-    // The commit wrote the posting obligation; the queue message is only a
-    // wake-up. If it is lost the dispatcher finds the outbox row.
-    let _ = bridge
-        .jobs
-        .send(
-            &Job::Extent {
-                v: JOB_VERSION,
-                extent: extent_id,
-                generation: generation_id,
-                stage: OutboxStage::Post,
-            },
-            0,
-        )
-        .await;
+    // The commit wrote the posting obligation, marked as sent; the queue
+    // message is only a wake-up. A send that fails takes the mark back,
+    // so the next dispatcher run sends the job. One that is lost after
+    // it was taken, or a mark that could not be taken back, is made up
+    // for by the dispatcher when the mark has aged.
+    let job = Job::Extent {
+        v: JOB_VERSION,
+        extent: extent_id.clone(),
+        generation: generation_id,
+        stage: OutboxStage::Post,
+    };
+    if bridge.jobs.send(&job, 0).await.is_err() {
+        let _ = bridge.catalog.unmark_sent(&[extent_id], commit.now).await;
+    }
 
     let checksum = match checksum {
         Some((algorithm, value)) => {
@@ -598,8 +598,10 @@ async fn put_sliced<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: K
     let _ = bridge.raise_stamp().await;
     drop(charge);
 
-    // The commit wrote the posting obligations; the queue messages are
-    // only a wake-up. If they are lost the dispatcher finds the rows.
+    // The commit wrote the posting obligations, marked as sent; the
+    // queue messages are only a wake-up. A send that fails takes the
+    // marks back (all of them: which jobs of a failed batch were taken
+    // is not known), so the next dispatcher run sends the jobs.
     let jobs: Vec<Job> = commit
         .extents
         .iter()
@@ -610,7 +612,10 @@ async fn put_sliced<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: K
             stage: OutboxStage::Post,
         })
         .collect();
-    let _ = bridge.jobs.send_many(&jobs).await;
+    if bridge.jobs.send_many(&jobs).await.is_err() {
+        let rows: Vec<ExtentId> = commit.extents.iter().map(|e| e.id.clone()).collect();
+        let _ = bridge.catalog.unmark_sent(&rows, commit.now).await;
+    }
 
     let checksum = match checksum {
         Some((algorithm, value)) => {

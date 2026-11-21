@@ -58,6 +58,11 @@ const ADMIN_TOKEN: &str = "bench-admin-token-0123456789abcdef0123";
 const CRON_SECS: u32 = 300;
 const DAY: u32 = 86_400;
 const MAX_ROUNDS: u32 = 2_000;
+/// How a job's claim of its outbox row begins (`sql/outbox.rs`).
+const CLAIM_SQL: &str = "UPDATE outbox SET lease_token = lease_token + 1, lease_owner = ?4";
+/// The late queue (`VELMORA_BENCH_LATE_QUEUE`): every message is delivered
+/// this long after it is due, so a dispatcher run always comes first.
+const LATE_SECS: u32 = CRON_SECS + 60;
 
 // ---------------------------------------------------------------------------
 // The meter
@@ -95,6 +100,10 @@ struct Counts {
     nntp_asks: u64,
     nntp_bodies: u64,
     nntp_body_bytes: u64,
+    /// Outbox claims by a job, and those that found nothing to do (the
+    /// row was not due, leased, or already past the job's stage).
+    outbox_claims: u64,
+    outbox_empty_claims: u64,
 }
 
 /// The label in force and everything charged so far.
@@ -186,6 +195,12 @@ impl Sql for MeterSql {
         let out = self.inner.query(sql, params).await;
         let returned = out.as_ref().map_or(0, |r| r.len() as u64);
         self.charge(1, false, returned, self.written() - before, out.is_ok());
+        if sql.starts_with(CLAIM_SQL) {
+            self.hub.add(|c| {
+                c.outbox_claims += 1;
+                c.outbox_empty_claims += u64::from(returned == 0);
+            });
+        }
         self.hub.trace("q", &[(sql, params)], out.is_ok());
         out
     }
@@ -658,6 +673,8 @@ struct Bench {
     bench_vars: Vec<(String, String)>,
     /// Distinct extents, plaintext bytes and objects, by class.
     classes: BTreeMap<String, (u64, u64, u64)>,
+    /// The queue delivers late: see [`LATE_SECS`].
+    late: bool,
 }
 
 /// Deterministic incompressible bytes.
@@ -674,7 +691,7 @@ fn bytes(seed: u64, len: usize) -> Vec<u8> {
 }
 
 impl Bench {
-    async fn new(trace: Option<File>) -> Bench {
+    async fn new(trace: Option<File>, late: bool) -> Bench {
         let mut cfg = ServerConfig::for_test();
         cfg.group = GROUP.to_string();
         cfg.users.clear();
@@ -794,6 +811,7 @@ impl Bench {
             vars,
             bench_vars,
             classes: BTreeMap::new(),
+            late,
         }
     }
 
@@ -1019,6 +1037,9 @@ impl Bench {
     /// the dispatcher on simulated cron ticks, until no outbox row is in
     /// `post` or `verify` (the pump of `tests/slice.rs`).
     async fn pump(&self) {
+        if self.late {
+            return self.pump_late().await;
+        }
         let b = &self.bridge;
         let mut pending: Vec<(UnixMs, Job, bool)> = Vec::new();
         for _ in 0..MAX_ROUNDS {
@@ -1057,6 +1078,69 @@ impl Bench {
         panic!("BENCH FAILED: outbox not drained: {}", self.outbox_dump());
     }
 
+    /// The pump with a late queue: the dispatcher runs every `CRON_SECS`
+    /// whatever is queued, and a message (a retried one too) is delivered
+    /// `LATE_SECS` after it is due. So every row a handler left due is
+    /// seen by a dispatcher run before the handler's own job arrives: the
+    /// state of a queue with a backlog.
+    async fn pump_late(&self) {
+        let b = &self.bridge;
+        let mut pending: Vec<(UnixMs, Job, bool)> = Vec::new();
+        let mut next_cron = b.clock.now().plus_secs(CRON_SECS);
+        for _ in 0..10 * MAX_ROUNDS {
+            assert_eq!(
+                self.sql_count("SELECT count(*) FROM outbox WHERE stage = 'dead'"),
+                0,
+                "BENCH FAILED: dead outbox rows: {}",
+                self.outbox_dump()
+            );
+            let now = b.clock.now();
+            for s in b.jobs.inner.take() {
+                pending.push((now.plus_secs(s.delay_secs + LATE_SECS), s.job, false));
+            }
+            if self.open_rows() == 0 {
+                // What is still queued: a second message for a row that
+                // is past its stage is delivered now (it finds nothing);
+                // the rest goes back to the queue for the next phase.
+                for (at, job, redelivery) in pending {
+                    let open = matches!(&job, Job::Extent { stage, .. }
+                        if matches!(stage, OutboxStage::Post | OutboxStage::Verify));
+                    if open {
+                        self.run_job(&job, redelivery).await;
+                    } else {
+                        let left = u32::try_from((at.0 - now.0).max(0) / 1000).expect("delay");
+                        // (A wake-up that comes early sends itself on.)
+                        let left = left.min(MAX_QUEUE_DELAY_SECS);
+                        b.jobs.inner.send(&job, left).await.expect("requeue");
+                    }
+                }
+                return;
+            }
+            match pending.iter().map(|(t, _, _)| *t).min() {
+                Some(t) if t < next_cron => {
+                    let now = t.max(now);
+                    b.clock.set(now);
+                    let (due, later): (Vec<_>, Vec<_>) =
+                        pending.into_iter().partition(|(t, _, _)| *t <= now);
+                    pending = later;
+                    for (_, job, redelivery) in due {
+                        if let JobOutcome::Retry { delay_secs } =
+                            self.run_job(&job, redelivery).await
+                        {
+                            pending.push((now.plus_secs(delay_secs + LATE_SECS), job, true));
+                        }
+                    }
+                }
+                _ => {
+                    b.clock.set(next_cron.max(now));
+                    self.cron().await;
+                    next_cron = next_cron.plus_secs(CRON_SECS);
+                }
+            }
+        }
+        panic!("BENCH FAILED: outbox not drained: {}", self.outbox_dump());
+    }
+
     /// Cron runs (charged to `cron_label`) and the jobs they send, until
     /// `done`. The release phase charges its dispatcher runs to ingest
     /// (`stage:cron`), the delete phase to `stage:cron_gc`.
@@ -1067,9 +1151,12 @@ impl Bench {
             }
             // Jobs already queued (the last verify round's release wakes,
             // due after the clock jump) are delivered before the
-            // dispatcher runs, so it does not send their work again.
-            for sent in self.bridge.jobs.inner.take() {
-                self.run_job(&sent.job, false).await;
+            // dispatcher runs, so it does not send their work again. A
+            // late queue delivers them after it.
+            if !self.late {
+                for sent in self.bridge.jobs.inner.take() {
+                    self.run_job(&sent.job, false).await;
+                }
             }
             if done(self) {
                 return;
@@ -1108,8 +1195,8 @@ impl Bench {
 // The scenario
 // ---------------------------------------------------------------------------
 
-async fn scenario(s: &Scale, trace: Option<File>) -> Bench {
-    let mut b = Bench::new(trace).await;
+async fn scenario(s: &Scale, trace: Option<File>, late: bool) -> Bench {
+    let mut b = Bench::new(trace, late).await;
     let big_parts = s.part * s.parts;
 
     // Ingest. `big/`: whole extents (PutObject and a multipart upload);
@@ -1394,6 +1481,7 @@ fn report(b: &Bench, scale: &str) -> serde_json::Value {
         "scale": scale,
         "vars": vars,
         "bench_vars": bench_vars,
+        "late_queue_secs": if b.late { LATE_SECS } else { 0 },
         "classes": classes,
         "calls": *b.hub.calls.borrow(),
         "counts": *b.hub.counts.borrow(),
@@ -1439,7 +1527,7 @@ fn sanity(b: &Bench) {
 
 #[tokio::test(flavor = "current_thread")]
 async fn bench_counts_smoke() {
-    let b = scenario(&SMOKE, None).await;
+    let b = scenario(&SMOKE, None, false).await;
     sanity(&b);
     let json = report(&b, "smoke");
     assert!(
@@ -1448,6 +1536,21 @@ async fn bench_counts_smoke() {
             .unwrap_or(0)
             > 0
     );
+}
+
+/// With a late queue (every message delivered after a dispatcher run),
+/// the dispatcher does not send again what a handler has sent: no second
+/// message (and so no mark, which it writes per message sent) and no
+/// claim that finds nothing.
+#[tokio::test(flavor = "current_thread")]
+async fn bench_counts_late_queue_smoke() {
+    let b = scenario(&SMOKE, None, true).await;
+    sanity(&b);
+    let counts = b.hub.counts.borrow();
+    let cron = &counts["stage:cron"];
+    assert_eq!(cron.queue_messages, 0, "the dispatcher sent a job again");
+    let empty: u64 = counts.values().map(|c| c.outbox_empty_claims).sum();
+    assert_eq!(empty, 0, "a claim found nothing to do");
 }
 
 /// The full run: `VELMORA_BENCH_OUT=<dir> cargo test -p velmora-bridge
@@ -1467,7 +1570,10 @@ async fn bench_counts_full() {
         .map(|v| v.parse().expect("VELMORA_BENCH_TINY is a count"))
         .unwrap_or(FULL.tiny);
     let scale = Scale { tiny, ..FULL };
-    let b = scenario(&scale, Some(trace)).await;
+    // VELMORA_BENCH_LATE_QUEUE=1: every message is delivered after a
+    // dispatcher run (`bench/run-local.sh --late-queue`).
+    let late = std::env::var("VELMORA_BENCH_LATE_QUEUE").is_ok_and(|v| v == "1");
+    let b = scenario(&scale, Some(trace), late).await;
     sanity(&b);
     let json = report(&b, "full");
     std::fs::write(

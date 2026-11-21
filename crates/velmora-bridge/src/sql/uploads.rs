@@ -689,8 +689,10 @@ pub(super) async fn complete_upload<S: Sql>(
     ));
     stmts.push((
         concat!(
-            "INSERT INTO outbox(extent_id, generation_id, stage, next_at, updated_at) \
-             SELECT e.id, e.generation_id, 'post', ?2, ?2 FROM ",
+            // Marked as sent from the start (`sent_at`): the caller
+            // sends the post jobs itself (`Catalog::complete_upload`).
+            "INSERT INTO outbox(extent_id, generation_id, stage, next_at, updated_at, sent_at) \
+             SELECT e.id, e.generation_id, 'post', ?2, ?2, ?2 FROM ",
             adopted!()
         ),
         vec![gen_id(), ms(now)],

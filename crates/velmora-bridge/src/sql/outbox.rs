@@ -254,20 +254,36 @@ pub(super) async fn renew_all<S: Sql>(
 
 /// Moves the row to `to` and gives the lease up. Attempts and cursor
 /// restart: they are per stage.
+///
+/// With `sent`, the same write marks the row as sent for its new due
+/// time (`sent_at = next_at`, see [`due`]): the caller sends the job of
+/// the new stage itself, and takes the mark back if that send fails
+/// ([`unmark_sent`]). The mark is the due time and not the time of the
+/// send, because a mark older than the due time is outdated.
 pub(super) async fn advance<S: Sql>(
     c: &SqlCatalog<S>,
     l: &Lease,
     to: OutboxStage,
     next_at: UnixMs,
     now: UnixMs,
+    sent: bool,
 ) -> Result<bool> {
-    let sql = concat!(
-        "UPDATE outbox SET stage = ?5, next_at = ?6, updated_at = ?7, attempts = 0, cursor = 0, \
-           last_error = NULL, ",
-        unlease!(),
-        " WHERE ",
-        held!()
-    );
+    let sql = match sent {
+        false => concat!(
+            "UPDATE outbox SET stage = ?5, next_at = ?6, updated_at = ?7, attempts = 0, \
+               cursor = 0, last_error = NULL, ",
+            unlease!(),
+            " WHERE ",
+            held!()
+        ),
+        true => concat!(
+            "UPDATE outbox SET stage = ?5, next_at = ?6, updated_at = ?7, attempts = 0, \
+               cursor = 0, last_error = NULL, sent_at = ?6, ",
+            unlease!(),
+            " WHERE ",
+            held!()
+        ),
+    };
     fenced(c, sql, l, [text(to.as_str()), ms(next_at), ms(now)]).await
 }
 
@@ -1224,6 +1240,31 @@ pub(super) async fn mark_sent<S: Sql>(
         .await
 }
 
+/// Takes back the mark `mark` of the rows of `extents`: the job that was
+/// to be sent for each of them was not ([`advance`] with `sent`, or a
+/// publication, whose rows are marked as they are inserted). Only a row
+/// that still carries this very mark is changed: one that a job claimed
+/// since has none, and one that was marked again keeps its newer mark.
+/// One row written per row changed; each row is found by its id.
+pub(super) async fn unmark_sent<S: Sql>(
+    c: &SqlCatalog<S>,
+    extents: &[ExtentId],
+    mark: UnixMs,
+) -> Result<u64> {
+    if extents.is_empty() {
+        return Ok(0);
+    }
+    let ids: Vec<&str> = extents.iter().map(ExtentId::as_str).collect();
+    let ids = serde_json::to_string(&ids).map_err(|_| BridgeError::Sql("unmark_sent".into()))?;
+    c.sql
+        .exec(
+            "UPDATE outbox SET sent_at = NULL \
+             WHERE extent_id IN (SELECT value FROM json_each(?2)) AND sent_at = ?1",
+            &[ms(mark), text(&ids)],
+        )
+        .await
+}
+
 /// The attempts above which a row is in the `outbox_exhausted` index.
 /// The index says `attempts > 50` in its `WHERE`, and a statement is
 /// answered from it only when it spells the same condition, so the
@@ -1319,7 +1360,7 @@ pub(super) async fn redrive_underverified<S: Sql>(
     let last = Cols::new(last).text()?;
     let sql = concat!(
         "UPDATE outbox SET stage = 'verify', next_at = ?1, cursor = 0, attempts = 0, \
-           last_error = NULL, updated_at = ?1, ",
+           last_error = NULL, updated_at = ?1, sent_at = NULL, ",
         unlease!(),
         // Driven from the window of the index, each outbox row found by
         // its key: `CROSS JOIN` fixes the order and the unary `+` keeps
@@ -1403,7 +1444,8 @@ pub(super) async fn revive_referenced<S: Sql>(
                                           WHERE e.id = outbox.extent_id) \
                                    WHEN 'held' THEN 'post' WHEN 'releasing' THEN 'release' \
                                    ELSE 'done' END, \
-                attempts = 0, cursor = 0, last_error = NULL, next_at = ?1, updated_at = ?1, ",
+                attempts = 0, cursor = 0, last_error = NULL, next_at = ?1, updated_at = ?1, \
+                sent_at = NULL, ",
         unlease!(),
         // `+stage`: the window is found by rowid. Through the stage
         // index the statement would visit every cancelled row there is.
