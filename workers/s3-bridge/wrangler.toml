@@ -422,9 +422,14 @@ dead_letter_queue = "velmora-dlq"
 # an extent go to the aux queue, which must stay bound while this is
 # above 1. A job is not started after BATCH_START_MS (90 s) into a batch:
 # it goes back to the queue, so the batch ends within the wall time.
+# Verify jobs arrive at the pace extents are posted, one at a time: a
+# consumer waits up to max_batch_timeout (30 s) for its batch to fill
+# (measured: 1.5 jobs per batch with the default 5 s). Verification is
+# 30 s later at most; the release follows it either way.
 [[queues.consumers]]
 queue = "velmora-verify"
 max_batch_size = 8
+max_batch_timeout = 30
 max_concurrency = 8
 max_retries = 20
 retry_delay = 120
@@ -433,6 +438,7 @@ dead_letter_queue = "velmora-dlq"
 [[queues.consumers]]
 queue = "velmora-verify2"
 max_batch_size = 8
+max_batch_timeout = 30
 max_concurrency = 8
 max_retries = 20
 retry_delay = 120
@@ -441,6 +447,7 @@ dead_letter_queue = "velmora-dlq"
 [[queues.consumers]]
 queue = "velmora-verify3"
 max_batch_size = 8
+max_batch_timeout = 30
 max_concurrency = 8
 max_retries = 20
 retry_delay = 120
@@ -449,6 +456,7 @@ dead_letter_queue = "velmora-dlq"
 [[queues.consumers]]
 queue = "velmora-verify4"
 max_batch_size = 8
+max_batch_timeout = 30
 max_concurrency = 8
 max_retries = 20
 retry_delay = 120
