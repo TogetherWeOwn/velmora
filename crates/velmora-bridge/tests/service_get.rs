@@ -484,6 +484,81 @@ async fn object_responses_forbid_edge_transforms() {
     }
 }
 
+/// Every object response carries nosniff and a sandbox policy, whatever the
+/// object's stored type: an object is never a page of the host that serves it.
+#[tokio::test(flavor = "current_thread")]
+async fn object_responses_are_sandboxed_and_unsniffed() {
+    let rig = rig();
+    let (_, signer) = rig.standard(BUCKET).await;
+    for (key, content_type, disposition, body) in [
+        (
+            "page.html",
+            Some("text/html"),
+            None,
+            b"<script>alert(1)</script>".as_slice(),
+        ),
+        ("image.svg", Some("image/svg+xml"), None, b"<svg/>"),
+        ("untyped", None, None, b"data"),
+        ("inline", None, Some("inline"), b"data"),
+    ] {
+        let mut headers = Vec::new();
+        headers.extend(content_type.map(|v| ("content-type", v)));
+        headers.extend(disposition.map(|v| ("content-disposition", v)));
+        rig.call(
+            &signer,
+            Method::Put,
+            &path(BUCKET, key),
+            &[],
+            &headers,
+            body,
+        )
+        .await
+        .expect(200);
+
+        let head = rig.head(&signer, BUCKET, key).await;
+        let resp = get(&rig, &signer, key, &[]).await;
+        let range = get_range(&rig, &signer, key, "bytes=0-3").await;
+        let etag = md5_etag(body);
+        let conditional = get(&rig, &signer, key, &[("if-none-match", &etag)]).await;
+        for (request, response, status) in [
+            ("HEAD", head, 200),
+            ("GET", resp, 200),
+            ("range GET", range, 206),
+            ("conditional GET", conditional, 304),
+        ] {
+            response.expect(status);
+            for (name, value) in [
+                ("x-content-type-options", "nosniff"),
+                ("content-security-policy", "sandbox"),
+            ] {
+                let values: Vec<_> = response
+                    .headers
+                    .iter()
+                    .filter(|(n, _)| n.eq_ignore_ascii_case(name))
+                    .map(|(_, v)| v.as_str())
+                    .collect();
+                assert_eq!(values, [value], "{request} {key}: {name}");
+            }
+            if status != 304 {
+                assert_eq!(
+                    response.header("content-type"),
+                    content_type,
+                    "{request} {key}"
+                );
+                assert_eq!(
+                    response.header("content-disposition"),
+                    disposition,
+                    "{request} {key}"
+                );
+            }
+        }
+    }
+
+    let missing = get(&rig, &signer, "missing", &[]).await;
+    missing.expect_error(404, "NoSuchKey");
+    assert!(missing.header("content-security-policy").is_none());
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn cache_is_tried_before_the_safety_copy() {
     let rig = rig();

@@ -239,6 +239,26 @@ fn forbid_edge_transform(headers: &mut Vec<(String, String)>) {
     }
 }
 
+/// Headers that keep an object from acting as a page of the host that
+/// serves it: `X-Content-Type-Options: nosniff` (the browser takes the
+/// stored type as it is) and `Content-Security-Policy: sandbox` (an
+/// object opened as a document runs no script, submits no form and has
+/// an origin of its own, so it reads no cookie and no storage of the
+/// host's site). An S3 object is data, never a page of the service.
+///
+/// Media and downloads are not affected: `sandbox` applies to a
+/// document, and `Content-Disposition` is left as stored. A stored
+/// header of either name (an object stores neither today) is replaced,
+/// so an object cannot opt out.
+fn sandbox_object(headers: &mut Vec<(String, String)>) {
+    const SET: [(&str, &str); 2] = [
+        ("x-content-type-options", "nosniff"),
+        ("content-security-policy", "sandbox"),
+    ];
+    headers.retain(|(name, _)| !SET.iter().any(|(set, _)| name.eq_ignore_ascii_case(set)));
+    headers.extend(SET.iter().map(|(n, v)| (n.to_string(), v.to_string())));
+}
+
 /// The directives of a `Cache-Control` value: split at the commas outside
 /// quoted strings (`private="a, b"` is one directive), a backslash escaping
 /// the next character inside one.
@@ -311,6 +331,7 @@ async fn read<
     .map_err(s3_error)?;
     let mut headers = plan.headers;
     forbid_edge_transform(&mut headers);
+    sandbox_object(&mut headers);
     let mut resp = S3Response {
         status: plan.status,
         headers,
@@ -1690,6 +1711,32 @@ mod tests {
             .filter(|(n, _)| n.eq_ignore_ascii_case("cache-control"))
             .map(|(_, v)| v.as_str())
             .collect()
+    }
+
+    #[test]
+    fn an_object_is_served_sandboxed_and_unsniffed() {
+        let mut h = vec![
+            ("content-type".to_string(), "text/html".to_string()),
+            (
+                "Content-Security-Policy".to_string(),
+                "default-src *".to_string(),
+            ),
+            ("content-disposition".to_string(), "inline".to_string()),
+        ];
+        sandbox_object(&mut h);
+        fn get(h: &[(String, String)], n: &str) -> Vec<String> {
+            h.iter()
+                .filter(|(k, _)| k.eq_ignore_ascii_case(n))
+                .map(|(_, v)| v.clone())
+                .collect()
+        }
+        assert_eq!(get(&h, "content-security-policy"), ["sandbox"]);
+        assert_eq!(get(&h, "x-content-type-options"), ["nosniff"]);
+        assert_eq!(get(&h, "content-type"), ["text/html"]);
+        assert_eq!(get(&h, "content-disposition"), ["inline"]);
+        sandbox_object(&mut h);
+        assert_eq!(get(&h, "content-security-policy"), ["sandbox"]);
+        assert_eq!(h.len(), 4);
     }
 
     #[test]
