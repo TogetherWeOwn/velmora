@@ -579,11 +579,15 @@ where
                     &holder,
                 )
                 .await;
-                let Some(mut session) = (match opened {
+                let Some(session) = (match opened {
                     Err(_) if waited => return Err(Stop::NoPermit),
                     opened => opened?,
                 }) else {
                     continue;
+                };
+                let mut session = match shelf {
+                    Some(shelf) => session.for_batch(shelf),
+                    None => session,
                 };
                 let tally = self.ask(&mut session, lease, &rows, kind, together).await;
                 // Kept for the next job of the batch when it went well.
@@ -600,6 +604,14 @@ where
             }
             if refused {
                 return Err(Stop::Refused);
+            }
+            // The batch's own kept sessions may hold the slot this
+            // backbone needs (providers that share a pool, or the
+            // address limit): they are closed and the slot asked for at
+            // once, before any wait.
+            if let Some(shelf) = shelf.filter(|s| s.parked() > 0) {
+                shelf.drain(&self.catalog, &self.clock).await;
+                continue;
             }
             // No slot on this backbone. It is waited for under the claim
             // for a bounded time ([`crate::jobs::SLOT_WAIT_MS`]): the

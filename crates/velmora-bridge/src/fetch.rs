@@ -57,6 +57,9 @@ pub(crate) struct ProviderSession<'a, C: Catalog, N: NntpConnector, T: Clock> {
     /// reconnects, so a pass never dials a provider more often for
     /// having logged in first.
     broke_early: u32,
+    /// The shelf of the batch this session reads for: its kept sessions
+    /// are renewed as this one is used ([`Self::keep`]).
+    shelf: Option<&'a SessionShelf<N::Session>>,
 }
 
 impl<C: Catalog, N: NntpConnector, T: Clock> Drop for ProviderSession<'_, C, N, T> {
@@ -205,7 +208,15 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ProviderSession<'a, C, N, T> {
             held_from: asked,
             freed: false,
             broke_early: 0,
+            shelf: None,
         }))
+    }
+
+    /// Reads for a batch: while this session is used, the sessions
+    /// `shelf` keeps are renewed with it ([`SessionShelf::keep_alive`]).
+    pub(crate) fn for_batch(mut self, shelf: &'a SessionShelf<N::Session>) -> Self {
+        self.shelf = Some(shelf);
+        self
     }
 
     /// With the host's timer, a renewal that is bounded for the permit's
@@ -242,6 +253,12 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ProviderSession<'a, C, N, T> {
     /// [`READ_SLACK_SECS`](crate::ports::READ_SLACK_SECS) to spare), so
     /// the articles that follow within it need no round trip each.
     pub(crate) async fn keep(&mut self, lease: Option<&Lease>) -> core::result::Result<(), Stop> {
+        // Before every call of this session: the sessions the batch keeps
+        // meanwhile are renewed on the same rule, so none of them is
+        // logged in on a slot whose permit ran out during a long pass.
+        if let Some(shelf) = self.shelf {
+            shelf.keep_alive(self.catalog, self.clock).await;
+        }
         let now = self.clock.now();
         let every = match self.permit.class.renew_secs() {
             None => KEEP_EVERY_MS,
@@ -444,6 +461,10 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ProviderSession<'a, C, N, T> {
             return self.close().await;
         }
         let (catalog, clock) = (self.catalog, self.clock);
+        // The others first, as before a call: after this every kept slot
+        // was confirmed less than KEEP_EVERY_MS ago, with the time to the
+        // next job's first call (sweep at PARK_REUSE_MS) to spare.
+        shelf.keep_alive(catalog, clock).await;
         // Reported now, as a close would: a good session that waits on
         // the shelf does not clear, later, strikes others record meanwhile.
         // What the session does after it is taken again is reported when
@@ -482,7 +503,7 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ProviderSession<'a, C, N, T> {
         nntp: &'a N,
         clock: &'a T,
         provider: &'a ProviderConfig,
-        shelf: &SessionShelf<N::Session>,
+        shelf: &'a SessionShelf<N::Session>,
     ) -> Option<Self> {
         let found = {
             let mut parked = shelf.parked.borrow_mut();
@@ -511,6 +532,7 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ProviderSession<'a, C, N, T> {
             held_from: parked.held_from,
             freed: false,
             broke_early: parked.broke_early,
+            shelf: Some(shelf),
         })
     }
 
@@ -669,6 +691,43 @@ impl<S: NntpSession> SessionShelf<S> {
         for parked in all {
             close_parked(catalog, clock, parked).await;
         }
+    }
+
+    /// Renews the permit of every kept session whose slot was last
+    /// confirmed [`KEEP_EVERY_MS`] ago or more, as a session in use is
+    /// renewed before each call: a call takes at most
+    /// [`NNTP_CALL_SECS`](crate::ports::NNTP_CALL_SECS), so a kept slot
+    /// never runs out while a pass of another session goes on. A session
+    /// whose renewal fails is closed. Called before every call of a
+    /// session of the batch.
+    pub(crate) async fn keep_alive<C: Catalog, T: Clock>(&self, catalog: &C, clock: &T) {
+        let now = clock.now();
+        let due = |p: &Parked<S>| now.0 - p.held_from.0 >= KEEP_EVERY_MS;
+        if !self.parked.borrow().iter().any(due) {
+            return;
+        }
+        let all: Vec<Parked<S>> = self.parked.borrow_mut().drain(..).collect();
+        let mut kept = Vec::with_capacity(all.len());
+        for mut parked in all {
+            if !due(&parked) {
+                kept.push(parked);
+                continue;
+            }
+            match catalog.renew_permit(&parked.permit, now).await {
+                Ok(true) => {
+                    parked.held_from = now;
+                    parked.kept_at = Some(now);
+                    kept.push(parked);
+                }
+                _ => close_parked(catalog, clock, parked).await,
+            }
+        }
+        // Whatever was kept meanwhile stays (nothing parks during this,
+        // but the order is kept either way: oldest first).
+        let mut parked = self.parked.borrow_mut();
+        let newer: Vec<Parked<S>> = parked.drain(..).collect();
+        kept.extend(newer);
+        *parked = kept;
     }
 
     /// Ends every kept session that is too old to be taken again

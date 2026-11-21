@@ -423,3 +423,32 @@ async fn a_job_that_waits_for_a_slot_closes_the_kept_sessions_first() {
     }
     rig.close_shelf(&shelf).await;
 }
+
+/// While one session reads for a long time, the sessions the batch keeps
+/// are renewed with it: the next backbone still finds its kept session
+/// on a live slot and goes on with it.
+#[tokio::test]
+async fn a_long_pass_keeps_the_other_kept_slots_alive() {
+    let rig = rig_on().await;
+    let first = rig.on_two(1).await;
+    let second = rig.on_two(2).await;
+    let shelf = VerifyShelf::new().unwrap();
+
+    assert_eq!(rig.verify_in(&first, Some(&shelf)).await, JobOutcome::Ack);
+    assert_eq!(shelf.parked(), 2);
+    let before = rig.verify_connections();
+
+    // Every call takes 30 s: the second job's pass on bb0 alone outlasts
+    // the age at which a kept session is taken again.
+    rig.bridge.nntp.slow(&rig.bridge.clock, 30_000);
+    let started = rig.bridge.clock.now();
+    assert_eq!(rig.verify_in(&second, Some(&shelf)).await, JobOutcome::Ack);
+    assert!(rig.bridge.clock.now().0 - started.0 > 60_000);
+    assert!(rig.released(&second));
+    assert_eq!(shelf.reused(), 2, "both kept sessions taken again");
+    assert_eq!(rig.verify_connections(), before);
+    assert_eq!(held(&rig, "p0").await, 1);
+    assert_eq!(held(&rig, "p1").await, 1);
+    rig.close_shelf(&shelf).await;
+    assert_eq!(held(&rig, "p1").await, 0);
+}
