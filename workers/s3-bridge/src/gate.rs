@@ -119,6 +119,9 @@ pub struct PermitGate {
     state: State,
     /// `Err`: a binding is missing; every request fails with its name.
     gate: core::result::Result<Rc<Gate<D1Sql, DoStore>>, &'static str>,
+    /// A slot went to a job in the line since the object came into
+    /// memory: said once in the log.
+    handed: core::cell::Cell<bool>,
 }
 
 impl PermitGate {
@@ -219,6 +222,9 @@ impl PermitGate {
                 }
             }
             if !lost {
+                if !self.handed.replace(true) {
+                    console_log!("permit gate line: a slot went to a job that waited");
+                }
                 return;
             }
             gate.settle(WorkerClock.now()).await;
@@ -240,7 +246,11 @@ impl DurableObject for PermitGate {
                 version.id(),
             ))),
         };
-        PermitGate { state, gate }
+        PermitGate {
+            state,
+            gate,
+            handed: core::cell::Cell::new(false),
+        }
     }
 
     async fn fetch(&self, mut req: Request) -> worker::Result<Response> {
@@ -343,6 +353,9 @@ impl DurableObject for PermitGate {
         let Some(request) = request else {
             gate.close(session.id);
             end(1008, "gate: bad request");
+            // What the session held is free: for the line, now.
+            gate.settle(WorkerClock.now()).await;
+            self.deliver(gate).await;
             return Ok(());
         };
         // A request the gate could not answer is told so: the session

@@ -418,6 +418,8 @@ pub struct MemCatalog {
     /// Each wait in the line: the holder, its providers and the time
     /// it had.
     pub line_waits: RefCell<Vec<(String, Vec<String>, i64)>>,
+    /// The holders whose jobs said they stopped (`leave_line`).
+    pub line_left: RefCell<Vec<String>>,
     /// Each slot request waits for the runtime once before it is
     /// answered, as a catalogue round trip does, so that requests made
     /// together are seen in flight together (`acquire_peak`).
@@ -1383,6 +1385,10 @@ impl Catalog for MemCatalog {
             SlotWait::Unsupported => {}
         }
         Ok(end)
+    }
+
+    fn leave_line(&self, holder: &str) {
+        self.line_left.borrow_mut().push(holder.to_string());
     }
 
     // Not used by the post, verify, release or cold-read paths.
