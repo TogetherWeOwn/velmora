@@ -64,6 +64,7 @@ struct ClaimState {
     stop: bool,
     voids: Vec<u32>,
     commits: Vec<u32>,
+    pinned: Option<[u8; 8]>,
 }
 
 impl KeyVersionClaims for Claims {
@@ -82,32 +83,33 @@ impl KeyVersionClaims for Claims {
 
     async fn void(&self, _t: &TenantId, version: u32) -> Result<Claim> {
         let mut s = self.state.borrow_mut();
-        assert_eq!(
-            s.rotating_to,
-            Some(version),
-            "void of a claim that is not open"
-        );
+        if s.rotating_to != Some(version) {
+            return Err(BridgeError::Invalid("void of a claim that is not open"));
+        }
         s.voids.push(version);
         s.highest = version + 1;
         s.rotating_to = Some(version + 1);
         Ok(Claim::Claimed(version + 1))
     }
 
-    async fn commit(&self, _t: &TenantId, version: u32) -> Result<Commit> {
+    async fn commit(&self, _t: &TenantId, version: u32, kcv: [u8; 8]) -> Result<Commit> {
         let mut s = self.state.borrow_mut();
         if s.stop {
             return Ok(Commit::Stopped);
         }
         if s.rotating_to.is_none() && s.tk_version == version {
-            return Ok(Commit::Committed);
+            // A concurrent run committed it: only with the same key.
+            return match s.pinned.is_none_or(|p| p == kcv) {
+                true => Ok(Commit::Committed),
+                false => Err(BridgeError::Invalid("commit of another key")),
+            };
         }
-        assert_eq!(
-            s.rotating_to,
-            Some(version),
-            "commit of a claim that is not open"
-        );
+        if s.rotating_to != Some(version) {
+            return Err(BridgeError::Invalid("commit of a claim that is not open"));
+        }
         s.tk_version = version;
         s.rotating_to = None;
+        s.pinned = Some(kcv);
         s.commits.push(version);
         Ok(Commit::Committed)
     }
@@ -370,7 +372,7 @@ async fn an_escrow_copy_restores_a_tenant_after_both_key_buckets_lost_its_key() 
     assert!(w.a.lose(&blob_name) && w.b.lose(&blob_name));
     let cache = TkCache::new();
     let e = cache
-        .load(&set, &w.buckets(), &w.kek, &clock, &w.t, 1)
+        .load(&set, &w.buckets(), &w.kek, &clock, &w.t, 1, None)
         .await
         .unwrap_err();
     assert!(is_crypto(&e, "tenant key is missing"), "{e:?}");
@@ -388,7 +390,7 @@ async fn an_escrow_copy_restores_a_tenant_after_both_key_buckets_lost_its_key() 
         ]
     );
     let loaded = cache
-        .load(&set, &w.buckets(), &w.kek, &clock, &w.t, 1)
+        .load(&set, &w.buckets(), &w.kek, &clock, &w.t, 1, None)
         .await
         .unwrap();
     assert_eq!(loaded.check_value(), created.key.check_value());
@@ -430,7 +432,7 @@ async fn an_escrow_copy_restores_a_tenant_after_both_key_buckets_lost_its_key() 
     // Sealed under the real key: re-load it into a ring.
     let ring = OneKey(
         cache
-            .load(&set, &w.buckets(), &w.kek, &clock, &w.t, 1)
+            .load(&set, &w.buckets(), &w.kek, &clock, &w.t, 1, None)
             .await
             .map(|k| {
                 let _ = &ring;
@@ -485,4 +487,125 @@ async fn an_escrow_copy_restores_a_tenant_after_both_key_buckets_lost_its_key() 
     let checks = restore_check(&copy, &wrong_kek, &blobs, Some((1, &key_record)), None);
     assert!(checks.iter().any(|(c, ok)| *c == "open" && !ok));
     assert!(checks.iter().any(|(c, ok)| *c == "key_chain" && !ok));
+}
+
+/// A store that runs a hook once, just before its first put: another
+/// run's put lands between this run's listing and its own put.
+struct Hooked<'a> {
+    inner: &'a MemRecords,
+    before_put: RefCell<Option<Box<dyn FnOnce() + 'a>>>,
+}
+
+impl RecordStore for Hooked<'_> {
+    async fn put_if_absent(&self, name: &str, bytes: Vec<u8>) -> Result<bool> {
+        if let Some(hook) = self.before_put.borrow_mut().take() {
+            hook();
+        }
+        self.inner.put_if_absent(name, bytes).await
+    }
+    async fn get(&self, name: &str) -> Result<Option<Vec<u8>>> {
+        self.inner.get(name).await
+    }
+    async fn list(&self, prefix: &str, after: &str, limit: u32) -> Result<Vec<String>> {
+        self.inner.list(prefix, after, limit).await
+    }
+}
+
+/// Two runs under different active KEK versions (a KEK rotation): run A
+/// commits version 1 under KEK 1 while run B, under KEK 2, had listed the
+/// arbiter before A's put. B's put takes another name, so both land. B
+/// finds two keys for version 1, its void is refused (1 is committed),
+/// and it fails. Readers take only the pinned key; the audit reports the
+/// stray.
+#[tokio::test(flavor = "current_thread")]
+async fn a_run_racing_under_another_kek_version_never_replaces_the_committed_key() {
+    let t = tenant();
+    let both = TestKek::with_versions(2, &[(1, derived("kek")), (2, derived("kek 2"))]);
+    let (a, b) = (MemRecords::new(), MemRecords::new());
+    let a_key = TenantKey::from_bytes(&t, 1, derived("run A")).unwrap();
+    let (_, a_blob) = wrap_tenant_key(&kek(), &a_key, &mut TestRng(30)).unwrap();
+    let a_name = tk_blob_name(&t, 1, 1);
+    // Run A's state once it has committed: its blob in both buckets, and
+    // the commit pinned to its key.
+    let claims = Claims::default();
+    {
+        let mut s = claims.state.borrow_mut();
+        s.highest = 1;
+        s.tk_version = 1;
+        s.pinned = Some(a_key.check_value());
+    }
+    // Run B saw the claim of version 1 open before A committed.
+    struct Stale<'a>(&'a Claims);
+    impl KeyVersionClaims for Stale<'_> {
+        async fn claim(&self, _t: &TenantId) -> Result<Claim> {
+            Ok(Claim::Claimed(1))
+        }
+        async fn void(&self, t: &TenantId, version: u32) -> Result<Claim> {
+            self.0.void(t, version).await
+        }
+        async fn commit(&self, t: &TenantId, version: u32, kcv: [u8; 8]) -> Result<Commit> {
+            self.0.commit(t, version, kcv).await
+        }
+    }
+    let ha = Hooked {
+        inner: &a,
+        before_put: RefCell::new(Some(Box::new(|| {
+            a.plant(&a_name, a_blob.clone());
+            b.plant(&a_name, a_blob.clone());
+        }))),
+    };
+    let hb = Hooked {
+        inner: &b,
+        before_put: RefCell::new(None),
+    };
+    let buckets = KeyBuckets {
+        by_name: vec![("KEYS_A", &ha), ("KEYS_B", &hb)],
+    };
+    let set = two_in_account();
+    assert!(
+        create_key_version(&set, &buckets, &Stale(&claims), &both, &t, &mut TestRng(31))
+            .await
+            .is_err()
+    );
+    // B's stray is there, under KEK 2, beside A's key under KEK 1.
+    assert_eq!(World::blobs(&a, &t).len(), 2);
+    assert_eq!(claims.state.borrow().pinned, Some(a_key.check_value()));
+
+    // A reader with the pinned check value takes A's key, although the
+    // stray is under the active KEK. Without it, the load is refused.
+    let clock = FixedClock::new(UnixMs(1_700_000_000_000));
+    let plain = KeyBuckets {
+        by_name: vec![("KEYS_A", &a), ("KEYS_B", &b)],
+    };
+    let cache = TkCache::new();
+    let loaded = cache
+        .load(
+            &set,
+            &plain,
+            &both,
+            &clock,
+            &t,
+            1,
+            Some(a_key.check_value()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(loaded.check_value(), a_key.check_value());
+    let cache = TkCache::new();
+    let e = cache
+        .load(&set, &plain, &both, &clock, &t, 1, None)
+        .await
+        .unwrap_err();
+    assert!(velmora_bridge::keys::tk::is_split(&e), "{e:?}");
+    let report = velmora_bridge::keys::audit::audit(&set, &plain, Some(&both))
+        .await
+        .unwrap();
+    assert!(report.findings.iter().any(|f| matches!(
+        f,
+        velmora_bridge::keys::audit::Finding::VersionMismatch { version: 1, .. }
+    )));
+    // A cached key that is not the pinned one is not served.
+    let cache = TkCache::new();
+    let stray = cache.load(&set, &plain, &both, &clock, &t, 1, None).await;
+    assert!(stray.is_err());
 }
