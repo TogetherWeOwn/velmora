@@ -1837,6 +1837,81 @@ async fn a_put_off_job_resumes_at_the_backbone_it_reached() {
     assert_eq!((outbox.stage, outbox.cursor), (OutboxStage::Release, 0));
 }
 
+/// A backbone has no free slot, and the host has a timer: the job waits
+/// for one under its claim. The slots here are those of a holder that
+/// is gone: they free when their permits expire, half a permit lifetime
+/// after the claim, and the job goes on in the same run. Nothing is put
+/// off, and the queue delivers the job once.
+#[tokio::test]
+async fn a_job_waits_under_its_claim_for_a_slot_that_comes_free() {
+    let mut rig = two_backbone_rig().await;
+    rig.with_timer();
+    let (s, _) = rig.posted(48).await;
+    rig.propagate(&s, 0, 1).await;
+    let now = rig.bridge.clock.now();
+    let half = i64::from(PERMIT_SECS) * 500;
+    rig.take_slots(1, now.plus_ms(-half)).await;
+
+    assert_eq!(rig.run(&s, OutboxStage::Verify).await, JobOutcome::Ack);
+
+    let waited = rig.bridge.clock.now().0 - now.0;
+    assert!((half..jobs::SLOT_WAIT_MS).contains(&waited), "{waited}");
+    assert_eq!(
+        checks(&rig, &s),
+        [ok("bb0", VerifyKind::Body), ok("bb1", VerifyKind::Stat)]
+    );
+    let outbox = rig.outbox(&s);
+    assert_eq!((outbox.stage, outbox.cursor), (OutboxStage::Release, 0));
+    assert_eq!(rig.bridge.nntp.live(), 0);
+}
+
+/// The slots stay taken (their holder is at work and renews them): the
+/// job waits one permit lifetime from its claim and no longer, then is
+/// put off as a job without a timer is at once. The row's attempts are
+/// what they were before the claim, and the row says where the job got
+/// to.
+#[tokio::test]
+async fn a_job_that_waited_in_vain_is_put_off_without_an_attempt() {
+    let mut rig = two_backbone_rig().await;
+    rig.with_timer();
+    let (s, _) = rig.posted(49).await;
+    rig.propagate(&s, 0, 1).await;
+    let now = rig.bridge.clock.now();
+    // Held past the end of the wait, as after a renewal.
+    let held = rig.take_slots(1, now.plus_secs(30)).await;
+    let attempts = rig.outbox(&s).attempts;
+
+    let delay = retry_delay(&rig.run(&s, OutboxStage::Verify).await);
+
+    assert!((15..=60).contains(&delay), "delay {delay}");
+    let ended = rig.bridge.clock.now();
+    let poll = i64::from(jobs::SLOT_POLL_MS);
+    let waited = ended.0 - now.0;
+    assert!(
+        (jobs::SLOT_WAIT_MS..jobs::SLOT_WAIT_MS + poll).contains(&waited),
+        "{waited}"
+    );
+    assert_eq!(checks(&rig, &s), [ok("bb0", VerifyKind::Body)]);
+    let outbox = rig.outbox(&s);
+    assert_eq!(
+        (outbox.stage, outbox.cursor, outbox.attempts),
+        (OutboxStage::Verify, 8, attempts)
+    );
+    assert_eq!(outbox.next_at, ended.plus_secs(delay));
+    assert_eq!(rig.bridge.nntp.live(), 0);
+
+    // The job that comes back finds the slot and asks that backbone only.
+    for permit in held {
+        rig.bridge.catalog.release_permit(&permit).await.unwrap();
+    }
+    rig.bridge.clock.advance_secs(60);
+    assert_eq!(rig.run(&s, OutboxStage::Verify).await, JobOutcome::Ack);
+    assert_eq!(
+        checks(&rig, &s),
+        [ok("bb0", VerifyKind::Body), ok("bb1", VerifyKind::Stat)]
+    );
+}
+
 /// A lease lost while a later backbone is read: the first backbone's
 /// result, written under the lease, stays; nothing more is written, and
 /// the new holder's row is as its claim found it.

@@ -1879,6 +1879,37 @@ pub async fn rig(specs: &[Spec]) -> Rig {
     }
 }
 
+impl Rig {
+    /// The host has a timer from here on, as the Worker has: a job may
+    /// wait, and each wait moves the rig's clock by its length.
+    pub fn with_timer(&mut self) {
+        let clock = self.bridge.clock.clone();
+        self.bridge.budget = ByteBudget::new(48 * 1024 * 1024).with_sleeper(Rc::new(move |ms| {
+            clock.advance_ms(i64::from(ms));
+            Box::pin(async {})
+        }));
+    }
+
+    /// Takes every background slot of provider `index` for another
+    /// holder, as of `at`: they expire one permit lifetime after it.
+    pub async fn take_slots(&self, index: usize, at: UnixMs) -> Vec<Permit> {
+        let provider = &self.bridge.cfg.providers[index];
+        let class = PermitClass::Background;
+        let mut held = Vec::new();
+        while let Some(permit) = self
+            .bridge
+            .catalog
+            .acquire_permit(provider, class, "other", at)
+            .await
+            .unwrap()
+        {
+            held.push(permit);
+        }
+        assert!(!held.is_empty());
+        held
+    }
+}
+
 /// A single provider that posts and reads, two connections.
 pub async fn simple_rig() -> Rig {
     rig(&[Spec {
