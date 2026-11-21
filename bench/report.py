@@ -189,6 +189,7 @@ def model(counts, labels, prices, cpu):
         return {a: v * k for a, v in d.items()}
 
     cpu = cpu or {}
+    missing_cpu = [k for k in ("ingest_ms_per_extent", "hot_get_ms_per_mib", "cold_get_ms_per_mib") if k not in cpu]
     ingest_parts = {
         "s3_upload": ingest_s3,
         "post": stages["post"],
@@ -228,7 +229,8 @@ def model(counts, labels, prices, cpu):
             "extent_bytes": EXTENT,
             "extents_per_tb": EXTENTS_PER_TB,
             "hold_days": hold_days,
-            "cpu_source": cpu.get("source", "none: CPU priced at 0"),
+            "cpu_source": (cpu.get("source", "from --cpu, no source given") if cpu else "none: CPU priced at 0")
+            + ("; not given, priced at 0: " + ", ".join(missing_cpu) if cpu and missing_cpu else ""),
             "cpu": {k: v for k, v in cpu.items() if k != "source"},
         },
         "per_extent_ingest": {k: v for k, v in ingest_parts.items()},
@@ -369,6 +371,9 @@ def load_cpu(path):
     provenance. Exits with the reason otherwise."""
     cpu = json.loads(Path(path).read_text())
     timed = ("ingest_ms_per_extent", "hot_get_ms_per_mib", "cold_get_ms_per_mib")
+    unknown = sorted(set(cpu) - set(timed) - {"source"})
+    if unknown:
+        sys.exit(f"--cpu: unknown keys (a typo?): {', '.join(unknown)}")
     bad = [k for k in timed if k in cpu and (isinstance(cpu[k], bool) or not isinstance(cpu[k], (int, float))
                                               or not math.isfinite(cpu[k]) or cpu[k] < 0)]
     if bad:

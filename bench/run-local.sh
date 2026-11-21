@@ -48,14 +48,18 @@ done
 log() { printf '[bench %s] %s\n' "$(date -u +%H:%M:%S)" "$*" >&2; }
 # The scratch directory holds the wrangler this script runs: it must be
 # ours and closed to other users, or another local user could put code
-# there that runs as us. A new one is made 700; an existing one that others
-# may write to is refused, not repaired (what they left there stays).
+# there that runs as us. A new one is made 700; an existing one of ours is
+# closed to others (chmod go-w), and the wrangler install inside it is
+# checked on its own below (owner, not writable by others).
 while [[ $WORK == */ && $WORK != / ]]; do WORK=${WORK%/}; done
 # Two first runs may race to make it: whichever loses goes on to the checks.
 if [[ ! -e $WORK ]]; then mkdir -p -- "$(dirname -- "$WORK")"; mkdir -m 700 -- "$WORK" 2>/dev/null || true; fi
 writable_by_others() { [[ -n $(find "$1" -maxdepth 0 -perm /022 2>/dev/null) ]]; }
-if [[ -L $WORK || ! -d $WORK || ! -O $WORK ]] || writable_by_others "$WORK"; then
-  log "FAILED: $WORK is a symlink, not a directory, not owned by $(id -un) or writable by others"; exit 1
+if [[ -L $WORK || ! -d $WORK || ! -O $WORK ]]; then
+  log "FAILED: $WORK is a symlink, not a directory or not owned by $(id -un)"; exit 1
+fi
+if writable_by_others "$WORK"; then
+  log "closing $WORK to other users (chmod go-w)"; chmod go-w -- "$WORK"
 fi
 WORK=$(cd -P -- "$WORK" && pwd)
 
