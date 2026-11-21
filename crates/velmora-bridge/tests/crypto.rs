@@ -1221,9 +1221,14 @@ fn extent_sealer_refuses_a_chunk_of_the_wrong_length_and_then_everything() {
         ExtentSealer::begin(&k, &b, &extent(1), len as u64, &mut TestRng::new("r")).unwrap()
     };
 
-    // A short chunk that is not the final one.
+    // A short chunk that is not the final one. The sealer still lacks
+    // the whole extent afterwards, and it is not a new one any more:
+    // nothing may make a stream of it.
     let mut s = begin(plain.len());
+    assert!(s.is_new());
     assert!(is_crypto(&s.seal_next(&plain[..CHUNK - 1]).unwrap_err()));
+    assert_eq!(s.remaining(), plain.len() as u64);
+    assert!(!s.is_new() && !s.is_complete());
     assert!(
         s.seal_next(&plain[..CHUNK]).is_err(),
         "nothing after a refusal"
@@ -1245,6 +1250,7 @@ fn extent_sealer_refuses_a_chunk_of_the_wrong_length_and_then_everything() {
     // An empty chunk where bytes are due.
     let mut s = begin(100);
     assert!(s.seal_next(&[]).is_err());
+    assert!(s.remaining() == 100 && !s.is_new());
     assert!(
         s.seal_next(&plain[..100]).is_err(),
         "nothing after a refusal"
