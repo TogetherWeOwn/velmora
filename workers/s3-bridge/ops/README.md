@@ -603,7 +603,8 @@ requests in flight, and give rclone one connection per request:
   --s3-upload-concurrency 4 --transfers 4 --s3-disable-http2` (in the
   remote's section of `rclone.conf`: `upload_cutoff = 16M`,
   `chunk_size = 16M`, `upload_concurrency = 4`, `disable_http2 = true`;
-  `--transfers` is a global flag, not an `rclone.conf` key).
+  a plain `transfers` key in the section is ignored: pass `--transfers`,
+  or write `global.transfers = 4` in the remote's section).
   - The upload concurrency is per file and applies to multipart
     uploads only: rclone sends up to `transfers x upload_concurrency`
     parts at once, and one PutObject per transfer for a file below the
@@ -638,8 +639,9 @@ requests in flight, and give rclone one connection per request:
 Why these values:
 
 - **Extents.** One extent holds 16 MiB. A part of 16 MiB is one full
-  extent; a smaller part is an extent of its own. Each extent costs the
-  same catalogue rows and queue jobs whatever its size. Usenet articles
+  extent; a smaller part is an extent of its own. With `PACKED_PLANS` on
+  (as in production), each extent costs the same catalogue rows and
+  queue jobs whatever its size. Usenet articles
   follow the bytes instead (24 for a full 16 MiB extent, one for a tiny
   one), so fewer extents do not cut posts in the same proportion. A
   single PutObject above 16 MiB is stored in slices of 8 MiB (see
@@ -674,7 +676,11 @@ Why these values:
   No answer was a 5xx, and no client retried.
   - Big parts gain less than small files: the parts in one Worker
     isolate share its CPU and its in-flight byte budget, so one part
-    takes about 5.3 s at 16 at once.
+    takes about 5.3 s at 16 at once. A 16 MiB part counts 32 MiB
+    (plaintext and ciphertext) against an isolate's 48 MiB
+    `INFLIGHT_BUDGET_BYTES`, so one isolate stores one such part at a
+    time; another waits up to 20 s for budget, then gets 503
+    `SlowDown`, which clients retry. None was refused in these runs.
   - rclone sends all its requests to one host over a single HTTP/2
     connection, and that one connection carries 7 to 16 MiB/s at any
     concurrency. `--disable-http2` gives each request its own
@@ -682,7 +688,12 @@ Why these values:
 
 A running `rclone rcd` keeps the flags it was started with: a changed
 startup command takes effect only when the daemon restarts, and a
-restart aborts the copies it runs.
+restart aborts the copies it runs. Without a restart, `rclone rc
+backend/command command=set fs=<remote>: -o upload_cutoff=16M -o
+chunk_size=16M -o upload_concurrency=4` changes the remote's settings
+and `rclone rc options/set --json '{"main":{"Transfers":4}}'` the
+transfers, both for new copies; `disable_http2` applies only to a
+remote built anew (a job's fs string `<remote>,disable_http2=true:`).
 
 ## A PutObject or an UploadPart above one extent
 
@@ -722,7 +733,8 @@ object above 156 GiB does not fit this build.
   [Client settings](#client-settings) instead: multipart from 16 MiB, in
   parts of 16 MiB. Parts up to 95 MiB work too (`--s3-chunk-size 95M`;
   aws-cli: `multipart_chunksize = 95MB`), within the object size above,
-  but they save requests, not extents.
+  but they cost more extents: a part above 16 MiB is cut into slices of
+  8 MiB, about twice as many extents as parts of 16 MiB.
 - Before its first slice is stored, the request writes one row per
   slice into `write_intents`. The commit removes the rows. A request
   that died leaves its rows, and its slices in `SAFETY`.
