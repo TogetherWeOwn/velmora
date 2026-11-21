@@ -600,15 +600,18 @@ Write with parts of 16 MiB, start multipart at 16 MiB, keep about 16
 requests in flight, and give rclone one connection per request:
 
 - rclone: `--s3-upload-cutoff 16M --s3-chunk-size 16M
-  --s3-upload-concurrency 16 --transfers 16 --disable-http2` (in
-  `rclone.conf`: `upload_cutoff = 16M`, `chunk_size = 16M`,
-  `upload_concurrency = 16`; `--transfers` and `--disable-http2` are
-  global flags, not `rclone.conf` keys).
+  --s3-upload-concurrency 4 --transfers 4 --s3-disable-http2` (in the
+  remote's section of `rclone.conf`: `upload_cutoff = 16M`,
+  `chunk_size = 16M`, `upload_concurrency = 4`, `disable_http2 = true`;
+  `--transfers` is a global flag, not an `rclone.conf` key).
   - The upload concurrency is per file: rclone sends up to
-    `transfers x upload_concurrency` parts at once. For a tree of many
-    files above 16 MiB, keep that product near 16, for example
-    `--transfers 4 --s3-upload-concurrency 4`. More than 16 requests at
-    once was not measured.
+    `transfers x upload_concurrency` parts at once. Keep that product
+    near 16: `4 x 4` for a tree of many files, `--transfers 1
+    --s3-upload-concurrency 16` for one large file. More than 16
+    requests at once was not measured.
+  - The global `--disable-http2` does the same for every remote of the
+    command; `disable_http2` in the remote's section applies to this
+    remote only.
 - aws-cli, in `~/.aws/config`:
 
   ```ini
@@ -628,7 +631,9 @@ Why these values:
 
 - **Extents.** One extent holds 16 MiB. A part of 16 MiB is one full
   extent; a smaller part is an extent of its own. Each extent costs the
-  same catalogue rows, queue jobs and Usenet posts whatever its size. A
+  same catalogue rows and queue jobs whatever its size. Usenet articles
+  follow the bytes instead (24 for a full 16 MiB extent, one for a tiny
+  one), so fewer extents do not cut posts in the same proportion. A
   single PutObject above 16 MiB is stored in slices of 8 MiB (see
   below). With multipart from 16 MiB in 16 MiB parts, a file of 16 to
   95 MiB takes `ceil(size / 16 MiB)` extents. Measured on a test
@@ -667,8 +672,9 @@ Why these values:
     concurrency. `--disable-http2` gives each request its own
     connection.
 
-Flags of a running `rclone rcd` apply to new uploads only; restarting
-it aborts the copies it runs.
+A running `rclone rcd` keeps the flags it was started with: a changed
+startup command takes effect only when the daemon restarts, and a
+restart aborts the copies it runs.
 
 ## A PutObject or an UploadPart above one extent
 
