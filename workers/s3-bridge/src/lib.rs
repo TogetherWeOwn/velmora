@@ -39,6 +39,12 @@ use worker::{
     QueueRetryOptionsBuilder, Request, Response, Result, ScheduleContext, ScheduledEvent,
 };
 
+/// Raise this by one in the PR that ships a fence a rollback must never cross.
+/// The deploy job refuses bundles below the production variable VELMORA_FLOOR_MIN,
+/// so a revert of that PR cannot deploy regardless of its ancestry.
+/// See "Rollback floor" in ops/README.md.
+pub const FLOOR_LEVEL: u32 = 0;
+
 /// Error class for logs: the variant only, never its text.
 fn error_class(e: &BridgeError) -> &'static str {
     match e {

@@ -577,9 +577,10 @@ Above the floor a rollback is still not free:
 - (Versions from before the recovery records, #64, write no record at
   all; they are below the #71 floor anyway.)
 
-The CI auto-rollback only ever goes back to the version that served
-before that run's deploy, which is above the floor once the floor has
-been deployed. The floor matters for a rollback by hand.
+The CI auto-rollback targets the version that served before that run's
+deploy. If a rollback floor version is configured, CI refuses a target
+created before that version or an age comparison it cannot complete.
+Apply the same floor when rolling back by hand.
 
 To find the floor (version IDs are per account, so they are not listed
 here):
@@ -598,6 +599,46 @@ here):
    <commit>`. The first version for which it succeeds is the floor. A secret-change
    version takes the answer of the version before it. Treat any other
    version without a CI message (an upload by hand) as below the floor.
+
+## Deploy switches
+
+Set these GitHub configuration variables for production:
+
+| Variable | Effect and default |
+|---|---|
+| `VELMORA_MAINTENANCE` | `restore` enables restore mode. Defaults to `off`. |
+| `VELMORA_CATALOGUE_ID` | Sets the catalogue name used in rollback stamps. Defaults to `main`. Use 1 to 32 lowercase letters, digits, underscores or hyphens. Keep the id stable for a catalogue in use. |
+| `VELMORA_JOB_FORMAT` | Selects job format `1` or `2` once the Worker supports the switch. Defaults to `1`. |
+| `VELMORA_DEPLOY_FREEZE` | Allows only the specified full lowercase commit SHA to deploy. Unset allows any commit that passes the tip check. |
+| `VELMORA_FLOOR_MIN` | Sets the minimum bundle floor level. Defaults to `0`. |
+| `VELMORA_FLOOR_VERSION` | Sets the earliest automatic rollback target by Worker version UUID and creation time. Unset disables this comparison. |
+| `VELMORA_CATALOGUE_MIGRATIONS` | `on` (default) applies catalogue migrations. `off` checks that none are pending and refuses the deploy if any are. Set this as a repository variable so PR checks and the deploy job read the same setting. |
+| `VELMORA_DIRECTORY_D1_ID` | Binds the directory D1 database by lowercase UUID and applies its migrations. Unset leaves it unbound. |
+
+For a switch deploy, set the variable and re-run the deploy jobs of the
+tip commit's push run. The bundle artifact is kept for 30 days. Within
+that window, the deploy jobs alone can be re-run. After the window,
+re-run all the jobs of that run to build the same commit again. Check
+the switch values printed in the log and confirm that the deployed
+commit id matches the commit serving before the switch deploy.
+
+`FLOOR_LEVEL` travels with the bundle. Raise it by one in the PR that
+ships a fence a rollback must never cross. Once that deploy is live
+and before the next merge, raise `VELMORA_FLOOR_MIN` by hand to the new
+level. Set `VELMORA_FLOOR_VERSION` to the Worker version that establishes
+the floor so automatic rollback also respects it.
+
+Create the directory database once by hand with
+`wrangler d1 create velmora-directory --location enam`. Set its id as
+`VELMORA_DIRECTORY_D1_ID`. The binding is unused until Worker code
+reads it.
+
+Migration files are append-only. Give each new SQL file a name
+`NNNN_<snake>.sql` with a number higher than all existing numbers in
+its folder. Use additive SQL. A deliberate, reviewed destructive
+contract step requires a first line of `-- contract: <reason>`. With
+catalogue migrations `off`, CI also refuses new files in the catalogue
+migration folder. Directory migrations run independently.
 
 ## More than one S3 host
 

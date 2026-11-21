@@ -346,6 +346,12 @@ jobs:
       - name: Test the production config generator
         working-directory: workers/s3-bridge
         run: python3 -I tools/test_deploy_config.py
+      - name: Test the deploy switches and rollback
+        working-directory: workers/s3-bridge
+        run: python3 -I tools/test_deploy_switches.py
+      - name: Test the migration file check
+        working-directory: workers/s3-bridge
+        run: python3 -I tools/test_migrations_check.py
       # bundle.sh: worker-build, then the `name` section is dropped. The
       # same script builds the deploy artifact and the wrangler dev bundle.
       - name: Build the Worker bundle
@@ -471,9 +477,83 @@ jobs:
         working-directory: workers/alerts
         run: node --test test/*.test.js
 
+  migrations-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Check migration files
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          VELMORA_CATALOGUE_MIGRATIONS: ${{ vars.VELMORA_CATALOGUE_MIGRATIONS }}
+        run: |
+          set -euo pipefail
+          python3 -I - <<'PY'
+          import os, re, subprocess, sys
+
+          base = os.environ.get("BASE_SHA", "")
+          if not base or set(base) == {"0"}:
+              print("migration check skipped: this event has no base commit")
+              sys.exit(0)
+          head = os.environ["HEAD_SHA"]
+
+          def git(*args):
+              return subprocess.check_output(["git", *args])
+
+          destructive = re.compile(
+              r"\bDROP\s+(?:TABLE|COLUMN)\b|\bALTER\s+TABLE\b[^;]*\b(?:DROP|RENAME)\b",
+              re.IGNORECASE,
+          )
+          filename = re.compile(r"([0-9]{4})_[a-z][a-z0-9]*(?:_[a-z0-9]+)*\.sql")
+          checked = 0
+          errors = []
+          for folder in ("workers/s3-bridge/migrations/", "workers/s3-bridge/migrations-directory/"):
+              # With rename detection off, a move out of a folder is a removal.
+              diff = git("diff", "--no-renames", "--name-status", "-z", base, head, "--", folder)
+              changes = diff.decode("utf-8", "surrogateescape").split("\0")
+              existing = git("ls-tree", "-r", "--name-only", "-z", base, "--", folder)
+              numbers = re.findall(rb"(?:^|/)([0-9]+)_[^/\x00]+\.sql\x00", existing)
+              highest = max(map(int, numbers), default=-1)
+              new_numbers = set()
+              for status, path in zip(changes[::2], changes[1::2]):
+                  name = path.removeprefix(folder)
+                  # The deploy job also checks the database for pending migrations.
+                  if (status == "A" and folder.endswith("/migrations/")
+                          and os.environ.get("VELMORA_CATALOGUE_MIGRATIONS") == "off"):
+                      errors.append("no new catalogue migration while VELMORA_CATALOGUE_MIGRATIONS is off")
+                      if not name.endswith(".sql"):
+                          print(f"checking migration file {path!r}")
+                          checked += 1
+                  if not name.endswith(".sql"):
+                      continue
+                  print(f"checking migration file {path!r}")
+                  checked += 1
+                  if status != "A":
+                      errors.append(f"migration {name} was changed or removed; migrations are append-only")
+                      continue
+                  match = filename.fullmatch(name)
+                  number = int(match[1]) if match else -1
+                  if not match or number <= highest or number in new_numbers:
+                      errors.append(f"migration {name} must use a unique NNNN_<snake>.sql number greater than {highest}")
+                  new_numbers.add(number)
+                  sql = git("show", f"{head}:{path}").decode("utf-8")
+                  first = sql.partition("\n")[0].removesuffix("\r")
+                  if (destructive.search(re.sub(r"--[^\r\n]*", "", sql))
+                          and not re.fullmatch(r"-- contract: \S.*", first)):
+                      errors.append(f"migration {name} contains destructive SQL without a first-line contract reason")
+
+          print(f"migration check: {checked} file(s) checked, {len(errors)} error(s)")
+          if errors:
+              sys.exit("\n".join(errors))
+          PY
+
   ci-ok:
     name: ci-ok
-    needs: [rust-test, rust-wasm, rust-worker-pinned-tls, rust-msrv, cargo-deny, public-pr-security, changes, bridge-native, worker-build, worker-e2e, console-test, alerts-test]
+    needs: [rust-test, rust-wasm, rust-worker-pinned-tls, rust-msrv, cargo-deny, public-pr-security, changes, bridge-native, worker-build, worker-e2e, console-test, alerts-test, migrations-check]
     if: ${{ always() }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -573,13 +653,30 @@ jobs:
           size=$(stat -c %s build/index_bg.wasm)
           echo "index_bg.wasm: ${size} bytes (budget 3000000)"
           test "$size" -lt 3000000
+      - name: Write the floor level beside the bundle
+        if: steps.fresh.outputs.fresh == 'true'
+        working-directory: workers/s3-bridge
+        run: |
+          set -euo pipefail
+          python3 -I - <<'PY'
+          from pathlib import Path
+          import re, sys
+
+          source = Path("src/lib.rs").read_text(encoding="utf-8")
+          levels = re.findall(r"^pub const FLOOR_LEVEL: u32 = ([0-9]+);$", source, re.MULTILINE)
+          if len(levels) != 1:
+              sys.exit("expected exactly one FLOOR_LEVEL constant in src/lib.rs")
+          level = levels[0]
+          Path("build/floor-level").write_text(level + "\n", encoding="utf-8")
+          print(f"floor level: {level}")
+          PY
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: steps.fresh.outputs.fresh == 'true'
         with:
           name: s3-bridge-bundle
           path: workers/s3-bridge/build/
           if-no-files-found: error
-          retention-days: 1
+          retention-days: 30
       # The unstripped wasm of this release: it names the functions in a
       # production trace frame `wasm-function[N]:0xOFF` (same indices and
       # code offsets). Not deployed. See workers/s3-bridge/ops/README.md,
@@ -601,6 +698,8 @@ jobs:
     environment: production
     permissions:
       contents: read
+    outputs:
+      rollback: ${{ steps.rollback.outputs.rollback }}
     # One production deploy at a time; a running deploy is never cancelled.
     concurrency:
       group: deploy-production
@@ -631,6 +730,63 @@ jobs:
         with:
           name: s3-bridge-bundle
           path: workers/s3-bridge/build
+      - name: Check the deploy switches
+        if: steps.fresh.outputs.fresh == 'true'
+        id: switches
+        env:
+          VELMORA_DEPLOY_FREEZE: ${{ vars.VELMORA_DEPLOY_FREEZE }}
+          VELMORA_FLOOR_MIN: ${{ vars.VELMORA_FLOOR_MIN }}
+          VELMORA_FLOOR_VERSION: ${{ vars.VELMORA_FLOOR_VERSION }}
+          VELMORA_CATALOGUE_MIGRATIONS: ${{ vars.VELMORA_CATALOGUE_MIGRATIONS }}
+          FLOOR_LEVEL_FILE: workers/s3-bridge/build/floor-level
+        run: |
+          set -euo pipefail
+          python3 -I - <<'PY'
+          from pathlib import Path
+          import os, re, sys
+
+          freeze = os.environ.get("VELMORA_DEPLOY_FREEZE", "")
+          if freeze:
+              if not re.fullmatch(r"[0-9a-f]{40}", freeze):
+                  sys.exit("VELMORA_DEPLOY_FREEZE must be unset or a full 40-hex commit id")
+              sha = os.environ["GITHUB_SHA"]
+              if freeze != sha:
+                  print(f"::error::deploy frozen: only commit {freeze} may deploy; this run is {sha}")
+                  sys.exit(1)
+              print("deploy freeze: on, this commit is the one allowed")
+          else:
+              print("deploy freeze: off")
+
+          try:
+              level = Path(os.environ["FLOOR_LEVEL_FILE"]).read_bytes()
+          except OSError:
+              level = b""
+          if not re.fullmatch(rb"[0-9]+\n?", level):
+              sys.exit("the bundle has no valid floor level")
+          minimum = os.environ.get("VELMORA_FLOOR_MIN", "") or "0"
+          if not re.fullmatch(r"[0-9]+", minimum):
+              sys.exit("VELMORA_FLOOR_MIN must be unset or a whole number")
+          # Compare decimal digits without an integer conversion size limit.
+          level = level.decode("ascii").rstrip("\n").lstrip("0") or "0"
+          minimum = minimum.lstrip("0") or "0"
+          if (len(level), level) < (len(minimum), minimum):
+              print(f"::error::bundle floor level {level} is below VELMORA_FLOOR_MIN {minimum}; refusing to deploy")
+              sys.exit(1)
+          print(f"floor level of this bundle: {level}; required minimum: {minimum}")
+
+          version = os.environ.get("VELMORA_FLOOR_VERSION", "")
+          uuid = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+          if version and not re.fullmatch(uuid, version):
+              sys.exit("VELMORA_FLOOR_VERSION must be unset or a lowercase version id (UUID)")
+          print(f"rollback floor version: {version or 'unset'}")
+
+          migrations = os.environ.get("VELMORA_CATALOGUE_MIGRATIONS", "") or "on"
+          if migrations not in ("on", "off"):
+              sys.exit("VELMORA_CATALOGUE_MIGRATIONS must be unset, on or off")
+          print(f"catalogue migrations: {migrations}")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write(f"migrations={migrations}\nfloor_version={version}\n")
+          PY
       # Pinned wrangler from the committed lockfile; no install scripts run,
       # and no credentials are in env.
       - name: Install pinned wrangler (npm ci)
@@ -699,6 +855,10 @@ jobs:
           VELMORA_RECOVERY_PREFIX: ${{ vars.VELMORA_RECOVERY_PREFIX }}
           VELMORA_VERIFY_MODE: ${{ vars.VELMORA_VERIFY_MODE }}
           VELMORA_RECORD_LAYOUT: ${{ vars.VELMORA_RECORD_LAYOUT }}
+          VELMORA_MAINTENANCE: ${{ vars.VELMORA_MAINTENANCE }}
+          VELMORA_CATALOGUE_ID: ${{ vars.VELMORA_CATALOGUE_ID }}
+          VELMORA_JOB_FORMAT: ${{ vars.VELMORA_JOB_FORMAT }}
+          VELMORA_DIRECTORY_D1_ID: ${{ vars.VELMORA_DIRECTORY_D1_ID }}
         run: |
           set -euo pipefail
           python3 -I - wrangler.toml wrangler.deploy.toml <<'PY'
@@ -712,7 +872,8 @@ jobs:
           hostname = re.compile(rf"{label}(\.{label})+")
           if len(host) > 253 or not hostname.fullmatch(host):
               sys.exit("VELMORA_S3_HOST is missing or not a plain lowercase hostname")
-          if not re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", dbid):
+          uuid = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+          if not re.fullmatch(uuid, dbid):
               sys.exit("VELMORA_D1_DATABASE_ID is missing or not a lowercase UUID")
           copy = os.environ.get("VELMORA_RECOVERY_COPY", "") or "off"
           prefix = os.environ.get("VELMORA_RECOVERY_PREFIX", "")
@@ -731,26 +892,62 @@ jobs:
           if layout not in ("flat", "tenant"):
               sys.exit("VELMORA_RECORD_LAYOUT must be unset, flat or tenant")
 
+          maintenance = os.environ.get("VELMORA_MAINTENANCE", "") or "off"
+          if maintenance not in ("off", "restore"):
+              sys.exit("VELMORA_MAINTENANCE must be unset, off or restore")
+          catalogue = os.environ.get("VELMORA_CATALOGUE_ID", "")
+          if catalogue and not re.fullmatch(r"[a-z0-9_-]{1,32}", catalogue):
+              sys.exit("VELMORA_CATALOGUE_ID must be unset or 1 to 32 of a-z 0-9 _ -")
+          job_format = os.environ.get("VELMORA_JOB_FORMAT", "")
+          if job_format not in ("", "1", "2"):
+              sys.exit("VELMORA_JOB_FORMAT must be unset, 1 or 2")
+          directory = os.environ.get("VELMORA_DIRECTORY_D1_ID", "")
+          if directory and not re.fullmatch(uuid, directory):
+              sys.exit("VELMORA_DIRECTORY_D1_ID must be unset or a lowercase UUID")
+          if directory == dbid:
+              sys.exit("VELMORA_DIRECTORY_D1_ID must not be the catalogue database")
+
           with open(src, encoding="utf-8") as f:
               lines = f.read().split("\n")
           header = re.compile(r"\s*\[")
           # The prod section ends at the first [env.*] table header.
           end = next((i for i, l in enumerate(lines)
                       if re.match(r"\s*\[\[?env\.", l)), len(lines))
-          host_key = re.compile(r"""\s*(?:S3_HOSTS|"S3_HOSTS"|'S3_HOSTS')\s*[.=]""")
-          if any(host_key.match(line) for line in lines[:end]):
-              sys.exit("the prod section of the shipped file sets S3_HOSTS")
-          def sets_s3_hosts(value):
+          def count_key(value, key):
               if isinstance(value, dict):
-                  return "S3_HOSTS" in value or any(map(sets_s3_hosts, value.values()))
-              return isinstance(value, list) and any(map(sets_s3_hosts, value))
+                  return (key in value) + sum(count_key(item, key) for item in value.values())
+              if isinstance(value, list):
+                  return sum(count_key(item, key) for item in value)
+              return 0
+
+          def assignment(key):
+              return re.compile(rf'''\s*(?:{key}|"{key}"|'{key}')\s*[.=]''')
 
           try:
               shipped_prod = tomllib.loads("\n".join(lines[:end]))
           except tomllib.TOMLDecodeError:
               shipped_prod = {}  # The generated config is checked below.
-          if sets_s3_hosts(shipped_prod):
-              sys.exit("the prod section of the shipped file sets S3_HOSTS")
+          for key in ("S3_HOSTS", "CATALOGUE_ID", "JOB_FORMAT"):
+              if any(assignment(key).match(line) for line in lines[:end]) or count_key(shipped_prod, key):
+                  sys.exit(f"the prod section of the shipped file sets {key}")
+
+          maintenance_line = re.compile(r'^\s*MAINTENANCE = "off"(\s+#.*)?$')
+          hits = [i for i in range(end) if maintenance_line.fullmatch(lines[i])]
+          if len(hits) != 1:
+              sys.exit('expected exactly one prod line MAINTENANCE = "off"')
+          maintenance_at = hits[0]
+          tables = [line.strip() for line in lines[:maintenance_at] if header.match(line)]
+          if tables[-1:] != ["[vars]"]:
+              sys.exit("the prod MAINTENANCE line is not in the [vars] table")
+          if (any(assignment("MAINTENANCE").match(lines[i]) for i in range(end) if i != maintenance_at)
+                  or count_key(shipped_prod, "MAINTENANCE") > 1):
+              sys.exit("the prod section sets MAINTENANCE a second time")
+
+          shipped_d1 = shipped_prod.get("d1_databases", [])
+          if (any(re.fullmatch(r'''\s*binding\s*=\s*["']DIRECTORY["']\s*(?:#.*)?''', line)
+                  for line in lines[:end])
+                  or any(db.get("binding") == "DIRECTORY" for db in shipped_d1)):
+              sys.exit("the prod section of the shipped file binds DIRECTORY")
           entries = hosts.split(",") if hosts else []
           seen = {host}
           classes = []
@@ -804,6 +1001,33 @@ jobs:
               lines[i] = indent + value
               if hosts and placeholder.startswith("S3_HOST "):
                   lines[i] += f'\n{indent}S3_HOSTS = "{hosts}"'
+          lines[maintenance_at] = lines[maintenance_at].replace('MAINTENANCE = "off"', f'MAINTENANCE = "{maintenance}"', 1)
+          for key, value in (("CATALOGUE_ID", catalogue), ("JOB_FORMAT", job_format)):
+              if value:
+                  lines[maintenance_at] += f'\n{key} = "{value}"'
+
+          directory_table = []
+          if directory:
+              catalogue_tables = [
+                  i for i in range(end) if lines[i].strip() == "[[d1_databases]]"
+              ]
+              anchors = []
+              for table in catalogue_tables:
+                  stop = next((i for i in range(table + 1, end) if header.match(lines[i])), end)
+                  if any(line.strip() == 'binding = "CATALOG"' for line in lines[table + 1:stop]):
+                      anchors.extend(i for i in range(table + 1, stop)
+                                     if lines[i].strip() == 'migrations_dir = "migrations"')
+              if len(anchors) != 1:
+                  sys.exit("expected exactly one prod CATALOG migrations_dir line")
+              directory_table = [{
+                  "binding": "DIRECTORY",
+                  "database_name": "velmora-directory",
+                  "database_id": directory,
+                  "migrations_dir": "migrations-directory",
+              }]
+              lines[anchors[0]] += '\n\n[[d1_databases]]' + "".join(
+                  f'\n{key} = "{value}"' for key, value in directory_table[0].items()
+              )
           builds = [i for i in range(end) if lines[i].strip() == "[build]"]
           if len(builds) != 1:
               sys.exit(f"expected exactly one prod [build] table, found {len(builds)}")
@@ -815,7 +1039,8 @@ jobs:
           # written, before the file exists: a refusal leaves no file.
           # No RECORD_LAYOUT at all is "flat" to the Worker.
           try:
-              prod_vars = tomllib.loads(text)["vars"]
+              prod = tomllib.loads(text)
+              prod_vars = prod["vars"]
               found = prod_vars.get("RECORD_LAYOUT")
           except (tomllib.TOMLDecodeError, KeyError, AttributeError):
               sys.exit("the generated config is not valid TOML with a prod [vars] table")
@@ -823,9 +1048,24 @@ jobs:
               sys.exit("the generated config does not carry the record layout that was asked for")
           if prod_vars.get("S3_HOSTS") != (hosts or None):
               sys.exit("the generated config does not carry the S3 hosts that were asked for")
+          for key, value in (("MAINTENANCE", maintenance), ("CATALOGUE_ID", catalogue or None),
+                             ("JOB_FORMAT", job_format or None)):
+              if prod_vars.get(key) != value:
+                  sys.exit(f"the generated config does not carry the {key} that was asked for")
+          expected_catalogue = [{**db, "database_id": dbid} for db in shipped_d1
+                                if db.get("binding") == "CATALOG"]
+          actual_d1 = prod.get("d1_databases", [])
+          if (len(expected_catalogue) != 1
+                  or [db for db in actual_d1 if db.get("binding") == "CATALOG"] != expected_catalogue
+                  or [db for db in actual_d1 if db.get("binding") == "DIRECTORY"] != directory_table):
+              sys.exit("the generated config does not carry the expected D1 bindings")
           with open(dst, "w", encoding="utf-8") as f:
               f.write(text)
           print(f"wrangler.deploy.toml: prod placeholders substituted, prod [build] removed, recovery copy {copy}, verify mode {mode}")
+          print(f"maintenance in the generated config: {maintenance}")
+          print(f"catalogue id in the generated config: {catalogue or 'main (default)'}")
+          print(f"job format in the generated config: {job_format or '1 (default)'}")
+          print(f"directory database in the generated config: {'bound' if directory else 'none'}")
           print(f"record layout in the generated config: {layout}")
           class_list = f" ({','.join(classes)})" if classes else ""
           print(f"extra S3 hosts in the generated config: {len(classes)}{class_list}")
@@ -859,12 +1099,34 @@ jobs:
             exit 1
           fi
       - name: Apply D1 migrations (remote)
-        if: steps.fresh.outputs.fresh == 'true'
+        if: steps.fresh.outputs.fresh == 'true' && steps.switches.outputs.migrations == 'on'
         working-directory: workers/s3-bridge
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: ./node_modules/.bin/wrangler d1 migrations apply velmora-catalog --remote -c wrangler.deploy.toml
+      - name: Check that no catalogue migration is pending
+        if: steps.fresh.outputs.fresh == 'true' && steps.switches.outputs.migrations == 'off'
+        working-directory: workers/s3-bridge
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          out="${RUNNER_TEMP}/catalogue-migrations-list.log"
+          echo "catalogue migrations skipped: selector is not d1"
+          if ! ./node_modules/.bin/wrangler d1 migrations list velmora-catalog --remote -c wrangler.deploy.toml > "$out" 2>&1 ||
+             ! grep -qiF 'No migrations to apply!' "$out"; then
+            echo "::error::a catalogue migration is pending while VELMORA_CATALOGUE_MIGRATIONS is off; refusing to deploy"
+            exit 1
+          fi
+      - name: Apply directory migrations (remote)
+        if: steps.fresh.outputs.fresh == 'true' && vars.VELMORA_DIRECTORY_D1_ID != ''
+        working-directory: workers/s3-bridge
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: ./node_modules/.bin/wrangler d1 migrations apply velmora-directory --remote -c wrangler.deploy.toml
       - id: deploy
         name: Deploy the Worker
         if: steps.fresh.outputs.fresh == 'true'
@@ -923,12 +1185,14 @@ jobs:
       # version is the one this run deployed (from the wrangler output), so
       # a deployment made outside this job is never replaced. Any other
       # state fails the step for a manual check.
-      - name: Roll back to the recorded version
+      - id: rollback
+        name: Roll back to the recorded version
         if: ${{ (failure() || cancelled()) && steps.prev.outputs.version != '' }}
         working-directory: workers/s3-bridge
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          FLOOR_VERSION: ${{ steps.switches.outputs.floor_version }}
           PREV_VERSION: ${{ steps.prev.outputs.version }}
           WRANGLER_OUTPUT_FILE_PATH: ${{ runner.temp }}/wrangler-output.ndjson
         run: |
@@ -974,8 +1238,45 @@ jobs:
           fi
           # active is this run's version, or could not be read after a
           # deploy this run made: restore the recorded version.
-          ./node_modules/.bin/wrangler rollback "$PREV_VERSION" -c wrangler.deploy.toml \
-            --message "automatic rollback: deploy job failed or was cancelled" -y
+          if [ -n "$FLOOR_VERSION" ] && [ "$FLOOR_VERSION" != "$PREV_VERSION" ]; then
+            target_json="${RUNNER_TEMP}/rollback-target.json"
+            floor_json="${RUNNER_TEMP}/rollback-floor.json"
+            if ./node_modules/.bin/wrangler versions view "$PREV_VERSION" --json -c wrangler.deploy.toml > "$target_json" &&
+               ./node_modules/.bin/wrangler versions view "$FLOOR_VERSION" --json -c wrangler.deploy.toml > "$floor_json" &&
+               python3 -I - "$target_json" "$floor_json" <<'PY'
+          from datetime import datetime
+          import json, sys
+
+          def created_on(path):
+              with open(path, encoding="utf-8") as source:
+                  timestamp = datetime.fromisoformat(json.load(source)["metadata"]["created_on"])
+              if timestamp.tzinfo is None:
+                  raise ValueError("missing timestamp offset")
+              return timestamp
+
+          try:
+              sys.exit(created_on(sys.argv[1]) < created_on(sys.argv[2]))
+          except (OSError, KeyError, TypeError, ValueError):
+              sys.exit(1)
+          PY
+            then
+              echo "rollback target meets the configured floor version"
+            else
+              echo "::error::rollback refused: the recorded version ${PREV_VERSION} is older than the rollback floor version ${FLOOR_VERSION}; production stays on ${deployed}; check manually"
+              echo "rollback=refused-floor" >> "$GITHUB_OUTPUT"
+              exit 1
+            fi
+          fi
+          rollback_log="${RUNNER_TEMP}/rollback.log"
+          if ! ./node_modules/.bin/wrangler rollback "$PREV_VERSION" -c wrangler.deploy.toml \
+            --message "automatic rollback: deploy job failed or was cancelled" -y > "$rollback_log" 2>&1; then
+            cat "$rollback_log"
+            echo "::error::rollback refused by Cloudflare (see the output above); production stays on ${deployed}; check manually"
+            echo "rollback=refused" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+          cat "$rollback_log"
+          echo "rollback=done" >> "$GITHUB_OUTPUT"
           echo "Deploy failed or was cancelled; rolled back from \`${deployed}\` to Worker version \`${PREV_VERSION}\`." >> "$GITHUB_STEP_SUMMARY"
       - name: Record the Worker version id
         if: steps.fresh.outputs.fresh == 'true'
@@ -1022,6 +1323,7 @@ jobs:
           ALERTS_INGEST_TOKEN: ${{ secrets.ALERTS_INGEST_TOKEN }}
           BUILD_RESULT: ${{ needs.deploy-build.result }}
           DEPLOY_RESULT: ${{ needs.deploy.result }}
+          ROLLBACK: ${{ needs.deploy.outputs.rollback }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -uo pipefail
@@ -1029,10 +1331,13 @@ jobs:
             echo "::warning::deploy alert not sent: ALERTS_INGEST_URL or ALERTS_INGEST_TOKEN is not set in the production environment"
             exit 0
           fi
-          body=$(jq -n --arg sha "$GITHUB_SHA" --arg b "$BUILD_RESULT" --arg d "$DEPLOY_RESULT" --arg run "$RUN_URL" '{
-            source: "ci", key: "deploy-failed",
-            title: "Production deploy failed",
-            detail: ("Commit \($sha): deploy build \($b), deploy \($d). "
+          body=$(jq -n --arg sha "$GITHUB_SHA" --arg b "$BUILD_RESULT" --arg d "$DEPLOY_RESULT" --arg run "$RUN_URL" --arg rollback "$ROLLBACK" '
+            ($rollback == "refused" or $rollback == "refused-floor") as $refused | {
+            source: "ci",
+            key: (if $refused then "deploy-rollback-refused" else "deploy-failed" end),
+            title: (if $refused then "Production deploy failed and was not rolled back" else "Production deploy failed" end),
+            detail: ((if $refused then "The rollback was refused (\($rollback)): production runs the version this run deployed. " else "" end)
+              + "Commit \($sha): deploy build \($b), deploy \($d). "
               + (if $b == "failure" then "The build failed, so nothing was deployed; production is unchanged."
                  else "The deploy job rolls back to the version before it when it can; whether it did, or asks for a manual check, is in the run'"'"'s \"Roll back to the recorded version\" step." end)
               + " Run: \($run)")}')
