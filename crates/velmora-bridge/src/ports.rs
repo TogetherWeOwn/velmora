@@ -1121,12 +1121,13 @@ pub trait Catalog {
         scan: u32,
         limit: u32,
     ) -> Result<Vec<GcRow>>;
-    /// Records that the safety copy of the row's extent is gone, in one
-    /// batch with the proof that it may go: the row is open and was due
-    /// at or before `cutoff`, the extent is still an orphaned upload
-    /// part, and no replay or rollback is being handled. `false`:
-    /// nothing was written and the blob must stay.
-    async fn gc_orphan_claim(&self, row: &GcRow, cutoff: UnixMs) -> Result<bool>;
+    /// Records that the safety copies of the rows' extents are gone,
+    /// each in one batch with the proof that it may go: the row is open
+    /// and was due at or before `cutoff`, the extent is still an
+    /// orphaned upload part, and no replay or rollback is being
+    /// handled. One answer per row, in order; `false`: nothing was
+    /// written for it and its blob must stay.
+    async fn gc_orphan_claim(&self, rows: &[GcRow], cutoff: UnixMs) -> Result<Vec<bool>>;
     /// Closes the row after the blob delete that a claim allowed.
     async fn gc_orphan_done(&self, id: i64, now: UnixMs) -> Result<()>;
 

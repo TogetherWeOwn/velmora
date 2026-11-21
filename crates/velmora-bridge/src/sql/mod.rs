@@ -710,8 +710,8 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
     ) -> Result<Vec<GcRow>> {
         gc::gc_orphans(self, now, cutoff, scan, limit).await
     }
-    async fn gc_orphan_claim(&self, row: &GcRow, cutoff: UnixMs) -> Result<bool> {
-        gc::gc_orphan_claim(self, row, cutoff).await
+    async fn gc_orphan_claim(&self, rows: &[GcRow], cutoff: UnixMs) -> Result<Vec<bool>> {
+        gc::gc_orphan_claim(self, rows, cutoff).await
     }
     async fn gc_orphan_done(&self, id: i64, now: UnixMs) -> Result<()> {
         gc::gc_orphan_done(self, id, now).await

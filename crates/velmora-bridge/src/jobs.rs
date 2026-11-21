@@ -148,8 +148,9 @@ pub const GC_BATCH: u32 = 50;
 /// Open `gc` rows one run of the scan for orphaned upload parts reads.
 /// Most of them are rows of deleted objects, which it steps over.
 pub const ORPHAN_SCAN: u32 = 500;
-/// Orphaned parts one GC job deletes: a claim, a blob delete and a
-/// close each, which keeps a job well inside its subrequests.
+/// Orphaned parts one GC job deletes: the claims of all of them in a
+/// few batches, then a blob delete and a close each, which keeps a job
+/// well inside its subrequests.
 pub const ORPHAN_BATCH: u32 = 100;
 /// Extents one eviction job handles before it re-enqueues itself.
 pub const EVICT_BATCH: u32 = 50;
@@ -447,22 +448,21 @@ where
             .catalog
             .gc_orphans(now, cutoff, ORPHAN_SCAN, ORPHAN_BATCH)
             .await?;
+        // The scan read the rows a moment ago; the claim proves each
+        // again in the batch that records its delete, and only then
+        // does a blob go.
+        let granted = self.catalog.gc_orphan_claim(&rows, cutoff).await?;
         let mut failed = None;
-        for row in &rows {
-            if let Err(e) = self.orphan_row(row, cutoff).await {
+        for (row, _) in rows.iter().zip(granted).filter(|(_, granted)| *granted) {
+            if let Err(e) = self.orphan_row(row).await {
                 failed.get_or_insert(e);
             }
         }
         failed.map_or(Ok(()), Err)
     }
 
-    /// One orphaned part. The scan read the row a moment ago; the claim
-    /// proves it again in the batch that records the delete, and only
-    /// then does the blob go.
-    async fn orphan_row(&self, row: &GcRow, cutoff: UnixMs) -> Result<()> {
-        if !self.catalog.gc_orphan_claim(row, cutoff).await? {
-            return Ok(());
-        }
+    /// One orphaned part whose claim was granted.
+    async fn orphan_row(&self, row: &GcRow) -> Result<()> {
         delete_blob(&self.safety, &row.extent_id.safety_key()).await?;
         self.catalog.gc_orphan_done(row.id, self.clock.now()).await
     }
