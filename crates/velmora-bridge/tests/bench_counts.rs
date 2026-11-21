@@ -703,7 +703,10 @@ fn gate_bound() -> bool {
         env!("CARGO_MANIFEST_DIR"),
         "/../../workers/s3-bridge/wrangler.toml"
     );
-    let text = std::fs::read_to_string(file).expect("wrangler.toml");
+    gate_bound_in(&std::fs::read_to_string(file).expect("wrangler.toml"))
+}
+
+fn gate_bound_in(text: &str) -> bool {
     let mut in_binding = false;
     // A comment never holds the binding: cut it (no `#` occurs inside
     // the strings of these lines).
@@ -723,6 +726,27 @@ fn gate_bound() -> bool {
         }
     }
     false
+}
+
+#[test]
+fn gate_bound_reads_the_production_part_only() {
+    let bound = "[vars]\nPERMITS = \"d1\"\n[[durable_objects.bindings]]\nname = \"PERMIT_GATE\"\nclass_name = \"PermitGate\"\n";
+    assert!(gate_bound_in(bound));
+    // A comment after the name is still the binding.
+    assert!(gate_bound_in(
+        "[[durable_objects.bindings]]\nname = \"PERMIT_GATE\" # the gate\n"
+    ));
+    // Commented out, under another table, or in a dev-only part: not bound.
+    assert!(!gate_bound_in(
+        "[[durable_objects.bindings]]\n# name = \"PERMIT_GATE\"\n"
+    ));
+    assert!(!gate_bound_in("[[services]]\nname = \"PERMIT_GATE\"\n"));
+    assert!(!gate_bound_in(
+        "[vars]\n[env.dev]\n[[env.dev.durable_objects.bindings]]\nname = \"PERMIT_GATE\"\n"
+    ));
+    assert!(!gate_bound_in(
+        "[env.dev]\n[[durable_objects.bindings]]\nname = \"PERMIT_GATE\"\n"
+    ));
 }
 
 /// The `KEY = "value"` lines of the top-level `[vars]` of the Worker's
