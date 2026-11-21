@@ -1575,8 +1575,7 @@ pub struct DispatchReport {
 
 /// What the scrub found when it last checked an extent
 /// (`extents.scrub_result`, [`crate::scrub`]).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ScrubResult {
     /// Every article was read intact, and every backbone that counts
     /// toward a release said it holds every article.
@@ -1626,7 +1625,7 @@ pub struct ScrubCandidate {
 }
 
 /// The totals of one scrub run, added to `scrub_state` when it ends.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ScrubRun {
     pub checked: u32,
     pub ok: u32,
@@ -1649,8 +1648,7 @@ pub struct ScrubRun {
 }
 
 /// Why a scrub run ended.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ScrubEnd {
     /// Nothing more was due.
     #[default]
@@ -1667,8 +1665,21 @@ pub enum ScrubEnd {
     Stopped,
 }
 
+impl ScrubEnd {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ScrubEnd::Idle => "idle",
+            ScrubEnd::Quota => "quota",
+            ScrubEnd::Time => "time",
+            ScrubEnd::Busy => "busy",
+            ScrubEnd::Incident => "incident",
+            ScrubEnd::Stopped => "stopped",
+        }
+    }
+}
+
 /// The scrub's totals and lease (`scrub_state`).
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ScrubState {
     /// Moves on with every take of the lease.
     pub lease_token: u64,
