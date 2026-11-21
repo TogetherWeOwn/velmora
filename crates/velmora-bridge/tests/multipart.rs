@@ -9,7 +9,7 @@
 //! Objects are checked through the catalogue and the safety store: the
 //! committed extents are decrypted and compared with the uploaded bytes.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::rc::Rc;
 
@@ -49,16 +49,29 @@ struct Probe {
     db: RusqliteSql,
     /// When set, every batch first yields to the other request.
     yield_before_batch: Cell<bool>,
+    /// When set, every statement is kept here with its parameters.
+    recorded: RefCell<Option<Vec<(String, Vec<SqlValue>)>>>,
+}
+
+impl Probe {
+    fn record(&self, sql: &str, params: &[SqlValue]) {
+        if let Some(log) = self.recorded.borrow_mut().as_mut() {
+            log.push((sql.to_string(), params.to_vec()));
+        }
+    }
 }
 
 impl Sql for Probe {
     async fn query(&self, sql: &str, params: &[SqlValue]) -> Result<Vec<Row>> {
+        self.record(sql, params);
         self.db.query(sql, params).await
     }
     async fn exec(&self, sql: &str, params: &[SqlValue]) -> Result<u64> {
+        self.record(sql, params);
         self.db.exec(sql, params).await
     }
     async fn batch(&self, stmts: Vec<(&'static str, Vec<SqlValue>)>) -> Result<Vec<u64>> {
+        stmts.iter().for_each(|(q, p)| self.record(q, p));
         if self.yield_before_batch.get() {
             tokio::task::yield_now().await;
         }
@@ -366,6 +379,7 @@ impl Rig {
         let catalog = SqlCatalog::new(Probe {
             db: RusqliteSql::with_schema().expect("schema applies"),
             yield_before_batch: Cell::new(false),
+            recorded: RefCell::new(None),
         });
         let mut buckets = Vec::new();
         for (name, seed) in [("alpha", 0xa1u8), ("beta", 0xb2)] {
@@ -1695,4 +1709,48 @@ async fn aws_chunked_refusals_store_nothing() {
     assert_eq!(rig.count("SELECT COUNT(*) FROM extents").await, 0);
     assert_eq!(rig.count("SELECT COUNT(*) FROM upload_parts").await, 0);
     assert_eq!(rig.bridge.budget.in_use(), 0);
+}
+
+/// No statement an UploadPart runs, the check before the body included,
+/// walks the parts of the upload: the part tables are sought on
+/// (upload, part number) or on an extent id, so the rows read do not grow
+/// with the parts already uploaded.
+#[tokio::test]
+async fn upload_part_reads_no_other_part_of_the_upload() {
+    let rig = Rig::new().await;
+    let id = rig.create("alpha", KEY).await;
+    for n in 1..=6u8 {
+        rig.part("alpha", KEY, &id, u16::from(n), &test_bytes(n, 1024))
+            .await;
+    }
+    let sql = &rig.bridge.catalog.sql;
+    for (n, seed) in [(7u16, 7u8), (3, 33)] {
+        *sql.recorded.borrow_mut() = Some(Vec::new());
+        rig.part("alpha", KEY, &id, n, &test_bytes(seed, 1024))
+            .await;
+        let ran = sql.recorded.borrow_mut().take().expect("recording");
+        let mut by_part = 0;
+        for (q, params) in &ran {
+            let plan = sql
+                .db
+                .query(&format!("EXPLAIN QUERY PLAN {q}"), params)
+                .await
+                .unwrap();
+            for row in plan {
+                let SqlValue::Text(step) = &row[3] else {
+                    panic!("unexpected {row:?}")
+                };
+                if !step.contains("upload_part") {
+                    continue;
+                }
+                let part = step.contains("(upload_id=? AND part_number=?)");
+                by_part += usize::from(part);
+                assert!(
+                    step.starts_with("SEARCH ") && (part || step.ends_with("(extent_id=?)")),
+                    "part {n}: {q}\n{step}"
+                );
+            }
+        }
+        assert!(by_part >= 3, "part {n}: the GC select and the piece delete");
+    }
 }
