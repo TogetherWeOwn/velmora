@@ -233,6 +233,27 @@ fn a_blob_is_named_without_a_scope_only_at_the_listed_places() {
         assert!(all.contains_key(job_path), "{job_path} is gone");
         assert!(!found.contains_key(job_path), "{job_path}");
     }
+    // The records the job path writes are named in the layout of its
+    // scope: the configured layout is never used as it was read.
+    for job_path in [
+        "bridge/jobs.rs",
+        "bridge/post.rs",
+        "bridge/verify.rs",
+        "bridge/intents.rs",
+    ] {
+        let text = &all[job_path];
+        assert_eq!(
+            text.matches(".records").count(),
+            text.matches(".records.in_scope(scope)").count(),
+            "{job_path}: the record layout of the configuration, not of the scope"
+        );
+    }
+    assert_eq!(
+        all["bridge/post.rs"]
+            .matches(".records.in_scope(scope)")
+            .count(),
+        1
+    );
     // And no name of the two families is written out by hand.
     for family in ["\"x/", "\"c/"] {
         let found = uses(&all, family);

@@ -145,7 +145,9 @@ async fn the_first_raise_gc_and_eviction_run_on_a_stamp_of_the_old_build() {
     );
     assert_eq!(blobs(&rig), 1);
 
-    // An eviction step.
+    // An eviction step. Nothing here is released, so it frees nothing;
+    // `hot_tier.rs` (`an_eviction_frees_bytes_on_a_stamp_of_the_old_build`
+    // and its control) evicts a released extent on the same stamp.
     assert_eq!(rig.bridge.evict_batch(&TENANT_ZERO, 0).await.unwrap(), 0);
     assert!(rig.bridge.evict_batch(&TENANT_ZERO, 1).await.is_ok());
 

@@ -885,9 +885,15 @@ where
         // The message-ids exist nowhere but the catalogue until this
         // record is stored: without it, a lost catalogue could not find
         // the extent on Usenet. Nothing is posted before it is durable.
-        write_stored_plan(&self.safety, &self.kek, &self.cfg.records, extent, &plan)
-            .await
-            .map_err(|_| Stop::fail(FailClass::BlobError))?;
+        write_stored_plan(
+            &self.safety,
+            &self.kek,
+            &self.cfg.records.in_scope(scope),
+            extent,
+            &plan,
+        )
+        .await
+        .map_err(|_| Stop::fail(FailClass::BlobError))?;
         let load_ms = self.clock.now().0 - started.0;
         crate::trace::note(&lease.extent, |t| t.load_ms = load_ms);
         let mut rows = plan.rows;

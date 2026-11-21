@@ -198,6 +198,21 @@ impl Layout {
         [Layout::flat(), Layout::of(scope)]
     }
 
+    /// The configured layout of new records (`RECORD_LAYOUT`), for the
+    /// tenant of `scope`: the flat layout stays flat, and the tenant
+    /// layout is that of the scope's tenant. The job path names the
+    /// records it writes through this, so the name comes from the scope
+    /// and not from the tenant the configuration was read for.
+    ///
+    /// The flat layout is of tenant 0 only (see [`Layout::all`]).
+    pub fn in_scope(&self, scope: &TenantScope) -> Layout {
+        if self.root == RECORD_PREFIX {
+            Layout::flat()
+        } else {
+            Layout::of(scope)
+        }
+    }
+
     /// The directory: every name of the layout starts with it.
     pub fn root(&self) -> &str {
         &self.root

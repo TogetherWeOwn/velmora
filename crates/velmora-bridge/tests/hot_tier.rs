@@ -1733,5 +1733,70 @@ async fn a_pinned_extent_is_never_granted_as_unpinned() {
     assert!(catalog.begin_evict(&right).await.unwrap());
 }
 
+// ---------------------------------------------------------------------------
+// The tenant seams on a stamp of the build before them
+// ---------------------------------------------------------------------------
+
+/// Replaces the rollback stamp of `hot` with the row and the objects the
+/// build before the tenant seams left after three raises (as
+/// `tenant_upgrade.rs` writes them).
+async fn old_stamp(hot: &Hot) {
+    let bridge = hot.bridge();
+    for key in bridge.safety.keys() {
+        if key.starts_with("rs/") {
+            assert!(bridge.safety.lose(&key));
+        }
+    }
+    bridge.catalog.sql.with_conn(|c| {
+        c.execute_batch(
+            "DELETE FROM rollback_stamp;
+             INSERT INTO rollback_stamp(id, counter, catalogue_id) VALUES (1, 3, 'main');",
+        )
+        .unwrap()
+    });
+    for counter in 1..=3u64 {
+        let body = (hot.rig.now().0 - 60_000).to_string().into_bytes();
+        let meta = BlobMeta {
+            bucket: &BucketId::new("-"),
+            extent: &ExtentId::new("rollback-stamp"),
+            cipher_sha256: &sha256(&body),
+        };
+        let key = format!("rs/main/{counter:020}");
+        bridge.safety.put(&key, body, &meta).await.unwrap();
+    }
+}
+
+/// An eviction that frees bytes runs on the stamp of the old build: the
+/// catalogue id of tenant 0 is still the one that row holds. The
+/// eviction step of `tenant_upgrade.rs` has nothing to evict; this one
+/// has a released extent.
+#[tokio::test(flavor = "current_thread")]
+async fn an_eviction_frees_bytes_on_a_stamp_of_the_old_build() {
+    let hot = hot().await;
+    let x = hot.released("old-stamp").await;
+    old_stamp(&hot).await;
+    assert!(!hot.bridge().catalogue_rolled_back().await.unwrap());
+    assert_eq!(
+        hot.bridge().evict_batch(&TENANT_ZERO, 0).await.unwrap(),
+        x.cipher_size
+    );
+    assert!(!hot.has_safety(&x) && !hot.has_cache(&x));
+}
+
+/// The control: a build whose catalogue id is not `main` evicts nothing
+/// on the same stamp, and says why.
+#[tokio::test(flavor = "current_thread")]
+async fn an_eviction_under_another_catalogue_id_is_refused_by_the_old_stamp() {
+    let hot = hot_with(|cfg| cfg.catalogue_id = "t_0000000000000000".to_string()).await;
+    let x = hot.released("old-stamp").await;
+    old_stamp(&hot).await;
+    let err = hot.bridge().evict_batch(&TENANT_ZERO, 0).await.unwrap_err();
+    assert!(
+        velmora_bridge::stamp::is_catalogue_id_error(&err),
+        "{err:?}"
+    );
+    assert!(hot.has_safety(&x));
+}
+
 /// The one tenant there is.
 const TENANT_ZERO: velmora_bridge::TenantScope = velmora_bridge::TenantScope::tenant_zero();

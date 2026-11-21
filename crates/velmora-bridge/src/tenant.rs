@@ -133,6 +133,17 @@ mod tests {
         assert_eq!(tenant, Layout::of(&scope));
     }
 
+    /// The configured layout of new records, asked for tenant 0, is the
+    /// configured layout itself: flat stays flat, `tenant` stays tenant 0's.
+    #[test]
+    fn the_configured_layout_in_the_scope_of_tenant_zero_is_unchanged() {
+        let scope = TenantScope::tenant_zero();
+        assert_eq!(Layout::flat().in_scope(&scope), Layout::flat());
+        assert_eq!(Layout::of(&scope).in_scope(&scope), Layout::of(&scope));
+        let other = Layout::tenant("t_1").expect("a tenant id");
+        assert_eq!(other.in_scope(&scope), Layout::of(&scope));
+    }
+
     /// The form a second tenant's blobs will take cannot meet a name of
     /// tenant 0: an extent id has no `/`.
     #[test]
