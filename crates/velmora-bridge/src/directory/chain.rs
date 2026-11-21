@@ -230,6 +230,12 @@ impl<S: RecordStore, C: ControlSeal> TenantChain<'_, S, C> {
                 match record_seq(tenant, key) {
                     Some(seq) if seq == last + 1 => last = seq,
                     Some(seq) if first_key && seq > last + 1 => {
+                        // A purge from below removed the record before
+                        // `known` first: if it is still there, the gap is
+                        // inside the chain.
+                        if last > 0 && self.store.get(&record_key(tenant, last)).await?.is_some() {
+                            return Err(ChainError::Damaged("chain_gap_or_stray_name"));
+                        }
                         purged = true;
                         last = seq;
                     }

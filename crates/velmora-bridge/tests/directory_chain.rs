@@ -632,3 +632,36 @@ fn a_purge_under_way_reads_its_stub_as_the_head() {
         assert!(matches!(r, Err(ChainError::Damaged(_))), "{r:?}");
     });
 }
+
+/// A known seq above a gap whose record below is still there is a gap
+/// inside the chain, not a purge.
+#[test]
+fn a_gap_inside_the_chain_is_not_taken_for_a_purge() {
+    let store = MemRecords::new();
+    let seal = PlainSeal::new();
+    let chain = TenantChain {
+        store: &store,
+        seal: &seal,
+    };
+    block_on(async {
+        active(&chain).await;
+        chain
+            .write(&t1(), &delete(1), Actor::Customer, NOW, 0)
+            .await
+            .unwrap();
+        let due = UnixMs(NOW.0 + 7 * DAY);
+        chain
+            .write(&t1(), &Change::StartShred, Actor::ShredJob, due, 0)
+            .await
+            .unwrap();
+        seal.destroy_version(1);
+        chain
+            .write(&t1(), &Change::FinishShred, Actor::ShredJob, due, 0)
+            .await
+            .unwrap();
+        // Record 5 lost, 4 still there: with known = 5 that is damage.
+        assert!(store.lose(&record_key(&t1(), 5)));
+        let r = chain.head_seq(&t1(), 5).await;
+        assert!(matches!(r, Err(ChainError::Damaged(_))), "{r:?}");
+    });
+}

@@ -1322,6 +1322,7 @@ fn a_flag_or_selector_change_is_closing() {
         undo_stamp: None,
         catalogue_id: None,
         frozen_catalogues: vec!["main".into()],
+        flips: 0,
     });
     assert_eq!(write_order(Some(&z.door), &moved), WriteOrder::Closing);
 }
@@ -1913,4 +1914,62 @@ fn marking_the_escrow_again_forgets_the_old_destroyed_names() {
     );
     let again = apply(&c, Change::SetEscrowOffline, Actor::Operator);
     assert!(again.door.escrow_destroyed.is_empty());
+}
+
+#[test]
+fn a_bucket_is_dropped_only_from_an_active_tenant() {
+    let a = active();
+    let b = apply(
+        &a,
+        Change::CreateBucket {
+            bucket: "b_1".into(),
+            unit: 0,
+            creator: "p_owner".into(),
+        },
+        Actor::Customer,
+    );
+    let drop = || Change::DropBucket {
+        bucket: "b_1".into(),
+    };
+    let legal = apply(
+        &b,
+        operator_hold(HoldMode::Locked, OperatorReason::Legal, None),
+        Actor::Operator,
+    );
+    assert_eq!(refused(&legal, drop(), Actor::Customer), PRESERVED);
+    assert_eq!(refused(&legal, drop(), Actor::Operator), PRESERVED);
+    let held = apply(&b, billing_hold(Some(HoldMode::ReadOnly)), Actor::Billing);
+    assert_eq!(refused(&held, drop(), Actor::Customer), WRONG_STATE);
+    let dropped = apply(&b, drop(), Actor::Customer);
+    // Dropping a bucket closes a way in.
+    assert_eq!(
+        write_order(Some(&b.door), &dropped.door),
+        WriteOrder::Closing
+    );
+    assert_eq!(write_order(Some(&a.door), &b.door), WriteOrder::Opening);
+}
+
+#[test]
+fn a_flip_counts_the_moves_that_flipped() {
+    let f = apply(&moving(), Change::FlipMove { stamp: 9 }, Actor::MoveTool);
+    assert_eq!(f.door.tenant_zero.as_ref().unwrap().flips, 1);
+    let u = apply(
+        &f,
+        Change::UndoMove {
+            undo_stamp: 10,
+            catalogue_id: "main2".into(),
+        },
+        Actor::MoveTool,
+    );
+    let m2 = apply(
+        &u,
+        Change::StartMove {
+            to: t1(),
+            catalogue_id_frozen: "main2".into(),
+        },
+        Actor::MoveTool,
+    );
+    // A window that is given up does not count.
+    let g = apply(&m2, Change::GiveUpMove, Actor::MoveTool);
+    assert_eq!(g.door.tenant_zero.as_ref().unwrap().flips, 1);
 }

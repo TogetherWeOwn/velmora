@@ -619,7 +619,12 @@ pub fn next(
             if !matches!(actor, Actor::Customer | Actor::Operator) {
                 return Err(FORBIDDEN);
             }
-            if h.deletion.is_some() {
+            // Like a create: only an active tenant; a hold (a preserving
+            // one above all) keeps every bucket where it is.
+            if h.holds.preserves() {
+                return Err(PRESERVED);
+            }
+            if h.state() != super::record::TenantState::Active {
                 return Err(WRONG_STATE);
             }
             if !h.restoring.is_empty() {
@@ -714,6 +719,7 @@ pub fn next(
             }
             let mut z = z.clone();
             z.selector = Selector::Moved;
+            z.flips += 1;
             if let Some(m) = z.moved.as_mut() {
                 m.stamp = Some(*stamp);
                 m.flipped_at = Some(now);
@@ -953,6 +959,7 @@ fn first(
                 undo_stamp: None,
                 catalogue_id: None,
                 frozen_catalogues: vec![],
+                flips: 0,
             });
             Ok(Outcome::Next(TenantRecord {
                 door,
@@ -1135,6 +1142,14 @@ pub fn write_order(prev: Option<&TenantDoor>, next: &TenantDoor) -> WriteOrder {
         .iter()
         .any(|(k, v)| prev.limits.get(k).is_none_or(|old| v < old));
     let restoring_added = next.restoring.iter().any(|r| !prev.restoring.contains(r));
+    // A bucket that is dropped, or moves to another unit, closes the way
+    // in to where it was.
+    let placement_left = prev.placements.iter().any(|old| {
+        !next
+            .placements
+            .iter()
+            .any(|p| p.bucket == old.bucket && p.unit == old.unit)
+    });
     let closing = stricter_hold(
         prev.holds.billing.map(|h| h.mode),
         next.holds.billing.map(|h| h.mode),
@@ -1146,6 +1161,7 @@ pub fn write_order(prev: Option<&TenantDoor>, next: &TenantDoor) -> WriteOrder {
         || (prev.deletion.is_none() && next.deletion.is_some())
         || limit_lowered
         || restoring_added
+        || placement_left
         || (prev.lifecycle != next.lifecycle
             && matches!(next.lifecycle, Lifecycle::Shredding | Lifecycle::Shredded))
         // A flag or a rate class cannot be ranked, and tenant 0's

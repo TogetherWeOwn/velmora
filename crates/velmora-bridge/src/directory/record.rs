@@ -308,6 +308,11 @@ pub struct TenantZero {
     /// lands on one of them but by the fallback route, onto the newest.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub frozen_catalogues: Vec<String>,
+    /// How many moves flipped. The cutover marker that a move writes names
+    /// the move by `flips + 1`: a marker at or below `flips` is one of a
+    /// move that flipped, and its database was left behind.
+    #[serde(default)]
+    pub flips: u64,
 }
 
 impl TenantZero {
@@ -659,6 +664,7 @@ mod tests {
             undo_stamp: None,
             catalogue_id: None,
             frozen_catalogues: vec!["main".into()],
+            flips: 1,
         };
         let json = serde_json::to_value(&z).unwrap();
         assert_eq!(
@@ -666,7 +672,8 @@ mod tests {
             serde_json::json!({
                 "selector": "moved",
                 "move": {"to": "t_00000000000000a1", "catalogue_id_frozen": "main", "stamp": 7, "flipped_at": 5},
-                "frozen_catalogues": ["main"]
+                "frozen_catalogues": ["main"],
+                "flips": 1
             })
         );
         assert!(!z.undone());
