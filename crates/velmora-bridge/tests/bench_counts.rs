@@ -681,6 +681,30 @@ type BenchBridge =
 // Configuration: production's [vars], fake providers
 // ---------------------------------------------------------------------------
 
+/// Whether the production part of the Worker's `wrangler.toml` (before
+/// the first `[env.*]`) binds the permit gate (`PERMIT_GATE`).
+fn gate_bound() -> bool {
+    let file = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../workers/s3-bridge/wrangler.toml"
+    );
+    let text = std::fs::read_to_string(file).expect("wrangler.toml");
+    let mut in_binding = false;
+    for line in text.lines().map(str::trim) {
+        if line.starts_with("[env.") {
+            break;
+        }
+        if line.starts_with('[') {
+            in_binding = line == "[[durable_objects.bindings]]";
+            continue;
+        }
+        if in_binding && line.replace(' ', "") == "name=\"PERMIT_GATE\"" {
+            return true;
+        }
+    }
+    false
+}
+
 /// The `KEY = "value"` lines of the top-level `[vars]` of the Worker's
 /// `wrangler.toml` (the production configuration).
 fn production_vars() -> BTreeMap<String, String> {
@@ -965,7 +989,19 @@ impl Bench {
         // gate client too and only takes its slots from the catalogue.
         let clock = FixedClock::new(T0);
         let gates = Rc::new(GateHost::new(sql.clone(), Rc::clone(&hub), clock.clone()));
-        let catalog = SqlCatalog::with_gate(sql, gate_client(&gates, &vars, &cfg, &clock));
+        // Only where the measured commit binds the gate, as `env.rs`
+        // attaches the client only with the binding (and refuses
+        // `PERMITS=do` without it).
+        let catalog = if gate_bound() {
+            SqlCatalog::with_gate(sql, gate_client(&gates, &vars, &cfg, &clock))
+        } else {
+            let mode = PermitMode::from_var(vars.get("PERMITS").map(String::as_str));
+            assert!(
+                mode.expect("PERMITS") == PermitMode::Catalog,
+                "PERMITS=do: the measured commit binds no permit gate (PERMIT_GATE)"
+            );
+            SqlCatalog::new(sql)
+        };
         let bridge = Rc::new(Bridge {
             catalog,
             safety: MeterBlobs {
@@ -1714,7 +1750,8 @@ async fn bench_counts_smoke() {
 /// scenario still passes end to end.
 #[tokio::test(flavor = "current_thread")]
 async fn bench_counts_smoke_gate() {
-    let d1 = scenario(&SMOKE, None).await;
+    assert!(gate_bound(), "production binds the permit gate");
+    let d1 = scenario_with(&SMOKE, None, &[("PERMITS", "d1")]).await;
     let gate = scenario_with(&SMOKE, None, &[("PERMITS", "do")]).await;
     sanity(&gate);
     let total =

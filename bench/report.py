@@ -182,12 +182,21 @@ def model(counts, labels, prices, cpu):
 
     do_gb_s = cpu.get("do_gb_s_per_request", 0.0) if cpu else 0.0
 
+    def rate(name, used):
+        """A price the run needs; one it does not use may be missing (a price file from before it)."""
+        if not used:
+            return 0.0
+        if name not in usd:
+            sys.exit(f"prices: {name} is missing and this run uses it")
+        return usd[name]
+
     def dollars(c, cpu_ms=0.0):
         billed = c.get("do_billed", 0)
+        writes = c.get("do_storage_writes", 0)
         return {
-            "do_requests": billed * usd["do_requests_per_m"] / 1e6,
-            "do_duration": billed * do_gb_s * usd["do_duration_gb_s_per_m"] / 1e6,
-            "do_storage_writes": c.get("do_storage_writes", 0) * usd["do_rows_written_per_m"] / 1e6,
+            "do_requests": billed * rate("do_requests_per_m", billed) / 1e6,
+            "do_duration": billed * do_gb_s * rate("do_duration_gb_s_per_m", billed * do_gb_s) / 1e6,
+            "do_storage_writes": writes * rate("do_rows_written_per_m", writes) / 1e6,
             "workers_requests": c.get("invocations", 0) * usd["workers_requests_per_m"] / 1e6,
             "workers_cpu": cpu_ms * usd["workers_cpu_ms_per_m"] / 1e6,
             "d1_rows_read": c.get("d1_rows_read", 0) * usd["d1_rows_read_per_m"] / 1e6,
