@@ -2669,7 +2669,7 @@ async fn a_hand_over_marks_the_row_and_a_refused_send_unmarks_it() {
     fx.cat.sql.1.borrow_mut().clear();
     assert!(fx
         .cat
-        .advance_sent(&lease, OutboxStage::Verify, due, T0)
+        .advance(&lease, OutboxStage::Verify, due, T0)
         .await
         .unwrap());
     // One statement, as for a hand-over without the mark.
@@ -2679,7 +2679,7 @@ async fn a_hand_over_marks_the_row_and_a_refused_send_unmarks_it() {
     // A spent lease marks nothing.
     assert!(!fx
         .cat
-        .advance_sent(&lease, OutboxStage::Release, due.plus_secs(9), T0)
+        .advance(&lease, OutboxStage::Release, due.plus_secs(9), T0)
         .await
         .unwrap());
     assert_eq!(fx.outbox(&o, "sent_at").await, due.0.to_string());
@@ -2694,16 +2694,19 @@ async fn a_hand_over_marks_the_row_and_a_refused_send_unmarks_it() {
     // Another mark (a dispatcher run sent the row since) is not taken
     // back, nor is the mark of a row that is not named.
     let ids = std::slice::from_ref(&o.extent);
-    assert_eq!(fx.cat.unmark_sent(ids, due.plus_ms(1)).await.unwrap(), 0);
+    let jobs = &velmora_bridge::testkit::post_jobs([o.extent.clone()], &o.generation)[..];
+    let other = [Job::Gc { v: 1 }];
+    assert_eq!(fx.cat.unmark_sent(jobs, due.plus_ms(1)).await.unwrap(), 0);
     assert_eq!(fx.cat.unmark_sent(&[], due).await.unwrap(), 0);
+    assert_eq!(fx.cat.unmark_sent(&other, due).await.unwrap(), 0);
     assert_eq!(fx.outbox(&o, "sent_at").await, due.0.to_string());
     let before = fx.outbox(&o, "lease_token").await;
-    assert_eq!(fx.cat.unmark_sent(ids, due).await.unwrap(), 1);
+    assert_eq!(fx.cat.unmark_sent(jobs, due).await.unwrap(), 1);
     assert_eq!(fx.outbox(&o, "sent_at").await, "NULL");
     assert_eq!(fx.outbox(&o, "lease_token").await, before);
     assert_eq!(fx.due_ids(due).await, ids);
 
-    // The plain hand-over leaves no mark.
+    // A row that moves to an end stage keeps no mark.
     let lease = fx.claim(&o, OutboxStage::Verify, due).await.unwrap();
     let later = due.plus_secs(60);
     assert!(fx
@@ -2711,8 +2714,14 @@ async fn a_hand_over_marks_the_row_and_a_refused_send_unmarks_it() {
         .advance(&lease, OutboxStage::Release, later, due)
         .await
         .unwrap());
+    assert_eq!(fx.outbox(&o, "sent_at").await, later.0.to_string());
+    let lease = fx.claim(&o, OutboxStage::Release, later).await.unwrap();
+    assert!(fx
+        .cat
+        .advance(&lease, OutboxStage::Done, later, later)
+        .await
+        .unwrap());
     assert_eq!(fx.outbox(&o, "sent_at").await, "NULL");
-    assert_eq!(fx.due_ids(later).await, ids);
 }
 
 /// A mark never outlives the stage it was written for: a claim clears
@@ -2726,7 +2735,7 @@ async fn a_mark_does_not_outlive_its_stage() {
     let due = T0.plus_secs(30);
     assert!(fx
         .cat
-        .advance_sent(&lease, OutboxStage::Verify, due, T0)
+        .advance(&lease, OutboxStage::Verify, due, T0)
         .await
         .unwrap());
     assert_eq!(fx.outbox(&o, "sent_at").await, due.0.to_string());
@@ -2741,7 +2750,7 @@ async fn a_mark_does_not_outlive_its_stage() {
     let lease = fx.claim(&p, OutboxStage::Post, T0).await.unwrap();
     assert!(fx
         .cat
-        .advance_sent(&lease, OutboxStage::Verify, due, T0)
+        .advance(&lease, OutboxStage::Verify, due, T0)
         .await
         .unwrap());
     fx.publish(&fx.bucket, "gone").await;

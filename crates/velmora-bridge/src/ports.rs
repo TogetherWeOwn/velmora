@@ -889,22 +889,17 @@ pub trait Catalog {
     /// Moves the row to stage `to`, due at `next_at`, and frees the
     /// lease. The new stage starts at its first step: attempts and
     /// cursor are 0 again.
+    ///
+    /// The caller sends the job of a stage that has work (`post`,
+    /// `verify`, `release`) itself, right after this call: the same
+    /// write marks the row as sent for `next_at`, so the dispatcher does
+    /// not send a second job while that one is on its way
+    /// ([`Self::due`]). If the send fails, the caller takes the mark
+    /// back with [`Self::unmark_sent`] and `next_at`. A job that never
+    /// arrives although its send was answered is sent again by the
+    /// dispatcher once the mark has aged (`Resend`), counted from
+    /// `next_at`. A row moved to an end stage keeps no mark.
     async fn advance(
-        &self,
-        l: &Lease,
-        to: OutboxStage,
-        next_at: UnixMs,
-        now: UnixMs,
-    ) -> Result<bool>;
-    /// [`Self::advance`] by a caller that sends the job of the new stage
-    /// itself, right after this call: the same write marks the row as
-    /// sent for `next_at`, so the dispatcher does not send a second job
-    /// while that one is on its way ([`Self::due`]). If the send fails,
-    /// the caller takes the mark back with [`Self::unmark_sent`] and
-    /// `next_at`. A job that never arrives although its send was
-    /// answered is sent again by the dispatcher once the mark has aged
-    /// (`Resend`), counted from `next_at`.
-    async fn advance_sent(
         &self,
         l: &Lease,
         to: OutboxStage,
@@ -1078,13 +1073,13 @@ pub trait Catalog {
     /// ones that are still due and held by no job, and returns how many.
     /// The mark is a hint for [`Self::due`] alone; it gates no claim.
     async fn mark_sent(&self, extents: &[ExtentId], now: UnixMs) -> Result<u64>;
-    /// The job that was to be sent for each of `extents` was not: takes
+    /// `jobs`, each for an outbox row, were not sent: takes
     /// back the mark `mark` their rows were given by
-    /// [`Self::advance_sent`] (its `next_at`) or by the publication that
+    /// [`Self::advance`] (its `next_at`) or by the publication that
     /// inserted them (its `now`), and returns how many rows had it. A
     /// row that a job claimed since, or that was marked again, is left
     /// as it is. The next dispatcher run sends a row without a mark.
-    async fn unmark_sent(&self, extents: &[ExtentId], mark: UnixMs) -> Result<u64>;
+    async fn unmark_sent(&self, jobs: &[Job], mark: UnixMs) -> Result<u64>;
     async fn bury_exhausted(&self, max_attempts: u32, now: UnixMs) -> Result<u64>;
     /// Stamps `meta.last_dispatch_at` (the dispatcher, once per run).
     async fn record_dispatch(&self, now: UnixMs) -> Result<()>;

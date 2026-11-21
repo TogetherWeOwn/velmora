@@ -62,14 +62,14 @@ use crate::ports::{
 use crate::recovery::{id_after, write_generation};
 use crate::service::common::{
     auth_refused, check_precondition, discard_refused, discard_unless_present, header_refused,
-    hold_precondition, host_refused, precondition, restore_gate, writes_refused, REGION_ALIASES,
+    hold_precondition, host_refused, precondition, restore_gate, send_post_jobs, writes_refused,
+    REGION_ALIASES,
 };
 use crate::service::slices::{store_slices, SliceError, SliceSink};
 use crate::types::{
     Body, BridgeError, Bucket, CompleteUpload, ExtentId, ExtentPlacement, ExtentRow, ExtentState,
-    GenerationRow, GenerationState, Job, KeyStatus, OutboxStage, PartExtent, Perm, RespBody,
-    S3Request, S3Response, SafetyState, UploadId, UploadPartRow, UploadRow, UploadState, WriteId,
-    JOB_VERSION,
+    GenerationRow, GenerationState, KeyStatus, PartExtent, Perm, RespBody, S3Request, S3Response,
+    SafetyState, UploadId, UploadPartRow, UploadRow, UploadState, WriteId,
 };
 
 /// Smallest non-final part.
@@ -83,8 +83,6 @@ pub const MAX_COMPLETE_BODY_BYTES: u64 = 2 * 1024 * 1024;
 const COMPLETE_ATTEMPTS: u32 = 3;
 /// `KeyMode::Random`.
 const KEY_MODE_RANDOM: u8 = 1;
-/// Queue messages of one `send_many`.
-const JOB_BATCH: usize = 100;
 
 /// Headers the edge adds. They are never signed and their values are not
 /// always printable ASCII, so they are dropped before header validation.
@@ -1459,27 +1457,12 @@ where
             .await?
         {
             PublishOutcome::Applied => {
-                // The outbox rows are the durable obligation, marked
-                // as sent by the commit. A batch whose send fails has
-                // its marks taken back, so the next dispatcher run
-                // sends its jobs; a notification lost after it was
-                // taken is made up for when the mark has aged.
-                for batch in commit.placements.chunks(JOB_BATCH) {
-                    let jobs: Vec<Job> = batch
-                        .iter()
-                        .map(|p| Job::Extent {
-                            v: JOB_VERSION,
-                            extent: p.extent_id.clone(),
-                            generation: commit.generation.id.clone(),
-                            stage: OutboxStage::Post,
-                        })
-                        .collect();
-                    if bridge.jobs.send_many(&jobs).await.is_err() {
-                        let rows: Vec<ExtentId> =
-                            batch.iter().map(|p| p.extent_id.clone()).collect();
-                        let _ = bridge.catalog.unmark_sent(&rows, commit.now).await;
-                    }
-                }
+                let rows = commit
+                    .placements
+                    .iter()
+                    .map(|p| p.extent_id.clone())
+                    .collect();
+                send_post_jobs(bridge, &commit.generation.id, rows, commit.now).await;
                 return complete_response(&a, publication.etag, now.0);
             }
             PublishOutcome::Refused(record) => {

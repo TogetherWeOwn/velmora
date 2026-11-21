@@ -54,8 +54,8 @@ use crate::ports::{
 };
 use crate::recovery::write_stored_plan;
 use crate::types::{
-    valid_yenc_name, ArticleRow, ArticleState, BridgeError, ExtentRow, FailClass, Job, JobExtent,
-    JobOutcome, OutboxStage, ProviderConfig, Result, SafetyState, SizeCommand, UnixMs, JOB_VERSION,
+    valid_yenc_name, ArticleRow, ArticleState, BridgeError, ExtentRow, FailClass, JobExtent,
+    JobOutcome, OutboxStage, ProviderConfig, Result, SafetyState, SizeCommand, UnixMs,
 };
 
 /// Asks a provider whether it has an article and for the size it reports
@@ -805,35 +805,8 @@ where
 
     /// Every article is recorded as posted: the extent goes on to verify.
     async fn to_verify(&self, lease: &Lease) -> core::result::Result<(), Stop> {
-        let now = self.clock.now();
-        let delay = self.cfg.verify_delay_secs;
-        let due = now.plus_secs(delay);
-        // The move marks the row as sent: the verify job is sent right
-        // below, and the dispatcher would only send a second one for a
-        // row that is due before the first was delivered.
-        if !self
-            .catalog
-            .advance_sent(lease, OutboxStage::Verify, due, now)
-            .await?
-        {
-            return Err(Stop::Fenced);
-        }
-        let next = Job::Extent {
-            v: JOB_VERSION,
-            extent: lease.extent.clone(),
-            generation: lease.generation.clone(),
-            stage: OutboxStage::Verify,
-        };
-        // The outbox row is the obligation. A send that fails takes the
-        // mark back, so the next dispatcher run sends the job; one that
-        // is lost after it was taken is sent again when the mark has
-        // aged. If the mark cannot be taken back either, it ages too.
-        let sent = self.jobs.send(&next, delay.min(MAX_QUEUE_DELAY_SECS)).await;
-        if sent.is_err() {
-            let row = core::slice::from_ref(&lease.extent);
-            let _ = self.catalog.unmark_sent(row, due).await;
-        }
-        Ok(())
+        let due = self.clock.now().plus_secs(self.cfg.verify_delay_secs);
+        self.advance_notify(lease, OutboxStage::Verify, due).await
     }
 
     /// The verified ciphertext of the extent and its stored article plan,
