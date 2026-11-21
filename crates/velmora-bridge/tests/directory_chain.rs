@@ -1,0 +1,410 @@
+//! The tenant chain over a record store: put-once at the next seq, the
+//! loser of a race validated again, the head found by a listing after
+//! the last known seq, and a damaged chain refused.
+
+use std::collections::BTreeMap;
+
+use velmora_bridge::directory::chain::{
+    record_key, ChainError, ControlSeal, TenantChain, Written, MAX_PUT_TRIES,
+};
+use velmora_bridge::directory::record::DeletionReason;
+use velmora_bridge::directory::record::{HoldMode, OperatorReason, TenantId, TenantState};
+use velmora_bridge::directory::testing::{MemRecords, PlainSeal};
+use velmora_bridge::directory::transition::{next, Actor, Change, OperatorHoldRequest, Outcome};
+use velmora_bridge::UnixMs;
+
+const NOW: UnixMs = UnixMs(1_800_000_000_000);
+const DAY: i64 = 24 * 3_600_000;
+
+fn t1() -> TenantId {
+    TenantId::parse("t_00000000000000a1").unwrap()
+}
+
+fn block_on<F: std::future::Future>(f: F) -> F::Output {
+    tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap()
+        .block_on(f)
+}
+
+fn create() -> Change {
+    Change::Create {
+        jurisdiction: "us".into(),
+        location_hint: None,
+        synthetic: false,
+        limits: BTreeMap::new(),
+        rate_json: Default::default(),
+        features_json: Default::default(),
+        external_ref: Some("ws_1".into()),
+    }
+}
+
+fn hold(mode: HoldMode) -> Change {
+    Change::SetOperatorHold {
+        hold: Some(OperatorHoldRequest {
+            mode,
+            reason: OperatorReason::Security,
+            preserve: None,
+        }),
+    }
+}
+
+fn delete(key: u8) -> Change {
+    Change::SetDeletion {
+        shred_due_at: UnixMs(NOW.0 + 7 * DAY),
+        reason: DeletionReason::CustomerRequest,
+        key_hash: format!("{key:02x}").repeat(32),
+    }
+}
+
+/// Creates t1 and takes it to `active`: 4 records.
+async fn active(chain: &TenantChain<'_, MemRecords, PlainSeal>) {
+    let t = t1();
+    for change in [
+        create(),
+        Change::ClaimKeyVersion { version: 1 },
+        Change::CommitKeyVersion { version: 1 },
+        Change::Activate,
+    ] {
+        let w = chain
+            .write(&t, &change, Actor::TenantCreation, NOW, 0)
+            .await;
+        assert!(matches!(w, Ok(Written::Wrote(_))), "{change:?}: {w:?}");
+    }
+}
+
+/// The sealed bytes of the record that `change` makes on top of the head
+/// of `store`, as a second writer would put them.
+fn competitor(
+    store: &MemRecords,
+    seal: &PlainSeal,
+    change: Change,
+    actor: Actor,
+) -> (String, Vec<u8>) {
+    let chain = TenantChain { store, seal };
+    let head = block_on(chain.head(&t1(), 0)).unwrap().unwrap();
+    let record = velmora_bridge::directory::record::TenantRecord {
+        door: head.door,
+        private: head.private.unwrap(),
+    };
+    let Ok(Outcome::Next(rec)) = next(&t1(), Some(&record), &change, actor, NOW) else {
+        panic!("competitor");
+    };
+    let name = record_key(&t1(), rec.door.seq);
+    let door = serde_json::to_vec(&rec.door).unwrap();
+    let private = serde_json::to_vec(&rec.private).unwrap();
+    let sealed = seal.seal(&name, &t1(), &door, &private).unwrap();
+    (name, sealed)
+}
+
+#[test]
+fn records_are_put_once_at_the_next_seq() {
+    let store = MemRecords::new();
+    let seal = PlainSeal::new();
+    let chain = TenantChain {
+        store: &store,
+        seal: &seal,
+    };
+    block_on(async {
+        assert!(chain.head(&t1(), 0).await.unwrap().is_none());
+        active(&chain).await;
+        let head = chain.head(&t1(), 0).await.unwrap().unwrap();
+        assert_eq!(head.door.seq, 4);
+        assert_eq!(head.door.state(), TenantState::Active);
+        assert_eq!(head.private.unwrap().external_ref.as_deref(), Some("ws_1"));
+        assert_eq!(
+            store.keys(),
+            (1..=4).map(|s| record_key(&t1(), s)).collect::<Vec<_>>()
+        );
+        // A known seq starts the listing after it.
+        assert_eq!(chain.head_seq(&t1(), 3).await.unwrap(), Some(4));
+        assert_eq!(chain.head_seq(&t1(), 4).await.unwrap(), Some(4));
+        // Every record of the chain still reads.
+        for seq in 1..=4 {
+            let r = chain.read(&t1(), seq).await.unwrap().unwrap();
+            assert_eq!(r.door.seq, seq);
+        }
+    });
+}
+
+#[test]
+fn a_change_the_head_carries_writes_nothing() {
+    let store = MemRecords::new();
+    let seal = PlainSeal::new();
+    let chain = TenantChain {
+        store: &store,
+        seal: &seal,
+    };
+    block_on(async {
+        active(&chain).await;
+        let lift = Change::SetOperatorHold { hold: None };
+        let w = chain
+            .write(&t1(), &lift, Actor::Operator, NOW, 0)
+            .await
+            .unwrap();
+        let Written::Unchanged(head) = w else {
+            panic!("{w:?}")
+        };
+        assert_eq!(head.door.seq, 4);
+        assert_eq!(store.keys().len(), 4);
+    });
+}
+
+#[test]
+fn a_refused_change_writes_nothing() {
+    let store = MemRecords::new();
+    let seal = PlainSeal::new();
+    let chain = TenantChain {
+        store: &store,
+        seal: &seal,
+    };
+    block_on(async {
+        active(&chain).await;
+        let w = chain
+            .write(&t1(), &hold(HoldMode::Locked), Actor::Customer, NOW, 0)
+            .await;
+        let Err(ChainError::Refused(r)) = w else {
+            panic!("{w:?}")
+        };
+        assert_eq!(r.status, 403);
+        assert_eq!(store.keys().len(), 4);
+    });
+}
+
+/// The loser of a race reads the new head and validates again; its
+/// change lands at the seq after the winner's.
+#[test]
+fn the_loser_of_a_race_is_validated_again_on_the_new_head() {
+    let store = MemRecords::new();
+    let seal = PlainSeal::new();
+    let chain = TenantChain {
+        store: &store,
+        seal: &seal,
+    };
+    block_on(active(&chain));
+    let (name, sealed) = competitor(
+        &store,
+        &seal,
+        Change::SetBillingHold {
+            mode: Some(HoldMode::ReadOnly),
+        },
+        Actor::Billing,
+    );
+    let mut planted = Some((name, sealed));
+    store.before_put(move |_key, objects| {
+        if let Some((name, sealed)) = planted.take() {
+            objects.insert(name, sealed);
+        }
+    });
+    block_on(async {
+        let w = chain
+            .write(&t1(), &hold(HoldMode::Locked), Actor::Operator, NOW, 0)
+            .await
+            .unwrap();
+        let Written::Wrote(rec) = w else {
+            panic!("{w:?}")
+        };
+        assert_eq!(rec.door.seq, 6);
+        // Both changes are in force: the winner's was not overwritten.
+        assert!(rec.door.holds.billing.is_some());
+        assert!(rec.door.holds.operator.is_some());
+        let head = chain.head(&t1(), 0).await.unwrap().unwrap();
+        assert_eq!(head.door.seq, 6);
+    });
+}
+
+/// A race whose winner makes the loser's change invalid: the loser is
+/// refused and is never written at seq + 1.
+#[test]
+fn a_loser_that_is_no_longer_valid_is_refused() {
+    let store = MemRecords::new();
+    let seal = PlainSeal::new();
+    let chain = TenantChain {
+        store: &store,
+        seal: &seal,
+    };
+    block_on(active(&chain));
+    let (name, sealed) = competitor(&store, &seal, delete(1), Actor::Customer);
+    let mut planted = Some((name, sealed));
+    store.before_put(move |_key, objects| {
+        if let Some((name, sealed)) = planted.take() {
+            objects.insert(name, sealed);
+        }
+    });
+    block_on(async {
+        let w = chain
+            .write(&t1(), &delete(2), Actor::Customer, NOW, 0)
+            .await;
+        let Err(ChainError::Refused(r)) = w else {
+            panic!("{w:?}")
+        };
+        assert_eq!(r.code, "already_deleting");
+        assert_eq!(store.keys().len(), 5);
+        let head = chain.head(&t1(), 0).await.unwrap().unwrap();
+        assert_eq!(head.door.deletion.unwrap().key_hash, "01".repeat(32));
+    });
+}
+
+#[test]
+fn a_writer_that_keeps_losing_answers_busy() {
+    let store = MemRecords::new();
+    let seal = PlainSeal::new();
+    let chain = TenantChain {
+        store: &store,
+        seal: &seal,
+    };
+    block_on(active(&chain));
+    // Every put finds its seq taken: another writer is always first.
+    let seal_for_hook = PlainSeal::new();
+    store.before_put(move |key, objects| {
+        let t = t1();
+        let seq: u64 = key.rsplit('/').next().unwrap().parse().unwrap();
+        // A copy of the record before, re-sealed under this name, as a
+        // valid next record of another writer.
+        let prev = objects.get(&record_key(&t, seq - 1)).cloned().unwrap();
+        let opened = seal_for_hook
+            .open(&record_key(&t, seq - 1), &t, &prev)
+            .unwrap();
+        let mut door: serde_json::Value = serde_json::from_slice(&opened.door).unwrap();
+        door["seq"] = serde_json::json!(seq);
+        let door = serde_json::to_vec(&door).unwrap();
+        let sealed = seal_for_hook
+            .seal(key, &t, &door, opened.private.as_deref().unwrap())
+            .unwrap();
+        objects.insert(key.to_string(), sealed);
+    });
+    block_on(async {
+        let w = chain
+            .write(&t1(), &hold(HoldMode::Locked), Actor::Operator, NOW, 0)
+            .await;
+        assert!(matches!(w, Err(ChainError::Busy)), "{w:?}");
+        assert_eq!(store.keys().len(), 4 + MAX_PUT_TRIES as usize);
+    });
+}
+
+#[test]
+fn a_damaged_chain_is_refused() {
+    let seal = PlainSeal::new();
+    let t2 = TenantId::parse("t_00000000000000b2").unwrap();
+
+    // A gap.
+    let store = MemRecords::new();
+    let chain = TenantChain {
+        store: &store,
+        seal: &seal,
+    };
+    block_on(active(&chain));
+    let rec3 = store.raw(&record_key(&t1(), 3)).unwrap();
+    assert!(store.lose(&record_key(&t1(), 3)));
+    let r = block_on(chain.head(&t1(), 0));
+    assert!(matches!(r, Err(ChainError::Damaged(_))), "{r:?}");
+    // A record moved to another seq does not open as that seq.
+    store.plant(
+        &record_key(&t1(), 3),
+        store.raw(&record_key(&t1(), 2)).unwrap(),
+    );
+    assert!(block_on(chain.read(&t1(), 3)).is_err());
+    store.plant(&record_key(&t1(), 3), rec3.clone());
+    assert!(block_on(chain.head(&t1(), 0)).is_ok());
+
+    // A stray name under the chain's prefix.
+    store.plant(&format!("{}x", record_key(&t1(), 9)), vec![1]);
+    let r = block_on(chain.head(&t1(), 0));
+    assert!(matches!(r, Err(ChainError::Damaged(_))), "{r:?}");
+
+    // A record of t1 under t2's name: the seal refuses it, and a seal
+    // that would open it still finds the door naming another tenant.
+    let store = MemRecords::new();
+    let chain = TenantChain {
+        store: &store,
+        seal: &seal,
+    };
+    block_on(active(&chain));
+    let bytes = store.raw(&record_key(&t1(), 1)).unwrap();
+    store.plant(&record_key(&t2, 1), bytes);
+    assert!(block_on(chain.read(&t2, 1)).is_err());
+    let door = {
+        let opened = seal
+            .open(
+                &record_key(&t1(), 1),
+                &t1(),
+                &store.raw(&record_key(&t1(), 1)).unwrap(),
+            )
+            .unwrap();
+        opened.door
+    };
+    let forged = seal
+        .seal(&record_key(&t2, 1), &t2, &door, b"{\"v\":1}")
+        .unwrap();
+    store.plant(&record_key(&t2, 1), forged);
+    let r = block_on(chain.read(&t2, 1));
+    assert!(
+        matches!(r, Err(ChainError::Damaged("record_names_another"))),
+        "{r:?}"
+    );
+
+    // A known seq above the head.
+    let r = block_on(chain.head(&t1(), 9));
+    assert!(
+        matches!(r, Err(ChainError::Damaged("head_missing"))),
+        "{r:?}"
+    );
+}
+
+#[test]
+fn a_head_whose_private_part_does_not_open_takes_no_record() {
+    let store = MemRecords::new();
+    let seal = PlainSeal::new();
+    let chain = TenantChain {
+        store: &store,
+        seal: &seal,
+    };
+    block_on(active(&chain));
+    seal.lose_private(true);
+    block_on(async {
+        // The door part still reads, so a gate can still close doors.
+        let head = chain.head(&t1(), 0).await.unwrap().unwrap();
+        assert_eq!(head.private, None);
+        assert_eq!(head.door.state(), TenantState::Active);
+        let w = chain
+            .write(&t1(), &hold(HoldMode::Locked), Actor::Operator, NOW, 0)
+            .await;
+        assert!(matches!(w, Err(ChainError::PrivateUnreadable)), "{w:?}");
+        assert_eq!(store.keys().len(), 4);
+    });
+}
+
+#[test]
+fn the_head_is_found_across_listing_pages() {
+    let store = MemRecords::new();
+    let seal = PlainSeal::new();
+    let chain = TenantChain {
+        store: &store,
+        seal: &seal,
+    };
+    block_on(async {
+        active(&chain).await;
+        // 1,100 more records: hold on, hold off.
+        let mut known = 4;
+        for i in 0..1_100 {
+            let change = match i % 2 {
+                0 => hold(HoldMode::ReadOnly),
+                _ => Change::SetOperatorHold { hold: None },
+            };
+            let Written::Wrote(rec) = chain
+                .write(&t1(), &change, Actor::Operator, NOW, known)
+                .await
+                .unwrap()
+            else {
+                panic!("write {i}");
+            };
+            known = rec.door.seq;
+        }
+        assert_eq!(known, 1_104);
+        assert_eq!(chain.head_seq(&t1(), 0).await.unwrap(), Some(1_104));
+        // From a known seq, one listing call.
+        let before = store.lists();
+        assert_eq!(chain.head_seq(&t1(), 1_100).await.unwrap(), Some(1_104));
+        assert_eq!(store.lists() - before, 1);
+    });
+}
