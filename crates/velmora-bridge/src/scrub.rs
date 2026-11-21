@@ -840,11 +840,15 @@ where
                     loop {
                         tries += 1;
                         let reused = kept.is_some() && tries == 1;
+                        // Whether this run held other sessions when the slot
+                        // was asked for (the timer may end the set-aside
+                        // ones meanwhile, which frees a slot too).
+                        let held = !stats.is_empty() || !parked.borrow().is_empty();
                         let mut session = match kept.filter(|_| reused) {
                             Some(at) => Some(stats.swap_remove(at)),
                             None => self.stat_session(provider, holder).await?,
                         };
-                        if session.is_none() && (!stats.is_empty() || !parked.borrow().is_empty()) {
+                        if session.is_none() && held {
                             // The slot may be one this run keeps for another
                             // backbone (providers that share a pool): those are
                             // ended, and the slot asked for once more.
