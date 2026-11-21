@@ -88,13 +88,10 @@ const COMPLETE_ATTEMPTS: u32 = 3;
 /// `KeyMode::Random`.
 const KEY_MODE_RANDOM: u8 = 1;
 
-/// Headers the edge adds. They are never signed and their values are not
-/// always printable ASCII, so they are dropped before header validation.
-/// Dropping a header can only fail a signature, never satisfy one.
+/// Headers the edge adds, and the entry marker: dropped before header
+/// validation (see `common::edge_header`).
 fn edge_header(name: &str) -> bool {
-    name.starts_with("cf-")
-        || name.starts_with("x-forwarded-")
-        || matches!(name, "cdn-loop" | "x-real-ip" | "true-client-ip")
+    crate::entry::dropped_header(name)
 }
 
 // ---------------------------------------------------------------------------
@@ -437,7 +434,10 @@ where
 
     let mut authority = OneKey::default();
     let mut bucket = None;
-    if let Some(akid) = presented_access_key(&target, &headers) {
+    // The entry point admits one kind of key (`crate::entry`): a key of
+    // the other kind is looked up as if it did not exist.
+    let entry = crate::entry::Entry::of(&req.headers);
+    if let Some(akid) = presented_access_key(&target, &headers).filter(|akid| entry.admits(akid)) {
         // Unknown and disabled keys look the same: no credential.
         let row = bridge.catalog.access_key(&akid).await?;
         if let Some(row) = row.filter(|r| r.status == KeyStatus::Active) {

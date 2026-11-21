@@ -7,7 +7,7 @@
 //! | Route | Answer |
 //! |---|---|
 //! | `POST /_admin/buckets` `{name, disposable}` | `200` (a non-disposable bucket only with `"disposable": false`; `403` for one if `REAL_DATA_READY` is unset); `409` name taken |
-//! | `POST /_admin/keys` `{buckets, perm}` | `200` with the secret, once |
+//! | `POST /_admin/keys` `{buckets, perm[, kind]}` | `200` with the secret, once. `kind` is `s3` (default) or `app_password`: a key pair for the WebDAV entry point only (`crate::entry`) |
 //! | `GET /_admin/keys[?after=<id>]` | `200`: ids, status, created time and grants, never a secret; `next` while more follow |
 //! | `POST /_admin/keys/<access_key_id>/grants` `{bucket, perm}` | `200` `{access_key_id, bucket, perm}`, widening (`ro` to `rw`) or repeating an earlier grant on that bucket; `409` `GrantNarrowingRefused` for `rw` to `ro`; `404` unknown key or bucket; `400` bad `perm` |
 //! | `DELETE /_admin/keys/<access_key_id>` | `204` revoked; `404` unknown (so a second call is `404`) |
@@ -62,6 +62,7 @@ use zeroize::Zeroizing;
 
 use crate::config::{Maintenance, REAL_DATA_READY};
 use crate::crypto::{open_range, unwrap_bdk, wrap_bdk, wrap_secret, DataKey};
+use crate::entry::KeyKind;
 use crate::fetch::{cold_poll_ms, cold_step_bytes, ColdFetch, ColdReader, COLD_WAIT_MS};
 use crate::hashstate::Running;
 use crate::ingress::{self, check_admin_bearer, IngressError};
@@ -91,7 +92,6 @@ const REVOCATION_PAGE: u32 = 500;
 /// `owner` and `principal` of everything the admin API creates.
 const ADMIN_PRINCIPAL: &str = "admin";
 
-const KEY_ID_PREFIX: &str = "AKVL";
 const KEY_ID_RANDOM_LEN: usize = 16;
 const KEY_ID_ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
 const SECRET_LEN: usize = 40;
@@ -964,6 +964,9 @@ pub(super) async fn delete_bucket_s3<
 struct CreateKeyBody {
     buckets: Vec<String>,
     perm: String,
+    /// `s3` (the default) or `app_password` (see `crate::entry`).
+    #[serde(default)]
+    kind: Option<String>,
 }
 
 async fn create_key<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>(
@@ -972,6 +975,11 @@ async fn create_key<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: K
 ) -> Admin<S3Response> {
     let perm =
         Perm::parse(&body.perm).ok_or_else(|| fail(400, "InvalidArgument", "perm is rw or ro."))?;
+    let kind = match body.kind.as_deref() {
+        None => KeyKind::S3,
+        Some(kind) => KeyKind::parse(kind)
+            .ok_or_else(|| fail(400, "InvalidArgument", "kind is s3 or app_password."))?,
+    };
     if body.buckets.is_empty() || body.buckets.len() > MAX_GRANTS {
         return Err(fail(400, "InvalidArgument", "Name 1 to 32 buckets."));
     }
@@ -989,7 +997,7 @@ async fn create_key<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: K
     let mut rng = SystemRng;
     let mut id_tail = [0u8; KEY_ID_RANDOM_LEN];
     fill_alphabet(&mut rng, &mut id_tail, KEY_ID_ALPHABET).map_err(rng_failed)?;
-    let mut access_key_id = String::from(KEY_ID_PREFIX);
+    let mut access_key_id = String::from(kind.prefix());
     access_key_id.extend(id_tail.iter().map(|b| char::from(*b)));
 
     // The only plaintext copies of the secret: this buffer (wiped on
@@ -1029,6 +1037,8 @@ async fn create_key<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: K
     out.extend_from_slice(&secret[..]);
     out.extend_from_slice(b"\",\"perm\":\"");
     out.extend_from_slice(perm.as_str().as_bytes());
+    out.extend_from_slice(b"\",\"kind\":\"");
+    out.extend_from_slice(kind.as_str().as_bytes());
     out.extend_from_slice(b"\"}");
     Ok(S3Response {
         status: 200,
@@ -1068,6 +1078,7 @@ async fn list_keys<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Ke
         .map(|k| {
             json!({
                 "access_key_id": k.access_key_id,
+                "kind": KeyKind::of(&k.access_key_id).as_str(),
                 "status": k.status.as_str(),
                 "created_at": k.created_at.0,
                 "grants": k.grants.iter().map(|(bucket, perm)| json!({
