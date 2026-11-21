@@ -31,8 +31,8 @@
 //!
 //! **Not verified on D1 itself** (the drill shows each): reading
 //! `sqlite_master` through the binding; `CREATE TRIGGER` and `DROP
-//! TRIGGER` through `exec`; that the abort message reaches the error text;
-//! the form in which D1 stores a trigger's text (compared exactly below);
+//! TRIGGER` through `exec`; the form in which D1 stores a trigger's text
+//! (compared exactly below);
 //! that `_cf_` names all of the platform's own tables; and that a Time
 //! Travel restore to before the freeze takes the triggers and the marker
 //! with it.
@@ -47,7 +47,9 @@ use crate::types::{BridgeError, BucketId, ExtentId, Result, UnixMs};
 /// The prefix of the freeze triggers' names.
 pub const FREEZE_TRIGGER_PREFIX: &str = "move_freeze_";
 
-/// The message every frozen write aborts with.
+/// The message every frozen write aborts with. No code reads it from an
+/// error: the D1 adapter keeps only a class of an error, and the fence is
+/// read back from `sqlite_master`, never from an error text.
 pub const FROZEN_MESSAGE: &str = "catalogue frozen for the move";
 
 /// Tables that hold operational state and no catalogue data: not frozen.
@@ -60,12 +62,26 @@ const ERR_NAME: BridgeError = BridgeError::Invalid("catalogue table name");
 const ERR_NOT_FROZEN: BridgeError = BridgeError::Invalid("catalogue not frozen");
 const ERR_ID: BridgeError = BridgeError::Invalid("catalogue id of the stamp row");
 
-/// A table or trigger name, by the rules the freeze can name by.
-fn valid_name(name: &str) -> bool {
-    (1..=96).contains(&name.len())
+/// The longest table name the freeze takes: its trigger names, the
+/// prefix and a suffix added, stay within [`MAX_TRIGGER_NAME`].
+const MAX_TABLE_NAME: usize = 64;
+const MAX_TRIGGER_NAME: usize = FREEZE_TRIGGER_PREFIX.len() + MAX_TABLE_NAME + 4;
+
+fn plain_name(name: &str, max: usize) -> bool {
+    (1..=max).contains(&name.len())
         && name
             .bytes()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+}
+
+/// A table name the freeze can fence.
+fn valid_table(name: &str) -> bool {
+    plain_name(name, MAX_TABLE_NAME)
+}
+
+/// A trigger name under the freeze prefix that can be dropped.
+fn valid_trigger(name: &str) -> bool {
+    plain_name(name, MAX_TRIGGER_NAME)
 }
 
 fn trigger_name(table: &str, op: &str) -> String {
@@ -95,7 +111,7 @@ pub async fn catalogue_tables<S: Sql>(catalog: &S) -> Result<Vec<String>> {
     let mut out = Vec::new();
     for row in rows {
         match row.into_iter().next() {
-            Some(SqlValue::Text(name)) if valid_name(&name) => {
+            Some(SqlValue::Text(name)) if valid_table(&name) => {
                 if !OPERATIONAL_TABLES.contains(&name.as_str()) {
                     out.push(name);
                 }
@@ -121,7 +137,9 @@ pub async fn marker<S: Sql>(catalog: &S) -> Result<Option<i64>> {
     }
 }
 
-/// Writes the cutover marker of move `ordinal`, if no marker is there. A
+/// Writes the cutover marker of move `ordinal`, if no marker is there.
+/// The move tool passes `flips + 1` of tenant 0's head, the count the
+/// request path judges the marker against. A
 /// marker that is there is not written again (once the triggers exist,
 /// even a write that would change nothing aborts); one of another move is
 /// an error.
@@ -255,7 +273,7 @@ async fn freeze_triggers<S: Sql>(catalog: &S) -> Result<Vec<(String, String, Str
         .await?;
     rows.into_iter()
         .map(|row| match row.as_slice() {
-            [SqlValue::Text(n), SqlValue::Text(t), SqlValue::Text(sql)] if valid_name(n) => {
+            [SqlValue::Text(n), SqlValue::Text(t), SqlValue::Text(sql)] if valid_trigger(n) => {
                 Ok((n.clone(), t.clone(), sql.clone()))
             }
             _ => Err(BridgeError::Invalid("freeze trigger row")),
