@@ -286,6 +286,18 @@ fn a_blob_is_named_without_a_scope_only_at_the_listed_places() {
             .count(),
         1
     );
+    // Nor does it pick a layout of its own: no record of a job is named
+    // in a layout that is not its scope's.
+    for job_path in [
+        "bridge/jobs.rs",
+        "bridge/post.rs",
+        "bridge/verify.rs",
+        "bridge/intents.rs",
+    ] {
+        for named in ["Layout::flat", "Layout::of", "Layout::tenant", "Layout {"] {
+            assert!(!all[job_path].contains(named), "{job_path}: {named}");
+        }
+    }
     // And no name of the two families is written out by hand.
     for family in ["\"x/", "\"c/"] {
         let found = uses(&all, family);
