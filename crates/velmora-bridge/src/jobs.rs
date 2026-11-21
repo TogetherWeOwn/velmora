@@ -221,22 +221,24 @@ const _: () = assert!(SLOT_WAIT_MS + 393_000 < crate::jobtable::JOB_WAIT_MS);
 /// is (a connect, a login and one pass of a light check), so asking
 /// more often than this finds little.
 pub const SLOT_POLL_MS: u32 = 2_000;
-/// Catalogue calls all the asks of one wait may make together. D1 allows
-/// 1,000 queries per invocation, and a job that ran out of them could
-/// not even hand its claim back: the wait gets half, the job's own work
-/// the rest (a drill job made 13 calls on average). One ask is a read of
-/// the pool and at most three calls per provider (the sweep of expired
-/// permits, the take, the seeding of missing slots), so a job that asks
-/// many providers sleeps longer between asks ([`slot_poll_ms`]).
+/// Catalogue calls the asks of one wait may make together, after the
+/// first ask (the one a job always made). D1 allows 1,000 queries per
+/// invocation, and a job that ran out of them could not even hand its
+/// claim back: the wait gets half, the job's own work the rest (a drill
+/// job made 13 calls on average). One ask is a read of the pool and at
+/// most three calls per provider (the sweep of expired permits, the
+/// take, the seeding of missing slots), so a job that asks many
+/// providers sleeps longer between asks ([`slot_poll_ms`]).
 pub const SLOT_WAIT_CALLS: i64 = 500;
 
 /// The sleep before the next ask of `providers` providers: at least
-/// [`SLOT_POLL_MS`], and long enough that asks spaced like this make no
-/// more than [`SLOT_WAIT_CALLS`] calls in [`SLOT_WAIT_MS`] (and one ask
-/// more, where the last sleep begins just before the wait is over).
+/// [`SLOT_POLL_MS`], and long enough that the asks that follow such
+/// sleeps make no more than [`SLOT_WAIT_CALLS`] calls in
+/// [`SLOT_WAIT_MS`]: as many asks as fit in the calls, spread over the
+/// wait.
 pub fn slot_poll_ms(providers: usize) -> u32 {
-    let calls = 1 + 3 * providers as i64;
-    let ms = (SLOT_WAIT_MS * calls + SLOT_WAIT_CALLS - 1) / SLOT_WAIT_CALLS;
+    let asks = (SLOT_WAIT_CALLS / (1 + 3 * providers as i64)).max(1);
+    let ms = (SLOT_WAIT_MS + asks - 1) / asks;
     u32::try_from(ms).unwrap_or(u32::MAX).max(SLOT_POLL_MS)
 }
 

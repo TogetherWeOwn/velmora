@@ -476,7 +476,7 @@ where
             let asked = usable.len();
             let mut refused = false;
             for provider in usable {
-                let Some(mut session) = ProviderSession::open(
+                let opened = ProviderSession::open(
                     &self.catalog,
                     &self.nntp,
                     &self.clock,
@@ -484,8 +484,11 @@ where
                     PermitClass::Background,
                     &holder,
                 )
-                .await?
-                else {
+                .await;
+                let Some(mut session) = (match opened {
+                    Err(_) if waited => return Err(Stop::NoPermit),
+                    opened => opened?,
+                }) else {
                     continue;
                 };
                 let tally = match kind {

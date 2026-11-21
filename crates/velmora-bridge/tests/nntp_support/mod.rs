@@ -416,6 +416,8 @@ pub struct MemCatalog {
     /// `provider_failed` calls so far (strikes reported).
     pub failures_reported: Cell<u32>,
     loads: Cell<u32>,
+    acquires: Cell<u32>,
+    fail_asks: Cell<Option<(u32, bool)>>,
     /// The backbones read in full for a while, as `verify_escalations`.
     pub escalations: RefCell<Vec<VerifyEscalation>>,
     /// Extent, backbone and plan of each raise, as `verify_raises`.
@@ -464,10 +466,16 @@ impl MemCatalog {
         self.entries.borrow()[extent].verifications.clone()
     }
 
-    /// Every held slot passes to someone else: its holder's permit is dead.
-    /// How often the load of the providers was read.
-    pub fn pool_loads(&self) -> u32 {
-        self.loads.get()
+    /// How often the load of the providers was read, and how often a
+    /// slot was asked for.
+    pub fn slot_asks(&self) -> (u32, u32) {
+        (self.loads.get(), self.acquires.get())
+    }
+
+    /// From the `n`th read of the providers' load on, that read fails
+    /// (`acquire` false) or every ask for a slot after it does.
+    pub fn fail_slot_asks(&self, n: u32, acquire: bool) {
+        self.fail_asks.set(Some((n, acquire)));
     }
 
     /// Provider `id` reads as cooling until `until` from `from` on, as
@@ -476,6 +484,7 @@ impl MemCatalog {
         *self.later_cooldown.borrow_mut() = Some((id.to_string(), from.0, until.0));
     }
 
+    /// Every held slot passes to someone else: its holder's permit is dead.
     pub fn revoke_permits(&self) {
         for slot in self.slots.borrow_mut().values_mut().flatten() {
             slot.token += 1;
@@ -1038,6 +1047,10 @@ impl Catalog for MemCatalog {
         now: UnixMs,
     ) -> Result<Option<Permit>> {
         note_event("acquire");
+        self.acquires.set(self.acquires.get() + 1);
+        if matches!(self.fail_asks.get(), Some((n, true)) if self.loads.get() >= n) {
+            return Err(BridgeError::Sql("injected acquire_permit failure".into()));
+        }
         if self.acquire_takes_a_turn.get() {
             let in_flight = self.acquire_in_flight.get() + 1;
             self.acquire_in_flight.set(in_flight);
@@ -1614,6 +1627,9 @@ impl Catalog for MemCatalog {
     }
     async fn provider_load(&self, now: UnixMs) -> Result<Vec<ProviderLoad>> {
         self.loads.set(self.loads.get() + 1);
+        if matches!(self.fail_asks.get(), Some((n, false)) if self.loads.get() >= n) {
+            return Err(BridgeError::Sql("injected provider_load failure".into()));
+        }
         let slots = self.slots.borrow();
         let health = self.health.borrow();
         let later = self.later_cooldown.borrow();
