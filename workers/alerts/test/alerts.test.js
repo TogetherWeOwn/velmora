@@ -4,7 +4,7 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
 import { FakeD1, FakeBucket, FakeEmail } from "./d1.js";
-import { evaluate, DEFAULTS } from "../src/checks.js";
+import { evaluate, figures, DEFAULTS } from "../src/checks.js";
 import { SQL, newestExport, readSnapshot } from "../src/catalog.js";
 import * as store from "../src/store.js";
 import worker, { tick, ingest, digest } from "../src/index.js";
@@ -109,10 +109,78 @@ test("catalogue readings are SELECTs only, and read the oldest due rows", async 
   assert.equal(s.releaseHead, null);
   assert.equal(s.deadRows, 1);
   assert.deepEqual(s.providers, [{ id: "p1", coolingUntil: T0 + HOUR, reason: "login" }]);
+  assert.ok(e.CATALOG.log.includes(SQL.scrub));
   for (const sql of e.CATALOG.log) assert.match(sql, /^SELECT /, "catalogue is never written");
   // The head reading rides the outbox_due index.
   const plan = e.CATALOG.db.prepare(`EXPLAIN QUERY PLAN ${SQL.head}`).all("post", T0);
   assert.match(plan.map((r) => r.detail).join(" "), /USING (COVERING )?INDEX outbox_due/);
+});
+
+test("a fresh scrub state raises no scrub condition", async () => {
+  const e = env();
+  const r = await tick(e, T0);
+  assert.deepEqual(r.conditions, []);
+  assert.deepEqual(r.snap.scrub, {
+    runs: 0, checked: 0, unrecoverable: 0, stalled: 0,
+    lastRunAt: null, lastUnrecoverableAt: null, lastIncidentAt: null, incident: [],
+  });
+  assert.ok(figures(r.snap).includes("scrub: runs 0, checked 0, unrecoverable 0, stalled 0, breaker on: none, last run: never"));
+});
+
+test("scrub unrecoverable alerts at once within its window", async () => {
+  const e = env();
+  e.CATALOG.db.prepare("UPDATE scrub_state SET unrecoverable = 2, last_unrecoverable_at = ? WHERE id = 1")
+    .run(T0 - 3 * HOUR);
+  const s = await readSnapshot(e, T0);
+  const [c] = evaluate(s, e);
+  assert.equal(c.key, "scrub-unrecoverable");
+  assert.equal(c.forMs, 0);
+  assert.match(c.detail, /3\.0 h ago.*2 finding/);
+  assert.deepEqual(evaluate({ ...s, now: T0 + MIN }, e), []);
+  assert.deepEqual(evaluate(s, { SCRUB_UNRECOVERABLE_WINDOW_SECS: "3600" }), []);
+});
+
+test("scrub breaker alerts with the affected backbones", async () => {
+  const e = env();
+  const update = e.CATALOG.db.prepare("UPDATE scrub_state SET last_incident = ?, last_incident_at = ? WHERE id = 1");
+  update.run('["highwinds"]', T0 - HOUR);
+  const [c] = evaluate(await readSnapshot(e, T0), e);
+  assert.equal(c.key, "scrub-incident");
+  assert.equal(c.forMs, 0);
+  assert.match(c.detail, /highwinds/);
+  assert.ok(c.detail.includes(new Date(T0 - HOUR).toISOString()));
+  for (const raw of [null, "[]", "not json", "{}", '["highwinds", 3]']) {
+    update.run(raw, T0 - HOUR);
+    assert.deepEqual(evaluate(await readSnapshot(e, T0), e), [], String(raw));
+  }
+});
+
+test("scrub stopped is opt-in and needs an old or missing run", async () => {
+  const e = env();
+  const update = e.CATALOG.db.prepare("UPDATE scrub_state SET last_run_at = ? WHERE id = 1");
+  update.run(T0 - 2 * HOUR);
+  assert.deepEqual(evaluate(await readSnapshot(e, T0), e), []);
+  e.SCRUB_STALE_SECS = "3600";
+  for (const [lastRunAt, detail] of [[T0 - 2 * HOUR, /2\.0 h ago/], [null, /never ran/]]) {
+    update.run(lastRunAt);
+    const [c] = evaluate(await readSnapshot(e, T0), e);
+    assert.equal(c.key, "scrub-stopped");
+    assert.equal(c.forMs, 0);
+    assert.match(c.detail, detail);
+    assert.match(c.detail, /threshold 1\.0 h/);
+  }
+  update.run(T0 - 10 * MIN);
+  assert.deepEqual(evaluate(await readSnapshot(e, T0), e), []);
+});
+
+test("a catalogue without scrub state skips scrub checks", async () => {
+  const e = env({ SCRUB_STALE_SECS: "3600" });
+  e.CATALOG.db.exec("DROP TABLE scrub_state");
+  const r = await tick(e, T0);
+  assert.deepEqual(r.conditions, []);
+  assert.deepEqual(r.snap.errors, []);
+  assert.equal(r.snap.scrub, null);
+  assert.ok(figures(r.snap).includes("scrub: not deployed (no scrub_state)"));
 });
 
 test("a failed reading is named, the others still count", async () => {
@@ -212,6 +280,51 @@ test("event alerts expire after two hours without a report, never before their e
 });
 
 // ---- index.js ----
+
+test("tick: an increase in stalled scrub repairs emails once, then clears", async () => {
+  const e = env();
+  e.CATALOG.db.exec("UPDATE scrub_state SET stalled = 2 WHERE id = 1");
+  const first = await tick(e, T0);
+  assert.deepEqual(first.conditions, []);
+  assert.equal(first.sent, 0);
+  assert.equal(await store.getMeta(e.STATE, "scrub_stalled"), 2);
+  e.CATALOG.db.exec("UPDATE scrub_state SET stalled = 5 WHERE id = 1");
+  const next = await tick(e, T0 + 5 * MIN);
+  assert.deepEqual(next.conditions, ["scrub-stalled"]);
+  assert.equal(next.sent, 1);
+  assert.equal(e.ALERT_EMAIL.sent[0].subject, "[velmora] Scrub repair stalled");
+  assert.match(e.ALERT_EMAIL.sent[0].text, /3 repair\(s\) still pinned/);
+  assert.equal(await store.getMeta(e.STATE, "scrub_stalled"), 5);
+  const same = await tick(e, T0 + 10 * MIN);
+  assert.deepEqual(same.conditions, []);
+  assert.equal(e.ALERT_EMAIL.sent.length, 1);
+  const row = await e.STATE.prepare("SELECT active FROM alerts WHERE key = 'scrub-stalled'").first();
+  assert.equal(row.active, 0);
+});
+
+test("tick: a failed scrub reading keeps scrub keys and the last stalled total", async () => {
+  const e = env({ SCRUB_STALE_SECS: "3600" });
+  e.CATALOG.db.prepare("UPDATE scrub_state SET stalled = 2, last_unrecoverable_at = ?, last_incident = ? WHERE id = 1")
+    .run(T0, '["highwinds"]');
+  await tick(e, T0);
+  e.CATALOG.db.exec("UPDATE scrub_state SET stalled = 3 WHERE id = 1");
+  const active = await tick(e, T0 + 5 * MIN);
+  assert.deepEqual(active.conditions, ["scrub-unrecoverable", "scrub-incident", "scrub-stalled", "scrub-stopped"]);
+  const prepare = e.CATALOG.prepare.bind(e.CATALOG);
+  e.CATALOG.prepare = (sql) => {
+    if (sql === SQL.scrub) throw new Error("database unavailable");
+    return prepare(sql);
+  };
+  const r = await tick(e, T0 + 10 * MIN);
+  assert.deepEqual(r.conditions, ["check-error"]);
+  assert.deepEqual(r.snap.errors, ["scrub state: database unavailable"]);
+  assert.ok(figures(r.snap).includes("scrub: could not read"));
+  assert.equal(await store.getMeta(e.STATE, "scrub_stalled"), 3);
+  for (const key of active.conditions) {
+    const row = await e.STATE.prepare("SELECT active FROM alerts WHERE key = ?1").bind(key).first();
+    assert.equal(row.active, 1, key);
+  }
+});
 
 test("tick: a stalled post head emails once after 30 + 30 min, then clears", async () => {
   const e = env();

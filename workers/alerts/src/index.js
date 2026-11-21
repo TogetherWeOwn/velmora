@@ -85,6 +85,7 @@ async function heartbeat(env, ok) {
 export async function tick(env, now) {
   const db = env.STATE;
   const prevPostHead = await store.getMeta(db, "post_head");
+  const prevScrubStalled = await store.getMeta(db, "scrub_stalled");
   // The export bucket is listed once an hour; between, the last reading holds.
   const lastExport = await store.getMeta(db, "export_check");
   const checkExport = !lastExport || now - lastExport.at >= store.HOUR;
@@ -97,9 +98,13 @@ export async function tick(env, now) {
     }
   }
   snap.prevPostHead = prevPostHead;
+  snap.prevScrubStalled = prevScrubStalled ?? undefined;
   snap.dlqLastHour = await store.dlqSince(db, now - store.HOUR);
   if (!snap.errors.some((e) => e.startsWith("post head"))) {
     await store.setMeta(db, "post_head", snap.postHead);
+  }
+  if (snap.scrub && !snap.errors.some((e) => e.startsWith("scrub state:"))) {
+    await store.setMeta(db, "scrub_stalled", snap.scrub.stalled);
   }
 
   const conds = evaluate(snap, env);

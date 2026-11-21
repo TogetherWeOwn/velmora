@@ -23,6 +23,11 @@ export const DEFAULTS = Object.freeze({
   EXPORT_MAX_AGE_SECS: 26 * 3600,
   // A row with this many attempts in its stage counts as failing.
   FAILING_ATTEMPTS: 3,
+  // Longer than SCRUB_CONFIRM_SECS (1 h), with room for runs that end busy.
+  // Keep this above SCRUB_CONFIRM_SECS if that is raised.
+  SCRUB_UNRECOVERABLE_WINDOW_SECS: 3 * 3600,
+  // Off at 0. Set to e.g. 3600 once SCRUB=on. Scrub runs every 5 min.
+  SCRUB_STALE_SECS: 0,
 });
 
 /** Which reading each check needs (a failed reading leaves its keys as they were). */
@@ -34,6 +39,7 @@ export function readingOf(key) {
   if (key === "outbox-dead") return "dead rows";
   if (key.startsWith("provider-cooldown:")) return "provider health";
   if (key === "catalog-export-stale") return "export list";
+  if (key.startsWith("scrub-")) return "scrub state";
   return null;
 }
 
@@ -64,6 +70,9 @@ function ageText(ms) {
  *   dlqLastHour: number                 dead-letter messages received in the last hour
  *   exportNewestAt: number | null | undefined  ms of the newest export manifest;
  *                                       undefined = not checked (no binding)
+ *   scrub: { runs, checked, unrecoverable, stalled, lastRunAt,
+ *            lastUnrecoverableAt, lastIncidentAt, incident } | null
+ *   prevScrubStalled: number | undefined  stalled total from the previous reading
  *   errors:     [string]                readings that failed
  * }
  */
@@ -185,6 +194,58 @@ export function evaluate(snap, env = {}) {
     }
   }
 
+  const scrub = snap.scrub;
+  if (scrub) {
+    const windowMs = setting(env, "SCRUB_UNRECOVERABLE_WINDOW_SECS") * 1000;
+    if (scrub.lastUnrecoverableAt !== null && now - scrub.lastUnrecoverableAt <= windowMs) {
+      out.push({
+        key: "scrub-unrecoverable",
+        title: "Data with no intact copy",
+        detail:
+          "An extent has no intact copy on Usenet, in the cache or the safety store. " +
+          `Last found ${ageText(now - scrub.lastUnrecoverableAt)} ago. ${scrub.unrecoverable} finding(s) so far. ` +
+          "The scrub checks it again every hour and reports it in the Worker log (alert: scrub-unrecoverable). " +
+          "Find it with SELECT id FROM extents WHERE scrub_result = 'unrecoverable'.",
+        forMs: 0,
+      });
+    }
+
+    if (scrub.incident.length > 0) {
+      const since = scrub.lastIncidentAt === null ? "unknown" : new Date(scrub.lastIncidentAt).toISOString();
+      out.push({
+        key: "scrub-incident",
+        title: "Scrub breaker holds repairs back",
+        detail:
+          `Backbone(s) ${scrub.incident.join(", ")} lack articles on many extents at once (an outage, a purge, or throttling). ` +
+          `Repairs there are held to one a run since ${since}. The breaker clears after 8 clean checks in a row. Check the provider.`,
+        forMs: 0,
+      });
+    }
+
+    if (typeof snap.prevScrubStalled === "number" && scrub.stalled > snap.prevScrubStalled) {
+      out.push({
+        key: "scrub-stalled",
+        title: "Scrub repair stalled",
+        detail:
+          `${scrub.stalled - snap.prevScrubStalled} repair(s) still pinned in R2 at their bound ` +
+          "(verify could not post what a backbone lacks). The copy in R2 and the other backbone still hold the data. " +
+          "See the outbox rows in stage 'dead' and the scrub-stalled log line.",
+        forMs: 0,
+      });
+    }
+
+    const staleMs = setting(env, "SCRUB_STALE_SECS") * 1000;
+    if (staleMs > 0 && (scrub.lastRunAt === null || now - scrub.lastRunAt > staleMs)) {
+      const lastRun = scrub.lastRunAt === null ? "never ran" : `last ran ${ageText(now - scrub.lastRunAt)} ago`;
+      out.push({
+        key: "scrub-stopped",
+        title: "Scrub not running",
+        detail: `The scrub ${lastRun} (threshold ${ageText(staleMs)}). Check SCRUB, the cron and the aux queue.`,
+        forMs: 0,
+      });
+    }
+  }
+
   if ((snap.errors ?? []).length > 0) {
     out.push({
       key: "check-error",
@@ -203,11 +264,17 @@ export function figures(snap) {
   const failed = new Set((snap.errors ?? []).map((e) => e.split(":")[0]));
   const na = (reading, text) => (failed.has(reading) ? "could not read" : text);
   const age = (h) => (h ? ageText(now - h.nextAt) : "none due");
+  const scrub = snap.scrub;
+  const scrubText = scrub
+    ? `runs ${scrub.runs}, checked ${scrub.checked}, unrecoverable ${scrub.unrecoverable}, stalled ${scrub.stalled}, ` +
+      `breaker on: ${scrub.incident.join(", ") || "none"}, last run: ${scrub.lastRunAt === null ? "never" : ageText(now - scrub.lastRunAt) + " ago"}`
+    : "not deployed (no scrub_state)";
   const lines = [
     `oldest due post row: ${na("post head", age(snap.postHead))}`,
     `oldest due verify row: ${na("verify head", age(snap.verifyHead))}`,
     `oldest due release row: ${na("release head", age(snap.releaseHead))}`,
     `dead outbox rows: ${na("dead rows", snap.deadRows)}`,
+    `scrub: ${na("scrub state", scrubText)}`,
     `providers cooling: ${na("provider health", (snap.providers ?? []).filter((p) => p.coolingUntil > now).map((p) => p.id).join(", ") || "none")}`,
   ];
   if (snap.exportNewestAt !== undefined) {

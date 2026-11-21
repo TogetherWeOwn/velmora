@@ -6,7 +6,7 @@ and changing it never redeploys the S3 Worker.
 
 ## What it watches
 
-Every 5 minutes it takes a few index-only readings of the S3 Worker's
+Every 5 minutes it takes a few readings along indexes in the S3 Worker's
 catalogue. Each statement reads at most 20 rows (measured), and nothing is
 ever written there. Each condition below emails when it holds:
 
@@ -19,7 +19,16 @@ ever written there. Each condition below emails when it holds:
 | `outbox-dead` | outbox rows are in stage `dead` | at once |
 | `provider-cooldown:<id>` | a provider is cooling (skipped) | 15 min |
 | `catalog-export-stale` | the newest export manifest in the export bucket is over 26 h old (listed hourly) | at once |
+| `scrub-unrecoverable` | the scrub found an extent with no intact copy within `SCRUB_UNRECOVERABLE_WINDOW_SECS` (3 h) | at once |
+| `scrub-incident` | the scrub breaker is holding repairs back on one or more backbones | at once |
+| `scrub-stalled` | the total of repairs still pinned at their bound rose since the last reading | at once |
+| `scrub-stopped` | the scrub never ran or its last run is older than `SCRUB_STALE_SECS` (0 = off) | at once |
 | `check-error` | a reading failed (its check did not run) | 15 min |
+
+The scrub checks skip a catalogue without `scrub_state`. Keep
+`SCRUB_UNRECOVERABLE_WINDOW_SECS` above the scrub's `SCRUB_CONFIRM_SECS`
+(1 h by default). Set `SCRUB_STALE_SECS` to 3600, for example, once
+`SCRUB=on`. The scrub runs every 5 minutes.
 
 It also takes reports on `POST /v1/alert` (bearer `INGEST_TOKEN`) from:
 
@@ -67,7 +76,8 @@ destination address. That is free on every plan, and needs no sending
 domain. The rest:
 
 - 8,640 cron runs a month;
-- under 100,000 catalogue rows read a month;
+- under 100,000 catalogue rows read a month for the other checks, plus
+  one scrub row per tick (8,640 a month) and one per daily digest;
 - a few thousand writes to the Worker's own D1;
 - about 720 R2 list calls a month.
 

@@ -6,6 +6,7 @@
 //   - dead rows: outbox_due, at most DEAD_CAP rows (normally none);
 //   - provider_health: one row per provider that ever failed (a few).
 //   - the attempts of the 20 soonest rows of a stage: outbox_due, 20 rows.
+//   - scrub_state: 1 row by primary key.
 // Measured against production: 0 to 20 rows read per statement.
 
 export const DEAD_CAP = 1000;
@@ -22,6 +23,7 @@ export const SQL = Object.freeze({
   // Ordered along outbox_due; reads the 20 table rows (attempts and
   // last_error are not in the index).
   attempts: "SELECT attempts, last_error FROM outbox WHERE stage = ?1 ORDER BY next_at LIMIT 20",
+  scrub: "SELECT runs, checked, unrecoverable, stalled, last_run_at, last_unrecoverable_at, last_incident_at, last_incident FROM scrub_state WHERE id = 1",
 });
 
 // Complete exports: d1/<database>/<restore point ms>.sql (one object, as
@@ -67,6 +69,7 @@ export async function readSnapshot(env, now, opts = {}) {
     deadRows: 0,
     providers: [],
     attempts: { post: [], verify: [] },
+    scrub: null,
     errors: [],
   };
   const db = env.CATALOG;
@@ -89,6 +92,29 @@ export async function readSnapshot(env, now, opts = {}) {
       ]),
       ["dead rows", async () => (snap.deadRows = Number((await db.prepare(SQL.dead).first())?.n ?? 0))],
       [
+        "scrub state",
+        async () => {
+          const r = await db.prepare(SQL.scrub).first();
+          if (!r) return;
+          let incident;
+          try {
+            incident = JSON.parse(r.last_incident);
+          } catch {
+            // An unreadable incident list counts as empty.
+          }
+          snap.scrub = {
+            runs: Number(r.runs),
+            checked: Number(r.checked),
+            unrecoverable: Number(r.unrecoverable),
+            stalled: Number(r.stalled),
+            lastRunAt: r.last_run_at === null ? null : Number(r.last_run_at),
+            lastUnrecoverableAt: r.last_unrecoverable_at === null ? null : Number(r.last_unrecoverable_at),
+            lastIncidentAt: r.last_incident_at === null ? null : Number(r.last_incident_at),
+            incident: Array.isArray(incident) && incident.every((name) => typeof name === "string") ? incident : [],
+          };
+        },
+      ],
+      [
         "provider health",
         async () => {
           const r = await db.prepare(SQL.providers).all();
@@ -104,7 +130,9 @@ export async function readSnapshot(env, now, opts = {}) {
       try {
         await f();
       } catch (e) {
-        snap.errors.push(`${name}: ${String(e?.message ?? e).slice(0, 160)}`);
+        const message = String(e?.message ?? e);
+        if (name === "scrub state" && message.includes("no such table")) continue;
+        snap.errors.push(`${name}: ${message.slice(0, 160)}`);
       }
     }
   }
