@@ -1274,3 +1274,54 @@ async fn the_due_query_as_it_runs_uses_its_index() {
     assert!(text.contains("extents_scrub_due"), "{text}");
     assert!(!text.contains("TEMP B-TREE"), "{text}");
 }
+
+/// Two backbones whose providers share one pool of slots: the run's kept
+/// `STAT` session of one is given up for the other, so the run is not
+/// stopped by its own sessions.
+#[tokio::test(flavor = "current_thread")]
+async fn backbones_that_share_a_pool_are_both_asked() {
+    let w = world_with(|cfg| {
+        for p in &mut cfg.providers {
+            p.pool = Some("shared".to_string());
+            p.pool_max_conns = Some(2);
+        }
+        cfg.scrub.sockets = 2;
+    })
+    .await;
+    let a = w.released("a", 160).await;
+    let b = w.released("b", 161).await;
+    w.advance_secs(31 * DAY_SECS);
+    let run = w.scrub().await;
+    assert_eq!((run.checked, run.ok, run.ended), (2, 2, ScrubEnd::Idle));
+    assert_eq!(w.result(&a).await, "ok");
+    assert_eq!(w.result(&b).await, "ok");
+}
+
+/// A re-pinned extent whose object was deleted meanwhile is left to
+/// garbage collection: the watch writes no copy back for it.
+#[tokio::test(flavor = "current_thread")]
+async fn the_watch_leaves_an_extent_of_a_deleted_object_alone() {
+    let w = world().await;
+    let o = w.released("a", 162).await;
+    w.advance_secs(31 * DAY_SECS);
+    w.hide(1, &o, 0).await;
+    w.scrub().await;
+    w.advance_secs(3600);
+    assert_eq!(w.scrub().await.repaired, 1);
+    assert!(w.bridge().safety.lose(&o.extent.safety_key()));
+    w.rig
+        .call(&w.signer, Method::Delete, &path(BUCKET, "a"), &[], &[], b"")
+        .await
+        .expect(204);
+    let puts = w.bridge().safety.puts.borrow().len();
+    let bound = repair_bound_secs(w.bridge().cfg.safety_min_age_secs, 3600);
+    w.advance_secs(u32::try_from(bound).unwrap());
+    let run = w.scrub().await;
+    assert_eq!((run.stalled, run.unrecoverable, run.bytes_read), (0, 0, 0));
+    assert_eq!(
+        w.bridge().safety.puts.borrow().len(),
+        puts,
+        "no copy written"
+    );
+    assert_eq!(w.next_at(&o).await, None, "off the due list");
+}
