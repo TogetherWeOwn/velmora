@@ -6,7 +6,7 @@
 //! ```text
 //! VELMORA_ESCROW_FILE=<escrow copy> \
 //! VELMORA_ESCROW_KEK_ENV=<file with VELMORA_KEK_<v>= lines> \
-//! VELMORA_ESCROW_BLOBS=<blob read from KEYS_A>,<blob read from KEYS_B> \
+//! VELMORA_ESCROW_BLOBS=KEYS_A=<blob read from KEYS_A>,KEYS_B=<blob read from KEYS_B> \
 //! VELMORA_ESCROW_KEY_RECORD=<seq>:<newest key-chain record file> \
 //! VELMORA_ESCROW_DATA_RECORD=<record name>:<VMR2 record file> \
 //! cargo test -p velmora-bridge --test escrow_restore_check -- --ignored --nocapture
@@ -66,9 +66,17 @@ fn the_escrow_copy_restores_the_tenant_key() {
     let kek = KekRing::from_vars(active, |n| vars.get(n).cloned())
         .unwrap_or_else(|_| panic!("the KEK file does not hold a usable KEK"));
 
-    let blobs: Vec<Vec<u8>> = var("VELMORA_ESCROW_BLOBS")
-        .map(|v| v.split(',').map(read).collect())
+    let blobs: Vec<(String, Vec<u8>)> = var("VELMORA_ESCROW_BLOBS")
+        .map(|v| {
+            v.split(',')
+                .map(|item| {
+                    let (label, path) = item.split_once('=').expect("<bucket>=<file>");
+                    (label.to_owned(), read(path))
+                })
+                .collect()
+        })
         .unwrap_or_default();
+    let blobs: Vec<(&str, Vec<u8>)> = blobs.iter().map(|(l, b)| (l.as_str(), b.clone())).collect();
     let key_record = var("VELMORA_ESCROW_KEY_RECORD").map(|v| {
         let (seq, path) = v.split_once(':').expect("<seq>:<file>");
         (seq.parse::<u64>().expect("a seq"), read(path))

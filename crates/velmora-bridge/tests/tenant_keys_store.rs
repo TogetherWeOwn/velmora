@@ -268,13 +268,29 @@ async fn cached_keys_are_read_again_at_sixty_seconds() {
     let cache = TkCache::default();
 
     let loaded = cache
-        .load(&set, &buckets, &kek, &clock, &tenant, 1, None)
+        .load(
+            &set,
+            &buckets,
+            &kek,
+            &clock,
+            &tenant,
+            1,
+            original.check_value(),
+        )
         .await
         .unwrap();
     assert_eq!(loaded.check_value(), original.check_value());
     let lists = stores.a.lists();
     let cached = cache
-        .load(&set, &buckets, &kek, &clock, &tenant, 1, None)
+        .load(
+            &set,
+            &buckets,
+            &kek,
+            &clock,
+            &tenant,
+            1,
+            original.check_value(),
+        )
         .await
         .unwrap();
     assert!(Rc::ptr_eq(&loaded, &cached));
@@ -282,7 +298,15 @@ async fn cached_keys_are_read_again_at_sixty_seconds() {
 
     clock.advance_ms(60_000);
     let reloaded = cache
-        .load(&set, &buckets, &kek, &clock, &tenant, 1, None)
+        .load(
+            &set,
+            &buckets,
+            &kek,
+            &clock,
+            &tenant,
+            1,
+            original.check_value(),
+        )
         .await
         .unwrap();
     assert!(stores.a.lists() > lists);
@@ -303,14 +327,30 @@ async fn loading_falls_back_to_the_second_bucket_and_reports_missing_keys() {
     let (name, blob) = wrapped(&kek, &original, &mut TestRng::new("fallback"));
     stores.b.plant(&name, blob);
     let loaded = TkCache::default()
-        .load(&set, &buckets, &kek, &clock, &tenant, 1, None)
+        .load(
+            &set,
+            &buckets,
+            &kek,
+            &clock,
+            &tenant,
+            1,
+            original.check_value(),
+        )
         .await
         .unwrap();
     assert_eq!(loaded.check_value(), original.check_value());
 
     assert!(stores.b.lose(&name));
     let error = TkCache::default()
-        .load(&set, &buckets, &kek, &clock, &tenant, 1, None)
+        .load(
+            &set,
+            &buckets,
+            &kek,
+            &clock,
+            &tenant,
+            1,
+            original.check_value(),
+        )
         .await
         .unwrap_err();
     assert!(
@@ -336,7 +376,15 @@ async fn a_foreign_name_evicts_all_cached_versions_of_the_tenant() {
         let (name, blob) = wrapped(&kek, &original, &mut rng);
         stores.a.plant(&name, blob);
         cache
-            .load(&set, &buckets, &kek, &clock, &tenant, version, None)
+            .load(
+                &set,
+                &buckets,
+                &kek,
+                &clock,
+                &tenant,
+                version,
+                original.check_value(),
+            )
             .await
             .unwrap();
     }
@@ -345,7 +393,15 @@ async fn a_foreign_name_evicts_all_cached_versions_of_the_tenant() {
     stores.a.plant(&format!("m/tk/{tenant}/shredded"), vec![]);
     clock.advance_ms(60_001);
     let error = cache
-        .load(&set, &buckets, &kek, &clock, &tenant, 1, None)
+        .load(
+            &set,
+            &buckets,
+            &kek,
+            &clock,
+            &tenant,
+            1,
+            key(&tenant, 1, "cached version 1").check_value(),
+        )
         .await
         .unwrap_err();
     assert!(is_foreign(&error), "{error:?}");
@@ -366,7 +422,15 @@ async fn loading_prefers_the_active_kek_and_accepts_an_older_kek() {
     let (old_name, mut old_blob) = wrapped(&old_kek, &original, &mut rng);
     stores.a.plant(&old_name, old_blob.clone());
     let loaded = TkCache::default()
-        .load(&set, &buckets, &kek, &clock, &tenant, 1, None)
+        .load(
+            &set,
+            &buckets,
+            &kek,
+            &clock,
+            &tenant,
+            1,
+            original.check_value(),
+        )
         .await
         .unwrap();
     assert_eq!(loaded.check_value(), original.check_value());
@@ -376,7 +440,15 @@ async fn loading_prefers_the_active_kek_and_accepts_an_older_kek() {
     old_blob[40] ^= 1;
     stores.a.plant(&old_name, old_blob);
     let loaded = TkCache::default()
-        .load(&set, &buckets, &kek, &clock, &tenant, 1, None)
+        .load(
+            &set,
+            &buckets,
+            &kek,
+            &clock,
+            &tenant,
+            1,
+            original.check_value(),
+        )
         .await
         .unwrap();
     assert_eq!(loaded.check_value(), original.check_value());
@@ -436,7 +508,10 @@ async fn repair_restores_a_missing_copy_byte_for_byte() {
         }]
     );
     assert_eq!(
-        repair_missing(&set, &buckets, &kek, &report).await.unwrap(),
+        repair_missing(&set, &buckets, &kek, &report)
+            .await
+            .unwrap()
+            .restored,
         [("KEYS_B".into(), name.clone())]
     );
     assert_eq!(stores.b.raw(&name), stores.a.raw(&name));
@@ -460,6 +535,7 @@ async fn audit_flags_both_mismatches_when_copies_of_one_name_disagree() {
     assert!(repair_missing(&set, &buckets, &kek, &report)
         .await
         .unwrap()
+        .restored
         .is_empty());
     assert_eq!((stores.a.puts(), stores.b.puts()), puts);
     assert_eq!(stores.a.names(), std::slice::from_ref(&name));
@@ -536,6 +612,7 @@ async fn audit_reports_foreign_names_and_repair_skips_the_tenant() {
     assert!(repair_missing(&set, &buckets, &kek, &report)
         .await
         .unwrap()
+        .restored
         .is_empty());
     assert_eq!(stores.b.names(), ["m/tk/garbage"]);
 }
@@ -676,7 +753,9 @@ async fn escrow_restores_both_lost_copies_and_opens_existing_records() {
     assert!(stores.a.lose(&name));
     assert!(stores.b.lose(&name));
     assert_eq!(
-        restore_escrow(&copy, &kek, &set, &buckets).await.unwrap(),
+        restore_escrow(&copy, &kek, copy.kcv, &set, &buckets)
+            .await
+            .unwrap(),
         [
             ("KEYS_A".into(), RestoreStep::Restored),
             ("KEYS_B".into(), RestoreStep::Restored)
@@ -684,7 +763,15 @@ async fn escrow_restores_both_lost_copies_and_opens_existing_records() {
     );
 
     let loaded = TkCache::default()
-        .load(&set, &buckets, &kek, &clock(), tenant, 1, None)
+        .load(
+            &set,
+            &buckets,
+            &kek,
+            &clock(),
+            tenant,
+            1,
+            original.check_value(),
+        )
         .await
         .unwrap();
     assert_eq!(loaded.check_value(), original.check_value());
@@ -702,7 +789,7 @@ async fn escrow_leaves_present_copies_without_calling_put() {
     let puts = (stores.a.puts(), stores.b.puts());
 
     assert_eq!(
-        restore_escrow(&copy, &kek, &two_in_account(), &stores.buckets())
+        restore_escrow(&copy, &kek, copy.kcv, &two_in_account(), &stores.buckets())
             .await
             .unwrap(),
         [
@@ -728,7 +815,7 @@ async fn escrow_reports_conflicting_keys_and_preserves_their_bytes() {
     stores.b.plant(&name, other.clone());
 
     assert_eq!(
-        restore_escrow(&copy, &kek, &two_in_account(), &stores.buckets())
+        restore_escrow(&copy, &kek, copy.kcv, &two_in_account(), &stores.buckets())
             .await
             .unwrap(),
         [
@@ -750,7 +837,7 @@ async fn escrow_refuses_a_foreign_name_before_writing_to_the_second_bucket() {
     let puts = stores.b.puts();
 
     assert!(
-        restore_escrow(&copy, &kek, &two_in_account(), &stores.buckets())
+        restore_escrow(&copy, &kek, copy.kcv, &two_in_account(), &stores.buckets())
             .await
             .is_err()
     );

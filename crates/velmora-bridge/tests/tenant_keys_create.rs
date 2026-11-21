@@ -433,14 +433,22 @@ async fn an_escrow_copy_restores_a_tenant_after_both_key_buckets_lost_its_key() 
     assert!(w.a.lose(&blob_name) && w.b.lose(&blob_name));
     let cache = TkCache::new();
     let e = cache
-        .load(&set, &w.buckets(), &w.kek, &clock, &w.t, 1, None)
+        .load(
+            &set,
+            &w.buckets(),
+            &w.kek,
+            &clock,
+            &w.t,
+            1,
+            created.key.check_value(),
+        )
         .await
         .unwrap_err();
     assert!(is_crypto(&e, "tenant key is missing"), "{e:?}");
 
     // The restore.
     let copy = EscrowCopy::parse(&text).unwrap();
-    let steps = restore_escrow(&copy, &w.kek, &set, &w.buckets())
+    let steps = restore_escrow(&copy, &w.kek, copy.kcv, &set, &w.buckets())
         .await
         .unwrap();
     assert_eq!(
@@ -451,7 +459,15 @@ async fn an_escrow_copy_restores_a_tenant_after_both_key_buckets_lost_its_key() 
         ]
     );
     let loaded = cache
-        .load(&set, &w.buckets(), &w.kek, &clock, &w.t, 1, None)
+        .load(
+            &set,
+            &w.buckets(),
+            &w.kek,
+            &clock,
+            &w.t,
+            1,
+            created.key.check_value(),
+        )
         .await
         .unwrap();
     assert_eq!(loaded.check_value(), created.key.check_value());
@@ -466,7 +482,7 @@ async fn an_escrow_copy_restores_a_tenant_after_both_key_buckets_lost_its_key() 
     );
     // A second restore finds both copies present and writes nothing.
     let puts = (w.a.puts(), w.b.puts());
-    let steps = restore_escrow(&copy, &w.kek, &set, &w.buckets())
+    let steps = restore_escrow(&copy, &w.kek, copy.kcv, &set, &w.buckets())
         .await
         .unwrap();
     assert!(steps.iter().all(|(_, s)| *s == RestoreStep::Present));
@@ -493,7 +509,15 @@ async fn an_escrow_copy_restores_a_tenant_after_both_key_buckets_lost_its_key() 
     // Sealed under the real key: re-load it into a ring.
     let ring = OneKey(
         cache
-            .load(&set, &w.buckets(), &w.kek, &clock, &w.t, 1, None)
+            .load(
+                &set,
+                &w.buckets(),
+                &w.kek,
+                &clock,
+                &w.t,
+                1,
+                created.key.check_value(),
+            )
             .await
             .map(|k| {
                 let _ = &ring;
@@ -518,10 +542,14 @@ async fn an_escrow_copy_restores_a_tenant_after_both_key_buckets_lost_its_key() 
         1,
         &door,
         Some(&private),
+        false,
         &mut rng,
     )
     .unwrap();
-    let blobs = vec![w.a.raw(&blob_name).unwrap(), w.b.raw(&blob_name).unwrap()];
+    let blobs = vec![
+        ("KEYS_A", w.a.raw(&blob_name).unwrap()),
+        ("KEYS_B", w.b.raw(&blob_name).unwrap()),
+    ];
     let checks = restore_check(
         &copy,
         &w.kek,
@@ -542,7 +570,13 @@ async fn an_escrow_copy_restores_a_tenant_after_both_key_buckets_lost_its_key() 
     // record, is a mismatch.
     let other = TenantKey::from_bytes(&w.t, 1, derived("other key")).unwrap();
     let (_, other_blob) = wrap_tenant_key(&w.kek, &other, &mut rng).unwrap();
-    let checks = restore_check(&copy, &w.kek, &[blobs[0].clone(), other_blob], None, None);
+    let checks = restore_check(
+        &copy,
+        &w.kek,
+        &[blobs[0].clone(), ("KEYS_B", other_blob)],
+        None,
+        None,
+    );
     // A missing input is a mismatch, never a line left out.
     assert_eq!(
         checks,
@@ -664,24 +698,10 @@ async fn a_run_racing_under_another_kek_version_never_replaces_the_committed_key
     };
     let cache = TkCache::new();
     let loaded = cache
-        .load(
-            &set,
-            &plain,
-            &both,
-            &clock,
-            &t,
-            1,
-            Some(a_key.check_value()),
-        )
+        .load(&set, &plain, &both, &clock, &t, 1, a_key.check_value())
         .await
         .unwrap();
     assert_eq!(loaded.check_value(), a_key.check_value());
-    let cache = TkCache::new();
-    let e = cache
-        .load(&set, &plain, &both, &clock, &t, 1, None)
-        .await
-        .unwrap_err();
-    assert!(velmora_bridge::keys::tk::is_split(&e), "{e:?}");
     let report = velmora_bridge::keys::audit::audit(&set, &plain, Some(&both))
         .await
         .unwrap();
@@ -689,10 +709,14 @@ async fn a_run_racing_under_another_kek_version_never_replaces_the_committed_key
         f,
         velmora_bridge::keys::audit::Finding::VersionMismatch { version: 1, .. }
     )));
-    // A cached key that is not the pinned one is not served.
+    // Only the pinned key is ever taken, even with the stray under the
+    // active KEK in the arbiter.
     let cache = TkCache::new();
-    let stray = cache.load(&set, &plain, &both, &clock, &t, 1, None).await;
-    assert!(stray.is_err());
+    let pinned = cache
+        .load(&set, &plain, &both, &clock, &t, 1, a_key.check_value())
+        .await
+        .unwrap();
+    assert_eq!(pinned.check_value(), a_key.check_value());
 }
 
 // ---------------------------------------------------------------------------
@@ -731,7 +755,7 @@ async fn a_corrupt_copy_falls_back_to_the_other_bucket() {
             &clock,
             &w.t,
             1,
-            Some(created.key.check_value()),
+            created.key.check_value(),
         )
         .await
         .unwrap();
@@ -800,7 +824,7 @@ async fn the_cache_lets_no_key_outlive_its_time() {
     .unwrap();
     let clock = FixedClock::new(UnixMs(1_700_000_000_000));
     let cache = TkCache::new();
-    let pin = Some(created.key.check_value());
+    let pin = created.key.check_value();
     cache
         .load(&set, &w.buckets(), &w.kek, &clock, &w.t, 1, pin)
         .await
@@ -810,7 +834,7 @@ async fn the_cache_lets_no_key_outlive_its_time() {
     clock.advance_ms(60_000);
     let other = TenantId::parse("t_00000000000000b2").unwrap();
     let _ = cache
-        .load(&set, &w.buckets(), &w.kek, &clock, &other, 1, None)
+        .load(&set, &w.buckets(), &w.kek, &clock, &other, 1, [0; 8])
         .await;
     assert_eq!(cache.len(), 0);
 }
@@ -837,7 +861,7 @@ async fn a_restore_in_conflict_anywhere_writes_nothing_anywhere() {
     let (_, other_blob) = wrap_tenant_key(&w.kek, &other, &mut TestRng(55)).unwrap();
     w.a.plant(&name, other_blob);
     w.b.lose(&name);
-    let steps = restore_escrow(&copy, &w.kek, &set, &w.buckets())
+    let steps = restore_escrow(&copy, &w.kek, copy.kcv, &set, &w.buckets())
         .await
         .unwrap();
     assert_eq!(
@@ -870,7 +894,7 @@ async fn a_damaged_copy_is_a_conflict_not_present() {
     let copy = EscrowCopy::of_blob(&w.t, 1, 1, &w.a.raw(&name).unwrap()).unwrap();
     // The right check value, a rotten tag.
     flip(&w.b, &name, 80);
-    let steps = restore_escrow(&copy, &w.kek, &set, &w.buckets())
+    let steps = restore_escrow(&copy, &w.kek, copy.kcv, &set, &w.buckets())
         .await
         .unwrap();
     assert_eq!(steps[1], ("KEYS_B".to_owned(), RestoreStep::Conflict));
@@ -908,7 +932,7 @@ async fn an_escrow_copy_under_an_old_kek_brings_no_old_name_back() {
         s.lose(&old);
     }
     let puts = (w.a.puts(), w.b.puts());
-    let steps = restore_escrow(&copy, &both, &set, &w.buckets())
+    let steps = restore_escrow(&copy, &both, copy.kcv, &set, &w.buckets())
         .await
         .unwrap();
     assert!(
@@ -968,6 +992,7 @@ async fn a_repair_copies_only_from_a_source_that_opens() {
     assert!(repair_missing(&set, &buckets, &w.kek, &report)
         .await
         .unwrap()
+        .restored
         .is_empty());
     assert!(c.raw(&name).is_none());
 }
@@ -1027,4 +1052,346 @@ async fn an_audit_by_small_pages_finds_what_one_audit_finds() {
     findings.sort();
     assert_eq!(findings, whole.findings);
     assert!(pages > 2, "{pages}");
+}
+
+// ---------------------------------------------------------------------------
+// From the second review of the tenant-key package
+// ---------------------------------------------------------------------------
+
+fn stray_blob(t: &TenantId, label: &str) -> Vec<u8> {
+    let k = TenantKey::from_bytes(t, 1, derived(label)).unwrap();
+    wrap_tenant_key(&kek(), &k, &mut TestRng(80)).unwrap().1
+}
+
+/// The pre-commit check: a stray copy of the version that lands in the
+/// arbiter after this run's copy step voids the version.
+#[tokio::test(flavor = "current_thread")]
+async fn a_stray_that_lands_before_the_commit_voids_the_version() {
+    let w = World::new();
+    let set = two_in_account();
+    let stray = stray_blob(&w.t, "late stray");
+    let a = Hooked {
+        inner: &w.a,
+        before_put: RefCell::new(None),
+    };
+    let b = Hooked {
+        inner: &w.b,
+        before_put: RefCell::new(Some(Box::new(|| {
+            // Under another KEK version's name, so no put arbitrates it.
+            w.a.plant(&tk_blob_name(&w.t, 1, 9), stray.clone());
+        }))),
+    };
+    let buckets = KeyBuckets {
+        by_name: vec![("KEYS_A", &a), ("KEYS_B", &b)],
+    };
+    let created = create_key_version(&set, &buckets, &w.claims, &w.kek, &w.t, 0, &mut TestRng(81))
+        .await
+        .unwrap();
+    assert_eq!(created.voided, vec![1]);
+    assert_eq!(created.key.version(), 2);
+}
+
+/// The pre-commit check: a marker that lands after the copies stops the
+/// run before its commit.
+#[tokio::test(flavor = "current_thread")]
+async fn a_marker_that_lands_before_the_commit_stops_it() {
+    let w = World::new();
+    let set = two_in_account();
+    let marker = format!("{}shredded", tk_prefix(&w.t));
+    let a = Hooked {
+        inner: &w.a,
+        before_put: RefCell::new(None),
+    };
+    let b = Hooked {
+        inner: &w.b,
+        before_put: RefCell::new(Some(Box::new(|| w.a.plant(&marker, b"m".to_vec())))),
+    };
+    let buckets = KeyBuckets {
+        by_name: vec![("KEYS_A", &a), ("KEYS_B", &b)],
+    };
+    let e = create_key_version(&set, &buckets, &w.claims, &w.kek, &w.t, 0, &mut TestRng(82))
+        .await
+        .unwrap_err();
+    assert!(is_foreign(&e), "{e:?}");
+    assert!(w.claims.state.borrow().commits.is_empty());
+}
+
+/// A resumed claim on a Worker that lacks the blob's KEK is not a loss.
+#[tokio::test(flavor = "current_thread")]
+async fn a_resumed_claim_without_the_blobs_kek_is_not_a_loss() {
+    let w = World::new();
+    let set = two_in_account();
+    let other = TestKek::with_versions(2, &[(2, derived("kek 2"))]);
+    let key = TenantKey::from_bytes(&w.t, 1, derived("run under kek 2")).unwrap();
+    let (v, blob) = wrap_tenant_key(&other, &key, &mut TestRng(83)).unwrap();
+    w.a.plant(&tk_blob_name(&w.t, 1, v), blob);
+    w.claims.state.borrow_mut().highest = 1;
+    w.claims.state.borrow_mut().rotating_to = Some(1);
+    let e = create_key_version(
+        &set,
+        &w.buckets(),
+        &w.claims,
+        &w.kek,
+        &w.t,
+        0,
+        &mut TestRng(84),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(e, BridgeError::Crypto(m) if m.contains("KEK this Worker lacks")),
+        "{e:?}"
+    );
+}
+
+/// The only copy with a damaged header is corruption, not a missing key.
+#[tokio::test(flavor = "current_thread")]
+async fn a_damaged_only_copy_is_not_reported_missing() {
+    let w = World::new();
+    let set = two_in_account();
+    let created = create_key_version(
+        &set,
+        &w.buckets(),
+        &w.claims,
+        &w.kek,
+        &w.t,
+        0,
+        &mut TestRng(85),
+    )
+    .await
+    .unwrap();
+    let name = tk_blob_name(&w.t, 1, 1);
+    w.b.lose(&name);
+    flip(&w.a, &name, 8);
+    let clock = FixedClock::new(UnixMs(1_700_000_000_000));
+    let e = TkCache::new()
+        .load(
+            &set,
+            &w.buckets(),
+            &w.kek,
+            &clock,
+            &w.t,
+            1,
+            created.key.check_value(),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        !matches!(e, BridgeError::Crypto(m) if m == "tenant key is missing"),
+        "{e:?}"
+    );
+}
+
+/// A restore into an empty bucket copies the newest copy that another
+/// bucket holds, never the escrow's older name.
+#[tokio::test(flavor = "current_thread")]
+async fn a_restore_brings_back_the_newest_name() {
+    let w = World::new();
+    let set = two_in_account();
+    let both = TestKek::with_versions(2, &[(1, derived("kek")), (2, derived("kek 2"))]);
+    let created = create_key_version(
+        &set,
+        &w.buckets(),
+        &w.claims,
+        &w.kek,
+        &w.t,
+        0,
+        &mut TestRng(86),
+    )
+    .await
+    .unwrap();
+    let old = tk_blob_name(&w.t, 1, 1);
+    let copy = EscrowCopy::of_blob(&w.t, 1, 1, &w.a.raw(&old).unwrap()).unwrap();
+    let blob2 = velmora_bridge::crypto::scheme2::wrap_tenant_key_as(
+        &both,
+        2,
+        &created.key,
+        &mut TestRng(87),
+    )
+    .unwrap();
+    let new = tk_blob_name(&w.t, 1, 2);
+    w.a.plant(&new, blob2.clone());
+    w.a.lose(&old);
+    w.b.lose(&old);
+    let steps = restore_escrow(&copy, &both, copy.kcv, &set, &w.buckets())
+        .await
+        .unwrap();
+    assert_eq!(steps[1], ("KEYS_B".to_owned(), RestoreStep::Restored));
+    assert_eq!(w.b.raw(&new), Some(blob2));
+    assert!(w.b.raw(&old).is_none());
+    // A copy that is not the committed key is refused outright.
+    let stray = stray_blob(&w.t, "not committed");
+    let stray_copy = EscrowCopy::of_blob(&w.t, 1, 1, &stray).unwrap();
+    assert!(
+        restore_escrow(&stray_copy, &w.kek, copy.kcv, &set, &w.buckets())
+            .await
+            .is_err()
+    );
+}
+
+/// A conflict met while writing stops the writes after it; a copy under
+/// a KEK this Worker lacks is unverified, not present.
+#[tokio::test(flavor = "current_thread")]
+async fn a_restore_stops_at_a_write_conflict_and_reports_unverified_copies() {
+    let w = World::new();
+    let set = two_in_account();
+    let created = create_key_version(
+        &set,
+        &w.buckets(),
+        &w.claims,
+        &w.kek,
+        &w.t,
+        0,
+        &mut TestRng(88),
+    )
+    .await
+    .unwrap();
+    let name = tk_blob_name(&w.t, 1, 1);
+    let copy = EscrowCopy::of_blob(&w.t, 1, 1, &w.a.raw(&name).unwrap()).unwrap();
+    w.a.lose(&name);
+    w.b.lose(&name);
+    let stray = stray_blob(&w.t, "racing writer");
+    let a = Hooked {
+        inner: &w.a,
+        before_put: RefCell::new(Some(Box::new(|| w.a.plant(&name, stray.clone())))),
+    };
+    let b = Hooked {
+        inner: &w.b,
+        before_put: RefCell::new(None),
+    };
+    let buckets = KeyBuckets {
+        by_name: vec![("KEYS_A", &a), ("KEYS_B", &b)],
+    };
+    let steps = restore_escrow(&copy, &w.kek, copy.kcv, &set, &buckets)
+        .await
+        .unwrap();
+    assert_eq!(
+        steps,
+        vec![
+            ("KEYS_A".to_owned(), RestoreStep::Conflict),
+            ("KEYS_B".to_owned(), RestoreStep::Withheld),
+        ]
+    );
+    assert!(w.b.raw(&name).is_none());
+    // A copy under a KEK version this Worker lacks.
+    let other = TestKek::with_versions(5, &[(5, derived("kek 5"))]);
+    let blob5 = wrap_tenant_key(&other, &created.key, &mut TestRng(89))
+        .unwrap()
+        .1;
+    let w2 = World::new();
+    w2.b.plant(&tk_blob_name(&w2.t, 1, 5), blob5);
+    let steps = restore_escrow(&copy, &w2.kek, copy.kcv, &set, &w2.buckets())
+        .await
+        .unwrap();
+    assert_eq!(steps[1], ("KEYS_B".to_owned(), RestoreStep::Unverified));
+}
+
+/// The restore check needs a blob from each of two named buckets, each
+/// opening as the key.
+#[tokio::test(flavor = "current_thread")]
+async fn the_restore_check_needs_two_good_buckets() {
+    let w = World::new();
+    let set = two_in_account();
+    create_key_version(
+        &set,
+        &w.buckets(),
+        &w.claims,
+        &w.kek,
+        &w.t,
+        0,
+        &mut TestRng(90),
+    )
+    .await
+    .unwrap();
+    let name = tk_blob_name(&w.t, 1, 1);
+    let blob = w.a.raw(&name).unwrap();
+    let copy = EscrowCopy::of_blob(&w.t, 1, 1, &blob).unwrap();
+    let ok = |checks: Vec<(&'static str, bool)>| checks.contains(&("key_buckets", true));
+    assert!(ok(restore_check(
+        &copy,
+        &w.kek,
+        &[("KEYS_A", blob.clone()), ("KEYS_B", blob.clone())],
+        None,
+        None
+    )));
+    assert!(!ok(restore_check(
+        &copy,
+        &w.kek,
+        &[("KEYS_A", blob.clone()), ("KEYS_A", blob.clone())],
+        None,
+        None
+    )));
+    let mut rotten = blob.clone();
+    rotten[40] ^= 1;
+    assert!(!ok(restore_check(
+        &copy,
+        &w.kek,
+        &[("KEYS_A", blob.clone()), ("KEYS_B", rotten)],
+        None,
+        None
+    )));
+}
+
+/// The repair copies only from a source that opens, even when the audit
+/// ran without the KEK.
+#[tokio::test(flavor = "current_thread")]
+async fn a_repair_without_kek_findings_still_opens_its_source() {
+    use velmora_bridge::keys::audit::{audit, repair_missing};
+    use velmora_bridge::keys::locations::{KeyLocation, KeyLocations, LocationStatus};
+    let w = World::new();
+    let c = MemRecords::new();
+    let loc = |name: &str, arbiter: bool| KeyLocation {
+        name: name.into(),
+        status: LocationStatus::Active,
+        arbiter,
+        synchronous: true,
+    };
+    let set = KeyLocations {
+        v: 1,
+        seq: 1,
+        locations: vec![
+            loc("KEYS_A", true),
+            loc("KEYS_B", false),
+            loc("KEYS_C", false),
+        ],
+    };
+    let buckets = KeyBuckets {
+        by_name: vec![("KEYS_A", &w.a), ("KEYS_B", &w.b), ("KEYS_C", &c)],
+    };
+    create_key_version(&set, &buckets, &w.claims, &w.kek, &w.t, 0, &mut TestRng(91))
+        .await
+        .unwrap();
+    let name = tk_blob_name(&w.t, 1, 1);
+    flip(&w.a, &name, 40);
+    c.lose(&name);
+    let report = audit::<MemRecords, TestKek>(&set, &buckets, None)
+        .await
+        .unwrap();
+    let repair = repair_missing(&set, &buckets, &w.kek, &report)
+        .await
+        .unwrap();
+    assert_eq!(repair.restored, vec![("KEYS_C".to_owned(), name.clone())]);
+    assert_eq!(c.raw(&name), w.b.raw(&name));
+}
+
+/// More names than one page: the audit reads every page.
+#[tokio::test(flavor = "current_thread")]
+async fn an_audit_reads_past_its_first_page() {
+    use velmora_bridge::keys::audit::{audit, Finding};
+    let w = World::new();
+    let set = two_in_account();
+    let blob = stray_blob(&w.t, "many");
+    for n in 1..=1001u32 {
+        let t = TenantId::parse(&format!("t_{n:016x}")).unwrap();
+        w.a.plant(&tk_blob_name(&t, 1, 1), blob.clone());
+    }
+    let report = audit::<MemRecords, TestKek>(&set, &w.buckets(), None)
+        .await
+        .unwrap();
+    let missing = report
+        .findings
+        .iter()
+        .filter(|f| matches!(f, Finding::Missing { .. }))
+        .count();
+    assert_eq!(missing, 1001);
 }

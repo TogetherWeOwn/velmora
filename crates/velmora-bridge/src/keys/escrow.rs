@@ -215,67 +215,98 @@ impl EscrowCopy {
 /// What a restore did in each location.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RestoreStep {
-    /// The location held the same key already (under this KEK version
-    /// or another).
+    /// The location held the key already, in a copy that opens.
     Present,
-    /// The copy was put back.
+    /// A copy of the key was put back.
     Restored,
     /// The location holds another key of that version, or a copy that
     /// does not open under the KEK: nothing was written anywhere. An
     /// alarm.
     Conflict,
-    /// Not written, because another location is in conflict.
+    /// The location holds a copy under a KEK version this Worker lacks:
+    /// it could not be opened, so nothing is written to it.
+    Unverified,
+    /// Not written, because a location is in conflict.
     Withheld,
 }
 
-/// Puts the escrow copy back into every synchronous location of `set`
-/// that lacks the key, after deciding every location first: one location
-/// in conflict means nothing is written anywhere, so no location ever
-/// holds a key the arbiter does not. A location that holds the same key
-/// under another KEK version counts as holding it: an old name is never
-/// brought back beside a newer one. Opens the copy with `kek` first.
+/// Puts the tenant key back into every synchronous location of `set`
+/// that lacks it, from the escrow copy, after deciding every location
+/// first:
+/// - the copy must open under the KEK and hold the key whose check value
+///   the tenant chain committed (`committed`);
+/// - one location in conflict means nothing is written anywhere, so no
+///   location ever holds a key the arbiter does not;
+/// - when a location still holds the key, its newest copy is what is put
+///   back, so an old KEK name is never brought back beside a newer one;
+/// - a marker or a foreign name refuses the tenant before any write, and
+///   one that appears during a write is an error.
 pub async fn restore_escrow<S: RecordStore, K: Kek>(
     copy: &EscrowCopy,
     kek: &K,
+    committed: [u8; KCV_LEN],
     set: &KeyLocations,
     buckets: &KeyBuckets<'_, S>,
 ) -> Result<Vec<(String, RestoreStep)>> {
     copy.open(kek)?;
-    let name = copy.name();
-    // A marker or a foreign name anywhere: refused before any write.
+    if copy.kcv != committed {
+        return Err(ERR_ESCROW_KEY);
+    }
     let mut decided = Vec::new();
+    // The newest copy of the key that opens, wherever it is.
+    let mut newest: Option<(u32, String, Vec<u8>)> = None;
     for location in set.synchronous() {
         let store = buckets.get(location)?;
         let mut conflict = false;
         let mut present = false;
+        let mut unverified = false;
         for (other, n, v) in list_tenant_blobs(store, &copy.tenant).await? {
             if n != copy.version {
                 continue;
             }
             let bytes = store.get(&other).await?.ok_or(ERR_ESCROW)?;
             let same_key = tk_blob_check_value(&bytes).is_ok_and(|k| k == copy.kcv);
-            // A copy that does not open is not a copy of the key, whatever
-            // its check value says.
-            let opens = kek.version(v).is_none()
-                || unwrap_tenant_key(kek, v, &copy.tenant, n, &bytes).is_ok();
-            conflict |= !same_key || !opens;
-            present |= same_key && opens;
+            if !same_key {
+                conflict = true;
+                continue;
+            }
+            if kek.version(v).is_none() {
+                unverified = true;
+                continue;
+            }
+            // A copy that does not open is not a copy of the key.
+            if unwrap_tenant_key(kek, v, &copy.tenant, n, &bytes).is_err() {
+                conflict = true;
+                continue;
+            }
+            present = true;
+            if newest.as_ref().is_none_or(|(nv, _, _)| v > *nv) {
+                newest = Some((v, other.clone(), bytes));
+            }
         }
-        let step = match (conflict, present) {
-            (true, _) => RestoreStep::Conflict,
-            (false, true) => RestoreStep::Present,
-            (false, false) => RestoreStep::Restored,
+        let step = if conflict {
+            RestoreStep::Conflict
+        } else if present {
+            RestoreStep::Present
+        } else if unverified {
+            RestoreStep::Unverified
+        } else {
+            RestoreStep::Restored
         };
         decided.push((location, step));
     }
-    let any_conflict = decided.iter().any(|(_, s)| *s == RestoreStep::Conflict);
+    let (name, blob) = match newest {
+        Some((_, name, bytes)) => (name, bytes),
+        None => (copy.name(), copy.blob.clone()),
+    };
+    let mut stop = decided.iter().any(|(_, s)| *s == RestoreStep::Conflict);
     let mut out = Vec::new();
     for (location, step) in decided {
         let step = match step {
-            RestoreStep::Restored if any_conflict => RestoreStep::Withheld,
+            RestoreStep::Restored if stop => RestoreStep::Withheld,
             RestoreStep::Restored => {
                 let store = buckets.get(location)?;
-                let step = if store.put_if_absent(&name, copy.blob.clone()).await? {
+                let step = if store.put_if_absent(&name, blob.clone()).await? {
                     RestoreStep::Restored
                 } else {
                     // Someone put it in between: read it back.
@@ -286,6 +317,8 @@ pub async fn restore_escrow<S: RecordStore, K: Kek>(
                         _ => RestoreStep::Conflict,
                     }
                 };
+                // A conflict found while writing stops the writes after it.
+                stop |= step == RestoreStep::Conflict;
                 // A marker that appeared during the write wins: an error.
                 list_tenant_blobs(store, &copy.tenant).await?;
                 step
@@ -303,9 +336,9 @@ pub async fn restore_escrow<S: RecordStore, K: Kek>(
 /// or a record's content leaves this function.
 ///
 /// - `open`: the copy opens under the KEK as the key it names.
-/// - `key_buckets`: every blob given, as read from the key buckets, has
-///   the copy's check value, and at least two are given (one from each
-///   key bucket).
+/// - `key_buckets`: one blob per key bucket, labelled with the bucket's
+///   name, at least two buckets, each opening under the KEK as the key of
+///   the copy. (The blobs are the ones under the copy's own name.)
 /// - `key_chain`: the copy's key opens the private part of the given key
 ///   chain record (`seq`, bytes) of the tenant.
 /// - `data_record`: the copy's key opens the given VMR2 record (name,
@@ -315,20 +348,24 @@ pub async fn restore_escrow<S: RecordStore, K: Kek>(
 pub fn restore_check<K: Kek>(
     copy: &EscrowCopy,
     kek: &K,
-    bucket_blobs: &[Vec<u8>],
+    bucket_blobs: &[(&str, Vec<u8>)],
     key_record: Option<(u64, &[u8])>,
     data_record: Option<(&str, &[u8])>,
 ) -> Vec<(&'static str, bool)> {
     let key = copy.open(kek).ok();
     let mut out = vec![("open", key.is_some())];
-    // Both key buckets: one blob from each.
-    out.push((
-        "key_buckets",
-        bucket_blobs.len() >= 2
-            && bucket_blobs
-                .iter()
-                .all(|b| tk_blob_check_value(b).is_ok_and(|k| k == copy.kcv)),
-    ));
+    // Two key buckets, each named once, each copy opening as the key.
+    let mut names: Vec<&str> = bucket_blobs.iter().map(|(n, _)| *n).collect();
+    names.sort_unstable();
+    names.dedup();
+    let buckets_ok = names.len() >= 2
+        && names.len() == bucket_blobs.len()
+        && bucket_blobs.iter().all(|(_, b)| {
+            tk_blob_check_value(b).is_ok_and(|k| k == copy.kcv)
+                && unwrap_tenant_key(kek, copy.kek_version, &copy.tenant, copy.version, b)
+                    .is_ok_and(|k| k.check_value() == copy.kcv)
+        });
+    out.push(("key_buckets", buckets_ok));
     let (chain_ok, data_ok) = match key {
         // A check whose input is missing is a mismatch, never left out.
         None => (false, false),
