@@ -200,8 +200,26 @@ pub async fn respond(
             return (status, crate::http::to_response(resp));
         }
     };
-    // `resp` came with its request ID; a refusal made here gets it too.
-    let refuse = |resp: S3Response| {
+    // A failure opening the first piece is still the client's S3 response.
+    let refuse = |mut resp: S3Response| {
+        if headers
+            .iter()
+            .any(|(name, _)| name == "access-control-allow-origin")
+        {
+            resp.headers.extend(
+                headers
+                    .iter()
+                    .filter(|(name, _)| {
+                        matches!(
+                            name.as_str(),
+                            "access-control-allow-origin"
+                                | "access-control-expose-headers"
+                                | "vary"
+                        )
+                    })
+                    .cloned(),
+            );
+        }
         (
             resp.status,
             crate::http::to_response(resp.with_request_id(request_id)),

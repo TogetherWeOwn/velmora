@@ -97,6 +97,39 @@ fn verified(name: &str) -> VerifiedRequest {
 }
 
 #[test]
+fn only_presigned_reads_accept_an_unsigned_range() {
+    for (fixture_name, name, value, allowed) in [
+        ("presign-get", "Range", "bytes=1000-1999", true),
+        ("presign-head", "Range", "bytes=1000-1999", true),
+        ("presign-put", "Range", "bytes=1000-1999", false),
+        ("header-empty", "Range", "bytes=1000-1999", false),
+        ("presign-get", "If-Match", "\"etag\"", false),
+    ] {
+        let v = fixture(fixture_name);
+        let mut fields = fields(&v);
+        set(&mut fields, name, value);
+        let result = verify(
+            v["method"].as_str().unwrap(),
+            &Target::parse(v["target"].as_str().unwrap(), &policy()).unwrap(),
+            &headers(&fields),
+            true,
+            NOW,
+            &policy(),
+            &authority(),
+        );
+        if allowed {
+            assert!(result.is_ok(), "{fixture_name}: {result:?}");
+        } else {
+            assert_eq!(
+                result.unwrap_err(),
+                ErrorCode::AccessDenied,
+                "{fixture_name}: {name}"
+            );
+        }
+    }
+}
+
+#[test]
 fn static_botocore_canonical_and_signature_goldens() {
     let all: Vec<Value> = serde_json::from_str(include_str!("fixtures/s3-static.json")).unwrap();
     for v in all {

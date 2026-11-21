@@ -239,7 +239,16 @@ pub fn verify(
     if !presigned && !names.contains(&"x-amz-date") {
         return Err(ErrorCode::InvalidRequest);
     }
+    // A presigned GET or HEAD URL already grants the whole object, so a
+    // `Range` its holder adds narrows what it reads and widens nothing:
+    // browsers and media players seek and resume with one they did not
+    // sign. Every other semantic header stays signed, and so does
+    // `Range` under a header signature or on any other method.
+    let unsigned_range_ok = presigned && matches!(method, "GET" | "HEAD");
     for (key, _) in headers.iter() {
+        if key == "range" && unsigned_range_ok {
+            continue;
+        }
         // The content SHA is itself canonical request input. All other semantic
         // fields must be signed; transport/client headers may remain unsigned.
         if (key.starts_with("x-amz-") && key != "x-amz-content-sha256"

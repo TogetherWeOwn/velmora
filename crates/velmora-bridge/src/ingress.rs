@@ -329,7 +329,7 @@ pub fn upload_lengths(
     Ok(UploadLengths { encoded, decoded })
 }
 
-fn header<'a>(req: &'a S3Request, name: &str) -> Option<&'a str> {
+pub(crate) fn header<'a>(req: &'a S3Request, name: &str) -> Option<&'a str> {
     req.headers
         .iter()
         .find(|(n, _)| n.eq_ignore_ascii_case(name))
@@ -483,13 +483,20 @@ where
     if crate::fanout::is_internal_target(&req.raw_target) {
         return handle(req).await;
     }
+    if let Some(resp) = crate::cors::preflight(&req, cfg) {
+        return resp;
+    }
     let admin = is_admin_target(&req.raw_target);
     let checked = {
         let route = classify(&req.method, &req.raw_target);
         precheck(&route, &req, cfg, https)
     };
     let mut resp = match checked {
-        Err(e) => e.response(),
+        Err(e) => {
+            let mut resp = e.response();
+            crate::cors::decorate(&req, cfg, &mut resp);
+            resp
+        }
         Ok(()) => handle(req).await,
     };
     if admin {

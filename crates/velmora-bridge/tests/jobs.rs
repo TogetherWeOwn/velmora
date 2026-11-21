@@ -267,6 +267,7 @@ impl Fx {
             metrics_sample: 10,
             environment: Environment::Dev,
             s3_host: "s3.test".to_string(),
+            cors_origins: Vec::new(),
             region: "auto".to_string(),
             max_extent_bytes: 16 * 1024 * 1024,
             max_put_bytes: 16 * 1024 * 1024,

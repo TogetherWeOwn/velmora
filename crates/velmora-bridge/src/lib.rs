@@ -10,6 +10,7 @@
 pub mod articles;
 pub mod config;
 pub mod copy;
+mod cors;
 pub mod crypto;
 pub mod fanout;
 pub mod fetch;

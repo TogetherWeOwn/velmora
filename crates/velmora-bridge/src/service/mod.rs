@@ -252,8 +252,12 @@ where
         if crate::fanout::is_internal_target(&target) {
             return get::fanout_piece(&self, req).await;
         }
-        match classify(&req.method, &target) {
-            Route::Admin { rest } => admin::handle(&self, req, rest).await,
+        if let Some(resp) = crate::cors::preflight(&req, &self.cfg) {
+            return resp;
+        }
+        let origin = crate::cors::allowed_origin(&req, &self.cfg);
+        let mut resp = match classify(&req.method, &target) {
+            Route::Admin { rest } => return admin::handle(&self, req, rest).await,
             Route::ListBuckets => list::list_buckets(&self, req).await,
             Route::CreateBucket { bucket } => {
                 if bucket::is_sigv4(&req) {
@@ -306,7 +310,11 @@ where
                 .find(|(name, _)| name.eq_ignore_ascii_case("host"))
                 .and_then(|(_, host)| common::host_value_refused(host, &self.cfg))
                 .unwrap_or_else(S3Response::not_implemented),
+        };
+        if let Some(origin) = origin {
+            crate::cors::decorate_origin(origin, &mut resp);
         }
+        resp
     }
 }
 

@@ -178,6 +178,8 @@ pub struct BridgeConfig {
     pub environment: Environment,
     /// The host clients sign (`policy.host`).
     pub s3_host: String,
+    /// Exact browser origins allowed to access S3 responses.
+    pub cors_origins: Vec<String>,
     pub region: String,
     pub max_extent_bytes: u64,
     /// Largest PutObject body. A body above `max_extent_bytes` is cut
@@ -483,6 +485,41 @@ fn valid_s3_host(h: &str) -> bool {
     name_ok && port_ok
 }
 
+fn cors_origins(value: &str, dev: bool) -> Result<Vec<String>, ConfigError> {
+    let mut origins = Vec::new();
+    if value.trim().is_empty() {
+        return Ok(origins);
+    }
+    for origin in value.split(',').map(str::trim) {
+        let authority = origin
+            .strip_prefix("https://")
+            .or_else(|| dev.then(|| origin.strip_prefix("http://")).flatten());
+        let valid = authority.is_some_and(|authority| {
+            let (host, port) = authority
+                .split_once(':')
+                .map_or((authority, None), |(host, port)| (host, Some(port)));
+            host.len() <= 253
+                && host.split('.').all(|label| {
+                    (1..=63).contains(&label.len())
+                        && !label.starts_with('-')
+                        && !label.ends_with('-')
+                        && label
+                            .bytes()
+                            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+                })
+                && port.is_none_or(|port| {
+                    port.bytes().all(|b| b.is_ascii_digit())
+                        && port.parse::<u16>().is_ok_and(|port| port != 0)
+                })
+        });
+        if !valid || origins.len() == 8 || origins.iter().any(|entry| entry == origin) {
+            return Err(ConfigError::Invalid("CORS_ORIGINS".into()));
+        }
+        origins.push(origin.to_string());
+    }
+    Ok(origins)
+}
+
 /// The catalogue id when `CATALOGUE_ID` is not set.
 pub const DEFAULT_CATALOGUE_ID: &str = "main";
 
@@ -625,6 +662,7 @@ impl BridgeConfig {
         if !valid_s3_host(&s3_host) {
             return Err(ConfigError::Invalid("S3_HOST".into()));
         }
+        let cors_origins = cors_origins(&get("CORS_ORIGINS").unwrap_or_default(), dev)?;
         let region = required(&get, "S3_REGION")?;
 
         let max_extent_bytes: u64 = number(&get, "MAX_EXTENT_BYTES")?;
@@ -879,6 +917,7 @@ impl BridgeConfig {
         Ok(BridgeConfig {
             environment,
             s3_host,
+            cors_origins,
             region,
             max_extent_bytes,
             max_put_bytes,

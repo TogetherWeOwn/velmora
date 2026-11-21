@@ -1433,3 +1433,20 @@ names. To name a frame:
 After 90 days, rebuild at `<sha>` with the same toolchain
 (`bash bundle.sh`) and use `symbols/index_bg.unstripped.wasm`; a
 different rustc may number the functions differently.
+
+
+## Browser access (CORS)
+
+Set `CORS_ORIGINS` to a comma-separated list of up to eight exact origins,
+such as `https://console.example.app`. Include a port if the origin has one.
+HTTP origins are allowed in dev. An unset or empty list disables CORS.
+
+An S3 `OPTIONS` preflight needs a listed `Origin` and a requested method of
+`GET`, `HEAD`, `PUT`, `POST`, or `DELETE`. It can request up to 32 header names,
+each 1–64 ASCII letters, digits, or hyphens. Allowed preflights return 200
+and can be cached for 600 seconds. Invalid preflights return 403. The
+actual request still needs S3 authentication. Admin routes are excluded.
+
+S3 responses to listed origins expose `ETag`, `x-amz-request-id`,
+`Content-Range`, and `Accept-Ranges`. Presigned GET links may carry an
+unsigned `Range` header.
