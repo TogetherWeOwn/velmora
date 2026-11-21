@@ -592,6 +592,16 @@ impl<U: Upstream, S: StatePort> Ctx<'_, U, S> {
         }
     }
 
+    /// `403` unless the key may write to the bucket (see
+    /// [`S3::can_write`]).
+    async fn require_write(&self, bucket: &str, key: &str) -> Result<(), Resp<U::Body>> {
+        match self.s3.can_write(bucket, key).await {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(status(403)),
+            Err(e) => Err(from_s3(&e)),
+        }
+    }
+
     fn item<'l>(&self, loc: &'l Loc) -> Result<(&'l str, &'l str), Resp<U::Body>> {
         match loc {
             Loc::Root => Err(status(403)),
@@ -895,6 +905,8 @@ impl<U: Upstream, S: StatePort> Ctx<'_, U, S> {
             .iter()
             .filter(|p| path::addressable(p))
             .collect();
+        let folder_names: std::collections::HashSet<&str> =
+            folders.iter().map(|p| path::as_file(p)).collect();
         for p in &folders {
             out.push(Resource {
                 bucket: Some(bucket.to_owned()),
@@ -912,7 +924,7 @@ impl<U: Upstream, S: StatePort> Ctx<'_, U, S> {
             if e.key == coll
                 || e.key.ends_with('/')
                 || !path::addressable(&e.key)
-                || folders.iter().any(|p| p.as_str() == format!("{}/", e.key))
+                || folder_names.contains(e.key.as_str())
             {
                 continue;
             }
@@ -1001,7 +1013,16 @@ impl<U: Upstream, S: StatePort> Ctx<'_, U, S> {
                 self.upload(bucket, key, body, len, &content_type, &meta, guard.as_ref()),
             )
             .await;
-        self.end_write(bucket, &holder, Vec::new()).await;
+        // An object replaced through WebDAV keeps its dead properties.
+        let keep = match (&existing, &result) {
+            (Some(old), Ok(new)) if !new.is_empty() => vec![Op::PropRestamp {
+                path: key.to_owned(),
+                from: old.etag.clone(),
+                to: new.clone(),
+            }],
+            _ => Vec::new(),
+        };
+        self.end_write(bucket, &holder, keep).await;
         let etag = result?;
         let mut r = status(if existing.is_some() { 204 } else { 201 });
         if !etag.is_empty() {
@@ -1248,21 +1269,13 @@ impl<U: Upstream, S: StatePort> Ctx<'_, U, S> {
                     )
                     .await?;
                 let r = self.s3.delete(bucket, &path).await;
-                self.end_write(
-                    bucket,
-                    &holder,
-                    vec![
-                        Op::PropDrop {
-                            path: path.clone(),
-                            tree: false,
-                        },
-                        Op::DropLocks {
-                            path: path.clone(),
-                            tree: false,
-                        },
-                    ],
-                )
-                .await;
+                // Properties and locks go with the file, and only when it
+                // went.
+                let drops = match r {
+                    Ok(()) => forget(std::slice::from_ref(&path)),
+                    Err(_) => Vec::new(),
+                };
+                self.end_write(bucket, &holder, drops).await;
                 r.map_err(|e| from_s3(&e))?;
                 self.keep_folder(bucket, &parent(&path)).await;
                 Ok(status(204))
@@ -1291,10 +1304,9 @@ impl<U: Upstream, S: StatePort> Ctx<'_, U, S> {
                 let out = self
                     .under_lease(bucket, &holder, self.delete_tree(bucket, coll))
                     .await;
-                self.end_write(
-                    bucket,
-                    &holder,
-                    vec![
+                // Properties and locks of what was deleted, and nothing else.
+                let drops = match &out {
+                    Ok((_, failed)) if failed.is_empty() => vec![
                         Op::PropDrop {
                             path: coll.clone(),
                             tree: true,
@@ -1304,9 +1316,11 @@ impl<U: Upstream, S: StatePort> Ctx<'_, U, S> {
                             tree: true,
                         },
                     ],
-                )
-                .await;
-                let failed = out?;
+                    Ok((deleted, _)) => forget(deleted),
+                    Err(_) => Vec::new(),
+                };
+                self.end_write(bucket, &holder, drops).await;
+                let (_, failed) = out?;
                 if !failed.is_empty() {
                     return Ok(failed_members(bucket, &failed));
                 }
@@ -1317,12 +1331,13 @@ impl<U: Upstream, S: StatePort> Ctx<'_, U, S> {
     }
 
     /// Deletes every key under `coll`, markers last. Answers the keys
-    /// that failed with their status.
+    /// deleted, and those that failed with their status. Nothing is
+    /// deleted when the folder is over the cap.
     async fn delete_tree(
         &self,
         bucket: &str,
         coll: &str,
-    ) -> Result<Vec<(String, u16)>, Resp<U::Body>> {
+    ) -> Result<(Vec<String>, Vec<(String, u16)>), Resp<U::Body>> {
         let listing = self
             .s3
             .list_all(bucket, coll, false, self.cfg().max_tree)
@@ -1337,11 +1352,19 @@ impl<U: Upstream, S: StatePort> Ctx<'_, U, S> {
             .map(|e| e.key)
             .partition(|k| k.ends_with('/'));
         markers.sort_by_key(|m| std::cmp::Reverse(m.len()));
-        let mut failed = Vec::new();
+        let mut failed: Vec<(String, u16)> = Vec::new();
+        let mut deleted = Vec::new();
         for group in [files, markers] {
             for batch in group.chunks(1000) {
                 match self.s3.delete_many(bucket, batch).await {
-                    Ok(errors) => failed.extend(errors.into_iter().map(|(k, _)| (k, 500))),
+                    Ok(errors) => {
+                        for k in batch {
+                            if !errors.iter().any(|(e, _)| e == k) {
+                                deleted.push(k.clone());
+                            }
+                        }
+                        failed.extend(errors.into_iter().map(|(k, _)| (k, 500)));
+                    }
                     Err(e) => {
                         let code = from_s3::<U::Body>(&e).status;
                         if code == 401 {
@@ -1352,7 +1375,7 @@ impl<U: Upstream, S: StatePort> Ctx<'_, U, S> {
                 }
             }
         }
-        Ok(failed)
+        Ok((deleted, failed))
     }
 
     // -----------------------------------------------------------------
@@ -1475,6 +1498,13 @@ impl<U: Upstream, S: StatePort> Ctx<'_, U, S> {
             return Err(status(403));
         }
         let dst = self.resolve(bucket, as_file(dkey)).await?;
+        // A destination that holds the source (its own folder, or one
+        // above it) would be deleted first, the source with it.
+        if path::within(&as_collection(&dst_path), &src_path)
+            || matches!(&dst, Res::Coll { key: d } if path::within(d, &src_path))
+        {
+            return Err(status(403));
+        }
         if dst.exists() && !overwrite {
             return Err(status(412));
         }
@@ -1509,6 +1539,21 @@ impl<U: Upstream, S: StatePort> Ctx<'_, U, S> {
                 scope: Scope::Member,
             });
         }
+        // The members of a folder source, listed (and held to the cap)
+        // before anything at the destination is deleted.
+        let members = if src_coll && depth != Some(0) {
+            let listing = self
+                .s3
+                .list_all(bucket, &src_path, false, self.cfg().max_tree)
+                .await
+                .map_err(|e| from_s3(&e))?;
+            if listing.capped {
+                return Err(too_many(self.cfg().max_tree));
+            }
+            listing.entries.into_iter().map(|e| e.key).collect()
+        } else {
+            Vec::new()
+        };
         let holder = self
             .begin_write(bucket, checks, ifh.as_ref(), (&src_path, &src))
             .await?;
@@ -1516,7 +1561,7 @@ impl<U: Upstream, S: StatePort> Ctx<'_, U, S> {
             // A destination of the other kind (or a collection) is
             // replaced as a whole: deleted first.
             if let Res::Coll { key: dcoll } = &dst {
-                let failed = self.delete_tree(bucket, dcoll).await?;
+                let (_, failed) = self.delete_tree(bucket, dcoll).await?;
                 if !failed.is_empty() {
                     return Ok(failed_members(bucket, &failed));
                 }
@@ -1561,7 +1606,7 @@ impl<U: Upstream, S: StatePort> Ctx<'_, U, S> {
             let failed = if depth == Some(0) {
                 Vec::new()
             } else {
-                self.copy_tree(bucket, &src_path, &dst_path, is_move)
+                self.copy_tree(bucket, &src_path, &dst_path, members, is_move)
                     .await?
             };
             // The destination folder exists even when the source had no
@@ -1609,25 +1654,17 @@ impl<U: Upstream, S: StatePort> Ctx<'_, U, S> {
         Ok(out)
     }
 
-    /// Copies every key under `from` to the same place under `to`, six at
-    /// a time; with `delete`, removes each source whose copy succeeded.
-    /// Answers the source keys that failed.
+    /// Copies `keys` (every key under `from`, listed by the caller) to the
+    /// same place under `to`, six at a time; with `delete`, removes each
+    /// source whose copy succeeded. Answers the source keys that failed.
     async fn copy_tree(
         &self,
         bucket: &str,
         from: &str,
         to: &str,
+        keys: Vec<String>,
         delete: bool,
     ) -> Result<Vec<(String, u16)>, Resp<U::Body>> {
-        let listing = self
-            .s3
-            .list_all(bucket, from, false, self.cfg().max_tree)
-            .await
-            .map_err(|e| from_s3(&e))?;
-        if listing.capped {
-            return Err(too_many(self.cfg().max_tree));
-        }
-        let keys: Vec<String> = listing.entries.into_iter().map(|e| e.key).collect();
         let results: Vec<(String, Result<(), u16>)> = stream::iter(keys)
             .map(|k| async move {
                 let dest = format!("{to}{}", &k[from.len()..]);
@@ -1736,6 +1773,8 @@ impl<U: Upstream, S: StatePort> Ctx<'_, U, S> {
             return Err(status(400));
         }
         let owner_xml = doc.child(DAV, "owner").map(Element::to_xml);
+        // A lock is a write: a read-only key may not take one.
+        self.require_write(bucket, &lock_path).await?;
         if let (Some(h), true) = (&ifh, res.exists()) {
             self.check_if(bucket, &lock_path, &res, h).await?;
         }
@@ -1755,6 +1794,17 @@ impl<U: Upstream, S: StatePort> Ctx<'_, U, S> {
                     principal: self.principal.clone(),
                     timeout_secs: timeout,
                     holder: None,
+                    // Creating the file adds a member to its folder, as a
+                    // PUT would.
+                    checks: if res.exists() {
+                        Vec::new()
+                    } else {
+                        vec![Check {
+                            path: parent(&lock_path),
+                            scope: Scope::Member,
+                        }]
+                    },
+                    tokens: ifh.as_ref().map(IfHeader::submitted).unwrap_or_default(),
                 }],
             )
             .await?;
@@ -1905,6 +1955,8 @@ impl<U: Upstream, S: StatePort> Ctx<'_, U, S> {
         if patches.is_empty() {
             return Err(status(400));
         }
+        // Dead properties are writes: a read-only key may not change them.
+        self.require_write(bucket, &path).await?;
         let statuses: Vec<u16> = if protected.iter().any(|p| *p) {
             protected
                 .iter()
@@ -1973,6 +2025,25 @@ fn lock_answer<B>(code: u16, lock: &Lock, bucket: &str, now: i64, with_token: bo
         r.set_header("lock-token", format!("<{}>", lock.token));
     }
     r
+}
+
+/// Drops the properties and locks of exactly these paths.
+fn forget(paths: &[String]) -> Vec<Op> {
+    paths
+        .iter()
+        .flat_map(|p| {
+            [
+                Op::PropDrop {
+                    path: p.clone(),
+                    tree: false,
+                },
+                Op::DropLocks {
+                    path: p.clone(),
+                    tree: false,
+                },
+            ]
+        })
+        .collect()
 }
 
 fn too_many<B>(cap: usize) -> Resp<B> {

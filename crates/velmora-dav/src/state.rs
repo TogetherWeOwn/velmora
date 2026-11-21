@@ -146,6 +146,10 @@ pub enum Op {
         principal: String,
         timeout_secs: u32,
         holder: Option<String>,
+        /// Judged first as for a write, with `tokens`: a LOCK that
+        /// creates a file changes its folder's members.
+        checks: Vec<Check>,
+        tokens: Vec<String>,
     },
     /// Refreshes a lock that covers `path`, by one of `tokens`.
     Refresh {
@@ -203,6 +207,13 @@ pub enum Op {
     PropDrop {
         path: String,
         tree: bool,
+    },
+    /// The object was replaced through WebDAV: its properties stamped
+    /// with `from` (the etag it had) carry `to` (the new one) from now.
+    PropRestamp {
+        path: String,
+        from: String,
+        to: String,
     },
 }
 
@@ -303,23 +314,52 @@ impl<S: Sql> Engine<'_, S> {
     /// Locks that cover `path`: rooted at it, or depth infinity above it
     /// (one indexed lookup per segment).
     pub fn covering(&self, path: &str) -> Result<Vec<Lock>, String> {
-        let mut params = vec![t(path)];
-        for a in ancestors(path) {
-            if a != path {
-                params.push(t(&a));
+        // The ancestors go as one JSON parameter: a deep path must not
+        // run into the limit on bound parameters of a statement.
+        let above: Vec<String> = ancestors(path).into_iter().filter(|a| a != path).collect();
+        let above = serde_json::to_string(&above).map_err(|e| e.to_string())?;
+        let rows = self.sql.exec(
+            &format!(
+                "SELECT {LOCK_COLS} FROM locks WHERE root = ?1 \
+                 OR (depth_inf = 1 AND root IN (SELECT value FROM json_each(?2)))"
+            ),
+            &[t(path), t(&above)],
+        )?;
+        Ok(rows.iter().map(|r| lock_of(r)).collect())
+    }
+
+    /// The first lock root a request does not hold: for every root that
+    /// a check meets, one lock there must be named in `tokens` and belong
+    /// to `principal`.
+    fn blocked(
+        &self,
+        checks: &[Check],
+        tokens: &[String],
+        principal: &str,
+    ) -> Result<Option<String>, String> {
+        for check in checks {
+            let locks = match check.scope {
+                Scope::Exact => self.covering(&check.path)?,
+                Scope::Tree => {
+                    let mut l = self.covering(&check.path)?;
+                    l.extend(self.under(&check.path)?);
+                    l
+                }
+                Scope::Member => self.rooted_at(&check.path)?,
+            };
+            let mut roots: Vec<&str> = locks.iter().map(|l| l.root.as_str()).collect();
+            roots.sort_unstable();
+            roots.dedup();
+            for root in roots {
+                let held = locks.iter().any(|l| {
+                    l.root == root && tokens.contains(&l.token) && l.principal == principal
+                });
+                if !held {
+                    return Ok(Some(root.to_owned()));
+                }
             }
         }
-        let marks: Vec<String> = (2..=params.len()).map(|i| format!("?{i}")).collect();
-        let sql = if marks.is_empty() {
-            format!("SELECT {LOCK_COLS} FROM locks WHERE root = ?1")
-        } else {
-            format!(
-                "SELECT {LOCK_COLS} FROM locks WHERE root = ?1 OR (depth_inf = 1 AND root IN ({}))",
-                marks.join(",")
-            )
-        };
-        let rows = self.sql.exec(&sql, &params)?;
-        Ok(rows.iter().map(|r| lock_of(r)).collect())
+        Ok(None)
     }
 
     /// Locks rooted strictly under the collection `path`.
@@ -381,12 +421,17 @@ impl<S: Sql> Engine<'_, S> {
                 principal,
                 timeout_secs,
                 holder,
+                checks,
+                tokens,
             } => {
                 if owner_xml
                     .as_ref()
                     .is_some_and(|o| o.len() > MAX_OWNER_BYTES)
                 {
                     return Ok(Reply::Full);
+                }
+                if let Some(path) = self.blocked(&checks, &tokens, &principal)? {
+                    return Ok(Reply::Conflict { path });
                 }
                 let depth_inf = depth_inf && (root.is_empty() || root.ends_with('/'));
                 let mut seen = self.covering(&root)?;
@@ -491,29 +536,8 @@ impl<S: Sql> Engine<'_, S> {
                 holder,
                 ttl_secs,
             } => {
-                for check in &checks {
-                    let locks = match check.scope {
-                        Scope::Exact => self.covering(&check.path)?,
-                        Scope::Tree => {
-                            let mut l = self.covering(&check.path)?;
-                            l.extend(self.under(&check.path)?);
-                            l
-                        }
-                        Scope::Member => self.rooted_at(&check.path)?,
-                    };
-                    let mut roots: Vec<&str> = locks.iter().map(|l| l.root.as_str()).collect();
-                    roots.sort_unstable();
-                    roots.dedup();
-                    for root in roots {
-                        let held = locks.iter().any(|l| {
-                            l.root == root && tokens.contains(&l.token) && l.principal == principal
-                        });
-                        if !held {
-                            return Ok(Reply::Conflict {
-                                path: root.to_owned(),
-                            });
-                        }
-                    }
+                if let Some(path) = self.blocked(&checks, &tokens, &principal)? {
+                    return Ok(Reply::Conflict { path });
                 }
                 let expires = Val::Int(self.now + i64::from(ttl_secs));
                 for check in &checks {
@@ -615,6 +639,13 @@ impl<S: Sql> Engine<'_, S> {
             }
             Op::PropDrop { path, tree } => {
                 self.prop_drop(&path, tree)?;
+                Ok(Reply::Done)
+            }
+            Op::PropRestamp { path, from, to } => {
+                self.sql.exec(
+                    "UPDATE dav_props SET etag = ?3 WHERE path = ?1 AND etag = ?2",
+                    &[t(&path), t(&from), t(&to)],
+                )?;
                 Ok(Reply::Done)
             }
         }

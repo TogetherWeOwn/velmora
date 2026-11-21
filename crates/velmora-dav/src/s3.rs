@@ -656,6 +656,35 @@ impl<'a, U: Upstream> S3<'a, U> {
         Ok(text_of(&doc, "ETag").unwrap_or_default())
     }
 
+    /// Whether the key may write to the bucket, asked without writing:
+    /// an AbortMultipartUpload of an upload id that cannot exist. The
+    /// storage Worker checks write permission first (every multipart call
+    /// needs it) and then answers `NoSuchUpload` for an id that is not 32
+    /// hex digits, before any catalogue read. A read-only key gets
+    /// `AccessDenied`.
+    pub async fn can_write(&self, bucket: &str, key: &str) -> Result<bool, S3Error> {
+        let key = if key.is_empty() { "-" } else { key };
+        let resp = self
+            .call(
+                "DELETE",
+                &format!("/{bucket}/{key}"),
+                &[("uploadId", "write-probe")],
+                Vec::new(),
+                Body::Empty,
+                None,
+            )
+            .await?;
+        if (200..300).contains(&resp.status) {
+            return Ok(true);
+        }
+        let e = error_of(self.up, resp).await;
+        match e.code.as_str() {
+            "NoSuchUpload" => Ok(true),
+            "AccessDenied" => Ok(false),
+            _ => Err(e),
+        }
+    }
+
     pub async fn abort_upload(&self, bucket: &str, key: &str, upload_id: &str) {
         // Best effort: an upload left open is collected by the storage
         // Worker's own sweep of stale uploads.

@@ -153,6 +153,25 @@ fn resolved(r: ResolveResult<'_>) -> Result<Option<String>, XmlError> {
     }
 }
 
+/// A name without a colon (Namespaces in XML, `NCName`): a letter, `_`
+/// or a character above ASCII first, then also digits, `.` and `-`. A
+/// name that is not one would be written back as it came and break the
+/// documents of every later answer that carries it.
+fn ncname(s: &str) -> bool {
+    let mut chars = s.chars();
+    let start = |c: char| c.is_ascii_alphabetic() || c == '_' || (!c.is_ascii() && xml_char(c));
+    matches!(chars.next(), Some(c) if start(c))
+        && chars.all(|c| start(c) || c.is_ascii_digit() || c == '.' || c == '-')
+}
+
+/// A qualified name: an `NCName`, or two joined by one colon.
+fn qname(s: &str) -> bool {
+    match s.split_once(':') {
+        Some((prefix, local)) => ncname(prefix) && ncname(local),
+        None => ncname(s),
+    }
+}
+
 /// A character XML 1.0 can carry.
 fn xml_char(c: char) -> bool {
     matches!(c, '\t' | '\n' | '\r' | '\u{20}'..='\u{D7FF}' | '\u{E000}'..='\u{FFFD}' | '\u{10000}'..)
@@ -203,6 +222,9 @@ pub fn parse(body: &[u8]) -> Result<Element, XmlError> {
                 if nodes > MAX_NODES || stack.len() >= MAX_DEPTH {
                     return Err(XmlError::TooLarge);
                 }
+                if !qname(e.name().0) {
+                    return Err(XmlError::Malformed);
+                }
                 let (ns, local) = reader.resolver().resolve_element(e.name());
                 let ns = resolved(ns)?;
                 // `xmlns:p=""` cannot bind a prefix (Namespaces in XML
@@ -214,6 +236,9 @@ pub fn parse(body: &[u8]) -> Result<Element, XmlError> {
                 for attr in e.attributes() {
                     let attr = attr.map_err(|_| XmlError::Malformed)?;
                     let key = attr.key.0;
+                    if !qname(key) {
+                        return Err(XmlError::Malformed);
+                    }
                     if key == "xmlns" || key.starts_with("xmlns:") {
                         continue;
                     }
@@ -353,6 +378,21 @@ mod tests {
             parse(b"<!DOCTYPE a [<!ENTITY x \"y\">]><a>&x;</a>"),
             Err(XmlError::Malformed)
         );
+        for bad in [
+            &br#"<x<y xmlns="urn:z"/>"#[..],
+            b"<x&y/>",
+            b"<1a/>",
+            br#"<a b<c="1"/>"#,
+            b"<a:b:c xmlns:a=\"urn:a\"/>",
+        ] {
+            assert_eq!(
+                parse(bad),
+                Err(XmlError::Malformed),
+                "{}",
+                String::from_utf8_lossy(bad)
+            );
+        }
+        assert!(parse("<caf\u{e9}.x-1 xmlns=\"urn:z\"/>".as_bytes()).is_ok());
         let deep = "<a>".repeat(100) + &"</a>".repeat(100);
         assert_eq!(parse(deep.as_bytes()), Err(XmlError::TooLarge));
     }

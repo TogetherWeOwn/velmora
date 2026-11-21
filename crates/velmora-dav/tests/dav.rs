@@ -989,3 +989,198 @@ async fn parallel_large_puts_share_the_isolates_part_slots() {
     );
     assert_eq!(velmora_dav::slots::Slot::held(), 0);
 }
+
+// Review findings (reviewer-critical on the first version).
+
+#[tokio::test]
+async fn a_destination_that_holds_the_source_is_refused_and_nothing_is_lost() {
+    let w = World::new().await;
+    w.req("MKCOL", "/dav/a/", &[], b"").await.expect(201);
+    w.req("MKCOL", "/dav/a/x/", &[], b"").await.expect(201);
+    w.req("PUT", "/dav/a/x/f", &[], b"1").await.expect(201);
+    w.req("PUT", "/dav/a/f", &[], b"2").await.expect(201);
+    w.req("MOVE", "/dav/a/x/", &[("destination", "/dav/a/")], b"")
+        .await
+        .expect(403);
+    w.req("COPY", "/dav/a/f", &[("destination", "/dav/a")], b"")
+        .await
+        .expect(403);
+    w.req("MOVE", "/dav/a/x/f", &[("destination", "/dav/a/x")], b"")
+        .await
+        .expect(403);
+    let keys: Vec<String> = w.s3_list("a/").await.into_iter().map(|e| e.0).collect();
+    assert_eq!(keys, ["a/", "a/f", "a/x/", "a/x/f"]);
+}
+
+#[tokio::test]
+async fn the_cap_is_judged_before_the_destination_is_deleted() {
+    let w = World::with(Config {
+        max_tree: 3,
+        ..Config::default()
+    })
+    .await;
+    w.req("MKCOL", "/dav/d/", &[], b"").await.expect(201);
+    for i in 0..4 {
+        w.req("PUT", &format!("/dav/d/{i}"), &[], b"x")
+            .await
+            .expect(201);
+    }
+    w.req("MKCOL", "/dav/e/", &[], b"").await.expect(201);
+    w.req("PUT", "/dav/e/keep", &[], b"k").await.expect(201);
+    w.req("PUT", "/dav/f", &[], b"file").await.expect(201);
+    w.req("MOVE", "/dav/d/", &[("destination", "/dav/e/")], b"")
+        .await
+        .expect(403);
+    w.req("MOVE", "/dav/d/", &[("destination", "/dav/f")], b"")
+        .await
+        .expect(403);
+    assert_eq!(w.s3_get("e/keep").await.1, b"k");
+    assert_eq!(w.s3_get("f").await.1, b"file");
+    assert_eq!(w.s3_list("d/").await.len(), 5);
+}
+
+const SET_X: &[u8] = br#"<D:propertyupdate xmlns:D="DAV:"><D:set><D:prop><x xmlns="urn:x">1</x></D:prop></D:set></D:propertyupdate>"#;
+const ASK_X: &[u8] =
+    br#"<D:propfind xmlns:D="DAV:"><D:prop><x xmlns="urn:x"/></D:prop></D:propfind>"#;
+
+async fn has_x(w: &World, path: &str) -> bool {
+    let r = w.req("PROPFIND", path, &[("depth", "0")], ASK_X).await;
+    r.text().contains(r#"<x xmlns="urn:x">1</x>"#)
+}
+
+#[tokio::test]
+async fn a_delete_that_deletes_nothing_keeps_properties_and_locks() {
+    let w = World::with(Config {
+        max_tree: 2,
+        ..Config::default()
+    })
+    .await;
+    w.req("MKCOL", "/dav/d/", &[], b"").await.expect(201);
+    for name in ["a", "b", "c"] {
+        w.req("PUT", &format!("/dav/d/{name}"), &[], b"x")
+            .await
+            .expect(201);
+    }
+    w.req("PROPPATCH", "/dav/d/a", &[], SET_X).await.expect(207);
+    let lock = w
+        .req("LOCK", "/dav/d/b", &[], &lockinfo("exclusive", "me"))
+        .await;
+    lock.expect(200);
+    let token = lock.header("lock-token").unwrap().to_owned();
+    // Over the cap: nothing deleted, nothing forgotten.
+    let ifh = format!("</dav/d/b> ({token})");
+    w.req("DELETE", "/dav/d/", &[("if", &ifh)], b"")
+        .await
+        .expect(403);
+    assert!(has_x(&w, "/dav/d/a").await);
+    w.req("PUT", "/dav/d/b", &[], b"y").await.expect(423);
+    // A read-only key's refused delete forgets nothing either.
+    w.req_as(RO, RO_SECRET, "DELETE", "/dav/d/a", &[], b"")
+        .await
+        .expect(403);
+    assert!(has_x(&w, "/dav/d/a").await);
+}
+
+#[tokio::test]
+async fn a_read_only_key_cannot_set_properties_or_lock() {
+    let w = World::new().await;
+    w.req("PUT", "/dav/f", &[], b"x").await.expect(201);
+    w.req_as(RO, RO_SECRET, "PROPPATCH", "/dav/f", &[], SET_X)
+        .await
+        .expect(403);
+    assert!(!has_x(&w, "/dav/f").await);
+    w.req_as(
+        RO,
+        RO_SECRET,
+        "LOCK",
+        "/dav/f",
+        &[],
+        &lockinfo("exclusive", "ro"),
+    )
+    .await
+    .expect(403);
+    w.req("PUT", "/dav/f", &[], b"y").await.expect(204);
+    // The probe writes nothing: the object is as it was.
+    assert_eq!(w.s3_get("f").await.1, b"y");
+}
+
+#[tokio::test]
+async fn malformed_names_are_refused() {
+    let w = World::new().await;
+    w.req("PUT", "/dav/f", &[], b"x").await.expect(201);
+    for body in [
+        &br#"<D:propertyupdate xmlns:D="DAV:"><D:set><D:prop><x&y xmlns="urn:x">1</x&y></D:prop></D:set></D:propertyupdate>"#[..],
+        br#"<D:propertyupdate xmlns:D="DAV:"><D:set><D:prop><1a xmlns="urn:x">1</1a></D:prop></D:set></D:propertyupdate>"#,
+    ] {
+        w.req("PROPPATCH", "/dav/f", &[], body).await.expect(400);
+    }
+}
+
+#[tokio::test]
+async fn lock_on_an_unmapped_url_respects_the_folders_lock() {
+    let w = World::new().await;
+    w.req("MKCOL", "/dav/c/", &[], b"").await.expect(201);
+    let r = w
+        .req(
+            "LOCK",
+            "/dav/c/",
+            &[("depth", "0")],
+            &lockinfo("exclusive", "a"),
+        )
+        .await;
+    r.expect(200);
+    w.req_as(
+        APP2,
+        APP2_SECRET,
+        "LOCK",
+        "/dav/c/n",
+        &[],
+        &lockinfo("exclusive", "b"),
+    )
+    .await
+    .expect(423);
+    assert_eq!(w.s3_get("c/n").await.0, 404);
+    // The folder's owner, with its token, may.
+    let token = r.header("lock-token").unwrap().to_owned();
+    let ifh = format!("</dav/c/> ({token})");
+    w.req(
+        "LOCK",
+        "/dav/c/n",
+        &[("if", &ifh)],
+        &lockinfo("exclusive", "a"),
+    )
+    .await
+    .expect(201);
+}
+
+#[tokio::test]
+async fn a_webdav_overwrite_keeps_dead_properties() {
+    let w = World::new().await;
+    w.req("PUT", "/dav/f", &[], b"one").await.expect(201);
+    w.req("PROPPATCH", "/dav/f", &[], SET_X).await.expect(207);
+    w.req("PUT", "/dav/f", &[], b"two").await.expect(204);
+    assert!(has_x(&w, "/dav/f").await);
+    // An overwrite through S3 still makes them stale.
+    assert_eq!(w.s3_put("f", b"three").await, 200);
+    assert!(!has_x(&w, "/dav/f").await);
+}
+
+#[tokio::test]
+async fn locks_work_on_a_deep_path() {
+    let w = World::new().await;
+    let mut path = String::from("/dav/");
+    for i in 0..120 {
+        path.push_str(&format!("d{i}/"));
+    }
+    // Parents are implied by the key; no MKCOL per level.
+    let file = format!("{}f", &path[5..]);
+    assert_eq!(w.s3_put(&file, b"x").await, 200);
+    let url = format!("{path}f");
+    let r = w.req("LOCK", &url, &[], &lockinfo("exclusive", "me")).await;
+    r.expect(200);
+    w.req("PUT", &url, &[], b"y").await.expect(423);
+    let token = r.header("lock-token").unwrap().to_owned();
+    w.req("PUT", &url, &[("if", &format!("({token})"))], b"y")
+        .await
+        .expect(204);
+}
