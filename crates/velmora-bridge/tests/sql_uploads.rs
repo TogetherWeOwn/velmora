@@ -1682,8 +1682,8 @@ fn gc_want(extents: &[&ExtentId], now: UnixMs) -> Vec<String> {
     want
 }
 
-/// Every step of the query plan of `sql` that touches the part tables.
-async fn part_table_steps(fx: &Fx, sql: &str, params: &[SqlValue]) -> Vec<String> {
+/// Every step of the query plan of `sql`.
+async fn plan_steps(fx: &Fx, sql: &str, params: &[SqlValue]) -> Vec<String> {
     let plan = fx
         .cat
         .sql
@@ -1696,7 +1696,6 @@ async fn part_table_steps(fx: &Fx, sql: &str, params: &[SqlValue]) -> Vec<String
             SqlValue::Text(step) => step.clone(),
             other => panic!("unexpected {other:?}"),
         })
-        .filter(|step| step.contains("upload_part"))
         .collect()
 }
 
@@ -1737,16 +1736,19 @@ async fn upload_part_seeks_its_own_part_and_gc_rows_are_unchanged() {
     assert_eq!(g, Guard::Applied(()));
     assert_eq!(gc_rows(&fx).await, gc_want(&[&two[0], &two[1]], T0));
 
-    // No statement of that batch walks the parts of the upload: the part
-    // tables are sought on (upload, part number), or on an extent id.
+    // No statement of that batch walks the parts of the upload, whatever
+    // the alias: only the part tables have an `upload_id` column, so
+    // `(upload_id=?)` alone is such a walk; and nothing is scanned but
+    // constant rows and the one-row `restore_state`.
     let ran = std::mem::take(&mut *fx.cat.sql.batched.borrow_mut());
     let mut by_part = 0;
     for (sql, params) in &ran {
-        for step in part_table_steps(&fx, sql, params).await {
-            let part = step.contains("(upload_id=? AND part_number=?)");
-            by_part += usize::from(part);
+        for step in plan_steps(&fx, sql, params).await {
+            by_part += usize::from(step.contains("(upload_id=? AND part_number=?)"));
+            let scan_ok =
+                ["SCAN CONSTANT ROW", "SCAN a", "SCAN restore_state"].contains(&step.as_str());
             assert!(
-                step.starts_with("SEARCH ") && (part || step.ends_with("(extent_id=?)")),
+                !step.contains("(upload_id=?)") && (!step.starts_with("SCAN ") || scan_ok),
                 "{sql}\n{step}"
             );
         }

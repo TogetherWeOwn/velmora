@@ -1743,13 +1743,15 @@ async fn upload_part_reads_no_other_part_of_the_upload() {
                 let SqlValue::Text(step) = &row[3] else {
                     panic!("unexpected {row:?}")
                 };
-                if !step.contains("upload_part") {
-                    continue;
-                }
-                let part = step.contains("(upload_id=? AND part_number=?)");
-                by_part += usize::from(part);
+                // Whatever the alias: only the part tables have an
+                // `upload_id` column, so `(upload_id=?)` alone is a walk of
+                // the upload's parts; and nothing is scanned but constant
+                // rows and the one-row `restore_state`.
+                by_part += usize::from(step.contains("(upload_id=? AND part_number=?)"));
+                let scan_ok =
+                    ["SCAN CONSTANT ROW", "SCAN a", "SCAN restore_state"].contains(&step.as_str());
                 assert!(
-                    step.starts_with("SEARCH ") && (part || step.ends_with("(extent_id=?)")),
+                    !step.contains("(upload_id=?)") && (!step.starts_with("SCAN ") || scan_ok),
                     "part {n}: {q}\n{step}"
                 );
             }
