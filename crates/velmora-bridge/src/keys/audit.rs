@@ -45,6 +45,9 @@ pub enum Finding {
     Inactive { location: String, name: String },
     /// A copy that does not open under the KEK.
     Unopenable { location: String, name: String },
+    /// A copy under a KEK version this Worker does not hold: it could not
+    /// be opened, so it is not known to be good.
+    NoKek { location: String, name: String },
 }
 
 /// What the audit saw and found.
@@ -70,33 +73,82 @@ fn split_name(name: &str) -> Option<(TenantId, u32, u32)> {
     Some((tenant, n, v))
 }
 
-async fn list_all<S: RecordStore>(store: &S) -> Result<Vec<String>> {
-    let mut after = TK_PREFIX.to_owned();
-    let mut out = Vec::new();
-    loop {
-        let names = store.list(TK_PREFIX, &after, PAGE).await?;
-        out.extend(names.iter().cloned());
-        match names.last() {
-            Some(last) if names.len() >= PAGE as usize => after.clone_from(last),
-            _ => return Ok(out),
-        }
-    }
+/// The tenant prefix (`m/tk/<t>`, no slash) of a name below `m/tk/`.
+fn tenant_of(name: &str) -> Option<&str> {
+    let rest = name.strip_prefix(TK_PREFIX)?;
+    let (tenant, _) = rest.split_once('/')?;
+    Some(&name[..TK_PREFIX.len() + tenant.len()])
 }
 
-/// Audits every location of `set`. With `kek`, also opens every copy.
+/// Audits every location of `set`, page by page. With `kek`, also opens
+/// every copy.
 pub async fn audit<S: RecordStore, K: Kek>(
     set: &KeyLocations,
     buckets: &KeyBuckets<'_, S>,
     kek: Option<&K>,
 ) -> Result<AuditReport> {
     let mut report = AuditReport::default();
-    for location in set
+    let mut after = TK_PREFIX.to_owned();
+    loop {
+        let (page, next) = audit_page(set, buckets, kek, &after, PAGE).await?;
+        report.blobs.extend(page.blobs);
+        report.findings.extend(page.findings);
+        match next {
+            Some(n) => after = n,
+            None => {
+                report.findings.sort();
+                return Ok(report);
+            }
+        }
+    }
+}
+
+/// One bounded page of the audit: the names after `after` (`m/tk/` for
+/// the first page), at most `limit` per location, cut at a tenant's
+/// boundary so that every copy of a tenant's key versions is compared in
+/// one page. Returns the cursor of the next page, `None` at the end.
+pub async fn audit_page<S: RecordStore, K: Kek>(
+    set: &KeyLocations,
+    buckets: &KeyBuckets<'_, S>,
+    kek: Option<&K>,
+    after: &str,
+    limit: u32,
+) -> Result<(AuditReport, Option<String>)> {
+    let limit = limit.max(1);
+    let listed: Vec<_> = set
         .locations
         .iter()
         .filter(|l| l.status != LocationStatus::Lost)
-    {
+        .collect();
+    let mut names = Vec::new();
+    // The smallest last name of a full page: names after it may be
+    // missing from that location's page.
+    let mut bound: Option<String> = None;
+    for location in &listed {
         let store = buckets.get(location)?;
-        for name in list_all(store).await? {
+        let page = store.list(TK_PREFIX, after, limit).await?;
+        if page.len() >= limit as usize {
+            let last = page.last().cloned().unwrap_or_default();
+            bound = Some(bound.map_or(last.clone(), |b: String| b.min(last)));
+        }
+        names.push((*location, page));
+    }
+    // Cut before the bound's tenant, which the next page takes whole.
+    let (cut, next) = match &bound {
+        None => (None, None),
+        Some(b) => match tenant_of(b) {
+            Some(t) if t > after => (Some(format!("{t}/")), Some(t.to_owned())),
+            // One tenant fills a page: take the page as it is.
+            _ => (Some(format!("{b}\u{1}")), Some(b.clone())),
+        },
+    };
+    let mut report = AuditReport::default();
+    for (location, page) in names {
+        let store = buckets.get(location)?;
+        for name in page {
+            if cut.as_deref().is_some_and(|c| name.as_str() >= c) {
+                continue;
+            }
             let Some((tenant, n, v)) = split_name(&name) else {
                 report.findings.push(Finding::Foreign {
                     location: location.name.clone(),
@@ -121,14 +173,20 @@ pub async fn audit<S: RecordStore, K: Kek>(
                 continue;
             };
             if let Some(kek) = kek {
-                if kek.version(v).is_some()
-                    && unwrap_tenant_key(kek, v, &tenant, n, &bytes).is_err()
-                {
-                    report.findings.push(Finding::Unopenable {
+                let finding = match kek.version(v) {
+                    None => Some(Finding::NoKek {
                         location: location.name.clone(),
                         name: name.clone(),
-                    });
-                }
+                    }),
+                    Some(_) if unwrap_tenant_key(kek, v, &tenant, n, &bytes).is_err() => {
+                        Some(Finding::Unopenable {
+                            location: location.name.clone(),
+                            name: name.clone(),
+                        })
+                    }
+                    Some(_) => None,
+                };
+                report.findings.extend(finding);
             }
             report
                 .blobs
@@ -137,7 +195,14 @@ pub async fn audit<S: RecordStore, K: Kek>(
                 .insert(location.name.clone(), kcv);
         }
     }
+    compare(set, &mut report);
+    report.findings.sort();
+    Ok((report, next))
+}
 
+/// The findings across locations: missing copies, mismatched copies,
+/// versions that hold two keys.
+fn compare(set: &KeyLocations, report: &mut AuditReport) {
     let active: Vec<&str> = set.active().iter().map(|l| l.name.as_str()).collect();
     // Every check value seen for each key version, over every name and
     // every copy: more than one is a version that holds two keys.
@@ -172,74 +237,86 @@ pub async fn audit<S: RecordStore, K: Kek>(
                 .push(Finding::VersionMismatch { tenant, version });
         }
     }
-    report.findings.sort();
-    Ok(report)
 }
 
-/// Restores the copies the audit found missing, from a copy that exists,
-/// when every copy of that name and of its key version agrees and the
-/// tenant's directory holds no foreign name in any active location.
-/// Returns the names restored.
-pub async fn repair_missing<S: RecordStore>(
+/// Restores the copies the audit found missing, into synchronous
+/// locations only, from a copy that opens under the KEK. Nothing is done
+/// for a name or a key version with any other finding, nor for a tenant
+/// whose directory holds a foreign name in a synchronous location; a
+/// marker that appears during the write is reported. Returns the names
+/// restored.
+pub async fn repair_missing<S: RecordStore, K: Kek>(
     set: &KeyLocations,
     buckets: &KeyBuckets<'_, S>,
+    kek: &K,
     report: &AuditReport,
 ) -> Result<Vec<(String, String)>> {
-    let refused: Vec<&str> = report
-        .findings
-        .iter()
-        .filter_map(|f| match f {
-            Finding::Mismatch { name } => Some(name.as_str()),
-            _ => None,
+    let doubtful = |name: &str, tenant: &TenantId, n: u32| {
+        report.findings.iter().any(|f| match f {
+            Finding::Mismatch { name: m }
+            | Finding::Unopenable { name: m, .. }
+            | Finding::NoKek { name: m, .. }
+            | Finding::Inactive { name: m, .. } => m == name,
+            Finding::VersionMismatch { tenant: t, version } => {
+                t == tenant.as_str() && *version == n
+            }
+            Finding::Foreign { name: m, .. } => tenant_of(m) == tenant_of(name),
+            Finding::Missing { .. } => false,
         })
-        .collect();
+    };
+    let synchronous = set.synchronous();
     let mut restored = Vec::new();
     for finding in &report.findings {
         let Finding::Missing { location, name } = finding else {
             continue;
         };
-        let Some((tenant, n, _)) = split_name(name) else {
+        let Some(target) = synchronous.iter().find(|l| l.name == *location) else {
             continue;
         };
-        let version_bad = report.findings.iter().any(|f| {
-            matches!(f, Finding::VersionMismatch { tenant: t, version } if t == tenant.as_str() && *version == n)
-        });
-        if refused.contains(&name.as_str()) || version_bad {
+        let Some((tenant, n, v)) = split_name(name) else {
+            continue;
+        };
+        let Some(expected) = report
+            .blobs
+            .get(name)
+            .and_then(|c| c.values().next().copied())
+        else {
+            continue;
+        };
+        if doubtful(name, &tenant, n) {
             continue;
         }
-        // A marker or a foreign name in any active location: no writer
+        // A marker or a foreign name in a synchronous location: no writer
         // touches this tenant.
         let mut clean = true;
-        for l in set.active() {
-            if list_tenant_blobs(buckets.get(l)?, &tenant).await.is_err() {
-                clean = false;
-            }
+        for l in &synchronous {
+            clean &= list_tenant_blobs(buckets.get(l)?, &tenant).await.is_ok();
         }
         if !clean {
             continue;
         }
-        let Some(source) = set.active().into_iter().find(|l| {
-            report
-                .blobs
-                .get(name)
-                .is_some_and(|c| c.contains_key(&l.name))
-        }) else {
-            continue;
-        };
-        let Some(bytes) = buckets.get(source)?.get(name).await? else {
-            continue;
-        };
-        let target = set
-            .active()
-            .into_iter()
-            .find(|l| l.name == *location)
-            .map(|l| buckets.get(l))
-            .transpose()?;
-        if let Some(target) = target {
-            if target.put_if_absent(name, bytes).await? {
-                restored.push((location.clone(), name.clone()));
+        // A source that opens, and still has the check value the audit saw.
+        let mut source = None;
+        for l in &synchronous {
+            if let Some(bytes) = buckets.get(l)?.get(name).await? {
+                let good = tk_blob_check_value(&bytes).is_ok_and(|k| k == expected)
+                    && unwrap_tenant_key(kek, v, &tenant, n, &bytes).is_ok();
+                if good {
+                    source = Some(bytes);
+                    break;
+                }
             }
         }
+        let Some(bytes) = source else {
+            continue;
+        };
+        let store = buckets.get(target)?;
+        if store.put_if_absent(name, bytes).await? {
+            restored.push((location.clone(), name.clone()));
+        }
+        // A writer always loses to the marker: one that appeared during
+        // the write is an alarm for the operator.
+        list_tenant_blobs(store, &tenant).await?;
     }
     Ok(restored)
 }

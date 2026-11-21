@@ -208,8 +208,12 @@ fn locations_admit_only_valid_successors() {
         retired.admits(&next).is_err(),
         "reactivated retired location"
     );
+    // A lost location that comes back is emptied and retired; it never
+    // becomes active again.
     next.locations[1].status = Retired;
-    assert!(lost.admits(&next).is_err(), "changed lost location");
+    assert!(lost.admits(&next).is_ok(), "lost to retired");
+    next.locations[1].status = Active;
+    assert!(lost.admits(&next).is_err(), "lost to active");
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -432,7 +436,7 @@ async fn repair_restores_a_missing_copy_byte_for_byte() {
         }]
     );
     assert_eq!(
-        repair_missing(&set, &buckets, &report).await.unwrap(),
+        repair_missing(&set, &buckets, &kek, &report).await.unwrap(),
         [("KEYS_B".into(), name.clone())]
     );
     assert_eq!(stores.b.raw(&name), stores.a.raw(&name));
@@ -453,7 +457,7 @@ async fn audit_flags_both_mismatches_when_copies_of_one_name_disagree() {
 
     let report = audit(&set, &buckets, Some(&kek)).await.unwrap();
     let puts = (stores.a.puts(), stores.b.puts());
-    assert!(repair_missing(&set, &buckets, &report)
+    assert!(repair_missing(&set, &buckets, &kek, &report)
         .await
         .unwrap()
         .is_empty());
@@ -529,7 +533,7 @@ async fn audit_reports_foreign_names_and_repair_skips_the_tenant() {
             },
         ]
     );
-    assert!(repair_missing(&set, &buckets, &report)
+    assert!(repair_missing(&set, &buckets, &kek, &report)
         .await
         .unwrap()
         .is_empty());

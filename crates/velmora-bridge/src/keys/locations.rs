@@ -92,6 +92,16 @@ impl KeyLocations {
         out
     }
 
+    /// Every `active` synchronous location, the arbiter first: where a
+    /// key is read on the request path and where a writer checks for a
+    /// marker. An asynchronous location (an escrow) is in neither.
+    pub fn synchronous(&self) -> Vec<&KeyLocation> {
+        self.active()
+            .into_iter()
+            .filter(|l| l.synchronous)
+            .collect()
+    }
+
     /// Every `active` synchronous location but the arbiter: where a new
     /// key version is copied before its commit.
     pub fn synchronous_copies(&self) -> Vec<&KeyLocation> {
@@ -135,6 +145,9 @@ impl KeyLocations {
                 (a, b) if a == b => true,
                 (LocationStatus::Proposed, LocationStatus::Active) => true,
                 (LocationStatus::Active, LocationStatus::Retired) => !old.arbiter,
+                // A lost location that comes back is emptied, verified
+                // empty and retired; it is never used again.
+                (LocationStatus::Lost, LocationStatus::Retired) => true,
                 (LocationStatus::Lost, _) | (LocationStatus::Retired, _) => false,
                 (_, LocationStatus::Lost) => !old.arbiter,
                 _ => false,
