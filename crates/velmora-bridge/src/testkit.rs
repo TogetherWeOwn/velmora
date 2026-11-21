@@ -478,7 +478,7 @@ impl Sql for RusqliteSql {
 }
 
 /// A unit call is one transaction: a savepoint around it. When it rolls
-/// back, a workerd twin is rebuilt from what is left.
+/// back, a workerd twin is rebuilt from what is left before the next call.
 impl crate::unit::UnitSql for RusqliteSql {
     fn atomically(&self, f: &mut dyn FnMut() -> Result<()>) -> Result<()> {
         self.conn
@@ -492,11 +492,12 @@ impl crate::unit::UnitSql for RusqliteSql {
                 .execute_batch("RELEASE unit_call")
                 .map_err(map_err),
             Err(e) => {
-                let conn = self.conn.borrow();
-                conn.execute_batch("ROLLBACK TO unit_call; RELEASE unit_call")
+                self.conn
+                    .borrow()
+                    .execute_batch("ROLLBACK TO unit_call; RELEASE unit_call")
                     .map_err(map_err)?;
                 if let Some(shadow) = &self.shadow {
-                    shadow.rebuild(&conn);
+                    shadow.mark_dirty();
                 }
                 Err(e)
             }
