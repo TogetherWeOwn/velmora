@@ -2964,7 +2964,10 @@ fn production_places_the_fetch_handler_in_us_east_1_and_dev_does_not() {
         table_body("[placement]"),
         ["mode=targeted", "region=aws:us-east-1"]
     );
-    let dev: Vec<&String> = env.iter().filter(|t| t.starts_with("env.dev.placement")).collect();
+    let dev: Vec<&String> = env
+        .iter()
+        .filter(|t| t.starts_with("env.dev.placement"))
+        .collect();
     assert_eq!(dev, ["env.dev.placement"], "dev states its own placement");
     assert_eq!(table_body("[env.dev.placement]"), ["mode=off"]);
 }
