@@ -2346,7 +2346,9 @@ impl<T: GateTransport> GateClient<T> {
         let now = (self.clock)().0;
         let (mut found, mut old) = (None, Vec::new());
         self.pocket.borrow_mut().retain(|(by, permit, at)| {
-            if !(0..ttl_ms(true)).contains(&(now - at)) {
+            // An age below zero is another invocation's clock, read
+            // a moment later than this one's: not old.
+            if now - at >= ttl_ms(true) {
                 old.push(permit.clone());
                 return false;
             }
