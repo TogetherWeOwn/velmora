@@ -473,6 +473,7 @@ where
                     None => Stop::NoPermit,
                 });
             }
+            let asked = usable.len();
             let mut refused = false;
             for provider in usable {
                 let Some(mut session) = ProviderSession::open(
@@ -517,7 +518,7 @@ where
             // for a bounded time ([`crate::jobs::SLOT_WAIT_MS`]): the
             // row is not given back and delivered again for a slot
             // that comes free in seconds.
-            if !self.slot_wait(lease).await {
+            if !self.slot_wait(lease, asked).await {
                 return Err(Stop::NoPermit);
             }
             waited = true;

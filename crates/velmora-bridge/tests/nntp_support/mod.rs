@@ -415,6 +415,7 @@ pub struct MemCatalog {
     pub slow_next_renewal: RefCell<Option<(FixedClock, i64)>>,
     /// `provider_failed` calls so far (strikes reported).
     pub failures_reported: Cell<u32>,
+    loads: Cell<u32>,
     /// The backbones read in full for a while, as `verify_escalations`.
     pub escalations: RefCell<Vec<VerifyEscalation>>,
     /// Extent, backbone and plan of each raise, as `verify_raises`.
@@ -464,6 +465,11 @@ impl MemCatalog {
     }
 
     /// Every held slot passes to someone else: its holder's permit is dead.
+    /// How often the load of the providers was read.
+    pub fn pool_loads(&self) -> u32 {
+        self.loads.get()
+    }
+
     /// Provider `id` reads as cooling until `until` from `from` on, as
     /// when another job's failures begin a cooldown at `from`.
     pub fn cool_from(&self, id: &str, from: UnixMs, until: UnixMs) {
@@ -1607,6 +1613,7 @@ impl Catalog for MemCatalog {
         unused()
     }
     async fn provider_load(&self, now: UnixMs) -> Result<Vec<ProviderLoad>> {
+        self.loads.set(self.loads.get() + 1);
         let slots = self.slots.borrow();
         let health = self.health.borrow();
         let later = self.later_cooldown.borrow();
