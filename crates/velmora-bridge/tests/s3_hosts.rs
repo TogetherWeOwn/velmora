@@ -4,18 +4,33 @@ mod service_support;
 
 use service_support::*;
 use velmora_bridge::config::{HostClass, S3Host};
-use velmora_bridge::Method;
+use velmora_bridge::{Catalog, Method, Secret};
 
 const BUCKET: &str = "bkt-hosts";
+const TOKEN: &str = "admin-token-fixture-admin-token-fixture";
 const CUSTOMER: &str = "s3.customer.test";
 
 fn two_hosts() -> Rig {
     let mut cfg = config(Vec::new());
+    cfg.admin_token = Secret::new(TOKEN.to_string());
     cfg.s3_hosts = vec![S3Host {
         name: CUSTOMER.into(),
         class: HostClass::Customer,
     }];
     rig_with(NoNntp, cfg)
+}
+
+async fn bearer_call(rig: &Rig, method: Method, target: &str, host: &str) -> Resp {
+    rig.send(Req {
+        method,
+        target: target.to_string(),
+        headers: vec![
+            ("host".to_string(), host.to_string()),
+            ("authorization".to_string(), format!("Bearer {TOKEN}")),
+        ],
+        body: Vec::new(),
+    })
+    .await
 }
 
 fn assert_host_refused(resp: &Resp, message: &str) {
@@ -95,6 +110,80 @@ async fn changing_the_host_after_signing_invalidates_the_signature() {
     let resp = rig.send(req).await;
     resp.expect(403);
     assert_eq!(resp.code(), "SignatureDoesNotMatch");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn presigned_get_requires_the_host_it_was_signed_for() {
+    let rig = two_hosts();
+    let (_, signer) = rig.standard(BUCKET).await;
+    let payload = b"presigned payload";
+    rig.put(&signer, BUCKET, "presigned", payload)
+        .await
+        .expect(200);
+
+    let req = presign(&signer, rig.now(), &path(BUCKET, "presigned"));
+    let customer_req = Req {
+        method: Method::Get,
+        target: req.target.clone(),
+        headers: vec![("host".to_string(), CUSTOMER.to_string())],
+        body: Vec::new(),
+    };
+    rig.send(customer_req)
+        .await
+        .expect_error(403, "SignatureDoesNotMatch");
+
+    let resp = rig.send(req).await;
+    resp.expect(200);
+    assert_eq!(resp.body, payload);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn admin_routes_are_hidden_on_the_customer_host() {
+    let rig = two_hosts();
+    let target = "/_admin/status";
+    bearer_call(&rig, Method::Get, target, CUSTOMER)
+        .await
+        .expect_error(404, "NotFound");
+
+    bearer_call(&rig, Method::Get, target, HOST)
+        .await
+        .expect(200);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn bearer_create_bucket_requires_a_legacy_host() {
+    let rig = two_hosts();
+    bearer_call(&rig, Method::Put, "/newbucket", CUSTOMER)
+        .await
+        .expect_error(403, "AccessDenied");
+    assert!(rig
+        .bridge
+        .catalog
+        .bucket_by_name("newbucket")
+        .await
+        .unwrap()
+        .is_none());
+
+    bearer_call(&rig, Method::Put, "/newbucket", HOST)
+        .await
+        .expect(200);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn bearer_delete_bucket_is_refused_on_the_customer_host() {
+    let rig = two_hosts();
+    rig.bucket(BUCKET, true).await;
+
+    bearer_call(&rig, Method::Delete, "/bkt-hosts", CUSTOMER)
+        .await
+        .expect_error(403, "AccessDenied");
+    assert!(rig
+        .bridge
+        .catalog
+        .bucket_by_name(BUCKET)
+        .await
+        .unwrap()
+        .is_some());
 }
 
 #[tokio::test(flavor = "current_thread")]

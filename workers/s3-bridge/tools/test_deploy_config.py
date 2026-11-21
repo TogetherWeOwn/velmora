@@ -323,7 +323,7 @@ class S3HostsTest(GeneratorCase):
     def test_invalid_lists_are_refused_before_writing(self):
         message = (
             "VELMORA_S3_HOSTS must be a comma separated list of <lowercase host>=legacy|customer, "
-            "at most 8, without S3_HOST or a repeat"
+            "at most 8, without S3_HOST, a repeat or a subdomain of another host"
         )
         for value in (
             "A.example=customer", "a.example:443=customer", " a.example=customer",
@@ -331,6 +331,9 @@ class S3HostsTest(GeneratorCase):
             "a.example=public", "a.example", "a.example=", "=legacy",
             ",a.example=customer", "a.example=customer,", "a.example=customer,,b.example=legacy",
             "a.example=customer,a.example=legacy", f"{HOST}=customer",
+            f"eu.{HOST}=customer", f"{HOST.split('.', 1)[1]}=customer",
+            "a.example=legacy,x.a.example=customer",
+            "x.a.example=customer,a.example=legacy",
             ",".join(f"s3-{i}.example=legacy" for i in range(9)),
         ):
             with self.subTest(value=value):

@@ -368,6 +368,16 @@ fn header<'a>(req: &'a S3Request, name: &str) -> Option<&'a str> {
         .map(|(_, v)| v.as_str())
 }
 
+/// Whether the request's `Host` is an S3 host of class
+/// [`HostClass::Customer`](crate::config::HostClass::Customer). No admin
+/// route (`/_admin`, and the bearer-token CreateBucket and DeleteBucket)
+/// answers there: a customer host serves the S3 API and nothing else.
+pub fn on_customer_host(req: &S3Request, cfg: &BridgeConfig) -> bool {
+    header(req, "host")
+        .and_then(|host| cfg.s3_host_for(host))
+        .is_some_and(|(_, class)| class == crate::config::HostClass::Customer)
+}
+
 /// Constant-time check of `Authorization: Bearer <token>` against the
 /// configured admin token. `Ok(())` only on an exact match.
 pub fn check_admin_bearer(req: &S3Request, token: &str) -> Result<(), IngressError> {
@@ -404,6 +414,9 @@ pub const ADMIN_READ_ROUTES: [&str; 4] = [
 /// Both tokens are compared in constant time, and both are compared
 /// whichever matches.
 pub fn check_admin(req: &S3Request, cfg: &BridgeConfig) -> Result<(), IngressError> {
+    if on_customer_host(req, cfg) {
+        return Err(IngressError::AdminHidden);
+    }
     if let Some(only) = &cfg.admin_host {
         let host = header(req, "host").unwrap_or("");
         // Without a port: the name is what is configured.

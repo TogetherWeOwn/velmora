@@ -670,7 +670,8 @@ fn valid_newsgroup(g: &str) -> bool {
 /// separated list of `<host>=<class>`, class `legacy` or `customer`,
 /// at most [`MAX_EXTRA_S3_HOSTS`] entries. Each host is a valid
 /// `S3_HOST` value in lowercase, and no host is listed twice or equals
-/// `S3_HOST` (compared without case). Anything else refuses the whole
+/// `S3_HOST` (compared without case), and no host is a subdomain of
+/// another (ports aside). Anything else refuses the whole
 /// configuration: a host typed wrong must not leave a second endpoint
 /// half-configured.
 fn parse_s3_hosts(raw: Option<&str>, primary: &str) -> Result<Vec<S3Host>, ConfigError> {
@@ -702,6 +703,20 @@ fn parse_s3_hosts(raw: Option<&str>, primary: &str) -> Result<Vec<S3Host>, Confi
     }
     if out.len() > MAX_EXTRA_S3_HOSTS {
         return Err(invalid());
+    }
+    // No host may be a subdomain of another: `<bucket>.<host>` is how a
+    // virtual-hosted request names its bucket, and it must stay refused
+    // as such, not be taken as a path-style request on a second host.
+    let names: Vec<String> = core::iter::once(primary.to_ascii_lowercase())
+        .chain(out.iter().map(|h| h.name.clone()))
+        .collect();
+    let bare = |n: &str| n.split(':').next().unwrap_or(n).to_owned();
+    for a in &names {
+        for b in &names {
+            if a != b && bare(a).ends_with(&format!(".{}", bare(b))) {
+                return Err(invalid());
+            }
+        }
     }
     Ok(out)
 }

@@ -2088,6 +2088,12 @@ fn s3_hosts_lists_more_hosts_with_a_class() {
         [primary, "a.example", "b.example:8443"]
     );
 
+    let cfg = hosts(Some("a.example=legacy,b-a.example=customer")).unwrap();
+    assert_eq!(
+        cfg.all_s3_hosts().collect::<Vec<_>>(),
+        [primary, "a.example", "b-a.example"]
+    );
+
     let eight = (1..=8)
         .map(|i| format!("s3-{i}.example=legacy"))
         .collect::<Vec<_>>()
@@ -2106,6 +2112,10 @@ fn s3_hosts_lists_more_hosts_with_a_class() {
         "a.example=customer,a.example=legacy",
         &format!("{}=customer", primary.to_ascii_uppercase()),
         &format!("{primary}=customer"),
+        &format!("eu.{primary}=customer"),
+        "a.example=legacy,x.a.example=customer",
+        "x.a.example=customer,a.example=legacy",
+        "a.example:8443=legacy,x.a.example=customer",
         "a b.example=customer",
         "a.example:0=customer",
         "a.example=customer=legacy",

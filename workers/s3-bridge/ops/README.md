@@ -697,6 +697,10 @@ tenant; a later change binds tenants to classes. A request is checked
 against the host it was sent to: a signature made for one host is refused
 on another, and `CompleteMultipartUpload` names the host it was sent to
 in `Location`.
+A configured host may not be a subdomain of another configured host so
+virtual-hosted requests remain refused.
+Customer-class hosts return HTTP 404 for `/_admin` routes and HTTP 403
+for bearer-token CreateBucket and DeleteBucket requests.
 
 1. Attach the new host to the Worker as a Custom Domain.
 2. Set the GitHub Actions variable `VELMORA_S3_HOSTS` to the full list of

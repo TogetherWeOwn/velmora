@@ -28,7 +28,7 @@ use velmora_s3_proto::{storable_key, ChecksumAlgorithm, ErrorCode, UploadValidat
 
 use super::common::{
     authenticate, check_precondition, conditional_gate, internal, mutation_gate, policy_with,
-    restore_gate, s3_error, writes_refused,
+    restore_gate, s3_error, signed_host, writes_refused,
 };
 use crate::ingress::{read_upload, upload_lengths, UploadReadError};
 use crate::keepalive::Deferred;
@@ -635,7 +635,7 @@ async fn delete_many<
     // The limits of this document, not those of an object body.
     let xml_policy = policy_with(
         &bridge.cfg,
-        &bridge.cfg.s3_host,
+        signed_host(&bridge.cfg, &req),
         MAX_DELETE_BODY_BYTES as usize,
         MAX_DELETE_BODY_BYTES,
     )?;

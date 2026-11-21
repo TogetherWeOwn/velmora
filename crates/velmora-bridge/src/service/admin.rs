@@ -868,7 +868,9 @@ pub(super) async fn create_bucket_s3<
     req: S3Request,
     bucket: &str,
 ) -> S3Response {
-    if check_admin_bearer(&req, bridge.cfg.admin_token.expose()).is_err() {
+    if ingress::on_customer_host(&req, &bridge.cfg)
+        || check_admin_bearer(&req, bridge.cfg.admin_token.expose()).is_err()
+    {
         return IngressError::AccessDenied.response();
     }
     if mutable(bridge).await.is_err() {
@@ -916,7 +918,9 @@ pub(super) async fn delete_bucket_s3<
     req: S3Request,
     bucket: &str,
 ) -> S3Response {
-    if check_admin_bearer(&req, bridge.cfg.admin_token.expose()).is_err() {
+    if ingress::on_customer_host(&req, &bridge.cfg)
+        || check_admin_bearer(&req, bridge.cfg.admin_token.expose()).is_err()
+    {
         return IngressError::AccessDenied.response();
     }
     let failed = || S3Response::error(500, "InternalError", "The request failed.");

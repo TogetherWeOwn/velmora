@@ -942,8 +942,10 @@ jobs:
           for entry in entries:
               name, _, host_class = entry.partition("=")
               if (len(entries) > 8 or len(name) > 253 or not hostname.fullmatch(name)
-                      or host_class not in ("legacy", "customer") or name in seen):
-                  sys.exit("VELMORA_S3_HOSTS must be a comma separated list of <lowercase host>=legacy|customer, at most 8, without S3_HOST or a repeat")
+                      or host_class not in ("legacy", "customer") or name in seen
+                      or any(name.endswith("." + other) or other.endswith("." + name)
+                             for other in seen)):
+                  sys.exit("VELMORA_S3_HOSTS must be a comma separated list of <lowercase host>=legacy|customer, at most 8, without S3_HOST, a repeat or a subdomain of another host")
               seen.add(name)
               classes.append(host_class)
           subs = [
