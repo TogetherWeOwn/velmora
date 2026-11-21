@@ -267,7 +267,9 @@ bucket_name = "velmora-cache-enam"
 # invocations on one queue posted no faster than three (they wait for the
 # budget and are deferred), while four queues of three ran in seven
 # isolates and posted four times as fast. So throughput is raised by
-# adding a queue, not by raising max_concurrency.
+# adding a queue, not by raising max_concurrency. Light verify jobs are
+# the exception (see the verify queues below): they wait on the network,
+# not on the thread or the budget.
 #
 # The bindings of one kind are POST_Q, POST_Q2, POST_Q3, ... (VERIFY_Q,
 # VERIFY_Q2, ...), 8 at most, numbered without a gap: the Worker refuses
@@ -376,8 +378,11 @@ dead_letter_queue = "velmora-dlq"
 # 7 s of wall time per invocation. Four queues of six then ran all 24
 # consumers all the time and verified about 19 MiB/s, below the 30 MiB/s
 # posted, while the reading provider used 13 to 18 of its 19 background
-# holders. Eight per queue is the step that provider's holders allow:
-# past about 30 consumers its jobs are put off instead of running.
+# holders. Release jobs share these consumers and that provider. Eight
+# per queue is sized for light only and is the step those holders allow:
+# past about 30 consumers verify and release jobs are put off instead of
+# running, and every put-off spends one of the message's deliveries
+# (max_retries). Under body the provider's slots already bound at six.
 [[queues.consumers]]
 queue = "velmora-verify"
 max_batch_size = 1
