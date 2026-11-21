@@ -73,14 +73,32 @@ macro_rules! tally {
     };
 }
 
-/// Whether that row is a complete pass of its kind for the current plan.
+/// How many articles the plan of extent `e` has: its data articles and
+/// the parity articles of its addendum. NULL = no plan.
+macro_rules! total {
+    () => {
+        "(e.article_count + COALESCE(e.parity_count, 0))"
+    };
+}
+
+/// Whether that row is a complete pass of its kind for the current plan:
+/// of every article of it, the parity articles included ([`total`]). A
+/// pass that left them out is not one.
+///
+/// A pass is bound to the plan revision and to this number, not to the
+/// addendum itself. That holds because the addendum of a plan never
+/// changes once it is stored. Code that writes another addendum on an
+/// extent that has one must delete the extent's `verifications` in the
+/// same batch (or bind the passes to the revision of the addendum):
+/// otherwise a pass over other parity articles would count for these.
 macro_rules! counts {
     () => {
         concat!(
             "(v.result = 'ok' AND ",
             tally!(),
-            " = v.articles_total \
-               AND v.articles_total = COALESCE(e.article_count, -1))"
+            " = v.articles_total AND v.articles_total = COALESCE(",
+            total!(),
+            ", -1))"
         )
     };
 }
@@ -92,18 +110,28 @@ macro_rules! counts {
 /// it. A `STAT` answer, or a later size that fits, says nothing about
 /// bytes that were found missing or wrong, so such a backbone holds no
 /// copy until it is read in full again.
+///
+/// A full read of fewer articles than the plan has ([`total`]) is not a
+/// complete pass either, whatever it found: a version from before
+/// parity reads the data articles alone, and such a read says nothing
+/// of a parity article that an earlier read found missing or wrong.
 macro_rules! body_failed {
     () => {
-        "EXISTS (SELECT 1 FROM verifications f \
-           WHERE f.extent_id = v.extent_id AND f.backbone = v.backbone \
-             AND f.plan_rev = e.plan_rev \
-             AND ((f.kind = 'body' \
-                   AND (f.result <> 'ok' OR f.articles_ok <> f.articles_total)) \
-               OR (f.mode = 'size' AND f.result = 'corrupt')) \
-             AND NOT EXISTS (SELECT 1 FROM verifications g \
-               WHERE g.extent_id = f.extent_id AND g.backbone = f.backbone \
-                 AND g.plan_rev = f.plan_rev AND g.kind = 'body' \
-                 AND g.verified_at > f.verified_at))"
+        concat!(
+            "EXISTS (SELECT 1 FROM verifications f \
+               WHERE f.extent_id = v.extent_id AND f.backbone = v.backbone \
+                 AND f.plan_rev = e.plan_rev \
+                 AND ((f.kind = 'body' \
+                       AND (f.result <> 'ok' OR f.articles_ok <> f.articles_total \
+                         OR f.articles_total <> COALESCE(",
+            total!(),
+            ", -1))) \
+                   OR (f.mode = 'size' AND f.result = 'corrupt')) \
+                 AND NOT EXISTS (SELECT 1 FROM verifications g \
+                   WHERE g.extent_id = f.extent_id AND g.backbone = f.backbone \
+                     AND g.plan_rev = f.plan_rev AND g.kind = 'body' \
+                     AND g.verified_at > f.verified_at))"
+        )
     };
 }
 
@@ -133,13 +161,17 @@ macro_rules! fresh_pass {
 /// plan that changed has none until it is read in full again.
 macro_rules! body_on_record {
     () => {
-        "b.plan_rev = e.plan_rev AND b.kind = 'body' AND b.result = 'ok' \
-           AND b.articles_ok = b.articles_total \
-           AND b.articles_total = COALESCE(e.article_count, -1) \
-           AND NOT EXISTS (SELECT 1 FROM verifications x \
-             WHERE x.extent_id = b.extent_id AND x.backbone = b.backbone \
-               AND x.plan_rev = b.plan_rev AND x.verified_at > b.verified_at \
-               AND (x.kind = 'body' OR x.result <> 'ok'))"
+        concat!(
+            "b.plan_rev = e.plan_rev AND b.kind = 'body' AND b.result = 'ok' \
+               AND b.articles_ok = b.articles_total \
+               AND b.articles_total = COALESCE(",
+            total!(),
+            ", -1) \
+               AND NOT EXISTS (SELECT 1 FROM verifications x \
+                 WHERE x.extent_id = b.extent_id AND x.backbone = b.backbone \
+                   AND x.plan_rev = b.plan_rev AND x.verified_at > b.verified_at \
+                   AND (x.kind = 'body' OR x.result <> 'ok'))"
+        )
     };
 }
 
@@ -563,6 +595,13 @@ pub(super) async fn plan_packed<S: Sql>(
     let stmts: Vec<Stmt> = vec![
         (held_guard!(), lease_params(l, [])?),
         (
+            // The addendum is written once, with the plan, on an extent
+            // that has neither (`article_count IS NULL`), so no pass on
+            // record can be of another addendum. A statement that
+            // rewrites the addendum of an extent must delete that
+            // extent's `verifications` in the same batch: a pass is
+            // bound to `plan_rev` and the article total only
+            // (`counts!`).
             "UPDATE extents SET article_count = ?2, plan_rev = 1, plan = ?3, \
                parity = ?5, parity_count = ?6 \
              WHERE id = ?1 AND article_count IS NULL AND cipher_size = ?4",
@@ -788,7 +827,8 @@ pub(super) async fn record_verification<S: Sql>(
         ),
         (
             "UPDATE extents SET last_verified_at = ?2 \
-             WHERE id = ?1 AND ?3 = 'ok' AND ?4 = ?5 AND ?5 = article_count AND ?6 = plan_rev \
+             WHERE id = ?1 AND ?3 = 'ok' AND ?4 = ?5 \
+               AND ?5 = article_count + COALESCE(parity_count, 0) AND ?6 = plan_rev \
                AND ?7 = 'body' \
                AND (last_verified_at IS NULL OR last_verified_at < ?2)",
             vec![
@@ -814,9 +854,9 @@ pub(super) fn kind_of(r: &mut Cols) -> Result<VerifyKind> {
 
 /// Latest row per backbone for the extent's current plan. `counts` is true
 /// only for a complete pass of the row's `kind` (`ok`, `articles_ok =
-/// articles_total = article_count`): a newer failure hides an older pass,
-/// a newer `stat` pass hides an older `body` pass, and two providers on
-/// one backbone are one row.
+/// articles_total` = every article of the plan, parity included): a
+/// newer failure hides an older pass, a newer `stat` pass hides an older
+/// `body` pass, and two providers on one backbone are one row.
 pub(super) async fn backbone_status<S: Sql>(
     c: &SqlCatalog<S>,
     extent: &ExtentId,
