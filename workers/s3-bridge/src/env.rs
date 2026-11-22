@@ -167,7 +167,10 @@ fn build(env: &Env) -> Result<WorkerBridge, String> {
         Ok(namespace) => SqlCatalog::with_gate(
             catalog,
             GateClient::new(
-                DoTransport::new(namespace),
+                DoTransport::new(
+                    namespace,
+                    Rc::new(worker::wasm_bindgen_futures::spawn_local),
+                ),
                 || WorkerClock.now(),
                 permits,
                 sharding,
