@@ -324,18 +324,37 @@ impl Code {
     }
 
     /// What the `Tenancy` port does with this code: `Gone` for
-    /// `external_ref_retired`; a `Retry` with a page for a reused key and
-    /// for every `Upstream` code (each one a `kofra-api` or deploy fault,
-    /// such as a wrong token at sign-up, which must not retry in
-    /// silence); and `Retry` for every other code. A code this crate does
-    /// not know is `Upstream`: `Retry` with a page.
+    /// `external_ref_retired`; a plain `Retry` for a "not now" (`Busy`,
+    /// `Unavailable`, `IdempotencyKeyInUse`); and a `Retry` with a page for
+    /// every other code: a reused key, every `Upstream` code (a
+    /// `kofra-api` or deploy fault, such as a wrong token at sign-up), and
+    /// any code sign-up should never meet (such as `tenant_unavailable` at
+    /// a principal create for a shredded tenant). None of them may retry in
+    /// silence. A code this crate does not know is `Upstream`
+    /// ([`ErrorBody::tenancy`]).
     pub fn tenancy(self) -> TenancyMapping {
+        use KofraMapping as K;
         match self.kofra() {
-            KofraMapping::TenancyGone => TenancyMapping::Gone,
-            KofraMapping::IdempotencyKeyReused | KofraMapping::Upstream => {
-                TenancyMapping::RetryAndPage
-            }
-            _ => TenancyMapping::Retry,
+            K::TenancyGone => TenancyMapping::Gone,
+            K::Busy | K::Unavailable | K::IdempotencyKeyInUse => TenancyMapping::Retry,
+            K::Upstream
+            | K::IdempotencyKeyReused
+            | K::InvalidCursor
+            | K::GrantNotHeld
+            | K::BucketNotFound
+            | K::KeyNotFound
+            | K::BucketAlreadyExists
+            | K::BucketNotEmpty
+            | K::KeyLimitReached
+            | K::GrantLimitReached
+            | K::FeedReset
+            | K::DeletionAlreadyRequested
+            | K::DeletionNotRequested
+            | K::DeletionFinal
+            | K::DeletionNotCancellable
+            | K::AccountReadOnly
+            | K::AccountUnavailable
+            | K::RereadKey => TenancyMapping::RetryAndPage,
         }
     }
 
@@ -357,5 +376,18 @@ impl ErrorBody {
     /// The code of this body; `None` for a code this crate does not know.
     pub fn known(&self) -> Option<Code> {
         Code::parse(&self.code)
+    }
+
+    /// The `kofra-api` error of this body: [`KofraMapping::Upstream`] for
+    /// a code this crate does not know.
+    pub fn kofra(&self) -> KofraMapping {
+        self.known().map_or(KofraMapping::Upstream, Code::kofra)
+    }
+
+    /// What the `Tenancy` port does with this body: a `Retry` with a page
+    /// for a code this crate does not know.
+    pub fn tenancy(&self) -> TenancyMapping {
+        self.known()
+            .map_or(TenancyMapping::RetryAndPage, Code::tenancy)
     }
 }

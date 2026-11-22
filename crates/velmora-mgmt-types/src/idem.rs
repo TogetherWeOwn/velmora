@@ -29,8 +29,9 @@
 //!      `409 idempotency_key_in_use` with `Retry-After: 30` (the finisher
 //!      applies it); otherwise the call is admitted again under the same
 //!      reservation. A put that loses to a
-//!      record of its own reservation answers from that record and never
-//!      applies its own bytes;
+//!      record of its own reservation answers from that record (with
+//!      `secret_access_key: null` for a key) and never applies its own
+//!      bytes;
 //!    - same scope, another fingerprint: `422 idempotency_key_reused`,
 //!      with no reservation and no record.
 //!
@@ -38,7 +39,8 @@
 //! 2. **Tenant create:** `m/tref/` (create or adopt by `external_ref`).
 //! 3. **Closing calls** (revoke, disable, narrowing, bucket delete, the
 //!    tenant delete request): the chain. A tenant delete whose key hash
-//!    equals the set deletion's answers `200` with the tenant. Otherwise a
+//!    equals the set deletion's answers `200` with the tenant and runs
+//!    the stores again (steps 3 and 4, DUR-7). Otherwise a
 //!    reused key on another closing request is not refused: that request
 //!    is evaluated on its own. A repeated key revoke answers `204`; a
 //!    repeated bucket delete answers `404 bucket_not_found`.
