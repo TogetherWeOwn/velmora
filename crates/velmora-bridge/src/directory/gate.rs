@@ -169,7 +169,8 @@ pub trait GateSteps {
     /// Step 7, after the pending table was emptied: run the finisher for
     /// every tenant whose chain head is above its root unit's seq.
     async fn finisher(&self) -> Result<StepReport>;
-    /// Step 8: a new epoch of the event feed; the shred brake and the
+    /// Step 8: a new epoch of the event feed (with this run's epoch,
+    /// [`super::store::SqlDirectory::start_feed_epoch`]); the shred brake and the
     /// delete caps restart as used up for the current window, the other
     /// counters at zero. It refuses an epoch below the newest it has
     /// started: a run that was closed over may reach it late.
@@ -549,6 +550,64 @@ pub async fn run_gate<S: RecordStore, C: ControlSeal, Q: Sql, G: GateSteps>(
     now: UnixMs,
 ) -> Result<GateRun> {
     let epoch = close(chain.store, dir, reason, now).await?;
+    run_from(chain, dir, steps, epoch, now).await
+}
+
+/// [`run_gate`] only over a gate that is closed: the gate is read again
+/// ([`is_open`]) right before the closing's anchor is put, so a run whose guard
+/// passed while another run was under way does not close the gate that
+/// run has opened since (AM-78, the first open). `None`: the gate is open
+/// now, or another closing took the epoch first; nothing was written. A
+/// closing whose anchor landed but whose row write did not (a lost answer)
+/// leaves the row closed below the newest anchor: a later call closes
+/// over it at the next epoch. The read and the put are two calls, so a
+/// gate opened between them is closed again: the caller runs one call at
+/// a time.
+pub async fn run_gate_if_closed<S: RecordStore, C: ControlSeal, Q: Sql, G: GateSteps>(
+    chain: &TenantChain<'_, S, C>,
+    dir: &SqlDirectory<'_, Q>,
+    steps: &G,
+    reason: &str,
+    now: UnixMs,
+) -> Result<Option<GateRun>> {
+    let (anchored, _) = anchored_epoch(chain.store).await?;
+    let row = dir.gate().await?;
+    // Only a gate that is open in full is left alone. A row that says
+    // open under a newer anchor or a stray name is closed (`is_open`), and
+    // a closing over it is what opens it again.
+    if !row.closed && is_open(chain.store, dir).await? {
+        return Ok(None);
+    }
+    let epoch = anchored
+        .max(row.epoch)
+        .checked_add(1)
+        .filter(|&e| e <= MAX_EPOCH)
+        .ok_or(BridgeError::Invalid("gate epoch out of range"))?;
+    let body = serde_json::to_vec(&serde_json::json!({
+        "epoch": epoch,
+        "closed_at": now.0,
+    }))
+    .map_err(|_| BridgeError::Invalid("gate anchor"))?;
+    // Put once: of two runs that read the same anchors, one closes.
+    if !chain.store.put_if_absent(&anchor_key(epoch), body).await? {
+        return Ok(None);
+    }
+    dir.mark_closed(epoch, reason, now).await?;
+    let row = dir.gate().await?;
+    if !row.closed || row.epoch < epoch {
+        return Err(BridgeError::Invalid("gate row did not take the closing"));
+    }
+    run_from(chain, dir, steps, epoch, now).await.map(Some)
+}
+
+/// The steps of a run that closed the gate at `epoch`.
+async fn run_from<S: RecordStore, C: ControlSeal, Q: Sql, G: GateSteps>(
+    chain: &TenantChain<'_, S, C>,
+    dir: &SqlDirectory<'_, Q>,
+    steps: &G,
+    epoch: u64,
+    now: UnixMs,
+) -> Result<GateRun> {
     let mut run = GateRun {
         epoch,
         tenants: TenantStep::default(),

@@ -23,6 +23,13 @@ fn t1() -> Tenant {
     Tenant::parse("t_00000000000000a1").unwrap()
 }
 
+/// A BDK wrap of the scheme-2 form (`0x02`, 73 bytes).
+fn wrap() -> Vec<u8> {
+    let mut w = vec![7; velmora_bridge::crypto::WRAPPED_KEY_LEN];
+    w[0] = velmora_bridge::crypto::scheme2::WRAP_VERSION_2;
+    w
+}
+
 fn block_on<F: std::future::Future>(f: F) -> F::Output {
     tokio::runtime::Builder::new_current_thread()
         .build()
@@ -279,6 +286,9 @@ fn a_whole_field_change_never_erases_a_concurrent_bucket() {
             unit: 0,
             creator: "p_owner".into(),
             grant_seq: 1,
+            name: "photos".into(),
+            bdk_wrapped: wrap(),
+            tk_version: 1,
         },
         Actor::Customer,
     );
@@ -545,7 +555,13 @@ fn the_shredded_stub_needs_no_tenant_key() {
         assert_eq!(older.door.state(), TenantState::Active);
         // Nothing follows the stub.
         let w = chain
-            .write(&t1(), &Change::UndoDeletion, Actor::Operator, due, 0)
+            .write(
+                &t1(),
+                &Change::UndoDeletion { deletion_seq: 5 },
+                Actor::Operator,
+                due,
+                0,
+            )
             .await;
         let Err(ChainError::Refused(r)) = w else {
             panic!("{w:?}")
@@ -911,5 +927,184 @@ fn a_lost_answer_over_another_writers_record_is_a_lost_race() {
         assert!(r.door.holds.operator.is_some());
         assert!(r.door.deletion.is_some());
         assert_eq!(store.keys().len(), 6);
+    });
+}
+
+/// Review r1 MEDIUM 1: a move floor is checked against tenant 0's head as
+/// its chain holds it, never one the caller passes.
+#[test]
+fn a_move_floor_is_bound_to_tenant_zeros_own_head() {
+    let store = HookedRecords::new();
+    let seal = PlainSeal::new();
+    let chain = TenantChain {
+        store: &store,
+        seal: &seal,
+    };
+    block_on(async {
+        active(&chain).await;
+        let head = chain.head(&t1(), 0).await.unwrap().unwrap().door;
+        // A hand-built tenant 0 head is not taken through plain write.
+        let mut forged = head.clone();
+        forged.tenant = Tenant::zero();
+        let w = chain
+            .write(
+                &t1(),
+                &Change::SetMoveFloor {
+                    unit: 0,
+                    floor: UnixMs(10),
+                    zero: Box::new(forged),
+                },
+                Actor::MoveTool,
+                UnixMs(20),
+                0,
+            )
+            .await;
+        assert!(
+            matches!(&w, Err(ChainError::Refused(r)) if r.code == "invalid_change"),
+            "{w:?}"
+        );
+        // No tenant 0 chain: refused.
+        let w = chain
+            .set_move_floor(&t1(), 0, UnixMs(10), Actor::MoveTool, UnixMs(20), 0)
+            .await;
+        assert!(
+            matches!(&w, Err(ChainError::Refused(r)) if r.code == "no_move_to_tenant"),
+            "{w:?}"
+        );
+        // Tenant 0 `d1` with no move: a give-up's exit; the floor rises.
+        chain
+            .write(
+                &Tenant::zero(),
+                &Change::CreateTenantZero {
+                    jurisdiction: "us".into(),
+                },
+                Actor::Operator,
+                UnixMs(1),
+                0,
+            )
+            .await
+            .unwrap();
+        let w = chain
+            .set_move_floor(&t1(), 0, UnixMs(10), Actor::MoveTool, UnixMs(20), 0)
+            .await
+            .unwrap();
+        let Written::Wrote(r) = w else {
+            panic!("{w:?}")
+        };
+        assert_eq!(r.door.move_floors.get(&0), Some(&UnixMs(10)));
+        // Once more: unchanged.
+        let w = chain
+            .set_move_floor(&t1(), 0, UnixMs(10), Actor::RestoreTool, UnixMs(20), 0)
+            .await
+            .unwrap();
+        assert!(matches!(w, Written::Unchanged(_)), "{w:?}");
+        // A move into another tenant: this tenant's exit still raises it.
+        chain
+            .write(
+                &Tenant::zero(),
+                &Change::StartMove {
+                    to: Tenant::parse("t_00000000000000b2").unwrap(),
+                    catalogue_id_frozen: "main".into(),
+                },
+                Actor::MoveTool,
+                UnixMs(2),
+                0,
+            )
+            .await
+            .unwrap();
+        let w = chain
+            .set_move_floor(&t1(), 0, UnixMs(11), Actor::MoveTool, UnixMs(20), 0)
+            .await
+            .unwrap();
+        let Written::Wrote(r) = w else {
+            panic!("{w:?}")
+        };
+        assert_eq!(r.door.move_floors.get(&0), Some(&UnixMs(11)));
+    });
+}
+
+/// AM-79: a management call's record names the SHA-256 of its
+/// `Idempotency-Key`; the next record does not, a retry the head already
+/// carries writes nothing and keeps it, and a hash of another form is
+/// refused before any write.
+#[test]
+fn a_call_names_its_key_hash_in_its_own_record_only() {
+    let store = HookedRecords::new();
+    let seal = PlainSeal::new();
+    let chain = TenantChain {
+        store: &store,
+        seal: &seal,
+    };
+    block_on(async {
+        active(&chain).await;
+        let key = "ab".repeat(32);
+        let w = chain
+            .write_keyed(
+                &t1(),
+                &hold(HoldMode::ReadOnly),
+                Actor::Operator,
+                NOW,
+                0,
+                Some(&key),
+            )
+            .await
+            .unwrap();
+        let Written::Wrote(r) = w else {
+            panic!("the hold did not write");
+        };
+        assert_eq!(r.door.call_key_hash.as_deref(), Some(key.as_str()));
+        let read = chain.read(&t1(), r.door.seq).await.unwrap().unwrap();
+        assert_eq!(read.door.call_key_hash.as_deref(), Some(key.as_str()));
+        // The retry: nothing written, the head keeps the hash.
+        let again = chain
+            .write_keyed(
+                &t1(),
+                &hold(HoldMode::ReadOnly),
+                Actor::Operator,
+                NOW,
+                0,
+                Some(&key),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(again, Written::Unchanged(ref h) if h.door.seq == r.door.seq));
+        // The next record, by a job: none.
+        let Written::Wrote(n) = chain
+            .write(
+                &t1(),
+                &Change::ClaimKeyVersion { version: 2 },
+                Actor::RotationJob,
+                NOW,
+                0,
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("the claim did not write");
+        };
+        assert_eq!(n.door.call_key_hash, None);
+        let before = store.keys().len();
+        for bad in [
+            "AB".repeat(32),
+            "ab".repeat(31),
+            "zz".repeat(32),
+            String::new(),
+        ] {
+            let e = chain
+                .write_keyed(
+                    &t1(),
+                    &hold(HoldMode::Locked),
+                    Actor::Operator,
+                    NOW,
+                    0,
+                    Some(&bad),
+                )
+                .await;
+            assert!(
+                matches!(e, Err(ChainError::Refused(r)) if r.status == 400 && r.code == "invalid_change"),
+                "{bad}"
+            );
+        }
+        assert_eq!(store.keys().len(), before);
     });
 }

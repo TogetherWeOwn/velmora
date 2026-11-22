@@ -145,6 +145,7 @@ pub fn test_door(tenant: &TenantId, seq: u64, lifecycle: Lifecycle, units: &[u32
         "tenant": tenant.as_str(),
         "seq": seq,
         "written_at": 1,
+        "created_at": 1,
         "lifecycle": lifecycle,
         "units": units,
         "max_move_epoch": 0,

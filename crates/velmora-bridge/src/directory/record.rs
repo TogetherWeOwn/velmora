@@ -9,7 +9,8 @@
 //!   `restoring` entries, flags, limits, units and placements, key
 //!   versions, jurisdiction, and for tenant 0 the catalogue selector;
 //! - the **private part** ([`TenantPrivate`]): what must die with the
-//!   tenant's key. Today only the `external_ref` that binds a workspace.
+//!   tenant's key: the `external_ref` that binds a workspace, and in the
+//!   record that creates a bucket its name and its wrapped data key.
 //!
 //! How the two parts are sealed is the [`super::chain::ControlSeal`]
 //! port's business, not this module's.
@@ -186,6 +187,9 @@ impl OperatorReason {
 #[serde(deny_unknown_fields)]
 pub struct BillingHold {
     pub mode: HoldMode,
+    /// The `written_at` of the record that placed the hold or changed its
+    /// mode.
+    pub since: UnixMs,
 }
 
 /// The `operator` hold. `preserve` means: this tenant's data must not
@@ -197,6 +201,9 @@ pub struct OperatorHold {
     pub mode: HoldMode,
     pub reason: OperatorReason,
     pub preserve: bool,
+    /// The `written_at` of the record that placed the hold or changed its
+    /// mode. A change of the reason or of `preserve` alone keeps it.
+    pub since: UnixMs,
 }
 
 /// At most one hold per actor class. The customer plane has none.
@@ -225,6 +232,19 @@ impl Holds {
     pub fn preserves(&self) -> bool {
         self.operator.is_some_and(|h| h.preserve)
     }
+
+    /// Since when the mode in force holds: the `since` of the hold whose
+    /// mode is the strictest, the earlier one when both hold that mode.
+    /// `None` with no hold.
+    pub fn since(&self) -> Option<UnixMs> {
+        let mode = self.mode()?;
+        let billing = self.billing.filter(|h| h.mode == mode).map(|h| h.since);
+        let operator = self.operator.filter(|h| h.mode == mode).map(|h| h.since);
+        match (billing, operator) {
+            (Some(b), Some(o)) => Some(b.min(o)),
+            (b, o) => b.or(o),
+        }
+    }
 }
 
 /// The class of the plane that made a change, from the token that
@@ -250,6 +270,11 @@ pub enum DeletionReason {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Deletion {
+    /// The seq of the record that set this deletion. The undo names it
+    /// (`deletion_seq`), so a late retry never cancels a newer deletion.
+    pub seq: u64,
+    /// The `written_at` of that record.
+    pub requested_at: UnixMs,
     pub shred_due_at: UnixMs,
     pub reason: DeletionReason,
     pub actor: ActorClass,
@@ -371,6 +396,8 @@ impl TenantZero {
 /// History only: the creator's `rw` grant on the new bucket is a record of
 /// the key chain, written before this one, and grants are built from the
 /// key chain alone. Only the record that creates the bucket carries it.
+/// Its name and its wrapped data key are in the record's private part
+/// ([`BucketSecrets`]), sealed under the tenant key.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BucketCreated {
@@ -380,6 +407,48 @@ pub struct BucketCreated {
     /// The key-chain seq of the creator grant: the bucket's id is derived
     /// from it ([`crate::records::bucket_id`]).
     pub grant_seq: u64,
+}
+
+/// The private facts of the bucket a record creates: its name and its data
+/// key (BDK), wrapped under the tenant key (`crypto::scheme2::wrap_bdk_v2`,
+/// at the record's `tk_version`). The unit makes the bucket's row from
+/// them, also again after a restore, so the wrap is drawn once, before the
+/// record, and never again. The shred erases both with the tenant key.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BucketSecrets {
+    pub name: String,
+    #[serde(with = "b64")]
+    pub bdk_wrapped: Vec<u8>,
+    /// The tenant key version the wrap is bound to (its AAD names it):
+    /// the record's `tk_version` when it was written.
+    pub tk_version: u32,
+}
+
+impl fmt::Debug for BucketSecrets {
+    // Shapes only: a name is customer data, a wrap is key material.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BucketSecrets")
+            .field("name_len", &self.name.len())
+            .field("bdk_wrapped_len", &self.bdk_wrapped.len())
+            .field("tk_version", &self.tk_version)
+            .finish()
+    }
+}
+
+mod b64 {
+    use base64::engine::general_purpose::STANDARD;
+    use base64::Engine as _;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(bytes: &[u8], s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&STANDARD.encode(bytes))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
+        let s = String::deserialize(d)?;
+        STANDARD.decode(s).map_err(serde::de::Error::custom)
+    }
 }
 
 /// The owner's buckets that a record places in this tenant, moved from
@@ -401,6 +470,8 @@ pub struct TenantDoor {
     pub tenant: Tenant,
     pub seq: u64,
     pub written_at: UnixMs,
+    /// The `written_at` of seq 1, carried unchanged.
+    pub created_at: UnixMs,
     pub lifecycle: Lifecycle,
     #[serde(default)]
     pub holds: Holds,
@@ -410,8 +481,19 @@ pub struct TenantDoor {
     /// call that carries it again is refused.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub undone_deletion: Option<String>,
+    /// The `deletion.seq` of the last deletion that was undone: an undo
+    /// that names it again is answered without a record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub undone_deletion_seq: Option<u64>,
     #[serde(default)]
     pub restoring: Vec<Restoring>,
+    /// Per unit, the time before which no restore of it may land (plus the
+    /// margin the unit adds): raised by the move's step 8(b1) to the
+    /// unit's `lifted_at`, by every exit that empties the unit, and by the
+    /// restore tool before a `restore`. Never lowered, never removed. A
+    /// unit restore cannot take it back, since it is not in the unit.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub move_floors: BTreeMap<u32, UnixMs>,
     #[serde(default)]
     pub synthetic: bool,
     /// The tenant's key has an offline escrow copy: a shred waits and
@@ -473,6 +555,13 @@ pub struct TenantDoor {
     /// Tenant 0 only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tenant_zero: Option<TenantZero>,
+    /// The SHA-256 of the `Idempotency-Key` of the management call that
+    /// wrote this record, lowercase hex (AM-79): this record only, never
+    /// carried. The event built from the record names it as
+    /// `data.key_hash`, so `kofra-api` finds its confirmation id. A record
+    /// that no management call wrote (a job, a tool) has none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub call_key_hash: Option<String>,
 }
 
 /// The private part of a tenant record.
@@ -483,6 +572,10 @@ pub struct TenantPrivate {
     /// The workspace this tenant is bound to, opaque to storage.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub external_ref: Option<String>,
+    /// The name and wrapped key of the bucket that this record creates
+    /// (this record only, beside the door's `bucket_created`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bucket_created: Option<BucketSecrets>,
 }
 
 /// A tenant record: the door part and the private part.
@@ -590,11 +683,14 @@ mod tests {
             tenant: Tenant::parse("t_00000000000000a1").unwrap(),
             seq: 1,
             written_at: UnixMs(1),
+            created_at: UnixMs(1),
             lifecycle: Lifecycle::Live,
             holds: Holds::default(),
             deletion: None,
             undone_deletion: None,
+            undone_deletion_seq: None,
             restoring: vec![],
+            move_floors: BTreeMap::new(),
             synthetic: false,
             escrow_offline: false,
             escrow_destroyed: vec![],
@@ -614,6 +710,7 @@ mod tests {
             jurisdiction: "us".into(),
             location_hint: None,
             tenant_zero: None,
+            call_key_hash: None,
         }
     }
 
@@ -658,6 +755,7 @@ mod tests {
 
         d.holds.billing = Some(BillingHold {
             mode: HoldMode::ReadOnly,
+            since: UnixMs(3),
         });
         assert_eq!(d.state(), TenantState::Suspended(HoldMode::ReadOnly));
         assert_eq!(d.s3_access(0), S3Access::ReadOnly);
@@ -667,8 +765,11 @@ mod tests {
             mode: HoldMode::Locked,
             reason: OperatorReason::Security,
             preserve: false,
+            since: UnixMs(5),
         });
         assert_eq!(d.state(), TenantState::Suspended(HoldMode::Locked));
+        // The suspension holds since the hold whose mode is in force.
+        assert_eq!(d.holds.since(), Some(UnixMs(5)));
         assert_eq!(d.s3_access(0), S3Access::AccountProblem);
         assert_eq!(
             d.hold_classes(),
@@ -677,6 +778,8 @@ mod tests {
 
         // A deletion wins over the holds, and keeps them.
         d.deletion = Some(Deletion {
+            seq: 2,
+            requested_at: UnixMs(2),
             shred_due_at: UnixMs(10),
             reason: DeletionReason::CustomerRequest,
             actor: ActorClass::Customer,
