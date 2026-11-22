@@ -1971,6 +1971,9 @@ impl Catalog for MemCatalog {
     async fn guard_selftest(&self) -> Result<bool> {
         unused()
     }
+    async fn gc_enqueue_scrub_safety(&self, _: &ExtentId, _: UnixMs) -> Result<()> {
+        unused()
+    }
     async fn gc_due(&self, _: UnixMs, _: u32, _: bool) -> Result<Vec<GcRow>> {
         unused()
     }

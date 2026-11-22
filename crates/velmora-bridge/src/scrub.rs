@@ -69,8 +69,8 @@ use crate::ports::PermitClass;
 use crate::ports::{BlobMeta, BlobStore, Bridge, Catalog, Clock, JobSink, Kek, NntpConnector};
 use crate::post::Stop;
 use crate::types::{
-    ArticleRow, ArticleState, ExtentRow, GenerationState, JobOutcome, ProviderConfig, Result,
-    SafetyState, ScrubCandidate, ScrubEnd, ScrubResult, ScrubRun, UnixMs,
+    ArticleRow, ArticleState, ExtentRow, JobOutcome, ProviderConfig, Result, SafetyState,
+    ScrubCandidate, ScrubEnd, ScrubResult, ScrubRun, UnixMs,
 };
 use crate::verify::{release_backbones, MISSING_BACKOFF_SECS, REVERIFY_SECS};
 
@@ -1181,9 +1181,9 @@ where
         // is to sit open through them.
         Self::hang_up_all(reader, walk.stats).await;
         let read = found.cipher.is_some();
-        let (source, cipher, cleanup_cache_write) = match found.cipher {
-            Some(cipher) if found.rebuilt > 0 => (RepairSource::Parity, Some(cipher), false),
-            Some(cipher) => (RepairSource::Usenet, Some(cipher), false),
+        let (source, cipher) = match found.cipher {
+            Some(cipher) if found.rebuilt > 0 => (RepairSource::Parity, Some(cipher)),
+            Some(cipher) => (RepairSource::Usenet, Some(cipher)),
             None => match self.stored_copy(extent).await {
                 Ok(stored) => stored,
                 // A blob store did not answer: not "no copy". Looked at
@@ -1321,23 +1321,13 @@ where
             }
             return Ok(());
         }
-        // Refusal alone does not make the write safe to undo: another run
-        // may now own it. Clean up only if the old copy was known missing
-        // or corrupt and GC already retired the extent while we wrote it.
-        if let (true, Some(generation)) = (cleanup_cache_write, &extent.generation_id) {
-            let retired = self
-                .catalog
-                .job_extent(&extent.id, generation)
-                .await
-                .is_ok_and(|row| {
-                    row.is_some_and(|row| {
-                        row.generation_state != GenerationState::Live
-                            && row.extent.safety_state == SafetyState::Deleted
-                    })
-                });
-            if retired {
-                let _ = crate::recovery::delete_blob(&self.safety, &key).await;
-            }
+        // A refusal or a failed safety GET is not permission to delete:
+        // another run may need this copy. Only GC may remove the write,
+        // and only if the catalogue proves the extent is unreferenced.
+        if source == RepairSource::Cache {
+            self.catalog
+                .gc_enqueue_scrub_safety(&extent.id, self.clock.now())
+                .await?;
         }
         walk.run.suspect += 1;
         self.scrub_record_one(reader, walk, extent, (ScrubResult::Suspect, None))
@@ -1345,25 +1335,21 @@ where
     }
 
     /// Read the intact safety copy, or fall back to an intact cache copy.
-    /// The last field is true only for a cache copy when the safety store
-    /// answered with no object or bad bytes. `Err(())` means no intact copy
-    /// was found and at least one read failed.
+    /// `Err(())` means no intact copy was found and at least one read failed.
     async fn stored_copy(
         &self,
         extent: &ExtentRow,
-    ) -> core::result::Result<(RepairSource, Option<Vec<u8>>, bool), ()> {
-        let safety_unusable = match self.safety.get(&extent.id.safety_key(), None).await {
+    ) -> core::result::Result<(RepairSource, Option<Vec<u8>>), ()> {
+        let safety_answered = match self.safety.get(&extent.id.safety_key(), None).await {
             Ok(Some(bytes)) if digest_ok(extent, &bytes) => {
-                return Ok((RepairSource::Safety, Some(bytes), false));
+                return Ok((RepairSource::Safety, Some(bytes)));
             }
             Ok(_) => true,
             Err(_) => false,
         };
         match self.cache.get(&extent.id.cache_key(), None).await {
-            Ok(Some(bytes)) if digest_ok(extent, &bytes) => {
-                Ok((RepairSource::Cache, Some(bytes), safety_unusable))
-            }
-            Ok(_) if safety_unusable => Ok((RepairSource::Usenet, None, false)),
+            Ok(Some(bytes)) if digest_ok(extent, &bytes) => Ok((RepairSource::Cache, Some(bytes))),
+            Ok(_) if safety_answered => Ok((RepairSource::Usenet, None)),
             _ => Err(()),
         }
     }

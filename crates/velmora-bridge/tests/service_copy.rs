@@ -521,6 +521,12 @@ async fn collector_refuses_an_extent_a_copy_references() {
             .expect(200);
     }
     assert_eq!(delete(&rig, &signer, "src").await.status, 204);
+    rig.bridge
+        .catalog
+        .gc_enqueue_scrub_safety(&extent, rig.now())
+        .await
+        .unwrap();
+    assert_eq!(rig.count("gc"), 0, "a live copy prevents enqueueing");
 
     for action in ["delete_cache", "delete_safety", "shred_key"] {
         rig.bridge
@@ -549,6 +555,36 @@ async fn collector_refuses_an_extent_a_copy_references() {
     let read = get(&rig, &signer, "kept").await;
     read.expect(200);
     assert_eq!(read.body, body);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn refused_scrub_write_does_not_queue_gc_for_a_non_disposable_bucket() {
+    let rig = rig();
+    let (_, signer) = rig.standard(BUCKET).await;
+    let bucket = rig.bucket("retained", false).await;
+    rig.grant(AKID, &bucket, Perm::Rw).await;
+    rig.put(&signer, "retained", "a", &pattern(1, 1000))
+        .await
+        .expect(200);
+    let (_, extents) = rig.live(&bucket, "a").await.unwrap();
+    rig.call(
+        &signer,
+        Method::Delete,
+        &path("retained", "a"),
+        &[],
+        &[],
+        b"",
+    )
+    .await
+    .expect(204);
+    let before = rig.count("gc");
+    assert!(before > 0, "ordinary retirement has queued GC rows");
+    rig.bridge
+        .catalog
+        .gc_enqueue_scrub_safety(&extents[0].id, rig.now())
+        .await
+        .unwrap();
+    assert_eq!(rig.count("gc"), before, "no new GC row for this bucket");
 }
 
 /// Without `SERVER_SIDE_COPY` no copy is created: a Worker that is rolled

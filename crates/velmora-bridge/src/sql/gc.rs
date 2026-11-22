@@ -267,6 +267,32 @@ macro_rules! open_row {
     };
 }
 
+/// The old row may already have deleted its blob, even if it is still
+/// open. Insert a new row with its own ID so completing the old delete
+/// cannot close this one. `gc_begin` rechecks the references at execution.
+pub(super) async fn gc_enqueue_scrub_safety<S: Sql>(
+    c: &SqlCatalog<S>,
+    extent: &ExtentId,
+    now: UnixMs,
+) -> Result<()> {
+    let insert = concat!(
+        "INSERT INTO gc(extent_id, action, due_at) \
+         SELECT e.id, 'delete_safety', ?2 FROM extents e \
+         JOIN buckets b ON b.id = e.bucket_id \
+         WHERE e.id = ?1 AND e.generation_id IS NOT NULL \
+           AND b.disposable = 1 AND NOT ",
+        in_use!()
+    );
+    let params = [text(extent.as_str()), ms(now)];
+    // Scrub will not visit a retired extent again. Retry once on error;
+    // if the first insert committed but lost its reply, both rows are
+    // safe to run: each rechecks references before an idempotent delete.
+    if c.sql.exec(insert, &params).await.is_err() {
+        c.sql.exec(insert, &params).await?;
+    }
+    Ok(())
+}
+
 /// Open rows that are due, oldest first. With `disposable_only`, only rows
 /// whose extent belongs to a bucket flagged `disposable`.
 pub(super) async fn gc_due<S: Sql>(

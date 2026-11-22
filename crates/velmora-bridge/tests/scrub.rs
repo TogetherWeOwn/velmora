@@ -2379,7 +2379,118 @@ async fn cache_repair_does_not_leave_a_copy_after_gc_collects_the_extent() {
         _ = &mut run => panic!("scrub finished without writing the cached copy"),
     }
     assert_eq!(run.await.repaired, 0);
-    assert!(!w.has_safety(&o), "GC already collected the extent");
+    assert!(w.has_safety(&o), "scrub leaves cleanup to GC");
+    assert_eq!(
+        bridge.run_job(&Job::Gc { v: JOB_VERSION }).await,
+        JobOutcome::Ack
+    );
+    assert!(!w.has_safety(&o), "GC also collects the replacement");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn cache_repair_after_gc_blob_delete_leaves_a_fresh_gc_obligation() {
+    cache_repair_during_gc(None).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn refused_cache_repair_retries_a_failed_gc_enqueue() {
+    cache_repair_during_gc(Some(Trip::Fail)).await;
+}
+
+async fn cache_repair_during_gc(enqueue_fault: Option<Trip>) {
+    let w = world_with(|cfg| cfg.gc_mode = velmora_bridge::config::GcMode::Disposable).await;
+    let o = w.released("a", 233).await;
+    let bridge = w.bridge();
+    let safety = &bridge.safety;
+    let key = o.extent.safety_key();
+    let cipher = safety.stored(&key).unwrap().bytes;
+    let extent = w.rig.live(&w.bucket, "a").await.unwrap().1.remove(0);
+    let meta = BlobMeta {
+        bucket: &extent.bucket_id,
+        extent: &extent.id,
+        cipher_sha256: &extent.cipher_sha256,
+    };
+    bridge
+        .cache
+        .put(&o.extent.cache_key(), cipher, &meta)
+        .await
+        .unwrap();
+    w.advance_secs(31 * DAY_SECS);
+    w.hide(0, &o, 0).await;
+    w.hide(1, &o, 0).await;
+    assert_eq!(w.scrub().await.repaired, 0);
+    w.advance_secs(bridge.cfg.scrub.confirm_secs);
+
+    safety.fail_next_get.set(true);
+    safety.hold_put_prefix.replace(Some(key.clone()));
+    let run = w.scrub();
+    tokio::pin!(run);
+    let delete_before_put = async {
+        while !safety.held.get() {
+            tokio::task::yield_now().await;
+        }
+        assert!(!safety.fail_next_get.get(), "the safety GET failed");
+        w.rig
+            .call(&w.signer, Method::Delete, &path(BUCKET, "a"), &[], &[], b"")
+            .await
+            .expect(204);
+        let now = bridge.clock.now();
+        let old = bridge
+            .catalog
+            .gc_due(now, 10, true)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|row| row.action == GcAction::DeleteSafety)
+            .unwrap();
+        assert!(matches!(
+            bridge.catalog.gc_begin(&old, now).await.unwrap(),
+            GcStep::DeleteBlob { store: BlobStoreKind::Safety, key: gc_key } if gc_key == key
+        ));
+        safety.delete(&key).await.unwrap();
+        if let Some(fault) = enqueue_fault {
+            // Let the R2 PUT and the guarded re-pin batch run, then
+            // fail just the first insert of the new GC obligation.
+            w.rig.trip().arm(2, fault);
+        }
+        safety.hold_put_prefix.replace(None);
+        old
+    };
+    let old = tokio::select! {
+        old = delete_before_put => old,
+        _ = &mut run => panic!("scrub finished without writing the cached copy"),
+    };
+    assert_eq!(run.await.repaired, 0);
+    assert!(
+        w.has_safety(&o),
+        "scrub must not delete after a transient GET error"
+    );
+    assert_eq!(
+        w.safety_state(&o).await,
+        "released",
+        "old GC still in flight"
+    );
+    let now = bridge.clock.now();
+    bridge.catalog.gc_done(old.id, now).await.unwrap();
+    assert!(
+        w.has_safety(&o),
+        "the old GC delete preceded the replacement"
+    );
+    let due = bridge.catalog.gc_due(now, 10, true).await.unwrap();
+    assert!(!due.iter().any(|row| row.id == old.id), "old row is closed");
+    assert!(
+        due.iter()
+            .any(|row| row.extent_id == o.extent && row.action == GcAction::DeleteSafety),
+        "the old completion must not close the replacement's GC obligation"
+    );
+    assert_eq!(
+        bridge.run_job(&Job::Gc { v: JOB_VERSION }).await,
+        JobOutcome::Ack
+    );
+    assert!(
+        !w.has_safety(&o),
+        "a later GC pass collects the replacement"
+    );
 }
 
 /// A clean check carries the count of clean checks across runs: at 8 in a

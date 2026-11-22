@@ -720,6 +720,9 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
     }
 
     // gc
+    async fn gc_enqueue_scrub_safety(&self, extent: &ExtentId, now: UnixMs) -> Result<()> {
+        gc::gc_enqueue_scrub_safety(self, extent, now).await
+    }
     async fn gc_due(&self, now: UnixMs, limit: u32, disposable_only: bool) -> Result<Vec<GcRow>> {
         gc::gc_due(self, now, limit, disposable_only).await
     }

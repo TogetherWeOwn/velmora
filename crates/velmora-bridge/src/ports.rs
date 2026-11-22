@@ -1313,6 +1313,10 @@ pub trait Catalog {
     async fn guard_selftest(&self) -> Result<bool>;
 
     // gc
+    /// After scrub writes a safety copy but cannot re-pin it, queues a new
+    /// delete only for a published extent in a disposable bucket with no
+    /// live generation or open upload referencing it.
+    async fn gc_enqueue_scrub_safety(&self, extent: &ExtentId, now: UnixMs) -> Result<()>;
     async fn gc_due(&self, now: UnixMs, limit: u32, disposable_only: bool) -> Result<Vec<GcRow>>;
     /// Re-checks that no live generation and no open upload references
     /// the extent; applies catalogue-only actions.
