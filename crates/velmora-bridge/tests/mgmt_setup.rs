@@ -540,6 +540,7 @@ async fn an_open_gate_stays_open_and_keeps_pending_ops() {
     let epoch = close(&ports.records, &dir, "first_rebuild", NOW)
         .await
         .unwrap();
+    assert_eq!(epoch, 1);
     assert!(dir.open_gate(epoch, NOW).await.unwrap());
     assert!(is_open(&ports.records, &dir).await.unwrap());
     let pending = PendingOp {
@@ -550,17 +551,22 @@ async fn an_open_gate_stays_open_and_keeps_pending_ops() {
         created_at: UnixMs(NOW.0 - 1),
     };
     dir.add_pending(&pending).await.unwrap();
-    let before = dir.gate().await.unwrap();
+    let before = dir.gate_row().await.unwrap();
     let names = ports.records.names();
+    assert_eq!(names, ["m/dg/00000000000000000001"]);
     let puts = ports.records.puts();
+    let steps = dir.sql.inner.write_steps();
 
+    watch_alerts();
     let resp = ports.post(GATE_PATH).await;
     assert_eq!(
         json_response(&resp, 200),
         json!({"gate": "open", "ran": false})
     );
+    assert!(take_alerts().is_empty());
+    assert_eq!(dir.sql.inner.write_steps(), steps);
     assert!(is_open(&ports.records, &dir).await.unwrap());
-    assert_eq!(dir.gate().await.unwrap(), before);
+    assert_eq!(dir.gate_row().await.unwrap(), before);
     assert_eq!(dir.pending_before(NOW, 2).await.unwrap(), [pending]);
     assert_eq!(ports.records.puts(), puts);
     assert_eq!(ports.records.names(), names);
@@ -637,6 +643,26 @@ async fn a_gate_row_closed_at_epoch_two_refuses_first_open_and_alerts() {
     assert_unexpected_epoch_without_writes(&ports).await;
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn a_gate_open_at_epoch_two_refuses_first_open_and_alerts() {
+    let ports = Ports::with_closed_directory();
+    let dir = ports.dir();
+    for epoch in [1, 2] {
+        assert_eq!(
+            close(&ports.records, &dir, "fixture", NOW).await.unwrap(),
+            epoch
+        );
+        assert!(dir.open_gate(epoch, NOW).await.unwrap());
+    }
+    assert_eq!(
+        ports.records.names(),
+        ["m/dg/00000000000000000001", "m/dg/00000000000000000002"]
+    );
+    // Open for normal directory users, but not an idempotent first open.
+    assert!(is_open(&ports.records, &dir).await.unwrap());
+    assert_unexpected_epoch_without_writes(&ports).await;
+}
+
 async fn assert_unexpected_epoch_without_writes(ports: &Ports) {
     let dir = ports.dir();
     let pending = PendingOp {
@@ -648,6 +674,7 @@ async fn assert_unexpected_epoch_without_writes(ports: &Ports) {
     };
     dir.add_pending(&pending).await.unwrap();
     let gate = dir.gate_row().await.unwrap();
+    let open = is_open(&ports.records, &dir).await.unwrap();
     let puts = ports.records.puts();
     let names = ports.records.names();
     let steps = dir.sql.inner.write_steps();
@@ -656,7 +683,7 @@ async fn assert_unexpected_epoch_without_writes(ports: &Ports) {
     assert_eq!(take_alerts().len(), 1);
     assert_eq!(dir.sql.inner.write_steps(), steps);
     assert_eq!(dir.gate_row().await.unwrap(), gate);
-    assert!(!is_open(&ports.records, &dir).await.unwrap());
+    assert_eq!(is_open(&ports.records, &dir).await.unwrap(), open);
     assert_eq!(dir.pending_before(NOW, 2).await.unwrap(), [pending]);
     assert_eq!(ports.records.puts(), puts);
     assert_eq!(ports.records.names(), names);

@@ -7,7 +7,7 @@ use std::pin::Pin;
 use sha2::{Digest, Sha256};
 use tokio::sync::Notify;
 use velmora::rng::FillRandom;
-use velmora_bridge::directory::chain::{TenantChain, TENANT_CHAIN_PREFIX};
+use velmora_bridge::directory::chain::{TenantChain, Written, TENANT_CHAIN_PREFIX};
 use velmora_bridge::directory::first_open::{first_open, FirstOpenAnswer};
 use velmora_bridge::directory::gate::{anchored_epoch, is_open, GATE_ANCHOR_PREFIX};
 use velmora_bridge::directory::record::Tenant;
@@ -28,6 +28,7 @@ const A_NOW: UnixMs = UnixMs(NOW.0 - 2);
 const B_NOW: UnixMs = UnixMs(NOW.0 - 1);
 const A1: &str = "t_00000000000000a1";
 const FIRST_ANCHOR: &str = "m/dg/00000000000000000001";
+const SECOND_ANCHOR: &str = "m/dg/00000000000000000002";
 
 fn block_on<F: Future>(f: F) -> F::Output {
     tokio::runtime::Builder::new_current_thread()
@@ -75,6 +76,22 @@ async fn note(dir: &SqlDirectory<'_, Db>, tenant: &str, kind: &str, created_at: 
 
 async fn seed(store: &HookedRecords, dir: &SqlDirectory<'_, Db>) {
     locations(store, &kek()).await;
+    let chain = TenantChain {
+        store,
+        seal: &PlainSeal::new(),
+    };
+    chain
+        .write(
+            &Tenant::Zero,
+            &Change::CreateTenantZero {
+                jurisdiction: "us".into(),
+            },
+            Actor::Operator,
+            NOW,
+            0,
+        )
+        .await
+        .unwrap();
     note(
         dir,
         "t_00000000000000b2",
@@ -89,7 +106,8 @@ async fn create(store: &HookedRecords, dir: &SqlDirectory<'_, Db>) {
         store,
         seal: &PlainSeal::new(),
     };
-    chain
+    note(dir, A1, "tenant_create", NOW).await;
+    let Written::Wrote(record) = chain
         .write(
             &Tenant::parse(A1).unwrap(),
             &Change::Create {
@@ -105,8 +123,31 @@ async fn create(store: &HookedRecords, dir: &SqlDirectory<'_, Db>) {
             0,
         )
         .await
-        .unwrap();
-    note(dir, A1, "tenant_create", NOW).await;
+        .unwrap()
+    else {
+        panic!("expected a new tenant head");
+    };
+    // The finisher projects the door, including its unit rows; it does not
+    // create a key route for a tenant create.
+    dir.apply_tenant(&record.door, NOW).await.unwrap();
+}
+
+// Model a route and label written by ordinary activity after a tenant
+// exists (not by tenant create itself).
+async fn add_route_and_label(db: &Db) {
+    let tenant = SqlValue::Text(A1.into());
+    db.exec(
+        "INSERT INTO key_routes (akid, tenant, kind, created_at) VALUES ('AKIA1', ?1, 's3', ?2)",
+        &[tenant.clone(), SqlValue::Int(NOW.0)],
+    )
+    .await
+    .unwrap();
+    db.exec(
+        "INSERT INTO bucket_index (label, tenant, bucket_id) VALUES ('fixture-bucket', ?1, 'b_1')",
+        &[tenant],
+    )
+    .await
+    .unwrap();
 }
 
 fn create_pending_row() -> Row {
@@ -125,6 +166,8 @@ enum StopAt {
     OpenGate,
     FirstWrite,
     TenantCheck,
+    TenantZeroRowSeq,
+    AnchorList,
     Io(usize),
 }
 
@@ -134,6 +177,8 @@ enum Io {
     Write,
     OpenGate,
     TenantCheck,
+    TenantZeroRowSeq,
+    AnchorList,
 }
 
 /// One stop shared by the two adapters of one attempt, not by both attempts.
@@ -167,6 +212,8 @@ impl Pause {
             StopAt::OpenGate => io == Io::OpenGate,
             StopAt::FirstWrite => matches!(io, Io::Write | Io::OpenGate),
             StopAt::TenantCheck => io == Io::TenantCheck,
+            StopAt::TenantZeroRowSeq => io == Io::TenantZeroRowSeq,
+            StopAt::AnchorList => io == Io::AnchorList,
             StopAt::Io(k) => call == k,
         };
         if stop {
@@ -207,10 +254,10 @@ impl RecordStore for PausedRecords<'_> {
     }
 
     async fn list(&self, prefix: &str, start_after: &str, limit: u32) -> Result<Vec<String>> {
-        let io = if prefix == TENANT_CHAIN_PREFIX {
-            Io::TenantCheck
-        } else {
-            Io::Other
+        let io = match prefix {
+            TENANT_CHAIN_PREFIX => Io::TenantCheck,
+            GATE_ANCHOR_PREFIX => Io::AnchorList,
+            _ => Io::Other,
         };
         self.pause.before(io).await;
         self.records.list(prefix, start_after, limit).await
@@ -229,7 +276,16 @@ struct PausedSql<'a> {
 
 impl Sql for PausedSql<'_> {
     async fn query(&self, sql: &str, params: &[SqlValue]) -> Result<Vec<Row>> {
-        self.pause.before(Io::Other).await;
+        let io = match params {
+            [SqlValue::Text(tenant)]
+                if sql.starts_with("SELECT record_seq FROM tenants")
+                    && tenant == Tenant::Zero.as_str() =>
+            {
+                Io::TenantZeroRowSeq
+            }
+            _ => Io::Other,
+        };
+        self.pause.before(io).await;
         self.db.query(sql, params).await
     }
 
@@ -275,10 +331,42 @@ async fn attempt(
 }
 
 #[derive(Debug, PartialEq, Eq)]
+struct TenantTables {
+    tenants: Vec<Row>,
+    units: Vec<Row>,
+    key_routes: Vec<Row>,
+    bucket_index: Vec<Row>,
+}
+
+impl TenantTables {
+    async fn read(db: &Db) -> Self {
+        Self {
+            tenants: db
+                .query("SELECT * FROM tenants ORDER BY id", &[])
+                .await
+                .unwrap(),
+            units: db
+                .query("SELECT * FROM units ORDER BY tenant, unit", &[])
+                .await
+                .unwrap(),
+            key_routes: db
+                .query("SELECT * FROM key_routes ORDER BY akid", &[])
+                .await
+                .unwrap(),
+            bucket_index: db
+                .query("SELECT * FROM bucket_index ORDER BY label", &[])
+                .await
+                .unwrap(),
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
 struct Snapshot {
     gate: Vec<Row>,
     pending: Vec<Row>,
     anchors: Vec<String>,
+    tenant_tables: TenantTables,
 }
 
 impl Snapshot {
@@ -303,6 +391,7 @@ impl Snapshot {
                 .into_iter()
                 .filter(|key| key.starts_with(GATE_ANCHOR_PREFIX))
                 .collect(),
+            tenant_tables: TenantTables::read(db).await,
         }
     }
 }
@@ -341,6 +430,7 @@ fn a_losing_first_open_never_closes_an_open_gate_or_empties_pending() {
         let a_answer = a.await;
         assert!(gate_open_at_one(&store, &dir).await, "A={a_answer:?}");
         create(&store, &dir).await;
+        add_route_and_label(&db).await;
         let before = Snapshot::read(&db, &store).await;
         assert_eq!(before.anchors, [FIRST_ANCHOR]);
         assert_eq!(before.pending, [create_pending_row()]);
@@ -349,9 +439,7 @@ fn a_losing_first_open_never_closes_an_open_gate_or_empties_pending() {
         assert_eq!(b.await.unwrap(), FirstOpenAnswer::AlreadyOpen);
 
         let after = Snapshot::read(&db, &store).await;
-        assert_eq!(after.anchors, [FIRST_ANCHOR], "B added a gate anchor");
-        assert_eq!(after.pending, before.pending, "B changed pending_ops");
-        assert_eq!(after.gate, before.gate, "B changed the open gate row");
+        assert_eq!(after, before, "B changed the open directory");
         assert!(gate_open_at_one(&store, &dir).await);
     });
 }
@@ -382,6 +470,7 @@ fn check_every_await_point(paused: &str, paused_now: UnixMs, other_now: UnixMs) 
             let other_answer = attempt(&store, &db, &Pause::new(StopAt::Never), other_now).await;
             let before = if is_open(&store, &dir).await.unwrap() {
                 create(&store, &dir).await;
+                add_route_and_label(&db).await;
                 Some(Snapshot::read(&db, &store).await)
             } else {
                 None
@@ -410,10 +499,14 @@ fn check_every_await_point(paused: &str, paused_now: UnixMs, other_now: UnixMs) 
             if let Some(before) = before {
                 if !after.pending.contains(&create_pending_row()) || after.pending != before.pending
                 {
-                    problems.push("the create's pending row was lost or A changed pending_ops");
+                    problems
+                        .push("the create's pending row was lost or the loser changed pending_ops");
                 }
                 if after.gate != before.gate {
-                    problems.push("A changed the open gate row after the create");
+                    problems.push("the loser changed the open gate row after the create");
+                }
+                if after.tenant_tables != before.tenant_tables {
+                    problems.push("the loser changed tenants, units, key_routes, or bucket_index");
                 }
             }
             if !problems.is_empty() {
@@ -507,15 +600,126 @@ fn a_call_at_its_tenant_check_recognizes_an_open_and_create_since_its_reads() {
 }
 
 #[test]
+fn a_loser_paused_before_tenant_zero_row_seq_does_not_rewrite_it() {
+    block_on(async {
+        let db = database();
+        let store = HookedRecords::new();
+        let dir = SqlDirectory { sql: &db };
+        seed(&store, &dir).await;
+
+        // A passed the tenant-step fence and found a missing tenant 0 row.
+        let pause = Pause::new(StopAt::TenantZeroRowSeq);
+        let mut a = std::pin::pin!(attempt(&store, &db, &pause, A_NOW));
+        if let Some(answer) = pause.wait_or_finish(a.as_mut()).await {
+            panic!("A completed before the pause: {answer:?}");
+        }
+        assert!(dir.gate().await.unwrap().closed);
+        assert!(dir.tenant(&Tenant::Zero).await.unwrap().is_none());
+
+        let b = attempt(&store, &db, &Pause::new(StopAt::Never), B_NOW)
+            .await
+            .unwrap();
+        assert!(matches!(b, FirstOpenAnswer::Ran(run) if run.opened && run.epoch == 1));
+        let before = TenantTables::read(&db).await;
+        assert_eq!(before.tenants.len(), 1);
+        let read_updated_at = || async {
+            db.query("SELECT updated_at FROM tenants", &[])
+                .await
+                .unwrap()
+        };
+        let updated_at = read_updated_at().await;
+        assert_eq!(updated_at, [vec![SqlValue::Int(B_NOW.0)]]);
+
+        pause.release.notify_one();
+        assert_eq!(a.await.unwrap(), FirstOpenAnswer::AlreadyOpen);
+        assert_eq!(
+            read_updated_at().await,
+            updated_at,
+            "A rewrote tenant 0's updated_at"
+        );
+        assert_eq!(TenantTables::read(&db).await, before);
+    });
+}
+
+#[test]
+fn first_open_removes_an_orphan_managed_tenant_and_its_dependents() {
+    block_on(async {
+        let db = database();
+        let store = HookedRecords::new();
+        let dir = SqlDirectory { sql: &db };
+        locations(&store, &kek()).await;
+        // Only the directory projection survives; the live record store
+        // never contains the managed tenant's chain.
+        create(&HookedRecords::new(), &dir).await;
+        add_route_and_label(&db).await;
+        let before = TenantTables::read(&db).await;
+        assert_eq!(before.tenants.len(), 1);
+        assert_eq!(before.units.len(), 1);
+        assert_eq!(before.key_routes.len(), 1);
+        assert_eq!(before.bucket_index.len(), 1);
+        assert_eq!(dir.gate_row().await.unwrap(), None);
+
+        let answer = attempt(&store, &db, &Pause::new(StopAt::Never), NOW)
+            .await
+            .unwrap();
+        assert!(
+            matches!(&answer, FirstOpenAnswer::Ran(run) if run.opened && run.epoch == 1 && run.tenants.removed == 1),
+            "{answer:?}"
+        );
+        let after = TenantTables::read(&db).await;
+        assert!(after.tenants.is_empty(), "{after:?}");
+        assert!(after.units.is_empty(), "{after:?}");
+        assert!(after.key_routes.is_empty(), "{after:?}");
+        assert!(after.bucket_index.is_empty(), "{after:?}");
+        assert!(gate_open_at_one(&store, &dir).await);
+    });
+}
+
+#[test]
+fn a_lost_open_cas_reports_moved_if_a_second_anchor_appears() {
+    block_on(async {
+        let db = database();
+        let store = HookedRecords::new();
+        let dir = SqlDirectory { sql: &db };
+        seed(&store, &dir).await;
+
+        let pause = Pause::new(StopAt::OpenGate);
+        let mut a = std::pin::pin!(attempt(&store, &db, &pause, A_NOW));
+        if let Some(answer) = pause.wait_or_finish(a.as_mut()).await {
+            panic!("A completed before the pause: {answer:?}");
+        }
+        let b = attempt(&store, &db, &Pause::new(StopAt::Never), B_NOW)
+            .await
+            .unwrap();
+        assert!(matches!(b, FirstOpenAnswer::Ran(run) if run.opened && run.epoch == 1));
+        let before = Snapshot::read(&db, &store).await;
+        assert_eq!(before.anchors, [FIRST_ANCHOR]);
+
+        // A loses the CAS, reads B's open-at-one row, then reaches the
+        // anchor listing in open_at_one. Insert anchor 2 at that boundary.
+        pause.stop_at.set(StopAt::AnchorList);
+        pause.release.notify_one();
+        if let Some(answer) = pause.wait_or_finish(a.as_mut()).await {
+            panic!("A completed before the pause: {answer:?}");
+        }
+        store.plant(SECOND_ANCHOR, vec![1]);
+        pause.release.notify_one();
+        assert_eq!(a.await.unwrap(), FirstOpenAnswer::Moved);
+        let mut expected = before;
+        expected.anchors.push(SECOND_ANCHOR.into());
+        assert_eq!(Snapshot::read(&db, &store).await, expected);
+    });
+}
+
+#[test]
 fn invalid_first_open_epochs_and_anchors_are_left_untouched() {
-    const SECOND: &str = "m/dg/00000000000000000002";
     block_on(async {
         for (row, anchors) in [
             (Some((1, 1)), &[][..]),
             (Some((1, 2)), &[FIRST_ANCHOR][..]),
             (Some((0, 2)), &[FIRST_ANCHOR][..]),
-            (None, &[SECOND][..]),
-            (Some((0, 1)), &[FIRST_ANCHOR, SECOND][..]),
+            (None, &[SECOND_ANCHOR][..]),
+            (Some((0, 1)), &[FIRST_ANCHOR, SECOND_ANCHOR][..]),
             (Some((1, 1)), &["m/dg/0", FIRST_ANCHOR][..]),
             (Some((1, 1)), &[FIRST_ANCHOR, "m/dg/z"][..]),
             (Some((0, 1)), &[][..]),
