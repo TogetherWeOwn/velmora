@@ -250,6 +250,17 @@ impl std::fmt::Debug for Grant {
     }
 }
 
+/// Whether a record's `closes` fits its change: a create, a re-enable
+/// and a restate open nothing closed; a disable or a revoke closes; a
+/// grants change is classed by the writer from the head.
+fn closes_fits(op: KeyOp, status: SubjectStatus, closes: bool) -> bool {
+    match op {
+        KeyOp::Create | KeyOp::Restate => !closes,
+        KeyOp::Status => closes == (status != SubjectStatus::Active),
+        KeyOp::Grants => true,
+    }
+}
+
 /// The rules of a subject's state, for a reader that builds an entry from
 /// something other than a record (a checkpoint).
 pub(super) fn check_entry(
@@ -417,7 +428,7 @@ pub fn seal_key_record<K: Kek, T: TkRing, R: FillRandom>(
 ) -> Result<Vec<u8>> {
     check_subject(tenant, door, private)?;
     let closing_status = op == KeyOp::Status && door.status != SubjectStatus::Active && closes;
-    if private.is_none() && !closing_status {
+    if (private.is_none() && !closing_status) || !closes_fits(op, door.status, closes) {
         return Err(ERR_KEY_RECORD);
     }
     let tk = ring
@@ -484,6 +495,9 @@ pub fn open_key_record<K: Kek, T: TkRing>(
     // A record without a private part must be a closing status change.
     let closing_status = door.op == KeyOp::Status && door.subject.status != SubjectStatus::Active;
     if door.private_unchanged && (!closing_status || !door.closes) {
+        return Err(ERR_KEY_RECORD);
+    }
+    if !closes_fits(door.op, door.subject.status, door.closes) {
         return Err(ERR_KEY_RECORD);
     }
     let private = match door.private_unchanged {
@@ -664,6 +678,14 @@ impl KeyTable {
     pub fn apply(&mut self, record: &KeyRecord) -> Result<()> {
         if record.seq != self.seq + 1 {
             return Err(ERR_KEY_RECORD);
+        }
+        // A restate moves a private part to a newer key version, never
+        // back: an older one may be retired.
+        if record.op == KeyOp::Restate {
+            let before = self.subjects.get(&record.door.id).ok_or(ERR_KEY_RECORD)?;
+            if record.private_unchanged || record.tk_version <= before.tk_version {
+                return Err(ERR_KEY_RECORD);
+            }
         }
         self.admits(record.op, &record.door, record.private.as_ref())
             .map_err(|_| ERR_KEY_RECORD)?;

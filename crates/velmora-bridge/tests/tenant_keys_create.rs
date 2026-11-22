@@ -1418,3 +1418,41 @@ fn the_restore_check_opens_bucket_copies_under_a_newer_kek() {
     assert!(checks.contains(&("open", true)), "{checks:?}");
     assert!(checks.contains(&("key_buckets", true)), "{checks:?}");
 }
+
+/// A creation run counts a location only once its copy opens: a damaged
+/// replica that carries the right check value voids the version.
+#[tokio::test(flavor = "current_thread")]
+async fn a_damaged_replica_is_not_counted_as_a_copy() {
+    let set = two_in_account();
+    // The blob this run will make, learnt from a run with the same seed.
+    let probe = World::new();
+    create_key_version(
+        &set,
+        &probe.buckets(),
+        &probe.claims,
+        &probe.kek,
+        &probe.t,
+        0,
+        &mut TestRng(160),
+    )
+    .await
+    .unwrap();
+    let name = tk_blob_name(&probe.t, 1, 1);
+    let mut rotten = probe.a.raw(&name).unwrap();
+    let last = rotten.len() - 1;
+    rotten[last] ^= 1;
+    let w = World::new();
+    w.b.plant(&name, rotten);
+    let created = create_key_version(
+        &set,
+        &w.buckets(),
+        &w.claims,
+        &w.kek,
+        &w.t,
+        0,
+        &mut TestRng(160),
+    )
+    .await
+    .unwrap();
+    assert!(created.voided.contains(&1), "{:?}", created.voided);
+}

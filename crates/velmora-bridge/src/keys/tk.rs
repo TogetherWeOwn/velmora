@@ -280,10 +280,12 @@ async fn adopt_in_arbiter<S: RecordStore, K: Kek, R: FillRandom>(
 }
 
 /// Copies `bytes` to `store` under `name`, and checks that every copy of
-/// version `m` there has the same check value. `Ok(false)`: they
-/// disagree. A marker in the location stops it before the put.
-async fn copy_to<S: RecordStore>(
+/// version `m` there has the same check value, and that the copy under
+/// `name` opens as that key. `Ok(false)`: they disagree. A marker in the
+/// location stops it before the put.
+async fn copy_to<S: RecordStore, K: Kek>(
     store: &S,
+    kek: &K,
     tenant: &TenantId,
     m: u32,
     name: &str,
@@ -298,12 +300,19 @@ async fn copy_to<S: RecordStore>(
             return Err(e);
         }
     }
-    for (other, n, _) in list_tenant_blobs(store, tenant).await? {
+    for (other, n, v) in list_tenant_blobs(store, tenant).await? {
         if n != m {
             continue;
         }
         let there = store.get(&other).await?.ok_or(ERR_TK_MISSING)?;
         if tk_blob_check_value(&there)? != kcv {
+            return Ok(false);
+        }
+        // The copy this location counts with: it must open as the key,
+        // not only carry its check value.
+        let opens = there == bytes
+            || unwrap_tenant_key(kek, v, tenant, m, &there).is_ok_and(|k| k.check_value() == kcv);
+        if other == name && !opens {
             return Ok(false);
         }
     }
@@ -356,7 +365,7 @@ where
         if let Some((name, bytes, _)) = &adopted {
             for location in set.synchronous_copies() {
                 let store = buckets.get(location)?;
-                if !copy_to(store, tenant, m, name, bytes).await? {
+                if !copy_to(store, kek, tenant, m, name, bytes).await? {
                     agree = false;
                     break;
                 }
@@ -416,6 +425,9 @@ where
 #[derive(Default)]
 pub struct TkCache {
     keys: RefCell<BTreeMap<(TenantId, u32), Cached>>,
+    /// Bumped by every `forget` of a tenant: a load that overlapped one
+    /// is not cached.
+    forgotten: RefCell<BTreeMap<TenantId, u64>>,
 }
 
 /// A key and the time it was loaded.
@@ -429,6 +441,15 @@ impl TkCache {
     /// Drops every key of `tenant` (a shred, a refused load).
     pub fn forget(&self, tenant: &TenantId) {
         self.keys.borrow_mut().retain(|(t, _), _| t != tenant);
+        *self
+            .forgotten
+            .borrow_mut()
+            .entry(tenant.clone())
+            .or_default() += 1;
+    }
+
+    fn generation(&self, tenant: &TenantId) -> u64 {
+        self.forgotten.borrow().get(tenant).copied().unwrap_or(0)
     }
 
     /// How many keys are held (tests).
@@ -466,7 +487,11 @@ impl TkCache {
             }
         }
         self.keys.borrow_mut().remove(&id);
+        let generation = self.generation(tenant);
         match load_pinned(set, buckets, kek, tenant, version, pinned).await {
+            // Another load refused the tenant while this one read: its
+            // answer wins.
+            Ok(_) if self.generation(tenant) != generation => Err(ERR_TK_FOREIGN),
             Ok((key, _)) => {
                 let key = Rc::new(key);
                 self.keys.borrow_mut().insert(id, (key.clone(), now));
@@ -497,10 +522,23 @@ async fn load_pinned<S: RecordStore, K: Kek>(
     pinned: [u8; KCV_LEN],
 ) -> Result<(TenantKey, u32)> {
     let mut last_err = ERR_TK_MISSING;
-    for location in set.synchronous() {
+    let synchronous = set.synchronous();
+    for (i, location) in synchronous.iter().enumerate() {
         let store = buckets.get(location)?;
         match load_from(store, kek, tenant, version, pinned).await {
-            Ok(Some(found)) => return Ok(found),
+            Ok(Some(found)) => {
+                // A marker or a foreign name in any other synchronous
+                // location refuses the tenant too; other failures there
+                // do not stop a key that opened.
+                for other in synchronous.iter().skip(i + 1) {
+                    if let Err(e) = list_tenant_blobs(buckets.get(other)?, tenant).await {
+                        if is_foreign(&e) {
+                            return Err(e);
+                        }
+                    }
+                }
+                return Ok(found);
+            }
             Ok(None) => {}
             Err(e) if is_foreign(&e) => return Err(e),
             Err(e) => last_err = e,
@@ -527,8 +565,14 @@ async fn load_from<S: RecordStore, K: Kek>(
         if n != version {
             continue;
         }
-        let Some(bytes) = store.get(&name).await? else {
-            continue;
+        let bytes = match store.get(&name).await {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => continue,
+            // A failed read: the other copies are still tried.
+            Err(e) => {
+                damaged = Some(e);
+                continue;
+            }
         };
         match tk_blob_check_value(&bytes) {
             Ok(kcv) => copies.push((kcv, v, bytes)),

@@ -366,3 +366,30 @@ fn restore_check_rejects_duplicate_bucket_labels() {
         );
     }
 }
+
+/// A key that opens in the arbiter is refused when the other
+/// synchronous location holds a shred marker.
+#[tokio::test(flavor = "current_thread")]
+async fn a_marker_in_the_other_location_refuses_a_key_that_opens() {
+    let (tenant, set, kek) = (tenant(), two_in_account(), kek(1));
+    let (a, b) = (MemRecords::new(), MemRecords::new());
+    let committed = key(&tenant, 1, "committed");
+    let mut rng = TestRng::default();
+    let (name, blob) = wrapped(&kek, &committed, &mut rng);
+    a.plant(&name, blob);
+    b.plant(&marker(&tenant), vec![]);
+    let clock = velmora_bridge::testkit::FixedClock::new(velmora_bridge::UnixMs(1_700_000_000_000));
+    let error = TkCache::default()
+        .load(
+            &set,
+            &buckets(&a, &b),
+            &kek,
+            &clock,
+            &tenant,
+            1,
+            committed.check_value(),
+        )
+        .await
+        .unwrap_err();
+    assert!(is_foreign(&error), "{error:?}");
+}

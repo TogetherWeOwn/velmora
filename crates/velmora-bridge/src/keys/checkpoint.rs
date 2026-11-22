@@ -318,10 +318,14 @@ pub async fn read_key_chain<S: RecordStore, K: Kek, T: TkRing>(
         let mut table = match candidate {
             None => KeyTable::empty(tenant.clone()),
             Some(seq) => {
-                let (Some(bytes), Some(record)) = (
-                    store.get(&checkpoint_name(tenant, seq)).await?,
-                    store.get(&chain.name(seq)).await?,
-                ) else {
+                // A checkpoint that cannot be read is skipped: the chain
+                // decides. The chain record itself must be readable.
+                let checkpoint = store
+                    .get(&checkpoint_name(tenant, seq))
+                    .await
+                    .unwrap_or_default();
+                let (Some(bytes), Some(record)) = (checkpoint, store.get(&chain.name(seq)).await?)
+                else {
                     skipped.push(seq);
                     continue;
                 };

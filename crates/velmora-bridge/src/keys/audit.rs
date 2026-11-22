@@ -288,18 +288,32 @@ pub async fn repair_missing<S: RecordStore, K: Kek>(
     kek: &K,
     report: &AuditReport,
 ) -> Result<Repair> {
-    let doubtful = |name: &str, tenant: &TenantId, n: u32| {
-        report.findings.iter().any(|f| match f {
+    // The blockers, indexed once: by name, by tenant and version, by
+    // tenant directory.
+    let mut bad_names: BTreeSet<&str> = BTreeSet::new();
+    let mut bad_versions: BTreeSet<(&str, u32)> = BTreeSet::new();
+    let mut bad_dirs: BTreeSet<Option<&str>> = BTreeSet::new();
+    for f in &report.findings {
+        match f {
             Finding::Mismatch { name: m }
             | Finding::Unopenable { name: m, .. }
             | Finding::NoKek { name: m, .. }
-            | Finding::Inactive { name: m, .. } => m == name,
-            Finding::VersionMismatch { tenant: t, version } => {
-                t == tenant.as_str() && *version == n
+            | Finding::Inactive { name: m, .. } => {
+                bad_names.insert(m.as_str());
             }
-            Finding::Foreign { name: m, .. } => tenant_of(m) == tenant_of(name),
-            Finding::Missing { .. } => false,
-        })
+            Finding::VersionMismatch { tenant: t, version } => {
+                bad_versions.insert((t.as_str(), *version));
+            }
+            Finding::Foreign { name: m, .. } => {
+                bad_dirs.insert(tenant_of(m));
+            }
+            Finding::Missing { .. } => {}
+        }
+    }
+    let doubtful = |name: &str, tenant: &TenantId, n: u32| {
+        bad_names.contains(name)
+            || bad_versions.contains(&(tenant.as_str(), n))
+            || bad_dirs.contains(&tenant_of(name))
     };
     let active = set.active();
     let mut out = Repair::default();
@@ -356,8 +370,17 @@ pub async fn repair_missing<S: RecordStore, K: Kek>(
             continue;
         };
         let store = buckets.get(target)?;
-        if store.put_if_absent(name, bytes).await? {
-            out.restored.push((location.clone(), name.clone()));
+        match store.put_if_absent(name, bytes.clone()).await {
+            Ok(true) => out.restored.push((location.clone(), name.clone())),
+            Ok(false) => {}
+            // A lost answer: the copy may be there; the marker check
+            // below runs either way.
+            Err(e) => match store.get(name).await? {
+                Some(there) if there == bytes => {
+                    out.restored.push((location.clone(), name.clone()))
+                }
+                _ => return Err(e),
+            },
         }
         // A writer always loses to the marker: one that appeared during
         // the write is an alarm.

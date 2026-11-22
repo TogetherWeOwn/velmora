@@ -321,7 +321,18 @@ pub async fn restore_escrow<S: RecordStore, K: Kek>(
             RestoreStep::Restored if stop => RestoreStep::Withheld,
             RestoreStep::Restored => {
                 let store = buckets.get(location)?;
-                let step = if store.put_if_absent(&name, blob.clone()).await? {
+                // A marker that landed since the decision stops the write.
+                list_tenant_blobs(store, &copy.tenant).await?;
+                let put = match store.put_if_absent(&name, blob.clone()).await {
+                    Ok(stored) => stored,
+                    // A lost answer: the exact bytes there count as ours.
+                    Err(e) => match store.get(&name).await? {
+                        Some(there) if there == blob => true,
+                        Some(_) => false,
+                        None => return Err(e),
+                    },
+                };
+                let step = if put {
                     RestoreStep::Restored
                 } else {
                     // Someone put it in between: read it back.

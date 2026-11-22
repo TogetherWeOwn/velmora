@@ -424,15 +424,13 @@ fn private_unchanged_requires_a_prior_entry() {
                 &mut w.rng,
             )
             .unwrap();
+            // A status change whose `closes` does not fit it is refused,
+            // with or without its private part.
             let opened = open_key_record(&w.kek, &w.ring, &w.tenant, 2, &bytes);
-            if private_unchanged {
-                assert!(matches!(
-                    opened,
-                    Err(BridgeError::Invalid("key record is malformed"))
-                ));
-            } else {
-                assert_eq!(opened.unwrap().private.as_ref(), record.private.as_ref());
-            }
+            assert!(matches!(
+                opened,
+                Err(BridgeError::Invalid("key record is malformed"))
+            ));
         }
     }
 }
@@ -651,4 +649,37 @@ async fn repair_missing_checks_async_location_for_foreign_names() {
         .unwrap();
     assert_eq!(repair.restored, [("KEYS_B".into(), name.clone())]);
     assert_eq!(stores.b.raw(&name), Some(blob));
+}
+
+/// A create or a re-enable sealed as closing is refused, and a restate
+/// that does not move to a newer key version does not fold.
+#[test]
+fn closes_must_fit_the_change_and_restates_move_forward() {
+    let mut w = World::new();
+    let subject = principal(ID, &[]);
+    // A create sealed as closing.
+    assert!(seal_key_record(
+        &w.kek,
+        &w.ring,
+        &w.tenant,
+        1,
+        KeyOp::Create,
+        11,
+        &subject.door,
+        Some(&subject.private),
+        true,
+        &mut w.rng,
+    )
+    .is_err());
+    // A restate under the same key version.
+    let bytes = w.record(1, KeyOp::Create, &subject, false);
+    let create = open_key_record(&w.kek, &w.ring, &w.tenant, 1, &bytes).unwrap();
+    let mut table = KeyTable::empty(w.tenant.clone());
+    table.apply(&create).unwrap();
+    let mut restate = create.clone();
+    restate.seq = 2;
+    restate.op = KeyOp::Restate;
+    assert!(table.apply(&restate).is_err());
+    restate.tk_version = 2;
+    table.apply(&restate).unwrap();
 }

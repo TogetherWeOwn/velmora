@@ -504,14 +504,16 @@ where
         rng: &mut R,
     ) -> Result<KeyAnswer> {
         let chain = key_chain(self.tenant);
-        let mut revoked: BTreeSet<String> = list_tenant_revocations(self.store, self.tenant)
-            .await?
-            .into_iter()
-            .collect();
         let mut puts = 0;
         let mut caught_up = false;
         let mut caught_up_in_full = false;
         while puts < MAX_PUTS {
+            // Read for every attempt: a retry validates against the
+            // revocations as they are now.
+            let mut revoked: BTreeSet<String> = list_tenant_revocations(self.store, self.tenant)
+                .await?
+                .into_iter()
+                .collect();
             advance(self.store, self.kek, self.ring, &chain, table).await?;
             // A cached table opens what this ring can open now.
             reopen_closed(self.store, self.kek, self.ring, &chain, table).await?;
