@@ -168,7 +168,7 @@ fn active_store(kek: &TestKek) -> HookedRecords {
     let store = HookedRecords::new();
     let keys = SealKeys::new();
     let key = tk(1, 1, TK_1);
-    keys.hold(key.clone(), NOW).unwrap();
+    keys.hold(key.clone(), NOW, NOW).unwrap();
     let clock = clock();
     let seal = ChainSeal::new(kek, &keys, &clock, TestRng::new("fixture"));
     block_on(active(
@@ -205,7 +205,7 @@ fn a_managed_tenant_round_trips_from_its_first_record_to_active() {
     let kek = kek();
     let store = active_store(&kek);
     let keys = SealKeys::new();
-    keys.hold(tk(1, 1, TK_1), NOW).unwrap();
+    keys.hold(tk(1, 1, TK_1), NOW, NOW).unwrap();
     let clock = clock();
     let seal = ChainSeal::new(&kek, &keys, &clock, TestRng::new("r"));
     let chain = TenantChain {
@@ -263,13 +263,13 @@ fn a_version_not_held_asks_for_a_load_and_the_door_names_what_to_load() {
             .collect();
         assert_eq!(door.key_checks.get(&1), Some(&kcv));
         // Loaded: the head reads.
-        keys.hold(key.clone(), NOW).unwrap();
+        keys.hold(key.clone(), NOW, NOW).unwrap();
         assert!(keys.holds(&id(1), 1, &key.check_value(), NOW));
         let head = chain.head(&t(1), 0).await.unwrap().unwrap();
         assert_eq!(head.door.state(), TenantState::Active);
         // Another tenant's key of the same version is not this one's.
         let other = SealKeys::new();
-        other.hold(tk(2, 1, TK_1), NOW).unwrap();
+        other.hold(tk(2, 1, TK_1), NOW, NOW).unwrap();
         let seal = ChainSeal::new(&kek, &other, &clock, TestRng::new("o"));
         let name = record_key(&t(1), 4);
         let e = seal.open(&name, &t(1), &store.raw(&name).unwrap());
@@ -289,7 +289,7 @@ fn a_key_is_used_only_for_the_check_value_its_record_names() {
     // no other key of the version is tried, and the record is not damage.
     let store = active_store(&kek);
     let keys = SealKeys::new();
-    keys.hold(stray.clone(), NOW).unwrap();
+    keys.hold(stray.clone(), NOW, NOW).unwrap();
     let seal = ChainSeal::new(&kek, &keys, &clock, TestRng::new("r"));
     let name = record_key(&t(1), 4);
     let e = seal.open(&name, &t(1), &store.raw(&name).unwrap());
@@ -315,7 +315,7 @@ fn a_key_is_used_only_for_the_check_value_its_record_names() {
             NOW,
         )
         .await;
-        keys.hold(stray.clone(), NOW).unwrap();
+        keys.hold(stray.clone(), NOW, NOW).unwrap();
         // Only the stray key is held: the commit of `committed` is refused
         // and nothing is put.
         let w = chain
@@ -325,7 +325,7 @@ fn a_key_is_used_only_for_the_check_value_its_record_names() {
         assert_eq!(store.keys().len(), 2);
         // Both held: it is sealed under `committed`, which a pinned reader
         // holds.
-        keys.hold(committed.clone(), NOW).unwrap();
+        keys.hold(committed.clone(), NOW, NOW).unwrap();
         wrote(
             &chain,
             &t(1),
@@ -335,7 +335,7 @@ fn a_key_is_used_only_for_the_check_value_its_record_names() {
         )
         .await;
         let only = SealKeys::new();
-        only.hold(committed.clone(), NOW).unwrap();
+        only.hold(committed.clone(), NOW, NOW).unwrap();
         let reader = ChainSeal::new(&kek, &only, &clock, TestRng::new("p"));
         let name = record_key(&t(1), 3);
         assert!(reader
@@ -350,7 +350,7 @@ fn a_key_is_used_only_for_the_check_value_its_record_names() {
     door.key_checks.clear();
     let door = serde_json::to_vec(&door).unwrap();
     let keys = SealKeys::new();
-    keys.hold(committed.clone(), NOW).unwrap();
+    keys.hold(committed.clone(), NOW, NOW).unwrap();
     let seal = ChainSeal::new(&kek, &keys, &clock, TestRng::new("n"));
     let name = record_key(&t(1), 5);
     let e = seal.seal(&name, &t(1), 1, &door, b"{}").unwrap_err();
@@ -375,7 +375,7 @@ fn a_held_key_expires_with_the_loaders_cache_time() {
     let key = tk(1, 1, TK_1);
     let keys = SealKeys::new();
     let clock = clock();
-    keys.hold(key.clone(), NOW).unwrap();
+    keys.hold(key.clone(), NOW, NOW).unwrap();
     let seal = ChainSeal::new(&kek, &keys, &clock, TestRng::new("r"));
     let name = record_key(&t(1), 4);
     let sealed = store.raw(&name).unwrap();
@@ -394,7 +394,7 @@ fn a_held_key_expires_with_the_loaders_cache_time() {
     assert!(format!("{e:?}").contains("not held"), "{e:?}");
     // A clock that went back does not make a key fresh.
     let keys = SealKeys::new();
-    keys.hold(key.clone(), NOW).unwrap();
+    keys.hold(key.clone(), NOW, NOW).unwrap();
     clock.set(UnixMs(NOW.0 - 1));
     let seal = ChainSeal::new(&kek, &keys, &clock, TestRng::new("b"));
     assert!(matches!(
@@ -408,7 +408,7 @@ fn every_changed_byte_is_refused() {
     let kek = kek();
     let store = active_store(&kek);
     let keys = SealKeys::new();
-    keys.hold(tk(1, 1, TK_1), NOW).unwrap();
+    keys.hold(tk(1, 1, TK_1), NOW, NOW).unwrap();
     let clock = clock();
     let seal = ChainSeal::new(&kek, &keys, &clock, TestRng::new("s"));
     let chain = TenantChain {
@@ -435,8 +435,10 @@ fn every_changed_byte_is_refused() {
             match seal.open(&name, &tenant, &bad) {
                 Err(SealError::Damaged) => {}
                 // The header's KEK version now names one newer than this
-                // Worker's: refused, not read, and may pass.
-                Err(SealError::Failed(_)) if (4..8).contains(&i) => {}
+                // Worker's that a deploy can have (the low byte: 17):
+                // refused, not read, and may pass. A higher byte names one
+                // no deploy can have: damage.
+                Err(SealError::Failed(_)) if i == 7 => {}
                 other => panic!("{name} byte {i}: {:?}", other.map(|_| ())),
             }
         }
@@ -458,8 +460,8 @@ fn a_record_opens_only_under_its_own_name_and_tenant() {
     let kek = kek();
     let keys = SealKeys::new();
     let (a, b) = (tk(1, 1, TK_1), tk(2, 1, "tenant b key 1"));
-    keys.hold(a.clone(), NOW).unwrap();
-    keys.hold(b.clone(), NOW).unwrap();
+    keys.hold(a.clone(), NOW, NOW).unwrap();
+    keys.hold(b.clone(), NOW, NOW).unwrap();
     let clock = clock();
     let seal = ChainSeal::new(&kek, &keys, &clock, TestRng::new("s"));
     let chain = TenantChain {
@@ -514,7 +516,7 @@ fn a_record_of_another_label_or_kind_is_refused() {
     let store = active_store(&kek);
     let keys = SealKeys::new();
     let key = tk(1, 1, TK_1);
-    keys.hold(key.clone(), NOW).unwrap();
+    keys.hold(key.clone(), NOW, NOW).unwrap();
     let clock = clock();
     let seal = ChainSeal::new(&kek, &keys, &clock, TestRng::new("s"));
     let name = record_key(&t(1), 3);
@@ -598,7 +600,7 @@ fn a_door_and_its_key_version_must_agree() {
     let store = active_store(&kek);
     let keys = SealKeys::new();
     let key = tk(1, 1, TK_1);
-    keys.hold(key.clone(), NOW).unwrap();
+    keys.hold(key.clone(), NOW, NOW).unwrap();
     let clock = clock();
     let seal = ChainSeal::new(&kek, &keys, &clock, TestRng::new("s"));
     let keyed_door = door_of(&store, &kek, &t(1), 4);
@@ -671,7 +673,7 @@ fn the_shred_leaves_door_parts_and_a_keyless_stub() {
     let kek = kek();
     let keys = SealKeys::new();
     let key = tk(1, 1, TK_1);
-    keys.hold(key.clone(), NOW).unwrap();
+    keys.hold(key.clone(), NOW, NOW).unwrap();
     let clock = clock();
     let seal = ChainSeal::new(&kek, &keys, &clock, TestRng::new("s"));
     let chain = TenantChain {
@@ -695,13 +697,13 @@ fn the_shred_leaves_door_parts_and_a_keyless_stub() {
         let due = UnixMs(NOW.0 + 7 * DAY);
         // The key is loaded again for the shred job's run.
         clock.set(due);
-        keys.hold(key.clone(), due).unwrap();
+        keys.hold(key.clone(), due, due).unwrap();
         wrote(&chain, &t(1), Change::StartShred, Actor::ShredJob, due).await;
         // The shred destroys version 1.
         keys.gone(&id(1), 1);
         assert!(!keys.holds(&id(1), 1, &key.check_value(), due));
         assert!(
-            keys.hold(key.clone(), due).is_err(),
+            keys.hold(key.clone(), due, due).is_err(),
             "a gone version is not taken back"
         );
         wrote(&chain, &t(1), Change::FinishShred, Actor::ShredJob, due).await;
@@ -801,7 +803,7 @@ fn no_key_byte_reaches_an_error() {
     let store = active_store(&kek);
     let keys = SealKeys::new();
     let key = tk(1, 1, TK_1);
-    keys.hold(key.clone(), NOW).unwrap();
+    keys.hold(key.clone(), NOW, NOW).unwrap();
     let clock = clock();
     let seal = ChainSeal::new(&kek, &keys, &clock, TestRng::new("s"));
     let name = record_key(&t(1), 4);
@@ -816,7 +818,7 @@ fn no_key_byte_reaches_an_error() {
     ];
     let mut texts = vec![format!("{key:?}")];
     let wrong = SealKeys::new();
-    wrong.hold(tk(1, 1, "x"), NOW).unwrap();
+    wrong.hold(tk(1, 1, "x"), NOW, NOW).unwrap();
     let wrong_seal = ChainSeal::new(&kek, &wrong, &clock, TestRng::new("w"));
     texts.push(format!(
         "{:?}",
@@ -896,4 +898,80 @@ fn a_door_reader_reads_heads_without_a_tenant_key_and_writes_nothing() {
         assert!(damaged(doors.open(&record_key(&t(1), 3), &t(1), &sealed)));
         assert!(damaged(doors.open(&record_key(&t(2), 4), &t(2), &sealed)));
     });
+}
+
+/// Confirmation review LOW 2 and 3: a key is dated from its unwrap, a
+/// second hold keeps the first date, and every use drops every expired
+/// key of every tenant.
+#[test]
+fn keys_are_dated_from_their_unwrap_and_dropped_for_every_tenant() {
+    let kek = kek();
+    let store = active_store(&kek);
+    let key = tk(1, 1, TK_1);
+    let name = record_key(&t(1), 4);
+    let sealed = store.raw(&name).unwrap();
+    let clock = clock();
+
+    // Unwrapped 1 ms short of the cache time ago: usable for 1 ms.
+    let keys = SealKeys::new();
+    keys.hold(key.clone(), UnixMs(NOW.0 - TK_CACHE_MS + 1), NOW)
+        .unwrap();
+    let seal = ChainSeal::new(&kek, &keys, &clock, TestRng::new("a"));
+    assert!(seal.open(&name, &t(1), &sealed).is_ok());
+    clock.advance_ms(1);
+    assert!(matches!(
+        seal.open(&name, &t(1), &sealed),
+        Err(SealError::KeyNotHeld { version: 1 })
+    ));
+    // Past its time: not taken.
+    assert!(keys
+        .hold(key.clone(), UnixMs(NOW.0 - TK_CACHE_MS + 1), clock.now())
+        .is_err());
+
+    // A second hold keeps the first date.
+    let clock = FixedClock::new(NOW);
+    let keys = SealKeys::new();
+    keys.hold(key.clone(), NOW, NOW).unwrap();
+    let later = UnixMs(NOW.0 + 30_000);
+    keys.hold(key.clone(), later, later).unwrap();
+    clock.set(UnixMs(NOW.0 + TK_CACHE_MS));
+    assert!(!keys.holds(&id(1), 1, &key.check_value(), clock.now()));
+
+    // Any use drops the expired keys of every tenant.
+    let keys = SealKeys::new();
+    keys.hold(key.clone(), NOW, NOW).unwrap();
+    let b = tk(2, 1, "tenant b key 1");
+    let b_at = UnixMs(NOW.0 + TK_CACHE_MS - 1);
+    keys.hold(b.clone(), b_at, b_at).unwrap();
+    assert_eq!(keys.len(), 2);
+    assert!(keys.holds(&id(2), 1, &b.check_value(), UnixMs(NOW.0 + TK_CACHE_MS)));
+    assert_eq!(keys.len(), 1, "tenant a's key is dropped by tenant b's use");
+}
+
+/// Confirmation review LOW 1: a KEK version no deploy can have is damage.
+#[test]
+fn a_kek_version_no_deploy_can_have_is_damage() {
+    let kek = kek();
+    let store = active_store(&kek);
+    let keys = SealKeys::new();
+    let clock = clock();
+    let seal = ChainSeal::new(&kek, &keys, &clock, TestRng::new("k"));
+    let name = record_key(&t(1), 1);
+    let sealed = store.raw(&name).unwrap();
+    let with_version = |v: u32| {
+        let mut b = sealed.clone();
+        b[4..8].copy_from_slice(&v.to_be_bytes());
+        b
+    };
+    assert!(matches!(
+        seal.open(&name, &t(1), &with_version(2)),
+        Err(SealError::Failed(_))
+    ));
+    assert!(matches!(
+        seal.open(&name, &t(1), &with_version(1024)),
+        Err(SealError::Failed(_))
+    ));
+    for v in [0, 1025, u32::MAX] {
+        assert!(damaged(seal.open(&name, &t(1), &with_version(v))), "{v}");
+    }
 }

@@ -39,9 +39,11 @@
 //! ever sealed under a key that a pinned loader would not give back, and
 //! no other key of the version is ever tried.
 //!
-//! **A key is held for at most [`TK_CACHE_MS`]**, as in the loader's own
-//! cache (the shred's settle time counts on it, ADR §3.3): an older one
-//! is dropped on the next use, and a record under it asks for a load.
+//! **A key is held for at most [`TK_CACHE_MS`] after it was unwrapped**,
+//! as in the loader's own cache, which it is dated from
+//! (`keys::tk::TkCache::loaded_at`; the shred's settle time counts on it,
+//! ADR §3.3). Every use drops every older key, of every tenant, and a
+//! record under a dropped key asks for a load.
 //!
 //! The seal does no I/O ([`ControlSeal`]): the root loads the version a
 //! record asks for and reads again. [`ChainSeal::door`] opens a door part
@@ -63,6 +65,7 @@ use zeroize::Zeroizing;
 
 use super::chain::{seal_version, ControlSeal, OpenedParts, SealError};
 use super::record::{Tenant, TenantDoor, TenantPrivate, RECORD_FORMAT};
+use crate::config::MAX_KEK_VERSION;
 use crate::crypto::scheme2::{
     parse_control, seal_control, ControlOwner, ControlSealer, OpenedControl, PrivateKeyRef,
     TenantKey, KCV_LEN,
@@ -81,6 +84,7 @@ const ERR_PRIVATE_WITHOUT_KEY: BridgeError =
 const ERR_KEK_NOT_HELD: BridgeError =
     BridgeError::Crypto("control record names a KEK version not held yet");
 const ERR_KEY_VERSION_ZERO: BridgeError = BridgeError::Crypto("tenant key version 0 is no key");
+const ERR_KEY_STALE: BridgeError = BridgeError::Crypto("tenant key is past its cache time");
 const ERR_ENCODE: BridgeError = BridgeError::Crypto("empty private part does not encode");
 const ERR_DOOR: BridgeError =
     BridgeError::Crypto("door part is not a record of this tenant at this key version");
@@ -124,13 +128,20 @@ impl SealKeys {
     }
 
     /// Holds `key` as its own tenant's key of its own version and check
-    /// value (the key carries all three), from `now` for at most
-    /// [`TK_CACHE_MS`]. A version marked gone is not taken back: `Err`.
-    pub fn hold(&self, key: Rc<TenantKey>, now: UnixMs) -> Result<()> {
+    /// value (the key carries all three), for at most [`TK_CACHE_MS`]
+    /// after `loaded_at`, the time it was unwrapped
+    /// (`keys::tk::TkCache::loaded_at`). A key already held keeps its
+    /// earlier time. A key whose time has passed is not taken, and a
+    /// version marked gone is not taken back: `Err` for both.
+    pub fn hold(&self, key: Rc<TenantKey>, loaded_at: UnixMs, now: UnixMs) -> Result<()> {
         if key.version() == 0 {
             return Err(ERR_KEY_VERSION_ZERO);
         }
         let mut tenants = self.tenants.borrow_mut();
+        prune(&mut tenants, now);
+        if !fresh(loaded_at, now) {
+            return Err(ERR_KEY_STALE);
+        }
         let held = tenants.entry(key.tenant().clone()).or_default();
         if held.gone.contains(&key.version()) {
             return Err(ERR_KEY_GONE);
@@ -138,7 +149,8 @@ impl SealKeys {
         held.keys
             .entry(key.version())
             .or_default()
-            .insert(key.check_value(), (key, now));
+            .entry(key.check_value())
+            .or_insert((key, loaded_at));
         Ok(())
     }
 
@@ -163,6 +175,19 @@ impl SealKeys {
         }
     }
 
+    /// How many keys are held, of every tenant (tests).
+    pub fn len(&self) -> usize {
+        self.tenants
+            .borrow()
+            .values()
+            .map(|held| held.keys.values().map(BTreeMap::len).sum::<usize>())
+            .sum()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     /// Whether a key of `version` of `tenant` with check value `kcv` is
     /// held and fresh at `now`.
     pub fn holds(&self, tenant: &TenantId, version: u32, kcv: &[u8; KCV_LEN], now: UnixMs) -> bool {
@@ -177,22 +202,31 @@ impl SealKeys {
         now: UnixMs,
     ) -> Version {
         let mut tenants = self.tenants.borrow_mut();
-        let Some(held) = tenants.get_mut(tenant) else {
+        prune(&mut tenants, now);
+        let Some(held) = tenants.get(tenant) else {
             return Version::Unknown;
         };
         if held.gone.contains(&version) {
             return Version::Gone;
         }
-        let Some(keys) = held.keys.get_mut(&version) else {
-            return Version::Unknown;
-        };
-        // No key outlives its time here, whatever it is asked for.
-        keys.retain(|_, (_, at)| fresh(*at, now));
-        match keys.get(kcv) {
+        match held.keys.get(&version).and_then(|keys| keys.get(kcv)) {
             Some((key, _)) => Version::Held(key.clone()),
             None => Version::Unknown,
         }
     }
+}
+
+/// No key outlives its time here, whoever it belongs to: every use drops
+/// every key past [`TK_CACHE_MS`] after its unwrap, of every tenant, as
+/// the loader's cache does.
+fn prune(tenants: &mut BTreeMap<TenantId, Held>, now: UnixMs) {
+    for held in tenants.values_mut() {
+        for keys in held.keys.values_mut() {
+            keys.retain(|_, (_, at)| fresh(*at, now));
+        }
+        held.keys.retain(|_, keys| !keys.is_empty());
+    }
+    tenants.retain(|_, held| !held.keys.is_empty() || !held.gone.is_empty());
 }
 
 /// The tenant chain's seal: the KEK ring, the tenant keys the root
@@ -274,12 +308,13 @@ impl<K: Kek> ControlSeal for DoorSeal<'_, K> {
     }
 }
 
-/// A KEK version this Worker does not hold. Newer than its active one: a
-/// record of a newer deploy, a failure that may pass. Older: a version
-/// this deploy no longer carries, or a changed header byte; either way
-/// the record cannot be read here, which is damage and pages.
+/// A KEK version this Worker does not hold. Newer than its active one,
+/// and one a deploy can have (`config::MAX_KEK_VERSION`): a record of a
+/// newer deploy, a failure that may pass. Any other: a version this
+/// deploy no longer carries, or a changed header byte; either way the
+/// record cannot be read here, which is damage and pages.
 fn kek_not_held<K: Kek>(kek: &K, v: u32) -> SealError {
-    match v > kek.active().0 {
+    match v > kek.active().0 && v <= MAX_KEK_VERSION {
         true => SealError::Failed(ERR_KEK_NOT_HELD),
         false => SealError::Damaged,
     }
@@ -316,8 +351,9 @@ fn empty_private() -> Result<Vec<u8>> {
     .map_err(|_| ERR_ENCODE)
 }
 
-/// The check value a door part names for key version `v`.
-fn committed_check(door: &TenantDoor, v: u32) -> Option<[u8; KCV_LEN]> {
+/// The check value a door part names for key version `v` (`key_checks`,
+/// lowercase hex); `None` when it names none or not in that form.
+pub fn committed_check(door: &TenantDoor, v: u32) -> Option<[u8; KCV_LEN]> {
     let text = door.key_checks.get(&v)?;
     if text.len() != 2 * KCV_LEN {
         return None;
