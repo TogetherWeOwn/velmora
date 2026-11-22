@@ -21,8 +21,8 @@ use velmora_bridge::keys::record::{
     SubjectPrivate, SubjectStatus,
 };
 use velmora_bridge::keys::revocations::tenant_revocation_name;
-use velmora_bridge::keys::store::{MemRecords, RecordStore};
 use velmora_bridge::plan::StoredPlan;
+use velmora_bridge::records::{MemRecords, RecordStore};
 use velmora_bridge::recovery::{GenerationManifest, Tombstone};
 use velmora_bridge::testkit::{MemBlobStore, TestKek};
 use velmora_bridge::{
@@ -35,6 +35,18 @@ const TENANT: &str = "t_00000000000000a1";
 const PRINCIPAL: &str = "PR0001";
 const OWNER: &str = "member";
 const AT: u64 = 10;
+
+/// A ring of one borrowed key.
+struct RefRing<'a>(&'a TenantKey);
+
+impl velmora_bridge::keys::record::TkRing for RefRing<'_> {
+    fn current(&self) -> Option<&TenantKey> {
+        Some(self.0)
+    }
+    fn key(&self, v: u32) -> Option<&TenantKey> {
+        (self.0.version() == v).then_some(self.0)
+    }
+}
 
 fn derived(label: &str) -> [u8; 32] {
     Sha256::digest(label.as_bytes()).into()
@@ -126,7 +138,7 @@ impl Records {
         let mut rng = TestRng::default();
         let bdk = DataKey::from_bytes(derived("bdk"));
         let original = bucket_v1(&kek, 1, &bdk, &mut rng);
-        let moved = moved_bucket(&kek, &tk, &original, PRINCIPAL, &mut rng).unwrap();
+        let moved = moved_bucket(&kek, &tk, &original, PRINCIPAL, None, &mut rng).unwrap();
         let id = GenerationId::new("g_01");
         let (first, ciphertext) = extent(&bdk, &original.id, 1, &mut rng);
         let (second, _) = extent(&bdk, &original.id, 2, &mut rng);
@@ -297,7 +309,7 @@ fn moving_a_bucket_preserves_its_metadata_and_requires_scheme_one() {
     let tk = TenantKey::from_bytes(&t, 2, derived("tk")).unwrap();
     let mut rng = TestRng::default();
     let old = bucket_v1(&kek, 1, &DataKey::from_bytes(derived("bdk")), &mut rng);
-    let moved = moved_bucket(&kek, &tk, &old, PRINCIPAL, &mut rng).unwrap();
+    let moved = moved_bucket(&kek, &tk, &old, PRINCIPAL, None, &mut rng).unwrap();
 
     assert_eq!(moved.id, old.id);
     assert_eq!(moved.name, old.name);
@@ -306,7 +318,7 @@ fn moving_a_bucket_preserves_its_metadata_and_requires_scheme_one() {
     assert_eq!(moved.owner, PRINCIPAL);
     assert_eq!(moved.kek_version, tk.version());
     assert_eq!(moved.bdk_wrapped[0], 0x02);
-    assert!(moved_bucket(&kek, &tk, &moved, PRINCIPAL, &mut rng).is_err());
+    assert!(moved_bucket(&kek, &tk, &moved, PRINCIPAL, None, &mut rng).is_err());
 }
 
 #[test]
@@ -392,11 +404,15 @@ async fn putting_a_sealed_record_distinguishes_retries_from_conflicts() {
     let store = MemRecords::new();
     let first = records.reseal();
     assert_eq!(
-        put_sealed(&store, &records.tk, &first).await.unwrap(),
+        put_sealed(&store, &RefRing(&records.tk), records.tk.tenant(), &first)
+            .await
+            .unwrap(),
         Placed::Written
     );
     assert_eq!(
-        put_sealed(&store, &records.tk, &first).await.unwrap(),
+        put_sealed(&store, &RefRing(&records.tk), records.tk.tenant(), &first)
+            .await
+            .unwrap(),
         Placed::Written
     );
 
@@ -405,16 +421,23 @@ async fn putting_a_sealed_record_distinguishes_retries_from_conflicts() {
     assert_eq!(same.plain, first.plain);
     assert_ne!(same.sealed, first.sealed);
     assert_eq!(
-        put_sealed(&store, &records.tk, &same).await.unwrap(),
+        put_sealed(&store, &RefRing(&records.tk), records.tk.tenant(), &same)
+            .await
+            .unwrap(),
         Placed::Same
     );
 
     records.generation.etag = "\"changed\"".into();
     let different = records.reseal();
     assert_invalid(
-        put_sealed(&store, &records.tk, &different)
-            .await
-            .unwrap_err(),
+        put_sealed(
+            &store,
+            &RefRing(&records.tk),
+            records.tk.tenant(),
+            &different,
+        )
+        .await
+        .unwrap_err(),
         "the target holds something else under this name",
     );
     assert_eq!(store.raw(&first.name), Some(first.sealed));
@@ -450,7 +473,9 @@ async fn counting_records_reports_garbage_and_foreign_records_and_skips_bucket_c
         records.article_plan(),
     ] {
         assert_eq!(
-            put_sealed(&store, &records.tk, &sealed).await.unwrap(),
+            put_sealed(&store, &RefRing(&records.tk), records.tk.tenant(), &sealed)
+                .await
+                .unwrap(),
             Placed::Written
         );
     }
@@ -873,4 +898,178 @@ fn tenant_blob_keys_include_the_tenant_and_extent_ids() {
         tenant_cache_key(tk.tenant(), &id),
         format!("c/{TENANT}/{}", id.as_str())
     );
+}
+
+/// A bucket is re-wrapped once: a resumed run that passes the stored
+/// wrap re-seals the same plaintext; a fresh wrap would not; a wrap of
+/// another bucket key is refused.
+#[tokio::test(flavor = "current_thread")]
+async fn a_resumed_move_reuses_the_stored_bucket_wrap() {
+    let mut records = Records::new();
+    let store = MemRecords::new();
+    let first = records.reseal();
+    assert_eq!(
+        put_sealed(&store, &RefRing(&records.tk), records.tk.tenant(), &first)
+            .await
+            .unwrap(),
+        Placed::Written
+    );
+    let stored = records.moved.bdk_wrapped.clone();
+    let again = moved_bucket(
+        &kek(),
+        &records.tk,
+        &records.original,
+        PRINCIPAL,
+        Some(&stored),
+        &mut records.rng,
+    )
+    .unwrap();
+    assert_eq!(again.bdk_wrapped, stored);
+    records.moved = again;
+    let resumed = records.reseal();
+    assert_eq!(
+        put_sealed(&store, &RefRing(&records.tk), records.tk.tenant(), &resumed)
+            .await
+            .unwrap(),
+        Placed::Same
+    );
+    // A fresh wrap holds the same key, but the record differs.
+    records.moved = moved_bucket(
+        &kek(),
+        &records.tk,
+        &records.original,
+        PRINCIPAL,
+        None,
+        &mut records.rng,
+    )
+    .unwrap();
+    assert_ne!(records.moved.bdk_wrapped, stored);
+    let fresh = records.reseal();
+    assert!(
+        put_sealed(&store, &RefRing(&records.tk), records.tk.tenant(), &fresh)
+            .await
+            .is_err()
+    );
+    // A stored wrap of another bucket key is refused.
+    let other = bucket_v1(
+        &kek(),
+        1,
+        &DataKey::from_bytes(derived("another bdk")),
+        &mut records.rng,
+    );
+    let other_moved = moved_bucket(
+        &kek(),
+        &records.tk,
+        &other,
+        PRINCIPAL,
+        None,
+        &mut records.rng,
+    )
+    .unwrap();
+    assert_invalid(
+        moved_bucket(
+            &kek(),
+            &records.tk,
+            &records.original,
+            PRINCIPAL,
+            Some(&other_moved.bdk_wrapped),
+            &mut records.rng,
+        )
+        .unwrap_err(),
+        "the target holds something else under this name",
+    );
+}
+
+/// A record sealed before a tenant-key rotation is compared under the
+/// version its envelope names.
+#[tokio::test(flavor = "current_thread")]
+async fn a_record_sealed_before_a_key_rotation_compares_as_the_same() {
+    struct Two<'a>(&'a TenantKey, &'a TenantKey);
+    impl velmora_bridge::keys::record::TkRing for Two<'_> {
+        fn current(&self) -> Option<&TenantKey> {
+            Some(self.1)
+        }
+        fn key(&self, v: u32) -> Option<&TenantKey> {
+            [self.0, self.1].into_iter().find(|k| k.version() == v)
+        }
+    }
+    let mut records = Records::new();
+    let store = MemRecords::new();
+    let old = records.tombstone();
+    put_sealed(&store, &RefRing(&records.tk), records.tk.tenant(), &old)
+        .await
+        .unwrap();
+    let tenant = records.tk.tenant().clone();
+    let v2 = TenantKey::from_bytes(&tenant, 2, derived("tk v2")).unwrap();
+    let tombstone = Tombstone {
+        v: 1,
+        id: "g_deleted".into(),
+        bucket_id: records.moved.id.as_str().into(),
+        key: "deleted-object".into(),
+        deleted_at: 2,
+    };
+    let new = reseal_tombstone(&v2, &tombstone, &mut records.rng).unwrap();
+    assert_eq!(new.plain, old.plain);
+    assert_eq!(
+        put_sealed(&store, &Two(&records.tk, &v2), &tenant, &new)
+            .await
+            .unwrap(),
+        Placed::Same
+    );
+    assert!(put_sealed(&store, &RefRing(&v2), &tenant, &new)
+        .await
+        .is_err());
+}
+
+/// A resumed key move refuses a key whose owner differs.
+#[tokio::test(flavor = "current_thread")]
+async fn repeating_a_key_move_for_another_owner_reports_a_conflict() {
+    let mut fixture = FrozenKeys::new().await;
+    fixture.write(PRINCIPAL).await.unwrap();
+    assert_invalid(
+        write_moved_keys(
+            &fixture.store,
+            &fixture.kek,
+            &fixture.ring,
+            fixture.ring.0.tenant(),
+            PRINCIPAL,
+            "another-member",
+            &fixture.buckets,
+            &fixture.keys,
+            AT,
+            &mut fixture.rng,
+        )
+        .await
+        .unwrap_err(),
+        "the target holds something else under this name",
+    );
+}
+
+/// A bad key anywhere in the input stops the move before any record.
+#[tokio::test(flavor = "current_thread")]
+async fn a_bad_last_key_writes_nothing() {
+    let mut fixture = FrozenKeys::new().await;
+    fixture.keys[3].grants[0].0 = "b_09".into();
+    assert_invalid(
+        fixture.write(PRINCIPAL).await.unwrap_err(),
+        "move input is not valid",
+    );
+    let chain = key_chain(fixture.ring.0.tenant());
+    assert_eq!(chain.head(&fixture.store, 0).await.unwrap(), 1);
+}
+
+/// A revoked key's revocation is written before its create record.
+#[tokio::test(flavor = "current_thread")]
+async fn a_revoked_key_is_revoked_before_it_is_created() {
+    let mut fixture = FrozenKeys::new().await;
+    let all = std::mem::take(&mut fixture.keys);
+    fixture.write(PRINCIPAL).await.unwrap();
+    fixture.keys = vec![all[3].clone()];
+    let tenant = fixture.ring.0.tenant().clone();
+    fixture.store.refuse(key_chain(&tenant).prefix());
+    assert!(fixture.write(PRINCIPAL).await.is_err());
+    assert!(fixture
+        .store
+        .raw(&tenant_revocation_name(&tenant, "AKVL0004"))
+        .is_some());
 }

@@ -33,17 +33,17 @@ use super::chain::Put;
 use super::checkpoint::read_key_chain;
 use super::record::{
     key_chain, open_key_record, seal_key_record, Access, DoorGrant, KeyOp, KeyTable, PrivateGrant,
-    SubjectDoor, SubjectKind, SubjectPrivate, SubjectStatus, TkRing,
+    SubjectDoor, SubjectKind, SubjectPrivate, SubjectStatus, TkRing, MAX_SUBJECT_GRANTS,
 };
 use super::revocations::put_tenant_revocation;
-use super::store::RecordStore;
 use crate::crypto::scheme2::{
-    open_record_v2, record_v2_header, rewrap_bdk_to_v2, rewrap_secret_to_v2, same_secret,
+    open_record_v2, record_v2_header, rewrap_bdk_to_v2, rewrap_secret_to_v2, same_bdk, same_secret,
     seal_record_v2, unwrap_bdk_v2, Scheme, TenantId, TenantKey,
 };
 use crate::crypto::unwrap_file_key;
 use crate::plan::StoredPlan;
 use crate::ports::{BlobMeta, BlobStore, Kek};
+use crate::records::RecordStore;
 use crate::recovery::{ArticleManifest, GenerationManifest, Layout, Tombstone};
 use crate::types::{
     BridgeError, Bucket, BucketId, ExtentId, ExtentRow, GenerationId, GenerationRow, Result,
@@ -87,22 +87,49 @@ fn layout(tenant: &TenantId) -> Result<Layout> {
 /// The bucket row as the new tenant holds it: the bucket key re-wrapped
 /// to scheme 2 under `tk`, the row's key version set to `tk`'s, the
 /// owner set to `owner`. Everything else is kept.
+///
+/// A wrap is random, and the generation records embed it, so a bucket
+/// is re-wrapped **once**: the caller stores the first result and passes
+/// its wrap as `already` on every later call (a resumed run, the
+/// pre-seal, the in-window steps). That wrap is reused once it is shown
+/// to hold the same bucket key; one that does not is
+/// [`ERR_MOVE_DIFFERS`].
 pub fn moved_bucket<K: Kek, R: FillRandom>(
     kek: &K,
     tk: &TenantKey,
     bucket: &Bucket,
     owner: &str,
+    already: Option<&[u8]>,
     rng: &mut R,
 ) -> Result<Bucket> {
     Scheme::One.check(&bucket.bdk_wrapped)?;
-    let wrapped = rewrap_bdk_to_v2(
-        kek,
-        bucket.kek_version,
-        &bucket.id,
-        &bucket.bdk_wrapped,
-        tk,
-        rng,
-    )?;
+    let wrapped = match already {
+        Some(wrap) => {
+            let same = same_bdk(
+                kek,
+                bucket.kek_version,
+                &bucket.bdk_wrapped,
+                tk,
+                tk.tenant(),
+                tk.version(),
+                &bucket.id,
+                wrap,
+            )
+            .map_err(|_| ERR_MOVE_DIFFERS)?;
+            if !same {
+                return Err(ERR_MOVE_DIFFERS);
+            }
+            wrap.to_vec()
+        }
+        None => rewrap_bdk_to_v2(
+            kek,
+            bucket.kek_version,
+            &bucket.id,
+            &bucket.bdk_wrapped,
+            tk,
+            rng,
+        )?,
+    };
     Ok(Bucket {
         bdk_wrapped: wrapped,
         kek_version: tk.version(),
@@ -247,12 +274,14 @@ pub enum Placed {
     Same,
 }
 
-/// Puts `sealed` once. A record already under the name is opened and
-/// compared: the same plaintext is [`Placed::Same`]; anything else is
-/// [`ERR_MOVE_DIFFERS`], and the move stops.
-pub async fn put_sealed<S: RecordStore>(
+/// Puts `sealed` once. A record already under the name is opened, under
+/// the key version its envelope names, and compared: the same plaintext
+/// is [`Placed::Same`]; anything else is [`ERR_MOVE_DIFFERS`], and the
+/// move stops.
+pub async fn put_sealed<S: RecordStore, T: TkRing>(
     store: &S,
-    tk: &TenantKey,
+    ring: &T,
+    tenant: &TenantId,
     sealed: &Sealed,
 ) -> Result<Placed> {
     let put = store
@@ -270,8 +299,9 @@ pub async fn put_sealed<S: RecordStore>(
     if there == sealed.sealed {
         return Ok(Placed::Written);
     }
-    let opened =
-        open_record_v2(tk, tk.tenant(), &sealed.name, &there).map_err(|_| ERR_MOVE_DIFFERS)?;
+    let (_, version) = record_v2_header(&there).map_err(|_| ERR_MOVE_DIFFERS)?;
+    let tk = ring.key(version).ok_or(ERR_MOVE_DIFFERS)?;
+    let opened = open_record_v2(tk, tenant, &sealed.name, &there).map_err(|_| ERR_MOVE_DIFFERS)?;
     if *opened != *sealed.plain {
         return Err(ERR_MOVE_DIFFERS);
     }
@@ -418,11 +448,27 @@ where
     let mut out = MovedKeys::default();
     let moved: BTreeSet<&str> = buckets.iter().map(String::as_str).collect();
 
-    // 1. The principal's grants.
+    // Every input is checked before the first record: a record, once
+    // written, is never rewritten.
     let entry = table.get(principal).ok_or(ERR_MOVE_INPUT)?;
-    if entry.door.kind != SubjectKind::Principal || entry.private.is_none() {
+    if entry.door.kind != SubjectKind::Principal
+        || entry.private.is_none()
+        || entry.door.status != SubjectStatus::Active
+        || buckets.len() > MAX_SUBJECT_GRANTS
+    {
         return Err(ERR_MOVE_INPUT);
     }
+    for key in keys {
+        let kind_ok = matches!(key.kind, SubjectKind::S3 | SubjectKind::AppPassword);
+        let grants_ok = !key.grants.is_empty()
+            && key.grants.len() <= MAX_SUBJECT_GRANTS
+            && key.grants.iter().all(|(b, _)| moved.contains(b.as_str()));
+        if !kind_ok || !grants_ok {
+            return Err(ERR_MOVE_INPUT);
+        }
+    }
+
+    // 1. The principal's grants.
     for bucket in buckets {
         let entry = table.get(principal).ok_or(ERR_MOVE_INPUT)?;
         let has = entry
@@ -487,10 +533,11 @@ where
 
     // 2. The keys.
     for key in keys {
-        let kind_ok = matches!(key.kind, SubjectKind::S3 | SubjectKind::AppPassword);
-        let grants_ok = key.grants.iter().all(|(b, _)| moved.contains(b.as_str()));
-        if !kind_ok || !grants_ok {
-            return Err(ERR_MOVE_INPUT);
+        // A revoked key: its revocation first, so no crash leaves it in
+        // force between its create record and its revoke record.
+        if key.status == SubjectStatus::Revoked {
+            put_tenant_revocation(store, kek, tenant, &key.access_key_id, at, rng).await?;
+            out.revoked.push(key.access_key_id.clone());
         }
         let door_grants: Vec<DoorGrant> = key
             .grants
@@ -515,6 +562,9 @@ where
             let private = entry.private.as_ref().ok_or(ERR_MOVE_DIFFERS)?;
             let same = entry.door.kind == key.kind
                 && entry.door.made_by.as_deref() == Some(principal)
+                && entry.door.created_at == key.created_at
+                && private.owner_ref.as_deref() == Some(owner_ref)
+                && private.label.is_none()
                 && entry.door.grants == door_grants
                 && private.grants == private_grants
                 && match (entry.door.secret_kek_version, &private.secret_wrapped) {
@@ -577,10 +627,6 @@ where
 
         // The status, when it is not active.
         let entry = table.get(&key.access_key_id).ok_or(ERR_MOVE_INPUT)?;
-        if key.status == SubjectStatus::Revoked {
-            put_tenant_revocation(store, kek, tenant, &key.access_key_id, at, rng).await?;
-            out.revoked.push(key.access_key_id.clone());
-        }
         if entry.door.status != key.status {
             if entry.door.status == SubjectStatus::Revoked {
                 return Err(ERR_MOVE_DIFFERS);
