@@ -1138,12 +1138,16 @@ if [[ $MODE == local ]]; then
     curl -sf "${CURL_TLS[@]}" --max-time 60 "$BASE/__scheduled?cron=*/5+*+*+*+*" >/dev/null || return 1
     stage_reached lost.bin
   }
-  # 180 s, not 90: provider slots held by sessions of the stopped isolate
+  # 300 s, not 90: provider slots held by sessions of the stopped isolate
   # stay claimed until their 120 s lease expires, and only then can the
-  # re-driven post job get a connection.
-  if ! poll 180 2 cron_then_check; then
+  # re-driven post job get a connection; its verify follows. With
+  # PERMITS=do the step took 165 to 176 s on green CI runs and 192 s on
+  # two red ones (verified 26 ms after a 180 s window), so 180 s left no
+  # margin. The check is unchanged: the cron, not a queue message, must
+  # bring the object to release or done with a counted backbone.
+  if ! poll 300 2 cron_then_check; then
     json=$(adm "GET /_admin/objects/$SB/a/lost.bin" "$BASE/_admin/objects/$SB/a/lost.bin")
-    fail "a/lost.bin recovered by the scheduled handler within 180 s" "jq: ($REACHED) and ($COUNTED)" "$json"
+    fail "a/lost.bin recovered by the scheduled handler within 300 s" "jq: ($REACHED) and ($COUNTED)" "$json"
   fi
 else
   # The drop counter is dev-only: prove the real cron runs after deploy,
