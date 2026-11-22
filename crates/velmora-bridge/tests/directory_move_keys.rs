@@ -13,7 +13,10 @@ use velmora_bridge::directory::move_keys::{
     KeyUnit, OwnerKeys,
 };
 use velmora_bridge::directory::move_preflight::p2_lines;
-use velmora_bridge::unit::keys::{Applied, KeyEntry, KeyKind, SubjectStatus, MAX_ENTRIES};
+use velmora_bridge::unit::keys::{
+    Applied, ApplyEntry, KeyEntry, KeyKind, KeyMarker, KeyRefusal, MarkerKind, SubjectStatus,
+    MAX_ENTRIES,
+};
 use velmora_bridge::*;
 
 fn block_on<F: std::future::Future>(f: F) -> F::Output {
@@ -43,7 +46,7 @@ fn entry(id: &str, status: SubjectStatus, seq: u64) -> KeyEntry {
 
 #[derive(Default)]
 struct Keys {
-    chain: RefCell<Vec<KeyEntry>>,
+    chain: RefCell<Vec<ApplyEntry>>,
     /// The chain answers fewer records than its head (damage).
     short: Cell<bool>,
     flat: RefCell<BTreeSet<String>>,
@@ -56,7 +59,7 @@ impl OwnerKeys for Keys {
     async fn head(&self) -> Result<u64> {
         Ok(self.chain.borrow().len() as u64 + u64::from(self.short.get()))
     }
-    async fn entries(&self, after: u64, limit: usize) -> Result<Vec<KeyEntry>> {
+    async fn entries(&self, after: u64, limit: usize) -> Result<Vec<ApplyEntry>> {
         Ok(self
             .chain
             .borrow()
@@ -80,7 +83,7 @@ impl OwnerKeys for Keys {
         let seq = self.chain.borrow().len() as u64 + 1;
         self.chain
             .borrow_mut()
-            .push(entry(akid, SubjectStatus::Revoked, seq));
+            .push(entry(akid, SubjectStatus::Revoked, seq).into());
         Ok(())
     }
     async fn revoke_grants(&self, _buckets: &[String]) -> Result<()> {
@@ -111,19 +114,26 @@ struct Unit {
 }
 
 impl KeyUnit for Unit {
-    async fn apply_keys(&self, from_seq: u64, entries: &[KeyEntry]) -> Result<Applied> {
+    async fn apply_keys(&self, from_seq: u64, entries: &[ApplyEntry]) -> Result<Applied> {
         self.calls.borrow_mut().push((from_seq, entries.len()));
         if from_seq > self.keys_seq.get() {
             return Ok(Applied::Behind {
                 keys_seq: self.keys_seq.get(),
             });
         }
-        for e in entries {
+        // The unit's gap rule (AM-62): item i is record from_seq + 1 + i,
+        // a marker counted like an entry.
+        for (i, e) in entries.iter().enumerate() {
+            if e.seq() != from_seq + 1 + i as u64 {
+                return Ok(Applied::Refused(KeyRefusal::Gap));
+            }
+        }
+        for e in entries.iter().filter_map(ApplyEntry::key) {
             if e.last_seq > self.keys_seq.get() {
                 self.rows.borrow_mut().insert(e.id.clone(), e.status);
             }
         }
-        let last = entries.last().map_or(0, |e| e.last_seq);
+        let last = entries.last().map_or(0, ApplyEntry::seq);
         self.keys_seq.set(self.keys_seq.get().max(last));
         Ok(Applied::Done {
             keys_seq: self.keys_seq.get(),
@@ -141,11 +151,9 @@ impl KeyUnit for Unit {
 fn chain_of(n: u64) -> Keys {
     let k = Keys::default();
     for seq in 1..=n {
-        k.chain.borrow_mut().push(entry(
-            &format!("AKMOVE{seq:014}"),
-            SubjectStatus::Active,
-            seq,
-        ));
+        k.chain
+            .borrow_mut()
+            .push(entry(&format!("AKMOVE{seq:014}"), SubjectStatus::Active, seq).into());
     }
     k
 }
@@ -180,7 +188,9 @@ fn the_key_apply_sends_the_whole_chain_in_pages() {
 fn the_key_apply_refuses_held_entries_and_a_short_chain() {
     block_on(async {
         let keys = chain_of(3);
-        keys.chain.borrow_mut()[1].held = true;
+        if let ApplyEntry::Key(e) = &mut keys.chain.borrow_mut()[1] {
+            e.held = true;
+        }
         let unit = Unit::default();
         let r = apply_owner_keys(&keys, &unit).await;
         assert!(matches!(r, Err(KeyStepError::HeldEntry(_))), "{r:?}");
@@ -196,7 +206,13 @@ fn the_key_apply_refuses_held_entries_and_a_short_chain() {
 fn the_sweep_revokes_flat_revocations_and_step_9_checks_them() {
     block_on(async {
         let keys = chain_of(2);
-        let moved: Vec<String> = keys.chain.borrow().iter().map(|e| e.id.clone()).collect();
+        let moved: Vec<String> = keys
+            .chain
+            .borrow()
+            .iter()
+            .filter_map(ApplyEntry::key)
+            .map(|e| e.id.clone())
+            .collect();
         let unit = Unit::default();
         apply_owner_keys(&keys, &unit).await.unwrap();
         // A tenant-0 revoke during the window left a flat revocation.
@@ -375,7 +391,7 @@ fn the_key_apply_finishes_with_short_pages() {
         async fn head(&self) -> Result<u64> {
             self.0.head().await
         }
-        async fn entries(&self, after: u64, _limit: usize) -> Result<Vec<KeyEntry>> {
+        async fn entries(&self, after: u64, _limit: usize) -> Result<Vec<ApplyEntry>> {
             self.0.entries(after, 1).await
         }
         async fn flat_revoked(&self, a: &str) -> Result<bool> {
@@ -405,5 +421,42 @@ fn the_key_apply_finishes_with_short_pages() {
         let unit = Unit::default();
         assert_eq!(apply_owner_keys(&keys, &unit).await.unwrap(), 150);
         assert_eq!(unit.calls.borrow().len(), 150);
+    });
+}
+
+/// A chain with `KeysFrozen`/`KeysThawed` records (an undone move, then
+/// the next move's thaw) is sent whole, each marker as a marker item in
+/// its place (AM-62): one inside a page, one ending a page, one ending
+/// the chain. The unit's gap rule holds and `keys_seq` reaches the head.
+#[test]
+fn the_key_apply_sends_freeze_markers_in_their_place() {
+    block_on(async {
+        let n = MAX_ENTRIES as u64 + 3;
+        let marker_at = [5, MAX_ENTRIES as u64, n];
+        let keys = Keys::default();
+        for seq in 1..=n {
+            let item: ApplyEntry = if marker_at.contains(&seq) {
+                KeyMarker {
+                    marker: if seq == 5 {
+                        MarkerKind::KeysFrozen
+                    } else {
+                        MarkerKind::KeysThawed
+                    },
+                    seq,
+                }
+                .into()
+            } else {
+                entry(&format!("AKMOVE{seq:014}"), SubjectStatus::Active, seq).into()
+            };
+            keys.chain.borrow_mut().push(item);
+        }
+        let unit = Unit::default();
+        assert_eq!(apply_owner_keys(&keys, &unit).await.unwrap(), n);
+        assert_eq!(unit.keys_seq.get(), n);
+        assert_eq!(unit.rows.borrow().len() as u64, n - 3);
+        assert_eq!(
+            *unit.calls.borrow(),
+            [(0, MAX_ENTRIES), (MAX_ENTRIES as u64, 3)]
+        );
     });
 }

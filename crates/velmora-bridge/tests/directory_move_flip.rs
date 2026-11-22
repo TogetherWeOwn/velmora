@@ -25,7 +25,7 @@ use velmora_bridge::directory::store::{KeyRoute, RouteKind, SqlDirectory};
 use velmora_bridge::directory::testing::{HookedRecords, PlainSeal};
 use velmora_bridge::directory::transition::{Actor, Change, OperatorHoldRequest, KEY_CHECK_LEN};
 use velmora_bridge::testkit::RusqliteSql;
-use velmora_bridge::unit::keys::{Applied, KeyEntry, KeyKind, SubjectStatus};
+use velmora_bridge::unit::keys::{Applied, ApplyEntry, KeyEntry, KeyKind, SubjectStatus};
 use velmora_bridge::unit::lift::{GateRefusal, LiftProof, ReplayId};
 use velmora_bridge::unit::Refused as UnitRefused;
 use velmora_bridge::*;
@@ -140,14 +140,14 @@ fn take(c: &Cell<u32>) -> bool {
 }
 
 impl KeyUnit for FakeUnit {
-    async fn apply_keys(&self, from_seq: u64, entries: &[KeyEntry]) -> Result<Applied> {
+    async fn apply_keys(&self, from_seq: u64, entries: &[ApplyEntry]) -> Result<Applied> {
         self.applies.set(self.applies.get() + 1);
         if from_seq > self.keys_seq.get() {
             return Ok(Applied::Behind {
                 keys_seq: self.keys_seq.get(),
             });
         }
-        for e in entries {
+        for e in entries.iter().filter_map(ApplyEntry::key) {
             assert!(!e.held, "the move sends no held entry");
             if e.last_seq > self.keys_seq.get() {
                 let mut rows = self.key_rows.borrow_mut();
@@ -157,7 +157,7 @@ impl KeyUnit for FakeUnit {
                 }
             }
         }
-        let last = entries.last().map_or(0, |e| e.last_seq);
+        let last = entries.last().map_or(0, ApplyEntry::seq);
         self.keys_seq.set(self.keys_seq.get().max(last));
         Ok(Applied::Done {
             keys_seq: self.keys_seq.get(),
@@ -340,7 +340,7 @@ impl OwnerKeys for FakeKeys {
         Ok(self.chain.borrow().len() as u64)
     }
 
-    async fn entries(&self, after: u64, limit: usize) -> Result<Vec<KeyEntry>> {
+    async fn entries(&self, after: u64, limit: usize) -> Result<Vec<ApplyEntry>> {
         Ok(self
             .chain
             .borrow()
@@ -348,6 +348,7 @@ impl OwnerKeys for FakeKeys {
             .skip(after as usize)
             .take(limit)
             .cloned()
+            .map(ApplyEntry::from)
             .collect())
     }
 

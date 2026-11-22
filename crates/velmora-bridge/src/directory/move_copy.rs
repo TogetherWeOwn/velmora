@@ -161,8 +161,11 @@ impl ImportState {
     /// move record and no table progress).
     ///
     /// Fails closed: a field of the wrong type, an unknown table, a table
-    /// twice, or a `lifted_at` without `move_lifted: true` is
-    /// [`BridgeError::Invalid`], never read as "not said".
+    /// twice, a move record only partly said (the unit answers `t0_seq`,
+    /// `since_seq` and `move_lifted` from one row: all null or all set), a
+    /// `sealed` or `lifted_at` without that record, or a `lifted_at`
+    /// without `move_lifted: true` is [`BridgeError::Invalid`], never read
+    /// as "not said".
     pub fn from_progress(body: &serde_json::Value) -> crate::types::Result<Option<ImportState>> {
         use serde_json::Value;
         const BAD: BridgeError = BridgeError::Invalid("import_progress");
@@ -174,6 +177,7 @@ impl ImportState {
         }
         let obj = body.as_object().ok_or(BAD)?;
         let t0_seq = opt_u64(obj.get("t0_seq"))?;
+        let since_seq = opt_u64(obj.get("since_seq"))?;
         let sealed = opt_u64(obj.get("sealed"))?;
         let move_lifted = match obj.get("move_lifted") {
             None | Some(Value::Null) => None,
@@ -183,6 +187,13 @@ impl ImportState {
             None | Some(Value::Null) => None,
             Some(v) => Some(UnixMs(v.as_i64().ok_or(BAD)?)),
         };
+        let record = t0_seq.is_some();
+        if since_seq.is_some() != record || move_lifted.is_some() != record {
+            return Err(BAD);
+        }
+        if (sealed.is_some() || lifted_at.is_some()) && !record {
+            return Err(BAD);
+        }
         if lifted_at.is_some() && move_lifted != Some(true) {
             return Err(BAD);
         }
@@ -1050,7 +1061,7 @@ mod tests {
             "tables": tables,
             "sealed": sealed,
             "t0_seq": t0,
-            "since_seq": 7,
+            "since_seq": if t0.is_null() { Value::Null } else { json!(7) },
             "move_lifted": lifted,
             "lifted_at": at,
             "schema_tables": ["buckets"],
@@ -1113,6 +1124,46 @@ mod tests {
             // A lift time without the lift.
             progress(json!(11), json!(1), json!(false), json!(5), t.clone()),
             progress(json!(11), json!(1), json!(null), json!(5), t.clone()),
+            // A move record only partly said, or a seal or lift time
+            // without it.
+            progress(
+                json!(null),
+                json!(null),
+                json!(true),
+                json!(null),
+                t.clone(),
+            ),
+            progress(
+                json!(null),
+                json!(null),
+                json!(false),
+                json!(null),
+                t.clone(),
+            ),
+            progress(json!(11), json!(null), json!(null), json!(null), t.clone()),
+            progress(json!(null), json!(1), json!(null), json!(null), t.clone()),
+            progress(json!(null), json!(null), json!(null), json!(5), t.clone()),
+            {
+                let mut b = progress(json!(11), json!(null), json!(false), json!(null), t.clone());
+                b["since_seq"] = json!(null);
+                b
+            },
+            {
+                let mut b = progress(json!(11), json!(null), json!(false), json!(null), t.clone());
+                b["since_seq"] = json!("x");
+                b
+            },
+            {
+                let mut b = progress(
+                    json!(null),
+                    json!(null),
+                    json!(null),
+                    json!(null),
+                    t.clone(),
+                );
+                b["since_seq"] = json!(7);
+                b
+            },
             progress(json!(11), json!(1), json!(true), json!(5), json!(null)),
             progress(
                 json!(11),
