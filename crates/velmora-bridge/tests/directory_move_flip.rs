@@ -9,9 +9,9 @@ use std::collections::BTreeMap;
 
 use service_support::*;
 use velmora_bridge::directory::chain::{TenantChain, Written};
-use velmora_bridge::directory::fence::{freeze, legacy_stamp_key};
+use velmora_bridge::directory::fence::{freeze, legacy_stamp_key, stamp_row, thaw};
 use velmora_bridge::directory::move_flip::{
-    flip, give_up, FlipError, Flipped, RouteRecords, UnitSync, Window,
+    flip, give_up, FlipError, Flipped, GaveUp, RouteRecords, UnitSync, Window,
 };
 use velmora_bridge::directory::record::{Selector, Tenant, TenantDoor};
 use velmora_bridge::directory::store::{KeyRoute, RouteKind, SqlDirectory};
@@ -63,21 +63,31 @@ struct FakeRoutes {
     records: RefCell<BTreeMap<String, String>>,
     /// Puts fail after this many more.
     fail_after: Cell<Option<u32>>,
+    /// The next N puts store, then answer an error.
+    lose: Cell<u32>,
 }
 
 impl RouteRecords for FakeRoutes {
-    async fn put(&self, akid: &str, tenant: &Tenant) -> Result<bool> {
+    async fn put(&self, akid: &str, tenant: &Tenant, kind: RouteKind) -> Result<bool> {
+        assert_eq!(kind, RouteKind::S3);
         if let Some(n) = self.fail_after.get() {
             if n == 0 {
                 return Err(BridgeError::Blob("route store unreachable".into()));
             }
             self.fail_after.set(Some(n - 1));
         }
-        let mut records = self.records.borrow_mut();
-        let named = records
-            .entry(akid.to_string())
-            .or_insert_with(|| tenant.as_str().to_string());
-        Ok(named == tenant.as_str())
+        let ours = {
+            let mut records = self.records.borrow_mut();
+            let named = records
+                .entry(akid.to_string())
+                .or_insert_with(|| tenant.as_str().to_string());
+            named == tenant.as_str()
+        };
+        if self.lose.get() > 0 {
+            self.lose.set(self.lose.get() - 1);
+            return Err(BridgeError::Blob("answer lost".into()));
+        }
+        Ok(ours)
     }
 
     async fn get(&self, akid: &str) -> Result<Option<String>> {
@@ -143,7 +153,7 @@ impl Move {
         .await
     }
 
-    async fn give_up(&self) -> std::result::Result<(), FlipError> {
+    async fn give_up(&self) -> std::result::Result<Option<GaveUp>, FlipError> {
         let k = keys();
         let window = Window {
             owner: &owner(),
@@ -152,6 +162,8 @@ impl Move {
         };
         give_up(
             &self.chain(),
+            &self.rig.bridge.catalog.sql,
+            &self.rig.bridge.safety,
             &self.dir(),
             &self.unit,
             &self.routes,
@@ -167,6 +179,28 @@ impl Move {
 
     async fn route_row(&self, akid: &str) -> Tenant {
         self.dir().route(akid).await.unwrap().unwrap().tenant
+    }
+
+    async fn stamp_put(&self) -> bool {
+        let counter = stamp_row(&self.rig.bridge.catalog.sql)
+            .await
+            .unwrap()
+            .map(|(c, _)| c);
+        self.rig
+            .bridge
+            .safety
+            .head(&legacy_stamp_key("main", counter))
+            .await
+            .unwrap()
+            .is_some()
+    }
+
+    async fn selector(&self) -> Selector {
+        self.head(&Tenant::zero())
+            .await
+            .tenant_zero
+            .unwrap()
+            .selector
     }
 }
 
@@ -349,11 +383,22 @@ fn a_route_record_of_another_tenant_stops_the_flip() {
             matches!(&r, Err(FlipError::RouteTaken(k)) if k == KEYS[1]),
             "{r:?}"
         );
+        // Refused before the first write: no stamp, the unit still
+        // closed, the first key's record not put.
+        assert_eq!(m.selector().await, Selector::Moving);
+        assert!(!m.stamp_put().await);
+        assert!(m.head(&owner()).await.restoring_entry(0).is_some());
+        assert!(!m.routes.records.borrow().contains_key(KEYS[0]));
+        // So the move can still be given up.
+        let g = m.give_up().await.map_err(|e| format!("{e:?}")).unwrap();
         assert_eq!(
-            m.head(&Tenant::zero()).await.tenant_zero.unwrap().selector,
-            Selector::Moving
+            g,
+            Some(GaveUp {
+                catalogue_id_frozen: "main".into(),
+                stamp_put: false
+            })
         );
-        assert!(m.route_row(KEYS[1]).await.is_zero());
+        assert_eq!(m.selector().await, Selector::D1);
     });
 }
 
@@ -377,7 +422,10 @@ fn the_move_is_given_up_before_its_routes() {
         m.routes.fail_after.set(Some(0));
         assert!(m.flip().await.is_err());
         assert!(m.head(&owner()).await.restoring.is_empty());
-        m.give_up().await.map_err(|e| format!("{e:?}")).unwrap();
+        let g = m.give_up().await.map_err(|e| format!("{e:?}")).unwrap();
+        // (a) ran: the tool levels the thawed D1's stamp.
+        assert_eq!(g.map(|g| g.stamp_put), Some(true));
+        assert!(m.stamp_put().await);
         let o = m.head(&owner()).await;
         assert!(o.restoring_entry(0).is_some());
         assert_eq!(m.unit.synced.borrow().last().unwrap().seq, o.seq);
@@ -389,7 +437,10 @@ fn the_move_is_given_up_before_its_routes() {
         }
         // Run again: nothing more.
         let n = m.records();
-        m.give_up().await.map_err(|e| format!("{e:?}")).unwrap();
+        assert_eq!(
+            m.give_up().await.map_err(|e| format!("{e:?}")).unwrap(),
+            None
+        );
         assert_eq!(m.records(), n);
         // And the flip no longer runs.
         assert!(matches!(m.flip().await, Err(FlipError::NotThisMove)));
@@ -411,5 +462,99 @@ fn the_give_up_stops_once_a_route_record_names_the_owner() {
             m.head(&Tenant::zero()).await.tenant_zero.unwrap().selector,
             Selector::Moving
         );
+    });
+}
+
+#[test]
+fn lost_answers_in_the_routes_and_the_flip_record_are_read_back() {
+    block_on(async {
+        let m = window().await;
+        let before = m.records();
+        // The first key's record is stored, its answer lost.
+        m.routes.lose.set(1);
+        assert!(matches!(m.flip().await, Err(FlipError::Store(_))));
+        assert_eq!(m.routes.records.borrow()[KEYS[0]], OWNER);
+        assert!(m.route_row(KEYS[0]).await.is_zero());
+        // The flip record is stored, its answer lost: read back as
+        // written. (The lift is already done, so the next record put is
+        // the flip's.)
+        m.store.lose_answers(1);
+        let f = m.flip().await.map_err(|e| format!("{e:?}")).unwrap();
+        assert!(f.wrote);
+        assert_flipped(&m, f.stamp).await;
+        assert_eq!(m.records(), before + 2);
+    });
+}
+
+#[test]
+fn the_move_is_given_up_before_the_unit_opens() {
+    block_on(async {
+        let m = window().await;
+        let before = m.records();
+        let o = m.head(&owner()).await;
+        let g = m.give_up().await.map_err(|e| format!("{e:?}")).unwrap();
+        assert_eq!(g.map(|g| g.stamp_put), Some(false));
+        // The entry stood: no new owner record, only tenant 0's.
+        assert_eq!(m.head(&owner()).await.seq, o.seq);
+        assert_eq!(m.records(), before + 1);
+        assert_eq!(m.selector().await, Selector::D1);
+    });
+}
+
+#[test]
+fn a_give_up_that_crashed_after_closing_the_unit_runs_again() {
+    block_on(async {
+        let m = window().await;
+        m.routes.fail_after.set(Some(0));
+        assert!(m.flip().await.is_err());
+        // The unit is not reached after the new restoring entry.
+        m.unit.fail.set(1);
+        assert!(matches!(m.give_up().await, Err(FlipError::Store(_))));
+        let closed = m.head(&owner()).await;
+        let entry = closed.restoring_entry(0).unwrap().since_seq;
+        assert!(entry > m.since);
+        assert_eq!(m.selector().await, Selector::Moving);
+        let g = m.give_up().await.map_err(|e| format!("{e:?}")).unwrap();
+        assert_eq!(g.map(|g| g.stamp_put), Some(true));
+        // No second entry; the unit saw the closed head.
+        let after = m.head(&owner()).await;
+        assert_eq!(after.restoring_entry(0).unwrap().since_seq, entry);
+        assert_eq!(m.unit.synced.borrow().last().unwrap().seq, after.seq);
+        assert_eq!(m.selector().await, Selector::D1);
+    });
+}
+
+#[test]
+fn the_flip_needs_this_windows_marker_and_a_later_window_is_not_this_one() {
+    block_on(async {
+        let m = window().await;
+        // A marker of another move ordinal.
+        thaw(&m.rig.bridge.catalog.sql).await.unwrap();
+        freeze(&m.rig.bridge.catalog.sql, 2).await.unwrap();
+        assert!(matches!(m.flip().await, Err(FlipError::Marker)));
+        assert!(!m.stamp_put().await);
+        thaw(&m.rig.bridge.catalog.sql).await.unwrap();
+        freeze(&m.rig.bridge.catalog.sql, 1).await.unwrap();
+        // Opened, given up (a new restoring entry), then a new window into
+        // the same owner: the old window's flip does not act on it. (A
+        // window whose entry was never lifted keeps it, and the next window
+        // takes the same one: the two cannot be told apart.)
+        m.routes.fail_after.set(Some(0));
+        assert!(m.flip().await.is_err());
+        m.routes.fail_after.set(None);
+        m.give_up().await.map_err(|e| format!("{e:?}")).unwrap();
+        m.write(
+            &Tenant::zero(),
+            Change::StartMove {
+                to: owner(),
+                catalogue_id_frozen: "main".into(),
+            },
+            Actor::MoveTool,
+        )
+        .await;
+        let o = m.head(&owner()).await;
+        assert!(o.restoring_entry(0).is_some());
+        let r = m.flip().await;
+        assert!(matches!(r, Err(FlipError::OtherWindow { .. })), "{r:?}");
     });
 }

@@ -1,9 +1,15 @@
 //! The move's flip, and its give-up before the flip (DS1 §3.4 step 8,
 //! §3.8).
 //!
-//! The flip runs after the verify (step 7) and in this order; each
-//! sub-step reads what is there first, so a crash anywhere is finished by
-//! running [`flip`] again:
+//! The flip runs after the verify (step 7). Before it writes anything it
+//! checks the whole window: tenant 0 `moving` into the owner, the frozen
+//! catalogue carrying this window's marker, the owner's `restoring` entry
+//! of this window (or its lift), and for every moved key a route record
+//! that is absent or names the owner and a directory row on tenant 0 or
+//! the owner. A key that would stop the flip halfway therefore stops it
+//! before (a), while the give-up is still open. Then, in this order, each
+//! sub-step reading what is there first, so a crash anywhere is finished
+//! by running [`flip`] again:
 //!
 //! - **(a)** the legacy stamp on the frozen catalogue
 //!   ([`super::fence::put_legacy_stamp`]): from here every destructive act
@@ -29,9 +35,9 @@
 //! writes tenant 0's records.
 
 use super::chain::{ChainError, ControlSeal, TenantChain, Written};
-use super::fence::put_legacy_stamp;
-use super::record::{Selector, Tenant, TenantDoor};
-use super::store::SqlDirectory;
+use super::fence::{legacy_stamp_key, marker, put_legacy_stamp, stamp_row};
+use super::record::{Lifecycle, Selector, Tenant, TenantDoor};
+use super::store::{RouteKind, SqlDirectory};
 use super::transition::{Actor, Change};
 use crate::ports::{BlobStore, Sql};
 use crate::records::RecordStore;
@@ -58,6 +64,10 @@ pub enum FlipError {
     /// Route records already name the owner; the give-up cannot put them
     /// back.
     RoutesPut(Vec<String>),
+    /// The frozen catalogue does not carry this window's cutover marker.
+    Marker,
+    /// The owner has no live directory row to move routes to.
+    OwnerRow,
 }
 
 impl From<BridgeError> for FlipError {
@@ -83,9 +93,11 @@ pub trait UnitSync {
 /// The route records `m/kr/<akid>`.
 #[allow(async_fn_in_trait)]
 pub trait RouteRecords {
-    /// Puts the route of `akid` to `tenant`, or finds it there. `false` =
-    /// the record names another tenant.
-    async fn put(&self, akid: &str, tenant: &Tenant) -> crate::types::Result<bool>;
+    /// Puts the route of `akid` (of `kind`, from its directory row) to
+    /// `tenant`, or finds it there. `false` = the record names another
+    /// tenant.
+    async fn put(&self, akid: &str, tenant: &Tenant, kind: RouteKind)
+        -> crate::types::Result<bool>;
     /// The tenant the route record of `akid` names; `None` = no record.
     async fn get(&self, akid: &str) -> crate::types::Result<Option<String>>;
 }
@@ -181,13 +193,22 @@ where
             wrote: false,
         });
     }
+    // The whole window is checked before the first write.
+    let owner = owner_head(chain, window.owner).await?;
+    let lifted = window_entry(chain, &owner, window).await?;
+    let ordinal = z.flips.checked_add(1).and_then(|o| i64::try_from(o).ok());
+    if ordinal.is_none() || marker(frozen).await? != ordinal {
+        return Err(FlipError::Marker);
+    }
+    let kinds = routes_movable(dir, routes, window).await?;
+
     // (a) The legacy stamp, under the catalogue the window froze.
     let stamp = put_legacy_stamp(frozen, safety, &m.catalogue_id_frozen, now).await?;
 
     // (b) The owner's root unit opens.
-    let owner = owner_head(chain, window.owner).await?;
-    let owner = match owner.restoring_entry(0) {
-        Some(r) if r.since_seq == window.since => {
+    let owner = match lifted {
+        true => owner,
+        false => {
             let lift = Change::LiftRestoring {
                 unit: 0,
                 since_seq: window.since,
@@ -200,20 +221,13 @@ where
                 Written::Unchanged(read) => read.door,
             }
         }
-        Some(r) => {
-            return Err(FlipError::OtherWindow {
-                since_seq: r.since_seq,
-            })
-        }
-        // Lifted by an earlier run.
-        None => owner,
     };
     unit.apply_head(&owner).await?;
 
     // (c) Routes: the record first, then the directory row.
     let zero_tenant = Tenant::Zero;
-    for akid in window.keys {
-        if !routes.put(akid, window.owner).await? {
+    for (akid, kind) in window.keys.iter().zip(kinds) {
+        if !routes.put(akid, window.owner, kind).await? {
             return Err(FlipError::RouteTaken(akid.clone()));
         }
         if !dir.move_route(akid, &zero_tenant, window.owner).await? {
@@ -224,7 +238,12 @@ where
         }
     }
 
-    // (d) Tenant 0: moved, at the stamp's counter.
+    // (d) Tenant 0: moved, at the stamp's counter, on the head this run
+    // checked (a give-up and a new window in between stop it).
+    let now_zero = zero_head(chain, window.owner, false).await?;
+    if now_zero.seq != zero.seq {
+        return Err(FlipError::NotThisMove);
+    }
     let wrote = matches!(
         chain
             .write(
@@ -240,22 +259,96 @@ where
     Ok(Flipped { stamp, wrote })
 }
 
+/// Whether the owner's root unit 0 entry of this window is already lifted
+/// (`true`) or still set (`false`). Refused for an entry of another
+/// window, and for a missing entry that this window never set.
+async fn window_entry<S: RecordStore, C: ControlSeal>(
+    chain: &TenantChain<'_, S, C>,
+    owner: &TenantDoor,
+    window: &Window<'_>,
+) -> Result<bool, FlipError> {
+    match owner.restoring_entry(0) {
+        Some(r) if r.since_seq == window.since => Ok(false),
+        Some(r) => Err(FlipError::OtherWindow {
+            since_seq: r.since_seq,
+        }),
+        None => {
+            // Lifted by an earlier run: the record at `since` set it, and
+            // no later entry stands (the head has none).
+            let set = chain.read(window.owner, window.since).await?;
+            let ours = set.is_some_and(|r| {
+                r.door
+                    .restoring_entry(0)
+                    .is_some_and(|e| e.since_seq == window.since)
+            });
+            match ours {
+                true => Ok(true),
+                false => Err(FlipError::OtherWindow { since_seq: 0 }),
+            }
+        }
+    }
+}
+
+/// The read-only pre-pass of (c): every moved key can be moved. Answers
+/// each key's kind, from its directory row.
+async fn routes_movable<Q: Sql, R: RouteRecords>(
+    dir: &SqlDirectory<'_, Q>,
+    routes: &R,
+    window: &Window<'_>,
+) -> Result<Vec<RouteKind>, FlipError> {
+    let live = dir
+        .tenant(window.owner)
+        .await?
+        .is_some_and(|row| row.door.lifecycle != Lifecycle::Shredded);
+    if !live {
+        return Err(FlipError::OwnerRow);
+    }
+    let mut kinds = Vec::with_capacity(window.keys.len());
+    for akid in window.keys {
+        if let Some(t) = routes.get(akid).await? {
+            if t != window.owner.as_str() {
+                return Err(FlipError::RouteTaken(akid.clone()));
+            }
+        }
+        match dir.route(akid).await? {
+            Some(r) if r.tenant.is_zero() || r.tenant == *window.owner => kinds.push(r.kind),
+            _ => return Err(FlipError::RouteRow(akid.clone())),
+        }
+    }
+    Ok(kinds)
+}
+
+/// What the give-up leaves to the tool: the frozen catalogue to thaw, and
+/// whether (a) put its legacy stamp, after which the thawed D1's stamp
+/// must be levelled before tenant 0 serves from it (its reads fail closed
+/// until then, which maintenance covers).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GaveUp {
+    pub catalogue_id_frozen: String,
+    pub stamp_put: bool,
+}
+
 /// Gives the move up before the flip: the owner's unit closed again, the
 /// directory rows back on tenant 0, tenant 0's record back to `d1`. Runs
 /// again from wherever it stopped. Refused once tenant 0 is `moved` (the
 /// way back is then the reverse move) and once a route record names the
 /// owner.
-pub async fn give_up<S, C, Q, U, R>(
+#[allow(clippy::too_many_arguments)]
+pub async fn give_up<S, C, F, B, Q, U, R>(
     chain: &TenantChain<'_, S, C>,
+    frozen: &F,
+    safety: &B,
     dir: &SqlDirectory<'_, Q>,
     unit: &U,
     routes: &R,
     window: &Window<'_>,
     now: UnixMs,
-) -> Result<(), FlipError>
+) -> Result<Option<GaveUp>, FlipError>
 where
     S: RecordStore,
     C: ControlSeal,
+    F: Sql,
+    B: BlobStore,
     Q: Sql,
     U: UnitSync,
     R: RouteRecords,
@@ -263,9 +356,15 @@ where
     let zero = match zero_head(chain, window.owner, false).await {
         Ok(zero) => zero,
         // Given up by an earlier run: tenant 0 is on its D1 with no move.
-        Err(FlipError::NotThisMove) if given_up(chain).await? => return Ok(()),
+        Err(FlipError::NotThisMove) if given_up(chain).await? => return Ok(None),
         Err(e) => return Err(e),
     };
+    let frozen_id = zero
+        .tenant_zero
+        .as_ref()
+        .and_then(|z| z.moved.as_ref())
+        .map(|m| m.catalogue_id_frozen.clone())
+        .expect("checked by zero_head");
     let mut put = Vec::new();
     for akid in window.keys {
         if routes.get(akid).await?.as_deref() == Some(window.owner.as_str()) {
@@ -278,7 +377,14 @@ where
     // The owner's unit closed again, if an earlier step opened it.
     let owner = owner_head(chain, window.owner).await?;
     let owner = match owner.restoring_entry(0) {
-        Some(_) => owner,
+        // This window's entry, or the one an earlier run of this give-up
+        // set after it; an older entry is another window's.
+        Some(r) if r.since_seq >= window.since => owner,
+        Some(r) => {
+            return Err(FlipError::OtherWindow {
+                since_seq: r.since_seq,
+            })
+        }
         None => match chain
             .write(
                 window.owner,
@@ -304,6 +410,12 @@ where
             }
         }
     }
+    // Whether (a) ran, read before tenant 0's record forgets the window.
+    let counter = stamp_row(frozen).await?.map(|(c, _)| c);
+    let stamp_put = safety
+        .head(&legacy_stamp_key(&frozen_id, counter))
+        .await?
+        .is_some();
     chain
         .write(
             &zero_tenant,
@@ -313,7 +425,10 @@ where
             zero.seq,
         )
         .await?;
-    Ok(())
+    Ok(Some(GaveUp {
+        catalogue_id_frozen: frozen_id,
+        stamp_put,
+    }))
 }
 
 /// Tenant 0 on its D1 with no move open.
