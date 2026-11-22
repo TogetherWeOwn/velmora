@@ -93,6 +93,12 @@ fn within(what: &str, found: &BTreeMap<String, usize>, allowed: &[(&str, usize)]
 
 const TENANT: &str = "bridge/tenant.rs";
 
+/// A file of the directory module (#199), other than the port of
+/// `directory/port.rs`, which the seams below hold as before.
+fn in_directory(file: &str) -> bool {
+    file.starts_with("bridge/directory/") && file != "bridge/directory/port.rs"
+}
+
 /// A scope is made where work enters with no tenant on it, and nowhere
 /// else.
 #[test]
@@ -101,6 +107,15 @@ fn a_scope_is_made_only_at_the_listed_places() {
     let mut found = uses(&all, "tenant_zero");
     // The definition, and its own tests.
     assert!(found.remove(TENANT).is_some());
+    // The directory's own module `directory::tenant_zero` (the selector of
+    // tenant 0's catalogue) is a name, not a scope: the directory makes no
+    // `TenantScope` (checked here).
+    found.retain(|f, _| !in_directory(f));
+    for (f, text) in &all {
+        if in_directory(f) {
+            assert!(!text.contains("TenantScope"), "{f}");
+        }
+    }
     within(
         "tenant_zero",
         &found,
@@ -131,6 +146,14 @@ fn a_scope_is_made_only_at_the_listed_places() {
             // in the key-chain check (a `bool`), and a test's name.
             ("bridge/unit/keys.rs", 4),
             ("bridge/unit/birth.rs", 1),
+            // Not a scope: the name of the opener of tenant 0's private
+            // part of a control record (`open_private_tenant_zero`).
+            ("bridge/crypto/scheme2.rs", 1),
+            // Not scopes: the lister of tenant 0's flat revocations
+            // (`list_tenant_zero_revocations`, #194), and its caller in
+            // the admin listing (the import and the call).
+            ("bridge/keys/revocations.rs", 1),
+            ("bridge/service/admin.rs", 2),
         ],
     );
     // The reader of a message makes the scope of the job path, and the
@@ -214,7 +237,19 @@ fn the_scope_has_one_constructor() {
 #[test]
 fn the_id_of_tenant_zero_is_written_in_one_place() {
     let all = all();
-    let mut literal = uses(&all, "t_0000000000000000");
+    // In code: comment lines and the module's tests are left out (the
+    // directory record and the control seal say the id in their text and
+    // tests).
+    let code_only: BTreeMap<String, String> = all
+        .iter()
+        .map(|(f, t)| {
+            (
+                f.clone(),
+                code(t.split("#[cfg(test)]").next().unwrap_or("")),
+            )
+        })
+        .collect();
+    let mut literal = uses(&code_only, "t_0000000000000000");
     // The tests of the scope and of a unit's name say the names in full;
     // the code of a unit's name does not.
     literal.remove(TENANT);
@@ -227,9 +262,18 @@ fn the_id_of_tenant_zero_is_written_in_one_place() {
     assert_eq!(literal.keys().collect::<Vec<_>>(), ["bridge/recovery.rs"]);
     let named = uses(&all, "DEFAULT_TENANT");
     // A unit's tenant id (`unit::TenantId::zero`) takes it by name too.
+    // So do the control seal's scheme, the directory's tenant and a
+    // unit's stamp id (which refuses it: tenant 0 has no unit).
     assert_eq!(
         named.keys().collect::<Vec<_>>(),
-        ["bridge/recovery.rs", TENANT, "bridge/unit/name.rs"]
+        [
+            "bridge/crypto/scheme2.rs",
+            "bridge/directory/record.rs",
+            "bridge/recovery.rs",
+            TENANT,
+            "bridge/unit/name.rs",
+            "bridge/unit_lease/stamp_id.rs",
+        ]
     );
 }
 
@@ -376,7 +420,14 @@ fn the_reserved_names_are_used_by_nothing() {
     let all = all();
     for name in ["BUCKET_CONFIG_DIR", "CATALOGUE_DUMP_PREFIX", "\"cb/"] {
         let found = uses(&all, name);
-        let files: Vec<&String> = found.keys().filter(|f| *f != TENANT).collect();
+        // The control seal tells a bucket configuration name (a control
+        // record) from a data record name, to refuse one for the other;
+        // it reads, writes and lists none.
+        let files: Vec<&String> = found
+            .keys()
+            .filter(|f| *f != TENANT)
+            .filter(|f| !(name == "BUCKET_CONFIG_DIR" && *f == "bridge/crypto/scheme2.rs"))
+            .collect();
         assert!(files.is_empty(), "{name}: {files:?}");
     }
 }
@@ -403,7 +454,17 @@ fn the_catalogue_id_is_read_in_one_place() {
             (file.clone(), n)
         })
         .filter(|(_, n)| *n > 0)
+        // The directory's records and the D1 database's marker carry a
+        // field of that name (the catalogue an undo landed on); the
+        // directory never reads the bridge's configuration (checked here).
+        .filter(|(f, _)| !in_directory(f))
         .collect();
+    for (f, text) in &all {
+        if in_directory(f) {
+            assert!(!text.contains("cfg.catalogue_id"), "{f}");
+            assert!(!text.contains("BridgeConfig"), "{f}");
+        }
+    }
     within(
         "`.catalogue_id`",
         &found,
@@ -449,7 +510,12 @@ fn the_directory_is_asked_by_nothing() {
     const DIRECTORY: &str = "bridge/directory/port.rs";
     for name in ["Directory", "SingleTenant", "directory::", ".route("] {
         let found = uses(&all, name);
-        let files: Vec<&String> = found.keys().filter(|f| *f != DIRECTORY).collect();
+        // The directory module's own files (its store, gate and the
+        // re-export) are not callers of the port.
+        let files: Vec<&String> = found
+            .keys()
+            .filter(|f| *f != DIRECTORY && !f.starts_with("bridge/directory/"))
+            .collect();
         assert!(files.is_empty(), "{name}: {files:?}");
     }
     // One method, and one adapter.

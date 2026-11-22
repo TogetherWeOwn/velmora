@@ -785,3 +785,53 @@ fn failing_duties_back_off() {
     assert_eq!(gap(2), 120_000);
     assert_eq!(gap(10), 1_800_000);
 }
+
+/// Round 5 L6-5: the consumer builds a unit's job config through
+/// `jobcall::stamp_id(&UnitName)`, and the stamp ledger keys the unit's
+/// row and objects by `UnitStampId`. The two formatters of `<t>.<u>` must
+/// give the same id for every unit name a managed tenant can have, or the
+/// unit refuses its own stamp calls (`ERR_CATALOGUE_ID`). This test holds
+/// until `jobcall::stamp_id` is built through `UnitStampId` (L1-4d).
+#[test]
+fn jobcall_stamp_id_is_the_unit_stamp_id_form() {
+    use velmora_bridge::unit::jobcall::stamp_id;
+    use velmora_bridge::unit::{TenantId, UnitName};
+
+    let mut tenants: Vec<String> = vec![
+        "t_0000000000000001".into(),
+        "t_0123456789abcdef".into(),
+        "t_ffffffffffffffff".into(),
+        "t_a000000000000000".into(),
+    ];
+    // A fixed sweep of hex tenant ids (an LCG, so the test is the same
+    // on every run).
+    let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
+    for _ in 0..256 {
+        x = x
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        tenants.push(format!("t_{x:016x}"));
+    }
+    let units = [0u32, 1, 9, 10, 99, 100, 65_535, 1_000_000, u32::MAX];
+    let mut checked = 0;
+    for t in &tenants {
+        let tenant = TenantId::parse(t).expect("a hex tenant id");
+        if tenant.is_zero() {
+            continue;
+        }
+        for &u in &units {
+            let name = UnitName::new(tenant.clone(), u);
+            let by_job = stamp_id(&name);
+            let by_ledger = UnitStampId::new(tenant.as_str(), u).expect("a managed tenant");
+            assert_eq!(by_job, by_ledger.as_str(), "{name:?}");
+            // And the ledger reads the job's id back as the same unit.
+            let back = UnitStampId::parse(&by_job).expect("the ledger's own form");
+            assert_eq!((back.tenant(), back.unit()), (tenant.as_str(), u));
+            checked += 1;
+        }
+    }
+    assert_eq!(checked, tenants.len() * units.len());
+    // Tenant 0 has no unit: the ledger refuses its id, and `for_unit`
+    // refuses to build a job config for it.
+    assert!(UnitStampId::new(TenantId::zero().as_str(), 0).is_err());
+}

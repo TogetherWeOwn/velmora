@@ -28,7 +28,7 @@
 use velmora_bridge::jobmsg::{JobTenant, Units};
 use velmora_bridge::sql::SqlCatalog;
 use velmora_bridge::tenant_catalog::{TenantCatalog, UnitPort};
-use velmora_bridge::unit::{Seqs, TenantId, UnitAnswer, UnitCall, UnitName};
+use velmora_bridge::unit::{Seqs, TenantId, UnitAnswer, UnitCall, UnitName, UnitReply};
 use velmora_bridge::{Bridge, BridgeError, Result};
 use worker::wasm_bindgen::JsValue;
 use worker::{Env, Method, ObjectNamespace, Request, RequestInit, Stub};
@@ -97,8 +97,17 @@ impl UnitPort for UnitStub {
             return Err(failed("call refused"));
         }
         let raw = resp.text().await.map_err(|_| failed("answer unreadable"))?;
-        serde_json::from_str(&raw).map_err(|_| failed("answer unreadable"))
+        decode_answer(&raw)
     }
+}
+
+/// The object answers a [`UnitReply`]: the answer, flattened, with the
+/// lease's `lease_left_ms` and `revoked` beside it (#225). `UnitAnswer`
+/// refuses unknown fields, so it is read through the reply.
+fn decode_answer(raw: &str) -> Result<UnitAnswer> {
+    serde_json::from_str::<UnitReply>(raw)
+        .map(|reply| reply.answer)
+        .map_err(|_| failed("answer unreadable"))
 }
 
 /// A class-only error: no call, answer or name in it.
@@ -143,4 +152,41 @@ pub fn unit_bridge(
         budget: base.budget.shared(),
         cfg,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// What the object sends (a `UnitReply`) is what the stub reads; the
+    /// bare answer type alone refuses it.
+    #[test]
+    fn the_stub_reads_the_objects_reply() {
+        let seqs = Seqs {
+            state_seq: 3,
+            keys_seq: 2,
+        };
+        for (answer, revoked) in [
+            (
+                UnitAnswer::Ok {
+                    seqs,
+                    body: json!({ "n": 1 }),
+                },
+                Some(4),
+            ),
+            (UnitAnswer::SyncNeeded { seqs }, None),
+            (UnitAnswer::RenewNeeded { seqs, why: None }, Some(0)),
+        ] {
+            let raw = serde_json::to_string(&UnitReply {
+                answer: answer.clone(),
+                lease_left_ms: 1_234,
+                revoked,
+            })
+            .unwrap();
+            assert!(serde_json::from_str::<UnitAnswer>(&raw).is_err(), "{raw}");
+            assert_eq!(decode_answer(&raw).unwrap(), answer, "{raw}");
+        }
+        assert!(decode_answer("{}").is_err());
+    }
 }
