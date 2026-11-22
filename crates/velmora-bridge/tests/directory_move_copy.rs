@@ -1233,7 +1233,7 @@ impl velmora_bridge::directory::move_keys::KeyUnit for LiftCalls<'_> {
     async fn apply_keys(
         &self,
         _from: u64,
-        _entries: &[velmora_bridge::unit::keys::KeyEntry],
+        _entries: &[velmora_bridge::unit::keys::ApplyEntry],
     ) -> Result<velmora_bridge::unit::keys::Applied> {
         unimplemented!("not a lift call")
     }

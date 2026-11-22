@@ -3,8 +3,10 @@
 //! the thawed D1 (AM-31).
 //!
 //! - [`apply_owner_keys`] is step 5(e): the owner's key-chain records sent
-//!   to the unit with a direct `apply(from_seq)`, each entry as its record
-//!   states (`held = false`), not through the writer's bring-up. A
+//!   to the unit with a direct `apply(from_seq)`, one item per record:
+//!   each entry as the head states its subject, stamped at the record's
+//!   seq (`held = false`), and a `KeysFrozen`/`KeysThawed` record as a
+//!   marker item (AM-62), not through the writer's bring-up. A
 //!   `behind` answer re-reads from the unit's seq + 1. The unit is closed
 //!   until 8(b) and no route names the owner until 8(c), so the hold of
 //!   ADR §2.5 does not apply (AM-16).
@@ -26,7 +28,7 @@
 
 use crate::ports::{Sql, SqlValue};
 use crate::types::{BridgeError, Result};
-use crate::unit::keys::{Applied, KeyEntry, KeyRefusal, MAX_ENTRIES};
+use crate::unit::keys::{Applied, ApplyEntry, KeyRefusal, MAX_ENTRIES};
 
 /// The owner tenant's key chain and its revocations, as the move tool
 /// holds them (the key lane's code in the Worker).
@@ -34,12 +36,13 @@ use crate::unit::keys::{Applied, KeyEntry, KeyRefusal, MAX_ENTRIES};
 pub trait OwnerKeys {
     /// The seq of the owner's key-chain head (0: no record).
     async fn head(&self) -> Result<u64>;
-    /// The verified entries of the records after `after`, in chain order,
-    /// at most `limit`: one entry per record, as the record states it. A
-    /// record that names no subject (`KeysFrozen`, `KeysThawed`, AM-28)
-    /// has no entry and is left out, so the seqs may have gaps; a record
-    /// that does not verify is an error, never left out.
-    async fn entries(&self, after: u64, limit: usize) -> Result<Vec<KeyEntry>>;
+    /// The verified items of the records after `after`, in chain order,
+    /// at most `limit`, with no gap: one per record, an entry stating its
+    /// subject as the head holds it, stamped at the record's seq, or a
+    /// marker for a record that changes no subject (`KeysFrozen`,
+    /// `KeysThawed`, AM-28, AM-62). A record that does not verify is an
+    /// error, never left out.
+    async fn entries(&self, after: u64, limit: usize) -> Result<Vec<ApplyEntry>>;
     /// Whether tenant 0's flat revocation `m/rk/<akid>` exists.
     async fn flat_revoked(&self, akid: &str) -> Result<bool>;
     /// Whether the owner's revocation `m/rk/<t>/<akid>` exists.
@@ -98,8 +101,8 @@ pub trait KeyFreeze {
 /// The owner's root unit, for the key steps.
 #[allow(async_fn_in_trait)]
 pub trait KeyUnit {
-    /// `ApplyKeys{from_seq, entries}` (AM-12).
-    async fn apply_keys(&self, from_seq: u64, entries: &[KeyEntry]) -> Result<Applied>;
+    /// `ApplyKeys{from_seq, entries}` (AM-12, AM-62).
+    async fn apply_keys(&self, from_seq: u64, entries: &[ApplyEntry]) -> Result<Applied>;
     /// Whether the unit serves `akid` now: its key row is `active`, not
     /// held, through `KeyRow`.
     async fn key_active(&self, akid: &str) -> Result<bool>;
@@ -148,10 +151,10 @@ pub async fn apply_owner_keys<K: OwnerKeys, U: KeyUnit>(
             return Ok(unit_seq.max(from));
         }
         let entries = keys.entries(from, MAX_ENTRIES).await?;
-        let Some(last) = entries.last().map(|e| e.last_seq) else {
+        let Some(last) = entries.last().map(ApplyEntry::seq) else {
             return Err(KeyStepError::Diverged);
         };
-        if let Some(e) = entries.iter().find(|e| e.held) {
+        if let Some(e) = entries.iter().filter_map(ApplyEntry::key).find(|e| e.held) {
             return Err(KeyStepError::HeldEntry(e.id.clone()));
         }
         match unit.apply_keys(from, &entries).await? {

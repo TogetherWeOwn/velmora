@@ -110,7 +110,9 @@ use crate::types::{BridgeError, UnixMs};
 use crate::unit::call::Refused as UnitRefused;
 use crate::unit::export::{hash_rows, key_of, ExportMode, ExportRefusal, ExportTable, MAX_ROWS};
 use crate::unit::import::{ImportTable, ImportValue};
-use crate::unit::keys::{Access, KeyEntry, KeyKind, SubjectStatus, MAX_DEPTH, MAX_ENTRIES};
+use crate::unit::keys::{
+    Access, ApplyEntry, KeyEntry, KeyKind, SubjectStatus, MAX_DEPTH, MAX_ENTRIES,
+};
 
 // ---------------------------------------------------------------------------
 // Errors and ports
@@ -1369,31 +1371,35 @@ pub fn project(
 }
 
 /// Every entry of the owner's chain up to `k_u`, in chain order. The
-/// freeze records (`KeysFrozen`, `KeysThawed`) are no subject's entry, so
-/// `K_u` itself may be one: a page that ends below `k_u` and a next one
-/// that is empty end the read.
+/// chain answers one item per record with no gap (AM-62): the freeze
+/// records (`KeysFrozen`, `KeysThawed`) come as markers, which are no
+/// subject's entry and are left out here, so `K_u` itself may be one. A
+/// chain that answers nothing below `k_u` diverged.
 pub async fn entries_to<K: OwnerKeys>(keys: &K, k_u: u64) -> Result<Vec<KeyEntry>> {
     let mut out = Vec::new();
     let mut from = 0u64;
     while from < k_u {
         let page = keys.entries(from, MAX_ENTRIES).await?;
-        let Some(last) = page.last().map(|e| e.last_seq) else {
-            // No entry follows `from`: only freeze records up to the head,
-            // which must reach `k_u`.
-            if keys.head().await? < k_u {
-                return Err(UndoError::Keys(KeyStepError::Diverged));
-            }
-            break;
+        let Some(last) = page.last().map(ApplyEntry::seq) else {
+            return Err(UndoError::Keys(KeyStepError::Diverged));
         };
         if last <= from {
             return Err(UndoError::Keys(KeyStepError::Diverged));
         }
+        let page: Vec<KeyEntry> = page
+            .into_iter()
+            .filter(|e| e.seq() <= k_u)
+            .filter_map(|e| match e {
+                ApplyEntry::Key(k) => Some(k),
+                ApplyEntry::Marker(_) => None,
+            })
+            .collect();
         // A held entry may lack its private grant limits: the move sends
         // records as they state, never held.
-        if let Some(e) = page.iter().find(|e| e.held && e.last_seq <= k_u) {
+        if let Some(e) = page.iter().find(|e| e.held) {
             return Err(UndoError::Keys(KeyStepError::HeldEntry(e.id.clone())));
         }
-        out.extend(page.into_iter().filter(|e| e.last_seq <= k_u));
+        out.extend(page);
         from = last;
     }
     Ok(out)

@@ -26,7 +26,7 @@ use velmora_bridge::ports::{Sql, SqlValue};
 use velmora_bridge::testkit::RusqliteSql;
 use velmora_bridge::unit::export::{export, ExportMode, ExportTable};
 use velmora_bridge::unit::import::{ImportTable, ImportValue};
-use velmora_bridge::unit::keys::{Access, KeyEntry, KeyGrant, KeyKind, SubjectStatus};
+use velmora_bridge::unit::keys::{Access, ApplyEntry, KeyEntry, KeyGrant, KeyKind, SubjectStatus};
 use velmora_bridge::unit::lift::{LiftProof, ReplayId};
 use velmora_bridge::*;
 
@@ -238,15 +238,31 @@ impl OwnerKeys for FakeKeys {
         Ok(self.seq())
     }
 
-    async fn entries(&self, after: u64, limit: usize) -> Result<Vec<KeyEntry>> {
+    /// One item per record, no gap (AM-62): the freeze records as
+    /// markers at their own seq.
+    async fn entries(&self, after: u64, limit: usize) -> Result<Vec<ApplyEntry>> {
+        use velmora_bridge::unit::keys::{KeyMarker, MarkerKind};
         Ok(self
             .records
             .borrow()
             .iter()
+            .enumerate()
             .skip(after as usize)
-            .filter_map(|r| match r {
-                KeyRecord::Entry(e) => Some(e.clone()),
-                _ => None,
+            .map(|(i, r)| {
+                let seq = i as u64 + 1;
+                match r {
+                    KeyRecord::Entry(e) => e.clone().into(),
+                    KeyRecord::Frozen(_) => KeyMarker {
+                        marker: MarkerKind::KeysFrozen,
+                        seq,
+                    }
+                    .into(),
+                    KeyRecord::Thawed(_) => KeyMarker {
+                        marker: MarkerKind::KeysThawed,
+                        seq,
+                    }
+                    .into(),
+                }
             })
             .take(limit)
             .collect())
@@ -2540,5 +2556,60 @@ fn an_earlier_import_found_after_the_moving_record_stops_step_two() {
             "{r:?}"
         );
         assert_eq!(u.head(&owner()).await.seq, before);
+    });
+}
+
+/// The undo's read of the owner's chain up to `K_u` (AM-62): the freeze
+/// records come as markers in their place and are no entry; `K_u` may be
+/// a marker; an entry above `K_u` is not read; a chain that answers less
+/// than its head says diverged.
+#[test]
+fn the_chain_read_up_to_k_u_skips_markers_and_refuses_a_short_chain() {
+    block_on(async {
+        let keys = FakeKeys::default();
+        let a = keys.push(
+            "AKUNDO0000000001",
+            KeyKind::S3,
+            SubjectStatus::Active,
+            None,
+            vec![],
+        );
+        keys.records.borrow_mut().push(KeyRecord::Frozen(a));
+        keys.records.borrow_mut().push(KeyRecord::Thawed(a));
+        let b = keys.push(
+            "AKUNDO0000000002",
+            KeyKind::S3,
+            SubjectStatus::Active,
+            None,
+            vec![],
+        );
+        keys.records.borrow_mut().push(KeyRecord::Frozen(b));
+        let k_u = keys.seq();
+        keys.push(
+            "AKUNDO0000000003",
+            KeyKind::S3,
+            SubjectStatus::Active,
+            None,
+            vec![],
+        );
+        let ids = |v: Vec<KeyEntry>| v.into_iter().map(|e| e.id).collect::<Vec<_>>();
+        assert_eq!(
+            ids(entries_to(&keys, k_u).await.unwrap()),
+            ["AKUNDO0000000001", "AKUNDO0000000002"]
+        );
+        assert_eq!(
+            ids(entries_to(&keys, 3).await.unwrap()),
+            ["AKUNDO0000000001"]
+        );
+        let r = entries_to(&keys, keys.seq() + 1).await;
+        assert!(
+            matches!(
+                r,
+                Err(UndoError::Keys(
+                    velmora_bridge::directory::move_keys::KeyStepError::Diverged
+                ))
+            ),
+            "{r:?}"
+        );
     });
 }
