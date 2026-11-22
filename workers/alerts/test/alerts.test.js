@@ -304,31 +304,36 @@ test("event alerts expire after two hours without a report, never before their e
 
 // ---- index.js ----
 
-test("tick: an increase in stalled scrub repairs emails once, then clears", async () => {
+test("tick: the first stalled scrub reading is quiet and a rise stays active for six hours", async () => {
   const e = env();
   e.CATALOG.db.exec("UPDATE scrub_state SET stalled = 2 WHERE id = 1");
   const first = await tick(e, T0);
   assert.deepEqual(first.conditions, []);
   assert.equal(first.sent, 0);
-  assert.equal(await store.getMeta(e.STATE, "scrub_stalled_reported"), 2);
+  assert.deepEqual(await store.getMeta(e.STATE, "scrub_stalled"), { seen: 2, roseAt: null });
   e.CATALOG.db.exec("UPDATE scrub_state SET stalled = 5 WHERE id = 1");
   const next = await tick(e, T0 + 5 * MIN);
   assert.deepEqual(next.conditions, ["scrub-stalled"]);
   assert.equal(next.sent, 1);
   assert.equal(e.ALERT_EMAIL.sent[0].subject, "[velmora] Scrub repair stalled");
   assert.ok(e.ALERT_EMAIL.sent[0].text.includes(
-    "3 scrub repair(s) still pinned in R2 at their bound: verify could not make every backbone hold the extent again. " +
-    "The scrub-stalled line in the S3 Worker log says whether the safety copy is intact, written again or missing; the extent's outbox row is in stage verify.",
+    "A scrub repair is still pinned in R2 at its bound (the stalled total rose 0 min ago; 5 in all): verify could not make every backbone hold the extent again. " +
+    "The scrub-stalled line in the S3 Worker log says whether the safety copy is intact, written again or missing; the extent's outbox row is in stage verify. " +
+    "This alert clears 6.0 h after the last rise.",
   ));
-  assert.equal(await store.getMeta(e.STATE, "scrub_stalled_reported"), 5);
+  assert.deepEqual(await store.getMeta(e.STATE, "scrub_stalled"), { seen: 5, roseAt: T0 + 5 * MIN });
   const same = await tick(e, T0 + 10 * MIN);
-  assert.deepEqual(same.conditions, []);
+  assert.deepEqual(same.conditions, ["scrub-stalled"]);
   assert.equal(e.ALERT_EMAIL.sent.length, 1);
-  const row = await e.STATE.prepare("SELECT active FROM alerts WHERE key = 'scrub-stalled'").first();
-  assert.equal(row.active, 0);
+  const row = e.STATE.prepare("SELECT active FROM alerts WHERE key = 'scrub-stalled'");
+  assert.equal((await row.first()).active, 1);
+  const end = T0 + 5 * MIN + 6 * HOUR;
+  assert.deepEqual((await tick(e, end)).conditions, ["scrub-stalled"]);
+  assert.deepEqual((await tick(e, end + 1)).conditions, []);
+  assert.equal((await row.first()).active, 0);
 });
 
-test("tick: a lower stalled scrub total resets the baseline for the next rise", async () => {
+test("tick: a lower stalled scrub total lowers seen and allows a later rise to alert", async () => {
   const e = env();
   e.CATALOG.db.exec("UPDATE scrub_state SET stalled = 5 WHERE id = 1");
   await tick(e, T0);
@@ -336,15 +341,18 @@ test("tick: a lower stalled scrub total resets the baseline for the next rise", 
   const lower = await tick(e, T0 + 5 * MIN);
   assert.deepEqual(lower.conditions, []);
   assert.equal(lower.sent, 0);
-  assert.equal(await store.getMeta(e.STATE, "scrub_stalled_reported"), 2);
+  assert.deepEqual(await store.getMeta(e.STATE, "scrub_stalled"), { seen: 2, roseAt: null });
   e.CATALOG.db.exec("UPDATE scrub_state SET stalled = 3 WHERE id = 1");
   const rise = await tick(e, T0 + 10 * MIN);
   assert.deepEqual(rise.conditions, ["scrub-stalled"]);
   assert.equal(rise.sent, 1);
-  assert.equal(await store.getMeta(e.STATE, "scrub_stalled_reported"), 3);
+  assert.deepEqual(await store.getMeta(e.STATE, "scrub_stalled"), { seen: 3, roseAt: T0 + 10 * MIN });
+  e.CATALOG.db.exec("UPDATE scrub_state SET stalled = 2 WHERE id = 1");
+  assert.equal((await tick(e, T0 + 15 * MIN)).sent, 0);
+  assert.deepEqual(await store.getMeta(e.STATE, "scrub_stalled"), { seen: 2, roseAt: T0 + 10 * MIN });
 });
 
-test("tick: a failed scrub-stalled email leaves the baseline until the retry sends", async () => {
+test("tick: a failed scrub-stalled email is retried on the next tick", async () => {
   const e = env();
   await tick(e, T0);
   e.CATALOG.db.exec("UPDATE scrub_state SET stalled = 1 WHERE id = 1");
@@ -353,28 +361,39 @@ test("tick: a failed scrub-stalled email leaves the baseline until the retry sen
   assert.deepEqual(failed.conditions, ["scrub-stalled"]);
   assert.equal(failed.sendFailures, 1);
   assert.equal(e.ALERT_EMAIL.sent.length, 0);
-  assert.equal(await store.getMeta(e.STATE, "scrub_stalled_reported"), 0);
+  assert.deepEqual(await store.getMeta(e.STATE, "scrub_stalled"), { seen: 1, roseAt: T0 + 5 * MIN });
   e.ALERT_EMAIL.fail = null;
   const retried = await tick(e, T0 + 10 * MIN);
   assert.deepEqual(retried.conditions, ["scrub-stalled"]);
   assert.equal(retried.sent, 1);
-  assert.equal(await store.getMeta(e.STATE, "scrub_stalled_reported"), 1);
+  assert.deepEqual(await store.getMeta(e.STATE, "scrub_stalled"), { seen: 1, roseAt: T0 + 5 * MIN });
 });
 
-test("tick: a second scrub stall inside the hour emails after the gap", async () => {
+test("tick: hourly scrub stalls keep one active run and back off emails", async () => {
   const e = env();
-  await tick(e, T0);
+  await tick(e, T0 - 5 * MIN);
+  const update = e.CATALOG.db.prepare("UPDATE scrub_state SET stalled = ? WHERE id = 1");
+  const sentAt = [];
+  for (let hour = 0; hour < 12; hour++) {
+    update.run(hour + 1);
+    const now = T0 + hour * HOUR;
+    const rise = await tick(e, now);
+    assert.deepEqual(rise.conditions, ["scrub-stalled"]);
+    if (rise.sent) sentAt.push(hour);
+    assert.deepEqual(await store.getMeta(e.STATE, "scrub_stalled"), { seen: hour + 1, roseAt: now });
+    assert.deepEqual((await tick(e, now + 5 * MIN)).conditions, ["scrub-stalled"]);
+  }
+  assert.deepEqual(sentAt, [0, 1, 3, 7]);
+  assert.equal(e.ALERT_EMAIL.sent.length, 4);
+});
+
+test("tick: a zero stalled window is floored at one hour", async () => {
+  const e = env({ SCRUB_STALLED_WINDOW_SECS: "0" });
+  await tick(e, T0 - 5 * MIN);
   e.CATALOG.db.exec("UPDATE scrub_state SET stalled = 1 WHERE id = 1");
-  assert.equal((await tick(e, T0 + 5 * MIN)).sent, 1);
-  e.CATALOG.db.exec("UPDATE scrub_state SET stalled = 2 WHERE id = 1");
-  const held = await tick(e, T0 + 10 * MIN);
-  assert.deepEqual(held.conditions, ["scrub-stalled"]);
-  assert.equal(held.sent, 0);
-  assert.equal(await store.getMeta(e.STATE, "scrub_stalled_reported"), 1);
-  const due = await tick(e, T0 + 5 * MIN + HOUR);
-  assert.deepEqual(due.conditions, ["scrub-stalled"]);
-  assert.equal(due.sent, 1);
-  assert.equal(await store.getMeta(e.STATE, "scrub_stalled_reported"), 2);
+  assert.equal((await tick(e, T0)).sent, 1);
+  assert.deepEqual((await tick(e, T0 + HOUR)).conditions, ["scrub-stalled"]);
+  assert.deepEqual((await tick(e, T0 + HOUR + 1)).conditions, []);
 });
 
 test("tick: a failed scrub reading keeps scrub keys and the last stalled total", async () => {
@@ -392,11 +411,20 @@ test("tick: a failed scrub reading keeps scrub keys and the last stalled total",
   assert.match(r.snap.errors[0], /^scrub state: no such column: stalled/);
   assert.equal(r.snap.scrubMissing, false);
   assert.ok(figures(r.snap).includes("scrub: could not read"));
-  assert.equal(await store.getMeta(e.STATE, "scrub_stalled_reported"), 3);
+  assert.deepEqual(await store.getMeta(e.STATE, "scrub_stalled"), { seen: 3, roseAt: T0 + 5 * MIN });
   for (const key of active.conditions) {
     const row = await e.STATE.prepare("SELECT active FROM alerts WHERE key = ?1").bind(key).first();
     assert.equal(row.active, 1, key);
   }
+});
+
+test("tick: a missing scrub table leaves the stalled metadata unchanged", async () => {
+  const e = env();
+  await store.setMeta(e.STATE, "scrub_stalled", { seen: 3, roseAt: T0 });
+  e.CATALOG.db.exec("DROP TABLE scrub_state");
+  const result = await tick(e, T0 + 5 * MIN);
+  assert.equal(result.snap.scrubMissing, true);
+  assert.deepEqual(await store.getMeta(e.STATE, "scrub_stalled"), { seen: 3, roseAt: T0 });
 });
 
 test("tick: a stalled post head emails once after 30 + 30 min, then clears", async () => {

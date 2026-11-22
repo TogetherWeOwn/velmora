@@ -18,7 +18,6 @@ import { alertMessage, digestMessage, send } from "./email.js";
 
 const KEY_RE = /^[a-z0-9][a-z0-9._:-]{0,99}$/;
 const MAX_BODY = 16 * 1024;
-const SCRUB_STALLED_REPORTED = "scrub_stalled_reported";
 // Control characters (CR, LF ...) never reach a subject line.
 const oneLine = (s) => String(s).replace(/[\u0000-\u001f\u007f]+/g, " ").trim();
 const SOURCES = new Set(["host", "ci"]);
@@ -86,7 +85,7 @@ async function heartbeat(env, ok) {
 export async function tick(env, now) {
   const db = env.STATE;
   const prevPostHead = await store.getMeta(db, "post_head");
-  const prevScrubStalled = await store.getMeta(db, SCRUB_STALLED_REPORTED);
+  const scrubStalled = await store.getMeta(db, "scrub_stalled");
   // The export bucket is listed once an hour; between, the last reading holds.
   const lastExport = await store.getMeta(db, "export_check");
   const checkExport = !lastExport || now - lastExport.at >= store.HOUR;
@@ -99,24 +98,24 @@ export async function tick(env, now) {
     }
   }
   snap.prevPostHead = prevPostHead;
-  snap.prevScrubStalled = prevScrubStalled ?? undefined;
+  snap.scrubStalledRoseAt = scrubStalled?.roseAt ?? null;
   snap.dlqLastHour = await store.dlqSince(db, now - store.HOUR);
   if (!snap.errors.some((e) => e.startsWith("post head"))) {
     await store.setMeta(db, "post_head", snap.postHead);
   }
-  if (snap.scrub && (prevScrubStalled === null || snap.scrub.stalled < prevScrubStalled)) {
-    await store.setMeta(db, SCRUB_STALLED_REPORTED, snap.scrub.stalled);
+  if (snap.scrub && !snap.errors.some((e) => e.startsWith("scrub state"))) {
+    const seen = snap.scrub.stalled;
+    if (seen !== scrubStalled?.seen) {
+      if (scrubStalled && seen > scrubStalled.seen) snap.scrubStalledRoseAt = now;
+      await store.setMeta(db, "scrub_stalled", { seen, roseAt: snap.scrubStalledRoseAt });
+    }
   }
 
   const conds = evaluate(snap, env);
   const results = [];
   for (const c of conds) {
     const row = await store.observe(db, { ...c, source: "cron", severity: "page" }, now);
-    const result = await maybeSend(env, row, now, c.forMs);
-    if (c.key === "scrub-stalled" && result === "sent") {
-      await store.setMeta(db, SCRUB_STALLED_REPORTED, snap.scrub.stalled);
-    }
-    results.push(result);
+    results.push(await maybeSend(env, row, now, c.forMs));
   }
   // Reports that came in while their key waited out its hour.
   for (const row of await store.unsentEvents(db)) results.push(await maybeSend(env, row, now, 0));

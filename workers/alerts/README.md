@@ -21,7 +21,7 @@ ever written there. Each condition below emails when it holds:
 | `catalog-export-stale` | the newest export manifest in the export bucket is over 26 h old (listed hourly) | at once |
 | `scrub-unrecoverable` | the scrub found an extent with no intact copy within `SCRUB_UNRECOVERABLE_WINDOW_SECS` (6 h, minimum 1 h) | at once |
 | `scrub-incident` | the scrub breaker is holding repairs back on one or more backbones | at once |
-| `scrub-stalled` | the total of repairs still pinned at their bound rose above the reporting baseline | once per rise, retried until sent |
+| `scrub-stalled` | the total of repairs still pinned at their bound rose within `SCRUB_STALLED_WINDOW_SECS` (6 h, minimum 1 h) | at once |
 | `scrub-stopped` | `SCRUB_STALE_SECS` is enabled and the scrub state is missing, the scrub never ran, or its last run is older than the threshold | at once |
 | `check-error` | a reading failed (its check did not run) | 15 min |
 
@@ -114,8 +114,9 @@ All of it is well inside the included usage.
    `ALERTS_INGEST_URL` (this Worker's URL) and the secret
    `ALERTS_INGEST_TOKEN` (the same token).
 
-Set thresholds as Worker vars. `SCRUB_UNRECOVERABLE_WINDOW_SECS` defaults
-to 21600 with a floor of 3600, and `SCRUB_STALE_SECS` defaults to 0 (off).
+Set thresholds as Worker vars. `SCRUB_UNRECOVERABLE_WINDOW_SECS` and
+`SCRUB_STALLED_WINDOW_SECS` default to 21600 with a floor of 3600.
+`SCRUB_STALE_SECS` defaults to 0 (off).
 See `wrangler.toml` for the optional vars and their defaults.
 
 ## Tests

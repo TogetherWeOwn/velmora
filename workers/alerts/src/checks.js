@@ -25,6 +25,7 @@ export const DEFAULTS = Object.freeze({
   FAILING_ATTEMPTS: 3,
   // Keep at least 3 x SCRUB_CONFIRM_SECS (1 h) plus margin for delayed re-checks.
   SCRUB_UNRECOVERABLE_WINDOW_SECS: 6 * 3600,
+  SCRUB_STALLED_WINDOW_SECS: 6 * 3600,
   // Off at 0. Set to e.g. 3600 once SCRUB=on. Scrub runs every 5 min.
   SCRUB_STALE_SECS: 0,
 });
@@ -72,7 +73,7 @@ function ageText(ms) {
  *   scrub: { runs, checked, unrecoverable, stalled, lastRunAt,
  *            lastUnrecoverableAt, lastIncidentAt, incident } | null
  *   scrubMissing: boolean               scrub_state table or row is absent
- *   prevScrubStalled: number | undefined  stalled total used as the reporting baseline
+ *   scrubStalledRoseAt: number | null    ms of the last tick that saw the stalled total rise
  *   errors:     [string]                readings that failed
  * }
  */
@@ -222,13 +223,16 @@ export function evaluate(snap, env = {}) {
       });
     }
 
-    if (typeof snap.prevScrubStalled === "number" && scrub.stalled > snap.prevScrubStalled) {
+    const stalledWindowMs = setting(env, "SCRUB_STALLED_WINDOW_SECS", 3600) * 1000;
+    const roseAt = snap.scrubStalledRoseAt;
+    if (typeof roseAt === "number" && now - roseAt <= stalledWindowMs) {
       out.push({
         key: "scrub-stalled",
         title: "Scrub repair stalled",
         detail:
-          `${scrub.stalled - snap.prevScrubStalled} scrub repair(s) still pinned in R2 at their bound: verify could not make every backbone hold the extent again. ` +
-          "The scrub-stalled line in the S3 Worker log says whether the safety copy is intact, written again or missing; the extent's outbox row is in stage verify.",
+          `A scrub repair is still pinned in R2 at its bound (the stalled total rose ${ageText(now - roseAt)} ago; ${scrub.stalled} in all): verify could not make every backbone hold the extent again. ` +
+          "The scrub-stalled line in the S3 Worker log says whether the safety copy is intact, written again or missing; the extent's outbox row is in stage verify. " +
+          `This alert clears ${ageText(stalledWindowMs)} after the last rise.`,
         forMs: 0,
       });
     }
