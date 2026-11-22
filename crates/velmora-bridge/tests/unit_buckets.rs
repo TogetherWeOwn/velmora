@@ -300,13 +300,144 @@ fn a_dropped_record_drops_an_empty_row_and_keeps_one_that_holds_data_closing() {
     assert_eq!(done.drop_not_closed, vec![B3.to_string()]);
     assert_eq!(ids(&u), vec![B3.to_string()]);
     assert!(closing(&u, B3));
-    // Its name stays taken, and the head no longer places it: the
-    // placement check leaves it out.
+    // The kept row gives its name up (`~dropped/<id>`), so a later
+    // `created` takes it; the head no longer places it, so the placement
+    // check leaves it out.
+    assert_eq!(name_of(&u, B3), format!("~dropped/{B3}"));
     assert!(buckets::placement_check(u.sql(), &[]).unwrap());
-    assert!(!buckets::placement_check(u.sql(), &placed(&[B3])).unwrap());
+    let b4 = "b_00000000000000e4";
+    let done = apply(&u, &[created(10, b4, "gamma", 5)], false).unwrap();
+    assert_eq!(done.created, 1);
+    assert!(buckets::placement_check(u.sql(), &placed(&[b4])).unwrap());
     // A dropped record for a row that is gone changes nothing.
-    let done = apply(&u, &[dropped(10, B1)], false).unwrap();
+    let done = apply(&u, &[dropped(11, B1)], false).unwrap();
     assert_eq!(done, BucketsApplied::default());
+}
+
+fn name_of(u: &Unit<RusqliteSql>, id: &str) -> String {
+    u.sql()
+        .with_conn(|c| c.query_row("SELECT name FROM buckets WHERE id = ?1", [id], |r| r.get(0)))
+        .unwrap()
+}
+
+fn grant_rows(u: &Unit<RusqliteSql>, bucket: &str) -> i64 {
+    u.sql()
+        .with_conn(|c| {
+            c.query_row(
+                "SELECT count(*) FROM grants WHERE bucket_id = ?1",
+                [bucket],
+                |r| r.get(0),
+            )
+        })
+        .unwrap()
+}
+
+/// AM-57 step 2a: a closing row the head does not place is dropped once
+/// it holds nothing; a placed closing row, or one that still holds data,
+/// is kept.
+#[test]
+fn a_closing_row_the_head_does_not_place_is_swept_once_empty() {
+    let u = ready();
+    apply(
+        &u,
+        &[created(4, B1, "alpha", 2), created(5, B2, "beta", 3)],
+        false,
+    )
+    .unwrap();
+    for b in [B1, B2] {
+        worker(
+            &u,
+            UnitOp::BucketClose {
+                bucket_id: b.into(),
+            },
+        );
+    }
+    // Both closed by `bucket_close`; their records never came, and the
+    // head places B1 only (B2's drop was taken back, say).
+    hold_something(&u, B2);
+    assert_eq!(buckets::sweep_closing(u.sql(), &placed(&[B1])).unwrap(), 0);
+    assert!(buckets::placement_check(u.sql(), &placed(&[B1])).unwrap());
+    // B2's data is gone: swept.
+    u.sql()
+        .with_conn(|c| c.execute("DELETE FROM key_floors WHERE bucket_id = ?1", [B2]))
+        .unwrap();
+    assert_eq!(buckets::sweep_closing(u.sql(), &placed(&[B1])).unwrap(), 1);
+    assert_eq!(ids(&u), vec![B1.to_string()]);
+    // The placed closing row stays (its record has not come).
+    assert_eq!(buckets::sweep_closing(u.sql(), &placed(&[B1])).unwrap(), 0);
+    assert!(closing(&u, B1));
+}
+
+/// The keys' grants on a bucket are applied before its row exists (`sync`
+/// follows the key chain): the row's `created` serves them, and its drop
+/// takes the bucket's grant rows and nothing else.
+#[test]
+fn a_created_row_serves_the_grants_already_applied_and_a_drop_removes_them() {
+    use velmora_bridge::unit::keys::{Access, KeyEntry, KeyGrant, KeyKind, SubjectStatus};
+    let u = ready();
+    apply(&u, &[created(4, B1, "alpha", 2)], false).unwrap();
+    let g = |b: &str| KeyGrant {
+        bucket_id: b.into(),
+        access: Access::Rw,
+        expires_at: None,
+        prefix: None,
+        ip_list: vec![],
+    };
+    let principal = KeyEntry {
+        id: "p_owner".into(),
+        kind: KeyKind::Principal,
+        status: SubjectStatus::Active,
+        held: false,
+        made_by: None,
+        grants: vec![g(B1), g(B2)],
+        created_at: 1,
+        secret_wrapped: None,
+        secret_kek_version: None,
+        owner_ref: Some("owner-1".into()),
+        last_seq: 1,
+        rid: None,
+    };
+    let key = KeyEntry {
+        id: "AKBUCKETS00000000001".into(),
+        kind: KeyKind::S3,
+        made_by: Some("p_owner".into()),
+        grants: vec![g(B1), g(B2)],
+        secret_wrapped: Some(vec![0x02, 1]),
+        secret_kek_version: Some(1),
+        owner_ref: None,
+        last_seq: 2,
+        ..principal.clone()
+    };
+    let a = worker(
+        &u,
+        UnitOp::ApplyKeys {
+            from_seq: 0,
+            entries: vec![principal.into(), key.into()],
+            answers: vec![],
+        },
+    );
+    assert!(matches!(a, UnitAnswer::Ok { .. }), "{a:?}");
+    assert_eq!((grant_rows(&u, B1), grant_rows(&u, B2)), (1, 0));
+    apply(&u, &[created(5, B2, "beta", 3)], false).unwrap();
+    assert_eq!(grant_rows(&u, B2), 1);
+    apply(&u, &[dropped(6, B2)], false).unwrap();
+    assert_eq!((grant_rows(&u, B1), grant_rows(&u, B2)), (1, 0));
+}
+
+/// AM-56: once the reservation is gone, the finisher's binding read of K
+/// answers `created` from the row made for K, and never fences it.
+#[test]
+fn a_bucket_row_answers_its_creator_grant_after_the_reservation_is_gone() {
+    let u = ready();
+    apply(&u, &[created(4, B1, "alpha", 7)], false).unwrap();
+    let UnitAnswer::Ok { body, .. } = worker(&u, UnitOp::BucketBinding { grant_seq: 7 }) else {
+        panic!()
+    };
+    assert_eq!(body, json!({ "binding": "created", "bucket": B1 }));
+    let UnitAnswer::Ok { body, .. } = worker(&u, UnitOp::BucketBinding { grant_seq: 8 }) else {
+        panic!()
+    };
+    assert_eq!(body, json!({ "binding": "none" }));
 }
 
 #[test]
@@ -408,4 +539,72 @@ fn a_bucket_change_reads_back_from_its_json_and_shows_no_name_or_wrap() {
     assert!(serde_json::from_value::<BucketChange>(v).is_err());
     let shown = format!("{c:?}");
     assert!(!shown.contains("secret-name"), "{shown}");
+}
+
+/// The unit's bucket rows with its open creates stay below
+/// `MAX_PLACED`, the bound of the placement list every `sync` carries: a
+/// bucket create's reservation is refused `cap_reached` at it, so a
+/// tenant's `sync` is never refused for its size.
+#[test]
+fn a_bucket_create_is_refused_once_the_unit_holds_max_placed() {
+    use velmora_bridge::unit::keys::{KeyEntry, KeyKind, SubjectStatus};
+    use velmora_bridge::unit::reserve::{Acting, Hash32, Opening, ReserveRefusal, Rid};
+    let u = ready();
+    let principal = KeyEntry {
+        id: "p_owner".into(),
+        kind: KeyKind::Principal,
+        status: SubjectStatus::Active,
+        held: false,
+        made_by: None,
+        grants: vec![],
+        created_at: 1,
+        secret_wrapped: None,
+        secret_kek_version: None,
+        owner_ref: Some("owner-1".into()),
+        last_seq: 1,
+        rid: None,
+    };
+    let a = worker(
+        &u,
+        UnitOp::ApplyKeys {
+            from_seq: 0,
+            entries: vec![principal.into()],
+            answers: vec![],
+        },
+    );
+    assert!(matches!(a, UnitAnswer::Ok { .. }), "{a:?}");
+    u.sql()
+        .with_conn(|c| {
+            let tx = c.unchecked_transaction()?;
+            {
+                let mut st = tx.prepare(
+                    "INSERT INTO buckets(id, name, owner, bdk_wrapped, kek_version, created_at) \
+                     VALUES (?1, ?2, 'o', x'02', 1, 1)",
+                )?;
+                for i in 0..buckets::MAX_PLACED - 1 {
+                    st.execute([format!("b_{i:016x}"), format!("bulk-{i}")])?;
+                }
+            }
+            tx.commit()
+        })
+        .unwrap();
+    let ask = |n: u8| UnitOp::Reserve {
+        key_hash: Hash32([n; 32]),
+        fingerprint: Hash32([n; 32]),
+        rid: Rid([n; 16]),
+        acting: Some(Acting::OwnerRef("owner-1".into())),
+        opening: Opening::Bucket {
+            name: format!("last-{n}"),
+            unit: 0,
+        },
+    };
+    let first = worker(&u, ask(1));
+    assert!(matches!(first, UnitAnswer::Ok { .. }), "{first:?}");
+    assert!(matches!(
+        worker(&u, ask(2)),
+        UnitAnswer::Refused {
+            reason: Refused::Reserve(ReserveRefusal::CapReached),
+            ..
+        }
+    ));
 }

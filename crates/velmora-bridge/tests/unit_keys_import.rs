@@ -1124,6 +1124,7 @@ fn batches_apply_once_and_in_order_and_the_import_resumes_by_cursor() {
             "t0_seq": 10,
             "since_seq": SINCE,
             "move_lifted": false,
+            "lifted_at": null,
         })
     );
 }

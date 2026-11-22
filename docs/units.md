@@ -253,25 +253,36 @@ bucket ids the head places on this unit. `name` and `bdk_wrapped` come
 from the record's private part. In the `sync`'s transaction the unit:
 
 1. makes each created bucket's row (`created_at` = the record's
-   `written_at`) and turns the reservation bound to `grant_seq`, if one
-   is left, `applied` (no answer is kept: the Worker builds it from the
-   chain). A row with the same id and name changes nothing; another name
-   for the id, or the name for another id, refuses the `sync`
-   (`created_conflict`, alarm). A row of the other key scheme is refused
-   by the scheme triggers;
+   `written_at`; `grant_seq` kept beside it) and turns the reservation
+   bound to `grant_seq`, if one is left, `applied` (no answer is kept:
+   the Worker builds it from the chain). The keys' grants on the bucket,
+   applied before its row existed, are served from then on. A row with
+   the same id and name changes nothing; another name for the id, or the
+   name for another id, refuses the `sync` (`created_conflict`, alarm). A
+   row of the other key scheme is refused by the scheme triggers. Once
+   the reservation is gone, `bucket_binding(K)` answers `created` from
+   the row kept for K, and never fences a K whose bucket exists (AM-56);
 2. drops each dropped bucket's row (its grants first) if it is closing
-   and holds nothing. A row that is not closing is marked closing first;
-   one that still holds something is kept closing with the record's seq,
+   and holds nothing. A row that is not closing is marked closing first.
+   One that still holds something is kept and renamed
+   `~dropped/<bucket_id>`, so that a later `created` can take the name;
    the rest of the `sync` applies, and the answer names it for the
    operator's page (`drop_not_closed`). No object is deleted for it;
+2a. on every `sync` (after the changes, before the check) and on the
+   gate's last call after §8.6 step 7.4, drops each closing row the head
+   does not place once it holds nothing (`buckets::sweep_closing`);
 3. for `unplaced`, removes nothing while the unit's `restoring` entry is
    set, and otherwise drops those rows as in 2;
-4. checks that its bucket rows, less the closing rows a `dropped` or
-   `unplaced` named, equal the head's list, only while the `restoring`
-   entry is not set and in the `sync` that clears it. A difference
-   refuses the whole `sync` (`placements_off`, alarm); the Worker reads
-   the chain again and sends it once more, and the same refusal again
-   stops and pages.
+4. checks that its bucket rows, less every closing row the head does not
+   place, equal the head's list, only while the `restoring` entry is not
+   set and in the `sync` that clears it. A difference refuses the whole
+   `sync` (`placements_off`, alarm); the Worker reads the chain again and
+   sends it once more, and the same refusal again stops and pages.
+
+The list a `sync` carries is whole, so it is bounded: at most 10,000
+(est) ids, and as many changes, `unplaced` ids included. A bucket
+create's reservation is refused `cap_reached` once the unit's rows and
+its open creates reach that bound, so no tenant outgrows its `sync`.
 
 "Holds nothing" is the catalogue's rule for a bucket delete: no
 generation, object, key floor, upload or extent names the bucket. That
@@ -288,7 +299,9 @@ request path). Then the `DropBucket` record, then `sync`. A closing
 bucket whose record never came stays closed and empty, and its name
 taken, until a delete retry completes it. The `sync` arm that carries
 the changes, and the stamp raise after `bucket_close` (AM-48), are the
-Worker's (L2).
+Worker's (L2). Until the request path asks `is_closing` before a write
+(`RequestCall`, L1 package 5), a write into a closing bucket is not
+refused; a drop still keeps every row that holds data.
 
 ## Key scheme
 
@@ -359,8 +372,9 @@ passes under any entry, whatever the report.
 `import_progress` answers, read-only, every table's cursor and rows, and
 `sealed` (the seal's `move_ordinal`), `t0_seq` (the newest tenant-0 seq a
 batch, the seal or a `move` report was bound to), `since_seq` and
-`move_lifted`; the last three are null when no import was ever bound to
-the unit. It also answers `schema_tables`, every table the unit holds
+`move_lifted`, which are null when no import was ever bound to the unit,
+and `lifted_at`, the unit's clock at the lift, null until a `move` report
+lifted it (the chain's move floor is raised from it, AM-67). It also answers `schema_tables`, every table the unit holds
 (SQLite's and the platform's own left out), for the reverse move's
 preflight. A window's copy resumes only an import whose `t0_seq` is at or
 above its own first record (AM-53); a second move reads it before step 0
@@ -516,12 +530,18 @@ with `move_not_lifted`, so no undo bookmark from before the lift exists;
 `restore`, which needs that bookmark, is refused the same way. Once
 lifted, `restore` refuses a time target before `lifted_at` + 60 s (est)
 with `before_move_lift`. **The floor is also kept in the tenant chain**
-(AM-67), where a unit restore cannot take it back: the first owner-tenant
-record after the lift sets the carried door field `move_floors: {<unit>:
-<lifted_at>}`, and every `restore` call carries `floor_ms`, read by the
-Worker from the verified head for that unit (0 when there is none). The
-unit refuses a time target before max(its own `lifted_at`, `floor_ms`) +
-60 s with `before_move_lift`, also when its own record is gone. It also refuses a time target before the unit's
+(AM-67), where a unit restore cannot take it back: the carried door field
+`move_floors: {<unit>: <ms>}`, raised and never lowered or removed, by
+three writers: the move's step 8(b1) record `SetMoveFloor{unit,
+lifted_at}` (the tool reads `lifted_at` from `ImportProgress`); every
+exit that empties a unit with `deleteAll()` (to the Worker's clock after
+it answered); and the Worker before every `restore`, when
+`ImportProgress` shows a `lifted_at` above the head's. Every `restore`
+call carries `floor_ms`, a required field, read from the verified head
+for that unit (0 only when the head has none; no `restore` is sent when
+the head cannot be read). The unit refuses a time target before max(its
+own `lifted_at`, `floor_ms`) + 60 s with `before_move_lift`, also when
+its own record is gone. It also refuses a time target before the unit's
 own `born_at` + 60 s (est) with `before_birth`: a rebirth (a dump restore
 into a gone or unborn unit, or a re-creation after `deleteAll()`)
 replaced the unit, and the history before it would bring back the old

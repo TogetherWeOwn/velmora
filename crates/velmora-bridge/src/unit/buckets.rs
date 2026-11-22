@@ -15,20 +15,28 @@
 //!    `applied`. A row that exists with the same id and name changes
 //!    nothing; one with the same id and another name, or another id with
 //!    the name, is a broken chain: refused (`created_conflict`, alarm).
+//!    The row keeps `grant_seq` (`unit_bucket_grant`), so the finisher's
+//!    `bucket_binding(K)` answers `created` from it once the reservation
+//!    is gone (AM-56), and every key's grant on the bucket, applied before
+//!    the row existed, is served from now on.
 //! 2. `dropped`: drops the row if it is `closing` and holds nothing of
 //!    the bucket. A row that is not closing (a restore or a rollback took
-//!    the close back) is marked closing first; a row that still holds
-//!    something is kept closing, the rest of the `sync` applies, and the
-//!    unit pages `drop_not_closed` for the operator. No object is deleted
-//!    for it.
+//!    the close back) is marked closing first. A row kept because it
+//!    still holds something is renamed `~dropped/<bucket_id>`, so that a
+//!    later `created` can take the name; the rest of the `sync` applies,
+//!    and the unit pages `drop_not_closed` for the operator. No object is
+//!    deleted for it.
+//!
+//!    Step 2a: [`sweep_closing`], on every `sync` (after `apply`, before
+//!    the check) and on the gate's last call after §8.6 step 7.4, drops
+//!    each closing row the head does not place once it holds nothing.
 //! 3. `unplaced` (`UnplaceMovedBuckets`, AM-23): nothing while the unit's
 //!    `restoring` entry is set (the 30-day copy keeps its rows until the
 //!    day-30 `deleteAll()`); otherwise each bucket as in 2.
-//! 4. [`placement_check`]: the unit's bucket rows, less the closing rows
-//!    that a `dropped` or `unplaced` named, equal the head's list. Run
-//!    only while the `restoring` entry is not set, and by the `sync` that
-//!    clears it. A difference refuses the whole `sync`
-//!    (`placements_off`, alarm).
+//! 4. [`placement_check`]: the unit's bucket rows, less every closing row
+//!    the head does not place, equal the head's list. Run only while the
+//!    `restoring` entry is not set, and by the `sync` that clears it. A
+//!    difference refuses the whole `sync` (`placements_off`, alarm).
 //!
 //! "Holds nothing of the bucket" is the catalogue's own rule for a
 //! bucket delete (`sql::auth::delete_bucket`): no generation, object,
@@ -50,15 +58,22 @@ use std::collections::BTreeSet;
 
 use serde::{Deserialize, Serialize};
 
+use super::keys;
 use super::object::poll_once;
 use super::reserve;
 use crate::ports::{Sql, SqlValue};
 use crate::types::{BridgeError, Result, UnixMs};
 
-/// The most bucket changes one `sync` may carry (est), and the most
-/// bucket ids in its placement list or in one `unplaced`.
-pub const MAX_CHANGES: usize = 100;
-pub const MAX_PLACED: usize = 1_000;
+/// The most bucket rows a unit holds (est): a bucket create's
+/// reservation is refused `cap_reached` at it, so the head's placement
+/// list for the unit, which every `sync` carries whole, never outgrows
+/// [`check_shape`]'s bound.
+pub const MAX_PLACED: usize = 10_000;
+/// The most bucket changes one `sync` may carry (est), and the most ids
+/// all its `unplaced` changes name together: a restore to an older
+/// bookmark at the create cap (50 a day for 30 days, with their drops)
+/// stays inside it.
+pub const MAX_CHANGES: usize = 10_000;
 
 /// One bucket change of a tenant record, as the Worker read and verified
 /// it (`name` and `bdk_wrapped` come from the record's private part).
@@ -169,8 +184,9 @@ pub struct BucketsApplied {
     /// Rows dropped.
     pub dropped: u64,
     /// Rows a `dropped` or `unplaced` reached that still hold something:
-    /// kept closing, and paged `drop_not_closed` (the `sync` answer
-    /// carries them for the Worker's page).
+    /// kept closing under `~dropped/<bucket_id>`, and paged
+    /// `drop_not_closed` (the `sync` answer carries them for the Worker's
+    /// page).
     pub drop_not_closed: Vec<String>,
 }
 
@@ -223,9 +239,16 @@ pub fn check_shape(
         return Err(Malformed);
     }
     let mut last = from_seq;
+    let mut unplaced = 0usize;
     for c in changes {
-        if c.seq() <= last || c.seq() > to_seq {
+        if c.seq() <= last || c.seq() > to_seq || i64::try_from(c.seq()).is_err() {
             return Err(Malformed);
+        }
+        if let BucketChange::Unplaced { buckets, .. } = c {
+            unplaced = unplaced.saturating_add(buckets.len());
+            if unplaced > MAX_CHANGES {
+                return Err(Malformed);
+            }
         }
         last = c.seq();
         match c {
@@ -310,6 +333,17 @@ pub fn apply<S: Sql>(
                                 SqlValue::Int(int(*written_at)?),
                             ],
                         ))??;
+                        poll_once(sql.exec(
+                            "INSERT INTO unit_bucket_grant(bucket_id, grant_seq) VALUES (?1, ?2)",
+                            &[
+                                SqlValue::Text(bucket_id.clone()),
+                                SqlValue::Int(int(*grant_seq)?),
+                            ],
+                        ))??;
+                        // The keys' grants on it were applied before the
+                        // row existed (`sync` follows the key chain): they
+                        // are served from now on.
+                        keys::project_buckets(sql, std::slice::from_ref(bucket_id))?;
                         done.created += 1;
                     }
                 }
@@ -319,15 +353,15 @@ pub fn apply<S: Sql>(
                     done.reserved += 1;
                 }
             }
-            BucketChange::Dropped { seq, bucket_id } => {
-                drop_row(sql, bucket_id, *seq, now, &mut done)?;
+            BucketChange::Dropped { bucket_id, .. } => {
+                drop_row(sql, bucket_id, now, &mut done)?;
             }
-            BucketChange::Unplaced { seq, buckets } => {
+            BucketChange::Unplaced { buckets, .. } => {
                 if restoring {
                     continue;
                 }
                 for b in buckets {
-                    drop_row(sql, b, *seq, now, &mut done)?;
+                    drop_row(sql, b, now, &mut done)?;
                 }
             }
         }
@@ -335,28 +369,73 @@ pub fn apply<S: Sql>(
     Ok(Ok(done))
 }
 
-/// AM-57 step 4: whether the unit's bucket rows, less the closing rows a
-/// `dropped` or `unplaced` named, equal `placed`. The caller runs it only
-/// while the unit's `restoring` entry is not set, and in the `sync` that
-/// clears it.
+/// AM-57 step 4: whether the unit's bucket rows, less every closing row
+/// whose id `placed` does not hold, equal `placed`. The caller runs it
+/// only while the unit's `restoring` entry is not set, and in the `sync`
+/// that clears it.
 pub fn placement_check<S: Sql>(sql: &S, placed: &[String]) -> Result<bool> {
-    let rows = poll_once(sql.query(
-        "SELECT b.id FROM buckets b \
-           LEFT JOIN unit_bucket_closing c ON c.bucket_id = b.id \
-          WHERE c.dropped_seq IS NULL ORDER BY b.id",
-        &[],
-    ))??;
+    let want: BTreeSet<&str> = placed.iter().map(String::as_str).collect();
     let mut held = BTreeSet::new();
-    for r in rows {
-        match r.into_iter().next() {
-            Some(SqlValue::Text(id)) => {
-                held.insert(id);
-            }
-            _ => return Err(decode("buckets id")),
+    for (id, is_closing) in rows(sql)? {
+        if !is_closing || want.contains(id.as_str()) {
+            held.insert(id);
         }
     }
-    let want: BTreeSet<String> = placed.iter().cloned().collect();
-    Ok(held == want)
+    Ok(held.len() == want.len() && held.iter().all(|id| want.contains(id.as_str())))
+}
+
+/// AM-57 step 2a: drops each closing row whose id `placed` does not hold
+/// once it holds nothing. Run on every `sync` after [`apply`] and before
+/// [`placement_check`], and on the gate's last call after §8.6 step 7.4.
+/// Answers the rows dropped.
+pub fn sweep_closing<S: Sql>(sql: &S, placed: &[String]) -> Result<u64> {
+    let want: BTreeSet<&str> = placed.iter().map(String::as_str).collect();
+    let mut dropped = 0;
+    for (id, is_closing) in rows(sql)? {
+        if is_closing && !want.contains(id.as_str()) && !holds_anything(sql, &id)? {
+            delete_row(sql, &id)?;
+            dropped += 1;
+        }
+    }
+    Ok(dropped)
+}
+
+/// Every bucket row's id, and whether it is closing.
+fn rows<S: Sql>(sql: &S) -> Result<Vec<(String, bool)>> {
+    let rows = poll_once(sql.query(
+        "SELECT b.id, c.bucket_id IS NOT NULL FROM buckets b \
+           LEFT JOIN unit_bucket_closing c ON c.bucket_id = b.id ORDER BY b.id",
+        &[],
+    ))??;
+    rows.into_iter()
+        .map(|r| match (r.first(), r.get(1)) {
+            (Some(SqlValue::Text(id)), Some(SqlValue::Int(c))) => Ok((id.clone(), *c != 0)),
+            _ => Err(decode("buckets id")),
+        })
+        .collect()
+}
+
+/// The number of bucket rows the unit holds.
+pub fn count<S: Sql>(sql: &S) -> Result<u64> {
+    let rows = poll_once(sql.query("SELECT count(*) FROM buckets", &[]))??;
+    match rows.first().and_then(|r| r.first()) {
+        Some(SqlValue::Int(n)) => u64::try_from(*n).map_err(|_| decode("bucket count")),
+        _ => Err(decode("bucket count")),
+    }
+}
+
+/// The bucket row made from the `bucket_created` record whose creator
+/// grant is at `grant_seq`, if the unit holds it (AM-56).
+pub fn by_grant_seq<S: Sql>(sql: &S, grant_seq: u64) -> Result<Option<String>> {
+    let rows = poll_once(sql.query(
+        "SELECT bucket_id FROM unit_bucket_grant WHERE grant_seq = ?1",
+        &[SqlValue::Int(int(grant_seq)?)],
+    ))??;
+    match rows.into_iter().next().and_then(|r| r.into_iter().next()) {
+        None => Ok(None),
+        Some(SqlValue::Text(id)) => Ok(Some(id)),
+        Some(_) => Err(decode("unit_bucket_grant")),
+    }
 }
 
 enum Existing {
@@ -387,12 +466,11 @@ fn existing<S: Sql>(sql: &S, bucket_id: &str, name: &str) -> Result<Existing> {
 }
 
 /// AM-57 step 2 for one bucket id: absent, nothing; otherwise closing
-/// (marked now if it was not), then dropped if it holds nothing, or kept
-/// with `dropped_seq` and paged.
+/// (marked now if it was not), then dropped if it holds nothing, or kept,
+/// renamed `~dropped/<bucket_id>`, and paged.
 fn drop_row<S: Sql>(
     sql: &S,
     bucket_id: &str,
-    seq: u64,
     now: UnixMs,
     done: &mut BucketsApplied,
 ) -> Result<()> {
@@ -404,28 +482,31 @@ fn drop_row<S: Sql>(
         &[SqlValue::Text(bucket_id.into()), SqlValue::Int(now.0)],
     ))??;
     if holds_anything(sql, bucket_id)? {
+        // The head freed the name: a later `created` may take it. No
+        // bucket name starts with `~`, so the renamed row meets none.
         poll_once(sql.exec(
-            "UPDATE unit_bucket_closing SET dropped_seq = ?2 WHERE bucket_id = ?1",
-            &[SqlValue::Text(bucket_id.into()), SqlValue::Int(int(seq)?)],
+            "UPDATE buckets SET name = '~dropped/' || id WHERE id = ?1",
+            &[SqlValue::Text(bucket_id.into())],
         ))??;
         done.drop_not_closed.push(bucket_id.to_string());
         return Ok(());
     }
-    // As the catalogue's bucket delete: its grants, then the row (the
-    // closing row goes with it).
-    poll_once(sql.exec(
-        "DELETE FROM grants WHERE bucket_id = ?1",
-        &[SqlValue::Text(bucket_id.into())],
-    ))??;
-    poll_once(sql.exec(
-        "DELETE FROM unit_bucket_closing WHERE bucket_id = ?1",
-        &[SqlValue::Text(bucket_id.into())],
-    ))??;
-    poll_once(sql.exec(
-        "DELETE FROM buckets WHERE id = ?1",
-        &[SqlValue::Text(bucket_id.into())],
-    ))??;
+    delete_row(sql, bucket_id)?;
     done.dropped += 1;
+    Ok(())
+}
+
+/// As the catalogue's bucket delete: its grants, then the row (its
+/// closing and grant rows go with it).
+fn delete_row<S: Sql>(sql: &S, bucket_id: &str) -> Result<()> {
+    for text in [
+        "DELETE FROM grants WHERE bucket_id = ?1",
+        "DELETE FROM unit_bucket_closing WHERE bucket_id = ?1",
+        "DELETE FROM unit_bucket_grant WHERE bucket_id = ?1",
+        "DELETE FROM buckets WHERE id = ?1",
+    ] {
+        poll_once(sql.exec(text, &[SqlValue::Text(bucket_id.into())]))??;
+    }
     Ok(())
 }
 

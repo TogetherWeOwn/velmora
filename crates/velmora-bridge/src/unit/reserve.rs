@@ -1084,6 +1084,18 @@ fn caps<S: Sql>(
     now: UnixMs,
 ) -> Result<std::result::Result<(), ReserveRefusal>> {
     if let Opening::Bucket { .. } = opening {
+        // The unit's bucket rows, with the open creates, stay inside the
+        // placement list's bound (`buckets::MAX_PLACED`): a `sync` always
+        // carries the whole list.
+        let open = count(
+            sql,
+            "SELECT count(*) FROM unit_reservations WHERE class = 'bucket' AND state = 'reserved'",
+            &[],
+        )?;
+        let open = u64::try_from(open).map_err(|_| decode("count"))?;
+        if super::buckets::count(sql)?.saturating_add(open) >= super::buckets::MAX_PLACED as u64 {
+            return Ok(Err(ReserveRefusal::CapReached));
+        }
         let day = count(
             sql,
             "SELECT count(*) FROM unit_cap_uses WHERE at > ?1 AND class = 'bucket'",
@@ -1259,6 +1271,12 @@ pub fn bucket_binding<S: Sql>(sql: &S, grant_seq: u64) -> Result<Binding> {
             }),
             _ => Err(decode("unit_reservations binding")),
         };
+    }
+    // The reservation is gone (swept, or taken back by a restore), but
+    // the bucket row made from the record for K says it was created
+    // (AM-56): never fence a K whose bucket exists.
+    if let Some(bucket) = super::buckets::by_grant_seq(sql, grant_seq)? {
+        return Ok(Binding::Created { bucket });
     }
     poll_once(sql.exec(
         "INSERT OR IGNORE INTO unit_bucket_fences(grant_seq) VALUES (?1)",

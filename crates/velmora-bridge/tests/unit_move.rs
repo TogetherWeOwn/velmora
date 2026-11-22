@@ -1019,6 +1019,7 @@ fn record(u: &Unit<RusqliteSql>) -> Value {
         "t0_seq": p["t0_seq"],
         "since_seq": p["since_seq"],
         "move_lifted": p["move_lifted"],
+        "lifted_at": p["lifted_at"],
     })
 }
 
@@ -1032,6 +1033,7 @@ fn import_progress_answers_the_moves_record() {
     assert_eq!(
         keys,
         [
+            "lifted_at",
             "move_lifted",
             "schema_tables",
             "sealed",
@@ -1043,7 +1045,7 @@ fn import_progress_answers_the_moves_record() {
     assert_eq!(p["tables"], json!([]));
     assert_eq!(
         record(&u),
-        json!({ "sealed": null, "t0_seq": null, "since_seq": null, "move_lifted": null })
+        json!({ "sealed": null, "t0_seq": null, "since_seq": null, "move_lifted": null, "lifted_at": null })
     );
     // The unit's tables, with SQLite's own left out.
     let tables: Vec<String> = serde_json::from_value(p["schema_tables"].clone()).unwrap();
@@ -1057,12 +1059,12 @@ fn import_progress_answers_the_moves_record() {
     fill(&u, &["a"]);
     assert_eq!(
         record(&u),
-        json!({ "sealed": null, "t0_seq": 10, "since_seq": S, "move_lifted": false })
+        json!({ "sealed": null, "t0_seq": 10, "since_seq": S, "move_lifted": false, "lifted_at": null })
     );
     ok(seal(&u, moving(10), counts(&u)));
     assert_eq!(
         record(&u),
-        json!({ "sealed": F + 1, "t0_seq": 10, "since_seq": S, "move_lifted": false })
+        json!({ "sealed": F + 1, "t0_seq": 10, "since_seq": S, "move_lifted": false, "lifted_at": null })
     );
     // The `move` report binds the newer head; the lift uses the seal up.
     let id = rid(S, 0, "m1");
@@ -1079,11 +1081,12 @@ fn import_progress_answers_the_moves_record() {
     ok(sync_to(&u, S + 1, None, Some(p)));
     assert_eq!(
         record(&u),
-        json!({ "sealed": F + 1, "t0_seq": 11, "since_seq": S, "move_lifted": true })
+        json!({ "sealed": F + 1, "t0_seq": 11, "since_seq": S, "move_lifted": true, "lifted_at": NOW.0 })
     );
     // The record stays after the move, under any later entry (AM-47).
     ok(sync_to(&u, S + 2, Some(S + 2), None));
     assert_eq!(progress(&u)["move_lifted"], json!(true));
+    assert_eq!(progress(&u)["lifted_at"], json!(NOW.0));
     assert_eq!(progress(&u)["tables"].as_array().unwrap().len(), 3);
 }
 

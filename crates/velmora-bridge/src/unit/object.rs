@@ -480,6 +480,9 @@ impl<S: UnitSql> Unit<S> {
                         "t0_seq": record.map(|m| m.t0_seq),
                         "since_seq": record.map(|m| m.since_seq),
                         "move_lifted": record.map(|m| m.move_lifted),
+                        // AM-67: the floor the tenant chain keeps is raised
+                        // from it (null until a `move` report lifted).
+                        "lifted_at": import::move_lifted_at(self.sql())?,
                         "schema_tables": schema::tables(self.sql())?,
                     }))
                 });
