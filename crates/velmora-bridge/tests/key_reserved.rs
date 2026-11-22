@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 
 use sha2::{Digest, Sha256};
 use velmora::rng::FillRandom;
-use velmora_bridge::crypto::scheme2::{TenantId, TenantKey};
+use velmora_bridge::crypto::scheme2::{parse_control, ControlOwner, TenantId, TenantKey};
 use velmora_bridge::keys::checkpoint::{open_checkpoint, seal_checkpoint};
 use velmora_bridge::keys::gate::testkit::FakeGate;
 use velmora_bridge::keys::ports::{
@@ -17,7 +17,7 @@ use velmora_bridge::keys::ports::{
 };
 use velmora_bridge::keys::record::{
     key_chain, open_key_record, seal_key_record_carrying, Access, Entry, Grant, KeyOp, KeyTable,
-    OneKey, Rid, Subject, SubjectDoor, SubjectKind, SubjectPrivate, SubjectStatus,
+    NoKeys, OneKey, Rid, Subject, SubjectDoor, SubjectKind, SubjectPrivate, SubjectStatus,
 };
 use velmora_bridge::keys::reserved::{Carried, Finished, Reserved, ReservedAnswer};
 use velmora_bridge::keys::writer::{KeyAnswer, KeyEnv, KeyRequest, Limits};
@@ -480,6 +480,28 @@ const NEW: &str = "p_0000000000000002";
 // Tests
 // ---------------------------------------------------------------------------
 
+fn assert_call_hash_in_door(w: &World, seq: u64, hash: &str) {
+    let name = key_chain(&w.t).name(seq);
+    let bytes = w.store.raw(&name).unwrap();
+    let door = parse_control(&bytes)
+        .unwrap()
+        .open_door(&w.kek, &name, ControlOwner::Managed(&w.t))
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(door.door()).unwrap();
+    assert_eq!(
+        json.get("call_key_hash").and_then(|h| h.as_str()),
+        Some(hash)
+    );
+    let door_only = open_key_record(&w.kek, &NoKeys, &w.t, seq, &bytes).unwrap();
+    assert_eq!(door_only.call_key_hash.as_deref(), Some(hash));
+}
+
+const CALL_HASH_HEX: &str = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+
+fn test_call_hash() -> [u8; 32] {
+    Sha256::digest(b"abc").into()
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn a_reserved_create_records_exactly_keys_seq_plus_one_with_its_rid() {
     let w = World::new();
@@ -490,6 +512,7 @@ async fn a_reserved_create_records_exactly_keys_seq_plus_one_with_its_rid() {
     let reserved = Reserved {
         rid: RID,
         keys_seq: 1,
+        call_key_hash: test_call_hash(),
         answer: &answer,
     };
     let subject = principal(NEW, Some("p_0000000000000001"));
@@ -504,6 +527,7 @@ async fn a_reserved_create_records_exactly_keys_seq_plus_one_with_its_rid() {
     let record = open_key_record(&w.kek, &w.ring, &w.t, 2, &bytes).unwrap();
     assert_eq!(record.rid, Some(RID));
     assert_eq!(record.op, KeyOp::Create);
+    assert_call_hash_in_door(&w, 2, CALL_HASH_HEX);
     assert_eq!(table.get(NEW).unwrap().rid, Some(RID));
     for store in [&w.root, &w.unit2, &w.directory] {
         assert_eq!(store.seq.get(), 2, "{}", store.label);
@@ -536,6 +560,7 @@ async fn no_answer_is_kept_while_the_subject_is_held_closed() {
     let reserved = Reserved {
         rid: RID,
         keys_seq: 1,
+        call_key_hash: test_call_hash(),
         answer: &answer,
     };
     w.directory.down.set(true);
@@ -616,6 +641,7 @@ async fn a_put_lost_to_a_record_of_the_same_rid_takes_that_record() {
     let reserved = Reserved {
         rid: RID,
         keys_seq: 1,
+        call_key_hash: test_call_hash(),
         answer: &answer,
     };
     assert_eq!(
@@ -651,6 +677,7 @@ async fn a_put_lost_to_another_record_answers_lost_with_the_stores_at_the_head()
         let reserved = Reserved {
             rid: RID,
             keys_seq: 1,
+            call_key_hash: test_call_hash(),
             answer: &answer,
         };
         assert_eq!(
@@ -683,6 +710,7 @@ async fn a_put_lost_to_another_record_answers_lost_with_the_stores_at_the_head()
     let reserved = Reserved {
         rid: RID,
         keys_seq: 1,
+        call_key_hash: test_call_hash(),
         answer: &answer,
     };
     let puts = w.store.puts();
@@ -707,6 +735,7 @@ async fn carrying_finds_the_record_of_a_rid_above_a_seq() {
     let reserved = Reserved {
         rid: RID,
         keys_seq: 1,
+        call_key_hash: test_call_hash(),
         answer: &answer,
     };
     env.create_reserved(&mut table, &subject, reserved, &mut TestRng(2))
@@ -744,6 +773,7 @@ async fn each_entry_carries_the_rid_of_its_own_record() {
     let reserved = Reserved {
         rid: RID,
         keys_seq: 1,
+        call_key_hash: test_call_hash(),
         answer: &answer,
     };
     env.create_reserved(&mut table, &subject, reserved, &mut TestRng(2))
@@ -791,6 +821,7 @@ async fn a_root_unit_that_keeps_no_answers_leaves_the_create_unfinished() {
     let reserved = Reserved {
         rid: RID,
         keys_seq: 1,
+        call_key_hash: test_call_hash(),
         answer: &answer,
     };
     assert_eq!(
@@ -813,6 +844,7 @@ async fn a_kept_answer_of_another_reservation_is_refused_before_anything() {
     let reserved = Reserved {
         rid: RID,
         keys_seq: 1,
+        call_key_hash: test_call_hash(),
         answer: &answer,
     };
     let puts = w.store.puts();
@@ -843,6 +875,7 @@ async fn a_record_of_the_rid_for_another_subject_is_an_error() {
     let reserved = Reserved {
         rid: RID,
         keys_seq: 1,
+        call_key_hash: test_call_hash(),
         answer: &answer,
     };
     assert!(env
@@ -946,6 +979,7 @@ async fn the_move_rules_stop_a_reserved_create_before_any_put() {
         let reserved = Reserved {
             rid: RID,
             keys_seq: 1,
+            call_key_hash: test_call_hash(),
             answer: &answer,
         };
         let puts = w.store.puts();
@@ -1023,6 +1057,7 @@ async fn a_plane_principal_is_revoked_with_its_m_rk_first() {
     let reserved = Reserved {
         rid: RID,
         keys_seq: 1,
+        call_key_hash: test_call_hash(),
         answer: &answer,
     };
     env.create_reserved(
@@ -1075,6 +1110,7 @@ async fn a_subject_revoked_by_m_rk_alone_is_not_answered_as_open() {
     let reserved = Reserved {
         rid: RID,
         keys_seq: 1,
+        call_key_hash: test_call_hash(),
         answer: &answer,
     };
     w.directory.down.set(true);
@@ -1197,6 +1233,7 @@ async fn a_second_create_for_the_member_of_a_held_principal_is_refused() {
             Reserved {
                 rid: RID,
                 keys_seq,
+                call_key_hash: test_call_hash(),
                 answer: &answer,
             },
             &mut TestRng(2)
@@ -1302,6 +1339,7 @@ fn reserved_at(answer: &KeptAnswer, keys_seq: u64) -> Reserved<'_> {
     Reserved {
         rid: answer.rid,
         keys_seq,
+        call_key_hash: test_call_hash(),
         answer,
     }
 }
@@ -1332,6 +1370,7 @@ async fn a_reserved_widening_records_exactly_keys_seq_plus_one_with_its_rid() {
     let record = open_key_record(&w.kek, &w.ring, &w.t, 2, &bytes).unwrap();
     assert_eq!(record.rid, Some(RID));
     assert_eq!(record.op, KeyOp::Grants);
+    assert_call_hash_in_door(&w, 2, CALL_HASH_HEX);
     assert_eq!(record.door.grants.len(), 2);
     for store in [&w.root, &w.unit2, &w.directory] {
         assert_eq!(store.seq.get(), 2, "{}", store.label);
@@ -1586,6 +1625,7 @@ async fn a_reserved_change_refuses_another_subjects_rid_and_another_answer() {
     let mismatched = Reserved {
         rid: RID,
         keys_seq: 2,
+        call_key_hash: test_call_hash(),
         answer: &other,
     };
     assert!(env
@@ -1770,15 +1810,16 @@ async fn change_closing_never_records_an_opening_change() {
     };
     let mut other = table.clone();
     assert_eq!(
-        env.change_closing(&mut other, &to_b, &mut TestRng(4))
+        env.change_closing(&mut other, &to_b, [0x12; 32], &mut TestRng(4))
             .await
             .unwrap(),
         KeyAnswer::Done { seq: 3 }
     );
+    assert_call_hash_in_door(&w, 3, &"12".repeat(32));
     // Against that head, b_01 alone is a widening: nothing is recorded.
     let puts = w.store.puts();
     assert_eq!(
-        env.change_closing(&mut table, &to_a, &mut TestRng(5))
+        env.change_closing(&mut table, &to_a, [0x34; 32], &mut TestRng(5))
             .await
             .unwrap(),
         KeyAnswer::Busy
@@ -1790,12 +1831,14 @@ async fn change_closing_never_records_an_opening_change() {
         env.change_closing(
             &mut table,
             &set_status(SubjectStatus::Disabled),
+            test_call_hash(),
             &mut TestRng(6)
         )
         .await
         .unwrap(),
         KeyAnswer::Done { seq: 4 }
     );
+    assert_call_hash_in_door(&w, 4, CALL_HASH_HEX);
 }
 
 /// A reservation cannot revive a revoked subject.

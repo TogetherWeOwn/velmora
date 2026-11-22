@@ -16,7 +16,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use sha2::{Digest, Sha256};
 use velmora::rng::FillRandom;
-use velmora_bridge::crypto::scheme2::{wrap_secret_v2, TenantId, TenantKey};
+use velmora_bridge::crypto::scheme2::{
+    parse_control, wrap_secret_v2, ControlOwner, TenantId, TenantKey,
+};
 use velmora_bridge::keys::buckets::{
     finish_creator_grant, BucketAnswer, BucketRequest, CreatorGrant, BUCKET_CREATE_KIND,
     MAX_ORDER_TRIES,
@@ -452,6 +454,7 @@ impl KeyAdmission for FakeAdmission<'_> {
 struct FakeBuckets {
     /// (bucket, unit, creator, grant_seq)
     placed: RefCell<Vec<(String, u32, String, u64)>>,
+    placed_call_hashes: RefCell<Vec<Option<[u8; 32]>>>,
     last_grant_seq: Cell<u64>,
     refuse: Cell<Option<(u16, &'static str)>>,
     /// The next N creates lose the order: another create with a higher
@@ -481,6 +484,7 @@ impl BucketRecords for FakeBuckets {
         unit: u32,
         creator: &str,
         grant_seq: u64,
+        call_key_hash: Option<[u8; 32]>,
     ) -> Result<BucketPut> {
         self.calls.set(self.calls.get() + 1);
         if self.down.get() {
@@ -511,6 +515,7 @@ impl BucketRecords for FakeBuckets {
             return Ok(BucketPut::OrderLost);
         }
         self.last_grant_seq.set(grant_seq);
+        self.placed_call_hashes.borrow_mut().push(call_key_hash);
         self.placed.borrow_mut().push((
             bucket.as_str().to_owned(),
             unit,
@@ -924,6 +929,22 @@ async fn a_closing_change_with_a_unit_down_answers_unfinished_until_finished() {
             .unwrap(),
         KeyAnswer::Unfinished { seq: 3 }
     );
+    // The same subject's opening and closing calls carried different keys.
+    let chain = key_chain(&w.t);
+    for (seq, hash) in [
+        (
+            2,
+            "183b3e5d6026ad2c98ac523e9a2d6427d35e4e2e4828191522163748695fa7a8",
+        ),
+        (
+            3,
+            "de7d1b721a1e0632b7cf04edf5032c8ecffa9f9a08492152b926f1a5a7e765d7",
+        ),
+    ] {
+        let bytes = chain.get(&w.store, seq).await.unwrap();
+        let record = open_key_record(&w.kek, &w.ring, &w.t, seq, &bytes).unwrap();
+        assert_eq!(record.call_key_hash.as_deref(), Some(hash));
+    }
     // The root unit is closed already; the other one is not.
     assert_eq!(w.root.status("AKVL0001"), Some(SubjectStatus::Disabled));
     assert_eq!(w.unit2.status("AKVL0001"), Some(SubjectStatus::Active));
@@ -984,6 +1005,11 @@ async fn a_revoke_that_stopped_after_its_revocation_record_is_completed() {
     let record = open_key_record(&w.kek, &w.ring, &w.t, 3, &bytes).unwrap();
     assert_eq!(record.op, KeyOp::Status);
     assert_eq!(record.door.status, SubjectStatus::Revoked);
+    let create = key_chain(&w.t).get(&w.store, 2).await.unwrap();
+    let create = open_key_record(&w.kek, &w.ring, &w.t, 2, &create).unwrap();
+    assert!(create.call_key_hash.is_some());
+    // The finisher has no call key and must not copy the create's.
+    assert_eq!(record.call_key_hash, None);
     // A second run changes nothing.
     let again = finish_keys(&env, &mut rng).await.unwrap();
     assert!(again.appended.is_empty());
@@ -3328,7 +3354,23 @@ async fn a_create_that_loses_the_order_revokes_its_orphan_and_tries_again() {
         }
     );
     // 3: the orphan grant; 4: its revoke (closing); 5: the new grant.
-    let bytes = key_chain(&w.t).get(&w.store, 4).await.unwrap();
+    // All three records were written by this same management call.
+    let chain = key_chain(&w.t);
+    for seq in 3..=5 {
+        let name = chain.name(seq);
+        let bytes = chain.get(&w.store, seq).await.unwrap();
+        let door = parse_control(&bytes)
+            .unwrap()
+            .open_door(&w.kek, &name, ControlOwner::Managed(&w.t))
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(door.door()).unwrap();
+        assert_eq!(
+            json.get("call_key_hash").and_then(|h| h.as_str()),
+            Some("20c70cc074bcb47869c029abd2f82c40116175133a547eed971276b4c00ae707"),
+            "record {seq}"
+        );
+    }
+    let bytes = chain.get(&w.store, 4).await.unwrap();
     let revoke = open_key_record(&w.kek, &w.ring, &w.t, 4, &bytes).unwrap();
     assert!(revoke.closes);
     assert_eq!(
@@ -3341,6 +3383,7 @@ async fn a_create_that_loses_the_order_revokes_its_orphan_and_tries_again() {
     );
     assert_eq!(*adm.bucket_asks.borrow(), vec!["ib4", "ib4"]);
     assert_eq!(adm.bucket_open.borrow()["ib4"].2, Some(5), "bound again");
+    assert_eq!(*buckets.placed_call_hashes.borrow(), [Some(derived("ib4"))]);
     assert!(adm.released.borrow().is_empty());
 }
 
@@ -3561,6 +3604,7 @@ async fn the_finisher_places_a_bound_grant_and_revokes_an_unbound_one() {
     );
     assert_eq!(buckets.placed.borrow().len(), 1);
     assert_eq!(buckets.placed.borrow()[0].3, 3);
+    assert_eq!(*buckets.placed_call_hashes.borrow(), [Some(derived("ib9"))]);
 
     // (b) The bind fails: grant 4 is never bound, so never placed.
     adm.bind_down.set(true);
@@ -3600,6 +3644,59 @@ async fn the_finisher_places_a_bound_grant_and_revokes_an_unbound_one() {
                 .unwrap(),
             outcome,
             "seq {seq}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn bound_legacy_grant_placement_does_not_depend_on_who_resumes_it() {
+    for finisher in [false, true] {
+        let w = World::new();
+        let adm = FakeAdmission::new(&w.root);
+        let mut table = seed(&w, &adm).await;
+        let units = w.units();
+        let env = env!(w, &adm, &units);
+        let buckets = FakeBuckets::default();
+        let request = photos("PR0001");
+        let bucket = bucket_id(&w.t, 3);
+        let mut creator = table.get(request.creator).unwrap().subject().unwrap();
+        let mut grants = creator.grants();
+        grants.push(grant(bucket.as_str(), RW, None));
+        creator.set_grants(&grants);
+        plant(&w, 3, KeyOp::Grants, &creator, None);
+        adm.bucket_open.borrow_mut().insert(
+            "bound-key".into(),
+            (
+                request.creator.into(),
+                request.unit,
+                Some(3),
+                request.name.into(),
+            ),
+        );
+
+        let mut rng = TestRng(219);
+        if finisher {
+            assert_eq!(
+                finish_creator_grant(&env, &buckets, &mut table, 3, &mut rng)
+                    .await
+                    .unwrap(),
+                CreatorGrant::Placed
+            );
+        } else {
+            assert_eq!(
+                env.create_bucket(&buckets, &mut table, "bound-key", &request, &mut rng)
+                    .await
+                    .unwrap(),
+                BucketAnswer::Created {
+                    bucket,
+                    grant_seq: 3
+                }
+            );
+        }
+        assert_eq!(
+            *buckets.placed_call_hashes.borrow(),
+            [None],
+            "finisher: {finisher}"
         );
     }
 }
@@ -4092,10 +4189,19 @@ async fn the_finisher_creates_again_after_a_lost_order() {
     let buckets = FakeBuckets::default();
     let mut rng = TestRng(951);
     buckets.down.set(true);
+    // The binding returns the reservation lookup value, not the header.
+    let digest = derived("confirmation-for-bucket-test");
     assert_eq!(
-        env.create_bucket(&buckets, &mut table, "ib", &photos("PR0001"), &mut rng)
-            .await
-            .unwrap(),
+        env.create_bucket_keyed(
+            &buckets,
+            &mut table,
+            "test-reservation-handle",
+            digest,
+            &photos("PR0001"),
+            &mut rng,
+        )
+        .await
+        .unwrap(),
         BucketAnswer::Unfinished { grant_seq: 3 }
     );
     buckets.down.set(false);
@@ -4118,6 +4224,19 @@ async fn the_finisher_creates_again_after_a_lost_order() {
         adm.released.borrow().is_empty(),
         "its reservation became the bucket"
     );
+    // The original grant, its revocation and the replacement grant all
+    // belong to this call. The repair resumes its verified digest.
+    let chain = key_chain(&w.t);
+    for seq in 3..=5 {
+        let bytes = chain.get(&w.store, seq).await.unwrap();
+        let record = open_key_record(&w.kek, &w.ring, &w.t, seq, &bytes).unwrap();
+        assert_eq!(
+            record.call_key_hash.as_deref(),
+            Some("ac8f4ae25f81f0aed38c8417b1c11edfe2cbe3c1b0e5e7e24072f8c7c59b2493"),
+            "record {seq}"
+        );
+    }
+    assert_eq!(*buckets.placed_call_hashes.borrow(), [Some(digest)]);
 }
 
 /// A name and what to run on its second get.
@@ -4520,13 +4639,14 @@ impl BucketRecords for GatedBuckets<'_, '_> {
         unit: u32,
         creator: &str,
         grant_seq: u64,
+        call_key_hash: Option<[u8; 32]>,
     ) -> Result<BucketPut> {
         let g = self.gate.borrow_mut().take();
         if let Some(g) = g {
             until(g).await;
         }
         self.inner
-            .bucket_created(t, bucket, unit, creator, grant_seq)
+            .bucket_created(t, bucket, unit, creator, grant_seq, call_key_hash)
             .await
     }
     async fn is_placed(&self, t: &TenantId, bucket: &BucketId) -> Result<bool> {
@@ -4708,6 +4828,7 @@ impl BucketRecords for RefusedLate<'_, '_> {
         unit: u32,
         creator: &str,
         grant_seq: u64,
+        call_key_hash: Option<[u8; 32]>,
     ) -> Result<BucketPut> {
         let g = self.gate.borrow_mut().take();
         if let Some(g) = g {
@@ -4718,7 +4839,7 @@ impl BucketRecords for RefusedLate<'_, '_> {
             });
         }
         self.inner
-            .bucket_created(t, bucket, unit, creator, grant_seq)
+            .bucket_created(t, bucket, unit, creator, grant_seq, call_key_hash)
             .await
     }
     async fn is_placed(&self, t: &TenantId, bucket: &BucketId) -> Result<bool> {
@@ -4900,6 +5021,7 @@ impl BucketRecords for RaceAfterCheck<'_, '_> {
         unit: u32,
         creator: &str,
         grant_seq: u64,
+        call_key_hash: Option<[u8; 32]>,
     ) -> Result<BucketPut> {
         if self.armed.get() {
             return Ok(BucketPut::Refused {
@@ -4908,7 +5030,7 @@ impl BucketRecords for RaceAfterCheck<'_, '_> {
             });
         }
         self.inner
-            .bucket_created(t, bucket, unit, creator, grant_seq)
+            .bucket_created(t, bucket, unit, creator, grant_seq, call_key_hash)
             .await
     }
     async fn is_placed(&self, t: &TenantId, bucket: &BucketId) -> Result<bool> {

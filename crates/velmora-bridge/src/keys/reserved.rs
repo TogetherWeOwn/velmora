@@ -52,7 +52,7 @@ use super::ports::{
     Applied, ApplyEntry, ControlChain, ControlIntents, KeptAnswer, KeyAdmission, KeyTarget, Refusal,
 };
 use super::record::{
-    key_chain, open_chain_record, open_key_record, seal_key_record_carrying, ChainRecord, Entry,
+    key_chain, open_chain_record, open_key_record, seal_key_record_for_call, ChainRecord, Entry,
     KeyOp, KeyTable, Rid, Subject, SubjectStatus, TkRing,
 };
 use super::revocations::list_tenant_revocations;
@@ -74,6 +74,8 @@ pub struct Reserved<'a> {
     /// The root unit's `keys_seq` when it admitted the reservation: the
     /// record is exactly this + 1.
     pub keys_seq: u64,
+    /// The SHA-256 of the same `Idempotency-Key` used to reserve (AM-79).
+    pub call_key_hash: [u8; 32],
     /// The answer to keep (its `rid` must be [`Reserved::rid`]).
     pub answer: &'a KeptAnswer,
 }
@@ -298,6 +300,7 @@ where
         let Reserved {
             rid,
             keys_seq,
+            call_key_hash,
             answer,
         } = reserved;
         if answer.rid != rid {
@@ -375,7 +378,7 @@ where
             // The reservation is the caller's to release.
             return Ok(ReservedAnswer::Refused(Refusal::IdTaken));
         }
-        let bytes = seal_key_record_carrying(
+        let bytes = seal_key_record_for_call(
             self.kek,
             self.ring,
             self.tenant,
@@ -387,6 +390,7 @@ where
             false,
             table.frozen_at(),
             Some(rid),
+            Some(call_key_hash),
             rng,
         )?;
         let chain = key_chain(self.tenant);
@@ -447,6 +451,7 @@ where
         let Reserved {
             rid,
             keys_seq,
+            call_key_hash,
             answer,
         } = reserved;
         if answer.rid != rid {
@@ -546,7 +551,7 @@ where
             .intents
             .note(self.tenant, ControlChain::Keys, seq, op_kind(&plan))
             .await;
-        let bytes = seal_key_record_carrying(
+        let bytes = seal_key_record_for_call(
             self.kek,
             self.ring,
             self.tenant,
@@ -558,6 +563,7 @@ where
             false,
             table.frozen_at(),
             Some(rid),
+            Some(call_key_hash),
             rng,
         )?;
         let chain = key_chain(self.tenant);
