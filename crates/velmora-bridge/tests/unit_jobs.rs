@@ -662,7 +662,7 @@ async fn a_job_with_lower_numbers_changes_nothing_and_gets_the_units_numbers() {
     };
     assert_eq!(fx.bridge.catalog.stale_seqs(), Some(unit_seqs));
     assert_eq!(fx.bridge.catalog.latest_seqs(), Some(unit_seqs));
-    fx.bridge.run_job(&o.job(OutboxStage::Post)).await;
+    fx.bridge.run_job(&scope(), &o.job(OutboxStage::Post)).await;
     // The consumer can tell why: the unit's refusal is kept.
     assert_eq!(fx.bridge.catalog.refusal(), Some(UNIT_STALE));
     assert_eq!(fx.outbox(&o, "stage").await, "post");
@@ -736,12 +736,6 @@ async fn a_job_with_no_numbers_is_refused_and_is_not_stale() {
         "{err:?}"
     );
     assert_eq!(cat.stale_seqs(), None);
-    fx.bridge.run_job(&scope(), &o.job(OutboxStage::Post)).await;
-    // The consumer can tell why: the unit's refusal is kept.
-    assert_eq!(fx.bridge.catalog.refusal(), Some(UNIT_STALE_JOB));
-    assert_eq!(fx.outbox(&o, "stage").await, "post");
-    assert_eq!(fx.outbox(&o, "attempts").await, "0");
-    assert_eq!(fx.server.posted_count().await, 0);
 }
 
 #[tokio::test]

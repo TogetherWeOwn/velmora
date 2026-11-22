@@ -1153,10 +1153,11 @@ fn restore_at(u: &Unit<RusqliteSql>, since: u64, at_ms: i64) -> Option<(Refused,
 fn no_undo_bookmark_and_no_migration_while_an_import_is_not_lifted() {
     use velmora_bridge::unit::schema::migration_allowed;
     let not_lifted = Some((Refused::Restore(RestoreRefusal::MoveNotLifted), false));
-    // No import: the restore checks go on (here: no lease table).
+    // No import: the restore checks go on (here: the lease checks; the
+    // unit has its lease table, u0002, and closed just now: too soon).
     let u = closed_for_the_move();
-    let lease_unknown = Some((Refused::Restore(RestoreRefusal::LeaseUnknown), false));
-    assert_eq!(prepare(&u, S), lease_unknown);
+    let too_soon = Some((Refused::Restore(RestoreRefusal::TooSoon), false));
+    assert_eq!(prepare(&u, S), too_soon);
     assert!(migration_allowed(u.sql()).unwrap());
     // An import, not sealed, then sealed: refused (AM-46), and `restore`,
     // which needs the undo bookmark, is refused the same way.
@@ -1174,7 +1175,7 @@ fn no_undo_bookmark_and_no_migration_while_an_import_is_not_lifted() {
     assert!(migration_allowed(u.sql()).unwrap());
     let s2 = S + 2;
     ok(sync_to(&u, s2, Some(s2), None));
-    assert_eq!(prepare(&u, s2), lease_unknown);
+    assert_eq!(prepare(&u, s2), too_soon);
 }
 
 #[test]
@@ -1187,9 +1188,10 @@ fn a_restore_to_a_time_before_the_units_birth_is_refused() {
     for at_ms in [0, NOW.0 - 1, NOW.0, NOW.0 + LIFT_SLACK_MS - 1] {
         assert_eq!(restore_at(&u, S, at_ms), before_birth, "{at_ms}");
     }
+    // Past the margin it is the lease checks' turn (u0002): too soon.
     assert_eq!(
         restore_at(&u, S, NOW.0 + LIFT_SLACK_MS),
-        Some((Refused::Restore(RestoreRefusal::LeaseUnknown), false))
+        Some((Refused::Restore(RestoreRefusal::TooSoon), false))
     );
 }
 
@@ -1221,11 +1223,8 @@ fn the_first_batch_closes_the_undo_bookmark_and_the_span_before_it_is_open() {
         NOW,
     );
     assert!(matches!(a, UnitAnswer::Ok { .. }), "{a:?}");
-    // A lease table with no row, and far past T + 60 s: checks 1 to 3
-    // would pass.
-    u.sql()
-        .apply("CREATE TABLE unit_lease (id INTEGER PRIMARY KEY, fresh_until INTEGER, lease_hi INTEGER)")
-        .unwrap();
+    // The lease table is the unit's own (u0002); far past T + 60 s,
+    // checks 1 to 3 would pass.
     let late = UnixMs(NOW.0 + 86_400_000);
     let c = call_on(
         &own(),
