@@ -41,6 +41,7 @@ fi
 for tool in zstd jq sha256sum python3; do
   command -v "$tool" >/dev/null || die "missing tool: $tool"
 done
+catalog_require_sqlite
 catalog_init_sql_limits
 
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/velmora-import.XXXXXX")

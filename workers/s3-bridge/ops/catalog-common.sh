@@ -36,10 +36,18 @@ catalog_init_sql_limits() {
   catalog_sql_statement_limit=$(catalog_test_limit VELMORA_TEST_SQL_STATEMENT_BYTES "$D1_SQL_STATEMENT_MAX_BYTES")
 }
 
-catalog_limit_error() {
+catalog_error() {
   local command=${0##*/}
-  printf '%s: %s; this export could not be restored by catalog-import.sh\n' "${command%.sh}" "$*" >&2
+  printf '%s: %s\n' "${command%.sh}" "$*" >&2
   return 1
+}
+
+catalog_require_sqlite() {
+  python3 -I -c 'import sqlite3' 2>/dev/null || catalog_error 'python3 requires sqlite3 support'
+}
+
+catalog_limit_error() {
+  catalog_error "$*; this export could not be restored by catalog-import.sh"
 }
 
 catalog_check_sql_size() {
@@ -51,10 +59,12 @@ catalog_check_sql_size() {
 }
 
 catalog_check_sql_statements() {
-  local measurement longest line
-  measurement=$(python3 -I "$HERE/sql_longest_statement.py" "$1") || return 1
-  read -r longest line <<<"$measurement"
+  local measurement longest line more observed
+  measurement=$(python3 -I "$HERE/sql_longest_statement.py" "$1" "$catalog_sql_statement_limit") || return 1
+  read -r longest line more <<<"$measurement"
   if (( longest > catalog_sql_statement_limit )); then
-    catalog_limit_error "statement starting at line $line is $longest bytes, over the D1 statement limit of $catalog_sql_statement_limit bytes"
+    observed=$longest
+    if [[ $more == + ]]; then observed="at least $longest"; fi
+    catalog_limit_error "statement starting at line $line is $observed bytes, over the D1 statement limit of $catalog_sql_statement_limit bytes"
   fi
 }

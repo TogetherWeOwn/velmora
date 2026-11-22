@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import random
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -354,6 +355,31 @@ class CatalogueScripts(unittest.TestCase):
         result = self.run_script("export")
         self.assert_refused(result, "statement starting at line 2 is 36 bytes")
         self.assertEqual(list(self.bucket.rglob(f"{self.env['FAKE_DATE']}*")), [])
+
+    def test_export_bounds_reading_of_oversized_sql_line(self):
+        self.fixture.write_text("CREATE TABLE fixture (value TEXT);\n"
+                                "INSERT INTO fixture VALUES ('" + "a" * 200_000 + "');\n",
+                                encoding="utf-8")
+        result = self.run_script("export")
+        self.assert_refused(result, "statement starting at line 2 is at least 100001 bytes, "
+                                    "over the D1 statement limit of 100000 bytes")
+        self.assertEqual(list(self.bucket.rglob("*")), [])
+
+    def test_scripts_require_python_with_sqlite_before_remote_calls(self):
+        self.env["FAKE_PYTHON_EXE"] = sys.executable
+        python = Path(self.env["TMPDIR"]) / "python3"
+        python.write_text('#!/bin/sh\n'
+                          'if [ "$1" = -I ]; then\n'
+                          '    echo "ModuleNotFoundError: No module named _sqlite3" >&2\n'
+                          '    exit 1\n'
+                          'fi\n'
+                          'exec "$FAKE_PYTHON_EXE" "$@"\n')
+        python.chmod(0o755)
+        for action, args in (("export", ()), ("import", ("scratch-db", MS))):
+            with self.subTest(action=action):
+                result = self.run_script(action, *args)
+                self.assert_refused(result, f"catalog-{action}: python3 requires sqlite3 support")
+                self.assertEqual(self.calls(), [])
 
     def test_export_rejects_incomplete_sql_before_any_upload(self):
         self.fixture.write_text("CREATE TABLE fixture (value TEXT);\n"

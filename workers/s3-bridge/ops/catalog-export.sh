@@ -38,6 +38,7 @@ part_bytes=${VELMORA_EXPORT_PART_BYTES-268435456}
 for tool in zstd jq split sha256sum python3; do
   command -v "$tool" >/dev/null || { echo "catalog-export: missing tool: $tool" >&2; exit 1; }
 done
+catalog_require_sqlite
 catalog_init_sql_limits
 if [[ ${VELMORA_EXPORT_RCLONE_REMOTE+x} && ! $remote =~ ^[A-Za-z0-9_-]+$ ]]; then
   echo "catalog-export: invalid VELMORA_EXPORT_RCLONE_REMOTE" >&2

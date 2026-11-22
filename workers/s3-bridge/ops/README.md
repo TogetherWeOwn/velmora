@@ -263,11 +263,12 @@ the parts are named `<restore point>.sql.zst.part-000`, `-001`, and so on.
 The script uploads `<restore point>.manifest.json` last. The manifest lists
 the parts and checksums and marks a complete export.
 
-Both scripts require Python 3 with SQLite support to check the SQL statement
-lengths without executing the SQL. The export refuses to upload any parts
-if the uncompressed dump exceeds 5,000,000,000 bytes or a SQL statement
-exceeds 100,000 bytes. The importer checks the same limits before loading
-SQL with Wrangler's single-file D1 import.
+Install the pinned Wrangler with `npm ci` in `workers/s3-bridge` before
+running either script. Both scripts also require Python 3 with SQLite support
+to check statement lengths without executing the SQL. The export refuses to
+upload any parts if the uncompressed dump exceeds 5,000,000,000 bytes or a SQL
+statement exceeds 100,000 bytes. The importer checks the same limits before
+loading SQL with Wrangler's single-file D1 import.
 
 Wrangler uploads each part by default. Splitting keeps each upload under
 Wrangler's 300 MiB limit. `VELMORA_EXPORT_PART_BYTES` defaults to 268435456
