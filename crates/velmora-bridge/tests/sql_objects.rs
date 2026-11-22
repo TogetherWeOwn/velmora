@@ -2356,7 +2356,8 @@ async fn extents_in_matches_the_statement_it_replaced() {
             (size + 5, size + 9),
             (0, 0),
             (size, size),
-            (0, u64::MAX >> 1),
+            // The largest end the database takes as a bound value.
+            (0, MAX_SQL_INT as u64),
         ];
         let mut border = 0;
         for s in &sizes {
