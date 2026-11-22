@@ -443,6 +443,11 @@ mod control {
             "default",
             "t_ABC",
             "x_00000000000000a1",
+            "t_zz",
+            "t_00000000000000a",
+            "t_00000000000000a1f",
+            "t_0123456789abcdeg",
+            "t_00000000000000A1",
         ] {
             assert!(
                 ControlIntent::new(tenant, IntentChain::Keys, 1).is_none(),
@@ -477,6 +482,21 @@ mod control {
                 "tenant 0",
             ),
             (with("tenant", json!("t_A1")), BadTenant, "not a tenant id"),
+            (
+                with("tenant", json!("t_zz")),
+                BadTenant,
+                "record-name syntax, not an id",
+            ),
+            (
+                with("tenant", json!("t_00000000000000a")),
+                BadTenant,
+                "15 hex digits",
+            ),
+            (
+                with("tenant", json!("t_00000000000000a1f")),
+                BadTenant,
+                "17 hex digits",
+            ),
             (with("chain", json!("grants")), BadBody, "unknown chain"),
             (without("chain"), BadBody, "no chain"),
             (with("seq", json!(-1)), BadBody, "negative seq"),
@@ -492,14 +512,14 @@ mod control {
     }
 
     #[test]
-    fn a_control_message_of_another_format_is_no_job() {
-        for v in [json!(1), json!(3)] {
+    fn a_control_message_of_another_format_is_refused_never_dropped() {
+        for v in [json!(1), json!(3), json!("2"), Value::Null] {
             let body =
                 json!({"t": "apply_control", "v": v, "tenant": TENANT, "chain": "keys", "seq": 7});
-            assert_eq!(admit(&body), Admission::Malformed, "{body}");
+            assert_refused(&body, Refusal::BadBody, &body.to_string());
         }
         let body = json!({"t": "apply_control", "tenant": TENANT, "chain": "keys", "seq": 7});
-        assert_eq!(admit(&body), Admission::Malformed);
+        assert_refused(&body, Refusal::BadBody, "no v");
     }
 
     #[test]

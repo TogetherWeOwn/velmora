@@ -73,9 +73,14 @@
 //! unit and carries no `state_seq` or `keys_seq`: the finisher reads the
 //! head of the chain, never the message's numbers.
 //!
-//! The reader knows it ([`Admission::Control`]). Tenant 0 has no chain:
-//! a message that names it, a tenant that is not a tenant id, or a field
-//! this build does not know is refused. A build without the finisher
+//! The reader knows it ([`Admission::Control`]). It names a managed
+//! tenant (`t_` and 16 hex digits, not tenant 0), as the sender's
+//! `TenantId` does: the sender never names tenant 0, so the reader
+//! refuses it. (The finisher of tenant 0's chains while its selector is
+//! `d1`, ADR §2.5 and DUR-7, changes this.) A tenant that is not such an
+//! id, a field this build does not know, or a `v` other than 2 is
+//! refused: a control intent has no outbox row that would send it again,
+//! so it is never dropped as a malformed job. A build without the finisher
 //! (this one) hands every control message back until it reaches the
 //! dead-letter queue, which pages: no intent is dropped in silence, and
 //! the freshness lease and the pending sweep finish its change (ADR
@@ -466,7 +471,8 @@ pub struct ControlIntent {
 
 impl ControlIntent {
     /// The intent for record `seq` of `chain` of `tenant`. `None` for a
-    /// tenant that is not a managed tenant id: tenant 0 has no chain.
+    /// tenant that is not a managed tenant id (`t_` and 16 hex digits,
+    /// not tenant 0).
     pub fn new(tenant: &str, chain: IntentChain, seq: u64) -> Option<ControlIntent> {
         managed_tenant(tenant).then(|| ControlIntent {
             tenant: tenant.to_owned(),
@@ -517,9 +523,16 @@ impl ControlMessage<'_> {
     }
 }
 
-/// A managed tenant's id: a tenant id that is not tenant 0's.
+/// A managed tenant's id: `t_` and 16 lowercase hex digits (the
+/// tenant id of the key and tenant chains, `crypto::scheme2::TenantId`),
+/// and not tenant 0's.
 fn managed_tenant(tenant: &str) -> bool {
-    crate::recovery::valid_tenant_id(tenant) && tenant != TenantScope::tenant_zero().tenant_id()
+    let hex = tenant.strip_prefix("t_").unwrap_or_default();
+    hex.len() == 16
+        && hex
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        && tenant != TenantScope::tenant_zero().tenant_id()
 }
 
 /// What the consumer does with a message.
@@ -606,6 +619,14 @@ pub fn admit(body: &Value) -> Admission {
     // tenant: it is tenant 0's, the only tenant there was when it could
     // be written.
     let scope = TenantScope::tenant_zero();
+    // A control intent, in whatever format: never a job, and never
+    // dropped as a malformed one.
+    if body.get("t").and_then(Value::as_str) == Some(APPLY_CONTROL) {
+        return match control_message(body) {
+            Ok(intent) => Admission::Control(intent),
+            Err(refusal) => Admission::Refused(refusal),
+        };
+    }
     if body.get("v").and_then(Value::as_u64) != Some(u64::from(TENANT_FORMAT_VERSION)) {
         return match serde_json::from_value::<Job>(body.clone()) {
             Ok(job) => Admission::Run {
@@ -614,12 +635,6 @@ pub fn admit(body: &Value) -> Admission {
                 tenant: None,
             },
             Err(_) => Admission::Malformed,
-        };
-    }
-    if body.get("t").and_then(Value::as_str) == Some(APPLY_CONTROL) {
-        return match control_message(body) {
-            Ok(intent) => Admission::Control(intent),
-            Err(refusal) => Admission::Refused(refusal),
         };
     }
     match tenant_message(body, &scope) {
@@ -689,13 +704,15 @@ fn control_message(body: &Value) -> std::result::Result<ControlIntent, Refusal> 
     struct Body {
         #[allow(dead_code)]
         t: String,
-        #[allow(dead_code)]
-        v: u8,
+        v: Option<Value>,
         tenant: Option<Value>,
         chain: IntentChain,
         seq: u64,
     }
     let body = Body::deserialize(body).map_err(|_| Refusal::BadBody)?;
+    if body.v.as_ref().and_then(Value::as_u64) != Some(u64::from(TENANT_FORMAT_VERSION)) {
+        return Err(Refusal::BadBody);
+    }
     let tenant = match body.tenant {
         None | Some(Value::Null) => return Err(Refusal::NoTenant),
         Some(Value::String(tenant)) => tenant,
