@@ -194,9 +194,11 @@ hand-out, and its writes are due from their own time.
   changes nothing. A unit the head does not list is not called.
 - **The request path** (rule 5): `renew_needed` renews, `sync_needed`
   syncs, a lower request number takes the unit's numbers; each fix runs once
-  and the call runs once more. An unsigned call makes at most one renewal
-  attempt per unit and T in an isolate, and none while one runs (rule 11). An answer with less than half of T left asks
-  for a background renewal (`waitUntil`), one per unit and isolate.
+  and the call runs once more. An answer with less than half of T left asks
+  for a background renewal (`waitUntil`). Unsigned calls and background
+  renewals go through the isolate's spacing: none while one runs, and after
+  a failed attempt a backoff from 60 s doubling up to T, cleared by a
+  success (rule 11). Signed calls renew for themselves.
 - **The `renew` and `stamp_raise` jobs**, which the queue consumer hands to
   the client: a renewal as above; a raise moves the unit's counter, then puts
   its object, renewing first when the lease ran out. A failed call is handed

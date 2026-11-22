@@ -518,6 +518,15 @@ fn with_fresh<R>(f: impl FnOnce(&Rig<'_>) -> R) -> R {
     })
 }
 
+/// A request-path call that did not fail, and its pages.
+fn called(
+    c: &Client<'_, '_>,
+    call: UnitCall,
+) -> (velmora_bridge::unit_lease::client::Answered, Vec<Page>) {
+    let (a, pages) = block_on(c.call(call));
+    (a.unwrap(), pages)
+}
+
 /// A renewal that did not fail: what it came to, and its pages.
 fn renewed(c: &Client<'_, '_>, seqs: Seqs) -> (Renewal, Vec<Page>) {
     let (r, pages) = block_on(c.renew(seqs));
@@ -891,11 +900,12 @@ fn a_long_key_backlog_is_applied_in_pages() {
     });
 }
 
-/// Rule 11: unsigned calls on an expired lease make at most one renewal
-/// attempt per unit and T; signed calls renew for themselves (review
-/// finding 2).
+/// Rule 11: unsigned calls on an expired lease renew only through the
+/// isolate's spacing: none while one runs, and after a failed attempt a
+/// backoff from 60 s doubling up to T; signed calls renew for themselves
+/// (review findings 2 and M1).
 #[test]
-fn unsigned_calls_try_one_renewal_per_unit_and_t() {
+fn unsigned_calls_space_failed_renewals_with_a_backoff() {
     with_fresh(|rig| {
         // A renewal that is refused every time: a revocation the bucket
         // does not list.
@@ -903,25 +913,115 @@ fn unsigned_calls_try_one_renewal_per_unit_and_t() {
         block_on(rig.client().sync(rig.unit_seqs())).unwrap();
         rig.clock.advance_ms(T + 1);
         let unsigned = || {
-            let mut c = request(rig.unit_seqs(), UnitOp::Ping {});
+            // The key-row fetch: one of the two unsigned calls (rule 11).
+            let mut c = request(
+                rig.unit_seqs(),
+                UnitOp::KeyRow {
+                    access_key_id: K.into(),
+                },
+            );
             c.authenticated = false;
-            block_on(rig.client().call(c)).unwrap()
+            called(&rig.client(), c)
         };
         let reads = || rig.calls().iter().filter(|c| *c == "job:stamp").count();
         let before = reads();
-        let pages: usize = (0..5).map(|_| unsigned().pages.len()).sum();
+        let pages: usize = (0..5).map(|_| unsigned().1.len()).sum();
         assert_eq!(reads() - before, 1, "one attempt");
         assert_eq!(pages, 1, "one page");
-        // One T later: one more.
-        rig.clock.advance_ms(T);
+        // 60 s on: one more; then the wait doubles.
+        rig.clock.advance_ms(60_000);
         unsigned();
         unsigned();
         assert_eq!(reads() - before, 2);
+        rig.clock.advance_ms(60_000);
+        unsigned();
+        assert_eq!(reads() - before, 2, "120 s now");
+        rig.clock.advance_ms(60_000);
+        unsigned();
+        assert_eq!(reads() - before, 3);
         // A signed call tries every time.
         for _ in 0..2 {
-            block_on(rig.client().call(request(rig.unit_seqs(), UnitOp::Ping {}))).unwrap();
+            called(&rig.client(), request(rig.unit_seqs(), UnitOp::Ping {}));
         }
-        assert_eq!(reads() - before, 4);
+        assert_eq!(reads() - before, 5);
+    });
+}
+
+/// A transient failure holds unsigned renewals back for the first backoff
+/// only, not for T; a success clears it (review M1).
+#[test]
+fn a_transient_failure_delays_unsigned_renewals_by_the_first_backoff_only() {
+    with_fresh(|rig| {
+        rig.clock.advance_ms(T + 1);
+        let unsigned = || {
+            // The key-row fetch: one of the two unsigned calls (rule 11).
+            let mut c = request(
+                rig.unit_seqs(),
+                UnitOp::KeyRow {
+                    access_key_id: K.into(),
+                },
+            );
+            c.authenticated = false;
+            block_on(rig.client().call(c))
+        };
+        rig.obj.lose_answer_of.set(Some("job:stamp"));
+        let (a, _) = unsigned();
+        assert!(a.is_err(), "the attempt failed");
+        let (a, _) = unsigned();
+        assert!(matches!(
+            a.unwrap().reply.answer,
+            UnitAnswer::RenewNeeded { .. }
+        ));
+        rig.clock.advance_ms(60_000);
+        let (a, p) = unsigned();
+        let a = a.unwrap();
+        assert!(
+            matches!(a.reply.answer, UnitAnswer::Ok { .. }),
+            "recovered after 60 s: {a:?} {p:?} {:?}",
+            rig.calls()
+        );
+        // Cleared: a later expiry is renewed at once.
+        rig.clock.advance_ms(T + 1);
+        let (a, _) = unsigned();
+        assert!(matches!(a.unwrap().reply.answer, UnitAnswer::Ok { .. }));
+    });
+}
+
+/// The background renewal takes the same spacing (review M2).
+#[test]
+fn background_renewals_are_spaced_too() {
+    with_fresh(|rig| {
+        rig.key_record(3, key(K, 3, SubjectStatus::Revoked));
+        block_on(rig.client().sync(rig.unit_seqs())).unwrap();
+        let c = rig.client();
+        let first = block_on(c.renew_in_background(rig.unit_seqs()));
+        assert!(
+            matches!(first, Some((Ok(Renewal::Refused), _))),
+            "{first:?}"
+        );
+        for _ in 0..4 {
+            assert!(block_on(c.renew_in_background(rig.unit_seqs())).is_none());
+        }
+        rig.clock.advance_ms(60_000);
+        assert!(block_on(c.renew_in_background(rig.unit_seqs())).is_some());
+    });
+}
+
+/// The pages of a renewal a call made come back with its error (review
+/// L1).
+#[test]
+fn a_calls_error_keeps_the_renewals_pages() {
+    with_fresh(|rig| {
+        put(
+            rig.safety,
+            &format!("{}{K}", RecordNames.revocation_dir(tid())),
+        );
+        rig.clock.advance_ms(T + 1);
+        rig.finisher.1.set(true);
+        rig.obj.lose_answer_of.set(Some("renew"));
+        let (a, pages) = block_on(rig.client().call(request(rig.unit_seqs(), UnitOp::Ping {})));
+        assert!(a.is_err());
+        assert_eq!(pages, [Page::FinisherNotTold]);
     });
 }
 
@@ -1079,7 +1179,7 @@ fn a_stamp_raise_on_a_closed_unit_is_acknowledged() {
 fn a_request_on_an_expired_lease_renews_and_runs_once_more() {
     with_rig(|rig| {
         block_on(rig.client().sync(rig.unit_seqs())).unwrap();
-        let a = block_on(rig.client().call(request(rig.unit_seqs(), UnitOp::Ping {}))).unwrap();
+        let a = called(&rig.client(), request(rig.unit_seqs(), UnitOp::Ping {})).0;
         assert!(matches!(a.reply.answer, UnitAnswer::Ok { .. }), "{a:?}");
         assert_eq!(a.refreshed, None);
         assert!(!a.renew_due);
@@ -1098,7 +1198,7 @@ fn a_request_with_newer_numbers_syncs_and_runs_once_more() {
         rig.write(limits(rig), Actor::Operator);
         let mut seqs = rig.unit_seqs();
         seqs.state_seq = 5;
-        let a = block_on(rig.client().call(request(seqs, UnitOp::Ping {}))).unwrap();
+        let a = called(&rig.client(), request(seqs, UnitOp::Ping {})).0;
         assert!(matches!(a.reply.answer, UnitAnswer::Ok { .. }), "{a:?}");
         assert_eq!(rig.unit_seqs().state_seq, 5);
     });
@@ -1114,7 +1214,7 @@ fn a_request_with_older_numbers_takes_the_units_once() {
             state_seq: now.state_seq - 1,
             keys_seq: now.keys_seq,
         };
-        let a = block_on(rig.client().call(request(old, UnitOp::Ping {}))).unwrap();
+        let a = called(&rig.client(), request(old, UnitOp::Ping {})).0;
         assert!(matches!(a.reply.answer, UnitAnswer::Ok { .. }), "{a:?}");
         assert_eq!(a.refreshed, Some(now));
     });
@@ -1129,9 +1229,9 @@ fn a_request_renews_at_most_once() {
         // The bucket lists a revocation the unit cannot hold: refused.
         rig.key_record(3, key(K, 3, SubjectStatus::Revoked));
         block_on(rig.client().sync(rig.unit_seqs())).unwrap();
-        let a = block_on(rig.client().call(request(rig.unit_seqs(), UnitOp::Ping {}))).unwrap();
+        let (a, pages) = called(&rig.client(), request(rig.unit_seqs(), UnitOp::Ping {}));
         assert!(matches!(a.reply.answer, UnitAnswer::RenewNeeded { .. }));
-        assert_eq!(a.pages, [Page::RevocationsShort { listed: 0, held: 1 }]);
+        assert_eq!(pages, [Page::RevocationsShort { listed: 0, held: 1 }]);
         let renews = rig.calls().iter().filter(|c| *c == "job:stamp").count();
         assert_eq!(renews, 1);
     });
@@ -1157,7 +1257,7 @@ fn a_background_renewal_is_due_below_half_of_t() {
         assert!(!c.renew_due(&reply(half)));
         assert!(!c.renew_due(&reply(T as u64)));
         rig.clock.advance_ms(T / 2 + 1);
-        let a = block_on(c.call(request(rig.unit_seqs(), UnitOp::Ping {}))).unwrap();
+        let a = called(&c, request(rig.unit_seqs(), UnitOp::Ping {})).0;
         assert!(a.renew_due);
     });
 }

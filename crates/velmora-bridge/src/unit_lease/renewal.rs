@@ -100,9 +100,11 @@ pub enum Proof {
     /// A newer record exists in the named chain(s): `sync`, then prove
     /// again.
     SyncNeeded { tenant_chain: bool, key_chain: bool },
-    /// A stamp object exists after the counter the unit reported. Not yet
-    /// a rollback: a raise that ran after the unit answered gives the same
-    /// listing. The caller confirms with [`crate::stamp::Stamp::checked`]
+    /// A full page ([`STAMP_PAGE`]) of stamp objects after the counter the
+    /// unit reported: a unit far behind its stamp, confirmed before
+    /// anything else. (Fewer objects make a [`Proof::Fresh`] at the newest
+    /// one's counter.) Not yet a rollback: a run of raises after the unit
+    /// answered gives the same listing. The caller confirms with [`crate::stamp::Stamp::checked`]
     /// over the unit's counter, which records a rollback only while the
     /// counter is still `seen`, and otherwise proves again.
     StampAhead { seen: Option<u64> },
