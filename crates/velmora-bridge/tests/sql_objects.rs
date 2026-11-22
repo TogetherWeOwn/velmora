@@ -2384,10 +2384,8 @@ async fn extents_in_matches_the_statement_it_replaced() {
             (size + 5, size + 9),
             (0, 0),
             (size, size),
-            // An open end: the largest integer D1 and a Durable Object
-            // bind exactly (2^53 - 1). Above it both adapters refuse
-            // the statement, as the workerd run of this suite shows.
-            (0, (1 << 53) - 1),
+            // The largest end the database takes as a bound value.
+            (0, MAX_SQL_INT as u64),
         ];
         let mut border = 0;
         for s in &sizes {

@@ -3,7 +3,10 @@
 //!
 //! A revocation is put once, after the intent and before the chain
 //! record, and **overrides every `m/k/` status, whatever the order or
-//! the seq**. It is read by its name alone.
+//! the seq**. It is read by its name alone. A managed tenant's names are
+//! its subjects' ids: an access key id, or a principal's plane id
+//! (`p_` and 16 hex digits, [`is_principal_id`]). Tenant 0's are access
+//! key ids only.
 //!
 //! Tenant 0's revocations sit directly under `m/rk/`, beside the
 //! directories of the managed tenants. Every listing of tenant 0's
@@ -18,6 +21,7 @@
 use serde::{Deserialize, Serialize};
 use velmora::rng::FillRandom;
 
+use super::record::is_principal_id;
 use crate::crypto::scheme2::{parse_control, seal_control, ControlOwner, ControlSealer, TenantId};
 use crate::ports::{BlobStore, Kek};
 use crate::records::RecordStore;
@@ -28,6 +32,12 @@ use crate::types::{BridgeError, Result};
 pub const REVOCATION_PAGE: u32 = 1000;
 
 const ERR_REVOCATION: BridgeError = BridgeError::Invalid("revocation record is malformed");
+
+/// Whether `id` may name a managed tenant's revocation: an access key id
+/// or a principal's plane id.
+pub fn revocable_id(id: &str) -> bool {
+    valid_key_id(id) || is_principal_id(id)
+}
 
 /// The directory of `tenant`'s revocations.
 pub fn tenant_revocation_prefix(tenant: &TenantId) -> String {
@@ -58,7 +68,7 @@ pub async fn put_tenant_revocation<S: RecordStore, K: Kek, R: FillRandom>(
     at: u64,
     rng: &mut R,
 ) -> Result<()> {
-    if !valid_key_id(akid) {
+    if !revocable_id(akid) {
         return Err(ERR_REVOCATION);
     }
     let name = tenant_revocation_name(tenant, akid);
@@ -102,8 +112,9 @@ pub async fn read_tenant_revocation<S: RecordStore, K: Kek>(
     Ok(Some(body.revoked_at))
 }
 
-/// Every access key id with a revocation for `tenant`, by name. A name
-/// below the prefix that is no key id is skipped: it cannot name a key.
+/// Every subject id with a revocation for `tenant`, by name. A name below
+/// the prefix that is no subject id ([`revocable_id`]) is skipped: it
+/// cannot name a subject.
 pub async fn list_tenant_revocations<S: RecordStore>(
     store: &S,
     tenant: &TenantId,
@@ -117,7 +128,7 @@ pub async fn list_tenant_revocations<S: RecordStore>(
             names
                 .iter()
                 .filter_map(|n| n.strip_prefix(&prefix))
-                .filter(|id| valid_key_id(id))
+                .filter(|id| revocable_id(id))
                 .map(str::to_owned),
         );
         match names.last() {
