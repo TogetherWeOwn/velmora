@@ -252,8 +252,8 @@ jobs:
       - run: cargo check --locked -p velmora
       - run: cargo check --locked -p velmora --no-default-features
       - run: cargo check --locked -p velmora-ssrf-guard
-      # Bridge core and protocol crates declare the same 1.89 MSRV.
-      - run: cargo check --locked -p velmora-s3-proto -p velmora-bridge
+      # The bridge, protocol and WebDAV core crates also declare Rust 1.89.
+      - run: cargo check --locked -p velmora-s3-proto -p velmora-bridge -p velmora-dav
       - run: cargo check --locked -p velmora-parity-bench
       - run: cargo check --locked -p velmora-cpu-bench
       - name: Install Rust 1.91 (Worker SDK minimum)
