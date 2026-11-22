@@ -4,7 +4,8 @@
 use serde_json::{json, Map, Value};
 use velmora_bridge::directory::feed::{
     Appended, EventPage, FeedPosition, FeedReset, NewEvent, APPEND, EVENT_KEEP_MS, FEED_STATE,
-    MAX_EVENTS_PAGE, PRUNE_CUT, PRUNE_MARKS, PRUNE_ROWS, START_EPOCH, TENANT_RANGE,
+    MAX_EVENTS_PAGE, PRUNE_CUT, PRUNE_MARKS, PRUNE_ROWS, PURGE_MARK, PURGE_ROWS, START_EPOCH,
+    TENANT_RANGE,
 };
 use velmora_bridge::directory::record::Tenant;
 use velmora_bridge::directory::store::SqlDirectory;
@@ -272,7 +273,20 @@ fn every_feed_statement_has_a_bounded_plan() {
         let db = database();
         let one = SqlValue::Int(1);
         let text = SqlValue::Text(A1.into());
-        let cases: [(&str, &str, Vec<SqlValue>, &[&str]); 7] = [
+        let three = vec![text.clone(), one.clone(), one.clone()];
+        let cases: [(&str, &str, Vec<SqlValue>, &[&str]); 9] = [
+            (
+                "PURGE_MARK",
+                PURGE_MARK,
+                three.clone(),
+                &["tenant_events_tenant (tenant=? AND seq<?)"],
+            ),
+            (
+                "PURGE_ROWS",
+                PURGE_ROWS,
+                three.clone(),
+                &["tenant_events_tenant (tenant=? AND seq<?)"],
+            ),
             ("FEED_STATE", FEED_STATE, vec![text.clone()], &[]),
             (
                 "TENANT_RANGE",
@@ -331,11 +345,38 @@ fn every_feed_statement_has_a_bounded_plan() {
             }
             for l in &lines {
                 let scan = l.starts_with("SCAN ") && !l.starts_with("SCAN CONSTANT ROW");
-                // PRUNE_CUT scans its own subquery of at most `?2` rows.
-                let bounded = name == "PRUNE_CUT"
-                    && (l == "SCAN tenant_events" || l.starts_with("SCAN (subquery"));
+                // PRUNE_CUT and the purge scan their own subqueries of at most
+                // `LIMIT` rows.
+                let bounded = (name == "PRUNE_CUT" && l == "SCAN tenant_events")
+                    || ((name == "PRUNE_CUT" || name.starts_with("PURGE"))
+                        && l.starts_with("SCAN (subquery"));
                 assert!(!scan || bounded, "{name}: {l}");
             }
         }
+    });
+}
+
+/// Review r1 LOW 6: the shred purges one tenant's events, bounded, and
+/// raises its mark, so a poller below it is reset and nothing of another
+/// tenant moves.
+#[test]
+fn the_shred_purges_one_tenants_events_and_marks_them() {
+    block_on(async {
+        let db = database();
+        let dir = SqlDirectory { sql: &db };
+        // a1: 1, 3, 4; b2: 2; a1's final shred event: 5.
+        for (i, tenant) in [A1, B2, A1, A1, A1].into_iter().enumerate() {
+            append(&dir, tenant, &format!("t/{}", i + 1), NOW.0).await;
+        }
+        assert!(dir.purge_tenant_events(&t(A1), 4, 0).await.is_err());
+        assert_eq!(dir.purge_tenant_events(&t(A1), 4, 2).await.unwrap(), 2);
+        assert_eq!(dir.purge_tenant_events(&t(A1), 4, 2).await.unwrap(), 1);
+        assert_eq!(dir.purge_tenant_events(&t(A1), 4, 2).await.unwrap(), 0);
+        let a = page(&dir, A1, None, 10).await.unwrap();
+        assert_eq!(seqs(&a), [5]);
+        assert_eq!(page(&dir, A1, Some(pos(0, 3)), 10).await, Err(FeedReset));
+        assert!(page(&dir, A1, Some(pos(0, 4)), 10).await.is_ok());
+        let b = page(&dir, B2, Some(pos(0, 0)), 10).await.unwrap();
+        assert_eq!(seqs(&b), [2]);
     });
 }

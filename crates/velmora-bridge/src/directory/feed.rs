@@ -143,6 +143,17 @@ pub const PRUNE_MARKS: &str = "INSERT INTO tenant_feed_pruned (tenant, seq) \
 
 pub const PRUNE_ROWS: &str = "DELETE FROM tenant_events WHERE seq <= ?1";
 
+/// The shred's purge takes the oldest `?3` events of tenant `?1` at or
+/// below seq `?2` (one range of the `(tenant, seq)` index), and raises the tenant's prune mark as the prune does.
+pub const PURGE_MARK: &str = "INSERT INTO tenant_feed_pruned (tenant, seq) \
+     SELECT ?1, m FROM (SELECT MAX(seq) AS m FROM \
+     (SELECT seq FROM tenant_events WHERE tenant = ?1 AND seq <= ?2 ORDER BY seq LIMIT ?3)) \
+     WHERE m IS NOT NULL \
+     ON CONFLICT (tenant) DO UPDATE SET seq = excluded.seq WHERE excluded.seq > tenant_feed_pruned.seq";
+
+pub const PURGE_ROWS: &str = "DELETE FROM tenant_events WHERE seq IN \
+     (SELECT seq FROM tenant_events WHERE tenant = ?1 AND seq <= ?2 ORDER BY seq LIMIT ?3)";
+
 /// `^[a-z_]+(\.[a-z_]+)+$`.
 fn valid_event_type(s: &str) -> bool {
     let mut parts = 0;
@@ -315,10 +326,12 @@ impl<S: Sql> SqlDirectory<'_, S> {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        // A prune that ran meanwhile may have removed rows of this range
-        // before the read saw them; a new epoch makes the page stale.
+        // A new epoch makes the page stale. After a position, a prune that
+        // ran meanwhile may have removed rows of this range before the
+        // read saw them. Without one, the read starts at the oldest kept
+        // event, and a row the prune took is no longer kept.
         let again = self.feed_state(tenant).await?;
-        if again.epoch != state.epoch || again.pruned > from {
+        if again.epoch != state.epoch || (after.is_some() && again.pruned > from) {
             return Ok(Err(FeedReset));
         }
         let position = match (items.last(), after) {
@@ -379,6 +392,38 @@ impl<S: Sql> SqlDirectory<'_, S> {
                 (PRUNE_MARKS, vec![int(cut)?]),
                 (PRUNE_ROWS, vec![int(cut)?]),
             ])
+            .await?;
+        Ok(changed.get(1).copied().unwrap_or(0))
+    }
+}
+
+impl<S: Sql> SqlDirectory<'_, S> {
+    /// One step of the shred's purge of `tenant`'s events (ADR §3.3): its
+    /// oldest events at or below `through` (the seq before the final,
+    /// name-free shred events), at most `limit` (1 to [`MAX_PRUNE_ROWS`]),
+    /// with its prune mark raised in the same batch, so a position below
+    /// them answers [`FeedReset`]. Returns the rows removed; fewer than
+    /// `limit` = done. The event data names buckets, which the shred
+    /// erases everywhere else with the tenant key.
+    pub async fn purge_tenant_events(
+        &self,
+        tenant: &Tenant,
+        through: u64,
+        limit: u32,
+    ) -> Result<u64> {
+        if !(1..=MAX_PRUNE_ROWS).contains(&limit) {
+            return Err(ERR_LIMIT);
+        }
+        let p = || {
+            Ok::<_, BridgeError>(vec![
+                SqlValue::Text(tenant.as_str().to_string()),
+                int(through)?,
+                SqlValue::Int(i64::from(limit)),
+            ])
+        };
+        let changed = self
+            .sql
+            .batch(vec![(PURGE_MARK, p()?), (PURGE_ROWS, p()?)])
             .await?;
         Ok(changed.get(1).copied().unwrap_or(0))
     }

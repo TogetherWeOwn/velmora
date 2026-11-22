@@ -56,6 +56,11 @@ pub const KEY_CHECK_LEN: usize = 8;
 /// it, small.
 pub const MAX_MOVED_BUCKETS: usize = 1024;
 
+/// How far ahead of the writer's clock a move floor may be: every writer
+/// passes a `lifted_at` or its own clock, so a floor further ahead is a
+/// caller's bug (a time in another unit), and it could never be lowered.
+pub const MAX_FLOOR_AHEAD_MS: i64 = 5 * 60_000;
+
 /// How long tenant 0 stays `moved` before it can be retired: 30 days.
 pub const RETIRE_AFTER_MS: i64 = 30 * 24 * 3_600_000;
 
@@ -206,6 +211,10 @@ pub enum Change {
         grant_seq: u64,
         name: String,
         bdk_wrapped: Vec<u8>,
+        /// The tenant key version the wrap was made under: the head's
+        /// `tk_version`, or the create is refused with `key_version` and the
+        /// caller wraps the same BDK again under the new version.
+        tk_version: u32,
     },
     /// Remove a bucket's placement.
     DropBucket { bucket: String },
@@ -233,8 +242,11 @@ pub enum Change {
     /// Raise the move floor of `unit` to `floor` (AM-67): the move tool at
     /// step 8(b1) with the unit's `lifted_at`, and after every `deleteAll()`
     /// exit with its clock; the restore tool before a `restore`. `zero` is
-    /// tenant 0's head as the caller read it from its chain. A floor at or
-    /// above `floor` already is `Unchanged`; a floor is never lowered.
+    /// tenant 0's head, read from its chain by
+    /// [`super::chain::TenantChain::set_move_floor`] (plain `write` refuses
+    /// this change). A floor at or above `floor` already is `Unchanged`; a
+    /// floor is never lowered, and one more than [`MAX_FLOOR_AHEAD_MS`]
+    /// ahead of the clock is refused.
     SetMoveFloor {
         unit: u32,
         floor: UnixMs,
@@ -574,9 +586,11 @@ pub fn next(
             if actor.class().is_none() {
                 return Err(FORBIDDEN);
             }
-            let Some(d) = &h.deletion else {
+            // Another deletion than the one the caller read is answered so
+            // whoever asks: a late retry never cancels a newer one.
+            let Some(d) = h.deletion.as_ref().filter(|d| d.seq == *deletion_seq) else {
                 // A retry of the undo whose record landed: apply the head.
-                return match h.undone_deletion_seq == Some(*deletion_seq) {
+                return match h.deletion.is_none() && h.undone_deletion_seq == Some(*deletion_seq) {
                     true => Ok(Outcome::Unchanged),
                     false => Err(NOT_REQUESTED),
                 };
@@ -589,11 +603,6 @@ pub fn next(
             };
             if !allowed {
                 return Err(FORBIDDEN);
-            }
-            // Another deletion than the one the caller read: a late retry
-            // never cancels a newer one.
-            if d.seq != *deletion_seq {
-                return Err(NOT_REQUESTED);
             }
             door.undone_deletion = Some(d.key_hash.clone());
             door.undone_deletion_seq = Some(d.seq);
@@ -750,6 +759,7 @@ pub fn next(
             grant_seq,
             name,
             bdk_wrapped,
+            tk_version,
         } => {
             live(h)?;
             if !matches!(actor, Actor::Customer | Actor::Operator) {
@@ -782,6 +792,12 @@ pub fn next(
             if !h.units.contains(unit) {
                 return Err(UNIT_NOT_LISTED);
             }
+            // The wrap is bound to the key version in its AAD: one made
+            // before a rotation committed is wrapped again, never stored
+            // beside another version.
+            if *tk_version != h.tk_version {
+                return Err(VERSION);
+            }
             // The seq only grows, so a derived id is never placed twice,
             // also after its bucket was dropped. A create that is not placed
             // and whose seq is not above the last lost the order.
@@ -805,6 +821,7 @@ pub fn next(
             private.bucket_created = Some(BucketSecrets {
                 name: name.clone(),
                 bdk_wrapped: bdk_wrapped.clone(),
+                tk_version: *tk_version,
             });
         }
 
@@ -979,7 +996,7 @@ pub fn next(
             if tenant.is_zero() {
                 return Err(TENANT_ZERO);
             }
-            if floor.0 <= 0 {
+            if floor.0 <= 0 || floor.0 > now.0.saturating_add(MAX_FLOOR_AHEAD_MS) {
                 return Err(INVALID);
             }
             if h.move_floors.get(unit).is_some_and(|f| f >= floor) {
