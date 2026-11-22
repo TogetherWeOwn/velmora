@@ -242,11 +242,11 @@ fn the_id_of_tenant_zero_is_written_in_one_place() {
     // tests).
     let code_only: BTreeMap<String, String> = all
         .iter()
+        // Only the test module is cut: a test-only item near the top of a
+        // file (`plan.rs`, `queues.rs`) leaves the code after it counted.
         .map(|(f, t)| {
-            (
-                f.clone(),
-                code(t.split("#[cfg(test)]").next().unwrap_or("")),
-            )
+            let module = t.split("#[cfg(test)]\nmod ").next().unwrap_or("");
+            (f.clone(), code(module))
         })
         .collect();
     let mut literal = uses(&code_only, "t_0000000000000000");
@@ -510,7 +510,16 @@ fn the_catalogue_id_is_read_in_one_place() {
 fn the_directory_is_asked_by_nothing() {
     let all = all();
     const DIRECTORY: &str = "bridge/directory/port.rs";
-    for name in ["Directory", "SingleTenant", "directory::port", ".route("] {
+    // The port's paths: the tenant chain's reader (`directory::chain`,
+    // `directory::record`), which the unit client reads heads with, is not
+    // the port.
+    for name in [
+        "Directory",
+        "SingleTenant",
+        "directory::port",
+        "directory::{",
+        ".route(",
+    ] {
         let found = uses(&all, name);
         // The directory module's own files (its store, gate and the
         // re-export) are not callers of the port.

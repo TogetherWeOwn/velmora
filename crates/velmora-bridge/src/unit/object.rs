@@ -1348,7 +1348,7 @@ impl<S: UnitSql> Unit<S> {
                     (_, None) => Err(Refused::Reserve(reserve::ReserveRefusal::Malformed)),
                 })
             };
-            let out = transact(sql, true, &mut op)?;
+            let out = self.transact_noted(now, &mut op)?;
             // A re-ask that failed at the head leaves no row (§2.5 (c)):
             // the drop is its own transaction, as the refusal rolled the
             // ask back.
@@ -1359,7 +1359,7 @@ impl<S: UnitSql> Unit<S> {
                     ))
                 };
                 // Dropped, or already gone: either way no row is left.
-                let _ = transact(sql, true, &mut drop)?;
+                let _ = self.transact_noted(now, &mut drop)?;
             }
             return Ok(match out {
                 Ok(body) => ok(body),
@@ -1389,10 +1389,39 @@ impl<S: UnitSql> Unit<S> {
                 _ => return Err(BridgeError::Invalid("not a reservation call")),
             }))
         };
-        Ok(match transact(sql, true, &mut op)? {
+        Ok(match self.transact_noted(now, &mut op)? {
             Ok(body) => ok(body),
             Err(reason) => refused(reason, false),
         })
+    }
+
+    /// [`transact`] of an authenticated call that makes the alarm's stamp
+    /// raise due when it changes rows, outside [`Unit::run`]: the
+    /// reservation calls (AM-48). They hold the customer's idempotency
+    /// state, and a rollback that loses one can apply a call again, so
+    /// the first write since the last raise is noted in the same
+    /// transaction and the alarm is asked for the raise, as `run` does.
+    fn transact_noted(
+        &self,
+        now: UnixMs,
+        op: &mut dyn FnMut() -> Result<std::result::Result<Value, Refused>>,
+    ) -> Result<std::result::Result<Value, Refused>> {
+        let sql = self.sql();
+        let mut first_write = false;
+        let mut noted = || {
+            let before = total_changes(sql)?;
+            let out = op()?;
+            if out.is_ok() && total_changes(sql)? != before {
+                first_write = store::note_write(sql, now)?;
+            }
+            Ok(out)
+        };
+        let out = transact(sql, true, &mut noted)?;
+        // A refusal rolled the note back with the rest.
+        if first_write && out.is_ok() {
+            self.want_wake(alarm::stamp_raise_due(Some(now), &self.alarm_rules));
+        }
+        Ok(out)
     }
 
     /// The caller's numbers of a move call (an import batch, the seal, the

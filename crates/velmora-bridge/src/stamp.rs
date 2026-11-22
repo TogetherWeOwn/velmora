@@ -130,7 +130,8 @@ pub fn stamp_key(catalogue: &str, counter: u64) -> String {
     format!("{STAMP_PREFIX}{catalogue}/{counter:020}")
 }
 
-fn counter_of(dir: &str, key: &str) -> Result<u64> {
+/// The counter of stamp key `key` in the stamp directory `dir`.
+pub(crate) fn counter_of(dir: &str, key: &str) -> Result<u64> {
     key.strip_prefix(dir)
         .filter(|n| n.len() == 20 && n.bytes().all(|b| b.is_ascii_digit()))
         .and_then(|n| n.parse().ok())

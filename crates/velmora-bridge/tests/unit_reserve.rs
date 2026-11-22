@@ -17,6 +17,7 @@ use velmora_bridge::unit::{
     BirthKind, BirthToken, CallKind, Refused, Seqs, SyncHead, TenantId, TenantState, Unit,
     UnitAnswer, UnitCall, UnitName, UnitOp,
 };
+use velmora_bridge::unit_lease::lease::Proven;
 use velmora_bridge::UnixMs;
 
 const NOW: UnixMs = UnixMs(1_795_000_000_000);
@@ -45,8 +46,36 @@ fn call(op: UnitOp) -> UnitCall {
     }
 }
 
+/// One call at `now`, as the Worker makes it under rule 12: an answer
+/// `renew_needed` (the lease ran out: these tests move the clock by hours)
+/// is followed by a renewal at `now` and the same call once more.
 fn at(u: &Unit<RusqliteSql>, op: UnitOp, now: UnixMs) -> UnitAnswer {
-    u.handle(&call(op), now)
+    let c = call(op);
+    match u.handle(&c, now) {
+        UnitAnswer::RenewNeeded { why: None, .. } => {
+            renew(u, now);
+            u.handle(&c, now)
+        }
+        a => a,
+    }
+}
+
+/// The Worker's renewal at `now` (rule 12; `unit_lease_wiring.rs` holds
+/// its rules): the unit's lease then holds for T.
+fn renew(u: &Unit<RusqliteSql>, now: UnixMs) {
+    let seqs = u.head().unwrap().seqs;
+    let op = UnitOp::Renew {
+        proof_start: now,
+        proven: Proven {
+            state_seq: seqs.state_seq,
+            keys_seq: seqs.keys_seq,
+            stamp_counter: None,
+            revoked: 0,
+        },
+        revocations: Vec::new(),
+    };
+    let a = u.handle(&call(op), now);
+    assert!(matches!(a, UnitAnswer::Ok { .. }), "renew: {a:?}");
 }
 
 fn worker(u: &Unit<RusqliteSql>, op: UnitOp) -> UnitAnswer {
@@ -182,6 +211,7 @@ fn ready() -> Unit<RusqliteSql> {
         )],
         vec![],
     );
+    renew(&u, NOW);
     u
 }
 

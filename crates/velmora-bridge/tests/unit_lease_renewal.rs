@@ -554,12 +554,34 @@ async fn a_unit_behind_its_stamp_is_found_by_the_renewal_and_the_raise() {
         Proof::Fresh { .. }
     ));
 
-    // The platform takes the unit back to counter 1.
+    // The platform takes the unit back to counter 1. The proof holds the
+    // newest stamp object's counter, which the unit no longer has: it
+    // refuses the renewal.
     ledger.counter.set(Some(1));
     v.stamp_counter = Some(1);
+    let Proof::Fresh {
+        proof_start,
+        proven,
+        ..
+    } = prove(&bucket, &clock, &Names, &v).await.unwrap()
+    else {
+        panic!("the proof goes on at the newest stamp");
+    };
+    assert_eq!(proven.stamp_counter, Some(3));
+    let own = Proven {
+        stamp_counter: Some(1),
+        ..proven
+    };
     assert_eq!(
-        prove(&bucket, &clock, &Names, &v).await.unwrap(),
-        Proof::StampAhead { seen: Some(1) }
+        FreshLease::expired().renew(
+            proof_start,
+            &proven,
+            &own,
+            0,
+            clock.now(),
+            &LeaseRules::DEFAULT
+        ),
+        Err(RenewRefused::NotProven { proven, own })
     );
     // Confirmed through the unit's counter, and recorded.
     assert_eq!(stamp.checked().await.unwrap(), None);
@@ -570,9 +592,9 @@ async fn a_unit_behind_its_stamp_is_found_by_the_renewal_and_the_raise() {
 }
 
 /// A raise that runs after the unit answered puts a stamp object after
-/// the counter the proof was given. The proof reports the stamp ahead;
-/// the confirmation finds the counter moved, records nothing, and the
-/// next proof from the unit's new counter passes.
+/// the counter the proof was given. The proof goes on at that object's
+/// counter, which the unit holds by then: it renews, and nothing is
+/// recorded. The confirmation would find the counter moved too.
 #[tokio::test(flavor = "current_thread")]
 async fn a_raise_after_the_unit_answered_is_not_a_rollback() {
     let clock = FixedClock::new(T0);
@@ -592,18 +614,31 @@ async fn a_raise_after_the_unit_answered_is_not_a_rollback() {
 
     // A request raises between the unit's answer and the proof.
     stamp.raise().await.unwrap();
-    assert_eq!(
-        prove(&bucket, &clock, &Names, &v).await.unwrap(),
-        Proof::StampAhead { seen: Some(1) }
-    );
+    let Proof::Fresh {
+        proof_start,
+        proven,
+        ..
+    } = prove(&bucket, &clock, &Names, &v).await.unwrap()
+    else {
+        panic!("the proof goes on at the newest stamp");
+    };
+    assert_eq!(proven.stamp_counter, Some(2));
+    let own = Proven {
+        stamp_counter: ledger.counter.get(),
+        ..proven
+    };
+    assert!(FreshLease::expired()
+        .renew(
+            proof_start,
+            &proven,
+            &own,
+            0,
+            clock.now(),
+            &LeaseRules::DEFAULT
+        )
+        .is_ok());
     assert_eq!(stamp.checked().await.unwrap(), Some(Some(2)));
     assert!(!ledger.rolled_back.get(), "nothing recorded");
-
-    v.stamp_counter = Some(2);
-    assert!(matches!(
-        prove(&bucket, &clock, &Names, &v).await.unwrap(),
-        Proof::Fresh { .. }
-    ));
 }
 
 /// Two units of one tenant, and tenant 0's `main`, never read each
@@ -712,10 +747,39 @@ async fn a_proof_from_a_newer_view_gives_a_rolled_back_unit_no_lease() {
     assert!(!lease.is_fresh(clock.now(), &LeaseRules::DEFAULT));
 
     // The Worker proves again from the unit's own counter: the stamp
-    // objects after it are found.
+    // objects after it are found, and the proof holds the newest, which
+    // the unit does not reach.
     v.stamp_counter = own.stamp_counter;
+    let Proof::Fresh { proven, .. } = prove(&bucket, &clock, &Names, &v).await.unwrap() else {
+        panic!("the proof goes on at the newest stamp");
+    };
+    assert_eq!(proven.stamp_counter, Some(3));
+    assert!(!own.covers(&proven));
+}
+
+/// A full page of stamp objects after the unit's counter is a unit far
+/// behind its stamp: the proof stops there, and the Worker confirms the
+/// rollback through the unit's counter before anything else.
+#[tokio::test(flavor = "current_thread")]
+async fn a_full_page_of_stamps_ahead_is_confirmed_first() {
+    use velmora_bridge::unit_lease::renewal::STAMP_PAGE;
+    let clock = FixedClock::new(T0);
+    let bucket = SlowBucket::new(&clock);
+    chains(&bucket, TENANT, 1, 1).await;
+    let id = unit_id(0);
+    for n in 2..=(u64::from(STAMP_PAGE) + 1) {
+        bucket.plant(&stamp_key(id.as_str(), n)).await;
+    }
+    let mut v = view(&id, 1, 1, 0);
+    v.stamp_counter = Some(1);
     assert_eq!(
         prove(&bucket, &clock, &Names, &v).await.unwrap(),
         Proof::StampAhead { seen: Some(1) }
     );
+    // One object fewer: the proof goes on at the newest.
+    v.stamp_counter = Some(2);
+    let Proof::Fresh { proven, .. } = prove(&bucket, &clock, &Names, &v).await.unwrap() else {
+        panic!("not a full page");
+    };
+    assert_eq!(proven.stamp_counter, Some(u64::from(STAMP_PAGE) + 1));
 }
