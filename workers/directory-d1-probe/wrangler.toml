@@ -1,0 +1,18 @@
+# Test-only Worker: the directory's statements on D1 (README.md). Run with
+# `wrangler dev` for local D1. For a throwaway remote D1, generate a copy
+# of this file with the real database ids and run `wrangler dev --remote`;
+# no route, no deploy.
+name = "velmora-directory-d1-probe"
+main = "index.js"
+compatibility_date = "2026-11-01"
+workers_dev = false
+
+[[d1_databases]]
+binding = "DB0"
+database_name = "velmora-directory-probe-0"
+database_id = "00000000-0000-0000-0000-000000000000"
+
+[[d1_databases]]
+binding = "DB1"
+database_name = "velmora-directory-probe-1"
+database_id = "00000000-0000-0000-0000-000000000001"

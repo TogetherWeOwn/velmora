@@ -494,6 +494,7 @@ fn empty_private() -> TenantPrivate {
     TenantPrivate {
         v: RECORD_FORMAT,
         external_ref: None,
+        bucket_created: None,
     }
 }
 

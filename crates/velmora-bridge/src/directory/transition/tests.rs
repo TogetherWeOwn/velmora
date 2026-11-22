@@ -33,7 +33,16 @@ fn create_bucket(k: u64, unit: u32) -> Change {
         unit,
         creator: "p_owner".into(),
         grant_seq: k,
+        name: format!("bucket-{k}"),
+        bdk_wrapped: wrap(k as u8),
     }
+}
+
+/// A BDK wrap of the scheme-2 form (`0x02`, 73 bytes).
+fn wrap(n: u8) -> Vec<u8> {
+    let mut w = vec![n; crate::crypto::WRAPPED_KEY_LEN];
+    w[0] = crate::crypto::scheme2::WRAP_VERSION_2;
+    w
 }
 
 /// `r` with `bucket` placed on `unit` (listed if it was not) at the next
@@ -84,6 +93,17 @@ fn step(head: Option<&TenantRecord>, mut change: Change, actor: Actor) -> Result
     {
         if *base_seq == ANY {
             *base_seq = h.door.seq;
+        }
+    }
+    // An undo that names the deletion as the caller read it: the head's,
+    // or the last one undone.
+    if let (Some(h), Change::UndoDeletion { deletion_seq }) = (head, &mut change) {
+        if *deletion_seq == ANY {
+            *deletion_seq = match (&h.door.deletion, h.door.undone_deletion_seq) {
+                (Some(d), _) => d.seq,
+                (None, Some(seq)) => seq,
+                (None, None) => 0,
+            };
         }
     }
     next(&tenant, head, &change, actor, NOW)
@@ -429,10 +449,25 @@ fn who_sets_and_undoes_a_deletion() {
     );
     // Billing cannot undo a customer's deletion; the customer and the
     // operator can.
-    assert_eq!(refused(&d, Change::UndoDeletion, Actor::Billing), FORBIDDEN);
-    let undone = apply(&d, Change::UndoDeletion, Actor::Customer);
+    assert_eq!(
+        refused(
+            &d,
+            Change::UndoDeletion { deletion_seq: ANY },
+            Actor::Billing
+        ),
+        FORBIDDEN
+    );
+    let undone = apply(
+        &d,
+        Change::UndoDeletion { deletion_seq: ANY },
+        Actor::Customer,
+    );
     assert_eq!(undone.door.state(), TenantState::Active);
-    apply(&d, Change::UndoDeletion, Actor::Operator);
+    apply(
+        &d,
+        Change::UndoDeletion { deletion_seq: ANY },
+        Actor::Operator,
+    );
 
     // An operator's deletion is the operator's to undo.
     let od = apply(
@@ -446,15 +481,27 @@ fn who_sets_and_undoes_a_deletion() {
         Actor::Operator,
     );
     assert_eq!(
-        refused(&od, Change::UndoDeletion, Actor::Customer),
+        refused(
+            &od,
+            Change::UndoDeletion { deletion_seq: ANY },
+            Actor::Customer
+        ),
         FORBIDDEN
     );
-    apply(&od, Change::UndoDeletion, Actor::Operator);
+    apply(
+        &od,
+        Change::UndoDeletion { deletion_seq: ANY },
+        Actor::Operator,
+    );
 
-    // Undo without a deletion.
+    // Undo without a deletion, and none undone before.
     assert_eq!(
-        refused(&a, Change::UndoDeletion, Actor::Operator),
-        NOT_DELETING
+        refused(
+            &a,
+            Change::UndoDeletion { deletion_seq: ANY },
+            Actor::Operator
+        ),
+        NOT_REQUESTED
     );
     // A due date in the past and a malformed key hash are refused.
     assert_eq!(
@@ -496,7 +543,11 @@ fn the_undo_returns_to_the_carried_state() {
     // A hold can be placed and lifted while deleting.
     let d = apply(&d, billing_hold(Some(HoldMode::Locked)), Actor::Billing);
     let d = apply(&d, billing_hold(None), Actor::Billing);
-    let undone = apply(&d, Change::UndoDeletion, Actor::Customer);
+    let undone = apply(
+        &d,
+        Change::UndoDeletion { deletion_seq: ANY },
+        Actor::Customer,
+    );
     assert_eq!(
         undone.door.state(),
         TenantState::Suspended(HoldMode::ReadOnly)
@@ -523,9 +574,17 @@ fn billing_deletes_only_under_its_hold_and_with_sixty_days() {
     let d = apply(&b, dunning(60 * DAY), Actor::Billing);
     assert_eq!(d.door.deletion.as_ref().unwrap().actor, ActorClass::Billing);
     // Billing undoes its own deletion only.
-    apply(&d, Change::UndoDeletion, Actor::Billing);
+    apply(
+        &d,
+        Change::UndoDeletion { deletion_seq: ANY },
+        Actor::Billing,
+    );
     assert_eq!(
-        refused(&d, Change::UndoDeletion, Actor::Customer),
+        refused(
+            &d,
+            Change::UndoDeletion { deletion_seq: ANY },
+            Actor::Customer
+        ),
         FORBIDDEN
     );
 }
@@ -546,6 +605,8 @@ fn lifting_the_billing_hold_clears_a_billing_deletion() {
         assert_eq!(paid.door.state(), TenantState::Active, "{lifter:?}");
         assert_eq!(paid.door.deletion, None);
         assert_eq!(paid.door.undone_deletion, Some(hash(9)));
+        // The undo of AM-38 case 4 finds it by its seq.
+        assert_eq!(paid.door.undone_deletion_seq, Some(d.door.seq));
         // Easing the hold is not lifting it: the deletion stands.
         let eased = apply(&d, billing_hold(Some(HoldMode::ReadOnly)), lifter);
         assert!(eased.door.deletion.is_some());
@@ -571,7 +632,11 @@ fn an_undone_deletion_is_not_set_again_by_its_key() {
         delete_by(Actor::Customer, DeletionReason::CustomerRequest, 7 * DAY, 1),
         Actor::Customer,
     );
-    let undone = apply(&d, Change::UndoDeletion, Actor::Customer);
+    let undone = apply(
+        &d,
+        Change::UndoDeletion { deletion_seq: ANY },
+        Actor::Customer,
+    );
     let replay = delete_by(Actor::Customer, DeletionReason::CustomerRequest, 7 * DAY, 1);
     assert_eq!(refused(&undone, replay.clone(), Actor::Customer), REPLAYED);
     // A new key is a new request.
@@ -580,7 +645,11 @@ fn an_undone_deletion_is_not_set_again_by_its_key() {
         delete_by(Actor::Customer, DeletionReason::CustomerRequest, 7 * DAY, 2),
         Actor::Customer,
     );
-    let undone2 = apply(&d2, Change::UndoDeletion, Actor::Customer);
+    let undone2 = apply(
+        &d2,
+        Change::UndoDeletion { deletion_seq: ANY },
+        Actor::Customer,
+    );
     // One hash is kept, not a history.
     assert_eq!(undone2.door.undone_deletion, Some(hash(2)));
     apply(&undone2, replay, Actor::Customer);
@@ -613,7 +682,11 @@ fn a_deletion_voids_an_open_rotation_claim() {
     );
     // After the undo the rotation starts again with a new claim, of a
     // version that was never claimed.
-    let undone = apply(&d, Change::UndoDeletion, Actor::Customer);
+    let undone = apply(
+        &d,
+        Change::UndoDeletion { deletion_seq: ANY },
+        Actor::Customer,
+    );
     apply(
         &undone,
         Change::ClaimKeyVersion { version: 3 },
@@ -741,7 +814,11 @@ fn what_restoring_allows_and_refuses() {
         delete_by(Actor::Customer, DeletionReason::CustomerRequest, 7 * DAY, 1),
         Actor::Customer,
     );
-    let r = apply(&r, Change::UndoDeletion, Actor::Customer);
+    let r = apply(
+        &r,
+        Change::UndoDeletion { deletion_seq: ANY },
+        Actor::Customer,
+    );
     let r = apply(
         &r,
         Change::SetLimits {
@@ -868,7 +945,7 @@ fn shredding_admits_only_shredded_and_shredded_admits_nothing() {
     assert_eq!(s.door.state(), TenantState::Shredding);
     assert_eq!(s.door.s3_access(0), S3Access::AccountProblem);
     for (change, actor) in [
-        (Change::UndoDeletion, Actor::Operator),
+        (Change::UndoDeletion { deletion_seq: ANY }, Actor::Operator),
         (billing_hold(Some(HoldMode::Locked)), Actor::Billing),
         (Change::SetRestoring { unit: 0 }, Actor::Operator),
         (Change::ClaimKeyVersion { version: 2 }, Actor::RotationJob),
@@ -883,7 +960,11 @@ fn shredding_admits_only_shredded_and_shredded_admits_nothing() {
     assert!(gone.door.units.is_empty() && gone.door.limits.is_empty());
     assert!(gone.door.deletion.is_none() && gone.door.holds.is_empty());
     assert_eq!(gone.door.seq, s.door.seq + 1);
-    for change in [Change::FinishShred, Change::UndoDeletion, create()] {
+    for change in [
+        Change::FinishShred,
+        Change::UndoDeletion { deletion_seq: ANY },
+        create(),
+    ] {
         assert_eq!(refused(&gone, change, Actor::Operator), SHREDDED);
     }
 }
@@ -1051,7 +1132,11 @@ fn closing_and_opening_order() {
         Actor::Customer,
     );
     assert_eq!(order(&a, &d), WriteOrder::Closing);
-    let undone = apply(&d, Change::UndoDeletion, Actor::Customer);
+    let undone = apply(
+        &d,
+        Change::UndoDeletion { deletion_seq: ANY },
+        Actor::Customer,
+    );
     assert_eq!(order(&d, &undone), WriteOrder::Opening);
 
     let lower = apply(
@@ -1158,6 +1243,8 @@ fn tenant_zero_is_never_deleted_or_shredded() {
     // Not even from a head that a damaged writer left deleting.
     let mut planted = z.clone();
     planted.door.deletion = Some(Deletion {
+        seq: planted.door.seq,
+        requested_at: NOW,
         shred_due_at: NOW,
         reason: DeletionReason::CustomerRequest,
         actor: ActorClass::Customer,
@@ -1214,7 +1301,11 @@ fn a_voided_key_version_is_never_claimed_again() {
         Actor::Customer,
     );
     assert_eq!((d.door.rotating_to, d.door.highest_claimed), (None, 2));
-    let undone = apply(&d, Change::UndoDeletion, Actor::Customer);
+    let undone = apply(
+        &d,
+        Change::UndoDeletion { deletion_seq: ANY },
+        Actor::Customer,
+    );
     assert_eq!(
         refused(
             &undone,
@@ -2584,4 +2675,362 @@ fn lift(unit: u32, since_seq: u64) -> Change {
             acknowledged: Default::default(),
         },
     }
+}
+
+/// `next` at a time of its own.
+fn at(head: &TenantRecord, change: Change, actor: Actor, now: UnixMs) -> TenantRecord {
+    match next(&head.door.tenant, Some(head), &change, actor, now) {
+        Ok(Outcome::Next(r)) => r,
+        other => panic!("{other:?}"),
+    }
+}
+
+/// The tenant read's times are carried in the door (AM-59): the creation,
+/// each hold's start and the deletion's record, none read back from the
+/// chain.
+#[test]
+fn the_door_carries_the_times_of_the_tenant_read() {
+    let a = active();
+    assert_eq!(a.door.created_at, NOW);
+    assert!(a.door.seq > 1);
+    let t1 = UnixMs(NOW.0 + 1_000);
+    let t2 = UnixMs(NOW.0 + 2_000);
+    let t3 = UnixMs(NOW.0 + 3_000);
+
+    // A hold starts at its record; a new mode starts again; the same mode
+    // writes nothing.
+    let b = at(
+        &a,
+        billing_hold(Some(HoldMode::ReadOnly)),
+        Actor::Billing,
+        t1,
+    );
+    assert_eq!(b.door.created_at, NOW);
+    assert_eq!(b.door.holds.billing.unwrap().since, t1);
+    assert_eq!(b.door.holds.since(), Some(t1));
+    unchanged(&b, billing_hold(Some(HoldMode::ReadOnly)), Actor::Billing);
+    let b = at(&b, billing_hold(Some(HoldMode::Locked)), Actor::Billing, t2);
+    assert_eq!(b.door.holds.billing.unwrap().since, t2);
+
+    // The operator's hold: a new reason or `preserve` alone keeps its
+    // start, a new mode does not.
+    let o = at(
+        &b,
+        operator_hold(HoldMode::ReadOnly, OperatorReason::Security, None),
+        Actor::Operator,
+        t2,
+    );
+    assert_eq!(o.door.holds.operator.unwrap().since, t2);
+    let o = at(
+        &o,
+        operator_hold(HoldMode::ReadOnly, OperatorReason::Legal, Some(false)),
+        Actor::Operator,
+        t3,
+    );
+    assert_eq!(o.door.holds.operator.unwrap().since, t2);
+    assert_eq!(o.door.holds.operator.unwrap().reason, OperatorReason::Legal);
+    // The suspension's start is the start of the hold whose mode is in
+    // force: billing's `locked` here.
+    assert_eq!(o.door.holds.since(), Some(t2));
+    let o = at(
+        &o,
+        operator_hold(HoldMode::Locked, OperatorReason::Legal, Some(false)),
+        Actor::Operator,
+        t3,
+    );
+    assert_eq!(o.door.holds.operator.unwrap().since, t3);
+    // Both `locked`: the earlier start.
+    assert_eq!(o.door.holds.since(), Some(t2));
+    let lifted = at(&o, billing_hold(None), Actor::Billing, t3);
+    assert_eq!(lifted.door.holds.billing, None);
+    assert_eq!(lifted.door.holds.since(), Some(t3));
+    let lifted = at(
+        &lifted,
+        Change::SetOperatorHold { hold: None },
+        Actor::Operator,
+        t3,
+    );
+    assert_eq!(lifted.door.holds.since(), None);
+    assert_eq!(lifted.door.created_at, NOW);
+
+    // The deletion names its record and its time.
+    let d = at(
+        &a,
+        delete_by(Actor::Customer, DeletionReason::CustomerRequest, 8 * DAY, 1),
+        Actor::Customer,
+        t1,
+    );
+    let del = d.door.deletion.clone().unwrap();
+    assert_eq!(del.seq, d.door.seq);
+    assert_eq!(del.requested_at, t1);
+    // Later records carry it unchanged.
+    let later = at(
+        &d,
+        Change::SetLimits {
+            base_seq: d.door.seq,
+            limits: BTreeMap::new(),
+            rate_json: None,
+        },
+        Actor::Operator,
+        t2,
+    );
+    assert_eq!(later.door.deletion, Some(del));
+    assert_eq!(later.door.created_at, NOW);
+}
+
+/// AM-38 case 4: the undo names the deletion it undoes by its seq.
+#[test]
+fn an_undo_names_the_deletion_it_undoes() {
+    let a = active();
+    let undo = |seq| Change::UndoDeletion { deletion_seq: seq };
+    let d = apply(
+        &a,
+        delete_by(Actor::Customer, DeletionReason::CustomerRequest, 8 * DAY, 1),
+        Actor::Customer,
+    );
+    let seq = d.door.deletion.as_ref().unwrap().seq;
+    // Another seq than the head's deletion: refused, nothing written.
+    for other in [0, seq - 1, seq + 1] {
+        assert_eq!(refused(&d, undo(other), Actor::Customer), NOT_REQUESTED);
+    }
+    // Who may still comes first.
+    assert_eq!(refused(&d, undo(seq), Actor::Billing), FORBIDDEN);
+    assert_eq!(refused(&d, undo(seq), Actor::ShredJob), FORBIDDEN);
+    let u = apply(&d, undo(seq), Actor::Customer);
+    assert_eq!(u.door.deletion, None);
+    assert_eq!(u.door.undone_deletion, Some(hash(1)));
+    assert_eq!(u.door.undone_deletion_seq, Some(seq));
+    // Its retry writes nothing; any other seq is refused.
+    unchanged(&u, undo(seq), Actor::Customer);
+    unchanged(&u, undo(seq), Actor::Operator);
+    assert_eq!(refused(&u, undo(seq + 1), Actor::Customer), NOT_REQUESTED);
+    assert_eq!(refused(&u, undo(seq), Actor::RestoreTool), FORBIDDEN);
+
+    // A late retry never cancels a newer deletion.
+    let d2 = apply(
+        &u,
+        delete_by(Actor::Customer, DeletionReason::CustomerRequest, 8 * DAY, 2),
+        Actor::Customer,
+    );
+    let seq2 = d2.door.deletion.as_ref().unwrap().seq;
+    assert!(seq2 > seq);
+    assert_eq!(refused(&d2, undo(seq), Actor::Customer), NOT_REQUESTED);
+    let u2 = apply(&d2, undo(seq2), Actor::Operator);
+    assert_eq!(u2.door.undone_deletion_seq, Some(seq2));
+    assert_eq!(refused(&u2, undo(seq), Actor::Customer), NOT_REQUESTED);
+}
+
+/// AM-57: the record that creates a bucket carries its name and wrapped
+/// key in the private part, never in the door, and only that record.
+#[test]
+fn a_bucket_create_carries_its_name_and_wrap_in_the_private_part() {
+    let a = active();
+    let c = apply(&a, create_bucket(1, 0), Actor::Customer);
+    let secrets = c.private.bucket_created.clone().unwrap();
+    assert_eq!(secrets.name, "bucket-1");
+    assert_eq!(secrets.bdk_wrapped, wrap(1));
+    // The door names the id, never the name.
+    let door = serde_json::to_string(&c.door).unwrap();
+    assert!(!door.contains("bucket-1"), "{door}");
+    assert_eq!(c.door.bucket_created.as_ref().unwrap().bucket, bid(1));
+    // The private part keeps the workspace beside it.
+    assert_eq!(c.private.external_ref.as_deref(), Some("ws_1"));
+    // The base64 form, and a Debug that shows shapes only.
+    let private = serde_json::to_value(&c.private).unwrap();
+    assert_eq!(private["bucket_created"]["name"], "bucket-1");
+    assert_eq!(
+        private["bucket_created"]["bdk_wrapped"]
+            .as_str()
+            .unwrap()
+            .len(),
+        100
+    );
+    let back: TenantPrivate = serde_json::from_value(private).unwrap();
+    assert_eq!(back, c.private);
+    let shown = format!("{secrets:?}");
+    assert!(!shown.contains("bucket-1"), "{shown}");
+    // The next record drops both.
+    let n = apply(&c, create_bucket(2, 0), Actor::Customer);
+    assert_eq!(n.private.bucket_created.as_ref().unwrap().name, "bucket-2");
+    let n = apply(&n, Change::DropBucket { bucket: bid(1) }, Actor::Customer);
+    assert_eq!(n.private.bucket_created, None);
+    assert_eq!(n.door.bucket_created, None);
+    assert_eq!(n.private.external_ref.as_deref(), Some("ws_1"));
+
+    // A name of the plane's form, and a scheme-2 wrap.
+    let with = |name: &str, w: Vec<u8>| Change::CreateBucket {
+        bucket: bid(3),
+        unit: 0,
+        creator: "p_owner".into(),
+        grant_seq: 3,
+        name: name.into(),
+        bdk_wrapped: w,
+    };
+    for bad in ["ab", "Photos", "a.b", "-ab", "ab-", &"a".repeat(64), ""] {
+        assert_eq!(
+            refused(&a, with(bad, wrap(3)), Actor::Customer),
+            INVALID,
+            "{bad}"
+        );
+    }
+    let mut v1 = wrap(3);
+    v1[0] = 0x01;
+    for w in [
+        v1,
+        wrap(3)[..72].to_vec(),
+        [wrap(3), vec![0]].concat(),
+        vec![],
+    ] {
+        assert_eq!(refused(&a, with("photos", w), Actor::Customer), INVALID);
+    }
+    let ok = apply(&a, with("a-1", wrap(3)), Actor::Customer);
+    assert_eq!(ok.private.bucket_created.unwrap().name, "a-1");
+}
+
+/// AM-67: the move floor of a unit only rises, and only the move and
+/// restore tools raise it, on the owner tenant of tenant 0's move.
+#[test]
+fn the_move_floor_only_rises() {
+    let owner = active();
+    let moving = moving();
+    let floor = |zero: &TenantRecord, unit, ms| Change::SetMoveFloor {
+        unit,
+        floor: UnixMs(ms),
+        zero: Box::new(zero.door.clone()),
+    };
+    for actor in [
+        Actor::Customer,
+        Actor::Operator,
+        Actor::Billing,
+        Actor::ShredJob,
+    ] {
+        assert_eq!(
+            refused(&owner, floor(&moving, 0, 10), actor),
+            FORBIDDEN,
+            "{actor:?}"
+        );
+    }
+    let f = apply(&owner, floor(&moving, 0, 10), Actor::MoveTool);
+    assert_eq!(f.door.move_floors.get(&0), Some(&UnixMs(10)));
+    assert_eq!(write_order(Some(&owner.door), &f.door), WriteOrder::Closing);
+    // At or below the floor: nothing written. Above it: raised.
+    unchanged(&f, floor(&moving, 0, 10), Actor::RestoreTool);
+    unchanged(&f, floor(&moving, 0, 9), Actor::MoveTool);
+    let g = apply(&f, floor(&moving, 0, 11), Actor::RestoreTool);
+    assert_eq!(g.door.move_floors.get(&0), Some(&UnixMs(11)));
+    // Carried by every later record.
+    let h = apply(&g, create_bucket(1, 0), Actor::Customer);
+    assert_eq!(h.door.move_floors, g.door.move_floors);
+
+    // Allowed while the unit is being restored, and while suspended.
+    let r = apply(&g, Change::SetRestoring { unit: 0 }, Actor::Operator);
+    let r = apply(&r, floor(&moving, 0, 12), Actor::RestoreTool);
+    let s = apply(&r, billing_hold(Some(HoldMode::Locked)), Actor::Billing);
+    let s = apply(&s, floor(&moving, 0, 13), Actor::MoveTool);
+    assert_eq!(s.door.move_floors.get(&0), Some(&UnixMs(13)));
+    // Not while deleting.
+    let d = apply(
+        &g,
+        delete_by(Actor::Customer, DeletionReason::CustomerRequest, 8 * DAY, 1),
+        Actor::Customer,
+    );
+    assert_eq!(
+        refused(&d, floor(&moving, 0, 20), Actor::MoveTool),
+        WRONG_STATE
+    );
+    // A listed unit; a floor above 0; never tenant 0 itself.
+    assert_eq!(
+        refused(&owner, floor(&moving, 1, 10), Actor::MoveTool),
+        UNIT_NOT_LISTED
+    );
+    assert_eq!(
+        refused(&owner, floor(&moving, 0, 0), Actor::MoveTool),
+        INVALID
+    );
+    assert_eq!(
+        refused(&moving, floor(&moving, 0, 10), Actor::MoveTool),
+        TENANT_ZERO
+    );
+
+    // Tenant 0's head: a window into this tenant, its flip or its undo
+    // (`move.to` names it), or a give-up (`d1`, no move). Never a move
+    // into another tenant, a forged head or a retired tenant 0.
+    let flipped = apply(&moving, Change::FlipMove { stamp: 5 }, Actor::MoveTool);
+    apply(&owner, floor(&flipped, 0, 10), Actor::MoveTool);
+    let gave_up = apply(&moving, Change::GiveUpMove, Actor::MoveTool);
+    apply(&owner, floor(&gave_up, 0, 10), Actor::MoveTool);
+    let undone = apply(
+        &flipped,
+        Change::UndoMove {
+            undo_stamp: 6,
+            catalogue_id: "main2".into(),
+        },
+        Actor::MoveTool,
+    );
+    apply(&owner, floor(&undone, 0, 10), Actor::MoveTool);
+    let mut elsewhere = moving.clone();
+    if let Some(m) = elsewhere
+        .door
+        .tenant_zero
+        .as_mut()
+        .and_then(|z| z.moved.as_mut())
+    {
+        m.to = Tenant::parse("t_00000000000000b2").unwrap();
+    }
+    assert_eq!(
+        refused(&owner, floor(&elsewhere, 0, 10), Actor::MoveTool),
+        NOT_MOVING_HERE
+    );
+    assert_eq!(
+        refused(&owner, floor(&owner, 0, 10), Actor::MoveTool),
+        NOT_MOVING_HERE
+    );
+    let mut retired = flipped.clone();
+    retired.door.tenant_zero.as_mut().unwrap().selector = Selector::Retired;
+    assert_eq!(
+        refused(&owner, floor(&retired, 0, 10), Actor::MoveTool),
+        NOT_MOVING_HERE
+    );
+}
+
+/// The shredded stub keeps the creation time, which names nothing, and
+/// drops the move floors and the undo's seq with everything else.
+#[test]
+fn the_stub_keeps_the_creation_time_only() {
+    let a = active();
+    let moving = moving();
+    let a = apply(
+        &a,
+        Change::SetMoveFloor {
+            unit: 0,
+            floor: UnixMs(10),
+            zero: Box::new(moving.door.clone()),
+        },
+        Actor::MoveTool,
+    );
+    let d = apply(
+        &a,
+        delete_by(Actor::Customer, DeletionReason::CustomerRequest, 8 * DAY, 1),
+        Actor::Customer,
+    );
+    let u = apply(
+        &d,
+        Change::UndoDeletion { deletion_seq: ANY },
+        Actor::Customer,
+    );
+    let d = apply(
+        &u,
+        delete_by(Actor::Customer, DeletionReason::CustomerRequest, 8 * DAY, 2),
+        Actor::Customer,
+    );
+    assert!(d.door.undone_deletion_seq.is_some());
+    let later = UnixMs(NOW.0 + 9 * DAY);
+    let s = at(&d, Change::StartShred, Actor::ShredJob, later);
+    assert_eq!(s.door.move_floors.get(&0), Some(&UnixMs(10)));
+    let stub = at(&s, Change::FinishShred, Actor::ShredJob, later);
+    assert_eq!(stub.door.created_at, NOW);
+    assert!(stub.door.move_floors.is_empty());
+    assert_eq!(stub.door.undone_deletion_seq, None);
+    assert_eq!(stub.door.deletion, None);
+    assert_eq!(stub.private.bucket_created, None);
 }
