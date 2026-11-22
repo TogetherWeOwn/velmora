@@ -2258,6 +2258,7 @@ fn the_size_guard_refuses_a_batch_that_would_pass_the_extent_count() {
     let u = move_unit_with(SizeLimits {
         bytes: u64::MAX,
         extents: 3,
+        ..SizeLimits::default()
     });
     let a = import_extents(&u, None, "c1", extent_rows(0, 2));
     assert!(matches!(a, UnitAnswer::Ok { .. }), "{a:?}");
@@ -2282,6 +2283,7 @@ fn the_size_guard_refuses_any_batch_once_the_database_is_at_its_size() {
     let u = move_unit_with(SizeLimits {
         bytes: size,
         extents: u64::MAX,
+        ..SizeLimits::default()
     });
     assert_eq!(
         import_buckets(&u, 0x02),

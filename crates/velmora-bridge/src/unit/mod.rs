@@ -14,6 +14,8 @@
 //! - [`export`]: the unit's rows read back out (the move's checks, the
 //!   reverse move).
 //! - [`jobcall`]: the job path's catalogue calls.
+//! - [`request`]: the S3 request path's catalogue calls.
+//! - [`request_client`]: the Worker's side of them.
 //! - [`recount`]: the usage recount of a closed unit.
 //! - [`reserve`]: the reservation of a capped opening call.
 //! - [`size`]: the size guard.
@@ -37,6 +39,8 @@ pub mod lift;
 pub mod name;
 pub mod object;
 pub mod recount;
+pub mod request;
+pub mod request_client;
 pub mod reserve;
 pub mod restore;
 pub mod schema;

@@ -142,6 +142,11 @@ pub struct SqlCatalog<S: Sql> {
 }
 
 impl<S: Sql> SqlCatalog<S> {
+    /// [`uploads::fence`]: settles a Complete whose outcome is unknown.
+    pub(crate) async fn fence_upload(&self, t: &UploadTarget<'_>, revision: u64) -> Result<bool> {
+        uploads::fence(self, t, revision).await
+    }
+
     pub fn new(sql: S) -> Self {
         SqlCatalog {
             sql,
