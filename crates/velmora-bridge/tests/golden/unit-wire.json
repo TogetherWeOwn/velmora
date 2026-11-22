@@ -136,6 +136,13 @@
       "reason": {
         "gate": "ack_mismatch"
       }
+    },
+    {
+      "alarm": false,
+      "answer": "refused",
+      "reason": {
+        "export": "hash_only"
+      }
     }
   ],
   "calls": [
@@ -339,6 +346,7 @@
           "table": "usage_hours"
         },
         "head": {
+          "flips": 0,
           "selector": "moving",
           "seq": 11,
           "to": "t_00000000000000f1"
@@ -361,6 +369,82 @@
       },
       "op": {
         "op": "import_progress"
+      },
+      "seqs": {
+        "keys_seq": 3,
+        "state_seq": 7
+      }
+    },
+    {
+      "authenticated": true,
+      "kind": "worker",
+      "listed": true,
+      "name": {
+        "tenant": "t_00000000000000f1",
+        "unit": 0
+      },
+      "op": {
+        "head": {
+          "flips": 1,
+          "selector": "moving",
+          "seq": 12,
+          "to": "t_00000000000000f1"
+        },
+        "op": "import_seal",
+        "since": 7,
+        "tables": [
+          {
+            "rows": 2,
+            "table": "objects"
+          }
+        ]
+      },
+      "seqs": {
+        "keys_seq": 3,
+        "state_seq": 7
+      }
+    },
+    {
+      "authenticated": true,
+      "kind": "worker",
+      "listed": true,
+      "name": {
+        "tenant": "t_00000000000000f1",
+        "unit": 0
+      },
+      "op": {
+        "after": [
+          {
+            "t": "b_00000000000000f1"
+          },
+          {
+            "t": "a/b"
+          }
+        ],
+        "limit": 500,
+        "mode": "rows",
+        "op": "export",
+        "table": "objects"
+      },
+      "seqs": {
+        "keys_seq": 3,
+        "state_seq": 7
+      }
+    },
+    {
+      "authenticated": true,
+      "kind": "worker",
+      "listed": true,
+      "name": {
+        "tenant": "t_00000000000000f1",
+        "unit": 0
+      },
+      "op": {
+        "after": null,
+        "limit": 100,
+        "mode": "hash",
+        "op": "export",
+        "table": "unit_key_grants"
       },
       "seqs": {
         "keys_seq": 3,
@@ -458,6 +542,33 @@
       },
       "op": {
         "op": "gate_open",
+        "replay_id": {
+          "nonce": "n1",
+          "ordinal": 4,
+          "since": 7
+        }
+      },
+      "seqs": {
+        "keys_seq": 3,
+        "state_seq": 7
+      }
+    },
+    {
+      "authenticated": true,
+      "kind": "worker",
+      "listed": true,
+      "name": {
+        "tenant": "t_00000000000000f1",
+        "unit": 0
+      },
+      "op": {
+        "head": {
+          "flips": 1,
+          "selector": "moving",
+          "seq": 12,
+          "to": "t_00000000000000f1"
+        },
+        "op": "gate_open_move",
         "replay_id": {
           "nonce": "n1",
           "ordinal": 4,
@@ -707,6 +818,15 @@
       "restoring",
       "provisioning"
     ],
+    "export_mode": [
+      "hash",
+      "rows"
+    ],
+    "export_refusal": [
+      "not_restoring",
+      "hash_only",
+      "malformed"
+    ],
     "finding_list": [
       "damaged",
       "unreadable",
@@ -726,7 +846,10 @@
       "counters_off",
       "proof_mismatch",
       "list_mismatch",
-      "malformed"
+      "malformed",
+      "move_not_bound",
+      "import_not_sealed",
+      "move_not_empty"
     ],
     "hold_mode": [
       "read_only",
@@ -740,7 +863,9 @@
     "import_refusal": [
       "not_bound",
       "shape",
-      "out_of_order"
+      "out_of_order",
+      "sealed",
+      "count_mismatch"
     ],
     "import_table": [
       "buckets",
@@ -770,6 +895,10 @@
       "gap",
       "malformed"
     ],
+    "key_table": [
+      "unit_keys",
+      "unit_key_grants"
+    ],
     "provision_refusal": [
       "born_before",
       "not_the_listing_record",
@@ -780,6 +909,10 @@
       "stale_birth",
       "already_born",
       "no_numbers"
+    ],
+    "report_kind": [
+      "restore",
+      "move"
     ],
     "restore_refusal": [
       "not_restoring",

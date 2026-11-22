@@ -51,8 +51,12 @@ use crate::types::{BridgeError, Result};
 pub const MAX_ROWS: usize = 500;
 /// The longest cursor. The move's copy names the primary key of the last
 /// row it read, as typed JSON: for `objects` that is a bucket id and an
-/// object key of up to 1024 bytes, which JSON escaping can double.
-pub const MAX_CURSOR: usize = 4096;
+/// object key. The S3 path bounds a key only by its request target
+/// (8 KiB, `service::common`), and JSON escapes a control character in
+/// 6 bytes (`\u0001`), so a stored key can need about 48 KiB here. A
+/// cursor this bound refuses stops the move (`Shape`); it never stops it
+/// quietly.
+pub const MAX_CURSOR: usize = 64 * 1024;
 
 /// The verified head of tenant 0, as far as the import reads it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -65,6 +69,9 @@ pub struct MoveHead {
     /// `move.to`, when the record has a move.
     #[serde(default)]
     pub to: Option<TenantId>,
+    /// The record's `flips` (AM-7): this window's move ordinal is
+    /// `flips + 1` (AM-29).
+    pub flips: u64,
 }
 
 /// One value with its SQLite type class.
@@ -412,6 +419,38 @@ impl ImportTable {
     pub fn parse(name: &str) -> Option<ImportTable> {
         ImportTable::ALL.into_iter().find(|t| t.name() == name)
     }
+
+    /// The table's primary key, in index order: what an export pages by
+    /// (a test holds them to the schema).
+    pub fn key_columns(self) -> &'static [&'static str] {
+        match self {
+            ImportTable::Buckets
+            | ImportTable::Generations
+            | ImportTable::Extents
+            | ImportTable::Uploads
+            | ImportTable::Gc
+            | ImportTable::UsageRecounts => &["id"],
+            ImportTable::Objects => &["bucket_id", "key"],
+            ImportTable::GenerationExtents => &["generation_id", "seq"],
+            ImportTable::Articles => &["extent_id", "idx"],
+            ImportTable::Verifications => &["extent_id", "backbone", "verified_at"],
+            ImportTable::VerifyRaises => &["extent_id", "backbone", "plan_rev"],
+            ImportTable::VerifyEscalations => &["backbone"],
+            ImportTable::Outbox => &["extent_id"],
+            ImportTable::UploadParts => &["upload_id", "part_number"],
+            ImportTable::UploadPartExtents => &["upload_id", "part_number", "piece"],
+            ImportTable::UsageHours => &["hour"],
+        }
+    }
+}
+
+/// One table's row count at the end of the import, as the move tool
+/// states it in `import_seal` (AM-29).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ImportCount {
+    pub table: ImportTable,
+    pub rows: u64,
 }
 
 /// Why a batch was refused. Nothing of it is kept.
@@ -430,6 +469,12 @@ pub enum ImportRefusal {
     /// `after` is not the table's stored cursor, and the batch is not
     /// the last one sent again.
     OutOfOrder,
+    /// The import is sealed: no batch is taken after `import_seal`.
+    Sealed,
+    /// `import_seal` did not name every import table once, or named a
+    /// row count other than the unit holds (a batch is missing, or the
+    /// tool counted another run). Nothing is kept.
+    CountMismatch,
 }
 
 /// What a batch did.
@@ -471,6 +516,9 @@ pub fn apply<S: Sql>(
 ) -> Result<Imported> {
     if !move_seq_ok(sql, since, head.seq)? {
         return Ok(Imported::Refused(ImportRefusal::NotBound));
+    }
+    if sealed(sql)?.is_some() {
+        return Ok(Imported::Refused(ImportRefusal::Sealed));
     }
     let t = batch.table;
     let want = t.columns();
@@ -526,6 +574,112 @@ pub fn apply<S: Sql>(
         rows,
         applied: true,
     })
+}
+
+/// What `import_seal` did.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Seal {
+    /// The import is sealed for `move_ordinal`; `newly`: by this call.
+    Done {
+        move_ordinal: u64,
+        newly: bool,
+    },
+    Refused(ImportRefusal),
+}
+
+/// Seals the import (AM-29), inside the caller's transaction, after
+/// [`bound_to_move`] passed: `tables` must name every import table once,
+/// each with the rows the unit took (a table without a batch: 0). Sets
+/// `final` and `move_ordinal` = the head's `flips + 1`. From then on no
+/// batch is taken, and a `move` gate report ([`super::lift::open_move`])
+/// may be opened for that ordinal. A repeat with the same counts and
+/// ordinal changes nothing.
+pub fn seal<S: Sql>(sql: &S, since: u64, head: &MoveHead, tables: &[ImportCount]) -> Result<Seal> {
+    if !move_seq_ok(sql, since, head.seq)? {
+        return Ok(Seal::Refused(ImportRefusal::NotBound));
+    }
+    let Some(ordinal) = head.flips.checked_add(1) else {
+        return Ok(Seal::Refused(ImportRefusal::NotBound));
+    };
+    let held: std::collections::BTreeMap<String, u64> =
+        progress(sql)?.into_iter().map(|(t, _, n)| (t, n)).collect();
+    let mut named = std::collections::BTreeSet::new();
+    for c in tables {
+        let have = held.get(c.table.name()).copied().unwrap_or(0);
+        if !named.insert(c.table.name()) || c.rows != have {
+            return Ok(Seal::Refused(ImportRefusal::CountMismatch));
+        }
+    }
+    if named.len() != ImportTable::ALL.len() {
+        return Ok(Seal::Refused(ImportRefusal::CountMismatch));
+    }
+    match sealed(sql)? {
+        Some(o) if o == ordinal => {
+            return Ok(Seal::Done {
+                move_ordinal: o,
+                newly: false,
+            })
+        }
+        Some(_) => return Ok(Seal::Refused(ImportRefusal::NotBound)),
+        None => {}
+    }
+    let n = poll_once(sql.exec(
+        "UPDATE unit_import_move SET final = 1, move_ordinal = ?1 WHERE id = 1",
+        &[int(ordinal)?],
+    ))??;
+    if n != 1 {
+        return Err(decode("unit_import_move"));
+    }
+    Ok(Seal::Done {
+        move_ordinal: ordinal,
+        newly: true,
+    })
+}
+
+/// The sealed import's `move_ordinal`, or `None` while it is not sealed.
+pub fn sealed<S: Sql>(sql: &S) -> Result<Option<u64>> {
+    let rows = poll_once(sql.query(
+        "SELECT final, move_ordinal FROM unit_import_move WHERE id = 1",
+        &[],
+    ))??;
+    match rows.first().map(|r| (&r[0], &r[1])) {
+        None | Some((SqlValue::Int(0), _)) => Ok(None),
+        Some((SqlValue::Int(1), SqlValue::Int(o))) => u64::try_from(*o)
+            .map(Some)
+            .map_err(|_| decode("unit_import_move move_ordinal")),
+        Some(_) => Err(decode("unit_import_move final")),
+    }
+}
+
+/// Whether an import was ever bound to this unit (a batch or a finish).
+pub fn started<S: Sql>(sql: &S) -> Result<bool> {
+    let rows = poll_once(sql.query("SELECT count(*) FROM unit_import_move WHERE id = 1", &[]))??;
+    Ok(matches!(
+        rows.first().and_then(|r| r.first()),
+        Some(SqlValue::Int(1))
+    ))
+}
+
+/// The newest tenant-0 head seq the import was bound to, if any.
+pub fn seen_t0_seq<S: Sql>(sql: &S) -> Result<Option<u64>> {
+    let rows = poll_once(sql.query("SELECT t0_seq FROM unit_import_move WHERE id = 1", &[]))??;
+    match rows.first().and_then(|r| r.first()) {
+        None => Ok(None),
+        Some(SqlValue::Int(n)) => u64::try_from(*n)
+            .map(Some)
+            .map_err(|_| decode("unit_import_move t0_seq")),
+        Some(_) => Err(decode("unit_import_move t0_seq")),
+    }
+}
+
+/// Raises the newest tenant-0 head seq the unit has seen (never lowers
+/// it). The row exists once the import is sealed.
+pub fn see_t0_seq<S: Sql>(sql: &S, t0_seq: u64) -> Result<()> {
+    poll_once(sql.exec(
+        "UPDATE unit_import_move SET t0_seq = max(t0_seq, ?1) WHERE id = 1",
+        &[int(t0_seq)?],
+    ))??;
+    Ok(())
 }
 
 /// Every table's stored cursor and row count, by table name.

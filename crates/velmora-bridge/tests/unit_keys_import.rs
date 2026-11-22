@@ -580,6 +580,7 @@ fn moving(seq: u64) -> MoveHead {
         seq,
         selector: "moving".into(),
         to: Some(tenant()),
+        flips: 0,
     }
 }
 
@@ -763,6 +764,7 @@ fn an_import_runs_only_inside_the_move_window_of_this_unit() {
                 seq: 10,
                 selector: "d1".into(),
                 to: None,
+                flips: 0,
             },
             SINCE,
         ),
@@ -771,6 +773,7 @@ fn an_import_runs_only_inside_the_move_window_of_this_unit() {
                 seq: 10,
                 selector: "moved".into(),
                 to: Some(tenant()),
+                flips: 0,
             },
             SINCE,
         ),
@@ -780,6 +783,7 @@ fn an_import_runs_only_inside_the_move_window_of_this_unit() {
                 seq: 10,
                 selector: "moving".into(),
                 to: Some(TenantId::parse("t_0000000000000d02").unwrap()),
+                flips: 0,
             },
             SINCE,
         ),
@@ -935,7 +939,7 @@ fn batches_apply_once_and_in_order_and_the_import_resumes_by_cursor() {
     let progress = ok_body(worker(&u, UnitOp::ImportProgress {}));
     assert_eq!(
         progress,
-        json!({ "tables": [{ "table": "buckets", "cursor": "b2", "rows": 3 }] })
+        json!({ "tables": [{ "table": "buckets", "cursor": "b2", "rows": 3 }], "sealed": null })
     );
 }
 

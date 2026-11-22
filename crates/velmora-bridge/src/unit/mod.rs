@@ -11,6 +11,8 @@
 //! - [`object`]: the unit itself (rules 1 to 7 and 11).
 //! - [`keys`]: the key-chain apply and the effective grant.
 //! - [`import`]: the owner move's import.
+//! - [`export`]: the unit's rows read back out (the move's checks, the
+//!   reverse move).
 //! - [`jobcall`]: the job path's catalogue calls.
 //! - [`restore`]: the restore calls.
 //! - [`lift`]: the lift, checked in the unit.
@@ -21,6 +23,7 @@
 
 pub mod birth;
 pub mod call;
+pub mod export;
 pub mod gate;
 pub mod identity;
 pub mod import;
