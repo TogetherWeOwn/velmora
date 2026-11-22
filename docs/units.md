@@ -175,22 +175,27 @@ hand-out, and its writes are due from their own time.
 - **`renew`.** The unit's numbers, stamp counter and revoked count come
   from one stamp read through the job path (allowed with an expired lease),
   then the proof (`unit_lease::renewal`) and `renew(proof_start, proven,
-  revocations)`. A newer record means `sync` first. A stamp object after
-  the counter is confirmed through the unit's own counter: a raise that ran
-  in between moves it and is not a rollback; with the counter unchanged the
-  rollback is recorded, the unit closes and the client pages. Revocations
-  the unit did not hold are applied with the renewal, and the key chain's
-  finisher is told once (SEC-6). More revocations held than listed renews
-  nothing and pages.
+  revocations)`. A newer record means `sync` first. Stamp objects after
+  the counter: the proof holds the newest one's counter, and the unit
+  renews only if its own counter has reached it, so a raise in between
+  passes; a unit refused `not_proven` (or with a full page of objects
+  ahead) is confirmed through its own counter, and with the counter
+  unchanged the rollback is recorded, the unit closes and the client pages
+  (again at every look while it stays closed). Revocations the unit did not
+  hold are applied with the renewal, and the key chain's finisher is told
+  once, before the call (SEC-6). More revocations held than listed renews
+  nothing and pages. The pages come back with an error too.
 - **`sync`.** The tenant chain's verified head and the key-chain records
-  after the unit's `keys_seq`: first the key apply (AM-12), then `sync` at
+  after the unit's `keys_seq`: first the key apply (AM-12, in pages of at
+  most 100 records, each from the unit's own `keys_seq`), then `sync` at
   both heads, with the head's state, mode and this unit's `restoring` entry.
   A head that clears the entry is not sent as a lift: only the restore
   tool's `sync` carries the lift proof (AM-45); the client reports it and
   changes nothing. A unit the head does not list is not called.
 - **The request path** (rule 5): `renew_needed` renews, `sync_needed`
   syncs, a lower request number takes the unit's numbers; each fix runs once
-  and the call runs once more. An answer with less than half of T left asks
+  and the call runs once more. An unsigned call makes at most one renewal
+  attempt per unit and T in an isolate, and none while one runs (rule 11). An answer with less than half of T left asks
   for a background renewal (`waitUntil`), one per unit and isolate.
 - **The `renew` and `stamp_raise` jobs**, which the queue consumer hands to
   the client: a renewal as above; a raise moves the unit's counter, then puts

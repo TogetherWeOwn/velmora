@@ -38,7 +38,7 @@
 //! carries a key, a secret or a caller's input.
 
 use std::cell::{Cell, RefCell};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 
 use serde_json::Value;
@@ -58,7 +58,7 @@ use crate::types::{BridgeError, Result, UnixMs};
 use crate::unit::call::HoldMode;
 use crate::unit::identity::Refusal;
 use crate::unit::jobcall::JobCall;
-use crate::unit::keys::{KeptAnswer, KeyEntry};
+use crate::unit::keys::{KeptAnswer, KeyEntry, MAX_ENTRIES};
 use crate::unit::{
     CallKind, Refused, Seqs, SyncHead, TenantId, TenantState, UnitAnswer, UnitCall, UnitName,
     UnitOp, UnitReply,
@@ -140,7 +140,8 @@ pub trait KeyFinisher {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Page {
     /// Names under `m/rk/<t>/` that are not an access key id: skipped.
-    StrayRevocationNames(Vec<String>),
+    /// The first [`MAX_PAGED_NAMES`] of them, and how many there are.
+    StrayRevocationNames { first: Vec<String>, total: usize },
     /// The unit holds more revocations than `m/rk/<t>/` lists: not
     /// renewed (no correct history gives it).
     RevocationsShort { listed: u64, held: u64 },
@@ -153,6 +154,20 @@ pub enum Page {
     /// The finisher could not be told of unrecorded revocations; the
     /// unit holds them all the same.
     FinisherNotTold,
+}
+
+/// The most names one page carries.
+pub const MAX_PAGED_NAMES: usize = 10;
+
+impl Page {
+    /// The page of `names`, stray under the revocations: the first few.
+    fn stray(names: Vec<String>) -> Page {
+        let total = names.len();
+        Page::StrayRevocationNames {
+            first: names.into_iter().take(MAX_PAGED_NAMES).collect(),
+            total,
+        }
+    }
 }
 
 /// What [`UnitClient::renew`] came to.
@@ -252,6 +267,8 @@ pub struct UnitClient<U, B, T, N, H, K, F> {
     pub listed: bool,
     /// The lease dials (T): for the half-of-T rule.
     pub lease: LeaseRules,
+    /// The isolate's renewals in flight and their attempts, by unit.
+    pub flights: InFlight,
 }
 
 impl<U, B, T, N, H, K, F> UnitClient<U, B, T, N, H, K, F>
@@ -273,9 +290,15 @@ where
     /// Proves the unit fresh and renews its lease (rule 12). `seen`: the
     /// unit's numbers as its last answer gave them (the job message's for
     /// a `renew` job). Syncs first when the proof finds a newer record.
-    pub async fn renew(&self, seen: Seqs) -> Result<(Renewal, Vec<Page>)> {
-        let id = self.stamp_id()?;
+    /// The pages come back whatever the outcome, an `Err` included.
+    pub async fn renew(&self, seen: Seqs) -> (Result<Renewal>, Vec<Page>) {
         let mut pages = Vec::new();
+        let outcome = self.renew_into(seen, &mut pages).await;
+        (outcome, pages)
+    }
+
+    async fn renew_into(&self, seen: Seqs, pages: &mut Vec<Page>) -> Result<Renewal> {
+        let id = self.stamp_id()?;
         let mut seqs = seen;
         let mut kicked = false;
         let mut strays_paged = false;
@@ -290,14 +313,16 @@ where
                         seqs = now;
                         continue;
                     }
-                    Flow::Done(renewal) => return Ok((renewal, pages)),
+                    Flow::Done(renewal) => return Ok(renewal),
                 },
             };
             seqs = read.seqs;
             if read.row.rolled_back {
-                // Recorded before: the unit is closed already, and it
-                // paged when the rollback was found.
-                return Ok((Renewal::Closed { rolled_back: true }, pages));
+                // Closed until the restore gate lifts it. Paged on every
+                // look (the page that recorded it may have been lost); the
+                // request path tries at most once per unit and T unsigned.
+                pages.push(Page::RolledBack);
+                return Ok(Renewal::Closed { rolled_back: true });
             }
             let view = UnitView {
                 stamp_id: &id,
@@ -315,18 +340,14 @@ where
                 } => {
                     if !stray.is_empty() && !strays_paged {
                         strays_paged = true;
-                        pages.push(Page::StrayRevocationNames(stray));
+                        pages.push(Page::stray(stray));
                     }
-                    let listed = !revocations.is_empty();
-                    let op = UnitOp::Renew {
-                        proof_start,
-                        proven,
-                        revocations,
-                    };
-                    let reply = self.unit.reply(&self.worker_call(seqs, op)).await?;
-                    // The unit keeps the listed ids also when it refuses the
-                    // lease; the finisher appends their chain records.
-                    if listed && !kicked {
+                    // The finisher is told before the call: the unit keeps
+                    // the listed ids whatever it answers, and an answer lost
+                    // after it kept them would leave the next proof with
+                    // equal counts and nothing to tell (`apply_control` is
+                    // idempotent).
+                    if !revocations.is_empty() && !kicked {
                         kicked = true;
                         if self
                             .finisher
@@ -337,82 +358,108 @@ where
                             pages.push(Page::FinisherNotTold);
                         }
                     }
+                    // Stamp objects after the counter the unit reported:
+                    // the proof holds the newest, and the unit renews only
+                    // if its own counter reached it.
+                    let stamp_moved = proven.stamp_counter != read.row.counter;
+                    let op = UnitOp::Renew {
+                        proof_start,
+                        proven,
+                        revocations,
+                    };
+                    let reply = self.unit.reply(&self.worker_call(seqs, op)).await?;
                     match reply.answer {
                         UnitAnswer::Ok { seqs, .. } => {
                             let lease_left_ms = reply.lease_left_ms;
-                            return Ok((
-                                Renewal::Renewed {
-                                    seqs,
-                                    lease_left_ms,
-                                },
-                                pages,
-                            ));
+                            return Ok(Renewal::Renewed {
+                                seqs,
+                                lease_left_ms,
+                            });
                         }
                         UnitAnswer::RenewNeeded { seqs: now, why } => match why {
                             Some(LeaseRefusal::Restoring) => {
-                                return Ok((Renewal::Closed { rolled_back: false }, pages))
+                                return Ok(Renewal::Closed { rolled_back: false })
                             }
                             Some(LeaseRefusal::RolledBack) => {
-                                return Ok((Renewal::Closed { rolled_back: true }, pages))
+                                pages.push(Page::RolledBack);
+                                return Ok(Renewal::Closed { rolled_back: true });
                             }
                             Some(r @ (LeaseRefusal::NoLeaseTable | LeaseRefusal::BadList)) => {
                                 pages.push(Page::RenewRefused(r));
-                                return Ok((Renewal::Refused, pages));
+                                return Ok(Renewal::Refused);
+                            }
+                            // Behind the stamp it was proven at: confirmed
+                            // through its own counter.
+                            Some(LeaseRefusal::NotProven) if stamp_moved => {
+                                match self.confirm_stamp(&id, now, pages).await? {
+                                    Flow::Again(next) => seqs = next,
+                                    Flow::Done(renewal) => return Ok(renewal),
+                                }
                             }
                             // The unit moved (a sync, a key apply, a
                             // raise) or the proof aged: prove again.
                             _ => seqs = now,
                         },
-                        UnitAnswer::Unborn { .. } => return Ok((Renewal::Unborn, pages)),
+                        UnitAnswer::Unborn { .. } => return Ok(Renewal::Unborn),
                         _ => return Err(ERR_RENEW_ANSWER),
                     }
                 }
                 Proof::SyncNeeded { .. } => match self.on_stop(Stop::SyncNeeded(seqs)).await? {
                     Flow::Again(now) => seqs = now,
-                    Flow::Done(renewal) => return Ok((renewal, pages)),
+                    Flow::Done(renewal) => return Ok(renewal),
                 },
-                Proof::StampAhead { .. } => {
-                    // Not yet a rollback: a raise that ran after the read
-                    // moves the counter. `checked` records one only while
-                    // the counter is still the one it read.
-                    let ledger = UnitLedger::new(self, seqs);
-                    let stamp = Stamp {
-                        ledger: &ledger,
-                        safety: &self.safety,
-                        clock: &self.clock,
-                        id: id.as_str(),
-                    };
-                    let checked = stamp.checked().await;
-                    seqs = ledger.seqs.get();
-                    match checked {
-                        Ok(None) => {
-                            pages.push(Page::RolledBack);
-                            return Ok((Renewal::Closed { rolled_back: true }, pages));
-                        }
-                        Ok(Some(_)) => {}
-                        Err(e) => match ledger.stopped() {
-                            Some(stop) => match self.on_stop(stop).await? {
-                                Flow::Again(now) => seqs = now,
-                                Flow::Done(renewal) => return Ok((renewal, pages)),
-                            },
-                            None => return Err(e),
-                        },
-                    }
-                }
+                // A full page of stamp objects after the counter: confirmed
+                // before anything else.
+                Proof::StampAhead { .. } => match self.confirm_stamp(&id, seqs, pages).await? {
+                    Flow::Again(next) => seqs = next,
+                    Flow::Done(renewal) => return Ok(renewal),
+                },
                 Proof::RevocationsShort {
                     listed,
                     held,
                     stray,
                 } => {
                     if !stray.is_empty() && !strays_paged {
-                        pages.push(Page::StrayRevocationNames(stray));
+                        pages.push(Page::stray(stray));
                     }
                     pages.push(Page::RevocationsShort { listed, held });
-                    return Ok((Renewal::Refused, pages));
+                    return Ok(Renewal::Refused);
                 }
             }
         }
         Err(ERR_RENEW_ROUNDS)
+    }
+
+    /// Stamp objects lie after the unit's counter. Not yet a rollback: a
+    /// raise that ran after the read moves the counter. `checked` records
+    /// one only while the counter is still the one it read; then the unit
+    /// is closed and the client pages.
+    async fn confirm_stamp(
+        &self,
+        id: &UnitStampId,
+        seqs: Seqs,
+        pages: &mut Vec<Page>,
+    ) -> Result<Flow> {
+        let ledger = UnitLedger::new(self, seqs);
+        let stamp = Stamp {
+            ledger: &ledger,
+            safety: &self.safety,
+            clock: &self.clock,
+            id: id.as_str(),
+        };
+        let checked = stamp.checked().await;
+        let seqs = ledger.seqs.get();
+        match checked {
+            Ok(None) => {
+                pages.push(Page::RolledBack);
+                Ok(Flow::Done(Renewal::Closed { rolled_back: true }))
+            }
+            Ok(Some(_)) => Ok(Flow::Again(seqs)),
+            Err(e) => match ledger.stopped() {
+                Some(stop) => self.on_stop(stop).await,
+                None => Err(e),
+            },
+        }
     }
 
     /// What a renewal does when the unit's answer stops a stamp call, or
@@ -457,27 +504,48 @@ where
             if batch.head < unit.keys_seq {
                 return Err(ERR_KEYS_BELOW);
             }
-            if batch.head > unit.keys_seq {
+            // In pages the unit takes (`keys::MAX_ENTRIES`), each from the
+            // unit's own `keys_seq`; every page must move it on.
+            let mut behind = false;
+            while unit.keys_seq < batch.head {
+                let page: Vec<KeyEntry> = batch
+                    .entries
+                    .iter()
+                    .filter(|e| e.last_seq > unit.keys_seq)
+                    .take(MAX_ENTRIES)
+                    .cloned()
+                    .collect();
+                if page.is_empty() {
+                    return Err(ERR_KEYS_GAP);
+                }
+                let answers: Vec<KeptAnswer> = batch
+                    .answers
+                    .iter()
+                    .filter(|a| page.iter().any(|e| e.rid.as_ref() == Some(&a.rid)))
+                    .cloned()
+                    .collect();
                 let op = UnitOp::ApplyKeys {
                     from_seq: unit.keys_seq,
-                    entries: batch.entries,
-                    answers: batch.answers,
+                    entries: page,
+                    answers,
                 };
                 let reply = self.unit.reply(&self.worker_call(unit, op)).await?;
                 match reply.answer {
-                    UnitAnswer::Ok { seqs, .. } => unit = seqs,
+                    UnitAnswer::Ok { seqs, .. } if seqs.keys_seq > unit.keys_seq => unit = seqs,
+                    UnitAnswer::Ok { .. } => return Err(ERR_KEYS_STUCK),
                     // The unit holds fewer records than it said (restored
                     // in between): read again from its own seq.
                     UnitAnswer::KeysBehind { seqs } => {
                         unit = seqs;
-                        continue;
+                        behind = true;
+                        break;
                     }
                     UnitAnswer::Unborn { .. } => return Ok(Synced::Unborn),
                     _ => return Err(ERR_KEYS_ANSWER),
                 }
-                if unit.keys_seq != batch.head {
-                    continue;
-                }
+            }
+            if behind || unit.keys_seq != batch.head {
+                continue;
             }
             let (tenant_state, tenant_mode) = unit_state(&door);
             let restoring_since = door.restoring_entry(self.name.unit).map(|r| r.since_seq);
@@ -533,9 +601,32 @@ where
             match reply.answer {
                 UnitAnswer::RenewNeeded { seqs, why: None } if !renewed => {
                     renewed = true;
-                    let (renewal, more) = self.renew(seqs).await?;
+                    // Rule 11: an unsigned call causes at most one renewal
+                    // attempt per unit and T in this isolate, and none while
+                    // one runs. A signed call renews for itself.
+                    let attempt = match call.authenticated {
+                        true => None,
+                        false => match self.flights.attempt(
+                            &self.name,
+                            self.clock.now(),
+                            self.lease.term_ms,
+                        ) {
+                            Some(guard) => Some(guard),
+                            None => {
+                                let renew_due = self.renew_due(&reply);
+                                return Ok(Answered {
+                                    reply,
+                                    refreshed,
+                                    renew_due,
+                                    pages,
+                                });
+                            }
+                        },
+                    };
+                    let (renewal, more) = self.renew(seqs).await;
+                    drop(attempt);
                     pages.extend(more);
-                    if matches!(renewal, Renewal::Renewed { .. }) {
+                    if matches!(renewal?, Renewal::Renewed { .. }) {
                         continue;
                     }
                 }
@@ -575,12 +666,8 @@ where
     pub async fn run_job(&self, job: UnitJob, seqs: Seqs) -> JobResult {
         match job {
             UnitJob::Renew { .. } => match self.renew(seqs).await {
-                Ok((renewal, pages)) => renewal_result(renewal, pages),
-                Err(_) => JobResult {
-                    delivery: Delivery::HandBack,
-                    code: "renew_failed",
-                    pages: Vec::new(),
-                },
+                (Ok(renewal), pages) => renewal_result(renewal, pages),
+                (Err(_), pages) => job_result(Delivery::HandBack, "renew_failed", pages),
             },
             UnitJob::StampRaise { .. } => self.raise(seqs).await,
         }
@@ -613,22 +700,15 @@ where
                     pages.push(Page::RolledBack);
                     return job_result(Delivery::Ack, "rolled_back", pages);
                 }
-                (Err(_), Some(Stop::RenewNeeded)) if attempt == 0 => match self.renew(seqs).await {
-                    Ok((Renewal::Renewed { seqs: now, .. }, more)) => {
-                        pages.extend(more);
-                        seqs = now;
+                (Err(_), Some(Stop::RenewNeeded)) if attempt == 0 => {
+                    let (renewal, more) = self.renew(seqs).await;
+                    pages.extend(more);
+                    match renewal {
+                        Ok(Renewal::Renewed { seqs: now, .. }) => seqs = now,
+                        Ok(renewal) => return renewal_result(renewal, pages),
+                        Err(_) => return job_result(Delivery::HandBack, "renew_failed", pages),
                     }
-                    Ok((renewal, more)) => {
-                        pages.extend(more);
-                        let mut r = renewal_result(renewal, pages);
-                        if r.code == "renewed" {
-                            r.code = "raise_failed";
-                            r.delivery = Delivery::HandBack;
-                        }
-                        return r;
-                    }
-                    Err(_) => return job_result(Delivery::HandBack, "renew_failed", pages),
-                },
+                }
                 (Err(_), Some(Stop::Closed)) => return job_result(Delivery::Ack, "closed", pages),
                 (Err(_), Some(Stop::Unborn)) => {
                     return job_result(Delivery::Unborn, "unborn", pages)
@@ -718,6 +798,10 @@ const ERR_LEASE_EXPIRED: BridgeError =
 const ERR_SYNC_ROUNDS: BridgeError = BridgeError::Invalid("unit sync: the unit kept moving");
 const ERR_SYNC_ANSWER: BridgeError = BridgeError::Invalid("unit sync: unexpected answer");
 const ERR_KEYS_ANSWER: BridgeError = BridgeError::Invalid("unit sync: key apply refused");
+const ERR_KEYS_GAP: BridgeError =
+    BridgeError::Invalid("unit sync: the key feed has no record after the unit's keys_seq");
+const ERR_KEYS_STUCK: BridgeError =
+    BridgeError::Invalid("unit sync: a key apply did not move the unit's keys_seq");
 const ERR_KEYS_BELOW: BridgeError =
     BridgeError::Invalid("unit sync: the key chain ends below the unit's keys_seq");
 const ERR_PING_ANSWER: BridgeError = BridgeError::Invalid("unit: unexpected answer to a ping");
@@ -1029,26 +1113,68 @@ impl ChainNames for RecordNames {
     }
 }
 
-/// The background renewals in flight in one isolate, by unit: a second
-/// one for the same unit is not started while the first runs. Cheap to
-/// clone; one per isolate.
+/// The renewals in flight in one isolate, by unit, and when each unit's
+/// last attempt began: a second one for the same unit is not started while
+/// one runs, and [`InFlight::attempt`] spaces them. Cheap to clone; one per
+/// isolate.
 #[derive(Clone, Debug, Default)]
-pub struct InFlight(Rc<RefCell<BTreeSet<String>>>);
+pub struct InFlight(Rc<RefCell<Flights>>);
 
-/// Held while one background renewal runs; dropping it ends it.
+#[derive(Debug, Default)]
+struct Flights {
+    running: BTreeSet<String>,
+    last: BTreeMap<String, UnixMs>,
+}
+
+/// Held while one renewal runs; dropping it ends it.
 #[derive(Debug)]
 pub struct InFlightGuard {
-    set: Rc<RefCell<BTreeSet<String>>>,
+    set: Rc<RefCell<Flights>>,
     name: String,
 }
+
+/// Units whose last attempt is remembered, at most: an isolate serves far
+/// fewer; past it the oldest are forgotten.
+const MAX_REMEMBERED: usize = 4096;
 
 impl InFlight {
     /// Starts a renewal of `name`, or `None` when one is running.
     pub fn begin(&self, name: &UnitName) -> Option<InFlightGuard> {
+        self.start(name, None)
+    }
+
+    /// Starts a renewal attempt of `name` at `now`, or `None` when one is
+    /// running or the last one began less than `gap_ms` ago.
+    pub fn attempt(&self, name: &UnitName, now: UnixMs, gap_ms: i64) -> Option<InFlightGuard> {
+        self.start(name, Some((now, gap_ms)))
+    }
+
+    fn start(&self, name: &UnitName, spaced: Option<(UnixMs, i64)>) -> Option<InFlightGuard> {
         let key = name.object_name();
-        if !self.0.borrow_mut().insert(key.clone()) {
+        let mut f = self.0.borrow_mut();
+        if f.running.contains(&key) {
             return None;
         }
+        if let Some((now, gap)) = spaced {
+            if f.last
+                .get(&key)
+                .is_some_and(|at| now.0 < at.0.saturating_add(gap))
+            {
+                return None;
+            }
+            if f.last.len() >= MAX_REMEMBERED && !f.last.contains_key(&key) {
+                if let Some(oldest) = f
+                    .last
+                    .iter()
+                    .min_by_key(|(_, at)| at.0)
+                    .map(|(k, _)| k.clone())
+                {
+                    f.last.remove(&oldest);
+                }
+            }
+            f.last.insert(key.clone(), now);
+        }
+        f.running.insert(key.clone());
         Some(InFlightGuard {
             set: self.0.clone(),
             name: key,
@@ -1058,6 +1184,6 @@ impl InFlight {
 
 impl Drop for InFlightGuard {
     fn drop(&mut self) {
-        self.set.borrow_mut().remove(&self.name);
+        self.set.borrow_mut().running.remove(&self.name);
     }
 }

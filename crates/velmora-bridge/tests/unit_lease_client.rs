@@ -78,6 +78,12 @@ struct Obj<'a> {
     fail: Cell<bool>,
     /// Run once, right after the first `stamp` read answered.
     after_stamp_read: RefCell<Option<Hook<'a>>>,
+    /// The answer to the next call of this op is lost after the unit ran
+    /// it.
+    lose_answer_of: Cell<Option<&'static str>>,
+    /// Another writer raises the stamp after every stamp read.
+    raise_after_each_read: Cell<bool>,
+    safety: &'a MemBlobStore,
 }
 
 fn op_name(op: &UnitOp) -> String {
@@ -102,15 +108,20 @@ impl UnitReplies for Obj<'_> {
             .borrow_mut()
             .push((call.kind, call.listed, op_name(&call.op)));
         let reply = self.unit.reply(call, self.clock.now());
-        if matches!(
-            &call.op,
-            UnitOp::Job {
-                call: JobCall::stamp { .. }
-            }
-        ) {
+        if let UnitOp::Job {
+            call: JobCall::stamp { catalogue },
+        } = &call.op
+        {
             if let Some(hook) = self.after_stamp_read.borrow_mut().take() {
                 hook(&self.unit);
             }
+            if self.raise_after_each_read.get() {
+                raise_now(&self.unit, self.safety, catalogue, self.clock.now());
+            }
+        }
+        if self.lose_answer_of.get() == Some(op_name(&call.op).as_str()) {
+            self.lose_answer_of.set(None);
+            return Err(BridgeError::Sql("unit: answer lost".into()));
         }
         Ok(reply)
     }
@@ -135,13 +146,49 @@ impl KeyFeed for Keys {
 }
 
 #[derive(Default)]
-struct Finisher(Cell<u32>);
+struct Finisher(Cell<u32>, Cell<bool>);
 
 impl KeyFinisher for Finisher {
     async fn revocations_unrecorded(&self, t: &TenantId) -> Result<()> {
         assert_eq!(t, &tenant());
         self.0.set(self.0.get() + 1);
-        Ok(())
+        match self.1.get() {
+            true => Err(BridgeError::Queue("send failed".into())),
+            false => Ok(()),
+        }
+    }
+}
+
+/// Another writer's raise: the counter in the unit, then the object.
+fn raise_now(unit: &Unit<RusqliteSql>, safety: &MemBlobStore, id: &str, now: UnixMs) {
+    let seqs = unit.head().unwrap().seqs;
+    let read = UnitCall {
+        name: own(),
+        kind: CallKind::Job,
+        seqs: Some(seqs),
+        authenticated: true,
+        listed: false,
+        op: UnitOp::Job {
+            call: JobCall::stamp {
+                catalogue: id.to_string(),
+            },
+        },
+    };
+    let UnitAnswer::Ok { body, .. } = unit.handle(&read, now) else {
+        return;
+    };
+    let row: velmora_bridge::stamp::StampRow = serde_json::from_value(body).unwrap();
+    let advance = UnitCall {
+        op: UnitOp::Job {
+            call: JobCall::stamp_advance {
+                from: row.counter,
+                catalogue: id.to_string(),
+            },
+        },
+        ..read
+    };
+    if matches!(unit.handle(&advance, now), UnitAnswer::Ok { .. }) {
+        put_inline(safety, &stamp_key(id, row.counter.map_or(1, |c| c + 1)));
     }
 }
 
@@ -152,6 +199,7 @@ struct Rig<'a> {
     safety: &'a MemBlobStore,
     keys: &'a Keys,
     finisher: &'a Finisher,
+    flights: InFlight,
     obj: Obj<'a>,
 }
 
@@ -209,6 +257,7 @@ impl<'a> Rig<'a> {
             name,
             listed: true,
             lease: LeaseRules::DEFAULT,
+            flights: self.flights.clone(),
         }
     }
 
@@ -399,12 +448,16 @@ fn with_rig<R>(f: impl FnOnce(&Rig<'_>) -> R) -> R {
         safety: &safety,
         keys: &keys,
         finisher: &finisher,
+        flights: InFlight::default(),
         obj: Obj {
             unit: Unit::new(RusqliteSql::open_in_memory().unwrap(), own(), ""),
             clock: &clock,
             log: RefCell::new(vec![]),
             fail: Cell::new(false),
             after_stamp_read: RefCell::new(None),
+            lose_answer_of: Cell::new(None),
+            raise_after_each_read: Cell::new(false),
+            safety: &safety,
         },
     };
     for change in [
@@ -458,11 +511,17 @@ fn with_fresh<R>(f: impl FnOnce(&Rig<'_>) -> R) -> R {
             block_on(c.sync(rig.unit_seqs())).unwrap(),
             Synced::Synced { .. }
         ));
-        let (r, pages) = block_on(c.renew(rig.unit_seqs())).unwrap();
+        let (r, pages) = renewed(&c, rig.unit_seqs());
         assert!(matches!(r, Renewal::Renewed { .. }), "{r:?}");
         assert!(pages.is_empty(), "{pages:?}");
         f(rig)
     })
+}
+
+/// A renewal that did not fail: what it came to, and its pages.
+fn renewed(c: &Client<'_, '_>, seqs: Seqs) -> (Renewal, Vec<Page>) {
+    let (r, pages) = block_on(c.renew(seqs));
+    (r.unwrap(), pages)
 }
 
 fn revoked_count(rig: &Rig<'_>) -> u64 {
@@ -583,7 +642,7 @@ fn a_renewal_reads_the_unit_proves_and_opens_it() {
         block_on(rig.client().sync(rig.unit_seqs())).unwrap();
         assert!(matches!(rig.ping(), UnitAnswer::RenewNeeded { .. }));
         rig.obj.log.borrow_mut().clear();
-        let (r, pages) = block_on(rig.client().renew(rig.unit_seqs())).unwrap();
+        let (r, pages) = renewed(&rig.client(), rig.unit_seqs());
         assert_eq!(
             r,
             Renewal::Renewed {
@@ -608,7 +667,7 @@ fn a_renewal_that_finds_a_newer_record_syncs_first() {
         let old = rig.unit_seqs();
         rig.write(limits(rig), Actor::Operator);
         rig.clock.advance_ms(T + 1);
-        let (r, _) = block_on(rig.client().renew(old)).unwrap();
+        let (r, _) = renewed(&rig.client(), old);
         let Renewal::Renewed { seqs, .. } = r else {
             panic!("{r:?}")
         };
@@ -623,7 +682,7 @@ fn a_renewal_that_finds_a_newer_key_record_applies_it_first() {
     with_fresh(|rig| {
         rig.key_record(3, key(GONE, 3, SubjectStatus::Active));
         rig.clock.advance_ms(T + 1);
-        let (r, _) = block_on(rig.client().renew(rig.unit_seqs())).unwrap();
+        let (r, _) = renewed(&rig.client(), rig.unit_seqs());
         assert!(
             matches!(r, Renewal::Renewed { seqs, .. } if seqs.keys_seq == 3),
             "{r:?}"
@@ -641,14 +700,14 @@ fn a_listed_revocation_is_applied_and_the_finisher_told() {
             &format!("{}{K}", RecordNames.revocation_dir(tid())),
         );
         rig.clock.advance_ms(T + 1);
-        let (r, pages) = block_on(rig.client().renew(rig.unit_seqs())).unwrap();
+        let (r, pages) = renewed(&rig.client(), rig.unit_seqs());
         assert!(matches!(r, Renewal::Renewed { .. }), "{r:?}");
         assert!(pages.is_empty(), "{pages:?}");
         assert_eq!(revoked_count(rig), 1);
         assert_eq!(rig.finisher.0.get(), 1);
         // The next renewal lists the same count: nothing to apply.
         rig.clock.advance_ms(T + 1);
-        block_on(rig.client().renew(rig.unit_seqs())).unwrap();
+        renewed(&rig.client(), rig.unit_seqs());
         assert_eq!(rig.finisher.0.get(), 1);
     });
 }
@@ -661,9 +720,15 @@ fn a_stray_revocation_name_pages_and_renews() {
         let stray = format!("{}not.an-id", RecordNames.revocation_dir(tid()));
         put(rig.safety, &stray);
         rig.clock.advance_ms(T + 1);
-        let (r, pages) = block_on(rig.client().renew(rig.unit_seqs())).unwrap();
+        let (r, pages) = renewed(&rig.client(), rig.unit_seqs());
         assert!(matches!(r, Renewal::Renewed { .. }), "{r:?}");
-        assert_eq!(pages, [Page::StrayRevocationNames(vec![stray])]);
+        assert_eq!(
+            pages,
+            [Page::StrayRevocationNames {
+                first: vec![stray],
+                total: 1
+            }]
+        );
     });
 }
 
@@ -676,7 +741,7 @@ fn more_revocations_held_than_listed_is_refused_and_pages() {
         block_on(rig.client().sync(rig.unit_seqs())).unwrap();
         assert_eq!(revoked_count(rig), 1);
         rig.clock.advance_ms(T + 1);
-        let (r, pages) = block_on(rig.client().renew(rig.unit_seqs())).unwrap();
+        let (r, pages) = renewed(&rig.client(), rig.unit_seqs());
         assert_eq!(r, Renewal::Refused);
         assert_eq!(pages, [Page::RevocationsShort { listed: 0, held: 1 }]);
         assert!(matches!(rig.ping(), UnitAnswer::RenewNeeded { .. }));
@@ -692,12 +757,14 @@ fn a_stamp_ahead_of_the_counter_closes_the_unit_as_rolled_back() {
         let id = rig.client().stamp_id().unwrap();
         put(rig.safety, &stamp_key(id.as_str(), 1));
         rig.clock.advance_ms(T + 1);
-        let (r, pages) = block_on(rig.client().renew(rig.unit_seqs())).unwrap();
+        let (r, pages) = renewed(&rig.client(), rig.unit_seqs());
         assert_eq!(r, Renewal::Closed { rolled_back: true });
         assert_eq!(pages, [Page::RolledBack]);
-        let (r, pages) = block_on(rig.client().renew(rig.unit_seqs())).unwrap();
+        // Seen again: closed, and paged again (the page that recorded it
+        // may have been lost).
+        let (r, pages) = renewed(&rig.client(), rig.unit_seqs());
         assert_eq!(r, Renewal::Closed { rolled_back: true });
-        assert!(pages.is_empty());
+        assert_eq!(pages, [Page::RolledBack]);
         assert!(matches!(rig.ping(), UnitAnswer::RenewNeeded { .. }));
     });
 }
@@ -729,7 +796,7 @@ fn a_raise_between_the_read_and_the_list_is_not_a_rollback() {
             assert!(matches!(unit.handle(&c, NOW), UnitAnswer::Ok { .. }));
             put_inline(safety, &stamp_key(&id2, 1));
         }));
-        let (r, pages) = block_on(rig.client().renew(rig.unit_seqs())).unwrap();
+        let (r, pages) = renewed(&rig.client(), rig.unit_seqs());
         assert!(matches!(r, Renewal::Renewed { .. }), "{r:?}");
         assert!(pages.is_empty(), "{pages:?}");
     });
@@ -741,7 +808,7 @@ fn a_restoring_unit_is_not_renewed() {
     with_fresh(|rig| {
         rig.write(Change::SetRestoring { unit: 0 }, Actor::Operator);
         block_on(rig.client().sync(rig.unit_seqs())).unwrap();
-        let (r, _) = block_on(rig.client().renew(rig.unit_seqs())).unwrap();
+        let (r, _) = renewed(&rig.client(), rig.unit_seqs());
         assert_eq!(r, Renewal::Closed { rolled_back: false });
     });
 }
@@ -759,19 +826,23 @@ fn an_unborn_unit_is_reported() {
         safety: &safety,
         keys: &keys,
         finisher: &finisher,
+        flights: InFlight::default(),
         obj: Obj {
             unit: Unit::new(RusqliteSql::open_in_memory().unwrap(), own(), ""),
             clock: &clock,
             log: RefCell::new(vec![]),
             fail: Cell::new(false),
             after_stamp_read: RefCell::new(None),
+            lose_answer_of: Cell::new(None),
+            raise_after_each_read: Cell::new(false),
+            safety: &safety,
         },
     };
     let seqs = Seqs {
         state_seq: 4,
         keys_seq: 0,
     };
-    let (r, pages) = block_on(rig.client().renew(seqs)).unwrap();
+    let (r, pages) = renewed(&rig.client(), seqs);
     assert_eq!(r, Renewal::Unborn);
     assert!(pages.is_empty());
     let job = block_on(rig.client().run_job(UnitJob::Renew { at: NOW }, seqs));
@@ -790,11 +861,126 @@ fn a_renewal_from_old_numbers_takes_the_units() {
             state_seq: 4,
             keys_seq: 2,
         };
-        let (r, _) = block_on(rig.client().renew(old)).unwrap();
+        let (r, _) = renewed(&rig.client(), old);
         assert!(
             matches!(r, Renewal::Renewed { seqs, .. } if seqs.state_seq == 5),
             "{r:?}"
         );
+    });
+}
+
+/// A key backlog longer than the unit takes in one apply goes in pages,
+/// each from the unit's own `keys_seq` (review finding 1).
+#[test]
+fn a_long_key_backlog_is_applied_in_pages() {
+    with_rig(|rig| {
+        // 250 records: the principal, the key, and 248 more keys.
+        for seq in 3..=250 {
+            rig.key_record(
+                seq,
+                key(&format!("AKCLIENT{seq:012}"), seq, SubjectStatus::Active),
+            );
+        }
+        let s = block_on(rig.client().sync(rig.unit_seqs())).unwrap();
+        assert!(
+            matches!(s, Synced::Synced { seqs } if seqs.keys_seq == 250),
+            "{s:?}"
+        );
+        let applies = rig.calls().iter().filter(|c| *c == "apply_keys").count();
+        assert_eq!(applies, 3, "100 + 100 + 50");
+    });
+}
+
+/// Rule 11: unsigned calls on an expired lease make at most one renewal
+/// attempt per unit and T; signed calls renew for themselves (review
+/// finding 2).
+#[test]
+fn unsigned_calls_try_one_renewal_per_unit_and_t() {
+    with_fresh(|rig| {
+        // A renewal that is refused every time: a revocation the bucket
+        // does not list.
+        rig.key_record(3, key(K, 3, SubjectStatus::Revoked));
+        block_on(rig.client().sync(rig.unit_seqs())).unwrap();
+        rig.clock.advance_ms(T + 1);
+        let unsigned = || {
+            let mut c = request(rig.unit_seqs(), UnitOp::Ping {});
+            c.authenticated = false;
+            block_on(rig.client().call(c)).unwrap()
+        };
+        let reads = || rig.calls().iter().filter(|c| *c == "job:stamp").count();
+        let before = reads();
+        let pages: usize = (0..5).map(|_| unsigned().pages.len()).sum();
+        assert_eq!(reads() - before, 1, "one attempt");
+        assert_eq!(pages, 1, "one page");
+        // One T later: one more.
+        rig.clock.advance_ms(T);
+        unsigned();
+        unsigned();
+        assert_eq!(reads() - before, 2);
+        // A signed call tries every time.
+        for _ in 0..2 {
+            block_on(rig.client().call(request(rig.unit_seqs(), UnitOp::Ping {}))).unwrap();
+        }
+        assert_eq!(reads() - before, 4);
+    });
+}
+
+/// The finisher is told before the `renew` call: an answer lost after
+/// the unit kept the listed ids leaves nothing for a later proof to tell
+/// (review finding 3). The pages come back with the error (finding 6).
+#[test]
+fn the_finisher_is_told_before_the_renew_call() {
+    with_fresh(|rig| {
+        put(
+            rig.safety,
+            &format!("{}{K}", RecordNames.revocation_dir(tid())),
+        );
+        rig.clock.advance_ms(T + 1);
+        rig.finisher.1.set(true);
+        rig.obj.lose_answer_of.set(Some("renew"));
+        let (r, pages) = block_on(rig.client().renew(rig.unit_seqs()));
+        assert!(r.is_err());
+        assert_eq!(rig.finisher.0.get(), 1, "told before the call");
+        assert_eq!(pages, [Page::FinisherNotTold], "kept with the error");
+        // The unit kept the id: the next proof has equal counts.
+        assert_eq!(revoked_count(rig), 1);
+        rig.finisher.1.set(false);
+        let (r, _) = renewed(&rig.client(), rig.unit_seqs());
+        assert!(matches!(r, Renewal::Renewed { .. }));
+    });
+}
+
+/// Another writer raises the stamp after every read of it: the proof
+/// holds the newest stamp, which the unit holds by then, and renews in
+/// one round (review finding 4).
+#[test]
+fn a_unit_whose_stamp_moves_under_every_read_still_renews() {
+    with_fresh(|rig| {
+        rig.clock.advance_ms(T + 1);
+        rig.obj.raise_after_each_read.set(true);
+        let (r, pages) = renewed(&rig.client(), rig.unit_seqs());
+        assert!(matches!(r, Renewal::Renewed { .. }), "{r:?}");
+        assert!(pages.is_empty(), "{pages:?}");
+        let renews = rig.calls().iter().filter(|c| *c == "renew").count();
+        assert_eq!(renews, 2, "the fixture's and this one");
+    });
+}
+
+/// The stray-name page carries the first few names and the count
+/// (review finding 7).
+#[test]
+fn a_stray_page_is_bounded() {
+    with_fresh(|rig| {
+        let dir = RecordNames.revocation_dir(tid());
+        for n in 0..15 {
+            put(rig.safety, &format!("{dir}stray.{n:02}"));
+        }
+        rig.clock.advance_ms(T + 1);
+        let (_, pages) = renewed(&rig.client(), rig.unit_seqs());
+        let [Page::StrayRevocationNames { first, total }] = pages.as_slice() else {
+            panic!("{pages:?}");
+        };
+        assert_eq!((first.len(), *total), (10, 15));
     });
 }
 
