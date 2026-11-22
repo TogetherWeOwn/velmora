@@ -43,8 +43,13 @@ use crate::types::{Result, UnixMs};
 use crate::unit::TenantId;
 
 /// The plane's cap of active S3 keys per tenant when the head names no
-/// `active_keys` limit (ADR §6.3, "Key caps": 20 active S3 keys).
-pub const DEFAULT_ACTIVE_KEYS: u32 = 20;
+/// `active_keys` limit: the cap the root unit enforces
+/// (`unit::reserve::S3_KEYS`, AM-76), read from that constant.
+pub const DEFAULT_ACTIVE_KEYS: u32 = {
+    let cap = crate::unit::reserve::S3_KEYS;
+    assert!(cap > 0 && cap <= u32::MAX as i64);
+    cap as u32
+};
 
 /// The limit names of the head (`TenantDoor::limits`) that the answer
 /// carries.

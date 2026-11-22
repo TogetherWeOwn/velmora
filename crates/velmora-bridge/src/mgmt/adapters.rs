@@ -53,8 +53,7 @@ use crate::ports::{Clock, Kek};
 use crate::records::RecordStore;
 use crate::types::{BridgeError, Result};
 use crate::unit::keys::{
-    Access as UnitAccess, KeptAnswer as UnitKept, KeyGrant,
-    SubjectStatus as UnitStatus,
+    Access as UnitAccess, KeptAnswer as UnitKept, KeyGrant, SubjectStatus as UnitStatus,
 };
 use crate::unit::reserve::Rid as UnitRid;
 use crate::unit::{CallKind, Seqs, TenantId, UnitAnswer, UnitOp};
@@ -707,9 +706,9 @@ where
             Ok(ReservedAnswer::KeyMoved) => Ok(ChainWrite::Refused(Code::KeyMoved)),
             Ok(ReservedAnswer::Refused(r)) => Ok(ChainWrite::Refused(refusal_code(r))),
             // Answers of `change_reserved` only; a create never gets one.
-            Ok(ReservedAnswer::InHead { .. } | ReservedAnswer::Closes) => Err(
-                BridgeError::Invalid("mgmt: a create got a change's answer"),
-            ),
+            Ok(ReservedAnswer::InHead { .. } | ReservedAnswer::Closes) => {
+                Err(BridgeError::Invalid("mgmt: a create got a change's answer"))
+            }
             Err(e) => Err(e),
         };
         self.put_back(table);
