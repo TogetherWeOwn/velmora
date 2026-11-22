@@ -186,8 +186,10 @@ pub fn reap(budget: &ByteBudget, isolate: i64, now: UnixMs) -> Option<String> {
     (n > 0).then(|| {
         format!(
             "job table: abandoned jobs dropped: isolate={isolate} dropped={n} quiet={quiet} \
-             budget_in_use_before={before} budget_in_use={} running_jobs={left} dropped_total={total}",
+             budget_in_use_before={before} budget_in_use={} running_jobs={left} dropped_total={total} \
+             spare_bytes={}",
             budget.in_use(),
+            budget.spare_bytes(),
         )
     })
 }
@@ -200,6 +202,9 @@ pub struct Reading {
     pub refused: u64,
     pub in_use: u64,
     pub jobs_in_use: u64,
+    /// `ByteBudget::spare_bytes`: idle extent buffers, in both counts
+    /// above.
+    pub spare_bytes: u64,
     pub capacity: u64,
     pub job_capacity: u64,
     pub waiting: usize,
@@ -244,7 +249,7 @@ impl Watch {
         Some(format!(
             "budget saturated: isolate={isolate} refused={refused_since} refused_total={} \
              budget_in_use={} jobs_in_use={} capacity={} job_capacity={} waiting={} \
-             running_jobs={} oldest_job_age_s={oldest} dropped_total={}",
+             running_jobs={} oldest_job_age_s={oldest} dropped_total={} spare_bytes={}",
             r.refused,
             r.in_use,
             r.jobs_in_use,
@@ -253,6 +258,7 @@ impl Watch {
             r.waiting,
             r.running_jobs,
             r.dropped_total,
+            r.spare_bytes,
         ))
     }
 }
@@ -266,6 +272,7 @@ pub fn watch_line(budget: &ByteBudget, isolate: i64, now: UnixMs) -> Option<Stri
         refused: budget.refused(),
         in_use: budget.in_use(),
         jobs_in_use: budget.jobs_in_use(),
+        spare_bytes: budget.spare_bytes(),
         capacity: budget.capacity(),
         job_capacity: budget.job_capacity(),
         waiting: budget.waiting(),
@@ -395,6 +402,7 @@ mod tests {
             refused,
             in_use: 66,
             jobs_in_use: 66,
+            spare_bytes: 16,
             capacity: 48,
             job_capacity: 72,
             waiting: 2,
@@ -414,7 +422,7 @@ mod tests {
             Some(
                 "budget saturated: isolate=7 refused=3 refused_total=3 budget_in_use=66 \
                  jobs_in_use=66 capacity=48 job_capacity=72 waiting=2 running_jobs=3 \
-                 oldest_job_age_s=90 dropped_total=1"
+                 oldest_job_age_s=90 dropped_total=1 spare_bytes=16"
             )
         );
         // More are refused within the minute: said when it is over, with

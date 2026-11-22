@@ -1025,30 +1025,44 @@ impl ByteBudget {
         let s = &self.state;
         let limit = if job { s.job_capacity } else { s.capacity };
         let extent = extent.filter(|len| job && *len >= EXTENT_POOL_MIN_BYTES && *len <= bytes);
-        // The spare this charge takes over: its place, its capacity.
-        let lend = extent
-            .and_then(|len| s.spare_for(len))
-            .filter(|(_, cap)| extent.is_some_and(|len| bytes + (cap - len) <= limit));
-        let bytes = match (lend, extent) {
-            (Some((_, cap)), Some(len)) => bytes + (cap - len),
-            _ => bytes,
-        };
-        let (requests, jobs) = if job { (0, bytes) } else { (bytes, 0) };
-        let next_requests = s.requests.get().checked_add(requests)?;
-        let next_jobs = s.jobs.get().checked_add(jobs)?;
-        let mut spare_left = s.spare_bytes.get() - lend.map_or(0, |(_, cap)| cap);
-        let mut evict = 0usize;
-        {
+        let given = bytes;
+        // With `lend` (the spare taken over: its place, its capacity):
+        // the bytes charged, and how many of the other spares, oldest
+        // first, are let go to make room. `None`: no room even with
+        // every other spare let go.
+        let plan = |lend: Option<(usize, u64)>| -> Option<(u64, u64, u64, usize)> {
+            let bytes = match (lend, extent) {
+                (Some((_, cap)), Some(len)) => given.checked_add(cap - len)?,
+                _ => given,
+            };
+            if bytes > limit {
+                return None;
+            }
+            let (requests, jobs) = if job { (0, bytes) } else { (bytes, 0) };
+            let next_requests = s.requests.get().checked_add(requests)?;
+            let next_jobs = s.jobs.get().checked_add(jobs)?;
+            let mut spare_left = s.spare_bytes.get() - lend.map_or(0, |(_, cap)| cap);
+            let mut evict = 0usize;
             let spare = s.spare.borrow();
             let mut others = (0..spare.len())
                 .filter(|at| lend.is_none_or(|(lent, _)| lent != *at))
                 .map(|at| spare[at].capacity() as u64);
             while !s.fits(next_requests, next_jobs.saturating_add(spare_left)) {
-                // No room even with every other spare let go: none is.
                 spare_left -= others.next()?;
                 evict += 1;
             }
-        }
+            Some((bytes, next_requests, next_jobs, evict))
+        };
+        // Taking a spare over charges what it holds beyond the extent; when
+        // that is what keeps the charge out, the spare is let go instead,
+        // like any other, and the extent gets a buffer of its own.
+        let candidate = extent.and_then(|len| s.spare_for(len));
+        let (lend, (bytes, next_requests, next_jobs, evict)) =
+            match candidate.and_then(|c| plan(Some(c)).map(|p| (Some(c), p))) {
+                Some(planned) => planned,
+                None => (None, plan(None)?),
+            };
+        let (requests, jobs) = if job { (0, bytes) } else { (bytes, 0) };
         let lent = match (lend, evict) {
             (None, 0) => None,
             (lend, evict) => s.take_spares(lend.map(|(at, _)| at), evict),
@@ -1298,13 +1312,25 @@ impl Charge {
         s.requests.set(others.saturating_add(bytes));
         self.requests = bytes;
         self.count(bytes, true);
-        let in_use = s
-            .requests
-            .get()
-            .saturating_add(s.jobs.get())
-            .saturating_add(s.spare_bytes.get());
+        let requests = s.requests.get();
+        let jobs = s.jobs.get();
+        let mut spare_left = s.spare_bytes.get();
+        let in_use = requests.saturating_add(jobs).saturating_add(spare_left);
         if in_use > s.peak.get() {
             s.peak.set(in_use);
+        }
+        // The bytes held are already resident and must always be charged.
+        // If idle spares alone put them over budget, give back just enough room.
+        if !s.fits(requests, jobs.saturating_add(spare_left)) && s.fits(requests, jobs) {
+            let mut evict = 0;
+            for spare in s.spare.borrow().iter() {
+                spare_left -= spare.capacity() as u64;
+                evict += 1;
+                if s.fits(requests, jobs.saturating_add(spare_left)) {
+                    break;
+                }
+            }
+            drop(s.take_spares(None, evict));
         }
     }
 
@@ -1346,6 +1372,7 @@ impl Charge {
             return;
         }
         buffer.clear();
+        self.count(cap, false);
         self.jobs -= cap;
         s.jobs.set(s.jobs.get().saturating_sub(cap));
         let mut spare = s.spare.borrow_mut();
@@ -1448,8 +1475,10 @@ mod charge_tests {
 
         let mut extra = original.beside();
         extra.hold(len);
-        assert_eq!(budget.in_use(), 3 * len);
         assert_eq!(budget.peak(), 3 * len);
+        assert_eq!(budget.in_use(), 2 * len);
+        assert_eq!(request.held(), 2 * len);
+        assert_eq!((budget.spares(), budget.spare_bytes()), (0, 0));
     }
 }
 

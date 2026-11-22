@@ -1982,6 +1982,7 @@ async fn status<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, 
         // Figures of the isolate that answers; another isolate has its own.
         "inflight_peak_bytes": bridge.budget.peak(),
         "inflight_bytes": bridge.budget.in_use(),
+        "spare_extent_bytes": bridge.budget.spare_bytes(),
         "inflight_budget_bytes": bridge.budget.capacity(),
         "job_budget_bytes": bridge.budget.job_capacity(),
         // `on`: the totals above come from the usage counters. `off`:

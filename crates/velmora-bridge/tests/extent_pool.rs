@@ -98,6 +98,26 @@ async fn a_larger_spare_is_charged_at_its_size_and_a_much_larger_one_is_not_take
     assert_eq!((budget.spares(), budget.spare_bytes()), (2, 24 * MIB));
 }
 
+/// When what a larger spare holds beyond the extent is all that keeps a
+/// charge out, the spare is let go instead and the job gets a buffer of
+/// its own: the pool never refuses a charge that fits without it.
+#[tokio::test]
+async fn a_spare_too_large_to_fit_is_let_go_rather_than_keep_the_job_out() {
+    let budget = budget(3);
+    one_job(&budget, 25 * MIB, 16 * MIB).await;
+    let held = budget.try_charge_job(66 * MIB).unwrap();
+    assert_eq!(budget.in_use(), 82 * MIB);
+    // 14 MiB in the 16 MiB spare would charge 25 MiB: 91 of 90. Without
+    // it, 23 MiB fit (89).
+    let charge = budget.charge_job_extent(23 * MIB, 14 * MIB).await.unwrap();
+    assert_eq!(charge.bytes(), 23 * MIB);
+    assert_eq!((budget.spares(), budget.in_use()), (0, 89 * MIB));
+    charge.lend(14 * MIB as usize);
+    drop((held, charge));
+    // Its own buffer is the spare now, charged at its size.
+    assert_eq!((budget.spares(), budget.in_use()), (1, 14 * MIB));
+}
+
 #[tokio::test]
 async fn the_pool_keeps_its_newest_buffers_up_to_its_size() {
     let budget = budget(1);
