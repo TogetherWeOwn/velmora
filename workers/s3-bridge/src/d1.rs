@@ -2,11 +2,18 @@
 //!
 //! Value mapping:
 //! - `Null` <-> JS `null` (`undefined` reads as `Null` too).
-//! - `Int` <-> JS number. D1 has no BigInt binding, so only integers in
-//!   `±(2^53 - 1)` round-trip exactly. A bound `Int` outside that range is
-//!   refused, and a returned number that is fractional or outside it is a
-//!   decode error: values are never rounded. Every catalogue integer
-//!   (millisecond times, sizes, counters, fencing tokens) is far inside it.
+//! - `Int` -> its decimal text, **bound through `+CAST(?N AS INTEGER)`**
+//!   (`velmora_bridge::sql_bind::cast_bound`, the statement text the
+//!   Durable Object adapter uses too). D1 binds a JS number as a SQLite
+//!   REAL, so an integer bound as a number would divide as a fraction and
+//!   be stored as a REAL wherever no INTEGER affinity converts it; the
+//!   text is cast to the exact `i64`, so every integer is stored as the
+//!   INTEGER a native binding gives, above 2^53 too.
+//! - `Int` <- JS number. D1 has no BigInt result, so only integers in
+//!   `±(2^53 - 1)` read back exactly: a returned number that is fractional
+//!   or outside that range is a decode error, never rounded. Every
+//!   catalogue integer (millisecond times, sizes, counters, fencing tokens)
+//!   is far inside it.
 //! - `Text` <-> JS string.
 //! - `Blob` -> `ArrayBuffer` (D1's BLOB binding). A returned BLOB may be an
 //!   array of byte numbers, an `ArrayBuffer` or a `Uint8Array`.
@@ -26,6 +33,7 @@
 use std::future::Future;
 use std::time::Duration;
 
+use velmora_bridge::sql_bind::cast_bound;
 use velmora_bridge::{
     is_tx_guard_violation, BridgeError, Result, Row, Sql, SqlValue, MAX_SQL_PARAMS,
 };
@@ -67,10 +75,11 @@ impl D1Sql {
 
     fn statement(&self, sql: &str, params: &[SqlValue]) -> Result<D1PreparedStatement> {
         check_params(params.len())?;
+        let (sql, params) = cast_bound(sql, params)?;
         let values = params.iter().map(to_js).collect::<Result<Array>>()?;
         let bind_err = |_| BridgeError::Sql("d1: bind failed".into());
         self.db
-            .prepare(sql)
+            .prepare(&sql)
             .map_err(bind_err)?
             .bind(values)
             .map_err(bind_err)
@@ -188,13 +197,6 @@ fn check_params(n: usize) -> Result<()> {
     Ok(())
 }
 
-fn int_to_number(i: i64) -> Result<f64> {
-    if !(-MAX_SAFE_INT..=MAX_SAFE_INT).contains(&i) {
-        return Err(BridgeError::Sql("d1: integer outside JS safe range".into()));
-    }
-    Ok(i as f64)
-}
-
 fn number_to_int(f: f64) -> Result<i64> {
     let safe = MAX_SAFE_INT as f64;
     if !f.is_finite() || f.fract() != 0.0 || f.abs() > safe {
@@ -213,7 +215,8 @@ fn number_to_byte(f: f64) -> Result<u8> {
 fn to_js(v: &SqlValue) -> Result<JsValue> {
     Ok(match v {
         SqlValue::Null => JsValue::NULL,
-        SqlValue::Int(i) => JsValue::from_f64(int_to_number(*i)?),
+        // `cast_bound` made every integer its text.
+        SqlValue::Int(_) => return Err(BridgeError::Sql("d1: integer not cast".into())),
         SqlValue::Text(s) => JsValue::from_str(s),
         SqlValue::Blob(b) => Uint8Array::from(b.as_slice()).buffer().into(),
     })
@@ -295,9 +298,8 @@ mod tests {
         assert!(check_params(MAX_SQL_PARAMS).is_ok());
         assert!(check_params(MAX_SQL_PARAMS + 1).is_err());
         let now = 1_794_000_000_000_i64; // a millisecond timestamp
-        assert_eq!(number_to_int(int_to_number(now).unwrap()).unwrap(), now);
-        assert!(int_to_number(MAX_SAFE_INT).is_ok() && int_to_number(-MAX_SAFE_INT).is_ok());
-        assert!(int_to_number(MAX_SAFE_INT + 1).is_err() && int_to_number(i64::MIN).is_err());
+        assert_eq!(number_to_int(now as f64).unwrap(), now);
+        assert_eq!(number_to_int(MAX_SAFE_INT as f64).unwrap(), MAX_SAFE_INT);
         for bad in [1.5, f64::NAN, f64::INFINITY, 9_007_199_254_740_992.0] {
             assert!(number_to_int(bad).is_err(), "{bad}");
         }

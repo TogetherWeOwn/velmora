@@ -125,11 +125,15 @@ lifts that test on purpose.
 `DoSql` (`workers/unit/src/do_sql.rs`) is the catalogue's `Sql` port over a
 Durable Object's SQLite storage. What it does about the runtime, as measured:
 
-- A JS number binds as a SQLite REAL (in a Durable Object and in D1). `DoSql`
-  writes every integer placeholder as `+CAST(?N AS INTEGER)`: the integer a
-  native binding gives, without the affinity a bare `CAST` adds.
+- A JS number binds as a SQLite REAL (in a Durable Object and in D1). Both
+  adapters write every integer placeholder as `+CAST(?N AS INTEGER)`
+  (`velmora_bridge::sql_bind`): the integer a native binding gives, without
+  the affinity a bare `CAST` adds. `DoSql` binds the integer as a JS number;
+  the D1 adapter binds its decimal text, so every `i64` is stored exactly.
 - An integer above 2^53 reads back rounded, silently: `DoSql` refuses
-  integers outside ±(2^53 - 1) both ways, as the D1 adapter does.
+  integers outside ±(2^53 - 1) both ways, and the D1 adapter refuses to
+  read one (a stored one is still exact in SQL: compare it there, or read
+  it as `CAST(… AS TEXT)`).
 - `BEGIN` and `SAVEPOINT` are refused; `transactionSync` nests as a
   savepoint. Rows changed are the difference of `total_changes()` around a
   statement, which counts trigger rows as D1's `meta.changes` does.
