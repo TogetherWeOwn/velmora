@@ -1,37 +1,29 @@
-//! The scrub's catalogue (migration 0023, [`crate::scrub`]).
+//! The scrub's catalogue ([`crate::scrub`]).
 //!
-//! - One run at a time: `scrub_state.lease_token` moves on with every
-//!   take, and every write of a run names the token it took. A run whose
-//!   lease was taken over writes nothing more.
-//! - The due list is read from `extents_scrub_due` alone, a page at a
-//!   time: no statement reads more than its page of extents.
-//! - A result is one `UPDATE` of one extent. A healthy extent costs that
-//!   row and its index entry, nothing else.
-//! - The re-pin is one guarded batch: the extent goes back to `held` and
-//!   its outbox row back to `verify` together, or neither does.
+//! One run at a time owns the scrub lease. Enrollment, due-time changes
+//! and repairs are fenced by its token. Each list uses an indexed range
+//! with a hard page size; extent rows are joined by primary key.
+
+use std::collections::{BTreeMap, HashMap};
+
+use sha2::{Digest, Sha256};
 
 use super::objects::{extent_row, ms, text, uint, Cols, Stmt, EXTENT_COLS};
 use super::uploads::guarded;
 use super::SqlCatalog;
 use crate::ports::{Guard, Sql, SqlValue};
 use crate::types::{
-    BridgeError, ExtentId, Result, ScrubCandidate, ScrubResult, ScrubRun, ScrubState, UnixMs,
+    BridgeError, ExtentId, Result, ScrubCandidate, ScrubCheck, ScrubResult, ScrubRun, ScrubState,
+    UnixMs,
 };
 
-/// The due key of the index, word for word.
-macro_rules! due_key {
-    () => {
-        "COALESCE(scrub_next_at, \
-                  COALESCE(last_verified_at, released_at, created_at) + 2592000000)"
-    };
-}
-
-/// The condition of the index, word for word.
-macro_rules! scrubbed {
-    () => {
-        "(safety_state = 'released' OR scrub_next_at IS NOT NULL)"
-    };
-}
+const ENROLL_PAGE: i64 = 128;
+const PENDING_SQL: &str =
+    "SELECT id, COALESCE(released_at, created_at) FROM extents INDEXED BY extents_scrub_pending \
+    WHERE safety_state = 'released' AND scrub_enrolled = 0 AND id > ?1 ORDER BY id LIMIT ?2";
+const BACKFILL_SQL: &str =
+    "SELECT id, COALESCE(released_at, created_at) FROM extents INDEXED BY extents_scrub_enrolled \
+    WHERE scrub_enrolled = 1 AND safety_state <> 'deleted' AND id > ?1 ORDER BY id LIMIT ?2";
 
 /// The run that holds the lease is the one with token `?2`.
 macro_rules! run_holds {
@@ -66,7 +58,7 @@ pub(super) async fn state<S: Sql>(c: &SqlCatalog<S>) -> Result<ScrubState> {
         .query(
             "SELECT lease_token, lease_until, runs, checked, ok, suspect, repaired, unrecoverable, stalled, \
                incidents, bytes_read, last_run_at, last_unrecoverable_at, last_incident_at, \
-               last_incident, incident_clean FROM scrub_state WHERE id = 1",
+               last_incident, incident_clean, incident_clean_by FROM scrub_state WHERE id = 1",
             &[],
         )
         .await?;
@@ -91,50 +83,321 @@ pub(super) async fn state<S: Sql>(c: &SqlCatalog<S>) -> Result<ScrubState> {
         last_incident_at: r.opt_ms()?,
         last_incident: r.opt_text()?,
         incident_clean: r.num()?,
+        incident_clean_by: r
+            .opt_text()?
+            .and_then(|raw| serde_json::from_str(&raw).ok())
+            .unwrap_or_default(),
     })
 }
 
-/// The due query, as it runs.
+fn json(value: &impl serde::Serialize) -> Result<SqlValue> {
+    serde_json::to_string(value)
+        .map(SqlValue::Text)
+        .map_err(|_| BridgeError::Invalid("scrub schedule"))
+}
+
+/// Spread extents across the intervals, but group one extent's copies
+/// so a run can check them with one plan load. When full is a multiple
+/// of STAT, choose one of its STAT slots within the full interval.
+fn phase(id: &str, [stat, full]: [i64; 2]) -> [i64; 2] {
+    let bytes = Sha256::digest(id.as_bytes());
+    let stat_seed = u64::from_le_bytes(bytes[..8].try_into().expect("8 bytes"));
+    let full_seed = u64::from_le_bytes(bytes[8..16].try_into().expect("8 bytes"));
+    let a = (stat_seed % stat as u64) as i64;
+    let b = if full % stat == 0 {
+        a + (full_seed % (full / stat) as u64) as i64 * stat
+    } else {
+        (full_seed % full as u64) as i64
+    };
+    [a, b]
+}
+
+pub(super) async fn enroll<S: Sql>(
+    c: &SqlCatalog<S>,
+    token: u64,
+    backbones: &[String],
+    now: UnixMs,
+    intervals: [i64; 2],
+) -> Result<bool> {
+    if intervals.iter().any(|&interval| interval <= 0) {
+        return Err(BridgeError::Invalid("scrub interval"));
+    }
+    if backbones.is_empty() {
+        return Ok(false);
+    }
+    let mut labels = backbones.to_vec();
+    labels.sort_unstable();
+    labels.dedup();
+    let labels_json = json(&labels)?;
+    let mut state = Cols::new(
+        c.sql.query(
+            "SELECT cadence_backbones, cadence_after, cadence_epoch FROM scrub_state WHERE id = 1 AND lease_token = ?1",
+            &[uint(token)?],
+        ).await?.into_iter().next().ok_or(BridgeError::Invalid("scrub lease"))?,
+    );
+    let previous = state.opt_text()?.map(SqlValue::Text);
+    let changed = previous.as_ref() != Some(&labels_json);
+    let mut after = state.opt_text()?;
+    let mut epoch = state.opt_ms()?.unwrap_or(now);
+    if changed {
+        // Anchor the whole first pass, not each page, to the same epoch.
+        // On first enable the pending index holds the whole inventory.
+        epoch = now;
+        after = previous.map(|_| String::new());
+    }
+    let ids = |rows: Vec<crate::ports::Row>| -> Result<Vec<(String, UnixMs)>> {
+        rows.into_iter()
+            .map(|r| {
+                let mut row = Cols::new(r);
+                Ok((row.text()?, row.ms()?))
+            })
+            .collect()
+    };
+    let pending = ids(c
+        .sql
+        .query(PENDING_SQL, &[text(""), SqlValue::Int(ENROLL_PAGE)])
+        .await?)?;
+    let mut advance = changed;
+    let mut work: BTreeMap<String, UnixMs> = pending.iter().cloned().collect();
+    if let Some(cursor) = &after {
+        let page = ids(c
+            .sql
+            .query(BACKFILL_SQL, &[text(cursor), SqlValue::Int(ENROLL_PAGE)])
+            .await?)?;
+        after = if page.len() as i64 == ENROLL_PAGE {
+            page.last().map(|(id, _)| id.clone())
+        } else {
+            None
+        };
+        work.extend(page);
+        advance = true;
+    }
+    let mut stmts = Vec::<Stmt>::new();
+    if !work.is_empty() {
+        // One small statement per backbone, with the same bounded extent page.
+        // Conflict means a prior enrollment already established the clocks.
+        let entries: Vec<_> = work
+            .iter()
+            .map(|(id, released)| {
+                let start = epoch.max(*released);
+                let [stat, full] = phase(id, intervals);
+                (id, start.plus_ms(stat).0, start.plus_ms(full).0)
+            })
+            .collect();
+        let entries = json(&entries)?;
+        for label in &labels {
+            stmts.push((
+                concat!(
+                    "INSERT INTO scrub_copies(extent_id, backbone, stat_at, full_at) \
+                 SELECT e.id, ?1, json_extract(j.value, '$[1]'), json_extract(j.value, '$[2]') \
+                 FROM json_each(?3) j CROSS JOIN extents e ON e.id = json_extract(j.value, '$[0]') \
+                 WHERE e.safety_state <> 'deleted' AND (e.safety_state = 'released' OR e.scrub_enrolled = 1) AND ",
+                    run_holds!(),
+                    " ON CONFLICT(extent_id, backbone) DO NOTHING"
+                ),
+                vec![text(label), uint(token)?, entries.clone()],
+            ));
+        }
+        stmts.push((
+            concat!(
+                "UPDATE extents SET scrub_enrolled = 1 WHERE safety_state = 'released' \
+             AND scrub_enrolled = 0 AND id IN (SELECT value FROM json_each(?1)) AND ",
+                run_holds!()
+            ),
+            vec![
+                json(&pending.iter().map(|(id, _)| id).collect::<Vec<_>>())?,
+                uint(token)?,
+            ],
+        ));
+    }
+    if advance {
+        stmts.push((
+            "UPDATE scrub_state SET cadence_backbones = ?1, cadence_after = ?3, cadence_epoch = ?4 WHERE id = 1 AND lease_token = ?2",
+            vec![labels_json, uint(token)?, after.as_deref().map_or(SqlValue::Null, text), ms(epoch)],
+        ));
+    }
+    if !stmts.is_empty() {
+        c.sql.batch(stmts).await?;
+    }
+    Ok(pending.len() as i64 == ENROLL_PAGE || after.is_some())
+}
+
 pub(crate) fn due_sql() -> String {
     format!(
-        "SELECT {EXTENT_COLS}, scrub_result, last_scrubbed_at FROM extents \
-          INDEXED BY extents_scrub_due \
-          WHERE {scrubbed} AND {key} <= ?1 \
-          ORDER BY {key} LIMIT ?2",
-        scrubbed = scrubbed!(),
-        key = due_key!(),
+        "SELECT {EXTENT_COLS}, scrub_result, last_scrubbed_at, stat_at, full_at, stat_loss_at, full_loss_at \
+         FROM scrub_copies s INDEXED BY scrub_copies_due CROSS JOIN extents e ON e.id = s.extent_id \
+         WHERE s.backbone = ?1 AND MIN(stat_at, full_at) <= ?2 \
+         ORDER BY MIN(stat_at, full_at), s.extent_id LIMIT ?3"
     )
+}
+
+fn watch_sql() -> String {
+    format!(
+        "SELECT {EXTENT_COLS}, scrub_result, last_scrubbed_at, scrub_next_at \
+         FROM extents INDEXED BY extents_scrub_watch WHERE scrub_next_at <= ?1 \
+         ORDER BY scrub_next_at, id LIMIT ?2"
+    )
+}
+
+pub(crate) fn range_queries() -> [String; 4] {
+    [
+        due_sql(),
+        watch_sql(),
+        PENDING_SQL.into(),
+        BACKFILL_SQL.into(),
+    ]
+}
+
+fn parse_candidate(mut row: crate::ports::Row) -> Result<(ScrubCandidate, Cols)> {
+    let width = EXTENT_COLS.split(',').count();
+    if row.len() < width + 2 {
+        return Err(BridgeError::Sql("row decode: scrub columns".into()));
+    }
+    let mut extra = Cols::new(row.split_off(width));
+    let last = extra.opt_text()?.as_deref().and_then(ScrubResult::parse);
+    let last_scrubbed_at = extra.opt_ms()?;
+    Ok((
+        ScrubCandidate {
+            extent: extent_row(row)?,
+            last,
+            last_scrubbed_at,
+            watch: false,
+            checks: Vec::new(),
+        },
+        extra,
+    ))
 }
 
 pub(super) async fn due<S: Sql>(
     c: &SqlCatalog<S>,
+    backbones: &[String],
     now: UnixMs,
     limit: u32,
 ) -> Result<Vec<ScrubCandidate>> {
+    let limit = limit.min(crate::scrub::SCRUB_PAGE);
+    let page = SqlValue::Int(i64::from(limit));
+    let mut grouped = HashMap::new();
+    for row in c.sql.query(&watch_sql(), &[ms(now), page.clone()]).await? {
+        let (mut candidate, mut extra) = parse_candidate(row)?;
+        candidate.watch = true;
+        grouped.insert(
+            candidate.extent.id.clone(),
+            (UnixMs(extra.num()?), candidate),
+        );
+    }
     let sql = due_sql();
+    for backbone in backbones {
+        for row in c
+            .sql
+            .query(&sql, &[text(backbone), ms(now), page.clone()])
+            .await?
+        {
+            let (candidate, mut extra) = parse_candidate(row)?;
+            let stat = UnixMs(extra.num()?);
+            let full = UnixMs(extra.num()?);
+            let stat_loss = extra.opt_ms()?;
+            let full_loss = extra.opt_ms()?;
+            let (oldest, candidate) = grouped
+                .entry(candidate.extent.id.clone())
+                .or_insert((stat.min(full), candidate));
+            *oldest = (*oldest).min(stat.min(full));
+            for (due_at, loss_at, full) in [(stat, stat_loss, false), (full, full_loss, true)] {
+                if due_at <= now {
+                    candidate.checks.push(ScrubCheck {
+                        backbone: backbone.clone(),
+                        full,
+                        due_at,
+                        loss_at,
+                    });
+                }
+            }
+        }
+    }
+    let mut grouped: Vec<_> = grouped.into_values().collect();
+    grouped.sort_unstable_by(|(a, left), (b, right)| {
+        a.cmp(b)
+            .then_with(|| left.extent.id.as_str().cmp(right.extent.id.as_str()))
+    });
+    Ok(grouped
+        .into_iter()
+        .take(limit as usize)
+        .map(|(_, candidate)| candidate)
+        .collect())
+}
+
+pub(super) async fn advance<S: Sql>(
+    c: &SqlCatalog<S>,
+    token: u64,
+    extent: &ExtentId,
+    updates: &[(ScrubCheck, UnixMs, Option<UnixMs>)],
+) -> Result<bool> {
+    let mut stmts = Vec::with_capacity(updates.len() + 1);
+    stmts.push((
+        concat!("INSERT INTO tx_guard(ok) SELECT 0 WHERE NOT ", run_holds!()),
+        vec![text(extent.as_str()), uint(token)?],
+    ));
+    for (check, next, loss) in updates {
+        let sql = if check.full {
+            "UPDATE scrub_copies SET full_at = ?4, full_loss_at = ?5 \
+             WHERE extent_id = ?1 AND backbone = ?2 AND full_at = ?3"
+        } else {
+            "UPDATE scrub_copies SET stat_at = ?4, stat_loss_at = ?5 \
+             WHERE extent_id = ?1 AND backbone = ?2 AND stat_at = ?3"
+        };
+        stmts.push((
+            sql,
+            vec![
+                text(extent.as_str()),
+                text(&check.backbone),
+                ms(check.due_at),
+                ms(*next),
+                loss.map_or(SqlValue::Null, ms),
+            ],
+        ));
+    }
+    Ok(guarded(c, stmts).await? == Guard::Applied(()))
+}
+
+pub(super) async fn has_loss<S: Sql>(
+    c: &SqlCatalog<S>,
+    extent: &ExtentId,
+    backbones: &[String],
+) -> Result<bool> {
     let rows = c
         .sql
-        .query(&sql, &[ms(now), SqlValue::Int(i64::from(limit))])
+        .query(
+            "SELECT 1 FROM json_each(?2) j CROSS JOIN scrub_copies s \
+         ON s.extent_id = ?1 AND s.backbone = j.value \
+         WHERE s.stat_loss_at IS NOT NULL OR s.full_loss_at IS NOT NULL LIMIT 1",
+            &[text(extent.as_str()), json(&backbones)?],
+        )
         .await?;
-    let width = EXTENT_COLS.split(',').count();
-    let mut out = Vec::with_capacity(rows.len());
-    for mut row in rows {
-        if row.len() != width + 2 {
-            return Err(crate::types::BridgeError::Sql(
-                "row decode: scrub columns".into(),
-            ));
-        }
-        let extra = row.split_off(width);
-        let mut r = Cols::new(extra);
-        let last = r.opt_text()?.as_deref().and_then(ScrubResult::parse);
-        let last_scrubbed_at = r.opt_ms()?;
-        out.push(ScrubCandidate {
-            extent: extent_row(row)?,
-            last,
-            last_scrubbed_at,
-        });
-    }
-    Ok(out)
+    Ok(!rows.is_empty())
+}
+
+pub(super) async fn retire<S: Sql>(
+    c: &SqlCatalog<S>,
+    token: u64,
+    extent: &ExtentId,
+) -> Result<bool> {
+    let guard = concat!(
+        "INSERT INTO tx_guard(ok) SELECT 0 WHERE NOT ",
+        run_holds!(),
+        " OR NOT EXISTS (SELECT 1 FROM extents WHERE id = ?1 AND safety_state = 'deleted')"
+    );
+    let key = text(extent.as_str());
+    let stmts = vec![
+        (guard, vec![key.clone(), uint(token)?]),
+        (
+            "DELETE FROM scrub_copies WHERE extent_id = ?1",
+            vec![key.clone()],
+        ),
+        (
+            "UPDATE extents SET scrub_enrolled = 0, scrub_next_at = NULL WHERE id = ?1",
+            vec![key],
+        ),
+    ];
+    Ok(guarded(c, stmts).await? == Guard::Applied(()))
 }
 
 pub(super) async fn record<S: Sql>(
@@ -143,7 +406,7 @@ pub(super) async fn record<S: Sql>(
     extent: &ExtentId,
     result: ScrubResult,
     now: UnixMs,
-    next_at: UnixMs,
+    next_at: Option<UnixMs>,
 ) -> Result<bool> {
     let sql = concat!(
         "UPDATE extents SET scrub_result = ?3, last_scrubbed_at = ?4, scrub_next_at = ?5 \
@@ -159,7 +422,7 @@ pub(super) async fn record<S: Sql>(
                 uint(token)?,
                 text(result.as_str()),
                 ms(now),
-                ms(next_at),
+                next_at.map_or(SqlValue::Null, ms),
             ],
         )
         .await?;
@@ -217,7 +480,7 @@ pub(super) async fn block<S: Sql>(
     let changed = c
         .sql
         .exec(
-            "UPDATE scrub_state SET last_incident = ?2, incident_clean = 0 \
+            "UPDATE scrub_state SET last_incident = ?2, incident_clean = 0, incident_clean_by = NULL \
              WHERE id = 1 AND lease_token = ?1",
             &[uint(token)?, text(&labels)],
         )
@@ -298,6 +561,15 @@ pub(super) async fn repin<S: Sql>(
              ON CONFLICT(extent_id, backbone, verified_at) DO NOTHING",
             vec![text(extent.as_str()), text(&labels), ms(now)],
         ));
+        // The existing verify job now owns these failures. If the repair
+        // releases, require a fresh finding before another re-pin, and
+        // still give the repaired copy its own scheduled BODY pass.
+        stmts.push((
+            "UPDATE scrub_copies SET stat_loss_at = NULL, full_loss_at = NULL, \
+             full_at = MIN(full_at, ?3) WHERE extent_id = ?1 \
+             AND backbone IN (SELECT value FROM json_each(?2))",
+            vec![text(extent.as_str()), text(&labels), ms(next_at)],
+        ));
     }
     Ok(guarded(c, stmts).await? == Guard::Applied(()))
 }
@@ -323,7 +595,7 @@ pub(super) async fn end<S: Sql>(
                bytes_read = bytes_read + ?10, last_run_at = ?1, \
                last_unrecoverable_at = CASE WHEN ?7 > 0 THEN ?1 ELSE last_unrecoverable_at END, \
                last_incident_at = CASE WHEN ?11 IS NOT NULL THEN ?1 ELSE last_incident_at END, \
-               last_incident = ?12, incident_clean = ?13 \
+               last_incident = ?12, incident_clean = ?13, incident_clean_by = ?14 \
              WHERE id = 1 AND lease_token = ?2",
             &[
                 ms(now),
@@ -345,6 +617,11 @@ pub(super) async fn end<S: Sql>(
                     ),
                 },
                 uint(run.incident_clean)?,
+                if run.incident_clean_by.is_empty() {
+                    SqlValue::Null
+                } else {
+                    json(&run.incident_clean_by)?
+                },
             ],
         )
         .await?;

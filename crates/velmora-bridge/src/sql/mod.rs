@@ -140,8 +140,8 @@ fn overlay(load: &mut [ProviderLoad], held: &[crate::gate::GateLoad]) {
 
 /// The scrub's due query, word for word as it runs (for a test of its
 /// query plan).
-pub fn scrub_due_sql() -> String {
-    scrub::due_sql()
+pub fn scrub_range_queries() -> [String; 4] {
+    scrub::range_queries()
 }
 
 /// The catalogue over any [`Sql`] backend.
@@ -990,12 +990,36 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
     async fn scrub_state(&self) -> Result<crate::types::ScrubState> {
         scrub::state(self).await
     }
+    async fn scrub_enroll(
+        &self,
+        token: u64,
+        backbones: &[String],
+        now: UnixMs,
+        intervals_ms: [i64; 2],
+    ) -> Result<bool> {
+        scrub::enroll(self, token, backbones, now, intervals_ms).await
+    }
     async fn scrub_due(
         &self,
+        backbones: &[String],
         now: UnixMs,
         limit: u32,
     ) -> Result<Vec<crate::types::ScrubCandidate>> {
-        scrub::due(self, now, limit).await
+        scrub::due(self, backbones, now, limit).await
+    }
+    async fn scrub_advance(
+        &self,
+        token: u64,
+        extent: &ExtentId,
+        updates: &[(crate::types::ScrubCheck, UnixMs, Option<UnixMs>)],
+    ) -> Result<bool> {
+        scrub::advance(self, token, extent, updates).await
+    }
+    async fn scrub_has_loss(&self, extent: &ExtentId, backbones: &[String]) -> Result<bool> {
+        scrub::has_loss(self, extent, backbones).await
+    }
+    async fn scrub_retire(&self, token: u64, extent: &ExtentId) -> Result<bool> {
+        scrub::retire(self, token, extent).await
     }
     async fn scrub_record(
         &self,
@@ -1003,7 +1027,7 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
         extent: &ExtentId,
         result: crate::types::ScrubResult,
         now: UnixMs,
-        next_at: UnixMs,
+        next_at: Option<UnixMs>,
     ) -> Result<bool> {
         scrub::record(self, token, extent, result, now, next_at).await
     }

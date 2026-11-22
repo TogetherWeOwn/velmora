@@ -521,6 +521,9 @@ impl RusqliteSql {
         db.apply(MIGRATION_0025)?;
         db.apply(MIGRATION_0026)?;
         db.apply(MIGRATION_0023)?;
+        db.apply(include_str!(
+            "../../../workers/s3-bridge/migrations/0024_scrub_cadence.sql"
+        ))?;
         Ok(db)
     }
 

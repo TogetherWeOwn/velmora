@@ -1634,6 +1634,17 @@ pub struct ScrubCandidate {
     /// `None` = never checked, or a value this version does not know.
     pub last: Option<ScrubResult>,
     pub last_scrubbed_at: Option<UnixMs>,
+    pub watch: bool,
+    pub checks: Vec<ScrubCheck>,
+}
+
+/// An independently due check of one backbone's copy of an extent.
+#[derive(Clone, Debug)]
+pub struct ScrubCheck {
+    pub backbone: String,
+    pub full: bool,
+    pub due_at: UnixMs,
+    pub loss_at: Option<UnixMs>,
 }
 
 /// The totals of one scrub run, added to `scrub_state` when it ends.
@@ -1654,6 +1665,8 @@ pub struct ScrubRun {
     pub blocked: Vec<String>,
     /// [`ScrubState::incident_clean`] when the run ends.
     pub incident_clean: u64,
+    /// Independent clean streaks for the blocked backbones.
+    pub incident_clean_by: Vec<(String, u64)>,
     /// Ciphertext bytes read from Usenet.
     pub bytes_read: u64,
     /// Articles a provider did not serve intact that another one did,
@@ -1721,6 +1734,8 @@ pub struct ScrubState {
     /// there sets it back to 0, and at
     /// [`crate::scrub::INCIDENT_MIN_EXTENTS`] the incidents clear.
     pub incident_clean: u64,
+    /// Independent clean streaks for the blocked backbones.
+    pub incident_clean_by: Vec<(String, u64)>,
 }
 
 impl ScrubState {

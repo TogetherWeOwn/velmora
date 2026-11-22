@@ -1501,6 +1501,7 @@ async fn ddl_applies_cleanly_with_fixed_times() {
             "restore_state",
             "rollback_stamp",
             "scan_cursors",
+            "scrub_copies",
             "scrub_state",
             "tx_guard",
             "upload_part_extents",
@@ -3388,6 +3389,24 @@ fn scrub_settings_are_bounded() {
     let cfg = load(&prod).unwrap();
     assert!(!cfg.scrub.on, "off as shipped");
     assert_eq!(cfg.scrub, velmora_bridge::config::ScrubConfig::default());
+    assert_eq!(
+        (cfg.scrub.interval_days, cfg.scrub.full_interval_days),
+        (30, 90)
+    );
+    let custom = with(
+        &prod,
+        &[
+            ("SCRUB_INTERVAL_DAYS", "7"),
+            ("SCRUB_FULL_INTERVAL_DAYS", "19"),
+        ],
+    )
+    .unwrap()
+    .scrub;
+    assert_eq!((custom.interval_days, custom.full_interval_days), (7, 19));
+    for name in ["SCRUB_INTERVAL_DAYS", "SCRUB_FULL_INTERVAL_DAYS"] {
+        assert_eq!(with(&prod, &[(name, "0")]).map(|_| ()), invalid(name));
+        assert_eq!(with(&prod, &[(name, "3651")]).map(|_| ()), invalid(name));
+    }
     assert!(with(&prod, &[("SCRUB", "on")]).unwrap().scrub.on);
     for bad in ["1", "ON", "true"] {
         assert_eq!(with(&prod, &[("SCRUB", bad)]).map(|_| ()), invalid("SCRUB"));

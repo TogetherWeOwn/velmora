@@ -130,6 +130,12 @@ impl World {
     /// that lacks it, and runs verify and release: the extent ends
     /// released on both backbones.
     async fn released(&self, key: &str, seed: u8) -> Obj {
+        let o = self.released_unenrolled(key, seed).await;
+        self.align_clocks(&o).await;
+        o
+    }
+
+    async fn released_unenrolled(&self, key: &str, seed: u8) -> Obj {
         let plain = pattern(seed, PLAIN);
         self.rig
             .put(&self.signer, BUCKET, key, &plain)
@@ -186,7 +192,73 @@ impl World {
         }
         self.drive(&o).await;
         assert_eq!(self.safety_state(&o).await, "released");
+        self.align_clocks(&o).await;
         o
+    }
+
+    // Older repair tests bring all STAT clocks due at once. Separate tests
+    // below exercise enrollment, staggering, and independently due clocks.
+    async fn align_clocks(&self, o: &Obj) {
+        let c = &self.bridge().catalog;
+        let now = self.bridge().clock.now();
+        let token = c.scrub_take(now, now.plus_secs(60)).await.unwrap().unwrap();
+        let cfg = &self.bridge().cfg;
+        let names: Vec<String> = cfg
+            .providers
+            .iter()
+            .filter(|p| p.enabled && p.read && p.release)
+            .map(|p| p.backbone.clone())
+            .collect();
+        c.scrub_enroll(token, &names, now, [30 * 86_400_000, 90 * 86_400_000])
+            .await
+            .unwrap();
+        c.scrub_free(token, now).await.unwrap();
+        c.sql
+            .exec(
+                "UPDATE scrub_copies SET stat_at = ?2, full_at = ?3 WHERE extent_id = ?1",
+                &[
+                    SqlValue::Text(o.extent.as_str().to_owned()),
+                    SqlValue::Int(now.plus_secs(30 * DAY_SECS).0),
+                    SqlValue::Int(now.plus_secs(90 * DAY_SECS).0),
+                ],
+            )
+            .await
+            .unwrap();
+    }
+
+    async fn set_clocks(&self, o: &Obj, backbone: &str, stat_at: UnixMs, full_at: UnixMs) {
+        self.bridge().catalog.sql.exec(
+            "UPDATE scrub_copies SET stat_at = ?3, full_at = ?4 WHERE extent_id = ?1 AND backbone = ?2",
+            &[SqlValue::Text(o.extent.as_str().to_owned()), SqlValue::Text(backbone.to_owned()), SqlValue::Int(stat_at.0), SqlValue::Int(full_at.0)],
+        ).await.unwrap();
+    }
+
+    async fn full_checks_now(&self, o: &Obj) {
+        let now = self.bridge().clock.now();
+        for name in ["alpha", "beta"] {
+            self.set_clocks(o, name, now.plus_secs(30 * DAY_SECS), now)
+                .await;
+        }
+    }
+
+    async fn clocks(&self, o: &Obj, backbone: &str) -> (UnixMs, UnixMs) {
+        let result = self
+            .bridge()
+            .catalog
+            .sql
+            .query(
+                "SELECT stat_at, full_at FROM scrub_copies WHERE extent_id = ?1 AND backbone = ?2",
+                &[
+                    SqlValue::Text(o.extent.as_str().to_owned()),
+                    SqlValue::Text(backbone.to_owned()),
+                ],
+            )
+            .await
+            .unwrap();
+        let [SqlValue::Int(stat), SqlValue::Int(full)] = result[0][..] else {
+            panic!("missing copy clocks for {backbone}");
+        };
+        (UnixMs(stat), UnixMs(full))
     }
 
     /// Runs the object's jobs until its outbox row is `done`.
@@ -342,10 +414,9 @@ impl World {
     }
 }
 
-/// The first check of a released extent is due 30 days after its last
-/// verification, not before.
+/// A released extent is not checked before either copy clock is due.
 #[tokio::test(flavor = "current_thread")]
-async fn nothing_is_due_before_thirty_days_after_the_last_verification() {
+async fn nothing_is_read_before_the_first_copy_deadline() {
     let w = world().await;
     let o = w.released("a", 1).await;
     w.advance_secs(29 * DAY_SECS);
@@ -354,11 +425,10 @@ async fn nothing_is_due_before_thirty_days_after_the_last_verification() {
     assert_eq!(w.result(&o).await, "NULL");
 }
 
-/// A healthy extent is read back whole from Usenet, recorded `ok`, and is
-/// due again after `SCRUB_INTERVAL_DAYS`. Nothing is posted and nothing
-/// is written to a blob store.
+/// On a healthy monthly STAT pass only the STAT clocks move. Nothing is
+/// posted and nothing is written to a blob store.
 #[tokio::test(flavor = "current_thread")]
-async fn a_healthy_extent_is_read_back_recorded_ok_and_due_again_after_the_interval() {
+async fn a_healthy_stat_pass_moves_only_the_stat_clocks() {
     let w = world().await;
     let o = w.released("a", 1).await;
     w.advance_secs(31 * DAY_SECS);
@@ -366,6 +436,7 @@ async fn a_healthy_extent_is_read_back_recorded_ok_and_due_again_after_the_inter
     let safety_puts = w.bridge().safety.puts.borrow().len();
     let cache_puts = w.bridge().cache.puts.borrow().len();
     let now = w.bridge().clock.now();
+    let (stat, full) = w.clocks(&o, "alpha").await;
 
     let run = w.scrub().await;
 
@@ -374,10 +445,18 @@ async fn a_healthy_extent_is_read_back_recorded_ok_and_due_again_after_the_inter
         (1, 1, 0, 0)
     );
     assert_eq!(run.ended, ScrubEnd::Idle);
-    assert!(run.bytes_read > PLAIN as u64);
+    assert_eq!(
+        run.bytes_read, 0,
+        "the monthly STAT pass does not read BODY"
+    );
     assert_eq!(w.result(&o).await, "ok");
     assert_eq!(w.scrubbed_at(&o).await, Some(now.0));
-    assert_eq!(w.next_at(&o).await, Some(now.0 + 30 * 86_400_000));
+    for backbone in ["alpha", "beta"] {
+        assert_eq!(
+            w.clocks(&o, backbone).await,
+            (stat.plus_secs(30 * DAY_SECS), full)
+        );
+    }
     assert_eq!(w.posts(), posts, "a check posts nothing");
     assert_eq!(w.bridge().safety.puts.borrow().len(), safety_puts);
     assert_eq!(w.bridge().cache.puts.borrow().len(), cache_puts);
@@ -387,11 +466,158 @@ async fn a_healthy_extent_is_read_back_recorded_ok_and_due_again_after_the_inter
     assert_eq!(state.lease_until, None, "the run gave the lease back");
     assert!(alerts().is_empty(), "{:?}", alerts());
 
-    // Checked again only once the interval is over.
-    w.advance_secs(29 * DAY_SECS);
+    // A late check retains its scheduled phase, rather than drifting.
+    w.advance_secs(28 * DAY_SECS);
     assert_eq!(w.scrub().await.checked, 0);
     w.advance_secs(DAY_SECS);
     assert_eq!(w.scrub().await.ok, 1);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn mixed_due_kinds_advance_only_their_own_backbone_and_interval() {
+    let w = world_with(|cfg| {
+        cfg.scrub.interval_days = 7;
+        cfg.scrub.full_interval_days = 19;
+    })
+    .await;
+    let o = w.released("mixed", 5).await;
+    let now = w.bridge().clock.now();
+    let later = now.plus_secs(100 * DAY_SECS);
+    w.set_clocks(&o, "alpha", now, later).await;
+    w.set_clocks(&o, "beta", later, now).await;
+    // An alpha BODY would fail; only alpha STAT and beta BODY are due.
+    w.servers[0].set_body_gone(true).await;
+    let run = w.scrub().await;
+    assert_eq!((run.checked, run.ok, run.suspect), (1, 1, 0));
+    assert!(run.bytes_read > PLAIN as u64);
+    assert_eq!(
+        w.clocks(&o, "alpha").await,
+        (now.plus_secs(7 * DAY_SECS), later)
+    );
+    assert_eq!(
+        w.clocks(&o, "beta").await,
+        (later, now.plus_secs(19 * DAY_SECS))
+    );
+    w.advance_secs(7 * DAY_SECS - 1);
+    assert_eq!(w.scrub().await.checked, 0);
+    w.advance_secs(1);
+    assert_eq!(w.scrub().await.bytes_read, 0);
+    w.advance_secs(12 * DAY_SECS);
+    assert!(w.scrub().await.bytes_read > PLAIN as u64);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn beta_corruption_survives_stat_and_alpha_full_but_not_beta_full() {
+    let w = world().await;
+    let o = w.released("beta-corrupt", 6).await;
+    let id = &w.plan(&o).await[0].message_id;
+    assert!(w.servers[1].replace_posted_body(id, b"not yEnc\r\n").await);
+    assert!(w.bridge().safety.lose(&o.extent.safety_key()));
+    let now = w.bridge().clock.now();
+    let beta_full = now.plus_secs(DAY_SECS);
+    let later = now.plus_secs(100 * DAY_SECS);
+    w.set_clocks(&o, "alpha", later, now).await;
+    w.set_clocks(&o, "beta", now, beta_full).await;
+
+    let first = w.scrub().await;
+    assert_eq!((first.ok, first.suspect), (1, 0));
+    assert_eq!(w.clocks(&o, "alpha").await.1, now.plus_secs(90 * DAY_SECS));
+    assert_eq!(w.clocks(&o, "beta").await.1, beta_full);
+    w.advance_secs(DAY_SECS);
+    assert_eq!(w.scrub().await.suspect, 1);
+    w.advance_secs(w.bridge().cfg.scrub.confirm_secs);
+    assert_eq!(w.scrub().await.repaired, 1);
+    assert_eq!(w.stage(&o).await, "verify");
+    assert!(w.has_safety(&o));
+    assert_eq!(w.clocks(&o, "alpha").await.1, now.plus_secs(90 * DAY_SECS));
+    assert!(alerts()
+        .iter()
+        .any(|a| a.contains("source=usenet") && a.contains("lacking=[beta]")));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn enrollment_spreads_first_checks_and_preserves_existing_clocks() {
+    let w = world().await;
+    let a = w.released_unenrolled("new-a", 8).await;
+    let b = w.released_unenrolled("new-b", 9).await;
+    let now = w.bridge().clock.now();
+    assert_eq!(w.scrub().await.checked, 0);
+    let a_alpha = w.clocks(&a, "alpha").await;
+    let b_alpha = w.clocks(&b, "alpha").await;
+    assert_ne!(a_alpha, b_alpha);
+    for o in [&a, &b] {
+        for name in ["alpha", "beta"] {
+            let (stat, full) = w.clocks(o, name).await;
+            assert!((now..now.plus_secs(30 * DAY_SECS)).contains(&stat));
+            assert!((now..now.plus_secs(90 * DAY_SECS)).contains(&full));
+        }
+    }
+    let c = &w.bridge().catalog;
+    let token = c.scrub_take(now, now.plus_secs(60)).await.unwrap().unwrap();
+    assert!(c
+        .scrub_repin(token, &a.extent, (now, now.plus_secs(3600)), &[])
+        .await
+        .unwrap());
+    c.scrub_enroll(
+        token,
+        &["alpha".into(), "beta".into(), "gamma".into()],
+        now,
+        [30 * 86_400_000, 90 * 86_400_000],
+    )
+    .await
+    .unwrap();
+    assert_eq!(w.clocks(&a, "alpha").await, a_alpha);
+    assert!(w.clocks(&a, "gamma").await.1 >= now);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_copy_pass_cannot_clear_or_confirm_another_backbones_loss() {
+    let w = world().await;
+    let o = w.released("independent-confirm", 10).await;
+    let now = w.bridge().clock.now();
+    let later = now.plus_secs(100 * DAY_SECS);
+    w.set_clocks(&o, "alpha", now, later).await;
+    w.set_clocks(&o, "beta", now.plus_secs(1800), later).await;
+    w.hide(0, &o, 0).await;
+    assert_eq!(w.scrub().await.suspect, 1);
+    w.advance_secs(1800);
+    assert_eq!(w.scrub().await.ok, 0);
+    assert_eq!(w.result(&o).await, "suspect");
+
+    w.advance_secs(1800);
+    w.set_clocks(&o, "beta", w.bridge().clock.now(), later)
+        .await;
+    w.hide(1, &o, 1).await;
+    assert_eq!(w.scrub().await.repaired, 1);
+    assert_eq!(w.scalar(
+        "SELECT group_concat(backbone) FROM verifications WHERE extent_id = ?1 AND provider_id = 'scrub'", &o.extent,
+    ).await, "alpha");
+    assert_ne!(
+        w.scalar(
+            "SELECT stat_loss_at FROM scrub_copies WHERE extent_id = ?1 AND backbone = 'beta'",
+            &o.extent
+        )
+        .await,
+        "NULL"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn clean_checks_clear_only_the_observed_backbones_incident() {
+    let w = world().await;
+    let o = w.released("independent-incident", 11).await;
+    let now = w.bridge().clock.now();
+    let later = now.plus_secs(DAY_SECS);
+    w.set_clocks(&o, "alpha", now, later).await;
+    w.set_clocks(&o, "beta", later, later).await;
+    w.bridge().catalog.sql.exec(
+        r#"UPDATE scrub_state SET last_incident = '["alpha","beta"]', incident_clean_by = '[["alpha",7],["beta",7]]'"#,
+        &[],
+    ).await.unwrap();
+    assert_eq!(w.scrub().await.ok, 1);
+    let state = w.state().await;
+    assert_eq!(state.blocked(), ["beta"]);
+    assert_eq!(state.incident_clean_by, [("beta".into(), 7)]);
 }
 
 /// An article lost on one backbone: seen once it is only `suspect`;
@@ -583,10 +809,9 @@ async fn a_loss_with_no_intact_copy_anywhere_is_unrecoverable_and_alerted() {
     assert_eq!(back.repaired, 1, "beta has it again: repaired from Usenet");
 }
 
-/// No free slot for the check: the run ends and records nothing for the
-/// extent, which stays due.
+/// A busy backbone cannot complete its check or block later healthy work.
 #[tokio::test(flavor = "current_thread")]
-async fn a_provider_without_a_free_slot_ends_the_run_and_nothing_is_recorded() {
+async fn a_provider_without_a_free_slot_defers_only_its_own_check() {
     let w = world_with(|cfg| {
         for p in &mut cfg.providers {
             p.max_conns = 1;
@@ -595,7 +820,11 @@ async fn a_provider_without_a_free_slot_ends_the_run_and_nothing_is_recorded() {
     })
     .await;
     let o = w.released("a", 6).await;
+    let healthy = w.released("b", 7).await;
     w.advance_secs(31 * DAY_SECS);
+    let now = w.bridge().clock.now();
+    let later = now.plus_secs(30 * DAY_SECS);
+    w.set_clocks(&healthy, "beta", later, later).await;
     // Another job holds beta's only slot.
     let beta = w.bridge().cfg.providers[1].clone();
     let held = w
@@ -612,9 +841,19 @@ async fn a_provider_without_a_free_slot_ends_the_run_and_nothing_is_recorded() {
     assert!(held.is_some());
 
     let run = w.scrub().await;
-    assert_eq!((run.checked, run.ended), (0, ScrubEnd::Busy));
+    assert_eq!((run.checked, run.ended), (1, ScrubEnd::Idle));
+    assert_eq!(w.result(&healthy).await, "ok");
     assert_eq!(w.result(&o).await, "NULL");
     assert_eq!(w.next_at(&o).await, None);
+    let now = w.bridge().clock.now();
+    assert!(
+        w.clocks(&o, "alpha").await.0 > now,
+        "alpha completed independently"
+    );
+    assert_eq!(
+        w.clocks(&o, "beta").await.0,
+        now.plus_secs(w.bridge().cfg.scrub.confirm_secs)
+    );
 }
 
 /// The breaker: 8 extents of 8 lacking articles on one backbone is a
@@ -822,35 +1061,66 @@ async fn an_extent_of_a_deleted_object_is_skipped_and_not_re_pinned() {
         puts,
         "no copy written"
     );
-    // Not looked at again before the interval.
+    // Not even selected again at the confirmation interval.
     w.advance_secs(3600);
-    assert_eq!(w.scrub().await.checked, 0);
-}
+    let catalog = &w.bridge().catalog;
+    let labels = ["alpha".into(), "beta".into()];
+    let now = w.bridge().clock.now();
+    assert!(catalog.scrub_due(&labels, now, 8).await.unwrap().is_empty());
 
-/// The due list is read from its index, a page at a time.
-#[tokio::test(flavor = "current_thread")]
-async fn the_due_list_is_read_from_its_index() {
-    let w = world().await;
-    let plan = w
-        .bridge()
-        .catalog
+    // Once GC has marked it deleted, remove its indexed schedules.
+    catalog
         .sql
-        .query(
-            "EXPLAIN QUERY PLAN SELECT id FROM extents INDEXED BY extents_scrub_due \
-              WHERE (safety_state = 'released' OR scrub_next_at IS NOT NULL) \
-                AND COALESCE(scrub_next_at, \
-                  COALESCE(last_verified_at, released_at, created_at) + 2592000000) <= ?1 \
-              ORDER BY COALESCE(scrub_next_at, \
-                  COALESCE(last_verified_at, released_at, created_at) + 2592000000) LIMIT 8",
-            &[SqlValue::Int(0)],
+        .exec(
+            "UPDATE extents SET safety_state = 'deleted' WHERE id = ?1",
+            &[SqlValue::Text(o.extent.as_str().into())],
         )
         .await
         .unwrap();
-    let text = format!("{plan:?}");
-    assert!(text.contains("extents_scrub_due"), "{text}");
+    w.advance_secs(30 * DAY_SECS);
+    assert_eq!(w.scrub().await.checked, 0);
+    assert_eq!(
+        w.scalar(
+            "SELECT COUNT(*) FROM scrub_copies WHERE extent_id = ?1",
+            &o.extent
+        )
+        .await,
+        "0"
+    );
+}
+
+/// A 20,000-row ready backlog still reads just one page and its PK joins.
+#[tokio::test(flavor = "current_thread")]
+async fn due_work_is_bounded_even_when_twenty_thousand_copies_are_due() {
+    let w = world().await;
+    let c = &w.bridge().catalog;
+    c.sql.exec(
+        "WITH RECURSIVE n(x) AS (VALUES (1) UNION ALL SELECT x+1 FROM n WHERE x < 20000) \
+         INSERT INTO extents(id,bucket_id,state,plain_size,cipher_size,media_header,plain_md5,plain_sha256,cipher_sha256,safety_state,created_at) \
+         SELECT printf('fixture-%05d', x), ?1, 'committed', 1, 65, zeroblob(48), zeroblob(16), zeroblob(32), zeroblob(32), 'released', 0 FROM n",
+        &[SqlValue::Text(w.bucket.id.as_str().to_owned())],
+    ).await.unwrap();
+    c.sql
+        .exec(
+            "INSERT INTO scrub_copies(extent_id,backbone,stat_at,full_at) \
+         SELECT id, 'alpha', 0, 100 FROM extents",
+            &[],
+        )
+        .await
+        .unwrap();
+    c.sql.inner.reset_read_stats();
+    let due = c
+        .scrub_due(&["alpha".into()], UnixMs(0), u32::MAX)
+        .await
+        .unwrap();
+    assert_eq!(due.len(), 8);
+    assert_eq!(due[0].extent.id.as_str(), "fixture-00001");
+    assert_eq!(due[7].extent.id.as_str(), "fixture-00008");
+    let reads = c.sql.inner.read_stats();
+    assert_eq!((reads.queries, reads.rows), (2, 8));
     assert!(
-        !text.contains("TEMP B-TREE"),
-        "no sort outside the index: {text}"
+        reads.vm_steps < 1000,
+        "an index page, not a scan: {reads:?}"
     );
 }
 
@@ -885,8 +1155,10 @@ async fn a_healthy_check_writes_its_result_and_the_run_its_slots() {
     }
     assert_eq!(extents, 4 * 2, "the result and its index entry, per extent");
     assert_eq!(state, 2, "the lease taken, the totals added");
+    let copies = spent.table("scrub_copies");
+    assert_eq!(copies, 4 * 2 * 2, "each STAT clock and its index entry");
     // Everything else is the run's provider slots, kept across extents.
-    assert_eq!(spent.billed(), extents + state + slots);
+    assert_eq!(spent.billed(), extents + copies + state + slots);
     let one = {
         let w = world().await;
         let _ = w.released("a", 70).await;
@@ -1026,6 +1298,7 @@ async fn a_provider_past_its_retention_is_not_asked_for_presence() {
     dst.quit().await;
     w.drive(&o).await;
     assert_eq!(w.safety_state(&o).await, "released");
+    w.align_clocks(&o).await;
     // Past its 30 days the short account no longer has them.
     w.advance_secs(31 * DAY_SECS);
     for row in w.plan(&o).await {
@@ -1079,7 +1352,7 @@ async fn a_run_whose_lease_was_taken_writes_nothing() {
     assert_ne!(old, new);
     let next = now.plus_secs(60);
     assert!(!c
-        .scrub_record(old, &o.extent, ScrubResult::Ok, now, next)
+        .scrub_record(old, &o.extent, ScrubResult::Ok, now, Some(next))
         .await
         .unwrap());
     assert!(!c.scrub_drop(old, &o.extent).await.unwrap());
@@ -1094,7 +1367,7 @@ async fn a_run_whose_lease_was_taken_writes_nothing() {
     assert_eq!(w.state().await.runs, 0);
     // The run that holds it writes.
     assert!(c
-        .scrub_record(new, &o.extent, ScrubResult::Ok, now, next)
+        .scrub_record(new, &o.extent, ScrubResult::Ok, now, Some(next))
         .await
         .unwrap());
 }
@@ -1121,7 +1394,7 @@ async fn the_re_pin_is_refused_unless_released_done_and_live() {
     let held = w.rig.live(&w.bucket, "held").await.unwrap().1.remove(0);
     assert!(!c.scrub_repin(token, &held.id, at, &[]).await.unwrap());
     // Released, but its outbox row is not `done`.
-    let o = w.released("a", 112).await;
+    let o = w.released_unenrolled("a", 112).await;
     c.sql
         .exec(
             "UPDATE outbox SET stage = 'verify' WHERE extent_id = ?1",
@@ -1131,14 +1404,14 @@ async fn the_re_pin_is_refused_unless_released_done_and_live() {
         .unwrap();
     assert!(!c.scrub_repin(token, &o.extent, at, &[]).await.unwrap());
     // Released and done, but no live object holds it.
-    let gone = w.released("b", 113).await;
+    let gone = w.released_unenrolled("b", 113).await;
     w.rig
         .call(&w.signer, Method::Delete, &path(BUCKET, "b"), &[], &[], b"")
         .await
         .expect(204);
     assert!(!c.scrub_repin(token, &gone.extent, at, &[]).await.unwrap());
     // Released, done and live: re-pinned.
-    let ok = w.released("c", 114).await;
+    let ok = w.released_unenrolled("c", 114).await;
     assert!(c.scrub_repin(token, &ok.extent, at, &[]).await.unwrap());
     assert_eq!(w.safety_state(&ok).await, "held");
     assert_eq!(w.stage(&ok).await, "verify");
@@ -1206,7 +1479,7 @@ async fn bodies_no_provider_serves_are_never_released_on_stat_alone() {
     })
     .await;
     let o = w.released("a", 140).await;
-    w.advance_secs(31 * DAY_SECS);
+    w.full_checks_now(&o).await;
     for s in &w.servers {
         s.set_body_gone(true).await;
     }
@@ -1327,24 +1600,36 @@ async fn the_read_gets_the_slot_the_stat_session_held() {
     assert_eq!(w.result(&p).await, "ok");
 }
 
-/// The due query as it runs is read from its index.
+/// All scheduler listings use bounded ranges on their actual indexes.
 #[tokio::test(flavor = "current_thread")]
-async fn the_due_query_as_it_runs_uses_its_index() {
+async fn scheduler_queries_use_indexed_ranges_without_sorting() {
     let w = world().await;
-    let sql = format!(
-        "EXPLAIN QUERY PLAN {}",
-        velmora_bridge::sql::scrub_due_sql()
-    );
-    let plan = w
-        .bridge()
-        .catalog
-        .sql
-        .query(&sql, &[SqlValue::Int(0), SqlValue::Int(8)])
-        .await
-        .unwrap();
-    let text = format!("{plan:?}");
-    assert!(text.contains("extents_scrub_due"), "{text}");
-    assert!(!text.contains("TEMP B-TREE"), "{text}");
+    use SqlValue::{Int, Text};
+    let cases = [
+        (
+            "scrub_copies_due",
+            vec![Text("alpha".into()), Int(0), Int(8)],
+        ),
+        ("extents_scrub_watch", vec![Int(0), Int(8)]),
+        ("extents_scrub_pending", vec![Text(String::new()), Int(128)]),
+        (
+            "extents_scrub_enrolled",
+            vec![Text(String::new()), Int(128)],
+        ),
+    ];
+    for (query, (index, bind)) in velmora_bridge::sql::scrub_range_queries()
+        .into_iter()
+        .zip(cases)
+    {
+        let sql = format!("EXPLAIN QUERY PLAN {query}");
+        let plan = w.bridge().catalog.sql.query(&sql, &bind).await.unwrap();
+        let text = format!("{plan:?}");
+        assert!(text.contains("SEARCH ") && text.contains(index), "{text}");
+        assert!(
+            !text.contains("TEMP B-TREE") && !text.contains("SCAN "),
+            "{text}"
+        );
+    }
 }
 
 /// Two backbones whose providers share one pool of slots: the run's kept
@@ -1561,7 +1846,8 @@ async fn a_read_that_breaks_off_is_deferred_and_the_run_goes_on() {
     let w = world().await;
     let a = w.released("a", 205).await;
     let b = w.released("b", 206).await;
-    w.advance_secs(31 * DAY_SECS);
+    w.full_checks_now(&a).await;
+    w.full_checks_now(&b).await;
     for s in &w.servers {
         s.drop_next_bodies(1000).await;
     }
@@ -1727,7 +2013,7 @@ async fn a_run_that_fails_at_its_start_keeps_the_incidents() {
 async fn a_backbone_that_does_not_serve_what_it_says_it_holds_is_read_in_full() {
     let w = world().await;
     let o = w.released("a", 250).await;
-    w.advance_secs(31 * DAY_SECS);
+    w.full_checks_now(&o).await;
     // Alpha serves no body (but answers STAT); beta serves them all.
     w.servers[0].set_body_gone(true).await;
     let first = w.scrub().await;

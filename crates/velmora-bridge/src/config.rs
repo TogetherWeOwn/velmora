@@ -559,9 +559,10 @@ pub const DEFAULT_SCRUB_EXTENTS_PER_RUN: u32 = 96;
 /// Drill connections one scrub run reads over when `SCRUB_SOCKETS` is
 /// unset: 2 of the 14 production drill connections.
 pub const DEFAULT_SCRUB_SOCKETS: u32 = 2;
-/// Days between two scrubs of one extent (`SCRUB_INTERVAL_DAYS`): H6,
-/// every extent at least every 30 days.
+/// Days between STAT passes of each copy (`SCRUB_INTERVAL_DAYS`).
 pub const DEFAULT_SCRUB_INTERVAL_DAYS: u32 = 30;
+/// Days between full read-backs of each copy (`SCRUB_FULL_INTERVAL_DAYS`).
+pub const DEFAULT_SCRUB_FULL_INTERVAL_DAYS: u32 = 90;
 /// Seconds before a loss the scrub found is checked again, and repaired
 /// only if it is still there (`SCRUB_CONFIRM_SECS`): the repair-data
 /// design's rule of a second look at least an hour later, which is also
@@ -585,6 +586,7 @@ pub struct ScrubConfig {
     pub extents_per_run: u32,
     pub sockets: u32,
     pub interval_days: u32,
+    pub full_interval_days: u32,
     pub confirm_secs: u32,
     pub run_secs: u32,
     pub repairs_per_run: u32,
@@ -597,6 +599,7 @@ impl Default for ScrubConfig {
             extents_per_run: DEFAULT_SCRUB_EXTENTS_PER_RUN,
             sockets: DEFAULT_SCRUB_SOCKETS,
             interval_days: DEFAULT_SCRUB_INTERVAL_DAYS,
+            full_interval_days: DEFAULT_SCRUB_FULL_INTERVAL_DAYS,
             confirm_secs: DEFAULT_SCRUB_CONFIRM_SECS,
             run_secs: DEFAULT_SCRUB_RUN_SECS,
             repairs_per_run: DEFAULT_SCRUB_REPAIRS_PER_RUN,
@@ -627,6 +630,12 @@ impl ScrubConfig {
             )?,
             sockets: number_or(get, "SCRUB_SOCKETS", d.sockets, (1, MAX_COLD_SOCKETS))?,
             interval_days: number_or(get, "SCRUB_INTERVAL_DAYS", d.interval_days, (1, 3650))?,
+            full_interval_days: number_or(
+                get,
+                "SCRUB_FULL_INTERVAL_DAYS",
+                d.full_interval_days,
+                (1, 3650),
+            )?,
             confirm_secs: number_or(
                 get,
                 "SCRUB_CONFIRM_SECS",

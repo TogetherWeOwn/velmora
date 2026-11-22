@@ -1579,10 +1579,40 @@ pub trait Catalog {
     async fn scrub_state(&self) -> Result<ScrubState> {
         Err(BridgeError::Invalid("this catalogue has no scrub"))
     }
-    /// Up to `limit` extents due for a check at `now`, the one due
-    /// longest first. Released extents, and those the scrub has put a
-    /// due time on (a re-pinned one is held).
-    async fn scrub_due(&self, _now: UnixMs, _limit: u32) -> Result<Vec<ScrubCandidate>> {
+    /// Enroll a bounded page under the lease; true means more may be pending.
+    async fn scrub_enroll(
+        &self,
+        _token: u64,
+        _backbones: &[String],
+        _now: UnixMs,
+        _intervals_ms: [i64; 2],
+    ) -> Result<bool> {
+        Err(BridgeError::Invalid("this catalogue has no scrub"))
+    }
+    /// Up to `limit` extents with due checks or repair watches, oldest first.
+    async fn scrub_due(
+        &self,
+        _backbones: &[String],
+        _now: UnixMs,
+        _limit: u32,
+    ) -> Result<Vec<ScrubCandidate>> {
+        Err(BridgeError::Invalid("this catalogue has no scrub"))
+    }
+    /// Move only the named checks, recording their own loss timestamps.
+    async fn scrub_advance(
+        &self,
+        _token: u64,
+        _extent: &ExtentId,
+        _updates: &[(crate::types::ScrubCheck, UnixMs, Option<UnixMs>)],
+    ) -> Result<bool> {
+        Err(BridgeError::Invalid("this catalogue has no scrub"))
+    }
+    /// Whether any counting copy still has an unresolved check failure.
+    async fn scrub_has_loss(&self, _extent: &ExtentId, _backbones: &[String]) -> Result<bool> {
+        Err(BridgeError::Invalid("this catalogue has no scrub"))
+    }
+    /// Remove the schedules of a tombstoned extent under the scrub lease.
+    async fn scrub_retire(&self, _token: u64, _extent: &ExtentId) -> Result<bool> {
         Err(BridgeError::Invalid("this catalogue has no scrub"))
     }
     /// Records a check of a released or held extent, if the run of
@@ -1593,7 +1623,7 @@ pub trait Catalog {
         _extent: &ExtentId,
         _result: ScrubResult,
         _now: UnixMs,
-        _next_at: UnixMs,
+        _next_at: Option<UnixMs>,
     ) -> Result<bool> {
         Err(BridgeError::Invalid("this catalogue has no scrub"))
     }
