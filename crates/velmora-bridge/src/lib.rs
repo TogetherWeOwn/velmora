@@ -42,6 +42,7 @@ pub mod verify;
 #[cfg(feature = "testkit")]
 pub mod meter;
 pub mod metrics;
+pub mod mgmt;
 #[cfg(feature = "testkit")]
 pub mod testkit;
 
