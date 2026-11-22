@@ -12,7 +12,7 @@ use velmora_bridge::directory::store::{
 };
 use velmora_bridge::directory::testing::{HookedRecords, PlainSeal};
 use velmora_bridge::directory::transition::{Actor, Change, OperatorHoldRequest, KEY_CHECK_LEN};
-use velmora_bridge::ports::{Sql, SqlValue};
+use velmora_bridge::ports::{Row, Sql, SqlValue};
 use velmora_bridge::{Result, UnixMs};
 
 mod directory_support;
@@ -37,6 +37,115 @@ fn block_on<F: std::future::Future>(f: F) -> F::Output {
         .build()
         .unwrap()
         .block_on(f)
+}
+
+// (closed, epoch, pending_cleared), including deliberately inconsistent rows
+// that a statement must not touch, even if first_open would reject them earlier.
+const FIRST_GATE_STATES: &[Option<(i64, i64, i64)>] = &[
+    None,
+    Some((1, 0, 0)),
+    Some((1, 1, 1)),
+    Some((1, 1, 0)),
+    Some((0, 1, 1)),
+    Some((0, 1, 0)),
+    Some((1, 2, 1)),
+    Some((0, 0, 0)),
+];
+
+async fn seed_first_gate(db: &Db, row: Option<(i64, i64, i64)>) {
+    if let Some((closed, epoch, cleared)) = row {
+        db.exec(
+            "INSERT INTO directory_gate (id, closed, epoch, pending_cleared, reason, closed_at, opened_at) \
+             VALUES (1, ?1, ?2, ?3, 'before', 5, NULL)",
+            &[SqlValue::Int(closed), SqlValue::Int(epoch), SqlValue::Int(cleared)],
+        ).await.unwrap();
+    }
+}
+
+async fn first_gate_snapshot(db: &Db) -> Vec<velmora_bridge::ports::Row> {
+    db.query(
+        "SELECT closed, epoch, pending_cleared, reason, closed_at, opened_at FROM directory_gate WHERE id = 1",
+        &[],
+    ).await.unwrap()
+}
+
+#[test]
+fn first_close_only_advances_fresh_rows_and_clears_pending_once() {
+    block_on(async {
+        for &initial in FIRST_GATE_STATES {
+            let db = database();
+            let dir = SqlDirectory { sql: &db };
+            seed_first_gate(&db, initial).await;
+            let before = first_gate_snapshot(&db).await;
+            let pending = PendingOp {
+                tenant: Tenant::parse(A1).unwrap(),
+                chain: ChainKind::Tenant,
+                seq: 1,
+                kind: "before".into(),
+                created_at: NOW.plus_ms(-1),
+            };
+            dir.add_pending(&pending).await.unwrap();
+            dir.first_close("first", NOW).await.unwrap();
+
+            let (expected, clears) = match initial {
+                None | Some((1, 0, 0)) => (
+                    vec![vec![
+                        SqlValue::Int(1),
+                        SqlValue::Int(1),
+                        SqlValue::Int(1),
+                        SqlValue::Text("first".into()),
+                        SqlValue::Int(NOW.0),
+                        SqlValue::Null,
+                    ]],
+                    true,
+                ),
+                Some((1, 1, 0)) => {
+                    let mut row = before;
+                    row[0][2] = SqlValue::Int(1);
+                    (row, true)
+                }
+                _ => (before, false),
+            };
+            assert_eq!(
+                first_gate_snapshot(&db).await,
+                expected,
+                "initial={initial:?}"
+            );
+            let rows = dir.pending_before(NOW, 10).await.unwrap();
+            if clears {
+                assert!(rows.is_empty(), "initial={initial:?}; pending={rows:?}");
+            } else {
+                assert_eq!(rows, [pending], "initial={initial:?}");
+            }
+        }
+    });
+}
+
+#[test]
+fn first_open_gate_only_opens_closed_epoch_one_after_the_pending_clear() {
+    block_on(async {
+        for &initial in FIRST_GATE_STATES {
+            let db = database();
+            let dir = SqlDirectory { sql: &db };
+            seed_first_gate(&db, initial).await;
+            let mut expected = first_gate_snapshot(&db).await;
+            let should_open = initial == Some((1, 1, 1));
+            if should_open {
+                expected[0][0] = SqlValue::Int(0);
+                expected[0][5] = SqlValue::Int(NOW.0);
+            }
+            assert_eq!(
+                dir.first_open_gate(NOW).await.unwrap(),
+                should_open,
+                "initial={initial:?}"
+            );
+            assert_eq!(
+                first_gate_snapshot(&db).await,
+                expected,
+                "initial={initial:?}"
+            );
+        }
+    });
 }
 
 async fn write(
@@ -311,6 +420,41 @@ fn unit_rows_follow_the_head() {
     });
 }
 
+async fn shred_active_tenant(chain: &Chain<'_>, tenant: &Tenant) -> TenantDoor {
+    let due = UnixMs(NOW.0 + 7 * DAY);
+    let deleting = write(
+        chain,
+        tenant,
+        Change::SetDeletion {
+            shred_due_at: due,
+            reason: DeletionReason::CustomerRequest,
+            key_hash: "01".repeat(32),
+        },
+        Actor::Customer,
+        NOW,
+        4,
+    )
+    .await;
+    let shredding = write(
+        chain,
+        tenant,
+        Change::StartShred,
+        Actor::ShredJob,
+        due,
+        deleting.seq,
+    )
+    .await;
+    write(
+        chain,
+        tenant,
+        Change::FinishShred,
+        Actor::ShredJob,
+        due,
+        shredding.seq,
+    )
+    .await
+}
+
 #[test]
 fn a_shredded_tenant_keeps_its_row_and_loses_its_routes() {
     block_on(async {
@@ -352,38 +496,8 @@ fn a_shredded_tenant_keeps_its_row_and_loses_its_routes() {
             assert_eq!(dir.route("AKIA1").await.unwrap().as_ref(), Some(&route));
         }
 
-        let due = UnixMs(NOW.0 + 7 * DAY);
-        let deleting = write(
-            &chain,
-            &t,
-            Change::SetDeletion {
-                shred_due_at: due,
-                reason: DeletionReason::CustomerRequest,
-                key_hash: "01".repeat(32),
-            },
-            Actor::Customer,
-            NOW,
-            4,
-        )
-        .await;
-        let shredding = write(
-            &chain,
-            &t,
-            Change::StartShred,
-            Actor::ShredJob,
-            due,
-            deleting.seq,
-        )
-        .await;
-        let shredded = write(
-            &chain,
-            &t,
-            Change::FinishShred,
-            Actor::ShredJob,
-            due,
-            shredding.seq,
-        )
-        .await;
+        let shredded = shred_active_tenant(&chain, &t).await;
+        let due = shredded.written_at;
         assert_eq!(
             dir.apply_tenant(&shredded, due).await.unwrap(),
             Applied::Applied
@@ -809,6 +923,169 @@ fn the_gate_does_not_overwrite_a_row_that_moved_on() {
         assert!(dir.tenant(&t).await.unwrap().is_none());
         assert!(dir.replace_tenant(&old, &no_row, NOW).await.unwrap());
         assert_eq!(dir.tenant(&t).await.unwrap().unwrap().record_seq, old.seq);
+    });
+}
+
+async fn tenant_write_snapshot(db: &Db) -> [Vec<Row>; 4] {
+    [
+        db.query("SELECT * FROM tenants ORDER BY id", &[])
+            .await
+            .unwrap(),
+        db.query("SELECT * FROM units ORDER BY tenant, unit", &[])
+            .await
+            .unwrap(),
+        db.query("SELECT * FROM key_routes ORDER BY akid", &[])
+            .await
+            .unwrap(),
+        db.query("SELECT * FROM bucket_index ORDER BY label", &[])
+            .await
+            .unwrap(),
+    ]
+}
+
+async fn add_tenant_dependents(db: &Db, tenant: &Tenant) {
+    let id = SqlValue::Text(tenant.as_str().into());
+    db.exec(
+        "INSERT INTO key_routes (akid, tenant, kind, created_at) VALUES (?1, ?1, 's3', 1)",
+        std::slice::from_ref(&id),
+    )
+    .await
+    .unwrap();
+    db.exec(
+        "INSERT INTO bucket_index (label, tenant, bucket_id) VALUES (?1, ?1, 'b_1')",
+        &[id],
+    )
+    .await
+    .unwrap();
+}
+
+async fn seed_replacements(db: &Db, restoring: &TenantDoor, shredded: &TenantDoor) {
+    let dir = SqlDirectory { sql: db };
+    // At the same seq and door, each unit statement can change the copy
+    // even if the upsert is blocked, so exercise all three here.
+    for door in [restoring, shredded] {
+        dir.apply_tenant(door, NOW).await.unwrap();
+    }
+    let id = [SqlValue::Text(restoring.tenant.as_str().into())];
+    for sql in [
+        "DELETE FROM units WHERE tenant = ?1 AND unit = 0",
+        "UPDATE units SET restoring_since = NULL WHERE tenant = ?1 AND unit = 1",
+        "INSERT INTO units (tenant, unit) VALUES (?1, 2)",
+    ] {
+        assert_eq!(db.exec(sql, &id).await.unwrap(), 1);
+    }
+    // Model stale dependents on a row that already says shredded.
+    add_tenant_dependents(db, &shredded.tenant).await;
+}
+
+#[test]
+fn first_open_replacement_fences_inserts_updates_and_dependent_writes() {
+    block_on(async {
+        let chain = TenantChain {
+            store: &HookedRecords::new(),
+            seal: &PlainSeal::new(),
+        };
+        let a = Tenant::parse(A1).unwrap();
+        let b = Tenant::parse(B2).unwrap();
+        active(&chain, &a).await;
+        active(&chain, &b).await;
+        let expanded = write(&chain, &a, two_units(4), Actor::Operator, NOW, 4).await;
+        let restoring = write(
+            &chain,
+            &a,
+            Change::SetRestoring { unit: 1 },
+            Actor::Operator,
+            NOW,
+            expanded.seq,
+        )
+        .await;
+        let shredded = shred_active_tenant(&chain, &b).await;
+        let zero = create_zero(&chain, &Tenant::Zero).await;
+
+        for &initial in FIRST_GATE_STATES {
+            let db = database();
+            let dir = SqlDirectory { sql: &db };
+            seed_replacements(&db, &restoring, &shredded).await;
+            seed_first_gate(&db, initial).await;
+            let before = tenant_write_snapshot(&db).await;
+            let at = NOW.plus_ms(1);
+            let held = initial == Some((1, 1, 1));
+            for door in [&restoring, &shredded, &zero] {
+                let observed = dir.row_seq(&door.tenant).await.unwrap();
+                assert_eq!(
+                    dir.replace_tenant_in_first_open(door, &observed, at)
+                        .await
+                        .unwrap(),
+                    held,
+                    "initial={initial:?}, tenant={}",
+                    door.tenant.as_str()
+                );
+            }
+            let expected = if held {
+                let restore_db = database();
+                let restore = SqlDirectory { sql: &restore_db };
+                seed_replacements(&restore_db, &restoring, &shredded).await;
+                for door in [&restoring, &shredded, &zero] {
+                    let observed = restore.row_seq(&door.tenant).await.unwrap();
+                    assert!(restore.replace_tenant(door, &observed, at).await.unwrap());
+                }
+                tenant_write_snapshot(&restore_db).await
+            } else {
+                before
+            };
+            assert_eq!(
+                tenant_write_snapshot(&db).await,
+                expected,
+                "initial={initial:?}"
+            );
+        }
+    });
+}
+
+#[test]
+fn first_open_removal_fences_the_tenant_and_all_dependents() {
+    block_on(async {
+        let chain = TenantChain {
+            store: &HookedRecords::new(),
+            seal: &PlainSeal::new(),
+        };
+        let t = Tenant::parse(A1).unwrap();
+        active(&chain, &t).await;
+        let door = head(&chain, &t).await;
+        for &initial in FIRST_GATE_STATES {
+            let db = database();
+            let dir = SqlDirectory { sql: &db };
+            dir.apply_tenant(&door, NOW).await.unwrap();
+            add_tenant_dependents(&db, &t).await;
+            seed_first_gate(&db, initial).await;
+            let before = tenant_write_snapshot(&db).await;
+            assert!(before.iter().all(|rows| rows.len() == 1));
+            let observed = dir.row_seq(&t).await.unwrap();
+            let held = initial == Some((1, 1, 1));
+            assert_eq!(
+                dir.remove_tenant_in_first_open(&t, &observed)
+                    .await
+                    .unwrap(),
+                held,
+                "initial={initial:?}"
+            );
+            let expected = if held {
+                let restore_db = database();
+                let restore = SqlDirectory { sql: &restore_db };
+                restore.apply_tenant(&door, NOW).await.unwrap();
+                add_tenant_dependents(&restore_db, &t).await;
+                let observed = restore.row_seq(&t).await.unwrap();
+                assert!(restore.remove_tenant(&t, &observed).await.unwrap());
+                tenant_write_snapshot(&restore_db).await
+            } else {
+                before
+            };
+            assert_eq!(
+                tenant_write_snapshot(&db).await,
+                expected,
+                "initial={initial:?}"
+            );
+        }
     });
 }
 

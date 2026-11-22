@@ -25,7 +25,7 @@ use velmora_bridge::{BridgeError, Result};
 
 /// The directory's migrations, in order. A test checks that this is every
 /// file of the folder.
-pub const MIGRATIONS: [(&str, &str); 3] = [
+pub const MIGRATIONS: [(&str, &str); 4] = [
     (
         "0001_directory.sql",
         include_str!("../../../../workers/s3-bridge/migrations-directory/0001_directory.sql"),
@@ -38,6 +38,12 @@ pub const MIGRATIONS: [(&str, &str); 3] = [
         "0003_pending_chains_and_caps.sql",
         include_str!(
             "../../../../workers/s3-bridge/migrations-directory/0003_pending_chains_and_caps.sql"
+        ),
+    ),
+    (
+        "0004_gate_pending_cleared.sql",
+        include_str!(
+            "../../../../workers/s3-bridge/migrations-directory/0004_gate_pending_cleared.sql"
         ),
     ),
 ];

@@ -29,17 +29,23 @@
 //!   written only by a deploy that has them. A head that is there is
 //!   answered as above whatever the deployment binds.
 //! - Under `MAINTENANCE=restore` both answer `503` and do nothing.
-//! - [`GATE_FIRST_OPEN_PATH`]: `directory::first_open::first_open`, whose
-//!   guard runs before any gate step: an open gate answers `200` with
+//! - [`GATE_FIRST_OPEN_PATH`]: `directory::first_open::first_open`, at
+//!   epoch 1 only (AM-83b): an open gate answers `200` with
 //!   `{"gate": "open", "ran": false}` and runs nothing (a repeat never
-//!   closes an open gate, and never empties `pending_ops`); a tenant chain
+//!   closes an open gate, and never empties `pending_ops`), before any
+//!   tenant check; anchors or a gate row that no first open makes answer
+//!   `409 gate_epoch_unexpected` (a page) and run nothing; a tenant chain
 //!   of a managed tenant answers `409 gate_has_tenants` (a page) and runs
-//!   nothing. Otherwise one gate run with `FirstOpen` steps: `200` with
-//!   `{"gate": "open", "ran": true, "epoch": E}` when it opened, and
+//!   nothing. Otherwise one run with `FirstOpen` steps at epoch 1: `200`
+//!   with `{"gate": "open", "ran": true, "epoch": 1}` when it opened, and
 //!   `503 gate_not_opened` with the steps that are not done when it did
-//!   not (a run that left the gate closed may be started again). With
-//!   `DIRECTORY` unbound the gate counts as closed: `503
-//!   directory_unbound`, nothing run.
+//!   not (a run that left the gate closed may be started again). A
+//!   compare-and-set that lost to another call answers `200` with
+//!   `{"gate": "open", "ran": false}` when the gate is then open at
+//!   epoch 1, and `503` with `Retry-After` otherwise; a store error that
+//!   the call returns is `503` with `Retry-After` too (a head of `m/kl/`
+//!   that cannot be read is a step that is not done, `gate_not_opened`). With `DIRECTORY` unbound the
+//!   gate counts as closed: `503 directory_unbound`, nothing run.
 //!
 //! Every answer carries fixed words and numbers only, never a store's
 //! text.
@@ -48,7 +54,6 @@ use serde_json::{json, Value};
 use velmora::rng::FillRandom;
 
 use crate::directory::first_open::{first_open, FirstOpenAnswer};
-use crate::directory::gate::is_open;
 use crate::ingress::{self, check_admin};
 use crate::keys::locations::{
     init_locations, is_kek_not_held, read_locations, two_in_account, InitLocations,
@@ -230,20 +235,25 @@ where
             "No directory is bound; the gate counts as closed.",
         );
     };
-    // The route's own guard (AM-78, §R7-13 N1): an open gate answers
-    // `200` and runs nothing, so a repeat never closes it or empties
-    // `pending_ops`; a read that fails runs nothing either. `first_open`
-    // checks the gate and the managed tenant chains again before its run.
-    match is_open(root.records(), &dir).await {
-        Ok(true) => return json_response(200, &json!({ "gate": "open", "ran": false })),
-        Ok(false) => {}
-        Err(_) => return unavailable(),
-    }
+    // No guard of its own: `first_open`'s first step answers `200` only for
+    // a gate open at epoch 1 with anchor 1 alone, before any write, and
+    // every other open state is `409 gate_epoch_unexpected` (AM-83b).
     let now = root.clock().now();
     let chain = root.chain();
     match first_open(&chain, &dir, root.kek(), now).await {
         Ok(FirstOpenAnswer::AlreadyOpen) => {
             json_response(200, &json!({ "gate": "open", "ran": false }))
+        }
+        Ok(FirstOpenAnswer::EpochUnexpected) => {
+            crate::trace::alert(|| {
+                "setup: first open refused: the gate row and anchors are no state a first open makes"
+                    .to_string()
+            });
+            fail(
+                409,
+                "gate_epoch_unexpected",
+                "The gate is in a state no first open makes; nothing was run.",
+            )
         }
         Ok(FirstOpenAnswer::HasTenants) => {
             crate::trace::alert(|| {

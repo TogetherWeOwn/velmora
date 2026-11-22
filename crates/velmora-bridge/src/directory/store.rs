@@ -157,39 +157,168 @@ const UPSERT_TENANT: &str = "INSERT INTO tenants (id, record_seq, state, hold_mo
      ON CONFLICT (id) DO UPDATE SET record_seq = excluded.record_seq, state = excluded.state, hold_mode = excluded.hold_mode, shred_due_at = excluded.shred_due_at, tk_version = excluded.tk_version, rotating_to = excluded.rotating_to, selector = excluded.selector, synthetic = excluded.synthetic, jurisdiction = excluded.jurisdiction, door_json = excluded.door_json, updated_at = excluded.updated_at \
      WHERE excluded.record_seq > tenants.record_seq";
 
+macro_rules! replace_tenant_insert {
+    () => {
+        "INSERT INTO tenants (id, record_seq, state, hold_mode, shred_due_at, tk_version, rotating_to, selector, synthetic, jurisdiction, door_json, updated_at) \
+         SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12"
+    };
+}
+
+macro_rules! replace_tenant_conflict {
+    () => {
+        " ON CONFLICT (id) DO UPDATE SET record_seq = excluded.record_seq, state = excluded.state, hold_mode = excluded.hold_mode, shred_due_at = excluded.shred_due_at, tk_version = excluded.tk_version, rotating_to = excluded.rotating_to, selector = excluded.selector, synthetic = excluded.synthetic, jurisdiction = excluded.jurisdiction, door_json = excluded.door_json, updated_at = excluded.updated_at \
+         WHERE tenants.record_seq IS ?13"
+    };
+}
+
 /// The gate's form: the row takes the head whatever seq it held, a higher
 /// one included (a restored or damaged row is not trusted over R2), but
 /// only if the row still holds the seq the gate saw (`?13`, NULL for no
 /// row): a head that a closing call applied in between is newer than the
 /// gate's and stays. A row the gate saw that is gone since is not made
 /// again either.
-const REPLACE_TENANT: &str = "INSERT INTO tenants (id, record_seq, state, hold_mode, shred_due_at, tk_version, rotating_to, selector, synthetic, jurisdiction, door_json, updated_at) \
-     SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12 \
-     WHERE ?13 IS NULL OR EXISTS (SELECT 1 FROM tenants WHERE id = ?1) \
-     ON CONFLICT (id) DO UPDATE SET record_seq = excluded.record_seq, state = excluded.state, hold_mode = excluded.hold_mode, shred_due_at = excluded.shred_due_at, tk_version = excluded.tk_version, rotating_to = excluded.rotating_to, selector = excluded.selector, synthetic = excluded.synthetic, jurisdiction = excluded.jurisdiction, door_json = excluded.door_json, updated_at = excluded.updated_at \
-     WHERE tenants.record_seq IS ?13";
+const REPLACE_TENANT: &str = concat!(
+    replace_tenant_insert!(),
+    " WHERE ?13 IS NULL OR EXISTS (SELECT 1 FROM tenants WHERE id = ?1)",
+    replace_tenant_conflict!()
+);
+
+/// The condition every tenant write of a first-open run carries in its
+/// own statement (AM-83b item 7): the gate row is still closed at epoch 1
+/// with `pending_ops` emptied. Once any run opened the gate, the write
+/// changes nothing, so a run that lost the race writes no tenant row,
+/// unit, route or label after the open.
+macro_rules! first_open_held {
+    () => {
+        " AND EXISTS (SELECT 1 FROM directory_gate WHERE id = 1 AND closed = 1 AND epoch = 1 AND pending_cleared = 1)"
+    };
+}
+
+/// [`REPLACE_TENANT`] in a first-open run.
+const REPLACE_TENANT_HELD: &str = concat!(
+    replace_tenant_insert!(),
+    " WHERE (?13 IS NULL OR EXISTS (SELECT 1 FROM tenants WHERE id = ?1))",
+    first_open_held!(),
+    replace_tenant_conflict!()
+);
 
 // The unit statements run only when the tenant row holds exactly this
 // head after the upsert (its seq and its door), so an older head, or
 // another door at the same seq, changes no unit row.
-const DROP_UNLISTED_UNITS: &str = "DELETE FROM units WHERE tenant = ?1 \
-     AND (SELECT door_json FROM tenants WHERE id = ?1 AND record_seq = ?2) = ?4 \
-     AND unit NOT IN (SELECT value FROM json_each(?3))";
+macro_rules! drop_unlisted_units {
+    () => {
+        "DELETE FROM units WHERE tenant = ?1 \
+         AND (SELECT door_json FROM tenants WHERE id = ?1 AND record_seq = ?2) = ?4 \
+         AND unit NOT IN (SELECT value FROM json_each(?3))"
+    };
+}
+const DROP_UNLISTED_UNITS: &str = drop_unlisted_units!();
+const DROP_UNLISTED_UNITS_HELD: &str = concat!(drop_unlisted_units!(), first_open_held!());
 
-const ADD_LISTED_UNITS: &str = "INSERT INTO units (tenant, unit) \
-     SELECT ?1, value FROM json_each(?3) WHERE (SELECT door_json FROM tenants WHERE id = ?1 AND record_seq = ?2) = ?4 \
-     ON CONFLICT (tenant, unit) DO NOTHING";
+macro_rules! add_listed_units {
+    () => {
+        "INSERT INTO units (tenant, unit) \
+         SELECT ?1, value FROM json_each(?3) WHERE (SELECT door_json FROM tenants WHERE id = ?1 AND record_seq = ?2) = ?4"
+    };
+}
+const ADD_LISTED_UNITS: &str = concat!(
+    add_listed_units!(),
+    " ON CONFLICT (tenant, unit) DO NOTHING"
+);
+const ADD_LISTED_UNITS_HELD: &str = concat!(
+    add_listed_units!(),
+    first_open_held!(),
+    " ON CONFLICT (tenant, unit) DO NOTHING"
+);
 
-const SET_RESTORING: &str = "UPDATE units SET restoring_since = \
-     (SELECT json_extract(r.value, '$.since_seq') FROM json_each(?3) r WHERE json_extract(r.value, '$.unit') = units.unit) \
-     WHERE tenant = ?1 AND (SELECT door_json FROM tenants WHERE id = ?1 AND record_seq = ?2) = ?4";
+macro_rules! set_restoring {
+    () => {
+        "UPDATE units SET restoring_since = \
+         (SELECT json_extract(r.value, '$.since_seq') FROM json_each(?3) r WHERE json_extract(r.value, '$.unit') = units.unit) \
+         WHERE tenant = ?1 AND (SELECT door_json FROM tenants WHERE id = ?1 AND record_seq = ?2) = ?4"
+    };
+}
+const SET_RESTORING: &str = set_restoring!();
+const SET_RESTORING_HELD: &str = concat!(set_restoring!(), first_open_held!());
 
 // A shredded tenant keeps its row and loses every route and label.
-const DROP_SHREDDED_ROUTES: &str = "DELETE FROM key_routes WHERE tenant = ?1 \
-     AND (SELECT state FROM tenants WHERE id = ?1 AND record_seq = ?2) = 'shredded'";
+macro_rules! drop_shredded_routes {
+    () => {
+        "DELETE FROM key_routes WHERE tenant = ?1 \
+         AND (SELECT state FROM tenants WHERE id = ?1 AND record_seq = ?2) = 'shredded'"
+    };
+}
+const DROP_SHREDDED_ROUTES: &str = drop_shredded_routes!();
+const DROP_SHREDDED_ROUTES_HELD: &str = concat!(drop_shredded_routes!(), first_open_held!());
 
-const DROP_SHREDDED_LABELS: &str = "DELETE FROM bucket_index WHERE tenant = ?1 \
-     AND (SELECT state FROM tenants WHERE id = ?1 AND record_seq = ?2) = 'shredded'";
+macro_rules! drop_shredded_labels {
+    () => {
+        "DELETE FROM bucket_index WHERE tenant = ?1 \
+         AND (SELECT state FROM tenants WHERE id = ?1 AND record_seq = ?2) = 'shredded'"
+    };
+}
+const DROP_SHREDDED_LABELS: &str = drop_shredded_labels!();
+const DROP_SHREDDED_LABELS_HELD: &str = concat!(drop_shredded_labels!(), first_open_held!());
+
+// The removal of a row that no chain backs, if the row still holds the
+// seq the gate saw: units, routes, labels, then the row.
+macro_rules! remove_units {
+    () => {
+        "DELETE FROM units WHERE tenant = ?1 AND (SELECT record_seq FROM tenants WHERE id = ?1) = ?2"
+    };
+}
+macro_rules! remove_routes {
+    () => {
+        "DELETE FROM key_routes WHERE tenant = ?1 AND (SELECT record_seq FROM tenants WHERE id = ?1) = ?2"
+    };
+}
+macro_rules! remove_labels {
+    () => {
+        "DELETE FROM bucket_index WHERE tenant = ?1 AND (SELECT record_seq FROM tenants WHERE id = ?1) = ?2"
+    };
+}
+macro_rules! remove_row {
+    () => {
+        "DELETE FROM tenants WHERE id = ?1 AND record_seq = ?2"
+    };
+}
+const REMOVE_TENANT: [&str; 4] = [
+    remove_units!(),
+    remove_routes!(),
+    remove_labels!(),
+    remove_row!(),
+];
+const REMOVE_TENANT_HELD: [&str; 4] = [
+    concat!(remove_units!(), first_open_held!()),
+    concat!(remove_routes!(), first_open_held!()),
+    concat!(remove_labels!(), first_open_held!()),
+    concat!(remove_row!(), first_open_held!()),
+];
+
+/// The statements of a tenant write: the upsert's form is the caller's.
+struct TenantWrite {
+    drop_unlisted: &'static str,
+    add_listed: &'static str,
+    set_restoring: &'static str,
+    drop_routes: &'static str,
+    drop_labels: &'static str,
+}
+
+const ANY_GATE: TenantWrite = TenantWrite {
+    drop_unlisted: DROP_UNLISTED_UNITS,
+    add_listed: ADD_LISTED_UNITS,
+    set_restoring: SET_RESTORING,
+    drop_routes: DROP_SHREDDED_ROUTES,
+    drop_labels: DROP_SHREDDED_LABELS,
+};
+
+const FIRST_OPEN_HELD: TenantWrite = TenantWrite {
+    drop_unlisted: DROP_UNLISTED_UNITS_HELD,
+    add_listed: ADD_LISTED_UNITS_HELD,
+    set_restoring: SET_RESTORING_HELD,
+    drop_routes: DROP_SHREDDED_ROUTES_HELD,
+    drop_labels: DROP_SHREDDED_LABELS_HELD,
+};
 
 /// A tenant's key chain head as its row holds it: a point read.
 pub const KEYS_SEQ_OF: &str = "SELECT keys_seq FROM tenants WHERE id = ?1";
@@ -268,7 +397,9 @@ impl<S: Sql> SqlDirectory<'_, S> {
     /// Copies a chain head into the tenant's row and unit rows, if it is
     /// newer than what the row holds. One atomic batch.
     pub async fn apply_tenant(&self, door: &TenantDoor, now: UnixMs) -> Result<Applied> {
-        let changed = self.write_tenant(UPSERT_TENANT, None, door, now).await?;
+        let changed = self
+            .write_tenant(UPSERT_TENANT, &ANY_GATE, None, door, now)
+            .await?;
         Ok(match changed {
             0 => Applied::NotNewer,
             _ => Applied::Applied,
@@ -302,7 +433,34 @@ impl<S: Sql> SqlDirectory<'_, S> {
         now: UnixMs,
     ) -> Result<bool> {
         let changed = self
-            .write_tenant(REPLACE_TENANT, Some(observed.0.clone()), door, now)
+            .write_tenant(
+                REPLACE_TENANT,
+                &ANY_GATE,
+                Some(observed.0.clone()),
+                door,
+                now,
+            )
+            .await?;
+        Ok(changed > 0)
+    }
+
+    /// [`Self::replace_tenant`] in a first-open run (AM-83b item 7): every
+    /// statement also needs the gate row closed at epoch 1 with
+    /// `pending_ops` emptied, so nothing is written once a run opened it.
+    pub async fn replace_tenant_in_first_open(
+        &self,
+        door: &TenantDoor,
+        observed: &RowSeq,
+        now: UnixMs,
+    ) -> Result<bool> {
+        let changed = self
+            .write_tenant(
+                REPLACE_TENANT_HELD,
+                &FIRST_OPEN_HELD,
+                Some(observed.0.clone()),
+                door,
+                now,
+            )
             .await?;
         Ok(changed > 0)
     }
@@ -310,6 +468,7 @@ impl<S: Sql> SqlDirectory<'_, S> {
     async fn write_tenant(
         &self,
         upsert: &'static str,
+        rest: &TenantWrite,
         observed: Option<SqlValue>,
         door: &TenantDoor,
         now: UnixMs,
@@ -329,11 +488,11 @@ impl<S: Sql> SqlDirectory<'_, S> {
             .sql
             .batch(vec![
                 (upsert, params),
-                (DROP_UNLISTED_UNITS, unit_params(units.clone())),
-                (ADD_LISTED_UNITS, unit_params(units)),
-                (SET_RESTORING, unit_params(restoring)),
-                (DROP_SHREDDED_ROUTES, vec![id.clone(), seq.clone()]),
-                (DROP_SHREDDED_LABELS, vec![id, seq]),
+                (rest.drop_unlisted, unit_params(units.clone())),
+                (rest.add_listed, unit_params(units)),
+                (rest.set_restoring, unit_params(restoring)),
+                (rest.drop_routes, vec![id.clone(), seq.clone()]),
+                (rest.drop_labels, vec![id, seq]),
             ])
             .await?;
         Ok(changed.first().copied().unwrap_or(0))
@@ -401,32 +560,39 @@ impl<S: Sql> SqlDirectory<'_, S> {
     /// and labels, if the row still holds the seq the gate saw. Only the
     /// gate calls this. `false` = the row changed, nothing was removed.
     pub async fn remove_tenant(&self, tenant: &Tenant, observed: &RowSeq) -> Result<bool> {
+        self.remove_tenant_with(REMOVE_TENANT, tenant, observed)
+            .await
+    }
+
+    /// [`Self::remove_tenant`] in a first-open run: every statement also
+    /// needs the gate row closed at epoch 1 with `pending_ops` emptied.
+    pub async fn remove_tenant_in_first_open(
+        &self,
+        tenant: &Tenant,
+        observed: &RowSeq,
+    ) -> Result<bool> {
+        self.remove_tenant_with(REMOVE_TENANT_HELD, tenant, observed)
+            .await
+    }
+
+    async fn remove_tenant_with(
+        &self,
+        stmts: [&'static str; 4],
+        tenant: &Tenant,
+        observed: &RowSeq,
+    ) -> Result<bool> {
         if observed.0 == SqlValue::Null {
             return Ok(false);
         }
         let p = || {
-            Ok::<_, BridgeError>(vec![
+            vec![
                 SqlValue::Text(tenant.as_str().to_string()),
                 observed.0.clone(),
-            ])
+            ]
         };
         let changed = self
             .sql
-            .batch(vec![
-                (
-                    "DELETE FROM units WHERE tenant = ?1 AND (SELECT record_seq FROM tenants WHERE id = ?1) = ?2",
-                    p()?,
-                ),
-                (
-                    "DELETE FROM key_routes WHERE tenant = ?1 AND (SELECT record_seq FROM tenants WHERE id = ?1) = ?2",
-                    p()?,
-                ),
-                (
-                    "DELETE FROM bucket_index WHERE tenant = ?1 AND (SELECT record_seq FROM tenants WHERE id = ?1) = ?2",
-                    p()?,
-                ),
-                ("DELETE FROM tenants WHERE id = ?1 AND record_seq = ?2", p()?),
-            ])
+            .batch(stmts.into_iter().map(|stmt| (stmt, p())).collect())
             .await?;
         Ok(changed.last().copied().unwrap_or(0) > 0)
     }
@@ -788,6 +954,8 @@ impl<S: Sql> SqlDirectory<'_, S> {
 
     /// Marks the gate closed at `epoch`, which the caller has anchored in
     /// R2. An older epoch changes nothing; the caller reads the row back.
+    /// The same epoch closes an open row, so the first open never calls
+    /// this (AM-83b): it moves the row by [`Self::first_close`].
     pub async fn mark_closed(&self, epoch: u64, reason: &str, now: UnixMs) -> Result<()> {
         self.sql
             .exec(
@@ -812,7 +980,85 @@ impl<S: Sql> SqlDirectory<'_, S> {
             .await?;
         Ok(changed > 0)
     }
+
+    /// The gate row as the first open reads it (AM-83b item 1); `None`:
+    /// no row (the migration's state). Never [`Self::gate`]'s "no row =
+    /// closed at 0": the first open tells the two apart in its answer.
+    pub async fn gate_row(&self) -> Result<Option<GateRow>> {
+        let rows = self
+            .sql
+            .query(
+                "SELECT closed, epoch, pending_cleared FROM directory_gate WHERE id = 1",
+                &[],
+            )
+            .await?;
+        rows.first()
+            .map(|row| {
+                Ok(GateRow {
+                    closed: int_at(row, 0)? != 0,
+                    epoch: u64::try_from(int_at(row, 1)?).map_err(|_| ERR_ROW)?,
+                    pending_cleared: int_at(row, 2)? != 0,
+                })
+            })
+            .transpose()
+    }
+
+    /// The first open's move to closed at epoch 1 (AM-83b item 6): one
+    /// batch, every statement conditioned in itself. The row moves from
+    /// no row or closed at epoch 0 to closed at epoch 1, and `pending_ops`
+    /// is emptied once, only while the row is closed at epoch 1 and not
+    /// yet emptied, so never after an open. A row in any other state is
+    /// left as it is; the caller reads it back. Never [`Self::mark_closed`].
+    pub async fn first_close(&self, reason: &str, now: UnixMs) -> Result<()> {
+        self.sql
+            .batch(vec![
+                (
+                    FIRST_CLOSE,
+                    vec![SqlValue::Text(reason.to_string()), SqlValue::Int(now.0)],
+                ),
+                (FIRST_CLEAR_PENDING, vec![]),
+                (FIRST_MARK_CLEARED, vec![]),
+            ])
+            .await
+            .map(|_| ())
+    }
+
+    /// The first open's open (AM-83b item 8): only a row closed at epoch
+    /// 1 whose pending table was emptied. `false`: no row changed.
+    pub async fn first_open_gate(&self, now: UnixMs) -> Result<bool> {
+        let changed = self.sql.exec(FIRST_OPEN, &[SqlValue::Int(now.0)]).await?;
+        Ok(changed > 0)
+    }
 }
+
+/// The gate row with the first open's column (AM-83b).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GateRow {
+    pub closed: bool,
+    pub epoch: u64,
+    /// The first open's batch emptied `pending_ops` at epoch 1.
+    pub pending_cleared: bool,
+}
+
+/// The compare-and-set of the first open: no row, or closed at epoch 0,
+/// becomes closed at epoch 1; any other row is left as it is.
+pub const FIRST_CLOSE: &str = "INSERT INTO directory_gate (id, closed, epoch, reason, closed_at, pending_cleared) \
+     VALUES (1, 1, 1, ?1, ?2, 0) \
+     ON CONFLICT (id) DO UPDATE SET epoch = 1, pending_cleared = 0, reason = excluded.reason, closed_at = excluded.closed_at \
+     WHERE directory_gate.closed = 1 AND directory_gate.epoch = 0";
+
+/// Empties `pending_ops` once: only while the row is closed at epoch 1
+/// and its first-open batch has not emptied it yet.
+pub const FIRST_CLEAR_PENDING: &str = "DELETE FROM pending_ops WHERE EXISTS \
+     (SELECT 1 FROM directory_gate WHERE id = 1 AND closed = 1 AND epoch = 1 AND pending_cleared = 0)";
+
+/// Marks the emptying done, under the same condition.
+pub const FIRST_MARK_CLEARED: &str = "UPDATE directory_gate SET pending_cleared = 1 \
+     WHERE id = 1 AND closed = 1 AND epoch = 1 AND pending_cleared = 0";
+
+/// The first open's open: only from closed at epoch 1, emptied.
+pub const FIRST_OPEN: &str = "UPDATE directory_gate SET closed = 0, opened_at = ?1 \
+     WHERE id = 1 AND closed = 1 AND epoch = 1 AND pending_cleared = 1";
 
 fn tenant_row(row: Row) -> Result<TenantRow> {
     let id = Tenant::parse(&text(&row, 0)?).ok_or(ERR_ROW)?;

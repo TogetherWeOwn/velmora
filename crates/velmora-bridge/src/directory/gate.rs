@@ -43,7 +43,7 @@ use std::collections::BTreeMap;
 
 use super::chain::{ChainError, ControlSeal, TenantChain, TENANT_CHAIN_PREFIX};
 use super::record::{Tenant, TenantDoor};
-use super::store::SqlDirectory;
+use super::store::{GateRow, SqlDirectory};
 use crate::ports::Sql;
 use crate::records::RecordStore;
 use crate::types::{BridgeError, Result, UnixMs};
@@ -238,7 +238,8 @@ const MAX_ANCHOR_TRIES: u32 = 3;
 /// on rows that keep changing under it.
 const MAX_TENANT_ROUNDS: u32 = 3;
 
-fn anchor_key(epoch: u64) -> String {
+/// The name of the anchor of `epoch`.
+pub fn anchor_key(epoch: u64) -> String {
     format!("{GATE_ANCHOR_PREFIX}{epoch:020}")
 }
 
@@ -487,6 +488,27 @@ pub async fn rebuild_tenants<S: RecordStore, C: ControlSeal, Q: Sql>(
     dir: &SqlDirectory<'_, Q>,
     now: UnixMs,
 ) -> Result<TenantStep> {
+    rebuild_tenants_in(chain, dir, now, RowsWritten::Any).await
+}
+
+/// Which statements a tenant step writes with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RowsWritten {
+    /// Every gate run but the first open.
+    Any,
+    /// The first open (AM-83b item 7): every statement also needs the gate
+    /// row still closed at epoch 1 with `pending_ops` emptied, so a run
+    /// that lost the race to another run's open writes no tenant row,
+    /// unit, route or label after it.
+    InFirstOpen,
+}
+
+async fn rebuild_tenants_in<S: RecordStore, C: ControlSeal, Q: Sql>(
+    chain: &TenantChain<'_, S, C>,
+    dir: &SqlDirectory<'_, Q>,
+    now: UnixMs,
+    scope: RowsWritten,
+) -> Result<TenantStep> {
     let heads = heads(chain).await?;
     let compared = compare(&heads, dir).await?;
     let mut step = TenantStep {
@@ -512,7 +534,14 @@ pub async fn rebuild_tenants<S: RecordStore, C: ControlSeal, Q: Sql>(
             Err(ChainError::Store(e)) => return Err(e),
             Err(_) => return Err(BridgeError::Invalid("tenant chain not readable now")),
         };
-        match dir.replace_tenant(&fresh, &observed, now).await? {
+        let written = match scope {
+            RowsWritten::Any => dir.replace_tenant(&fresh, &observed, now).await?,
+            RowsWritten::InFirstOpen => {
+                dir.replace_tenant_in_first_open(&fresh, &observed, now)
+                    .await?
+            }
+        };
+        match written {
             true => step.written += 1,
             false => step.raced += 1,
         }
@@ -529,7 +558,13 @@ pub async fn rebuild_tenants<S: RecordStore, C: ControlSeal, Q: Sql>(
                     continue;
                 }
             }
-            match dir.remove_tenant(tenant, &observed).await? {
+            let removed = match scope {
+                RowsWritten::Any => dir.remove_tenant(tenant, &observed).await?,
+                RowsWritten::InFirstOpen => {
+                    dir.remove_tenant_in_first_open(tenant, &observed).await?
+                }
+            };
+            match removed {
                 true => step.removed += 1,
                 false => step.raced += 1,
             }
@@ -550,64 +585,115 @@ pub async fn run_gate<S: RecordStore, C: ControlSeal, Q: Sql, G: GateSteps>(
     now: UnixMs,
 ) -> Result<GateRun> {
     let epoch = close(chain.store, dir, reason, now).await?;
-    run_from(chain, dir, steps, epoch, now).await
+    run_from(chain, dir, steps, Fence::Anchor(epoch), now).await
 }
 
-/// [`run_gate`] only over a gate that is closed: the gate is read again
-/// ([`is_open`]) right before the closing's anchor is put, so a run whose guard
-/// passed while another run was under way does not close the gate that
-/// run has opened since (AM-78, the first open). `None`: the gate is open
-/// now, or another closing took the epoch first; nothing was written. A
-/// closing whose anchor landed but whose row write did not (a lost answer)
-/// leaves the row closed below the newest anchor: a later call closes
-/// over it at the next epoch. The read and the put are two calls, so a
-/// gate opened between them is closed again: the caller runs one call at
-/// a time.
-pub async fn run_gate_if_closed<S: RecordStore, C: ControlSeal, Q: Sql, G: GateSteps>(
+/// The steps of the first open (AM-83b items 7 and 8), over a gate row
+/// that [`SqlDirectory::first_close`] moved to closed at epoch 1. Two
+/// first-open runs both hold epoch 1, so the anchor cannot tell them
+/// apart: before every step the run reads the row again, and stops
+/// (`closed_over`) unless it is still closed at epoch 1 with
+/// `pending_ops` emptied and anchor 1 is the only name under the anchor
+/// prefix. Every write a step makes after that read is conditioned in its
+/// own statement or is monotone: the tenant rows, units, routes and
+/// labels on the gate row still closed at epoch 1 (and on their row seq),
+/// key locations by their seq, the feed epoch by `>`, and the open itself
+/// only from closed at epoch 1. The run
+/// never empties `pending_ops` (the move to epoch 1 did, once) and never
+/// marks the row closed, so it cannot close a gate that another run
+/// opened. An open that changed no row reports `closed_over`.
+pub async fn run_first_open<S: RecordStore, C: ControlSeal, Q: Sql, G: GateSteps>(
     chain: &TenantChain<'_, S, C>,
     dir: &SqlDirectory<'_, Q>,
     steps: &G,
-    reason: &str,
     now: UnixMs,
-) -> Result<Option<GateRun>> {
-    let (anchored, _) = anchored_epoch(chain.store).await?;
-    let row = dir.gate().await?;
-    // Only a gate that is open in full is left alone. A row that says
-    // open under a newer anchor or a stray name is closed (`is_open`), and
-    // a closing over it is what opens it again.
-    if !row.closed && is_open(chain.store, dir).await? {
-        return Ok(None);
-    }
-    let epoch = anchored
-        .max(row.epoch)
-        .checked_add(1)
-        .filter(|&e| e <= MAX_EPOCH)
-        .ok_or(BridgeError::Invalid("gate epoch out of range"))?;
-    let body = serde_json::to_vec(&serde_json::json!({
-        "epoch": epoch,
-        "closed_at": now.0,
-    }))
-    .map_err(|_| BridgeError::Invalid("gate anchor"))?;
-    // Put once: of two runs that read the same anchors, one closes.
-    if !chain.store.put_if_absent(&anchor_key(epoch), body).await? {
-        return Ok(None);
-    }
-    dir.mark_closed(epoch, reason, now).await?;
-    let row = dir.gate().await?;
-    if !row.closed || row.epoch < epoch {
-        return Err(BridgeError::Invalid("gate row did not take the closing"));
-    }
-    run_from(chain, dir, steps, epoch, now).await.map(Some)
+) -> Result<GateRun> {
+    run_from(chain, dir, steps, Fence::FirstOpen, now).await
 }
 
-/// The steps of a run that closed the gate at `epoch`.
+/// How a run checks, before each step, that the gate is still its own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Fence {
+    /// A run that closed the gate at this epoch with its own anchor: the
+    /// newest anchor is still this one.
+    Anchor(u64),
+    /// The first open: [`first_open_holds`].
+    FirstOpen,
+}
+
+impl Fence {
+    fn epoch(self) -> u64 {
+        match self {
+            Fence::Anchor(epoch) => epoch,
+            Fence::FirstOpen => 1,
+        }
+    }
+
+    fn scope(self) -> RowsWritten {
+        match self {
+            Fence::Anchor(_) => RowsWritten::Any,
+            Fence::FirstOpen => RowsWritten::InFirstOpen,
+        }
+    }
+
+    async fn holds<S: RecordStore, Q: Sql>(
+        self,
+        store: &S,
+        dir: &SqlDirectory<'_, Q>,
+    ) -> Result<bool> {
+        match self {
+            Fence::Anchor(epoch) => ours(store, epoch).await,
+            Fence::FirstOpen => first_open_holds(store, dir).await,
+        }
+    }
+}
+
+/// Whether a first-open run may still write: the row is closed at epoch
+/// 1 with `pending_ops` emptied, and the only name under the anchor
+/// prefix is anchor 1. One point read and one listing of two names.
+pub async fn first_open_holds<S: RecordStore, Q: Sql>(
+    store: &S,
+    dir: &SqlDirectory<'_, Q>,
+) -> Result<bool> {
+    let held = GateRow {
+        closed: true,
+        epoch: 1,
+        pending_cleared: true,
+    };
+    if dir.gate_row().await? != Some(held) {
+        return Ok(false);
+    }
+    Ok(store.list(GATE_ANCHOR_PREFIX, "", 2).await? == [anchor_key(1)])
+}
+
+/// Whether the gate is open at epoch 1, as the first open answers it: one
+/// read of the row (open at 1), then anchor 1 as the only name under the
+/// anchor prefix. An open at a later epoch is not this.
+pub async fn open_at_one<S: RecordStore, Q: Sql>(
+    store: &S,
+    dir: &SqlDirectory<'_, Q>,
+) -> Result<bool> {
+    let open = matches!(
+        dir.gate_row().await?,
+        Some(GateRow {
+            closed: false,
+            epoch: 1,
+            ..
+        })
+    );
+    Ok(open && store.list(GATE_ANCHOR_PREFIX, "", 2).await? == [anchor_key(1)])
+}
+
+/// The steps of a run that holds the gate by `fence`.
 async fn run_from<S: RecordStore, C: ControlSeal, Q: Sql, G: GateSteps>(
     chain: &TenantChain<'_, S, C>,
     dir: &SqlDirectory<'_, Q>,
     steps: &G,
-    epoch: u64,
+    fence: Fence,
     now: UnixMs,
 ) -> Result<GateRun> {
+    let epoch = fence.epoch();
+    let scope = fence.scope();
     let mut run = GateRun {
         epoch,
         tenants: TenantStep::default(),
@@ -616,11 +702,12 @@ async fn run_from<S: RecordStore, C: ControlSeal, Q: Sql, G: GateSteps>(
         closed_over: false,
         anchor_strays: 0,
     };
-    // Before every step: a newer run that closed the gate over this one
-    // does the rest, and this one writes nothing more.
+    // Before every step: a run that no longer holds the gate (a newer run
+    // closed over it, or, in the first open, another run opened it) writes
+    // nothing more.
     macro_rules! step {
         ($name:expr, $call:expr) => {{
-            if !ours(chain.store, epoch).await? {
+            if !fence.holds(chain.store, dir).await? {
                 run.closed_over = true;
                 return Ok(run);
             }
@@ -628,11 +715,11 @@ async fn run_from<S: RecordStore, C: ControlSeal, Q: Sql, G: GateSteps>(
         }};
     }
     step!("revocations", steps.revocations());
-    if !ours(chain.store, epoch).await? {
+    if !fence.holds(chain.store, dir).await? {
         run.closed_over = true;
         return Ok(run);
     }
-    run.tenants = rebuild_tenants(chain, dir, now).await?;
+    run.tenants = rebuild_tenants_in(chain, dir, now, scope).await?;
     step!(
         "key_locations_and_registry",
         steps.key_locations_and_registry()
@@ -640,8 +727,11 @@ async fn run_from<S: RecordStore, C: ControlSeal, Q: Sql, G: GateSteps>(
     step!("key_versions", steps.key_versions());
     step!("key_routes_and_labels", steps.key_routes_and_labels());
     step!("root_units", steps.root_units());
-    // Only while the gate is closed at this run's epoch.
-    dir.clear_pending_in_gate(epoch).await?;
+    // Only while the gate is closed at this run's epoch. The first open
+    // emptied the table once, in its move to epoch 1, and never again.
+    if let Fence::Anchor(epoch) = fence {
+        dir.clear_pending_in_gate(epoch).await?;
+    }
     step!("finisher", steps.finisher());
     step!("counters", steps.counters(epoch));
     step!("sealed_days", steps.sealed_days());
@@ -660,16 +750,37 @@ async fn run_from<S: RecordStore, C: ControlSeal, Q: Sql, G: GateSteps>(
             if left.iter().any(|d| matches!(d, Difference::Damaged { .. })) {
                 break;
             }
-            rebuild_tenants(chain, dir, now).await?;
+            if fence == Fence::FirstOpen && !fence.holds(chain.store, dir).await? {
+                break;
+            }
+            rebuild_tenants_in(chain, dir, now, scope).await?;
         }
     }
     let (anchored, strays) = anchored_epoch(chain.store).await?;
     run.anchor_strays = strays;
-    run.closed_over = anchored != epoch;
+    run.closed_over = match fence {
+        Fence::Anchor(epoch) => anchored != epoch,
+        Fence::FirstOpen => !first_open_holds(chain.store, dir).await?,
+    };
     let ready = clean && !run.closed_over && run.steps.iter().all(|(_, r)| r.done);
+    if !ready {
+        return Ok(run);
+    }
+    let changed = match fence {
+        Fence::Anchor(epoch) => dir.open_gate(epoch, now).await?,
+        Fence::FirstOpen => dir.first_open_gate(now).await?,
+    };
+    // A first-open run whose open changed no row lost to another run.
+    if !changed && fence == Fence::FirstOpen {
+        run.closed_over = true;
+    }
     // Open, and say so only if the open check agrees: a stray anchor
     // name keeps the gate closed, and the run reports it.
-    run.opened = ready && dir.open_gate(epoch, now).await? && is_open(chain.store, dir).await?;
+    run.opened = changed
+        && match fence {
+            Fence::Anchor(_) => is_open(chain.store, dir).await?,
+            Fence::FirstOpen => open_at_one(chain.store, dir).await?,
+        };
     Ok(run)
 }
 
