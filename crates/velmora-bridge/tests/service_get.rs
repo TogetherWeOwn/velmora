@@ -778,7 +778,10 @@ impl Cold {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(rig.bridge.post_stage(&lease, &job).await, JobOutcome::Ack);
+        assert_eq!(
+            rig.bridge.post_stage(&TENANT_ZERO, &lease, &job).await,
+            JobOutcome::Ack
+        );
     }
 }
 
@@ -2476,3 +2479,6 @@ async fn largest_extent_fits_the_smallest_allowed_budget_cold() {
     assert!(resp.body == body);
     assert_eq!(cold.rig.bridge.budget.in_use(), 0);
 }
+
+/// The one tenant there is.
+const TENANT_ZERO: velmora_bridge::TenantScope = velmora_bridge::TenantScope::tenant_zero();

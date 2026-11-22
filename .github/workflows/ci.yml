@@ -437,6 +437,10 @@ jobs:
           # This run takes provider permits from the gate object; the
           # HTTP run above takes them from the catalogue's slot rows.
           E2E_PERMITS: "do"
+          # And its writers send job messages that name their tenant
+          # (format 2), through the real queue binding; the HTTP run
+          # above sends format 1.
+          E2E_JOB_FORMAT: "2"
         run: bash e2e/slice.sh https://127.0.0.1:8787
 
   # The console Worker (apps/console): plain JavaScript, no dependencies,

@@ -27,6 +27,7 @@ use crate::jobs::{abandon_from_var, set_abandon, DEV_ABANDON_JOB_N};
 use crate::nntp::WorkerConnector;
 use crate::queues::{binding_name, bound_queues, DropNotify, QueueSink, AUX_Q, DEV_DROP_NOTIFY_N};
 use crate::r2::{tombstone_delay_from_var, R2Blobs, DEV_TOMBSTONE_PUT_DELAY_MS};
+use velmora_bridge::jobmsg::{JobFormat, JobTenant, JOB_FORMAT_VAR};
 use velmora_bridge::remote::{RemoteConfig, S3Remote};
 
 /// Wall clock of the Workers runtime (advances on I/O only).
@@ -139,6 +140,7 @@ fn build(env: &Env) -> Result<WorkerBridge, String> {
     let cfg = BridgeConfig::from_vars(get).map_err(|e| e.to_string())?;
     let kek = KekRing::from_vars(cfg.kek_active, get).map_err(|e| e.to_string())?;
     let drop_notify = DropNotify::from_var(cfg.is_dev(), get(DEV_DROP_NOTIFY_N).as_deref())?;
+    let job_format = JobFormat::from_var(get(JOB_FORMAT_VAR).as_deref())?;
     let tombstone_delay =
         tombstone_delay_from_var(cfg.is_dev(), get(DEV_TOMBSTONE_PUT_DELAY_MS).as_deref())?;
     let abandon = abandon_from_var(cfg.is_dev(), get(DEV_ABANDON_JOB_N).as_deref())?;
@@ -185,6 +187,12 @@ fn build(env: &Env) -> Result<WorkerBridge, String> {
             queues(env, "VERIFY_Q")?,
             aux_queue(env)?,
             drop_notify,
+            // Every job of this Worker is tenant 0's: the messages it
+            // sends in the format of `v` 2 name it.
+            (
+                job_format,
+                JobTenant::of(&velmora_bridge::TenantScope::tenant_zero()),
+            ),
         )
         .map_err(|name| format!("missing binding {name}"))?,
         kek,

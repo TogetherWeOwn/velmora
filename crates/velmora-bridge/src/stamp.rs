@@ -132,17 +132,28 @@ where
     K: Kek,
     T: Clock,
 {
+    /// The id of the catalogue this bridge works on: the one of the
+    /// configuration. Its rollback stamp is raised and checked under
+    /// this id, and nothing here reads the configuration for it in
+    /// another way. A bridge is bound to one catalogue; when a tenant's
+    /// rows live in a unit of their own, the bridge of that unit answers
+    /// here with the id of the unit. The id is not made from a tenant:
+    /// a stamp row made under `main` has to stay good.
+    pub fn catalogue_id(&self) -> &str {
+        &self.cfg.catalogue_id
+    }
+
     /// The stamp row. Fails if it was created under another catalogue
     /// id: see the module text.
     pub(crate) async fn stamp_row(&self) -> Result<StampRow> {
-        self.catalog.stamp(&self.cfg.catalogue_id).await
+        self.catalog.stamp(self.catalogue_id()).await
     }
 
     /// Whether a stamp object exists after the one of `counter`.
     async fn stamp_ahead(&self, counter: Option<u64>) -> Result<bool> {
-        let dir = stamp_dir(&self.cfg.catalogue_id);
+        let dir = stamp_dir(self.catalogue_id());
         let after = match counter {
-            Some(c) => stamp_key(&self.cfg.catalogue_id, c),
+            Some(c) => stamp_key(self.catalogue_id(), c),
             None => dir.clone(),
         };
         Ok(!self.safety.list(&dir, &after, 1).await?.is_empty())
@@ -192,7 +203,7 @@ where
     /// counter of a catalogue that was not restored never moves down.
     async fn stamp_behind(&self, seen: Option<u64>) -> Result<bool> {
         self.catalog
-            .stamp_rolled_back(seen, self.clock.now(), &self.cfg.catalogue_id)
+            .stamp_rolled_back(seen, self.clock.now(), self.catalogue_id())
             .await
     }
 
@@ -229,7 +240,7 @@ where
             // value without an object is harmless.
             match self
                 .catalog
-                .stamp_advance(row.counter, &self.cfg.catalogue_id)
+                .stamp_advance(row.counter, self.catalogue_id())
                 .await
             {
                 Ok(true) => return Ok(Advance::Raised(row.counter.map_or(1, |c| c + 1))),
@@ -255,7 +266,7 @@ where
 
     /// Puts the object of a value the catalogue holds.
     pub(crate) async fn stamp_store(&self, counter: u64) -> Result<()> {
-        let key = stamp_key(&self.cfg.catalogue_id, counter);
+        let key = stamp_key(self.catalogue_id(), counter);
         // The body is the time of the raise: read by the last step of
         // a replay, and by the operator who looks for the restore point.
         let body = self.clock.now().0.to_string().into_bytes();
@@ -306,7 +317,7 @@ where
 
     /// When the stamp object of `counter` was raised.
     async fn stamp_time(&self, counter: u64) -> Result<UnixMs> {
-        let key = stamp_key(&self.cfg.catalogue_id, counter);
+        let key = stamp_key(self.catalogue_id(), counter);
         let body = self.safety.get(&key, None).await?.ok_or(ERR_STAMP_BODY)?;
         std::str::from_utf8(&body)
             .ok()
@@ -354,11 +365,11 @@ where
     /// list calls follows the raises since the restore point, not the
     /// age of the bucket.
     async fn stamp_top(&self, counter: Option<u64>) -> Result<u64> {
-        let dir = stamp_dir(&self.cfg.catalogue_id);
+        let dir = stamp_dir(self.catalogue_id());
         let mut top = 0;
         let mut after = match counter {
             // The object of the counter itself may be the newest one.
-            Some(c) if c > 0 => stamp_key(&self.cfg.catalogue_id, c - 1),
+            Some(c) if c > 0 => stamp_key(self.catalogue_id(), c - 1),
             _ => dir.clone(),
         };
         loop {
