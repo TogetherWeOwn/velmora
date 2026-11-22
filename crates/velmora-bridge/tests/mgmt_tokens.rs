@@ -7,10 +7,13 @@
 use std::collections::BTreeSet;
 
 use sha2::{Digest, Sha256};
+use velmora_bridge::crypto::scheme2::{
+    parse_control, seal_control, ControlOwner, ControlSealer, PrivateKeyRef,
+};
 use velmora_bridge::mgmt::token::{
-    authenticate, id_of_hash, list_disabled, write_disable, Actor, DisabledTokens, Refused, Scope,
-    TokenClass, TokenHashes, TokenId, DISABLED_TOKEN_PREFIX, LIST_AGAIN_SHUT_MS, LIST_EVERY_MS,
-    STALE_AFTER_MS,
+    authenticate, id_of_hash, list_disabled, read_disable, write_disable, Actor, DisabledTokens,
+    Refused, Scope, TokenClass, TokenHashes, TokenId, DISABLED_TOKEN_PREFIX, DISABLE_LABEL,
+    LIST_AGAIN_SHUT_MS, LIST_EVERY_MS, STALE_AFTER_MS,
 };
 use velmora_bridge::recovery::{is_protected_key, record_name, Unpublished};
 use velmora_bridge::testkit::{MemBlobStore, TestKek};
@@ -532,4 +535,67 @@ fn a_shut_door_lists_again_soon() {
         UnixMs(T0.0 + LIST_AGAIN_SHUT_MS)
     )
     .is_ok());
+}
+
+/// A disable record is a control record with a door part only: the control key opens it under its
+/// own name, it names its kind and token, and it opens under no other name.
+#[tokio::test(flavor = "current_thread")]
+async fn a_disable_record_is_a_door_only_control_record() {
+    let store = MemBlobStore::new();
+    let kek = TestKek::new();
+    let id = id_of_hash(&hash(STANDARD)).unwrap();
+    let other = id_of_hash(&hash(CONFIRMED)).unwrap();
+    assert_eq!(read_disable(&store, &kek, &id).await.unwrap(), None);
+    write_disable(&store, &kek, &id, T0).await.unwrap();
+    assert_eq!(read_disable(&store, &kek, &id).await.unwrap(), Some(T0));
+
+    let name = id.disable_record();
+    let bytes = store.stored(&name).unwrap().bytes;
+    let envelope = parse_control(&bytes).unwrap();
+    assert_eq!(envelope.private_key(), PrivateKeyRef::None);
+    let opened = envelope
+        .open_door(&kek, &name, ControlOwner::Global)
+        .unwrap();
+    let body: serde_json::Value = serde_json::from_slice(opened.door()).unwrap();
+    assert_eq!(body["label"], DISABLE_LABEL);
+    assert_eq!(body["token"], id.as_str());
+    assert_eq!(body["disabled_at"], T0.0);
+
+    // Moved to another token's name, it does not open: the name is in the authenticated data.
+    let moved = other.disable_record();
+    assert!(parse_control(&bytes)
+        .unwrap()
+        .open_door(&kek, &moved, ControlOwner::Global)
+        .is_err());
+    let meta = BlobMeta {
+        bucket: &BucketId::new("-"),
+        extent: &ExtentId::new(other.as_str()),
+        cipher_sha256: &Sha256::digest(&bytes).into(),
+    };
+    store.put(&moved, bytes.clone(), &meta).await.unwrap();
+    assert!(read_disable(&store, &kek, &other).await.is_err());
+    // It still disables by its name alone: the gate never opens it.
+    assert!(list_disabled(&store).await.unwrap().contains(&other));
+
+    // Another control kind sealed under a disable name is not a disable record.
+    let third = TokenId::parse("00000000000000aa").unwrap();
+    let foreign = seal_control(
+        &kek,
+        &third.disable_record(),
+        &ControlSealer::Global,
+        br#"{"v":1,"tenant":"t_0123456789abcdef","access_key_id":"AKIAEXAMPLE","revoked_at":1}"#,
+        None,
+        &mut velmora::rng::SystemRng,
+    )
+    .unwrap();
+    let meta = BlobMeta {
+        bucket: &BucketId::new("-"),
+        extent: &ExtentId::new(third.as_str()),
+        cipher_sha256: &Sha256::digest(&foreign).into(),
+    };
+    store
+        .put(&third.disable_record(), foreign, &meta)
+        .await
+        .unwrap();
+    assert!(read_disable(&store, &kek, &third).await.is_err());
 }

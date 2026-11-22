@@ -38,17 +38,21 @@
 //!
 //! A record is recognised by its name alone, as `m/rk/` is: forging one
 //! needs write access to the record store and can only refuse a token.
+//! It is a control record with a door part only (`seal_control`, the
+//! owner "global"): the control key seals it, its name is in the
+//! authenticated data, and its body says [`DISABLE_LABEL`], so a record
+//! of another kind can never pass for one ([`read_disable`]).
 
 use std::collections::BTreeSet;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use velmora::rng::SystemRng;
 
-use crate::crypto::seal_manifest;
+use crate::crypto::scheme2::{parse_control, seal_control, ControlOwner, ControlSealer};
 use crate::ports::{BlobMeta, BlobStore, Kek};
-use crate::types::{BucketId, ExtentId, Result, UnixMs};
+use crate::types::{BridgeError, BucketId, ExtentId, Result, UnixMs};
 
 /// Worker secret: the hashes of the standard token.
 pub const STANDARD_HASHES: &str = "MGMT_TOKEN_SHA256_STANDARD";
@@ -57,6 +61,11 @@ pub const CONFIRMED_HASHES: &str = "MGMT_TOKEN_SHA256_CONFIRMED";
 
 /// The records that disable a token: this prefix and the token id.
 pub const DISABLED_TOKEN_PREFIX: &str = "m/rst/";
+
+/// The kind a disable record's body names.
+pub const DISABLE_LABEL: &str = "velmora/rst/v1";
+
+const ERR_DISABLE: BridgeError = BridgeError::Invalid("token disable record is malformed");
 
 /// How often an isolate lists [`DISABLED_TOKEN_PREFIX`], at most, while
 /// its list is fresh.
@@ -503,11 +512,14 @@ pub async fn list_disabled<B: BlobStore>(records: &B) -> Result<BTreeSet<TokenId
 }
 
 /// The content of a disable record. Only its name counts; the content
-/// says when and is sealed like every other record.
-#[derive(Serialize)]
-struct DisableRecord<'a> {
+/// says what it is and when, sealed as a control record with a door part
+/// only.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DisableRecord {
+    label: String,
     v: u32,
-    token: &'a str,
+    token: String,
     disabled_at: i64,
 }
 
@@ -526,12 +538,21 @@ pub async fn write_disable<B: BlobStore, K: Kek>(
         return Ok(());
     }
     let plain = serde_json::to_vec(&DisableRecord {
+        label: DISABLE_LABEL.to_string(),
         v: 1,
-        token: token.as_str(),
+        token: token.as_str().to_string(),
         disabled_at: now.0,
     })
-    .unwrap_or_default();
-    let sealed = seal_manifest(kek, &name, &plain, &mut SystemRng)?;
+    .map_err(|_| ERR_DISABLE)?;
+    // Door part only: a token must be disabled without any tenant key.
+    let sealed = seal_control(
+        kek,
+        &name,
+        &ControlSealer::Global,
+        &plain,
+        None,
+        &mut SystemRng,
+    )?;
     let sha: [u8; 32] = Sha256::digest(&sealed).into();
     // No bucket and no extent: the descriptive metadata says "-" and the
     // token id, as a key revocation says its key id.
@@ -541,6 +562,27 @@ pub async fn write_disable<B: BlobStore, K: Kek>(
         cipher_sha256: &sha,
     };
     records.put(&name, sealed, &meta).await
+}
+
+/// When `token` was disabled, read from its record; `None` when there is
+/// none. Proves the record with the control key and refuses one whose
+/// body is not a disable record of this token. The gate never calls it:
+/// the name alone disables. It is for the operator's view of a disable.
+pub async fn read_disable<B: BlobStore, K: Kek>(
+    records: &B,
+    kek: &K,
+    token: &TokenId,
+) -> Result<Option<UnixMs>> {
+    let name = token.disable_record();
+    let Some(bytes) = records.get(&name, None).await? else {
+        return Ok(None);
+    };
+    let opened = parse_control(&bytes)?.open_door(kek, &name, ControlOwner::Global)?;
+    let body: DisableRecord = serde_json::from_slice(opened.door()).map_err(|_| ERR_DISABLE)?;
+    if body.label != DISABLE_LABEL || body.v != 1 || body.token != token.as_str() {
+        return Err(ERR_DISABLE);
+    }
+    Ok(Some(UnixMs(body.disabled_at)))
 }
 
 /// The id of the token whose SHA-256 is `hash_hex`: what an operator
