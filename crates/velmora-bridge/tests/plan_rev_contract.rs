@@ -465,6 +465,8 @@ fn set_list(w: &[String], mut j: usize) -> &[String] {
                     break;
                 }
             }
+            // `IS [NOT] DISTINCT FROM` is a comparison, not a clause.
+            "from" if depth == 0 && j > start && w[j - 1] == "distinct" => {}
             "where" | "returning" | "from" | ";" if depth == 0 => break,
             _ => {}
         }
@@ -719,6 +721,7 @@ fn the_scanner_finds_a_statement_however_it_is_written() {
         "const X: &str = \"UPDATE extents SET note = ')', 'plan_rev' = 2\";",
         "const X: &str = \"UPDATE extents SET n = (SELECT 1 AS \\\"(\\\"), 'plan_rev' = 2\";",
         "const X: &str = \"UPDATE extents SET \\\"where\\\" = 1, plan_rev = 2\";",
+        "const X: &str = \"UPDATE extents SET n = a IS NOT DISTINCT FROM b, plan_rev = 2\";",
         // A named parameter is not a keyword.
         "const X: &str = \"UPDATE extents SET last_verified_at = :where, plan_rev = 2 WHERE id = :id\";",
         "const X: &str = \"UPDATE extents SET last_verified_at = @where, plan_rev = 2\";",

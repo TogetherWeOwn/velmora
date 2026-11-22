@@ -40,6 +40,10 @@ WORKERD=$REPO/workers/s3-bridge/node_modules/@cloudflare/workerd-linux-64/bin/wo
 
 log() { printf '[unit-suite %s] %s\n' "$(date -u +%H:%M:%S)" "$*" >&2; }
 
+for tool in cargo curl jq python3; do
+  command -v "$tool" >/dev/null || { log "needs $tool on PATH"; exit 1; }
+done
+
 if [ ! -x "$WORKERD" ]; then
   log "installing the pinned deploy tooling (npm ci in workers/s3-bridge)"
   (cd "$REPO/workers/s3-bridge" && npm ci --silent)

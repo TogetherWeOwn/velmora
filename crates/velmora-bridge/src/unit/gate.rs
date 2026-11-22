@@ -138,7 +138,10 @@ impl GateFindings {
     /// all of them while the replay is not whole or the rows are not
     /// classified; then the classified live ids.
     fn live_held(&self) -> (&[String], u64) {
-        match (self.whole(), &self.held_missing_live) {
+        // A classification covers the listed rows only: with rows beyond
+        // the list, all of them count.
+        let listed = self.held_missing.len() as u64 == self.held_missing_rows();
+        match (self.whole() && listed, &self.held_missing_live) {
             (true, Some(live)) => (live, live.len() as u64),
             _ => (&self.held_missing, self.held_missing_rows()),
         }
@@ -506,6 +509,11 @@ mod tests {
         assert_eq!(g.held_missing_live, None);
         assert_eq!(g.held_missing_live(), 3);
         assert!(matches!(lift(&g, &live_only), Lift::Closed { .. }));
+        // Rows beyond the list are not covered by a classification.
+        let mut h = f.clone();
+        h.held_missing_total = 3;
+        assert_eq!(h.held_missing_live(), 3);
+        assert!(matches!(lift(&h, &live_only), Lift::Closed { .. }));
         f.held_missing_live = Some(Vec::new());
         // The same classification on a replay that is not whole counts
         // nothing aside.
