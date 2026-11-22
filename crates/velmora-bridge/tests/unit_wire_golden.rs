@@ -497,7 +497,7 @@ fn nested() -> Value {
         "reserve_refusal": every!(ReserveRefusal: CapReached, GrantNotHeld,
             GrantLimitsNotServed, TooManyGrants, ActingPrincipalUnknown,
             ActingPrincipalInactive, ActingPrincipalHeld, OwnerRefAmbiguous,
-            BucketAlreadyExists, PrincipalExists, Conflict, InternalKeyRefused, NotFound, RidTaken,
+            BucketAlreadyExists, PrincipalExists, Conflict, InternalKeyRefused, NotFound, BucketNotFound, RidTaken,
             Malformed),
         "size_refusal": every!(SizeRefusal: DatabaseFull, TooManyExtents),
         "reservation_bodies": reservation_bodies(),

@@ -433,10 +433,11 @@ struct Row {
 /// whether this call wrote it or found it), and `answers` are kept for
 /// the reservations that are applied and have none yet. A principal
 /// whose record closes or narrows it (any status but `active`, a grant
-/// it held that no grant of the record covers, or a held record, which
-/// may lack its private grant parts) has its other open reservations
-/// that are not bound to a creator grant cancelled, and their cap slots
-/// given back.
+/// it held on a bucket the unit holds that no grant of the record
+/// covers, or a held record, which may lack its private grant parts) has
+/// its other open reservations that are not bound to a creator grant
+/// cancelled, and their cap slots given back. A dropped grant on a
+/// bucket id the unit holds no row for narrows nothing (AM-61).
 pub fn apply<S: Sql>(
     sql: &S,
     keys_seq: u64,
@@ -467,13 +468,19 @@ pub fn apply<S: Sql>(
             if let Some(r) = &row {
                 let before = grants_of(sql, &e.id)?;
                 // A held record may come without its private grant parts:
-                // it never counts as keeping a limited grant.
-                let kept = !e.held
+                // it never counts as keeping a limited grant. A grant
+                // dropped on a bucket id the unit holds no bucket row for
+                // opened nothing, so dropping it narrows nothing (AM-61).
+                let mut kept = !e.held
                     && e.status == SubjectStatus::Active
-                    && r.status == SubjectStatus::Active
-                    && before
-                        .iter()
-                        .all(|old| e.grants.iter().any(|new| new.covers(old)));
+                    && r.status == SubjectStatus::Active;
+                for old in &before {
+                    if !kept {
+                        break;
+                    }
+                    kept = e.grants.iter().any(|new| new.covers(old))
+                        || !bucket_exists(sql, &old.bucket_id)?;
+                }
                 if !kept && (e.last_seq > r.last_seq || e.status == SubjectStatus::Revoked) {
                     reserve::cancel_open(sql, &e.id, e.rid.as_ref())?;
                 }
@@ -525,6 +532,15 @@ pub fn apply<S: Sql>(
         reserved,
         kept,
     })
+}
+
+/// Whether the unit holds a bucket row with this id.
+pub(crate) fn bucket_exists<S: Sql>(sql: &S, bucket_id: &str) -> Result<bool> {
+    Ok(!poll_once(sql.query(
+        "SELECT 1 FROM buckets WHERE id = ?1",
+        &[SqlValue::Text(bucket_id.to_string())],
+    ))??
+    .is_empty())
 }
 
 /// The subjects the unit holds closed and not revoked: they are sent

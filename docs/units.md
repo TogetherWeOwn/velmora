@@ -185,8 +185,10 @@ change. In one transaction the unit:
    `409 principal_exists` otherwise); the id it makes must be new; the
    bucket name must be no bucket's and held by no other open call; the
    `owner_ref` of a principal create held by no other open call; every
-   grant no wider than the acting principal's effective grant (bucket
-   and access; a sign-up principal without an acting principal has none);
+   grant on a bucket the unit holds (`404 bucket_not_found` otherwise,
+   for a key create, a principal create and a widening alike; AM-61) and
+   no wider than the acting principal's effective grant (bucket and
+   access; a sign-up principal without an acting principal has none);
    then the caps: 30 capped changes an hour, 50 bucket creates a day, 20
    active S3 keys and 20 app passwords (open reservations count). Then
    the row is kept `reserved`, and its cap slot (`unit_cap_uses`) is
@@ -203,7 +205,9 @@ and keeps the answer the Worker passes with it (once; a 2xx status and a
 JSON object of at most 16 KiB with no `secret_access_key`, or none is
 kept and the Worker builds the answer from the chain). A record that
 closes or narrows a principal (any status but `active`, or a grant it
-held that no grant of the record covers) cancels that principal's
+held on a bucket the unit holds that no grant of the record covers; a
+grant dropped on a bucket id the unit holds no row for opened nothing,
+so it narrows nothing, AM-61) cancels that principal's
 other open reservations that are not bound to a creator grant, and
 gives their cap slots back (a held principal record counts as a
 narrowing: it may come without its private grant parts). Each

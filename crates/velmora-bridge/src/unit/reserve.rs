@@ -288,6 +288,10 @@ pub enum ReserveRefusal {
     /// The subject of a grant change is not held, or is revoked:
     /// `404 key_not_found`.
     NotFound,
+    /// A grant names a bucket id the unit holds no bucket row for, in a
+    /// key create, a principal create or a widening (AM-61):
+    /// `404 bucket_not_found`.
+    BucketNotFound,
     /// The `rid` is another reservation's: the Worker draws again.
     RidTaken,
     /// The ask cannot be one: `400 bad_request`.
@@ -1058,6 +1062,14 @@ fn check<S: Sql>(
         let Some(p) = acting else {
             return Ok(Err(Malformed));
         };
+        // AM-61: a grant on a bucket the unit does not hold is refused as
+        // such, before the subset rule (which could only say "not held").
+        // A bucket create's creator grant is the writer's, in no ask.
+        for g in grants {
+            if !keys::bucket_exists(sql, &g.bucket_id)? {
+                return Ok(Err(BucketNotFound));
+            }
+        }
         if !subset(sql, &p.id, grants)? {
             return Ok(Err(GrantNotHeld));
         }

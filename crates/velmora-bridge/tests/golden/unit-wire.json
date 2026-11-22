@@ -1290,6 +1290,7 @@
       "conflict",
       "internal_key_refused",
       "not_found",
+      "bucket_not_found",
       "rid_taken",
       "malformed"
     ],

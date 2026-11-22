@@ -167,7 +167,7 @@ fn ready() -> Unit<RusqliteSql> {
     u.sql()
         .apply(&format!(
             "INSERT INTO buckets(id, name, owner, bdk_wrapped, kek_version, created_at) \
-               VALUES ('{B1}', 'alpha', 'o', x'02', 1, 1);"
+               VALUES ('{B1}', 'alpha', 'o', x'02', 1, 1), ('{B2}', 'held-two', 'o', x'02', 1, 1);"
         ))
         .unwrap();
     apply(
@@ -564,7 +564,6 @@ fn a_grant_wider_than_the_acting_principals_is_refused() {
     let ask = |grants| reserve_op(1, 1, 1, by_owner(), new_key("AK1", grants));
     for grants in [
         vec![grant(B2, Access::Rw)],
-        vec![grant("b_00000000000000f9", Access::Ro)],
         vec![grant(B1, Access::Rw), grant(B2, Access::Rw)],
     ] {
         assert_eq!(
@@ -572,6 +571,14 @@ fn a_grant_wider_than_the_acting_principals_is_refused() {
             Some(ReserveRefusal::GrantNotHeld)
         );
     }
+    // A bucket the unit does not hold: named as such (AM-61).
+    assert_eq!(
+        refused(&worker(
+            &u,
+            ask(vec![grant("b_00000000000000f9", Access::Ro)])
+        )),
+        Some(ReserveRefusal::BucketNotFound)
+    );
     assert!(matches!(
         worker(&u, ask(vec![grant(B1, Access::Rw), grant(B2, Access::Ro)])),
         UnitAnswer::Ok { .. }
@@ -904,6 +911,159 @@ fn a_record_that_narrows_or_closes_the_principal_cancels_its_open_reservations()
         vec![],
     );
     assert_eq!(state_of(&u, 2), None);
+}
+
+/// AM-61: a bucket id the unit holds no bucket row for.
+const ORPHAN: &str = "b_00000000000000f9";
+
+/// AM-61: a record whose only change drops grants on bucket ids the unit
+/// holds no row for narrows nothing, so it cancels no reservation; a
+/// record that also drops a grant on a bucket the unit holds does.
+#[test]
+fn dropping_only_a_grant_on_a_bucket_the_unit_does_not_hold_cancels_nothing() {
+    let u = ready();
+    // The principal gains a grant on a bucket the unit does not hold (a
+    // widening, which cancels nothing).
+    apply(
+        &u,
+        vec![principal_entry(
+            P,
+            OWNER,
+            2,
+            SubjectStatus::Active,
+            false,
+            vec![
+                grant(B1, Access::Rw),
+                grant(B2, Access::Ro),
+                grant(ORPHAN, Access::Rw),
+            ],
+        )],
+        vec![],
+    );
+    ok(worker(
+        &u,
+        reserve_op(
+            1,
+            1,
+            1,
+            by_owner(),
+            new_key("AK1", vec![grant(B1, Access::Ro)]),
+        ),
+    ));
+    // The orphan grant is dropped, or narrowed: the reservation stays.
+    for (seq, orphan) in [(3, vec![grant(ORPHAN, Access::Ro)]), (4, vec![])] {
+        let mut grants = vec![grant(B1, Access::Rw), grant(B2, Access::Ro)];
+        grants.extend(orphan);
+        apply(
+            &u,
+            vec![principal_entry(
+                P,
+                OWNER,
+                seq,
+                SubjectStatus::Active,
+                false,
+                grants,
+            )],
+            vec![],
+        );
+        assert_eq!(state_of(&u, 1).as_deref(), Some("reserved"), "seq {seq}");
+    }
+    // A grant on a bucket the unit holds is dropped too: cancelled.
+    apply(
+        &u,
+        vec![principal_entry(
+            P,
+            OWNER,
+            5,
+            SubjectStatus::Active,
+            false,
+            vec![grant(B1, Access::Rw)],
+        )],
+        vec![],
+    );
+    assert_eq!(state_of(&u, 1), None);
+}
+
+/// AM-61: an ask that grants on a bucket id the unit holds no row for is
+/// refused `bucket_not_found` (key create, principal create, widening),
+/// before the subset rule, and nothing is kept.
+#[test]
+fn a_grant_on_a_bucket_the_unit_does_not_hold_is_refused_as_not_found() {
+    let u = ready();
+    let not_found = Some(ReserveRefusal::BucketNotFound);
+    assert_eq!(
+        refused(&worker(
+            &u,
+            reserve_op(
+                1,
+                1,
+                1,
+                by_owner(),
+                new_key(
+                    "AK1",
+                    vec![grant(B1, Access::Ro), grant(ORPHAN, Access::Ro)]
+                ),
+            ),
+        )),
+        not_found
+    );
+    assert_eq!(
+        refused(&worker(
+            &u,
+            reserve_op(
+                2,
+                2,
+                2,
+                by_owner(),
+                Opening::Principal {
+                    id: "p_new".into(),
+                    owner_ref: "member-9".into(),
+                    grants: vec![grant(ORPHAN, Access::Ro)],
+                },
+            ),
+        )),
+        not_found
+    );
+    // A widening of a held key onto it.
+    ok(worker(
+        &u,
+        reserve_op(
+            3,
+            3,
+            3,
+            by_owner(),
+            new_key("AK3", vec![grant(B1, Access::Ro)]),
+        ),
+    ));
+    apply(
+        &u,
+        vec![key_entry(
+            "AK3",
+            2,
+            vec![grant(B1, Access::Ro)],
+            Some(rid(3)),
+        )],
+        vec![],
+    );
+    assert_eq!(
+        refused(&worker(
+            &u,
+            reserve_op(
+                4,
+                4,
+                4,
+                by_owner(),
+                Opening::Grants {
+                    subject: "AK3".into(),
+                    grants: vec![grant(B1, Access::Ro), grant(ORPHAN, Access::Ro)],
+                },
+            ),
+        )),
+        not_found
+    );
+    assert_eq!(state_of(&u, 1), None);
+    assert_eq!(state_of(&u, 2), None);
+    assert_eq!(state_of(&u, 4), None);
 }
 
 #[test]
@@ -1900,7 +2060,7 @@ fn import_buckets(u: &Unit<RusqliteSql>, scheme: u8) -> UnitAnswer {
                 after: None,
                 cursor: "c1".into(),
                 rows: vec![vec![
-                    t(B2),
+                    t("b_00000000000000f3"),
                     t("beta"),
                     t(P),
                     ImportValue::Blob(wrap),
