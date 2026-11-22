@@ -1571,6 +1571,7 @@ dependencies = [
  "tokio",
  "velmora",
  "velmora-bridge",
+ "velmora-mgmt-types",
  "velmora-s3-proto",
  "velmora-test-nntp",
  "zeroize",
@@ -1582,6 +1583,15 @@ version = "0.1.0"
 dependencies = [
  "velmora",
  "velmora-bridge",
+]
+
+[[package]]
+name = "velmora-mgmt-types"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2",
 ]
 
 [[package]]

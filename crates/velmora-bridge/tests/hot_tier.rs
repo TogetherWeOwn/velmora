@@ -668,7 +668,11 @@ async fn pinned_extents_are_never_evicted_however_far_over_the_cap() {
 
     // A week later the verified one is released, after a fresh read-back,
     // and only then can it go. The unverified one stays.
-    hot.bridge().clock.advance_secs(WEEK_SECS);
+    // (The release's own wake-up went with the jobs dropped above, so
+    // the dispatcher sends it once its mark has aged.)
+    hot.bridge()
+        .clock
+        .advance_secs(WEEK_SECS + velmora_bridge::jobs::RESEND_SECS);
     hot.bridge().dispatch().await.unwrap();
     hot.pump_if(|job| matches!(job, Job::Extent { extent, .. } if *extent == young.id))
         .await;

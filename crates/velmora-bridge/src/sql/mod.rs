@@ -643,6 +643,9 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
     async fn mark_sent(&self, extents: &[ExtentId], now: UnixMs) -> Result<u64> {
         outbox::mark_sent(self, extents, now).await
     }
+    async fn unmark_sent(&self, jobs: &[crate::types::Job], mark: UnixMs) -> Result<u64> {
+        outbox::unmark_sent(self, jobs, mark).await
+    }
     async fn bury_exhausted(&self, max_attempts: u32, now: UnixMs) -> Result<u64> {
         outbox::bury_exhausted(self, max_attempts, now).await
     }

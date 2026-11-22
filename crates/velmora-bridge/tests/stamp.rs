@@ -824,7 +824,7 @@ async fn a_tick_whose_check_fails_sends_no_job() {
     rig.bridge.raise_stamp().await.unwrap();
     rig.bridge.jobs.inner.take();
     // The tick has something to send.
-    sql(&rig, "UPDATE outbox SET next_at = 0;");
+    sql(&rig, "UPDATE outbox SET next_at = 0, sent_at = NULL;");
 
     // The bucket cannot be listed.
     rig.bridge.safety.fail_list.set(true);
@@ -971,7 +971,7 @@ async fn a_stamp_of_another_catalogue_id_is_not_used() {
     rig.put(&signer, BUCKET, "a", b"a").await.expect(200);
     rig.bridge.raise_stamp().await.unwrap();
     rig.bridge.jobs.inner.take();
-    sql(&rig, "UPDATE outbox SET next_at = 0;");
+    sql(&rig, "UPDATE outbox SET next_at = 0, sent_at = NULL;");
 
     let set_id = |rig: &mut Rig, id: &str| {
         Rc::get_mut(&mut rig.bridge).unwrap().cfg.catalogue_id = id.to_string();

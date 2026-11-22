@@ -43,7 +43,7 @@ pub type WorkerBridge =
     Bridge<SqlCatalog<D1Sql>, R2Blobs, WorkerConnector, QueueSink, KekRing, WorkerClock>;
 
 /// Var or secret by name; `None` when absent.
-fn lookup(env: &Env, name: &str) -> Option<String> {
+pub(crate) fn lookup(env: &Env, name: &str) -> Option<String> {
     env.var(name)
         .map(|v| v.to_string())
         .or_else(|_| env.secret(name).map(|s| s.to_string()))

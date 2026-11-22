@@ -315,6 +315,7 @@ async fn list_shows_ids_grants_and_times_never_secrets() {
         find(&a.akid),
         &json!({
             "access_key_id": a.akid,
+            "kind": "s3",
             "status": "active",
             "created_at": rig.now().0,
             "grants": [
@@ -331,7 +332,10 @@ async fn list_shows_ids_grants_and_times_never_secrets() {
     for k in keys {
         let mut fields: Vec<&String> = k.as_object().unwrap().keys().collect();
         fields.sort();
-        assert_eq!(fields, ["access_key_id", "created_at", "grants", "status"]);
+        assert_eq!(
+            fields,
+            ["access_key_id", "created_at", "grants", "kind", "status"]
+        );
     }
 
     // `after` pages by id.
@@ -1087,4 +1091,66 @@ async fn admin_refusals_of_the_precheck_are_no_store() {
     ] {
         assert_eq!(ingress::url_authority(url), host, "{url}");
     }
+}
+
+/// `kind: app_password` mints an `APVL` key pair that the S3 entry point
+/// refuses; a bad kind is refused before anything is written.
+#[tokio::test]
+async fn app_passwords_are_minted_with_their_own_prefix() {
+    let rig = rig();
+    rig.bucket(BUCKET, true).await;
+    let r = admin(
+        &rig,
+        Method::Post,
+        "/_admin/keys",
+        Some(json!({ "buckets": [BUCKET], "perm": "rw", "kind": "app_password" })),
+    )
+    .await;
+    assert_eq!(r.status, 200, "{}", r.text());
+    let v: Value = serde_json::from_slice(&r.body).unwrap();
+    assert_eq!(v["kind"], "app_password");
+    let app = Signer::new(
+        v["access_key_id"].as_str().unwrap(),
+        v["secret"].as_str().unwrap(),
+    );
+    assert!(
+        app.akid.starts_with("APVL") && app.akid.len() == 20,
+        "{}",
+        app.akid
+    );
+    let s3 = mint(&rig, &[BUCKET], "rw").await;
+    assert!(s3.akid.starts_with("AKVL"), "{}", s3.akid);
+
+    let r = rig.put(&app, BUCKET, "k", b"x").await;
+    assert_eq!(r.status, 403, "{}", r.text());
+    assert!(r.text().contains("InvalidAccessKeyId"));
+    assert_eq!(rig.put(&s3, BUCKET, "k", b"x").await.status, 200);
+
+    let v: Value = serde_json::from_slice(&list(&rig, "").await.body).unwrap();
+    let kinds: Vec<(String, String)> = v["keys"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|k| {
+            (
+                k["access_key_id"].as_str().unwrap().to_string(),
+                k["kind"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect();
+    assert!(kinds.contains(&(app.akid.clone(), "app_password".into())));
+    assert!(kinds.contains(&(s3.akid.clone(), "s3".into())));
+
+    let keys_before = rig.count("access_keys");
+    for bad in ["internal", "S3", ""] {
+        let r = admin(
+            &rig,
+            Method::Post,
+            "/_admin/keys",
+            Some(json!({ "buckets": [BUCKET], "perm": "ro", "kind": bad })),
+        )
+        .await;
+        assert_eq!(r.status, 400, "{bad}: {}", r.text());
+    }
+    assert_eq!(rig.count("access_keys"), keys_before);
 }

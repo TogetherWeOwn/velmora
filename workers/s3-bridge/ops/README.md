@@ -204,9 +204,15 @@ and its record may already be stored (a later restore then deletes the
 key): send the call again until it answers `204` or `404`. Revocation is accepted
 under maintenance and during a replay.
 
-`GET /_admin/keys` lists every key: id, status, created time and its
-grants (bucket and permission), never a secret, 500 per page in id
+`GET /_admin/keys` lists every key: id, kind, status, created time and
+its grants (bucket and permission), never a secret, 500 per page in id
 order; follow `next` with `?after=<next>`.
+
+An **app password** is a key pair for the WebDAV gateway only: mint it
+with `"kind":"app_password"` in the `POST /_admin/keys` body. Its id
+starts with `APVL`. The S3 endpoint refuses it (`403
+InvalidAccessKeyId`), and the WebDAV entry point refuses every other
+key; nothing else about it differs (grants, revocation).
 
 ## Granting a key on another bucket
 
@@ -1418,8 +1424,9 @@ KEK.
 
 ## Naming a wasm frame
 
-The deployed wasm has no `name` section (bundle.sh drops it to stay
-under the size budget), so a panic's message is logged as before but
+The deployed wasm has no `name` section (bundle.sh drops it to keep the
+bundle small: about 800 KB, about 8 ms on a request served by a new
+isolate), so a panic's message is logged as before but
 its trace frames read `wasm-function[N]:0xOFF` instead of Rust function
 names. To name a frame:
 

@@ -62,14 +62,14 @@ use crate::ports::{
 use crate::recovery::{id_after, write_generation};
 use crate::service::common::{
     auth_refused, check_precondition, discard_refused, discard_unless_present, header_refused,
-    hold_precondition, host_refused, precondition, restore_gate, writes_refused, REGION_ALIASES,
+    hold_precondition, host_refused, precondition, restore_gate, send_post_jobs, writes_refused,
+    REGION_ALIASES,
 };
 use crate::service::slices::{store_slices, SliceError, SliceSink};
 use crate::types::{
     Body, BridgeError, Bucket, CompleteUpload, ExtentId, ExtentPlacement, ExtentRow, ExtentState,
-    GenerationRow, GenerationState, Job, KeyStatus, OutboxStage, PartExtent, Perm, RespBody,
-    S3Request, S3Response, SafetyState, UploadId, UploadPartRow, UploadRow, UploadState, WriteId,
-    JOB_VERSION,
+    GenerationRow, GenerationState, KeyStatus, PartExtent, Perm, RespBody, S3Request, S3Response,
+    SafetyState, UploadId, UploadPartRow, UploadRow, UploadState, WriteId,
 };
 
 /// Smallest non-final part.
@@ -83,17 +83,6 @@ pub const MAX_COMPLETE_BODY_BYTES: u64 = 2 * 1024 * 1024;
 const COMPLETE_ATTEMPTS: u32 = 3;
 /// `KeyMode::Random`.
 const KEY_MODE_RANDOM: u8 = 1;
-/// Queue messages of one `send_many`.
-const JOB_BATCH: usize = 100;
-
-/// Headers the edge adds. They are never signed and their values are not
-/// always printable ASCII, so they are dropped before header validation.
-/// Dropping a header can only fail a signature, never satisfy one.
-fn edge_header(name: &str) -> bool {
-    name.starts_with("cf-")
-        || name.starts_with("x-forwarded-")
-        || matches!(name, "cdn-loop" | "x-real-ip" | "true-client-ip")
-}
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -415,7 +404,7 @@ where
     let fields: Vec<(&str, &str)> = req
         .headers
         .iter()
-        .filter(|(n, _)| !edge_header(n))
+        .filter(|(n, _)| !crate::entry::dropped_header(n))
         .map(|(n, v)| (n.as_str(), v.as_str()))
         .collect();
     let headers = Headers::new(&fields, &policy);
@@ -434,7 +423,10 @@ where
 
     let mut authority = OneKey::default();
     let mut bucket = None;
-    if let Some(akid) = presented_access_key(&target, &headers) {
+    // The entry point admits one kind of key (`crate::entry`): a key of
+    // the other kind is looked up as if it did not exist.
+    let entry = crate::entry::Entry::of(&req.headers);
+    if let Some(akid) = presented_access_key(&target, &headers).filter(|akid| entry.admits(akid)) {
         // Unknown and disabled keys look the same: no credential.
         let row = bridge.catalog.access_key(&akid).await?;
         if let Some(row) = row.filter(|r| r.status == KeyStatus::Active) {
@@ -1459,21 +1451,12 @@ where
             .await?
         {
             PublishOutcome::Applied => {
-                // The outbox rows are the durable obligation; a lost
-                // notification is picked up by the dispatcher.
-                let jobs: Vec<Job> = commit
+                let rows = commit
                     .placements
                     .iter()
-                    .map(|p| Job::Extent {
-                        v: JOB_VERSION,
-                        extent: p.extent_id.clone(),
-                        generation: commit.generation.id.clone(),
-                        stage: OutboxStage::Post,
-                    })
+                    .map(|p| p.extent_id.clone())
                     .collect();
-                for batch in jobs.chunks(JOB_BATCH) {
-                    let _ = bridge.jobs.send_many(batch).await;
-                }
+                send_post_jobs(bridge, &commit.generation.id, rows, commit.now).await;
                 return complete_response(&a, publication.etag, now.0);
             }
             PublishOutcome::Refused(record) => {

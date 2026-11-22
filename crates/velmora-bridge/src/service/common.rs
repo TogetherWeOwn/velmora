@@ -14,13 +14,14 @@ use zeroize::Zeroizing;
 
 use crate::config::{BridgeConfig, Maintenance, REAL_DATA_READY};
 use crate::crypto::unwrap_secret;
+use crate::entry::Entry;
 use crate::ingress::IngressError;
 use crate::ports::{BlobStore, Bridge, Catalog, Clock, JobSink, Kek, NntpConnector};
 use crate::recovery::{discard_generation, revocation_recorded, Unpublished};
 use crate::replay::ReplayProbe;
 use crate::types::{
-    Bucket, BucketId, GenerationId, GenerationRow, KeyStatus, Perm, Precondition,
-    PreconditionError, RespBody, S3Request, S3Response,
+    Bucket, BucketId, ExtentId, GenerationId, GenerationRow, Job, KeyStatus, OutboxStage, Perm,
+    Precondition, PreconditionError, RespBody, S3Request, S3Response, UnixMs, JOB_VERSION,
 };
 
 /// Longest accepted origin-form target: a 1024-byte key with every byte
@@ -370,15 +371,6 @@ fn claimed_key(headers: &Headers, target: &Target) -> Option<String> {
     (!akid.is_empty()).then(|| akid.to_owned())
 }
 
-/// Headers the edge adds. They are never signed and their values are not
-/// always printable ASCII, so they are dropped before header validation.
-/// Dropping a header can only fail a signature, never satisfy one.
-pub(super) fn edge_header(name: &str) -> bool {
-    name.starts_with("cf-")
-        || name.starts_with("x-forwarded-")
-        || matches!(name, "cdn-loop" | "x-real-ip" | "true-client-ip")
-}
-
 /// Authenticates and authorizes from the request line and headers only.
 /// The body is never touched. A key with no usable row is
 /// `InvalidAccessKeyId` for every bucket.
@@ -408,7 +400,7 @@ where
     let fields: Vec<(&str, &str)> = req
         .headers
         .iter()
-        .filter(|(n, _)| !edge_header(n))
+        .filter(|(n, _)| !crate::entry::dropped_header(n))
         .map(|(n, v)| (n.as_str(), v.as_str()))
         .collect();
     let headers = Headers::new(&fields, &policy).map_err(s3_error);
@@ -427,8 +419,13 @@ where
         .check_features()
         .map_err(|refusal| header_refused(&refusal))?;
 
+    // The entry point admits one kind of key (`crate::entry`): a key of
+    // the other kind is looked up as if it did not exist.
+    let entry = Entry::of(&req.headers);
     let mut authority = OneKey {
-        akid: claimed_key(&headers, &target).unwrap_or_default(),
+        akid: claimed_key(&headers, &target)
+            .filter(|akid| entry.admits(akid))
+            .unwrap_or_default(),
         principal: String::new(),
         secret: None,
         perm: None,
@@ -822,5 +819,54 @@ pub(super) async fn restore_gate<
         Ok(false) => Ok(()),
         Ok(true) => Err(writes_refused()),
         Err(_) => Err(internal()),
+    }
+}
+
+/// Queue messages of one `send_many`.
+const JOB_BATCH: usize = 100;
+
+/// Sends the post job of each of `extents`: the rows a publication of
+/// `generation` has just inserted, marked as sent at its `now`.
+///
+/// The outbox rows are the durable obligation; the queue messages are
+/// only a wake-up. If a send fails, the marks are taken back (all of
+/// them: which jobs of a failed batch were taken is not known, and a
+/// second job for a row costs one empty claim), so the next dispatcher
+/// run sends the jobs. A message lost after it was taken, or a mark
+/// that could not be taken back, is made up for by the dispatcher when
+/// the mark has aged.
+pub(super) async fn send_post_jobs<C, B, N, J, K, T>(
+    bridge: &Bridge<C, B, N, J, K, T>,
+    generation: &GenerationId,
+    extents: Vec<ExtentId>,
+    now: UnixMs,
+) where
+    C: Catalog,
+    B: BlobStore,
+    N: NntpConnector,
+    J: JobSink,
+    K: Kek,
+    T: Clock,
+{
+    let jobs: Vec<Job> = extents
+        .into_iter()
+        .map(|extent| Job::Extent {
+            v: JOB_VERSION,
+            extent,
+            generation: generation.clone(),
+            stage: OutboxStage::Post,
+        })
+        .collect();
+    let mut refused = false;
+    match &jobs[..] {
+        [job] => refused = bridge.jobs.send(job, 0).await.is_err(),
+        jobs => {
+            for batch in jobs.chunks(JOB_BATCH) {
+                refused |= bridge.jobs.send_many(batch).await.is_err();
+            }
+        }
+    }
+    if refused {
+        let _ = bridge.catalog.unmark_sent(&jobs, now).await;
     }
 }

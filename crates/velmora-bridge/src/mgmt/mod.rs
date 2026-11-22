@@ -6,12 +6,18 @@
 //! plane checks before any handler runs.
 //!
 //! - [`gate`]: what every call passes before its handler runs.
+//! - [`idem`]: `Idempotency-Key` for the capped opening calls, through
+//!   the root unit's reservation.
+//! - [`request`]: the acting header, the `Idempotency-Key` and the query
+//!   of each call.
 //! - [`route`]: the calls, their paths and the least scope of each.
 //! - [`serve`]: one request, from the gate to its answer.
 //! - [`token`]: the service tokens, their classes and scopes, and the
 //!   records that disable one.
 
 pub mod gate;
+pub mod idem;
+pub mod request;
 pub mod route;
 pub mod serve;
 pub mod token;

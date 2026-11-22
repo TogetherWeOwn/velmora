@@ -11,7 +11,7 @@
 # bodies are aws-chunked with a trailing checksum, over HTTP the checksum is
 # a header). Step 0b repeats uploads with `when_required` (no checksum, no
 # aws-chunked), so both client settings are covered in every run. Step 7 restarts it with DEV_DROP_NOTIFY_N=1 so the next
-# queue send is lost, then calls the scheduled handler. Step 7b restarts it
+# queue send is refused, then calls the scheduled handler. Step 7b restarts it
 # with DEV_TOMBSTONE_PUT_DELAY_MS so a DeleteObjects outlasts aws-cli's read
 # timeout. Everything it started or wrote is removed on exit.
 #
@@ -219,7 +219,7 @@ if [[ $MODE == local ]]; then
         "$FAKESRV_PORT" "$NNTP_PASS"
       # The host clients sign is this run's port, not the default in wrangler.toml.
       printf 'S3_HOST=%s:%s\n' "$HOST" "$PORT"
-      # Dev only: the first n queue sends of the isolate are lost (step 7).
+      # Dev only: the first n queue sends of the isolate are refused (step 7).
       printf 'DEV_DROP_NOTIFY_N=%s\n' "$1"
       # Dev only: every tombstone put waits this long first (step 7b).
       printf 'DEV_TOMBSTONE_PUT_DELAY_MS=%s\n' "${2:-0}"
@@ -714,7 +714,7 @@ listed_key() {
   local after='' page
   while :; do
     page=$(adm "GET /_admin/keys" "$BASE/_admin/keys${after:+?after=$after}")
-    jq -e '(.keys | type == "array") and all(.keys[]; keys == ["access_key_id", "created_at", "grants", "status"])' >/dev/null <<<"$page" ||
+    jq -e '(.keys | type == "array") and all(.keys[]; keys == ["access_key_id", "created_at", "grants", "kind", "status"])' >/dev/null <<<"$page" ||
       fail "GET /_admin/keys" "a key list without a secret" "fields: $(jq -c '[.keys[0] | keys?]' <<<"$page" 2>&1)"
     if jq -e --arg id "$1" '.keys | map(select(.access_key_id == $id)) | length > 0' >/dev/null <<<"$page"; then
       jq -c --arg id "$1" '.keys[] | select(.access_key_id == $id)' <<<"$page"
@@ -726,7 +726,7 @@ listed_key() {
 }
 json=$(listed_key "$RK_ID") || fail "GET /_admin/keys" "the second key listed" "absent"
 jcheck "the second key is listed as read-only on $SB" \
-  "(.grants == [{\"bucket\": \"$SB\", \"perm\": \"ro\"}]) and .status == \"active\" and (.created_at | type == \"number\")" "$json"
+  "(.grants == [{\"bucket\": \"$SB\", \"perm\": \"ro\"}]) and .status == \"active\" and .kind == \"s3\" and (.created_at | type == \"number\")" "$json"
 code=$(adm_code -X DELETE "$BASE/_admin/keys/$RK_ID")
 [[ $code == 204 ]] || fail "DELETE /_admin/keys/<second key>" "HTTP 204" "HTTP $code $(<"$T/adm.out")"
 # Refused on the very next request: signed, and the URL presigned before.
@@ -1109,7 +1109,7 @@ expect_err "HEAD $SMALL_KEY after delete" '\(404\)' \
 STEP=7-dispatcher-recovery
 log "step $STEP"
 if [[ $MODE == local ]]; then
-  # Let earlier work settle, so the dropped send is this PUT's notification.
+  # Let earlier work settle, so the refused send is this PUT's notification.
   settled() {
     local j
     j=$(adm_try "$BASE/_admin/status") || return 1
@@ -1119,7 +1119,8 @@ if [[ $MODE == local ]]; then
     json=$(adm "GET /_admin/status" "$BASE/_admin/status")
     fail "earlier objects settled within 180 s" "no outbox row in post or verify" "$json"
   fi
-  # Restart with the first queue send of the new isolate dropped.
+  # Restart with the first queue send of the new isolate refused: the PUT
+  # leaves its outbox row unmarked, so the next dispatcher run sends the job.
   log "restarting wrangler dev with DEV_DROP_NOTIFY_N=1"
   stop_wrangler
   write_dev_vars 1
