@@ -18,7 +18,9 @@
 //!   on the directory.
 //!
 //! Where the directory row was not read (or is ahead, or a record did not
-//! read), the head's own record decides, and an opening head waits. Where
+//! read), the head's own record decides, and an opening head waits; a
+//! record before the head that does not read now counts as closing
+//! (`head_closes`), so the head then goes to the units first. Where
 //! the row is further behind than one run reads ([`MAX_FINISH_RECORDS`]),
 //! the records past the window are not known, and the run takes the
 //! closing order. In both, an opening may reach a unit before the
@@ -226,10 +228,12 @@ where
                 true => h,
                 false => s + MAX_FINISH_RECORDS,
             };
-            far = to < h;
             match read_steps(chain, &managed, s, to, &head).await {
                 Ok(read) => {
                     readable = true;
+                    // Far only for a window that read: a record that did
+                    // not read leaves the order to the head's own record.
+                    far = to < h;
                     steps = read;
                 }
                 Err(Some(what)) => run.pages.push(what),
@@ -289,10 +293,12 @@ where
         bring_units(units, tenant, &head, &mut run).await;
     }
     // A closing reaches the directory only once every listed unit holds
-    // the head, so a run whose unit step failed leaves the closing record
+    // what the directory step writes (the head, or the end of a far
+    // window), so a run whose unit step failed leaves the closing record
     // above the row, and the next run takes the closing order again.
+    let publishes = steps.last().map_or(h, |(_, r)| r.door.seq);
     let units_hold = run.units.iter().all(|(_, step)| match step {
-        StoreStep::Holds(seq) => *seq >= h,
+        StoreStep::Holds(seq) => *seq >= publishes,
         StoreStep::Unborn => provisioning,
         _ => false,
     });
