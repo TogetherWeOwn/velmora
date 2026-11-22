@@ -98,7 +98,12 @@ fn fail(status: u16, code: &'static str, message: &'static str) -> S3Response {
 }
 
 fn unavailable() -> S3Response {
-    fail(503, "SlowDown", "Not available now; retry shortly.")
+    let mut resp = fail(503, "SlowDown", "Not available now; retry shortly.");
+    resp.headers.push((
+        "retry-after".into(),
+        super::gate::RETRY_AFTER_SECS.to_string(),
+    ));
+    resp
 }
 
 /// Whether the request carries a body: a declared length above 0, or a

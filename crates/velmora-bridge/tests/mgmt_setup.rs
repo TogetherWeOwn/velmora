@@ -542,6 +542,20 @@ async fn a_managed_tenant_chain_refuses_first_open_and_alerts() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn a_first_open_lookup_failure_returns_retry_after() {
+    let ports = Ports::with_closed_directory();
+    ports.records.refuse_lists(true);
+
+    let resp = ports.post(GATE_PATH).await;
+    expect_error(&resp, 503, "SlowDown");
+    let retry_after = resp.headers.iter().find_map(|(name, value)| {
+        name.eq_ignore_ascii_case("retry-after")
+            .then_some(value.as_str())
+    });
+    assert_eq!(retry_after, Some("5"));
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn a_closed_gate_without_tenants_runs_first_open() {
     let ports = Ports::with_closed_directory();
     let dir = ports.dir();
