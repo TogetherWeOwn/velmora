@@ -9,9 +9,10 @@
 //!
 //! | Code | Status | Retry-After | When | `kofra-api` |
 //! |---|---|---|---|---|
-//! | `bad_request`, `grant_limits_not_served`, `idempotency_key_required` | 400 | — | malformed or not served | `Upstream` |
+//! | `bad_request`, `grant_limits_not_served` | 400 | — | malformed or not served | `Upstream` |
 //! | `jurisdiction_not_served` | 400 | — | a tenant create names a jurisdiction other than `none` (milestone 1 serves `none` only) | `Upstream` |
 //! | `limits_not_served`, `rate_class_not_served` | 400 | — | a tenant create carries `limits` or `rate_class` (milestone 1 serves neither) | `Upstream` |
+//! | `idempotency_key_required` | 400 | — | missing required idempotency key | `Upstream` |
 //! | `invalid_position` | 400 | — | a position that does not parse | `InvalidCursor` |
 //! | `unauthenticated` | 401 | — | token | `Upstream` |
 //! | `insufficient_scope`, `internal_key_refused`, `acting_principal_unknown`, `acting_principal_inactive` | 403 | — | wrong token class; the tenant's internal key; the acting header | `Upstream` |

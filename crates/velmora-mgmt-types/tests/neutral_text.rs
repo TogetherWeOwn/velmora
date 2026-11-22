@@ -11,12 +11,11 @@
 //! SHA-256 hashes of the lowercase terms, as there. When the caller's list
 //! changes, copy it again.
 //!
-//! The port is never looser than the checker, and stricter in two places:
-//! it does not blank checksum-like and base64-like runs before the short
-//! class (it blanks only lowercase hex runs of 32 or more), and it flags
-//! every `@` address with a domain other than the allowed ones. Every file
-//! under `src/` must be Rust source; another kind fails the test until
-//! this port covers its rules.
+//! The port is conservative: it does not blank blobs before the short
+//! class, and also checks candidates where blanking could expose a new
+//! token or change a token part. Its email and whitespace rules can also
+//! flag more than the checker. Every file under `src/` must be Rust source;
+//! another kind fails the test until this port covers its rules.
 //!
 //! This file lives outside `src/`, so it is not part of the copy.
 
@@ -164,31 +163,41 @@ fn parts(raw: &str) -> Vec<String> {
     out
 }
 
-/// The line with every lowercase hex run of 32 or more characters,
-/// between word boundaries, blanked (part of the checker's `BLOB`).
-fn blank_hex(line: &str) -> String {
-    let c: Vec<char> = line.chars().collect();
-    let word = |ch: char| ch.is_ascii_alphanumeric() || ch == '_';
-    let mut out = c.clone();
-    let mut i = 0;
-    while i < c.len() {
-        let hexch = |ch: char| ch.is_ascii_digit() || ('a'..='f').contains(&ch);
-        if hexch(c[i]) && (i == 0 || !word(c[i - 1])) {
-            let mut j = i;
-            while j < c.len() && hexch(c[j]) {
-                j += 1;
-            }
-            if j - i >= 32 && (j == c.len() || !word(c[j])) {
-                for o in out.iter_mut().take(j).skip(i) {
-                    *o = ' ';
-                }
-            }
-            i = j.max(i + 1);
-        } else {
-            i += 1;
+/// Short matches in an unblanked ASCII token, including candidates
+/// exposed by the checker's blob blanking.
+fn is_short(t: &Terms, raw: &str) -> bool {
+    let matches_prefix = |candidate: &str| {
+        SHORT_LENGTHS.iter().any(|&len| {
+            candidate
+                .get(..len)
+                .is_some_and(|prefix| t.short.contains(sha(&prefix.to_ascii_lowercase()).as_str()))
+        })
+    };
+    let joined = raw.replace(is_sep, "");
+    let mut offset = 0;
+    for segment in raw.split(is_sep) {
+        // Blanking consumes the rest of an alphanumeric run. A newly exposed
+        // token starts at a segment boundary; its parts are already in `parts(raw)`.
+        if matches_prefix(&joined[offset..]) {
+            return true;
         }
+        offset += segment.len();
     }
-    out.into_iter().collect()
+    if parts(raw).iter().any(|p| matches_prefix(p)) {
+        return true;
+    }
+
+    // A checksum can also start inside a run. Ending the token there can
+    // remove an acronym-to-word edge (the final capital loses its lowercase
+    // lookahead). Recheck the last part of those prefixes.
+    let sha_prefixes = raw.match_indices("sha").filter_map(|(i, _)| {
+        // The hyphen may be outside this token when the payload starts with `+` or `/`.
+        let algorithm = raw[i + "sha".len()..].split('-').next();
+        matches!(algorithm, Some("1" | "256" | "384" | "512")).then_some(&raw[..i])
+    });
+    sha_prefixes
+        .chain(raw.strip_suffix("h1"))
+        .any(|prefix| parts(prefix).last().is_some_and(|p| matches_prefix(p)))
 }
 
 /// Strict and short hits in one line.
@@ -203,17 +212,8 @@ fn scan_line(t: &Terms, line: &str) -> Vec<(&'static str, String)> {
                 }
             }
         }
-    }
-    for raw in tokens(&blank_hex(line)) {
-        let token: String = raw.to_lowercase().chars().filter(|c| !is_sep(*c)).collect();
-        let mut all = vec![token];
-        all.extend(parts(&raw).into_iter().map(|p| p.to_lowercase()));
-        for part in all {
-            for l in SHORT_LENGTHS {
-                if l <= part.len() && t.short.contains(sha(&part[..l]).as_str()) {
-                    hits.push(("short", raw.clone()));
-                }
-            }
+        if is_short(t, &raw) {
+            hits.push(("short", raw));
         }
     }
     let mut seen = HashSet::new();
@@ -264,6 +264,11 @@ fn scan_prose(t: &Terms, text: &str) -> Vec<String> {
     hits
 }
 
+/// A superset of JavaScript's `\s`: Rust's whitespace plus the BOM.
+fn checker_whitespace(c: char) -> bool {
+    c.is_whitespace() || c == '\u{feff}'
+}
+
 /// The checker's comment rule for code files:
 /// `(?:^|\s)(?:\/\/+|#|\/\*+|\*)\s?(.*)$`, the leftmost match.
 fn comment(line: &str) -> Option<&str> {
@@ -273,7 +278,7 @@ fn comment(line: &str) -> Option<&str> {
             || line[..i]
                 .chars()
                 .next_back()
-                .is_some_and(char::is_whitespace);
+                .is_some_and(checker_whitespace);
         if !at_start {
             continue;
         }
@@ -294,7 +299,7 @@ fn comment(line: &str) -> Option<&str> {
         }
         let rest = &line[j..];
         return Some(match rest.chars().next() {
-            Some(w) if w.is_whitespace() => &rest[w.len_utf8()..],
+            Some(w) if checker_whitespace(w) => &rest[w.len_utf8()..],
             _ => rest,
         });
     }
@@ -379,8 +384,13 @@ fn home_path(line: &str) -> bool {
                 return true;
             }
         }
-        let tilde_ok = i == 0 || b" \t\"'=(:`".contains(&b[i - 1]);
-        if tilde_ok && rest.starts_with(b"~/") && rest.get(2).is_some_and(fname) {
+        if rest.starts_with(b"~/")
+            && rest.get(2).is_some_and(fname)
+            && line[..i]
+                .chars()
+                .next_back()
+                .is_none_or(|c| checker_whitespace(c) || "\"'=(:`".contains(c))
+        {
             return true;
         }
     }
@@ -437,12 +447,34 @@ fn files(dir: &Path, out: &mut Vec<PathBuf>) {
         .collect();
     entries.sort();
     for p in entries {
-        if p.is_dir() {
+        // Not followed: the caller's checker reads a link as a file and
+        // fails on it, so the port refuses one too.
+        let meta = fs::symlink_metadata(&p).unwrap_or_else(|e| panic!("{}: {e}", p.display()));
+        assert!(
+            !meta.file_type().is_symlink(),
+            "{}: a link under src/ is not covered by this port",
+            p.display()
+        );
+        if meta.is_dir() {
             files(&p, out);
         } else {
             out.push(p);
         }
     }
+}
+
+/// The name the caller's checker sees: `src/` and the path below it as
+/// it is (a name that is not UTF-8 cannot be read there either), and
+/// whether it is Rust source as the checker's `extname` tells it (a file
+/// named `.rs` has no extension).
+fn checked_name(src: &Path, p: &Path) -> (String, bool) {
+    let below = p
+        .strip_prefix(src)
+        .unwrap()
+        .to_str()
+        .unwrap_or_else(|| panic!("{}: a name that is not UTF-8", p.display()));
+    let rust = p.extension().is_some_and(|e| e == "rs");
+    (format!("src/{below}"), rust)
 }
 
 #[test]
@@ -454,15 +486,9 @@ fn the_source_names_no_deny_listed_term() {
     assert!(all.len() >= 10, "src/ looks empty: {all:?}");
     let mut hits = Vec::new();
     for p in &all {
-        let rel = format!(
-            "src/{}",
-            p.strip_prefix(&src)
-                .unwrap()
-                .to_string_lossy()
-                .replace('\\', "/")
-        );
+        let (rel, rust) = checked_name(&src, p);
         assert!(
-            rel.ends_with(".rs"),
+            rust,
             "{rel}: only Rust source is covered by this port; extend it first"
         );
         let text = fs::read_to_string(p).unwrap_or_else(|e| panic!("{rel}: {e}"));
@@ -478,6 +504,20 @@ fn the_source_names_no_deny_listed_term() {
         report.len(),
         report.join("\n")
     );
+}
+
+#[test]
+fn a_name_is_checked_as_the_checker_sees_it() {
+    let src = Path::new("/x/src");
+    assert_eq!(
+        checked_name(src, &src.join("a/b.rs")),
+        ("src/a/b.rs".to_string(), true)
+    );
+    // `.rs` alone has no extension for the checker: prose, not Rust.
+    assert!(!checked_name(src, &src.join(".rs")).1);
+    // A backslash stays, so a Windows user folder is still found.
+    let (name, _) = checked_name(src, &src.join("C:\\Users\\1.rs"));
+    assert!(home_path(&name), "{name}");
 }
 
 /// Positive controls: each class finds a term this repository may name
@@ -507,7 +547,7 @@ fn the_port_finds_what_the_checker_finds() {
     assert!(classes("fn unntp() {}").is_empty(), "not at a part start");
     assert!(
         classes("let h = \"0123456789abcdef0123456789abcdef\";").is_empty(),
-        "a hex run is blanked"
+        "a hex run without a short term is clean"
     );
     // Prose: whole words of comments only.
     assert_eq!(classes("/// One article per call."), ["prose"]);
@@ -538,6 +578,24 @@ fn the_port_finds_what_the_checker_finds() {
     );
     assert_eq!(classes("/// see /home/someone/x"), ["path"]);
     assert_eq!(classes("/// see ~/notes"), ["path"]);
+    // Blanking can expose a token start or change the last acronym part.
+    let padded = format!("\"{}==B.nn.tp\"", "A".repeat(40));
+    let probes = [
+        ("\"h1:abc.nn.tp\"", "short"),
+        ("\"xsha256-abc.nn.tp\"", "short"),
+        (&padded, "short"),
+        ("\"prefixNNTPsha256-abc\"", "short"),
+        ("\"prefixNNTPsha256-+abc\"", "short"),
+        ("\u{feff}//! One article per call.", "prose"),
+        ("let a = 1;\u{feff}// an article", "prose"),
+        ("/// see\u{a0}~/notes", "path"),
+        ("/// see\u{b}~/notes", "path"),
+    ];
+    let missed: Vec<_> = probes
+        .into_iter()
+        .filter(|(line, class)| !classes(line).contains(class))
+        .collect();
+    assert!(missed.is_empty(), "missing expected findings: {missed:?}");
     // File paths are checked too.
     assert_eq!(
         scan_file(&t, "src/velmora.rs", "")
