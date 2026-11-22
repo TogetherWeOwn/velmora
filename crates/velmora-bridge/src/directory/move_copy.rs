@@ -149,6 +149,10 @@ pub struct ImportState {
     /// (a give-up that did not reach its `deleteAll()`); `None`: the unit
     /// did not say (L1 package 4c).
     pub move_lifted: Option<bool>,
+    /// When the move's lift landed in the unit (`ImportProgress.lifted_at`,
+    /// the unit's clock), once `move_lifted`. `None`: not lifted, or the
+    /// unit did not say.
+    pub lifted_at: Option<UnixMs>,
     pub tables: Vec<ImportCount>,
 }
 

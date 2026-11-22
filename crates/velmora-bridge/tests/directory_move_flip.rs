@@ -14,8 +14,8 @@ use velmora_bridge::directory::chain::{TenantChain, Written};
 use velmora_bridge::directory::fence::{freeze, legacy_stamp_key, stamp_row, thaw};
 use velmora_bridge::directory::move_copy::ImportState;
 use velmora_bridge::directory::move_flip::{
-    flip, give_up, FlipError, Flipped, GateView, GaveUp, MoveReceipt, OwnerUnit, Reported,
-    RouteRecords, Synced, Window,
+    flip, floor_after_empty, give_up, FlipError, Flipped, GateView, GaveUp, MoveReceipt, OwnerUnit,
+    Reported, RouteRecords, Synced, Window,
 };
 use velmora_bridge::directory::move_flip::{MAX_WINDOW_RECORDS, SYNC_TRIES};
 use velmora_bridge::directory::move_keys::{KeyUnit, OwnerKeys};
@@ -31,6 +31,8 @@ use velmora_bridge::unit::Refused as UnitRefused;
 use velmora_bridge::*;
 
 const OWNER: &str = "t_00000000000000a1";
+/// When the fake unit says the move's lift landed (`ImportProgress`).
+const LIFTED_AT: UnixMs = UnixMs(1_700_000_000_000);
 const KEYS: [&str; 2] = ["AKMOVE00000000000001", "AKMOVE00000000000002"];
 
 fn block_on<F: std::future::Future>(f: F) -> F::Output {
@@ -116,6 +118,7 @@ impl Default for FakeUnit {
                 move_lifted: None,
                 t0_seq: Some(1 << 40),
                 sealed: Some(1),
+                lifted_at: Some(LIFTED_AT),
                 tables: vec![],
             })),
             fail_lift: Cell::new(0),
@@ -550,6 +553,19 @@ impl Move {
         self.chain().head(tenant, 0).await.unwrap().unwrap().door
     }
 
+    /// The owner's newest lift record (the move floor (b1) writes after
+    /// it, so it need not be the head).
+    async fn lift_record(&self) -> Option<velmora_bridge::directory::record::Lifted> {
+        let head = self.head(&owner()).await;
+        for seq in (1..=head.seq).rev() {
+            let door = self.chain().read(&owner(), seq).await.unwrap()?.door;
+            if door.lifted.is_some() {
+                return door.lifted;
+            }
+        }
+        None
+    }
+
     async fn flip(&self) -> std::result::Result<Flipped, FlipError> {
         let k = keys();
         let window = Window {
@@ -774,10 +790,12 @@ async fn assert_flipped(m: &Move, stamp: u64) {
     assert_eq!(z.moved.unwrap().stamp, Some(stamp));
     let o = m.head(&owner()).await;
     assert!(o.restoring.is_empty());
+    // (b1): the floor at the unit's lift time (AM-67).
+    assert_eq!(o.move_floors.get(&0), Some(&LIFTED_AT));
     // The lift record carries the move report's proof, and the unit last
     // saw the lifted head with it.
     // (A later owner record may stand on the lift.)
-    let lifted = o.lifted.clone();
+    let lifted = m.lift_record().await;
     let (seen, proof) = m.unit.synced.borrow().last().unwrap().clone();
     assert!(seen.restoring.is_empty());
     let proof = proof.expect("the opening sync names the lift");
@@ -811,8 +829,9 @@ fn the_flip_runs_its_four_steps_in_order() {
         let f = m.flip().await.map_err(|e| format!("{e:?}")).unwrap();
         assert!(f.wrote);
         assert_flipped(&m, f.stamp).await;
-        // Two records: the owner's lift and tenant 0's flip.
-        assert_eq!(m.records(), before + 2);
+        // Three records: the owner's lift, its move floor (b1) and tenant
+        // 0's flip.
+        assert_eq!(m.records(), before + 3);
         // Run again: found, nothing written.
         let again = m.flip().await.map_err(|e| format!("{e:?}")).unwrap();
         assert_eq!(
@@ -822,7 +841,7 @@ fn the_flip_runs_its_four_steps_in_order() {
                 wrote: false
             }
         );
-        assert_eq!(m.records(), before + 2);
+        assert_eq!(m.records(), before + 3);
         // No give-up after the flip: the way back is the reverse move.
         assert!(matches!(m.give_up().await, Err(FlipError::NotThisMove)));
     });
@@ -849,8 +868,8 @@ fn a_crash_at_any_step_is_finished_by_running_the_flip_again() {
         m.routes.fail_after.set(None);
         let f = m.flip().await.map_err(|e| format!("{e:?}")).unwrap();
         assert_flipped(&m, f.stamp).await;
-        // Still one lift record and one flip record.
-        assert_eq!(m.records(), before + 2);
+        // Still one lift record, one floor record and one flip record.
+        assert_eq!(m.records(), before + 3);
     });
 }
 
@@ -997,7 +1016,7 @@ fn lost_answers_in_the_routes_and_the_flip_record_are_read_back() {
         let f = m.flip().await.map_err(|e| format!("{e:?}")).unwrap();
         assert!(f.wrote);
         assert_flipped(&m, f.stamp).await;
-        assert_eq!(m.records(), before + 2);
+        assert_eq!(m.records(), before + 3);
     });
 }
 
@@ -1227,8 +1246,8 @@ fn a_tenant_zero_record_during_the_run_stops_the_flip_record_until_run_again() {
         let n = m.records();
         let r = m.flip().await;
         assert!(matches!(r, Err(FlipError::NotThisMove)), "{r:?}");
-        // The lift and the planted record; no flip record.
-        assert_eq!(m.records(), n + 2);
+        // The lift, the floor and the planted record; no flip record.
+        assert_eq!(m.records(), n + 3);
         assert_eq!(m.selector().await, Selector::Moving);
         // The window is still this one: run again, it flips.
         let f = m.flip().await.map_err(|e| format!("{e:?}")).unwrap();
@@ -1395,7 +1414,7 @@ fn the_lift_opens_one_move_report_for_the_units_entry() {
         // The lift record names the entry and the report, by the move
         // tool; it is the record below tenant 0's flip on the owner.
         let o = m.head(&owner()).await;
-        let l = o.lifted.unwrap();
+        let l = m.lift_record().await.unwrap();
         assert_eq!((l.unit, l.since_seq), (0, m.since));
         assert_eq!(l.proof.replay_id, r);
         assert!(l.proof.acknowledged.is_empty());
@@ -1458,10 +1477,11 @@ fn a_refused_sync_re_enters_under_a_new_entry() {
         let f = m.flip().await.map_err(|e| format!("{e:?}")).unwrap();
         assert!(f.wrote);
         assert_flipped(&m, f.stamp).await;
-        // The first lift, the re-entry's entry, the second lift, the flip.
-        assert_eq!(m.records(), before + 4);
+        // The first lift, the re-entry's entry, the second lift, the
+        // floor, the flip.
+        assert_eq!(m.records(), before + 5);
         let o = m.head(&owner()).await;
-        let l = o.lifted.unwrap();
+        let l = m.lift_record().await.unwrap();
         assert!(l.since_seq > m.since);
         // The second report names the new entry.
         assert_eq!(m.unit.reports.get(), 2);
@@ -1496,7 +1516,7 @@ fn a_crash_after_the_lift_record_syncs_with_its_proof() {
         let m = window().await;
         m.unit.fail_lift.set(SYNC_TRIES);
         assert!(matches!(m.flip().await, Err(FlipError::Store(_))));
-        let lifted = m.head(&owner()).await.lifted.unwrap();
+        let lifted = m.lift_record().await.unwrap();
         // A tenant-0-free owner record lands on top (a later record of
         // the window): the proof is found below it.
         m.write(&owner(), hold(true), Actor::Operator).await;
@@ -1532,7 +1552,8 @@ fn v9_failing_in_the_open_unit_gives_the_move_up_for_good() {
         m.unit.v9_ok.set(false);
         let r = m.flip().await;
         assert!(matches!(r, Err(FlipError::V9Failed)), "{r:?}");
-        // The unit closed under the entry, the lift; then (AM-52) the V9
+        // The unit closed under the entry, the lift and its floor (b1);
+        // then (AM-52) the V9
         // result to the receipt, the owner's entry again and the unit
         // closed under it while tenant 0 is still `moving`, then tenant 0
         // at d1, the grant revocations, the unplace.
@@ -1540,6 +1561,7 @@ fn v9_failing_in_the_open_unit_gives_the_move_up_for_good() {
             *m.keys.log.borrow(),
             [
                 "close",
+                "owner",
                 "owner",
                 "receipt",
                 "owner",
@@ -1577,11 +1599,11 @@ fn the_give_up_after_the_unit_opened_exits_in_order() {
         m.routes.fail_after.set(Some(0));
         assert!(m.flip().await.is_err());
         m.give_up().await.map_err(|e| format!("{e:?}")).unwrap();
-        // The lift; then the unit closed, tenant 0 at d1, the grant
-        // revocations, the unplace.
+        // The lift and its floor (b1); then the unit closed, tenant 0 at
+        // d1, the grant revocations, the unplace.
         assert_eq!(
             *m.keys.log.borrow(),
-            ["owner", "owner", "zero", "revoke_grants", "owner"]
+            ["owner", "owner", "owner", "zero", "revoke_grants", "owner"]
         );
     });
 }
@@ -1774,7 +1796,7 @@ fn a_re_entry_that_stopped_after_its_record_closes_the_unit_first() {
         let f = m.flip().await.map_err(|e| format!("{e:?}")).unwrap();
         assert!(f.wrote);
         assert_eq!(m.unit.report.borrow().clone().unwrap().since, s2);
-        assert_eq!(m.head(&owner()).await.lifted.unwrap().since_seq, s2);
+        assert_eq!(m.lift_record().await.unwrap().since_seq, s2);
     });
 }
 
@@ -1790,8 +1812,8 @@ fn a_crash_after_the_lift_record_then_a_refusal_re_enters() {
         m.unit.refuse_lift.set(1);
         let f = m.flip().await.map_err(|e| format!("{e:?}")).unwrap();
         assert!(f.wrote);
-        // Lift, re-entry, lift, flip.
-        assert_eq!(m.records(), before + 4);
+        // Lift, re-entry, lift, floor, flip.
+        assert_eq!(m.records(), before + 5);
         assert_eq!(m.unit.reports.get(), 2);
     });
 }
@@ -1893,8 +1915,8 @@ fn the_lift_sync_applies_the_keys_and_re_reads_a_stale_head() {
         let f = m.flip().await.map_err(|e| format!("{e:?}")).unwrap();
         assert!(f.wrote);
         assert_flipped(&m, f.stamp).await;
-        // Neither re-entered: one lift record and the flip.
-        assert_eq!(m.records(), before + 2);
+        // Neither re-entered: one lift record, the floor and the flip.
+        assert_eq!(m.records(), before + 3);
         assert_eq!(m.unit.reports.get(), 1);
         assert!(m.unit.applies.get() > applies + 1);
         // A refusal that is neither stops the flip, before the routes.
@@ -1924,8 +1946,8 @@ fn a_gate_refusal_on_an_open_unit_is_the_lift_that_landed() {
             .push_back(UnitRefused::Gate(GateRefusal::NotRestoring));
         let f = m.flip().await.map_err(|e| format!("{e:?}")).unwrap();
         assert!(f.wrote);
-        // No re-entry: the lift record and the flip only.
-        assert_eq!(m.records(), before + 2);
+        // No re-entry: the lift record, the floor and the flip only.
+        assert_eq!(m.records(), before + 3);
         assert!(m.unit.closed.get().is_none());
     });
 }
@@ -1938,24 +1960,28 @@ fn the_lift_needs_this_windows_sealed_import() {
             move_lifted: None,
             t0_seq: Some(1 << 40),
             sealed: None,
+            lifted_at: None,
             tables: vec![],
         }),
         Some(ImportState {
             move_lifted: None,
             t0_seq: Some(1 << 40),
             sealed: Some(2),
+            lifted_at: None,
             tables: vec![],
         }),
         Some(ImportState {
             move_lifted: None,
             t0_seq: Some(1),
             sealed: Some(1),
+            lifted_at: None,
             tables: vec![],
         }),
         Some(ImportState {
             move_lifted: None,
             t0_seq: None,
             sealed: Some(1),
+            lifted_at: None,
             tables: vec![],
         }),
     ] {
@@ -2210,5 +2236,65 @@ fn a_head_that_keeps_moving_is_bounded() {
         assert_eq!(m.unit.recounts.get(), 16);
         assert!(m.routes.records.borrow().is_empty());
         assert_eq!(m.selector().await, Selector::Moving);
+    });
+}
+
+/// AM-67 (b1): the flip writes the move floor at the unit's own lift time
+/// before V9 and the routes, and stops there while the unit does not say
+/// it; a later run with the time writes it and goes on.
+#[test]
+fn the_flip_writes_the_move_floor_before_v9_and_the_routes() {
+    block_on(async {
+        let m = window().await;
+        if let Some(i) = m.unit.import.borrow_mut().as_mut() {
+            i.lifted_at = None;
+        }
+        let r = m.flip().await;
+        assert!(matches!(r, Err(FlipError::NoLiftTime)), "{r:?}");
+        // The unit is open; no V9, no route, no floor.
+        assert!(m.unit.closed.get().is_none());
+        assert_eq!(m.unit.v9_runs.get(), 0);
+        assert!(m.routes.records.borrow().is_empty());
+        assert!(m.head(&owner()).await.move_floors.is_empty());
+        assert_eq!(m.selector().await, Selector::Moving);
+        // The unit says its lift time now: the floor, then the rest.
+        if let Some(i) = m.unit.import.borrow_mut().as_mut() {
+            i.lifted_at = Some(LIFTED_AT);
+        }
+        let f = m.flip().await.map_err(|e| format!("{e:?}")).unwrap();
+        assert_flipped(&m, f.stamp).await;
+        // The directory's copy holds the floor too.
+        let row = m.dir().tenant(&owner()).await.unwrap().unwrap();
+        assert_eq!(row.door.move_floors.get(&0), Some(&LIFTED_AT));
+    });
+}
+
+/// AM-67 writer 2: after a give-up's `deleteAll()`, the floor of the unit
+/// rises to the clock after it, also for a window whose import never
+/// lifted; a repeat or an older clock changes nothing.
+#[test]
+fn an_exit_that_empties_the_unit_raises_its_floor() {
+    block_on(async {
+        let m = window().await;
+        m.give_up().await.map_err(|e| format!("{e:?}")).unwrap();
+        let emptied = UnixMs(m.rig.now().0 + 1_000);
+        let o = floor_after_empty(&m.chain(), &m.dir(), &owner(), 0, emptied)
+            .await
+            .map_err(|e| format!("{e:?}"))
+            .unwrap();
+        assert_eq!(o.move_floors.get(&0), Some(&emptied));
+        let n = m.records();
+        let again = floor_after_empty(&m.chain(), &m.dir(), &owner(), 0, emptied)
+            .await
+            .unwrap();
+        assert_eq!(again.move_floors.get(&0), Some(&emptied));
+        assert!(
+            floor_after_empty(&m.chain(), &m.dir(), &owner(), 0, UnixMs(emptied.0 - 5))
+                .await
+                .is_ok()
+        );
+        assert_eq!(m.records(), n);
+        let row = m.dir().tenant(&owner()).await.unwrap().unwrap();
+        assert_eq!(row.door.move_floors.get(&0), Some(&emptied));
     });
 }

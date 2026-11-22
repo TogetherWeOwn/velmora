@@ -1019,6 +1019,13 @@ async fn flipped() -> Undo {
             unit: 0,
             creator: PRINCIPAL.into(),
             grant_seq,
+            name: "photos".into(),
+            bdk_wrapped: {
+                let mut w = vec![5; velmora_bridge::crypto::WRAPPED_KEY_LEN];
+                w[0] = velmora_bridge::crypto::scheme2::WRAP_VERSION_2;
+                w
+            },
+            tk_version: u.head(&o).await.tk_version,
         },
         Actor::Customer,
     )
@@ -1979,6 +1986,7 @@ fn the_next_window_thaws_the_undo_and_sets_a_new_entry() {
             move_lifted: None,
             t0_seq: Some(3),
             sealed: Some(1),
+            lifted_at: None,
             tables: vec![],
         });
         let r = open_window(
@@ -2038,6 +2046,7 @@ fn the_next_window_thaws_the_undo_and_sets_a_new_entry() {
             move_lifted: None,
             t0_seq: Some(opened.zero_seq),
             sealed: None,
+            lifted_at: None,
             tables: vec![],
         });
         let seq = o.seq;
@@ -2151,6 +2160,7 @@ fn p12_reads_both_heads_and_the_unit() {
                 move_lifted: lifted,
                 t0_seq: Some(1),
                 sealed,
+                lifted_at: None,
                 tables: vec![],
             },
             closed,
@@ -2502,6 +2512,7 @@ fn an_earlier_import_found_after_the_moving_record_stops_step_two() {
             move_lifted: Some(true),
             t0_seq: Some(3),
             sealed: Some(1),
+            lifted_at: None,
             tables: vec![],
         });
         let before = u.head(&owner()).await.seq;

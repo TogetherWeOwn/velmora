@@ -28,6 +28,13 @@
 //!   as it stands. A refused `sync` re-enters: a new `restoring` entry for
 //!   unit 0, the unit synced to it, and (b) again under the new S. (c)
 //!   waits until `sync` answers ok;
+//! - **(b1)** the move floor (AM-67): once the unit's own
+//!   `restoring_since` is empty, the unit's `lifted_at` (from
+//!   `ImportProgress`) goes into the owner's record as `move_floors[0]`
+//!   ([`super::chain::TenantChain::set_move_floor`]). (b2) and (c) run only
+//!   once the head holds a floor at or above it, so no time restore can
+//!   reach into the seal-to-lift span after the flip; a unit that does not
+//!   say its `lifted_at` stops the flip here;
 //! - **(b2)** V9 through the open unit (AM-30): a failure stops the flip
 //!   here, and the tool gives up ([`give_up`]);
 //! - **(c)** the owner's key chain applied to the unit once more and the
@@ -125,6 +132,12 @@ pub enum FlipError {
     /// stopped with this error: the window may still be open, so the tool
     /// must not run step 8 again before it records the failure (AM-52).
     V9Unrecorded(Box<FlipError>),
+    /// The owner's unit is open, but it does not say when the move's lift
+    /// landed (`ImportProgress.lifted_at`), or it still has a `restoring`
+    /// entry: no floor can be written, so (b2) and (c) do not run.
+    NoLiftTime,
+    /// The owner's head does not hold the move floor (b1) wrote.
+    FloorMissing,
     /// The unit's import is not this window's sealed import: not sealed
     /// under `flips + 1`, or bound below the window's record `zero_seq`
     /// (a given-up window's, whose unit was not emptied).
@@ -496,6 +509,9 @@ where
     // (b) The owner's root unit opens through the move's lift.
     let owner = open_unit(chain, dir, unit, keys, &zero, window, now).await?;
 
+    // (b1) The move floor, from the unit's own lift time.
+    move_floor(chain, dir, unit, &owner, now).await?;
+
     // (b2) V9, once the unit is open; a run that already put a route
     // passed it. A failure gives the move up at once, in the order of DS1
     // §3.8 row 8(b2) (AM-52): the receipt, the unit closed again while
@@ -611,6 +627,43 @@ where
         Ok(_) => Err(FlipError::V9Failed),
         Err(e) => Err(FlipError::V9GiveUp(Box::new(e))),
     }
+}
+
+/// Step 8(b1) (AM-67): after the unit says its entry is gone, its
+/// `lifted_at` into the owner's `move_floors[0]`, by the chain's own
+/// tenant-0 read. Answers the owner's head that holds the floor. Every run
+/// of step 8 that finds the entry lifted passes here first; a repeat is
+/// `Unchanged`.
+async fn move_floor<S, C, Q, U>(
+    chain: &TenantChain<'_, S, C>,
+    dir: &SqlDirectory<'_, Q>,
+    unit: &U,
+    owner: &TenantDoor,
+    now: UnixMs,
+) -> Result<TenantDoor, FlipError>
+where
+    S: RecordStore,
+    C: ControlSeal,
+    Q: Sql,
+    U: OwnerUnit,
+{
+    if unit.restoring_since().await?.is_some() {
+        return Err(FlipError::NoLiftTime);
+    }
+    let lifted_at = unit
+        .move_import()
+        .await?
+        .and_then(|i| i.lifted_at)
+        .ok_or(FlipError::NoLiftTime)?;
+    let written = chain
+        .set_move_floor(&owner.tenant, 0, lifted_at, Actor::MoveTool, now, owner.seq)
+        .await?;
+    let head = door_of(written);
+    if !head.move_floors.get(&0).is_some_and(|f| *f >= lifted_at) {
+        return Err(FlipError::FloorMissing);
+    }
+    dir.apply_tenant(&head, now).await?;
+    Ok(head)
 }
 
 /// Step 8(b): the owner's unit 0 lifted by the move's report and synced
@@ -1190,6 +1243,40 @@ where
         catalogue_id_frozen: frozen_id,
         stamp_put,
     })
+}
+
+/// AM-67 writer 2: after every exit that empties a unit of the owner with
+/// `deleteAll()` (a give-up, P12, the undo copy's day 30), the floor of
+/// that unit raised to `emptied_at`, the clock read after `deleteAll()`
+/// answered. So a bookmark from before the empty, restored later, cannot
+/// open the seal-to-`deleteAll()` span to a time target, also for a window
+/// whose import never lifted. Run again until it answers; a repeat is
+/// `Unchanged`. Answers the owner's head, which the directory copies.
+pub async fn floor_after_empty<S, C, Q>(
+    chain: &TenantChain<'_, S, C>,
+    dir: &SqlDirectory<'_, Q>,
+    owner: &Tenant,
+    unit: u32,
+    emptied_at: UnixMs,
+) -> Result<TenantDoor, FlipError>
+where
+    S: RecordStore,
+    C: ControlSeal,
+    Q: Sql,
+{
+    let written = chain
+        .set_move_floor(owner, unit, emptied_at, Actor::MoveTool, emptied_at, 0)
+        .await?;
+    let head = door_of(written);
+    if !head
+        .move_floors
+        .get(&unit)
+        .is_some_and(|f| *f >= emptied_at)
+    {
+        return Err(FlipError::FloorMissing);
+    }
+    dir.apply_tenant(&head, emptied_at).await?;
+    Ok(head)
 }
 
 /// Steps (2) and (3) of every exit of the move (AM-23), once tenant 0 is
