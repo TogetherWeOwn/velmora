@@ -214,7 +214,8 @@ pub struct Routed {
 }
 
 /// Why the router answers instead of a unit: each is `503` with
-/// `Retry-After`, with no field of the request or the unit in it.
+/// `Retry-After` but `AccountProblem` (`403`), with no field of the request
+/// or the unit in it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RouteRefusal {
     /// `MAINTENANCE=restore` and the request writes: no unit call (AM-50).
@@ -231,6 +232,9 @@ pub enum RouteRefusal {
     CatalogueLost,
     /// The unit still refused the numbers after the client's one fix.
     NotFresh,
+    /// The tenant is being shredded: `403 AccountProblem`, as the unit
+    /// answers a held tenant (AM-50's shredding row, on the request path).
+    AccountProblem,
 }
 
 impl RouteRefusal {
@@ -243,6 +247,7 @@ impl RouteRefusal {
             RouteRefusal::Closed => "closed",
             RouteRefusal::CatalogueLost => "catalogue_lost",
             RouteRefusal::NotFresh => "not_fresh",
+            RouteRefusal::AccountProblem => "account_problem",
         }
     }
 
@@ -511,6 +516,7 @@ impl<C: RequestClients, H: TenantHeads, T: Clock> UnitRouter for Router<'_, C, H
             (Some(Renewal::NotListed), _) | (_, Some(Synced::NotListed)) => {
                 Some(RouteRefusal::NotPlaced)
             }
+            (Some(Renewal::Shredding), _) => Some(RouteRefusal::AccountProblem),
             _ => None,
         };
         let result = match &answered.reply.answer {

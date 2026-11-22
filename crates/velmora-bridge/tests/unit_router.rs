@@ -646,6 +646,7 @@ async fn closed_unborn_stale_and_an_unreachable_unit_are_refusals() {
         ),
         (None, Some(Synced::NotListed), RouteRefusal::NotPlaced),
         (Some(Renewal::Refused), None, RouteRefusal::NotFresh),
+        (Some(Renewal::Shredding), None, RouteRefusal::AccountProblem),
     ] {
         let mut a = answered(
             UnitAnswer::RenewNeeded {
@@ -673,12 +674,12 @@ async fn closed_unborn_stale_and_an_unreachable_unit_are_refusals() {
     let cache = HeadCache::default();
     let r = router(Maintenance::Off, &clients, &heads, &cache, &clock);
     let routed = r.route(&tenant(), None, NONE).await.unwrap();
-    assert_eq!(
-        r.call(&routed, CallKind::Request, true, UnitOp::Ping {})
-            .await
-            .0,
-        Err(RouteRefusal::Unavailable)
-    );
+    let (result, pages) = r
+        .call(&routed, CallKind::Request, true, UnitOp::Ping {})
+        .await;
+    assert_eq!(result, Err(RouteRefusal::Unavailable));
+    // The client's pages come with the refusal, for the caller to log.
+    assert_eq!(pages, [Page::UnitRefused("down")]);
 }
 
 #[test]
@@ -690,6 +691,7 @@ fn refusal_codes_are_fixed_and_distinct() {
         RouteRefusal::Closed,
         RouteRefusal::CatalogueLost,
         RouteRefusal::NotFresh,
+        RouteRefusal::AccountProblem,
     ];
     let codes: std::collections::BTreeSet<_> = all.iter().map(|r| r.code()).collect();
     assert_eq!(codes.len(), all.len());
