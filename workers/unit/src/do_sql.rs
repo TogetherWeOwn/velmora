@@ -465,6 +465,9 @@ fn map_err(e: JsValue) -> BridgeError {
         .unwrap_or_default();
     if is_tx_guard_violation(&message) {
         BridgeError::GuardFailed
+    } else if message.contains(velmora_bridge::unit::object::KEY_SCHEME) {
+        // Rule 13's triggers: named, so the unit answers its own class.
+        BridgeError::Sql(velmora_bridge::unit::object::KEY_SCHEME.into())
     } else if message.contains("constraint failed") {
         BridgeError::Sql("do: constraint violation".into())
     } else {

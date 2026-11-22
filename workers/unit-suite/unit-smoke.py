@@ -61,6 +61,10 @@ S = {"state_seq": 3, "keys_seq": 0}
 check("unborn, not listed", unit_post(0, call(0, "request", PING, (3, 0), listed=False)),
       {"answer": "unborn", "listed": False})
 check("unborn, listed", unit_post(0, call(0, "request", PING, (3, 0))), {"answer": "unborn", "listed": True})
+# P12 (AM-47): the move tool reads import state with listed = false where
+# its heads expect an unborn unit; the unit answers as the call says.
+check("import_progress on an unborn unit", unit_post(0, call(0, "worker", {"op": "import_progress"}, listed=False)),
+      {"answer": "unborn", "listed": False})
 
 # An object without a name matches no call.
 check("an object made without a name", post("/unit-unnamed", call(0, "request", PING, (3, 0))),
@@ -89,6 +93,16 @@ check("a higher number", unit_post(0, call(0, "request", PING, (4, 0))), {"answe
 check("a lower number from a request", unit_post(0, call(0, "request", PING, (2, 0))), {"answer": "stale", "seqs": S})
 check("a job without numbers", unit_post(0, call(0, "job", PING)),
       {"answer": "refused", "reason": {"identity": "stale_job"}, "alarm": False})
+check("a lower number from a job (AM-50)", unit_post(0, call(0, "job", PING, (2, 0))), {"answer": "stale", "seqs": S})
+
+# AM-47: no import was ever bound; the table list leaves SQLite's and the
+# platform's own tables out.
+progress = unit_post(0, call(0, "worker", {"op": "import_progress"})).get("body", {})
+check("import_progress with no import", {k: progress.get(k) for k in ("tables", "sealed", "t0_seq", "since_seq", "move_lifted")},
+      {"tables": [], "sealed": None, "t0_seq": None, "since_seq": None, "move_lifted": None})
+names = progress.get("schema_tables", [])
+check("schema_tables holds the unit's tables", all(n in names for n in ("unit_birth", "unit_import", "objects")), True)
+check("schema_tables leaves the platform's out", [n for n in names if n.startswith("_cf_") or n.startswith("sqlite_")], [])
 
 # Rule 11.
 check("an unauthenticated ping", unit_post(0, call(0, "request", PING, (3, 0), authenticated=False)),
@@ -107,7 +121,7 @@ check("restore_prepare on an open unit", unit_post(0, call(0, "worker", {"op": "
       {"answer": "refused", "reason": {"restore": "not_restoring"}, "alarm": False})
 rtoken = dict(token, kind="restore")
 check("restore on an open unit", unit_post(0, call(0, "worker", {"op": "restore", "token": rtoken,
-      "target": {"to": "time", "at_ms": 1}, "expect_undo": "bm"})),
+      "target": {"to": "time", "at_ms": 4102444800000}, "expect_undo": "bm", "floor_ms": 0})),
       {"answer": "refused", "reason": {"restore": "not_restoring"}, "alarm": False})
 check("a restore entry closes the unit", unit_post(0, call(0, "worker", {"op": "sync", "head": {"seqs": {"state_seq": 4, "keys_seq": 0},
       "tenant_state": "active", "restoring_since": 4}})), {"answer": "ok", "seqs": {"state_seq": 4, "keys_seq": 0}, "body": {"synced": 4}})

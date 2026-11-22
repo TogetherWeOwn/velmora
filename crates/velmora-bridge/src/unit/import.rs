@@ -676,15 +676,25 @@ pub fn move_lifted<S: Sql>(sql: &S) -> Result<bool> {
 }
 
 /// Uses the seal up: called in the `sync` that a `move` report lifted.
-pub fn mark_move_lifted<S: Sql>(sql: &S) -> Result<()> {
+pub fn mark_move_lifted<S: Sql>(sql: &S, now: crate::types::UnixMs) -> Result<()> {
     let n = poll_once(sql.exec(
-        "UPDATE unit_import_move SET move_lifted = 1 WHERE id = 1 AND final = 1",
-        &[],
+        "UPDATE unit_import_move SET move_lifted = 1, lifted_at = ?1 WHERE id = 1 AND final = 1",
+        &[SqlValue::Int(now.0)],
     ))??;
     if n != 1 {
         return Err(decode("unit_import_move seal"));
     }
     Ok(())
+}
+
+/// The unit's time of the move's lift, once a `move` report lifted it.
+pub fn move_lifted_at<S: Sql>(sql: &S) -> Result<Option<i64>> {
+    let rows = poll_once(sql.query("SELECT lifted_at FROM unit_import_move WHERE id = 1", &[]))??;
+    match rows.first().and_then(|r| r.first()) {
+        None | Some(SqlValue::Null) => Ok(None),
+        Some(SqlValue::Int(t)) => Ok(Some(*t)),
+        Some(_) => Err(decode("unit_import_move lifted_at")),
+    }
 }
 
 /// The newest tenant-0 head seq the import was bound to, if any.
@@ -707,6 +717,52 @@ pub fn see_t0_seq<S: Sql>(sql: &S, t0_seq: u64) -> Result<()> {
         &[int(t0_seq)?],
     ))??;
     Ok(())
+}
+
+/// The move's record as `ImportProgress` answers it (AM-47): `None`
+/// when no import was ever bound to this unit (no `unit_import_move`
+/// row).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MoveRecord {
+    /// The newest tenant-0 head seq a batch, the seal or a `move` report
+    /// was bound to: a window's copy resumes only an import at or above
+    /// its own first record (L3, AM-53).
+    pub t0_seq: u64,
+    /// The `since_seq` of the entry the import fills.
+    pub since_seq: u64,
+    /// A `move` report lifted this unit (the seal is used up).
+    pub move_lifted: bool,
+}
+
+/// The move's record, if an import was ever bound to this unit.
+pub fn move_record<S: Sql>(sql: &S) -> Result<Option<MoveRecord>> {
+    let rows = poll_once(sql.query(
+        "SELECT t0_seq, since_seq, move_lifted FROM unit_import_move WHERE id = 1",
+        &[],
+    ))??;
+    let Some(r) = rows.first() else {
+        return Ok(None);
+    };
+    match (&r[0], &r[1], &r[2]) {
+        (SqlValue::Int(t0), SqlValue::Int(since), SqlValue::Int(lifted))
+            if *t0 >= 0 && *since >= 0 && (*lifted == 0 || *lifted == 1) =>
+        {
+            Ok(Some(MoveRecord {
+                t0_seq: *t0 as u64,
+                since_seq: *since as u64,
+                move_lifted: *lifted == 1,
+            }))
+        }
+        _ => Err(decode("unit_import_move")),
+    }
+}
+
+/// Whether an import exists that no `move` report has lifted yet
+/// (`unit_import_move` with `move_lifted = 0`). While it does, the unit
+/// takes no undo bookmark (`restore_prepare`, AM-46) and runs no schema
+/// migration ([`super::schema::migration_allowed`]).
+pub fn unlifted_import<S: Sql>(sql: &S) -> Result<bool> {
+    Ok(move_record(sql)?.is_some_and(|m| !m.move_lifted))
 }
 
 /// Every table's stored cursor and row count, by table name.

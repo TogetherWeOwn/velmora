@@ -9,7 +9,10 @@ use velmora_bridge::unit::identity::Refusal;
 use velmora_bridge::unit::import::{
     ImportBatch, ImportRefusal, ImportTable, ImportValue, MoveHead, MAX_ROWS,
 };
-use velmora_bridge::unit::keys::{Access, KeyEntry, KeyGrant, KeyKind, KeyRefusal, SubjectStatus};
+use velmora_bridge::unit::keys::{
+    Access, ApplyEntry, KeyEntry, KeyGrant, KeyKind, KeyMarker, KeyRefusal, MarkerKind,
+    SubjectStatus,
+};
 use velmora_bridge::unit::{
     BirthKind, BirthToken, CallKind, Refused, Seqs, SyncHead, TenantId, TenantState, Unit,
     UnitAnswer, UnitCall, UnitName, UnitOp,
@@ -102,7 +105,7 @@ fn born() -> Unit<RusqliteSql> {
     u.sql()
         .apply(&format!(
             "INSERT INTO buckets(id, name, owner, bdk_wrapped, kek_version, created_at) \
-               VALUES ('{B1}', 'alpha', 'o', x'00', 1, 1);"
+               VALUES ('{B1}', 'alpha', 'o', x'02', 1, 1);"
         ))
         .unwrap();
     u
@@ -131,6 +134,7 @@ fn principal(seq: u64, status: SubjectStatus, grants: Vec<KeyGrant>) -> KeyEntry
         secret_kek_version: None,
         owner_ref: Some("member-1".into()),
         last_seq: seq,
+        rid: None,
     }
 }
 
@@ -147,11 +151,19 @@ fn key(seq: u64, status: SubjectStatus, grants: Vec<KeyGrant>) -> KeyEntry {
         secret_kek_version: Some(1),
         owner_ref: Some("member-1".into()),
         last_seq: seq,
+        rid: None,
     }
 }
 
 fn apply(u: &Unit<RusqliteSql>, from_seq: u64, entries: Vec<KeyEntry>) -> UnitAnswer {
-    worker(u, UnitOp::ApplyKeys { from_seq, entries })
+    worker(
+        u,
+        UnitOp::ApplyKeys {
+            from_seq,
+            entries: entries.into_iter().map(Into::into).collect(),
+            answers: vec![],
+        },
+    )
 }
 
 fn keys_seq(u: &Unit<RusqliteSql>) -> u64 {
@@ -305,6 +317,162 @@ fn a_gap_or_a_malformed_entry_is_refused_and_nothing_is_kept() {
     assert_eq!(rows, 0);
 }
 
+fn marker(kind: MarkerKind, seq: u64) -> ApplyEntry {
+    ApplyEntry::Marker(KeyMarker { marker: kind, seq })
+}
+
+fn apply_items(u: &Unit<RusqliteSql>, from_seq: u64, entries: Vec<ApplyEntry>) -> UnitAnswer {
+    worker(
+        u,
+        UnitOp::ApplyKeys {
+            from_seq,
+            entries,
+            answers: vec![],
+        },
+    )
+}
+
+fn key_rows(u: &Unit<RusqliteSql>) -> i64 {
+    u.sql()
+        .with_conn(|c| c.query_row("SELECT count(*) FROM unit_keys", [], |r| r.get(0)))
+        .unwrap()
+}
+
+/// AM-62: a record that changes no subject (`KeysFrozen`, `KeysThawed`)
+/// comes as a marker item. It counts in the gap rule, writes no row, is
+/// counted as skipped, and `keys_seq` moves past it.
+#[test]
+fn a_marker_counts_in_the_gap_rule_writes_no_row_and_moves_keys_seq() {
+    let u = born();
+    let body = ok_body(apply_items(
+        &u,
+        0,
+        vec![
+            principal(1, SubjectStatus::Active, vec![grant(B1, Access::Rw)]).into(),
+            marker(MarkerKind::KeysFrozen, 2),
+            key(3, SubjectStatus::Active, vec![grant(B1, Access::Ro)]).into(),
+            marker(MarkerKind::KeysThawed, 4),
+        ],
+    ));
+    assert_eq!(body["applied"], json!(2));
+    assert_eq!(body["skipped"], json!(2));
+    assert_eq!(keys_seq(&u), 4);
+    assert_eq!(key_rows(&u), 2);
+    assert_eq!(served(&u, K), (true, vec![(B1.into(), "ro".into())]));
+    // A page of a marker alone moves keys_seq and writes no key row, so
+    // the next page's base (the marker's seq) is not above the unit's:
+    // a frozen chain is never answered `Behind` for ever (L4 #234 r1 M3).
+    let body = ok_body(apply_items(&u, 4, vec![marker(MarkerKind::KeysFrozen, 5)]));
+    assert_eq!(
+        (body["applied"].clone(), body["skipped"].clone()),
+        (json!(0), json!(1))
+    );
+    assert_eq!(keys_seq(&u), 5);
+    assert_eq!(key_rows(&u), 2);
+    let body = ok_body(apply_items(
+        &u,
+        5,
+        vec![key(6, SubjectStatus::Revoked, vec![]).into()],
+    ));
+    assert_eq!(body["applied"], json!(1));
+    assert_eq!(keys_seq(&u), 6);
+    assert_eq!(status_of(&u, K), "revoked");
+    // A marker sent again at or below keys_seq changes nothing.
+    let body = ok_body(apply_items(&u, 4, vec![marker(MarkerKind::KeysFrozen, 5)]));
+    assert_eq!(body["skipped"], json!(1));
+    assert_eq!(keys_seq(&u), 6);
+}
+
+#[test]
+fn a_marker_out_of_its_seq_is_a_gap_and_nothing_is_kept() {
+    let u = born();
+    for entries in [
+        // The marker skips seq 2.
+        vec![
+            principal(1, SubjectStatus::Active, vec![]).into(),
+            marker(MarkerKind::KeysFrozen, 3),
+        ],
+        // The marker repeats seq 1.
+        vec![
+            principal(1, SubjectStatus::Active, vec![]).into(),
+            marker(MarkerKind::KeysThawed, 1),
+        ],
+        // An entry after a marker skips a seq.
+        vec![
+            marker(MarkerKind::KeysFrozen, 1),
+            key(3, SubjectStatus::Active, vec![]).into(),
+        ],
+    ] {
+        assert!(matches!(
+            apply_items(&u, 0, entries),
+            UnitAnswer::Refused {
+                reason: Refused::Keys(KeyRefusal::Gap),
+                ..
+            }
+        ));
+    }
+    assert_eq!(keys_seq(&u), 0);
+    assert_eq!(key_rows(&u), 0);
+    // Above MAX_ENTRIES items, markers included: malformed.
+    let many: Vec<ApplyEntry> = (1..=101)
+        .map(|n| marker(MarkerKind::KeysFrozen, n))
+        .collect();
+    assert!(matches!(
+        apply_items(&u, 0, many),
+        UnitAnswer::Refused {
+            reason: Refused::Keys(KeyRefusal::Malformed),
+            ..
+        }
+    ));
+    assert_eq!(keys_seq(&u), 0);
+}
+
+#[test]
+fn a_marker_reads_back_from_its_json_and_takes_nothing_else() {
+    let c = call(
+        CallKind::Worker,
+        None,
+        UnitOp::ApplyKeys {
+            from_seq: 1,
+            entries: vec![
+                marker(MarkerKind::KeysFrozen, 2),
+                marker(MarkerKind::KeysThawed, 3),
+            ],
+            answers: vec![],
+        },
+    );
+    let text = serde_json::to_string(&c).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(
+        v["op"]["entries"],
+        json!([
+            {"marker": "keys_frozen", "seq": 2},
+            {"marker": "keys_thawed", "seq": 3},
+        ])
+    );
+    assert_eq!(serde_json::from_str::<UnitCall>(&text).unwrap(), c);
+    // A marker is exactly `marker` and `seq`; anything else is refused,
+    // and so is an entry that carries `marker`.
+    for bad in [
+        json!({"marker": "keys_frozen", "seq": 2, "id": "AK"}),
+        json!({"marker": "keys_opened", "seq": 2}),
+        json!({"marker": "keys_frozen"}),
+        json!({"seq": 2}),
+    ] {
+        let mut w = v.clone();
+        w["op"]["entries"][0] = bad.clone();
+        assert!(
+            serde_json::from_value::<UnitCall>(w).is_err(),
+            "{bad} was taken"
+        );
+    }
+    let mut entry = serde_json::to_value(key(2, SubjectStatus::Active, vec![])).unwrap();
+    entry["marker"] = json!("keys_frozen");
+    let mut w = v.clone();
+    w["op"]["entries"][0] = entry;
+    assert!(serde_json::from_value::<UnitCall>(w).is_err());
+}
+
 #[test]
 fn an_entry_at_or_below_its_rows_seq_is_skipped() {
     let u = born();
@@ -414,7 +582,7 @@ fn the_served_grant_is_the_keys_own_inside_its_principals() {
     u.sql()
         .apply(
             "INSERT INTO buckets(id, name, owner, bdk_wrapped, kek_version, created_at) \
-               VALUES ('b_00000000000000d3', 'gamma', 'o', x'00', 1, 1);",
+               VALUES ('b_00000000000000d3', 'gamma', 'o', x'02', 1, 1);",
         )
         .unwrap();
     let b3 = "b_00000000000000d3";
@@ -521,7 +689,8 @@ fn a_key_entry_reads_back_from_its_json_and_hides_its_secret_in_debug() {
         None,
         UnitOp::ApplyKeys {
             from_seq: 1,
-            entries: vec![e.clone()],
+            entries: vec![e.clone().into()],
+            answers: vec![],
         },
     );
     let text = serde_json::to_string(&c).unwrap();
@@ -543,7 +712,8 @@ fn apply_is_a_worker_call_only() {
             seqs(3, 0),
             UnitOp::ApplyKeys {
                 from_seq: 0,
-                entries: vec![principal(1, SubjectStatus::Active, vec![])],
+                entries: vec![principal(1, SubjectStatus::Active, vec![]).into()],
+                answers: vec![],
             },
         ),
         NOW,
@@ -634,8 +804,15 @@ fn import(
     )
 }
 
+/// A scheme-2 BDK wrap's shape: 73 bytes after the version byte 0x02.
+fn bdk() -> ImportValue {
+    let mut w = vec![0; 73];
+    w[0] = 0x02;
+    ImportValue::Blob(w)
+}
+
 fn bucket_row(id: &str, name: &str) -> Vec<ImportValue> {
-    vec![t(id), t(name), t(P), b(73), i(1), i(0), i(10)]
+    vec![t(id), t(name), t(P), bdk(), i(1), i(0), i(10)]
 }
 
 const G: &str = "g_0019a00000000d1d1d1d1d1d1d1d1";
@@ -936,10 +1113,19 @@ fn batches_apply_once_and_in_order_and_the_import_resumes_by_cursor() {
         Some((Refused::Import(ImportRefusal::OutOfOrder), false))
     );
     assert_eq!(imported(&u, "buckets"), 4);
-    let progress = ok_body(worker(&u, UnitOp::ImportProgress {}));
+    let mut progress = ok_body(worker(&u, UnitOp::ImportProgress {}));
+    assert!(progress["schema_tables"].is_array());
+    progress.as_object_mut().unwrap().remove("schema_tables");
     assert_eq!(
         progress,
-        json!({ "tables": [{ "table": "buckets", "cursor": "b2", "rows": 3 }], "sealed": null })
+        json!({
+            "tables": [{ "table": "buckets", "cursor": "b2", "rows": 3 }],
+            "sealed": null,
+            "t0_seq": 10,
+            "since_seq": SINCE,
+            "move_lifted": false,
+            "lifted_at": null,
+        })
     );
 }
 
