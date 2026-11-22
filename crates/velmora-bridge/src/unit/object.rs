@@ -417,6 +417,21 @@ impl<S: UnitSql> Unit<S> {
                 why: Closed::Provisioning,
             });
         }
+        // A job call (W2-jobs): only from the consumer, authenticated,
+        // with the job's numbers (checked above as a job's); it runs in
+        // any tenant state but a shred.
+        if let UnitOp::Job { .. } = &call.op {
+            if call.kind != CallKind::Job || !call.authenticated {
+                return Ok(refused(Refused::Unauthenticated, false));
+            }
+            if matches!(
+                head.tenant_state,
+                TenantState::Shredding | TenantState::Shredded
+            ) {
+                return Ok(refused(Refused::AccountProblem, false));
+            }
+            return self.run(call, &head, false, now);
+        }
         // A fan-out read names a grant: it is never a cold read, so it
         // is refused without `authenticated` (rule 11).
         if !call.authenticated && (!call.op.read_only() || call.kind == CallKind::Fanout) {
@@ -586,6 +601,7 @@ impl<S: UnitSql> Unit<S> {
                     "state": state,
                 })))
             }
+            UnitOp::Job { call } => Ok(Ok(call.clone().run(&self.cat).await?)),
             UnitOp::Provision { .. }
             | UnitOp::Sync { .. }
             | UnitOp::ApplyKeys { .. }

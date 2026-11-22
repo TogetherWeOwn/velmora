@@ -13,6 +13,7 @@ use serde_json::Value;
 use super::birth::{BirthToken, ProvisionRefusal};
 use super::identity::{CallKind, Refusal, Seqs};
 use super::import::{ImportBatch, ImportRefusal, MoveHead};
+use super::jobcall::JobCall;
 use super::keys::{KeyEntry, KeyRefusal};
 use super::lift::{AckClass, FindingList, GateRefusal, GateSummary, LiftProof, ReplayId};
 use super::name::UnitName;
@@ -204,6 +205,10 @@ pub enum UnitOp {
     /// The stored report and whether a lift would pass now, with the
     /// counts and hashes for the lift record. A Worker call.
     GateStatus {},
+    /// One catalogue method of the job path (W2-jobs). A `job` call:
+    /// the job's numbers must equal the unit's, and it is
+    /// `authenticated`.
+    Job { call: JobCall },
     /// The read plan of a range of an object: the live generation (or
     /// the one named) and its extents in `[start, end)`. Allowed without
     /// `authenticated`, and then it writes nothing (no read stamp).

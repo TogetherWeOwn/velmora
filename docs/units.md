@@ -157,6 +157,21 @@ while the counters are on, and the recount fills them when they are off.
 An `outbox` row must come with its lease cleared, and an extent's
 `plan_rev` is bound through `plan_rev::bound`.
 
+## Jobs
+
+Post, verify, release, GC, eviction and the dispatcher run in the Worker,
+as today: they hold the NNTP sessions, the blob stores and the keys (rules
+3 and 4). What they ask of the catalogue, the tenant's unit answers. Each
+catalogue method of the job path is one `job` call (`unit::jobcall`), run
+by the unit's own catalogue in one transaction; on the Worker's side,
+`TenantCatalog` is a catalogue whose job methods are these calls, so the
+job code runs unchanged against a unit. A job call carries the job's
+numbers and must match the unit's (rule 5: missing or lower is refused,
+higher is `sync_needed`), is `authenticated`, is refused while the unit is
+closed, and is refused for a tenant being shredded. Provider permits and
+provider health are not a unit's: they stay in the shared database, which
+every tenant's jobs use. The request path does not use `TenantCatalog`.
+
 ## Bookmarks
 
 **A bookmark leaves the unit only sealed.** No bookmark is stored or
