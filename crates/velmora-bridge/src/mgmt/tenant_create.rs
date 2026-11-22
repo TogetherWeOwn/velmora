@@ -440,8 +440,11 @@ where
         Ok(None) => {
             let mut id = [0u8; ID_BYTES];
             rng.fill_bytes(&mut id).map_err(|_| unavailable())?;
-            let drawn =
-                crate::unit::TenantId::parse(&format!("t_{}", hex(&id))).ok_or_else(internal)?;
+            let text = format!("t_{}", hex(&id));
+            // A managed id, checked before it is put: an all-zero draw is
+            // tenant 0 and is never named (the retry draws again).
+            crate::TenantId::parse(&text).map_err(|_| unavailable())?;
+            let drawn = crate::unit::TenantId::parse(&text).ok_or_else(internal)?;
             match put_tref(records, kek, &body.external_ref, &drawn, rng).await {
                 Ok(true) => drawn,
                 Ok(false) => match read_tref(records, kek, &body.external_ref).await {
@@ -453,8 +456,6 @@ where
         }
         Err(_) => return Err(unavailable()),
     };
-    // An id the draw made tenant 0 (all zero bytes) is refused by the
-    // record's own parse: the retry draws again.
     let chain_tenant = crate::TenantId::parse(tenant.as_str()).map_err(|_| unavailable())?;
     let t = Tenant::Managed(chain_tenant.clone());
 
