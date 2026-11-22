@@ -14,7 +14,7 @@ use velmora_bridge::unit::lift::{
 use velmora_bridge::unit::recount::{RecountCall, RecountRefusal};
 use velmora_bridge::unit::restore::{
     drive, Bookmark, PitrStep, PointInTimePort, RestoreRefusal, RestoreTarget, LEASE_TERM_MS,
-    RESTORE_MARGIN_MS,
+    LIFT_SLACK_MS, RESTORE_MARGIN_MS,
 };
 use velmora_bridge::unit::{
     poll_once, BirthKind, BirthToken, CallKind, Refused, Seqs, SyncHead, TenantId, TenantState,
@@ -348,7 +348,9 @@ fn a_restore_armed_without_the_restart_says_so() {
     let op = restore_op(
         BirthKind::Restore,
         S,
-        RestoreTarget::Time { at_ms: 1 },
+        RestoreTarget::Time {
+            at_ms: BORN + LIFT_SLACK_MS,
+        },
         "bm-undo",
     );
     let a = poll_once(drive(step(&u, op, ready_at(BORN + 1000)), &pitr)).unwrap();
@@ -365,7 +367,9 @@ fn restore_checks_its_token_and_that_nothing_moved_since_prepare() {
     let u = closed();
     let t = ready_at(BORN + 1000);
     let pitr = FakePitr::new("bm-undo");
-    let at = RestoreTarget::Time { at_ms: BORN + 500 };
+    let at = RestoreTarget::Time {
+        at_ms: BORN + LIFT_SLACK_MS + 500,
+    };
     assert_eq!(
         run(
             &u,
@@ -420,7 +424,7 @@ fn restore_checks_its_token_and_that_nothing_moved_since_prepare() {
     );
     assert_eq!(
         *pitr.restored.borrow(),
-        vec![format!("bm-at-{}", BORN + 500)]
+        vec![format!("bm-at-{}", BORN + LIFT_SLACK_MS + 500)]
     );
     // An undo goes back to the sealed undo bookmark, unsealed by the tool.
     let back = RestoreTarget::Bookmark {
