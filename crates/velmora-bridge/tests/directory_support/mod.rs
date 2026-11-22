@@ -25,7 +25,7 @@ use velmora_bridge::{BridgeError, Result};
 
 /// The directory's migrations, in order. A test checks that this is every
 /// file of the folder.
-pub const MIGRATIONS: [(&str, &str); 2] = [
+pub const MIGRATIONS: [(&str, &str); 3] = [
     (
         "0001_directory.sql",
         include_str!("../../../../workers/s3-bridge/migrations-directory/0001_directory.sql"),
@@ -34,11 +34,17 @@ pub const MIGRATIONS: [(&str, &str); 2] = [
         "0002_tenant_events.sql",
         include_str!("../../../../workers/s3-bridge/migrations-directory/0002_tenant_events.sql"),
     ),
+    (
+        "0003_pending_chains_and_caps.sql",
+        include_str!(
+            "../../../../workers/s3-bridge/migrations-directory/0003_pending_chains_and_caps.sql"
+        ),
+    ),
 ];
 
 /// Every table of the schema, children before parents, for the probe's
 /// reset.
-const TABLES: [&str; 12] = [
+const TABLES: [&str; 13] = [
     "units",
     "key_routes",
     "bucket_index",
@@ -51,6 +57,7 @@ const TABLES: [&str; 12] = [
     "tenant_events",
     "feed_epoch",
     "tenant_feed_pruned",
+    "token_caps",
 ];
 
 /// A directory database for one test.
