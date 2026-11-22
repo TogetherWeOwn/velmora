@@ -279,10 +279,15 @@ async fn queue(batch: MessageBatch<serde_json::Value>, env: Env, _ctx: Context) 
                 msg.ack();
                 continue;
             }
-            Admission::Refused(why) => {
+            refused @ (Admission::Refused(_) | Admission::Control(_)) => {
                 // Never run, never dropped in silence: handed back until
                 // its deliveries are used up, so that it reaches the
-                // dead-letter queue, which pages.
+                // dead-letter queue, which pages. A control intent too:
+                // this build has no finisher (`jobmsg`).
+                let why = match refused {
+                    Admission::Refused(why) => why,
+                    _ => velmora_bridge::jobmsg::Refusal::NoFinisher,
+                };
                 console_error!(
                     "alert: job message refused ({}): to the dead-letter queue",
                     why.code()

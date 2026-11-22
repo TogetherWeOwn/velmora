@@ -391,3 +391,127 @@ fn the_format_switch_reports_errors_without_raw_values() {
         assert!(!error.contains(raw), "{error}");
     }
 }
+
+// ---------------------------------------------------------------------------
+// apply_control: a control intent, v 2 only, for the finisher of its chain
+// ---------------------------------------------------------------------------
+
+mod control {
+    use super::*;
+    use velmora_bridge::jobmsg::{
+        ControlIntent, Disposition, FormatCount, IntentChain, APPLY_CONTROL_DELAY_SECS,
+    };
+
+    const TENANT: &str = "t_00000000000000a1";
+
+    fn intent(chain: IntentChain, seq: u64) -> ControlIntent {
+        ControlIntent::new(TENANT, chain, seq).unwrap()
+    }
+
+    #[test]
+    fn an_intent_is_sent_as_its_golden_body_and_read_back_as_it_is() {
+        for (chain, word) in [(IntentChain::Keys, "keys"), (IntentChain::Tenant, "tenant")] {
+            let sent = intent(chain, 42);
+            let text = sent.message().to_json();
+            assert_eq!(
+                text,
+                format!(
+                    r#"{{"t":"apply_control","v":2,"tenant":"{TENANT}","chain":"{word}","seq":42}}"#
+                )
+            );
+            let admission = admit(&serde_json::from_str::<Value>(&text).unwrap());
+            assert_eq!(admission, Admission::Control(sent.clone()));
+            // No finisher in this build: handed back to the dead-letter
+            // queue, never run and never dropped.
+            assert_eq!(admission.disposition(), Disposition::Refuse);
+            assert_eq!(
+                (sent.tenant(), sent.chain(), sent.seq()),
+                (TENANT, chain, 42)
+            );
+        }
+        assert_eq!(APPLY_CONTROL_DELAY_SECS, 30);
+        assert_eq!(Refusal::NoFinisher.code(), "no_finisher");
+    }
+
+    #[test]
+    fn tenant_zero_and_ids_that_are_no_tenant_have_no_intent() {
+        let zero = TenantScope::tenant_zero();
+        for tenant in [
+            zero.tenant_id(),
+            "",
+            "t_",
+            "default",
+            "t_ABC",
+            "x_00000000000000a1",
+        ] {
+            assert!(
+                ControlIntent::new(tenant, IntentChain::Keys, 1).is_none(),
+                "{tenant}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_control_message_that_is_not_one_of_this_build_is_refused() {
+        use Refusal::{BadBody, BadTenant, NoTenant};
+        let good =
+            json!({"t": "apply_control", "v": 2, "tenant": TENANT, "chain": "keys", "seq": 7});
+        let with = |key: &str, value: Value| {
+            let mut body = good.clone();
+            body[key] = value;
+            body
+        };
+        let without = |key: &str| {
+            let mut body = good.clone();
+            body.as_object_mut().unwrap().remove(key);
+            body
+        };
+        let zero = TenantScope::tenant_zero();
+        for (body, refusal, what) in [
+            (without("tenant"), NoTenant, "no tenant"),
+            (with("tenant", Value::Null), NoTenant, "null tenant"),
+            (with("tenant", json!(7)), BadTenant, "tenant not a string"),
+            (
+                with("tenant", json!(zero.tenant_id())),
+                BadTenant,
+                "tenant 0",
+            ),
+            (with("tenant", json!("t_A1")), BadTenant, "not a tenant id"),
+            (with("chain", json!("grants")), BadBody, "unknown chain"),
+            (without("chain"), BadBody, "no chain"),
+            (with("seq", json!(-1)), BadBody, "negative seq"),
+            (with("seq", json!("7")), BadBody, "seq as text"),
+            (without("seq"), BadBody, "no seq"),
+            (with("unit", json!(1)), BadBody, "a unit"),
+            (with("state_seq", json!(0)), BadBody, "a state_seq"),
+            (with("keys_seq", json!(0)), BadBody, "a keys_seq"),
+            (with("extra", json!(true)), BadBody, "an unknown field"),
+        ] {
+            assert_refused(&body, refusal, what);
+        }
+    }
+
+    #[test]
+    fn a_control_message_of_another_format_is_no_job() {
+        for v in [json!(1), json!(3)] {
+            let body =
+                json!({"t": "apply_control", "v": v, "tenant": TENANT, "chain": "keys", "seq": 7});
+            assert_eq!(admit(&body), Admission::Malformed, "{body}");
+        }
+        let body = json!({"t": "apply_control", "tenant": TENANT, "chain": "keys", "seq": 7});
+        assert_eq!(admit(&body), Admission::Malformed);
+    }
+
+    #[test]
+    fn the_format_count_counts_an_intent_as_refused() {
+        let mut count = FormatCount::default();
+        let line = count.count(
+            &Admission::Control(intent(IntentChain::Tenant, 1)),
+            velmora_bridge::UnixMs(1_000),
+        );
+        assert_eq!(
+            line.as_deref(),
+            Some("job message formats: v1=0 v2=0 refused=1 over 0 s")
+        );
+    }
+}

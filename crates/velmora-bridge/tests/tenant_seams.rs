@@ -115,16 +115,16 @@ fn a_scope_is_made_only_at_the_listed_places() {
             // The replay: the listing, and the plans of an extent.
             ("bridge/replay.rs", 3),
             // The reader of a queue message: the tenant a message names
-            // (one scope), and whether a scope is tenant 0
-            // (`is_tenant_zero`, twice).
-            ("bridge/jobmsg.rs", 3),
+            // (one scope), whether a scope is tenant 0 (`is_tenant_zero`,
+            // twice), and the tenant a control intent must not name.
+            ("bridge/jobmsg.rs", 4),
             // The queue sink: the tenant its messages name.
             ("worker/env.rs", 1),
         ],
     );
     // The reader of a message makes the scope of the job path, and the
     // consumer takes it from there: it makes none of its own.
-    assert_eq!(found.get("bridge/jobmsg.rs"), Some(&3));
+    assert_eq!(found.get("bridge/jobmsg.rs"), Some(&4));
     assert_eq!(found.get("worker/lib.rs"), None);
 }
 

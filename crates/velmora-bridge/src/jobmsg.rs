@@ -62,6 +62,25 @@
 //! before this module: `run_job` drops it and the outbox sends its row
 //! again in the current format.
 //!
+//! # Control intents: `apply_control`
+//!
+//! A control change of a managed tenant (tenancy ADR §2.5, step 1) sends
+//! `apply_control(tenant, chain, seq)` with a delay of
+//! [`APPLY_CONTROL_DELAY_SECS`]: the durable part of its intent, which
+//! the finisher of the chain consumes. It is a `v` 2 message only, and
+//! no job: `{"t": "apply_control", "v": 2, "tenant", "chain", "seq"}`,
+//! `chain` being `tenant` or `keys` ([`ControlIntent`]). It names no
+//! unit and carries no `state_seq` or `keys_seq`: the finisher reads the
+//! head of the chain, never the message's numbers.
+//!
+//! The reader knows it ([`Admission::Control`]). Tenant 0 has no chain:
+//! a message that names it, a tenant that is not a tenant id, or a field
+//! this build does not know is refused. A build without the finisher
+//! (this one) hands every control message back until it reaches the
+//! dead-letter queue, which pages: no intent is dropped in silence, and
+//! the freshness lease and the pending sweep finish its change (ADR
+//! §2.5, "Three things finish a crashed change").
+//!
 //! # Inside the Worker
 //!
 //! The body of a `v` 2 message is the body of a `v` 1 message plus the
@@ -87,6 +106,13 @@ const _: () = assert!(JOB_VERSION < TENANT_FORMAT_VERSION);
 /// none, so that its deliveries are used up at once and it reaches the
 /// dead-letter queue within seconds.
 pub const REFUSED_RETRY_DELAY_SECS: u32 = 0;
+
+/// The delay of an `apply_control` message (ADR §2.5 step 1, est): the
+/// change it names is finished by its own request first.
+pub const APPLY_CONTROL_DELAY_SECS: u32 = 30;
+
+/// `t` of a control intent.
+pub const APPLY_CONTROL: &str = "apply_control";
 
 /// Name of the configuration switch of the writers' format.
 pub const JOB_FORMAT_VAR: &str = "JOB_FORMAT";
@@ -393,7 +419,7 @@ impl FormatCount {
             Admission::Run {
                 tenant: Some(_), ..
             } => 1,
-            Admission::Refused(_) => 2,
+            Admission::Refused(_) | Admission::Control(_) => 2,
             Admission::Malformed => return None,
         };
         self.counts[kind] += 1;
@@ -420,6 +446,82 @@ impl FormatCount {
     }
 }
 
+/// The chain a control intent names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IntentChain {
+    /// `m/t/<t>/`: the tenant's state.
+    Tenant,
+    /// `m/k/<t>/`: keys, grants and principals.
+    Keys,
+}
+
+/// `apply_control(tenant, chain, seq)`: a `v` 2 message, never a job.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ControlIntent {
+    tenant: String,
+    chain: IntentChain,
+    seq: u64,
+}
+
+impl ControlIntent {
+    /// The intent for record `seq` of `chain` of `tenant`. `None` for a
+    /// tenant that is not a managed tenant id: tenant 0 has no chain.
+    pub fn new(tenant: &str, chain: IntentChain, seq: u64) -> Option<ControlIntent> {
+        managed_tenant(tenant).then(|| ControlIntent {
+            tenant: tenant.to_owned(),
+            chain,
+            seq,
+        })
+    }
+
+    pub fn tenant(&self) -> &str {
+        &self.tenant
+    }
+
+    pub fn chain(&self) -> IntentChain {
+        self.chain
+    }
+
+    pub fn seq(&self) -> u64 {
+        self.seq
+    }
+
+    /// The message to send, with [`APPLY_CONTROL_DELAY_SECS`].
+    pub fn message(&self) -> ControlMessage<'_> {
+        ControlMessage {
+            t: APPLY_CONTROL,
+            v: TENANT_FORMAT_VERSION,
+            tenant: &self.tenant,
+            chain: self.chain,
+            seq: self.seq,
+        }
+    }
+}
+
+/// The body of an `apply_control` message: a struct, so a plain JSON
+/// object on the wire.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ControlMessage<'a> {
+    t: &'static str,
+    v: u8,
+    tenant: &'a str,
+    chain: IntentChain,
+    seq: u64,
+}
+
+impl ControlMessage<'_> {
+    pub fn to_json(&self) -> String {
+        // Plain strings and integers only: it cannot fail.
+        serde_json::to_string(self).unwrap_or_default()
+    }
+}
+
+/// A managed tenant's id: a tenant id that is not tenant 0's.
+fn managed_tenant(tenant: &str) -> bool {
+    crate::recovery::valid_tenant_id(tenant) && tenant != TenantScope::tenant_zero().tenant_id()
+}
+
 /// What the consumer does with a message.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Admission {
@@ -436,6 +538,10 @@ pub enum Admission {
     /// A `v` 2 message that must not run: handed back to the queue until
     /// it reaches the dead-letter queue, which pages.
     Refused(Refusal),
+    /// A control intent for the finisher of its chain. A build without
+    /// the finisher hands it back, as a refusal
+    /// ([`Refusal::NoFinisher`]).
+    Control(ControlIntent),
 }
 
 /// What the consumer does with a message's delivery.
@@ -457,6 +563,8 @@ impl Admission {
             Admission::Run { .. } => Disposition::Run,
             Admission::Malformed => Disposition::Drop,
             Admission::Refused(_) => Disposition::Refuse,
+            // No finisher in this build.
+            Admission::Control(_) => Disposition::Refuse,
         }
     }
 }
@@ -475,6 +583,8 @@ pub enum Refusal {
     UnitOfTenantZero,
     /// Its fields are not a job of this build.
     BadBody,
+    /// A control intent, and this build has no finisher for it.
+    NoFinisher,
 }
 
 impl Refusal {
@@ -485,6 +595,7 @@ impl Refusal {
             Refusal::OtherTenant => "other_tenant",
             Refusal::UnitOfTenantZero => "unit_of_tenant_0",
             Refusal::BadBody => "bad_body",
+            Refusal::NoFinisher => "no_finisher",
         }
     }
 }
@@ -503,6 +614,12 @@ pub fn admit(body: &Value) -> Admission {
                 tenant: None,
             },
             Err(_) => Admission::Malformed,
+        };
+    }
+    if body.get("t").and_then(Value::as_str) == Some(APPLY_CONTROL) {
+        return match control_message(body) {
+            Ok(intent) => Admission::Control(intent),
+            Err(refusal) => Admission::Refused(refusal),
         };
     }
     match tenant_message(body, &scope) {
@@ -563,6 +680,28 @@ fn tenant_message(
             keys_seq: numbers.keys_seq,
         },
     ))
+}
+
+/// An `apply_control` message of `v` 2 as its intent.
+fn control_message(body: &Value) -> std::result::Result<ControlIntent, Refusal> {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Body {
+        #[allow(dead_code)]
+        t: String,
+        #[allow(dead_code)]
+        v: u8,
+        tenant: Option<Value>,
+        chain: IntentChain,
+        seq: u64,
+    }
+    let body = Body::deserialize(body).map_err(|_| Refusal::BadBody)?;
+    let tenant = match body.tenant {
+        None | Some(Value::Null) => return Err(Refusal::NoTenant),
+        Some(Value::String(tenant)) => tenant,
+        Some(_) => return Err(Refusal::BadTenant),
+    };
+    ControlIntent::new(&tenant, body.chain, body.seq).ok_or(Refusal::BadTenant)
 }
 
 /// The tenant fields as a `v` 2 message must carry them: both numbers
