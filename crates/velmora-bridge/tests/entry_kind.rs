@@ -196,6 +196,24 @@ async fn multipart_holds_the_same_binding() {
         (part.status, code(&part).as_str()),
         (403, "InvalidAccessKeyId")
     );
+    // The multipart authenticator refuses a marker beside an edge header
+    // for both kinds, as the object path does.
+    for key in [&s3, &app] {
+        let part = send(
+            &rig,
+            key,
+            Method::Put,
+            "/dav/big",
+            &q,
+            b"part",
+            &[MARK, ("cf-connecting-ip", "192.0.2.1")],
+        )
+        .await;
+        assert_eq!(
+            (part.status, code(&part).as_str()),
+            (403, "InvalidAccessKeyId")
+        );
+    }
     let part = send(&rig, &app, Method::Put, "/dav/big", &q, b"part", &[MARK]).await;
     assert_eq!(part.status, 200, "{}", String::from_utf8_lossy(&part.body));
 
