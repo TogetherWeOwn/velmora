@@ -30,7 +30,20 @@ bench/run-local.sh [--ref <git ref>] [--name <name>] [--out <dir>] [--tiny <n>] 
   written that are reported and priced are D1's. The native rows-written
   meter is compared with them label by label: `results.md` and
   `results.json` (`rows_written_check`) say whether it agrees, and where
-  not.
+  not. The two run the same statements from the same state, so they agree
+  exactly when both are right (measured: 0 rows apart). The run fails
+  (after writing the report) when they are more than `ROWS_WRITTEN_NOISE`
+  rows apart in all, or when the replay has nothing to compare. The
+  tolerance is 1 row, set to the run-to-run noise of Repeatability below
+  (one sampled extent); it is not noise between the two.
+- The migrations leave the usage counters off (production switches them on
+  with its first recount). The rig starts from the migrations and switches
+  them on with the first call of the trace (`ARM_USAGE`, the recount's end
+  state over an empty catalogue), so the replay counts them as the native
+  run does. Before this, the replay ran with them off: its rows written
+  left out every counter-trigger row. `--ref` therefore needs a commit
+  with the usage counters (migration 0020 and
+  `RusqliteSql::with_schema_unarmed`).
 - `report.py` writes `results.json` and `results.md`: per S3 operation, per
   pipeline stage and extent (classes `big` = 16 MiB extents, `mix`, `tiny`),
   the statements that read the most rows, and the cost model.
