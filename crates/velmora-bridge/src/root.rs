@@ -63,6 +63,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
+use futures_util::lock::{Mutex, MutexGuard};
 use velmora::rng::FillRandom;
 
 use crate::crypto::scheme2::{TenantKey, KCV_LEN};
@@ -135,6 +136,8 @@ pub struct RootCache {
     /// The unit clients' renewal state (rule 11's spacing and backoff, the
     /// renewals in flight), by unit, bounded at 4,096 units (AM-71).
     pub flights: InFlight,
+    /// Serializes the directory first-open route within this isolate.
+    first_open: Mutex<()>,
 }
 
 impl RootCache {
@@ -182,6 +185,10 @@ impl<'a, P: RootPorts, R: FillRandom> Root<'a, P, R> {
     /// The directory, when it is bound.
     pub fn directory(&self) -> Option<SqlDirectory<'a, P::Sql>> {
         self.ports.directory().map(|sql| SqlDirectory { sql })
+    }
+
+    pub(crate) fn try_first_open(&self) -> Option<MutexGuard<'_, ()>> {
+        self.cache.first_open.try_lock()
     }
 
     /// The router's tenant head cache.

@@ -39,7 +39,10 @@
 //!   `503 gate_not_opened` with the steps that are not done when it did
 //!   not (a run that left the gate closed may be started again). With
 //!   `DIRECTORY` unbound the gate counts as closed: `503
-//!   directory_unbound`, nothing run.
+//!   directory_unbound`, nothing run. An overlapping call in one isolate
+//!   answers retryable `503` without checking the gate. AM-78 calls for
+//!   one operator or drill-runner call per environment; the isolate
+//!   guard is not a cross-isolate lock.
 //!
 //! Every answer carries fixed words and numbers only, never a store's
 //! text.
@@ -225,6 +228,12 @@ where
             "No directory is bound; the gate counts as closed.",
         );
     };
+    // Hold the isolate's lock from before the guard through the whole run:
+    // the durable guard's final read and anchor put are separate calls.
+    // A waiter could wake in another request's Worker I/O context.
+    let Some(_first_open) = root.try_first_open() else {
+        return unavailable();
+    };
     // The route's own guard (AM-78, §R7-13 N1): an open gate answers
     // `200` and runs nothing, so a repeat never closes it or empties
     // `pending_ops`; a read that fails runs nothing either. `first_open`
@@ -250,11 +259,21 @@ where
                 "A managed tenant chain exists; nothing was run.",
             )
         }
-        Ok(FirstOpenAnswer::Ran(run)) if run.opened => json_response(
-            200,
-            &json!({ "gate": "open", "ran": true, "epoch": run.epoch }),
-        ),
         Ok(FirstOpenAnswer::Ran(run)) => {
+            if run.anchor_strays != 0 {
+                crate::trace::alert(|| "setup: first open found stray gate anchors".to_string());
+            }
+            if run.tenants.damaged() {
+                crate::trace::alert(|| {
+                    "setup: first open found a damaged tenant chain".to_string()
+                });
+            }
+            if run.opened {
+                return json_response(
+                    200,
+                    &json!({ "gate": "open", "ran": true, "epoch": run.epoch }),
+                );
+            }
             // The step names and their problem codes are fixed words.
             let not_done: Vec<Value> = run
                 .steps

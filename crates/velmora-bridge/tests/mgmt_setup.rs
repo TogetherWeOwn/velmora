@@ -2,13 +2,17 @@
 
 mod service_support;
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
+use std::future::Future;
+use std::ops::Deref;
+use std::pin::pin;
+use std::task::{Context, Waker};
 
 use futures_util::stream;
 use serde_json::{json, Value};
 use velmora::rng::SystemRng;
 use velmora_bridge::config::Maintenance;
-use velmora_bridge::directory::gate::{anchored_epoch, close, is_open};
+use velmora_bridge::directory::gate::{anchored_epoch, close, is_open, GATE_ANCHOR_PREFIX};
 use velmora_bridge::directory::record::Tenant;
 use velmora_bridge::directory::store::{ChainKind, PendingOp, SqlDirectory};
 use velmora_bridge::keys::locations::{
@@ -16,7 +20,7 @@ use velmora_bridge::keys::locations::{
 };
 use velmora_bridge::keys::tk::KeyBuckets;
 use velmora_bridge::mgmt::setup::{serve_setup, setup_call, SetupCall};
-use velmora_bridge::records::MemRecords;
+use velmora_bridge::records::{MemRecords, RecordStore};
 use velmora_bridge::root::{Root, RootCache, RootPorts};
 use velmora_bridge::testkit::{FixedClock, RusqliteSql, TestKek};
 use velmora_bridge::{Body, BridgeConfig, Method, RespBody, S3Request, S3Response, Secret, UnixMs};
@@ -28,8 +32,48 @@ const ADMIN: &str = "admin-token-fixture-admin-token-fixture";
 const READ: &str = "read-token-fixture-read-token-fixture";
 const NOW: UnixMs = UnixMs(1_800_000_000_000);
 
+// Pause after the first anchor is durable, before that caller can update SQL.
+#[derive(Default)]
+struct SetupRecords {
+    inner: MemRecords,
+    pause_after_anchor: Cell<bool>,
+}
+
+impl Deref for SetupRecords {
+    type Target = MemRecords;
+
+    fn deref(&self) -> &MemRecords {
+        &self.inner
+    }
+}
+
+impl RecordStore for SetupRecords {
+    async fn put_if_absent(&self, name: &str, bytes: Vec<u8>) -> velmora_bridge::Result<bool> {
+        let stored = self.inner.put_if_absent(name, bytes).await?;
+        if stored && name.starts_with(GATE_ANCHOR_PREFIX) && self.pause_after_anchor.replace(false)
+        {
+            tokio::task::yield_now().await;
+        }
+        Ok(stored)
+    }
+
+    async fn get(&self, name: &str) -> velmora_bridge::Result<Option<Vec<u8>>> {
+        self.inner.get(name).await
+    }
+
+    async fn list(
+        &self,
+        prefix: &str,
+        start_after: &str,
+        limit: u32,
+    ) -> velmora_bridge::Result<Vec<String>> {
+        self.inner.list(prefix, start_after, limit).await
+    }
+}
+
 struct Ports {
-    records: MemRecords,
+    cache: RootCache,
+    records: SetupRecords,
     keys_a: MemRecords,
     keys_b: MemRecords,
     bind_keys_b: bool,
@@ -42,7 +86,8 @@ struct Ports {
 impl Ports {
     fn new() -> Self {
         Self {
-            records: MemRecords::new(),
+            cache: RootCache::new(),
+            records: SetupRecords::default(),
             keys_a: MemRecords::new(),
             keys_b: MemRecords::new(),
             bind_keys_b: true,
@@ -78,8 +123,7 @@ impl Ports {
 
     async fn serve(&self, req: S3Request) -> S3Response {
         let call = setup_call(&req.raw_target).expect("setup route");
-        let cache = RootCache::new();
-        let root = Root::new(self, &cache, SystemRng);
+        let root = Root::new(self, &self.cache, SystemRng);
         let cfg = config(self.maintenance);
         serve_setup(call, &req, &cfg, self, &root, &mut SystemRng).await
     }
@@ -110,13 +154,13 @@ impl Ports {
 }
 
 impl RootPorts for Ports {
-    type Records = MemRecords;
+    type Records = SetupRecords;
     type KeyStore = MemRecords;
     type Kek = TestKek;
     type Sql = RusqliteSql;
     type Clock = FixedClock;
 
-    fn records(&self) -> &MemRecords {
+    fn records(&self) -> &SetupRecords {
         &self.records
     }
 
@@ -526,7 +570,6 @@ async fn an_open_gate_stays_open_and_keeps_pending_ops() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-#[ignore = "waits for L3-E first_open bodies"]
 async fn a_managed_tenant_chain_refuses_first_open_and_alerts() {
     let ports = Ports::with_closed_directory();
     let dir = ports.dir();
@@ -543,31 +586,90 @@ async fn a_managed_tenant_chain_refuses_first_open_and_alerts() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-#[ignore = "waits for L3-E first_open bodies"]
 async fn a_closed_gate_without_tenants_runs_first_open() {
     let ports = Ports::with_closed_directory();
     let dir = ports.dir();
     assert!(!is_open(&ports.records, &dir).await.unwrap());
 
-    let resp = ports.post(GATE_PATH).await;
-    let opened = match resp.status {
-        200 => true,
-        503 => false,
-        status => panic!("expected a first-open run response (200 or 503), got {status}"),
-    };
-    let body = json_response(&resp, resp.status);
-    if opened {
-        assert_eq!(body["gate"], "open");
-        assert_eq!(body["ran"], true);
-    } else {
-        assert_eq!(body["error"], "gate_not_opened");
-    }
-    let (epoch, strays) = anchored_epoch(&ports.records).await.unwrap();
-    assert_eq!((epoch, strays), (1, 0));
-    assert_eq!(body["epoch"], epoch);
-    assert_eq!(dir.gate().await.unwrap().epoch, epoch);
-    assert_eq!(is_open(&ports.records, &dir).await.unwrap(), opened);
+    let body = json_response(&ports.post(GATE_PATH).await, 503);
+    assert_eq!(body["error"], "gate_not_opened");
+    assert_eq!(body["epoch"], 1);
+    assert_eq!(
+        body["not_done"],
+        json!([{"step": "key_locations_and_registry", "problems": ["key_locations_absent"]}])
+    );
+    assert_eq!(anchored_epoch(&ports.records).await.unwrap(), (1, 0));
+    assert_eq!(dir.gate().await.unwrap().epoch, 1);
+    assert!(!is_open(&ports.records, &dir).await.unwrap());
     assert_eq!(ports.records.puts(), 1);
     assert_eq!(ports.records.names().len(), 1);
+
+    // Once the missing prerequisite is ready, a new call can run again.
+    assert_eq!(ports.post(KEY_PATH).await.status, 200);
+    assert_eq!(
+        json_response(&ports.post(GATE_PATH).await, 200),
+        json!({"gate": "open", "ran": true, "epoch": 2})
+    );
+    assert!(is_open(&ports.records, &dir).await.unwrap());
     ports.assert_key_buckets_untouched();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_stray_gate_anchor_leaves_first_open_closed_and_alerts() {
+    let ports = Ports::with_closed_directory();
+    assert_eq!(ports.post(KEY_PATH).await.status, 200);
+    ports.records.plant("m/dg/x", Vec::new());
+
+    watch_alerts();
+    expect_error(&ports.post(GATE_PATH).await, 503, "gate_not_opened");
+    assert_eq!(take_alerts().len(), 1);
+    assert!(!is_open(&ports.records, &ports.dir()).await.unwrap());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_damaged_tenant_zero_chain_leaves_first_open_closed_and_alerts() {
+    let ports = Ports::with_closed_directory();
+    assert_eq!(ports.post(KEY_PATH).await.status, 200);
+    ports.records.plant(
+        "m/t/t_0000000000000000/00000000000000000001",
+        b"damaged tenant record".to_vec(),
+    );
+
+    watch_alerts();
+    expect_error(&ports.post(GATE_PATH).await, 503, "gate_not_opened");
+    assert_eq!(take_alerts().len(), 1);
+    assert!(!is_open(&ports.records, &ports.dir()).await.unwrap());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn concurrent_first_open_calls_fail_fast_and_open_at_one_epoch() {
+    let ports = Ports::with_closed_directory();
+    let dir = ports.dir();
+    assert_eq!(ports.post(KEY_PATH).await.status, 200);
+    ports.records.pause_after_anchor.set(true);
+
+    let mut cx = Context::from_waker(Waker::noop());
+    let mut first = pin!(ports.post(GATE_PATH));
+    assert!(first.as_mut().poll(&mut cx).is_pending());
+    assert_eq!(anchored_epoch(&ports.records).await.unwrap(), (1, 0));
+    assert_eq!(dir.gate().await.unwrap().epoch, 0);
+
+    let activity = (ports.records.lists(), ports.records.puts());
+    let mut second = pin!(ports.post(GATE_PATH));
+    let std::task::Poll::Ready(response) = second.as_mut().poll(&mut cx) else {
+        panic!("an overlapping request must answer without waiting on another request");
+    };
+    expect_error(&response, 503, "SlowDown");
+    assert_eq!((ports.records.lists(), ports.records.puts()), activity);
+    assert_eq!(
+        json_response(&first.await, 200),
+        json!({"gate": "open", "ran": true, "epoch": 1})
+    );
+    assert_eq!(
+        json_response(&ports.post(GATE_PATH).await, 200),
+        json!({"gate": "open", "ran": false})
+    );
+    assert_eq!(anchored_epoch(&ports.records).await.unwrap(), (1, 0));
+    assert_eq!(dir.feed_epoch().await.unwrap(), 1);
+    assert!(is_open(&ports.records, &dir).await.unwrap());
 }
