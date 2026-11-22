@@ -269,12 +269,23 @@ pub async fn seal<U: UnitImport>(
     ))))
 }
 
-/// The same count for every table, in any order.
+/// The same count for every import table, in any order; a table that is
+/// not named counts 0 (AM-29), and a table named twice or unknown makes
+/// the two differ.
 fn same(a: &[(ImportTable, u64)], b: &[(ImportTable, u64)]) -> bool {
-    let set = |v: &[(ImportTable, u64)]| -> BTreeMap<&'static str, u64> {
-        v.iter().map(|(t, n)| (t.name(), *n)).collect()
+    let counts = |v: &[(ImportTable, u64)]| -> Option<BTreeMap<&'static str, u64>> {
+        let mut m: BTreeMap<&'static str, u64> =
+            ImportTable::ALL.iter().map(|t| (t.name(), 0)).collect();
+        let mut seen = BTreeSet::new();
+        for (t, n) in v {
+            if !seen.insert(t.name()) {
+                return None;
+            }
+            m.insert(t.name(), *n);
+        }
+        Some(m)
     };
-    a.len() == b.len() && set(a) == set(b)
+    matches!((counts(a), counts(b)), (Some(x), Some(y)) if x == y)
 }
 
 /// Copies every table, in [`ImportTable::ALL`] order, resuming each from
@@ -845,6 +856,26 @@ mod tests {
              ORDER BY t.\"bucket_id\", t.\"key\" LIMIT 500"
         );
         assert!(!select_page(ImportTable::Articles, false, 2).contains("WHERE"));
+    }
+
+    #[test]
+    fn a_seal_state_without_its_empty_tables_is_the_same_seal() {
+        let all: Vec<(ImportTable, u64)> = ImportTable::ALL
+            .iter()
+            .map(|t| (*t, u64::from(*t == ImportTable::Buckets) * 22))
+            .collect();
+        let short = vec![(ImportTable::Buckets, 22)];
+        assert!(same(&all, &short));
+        assert!(same(&short, &all));
+        assert!(!same(&all, &[(ImportTable::Buckets, 21)]));
+        assert!(!same(
+            &all,
+            &[(ImportTable::Buckets, 22), (ImportTable::Buckets, 22)]
+        ));
+        assert!(!same(
+            &all,
+            &[(ImportTable::Buckets, 22), (ImportTable::Gc, 1)]
+        ));
     }
 
     #[test]
