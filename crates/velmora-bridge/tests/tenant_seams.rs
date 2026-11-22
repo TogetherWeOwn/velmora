@@ -162,9 +162,12 @@ fn a_scope_is_made_only_at_the_listed_places() {
     assert_eq!(found.get("worker/lib.rs"), None);
 }
 
-/// A managed tenant's scope is made in one place: the reader of a queue
-/// message, for a message that names the tenant's unit while the unit
-/// class is bound (`jobmsg::admit_for`).
+/// A managed tenant's scope is made in one place on the job path: the
+/// reader of a queue message, for a message that names the tenant's unit
+/// while the unit class is bound (`jobmsg::admit_for`). Off the job path,
+/// the move of tenant 0's data names the managed tenant's copies through
+/// its scope too (`keys::moving`, once), so that no name of the two
+/// families is written out by hand.
 #[test]
 fn a_managed_scope_is_made_only_by_the_reader() {
     let all = all();
@@ -173,7 +176,10 @@ fn a_managed_scope_is_made_only_by_the_reader() {
     found.remove(TENANT);
     assert_eq!(
         found.into_iter().collect::<Vec<_>>(),
-        [("bridge/jobmsg.rs".to_string(), 1)]
+        [
+            ("bridge/jobmsg.rs".to_string(), 1),
+            ("bridge/keys/moving.rs".to_string(), 1)
+        ]
     );
 }
 
@@ -309,6 +315,11 @@ fn a_blob_is_named_without_a_scope_only_at_the_listed_places() {
             // The delete list the catalogue makes for garbage
             // collection: rows carry no tenant yet.
             ("bridge/sql/gc.rs", 2),
+            // The move of tenant 0's data names the managed tenant's
+            // copies by its id, never by the flat layout
+            // (`tenant_safety_key`, `tenant_cache_key`): two definitions
+            // and one call.
+            ("bridge/keys/moving.rs", 3),
         ],
     );
     for job_path in [
