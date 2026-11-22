@@ -6,7 +6,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use velmora_bridge::entry::{names_mgmt, ENTRY_HEADER};
-use velmora_bridge::mgmt::serve::{serve_request, Answer, MISCONFIGURED};
+use velmora_bridge::mgmt::serve::{serve_request, Answer, NotBuilt, MISCONFIGURED};
 use velmora_bridge::mgmt::token::{DisabledTokens, TokenHashes};
 use velmora_bridge::S3Request;
 use worker::{console_error, Env, Headers, Response, Result};
@@ -28,8 +28,10 @@ pub fn marked(headers: &Headers) -> bool {
         .is_some_and(|value| names_mgmt(&value))
 }
 
-/// The answer to a management request.
-pub async fn answer(env: &Env, bridge: &WorkerBridge, method: &str, req: &S3Request) -> Answer {
+/// The answer to a management request. No handler is wired yet
+/// ([`NotBuilt`]): the ports of the stores the handlers use (the unit
+/// router, the unit client, the key writer) are not in this Worker.
+pub async fn answer(env: &Env, bridge: &WorkerBridge, method: &str, req: S3Request) -> Answer {
     // Read per request: two secrets, no I/O. A value that does not parse
     // shuts the plane; the log names the variable, never a value.
     let hashes = match TokenHashes::from_vars(|name| crate::env::lookup(env, name)) {
@@ -41,7 +43,16 @@ pub async fn answer(env: &Env, bridge: &WorkerBridge, method: &str, req: &S3Requ
     };
     let disabled = DISABLED.with(Rc::clone);
     let now = velmora_bridge::ports::Clock::now(&bridge.clock);
-    serve_request(&disabled, &hashes, &bridge.safety, method, req, now).await
+    serve_request(
+        &disabled,
+        &hashes,
+        &bridge.safety,
+        &NotBuilt,
+        method,
+        req,
+        now,
+    )
+    .await
 }
 
 /// The answer as a response: JSON, never stored by a cache.

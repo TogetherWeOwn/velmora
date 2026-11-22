@@ -25,6 +25,7 @@ pub mod keepalive;
 pub mod keys;
 pub mod parity;
 pub mod plan;
+pub mod plan_rev;
 mod pool;
 pub mod ports;
 pub mod post;
@@ -36,8 +37,10 @@ pub mod replay;
 pub mod service;
 pub mod sql;
 pub mod stamp;
+pub mod tenant_catalog;
 pub mod trace;
 pub mod types;
+pub mod unit;
 pub mod verify;
 
 #[cfg(feature = "testkit")]

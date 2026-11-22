@@ -242,7 +242,7 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
     let mark = velmora_bridge::entry::mgmt_mark(&incoming.req.headers);
     if by_mgmt || mark != MgmtMark::None {
         let answer = match mark {
-            MgmtMark::Serve => mgmt::answer(&env, &bridge, &method, &incoming.req).await,
+            MgmtMark::Serve => mgmt::answer(&env, &bridge, &method, incoming.req).await,
             MgmtMark::Refuse | MgmtMark::None => BAD_REQUEST,
         };
         console_log!(
