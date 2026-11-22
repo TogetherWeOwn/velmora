@@ -1073,3 +1073,146 @@ async fn a_revoked_key_is_revoked_before_it_is_created() {
         .raw(&tenant_revocation_name(&tenant, "AKVL0004"))
         .is_some());
 }
+
+/// A change made to the frozen input.
+type Spoil = dyn Fn(&mut FrozenKeys);
+
+/// Bad input anywhere stops the move before any write, revocations
+/// included: a duplicate grant, a key id equal to the principal's, a
+/// key id twice, empty grants, too many buckets, a principal that is
+/// not active, and a resumed key with another creation time.
+#[tokio::test(flavor = "current_thread")]
+async fn every_bad_input_stops_the_move_before_any_write() {
+    let expected = "move input is not valid";
+    let tenant = TenantId::parse(TENANT).unwrap();
+    let chain = key_chain(&tenant);
+    let cases: Vec<Box<Spoil>> = vec![
+        Box::new(|f| {
+            let g = f.keys[3].grants[0].clone();
+            f.keys[3].grants.push(g);
+        }),
+        Box::new(|f| f.keys[3].access_key_id = PRINCIPAL.into()),
+        Box::new(|f| {
+            let k = f.keys[0].clone();
+            f.keys.push(k);
+        }),
+        Box::new(|f| f.keys[1].grants.clear()),
+        Box::new(|f| {
+            f.buckets = (0..65).map(|n| format!("b_{n:02}")).collect();
+        }),
+    ];
+    for (n, case) in cases.iter().enumerate() {
+        let mut fixture = FrozenKeys::new().await;
+        case(&mut fixture);
+        let puts = fixture.store.puts();
+        assert_invalid(fixture.write(PRINCIPAL).await.unwrap_err(), expected);
+        assert_eq!(fixture.store.puts(), puts, "case {n} wrote");
+        assert_eq!(chain.head(&fixture.store, 0).await.unwrap(), 1, "case {n}");
+        assert!(fixture
+            .store
+            .raw(&tenant_revocation_name(&tenant, "AKVL0004"))
+            .is_none());
+    }
+
+    // A principal that is not active.
+    let mut fixture = FrozenKeys::new().await;
+    let read = read_key_chain(&fixture.store, &fixture.kek, &fixture.ring, &tenant)
+        .await
+        .unwrap();
+    let entry = read.table.get(PRINCIPAL).unwrap();
+    let mut door = entry.door.clone();
+    door.status = SubjectStatus::Disabled;
+    let disabled = seal_key_record(
+        &fixture.kek,
+        &fixture.ring,
+        &tenant,
+        2,
+        KeyOp::Status,
+        AT,
+        &door,
+        entry.private.as_ref(),
+        true,
+        &mut fixture.rng,
+    )
+    .unwrap();
+    chain.put(&fixture.store, 2, disabled).await.unwrap();
+    assert_invalid(fixture.write(PRINCIPAL).await.unwrap_err(), expected);
+    assert_eq!(chain.head(&fixture.store, 0).await.unwrap(), 2);
+
+    // A resumed key with another creation time.
+    let mut fixture = FrozenKeys::new().await;
+    fixture.write(PRINCIPAL).await.unwrap();
+    fixture.keys[0].created_at += 1;
+    assert_invalid(
+        fixture.write(PRINCIPAL).await.unwrap_err(),
+        "the target holds something else under this name",
+    );
+}
+
+/// A stored bucket wrap that does not open as this bucket's key under
+/// this tenant key is refused: another bucket's, another tenant's,
+/// another key version's.
+#[test]
+fn a_stored_wrap_that_does_not_open_is_refused() {
+    let mut records = Records::new();
+    let kek = kek();
+    let other_bucket = bucket_v1(
+        &kek,
+        2,
+        &DataKey::from_bytes(derived("bdk")),
+        &mut records.rng,
+    );
+    let other_tenant = TenantKey::from_bytes(
+        &TenantId::parse("t_00000000000000ee").unwrap(),
+        1,
+        derived("tk"),
+    )
+    .unwrap();
+    let other_version = TenantKey::from_bytes(records.tk.tenant(), 2, derived("tk")).unwrap();
+    let wraps = [
+        moved_bucket(
+            &kek,
+            &records.tk,
+            &other_bucket,
+            PRINCIPAL,
+            None,
+            &mut records.rng,
+        )
+        .unwrap()
+        .bdk_wrapped,
+        moved_bucket(
+            &kek,
+            &other_tenant,
+            &records.original,
+            PRINCIPAL,
+            None,
+            &mut records.rng,
+        )
+        .unwrap()
+        .bdk_wrapped,
+        moved_bucket(
+            &kek,
+            &other_version,
+            &records.original,
+            PRINCIPAL,
+            None,
+            &mut records.rng,
+        )
+        .unwrap()
+        .bdk_wrapped,
+    ];
+    for wrap in wraps {
+        assert_invalid(
+            moved_bucket(
+                &kek,
+                &records.tk,
+                &records.original,
+                PRINCIPAL,
+                Some(&wrap),
+                &mut records.rng,
+            )
+            .unwrap_err(),
+            "the target holds something else under this name",
+        );
+    }
+}

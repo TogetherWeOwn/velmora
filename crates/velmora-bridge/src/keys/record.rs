@@ -263,7 +263,7 @@ fn closes_fits(op: KeyOp, status: SubjectStatus, closes: bool) -> bool {
 
 /// The rules of a subject's state, for a reader that builds an entry from
 /// something other than a record (a checkpoint).
-pub(super) fn check_entry(
+pub(crate) fn check_entry(
     tenant: &TenantId,
     door: &SubjectDoor,
     private: Option<&SubjectPrivate>,

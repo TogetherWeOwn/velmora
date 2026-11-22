@@ -32,8 +32,9 @@ use velmora::rng::FillRandom;
 use super::chain::Put;
 use super::checkpoint::read_key_chain;
 use super::record::{
-    key_chain, open_key_record, seal_key_record, Access, DoorGrant, KeyOp, KeyTable, PrivateGrant,
-    SubjectDoor, SubjectKind, SubjectPrivate, SubjectStatus, TkRing, MAX_SUBJECT_GRANTS,
+    check_entry, key_chain, open_key_record, seal_key_record, Access, DoorGrant, KeyOp, KeyTable,
+    PrivateGrant, SubjectDoor, SubjectKind, SubjectPrivate, SubjectStatus, TkRing,
+    MAX_SUBJECT_GRANTS,
 };
 use super::revocations::put_tenant_revocation;
 use crate::crypto::scheme2::{
@@ -454,7 +455,6 @@ where
     if entry.door.kind != SubjectKind::Principal
         || entry.private.is_none()
         || entry.door.status != SubjectStatus::Active
-        || buckets.len() > MAX_SUBJECT_GRANTS
     {
         return Err(ERR_MOVE_INPUT);
     }
@@ -466,6 +466,98 @@ where
         if !kind_ok || !grants_ok {
             return Err(ERR_MOVE_INPUT);
         }
+    }
+
+    // The plan of every key, with no write: a resumed key is compared
+    // whole, a new one gets its re-wrapped secret and the record rules.
+    let mut ids = BTreeSet::new();
+    let mut planned: Vec<(&MovedKey, Option<(SubjectDoor, SubjectPrivate)>)> = Vec::new();
+    for key in keys {
+        if key.access_key_id == principal || !ids.insert(key.access_key_id.as_str()) {
+            return Err(ERR_MOVE_INPUT);
+        }
+        let door_grants: Vec<DoorGrant> = key
+            .grants
+            .iter()
+            .map(|(b, a)| DoorGrant {
+                bucket_id: b.clone(),
+                access: *a,
+                expires_at: None,
+            })
+            .collect();
+        let private_grants: Vec<PrivateGrant> = key
+            .grants
+            .iter()
+            .map(|(b, _)| PrivateGrant {
+                bucket_id: b.clone(),
+                prefix: None,
+                ip_list: Vec::new(),
+            })
+            .collect();
+        if let Some(entry) = table.get(&key.access_key_id) {
+            // A resumed run: the key must be the one this run would write.
+            let private = entry.private.as_ref().ok_or(ERR_MOVE_DIFFERS)?;
+            let same = entry.door.kind == key.kind
+                && entry.door.made_by.as_deref() == Some(principal)
+                && entry.door.created_at == key.created_at
+                && private.owner_ref.as_deref() == Some(owner_ref)
+                && private.label.is_none()
+                && entry.door.grants == door_grants
+                && private.grants == private_grants
+                && match (entry.door.secret_kek_version, &private.secret_wrapped) {
+                    (Some(v2), Some(w2)) => same_secret(
+                        kek,
+                        key.kek_version,
+                        &key.secret_wrapped_v1,
+                        tenant,
+                        v2,
+                        w2,
+                        &key.access_key_id,
+                    )
+                    .unwrap_or(false),
+                    _ => false,
+                };
+            if !same {
+                return Err(ERR_MOVE_DIFFERS);
+            }
+            planned.push((key, None));
+        } else {
+            let (v2, wrapped) = rewrap_secret_to_v2(
+                kek,
+                key.kek_version,
+                &key.access_key_id,
+                &key.secret_wrapped_v1,
+                tenant,
+                rng,
+            )?;
+            let door = SubjectDoor {
+                id: key.access_key_id.clone(),
+                kind: key.kind,
+                status: SubjectStatus::Active,
+                made_by: Some(principal.to_owned()),
+                grants: door_grants,
+                created_at: key.created_at,
+                secret_kek_version: Some(v2),
+            };
+            let private = SubjectPrivate {
+                owner_ref: Some(owner_ref.to_owned()),
+                label: None,
+                grants: private_grants,
+                secret_wrapped: Some(wrapped),
+            };
+            check_entry(tenant, &door, Some(&private)).map_err(|_| ERR_MOVE_INPUT)?;
+            planned.push((key, Some((door, private))));
+        }
+    }
+    // The principal's grants after this run fit its cap.
+    let kept = entry
+        .door
+        .grants
+        .iter()
+        .filter(|g| !moved.contains(g.bucket_id.as_str()))
+        .count();
+    if kept + buckets.len() > MAX_SUBJECT_GRANTS {
+        return Err(ERR_MOVE_INPUT);
     }
 
     // 1. The principal's grants.
@@ -531,98 +623,32 @@ where
         out.written.push(seq);
     }
 
-    // 2. The keys.
-    for key in keys {
-        // A revoked key: its revocation first, so no crash leaves it in
-        // force between its create record and its revoke record.
+    // 2. The keys, written from a plan made in full before any key is
+    // written (see the checks above).
+    for (key, create) in planned {
         if key.status == SubjectStatus::Revoked {
             put_tenant_revocation(store, kek, tenant, &key.access_key_id, at, rng).await?;
             out.revoked.push(key.access_key_id.clone());
         }
-        let door_grants: Vec<DoorGrant> = key
-            .grants
-            .iter()
-            .map(|(b, a)| DoorGrant {
-                bucket_id: b.clone(),
-                access: *a,
-                expires_at: None,
-            })
-            .collect();
-        let private_grants: Vec<PrivateGrant> = key
-            .grants
-            .iter()
-            .map(|(b, _)| PrivateGrant {
-                bucket_id: b.clone(),
-                prefix: None,
-                ip_list: Vec::new(),
-            })
-            .collect();
-        if let Some(entry) = table.get(&key.access_key_id) {
-            // A resumed run: the key must be the one this run would write.
-            let private = entry.private.as_ref().ok_or(ERR_MOVE_DIFFERS)?;
-            let same = entry.door.kind == key.kind
-                && entry.door.made_by.as_deref() == Some(principal)
-                && entry.door.created_at == key.created_at
-                && private.owner_ref.as_deref() == Some(owner_ref)
-                && private.label.is_none()
-                && entry.door.grants == door_grants
-                && private.grants == private_grants
-                && match (entry.door.secret_kek_version, &private.secret_wrapped) {
-                    (Some(v2), Some(w2)) => same_secret(
-                        kek,
-                        key.kek_version,
-                        &key.secret_wrapped_v1,
-                        tenant,
-                        v2,
-                        w2,
-                        &key.access_key_id,
-                    )
-                    .unwrap_or(false),
-                    _ => false,
-                };
-            if !same {
-                return Err(ERR_MOVE_DIFFERS);
+        match create {
+            None => out.present.push(key.access_key_id.clone()),
+            Some((door, private)) => {
+                let seq = append(
+                    store,
+                    kek,
+                    ring,
+                    tenant,
+                    &mut table,
+                    KeyOp::Create,
+                    at,
+                    &door,
+                    Some(&private),
+                    false,
+                    rng,
+                )
+                .await?;
+                out.written.push(seq);
             }
-            out.present.push(key.access_key_id.clone());
-        } else {
-            let (v2, wrapped) = rewrap_secret_to_v2(
-                kek,
-                key.kek_version,
-                &key.access_key_id,
-                &key.secret_wrapped_v1,
-                tenant,
-                rng,
-            )?;
-            let door = SubjectDoor {
-                id: key.access_key_id.clone(),
-                kind: key.kind,
-                status: SubjectStatus::Active,
-                made_by: Some(principal.to_owned()),
-                grants: door_grants,
-                created_at: key.created_at,
-                secret_kek_version: Some(v2),
-            };
-            let private = SubjectPrivate {
-                owner_ref: Some(owner_ref.to_owned()),
-                label: None,
-                grants: private_grants,
-                secret_wrapped: Some(wrapped),
-            };
-            let seq = append(
-                store,
-                kek,
-                ring,
-                tenant,
-                &mut table,
-                KeyOp::Create,
-                at,
-                &door,
-                Some(&private),
-                false,
-                rng,
-            )
-            .await?;
-            out.written.push(seq);
         }
 
         // The status, when it is not active.
