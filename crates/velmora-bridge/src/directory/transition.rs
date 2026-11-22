@@ -27,9 +27,9 @@
 use std::collections::BTreeMap;
 
 use super::record::{
-    ActorClass, BillingHold, BucketCreated, Deletion, DeletionReason, HoldMode, Holds, Lifecycle,
-    Move, OperatorHold, OperatorReason, Placement, Restoring, Selector, Tenant, TenantDoor,
-    TenantPrivate, TenantRecord, TenantZero, RECORD_FORMAT,
+    ActorClass, BillingHold, BucketCreated, BucketSecrets, Deletion, DeletionReason, HoldMode,
+    Holds, Lifecycle, Move, OperatorHold, OperatorReason, Placement, Restoring, Selector, Tenant,
+    TenantDoor, TenantPrivate, TenantRecord, TenantZero, RECORD_FORMAT,
 };
 use crate::types::UnixMs;
 
@@ -54,6 +54,11 @@ pub const KEY_CHECK_LEN: usize = 8;
 /// moves 22; the bound keeps one record, and the directory row that copies
 /// it, small.
 pub const MAX_MOVED_BUCKETS: usize = 1024;
+
+/// How far ahead of the writer's clock a move floor may be: every writer
+/// passes a `lifted_at` or its own clock, so a floor further ahead is a
+/// caller's bug (a time in another unit), and it could never be lowered.
+pub const MAX_FLOOR_AHEAD_MS: i64 = 5 * 60_000;
 
 /// How long tenant 0 stays `moved` before it can be retired: 30 days.
 pub const RETIRE_AFTER_MS: i64 = 30 * 24 * 3_600_000;
@@ -143,8 +148,13 @@ pub enum Change {
         reason: DeletionReason,
         key_hash: String,
     },
-    /// Clear the deletion and nothing else.
-    UndoDeletion,
+    /// Clear the deletion that the record at `deletion_seq` set, and
+    /// nothing else. The caller names the seq it read (`Tenant.deletion.seq`),
+    /// so a late retry never cancels a newer deletion: against a head whose
+    /// deletion has another seq it is refused (`deletion_not_requested`),
+    /// and against a head whose last undone deletion has this seq it is
+    /// `Unchanged`.
+    UndoDeletion { deletion_seq: u64 },
     /// Replace the limits, and the rate class when `Some`. The floor of a
     /// limit set by the billing token (the free allowance) is a registry
     /// value, checked by the management entrypoint with the registry.
@@ -181,11 +191,22 @@ pub enum Change {
     /// below the head's `last_grant_seq` is refused with
     /// `grant_order_lost`: the caller revokes that grant and tries again
     /// under a new one.
+    ///
+    /// `name` and `bdk_wrapped` (the bucket's data key, wrapped under the
+    /// tenant key at the head's `tk_version`) go into the record's private
+    /// part. The caller draws and wraps the key once, before the first try,
+    /// and keeps that wrap on every retry.
     CreateBucket {
         bucket: String,
         unit: u32,
         creator: String,
         grant_seq: u64,
+        name: String,
+        bdk_wrapped: Vec<u8>,
+        /// The tenant key version the wrap was made under: the head's
+        /// `tk_version`, or the create is refused with `key_version` and the
+        /// caller wraps the same BDK again under the new version.
+        tk_version: u32,
     },
     /// Remove a bucket's placement.
     DropBucket { bucket: String },
@@ -196,6 +217,19 @@ pub enum Change {
     PlaceMovedBuckets {
         buckets: Vec<String>,
         unit: u32,
+        zero: Box<TenantDoor>,
+    },
+    /// Raise the move floor of `unit` to `floor` (AM-67): the move tool at
+    /// step 8(b1) with the unit's `lifted_at`, and after every `deleteAll()`
+    /// exit with its clock; the restore tool before a `restore`. `zero` is
+    /// tenant 0's head, read from its chain by
+    /// [`super::chain::TenantChain::set_move_floor`] (plain `write` refuses
+    /// this change). A floor at or above `floor` already is `Unchanged`; a
+    /// floor is never lowered, and one more than [`MAX_FLOOR_AHEAD_MS`]
+    /// ahead of the clock is refused.
+    SetMoveFloor {
+        unit: u32,
+        floor: UnixMs,
         zero: Box<TenantDoor>,
     },
     /// Mark the tenant's key as escrowed offline.
@@ -269,6 +303,9 @@ const SHREDDED: Refusal = refuse(409, "tenant_shredded");
 const RESTORING: Refusal = refuse(409, "restoring");
 const DELETING: Refusal = refuse(409, "already_deleting");
 const NOT_DELETING: Refusal = refuse(409, "not_deleting");
+/// The undo names a deletion that is neither the head's nor the last one
+/// undone.
+const NOT_REQUESTED: Refusal = refuse(409, "deletion_not_requested");
 const REPLAYED: Refusal = refuse(409, "deletion_replayed");
 const NOT_DUE: Refusal = refuse(409, "shred_not_due");
 const PRESERVED: Refusal = refuse(409, "preserved_by_hold");
@@ -343,6 +380,7 @@ pub fn next(
     door.bucket_created = None;
     door.buckets_moved_in = None;
     let mut private = head.private.clone();
+    private.bucket_created = None;
 
     match change {
         Change::Create { .. } | Change::CreateTenantZero { .. } => unreachable!("handled above"),
@@ -426,7 +464,8 @@ pub fn next(
             if h.holds.billing.map(|b| b.mode) == *mode {
                 return Ok(Outcome::Unchanged);
             }
-            door.holds.billing = mode.map(|mode| BillingHold { mode });
+            // A new hold or a new mode starts its time now.
+            door.holds.billing = mode.map(|mode| BillingHold { mode, since: now });
             if mode.is_none() {
                 // A record that removes the billing hold also
                 // clears a deletion whose actor is billing, whoever
@@ -434,6 +473,7 @@ pub fn next(
                 if let Some(d) = &h.deletion {
                     if d.actor == ActorClass::Billing {
                         door.undone_deletion = Some(d.key_hash.clone());
+                        door.undone_deletion_seq = Some(d.seq);
                         door.deletion = None;
                     }
                 }
@@ -445,12 +485,19 @@ pub fn next(
             if actor != Actor::Operator {
                 return Err(FORBIDDEN);
             }
+            let old = h.holds.operator;
             let new = hold.map(|r| OperatorHold {
                 mode: r.mode,
                 reason: r.reason,
                 preserve: r.preserve.unwrap_or(r.reason.preserves_by_default()),
+                // The hold's time runs from when it was placed or its mode
+                // changed; a new reason or `preserve` alone keeps it.
+                since: match old {
+                    Some(o) if o.mode == r.mode => o.since,
+                    _ => now,
+                },
             });
-            if new == h.holds.operator {
+            if new == old {
                 return Ok(Outcome::Unchanged);
             }
             door.holds.operator = new;
@@ -498,6 +545,8 @@ pub fn next(
                 return Err(HOLD_PERIOD);
             }
             door.deletion = Some(Deletion {
+                seq: h.seq + 1,
+                requested_at: now,
                 shred_due_at: *shred_due_at,
                 reason: *reason,
                 actor: class,
@@ -507,10 +556,19 @@ pub fn next(
             door.rotating_to = None;
         }
 
-        Change::UndoDeletion => {
+        Change::UndoDeletion { deletion_seq } => {
             live(h)?;
-            let Some(d) = &h.deletion else {
-                return Err(NOT_DELETING);
+            if actor.class().is_none() {
+                return Err(FORBIDDEN);
+            }
+            // Another deletion than the one the caller read is answered so
+            // whoever asks: a late retry never cancels a newer one.
+            let Some(d) = h.deletion.as_ref().filter(|d| d.seq == *deletion_seq) else {
+                // A retry of the undo whose record landed: apply the head.
+                return match h.deletion.is_none() && h.undone_deletion_seq == Some(*deletion_seq) {
+                    true => Ok(Outcome::Unchanged),
+                    false => Err(NOT_REQUESTED),
+                };
             };
             let allowed = match actor {
                 Actor::Customer => d.actor == ActorClass::Customer,
@@ -522,6 +580,7 @@ pub fn next(
                 return Err(FORBIDDEN);
             }
             door.undone_deletion = Some(d.key_hash.clone());
+            door.undone_deletion_seq = Some(d.seq);
             door.deletion = None;
         }
 
@@ -653,6 +712,9 @@ pub fn next(
             unit,
             creator,
             grant_seq,
+            name,
+            bdk_wrapped,
+            tk_version,
         } => {
             live(h)?;
             if !matches!(actor, Actor::Customer | Actor::Operator) {
@@ -661,7 +723,7 @@ pub fn next(
             let Some(managed) = tenant.managed() else {
                 return Err(TENANT_ZERO);
             };
-            if !valid_name(creator) {
+            if !valid_name(creator) || !valid_bucket_name(name) || !valid_bdk_wrap(bdk_wrapped) {
                 return Err(INVALID);
             }
             if *bucket != crate::records::bucket_id(managed, *grant_seq).as_str() {
@@ -685,6 +747,12 @@ pub fn next(
             if !h.units.contains(unit) {
                 return Err(UNIT_NOT_LISTED);
             }
+            // The wrap is bound to the key version in its AAD: one made
+            // before a rotation committed is wrapped again, never stored
+            // beside another version.
+            if *tk_version != h.tk_version {
+                return Err(VERSION);
+            }
             // The seq only grows, so a derived id is never placed twice,
             // also after its bucket was dropped. A create that is not placed
             // and whose seq is not above the last lost the order.
@@ -705,6 +773,11 @@ pub fn next(
             door.max_move_epoch = epoch;
             door.last_grant_seq = *grant_seq;
             door.bucket_created = Some(created);
+            private.bucket_created = Some(BucketSecrets {
+                name: name.clone(),
+                bdk_wrapped: bdk_wrapped.clone(),
+                tk_version: *tk_version,
+            });
         }
 
         Change::DropBucket { bucket } => {
@@ -794,6 +867,47 @@ pub fn next(
                 unit: *unit,
                 buckets: buckets.clone(),
             });
+        }
+
+        Change::SetMoveFloor { unit, floor, zero } => {
+            live(h)?;
+            if !matches!(actor, Actor::MoveTool | Actor::RestoreTool) {
+                return Err(FORBIDDEN);
+            }
+            if tenant.is_zero() {
+                return Err(TENANT_ZERO);
+            }
+            if floor.0 <= 0 || floor.0 > now.0.saturating_add(MAX_FLOOR_AHEAD_MS) {
+                return Err(INVALID);
+            }
+            if h.move_floors.get(unit).is_some_and(|f| f >= floor) {
+                return Ok(Outcome::Unchanged);
+            }
+            // The owner tenant, `active` or `suspended`; allowed while a
+            // `restoring` entry is set (the restore tool raises it first).
+            if !matches!(
+                h.state(),
+                super::record::TenantState::Active | super::record::TenantState::Suspended(_)
+            ) {
+                return Err(WRONG_STATE);
+            }
+            if !h.units.contains(unit) {
+                return Err(UNIT_NOT_LISTED);
+            }
+            // Tenant 0's head `moving`, `moved` or `d1` (the §2.8 row),
+            // never `retired`. Whom `move.to` names is not asked: an exit of
+            // this tenant's move may run after a later move into another
+            // tenant began (an undo's day 30, a give-up finished late), and
+            // a raised floor only narrows what a restore may do.
+            let open = zero.tenant.is_zero()
+                && zero
+                    .tenant_zero
+                    .as_ref()
+                    .is_some_and(|z| z.selector != Selector::Retired);
+            if !open {
+                return Err(NOT_MOVING_HERE);
+            }
+            door.move_floors.insert(*unit, *floor);
         }
 
         Change::SetEscrowOffline => {
@@ -1023,6 +1137,7 @@ pub fn next(
             private = TenantPrivate {
                 v: RECORD_FORMAT,
                 external_ref: None,
+                bucket_created: None,
             };
         }
     }
@@ -1039,11 +1154,14 @@ fn first(tenant: &Tenant, change: &Change, actor: Actor, now: UnixMs) -> Result<
         tenant: tenant.clone(),
         seq: 1,
         written_at: now,
+        created_at: now,
         lifecycle,
         holds: Holds::default(),
         deletion: None,
         undone_deletion: None,
+        undone_deletion_seq: None,
         restoring: vec![],
+        move_floors: BTreeMap::new(),
         synthetic: false,
         escrow_offline: false,
         escrow_destroyed: vec![],
@@ -1097,6 +1215,7 @@ fn first(tenant: &Tenant, change: &Change, actor: Actor, now: UnixMs) -> Result<
                 private: TenantPrivate {
                     v: RECORD_FORMAT,
                     external_ref: None,
+                    bucket_created: None,
                 },
             }))
         }
@@ -1124,6 +1243,7 @@ fn first(tenant: &Tenant, change: &Change, actor: Actor, now: UnixMs) -> Result<
                 private: TenantPrivate {
                     v: RECORD_FORMAT,
                     external_ref: None,
+                    bucket_created: None,
                 },
             }))
         }
@@ -1217,6 +1337,24 @@ fn valid_bucket_id(s: &str) -> bool {
     })
 }
 
+/// A bucket name of the management plane: 3 to 63 of `a-z`, `0-9` and
+/// `-`, starting and ending with a letter or a digit (S3's rule without
+/// dots), as `velmora-mgmt-types` checks it.
+fn valid_bucket_name(s: &str) -> bool {
+    let b = s.as_bytes();
+    let edge = |c: &u8| c.is_ascii_lowercase() || c.is_ascii_digit();
+    (3..=63).contains(&b.len())
+        && b.iter().all(|c| edge(c) || *c == b'-')
+        && b.first().is_some_and(edge)
+        && b.last().is_some_and(edge)
+}
+
+/// A scheme-2 BDK wrap: `0x02 ‖ nonce ‖ ct ‖ tag`, 73 bytes.
+fn valid_bdk_wrap(w: &[u8]) -> bool {
+    w.len() == crate::crypto::WRAPPED_KEY_LEN
+        && w.first() == Some(&crate::crypto::scheme2::WRAP_VERSION_2)
+}
+
 /// A bucket id, a principal id or a catalogue id: 1 to 128 bytes of
 /// ASCII letters, digits, `_` and `-`.
 fn valid_name(s: &str) -> bool {
@@ -1233,11 +1371,14 @@ fn shredded_stub(h: &TenantDoor) -> TenantDoor {
         tenant: h.tenant.clone(),
         seq: h.seq,
         written_at: h.written_at,
+        created_at: h.created_at,
         lifecycle: Lifecycle::Shredded,
         holds: Holds::default(),
         deletion: None,
         undone_deletion: None,
+        undone_deletion_seq: None,
         restoring: vec![],
+        move_floors: BTreeMap::new(),
         synthetic: h.synthetic,
         escrow_offline: false,
         escrow_destroyed: vec![],
@@ -1354,7 +1495,9 @@ pub fn write_order(prev: Option<&TenantDoor>, next: &TenantDoor) -> WriteOrder {
         // selector closes its catalogue: any change of them closes.
         || prev.rate_json != next.rate_json
         || prev.features_json != next.features_json
-        || prev.tenant_zero != next.tenant_zero;
+        || prev.tenant_zero != next.tenant_zero
+        // A raised move floor narrows what a restore may do.
+        || prev.move_floors != next.move_floors;
     match closing {
         true => WriteOrder::Closing,
         false => WriteOrder::Opening,
