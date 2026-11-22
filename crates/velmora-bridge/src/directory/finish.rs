@@ -214,7 +214,12 @@ where
     // head then reaches the units by the lease renewal (ADR §2.4 rule 12,
     // within T) or a later run.
     let known = matches!(row, Row::Seq(_)) && readable && !far;
-    let mut closes = steps.iter().any(|(prev, r)| {
+    // A head in a shred closes, also where its records below are purged
+    // and only the stub is read.
+    let mut closes = matches!(
+        head.door.lifecycle,
+        Lifecycle::Shredding | Lifecycle::Shredded
+    ) || steps.iter().any(|(prev, r)| {
         write_order(prev.as_ref().map(|p| &p.door), &r.door) == WriteOrder::Closing
     });
     if !known && !closes {
