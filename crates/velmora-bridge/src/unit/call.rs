@@ -11,14 +11,18 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::birth::{BirthToken, ProvisionRefusal};
+use super::buckets::BucketRefusal;
 use super::export::{ExportMode, ExportRefusal, ExportTable};
 use super::identity::{CallKind, Refusal, Seqs};
 use super::import::{ImportBatch, ImportCount, ImportRefusal, ImportValue, MoveHead};
 use super::jobcall::JobCall;
-use super::keys::{KeyEntry, KeyRefusal};
+use super::keys::{ApplyEntry, KeptAnswer, KeyRefusal};
 use super::lift::{AckClass, FindingList, GateRefusal, GateSummary, LiftProof, ReplayId};
 use super::name::UnitName;
+use super::recount::{RecountCall, RecountRefusal};
+use super::reserve::{Acting, Hash32, Opening, ReserveRefusal, Rid};
 use super::restore::{Bookmark, RestoreRefusal, RestoreTarget};
+use super::size::SizeRefusal;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -149,12 +153,17 @@ pub enum UnitOp {
     /// isolate. Allowed without `authenticated`.
     KeyRow { access_key_id: String },
     /// The key-chain apply (AM-12): the records after `from_seq`, one
-    /// entry per record, in chain order. A Worker call: the entries are
-    /// records the Worker verified. It runs while the unit is closed too
-    /// (a restore re-applies the chain at its gate).
+    /// item per record, in chain order: a subject's entry, or a marker
+    /// for a record that changes no subject (AM-62). A Worker call: the
+    /// items are records the Worker verified. It runs while the unit is
+    /// closed too (a restore re-applies the chain at its gate).
     ApplyKeys {
         from_seq: u64,
-        entries: Vec<KeyEntry>,
+        entries: Vec<ApplyEntry>,
+        /// The answers to keep for the reservations whose records these
+        /// are (AM-38).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        answers: Vec<KeptAnswer>,
     },
     /// The subjects the unit holds closed (`KeyTarget::closed`). A
     /// Worker call.
@@ -199,11 +208,15 @@ pub enum UnitOp {
     /// The second restore call (AM-2): refused unless the unit is closed
     /// under the token's entry long enough and still at `expect_undo`;
     /// then restores to `target` and restarts. A Worker call, run by the
-    /// object class. It never answers `ok`.
+    /// object class. It never answers `ok`. `floor_ms`: the move floor
+    /// the verified tenant head holds for this unit (`move_floors`, 0
+    /// when none; AM-67): a time target before it + 60 s is refused, as
+    /// before the unit's own `lifted_at`.
     Restore {
         token: BirthToken,
         target: RestoreTarget,
         expect_undo: Bookmark,
+        floor_ms: u64,
     },
     /// Starts the gate report of one replay, discarding any other.
     GateOpen { replay_id: ReplayId },
@@ -231,6 +244,54 @@ pub enum UnitOp {
     /// The stored report and whether a lift would pass now, with the
     /// counts and hashes for the lift record. A Worker call.
     GateStatus {},
+    /// One step of the usage recount of a closed unit (AM-27): the
+    /// restore gate's, or the move's with tenant 0's verified head,
+    /// numbered as an import batch. A Worker call.
+    Recount {
+        call: RecountCall,
+        #[serde(default)]
+        head: Option<MoveHead>,
+    },
+    /// The reservation of a capped opening call (ADR §2.5 step 0, AM-38):
+    /// the `Idempotency-Key`'s hash, the request's fingerprint, a fresh
+    /// `rid` (kept only by a new reservation), the acting principal and
+    /// the change. A Worker call, `authenticated`, on an open unit.
+    Reserve {
+        key_hash: Hash32,
+        fingerprint: Hash32,
+        rid: Rid,
+        #[serde(default)]
+        acting: Option<Acting>,
+        opening: Opening,
+    },
+    /// The acting principal of `objects.list` and `objects.presign`
+    /// (AM-35), read-only. A Worker call.
+    ResolveActing { acting: Acting },
+    /// Releases the `reserved` reservation `rid`. A Worker call.
+    Release { rid: Rid },
+    /// Binds the bucket reservation `rid` to the creator grant
+    /// `grant_seq` while it is bound to `expected`. A Worker call.
+    BindBucket {
+        rid: Rid,
+        #[serde(default)]
+        expected: Option<u64>,
+        grant_seq: u64,
+    },
+    /// Releases the bucket reservation `rid` while it is bound to
+    /// `bound`. A Worker call.
+    ReleaseBound {
+        rid: Rid,
+        #[serde(default)]
+        bound: Option<u64>,
+    },
+    /// What the reservations say of the creator grant `grant_seq`; an
+    /// answer of none fences it. A Worker call.
+    BucketBinding { grant_seq: u64 },
+    /// Bucket delete's first step (ADR §6.2, AM-57): `bucket_not_empty`
+    /// if the bucket holds anything, otherwise it is marked closing and
+    /// every write into it answers `NoSuchBucket`. Then the `DropBucket`
+    /// record, then `sync`. A Worker call, on an open unit.
+    BucketClose { bucket_id: String },
     /// One catalogue method of the job path (W2-jobs). A `job` call:
     /// the job's numbers must equal the unit's, and it is
     /// `authenticated`.
@@ -284,6 +345,28 @@ impl UnitOp {
                 | UnitOp::GateBlockers { .. }
                 | UnitOp::GateAck { .. }
                 | UnitOp::GateStatus {}
+                | UnitOp::Recount { .. }
+                | UnitOp::Reserve { .. }
+                | UnitOp::ResolveActing { .. }
+                | UnitOp::Release { .. }
+                | UnitOp::BindBucket { .. }
+                | UnitOp::ReleaseBound { .. }
+                | UnitOp::BucketBinding { .. }
+                | UnitOp::BucketClose { .. }
+        )
+    }
+
+    /// The reservation calls (ADR §2.5 step 0): on an open unit only.
+    pub fn reservation_call(&self) -> bool {
+        matches!(
+            self,
+            UnitOp::Reserve { .. }
+                | UnitOp::ResolveActing { .. }
+                | UnitOp::Release { .. }
+                | UnitOp::BindBucket { .. }
+                | UnitOp::ReleaseBound { .. }
+                | UnitOp::BucketBinding { .. }
+                | UnitOp::BucketClose { .. }
         )
     }
 
@@ -333,7 +416,9 @@ pub enum Refused {
     /// records: the key-chain apply moves it, together with the rows.
     KeysNotApplied,
     /// The tenant's state does not allow this call: `403 AccountProblem`
-    /// once the signature verified.
+    /// once the signature verified. On a reservation ask the Worker
+    /// answers `409 tenant_read_only` or `409 tenant_unavailable` instead
+    /// (`docs/units.md`, "Reservations").
     AccountProblem,
     /// The fan-out reader is no longer allowed (`403 AccessDenied`, as
     /// the full request would get).
@@ -350,6 +435,15 @@ pub enum Refused {
     Gate(GateRefusal),
     /// An export was refused (AM-26).
     Export(ExportRefusal),
+    /// A recount was refused (AM-27).
+    Recount(RecountRefusal),
+    /// A reservation, or the read of an acting principal, was refused
+    /// (ADR §2.5 step 0, AM-18, AM-35, AM-38).
+    Reserve(ReserveRefusal),
+    /// The size guard refused a call that adds extents (ADR §2.6).
+    Size(SizeRefusal),
+    /// A bucket call, or a `sync`'s bucket part, was refused (AM-57).
+    Buckets(BucketRefusal),
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -363,7 +457,8 @@ pub enum UnitAnswer {
     SyncNeeded {
         seqs: Seqs,
     },
-    /// The caller is behind; nothing was done (rule 5).
+    /// The caller is behind; nothing was done (rule 5). A job runs once
+    /// more with these numbers (AM-50).
     Stale {
         seqs: Seqs,
     },
@@ -384,7 +479,9 @@ pub enum UnitAnswer {
         bookmark: Bookmark,
     },
     /// No certificate (rule 7). `listed`: as the call said; the Worker
-    /// answers `503` and pages when it is set, `404` when not.
+    /// answers `503` and pages when it is set, `404` when not. The move
+    /// tool's P12 read of `import_progress` sends `listed = false` where
+    /// its verified heads say an unborn unit is expected.
     Unborn {
         listed: bool,
     },

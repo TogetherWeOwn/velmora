@@ -14,6 +14,9 @@
 //! - [`export`]: the unit's rows read back out (the move's checks, the
 //!   reverse move).
 //! - [`jobcall`]: the job path's catalogue calls.
+//! - [`recount`]: the usage recount of a closed unit.
+//! - [`reserve`]: the reservation of a capped opening call.
+//! - [`size`]: the size guard.
 //! - [`restore`]: the restore calls.
 //! - [`lift`]: the lift, checked in the unit.
 //! - [`schema`]: what a unit is born with.
@@ -22,6 +25,7 @@
 //! Nothing here holds a key or reaches the network (rules 3 and 4).
 
 pub mod birth;
+pub mod buckets;
 pub mod call;
 pub mod export;
 pub mod gate;
@@ -32,8 +36,11 @@ pub mod keys;
 pub mod lift;
 pub mod name;
 pub mod object;
+pub mod recount;
+pub mod reserve;
 pub mod restore;
 pub mod schema;
+pub mod size;
 
 pub use birth::{may_provision, BirthKind, BirthToken, HeadView, ProvisionRefusal};
 pub use call::{Reader, Refused, SyncHead, TenantState, UnitAnswer, UnitCall, UnitOp};

@@ -7,9 +7,10 @@ use serde_json::json;
 use velmora_bridge::testkit::RusqliteSql;
 use velmora_bridge::unit::call::{Closed, HoldMode};
 use velmora_bridge::unit::identity::Refusal;
+use velmora_bridge::unit::object::transact;
 use velmora_bridge::unit::{
-    BirthKind, BirthToken, CallKind, ProvisionRefusal, Reader, Refused, Seqs, SyncHead, TenantId,
-    TenantState, Unit, UnitAnswer, UnitCall, UnitName, UnitOp,
+    poll_once, BirthKind, BirthToken, CallKind, ProvisionRefusal, Reader, Refused, Seqs, SyncHead,
+    TenantId, TenantState, Unit, UnitAnswer, UnitCall, UnitName, UnitOp,
 };
 use velmora_bridge::{Sql, SqlValue, UnixMs};
 
@@ -105,7 +106,7 @@ fn ready() -> Unit<RusqliteSql> {
     u.sql()
         .apply(
             "INSERT INTO buckets(id, name, owner, bdk_wrapped, kek_version, created_at) \
-               VALUES ('b_00000000000000c1', 'alpha', 'o', x'00', 1, 1); \
+               VALUES ('b_00000000000000c1', 'alpha', 'o', x'02', 1, 1); \
              INSERT INTO generations(id, bucket_id, key, state, size, etag, content_json, \
                user_meta_json, extent_count, created_at) \
                VALUES ('g_0019a00000000c1c1c1c1c1c1c1c1', 'b_00000000000000c1', 'k', 'live', 20, \
@@ -122,7 +123,7 @@ fn ready() -> Unit<RusqliteSql> {
                  'g_0019a00000000c1c1c1c1c1c1c1c1', 'committed', 1, 10, 10, 10, zeroblob(48), zeroblob(16), \
                  zeroblob(32), zeroblob(32), 'held', 1); \
              INSERT INTO access_keys(access_key_id, principal, secret_wrapped, kek_version, \
-               status, created_at) VALUES ('AKUNITCORE0000000001', 'p', x'01', 1, 'active', 1); \
+               status, created_at) VALUES ('AKUNITCORE0000000001', 'p', x'02', 1, 'active', 1); \
              INSERT INTO grants(access_key_id, bucket_id, perm) \
                VALUES ('AKUNITCORE0000000001', 'b_00000000000000c1', 'ro');",
         )
@@ -487,15 +488,19 @@ fn numbers_above_the_units_need_a_sync_and_below_are_stale() {
         ),
         UnitAnswer::Stale { seqs: own_seqs }
     );
-    for s in [seqs(2, 0), None] {
-        assert_eq!(
-            u.handle(&call(CallKind::Job, s, true, UnitOp::Ping {}), NOW),
-            UnitAnswer::Refused {
-                reason: Refused::Identity(Refusal::StaleJob),
-                alarm: false
-            }
-        );
-    }
+    // AM-50: a job behind the unit gets the unit's numbers; a job with
+    // none is refused.
+    assert_eq!(
+        u.handle(&call(CallKind::Job, seqs(2, 0), true, UnitOp::Ping {}), NOW),
+        UnitAnswer::Stale { seqs: own_seqs }
+    );
+    assert_eq!(
+        u.handle(&call(CallKind::Job, None, true, UnitOp::Ping {}), NOW),
+        UnitAnswer::Refused {
+            reason: Refused::Identity(Refusal::StaleJob),
+            alarm: false
+        }
+    );
     // A stale request did nothing: no read stamp.
     assert_eq!(last_read(&u), vec![None, None]);
 }
@@ -1067,4 +1072,53 @@ fn the_unit_code_holds_no_key_and_reaches_for_no_io() {
         }
     }
     assert!(seen >= 10, "the unit's files were found ({seen})");
+}
+
+/// Rule 11 under the workerd twin. The twin sends each statement of a
+/// call as a request of its own, and the object's connection may not
+/// live across requests: workerd evicts an object idle for about 10 s
+/// (a host stall between two statements of one call is enough), and the
+/// twin's rebuild empties it; either way its `total_changes()` restarts.
+/// A read-only call whose object restarts between its two counter reads
+/// is still answered, not refused as `wrote_without_authentication`: the
+/// twin's counters are SQLite's, whose savepoint spans the call
+/// (`testkit_shadow.rs`). Without that, this test is refused under the
+/// twin as primary (`SUITE_PRIMARY=do`, the default); with SQLite as
+/// primary, or without a twin, it passes either way.
+#[test]
+fn a_read_only_call_is_answered_when_the_twins_object_restarts_inside_it() {
+    let db = RusqliteSql::open_in_memory().unwrap();
+    db.apply("CREATE TABLE t (n INTEGER NOT NULL)").unwrap();
+    for n in 0..3 {
+        let changed = poll_once(db.exec("INSERT INTO t (n) VALUES (?1)", &[SqlValue::Int(n)]))
+            .unwrap()
+            .unwrap();
+        assert_eq!(changed, 1);
+    }
+    // Five rows changed and one left: the copy the rebuild writes changes
+    // fewer rows than the connection had counted.
+    assert_eq!(
+        poll_once(db.exec("DELETE FROM t WHERE n < 2", &[]))
+            .unwrap()
+            .unwrap(),
+        2
+    );
+    let before = db.twin_total_changes();
+    let mut after = None;
+    let mut op = || {
+        after = db.restart_twin();
+        let rows = poll_once(db.query("SELECT count(*) FROM t", &[]))??;
+        Ok(Ok(match rows.first().and_then(|r| r.first()) {
+            Some(SqlValue::Int(n)) => json!(n),
+            other => json!(format!("{other:?}")),
+        }))
+    };
+    let out = transact(&db, false, &mut op).unwrap();
+    assert_eq!(out, Ok(json!(1)));
+    // Under the twin the object's own counter moved with no write of the
+    // call: the case the refusal must not see.
+    if let (Some(b), Some(a)) = (before, after) {
+        assert_ne!(a, b, "the twin's counter did not restart");
+    }
+    assert_eq!(before.is_some(), after.is_some());
 }

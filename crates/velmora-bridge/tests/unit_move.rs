@@ -16,6 +16,10 @@ use velmora_bridge::unit::keys::{Access, KeyEntry, KeyGrant, KeyKind, SubjectSta
 use velmora_bridge::unit::lift::{
     ids_hash, ClassProof, FindingList, GateRefusal, GateSummary, LiftProof, ReplayId,
 };
+use velmora_bridge::unit::recount::{RecountCall, RecountRefusal};
+use velmora_bridge::unit::restore::{
+    Bookmark, PitrStep, RestoreRefusal, RestoreTarget, LIFT_SLACK_MS,
+};
 use velmora_bridge::unit::{
     BirthKind, BirthToken, CallKind, Refused, Seqs, SyncHead, TenantId, TenantState, Unit,
     UnitAnswer, UnitCall, UnitName, UnitOp,
@@ -194,8 +198,15 @@ fn refusal(a: &UnitAnswer) -> Option<(Refused, bool)> {
     }
 }
 
+/// A scheme-2 BDK wrap's shape: 73 bytes after the version byte 0x02.
+fn bdk() -> ImportValue {
+    let mut w = vec![7; 73];
+    w[0] = 0x02;
+    ImportValue::Blob(w)
+}
+
 fn bucket_row(id: &str, name: &str, owner: &str) -> Vec<ImportValue> {
-    vec![t(id), t(name), t(owner), b(73), i(2), i(0), i(10)]
+    vec![t(id), t(name), t(owner), bdk(), i(2), i(0), i(10)]
 }
 
 fn generation_row(meta: &str) -> Vec<ImportValue> {
@@ -823,9 +834,25 @@ fn a_move_report_carries_the_units_numbers() {
     assert!(matches!(ahead, UnitAnswer::SyncNeeded { .. }), "{ahead:?}");
 }
 
+fn recount(call: RecountCall, head: Option<MoveHead>) -> UnitOp {
+    UnitOp::Recount { call, head }
+}
+
+fn recount_refused(r: RecountRefusal) -> Option<(Refused, bool)> {
+    Some((Refused::Recount(r), false))
+}
+
 #[test]
 fn a_restore_born_unit_lifts_a_move_only_with_its_counters_on() {
     let u = born_as(own(), BirthKind::Restore);
+    fill(&u, &["a"]);
+    let start = |head| recount(RecountCall::Start {}, head);
+    // The import filled this entry: the recount is the move's, and needs
+    // the seal (AM-27, AM-29).
+    assert_eq!(
+        refusal(&numbered(&u, start(Some(moving(10))))),
+        recount_refused(RecountRefusal::ImportNotSealed)
+    );
     ok(seal(&u, moving(10), counts(&u)));
     let id = rid(S, 0, "m1");
     ok(open_move(&u, id.clone(), moving(10)));
@@ -836,8 +863,461 @@ fn a_restore_born_unit_lifts_a_move_only_with_its_counters_on() {
             summary: empty_summary(),
         },
     ));
-    // `Recount` (AM-27) turns them on; until then the lift is refused.
+    // Until `Recount` turns them on, the lift is refused.
     assert_eq!(status(&u)["lift"]["refused"], json!("counters_off"));
+    // Bound as the move report is: tenant 0's head, this window, moving
+    // here, not older than seen; numbered as an import batch.
+    assert_eq!(
+        refusal(&numbered(&u, start(None))),
+        recount_refused(RecountRefusal::MoveNotBound)
+    );
+    let mut other_window = moving(10);
+    other_window.flips = F + 1;
+    assert_eq!(
+        refusal(&numbered(&u, start(Some(other_window)))),
+        recount_refused(RecountRefusal::ImportNotSealed)
+    );
+    let mut d1 = moving(10);
+    d1.selector = "d1".into();
+    let mut elsewhere = moving(10);
+    elsewhere.to = Some(TenantId::parse("t_0000000000000e02").unwrap());
+    for head in [d1, elsewhere, moving(9)] {
+        assert_eq!(
+            refusal(&numbered(&u, start(Some(head)))),
+            recount_refused(RecountRefusal::MoveNotBound)
+        );
+    }
+    assert_eq!(
+        refusal(&worker(&u, start(Some(moving(10))))),
+        Some((Refused::Identity(Refusal::StaleJob), false))
+    );
+    // It writes: an unauthenticated call is refused (rule 11).
+    let mut unauthenticated = call_on(
+        &own(),
+        CallKind::Worker,
+        Some(u.head().unwrap().seqs),
+        start(Some(moving(10))),
+    );
+    unauthenticated.authenticated = false;
+    assert_eq!(
+        refusal(&u.handle(&unauthenticated, NOW)),
+        Some((Refused::Unauthenticated, false))
+    );
+    let started = ok(numbered(&u, start(Some(moving(10)))));
+    assert_eq!(started["started"], json!(true));
+    let mut on = false;
+    for _ in 0..10 {
+        let step = ok(numbered(
+            &u,
+            recount(RecountCall::Step { chunk: 1 }, Some(moving(10))),
+        ));
+        if step["counters_on"] == json!(true) {
+            on = true;
+            break;
+        }
+    }
+    assert!(on, "the recount ends and turns the counters on");
+    // The pass counted what the import brought.
+    let live: i64 = u
+        .sql()
+        .with_conn(|c| {
+            c.query_row(
+                "SELECT live_objects FROM usage_buckets WHERE kind = 1 AND bucket_id = ?1",
+                [B1],
+                |r| r.get(0),
+            )
+        })
+        .unwrap();
+    assert_eq!(live, 1);
+    let p = proof(&u);
+    assert!(matches!(
+        sync_to(&u, S + 1, None, Some(p)),
+        UnitAnswer::Ok { .. }
+    ));
+    assert_eq!(
+        refusal(&numbered(&u, start(Some(moving(10))))),
+        recount_refused(RecountRefusal::NotRestoring)
+    );
+    // A later restore of this unit never goes back into the move's
+    // window: a time before the lift is refused; a time after it goes on
+    // to the lease checks.
+    let s2 = S + 2;
+    assert!(matches!(
+        sync_to(&u, s2, Some(s2), None),
+        UnitAnswer::Ok { .. }
+    ));
+    let restore = |at_ms| {
+        let c = call_on(
+            &own(),
+            CallKind::Worker,
+            None,
+            UnitOp::Restore {
+                token: BirthToken {
+                    name: own(),
+                    jurisdiction: String::new(),
+                    record_seq: s2,
+                    schema_version: velmora_bridge::unit::schema::SCHEMA_VERSION,
+                    key_scheme: 2,
+                    kind: BirthKind::Restore,
+                },
+                target: RestoreTarget::Time { at_ms },
+                expect_undo: Bookmark("undo".into()),
+                floor_ms: 0,
+            },
+        );
+        match u.pitr_step(&c, NOW) {
+            PitrStep::Answer(a) => refusal(&a),
+            other => panic!("armed: {other:?}"),
+        }
+    };
+    // The lift's time is its call's clock: a margin after it is refused too.
+    for at_ms in [NOW.0 - 1, NOW.0, NOW.0 + LIFT_SLACK_MS - 1] {
+        assert_eq!(
+            restore(at_ms),
+            Some((Refused::Restore(RestoreRefusal::BeforeMoveLift), false)),
+            "{at_ms}"
+        );
+    }
+    assert_eq!(
+        restore(NOW.0 + LIFT_SLACK_MS),
+        Some((Refused::Restore(RestoreRefusal::LeaseUnknown), false))
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The move's record (AM-46, AM-47)
+// ---------------------------------------------------------------------------
+
+/// Seals the import of `u` and lifts it with a `move` report at tenant 0's
+/// head 11.
+fn lift_the_move(u: &Unit<RusqliteSql>) {
+    ok(seal(u, moving(10), counts(u)));
+    let id = rid(S, 0, "m1");
+    ok(open_move(u, id.clone(), moving(11)));
+    ok(worker(
+        u,
+        UnitOp::GateReport {
+            replay_id: id,
+            summary: empty_summary(),
+        },
+    ));
+    let p = proof(u);
+    assert!(matches!(
+        sync_to(u, S + 1, None, Some(p)),
+        UnitAnswer::Ok { .. }
+    ));
+}
+
+fn progress(u: &Unit<RusqliteSql>) -> Value {
+    ok(worker(u, UnitOp::ImportProgress {}))
+}
+
+fn record(u: &Unit<RusqliteSql>) -> Value {
+    let p = progress(u);
+    json!({
+        "sealed": p["sealed"],
+        "t0_seq": p["t0_seq"],
+        "since_seq": p["since_seq"],
+        "move_lifted": p["move_lifted"],
+        "lifted_at": p["lifted_at"],
+    })
+}
+
+#[test]
+fn import_progress_answers_the_moves_record() {
+    let u = closed_for_the_move();
+    // No import was ever bound: nothing.
+    let p = progress(&u);
+    let mut keys: Vec<&str> = p.as_object().unwrap().keys().map(|k| k.as_str()).collect();
+    keys.sort();
+    assert_eq!(
+        keys,
+        [
+            "lifted_at",
+            "move_lifted",
+            "schema_tables",
+            "sealed",
+            "since_seq",
+            "t0_seq",
+            "tables"
+        ]
+    );
+    assert_eq!(p["tables"], json!([]));
+    assert_eq!(
+        record(&u),
+        json!({ "sealed": null, "t0_seq": null, "since_seq": null, "move_lifted": null, "lifted_at": null })
+    );
+    // The unit's tables, with SQLite's own left out.
+    let tables: Vec<String> = serde_json::from_value(p["schema_tables"].clone()).unwrap();
+    for t in ["objects", "unit_birth", "unit_import", "unit_import_move"] {
+        assert!(tables.iter().any(|n| n == t), "{t} in {tables:?}");
+    }
+    assert!(tables.iter().all(|n| !n.starts_with("sqlite_")));
+    let mut sorted = tables.clone();
+    sorted.sort();
+    assert_eq!(tables, sorted);
+    fill(&u, &["a"]);
+    assert_eq!(
+        record(&u),
+        json!({ "sealed": null, "t0_seq": 10, "since_seq": S, "move_lifted": false, "lifted_at": null })
+    );
+    ok(seal(&u, moving(10), counts(&u)));
+    assert_eq!(
+        record(&u),
+        json!({ "sealed": F + 1, "t0_seq": 10, "since_seq": S, "move_lifted": false, "lifted_at": null })
+    );
+    // The `move` report binds the newer head; the lift uses the seal up.
+    let id = rid(S, 0, "m1");
+    ok(open_move(&u, id.clone(), moving(11)));
+    assert_eq!(progress(&u)["t0_seq"], json!(11));
+    ok(worker(
+        &u,
+        UnitOp::GateReport {
+            replay_id: id,
+            summary: empty_summary(),
+        },
+    ));
+    let p = proof(&u);
+    ok(sync_to(&u, S + 1, None, Some(p)));
+    assert_eq!(
+        record(&u),
+        json!({ "sealed": F + 1, "t0_seq": 11, "since_seq": S, "move_lifted": true, "lifted_at": NOW.0 })
+    );
+    // The record stays after the move, under any later entry (AM-47).
+    ok(sync_to(&u, S + 2, Some(S + 2), None));
+    assert_eq!(progress(&u)["move_lifted"], json!(true));
+    assert_eq!(progress(&u)["lifted_at"], json!(NOW.0));
+    assert_eq!(progress(&u)["tables"].as_array().unwrap().len(), 3);
+}
+
+#[test]
+fn import_progress_on_an_unborn_unit_answers_as_the_call_says_and_makes_nothing() {
+    let u = Unit::new(RusqliteSql::open_in_memory().unwrap(), own(), "");
+    // P12 sends `listed = false` where its heads expect an unborn unit;
+    // any other read of import state keeps rule 7's page.
+    let mut c = call_on(&own(), CallKind::Worker, None, UnitOp::ImportProgress {});
+    c.listed = false;
+    assert_eq!(u.handle(&c, NOW), UnitAnswer::Unborn { listed: false });
+    c.listed = true;
+    assert_eq!(u.handle(&c, NOW), UnitAnswer::Unborn { listed: true });
+    // And nothing was made.
+    assert!(!u
+        .sql()
+        .with_conn(|c| {
+            c.query_row(
+                "SELECT count(*) FROM sqlite_master WHERE name = 'unit_birth'",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+        })
+        .map(|n| n > 0)
+        .unwrap());
+}
+
+fn prepare(u: &Unit<RusqliteSql>, since: u64) -> Option<(Refused, bool)> {
+    let c = call_on(
+        &own(),
+        CallKind::Worker,
+        None,
+        UnitOp::RestorePrepare { since },
+    );
+    match u.pitr_step(&c, NOW) {
+        PitrStep::Answer(a) => refusal(&a),
+        other => panic!("prepared: {other:?}"),
+    }
+}
+
+fn restore_at(u: &Unit<RusqliteSql>, since: u64, at_ms: i64) -> Option<(Refused, bool)> {
+    restore_floor(u, since, at_ms, 0)
+}
+
+fn restore_floor(
+    u: &Unit<RusqliteSql>,
+    since: u64,
+    at_ms: i64,
+    floor_ms: u64,
+) -> Option<(Refused, bool)> {
+    let c = call_on(
+        &own(),
+        CallKind::Worker,
+        None,
+        UnitOp::Restore {
+            token: BirthToken {
+                name: own(),
+                jurisdiction: String::new(),
+                record_seq: since,
+                schema_version: velmora_bridge::unit::schema::SCHEMA_VERSION,
+                key_scheme: 2,
+                kind: BirthKind::Restore,
+            },
+            target: RestoreTarget::Time { at_ms },
+            expect_undo: Bookmark("undo".into()),
+            floor_ms,
+        },
+    );
+    match u.pitr_step(&c, NOW) {
+        PitrStep::Answer(a) => refusal(&a),
+        other => panic!("armed: {other:?}"),
+    }
+}
+
+/// AM-67: the move floor the tenant chain keeps (`move_floors`), named
+/// by every `restore` call. It holds when the unit's own record is gone
+/// (a first restore took `unit_import_move` away): a time target before
+/// the later of the two floors + 60 s is refused with `before_move_lift`.
+#[test]
+fn a_time_restore_before_the_chains_move_floor_is_refused() {
+    let before_lift = Some((Refused::Restore(RestoreRefusal::BeforeMoveLift), false));
+    let lease_unknown = Some((Refused::Restore(RestoreRefusal::LeaseUnknown), false));
+    // No move record in the unit (as after a restore to a bookmark taken
+    // before the move's first batch): only the named floor holds.
+    let u = closed_for_the_move();
+    let floor = NOW.0 + 3_600_000;
+    for at_ms in [NOW.0 + LIFT_SLACK_MS, floor, floor + LIFT_SLACK_MS - 1] {
+        assert_eq!(
+            restore_floor(&u, S, at_ms, floor as u64),
+            before_lift,
+            "{at_ms}"
+        );
+    }
+    assert_eq!(
+        restore_floor(&u, S, floor + LIFT_SLACK_MS, floor as u64),
+        lease_unknown
+    );
+    // No floor named (0) and no record: the birth floor only.
+    assert_eq!(
+        restore_floor(&u, S, NOW.0 + LIFT_SLACK_MS, 0),
+        lease_unknown
+    );
+    // A floor that is no time: malformed, before anything else.
+    assert_eq!(
+        restore_floor(&u, S, NOW.0 + LIFT_SLACK_MS, u64::MAX),
+        Some((Refused::Restore(RestoreRefusal::Malformed), false))
+    );
+    // With the unit's own lift, the later of the two holds: a named floor
+    // below the lift does not lower it.
+    let u = closed_for_the_move();
+    fill(&u, &["a"]);
+    lift_the_move(&u);
+    let s2 = S + 2;
+    ok(sync_to(&u, s2, Some(s2), None));
+    assert_eq!(
+        restore_floor(&u, s2, NOW.0 + LIFT_SLACK_MS - 1, 1),
+        before_lift
+    );
+    assert_eq!(
+        restore_floor(&u, s2, NOW.0 + LIFT_SLACK_MS, 1),
+        lease_unknown
+    );
+    assert_eq!(
+        restore_floor(&u, s2, NOW.0 + LIFT_SLACK_MS, floor as u64),
+        before_lift
+    );
+}
+
+#[test]
+fn no_undo_bookmark_and_no_migration_while_an_import_is_not_lifted() {
+    use velmora_bridge::unit::schema::migration_allowed;
+    let not_lifted = Some((Refused::Restore(RestoreRefusal::MoveNotLifted), false));
+    // No import: the restore checks go on (here: no lease table).
+    let u = closed_for_the_move();
+    let lease_unknown = Some((Refused::Restore(RestoreRefusal::LeaseUnknown), false));
+    assert_eq!(prepare(&u, S), lease_unknown);
+    assert!(migration_allowed(u.sql()).unwrap());
+    // An import, not sealed, then sealed: refused (AM-46), and `restore`,
+    // which needs the undo bookmark, is refused the same way.
+    fill(&u, &["a"]);
+    assert_eq!(prepare(&u, S), not_lifted);
+    assert_eq!(restore_at(&u, S, NOW.0 + LIFT_SLACK_MS), not_lifted);
+    assert!(!migration_allowed(u.sql()).unwrap());
+    ok(seal(&u, moving(10), counts(&u)));
+    assert_eq!(prepare(&u, S), not_lifted);
+    assert!(!migration_allowed(u.sql()).unwrap());
+    // Lifted: a later entry's restore goes on to the lease checks.
+    let u = closed_for_the_move();
+    fill(&u, &["a"]);
+    lift_the_move(&u);
+    assert!(migration_allowed(u.sql()).unwrap());
+    let s2 = S + 2;
+    ok(sync_to(&u, s2, Some(s2), None));
+    assert_eq!(prepare(&u, s2), lease_unknown);
+}
+
+#[test]
+fn a_restore_to_a_time_before_the_units_birth_is_refused() {
+    // A unit born from a `restore` token (a re-creation after
+    // `deleteAll()`), with no import, under a later entry: its history
+    // before the birth is another incarnation's.
+    let u = born_as(own(), BirthKind::Restore);
+    let before_birth = Some((Refused::Restore(RestoreRefusal::BeforeBirth), false));
+    for at_ms in [0, NOW.0 - 1, NOW.0, NOW.0 + LIFT_SLACK_MS - 1] {
+        assert_eq!(restore_at(&u, S, at_ms), before_birth, "{at_ms}");
+    }
+    assert_eq!(
+        restore_at(&u, S, NOW.0 + LIFT_SLACK_MS),
+        Some((Refused::Restore(RestoreRefusal::LeaseUnknown), false))
+    );
+}
+
+#[test]
+fn the_first_batch_closes_the_undo_bookmark_and_the_span_before_it_is_open() {
+    // The move's step 2 re-creates an unborn owner unit with a `restore`
+    // token under its entry (AM-53). Before the first batch there is no
+    // move record: the restore checks go on (the chain's move floor,
+    // AM-67, covers a later time restore). From the first batch on, no
+    // undo bookmark (AM-46).
+    let u = Unit::new(RusqliteSql::open_in_memory().unwrap(), own(), "");
+    let token = BirthToken {
+        name: own(),
+        jurisdiction: String::new(),
+        record_seq: S,
+        schema_version: velmora_bridge::unit::schema::SCHEMA_VERSION,
+        key_scheme: 2,
+        kind: BirthKind::Restore,
+    };
+    let a = u.handle(
+        &call_on(
+            &own(),
+            CallKind::Worker,
+            seqs(S, 0),
+            UnitOp::Provision {
+                token,
+                sealed: b"sealed".to_vec(),
+            },
+        ),
+        NOW,
+    );
+    assert!(matches!(a, UnitAnswer::Ok { .. }), "{a:?}");
+    // A lease table with no row, and far past T + 60 s: checks 1 to 3
+    // would pass.
+    u.sql()
+        .apply("CREATE TABLE unit_lease (id INTEGER PRIMARY KEY, fresh_until INTEGER, lease_hi INTEGER)")
+        .unwrap();
+    let late = UnixMs(NOW.0 + 86_400_000);
+    let c = call_on(
+        &own(),
+        CallKind::Worker,
+        None,
+        UnitOp::RestorePrepare { since: S },
+    );
+    assert!(matches!(u.pitr_step(&c, late), PitrStep::Prepare { .. }));
+    // The first batch binds the move: then `move_not_lifted`.
+    ok(import(
+        &u,
+        batch(
+            ImportTable::Buckets,
+            None,
+            "c1",
+            vec![bucket_row(B1, "alpha", P)],
+        ),
+    ));
+    match u.pitr_step(&c, late) {
+        PitrStep::Answer(a) => assert_eq!(
+            refusal(&a),
+            Some((Refused::Restore(RestoreRefusal::MoveNotLifted), false))
+        ),
+        other => panic!("prepared: {other:?}"),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1095,7 +1575,7 @@ fn export_pages_in_key_order_and_its_hash_is_the_rows_without_excluded_columns()
     }
     // The wraps leave as stored, still wrapped, in rows mode.
     let r = ok(worker(&u, export_op(buckets, None, 10, ExportMode::Rows)));
-    assert_eq!(rows_of(&r)[0][3], b(73));
+    assert_eq!(rows_of(&r)[0][3], bdk());
     // An empty table: no rows, no last key, the digest of nothing.
     let gc = ExportTable::Data(ImportTable::Gc);
     let e = ok(worker(&u, export_op(gc, None, 10, ExportMode::Hash)));
@@ -1181,6 +1661,7 @@ fn principal(seq: u64, grants: Vec<KeyGrant>) -> KeyEntry {
         secret_kek_version: None,
         owner_ref: Some("member-1".into()),
         last_seq: seq,
+        rid: None,
     }
 }
 
@@ -1197,6 +1678,7 @@ fn key(id: &str, seq: u64, status: SubjectStatus, grants: Vec<KeyGrant>) -> KeyE
         secret_kek_version: Some(1),
         owner_ref: Some("member-1".into()),
         last_seq: seq,
+        rid: None,
     }
 }
 
@@ -1227,7 +1709,8 @@ fn the_key_tables_are_hashed_only_and_equal_the_chains_projection() {
         &u,
         UnitOp::ApplyKeys {
             from_seq: 0,
-            entries: entries.clone(),
+            entries: entries.iter().cloned().map(Into::into).collect(),
+            answers: vec![],
         },
     );
     assert!(matches!(a, UnitAnswer::Ok { .. }), "{a:?}");

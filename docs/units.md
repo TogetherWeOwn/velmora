@@ -36,7 +36,10 @@ database, so they run natively in tests); the Durable Object class, the
      records up to the head and calls `sync` first;
    - a request with a lower number: the unit answers its own numbers and
      does nothing; the Worker refreshes and retries once;
-   - a job with no number, or a lower one: refused;
+   - a job with a lower number: the unit answers `stale` with its own
+     numbers and does nothing; the consumer runs the job once more with
+     them (AM-50, "Jobs");
+   - a job with no number: refused (`stale_job`); no writer sends one;
    - a fan-out sub-request (a part of a large GET, under a grant made
      earlier) with lower numbers: served only if, in the same transaction,
      the unit's own tables say the tenant may read, the bucket exists, and
@@ -54,9 +57,15 @@ database, so they run natively in tests); the Durable Object class, the
      from the unit's seq + 1. Each entry is compared, per subject, with
      that row's `last_seq`: an entry at or below it is skipped, except an
      entry that revokes, and one that opens at the same seq a row held
-     closed (the bring-up's second send). `revoked` is final. The apply
-     is the one way `keys_seq` moves; `sync` refuses a `keys_seq` above
-     the unit's (`keys_not_applied`).
+     closed (the bring-up's second send). `revoked` is final. Each entry
+     states its subject as the head holds it, stamped at that record's
+     seq. A record that changes no subject (`KeysFrozen`, `KeysThawed`,
+     AM-28) comes as a marker item, `{"marker": "keys_frozen" |
+     "keys_thawed", "seq": n}` (AM-62): it counts in the gap rule, writes
+     no row, is counted as skipped, and `keys_seq` moves past it. The
+     golden file pins the form. The apply is the one way `keys_seq`
+     moves; `sync` refuses a `keys_seq` above the unit's
+     (`keys_not_applied`).
 6. **Birth certificate.** A unit is made only by `provision(token)`. The
    token names the tenant, the unit, the jurisdiction, the record seq, the
    schema version, the key scheme and its kind (`birth` or `restore`), and is
@@ -106,7 +115,9 @@ variant.
 certificate); `unit_head` (`state_seq`, `keys_seq`, the tenant state and
 mode, `restoring_since` and `closed_at`; moved by
 `sync`, and `keys_seq` by the key apply); `unit_keys` and
-`unit_key_grants` (the key chain); the gate report and its
+`unit_key_grants` (the key chain); the reservations of capped opening
+calls and the fenced creator-grant seqs (`unit_reservations`,
+`unit_bucket_fences`); the gate report and its
 acknowledgements; the lease and the alarm's counters in
 `unit_lease`, and revocations listed for a key the unit does not hold as
 tombstones (with the lease); and the stamp counter.
@@ -134,7 +145,191 @@ rows: it signs presigned URLs only, which they cannot say. A key or an
 app password outside tenant 0 must name its principal. Everything else
 fails closed. **Milestone 1 serves unlimited grants only:** a key or
 principal grant with a prefix, an expiry or an address list is refused
-at use (AM-18).
+at use, and at its reservation (`grant_limits_not_served`, below).
+
+## Reservations
+
+A capped opening call (create an S3 key, an app password, a principal or
+a bucket; a widening grant change) first asks the tenant's root unit for
+a reservation (`reserve`, `unit::reserve`), before any intent or record.
+The Worker sends SHA-256 of the request's `Idempotency-Key`, the
+request's fingerprint, a fresh random 16-byte `rid`, the acting
+principal (as `Kofra-Acting-Owner-Ref` named it, or by id) and the
+change. In one transaction the unit:
+
+1. refuses a malformed ask, more than 64 grants, and any grant with a
+   prefix, an expiry or an address list (`grant_limits_not_served`);
+2. resolves the acting principal in its own key rows, by `owner_ref`
+   among the principals that are not revoked (an index serves it; two
+   such principals for one `owner_ref` are never resolved, and alarm):
+   none is `acting_principal_unknown`;
+3. reads the row of the scope (the principal's id, or `''` for none; the
+   key hash). Another fingerprint is `reused`. An `applied` row answers
+   its kept answer. A `reserved` row is asked again: checked again at the
+   unit's head for the subject (and a bucket's unit) it holds, not for
+   ids the retry drew again, and answered with its own `rid`, `subject`
+   and `again`; if the check now fails, the refusal leaves no row (its
+   cap slot stays). A bound bucket reservation is answered whatever its
+   creator is now;
+4. otherwise: a grant change that is a narrowing of the subject's
+   current grants (each new grant inside an unlimited current grant on
+   the same bucket, access no higher) is answered `narrowing` with the
+   unit's `keys_seq`, and takes nothing; its record must be exactly
+   `keys_seq + 1` too, so a narrowing judged on a stale key table is
+   never recorded on a newer head. A held acting principal may narrow, a
+   disabled one may not; the internal key is refused
+   (`internal_key_refused`). Then the acting principal must be `active`
+   (`acting_principal_inactive`) and not held (`503`); a principal create
+   that finds a principal of that `owner_ref` that is not revoked answers
+   it (`exists`: the Worker answers `200` when the grant sets are equal,
+   `409 principal_exists` otherwise); the id it makes must be new; the
+   bucket name must be no bucket's and held by no other open call; the
+   `owner_ref` of a principal create held by no other open call; every
+   grant on a bucket the unit holds (`404 bucket_not_found` otherwise,
+   for a key create, a principal create and a widening alike; AM-61) and
+   no wider than the acting principal's effective grant (bucket and
+   access; a sign-up principal without an acting principal has none);
+   then the caps: 30 capped changes an hour, 50 bucket creates a day, 20
+   active S3 keys and 20 app passwords (open reservations count). Then
+   the row is kept `reserved`, and its cap slot (`unit_cap_uses`) is
+   kept for the cap's window whatever becomes of the row; only an
+   explicit release and a cancel (below) give it back.
+
+The answer carries the unit's `keys_seq`: the call's record is exactly
+`keys_seq + 1` and carries the `rid` in its door part. The Worker draws
+the `rid` (16 bytes from its CSPRNG) and sends it with every ask; the
+unit keeps the first one and answers it on every re-ask, ignoring the
+re-ask's, and draws no random value itself. A re-ask is checked again at
+the head, answers the unit's current `keys_seq`, and the row keeps that
+seq. On an `again` or `not_open` answer the Worker reads and verifies
+exactly one record, `m/k/<t>/<keys_seq + 1>` (AM-55): one that carries
+the `rid` is the finisher's to apply (`409 idempotency_key_in_use`).
+Key records are applied in seq order with no gap, so a record of the
+call can only sit there. The key-chain apply turns the row
+`applied` when it holds a record that carries its `rid` for its subject,
+and keeps the answer the Worker passes with it (once; a 2xx status and a
+JSON object of at most 16 KiB with no `secret_access_key`, or none is
+kept and the Worker builds the answer from the chain). A record that
+closes or narrows a principal (any status but `active`, or a grant it
+held on a bucket the unit holds that no grant of the record covers; a
+grant dropped on a bucket id the unit holds no row for opened nothing,
+so it narrows nothing, AM-61) cancels that principal's
+other open reservations that are not bound to a creator grant, and
+gives their cap slots back (a held principal record counts as a
+narrowing: it may come without its private grant parts). Each
+entry's reservation turns `applied` before a later entry of the same
+call is applied. A bucket reservation is bound to its creator
+grant's seq (`bind_bucket`, a compare-and-set; `release_bound`); the
+finisher's `bucket_binding` read answers `open`, `created` or `none`, and
+`none` fences the seq for good. The apply of the tenant record
+`bucket_created` turns the reservation bound to its seq into the bucket
+(`reserve::bucket_created`). The unit does not apply tenant-chain bucket
+records yet: until that apply exists and calls it in its transaction, a
+bucket reservation stays `reserved`, is swept after its hour (its slot
+still counts for the day), and a retry after that hour is checked again
+as a new ask. `release` drops a `reserved` row. Each ask sweeps first: a
+`reserved` row goes after 1 hour, an `applied` one 24 hours after its
+apply. `resolve_acting` reads the acting principal of `objects.list` and
+`objects.presign` (refused unless active and not held) and writes
+nothing. The reservation calls run on an open unit, `authenticated`; an
+ask runs in every tenant state but a shred. In a hold or a deletion it
+answers only what keeps no reservation (a narrowing, a reused key, a
+kept answer, a bound bucket reservation); a re-ask of its own open row
+answers `not_open` with the `rid` and `keys_seq` (the Worker reads the
+chain for a record of it first, then refuses), and a new ask is refused
+as `account_problem`. The Worker answers the contract's code for the
+tenant's state (`409 tenant_read_only` or `409 tenant_unavailable`),
+never `403`. The other reservation calls run in any state.
+
+## Buckets
+
+A managed tenant's bucket rows come only from its tenant chain (AM-57;
+`unit::buckets`). The Worker's `sync` carries, besides the head's numbers
+and state, every bucket change of the tenant records it moves past, for
+buckets placed on this unit, in seq order: `created{seq, bucket_id,
+grant_seq, creator, name, bdk_wrapped, tk_version, written_at}`,
+`dropped{seq, bucket_id}` and `unplaced{seq, buckets}`, and the list of
+bucket ids the head places on this unit. `name` and `bdk_wrapped` come
+from the record's private part. In the `sync`'s transaction the unit:
+
+1. makes each created bucket's row (`created_at` = the record's
+   `written_at`; `grant_seq` kept beside it) and turns the reservation
+   bound to `grant_seq`, if one is left, `applied` (no answer is kept:
+   the Worker builds it from the chain). The keys' grants on the bucket,
+   applied before its row existed, are served from then on. A row with
+   the same id and name changes nothing; another name for the id, or the
+   name for another id, refuses the `sync` (`created_conflict`, alarm). A
+   row of the other key scheme is refused by the scheme triggers. Once
+   the reservation is gone, `bucket_binding(K)` answers `created` from
+   the row kept for K, and never fences a K whose bucket exists (AM-56);
+2. drops each dropped bucket's row (its grants first) if it is closing
+   and holds nothing. A row that is not closing is marked closing first.
+   One that still holds something is kept and renamed
+   `~dropped/<bucket_id>`, so that a later `created` can take the name;
+   the rest of the `sync` applies, and the answer names it for the
+   operator's page (`drop_not_closed`). No object is deleted for it;
+2a. on every `sync` (after the changes, before the check) and on the
+   gate's last call after §8.6 step 7.4, drops each closing row the head
+   does not place once it holds nothing (`buckets::sweep_closing`);
+3. for `unplaced`, removes nothing while the unit's `restoring` entry is
+   set, and otherwise drops those rows as in 2;
+4. checks that its bucket rows, less every closing row the head does not
+   place, equal the head's list, only while the `restoring` entry is not
+   set and in the `sync` that clears it. A difference refuses the whole
+   `sync` (`placements_off`, alarm); the Worker reads the chain again and
+   sends it once more, and the same refusal again stops and pages.
+
+The list a `sync` carries is whole, so it is bounded: at most 10,000
+(est) ids, and as many changes, `unplaced` ids included. A bucket
+create's reservation is refused `cap_reached` once the unit's rows and
+its open creates reach that bound, so no tenant outgrows its `sync`.
+
+"Holds nothing" is the catalogue's rule for a bucket delete: no
+generation, object, key floor, upload or extent names the bucket. That
+is stricter than "no object and no open upload": a bucket whose deleted
+objects still wait for the collector stays closing until they are gone,
+so no row that names data on the backbone loses its bucket and BDK.
+
+Bucket delete is close, then record, then drop. `bucket_close(bucket_id)`
+(a Worker call, in an active tenant) answers `bucket_not_empty` if the
+bucket holds anything and `bucket_not_found` if the unit has no such
+row; otherwise it marks the bucket closing (once), and every write into
+it answers `NoSuchBucket` from then on (`buckets::is_closing`, for the
+request path). Then the `DropBucket` record, then `sync`. A closing
+bucket whose record never came stays closed and empty, and its name
+taken, until a delete retry completes it. The `sync` arm that carries
+the changes, and the stamp raise after `bucket_close` (AM-48), are the
+Worker's (L2). Until the request path asks `is_closing` before a write
+(`RequestCall`, L1 package 5), a write into a closing bucket is not
+refused; a drop still keeps every row that holds data. Package 5 also
+leaves closing rows out of ListBuckets and HeadBucket: a kept row keeps
+its grant rows, and its `~dropped/<id>` name is no S3 name.
+
+## Key scheme
+
+The key scheme follows the tenant (rule 13): tenant 0 is scheme 1, every
+other tenant scheme 2, fixed by the birth certificate. A trigger on
+insert and on update of every wrap that names a scheme
+(`buckets.bdk_wrapped`, `access_keys.secret_wrapped`,
+`unit_keys.secret_wrapped`) refuses a value that is not a blob or whose
+first byte is not the certificate's scheme (`0x01` or `0x02`), so a
+scheme-1 wrap can never sit in a managed tenant's unit and survive its
+shred. The call fails whole and answers the failure class `key_scheme`;
+the Worker pages. An extent's file key is wrapped under the bucket's
+key, with the same byte in both schemes, and is not checked.
+
+## Size guard
+
+A Durable Object's SQLite stops at 10 GB. At 8 GB of database (the
+object's `databaseSize`) or 3.4 M extents, a call that adds extents is
+refused before it writes (`size`: `database_full` or
+`too_many_extents`, with an alarm): the Worker answers `503 SlowDown` and
+pages. Reads, deletes and smaller overwrites go on. The extent count is
+the usage counters' while they are on (one row read), and the rows the
+move's import took while they are off. Today the move's import batches
+are the calls that add extents to a unit; the request path's write
+admission takes the same check when it moves into the unit. Tests run it
+against a lowered limit.
 
 ## Import
 
@@ -171,7 +366,24 @@ from then on no batch is taken, not even the last one sent again, under
 any entry: the refusal is its own code, `sealed`, so a resumed copy knows
 the import is done. The seal survives a new `restoring` entry;
 `deleteAll()` clears it. While a move's import is not sealed, no lift
-passes under any entry, whatever the report. Every imported key value must
+passes under any entry, whatever the report.
+
+**The move's record stays** (AM-47): `unit_import` and
+`unit_import_move` (the seal, `t0_seq`, `move_ordinal`, `move_lifted`,
+`lifted_at`) stay after the move as its record until `deleteAll()`.
+`import_progress` answers, read-only, every table's cursor and rows, and
+`sealed` (the seal's `move_ordinal`), `t0_seq` (the newest tenant-0 seq a
+batch, the seal or a `move` report was bound to), `since_seq` and
+`move_lifted`, which are null when no import was ever bound to the unit,
+and `lifted_at`, the unit's clock at the lift, null until a `move` report
+lifted it (the chain's move floor is raised from it, AM-67). It also answers `schema_tables`, every table the unit holds
+(SQLite's and the platform's own left out), for the reverse move's
+preflight. A window's copy resumes only an import whose `t0_seq` is at or
+above its own first record (AM-53); a second move reads it before step 0
+(P12). On an unborn unit, `import_progress` answers `unborn` and makes
+nothing; `listed` is as the call says (rule 7). P12 reads both heads
+first and sends `listed = false` where they say an unborn unit is
+expected (the day-30 `deleteAll()`); every other read keeps the page. Every imported key value must
 be of its column's class (text, or integer where declared), so the unit
 never holds a key that `export` cannot page after.
 
@@ -210,17 +422,44 @@ catalogue method of the job path is one `job` call (`unit::jobcall`), run
 by the unit's own catalogue in one transaction; on the Worker's side,
 `TenantCatalog` is a catalogue whose job methods are these calls, so the
 job code runs unchanged against a unit. A job call carries the job's
-numbers and must match the unit's (rule 5: missing or lower is refused,
-higher is `sync_needed`), and is `authenticated`. Post, verify, release,
+numbers and must match the unit's (rule 5: lower is answered `stale`
+with the unit's numbers, missing is refused `stale_job`, higher is
+`sync_needed`), and is `authenticated`. A job call carries
+`listed = false`: it reaches the unit through its message, not through a
+record, so an unborn unit is decided by the consumer from the tenant's
+verified head (rule 7). Post, verify, release,
 GC and scrub run in `active`, `suspended` (either mode) and `deleting`.
 They are refused in `shredding` and `shredded`, and while this unit is
 closed (its own `restoring` entry is set, or its lease has expired: rule
 12). Provider permits and
 provider health are not a unit's: they stay in the shared database, which
 every tenant's jobs use. The request path does not use `TenantCatalog`.
-A refusal (`sync_needed`, a stale job, closed, unborn) comes back as a
-typed error, and the first one is kept (`TenantCatalog::refusal`) so the
-consumer can re-read the heads and run the job again or drop it. Stamp
+A refusal (`sync_needed`, stale, a job with no numbers, closed, unborn)
+comes back as a typed error, and the first one is kept
+(`TenantCatalog::refusal`). With `stale`, `TenantCatalog::stale_seqs`
+holds the unit's numbers, and `latest_seqs` holds the numbers of the
+unit's latest `ok` or `stale` answer in the run, for a follow-up job
+(never below the job's own).
+
+**What the consumer does with a unit's answer to a job call (AM-50):**
+
+| The unit answers | The consumer |
+|---|---|
+| `stale{seqs}` | runs the job once more with the unit's `seqs`. They stand for the chain heads, because the unit refuses every job once its lease has expired, so they are at most T old (rule 12). A second `stale` is acknowledged; the outbox row stays. |
+| `refused{stale_job}` (no numbers) | DLQ and page: no writer sends a format-2 job without numbers. |
+| `closed` (restoring, provisioning) | acknowledges. The row stays in the unit's outbox, and the unit's dispatcher sends it again once the unit opens. |
+| `renew_needed` | renews through the unit client (rule 12), then runs the job once more. A failed renewal hands the message back with the queue's `retry_delay`. |
+| `sync_needed` | reads and verifies both chains up to their heads, applies the keys and calls `sync`, then runs the job once more. A failure hands the message back, and the DLQ pages once `max_retries` is reached. |
+| `unborn` | reads the tenant's verified head. If it lists the unit: DLQ and a "catalogue lost" page (rule 7). If not: acknowledged with a log line and no page. A head read that fails or does not verify hands the message back. |
+| `account_problem` while the tenant is `shredding` or `shredded` | acknowledges with a log line and no page. |
+| any other refusal | DLQ and page. |
+
+`renew` and `stamp_raise` have no outbox row; the unit keeps a raise
+pending until its stamp call lands. A managed tenant's job and request
+configs keep `MAINTENANCE` as tenant 0's: under `restore`, a unit job
+makes no unit call (an outbox job, `renew` and `stamp_raise` are
+acknowledged, with a log line and no page), and the request path refuses
+unit writes with `503`. Stamp
 calls must name the unit's own stamp id, `<tenant>.<unit>`. Eviction runs
 per unit against the configured cap until the directory's global
 threshold exists (ADR §5.5): with N managed tenants the cache can hold up
@@ -286,6 +525,51 @@ answer `failed` of class `pitr_armed` means the restore was armed without
 the restart, which applies it: the tool sends the same restore again until
 it gets no answer, and runs the gate only once the restart is seen.
 
+**Not before a move's lift, not before the birth** (AM-46, check 5).
+While an import exists that no `move` report has lifted
+(`unit_import_move` with `move_lifted = 0`), `restore_prepare` is refused
+with `move_not_lifted`, so no undo bookmark from before the lift exists;
+`restore`, which needs that bookmark, is refused the same way. Once
+lifted, `restore` refuses a time target before `lifted_at` + 60 s (est)
+with `before_move_lift`. **The floor is also kept in the tenant chain**
+(AM-67), where a unit restore cannot take it back: the carried door field
+`move_floors: {<unit>: <ms>}`, raised and never lowered or removed, by
+three writers: the move's step 8(b1) record `SetMoveFloor{unit,
+lifted_at}` (the tool reads `lifted_at` from `ImportProgress`); every
+exit that empties a unit with `deleteAll()` (to the Worker's clock after
+it answered); and the Worker before every `restore`, when
+`ImportProgress` shows a `lifted_at` above the head's. Every `restore`
+call carries `floor_ms`, a required field, read from the verified head
+for that unit (0 only when the head has none; no `restore` is sent when
+the head cannot be read). The unit refuses a time target before max(its
+own `lifted_at`, `floor_ms`) + 60 s with `before_move_lift`, also when
+its own record is gone. It also refuses a time target before the unit's
+own `born_at` + 60 s (est) with `before_birth`: a rebirth (a dump restore
+into a gone or unborn unit, or a re-creation after `deleteAll()`)
+replaced the unit, and the history before it would bring back the old
+incarnation. Both margins cover a recorded time that is its call's clock,
+a little before the commit; the S3 drill measures
+`getBookmarkForTime`'s offset, and above 30 s the margin becomes twice
+it. A bookmark target is not compared: the only bookmarks are the undo
+bookmark and the pre-migration bookmark, and neither can be taken before
+the lift, with one span open: from the time the owner's unit is closed
+with no move record (the move's step-2 sync, or a re-creation with a
+`restore` token under the move's entry, AM-53, or under a left entry,
+P12) until the first import batch, the unit cannot tell that entry from
+a restore's, whatever its birth, so `restore_prepare` there goes on to
+checks 1 to 3. Restoring such a bookmark after the lift takes the unit's
+own record away; the chain's floor then still refuses a later time
+restore into the seal-to-lift span (AM-67; the move's P14 drills it). A unit runs no schema
+migration while an import is not lifted
+(`schema::migration_allowed`; code reads N - 1 and N, so it serves
+without migrating), and the move window runs under the merge freeze.
+Every state before the lift is a closed unit in mid-move that never
+served a request, so no recovery point is lost. A rollback of the object
+by the platform, outside `restore`, is an accepted residual. W4 dumps
+leave out `unit_import` and `unit_import_move`, as `export` does, so a
+unit born from a dump cannot take a `move` report (`import_not_sealed`);
+a dump restore empties the unit first.
+
 A unit born from a `restore` token starts with its usage counters off. The
 gate's recount turns them on, and the lift is refused while any is off. A
 unit born from a `birth` token starts with them on.
@@ -332,22 +616,51 @@ newest the unit has seen; the call carries the unit's numbers; and the
 ordinal is the unit's stamp counter (0 while no stamp was ever raised).
 A `move` report takes no blocker page and no acknowledgement, and no
 summary but a complete, empty one. The lift check reads the binding the
-unit holds again (root unit, seal, stamp counter, empty summary). If a
+unit holds again (root unit, seal, stamp counter, empty summary).
+The stamp counter is the unit's `rollback_stamp` row, or 0 when no row
+exists; only a `move` report takes the 0, and a restore report needs the
+row, which the gate's stamp levelling writes. Jobs, the stamp's own
+included, are refused while the unit is closed, so the window raises
+none. A move into a unit whose stamp prefix `rs/<t>.<u>/` already holds
+stamps (a second attempt, or a second move after an undo) must first
+level the counter to the newest of them; until W4-gate's levelling
+exists, the move's preflight stops before step 0 (AM-44). If a
 stamp raise lands between the report and the lift record, the `sync` is
 refused by the gate (`refused: gate`); the tool writes a new `restoring`
 entry, syncs the unit to it, and opens a new report under it. The lift a
 `move` report passes uses the seal up: no other `move` report is taken
 after it, so a later entry (a restore of the owner's unit) is lifted only
-by the restore gate. So a tool that re-runs 8(b) first reads the unit:
-if its `restoring_since` is already empty, the lift landed and 8(c)
-follows; a `keys_not_applied` answer means apply the keys and send the
-`sync` again, and `stale_sync` means read the head again. Only a gate
-refusal re-enters. Not covered: a rollback of the unit to a point between
-the seal and the lift brings back an unused seal (a design question). No
-other kind of lift exists.
+by the restore gate. So a tool that re-runs 8(b) first reads the unit
+(AM-45): if its `restoring_since` is already empty, the lift landed, and
+V9 (8(b2)) runs before 8(c). Otherwise: a lost or `failed` answer sends
+the same `sync` again; `keys_not_applied` means apply the keys and send
+it again, `stale_sync` read the head again, `counters_off` run
+`recount`, each once per entry. If the same refusal comes back after
+its fix while the owner tenant's chain heads have not moved since the
+fix, the window stops; a higher head allows one more fix. Only `not_restoring`, `no_report`,
+`stamp_not_levelled` and `proof_mismatch` re-enter, once per window; any
+other refusal stops the window. The unit keeps the time of that lift, and refuses a
+restore to a time before it, or less than 60 s (est) after it, as the
+time is the lift call's clock (`before_move_lift`): a rollback into the
+move's window would bring back an unused seal. A restore to an undo
+bookmark is not compared (a bookmark names no time); a platform rollback
+of the object is outside the unit. The move's import record (the seal,
+the tenant-0 seq, the lift) stays until `deleteAll()`. No other kind of
+lift exists.
 
-A unit born from a `restore` token cannot lift until `recount` (AM-27)
-turns its counters on; that call is not built yet.
+**Recount** (`recount`, `unit::recount`, AM-27). A unit born from a
+`restore` token starts with its usage counters off, and the lift is
+refused while any is off; jobs are refused while the unit is closed, so
+the cron's recount cannot run. `recount{start}` begins a pass of the
+catalogue's recount that adopts its figures, and `recount{step}` runs
+one bounded chunk, one transaction each; the pass's last step adopts its
+figures and turns every counter on. It is accepted only while the
+unit's `restoring` entry is set. It is the move's when the import filled
+the entry the unit is closed under: then it also needs the seal, tenant
+0's verified head moving here, not older than the import's, with `flips
++ 1` equal to the sealed ordinal, and the unit's numbers, as a `move`
+report does. Any other `recount` is the restore gate's. It writes, so it
+is an `authenticated` Worker call.
 
 A restored unit stays closed until the gate lifts it, and the gate lifts only
 on a whole, clean replay (`unit::gate`): no damaged generation, no held row
@@ -398,5 +711,12 @@ SQLite's message. Not compared, by design: calls that meet a state with a
 broken foreign key (a test that switched the keys off; they run on SQLite
 alone, are counted, and the twin is rebuilt at the next whole state), plain
 `EXPLAIN` bytecode (counted as skipped), and `total_changes()` and
-`last_insert_rowid()`, which are each connection's own counters. Then
-`unit-smoke.py` drives the unit class itself in the same workerd.
+`last_insert_rowid()`, which are each connection's own counters. Those two
+are answered by SQLite even with the object as primary: the twin sends each
+statement as a request of its own, and workerd evicts an object idle for
+about 10 s, which restarts its counters (a host stall inside one call was
+enough to refuse a read-only call as `wrote_without_authentication`). In
+production a call is one `transactionSync` with no await, on one
+connection. Rows changed are compared for every statement instead,
+`query` included. Then `unit-smoke.py` drives the unit class itself in the
+same workerd.

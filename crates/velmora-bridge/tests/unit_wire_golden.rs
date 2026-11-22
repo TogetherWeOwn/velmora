@@ -12,6 +12,7 @@
 //! To write the file after a deliberate change: `UNIT_WIRE_GOLDEN=write`.
 
 use serde_json::{json, Value};
+use velmora_bridge::unit::buckets::{BucketChange, BucketRefusal};
 use velmora_bridge::unit::call::{Closed, HoldMode};
 use velmora_bridge::unit::export::{ExportMode, ExportRefusal, ExportTable, KeyTable};
 use velmora_bridge::unit::identity::Refusal as IdentityRefusal;
@@ -20,11 +21,19 @@ use velmora_bridge::unit::import::{
     ImportBatch, ImportCount, ImportRefusal, ImportTable, ImportValue, MoveHead,
 };
 use velmora_bridge::unit::jobcall::JobCall;
-use velmora_bridge::unit::keys::{Access, KeyEntry, KeyGrant, KeyKind, KeyRefusal, SubjectStatus};
+use velmora_bridge::unit::keys::{
+    Access, ApplyEntry, KeptAnswer, KeyEntry, KeyGrant, KeyKind, KeyMarker, KeyRefusal, MarkerKind,
+    SubjectStatus,
+};
 use velmora_bridge::unit::lift::{
     AckClass, ClassProof, FindingList, GateRefusal, GateSummary, LiftProof, ReplayId, ReportKind,
 };
+use velmora_bridge::unit::recount::{RecountCall, RecountRefusal};
+use velmora_bridge::unit::reserve::{
+    Acting, Admit, Binding, Hash32, Opening, PrincipalView, ReserveRefusal, Rid,
+};
 use velmora_bridge::unit::restore::{Bookmark, RestoreRefusal, RestoreTarget};
+use velmora_bridge::unit::size::SizeRefusal;
 use velmora_bridge::unit::{
     BirthKind, BirthToken, CallKind, ProvisionRefusal, Reader, Refused, Seqs, SyncHead, TenantId,
     TenantState, UnitAnswer, UnitCall, UnitName, UnitOp,
@@ -84,6 +93,14 @@ fn op_kind(op: &UnitOp) -> &'static str {
         UnitOp::GateBlockers { .. } => "gate_blockers",
         UnitOp::GateAck { .. } => "gate_ack",
         UnitOp::GateStatus {} => "gate_status",
+        UnitOp::Recount { .. } => "recount",
+        UnitOp::Reserve { .. } => "reserve",
+        UnitOp::ResolveActing { .. } => "resolve_acting",
+        UnitOp::Release { .. } => "release",
+        UnitOp::BindBucket { .. } => "bind_bucket",
+        UnitOp::ReleaseBound { .. } => "release_bound",
+        UnitOp::BucketBinding { .. } => "bucket_binding",
+        UnitOp::BucketClose { .. } => "bucket_close",
         UnitOp::Job { .. } => "job",
         UnitOp::ReadPlan { .. } => "read_plan",
     }
@@ -122,6 +139,10 @@ fn refused_kind(r: &Refused) -> &'static str {
         Refused::Restore(_) => "restore",
         Refused::Gate(_) => "gate",
         Refused::Export(_) => "export",
+        Refused::Recount(_) => "recount",
+        Refused::Reserve(_) => "reserve",
+        Refused::Size(_) => "size",
+        Refused::Buckets(_) => "buckets",
     }
 }
 
@@ -156,24 +177,41 @@ fn ops() -> Vec<UnitOp> {
         },
         UnitOp::ApplyKeys {
             from_seq: 2,
-            entries: vec![KeyEntry {
-                id: "AKGOLDEN000000000001".into(),
-                kind: KeyKind::S3,
-                status: SubjectStatus::Active,
-                held: false,
-                made_by: Some("p_1".into()),
-                grants: vec![KeyGrant {
-                    bucket_id: "b_00000000000000f1".into(),
-                    access: Access::Ro,
-                    expires_at: Some(9),
-                    prefix: Some("a/".into()),
-                    ip_list: vec!["192.0.2.0/24".into()],
-                }],
-                created_at: 5,
-                secret_wrapped: Some(vec![2, 9]),
-                secret_kek_version: Some(1),
-                owner_ref: Some("m_1".into()),
-                last_seq: 3,
+            entries: vec![
+                ApplyEntry::Key(KeyEntry {
+                    id: "AKGOLDEN000000000001".into(),
+                    kind: KeyKind::S3,
+                    status: SubjectStatus::Active,
+                    held: false,
+                    made_by: Some("p_1".into()),
+                    grants: vec![KeyGrant {
+                        bucket_id: "b_00000000000000f1".into(),
+                        access: Access::Ro,
+                        expires_at: Some(9),
+                        prefix: Some("a/".into()),
+                        ip_list: vec!["192.0.2.0/24".into()],
+                    }],
+                    created_at: 5,
+                    secret_wrapped: Some(vec![2, 9]),
+                    secret_kek_version: Some(1),
+                    owner_ref: Some("m_1".into()),
+                    last_seq: 3,
+                    rid: Some(Rid([0x11; 16])),
+                }),
+                // AM-62: the records that change no subject.
+                ApplyEntry::Marker(KeyMarker {
+                    marker: MarkerKind::KeysFrozen,
+                    seq: 4,
+                }),
+                ApplyEntry::Marker(KeyMarker {
+                    marker: MarkerKind::KeysThawed,
+                    seq: 5,
+                }),
+            ],
+            answers: vec![KeptAnswer {
+                rid: Rid([0x11; 16]),
+                status: 201,
+                body: r#"{"id":"AKGOLDEN000000000001","secret_access_key":null}"#.into(),
             }],
         },
         UnitOp::HeldKeys {},
@@ -238,6 +276,7 @@ fn ops() -> Vec<UnitOp> {
             token: token(),
             target: RestoreTarget::Time { at_ms: 1_000 },
             expect_undo: Bookmark("bm-1".into()),
+            floor_ms: 900,
         },
         UnitOp::Restore {
             token: token(),
@@ -245,6 +284,7 @@ fn ops() -> Vec<UnitOp> {
                 bookmark: Bookmark("bm-0".into()),
             },
             expect_undo: Bookmark("bm-1".into()),
+            floor_ms: 0,
         },
         UnitOp::GateOpen { replay_id: rid() },
         UnitOp::GateOpenMove {
@@ -285,6 +325,86 @@ fn ops() -> Vec<UnitOp> {
             ids: vec!["g_1".into()],
         },
         UnitOp::GateStatus {},
+        UnitOp::Recount {
+            call: RecountCall::Start {},
+            head: None,
+        },
+        UnitOp::Recount {
+            call: RecountCall::Step { chunk: 500 },
+            head: Some(MoveHead {
+                seq: 11,
+                selector: "moving".into(),
+                to: Some(name().tenant),
+                flips: 0,
+            }),
+        },
+        UnitOp::Reserve {
+            key_hash: Hash32([0x22; 32]),
+            fingerprint: Hash32([0x33; 32]),
+            rid: Rid([0x44; 16]),
+            acting: Some(Acting::OwnerRef("m_1".into())),
+            opening: Opening::Key {
+                kind: KeyKind::S3,
+                id: "AKGOLDEN000000000002".into(),
+                grants: vec![KeyGrant {
+                    bucket_id: "b_00000000000000f1".into(),
+                    access: Access::Ro,
+                    expires_at: None,
+                    prefix: None,
+                    ip_list: vec![],
+                }],
+            },
+        },
+        UnitOp::Reserve {
+            key_hash: Hash32([0x22; 32]),
+            fingerprint: Hash32([0x33; 32]),
+            rid: Rid([0x45; 16]),
+            acting: None,
+            opening: Opening::Principal {
+                id: "p_2".into(),
+                owner_ref: "m_2".into(),
+                grants: vec![],
+            },
+        },
+        UnitOp::Reserve {
+            key_hash: Hash32([0x22; 32]),
+            fingerprint: Hash32([0x33; 32]),
+            rid: Rid([0x46; 16]),
+            acting: Some(Acting::Principal("p_1".into())),
+            opening: Opening::Grants {
+                subject: "AKGOLDEN000000000001".into(),
+                grants: vec![],
+            },
+        },
+        UnitOp::Reserve {
+            key_hash: Hash32([0x22; 32]),
+            fingerprint: Hash32([0x33; 32]),
+            rid: Rid([0x47; 16]),
+            acting: Some(Acting::OwnerRef("m_1".into())),
+            opening: Opening::Bucket {
+                name: "alpha".into(),
+                unit: 0,
+            },
+        },
+        UnitOp::ResolveActing {
+            acting: Acting::OwnerRef("m_1".into()),
+        },
+        UnitOp::Release {
+            rid: Rid([0x44; 16]),
+        },
+        UnitOp::BindBucket {
+            rid: Rid([0x47; 16]),
+            expected: None,
+            grant_seq: 4,
+        },
+        UnitOp::ReleaseBound {
+            rid: Rid([0x47; 16]),
+            bound: Some(4),
+        },
+        UnitOp::BucketBinding { grant_seq: 4 },
+        UnitOp::BucketClose {
+            bucket_id: "b_00000000000000f1".into(),
+        },
         UnitOp::Job {
             call: JobCall::claim {
                 extent: ExtentId::new("x_000000000000000000000000f1"),
@@ -346,6 +466,59 @@ macro_rules! every {
     }};
 }
 
+/// `ImportProgress`'s answer body as a real unit gives it (AM-47,
+/// AM-67): before any import, and after a lift (`lifted_at` set). The
+/// L3 move tool and the restore tool read `lifted_at` from it.
+/// `schema_tables` is left out: it lists the unit's tables, so every
+/// migration changes it.
+fn import_progress_bodies() -> Value {
+    use velmora_bridge::testkit::RusqliteSql;
+    use velmora_bridge::unit::Unit;
+    let now = UnixMs(1_795_000_000_000);
+    let u = Unit::new(RusqliteSql::open_in_memory().unwrap(), name(), "");
+    let mut token = token();
+    token.jurisdiction = String::new();
+    token.schema_version = velmora_bridge::unit::schema::SCHEMA_VERSION;
+    token.kind = BirthKind::Birth;
+    let call = |op, s: Option<Seqs>| UnitCall {
+        name: name(),
+        kind: CallKind::Worker,
+        seqs: s,
+        authenticated: true,
+        listed: true,
+        op,
+    };
+    let born = u.handle(
+        &call(
+            UnitOp::Provision {
+                token,
+                sealed: b"sealed".to_vec(),
+            },
+            Some(seqs()),
+        ),
+        now,
+    );
+    assert!(matches!(born, UnitAnswer::Ok { .. }), "{born:?}");
+    let body = || match u.handle(&call(UnitOp::ImportProgress {}, None), now) {
+        UnitAnswer::Ok { mut body, .. } => {
+            body.as_object_mut().unwrap().remove("schema_tables");
+            body
+        }
+        other => panic!("{other:?}"),
+    };
+    let before = body();
+    u.sql()
+        .with_conn(|c| {
+            c.execute(
+                "INSERT INTO unit_import_move(id, t0_seq, since_seq, final, move_ordinal, \
+                   move_lifted, lifted_at) VALUES (1, 11, 7, 1, 1, 1, ?1)",
+                [now.0],
+            )
+        })
+        .unwrap();
+    json!({ "never_bound": before, "lifted": body() })
+}
+
 fn nested() -> Value {
     json!({
         "call_kind": every!(CallKind: Request, Job, Fanout, Worker),
@@ -377,7 +550,41 @@ fn nested() -> Value {
             AckMismatch, CountersOff, ProofMismatch, ListMismatch, Malformed, MoveNotBound,
             ImportNotSealed, MoveNotEmpty),
         "restore_refusal": every!(RestoreRefusal: NotRestoring, WrongToken, LeaseLive,
-            LeaseUnknown, TooSoon, Moved, Malformed, NoPointInTime),
+            LeaseUnknown, TooSoon, Moved, Malformed, NoPointInTime, BeforeMoveLift, MoveNotLifted,
+            BeforeBirth),
+        "recount_refusal": every!(RecountRefusal: NotRestoring, ImportNotSealed, MoveNotBound),
+        "reserve_refusal": every!(ReserveRefusal: CapReached, GrantNotHeld,
+            GrantLimitsNotServed, TooManyGrants, ActingPrincipalUnknown,
+            ActingPrincipalInactive, ActingPrincipalHeld, OwnerRefAmbiguous,
+            BucketAlreadyExists, PrincipalExists, Conflict, InternalKeyRefused, NotFound, BucketNotFound, RidTaken,
+            Malformed),
+        "size_refusal": every!(SizeRefusal: DatabaseFull, TooManyExtents),
+        "bucket_refusal": every!(BucketRefusal: NotEmpty, NotFound, PlacementsOff,
+            CreatedConflict, Malformed),
+        // AM-57: the bucket changes a `sync` carries (the `sync` arm is
+        // L2's; the form is pinned here).
+        "bucket_change": serde_json::to_value(vec![
+            BucketChange::Created {
+                seq: 8,
+                bucket_id: "b_00000000000000f1".into(),
+                grant_seq: 4,
+                creator: "p_1".into(),
+                name: "golden".into(),
+                bdk_wrapped: vec![2, 7],
+                tk_version: 1,
+                written_at: 5,
+            },
+            BucketChange::Dropped {
+                seq: 9,
+                bucket_id: "b_00000000000000f1".into(),
+            },
+            BucketChange::Unplaced {
+                seq: 10,
+                buckets: vec!["b_00000000000000f2".into()],
+            },
+        ])
+        .unwrap(),
+        "reservation_bodies": reservation_bodies(),
     })
 }
 
@@ -398,7 +605,84 @@ fn refusals() -> Vec<Refused> {
         Refused::Restore(RestoreRefusal::Moved),
         Refused::Gate(GateRefusal::AckMismatch),
         Refused::Export(ExportRefusal::HashOnly),
+        Refused::Recount(RecountRefusal::ImportNotSealed),
+        Refused::Reserve(ReserveRefusal::GrantLimitsNotServed),
+        Refused::Size(SizeRefusal::TooManyExtents),
+        Refused::Buckets(BucketRefusal::NotEmpty),
     ]
+}
+
+/// The bodies of the reservation calls' `ok` answers (exhaustive over
+/// what an ask and a binding read answer).
+fn reservation_bodies() -> Value {
+    let principal = PrincipalView {
+        id: "p_1".into(),
+        status: SubjectStatus::Active,
+        held: false,
+        grants: vec![],
+    };
+    let admits = vec![
+        Admit::Admitted {
+            rid: Rid([0x44; 16]),
+            keys_seq: 3,
+            again: false,
+            scope: Some("p_1".into()),
+            bound: None,
+            subject: Some("AKGOLDEN000000000002".into()),
+            unit: None,
+        },
+        Admit::Applied {
+            status: Some(201),
+            body: Some("{}".into()),
+            subject: Some("AKGOLDEN000000000002".into()),
+            bucket: None,
+            grant_seq: None,
+        },
+        Admit::Reused,
+        Admit::Narrowing { keys_seq: 3 },
+        Admit::NotOpen { open: None },
+        Admit::NotOpen {
+            open: Some((Rid([0x44; 16]), 3)),
+        },
+        Admit::Exists(principal),
+        Admit::Refused(ReserveRefusal::CapReached),
+        Admit::RefusedDrop(ReserveRefusal::GrantNotHeld, Rid([0x44; 16])),
+    ];
+    let mut kinds = std::collections::BTreeSet::new();
+    for a in &admits {
+        kinds.insert(match a {
+            Admit::Admitted { .. } => "admitted",
+            Admit::Applied { .. } => "applied",
+            Admit::Reused => "reused",
+            Admit::Narrowing { .. } => "narrowing",
+            Admit::NotOpen { .. } => "not_open",
+            Admit::Exists(_) => "exists",
+            Admit::Refused(_) => "refused",
+            Admit::RefusedDrop(..) => "refused_drop",
+        });
+    }
+    assert_eq!(kinds.len(), 8);
+    let bindings = [
+        Binding::Open {
+            rid: Rid([0x47; 16]),
+            name: "alpha".into(),
+            creator: "p_1".into(),
+            unit: 0,
+        },
+        Binding::Created {
+            bucket: "b_00000000000000f1".into(),
+        },
+        Binding::None,
+    ];
+    for b in &bindings {
+        match b {
+            Binding::Open { .. } | Binding::Created { .. } | Binding::None => {}
+        }
+    }
+    json!({
+        "admits": admits.iter().map(Admit::body).collect::<Vec<_>>(),
+        "bindings": bindings.iter().map(Binding::body).collect::<Vec<_>>(),
+    })
 }
 
 fn answers() -> Vec<UnitAnswer> {
@@ -460,13 +744,18 @@ fn document() -> Value {
             v
         })
         .collect();
-    json!({ "calls": calls, "answers": answers, "nested": nested() })
+    json!({
+        "calls": calls,
+        "answers": answers,
+        "nested": nested(),
+        "import_progress": import_progress_bodies(),
+    })
 }
 
 #[test]
 fn every_variant_has_a_sample() {
     let ops: std::collections::BTreeSet<_> = ops().iter().map(op_kind).collect();
-    assert_eq!(ops.len(), 20, "{ops:?}");
+    assert_eq!(ops.len(), 28, "{ops:?}");
     let readers: std::collections::BTreeSet<_> = ops_readers().into_iter().collect();
     assert_eq!(readers.len(), 2, "both readers have a sample");
     // The variants that carry data, each with a sample (exhaustive).
@@ -498,7 +787,7 @@ fn every_variant_has_a_sample() {
     let answers: std::collections::BTreeSet<_> = answers().iter().map(answer_kind).collect();
     assert_eq!(answers.len(), 9, "{answers:?}");
     let reasons: std::collections::BTreeSet<_> = refusals().iter().map(refused_kind).collect();
-    assert_eq!(reasons.len(), 15, "{reasons:?}");
+    assert_eq!(reasons.len(), 19, "{reasons:?}");
 }
 
 #[test]
