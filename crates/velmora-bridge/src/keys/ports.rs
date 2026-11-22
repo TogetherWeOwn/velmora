@@ -17,10 +17,15 @@ pub const MAX_APPLY: usize = 100;
 #[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ApplyEntry {
-    /// A subject's record: the subject's state right after it, with
-    /// `last_seq` = the record's seq and the `m/rk/` revocations in force.
+    /// A subject's record: the subject as the head holds it, at
+    /// `last_seq` = the record's seq (for the subject's newest record,
+    /// exactly that record's state), with the `m/rk/` revocations in force.
     /// `private` is `None` when the store must hold it closed (its private
     /// part does not open, or the directory may not have its opening).
+    ///
+    /// For the unit's wire (`KeyEntry`): `held = private.is_none()`; a held
+    /// entry is sent without its secret, and then also without
+    /// `secret_kek_version` (the unit refuses one without the other).
     Subject(Entry),
     /// A marker record (`KeysFrozen`, `KeysThawed`; AM-28): it changes no
     /// subject. The store skips it; it holds its seq's place in the run.

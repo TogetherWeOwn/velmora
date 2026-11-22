@@ -14,16 +14,21 @@
 //!   entry that opens, at the same seq, a row it holds closed.
 //!
 //! So a bring-up sends the records after the store's `keys_seq` up to the
-//! head, page by page. For a subject's newest record the entry is the head
-//! table's entry, exactly. **Every older record is sent closed** (held),
-//! with its door as the record states it: the subject's newest record
-//! lies later in the same run, so a store that stops between two pages
-//! never serves a subject more open than the head does, nor more open
-//! than it did before (a disable answered `Done` is never undone there).
+//! head, page by page. **Every entry states the subject as the head table
+//! holds it**, at the seq of the record it stands for: for a subject's
+//! newest record that is that record's state exactly; for an older one it
+//! is the head's state sent early. A store that stops between two pages
+//! therefore never serves a subject other than as the head does (a disable
+//! answered `Done` is never undone there, and a subject the head holds
+//! open is not closed in between), and the closing step's hold rule, which
+//! reads the head's newest opening, holds every entry the directory may
+//! not have.
 //!
 //! Before the pages, every `m/rk/` revocation the chain does not record
-//! yet is sent alone at its subject's newest seq, so a store that a page
-//! cannot reach still gets it. After the pages, every subject the store
+//! yet whose subject's newest record the store already holds is sent alone
+//! at that seq. One whose newest record is above the store's seq comes in
+//! the pages, with the revocation in force; a store that a page cannot
+//! reach gets it from the renewal's revocation check (ADR §2.4 rule 12). After the pages, every subject the store
 //! holds closed whose private part now opens is sent again (the
 //! bring-up's second send): alone at its own seq, or, when that takes
 //! fewer calls, as one run of the records from the lowest such seq.
@@ -37,6 +42,7 @@ use super::record::{
     key_chain, open_chain_record, ChainRecord, Entry, KeyTable, SubjectStatus, TkRing,
     ERR_KEY_RECORD,
 };
+
 use crate::ports::Kek;
 use crate::records::RecordStore;
 use crate::types::{BridgeError, Result};
@@ -118,8 +124,8 @@ impl<'a, S: RecordStore, K: Kek, T: TkRing> Feed<'a, S, K, T> {
         e
     }
 
-    /// The entries of the records `(from, to]`: the head's entry for a
-    /// subject's newest record, every older one held closed.
+    /// The entries of the records `(from, to]`: each the head's entry of
+    /// its subject, at the record's seq.
     async fn page(&self, from: u64, to: u64) -> Result<Vec<ApplyEntry>> {
         let mut out = Vec::with_capacity((to - from) as usize);
         for seq in from + 1..=to {
@@ -131,18 +137,8 @@ impl<'a, S: RecordStore, K: Kek, T: TkRing> Feed<'a, S, K, T> {
                 ChainRecord::Key(r) => r,
             };
             let head = self.table.get(&r.door.id).ok_or(ERR_KEY_RECORD)?;
-            let entry = match head.last_seq == r.seq {
-                true => head.clone(),
-                false => Entry {
-                    door: r.door,
-                    private: None,
-                    last_seq: r.seq,
-                    private_seq: r.seq,
-                    tk_version: r.tk_version,
-                    closes: r.closes,
-                    opened_seq: head.opened_seq,
-                },
-            };
+            let mut entry = head.clone();
+            entry.last_seq = r.seq;
             out.push(ApplyEntry::Subject(self.in_force(entry)));
         }
         Ok(out)
@@ -247,12 +243,16 @@ impl<'a, S: RecordStore, K: Kek, T: TkRing> Feed<'a, S, K, T> {
         let Some(lowest) = reopened.iter().map(|e| e.last_seq).min() else {
             return Ok(true);
         };
-        // One run from the lowest such seq takes ceil(span / 100) calls;
-        // the store skips every other entry at or below its rows.
-        let span = held - (lowest - 1);
+        // One run from the lowest such seq to the table's head (never
+        // past it: a store may be ahead) takes ceil(span / 100) calls; the
+        // store skips every other entry at or below its rows. It also
+        // reads span records (the memo holds most), so it is taken only
+        // when it saves calls.
+        let top = held.min(self.table.seq());
+        let span = top - (lowest - 1);
         let run_calls = span.div_ceil(MAX_APPLY as u64);
         if run_calls < reopened.len() as u64 {
-            self.run(target, Mode::Full, held, &closed, lowest - 1, held)
+            self.run(target, Mode::Full, held, &closed, lowest - 1, top)
                 .await
         } else {
             self.singly(target, reopened).await

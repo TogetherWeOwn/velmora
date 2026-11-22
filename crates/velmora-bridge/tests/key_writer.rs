@@ -5840,9 +5840,11 @@ async fn a_store_behind_gets_every_record_in_pages_without_a_gap() {
     assert_eq!(mid.applies.get(), 2);
 }
 
-/// A store that stops between two pages holds the chain exactly as of
-/// the last page it took: a subject disabled in page 1 and re-enabled in
-/// page 2 is disabled there, never its older open state.
+/// A store that stops between two pages holds every subject it took as
+/// the head holds it: a subject disabled in page 1 and re-enabled at the
+/// head (in page 2) is sent in page 1 as the head has it. In full mode the
+/// directory has the head, so that is in force; the closing step holds it
+/// (see the hold rule's test).
 #[tokio::test(flavor = "current_thread")]
 async fn a_store_that_stops_between_pages_holds_the_chain_as_of_its_last_page() {
     let w = World::new();
@@ -5877,7 +5879,8 @@ async fn a_store_that_stops_between_pages_holds_the_chain_as_of_its_last_page() 
     assert_eq!(unit.seq.get(), 100);
     let row = unit.row("PX0001").unwrap();
     assert_eq!(row.last_seq, 50);
-    assert_eq!(row.door.status, SubjectStatus::Disabled);
+    assert_eq!(row.door.status, SubjectStatus::Active);
+    assert_eq!(row.door, table.get("PX0001").unwrap().door);
     // Once back, the rest: the head's state.
     unit.down.set(false);
     unit.down_after.set(None);
@@ -6616,4 +6619,126 @@ async fn many_reopened_subjects_take_one_run() {
         .unwrap();
     assert_eq!(unit.applies.get() - before, 3, "100 + 100 + 50, not 250");
     assert!(unit.rows.borrow().values().all(|r| r.private.is_some()));
+}
+
+/// Confirmation of the apply (N1): a directory that stopped between
+/// pages holds what it took as the head has it, so the closing step at a
+/// unit opens nothing the directory holds closed. PX0001 is made at 40 and
+/// narrowed at 150; the directory takes page 1 and stops; then the unit's
+/// closing step at `acked = 100` must match what the directory holds.
+#[tokio::test(flavor = "current_thread")]
+async fn the_closing_step_never_opens_what_a_partial_directory_holds_closed() {
+    let w = World::new();
+    for seq in 1..=149 {
+        let id = match seq {
+            40 => "PX0001".to_owned(),
+            _ => format!("PA{seq:04}"),
+        };
+        let g = [grant("b_01", RW, None)];
+        let grants: &[Grant] = if seq == 40 { &g } else { &[] };
+        plant(&w, seq, KeyOp::Create, &principal(&id, grants), None);
+    }
+    plant(&w, 150, KeyOp::Grants, &principal("PX0001", &[]), None);
+    let table = head_table(&w).await;
+    let none = Default::default();
+    let directory = FakeTarget::new("directory");
+    directory.down_after.set(Some(1));
+    assert!(
+        apply_direct(&w.store, &w.kek, &w.ring, &table, &none, &directory)
+            .await
+            .is_err()
+    );
+    assert_eq!(directory.seq.get(), 100);
+    let at_dir = directory.row("PX0001").unwrap();
+    assert!(at_dir.private.is_some(), "the directory holds it open");
+    assert!(at_dir.door.grants.is_empty(), "as the head narrows it");
+}
+
+/// Confirmation of the apply (N6): the closing step sends open what the
+/// directory acknowledged, without waiting for the full step.
+#[tokio::test(flavor = "current_thread")]
+async fn the_closing_step_sends_open_what_the_directory_acknowledged() {
+    let w = World::new();
+    let adm = FakeAdmission::new(&w.root);
+    let mut table = seed(&w, &adm).await;
+    let units = w.units();
+    let env = env!(w, &adm, &units);
+    let mut rng = TestRng(440);
+    // A new key at 3, held at the units (the directory was down).
+    w.directory.down.set(true);
+    let k = s3_key(&w.t, "AKVL0002", "PR0001", &[grant("b_01", RO, None)]);
+    assert_eq!(
+        env.change(&mut table, "i-k2", &KeyRequest::Create(k), &mut rng)
+            .await
+            .unwrap(),
+        KeyAnswer::Unfinished { seq: 3 }
+    );
+    w.directory.down.set(false);
+    // The directory takes the head by itself; the units are reset to seq
+    // 2, then a finisher whose directory step fails.
+    apply_direct(
+        &w.store,
+        &w.kek,
+        &w.ring,
+        &head_table(&w).await,
+        &Default::default(),
+        &w.directory,
+    )
+    .await
+    .unwrap();
+    for u in [&w.root, &w.unit2] {
+        u.rows.borrow_mut().remove("AKVL0002");
+        u.seq.set(2);
+    }
+    // A revoke of another key lands first, so the directory has a step
+    // to fail.
+    put_tenant_revocation(&w.store, &w.kek, &w.t, "AKVL0001", 5, &mut rng)
+        .await
+        .unwrap();
+    w.directory.down_after.set(Some(0));
+    let report = finish_keys(&env, &mut rng).await.unwrap();
+    assert!(report.failed.contains(&"directory".to_owned()));
+    assert!(w.root.row("AKVL0002").unwrap().private.is_some());
+}
+
+/// Confirmation of the apply (N2, N6): one held subject with a long span
+/// is sent alone; a store ahead of the table is never asked for records
+/// past the table.
+#[tokio::test(flavor = "current_thread")]
+async fn the_second_send_picks_the_cheaper_form_and_stays_within_the_table() {
+    let w = World::new();
+    plant_principals(&w, 250);
+    let table = head_table(&w).await;
+    let none = Default::default();
+    let unit = FakeTarget::new("unit");
+    apply_direct(&w.store, &w.kek, &w.ring, &table, &none, &unit)
+        .await
+        .unwrap();
+    unit.rows.borrow_mut().get_mut("PA0001").unwrap().private = None;
+    let before = unit.applies.get();
+    apply_direct(&w.store, &w.kek, &w.ring, &table, &none, &unit)
+        .await
+        .unwrap();
+    assert_eq!(unit.applies.get() - before, 1, "alone, not 3 pages");
+    // A store ahead of the caller's table (another writer's records) with
+    // five held subjects: the run stops at the table's head.
+    let stale = {
+        let mut t = KeyTable::empty(w.t.clone());
+        let chain = key_chain(&w.t);
+        for seq in 1..=5 {
+            let b = chain.get(&w.store, seq).await.unwrap();
+            t.apply(&open_key_record(&w.kek, &w.ring, &w.t, seq, &b).unwrap())
+                .unwrap();
+        }
+        t
+    };
+    for id in ["PA0001", "PA0002", "PA0003", "PA0004", "PA0005"] {
+        unit.rows.borrow_mut().get_mut(id).unwrap().private = None;
+    }
+    apply_direct(&w.store, &w.kek, &w.ring, &stale, &none, &unit)
+        .await
+        .unwrap();
+    for id in ["PA0001", "PA0002", "PA0003", "PA0004", "PA0005"] {
+        assert!(unit.row(id).unwrap().private.is_some(), "{id}");
+    }
 }
