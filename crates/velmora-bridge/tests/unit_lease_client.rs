@@ -94,6 +94,8 @@ struct Obj<'a> {
     sync_attempts: RefCell<Vec<SyncAttempt>>,
     /// Holds the next sync just before it reaches the unit.
     sync_gate: RefCell<Option<oneshot::Receiver<()>>>,
+    /// Holds the next key apply just before it reaches the unit.
+    apply_keys_gate: RefCell<Option<oneshot::Receiver<()>>>,
     /// Run once, after the unit answers `sync` but before the client resumes.
     after_sync_reply: RefCell<Option<Hook<'a>>>,
     fail: Cell<bool>,
@@ -163,6 +165,12 @@ impl UnitReplies for Obj<'_> {
             let gate = self.sync_gate.borrow_mut().take();
             if let Some(gate) = gate {
                 gate.await.expect("the test must release the sync");
+            }
+        }
+        if matches!(call.op, UnitOp::ApplyKeys { .. }) {
+            let gate = self.apply_keys_gate.borrow_mut().take();
+            if let Some(gate) = gate {
+                gate.await.expect("the test must release the key apply");
             }
         }
         let reply = self.unit.reply(call, self.clock.now());
@@ -292,13 +300,17 @@ struct Rig<'a> {
     keys: &'a Keys,
     finisher: &'a Finisher,
     flights: InFlight,
+    head_reads: RefCell<Vec<u64>>,
+    head_read_gate: RefCell<Option<oneshot::Receiver<()>>>,
     record_reads: RefCell<Vec<u64>>,
     obj: Obj<'a>,
 }
 
-/// The real tenant chain, with a trace of the exact records a sync opens.
+/// The real tenant chain, with a trace of head and record reads and a one-shot head gate.
 struct Heads<'a> {
     chain: TenantChain<'a, HookedRecords, PlainSeal>,
+    head_reads: &'a RefCell<Vec<u64>>,
+    head_read_gate: &'a RefCell<Option<oneshot::Receiver<()>>>,
     record_reads: &'a RefCell<Vec<u64>>,
 }
 
@@ -308,6 +320,11 @@ impl TenantHeads for Heads<'_> {
         tenant: &TenantId,
         known: u64,
     ) -> std::result::Result<Option<TenantDoor>, ChainError> {
+        self.head_reads.borrow_mut().push(known);
+        let gate = self.head_read_gate.borrow_mut().take();
+        if let Some(gate) = gate {
+            gate.await.expect("the test must release the head read");
+        }
         TenantHeads::head(&self.chain, tenant, known).await
     }
 
@@ -364,6 +381,8 @@ impl<'a> Rig<'a> {
                     store: self.records,
                     seal: self.seal,
                 },
+                head_reads: &self.head_reads,
+                head_read_gate: &self.head_read_gate,
                 record_reads: &self.record_reads,
             },
             keys: self.keys,
@@ -590,6 +609,8 @@ fn with_rig<R>(f: impl FnOnce(&Rig<'_>) -> R) -> R {
         keys: &keys,
         finisher: &finisher,
         flights: InFlight::default(),
+        head_reads: RefCell::default(),
+        head_read_gate: RefCell::default(),
         record_reads: RefCell::default(),
         obj: Obj {
             unit: Unit::new(RusqliteSql::open_in_memory().unwrap(), own(), ""),
@@ -597,6 +618,7 @@ fn with_rig<R>(f: impl FnOnce(&Rig<'_>) -> R) -> R {
             log: RefCell::new(vec![]),
             sync_attempts: RefCell::default(),
             sync_gate: RefCell::default(),
+            apply_keys_gate: RefCell::default(),
             after_sync_reply: RefCell::default(),
             fail: Cell::new(false),
             after_stamp_read: RefCell::new(None),
@@ -1027,6 +1049,59 @@ fn sync_replaces_restore_across_a_long_gap_after_the_lift() {
         let head = rig.obj.unit.head().unwrap();
         assert_eq!(head.seqs, want);
         assert_eq!(head.restoring_since, Some(b));
+    });
+}
+
+/// A sync paused at key apply re-reads the head if another sync installs a newer restore.
+#[test]
+fn racing_key_apply_rereads_the_head_before_sending_restore_admission() {
+    with_fresh(|rig| {
+        let before = rig.unit_seqs();
+        rig.write(Change::SetRestoring { unit: 0 }, Actor::Operator);
+        let a = rig.head_seq();
+        let key_seq = before.keys_seq + 1;
+        rig.key_record(key_seq, key(GONE, key_seq, SubjectStatus::Active));
+        rig.obj.log.borrow_mut().clear();
+        rig.obj.sync_attempts.borrow_mut().clear();
+        rig.head_reads.borrow_mut().clear();
+
+        let first = rig.client();
+        let second = rig.client();
+        let (release, held) = oneshot::channel();
+        *rig.obj.apply_keys_gate.borrow_mut() = Some(held);
+        let mut late = std::pin::pin!(first.sync(before));
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(late.as_mut().poll(&mut cx).is_pending());
+        assert!(rig.obj.apply_keys_gate.borrow().is_none());
+        assert_eq!(rig.calls(), ["held_keys", "apply_keys"]);
+        assert_eq!(*rig.head_reads.borrow(), [before.state_seq]);
+        assert_eq!(rig.unit_seqs(), before);
+
+        write_lift(rig, a);
+        rig.write(Change::SetRestoring { unit: 0 }, Actor::Operator);
+        let b = rig.head_seq();
+        assert!(b > a);
+        let want = Seqs {
+            state_seq: b,
+            keys_seq: key_seq,
+        };
+        assert_eq!(synced(&second, before), Synced::Synced { seqs: want });
+        let installed = rig.obj.unit.head().unwrap();
+        assert_eq!(installed.restoring_since, Some(b));
+
+        // The two applies have the same key head. It is the moved tenant
+        // sequence in the first client's reply that must force a re-read.
+        rig.clock.advance_ms(1);
+        release.send(()).unwrap();
+        let (result, pages) = block_on(late);
+        assert_eq!(result.unwrap(), Synced::Synced { seqs: want });
+        assert!(pages.is_empty(), "{pages:?}");
+        assert_eq!(
+            *rig.head_reads.borrow(),
+            [before.state_seq, before.state_seq, b]
+        );
+        assert_restore_steps(rig, before, &[b, b], b);
+        assert_eq!(rig.obj.unit.head().unwrap(), installed);
     });
 }
 
@@ -1552,6 +1627,8 @@ fn an_unborn_unit_is_reported() {
         keys: &keys,
         finisher: &finisher,
         flights: InFlight::default(),
+        head_reads: RefCell::default(),
+        head_read_gate: RefCell::default(),
         record_reads: RefCell::default(),
         obj: Obj {
             unit: Unit::new(RusqliteSql::open_in_memory().unwrap(), own(), ""),
@@ -1559,6 +1636,7 @@ fn an_unborn_unit_is_reported() {
             log: RefCell::new(vec![]),
             sync_attempts: RefCell::default(),
             sync_gate: RefCell::default(),
+            apply_keys_gate: RefCell::default(),
             after_sync_reply: RefCell::default(),
             fail: Cell::new(false),
             after_stamp_read: RefCell::new(None),
@@ -2307,6 +2385,119 @@ fn a_request_with_newer_numbers_syncs_and_runs_once_more() {
     });
 }
 
+/// After eight catch-up steps, the next unsigned request can finish syncing at the same time.
+#[test]
+fn partial_request_sync_progress_does_not_back_off() {
+    with_fresh(|rig| {
+        let before = rig.unit_seqs();
+        for _ in 0..257 {
+            rig.write(limits(rig), Actor::Operator);
+        }
+        let client = rig.client();
+        let call = unsigned_key_row_at_head(rig);
+        let want = call.seqs.unwrap();
+        assert_eq!(want.state_seq, before.state_seq + 257);
+        rig.obj.sync_attempts.borrow_mut().clear();
+        let now = rig.clock.now();
+
+        let (result, pages) = block_on(client.call(call.clone()));
+        assert!(
+            matches!(
+                result,
+                Err(BridgeError::Invalid(
+                    "unit sync: the unit is far behind; brought up part of the way"
+                ))
+            ),
+            "{result:?}"
+        );
+        assert!(pages.is_empty(), "{pages:?}");
+        let partial = rig.unit_seqs();
+        assert_eq!(partial.state_seq, before.state_seq + 256);
+        let steps = rig.obj.sync_attempts.borrow();
+        assert_eq!(steps.len(), 8);
+        for (i, step) in steps.iter().enumerate() {
+            let base = before.state_seq + i as u64 * MAX_SYNC_RECORDS;
+            assert_eq!(
+                (step.from_seq, step.to_seq),
+                (base, base + MAX_SYNC_RECORDS)
+            );
+            assert!(
+                matches!(step.answer, UnitAnswer::Ok { .. }),
+                "{:?}",
+                step.answer
+            );
+        }
+        drop(steps);
+
+        let (answer, pages) = called(&client, call);
+        assert_eq!(rig.clock.now(), now);
+        assert!(pages.is_empty(), "{pages:?}");
+        assert_eq!(answer.synced, Some(Synced::Synced { seqs: want }));
+        assert!(matches!(answer.reply.answer, UnitAnswer::Ok { seqs, .. } if seqs == want));
+        assert_eq!(rig.unit_seqs(), want);
+        let steps = rig.obj.sync_attempts.borrow();
+        assert_eq!(steps.len(), 9);
+        assert_eq!(
+            (steps[8].from_seq, steps[8].to_seq),
+            (partial.state_seq, want.state_seq)
+        );
+    });
+}
+
+/// A slow failed request sync starts the unsigned backoff when its chain read returns.
+#[test]
+fn request_sync_backoff_starts_when_the_failure_returns() {
+    with_fresh(|rig| {
+        let before = rig.unit_seqs();
+        rig.write(limits(rig), Actor::Operator);
+        let client = rig.client();
+        let call = unsigned_key_row_at_head(rig);
+        let want = call.seqs.unwrap();
+        rig.head_reads.borrow_mut().clear();
+        let (release, held) = oneshot::channel();
+        *rig.head_read_gate.borrow_mut() = Some(held);
+        let started = rig.clock.now();
+
+        let ((result, pages), ()) = block_on(async {
+            tokio::join!(biased;
+                client.call(call.clone()),
+                async {
+                    assert!(rig.head_read_gate.borrow().is_none());
+                    assert_eq!(*rig.head_reads.borrow(), [before.state_seq]);
+                    rig.clock.advance_secs(61);
+                    rig.records.fail_lists(true);
+                    release.send(()).unwrap();
+                },
+            )
+        });
+        assert!(
+            matches!(&result, Err(BridgeError::Blob(msg)) if msg == "mem: list refused"),
+            "{result:?}"
+        );
+        assert!(pages.is_empty(), "{pages:?}");
+        assert_eq!(rig.clock.now(), UnixMs(started.0 + 61_000));
+        rig.records.fail_lists(false);
+
+        rig.clock.advance_secs(1);
+        let (answer, pages) = called(&client, call.clone());
+        assert_eq!(answer.reply.answer, UnitAnswer::SyncNeeded { seqs: before });
+        assert_eq!(answer.synced, None);
+        assert!(pages.is_empty(), "{pages:?}");
+        assert_eq!(*rig.head_reads.borrow(), [before.state_seq]);
+        assert_eq!(rig.unit_seqs(), before);
+
+        rig.clock.advance_secs(59);
+        let (answer, pages) = called(&client, call);
+        assert_eq!(answer.synced, Some(Synced::Synced { seqs: want }));
+        assert!(matches!(answer.reply.answer, UnitAnswer::Ok { seqs, .. } if seqs == want));
+        assert!(pages.is_empty(), "{pages:?}");
+        assert_eq!(
+            *rig.head_reads.borrow(),
+            [before.state_seq, before.state_seq]
+        );
+    });
+}
+
 /// A persistent placement mismatch permits one unsigned sync per backoff,
 /// with one page for its two wire attempts. Signed requests retry after 1 s.
 #[test]
@@ -2595,6 +2786,67 @@ fn fake_sleep_with_first_tick(tick: impl FnOnce() + 'static) -> (InFlight, Rc<Re
         }
     });
     (InFlight::with_sleep(sleep), seen)
+}
+
+/// Two requests needing a sync share one chain read; the waiting request is served on retry.
+#[test]
+fn a_request_waits_for_the_shared_sync_and_retries_once() {
+    with_fresh(|rig| {
+        let before = rig.unit_seqs();
+        rig.write(limits(rig), Actor::Operator);
+        let call = unsigned_key_row_at_head(rig);
+        let want = call.seqs.unwrap();
+        let (flights, slept) = fake_sleep();
+        let leader = UnitClient {
+            flights: flights.clone(),
+            ..rig.client()
+        };
+        let waiter = UnitClient {
+            flights,
+            ..rig.client()
+        };
+        rig.obj.log.borrow_mut().clear();
+        rig.obj.sync_attempts.borrow_mut().clear();
+        rig.head_reads.borrow_mut().clear();
+        let (release, held) = oneshot::channel();
+        *rig.head_read_gate.borrow_mut() = Some(held);
+
+        let ((lead, lead_pages), (follow, follow_pages), ()) = block_on(async {
+            tokio::join!(biased;
+                leader.call(call.clone()),
+                waiter.call(call),
+                async {
+                    assert!(rig.head_read_gate.borrow().is_none());
+                    assert_eq!(*rig.head_reads.borrow(), [before.state_seq]);
+                    assert_eq!(rig.calls(), ["key_row", "key_row"]);
+                    assert_eq!(*slept.borrow(), [RENEW_POLL_MS]);
+                    assert_eq!(rig.unit_seqs(), before);
+                    release.send(()).unwrap();
+                },
+            )
+        });
+        assert!(lead_pages.is_empty(), "{lead_pages:?}");
+        assert!(follow_pages.is_empty(), "{follow_pages:?}");
+        let lead = lead.unwrap();
+        let follow = follow.unwrap();
+        assert_eq!(lead.synced, Some(Synced::Synced { seqs: want }));
+        assert!(matches!(lead.reply.answer, UnitAnswer::Ok { seqs, .. } if seqs == want));
+        assert_eq!(follow.reply.answer, lead.reply.answer);
+        assert_eq!(*slept.borrow(), [RENEW_POLL_MS]);
+        assert_eq!(*rig.head_reads.borrow(), [before.state_seq]);
+        assert_eq!(rig.obj.sync_attempts.borrow().len(), 1);
+        assert_eq!(
+            rig.calls(),
+            [
+                "key_row",
+                "key_row",
+                "held_keys",
+                "sync",
+                "key_row",
+                "key_row"
+            ]
+        );
+    });
 }
 
 /// Two expired requests share one renewal; the waiting one retries once.

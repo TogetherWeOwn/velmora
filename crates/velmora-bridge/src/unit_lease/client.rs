@@ -582,6 +582,7 @@ where
             if rounds > SYNC_ROUNDS {
                 return Err(ERR_SYNC_ROUNDS);
             }
+            let read_at = unit.state_seq;
             let door = match self.heads.head(tenant, unit.state_seq).await {
                 Ok(Some(door)) => door,
                 Ok(None) => return Ok(Synced::NotListed),
@@ -651,6 +652,12 @@ where
                 }
             }
             if behind || unit.keys_seq != batch.head {
+                continue;
+            }
+            // The unit moved on while the keys were applied (another
+            // sync): its state is past the head read here, so read the
+            // head again rather than send an older admission.
+            if unit.state_seq != read_at {
                 continue;
             }
             // AM-57: the bucket part, from the records after the unit's
@@ -897,10 +904,30 @@ where
                         true => SIGNED_RETRY_MS,
                         false => self.lease.term_ms,
                     };
-                    let Some(guard) =
-                        self.flights
-                            .attempt_sync(&self.name, self.clock.now(), max_gap)
-                    else {
+                    // A sync of this unit runs in this isolate: wait for it
+                    // (as for a renewal, at most RENEW_WAIT_MS on this
+                    // call's own timer) and run once more if it synced.
+                    // Either way it starts no sync of its own.
+                    let waited = match self.flights.running_sync(&self.name) {
+                        true => Some(
+                            self.flights
+                                .wait_sync(&self.name, RENEW_WAIT_MS, &self.clock)
+                                .await,
+                        ),
+                        false => None,
+                    };
+                    if let Some(w) = &waited {
+                        if w.as_ref().is_some_and(|w| w.renewed) {
+                            continue;
+                        }
+                    }
+                    let guard = match waited {
+                        Some(_) => None,
+                        None => self
+                            .flights
+                            .attempt_sync(&self.name, self.clock.now(), max_gap),
+                    };
+                    let Some(guard) = guard else {
                         // Held back: the call answers `sync_needed` (503).
                         let renew_due = self.renew_due(&reply);
                         return Ok(Answered {
@@ -912,7 +939,16 @@ where
                         });
                     };
                     let outcome = self.sync_into(seqs, pages).await;
-                    guard.done(matches!(outcome, Ok(Synced::Synced { .. })));
+                    // A unit far behind that was brought up part of the
+                    // way made progress: no backoff for that.
+                    let progressed = match &outcome {
+                        Ok(Synced::Synced { .. }) => true,
+                        Err(BridgeError::Invalid(t)) => {
+                            matches!(ERR_SYNC_FAR_BEHIND, BridgeError::Invalid(f) if f == *t)
+                        }
+                        _ => false,
+                    };
+                    guard.done_at(progressed, self.clock.now());
                     let outcome = outcome?;
                     let again = matches!(outcome, Synced::Synced { .. });
                     sync_outcome = Some(outcome);
@@ -960,7 +996,7 @@ where
             .flights
             .attempt(&self.name, self.clock.now(), max_gap_ms)?;
         let (renewal, pages) = self.renew(seen).await;
-        guard.ended(&renewal);
+        guard.ended_at(&renewal, self.clock.now());
         Some((renewal, pages))
     }
 
@@ -971,7 +1007,7 @@ where
     async fn renew_single(&self, seen: Seqs) -> Option<(Result<Renewal>, Vec<Page>)> {
         let guard = self.flights.begin(&self.name)?;
         let (renewal, pages) = self.renew(seen).await;
-        guard.ended(&renewal);
+        guard.ended_at(&renewal, self.clock.now());
         Some((renewal, pages))
     }
 
@@ -1683,12 +1719,21 @@ pub struct InFlightGuard {
     name: String,
     /// Spaced attempts record their outcome; `begin`'s do not.
     spaced: Option<UnixMs>,
+    /// When the attempt ended, if the caller said: a failure's backoff is
+    /// counted from it (a slow failure does not use its backoff up).
+    finished: Option<UnixMs>,
     ended: bool,
 }
 
 /// Units whose failed attempts are remembered, at most: an isolate serves
 /// far fewer; past it the oldest are forgotten.
 const MAX_REMEMBERED: usize = 4096;
+
+/// The key of a unit's request-path sync in [`InFlight`] (beside its
+/// renewal's, the unit's object name).
+fn sync_key(name: &UnitName) -> String {
+    format!("sync:{}", name.object_name())
+}
 
 /// The longest a call waits for its isolate's renewal of its unit (rule
 /// 12, AM-63; est).
@@ -1733,13 +1778,28 @@ impl InFlight {
     /// spent. `None`: none runs, the wait ran out, or this state has no
     /// timer (then nothing waits).
     pub async fn wait<C: Clock>(&self, name: &UnitName, max_ms: u64, clock: &C) -> Option<Waited> {
+        self.wait_key(&name.object_name(), max_ms, clock).await
+    }
+
+    /// Whether a request-path sync of `name` runs in this isolate now.
+    pub fn running_sync(&self, name: &UnitName) -> bool {
+        self.flights.borrow().running.contains_key(&sync_key(name))
+    }
+
+    /// [`Self::wait`] for the request-path sync of `name` that runs in
+    /// this isolate (`renewed`: it synced).
+    pub async fn wait_sync<C: Clock>(
+        &self,
+        name: &UnitName,
+        max_ms: u64,
+        clock: &C,
+    ) -> Option<Waited> {
+        self.wait_key(&sync_key(name), max_ms, clock).await
+    }
+
+    async fn wait_key<C: Clock>(&self, key: &str, max_ms: u64, clock: &C) -> Option<Waited> {
         let sleep = self.sleep.clone()?;
-        let notice = self
-            .flights
-            .borrow()
-            .running
-            .get(&name.object_name())
-            .cloned()?;
+        let notice = self.flights.borrow().running.get(key).cloned()?;
         let deadline = clock
             .now()
             .0
@@ -1773,11 +1833,7 @@ impl InFlight {
         now: UnixMs,
         max_gap_ms: i64,
     ) -> Option<InFlightGuard> {
-        self.start_key(
-            format!("sync:{}", name.object_name()),
-            Some(now),
-            max_gap_ms,
-        )
+        self.start_key(sync_key(name), Some(now), max_gap_ms)
     }
 
     fn start(
@@ -1812,6 +1868,7 @@ impl InFlight {
             notice,
             name: key,
             spaced,
+            finished: None,
             ended: false,
         })
     }
@@ -1824,6 +1881,18 @@ impl InFlightGuard {
             renewed: ok,
             renewal: None,
         });
+    }
+
+    /// [`Self::done`] at `now`, the time the attempt ended.
+    pub fn done_at(mut self, ok: bool, now: UnixMs) {
+        self.finished = Some(now);
+        self.done(ok);
+    }
+
+    /// [`Self::ended`] at `now`, the time the attempt ended.
+    pub fn ended_at(mut self, outcome: &Result<Renewal>, now: UnixMs) {
+        self.finished = Some(now);
+        self.ended(outcome);
     }
 
     /// The attempt ended with `outcome`: its waiters learn it.
@@ -1847,7 +1916,10 @@ impl InFlightGuard {
             if ok {
                 f.failed.remove(&self.name);
             }
-            if let Some(now) = self.spaced {
+            if let Some(start) = self.spaced {
+                let now = self
+                    .finished
+                    .map_or(start, |end| UnixMs(end.0.max(start.0)));
                 if !ok {
                     if f.failed.len() >= MAX_REMEMBERED && !f.failed.contains_key(&self.name) {
                         if let Some(oldest) = f

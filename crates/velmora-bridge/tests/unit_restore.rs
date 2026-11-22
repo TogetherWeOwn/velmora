@@ -207,6 +207,44 @@ fn the_close_time_is_the_syncs_that_set_the_entry() {
     assert_eq!(closed_at(&r), Some(BORN));
 }
 
+/// A stale restore entry cannot replace the current one even if the sync's base is current.
+#[test]
+fn sync_refuses_an_older_restore_entry_without_writing() {
+    let u = closed();
+    let before = u.head().unwrap();
+    assert_eq!(before.restoring_since, Some(S));
+    let total_changes = || u.sql().with_conn(|conn| conn.total_changes());
+    let writes = total_changes();
+
+    assert_eq!(
+        sync(&u, S + 1, Some(S - 1), BORN + 2000),
+        UnitAnswer::Refused {
+            reason: Refused::StaleSync,
+            alarm: false,
+        }
+    );
+    assert_eq!(u.head().unwrap(), before);
+    assert_eq!(total_changes(), writes);
+
+    assert!(matches!(
+        sync(&u, S + 1, Some(S), BORN + 3000),
+        UnitAnswer::Ok { .. }
+    ));
+    let same = u.head().unwrap();
+    assert_eq!(same.seqs.state_seq, S + 1);
+    assert_eq!(same.restoring_since, Some(S));
+    assert_eq!(same.closed_at, before.closed_at);
+
+    assert!(matches!(
+        sync(&u, S + 2, Some(S + 2), BORN + 4000),
+        UnitAnswer::Ok { .. }
+    ));
+    let newer = u.head().unwrap();
+    assert_eq!(newer.seqs.state_seq, S + 2);
+    assert_eq!(newer.restoring_since, Some(S + 2));
+    assert_eq!(newer.closed_at, Some(BORN + 4000));
+}
+
 #[test]
 fn restore_prepare_is_refused_until_the_unit_is_closed_long_enough() {
     let pitr = FakePitr::new("bm-now");

@@ -234,7 +234,10 @@ hand-out, and its writes are due from their own time.
   `sync` names the unit's `state_seq` its part was built from
   (`from_seq`); a unit at another seq refuses it `stale_sync` and the
   Worker reads again, so a part from another base (a second isolate's
-  `sync` first, or a restore in between) is never applied.
+  `sync` first, or a restore in between) is never applied. A `sync`
+  carrying an older `restoring` entry than the unit holds is refused the
+  same way, and the client reads the head again when the unit moved during
+  its key apply.
   `placements_off` reads the chain again and sends once more; the same
   refusal again pages. A `sync` that kept a bucket closing because it
   still holds something pages `drop_not_closed`. A head that clears the
@@ -251,7 +254,10 @@ hand-out, and its writes are due from their own time.
   backoff capped at 1 s. A `sync_needed` sync takes the same spacing under
   its own key (it reads up to 32 records, and an unsigned call can cause
   it), so a sync that keeps failing (`placements_off`, damage) is read
-  and paged at that pace. A call answered `renew_needed` that finds a
+  and paged at that pace; the backoff counts from the failure's end, and
+  a sync that brought a far-behind unit part of the way is no failure. A
+  call that meets a running sync of its unit waits for it as for a
+  renewal (at most 5 s) and runs once more if it synced. A call answered `renew_needed` that finds a
   renewal of its unit running in its isolate waits for it, at most 5 s
   (est), and runs once more if it renewed; otherwise it answers
   `renew_needed` (rule 12, AM-63). The waiting call looks every 50 ms

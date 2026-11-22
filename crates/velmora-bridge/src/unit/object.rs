@@ -1826,6 +1826,14 @@ impl<S: UnitSql> Unit<S> {
         if next.from_seq != head.seqs.state_seq {
             return Ok(refused(Refused::StaleSync, false));
         }
+        // An entry is replaced only by a newer one (its `since_seq` is the
+        // seq of the record that set it): an older one comes from a sync
+        // that read the head before another sync landed.
+        if let (Some(have), Some(want)) = (head.restoring_since, next.restoring_since) {
+            if want < have {
+                return Ok(refused(Refused::StaleSync, false));
+            }
+        }
         let mode_ok = (next.tenant_state == TenantState::Suspended) == next.tenant_mode.is_some();
         if !mode_ok {
             return Err(BridgeError::Invalid("sync: mode without suspension"));
