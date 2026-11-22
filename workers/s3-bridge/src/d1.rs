@@ -8,12 +8,15 @@
 //!   REAL, so an integer bound as a number would divide as a fraction and
 //!   be stored as a REAL wherever no INTEGER affinity converts it; the
 //!   text is cast to the exact `i64`, so every integer is stored as the
-//!   INTEGER a native binding gives, above 2^53 too.
-//! - `Int` <- JS number. D1 has no BigInt result, so only integers in
-//!   `±(2^53 - 1)` read back exactly: a returned number that is fractional
-//!   or outside that range is a decode error, never rounded. Every
-//!   catalogue integer (millisecond times, sizes, counters, fencing tokens)
-//!   is far inside it.
+//!   INTEGER a native binding gives ([`d1_bound`]).
+//! - Only integers in `±(2^53 - 1)` are bound; another is refused before
+//!   the call, as the Durable Object adapter refuses it. D1 has no BigInt
+//!   result, so a larger one could be stored but never read back: a row
+//!   holding one would fail every read of it.
+//! - `Int` <- JS number. A returned number that is fractional or outside
+//!   `±(2^53 - 1)` is a decode error, never rounded. Every catalogue
+//!   integer (millisecond times, sizes, counters, fencing tokens) is far
+//!   inside it.
 //! - `Text` <-> JS string.
 //! - `Blob` -> `ArrayBuffer` (D1's BLOB binding). A returned BLOB may be an
 //!   array of byte numbers, an `ArrayBuffer` or a `Uint8Array`.
@@ -74,8 +77,7 @@ impl D1Sql {
     }
 
     fn statement(&self, sql: &str, params: &[SqlValue]) -> Result<D1PreparedStatement> {
-        check_params(params.len())?;
-        let (sql, params) = cast_bound(sql, params)?;
+        let (sql, params) = d1_bound(sql, params)?;
         let values = params.iter().map(to_js).collect::<Result<Array>>()?;
         let bind_err = |_| BridgeError::Sql("d1: bind failed".into());
         self.db
@@ -212,6 +214,25 @@ fn number_to_byte(f: f64) -> Result<u8> {
     }
 }
 
+/// The statement and values D1 is given: at most [`MAX_SQL_PARAMS`]
+/// values, every integer inside `±(2^53 - 1)`, and then
+/// [`cast_bound`]: each integer placeholder `+CAST(?N AS INTEGER)`, each
+/// integer bound as its decimal text. The values hold no `Int`.
+fn d1_bound<'a>(
+    sql: &'a str,
+    params: &[SqlValue],
+) -> Result<(std::borrow::Cow<'a, str>, Vec<SqlValue>)> {
+    check_params(params.len())?;
+    for p in params {
+        if let SqlValue::Int(i) = p {
+            if !(-MAX_SAFE_INT..=MAX_SAFE_INT).contains(i) {
+                return Err(BridgeError::Sql("d1: integer outside JS safe range".into()));
+            }
+        }
+    }
+    cast_bound(sql, params)
+}
+
 fn to_js(v: &SqlValue) -> Result<JsValue> {
     Ok(match v {
         SqlValue::Null => JsValue::NULL,
@@ -292,6 +313,41 @@ fn classify(text: &str) -> BridgeError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn integers_are_bound_as_cast_text_inside_the_safe_range() {
+        let (sql, values) = d1_bound(
+            "SELECT a FROM t WHERE n = ?1 AND s = ?2 LIMIT ?3",
+            &[
+                SqlValue::Int(MAX_SAFE_INT),
+                SqlValue::Text("x".into()),
+                SqlValue::Int(-7),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            sql,
+            "SELECT a FROM t WHERE n = +CAST(?1 AS INTEGER) AND s = ?2 LIMIT +CAST(?3 AS INTEGER)"
+        );
+        assert_eq!(
+            values,
+            [
+                SqlValue::Text("9007199254740991".into()),
+                SqlValue::Text("x".into()),
+                SqlValue::Text("-7".into()),
+            ]
+        );
+        for unsafe_int in [MAX_SAFE_INT + 1, -MAX_SAFE_INT - 1, i64::MAX, i64::MIN] {
+            assert!(
+                d1_bound("SELECT ?1", &[SqlValue::Int(unsafe_int)]).is_err(),
+                "{unsafe_int}"
+            );
+        }
+        // No placeholder takes an integer: the statement is as it was.
+        let (sql, _) = d1_bound("SELECT ?1", &[SqlValue::Null]).unwrap();
+        assert_eq!(sql, "SELECT ?1");
+        assert!(d1_bound("SELECT 1", &vec![SqlValue::Null; MAX_SQL_PARAMS + 1]).is_err());
+    }
 
     #[test]
     fn param_guard_and_safe_integers() {

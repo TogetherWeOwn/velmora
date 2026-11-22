@@ -4,9 +4,10 @@
 //! the integer a native binding gives ([`bind_text`]).
 //!
 //! Two adapters use it. The Durable Object adapter (`velmora-unit-do`)
-//! binds the integer as a JS number, so it takes only `±(2^53 - 1)`.
-//! The D1 adapter of the Worker binds it as its decimal text
-//! ([`cast_bound`]), so every `i64` is stored exactly.
+//! binds the integer as a JS number; the D1 adapter of the Worker binds
+//! its decimal text ([`cast_bound`]), which the cast reads back as the
+//! same `i64` whatever its size. Both take only `±(2^53 - 1)`: a JS
+//! number cannot carry a larger integer back.
 
 use std::borrow::Cow;
 

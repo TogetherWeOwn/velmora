@@ -2,7 +2,9 @@
 //! `+CAST(?N AS INTEGER)` (`sql_bind::cast_bound`). Here each statement
 //! runs twice on the native database: once with the integers bound
 //! natively, once as the D1 adapter gives them. The answers must be the
-//! same, and an integer above 2^53 must be stored exactly.
+//! same. The text the adapter binds is exact for every `i64`, above 2^53
+//! too (the adapter itself binds only `±(2^53 - 1)`, because it cannot
+//! read a larger one back; `workers/s3-bridge/src/d1.rs`).
 //!
 //! Under `workers/unit-suite/run-suite.sh` every call here is also asked
 //! of a Durable Object and compared; no value read back here is outside

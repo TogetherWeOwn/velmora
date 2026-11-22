@@ -129,11 +129,10 @@ Durable Object's SQLite storage. What it does about the runtime, as measured:
   adapters write every integer placeholder as `+CAST(?N AS INTEGER)`
   (`velmora_bridge::sql_bind`): the integer a native binding gives, without
   the affinity a bare `CAST` adds. `DoSql` binds the integer as a JS number;
-  the D1 adapter binds its decimal text, so every `i64` is stored exactly.
-- An integer above 2^53 reads back rounded, silently: `DoSql` refuses
-  integers outside ±(2^53 - 1) both ways, and the D1 adapter refuses to
-  read one (a stored one is still exact in SQL: compare it there, or read
-  it as `CAST(… AS TEXT)`).
+  the D1 adapter binds its decimal text.
+- An integer above 2^53 reads back rounded, silently: both adapters refuse
+  integers outside ±(2^53 - 1) both ways, so such a value is never stored
+  and never taken.
 - `BEGIN` and `SAVEPOINT` are refused; `transactionSync` nests as a
   savepoint. Rows changed are the difference of `total_changes()` around a
   statement, which counts trigger rows as D1's `meta.changes` does.
