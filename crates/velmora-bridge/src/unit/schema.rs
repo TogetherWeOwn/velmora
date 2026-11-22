@@ -34,7 +34,10 @@ pub const CATALOGUE: &[&str] = &[
 ];
 
 /// The unit's own migrations, in order.
-pub const UNIT: &[&str] = &[include_str!("migrations/u0001_identity.sql")];
+pub const UNIT: &[&str] = &[
+    include_str!("migrations/u0001_identity.sql"),
+    include_str!("migrations/u0003_keys_import.sql"),
+];
 
 /// The schema a token must name: every migration a unit applies.
 pub const SCHEMA_VERSION: u32 = (CATALOGUE.len() + UNIT.len()) as u32;

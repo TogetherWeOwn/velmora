@@ -38,6 +38,8 @@ use super::call::{
     Closed, HoldMode, Reader, Refused, SyncHead, TenantState, UnitAnswer, UnitCall, UnitOp,
 };
 use super::identity::{self, CallKind, Seqs, Verdict};
+use super::import::{self, ImportBatch, ImportRefusal, ImportTable, Imported, MoveHead};
+use super::keys::{self, Applied, KeyEntry};
 use super::name::UnitName;
 use super::schema;
 use crate::ports::{Catalog, Sql, SqlValue};
@@ -307,8 +309,33 @@ impl<S: UnitSql> Unit<S> {
                 return Ok(refused(Refused::Identity(reason), alarm))
             }
         };
-        if let UnitOp::Sync { head: next } = &call.op {
-            return self.sync(&head, next);
+        // The Worker's own calls run whatever the unit's state: they copy
+        // verified records, or (the import) fill a closed unit.
+        match &call.op {
+            UnitOp::Sync { head: next } => return self.sync(&head, next),
+            UnitOp::ApplyKeys { from_seq, entries } => {
+                return self.apply_keys(&head, *from_seq, entries)
+            }
+            UnitOp::HeldKeys {} => {
+                return self.read_only(&head, &mut || {
+                    Ok(json!({ "held": keys::held(self.sql())? }))
+                })
+            }
+            UnitOp::Import {
+                head: mover,
+                since,
+                batch,
+            } => return self.import(call, &head, mover, *since, batch),
+            UnitOp::ImportProgress {} => {
+                return self.read_only(&head, &mut || {
+                    let tables: Vec<Value> = import::progress(self.sql())?
+                        .into_iter()
+                        .map(|(t, c, n)| json!({ "table": t, "cursor": c, "rows": n }))
+                        .collect();
+                    Ok(json!({ "tables": tables }))
+                })
+            }
+            _ => {}
         }
         if head.restoring_since.is_some() {
             return Ok(UnitAnswer::Closed {
@@ -491,7 +518,12 @@ impl<S: UnitSql> Unit<S> {
                     "state": state,
                 })))
             }
-            UnitOp::Provision { .. } | UnitOp::Sync { .. } => {
+            UnitOp::Provision { .. }
+            | UnitOp::Sync { .. }
+            | UnitOp::ApplyKeys { .. }
+            | UnitOp::HeldKeys {}
+            | UnitOp::Import { .. }
+            | UnitOp::ImportProgress {} => {
                 Err(BridgeError::Invalid("worker call routed as an operation"))
             }
         }
@@ -523,6 +555,140 @@ impl<S: UnitSql> Unit<S> {
                 Ok(self.cat.grant(access_key_id, bucket).await?.is_some())
             }
         }
+    }
+
+    /// A Worker call that only reads: run as an unauthenticated
+    /// transaction, so a write in it is refused and rolled back.
+    fn read_only(&self, head: &Head, f: &mut dyn FnMut() -> Result<Value>) -> Result<UnitAnswer> {
+        let mut op = || f().map(Ok);
+        Ok(match transact(self.sql(), false, &mut op)? {
+            Ok(body) => UnitAnswer::Ok {
+                seqs: head.seqs,
+                body,
+            },
+            Err(reason) => refused(reason, true),
+        })
+    }
+
+    /// The key-chain apply (AM-12): [`keys::apply`], then the unit's
+    /// `keys_seq`, in one transaction.
+    fn apply_keys(&self, head: &Head, from_seq: u64, entries: &[KeyEntry]) -> Result<UnitAnswer> {
+        let sql = self.sql();
+        let mut behind = false;
+        let mut now_seqs = head.seqs;
+        let mut op = || -> Result<std::result::Result<Value, Refused>> {
+            match keys::apply(sql, head.seqs.keys_seq, from_seq, entries)? {
+                Applied::Behind { .. } => {
+                    behind = true;
+                    Ok(Ok(Value::Null))
+                }
+                Applied::Refused(r) => Ok(Err(Refused::Keys(r))),
+                Applied::Done {
+                    keys_seq,
+                    applied,
+                    skipped,
+                } => {
+                    let n = poll_once(sql.exec(
+                        "UPDATE unit_head SET keys_seq = ?1 WHERE id = 1",
+                        &[int_param(keys_seq)?],
+                    ))??;
+                    if n != 1 {
+                        return Err(decode("unit_head"));
+                    }
+                    now_seqs = self.head()?.seqs;
+                    Ok(Ok(json!({
+                        "applied": applied,
+                        "skipped": skipped,
+                        "revoked": keys::revoked(sql)?,
+                    })))
+                }
+            }
+        };
+        let out = transact(sql, true, &mut op)?;
+        if behind {
+            return Ok(UnitAnswer::KeysBehind { seqs: head.seqs });
+        }
+        Ok(match out {
+            Ok(body) => UnitAnswer::Ok {
+                seqs: now_seqs,
+                body,
+            },
+            Err(reason) => refused(reason, false),
+        })
+    }
+
+    /// One import batch (DS1 §2.3): bound to the move, then
+    /// [`import::apply`] in one transaction.
+    fn import(
+        &self,
+        call: &UnitCall,
+        head: &Head,
+        mover: &MoveHead,
+        since: u64,
+        batch: &ImportBatch,
+    ) -> Result<UnitAnswer> {
+        // The caller's numbers, as a job's: equal, or refused.
+        match identity::check(&self.own, head.seqs, &call.name, CallKind::Job, call.seqs) {
+            Verdict::Proceed => {}
+            Verdict::SyncNeeded => return Ok(UnitAnswer::SyncNeeded { seqs: head.seqs }),
+            Verdict::Refused { reason, alarm } => {
+                return Ok(refused(Refused::Identity(reason), alarm))
+            }
+            Verdict::Stale | Verdict::FanoutCheck => {
+                return Ok(refused(
+                    Refused::Identity(identity::Refusal::StaleJob),
+                    false,
+                ))
+            }
+        }
+        if !import::bound_to_move(
+            &self.own.tenant,
+            self.own.unit,
+            head.restoring_since,
+            since,
+            mover,
+        ) {
+            return Ok(refused(Refused::Import(ImportRefusal::NotBound), true));
+        }
+        let sql = self.sql();
+        let mut op = || -> Result<std::result::Result<Value, Refused>> {
+            match import::apply(sql, since, mover, batch)? {
+                Imported::Refused(r) => Ok(Err(Refused::Import(r))),
+                Imported::Done {
+                    cursor,
+                    rows,
+                    applied,
+                } => {
+                    if applied && batch.table == ImportTable::Buckets {
+                        let ids: Vec<String> = batch
+                            .rows
+                            .iter()
+                            .filter_map(|r| match r.first() {
+                                Some(import::ImportValue::Text(id)) => Some(id.clone()),
+                                _ => None,
+                            })
+                            .collect();
+                        keys::project_buckets(sql, &ids)?;
+                    }
+                    Ok(Ok(json!({
+                        "table": batch.table.name(),
+                        "cursor": cursor,
+                        "rows": rows,
+                        "applied": applied,
+                    })))
+                }
+            }
+        };
+        Ok(match transact(sql, true, &mut op)? {
+            Ok(body) => UnitAnswer::Ok {
+                seqs: head.seqs,
+                body,
+            },
+            Err(reason) => {
+                let alarm = reason == Refused::Import(ImportRefusal::NotBound);
+                refused(reason, alarm)
+            }
+        })
     }
 
     /// `sync` (rule 5): copies a verified record. Numbers never go back.

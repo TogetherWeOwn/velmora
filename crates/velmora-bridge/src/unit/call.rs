@@ -12,6 +12,8 @@ use serde_json::Value;
 
 use super::birth::{BirthToken, ProvisionRefusal};
 use super::identity::{CallKind, Refusal, Seqs};
+use super::import::{ImportBatch, ImportRefusal, MoveHead};
+use super::keys::{KeyEntry, KeyRefusal};
 use super::name::UnitName;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -137,6 +139,28 @@ pub enum UnitOp {
     /// The key row of an access key: the first of the two calls of a cold
     /// isolate. Allowed without `authenticated`.
     KeyRow { access_key_id: String },
+    /// The key-chain apply (AM-12): the records after `from_seq`, one
+    /// entry per record, in chain order. A Worker call: the entries are
+    /// records the Worker verified. It runs while the unit is closed too
+    /// (a restore re-applies the chain at its gate).
+    ApplyKeys {
+        from_seq: u64,
+        entries: Vec<KeyEntry>,
+    },
+    /// The subjects the unit holds closed (`KeyTarget::closed`). A
+    /// Worker call.
+    HeldKeys {},
+    /// One batch of the owner move's import (DS1 §2.3). A Worker call
+    /// that also carries the caller's numbers, judged as a job's are.
+    /// `head`: tenant 0's verified head; `since`: the `since_seq` of the
+    /// unit's `restoring` entry the import fills.
+    Import {
+        head: MoveHead,
+        since: u64,
+        batch: ImportBatch,
+    },
+    /// Every table's import cursor and row count. A Worker call.
+    ImportProgress {},
     /// The read plan of a range of an object: the live generation (or
     /// the one named) and its extents in `[start, end)`. Allowed without
     /// `authenticated`, and then it writes nothing (no read stamp).
@@ -168,7 +192,15 @@ impl UnitOp {
     /// The Worker's own calls: their content is a verified record, never
     /// a caller's input.
     pub fn worker_call(&self) -> bool {
-        matches!(self, UnitOp::Provision { .. } | UnitOp::Sync { .. })
+        matches!(
+            self,
+            UnitOp::Provision { .. }
+                | UnitOp::Sync { .. }
+                | UnitOp::ApplyKeys { .. }
+                | UnitOp::HeldKeys {}
+                | UnitOp::Import { .. }
+                | UnitOp::ImportProgress {}
+        )
     }
 
     /// A read, for the tenant-state rule (`read_only` serves
@@ -218,6 +250,10 @@ pub enum Refused {
     AccessDenied,
     /// The call names no object or bucket the unit holds.
     NotFound,
+    /// The key-chain apply was refused (AM-12).
+    Keys(KeyRefusal),
+    /// An import batch was refused (DS1 §2.3).
+    Import(ImportRefusal),
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -233,6 +269,12 @@ pub enum UnitAnswer {
     },
     /// The caller is behind; nothing was done (rule 5).
     Stale {
+        seqs: Seqs,
+    },
+    /// A key-chain apply whose base is above the unit's `keys_seq`:
+    /// nothing was done; the caller reads again from `keys_seq + 1`
+    /// (AM-12).
+    KeysBehind {
         seqs: Seqs,
     },
     Refused {

@@ -9,6 +9,8 @@
 //! - [`birth`]: the birth certificate, on both sides (rules 6, 13).
 //! - [`call`]: the call and its answer, as JSON.
 //! - [`object`]: the unit itself (rules 1 to 7 and 11).
+//! - [`keys`]: the key-chain apply and the effective grant.
+//! - [`import`]: the owner move's import.
 //! - [`schema`]: what a unit is born with.
 //! - [`gate`]: the restore gate's lift decision.
 //!
@@ -18,6 +20,8 @@ pub mod birth;
 pub mod call;
 pub mod gate;
 pub mod identity;
+pub mod import;
+pub mod keys;
 pub mod name;
 pub mod object;
 pub mod schema;
