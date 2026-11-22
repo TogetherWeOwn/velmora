@@ -7,6 +7,7 @@ use std::cell::RefCell;
 use futures_util::stream;
 use serde_json::{json, Value};
 use velmora::rng::SystemRng;
+use velmora_bridge::config::Maintenance;
 use velmora_bridge::directory::gate::{anchored_epoch, close, is_open};
 use velmora_bridge::directory::record::Tenant;
 use velmora_bridge::directory::store::{ChainKind, PendingOp, SqlDirectory};
@@ -32,6 +33,7 @@ struct Ports {
     keys_a: MemRecords,
     keys_b: MemRecords,
     bind_keys_b: bool,
+    maintenance: Maintenance,
     kek: TestKek,
     clock: FixedClock,
     sql: Option<RusqliteSql>,
@@ -44,6 +46,7 @@ impl Ports {
             keys_a: MemRecords::new(),
             keys_b: MemRecords::new(),
             bind_keys_b: true,
+            maintenance: Maintenance::Off,
             kek: TestKek::new(),
             clock: FixedClock::new(NOW),
             sql: None,
@@ -77,7 +80,8 @@ impl Ports {
         let call = setup_call(&req.raw_target).expect("setup route");
         let cache = RootCache::new();
         let root = Root::new(self, &cache, SystemRng);
-        serve_setup(call, &req, &config(), self, &root, &mut SystemRng).await
+        let cfg = config(self.maintenance);
+        serve_setup(call, &req, &cfg, self, &root, &mut SystemRng).await
     }
 
     async fn post(&self, path: &str) -> S3Response {
@@ -137,8 +141,9 @@ impl RootPorts for Ports {
     }
 }
 
-fn config() -> BridgeConfig {
+fn config(maintenance: Maintenance) -> BridgeConfig {
     BridgeConfig {
+        maintenance,
         admin_token: Secret::new(ADMIN.to_string()),
         admin_read_token: Some(Secret::new(READ.to_string())),
         admin_host: Some(ADMIN_HOST.to_string()),
@@ -293,6 +298,22 @@ async fn method_query_and_body_refusals_write_nothing_on_either_route() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn restore_refuses_both_setup_routes_without_writing() {
+    let ports = Ports {
+        maintenance: Maintenance::Restore,
+        ..Ports::with_closed_directory()
+    };
+    let sql = ports.directory().unwrap();
+    let store_activity = || (ports.records.lists(), sql.read_stats(), sql.write_steps());
+    let before = store_activity();
+    for path in [KEY_PATH, GATE_PATH] {
+        expect_error(&ports.post(path).await, 503, "ServiceUnavailable");
+        ports.assert_writes(0, &[]);
+        assert_eq!(store_activity(), before);
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn zero_length_stream_is_accepted() {
     let ports = Ports::new();
     let body = Body::Stream {
@@ -390,6 +411,67 @@ async fn a_key_location_head_under_a_newer_kek_neither_alerts_nor_writes() {
         Some(locations)
     );
     ports.assert_writes(1, &[&locations_chain().name(1)]);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn matching_key_location_head_is_present_with_one_bucket_bound() {
+    let ports = Ports {
+        bind_keys_b: false,
+        ..Ports::new()
+    };
+    let locations = two_in_account();
+    assert!(
+        write_locations(&ports.records, &ports.kek, &locations, &mut SystemRng)
+            .await
+            .unwrap()
+    );
+
+    watch_alerts();
+    assert_eq!(
+        json_response(&ports.post(KEY_PATH).await, 200),
+        json!({"key_locations": "present"})
+    );
+    assert!(take_alerts().is_empty());
+    ports.assert_writes(1, &[&locations_chain().name(1)]);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn different_key_location_head_conflicts_and_alerts_with_one_bucket_bound() {
+    let ports = Ports {
+        bind_keys_b: false,
+        ..Ports::new()
+    };
+    let mut other = two_in_account();
+    other.locations[1].name = "KEYS_OTHER".to_string();
+    assert!(
+        write_locations(&ports.records, &ports.kek, &other, &mut SystemRng)
+            .await
+            .unwrap()
+    );
+
+    watch_alerts();
+    expect_error(&ports.post(KEY_PATH).await, 409, "locations_differ");
+    assert_eq!(take_alerts().len(), 1);
+    assert_eq!(
+        read_locations(&ports.records, &ports.kek, 0).await.unwrap(),
+        Some(other)
+    );
+    ports.assert_writes(1, &[&locations_chain().name(1)]);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_failed_key_location_head_lookup_takes_precedence_over_a_missing_binding() {
+    let ports = Ports {
+        bind_keys_b: false,
+        ..Ports::new()
+    };
+    ports.records.refuse_lists(true);
+
+    watch_alerts();
+    expect_error(&ports.post(KEY_PATH).await, 503, "SlowDown");
+    assert!(take_alerts().is_empty());
+    assert_eq!(ports.records.lists(), 1, "stop after the failed lookup");
+    ports.assert_writes(0, &[]);
 }
 
 #[tokio::test(flavor = "current_thread")]

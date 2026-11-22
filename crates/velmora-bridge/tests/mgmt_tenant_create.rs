@@ -24,7 +24,7 @@ use velmora_bridge::mgmt::adapters::RoutedUnit;
 use velmora_bridge::mgmt::serve::{serve_with, Answer, Either, MgmtRequest, NotBuilt};
 use velmora_bridge::mgmt::tenant_create::{
     born_name, call_key_hash, put_tref, read_born, read_tref, tref_name, CreatePorts,
-    TenantCreateHandler, LOCATION_HINT,
+    TenantCreateHandler, TenantStores, LOCATION_HINT,
 };
 use velmora_bridge::mgmt::token::{DisabledTokens, TokenHashes};
 use velmora_bridge::records::{MemRecords, RecordStore};
@@ -84,6 +84,7 @@ type Planted = Vec<(String, Vec<u8>)>;
 #[derive(Default)]
 struct Faults {
     puts: Cell<u64>,
+    reads: Cell<u64>,
     tref_reads: Cell<u64>,
     /// The put that fails: refused (nothing stored) or answer lost
     /// (stored, then an error).
@@ -137,6 +138,7 @@ impl RecordStore for Faulty {
         }
     }
     async fn get(&self, name: &str) -> Result<Option<Vec<u8>>> {
+        self.faults.reads.set(self.faults.reads.get() + 1);
         if let Some(prefix) = self.faults.fail_gets_under.borrow().as_deref() {
             if name.starts_with(prefix) {
                 return Err(BridgeError::Blob("fault: read failed".into()));
@@ -148,6 +150,7 @@ impl RecordStore for Faulty {
         self.inner.get(name).await
     }
     async fn list(&self, prefix: &str, start_after: &str, limit: u32) -> Result<Vec<String>> {
+        self.faults.reads.set(self.faults.reads.get() + 1);
         self.inner.list(prefix, start_after, limit).await
     }
 }
@@ -284,6 +287,39 @@ impl ControlIntents for Intents<'_> {
     }
 }
 
+#[derive(Clone, Copy, Default)]
+enum FinishOutcome {
+    #[default]
+    Ready,
+    Pending,
+    Failed,
+}
+
+struct Stores<'r, 'a> {
+    root: &'r Root<'a, Ports, TestRng>,
+    calls: &'r RefCell<Vec<(TenantId, Option<Lifecycle>)>>,
+    outcome: FinishOutcome,
+}
+
+impl TenantStores for Stores<'_, '_> {
+    async fn finish(&self, tenant: &TenantId) -> Result<bool> {
+        // Read the door now, not after the handler has returned.
+        let lifecycle = self
+            .root
+            .heads()
+            .head(&Tenant::Managed(tenant.clone()), 0)
+            .await
+            .expect("read the head at finish")
+            .map(|head| head.door.lifecycle);
+        self.calls.borrow_mut().push((tenant.clone(), lifecycle));
+        match self.outcome {
+            FinishOutcome::Ready => Ok(true),
+            FinishOutcome::Pending => Ok(false),
+            FinishOutcome::Failed => Err(BridgeError::Sql("fake: finish failed".into())),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Units: one real unit per name, made on its first call
 // ---------------------------------------------------------------------------
@@ -385,6 +421,9 @@ struct World {
     cache: RootCache,
     units: Units,
     intents: IntentLog,
+    finish_calls: RefCell<Vec<(TenantId, Option<Lifecycle>)>>,
+    finish_outcome: Cell<FinishOutcome>,
+    maintenance: Maintenance,
     rng_seed: Cell<u64>,
 }
 
@@ -417,6 +456,9 @@ impl World {
             cache: RootCache::new(),
             units: Units::default(),
             intents: IntentLog::default(),
+            finish_calls: RefCell::default(),
+            finish_outcome: Cell::default(),
+            maintenance: Maintenance::Off,
             rng_seed: Cell::new(100),
         }
     }
@@ -476,6 +518,11 @@ impl World {
             records: &self.ports.records,
             log: &self.intents,
         };
+        let stores = Stores {
+            root: &root,
+            calls: &self.finish_calls,
+            outcome: self.finish_outcome.get(),
+        };
         let seed = self.rng_seed.get();
         self.rng_seed.set(seed + 1_000);
         let handlers = Either(
@@ -485,6 +532,8 @@ impl World {
                     root: &root,
                     unit: &unit,
                     intents: &intents,
+                    stores: &stores,
+                    maintenance: self.maintenance,
                 },
                 rng: RefCell::new(Some(TestRng(seed))),
             },
@@ -629,6 +678,82 @@ fn sign_up_creates_a_live_tenant_and_a_retry_adopts_it() {
         let other = w.create(&json!({"external_ref": "ws_other"})).await;
         expect(&other, 201, "ok");
         assert_ne!(json_of(&other)["id"], t["id"]);
+    });
+}
+
+fn assert_store_failure_is_retryable(outcome: FinishOutcome) {
+    let w = World::new();
+    w.finish_outcome.set(outcome);
+    futures_executor_block_on(async {
+        expect(&w.create(&signup()).await, 503, "service_unavailable");
+        let tenant = assert_one_live_tenant(&w).await;
+        let puts = w.faults.puts.get();
+
+        // A live record alone is not enough for an adopting call, either.
+        expect(&w.create(&signup()).await, 503, "service_unavailable");
+        w.finish_outcome.set(FinishOutcome::Ready);
+        let adopted = w.create(&signup()).await;
+        expect(&adopted, 200, "ok");
+        assert_eq!(json_of(&adopted)["id"], tenant.as_str());
+        assert_eq!(w.faults.puts.get(), puts);
+        assert_eq!(w.units.provisions(), 1);
+    });
+}
+
+#[test]
+fn stores_not_yet_at_the_head_leave_a_live_tenant_for_retry() {
+    assert_store_failure_is_retryable(FinishOutcome::Pending);
+}
+
+#[test]
+fn a_store_finish_error_leaves_a_live_tenant_for_retry() {
+    assert_store_failure_is_retryable(FinishOutcome::Failed);
+}
+
+#[test]
+fn create_and_adopt_each_finish_once_with_a_live_head() {
+    let w = World::new();
+    futures_executor_block_on(async {
+        let created = w.create(&signup()).await;
+        expect(&created, 201, "ok");
+        let tenant = TenantId::parse(json_of(&created)["id"].as_str().unwrap()).unwrap();
+        let finished = (tenant, Some(Lifecycle::Live));
+        assert_eq!(
+            w.finish_calls.borrow().as_slice(),
+            std::slice::from_ref(&finished)
+        );
+
+        let adopted = w.create(&signup()).await;
+        expect(&adopted, 200, "ok");
+        assert_eq!(json_of(&adopted), json_of(&created));
+        assert_eq!(*w.finish_calls.borrow(), [finished.clone(), finished]);
+    });
+}
+
+#[test]
+fn restore_refuses_create_before_store_access_but_after_body_checks() {
+    // This fixture would normally let create go all the way to Live.
+    let w = World {
+        maintenance: Maintenance::Restore,
+        ..World::new()
+    };
+    futures_executor_block_on(async {
+        let sql = w.ports.directory().unwrap();
+        let store_activity = || (w.faults.reads.get(), sql.read_stats(), sql.write_steps());
+        let before = store_activity();
+        for (body, status, code) in [
+            (signup(), 503, "service_unavailable"),
+            (
+                json!({"external_ref": WS, "rate_class": "free"}),
+                400,
+                "rate_class_not_served",
+            ),
+        ] {
+            expect(&w.create(&body).await, status, code);
+            assert_create_did_not_start(&w);
+            assert_eq!(store_activity(), before);
+            assert!(w.finish_calls.borrow().is_empty());
+        }
     });
 }
 
