@@ -150,9 +150,13 @@ at use, and at its reservation (`grant_limits_not_served`, below).
 A row's `owner_ref` is written once (AM-72). An entry with none keeps
 the stored value, a stored null takes the entry's, and an entry with
 another non-null value keeps the stored value, applies every other
-field, and marks the row (`unit_owner_ref_conflicts`, with the value it
-brought): the apply's answer names the subject in `owner_ref_conflict`,
-and the Worker raises that alarm. While the mark is set, every acting
+field, and marks the row (`unit_owner_ref_conflicts`, one mark per
+disputed value; a revocation applied below the row's seq follows the
+same rule): the apply's answer names the subject in
+`owner_ref_conflict`, and the Worker raises that alarm. The marked
+principal's other open reservations that are not bound to a creator
+grant are cancelled, with their cap slots, as for a record that closes
+it. While the mark is set, every acting
 lookup of that principal (a reservation, `resolve_acting`, a presigned
 URL), by its id, by the stored value or by the disputed one, answers
 `owner_ref_ambiguous` and fails closed, as two principals for one
@@ -313,8 +317,9 @@ one `sync` together (`buckets::MAX_PLACED`), and at most 10,000 changes
 (est; `reserve::MAX_BUCKETS`). A swept reservation still gets its row
 from its record, so the head can place more than the cap counted: the
 shape bound is twice the cap, a placement list over 10,000 is served and
-the `sync` answer pages `buckets_over_cap` (`buckets::over_cap`), and
-only a list over 20,000 is `malformed`.
+the `sync` answer pages `buckets_over_cap` (`buckets::over_cap`; the
+`sync` arm that carries the bucket part, L2's, puts it in the answer),
+and only a list over 20,000 is `malformed`.
 
 "Holds nothing" is the catalogue's rule for a bucket delete: no
 generation, object, key floor, upload or extent names the bucket. That

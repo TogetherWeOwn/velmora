@@ -507,24 +507,22 @@ pub fn apply<S: Sql>(
         let was_revoked = row
             .as_ref()
             .is_some_and(|r| r.status == SubjectStatus::Revoked);
+        let stored_ref = row.as_ref().and_then(|r| r.owner_ref.as_deref());
         if write {
-            let stored_ref = row.as_ref().and_then(|r| r.owner_ref.as_deref());
-            let owner_ref = match write_once(stored_ref, e.owner_ref.as_deref()) {
-                OwnerRef::Keep(v) => v,
-                OwnerRef::Conflict(kept) => {
-                    mark_conflict(sql, e, now)?;
-                    conflicts.push(e.id.clone());
-                    Some(kept)
-                }
-            };
+            let owner_ref = owner_ref_of(sql, e, stored_ref, now, &mut conflicts)?;
             put(sql, e, owner_ref, was_revoked)?;
             applied += 1;
             touched.insert(e.id.clone());
         } else if e.status == SubjectStatus::Revoked && !was_revoked {
-            // A revocation is applied whatever its seq.
+            // A revocation is applied whatever its seq, with the
+            // write-once rule for `owner_ref` (AM-72).
+            let owner_ref = owner_ref_of(sql, e, stored_ref, now, &mut conflicts)?;
             poll_once(sql.exec(
-                "UPDATE unit_keys SET status = 'revoked' WHERE id = ?1",
-                &[SqlValue::Text(e.id.clone())],
+                "UPDATE unit_keys SET status = 'revoked', owner_ref = ?2 WHERE id = ?1",
+                &[
+                    SqlValue::Text(e.id.clone()),
+                    owner_ref.map_or(SqlValue::Null, |o| SqlValue::Text(o.to_string())),
+                ],
             ))??;
             applied += 1;
             touched.insert(e.id.clone());
@@ -578,14 +576,39 @@ pub(crate) fn write_once<'a>(stored: Option<&'a str>, entry: Option<&'a str>) ->
     }
 }
 
-/// Marks the row of `e` as holding a disputed `owner_ref` (AM-72), once:
-/// the first disputed value is kept. Only an operator clears it.
+/// The `owner_ref` the row of `e` holds after this entry
+/// ([`write_once`]): on a conflict the row is marked and the subject
+/// noted for the answer.
+fn owner_ref_of<'a, S: Sql>(
+    sql: &S,
+    e: &'a KeyEntry,
+    stored: Option<&'a str>,
+    now: UnixMs,
+    conflicts: &mut Vec<String>,
+) -> Result<Option<&'a str>> {
+    Ok(match write_once(stored, e.owner_ref.as_deref()) {
+        OwnerRef::Keep(v) => v,
+        OwnerRef::Conflict(kept) => {
+            mark_conflict(sql, e, now)?;
+            conflicts.push(e.id.clone());
+            Some(kept)
+        }
+    })
+}
+
+/// Marks the row of `e` as holding a disputed `owner_ref` (AM-72): one
+/// mark per disputed value, so each resolves to no principal. Only an
+/// operator clears them. The marked principal can no longer act, so its
+/// other open reservations that are not bound to a creator grant are
+/// cancelled and their cap slots given back, as for a record that closes
+/// it (§2.5); the reservation of this entry's own record is kept.
 fn mark_conflict<S: Sql>(sql: &S, e: &KeyEntry, now: UnixMs) -> Result<()> {
     let Some(disputed) = &e.owner_ref else {
         return Err(BridgeError::Invalid(
             "unit: owner_ref conflict without a value",
         ));
     };
+    reserve::cancel_open(sql, &e.id, e.rid.as_ref())?;
     poll_once(sql.exec(
         "INSERT OR IGNORE INTO unit_owner_ref_conflicts(id, disputed, marked_at, seq) \
          VALUES (?1, ?2, ?3, ?4)",
