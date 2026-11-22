@@ -72,6 +72,9 @@ impl FillRandom for TestRng {
 // The root's ports
 // ---------------------------------------------------------------------------
 
+/// Records planted by another writer: (name, bytes).
+type Planted = Vec<(String, Vec<u8>)>;
+
 /// Puts counted across every store of a world, for a fault at the k-th.
 #[derive(Default)]
 struct Faults {
@@ -81,7 +84,7 @@ struct Faults {
     at: Cell<Option<(u64, bool)>>,
     /// Once a put under this prefix lands, these records land too (another
     /// writer between this put and the call's next read).
-    plant_after: RefCell<Option<(String, Vec<(String, Vec<u8>)>)>>,
+    plant_after: RefCell<Option<(String, Planted)>>,
 }
 
 /// An in-memory store that fails the world's k-th put.
