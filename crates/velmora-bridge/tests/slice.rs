@@ -994,11 +994,11 @@ impl Rig {
                 continue;
             }
             let outcomes = match in_turn {
-                false => join_all(due.iter().map(|(_, job)| b.run_job(job))).await,
+                false => join_all(due.iter().map(|(_, job)| b.run_job(&TENANT_ZERO, job))).await,
                 true => {
                     let mut outcomes = Vec::new();
                     for (_, job) in &due {
-                        outcomes.push(b.run_job(job).await);
+                        outcomes.push(b.run_job(&TENANT_ZERO, job).await);
                     }
                     outcomes
                 }
@@ -1758,7 +1758,7 @@ async fn copy_outlives_its_source() {
         s,
         "garbage-collection job",
         JobOutcome::Ack,
-        rig.bridge.run_job(&gc).await,
+        rig.bridge.run_job(&TENANT_ZERO, &gc).await,
     );
 
     // Only Usenet holds the bytes now.
@@ -1823,7 +1823,7 @@ async fn copy_outlives_its_source() {
         s,
         "garbage-collection job",
         JobOutcome::Ack,
-        rig.bridge.run_job(&gc).await,
+        rig.bridge.run_job(&TENANT_ZERO, &gc).await,
     );
     expect_eq(
         s,
@@ -1888,7 +1888,7 @@ async fn permits_never_exceed_max_conns() {
     expect(s, "post jobs are queued", queued.len() >= 4, queued.len());
     // All posts and the cold read at once; the clock stands still so no
     // lease or permit expires mid-flight.
-    let posts = join_all(queued.iter().map(|j| rig.bridge.run_job(j)));
+    let posts = join_all(queued.iter().map(|j| rig.bridge.run_job(&TENANT_ZERO, j)));
     let (_, r) = join(posts, rig.get("/slice/p/cold.bin")).await;
     expect_status(s, "cold GET p/cold.bin under load", 200, &r);
     expect_bytes(s, "cold GET p/cold.bin body", &cold, &r.body);
@@ -2033,7 +2033,7 @@ async fn rebuild_from_usenet(packed_plans: &str) {
         .await
         .unwrap_or_else(|e| fail(s, "Catalog::hot_drain_set", "Ok", e));
     rig.bridge
-        .evict_batch(all)
+        .evict_batch(&TENANT_ZERO, all)
         .await
         .unwrap_or_else(|e| fail(s, "Bridge::evict_batch", "Ok", e));
     let pinned = extents
@@ -2575,7 +2575,7 @@ impl Rig {
             fail(step, "Bridge::dispatch (cron tick)", "Ok", e);
         }
         for sent in b.jobs.take() {
-            b.run_job(&sent.job).await;
+            b.run_job(&TENANT_ZERO, &sent.job).await;
         }
     }
 }
@@ -2824,7 +2824,7 @@ async fn a_backfill_packs_posted_plans_and_they_read_from_usenet() {
         .await
         .unwrap_or_else(|e| fail(s, "Catalog::hot_drain_set", "Ok", e));
     rig.bridge
-        .evict_batch(all)
+        .evict_batch(&TENANT_ZERO, all)
         .await
         .unwrap_or_else(|e| fail(s, "Bridge::evict_batch", "Ok", e));
     for key in rig.bridge.cache.keys() {
@@ -2955,7 +2955,7 @@ async fn a_packed_plan_is_repaired_by_a_repost() {
     // The post job alone.
     let sent = rig.bridge.jobs.take();
     expect_eq(s, "jobs after the upload", 1, sent.len());
-    let outcome = rig.bridge.run_job(&sent[0].job).await;
+    let outcome = rig.bridge.run_job(&TENANT_ZERO, &sent[0].job).await;
     expect(
         s,
         "the post job is done",
@@ -3081,7 +3081,7 @@ async fn a_packed_plan_posted_but_not_recorded_is_not_posted_twice() {
         )
         .expect("create trigger");
     });
-    let outcome = rig.bridge.run_job(job).await;
+    let outcome = rig.bridge.run_job(&TENANT_ZERO, job).await;
     expect(
         s,
         "the post job did not finish",
@@ -3121,7 +3121,11 @@ async fn a_packed_plan_posted_but_not_recorded_is_not_posted_twice() {
     });
     rig.server.set_posting_allowed(false).await;
     rig.bridge.clock.advance_secs(3600);
-    let outcomes = join_all([rig.bridge.run_job(job), rig.bridge.run_job(job)]).await;
+    let outcomes = join_all([
+        rig.bridge.run_job(&TENANT_ZERO, job),
+        rig.bridge.run_job(&TENANT_ZERO, job),
+    ])
+    .await;
     expect(
         s,
         "the job is done, and its second delivery has nothing to do",
@@ -3144,7 +3148,7 @@ async fn a_packed_plan_posted_but_not_recorded_is_not_posted_twice() {
     let posted_at = rig.sql_count("SELECT posted_at FROM extents WHERE plan IS NOT NULL");
     // Delivered once more, long after: the stamp stands.
     rig.bridge.clock.advance_secs(600);
-    let outcome = rig.bridge.run_job(job).await;
+    let outcome = rig.bridge.run_job(&TENANT_ZERO, job).await;
     expect(
         s,
         "a late delivery",
@@ -3210,7 +3214,7 @@ async fn a_plan_with_parity_is_posted_and_recorded_as_a_whole() {
     let planned = "SELECT COUNT(*) FROM extents WHERE parity IS NOT NULL";
     expect_eq(s, "addenda before the job", 0, rig.sql_count(planned));
     rig.server.set_posting_allowed(false).await;
-    let outcome = rig.bridge.run_job(job).await;
+    let outcome = rig.bridge.run_job(&TENANT_ZERO, job).await;
     expect(
         s,
         "the post job did not finish",
@@ -3258,7 +3262,7 @@ async fn a_plan_with_parity_is_posted_and_recorded_as_a_whole() {
         )
         .expect("create trigger");
     });
-    let outcome = rig.bridge.run_job(job).await;
+    let outcome = rig.bridge.run_job(&TENANT_ZERO, job).await;
     expect(
         s,
         "the post job did not finish",
@@ -3345,7 +3349,7 @@ async fn a_plan_with_parity_is_posted_and_recorded_as_a_whole() {
     });
     rig.server.set_posting_allowed(false).await;
     rig.bridge.clock.advance_secs(3600);
-    let outcome = rig.bridge.run_job(job).await;
+    let outcome = rig.bridge.run_job(&TENANT_ZERO, job).await;
     expect(
         s,
         "the job is done",
@@ -3709,3 +3713,6 @@ fn signer_matches_the_published_aws_example() {
     );
     assert_eq!(req.target, "/b/k?uploads");
 }
+
+/// The one tenant there is.
+static TENANT_ZERO: velmora_bridge::TenantScope = velmora_bridge::TenantScope::tenant_zero();

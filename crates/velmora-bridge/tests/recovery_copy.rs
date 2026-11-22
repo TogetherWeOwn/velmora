@@ -4972,7 +4972,7 @@ fn assert_segments_then_head(w: &World, key: &str, sealed: &Sealed) {
 /// The next pass sends nothing.
 #[tokio::test(flavor = "current_thread")]
 async fn a_segmented_record_is_sent_after_its_plans_and_its_segments() {
-    for layout in Layout::all() {
+    for layout in Layout::all(&TENANT_ZERO) {
         let w = World::new();
         let key = generation_in(&layout, 600_000, "_a");
         let sealed = w.segmented(&key, 10, 4, true).await;
@@ -5027,7 +5027,7 @@ async fn a_segmented_record_is_held_back_for_an_article_plan() {
 /// look at its plans, in both layouts.
 #[tokio::test(flavor = "current_thread")]
 async fn the_walk_sends_a_segmented_record_after_its_segments() {
-    for layout in Layout::all() {
+    for layout in Layout::all(&TENANT_ZERO) {
         let w = World::new();
         let key = generation_in(&layout, OLD, "_a");
         let sealed = w.segmented(&key, 10, 4, false).await;
@@ -5044,7 +5044,7 @@ async fn the_walk_sends_a_segmented_record_after_its_segments() {
 /// record goes over.
 #[tokio::test(flavor = "current_thread")]
 async fn a_head_is_not_sent_when_a_segment_is_missing_or_wrong() {
-    for layout in Layout::all() {
+    for layout in Layout::all(&TENANT_ZERO) {
         for age in [600_000, OLD] {
             for (what, at) in [
                 ("missing", 0),
@@ -5396,7 +5396,7 @@ async fn a_pass_over_six_segmented_records_holds_a_few_segments_at_once() {
     const SEGMENTS: usize = 32;
     const FULL: usize = 4096;
     const BUDGET: isize = 48 << 20;
-    for layout in Layout::all() {
+    for layout in Layout::all(&TENANT_ZERO) {
         // Every segment is over there already, and every segment is
         // to send.
         for there in [true, false] {
@@ -5441,3 +5441,6 @@ async fn a_pass_over_six_segmented_records_holds_a_few_segments_at_once() {
         }
     }
 }
+
+/// The one tenant there is.
+static TENANT_ZERO: velmora_bridge::TenantScope = velmora_bridge::TenantScope::tenant_zero();

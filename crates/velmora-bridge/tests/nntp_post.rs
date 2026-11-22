@@ -305,7 +305,10 @@ async fn stale_lease_stops_before_any_post() {
     let job = rig.job(&s).await;
     let gets = rig.bridge.safety.gets();
 
-    assert_eq!(rig.bridge.post_stage(&stale, &job).await, JobOutcome::Ack);
+    assert_eq!(
+        rig.bridge.post_stage(&TENANT_ZERO, &stale, &job).await,
+        JobOutcome::Ack
+    );
     assert!(rig.plan(&s).await.is_empty());
     assert_eq!(rig.server().posted_count().await, 0);
     assert_eq!(rig.bridge.nntp.connects(), 0);
@@ -318,7 +321,10 @@ async fn stale_lease_stops_before_any_post() {
     assert_eq!(outbox.stage, OutboxStage::Post);
 
     // The current holder is unaffected.
-    assert_eq!(rig.bridge.post_stage(&current, &job).await, JobOutcome::Ack);
+    assert_eq!(
+        rig.bridge.post_stage(&TENANT_ZERO, &current, &job).await,
+        JobOutcome::Ack
+    );
     assert_eq!(rig.server().posted_count().await, 3);
 }
 
@@ -356,7 +362,10 @@ async fn lease_lost_mid_stage_stops_posting() {
     assert!(rig.bridge.jobs.sent().is_empty());
 
     let job = rig.job(&s).await;
-    assert_eq!(rig.bridge.post_stage(&thief, &job).await, JobOutcome::Ack);
+    assert_eq!(
+        rig.bridge.post_stage(&TENANT_ZERO, &thief, &job).await,
+        JobOutcome::Ack
+    );
     let done = rig.plan(&s).await;
     assert_eq!(ids(&done), ids(&plan));
     assert!(done.iter().all(|a| a.state == ArticleState::Posted));
@@ -612,4 +621,32 @@ async fn mismatched_safety_bytes_are_not_posted() {
     // corrupt posts nothing and ends it.
     assert_eq!(rig.bridge.nntp.connects(), 1);
     assert_eq!(rig.bridge.nntp.live(), 0);
+}
+
+/// The one tenant there is.
+static TENANT_ZERO: velmora_bridge::TenantScope = velmora_bridge::TenantScope::tenant_zero();
+
+/// The post stage writes the article-plan record in the record layout
+/// of its scope: flat when the layout is unset, tenant 0's directory
+/// under `RECORD_LAYOUT=tenant`, and never both.
+#[tokio::test]
+async fn the_plan_record_is_named_in_the_layout_of_the_scope() {
+    use velmora_bridge::recovery::Layout;
+    for tenant in [false, true] {
+        let mut rig = simple_rig().await;
+        if tenant {
+            rig.bridge.cfg.records = Layout::of(&TenantScope::tenant_zero());
+        }
+        let s = rig.seed(1, &marked_plaintext(PLAIN_LEN)).await;
+        assert_eq!(rig.run_post(&s).await, JobOutcome::Ack);
+        let flat = format!("m/art/{}", s.extent.as_str());
+        let scoped = format!("m/x/t_0000000000000000/art/{}", s.extent.as_str());
+        let (wanted, other) = if tenant {
+            (scoped, flat)
+        } else {
+            (flat, scoped)
+        };
+        assert!(rig.bridge.safety.contains(&wanted), "{wanted}");
+        assert!(!rig.bridge.safety.contains(&other), "{other}");
+    }
 }

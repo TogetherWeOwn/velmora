@@ -17,6 +17,9 @@ path = "src/lib.rs"
 # manifest is frozen with the contract).
 [dependencies]
 velmora-bridge = { version = "0.1.0", path = "../../crates/velmora-bridge" }
+# The unit's Durable Object class, exported below and bound by no
+# configuration yet (stage C(a)).
+velmora-unit-do = { version = "0.1.0", path = "../unit" }
 velmora = { version = "0.1.0", path = "../../crates/velmora", default-features = false, features = ["worker-transport", "worker-socks5-tls"] }
 worker = { version = "0.8", features = ["d1", "queue"] }
 serde = { version = "1", features = ["derive"] }

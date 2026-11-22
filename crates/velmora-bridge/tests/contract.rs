@@ -413,6 +413,38 @@ fn config_loads_from_documented_vars() {
     assert!(!cfg.providers[0].tls);
 }
 
+/// A unit's job configuration (round 3 L1-Q7): made from tenant 0's,
+/// with the unit's stamp id from its name and the tenant's own record
+/// layout, and nothing else changed. `CATALOGUE_ID` still refuses the
+/// unit form, so no deploy variable can name a unit's stamp prefix.
+#[test]
+fn a_units_job_config_takes_its_stamp_id_from_the_units_name() {
+    use velmora_bridge::recovery::Layout;
+    use velmora_bridge::unit::{jobcall, TenantId, UnitName};
+    let (prod, _) = wrangler_vars();
+    let vars = with_secrets(prod, PROVIDER_TLS);
+    let base = load(&vars).unwrap();
+    let name = UnitName::new(TenantId::parse("t_00000000000000a7").unwrap(), 3);
+    let unit = base.for_unit(&name).unwrap();
+    assert_eq!(unit.catalogue_id, "t_00000000000000a7.3");
+    assert_eq!(unit.catalogue_id, jobcall::stamp_id(&name));
+    assert_eq!(unit.records, Layout::tenant("t_00000000000000a7").unwrap());
+    assert_ne!(unit.records, Layout::flat());
+    assert_eq!(base.catalogue_id, "main");
+    let same = BridgeConfig {
+        catalogue_id: base.catalogue_id.clone(),
+        records: base.records.clone(),
+        ..unit.clone()
+    };
+    assert_eq!(format!("{same:?}"), format!("{base:?}"));
+    assert!(base.for_unit(&UnitName::new(TenantId::zero(), 0)).is_err());
+    for id in ["t_00000000000000a7.3", "main.0"] {
+        let mut v = vars.clone();
+        v.insert("CATALOGUE_ID".to_string(), id.to_string());
+        assert!(load(&v).is_err(), "{id}");
+    }
+}
+
 /// The recovery copy is no part of the service's configuration: off
 /// when unset or blank, and a copy that is refused does not stop the
 /// service.
@@ -476,7 +508,7 @@ fn record_layout_is_flat_unless_tenant_is_asked_for() {
     for tenant in ["tenant", " tenant "] {
         vars.insert("RECORD_LAYOUT".into(), tenant.into());
         let records = load(&vars).unwrap().records;
-        assert_eq!(records, Layout::default_tenant(), "{tenant:?}");
+        assert_eq!(records, Layout::of(&TENANT_ZERO), "{tenant:?}");
         assert_eq!(records.root(), "m/x/t_0000000000000000/");
     }
     for bad in ["on", "off", "TENANT", "Flat", "t_1", "m/x/", "tenant,flat"] {
@@ -1735,7 +1767,7 @@ async fn contract_compiles_against_fakes() {
         budget: ByteBudget::new(cfg.inflight_budget_bytes),
         cfg,
     });
-    let _ = bridge.run_job(&job).await;
+    let _ = bridge.run_job(&TENANT_ZERO, &job).await;
     let _ = bridge.dispatch().await;
     let resp = Rc::clone(&bridge)
         .handle(S3Request {
@@ -2973,3 +3005,6 @@ fn production_places_the_fetch_handler_in_us_east_1_and_dev_does_not() {
     assert_eq!(dev, ["env.dev.placement"], "dev states its own placement");
     assert_eq!(table_body("[env.dev.placement]"), ["mode=off"]);
 }
+
+/// The one tenant there is.
+static TENANT_ZERO: velmora_bridge::TenantScope = velmora_bridge::TenantScope::tenant_zero();

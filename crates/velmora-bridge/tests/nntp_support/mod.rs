@@ -1553,6 +1553,9 @@ impl Catalog for MemCatalog {
     ) -> Result<Option<(UploadRow, Vec<UploadPartRow>)>> {
         unused()
     }
+    async fn upload_state(&self, _: &UploadTarget<'_>) -> Result<Option<UploadState>> {
+        unused()
+    }
     async fn list_uploads(&self, _: &BucketId, _: &UploadListQuery) -> Result<Vec<OpenUpload>> {
         unused()
     }
@@ -2057,7 +2060,7 @@ impl Rig {
     pub async fn run_post(&self, s: &Seeded) -> JobOutcome {
         let lease = self.claim(s, OutboxStage::Post).await;
         let job = self.job(s).await;
-        self.bridge.post_stage(&lease, &job).await
+        self.bridge.post_stage(&TENANT_ZERO, &lease, &job).await
     }
 
     /// Claims the post stage and runs it; as soon as server `server`
@@ -2075,7 +2078,7 @@ impl Rig {
         // as it is: `then` does not run and nothing waits for ever.
         let done = Cell::new(false);
         let post = async {
-            let outcome = self.bridge.post_stage(&lease, &job).await;
+            let outcome = self.bridge.post_stage(&TENANT_ZERO, &lease, &job).await;
             done.set(true);
             outcome
         };
@@ -2103,8 +2106,8 @@ impl Rig {
         let lease = self.claim(s, stage).await;
         let job = self.job(s).await;
         match stage {
-            OutboxStage::Post => self.bridge.post_stage(&lease, &job).await,
-            OutboxStage::Verify => self.bridge.verify_stage(&lease, &job).await,
+            OutboxStage::Post => self.bridge.post_stage(&TENANT_ZERO, &lease, &job).await,
+            OutboxStage::Verify => self.bridge.verify_stage(&TENANT_ZERO, &lease, &job).await,
             OutboxStage::Release => self.bridge.release_stage(&lease, &job).await,
             other => panic!("no stage function for {other:?}"),
         }
@@ -2181,3 +2184,6 @@ fn slot_key(p: &Permit) -> String {
         _ => p.provider.clone(),
     }
 }
+
+/// The one tenant there is.
+static TENANT_ZERO: velmora_bridge::TenantScope = velmora_bridge::TenantScope::tenant_zero();

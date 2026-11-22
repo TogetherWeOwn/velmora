@@ -14,7 +14,7 @@ use velmora_bridge::unit::lift::{
 use velmora_bridge::unit::recount::{RecountCall, RecountRefusal};
 use velmora_bridge::unit::restore::{
     drive, Bookmark, PitrStep, PointInTimePort, RestoreRefusal, RestoreTarget, LEASE_TERM_MS,
-    RESTORE_MARGIN_MS,
+    LIFT_SLACK_MS, RESTORE_MARGIN_MS,
 };
 use velmora_bridge::unit::{
     poll_once, BirthKind, BirthToken, CallKind, Refused, Seqs, SyncHead, TenantId, TenantState,
@@ -99,14 +99,10 @@ fn provision(kind: BirthKind, seq: u64) -> Unit<RusqliteSql> {
         UnixMs(BORN),
     );
     assert!(matches!(a, UnitAnswer::Ok { .. }), "{a:?}");
-    // The lease's own table (L2's migration), here by hand: no row, so
-    // the unit never issued a lease.
-    u.sql().apply(LEASE_TABLE).unwrap();
+    // The lease's own table comes with the birth (`u0002`), with no
+    // lease: the unit never issued one.
     u
 }
-
-const LEASE_TABLE: &str =
-    "CREATE TABLE unit_lease (id INTEGER PRIMARY KEY, fresh_until INTEGER, lease_hi INTEGER)";
 
 /// A born, active unit, closed for a restore at `S` at time `BORN + 1000`.
 fn closed() -> Unit<RusqliteSql> {
@@ -268,7 +264,7 @@ fn a_live_lease_or_a_later_lease_holds_the_restore_back() {
     let t = ready_at(BORN + 1000);
     u.sql()
         .apply(&format!(
-            "INSERT INTO unit_lease(id, fresh_until, lease_hi) VALUES (1, {}, {})",
+            "UPDATE unit_lease SET fresh_until = {}, lease_hi = {} WHERE id = 1",
             t + 5,
             t + 5
         ))
@@ -352,7 +348,9 @@ fn a_restore_armed_without_the_restart_says_so() {
     let op = restore_op(
         BirthKind::Restore,
         S,
-        RestoreTarget::Time { at_ms: 1 },
+        RestoreTarget::Time {
+            at_ms: BORN + LIFT_SLACK_MS,
+        },
         "bm-undo",
     );
     let a = poll_once(drive(step(&u, op, ready_at(BORN + 1000)), &pitr)).unwrap();
@@ -369,7 +367,9 @@ fn restore_checks_its_token_and_that_nothing_moved_since_prepare() {
     let u = closed();
     let t = ready_at(BORN + 1000);
     let pitr = FakePitr::new("bm-undo");
-    let at = RestoreTarget::Time { at_ms: BORN + 500 };
+    let at = RestoreTarget::Time {
+        at_ms: BORN + LIFT_SLACK_MS + 500,
+    };
     assert_eq!(
         run(
             &u,
@@ -424,7 +424,7 @@ fn restore_checks_its_token_and_that_nothing_moved_since_prepare() {
     );
     assert_eq!(
         *pitr.restored.borrow(),
-        vec![format!("bm-at-{}", BORN + 500)]
+        vec![format!("bm-at-{}", BORN + LIFT_SLACK_MS + 500)]
     );
     // An undo goes back to the sealed undo bookmark, unsealed by the tool.
     let back = RestoreTarget::Bookmark {

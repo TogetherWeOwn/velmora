@@ -32,10 +32,12 @@ use velmora_bridge::unit::reserve::{
 };
 use velmora_bridge::unit::restore::{Bookmark, RestoreRefusal, RestoreTarget};
 use velmora_bridge::unit::size::SizeRefusal;
+use velmora_bridge::unit::UnitReply;
 use velmora_bridge::unit::{
     BirthKind, BirthToken, CallKind, ProvisionRefusal, Reader, Refused, Seqs, SyncHead, TenantId,
     TenantState, UnitAnswer, UnitCall, UnitName, UnitOp,
 };
+use velmora_bridge::unit_lease::lease::{LeaseRefusal, Proven};
 use velmora_bridge::{ExtentId, GenerationId, Lease, OutboxStage, UnixMs};
 
 const GOLDEN: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/golden/unit-wire.json");
@@ -75,6 +77,7 @@ fn op_kind(op: &UnitOp) -> &'static str {
     match op {
         UnitOp::Provision { .. } => "provision",
         UnitOp::Sync { .. } => "sync",
+        UnitOp::Renew { .. } => "renew",
         UnitOp::Ping {} => "ping",
         UnitOp::KeyRow { .. } => "key_row",
         UnitOp::ApplyKeys { .. } => "apply_keys",
@@ -109,6 +112,7 @@ fn answer_kind(a: &UnitAnswer) -> &'static str {
         UnitAnswer::Ok { .. } => "ok",
         UnitAnswer::SyncNeeded { .. } => "sync_needed",
         UnitAnswer::Stale { .. } => "stale",
+        UnitAnswer::RenewNeeded { .. } => "renew_needed",
         UnitAnswer::KeysBehind { .. } => "keys_behind",
         UnitAnswer::Refused { .. } => "refused",
         UnitAnswer::UndoBookmark { .. } => "undo_bookmark",
@@ -166,6 +170,16 @@ fn ops() -> Vec<UnitOp> {
                     .into(),
                 }),
             },
+        },
+        UnitOp::Renew {
+            proof_start: UnixMs(1_795_000_000_000),
+            proven: Proven {
+                state_seq: 7,
+                keys_seq: 3,
+                stamp_counter: Some(12),
+                revoked: 2,
+            },
+            revocations: vec!["AKGOLDEN000000000001".into(), "AKGOLDEN000000000002".into()],
         },
         UnitOp::Ping {},
         UnitOp::KeyRow {
@@ -477,7 +491,8 @@ fn nested() -> Value {
             AckMismatch, CountersOff, ProofMismatch, ListMismatch, Malformed, MoveNotBound,
             ImportNotSealed, MoveNotEmpty),
         "restore_refusal": every!(RestoreRefusal: NotRestoring, WrongToken, LeaseLive,
-            LeaseUnknown, TooSoon, Moved, Malformed, NoPointInTime, BeforeMoveLift),
+            LeaseUnknown, TooSoon, Moved, Malformed, NoPointInTime, BeforeMoveLift, MoveNotLifted,
+            BeforeBirth),
         "recount_refusal": every!(RecountRefusal: NotRestoring, ImportNotSealed, MoveNotBound),
         "reserve_refusal": every!(ReserveRefusal: CapReached, GrantNotHeld,
             GrantLimitsNotServed, TooManyGrants, ActingPrincipalUnknown,
@@ -486,6 +501,8 @@ fn nested() -> Value {
             Malformed),
         "size_refusal": every!(SizeRefusal: DatabaseFull, TooManyExtents),
         "reservation_bodies": reservation_bodies(),
+        "lease_refusal": every!(LeaseRefusal: Restoring, RolledBack, NoLeaseTable, ProofTooOld,
+            ProofAhead, NotProven, RevocationsUnapplied, BadList),
     })
 }
 
@@ -593,6 +610,14 @@ fn answers() -> Vec<UnitAnswer> {
         },
         UnitAnswer::SyncNeeded { seqs: seqs() },
         UnitAnswer::Stale { seqs: seqs() },
+        UnitAnswer::RenewNeeded {
+            seqs: seqs(),
+            why: None,
+        },
+        UnitAnswer::RenewNeeded {
+            seqs: seqs(),
+            why: Some(LeaseRefusal::ProofTooOld),
+        },
         UnitAnswer::KeysBehind { seqs: seqs() },
         UnitAnswer::UndoBookmark {
             seqs: seqs(),
@@ -612,6 +637,37 @@ fn answers() -> Vec<UnitAnswer> {
         alarm: false,
     }));
     out
+}
+
+/// The answer as it leaves the unit: the answer's object with the
+/// lease's time left and, for a unit that holds keys, `revoked`.
+fn replies() -> Vec<Value> {
+    let samples = [
+        UnitReply {
+            answer: UnitAnswer::Ok {
+                seqs: seqs(),
+                body: json!({ "fresh_until": 1_795_000_600_000_i64, "applied": 1 }),
+            },
+            lease_left_ms: 600_000,
+            revoked: Some(2),
+        },
+        UnitReply {
+            answer: UnitAnswer::RenewNeeded {
+                seqs: seqs(),
+                why: None,
+            },
+            lease_left_ms: 0,
+            revoked: None,
+        },
+    ];
+    samples
+        .into_iter()
+        .map(|r| {
+            let v = serde_json::to_value(&r).unwrap();
+            assert_eq!(serde_json::from_value::<UnitReply>(v.clone()).unwrap(), r);
+            v
+        })
+        .collect()
 }
 
 fn document() -> Value {
@@ -644,13 +700,13 @@ fn document() -> Value {
             v
         })
         .collect();
-    json!({ "calls": calls, "answers": answers, "nested": nested() })
+    json!({ "calls": calls, "answers": answers, "replies": replies(), "nested": nested() })
 }
 
 #[test]
 fn every_variant_has_a_sample() {
     let ops: std::collections::BTreeSet<_> = ops().iter().map(op_kind).collect();
-    assert_eq!(ops.len(), 27, "{ops:?}");
+    assert_eq!(ops.len(), 28, "{ops:?}");
     let readers: std::collections::BTreeSet<_> = ops_readers().into_iter().collect();
     assert_eq!(readers.len(), 2, "both readers have a sample");
     // The variants that carry data, each with a sample (exhaustive).
@@ -680,7 +736,7 @@ fn every_variant_has_a_sample() {
     assert_eq!(targets.len(), 2, "{targets:?}");
     assert_eq!(values.len(), 4, "{values:?}");
     let answers: std::collections::BTreeSet<_> = answers().iter().map(answer_kind).collect();
-    assert_eq!(answers.len(), 9, "{answers:?}");
+    assert_eq!(answers.len(), 10, "{answers:?}");
     let reasons: std::collections::BTreeSet<_> = refusals().iter().map(refused_kind).collect();
     assert_eq!(reasons.len(), 18, "{reasons:?}");
 }

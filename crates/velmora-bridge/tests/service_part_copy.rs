@@ -186,7 +186,9 @@ async fn parts_copied_by_range_read_back_and_outlive_the_source() {
     }
     rig.bridge.clock.advance_secs(7 * 86_400);
     assert_eq!(
-        rig.bridge.run_job(&Job::Gc { v: JOB_VERSION }).await,
+        rig.bridge
+            .run_job(&TENANT_ZERO, &Job::Gc { v: JOB_VERSION })
+            .await,
         JobOutcome::Ack
     );
     assert_eq!(get(&rig, &signer, "big").await.status, 404);
@@ -481,3 +483,6 @@ async fn a_full_size_extent_is_copied_within_the_byte_budget() {
     read.expect(200);
     assert!(read.body == [&body[..], &body[1..]].concat());
 }
+
+/// The one tenant there is.
+static TENANT_ZERO: velmora_bridge::TenantScope = velmora_bridge::TenantScope::tenant_zero();

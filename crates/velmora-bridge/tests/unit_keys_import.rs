@@ -14,6 +14,7 @@ use velmora_bridge::unit::{
     BirthKind, BirthToken, CallKind, Refused, Seqs, SyncHead, TenantId, TenantState, Unit,
     UnitAnswer, UnitCall, UnitName, UnitOp,
 };
+use velmora_bridge::unit_lease::lease::Proven;
 use velmora_bridge::{SqlValue, UnixMs};
 
 const NOW: UnixMs = UnixMs(1_795_000_000_000);
@@ -99,6 +100,21 @@ fn born() -> Unit<RusqliteSql> {
     );
     assert!(matches!(a, UnitAnswer::Ok { .. }), "{a:?}");
     assert!(matches!(sync(&u, 3, 0, None), UnitAnswer::Ok { .. }));
+    // A fresh lease (rule 12; `unit_lease_wiring.rs` holds its rules).
+    let a = worker(
+        &u,
+        UnitOp::Renew {
+            proof_start: NOW,
+            proven: Proven {
+                state_seq: 3,
+                keys_seq: 0,
+                stamp_counter: None,
+                revoked: 0,
+            },
+            revocations: Vec::new(),
+        },
+    );
+    assert!(matches!(a, UnitAnswer::Ok { .. }), "renew: {a:?}");
     u.sql()
         .apply(&format!(
             "INSERT INTO buckets(id, name, owner, bdk_wrapped, kek_version, created_at) \
@@ -954,10 +970,18 @@ fn batches_apply_once_and_in_order_and_the_import_resumes_by_cursor() {
         Some((Refused::Import(ImportRefusal::OutOfOrder), false))
     );
     assert_eq!(imported(&u, "buckets"), 4);
-    let progress = ok_body(worker(&u, UnitOp::ImportProgress {}));
+    let mut progress = ok_body(worker(&u, UnitOp::ImportProgress {}));
+    assert!(progress["schema_tables"].is_array());
+    progress.as_object_mut().unwrap().remove("schema_tables");
     assert_eq!(
         progress,
-        json!({ "tables": [{ "table": "buckets", "cursor": "b2", "rows": 3 }], "sealed": null })
+        json!({
+            "tables": [{ "table": "buckets", "cursor": "b2", "rows": 3 }],
+            "sealed": null,
+            "t0_seq": 10,
+            "since_seq": SINCE,
+            "move_lifted": false,
+        })
     );
 }
 

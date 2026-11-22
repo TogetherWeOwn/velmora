@@ -10,7 +10,8 @@
 //! | a name that is not the object's own | refuse and alarm |
 //! | either number above the unit's | `sync_needed`: the Worker verifies the records up to the head and calls `sync` first |
 //! | a request with a lower number | answer the unit's own numbers and do nothing; the Worker refreshes and retries once |
-//! | a job with no number, or a lower one | refuse; the consumer reads the heads and runs the job again or drops it |
+//! | a job with a lower number | answer `Stale` with the unit's own numbers and do nothing; the consumer runs the job once more with them (AM-50) |
+//! | a job with no number | refuse (`stale_job`): no writer sends a job without numbers, so the consumer pages |
 //! | a fan-out sub-request with lower numbers | serve only if the unit's own tables still allow this reader (`fanout`) |
 //! | both numbers equal | proceed |
 //!
@@ -52,8 +53,9 @@ pub enum Verdict {
     Proceed,
     /// The caller knows a newer record: it must `sync` first.
     SyncNeeded,
-    /// A request from a caller behind the unit: answer the unit's own
-    /// numbers and do nothing else.
+    /// A request or a job from a caller behind the unit: answer the
+    /// unit's own numbers and do nothing else (a job runs once more with
+    /// them, AM-50).
     Stale,
     /// A fan-out sub-request behind the unit: serve only after the
     /// unit's own tables allow the reader, in the same transaction.
@@ -67,7 +69,8 @@ pub enum Verdict {
 pub enum Refusal {
     /// The call names another tenant or unit than this object.
     WrongName,
-    /// A job without numbers, or with lower ones.
+    /// A job without numbers. (A job with lower ones is answered
+    /// [`Verdict::Stale`], AM-50; the name is the wire form's.)
     StaleJob,
     /// A call that is not a Worker call carried no numbers.
     NoNumbers,
@@ -107,11 +110,7 @@ pub fn check(
         return Verdict::Proceed;
     }
     match kind {
-        CallKind::Request => Verdict::Stale,
-        CallKind::Job => Verdict::Refused {
-            reason: Refusal::StaleJob,
-            alarm: false,
-        },
+        CallKind::Request | CallKind::Job => Verdict::Stale,
         CallKind::Fanout => Verdict::FanoutCheck,
         CallKind::Worker => Verdict::Proceed,
     }
@@ -189,12 +188,10 @@ mod tests {
                 check(&name(0), OWN, &name(0), CallKind::Request, seqs),
                 Verdict::Stale
             );
+            // AM-50: a job behind the unit gets the unit's numbers.
             assert_eq!(
                 check(&name(0), OWN, &name(0), CallKind::Job, seqs),
-                Verdict::Refused {
-                    reason: Refusal::StaleJob,
-                    alarm: false
-                }
+                Verdict::Stale
             );
             assert_eq!(
                 check(&name(0), OWN, &name(0), CallKind::Fanout, seqs),

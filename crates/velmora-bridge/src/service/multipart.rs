@@ -687,9 +687,10 @@ where
     };
     // Refuse an unknown or closed upload before the body is read or
     // anything is stored. The guarded batch below decides for real.
-    match bridge.catalog.upload(&target).await? {
-        Some((upload, _)) if upload.state == UploadState::Open => {}
-        _ => return Err(ErrorCode::NoSuchUpload.into()),
+    // The state alone: reading the parts here would cost a row per part
+    // already uploaded, on every part.
+    if bridge.catalog.upload_state(&target).await? != Some(UploadState::Open) {
+        return Err(ErrorCode::NoSuchUpload.into());
     }
 
     // Plaintext and ciphertext live together while sealing: the charge
@@ -964,8 +965,8 @@ where
             // longer this request's. The slices are left to the sweep.
             give_up().await;
             restore_gate(bridge).await?;
-            return Err(match bridge.catalog.upload(target).await? {
-                Some((upload, _)) if upload.state == UploadState::Open => ErrorCode::SlowDown,
+            return Err(match bridge.catalog.upload_state(target).await? {
+                Some(UploadState::Open) => ErrorCode::SlowDown,
                 _ => ErrorCode::NoSuchUpload,
             }
             .into());

@@ -27,6 +27,7 @@ use crate::jobs::{abandon_from_var, set_abandon, DEV_ABANDON_JOB_N};
 use crate::nntp::WorkerConnector;
 use crate::queues::{binding_name, bound_queues, DropNotify, QueueSink, AUX_Q, DEV_DROP_NOTIFY_N};
 use crate::r2::{tombstone_delay_from_var, R2Blobs, DEV_TOMBSTONE_PUT_DELAY_MS};
+use velmora_bridge::jobmsg::{JobFormat, JobTenant, JOB_FORMAT_VAR};
 use velmora_bridge::remote::{RemoteConfig, S3Remote};
 
 /// Wall clock of the Workers runtime (advances on I/O only).
@@ -139,6 +140,7 @@ fn build(env: &Env) -> Result<WorkerBridge, String> {
     let cfg = BridgeConfig::from_vars(get).map_err(|e| e.to_string())?;
     let kek = KekRing::from_vars(cfg.kek_active, get).map_err(|e| e.to_string())?;
     let drop_notify = DropNotify::from_var(cfg.is_dev(), get(DEV_DROP_NOTIFY_N).as_deref())?;
+    let job_format = JobFormat::from_var(get(JOB_FORMAT_VAR).as_deref())?;
     let tombstone_delay =
         tombstone_delay_from_var(cfg.is_dev(), get(DEV_TOMBSTONE_PUT_DELAY_MS).as_deref())?;
     let abandon = abandon_from_var(cfg.is_dev(), get(DEV_ABANDON_JOB_N).as_deref())?;
@@ -174,19 +176,22 @@ fn build(env: &Env) -> Result<WorkerBridge, String> {
         }
         Err(_) => SqlCatalog::new(catalog),
     };
+    let (safety, cache) = blob_stores(env, tombstone_delay)?;
     Ok(Bridge {
         catalog,
-        safety: R2Blobs::new(env.bucket("SAFETY").map_err(binding("SAFETY"))?)
-            .with_tombstone_delay(tombstone_delay),
-        cache: R2Blobs::new(env.bucket("CACHE").map_err(binding("CACHE"))?),
+        safety,
+        cache,
         nntp: WorkerConnector::new(),
-        jobs: QueueSink::new(
-            queues(env, "POST_Q")?,
-            queues(env, "VERIFY_Q")?,
-            aux_queue(env)?,
+        jobs: queue_sink(
+            env,
             drop_notify,
-        )
-        .map_err(|name| format!("missing binding {name}"))?,
+            // Every job of this bridge is tenant 0's: the messages it
+            // sends in the format of `v` 2 name it.
+            (
+                job_format,
+                JobTenant::of(&velmora_bridge::TenantScope::tenant_zero()),
+            ),
+        )?,
         kek,
         clock: WorkerClock,
         budget: ByteBudget::new(cfg.inflight_budget_bytes)
@@ -195,6 +200,57 @@ fn build(env: &Env) -> Result<WorkerBridge, String> {
             .with_spawner(Rc::new(worker::wasm_bindgen_futures::spawn_local)),
         cfg,
     })
+}
+
+/// The safety and cache buckets, as every bridge of the isolate has them.
+fn blob_stores(env: &Env, tombstone_delay_ms: u32) -> Result<(R2Blobs, R2Blobs), String> {
+    let binding = |name: &'static str| move |_| format!("missing binding {name}");
+    Ok((
+        R2Blobs::new(env.bucket("SAFETY").map_err(binding("SAFETY"))?)
+            .with_tombstone_delay(tombstone_delay_ms),
+        R2Blobs::new(env.bucket("CACHE").map_err(binding("CACHE"))?),
+    ))
+}
+
+/// The job queues, with the format and the tenant their messages name.
+fn queue_sink(
+    env: &Env,
+    drop_notify: DropNotify,
+    format: (JobFormat, JobTenant),
+) -> Result<QueueSink, String> {
+    QueueSink::new(
+        queues(env, "POST_Q")?,
+        queues(env, "VERIFY_Q")?,
+        aux_queue(env)?,
+        drop_notify,
+        format,
+    )
+    .map_err(|name| format!("missing binding {name}"))
+}
+
+/// What the bridge of a managed tenant's unit shares with the isolate's
+/// bridge, made from the same bindings and settings: the shared database
+/// (permits and provider health of every tenant) through the isolate's
+/// catalogue's permit gate and its throttle (`SqlCatalog::sharing`), the
+/// two buckets and the job queues, whose messages name
+/// `tenant` (always `v` 2; the dev fault of `DEV_DROP_NOTIFY_N` is tenant
+/// 0's sink only). Class-only reasons.
+pub fn unit_parts(
+    env: &Env,
+    base: &WorkerBridge,
+    tenant: JobTenant,
+) -> Result<(SqlCatalog<D1Sql>, R2Blobs, R2Blobs, QueueSink), String> {
+    let get = |name: &str| lookup(env, name);
+    let dev = base.cfg.is_dev();
+    let shared = base.catalog.sharing(D1Sql::new(
+        env.d1("CATALOG")
+            .map_err(|_| "missing binding CATALOG".to_string())?,
+    ));
+    let tombstone_delay =
+        tombstone_delay_from_var(dev, get(DEV_TOMBSTONE_PUT_DELAY_MS).as_deref())?;
+    let (safety, cache) = blob_stores(env, tombstone_delay)?;
+    let jobs = queue_sink(env, DropNotify::default(), (JobFormat::Tenant, tenant))?;
+    Ok((shared, safety, cache, jobs))
 }
 
 /// The recovery store, when `RECOVERY_COPY` is on. A refused

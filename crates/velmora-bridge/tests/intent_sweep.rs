@@ -81,7 +81,10 @@ impl Setup {
     }
 
     async fn sweep(&self, write: &str) -> JobOutcome {
-        self.rig.bridge.run_job(&sweep_job(write)).await
+        self.rig
+            .bridge
+            .run_job(&TENANT_ZERO, &sweep_job(write))
+            .await
     }
 }
 
@@ -392,7 +395,7 @@ async fn killed_between_record_and_publish_everything_is_kept_and_a_replay_publi
 async fn a_record_of_the_tenant_layout_keeps_its_slices_from_the_sweep() {
     use velmora_bridge::recovery::Layout;
 
-    let tenant = Layout::default_tenant();
+    let tenant = Layout::of(&TENANT_ZERO);
     let in_tenant = |rig: &Rig| keys_under(rig, &tenant.generation_prefix()).len();
     let mut cfg = small_config();
     cfg.records = tenant.clone();
@@ -1422,7 +1425,10 @@ async fn a_tick_hands_over_twenty_writes_oldest_first_and_the_switch_stops_it() 
     assert_eq!(sent, expected);
     for job in &jobs {
         // A slice that was never stored is no obstacle.
-        assert_eq!(s.rig.bridge.run_job(job).await, JobOutcome::Ack);
+        assert_eq!(
+            s.rig.bridge.run_job(&TENANT_ZERO, job).await,
+            JobOutcome::Ack
+        );
     }
     assert_eq!(s.rig.count("write_intents"), 4 + SLICES as i64);
     assert_eq!(sweep_tick(&s.rig).await, 5);
@@ -2097,3 +2103,6 @@ impl Drop for PanicNote {
         }
     }
 }
+
+/// The one tenant there is.
+static TENANT_ZERO: velmora_bridge::TenantScope = velmora_bridge::TenantScope::tenant_zero();

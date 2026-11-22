@@ -457,7 +457,11 @@ impl Fx {
                 stage: OutboxStage::parse(&stage).expect("a stage"),
             };
             b.clock.advance_secs(60);
-            assert_eq!(b.run_job(&job).await, JobOutcome::Ack, "{stage}");
+            assert_eq!(
+                b.run_job(&TENANT_ZERO, &job).await,
+                JobOutcome::Ack,
+                "{stage}"
+            );
             b.jobs.take();
         }
         panic!("the object never reached {until}");
@@ -3182,3 +3186,6 @@ async fn admin_answers_only_on_its_host_when_one_is_set() {
         403
     );
 }
+
+/// The one tenant there is.
+static TENANT_ZERO: velmora_bridge::TenantScope = velmora_bridge::TenantScope::tenant_zero();

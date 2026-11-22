@@ -25,12 +25,21 @@ use crate::unit::identity::{self, CallKind, Seqs};
 use crate::unit::jobcall::JobCall;
 use crate::unit::{Refused, UnitAnswer, UnitCall, UnitName, UnitOp};
 
+/// The unit's lease has expired (ADR §2.4 rule 12): it runs no job until
+/// a renewal; the consumer retries later (the unit's alarm sends the
+/// `renew` job).
+pub const UNIT_RENEW_NEEDED: &str = "unit: renew needed";
+
 /// A method the job path does not use: not served through a unit.
 pub const NOT_ON_UNIT: &str = "not on the unit job path";
 /// The unit holds a newer record than the job: `sync` first.
 pub const UNIT_SYNC_NEEDED: &str = "unit: sync needed";
-/// The job's numbers are below the unit's, or missing: run it again with
-/// fresh numbers, or drop it.
+/// The job's numbers are below the unit's: the unit answered its own
+/// ([`TenantCatalog::stale_seqs`]), and the consumer runs the job once more
+/// with them (AM-50).
+pub const UNIT_STALE: &str = "unit: stale";
+/// The job carried no numbers (`Refused{stale_job}`): no writer sends one,
+/// so the consumer sends it to the DLQ and pages (AM-50).
 pub const UNIT_STALE_JOB: &str = "unit: stale job";
 /// The unit is closed (restoring or provisioning).
 pub const UNIT_CLOSED: &str = "unit: closed";
@@ -53,6 +62,11 @@ pub struct TenantCatalog<P: UnitPort, S: Catalog> {
     seqs: Seqs,
     /// The first refusal the unit gave (one of the `UNIT_*` texts).
     refusal: std::cell::Cell<Option<&'static str>>,
+    /// The unit's numbers of the first `Stale` answer.
+    stale: std::cell::Cell<Option<Seqs>>,
+    /// The unit's numbers of its latest `Ok` or `Stale` answer: never
+    /// below the job's (L6-7d).
+    latest: std::cell::Cell<Option<Seqs>>,
 }
 
 impl<P: UnitPort, S: Catalog> TenantCatalog<P, S> {
@@ -64,6 +78,8 @@ impl<P: UnitPort, S: Catalog> TenantCatalog<P, S> {
             name,
             seqs,
             refusal: std::cell::Cell::new(None),
+            stale: std::cell::Cell::new(None),
+            latest: std::cell::Cell::new(None),
         }
     }
 
@@ -73,6 +89,20 @@ impl<P: UnitPort, S: Catalog> TenantCatalog<P, S> {
     /// again with fresh numbers or drops it (ADR §2.4 rule 5).
     pub fn refusal(&self) -> Option<&'static str> {
         self.refusal.get()
+    }
+
+    /// With [`UNIT_STALE`]: the unit's numbers, which the job runs once
+    /// more with (AM-50). They stand for the chain heads: the unit refuses
+    /// every job once its lease has expired (the re-run meets that check),
+    /// so a re-run that is not refused ran on numbers at most T old.
+    pub fn stale_seqs(&self) -> Option<Seqs> {
+        self.stale.get()
+    }
+
+    /// The numbers of the unit's latest `Ok` or `Stale` answer in this
+    /// run, for a follow-up job (L6-7d); never below the job's own.
+    pub fn latest_seqs(&self) -> Option<Seqs> {
+        self.latest.get()
     }
 
     fn refused(&self, why: &'static str) -> BridgeError {
@@ -92,19 +122,32 @@ impl<P: UnitPort, S: Catalog> TenantCatalog<P, S> {
             kind: CallKind::Job,
             seqs: Some(self.seqs),
             authenticated: true,
-            listed: true,
+            // A job reaches the unit through its message, not through a
+            // record that lists it: an unborn unit is decided by the
+            // consumer from the tenant's verified head (AM-50, L6-7c).
+            listed: false,
             op: UnitOp::Job { call },
         };
         match self.port.call(&c).await? {
-            UnitAnswer::Ok { body, .. } => serde_json::from_value(body)
-                .map_err(|_| BridgeError::Sql("unit: job answer does not decode".into())),
+            UnitAnswer::Ok { seqs, body } => {
+                self.latest.set(Some(seqs));
+                serde_json::from_value(body)
+                    .map_err(|_| BridgeError::Sql("unit: job answer does not decode".into()))
+            }
             UnitAnswer::SyncNeeded { .. } => Err(self.refused(UNIT_SYNC_NEEDED)),
+            UnitAnswer::Stale { seqs } => {
+                self.latest.set(Some(seqs));
+                if self.refusal.get().is_none() {
+                    self.stale.set(Some(seqs));
+                }
+                Err(self.refused(UNIT_STALE))
+            }
             UnitAnswer::Refused {
                 reason: Refused::Identity(identity::Refusal::StaleJob),
                 ..
-            }
-            | UnitAnswer::Stale { .. } => Err(self.refused(UNIT_STALE_JOB)),
+            } => Err(self.refused(UNIT_STALE_JOB)),
             UnitAnswer::Closed { .. } => Err(self.refused(UNIT_CLOSED)),
+            UnitAnswer::RenewNeeded { .. } => Err(self.refused(UNIT_RENEW_NEEDED)),
             UnitAnswer::Unborn { .. } => Err(self.refused(UNIT_UNBORN)),
             UnitAnswer::Failed { class } => Err(match class.as_str() {
                 "guard" => BridgeError::GuardFailed,
@@ -380,14 +423,12 @@ impl<P: UnitPort, S: Catalog> Catalog for TenantCatalog<P, S> {
         })
         .await
     }
-    /// Not a job call of the unit yet (main's #172 added the method after
-    /// the unit's job list was fixed). Every caller is best effort: a mark
-    /// that is not taken back leaves the row marked, as a failed take-back
-    /// does on D1. The unit's job call is the unit lanes' to add.
-    async fn unmark_sent(&self, _jobs: &[crate::types::Job], _mark: UnixMs) -> Result<u64> {
-        Err(BridgeError::Sql(
-            "unit: unmark_sent is not a job call".into(),
-        ))
+    async fn unmark_sent(&self, jobs: &[Job], mark: UnixMs) -> Result<u64> {
+        self.unit(JobCall::unmark_sent {
+            jobs: jobs.to_vec(),
+            mark,
+        })
+        .await
     }
     async fn pack_plans(&self, limit: u32) -> Result<PackReport> {
         self.unit(JobCall::pack_plans { limit }).await
@@ -771,6 +812,9 @@ impl<P: UnitPort, S: Catalog> Catalog for TenantCatalog<P, S> {
         &self,
         t: &UploadTarget<'_>,
     ) -> Result<Option<(UploadRow, Vec<UploadPartRow>)>> {
+        Err(BridgeError::NotImplemented(NOT_ON_UNIT))
+    }
+    async fn upload_state(&self, t: &UploadTarget<'_>) -> Result<Option<UploadState>> {
         Err(BridgeError::NotImplemented(NOT_ON_UNIT))
     }
     async fn list_uploads(
