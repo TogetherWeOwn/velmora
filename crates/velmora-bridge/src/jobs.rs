@@ -385,7 +385,9 @@ where
 
     /// Handles up to [`GC_BATCH`] due `gc` rows of the tenant of `scope`
     /// in the mode `GC_MODE` allows, and one window of its orphaned upload
-    /// parts with `GC_ORPHANS` (a unit's catalogue has none yet).
+    /// parts with `GC_ORPHANS` (on a unit the orphan scan is not on the job
+    /// path yet: its catalogue answers nothing due, so a unit's orphaned
+    /// parts wait, kept, until it is).
     async fn run_gc(&self, scope: &TenantScope) -> JobOutcome {
         // Every step of both is idempotent, so a failed job simply runs
         // again.
