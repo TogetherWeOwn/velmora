@@ -77,7 +77,9 @@ pub struct FeedEvent {
 
 /// A page of one tenant's events, oldest first. `position` is the last
 /// item's position; with no item, `after` itself, or without `after` the
-/// feed's head (never below the tenant's prune mark).
+/// feed's head (never below the tenant's prune mark), or the tenant's
+/// prune mark when a prune took every row of the page during the read
+/// (the head would skip kept rows past a page cut short by `limit`).
 #[derive(Clone, Debug, PartialEq)]
 pub struct EventPage {
     pub items: Vec<FeedEvent>,
