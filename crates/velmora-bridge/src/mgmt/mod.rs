@@ -17,6 +17,8 @@
 //!   of the stores it reads and writes.
 //! - [`route`]: the calls, their paths and the least scope of each.
 //! - [`serve`]: one request, from the gate to its answer.
+//! - [`setup`]: the two operator setup routes under `/_admin` (the first
+//!   key-location record, the directory gate's first open; AM-70b).
 //! - [`tenant`]: tenant read, from the verified head.
 //! - [`tenant_create`]: tenant create (AM-58).
 //! - [`token`]: the service tokens, their classes and scopes, and the
@@ -30,6 +32,7 @@ pub mod principal;
 pub mod request;
 pub mod route;
 pub mod serve;
+pub mod setup;
 pub mod tenant;
 pub mod tenant_create;
 pub mod token;

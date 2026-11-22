@@ -284,6 +284,11 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
     // route, and tenant 0's path is unchanged.
     let units = units::units(&env);
     let resp = ingress::front(incoming.req, &bridge.cfg, incoming.https, |req| async {
+        // The two managed-plane setup calls under `/_admin` (AM-70b),
+        // after the front's admin check.
+        if let Some(call) = velmora_bridge::mgmt::setup::setup_call(&req.raw_target) {
+            return mgmt::setup(&env, &bridge, call, &req).await;
+        }
         if let Some(resp) =
             units::route_request(&env, &bridge, units, admin || internal.get(), &req).await
         {

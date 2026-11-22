@@ -117,3 +117,40 @@ pub fn response(answer: Answer, request_id: &str) -> Result<Response> {
         .with_status(answer.status)
         .with_headers(headers))
 }
+
+/// The answer to one of the two setup calls under `/_admin` (AM-70b): the
+/// first key-location record and the directory gate's first open
+/// (`velmora_bridge::mgmt::setup`). Reached only after the front's admin
+/// check; `serve_setup` checks again. The coordinator and the drill
+/// runner call these from the host; CI never does.
+pub async fn setup(
+    env: &Env,
+    bridge: &WorkerBridge,
+    call: velmora_bridge::mgmt::setup::SetupCall,
+    req: &S3Request,
+) -> velmora_bridge::S3Response {
+    velmora_bridge::trace::log_alerts(|line| console_error!("alert: {line}"));
+    let ports = match crate::root::WorkerPorts::from_env(env, bridge) {
+        Ok(ports) => ports,
+        Err(reason) => {
+            // Only SAFETY is required, and the reason names the binding.
+            console_error!("setup root refused: {reason}");
+            return velmora_bridge::S3Response::error(
+                503,
+                "SlowDown",
+                "Not available now; retry shortly.",
+            );
+        }
+    };
+    let cache = crate::root::cache();
+    let root = velmora_bridge::root::Root::new(&ports, &cache, velmora::rng::SystemRng);
+    velmora_bridge::mgmt::setup::serve_setup(
+        call,
+        req,
+        &bridge.cfg,
+        &ports,
+        &root,
+        &mut velmora::rng::SystemRng,
+    )
+    .await
+}
