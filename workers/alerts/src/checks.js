@@ -230,7 +230,7 @@ export function evaluate(snap, env = {}) {
         key: "scrub-stalled",
         title: "Scrub repair stalled",
         detail:
-          `A scrub repair is still pinned in R2 at its bound (the stalled total rose ${ageText(now - roseAt)} ago; ${scrub.stalled} in all). ` +
+          `A scrub repair was still pinned in R2 at its bound when the scrub last looked (the stalled total rose ${ageText(now - roseAt)} ago; ${scrub.stalled} in all; a total of findings, not of current pins). ` +
           "The scrub-stalled line in the S3 Worker log names the extent and says whether the safety copy is intact, written again or missing; " +
           "its outbox row says why (normally in stage verify; dead once its attempts ran out). " +
           `This alert clears ${ageText(stalledWindowMs)} after the last rise.`,
@@ -243,7 +243,7 @@ export function evaluate(snap, env = {}) {
   if (staleMs > 0) {
     let detail;
     if (snap.scrubMissing) {
-      detail = "The catalogue has no scrub_state (migration 0023 not applied) while SCRUB_STALE_SECS is set.";
+      detail = "The catalogue has no scrub_state table or no row in it (migration 0023 not applied, or its row removed) while SCRUB_STALE_SECS is set.";
     } else if (scrub && (scrub.lastRunAt === null || now - scrub.lastRunAt > staleMs)) {
       const lastRun = scrub.lastRunAt === null ? "never ran" : `last ran ${ageText(now - scrub.lastRunAt)} ago`;
       detail = `The scrub ${lastRun} (threshold ${ageText(staleMs)}). Check SCRUB, the cron and the aux queue.`;

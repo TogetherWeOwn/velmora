@@ -200,7 +200,7 @@ test("scrub stopped detects the missing table or row when enabled", async () => 
     e.SCRUB_STALE_SECS = "3600";
     const enabled = await tick(e, T0 + 5 * MIN);
     assert.deepEqual(enabled.conditions, ["scrub-stopped"]);
-    assert.ok(e.ALERT_EMAIL.sent[0].text.includes("The catalogue has no scrub_state (migration 0023 not applied) while SCRUB_STALE_SECS is set."));
+    assert.ok(e.ALERT_EMAIL.sent[0].text.includes("The catalogue has no scrub_state table or no row in it (migration 0023 not applied, or its row removed) while SCRUB_STALE_SECS is set."));
   }
   const e = env({ CATALOG: undefined, SCRUB_STALE_SECS: "3600" });
   assert.deepEqual((await tick(e, T0)).conditions, []);
@@ -317,7 +317,7 @@ test("tick: the first stalled scrub reading is quiet and a rise stays active for
   assert.equal(next.sent, 1);
   assert.equal(e.ALERT_EMAIL.sent[0].subject, "[velmora] Scrub repair stalled");
   assert.ok(e.ALERT_EMAIL.sent[0].text.includes(
-    "A scrub repair is still pinned in R2 at its bound (the stalled total rose 0 min ago; 5 in all). " +
+    "A scrub repair was still pinned in R2 at its bound when the scrub last looked (the stalled total rose 0 min ago; 5 in all; a total of findings, not of current pins). " +
     "The scrub-stalled line in the S3 Worker log names the extent and says whether the safety copy is intact, written again or missing; " +
     "its outbox row says why (normally in stage verify; dead once its attempts ran out). " +
     "This alert clears 6.0 h after the last rise.",
@@ -783,4 +783,27 @@ test("a negative setting falls back to the default, or to the floor when one is 
   assert.equal(setting({ POST_STALL_SECS: "0" }, "POST_STALL_SECS"), 0);
   assert.equal(setting({ SCRUB_STALLED_WINDOW_SECS: "-5" }, "SCRUB_STALLED_WINDOW_SECS", 3600), 3600);
   assert.equal(setting({ SCRUB_STALLED_WINDOW_SECS: "7200" }, "SCRUB_STALLED_WINDOW_SECS", 3600), 7200);
+});
+
+test("tick: a stall after the last one's window is a new alert, not a late reminder", async () => {
+  const e = env({ SCRUB_STALLED_WINDOW_SECS: "3600" });
+  const set = (n) => e.CATALOG.db.prepare("UPDATE scrub_state SET stalled = ? WHERE id = 1").run(n);
+  set(0);
+  await tick(e, T0);
+  set(1);
+  for (let t = 5; t <= 65; t += 5) await tick(e, T0 + t * MIN);
+  const before = e.ALERT_EMAIL.sent.length;
+  assert.ok(before >= 1);
+  // The next rise lands on the first tick past the window. As a new run
+  // it is emailed once the hour between emails allows, inside its own
+  // window; as a reminder of the old run its backoff would let the
+  // window end first.
+  set(2);
+  let held = false;
+  for (let t = 66; t <= 126; t += 5) {
+    const r = await tick(e, T0 + t * MIN);
+    held ||= r.conditions.includes("scrub-stalled");
+  }
+  assert.ok(held);
+  assert.equal(e.ALERT_EMAIL.sent.length, before + 1, "the new stall is emailed");
 });

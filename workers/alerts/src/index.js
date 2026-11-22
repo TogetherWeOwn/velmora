@@ -11,7 +11,7 @@
 // It is its own Worker so that a broken S3 Worker cannot silence it, and so
 // that changing it never redeploys the S3 Worker.
 
-import { evaluate, figures, readingOf } from "./checks.js";
+import { evaluate, figures, readingOf, setting } from "./checks.js";
 import { readSnapshot } from "./catalog.js";
 import * as store from "./store.js";
 import { alertMessage, digestMessage, send } from "./email.js";
@@ -106,7 +106,16 @@ export async function tick(env, now) {
   if (snap.scrub && !snap.errors.some((e) => e.startsWith("scrub state"))) {
     const seen = snap.scrub.stalled;
     if (seen !== scrubStalled?.seen) {
-      if (scrubStalled && seen > scrubStalled.seen) snap.scrubStalledRoseAt = now;
+      if (scrubStalled && seen > scrubStalled.seen) {
+        // A rise after the last one's window is over is a new alert, not
+        // a reminder of the old one (whose backoff would delay it).
+        const windowMs = setting(env, "SCRUB_STALLED_WINDOW_SECS", 3600) * 1000;
+        const last = snap.scrubStalledRoseAt;
+        if (last === null || now - last > windowMs) {
+          await store.resolveCron(db, [], now, (k) => k !== "scrub-stalled");
+        }
+        snap.scrubStalledRoseAt = now;
+      }
       await store.setMeta(db, "scrub_stalled", { seen, roseAt: snap.scrubStalledRoseAt });
     }
   }
