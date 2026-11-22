@@ -39,10 +39,7 @@
 //!   `503 gate_not_opened` with the steps that are not done when it did
 //!   not (a run that left the gate closed may be started again). With
 //!   `DIRECTORY` unbound the gate counts as closed: `503
-//!   directory_unbound`, nothing run. An overlapping call in one isolate
-//!   answers retryable `503` without checking the gate. AM-78 calls for
-//!   one operator or drill-runner call per environment; the isolate
-//!   guard is not a cross-isolate lock.
+//!   directory_unbound`, nothing run.
 //!
 //! Every answer carries fixed words and numbers only, never a store's
 //! text.
@@ -227,12 +224,6 @@ where
             "directory_unbound",
             "No directory is bound; the gate counts as closed.",
         );
-    };
-    // Hold the isolate's lock from before the guard through the whole run:
-    // the durable guard's final read and anchor put are separate calls.
-    // A waiter could wake in another request's Worker I/O context.
-    let Some(_first_open) = root.try_first_open() else {
-        return unavailable();
     };
     // The route's own guard (AM-78, §R7-13 N1): an open gate answers
     // `200` and runs nothing, so a repeat never closes it or empties
