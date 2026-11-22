@@ -1109,6 +1109,63 @@ fn a_row_far_behind_is_raised_in_steps() {
     });
 }
 
+/// A row far behind, a window of closings every unit holds, and a closing
+/// head: the head is classed on its own, and the closing reaches the unit
+/// before the directory (the records past one run's read are not known).
+#[test]
+fn a_far_row_with_a_closing_head_takes_the_closing_order() {
+    let db = database();
+    let store = HookedRecords::new();
+    let seal = PlainSeal::new();
+    let chain = TenantChain {
+        store: &store,
+        seal: &seal,
+    };
+    let dir = SqlDirectory { sql: &db };
+    let units = Units::new(&db);
+    block_on(async {
+        active(&chain, A1).await;
+        let mut head = 4;
+        while head < 4 + MAX_FINISH_RECORDS + 20 {
+            let mode = match head % 2 {
+                0 => Some(HoldMode::ReadOnly),
+                _ => None,
+            };
+            head = write(&chain, A1, Change::SetBillingHold { mode }, Actor::Billing).await;
+        }
+        // The unit holds every record so far, but not the closing head.
+        units.held_answers.borrow_mut().insert(0, Answer::Seq(head));
+        let closing = write(&chain, A1, hold(HoldMode::Locked), Actor::Operator).await;
+        units.head.set(closing);
+        let run = finish_tenant(&chain, Some(&dir), &units, &tid(A1), NOW)
+            .await
+            .unwrap();
+        assert_eq!(run.order, Some(WriteOrder::Closing));
+        assert_eq!(units.take_log(), vec![(0, None)]);
+        assert_eq!(run.units, vec![(0, StoreStep::Holds(closing))]);
+        // A far row whose window closes and whose head opens: the closing
+        // order too (the records past the window are not known).
+        let opening = write(
+            &chain,
+            A1,
+            Change::SetOperatorHold { hold: None },
+            Actor::Operator,
+        )
+        .await;
+        units.head.set(opening);
+        units
+            .held_answers
+            .borrow_mut()
+            .insert(0, Answer::Seq(closing));
+        db.exec("DELETE FROM units", &[]).await.unwrap();
+        db.exec("DELETE FROM tenants", &[]).await.unwrap();
+        let run = finish_tenant(&chain, Some(&dir), &units, &tid(A1), NOW)
+            .await
+            .unwrap();
+        assert_eq!(run.order, Some(WriteOrder::Closing));
+    });
+}
+
 /// A row ahead of its chain is damage: it pages, the directory step does
 /// not run, and the head's own record decides the order.
 #[test]

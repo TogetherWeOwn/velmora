@@ -79,10 +79,20 @@ pub trait TenantUnits {
     /// seq. An `Err`: the unit could not be reached.
     async fn bring_up(&self, tenant: &TenantId, unit: u32) -> Result<UnitHolds>;
     /// What `unit` of `tenant` holds of the tenant chain, read without
-    /// bringing it up (the unit's own numbers, rule 5). The finisher asks
-    /// it only for an opening head over closings the directory does not
-    /// hold: if every unit holds them, the opening goes to the directory
-    /// first. An `Err`: the unit could not be read (the closing order).
+    /// bringing it up. The finisher asks it only for an opening head over
+    /// closings the directory does not hold, all of them read: if every
+    /// unit holds them, the opening goes to the directory first. An `Err`
+    /// (the unit could not be read) takes the closing order, so a closing
+    /// never waits on the directory.
+    ///
+    /// The adapter makes **one read of the unit's own numbers and nothing
+    /// else**: no renewal, no sync, no retry layer that may sync (a sync
+    /// would bring the unit to an opening head before the directory), and
+    /// no cached numbers (a stale-high value would skip a closing the unit
+    /// lacks). The unit client's read-only probe of its numbers, a `Ping`
+    /// request call with the lowest numbers (`UnitClient` `unit_seqs`), is
+    /// that read; any answer that does not carry the unit's own numbers is
+    /// an `Err`.
     async fn held(&self, tenant: &TenantId, unit: u32) -> Result<UnitHolds>;
     /// Writes `unit`'s born marker if it is missing (ADR §2.4 rule 6),
     /// once the unit answered born. Idempotent; the finisher calls it for
@@ -240,15 +250,16 @@ where
     if matches!(
         head.door.lifecycle,
         Lifecycle::Shredding | Lifecycle::Shredded
-    ) || (!known
-        && last_closing.is_none()
-        && head_closes(chain, &managed, &head, &mut run.pages).await)
+    ) || (!known && head_closes(chain, &managed, &head, &mut run.pages).await)
     {
         last_closing = Some(h);
     }
     let order = match last_closing {
         None => WriteOrder::Opening,
         Some(c) if c == h => WriteOrder::Closing,
+        // Records between what one run read and the head are not known:
+        // one of them may close.
+        Some(_) if !known => WriteOrder::Closing,
         // An opening head over closings: if every unit holds them already,
         // only openings are left, and the directory goes first.
         Some(c) => match units_hold_at_least(units, tenant, &head, c, provisioning).await {
