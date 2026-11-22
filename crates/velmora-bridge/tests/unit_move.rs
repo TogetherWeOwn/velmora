@@ -1170,7 +1170,9 @@ fn restore_floor(
 #[test]
 fn a_time_restore_before_the_chains_move_floor_is_refused() {
     let before_lift = Some((Refused::Restore(RestoreRefusal::BeforeMoveLift), false));
-    let lease_unknown = Some((Refused::Restore(RestoreRefusal::LeaseUnknown), false));
+    // Past the floors the restore checks go on to the lease checks: the
+    // unit has its lease table (u0002) and closed just now, so too soon.
+    let too_soon = Some((Refused::Restore(RestoreRefusal::TooSoon), false));
     // No move record in the unit (as after a restore to a bookmark taken
     // before the move's first batch): only the named floor holds.
     let u = closed_for_the_move();
@@ -1184,12 +1186,12 @@ fn a_time_restore_before_the_chains_move_floor_is_refused() {
     }
     assert_eq!(
         restore_floor(&u, S, floor + LIFT_SLACK_MS, floor as u64),
-        lease_unknown
+        too_soon
     );
     // No floor named (0) and no record: the birth floor only.
     assert_eq!(
         restore_floor(&u, S, NOW.0 + LIFT_SLACK_MS, 0),
-        lease_unknown
+        too_soon
     );
     // A floor that is no time: malformed, before anything else.
     assert_eq!(
@@ -1209,7 +1211,7 @@ fn a_time_restore_before_the_chains_move_floor_is_refused() {
     );
     assert_eq!(
         restore_floor(&u, s2, NOW.0 + LIFT_SLACK_MS, 1),
-        lease_unknown
+        too_soon
     );
     assert_eq!(
         restore_floor(&u, s2, NOW.0 + LIFT_SLACK_MS, floor as u64),
