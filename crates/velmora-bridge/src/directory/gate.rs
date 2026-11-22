@@ -666,6 +666,24 @@ pub async fn first_open_holds<S: RecordStore, Q: Sql>(
     Ok(store.list(GATE_ANCHOR_PREFIX, "", 2).await? == [anchor_key(1)])
 }
 
+/// Whether the gate is open at epoch 1, as the first open answers it: one
+/// read of the row (open at 1), then anchor 1 as the only name under the
+/// anchor prefix. An open at a later epoch is not this.
+pub async fn open_at_one<S: RecordStore, Q: Sql>(
+    store: &S,
+    dir: &SqlDirectory<'_, Q>,
+) -> Result<bool> {
+    let open = matches!(
+        dir.gate_row().await?,
+        Some(GateRow {
+            closed: false,
+            epoch: 1,
+            ..
+        })
+    );
+    Ok(open && store.list(GATE_ANCHOR_PREFIX, "", 2).await? == [anchor_key(1)])
+}
+
 /// The steps of a run that holds the gate by `fence`.
 async fn run_from<S: RecordStore, C: ControlSeal, Q: Sql, G: GateSteps>(
     chain: &TenantChain<'_, S, C>,
@@ -758,7 +776,11 @@ async fn run_from<S: RecordStore, C: ControlSeal, Q: Sql, G: GateSteps>(
     }
     // Open, and say so only if the open check agrees: a stray anchor
     // name keeps the gate closed, and the run reports it.
-    run.opened = changed && is_open(chain.store, dir).await?;
+    run.opened = changed
+        && match fence {
+            Fence::Anchor(_) => is_open(chain.store, dir).await?,
+            Fence::FirstOpen => open_at_one(chain.store, dir).await?,
+        };
     Ok(run)
 }
 

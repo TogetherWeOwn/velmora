@@ -42,8 +42,9 @@
 //!   not (a run that left the gate closed may be started again). A
 //!   compare-and-set that lost to another call answers `200` with
 //!   `{"gate": "open", "ran": false}` when the gate is then open at
-//!   epoch 1, and `503` with `Retry-After` otherwise; a store that did not
-//!   answer is `503` with `Retry-After` too. With `DIRECTORY` unbound the
+//!   epoch 1, and `503` with `Retry-After` otherwise; a store error that
+//!   the call returns is `503` with `Retry-After` too (a head of `m/kl/`
+//!   that cannot be read is a step that is not done, `gate_not_opened`). With `DIRECTORY` unbound the
 //!   gate counts as closed: `503 directory_unbound`, nothing run.
 //!
 //! Every answer carries fixed words and numbers only, never a store's
@@ -245,7 +246,7 @@ where
         }
         Ok(FirstOpenAnswer::EpochUnexpected) => {
             crate::trace::alert(|| {
-                "setup: first open refused: the gate anchors or row are not at epoch 0 or 1"
+                "setup: first open refused: the gate row and anchors are no state a first open makes"
                     .to_string()
             });
             fail(
