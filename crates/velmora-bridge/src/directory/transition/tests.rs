@@ -2946,6 +2946,55 @@ fn a_floor_ahead_of_the_clock_and_an_undo_of_another_deletion_are_refused() {
     );
 }
 
+// When adding a Change or Actor variant, update the exhaustive match, add a
+// representative to the corresponding sweep list, and bump its variant count.
+fn every_change_is_listed(change: &Change) {
+    match change {
+        Change::Create { .. } => {}
+        Change::CreateTenantZero { .. } => {}
+        Change::ClaimKeyVersion { .. } => {}
+        Change::VoidKeyClaim { .. } => {}
+        Change::CommitKeyVersion { .. } => {}
+        Change::Activate { .. } => {}
+        Change::SetBillingHold { .. } => {}
+        Change::SetOperatorHold { .. } => {}
+        Change::SetDeletion { .. } => {}
+        Change::UndoDeletion { .. } => {}
+        Change::SetLimits { .. } => {}
+        Change::SetFeatures { .. } => {}
+        Change::SetUnits { .. } => {}
+        Change::SetRestoring { .. } => {}
+        Change::LiftRestoring { .. } => {}
+        Change::CreateBucket { .. } => {}
+        Change::DropBucket { .. } => {}
+        Change::PlaceMovedBuckets { .. } => {}
+        Change::SetMoveFloor { .. } => {}
+        Change::SetEscrowOffline => {}
+        Change::ClearEscrowOffline { .. } => {}
+        Change::StartMove { .. } => {}
+        Change::FlipMove { .. } => {}
+        Change::GiveUpMove => {}
+        Change::UndoMove { .. } => {}
+        Change::UndoMoveOntoFrozen { .. } => {}
+        Change::RetireTenantZero => {}
+        Change::StartShred => {}
+        Change::FinishShred => {}
+    }
+}
+
+fn every_actor_is_listed(actor: &Actor) {
+    match actor {
+        Actor::Customer => {}
+        Actor::Billing => {}
+        Actor::Operator => {}
+        Actor::TenantCreation => {}
+        Actor::RotationJob => {}
+        Actor::ShredJob => {}
+        Actor::RestoreTool => {}
+        Actor::MoveTool => {}
+    }
+}
+
 /// AM-69: a managed tenant's record is keyless only before its first key
 /// version or as the stub, so no record of a live tenant may follow its
 /// first commit with a lower `tk_version`. Every change, by every actor,
@@ -2953,6 +3002,9 @@ fn a_floor_ahead_of_the_clock_and_an_undo_of_another_deletion_are_refused() {
 /// and the stub takes no record at all.
 #[test]
 fn no_transition_lowers_the_key_version_and_the_stub_takes_nothing() {
+    use std::collections::HashSet;
+    use std::mem::discriminant;
+
     let provisioning = match step(None, create(), Actor::TenantCreation) {
         Ok(Outcome::Next(r)) => r,
         _ => panic!("create"),
@@ -2962,6 +3014,7 @@ fn no_transition_lowers_the_key_version_and_the_stub_takes_nothing() {
         Change::ClaimKeyVersion { version: 1 },
         Actor::TenantCreation,
     );
+    let committed = apply(&claimed, commit(1), Actor::TenantCreation);
     let a = active();
     let rotating = apply(
         &a,
@@ -2969,6 +3022,11 @@ fn no_transition_lowers_the_key_version_and_the_stub_takes_nothing() {
         Actor::RotationJob,
     );
     let rotated = apply(&rotating, commit(2), Actor::RotationJob);
+    let rotating_again = apply(
+        &rotated,
+        Change::ClaimKeyVersion { version: 3 },
+        Actor::RotationJob,
+    );
     let suspended = apply(
         &rotated,
         billing_hold(Some(HoldMode::ReadOnly)),
@@ -2995,6 +3053,7 @@ fn no_transition_lowers_the_key_version_and_the_stub_takes_nothing() {
     assert_eq!(stub.door.tk_version, 2, "the stub keeps the last version");
     let zero = tenant_zero();
     let moving = moving();
+    let flipped = apply(&moving, Change::FlipMove { stamp: 3 }, Actor::MoveTool);
 
     let floor = |ms| Change::SetMoveFloor {
         unit: 0,
@@ -3011,6 +3070,7 @@ fn no_transition_lowers_the_key_version_and_the_stub_takes_nothing() {
         Change::ClaimKeyVersion { version: 3 },
         Change::VoidKeyClaim { version: 1 },
         Change::VoidKeyClaim { version: 2 },
+        Change::VoidKeyClaim { version: 3 },
         commit(1),
         commit(2),
         commit(3),
@@ -3082,12 +3142,34 @@ fn no_transition_lowers_the_key_version_and_the_stub_takes_nothing() {
         Actor::RestoreTool,
         Actor::MoveTool,
     ];
+    changes.iter().for_each(every_change_is_listed);
+    actors.iter().for_each(every_actor_is_listed);
+    // One distinct discriminant per arm in the corresponding match above.
+    assert_eq!(
+        changes
+            .iter()
+            .map(discriminant)
+            .collect::<HashSet<_>>()
+            .len(),
+        29
+    );
+    assert_eq!(
+        actors
+            .iter()
+            .map(discriminant)
+            .collect::<HashSet<_>>()
+            .len(),
+        8
+    );
+
     let heads = [
         &provisioning,
         &claimed,
+        &committed,
         &a,
         &rotating,
         &rotated,
+        &rotating_again,
         &suspended,
         &restoring,
         &with_bucket,
@@ -3096,12 +3178,15 @@ fn no_transition_lowers_the_key_version_and_the_stub_takes_nothing() {
         &stub,
         &zero,
         &moving,
+        &flipped,
     ];
     let mut written = 0;
+    // The writes of the flipped head's own changes, by name.
+    let mut after_flip: Vec<&'static str> = Vec::new();
     for head in heads {
         for change in &changes {
             for actor in actors {
-                for now in [NOW, UnixMs(NOW.0 + 8 * DAY)] {
+                for now in [NOW, UnixMs(NOW.0 + 8 * DAY), UnixMs(NOW.0 + 31 * DAY)] {
                     let mut change = change.clone();
                     if let Change::SetLimits { base_seq, .. }
                     | Change::SetFeatures { base_seq, .. }
@@ -3118,6 +3203,14 @@ fn no_transition_lowers_the_key_version_and_the_stub_takes_nothing() {
                         continue;
                     };
                     written += 1;
+                    if std::ptr::eq(head, &flipped) {
+                        after_flip.push(match change {
+                            Change::UndoMove { .. } => "undo",
+                            Change::UndoMoveOntoFrozen { .. } => "undo_onto_frozen",
+                            Change::RetireTenantZero => "retire",
+                            _ => "other",
+                        });
+                    }
                     assert_ne!(
                         head.door.lifecycle,
                         Lifecycle::Shredded,
@@ -3133,8 +3226,12 @@ fn no_transition_lowers_the_key_version_and_the_stub_takes_nothing() {
             }
         }
     }
-    // The sweep reached real transitions, not only refusals.
+    // The sweep reached real transitions, not only refusals, the flipped
+    // tenant 0's undo, fallback undo and retirement among them.
     assert!(written > 50, "{written}");
+    for w in ["undo", "undo_onto_frozen", "retire"] {
+        assert!(after_flip.contains(&w), "{w}: {after_flip:?}");
+    }
 }
 
 /// AM-74 (Q30): `SetMoveFloor` asks for the unit to be listed on the

@@ -273,6 +273,6 @@ where
                 }),
             )
         }
-        Err(_) => unavailable(),
+        Ok(FirstOpenAnswer::Moved) | Err(_) => unavailable(),
     }
 }

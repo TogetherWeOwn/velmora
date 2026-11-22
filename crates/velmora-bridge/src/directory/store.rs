@@ -191,6 +191,30 @@ const DROP_SHREDDED_ROUTES: &str = "DELETE FROM key_routes WHERE tenant = ?1 \
 const DROP_SHREDDED_LABELS: &str = "DELETE FROM bucket_index WHERE tenant = ?1 \
      AND (SELECT state FROM tenants WHERE id = ?1 AND record_seq = ?2) = 'shredded'";
 
+/// A tenant's key chain head as its row holds it: a point read.
+pub const KEYS_SEQ_OF: &str = "SELECT keys_seq FROM tenants WHERE id = ?1";
+
+/// The rows of a chain at or below a seq: one range of the primary key.
+pub const CLEAR_PENDING: &str =
+    "DELETE FROM pending_ops WHERE tenant = ?1 AND chain = ?2 AND seq <= ?3";
+
+/// One location of the key-location set; a row at a newer seq stays.
+const PUT_KEY_LOCATION: &str =
+    "INSERT INTO key_locations (location, status, kl_seq) VALUES (?1, ?2, ?3) \
+     ON CONFLICT (location) DO UPDATE SET status = excluded.status, kl_seq = excluded.kl_seq \
+     WHERE excluded.kl_seq >= key_locations.kl_seq";
+
+/// A location's status as the `key_locations` row names it.
+pub fn location_status(status: crate::keys::locations::LocationStatus) -> &'static str {
+    use crate::keys::locations::LocationStatus as L;
+    match status {
+        L::Proposed => "proposed",
+        L::Active => "active",
+        L::Retired => "retired",
+        L::Lost => "lost",
+    }
+}
+
 const TENANT_COLUMNS: &str = "id, record_seq, keys_seq, door_json, updated_at";
 
 /// The columns that are taken from the door, in the order of
@@ -431,8 +455,13 @@ impl<S: Sql> SqlDirectory<'_, S> {
 
     /// The tenant's key chain head as the row holds it; `None`: no row.
     pub async fn keys_seq_of(&self, tenant: &Tenant) -> Result<Option<u64>> {
-        let _ = tenant;
-        Err(BridgeError::NotImplemented("keys_seq_of"))
+        let rows = self
+            .sql
+            .query(KEYS_SEQ_OF, &[SqlValue::Text(tenant.as_str().to_string())])
+            .await?;
+        rows.first()
+            .map(|row| u64::try_from(int_at(row, 0)?).map_err(|_| ERR_ROW))
+            .transpose()
     }
 
     /// Copies the head of `m/kl/` into `key_locations` (ADR §8.6 step 3),
@@ -443,13 +472,40 @@ impl<S: Sql> SqlDirectory<'_, S> {
         &self,
         set: &crate::keys::locations::KeyLocations,
     ) -> Result<()> {
-        let _ = set;
-        Err(BridgeError::NotImplemented("put_key_locations"))
+        set.check()?;
+        let seq = int(set.seq)?;
+        let mut stmts = Vec::with_capacity(set.locations.len());
+        for l in &set.locations {
+            stmts.push((
+                PUT_KEY_LOCATION,
+                vec![
+                    SqlValue::Text(l.name.clone()),
+                    SqlValue::Text(location_status(l.status).to_string()),
+                    seq.clone(),
+                ],
+            ));
+        }
+        self.sql.batch(stmts).await.map(|_| ())
     }
 
     /// The `key_locations` rows, by name: name, status, seq.
     pub async fn key_locations(&self) -> Result<Vec<(String, String, u64)>> {
-        Err(BridgeError::NotImplemented("key_locations"))
+        let rows = self
+            .sql
+            .query(
+                "SELECT location, status, kl_seq FROM key_locations ORDER BY location",
+                &[],
+            )
+            .await?;
+        rows.iter()
+            .map(|row| {
+                Ok((
+                    text(row, 0)?,
+                    text(row, 1)?,
+                    u64::try_from(int_at(row, 2)?).map_err(|_| ERR_ROW)?,
+                ))
+            })
+            .collect()
     }
 
     /// Raises the tenant's key chain head; a lower seq changes nothing.
@@ -517,7 +573,26 @@ impl<S: Sql> SqlDirectory<'_, S> {
             return Ok(RoutePut::Inserted);
         }
         match self.route(&route.akid).await? {
-            Some(old) if old.tenant == route.tenant && old.kind == route.kind => Ok(RoutePut::Same),
+            Some(old) if old.tenant == route.tenant && old.kind == route.kind => {
+                // A route stored while the key's private part did not open
+                // has no `owner_ref`: a later put that knows it fills it in,
+                // once. Nothing else of a route changes.
+                if old.owner_ref.is_none() && route.owner_ref.is_some() {
+                    self.sql
+                        .exec(
+                            "UPDATE key_routes SET owner_ref = ?2 WHERE akid = ?1 AND owner_ref IS NULL \
+                             AND tenant = ?3 AND kind = ?4",
+                            &[
+                                SqlValue::Text(route.akid.clone()),
+                                opt_text(route.owner_ref.as_deref()),
+                                SqlValue::Text(route.tenant.as_str().to_string()),
+                                SqlValue::Text(route.kind.as_str().to_string()),
+                            ],
+                        )
+                        .await?;
+                }
+                Ok(RoutePut::Same)
+            }
             Some(_) => Ok(RoutePut::Conflict),
             None => Ok(RoutePut::NoTenant),
         }
@@ -631,7 +706,7 @@ impl<S: Sql> SqlDirectory<'_, S> {
     pub async fn clear_pending(&self, tenant: &Tenant, chain: ChainKind, seq: u64) -> Result<u64> {
         self.sql
             .exec(
-                "DELETE FROM pending_ops WHERE tenant = ?1 AND chain = ?2 AND seq <= ?3",
+                CLEAR_PENDING,
                 &[
                     SqlValue::Text(tenant.as_str().to_string()),
                     SqlValue::Text(chain.as_str().to_string()),
