@@ -156,8 +156,13 @@ impl UnitPort for LocalUnit {
             if std::env::var_os("VELMORA_UNIT_TRACE").is_some()
                 && !matches!(answer, UnitAnswer::Ok { .. })
             {
-                let op = serde_json::to_string(&call.op).unwrap();
-                eprintln!("unit: {} -> {answer:?}", &op[..op.len().min(300)]);
+                // The method's name and the answer only: an op can carry
+                // wrapped secrets.
+                let what = match &call.op {
+                    UnitOp::Request { call } => call.name(),
+                    _ => "worker or read call",
+                };
+                eprintln!("unit: {what} -> {answer:?}");
             }
             Ok(answer)
         };

@@ -1324,6 +1324,7 @@
     ],
     "presign_refusal": [
       "not_internal",
+      "key_inactive",
       "malformed",
       "principal_unknown",
       "principal_inactive",

@@ -26,7 +26,7 @@ use velmora_bridge::unit::identity::Refusal;
 use velmora_bridge::unit::keys::{Access, KeyEntry, KeyGrant, KeyKind, SubjectStatus};
 use velmora_bridge::unit::request::{
     PresignRefusal, Presigned, Published, RecordWire, RequestCall, RequestRefusal, MAX_EXTENTS,
-    MAX_KEY_BYTES, MAX_PAGE,
+    MAX_KEY_BYTES, MAX_MARKER_BYTES, MAX_PAGE,
 };
 use velmora_bridge::unit::request_client::{RequestClient, REQUEST_REFUSED};
 use velmora_bridge::unit::size::{SizeLimits, SizeRefusal};
@@ -736,34 +736,118 @@ fn a_closing_bucket_is_not_found_and_takes_no_rows() {
     ok(ask(&u, seqs, raise_floor(B1)));
 }
 
+/// `commit(bucket)` under another generation and extent id.
+fn commit_as(bucket: &str, g: &str, x: &str) -> RequestCall {
+    let RequestCall::commit_generation { mut c, .. } = commit(bucket) else {
+        unreachable!()
+    };
+    let g = GenerationId::new(g);
+    c.generation.id = g.clone();
+    c.extents[0].id = ExtentId::new(x);
+    c.extents[0].generation_id = Some(g.clone());
+    RequestCall::commit_generation {
+        c,
+        condition: None,
+        record: RecordWire {
+            generation: g,
+            key: "m/g".into(),
+        },
+    }
+}
+
 #[test]
-fn a_full_unit_refuses_calls_that_add_extents_or_rows() {
+fn a_full_unit_refuses_growth_and_lets_deletes_and_smaller_overwrites_go_on() {
     let u = born_with(SizeLimits {
         bytes: u64::MAX,
         extents: 0,
     });
     let seqs = s(3, 0);
     assert_eq!(
-        refused(&ask(&u, seqs, commit(B1))).0,
-        Refused::Size(SizeRefusal::TooManyExtents)
+        refused(&ask(&u, seqs, commit(B1))),
+        (Refused::Size(SizeRefusal::TooManyExtents), true)
     );
     ok(ask(&u, seqs, raise_floor(B1)));
     ok(ask(&u, seqs, live_generation()));
 
-    let u = born_with(SizeLimits {
+    // One live object, then the database is at the guard.
+    let u = born();
+    ok(ask(&u, seqs, commit(B1)));
+    let u = u.with_size_limits(SizeLimits {
         bytes: 0,
         extents: u64::MAX,
     });
     let before = changes(&u);
-    for call in [commit(B1), raise_floor(B1)] {
+    for call in [
+        commit_as(
+            B1,
+            "g_0019a00000000e5e5e5e5e5e5e5e5",
+            "x_0000000000000000000000e005",
+        )
+        .clone(),
+        RequestCall::create_upload {
+            u: UploadRow {
+                id: UploadId::new("u_00000000000000e1"),
+                bucket_id: BucketId::new(B1),
+                key: "new".into(),
+                content_json: "{}".into(),
+                user_meta_json: "{}".into(),
+                state: UploadState::Open,
+                revision: 0,
+                completed_generation_id: None,
+                complete_digest: None,
+                result_etag: None,
+                initiated_at: NOW,
+            },
+        },
+    ] {
+        // A new key's object, and a new upload: growth.
+        let call = match call {
+            RequestCall::commit_generation {
+                mut c,
+                condition,
+                record,
+            } => {
+                c.generation.key = "new".into();
+                RequestCall::commit_generation {
+                    c,
+                    condition,
+                    record,
+                }
+            }
+            other => other,
+        };
+        let name = call.name();
         assert_eq!(
-            refused(&ask(&u, seqs, call)).0,
-            Refused::Size(SizeRefusal::DatabaseFull)
+            refused(&ask(&u, seqs, call)),
+            (Refused::Size(SizeRefusal::DatabaseFull), true),
+            "{name}"
         );
     }
     assert_eq!(changes(&u), before);
-    // Reads, and calls that only take rows away, still run.
+    // A smaller (here: equal) overwrite of the live object goes on.
+    let a = ask(
+        &u,
+        seqs,
+        commit_as(
+            B1,
+            "g_0019a00000000e6e6e6e6e6e6e6e6",
+            "x_0000000000000000000000e006",
+        ),
+    );
+    assert_eq!(ok(a), serde_json::json!("applied"));
+    // Reads, deletes and the calls that only take rows away go on.
     ok(ask(&u, seqs, live_generation()));
+    ok(ask(&u, seqs, raise_floor(B1)));
+    ok(ask(
+        &u,
+        seqs,
+        RequestCall::delete_object_before {
+            bucket: BucketId::new(B1),
+            key: "k".into(),
+            before: GenerationId::new("g_0019a00000000e7e7e7e7e7e7e7e7"),
+            now: NOW,
+        },
+    ));
     ok(ask(
         &u,
         seqs,
@@ -793,7 +877,9 @@ fn a_call_above_its_bounds_is_refused_with_an_alarm() {
         },
     };
     ok(ask(&u, seqs, list(MAX_PAGE + 1, String::new())));
-    ok(ask(&u, seqs, list(1, "p".repeat(MAX_KEY_BYTES))));
+    // A listing's prefix and markers are bounded only by the request
+    // target on tenant 0.
+    ok(ask(&u, seqs, list(1, "p".repeat(MAX_MARKER_BYTES))));
     let upload_extents = |limit: u32| RequestCall::upload_extents {
         bucket: BucketId::new(B1),
         key: "k".into(),
@@ -804,7 +890,7 @@ fn a_call_above_its_bounds_is_refused_with_an_alarm() {
     for call in [
         keys(MAX_PAGE as usize + 1),
         list(MAX_PAGE + 2, String::new()),
-        list(1, "p".repeat(MAX_KEY_BYTES + 1)),
+        list(1, "p".repeat(MAX_MARKER_BYTES + 1)),
         upload_extents(MAX_EXTENTS + 1),
         RequestCall::live_generation {
             bucket: BucketId::new(B1),
@@ -914,6 +1000,10 @@ async fn the_client_reads_answers_back_and_keeps_the_first_refusal() {
             ..
         })
     ));
+    assert!(
+        client.take_unpublished().is_empty(),
+        "no publication was refused"
+    );
     // Only the first refusal is kept.
     let stale = RequestClient::new(Port(Rc::clone(&u)), own(), s(3, 0));
     assert!(stale.bucket_by_name("alpha").await.is_err());
@@ -1180,5 +1270,82 @@ fn key_row_under_an_expired_lease_is_read_only_and_marked() {
     assert_eq!(
         refused(&u.key_row_expired(&c, &head).unwrap()).0,
         Refused::Unauthenticated
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_publication_refused_before_it_ran_hands_its_record_back() {
+    let u = Rc::new(born());
+    let a = worker(
+        &u,
+        UnitOp::BucketClose {
+            bucket_id: B2.into(),
+        },
+    );
+    assert!(matches!(a, UnitAnswer::Ok { .. }), "{a:?}");
+    let client = RequestClient::new(Port(Rc::clone(&u)), own(), s(3, 0));
+    // Into a closing bucket, and into one the unit does not hold (a
+    // `sync` dropped its row after the request looked it up).
+    for bucket in [B2, "b_00000000000000e9"] {
+        let RequestCall::commit_generation { c, .. } = commit(bucket) else {
+            unreachable!()
+        };
+        let g = c.generation.id.clone();
+        let e = client
+            .commit_generation(&c, None, Recorded::for_test(&g))
+            .await
+            .unwrap_err();
+        assert!(matches!(e, BridgeError::Invalid(REQUEST_REFUSED)), "{e:?}");
+        let back = client.take_unpublished();
+        assert_eq!(back.len(), 1, "{bucket}");
+        assert_eq!(back[0].generation(), &g);
+        assert_eq!(
+            refused(&ask(&u, s(3, 0), raise_floor(bucket))).0,
+            Refused::NotFound
+        );
+    }
+    assert!(matches!(
+        client.refusal(),
+        Some(UnitAnswer::Refused {
+            reason: Refused::NotFound,
+            ..
+        })
+    ));
+    // A stale client's publication never ran either.
+    sync(&u, s(4, 0), TenantState::Active, None);
+    let stale = RequestClient::new(Port(Rc::clone(&u)), own(), s(3, 0));
+    let RequestCall::commit_generation { c, .. } = commit(B1) else {
+        unreachable!()
+    };
+    let g = c.generation.id.clone();
+    assert!(stale
+        .commit_generation(&c, None, Recorded::for_test(&g))
+        .await
+        .is_err());
+    assert_eq!(stale.take_unpublished().len(), 1);
+}
+
+#[test]
+fn the_presigned_check_needs_an_open_internal_key() {
+    let u = with_keys();
+    // Disabled, with its secret kept: the row says so, and so does the
+    // check. (A held entry without its secret is no key at all.)
+    let disabled = KeyEntry {
+        status: SubjectStatus::Disabled,
+        secret_wrapped: Some(vec![2, 0xcc, 0xdd]),
+        secret_kek_version: Some(1),
+        ..subject(INTERNAL, KeyKind::Internal, 4)
+    };
+    apply(&u, 3, vec![disabled]);
+    sync(&u, s(3, 4), TenantState::Active, None);
+    let body = ok(u.handle(
+        &key_row(INTERNAL, presigned(P, "alpha", false), s(3, 4)),
+        NOW,
+    ));
+    assert_eq!(body["key"]["status"], "disabled");
+    assert_eq!(body["presigned"]["ok"], false);
+    assert_eq!(
+        body["presigned"]["refusal"],
+        serde_json::to_value(PresignRefusal::KeyInactive).unwrap()
     );
 }

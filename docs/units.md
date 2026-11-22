@@ -492,7 +492,11 @@ signature), and `listed = true`.
 publication answers `"applied"`, `"refused"` or `"fenced"`, and the
 Worker rebuilds the outcome from the proof it kept
 (`Published::outcome`): a refused publication discards the Worker's own
-record, never one the unit named.
+record, never one the unit named. A publication the unit refused before
+it ran it (any answer but `ok` and `failed`) wrote nothing under its id:
+the client hands its proof back (`RequestClient::take_unpublished`), and
+the Worker discards that record before it answers. A `failed` answer, or
+none, keeps the record, as on tenant 0.
 
 | The unit answers | The Worker |
 |---|---|
@@ -502,7 +506,7 @@ record, never one the unit named.
 | `closed` | `503` |
 | `unborn` | `503`; it pages "catalogue lost" when the route lists the unit (rule 7) |
 | `refused{account_problem}` | `403 AccountProblem` |
-| `refused{not_found}` (a write into a closing bucket) | `404 NoSuchBucket` |
+| `refused{not_found}` (a write into a closing bucket, or one whose row is gone) | `404 NoSuchBucket` |
 | `refused{size}` | `503 SlowDown` and a page, or `403 QuotaExceeded` (ADR §2.6) |
 | `refused{request: out_of_bounds}` (alarm) | `500` and a page: only a Worker bug sends one |
 | `failed{class}` | as on the job path: `guard` is `GuardFailed`; any other class is a catalogue error (`500`) |
@@ -513,12 +517,18 @@ a read's own two writes (its read stamp, `touch_read`, and its cache
 fill, `record_cache_fill`); none otherwise. While a bucket is closing
 (AM-57), `bucket_by_name` answers none for it, `buckets_for` leaves it
 out, and a write that adds a row naming it (a generation, extents, a
-floor, a tombstone, an upload or a part) is refused `not_found`. A call
-that adds extents or rows takes the size guard first, in its own
-transaction. Each list, limit and key of a call has a bound: at most
-1,000 keys, ids or rows (S3's page and DeleteObjects bound), 10,001
-extents (one object's bound and one more), and 1,024 bytes a key, prefix
-or marker.
+floor, a tombstone, an upload or a part) is refused `not_found`; so is
+such a write into a bucket the unit no longer holds (a `sync` dropped
+the row after the request looked it up). A call
+that adds extents, or a new object, upload or intent, takes the size
+guard first, in its own transaction, and a refusal pages. Reads,
+deletes and smaller overwrites go on (ADR §2.6): a publication that
+replaces a live generation of at least as many extents passes the
+guard. Each list, limit and key of a call has a bound: at most 1,000
+keys, ids or rows (S3's page and DeleteObjects bound; a listing asks for
+one more), 10,001 extents (one object's bound and one more), 1,024 bytes
+an object key (the protocol's own bound), and 8 KiB a listing prefix,
+delimiter or marker (the request target's bound, as on tenant 0).
 
 **Not request calls.** Bucket create and delete, and the key and grant
 writes: a managed tenant's buckets come from its tenant chain and its
@@ -537,8 +547,8 @@ names (`presigned: {principal, bucket, create_only}`, AM-64). `key` is
 then the unit's internal key (none for any other key: only the internal
 key signs on that entry point), and the answer carries
 `presigned: {ok, refusal, bucket_id, access}`, checked in the same
-transaction. `ok` needs the principal `active` and not held, an open
-bucket of that name, and the principal's effective grant on it (`rw` for
+transaction. `ok` needs the internal key `active` and not held, the principal
+`active` and not held, an open bucket of that name, and the principal's effective grant on it (`rw` for
 a create-only URL). The row is never withheld: the Worker checks SigV4
 first, and answers `403 SignatureDoesNotMatch` if it fails, whatever the
 check found. A verified request with `ok = false` answers

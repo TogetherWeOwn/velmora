@@ -830,14 +830,18 @@ impl<S: UnitSql> Unit<S> {
             None => 0,
         };
         let mut op = || -> Result<std::result::Result<Value, Refused>> {
+            // A closing bucket, or one whose row a `sync` dropped since
+            // the request looked it up (AM-57): `NoSuchBucket`.
             if let Some(b) = rc.bucket_written() {
-                if buckets::is_closing(sql, b.as_str())? {
+                if buckets::is_closing(sql, b.as_str())? || !keys::bucket_exists(sql, b.as_str())? {
                     return Ok(Err(Refused::NotFound));
                 }
             }
             if let Some(adding) = grows {
-                if let Err(r) = size::admit(sql, self.size, database_size, adding)? {
-                    return Ok(Err(Refused::Size(r)));
+                if !self.smaller_overwrite(rc)? {
+                    if let Err(r) = size::admit(sql, self.size, database_size, adding)? {
+                        return Ok(Err(Refused::Size(r)));
+                    }
                 }
             }
             Ok(Ok(poll_once(rc.clone().run(&self.cat))??))
@@ -848,10 +852,24 @@ impl<S: UnitSql> Unit<S> {
                 body,
             },
             Err(reason) => {
-                let alarm = matches!(reason, Refused::AwaitedInside);
+                // The size guard pages, as on the import (ADR §2.6).
+                let alarm = matches!(reason, Refused::AwaitedInside | Refused::Size(_));
                 refused(reason, alarm)
             }
         })
+    }
+
+    /// A publication that replaces a live generation of at least as many
+    /// extents: a smaller overwrite, which goes on at the size guard (ADR
+    /// §2.6). Read in the call's transaction.
+    fn smaller_overwrite(&self, rc: &super::request::RequestCall) -> Result<bool> {
+        use super::request::RequestCall as R;
+        let (R::commit_generation { c, .. } | R::commit_sliced { c, .. }) = rc else {
+            return Ok(false);
+        };
+        let g = &c.generation;
+        let live = poll_once(self.cat.live_generation(&g.bucket_id, &g.key))??;
+        Ok(live.is_some_and(|l| c.extents.len() <= l.extent_count as usize))
     }
 
     /// The third case of rule 5: a sub-request under an earlier grant is

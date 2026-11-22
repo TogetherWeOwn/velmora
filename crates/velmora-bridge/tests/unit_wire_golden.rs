@@ -668,7 +668,7 @@ fn nested() -> Value {
         .unwrap(),
         "reservation_bodies": reservation_bodies(),
         "request_refusal": every!(RequestRefusal: OutOfBounds),
-        "presign_refusal": every!(PresignRefusal: NotInternal, Malformed, PrincipalUnknown,
+        "presign_refusal": every!(PresignRefusal: NotInternal, KeyInactive, Malformed, PrincipalUnknown,
             PrincipalInactive, PrincipalHeld, NoSuchBucket, NoGrant),
         "published": every!(Published: Applied, Refused, Fenced),
         "precondition": serde_json::to_value(vec![

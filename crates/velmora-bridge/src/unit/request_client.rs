@@ -21,7 +21,7 @@ use super::identity::{CallKind, Seqs};
 use super::request::{Published, RecordWire, RequestCall};
 use super::{UnitAnswer, UnitCall, UnitName, UnitOp};
 use crate::ports::{KeyHead, PublishOutcome, UploadTarget};
-use crate::recovery::Recorded;
+use crate::recovery::{Recorded, Unpublished};
 use crate::replay::ReplayProbe;
 use crate::tenant_catalog::UnitPort;
 use crate::types::*;
@@ -37,6 +37,7 @@ pub struct RequestClient<P: UnitPort> {
     name: UnitName,
     seqs: Seqs,
     refusal: RefCell<Option<UnitAnswer>>,
+    unpublished: RefCell<Vec<Unpublished>>,
 }
 
 impl<P: UnitPort> RequestClient<P> {
@@ -46,7 +47,17 @@ impl<P: UnitPort> RequestClient<P> {
             name,
             seqs,
             refusal: RefCell::new(None),
+            unpublished: RefCell::new(Vec::new()),
         }
+    }
+
+    /// The records of publications the unit refused before it ran them
+    /// (any answer but `ok`, `failed` and none): nothing was written under
+    /// their ids, so the Worker discards each (`discard_generation`)
+    /// before it answers the request. A `failed` answer or none keeps the
+    /// record, as on tenant 0.
+    pub fn take_unpublished(&self) -> Vec<Unpublished> {
+        std::mem::take(&mut *self.unpublished.borrow_mut())
     }
 
     /// The first answer that was not `ok` or `failed` since this client
@@ -101,8 +112,22 @@ impl<P: UnitPort> RequestClient<P> {
     }
 
     async fn publish(&self, call: RequestCall, record: Recorded) -> Result<PublishOutcome> {
-        let published: Published = self.call(call).await?;
-        Ok(published.outcome(record))
+        let answer = self.send(call).await?;
+        self.published(answer, record)
+    }
+
+    /// A publication's answer with the Worker's own proof: an outcome
+    /// for `ok`; for a refusal the unit gave before it ran the call, the
+    /// proof is kept for [`Self::take_unpublished`].
+    fn published(&self, answer: UnitAnswer, record: Recorded) -> Result<PublishOutcome> {
+        match answer {
+            UnitAnswer::Ok { .. } => Ok(self.read::<Published>(answer)?.outcome(record)),
+            UnitAnswer::Failed { .. } => self.read::<Published>(answer).map(|_| unreachable!()),
+            refused => {
+                self.unpublished.borrow_mut().push(record.refused_on_unit());
+                self.read::<Published>(refused).map(|_| unreachable!())
+            }
+        }
     }
 
     pub async fn access_key(&self, akid: &str) -> Result<Option<AccessKeyRow>> {
@@ -564,7 +589,7 @@ impl<P: UnitPort> RequestClient<P> {
             record: RecordWire::of(&record),
         };
         match self.send(call).await {
-            Ok(answer) => Ok(self.read::<Published>(answer)?.outcome(record)),
+            Ok(answer) => self.published(answer, record),
             // No answer: the Complete may have applied, or may still.
             // Moving the upload to its next revision settles it, as
             // tenant 0's catalogue does: if that applies, the Complete had

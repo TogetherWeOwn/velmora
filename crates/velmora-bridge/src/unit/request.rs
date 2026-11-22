@@ -54,6 +54,10 @@ pub const MAX_EXTENTS: u32 = MAX_OBJECT_EXTENTS_LIMIT + 1;
 /// The longest object key, prefix or marker a call names (bytes, S3's
 /// key bound).
 pub const MAX_KEY_BYTES: usize = 1_024;
+/// The longest listing prefix, delimiter or marker a call names (bytes):
+/// the request target's own bound (`service::common`), which is all that
+/// bounds them on tenant 0.
+pub const MAX_MARKER_BYTES: usize = 8 * 1_024;
 
 /// The proof of a generation's recovery record, as a publication call
 /// carries it: the generation and the name the record was stored under
@@ -500,8 +504,11 @@ impl RequestCall {
 
     /// For a call that grows the database: the extents it adds (0 when
     /// it adds other rows only). The size guard runs before it (ADR
-    /// §2.6). `None` for the reads (and their stamps) and the calls that
-    /// only take rows away.
+    /// §2.6). `None` for the reads (and their stamps), the deletes (a
+    /// floor, then a tombstone: "reads, deletes and smaller overwrites
+    /// go on") and the calls that only take rows away. A publication
+    /// that replaces a live generation of at least as many extents is a
+    /// smaller overwrite: `Unit::request` admits it past the guard.
     pub fn grows(&self) -> Option<u64> {
         let n = |v: usize| u64::try_from(v).unwrap_or(u64::MAX);
         match self {
@@ -515,11 +522,6 @@ impl RequestCall {
             RequestCall::copy_generation { .. }
             | RequestCall::complete_upload { .. }
             | RequestCall::open_intents { .. }
-            | RequestCall::raise_floor { .. }
-            | RequestCall::raise_floors { .. }
-            | RequestCall::delete_object_before { .. }
-            | RequestCall::delete_object_if { .. }
-            | RequestCall::delete_objects_before { .. }
             | RequestCall::create_upload { .. } => Some(0),
             _ => None,
         }
@@ -531,7 +533,8 @@ impl RequestCall {
         let page = |n: usize| n <= MAX_PAGE as usize;
         let extents = |n: usize| n <= MAX_EXTENTS as usize;
         let key = |k: &str| k.len() <= MAX_KEY_BYTES;
-        let opt = |k: &Option<String>| k.as_deref().is_none_or(key);
+        let marker = |k: &str| k.len() <= MAX_MARKER_BYTES;
+        let opt = |k: &Option<String>| k.as_deref().is_none_or(marker);
         let ok = match self {
             RequestCall::live_object { key: k, .. }
             | RequestCall::live_generation { key: k, .. }
@@ -551,16 +554,16 @@ impl RequestCall {
             // it is the last.
             RequestCall::list { q, .. } | RequestCall::list_heads { q, .. } => {
                 q.max_keys <= MAX_PAGE + 1
-                    && key(&q.prefix)
+                    && marker(&q.prefix)
                     && opt(&q.delimiter)
                     && opt(&q.after)
                     && opt(&q.skip_prefix)
             }
             RequestCall::list_uploads { q, .. } => {
                 q.limit <= MAX_PAGE + 1
-                    && key(&q.prefix)
+                    && marker(&q.prefix)
                     && opt(&q.skip_prefix)
-                    && q.after.as_ref().is_none_or(|(k, _)| key(k))
+                    && q.after.as_ref().is_none_or(|(k, id)| marker(k) && opt(id))
             }
             RequestCall::upload_extents { key: k, limit, .. } => key(k) && *limit <= MAX_EXTENTS,
             RequestCall::usage_buckets { after, limit } => {
@@ -872,6 +875,8 @@ pub enum PresignRefusal {
     /// The key is not the unit's internal key (only it signs on this
     /// entry point, X-8).
     NotInternal,
+    /// The internal key is not `active`, or is held.
+    KeyInactive,
     /// The principal or the bucket name is not well formed.
     Malformed,
     /// No principal that is not revoked has this id.
@@ -927,6 +932,9 @@ pub(crate) fn presigned_check<S: Sql>(
     };
     if key.is_null() {
         return Ok((key, verdict(Err(PresignRefusal::NotInternal))));
+    }
+    if key["status"] != "active" {
+        return Ok((key, verdict(Err(PresignRefusal::KeyInactive))));
     }
     if !super::reserve::valid_id(&p.principal) || p.bucket.is_empty() || p.bucket.len() > 255 {
         return Ok((key, verdict(Err(PresignRefusal::Malformed))));
