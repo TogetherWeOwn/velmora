@@ -1934,15 +1934,28 @@ impl<U: Upstream, S: StatePort> Ctx<'_, U, S> {
                 continue;
             };
             let prop = instr.child(DAV, "prop").ok_or_else(|| status(400))?;
+            let inherited_lang = prop.lang().or_else(|| instr.lang()).or_else(|| doc.lang());
             for p in prop.elements() {
                 let ns = p.ns.clone().unwrap_or_default();
                 protected.push(ns == DAV && LIVE.contains(&p.name.as_str()));
                 names.push((ns.clone(), p.name.clone()));
                 patches.push(if set {
+                    let xml = match (p.lang(), inherited_lang) {
+                        (None, Some(lang)) => {
+                            let mut root = p.clone();
+                            root.attrs.push((
+                                Some(xml::XML_NS.to_owned()),
+                                "lang".to_owned(),
+                                lang.to_owned(),
+                            ));
+                            root.to_xml()
+                        }
+                        _ => p.to_xml(),
+                    };
                     Patch::Set(DeadProp {
                         ns,
                         name: p.name.clone(),
-                        xml: p.to_xml(),
+                        xml,
                     })
                 } else {
                     Patch::Remove {
@@ -2072,27 +2085,77 @@ fn guard_for(existing: Option<&Meta>) -> Cond {
     }
 }
 
+/// Mirrors the private `matches_tag`/`valid_tag` parser in
+/// velmora-s3-proto/src/read.rs. Weak comparison ignores the prefix on
+/// either side; strong comparison only matches two strong tags.
+fn matches_etag(list: &str, etag: Option<&str>, weak: bool) -> Result<bool, ()> {
+    let mut rest = list.trim();
+    if rest == "*" {
+        return Ok(etag.is_some());
+    }
+    let etag = etag.and_then(|tag| match tag.strip_prefix("W/") {
+        Some(opaque) => weak.then_some(opaque),
+        None => Some(tag),
+    });
+    let mut found = false;
+    loop {
+        let (tag, is_weak) = rest.strip_prefix("W/").map_or((rest, false), |t| (t, true));
+        let inner = tag.strip_prefix('"').ok_or(())?;
+        let end = inner.find('"').ok_or(())?;
+        if !inner.as_bytes()[..end]
+            .iter()
+            .all(|c| *c == 0x21 || (0x23..=0x7e).contains(c))
+        {
+            return Err(());
+        }
+        found |= (weak || !is_weak) && etag == Some(&tag[..end + 2]);
+        rest = inner[end + 1..].trim_start();
+        if rest.is_empty() {
+            return Ok(found);
+        }
+        rest = rest.strip_prefix(',').ok_or(())?.trim_start();
+    }
+}
+
+#[cfg(test)]
+mod etag_tests {
+    use super::matches_etag;
+
+    #[test]
+    fn validator_lists_use_opaque_tags_and_reject_invalid_syntax() {
+        assert_eq!(
+            matches_etag(r#"  W/"other" , "a,b"  "#, Some(r#"W/"a,b""#), true),
+            Ok(true)
+        );
+        assert_eq!(
+            matches_etag(r#""a,b""#, Some(r#"W/"a,b""#), false),
+            Ok(false)
+        );
+        assert_eq!(
+            matches_etag(r#"W/"a,b""#, Some(r#""a,b""#), false),
+            Ok(false)
+        );
+        assert_eq!(matches_etag(" * ", Some(r#"W/"a,b""#), false), Ok(true));
+        assert_eq!(matches_etag(" * ", None, true), Ok(false));
+        assert_eq!(matches_etag(r#""a,b", "#, Some(r#""a,b""#), true), Err(()));
+        assert_eq!(matches_etag(r#""a b""#, Some(r#""a,b""#), true), Err(()));
+    }
+}
+
 /// `If-Match`, `If-None-Match` and `If-Unmodified-Since` of a write,
 /// judged against what is there. `Some(guard)` when there were any.
 fn http_conditions<B>(req: &Request<B>, existing: Option<&Meta>) -> Result<Option<Cond>, Resp<B>> {
+    let etag = existing.map(|m| m.etag.as_str());
     let mut any = false;
     if let Some(v) = req.header("if-match") {
         any = true;
-        let ok = match existing {
-            None => false,
-            Some(m) => v.trim() == "*" || v.split(',').any(|e| e.trim() == m.etag),
-        };
-        if !ok {
+        if !matches_etag(v, etag, false).map_err(|()| status(400))? {
             return Err(status(412));
         }
     }
     if let Some(v) = req.header("if-none-match") {
         any = true;
-        let hit = match existing {
-            None => false,
-            Some(m) => v.trim() == "*" || v.split(',').any(|e| e.trim() == m.etag),
-        };
-        if hit {
+        if matches_etag(v, etag, true).map_err(|()| status(400))? {
             return Err(status(412));
         }
     }

@@ -759,6 +759,31 @@ async fn dead_properties_follow_copy_and_move_and_go_with_delete() {
 }
 
 #[tokio::test]
+async fn proppatch_preserves_the_nearest_xml_language() {
+    let w = World::new().await;
+    w.req("PUT", "/dav/p", &[], b"x").await.expect(201);
+    let patch = br#"<D:propertyupdate xmlns:D="DAV:" xmlns:Z="urn:z" xml:lang="fr">
+      <D:set><D:prop><Z:root>bonjour</Z:root><Z:clear xml:lang="">clear</Z:clear></D:prop></D:set>
+      <D:set xml:lang="de"><D:prop xml:lang="it"><Z:nearest>ciao</Z:nearest><Z:own xml:lang="en">hello</Z:own></D:prop></D:set>
+    </D:propertyupdate>"#;
+    w.req("PROPPATCH", "/dav/p", &[], patch).await.expect(207);
+    let r = w.req("PROPFIND", "/dav/p", &[("depth", "0")], b"").await;
+    r.expect(207);
+    let text = r.text();
+    for (name, lang) in [
+        ("root", "fr"),
+        ("clear", ""),
+        ("nearest", "it"),
+        ("own", "en"),
+    ] {
+        assert!(
+            text.contains(&format!(r#"<{name} xmlns="urn:z" xml:lang="{lang}">"#)),
+            "{text}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn large_puts_go_up_in_parts() {
     let part = 5 * MIB;
     let w = World::with(Config {
@@ -847,6 +872,38 @@ async fn conditional_writes() {
     w.req("DELETE", "/dav/c", &[("if-match", "\"nope\"")], b"")
         .await
         .expect(412);
+}
+
+#[tokio::test]
+async fn write_conditions_use_weak_and_strong_etag_comparison() {
+    let w = World::new().await;
+    let tag = w
+        .req("PUT", "/dav/c", &[], b"old")
+        .await
+        .expect(201)
+        .header("etag")
+        .unwrap()
+        .to_owned();
+    let weak = format!(r#"  "other,tag" , W/{tag}  "#);
+    for header in ["if-none-match", "if-match"] {
+        w.req("PUT", "/dav/c", &[(header, &weak)], b"new")
+            .await
+            .expect(412);
+        assert_eq!(w.s3_get("c").await.1, b"old");
+    }
+    let strong = format!(r#" W/"other,tag" , {tag} "#);
+    w.req("PUT", "/dav/c", &[("if-match", &strong)], b"new")
+        .await
+        .expect(204);
+    w.req("PUT", "/dav/c", &[("if-match", "  * ")], b"newer")
+        .await
+        .expect(204);
+    w.req("PUT", "/dav/c", &[("if-none-match", "  * ")], b"blocked")
+        .await
+        .expect(412);
+    w.req("PUT", "/dav/new", &[("if-none-match", "  * ")], b"new")
+        .await
+        .expect(201);
 }
 
 #[tokio::test]
