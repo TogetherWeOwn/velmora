@@ -70,6 +70,7 @@ export async function readSnapshot(env, now, opts = {}) {
     providers: [],
     attempts: { post: [], verify: [] },
     scrub: null,
+    scrubMissing: false,
     errors: [],
   };
   const db = env.CATALOG;
@@ -95,7 +96,10 @@ export async function readSnapshot(env, now, opts = {}) {
         "scrub state",
         async () => {
           const r = await db.prepare(SQL.scrub).first();
-          if (!r) return;
+          if (!r) {
+            snap.scrubMissing = true;
+            return;
+          }
           let incident;
           try {
             incident = JSON.parse(r.last_incident);
@@ -131,7 +135,10 @@ export async function readSnapshot(env, now, opts = {}) {
         await f();
       } catch (e) {
         const message = String(e?.message ?? e);
-        if (name === "scrub state" && message.includes("no such table")) continue;
+        if (name === "scrub state" && /no such table: (?:main\.)?scrub_state\b/.test(message)) {
+          snap.scrubMissing = true;
+          continue;
+        }
         snap.errors.push(`${name}: ${message.slice(0, 160)}`);
       }
     }

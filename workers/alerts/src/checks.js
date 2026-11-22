@@ -23,9 +23,8 @@ export const DEFAULTS = Object.freeze({
   EXPORT_MAX_AGE_SECS: 26 * 3600,
   // A row with this many attempts in its stage counts as failing.
   FAILING_ATTEMPTS: 3,
-  // Longer than SCRUB_CONFIRM_SECS (1 h), with room for runs that end busy.
-  // Keep this above SCRUB_CONFIRM_SECS if that is raised.
-  SCRUB_UNRECOVERABLE_WINDOW_SECS: 3 * 3600,
+  // Keep at least 3 x SCRUB_CONFIRM_SECS (1 h) plus margin for delayed re-checks.
+  SCRUB_UNRECOVERABLE_WINDOW_SECS: 6 * 3600,
   // Off at 0. Set to e.g. 3600 once SCRUB=on. Scrub runs every 5 min.
   SCRUB_STALE_SECS: 0,
 });
@@ -43,12 +42,12 @@ export function readingOf(key) {
   return null;
 }
 
-/** Reads a positive integer var, falling back to the default. */
-export function setting(env, name) {
+/** Reads a nonnegative numeric var, or floors it when a minimum is given. */
+export function setting(env, name, minimum) {
   const raw = env?.[name];
   if (raw !== undefined && raw !== null && raw !== "") {
     const n = Number(raw);
-    if (Number.isFinite(n) && n >= 0) return n;
+    if (Number.isFinite(n) && (minimum !== undefined || n >= 0)) return Math.max(n, minimum ?? 0);
   }
   return DEFAULTS[name];
 }
@@ -72,7 +71,8 @@ function ageText(ms) {
  *                                       undefined = not checked (no binding)
  *   scrub: { runs, checked, unrecoverable, stalled, lastRunAt,
  *            lastUnrecoverableAt, lastIncidentAt, incident } | null
- *   prevScrubStalled: number | undefined  stalled total from the previous reading
+ *   scrubMissing: boolean               scrub_state table or row is absent
+ *   prevScrubStalled: number | undefined  stalled total used as the reporting baseline
  *   errors:     [string]                readings that failed
  * }
  */
@@ -196,7 +196,7 @@ export function evaluate(snap, env = {}) {
 
   const scrub = snap.scrub;
   if (scrub) {
-    const windowMs = setting(env, "SCRUB_UNRECOVERABLE_WINDOW_SECS") * 1000;
+    const windowMs = setting(env, "SCRUB_UNRECOVERABLE_WINDOW_SECS", 3600) * 1000;
     if (scrub.lastUnrecoverableAt !== null && now - scrub.lastUnrecoverableAt <= windowMs) {
       out.push({
         key: "scrub-unrecoverable",
@@ -204,20 +204,20 @@ export function evaluate(snap, env = {}) {
         detail:
           "An extent has no intact copy on Usenet, in the cache or the safety store. " +
           `Last found ${ageText(now - scrub.lastUnrecoverableAt)} ago. ${scrub.unrecoverable} finding(s) so far. ` +
-          "The scrub checks it again every hour and reports it in the Worker log (alert: scrub-unrecoverable). " +
-          "Find it with SELECT id FROM extents WHERE scrub_result = 'unrecoverable'.",
+          `This alert clears when no re-check has found an unrecoverable extent for ${ageText(windowMs)}. The extent may still be unrecoverable. ` +
+          "Check the digest's unrecoverable total and run SELECT id FROM extents WHERE scrub_result = 'unrecoverable'.",
         forMs: 0,
       });
     }
 
     if (scrub.incident.length > 0) {
-      const since = scrub.lastIncidentAt === null ? "unknown" : new Date(scrub.lastIncidentAt).toISOString();
+      const lastTrip = scrub.lastIncidentAt === null ? "unknown" : new Date(scrub.lastIncidentAt).toISOString();
       out.push({
         key: "scrub-incident",
         title: "Scrub breaker holds repairs back",
         detail:
           `Backbone(s) ${scrub.incident.join(", ")} lack articles on many extents at once (an outage, a purge, or throttling). ` +
-          `Repairs there are held to one a run since ${since}. The breaker clears after 8 clean checks in a row. Check the provider.`,
+          `Repairs there are held to one a run (last trip ${lastTrip}). The breaker clears after 8 clean checks in a row. Check the provider.`,
         forMs: 0,
       });
     }
@@ -227,20 +227,27 @@ export function evaluate(snap, env = {}) {
         key: "scrub-stalled",
         title: "Scrub repair stalled",
         detail:
-          `${scrub.stalled - snap.prevScrubStalled} repair(s) still pinned in R2 at their bound ` +
-          "(verify could not post what a backbone lacks). The copy in R2 and the other backbone still hold the data. " +
-          "See the outbox rows in stage 'dead' and the scrub-stalled log line.",
+          `${scrub.stalled - snap.prevScrubStalled} scrub repair(s) still pinned in R2 at their bound: verify could not make every backbone hold the extent again. ` +
+          "The scrub-stalled line in the S3 Worker log says whether the safety copy is intact, written again or missing; the extent's outbox row is in stage verify.",
         forMs: 0,
       });
     }
+  }
 
-    const staleMs = setting(env, "SCRUB_STALE_SECS") * 1000;
-    if (staleMs > 0 && (scrub.lastRunAt === null || now - scrub.lastRunAt > staleMs)) {
+  const staleMs = setting(env, "SCRUB_STALE_SECS") * 1000;
+  if (staleMs > 0) {
+    let detail;
+    if (snap.scrubMissing) {
+      detail = "The catalogue has no scrub_state (migration 0023 not applied) while SCRUB_STALE_SECS is set.";
+    } else if (scrub && (scrub.lastRunAt === null || now - scrub.lastRunAt > staleMs)) {
       const lastRun = scrub.lastRunAt === null ? "never ran" : `last ran ${ageText(now - scrub.lastRunAt)} ago`;
+      detail = `The scrub ${lastRun} (threshold ${ageText(staleMs)}). Check SCRUB, the cron and the aux queue.`;
+    }
+    if (detail) {
       out.push({
         key: "scrub-stopped",
         title: "Scrub not running",
-        detail: `The scrub ${lastRun} (threshold ${ageText(staleMs)}). Check SCRUB, the cron and the aux queue.`,
+        detail,
         forMs: 0,
       });
     }
