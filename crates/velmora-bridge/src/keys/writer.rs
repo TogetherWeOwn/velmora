@@ -59,8 +59,8 @@ use velmora::rng::FillRandom;
 
 use super::chain::Put;
 use super::checkpoint::{
-    advance, checkpoint_name, read_key_chain, reopen_closed, reopen_from_checkpoints,
-    seal_checkpoint, CHECKPOINT_EVERY,
+    advance, checkpoint_name, may_hold_private, read_key_chain, reopen_closed,
+    reopen_from_checkpoints, seal_checkpoint, CHECKPOINT_EVERY,
 };
 use super::ports::{
     Admission, ControlChain, ControlIntents, KeyAdmission, KeyTarget, OpeningChange, Refusal,
@@ -508,16 +508,41 @@ pub(super) struct Acks {
 }
 
 /// The subjects of `table` whose private part did not open, revoked ones
-/// aside: held `disabled` wherever applied. `gone`: those whose private
-/// part is sealed under a key version the ring marks gone (AM-11), which
-/// never open again; otherwise the others, which a later run opens.
-fn closed_subjects<T: TkRing>(table: &KeyTable, ring: &T, gone: bool) -> Vec<String> {
+/// aside: held `disabled` wherever applied.
+fn closed_subjects(table: &KeyTable) -> Vec<String> {
     table
         .entries()
         .filter(|e| e.private.is_none() && e.door.status != SubjectStatus::Revoked)
-        .filter(|e| ring.gone(e.tk_version) == gone)
         .map(|e| e.door.id.clone())
         .collect()
+}
+
+/// The closed subjects of `table` whose private part is lost for good
+/// (AM-11): sealed under a key version the ring marks gone, with a ring
+/// that loaded every other committed version, and no checkpoint that may
+/// still carry it. Anything less is a closed subject to retry.
+async fn lost_subjects<S: RecordStore, K: Kek, T: TkRing>(
+    store: &S,
+    kek: &K,
+    ring: &T,
+    table: &KeyTable,
+) -> BTreeSet<String> {
+    let mut lost = BTreeSet::new();
+    if ring.partial() {
+        return lost;
+    }
+    for e in table.entries() {
+        if e.private.is_some()
+            || e.door.status == SubjectStatus::Revoked
+            || !ring.gone(e.tk_version)
+        {
+            continue;
+        }
+        if !may_hold_private(store, kek, ring, table.tenant(), &e.door.id, e.private_seq).await {
+            lost.insert(e.door.id.clone());
+        }
+    }
+    lost
 }
 
 impl<S, K, T, A, I, U, D, C> KeyEnv<'_, S, K, T, A, I, U, D, C>
@@ -572,7 +597,7 @@ where
             Class::Closing => acks.closed,
             Class::Opening => acks.units && acks.directory,
         };
-        if acks.units && acks.directory && closed_subjects(table, self.ring, false).is_empty() {
+        if acks.units && acks.directory && closed_subjects(table).is_empty() {
             let _ = self
                 .intents
                 .clear(self.tenant, ControlChain::Keys, seq)
@@ -907,13 +932,13 @@ where
         .await
         .is_ok()
     {
+        let lost = lost_subjects(env.store, env.kek, env.ring, &table).await;
         let gone: Vec<String> = table
             .entries()
             .filter(|e| {
-                e.private.is_none()
+                lost.contains(&e.door.id)
                     && e.door.status == SubjectStatus::Active
                     && !read.revoked.contains(&e.door.id)
-                    && env.ring.gone(e.tk_version)
             })
             .map(|e| e.door.id.clone())
             .collect();
@@ -985,8 +1010,12 @@ where
     }
 
     report.head = table.seq();
-    report.closed = closed_subjects(&table, env.ring, false);
-    report.gone = closed_subjects(&table, env.ring, true);
+    let lost = lost_subjects(env.store, env.kek, env.ring, &table).await;
+    let (gone, closed): (Vec<String>, Vec<String>) = closed_subjects(&table)
+        .into_iter()
+        .partition(|id| lost.contains(id));
+    report.closed = closed;
+    report.gone = gone;
     if !report.retry() {
         let _ = env
             .intents

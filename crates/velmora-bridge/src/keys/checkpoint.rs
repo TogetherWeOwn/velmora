@@ -433,6 +433,53 @@ async fn reopen_from_older<S: RecordStore, K: Kek, T: TkRing>(
     Ok(())
 }
 
+/// Whether a checkpoint of `tenant` may still carry the private part of
+/// `id` recorded at `private_seq` under a key version the ring does not
+/// mark gone: one at or after that seq that cannot be read or verified,
+/// or one sealed under a version that is not gone and naming the subject
+/// open with that `private_seq`. A reader that finds one must not take
+/// the private part for lost (AM-11): a transient error is not a loss.
+pub(super) async fn may_hold_private<S: RecordStore, K: Kek, T: TkRing>(
+    store: &S,
+    kek: &K,
+    ring: &T,
+    tenant: &TenantId,
+    id: &str,
+    private_seq: u64,
+) -> bool {
+    let Ok(checkpoints) = list_checkpoints(store, tenant).await else {
+        return true;
+    };
+    for seq in checkpoints.into_iter().filter(|s| *s >= private_seq) {
+        let name = checkpoint_name(tenant, seq);
+        let Ok(Some(bytes)) = store.get(&name).await else {
+            return true;
+        };
+        let Ok(opened) = parse_control(&bytes)
+            .and_then(|c| c.open_door(kek, &name, ControlOwner::Managed(tenant)))
+        else {
+            return true;
+        };
+        let PrivateKeyRef::Tenant(version) = opened.private_key() else {
+            return true;
+        };
+        if ring.gone(version) {
+            continue;
+        }
+        let Ok(door) = serde_json::from_slice::<CheckpointDoor>(opened.door()) else {
+            return true;
+        };
+        if door
+            .subjects
+            .iter()
+            .any(|d| d.door.id == id && d.open && d.private_seq == private_seq)
+        {
+            return true;
+        }
+    }
+    false
+}
+
 fn is_record_error(e: &BridgeError) -> bool {
     matches!(e, BridgeError::Invalid(m) if *m == "key record is malformed")
 }

@@ -386,6 +386,13 @@ pub trait TkRing {
     fn gone(&self, _version: u32) -> bool {
         false
     }
+    /// Whether some committed version did not load now (a transient
+    /// error). A reader with a partial ring must not take a private part
+    /// for lost: what it cannot open may be in a checkpoint sealed under
+    /// the missing version.
+    fn partial(&self) -> bool {
+        false
+    }
 }
 
 /// A ring with one key version (tests, and a tenant before its first

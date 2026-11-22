@@ -3639,3 +3639,90 @@ async fn subjects_under_a_gone_version_are_disabled_reported_and_not_retried() {
         assert_eq!(again.gone, report.gone);
     }
 }
+
+/// A ring with version 3 current, the keys `held`, and the versions
+/// `gone` marked gone; `partial`: a committed version did not load.
+struct Ring3 {
+    keys: Vec<TenantKey>,
+    gone: Vec<u32>,
+    partial: bool,
+}
+
+impl velmora_bridge::keys::record::TkRing for Ring3 {
+    fn current(&self) -> Option<&TenantKey> {
+        self.keys.iter().find(|k| k.version() == 3)
+    }
+    fn key(&self, v: u32) -> Option<&TenantKey> {
+        self.keys.iter().find(|k| k.version() == v)
+    }
+    fn gone(&self, v: u32) -> bool {
+        self.gone.contains(&v)
+    }
+    fn partial(&self) -> bool {
+        self.partial
+    }
+}
+
+/// (Review of the gone-disable.) Version 1 is gone, but a checkpoint
+/// sealed under version 2 carries both subjects whole. While version 2
+/// does not load (a partial ring), or is merely missing from the ring,
+/// nothing is disabled and the run is retried; with version 2 loaded the
+/// subjects open; only with version 2 gone too are they disabled.
+#[tokio::test(flavor = "current_thread")]
+async fn a_private_part_a_checkpoint_may_hold_is_never_taken_for_lost() {
+    let tk = |v: u32| TenantKey::from_bytes(&tenant(1), v, derived(&format!("tk {v}"))).unwrap();
+    for (case, held, gone, partial, checkpoint) in [
+        ("v2 did not load", vec![3], vec![1], true, true),
+        ("v2 missing, not gone", vec![3], vec![1], false, true),
+        ("v2 loaded", vec![2, 3], vec![1], false, true),
+        ("v2 gone too", vec![3], vec![1, 2], false, true),
+        ("no checkpoint, partial ring", vec![3], vec![1], true, false),
+        ("no checkpoint", vec![3], vec![1], false, false),
+    ] {
+        let w = World::new();
+        let adm = FakeAdmission::new(&w.root);
+        let table = seed(&w, &adm).await;
+        // A checkpoint at seq 2, sealed under version 2.
+        let record = key_chain(&w.t).get(&w.store, 2).await.unwrap();
+        let sealed = velmora_bridge::keys::checkpoint::seal_checkpoint(
+            &w.kek,
+            &OneKey(tk(2)),
+            &table,
+            &record,
+            &mut TestRng(230),
+        )
+        .unwrap();
+        if checkpoint {
+            w.store.plant(
+                &velmora_bridge::keys::checkpoint::checkpoint_name(&w.t, 2),
+                sealed,
+            );
+        }
+        let ring = Ring3 {
+            keys: held.iter().map(|v| tk(*v)).collect(),
+            gone,
+            partial,
+        };
+        let units = w.units();
+        let env = env_with!(w, &ring, &adm, &units);
+        let report = finish_keys(&env, &mut TestRng(231)).await.unwrap();
+        let both = vec!["AKVL0001".to_owned(), "PR0001".to_owned()];
+        match case {
+            "v2 gone too" | "no checkpoint" => {
+                assert_eq!(report.gone, both, "{case}");
+                assert_eq!(report.gone_disabled.len(), 2, "{case}");
+            }
+            "v2 loaded" => {
+                assert!(report.gone.is_empty() && report.closed.is_empty(), "{case}");
+                assert!(!report.retry(), "{case}");
+            }
+            _ => {
+                assert!(report.gone.is_empty(), "{case}");
+                assert!(report.gone_disabled.is_empty(), "{case}");
+                assert_eq!(report.closed, both, "{case}");
+                assert!(report.retry(), "{case}");
+                assert_eq!(w.root.status("AKVL0001"), Some(SubjectStatus::Active));
+            }
+        }
+    }
+}

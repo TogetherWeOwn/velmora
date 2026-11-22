@@ -627,7 +627,9 @@ pub async fn load_ring<S: RecordStore, K: Kek, T: Clock, C: KeyVersionClaims>(
             Err(_) => failed.push(version),
         }
     }
-    let ring = LoadedRing::new(current_key, others)?.with_gone(gone);
+    let ring = LoadedRing::new(current_key, others)?
+        .with_gone(gone)
+        .with_partial(!failed.is_empty());
     Ok(RingLoad { ring, failed })
 }
 
@@ -734,6 +736,7 @@ pub struct LoadedRing {
     current: Rc<TenantKey>,
     others: Vec<Rc<TenantKey>>,
     gone: BTreeSet<u32>,
+    partial: bool,
 }
 
 impl LoadedRing {
@@ -753,6 +756,7 @@ impl LoadedRing {
             current,
             others,
             gone: BTreeSet::new(),
+            partial: false,
         })
     }
 
@@ -763,6 +767,13 @@ impl LoadedRing {
             .into_iter()
             .filter(|v| self.key(*v).is_none())
             .collect();
+        self
+    }
+
+    /// The ring with `partial` set when a committed version did not load
+    /// now ([`TkRing::partial`]).
+    pub fn with_partial(mut self, partial: bool) -> LoadedRing {
+        self.partial = partial;
         self
     }
 }
@@ -781,5 +792,9 @@ impl TkRing for LoadedRing {
 
     fn gone(&self, version: u32) -> bool {
         self.gone.contains(&version)
+    }
+
+    fn partial(&self) -> bool {
+        self.partial
     }
 }
