@@ -169,7 +169,8 @@ pub trait GateSteps {
     /// Step 7, after the pending table was emptied: run the finisher for
     /// every tenant whose chain head is above its root unit's seq.
     async fn finisher(&self) -> Result<StepReport>;
-    /// Step 8: a new epoch of the event feed; the shred brake and the
+    /// Step 8: a new epoch of the event feed (with this run's epoch,
+    /// [`super::store::SqlDirectory::start_feed_epoch`]); the shred brake and the
     /// delete caps restart as used up for the current window, the other
     /// counters at zero. It refuses an epoch below the newest it has
     /// started: a run that was closed over may reach it late.

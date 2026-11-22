@@ -699,7 +699,7 @@ fn tenant_row(row: Row) -> Result<TenantRow> {
     })
 }
 
-fn int(v: u64) -> Result<SqlValue> {
+pub(super) fn int(v: u64) -> Result<SqlValue> {
     i64::try_from(v).map(SqlValue::Int).map_err(|_| ERR_ROW)
 }
 
@@ -707,14 +707,14 @@ fn opt_text(v: Option<&str>) -> SqlValue {
     v.map_or(SqlValue::Null, |s| SqlValue::Text(s.to_string()))
 }
 
-fn text(row: &Row, i: usize) -> Result<String> {
+pub(super) fn text(row: &Row, i: usize) -> Result<String> {
     match row.get(i) {
         Some(SqlValue::Text(s)) => Ok(s.clone()),
         _ => Err(ERR_ROW),
     }
 }
 
-fn int_at(row: &Row, i: usize) -> Result<i64> {
+pub(super) fn int_at(row: &Row, i: usize) -> Result<i64> {
     match row.get(i) {
         Some(SqlValue::Int(v)) => Ok(*v),
         _ => Err(ERR_ROW),
