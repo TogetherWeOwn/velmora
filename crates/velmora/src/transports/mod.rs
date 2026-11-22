@@ -28,8 +28,16 @@ pub use tokio_tls::{
     connect as connect_native, connect_pinned as connect_native_pinned, NativeTlsTransport,
 };
 
+// Runtime-free, so its tests run natively; the Workers stream is its
+// only user outside them.
+#[cfg(any(test, all(feature = "worker-transport", target_arch = "wasm32")))]
+mod chunk_reader;
+
 #[cfg(all(feature = "worker-transport", target_arch = "wasm32"))]
 pub mod worker_socket;
+
+#[cfg(all(feature = "worker-transport", target_arch = "wasm32"))]
+mod worker_stream;
 
 #[cfg(all(feature = "worker-transport", target_arch = "wasm32"))]
 pub use worker_socket::WorkerTransport;

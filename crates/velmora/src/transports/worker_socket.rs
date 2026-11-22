@@ -1,8 +1,9 @@
 //! Cloudflare Workers NNTP transport over the runtime `connect()` TCP socket.
 //!
-//! Opens `hostname:port` with [`worker::Socket`] (implicit TLS for NNTPS via
-//! [`SecureTransport::On`](worker::SecureTransport)). The socket already
-//! implements tokio's `AsyncRead`/`AsyncWrite`; per-operation timeouts are
+//! Opens `hostname:port` with the runtime's `connect()` (implicit TLS for
+//! NNTPS, `secureTransport: "on"`) and reads and writes it through
+//! `worker_stream`, which holds one stream reader and one writer for the
+//! connection's life. Per-operation timeouts are
 //! enforced by racing each operation against
 //! [`worker::Delay`](https://docs.rs/worker/latest/worker/struct.Delay.html)
 //! and reporting expiry as [`io::ErrorKind::TimedOut`], matching the native
@@ -19,15 +20,24 @@ use std::time::Duration;
 use futures_util::future::{self, Either};
 use futures_util::task::noop_waker_ref;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use worker::{Delay, SecureTransport, Socket};
+use worker::{Delay, Socket};
+
+use super::worker_stream::WorkerStream;
 
 use crate::nntp::NntpConfig;
 use crate::transport::Transport;
 
 /// Workers transport over a `connect()` TCP socket.
 pub struct WorkerTransport {
-    socket: Socket,
+    io: Io,
     timeout: Duration,
+}
+
+enum Io {
+    /// A socket this transport opened.
+    Stream(WorkerStream),
+    /// A socket the caller opened ([`WorkerTransport::from_socket`]).
+    Socket(Socket),
 }
 
 fn timed_out(op: &'static str) -> io::Error {
@@ -77,16 +87,9 @@ impl WorkerTransport {
     /// enforces the fail-closed [`crate::pinned_transport`] policy before
     /// any socket open.
     pub fn connect(config: &NntpConfig) -> worker::Result<Self> {
-        let secure = if config.tls {
-            SecureTransport::On
-        } else {
-            SecureTransport::Off
-        };
-        let socket = Socket::builder()
-            .secure_transport(secure)
-            .connect(config.host.clone(), config.port)?;
+        let stream = WorkerStream::open(&config.host, config.port, config.tls)?;
         Ok(WorkerTransport {
-            socket,
+            io: Io::Stream(stream),
             timeout: config.timeout,
         })
     }
@@ -94,7 +97,10 @@ impl WorkerTransport {
     /// Wraps an already-connected [`Socket`] (e.g. after `STARTTLS` via
     /// [`Socket::start_tls`], owned by the caller).
     pub fn from_socket(socket: Socket, timeout: Duration) -> Self {
-        WorkerTransport { socket, timeout }
+        WorkerTransport {
+            io: Io::Socket(socket),
+            timeout,
+        }
     }
 }
 
@@ -109,22 +115,37 @@ impl WorkerTransport {
 /// connection counts on the posting path must not rely on this.
 impl Drop for WorkerTransport {
     fn drop(&mut self) {
-        let mut close = pin!(self.socket.close());
-        let mut cx = Context::from_waker(noop_waker_ref());
-        let _ = close.as_mut().poll(&mut cx);
+        match &mut self.io {
+            // The stream asks for the close when it is dropped, below.
+            Io::Stream(_) => {}
+            Io::Socket(socket) => {
+                let mut close = pin!(socket.close());
+                let mut cx = Context::from_waker(noop_waker_ref());
+                let _ = close.as_mut().poll(&mut cx);
+            }
+        }
     }
 }
 
 impl Transport for WorkerTransport {
     async fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        with_timeout(self.timeout, "read", self.socket.read(buf)).await
+        match &mut self.io {
+            Io::Stream(stream) => with_timeout(self.timeout, "read", stream.read(buf)).await,
+            Io::Socket(socket) => with_timeout(self.timeout, "read", socket.read(buf)).await,
+        }
     }
 
     async fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
-        with_timeout(self.timeout, "write", self.socket.write_all(buf)).await
+        match &mut self.io {
+            Io::Stream(stream) => with_timeout(self.timeout, "write", stream.write_all(buf)).await,
+            Io::Socket(socket) => with_timeout(self.timeout, "write", socket.write_all(buf)).await,
+        }
     }
 
     async fn shutdown(&mut self) -> io::Result<()> {
-        with_timeout(self.timeout, "shutdown", self.socket.shutdown()).await
+        match &mut self.io {
+            Io::Stream(stream) => with_timeout(self.timeout, "shutdown", stream.shutdown()).await,
+            Io::Socket(socket) => with_timeout(self.timeout, "shutdown", socket.shutdown()).await,
+        }
     }
 }
