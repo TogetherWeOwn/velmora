@@ -44,7 +44,7 @@ use crate::ports::{BlobStore, Clock};
 use crate::types::{BridgeError, Result, UnixMs};
 use crate::unit::{CallKind, Seqs, TenantId, UnitAnswer, UnitCall, UnitName, UnitOp};
 use crate::unit_lease::client::{
-    Answered, KeyFeed, KeyFinisher, TenantHeads, UnitClient, UnitReplies,
+    Answered, KeyFeed, KeyFinisher, Page, Renewal, Synced, TenantHeads, UnitClient, UnitReplies,
 };
 use crate::unit_lease::renewal::ChainNames;
 
@@ -270,17 +270,18 @@ pub trait UnitRouter {
 
     /// One call to `routed`, carrying its numbers and `listed`, through
     /// the unit client (rule 5 runs there). Under `MAINTENANCE=restore` a
-    /// `Request` call that writes ([`writes`]) is refused before any call.
-    /// `Closed`, `Unborn` and numbers still refused become refusals; any
-    /// other answer is the caller's to map. `renew_due` in the answer asks
-    /// the caller for a background renewal (`waitUntil`).
+    /// call that writes ([`writes`]) is refused before any call. `Closed`,
+    /// `Unborn` and numbers still refused become refusals; any other
+    /// answer is the caller's to map. `renew_due` in the answer asks the
+    /// caller for a background renewal (`waitUntil`). The client's pages
+    /// come with every outcome: the caller logs each as an alert.
     async fn call(
         &self,
         routed: &Routed,
         kind: CallKind,
         authenticated: bool,
         op: UnitOp,
-    ) -> std::result::Result<Answered, RouteRefusal>;
+    ) -> (std::result::Result<Answered, RouteRefusal>, Vec<Page>);
 }
 
 /// A call to a unit that writes on a caller's behalf, for the maintenance
@@ -308,7 +309,7 @@ pub fn writes(kind: CallKind, op: &UnitOp) -> bool {
 /// `UnitClient::call` (rule 5 on the request path).
 #[allow(async_fn_in_trait)]
 pub trait RequestClient {
-    async fn call(&self, call: UnitCall) -> Result<Answered>;
+    async fn call(&self, call: UnitCall) -> (Result<Answered>, Vec<Page>);
 }
 
 impl<U, B, T, N, H, K, F> RequestClient for UnitClient<U, B, T, N, H, K, F>
@@ -321,7 +322,7 @@ where
     K: KeyFeed,
     F: KeyFinisher,
 {
-    async fn call(&self, call: UnitCall) -> Result<Answered> {
+    async fn call(&self, call: UnitCall) -> (Result<Answered>, Vec<Page>) {
         UnitClient::call(self, call).await
     }
 }
@@ -474,15 +475,14 @@ impl<C: RequestClients, H: TenantHeads, T: Clock> UnitRouter for Router<'_, C, H
         kind: CallKind,
         authenticated: bool,
         op: UnitOp,
-    ) -> std::result::Result<Answered, RouteRefusal> {
+    ) -> (std::result::Result<Answered, RouteRefusal>, Vec<Page>) {
         if self.maintenance == Maintenance::Restore && writes(kind, &op) {
-            return Err(RouteRefusal::Maintenance);
+            return (Err(RouteRefusal::Maintenance), Vec::new());
         }
-        let client = self
-            .clients
-            .client(routed)
-            .map_err(|_| RouteRefusal::Unavailable)?;
-        let answered = client
+        let Ok(client) = self.clients.client(routed) else {
+            return (Err(RouteRefusal::Unavailable), Vec::new());
+        };
+        let (answered, pages) = client
             .call(UnitCall {
                 name: routed.unit.clone(),
                 kind,
@@ -491,13 +491,29 @@ impl<C: RequestClients, H: TenantHeads, T: Clock> UnitRouter for Router<'_, C, H
                 listed: routed.listed,
                 op,
             })
-            .await
-            .map_err(|_| RouteRefusal::Unavailable)?;
+            .await;
+        let Ok(answered) = answered else {
+            return (Err(RouteRefusal::Unavailable), pages);
+        };
         let tenant = &routed.unit.tenant;
         if let Some(seqs) = answered.refreshed {
             self.cache.answered(tenant, seqs);
         }
-        match &answered.reply.answer {
+        // What the client's own fix came to names the refusal when the
+        // unit still refused the numbers (AM-50's rows, on the request path).
+        let fixed = match (&answered.renewal, &answered.synced) {
+            (Some(Renewal::Closed { .. }), _) | (_, Some(Synced::LiftPending { .. })) => {
+                Some(RouteRefusal::Closed)
+            }
+            (Some(Renewal::Unborn), _) | (_, Some(Synced::Unborn)) => {
+                Some(RouteRefusal::CatalogueLost)
+            }
+            (Some(Renewal::NotListed), _) | (_, Some(Synced::NotListed)) => {
+                Some(RouteRefusal::NotPlaced)
+            }
+            _ => None,
+        };
+        let result = match &answered.reply.answer {
             UnitAnswer::Closed { .. } => Err(RouteRefusal::Closed),
             UnitAnswer::Unborn { listed: true } => Err(RouteRefusal::CatalogueLost),
             UnitAnswer::Unborn { listed: false } => Err(RouteRefusal::NotPlaced),
@@ -506,14 +522,15 @@ impl<C: RequestClients, H: TenantHeads, T: Clock> UnitRouter for Router<'_, C, H
             | UnitAnswer::RenewNeeded { .. }
                 if kind == CallKind::Request =>
             {
-                Err(RouteRefusal::NotFresh)
+                Err(fixed.unwrap_or(RouteRefusal::NotFresh))
             }
             UnitAnswer::Ok { seqs, .. } => {
                 self.cache.answered(tenant, *seqs);
                 Ok(answered)
             }
             _ => Ok(answered),
-        }
+        };
+        (result, pages)
     }
 }
 
@@ -525,7 +542,7 @@ pub struct NoClients;
 pub enum NoClient {}
 
 impl RequestClient for NoClient {
-    async fn call(&self, _: UnitCall) -> Result<Answered> {
+    async fn call(&self, _: UnitCall) -> (Result<Answered>, Vec<Page>) {
         match *self {}
     }
 }

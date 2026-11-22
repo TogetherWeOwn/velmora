@@ -134,7 +134,7 @@ fn born() -> Unit<RusqliteSql> {
     u.sql()
         .apply(&format!(
             "INSERT INTO buckets(id, name, owner, bdk_wrapped, kek_version, created_at) \
-               VALUES ('{B1}', 'alpha', 'o', x'00', 1, 1); \
+               VALUES ('{B1}', 'alpha', 'o', x'02', 1, 1); \
              INSERT INTO generations(id, bucket_id, key, state, size, etag, content_json, \
                user_meta_json, extent_count, created_at) \
                VALUES ('g_0019a00000000e1e1e1e1e1e1e1e1', '{B1}', 'k', 'live', 20, \
@@ -685,6 +685,111 @@ fn the_first_write_since_the_raise_asks_for_the_alarm_once() {
     ));
     assert_eq!(lease_row(&u).first_write_at, None);
     assert_eq!(u.take_wake(), None);
+}
+
+/// A fresh unit holding the principal `P` (its owner ref `member-1`).
+fn fresh_with_principal() -> Unit<RusqliteSql> {
+    let u = fresh();
+    let a = worker(
+        &u,
+        UnitOp::ApplyKeys {
+            from_seq: 0,
+            entries: vec![principal(1)],
+            answers: vec![],
+        },
+        NOW,
+    );
+    assert!(matches!(a, UnitAnswer::Ok { .. }), "{a:?}");
+    renew(&u, NOW);
+    let _ = u.take_wake();
+    u
+}
+
+/// The six reservation calls of #231, each asking for something new.
+fn reservation_calls() -> Vec<UnitOp> {
+    use velmora_bridge::unit::reserve::{Acting, Hash32, Opening, Rid};
+    vec![
+        UnitOp::Reserve {
+            key_hash: Hash32([1; 32]),
+            fingerprint: Hash32([1; 32]),
+            rid: Rid([1; 16]),
+            acting: Some(Acting::OwnerRef("member-1".into())),
+            opening: Opening::Key {
+                kind: KeyKind::S3,
+                id: "AKWIRE00000000000007".into(),
+                grants: vec![],
+            },
+        },
+        UnitOp::ResolveActing {
+            acting: Acting::OwnerRef("member-1".into()),
+        },
+        UnitOp::Release { rid: Rid([1; 16]) },
+        UnitOp::BindBucket {
+            rid: Rid([1; 16]),
+            expected: None,
+            grant_seq: 1,
+        },
+        UnitOp::ReleaseBound {
+            rid: Rid([1; 16]),
+            bound: None,
+        },
+        UnitOp::BucketBinding { grant_seq: 1 },
+    ]
+}
+
+fn reservations(u: &Unit<RusqliteSql>) -> i64 {
+    u.sql()
+        .with_conn(|c| c.query_row("SELECT count(*) FROM unit_reservations", [], |r| r.get(0)))
+        .unwrap()
+}
+
+/// AM-48: a reservation call that writes makes the alarm's raise due, as
+/// an S3 write does; the first one asks for the alarm.
+#[test]
+fn a_reservation_makes_the_raise_due() {
+    let u = fresh_with_principal();
+    assert_eq!(lease_row(&u).first_write_at, None);
+    let reserve = reservation_calls().remove(0);
+    let a = worker(&u, reserve, NOW);
+    assert!(matches!(a, UnitAnswer::Ok { .. }), "{a:?}");
+    assert_eq!(reservations(&u), 1);
+    assert_eq!(lease_row(&u).first_write_at, Some(NOW));
+    assert_eq!(u.take_wake(), Some(UnixMs(NOW.0 + PERIOD)));
+    // The release writes too, and the first write stays the first.
+    let later = UnixMs(NOW.0 + 1_000);
+    let a = worker(&u, reservation_calls().remove(2), later);
+    assert!(matches!(a, UnitAnswer::Ok { .. }), "{a:?}");
+    assert_eq!(lease_row(&u).first_write_at, Some(NOW));
+    assert_eq!(u.take_wake(), None);
+    // `resolve_acting` is a read: no raise due.
+    let u = fresh_with_principal();
+    let a = worker(&u, reservation_calls().remove(1), NOW);
+    assert!(matches!(a, UnitAnswer::Ok { .. }), "{a:?}");
+    assert_eq!(lease_row(&u).first_write_at, None);
+    assert_eq!(u.take_wake(), None);
+    // `bucket_binding` of a grant nothing is bound to writes its fence
+    // (a later bind of that grant is refused): that write counts.
+    let a = worker(&u, reservation_calls().remove(5), NOW);
+    assert!(matches!(a, UnitAnswer::Ok { .. }), "{a:?}");
+    assert_eq!(lease_row(&u).first_write_at, Some(NOW));
+    assert_eq!(u.take_wake(), Some(UnixMs(NOW.0 + PERIOD)));
+}
+
+/// Rule 12 holds for the reservation calls: on an open unit with an
+/// expired lease each one answers `renew_needed` and writes nothing
+/// (they run after the lease check).
+#[test]
+fn an_expired_lease_refuses_every_reservation_call_and_writes_nothing() {
+    let u = fresh_with_principal();
+    let late = UnixMs(NOW.0 + T + 1);
+    for op in reservation_calls() {
+        let before = changes(&u);
+        let a = worker(&u, op.clone(), late);
+        assert!(renew_needed(None)(&a), "{op:?}: {a:?}");
+        assert_eq!(changes(&u), before, "{op:?}");
+    }
+    assert_eq!(reservations(&u), 0);
+    assert_eq!(lease_row(&u).first_write_at, None);
 }
 
 // ---------------------------------------------------------------------------

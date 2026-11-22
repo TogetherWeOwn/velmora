@@ -115,11 +115,12 @@ const fn line(code: &'static str, alert: bool) -> Line {
 /// names some pages carry stay out of the log line.
 pub fn page_code(page: &Page) -> &'static str {
     match page {
-        Page::StrayRevocationNames(_) => "stray_revocation_names",
+        Page::StrayRevocationNames { .. } => "stray_revocation_names",
         Page::RevocationsShort { .. } => "revocations_short",
         Page::RolledBack => "rolled_back",
         Page::RenewRefused(_) => "renew_refused",
         Page::FinisherNotTold => "finisher_not_told",
+        Page::UnitRefused(_) => "unit_refused",
     }
 }
 
@@ -133,8 +134,9 @@ fn pages(pages: &[Page]) -> impl Iterator<Item = Line> + '_ {
 #[allow(async_fn_in_trait)]
 pub trait ConsumerClient {
     /// `UnitClient::renew`: prove the lease and `renew` (rule 12). `seen`:
-    /// the unit's numbers as its last answer gave them.
-    async fn renew(&self, seen: Seqs) -> Result<(Renewal, Vec<Page>)>;
+    /// the unit's numbers as its last answer gave them. The pages come
+    /// with a failure too.
+    async fn renew(&self, seen: Seqs) -> (Result<Renewal>, Vec<Page>);
     /// `UnitClient::sync`: read and verify both chains, apply the keys
     /// (AM-12), then `sync`.
     async fn sync(&self, seen: Seqs) -> Result<Synced>;
@@ -153,7 +155,7 @@ where
     K: KeyFeed,
     F: KeyFinisher,
 {
-    async fn renew(&self, seen: Seqs) -> Result<(Renewal, Vec<Page>)> {
+    async fn renew(&self, seen: Seqs) -> (Result<Renewal>, Vec<Page>) {
         UnitClient::renew(self, seen).await
     }
     async fn sync(&self, seen: Seqs) -> Result<Synced> {
@@ -173,8 +175,8 @@ pub struct NoClient;
 pub const NO_UNIT_CLIENT: &str = "no unit client in this build";
 
 impl ConsumerClient for NoClient {
-    async fn renew(&self, _: Seqs) -> Result<(Renewal, Vec<Page>)> {
-        Err(BridgeError::NotImplemented(NO_UNIT_CLIENT))
+    async fn renew(&self, _: Seqs) -> (Result<Renewal>, Vec<Page>) {
+        (Err(BridgeError::NotImplemented(NO_UNIT_CLIENT)), Vec::new())
     }
     async fn sync(&self, _: Seqs) -> Result<Synced> {
         Err(BridgeError::NotImplemented(NO_UNIT_CLIENT))
@@ -286,29 +288,24 @@ pub async fn deliver<R: UnitRun, C: ConsumerClient, H: TenantHeads>(
             UnitRefusal::Closed => Next::Done(Delivery::Ack, line("closed", false)),
             UnitRefusal::RenewNeeded(seen) if !renewed => {
                 renewed = true;
-                match client.renew(seen).await {
+                let (renewal, alerts) = client.renew(seen).await;
+                lines.extend(pages(&alerts));
+                match renewal {
                     Err(_) => Next::Done(Delivery::HandBack, line("renew_failed", false)),
-                    Ok((renewal, alerts)) => {
-                        lines.extend(pages(&alerts));
-                        match renewal {
-                            Renewal::Renewed { seqs: renewed, .. } => {
-                                Next::Again(higher(seqs, renewed))
-                            }
-                            Renewal::Closed { .. } => {
-                                Next::Done(Delivery::Ack, line("closed", false))
-                            }
-                            Renewal::Unborn => {
-                                let (d, l) = unborn(heads, unit).await;
-                                Next::Done(d, l)
-                            }
-                            Renewal::NotListed => {
-                                Next::Done(Delivery::Ack, line("not_listed", false))
-                            }
-                            Renewal::Refused => {
-                                Next::Done(Delivery::DEAD_LETTER, line("renew_refused", true))
-                            }
-                        }
+                    Ok(Renewal::Renewed { seqs: renewed, .. }) => {
+                        Next::Again(higher(seqs, renewed))
                     }
+                    Ok(Renewal::Closed { .. }) => Next::Done(Delivery::Ack, line("closed", false)),
+                    Ok(Renewal::Unborn) => {
+                        let (d, l) = unborn(heads, unit).await;
+                        Next::Done(d, l)
+                    }
+                    Ok(Renewal::NotListed) => Next::Done(Delivery::Ack, line("not_listed", false)),
+                    Ok(Renewal::Refused) => {
+                        Next::Done(Delivery::DEAD_LETTER, line("renew_refused", true))
+                    }
+                    // AM-50's shredding row: no job runs, nothing pages.
+                    Ok(Renewal::Shredding) => Next::Done(Delivery::Ack, line("shredding", false)),
                 }
             }
             UnitRefusal::RenewNeeded(_) => {
@@ -385,6 +382,11 @@ pub async fn deliver_unit_job<C: ConsumerClient, H: TenantHeads>(
             lines.push(l);
             d
         }
+        // AM-50's "any other refusal": to the dead-letter queue, paged.
+        client::Delivery::DeadLetter => {
+            lines.push(line("unit_job_refused", true));
+            Delivery::DEAD_LETTER
+        }
     };
     (delivery, lines)
 }
@@ -459,7 +461,7 @@ mod tests {
     /// The unit client: answers what it is told, counts its calls and
     /// keeps the numbers it was given.
     struct Client {
-        renewal: Option<(Renewal, Vec<Page>)>,
+        renewal: (Option<Renewal>, Vec<Page>),
         synced: Option<Synced>,
         job: JobResult,
         renews: Cell<u32>,
@@ -471,13 +473,13 @@ mod tests {
     impl Default for Client {
         fn default() -> Client {
             Client {
-                renewal: Some((
-                    Renewal::Renewed {
+                renewal: (
+                    Some(Renewal::Renewed {
                         seqs: seqs(3, 1),
                         lease_left_ms: 600_000,
-                    },
+                    }),
                     vec![],
-                )),
+                ),
                 synced: Some(Synced::Synced { seqs: seqs(9, 9) }),
                 job: JobResult {
                     delivery: client::Delivery::Ack,
@@ -495,14 +497,14 @@ mod tests {
     impl Client {
         fn failing() -> Client {
             Client {
-                renewal: None,
+                renewal: (None, vec![]),
                 synced: None,
                 ..Client::default()
             }
         }
         fn renewing(renewal: Renewal, pages: Vec<Page>) -> Client {
             Client {
-                renewal: Some((renewal, pages)),
+                renewal: (Some(renewal), pages),
                 ..Client::default()
             }
         }
@@ -518,10 +520,11 @@ mod tests {
     }
 
     impl ConsumerClient for Client {
-        async fn renew(&self, seen: Seqs) -> Result<(Renewal, Vec<Page>)> {
+        async fn renew(&self, seen: Seqs) -> (Result<Renewal>, Vec<Page>) {
             self.renews.set(self.renews.get() + 1);
             self.seen.borrow_mut().push(seen);
-            self.renewal.clone().ok_or(BridgeError::Sql("down".into()))
+            let (renewal, pages) = self.renewal.clone();
+            (renewal.ok_or(BridgeError::Sql("down".into())), pages)
         }
         async fn sync(&self, seen: Seqs) -> Result<Synced> {
             self.syncs.set(self.syncs.get() + 1);
@@ -699,6 +702,13 @@ mod tests {
                 Heads::failing(),
                 Delivery::DEAD_LETTER,
                 vec![("finisher_not_told", true), ("renew_refused", true)],
+            ),
+            (
+                Renewal::Shredding,
+                vec![],
+                Heads::failing(),
+                Delivery::Ack,
+                vec![("shredding", false)],
             ),
         ];
         for (renewal, pages, heads, want, lines) in cases {
@@ -966,6 +976,25 @@ mod tests {
             assert_eq!(d, want);
             assert_eq!(codes(&l), [("unborn", false), code]);
         }
+        // A refusal no row names: dead-letter queue and page.
+        let c = Client {
+            job: JobResult {
+                delivery: client::Delivery::DeadLetter,
+                code: "refused",
+                pages: vec![Page::UnitRefused("wrong_name")],
+            },
+            ..Client::default()
+        };
+        let (d, l) = deliver_unit_job(Maintenance::Off, job, &unit(), seqs(4, 2), &c, &h).await;
+        assert_eq!(d, Delivery::DEAD_LETTER);
+        assert_eq!(
+            codes(&l),
+            [
+                ("unit_refused", true),
+                ("refused", false),
+                ("unit_job_refused", true)
+            ]
+        );
         // This build has no client: handed back.
         let (d, l) =
             deliver_unit_job(Maintenance::Off, job, &unit(), seqs(4, 2), &NoClient, &h).await;
@@ -976,11 +1005,15 @@ mod tests {
     #[test]
     fn page_codes_are_fixed_and_distinct() {
         let all = [
-            Page::StrayRevocationNames(vec!["x".into()]),
+            Page::StrayRevocationNames {
+                first: vec!["x".into()],
+                total: 1,
+            },
             Page::RevocationsShort { listed: 0, held: 1 },
             Page::RolledBack,
             Page::RenewRefused(crate::unit_lease::lease::LeaseRefusal::NoLeaseTable),
             Page::FinisherNotTold,
+            Page::UnitRefused("x"),
         ];
         let codes: std::collections::BTreeSet<_> = all.iter().map(page_code).collect();
         assert_eq!(codes.len(), all.len());

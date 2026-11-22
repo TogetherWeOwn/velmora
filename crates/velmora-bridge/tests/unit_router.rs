@@ -17,7 +17,7 @@ use velmora_bridge::unit::{
     CallKind, Seqs, SyncHead, TenantId, TenantState, UnitAnswer, UnitCall, UnitName, UnitOp,
     UnitReply,
 };
-use velmora_bridge::unit_lease::client::{Answered, TenantHeads};
+use velmora_bridge::unit_lease::client::{Answered, Page, TenantHeads};
 use velmora_bridge::unit_router::{
     test_door, HeadCache, RequestClient, RequestClients, RouteRefusal, Routed, Router, UnitRouter,
     HEAD_MAX_AGE_MS,
@@ -48,6 +48,8 @@ fn answered(answer: UnitAnswer, refreshed: Option<Seqs>) -> Answered {
         },
         refreshed,
         renew_due: false,
+        renewal: None,
+        synced: None,
     }
 }
 
@@ -73,12 +75,15 @@ struct Client {
 }
 
 impl RequestClient for Client {
-    async fn call(&self, call: UnitCall) -> Result<Answered> {
+    async fn call(&self, call: UnitCall) -> (Result<Answered>, Vec<Page>) {
         self.calls.borrow_mut().push(call);
         let mut answers = self.answers.borrow_mut();
         match answers.is_empty() {
-            true => Err(BridgeError::Sql("no answer".into())),
-            false => Ok(answers.remove(0)),
+            true => (
+                Err(BridgeError::Sql("no answer".into())),
+                vec![Page::UnitRefused("down")],
+            ),
+            false => (Ok(answers.remove(0)), vec![]),
         }
     }
 }
@@ -275,7 +280,8 @@ async fn under_restore_writes_answer_503_with_no_unit_call() {
     let routed = r.route(&tenant(), Some("b"), NONE).await.unwrap();
     assert_eq!(
         r.call(&routed, CallKind::Request, true, UnitOp::HeldKeys {})
-            .await,
+            .await
+            .0,
         Err(RouteRefusal::Maintenance)
     );
     assert_eq!(clients.made.get(), 0);
@@ -289,6 +295,7 @@ async fn under_restore_writes_answer_503_with_no_unit_call() {
     assert!(r
         .call(&routed, CallKind::Request, false, read)
         .await
+        .0
         .is_ok());
     let sync = UnitOp::Sync {
         head: SyncHead {
@@ -299,7 +306,11 @@ async fn under_restore_writes_answer_503_with_no_unit_call() {
             lift: None,
         },
     };
-    assert!(r.call(&routed, CallKind::Worker, true, sync).await.is_ok());
+    assert!(r
+        .call(&routed, CallKind::Worker, true, sync)
+        .await
+        .0
+        .is_ok());
     assert_eq!(clients.calls().len(), 2);
 }
 
@@ -472,7 +483,7 @@ async fn under_restore_the_reservation_writes_are_refused() {
             "{op:?}"
         );
         assert_eq!(
-            r.call(&routed, CallKind::Worker, true, op).await,
+            r.call(&routed, CallKind::Worker, true, op).await.0,
             Err(RouteRefusal::Maintenance)
         );
     }
@@ -514,6 +525,7 @@ async fn a_call_carries_the_numbers_and_listed_through_the_client() {
     let got = r
         .call(&routed, CallKind::Request, true, op.clone())
         .await
+        .0
         .unwrap();
     assert_eq!(got.reply.answer, ok(seqs(3, 2)));
     let calls = clients.calls();
@@ -552,6 +564,7 @@ async fn refreshed_numbers_are_kept_and_a_newer_state_reads_the_head_again() {
     let routed = r.route(&tenant(), None, NONE).await.unwrap();
     r.call(&routed, CallKind::Request, true, UnitOp::Ping {})
         .await
+        .0
         .unwrap();
     assert_eq!(
         r.route(&tenant(), None, NONE).await.unwrap().seqs,
@@ -560,6 +573,7 @@ async fn refreshed_numbers_are_kept_and_a_newer_state_reads_the_head_again() {
     assert_eq!(heads.reads(), 1);
     r.call(&routed, CallKind::Request, true, UnitOp::Ping {})
         .await
+        .0
         .unwrap();
     assert_eq!(
         r.route(&tenant(), None, NONE).await.unwrap().seqs,
@@ -610,9 +624,47 @@ async fn closed_unborn_stale_and_an_unreachable_unit_are_refusals() {
         let routed = r.route(&tenant(), None, NONE).await.unwrap();
         assert_eq!(
             r.call(&routed, CallKind::Request, true, UnitOp::Ping {})
-                .await,
+                .await
+                .0,
             Err(want),
             "{answer:?}"
+        );
+    }
+    // The client's fix names the refusal when the unit still refuses.
+    use velmora_bridge::unit_lease::client::{Renewal, Synced};
+    for (renewal, synced, want) in [
+        (Some(Renewal::Unborn), None, RouteRefusal::CatalogueLost),
+        (
+            Some(Renewal::Closed { rolled_back: true }),
+            None,
+            RouteRefusal::Closed,
+        ),
+        (
+            None,
+            Some(Synced::LiftPending { seqs: seqs(3, 0) }),
+            RouteRefusal::Closed,
+        ),
+        (None, Some(Synced::NotListed), RouteRefusal::NotPlaced),
+        (Some(Renewal::Refused), None, RouteRefusal::NotFresh),
+    ] {
+        let mut a = answered(
+            UnitAnswer::RenewNeeded {
+                seqs: seqs(3, 0),
+                why: None,
+            },
+            None,
+        );
+        a.renewal = renewal;
+        a.synced = synced;
+        let clients = Clients::answering(vec![a]);
+        let cache = HeadCache::default();
+        let r = router(Maintenance::Off, &clients, &heads, &cache, &clock);
+        let routed = r.route(&tenant(), None, NONE).await.unwrap();
+        assert_eq!(
+            r.call(&routed, CallKind::Request, true, UnitOp::Ping {})
+                .await
+                .0,
+            Err(want)
         );
     }
     assert!(RouteRefusal::CatalogueLost.alert());
@@ -623,7 +675,8 @@ async fn closed_unborn_stale_and_an_unreachable_unit_are_refusals() {
     let routed = r.route(&tenant(), None, NONE).await.unwrap();
     assert_eq!(
         r.call(&routed, CallKind::Request, true, UnitOp::Ping {})
-            .await,
+            .await
+            .0,
         Err(RouteRefusal::Unavailable)
     );
 }

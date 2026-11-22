@@ -36,10 +36,12 @@
 //! concurrent revoke of another key reached the unit leaves the count
 //! level and the first key alive.
 //!
-//! A value **above** the proven one is accepted. The proof saw no stamp
-//! object after its counter and no record after its seqs at the time it
-//! listed, so a higher value in the unit came from a raise or a `sync`
-//! after `proof_start`. Refusing it would fail the renewals of every busy
+//! A value **above** the proven one is accepted. The proof's stamp counter
+//! is the newest stamp object it listed (or the unit's counter when it
+//! listed none), and it saw no record after its seqs, so a higher value in
+//! the unit came from a raise or a `sync` after `proof_start`. A value
+//! below it is a unit behind its stamp: refused `not_proven`, and the
+//! Worker confirms the rollback through the unit's counter. Refusing it would fail the renewals of every busy
 //! unit, whose stamp moves twice per commit during the 300 ms of a proof.
 //!
 //! A renewal never moves the lease back: of two renewals that cross,
