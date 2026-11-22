@@ -98,24 +98,47 @@ async fn webdav_entry_admits_app_passwords_only() {
 }
 
 #[tokio::test]
-async fn a_marker_from_the_edge_counts_for_nothing() {
+async fn a_marker_beside_edge_headers_admits_no_key() {
     let (rig, s3, app) = two_kinds().await;
     for edge in [
         ("cf-connecting-ip", "192.0.2.1"),
         ("x-forwarded-for", "192.0.2.1"),
     ] {
-        // An app password with a forged marker is still on the S3 entry.
+        // A marker beside an edge header is forged, or a caller of the
+        // WebDAV entrypoint passed edge headers on: neither kind gets in.
+        // The app password is not admitted...
         let got = send(&rig, &app, Method::Put, "/dav/a", &[], b"x", &[MARK, edge]).await;
         assert_eq!(
             (got.status, code(&got).as_str()),
             (403, "InvalidAccessKeyId")
         );
-        // And an S3 key keeps working on it: the marker is ignored.
+        // ...and neither is an S3 key, so the WebDAV entrypoint can never
+        // admit one, whatever headers its caller sends.
         let got = send(&rig, &s3, Method::Put, "/dav/a", &[], b"x", &[MARK, edge]).await;
-        assert_eq!(got.status, 200);
+        assert_eq!(
+            (got.status, code(&got).as_str()),
+            (403, "InvalidAccessKeyId")
+        );
     }
-    // Two markers, or one with another value, is no marker.
+    // Without the marker the S3 key works with the same edge headers.
+    let plain = send(
+        &rig,
+        &s3,
+        Method::Put,
+        "/dav/a",
+        &[],
+        b"x",
+        &[("cf-connecting-ip", "192.0.2.1")],
+    )
+    .await;
+    assert_eq!(plain.status, 200);
+    // Two markers, or one with another value, admits neither kind.
     let two = send(&rig, &app, Method::Get, "/dav/a", &[], b"", &[MARK, MARK]).await;
+    assert_eq!(
+        (two.status, code(&two).as_str()),
+        (403, "InvalidAccessKeyId")
+    );
+    let two = send(&rig, &s3, Method::Get, "/dav/a", &[], b"", &[MARK, MARK]).await;
     assert_eq!(
         (two.status, code(&two).as_str()),
         (403, "InvalidAccessKeyId")

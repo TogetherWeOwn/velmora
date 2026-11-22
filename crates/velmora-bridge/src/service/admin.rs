@@ -964,9 +964,19 @@ pub(super) async fn delete_bucket_s3<
 struct CreateKeyBody {
     buckets: Vec<String>,
     perm: String,
-    /// `s3` (the default) or `app_password` (see `crate::entry`).
-    #[serde(default)]
-    kind: Option<String>,
+    /// `s3` (the default when the field is absent) or `app_password` (see
+    /// `crate::entry`). Kept as raw JSON so that an explicit `null` or a
+    /// non-string is a `400`, not an S3 key.
+    #[serde(default, deserialize_with = "present")]
+    kind: Option<serde_json::Value>,
+}
+
+/// `Some` for a field that is present, `null` included (`Option`'s own
+/// deserializer reads `null` as absent).
+fn present<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<serde_json::Value>, D::Error> {
+    serde::Deserialize::deserialize(deserializer).map(Some)
 }
 
 async fn create_key<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>(
@@ -975,9 +985,11 @@ async fn create_key<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: K
 ) -> Admin<S3Response> {
     let perm =
         Perm::parse(&body.perm).ok_or_else(|| fail(400, "InvalidArgument", "perm is rw or ro."))?;
-    let kind = match body.kind.as_deref() {
+    let kind = match &body.kind {
         None => KeyKind::S3,
-        Some(kind) => KeyKind::parse(kind)
+        Some(kind) => kind
+            .as_str()
+            .and_then(KeyKind::parse)
             .ok_or_else(|| fail(400, "InvalidArgument", "kind is s3 or app_password."))?,
     };
     if body.buckets.is_empty() || body.buckets.len() > MAX_GRANTS {

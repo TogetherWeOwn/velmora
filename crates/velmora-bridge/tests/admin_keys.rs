@@ -1051,7 +1051,16 @@ async fn app_passwords_are_minted_with_their_own_prefix() {
     assert!(kinds.contains(&(s3.akid.clone(), "s3".into())));
 
     let keys_before = rig.count("access_keys");
-    for bad in ["internal", "S3", ""] {
+    // An explicit null or a non-string is no kind either: never a default
+    // S3 key.
+    for bad in [
+        json!("internal"),
+        json!("S3"),
+        json!(""),
+        json!(null),
+        json!(1),
+        json!(["app_password"]),
+    ] {
         let r = admin(
             &rig,
             Method::Post,

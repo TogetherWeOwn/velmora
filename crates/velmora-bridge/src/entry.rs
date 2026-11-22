@@ -20,8 +20,9 @@
 //! request reaches Rust. As a second guard the header counts only when
 //! the request carries none of the headers the edge adds
 //! ([`from_edge`]): a request from the Internet always carries some, a
-//! request over a service binding carries none. A request that fails
-//! either test is an S3 request.
+//! request over a service binding carries none. A request without the
+//! header is an S3 request; one that carries it but fails either test
+//! admits no key at all ([`Entry::Refused`]).
 //!
 //! A credential of the wrong kind for its entry point is treated as an
 //! unknown key (`InvalidAccessKeyId`): it says nothing about whether the
@@ -92,6 +93,13 @@ pub enum Entry {
     S3,
     /// The named entrypoint the WebDAV gateway is bound to.
     WebDav,
+    /// A request whose marker contradicts itself or its other headers
+    /// (a marker beside an edge header, two markers, another value). No
+    /// honest request looks like this: the default entrypoint deletes the
+    /// marker and `DavEntry` sets exactly one. It admits no key, so a
+    /// request that is neither provably S3 nor provably WebDAV is refused
+    /// rather than guessed.
+    Refused,
 }
 
 /// A header the edge adds to every request from the Internet. The same
@@ -118,19 +126,16 @@ pub fn dropped_header(name: &str) -> bool {
 }
 
 impl Entry {
-    /// The entry point of a request with these headers: WebDAV only when
-    /// exactly one [`ENTRY_HEADER`] says so and nothing says the request
-    /// came from the edge.
+    /// The entry point of a request with these headers: S3 when there is
+    /// no [`ENTRY_HEADER`]; WebDAV only when exactly one says so and
+    /// nothing says the request came from the edge; [`Entry::Refused`]
+    /// for any other request that carries the marker.
     pub fn of(headers: &[(String, String)]) -> Entry {
         let mut marks = headers.iter().filter(|(name, _)| name == ENTRY_HEADER);
-        let webdav = matches!(
-            (marks.next(), marks.next()),
-            (Some((_, value)), None) if value == WEBDAV
-        );
-        if webdav && !from_edge(headers) {
-            Entry::WebDav
-        } else {
-            Entry::S3
+        match (marks.next(), marks.next()) {
+            (None, _) => Entry::S3,
+            (Some((_, value)), None) if value == WEBDAV && !from_edge(headers) => Entry::WebDav,
+            _ => Entry::Refused,
         }
     }
 
@@ -176,7 +181,9 @@ mod tests {
             Entry::of(&h(&[("host", "s3.test"), (ENTRY_HEADER, WEBDAV)])),
             Entry::WebDav
         );
-        // Any edge header: the marker is forged or the wrapper is missing.
+        // Any edge header: the marker is forged, the wrapper is missing, or
+        // a caller of `DavEntry` passed edge headers on. Refused, not S3:
+        // an S3 key must not get in through the WebDAV entrypoint either.
         for edge in [
             "cf-connecting-ip",
             "cf-ray",
@@ -187,17 +194,17 @@ mod tests {
         ] {
             assert_eq!(
                 Entry::of(&h(&[(ENTRY_HEADER, WEBDAV), (edge, "1")])),
-                Entry::S3,
+                Entry::Refused,
                 "{edge}"
             );
         }
         // Another value, a value with other case or spaces, or two markers.
         for value in ["WebDAV", " webdav", "webdav ", "s3", ""] {
-            assert_eq!(Entry::of(&h(&[(ENTRY_HEADER, value)])), Entry::S3);
+            assert_eq!(Entry::of(&h(&[(ENTRY_HEADER, value)])), Entry::Refused);
         }
         assert_eq!(
             Entry::of(&h(&[(ENTRY_HEADER, WEBDAV), (ENTRY_HEADER, WEBDAV)])),
-            Entry::S3
+            Entry::Refused
         );
         // Names arrive in lower case; another case is no marker.
         assert_eq!(Entry::of(&h(&[("X-Velmora-Entry", WEBDAV)])), Entry::S3);
@@ -210,6 +217,9 @@ mod tests {
         assert!(Entry::WebDav.admits("APVL0000000000000000"));
         assert!(!Entry::WebDav.admits("AKVL0000000000000000"));
         assert!(!Entry::WebDav.admits("AKIDTESTKEY000000001"));
+        assert!(!Entry::Refused.admits("AKVL0000000000000000"));
+        assert!(!Entry::Refused.admits("APVL0000000000000000"));
+        assert!(!Entry::Refused.admits("AKIDTESTKEY000000001"));
     }
 
     /// The Worker's main module is the wrapper (a revert to the generated
