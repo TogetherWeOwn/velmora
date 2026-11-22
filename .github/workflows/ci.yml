@@ -315,16 +315,23 @@ jobs:
       - run: cargo build --locked -p velmora-test-nntp --bin fakesrv
 
   # The S3 Worker bundle: wasm clippy with the request-target lint
-  # (workers/s3-bridge/clippy.toml bans worker::Request::url), worker-build, size budget.
+  # (workers/s3-bridge/clippy.toml bans worker::Request::url), worker-build,
+  # Cloudflare's size limit, and a size report against main.
   worker-build:
     name: worker build (s3-bridge)
     needs: changes
     if: needs.changes.outputs.bridge == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    permissions:
+      contents: read
+      actions: read # The size report reads main's last measurement (an artifact).
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          # The PR merge commit and its first parent (the base tip), for
+          # the size report.
+          fetch-depth: 2
           persist-credentials: false
       - name: Install Rust stable
         run: |
@@ -343,6 +350,12 @@ jobs:
       - name: Test the entry module (entry.mjs)
         working-directory: workers/s3-bridge
         run: node --test test/*.test.mjs
+      - name: Test the registry path remap of bundle.sh
+        working-directory: workers/s3-bridge
+        run: python3 -I tools/test_registry_src_dirs.py
+      - name: Test the bundle size check and report
+        working-directory: workers/s3-bridge
+        run: python3 -I tools/test_bundle_size.py
       # The script of the deploy job's "Generate the production wrangler
       # config" step, taken from this file and run on the shipped
       # wrangler.toml with made-up values. No credential, no network.
@@ -354,7 +367,7 @@ jobs:
       - name: Build the Worker bundle
         working-directory: workers/s3-bridge
         run: bash bundle.sh
-      - name: Size budget (index_bg.wasm under 3 MB)
+      - name: Bundle contents (stripped, no registry path)
         working-directory: workers/s3-bridge
         run: |
           set -euo pipefail
@@ -362,9 +375,77 @@ jobs:
           # The strip found a `name` section and kept the copy that
           # deploy-build uploads; fails here, not after the merge.
           test -s symbols/index_bg.unstripped.wasm
-          size=$(stat -c %s build/index_bg.wasm)
-          echo "index_bg.wasm: ${size} bytes (budget 3000000)"
-          test "$size" -lt 3000000
+          # bundle.sh remapped the registry source paths of panic
+          # locations to `crates.io/..`; none is left.
+          if grep -a -q '/registry/src/' build/index_bg.wasm; then
+            echo "index_bg.wasm still names a registry source path"
+            exit 1
+          fi
+      - name: Install pinned wrangler (npm ci)
+        working-directory: workers/s3-bridge
+        run: npm ci --ignore-scripts --no-audit --no-fund
+      # The only blocking size check is Cloudflare's own limit: 64 MiB
+      # uncompressed on every plan, no compressed limit
+      # (developers.cloudflare.com/workers/platform/limits/#worker-size),
+      # on what `wrangler deploy --dry-run` would upload (its "Total
+      # Upload"). The other limit, 1 s of start-up, has no CI measurement:
+      # the dry run reports none. Cloudflare measures it on each upload and
+      # refuses a deploy over it (error 10021); it reported 3 to 6 ms for
+      # every bundle from 2.8 to 16.0 MB (2026-11-21).
+      - name: Worker size limit (64 MiB uncompressed upload)
+        working-directory: workers/s3-bridge
+        run: bash tools/size_check.sh "$RUNNER_TEMP/size.json"
+      # Not blocking: the size, its change against main, and a warning
+      # when it grew by more than 1 % or 50,000 bytes, with its measured
+      # cost (about 10.5 ms per MB on a request served by a new isolate).
+      # main's measurement is the artifact of main's run for the base
+      # commit, else the newest one from main.
+      - name: Fetch main's size measurement (not blocking)
+        if: github.event_name == 'pull_request' || github.event_name == 'merge_group'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        # Only gh, jq and unzip see the token; no script of the repo runs here.
+        run: |
+          set -euo pipefail
+          base="$RUNNER_TEMP/base.json"
+          parent=$(git rev-parse HEAD^1)
+          id=$(gh api -X GET "repos/${GITHUB_REPOSITORY}/actions/artifacts" \
+                 -f name=s3-bridge-size -f per_page=100 \
+               | jq -r --arg p "$parent" '
+                   [.artifacts[]
+                    | select(.expired | not)
+                    | select(.workflow_run.head_branch == "main")
+                    | select(.workflow_run.head_repository_id == .workflow_run.repository_id)]
+                   | sort_by(.created_at) | reverse
+                   | ([.[] | select(.workflow_run.head_sha == $p)] + .)
+                   | .[0].id // empty') || id=""
+          if [ -n "$id" ] \
+             && gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts/${id}/zip" > "$RUNNER_TEMP/base.zip" \
+             && unzip -p "$RUNNER_TEMP/base.zip" size.json > "$base"; then
+            :
+          else
+            [ ! -e "$base" ] || rm -- "$base"
+            echo "No size measurement from main could be read; reporting without a delta."
+          fi
+      # Without a token. A failed fetch above still leaves a report.
+      - name: Size report against main (not blocking)
+        if: github.event_name == 'pull_request' || github.event_name == 'merge_group'
+        continue-on-error: true
+        working-directory: workers/s3-bridge
+        run: |
+          set -euo pipefail
+          python3 -I tools/bundle_size.py report "$RUNNER_TEMP/size.json" "$RUNNER_TEMP/base.json" "$(git rev-parse HEAD^1)"
+      # main's measurement, for the reports of later PRs. Never blocks the
+      # release: without it a later report has no delta or an older one.
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        continue-on-error: true
+        with:
+          name: s3-bridge-size
+          path: ${{ runner.temp }}/size.json
+          if-no-files-found: error
+          retention-days: 90
 
   # Local end-to-end slice under `wrangler dev` with the fake NNTP server.
   # Passes with "skipped: no script" until workers/s3-bridge/e2e/slice.sh
@@ -565,7 +646,7 @@ jobs:
         if: steps.fresh.outputs.fresh == 'true'
         run: cargo install --locked worker-build --version 0.8.7
       # The same build as the worker-build job (bundle.sh), and the same
-      # size budget, measured here on the wasm that ships.
+      # size check (Cloudflare's 64 MiB limit), here on the bundle that ships.
       - name: Build the Worker bundle
         if: steps.fresh.outputs.fresh == 'true'
         working-directory: workers/s3-bridge
@@ -573,9 +654,14 @@ jobs:
           set -euo pipefail
           bash bundle.sh
           python3 -I tools/strip_wasm.py check build/index_bg.wasm
-          size=$(stat -c %s build/index_bg.wasm)
-          echo "index_bg.wasm: ${size} bytes (budget 3000000)"
-          test "$size" -lt 3000000
+      - name: Install pinned wrangler (npm ci)
+        if: steps.fresh.outputs.fresh == 'true'
+        working-directory: workers/s3-bridge
+        run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: Worker size limit (64 MiB uncompressed upload)
+        if: steps.fresh.outputs.fresh == 'true'
+        working-directory: workers/s3-bridge
+        run: bash tools/size_check.sh "$RUNNER_TEMP/size.json"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: steps.fresh.outputs.fresh == 'true'
         with:
