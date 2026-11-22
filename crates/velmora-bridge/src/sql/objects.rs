@@ -501,7 +501,7 @@ fn extent_insert(e: &ExtentRow, generation: &GenerationId) -> Result<Stmt> {
             SqlValue::Blob(e.cipher_sha256.to_vec()),
             text(e.safety_state.as_str()),
             opt(e.article_count, |v| SqlValue::Int(i64::from(v))),
-            SqlValue::Int(i64::from(e.plan_rev)),
+            crate::plan_rev::bound(e.plan_rev)?,
             opt(e.last_verified_at, ms),
             opt(e.release_evidence.as_deref(), text),
             opt(e.released_at, ms),

@@ -1367,6 +1367,9 @@ pub async fn write_stored_plan<B: BlobStore, K: Kek>(
     extent: &ExtentRow,
     plan: &StoredPlan,
 ) -> Result<()> {
+    if !crate::plan_rev::readable(extent.plan_rev) {
+        return Err(BridgeError::Invalid(crate::plan_rev::ERR_PLAN_REV));
+    }
     let name = layout.article_key(&extent.id);
     let record = ArticleManifest::of(extent, plan);
     write(
