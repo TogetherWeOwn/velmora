@@ -17,12 +17,22 @@
 //! | `AccountProblem` while the tenant is `shredding` or `shredded` | acknowledged with a log line, no page (the head says the state; a failed read hands back) |
 //! | any other refusal | dead-letter queue and page |
 //!
-//! A job runs once more at most once per delivery. A `renew_needed` or a
-//! `SyncNeeded` after that run hands the message back. Before it runs once
-//! more, the outbox lease its first run took is given back with the new
-//! numbers ([`UnitRun::prepare`]): the run once more must be able to claim
-//! the row, or it would find it leased and acknowledge having done
-//! nothing. If the lease cannot be given back, the message is handed back.
+//! Each fix runs at most once per delivery: the unit's numbers (`Stale`),
+//! a renewal and a `sync`, so a delivery runs the job at most four times.
+//! The same refusal after its fix: a second `Stale` is acknowledged, a
+//! second `renew_needed` or `SyncNeeded` hands the message back. Before
+//! each run once more, the outbox lease the last run took is given back
+//! with the new numbers ([`UnitRun::prepare`]): the run once more must be
+//! able to claim the row, or it would find it leased and acknowledge
+//! having done nothing. If the lease cannot be given back, the message is
+//! handed back. A run the job table gave up (it did not end in time)
+//! never runs once more: its outcome stands.
+//!
+//! A hand-back whose lease could not be given back leaves the row leased:
+//! a redelivery before the lease runs out (600 s) finds it leased and is
+//! acknowledged, and the unit's dispatcher sends the row again once the
+//! lease is over. That delays the work by at most the lease and one
+//! dispatcher period; the row, which is the obligation, stays.
 //!
 //! What the unit client answers besides an error is mapped onto the same
 //! rows: a renewal or a `sync` that finds the unit closed (or a lift
@@ -178,12 +188,22 @@ impl ConsumerClient for NoClient {
     }
 }
 
+/// What one run of the job came to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Ran {
+    pub outcome: JobOutcome,
+    /// The first refusal the unit gave in the run.
+    pub refusal: Option<UnitRefusal>,
+    /// The job ended; `false`: the job table gave it up (it did not end in
+    /// time, or it was dropped), and `outcome` is the table's retry.
+    pub finished: bool,
+}
+
 /// One run of the job against its unit.
 #[allow(async_fn_in_trait)]
 pub trait UnitRun {
-    /// Runs the job with its calls carrying `seqs`, and answers its
-    /// outcome and the first refusal the unit gave in that run.
-    async fn run(&self, seqs: Seqs) -> (JobOutcome, Option<UnitRefusal>);
+    /// Runs the job with its calls carrying `seqs`.
+    async fn run(&self, seqs: Seqs) -> Ran;
     /// Before the job runs once more with `seqs`: gives back, with `seqs`,
     /// the outbox lease the last run took and did not free. `false`: it
     /// could not be given back.
@@ -241,56 +261,76 @@ pub async fn deliver<R: UnitRun, C: ConsumerClient, H: TenantHeads>(
     }
     let mut lines = Vec::new();
     let mut seqs = seqs;
-    let mut again = false;
+    // Each fix once per delivery.
+    let (mut restamped, mut renewed, mut synced) = (false, false, false);
     loop {
-        let (outcome, refusal) = run.run(seqs).await;
-        let Some(refusal) = refusal else {
-            return (Delivery::of(outcome), lines);
+        let ran = run.run(seqs).await;
+        if !ran.finished {
+            // The table's retry stands; a run once more would start late
+            // in this invocation and could outlive it.
+            lines.push(line("job_not_finished", false));
+            return (Delivery::of(ran.outcome), lines);
+        }
+        let Some(refusal) = ran.refusal else {
+            return (Delivery::of(ran.outcome), lines);
         };
         let next = match refusal {
-            UnitRefusal::Stale(unit_seqs) if !again => Next::Again(higher(seqs, unit_seqs)),
+            UnitRefusal::Stale(unit_seqs) if !restamped => {
+                restamped = true;
+                Next::Again(higher(seqs, unit_seqs))
+            }
             UnitRefusal::Stale(_) => Next::Done(Delivery::Ack, line("stale_again", false)),
             UnitRefusal::StaleJob => {
                 Next::Done(Delivery::DEAD_LETTER, line("stale_job_no_numbers", true))
             }
             UnitRefusal::Closed => Next::Done(Delivery::Ack, line("closed", false)),
-            UnitRefusal::RenewNeeded(seen) if !again => match client.renew(seen).await {
-                Err(_) => Next::Done(Delivery::HandBack, line("renew_failed", false)),
-                Ok((renewal, alerts)) => {
-                    lines.extend(pages(&alerts));
-                    match renewal {
-                        Renewal::Renewed { seqs: renewed, .. } => {
-                            Next::Again(higher(seqs, renewed))
-                        }
-                        Renewal::Closed { .. } => Next::Done(Delivery::Ack, line("closed", false)),
-                        Renewal::Unborn => {
-                            let (d, l) = unborn(heads, unit).await;
-                            Next::Done(d, l)
-                        }
-                        Renewal::NotListed => Next::Done(Delivery::Ack, line("not_listed", false)),
-                        Renewal::Refused => {
-                            Next::Done(Delivery::DEAD_LETTER, line("renew_refused", true))
+            UnitRefusal::RenewNeeded(seen) if !renewed => {
+                renewed = true;
+                match client.renew(seen).await {
+                    Err(_) => Next::Done(Delivery::HandBack, line("renew_failed", false)),
+                    Ok((renewal, alerts)) => {
+                        lines.extend(pages(&alerts));
+                        match renewal {
+                            Renewal::Renewed { seqs: renewed, .. } => {
+                                Next::Again(higher(seqs, renewed))
+                            }
+                            Renewal::Closed { .. } => {
+                                Next::Done(Delivery::Ack, line("closed", false))
+                            }
+                            Renewal::Unborn => {
+                                let (d, l) = unborn(heads, unit).await;
+                                Next::Done(d, l)
+                            }
+                            Renewal::NotListed => {
+                                Next::Done(Delivery::Ack, line("not_listed", false))
+                            }
+                            Renewal::Refused => {
+                                Next::Done(Delivery::DEAD_LETTER, line("renew_refused", true))
+                            }
                         }
                     }
                 }
-            },
+            }
             UnitRefusal::RenewNeeded(_) => {
                 Next::Done(Delivery::HandBack, line("renew_needed_again", false))
             }
-            UnitRefusal::SyncNeeded(seen) if !again => match client.sync(seen).await {
-                Err(_) => Next::Done(Delivery::HandBack, line("sync_failed", false)),
-                Ok(Synced::Synced { seqs: synced }) => Next::Again(higher(seqs, synced)),
-                // Only the restore tool's `sync` lifts: the unit stays
-                // closed, as the `Closed` row.
-                Ok(Synced::LiftPending { .. }) => {
-                    Next::Done(Delivery::Ack, line("lift_pending", false))
+            UnitRefusal::SyncNeeded(seen) if !synced => {
+                synced = true;
+                match client.sync(seen).await {
+                    Err(_) => Next::Done(Delivery::HandBack, line("sync_failed", false)),
+                    Ok(Synced::Synced { seqs: synced }) => Next::Again(higher(seqs, synced)),
+                    // Only the restore tool's `sync` lifts: the unit stays
+                    // closed, as the `Closed` row.
+                    Ok(Synced::LiftPending { .. }) => {
+                        Next::Done(Delivery::Ack, line("lift_pending", false))
+                    }
+                    Ok(Synced::Unborn) => {
+                        let (d, l) = unborn(heads, unit).await;
+                        Next::Done(d, l)
+                    }
+                    Ok(Synced::NotListed) => Next::Done(Delivery::Ack, line("not_listed", false)),
                 }
-                Ok(Synced::Unborn) => {
-                    let (d, l) = unborn(heads, unit).await;
-                    Next::Done(d, l)
-                }
-                Ok(Synced::NotListed) => Next::Done(Delivery::Ack, line("not_listed", false)),
-            },
+            }
             UnitRefusal::SyncNeeded(_) => {
                 Next::Done(Delivery::HandBack, line("sync_needed_again", false))
             }
@@ -315,7 +355,6 @@ pub async fn deliver<R: UnitRun, C: ConsumerClient, H: TenantHeads>(
                     return (Delivery::HandBack, lines);
                 }
                 seqs = next;
-                again = true;
             }
         }
     }
@@ -381,6 +420,7 @@ mod tests {
         carried: RefCell<Vec<Seqs>>,
         prepared: RefCell<Vec<Seqs>>,
         give_back: bool,
+        finished: bool,
         outcome: JobOutcome,
     }
 
@@ -391,6 +431,7 @@ mod tests {
                 carried: RefCell::default(),
                 prepared: RefCell::default(),
                 give_back: true,
+                finished: true,
                 outcome: JobOutcome::Retry { delay_secs: 30 },
             }
         }
@@ -400,10 +441,14 @@ mod tests {
     }
 
     impl UnitRun for Script {
-        async fn run(&self, seqs: Seqs) -> (JobOutcome, Option<UnitRefusal>) {
+        async fn run(&self, seqs: Seqs) -> Ran {
             self.carried.borrow_mut().push(seqs);
             let next = self.answers.borrow_mut().pop().flatten();
-            (self.outcome, next)
+            Ran {
+                outcome: self.outcome,
+                refusal: next,
+                finished: self.finished,
+            }
         }
         async fn prepare(&self, seqs: Seqs) -> bool {
             self.prepared.borrow_mut().push(seqs);
@@ -728,19 +773,59 @@ mod tests {
         }
     }
 
-    /// One run once more per delivery, whatever the mix.
+    /// Each fix once per delivery (confirmation review of L6-1, MEDIUM):
+    /// the unit's numbers, then a renewal, then a third run.
     #[tokio::test]
-    async fn one_run_once_more_per_delivery() {
+    async fn each_fix_runs_once_per_delivery() {
         let c = Client::default();
         let s = Script::new(&[
             Some(UnitRefusal::Stale(seqs(5, 2))),
             Some(UnitRefusal::RenewNeeded(seqs(5, 2))),
+            None,
+        ]);
+        let (d, l) = go(&s, &c, &Heads::failing()).await;
+        assert_eq!((d, l), (Delivery::Retry { delay_secs: 30 }, vec![]));
+        assert_eq!(c.calls(), (1, 0, 0));
+        assert_eq!(s.runs().len(), 3);
+        assert_eq!(s.prepared.borrow().len(), 2);
+        // All three fixes, then the same refusal again.
+        let c = Client::syncing(Synced::Synced { seqs: seqs(6, 2) });
+        let s = Script::new(&[
+            Some(UnitRefusal::Stale(seqs(5, 2))),
+            Some(UnitRefusal::RenewNeeded(seqs(5, 2))),
+            Some(UnitRefusal::SyncNeeded(seqs(5, 2))),
+            Some(UnitRefusal::RenewNeeded(seqs(6, 2))),
         ]);
         let (d, l) = go(&s, &c, &Heads::failing()).await;
         assert_eq!(d, Delivery::HandBack);
         assert_eq!(codes(&l), [("renew_needed_again", false)]);
+        assert_eq!(c.calls(), (1, 1, 0));
+        assert_eq!(s.runs().len(), 4);
+        // A shred found after two fixes: acknowledged, no page.
+        let s = Script::new(&[
+            Some(UnitRefusal::Stale(seqs(5, 2))),
+            Some(UnitRefusal::RenewNeeded(seqs(5, 2))),
+            Some(UnitRefusal::AccountProblem),
+        ]);
+        let heads = Heads::of(Lifecycle::Shredding, &[0]);
+        let (d, l) = go(&s, &Client::default(), &heads).await;
+        assert_eq!(d, Delivery::Ack);
+        assert_eq!(codes(&l), [("shredding", false)]);
+    }
+
+    /// A run the job table gave up never runs once more (confirmation
+    /// review of L6-1, LOW): the table's retry stands.
+    #[tokio::test]
+    async fn a_run_given_up_by_the_job_table_is_not_run_once_more() {
+        let mut s = Script::new(&[Some(UnitRefusal::RenewNeeded(seqs(3, 1)))]);
+        s.finished = false;
+        let c = Client::default();
+        let (d, l) = go(&s, &c, &Heads::failing()).await;
+        assert_eq!(d, Delivery::Retry { delay_secs: 30 });
+        assert_eq!(codes(&l), [("job_not_finished", false)]);
+        assert_eq!(s.runs().len(), 1);
+        assert!(s.prepared.borrow().is_empty());
         assert_eq!(c.calls(), (0, 0, 0));
-        assert_eq!(s.runs().len(), 2);
     }
 
     #[tokio::test]
