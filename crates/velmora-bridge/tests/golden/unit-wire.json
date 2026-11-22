@@ -3191,6 +3191,29 @@
         "keys_seq": 3,
         "state_seq": 7
       }
+    },
+    {
+      "authenticated": true,
+      "kind": "request",
+      "listed": true,
+      "name": {
+        "tenant": "t_00000000000000f1",
+        "unit": 0
+      },
+      "op": {
+        "call": {
+          "bucket": "b_00000000000000f1",
+          "key": "k",
+          "m": "fence_upload",
+          "revision": 1,
+          "upload": "u_00000000000000f1"
+        },
+        "op": "request"
+      },
+      "seqs": {
+        "keys_seq": 3,
+        "state_seq": 7
+      }
     }
   ]
 }

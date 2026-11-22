@@ -346,6 +346,17 @@ pub enum RequestCall {
         upload: UploadId,
         now: UnixMs,
     },
+    /// Settles a `complete_upload` whose answer was lost: moves the
+    /// upload to its next revision while it is still open at `revision`,
+    /// and answers whether that applied (then the Complete had not, and
+    /// never will). Complete's own settling of an unknown outcome on
+    /// tenant 0, across `fetch`.
+    fence_upload {
+        bucket: BucketId,
+        key: String,
+        upload: UploadId,
+        revision: u64,
+    },
 }
 
 impl RequestCall {
@@ -402,6 +413,7 @@ impl RequestCall {
             RequestCall::put_upload_part_sliced { .. } => "put_upload_part_sliced",
             RequestCall::complete_upload { .. } => "complete_upload",
             RequestCall::abort_upload { .. } => "abort_upload",
+            RequestCall::fence_upload { .. } => "fence_upload",
         }
     }
 
@@ -458,7 +470,8 @@ impl RequestCall {
             | RequestCall::put_upload_part { .. }
             | RequestCall::put_upload_part_sliced { .. }
             | RequestCall::complete_upload { .. }
-            | RequestCall::abort_upload { .. } => false,
+            | RequestCall::abort_upload { .. }
+            | RequestCall::fence_upload { .. } => false,
         }
     }
 
@@ -531,17 +544,20 @@ impl RequestCall {
             | RequestCall::delete_object_before { key: k, .. }
             | RequestCall::delete_object_if { key: k, .. }
             | RequestCall::put_upload_part { key: k, .. }
-            | RequestCall::abort_upload { key: k, .. } => key(k),
+            | RequestCall::abort_upload { key: k, .. }
+            | RequestCall::fence_upload { key: k, .. } => key(k),
             RequestCall::key_heads { keys, .. } => page(keys.len()) && keys.iter().all(|k| key(k)),
+            // A page asks for one row more than it shows, to know whether
+            // it is the last.
             RequestCall::list { q, .. } | RequestCall::list_heads { q, .. } => {
-                q.max_keys <= MAX_PAGE
+                q.max_keys <= MAX_PAGE + 1
                     && key(&q.prefix)
                     && opt(&q.delimiter)
                     && opt(&q.after)
                     && opt(&q.skip_prefix)
             }
             RequestCall::list_uploads { q, .. } => {
-                q.limit <= MAX_PAGE
+                q.limit <= MAX_PAGE + 1
                     && key(&q.prefix)
                     && opt(&q.skip_prefix)
                     && q.after.as_ref().is_none_or(|(k, _)| key(k))
@@ -821,6 +837,15 @@ impl RequestCall {
                 upload,
                 now,
             } => answer(Catalog::abort_upload(cat, &target(&bucket, &key, &upload), now).await?),
+            RequestCall::fence_upload {
+                bucket,
+                key,
+                upload,
+                revision,
+            } => answer(
+                cat.fence_upload(&target(&bucket, &key, &upload), revision)
+                    .await?,
+            ),
         }
     }
 }

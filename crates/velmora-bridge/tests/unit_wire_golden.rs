@@ -167,7 +167,8 @@ fn request_kind(c: &RequestCall) -> &'static str {
         | RequestCall::put_upload_part { .. }
         | RequestCall::put_upload_part_sliced { .. }
         | RequestCall::complete_upload { .. }
-        | RequestCall::abort_upload { .. } => c.name(),
+        | RequestCall::abort_upload { .. }
+        | RequestCall::fence_upload { .. } => c.name(),
     }
 }
 
@@ -1011,6 +1012,12 @@ fn requests() -> Vec<RequestCall> {
             upload: upload_id(),
             now: UnixMs(1_000),
         },
+        RequestCall::fence_upload {
+            bucket: b(),
+            key: k(),
+            upload: upload_id(),
+            revision: 1,
+        },
     ]
 }
 
@@ -1204,7 +1211,7 @@ fn every_variant_has_a_sample() {
     let ops: std::collections::BTreeSet<_> = ops().iter().map(op_kind).collect();
     assert_eq!(ops.len(), 29, "{ops:?}");
     let requests: std::collections::BTreeSet<_> = requests().iter().map(request_kind).collect();
-    assert_eq!(requests.len(), 50, "{requests:?}");
+    assert_eq!(requests.len(), 51, "{requests:?}");
     let readers: std::collections::BTreeSet<_> = ops_readers().into_iter().collect();
     assert_eq!(readers.len(), 2, "both readers have a sample");
     // The variants that carry data, each with a sample (exhaustive).
