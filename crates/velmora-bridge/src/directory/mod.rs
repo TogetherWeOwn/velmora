@@ -19,8 +19,14 @@
 //!   marker, the freeze triggers, the legacy stamp, and the thaw;
 //! - [`move_copy`]: the move's copy of the frozen D1's rows into the
 //!   owner's root unit, by bounded pages and resumable import batches;
-//! - [`move_flip`]: the move's flip (legacy stamp, the unit opened, the
-//!   routes, tenant 0 `moved`) and its give-up before the flip;
+//! - [`move_flip`]: the move's flip (legacy stamp, the unit opened by the
+//!   `move` report, the routes, tenant 0 `moved`), its give-up before the
+//!   flip, and the exit that removes the moved-in placements;
+//! - [`move_keys`]: the move's key steps on the unit (the direct key
+//!   apply, the revocation sweep, step 9's check) and the give-up's
+//!   revocations on the thawed D1;
+//! - [`move_preflight`]: the read-only counts of precondition P2 that
+//!   stop the move before its window;
 //! - [`tenant_zero`]: whether tenant 0 may be served from the D1
 //!   catalogue, from its record and the database's own marker, and the
 //!   route of a request when the directory cannot be read.
@@ -33,6 +39,8 @@ pub mod fence;
 pub mod gate;
 pub mod move_copy;
 pub mod move_flip;
+pub mod move_keys;
+pub mod move_preflight;
 pub mod record;
 pub mod store;
 pub mod tenant_zero;

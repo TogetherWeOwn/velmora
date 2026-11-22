@@ -393,6 +393,27 @@ pub struct BucketsMovedIn {
     pub buckets: Vec<String>,
 }
 
+/// The move that filled this tenant with tenant 0's buckets: the seq of
+/// tenant 0's `moving` head that admitted the first placement. Carried
+/// from the record that places them until the record that removes them
+/// (AM-23): it ties `UnplaceMovedBuckets` to a tenant that a move filled.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MovedIn {
+    pub zero_seq: u64,
+}
+
+/// The `restoring` entry a record lifts, with the lift the unit checks
+/// (ADR §8.6 step 8, AM-2, AM-15): the restore gate's, or the move's
+/// `move` report. Only the record that lifts carries it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Lifted {
+    pub unit: u32,
+    pub since_seq: u64,
+    pub proof: crate::unit::lift::LiftProof,
+}
+
 /// The door part of a tenant record. See the [module](self).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -454,6 +475,17 @@ pub struct TenantDoor {
     /// The owner's moved buckets this record places (this record only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub buckets_moved_in: Option<BucketsMovedIn>,
+    /// Set by the record that places moved buckets, cleared by the one
+    /// that removes them; carried in between.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub moved_in: Option<MovedIn>,
+    /// The placements an exit of the move removes, and the tenant-0 seq
+    /// that admitted it (this record only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub buckets_unplaced: Option<BucketsMovedIn>,
+    /// The `restoring` entry this record lifts (this record only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lifted: Option<Lifted>,
     /// The tenant key version in force; 0 for tenant 0, which has none.
     pub tk_version: u32,
     /// The key check value of every committed tenant key version, in
@@ -606,6 +638,9 @@ mod tests {
             max_move_epoch: 0,
             last_grant_seq: 0,
             buckets_moved_in: None,
+            moved_in: None,
+            buckets_unplaced: None,
+            lifted: None,
             bucket_created: None,
             tk_version: 1,
             key_checks: BTreeMap::from([(1, "00".repeat(16))]),

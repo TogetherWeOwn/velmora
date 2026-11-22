@@ -1,25 +1,31 @@
-//! The move's flip: the legacy stamp, the owner's unit opened, the routes
-//! moved, tenant 0 `moved`; finished by a second run after a crash at any
-//! sub-step; and the give-up before the flip.
+//! The move's flip: the legacy stamp, the owner's unit opened by the
+//! move's lift report, the keys and routes moved, tenant 0 `moved`;
+//! finished by a second run after a crash at any sub-step; and the
+//! give-up before the flip, ending in the exit order of AM-23.
 
 mod service_support;
 
 use std::cell::{Cell, RefCell};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::rc::Rc;
 
 use service_support::*;
 use velmora_bridge::directory::chain::{TenantChain, Written};
 use velmora_bridge::directory::fence::{freeze, legacy_stamp_key, stamp_row, thaw};
 use velmora_bridge::directory::move_flip::MAX_WINDOW_RECORDS;
 use velmora_bridge::directory::move_flip::{
-    flip, give_up, FlipError, Flipped, GaveUp, RouteRecords, UnitSync, Window,
+    flip, give_up, FlipError, Flipped, GateView, GaveUp, OwnerUnit, Reported, RouteRecords, Synced,
+    Window,
 };
+use velmora_bridge::directory::move_keys::{KeyUnit, OwnerKeys};
 use velmora_bridge::directory::record::{HoldMode, OperatorReason};
 use velmora_bridge::directory::record::{Selector, Tenant, TenantDoor};
 use velmora_bridge::directory::store::{KeyRoute, RouteKind, SqlDirectory};
 use velmora_bridge::directory::testing::{HookedRecords, PlainSeal};
 use velmora_bridge::directory::transition::{Actor, Change, OperatorHoldRequest, KEY_CHECK_LEN};
 use velmora_bridge::testkit::RusqliteSql;
+use velmora_bridge::unit::keys::{Applied, KeyEntry, KeyKind, SubjectStatus};
+use velmora_bridge::unit::lift::{LiftProof, ReplayId};
 use velmora_bridge::*;
 
 const OWNER: &str = "t_00000000000000a1";
@@ -41,21 +47,288 @@ fn keys() -> Vec<String> {
     KEYS.iter().map(|k| k.to_string()).collect()
 }
 
-/// The owner's root unit: the heads it was synced with.
-#[derive(Default)]
+/// The owner's root unit as L1's package 4 states it: a `move` report
+/// is taken only for the entry the unit is closed under; the `sync` that
+/// lifts needs the stored report's proof; key rows from the chain apply.
 struct FakeUnit {
-    synced: RefCell<Vec<TenantDoor>>,
+    /// Every head the unit was synced with, and the lift it carried.
+    synced: RefCell<Vec<(TenantDoor, Option<LiftProof>)>>,
+    /// The `since_seq` the unit is closed under (`None`: open).
+    closed: Cell<Option<u64>>,
+    /// The stored `move` report.
+    report: RefCell<Option<ReplayId>>,
+    reports: Cell<u32>,
+    /// The next N syncs are not reached.
     fail: Cell<u32>,
+    /// The next N syncs that lift are refused.
+    refuse_lift: Cell<u32>,
+    /// The next N gate reads say the lift would not pass.
+    not_ok: Cell<u32>,
+    renews: Cell<u32>,
+    v9_ok: Cell<bool>,
+    v9_runs: Cell<u32>,
+    nonces: Cell<u32>,
+    keys_seq: Cell<u64>,
+    /// Key status by id, as applied.
+    key_rows: RefCell<BTreeMap<String, SubjectStatus>>,
+    applies: Cell<u32>,
 }
 
-impl UnitSync for FakeUnit {
-    async fn apply_head(&self, owner: &TenantDoor) -> Result<()> {
-        if self.fail.get() > 0 {
-            self.fail.set(self.fail.get() - 1);
+impl Default for FakeUnit {
+    fn default() -> Self {
+        FakeUnit {
+            synced: RefCell::default(),
+            closed: Cell::new(None),
+            report: RefCell::default(),
+            reports: Cell::new(0),
+            fail: Cell::new(0),
+            refuse_lift: Cell::new(0),
+            not_ok: Cell::new(0),
+            renews: Cell::new(0),
+            v9_ok: Cell::new(true),
+            v9_runs: Cell::new(0),
+            nonces: Cell::new(0),
+            keys_seq: Cell::new(0),
+            key_rows: RefCell::default(),
+            applies: Cell::new(0),
+        }
+    }
+}
+
+fn take(c: &Cell<u32>) -> bool {
+    let n = c.get();
+    if n > 0 {
+        c.set(n - 1);
+    }
+    n > 0
+}
+
+impl KeyUnit for FakeUnit {
+    async fn apply_keys(&self, from_seq: u64, entries: &[KeyEntry]) -> Result<Applied> {
+        self.applies.set(self.applies.get() + 1);
+        if from_seq > self.keys_seq.get() {
+            return Ok(Applied::Behind {
+                keys_seq: self.keys_seq.get(),
+            });
+        }
+        for e in entries {
+            assert!(!e.held, "the move sends no held entry");
+            if e.last_seq > self.keys_seq.get() {
+                let mut rows = self.key_rows.borrow_mut();
+                // Revoked is final.
+                if rows.get(&e.id) != Some(&SubjectStatus::Revoked) {
+                    rows.insert(e.id.clone(), e.status);
+                }
+            }
+        }
+        let last = entries.last().map_or(0, |e| e.last_seq);
+        self.keys_seq.set(self.keys_seq.get().max(last));
+        Ok(Applied::Done {
+            keys_seq: self.keys_seq.get(),
+            applied: entries.len() as u64,
+            skipped: 0,
+        })
+    }
+
+    async fn key_active(&self, akid: &str) -> Result<bool> {
+        Ok(self.key_rows.borrow().get(akid) == Some(&SubjectStatus::Active))
+    }
+}
+
+impl OwnerUnit for FakeUnit {
+    async fn sync(&self, owner: &TenantDoor, lift: Option<&LiftProof>) -> Result<Synced> {
+        if take(&self.fail) {
             return Err(BridgeError::Blob("unit unreachable".into()));
         }
-        self.synced.borrow_mut().push(owner.clone());
+        match owner.restoring_entry(0) {
+            Some(e) => self.closed.set(Some(e.since_seq)),
+            None => {
+                // The in-unit lift check: the stored report, for the entry
+                // the unit is closed under, named by the sync.
+                let report = self.report.borrow().clone();
+                let ok = match (lift, &report, self.closed.get()) {
+                    (_, _, None) => true,
+                    (Some(l), Some(r), Some(s)) => l.replay_id == *r && r.since == s,
+                    _ => false,
+                };
+                if !ok {
+                    return Ok(Synced::Refused("proof_mismatch".into()));
+                }
+                if self.closed.get().is_some() && take(&self.refuse_lift) {
+                    return Ok(Synced::Refused("closed".into()));
+                }
+                self.closed.set(None);
+            }
+        }
+        self.synced
+            .borrow_mut()
+            .push((owner.clone(), lift.cloned()));
+        Ok(Synced::Ok)
+    }
+
+    async fn renew(&self) -> Result<()> {
+        assert!(self.closed.get().is_none(), "a closed unit refuses renew");
+        self.renews.set(self.renews.get() + 1);
         Ok(())
+    }
+
+    async fn stamp_ordinal(&self) -> Result<u64> {
+        Ok(2)
+    }
+
+    async fn report_move(&self, zero: &TenantDoor, replay_id: &ReplayId) -> Result<Reported> {
+        let moving = zero
+            .tenant_zero
+            .as_ref()
+            .is_some_and(|z| z.selector == Selector::Moving);
+        if !moving || self.closed.get() != Some(replay_id.since) {
+            return Ok(Reported::Refused("not_this_window".into()));
+        }
+        self.reports.set(self.reports.get() + 1);
+        *self.report.borrow_mut() = Some(replay_id.clone());
+        Ok(Reported::Done)
+    }
+
+    async fn gate_status(&self) -> Result<GateView> {
+        let report = self.report.borrow().clone();
+        let lift_ok = report
+            .as_ref()
+            .is_some_and(|r| Some(r.since) == self.closed.get())
+            && !take(&self.not_ok);
+        Ok(GateView {
+            kind_move: report.is_some(),
+            lift_ok,
+            proof: report.clone().map(|replay_id| LiftProof {
+                replay_id,
+                acknowledged: Default::default(),
+            }),
+            replay_id: report,
+        })
+    }
+
+    async fn v9(&self) -> Result<bool> {
+        assert!(self.closed.get().is_none(), "V9 reads an open unit");
+        self.v9_runs.set(self.v9_runs.get() + 1);
+        Ok(self.v9_ok.get())
+    }
+
+    fn nonce(&self) -> String {
+        self.nonces.set(self.nonces.get() + 1);
+        format!("n{}", self.nonces.get())
+    }
+}
+
+/// The owner's key chain (one entry per record) and the revocations.
+#[derive(Default)]
+struct FakeKeys {
+    chain: RefCell<Vec<KeyEntry>>,
+    flat: RefCell<BTreeSet<String>>,
+    tenant: RefCell<BTreeSet<String>>,
+    /// The bucket lists of every grant revocation, in order.
+    grants_revoked: RefCell<Vec<Vec<String>>>,
+    /// The next N grant revocations are not reached.
+    fail_grants: Cell<u32>,
+    /// What happened, in order; a test may add the chain's puts.
+    log: Rc<RefCell<Vec<String>>>,
+}
+
+fn entry(id: &str, status: SubjectStatus, seq: u64) -> KeyEntry {
+    KeyEntry {
+        id: id.into(),
+        kind: KeyKind::S3,
+        status,
+        held: false,
+        made_by: Some("PRowner".into()),
+        grants: vec![],
+        created_at: 1,
+        secret_wrapped: (status == SubjectStatus::Active).then(|| vec![2; 40]),
+        secret_kek_version: Some(1),
+        owner_ref: None,
+        last_seq: seq,
+    }
+}
+
+impl FakeKeys {
+    /// Step 5(b): one record per moved key.
+    fn with_moved_keys() -> FakeKeys {
+        let k = FakeKeys::default();
+        for akid in KEYS {
+            let seq = k.chain.borrow().len() as u64 + 1;
+            k.chain
+                .borrow_mut()
+                .push(entry(akid, SubjectStatus::Active, seq));
+        }
+        k
+    }
+}
+
+impl OwnerKeys for FakeKeys {
+    async fn head(&self) -> Result<u64> {
+        Ok(self.chain.borrow().len() as u64)
+    }
+
+    async fn entries(&self, after: u64, limit: usize) -> Result<Vec<KeyEntry>> {
+        Ok(self
+            .chain
+            .borrow()
+            .iter()
+            .skip(after as usize)
+            .take(limit)
+            .cloned()
+            .collect())
+    }
+
+    async fn flat_revoked(&self, akid: &str) -> Result<bool> {
+        Ok(self.flat.borrow().contains(akid))
+    }
+
+    async fn tenant_revoked(&self, akid: &str) -> Result<bool> {
+        Ok(self.tenant.borrow().contains(akid))
+    }
+
+    async fn put_tenant_revocation(&self, akid: &str) -> Result<()> {
+        self.tenant.borrow_mut().insert(akid.into());
+        self.log.borrow_mut().push(format!("rk/t/{akid}"));
+        Ok(())
+    }
+
+    async fn revoke(&self, akid: &str) -> Result<()> {
+        let revoked = self
+            .chain
+            .borrow()
+            .iter()
+            .rev()
+            .find(|e| e.id == akid)
+            .is_some_and(|e| e.status == SubjectStatus::Revoked);
+        if !revoked {
+            let seq = self.chain.borrow().len() as u64 + 1;
+            self.chain
+                .borrow_mut()
+                .push(entry(akid, SubjectStatus::Revoked, seq));
+            self.log.borrow_mut().push(format!("revoke {akid}"));
+        }
+        Ok(())
+    }
+
+    async fn revoke_grants(&self, buckets: &[String]) -> Result<()> {
+        if take(&self.fail_grants) {
+            return Err(BridgeError::Blob("key chain unreachable".into()));
+        }
+        self.grants_revoked.borrow_mut().push(buckets.to_vec());
+        self.log.borrow_mut().push("revoke_grants".into());
+        Ok(())
+    }
+
+    async fn flat_revocations(&self, after: Option<&str>) -> Result<(Vec<String>, Option<String>)> {
+        Ok((
+            self.flat
+                .borrow()
+                .iter()
+                .filter(|id| after.is_none_or(|a| id.as_str() > a))
+                .cloned()
+                .collect(),
+            None,
+        ))
     }
 }
 
@@ -104,8 +377,12 @@ struct Move {
     db: RusqliteSql,
     unit: FakeUnit,
     routes: FakeRoutes,
+    keys: FakeKeys,
+    excluded: BTreeSet<String>,
     since: u64,
     zero_seq: u64,
+    /// The frozen D1's bucket ids, placed in the owner.
+    buckets: Vec<String>,
 }
 
 impl Move {
@@ -143,6 +420,7 @@ impl Move {
             zero_seq: self.zero_seq,
             since: self.since,
             keys: &k,
+            excluded: &self.excluded,
         };
         flip(
             &self.chain(),
@@ -151,19 +429,21 @@ impl Move {
             &self.dir(),
             &self.unit,
             &self.routes,
+            &self.keys,
             &window,
             self.rig.now(),
         )
         .await
     }
 
-    async fn give_up(&self) -> std::result::Result<Option<GaveUp>, FlipError> {
+    async fn give_up(&self) -> std::result::Result<GaveUp, FlipError> {
         let k = keys();
         let window = Window {
             owner: &owner(),
             zero_seq: self.zero_seq,
             since: self.since,
             keys: &k,
+            excluded: &self.excluded,
         };
         give_up(
             &self.chain(),
@@ -172,6 +452,7 @@ impl Move {
             &self.dir(),
             &self.unit,
             &self.routes,
+            &self.keys,
             &window,
             self.rig.now(),
         )
@@ -207,19 +488,41 @@ impl Move {
             .unwrap()
             .selector
     }
+
+    /// The directory's row of `tenant`: its seq and selector.
+    async fn dir_row(&self, tenant: &Tenant) -> (u64, Option<Selector>) {
+        let row = self.dir().tenant(tenant).await.unwrap().unwrap();
+        (row.door.seq, row.door.tenant_zero.map(|z| z.selector))
+    }
+
+    async fn place(&self) {
+        self.chain()
+            .place_moved_buckets(&owner(), &self.buckets, 0, self.rig.now(), 0)
+            .await
+            .unwrap();
+    }
 }
 
 /// The window up to step 7: tenant 0 frozen and `moving` into the owner,
-/// the owner's unit 0 `restoring`, both tenants and tenant 0's key routes
-/// in the directory.
+/// the owner's unit 0 `restoring` with the moved buckets placed, the unit
+/// closed under that entry, the moved keys in the owner's key chain, both
+/// tenants and tenant 0's key routes in the directory. The canary bucket
+/// is excluded.
 async fn window() -> Move {
+    window_with(true).await
+}
+
+async fn window_with(placed: bool) -> Move {
     let rig = rig();
-    let (_, signer) = rig.standard("vault").await;
+    let (vault, signer) = rig.standard("vault").await;
     rig.put(&signer, "vault", "a.bin", &pattern(1, 1_000))
         .await
         .expect(200);
+    let canary = rig.bucket("mq-canary", true).await;
     rig.bridge.raise_stamp().await.unwrap();
     freeze(&rig.bridge.catalog.sql, 1).await.unwrap();
+    let vault = vault.id.as_str().to_string();
+    let canary = canary.id.as_str().to_string();
     let db = RusqliteSql::open_in_memory().unwrap();
     db.apply(include_str!(
         "../../../workers/s3-bridge/migrations-directory/0001_directory.sql"
@@ -232,8 +535,11 @@ async fn window() -> Move {
         db,
         unit: FakeUnit::default(),
         routes: FakeRoutes::default(),
+        keys: FakeKeys::with_moved_keys(),
+        excluded: BTreeSet::from([canary]),
         since: 0,
         zero_seq: 0,
+        buckets: vec![vault],
     };
     let zero = Tenant::zero();
     m.write(
@@ -290,6 +596,11 @@ async fn window() -> Move {
         .write(&o, Change::SetRestoring { unit: 0 }, Actor::Operator)
         .await;
     m.since = closed.restoring_entry(0).unwrap().since_seq;
+    if placed {
+        m.place().await;
+    }
+    // The window's step 2 closed the unit under its entry.
+    m.unit.closed.set(Some(m.since));
     let dir = m.dir();
     for t in [&zero, &o] {
         dir.apply_tenant(&m.head(t).await, m.rig.now())
@@ -317,14 +628,31 @@ async fn assert_flipped(m: &Move, stamp: u64) {
     assert_eq!(z.moved.unwrap().stamp, Some(stamp));
     let o = m.head(&owner()).await;
     assert!(o.restoring.is_empty());
-    // The unit last saw the lifted head.
-    assert!(m.unit.synced.borrow().last().unwrap().restoring.is_empty());
+    // The lift record carries the move report's proof, and the unit last
+    // saw the lifted head with it.
+    // (A later owner record may stand on the lift.)
+    let lifted = o.lifted.clone();
+    let (seen, proof) = m.unit.synced.borrow().last().unwrap().clone();
+    assert!(seen.restoring.is_empty());
+    let proof = proof.expect("the opening sync names the lift");
+    if let Some(l) = lifted {
+        assert_eq!(l.proof, proof);
+    }
+    assert_eq!(Some(proof.replay_id), *m.unit.report.borrow());
+    assert!(m.unit.closed.get().is_none());
+    assert!(m.unit.renews.get() > 0);
     for akid in KEYS {
         assert_eq!(m.routes.records.borrow()[akid], OWNER);
         assert_eq!(m.route_row(akid).await, owner());
     }
     let key = legacy_stamp_key("main", Some(stamp - 1));
     assert!(m.rig.bridge.safety.head(&key).await.unwrap().is_some());
+    // The directory copies: tenant 0's selector, the owner's keys_seq.
+    assert_eq!(m.dir_row(&Tenant::zero()).await.1, Some(Selector::Moved));
+    let row = m.dir().tenant(&owner()).await.unwrap().unwrap();
+    assert!(row.keys_seq >= m.keys.chain.borrow().len() as u64);
+    // The unit holds every key record.
+    assert_eq!(m.unit.keys_seq.get(), m.keys.chain.borrow().len() as u64);
 }
 
 #[test]
@@ -401,10 +729,10 @@ fn a_route_record_of_another_tenant_stops_the_flip() {
         let g = m.give_up().await.map_err(|e| format!("{e:?}")).unwrap();
         assert_eq!(
             g,
-            Some(GaveUp {
+            GaveUp {
                 catalogue_id_frozen: "main".into(),
                 stamp_put: false
-            })
+            }
         );
         assert_eq!(m.selector().await, Selector::D1);
     });
@@ -432,27 +760,37 @@ fn the_move_is_given_up_before_its_routes() {
         assert!(m.head(&owner()).await.restoring.is_empty());
         let g = m.give_up().await.map_err(|e| format!("{e:?}")).unwrap();
         // (a) ran: the tool levels the thawed D1's stamp.
-        assert_eq!(g.map(|g| g.stamp_put), Some(true));
+        assert!(g.stamp_put);
         assert!(m.stamp_put().await);
         let o = m.head(&owner()).await;
-        assert!(o.restoring_entry(0).is_some());
-        assert_eq!(m.unit.synced.borrow().last().unwrap().seq, o.seq);
+        let entry = o.restoring_entry(0).unwrap().since_seq;
+        assert!(entry > m.since);
+        // The unit was closed again under the new entry.
+        assert_eq!(m.unit.closed.get(), Some(entry));
         let z = m.head(&Tenant::zero()).await.tenant_zero.unwrap();
         assert_eq!(z.selector, Selector::D1);
         assert!(z.moved.is_none());
+        assert_eq!(m.dir_row(&Tenant::zero()).await.1, Some(Selector::D1));
         for akid in KEYS {
             assert!(m.route_row(akid).await.is_zero());
         }
+        // The exit: the grants on the moved bucket revoked, then the
+        // placements removed and `moved_in` cleared.
+        assert_eq!(*m.keys.grants_revoked.borrow(), vec![m.buckets.clone()]);
+        assert!(o.placements.is_empty());
+        assert_eq!(o.moved_in, None);
+        assert_eq!(m.dir_row(&owner()).await.0, o.seq);
         // Run again: nothing more is written, and the answer is the same
         // (a re-run after a lost answer still learns the level step).
         let n = m.records();
         assert_eq!(
             m.give_up().await.map_err(|e| format!("{e:?}")).unwrap(),
-            Some(GaveUp {
+            GaveUp {
                 catalogue_id_frozen: "main".into(),
                 stamp_put: true
-            })
+            }
         );
+        assert_eq!(m.keys.grants_revoked.borrow().len(), 1);
         assert_eq!(m.records(), n);
         // And the flip no longer runs.
         assert!(matches!(m.flip().await, Err(FlipError::NotThisMove)));
@@ -505,11 +843,16 @@ fn the_move_is_given_up_before_the_unit_opens() {
         let before = m.records();
         let o = m.head(&owner()).await;
         let g = m.give_up().await.map_err(|e| format!("{e:?}")).unwrap();
-        assert_eq!(g.map(|g| g.stamp_put), Some(false));
-        // The entry stood: no new owner record, only tenant 0's.
-        assert_eq!(m.head(&owner()).await.seq, o.seq);
-        assert_eq!(m.records(), before + 1);
+        assert!(!g.stamp_put);
+        // The entry stood: no new entry; tenant 0's record and the
+        // owner's unplace only.
+        let after = m.head(&owner()).await;
+        assert_eq!(after.seq, o.seq + 1);
+        assert_eq!(after.restoring, o.restoring);
+        assert!(after.placements.is_empty());
+        assert_eq!(m.records(), before + 2);
         assert_eq!(m.selector().await, Selector::D1);
+        assert_eq!(m.unit.closed.get(), Some(m.since));
     });
 }
 
@@ -527,11 +870,11 @@ fn a_give_up_that_crashed_after_closing_the_unit_runs_again() {
         assert!(entry > m.since);
         assert_eq!(m.selector().await, Selector::Moving);
         let g = m.give_up().await.map_err(|e| format!("{e:?}")).unwrap();
-        assert_eq!(g.map(|g| g.stamp_put), Some(true));
-        // No second entry; the unit saw the closed head.
+        assert!(g.stamp_put);
+        // No second entry; the unit is closed under it.
         let after = m.head(&owner()).await;
         assert_eq!(after.restoring_entry(0).unwrap().since_seq, entry);
-        assert_eq!(m.unit.synced.borrow().last().unwrap().seq, after.seq);
+        assert_eq!(m.unit.closed.get(), Some(entry));
         assert_eq!(m.selector().await, Selector::D1);
     });
 }
@@ -577,13 +920,22 @@ fn the_flip_needs_this_windows_marker_and_a_later_window_is_not_this_one() {
         assert!(matches!(r, Err(FlipError::NotThisMove)), "{r:?}");
         assert_eq!(m.records(), n);
         assert_eq!(m.selector().await, Selector::Moving);
-        // The second window, named by its own record, is not the first's
-        // entry either: the owner's entry is the give-up's, set after the
-        // first window's lift.
+        // The second window, named by its own record: the first window's
+        // exit removed the placements, so its flip stops at the placement
+        // check until the second window places them again.
         let mut m2 = m;
         m2.zero_seq = w2.seq;
         let r = m2.flip().await;
-        assert!(matches!(r, Err(FlipError::OtherWindow { .. })), "{r:?}");
+        assert!(
+            matches!(&r, Err(FlipError::Placements { missing, extra })
+                if *missing == m2.buckets && extra.is_empty()),
+            "{r:?}"
+        );
+        m2.place().await;
+        assert_eq!(
+            m2.head(&owner()).await.moved_in.map(|m| m.zero_seq),
+            Some(w2.seq)
+        );
         m2.since = o.restoring_entry(0).unwrap().since_seq;
         let f = m2.flip().await.map_err(|e| format!("{e:?}")).unwrap();
         assert!(f.wrote);
@@ -814,7 +1166,7 @@ fn a_window_longer_than_the_bound_is_not_walked() {
             on = !on;
         }
         // Inside the bound: still this window.
-        assert!(matches!(m.give_up().await, Ok(Some(_))), "inside the bound");
+        assert!(m.give_up().await.is_ok(), "inside the bound");
         let m = window().await;
         let mut head = m.head(&zero).await.seq;
         let mut on = true;
@@ -858,5 +1210,301 @@ fn a_shredded_owner_row_stops_the_flip_before_any_write() {
         assert!(matches!(r, Err(FlipError::OwnerRow)), "{r:?}");
         assert_eq!(m.records(), n);
         assert!(!m.stamp_put().await);
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Round 3: the move's lift report, re-entry, V9, keys, placements, exit
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_lift_opens_one_move_report_for_the_units_entry() {
+    block_on(async {
+        let m = window().await;
+        m.flip().await.map_err(|e| format!("{e:?}")).unwrap();
+        // One report, for (S, the unit's stamp ordinal, a nonce).
+        assert_eq!(m.unit.reports.get(), 1);
+        let r = m.unit.report.borrow().clone().unwrap();
+        assert_eq!((r.since, r.ordinal, r.nonce.as_str()), (m.since, 2, "n1"));
+        // The lift record names the entry and the report, by the move
+        // tool; it is the record below tenant 0's flip on the owner.
+        let o = m.head(&owner()).await;
+        let l = o.lifted.unwrap();
+        assert_eq!((l.unit, l.since_seq), (0, m.since));
+        assert_eq!(l.proof.replay_id, r);
+        assert!(l.proof.acknowledged.is_empty());
+        // V9 ran once, on the open unit, before the routes.
+        assert_eq!(m.unit.v9_runs.get(), 1);
+        // A run after the flip opens nothing more.
+        m.flip().await.unwrap();
+        assert_eq!(m.unit.reports.get(), 1);
+    });
+}
+
+#[test]
+fn a_stored_report_that_passes_is_used_and_a_failing_one_replaced() {
+    block_on(async {
+        // The gate says no once: a second report, with a new nonce.
+        let m = window().await;
+        m.unit.not_ok.set(1);
+        m.flip().await.map_err(|e| format!("{e:?}")).unwrap();
+        assert_eq!(m.unit.reports.get(), 2);
+        assert_eq!(m.unit.report.borrow().clone().unwrap().nonce, "n2");
+        // It never passes: no lift record, the unit closed, give-up open.
+        let m = window().await;
+        m.unit.not_ok.set(99);
+        let before = m.records();
+        let r = m.flip().await;
+        assert!(matches!(r, Err(FlipError::LiftNotOk)), "{r:?}");
+        assert_eq!(m.records(), before);
+        assert!(m.head(&owner()).await.restoring_entry(0).is_some());
+        assert_eq!(m.unit.closed.get(), Some(m.since));
+        m.unit.not_ok.set(0);
+        // The next run takes the stored report as it passes now.
+        let n = m.unit.reports.get();
+        m.flip().await.map_err(|e| format!("{e:?}")).unwrap();
+        assert_eq!(m.unit.reports.get(), n);
+    });
+}
+
+#[test]
+fn a_refused_report_stops_the_lift() {
+    block_on(async {
+        let m = window().await;
+        // The unit is closed under another entry than the owner's head.
+        m.unit.closed.set(Some(m.since + 7));
+        let before = m.records();
+        let r = m.flip().await;
+        assert!(
+            matches!(&r, Err(FlipError::Report(c)) if c == "not_this_window"),
+            "{r:?}"
+        );
+        assert_eq!(m.records(), before);
+    });
+}
+
+#[test]
+fn a_refused_sync_re_enters_under_a_new_entry() {
+    block_on(async {
+        let m = window().await;
+        let before = m.records();
+        m.unit.refuse_lift.set(1);
+        let f = m.flip().await.map_err(|e| format!("{e:?}")).unwrap();
+        assert!(f.wrote);
+        assert_flipped(&m, f.stamp).await;
+        // The first lift, the re-entry's entry, the second lift, the flip.
+        assert_eq!(m.records(), before + 4);
+        let o = m.head(&owner()).await;
+        let l = o.lifted.unwrap();
+        assert!(l.since_seq > m.since);
+        // The second report names the new entry.
+        assert_eq!(m.unit.reports.get(), 2);
+        assert_eq!(m.unit.report.borrow().clone().unwrap().since, l.since_seq);
+    });
+}
+
+#[test]
+fn a_lift_the_unit_keeps_refusing_stops_before_the_routes() {
+    block_on(async {
+        let m = window().await;
+        m.unit.refuse_lift.set(99);
+        let r = m.flip().await;
+        assert!(matches!(r, Err(FlipError::SyncRefused(_))), "{r:?}");
+        assert!(m.routes.records.borrow().is_empty());
+        assert_eq!(m.selector().await, Selector::Moving);
+        assert!(m.unit.closed.get().is_some());
+        assert_eq!(m.unit.v9_runs.get(), 0);
+        // The owner's head was lifted by the last try; the give-up closes
+        // the unit again and exits.
+        let g = m.give_up().await.map_err(|e| format!("{e:?}")).unwrap();
+        assert!(g.stamp_put);
+        let o = m.head(&owner()).await;
+        assert!(o.restoring_entry(0).is_some());
+        assert!(o.placements.is_empty());
+    });
+}
+
+#[test]
+fn a_crash_after_the_lift_record_syncs_with_its_proof() {
+    block_on(async {
+        let m = window().await;
+        m.unit.fail.set(1);
+        assert!(matches!(m.flip().await, Err(FlipError::Store(_))));
+        let lifted = m.head(&owner()).await.lifted.unwrap();
+        // A tenant-0-free owner record lands on top (a later record of
+        // the window): the proof is found below it.
+        m.write(&owner(), hold(true), Actor::Operator).await;
+        let f = m.flip().await.map_err(|e| format!("{e:?}")).unwrap();
+        let (_, proof) = m.unit.synced.borrow().last().unwrap().clone();
+        assert_eq!(proof, Some(lifted.proof));
+        assert_eq!(m.unit.reports.get(), 1);
+        assert!(f.wrote);
+    });
+}
+
+#[test]
+fn v9_failing_in_the_open_unit_takes_the_give_up_in_the_exit_order() {
+    block_on(async {
+        let m = window().await;
+        m.unit.v9_ok.set(false);
+        let r = m.flip().await;
+        assert!(matches!(r, Err(FlipError::V9Failed)), "{r:?}");
+        // The unit is open, no route moved.
+        assert!(m.unit.closed.get().is_none());
+        assert!(m.routes.records.borrow().is_empty());
+        // The order of the exit: the owner closed, tenant 0 at d1, the
+        // grant revocations, then the unplace.
+        let log = Rc::clone(&m.keys.log);
+        let zero_prefix = "m/t/t_0000000000000000/".to_string();
+        let owner_prefix = format!("m/t/{OWNER}/");
+        m.store.before_put(move |key, _| {
+            if key.starts_with(&zero_prefix) {
+                log.borrow_mut().push("zero".into());
+            } else if key.starts_with(&owner_prefix) {
+                log.borrow_mut().push("owner".into());
+            }
+        });
+        m.give_up().await.map_err(|e| format!("{e:?}")).unwrap();
+        assert_eq!(
+            *m.keys.log.borrow(),
+            ["owner", "zero", "revoke_grants", "owner"]
+        );
+        let o = m.head(&owner()).await;
+        assert!(o.placements.is_empty());
+        assert_eq!(o.buckets_unplaced.clone().unwrap().buckets, m.buckets);
+        assert_eq!(
+            m.unit.closed.get(),
+            o.restoring_entry(0).map(|e| e.since_seq)
+        );
+    });
+}
+
+#[test]
+fn a_give_up_that_crashed_before_its_unplace_finishes_it() {
+    block_on(async {
+        let m = window().await;
+        // Tenant 0 is back at d1; the grant revocations are not reached.
+        m.keys.fail_grants.set(1);
+        let r = m.give_up().await;
+        assert!(matches!(r, Err(FlipError::Store(_))), "{r:?}");
+        assert_eq!(m.selector().await, Selector::D1);
+        let o = m.head(&owner()).await;
+        assert_eq!(o.placements.len(), 1);
+        assert!(o.moved_in.is_some());
+        // Run again: the exit is finished (the revocations again, which
+        // are idempotent, then the unplace).
+        let g = m.give_up().await.map_err(|e| format!("{e:?}")).unwrap();
+        assert!(!g.stamp_put);
+        let o = m.head(&owner()).await;
+        assert!(o.placements.is_empty());
+        assert!(o.moved_in.is_none());
+        assert_eq!(m.keys.grants_revoked.borrow().len(), 1);
+        // And again: nothing more.
+        let n = m.records();
+        m.give_up().await.unwrap();
+        assert_eq!(m.records(), n);
+        assert_eq!(m.keys.grants_revoked.borrow().len(), 1);
+    });
+}
+
+#[test]
+fn an_exit_before_any_placement_revokes_and_removes_nothing() {
+    block_on(async {
+        let m = window_with(false).await;
+        let before = m.records();
+        m.give_up().await.map_err(|e| format!("{e:?}")).unwrap();
+        assert!(m.keys.grants_revoked.borrow().is_empty());
+        // Tenant 0's give-up only.
+        assert_eq!(m.records(), before + 1);
+        assert_eq!(m.selector().await, Selector::D1);
+    });
+}
+
+#[test]
+fn the_placements_must_be_the_frozen_buckets_less_the_excluded() {
+    block_on(async {
+        // The canary is not excluded: it should have been placed.
+        let mut m = window().await;
+        m.excluded.clear();
+        let before = m.records();
+        let r = m.flip().await;
+        assert!(
+            matches!(&r, Err(FlipError::Placements { missing, extra })
+                if missing.len() == 1 && extra.is_empty()),
+            "{r:?}"
+        );
+        assert_eq!(m.records(), before);
+        assert!(!m.stamp_put().await);
+        // A placement of a bucket the frozen D1 does not hold.
+        let m = window().await;
+        m.chain()
+            .place_moved_buckets(
+                &owner(),
+                &["b_00000000000000ff".to_string()],
+                0,
+                m.rig.now(),
+                0,
+            )
+            .await
+            .unwrap();
+        let r = m.flip().await;
+        assert!(
+            matches!(&r, Err(FlipError::Placements { missing, extra })
+                if missing.is_empty() && *extra == ["b_00000000000000ff"]),
+            "{r:?}"
+        );
+        assert!(!m.stamp_put().await);
+    });
+}
+
+#[test]
+fn a_flat_revocation_is_swept_into_the_unit_before_the_lift_record() {
+    block_on(async {
+        let m = window().await;
+        m.keys.flat.borrow_mut().insert(KEYS[1].into());
+        // The unit had the key active from step 5(e).
+        m.unit
+            .key_rows
+            .borrow_mut()
+            .insert(KEYS[1].into(), SubjectStatus::Active);
+        let log = Rc::clone(&m.keys.log);
+        let owner_prefix = format!("m/t/{OWNER}/");
+        m.store.before_put(move |key, _| {
+            if key.starts_with(&owner_prefix) {
+                log.borrow_mut().push("owner".into());
+            }
+        });
+        m.flip().await.map_err(|e| format!("{e:?}")).unwrap();
+        assert_eq!(
+            m.keys.log.borrow()[..3],
+            [
+                format!("rk/t/{}", KEYS[1]),
+                format!("revoke {}", KEYS[1]),
+                "owner".to_string()
+            ]
+        );
+        assert!(m.keys.tenant.borrow().contains(KEYS[1]));
+        assert_eq!(m.unit.key_rows.borrow()[KEYS[1]], SubjectStatus::Revoked);
+        assert_eq!(m.unit.key_rows.borrow()[KEYS[0]], SubjectStatus::Active);
+        // keys_seq of the directory covers the revoke record.
+        let row = m.dir().tenant(&owner()).await.unwrap().unwrap();
+        assert_eq!(row.keys_seq, 3);
+        // A re-run does not revoke twice.
+        m.flip().await.unwrap();
+        assert_eq!(m.keys.chain.borrow().len(), 3);
+    });
+}
+
+#[test]
+fn a_crash_after_the_flip_record_still_copies_the_selector() {
+    block_on(async {
+        let m = window().await;
+        m.flip().await.unwrap();
+        // The directory's copy went missing (a crash before it).
+        m.db
+            .apply("UPDATE tenants SET selector = 'moving', record_seq = 1 WHERE id = 't_0000000000000000';")
+            .unwrap();
+        m.flip().await.unwrap();
+        assert_eq!(m.dir_row(&Tenant::zero()).await.1, Some(Selector::Moved));
     });
 }

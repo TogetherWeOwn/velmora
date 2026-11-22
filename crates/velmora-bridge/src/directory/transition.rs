@@ -28,10 +28,11 @@ use std::collections::BTreeMap;
 
 use super::record::{
     ActorClass, BillingHold, BucketCreated, Deletion, DeletionReason, HoldMode, Holds, Lifecycle,
-    Move, OperatorHold, OperatorReason, Placement, Restoring, Selector, Tenant, TenantDoor,
-    TenantPrivate, TenantRecord, TenantZero, RECORD_FORMAT,
+    Lifted, Move, MovedIn, OperatorHold, OperatorReason, Placement, Restoring, Selector, Tenant,
+    TenantDoor, TenantPrivate, TenantRecord, TenantZero, RECORD_FORMAT,
 };
 use crate::types::UnixMs;
+use crate::unit::lift::LiftProof;
 
 /// The shortest hold period of a deletion by the billing token: 60 days,
 /// less 1 hour of tolerance.
@@ -172,8 +173,15 @@ pub enum Change {
     /// Set `restoring` for one unit.
     SetRestoring { unit: u32 },
     /// Lift the `restoring` entry of `unit` whose `since_seq` is
-    /// `since_seq`.
-    LiftRestoring { unit: u32, since_seq: u64 },
+    /// `since_seq`, with the lift the unit checks at its `sync`: the
+    /// restore gate's (the restore tool), or the move's `move` report
+    /// (the move tool, DS1 §3.4 step 8(b), AM-15: the root unit of a
+    /// managed tenant, nothing acknowledged). The proof names the entry.
+    LiftRestoring {
+        unit: u32,
+        since_seq: u64,
+        proof: LiftProof,
+    },
     /// Create a bucket on a unit of the tenant. `creator` names the acting
     /// principal, as history; its grant on the bucket is a key-chain record
     /// written first, at seq `grant_seq`, and the bucket's id is derived
@@ -194,6 +202,18 @@ pub enum Change {
     /// read from its chain by the caller, is `moving` to this tenant, and
     /// while `unit` has a `restoring` entry (the move's import).
     PlaceMovedBuckets {
+        buckets: Vec<String>,
+        unit: u32,
+        zero: Box<TenantDoor>,
+    },
+    /// Remove the placements a move put on `unit` (AM-23): the last step
+    /// of every exit of the move (give-up, reverse move, fallback), after
+    /// tenant 0 is back at `d1` and the grants on the ids are revoked.
+    /// `zero` is tenant 0's head read from its chain by the caller: `d1`,
+    /// above `moved_in.zero_seq`, with the move cleared or naming this
+    /// tenant. `buckets` must be every placement of the tenant on `unit`.
+    /// Allowed while `unit` is `restoring` (it must be).
+    UnplaceMovedBuckets {
         buckets: Vec<String>,
         unit: u32,
         zero: Box<TenantDoor>,
@@ -295,6 +315,9 @@ const NOT_DERIVED: Refusal = refuse(400, "bucket_id_not_derived");
 const GRANT_ORDER: Refusal = refuse(409, "grant_order_lost");
 const NOT_MOVING_HERE: Refusal = refuse(409, "no_move_to_tenant");
 const NOT_RESTORING: Refusal = refuse(409, "unit_not_restoring");
+const NOT_MOVED_IN: Refusal = refuse(409, "not_moved_in");
+const NO_MOVE_EXIT: Refusal = refuse(409, "no_move_exit");
+const UNPLACE_INCOMPLETE: Refusal = refuse(409, "unplace_list_incomplete");
 
 /// Validates `change` against `head` and builds the record that follows.
 /// See the [module](self).
@@ -342,6 +365,8 @@ pub fn next(
     // that places moved buckets names them.
     door.bucket_created = None;
     door.buckets_moved_in = None;
+    door.buckets_unplaced = None;
+    door.lifted = None;
     let mut private = head.private.clone();
 
     match change {
@@ -634,9 +659,24 @@ pub fn next(
             });
         }
 
-        Change::LiftRestoring { unit, since_seq } => {
-            if actor != Actor::RestoreTool {
-                return Err(FORBIDDEN);
+        Change::LiftRestoring {
+            unit,
+            since_seq,
+            proof,
+        } => {
+            match actor {
+                Actor::RestoreTool => {}
+                // The move's lift: the owner's root unit, from a `move`
+                // report, which acknowledges nothing (AM-15).
+                Actor::MoveTool => {
+                    if tenant.is_zero() || *unit != 0 || !proof.acknowledged.is_empty() {
+                        return Err(INVALID);
+                    }
+                }
+                _ => return Err(FORBIDDEN),
+            }
+            if proof.replay_id.since != *since_seq {
+                return Err(INVALID);
             }
             let ours = Restoring {
                 unit: *unit,
@@ -646,6 +686,11 @@ pub fn next(
                 return Err(ENTRY_GONE);
             }
             door.restoring.retain(|r| *r != ours);
+            door.lifted = Some(Lifted {
+                unit: *unit,
+                since_seq: *since_seq,
+                proof: proof.clone(),
+            });
         }
 
         Change::CreateBucket {
@@ -790,6 +835,80 @@ pub fn next(
             }));
             door.max_move_epoch = epoch;
             door.buckets_moved_in = Some(super::record::BucketsMovedIn {
+                zero_seq: zero.seq,
+                unit: *unit,
+                buckets: buckets.clone(),
+            });
+            // The first placement names the move; a later one of the same
+            // move keeps it.
+            if door.moved_in.is_none() {
+                door.moved_in = Some(MovedIn { zero_seq: zero.seq });
+            }
+        }
+
+        Change::UnplaceMovedBuckets {
+            buckets,
+            unit,
+            zero,
+        } => {
+            live(h)?;
+            if actor != Actor::MoveTool {
+                return Err(FORBIDDEN);
+            }
+            if tenant.is_zero() {
+                return Err(TENANT_ZERO);
+            }
+            // An empty list is the exit of a move whose placements are
+            // already gone (dropped before the window closed): it clears
+            // `moved_in` only.
+            let distinct: std::collections::BTreeSet<&String> = buckets.iter().collect();
+            if buckets.len() > MAX_MOVED_BUCKETS
+                || distinct.len() != buckets.len()
+                || !buckets.iter().all(|b| valid_bucket_id(b))
+            {
+                return Err(INVALID);
+            }
+            // A repeat: nothing listed is placed and the move is no
+            // longer named. Checked before the rest (AM-23).
+            if h.moved_in.is_none()
+                && !buckets
+                    .iter()
+                    .any(|b| h.placements.iter().any(|p| p.bucket == *b))
+            {
+                return Ok(Outcome::Unchanged);
+            }
+            // (a) A tenant that a move filled.
+            let Some(moved_in) = h.moved_in else {
+                return Err(NOT_MOVED_IN);
+            };
+            // (b) Tenant 0 back at `d1` after that move: given up (the
+            // move cleared) or undone (the move names this tenant).
+            let exited = zero.tenant.is_zero()
+                && zero.seq > moved_in.zero_seq
+                && zero.tenant_zero.as_ref().is_some_and(|z| {
+                    z.selector == Selector::D1 && z.moved.as_ref().is_none_or(|m| m.to == *tenant)
+                });
+            if !exited {
+                return Err(NO_MOVE_EXIT);
+            }
+            // (c) The unit is closed.
+            if h.restoring_entry(*unit).is_none() {
+                return Err(NOT_RESTORING);
+            }
+            // (d) Every placement of the tenant on the unit, and no other
+            // id: buckets made after the move go too.
+            let placed: std::collections::BTreeSet<&String> = h
+                .placements
+                .iter()
+                .filter(|p| p.unit == *unit)
+                .map(|p| &p.bucket)
+                .collect();
+            if placed != distinct {
+                return Err(UNPLACE_INCOMPLETE);
+            }
+            door.placements.retain(|p| p.unit != *unit);
+            door.moved_in = None;
+            door.buckets_unplaced = Some(super::record::BucketsMovedIn {
                 zero_seq: zero.seq,
                 unit: *unit,
                 buckets: buckets.clone(),
@@ -1055,6 +1174,9 @@ fn first(tenant: &Tenant, change: &Change, actor: Actor, now: UnixMs) -> Result<
         max_move_epoch: 0,
         last_grant_seq: 0,
         buckets_moved_in: None,
+        moved_in: None,
+        buckets_unplaced: None,
+        lifted: None,
         bucket_created: None,
         tk_version: 0,
         key_checks: BTreeMap::new(),
@@ -1208,7 +1330,7 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 /// A minted bucket id: `b_` and 16 lowercase hex digits.
-fn valid_bucket_id(s: &str) -> bool {
+pub(crate) fn valid_bucket_id(s: &str) -> bool {
     s.strip_prefix("b_").is_some_and(|hex| {
         hex.len() == 16
             && hex
@@ -1249,6 +1371,9 @@ fn shredded_stub(h: &TenantDoor) -> TenantDoor {
         max_move_epoch: h.max_move_epoch,
         last_grant_seq: h.last_grant_seq,
         buckets_moved_in: None,
+        moved_in: None,
+        buckets_unplaced: None,
+        lifted: None,
         bucket_created: None,
         tk_version: h.tk_version,
         key_checks: BTreeMap::new(),

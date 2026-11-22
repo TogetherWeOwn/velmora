@@ -323,7 +323,11 @@ impl<S: RecordStore, C: ControlSeal> TenantChain<'_, S, C> {
         now: UnixMs,
         known: u64,
     ) -> Result<Written, ChainError> {
-        if matches!(change, Change::PlaceMovedBuckets { .. }) {
+        // Both name tenant 0's head, which only the calls below read.
+        if matches!(
+            change,
+            Change::PlaceMovedBuckets { .. } | Change::UnplaceMovedBuckets { .. }
+        ) {
             return Err(ChainError::Refused(Refusal {
                 status: 400,
                 code: "invalid_change",
@@ -361,6 +365,42 @@ impl<S: RecordStore, C: ControlSeal> TenantChain<'_, S, C> {
                 }));
             };
             let change = Change::PlaceMovedBuckets {
+                buckets: buckets.to_vec(),
+                unit,
+                zero: Box::new(zero.door),
+            };
+            match self
+                .try_write(tenant, &change, Actor::MoveTool, now, known)
+                .await?
+            {
+                Try::Done(written) => return Ok(written),
+                Try::Lost(seq) => known = seq,
+            }
+        }
+        Err(ChainError::Busy)
+    }
+
+    /// Removes the placements a move put on `unit` of `tenant`: the last
+    /// step of every exit of the move (AM-23), by the move tool. Tenant
+    /// 0's head is read from its own chain before every try, as for
+    /// [`Self::place_moved_buckets`]; the record names that head's seq.
+    pub async fn unplace_moved_buckets(
+        &self,
+        tenant: &Tenant,
+        buckets: &[String],
+        unit: u32,
+        now: UnixMs,
+        known: u64,
+    ) -> Result<Written, ChainError> {
+        let mut known = known;
+        for _ in 0..MAX_PUT_TRIES {
+            let Some(zero) = self.head(&Tenant::Zero, 0).await? else {
+                return Err(ChainError::Refused(Refusal {
+                    status: 409,
+                    code: "no_move_exit",
+                }));
+            };
+            let change = Change::UnplaceMovedBuckets {
                 buckets: buckets.to_vec(),
                 unit,
                 zero: Box::new(zero.door),

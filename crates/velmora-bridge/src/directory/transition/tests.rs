@@ -715,36 +715,12 @@ fn restoring_is_idempotent_extendable_and_lifted_by_its_own_entry() {
     assert_eq!(r1.door.restoring.len(), 2);
     // Other records move the head; the lift checks its own entry.
     let r1 = apply(&r1, billing_hold(Some(HoldMode::ReadOnly)), Actor::Billing);
+    assert_eq!(refused(&r1, lift(0, s0), Actor::Operator), FORBIDDEN);
     assert_eq!(
-        refused(
-            &r1,
-            Change::LiftRestoring {
-                unit: 0,
-                since_seq: s0
-            },
-            Actor::Operator
-        ),
-        FORBIDDEN
-    );
-    assert_eq!(
-        refused(
-            &r1,
-            Change::LiftRestoring {
-                unit: 0,
-                since_seq: s0 + 5
-            },
-            Actor::RestoreTool
-        ),
+        refused(&r1, lift(0, s0 + 5), Actor::RestoreTool),
         ENTRY_GONE
     );
-    let lifted = apply(
-        &r1,
-        Change::LiftRestoring {
-            unit: 0,
-            since_seq: s0,
-        },
-        Actor::RestoreTool,
-    );
+    let lifted = apply(&r1, lift(0, s0), Actor::RestoreTool);
     assert_eq!(lifted.door.restoring.len(), 1);
     assert_eq!(lifted.door.restoring[0].unit, 1);
     // The hold written in between is in force at the lift.
@@ -1116,14 +1092,7 @@ fn closing_and_opening_order() {
     let r = apply(&a, Change::SetRestoring { unit: 0 }, Actor::Operator);
     assert_eq!(order(&a, &r), WriteOrder::Closing);
     let since = r.door.restoring[0].since_seq;
-    let l = apply(
-        &r,
-        Change::LiftRestoring {
-            unit: 0,
-            since_seq: since,
-        },
-        Actor::RestoreTool,
-    );
+    let l = apply(&r, lift(0, since), Actor::RestoreTool);
     assert_eq!(order(&r, &l), WriteOrder::Opening);
 
     let preserve = apply(
@@ -2037,10 +2006,7 @@ fn moved_buckets_are_placed_only_by_the_move() {
     // The next record does not repeat the list.
     let lifted = apply(
         &r,
-        Change::LiftRestoring {
-            unit: 0,
-            since_seq: owner.door.restoring[0].since_seq,
-        },
+        lift(0, owner.door.restoring[0].since_seq),
         Actor::RestoreTool,
     );
     assert_eq!(lifted.door.buckets_moved_in, None);
@@ -2050,6 +2016,236 @@ fn moved_buckets_are_placed_only_by_the_move() {
         refused(&moving, place(&moving, ids.clone(), 0), Actor::MoveTool),
         TENANT_ZERO
     );
+    // `moved_in` names the move and is carried; a second placement of
+    // the same move keeps the first seq.
+    assert_eq!(
+        r.door.moved_in,
+        Some(crate::directory::record::MovedIn {
+            zero_seq: moving.door.seq
+        })
+    );
+    assert_eq!(lifted.door.moved_in, r.door.moved_in);
+    let later = apply(&moving, Change::GiveUpMove, Actor::MoveTool);
+    let later = apply(
+        &later,
+        Change::StartMove {
+            to: t1(),
+            catalogue_id_frozen: "main".into(),
+        },
+        Actor::MoveTool,
+    );
+    let more = apply(
+        &r,
+        place(&later, vec!["b_00000000000000cc".into()], 0),
+        Actor::MoveTool,
+    );
+    assert_eq!(more.door.moved_in, r.door.moved_in);
+}
+
+/// Every exit of the move removes the moved-in placements, bound to the
+/// move by `moved_in` and to tenant 0 back at `d1` (AM-23).
+#[test]
+fn moved_buckets_are_removed_only_by_an_exit_of_the_move() {
+    let owner = apply(&active(), Change::SetRestoring { unit: 0 }, Actor::Operator);
+    let moving = moving();
+    let ids = vec![
+        "b_00000000000000aa".to_string(),
+        "b_00000000000000bb".to_string(),
+    ];
+    let placed = apply(
+        &owner,
+        Change::PlaceMovedBuckets {
+            buckets: ids.clone(),
+            unit: 0,
+            zero: Box::new(moving.door.clone()),
+        },
+        Actor::MoveTool,
+    );
+    let unplace = |zero: &TenantRecord, buckets: Vec<String>| Change::UnplaceMovedBuckets {
+        buckets,
+        unit: 0,
+        zero: Box::new(zero.door.clone()),
+    };
+    let given_up = apply(&moving, Change::GiveUpMove, Actor::MoveTool);
+    // Only the move tool.
+    for actor in [Actor::Customer, Actor::Operator, Actor::RestoreTool] {
+        assert_eq!(
+            refused(&placed, unplace(&given_up, ids.clone()), actor),
+            FORBIDDEN
+        );
+    }
+    // (b) Not while tenant 0 is still in the window, nor after the flip.
+    assert_eq!(
+        refused(&placed, unplace(&moving, ids.clone()), Actor::MoveTool),
+        NO_MOVE_EXIT
+    );
+    let flipped = apply(&moving, Change::FlipMove { stamp: 7 }, Actor::MoveTool);
+    assert_eq!(
+        refused(&placed, unplace(&flipped, ids.clone()), Actor::MoveTool),
+        NO_MOVE_EXIT
+    );
+    // ... nor with a door that is not tenant 0's, nor with tenant 0's
+    // head of before the placement.
+    let mut planted = given_up.clone();
+    planted.door.tenant = t1();
+    assert_eq!(
+        refused(&placed, unplace(&planted, ids.clone()), Actor::MoveTool),
+        NO_MOVE_EXIT
+    );
+    let mut old = given_up.clone();
+    old.door.seq = moving.door.seq;
+    assert_eq!(
+        refused(&placed, unplace(&old, ids.clone()), Actor::MoveTool),
+        NO_MOVE_EXIT
+    );
+    // ... nor after an undo into another tenant.
+    let undone = apply(
+        &flipped,
+        Change::UndoMove {
+            undo_stamp: 8,
+            catalogue_id: "fresh".into(),
+        },
+        Actor::MoveTool,
+    );
+    let mut undone_elsewhere = undone.clone();
+    if let Some(m) = undone_elsewhere
+        .door
+        .tenant_zero
+        .as_mut()
+        .and_then(|z| z.moved.as_mut())
+    {
+        m.to = Tenant::parse("t_00000000000000a2").unwrap();
+    }
+    assert_eq!(
+        refused(
+            &placed,
+            unplace(&undone_elsewhere, ids.clone()),
+            Actor::MoveTool
+        ),
+        NO_MOVE_EXIT
+    );
+    // (c) Not on an open unit.
+    let open = apply(
+        &placed,
+        lift(0, owner.door.restoring[0].since_seq),
+        Actor::RestoreTool,
+    );
+    assert_eq!(
+        refused(&open, unplace(&given_up, ids.clone()), Actor::MoveTool),
+        NOT_RESTORING
+    );
+    // (d) Every placement on the unit, a bucket made later included.
+    assert_eq!(
+        refused(
+            &placed,
+            unplace(&given_up, vec![ids[0].clone()]),
+            Actor::MoveTool
+        ),
+        UNPLACE_INCOMPLETE
+    );
+    let with_extra = vec![ids[0].clone(), ids[1].clone(), "b_00000000000000cc".into()];
+    assert_eq!(
+        refused(&placed, unplace(&given_up, with_extra), Actor::MoveTool),
+        UNPLACE_INCOMPLETE
+    );
+    for bad in [
+        vec![ids[0].clone(), ids[0].clone()],
+        vec!["vault".to_string()],
+    ] {
+        assert_eq!(
+            refused(&placed, unplace(&given_up, bad), Actor::MoveTool),
+            INVALID
+        );
+    }
+    // The give-up's exit: removed, `moved_in` cleared, the list named.
+    let out = apply(&placed, unplace(&given_up, ids.clone()), Actor::MoveTool);
+    assert!(out.door.placements.is_empty());
+    assert_eq!(out.door.moved_in, None);
+    assert_eq!(
+        out.door.buckets_unplaced,
+        Some(crate::directory::record::BucketsMovedIn {
+            zero_seq: given_up.door.seq,
+            unit: 0,
+            buckets: ids.clone(),
+        })
+    );
+    assert_eq!(
+        write_order(Some(&placed.door), &out.door),
+        WriteOrder::Closing
+    );
+    // A repeat writes nothing; the next record does not repeat the list.
+    unchanged(&out, unplace(&given_up, ids.clone()), Actor::MoveTool);
+    let next_record = apply(&out, billing_hold(Some(HoldMode::ReadOnly)), Actor::Billing);
+    assert_eq!(next_record.door.buckets_unplaced, None);
+    assert!(next_record.door.placements.is_empty());
+    // The undo's exit (move named, this tenant) takes every placement.
+    let out = apply(&placed, unplace(&undone, ids.clone()), Actor::MoveTool);
+    assert!(out.door.placements.is_empty());
+    // A tenant that no move filled: its own buckets are not the move's
+    // to remove; a list of nothing placed is a repeat.
+    let mut own = placed.clone();
+    own.door.moved_in = None;
+    assert_eq!(
+        refused(&own, unplace(&given_up, ids.clone()), Actor::MoveTool),
+        NOT_MOVED_IN
+    );
+    unchanged(&owner, unplace(&given_up, ids.clone()), Actor::MoveTool);
+    unchanged(&owner, unplace(&given_up, vec![]), Actor::MoveTool);
+    // A move whose placements are gone: the empty list clears the mark.
+    let mut emptied = placed.clone();
+    emptied.door.placements.clear();
+    let cleared = apply(&emptied, unplace(&given_up, vec![]), Actor::MoveTool);
+    assert_eq!(cleared.door.moved_in, None);
+    // Tenant 0 removes nothing from itself.
+    assert_eq!(
+        refused(&given_up, unplace(&given_up, ids), Actor::MoveTool),
+        TENANT_ZERO
+    );
+}
+
+/// The move tool lifts only the owner's root unit, with a `move`
+/// report's proof (AM-15); every lift names its entry and is recorded.
+#[test]
+fn the_move_tool_lifts_the_root_unit_with_its_report() {
+    let owner = apply(&active(), Change::SetRestoring { unit: 0 }, Actor::Operator);
+    let since = owner.door.restoring[0].since_seq;
+    let lifted = apply(&owner, lift(0, since), Actor::MoveTool);
+    assert!(lifted.door.restoring.is_empty());
+    let l = lifted.door.lifted.clone().unwrap();
+    assert_eq!((l.unit, l.since_seq), (0, since));
+    assert_eq!(l.proof.replay_id.since, since);
+    // The next record does not repeat it.
+    let next_record = apply(&lifted, Change::SetRestoring { unit: 0 }, Actor::Operator);
+    assert_eq!(next_record.door.lifted, None);
+    // A proof for another entry.
+    let mut other = lift(0, since);
+    if let Change::LiftRestoring { proof, .. } = &mut other {
+        proof.replay_id.since = since + 1;
+    }
+    for actor in [Actor::MoveTool, Actor::RestoreTool] {
+        assert_eq!(refused(&owner, other.clone(), actor), INVALID);
+    }
+    // The move's report acknowledges nothing.
+    let mut acked = lift(0, since);
+    if let Change::LiftRestoring { proof, .. } = &mut acked {
+        proof.acknowledged.insert(
+            crate::unit::lift::AckClass::Damaged,
+            crate::unit::lift::ClassProof {
+                count: 1,
+                sha256: "0".repeat(64),
+            },
+        );
+    }
+    assert_eq!(refused(&owner, acked.clone(), Actor::MoveTool), INVALID);
+    let gate = apply(&owner, acked, Actor::RestoreTool);
+    assert!(gate.door.restoring.is_empty());
+    // Not another unit, not tenant 0, no other actor.
+    assert_eq!(refused(&owner, lift(1, since), Actor::MoveTool), INVALID);
+    assert_eq!(
+        refused(&tenant_zero(), lift(0, 1), Actor::MoveTool),
+        INVALID
+    );
+    assert_eq!(refused(&owner, lift(0, since), Actor::Operator), FORBIDDEN);
 }
 
 #[test]
@@ -2361,14 +2557,7 @@ fn a_flag_is_turned_off_but_never_on_while_restoring() {
     );
     // After the lift it may be turned on again.
     let since = turned_off.door.restoring[0].since_seq;
-    let lifted = apply(
-        &turned_off,
-        Change::LiftRestoring {
-            unit: 0,
-            since_seq: since,
-        },
-        Actor::RestoreTool,
-    );
+    let lifted = apply(&turned_off, lift(0, since), Actor::RestoreTool);
     apply(
         &lifted,
         Change::SetFeatures {
@@ -2377,4 +2566,22 @@ fn a_flag_is_turned_off_but_never_on_while_restoring() {
         },
         Actor::Operator,
     );
+}
+
+/// A lift of `unit`'s entry at `since_seq`, as the restore tool writes it
+/// after the gate (nothing acknowledged).
+#[allow(dead_code)]
+fn lift(unit: u32, since_seq: u64) -> Change {
+    Change::LiftRestoring {
+        unit,
+        since_seq,
+        proof: crate::unit::lift::LiftProof {
+            replay_id: crate::unit::lift::ReplayId {
+                since: since_seq,
+                ordinal: 1,
+                nonce: "n".into(),
+            },
+            acknowledged: Default::default(),
+        },
+    }
 }

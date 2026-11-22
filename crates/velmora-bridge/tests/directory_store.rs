@@ -285,7 +285,7 @@ fn unit_rows_follow_the_head() {
         let lifted = write(
             &chain,
             &t,
-            Change::LiftRestoring { unit: 1, since_seq },
+            lift(1, since_seq),
             Actor::RestoreTool,
             NOW,
             since_seq,
@@ -1351,4 +1351,22 @@ fn a_bare_tenant_name_is_a_stray() {
         store.plant(&format!("m/t/{A1}"), vec![1]);
         assert!(chain_tenants(&store).await.is_err());
     });
+}
+
+/// A lift of `unit`'s entry at `since_seq`, as the restore tool writes it
+/// after the gate (nothing acknowledged).
+#[allow(dead_code)]
+fn lift(unit: u32, since_seq: u64) -> Change {
+    Change::LiftRestoring {
+        unit,
+        since_seq,
+        proof: velmora_bridge::unit::lift::LiftProof {
+            replay_id: velmora_bridge::unit::lift::ReplayId {
+                since: since_seq,
+                ordinal: 1,
+                nonce: "n".into(),
+            },
+            acknowledged: Default::default(),
+        },
+    }
 }
