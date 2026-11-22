@@ -605,7 +605,7 @@ class SegmentWriterTest(GeneratorCase):
             doc = tomllib.loads(written.decode("utf-8"))
             self.assertEqual(doc["vars"]["RECORD_LAYOUT"], "tenant", value)
             self.assertEqual(doc["vars"][WRITER], tomllib.loads(f"v = {value}")["v"], value)
-            self.assertEqual(out.splitlines()[-1], LOG + "tenant", value)
+            self.assertEqual(out.splitlines()[-2], LOG + "tenant", value)
             # The bytes: what the step wrote for this file before the
             # rule, and the one line.
             self.one_line_more(without_switches(doctored), written, value)
