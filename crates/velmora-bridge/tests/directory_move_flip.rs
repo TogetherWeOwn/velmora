@@ -825,3 +825,38 @@ fn a_window_longer_than_the_bound_is_not_walked() {
         assert!(matches!(m.flip().await, Err(FlipError::NotThisMove)));
     });
 }
+
+#[test]
+fn records_of_no_window_after_the_give_up_keep_its_answer() {
+    block_on(async {
+        let m = window().await;
+        let first = m.give_up().await.map_err(|e| format!("{e:?}")).unwrap();
+        let zero = Tenant::zero();
+        m.write(&zero, hold(true), Actor::Operator).await;
+        m.write(&zero, hold(false), Actor::Operator).await;
+        let n = m.records();
+        assert_eq!(
+            m.give_up().await.map_err(|e| format!("{e:?}")).unwrap(),
+            first
+        );
+        assert_eq!(m.records(), n);
+        assert!(matches!(m.flip().await, Err(FlipError::NotThisMove)));
+    });
+}
+
+#[test]
+fn a_shredded_owner_row_stops_the_flip_before_any_write() {
+    use velmora_bridge::directory::record::Lifecycle;
+    block_on(async {
+        let m = window().await;
+        let mut gone = m.head(&owner()).await;
+        gone.seq += 1;
+        gone.lifecycle = Lifecycle::Shredded;
+        m.dir().apply_tenant(&gone, m.rig.now()).await.unwrap();
+        let n = m.records();
+        let r = m.flip().await;
+        assert!(matches!(r, Err(FlipError::OwnerRow)), "{r:?}");
+        assert_eq!(m.records(), n);
+        assert!(!m.stamp_put().await);
+    });
+}
