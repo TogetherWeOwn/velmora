@@ -33,7 +33,7 @@ pub mod restore;
 pub mod schema;
 
 pub use birth::{may_provision, BirthKind, BirthToken, HeadView, ProvisionRefusal};
-pub use call::{Reader, Refused, SyncHead, TenantState, UnitAnswer, UnitCall, UnitOp};
+pub use call::{Reader, Refused, SyncHead, TenantState, UnitAnswer, UnitCall, UnitOp, UnitReply};
 pub use identity::{CallKind, Seqs, Verdict};
 pub use name::{TenantId, UnitName};
-pub use object::{poll_once, Unit, UnitSql};
+pub use object::{poll_once, AlarmStep, Unit, UnitSql};

@@ -30,6 +30,7 @@
 //! |---|---|
 //! | a newer tenant or key record | `sync` first, then proves again |
 //! | a stamp object after the unit's counter | confirms it through the unit's stamp counter ([`crate::stamp::Stamp::checked`]): a raise that ran after the unit answered moves the counter and is not a rollback; with the counter unchanged the rollback is recorded, the unit is closed and the restore gate is needed (§8.6) |
+//! | a name under `m/rk/<t>/` that is not an access key id | skips it and pages (`stray` in the proof): it cannot match a key, so skipping it un-revokes nothing, and `m/` is put-only, so failing on it would close the tenant for good |
 //! | more revocations listed than the unit holds | applies every listed id to that unit (setting `revoked` twice changes nothing), sends an `apply_control` message for the key chain so the finisher appends a missing record, then calls `renew` with the same `proof_start`, the proven state and the listed ids |
 //! | fewer revocations listed than the unit holds | does not renew, and pages: `m/rk/` is put-only, so the unit holds a revocation the bucket does not, which no correct history gives |
 //!
@@ -40,6 +41,7 @@
 //! lanes that write them; this module takes them through [`ChainNames`].
 
 use crate::ports::{BlobStore, Clock};
+use crate::recovery::valid_key_id;
 use crate::stamp::{stamp_key, STAMP_PREFIX};
 use crate::types::{BridgeError, Result, UnixMs};
 
@@ -50,8 +52,6 @@ use super::stamp_id::UnitStampId;
 pub const REVOCATION_PAGE: u32 = 1000;
 
 const ERR_SEQ: BridgeError = BridgeError::Invalid("a chain seq is at its largest value");
-const ERR_REVOCATION_KEY: BridgeError =
-    BridgeError::Invalid("a revocation key under the tenant's directory is malformed");
 const ERR_NAMES: BridgeError =
     BridgeError::Invalid("the revocation directory does not name the unit's tenant");
 
@@ -88,6 +88,9 @@ pub enum Proof {
         proof_start: UnixMs,
         proven: Proven,
         revocations: Vec<String>,
+        /// Names under the revocation directory that are not an access
+        /// key id: skipped, and the caller pages with them.
+        stray: Vec<String>,
     },
     /// A newer record exists in the named chain(s): `sync`, then prove
     /// again.
@@ -100,7 +103,21 @@ pub enum Proof {
     StampAhead { seen: Option<u64> },
     /// The unit holds more revocations than the bucket lists. Not
     /// renewed; pages.
-    RevocationsShort { listed: u64, held: u64 },
+    RevocationsShort {
+        listed: u64,
+        held: u64,
+        stray: Vec<String>,
+    },
+}
+
+/// The revocation directory of a tenant, as listed.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Listed {
+    /// The access key ids, in key order.
+    pub ids: Vec<String>,
+    /// The names that are not one access key id below the directory
+    /// (nested, empty or another shape), in key order. Not counted.
+    pub stray: Vec<String>,
 }
 
 /// Runs the proof for `unit`. Reads only; writes nothing anywhere.
@@ -148,7 +165,7 @@ where
         });
     }
 
-    let ids = revocations(safety, names, tenant).await?;
+    let Listed { ids, stray } = revocations(safety, names, tenant).await?;
     let listed = ids.len() as u64;
     let proven = Proven {
         state_seq: unit.state_seq,
@@ -161,46 +178,50 @@ where
             proof_start,
             proven,
             revocations: Vec::new(),
+            stray,
         }),
         std::cmp::Ordering::Greater => Ok(Proof::Fresh {
             proof_start,
             proven,
             revocations: ids,
+            stray,
         }),
         std::cmp::Ordering::Less => Ok(Proof::RevocationsShort {
             listed,
             held: unit.revoked,
+            stray,
         }),
     }
 }
 
 /// Every access key id under the tenant's revocation directory, in key
-/// order.
+/// order, and apart the names that are not one (page
+/// and skip). Every name that is an access key id counts as a
+/// revocation, whatever its body (fail toward revoked).
 pub async fn revocations<B: BlobStore, N: ChainNames>(
     safety: &B,
     names: &N,
     tenant: &str,
-) -> Result<Vec<String>> {
+) -> Result<Listed> {
     let dir = names.revocation_dir(tenant);
     // A directory that is not the tenant's own would list another
     // tenant's revocations, or tenant 0's whole flat prefix.
     if !dir.ends_with('/') || !dir.contains(&format!("/{tenant}/")) {
         return Err(ERR_NAMES);
     }
-    let mut ids = Vec::new();
+    let mut listed = Listed::default();
     let mut after = dir.clone();
     loop {
         let page = safety.list(&dir, &after, REVOCATION_PAGE).await?;
         for key in &page {
-            let id = key
-                .strip_prefix(&dir)
-                .filter(|id| !id.is_empty() && !id.contains('/'))
-                .ok_or(ERR_REVOCATION_KEY)?;
-            ids.push(id.to_string());
+            match key.strip_prefix(&dir).filter(|id| valid_key_id(id)) {
+                Some(id) => listed.ids.push(id.to_string()),
+                None => listed.stray.push(key.clone()),
+            }
         }
         match page.last() {
             Some(last) if page.len() as u64 >= u64::from(REVOCATION_PAGE) => after = last.clone(),
-            _ => return Ok(ids),
+            _ => return Ok(listed),
         }
     }
 }

@@ -36,6 +36,7 @@ pub const CATALOGUE: &[&str] = &[
 /// The unit's own migrations, in order.
 pub const UNIT: &[&str] = &[
     include_str!("migrations/u0001_identity.sql"),
+    include_str!("migrations/u0002_lease.sql"),
     include_str!("migrations/u0003_keys_import.sql"),
     include_str!("migrations/u0004_restore.sql"),
 ];

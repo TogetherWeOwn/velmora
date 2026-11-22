@@ -25,9 +25,24 @@
 //!   and `read_plan` run without `authenticated`, and their transaction
 //!   is rolled back and refused if it changed a row (counted by SQLite's
 //!   `total_changes()`).
+//! - **Rule 12, freshness lease** ([`crate::unit_lease`]). With an
+//!   expired lease every call but the Worker's own (`sync`, `renew`, the
+//!   key apply, the import, the gate's and the restore's) and the stamp
+//!   check of a job (`stamp`, `stamp_rolled_back`) answers
+//!   [`UnitAnswer::RenewNeeded`]. `renew` sets the lease from a proof,
+//!   after it applied the revocations the proof listed; the `sync` that
+//!   sets a `restoring` entry closes it. Every answer leaves the unit as a
+//!   [`UnitReply`] with `lease_left_ms`, and `revoked` once it holds keys.
+//! - **Rules 4 and 8, the alarm** ([`Unit::alarm`]): the only sender of
+//!   jobs. It sends `stamp_raise` once per period with writes under a
+//!   fresh lease, and with an expired lease one `renew` and nothing else.
+//! - **The write mark** ([`crate::unit_lease::mark`]): the catalogue and
+//!   every table of the unit are reached only through [`MarkedSql`].
 
+use std::cell::Cell;
 use std::future::Future;
 use std::pin::pin;
+use std::rc::Rc;
 use std::task::{Context, Poll, Waker};
 
 use base64::Engine as _;
@@ -36,9 +51,11 @@ use serde_json::{json, Value};
 use super::birth::{check_token, BirthKind, BirthToken, ProvisionRefusal};
 use super::call::{
     Closed, HoldMode, Reader, Refused, SyncHead, TenantState, UnitAnswer, UnitCall, UnitOp,
+    UnitReply,
 };
 use super::identity::{self, CallKind, Seqs, Verdict};
 use super::import::{self, ImportBatch, ImportRefusal, ImportTable, Imported, MoveHead};
+use super::jobcall::JobCall;
 use super::keys::{self, Applied, KeyEntry};
 use super::lift::{self, GateRefusal};
 use super::name::UnitName;
@@ -47,6 +64,11 @@ use super::schema;
 use crate::ports::{Catalog, Sql, SqlValue};
 use crate::sql::SqlCatalog;
 use crate::types::{BridgeError, BucketId, ExtentId, GenerationId, KeyStatus, Result, UnixMs};
+use crate::unit_lease::alarm::{self, AlarmRules, AlarmRun, Dues, Duty};
+use crate::unit_lease::job::{self, UnitJobKind};
+use crate::unit_lease::lease::{Admit, LeaseRefusal, LeaseRules, Proven};
+use crate::unit_lease::mark::{Mark, MarkedSql, WriteMark};
+use crate::unit_lease::store;
 
 /// The database of a unit: [`Sql`] with whole-call transactions.
 pub trait UnitSql: Sql {
@@ -92,27 +114,94 @@ pub struct Head {
     pub closed_at: Option<i64>,
 }
 
+/// What one alarm run sends ([`Unit::alarm`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AlarmStep {
+    /// What the dispatcher decided ([`alarm::on_alarm`]).
+    pub run: AlarmRun,
+    /// The job messages to send, in order: the stamp raise, then the
+    /// renewal. Empty when the unit has no job form (tenant 0).
+    pub jobs: Vec<String>,
+    /// The stamp raise is among them.
+    pub raise: bool,
+}
+
 /// One unit over its database.
 pub struct Unit<S: UnitSql> {
-    cat: SqlCatalog<S>,
+    /// The catalogue, over the marked database: every write of the unit
+    /// goes through the mark, and nothing here holds the inner one.
+    cat: SqlCatalog<MarkedSql<S>>,
     own: UnitName,
     /// The jurisdiction the object was made under ("" for none).
     jurisdiction: String,
+    lease_rules: LeaseRules,
+    alarm_rules: AlarmRules,
+    /// The earliest time a call of this wake asked the alarm to be armed
+    /// for; the object class takes it after the call ([`Unit::take_wake`]).
+    wake: Cell<Option<UnixMs>>,
 }
 
 impl<S: UnitSql> Unit<S> {
     /// `own`: the name the object was made under; `jurisdiction`: the
-    /// jurisdiction of its namespace ("" for none).
-    pub fn new(sql: S, own: UnitName, jurisdiction: &str) -> Self {
+    /// jurisdiction of its namespace ("" for none); `wake_id`: 16 bytes
+    /// of the platform's random source, new at each wake of the object
+    /// (the write mark's, [`WriteMark::new`]).
+    pub fn woken(sql: S, own: UnitName, jurisdiction: &str, wake_id: [u8; 16]) -> Self {
+        let mark = Rc::new(WriteMark::new(wake_id));
         Unit {
-            cat: SqlCatalog::new(sql),
+            cat: SqlCatalog::new(MarkedSql::new(sql, mark)),
             own,
             jurisdiction: jurisdiction.to_string(),
+            lease_rules: LeaseRules::DEFAULT,
+            alarm_rules: AlarmRules::DEFAULT,
+            wake: Cell::new(None),
         }
     }
 
-    pub fn sql(&self) -> &S {
+    /// [`Unit::woken`] with a fixed wake id, for native tests only: a
+    /// real object needs a random one.
+    #[cfg(feature = "testkit")]
+    pub fn new(sql: S, own: UnitName, jurisdiction: &str) -> Self {
+        Unit::woken(sql, own, jurisdiction, [0x5a; 16])
+    }
+
+    /// The lease and alarm dials (native tests). Both must be valid
+    /// together.
+    pub fn with_rules(mut self, lease: LeaseRules, alarm: AlarmRules) -> Self {
+        assert!(
+            lease.valid() && alarm.valid(&lease),
+            "unit: invalid lease dials"
+        );
+        self.lease_rules = lease;
+        self.alarm_rules = alarm;
+        self
+    }
+
+    /// The unit's database, behind the write mark.
+    pub fn sql(&self) -> &MarkedSql<S> {
         &self.cat.sql
+    }
+
+    /// The write mark now: what every page of a dump carries.
+    pub fn mark(&self) -> Mark {
+        self.cat.sql.mark()
+    }
+
+    /// The earliest alarm time a call since the last take asked for
+    /// (a first write since the stamp raise, a renewal with work due).
+    /// The object class arms it if it is earlier than the armed one
+    /// ([`alarm::rearm`]).
+    pub fn take_wake(&self) -> Option<UnixMs> {
+        self.wake.take()
+    }
+
+    fn want_wake(&self, at: Option<UnixMs>) {
+        let Some(at) = at else { return };
+        let earlier = match self.wake.get() {
+            Some(cur) => cur.0.min(at.0),
+            None => at.0,
+        };
+        self.wake.set(Some(UnixMs(earlier)));
     }
 
     pub fn name(&self) -> &UnitName {
@@ -126,6 +215,55 @@ impl<S: UnitSql> Unit<S> {
             Ok(answer) => answer,
             Err(e) => failed(&e),
         }
+    }
+
+    /// One call as it leaves the unit: [`Unit::handle`], with the numbers
+    /// every answer carries ([`Unit::wrap`]).
+    pub fn reply(&self, call: &UnitCall, now: UnixMs) -> UnitReply {
+        let answer = self.handle(call, now);
+        self.wrap(answer, now)
+    }
+
+    /// `answer` with the time the lease has left at `now` and, for a unit
+    /// that holds keys, the revoked keys it holds (rule 12, SEC-6), read
+    /// after the call. An unborn unit, a call for another name and a
+    /// unit whose numbers cannot be read carry 0 and no `revoked`.
+    pub fn wrap(&self, answer: UnitAnswer, now: UnixMs) -> UnitReply {
+        let foreign = matches!(
+            answer,
+            UnitAnswer::Unborn { .. }
+                | UnitAnswer::Refused {
+                    reason: Refused::Identity(identity::Refusal::WrongName),
+                    ..
+                }
+        );
+        let (lease_left_ms, revoked) = if foreign {
+            (0, None)
+        } else {
+            self.numbers(now).unwrap_or((0, None))
+        };
+        UnitReply {
+            answer,
+            lease_left_ms,
+            revoked,
+        }
+    }
+
+    fn numbers(&self, now: UnixMs) -> Result<(u64, Option<u64>)> {
+        let left = match self.lease_at(now)? {
+            Admit::Fresh { left_ms, .. } => u64::try_from(left_ms).unwrap_or(0),
+            Admit::RenewNeeded => 0,
+        };
+        Ok((left, store::revoked(self.sql())?))
+    }
+
+    /// The lease at `now`. No lease table (a unit born before `u0002`)
+    /// reads as expired: such a unit is never served (fail closed).
+    fn lease_at(&self, now: UnixMs) -> Result<Admit> {
+        Ok(match store::read(self.sql())? {
+            Some(row) => row.lease().admit(now, &self.lease_rules),
+            None => Admit::RenewNeeded,
+        })
     }
 
     fn dispatch(&self, call: &UnitCall, now: UnixMs) -> Result<UnitAnswer> {
@@ -330,6 +468,11 @@ impl<S: UnitSql> Unit<S> {
         // verified records, or (the import) fill a closed unit.
         match &call.op {
             UnitOp::Sync { head: next } => return self.sync(&head, next, now),
+            UnitOp::Renew {
+                proof_start,
+                proven,
+                revocations,
+            } => return self.renew(&head, *proof_start, proven, revocations, now),
             UnitOp::RestorePrepare { .. } | UnitOp::Restore { .. } => {
                 // Restores need the object's storage: the object class
                 // runs them through `pitr_step`.
@@ -417,6 +560,22 @@ impl<S: UnitSql> Unit<S> {
                 why: Closed::Provisioning,
             });
         }
+        // Rule 12: with an expired lease nothing is served and no job
+        // runs. The stamp check of a job is the exception: it can only
+        // find the unit behind its stamp and close it (a renewal's
+        // `Proof::StampAhead` is confirmed through it).
+        let stamp_check = matches!(
+            &call.op,
+            UnitOp::Job {
+                call: JobCall::stamp { .. } | JobCall::stamp_rolled_back { .. }
+            }
+        );
+        if !stamp_check && self.lease_at(now)? == Admit::RenewNeeded {
+            return Ok(UnitAnswer::RenewNeeded {
+                seqs: head.seqs,
+                why: None,
+            });
+        }
         // A job call (W2-jobs): only from the consumer, authenticated,
         // with the job's numbers (checked above as a job's); it runs in
         // any tenant state but a shred.
@@ -471,12 +630,35 @@ impl<S: UnitSql> Unit<S> {
         fanout_check: bool,
         now: UnixMs,
     ) -> Result<UnitAnswer> {
-        let mut op = || poll_once(self.operate(call, head, fanout_check, now))?;
-        match transact(self.sql(), call.authenticated, &mut op)? {
-            Ok(body) => Ok(UnitAnswer::Ok {
-                seqs: head.seqs,
-                body,
-            }),
+        let sql = self.sql();
+        let mut first_write = false;
+        let mut op = || {
+            let before = total_changes(sql)?;
+            let out = poll_once(self.operate(call, head, fanout_check, now))??;
+            if let Ok(body) = &out {
+                // The first write since the alarm's last stamp raise
+                // makes the next raise due (§8.5).
+                if call.authenticated && raises_stamp(&call.op) && total_changes(sql)? != before {
+                    first_write = store::note_write(sql, now)?;
+                }
+                // A recorded rollback closes the lease at once: the
+                // unit is behind its stamp and needs the gate (§8.6).
+                if recorded_rollback(&call.op, body) {
+                    store::close(sql)?;
+                }
+            }
+            Ok(out)
+        };
+        match transact(sql, call.authenticated, &mut op)? {
+            Ok(body) => {
+                if first_write {
+                    self.want_wake(alarm::stamp_raise_due(Some(now), &self.alarm_rules));
+                }
+                Ok(UnitAnswer::Ok {
+                    seqs: head.seqs,
+                    body,
+                })
+            }
             Err(reason) => {
                 let alarm = matches!(
                     reason,
@@ -614,6 +796,7 @@ impl<S: UnitSql> Unit<S> {
             }
             UnitOp::Provision { .. }
             | UnitOp::Sync { .. }
+            | UnitOp::Renew { .. }
             | UnitOp::ApplyKeys { .. }
             | UnitOp::HeldKeys {}
             | UnitOp::Import { .. }
@@ -795,6 +978,8 @@ impl<S: UnitSql> Unit<S> {
                     applied,
                     skipped,
                 } => {
+                    // A listed revocation overrides any record's status.
+                    store::enforce_listed(sql)?;
                     let n = poll_once(sql.exec(
                         "UPDATE unit_head SET keys_seq = ?1 WHERE id = 1",
                         &[int_param(keys_seq)?],
@@ -806,7 +991,7 @@ impl<S: UnitSql> Unit<S> {
                     Ok(Ok(json!({
                         "applied": applied,
                         "skipped": skipped,
-                        "revoked": keys::revoked(sql)?,
+                        "revoked": store::revoked(sql)?.unwrap_or(0),
                     })))
                 }
             }
@@ -935,6 +1120,11 @@ impl<S: UnitSql> Unit<S> {
                 }
                 lift::clear(sql)?;
             }
+            // The close of §8.6 step 2: a `restoring` entry ends the
+            // lease at once (`lease_hi` is kept for the restore's wait).
+            if next.restoring_since.is_some() && store::read(sql)?.is_some() {
+                store::close(sql)?;
+            }
             let n = poll_once(sql.exec(
                 "UPDATE unit_head SET state_seq = ?1, tenant_state = ?2, tenant_mode = ?3, \
                    restoring_since = ?4, closed_at = ?5 WHERE id = 1",
@@ -971,6 +1161,213 @@ impl<S: UnitSql> Unit<S> {
             seqs: head.seqs,
             body: json!({ "synced": head.seqs.state_seq }),
         })
+    }
+
+    /// `renew` (rule 12): applies the revocations the proof listed, then
+    /// sets `fresh_until = proof_start + T` if the unit holds at least the
+    /// proven state and every listed id as revoked. One transaction: the
+    /// applied revocations are kept also when the lease is refused (each
+    /// is a fact of `m/rk/`, which always wins).
+    fn renew(
+        &self,
+        head: &Head,
+        proof_start: UnixMs,
+        proven: &Proven,
+        listed: &[String],
+        now: UnixMs,
+    ) -> Result<UnitAnswer> {
+        let no = |why: LeaseRefusal| {
+            Ok(UnitAnswer::RenewNeeded {
+                seqs: head.seqs,
+                why: Some(why),
+            })
+        };
+        // A closed unit renews nothing until the gate lifts it (§8.6
+        // step 2).
+        if head.restoring_since.is_some() {
+            return no(LeaseRefusal::Restoring);
+        }
+        let sql = self.sql();
+        let Some(row) = store::read(sql)? else {
+            return no(LeaseRefusal::NoLeaseTable);
+        };
+        let stamp_id = super::jobcall::stamp_id(&self.own);
+        let mut outcome: Option<std::result::Result<UnixMs, LeaseRefusal>> = None;
+        let mut applied = 0;
+        let mut run = || -> Result<()> {
+            let stamp = poll_once(self.cat.stamp(&stamp_id))??;
+            if stamp.rolled_back {
+                outcome = Some(Err(LeaseRefusal::RolledBack));
+                return Ok(());
+            }
+            match store::revoke_listed(sql, listed, now)? {
+                Ok(n) => applied = n,
+                Err(_) => {
+                    outcome = Some(Err(LeaseRefusal::BadList));
+                    return Ok(());
+                }
+            }
+            let own = Proven {
+                state_seq: head.seqs.state_seq,
+                keys_seq: head.seqs.keys_seq,
+                stamp_counter: stamp.counter,
+                revoked: store::revoked(sql)?.unwrap_or(0),
+            };
+            let mut unapplied = 0;
+            for id in listed {
+                if !store::holds_revoked(sql, id)? {
+                    unapplied += 1;
+                }
+            }
+            let mut lease = row.lease();
+            outcome = Some(
+                match lease.renew(proof_start, proven, &own, unapplied, now, &self.lease_rules) {
+                    Ok(until) => {
+                        store::renewed(sql, until)?;
+                        Ok(until)
+                    }
+                    Err(r) => Err(r.into()),
+                },
+            );
+            Ok(())
+        };
+        sql.atomically(&mut run)?;
+        match outcome.ok_or(BridgeError::Invalid("renew without an outcome"))? {
+            Ok(until) => {
+                // Work that waited for the renewal runs at once (RD-9).
+                if let Some(after) = store::read(sql)? {
+                    self.want_wake(alarm::after_renew(now, &self.dues(&after)));
+                }
+                Ok(UnitAnswer::Ok {
+                    seqs: head.seqs,
+                    body: json!({ "fresh_until": until.0, "applied": applied }),
+                })
+            }
+            Err(why) => no(why),
+        }
+    }
+
+    /// When each duty of the alarm is due. Only the stamp raise is built
+    /// (§8.5); the day close (W7), the sweeps, the job hand-out and the
+    /// report to the directory are not due on a unit yet: the Worker's
+    /// cron runs the jobs of a unit through `TenantCatalog`.
+    fn dues(&self, row: &store::LeaseRow) -> Dues {
+        Dues::none().with(
+            Duty::StampRaise,
+            alarm::stamp_raise_due(row.first_write_at, &self.alarm_rules),
+        )
+    }
+
+    /// Whether the unit takes no `renew` and no job: a `restoring` entry,
+    /// or a recorded rollback.
+    fn closed(&self, head: &Head) -> Result<bool> {
+        if head.restoring_since.is_some() {
+            return Ok(true);
+        }
+        let stamp = poll_once(self.cat.stamp(&super::jobcall::stamp_id(&self.own)))??;
+        Ok(stamp.rolled_back)
+    }
+
+    /// One alarm run at `now`, first part: what to send. The object class
+    /// sends [`AlarmStep::jobs`] (the only sends of a unit, rule 4), then
+    /// calls [`Unit::alarm_done`]. An unborn unit, or one without a lease
+    /// table, has nothing to run.
+    pub fn alarm(&self, now: UnixMs) -> Result<AlarmStep> {
+        let idle = AlarmStep {
+            run: AlarmRun {
+                run: Vec::new(),
+                send_renew: false,
+                retry_at: None,
+            },
+            jobs: Vec::new(),
+            raise: false,
+        };
+        match self.born()? {
+            Some(cert) if cert == self.own => {}
+            _ => return Ok(idle),
+        }
+        let Some(row) = store::read(self.sql())? else {
+            return Ok(idle);
+        };
+        let head = self.head()?;
+        let lease = row.lease();
+        let closed = self.closed(&head)?;
+        let run = alarm::on_alarm(
+            now,
+            &row.at(&lease, closed),
+            &self.dues(&row),
+            &self.lease_rules,
+            &self.alarm_rules,
+        );
+        let mut jobs = Vec::new();
+        let mut raise = false;
+        for duty in &run.run {
+            // The other duties are never due here (`dues`).
+            if *duty == Duty::StampRaise {
+                raise = true;
+                jobs.push(job::message(
+                    UnitJobKind::StampRaise,
+                    &self.own,
+                    head.seqs,
+                    now,
+                ));
+            }
+        }
+        if run.send_renew {
+            jobs.push(job::message(UnitJobKind::Renew, &self.own, head.seqs, now));
+        }
+        Ok(AlarmStep {
+            jobs: jobs
+                .into_iter()
+                .collect::<Option<Vec<_>>>()
+                .unwrap_or_default(),
+            raise,
+            run,
+        })
+    }
+
+    /// One alarm run, second part: `failed` = a send of the step was
+    /// refused (or the unit has no job form: tenant 0). Records the run
+    /// (a renew try, the raise asked for, the failed-run count) and
+    /// answers when the alarm must fire next (`None` = not at all: the
+    /// unit is closed, or nothing waits). The alarm just fired, so the
+    /// object class arms that time as it is.
+    pub fn alarm_done(
+        &self,
+        now: UnixMs,
+        step: &AlarmStep,
+        failed: bool,
+    ) -> Result<Option<UnixMs>> {
+        if step.run.run.is_empty() && !step.run.send_renew {
+            // Woken for nothing: arm what is due, if anything.
+            return self.alarm_next(now, None);
+        }
+        let failed =
+            failed || step.jobs.len() != step.run.run.len() + usize::from(step.run.send_renew);
+        let sql = self.sql();
+        let mut run = || store::alarm_ran(sql, step.run.send_renew, step.raise && !failed, failed);
+        sql.atomically(&mut run)?;
+        self.alarm_next(now, step.run.retry_at)
+    }
+
+    fn alarm_next(&self, now: UnixMs, retry_at: Option<UnixMs>) -> Result<Option<UnixMs>> {
+        let Some(row) = store::read(self.sql())? else {
+            return Ok(None);
+        };
+        if self.born()?.is_none() {
+            return Ok(None);
+        }
+        let head = self.head()?;
+        let lease = row.lease();
+        let closed = self.closed(&head)?;
+        Ok(alarm::next_alarm(
+            now,
+            &row.at(&lease, closed),
+            &self.dues(&row),
+            retry_at,
+            &self.lease_rules,
+            &self.alarm_rules,
+        ))
     }
 }
 
@@ -1014,6 +1411,36 @@ pub fn transact<S: UnitSql>(
         )),
         Err(e) => Err(e),
     }
+}
+
+/// Whether a call that changed rows makes the alarm's stamp raise due
+/// (§8.5): every call but the stamp's own calls (else every raise would
+/// make the next one due, and an idle unit would raise for ever) and the
+/// bookkeeping that the Worker's cron writes on every run (the
+/// dispatcher's run time, scan cursors), whose loss in a rollback costs
+/// nothing.
+fn raises_stamp(op: &UnitOp) -> bool {
+    !matches!(
+        op,
+        UnitOp::Job {
+            call: JobCall::stamp { .. }
+                | JobCall::stamp_advance { .. }
+                | JobCall::stamp_rolled_back { .. }
+                | JobCall::record_dispatch { .. }
+                | JobCall::set_cursor { .. }
+        }
+    )
+}
+
+/// Whether `body` is the answer of a `stamp_rolled_back` job call that
+/// recorded the rollback.
+fn recorded_rollback(op: &UnitOp, body: &Value) -> bool {
+    matches!(
+        op,
+        UnitOp::Job {
+            call: JobCall::stamp_rolled_back { .. }
+        }
+    ) && body == &Value::Bool(true)
 }
 
 /// What the tenant's state lets an S3 call do (`docs/units.md`).

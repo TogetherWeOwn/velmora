@@ -48,7 +48,7 @@
 //!
 //! This is the unit's side and it is pure: no I/O, no clock of its own.
 //! The unit object passes its clock in and stores [`FreshLease::fresh_until`]
-//! in its `meta` row (one row write per renewal).
+//! in its `unit_lease` row (one row write per renewal, [`super::store`]).
 
 use crate::types::UnixMs;
 
@@ -101,11 +101,13 @@ pub enum Admit {
 }
 
 /// The unit state a renewal proof was made for: the two chain seqs and
-/// the stamp counter (`None` = never raised).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+/// the stamp counter (`None` = never raised). On the wire in `renew`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Proven {
     pub state_seq: u64,
     pub keys_seq: u64,
+    #[serde(default)]
     pub stamp_counter: Option<u64>,
     /// Revoked keys: what the proof listed under `m/rk/<t>/`, and for the
     /// unit what it holds, tombstones included.
@@ -123,8 +125,8 @@ impl Proven {
     }
 }
 
-/// Why a `renew` was refused. The unit answers `renew_needed` for
-/// both; the Worker proves again.
+/// Why a `renew` was refused. The unit answers `renew_needed` with the
+/// reason ([`LeaseRefusal`]); the Worker proves again.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RenewRefused {
     /// `proof_start` is more than [`LeaseRules::max_behind_ms`] behind
@@ -139,6 +141,44 @@ pub enum RenewRefused {
     /// This many ids that the proof listed for the unit to apply are not
     /// revoked (or tombstoned) in the unit.
     RevocationsUnapplied { count: usize },
+}
+
+/// Why the unit answered `renew_needed` to a `renew`, as it crosses the
+/// wire. Nothing of the lease moved.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LeaseRefusal {
+    /// The unit has a `restoring` entry: it refuses `renew` until the
+    /// restore gate lifts it (§8.6 step 2).
+    Restoring,
+    /// The unit's stamp row records a rollback: the restore gate is
+    /// needed (§8.6). The Worker pages.
+    RolledBack,
+    /// The unit has no lease table (born before `u0002`). The Worker
+    /// pages.
+    NoLeaseTable,
+    /// [`RenewRefused::ProofTooOld`].
+    ProofTooOld,
+    /// [`RenewRefused::ProofAhead`].
+    ProofAhead,
+    /// [`RenewRefused::NotProven`].
+    NotProven,
+    /// [`RenewRefused::RevocationsUnapplied`].
+    RevocationsUnapplied,
+    /// The listed ids were too many or not access key ids; nothing was
+    /// applied.
+    BadList,
+}
+
+impl From<RenewRefused> for LeaseRefusal {
+    fn from(r: RenewRefused) -> LeaseRefusal {
+        match r {
+            RenewRefused::ProofTooOld { .. } => LeaseRefusal::ProofTooOld,
+            RenewRefused::ProofAhead { .. } => LeaseRefusal::ProofAhead,
+            RenewRefused::NotProven { .. } => LeaseRefusal::NotProven,
+            RenewRefused::RevocationsUnapplied { .. } => LeaseRefusal::RevocationsUnapplied,
+        }
+    }
 }
 
 /// How many of `listed` (the ids of [`super::renewal::Proof::Fresh`] that

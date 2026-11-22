@@ -214,6 +214,7 @@ async fn a_unit_at_the_head_is_proven_with_two_heads_and_two_lists() {
                 revoked: 1,
             },
             revocations: Vec::new(),
+            stray: Vec::new(),
         }
     );
     assert_eq!(bucket.count("head"), 2);
@@ -352,6 +353,7 @@ async fn a_revocation_only_in_the_bucket_is_applied_at_renewal_of_every_unit() {
                 revoked: 2,
             },
             revocations: both.clone(),
+            stray: Vec::new(),
         }
     );
 
@@ -417,7 +419,14 @@ async fn a_unit_with_more_revocations_than_the_bucket_is_not_renewed() {
     let proof = prove(&bucket, &clock, &Names, &view(&id, 1, 1, 2))
         .await
         .unwrap();
-    assert_eq!(proof, Proof::RevocationsShort { listed: 1, held: 2 });
+    assert_eq!(
+        proof,
+        Proof::RevocationsShort {
+            listed: 1,
+            held: 2,
+            stray: Vec::new()
+        }
+    );
 }
 
 /// The revocation list is read in pages of 1,000 and counts all of them.
@@ -428,7 +437,7 @@ async fn revocations_are_listed_in_pages_of_a_thousand() {
     for n in 0..2_500 {
         bucket.plant(&format!("m/rk/{TENANT}/AKIA{n:08}")).await;
     }
-    let ids = revocations(&bucket, &Names, TENANT).await.unwrap();
+    let ids = revocations(&bucket, &Names, TENANT).await.unwrap().ids;
     assert_eq!(ids.len(), 2_500);
     assert_eq!(bucket.count("list"), 3);
     assert!(ids.windows(2).all(|w| w[0] < w[1]));
@@ -440,21 +449,56 @@ async fn revocations_are_listed_in_pages_of_a_thousand() {
         bucket.plant(&format!("m/rk/{TENANT}/AKIA{n:08}")).await;
     }
     assert_eq!(
-        revocations(&bucket, &Names, TENANT).await.unwrap().len(),
+        revocations(&bucket, &Names, TENANT)
+            .await
+            .unwrap()
+            .ids
+            .len(),
         1_000
     );
     assert_eq!(bucket.count("list"), 2);
 }
 
-/// A key below the revocation directory that is not one access key id
-/// fails the proof; a directory that does not name the tenant is
+/// A name below the revocation directory that is not one access key id
+/// is skipped and reported for paging, and every
+/// name that is one counts; a directory that does not name the tenant is
 /// refused before any list.
 #[tokio::test(flavor = "current_thread")]
-async fn malformed_revocation_names_fail_closed() {
+async fn stray_revocation_names_are_skipped_and_reported() {
     let clock = FixedClock::new(T0);
     let bucket = SlowBucket::new(&clock);
+    bucket.plant(&format!("m/rk/{TENANT}/AKIA00000001")).await;
     bucket.plant(&format!("m/rk/{TENANT}/nested/AKIA")).await;
-    assert!(revocations(&bucket, &Names, TENANT).await.is_err());
+    bucket.plant(&format!("m/rk/{TENANT}/AKIA-not.an.id")).await;
+    bucket.plant(&format!("m/rk/{TENANT}/AKIA00000002")).await;
+    let listed = revocations(&bucket, &Names, TENANT).await.unwrap();
+    assert_eq!(listed.ids, vec!["AKIA00000001", "AKIA00000002"]);
+    assert_eq!(
+        listed.stray,
+        vec![
+            format!("m/rk/{TENANT}/AKIA-not.an.id"),
+            format!("m/rk/{TENANT}/nested/AKIA"),
+        ]
+    );
+
+    // The proof counts only the ids, and hands the strays on.
+    chains(&bucket, TENANT, 1, 1).await;
+    let id = unit_id(0);
+    let proof = prove(&bucket, &clock, &Names, &view(&id, 1, 1, 2))
+        .await
+        .unwrap();
+    let Proof::Fresh {
+        revocations: to_apply,
+        stray,
+        proven,
+        ..
+    } = proof
+    else {
+        panic!("a stray name does not fail the proof: {proof:?}");
+    };
+    assert!(to_apply.is_empty());
+    assert_eq!(proven.revoked, 2);
+    assert_eq!(stray.len(), 2);
 
     struct Flat;
     impl ChainNames for Flat {

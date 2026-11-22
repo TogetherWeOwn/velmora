@@ -15,12 +15,16 @@
 //! - the unit's database: [`mark::MarkedSql`] over its `Sql`, and
 //!   [`mark::Mark`] on every page of a dump;
 //! - the alarm: [`alarm::on_alarm`], [`alarm::after_renew`],
-//!   [`alarm::rearm`].
+//!   [`alarm::rearm`], and the two jobs it sends ([`job`]);
+//! - the unit's rows of all this: [`store`] (`unit_lease`,
+//!   `unit_revoked_ids`; migration `u0002`).
 
 pub mod alarm;
+pub mod job;
 pub mod lease;
 pub mod mark;
 pub mod renewal;
 pub mod stamp_id;
+pub mod store;
 
 pub use stamp_id::UnitStampId;

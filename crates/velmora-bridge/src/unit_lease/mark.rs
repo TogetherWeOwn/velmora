@@ -228,3 +228,29 @@ impl<S: Sql> Sql for MarkedSql<S> {
         self.inner.limits()
     }
 }
+
+/// The unit's whole-call transactions and its migrations, behind the
+/// mark: a migration is a write; a transaction is its statements, which
+/// count one by one.
+impl<S: crate::unit::UnitSql> crate::unit::UnitSql for MarkedSql<S> {
+    fn atomically(&self, f: &mut dyn FnMut() -> Result<()>) -> Result<()> {
+        self.inner.atomically(f)
+    }
+
+    fn apply_script(&self, script: &str) -> Result<()> {
+        let _writing = self.mark.begin();
+        self.inner.apply_script(script)
+    }
+}
+
+/// Native tests read the database behind a unit as they did before the
+/// mark (`unit.sql().with_conn(..)`). Never in the Worker build: there no
+/// code reaches the inner database past the mark.
+#[cfg(feature = "testkit")]
+impl<S: Sql> std::ops::Deref for MarkedSql<S> {
+    type Target = S;
+
+    fn deref(&self) -> &S {
+        &self.inner
+    }
+}
