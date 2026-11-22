@@ -283,7 +283,10 @@ fn to_response(resp: DavResponse<WBody>) -> Result<Response> {
 #[event(fetch)]
 async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
     // The gateway is disabled unless this deployment explicitly opts in.
-    if !env.var("DAV_ENABLED").is_ok_and(|v| v.to_string() == "true") {
+    if !env
+        .var("DAV_ENABLED")
+        .is_ok_and(|v| v.to_string() == "true")
+    {
         return Ok(Response::empty()?.with_status(404));
     }
     let started = worker::Date::now().as_millis();
