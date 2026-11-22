@@ -163,13 +163,10 @@ impl SuiteDb {
                 };
                 let mut stmts = Vec::with_capacity(list.len() + 1);
                 if op == "rebuild" {
-                    self.state
-                        .storage()
-                        .delete_all()
-                        .await
-                        .map_err(|_| BridgeError::Sql("suite: deleteAll failed".into()))?;
                     stmts.push((intern("PRAGMA defer_foreign_keys = ON"), Vec::new()));
                 }
+                // Every statement is read before anything is cleared, so a
+                // malformed rebuild leaves the twin as it was.
                 for pair in list {
                     let sql = pair.get(0).and_then(Value::as_str);
                     let p = params(pair.get(1));
@@ -177,6 +174,13 @@ impl SuiteDb {
                         return Ok(None);
                     };
                     stmts.push((intern(sql), p));
+                }
+                if op == "rebuild" {
+                    self.state
+                        .storage()
+                        .delete_all()
+                        .await
+                        .map_err(|_| BridgeError::Sql("suite: deleteAll failed".into()))?;
                 }
                 json!(self.sql.batch(stmts).await?)
             }

@@ -71,9 +71,10 @@ export function pitrAt(storage, unixMs) {
 // Arms the restore and ends the object's session in one step, so that a
 // restore is never armed without the restart that applies it. The
 // request that asks for it does not get an answer: `abort()` resets the
-// object, and the next request starts it from `bookmark`. The caller
-// takes `getCurrentBookmark()` first and keeps it outside the object:
-// that bookmark undoes the restore.
+// object, and the next request starts it from `bookmark`. The undo point
+// is the caller's: a `getCurrentBookmark()` taken before, kept outside
+// the object, undoes the restore exactly only if no write commits in
+// between, so the restore call must close the unit first.
 export async function pitrRestoreNow(state, storage, bookmark) {
   await storage.onNextSessionRestoreBookmark(bookmark);
   state.abort("point-in-time restore");

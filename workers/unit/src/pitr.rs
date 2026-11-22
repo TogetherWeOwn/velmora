@@ -13,7 +13,11 @@
 //!   does not return to its request:** `abort()` resets the object, the
 //!   request fails, and the next request finds the restored state. The
 //!   caller takes [`PointInTime::current`] first and keeps that bookmark
-//!   outside the object; restoring it undoes the restore.
+//!   outside the object; restoring it undoes the restore exactly only if
+//!   no write commits in between, so the restore call must close the unit
+//!   (no call writes) before it takes the bookmark. The bookmark that
+//!   `onNextSessionRestoreBookmark` returns cannot leave the request,
+//!   which ends in the reset.
 //!
 //! Bookmarks are opaque strings. A bookmark of one object means nothing
 //! to another. Local workerd has no history: `at` and a restore answer

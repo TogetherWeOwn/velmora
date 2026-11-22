@@ -343,8 +343,11 @@ impl RusqliteSql {
             (c.total_changes(), version)
         };
         let before = mark(&conn);
+        // Inside an open transaction or savepoint, direct access can roll
+        // back writes the twin already has, which no counter shows.
+        let open = !conn.is_autocommit();
         let out = f(&conn);
-        if mark(&conn) != before {
+        if open || !conn.is_autocommit() || mark(&conn) != before {
             shadow.mark_dirty();
         }
         out
@@ -485,21 +488,28 @@ impl crate::unit::UnitSql for RusqliteSql {
             .borrow()
             .execute_batch("SAVEPOINT unit_call")
             .map_err(map_err)?;
-        match f() {
-            Ok(()) => self
-                .conn
+        // A failed RELEASE (a deferred foreign key) leaves the savepoint
+        // open: it is rolled back like a failed call.
+        let done = f().and_then(|()| {
+            self.conn
                 .borrow()
                 .execute_batch("RELEASE unit_call")
-                .map_err(map_err),
+                .map_err(map_err)
+        });
+        match done {
+            Ok(()) => Ok(()),
             Err(e) => {
-                self.conn
+                let undone = self
+                    .conn
                     .borrow()
-                    .execute_batch("ROLLBACK TO unit_call; RELEASE unit_call")
-                    .map_err(map_err)?;
+                    .execute_batch("ROLLBACK TO unit_call; RELEASE unit_call");
                 if let Some(shadow) = &self.shadow {
                     shadow.mark_dirty();
                 }
-                Err(e)
+                match undone {
+                    Ok(()) => Err(e),
+                    Err(r) => Err(BridgeError::Sql(format!("{e}; and the rollback: {r}"))),
+                }
             }
         }
     }

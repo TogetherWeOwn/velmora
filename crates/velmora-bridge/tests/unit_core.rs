@@ -715,6 +715,32 @@ fn an_unauthenticated_read_plan_writes_no_row() {
     assert_eq!(total_changes(&u), before, "no row written");
     assert_eq!(last_read(&u), vec![None, None], "no read stamp");
 
+    // A fan-out piece names a grant: never a cold read, so never served
+    // without authentication, even at the unit's own numbers.
+    let fan = read_plan(Some(Reader::Key {
+        access_key_id: AKID.into(),
+    }));
+    assert_eq!(
+        u.handle(&call(CallKind::Fanout, seqs(3, 0), false, fan), NOW),
+        UnitAnswer::Refused {
+            reason: Refused::Unauthenticated,
+            alarm: false
+        }
+    );
+
+    // An empty range holds no extent and stamps none.
+    let mut empty = read_plan(None);
+    if let UnitOp::ReadPlan { start, end, .. } = &mut empty {
+        (*start, *end) = (5, 5);
+    }
+    let UnitAnswer::Ok { body, .. } =
+        u.handle(&call(CallKind::Request, seqs(3, 0), true, empty), NOW)
+    else {
+        panic!("an empty range is answered");
+    };
+    assert_eq!(body["extents"], json!([]));
+    assert_eq!(last_read(&u), vec![None, None], "no read stamp");
+
     // The same call authenticated stamps the reads.
     let c = call(CallKind::Request, seqs(3, 0), true, read_plan(None));
     assert!(matches!(u.handle(&c, NOW), UnitAnswer::Ok { .. }));

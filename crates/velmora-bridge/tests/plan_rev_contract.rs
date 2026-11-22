@@ -103,24 +103,13 @@ fn rust_pieces(src: &str) -> Vec<String> {
             continue;
         }
         if b[i] == b'\'' {
-            // A char literal ('x', '\n', '\u{..}', '"') or a lifetime.
-            if b.get(i + 1) == Some(&b'\\') {
-                let mut j = i + 2;
-                while j < b.len() && b[j] != b'\'' {
-                    j += 1;
-                }
-                i = j + 1;
-            } else if b.get(i + 2) == Some(&b'\'') {
-                i += 3;
-            } else {
-                // A multi-byte char literal, or a lifetime.
-                let mut j = i + 1;
-                while j < b.len() && (b[j] as char).is_alphanumeric() || j < b.len() && b[j] >= 0x80
-                {
-                    j += 1;
-                }
-                i = if b.get(j) == Some(&b'\'') { j + 1 } else { j };
+            // A char literal ('x', '\n', '\'', '\u{..}', '"') or a lifetime.
+            // Inside a `concat!` a char is one of the pieces Rust joins.
+            let (text, next) = char_literal(b, i);
+            if let (Some(text), Some(_)) = (text, concat.as_ref()) {
+                push(&mut out, &mut concat, text);
             }
+            i = next;
             continue;
         }
         // A raw string: r"…", r#"…"#, br#"…"#.
@@ -203,6 +192,49 @@ fn rust_pieces(src: &str) -> Vec<String> {
     out
 }
 
+/// A char literal at `i` (its opening quote): its text, and the index
+/// after it; a lifetime has no text.
+fn char_literal(b: &[u8], i: usize) -> (Option<String>, usize) {
+    if b.get(i + 1) == Some(&b'\\') {
+        // An escape runs to the first quote after the escaped character.
+        let mut j = i + 3;
+        while j < b.len() && b[j] != b'\'' {
+            j += 1;
+        }
+        let body = &b[i + 1..j.min(b.len())];
+        let text = if body == b"\\'" {
+            "'".to_string()
+        } else if body == b"\\\"" {
+            "\"".to_string()
+        } else {
+            // Read as the same escape in a string literal.
+            let mut lit = body.to_vec();
+            lit.push(b'"');
+            cooked(&lit, 0).0
+        };
+        return (Some(text), j + 1);
+    }
+    // One character, of one or more bytes, then a quote; else a lifetime.
+    let mut j = i + 1;
+    if j < b.len() {
+        j += 1;
+        while j < b.len() && (b[j] & 0xC0) == 0x80 {
+            j += 1;
+        }
+    }
+    if b.get(j) == Some(&b'\'') {
+        return (
+            Some(String::from_utf8_lossy(&b[i + 1..j]).to_string()),
+            j + 1,
+        );
+    }
+    let mut k = i + 1;
+    while k < b.len() && (b[k].is_ascii_alphanumeric() || b[k] == b'_') {
+        k += 1;
+    }
+    (None, k)
+}
+
 fn prev_ident(b: &[u8], i: usize) -> bool {
     i > 0 && (b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_')
 }
@@ -283,9 +315,11 @@ fn sql_pieces(src: &str) -> Vec<String> {
 // Finding the statements that write plan_rev
 // ---------------------------------------------------------------------------
 
-/// The words of a piece of SQL, lower case, identifier quotes dropped,
-/// a string literal as one token that starts with `'`, punctuation as
-/// its own token.
+/// The words of a piece of SQL, lower case: a string literal as one
+/// token that starts with `'`, a quoted identifier as one that starts
+/// with `"` (so that neither is ever read as a keyword or punctuation), a
+/// named parameter (`:a`, `@a`, `$a`) as one token, punctuation as its
+/// own token.
 fn words(sql: &str) -> Vec<String> {
     let b = sql.as_bytes();
     let mut out = Vec::new();
@@ -326,8 +360,23 @@ fn words(sql: &str) -> Vec<String> {
             while i < b.len() && b[i] != close {
                 i += 1;
             }
-            out.push(sql[start..i.min(sql.len())].to_ascii_lowercase());
+            out.push(format!(
+                "\"{}",
+                sql[start..i.min(sql.len())].to_ascii_lowercase()
+            ));
             i += 1;
+        } else if (c == b':' || c == b'@')
+            && b.get(i + 1)
+                .is_some_and(|n| n.is_ascii_alphanumeric() || *n == b'_' || *n >= 0x80)
+        {
+            let start = i;
+            i += 1;
+            while i < b.len()
+                && (b[i].is_ascii_alphanumeric() || b[i] == b'_' || b[i] == b'$' || b[i] >= 0x80)
+            {
+                i += 1;
+            }
+            out.push(sql[start..i].to_ascii_lowercase());
         } else if c.is_ascii_alphanumeric() || c == b'_' || c == b'$' || c >= 0x80 {
             let start = i;
             while i < b.len()
@@ -344,19 +393,20 @@ fn words(sql: &str) -> Vec<String> {
     out
 }
 
-/// A word where a name is expected. SQLite takes a string literal there
-/// as the name (`UPDATE 'extents' SET 'plan_rev' = 2`); in an expression
-/// it stays a string.
+/// A word where a name is expected: bare, in identifier quotes, or a
+/// string literal, which SQLite takes there as the name
+/// (`UPDATE 'extents' SET 'plan_rev' = 2`; in an expression it stays a
+/// string).
 fn nm(t: &str) -> &str {
-    t.strip_prefix('\'').unwrap_or(t)
+    t.strip_prefix(['\'', '"']).unwrap_or(t)
 }
 
-/// Whether a `SET` list assigns `plan_rev`, or may. A bare `plan_rev` or a
-/// `format!` placeholder anywhere counts; a quoted `'plan_rev'` only where
-/// a column is assigned (before the `=` of an assignment, row values
-/// included), not as a value.
+/// Whether a `SET` list assigns `plan_rev`, or may: `plan_rev` (in any
+/// quotes) where a column is assigned, before the `=` of an assignment,
+/// row values included; or a `format!` placeholder anywhere. A read of
+/// `plan_rev` in a value is not a write.
 fn sets_plan_rev(list: &[String]) -> bool {
-    if list.iter().any(|t| t == "plan_rev" || t == "{") {
+    if list.iter().any(|t| t == "{") {
         return true;
     }
     let mut depth = 0i32;
@@ -667,6 +717,14 @@ fn the_scanner_finds_a_statement_however_it_is_written() {
         // A literal that reads like a keyword ends nothing.
         "const X: &str = \"UPDATE extents SET note = 'where', plan_rev = 2 WHERE id = ?1\";",
         "const X: &str = \"UPDATE extents SET note = ')', 'plan_rev' = 2\";",
+        "const X: &str = \"UPDATE extents SET n = (SELECT 1 AS \\\"(\\\"), 'plan_rev' = 2\";",
+        "const X: &str = \"UPDATE extents SET \\\"where\\\" = 1, plan_rev = 2\";",
+        // A named parameter is not a keyword.
+        "const X: &str = \"UPDATE extents SET last_verified_at = :where, plan_rev = 2 WHERE id = :id\";",
+        "const X: &str = \"UPDATE extents SET last_verified_at = @where, plan_rev = 2\";",
+        // A char among the pieces of a `concat!`.
+        "const X: &str = concat!(\"UPDATE \", 'e', \"xtents SET plan_rev = 2\");",
+        "const X: &str = concat!(\"UPDATE extents SET plan\", '\\x5f', \"rev = 2\");",
         // `format!`: a placeholder may hold the column or the table.
         "let s = format!(\"INSERT OR REPLACE INTO extents({EXTENT_COLS}) VALUES ({v})\");",
         "let s = format!(\"UPDATE extents SET {SET} WHERE id = ?1\");",
@@ -687,7 +745,9 @@ fn the_scanner_finds_a_statement_however_it_is_written() {
         "const X: &str = \"INSERT INTO verifications(extent_id, plan_rev) VALUES (?1, ?2)\";",
         "const X: &str = \"UPDATE verify_raises SET plan_rev = (SELECT plan_rev FROM extents)\";",
         "const X: &str = \"SELECT plan_rev FROM extents\";",
-        // A quoted value is a string, not the column.
+        // A quoted value is a string, not the column; a read is not a write.
+        "const X: &str = \"UPDATE extents SET last_verified_at = CASE WHEN plan_rev = 1 THEN ?2 ELSE last_verified_at END WHERE id = ?1\";",
+        "const X: &str = \"UPDATE extents SET n = (SELECT plan_rev FROM extents AS e WHERE e.id = ?1)\";",
         "const X: &str = \"UPDATE extents SET note = 'plan_rev' WHERE id = ?1\";",
         "const X: &str = \"UPDATE extents SET note = 'x' || 'plan_rev', n = 1\";",
         "const X: &str = \"INSERT INTO 'verifications'('extent_id', 'plan_rev') VALUES (?1, ?2)\";",

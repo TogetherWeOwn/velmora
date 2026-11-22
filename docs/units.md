@@ -25,9 +25,12 @@ database, so they run natively in tests); the Durable Object class, the
    call, so the object can sleep between calls and its duration cost stays
    near zero. A call is polled once; a call that waits on anything is
    refused and rolled back.
-5. **Identity.** Every call carries the tenant and unit it is for and two
-   chain numbers: `state_seq` (the tenant's records) and `keys_seq` (its key
-   records). The unit compares them with its own:
+5. **Identity.** Every call carries the tenant and unit it is for. Every
+   call but the Worker's own `sync` also carries two chain numbers:
+   `state_seq` (the tenant's records) and `keys_seq` (its key records);
+   `sync` carries them in the verified record it copies, and `provision`
+   carries the caller's `state_seq` for the birth check. The unit compares
+   the numbers with its own:
    - another tenant or unit than the object: refused, and the Worker alarms;
    - a number above the unit's: `sync_needed`; the Worker verifies the
      records up to the head and calls `sync` first;

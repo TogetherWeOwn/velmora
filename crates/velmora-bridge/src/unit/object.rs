@@ -231,6 +231,7 @@ impl<S: UnitSql> Unit<S> {
         }
         let restoring = (token.kind == BirthKind::Restore).then_some(token.record_seq);
         let sql = self.sql();
+        let mut born = None;
         let mut run = || -> Result<()> {
             for script in schema::all() {
                 sql.apply_script(script)?;
@@ -274,10 +275,13 @@ impl<S: UnitSql> Unit<S> {
             if birth != 1 || head != 1 {
                 return Err(decode("birth rows"));
             }
+            // The answer is read inside the call: a failed read rolls
+            // the birth back, so a failure answer never hides a birth.
+            born = Some(self.head()?);
             Ok(())
         };
         sql.atomically(&mut run)?;
-        let head = self.head()?;
+        let head = born.ok_or_else(|| decode("unit_head"))?;
         Ok(UnitAnswer::Ok {
             seqs: head.seqs,
             body: json!({ "born": token.kind.as_str(), "restoring": head.restoring_since }),
@@ -318,7 +322,9 @@ impl<S: UnitSql> Unit<S> {
                 why: Closed::Provisioning,
             });
         }
-        if !call.authenticated && !call.op.read_only() {
+        // A fan-out read names a grant: it is never a cold read, so it
+        // is refused without `authenticated` (rule 11).
+        if !call.authenticated && (!call.op.read_only() || call.kind == CallKind::Fanout) {
             return Ok(refused(Refused::Unauthenticated, false));
         }
         // The tenant's state decides an authenticated call here. An
@@ -463,7 +469,12 @@ impl<S: UnitSql> Unit<S> {
                         "state": state,
                     })));
                 };
-                let extents = self.cat.extents_in(&generation.id, *start, *end).await?;
+                // An empty range holds no extent (and stamps none).
+                let extents = if start < end {
+                    self.cat.extents_in(&generation.id, *start, *end).await?
+                } else {
+                    Vec::new()
+                };
                 if call.authenticated {
                     for x in &extents {
                         self.cat
@@ -530,6 +541,7 @@ impl<S: UnitSql> Unit<S> {
             return Err(BridgeError::Invalid("sync: mode without suspension"));
         }
         let sql = self.sql();
+        let mut synced = None;
         let mut run = || -> Result<()> {
             let n = poll_once(sql.exec(
                 "UPDATE unit_head SET state_seq = ?1, tenant_state = ?2, tenant_mode = ?3, \
@@ -550,10 +562,12 @@ impl<S: UnitSql> Unit<S> {
             if n != 1 {
                 return Err(decode("unit_head"));
             }
+            // Read inside the call, as in `provision`.
+            synced = Some(self.head()?);
             Ok(())
         };
         sql.atomically(&mut run)?;
-        let head = self.head()?;
+        let head = synced.ok_or_else(|| decode("unit_head"))?;
         Ok(UnitAnswer::Ok {
             seqs: head.seqs,
             body: json!({ "synced": head.seqs.state_seq }),

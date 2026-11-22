@@ -115,7 +115,8 @@ log "workerd $("$WORKERD" --version): $INSTANCES processes from 127.0.0.1:$PORT"
 for i in $(seq 0 $((INSTANCES - 1))); do
   ready=
   for _ in $(seq 1 100); do
-    if curl -sf -X POST "http://127.0.0.1:$((PORT + i))/db/ready" \
+    kill -0 "${PIDS[$i]}" 2>/dev/null || break
+    if curl -sf --max-time 5 -X POST "http://127.0.0.1:$((PORT + i))/db/ready" \
         -d '{"op":"query","sql":"SELECT ?","params":[{"i":1}]}' | grep -q '"ok"'; then
       ready=1
       break
@@ -132,9 +133,12 @@ done
 # The point-in-time bridge reaches the runtime's calls: workerd keeps no
 # history, so a time and a restore are refused there (they work on
 # Cloudflare), and a bookmark for now is given.
-pitr=$(curl -sf -X POST "http://127.0.0.1:$PORT/db/pitr-check" -d '{"op":"pitr"}' || true)
-if ! printf '%s' "$pitr" | grep -q '"current":true' \
-    || [ "$(printf '%s' "$pitr" | grep -o 'does not implement point-in-time recovery' | wc -l)" -lt 1 ]; then
+pitr=$(curl -sf --max-time 30 -X POST "http://127.0.0.1:$PORT/db/pitr-check" -d '{"op":"pitr"}' || true)
+# Each of the two refusals is checked on its own field.
+if ! printf '%s' "$pitr" | jq -e '.ok.current == true
+    and (.ok.at | type == "string" and contains("does not implement point-in-time recovery"))
+    and (.ok.restore | type == "string" and contains("does not implement point-in-time recovery"))' \
+    >/dev/null 2>&1; then
   log "point-in-time bridge check failed: $pitr"
   exit 1
 fi

@@ -206,6 +206,12 @@ impl Shadow {
             Err(e) => error_answer(e),
         };
         self.check("apply", script, &[], &mine, &answer);
+        // A failed script keeps the statements before the failure natively
+        // (as D1 does) and none in the object (one `transactionSync`): the
+        // twin is rebuilt from the native state before the next call.
+        if local.is_err() {
+            self.mark_dirty();
+        }
     }
 
     pub(crate) fn query(
@@ -501,9 +507,21 @@ fn is_explain(sql: &str) -> bool {
         .is_some_and(|w| w.eq_ignore_ascii_case("explain"))
 }
 
+/// Whether a query reads only a connection's own counters
+/// (`SELECT total_changes()`, `SELECT last_insert_rowid()`, or both): a
+/// query that reads anything else beside them is compared.
 fn engine_counter(sql: &str) -> bool {
-    let lower = sql.to_ascii_lowercase();
-    lower.contains("total_changes()") || lower.contains("last_insert_rowid()")
+    let lower = sql.trim().trim_end_matches(';').to_ascii_lowercase();
+    let Some(list) = lower.strip_prefix("select") else {
+        return false;
+    };
+    list.split(',')
+        .all(|c| matches!(c.trim(), "total_changes()" | "last_insert_rowid()"))
+}
+
+/// An identifier in double quotes, with its own quotes doubled.
+fn quoted(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
 }
 
 fn error_answer(e: &BridgeError) -> Answer {
@@ -596,22 +614,23 @@ fn dump_rows(conn: &rusqlite::Connection) -> Option<std::result::Result<Value, S
                 stmts.push(json!([sql, []]));
                 let rowid = !sql.to_ascii_uppercase().contains("WITHOUT ROWID");
                 let mut cols: Vec<String> = conn
-                    .prepare(&format!("SELECT name FROM pragma_table_info('{name}')"))
+                    .prepare("SELECT name FROM pragma_table_info(?1)")
                     .ok()?
-                    .query_map([], |r| r.get::<_, String>(0))
+                    .query_map([name], |r| r.get::<_, String>(0))
                     .ok()?
                     .collect::<std::result::Result<_, _>>()
                     .ok()?;
-                cols = cols.into_iter().map(|c| format!("\"{c}\"")).collect();
+                cols = cols.into_iter().map(|c| quoted(&c)).collect();
                 if rowid {
                     cols.insert(0, "rowid".into());
                 }
                 let list = cols.join(", ");
                 let order = if rowid { " ORDER BY rowid" } else { "" };
                 let marks = vec!["?"; cols.len()].join(", ");
-                let insert = format!("INSERT INTO \"{name}\" ({list}) VALUES ({marks})");
+                let table = quoted(name);
+                let insert = format!("INSERT INTO {table} ({list}) VALUES ({marks})");
                 let mut select = conn
-                    .prepare(&format!("SELECT {list} FROM \"{name}\"{order}"))
+                    .prepare(&format!("SELECT {list} FROM {table}{order}"))
                     .ok()?;
                 let n = cols.len();
                 let mut found = select.query([]).ok()?;

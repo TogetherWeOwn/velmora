@@ -48,9 +48,10 @@ pub struct GateFindings {
     /// Held rows whose safety copy is gone, all classes.
     pub held_missing_total: u32,
     pub held_missing: Vec<String>,
-    /// Of those, the rows a servable generation names, when the gate
-    /// has classified them; `None` = not classified, all count as live.
-    pub held_missing_live: Option<u32>,
+    /// Of those, the ids of the rows a servable generation names, when
+    /// the gate has classified the whole list; `None` = not classified,
+    /// all count as live. A step that adds held rows clears it.
+    pub held_missing_live: Option<Vec<String>>,
 }
 
 impl GateFindings {
@@ -91,6 +92,10 @@ impl GateFindings {
             step.other_bucket.iter().cloned(),
             false,
         );
+        // Rows added after a classification are not classified.
+        if step.held_missing_total > 0 || !step.held_missing.is_empty() {
+            self.held_missing_live = None;
+        }
         self.held_missing_total = self
             .held_missing_total
             .saturating_add(step.held_missing_total);
@@ -129,13 +134,19 @@ impl GateFindings {
             && self.other_bucket_rows() == 0
     }
 
-    /// The held rows without a copy that count as live: all of them
-    /// while the replay is not whole or the rows are not classified.
-    pub fn held_missing_live(&self) -> u64 {
-        match (self.whole(), self.held_missing_live) {
-            (true, Some(live)) => u64::from(live).min(self.held_missing_rows()),
-            _ => self.held_missing_rows(),
+    /// The held rows without a copy that count as live, and their ids:
+    /// all of them while the replay is not whole or the rows are not
+    /// classified; then the classified live ids.
+    fn live_held(&self) -> (&[String], u64) {
+        match (self.whole(), &self.held_missing_live) {
+            (true, Some(live)) => (live, live.len() as u64),
+            _ => (&self.held_missing, self.held_missing_rows()),
         }
+    }
+
+    /// How many held rows without a copy count as live.
+    pub fn held_missing_live(&self) -> u64 {
+        self.live_held().1
     }
 }
 
@@ -269,13 +280,14 @@ pub fn lift(found: &GateFindings, ack: &Acknowledged) -> Lift {
         &mut needed.other_bucket,
     );
     // Held rows without a copy: all of them count while the replay is
-    // not whole or not classified; then the whole list must be named.
-    let live = found.held_missing_live();
+    // not whole or not classified, and must all be named; once classified,
+    // the live ones.
+    let (live_ids, live) = found.live_held();
     if live > 0 {
         need(
             "held_missing",
-            &found.held_missing,
-            found.held_missing_rows(),
+            live_ids,
+            live,
             &ack.held_missing,
             &mut needed.held_missing,
         );
@@ -470,9 +482,31 @@ mod tests {
         assert_eq!(f.held_missing_live(), 2);
         // Classified on a whole replay: orphans and deleted rows are set
         // aside and do not count.
-        f.held_missing_live = Some(0);
+        f.held_missing_live = Some(Vec::new());
         assert_eq!(f.held_missing_live(), 0);
         assert_eq!(lift(&f, &Acknowledged::default()), Lift::Clean);
+        // One live row: the lift names that one, not the orphan.
+        f.held_missing_live = Some(v(&["x1"]));
+        let live_only = Acknowledged {
+            held_missing: set(&["x1"]),
+            ..Default::default()
+        };
+        assert_eq!(
+            lift(&f, &live_only),
+            Lift::Acknowledged {
+                named: live_only.clone()
+            }
+        );
+        // A later step that adds held rows clears the classification.
+        let mut more = step(true);
+        more.held_missing_total = 1;
+        more.held_missing = v(&["x3"]);
+        let mut g = f.clone();
+        g.add(&more);
+        assert_eq!(g.held_missing_live, None);
+        assert_eq!(g.held_missing_live(), 3);
+        assert!(matches!(lift(&g, &live_only), Lift::Closed { .. }));
+        f.held_missing_live = Some(Vec::new());
         // The same classification on a replay that is not whole counts
         // nothing aside.
         f.unreadable = v(&["m/x/u"]);
