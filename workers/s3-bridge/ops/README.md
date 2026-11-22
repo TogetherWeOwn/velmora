@@ -418,8 +418,15 @@ fails the job before the deploy). Step 2 in production:
 3. Check that this push run is younger than 1 day: the job `deploy
    (production)` takes the bundle the run built, and it is kept for 1
    day. If it is older, wait for the day of the next deploy.
-4. Set `VELMORA_RECORD_LAYOUT` to `tenant` in the `production`
-   environment.
+4. Check the other variables of the `production` environment that the
+   deploy job writes into the config (`VELMORA_S3_HOST`,
+   `VELMORA_RECOVERY_COPY`, `VELMORA_RECOVERY_PREFIX`,
+   `VELMORA_VERIFY_MODE`): the run in step 5 deploys their values of
+   now, not those of the serving deploy. Compare them with the step
+   "Generate the production wrangler config" of the serving run's log
+   (it prints the recovery copy and the verify mode). Put any
+   difference right, or confirm it is meant, before going on. Then set
+   `VELMORA_RECORD_LAYOUT` to `tenant` in the `production` environment.
 5. Run the job `deploy (production)` of that push run again, and that
    job only. Running `deploy-build` again builds a new bundle from the
    same commit with the toolchain of that day, which is not the bundle
@@ -428,8 +435,14 @@ fails the job before the deploy). Step 2 in production:
    config" names the layout the generated config carries, `tenant`,
    and the deploy message carries the same commit as the version that
    served before. Then check that the job ended green and that the
-   version that serves production carries this run's message: a job
-   that fails after the deploy rolls back to the version before it.
+   version that serves production carries this run's message. A job
+   that fails after the deploy rolls back to the version before it,
+   but not always: with no version recorded before the deploy, the
+   rollback is skipped; if a third version is active, or this run's
+   version cannot be told, the step stops with an error and rolls
+   nothing back; and the rollback command itself can fail. Each of
+   these fails the job and sends the deploy alert. After a failed job,
+   read which version serves before taking production as restored.
    Nothing else changed.
 
 `wrangler secret list` must show no secret named `RECORD_LAYOUT`,
