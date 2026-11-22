@@ -84,6 +84,7 @@ fn sync(
             tenant_state: state,
             tenant_mode: mode,
             restoring_since: None,
+            lift: None,
         },
     };
     u.handle(&call(CallKind::Worker, None, true, op), NOW)
@@ -199,6 +200,7 @@ fn an_unborn_unit_answers_unborn_and_writes_nothing() {
                     tenant_state: TenantState::Active,
                     tenant_mode: None,
                     restoring_since: None,
+                    lift: None,
                 },
             },
         );
@@ -407,6 +409,7 @@ fn a_restored_unit_starts_closed_and_a_sync_still_reaches_it() {
             tenant_state: TenantState::Active,
             tenant_mode: None,
             restoring_since: Some(7),
+            lift: None,
         },
     };
     assert!(matches!(
@@ -857,6 +860,7 @@ fn a_sync_never_moves_back_and_never_claims_keys_it_does_not_hold() {
             tenant_state: TenantState::Active,
             tenant_mode: None,
             restoring_since: None,
+            lift: None,
         },
     };
     assert_eq!(
@@ -876,6 +880,7 @@ fn a_sync_never_moves_back_and_never_claims_keys_it_does_not_hold() {
             tenant_state: TenantState::Active,
             tenant_mode: None,
             restoring_since: None,
+            lift: None,
         },
     };
     assert_eq!(
