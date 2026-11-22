@@ -12,6 +12,7 @@
 //! To write the file after a deliberate change: `UNIT_WIRE_GOLDEN=write`.
 
 use serde_json::{json, Value};
+use velmora_bridge::unit::buckets::{BucketChange, BucketRefusal};
 use velmora_bridge::unit::call::{Closed, HoldMode};
 use velmora_bridge::unit::export::{ExportMode, ExportRefusal, ExportTable, KeyTable};
 use velmora_bridge::unit::identity::Refusal as IdentityRefusal;
@@ -21,7 +22,8 @@ use velmora_bridge::unit::import::{
 };
 use velmora_bridge::unit::jobcall::JobCall;
 use velmora_bridge::unit::keys::{
-    Access, KeptAnswer, KeyEntry, KeyGrant, KeyKind, KeyRefusal, SubjectStatus,
+    Access, ApplyEntry, KeptAnswer, KeyEntry, KeyGrant, KeyKind, KeyMarker, KeyRefusal, MarkerKind,
+    SubjectStatus,
 };
 use velmora_bridge::unit::lift::{
     AckClass, ClassProof, FindingList, GateRefusal, GateSummary, LiftProof, ReplayId, ReportKind,
@@ -101,6 +103,7 @@ fn op_kind(op: &UnitOp) -> &'static str {
         UnitOp::BindBucket { .. } => "bind_bucket",
         UnitOp::ReleaseBound { .. } => "release_bound",
         UnitOp::BucketBinding { .. } => "bucket_binding",
+        UnitOp::BucketClose { .. } => "bucket_close",
         UnitOp::Job { .. } => "job",
         UnitOp::ReadPlan { .. } => "read_plan",
     }
@@ -143,6 +146,7 @@ fn refused_kind(r: &Refused) -> &'static str {
         Refused::Recount(_) => "recount",
         Refused::Reserve(_) => "reserve",
         Refused::Size(_) => "size",
+        Refused::Buckets(_) => "buckets",
     }
 }
 
@@ -187,26 +191,37 @@ fn ops() -> Vec<UnitOp> {
         },
         UnitOp::ApplyKeys {
             from_seq: 2,
-            entries: vec![KeyEntry {
-                id: "AKGOLDEN000000000001".into(),
-                kind: KeyKind::S3,
-                status: SubjectStatus::Active,
-                held: false,
-                made_by: Some("p_1".into()),
-                grants: vec![KeyGrant {
-                    bucket_id: "b_00000000000000f1".into(),
-                    access: Access::Ro,
-                    expires_at: Some(9),
-                    prefix: Some("a/".into()),
-                    ip_list: vec!["192.0.2.0/24".into()],
-                }],
-                created_at: 5,
-                secret_wrapped: Some(vec![2, 9]),
-                secret_kek_version: Some(1),
-                owner_ref: Some("m_1".into()),
-                last_seq: 3,
-                rid: Some(Rid([0x11; 16])),
-            }],
+            entries: vec![
+                ApplyEntry::Key(KeyEntry {
+                    id: "AKGOLDEN000000000001".into(),
+                    kind: KeyKind::S3,
+                    status: SubjectStatus::Active,
+                    held: false,
+                    made_by: Some("p_1".into()),
+                    grants: vec![KeyGrant {
+                        bucket_id: "b_00000000000000f1".into(),
+                        access: Access::Ro,
+                        expires_at: Some(9),
+                        prefix: Some("a/".into()),
+                        ip_list: vec!["192.0.2.0/24".into()],
+                    }],
+                    created_at: 5,
+                    secret_wrapped: Some(vec![2, 9]),
+                    secret_kek_version: Some(1),
+                    owner_ref: Some("m_1".into()),
+                    last_seq: 3,
+                    rid: Some(Rid([0x11; 16])),
+                }),
+                // AM-62: the records that change no subject.
+                ApplyEntry::Marker(KeyMarker {
+                    marker: MarkerKind::KeysFrozen,
+                    seq: 4,
+                }),
+                ApplyEntry::Marker(KeyMarker {
+                    marker: MarkerKind::KeysThawed,
+                    seq: 5,
+                }),
+            ],
             answers: vec![KeptAnswer {
                 rid: Rid([0x11; 16]),
                 status: 201,
@@ -275,6 +290,7 @@ fn ops() -> Vec<UnitOp> {
             token: token(),
             target: RestoreTarget::Time { at_ms: 1_000 },
             expect_undo: Bookmark("bm-1".into()),
+            floor_ms: 900,
         },
         UnitOp::Restore {
             token: token(),
@@ -282,6 +298,7 @@ fn ops() -> Vec<UnitOp> {
                 bookmark: Bookmark("bm-0".into()),
             },
             expect_undo: Bookmark("bm-1".into()),
+            floor_ms: 0,
         },
         UnitOp::GateOpen { replay_id: rid() },
         UnitOp::GateOpenMove {
@@ -399,6 +416,9 @@ fn ops() -> Vec<UnitOp> {
             bound: Some(4),
         },
         UnitOp::BucketBinding { grant_seq: 4 },
+        UnitOp::BucketClose {
+            bucket_id: "b_00000000000000f1".into(),
+        },
         UnitOp::Job {
             call: JobCall::claim {
                 extent: ExtentId::new("x_000000000000000000000000f1"),
@@ -460,6 +480,59 @@ macro_rules! every {
     }};
 }
 
+/// `ImportProgress`'s answer body as a real unit gives it (AM-47,
+/// AM-67): before any import, and after a lift (`lifted_at` set). The
+/// L3 move tool and the restore tool read `lifted_at` from it.
+/// `schema_tables` is left out: it lists the unit's tables, so every
+/// migration changes it.
+fn import_progress_bodies() -> Value {
+    use velmora_bridge::testkit::RusqliteSql;
+    use velmora_bridge::unit::Unit;
+    let now = UnixMs(1_795_000_000_000);
+    let u = Unit::new(RusqliteSql::open_in_memory().unwrap(), name(), "");
+    let mut token = token();
+    token.jurisdiction = String::new();
+    token.schema_version = velmora_bridge::unit::schema::SCHEMA_VERSION;
+    token.kind = BirthKind::Birth;
+    let call = |op, s: Option<Seqs>| UnitCall {
+        name: name(),
+        kind: CallKind::Worker,
+        seqs: s,
+        authenticated: true,
+        listed: true,
+        op,
+    };
+    let born = u.handle(
+        &call(
+            UnitOp::Provision {
+                token,
+                sealed: b"sealed".to_vec(),
+            },
+            Some(seqs()),
+        ),
+        now,
+    );
+    assert!(matches!(born, UnitAnswer::Ok { .. }), "{born:?}");
+    let body = || match u.handle(&call(UnitOp::ImportProgress {}, None), now) {
+        UnitAnswer::Ok { mut body, .. } => {
+            body.as_object_mut().unwrap().remove("schema_tables");
+            body
+        }
+        other => panic!("{other:?}"),
+    };
+    let before = body();
+    u.sql()
+        .with_conn(|c| {
+            c.execute(
+                "INSERT INTO unit_import_move(id, t0_seq, since_seq, final, move_ordinal, \
+                   move_lifted, lifted_at) VALUES (1, 11, 7, 1, 1, 1, ?1)",
+                [now.0],
+            )
+        })
+        .unwrap();
+    json!({ "never_bound": before, "lifted": body() })
+}
+
 fn nested() -> Value {
     json!({
         "call_kind": every!(CallKind: Request, Job, Fanout, Worker),
@@ -497,9 +570,34 @@ fn nested() -> Value {
         "reserve_refusal": every!(ReserveRefusal: CapReached, GrantNotHeld,
             GrantLimitsNotServed, TooManyGrants, ActingPrincipalUnknown,
             ActingPrincipalInactive, ActingPrincipalHeld, OwnerRefAmbiguous,
-            BucketAlreadyExists, PrincipalExists, Conflict, InternalKeyRefused, NotFound, RidTaken,
+            BucketAlreadyExists, PrincipalExists, Conflict, InternalKeyRefused, NotFound, BucketNotFound, RidTaken,
             Malformed),
         "size_refusal": every!(SizeRefusal: DatabaseFull, TooManyExtents),
+        "bucket_refusal": every!(BucketRefusal: NotEmpty, NotFound, PlacementsOff,
+            CreatedConflict, Malformed),
+        // AM-57: the bucket changes a `sync` carries (the `sync` arm is
+        // L2's; the form is pinned here).
+        "bucket_change": serde_json::to_value(vec![
+            BucketChange::Created {
+                seq: 8,
+                bucket_id: "b_00000000000000f1".into(),
+                grant_seq: 4,
+                creator: "p_1".into(),
+                name: "golden".into(),
+                bdk_wrapped: vec![2, 7],
+                tk_version: 1,
+                written_at: 5,
+            },
+            BucketChange::Dropped {
+                seq: 9,
+                bucket_id: "b_00000000000000f1".into(),
+            },
+            BucketChange::Unplaced {
+                seq: 10,
+                buckets: vec!["b_00000000000000f2".into()],
+            },
+        ])
+        .unwrap(),
         "reservation_bodies": reservation_bodies(),
         "lease_refusal": every!(LeaseRefusal: Restoring, RolledBack, NoLeaseTable, ProofTooOld,
             ProofAhead, NotProven, RevocationsUnapplied, BadList),
@@ -526,6 +624,7 @@ fn refusals() -> Vec<Refused> {
         Refused::Recount(RecountRefusal::ImportNotSealed),
         Refused::Reserve(ReserveRefusal::GrantLimitsNotServed),
         Refused::Size(SizeRefusal::TooManyExtents),
+        Refused::Buckets(BucketRefusal::NotEmpty),
     ]
 }
 
@@ -700,7 +799,13 @@ fn document() -> Value {
             v
         })
         .collect();
-    json!({ "calls": calls, "answers": answers, "replies": replies(), "nested": nested() })
+    json!({
+        "calls": calls,
+        "answers": answers,
+        "replies": replies(),
+        "nested": nested(),
+        "import_progress": import_progress_bodies(),
+    })
 }
 
 #[test]
@@ -738,7 +843,7 @@ fn every_variant_has_a_sample() {
     let answers: std::collections::BTreeSet<_> = answers().iter().map(answer_kind).collect();
     assert_eq!(answers.len(), 10, "{answers:?}");
     let reasons: std::collections::BTreeSet<_> = refusals().iter().map(refused_kind).collect();
-    assert_eq!(reasons.len(), 18, "{reasons:?}");
+    assert_eq!(reasons.len(), 19, "{reasons:?}");
 }
 
 #[test]

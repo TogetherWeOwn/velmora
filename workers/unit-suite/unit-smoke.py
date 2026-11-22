@@ -152,7 +152,7 @@ check("restore_prepare on an open unit", unit_post(0, call(0, "worker", {"op": "
       {"answer": "refused", "reason": {"restore": "not_restoring"}, "alarm": False})
 rtoken = dict(token, kind="restore")
 check("restore on an open unit", unit_post(0, call(0, "worker", {"op": "restore", "token": rtoken,
-      "target": {"to": "time", "at_ms": 4102444800000}, "expect_undo": "bm"})),
+      "target": {"to": "time", "at_ms": 4102444800000}, "expect_undo": "bm", "floor_ms": 0})),
       {"answer": "refused", "reason": {"restore": "not_restoring"}, "alarm": False})
 check("a restore entry closes the unit", unit_post(0, call(0, "worker", {"op": "sync", "head": {"seqs": {"state_seq": 4, "keys_seq": 0},
       "tenant_state": "active", "restoring_since": 4}})), {"answer": "ok", "seqs": {"state_seq": 4, "keys_seq": 0}, "body": {"synced": 4}})

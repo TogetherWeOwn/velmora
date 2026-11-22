@@ -331,7 +331,7 @@ fn an_expired_lease_refuses_every_call_but_the_workers_and_writes_nothing() {
             &u,
             UnitOp::ApplyKeys {
                 from_seq: 0,
-                entries: vec![principal(1)],
+                entries: vec![principal(1).into()],
                 answers: vec![],
             },
             NOW
@@ -433,7 +433,7 @@ fn renew_applies_the_listed_revocations_and_counts_each_id_once() {
             &u,
             UnitOp::ApplyKeys {
                 from_seq: 0,
-                entries: vec![principal(1), key(K, 2)],
+                entries: vec![principal(1).into(), key(K, 2).into()],
                 answers: vec![],
             },
             NOW
@@ -458,7 +458,7 @@ fn renew_applies_the_listed_revocations_and_counts_each_id_once() {
         &u,
         UnitOp::ApplyKeys {
             from_seq: 2,
-            entries: vec![key(GONE, 3)],
+            entries: vec![key(GONE, 3).into()],
             answers: vec![],
         },
         NOW,
@@ -589,7 +589,7 @@ fn every_answer_carries_the_lease_left_and_the_revoked_count_once_keys_exist() {
             &u,
             UnitOp::ApplyKeys {
                 from_seq: 0,
-                entries: vec![principal(1)],
+                entries: vec![principal(1).into()],
                 answers: vec![],
             },
             NOW
@@ -694,7 +694,7 @@ fn fresh_with_principal() -> Unit<RusqliteSql> {
         &u,
         UnitOp::ApplyKeys {
             from_seq: 0,
-            entries: vec![principal(1)],
+            entries: vec![principal(1).into()],
             answers: vec![],
         },
         NOW,
@@ -951,7 +951,7 @@ fn a_revoked_principal_is_not_counted() {
             &u,
             UnitOp::ApplyKeys {
                 from_seq: 0,
-                entries: vec![gone],
+                entries: vec![gone.into()],
                 answers: vec![],
             },
             NOW
@@ -1032,7 +1032,7 @@ fn a_listed_id_of_a_principal_row_counts_without_touching_it() {
             &u,
             UnitOp::ApplyKeys {
                 from_seq: 0,
-                entries: vec![p],
+                entries: vec![p.into()],
                 answers: vec![],
             },
             NOW

@@ -179,6 +179,13 @@
       "reason": {
         "size": "too_many_extents"
       }
+    },
+    {
+      "alarm": false,
+      "answer": "refused",
+      "reason": {
+        "buckets": "not_empty"
+      }
     }
   ],
   "calls": [
@@ -348,6 +355,14 @@
             "secret_kek_version": 1,
             "secret_wrapped": "Agk=",
             "status": "active"
+          },
+          {
+            "marker": "keys_frozen",
+            "seq": 4
+          },
+          {
+            "marker": "keys_thawed",
+            "seq": 5
           }
         ],
         "from_seq": 2,
@@ -549,6 +564,7 @@
       },
       "op": {
         "expect_undo": "bm-1",
+        "floor_ms": 900,
         "op": "restore",
         "target": {
           "at_ms": 1000,
@@ -581,6 +597,7 @@
       },
       "op": {
         "expect_undo": "bm-1",
+        "floor_ms": 0,
         "op": "restore",
         "target": {
           "bookmark": "bm-0",
@@ -1006,6 +1023,23 @@
     },
     {
       "authenticated": true,
+      "kind": "worker",
+      "listed": true,
+      "name": {
+        "tenant": "t_00000000000000f1",
+        "unit": 0
+      },
+      "op": {
+        "bucket_id": "b_00000000000000f1",
+        "op": "bucket_close"
+      },
+      "seqs": {
+        "keys_seq": 3,
+        "state_seq": 7
+      }
+    },
+    {
+      "authenticated": true,
       "kind": "job",
       "listed": true,
       "name": {
@@ -1114,6 +1148,24 @@
       }
     }
   ],
+  "import_progress": {
+    "lifted": {
+      "lifted_at": 1795000000000,
+      "move_lifted": true,
+      "sealed": 1,
+      "since_seq": 7,
+      "t0_seq": 11,
+      "tables": []
+    },
+    "never_bound": {
+      "lifted_at": null,
+      "move_lifted": null,
+      "sealed": null,
+      "since_seq": null,
+      "t0_seq": null,
+      "tables": []
+    }
+  },
   "nested": {
     "access": [
       "ro",
@@ -1131,6 +1183,38 @@
     "birth_kind": [
       "birth",
       "restore"
+    ],
+    "bucket_change": [
+      {
+        "bdk_wrapped": "Agc=",
+        "bucket_id": "b_00000000000000f1",
+        "change": "created",
+        "creator": "p_1",
+        "grant_seq": 4,
+        "name": "golden",
+        "seq": 8,
+        "tk_version": 1,
+        "written_at": 5
+      },
+      {
+        "bucket_id": "b_00000000000000f1",
+        "change": "dropped",
+        "seq": 9
+      },
+      {
+        "buckets": [
+          "b_00000000000000f2"
+        ],
+        "change": "unplaced",
+        "seq": 10
+      }
+    ],
+    "bucket_refusal": [
+      "not_empty",
+      "not_found",
+      "placements_off",
+      "created_conflict",
+      "malformed"
     ],
     "call_kind": [
       "request",
@@ -1332,6 +1416,7 @@
       "conflict",
       "internal_key_refused",
       "not_found",
+      "bucket_not_found",
       "rid_taken",
       "malformed"
     ],
