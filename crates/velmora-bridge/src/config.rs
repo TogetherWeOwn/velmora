@@ -1012,15 +1012,19 @@ impl BridgeConfig {
         };
         let admin_host = match get("ADMIN_HOST").as_deref().map(str::trim) {
             None | Some("") => None,
-            // As `ingress::host_name` leaves it, or no request could name it.
+            // Kept as `ingress::host_name` makes it (one root dot
+            // removed), the name a request is compared by. An empty label
+            // is refused: no request could name it.
             Some(h)
                 if h.len() <= 253
                     && h.bytes().all(|b| {
                         b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'.' || b == b'-'
-                    })
-                    && crate::ingress::host_name(h).as_deref() == Some(h) =>
+                    }) =>
             {
-                Some(h.to_string())
+                match crate::ingress::host_name(h) {
+                    Some(name) => Some(name),
+                    None => return Err(ConfigError::Invalid("ADMIN_HOST".into())),
+                }
             }
             Some(_) => return Err(ConfigError::Invalid("ADMIN_HOST".into())),
         };

@@ -1049,6 +1049,9 @@ fn admin_read_token_host_and_metrics_sample() {
         Some(read)
     );
     assert_eq!(set.admin_host.as_deref(), Some("admin.internal"));
+    // The root's dot is the same name: kept as a request is compared.
+    let dotted = with(&[("ADMIN_HOST", "admin.internal.")]).unwrap();
+    assert_eq!(dotted.admin_host.as_deref(), Some("admin.internal"));
     assert_eq!(set.metrics_sample, 1);
     assert!(
         !format!("{set:?}").contains(read),
@@ -1068,7 +1071,7 @@ fn admin_read_token_host_and_metrics_sample() {
         "admin internal",
         "admin/x",
         "admin:443",
-        "admin.internal.",
+        "admin.internal..",
         "admin..internal",
         ".admin.internal",
     ] {
