@@ -772,8 +772,9 @@ impl Stored {
 /// One ask (module doc), inside the caller's transaction. `keys_seq` is
 /// the unit's own; `may_open`: the tenant's state allows opening writes
 /// (`active`). Otherwise only what keeps no reservation is answered (a
-/// narrowing, a reused key, a kept answer). A refusal writes nothing; the
-/// caller rolls back.
+/// narrowing, a reused key, a kept answer, a bound bucket reservation),
+/// and a re-ask of an open row answers `not_open` with its `rid`. A
+/// refusal writes nothing; the caller rolls back.
 pub fn admit<S: Sql>(
     sql: &S,
     keys_seq: u64,

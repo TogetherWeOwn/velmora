@@ -351,9 +351,11 @@ struct Row {
 /// turns that reservation `applied` (the unit now holds its record,
 /// whether this call wrote it or found it), and `answers` are kept for
 /// the reservations that are applied and have none yet. A principal
-/// whose record closes or narrows it (any status but `active`, or a
-/// grant it held that the record does not hold the same) has its other
-/// open reservations cancelled.
+/// whose record closes or narrows it (any status but `active`, a grant
+/// it held that no grant of the record covers, or a held record, which
+/// may lack its private grant parts) has its other open reservations
+/// that are not bound to a creator grant cancelled, and their cap slots
+/// given back.
 pub fn apply<S: Sql>(
     sql: &S,
     keys_seq: u64,

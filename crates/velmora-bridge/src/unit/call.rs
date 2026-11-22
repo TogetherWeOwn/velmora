@@ -403,7 +403,9 @@ pub enum Refused {
     /// records: the key-chain apply moves it, together with the rows.
     KeysNotApplied,
     /// The tenant's state does not allow this call: `403 AccountProblem`
-    /// once the signature verified.
+    /// once the signature verified. On a reservation ask the Worker
+    /// answers `409 tenant_read_only` or `409 tenant_unavailable` instead
+    /// (`docs/units.md`, "Reservations").
     AccountProblem,
     /// The fan-out reader is no longer allowed (`403 AccessDenied`, as
     /// the full request would get).
