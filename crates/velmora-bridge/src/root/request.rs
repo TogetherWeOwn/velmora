@@ -118,6 +118,12 @@ impl<P: UnitPorts, R: FillRandom> RequestPort<P, R> {
     }
 
     fn keep(&self, refusal: RouteRefusal) {
+        // After `finish` (a streamed body's later calls) nobody reads the
+        // kept refusal: one that pages (rule 7's "catalogue lost") is
+        // logged at once.
+        if self.drained.get() && refusal.alert() {
+            crate::trace::alert(|| format!("unit request ({})", refusal.code()));
+        }
         if self.refusal.get().is_none() {
             self.refusal.set(Some(refusal));
         }

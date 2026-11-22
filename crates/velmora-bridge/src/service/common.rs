@@ -437,18 +437,6 @@ pub(super) fn edge_header(name: &str) -> bool {
         || matches!(name, "cdn-loop" | "x-real-ip" | "true-client-ip")
 }
 
-/// Authenticates and authorizes from the request line and headers only.
-/// The body is never touched. A key with no usable row is
-/// `InvalidAccessKeyId` for every bucket.
-///
-/// A bucket that does not exist and one the key holds no grant on are
-/// indistinguishable, to everyone: a caller that did not authenticate
-/// gets the authentication error and learns nothing of the bucket, and
-/// one that did gets `NoSuchBucket` for both (S3 checks in that order
-/// too: signature, then bucket, then permission). To a key, a bucket it
-/// has no grant on does not exist, so no key can probe for the names of
-/// buckets that are not its own. A key that holds a grant too weak for
-/// the operation (read-only, on a write) is `AccessDenied`.
 /// The request's policy, target and headers, with the refusals that name
 /// their cause. None reads anything but the request itself and the
 /// configuration. The host comes before the path is judged: on a
@@ -501,6 +489,18 @@ where
     }
 }
 
+/// Authenticates and authorizes from the request line and headers only.
+/// The body is never touched. A key with no usable row is
+/// `InvalidAccessKeyId` for every bucket.
+///
+/// A bucket that does not exist and one the key holds no grant on are
+/// indistinguishable, to everyone: a caller that did not authenticate
+/// gets the authentication error and learns nothing of the bucket, and
+/// one that did gets `NoSuchBucket` for both (S3 checks in that order
+/// too: signature, then bucket, then permission). To a key, a bucket it
+/// has no grant on does not exist, so no key can probe for the names of
+/// buckets that are not its own. A key that holds a grant too weak for
+/// the operation (read-only, on a write) is `AccessDenied`.
 pub(super) async fn authenticate<C, B, N, J, K, T>(
     bridge: &Bridge<C, B, N, J, K, T>,
     req: &S3Request,
