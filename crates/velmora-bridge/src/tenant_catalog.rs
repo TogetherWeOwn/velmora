@@ -29,8 +29,12 @@ use crate::unit::{Refused, UnitAnswer, UnitCall, UnitName, UnitOp};
 pub const NOT_ON_UNIT: &str = "not on the unit job path";
 /// The unit holds a newer record than the job: `sync` first.
 pub const UNIT_SYNC_NEEDED: &str = "unit: sync needed";
-/// The job's numbers are below the unit's, or missing: run it again with
-/// fresh numbers, or drop it.
+/// The job's numbers are below the unit's: the unit answered its own
+/// ([`UnitRefusal::Stale`]), and the consumer runs the job once more with
+/// them (AM-50).
+pub const UNIT_STALE: &str = "unit: stale";
+/// The job carried no numbers (`Refused{stale_job}`): no writer sends one,
+/// so the consumer sends it to the DLQ and pages (AM-50).
 pub const UNIT_STALE_JOB: &str = "unit: stale job";
 /// The unit's lease has run out: `renew` first (rule 12).
 pub const UNIT_RENEW_NEEDED: &str = "unit: renew needed";
@@ -72,7 +76,8 @@ impl UnitRefusal {
     /// The text of the error the job code sees (one of the `UNIT_*`).
     pub fn text(self) -> &'static str {
         match self {
-            UnitRefusal::Stale(_) | UnitRefusal::StaleJob => UNIT_STALE_JOB,
+            UnitRefusal::Stale(_) => UNIT_STALE,
+            UnitRefusal::StaleJob => UNIT_STALE_JOB,
             UnitRefusal::SyncNeeded(_) => UNIT_SYNC_NEEDED,
             UnitRefusal::RenewNeeded(_) => UNIT_RENEW_NEEDED,
             UnitRefusal::Closed => UNIT_CLOSED,

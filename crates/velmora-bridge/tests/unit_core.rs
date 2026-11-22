@@ -507,15 +507,19 @@ fn numbers_above_the_units_need_a_sync_and_below_are_stale() {
         ),
         UnitAnswer::Stale { seqs: own_seqs }
     );
-    for s in [seqs(2, 0), None] {
-        assert_eq!(
-            u.handle(&call(CallKind::Job, s, true, UnitOp::Ping {}), NOW),
-            UnitAnswer::Refused {
-                reason: Refused::Identity(Refusal::StaleJob),
-                alarm: false
-            }
-        );
-    }
+    // AM-50: a job behind the unit gets the unit's numbers; a job with
+    // none is refused.
+    assert_eq!(
+        u.handle(&call(CallKind::Job, seqs(2, 0), true, UnitOp::Ping {}), NOW),
+        UnitAnswer::Stale { seqs: own_seqs }
+    );
+    assert_eq!(
+        u.handle(&call(CallKind::Job, None, true, UnitOp::Ping {}), NOW),
+        UnitAnswer::Refused {
+            reason: Refused::Identity(Refusal::StaleJob),
+            alarm: false
+        }
+    );
     // A stale request did nothing: no read stamp.
     assert_eq!(last_read(&u), vec![None, None]);
 }
