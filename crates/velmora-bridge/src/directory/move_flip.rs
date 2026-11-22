@@ -450,6 +450,23 @@ where
         let gave_up = async {
             let mut last = None;
             for _ in 0..V9_GIVE_UP_TRIES {
+                // Each try checks that the window is still this one: a
+                // give-up by another run ends the loop, a later window
+                // stops it.
+                match window_state(chain, window).await {
+                    Ok(WindowState::GivenUp(_)) => {
+                        last = None;
+                        dir.apply_tenant(&head_of(chain, &Tenant::Zero).await?, now)
+                            .await?;
+                        break;
+                    }
+                    Ok(WindowState::Open(z)) if z.seq == zero.seq => {}
+                    Ok(_) => return Err(FlipError::NotThisMove),
+                    Err(e) => {
+                        last = Some(e);
+                        continue;
+                    }
+                }
                 match chain
                     .write(
                         &Tenant::Zero,
@@ -465,11 +482,11 @@ where
                         dir.apply_tenant(&door_of(written), now).await?;
                         break;
                     }
-                    Err(e) => last = Some(e),
+                    Err(e) => last = Some(FlipError::Chain(e)),
                 }
             }
             if let Some(e) = last {
-                return Err(FlipError::Chain(e));
+                return Err(e);
             }
             give_up(chain, frozen, safety, dir, unit, routes, keys, window, now).await
         };
