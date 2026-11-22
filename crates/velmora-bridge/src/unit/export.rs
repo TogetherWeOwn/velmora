@@ -401,26 +401,35 @@ pub fn export<S: Sql>(
 /// order: what V6 hashes on the chain side with [`hash_rows`], against
 /// `export` in `hash` mode on the unit. Each subject's row is its last
 /// entry, and a subject once revoked stays revoked, as `keys::apply`
-/// writes them. A marker item (AM-62) holds no subject: pass the
-/// subjects' entries only (`items.iter().filter_map(ApplyEntry::key)`).
+/// writes them. Its `owner_ref` is written once (AM-72): the first
+/// non-null value of its entries, as [`keys::write_once`] keeps it. A
+/// marker item (AM-62) holds no subject: pass the subjects' entries only
+/// (`items.iter().filter_map(ApplyEntry::key)`).
 #[allow(clippy::type_complexity)]
 pub fn chain_key_rows<'a>(
     entries: impl IntoIterator<Item = &'a KeyEntry>,
 ) -> Result<(Vec<Vec<ImportValue>>, Vec<Vec<ImportValue>>)> {
-    let mut last: BTreeMap<&str, (&KeyEntry, bool)> = BTreeMap::new();
+    let mut last: BTreeMap<&str, (&KeyEntry, bool, Option<&str>)> = BTreeMap::new();
     for e in entries {
-        let revoked =
-            e.status == SubjectStatus::Revoked || last.get(e.id.as_str()).is_some_and(|(_, r)| *r);
-        last.insert(e.id.as_str(), (e, revoked));
+        let before = last.get(e.id.as_str());
+        let revoked = e.status == SubjectStatus::Revoked || before.is_some_and(|(_, r, _)| *r);
+        let owner = match keys::write_once(before.and_then(|b| b.2), e.owner_ref.as_deref()) {
+            keys::OwnerRef::Keep(v) => v,
+            keys::OwnerRef::Conflict(kept) => Some(kept),
+        };
+        last.insert(e.id.as_str(), (e, revoked, owner));
     }
     let (mut keys_rows, mut grant_rows) = (Vec::new(), Vec::new());
-    for (e, revoked) in last.into_values() {
+    for (e, revoked, owner) in last.into_values() {
         let status = if revoked {
             SubjectStatus::Revoked
         } else {
             e.status
         };
-        let (row, grants) = keys::entry_values(e, status)?;
+        let (mut row, grants) = keys::entry_values(e, status)?;
+        row[keys::OWNER_REF_COLUMN] = owner.map_or(crate::ports::SqlValue::Null, |o| {
+            crate::ports::SqlValue::Text(o.into())
+        });
         keys_rows.push(row.into_iter().map(value).collect());
         for g in grants {
             grant_rows.push(g.into_iter().map(value).collect());

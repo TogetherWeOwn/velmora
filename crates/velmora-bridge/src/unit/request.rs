@@ -244,6 +244,31 @@ pub enum RequestCall {
     hot_seq {
         extent: ExtentId,
     },
+    // --- the management plane's reads (`super::plane`; L1-Q16)
+    bucket_names {
+        ids: Vec<String>,
+    },
+    buckets_page {
+        #[serde(default)]
+        after: Option<String>,
+        limit: u32,
+    },
+    buckets_named {
+        names: Vec<String>,
+    },
+    bucket_by_id {
+        id: String,
+    },
+    keys_page {
+        kind: super::plane::ListedKind,
+        #[serde(default)]
+        after: Option<super::plane::KeysAfter>,
+        limit: u32,
+    },
+    key_by_id {
+        id: String,
+    },
+    reach {},
     // --- writes
     commit_generation {
         c: CommitGeneration,
@@ -399,6 +424,13 @@ impl RequestCall {
             RequestCall::usage_recounts {} => "usage_recounts",
             RequestCall::hot_stats {} => "hot_stats",
             RequestCall::hot_seq { .. } => "hot_seq",
+            RequestCall::bucket_names { .. } => "bucket_names",
+            RequestCall::buckets_page { .. } => "buckets_page",
+            RequestCall::buckets_named { .. } => "buckets_named",
+            RequestCall::bucket_by_id { .. } => "bucket_by_id",
+            RequestCall::keys_page { .. } => "keys_page",
+            RequestCall::key_by_id { .. } => "key_by_id",
+            RequestCall::reach {} => "reach",
             RequestCall::commit_generation { .. } => "commit_generation",
             RequestCall::commit_sliced { .. } => "commit_sliced",
             RequestCall::copy_generation { .. } => "copy_generation",
@@ -456,7 +488,14 @@ impl RequestCall {
             | RequestCall::usage_buckets { .. }
             | RequestCall::usage_recounts {}
             | RequestCall::hot_stats {}
-            | RequestCall::hot_seq { .. } => true,
+            | RequestCall::hot_seq { .. }
+            | RequestCall::bucket_names { .. }
+            | RequestCall::buckets_page { .. }
+            | RequestCall::buckets_named { .. }
+            | RequestCall::bucket_by_id { .. }
+            | RequestCall::keys_page { .. }
+            | RequestCall::key_by_id { .. }
+            | RequestCall::reach {} => true,
             RequestCall::commit_generation { .. }
             | RequestCall::commit_sliced { .. }
             | RequestCall::copy_generation { .. }
@@ -604,6 +643,21 @@ impl RequestCall {
             }
             RequestCall::create_upload { u } => key(&u.key),
             RequestCall::replay_probe { g } => key(&g.key),
+            // The plane's reads: lookups of at most 64, pages of 1 to
+            // 1,000, and every name or id within the key bound.
+            RequestCall::bucket_names { ids: v } | RequestCall::buckets_named { names: v } => {
+                v.len() <= super::plane::MAX_LOOKUP && v.iter().all(|s| key(s))
+            }
+            RequestCall::buckets_page { after, limit } => {
+                (1..=super::plane::MAX_ITEMS).contains(limit) && after.as_deref().is_none_or(key)
+            }
+            RequestCall::keys_page { after, limit, .. } => {
+                (1..=super::plane::MAX_ITEMS).contains(limit)
+                    && after
+                        .as_ref()
+                        .is_none_or(|a| key(&a.id) && i64::try_from(a.created_at).is_ok())
+            }
+            RequestCall::bucket_by_id { id } | RequestCall::key_by_id { id } => key(id),
             _ => true,
         };
         if ok {
@@ -719,6 +773,26 @@ impl RequestCall {
             RequestCall::usage_recounts {} => answer(Catalog::usage_recounts(cat).await?),
             RequestCall::hot_stats {} => answer(Catalog::hot_stats(cat).await?),
             RequestCall::hot_seq { extent } => answer(Catalog::hot_seq(cat, &extent).await?),
+            RequestCall::bucket_names { ids } => {
+                answer(super::plane::bucket_names(&cat.sql, &ids)?)
+            }
+            RequestCall::buckets_page { after, limit } => answer(super::plane::buckets_page(
+                &cat.sql,
+                after.as_deref(),
+                limit,
+            )?),
+            RequestCall::buckets_named { names } => {
+                answer(super::plane::buckets_named(&cat.sql, &names)?)
+            }
+            RequestCall::bucket_by_id { id } => answer(super::plane::bucket_by_id(&cat.sql, &id)?),
+            RequestCall::keys_page { kind, after, limit } => answer(super::plane::keys_page(
+                &cat.sql,
+                kind,
+                after.as_ref(),
+                limit,
+            )?),
+            RequestCall::key_by_id { id } => answer(super::plane::key_by_id(&cat.sql, &id)?),
+            RequestCall::reach {} => answer(super::plane::reach(&cat.sql)?),
             RequestCall::commit_generation {
                 c,
                 condition,
@@ -900,6 +974,9 @@ pub enum PresignRefusal {
     PrincipalInactive,
     /// The principal is held (AM-9).
     PrincipalHeld,
+    /// The principal's row carries an `owner_ref` conflict mark (AM-72):
+    /// it resolves to no principal until an operator clears it.
+    OwnerRefAmbiguous,
     /// The unit holds no open bucket of that name.
     NoSuchBucket,
     /// The principal's effective grant does not cover the bucket (for a
@@ -961,6 +1038,7 @@ pub(crate) fn presigned_check<S: Sql>(
             R::ActingPrincipalInactive => PresignRefusal::PrincipalInactive,
             R::ActingPrincipalHeld => PresignRefusal::PrincipalHeld,
             R::Malformed => PresignRefusal::Malformed,
+            R::OwnerRefAmbiguous => PresignRefusal::OwnerRefAmbiguous,
             _ => PresignRefusal::PrincipalUnknown,
         };
         return Ok((key, verdict(Err(r))));

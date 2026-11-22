@@ -275,8 +275,10 @@ pub enum UnitOp {
     /// The acting principal of `objects.list` and `objects.presign`
     /// (AM-35), read-only. A Worker call.
     ResolveActing { acting: Acting },
-    /// Releases the `reserved` reservation `rid`. A Worker call.
-    Release { rid: Rid },
+    /// Releases the `reserved` reservation `rid` while it still holds
+    /// `asks`, the count of the last admit answer the caller got (AM-72).
+    /// A Worker call.
+    Release { rid: Rid, asks: u64 },
     /// Binds the bucket reservation `rid` to the creator grant
     /// `grant_seq` while it is bound to `expected`. A Worker call.
     BindBucket {

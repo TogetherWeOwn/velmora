@@ -1094,6 +1094,7 @@ impl<S: UnitSql> Unit<S> {
                     skipped,
                     reserved,
                     kept,
+                    owner_ref_conflict,
                 } => {
                     let n = poll_once(sql.exec(
                         "UPDATE unit_head SET keys_seq = ?1 WHERE id = 1",
@@ -1109,6 +1110,9 @@ impl<S: UnitSql> Unit<S> {
                         "revoked": keys::revoked(sql)?,
                         "reserved": reserved,
                         "answers_kept": kept,
+                        // AM-72: the Worker raises `owner_ref_conflict`
+                        // for each subject named here.
+                        "owner_ref_conflict": owner_ref_conflict,
                     })))
                 }
             }
@@ -1352,11 +1356,7 @@ impl<S: UnitSql> Unit<S> {
             // the drop is its own transaction, as the refusal rolled the
             // ask back.
             if let Some(Admit::RefusedDrop(_, rid)) = outcome {
-                let mut drop = || {
-                    Ok(Ok(
-                        json!({ "released": reserve::release(sql, &rid, false)? }),
-                    ))
-                };
+                let mut drop = || Ok(Ok(json!({ "released": reserve::drop_refused(sql, &rid)? })));
                 // Dropped, or already gone: either way no row is left.
                 let _ = transact(sql, true, &mut drop)?;
             }
@@ -1371,8 +1371,8 @@ impl<S: UnitSql> Unit<S> {
         }
         let mut op = || -> Result<std::result::Result<Value, Refused>> {
             Ok(Ok(match &call.op {
-                UnitOp::Release { rid } => {
-                    json!({ "released": reserve::release(sql, rid, true)? })
+                UnitOp::Release { rid, asks } => {
+                    json!({ "released": reserve::release(sql, rid, *asks)? })
                 }
                 UnitOp::BindBucket {
                     rid,
