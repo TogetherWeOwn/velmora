@@ -15,8 +15,9 @@ use velmora::rng::FillRandom;
 use velmora_bridge::config::Maintenance;
 use velmora_bridge::crypto::scheme2::{tk_blob_name, wrap_tenant_key, TenantKey, TK_PREFIX};
 use velmora_bridge::directory::gate;
-use velmora_bridge::directory::record::{Lifecycle, Tenant};
+use velmora_bridge::directory::record::{HoldMode, Lifecycle, Tenant};
 use velmora_bridge::directory::store::SqlDirectory;
+use velmora_bridge::directory::transition::{Actor, Change};
 use velmora_bridge::keys::locations::{locations_chain, two_in_account, write_locations};
 use velmora_bridge::keys::ports::{ControlChain, ControlIntents};
 use velmora_bridge::keys::tk::{tk_prefix, KeyBuckets};
@@ -296,6 +297,9 @@ enum FinishOutcome {
     /// The stores hold the record before the head (another call's record
     /// landed after the finisher ran).
     Behind,
+    /// Another call's record (a billing hold) lands while the finisher
+    /// runs, after the stores were brought to the head it read.
+    Advanced,
 }
 
 struct Stores<'r, 'a> {
@@ -321,6 +325,24 @@ impl TenantStores for Stores<'_, '_> {
             FinishOutcome::Pending => Ok(None),
             FinishOutcome::Failed => Err(BridgeError::Sql("fake: finish failed".into())),
             FinishOutcome::Behind => Ok(Some(seq.saturating_sub(1))),
+            FinishOutcome::Advanced => {
+                let t = Tenant::Managed(tenant.clone());
+                self.root
+                    .chain()
+                    .write(
+                        &t,
+                        // Set, then lift: each call's record is a change.
+                        &Change::SetBillingHold {
+                            mode: (seq % 2 == 0).then_some(HoldMode::ReadOnly),
+                        },
+                        Actor::Billing,
+                        NOW,
+                        0,
+                    )
+                    .await
+                    .expect("another call's record");
+                Ok(Some(seq))
+            }
         }
     }
 }
@@ -721,6 +743,31 @@ fn a_store_finish_error_leaves_a_live_tenant_for_retry() {
 #[test]
 fn a_head_past_what_the_stores_hold_is_not_answered() {
     assert_store_failure_is_retryable(FinishOutcome::Behind);
+}
+
+/// A record that lands while the finisher runs is past what the stores
+/// hold: neither the activating nor an adopting call answers from it,
+/// nor from the head it read before the finisher.
+#[test]
+fn a_record_landing_during_the_finisher_is_not_answered() {
+    let w = World::new();
+    w.finish_outcome.set(FinishOutcome::Advanced);
+    futures_executor_block_on(async {
+        expect(&w.create(&signup()).await, 503, "service_unavailable");
+        let tenant = w.tenant_of(WS).await.unwrap();
+        // Record 1, claim, commit, live, and the hold that landed.
+        assert_eq!(w.chain_len(&tenant), 5);
+        // The adopting call meets the same: its finisher's record lands too.
+        expect(&w.create(&signup()).await, 503, "service_unavailable");
+        assert_eq!(w.chain_len(&tenant), 6);
+        // A finisher with nothing landing during it: answered from the
+        // head the stores hold.
+        w.finish_outcome.set(FinishOutcome::Ready);
+        let adopted = w.create(&signup()).await;
+        expect(&adopted, 200, "ok");
+        assert_eq!(json_of(&adopted)["id"], tenant.as_str());
+        assert_eq!(w.chain_len(&tenant), 6);
+    });
 }
 
 #[test]
