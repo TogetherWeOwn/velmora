@@ -59,9 +59,11 @@ its row).
 
 `velmora/src/transports/chunk_reader.rs` and
 `velmora/src/transports/worker_stream.rs` are new in this repository too: the
-byte stream both Workers connectors read and write. It replaces the runtime
-adapter under them and changes no TLS setting, deadline or protocol byte (see
-the `worker_socket.rs` row).
+byte stream under the direct connector (`WorkerTransport::connect` in
+`worker_socket.rs`) and the proxied one (`worker_socks5.rs`). It replaces the
+runtime adapter under those two and changes no TLS setting, deadline or
+protocol byte (see the `worker_socket.rs` row). `WorkerTransport::from_socket`
+and `worker_pinned_tls.rs` still read and write through `worker::Socket`.
 
 The proxied connector is a runtime call site for rustls in the Worker, for a
 provider with `proxies` and no other. It builds its client from
