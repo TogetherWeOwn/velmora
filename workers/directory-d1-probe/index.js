@@ -78,12 +78,22 @@ export default {
     }
     try {
       switch (url.pathname) {
-        // Drops the named tables (children first), then runs each schema
+        // Drops every object of the database but SQLite's and the
+        // platform's own (triggers and views first, then tables, newest
+        // first so a child goes before its parent), then runs each schema
         // statement on its own.
-        case "/reset": {
-          for (const name of body.drop) {
-            if (!/^[a-z_]+$/.test(name)) throw new Error("probe: bad table name");
-            await db.prepare(`DROP TABLE IF EXISTS ${name}`).run();
+        case "/wipe": {
+          const objects = await db
+            .prepare(
+              "SELECT type, name FROM sqlite_master WHERE type IN ('trigger', 'view', 'table') " +
+                "AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\' AND name NOT LIKE '\\_cf\\_%' ESCAPE '\\' " +
+                "ORDER BY CASE type WHEN 'table' THEN 1 ELSE 0 END, rowid DESC",
+            )
+            .raw();
+          for (const [type, name] of objects) {
+            if (!/^[A-Za-z0-9_]+$/.test(name)) throw new Error("probe: bad object name");
+            const kind = type === "trigger" ? "TRIGGER" : type === "view" ? "VIEW" : "TABLE";
+            await db.prepare(`DROP ${kind} IF EXISTS ${name}`).run();
           }
           for (const sql of body.schema) await db.prepare(sql).run();
           return Response.json({ ok: true });
