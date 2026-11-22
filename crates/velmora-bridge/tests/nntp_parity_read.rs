@@ -4,6 +4,7 @@
 //! rebuild holds its room in the byte budget or does not start.
 
 mod nntp_support;
+mod service_support;
 
 use nntp_support::*;
 use velmora::rng::SystemRng;
@@ -129,6 +130,126 @@ impl Stripe {
         let load = load.into_iter().find(|l| l.provider_id == id).unwrap();
         assert!(load.cooldown_until > now, "{id} is not cooling");
     }
+}
+
+/// Exercise the S3 GET with one permit shared by two same-tier read
+/// providers. The second provider has either one required parity article
+/// or one required data article.
+async fn shared_pool_cold_get(with_parity: bool) {
+    let nntp = rig(&[
+        Spec {
+            backbone: "bb0",
+            post: true,
+            max_conns: 2,
+        },
+        Spec {
+            backbone: "bb1",
+            post: false,
+            max_conns: 2,
+        },
+    ])
+    .await;
+    let mut providers = nntp.bridge.cfg.providers.clone();
+    for p in &mut providers {
+        p.pool = Some("shared".into());
+        p.pool_max_conns = Some(1);
+    }
+    let mut cfg = service_support::config(providers);
+    cfg.cold_sockets = 2;
+    cfg.packed_plans = with_parity;
+    cfg.parity = with_parity;
+    let svc = service_support::rig_with(TcpConnector::default(), cfg);
+    let bridge = &svc.bridge;
+    bridge
+        .catalog
+        .seed_permits(&bridge.cfg.providers)
+        .await
+        .unwrap();
+    let (bucket, signer) = svc.standard("pool-read").await;
+    let key = "extent.bin";
+    let body = marked_plaintext(if with_parity { TEN } else { THREE });
+    svc.put(&signer, &bucket.name, key, &body).await.expect(200);
+    let (generation, extents) = svc.live(&bucket, key).await.unwrap();
+    let extent = &extents[0];
+    let lease = bridge
+        .catalog
+        .claim(
+            &extent.id,
+            &generation.id,
+            OutboxStage::Post,
+            "post",
+            svc.now(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    let job = bridge
+        .catalog
+        .job_extent(&extent.id, &generation.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(bridge.post_stage(&lease, &job).await, JobOutcome::Ack);
+
+    let stored = bridge.catalog.stored_plan(&extent.id).await.unwrap();
+    let parity = stored.parity_plan(&extent.id, extent.cipher_size).unwrap();
+    let mut src = nntp.raw_client(0).await;
+    let mut dst = nntp.raw_client(1).await;
+    for row in &stored.rows {
+        let mut article = Vec::new();
+        src.article_to(&row.message_id, &mut article).await.unwrap();
+        dst.post_article(&row.message_id, &article).await.unwrap();
+    }
+    if let Some(parity) = parity {
+        assert_eq!(parity.articles.len(), 2);
+        let row = &parity.articles[1];
+        let mut article = Vec::new();
+        src.article_to(&row.message_id, &mut article).await.unwrap();
+        dst.post_article(&row.message_id, &article).await.unwrap();
+        nntp.servers[0].hide(&row.message_id).await;
+        for row in &stored.rows[..2] {
+            for server in &nntp.servers {
+                server.hide(&row.message_id).await;
+            }
+        }
+    } else {
+        // Both providers are needed, regardless of which one is first
+        // in the catalogue's order after the post.
+        nntp.servers[0].hide(&stored.rows[0].message_id).await;
+        nntp.servers[1].hide(&stored.rows[1].message_id).await;
+    }
+    src.quit().await;
+    dst.quit().await;
+    bridge.cache.delete(&extent.id.cache_key()).await.unwrap();
+    bridge.safety.delete(&extent.id.safety_key()).await.unwrap();
+
+    let response = svc
+        .call(
+            &signer,
+            Method::Get,
+            &service_support::path(&bucket.name, key),
+            &[],
+            &[],
+            b"",
+        )
+        .await;
+    response.expect(200);
+    assert!(
+        response.body == body,
+        "cold GET did not return the original bytes"
+    );
+    assert_eq!(bridge.nntp.peak(), 1);
+    assert!(bridge.nntp.connects_to("p1") > 0);
+}
+
+#[tokio::test]
+async fn cold_get_rebuilds_with_parity_split_over_one_shared_pool_slot() {
+    shared_pool_cold_get(true).await;
+}
+
+#[tokio::test]
+async fn cold_get_reads_data_from_the_waiting_provider_of_a_shared_pool() {
+    shared_pool_cold_get(false).await;
 }
 
 fn verified(stats: &ColdStats) -> u32 {
@@ -413,4 +534,23 @@ async fn parity_is_read_from_a_provider_whose_slots_a_tier_switch_freed() {
 
     assert!(read == ColdFetch::Filled(st.s.cipher.clone()), "{stats:?}");
     assert_eq!((stats.rebuilt, stats.unrecoverable), (1, 0));
+}
+
+#[tokio::test]
+async fn a_broken_session_frees_the_shared_slot_for_a_waiting_provider() {
+    let mut st = posted(13, THREE, 2).await;
+    st.rig.bridge.cfg.cold_sockets = 2;
+    for p in &mut st.rig.bridge.cfg.providers {
+        p.pool = Some("shared".into());
+        p.pool_max_conns = Some(1);
+    }
+    // p1 has used fewer slots (p0 posted the extent), so gets the
+    // shared slot first. Its session keeps breaking off.
+    st.rig.servers[1].drop_next_bodies(100).await;
+
+    let (read, stats) = st.read().await;
+
+    assert!(read == ColdFetch::Filled(st.s.cipher.clone()), "{stats:?}");
+    assert!(stats.broken > 0);
+    assert_eq!(stats.rebuilt, 0);
 }

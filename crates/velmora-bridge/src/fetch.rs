@@ -1307,6 +1307,20 @@ fn tier_of(drill: bool, p: &ProviderConfig) -> u16 {
     }
 }
 
+fn pool_siblings(a: &ProviderConfig, b: &ProviderConfig) -> bool {
+    a.id != b.id && a.pool.is_some() && a.pool == b.pool
+}
+
+/// A slot is being given back: a sibling that could not get one can ask
+/// again. Providers already out for this extent still stay out.
+fn free_pool_slot(provider: &ProviderConfig, order: &[&ProviderConfig], full: &mut [bool]) {
+    for (p, full) in order.iter().zip(full) {
+        if *full && pool_siblings(p, provider) {
+            *full = false;
+        }
+    }
+}
+
 /// A session's slot kept, or its first login made.
 type Kept<'s> = LocalBoxFuture<'s, core::result::Result<(), Stop>>;
 
@@ -1426,7 +1440,11 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ColdReader<'a, C, N, T> {
     /// failed. (Boxed, like [`Self::first_logins`]: sessions are moved
     /// here, and a future that moves them in place makes every read's
     /// larger by each move.)
-    fn renew_all(&mut self) -> LocalBoxFuture<'_, bool> {
+    fn renew_all<'s>(
+        &'s mut self,
+        order: &'s [&'a ProviderConfig],
+        full: &'s mut [bool],
+    ) -> LocalBoxFuture<'s, bool> {
         Box::pin(async move {
             // Boxed, here and in the first logins: one kind of future,
             // so one copy of the join in the Worker's wasm.
@@ -1441,7 +1459,9 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ColdReader<'a, C, N, T> {
             for (n, kept) in kept.into_iter().enumerate().rev() {
                 if let Err(stop) = kept {
                     fatal |= matches!(stop, Stop::Fenced | Stop::Catalog);
-                    lost.push(self.sessions.remove(n));
+                    let session = self.sessions.remove(n);
+                    free_pool_slot(session.provider, order, full);
+                    lost.push(session);
                 }
             }
             self.stats.borrow_mut().broken += lost.len() as u32;
@@ -1462,7 +1482,9 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ColdReader<'a, C, N, T> {
     fn first_logins<'s>(
         &'s mut self,
         first: &'s [(usize, usize)],
+        order: &'s [&'a ProviderConfig],
         out: &'s mut [Option<Out>],
+        full: &'s mut [bool],
     ) -> LocalBoxFuture<'s, bool> {
         Box::pin(async move {
             let logins = join_all(
@@ -1501,6 +1523,7 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ColdReader<'a, C, N, T> {
                     Stop::NoPermit => Out::Busy,
                     _ => Out::Broken,
                 });
+                free_pool_slot(session.provider, order, full);
                 ended.push(session);
             }
             self.stats.borrow_mut().broken += ended.len() as u32;
@@ -1519,8 +1542,10 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ColdReader<'a, C, N, T> {
     /// the tiers above could not supply. A provider that gives no slot
     /// while the reader holds none there is out for this extent
     /// ([`Out::Busy`]); one that gives fewer than asked keeps what it
-    /// gave. When every socket is in use and a provider with work has
-    /// none, a session of a provider without work is closed for it.
+    /// gave. A provider stays eligible if a session of this reader on
+    /// another provider in the same pool may be holding its slot.
+    /// When every socket is in use and a provider with work has none,
+    /// a session of a provider without work is closed for it.
     async fn staff(
         &mut self,
         order: &[&'a ProviderConfig],
@@ -1576,7 +1601,9 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ColdReader<'a, C, N, T> {
                 let Some(idle) = idle else {
                     return Ok(());
                 };
-                self.sessions.swap_remove(idle).close().await;
+                let idle = self.sessions.swap_remove(idle);
+                free_pool_slot(idle.provider, order, full);
+                idle.close().await;
             }
             let need = self.sockets - self.sessions.len();
             let mut asked: Vec<usize> = Vec::with_capacity(need);
@@ -1592,7 +1619,7 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ColdReader<'a, C, N, T> {
             // wait for it have their slots renewed first, so none runs
             // out while its socket is open; one that lost its slot is
             // ended.
-            if !asked.is_empty() && !self.sessions.is_empty() && self.renew_all().await {
+            if !asked.is_empty() && !self.sessions.is_empty() && self.renew_all(order, full).await {
                 return Err(BridgeError::Sql(CATALOGUE_FAILED.into()));
             }
             let began = self.clock.now();
@@ -1630,11 +1657,17 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ColdReader<'a, C, N, T> {
             if let Some(e) = failed {
                 return Err(e);
             }
-            if !first.is_empty() && self.first_logins(&first, out).await {
+            if !first.is_empty() && self.first_logins(&first, order, out, full).await {
                 return Err(BridgeError::Sql(CATALOGUE_FAILED.into()));
             }
             for &i in &needy {
-                if full[i] && self.held(order[i]) == 0 {
+                if full[i]
+                    && self.held(order[i]) == 0
+                    && !self
+                        .sessions
+                        .iter()
+                        .any(|s| pool_siblings(s.provider, order[i]))
+                {
                     out[i] = Some(Out::Busy);
                 }
             }
@@ -1719,25 +1752,46 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ColdReader<'a, C, N, T> {
                 let index = |s: &ProviderSession<'a, C, N, T>| {
                     order.iter().position(|p| p.id == s.provider.id)
                 };
-                let (kept, other): (Vec<_>, Vec<_>) = core::mem::take(&mut self.sessions)
-                    .into_iter()
-                    .partition(|s| {
-                        Some(tier_of(drill, s.provider)) == tier
-                            && index(s).is_some_and(|i| out[i].is_none())
-                    });
-                self.sessions = kept;
-                // The slots of a session that is ended are free again:
-                // its provider is not full, and is given sessions anew
-                // when its tier has work once more (the parity articles
-                // of an extent, after a lower tier was asked for a data
-                // article).
-                for i in other.iter().filter_map(index) {
-                    full[i] = false;
-                }
-                ProviderSession::close_all(other).await;
-                if let Err(e) = self.staff(order, &work, out, full).await {
-                    failure = Some(e);
-                    break 'phases;
+                let lends_slot =
+                    |s: &ProviderSession<'a, C, N, T>, out: &[Option<Out>], full: &[bool]| {
+                        index(s).is_some_and(|i| work[i] == 0)
+                            && (0..order.len()).any(|i| {
+                                work[i] > 0
+                                    && out[i].is_none()
+                                    && full[i]
+                                    && pool_siblings(s.provider, order[i])
+                            })
+                    };
+                loop {
+                    let (kept, other): (Vec<_>, Vec<_>) = core::mem::take(&mut self.sessions)
+                        .into_iter()
+                        .partition(|s| {
+                            Some(tier_of(drill, s.provider)) == tier
+                                && index(s).is_some_and(|i| out[i].is_none())
+                                && !lends_slot(s, out, full)
+                        });
+                    self.sessions = kept;
+                    // A closed session frees its own slot and makes
+                    // room in its pool for any sibling waiting for one.
+                    for s in &other {
+                        if let Some(i) = index(s) {
+                            full[i] = false;
+                        }
+                        free_pool_slot(s.provider, order, full);
+                    }
+                    ProviderSession::close_all(other).await;
+                    if let Err(e) = self.staff(order, &work, out, full).await {
+                        failure = Some(e);
+                        break 'phases;
+                    }
+                    // Staffing may just have found a sibling blocked by
+                    // an idle session kept from the previous pass. Give
+                    // up that slot before deciding that no one can read.
+                    // Each repeat closes a session with no work, which
+                    // cannot be reopened in this pass.
+                    if !self.sessions.iter().any(|s| lends_slot(s, out, full)) {
+                        break;
+                    }
                 }
                 // No session for any of the work that is left: nothing
                 // would be read, and the same pass would come again. The
@@ -1762,6 +1816,9 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ColdReader<'a, C, N, T> {
                     .into_iter()
                     .partition(|s| index(s).is_some_and(|i| out[i].is_none()));
                 self.sessions = kept;
+                for s in &other {
+                    free_pool_slot(s.provider, order, full);
+                }
                 ProviderSession::close_all(other).await;
                 let ended = join_all(self.sessions.iter_mut().map(|session| {
                     let (plan, wanted, out) = (plan, &wanted, &*out);
@@ -1802,6 +1859,9 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ColdReader<'a, C, N, T> {
                 }
                 self.sessions = live;
                 stats.borrow_mut().broken += dead.len() as u32;
+                for s in &dead {
+                    free_pool_slot(s.provider, order, full);
+                }
                 ProviderSession::close_all(dead).await;
                 let mut fatal = false;
                 for (i, stop) in stops {
@@ -1839,6 +1899,9 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ColdReader<'a, C, N, T> {
                 (self.sockets, self.replacements) =
                     after_slow(self.sockets, self.replacements, slow.len());
                 stats.borrow_mut().slow += slow.len() as u32;
+                for s in &slow {
+                    free_pool_slot(s.provider, order, full);
+                }
                 ProviderSession::close_all(slow).await;
             }
         }
