@@ -21,8 +21,8 @@ use crate::types::{
     IntentFence, IntentStats, Job, JobExtent, KekBytes, ListEntry, ListPage, ListQuery,
     ObjectStatus, OpenUpload, OutboxStage, OutboxStats, PartExtent, Perm, Precondition,
     ProviderConfig, ProviderFault, ProviderLoad, Resend, SafetyState, SizeCommand, UnixMs,
-    UploadId, UploadListQuery, UploadPartRow, UploadRow, VerificationRow, VerifyEscalation,
-    WriteId,
+    UploadId, UploadListQuery, UploadPartRow, UploadRow, UploadState, VerificationRow,
+    VerifyEscalation, WriteId,
 };
 use crate::types::{
     BucketUsage, RecountState, RecountStep, UsageCounters, UsageRecount, UsageSnapshot,
@@ -834,6 +834,8 @@ pub trait Catalog {
     /// The row carries state, revision and the completion receipt.
     async fn upload(&self, t: &UploadTarget<'_>)
         -> Result<Option<(UploadRow, Vec<UploadPartRow>)>>;
+    /// The upload's state alone, without its parts: one key lookup.
+    async fn upload_state(&self, t: &UploadTarget<'_>) -> Result<Option<UploadState>>;
     /// The open uploads of the bucket in `(key, upload id)` order, at
     /// most `q.limit`.
     async fn list_uploads(&self, bucket: &BucketId, q: &UploadListQuery)
