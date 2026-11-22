@@ -503,7 +503,7 @@ pub struct MarkerRecord {
 /// One record of the key chain: a change to a subject, or a marker.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ChainRecord {
-    Key(KeyRecord),
+    Key(Box<KeyRecord>),
     Marker(MarkerRecord),
 }
 
@@ -816,7 +816,7 @@ pub fn open_chain_record<K: Kek, T: TkRing>(
         true => None,
         false => private,
     };
-    Ok(ChainRecord::Key(KeyRecord {
+    Ok(ChainRecord::Key(Box::new(KeyRecord {
         seq,
         op: door.op,
         at: door.at,
@@ -828,7 +828,7 @@ pub fn open_chain_record<K: Kek, T: TkRing>(
         frozen_at: door.frozen_at,
         rid: door.rid,
         call_key_hash: door.call_key_hash,
-    }))
+    })))
 }
 
 /// Opens the record stored at `seq` of `tenant`'s key chain as a
@@ -843,7 +843,7 @@ pub fn open_key_record<K: Kek, T: TkRing>(
     bytes: &[u8],
 ) -> Result<KeyRecord> {
     match open_chain_record(kek, ring, tenant, seq, bytes)? {
-        ChainRecord::Key(r) => Ok(r),
+        ChainRecord::Key(r) => Ok(*r),
         ChainRecord::Marker(_) => Err(ERR_KEY_MARKER),
     }
 }
