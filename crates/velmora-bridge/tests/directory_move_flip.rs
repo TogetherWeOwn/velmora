@@ -10,13 +10,15 @@ use std::collections::BTreeMap;
 use service_support::*;
 use velmora_bridge::directory::chain::{TenantChain, Written};
 use velmora_bridge::directory::fence::{freeze, legacy_stamp_key, stamp_row, thaw};
+use velmora_bridge::directory::move_flip::MAX_WINDOW_RECORDS;
 use velmora_bridge::directory::move_flip::{
     flip, give_up, FlipError, Flipped, GaveUp, RouteRecords, UnitSync, Window,
 };
+use velmora_bridge::directory::record::{HoldMode, OperatorReason};
 use velmora_bridge::directory::record::{Selector, Tenant, TenantDoor};
 use velmora_bridge::directory::store::{KeyRoute, RouteKind, SqlDirectory};
 use velmora_bridge::directory::testing::{HookedRecords, PlainSeal};
-use velmora_bridge::directory::transition::{Actor, Change, KEY_CHECK_LEN};
+use velmora_bridge::directory::transition::{Actor, Change, OperatorHoldRequest, KEY_CHECK_LEN};
 use velmora_bridge::testkit::RusqliteSql;
 use velmora_bridge::*;
 
@@ -565,13 +567,14 @@ fn the_flip_needs_this_windows_marker_and_a_later_window_is_not_this_one() {
             .await;
         let o = m.head(&owner()).await;
         assert!(o.restoring_entry(0).is_some());
-        // A stale run of the first window: the flip does not act, and the
-        // give-up answers what the first window left, touching nothing.
+        // A stale run of the first window acts on nothing: the flip does
+        // not run, and the give-up does not answer a catalogue the second
+        // window has frozen again.
         let n = m.records();
         let r = m.flip().await;
         assert!(matches!(r, Err(FlipError::NotThisMove)), "{r:?}");
-        let g = m.give_up().await.map_err(|e| format!("{e:?}")).unwrap();
-        assert_eq!(g.map(|g| g.stamp_put), Some(true));
+        let r = m.give_up().await;
+        assert!(matches!(r, Err(FlipError::NotThisMove)), "{r:?}");
         assert_eq!(m.records(), n);
         assert_eq!(m.selector().await, Selector::Moving);
         // The second window, named by its own record, is not the first's
@@ -673,5 +676,152 @@ fn a_give_up_landing_before_the_flip_record_stops_the_flip() {
         let r = m.flip().await;
         assert!(r.is_err(), "{r:?}");
         assert_eq!(m.selector().await, Selector::D1);
+    });
+}
+
+fn hold(on: bool) -> Change {
+    Change::SetOperatorHold {
+        hold: on.then_some(OperatorHoldRequest {
+            mode: HoldMode::ReadOnly,
+            reason: OperatorReason::Security,
+            preserve: None,
+        }),
+    }
+}
+
+#[test]
+fn a_tenant_zero_record_during_the_run_stops_the_flip_record_until_run_again() {
+    block_on(async {
+        let m = window().await;
+        // A record of tenant 0 that keeps the window open lands while the
+        // flip runs (at the owner's lift): the re-walk before (d) sees a
+        // head this run did not check.
+        let head = m.chain().head(&Tenant::zero(), 0).await.unwrap().unwrap();
+        let (name, sealed) = sealed_next(&m, head, hold(true));
+        let mut planted = Some((name, sealed));
+        let owner_prefix = format!("m/t/{OWNER}/");
+        m.store.before_put(move |key, objects| {
+            if key.starts_with(&owner_prefix) {
+                if let Some((name, sealed)) = planted.take() {
+                    objects.insert(name, sealed);
+                }
+            }
+        });
+        let n = m.records();
+        let r = m.flip().await;
+        assert!(matches!(r, Err(FlipError::NotThisMove)), "{r:?}");
+        // The lift and the planted record; no flip record.
+        assert_eq!(m.records(), n + 2);
+        assert_eq!(m.selector().await, Selector::Moving);
+        // The window is still this one: run again, it flips.
+        let f = m.flip().await.map_err(|e| format!("{e:?}")).unwrap();
+        assert!(f.wrote);
+    });
+}
+
+/// The sealed record that `change` makes on `head` of tenant 0, as another
+/// writer would put it.
+fn sealed_next(
+    m: &Move,
+    head: velmora_bridge::directory::chain::ReadRecord,
+    change: Change,
+) -> (String, Vec<u8>) {
+    use velmora_bridge::directory::chain::{record_key, ControlSeal};
+    use velmora_bridge::directory::record::TenantRecord;
+    use velmora_bridge::directory::transition::{next, Outcome};
+    let record = TenantRecord {
+        door: head.door,
+        private: head.private.unwrap(),
+    };
+    let Ok(Outcome::Next(rec)) = next(
+        &Tenant::zero(),
+        Some(&record),
+        &change,
+        Actor::Operator,
+        m.rig.now(),
+    ) else {
+        panic!("tenant-0 record");
+    };
+    let name = record_key(&Tenant::zero(), rec.door.seq);
+    let sealed = m
+        .seal
+        .seal(
+            &name,
+            &Tenant::zero(),
+            rec.door.tk_version,
+            &serde_json::to_vec(&rec.door).unwrap(),
+            &serde_json::to_vec(&rec.private).unwrap(),
+        )
+        .unwrap();
+    (name, sealed)
+}
+
+#[test]
+fn the_give_up_refuses_an_older_windows_entry() {
+    block_on(async {
+        let mut m = window().await;
+        m.since += 1;
+        let n = m.records();
+        let r = m.give_up().await;
+        assert!(matches!(r, Err(FlipError::OtherWindow { .. })), "{r:?}");
+        assert_eq!(m.records(), n);
+        assert_eq!(m.selector().await, Selector::Moving);
+    });
+}
+
+#[test]
+fn an_owner_without_a_live_directory_row_stops_the_flip_before_any_write() {
+    block_on(async {
+        let m = window().await;
+        m.db.apply(&format!(
+            "DELETE FROM units WHERE tenant = '{OWNER}';\n\
+             DELETE FROM bucket_index WHERE tenant = '{OWNER}';\n\
+             DELETE FROM tenants WHERE id = '{OWNER}';"
+        ))
+        .unwrap();
+        let n = m.records();
+        let r = m.flip().await;
+        assert!(matches!(r, Err(FlipError::OwnerRow)), "{r:?}");
+        assert_eq!(m.records(), n);
+        assert!(!m.stamp_put().await);
+    });
+}
+
+#[test]
+fn a_window_named_by_a_record_outside_any_run_is_not_a_window() {
+    block_on(async {
+        let mut m = window().await;
+        // Seq 1: tenant 0's first record, on its D1 with no move.
+        m.zero_seq = 1;
+        assert!(matches!(m.flip().await, Err(FlipError::NotThisMove)));
+        assert!(matches!(m.give_up().await, Err(FlipError::NotThisMove)));
+        // Above the head.
+        m.zero_seq = 99;
+        assert!(matches!(m.flip().await, Err(FlipError::NotThisMove)));
+    });
+}
+
+#[test]
+fn a_window_longer_than_the_bound_is_not_walked() {
+    block_on(async {
+        let m = window().await;
+        let zero = Tenant::zero();
+        // Records that keep the window open, up to the bound.
+        let mut head = m.head(&zero).await.seq;
+        let mut on = true;
+        while head - m.zero_seq < MAX_WINDOW_RECORDS - 1 {
+            head = m.write(&zero, hold(on), Actor::Operator).await.seq;
+            on = !on;
+        }
+        // Inside the bound: still this window.
+        assert!(matches!(m.give_up().await, Ok(Some(_))), "inside the bound");
+        let m = window().await;
+        let mut head = m.head(&zero).await.seq;
+        let mut on = true;
+        while head - m.zero_seq < MAX_WINDOW_RECORDS {
+            head = m.write(&zero, hold(on), Actor::Operator).await.seq;
+            on = !on;
+        }
+        assert!(matches!(m.flip().await, Err(FlipError::NotThisMove)));
     });
 }

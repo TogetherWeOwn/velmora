@@ -159,6 +159,7 @@ async fn window_state<S: RecordStore, C: ControlSeal>(
         return Err(FlipError::NotThisMove);
     }
     let mut frozen: Option<String> = None;
+    let mut given_up = false;
     for seq in window.zero_seq..=head.seq {
         let door = match seq == head.seq {
             true => head.clone(),
@@ -173,6 +174,17 @@ async fn window_state<S: RecordStore, C: ControlSeal>(
             }
         };
         let z = door.tenant_zero.as_ref().ok_or(FlipError::NotThisMove)?;
+        if given_up {
+            // After the give-up only records of no window may follow: a
+            // later window must not be steered by this one's answer.
+            if z.selector != Selector::D1 || (z.moved.is_some() && !z.undone()) {
+                return Err(FlipError::NotThisMove);
+            }
+            if seq == head.seq {
+                break;
+            }
+            continue;
+        }
         let to_owner = z.moved.as_ref().filter(|m| m.to == *window.owner);
         match (z.selector, to_owner, &frozen) {
             (Selector::Moving, Some(m), _) => {
@@ -187,11 +199,14 @@ async fn window_state<S: RecordStore, C: ControlSeal>(
                     .map(WindowState::Flipped)
                     .ok_or(FlipError::NotThisMove)
             }
-            (Selector::D1, _, Some(f)) => return Ok(WindowState::GivenUp(f.clone())),
+            (Selector::D1, _, Some(_)) => given_up = true,
             _ => return Err(FlipError::NotThisMove),
         }
     }
-    Err(FlipError::NotThisMove)
+    match (given_up, frozen) {
+        (true, Some(f)) => Ok(WindowState::GivenUp(f)),
+        _ => Err(FlipError::NotThisMove),
+    }
 }
 
 async fn owner_head<S: RecordStore, C: ControlSeal>(
