@@ -1,7 +1,7 @@
 //! The WebDAV methods (RFC 4918 classes 1, 2 and 3) over the S3 calls of
 //! [`crate::s3`] and the bucket state of [`crate::state`].
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use base64::Engine;
 use futures_util::future::{join_all, select, Either, LocalBoxFuture};
@@ -1338,17 +1338,15 @@ impl<U: Upstream, S: StatePort> Ctx<'_, U, S> {
                     .await;
                 // Properties and locks of what was deleted, and nothing else.
                 let drops = match &out {
-                    Ok((_, failed)) if failed.is_empty() => vec![
-                        Op::PropDrop {
-                            path: coll.clone(),
-                            tree: true,
-                        },
-                        Op::DropLocks {
-                            path: coll.clone(),
-                            tree: true,
-                        },
-                    ],
-                    Ok((deleted, _)) => forget(deleted),
+                    Ok((_, failed)) if failed.is_empty() => forget_tree(coll).to_vec(),
+                    Ok((deleted, failed)) => {
+                        self.under_lease(
+                            bucket,
+                            &holder,
+                            self.forget_removed(bucket, deleted, failed),
+                        )
+                        .await
+                    }
                     Err(_) => Vec::new(),
                 };
                 self.end_write(bucket, &holder, drops).await;
@@ -1360,6 +1358,34 @@ impl<U: Upstream, S: StatePort> Ctx<'_, U, S> {
                 Ok(status(204))
             }
         }
+    }
+
+    /// A deleted S3 marker alone does not mean the WebDAV collection
+    /// disappeared. Preserve state when either known failures or a fresh
+    /// prefix lookup say the folder remains (or absence is not confirmed).
+    async fn forget_removed(
+        &self,
+        bucket: &str,
+        deleted: &[String],
+        failed: &[(String, u16)],
+    ) -> Vec<Op> {
+        let mut removed = stream::iter(deleted)
+            .map(|key| async move {
+                if !key.ends_with('/')
+                    || (!failed.iter().any(|(k, _)| k.starts_with(key))
+                        && matches!(self.s3.any_under(bucket, key).await, Ok(false)))
+                {
+                    Some(key.clone())
+                } else {
+                    None
+                }
+            })
+            .buffer_unordered(self.cfg().fan_out.max(1));
+        let mut files_and_gone_folders = Vec::new();
+        while let Some(key) = removed.next().await {
+            files_and_gone_folders.extend(key);
+        }
+        forget(&files_and_gone_folders)
     }
 
     async fn list_tree(&self, bucket: &str, coll: &str) -> Result<Vec<Entry>, Resp<U::Body>> {
@@ -1637,18 +1663,20 @@ impl<U: Upstream, S: StatePort> Ctx<'_, U, S> {
                 _ => None,
             };
             let mut obsolete = Vec::new();
+            let mut destination_markers = HashMap::new();
             if let Some(dcoll) = dest_collection {
                 let entries = self.list_tree(bucket, dcoll).await?;
                 require_visible_tree(&entries)?;
                 let mut new_keys = HashSet::from([dst_path.as_str()]);
                 new_keys.extend(members.iter().map(|(_, dest)| dest.as_str()));
                 new_keys.extend(markers.iter().map(String::as_str));
-                obsolete.extend(
-                    entries
-                        .into_iter()
-                        .filter(|e| !new_keys.contains(e.key.as_str()))
-                        .map(|e| (e.key, e.etag)),
-                );
+                for e in entries {
+                    if !new_keys.contains(e.key.as_str()) {
+                        obsolete.push((e.key, e.etag));
+                    } else if e.key.ends_with('/') {
+                        destination_markers.insert(e.key, e.etag);
+                    }
+                }
             }
             if let (true, Res::File(meta)) = (src_coll, &dst) {
                 obsolete.push((dst_existing, meta.etag.clone()));
@@ -1668,7 +1696,7 @@ impl<U: Upstream, S: StatePort> Ctx<'_, U, S> {
                 versions,
                 mut properties,
                 failed,
-            } = self.copy_tree(bucket, &members).await;
+            } = self.copy_tree(bucket, &members, &destination_markers).await;
             if let Some(tag) = &etag {
                 properties.push(copied_file_props(&src_path, &dst_path, tag));
             }
@@ -1705,7 +1733,16 @@ impl<U: Upstream, S: StatePort> Ctx<'_, U, S> {
             }
             // Copies may replace same-named keys, but never remove an
             // obsolete destination member until all copies have succeeded.
-            let (_, failed) = self.delete_matching_members(bucket, obsolete, 412).await;
+            let (removed, failed) = self.delete_matching_members(bucket, obsolete, 412).await;
+            if let Some(old) = dest_collection.filter(|_| !src_coll && failed.is_empty()) {
+                if matches!(self.s3.any_under(bucket, old).await, Ok(false)) {
+                    properties.extend(forget_tree(old));
+                } else {
+                    properties.extend(self.forget_removed(bucket, &removed, &failed).await);
+                }
+            } else {
+                properties.extend(self.forget_removed(bucket, &removed, &failed).await);
+            }
             if !failed.is_empty() {
                 if !properties.is_empty() {
                     self.state(bucket, properties).await?;
@@ -1744,23 +1781,13 @@ impl<U: Upstream, S: StatePort> Ctx<'_, U, S> {
             // destination tree first. File state is applied afterward.
             ops.extend(properties);
             if is_move && failed.is_empty() {
-                ops.push(Op::PropDrop {
-                    path: src_path.clone(),
-                    tree: src_coll,
-                });
-                ops.push(Op::DropLocks {
-                    path: src_path.clone(),
-                    tree: src_coll,
-                });
+                if src_coll {
+                    ops.extend(forget_tree(&src_path));
+                } else {
+                    ops.extend(forget(std::slice::from_ref(&src_path)));
+                }
             } else if is_move {
-                // Deleting a marker alone need not remove a collection:
-                // failed descendants can keep it visible. Drop state only
-                // for files whose conditional delete actually succeeded.
-                let files: Vec<_> = removed
-                    .into_iter()
-                    .filter(|key| !key.ends_with('/'))
-                    .collect();
-                ops.extend(forget(&files));
+                ops.extend(self.forget_removed(bucket, &removed, &failed).await);
             }
             self.state(bucket, ops).await?;
             if !failed.is_empty() {
@@ -1779,12 +1806,26 @@ impl<U: Upstream, S: StatePort> Ctx<'_, U, S> {
 
     /// Copy the preflighted members. Let the current batch settle, but
     /// schedule no further copies after a failed batch.
-    async fn copy_tree(&self, bucket: &str, members: &[(Entry, String)]) -> TreeCopy {
+    async fn copy_tree(
+        &self,
+        bucket: &str,
+        members: &[(Entry, String)],
+        destination_markers: &HashMap<String, String>,
+    ) -> TreeCopy {
         let mut copied = TreeCopy::default();
         for batch in members.chunks(self.cfg().fan_out.max(1)) {
-            let outcomes = join_all(batch.iter().map(|(src, dst)| {
+            let outcomes = join_all(batch.iter().map(|(src, dst)| async move {
                 let marker_etag = src.key.ends_with('/').then_some(src.etag.as_str());
-                self.s3.copy(bucket, &src.key, dst, None, marker_etag)
+                // A same-named destination marker can also become hidden
+                // after preflight. Replace only the listed empty object.
+                let condition = marker_etag.map(|_| {
+                    destination_markers
+                        .get(dst)
+                        .map_or(Cond::Absent, |tag| Cond::Is(tag.clone()))
+                });
+                self.s3
+                    .copy(bucket, &src.key, dst, condition.as_ref(), marker_etag)
+                    .await
             }))
             .await;
             for ((src, dst), result) in batch.iter().zip(outcomes) {
@@ -2171,6 +2212,19 @@ fn lock_answer<B>(code: u16, lock: &Lock, bucket: &str, now: i64, with_token: bo
         r.set_header("lock-token", format!("<{}>", lock.token));
     }
     r
+}
+
+fn forget_tree(path: &str) -> [Op; 2] {
+    [
+        Op::PropDrop {
+            path: path.to_owned(),
+            tree: true,
+        },
+        Op::DropLocks {
+            path: path.to_owned(),
+            tree: true,
+        },
+    ]
 }
 
 /// Drops the properties and locks of exactly these paths.
