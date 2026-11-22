@@ -193,23 +193,23 @@ pub(super) enum Class {
 }
 
 /// A change validated against the head.
-struct Plan {
-    op: KeyOp,
-    door: SubjectDoor,
-    private: Option<SubjectPrivate>,
-    class: Class,
+pub(super) struct Plan {
+    pub(super) op: KeyOp,
+    pub(super) door: SubjectDoor,
+    pub(super) private: Option<SubjectPrivate>,
+    pub(super) class: Class,
     acting: Option<String>,
     /// A revoke: the `m/rk/` record comes first.
     revoke: bool,
 }
 
 impl Plan {
-    fn closes(&self) -> bool {
+    pub(super) fn closes(&self) -> bool {
         self.class == Class::Closing
     }
 }
 
-enum Planned {
+pub(super) enum Planned {
     Change(Box<Plan>),
     /// The head already carries the effect; bring the stores up in this
     /// order.
@@ -272,7 +272,7 @@ fn same_create<K: Kek>(kek: &K, tenant: &TenantId, entry: &Entry, subject: &Subj
         )
 }
 
-fn plan<K: Kek>(
+pub(super) fn plan<K: Kek>(
     kek: &K,
     table: &KeyTable,
     revoked: &BTreeSet<String>,
@@ -441,7 +441,7 @@ pub(super) struct Acks {
     /// Every unit holds the head, with what does not close held closed.
     pub(super) closed: bool,
     /// The directory holds the head.
-    directory: bool,
+    pub(super) directory: bool,
     /// Every unit holds the head in full (only after the directory).
     pub(super) units: bool,
 }
@@ -797,7 +797,12 @@ where
     G: MoveGate,
 {
     /// The move rules for `request` at `table`'s head ([`super::gate`]).
-    async fn move_rules(&self, zero: &ZeroHead, table: &KeyTable, request: &KeyRequest) -> Gate {
+    pub(super) async fn move_rules(
+        &self,
+        zero: &ZeroHead,
+        table: &KeyTable,
+        request: &KeyRequest,
+    ) -> Gate {
         let kind = change_kind(request);
         let id = subject_of(request);
         let key_held =
@@ -885,7 +890,7 @@ fn change_kind(request: &KeyRequest) -> ChangeKind {
     }
 }
 
-fn op_kind(plan: &Plan) -> &'static str {
+pub(super) fn op_kind(plan: &Plan) -> &'static str {
     match (plan.op, plan.door.status) {
         (KeyOp::Create, _) => "key.create",
         (KeyOp::Status, SubjectStatus::Revoked) => "key.revoke",

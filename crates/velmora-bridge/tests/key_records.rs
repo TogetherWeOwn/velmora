@@ -263,6 +263,7 @@ fn principal_record_round_trips_and_opens_door_without_tenant_key() {
             closes: false,
             private_unchanged: false,
             frozen_at: None,
+            rid: None,
         }
     );
     let closed = open_key_record(&kek, &NoKeys, &t, 1, &bytes).unwrap();
@@ -302,6 +303,7 @@ fn fold(table: &mut KeyTable, op: KeyOp, subject: &Subject) {
             closes: false,
             private_unchanged: false,
             frozen_at: None,
+            rid: None,
         })
         .unwrap();
 }
@@ -406,6 +408,7 @@ fn effective_status_closes_unreadable_subjects_and_preserves_revocation() {
         tk_version: 1,
         closes: false,
         opened_seq: 1,
+        rid: None,
     };
     assert_eq!(entry.effective_status(), SubjectStatus::Disabled);
     entry.door.status = SubjectStatus::Revoked;
