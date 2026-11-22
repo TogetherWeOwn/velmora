@@ -526,6 +526,57 @@ fn secret_wrap_roundtrips_and_matches_the_documented_format() {
     );
 }
 
+/// An app password's secret is wrapped under its own domain. A Worker
+/// built before key kinds opens every secret with the `velmora/ak/v1`
+/// AAD; that AAD must not open an app password, so a rollback below the
+/// kinds leaves app passwords unusable (fail closed) rather than turning
+/// them into S3 keys on the public endpoint. S3 keys keep their AAD.
+#[test]
+fn app_password_secret_does_not_open_under_the_s3_key_aad() {
+    let kek = kek_v1();
+    let secret = hex(&derived("an app password"));
+    let id = "APVLEXAMPLE0000000001";
+    let (version, wrapped) =
+        wrap_secret(&kek, id, secret.as_bytes(), &mut TestRng::new("n")).unwrap();
+    assert_eq!(version, 1);
+
+    // What a Worker without key kinds would try: refused.
+    assert!(independent_open(
+        &derived("kek v1"),
+        &format!("velmora/ak/v1|{id}|1"),
+        &wrapped
+    )
+    .is_none());
+    // The documented app-password AAD opens it, and so does this build.
+    assert_eq!(
+        independent_open(
+            &derived("kek v1"),
+            &format!("velmora/app-password/v1|{id}|1"),
+            &wrapped
+        )
+        .unwrap(),
+        secret.as_bytes()
+    );
+    assert_eq!(
+        &unwrap_secret(&kek, 1, id, &wrapped).unwrap()[..],
+        secret.as_bytes()
+    );
+
+    // An S3 key minted by the admin API keeps the AAD every stored key
+    // was wrapped under.
+    let s3 = "AKVLEXAMPLE0000000001";
+    let (_, wrapped) = wrap_secret(&kek, s3, secret.as_bytes(), &mut TestRng::new("m")).unwrap();
+    assert_eq!(
+        independent_open(
+            &derived("kek v1"),
+            &format!("velmora/ak/v1|{s3}|1"),
+            &wrapped
+        )
+        .unwrap(),
+        secret.as_bytes()
+    );
+}
+
 #[test]
 fn secret_wrong_binding_or_tamper_rejected() {
     let kek = kek_v1();

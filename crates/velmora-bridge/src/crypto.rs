@@ -7,6 +7,7 @@
 //!   ├─ wraps BDK (per bucket, 32 random bytes)   AAD "velmora/bdk/v1|<bucket_id>|<v>"
 //!   │    └─ wraps FileKey (per extent, random)   AAD "velmora/fk/v1|<bucket_id>|<extent_id>"
 //!   ├─ wraps S3 secret access keys               AAD "velmora/ak/v1|<access_key_id>|<v>"
+//!   ├─ wraps app password secrets (APVL… ids)    AAD "velmora/app-password/v1|<access_key_id>|<v>"
 //!   └─ HKDF-SHA256(info "velmora/list-token/v1") → HMAC key for list tokens
 //! ```
 //!
@@ -129,6 +130,13 @@ pub const MAX_SECRET_LEN: usize = 1024;
 const BDK_DOMAIN: &str = "velmora/bdk/v1";
 const FILE_KEY_DOMAIN: &str = "velmora/fk/v1";
 const ACCESS_KEY_DOMAIN: &str = "velmora/ak/v1";
+/// The domain of an app password's secret ([`crate::entry::KeyKind`]).
+/// It differs from [`ACCESS_KEY_DOMAIN`] so that a Worker built before
+/// key kinds existed, which wraps and opens every secret under
+/// `velmora/ak/v1`, cannot open an app password's secret: after a
+/// rollback below the kinds, an app password fails closed instead of
+/// becoming an S3 key on the public endpoint.
+const APP_PASSWORD_DOMAIN: &str = "velmora/app-password/v1";
 const LIST_TOKEN_INFO: &[u8] = b"velmora/list-token/v1";
 const MANIFEST_DOMAIN: &str = "velmora/manifest/v1";
 /// A sealed recovery record starts with the KEK version, big-endian.
@@ -246,9 +254,17 @@ fn file_key_aad(bucket: &BucketId, extent: &ExtentId) -> Result<String> {
     ))
 }
 
+/// The secret's AAD. The domain follows the kind the id names
+/// ([`crate::entry::KeyKind::of`]), so a secret can only be opened as the
+/// kind it was minted as, and every S3 key keeps the AAD it was wrapped
+/// under.
 fn access_key_aad(access_key_id: &str, kek_version: u32) -> Result<String> {
+    let domain = match crate::entry::KeyKind::of(access_key_id) {
+        crate::entry::KeyKind::S3 => ACCESS_KEY_DOMAIN,
+        crate::entry::KeyKind::AppPassword => APP_PASSWORD_DOMAIN,
+    };
     Ok(format!(
-        "{ACCESS_KEY_DOMAIN}|{}|{kek_version}",
+        "{domain}|{}|{kek_version}",
         binding_id(access_key_id)?
     ))
 }

@@ -214,6 +214,13 @@ starts with `APVL`. The S3 endpoint refuses it (`403
 InvalidAccessKeyId`), and the WebDAV entry point refuses every other
 key; nothing else about it differs (grants, revocation).
 
+Its secret is wrapped under its own domain (`velmora/app-password/v1`,
+not the S3 keys' `velmora/ak/v1`). A Worker built before key kinds
+cannot open it, so after a rollback below that build every request
+signed with an app password fails (`500 InternalError`) instead of
+being accepted as an S3 key on the public endpoint. Roll forward again
+(or revoke the app passwords) to give WebDAV users access back.
+
 ## Granting a key on another bucket
 
 ```

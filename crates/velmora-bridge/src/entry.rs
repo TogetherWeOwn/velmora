@@ -26,6 +26,11 @@
 //! A credential of the wrong kind for its entry point is treated as an
 //! unknown key (`InvalidAccessKeyId`): it says nothing about whether the
 //! key exists.
+//!
+//! **After a rollback.** An app password's secret is wrapped under its own
+//! AAD domain (`crate::crypto`), which a build from before key kinds
+//! cannot open: on such a build an app password fails closed instead of
+//! passing as an S3 key.
 
 /// Set by the named WebDAV entrypoint, deleted by the default one.
 pub const ENTRY_HEADER: &str = "x-velmora-entry";
