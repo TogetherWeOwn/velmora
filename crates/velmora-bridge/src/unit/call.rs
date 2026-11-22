@@ -457,7 +457,8 @@ pub enum UnitAnswer {
     SyncNeeded {
         seqs: Seqs,
     },
-    /// The caller is behind; nothing was done (rule 5).
+    /// The caller is behind; nothing was done (rule 5). A job runs once
+    /// more with these numbers (AM-50).
     Stale {
         seqs: Seqs,
     },
@@ -487,7 +488,9 @@ pub enum UnitAnswer {
         bookmark: Bookmark,
     },
     /// No certificate (rule 7). `listed`: as the call said; the Worker
-    /// answers `503` and pages when it is set, `404` when not.
+    /// answers `503` and pages when it is set, `404` when not. The move
+    /// tool's P12 read of `import_progress` sends `listed = false` where
+    /// its verified heads say an unborn unit is expected.
     Unborn {
         listed: bool,
     },

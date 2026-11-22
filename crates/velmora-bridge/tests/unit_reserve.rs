@@ -1019,6 +1019,75 @@ fn one_principal_per_owner_ref_that_is_not_revoked() {
 }
 
 #[test]
+fn a_principal_create_for_an_ambiguous_owner_ref_alarms_on_every_path() {
+    // L5's review note: the create must not fall through to
+    // `principal_exists` when two principals hold one `owner_ref`.
+    let u = ready();
+    let create = |key: u8, r: u8, owner_ref: &str| {
+        reserve_op(
+            key,
+            key,
+            r,
+            None,
+            Opening::Principal {
+                id: format!("p_{r}"),
+                owner_ref: owner_ref.into(),
+                grants: vec![],
+            },
+        )
+    };
+    let ambiguous = UnitAnswer::Refused {
+        reason: Refused::Reserve(ReserveRefusal::OwnerRefAmbiguous),
+        alarm: true,
+    };
+    // A new ask.
+    let next = keys_seq(&u) + 1;
+    apply(
+        &u,
+        vec![principal_entry(
+            "p_twin",
+            OWNER,
+            next,
+            SubjectStatus::Active,
+            false,
+            vec![],
+        )],
+        vec![],
+    );
+    assert_eq!(worker(&u, create(1, 1, OWNER)), ambiguous);
+    assert_eq!(rows(&u), 0);
+    // A re-ask of a create reserved before the second principal came:
+    // refused with the alarm, and its row is dropped.
+    ok(worker(&u, create(2, 2, "member-3")));
+    assert_eq!(rows(&u), 1);
+    let next = keys_seq(&u) + 1;
+    apply(
+        &u,
+        vec![
+            principal_entry(
+                "p_m3a",
+                "member-3",
+                next,
+                SubjectStatus::Active,
+                false,
+                vec![],
+            ),
+            principal_entry(
+                "p_m3b",
+                "member-3",
+                next + 1,
+                SubjectStatus::Active,
+                false,
+                vec![],
+            ),
+        ],
+        vec![],
+    );
+    assert_eq!(worker(&u, create(2, 2, "member-3")), ambiguous);
+    assert_eq!(rows(&u), 0);
+}
+
+#[test]
 fn a_grant_change_is_classified_by_the_unit() {
     let u = ready();
     apply(
