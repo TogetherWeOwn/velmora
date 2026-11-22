@@ -25,8 +25,10 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
+use std::future::Future;
 use std::rc::Rc;
 use std::task::{Poll, Waker};
+use std::time::Duration;
 
 use velmora_bridge::gate::{
     open_detached, Gate, GateAnswer, GateRecord, GateReply, GateRequest, GateSession, GateStore,
@@ -403,6 +405,49 @@ impl DurableObject for PermitGate {
     }
 }
 
+thread_local! {
+    static DETACHED_OPENS: Cell<usize> = const { Cell::new(0) };
+}
+
+struct DetachedOpen;
+
+impl DetachedOpen {
+    fn start() -> Self {
+        DETACHED_OPENS.with(|n| n.set(n.get() + 1));
+        Self
+    }
+}
+
+impl Drop for DetachedOpen {
+    fn drop(&mut self) {
+        DETACHED_OPENS.with(|n| n.set(n.get() - 1));
+    }
+}
+
+fn tracked_open_spawner(spawn: Spawner) -> Spawner {
+    Rc::new(move |task| {
+        let in_flight = DetachedOpen::start();
+        spawn(Box::pin(async move {
+            let _in_flight = in_flight;
+            task.await;
+        }));
+    })
+}
+
+/// Used with the current invocation's `wait_until`. The cached transport
+/// does not own a Context, and `spawn_local` alone does not keep it alive.
+pub fn drain_detached_opens() -> Option<impl Future<Output = ()>> {
+    (DETACHED_OPENS.get() != 0).then_some(async {
+        let drain = async {
+            while DETACHED_OPENS.get() != 0 {
+                worker::Delay::from(Duration::from_millis(50)).await;
+            }
+        };
+        let timeout = worker::Delay::from(Duration::from_secs(30));
+        let _ = futures_util::future::select(std::pin::pin!(drain), std::pin::pin!(timeout)).await;
+    })
+}
+
 /// Asks the gate objects of one namespace.
 pub struct DoTransport {
     namespace: ObjectNamespace,
@@ -411,7 +456,10 @@ pub struct DoTransport {
 
 impl DoTransport {
     pub fn new(namespace: ObjectNamespace, spawn: Spawner) -> Self {
-        DoTransport { namespace, spawn }
+        DoTransport {
+            namespace,
+            spawn: tracked_open_spawner(spawn),
+        }
     }
 
     fn stub(&self, gate: &str) -> Result<Stub> {
@@ -620,5 +668,79 @@ impl GateTransport for DoTransport {
         }
         let raw = resp.text().await.map_err(|_| failed("reply unreadable"))?;
         serde_json::from_str(&raw).map_err(|_| failed("reply unreadable"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::future::Future;
+
+    struct Session(Rc<Cell<u32>>);
+
+    impl GateSession for Session {
+        async fn call(&self, _: GateRequest) -> Result<GateReply> {
+            unreachable!("the detached receiver never used the session")
+        }
+
+        fn close(&self) {
+            assert_eq!(DETACHED_OPENS.get(), 1, "still in flight during cleanup");
+            self.0.set(self.0.get() + 1);
+        }
+    }
+
+    #[test]
+    fn detached_opens_are_counted_through_completion_and_late_close() {
+        let tasks = Rc::new(RefCell::new(Vec::new()));
+        let queued = Rc::clone(&tasks);
+        let spawn = tracked_open_spawner(Rc::new(move |task| queued.borrow_mut().push(task)));
+        let mut cx = std::task::Context::from_waker(futures_util::task::noop_waker_ref());
+        assert!(drain_detached_opens().is_none());
+
+        let error = open_detached::<Session>(&spawn, Box::pin(async { Err(failed("test open")) }));
+        let mut error = std::pin::pin!(error);
+        assert_eq!(DETACHED_OPENS.get(), 1);
+        assert!(drain_detached_opens().is_some());
+        let mut task = tasks.borrow_mut().pop().unwrap();
+        assert!(task.as_mut().poll(&mut cx).is_ready());
+        assert!(matches!(error.as_mut().poll(&mut cx), Poll::Ready(Err(_))));
+        assert!(drain_detached_opens().is_none());
+
+        let closed = Rc::new(Cell::new(0));
+        let session = Session(Rc::clone(&closed));
+        let receiving = open_detached(&spawn, Box::pin(async { Ok(session) }));
+        let mut receiving = std::pin::pin!(receiving);
+        assert_eq!(DETACHED_OPENS.get(), 1);
+        let mut task = tasks.borrow_mut().pop().unwrap();
+        assert!(task.as_mut().poll(&mut cx).is_ready());
+        assert!(drain_detached_opens().is_none());
+        assert!(matches!(
+            receiving.as_mut().poll(&mut cx),
+            Poll::Ready(Ok(_))
+        ));
+        assert_eq!(closed.get(), 0);
+
+        let ready = Rc::new(Cell::new(false));
+        let (finish, count) = (Rc::clone(&ready), Rc::clone(&closed));
+        let receiving = open_detached(
+            &spawn,
+            Box::pin(std::future::poll_fn(move |_| {
+                if finish.get() {
+                    Poll::Ready(Ok(Session(Rc::clone(&count))))
+                } else {
+                    Poll::Pending
+                }
+            })),
+        );
+        assert_eq!(DETACHED_OPENS.get(), 1);
+        let mut task = tasks.borrow_mut().pop().unwrap();
+        assert!(task.as_mut().poll(&mut cx).is_pending());
+        drop(receiving);
+        assert_eq!(DETACHED_OPENS.get(), 1);
+        assert_eq!(closed.get(), 0);
+        ready.set(true);
+        assert!(task.as_mut().poll(&mut cx).is_ready());
+        assert_eq!(closed.get(), 1);
+        assert!(drain_detached_opens().is_none());
     }
 }
