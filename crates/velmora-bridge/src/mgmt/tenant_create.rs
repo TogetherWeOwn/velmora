@@ -43,6 +43,16 @@
 //! because the finisher applies the head, never a row's seq (`pending`).
 //! Each record names the call's `call_key_hash` (AM-79).
 //!
+//! **Step 3: the stores (AM-75).** Before it answers a `live` tenant (the
+//! call that activated it, and every call that adopts one), the call runs
+//! the tenant chain's finisher ([`TenantStores`]): the directory and the
+//! listed units brought to the head, the directory first for an opening.
+//! Until every store holds the head the answer is `503`, and the intent's
+//! message or the next call finishes it.
+//!
+//! **Maintenance.** Under `MAINTENANCE=restore` every mutation answers
+//! `503`, so the call stops after its body checks, before any read.
+//!
 //! **Answers.** `201` with the tenant for the call that wrote `m/tref/`;
 //! `200` with it for a call that adopts through `m/tref/` (it may finish
 //! a create still in flight), a `live` or deleting tenant included;
@@ -495,11 +505,61 @@ impl<P: RootPorts, R: FillRandom, I: ControlIntents> KeyVersionClaims
 }
 
 // ---------------------------------------------------------------------------
+// Step 3: the stores
+// ---------------------------------------------------------------------------
+
+/// Step 3 of a tenant-chain change (ADR §2.5, AM-75): the tenant chain's
+/// finisher, run by the handler before it answers.
+#[allow(async_fn_in_trait)]
+pub trait TenantStores {
+    /// Brings the directory and every listed unit of `tenant` to its
+    /// chain's head. `Ok(true)`: every store holds the head (an unbound
+    /// directory counts as holding it). `Ok(false)` or `Err`: not yet; the
+    /// call answers `503` and the intent's message finishes it.
+    async fn finish(&self, tenant: &crate::TenantId) -> Result<bool>;
+}
+
+/// [`TenantStores`] over `directory::finish::finish_tenant`, with the
+/// root's chain and directory and the units' adapter.
+pub struct ChainStores<'r, 'a, P: RootPorts, R, U> {
+    pub root: &'r Root<'a, P, R>,
+    pub units: &'r U,
+}
+
+impl<P, R, U> TenantStores for ChainStores<'_, '_, P, R, U>
+where
+    P: RootPorts,
+    R: FillRandom,
+    U: crate::directory::finish::TenantUnits,
+{
+    async fn finish(&self, tenant: &crate::TenantId) -> Result<bool> {
+        use crate::directory::finish::{finish_tenant, StoreStep};
+        let dir = self.root.directory();
+        let now = self.root.clock().now();
+        let run = finish_tenant(&self.root.chain(), dir.as_ref(), self.units, tenant, now).await?;
+        for page in &run.pages {
+            crate::trace::alert(|| format!("mgmt: tenant create: finisher: {page}"));
+        }
+        let head = run.head.seq;
+        let holds = |s: &StoreStep| match s {
+            StoreStep::Holds(seq) => *seq >= head,
+            StoreStep::Unbound => true,
+            StoreStep::Waiting | StoreStep::Failed => false,
+        };
+        Ok(head > 0
+            && run.head.complete
+            && holds(&run.directory)
+            && !run.units.is_empty()
+            && run.units.iter().all(|(_, s)| holds(s)))
+    }
+}
+
+// ---------------------------------------------------------------------------
 // The call
 // ---------------------------------------------------------------------------
 
 /// The stores of a tenant create.
-pub struct CreatePorts<'r, 'a, P: RootPorts, R, U, I> {
+pub struct CreatePorts<'r, 'a, P: RootPorts, R, U, I, F> {
     pub ports: &'a P,
     pub root: &'r Root<'a, P, R>,
     /// The router's root-unit calls (`provision`, and a probe of an
@@ -507,6 +567,10 @@ pub struct CreatePorts<'r, 'a, P: RootPorts, R, U, I> {
     pub unit: &'r RoutedUnit<'r, U>,
     /// The tenant chain's intents (AM-75).
     pub intents: &'r I,
+    /// Step 3: the stores brought to the head before a `live` answer.
+    pub stores: &'r F,
+    /// `MAINTENANCE`: under `restore` the call writes nothing.
+    pub maintenance: crate::config::Maintenance,
 }
 
 /// Why a step stopped the call: its answer.
@@ -556,8 +620,8 @@ pub fn call_key_hash(idempotency_key: &str) -> String {
 /// control records; it is taken for the call. `idempotency_key` is the
 /// call's (the gate requires one on every write); its hash goes into
 /// every record the call writes (AM-79).
-pub async fn create_tenant<P, R, U, I, G>(
-    ports: &CreatePorts<'_, '_, P, R, U, I>,
+pub async fn create_tenant<P, R, U, I, F, G>(
+    ports: &CreatePorts<'_, '_, P, R, U, I, F>,
     body: &[u8],
     idempotency_key: Option<&str>,
     rng: &mut G,
@@ -567,6 +631,7 @@ where
     R: FillRandom,
     U: UnitRouter,
     I: ControlIntents,
+    F: TenantStores,
     G: FillRandom,
 {
     let key_hash = idempotency_key.map(call_key_hash);
@@ -626,8 +691,8 @@ async fn ready_to_write<P: RootPorts, R: FillRandom>(
     }
 }
 
-async fn run<P, R, U, I, G>(
-    ports: &CreatePorts<'_, '_, P, R, U, I>,
+async fn run<P, R, U, I, F, G>(
+    ports: &CreatePorts<'_, '_, P, R, U, I, F>,
     body: &[u8],
     key_hash: Option<&str>,
     rng: &mut G,
@@ -637,9 +702,14 @@ where
     R: FillRandom,
     U: UnitRouter,
     I: ControlIntents,
+    F: TenantStores,
     G: FillRandom,
 {
     let (body, jurisdiction) = checked_body(body)?;
+    // Every mutation answers 503 under restore, before any read.
+    if ports.maintenance == crate::config::Maintenance::Restore {
+        return Err(unavailable());
+    }
     let root = ports.root;
     let records = root.records();
     let kek = root.kek();
@@ -695,7 +765,10 @@ where
             Lifecycle::Shredding | Lifecycle::Shredded => {
                 return Ok(Answer::code(Code::ExternalRefRetired, None))
             }
-            Lifecycle::Live => return answer(tenant.as_str(), door, 200),
+            Lifecycle::Live => {
+                stores_hold(ports.stores, &chain_tenant).await?;
+                return answer(tenant.as_str(), door, 200);
+            }
             Lifecycle::Provisioning => {}
         }
     }
@@ -725,7 +798,7 @@ where
     // 4. Tenant key version 1.
     let door = head(root, &t).await?.ok_or_else(unavailable)?;
     if door.lifecycle != Lifecycle::Provisioning {
-        return finish(root, &tenant, &t, status).await;
+        return finish(root, ports.stores, &chain_tenant, &tenant, &t, status).await;
     }
     if door.tk_version == 0 || door.rotating_to.is_some() {
         let claims = ChainClaims {
@@ -771,7 +844,7 @@ where
             Err(_) => return Err(unavailable()),
         }
     }
-    finish(root, &tenant, &t, status).await
+    finish(root, ports.stores, &chain_tenant, &tenant, &t, status).await
 }
 
 /// The tenant's head, door part only.
@@ -788,15 +861,40 @@ async fn head<P: RootPorts, R: FillRandom>(
 
 /// The head after the last step: `201` with the tenant once it is
 /// `live`; `503` while another create still holds a step.
-async fn finish<P: RootPorts, R: FillRandom>(
+/// Step 3 before a `live` answer: `503` until every store holds the head.
+async fn stores_hold<F: TenantStores>(
+    stores: &F,
+    tenant: &crate::TenantId,
+) -> std::result::Result<(), Stop> {
+    match stores.finish(tenant).await {
+        Ok(true) => Ok(()),
+        Ok(false) | Err(_) => Err(unavailable()),
+    }
+}
+
+async fn finish<P: RootPorts, R: FillRandom, F: TenantStores>(
     root: &Root<'_, P, R>,
+    stores: &F,
+    chain_tenant: &crate::TenantId,
     tenant: &crate::unit::TenantId,
     t: &Tenant,
     status: u16,
 ) -> std::result::Result<Answer, Stop> {
     let door = head(root, t).await?.ok_or_else(unavailable)?;
     match door.lifecycle {
-        Lifecycle::Live => answer(tenant.as_str(), &door, status),
+        Lifecycle::Live => {
+            stores_hold(stores, chain_tenant).await?;
+            // The head the stores hold: read again, so the answer is
+            // never older than what they were brought to.
+            let door = head(root, t).await?.ok_or_else(unavailable)?;
+            match door.lifecycle {
+                Lifecycle::Live => answer(tenant.as_str(), &door, status),
+                Lifecycle::Shredding | Lifecycle::Shredded => {
+                    Ok(Answer::code(Code::ExternalRefRetired, None))
+                }
+                Lifecycle::Provisioning => Err(unavailable()),
+            }
+        }
         Lifecycle::Shredding | Lifecycle::Shredded => {
             Ok(Answer::code(Code::ExternalRefRetired, None))
         }
@@ -822,8 +920,8 @@ fn answer(id: &str, door: &Door, status: u16) -> std::result::Result<Answer, Sto
 /// with a birth token any more: `500` with an alert when the unit says
 /// so, `503` with an alert when the router cannot tell it from an
 /// unreachable unit (an operator's case either way).
-async fn birth<P, R, U, I, G>(
-    ports: &CreatePorts<'_, '_, P, R, U, I>,
+async fn birth<P, R, U, I, F, G>(
+    ports: &CreatePorts<'_, '_, P, R, U, I, F>,
     tenant: &crate::unit::TenantId,
     t: &Tenant,
     jurisdiction: Jurisdiction,
@@ -911,17 +1009,19 @@ where
 // ---------------------------------------------------------------------------
 
 /// The plane's tenant create over `ports`, with its random source.
-pub struct TenantCreateHandler<'r, 'a, P: RootPorts, R, U, I, G> {
-    pub ports: CreatePorts<'r, 'a, P, R, U, I>,
+pub struct TenantCreateHandler<'r, 'a, P: RootPorts, R, U, I, F, G> {
+    pub ports: CreatePorts<'r, 'a, P, R, U, I, F>,
     pub rng: RefCell<Option<G>>,
 }
 
-impl<P, R, U, I, G> crate::mgmt::serve::Handlers for TenantCreateHandler<'_, '_, P, R, U, I, G>
+impl<P, R, U, I, F, G> crate::mgmt::serve::Handlers
+    for TenantCreateHandler<'_, '_, P, R, U, I, F, G>
 where
     P: RootPorts,
     R: FillRandom,
     U: UnitRouter,
     I: ControlIntents,
+    F: TenantStores,
     G: FillRandom,
 {
     fn serves(&self, call: &crate::mgmt::route::Call) -> bool {

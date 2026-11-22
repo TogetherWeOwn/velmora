@@ -806,6 +806,25 @@ where
     }
 }
 
+/// The units' side of the tenant finisher before the Worker has one: every
+/// bring-up fails, so a handler's step 3 answers `503` and the intent's
+/// message finishes the change once the adapter exists (L3's
+/// `TenantUnits`, the request path's unit client; not built yet).
+pub struct NoTenantUnits;
+
+impl crate::directory::finish::TenantUnits for NoTenantUnits {
+    async fn bring_up(
+        &self,
+        _tenant: &crate::TenantId,
+        _unit: u32,
+    ) -> Result<crate::directory::finish::UnitHolds> {
+        Err(BridgeError::NotImplemented("TenantUnits"))
+    }
+    async fn mark_born(&self, _tenant: &crate::TenantId, _unit: u32) -> Result<()> {
+        Err(BridgeError::NotImplemented("TenantUnits"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

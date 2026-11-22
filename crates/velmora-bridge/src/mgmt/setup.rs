@@ -23,10 +23,12 @@
 //!   `KEYS_B` as active and synchronous; `409 locations_differ` (a page)
 //!   for any other head. A head that does not open answers `503` with
 //!   nothing written: a page for damage, none for a KEK version this
-//!   Worker does not hold yet. A Worker that does not have both key
-//!   bucket bindings answers `503 key_buckets_unbound` and writes nothing:
-//!   the record is put once and names the bindings, so it is written only
-//!   by a deploy that has them.
+//!   Worker does not hold yet. With no head, a Worker that does not have
+//!   both key bucket bindings answers `503 key_buckets_unbound` and writes
+//!   nothing: the record is put once and names the bindings, so it is
+//!   written only by a deploy that has them. A head that is there is
+//!   answered as above whatever the deployment binds.
+//! - Under `MAINTENANCE=restore` both answer `503` and do nothing.
 //! - [`GATE_FIRST_OPEN_PATH`]: `directory::first_open::first_open`, whose
 //!   guard runs before any gate step: an open gate answers `200` with
 //!   `{"gate": "open", "ran": false}` and runs nothing (a repeat never
@@ -48,7 +50,9 @@ use velmora::rng::FillRandom;
 use crate::directory::first_open::{first_open, FirstOpenAnswer};
 use crate::directory::gate::is_open;
 use crate::ingress::{self, check_admin};
-use crate::keys::locations::{init_locations, is_kek_not_held, two_in_account, InitLocations};
+use crate::keys::locations::{
+    init_locations, is_kek_not_held, read_locations, two_in_account, InitLocations,
+};
 use crate::ports::Clock;
 use crate::root::{Root, RootPorts};
 use crate::types::{Body, BridgeError, Method, RespBody, S3Request, S3Response};
@@ -134,6 +138,14 @@ where
     if req.raw_target.contains('?') || has_body(req) {
         return fail(400, "BadRequest", "This route takes no query and no body.");
     }
+    // Every mutation answers 503 under restore.
+    if cfg.maintenance == crate::config::Maintenance::Restore {
+        return fail(
+            503,
+            "ServiceUnavailable",
+            "MAINTENANCE is restore: no changes are accepted.",
+        );
+    }
     match call {
         SetupCall::KeyLocations => key_locations(ports, root, rng).await,
         SetupCall::GateFirstOpen => gate_first_open(root).await,
@@ -146,6 +158,19 @@ where
     R: FillRandom,
     G: FillRandom,
 {
+    // A head that is there is answered for whatever this deployment binds:
+    // nothing is written for it.
+    // (Records are put once and never deleted, so `init_locations` reads
+    // the same head again and writes nothing.)
+    match read_locations(root.records(), root.kek(), 0).await {
+        Ok(Some(_)) => {
+            return key_locations_answer(init_locations(root.records(), root.kek(), rng).await)
+        }
+        // A head that does not open, or a store that did not answer:
+        // nothing is written, whatever a second read would say.
+        Err(e) => return key_locations_answer(Err(e)),
+        Ok(None) => {}
+    }
     let bound = ports.key_buckets();
     let all_bound = two_in_account()
         .locations
@@ -158,7 +183,11 @@ where
             "This deployment does not bind both key buckets; nothing was written.",
         );
     }
-    match init_locations(root.records(), root.kek(), rng).await {
+    key_locations_answer(init_locations(root.records(), root.kek(), rng).await)
+}
+
+fn key_locations_answer(result: crate::types::Result<InitLocations>) -> S3Response {
+    match result {
         Ok(InitLocations::Written) => json_response(200, &json!({ "key_locations": "written" })),
         Ok(InitLocations::Same) => json_response(200, &json!({ "key_locations": "present" })),
         Ok(InitLocations::Differ) => {

@@ -6,11 +6,13 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use velmora_bridge::entry::{names_mgmt, ENTRY_HEADER};
-use velmora_bridge::mgmt::adapters::{HeadDoor, NoBucketNames, QueueIntents, RoutedUnit};
+use velmora_bridge::mgmt::adapters::{
+    HeadDoor, NoBucketNames, NoTenantUnits, QueueIntents, RoutedUnit,
+};
 use velmora_bridge::mgmt::events::{GatedFeed, TenantEventsHandler};
 use velmora_bridge::mgmt::serve::{serve_request, Answer, Either, NotBuilt, MISCONFIGURED};
 use velmora_bridge::mgmt::tenant::TenantReadHandler;
-use velmora_bridge::mgmt::tenant_create::{CreatePorts, TenantCreateHandler};
+use velmora_bridge::mgmt::tenant_create::{ChainStores, CreatePorts, TenantCreateHandler};
 use velmora_bridge::mgmt::token::{DisabledTokens, TokenHashes};
 use velmora_bridge::root::UnitPorts;
 use velmora_bridge::S3Request;
@@ -91,12 +93,21 @@ pub async fn answer(env: &Env, bridge: &WorkerBridge, method: &str, req: S3Reque
         directory: root.directory(),
         clock: &bridge.clock,
     };
+    // Step 3 (AM-75): the tenant finisher over the units' adapter, which
+    // is not built yet, so a create answers 503 at its last step until it
+    // is (the gate and `m/kl/` stop it before any write until then too).
+    let stores = ChainStores {
+        root: &root,
+        units: &NoTenantUnits,
+    };
     let create = TenantCreateHandler {
         ports: CreatePorts {
             ports: &ports,
             root: &root,
             unit: &unit,
             intents: &intents,
+            stores: &stores,
+            maintenance: bridge.cfg.maintenance,
         },
         rng: RefCell::new(Some(velmora::rng::SystemRng)),
     };
