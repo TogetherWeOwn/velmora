@@ -488,25 +488,19 @@ pub async fn rebuild_tenants<S: RecordStore, C: ControlSeal, Q: Sql>(
     dir: &SqlDirectory<'_, Q>,
     now: UnixMs,
 ) -> Result<TenantStep> {
-    rebuild_tenants_in(chain, dir, now, RowsWritten::All).await
+    rebuild_tenants_in(chain, dir, now, RowsWritten::Any).await
 }
 
-/// Which tenants' rows a tenant step writes.
+/// Which statements a tenant step writes with.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RowsWritten {
-    /// Every tenant.
-    All,
-    /// Tenant 0's only (the first open, AM-83b item 7): a managed tenant
-    /// exists only once the gate has opened, so a first-open run that
-    /// meets one lost the race to another run's open and writes no row of
-    /// it. Its difference stays, and keeps this run from opening.
-    ZeroOnly,
-}
-
-impl RowsWritten {
-    fn writes(self, tenant: &Tenant) -> bool {
-        self == RowsWritten::All || *tenant == Tenant::Zero
-    }
+    /// Every gate run but the first open.
+    Any,
+    /// The first open (AM-83b item 7): every statement also needs the gate
+    /// row still closed at epoch 1 with `pending_ops` emptied, so a run
+    /// that lost the race to another run's open writes no tenant row,
+    /// unit, route or label after it.
+    InFirstOpen,
 }
 
 async fn rebuild_tenants_in<S: RecordStore, C: ControlSeal, Q: Sql>(
@@ -522,7 +516,7 @@ async fn rebuild_tenants_in<S: RecordStore, C: ControlSeal, Q: Sql>(
         ..TenantStep::default()
     };
     for (tenant, head) in &heads {
-        if head.is_err() || !scope.writes(tenant) {
+        if head.is_err() {
             continue;
         }
         step.chains += 1;
@@ -540,16 +534,20 @@ async fn rebuild_tenants_in<S: RecordStore, C: ControlSeal, Q: Sql>(
             Err(ChainError::Store(e)) => return Err(e),
             Err(_) => return Err(BridgeError::Invalid("tenant chain not readable now")),
         };
-        match dir.replace_tenant(&fresh, &observed, now).await? {
+        let written = match scope {
+            RowsWritten::Any => dir.replace_tenant(&fresh, &observed, now).await?,
+            RowsWritten::InFirstOpen => {
+                dir.replace_tenant_in_first_open(&fresh, &observed, now)
+                    .await?
+            }
+        };
+        match written {
             true => step.written += 1,
             false => step.raced += 1,
         }
     }
     for d in &compared.differences {
         if let Difference::Orphan(tenant) = d {
-            if !scope.writes(tenant) {
-                continue;
-            }
             let observed = dir.row_seq(tenant).await?;
             // Removed only when the chain is surely still absent; an
             // error is not "absent".
@@ -560,7 +558,13 @@ async fn rebuild_tenants_in<S: RecordStore, C: ControlSeal, Q: Sql>(
                     continue;
                 }
             }
-            match dir.remove_tenant(tenant, &observed).await? {
+            let removed = match scope {
+                RowsWritten::Any => dir.remove_tenant(tenant, &observed).await?,
+                RowsWritten::InFirstOpen => {
+                    dir.remove_tenant_in_first_open(tenant, &observed).await?
+                }
+            };
+            match removed {
                 true => step.removed += 1,
                 false => step.raced += 1,
             }
@@ -591,9 +595,10 @@ pub async fn run_gate<S: RecordStore, C: ControlSeal, Q: Sql, G: GateSteps>(
 /// (`closed_over`) unless it is still closed at epoch 1 with
 /// `pending_ops` emptied and anchor 1 is the only name under the anchor
 /// prefix. Every write a step makes after that read is conditioned in its
-/// own statement or is monotone: tenant 0's row by its row seq (and no
-/// managed tenant's row at all), key locations by their seq, the feed
-/// epoch by `>`, and the open itself only from closed at epoch 1. The run
+/// own statement or is monotone: the tenant rows, units, routes and
+/// labels on the gate row still closed at epoch 1 (and on their row seq),
+/// key locations by their seq, the feed epoch by `>`, and the open itself
+/// only from closed at epoch 1. The run
 /// never empties `pending_ops` (the move to epoch 1 did, once) and never
 /// marks the row closed, so it cannot close a gate that another run
 /// opened. An open that changed no row reports `closed_over`.
@@ -626,8 +631,8 @@ impl Fence {
 
     fn scope(self) -> RowsWritten {
         match self {
-            Fence::Anchor(_) => RowsWritten::All,
-            Fence::FirstOpen => RowsWritten::ZeroOnly,
+            Fence::Anchor(_) => RowsWritten::Any,
+            Fence::FirstOpen => RowsWritten::InFirstOpen,
         }
     }
 
@@ -727,7 +732,7 @@ async fn run_from<S: RecordStore, C: ControlSeal, Q: Sql, G: GateSteps>(
             if left.iter().any(|d| matches!(d, Difference::Damaged { .. })) {
                 break;
             }
-            if !fence.holds(chain.store, dir).await? {
+            if fence == Fence::FirstOpen && !fence.holds(chain.store, dir).await? {
                 break;
             }
             rebuild_tenants_in(chain, dir, now, scope).await?;

@@ -40,8 +40,10 @@
 //!   with `{"gate": "open", "ran": true, "epoch": 1}` when it opened, and
 //!   `503 gate_not_opened` with the steps that are not done when it did
 //!   not (a run that left the gate closed may be started again). A
-//!   compare-and-set that lost to another call, and a store that did not
-//!   answer, answer `503` with `Retry-After`. With `DIRECTORY` unbound the
+//!   compare-and-set that lost to another call answers `200` with
+//!   `{"gate": "open", "ran": false}` when the gate is then open at
+//!   epoch 1, and `503` with `Retry-After` otherwise; a store that did not
+//!   answer is `503` with `Retry-After` too. With `DIRECTORY` unbound the
 //!   gate counts as closed: `503 directory_unbound`, nothing run.
 //!
 //! Every answer carries fixed words and numbers only, never a store's

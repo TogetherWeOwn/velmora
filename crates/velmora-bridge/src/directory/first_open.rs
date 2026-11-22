@@ -53,9 +53,7 @@
 //! empties `pending_ops` after an open.
 
 use super::chain::{chain_prefix, ControlSeal, TenantChain, TENANT_CHAIN_PREFIX};
-use super::gate::{
-    anchor_key, is_open, run_first_open, GateRun, GateSteps, StepReport, GATE_ANCHOR_PREFIX,
-};
+use super::gate::{anchor_key, run_first_open, GateRun, GateSteps, StepReport, GATE_ANCHOR_PREFIX};
 use super::record::Tenant;
 use super::store::{location_status, GateRow, SqlDirectory};
 use crate::keys::locations::read_locations;
@@ -293,10 +291,14 @@ impl RowState {
     }
 }
 
-/// Whether the gate is open at epoch 1: the row, and anchor 1 as the only
-/// name under the anchor prefix ([`is_open`]).
+/// Whether the gate is open at epoch 1: one read of the row, then anchor 1
+/// as the only name under the anchor prefix (an open at a later epoch is
+/// not this).
 async fn open_at_one<S: RecordStore, Q: Sql>(store: &S, dir: &SqlDirectory<'_, Q>) -> Result<bool> {
-    Ok(RowState::of(dir.gate_row().await?) == RowState::OpenAtOne && is_open(store, dir).await?)
+    if RowState::of(dir.gate_row().await?) != RowState::OpenAtOne {
+        return Ok(false);
+    }
+    Ok(store.list(GATE_ANCHOR_PREFIX, "", 2).await? == [anchor_key(1)])
 }
 
 /// The answer after a compare-and-set that found another state.
