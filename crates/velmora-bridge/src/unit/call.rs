@@ -11,11 +11,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::birth::{BirthToken, ProvisionRefusal};
+use super::buckets::BucketRefusal;
 use super::export::{ExportMode, ExportRefusal, ExportTable};
 use super::identity::{CallKind, Refusal, Seqs};
 use super::import::{ImportBatch, ImportCount, ImportRefusal, ImportValue, MoveHead};
 use super::jobcall::JobCall;
-use super::keys::{KeptAnswer, KeyEntry, KeyRefusal};
+use super::keys::{ApplyEntry, KeptAnswer, KeyRefusal};
 use super::lift::{AckClass, FindingList, GateRefusal, GateSummary, LiftProof, ReplayId};
 use super::name::UnitName;
 use super::recount::{RecountCall, RecountRefusal};
@@ -166,12 +167,13 @@ pub enum UnitOp {
     /// isolate. Allowed without `authenticated`.
     KeyRow { access_key_id: String },
     /// The key-chain apply (AM-12): the records after `from_seq`, one
-    /// entry per record, in chain order. A Worker call: the entries are
-    /// records the Worker verified. It runs while the unit is closed too
-    /// (a restore re-applies the chain at its gate).
+    /// item per record, in chain order: a subject's entry, or a marker
+    /// for a record that changes no subject (AM-62). A Worker call: the
+    /// items are records the Worker verified. It runs while the unit is
+    /// closed too (a restore re-applies the chain at its gate).
     ApplyKeys {
         from_seq: u64,
-        entries: Vec<KeyEntry>,
+        entries: Vec<ApplyEntry>,
         /// The answers to keep for the reservations whose records these
         /// are (AM-38).
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -220,11 +222,15 @@ pub enum UnitOp {
     /// The second restore call (AM-2): refused unless the unit is closed
     /// under the token's entry long enough and still at `expect_undo`;
     /// then restores to `target` and restarts. A Worker call, run by the
-    /// object class. It never answers `ok`.
+    /// object class. It never answers `ok`. `floor_ms`: the move floor
+    /// the verified tenant head holds for this unit (`move_floors`, 0
+    /// when none; AM-67): a time target before it + 60 s is refused, as
+    /// before the unit's own `lifted_at`.
     Restore {
         token: BirthToken,
         target: RestoreTarget,
         expect_undo: Bookmark,
+        floor_ms: u64,
     },
     /// Starts the gate report of one replay, discarding any other.
     GateOpen { replay_id: ReplayId },
@@ -295,6 +301,11 @@ pub enum UnitOp {
     /// What the reservations say of the creator grant `grant_seq`; an
     /// answer of none fences it. A Worker call.
     BucketBinding { grant_seq: u64 },
+    /// Bucket delete's first step (ADR §6.2, AM-57): `bucket_not_empty`
+    /// if the bucket holds anything, otherwise it is marked closing and
+    /// every write into it answers `NoSuchBucket`. Then the `DropBucket`
+    /// record, then `sync`. A Worker call, on an open unit.
+    BucketClose { bucket_id: String },
     /// One catalogue method of the job path (W2-jobs). A `job` call:
     /// the job's numbers must equal the unit's, and it is
     /// `authenticated`.
@@ -356,6 +367,7 @@ impl UnitOp {
                 | UnitOp::BindBucket { .. }
                 | UnitOp::ReleaseBound { .. }
                 | UnitOp::BucketBinding { .. }
+                | UnitOp::BucketClose { .. }
         )
     }
 
@@ -369,6 +381,7 @@ impl UnitOp {
                 | UnitOp::BindBucket { .. }
                 | UnitOp::ReleaseBound { .. }
                 | UnitOp::BucketBinding { .. }
+                | UnitOp::BucketClose { .. }
         )
     }
 
@@ -444,6 +457,8 @@ pub enum Refused {
     Reserve(ReserveRefusal),
     /// The size guard refused a call that adds extents (ADR §2.6).
     Size(SizeRefusal),
+    /// A bucket call, or a `sync`'s bucket part, was refused (AM-57).
+    Buckets(BucketRefusal),
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

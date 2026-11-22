@@ -49,6 +49,7 @@ use base64::Engine as _;
 use serde_json::{json, Value};
 
 use super::birth::{check_token, BirthKind, BirthToken, ProvisionRefusal};
+use super::buckets;
 use super::call::{
     Closed, HoldMode, Reader, Refused, SyncHead, TenantState, UnitAnswer, UnitCall, UnitOp,
     UnitReply,
@@ -60,7 +61,7 @@ use super::import::{
     Seal,
 };
 use super::jobcall::JobCall;
-use super::keys::{self, Applied, KeptAnswer, KeyEntry};
+use super::keys::{self, Applied, ApplyEntry, KeptAnswer};
 use super::lift::{self, GateRefusal};
 use super::name::UnitName;
 use super::recount::{self, RecountCall};
@@ -654,6 +655,9 @@ impl<S: UnitSql> Unit<S> {
                         "t0_seq": record.map(|m| m.t0_seq),
                         "since_seq": record.map(|m| m.since_seq),
                         "move_lifted": record.map(|m| m.move_lifted),
+                        // AM-67: the floor the tenant chain keeps is raised
+                        // from it (null until a `move` report lifted).
+                        "lifted_at": import::move_lifted_at(self.sql())?,
                         "schema_tables": schema::tables(self.sql())?,
                     }))
                 });
@@ -934,7 +938,8 @@ impl<S: UnitSql> Unit<S> {
             | UnitOp::Release { .. }
             | UnitOp::BindBucket { .. }
             | UnitOp::ReleaseBound { .. }
-            | UnitOp::BucketBinding { .. } => {
+            | UnitOp::BucketBinding { .. }
+            | UnitOp::BucketClose { .. } => {
                 Err(BridgeError::Invalid("worker call routed as an operation"))
             }
         }
@@ -1003,7 +1008,11 @@ impl<S: UnitSql> Unit<S> {
                 token,
                 target,
                 expect_undo,
-            } => (token.record_seq, Some((token, target, expect_undo))),
+                floor_ms,
+            } => (
+                token.record_seq,
+                Some((token, target, expect_undo, *floor_ms)),
+            ),
             _ => return Ok(PitrStep::Answer(self.handle(call, now))),
         };
         if call.name != self.own {
@@ -1031,7 +1040,7 @@ impl<S: UnitSql> Unit<S> {
         }
         let head = self.head()?;
         let no = |r: RestoreRefusal| Ok(PitrStep::Answer(refused(Refused::Restore(r), false)));
-        if let Some((token, _, expect_undo)) = restore {
+        if let Some((token, _, expect_undo, floor_ms)) = restore {
             // The token is a restore certificate for this unit and this
             // entry; the Worker verified its seal.
             let ours = token.kind == BirthKind::Restore
@@ -1048,8 +1057,11 @@ impl<S: UnitSql> Unit<S> {
             if expect_undo.0.is_empty() || expect_undo.0.len() > restore::MAX_BOOKMARK {
                 return no(RestoreRefusal::Malformed);
             }
+            if i64::try_from(floor_ms).is_err() {
+                return no(RestoreRefusal::Malformed);
+            }
         }
-        if let Some((_, restore::RestoreTarget::Bookmark { bookmark }, _)) = &restore {
+        if let Some((_, restore::RestoreTarget::Bookmark { bookmark }, _, _)) = &restore {
             if bookmark.0.is_empty() || bookmark.0.len() > restore::MAX_BOOKMARK {
                 return no(RestoreRefusal::Malformed);
             }
@@ -1060,19 +1072,26 @@ impl<S: UnitSql> Unit<S> {
         if import::unlifted_import(self.sql())? {
             return no(RestoreRefusal::MoveNotLifted);
         }
-        // Open (design question, 4c review): between the close by a
-        // move's entry and its first batch there is no move record, and
-        // the unit cannot tell that entry from a restore's, so an undo
-        // bookmark can still be taken in that span.
+        // Between the close by a move's entry and its first batch there
+        // is no move record, and the unit cannot tell that entry from a
+        // restore's, so an undo bookmark can still be taken in that span.
+        // A later time restore into the seal-to-lift span is refused by
+        // the floor the tenant chain keeps (AM-67), which no unit restore
+        // takes back.
         let born_at = self.born_at()?;
-        if let Some((_, restore::RestoreTarget::Time { at_ms }, _)) = &restore {
+        if let Some((_, restore::RestoreTarget::Time { at_ms }, _, floor_ms)) = &restore {
             // Never back into the owner move's window: a time before the
-            // move's lift would bring back its unused seal. The lift's
-            // time is the call's clock, a little before its commit: a
-            // margin covers it.
-            if import::move_lifted_at(self.sql())?
-                .is_some_and(|lifted| *at_ms < lifted.saturating_add(restore::LIFT_SLACK_MS))
-            {
+            // move's lift would bring back its unused seal. The floor is
+            // the later of the unit's own `lifted_at` and the one the
+            // verified head names (AM-67); the lift's time is the call's
+            // clock, a little before its commit: a margin covers it.
+            let own = import::move_lifted_at(self.sql())?;
+            let named = i64::try_from(*floor_ms).ok().filter(|f| *f > 0);
+            let floor = match (own, named) {
+                (Some(a), Some(b)) => Some(a.max(b)),
+                (a, b) => a.or(b),
+            };
+            if floor.is_some_and(|f| *at_ms < f.saturating_add(restore::LIFT_SLACK_MS)) {
                 return no(RestoreRefusal::BeforeMoveLift);
             }
             // Never back before this incarnation's birth (AM-46), with the
@@ -1089,7 +1108,7 @@ impl<S: UnitSql> Unit<S> {
         }
         Ok(match restore {
             None => PitrStep::Prepare { seqs: head.seqs },
-            Some((_, target, expect_undo)) => PitrStep::Restore {
+            Some((_, target, expect_undo, _)) => PitrStep::Restore {
                 target: target.clone(),
                 expect_undo: expect_undo.clone(),
             },
@@ -1115,7 +1134,7 @@ impl<S: UnitSql> Unit<S> {
         &self,
         head: &Head,
         from_seq: u64,
-        entries: &[KeyEntry],
+        entries: &[ApplyEntry],
         answers: &[KeptAnswer],
         now: UnixMs,
     ) -> Result<UnitAnswer> {
@@ -1327,6 +1346,22 @@ impl<S: UnitSql> Unit<S> {
             seqs: head.seqs,
             body,
         };
+        if let UnitOp::BucketClose { bucket_id } = &call.op {
+            // A write: an active tenant only (a hold or a deletion refuses
+            // it, as any opening write).
+            if !allows(head, false) {
+                return Ok(refused(Refused::AccountProblem, false));
+            }
+            let mut op = || {
+                Ok(buckets::close(sql, bucket_id, now)?
+                    .map(|newly| json!({ "closing": true, "newly": newly }))
+                    .map_err(Refused::Buckets))
+            };
+            return Ok(match transact(sql, true, &mut op)? {
+                Ok(body) => ok(body),
+                Err(reason) => refused(reason, false),
+            });
+        }
         if let UnitOp::ResolveActing { acting } = &call.op {
             // Read-only: run as an unauthenticated transaction, so a write
             // in it is refused and rolled back.

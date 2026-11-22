@@ -3,7 +3,12 @@
 //!
 //! The Worker reads and verifies the tenant's key chain `m/k/<t>/` and
 //! sends it on in [`UnitOp::ApplyKeys`](super::call::UnitOp): one
-//! [`KeyEntry`] per record, in chain order, after a base `from_seq`.
+//! [`ApplyEntry`] per record, in chain order, after a base `from_seq`.
+//! Each is a [`KeyEntry`], the record's subject as the head holds it,
+//! stamped at the record's seq; or, for a record that changes no subject
+//! (`KeysFrozen`, `KeysThawed`, AM-28), a [`KeyMarker`]: the unit counts
+//! it in the gap rule, writes no row for it, counts it as skipped and
+//! moves `keys_seq` past it (AM-62).
 //!
 //! - `from_seq` is the **exclusive base**. The entries run without a gap
 //!   from `from_seq + 1`; a gap is refused ([`KeyRefusal::Gap`]).
@@ -180,11 +185,12 @@ impl KeyGrant {
 }
 
 /// One subject as of one record of the key chain: the Worker's
-/// `keys::record::Entry`, as it crosses `fetch`. `held`: the store must
-/// hold it closed (its private part did not open, or the directory has
-/// not acknowledged its opening record); a held entry may come without
-/// its secret and its private grant parts. `Debug` shows no secret,
-/// owner, prefix or address.
+/// `keys::record::Entry`, as it crosses `fetch`. It states the subject
+/// as the head holds it, stamped at that record's seq (AM-62). `held`:
+/// the store must hold it closed (its private part did not open, or the
+/// directory has not acknowledged its opening record); a held entry may
+/// come without its secret and its private grant parts. `Debug` shows no
+/// secret, owner, prefix or address.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct KeyEntry {
@@ -210,6 +216,77 @@ pub struct KeyEntry {
     /// the apply turns that reservation `applied`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rid: Option<Rid>,
+}
+
+/// A key-chain record that changes no subject (AM-28, AM-62): on the
+/// wire `{"marker": "keys_frozen" | "keys_thawed", "seq": n}`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KeyMarker {
+    pub marker: MarkerKind,
+    /// The seq of the record this marker stands for.
+    pub seq: u64,
+}
+
+/// The record a [`KeyMarker`] stands for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MarkerKind {
+    KeysFrozen,
+    KeysThawed,
+}
+
+/// One item of `ApplyKeys`, one per key-chain record (AM-62): a
+/// subject's [`KeyEntry`], or a [`KeyMarker`] for a record that changes
+/// no subject. On the wire either object as it is (no tag): a marker has
+/// exactly `marker` and `seq`, an entry its own fields, and each refuses
+/// the other's.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ApplyEntry {
+    Marker(KeyMarker),
+    Key(KeyEntry),
+}
+
+impl ApplyEntry {
+    /// The seq of the record this item is.
+    pub fn seq(&self) -> u64 {
+        match self {
+            ApplyEntry::Marker(m) => m.seq,
+            ApplyEntry::Key(e) => e.last_seq,
+        }
+    }
+
+    /// The subject's entry, if this item is one.
+    pub fn key(&self) -> Option<&KeyEntry> {
+        match self {
+            ApplyEntry::Marker(_) => None,
+            ApplyEntry::Key(e) => Some(e),
+        }
+    }
+}
+
+impl From<KeyEntry> for ApplyEntry {
+    fn from(e: KeyEntry) -> Self {
+        ApplyEntry::Key(e)
+    }
+}
+
+impl From<KeyMarker> for ApplyEntry {
+    fn from(m: KeyMarker) -> Self {
+        ApplyEntry::Marker(m)
+    }
+}
+
+/// Shows what [`KeyEntry`]'s `Debug` shows: no secret, owner, prefix or
+/// address.
+impl fmt::Debug for ApplyEntry {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ApplyEntry::Marker(m) => m.fmt(f),
+            ApplyEntry::Key(e) => e.fmt(f),
+        }
+    }
 }
 
 /// The answer to keep for a reservation whose record an apply holds
@@ -283,17 +360,21 @@ pub enum Applied {
 /// chain have no principal.
 pub fn check_entries(
     from_seq: u64,
-    entries: &[KeyEntry],
+    entries: &[ApplyEntry],
     tenant_zero: bool,
 ) -> std::result::Result<(), KeyRefusal> {
     if entries.len() > MAX_ENTRIES {
         return Err(KeyRefusal::Malformed);
     }
-    for (i, e) in entries.iter().enumerate() {
+    for (i, item) in entries.iter().enumerate() {
         let want = from_seq.checked_add(1 + i as u64).ok_or(KeyRefusal::Gap)?;
-        if e.last_seq != want {
+        if item.seq() != want {
             return Err(KeyRefusal::Gap);
         }
+        // A marker is its seq and nothing else.
+        let Some(e) = item.key() else {
+            continue;
+        };
         if e.id.is_empty() || e.id.len() > 128 || e.grants.len() > MAX_GRANTS {
             return Err(KeyRefusal::Malformed);
         }
@@ -352,15 +433,16 @@ struct Row {
 /// whether this call wrote it or found it), and `answers` are kept for
 /// the reservations that are applied and have none yet. A principal
 /// whose record closes or narrows it (any status but `active`, a grant
-/// it held that no grant of the record covers, or a held record, which
-/// may lack its private grant parts) has its other open reservations
-/// that are not bound to a creator grant cancelled, and their cap slots
-/// given back.
+/// it held on a bucket the unit holds that no grant of the record
+/// covers, or a held record, which may lack its private grant parts) has
+/// its other open reservations that are not bound to a creator grant
+/// cancelled, and their cap slots given back. A dropped grant on a
+/// bucket id the unit holds no row for narrows nothing (AM-61).
 pub fn apply<S: Sql>(
     sql: &S,
     keys_seq: u64,
     from_seq: u64,
-    entries: &[KeyEntry],
+    entries: &[ApplyEntry],
     tenant_zero: bool,
     answers: &[KeptAnswer],
     now: UnixMs,
@@ -373,7 +455,12 @@ pub fn apply<S: Sql>(
     }
     let mut touched = BTreeSet::new();
     let (mut applied, mut skipped, mut reserved) = (0, 0, 0);
-    for e in entries {
+    for item in entries {
+        // A marker writes no row (AM-62): skipped, its seq counted.
+        let Some(e) = item.key() else {
+            skipped += 1;
+            continue;
+        };
         let row = stored(sql, &e.id)?;
         // What a principal held before this record: a record that closes
         // or narrows it cancels its open reservations (§2.5).
@@ -381,13 +468,19 @@ pub fn apply<S: Sql>(
             if let Some(r) = &row {
                 let before = grants_of(sql, &e.id)?;
                 // A held record may come without its private grant parts:
-                // it never counts as keeping a limited grant.
-                let kept = !e.held
+                // it never counts as keeping a limited grant. A grant
+                // dropped on a bucket id the unit holds no bucket row for
+                // opened nothing, so dropping it narrows nothing (AM-61).
+                let mut kept = !e.held
                     && e.status == SubjectStatus::Active
-                    && r.status == SubjectStatus::Active
-                    && before
-                        .iter()
-                        .all(|old| e.grants.iter().any(|new| new.covers(old)));
+                    && r.status == SubjectStatus::Active;
+                for old in &before {
+                    if !kept {
+                        break;
+                    }
+                    kept = e.grants.iter().any(|new| new.covers(old))
+                        || !bucket_exists(sql, &old.bucket_id)?;
+                }
                 if !kept && (e.last_seq > r.last_seq || e.status == SubjectStatus::Revoked) {
                     reserve::cancel_open(sql, &e.id, e.rid.as_ref())?;
                 }
@@ -439,6 +532,15 @@ pub fn apply<S: Sql>(
         reserved,
         kept,
     })
+}
+
+/// Whether the unit holds a bucket row with this id.
+pub(crate) fn bucket_exists<S: Sql>(sql: &S, bucket_id: &str) -> Result<bool> {
+    Ok(!poll_once(sql.query(
+        "SELECT 1 FROM buckets WHERE id = ?1",
+        &[SqlValue::Text(bucket_id.to_string())],
+    ))??
+    .is_empty())
 }
 
 /// The subjects the unit holds closed and not revoked: they are sent

@@ -401,10 +401,11 @@ pub fn export<S: Sql>(
 /// order: what V6 hashes on the chain side with [`hash_rows`], against
 /// `export` in `hash` mode on the unit. Each subject's row is its last
 /// entry, and a subject once revoked stays revoked, as `keys::apply`
-/// writes them.
+/// writes them. A marker item (AM-62) holds no subject: pass the
+/// subjects' entries only (`items.iter().filter_map(ApplyEntry::key)`).
 #[allow(clippy::type_complexity)]
-pub fn chain_key_rows(
-    entries: &[KeyEntry],
+pub fn chain_key_rows<'a>(
+    entries: impl IntoIterator<Item = &'a KeyEntry>,
 ) -> Result<(Vec<Vec<ImportValue>>, Vec<Vec<ImportValue>>)> {
     let mut last: BTreeMap<&str, (&KeyEntry, bool)> = BTreeMap::new();
     for e in entries {
