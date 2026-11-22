@@ -33,7 +33,9 @@ if os.fstat(0).st_rdev != os.stat("/dev/null").st_rdev or os.read(0, 1) != b"":
     sys.exit("stub stdin was not /dev/null")
 
 def download(source, dest):
-    if source.name.endswith(".manifest.json") and os.environ.get("FAKE_FAIL_GET"):
+    fail_get = os.environ.get("FAKE_FAIL_GET")
+    if source.name.endswith(".manifest.json") and (
+            fail_get == "yes" or (fail_get == "readback" and source.exists())):
         for line in range(25):
             print(f"stub manifest error line {line:02d}", file=sys.stderr)
         sys.exit(1)
@@ -46,6 +48,8 @@ def download(source, dest):
 
 if Path(sys.argv[0]).name == "rclone":
     if args[0] == "lsf":
+        if os.environ.get("FAKE_FAIL_LISTING"):
+            sys.exit(os.environ["FAKE_FAIL_LISTING"])
         obj = bucket / args[1].removeprefix("r2x:")
         if obj.exists():
             print(obj.name)
@@ -254,12 +258,41 @@ class CatalogueScripts(unittest.TestCase):
         self.assertTrue(list(self.bucket.rglob("*.part-*")))
 
     def test_manifest_readback_failure(self):
-        self.env["FAKE_FAIL_GET"] = "yes"
+        self.env["FAKE_FAIL_GET"] = "readback"
         result = self.run_script("export")
         key = f"d1/{SOURCE}/{MS}.manifest.json"
         self.assert_refused(result, f"the manifest read back from {BUCKET}/{key} differs")
         self.assertEqual(result.stdout, "")
         self.assertTrue(self.object_path(key).is_file())
+
+    def test_manifest_lookup_failure_stops_export_before_upload(self):
+        for offset, (error, remote) in enumerate([
+            ("Authentication error [code: 10000]", False),
+            ("Connection timed out", False),
+            ("rclone: connection timed out", True),
+        ]):
+            with self.subTest(error=error):
+                ms = str(int(MS) + offset)
+                key = f"d1/{SOURCE}/{ms}.manifest.json"
+                self.env["FAKE_DATE"] = ms
+                if remote:
+                    self.env["VELMORA_EXPORT_RCLONE_REMOTE"] = "r2x"
+                    self.env["FAKE_FAIL_LISTING"] = error
+                else:
+                    self.env["FAKE_MISSING"] = error
+                before = len(self.calls())
+                result = self.run_script("export")
+                message = f"catalog-export: could not check {BUCKET}/{key}, see "
+                self.assert_refused(result, message)
+                self.assertEqual(len(self.calls()) - before, 1)
+                self.assertEqual(list(self.bucket.rglob("*")), [])
+                log = Path(result.stderr.strip().removeprefix(message))
+                self.assertEqual(log.read_text().strip(), error)
+                self.assertEqual(log.stat().st_mode & 0o777, 0o600)
+
+    def test_no_such_key_allows_export(self):
+        self.env["FAKE_MISSING"] = "NoSuchKey"
+        self.check_export()
 
     def test_export_refuses_existing_manifest(self):
         key = f"d1/{SOURCE}/{MS}.manifest.json"

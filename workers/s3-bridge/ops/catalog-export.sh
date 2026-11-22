@@ -48,7 +48,7 @@ else
 fi
 
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/velmora-export.XXXXXX")
-trap 'rm -rf "$WORK"' EXIT
+trap 'rm -r -- "$WORK"' EXIT
 
 if ! since_ms=$(date +%s%3N) || [[ ! $since_ms =~ ^[0-9]+$ ]]; then
   since_ms=$(($(date +%s) * 1000))
@@ -62,22 +62,32 @@ get() {
   if [[ -n $remote ]]; then
     # --ignore-times: parts of one size can share a modification time,
     # and rclone would skip a download onto the previous part's file.
-    rm -f "$out"
+    if [[ -e $out ]]; then rm -- "$out" || return 1; fi
     rclone copyto "$remote:$BUCKET/$key" "$out" --ignore-times </dev/null
   else
     npx wrangler r2 object get "$BUCKET/$key" --file "$out" --remote "$@" </dev/null
   fi >"$WORK/get.log" 2>&1
 }
 
+manifest_check_failed() {
+  local log
+  # Keep just the private lookup log after the work directory is removed.
+  log=$(mktemp "${TMPDIR:-/tmp}/velmora-catalog-get.XXXXXX")
+  mv -- "$WORK/get.log" "$log"
+  echo "catalog-export: could not check $BUCKET/$manifest, see $log" >&2
+  exit 1
+}
+
 if [[ -n $remote ]]; then
-  listing=$(rclone lsf "$remote:$BUCKET/$manifest" </dev/null) || {
-    echo "catalog-export: could not check $BUCKET/$manifest" >&2
-    exit 1
-  }
+  listing=$(rclone lsf "$remote:$BUCKET/$manifest" </dev/null 2>"$WORK/get.log") ||
+    manifest_check_failed
 elif get "$manifest" "$WORK/existing.json" "$@"; then
   listing=$manifest
-else
+# Match the missing-key test in catalog-import.sh's get_restore_object.
+elif grep -qiE 'The specified key does not exist|NoSuchKey|not found' "$WORK/get.log"; then
   listing=
+else
+  manifest_check_failed
 fi
 if [[ -n $listing ]]; then
   echo "catalog-export: an export at restore point $since_ms exists already" >&2

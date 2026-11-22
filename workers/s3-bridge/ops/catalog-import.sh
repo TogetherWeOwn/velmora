@@ -41,7 +41,7 @@ for tool in zstd jq sha256sum; do
 done
 
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/velmora-import.XXXXXX")
-trap 'rm -rf "$WORK"' EXIT
+trap 'rm -r -- "$WORK"' EXIT
 
 get() {
   local key=$1 out=$2
@@ -49,7 +49,7 @@ get() {
   if [[ -n $remote ]]; then
     # --ignore-times: parts of one size can share a modification time,
     # and rclone would skip a download onto the previous part's file.
-    rm -f "$out"
+    if [[ -e $out ]]; then rm -- "$out" || return 1; fi
     rclone copyto "$remote:$BUCKET/$key" "$out" --ignore-times </dev/null
   else
     npx wrangler r2 object get "$BUCKET/$key" --file "$out" --remote "$@" </dev/null
