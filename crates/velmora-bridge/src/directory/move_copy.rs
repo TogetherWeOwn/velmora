@@ -80,7 +80,9 @@ pub enum CopyError {
     LiveLease,
     /// The unit refused `ImportSeal`; the import stays open.
     SealRefused(ImportRefusal),
-    /// The unit is sealed for another window's ordinal or other counts.
+    /// The unit is sealed for another window (another ordinal, another
+    /// first entry, or one it does not name) or other counts: a seal left
+    /// by a given-up window, or not this copy's.
     SealedOther,
     /// A batch was refused because the import is sealed: step 3 is done
     /// (the next run reads the seal and sends nothing).
@@ -133,6 +135,10 @@ pub trait UnitImport {
 pub struct SealState {
     pub move_ordinal: u64,
     pub tables: Vec<ImportCount>,
+    /// The `since_seq` the import bound (`unit_import_move.since_seq`):
+    /// the entry the window set at step 2. `None`: the unit did not say,
+    /// and the seal cannot be told apart from a given-up window's.
+    pub since: Option<u64>,
 }
 
 /// The unit's answer to `ImportSeal`.
@@ -162,6 +168,10 @@ pub struct CopyPlan {
     pub excluded: BTreeSet<String>,
     /// Rows per page: 1 to [`PAGE`] (larger is taken as [`PAGE`]).
     pub page: usize,
+    /// The `since_seq` of the entry the window set at step 2, which the
+    /// import binds; `None`: the `since` the copy is called with (no
+    /// re-entry since).
+    pub window_since: Option<u64>,
 }
 
 impl Default for CopyPlan {
@@ -169,6 +179,7 @@ impl Default for CopyPlan {
         CopyPlan {
             excluded: BTreeSet::new(),
             page: PAGE,
+            window_since: None,
         }
     }
 }
@@ -247,6 +258,7 @@ pub async fn seal<U: UnitImport>(
     unit: &U,
     head: &MoveHead,
     since: u64,
+    window_since: u64,
     copied: &[TableCopy],
 ) -> Result<(), CopyError> {
     let ordinal = head.flips.checked_add(1).ok_or(CopyError::Incomplete)?;
@@ -264,9 +276,12 @@ pub async fn seal<U: UnitImport>(
     if copied.len() != tables.len() {
         return Err(CopyError::Incomplete);
     }
+    // This window's seal: its ordinal, its first entry, these counts.
     let found = |state: Option<SealState>| match state {
         None => None,
-        Some(s) => Some(s.move_ordinal == ordinal && same(&s.tables, &tables)),
+        Some(s) => Some(
+            s.move_ordinal == ordinal && s.since == Some(window_since) && same(&s.tables, &tables),
+        ),
     };
     match found(unit.seal_state().await?) {
         Some(true) => return Ok(()),
@@ -325,8 +340,14 @@ pub async fn copy_all<S: Sql, U: UnitImport, T: RowTransform>(
     now: UnixMs,
 ) -> Result<Vec<TableCopy>, CopyError> {
     // A sealed import takes no batch (`import: sealed`): step 3 is done,
-    // and each table's count is the seal's.
+    // and each table's count is the seal's, when the seal is this
+    // window's (its ordinal and first entry). A seal left by a given-up
+    // window stops the copy: the unit must be emptied first.
     if let Some(state) = unit.seal_state().await? {
+        let first = plan.window_since.unwrap_or(since);
+        if Some(state.move_ordinal) != head.flips.checked_add(1) || state.since != Some(first) {
+            return Err(CopyError::SealedOther);
+        }
         return Ok(ImportTable::ALL
             .iter()
             .map(|t| TableCopy {

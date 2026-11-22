@@ -360,9 +360,23 @@ impl UnitImport for Adapter<'_> {
                 rows: t["rows"].as_u64().unwrap(),
             })
             .collect();
+        // The first entry the import bound (L1 is asked to answer it in
+        // `ImportProgress`; read from the unit's table until then).
+        let since = ready(
+            self.unit
+                .sql()
+                .query("SELECT since_seq FROM unit_import_move WHERE id = 1", &[]),
+        )
+        .unwrap()
+        .first()
+        .and_then(|r| match r.first() {
+            Some(SqlValue::Int(n)) => Some(*n as u64),
+            _ => None,
+        });
         Ok(Some(SealState {
             move_ordinal: ordinal,
             tables,
+            since,
         }))
     }
 }
@@ -634,6 +648,7 @@ fn plan(canary: &Bucket, page: usize) -> CopyPlan {
     CopyPlan {
         excluded: BTreeSet::from([canary.id.as_str().to_string()]),
         page,
+        window_since: None,
     }
 }
 
@@ -724,7 +739,7 @@ fn every_table_arrives_row_for_row_without_the_canary() {
         let ordinal = move_ordinal(&zero.door).expect("moving");
         assert_eq!(ordinal, head.flips + 1);
         adapter.lose_seal.set(1);
-        seal(&adapter, &head, since, &again)
+        seal(&adapter, &head, since, since, &again)
             .await
             .map_err(|e| format!("{e:?}"))
             .unwrap();
@@ -755,7 +770,7 @@ fn every_table_arrives_row_for_row_without_the_canary() {
         .unwrap();
         assert_eq!(adapter.imports.get(), n);
         let seals = adapter.seals.get();
-        seal(&adapter, &head, since, &resumed).await.unwrap();
+        seal(&adapter, &head, since, since, &resumed).await.unwrap();
         assert_eq!(adapter.seals.get(), seals);
         // And a batch sent anyway is refused as sealed.
         let mut b = velmora_bridge::unit::import::ImportBatch {
@@ -805,17 +820,17 @@ fn the_seal_names_every_table_with_the_units_count() {
         .unwrap();
         // A run that did not reach every table cannot seal.
         let short: Vec<TableCopy> = done[..done.len() - 1].to_vec();
-        let r = seal(&adapter, &head, since, &short).await;
+        let r = seal(&adapter, &head, since, since, &short).await;
         assert!(matches!(r, Err(CopyError::Incomplete)), "{r:?}");
         let mut twice = done.clone();
         twice.push(done[0].clone());
-        let r = seal(&adapter, &head, since, &twice).await;
+        let r = seal(&adapter, &head, since, since, &twice).await;
         assert!(matches!(r, Err(CopyError::Incomplete)), "{r:?}");
         assert_eq!(adapter.seals.get(), 0);
         // A count the unit does not hold: refused, the import stays open.
         let mut off = done.clone();
         off[2].unit_rows += 1;
-        let r = seal(&adapter, &head, since, &off).await;
+        let r = seal(&adapter, &head, since, since, &off).await;
         assert!(
             matches!(r, Err(CopyError::SealRefused(ImportRefusal::CountMismatch))),
             "{r:?}"
@@ -824,22 +839,55 @@ fn the_seal_names_every_table_with_the_units_count() {
         // Lost answers are sent again, up to the tries: the first try
         // landed, and the next ones are repeats under the same entry.
         adapter.lose_seal.set(3);
-        let r = seal(&adapter, &head, since, &done).await;
+        let r = seal(&adapter, &head, since, since, &done).await;
         assert!(matches!(r, Err(CopyError::Store(_))), "{r:?}");
         assert_eq!(adapter.seals.get(), 4);
-        seal(&adapter, &head, since, &done).await.unwrap();
+        seal(&adapter, &head, since, since, &done).await.unwrap();
         // A repeat under a later restoring entry (AM-15's re-entry, which
         // the seal survives) is found done without a call (the unit would
         // page on it).
         let before = adapter.seals.get();
-        seal(&adapter, &head, since + 1, &done).await.unwrap();
+        seal(&adapter, &head, since + 1, since, &done)
+            .await
+            .unwrap();
         assert_eq!(adapter.seals.get(), before);
+        // A seal left by a given-up window: the next window's copy (a new
+        // first entry) stops, and its seal is not found done.
+        let next_window = since + 5;
+        let r = copy_all(
+            &rig.bridge.catalog.sql,
+            &adapter,
+            &Stub { rehomed: None },
+            &plan(&canary, 7),
+            &head,
+            next_window,
+            rig.now(),
+        )
+        .await;
+        assert!(matches!(r, Err(CopyError::SealedOther)), "{r:?}");
+        let r = seal(&adapter, &head, next_window, next_window, &done).await;
+        assert!(matches!(r, Err(CopyError::SealedOther)), "{r:?}");
+        // After a re-entry of the same window the first entry still names
+        // it: found done.
+        let mut reentered = plan(&canary, 7);
+        reentered.window_since = Some(since);
+        copy_all(
+            &rig.bridge.catalog.sql,
+            &adapter,
+            &Stub { rehomed: None },
+            &reentered,
+            &head,
+            next_window,
+            rig.now(),
+        )
+        .await
+        .unwrap();
         // Sealed under another ordinal, or other counts: not this one.
         let mut later = head.clone();
         later.flips += 1;
-        let r = seal(&adapter, &later, since, &done).await;
+        let r = seal(&adapter, &later, since, since, &done).await;
         assert!(matches!(r, Err(CopyError::SealedOther)), "{r:?}");
-        let r = seal(&adapter, &head, since, &off).await;
+        let r = seal(&adapter, &head, since, since, &off).await;
         assert!(matches!(r, Err(CopyError::SealedOther)), "{r:?}");
         // The ordinal is only a moving head's.
         let mut d1 = zero.clone();
@@ -1322,7 +1370,7 @@ fn the_move_report_lifts_the_real_unit_only_after_the_seal() {
             matches!(r, Err(FlipError::Report(GateRefusal::ImportNotSealed))),
             "{r:?}"
         );
-        seal(&adapter, &head, since, &done).await.unwrap();
+        seal(&adapter, &head, since, since, &done).await.unwrap();
         // After it: the report for (S, the stamp counter, a nonce), and a
         // proof the unit's own lift check gives.
         let proof = move_lift_proof(&calls, &zero.door, since)
@@ -1353,5 +1401,84 @@ fn the_move_report_lifts_the_real_unit_only_after_the_seal() {
             },
         );
         assert!(matches!(lifted, UnitAnswer::Ok { .. }), "{lifted:?}");
+    });
+}
+
+#[test]
+fn a_re_entry_reports_under_its_own_entry_and_a_lifted_unit_takes_no_report() {
+    use velmora_bridge::directory::move_flip::{move_lift_proof, FlipError};
+    block_on(async {
+        let rig = rig();
+        let (_, canary) = catalogue(&rig).await;
+        let (zero, owner) = heads();
+        let (head, since) = bound(&zero.door, &owner.door).unwrap();
+        let u = unit(since);
+        let adapter = Adapter::new(&u, since);
+        let done = copy_all(
+            &rig.bridge.catalog.sql,
+            &adapter,
+            &Stub { rehomed: None },
+            &plan(&canary, 500),
+            &head,
+            since,
+            rig.now(),
+        )
+        .await
+        .unwrap();
+        seal(&adapter, &head, since, since, &done).await.unwrap();
+        // AM-15's re-entry: a new entry S' after a refused lift; the unit
+        // is synced closed under it.
+        let s2 = since + 2;
+        sync(&u, s2, Some(s2));
+        let calls = LiftCalls {
+            unit: &u,
+            state_seq: s2,
+            nonces: Cell::new(0),
+        };
+        let proof = move_lift_proof(&calls, &zero.door, s2)
+            .await
+            .map_err(|e| format!("{e:?}"))
+            .unwrap();
+        assert_eq!(proof.replay_id.since, s2);
+        // The seal survived the re-entry: a resumed copy is found done.
+        let mut reentered = plan(&canary, 500);
+        reentered.window_since = Some(since);
+        copy_all(
+            &rig.bridge.catalog.sql,
+            &adapter,
+            &Stub { rehomed: None },
+            &reentered,
+            &head,
+            s2,
+            rig.now(),
+        )
+        .await
+        .unwrap();
+        let lifted = worker(
+            &u,
+            None,
+            UnitOp::Sync {
+                head: SyncHead {
+                    seqs: Seqs {
+                        state_seq: s2 + 1,
+                        keys_seq: 0,
+                    },
+                    tenant_state: TenantState::Active,
+                    tenant_mode: None,
+                    restoring_since: None,
+                    lift: Some(proof),
+                },
+            },
+        );
+        assert!(matches!(lifted, UnitAnswer::Ok { .. }), "{lifted:?}");
+        assert_eq!(u.head().unwrap().restoring_since, None);
+        // A lifted unit takes no second move report.
+        let calls = LiftCalls {
+            unit: &u,
+            state_seq: s2 + 1,
+            nonces: Cell::new(10),
+        };
+        let r = move_lift_proof(&calls, &zero.door, s2).await;
+        assert!(matches!(r, Err(FlipError::Report(_))), "{r:?}");
     });
 }

@@ -272,6 +272,9 @@ pub const MAX_WINDOW_RECORDS: u64 = 256;
 /// refused `sync`.
 pub const MAX_REENTRIES: u32 = 3;
 
+/// How often a failed V9 tries tenant 0's `d1` record.
+pub const V9_GIVE_UP_TRIES: u32 = 3;
+
 /// How many `move` reports (b) opens before it stops.
 pub const REPORT_TRIES: u32 = 2;
 
@@ -442,17 +445,32 @@ where
     if !routes_started && !unit.v9().await? {
         // Every error from here keeps the V9 answer: a re-run finds the
         // window given up and cannot report the failing check again.
+        // The `d1` record is tried a few times: until it lands, a re-run
+        // would sample V9 again.
         let gave_up = async {
-            let written = chain
-                .write(
-                    &Tenant::Zero,
-                    &Change::GiveUpMove,
-                    Actor::MoveTool,
-                    now,
-                    zero.seq,
-                )
-                .await?;
-            dir.apply_tenant(&door_of(written), now).await?;
+            let mut last = None;
+            for _ in 0..V9_GIVE_UP_TRIES {
+                match chain
+                    .write(
+                        &Tenant::Zero,
+                        &Change::GiveUpMove,
+                        Actor::MoveTool,
+                        now,
+                        zero.seq,
+                    )
+                    .await
+                {
+                    Ok(written) => {
+                        last = None;
+                        dir.apply_tenant(&door_of(written), now).await?;
+                        break;
+                    }
+                    Err(e) => last = Some(e),
+                }
+            }
+            if let Some(e) = last {
+                return Err(FlipError::Chain(e));
+            }
             give_up(chain, frozen, safety, dir, unit, routes, keys, window, now).await
         };
         return match gave_up.await {
