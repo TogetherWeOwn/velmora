@@ -21,7 +21,8 @@ use velmora_bridge::unit::import::{
 };
 use velmora_bridge::unit::jobcall::JobCall;
 use velmora_bridge::unit::keys::{
-    Access, KeptAnswer, KeyEntry, KeyGrant, KeyKind, KeyRefusal, SubjectStatus,
+    Access, ApplyEntry, KeptAnswer, KeyEntry, KeyGrant, KeyKind, KeyMarker, KeyRefusal, MarkerKind,
+    SubjectStatus,
 };
 use velmora_bridge::unit::lift::{
     AckClass, ClassProof, FindingList, GateRefusal, GateSummary, LiftProof, ReplayId, ReportKind,
@@ -173,26 +174,37 @@ fn ops() -> Vec<UnitOp> {
         },
         UnitOp::ApplyKeys {
             from_seq: 2,
-            entries: vec![KeyEntry {
-                id: "AKGOLDEN000000000001".into(),
-                kind: KeyKind::S3,
-                status: SubjectStatus::Active,
-                held: false,
-                made_by: Some("p_1".into()),
-                grants: vec![KeyGrant {
-                    bucket_id: "b_00000000000000f1".into(),
-                    access: Access::Ro,
-                    expires_at: Some(9),
-                    prefix: Some("a/".into()),
-                    ip_list: vec!["192.0.2.0/24".into()],
-                }],
-                created_at: 5,
-                secret_wrapped: Some(vec![2, 9]),
-                secret_kek_version: Some(1),
-                owner_ref: Some("m_1".into()),
-                last_seq: 3,
-                rid: Some(Rid([0x11; 16])),
-            }],
+            entries: vec![
+                ApplyEntry::Key(KeyEntry {
+                    id: "AKGOLDEN000000000001".into(),
+                    kind: KeyKind::S3,
+                    status: SubjectStatus::Active,
+                    held: false,
+                    made_by: Some("p_1".into()),
+                    grants: vec![KeyGrant {
+                        bucket_id: "b_00000000000000f1".into(),
+                        access: Access::Ro,
+                        expires_at: Some(9),
+                        prefix: Some("a/".into()),
+                        ip_list: vec!["192.0.2.0/24".into()],
+                    }],
+                    created_at: 5,
+                    secret_wrapped: Some(vec![2, 9]),
+                    secret_kek_version: Some(1),
+                    owner_ref: Some("m_1".into()),
+                    last_seq: 3,
+                    rid: Some(Rid([0x11; 16])),
+                }),
+                // AM-62: the records that change no subject.
+                ApplyEntry::Marker(KeyMarker {
+                    marker: MarkerKind::KeysFrozen,
+                    seq: 4,
+                }),
+                ApplyEntry::Marker(KeyMarker {
+                    marker: MarkerKind::KeysThawed,
+                    seq: 5,
+                }),
+            ],
             answers: vec![KeptAnswer {
                 rid: Rid([0x11; 16]),
                 status: 201,

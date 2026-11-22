@@ -1640,7 +1640,7 @@ fn the_key_tables_are_hashed_only_and_equal_the_chains_projection() {
         &u,
         UnitOp::ApplyKeys {
             from_seq: 0,
-            entries: entries.clone(),
+            entries: entries.iter().cloned().map(Into::into).collect(),
             answers: vec![],
         },
     );

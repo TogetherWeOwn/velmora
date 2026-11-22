@@ -134,7 +134,7 @@ fn apply(u: &Unit<RusqliteSql>, entries: Vec<KeyEntry>, answers: Vec<KeptAnswer>
         u,
         UnitOp::ApplyKeys {
             from_seq,
-            entries,
+            entries: entries.into_iter().map(Into::into).collect(),
             answers,
         },
     ))
@@ -1828,7 +1828,7 @@ fn the_key_chain_apply_and_the_import_refuse_the_other_schemes_wrap() {
         &u,
         UnitOp::ApplyKeys {
             from_seq: 1,
-            entries: vec![bad],
+            entries: vec![bad.into()],
             answers: vec![],
         },
     );

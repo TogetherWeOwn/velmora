@@ -43,7 +43,7 @@ use super::import::{
     self, ImportBatch, ImportCount, ImportRefusal, ImportTable, ImportValue, Imported, MoveHead,
     Seal,
 };
-use super::keys::{self, Applied, KeptAnswer, KeyEntry};
+use super::keys::{self, Applied, ApplyEntry, KeptAnswer};
 use super::lift::{self, GateRefusal};
 use super::name::UnitName;
 use super::recount::{self, RecountCall};
@@ -897,7 +897,7 @@ impl<S: UnitSql> Unit<S> {
         &self,
         head: &Head,
         from_seq: u64,
-        entries: &[KeyEntry],
+        entries: &[ApplyEntry],
         answers: &[KeptAnswer],
         now: UnixMs,
     ) -> Result<UnitAnswer> {

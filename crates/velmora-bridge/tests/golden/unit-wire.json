@@ -306,6 +306,14 @@
             "secret_kek_version": 1,
             "secret_wrapped": "Agk=",
             "status": "active"
+          },
+          {
+            "marker": "keys_frozen",
+            "seq": 4
+          },
+          {
+            "marker": "keys_thawed",
+            "seq": 5
           }
         ],
         "from_seq": 2,

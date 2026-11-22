@@ -57,9 +57,15 @@ database, so they run natively in tests); the Durable Object class, the
      from the unit's seq + 1. Each entry is compared, per subject, with
      that row's `last_seq`: an entry at or below it is skipped, except an
      entry that revokes, and one that opens at the same seq a row held
-     closed (the bring-up's second send). `revoked` is final. The apply
-     is the one way `keys_seq` moves; `sync` refuses a `keys_seq` above
-     the unit's (`keys_not_applied`).
+     closed (the bring-up's second send). `revoked` is final. Each entry
+     states its subject as the head holds it, stamped at that record's
+     seq. A record that changes no subject (`KeysFrozen`, `KeysThawed`,
+     AM-28) comes as a marker item, `{"marker": "keys_frozen" |
+     "keys_thawed", "seq": n}` (AM-62): it counts in the gap rule, writes
+     no row, is counted as skipped, and `keys_seq` moves past it. The
+     golden file pins the form. The apply is the one way `keys_seq`
+     moves; `sync` refuses a `keys_seq` above the unit's
+     (`keys_not_applied`).
 6. **Birth certificate.** A unit is made only by `provision(token)`. The
    token names the tenant, the unit, the jurisdiction, the record seq, the
    schema version, the key scheme and its kind (`birth` or `restore`), and is

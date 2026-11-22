@@ -15,7 +15,7 @@ use super::export::{ExportMode, ExportRefusal, ExportTable};
 use super::identity::{CallKind, Refusal, Seqs};
 use super::import::{ImportBatch, ImportCount, ImportRefusal, ImportValue, MoveHead};
 use super::jobcall::JobCall;
-use super::keys::{KeptAnswer, KeyEntry, KeyRefusal};
+use super::keys::{ApplyEntry, KeptAnswer, KeyRefusal};
 use super::lift::{AckClass, FindingList, GateRefusal, GateSummary, LiftProof, ReplayId};
 use super::name::UnitName;
 use super::recount::{RecountCall, RecountRefusal};
@@ -152,12 +152,13 @@ pub enum UnitOp {
     /// isolate. Allowed without `authenticated`.
     KeyRow { access_key_id: String },
     /// The key-chain apply (AM-12): the records after `from_seq`, one
-    /// entry per record, in chain order. A Worker call: the entries are
-    /// records the Worker verified. It runs while the unit is closed too
-    /// (a restore re-applies the chain at its gate).
+    /// item per record, in chain order: a subject's entry, or a marker
+    /// for a record that changes no subject (AM-62). A Worker call: the
+    /// items are records the Worker verified. It runs while the unit is
+    /// closed too (a restore re-applies the chain at its gate).
     ApplyKeys {
         from_seq: u64,
-        entries: Vec<KeyEntry>,
+        entries: Vec<ApplyEntry>,
         /// The answers to keep for the reservations whose records these
         /// are (AM-38).
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
