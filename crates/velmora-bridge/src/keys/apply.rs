@@ -299,9 +299,11 @@ impl<'a, S: RecordStore, K: Kek, T: TkRing> Feed<'a, S, K, T> {
     /// or `limit` is 0. A record that is missing or does not verify is an
     /// error, never left out.
     ///
-    /// This is the read behind the move tool's `OwnerKeys::entries`
-    /// (step 5(e)'s direct apply, the undo's `entries_to`): the items map
-    /// one to one onto the unit's `ApplyEntry`.
+    /// The read behind the move tool's `OwnerKeys::entries` (step 5(e)'s
+    /// direct apply, the undo's `entries_to`): the items map one to one
+    /// onto the unit's `ApplyEntry`. Nothing is held there; a store's own
+    /// feed, which must hold what the directory may not have, is
+    /// [`Feed::entries_for`].
     pub async fn entries(&self, after: u64, limit: usize) -> Result<Vec<ApplyEntry>> {
         let head = self.table.seq();
         if after >= head || limit == 0 {
@@ -309,6 +311,29 @@ impl<'a, S: RecordStore, K: Kek, T: TkRing> Feed<'a, S, K, T> {
         }
         let take = limit.min(MAX_APPLY) as u64;
         self.page(after, head.min(after.saturating_add(take))).await
+    }
+
+    /// [`Feed::entries`] as a store at `keys_seq = after` takes them in
+    /// `mode` (AM-71's `KeyFeed`, serving a unit that asks for the records
+    /// after its `keys_seq`): in [`Mode::Closing`], an entry whose newest
+    /// opening the directory has not acknowledged (above `acked`, unless
+    /// the store already holds that opening open at or below `after`) is
+    /// [`ApplyEntry::Held`] with its `owner_ref`; `closed` is the store's
+    /// closed subjects ([`KeyTarget::closed`]). [`Mode::Full`] holds
+    /// nothing. The `m/rk/` revocations below `after` and the second send
+    /// are the bring-up's ([`Feed::bring_up`]), not this read's.
+    pub async fn entries_for(
+        &self,
+        after: u64,
+        limit: usize,
+        mode: Mode,
+        closed: &BTreeSet<String>,
+    ) -> Result<Vec<ApplyEntry>> {
+        let mut out = self.entries(after, limit).await?;
+        for e in &mut out {
+            Self::hold(mode, after, closed, e);
+        }
+        Ok(out)
     }
 
     /// Brings `target` to the head in `mode`. A store that answers

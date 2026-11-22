@@ -6982,6 +6982,56 @@ async fn the_closing_step_holds_each_unacknowledged_opening_with_its_owner() {
     assert!(unit.rows.borrow().values().all(|r| r.private.is_some()));
 }
 
+/// AM-71's `KeyFeed` read: `entries_for` holds, in the closing mode, what
+/// the directory has not acknowledged, each with its `owner_ref`, keeps
+/// open what the store already holds open, holds nothing in full mode, and
+/// keeps the markers in place. `Debug` of a held entry hides the owner.
+#[tokio::test(flavor = "current_thread")]
+async fn entries_for_holds_what_the_directory_lacks_with_its_owner() {
+    let w = World::new();
+    plant_principals(&w, 2);
+    plant_marker(&w, 3, Marker::KeysFrozen);
+    let table = head_table(&w).await;
+    let none = Default::default();
+    let feed = Feed::new(&w.store, &w.kek, &w.ring, &table, &none);
+    let closed = Default::default();
+    // The directory acknowledged seq 1 only.
+    let items = feed
+        .entries_for(0, 100, Mode::Closing { acked: 1 }, &closed)
+        .await
+        .unwrap();
+    assert_eq!(items.len(), 3);
+    assert!(matches!(&items[0], ApplyEntry::Subject(e) if e.private.is_some()));
+    match &items[1] {
+        ApplyEntry::Held { entry, owner_ref } => {
+            assert_eq!(entry.door.id, "PA0002");
+            assert!(entry.private.is_none());
+            assert_eq!(owner_ref.as_deref(), Some("member-of-PA0002"));
+        }
+        other => panic!("not held: {other:?}"),
+    }
+    assert!(items[1].held() && !items[0].held());
+    assert_eq!(
+        items[2],
+        ApplyEntry::Marker {
+            seq: 3,
+            marker: Marker::KeysFrozen
+        }
+    );
+    let shown = format!("{:?}", items[1]);
+    assert!(!shown.contains("member-of"), "{shown}");
+    // A page after the store's seq: the same hold, the same items.
+    let from_one = feed
+        .entries_for(1, 100, Mode::Closing { acked: 1 }, &closed)
+        .await
+        .unwrap();
+    assert_eq!(from_one, items[1..].to_vec());
+    // Full mode holds nothing.
+    let full = feed.entries_for(0, 100, Mode::Full, &closed).await.unwrap();
+    assert_eq!(full, feed.entries(0, 100).await.unwrap());
+    assert!(full.iter().all(|e| !e.held()));
+}
+
 /// Confirmation of the apply (N6): the closing step sends open what the
 /// directory acknowledged, without waiting for the full step.
 #[tokio::test(flavor = "current_thread")]
