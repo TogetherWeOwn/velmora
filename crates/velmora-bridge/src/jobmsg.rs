@@ -548,7 +548,8 @@ pub enum Admission {
     /// Not a job: acknowledged and dropped, as before this module. The
     /// dispatcher sends its row again.
     Malformed,
-    /// A `v` 2 message that must not run: handed back to the queue until
+    /// A `v` 2 message, or an `apply_control` message of any `v`, that
+    /// must not run: handed back to the queue until
     /// it reaches the dead-letter queue, which pages.
     Refused(Refusal),
     /// A control intent for the finisher of its chain. A build without
@@ -582,7 +583,7 @@ impl Admission {
     }
 }
 
-/// Why a `v` 2 message is refused. [`Refusal::code`] is what the log
+/// Why a `v` 2 message, or an `apply_control` message of any `v`, is refused. [`Refusal::code`] is what the log
 /// says: a fixed word, never a field of the message.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Refusal {
@@ -697,7 +698,7 @@ fn tenant_message(
     ))
 }
 
-/// An `apply_control` message of `v` 2 as its intent.
+/// An `apply_control` message as its intent: of `v` 2 only.
 fn control_message(body: &Value) -> std::result::Result<ControlIntent, Refusal> {
     #[derive(Deserialize)]
     #[serde(deny_unknown_fields)]
