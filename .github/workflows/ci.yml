@@ -1240,7 +1240,10 @@ jobs:
           WRANGLER_OUTPUT_FILE_PATH: ${{ runner.temp }}/wrangler-output.ndjson
         # The version message identifies this run's version even when
         # wrangler fails before writing its deploy output entry.
-        run: ./node_modules/.bin/wrangler deploy -c wrangler.deploy.toml --message "ci ${GITHUB_RUN_ID}.${GITHUB_RUN_ATTEMPT} ${GITHUB_SHA}"
+        # --x-provision=false: a binding to a resource that does not exist
+        # fails the upload; wrangler never creates one (for a token with
+        # read access it would, with no location hint).
+        run: ./node_modules/.bin/wrangler deploy -c wrangler.deploy.toml --x-provision=false --message "ci ${GITHUB_RUN_ID}.${GITHUB_RUN_ATTEMPT} ${GITHUB_SHA}"
       # An unsigned GET must be refused with 403 and an S3 AccessDenied
       # body. Retries cover the propagation window right after deploy.
       - id: smoke

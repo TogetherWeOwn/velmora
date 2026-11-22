@@ -709,6 +709,12 @@ class KeyBucketsTest(GeneratorCase):
             f'\n\n[[r2_buckets]]\nbinding = "KEYS_B"\nbucket_name = "{self.b}"', 1)
         self.assertEqual(text, expected)
 
+    def test_the_deploy_never_provisions_a_missing_binding(self):
+        deploys = [line for line in self.ci.split("\n")
+                   if "wrangler deploy -c wrangler.deploy.toml" in line]
+        self.assertEqual(len(deploys), 1, deploys)
+        self.assertIn(" --x-provision=false ", deploys[0])
+
     def test_one_alone_is_refused(self):
         for env in ({"VELMORA_KEYS_A_BUCKET": self.a}, {"VELMORA_KEYS_B_BUCKET": self.b},
                     self.both(b="")):
