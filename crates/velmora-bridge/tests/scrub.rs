@@ -1391,8 +1391,8 @@ async fn due_work_is_bounded_even_when_twenty_thousand_copies_are_due() {
 }
 
 /// What a healthy check costs the catalogue in rows written, as D1
-/// bills them: the result (the row and its due-index entry) per extent,
-/// and per run the lease, its totals and the provider slots of the run.
+/// bills them: one result row per extent, each STAT clock and its index
+/// entry per copy, and per run the lease, its totals and provider slots.
 /// The slots are a per-run cost: the sessions are kept from one extent
 /// to the next, so a run of more extents does not take more of them.
 #[tokio::test(flavor = "current_thread")]
@@ -1419,7 +1419,7 @@ async fn a_healthy_check_writes_its_result_and_the_run_its_slots() {
     for (table, tally) in &spent.by_table {
         println!("  {table:?}: {}", tally.billed());
     }
-    assert_eq!(extents, 4 * 2, "the result and its index entry, per extent");
+    assert_eq!(extents, 4, "one summary row per extent");
     assert_eq!(state, 2, "the lease taken, the totals added");
     let copies = spent.table("scrub_copies");
     assert_eq!(copies, 4 * 2 * 2, "each STAT clock and its index entry");

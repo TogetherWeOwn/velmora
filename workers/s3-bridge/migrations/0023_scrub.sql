@@ -20,16 +20,6 @@ ALTER TABLE extents ADD COLUMN last_scrubbed_at INTEGER;
 ALTER TABLE extents ADD COLUMN scrub_result TEXT;
 ALTER TABLE extents ADD COLUMN scrub_next_at INTEGER;
 
--- The extents the scrub looks at, by when they are due, oldest first.
--- Released extents, and any the scrub has put a due time on (a re-pinned
--- one is `held`). The expression and the condition are those of the
--- statements in `sql/scrub.rs`, word for word: the planner takes a
--- partial or expression index only then. 2592000000 ms = 30 days.
-CREATE INDEX extents_scrub_due
-  ON extents(COALESCE(scrub_next_at,
-                      COALESCE(last_verified_at, released_at, created_at) + 2592000000))
-  WHERE safety_state = 'released' OR scrub_next_at IS NOT NULL;
-
 -- One row: the scrub's lease (one run at a time) and its running totals.
 CREATE TABLE scrub_state (
   id                    INTEGER PRIMARY KEY CHECK (id = 1),
