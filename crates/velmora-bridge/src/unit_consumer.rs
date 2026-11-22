@@ -654,6 +654,15 @@ mod tests {
         assert_eq!(d, Delivery::HandBack);
         assert_eq!(codes(&l), [("renew_needed_again", false)]);
         assert_eq!(c.calls(), (1, 0, 0));
+        // A failed renewal's pages are logged as alerts before its line.
+        let c = Client {
+            renewal: (None, vec![Page::RolledBack]),
+            ..Client::default()
+        };
+        let s = Script::new(&[Some(UnitRefusal::RenewNeeded(seqs(3, 1)))]);
+        let (d, l) = go(&s, &c, &Heads::failing()).await;
+        assert_eq!(d, Delivery::HandBack);
+        assert_eq!(codes(&l), [("rolled_back", true), ("renew_failed", false)]);
         // A failed renewal hands back with the queue's delay.
         let s = Script::new(&[Some(UnitRefusal::RenewNeeded(seqs(3, 1)))]);
         let (d, l) = go(&s, &Client::failing(), &Heads::failing()).await;
