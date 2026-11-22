@@ -270,8 +270,9 @@ exists: restore it to a timestamp, then replay from that timestamp.
 
 ## Restore
 
-1. Set `MAINTENANCE = "restore"` and deploy. Every write now answers 503,
-   and the jobs and the cron do nothing.
+1. Set the production variable `VELMORA_MAINTENANCE=restore` and re-run
+   the deploy job as described in [Deploy switches](#deploy-switches).
+   Every write now answers 503, and the jobs and the cron do nothing.
 2. Bring the database back, one of:
    - Time Travel: `npx wrangler d1 time-travel restore <db> --timestamp <T>`.
      The restore point is `T` in milliseconds.
@@ -307,7 +308,8 @@ exists: restore it to a timestamp, then replay from that timestamp.
      its post.
 5. Check: `GET /_admin/status` (`replay_unfinished` must be `false`), a
    listing, and a GET of a recent object.
-6. Set `MAINTENANCE = "off"` and deploy. Issue access keys again if the
+6. Unset the production variable `VELMORA_MAINTENANCE` or set it to
+   `off`, then re-run the deploy job. Issue access keys again if the
    database was rebuilt from the records alone. Keys revoked after the
    restore point stay revoked (`GET /_admin/keys` to check).
 
@@ -580,9 +582,10 @@ Above the floor a rollback is still not free:
 - (Versions from before the recovery records, #64, write no record at
   all; they are below the #71 floor anyway.)
 
-The CI auto-rollback only ever goes back to the version that served
-before that run's deploy, which is above the floor once the floor has
-been deployed. The floor matters for a rollback by hand.
+The CI auto-rollback targets the version that served before that run's
+deploy. If a rollback floor version is configured, CI refuses a target
+created before that version or an age comparison it cannot complete.
+Apply the same floor when rolling back by hand.
 
 To find the floor (version IDs are per account, so they are not listed
 here):
@@ -601,6 +604,86 @@ here):
    <commit>`. The first version for which it succeeds is the floor. A secret-change
    version takes the answer of the version before it. Treat any other
    version without a CI message (an upload by hand) as below the floor.
+
+## Deploy switches
+
+Set these GitHub configuration variables for production. Set
+`VELMORA_DEPLOY_FREEZE` and `VELMORA_CATALOGUE_MIGRATIONS` as **repository**
+variables under Settings → Secrets and variables → Actions → Variables →
+Repository. The build job and pull request checks run without the production
+environment, and the deploy job reads the same repository values.
+
+| Variable | Effect and default |
+|---|---|
+| `VELMORA_MAINTENANCE` | `restore` enables restore mode. Defaults to `off`. |
+| `VELMORA_CATALOGUE_ID` | Sets the catalogue name used in rollback stamps. Defaults to `main`. Use 1 to 32 lowercase letters, digits, underscores or hyphens. Keep the id stable for a catalogue in use. |
+| `VELMORA_JOB_FORMAT` | Selects job format `1` or `2` once the Worker supports the switch. Defaults to `1`. |
+| `VELMORA_DEPLOY_FREEZE` | Allows only the specified full lowercase commit SHA to deploy. Unset allows any commit that passes the tip check. |
+| `VELMORA_FLOOR_MIN` | Sets the minimum bundle floor level. Defaults to `0`. |
+| `VELMORA_FLOOR_VERSION` | Sets the earliest automatic rollback target by Worker version UUID and creation time. Unset disables this comparison. |
+| `VELMORA_CATALOGUE_MIGRATIONS` | `on` (default) applies catalogue migrations. `off` checks that none are pending and refuses the deploy if any are. |
+| `VELMORA_DIRECTORY_D1_ID` | Binds the directory D1 database by lowercase UUID and applies its migrations. Unset leaves it unbound. |
+| `VELMORA_KEYS_A_BUCKET`, `VELMORA_KEYS_B_BUCKET` | Bind the two key buckets of the tenant keys as `KEYS_A` (the bucket that creates a key version) and `KEYS_B` (its synchronous copy), by R2 bucket name. Set both or neither; they must differ from each other and from every bucket the file binds (production and dev). Unset leaves both unbound. |
+
+For a switch deploy, set the variable and re-run the deploy job of the
+tip commit's push run. During a freeze, use branch protection to hold
+merges and re-run the deploy job of the frozen commit's push run.
+
+The bundle artifact is kept for 30 days. Re-runs are possible only
+within GitHub's re-run window (about 30 days, check GitHub's current
+limit). Once that window closes, a switch deploy requires a new commit
+to main that changes the bridge. `workflow_dispatch` does not deploy.
+Check the switch values printed in the log and confirm that the deployed
+commit id matches the commit serving before the switch deploy.
+
+`FLOOR_LEVEL` travels with the bundle. Raise it by one in the PR that
+ships a fence a rollback must never cross. Once that deploy is live
+and before the next merge, raise `VELMORA_FLOOR_MIN` by hand to the new
+level. Set `VELMORA_FLOOR_VERSION` to the Worker version that establishes
+the floor so automatic rollback also respects it. The floor rule compares
+Worker version creation times. After a hand rollback or a secret change
+that re-stamps an old version, check by hand that the rollback target
+respects the floor.
+
+Create the directory database once by hand with
+`wrangler d1 create velmora-directory --location enam`. Set its id as
+`VELMORA_DIRECTORY_D1_ID`. The binding is unused until Worker code
+reads it.
+
+Create the two key buckets once by hand before you set their variables
+(Cloudflare refuses the upload of a version that binds a bucket that
+does not exist, so the deploy fails and the version before stays live),
+for example `wrangler r2 bucket create velmora-keys-a --location enam`
+and `wrangler r2 bucket create velmora-keys-b --location enam`. They hold
+wrapped tenant keys only. The bindings are unused until Worker code
+reads them.
+
+Migration files are append-only. Give each new SQL file a name
+`NNNN_<snake>.sql` with a number higher than all existing numbers in
+its folder. Use additive SQL. A deliberate, reviewed destructive
+contract step requires a first line of `-- contract: <reason>`. With
+catalogue migrations `off`, CI also refuses new files in the catalogue
+migration folder. Directory migrations run independently.
+
+## More than one S3 host
+
+`S3_HOST` is always in the `legacy` class. Extra hosts can be `legacy` or
+`customer`. Both classes admit every key for now, because there is one
+tenant; a later change binds tenants to classes. A request is checked
+against the host it was sent to: a signature made for one host is refused
+on another, and `CompleteMultipartUpload` names the host it was sent to
+in `Location`.
+
+1. Attach the new host to the Worker as a Custom Domain.
+2. Set the GitHub Actions variable `VELMORA_S3_HOSTS` to the full list of
+   extra hosts, for example `s3.example.io=customer,archive.example.io=legacy`.
+   Use up to eight lowercase hostnames without ports or spaces.
+3. Let CI deploy. Check the smoke lines for an HTTP 403 with
+   `AccessDenied` for each host. Index 1 is the primary host, followed
+   by the extra hosts in list order.
+
+To remove a host, remove its entry from `VELMORA_S3_HOSTS`, let CI deploy
+successfully, then detach the Custom Domain.
 
 ## Client settings
 
