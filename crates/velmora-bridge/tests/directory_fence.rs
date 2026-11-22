@@ -426,3 +426,64 @@ async fn a_read_from_usenet_serves_under_the_freeze() {
     assert_eq!(get.status, 200, "{}", get.status);
     assert_eq!(get.body, body);
 }
+
+/// The two operational tables stay writable through the window and are
+/// not copied by the move (ADR 7.2). That holds only while they carry no
+/// catalogue data, so their columns are pinned here: a migration that adds
+/// or changes a column of either table fails this test and needs a design
+/// answer before it lands.
+#[test]
+fn the_unfenced_operational_tables_keep_their_columns() {
+    block_on(async {
+        let rig = rig();
+        let sql = &rig.bridge.catalog.sql;
+        let columns = |table: &'static str| async move {
+            let rows = sql
+                .query(
+                    "SELECT name, type, \"notnull\", dflt_value, pk \
+                     FROM pragma_table_info(?1) ORDER BY cid",
+                    &[SqlValue::Text(table.into())],
+                )
+                .await
+                .unwrap();
+            rows.into_iter()
+                .map(|row| {
+                    row.into_iter()
+                        .map(|v| match v {
+                            SqlValue::Null => "-".to_string(),
+                            SqlValue::Int(i) => i.to_string(),
+                            SqlValue::Text(t) => t,
+                            SqlValue::Blob(_) => panic!("blob in table_info"),
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(OPERATIONAL_TABLES, ["provider_health", "provider_permits"]);
+        assert_eq!(
+            columns("provider_health").await,
+            [
+                "provider_id TEXT 1 - 1",
+                "failures INTEGER 1 0 0",
+                "cooldowns INTEGER 1 0 0",
+                "cooldown_until INTEGER 1 0 0",
+                "last_failure_at INTEGER 0 - 0",
+                "last_ok_at INTEGER 0 - 0",
+                "last_failure_reason TEXT 0 - 0",
+            ]
+        );
+        assert_eq!(
+            columns("provider_permits").await,
+            [
+                "provider_id TEXT 1 - 1",
+                "slot INTEGER 1 - 2",
+                "token INTEGER 1 0 0",
+                "holder TEXT 0 - 0",
+                "lease_until INTEGER 1 0 0",
+                "pool TEXT 0 - 0",
+                "background INTEGER 1 0 0",
+            ]
+        );
+    });
+}

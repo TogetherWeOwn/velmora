@@ -51,11 +51,6 @@ pub const OPERATOR_DELETE_MIN_MS: i64 = 3_600_000 - 60_000;
 pub const KEY_CHECK_LEN: usize = 8;
 
 /// How long tenant 0 stays `moved` before it can be retired: 30 days.
-/// The most dropped bucket ids a tenant's record keeps: past it, no new
-/// bucket is made (`409 too_many_dropped_buckets`), so a create and drop
-/// loop cannot grow every record of the chain without end. About 40 KB
-/// at the longest ids.
-pub const MAX_DROPPED_BUCKETS: usize = 1024;
 pub const RETIRE_AFTER_MS: i64 = 30 * 24 * 3_600_000;
 
 /// Who makes a change.
@@ -176,14 +171,28 @@ pub enum Change {
     LiftRestoring { unit: u32, since_seq: u64 },
     /// Create a bucket on a unit of the tenant. `creator` names the acting
     /// principal, as history; its grant on the bucket is a key-chain record
-    /// written first.
+    /// written first, at seq `grant_seq`, and the bucket's id is derived
+    /// from that seq ([`crate::records::bucket_id`]). A `grant_seq` at or
+    /// below the head's `last_grant_seq` is refused with
+    /// `grant_order_lost`: the caller revokes that grant and tries again
+    /// under a new one.
     CreateBucket {
         bucket: String,
         unit: u32,
         creator: String,
+        grant_seq: u64,
     },
     /// Remove a bucket's placement.
     DropBucket { bucket: String },
+    /// Place the owner's buckets, moved from tenant 0 with their ids
+    /// unchanged, on `unit`. Admitted only while `zero`, tenant 0's head
+    /// read from its chain by the caller, is `moving` to this tenant, and
+    /// while `unit` has a `restoring` entry (the move's import).
+    PlaceMovedBuckets {
+        buckets: Vec<String>,
+        unit: u32,
+        zero: Box<TenantDoor>,
+    },
     /// Mark the tenant's key as escrowed offline.
     SetEscrowOffline,
     /// Clear the offline escrow mark. The operator names the SHA-256 of
@@ -275,7 +284,12 @@ const SELECTOR: Refusal = refuse(409, "selector_does_not_allow");
 const NOT_TENANT_ZERO: Refusal = refuse(409, "not_tenant_zero");
 const BUCKET_EXISTS: Refusal = refuse(409, "bucket_exists");
 const STALE_BASE: Refusal = refuse(409, "stale_base");
-const TOO_MANY_DROPPED: Refusal = refuse(409, "too_many_dropped_buckets");
+const NOT_PLACED: Refusal = refuse(409, "bucket_not_placed");
+const NOT_DERIVED: Refusal = refuse(400, "bucket_id_not_derived");
+/// Another create recorded a higher creator-grant seq first.
+const GRANT_ORDER: Refusal = refuse(409, "grant_order_lost");
+const NOT_MOVING_HERE: Refusal = refuse(409, "no_move_to_tenant");
+const NOT_RESTORING: Refusal = refuse(409, "unit_not_restoring");
 
 /// Validates `change` against `head` and builds the record that follows.
 /// See the [module](self).
@@ -319,8 +333,10 @@ pub fn next(
         }
     }
     let mut door = h.clone();
-    // Only the record that creates a bucket names it.
+    // Only the record that creates a bucket names it, and only the record
+    // that places moved buckets names them.
     door.bucket_created = None;
+    door.buckets_moved_in = None;
     let mut private = head.private.clone();
 
     match change {
@@ -575,32 +591,20 @@ pub fn next(
             {
                 return Err(INVALID);
             }
-            // A bucket id that was dropped never comes back, and past the
-            // cap no new id is placed, as for CreateBucket.
+            // It moves placed buckets and drops them; it places no new
+            // id. New ids come only from CreateBucket (derived) and
+            // PlaceMovedBuckets (the owner's, in the move).
             if placements
                 .iter()
-                .any(|p| h.dropped_buckets.contains(&p.bucket))
+                .any(|p| !h.placements.iter().any(|old| old.bucket == p.bucket))
             {
-                return Err(BUCKET_EXISTS);
+                return Err(NOT_PLACED);
             }
-            let places_a_new_id = placements
-                .iter()
-                .any(|p| !h.placements.iter().any(|old| old.bucket == p.bucket));
-            if places_a_new_id && h.dropped_buckets.len() >= MAX_DROPPED_BUCKETS {
-                return Err(TOO_MANY_DROPPED);
-            }
-            let dropped: Vec<String> = h
-                .placements
-                .iter()
-                .filter(|old| !placements.iter().any(|p| p.bucket == old.bucket))
-                .map(|old| old.bucket.clone())
-                .collect();
             if *units == h.units && *placements == h.placements {
                 return Ok(Outcome::Unchanged);
             }
             door.units = units.clone();
             door.placements = placements.clone();
-            door.dropped_buckets.extend(dropped);
             door.max_move_epoch = placements
                 .iter()
                 .map(|p| p.epoch)
@@ -643,6 +647,7 @@ pub fn next(
             bucket,
             unit,
             creator,
+            grant_seq,
         } => {
             live(h)?;
             if !matches!(actor, Actor::Customer | Actor::Operator) {
@@ -654,20 +659,38 @@ pub fn next(
             if !h.restoring.is_empty() {
                 return Err(RESTORING);
             }
-            if !valid_name(bucket) || !valid_name(creator) {
+            let Some(managed) = tenant.managed() else {
+                return Err(TENANT_ZERO);
+            };
+            if !valid_name(creator) {
                 return Err(INVALID);
             }
             if !h.units.contains(unit) {
                 return Err(UNIT_NOT_LISTED);
             }
-            // An id is never reused, also not one that was dropped.
-            if h.placements.iter().any(|p| p.bucket == *bucket)
-                || h.dropped_buckets.contains(bucket)
+            let created = BucketCreated {
+                bucket: bucket.clone(),
+                creator: creator.clone(),
+                grant_seq: *grant_seq,
+            };
+            // The record this create wrote, read back after a lost answer.
+            if h.bucket_created.as_ref() == Some(&created)
+                && h.placements
+                    .iter()
+                    .any(|p| p.bucket == *bucket && p.unit == *unit)
             {
-                return Err(BUCKET_EXISTS);
+                return Ok(Outcome::Unchanged);
             }
-            if h.dropped_buckets.len() >= MAX_DROPPED_BUCKETS {
-                return Err(TOO_MANY_DROPPED);
+            if *bucket != crate::records::bucket_id(managed, *grant_seq).as_str() {
+                return Err(NOT_DERIVED);
+            }
+            // The seq only grows, so a derived id is never placed twice,
+            // also after its bucket was dropped.
+            if *grant_seq <= h.last_grant_seq {
+                return Err(GRANT_ORDER);
+            }
+            if h.placements.iter().any(|p| p.bucket == *bucket) {
+                return Err(BUCKET_EXISTS);
             }
             let epoch = h.max_move_epoch.checked_add(1).ok_or(INVALID)?;
             door.placements.push(Placement {
@@ -676,10 +699,8 @@ pub fn next(
                 epoch,
             });
             door.max_move_epoch = epoch;
-            door.bucket_created = Some(BucketCreated {
-                bucket: bucket.clone(),
-                creator: creator.clone(),
-            });
+            door.last_grant_seq = *grant_seq;
+            door.bucket_created = Some(created);
         }
 
         Change::DropBucket { bucket } => {
@@ -702,7 +723,74 @@ pub fn next(
                 return Ok(Outcome::Unchanged);
             }
             door.placements.retain(|p| p.bucket != *bucket);
-            door.dropped_buckets.push(bucket.clone());
+        }
+
+        Change::PlaceMovedBuckets {
+            buckets,
+            unit,
+            zero,
+        } => {
+            live(h)?;
+            if actor != Actor::MoveTool {
+                return Err(FORBIDDEN);
+            }
+            if tenant.is_zero() {
+                return Err(TENANT_ZERO);
+            }
+            if h.state() != super::record::TenantState::Active {
+                return Err(WRONG_STATE);
+            }
+            if buckets.is_empty()
+                || !buckets.iter().all(|b| valid_name(b))
+                || buckets
+                    .iter()
+                    .enumerate()
+                    .any(|(i, b)| buckets[..i].contains(b))
+            {
+                return Err(INVALID);
+            }
+            // A repeat of a place that was written (every id already on
+            // this unit) writes nothing, also after the flip.
+            if buckets.iter().all(|b| {
+                h.placements
+                    .iter()
+                    .any(|p| p.bucket == *b && p.unit == *unit)
+            }) {
+                return Ok(Outcome::Unchanged);
+            }
+            // Tenant 0's head, `moving` into this tenant.
+            let moving_here = zero.tenant.is_zero()
+                && zero.tenant_zero.as_ref().is_some_and(|z| {
+                    z.selector == Selector::Moving
+                        && z.moved.as_ref().is_some_and(|m| m.to == *tenant)
+                });
+            if !moving_here {
+                return Err(NOT_MOVING_HERE);
+            }
+            if !h.units.contains(unit) {
+                return Err(UNIT_NOT_LISTED);
+            }
+            if h.restoring_entry(*unit).is_none() {
+                return Err(NOT_RESTORING);
+            }
+            if buckets
+                .iter()
+                .any(|b| h.placements.iter().any(|p| p.bucket == *b))
+            {
+                return Err(BUCKET_EXISTS);
+            }
+            let epoch = h.max_move_epoch.checked_add(1).ok_or(INVALID)?;
+            door.placements.extend(buckets.iter().map(|b| Placement {
+                bucket: b.clone(),
+                unit: *unit,
+                epoch,
+            }));
+            door.max_move_epoch = epoch;
+            door.buckets_moved_in = Some(super::record::BucketsMovedIn {
+                zero_seq: zero.seq,
+                unit: *unit,
+                buckets: buckets.clone(),
+            });
         }
 
         Change::SetEscrowOffline => {
@@ -962,7 +1050,8 @@ fn first(tenant: &Tenant, change: &Change, actor: Actor, now: UnixMs) -> Result<
         units: vec![],
         placements: vec![],
         max_move_epoch: 0,
-        dropped_buckets: vec![],
+        last_grant_seq: 0,
+        buckets_moved_in: None,
         bucket_created: None,
         tk_version: 0,
         key_checks: BTreeMap::new(),
@@ -1145,7 +1234,8 @@ fn shredded_stub(h: &TenantDoor) -> TenantDoor {
         units: vec![],
         placements: vec![],
         max_move_epoch: h.max_move_epoch,
-        dropped_buckets: vec![],
+        last_grant_seq: h.last_grant_seq,
+        buckets_moved_in: None,
         bucket_created: None,
         tk_version: h.tk_version,
         key_checks: BTreeMap::new(),

@@ -377,6 +377,20 @@ pub struct BucketCreated {
     pub bucket: String,
     /// The key-chain id of the acting principal.
     pub creator: String,
+    /// The key-chain seq of the creator grant: the bucket's id is derived
+    /// from it ([`crate::records::bucket_id`]).
+    pub grant_seq: u64,
+}
+
+/// The owner's buckets that a record places in this tenant, moved from
+/// tenant 0 with their ids unchanged, and the seq of tenant 0's `moving`
+/// head that admitted them. Only that record carries it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BucketsMovedIn {
+    pub zero_seq: u64,
+    pub unit: u32,
+    pub buckets: Vec<String>,
 }
 
 /// The door part of a tenant record. See the [module](self).
@@ -424,9 +438,6 @@ pub struct TenantDoor {
     pub units: Vec<u32>,
     #[serde(default)]
     pub placements: Vec<Placement>,
-    /// Every bucket id this tenant dropped: an id is never placed again.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub dropped_buckets: Vec<String>,
     /// The highest move epoch any placement ever had. A bucket that is
     /// placed anew or moves takes an epoch above it, so an epoch never
     /// comes back, also for a placement that was dropped and added again.
@@ -435,6 +446,14 @@ pub struct TenantDoor {
     /// only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bucket_created: Option<BucketCreated>,
+    /// The highest creator-grant seq a bucket of this tenant was created
+    /// under. A new bucket needs a higher one, so a derived id never
+    /// comes back, also after its bucket was dropped.
+    #[serde(default)]
+    pub last_grant_seq: u64,
+    /// The owner's moved buckets this record places (this record only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub buckets_moved_in: Option<BucketsMovedIn>,
     /// The tenant key version in force; 0 for tenant 0, which has none.
     pub tk_version: u32,
     /// The key check value of every committed tenant key version, in
@@ -585,7 +604,8 @@ mod tests {
             units: vec![0],
             placements: vec![],
             max_move_epoch: 0,
-            dropped_buckets: vec![],
+            last_grant_seq: 0,
+            buckets_moved_in: None,
             bucket_created: None,
             tk_version: 1,
             key_checks: BTreeMap::from([(1, "00".repeat(16))]),

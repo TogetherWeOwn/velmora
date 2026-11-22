@@ -357,6 +357,36 @@ impl<S: RecordStore, C: ControlSeal> TenantChain<'_, S, C> {
     }
 }
 
+impl<S: RecordStore, C: ControlSeal> TenantChain<'_, S, C> {
+    /// Places the owner's buckets, moved from tenant 0 with their ids
+    /// unchanged, on `unit` of `tenant` (the move's import, by the move
+    /// tool). Tenant 0's head is read from its own chain here, so the
+    /// change is bound to a verified head that is `moving` into `tenant`;
+    /// the record names that head's seq.
+    pub async fn place_moved_buckets(
+        &self,
+        tenant: &Tenant,
+        buckets: &[String],
+        unit: u32,
+        now: UnixMs,
+        known: u64,
+    ) -> Result<Written, ChainError> {
+        let Some(zero) = self.head(&Tenant::Zero, 0).await? else {
+            return Err(ChainError::Refused(Refusal {
+                status: 409,
+                code: "no_move_to_tenant",
+            }));
+        };
+        let change = Change::PlaceMovedBuckets {
+            buckets: buckets.to_vec(),
+            unit,
+            zero: Box::new(zero.door),
+        };
+        self.write(tenant, &change, Actor::MoveTool, now, known)
+            .await
+    }
+}
+
 /// A record of a tenant other than tenant 0 from before its first key
 /// version: its private part must be empty.
 fn keyless(door: &TenantDoor) -> bool {

@@ -18,6 +18,42 @@ fn commit(version: u32) -> Change {
     }
 }
 
+/// The derived id of the bucket whose creator grant is `t1`'s key-chain
+/// record `k`.
+fn bid(k: u64) -> String {
+    crate::records::bucket_id(t1().managed().unwrap(), k)
+        .as_str()
+        .to_owned()
+}
+
+/// A create of the bucket under creator grant `k`, on `unit`.
+fn create_bucket(k: u64, unit: u32) -> Change {
+    Change::CreateBucket {
+        bucket: bid(k),
+        unit,
+        creator: "p_owner".into(),
+        grant_seq: k,
+    }
+}
+
+/// `r` with `bucket` placed on `unit` (listed if it was not) at the next
+/// epoch, as a create or a move's place leaves it: the start of the
+/// tests that move placed buckets.
+fn placed(mut r: TenantRecord, bucket: &str, unit: u32) -> TenantRecord {
+    if !r.door.units.contains(&unit) {
+        r.door.units.push(unit);
+        r.door.units.sort_unstable();
+    }
+    let epoch = r.door.max_move_epoch + 1;
+    r.door.placements.push(Placement {
+        bucket: bucket.into(),
+        unit,
+        epoch,
+    });
+    r.door.max_move_epoch = epoch;
+    r
+}
+
 fn hash(n: u8) -> String {
     format!("{n:02x}").repeat(32)
 }
@@ -636,7 +672,7 @@ fn rotation_claims_exactly_the_next_version_once() {
 
 #[test]
 fn restoring_is_idempotent_extendable_and_lifted_by_its_own_entry() {
-    let a = active();
+    let a = placed(active(), "b_1", 0);
     let two = apply(
         &a,
         Change::SetUnits {
@@ -645,7 +681,7 @@ fn restoring_is_idempotent_extendable_and_lifted_by_its_own_entry() {
             placements: vec![Placement {
                 bucket: "b_1".into(),
                 unit: 1,
-                epoch: 1,
+                epoch: 2,
             }],
         },
         Actor::Operator,
@@ -903,7 +939,13 @@ fn units_and_placements_are_checked() {
         refused(&a, set(vec![0, 1], vec![]), Actor::Customer),
         FORBIDDEN
     );
-    let two = apply(&a, set(vec![0, 1], vec![p("b", 1)]), Actor::Operator);
+    // A new id is never placed by a unit change.
+    assert_eq!(
+        refused(&a, set(vec![0, 1], vec![p("b", 1)]), Actor::Operator),
+        NOT_PLACED
+    );
+    let a = placed(a, "b", 0);
+    let two = apply(&a, set(vec![0, 1], vec![p("b", 0)]), Actor::Operator);
     assert_eq!(two.door.units, vec![0, 1]);
     // Not while deleting.
     let d = apply(
@@ -1234,9 +1276,10 @@ fn a_bucket_moves_only_to_the_next_epoch() {
         units: vec![0, 1],
         placements,
     };
-    // Placed anew: exactly the epoch above every one before.
-    assert_eq!(refused(&a, set(vec![p(0, 5)]), Actor::Operator), INVALID);
-    let at1 = apply(&a, set(vec![p(0, 1)]), Actor::Operator);
+    // It places no new id: only a create or a move's place does.
+    assert_eq!(refused(&a, set(vec![p(0, 1)]), Actor::Operator), NOT_PLACED);
+    let mut at1 = placed(a, "b", 0);
+    at1.door.units = vec![0, 1];
     assert_eq!(at1.door.max_move_epoch, 1);
     // In place, the epoch neither goes back nor up.
     assert_eq!(refused(&at1, set(vec![p(0, 0)]), Actor::Operator), INVALID);
@@ -1251,26 +1294,20 @@ fn a_bucket_moves_only_to_the_next_epoch() {
     let moved = apply(&at1, set(vec![p(1, 2)]), Actor::Operator);
     assert_eq!(moved.door.placements, vec![p(1, 2)]);
     assert_eq!(moved.door.max_move_epoch, 2);
-    // Dropped, the id never comes back; the next bucket takes the epoch
-    // above every one before.
+    // Dropped, the id is not placed again by a move; the next bucket
+    // takes the epoch above every one before.
     let dropped = apply(&moved, set(vec![]), Actor::Operator);
     assert_eq!(dropped.door.max_move_epoch, 2);
-    assert_eq!(dropped.door.dropped_buckets, ["b"]);
     assert_eq!(
         refused(&dropped, set(vec![p(1, 2)]), Actor::Operator),
         INVALID
     );
     assert_eq!(
         refused(&dropped, set(vec![p(1, 3)]), Actor::Operator),
-        BUCKET_EXISTS
+        NOT_PLACED
     );
-    let other = Placement {
-        bucket: "c".into(),
-        unit: 1,
-        epoch: 3,
-    };
-    let placed = apply(&dropped, set(vec![other.clone()]), Actor::Operator);
-    assert_eq!(placed.door.placements, vec![other]);
+    let next = apply(&dropped, create_bucket(1, 1), Actor::Customer);
+    assert_eq!(next.door.placements[0].epoch, 3);
 }
 
 /// A change that replaces a whole field names the head it was built from:
@@ -1756,144 +1793,239 @@ fn an_escrowed_tenant_waits_for_its_escrow_to_be_destroyed_before_a_shred() {
 #[test]
 fn a_bucket_create_names_its_creator_in_its_own_record_only() {
     let a = active();
-    let create = |bucket: &str, unit| Change::CreateBucket {
-        bucket: bucket.into(),
-        unit,
-        creator: "p_owner".into(),
-    };
-    assert_eq!(refused(&a, create("b_1", 0), Actor::Billing), FORBIDDEN);
+    assert_eq!(refused(&a, create_bucket(1, 0), Actor::Billing), FORBIDDEN);
     assert_eq!(
-        refused(&a, create("b_1", 3), Actor::Customer),
+        refused(&a, create_bucket(1, 3), Actor::Customer),
         UNIT_NOT_LISTED
     );
-    assert_eq!(refused(&a, create("", 0), Actor::Customer), INVALID);
-    let b = apply(&a, create("b_1", 0), Actor::Customer);
+    let mut no_creator = create_bucket(1, 0);
+    if let Change::CreateBucket { creator, .. } = &mut no_creator {
+        creator.clear();
+    }
+    assert_eq!(refused(&a, no_creator, Actor::Customer), INVALID);
+    let b = apply(&a, create_bucket(1, 0), Actor::Customer);
     assert_eq!(
         b.door.bucket_created,
         Some(BucketCreated {
-            bucket: "b_1".into(),
-            creator: "p_owner".into()
+            bucket: bid(1),
+            creator: "p_owner".into(),
+            grant_seq: 1,
         })
     );
     assert_eq!(b.door.placements[0].epoch, 1);
-    assert_eq!(
-        refused(&b, create("b_1", 0), Actor::Customer),
-        BUCKET_EXISTS
-    );
+    assert_eq!(b.door.last_grant_seq, 1);
+    // The same create read back after a lost answer writes nothing.
+    unchanged(&b, create_bucket(1, 0), Actor::Customer);
     // The next record of any kind carries no creator.
     let next_rec = apply(&b, billing_hold(Some(HoldMode::ReadOnly)), Actor::Billing);
     assert_eq!(next_rec.door.bucket_created, None);
+    assert_eq!(next_rec.door.last_grant_seq, 1);
     // Not while suspended, deleting or restoring.
     assert_eq!(
-        refused(&next_rec, create("b_2", 0), Actor::Customer),
+        refused(&next_rec, create_bucket(2, 0), Actor::Customer),
         WRONG_STATE
     );
     let r = apply(&b, Change::SetRestoring { unit: 0 }, Actor::Operator);
-    assert_eq!(refused(&r, create("b_2", 0), Actor::Operator), RESTORING);
+    assert_eq!(refused(&r, create_bucket(2, 0), Actor::Operator), RESTORING);
     // Dropping a bucket; dropping it again is unchanged.
-    let dropped = apply(
-        &b,
-        Change::DropBucket {
-            bucket: "b_1".into(),
-        },
-        Actor::Customer,
-    );
+    let dropped = apply(&b, Change::DropBucket { bucket: bid(1) }, Actor::Customer);
     assert!(dropped.door.placements.is_empty());
     unchanged(
         &dropped,
-        Change::DropBucket {
-            bucket: "b_1".into(),
-        },
+        Change::DropBucket { bucket: bid(1) },
         Actor::Customer,
     );
-    // A dropped id is never made again, also not by the operator; a new
-    // bucket takes a newer epoch.
-    assert_eq!(dropped.door.dropped_buckets, ["b_1"]);
+    // A dropped id is never made again, also not by the operator: its
+    // grant seq is not above the last one. A new bucket takes a newer
+    // epoch, and the record keeps no list of dropped ids.
     for actor in [Actor::Customer, Actor::Operator] {
-        assert_eq!(refused(&dropped, create("b_1", 0), actor), BUCKET_EXISTS);
+        assert_eq!(refused(&dropped, create_bucket(1, 0), actor), GRANT_ORDER);
     }
-    let again = apply(&dropped, create("b_2", 0), Actor::Operator);
+    let again = apply(&dropped, create_bucket(2, 0), Actor::Operator);
     assert_eq!(again.door.placements[0].epoch, 2);
-    assert_eq!(again.door.dropped_buckets, ["b_1"]);
-    // Tenant 0 lists no unit: no bucket is placed for it.
+    assert_eq!(again.door.last_grant_seq, 2);
+    // Tenant 0 makes no bucket here: it has no unit and no derived ids.
+    let mut z = tenant_zero();
+    z.door.units = vec![0];
     assert_eq!(
-        refused(&tenant_zero(), create("b_1", 0), Actor::Operator),
-        UNIT_NOT_LISTED
+        refused(&z, create_bucket(1, 0), Actor::Operator),
+        TENANT_ZERO
     );
 }
 
-/// The list of dropped ids is bounded: past the cap no bucket is made,
-/// and a bucket can still be dropped.
+/// A new bucket's id is the derivation from its creator grant's seq, and
+/// that seq is above every earlier one: no list of dropped ids, no cap.
 #[test]
-fn dropped_bucket_ids_are_capped() {
-    let mut a = active();
-    a.door.placements.push(Placement {
-        bucket: "b_live".into(),
-        unit: 0,
-        epoch: 1,
-    });
-    a.door.max_move_epoch = 1;
-    a.door.dropped_buckets = (0..MAX_DROPPED_BUCKETS).map(|i| format!("d_{i}")).collect();
-    let create = Change::CreateBucket {
-        bucket: "b_new".into(),
-        unit: 0,
-        creator: "p_owner".into(),
+fn bucket_ids_are_derived_from_the_creator_grant() {
+    let a = active();
+    // Any other id, also another grant's, is refused.
+    let mut drawn = create_bucket(1, 0);
+    if let Change::CreateBucket { bucket, .. } = &mut drawn {
+        *bucket = "b_0123456789abcdef".into();
+    }
+    assert_eq!(refused(&a, drawn, Actor::Customer), NOT_DERIVED);
+    let mut other_k = create_bucket(1, 0);
+    if let Change::CreateBucket { bucket, .. } = &mut other_k {
+        *bucket = bid(2);
+    }
+    assert_eq!(refused(&a, other_k, Actor::Customer), NOT_DERIVED);
+    // Another tenant's derivation for the same seq is not this one's.
+    let mut theirs = create_bucket(1, 0);
+    if let Change::CreateBucket { bucket, .. } = &mut theirs {
+        let t2 = crate::TenantId::parse("t_00000000000000a2").unwrap();
+        *bucket = crate::records::bucket_id(&t2, 1).as_str().to_owned();
+    }
+    assert_eq!(refused(&a, theirs, Actor::Customer), NOT_DERIVED);
+    // Seqs may skip (other key-chain records sit between grants), but a
+    // create whose grant lost the order to a higher one is refused: the
+    // caller revokes that grant and creates again under a new one.
+    let at5 = apply(&a, create_bucket(5, 0), Actor::Customer);
+    assert_eq!(at5.door.last_grant_seq, 5);
+    for k in [1, 4] {
+        assert_eq!(
+            refused(&at5, create_bucket(k, 0), Actor::Customer),
+            GRANT_ORDER
+        );
+    }
+    // Its own create again is the read-back, not a lost order.
+    unchanged(&at5, create_bucket(5, 0), Actor::Customer);
+    let at9 = apply(&at5, create_bucket(9, 0), Actor::Customer);
+    assert_eq!(at9.door.placements.len(), 2);
+    // Create and drop without end: every create passes, no record grows.
+    let mut r = at9;
+    for k in 10..2_100u64 {
+        r = apply(&r, create_bucket(k, 0), Actor::Customer);
+        r = apply(&r, Change::DropBucket { bucket: bid(k) }, Actor::Customer);
+    }
+    assert_eq!(r.door.placements.len(), 2);
+    assert_eq!(r.door.last_grant_seq, 2_099);
+    let bytes = serde_json::to_vec(&r.door).unwrap();
+    assert!(bytes.len() < 2_048, "{} bytes", bytes.len());
+}
+
+/// The owner's buckets enter the tenant only through the move: tenant 0's
+/// head `moving` into this tenant, and a `restoring` entry on the unit.
+#[test]
+fn moved_buckets_are_placed_only_by_the_move() {
+    let owner = active();
+    let owner = apply(&owner, Change::SetRestoring { unit: 0 }, Actor::Operator);
+    let z = tenant_zero();
+    let moving = moving();
+    let ids = vec![
+        "b_00000000000000aa".to_string(),
+        "b_00000000000000bb".to_string(),
+    ];
+    let place = |zero: &TenantRecord, buckets: Vec<String>, unit| Change::PlaceMovedBuckets {
+        buckets,
+        unit,
+        zero: Box::new(zero.door.clone()),
     };
-    assert_eq!(refused(&a, create, Actor::Customer), TOO_MANY_DROPPED);
-    let dropped = apply(
-        &a,
-        Change::DropBucket {
-            bucket: "b_live".into(),
-        },
-        Actor::Customer,
+    // Only the move tool.
+    for actor in [Actor::Customer, Actor::Operator, Actor::RestoreTool] {
+        assert_eq!(
+            refused(&owner, place(&moving, ids.clone(), 0), actor),
+            FORBIDDEN
+        );
+    }
+    // Not without a window into this tenant.
+    assert_eq!(
+        refused(&owner, place(&z, ids.clone(), 0), Actor::MoveTool),
+        NOT_MOVING_HERE
     );
-    assert_eq!(dropped.door.dropped_buckets.len(), MAX_DROPPED_BUCKETS + 1);
-    // Nor does the operator place a new id past the cap; ones already
-    // placed may still move.
-    let set = |placements| Change::SetUnits {
-        base_seq: ANY,
-        units: vec![0],
-        placements,
-    };
-    let new_id = Placement {
-        bucket: "b_new".into(),
-        unit: 0,
-        epoch: 2,
-    };
+    let mut elsewhere = moving.clone();
+    if let Some(m) = elsewhere
+        .door
+        .tenant_zero
+        .as_mut()
+        .and_then(|z| z.moved.as_mut())
+    {
+        m.to = Tenant::parse("t_00000000000000a2").unwrap();
+    }
+    assert_eq!(
+        refused(&owner, place(&elsewhere, ids.clone(), 0), Actor::MoveTool),
+        NOT_MOVING_HERE
+    );
+    // A door that is not tenant 0's, even one shaped like it.
+    let mut planted = moving.clone();
+    planted.door.tenant = t1();
+    assert_eq!(
+        refused(&owner, place(&planted, ids.clone(), 0), Actor::MoveTool),
+        NOT_MOVING_HERE
+    );
+    let flipped = apply(&moving, Change::FlipMove { stamp: 7 }, Actor::MoveTool);
+    assert_eq!(
+        refused(&owner, place(&flipped, ids.clone(), 0), Actor::MoveTool),
+        NOT_MOVING_HERE
+    );
+    // Not without the unit's restoring entry.
+    assert_eq!(
+        refused(&active(), place(&moving, ids.clone(), 0), Actor::MoveTool),
+        NOT_RESTORING
+    );
+    assert_eq!(
+        refused(&owner, place(&moving, ids.clone(), 3), Actor::MoveTool),
+        UNIT_NOT_LISTED
+    );
+    // Malformed lists.
+    for bad in [
+        vec![],
+        vec![String::new()],
+        vec![ids[0].clone(), ids[0].clone()],
+    ] {
+        assert_eq!(
+            refused(&owner, place(&moving, bad, 0), Actor::MoveTool),
+            INVALID
+        );
+    }
+    // Placed, at one new epoch, named with the head that admitted them.
+    let r = apply(&owner, place(&moving, ids.clone(), 0), Actor::MoveTool);
+    assert_eq!(
+        r.door
+            .placements
+            .iter()
+            .map(|p| (p.bucket.as_str(), p.unit, p.epoch))
+            .collect::<Vec<_>>(),
+        [(ids[0].as_str(), 0, 1), (ids[1].as_str(), 0, 1)]
+    );
+    assert_eq!(
+        r.door.buckets_moved_in,
+        Some(crate::directory::record::BucketsMovedIn {
+            zero_seq: moving.door.seq,
+            unit: 0,
+            buckets: ids.clone(),
+        })
+    );
+    assert_eq!(r.door.last_grant_seq, 0);
+    // A repeat writes nothing, also after the flip; an overlap is refused.
+    unchanged(&r, place(&moving, ids.clone(), 0), Actor::MoveTool);
+    unchanged(&r, place(&flipped, ids.clone(), 0), Actor::MoveTool);
     assert_eq!(
         refused(
-            &a,
-            set(vec![a.door.placements[0].clone(), new_id]),
-            Actor::Operator
+            &r,
+            place(
+                &moving,
+                vec![ids[1].clone(), "b_00000000000000cc".into()],
+                0
+            ),
+            Actor::MoveTool
         ),
-        TOO_MANY_DROPPED
+        BUCKET_EXISTS
     );
-    unchanged(&a, set(a.door.placements.clone()), Actor::Operator);
-    let moved = apply(
-        &a,
-        Change::SetUnits {
-            base_seq: ANY,
-            units: vec![0, 1],
-            placements: vec![Placement {
-                bucket: "b_live".into(),
-                unit: 1,
-                epoch: 2,
-            }],
-        },
-        Actor::Operator,
-    );
-    assert_eq!(moved.door.placements[0].unit, 1);
-    assert_eq!(moved.door.dropped_buckets.len(), MAX_DROPPED_BUCKETS);
-    let mut below = active();
-    below.door.dropped_buckets = (1..MAX_DROPPED_BUCKETS).map(|i| format!("d_{i}")).collect();
-    apply(
-        &below,
-        Change::CreateBucket {
-            bucket: "b_new".into(),
+    // The next record does not repeat the list.
+    let lifted = apply(
+        &r,
+        Change::LiftRestoring {
             unit: 0,
-            creator: "p_owner".into(),
+            since_seq: owner.door.restoring[0].since_seq,
         },
-        Actor::Customer,
+        Actor::RestoreTool,
+    );
+    assert_eq!(lifted.door.buckets_moved_in, None);
+    assert_eq!(lifted.door.placements.len(), 2);
+    // Tenant 0 places nothing in itself.
+    assert_eq!(
+        refused(&moving, place(&moving, ids.clone(), 0), Actor::MoveTool),
+        TENANT_ZERO
     );
 }
 
@@ -2101,18 +2233,8 @@ fn marking_the_escrow_again_forgets_the_old_destroyed_names() {
 #[test]
 fn a_bucket_is_dropped_only_from_an_active_tenant() {
     let a = active();
-    let b = apply(
-        &a,
-        Change::CreateBucket {
-            bucket: "b_1".into(),
-            unit: 0,
-            creator: "p_owner".into(),
-        },
-        Actor::Customer,
-    );
-    let drop = || Change::DropBucket {
-        bucket: "b_1".into(),
-    };
+    let b = apply(&a, create_bucket(1, 0), Actor::Customer);
+    let drop = || Change::DropBucket { bucket: bid(1) };
     let legal = apply(
         &b,
         operator_hold(HoldMode::Locked, OperatorReason::Legal, None),

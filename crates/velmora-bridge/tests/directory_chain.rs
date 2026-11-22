@@ -13,6 +13,7 @@ use velmora_bridge::directory::testing::{HookedRecords, PlainSeal};
 use velmora_bridge::directory::transition::{
     next, Actor, Change, OperatorHoldRequest, Outcome, KEY_CHECK_LEN,
 };
+use velmora_bridge::records::bucket_id;
 use velmora_bridge::UnixMs;
 
 const NOW: UnixMs = UnixMs(1_800_000_000_000);
@@ -269,13 +270,15 @@ fn a_whole_field_change_never_erases_a_concurrent_bucket() {
     };
     block_on(active(&chain));
     let base = block_on(chain.head(&t1(), 0)).unwrap().unwrap().door;
+    let new_bucket = bucket_id(t1().managed().unwrap(), 1).as_str().to_owned();
     let (name, sealed) = competitor(
         &store,
         &seal,
         Change::CreateBucket {
-            bucket: "b_new".into(),
+            bucket: new_bucket.clone(),
             unit: 0,
             creator: "p_owner".into(),
+            grant_seq: 1,
         },
         Actor::Customer,
     );
@@ -301,7 +304,7 @@ fn a_whole_field_change_never_erases_a_concurrent_bucket() {
         let head = chain.head(&t1(), 0).await.unwrap().unwrap();
         assert_eq!(head.door.seq, base.seq + 1);
         assert_eq!(head.door.placements.len(), 1);
-        assert_eq!(head.door.placements[0].bucket, "b_new");
+        assert_eq!(head.door.placements[0].bucket, new_bucket);
         // Built again on the new head, it keeps the bucket.
         let again = Change::SetUnits {
             base_seq: head.door.seq,
@@ -316,7 +319,7 @@ fn a_whole_field_change_never_erases_a_concurrent_bucket() {
             panic!("the rebuilt unit change did not write")
         };
         assert_eq!(rec.door.units, [0, 1]);
-        assert_eq!(rec.door.placements[0].bucket, "b_new");
+        assert_eq!(rec.door.placements[0].bucket, new_bucket);
     });
 }
 
@@ -727,5 +730,77 @@ fn a_gap_inside_the_chain_is_not_taken_for_a_purge() {
         assert!(store.lose(&record_key(&t1(), 5)));
         let r = chain.head_seq(&t1(), 5).await;
         assert!(matches!(r, Err(ChainError::Damaged(_))), "{r:?}");
+    });
+}
+
+/// The move's place of the owner's buckets reads tenant 0's head from its
+/// own chain: without a window into this tenant it writes nothing.
+#[test]
+fn moved_buckets_are_placed_against_tenant_zeros_own_head() {
+    let store = HookedRecords::new();
+    let seal = PlainSeal::new();
+    let chain = TenantChain {
+        store: &store,
+        seal: &seal,
+    };
+    let ids = vec!["b_00000000000000aa".to_string()];
+    let refused = |w: Result<Written, ChainError>| match w {
+        Err(ChainError::Refused(r)) => r.code,
+        other => panic!("not refused: {other:?}"),
+    };
+    block_on(async {
+        active(&chain).await;
+        let w = chain
+            .write(
+                &t1(),
+                &Change::SetRestoring { unit: 0 },
+                Actor::Operator,
+                NOW,
+                0,
+            )
+            .await;
+        assert!(matches!(w, Ok(Written::Wrote(_))));
+        // No tenant 0 chain yet.
+        let w = chain.place_moved_buckets(&t1(), &ids, 0, NOW, 0).await;
+        assert_eq!(refused(w), "no_move_to_tenant");
+        let zero = Tenant::zero();
+        let w = chain
+            .write(
+                &zero,
+                &Change::CreateTenantZero {
+                    jurisdiction: "us".into(),
+                },
+                Actor::Operator,
+                NOW,
+                0,
+            )
+            .await;
+        assert!(matches!(w, Ok(Written::Wrote(_))), "{w:?}");
+        // Tenant 0 on its D1, no window open.
+        let w = chain.place_moved_buckets(&t1(), &ids, 0, NOW, 0).await;
+        assert_eq!(refused(w), "no_move_to_tenant");
+        let start = Change::StartMove {
+            to: t1(),
+            catalogue_id_frozen: "main".into(),
+        };
+        let w = chain.write(&zero, &start, Actor::MoveTool, NOW, 0).await;
+        assert!(matches!(w, Ok(Written::Wrote(_))), "{w:?}");
+        let w = chain.place_moved_buckets(&t1(), &ids, 0, NOW, 0).await;
+        let Ok(Written::Wrote(r)) = w else {
+            panic!("{w:?}")
+        };
+        let moved_in = r.door.buckets_moved_in.unwrap();
+        assert_eq!((moved_in.zero_seq, moved_in.buckets), (2, ids.clone()));
+        // A repeat writes nothing.
+        let w = chain.place_moved_buckets(&t1(), &ids, 0, NOW, 0).await;
+        assert!(matches!(w, Ok(Written::Unchanged(_))), "{w:?}");
+        // The window given up: no new id is placed.
+        let w = chain
+            .write(&zero, &Change::GiveUpMove, Actor::MoveTool, NOW, 0)
+            .await;
+        assert!(matches!(w, Ok(Written::Wrote(_))));
+        let more = vec!["b_00000000000000bb".to_string()];
+        let w = chain.place_moved_buckets(&t1(), &more, 0, NOW, 0).await;
+        assert_eq!(refused(w), "no_move_to_tenant");
     });
 }

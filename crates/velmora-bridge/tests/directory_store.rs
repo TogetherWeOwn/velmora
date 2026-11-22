@@ -5,8 +5,7 @@ use velmora_bridge::directory::gate::{
     StepReport, PENDING_ALARM_MS, PENDING_PAGE_MS,
 };
 use velmora_bridge::directory::record::{
-    DeletionReason, HoldMode, Lifecycle, OperatorReason, Placement, Restoring, Tenant, TenantDoor,
-    TenantState,
+    DeletionReason, HoldMode, Lifecycle, OperatorReason, Restoring, Tenant, TenantDoor, TenantState,
 };
 use velmora_bridge::directory::store::{
     Applied, ChainKind, GateState, KeyRoute, PendingOp, RouteKind, RoutePut, SqlDirectory, UnitRow,
@@ -94,15 +93,13 @@ async fn head(chain: &Chain<'_>, tenant: &Tenant) -> TenantDoor {
     chain.head(tenant, 0).await.unwrap().unwrap().door
 }
 
+/// A second unit. A unit change moves placed buckets only, and these
+/// tenants have none.
 fn two_units(base_seq: u64) -> Change {
     Change::SetUnits {
         base_seq,
         units: vec![0, 1],
-        placements: vec![Placement {
-            bucket: "b_1".into(),
-            unit: 1,
-            epoch: 1,
-        }],
+        placements: vec![],
     }
 }
 
