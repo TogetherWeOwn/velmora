@@ -990,15 +990,40 @@ jobs:
                   or any(db.get("binding") == "DIRECTORY" for db in shipped_d1)):
               sys.exit("the prod section of the shipped file binds DIRECTORY")
           shipped_r2 = shipped_prod.get("r2_buckets", [])
-          for binding in ("KEYS_A", "KEYS_B"):
+          key_bindings = ("KEYS_A", "KEYS_B")
+          def tables_binding(value):
+              # Every table, at any depth and of any binding type, whose
+              # `binding` is a key binding.
+              if isinstance(value, dict):
+                  own = [value] if value.get("binding") in key_bindings else []
+                  return own + [t for item in value.values() for t in tables_binding(item)]
+              if isinstance(value, list):
+                  return [t for item in value for t in tables_binding(item)]
+              return []
+          for binding in key_bindings:
               if (any(re.fullmatch(rf'''\s*binding\s*=\s*["']{binding}["']\s*(?:#.*)?''', line)
                       for line in lines[:end])
-                      or any(b.get("binding") == binding for b in shipped_r2)):
+                      or any(t.get("binding") == binding for t in tables_binding(shipped_prod))):
                   sys.exit(f"the prod section of the shipped file binds {binding}")
-          bound_buckets = {b.get("bucket_name") for b in shipped_r2}
+          # Every bucket the file binds, production or not (the dev and drill
+          # Workers delete in theirs): never a key bucket.
+          bound_buckets = set(re.findall(r'''^\s*(?:preview_)?bucket_name\s*=\s*["']([^"']*)["']''',
+                                         "\n".join(lines), re.M))
+          try:
+              whole = tomllib.loads("\n".join(lines))
+          except tomllib.TOMLDecodeError:
+              whole = {}
+          def bucket_names(value):
+              if isinstance(value, dict):
+                  own = [value[k] for k in ("bucket_name", "preview_bucket_name") if isinstance(value.get(k), str)]
+                  return own + [n for item in value.values() for n in bucket_names(item)]
+              if isinstance(value, list):
+                  return [n for item in value for n in bucket_names(item)]
+              return []
+          bound_buckets.update(bucket_names(whole))
           for name, value in (("VELMORA_KEYS_A_BUCKET", keys_a), ("VELMORA_KEYS_B_BUCKET", keys_b)):
               if value and value in bound_buckets:
-                  sys.exit(f"{name} must not be a bucket the Worker already binds")
+                  sys.exit(f"{name} must not be a bucket the file already binds")
           entries = hosts.split(",") if hosts else []
           seen = {host}
           classes = []
@@ -1123,9 +1148,11 @@ jobs:
                   or [db for db in actual_d1 if db.get("binding") == "DIRECTORY"] != directory_table):
               sys.exit("the generated config does not carry the expected D1 bindings")
           actual_r2 = prod.get("r2_buckets", [])
-          if ([b for b in actual_r2 if b.get("binding") in ("KEYS_A", "KEYS_B")] != keys_tables
-                  or [b for b in actual_r2 if b.get("binding") not in ("KEYS_A", "KEYS_B")]
-                  != [b for b in shipped_r2 if b.get("binding") not in ("KEYS_A", "KEYS_B")]):
+          prod_only = {k: v for k, v in prod.items() if k != "env"}
+          if ([b for b in actual_r2 if b.get("binding") in key_bindings] != keys_tables
+                  or tables_binding(prod_only) != keys_tables
+                  or [b for b in actual_r2 if b.get("binding") not in key_bindings]
+                  != [b for b in shipped_r2 if b.get("binding") not in key_bindings]):
               sys.exit("the generated config does not carry the expected key bucket bindings")
           with open(dst, "w", encoding="utf-8") as f:
               f.write(text)

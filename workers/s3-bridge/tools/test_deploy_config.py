@@ -726,11 +726,14 @@ class KeyBucketsTest(GeneratorCase):
         self.refused(self.both(b=self.a),
                      "VELMORA_KEYS_A_BUCKET and VELMORA_KEYS_B_BUCKET must not be the same bucket")
 
-    def test_a_bucket_the_worker_binds_is_refused(self):
+    def test_a_bucket_the_file_binds_is_refused(self):
+        # Production's buckets, and the dev Worker's (it deletes in them).
         for variable, env in (("VELMORA_KEYS_A_BUCKET", self.both(a="velmora-safety-enam")),
-                              ("VELMORA_KEYS_B_BUCKET", self.both(b="velmora-cache-enam"))):
-            with self.subTest(variable=variable):
-                self.refused(env, f"{variable} must not be a bucket the Worker already binds")
+                              ("VELMORA_KEYS_B_BUCKET", self.both(b="velmora-cache-enam")),
+                              ("VELMORA_KEYS_A_BUCKET", self.both(a="velmora-cache-dev")),
+                              ("VELMORA_KEYS_B_BUCKET", self.both(b="velmora-safety-dev"))):
+            with self.subTest(variable=variable, env=env):
+                self.refused(env, f"{variable} must not be a bucket the file already binds")
 
     def test_a_shipped_key_binding_is_refused_whatever_is_asked(self):
         for binding in ("KEYS_A", "KEYS_B"):
@@ -746,6 +749,27 @@ class KeyBucketsTest(GeneratorCase):
         self.refused(self.both(), "expected exactly one prod CACHE bucket_name line", fixture)
         # Unset, the anchor is not needed.
         self.ok({}, fixture)
+
+    def test_a_shipped_key_binding_of_any_kind_is_refused(self):
+        # A service binding: the line pattern catches it.
+        services = add_after(self.shipped, self.cache,
+                             '\n[[services]]\nbinding = "KEYS_A"\nservice = "other"')
+        # A quoted key: only the parsed file shows it.
+        quoted = add_after(self.shipped, self.cache,
+                           '\n[[r2_buckets]]\n"binding" = "KEYS_B"\nbucket_name = "x-keys"')
+        # An inline table of another binding type.
+        inline = add_after(self.shipped, "[build]",
+                           'kv_namespaces = [{ binding = "KEYS_A", id = "0123" }]')
+        for fixture, binding in ((services, "KEYS_A"), (quoted, "KEYS_B"), (inline, "KEYS_A")):
+            for env in ({}, self.both()):
+                with self.subTest(binding=binding, env=env):
+                    self.refused(env, f"the prod section of the shipped file binds {binding}", fixture)
+
+    def test_read_back_refuses_a_key_table_that_is_not_what_was_asked(self):
+        # A line after the cache bucket's name lands in the KEYS_B table.
+        fixture = add_after(self.shipped, self.cache, 'jurisdiction = "eu"')
+        self.refused(self.both(), "the generated config does not carry the expected key bucket bindings",
+                     fixture)
 
     def test_a_shipped_key_binding_with_a_comment_is_refused(self):
         # No spaces around `=`, and a comment after the value.
