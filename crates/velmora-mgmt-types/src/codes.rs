@@ -10,6 +10,7 @@
 //! | Code | Status | Retry-After | When | `kofra-api` |
 //! |---|---|---|---|---|
 //! | `bad_request`, `grant_limits_not_served`, `idempotency_key_required` | 400 | — | malformed or not served | `Upstream` |
+//! | `jurisdiction_not_served` | 400 | — | a tenant create names a jurisdiction other than `none` (milestone 1 serves `none` only) | `Upstream` |
 //! | `invalid_position` | 400 | — | a position that does not parse | `InvalidCursor` |
 //! | `unauthenticated` | 401 | — | token | `Upstream` |
 //! | `insufficient_scope`, `internal_key_refused`, `acting_principal_unknown`, `acting_principal_inactive` | 403 | — | wrong token class; the tenant's internal key; the acting header | `Upstream` |
@@ -50,6 +51,7 @@ use serde::{Deserialize, Serialize};
 pub enum Code {
     BadRequest,
     GrantLimitsNotServed,
+    JurisdictionNotServed,
     IdempotencyKeyRequired,
     InvalidPosition,
     Unauthenticated,
@@ -137,9 +139,10 @@ pub enum TenancyMapping {
 
 impl Code {
     /// Every code, in the order of the table.
-    pub const ALL: [Code; 38] = [
+    pub const ALL: [Code; 39] = [
         Code::BadRequest,
         Code::GrantLimitsNotServed,
+        Code::JurisdictionNotServed,
         Code::IdempotencyKeyRequired,
         Code::InvalidPosition,
         Code::Unauthenticated,
@@ -184,6 +187,7 @@ impl Code {
         match self {
             BadRequest => "bad_request",
             GrantLimitsNotServed => "grant_limits_not_served",
+            JurisdictionNotServed => "jurisdiction_not_served",
             IdempotencyKeyRequired => "idempotency_key_required",
             InvalidPosition => "invalid_position",
             Unauthenticated => "unauthenticated",
@@ -233,7 +237,11 @@ impl Code {
     pub fn status(self) -> u16 {
         use Code::*;
         match self {
-            BadRequest | GrantLimitsNotServed | IdempotencyKeyRequired | InvalidPosition => 400,
+            BadRequest
+            | GrantLimitsNotServed
+            | JurisdictionNotServed
+            | IdempotencyKeyRequired
+            | InvalidPosition => 400,
             Unauthenticated => 401,
             InsufficientScope
             | InternalKeyRefused
@@ -287,6 +295,7 @@ impl Code {
         match self {
             BadRequest
             | GrantLimitsNotServed
+            | JurisdictionNotServed
             | IdempotencyKeyRequired
             | Unauthenticated
             | InsufficientScope

@@ -61,7 +61,7 @@ pub const EXAMPLES: &[Example] = &[
         token: TokenClass::Confirmed,
         acting: None,
         idempotency_key: Some("ws_01JD2Q8V5X"),
-        request: Some(r#"{"external_ref": "ws_01JD2Q8V5X", "jurisdiction": "us"}"#),
+        request: Some(r#"{"external_ref": "ws_01JD2Q8V5X"}"#),
         status: 201,
         answer: Some(TENANT_JSON),
     },
