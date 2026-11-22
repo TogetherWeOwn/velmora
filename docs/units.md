@@ -410,11 +410,15 @@ hands the message back with the queue's `retry_delay`; `Unborn` reads the
 tenant's verified head (listed: dead-letter queue and a "catalogue lost"
 page; not listed: acknowledged; a head that cannot be read: handed back);
 `AccountProblem` while the tenant is shredding is acknowledged with no
-page; anything else goes to the dead-letter queue and pages. A job runs
-once more at most once per delivery, with numbers never below the
-message's, and only after the outbox lease its first run claimed is given
-back (`TenantCatalog::give_back`; if it cannot be, the message is handed
-back). The unit client's other outcomes take the same rows: closed or a
+page; anything else goes to the dead-letter queue and pages. Each fix
+(the unit's numbers, a renewal, a `sync`) runs at most once per delivery,
+with numbers never below the message's, and only after the outbox lease
+the last run claimed is given back (`TenantCatalog::give_back`; if it
+cannot be, the message is handed back). A run the job table gave up is
+not run once more. A hand-back whose lease could not be given back
+leaves the row leased: a redelivery within the lease (600 s) is
+acknowledged, and the unit's dispatcher sends the row again after it, so
+the work waits at most the lease and one dispatcher period. The unit client's other outcomes take the same rows: closed or a
 lift pending is acknowledged, unborn reads the head, a unit the head no
 longer lists is acknowledged, and every page it returns is logged as an
 alert. The unit jobs `renew` and

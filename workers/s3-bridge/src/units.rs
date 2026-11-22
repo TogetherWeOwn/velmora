@@ -36,10 +36,10 @@
 
 use velmora_bridge::jobmsg::{JobTenant, Units};
 use velmora_bridge::sql::SqlCatalog;
-use velmora_bridge::tenant_catalog::{LatestSeqs, TenantCatalog, UnitPort, UnitRefusal};
+use velmora_bridge::tenant_catalog::{LatestSeqs, TenantCatalog, UnitPort};
 use velmora_bridge::types::JobOutcome;
 use velmora_bridge::unit::{Seqs, TenantId, UnitAnswer, UnitCall, UnitName, UnitReply};
-use velmora_bridge::unit_consumer::{NoClient, UnitRun};
+use velmora_bridge::unit_consumer::{NoClient, Ran, UnitRun};
 use velmora_bridge::unit_lease::client::UnitReplies;
 use velmora_bridge::unit_router::NoHeads;
 use velmora_bridge::{Bridge, BridgeError, Result};
@@ -206,16 +206,22 @@ pub struct OnUnit<'a> {
 }
 
 impl UnitRun for OnUnit<'_> {
-    async fn run(&self, seqs: Seqs) -> (JobOutcome, Option<UnitRefusal>) {
+    async fn run(&self, seqs: Seqs) -> Ran {
         self.bridge.catalog.run_again_with(seqs);
         let now = velmora_bridge::ports::Clock::now(&self.bridge.clock);
-        let (u, j, scope) = (
+        // Set when the job itself ended: the table can also answer a
+        // retry of its own for a job it gave up.
+        let ended = std::rc::Rc::new(std::cell::Cell::new(false));
+        let (u, j, scope, done) = (
             std::rc::Rc::clone(&self.bridge),
             self.job.clone(),
             self.scope.clone(),
+            std::rc::Rc::clone(&ended),
         );
         let outcome = match crate::jobs::run(now, crate::is_post(self.job), async move {
-            u.run_job(&scope, &j).await
+            let outcome = u.run_job(&scope, &j).await;
+            done.set(true);
+            outcome
         })
         .await
         {
@@ -226,7 +232,11 @@ impl UnitRun for OnUnit<'_> {
             },
         };
         crate::log_post_trace(self.job, &outcome);
-        (outcome, self.bridge.catalog.refusal())
+        Ran {
+            outcome,
+            refusal: self.bridge.catalog.refusal(),
+            finished: ended.get(),
+        }
     }
 
     async fn prepare(&self, seqs: Seqs) -> bool {
