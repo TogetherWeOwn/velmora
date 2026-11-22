@@ -3,7 +3,7 @@
 //! against fakes before the unit and the directory exist (tenant
 //! side) exist.
 
-use super::record::{Entry, KeyOp, Rid, Subject};
+use super::record::{Entry, KeyOp, Marker, Rid, Subject};
 use crate::crypto::scheme2::TenantId;
 use crate::types::{BridgeError, BucketId, Result};
 
@@ -27,9 +27,14 @@ pub enum ApplyEntry {
     /// entry is sent without its secret, and then also without
     /// `secret_kek_version` (the unit refuses one without the other).
     Subject(Entry),
-    /// A marker record (`KeysFrozen`, `KeysThawed`; AM-28): it changes no
-    /// subject. The store skips it; it holds its seq's place in the run.
-    Marker { seq: u64 },
+    /// A marker record (`KeysFrozen`, `KeysThawed`; AM-28, AM-62): it
+    /// changes no subject. The store writes no row for it; it holds its
+    /// seq's place in the run, so the run has no gap. `marker` is the
+    /// record's kind as the chain states it.
+    ///
+    /// For the unit's wire (`KeyMarker`): `{"marker": "keys_frozen" |
+    /// "keys_thawed", "seq": seq}` (a thaw's `ends` is not sent).
+    Marker { seq: u64, marker: Marker },
 }
 
 impl ApplyEntry {
@@ -37,7 +42,7 @@ impl ApplyEntry {
     pub fn seq(&self) -> u64 {
         match self {
             ApplyEntry::Subject(e) => e.last_seq,
-            ApplyEntry::Marker { seq } => *seq,
+            ApplyEntry::Marker { seq, .. } => *seq,
         }
     }
 }

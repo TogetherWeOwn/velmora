@@ -70,8 +70,8 @@ struct FakeTarget {
     rows: RefCell<BTreeMap<String, Entry>>,
     down: Cell<bool>,
     applies: Cell<u32>,
-    /// The seqs of the markers it was sent.
-    markers: RefCell<Vec<u64>>,
+    /// The markers it was sent: seq and kind.
+    markers: RefCell<Vec<(u64, Marker)>>,
     /// Goes down after this many more applies.
     down_after: Cell<Option<u32>>,
 }
@@ -159,8 +159,8 @@ impl KeyTarget for FakeTarget {
         for e in entries {
             let e = match e {
                 ApplyEntry::Subject(e) => e,
-                ApplyEntry::Marker { seq } => {
-                    self.markers.borrow_mut().push(*seq);
+                ApplyEntry::Marker { seq, marker } => {
+                    self.markers.borrow_mut().push((*seq, *marker));
                     continue;
                 }
             };
@@ -5777,7 +5777,7 @@ async fn a_freeze_the_receipt_does_not_name_is_thawed_before_a_new_one() {
 // apply(from_seq): one entry per record, pages, Behind
 // ---------------------------------------------------------------------------
 
-use velmora_bridge::keys::apply::{apply_direct, ERR_APPLY_BEHIND};
+use velmora_bridge::keys::apply::{apply_direct, Feed, ERR_APPLY_BEHIND};
 
 /// Plants `subject` at `seq` with `op` (no reservation: a fixture).
 fn plant(w: &World, seq: u64, op: KeyOp, subject: &Subject, frozen_at: Option<u64>) {
@@ -5940,8 +5940,175 @@ async fn markers_hold_their_place_in_the_run() {
     .await
     .unwrap();
     assert_eq!(unit.seq.get(), 7);
-    assert_eq!(*unit.markers.borrow(), vec![4, 6]);
+    assert_eq!(
+        *unit.markers.borrow(),
+        vec![(4, Marker::KeysFrozen), (6, Marker::KeysThawed { ends: 3 })]
+    );
     assert_eq!(unit.rows.borrow().len(), 4);
+}
+
+/// The seqs of `items`, and whether they run from `after + 1` with no gap.
+fn runs_from(after: u64, items: &[ApplyEntry]) -> bool {
+    items
+        .iter()
+        .enumerate()
+        .all(|(i, e)| e.seq() == after + 1 + i as u64)
+}
+
+/// L3's ask (AM-62): the read behind `OwnerKeys::entries` answers the
+/// `KeysFrozen` and `KeysThawed` records in place, as markers of their
+/// kind, in seq order with no gap, page by page, and stops at the head.
+#[tokio::test(flavor = "current_thread")]
+async fn entries_answer_the_freeze_markers_in_place_with_no_gap() {
+    let w = World::new();
+    plant_principals(&w, 3);
+    plant_marker(&w, 4, Marker::KeysFrozen);
+    plant(
+        &w,
+        5,
+        KeyOp::Grants,
+        &principal("PA0001", &[grant("b_09", RW, None)]),
+        Some(3),
+    );
+    plant_marker(&w, 6, Marker::KeysThawed { ends: 3 });
+    plant(&w, 7, KeyOp::Create, &principal("PA0007", &[]), None);
+    let table = head_table(&w).await;
+    let none = Default::default();
+    let feed = Feed::new(&w.store, &w.kek, &w.ring, &table, &none);
+
+    // One read of the whole chain.
+    let all = feed.entries(0, 100).await.unwrap();
+    assert!(runs_from(0, &all));
+    assert_eq!(all.len(), 7);
+    assert_eq!(
+        all[3],
+        ApplyEntry::Marker {
+            seq: 4,
+            marker: Marker::KeysFrozen
+        }
+    );
+    assert_eq!(
+        all[5],
+        ApplyEntry::Marker {
+            seq: 6,
+            marker: Marker::KeysThawed { ends: 3 }
+        }
+    );
+    for (i, e) in all.iter().enumerate() {
+        if i == 3 || i == 5 {
+            continue;
+        }
+        let ApplyEntry::Subject(e) = e else {
+            panic!("seq {}: a subject's record read as a marker", i + 1);
+        };
+        // The head's state, stamped at the record's seq.
+        let mut head = table.get(&e.door.id).unwrap().clone();
+        head.last_seq = e.last_seq;
+        head.rid = None;
+        assert_eq!(*e, head);
+    }
+
+    // Pages of two, as the caller reads them (`after` = the last seq it
+    // got): the same items, every page from `after + 1`, a page ending on
+    // a marker included.
+    let mut paged = Vec::new();
+    let mut after = 0;
+    loop {
+        let page = feed.entries(after, 2).await.unwrap();
+        let Some(last) = page.last().map(ApplyEntry::seq) else {
+            break;
+        };
+        assert!(page.len() <= 2);
+        assert!(runs_from(after, &page), "a gap after {after}");
+        after = last;
+        paged.extend(page);
+    }
+    assert_eq!(after, 7);
+    assert_eq!(paged, all);
+
+    // Past the head, at it, and a zero limit: nothing.
+    assert!(feed.entries(7, 100).await.unwrap().is_empty());
+    assert!(feed.entries(9, 100).await.unwrap().is_empty());
+    assert!(feed.entries(2, 0).await.unwrap().is_empty());
+    // A page from the middle starts on the marker.
+    let mid = feed.entries(3, 1).await.unwrap();
+    assert_eq!(
+        mid,
+        vec![ApplyEntry::Marker {
+            seq: 4,
+            marker: Marker::KeysFrozen
+        }]
+    );
+}
+
+/// A frozen head: the chain ends on its `KeysFrozen` (and the records
+/// after it carry `frozen_at`); the read ends on the marker, and a page
+/// is never larger than [`MAX_APPLY`] whatever the caller asks.
+#[tokio::test(flavor = "current_thread")]
+async fn entries_end_on_a_frozen_head_and_keep_to_a_page() {
+    let w = World::new();
+    plant_principals(&w, 150);
+    plant_marker(&w, 151, Marker::KeysFrozen);
+    let table = head_table(&w).await;
+    assert_eq!(table.frozen_at(), Some(150));
+    let none = Default::default();
+    let feed = Feed::new(&w.store, &w.kek, &w.ring, &table, &none);
+    let first = feed.entries(0, 1_000).await.unwrap();
+    assert_eq!(first.len(), MAX_APPLY);
+    assert!(runs_from(0, &first));
+    let rest = feed.entries(100, 1_000).await.unwrap();
+    assert!(runs_from(100, &rest));
+    assert_eq!(rest.len(), 51);
+    assert_eq!(
+        rest.last(),
+        Some(&ApplyEntry::Marker {
+            seq: 151,
+            marker: Marker::KeysFrozen
+        })
+    );
+    assert!(rest[..50]
+        .iter()
+        .all(|e| matches!(e, ApplyEntry::Subject(_))));
+}
+
+/// A marker record that does not verify, or is gone, fails the read: it
+/// is never left out (which would read as a gap, or as the end).
+#[tokio::test(flavor = "current_thread")]
+async fn a_marker_that_does_not_verify_fails_the_read() {
+    let w = World::new();
+    plant_principals(&w, 2);
+    plant_marker(&w, 3, Marker::KeysFrozen);
+    plant_marker(&w, 4, Marker::KeysThawed { ends: 2 });
+    plant(&w, 5, KeyOp::Create, &principal("PA0005", &[]), None);
+    let table = head_table(&w).await;
+    let none = Default::default();
+    let name = key_chain(&w.t).name(4);
+    let good = w.store.raw(&name).unwrap();
+    let mut bad = good.clone();
+    let last = bad.len() - 1;
+    bad[last] ^= 1;
+    w.store.plant(&name, bad);
+    let feed = Feed::new(&w.store, &w.kek, &w.ring, &table, &none);
+    assert!(feed.entries(0, 100).await.is_err());
+    assert!(feed.entries(3, 100).await.is_err());
+    // Below it the read still answers, up to the record before it.
+    assert_eq!(feed.entries(0, 3).await.unwrap().len(), 3);
+    // A marker record gone from the store.
+    assert!(w.store.lose(&name));
+    let feed = Feed::new(&w.store, &w.kek, &w.ring, &table, &none);
+    assert!(feed.entries(3, 100).await.is_err());
+    // Put back: the read answers again.
+    w.store.plant(&name, good);
+    let feed = Feed::new(&w.store, &w.kek, &w.ring, &table, &none);
+    let tail = feed.entries(3, 100).await.unwrap();
+    assert!(runs_from(3, &tail));
+    assert_eq!(
+        tail[0],
+        ApplyEntry::Marker {
+            seq: 4,
+            marker: Marker::KeysThawed { ends: 2 }
+        }
+    );
 }
 
 /// A store restored between its `keys_seq` and the apply answers
@@ -6576,7 +6743,13 @@ async fn an_older_record_never_opens_a_subject_between_pages() {
         KeyTarget::apply(
             &unit,
             0,
-            &[ApplyEntry::Marker { seq: 1 }, ApplyEntry::Subject(e)],
+            &[
+                ApplyEntry::Marker {
+                    seq: 1,
+                    marker: Marker::KeysFrozen,
+                },
+                ApplyEntry::Subject(e),
+            ],
         )
         .await
         .unwrap();
