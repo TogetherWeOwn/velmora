@@ -25,11 +25,6 @@ use crate::unit::identity::{self, CallKind, Seqs};
 use crate::unit::jobcall::JobCall;
 use crate::unit::{Refused, UnitAnswer, UnitCall, UnitName, UnitOp};
 
-/// The unit's lease has expired (ADR §2.4 rule 12): it runs no job until
-/// a renewal; the consumer retries later (the unit's alarm sends the
-/// `renew` job).
-pub const UNIT_RENEW_NEEDED: &str = "unit: renew needed";
-
 /// A method the job path does not use: not served through a unit.
 pub const NOT_ON_UNIT: &str = "not on the unit job path";
 /// The unit holds a newer record than the job: `sync` first.
@@ -37,12 +32,80 @@ pub const UNIT_SYNC_NEEDED: &str = "unit: sync needed";
 /// The job's numbers are below the unit's, or missing: run it again with
 /// fresh numbers, or drop it.
 pub const UNIT_STALE_JOB: &str = "unit: stale job";
+/// The unit's lease has run out: `renew` first (rule 12).
+pub const UNIT_RENEW_NEEDED: &str = "unit: renew needed";
 /// The unit is closed (restoring or provisioning).
 pub const UNIT_CLOSED: &str = "unit: closed";
 /// The unit has no certificate.
 pub const UNIT_UNBORN: &str = "unit: unborn";
+/// The tenant's state does not allow the call (a shred, for a job).
+pub const UNIT_ACCOUNT_PROBLEM: &str = "unit: account problem";
 /// The unit refused the call for another reason; the Worker alarms.
 pub const UNIT_REFUSED: &str = "unit: refused";
+
+/// Why the unit refused a job call: what the consumer needs to decide the
+/// delivery (`crate::unit_consumer`, ADR §2.4 rule 5 as AM-50 states it).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UnitRefusal {
+    /// `Stale{seqs}`: the job's numbers are below the unit's, which come
+    /// with the answer.
+    Stale(Seqs),
+    /// `Refused{stale_job}`: a job call with no numbers, or (before the
+    /// unit answers `Stale{seqs}` to job calls) with lower ones.
+    StaleJob,
+    /// `SyncNeeded`: the job knows a newer record than the unit.
+    SyncNeeded,
+    /// `renew_needed`: the unit's lease has run out.
+    RenewNeeded,
+    /// `Closed` (restoring or provisioning).
+    Closed,
+    /// `Unborn`: the unit has no certificate.
+    Unborn,
+    /// `Refused{account_problem}`: the tenant's state refuses jobs.
+    AccountProblem,
+    /// Any other refusal.
+    Other,
+}
+
+impl UnitRefusal {
+    /// The text of the error the job code sees (one of the `UNIT_*`).
+    pub fn text(self) -> &'static str {
+        match self {
+            UnitRefusal::Stale(_) | UnitRefusal::StaleJob => UNIT_STALE_JOB,
+            UnitRefusal::SyncNeeded => UNIT_SYNC_NEEDED,
+            UnitRefusal::RenewNeeded => UNIT_RENEW_NEEDED,
+            UnitRefusal::Closed => UNIT_CLOSED,
+            UnitRefusal::Unborn => UNIT_UNBORN,
+            UnitRefusal::AccountProblem => UNIT_ACCOUNT_PROBLEM,
+            UnitRefusal::Other => UNIT_REFUSED,
+        }
+    }
+}
+
+/// The highest numbers a unit has answered in a job's run, shared between
+/// the job's catalogue and its queue sink: a follow-up job carries them
+/// (AM-50, L6-7d), never lower ones than the job came with.
+#[derive(Clone, Debug)]
+pub struct LatestSeqs(std::rc::Rc<std::cell::Cell<Seqs>>);
+
+impl LatestSeqs {
+    pub fn new(seqs: Seqs) -> LatestSeqs {
+        LatestSeqs(std::rc::Rc::new(std::cell::Cell::new(seqs)))
+    }
+
+    pub fn get(&self) -> Seqs {
+        self.0.get()
+    }
+
+    /// Each number to the higher of the two.
+    pub fn raise(&self, seqs: Seqs) {
+        let now = self.0.get();
+        self.0.set(Seqs {
+            state_seq: now.state_seq.max(seqs.state_seq),
+            keys_seq: now.keys_seq.max(seqs.keys_seq),
+        });
+    }
+}
 
 /// The way to a unit: one call, one answer.
 #[allow(async_fn_in_trait)]
@@ -55,36 +118,70 @@ pub struct TenantCatalog<P: UnitPort, S: Catalog> {
     port: P,
     shared: S,
     name: UnitName,
-    seqs: Seqs,
-    /// The first refusal the unit gave (one of the `UNIT_*` texts).
-    refusal: std::cell::Cell<Option<&'static str>>,
+    /// The numbers the job calls carry: the message's, or the unit's for a
+    /// run again ([`TenantCatalog::run_again_with`]).
+    seqs: std::cell::Cell<Seqs>,
+    /// The first refusal the unit gave in this run.
+    refusal: std::cell::Cell<Option<UnitRefusal>>,
+    latest: LatestSeqs,
 }
 
 impl<P: UnitPort, S: Catalog> TenantCatalog<P, S> {
     /// `seqs`: the job's numbers (its message names them, ADR §2.4 rule 9).
     pub fn new(port: P, shared: S, name: UnitName, seqs: Seqs) -> Self {
+        Self::with_latest(port, shared, name, seqs, LatestSeqs::new(seqs))
+    }
+
+    /// As [`TenantCatalog::new`], raising `latest` with the numbers of
+    /// every answer (the job's queue sink reads it).
+    pub fn with_latest(port: P, shared: S, name: UnitName, seqs: Seqs, latest: LatestSeqs) -> Self {
+        latest.raise(seqs);
         TenantCatalog {
             port,
             shared,
             name,
-            seqs,
+            seqs: std::cell::Cell::new(seqs),
             refusal: std::cell::Cell::new(None),
+            latest,
         }
+    }
+
+    /// The unit the job calls go to.
+    pub fn name(&self) -> &UnitName {
+        &self.name
+    }
+
+    /// The numbers the job calls carry now.
+    pub fn seqs(&self) -> Seqs {
+        self.seqs.get()
+    }
+
+    /// The highest numbers the unit answered so far.
+    pub fn latest(&self) -> &LatestSeqs {
+        &self.latest
+    }
+
+    /// Before the job runs once more (AM-50): its calls carry `seqs`, and
+    /// the refusal of the last run is forgotten.
+    pub fn run_again_with(&self, seqs: Seqs) {
+        self.seqs.set(seqs);
+        self.latest.raise(seqs);
+        self.refusal.set(None);
     }
 
     /// The first refusal the unit gave since this catalogue was made: the
     /// job code turns every error into a retry, so the consumer reads it
     /// here after `run_job` and re-reads the heads, then runs the job
     /// again with fresh numbers or drops it (ADR §2.4 rule 5).
-    pub fn refusal(&self) -> Option<&'static str> {
+    pub fn refusal(&self) -> Option<UnitRefusal> {
         self.refusal.get()
     }
 
-    fn refused(&self, why: &'static str) -> BridgeError {
+    fn refused(&self, why: UnitRefusal) -> BridgeError {
         if self.refusal.get().is_none() {
             self.refusal.set(Some(why));
         }
-        BridgeError::Invalid(why)
+        BridgeError::Invalid(why.text())
     }
 
     pub fn shared(&self) -> &S {
@@ -95,23 +192,35 @@ impl<P: UnitPort, S: Catalog> TenantCatalog<P, S> {
         let c = UnitCall {
             name: self.name.clone(),
             kind: CallKind::Job,
-            seqs: Some(self.seqs),
+            seqs: Some(self.seqs.get()),
             authenticated: true,
-            listed: true,
+            // A job reaches its unit through its message, not through a
+            // record that lists it: an unborn unit answers `Unborn`, and
+            // the consumer reads the tenant's head to tell a lost
+            // catalogue from a unit that was removed (AM-50, rule 7).
+            listed: false,
             op: UnitOp::Job { call },
         };
-        match self.port.call(&c).await? {
+        let answer = self.port.call(&c).await?;
+        if let Some(seqs) = answer_seqs(&answer) {
+            self.latest.raise(seqs);
+        }
+        match answer {
             UnitAnswer::Ok { body, .. } => serde_json::from_value(body)
                 .map_err(|_| BridgeError::Sql("unit: job answer does not decode".into())),
-            UnitAnswer::SyncNeeded { .. } => Err(self.refused(UNIT_SYNC_NEEDED)),
+            UnitAnswer::SyncNeeded { .. } => Err(self.refused(UnitRefusal::SyncNeeded)),
+            UnitAnswer::Stale { seqs } => Err(self.refused(UnitRefusal::Stale(seqs))),
             UnitAnswer::Refused {
                 reason: Refused::Identity(identity::Refusal::StaleJob),
                 ..
-            }
-            | UnitAnswer::Stale { .. } => Err(self.refused(UNIT_STALE_JOB)),
-            UnitAnswer::Closed { .. } => Err(self.refused(UNIT_CLOSED)),
-            UnitAnswer::RenewNeeded { .. } => Err(self.refused(UNIT_RENEW_NEEDED)),
-            UnitAnswer::Unborn { .. } => Err(self.refused(UNIT_UNBORN)),
+            } => Err(self.refused(UnitRefusal::StaleJob)),
+            UnitAnswer::Refused {
+                reason: Refused::AccountProblem,
+                ..
+            } => Err(self.refused(UnitRefusal::AccountProblem)),
+            UnitAnswer::Closed { .. } => Err(self.refused(UnitRefusal::Closed)),
+            UnitAnswer::RenewNeeded { .. } => Err(self.refused(UnitRefusal::RenewNeeded)),
+            UnitAnswer::Unborn { .. } => Err(self.refused(UnitRefusal::Unborn)),
             UnitAnswer::Failed { class } => Err(match class.as_str() {
                 "guard" => BridgeError::GuardFailed,
                 "catalogue_id" => crate::stamp::ERR_CATALOGUE_ID,
@@ -120,8 +229,23 @@ impl<P: UnitPort, S: Catalog> TenantCatalog<P, S> {
             }),
             UnitAnswer::Refused { .. }
             | UnitAnswer::KeysBehind { .. }
-            | UnitAnswer::UndoBookmark { .. } => Err(self.refused(UNIT_REFUSED)),
+            | UnitAnswer::UndoBookmark { .. } => Err(self.refused(UnitRefusal::Other)),
         }
+    }
+}
+
+/// The unit's own numbers in an answer that carries them. `SyncNeeded`
+/// carries numbers below the job's: raising with them changes nothing.
+fn answer_seqs(answer: &UnitAnswer) -> Option<Seqs> {
+    match answer {
+        UnitAnswer::Ok { seqs, .. }
+        | UnitAnswer::SyncNeeded { seqs }
+        | UnitAnswer::Stale { seqs }
+        | UnitAnswer::RenewNeeded { seqs, .. }
+        | UnitAnswer::KeysBehind { seqs }
+        | UnitAnswer::UndoBookmark { seqs, .. }
+        | UnitAnswer::Closed { seqs, .. } => Some(*seqs),
+        UnitAnswer::Refused { .. } | UnitAnswer::Unborn { .. } | UnitAnswer::Failed { .. } => None,
     }
 }
 

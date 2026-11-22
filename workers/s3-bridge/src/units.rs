@@ -23,13 +23,25 @@
 //!   (`ByteBudget::shared`).
 //!
 //! After `run_job`, the first refusal the unit gave decides the delivery
-//! (`velmora_bridge::unit_consumer`).
+//! (`velmora_bridge::unit_consumer::deliver`, the AM-50 table); a
+//! follow-up job carries the numbers of the unit's latest answer. A unit
+//! job (`renew`, `stamp_raise`) runs through the unit client
+//! (`deliver_unit_job`).
+//!
+//! **This build has no unit client and no tenant head reader** (lanes L2
+//! and L3, on the C(b) base): [`client`] and [`heads`] fail every call,
+//! so a `renew_needed`, a `SyncNeeded`, an `Unborn`, a shred's refusal and
+//! every unit job are handed back until the dead-letter queue, which
+//! pages. Never acknowledged on a read that was not made.
 
 use velmora_bridge::jobmsg::{JobTenant, Units};
 use velmora_bridge::sql::SqlCatalog;
-use velmora_bridge::tenant_catalog::{TenantCatalog, UnitPort};
+use velmora_bridge::tenant_catalog::{LatestSeqs, TenantCatalog, UnitPort, UnitRefusal};
+use velmora_bridge::types::JobOutcome;
 use velmora_bridge::unit::{Seqs, TenantId, UnitAnswer, UnitCall, UnitName, UnitReply};
+use velmora_bridge::unit_consumer::{NoClient, UnitRun};
 use velmora_bridge::unit_lease::client::UnitReplies;
+use velmora_bridge::unit_router::NoHeads;
 use velmora_bridge::{Bridge, BridgeError, Result};
 use worker::wasm_bindgen::JsValue;
 use worker::{Env, Method, ObjectNamespace, Request, RequestInit, Stub};
@@ -157,8 +169,10 @@ pub fn unit_bridge(
         state_seq: tenant.state_seq(),
         keys_seq: tenant.keys_seq(),
     };
+    let latest = LatestSeqs::new(seqs);
+    let jobs = jobs.with_latest(latest.clone());
     Ok(Bridge {
-        catalog: TenantCatalog::new(port, shared, name, seqs),
+        catalog: TenantCatalog::with_latest(port, shared, name, seqs, latest),
         safety,
         cache,
         nntp: WorkerConnector::new(),
@@ -168,6 +182,49 @@ pub fn unit_bridge(
         budget: base.budget.shared(),
         cfg,
     })
+}
+
+/// The unit client of this build: none (see the [module](self)).
+pub fn client() -> NoClient {
+    NoClient
+}
+
+/// The tenant head reader of this build: none (see the [module](self)).
+pub fn heads() -> NoHeads {
+    NoHeads
+}
+
+/// One run of a job on its unit's bridge, in the isolate's job table as
+/// every job (`crate::jobs::run`).
+pub struct OnUnit<'a> {
+    pub bridge: std::rc::Rc<UnitBridge>,
+    pub scope: &'a velmora_bridge::TenantScope,
+    pub job: &'a velmora_bridge::Job,
+}
+
+impl UnitRun for OnUnit<'_> {
+    async fn run(&self, seqs: Seqs) -> (JobOutcome, Option<UnitRefusal>) {
+        self.bridge.catalog.run_again_with(seqs);
+        let now = velmora_bridge::ports::Clock::now(&self.bridge.clock);
+        let (u, j, scope) = (
+            std::rc::Rc::clone(&self.bridge),
+            self.job.clone(),
+            self.scope.clone(),
+        );
+        let outcome = match crate::jobs::run(now, crate::is_post(self.job), async move {
+            u.run_job(&scope, &j).await
+        })
+        .await
+        {
+            Some(outcome) => outcome,
+            // `jobs::run` has logged it.
+            None => JobOutcome::Retry {
+                delay_secs: velmora_bridge::jobs::INFRA_RETRY_SECS,
+            },
+        };
+        crate::log_post_trace(self.job, &outcome);
+        (outcome, self.bridge.catalog.refusal())
+    }
 }
 
 #[cfg(test)]
