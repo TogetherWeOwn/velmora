@@ -96,8 +96,8 @@ pub const ERR_TK_VOIDS: BridgeError =
 pub const ERR_TK_UNBOUND: BridgeError = BridgeError::Invalid("key location has no binding");
 /// The tenant chain keeps no check value for the version: it is not
 /// committed, and is never loaded (ADR §3.2, AM-10).
-pub const ERR_TK_NOT_COMMITTED: BridgeError =
-    BridgeError::Crypto("tenant key version is not committed");
+pub const ERR_TK_NOT_COMMITTED: BridgeError = BridgeError::Crypto(NOT_COMMITTED);
+const NOT_COMMITTED: &str = "tenant key version is not committed";
 /// The version that new records are sealed under is marked gone: a
 /// tenant chain that says so is damaged or misread.
 pub const ERR_TK_CURRENT_GONE: BridgeError =
@@ -580,10 +580,14 @@ impl TkCache {
 /// A ring as [`load_ring`] built it.
 pub struct RingLoad {
     pub ring: LoadedRing,
-    /// Older versions that did not load now (a store or KEK error, or not
-    /// committed): records sealed under them stay closed, and the caller
-    /// retries.
+    /// Older versions that did not load now (a store or KEK error):
+    /// records sealed under them stay closed, the ring is partial
+    /// ([`TkRing::partial`]), and the caller retries.
     pub failed: Vec<u32>,
+    /// Older versions asked for that the head does not hold as committed:
+    /// never loaded, and no reason to retry (the caller names versions
+    /// from `key_checks`).
+    pub not_committed: Vec<u32>,
 }
 
 /// The ring of `tenant`: `current` (the head's `tk_version`) and the
@@ -612,6 +616,7 @@ pub async fn load_ring<S: RecordStore, K: Kek, T: Clock, C: KeyVersionClaims>(
     let mut others = Vec::new();
     let mut gone = BTreeSet::new();
     let mut failed = Vec::new();
+    let mut not_committed = Vec::new();
     let wanted: BTreeSet<u32> = older.iter().copied().filter(|v| *v != current).collect();
     for version in wanted {
         match cache
@@ -624,13 +629,18 @@ pub async fn load_ring<S: RecordStore, K: Kek, T: Clock, C: KeyVersionClaims>(
             }
             // A marker or a foreign name refuses the tenant: no ring.
             Err(e) if is_foreign(&e) => return Err(e),
+            Err(BridgeError::Crypto(m)) if m == NOT_COMMITTED => not_committed.push(version),
             Err(_) => failed.push(version),
         }
     }
     let ring = LoadedRing::new(current_key, others)?
         .with_gone(gone)
         .with_partial(!failed.is_empty());
-    Ok(RingLoad { ring, failed })
+    Ok(RingLoad {
+        ring,
+        failed,
+        not_committed,
+    })
 }
 
 /// Key version `version` of `tenant` with the committed check value

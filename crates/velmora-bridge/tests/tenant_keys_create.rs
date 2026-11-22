@@ -1584,7 +1584,12 @@ async fn a_version_that_is_not_committed_is_never_loaded() {
     )
     .await
     .unwrap();
-    assert_eq!(load.failed, vec![3]);
+    assert!(load.failed.is_empty());
+    assert_eq!(load.not_committed, vec![3]);
+    assert!(
+        !load.ring.partial(),
+        "a version never committed is no load error"
+    );
     assert!(load.ring.key(3).is_none());
     assert!(load.ring.key(1).is_some());
     // A current version that is not committed fails the ring.

@@ -433,51 +433,75 @@ async fn reopen_from_older<S: RecordStore, K: Kek, T: TkRing>(
     Ok(())
 }
 
-/// Whether a checkpoint of `tenant` may still carry the private part of
-/// `id` recorded at `private_seq` under a key version the ring does not
-/// mark gone: one at or after that seq that cannot be read or verified,
-/// or one sealed under a version that is not gone and naming the subject
-/// open with that `private_seq`. A reader that finds one must not take
-/// the private part for lost (AM-11): a transient error is not a loss.
-pub(super) async fn may_hold_private<S: RecordStore, K: Kek, T: TkRing>(
+/// What the checkpoints of a tenant may still hold under key versions
+/// the ring does not mark gone (AM-11).
+#[derive(Debug, Default)]
+pub(super) struct Holds {
+    /// (subject, `private_seq`) pairs a checkpoint carries open.
+    held: BTreeSet<(String, u64)>,
+    /// The highest seq of a checkpoint that could not be listed, read or
+    /// verified: it may hold any private part at or before it.
+    max_unread: Option<u64>,
+}
+
+impl Holds {
+    /// Whether a checkpoint may still carry the private part of `id`
+    /// recorded at `private_seq`. A reader must then not take it for
+    /// lost: a transient error is not a loss.
+    pub(super) fn may_hold(&self, id: &str, private_seq: u64) -> bool {
+        self.max_unread.is_some_and(|m| m >= private_seq)
+            || self.held.contains(&(id.to_owned(), private_seq))
+    }
+}
+
+/// One pass over `tenant`'s checkpoints at or after `from`: every
+/// checkpoint is listed once, and the door of each is read once.
+pub(super) async fn checkpoint_holds<S: RecordStore, K: Kek, T: TkRing>(
     store: &S,
     kek: &K,
     ring: &T,
     tenant: &TenantId,
-    id: &str,
-    private_seq: u64,
-) -> bool {
+    from: u64,
+) -> Holds {
+    let mut holds = Holds::default();
     let Ok(checkpoints) = list_checkpoints(store, tenant).await else {
-        return true;
+        holds.max_unread = Some(u64::MAX);
+        return holds;
     };
-    for seq in checkpoints.into_iter().filter(|s| *s >= private_seq) {
+    let unread = |seq: u64, holds: &mut Holds| {
+        holds.max_unread = Some(holds.max_unread.map_or(seq, |m| m.max(seq)));
+    };
+    for seq in checkpoints.into_iter().filter(|s| *s >= from) {
         let name = checkpoint_name(tenant, seq);
         let Ok(Some(bytes)) = store.get(&name).await else {
-            return true;
+            unread(seq, &mut holds);
+            continue;
         };
         let Ok(opened) = parse_control(&bytes)
             .and_then(|c| c.open_door(kek, &name, ControlOwner::Managed(tenant)))
         else {
-            return true;
+            unread(seq, &mut holds);
+            continue;
         };
         let PrivateKeyRef::Tenant(version) = opened.private_key() else {
-            return true;
+            unread(seq, &mut holds);
+            continue;
         };
         if ring.gone(version) {
             continue;
         }
         let Ok(door) = serde_json::from_slice::<CheckpointDoor>(opened.door()) else {
-            return true;
+            unread(seq, &mut holds);
+            continue;
         };
-        if door
-            .subjects
-            .iter()
-            .any(|d| d.door.id == id && d.open && d.private_seq == private_seq)
-        {
-            return true;
-        }
+        holds.held.extend(
+            door.subjects
+                .into_iter()
+                .filter(|d| d.open)
+                .map(|d| (d.door.id, d.private_seq)),
+        );
     }
-    false
+    holds
 }
 
 fn is_record_error(e: &BridgeError) -> bool {

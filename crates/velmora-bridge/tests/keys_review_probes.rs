@@ -264,8 +264,12 @@ impl KeyAdmission for FakeAdmission {
         panic!("the finisher does not request admission");
     }
 
-    async fn bind_bucket(&self, _: &TenantId, _: &str, _: u64) -> Result<()> {
+    async fn bind_bucket(&self, _: &TenantId, _: &str, _: Option<u64>, _: u64) -> Result<bool> {
         panic!("the finisher does not bind reservations");
+    }
+
+    async fn release_bound(&self, _: &TenantId, _: &str, _: Option<u64>) -> Result<()> {
+        panic!("the finisher does not release reservations");
     }
 
     async fn bucket_binding(&self, _: &TenantId, _: u64) -> Result<Binding> {

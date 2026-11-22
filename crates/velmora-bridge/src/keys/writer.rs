@@ -59,7 +59,7 @@ use velmora::rng::FillRandom;
 
 use super::chain::Put;
 use super::checkpoint::{
-    advance, checkpoint_name, may_hold_private, read_key_chain, reopen_closed,
+    advance, checkpoint_holds, checkpoint_name, read_key_chain, reopen_closed,
     reopen_from_checkpoints, seal_checkpoint, CHECKPOINT_EVERY,
 };
 use super::ports::{
@@ -520,29 +520,34 @@ fn closed_subjects(table: &KeyTable) -> Vec<String> {
 /// The closed subjects of `table` whose private part is lost for good
 /// (AM-11): sealed under a key version the ring marks gone, with a ring
 /// that loaded every other committed version, and no checkpoint that may
-/// still carry it. Anything less is a closed subject to retry.
+/// still carry it. Anything less is a closed subject to retry. One pass
+/// over the checkpoints, only when some subject is a candidate.
 async fn lost_subjects<S: RecordStore, K: Kek, T: TkRing>(
     store: &S,
     kek: &K,
     ring: &T,
     table: &KeyTable,
 ) -> BTreeSet<String> {
-    let mut lost = BTreeSet::new();
     if ring.partial() {
-        return lost;
+        return BTreeSet::new();
     }
-    for e in table.entries() {
-        if e.private.is_some()
-            || e.door.status == SubjectStatus::Revoked
-            || !ring.gone(e.tk_version)
-        {
-            continue;
-        }
-        if !may_hold_private(store, kek, ring, table.tenant(), &e.door.id, e.private_seq).await {
-            lost.insert(e.door.id.clone());
-        }
-    }
-    lost
+    let candidates: Vec<&Entry> = table
+        .entries()
+        .filter(|e| {
+            e.private.is_none()
+                && e.door.status != SubjectStatus::Revoked
+                && ring.gone(e.tk_version)
+        })
+        .collect();
+    let Some(from) = candidates.iter().map(|e| e.private_seq).min() else {
+        return BTreeSet::new();
+    };
+    let holds = checkpoint_holds(store, kek, ring, table.tenant(), from).await;
+    candidates
+        .into_iter()
+        .filter(|e| !holds.may_hold(&e.door.id, e.private_seq))
+        .map(|e| e.door.id.clone())
+        .collect()
 }
 
 impl<S, K, T, A, I, U, D, C> KeyEnv<'_, S, K, T, A, I, U, D, C>
@@ -834,6 +839,7 @@ async fn append_status<S, K, T, A, I, U, D, C, R>(
     table: &mut KeyTable,
     id: &str,
     status: SubjectStatus,
+    lost_at: Option<u64>,
     rng: &mut R,
 ) -> Option<Option<u64>>
 where
@@ -859,6 +865,18 @@ where
             }
             Some(e) => e,
         };
+        // A disable for a lost private part: only while the subject is
+        // still closed with that private part under a gone version (a
+        // record that landed since may have opened it).
+        if let Some(private_seq) = lost_at {
+            let still = entry.private.is_none()
+                && entry.private_seq == private_seq
+                && env.ring.gone(entry.tk_version)
+                && entry.door.status == SubjectStatus::Active;
+            if !still {
+                return Some(None);
+            }
+        }
         let mut door = entry.door.clone();
         door.status = status;
         let private = entry.private.clone();
@@ -918,7 +936,7 @@ where
     // here stops nothing below: the stores get the revocation from its
     // `m/rk/` record.
     for id in read.unrecorded_revocations() {
-        match append_status(env, &mut table, &id, SubjectStatus::Revoked, rng).await {
+        match append_status(env, &mut table, &id, SubjectStatus::Revoked, None, rng).await {
             Some(Some(seq)) => report.appended.push(seq),
             Some(None) => {}
             None => report.append_failed.push(id),
@@ -928,22 +946,32 @@ where
     // (AM-11) never opens again: it is disabled by a record that keeps
     // its private part as it was, so every store closes it whatever row
     // it holds. A revoked one stays revoked.
+    let mut lost = BTreeSet::new();
     if advance(env.store, env.kek, env.ring, &chain, &mut table)
         .await
         .is_ok()
     {
-        let lost = lost_subjects(env.store, env.kek, env.ring, &table).await;
-        let gone: Vec<String> = table
+        lost = lost_subjects(env.store, env.kek, env.ring, &table).await;
+        let gone: Vec<(String, u64)> = table
             .entries()
             .filter(|e| {
                 lost.contains(&e.door.id)
                     && e.door.status == SubjectStatus::Active
                     && !read.revoked.contains(&e.door.id)
             })
-            .map(|e| e.door.id.clone())
+            .map(|e| (e.door.id.clone(), e.private_seq))
             .collect();
-        for id in gone {
-            match append_status(env, &mut table, &id, SubjectStatus::Disabled, rng).await {
+        for (id, private_seq) in gone {
+            let disabled = append_status(
+                env,
+                &mut table,
+                &id,
+                SubjectStatus::Disabled,
+                Some(private_seq),
+                rng,
+            )
+            .await;
+            match disabled {
                 Some(Some(seq)) => report.gone_disabled.push(seq),
                 Some(None) => {}
                 None => report.append_failed.push(id),
@@ -1010,7 +1038,8 @@ where
     }
 
     report.head = table.seq();
-    let lost = lost_subjects(env.store, env.kek, env.ring, &table).await;
+    // The set decided above: a disable record keeps the private part and
+    // its seq, so a subject in it is still lost.
     let (gone, closed): (Vec<String>, Vec<String>) = closed_subjects(&table)
         .into_iter()
         .partition(|id| lost.contains(id));

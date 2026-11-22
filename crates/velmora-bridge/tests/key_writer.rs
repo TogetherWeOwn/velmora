@@ -156,8 +156,8 @@ impl KeyTarget for FakeTarget {
     }
 }
 
-/// An open bucket reservation: (creator, unit, bound seq).
-type OpenBucket = (String, u32, Option<u64>);
+/// An open bucket reservation: (creator, unit, bound seq, name).
+type OpenBucket = (String, u32, Option<u64>, String);
 
 /// The root unit's reservation call, checked against the root fake.
 struct FakeAdmission<'a> {
@@ -235,17 +235,41 @@ impl KeyAdmission for FakeAdmission<'_> {
         &self,
         _t: &TenantId,
         idempotency_key: &str,
+        expected: Option<u64>,
         grant_seq: u64,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         if self.bind_down.get() {
             return Err(BridgeError::Sql("fake: root unit down".into()));
         }
         let mut open = self.bucket_open.borrow_mut();
-        let r = open
-            .get_mut(idempotency_key)
-            .expect("a bind names an open reservation");
+        let Some(r) = open.get_mut(idempotency_key) else {
+            return Ok(false);
+        };
+        if r.2 == Some(grant_seq) {
+            return Ok(true);
+        }
+        if r.2 != expected {
+            return Ok(false);
+        }
         assert!(r.2.is_none_or(|b| b < grant_seq), "a bind only moves up");
         r.2 = Some(grant_seq);
+        Ok(true)
+    }
+
+    async fn release_bound(
+        &self,
+        t: &TenantId,
+        idempotency_key: &str,
+        bound: Option<u64>,
+    ) -> Result<()> {
+        let matches = self
+            .bucket_open
+            .borrow()
+            .get(idempotency_key)
+            .is_some_and(|r| r.2 == bound);
+        if matches {
+            self.release(t, idempotency_key).await?;
+        }
         Ok(())
     }
 
@@ -262,9 +286,10 @@ impl KeyAdmission for FakeAdmission<'_> {
             .bucket_open
             .borrow()
             .iter()
-            .find(|(_, (_, _, b))| *b == Some(grant_seq))
-            .map(|(key, (creator, unit, _))| Binding::Open {
+            .find(|(_, (_, _, b, _))| *b == Some(grant_seq))
+            .map(|(key, (creator, unit, _, name))| Binding::Open {
                 idempotency_key: key.clone(),
+                name: name.clone(),
                 creator: creator.clone(),
                 unit: *unit,
             })
@@ -318,6 +343,7 @@ impl KeyAdmission for FakeAdmission<'_> {
                         bucket.creator.to_owned(),
                         bucket.unit,
                         None,
+                        bucket.name.to_owned(),
                     ));
                     BucketAdmission::Admitted {
                         keys_seq: self.stale.get().unwrap_or(seq),
@@ -3391,7 +3417,8 @@ async fn the_reservation_answers_the_cap_and_retries() {
         .await
         .is_err());
     assert_eq!(w.head(), 2);
-    assert_eq!(buckets.calls.get(), 0);
+    // Only the retry asked the tenant chain, to confirm it is in force.
+    assert_eq!(buckets.calls.get(), 1);
 }
 
 /// The finisher decides every creator grant by its reservation: it
@@ -3725,4 +3752,397 @@ async fn a_private_part_a_checkpoint_may_hold_is_never_taken_for_lost() {
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Second review of the creator-grant writer and the gone-disable
+// ---------------------------------------------------------------------------
+
+mod interleave {
+    //! Polls one call until it parks, inside another call's step: two
+    //! calls under one key, overlapping.
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::task::{Context, Poll, Waker};
+
+    pub type BoxFut<'b, T> = Pin<Box<dyn Future<Output = T> + 'b>>;
+
+    pub fn poll_once<T>(f: &mut BoxFut<'_, T>) -> Option<T> {
+        let mut cx = Context::from_waker(Waker::noop());
+        match f.as_mut().poll(&mut cx) {
+            Poll::Ready(r) => Some(r),
+            Poll::Pending => None,
+        }
+    }
+
+    /// Ready once `gate` is set.
+    pub async fn until(gate: &std::cell::Cell<bool>) {
+        std::future::poll_fn(|_| match gate.get() {
+            true => Poll::Ready(()),
+            false => Poll::Pending,
+        })
+        .await
+    }
+}
+
+use interleave::{poll_once, until, BoxFut};
+
+/// Delegates to the fake; on its first `bind_bucket` it first polls
+/// `other` until that call parks or ends. `gate`: this adm's own bind
+/// waits until it opens.
+struct HookAdm<'i, 'a, 'b> {
+    inner: &'i FakeAdmission<'a>,
+    other: RefCell<Option<BoxFut<'b, Result<BucketAnswer>>>>,
+    other_done: RefCell<Option<Result<BucketAnswer>>>,
+    gate: Option<&'b Cell<bool>>,
+}
+
+impl HookAdm<'_, '_, '_> {
+    fn run_other(&self) {
+        let taken = self.other.borrow_mut().take();
+        if let Some(mut f) = taken {
+            match poll_once(&mut f) {
+                Some(r) => *self.other_done.borrow_mut() = Some(r),
+                None => *self.other.borrow_mut() = Some(f),
+            }
+        }
+    }
+}
+
+impl KeyAdmission for HookAdm<'_, '_, '_> {
+    async fn admit(&self, t: &TenantId, k: &str, c: &OpeningChange<'_>) -> Result<Admission> {
+        self.inner.admit(t, k, c).await
+    }
+    async fn release(&self, t: &TenantId, k: &str) -> Result<()> {
+        self.inner.release(t, k).await
+    }
+    async fn admit_bucket(
+        &self,
+        t: &TenantId,
+        k: &str,
+        b: &BucketReservation<'_>,
+    ) -> Result<BucketAdmission> {
+        self.inner.admit_bucket(t, k, b).await
+    }
+    async fn bind_bucket(
+        &self,
+        t: &TenantId,
+        k: &str,
+        expected: Option<u64>,
+        seq: u64,
+    ) -> Result<bool> {
+        self.run_other();
+        if let Some(g) = self.gate {
+            until(g).await;
+        }
+        self.inner.bind_bucket(t, k, expected, seq).await
+    }
+    async fn release_bound(&self, t: &TenantId, k: &str, bound: Option<u64>) -> Result<()> {
+        self.inner.release_bound(t, k, bound).await
+    }
+    async fn bucket_binding(&self, t: &TenantId, seq: u64) -> Result<Binding> {
+        self.inner.bucket_binding(t, seq).await
+    }
+}
+
+/// Two overlapping calls under one key: the second is admitted after
+/// the first one's put and before its bind, and writes a grant of its
+/// own. The bind is a compare-and-set, so one binds; the other revokes
+/// its grant and places the bound one's bucket. One create, one bucket.
+#[tokio::test(flavor = "current_thread")]
+async fn two_overlapping_calls_under_one_key_place_one_bucket() {
+    let w = World::new();
+    let adm = FakeAdmission::new(&w.root);
+    let mut table_a = seed(&w, &adm).await;
+    let units = w.units();
+    let buckets = FakeBuckets::default();
+    let gate = Cell::new(false);
+    let adm_b = HookAdm {
+        inner: &adm,
+        other: RefCell::new(None),
+        other_done: RefCell::new(None),
+        gate: Some(&gate),
+    };
+    let env_b = env!(w, &adm_b, &units);
+    let mut table_b = table(&w);
+    let mut rng_b = TestRng(901);
+    let req = photos("PR0001");
+    let fut_b: BoxFut<'_, _> =
+        Box::pin(env_b.create_bucket(&buckets, &mut table_b, "same", &req, &mut rng_b));
+    let adm_a = HookAdm {
+        inner: &adm,
+        other: RefCell::new(Some(fut_b)),
+        other_done: RefCell::new(None),
+        gate: None,
+    };
+    let env_a = env!(w, &adm_a, &units);
+    let a = env_a
+        .create_bucket(&buckets, &mut table_a, "same", &req, &mut TestRng(902))
+        .await
+        .unwrap();
+    gate.set(true);
+    let fut_b = adm_a.other.borrow_mut().take();
+    let b = match fut_b {
+        Some(f) => f.await.unwrap(),
+        None => adm_a.other_done.borrow_mut().take().unwrap().unwrap(),
+    };
+    assert_eq!(buckets.placed.borrow().len(), 1, "one create, one bucket");
+    let placed = buckets.placed.borrow()[0].0.clone();
+    assert!(matches!(a, BucketAnswer::Created { ref bucket, .. } if bucket.as_str() == placed));
+    assert!(matches!(b, BucketAnswer::Created { ref bucket, .. } if bucket.as_str() == placed));
+    assert_eq!(
+        head_grants(&w, "PR0001").await,
+        vec!["b_01".to_owned(), placed.clone()],
+        "the losing call's grant is revoked"
+    );
+}
+
+/// A retry answered `Created` by the reservation is answered `200` only
+/// once the tenant chain's stores hold the bucket too.
+#[tokio::test(flavor = "current_thread")]
+async fn a_created_retry_waits_for_the_tenant_chain_in_force() {
+    let w = World::new();
+    let adm = FakeAdmission::new(&w.root);
+    let mut table = seed(&w, &adm).await;
+    let units = w.units();
+    let env = env!(w, &adm, &units);
+    let buckets = FakeBuckets::default();
+    let mut rng = TestRng(921);
+    buckets.not_in_force.set(true);
+    assert_eq!(
+        env.create_bucket(&buckets, &mut table, "ib", &photos("PR0001"), &mut rng)
+            .await
+            .unwrap(),
+        BucketAnswer::Unfinished { grant_seq: 3 }
+    );
+    // The root unit applied bucket_created; the directory has not.
+    *adm.bucket_done.borrow_mut() = Some((bucket_id(&w.t, 3), 3));
+    assert_eq!(
+        env.create_bucket(&buckets, &mut table, "ib", &photos("PR0001"), &mut rng)
+            .await
+            .unwrap(),
+        BucketAnswer::Unfinished { grant_seq: 3 }
+    );
+    buckets.not_in_force.set(false);
+    assert_eq!(
+        env.create_bucket(&buckets, &mut table, "ib", &photos("PR0001"), &mut rng)
+            .await
+            .unwrap(),
+        BucketAnswer::Created {
+            bucket: bucket_id(&w.t, 3),
+            grant_seq: 3,
+        }
+    );
+}
+
+/// A bound grant its creator no longer holds (revoked since) is never
+/// placed: the retry writes a new grant.
+#[tokio::test(flavor = "current_thread")]
+async fn a_bound_grant_that_was_revoked_is_never_placed() {
+    let w = World::new();
+    let adm = FakeAdmission::new(&w.root);
+    let mut table = seed(&w, &adm).await;
+    let units = w.units();
+    let env = env!(w, &adm, &units);
+    let buckets = FakeBuckets::default();
+    let mut rng = TestRng(941);
+    buckets.down.set(true);
+    assert_eq!(
+        env.create_bucket(&buckets, &mut table, "ib", &photos("PR0001"), &mut rng)
+            .await
+            .unwrap(),
+        BucketAnswer::Unfinished { grant_seq: 3 }
+    );
+    let drop = KeyRequest::DropGrant {
+        id: "PR0001".into(),
+        bucket_id: bucket_id(&w.t, 3).as_str().to_owned(),
+    };
+    assert_eq!(
+        env.change(&mut table, "", &drop, &mut rng).await.unwrap(),
+        KeyAnswer::Done { seq: 4 }
+    );
+    buckets.down.set(false);
+    assert_eq!(
+        env.create_bucket(&buckets, &mut table, "ib", &photos("PR0001"), &mut rng)
+            .await
+            .unwrap(),
+        BucketAnswer::Created {
+            bucket: bucket_id(&w.t, 5),
+            grant_seq: 5,
+        }
+    );
+    assert_eq!(buckets.placed.borrow().len(), 1);
+    assert_eq!(buckets.placed.borrow()[0].3, 5);
+}
+
+/// The finisher of an open bound grant runs the create again under its
+/// reservation: after a lost order that is a new grant and a new bucket
+/// (AM-8), and the old grant is revoked.
+#[tokio::test(flavor = "current_thread")]
+async fn the_finisher_creates_again_after_a_lost_order() {
+    let w = World::new();
+    let adm = FakeAdmission::new(&w.root);
+    let mut table = seed(&w, &adm).await;
+    let units = w.units();
+    let env = env!(w, &adm, &units);
+    let buckets = FakeBuckets::default();
+    let mut rng = TestRng(951);
+    buckets.down.set(true);
+    assert_eq!(
+        env.create_bucket(&buckets, &mut table, "ib", &photos("PR0001"), &mut rng)
+            .await
+            .unwrap(),
+        BucketAnswer::Unfinished { grant_seq: 3 }
+    );
+    buckets.down.set(false);
+    buckets.lose_orders.set(1);
+    let mut fin = table.clone();
+    assert!(matches!(
+        finish_creator_grant(&env, &buckets, &mut fin, 3, &mut rng)
+            .await
+            .unwrap(),
+        CreatorGrant::Revoked { .. }
+    ));
+    let id5 = bucket_id(&w.t, 5);
+    assert_eq!(buckets.placed.borrow().len(), 1);
+    assert_eq!(buckets.placed.borrow()[0].0, id5.as_str());
+    assert_eq!(
+        head_grants(&w, "PR0001").await,
+        vec!["b_01".to_owned(), id5.as_str().to_owned()]
+    );
+    assert!(
+        adm.released.borrow().is_empty(),
+        "its reservation became the bucket"
+    );
+}
+
+/// A name and what to run on its second get.
+type Hook<'a> = (String, Box<dyn FnOnce() + 'a>);
+
+/// A store that runs a hook on the second get of one name, and counts
+/// the gets under a prefix.
+struct Watch<'a> {
+    inner: &'a MemRecords,
+    prefix: String,
+    gets: Cell<u32>,
+    seen: Cell<u32>,
+    on_get: RefCell<Option<Hook<'a>>>,
+}
+
+impl RecordStore for Watch<'_> {
+    async fn put_if_absent(&self, name: &str, bytes: Vec<u8>) -> Result<bool> {
+        self.inner.put_if_absent(name, bytes).await
+    }
+    async fn get(&self, name: &str) -> Result<Option<Vec<u8>>> {
+        if name.starts_with(&self.prefix) {
+            self.gets.set(self.gets.get() + 1);
+        }
+        let hook = match self.on_get.borrow().as_ref() {
+            Some((n, _)) if n == name => {
+                self.seen.set(self.seen.get() + 1);
+                self.seen.get() == 2
+            }
+            _ => false,
+        };
+        if hook {
+            if let Some((_, f)) = self.on_get.borrow_mut().take() {
+                f();
+            }
+        }
+        self.inner.get(name).await
+    }
+    async fn list(&self, prefix: &str, after: &str, limit: u32) -> Result<Vec<String>> {
+        self.inner.list(prefix, after, limit).await
+    }
+}
+
+/// (Review of the gone-disable.) A record that opens the subject lands
+/// between the decision that its private part is lost and the disable:
+/// the disable is not written. The checkpoints are read once per run,
+/// whatever the number of lost subjects.
+#[tokio::test(flavor = "current_thread")]
+async fn a_subject_that_opens_after_the_decision_is_not_disabled() {
+    use velmora_bridge::keys::checkpoint::{checkpoint_name, checkpoint_prefix, seal_checkpoint};
+    let w = World::new();
+    let adm = FakeAdmission::new(&w.root);
+    let table = seed(&w, &adm).await;
+    // Checkpoints at 1 and 2, both sealed under version 1 (gone).
+    for seq in [1, 2] {
+        let mut t = velmora_bridge::keys::record::KeyTable::empty(w.t.clone());
+        for s in 1..=seq {
+            let bytes = key_chain(&w.t).get(&w.store, s).await.unwrap();
+            t.apply(&open_key_record(&w.kek, &w.ring, &w.t, s, &bytes).unwrap())
+                .unwrap();
+        }
+        let record = key_chain(&w.t).get(&w.store, seq).await.unwrap();
+        let sealed = seal_checkpoint(&w.kek, &w.ring, &t, &record, &mut TestRng(960)).unwrap();
+        w.store.plant(&checkpoint_name(&w.t, seq), sealed);
+    }
+    let v3 = || TenantKey::from_bytes(&w.t, 3, derived("tk 3")).unwrap();
+    let ring = Ring3 {
+        keys: vec![v3()],
+        gone: vec![1],
+        partial: false,
+    };
+    // The hook: AKVL0001 is restated under version 3 at seq 3.
+    let restate = {
+        let w = &w;
+        let v3 = v3();
+        let e = table.get("AKVL0001").unwrap().clone();
+        move || {
+            let bytes = seal_key_record(
+                &w.kek,
+                &OneKey(v3),
+                &w.t,
+                3,
+                KeyOp::Restate,
+                9,
+                &e.door,
+                e.private.as_ref(),
+                false,
+                &mut TestRng(961),
+            )
+            .unwrap();
+            w.store.plant(&key_chain(&w.t).name(3), bytes);
+        }
+    };
+    let store = Watch {
+        inner: &w.store,
+        prefix: checkpoint_prefix(&w.t),
+        gets: Cell::new(0),
+        seen: Cell::new(0),
+        on_get: RefCell::new(Some((checkpoint_name(&w.t, 1), Box::new(restate)))),
+    };
+    let units = w.units();
+    let env = KeyEnv {
+        store: &store,
+        kek: &w.kek,
+        ring: &ring,
+        tenant: &w.t,
+        admission: &adm,
+        intents: &w.intents,
+        units: &units,
+        directory: &&w.directory,
+        clock: &w.clock,
+        limits: Limits::Recorded,
+    };
+    // Reading the chain gets each checkpoint once (none opens); the hook
+    // fires on the second get of checkpoint 1, inside the one pass of the
+    // lost decision, so the restate lands after AKVL0001 was found lost.
+    let report = finish_keys(&env, &mut TestRng(962)).await.unwrap();
+    let read = read_key_chain(&w.store, &w.kek, &ring, &w.t).await.unwrap();
+    assert!(read.table.get("AKVL0001").unwrap().private.is_some());
+    assert_eq!(
+        read.table.get("AKVL0001").unwrap().door.status,
+        SubjectStatus::Active,
+        "the restated key is not disabled"
+    );
+    assert_eq!(
+        read.table.get("PR0001").unwrap().door.status,
+        SubjectStatus::Disabled
+    );
+    assert_eq!(report.gone, vec!["PR0001".to_owned()]);
+    // Two checkpoints: at most two gets to read the chain and two for the
+    // one pass of the lost decision.
+    assert!(store.gets.get() <= 4, "gets: {}", store.gets.get());
 }

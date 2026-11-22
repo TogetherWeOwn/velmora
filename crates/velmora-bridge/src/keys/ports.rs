@@ -157,6 +157,7 @@ pub enum Binding {
     /// An open reservation is bound to it: the create may still finish.
     Open {
         idempotency_key: String,
+        name: String,
         creator: String,
         unit: u32,
     },
@@ -195,15 +196,29 @@ pub trait KeyAdmission {
         bucket: &BucketReservation<'_>,
     ) -> Result<BucketAdmission>;
     /// Binds the bucket reservation under `idempotency_key` to the creator
-    /// grant at `grant_seq`, which this call's own put wrote; a later
-    /// bind of a higher seq replaces it. From then on the unit answers it
-    /// in `Admitted::bound`, and turns the reservation into the bucket
-    /// row when it applies `bucket_created` for that seq. Idempotent.
+    /// grant at `grant_seq`, which this call's own put wrote, only while
+    /// the reservation is bound to `expected` (the `bound` this call was
+    /// admitted with): a compare-and-set, so of two calls under one key
+    /// only one binds, and the other places that one's bucket. `Ok(false)`:
+    /// the binding was not `expected`; nothing changed. Binding the same
+    /// seq again answers `Ok(true)`. From then on the unit answers it in
+    /// `Admitted::bound`, and turns the reservation into the bucket row
+    /// when it applies `bucket_created` for that seq.
     async fn bind_bucket(
         &self,
         tenant: &TenantId,
         idempotency_key: &str,
+        expected: Option<u64>,
         grant_seq: u64,
+    ) -> Result<bool>;
+    /// Releases the bucket reservation under `idempotency_key` only while
+    /// it is bound to `bound`: a call never releases a reservation that
+    /// another call under the same key has bound since.
+    async fn release_bound(
+        &self,
+        tenant: &TenantId,
+        idempotency_key: &str,
+        bound: Option<u64>,
     ) -> Result<()>;
     /// What the reservations say of the creator grant at `grant_seq`.
     async fn bucket_binding(&self, tenant: &TenantId, grant_seq: u64) -> Result<Binding>;
