@@ -144,7 +144,15 @@ impl<H: TenantHeads, N: BucketNames> HeadDoor<'_, H, N> {
     /// The verified head; `None`: the tenant has no chain.
     pub async fn head(&self, tenant: &TenantId) -> Result<Option<Door>> {
         self.heads.head(tenant, 0).await.map_err(|e| match e {
-            ChainError::Damaged(_) | ChainError::PrivateUnreadable => ERR_HEAD_DAMAGED,
+            ChainError::Damaged(why) => {
+                // Fixed words only: the reason is a static string.
+                crate::trace::alert(|| format!("mgmt: tenant head damaged ({why})"));
+                ERR_HEAD_DAMAGED
+            }
+            ChainError::PrivateUnreadable => {
+                crate::trace::alert(|| "mgmt: tenant head private part unreadable".to_string());
+                ERR_HEAD_DAMAGED
+            }
             _ => ERR_HEAD,
         })
     }
@@ -634,6 +642,8 @@ where
     async fn take_table(&self) -> Result<KeyTable> {
         let held = self.table.borrow_mut().take();
         match held {
+            // A table of another tenant is never used (`with_table`).
+            Some(table) if table.tenant() != self.env.tenant => Err(ERR_TENANT),
             Some(table) => Ok(table),
             None => {
                 Ok(

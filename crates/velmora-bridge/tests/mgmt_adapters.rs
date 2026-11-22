@@ -1098,3 +1098,30 @@ async fn an_unborn_root_unit_of_a_live_tenant_pages() {
         assert!(unit.take_alerts().is_empty(), "taken once");
     }
 }
+
+/// A key table of another tenant handed to `with_table` is never used.
+#[tokio::test(flavor = "current_thread")]
+async fn a_key_table_of_another_tenant_is_refused() {
+    let s = Stores::new();
+    let units = [Directory::default()];
+    let env = KeyEnv {
+        store: &s.records,
+        kek: &s.kek,
+        ring: &s.ring,
+        tenant: &s.chain_tenant,
+        admission: &NoAdmission,
+        intents: &s.intents,
+        units: &units,
+        directory: &s.directory,
+        clock: &s.clock,
+        limits: Limits::NotServed,
+        gate: &s.gate,
+    };
+    let other = velmora_bridge::TenantId::parse("t_0000000000000f02").unwrap();
+    let chain = KeyChain::with_table(
+        &env,
+        velmora_bridge::keys::record::KeyTable::empty(other),
+        TestRng(3),
+    );
+    assert!(chain.carrying(&tenant(), &Rid([1; 16]), 0).await.is_err());
+}

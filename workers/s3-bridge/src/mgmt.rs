@@ -7,7 +7,7 @@ use std::rc::Rc;
 
 use velmora_bridge::entry::{names_mgmt, ENTRY_HEADER};
 use velmora_bridge::mgmt::adapters::{HeadDoor, NoBucketNames};
-use velmora_bridge::mgmt::events::TenantEventsHandler;
+use velmora_bridge::mgmt::events::{GatedFeed, TenantEventsHandler};
 use velmora_bridge::mgmt::serve::{serve_request, Answer, Either, NotBuilt, MISCONFIGURED};
 use velmora_bridge::mgmt::tenant::TenantReadHandler;
 use velmora_bridge::mgmt::token::{DisabledTokens, TokenHashes};
@@ -47,6 +47,8 @@ pub async fn answer(env: &Env, bridge: &WorkerBridge, method: &str, req: S3Reque
             return MISCONFIGURED;
         }
     };
+    // What an operator has to see: a tenant head that does not verify.
+    velmora_bridge::trace::log_alerts(|line| console_error!("alert: {line}"));
     let disabled = DISABLED.with(Rc::clone);
     let now = velmora_bridge::ports::Clock::now(&bridge.clock);
     let ports = match crate::root::WorkerPorts::from_env(env, &bridge.kek) {
@@ -73,13 +75,16 @@ pub async fn answer(env: &Env, bridge: &WorkerBridge, method: &str, req: S3Reque
         heads: &heads,
         names: &NoBucketNames,
     };
-    let directory = root.directory();
+    let feed = root.directory().map(|directory| GatedFeed {
+        records: root.records(),
+        directory,
+    });
     let handlers = Either(
         TenantReadHandler { heads: &door },
         Either(
             TenantEventsHandler {
                 heads: &door,
-                feed: directory.as_ref(),
+                feed: feed.as_ref(),
             },
             NotBuilt,
         ),

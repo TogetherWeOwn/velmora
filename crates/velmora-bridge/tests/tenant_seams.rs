@@ -541,8 +541,9 @@ fn the_directory_is_asked_by_nothing() {
     // directory's store for that router: its key routes
     // (`SqlDirectory::route`, ADR §8.4 step 2). The request path builds
     // it only with `UNIT` bound (off as shipped), and the management
-    // entry (no production binding) after its token gate; it names the
-    // store, never the port.
+    // entry (no production binding) for every request, whose handlers
+    // read stores after the token gate; it names the store, never the
+    // port.
     const ROOT: &str = "bridge/root.rs";
     // The management plane's tenant events read the directory's feed
     // (`SqlDirectory::tenant_events`, AM-37): the store again, never the

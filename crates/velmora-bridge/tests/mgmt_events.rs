@@ -9,12 +9,14 @@ use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use velmora_bridge::directory::chain::ChainError;
 use velmora_bridge::directory::feed::{NewEvent, MAX_EVENTS_PAGE};
+use velmora_bridge::directory::gate::close;
 use velmora_bridge::directory::record::{Lifecycle, Tenant, TenantDoor as Door};
 use velmora_bridge::directory::store::SqlDirectory;
 use velmora_bridge::mgmt::adapters::{HeadDoor, NoBucketNames};
-use velmora_bridge::mgmt::events::TenantEventsHandler;
+use velmora_bridge::mgmt::events::{GatedFeed, TenantEventsHandler};
 use velmora_bridge::mgmt::serve::{serve_with, Answer, Either, MgmtRequest, NotBuilt};
 use velmora_bridge::mgmt::token::{DisabledTokens, TokenHashes};
+use velmora_bridge::records::MemRecords;
 use velmora_bridge::testkit::{MemBlobStore, RusqliteSql};
 use velmora_bridge::types::Body;
 use velmora_bridge::unit::TenantId;
@@ -45,7 +47,24 @@ fn hashes() -> TokenHashes {
     .unwrap()
 }
 
-fn directory() -> RusqliteSql {
+/// The directory database with the real schema, and the records its
+/// gate anchors live in.
+struct Dir {
+    sql: RusqliteSql,
+    records: MemRecords,
+}
+
+/// A directory whose gate is open (ADR §8.6), as a served one is.
+async fn directory() -> Dir {
+    let d = closed_directory();
+    let dir = SqlDirectory { sql: &d.sql };
+    let epoch = close(&d.records, &dir, "first_rebuild", NOW).await.unwrap();
+    assert!(dir.open_gate(epoch, NOW).await.unwrap());
+    d
+}
+
+/// A directory whose gate was never opened.
+fn closed_directory() -> Dir {
     let db = RusqliteSql::open_in_memory().unwrap();
     db.apply(include_str!(
         "../../../workers/s3-bridge/migrations-directory/0001_directory.sql"
@@ -55,16 +74,24 @@ fn directory() -> RusqliteSql {
         "../../../workers/s3-bridge/migrations-directory/0002_tenant_events.sql"
     ))
     .unwrap();
-    db
+    Dir {
+        sql: db,
+        records: MemRecords::new(),
+    }
 }
 
 struct Heads {
     tenants: Vec<String>,
     down: Cell<bool>,
+    damaged: Cell<bool>,
+    lifecycle: Cell<Lifecycle>,
 }
 
 impl TenantHeads for Heads {
     async fn head(&self, t: &TenantId, _: u64) -> Result<Option<Door>, ChainError> {
+        if self.damaged.get() {
+            return Err(ChainError::Damaged("fake: a record is missing"));
+        }
         if self.down.get() {
             return Err(ChainError::Store(velmora_bridge::BridgeError::Sql(
                 "fake: down".into(),
@@ -74,7 +101,7 @@ impl TenantHeads for Heads {
             .tenants
             .iter()
             .any(|x| x == t.as_str())
-            .then(|| test_door(t, 3, Lifecycle::Live, &[0])))
+            .then(|| test_door(t, 3, self.lifecycle.get(), &[0])))
     }
 }
 
@@ -82,6 +109,8 @@ fn heads() -> Heads {
     Heads {
         tenants: vec![TENANT.into(), OTHER.into()],
         down: Cell::new(false),
+        damaged: Cell::new(false),
+        lifecycle: Cell::new(Lifecycle::Live),
     }
 }
 
@@ -92,8 +121,8 @@ fn data(v: Value) -> Map<String, Value> {
     }
 }
 
-async fn append(sql: &RusqliteSql, tenant: &str, source: &str, at: i64) {
-    let dir = SqlDirectory { sql };
+async fn append(d: &Dir, tenant: &str, source: &str, at: i64) {
+    let dir = SqlDirectory { sql: &d.sql };
     dir.append_event(&NewEvent {
         tenant: Tenant::parse(tenant).unwrap(),
         kind: "bucket.created".into(),
@@ -105,12 +134,15 @@ async fn append(sql: &RusqliteSql, tenant: &str, source: &str, at: i64) {
     .unwrap();
 }
 
-async fn get(heads: &Heads, sql: Option<&RusqliteSql>, tenant: &str, query: &str) -> Answer {
+async fn get(heads: &Heads, d: Option<&Dir>, tenant: &str, query: &str) -> Answer {
     let door = HeadDoor {
         heads,
         names: &NoBucketNames,
     };
-    let dir = sql.map(|sql| SqlDirectory { sql });
+    let dir = d.map(|d| GatedFeed {
+        records: &d.records,
+        directory: SqlDirectory { sql: &d.sql },
+    });
     let handlers = Either(
         TenantEventsHandler {
             heads: &door,
@@ -156,7 +188,7 @@ fn expect(a: &Answer, status: u16, code: &str) {
 
 #[tokio::test(flavor = "current_thread")]
 async fn a_tenants_events_page_oldest_first_and_resume_from_the_position() {
-    let sql = directory();
+    let sql = directory().await;
     append(&sql, TENANT, "t/2", NOW.0 + 1).await;
     append(&sql, OTHER, "t/2", NOW.0 + 2).await;
     append(&sql, TENANT, "t/3", NOW.0 + 3).await;
@@ -194,7 +226,7 @@ async fn a_tenants_events_page_oldest_first_and_resume_from_the_position() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn an_empty_feed_answers_its_head() {
-    let sql = directory();
+    let sql = directory().await;
     let page = json_of(&get(&heads(), Some(&sql), TENANT, "").await);
     assert_eq!(page["items"], json!([]));
     assert!(page["position"].as_str().unwrap().starts_with('e'));
@@ -202,7 +234,7 @@ async fn an_empty_feed_answers_its_head() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn an_older_epoch_is_a_feed_reset() {
-    let sql = directory();
+    let sql = directory().await;
     append(&sql, TENANT, "t/2", NOW.0 + 1).await;
     let page = json_of(&get(&heads(), Some(&sql), TENANT, "").await);
     let position = page["position"].as_str().unwrap();
@@ -217,7 +249,7 @@ async fn an_older_epoch_is_a_feed_reset() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn bad_queries_unknown_tenants_and_missing_stores() {
-    let sql = directory();
+    let sql = directory().await;
     let h = heads();
     expect(
         &get(&h, Some(&sql), TENANT, "after=nope").await,
@@ -248,4 +280,43 @@ async fn bad_queries_unknown_tenants_and_missing_stores() {
         503,
         "service_unavailable",
     );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_closed_directory_gate_answers_503() {
+    let d = closed_directory();
+    append(&d, TENANT, "t/2", NOW.0 + 1).await;
+    expect(
+        &get(&heads(), Some(&d), TENANT, "").await,
+        503,
+        "service_unavailable",
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn shredding_damage_and_bad_rows() {
+    let d = directory().await;
+    let h = heads();
+    // AM-40: any call while shredding or shredded.
+    for l in [Lifecycle::Shredding, Lifecycle::Shredded] {
+        h.lifecycle.set(l);
+        expect(
+            &get(&h, Some(&d), TENANT, "").await,
+            409,
+            "tenant_unavailable",
+        );
+    }
+    h.lifecycle.set(Lifecycle::Live);
+    // A head that does not verify: 500, never a retry.
+    h.damaged.set(true);
+    expect(&get(&h, Some(&d), TENANT, "").await, 500, "internal_error");
+    h.damaged.set(false);
+    // A stored row that does not read as an event: 500.
+    d.sql
+        .apply(&format!(
+            "INSERT INTO tenant_events(epoch, tenant, type, source, at, data_json) \
+             VALUES (0, '{TENANT}', 'bucket.created', 't/9', 1, '[1]');"
+        ))
+        .unwrap();
+    expect(&get(&h, Some(&d), TENANT, "").await, 500, "internal_error");
 }

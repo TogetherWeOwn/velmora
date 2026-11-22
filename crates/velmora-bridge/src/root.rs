@@ -18,7 +18,8 @@
 //! **Off as shipped.** Nothing in a production Worker builds a [`Root`]:
 //! the request path makes one only when `UNIT` is bound, which no
 //! production configuration does, and the management entry, which makes
-//! one after its token gate, has no production binding.
+//! one for every request (its handlers read stores only after the token
+//! gate), has no production binding.
 //!
 //! # What it gives
 //!

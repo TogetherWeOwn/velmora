@@ -13,8 +13,9 @@
 //! **Off as shipped:** the request path builds a root only with `UNIT`
 //! bound (`units::route_request`), which no production configuration
 //! does. The management entry (`mgmt.rs`) builds one for every request
-//! that passed its token gate (door reads of `SAFETY` and the directory's
-//! feed); it has no binding in production.
+//! (no store read: `Root::new` only prunes the isolate's caches); its
+//! handlers, which run only after the token gate, are the readers of
+//! `SAFETY` and the directory's feed. It has no binding in production.
 
 use std::rc::Rc;
 
