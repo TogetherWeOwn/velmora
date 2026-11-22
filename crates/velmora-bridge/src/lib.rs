@@ -38,6 +38,7 @@ pub mod tenant_catalog;
 pub mod trace;
 pub mod types;
 pub mod unit;
+pub mod unit_lease;
 pub mod verify;
 
 #[cfg(feature = "testkit")]
