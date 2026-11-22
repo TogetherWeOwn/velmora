@@ -480,11 +480,12 @@ fn with_a_directory_an_opening_it_has_not_acknowledged_is_held() {
             (5, Some(("PR0001", true))),
         ]
     );
-    // A held entry carries no secret, no KEK version, no owner and no
-    // grant limit; its grants' buckets and access stay.
+    // A held entry keeps its identity (AM-72) and carries no secret, no
+    // KEK version, no label and no grant limit; its grants' buckets and
+    // access stay.
     let held = entry_of(&batch.entries, 2);
     assert!(held.held);
-    assert_eq!(held.owner_ref, None);
+    assert_eq!(held.owner_ref.as_deref(), Some("member-of-PR0002"));
     assert_eq!(held.secret_wrapped, None);
     assert_eq!(held.secret_kek_version, None);
     assert_eq!(held.grants[0].prefix, None);
@@ -552,6 +553,82 @@ fn the_feed_fails_closed_without_key_locations_but_an_empty_chain_reads_no_key()
     )
     .unwrap();
     assert!(block_on(root.key_feed().after(&zero, 0)).is_err());
+}
+
+/// The unit learns an opening only from the directory's acknowledgement,
+/// never from its own seq: a subject opened at or below the unit's
+/// `keys_seq` but not acknowledged is sent held in a later record.
+#[test]
+fn an_opening_below_the_units_seq_is_held_until_the_directory_has_it() {
+    let records = active_records(true);
+    key_chain_records(&records);
+    // PR0002 narrowed at 6 (a closing change): its opening stays seq 2.
+    let mut narrowed = principal("PR0002");
+    narrowed.set_grants(&[Grant {
+        bucket_id: "b_00000000000000b1".into(),
+        access: Access::Ro,
+        expires_at: Some(9_000),
+        prefix: Some("photos/".into()),
+        ip_list: vec!["10.0.0.0/8".into()],
+    }]);
+    plant(&records, 6, KeyOp::Grants, &narrowed, true);
+    let p = ports(records, Some(directory_db()));
+    let cache = RootCache::new();
+    let root = Root::new(&p, &cache, TestRng(3));
+    // The unit holds up to 5 (PR0002 held there); nothing acknowledged.
+    let batch = block_on(root.key_feed().after(&unit_id(), 5)).unwrap();
+    assert_eq!(keys(&batch.entries), vec![(6, Some(("PR0002", true)))]);
+}
+
+#[test]
+fn held_items_keep_their_owner_and_lose_their_private_part() {
+    let s = principal("PR0003");
+    let open = Entry {
+        door: s.door.clone(),
+        private: Some(s.private.clone()),
+        last_seq: 4,
+        private_seq: 4,
+        tk_version: 1,
+        closes: false,
+        opened_seq: 4,
+        rid: None,
+    };
+    let UnitItem::Key(sent) = unit_item(&ChainItem::Subject(open.clone())).unwrap() else {
+        panic!()
+    };
+    assert!(!sent.held);
+    assert_eq!(sent.owner_ref.as_deref(), Some("member-of-PR0003"));
+    let mut closed = open.clone();
+    closed.private = None;
+    let UnitItem::Key(unopened) = unit_item(&ChainItem::Subject(closed.clone())).unwrap() else {
+        panic!()
+    };
+    assert!(unopened.held);
+    assert_eq!(unopened.owner_ref, None);
+    let UnitItem::Key(held) = unit_item(&ChainItem::Held {
+        entry: closed,
+        owner_ref: Some("member-of-PR0003".into()),
+    })
+    .unwrap() else {
+        panic!()
+    };
+    assert!(held.held);
+    assert_eq!(held.owner_ref.as_deref(), Some("member-of-PR0003"));
+    assert_eq!(held.secret_wrapped, None);
+    assert_eq!(held.secret_kek_version, None);
+    assert_eq!(held.grants[0].prefix, None);
+    assert!(held.grants[0].ip_list.is_empty());
+    // A held item that still carried its private part sends none of it.
+    let UnitItem::Key(stripped) = unit_item(&ChainItem::Held {
+        entry: open,
+        owner_ref: None,
+    })
+    .unwrap() else {
+        panic!()
+    };
+    assert!(stripped.held);
+    assert_eq!(stripped.owner_ref, None);
+    assert_eq!(stripped.grants[0].prefix, None);
 }
 
 #[test]
