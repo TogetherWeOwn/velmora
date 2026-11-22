@@ -274,10 +274,28 @@ async fn put_succeeds_when_the_wake_up_is_lost() {
     let put = rig.put(&signer, BUCKET, "k", b"payload").await;
     put.expect(200);
     assert_eq!(put.header("etag"), Some(md5_etag(b"payload").as_str()));
-    // The posting obligation is in the catalogue for the dispatcher.
+    // The posting obligation is in the catalogue for the dispatcher,
+    // unmarked: its next run sends the job.
     assert!(rig.live(&bucket, "k").await.is_some());
     assert_eq!(rig.count("outbox"), 1);
+    assert_eq!(rig.count("outbox WHERE sent_at IS NULL"), 1);
     assert!(rig.bridge.jobs.inner.sent().is_empty());
+
+    // A PUT whose job the queue takes leaves its row marked as sent, so
+    // the dispatcher does not send the job a second time.
+    rig.bridge.jobs.fail.set(false);
+    rig.put(&signer, BUCKET, "sent", b"payload")
+        .await
+        .expect(200);
+    assert_eq!(rig.bridge.jobs.inner.sent().len(), 1);
+    assert_eq!(rig.count("outbox WHERE sent_at = next_at"), 1);
+    let due = rig
+        .bridge
+        .catalog
+        .due(rig.now(), Resend::after(jobs::RESEND_SECS), 10)
+        .await
+        .unwrap();
+    assert_eq!(due.len(), 1, "only the row of the refused send");
 }
 
 #[tokio::test(flavor = "current_thread")]

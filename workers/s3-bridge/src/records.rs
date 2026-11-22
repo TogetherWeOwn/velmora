@@ -19,6 +19,23 @@
 //!   cursor is an error, never the end: a short listing would read as
 //!   the whole one.
 //! - `exists` is a head.
+//! - `get_tagged` is a get that answers the object's ETag beside its
+//!   bytes, bare (`etag`, not the quoted `httpEtag`), as the replace's
+//!   condition takes it.
+//! - `replace_if_match` is one R2 put with the condition
+//!   `onlyIf: { etagMatches: <etag> }` (L3-Q21, L4's `RecordStore`
+//!   replace, #244). R2 evaluates it against the committed object, so of
+//!   competing replaces against one ETag at most one stores (a store of
+//!   other bytes gives the object a new ETag: R2's ETag is the MD5 of a
+//!   single-part body, and a sealed route carries a fresh nonce). A
+//!   failed condition (another ETag, or no object) answers `null`:
+//!   `Ok(false)`, and nothing changed. Any other failure is an error,
+//!   which says nothing about whether the bytes were stored; the caller
+//!   reads the name back. A record above [`MAX_RECORD_BYTES`], and an
+//!   ETag that is not a bare R2 ETag (empty, the wildcard `*`, quoted,
+//!   weak or a list), are refused before the put. One-winner under
+//!   concurrency is R2's documented rule; the race probe on real R2 is
+//!   not run yet.
 //!
 //! Errors are `BridgeError::Blob` with a class only: no name, no bytes,
 //! no R2 message.
@@ -26,13 +43,13 @@
 //! No binding uses this yet: the key chain, the tenant chain and the key
 //! buckets are wired by later packages.
 
-use velmora_bridge::records::RecordStore;
+use velmora_bridge::records::{RecordStore, Tagged};
 use velmora_bridge::{BridgeError, Result};
 use worker::js_sys::{Object, Reflect, Uint8Array};
 use worker::wasm_bindgen::{JsCast, JsValue};
 use worker::wasm_bindgen_futures::JsFuture;
 use worker::worker_sys::R2Bucket as EdgeBucket;
-use worker::{Bucket, Headers};
+use worker::{Bucket, Conditional, Headers};
 
 /// The largest record that is stored or read: 16 MiB, about 32,000
 /// subjects in a key checkpoint (about 0.5 KiB each). A read holds the
@@ -129,6 +146,59 @@ impl RecordStore for R2Records {
     async fn exists(&self, name: &str) -> Result<bool> {
         Ok(self.bucket.head(name).await.map_err(err("head"))?.is_some())
     }
+
+    async fn get_tagged(&self, name: &str) -> Result<Option<Tagged>> {
+        let Some(object) = self.bucket.get(name).execute().await.map_err(err("get"))? else {
+            return Ok(None);
+        };
+        if object.size() > MAX_RECORD_BYTES {
+            return Err(BridgeError::Blob("records: record too large".into()));
+        }
+        let etag = object.etag();
+        if etag.is_empty() {
+            return Err(BridgeError::Blob("records: get returned no etag".into()));
+        }
+        let body = object
+            .body()
+            .ok_or_else(|| BridgeError::Blob("records: get returned no body".into()))?;
+        let bytes = body.bytes().await.map_err(err("get body"))?;
+        Ok(Some(Tagged { bytes, etag }))
+    }
+
+    async fn replace_if_match(&self, name: &str, etag: &str, bytes: Vec<u8>) -> Result<bool> {
+        if bytes.len() as u64 > MAX_RECORD_BYTES {
+            return Err(BridgeError::Blob("records: record too large".into()));
+        }
+        if !bare_etag(etag) {
+            return Err(BridgeError::Blob(
+                "records: replace with no bare etag".into(),
+            ));
+        }
+        let stored = self
+            .bucket
+            .put(name, bytes)
+            .only_if(only_if_matches(etag))
+            .execute()
+            .await
+            .map_err(err("replace"))?;
+        // `None`: the condition failed (another ETag, or no object).
+        Ok(stored.is_some())
+    }
+}
+
+/// A bare R2 ETag: hex digits, and `-` (a multipart ETag's part count).
+/// Never empty, never the wildcard `*` (which would match any object),
+/// never quoted, weak or a list.
+fn bare_etag(etag: &str) -> bool {
+    !etag.is_empty() && etag.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-')
+}
+
+/// The condition of a replace: the stored object's ETag is `etag`.
+fn only_if_matches(etag: &str) -> Conditional {
+    Conditional {
+        etag_matches: Some(etag.to_owned()),
+        ..Conditional::default()
+    }
 }
 
 /// Where a listing goes on after a page: `Some` = ask again from this
@@ -147,6 +217,36 @@ fn next_cursor(truncated: bool, cursor: Option<String>) -> Result<Option<String>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The replace's condition names the ETag and nothing else.
+    #[test]
+    fn a_replace_is_conditional_on_the_etag_alone() {
+        let c = only_if_matches("abc123");
+        assert_eq!(c.etag_matches.as_deref(), Some("abc123"));
+        assert_eq!(c.etag_does_not_match, None);
+        assert_eq!(c.uploaded_before, None);
+        assert_eq!(c.uploaded_after, None);
+    }
+
+    /// Only a bare ETag conditions a replace: the wildcard would match any
+    /// stored object (a lost update).
+    #[test]
+    fn only_a_bare_etag_conditions_a_replace() {
+        for good in ["0123456789abcdef0123456789abcdef", "d41d8cd98f00b204-3"] {
+            assert!(bare_etag(good), "{good}");
+        }
+        for bad in [
+            "",
+            "*",
+            "\"abc\"",
+            "W/\"abc\"",
+            "abc, def",
+            "abc def",
+            "xyz",
+        ] {
+            assert!(!bare_etag(bad), "{bad}");
+        }
+    }
 
     #[test]
     fn a_page_with_more_and_no_cursor_is_an_error() {

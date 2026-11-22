@@ -1553,6 +1553,9 @@ impl Catalog for MemCatalog {
     ) -> Result<Option<(UploadRow, Vec<UploadPartRow>)>> {
         unused()
     }
+    async fn upload_state(&self, _: &UploadTarget<'_>) -> Result<Option<UploadState>> {
+        unused()
+    }
     async fn list_uploads(&self, _: &BucketId, _: &UploadListQuery) -> Result<Vec<OpenUpload>> {
         unused()
     }
@@ -1702,6 +1705,9 @@ impl Catalog for MemCatalog {
     async fn mark_sent(&self, _: &[ExtentId], _: UnixMs) -> Result<u64> {
         unused()
     }
+    async fn unmark_sent(&self, _: &[Job], _: UnixMs) -> Result<u64> {
+        Ok(0)
+    }
     async fn bury_exhausted(&self, _: u32, _: UnixMs) -> Result<u64> {
         unused()
     }
@@ -1721,6 +1727,18 @@ impl Catalog for MemCatalog {
         unused()
     }
     async fn gc_done(&self, _: i64, _: UnixMs) -> Result<()> {
+        unused()
+    }
+    async fn gc_orphans_due(&self, _: UnixMs) -> Result<bool> {
+        unused()
+    }
+    async fn gc_orphans(&self, _: UnixMs, _: UnixMs, _: u32, _: u32) -> Result<Vec<GcRow>> {
+        unused()
+    }
+    async fn gc_orphan_claim(&self, _: &[GcRow], _: UnixMs, _: UnixMs) -> (Vec<bool>, Result<()>) {
+        (Vec::new(), unused())
+    }
+    async fn gc_orphan_done(&self, _: i64, _: UnixMs) -> Result<()> {
         unused()
     }
 }
@@ -1832,6 +1850,7 @@ pub async fn rig(specs: &[Spec]) -> Rig {
         slice_bytes: 8 * 1024 * 1024,
         max_object_extents: 10_000,
         intent_sweep: false,
+        gc_orphans: false,
         records: velmora_bridge::recovery::Layout::flat(),
         packed_plans: false,
         parity: false,
