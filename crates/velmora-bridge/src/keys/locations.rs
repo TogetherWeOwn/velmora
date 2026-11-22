@@ -262,3 +262,146 @@ pub fn two_in_account() -> KeyLocations {
         ],
     }
 }
+
+// ---------------------------------------------------------------------------
+// The first record (AM-70)
+// ---------------------------------------------------------------------------
+
+/// Where the probe objects of [`init_locations`] are written in a key
+/// bucket: outside every tenant's key directory (`tk/<t>/`), so no key
+/// load, audit or shred lists them.
+pub const PROBE_PREFIX: &str = "probe/kl/";
+
+/// A key bucket's delete, for the probe objects only.
+#[allow(async_fn_in_trait)]
+pub trait ProbeDelete {
+    /// Deletes `name`; a missing object is not an error.
+    async fn delete(&self, name: &str) -> Result<()>;
+}
+
+/// What [`init_locations`] answered.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InitLocations {
+    /// Seq 1 is written: [`two_in_account`]. `200`.
+    Written,
+    /// The head already names exactly that set; nothing written. `200`.
+    Same,
+    /// The head names another set; nothing written. `409 locations_differ`,
+    /// and the operator is paged.
+    Differ,
+    /// A probe written through one binding is visible through the other:
+    /// the two bindings are one bucket. Nothing written. The operator is
+    /// paged.
+    NotDistinct,
+}
+
+/// A probe read back through its own binding is not what was written.
+pub const ERR_PROBE_READBACK: BridgeError =
+    BridgeError::Invalid("a key bucket probe did not read back");
+
+const ERR_PROBE_RNG: BridgeError = BridgeError::Crypto("random source failed");
+
+fn probe_name<R: FillRandom>(rng: &mut R) -> Result<(String, Vec<u8>)> {
+    let mut b = [0u8; 32];
+    rng.fill_bytes(&mut b).map_err(|_| ERR_PROBE_RNG)?;
+    let hex: String = b[..16].iter().map(|x| format!("{x:02x}")).collect();
+    Ok((format!("{PROBE_PREFIX}{hex}"), b[16..].to_vec()))
+}
+
+/// Whether the head names exactly `want`'s locations.
+fn same_set(head: &KeyLocations, want: &KeyLocations) -> bool {
+    head.v == want.v && head.locations == want.locations
+}
+
+/// The head now, answered against `want`.
+async fn answer_head<S: RecordStore, K: Kek>(
+    store: &S,
+    kek: &K,
+    want: &KeyLocations,
+) -> Result<Option<InitLocations>> {
+    Ok(read_locations(store, kek, 0).await?.map(|h| {
+        if same_set(&h, want) {
+            InitLocations::Same
+        } else {
+            InitLocations::Differ
+        }
+    }))
+}
+
+/// Writes one probe through `a`, and checks it reads back there and is
+/// absent through `b`.
+async fn probe_one<A: RecordStore, B: RecordStore>(
+    a: &A,
+    b: &B,
+    name: &str,
+    body: &[u8],
+) -> Result<bool> {
+    if !a.put_if_absent(name, body.to_vec()).await? {
+        // A random 128-bit name already there: never by chance.
+        return Err(ERR_PROBE_READBACK);
+    }
+    if a.get(name).await?.as_deref() != Some(body) {
+        return Err(ERR_PROBE_READBACK);
+    }
+    Ok(b.get(name).await?.is_none())
+}
+
+/// The first key-location record (AM-70): the operator call of the deploy
+/// step that binds `KEYS_A` and `KEYS_B`, run once per deployment (and by
+/// the drill render). No request path calls it.
+///
+/// - A head that names exactly [`two_in_account`] answers
+///   [`InitLocations::Same`]; another head [`InitLocations::Differ`].
+///   Neither probes nor writes.
+/// - Otherwise a probe object with a random name is written to each
+///   bucket through its binding and read back there; the probe written
+///   through `KEYS_A` must be absent through `KEYS_B`, and the reverse.
+///   Both probes are deleted, whatever the outcome. Two bindings of one
+///   bucket answer [`InitLocations::NotDistinct`], and nothing is
+///   written.
+/// - Then seq 1 is put once ([`write_locations`]). A put that lost reads
+///   the head again and answers from it.
+///
+/// A store error is an `Err` (`503`): nothing is written after it, and a
+/// re-run starts again.
+pub async fn init_locations<S, K, A, B, R>(
+    store: &S,
+    kek: &K,
+    keys_a: &A,
+    keys_b: &B,
+    rng: &mut R,
+) -> Result<InitLocations>
+where
+    S: RecordStore,
+    K: Kek,
+    A: RecordStore + ProbeDelete,
+    B: RecordStore + ProbeDelete,
+    R: FillRandom,
+{
+    let want = two_in_account();
+    if let Some(answer) = answer_head(store, kek, &want).await? {
+        return Ok(answer);
+    }
+    let (name_a, body_a) = probe_name(rng)?;
+    let (name_b, body_b) = probe_name(rng)?;
+    let checked = async {
+        let a_alone = probe_one(keys_a, keys_b, &name_a, &body_a).await?;
+        let b_alone = probe_one(keys_b, keys_a, &name_b, &body_b).await?;
+        Ok::<bool, BridgeError>(a_alone && b_alone)
+    }
+    .await;
+    // Both probes go, whatever the checks found.
+    let gone_a = keys_a.delete(&name_a).await;
+    let gone_b = keys_b.delete(&name_b).await;
+    if !checked? {
+        return Ok(InitLocations::NotDistinct);
+    }
+    gone_a?;
+    gone_b?;
+    if write_locations(store, kek, &want, rng).await? {
+        return Ok(InitLocations::Written);
+    }
+    Ok(answer_head(store, kek, &want)
+        .await?
+        .unwrap_or(InitLocations::Differ))
+}
