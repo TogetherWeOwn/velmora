@@ -1382,34 +1382,41 @@ impl<U: Upstream, S: StatePort> Ctx<'_, U, S> {
     ) -> Result<(Vec<String>, Vec<(String, u16)>), Resp<U::Body>> {
         let entries = self.list_tree(bucket, coll).await?;
         require_visible_tree(&entries)?;
-        let (mut markers, files): (Vec<String>, Vec<String>) = entries
-            .into_iter()
-            .map(|e| e.key)
-            .partition(|k| k.ends_with('/'));
-        markers.sort_by_key(|m| std::cmp::Reverse(m.len()));
-        let mut failed: Vec<(String, u16)> = Vec::new();
+        let (markers, files): (Vec<_>, Vec<_>) =
+            entries.into_iter().partition(|e| e.key.ends_with('/'));
+        let files: Vec<_> = files.into_iter().map(|e| e.key).collect();
+        let mut failed = Vec::new();
         let mut deleted = Vec::new();
-        for group in [files, markers] {
-            for batch in group.chunks(1000) {
-                match self.s3.delete_many(bucket, batch).await {
-                    Ok(errors) => {
-                        for k in batch {
-                            if !errors.iter().any(|(e, _)| e == k) {
-                                deleted.push(k.clone());
-                            }
+        for batch in files.chunks(1000) {
+            match self.s3.delete_many(bucket, batch).await {
+                Ok(errors) => {
+                    for k in batch {
+                        if !errors.iter().any(|(e, _)| e == k) {
+                            deleted.push(k.clone());
                         }
-                        failed.extend(errors.into_iter().map(|(k, _)| (k, 500)));
                     }
-                    Err(e) => {
-                        let code = from_s3::<U::Body>(&e).status;
-                        if code == 401 {
-                            return Err(unauthorized());
-                        }
-                        failed.extend(batch.iter().map(|k| (k.clone(), code)));
+                    failed.extend(errors.into_iter().map(|(k, _)| (k, 500)));
+                }
+                Err(e) => {
+                    let code = from_s3::<U::Body>(&e).status;
+                    if code == 401 {
+                        return Err(unauthorized());
                     }
+                    failed.extend(batch.iter().map(|k| (k.clone(), code)));
                 }
             }
         }
+        // Another S3 writer can replace a visible zero-byte marker with
+        // a hidden nonempty object without going through the DAV lease.
+        let (removed, conflicts) = self
+            .delete_matching_members(
+                bucket,
+                markers.into_iter().map(|e| (e.key, e.etag)).collect(),
+                409,
+            )
+            .await;
+        deleted.extend(removed);
+        failed.extend(conflicts);
         Ok((deleted, failed))
     }
 
@@ -1581,10 +1588,11 @@ impl<U: Upstream, S: StatePort> Ctx<'_, U, S> {
         let mut members = Vec::new();
         if src_coll && depth != Some(0) {
             let entries = self.list_tree(bucket, &src_path).await?;
-            if is_move {
-                require_visible_tree(&entries)?;
+            let hidden = hidden_tree_keys(&entries);
+            if is_move && !hidden.is_empty() {
+                return Err(hidden_folder());
             }
-            for entry in entries.into_iter().filter(visible_tree_entry) {
+            for entry in entries.into_iter().filter(|e| !hidden.contains(&e.key)) {
                 let suffix = entry
                     .key
                     .strip_prefix(&src_path)
@@ -1593,7 +1601,7 @@ impl<U: Upstream, S: StatePort> Ctx<'_, U, S> {
                 if !storable_key(&dest) {
                     return Err(status(409));
                 }
-                members.push((entry.key, dest));
+                members.push((entry, dest));
             }
         }
         let holder = self
@@ -1628,7 +1636,7 @@ impl<U: Upstream, S: StatePort> Ctx<'_, U, S> {
                 let cond = (!overwrite).then_some(Cond::Absent);
                 Some(
                     self.s3
-                        .copy(bucket, &src_path, &dst_path, cond.as_ref())
+                        .copy(bucket, &src_path, &dst_path, cond.as_ref(), None)
                         .await
                         .map_err(|e| from_s3(&e))?,
                 )
@@ -1662,7 +1670,7 @@ impl<U: Upstream, S: StatePort> Ctx<'_, U, S> {
             }
             // Copies may replace same-named keys, but never remove an
             // obsolete destination member until all copies have succeeded.
-            let failed = self.delete_matching_members(bucket, obsolete, 412).await;
+            let (_, failed) = self.delete_matching_members(bucket, obsolete, 412).await;
             if !failed.is_empty() {
                 return Ok(failed_members(bucket, &failed));
             }
@@ -1682,7 +1690,7 @@ impl<U: Upstream, S: StatePort> Ctx<'_, U, S> {
                     })?;
                 Vec::new()
             } else {
-                self.delete_matching_members(bucket, copied, 409).await
+                self.delete_matching_members(bucket, copied, 409).await.1
             };
             let mut ops = vec![Op::PropCopy {
                 from: src_path.clone(),
@@ -1722,21 +1730,20 @@ impl<U: Upstream, S: StatePort> Ctx<'_, U, S> {
     async fn copy_tree(
         &self,
         bucket: &str,
-        members: &[(String, String)],
+        members: &[(Entry, String)],
     ) -> Result<Vec<(String, String)>, Vec<(String, u16)>> {
         let mut copied = Vec::with_capacity(members.len());
         for batch in members.chunks(self.cfg().fan_out.max(1)) {
-            let outcomes = join_all(
-                batch
-                    .iter()
-                    .map(|(src, dst)| self.s3.copy(bucket, src, dst, None)),
-            )
+            let outcomes = join_all(batch.iter().map(|(src, dst)| {
+                let marker_etag = src.key.ends_with('/').then_some(src.etag.as_str());
+                self.s3.copy(bucket, &src.key, dst, None, marker_etag)
+            }))
             .await;
             let mut failed = Vec::new();
             for ((src, _), result) in batch.iter().zip(outcomes) {
                 match result {
-                    Ok(etag) => copied.push((src.clone(), etag)),
-                    Err(e) => failed.push((src.clone(), from_s3::<U::Body>(&e).status)),
+                    Ok(etag) => copied.push((src.key.clone(), etag)),
+                    Err(e) => failed.push((src.key.clone(), from_s3::<U::Body>(&e).status)),
                 }
             }
             if !failed.is_empty() {
@@ -1752,29 +1759,30 @@ impl<U: Upstream, S: StatePort> Ctx<'_, U, S> {
         bucket: &str,
         members: Vec<(String, String)>,
         changed_status: u16,
-    ) -> Vec<(String, u16)> {
+    ) -> (Vec<String>, Vec<(String, u16)>) {
         let (mut markers, files): (Vec<_>, Vec<_>) =
             members.into_iter().partition(|(k, _)| k.ends_with('/'));
         markers.sort_by_key(|(k, _)| std::cmp::Reverse(k.len()));
         let mut failed = Vec::new();
+        let mut deleted = Vec::new();
         for group in [files, markers] {
             let mut results = stream::iter(group)
                 .map(|(key, etag)| async move {
-                    self.s3
-                        .delete(bucket, &key, Some(&Cond::Is(etag)))
-                        .await
-                        .err()
-                        .map(|e| {
-                            let code = from_s3::<U::Body>(&e).status;
-                            (key, if code == 412 { changed_status } else { code })
-                        })
+                    let result = self.s3.delete(bucket, &key, Some(&Cond::Is(etag))).await;
+                    (key, result)
                 })
                 .buffer_unordered(self.cfg().fan_out.max(1));
-            while let Some(result) = results.next().await {
-                failed.extend(result);
+            while let Some((key, result)) = results.next().await {
+                match result {
+                    Ok(()) => deleted.push(key),
+                    Err(e) => {
+                        let code = from_s3::<U::Body>(&e).status;
+                        failed.push((key, if code == 412 { changed_status } else { code }));
+                    }
+                }
             }
         }
-        failed
+        (deleted, failed)
     }
 
     // -----------------------------------------------------------------
@@ -2128,18 +2136,38 @@ fn forget(paths: &[String]) -> Vec<Op> {
         .collect()
 }
 
-fn visible_tree_entry(entry: &Entry) -> bool {
-    // The same path mapping as children(); only empty objects can be
-    // represented as collection markers rather than files.
-    path::addressable(&entry.key) && (!entry.key.ends_with('/') || entry.size == 0)
+fn hidden_tree_keys(entries: &[Entry]) -> HashSet<String> {
+    let mut keys: Vec<_> = entries.iter().map(|e| e.key.as_str()).collect();
+    keys.sort_unstable();
+    entries
+        .iter()
+        .filter(|e| {
+            if !path::addressable(&e.key) {
+                return true;
+            }
+            if e.key.ends_with('/') {
+                return e.size != 0;
+            }
+            // As in children(), a collection (explicit marker or any
+            // descendant) shadows a same-named file.
+            let prefix = as_collection(&e.key);
+            let first = keys.partition_point(|k| *k < prefix.as_str());
+            keys.get(first).is_some_and(|k| k.starts_with(&prefix))
+        })
+        .map(|e| e.key.clone())
+        .collect()
+}
+
+fn hidden_folder<B>() -> Resp<B> {
+    Response::new(409).with_bytes(
+        "text/plain; charset=utf-8",
+        b"this folder holds objects WebDAV cannot show; use an S3 tool".to_vec(),
+    )
 }
 
 fn require_visible_tree<B>(entries: &[Entry]) -> Result<(), Resp<B>> {
-    if entries.iter().any(|entry| !visible_tree_entry(entry)) {
-        return Err(Response::new(409).with_bytes(
-            "text/plain; charset=utf-8",
-            b"this folder holds objects WebDAV cannot show; use an S3 tool".to_vec(),
-        ));
+    if !hidden_tree_keys(entries).is_empty() {
+        return Err(hidden_folder());
     }
     Ok(())
 }

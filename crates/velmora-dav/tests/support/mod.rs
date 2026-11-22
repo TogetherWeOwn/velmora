@@ -431,12 +431,15 @@ impl World {
     /// Inject one failure, or an S3 write after a successful response but
     /// before the gateway receives it.
     pub fn storage_fault(&self, method: &'static str, key: &str, fault: StorageFault) {
-        let target = service_support::path(BUCKET, key);
+        self.storage_fault_target(method, &service_support::path(BUCKET, key), fault);
+    }
+
+    pub fn storage_fault_target(&self, method: &'static str, target: &str, fault: StorageFault) {
         assert!(self
             .dav
             .up
             .fault
-            .replace(Some((method, target, fault)))
+            .replace(Some((method, target.to_owned(), fault)))
             .is_none());
     }
 

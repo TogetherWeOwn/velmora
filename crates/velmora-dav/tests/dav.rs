@@ -684,9 +684,12 @@ async fn recursive_mutations_preserve_hidden_objects() {
         ("COPY", true),
         ("MOVE", true),
     ] {
-        for hidden in ["docs//backup.bin", "docs/x/", "docs/./backup.bin"] {
+        for hidden in ["docs//backup.bin", "docs/x/", "docs/./backup.bin", "docs/x"] {
             let w = World::new().await;
             assert_eq!(w.s3_put(hidden, b"hidden bytes").await, 200);
+            if hidden == "docs/x" {
+                assert_eq!(w.s3_put("docs/x/child", b"visible child").await, 200);
+            }
             assert_eq!(w.s3_put("docs/visible", b"visible bytes").await, 200);
             assert_eq!(w.s3_put("other/member", b"other bytes").await, 200);
             let before = w.s3_list("").await;
@@ -736,6 +739,8 @@ async fn recursive_copy_omits_hidden_source_objects() {
     for k in [
         "docs//backup.bin",
         "docs/x/",
+        "docs/x",
+        "docs/x/child",
         "docs/./backup.bin",
         "docs/visible",
     ] {
@@ -746,8 +751,33 @@ async fn recursive_copy_omits_hidden_source_objects() {
         .await
         .expect(201);
     let copied: Vec<_> = w.s3_list("out/").await.into_iter().map(|e| e.0).collect();
-    assert_eq!(copied, ["out/", "out/visible"]);
+    assert_eq!(copied, ["out/", "out/visible", "out/x/child"]);
     assert_eq!(w.s3_list("docs/").await, before);
+}
+
+#[tokio::test]
+async fn recursive_mutations_preserve_markers_replaced_after_listing() {
+    for method in ["DELETE", "MOVE"] {
+        let w = World::new().await;
+        assert_eq!(w.s3_put("docs/x/", b"").await, 200);
+        w.storage_fault_target(
+            "GET",
+            "/dav?encoding-type=url&list-type=2&max-keys=1000&prefix=docs%2F",
+            StorageFault::Replace {
+                key: "docs/x/".into(),
+                body: b"keep me".to_vec(),
+            },
+        );
+        let r = w
+            .req(method, "/dav/docs/", &[("destination", "/dav/out/")], b"")
+            .await;
+        assert_eq!(
+            (r.status, w.s3_get("docs/x/").await.1),
+            (207, b"keep me".to_vec()),
+            "{method}"
+        );
+        assert_eq!(w.s3_get("out/x/").await.0, 404);
+    }
 }
 
 #[tokio::test]

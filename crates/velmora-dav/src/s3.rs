@@ -469,11 +469,15 @@ impl<'a, U: Upstream> S3<'a, U> {
         from: &str,
         to: &str,
         cond: Option<&Cond>,
+        source_if_match: Option<&str>,
     ) -> Result<String, S3Error> {
         let mut headers = vec![(
             "x-amz-copy-source".to_string(),
             crate::path::encode(&format!("/{bucket}/{from}"), true),
         )];
+        if let Some(tag) = source_if_match {
+            headers.push(("x-amz-copy-source-if-match".into(), tag.to_owned()));
+        }
         if let Some(c) = cond {
             headers.push(c.header());
         }
