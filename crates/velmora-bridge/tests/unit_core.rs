@@ -631,6 +631,28 @@ fn a_fanout_piece_reads_the_generation_its_grant_names() {
         panic!("a read is served");
     };
     assert_eq!(body["generation"], json!("g_0019a00000001c2c2c2c2c2c2c2c2"));
+    // A generation of another key is not read through this key.
+    let mut op = read_plan(reader.clone());
+    if let UnitOp::ReadPlan { key, .. } = &mut op {
+        *key = "other".into();
+    }
+    let UnitAnswer::Ok { body, .. } = u.handle(&call(CallKind::Fanout, seqs(3, 0), true, op), NOW)
+    else {
+        panic!("a fan-out piece for another key is answered");
+    };
+    assert_eq!(body["generation"], json!(null));
+    assert!(body.get("extents").is_none());
+    // A fan-out call names its reader and generation even with the
+    // unit's own numbers.
+    for op in [read_plan(None), UnitOp::Ping {}] {
+        assert_eq!(
+            u.handle(&call(CallKind::Fanout, seqs(3, 0), true, op), NOW),
+            UnitAnswer::Refused {
+                reason: Refused::AccessDenied,
+                alarm: false
+            }
+        );
+    }
     // A fan-out piece that names no generation is refused.
     let mut op = read_plan(reader);
     if let UnitOp::ReadPlan { generation, .. } = &mut op {

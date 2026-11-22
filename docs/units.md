@@ -40,6 +40,9 @@ database, so they run natively in tests); the Durable Object class, the
      the reader's key is `active` with a grant on that bucket (a public
      read: the bucket is still public). Otherwise it is refused with the
      error the whole request would get.
+     Whatever its numbers, a fan-out call names its reader and the
+     generation its grant was made for, and reads that generation of that
+     key, not the one live now.
 6. **Birth certificate.** A unit is made only by `provision(token)`. The
    token names the tenant, the unit, the jurisdiction, the record seq, the
    schema version, the key scheme and its kind (`birth` or `restore`), and is

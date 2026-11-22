@@ -284,7 +284,8 @@ fn sql_pieces(src: &str) -> Vec<String> {
 // ---------------------------------------------------------------------------
 
 /// The words of a piece of SQL, lower case, identifier quotes dropped,
-/// string literals as one token, punctuation as its own token.
+/// a string literal as one token that starts with `'`, punctuation as
+/// its own token.
 fn words(sql: &str) -> Vec<String> {
     let b = sql.as_bytes();
     let mut out = Vec::new();
@@ -309,13 +310,14 @@ fn words(sql: &str) -> Vec<String> {
             while i < b.len() && !(b[i] == b'\'' && b.get(i + 1) != Some(&b'\'')) {
                 i += if b[i] == b'\'' { 2 } else { 1 };
             }
-            // SQLite takes a quoted string where a name is expected as
-            // that name ('extents', 'plan_rev'), so its text is a word too.
-            out.push(
+            // Marked, so that a literal is never read as a keyword, and
+            // read as a name only where SQLite reads it as one ([`nm`]).
+            out.push(format!(
+                "'{}",
                 sql[start..i.min(sql.len())]
                     .replace("''", "'")
-                    .to_ascii_lowercase(),
-            );
+                    .to_ascii_lowercase()
+            ));
             i += 1;
         } else if c == b'"' || c == b'`' || c == b'[' {
             let close = if c == b'[' { b']' } else { c };
@@ -342,6 +344,36 @@ fn words(sql: &str) -> Vec<String> {
     out
 }
 
+/// A word where a name is expected. SQLite takes a string literal there
+/// as the name (`UPDATE 'extents' SET 'plan_rev' = 2`); in an expression
+/// it stays a string.
+fn nm(t: &str) -> &str {
+    t.strip_prefix('\'').unwrap_or(t)
+}
+
+/// Whether a `SET` list assigns `plan_rev`, or may. A bare `plan_rev` or a
+/// `format!` placeholder anywhere counts; a quoted `'plan_rev'` only where
+/// a column is assigned (before the `=` of an assignment, row values
+/// included), not as a value.
+fn sets_plan_rev(list: &[String]) -> bool {
+    if list.iter().any(|t| t == "plan_rev" || t == "{") {
+        return true;
+    }
+    let mut depth = 0i32;
+    let mut assigned = true;
+    for t in list {
+        match t.as_str() {
+            "(" => depth += 1,
+            ")" => depth -= 1,
+            "," if depth == 0 => assigned = true,
+            "=" if depth == 0 => assigned = false,
+            _ if assigned && nm(t) == "plan_rev" => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
 /// The table a statement writes after `UPDATE [OR x]` or `INTO`, with
 /// an optional `schema.` in front, and the index after it.
 fn target(w: &[String], mut j: usize, after_update: bool) -> Option<(String, usize)> {
@@ -349,9 +381,9 @@ fn target(w: &[String], mut j: usize, after_update: bool) -> Option<(String, usi
         j += 2;
     }
     let (table, mut next) = if w.get(j + 1).map(String::as_str) == Some(".") {
-        (w.get(j + 2)?.clone(), j + 3)
+        (nm(w.get(j + 2)?).to_string(), j + 3)
     } else {
-        (w.get(j)?.clone(), j + 1)
+        (nm(w.get(j)?).to_string(), j + 1)
     };
     // `AS alias`, `INDEXED BY index`, `NOT INDEXED`.
     loop {
@@ -418,11 +450,12 @@ fn bracketed(w: &[String], j: usize) -> &[String] {
 /// column; or by a table renamed to `extents` (a rebuild).
 fn writes_plan_rev(sql: &str) -> bool {
     let w = words(sql);
-    // `plan_rev`, or a `format!` placeholder that may hold it.
-    let has = |list: &[String]| list.iter().any(|t| t == "plan_rev" || t == "{");
+    // A column list naming `plan_rev`, or a `format!` placeholder that may
+    // hold it.
+    let names = |list: &[String]| list.iter().any(|t| nm(t) == "plan_rev" || t == "{");
     // A table rebuilt and renamed to `extents` writes every row of it.
     if w.windows(3)
-        .any(|x| x[0] == "rename" && x[1] == "to" && x[2] == "extents")
+        .any(|x| x[0] == "rename" && x[1] == "to" && nm(&x[2]) == "extents")
     {
         return true;
     }
@@ -435,7 +468,7 @@ fn writes_plan_rev(sql: &str) -> bool {
                 // A table given by a placeholder may be `extents`.
                 if (table == "extents" || table == "{")
                     && w.get(after).map(String::as_str) == Some("set")
-                    && has(set_list(&w, after + 1))
+                    && sets_plan_rev(set_list(&w, after + 1))
                 {
                     return true;
                 }
@@ -453,7 +486,7 @@ fn writes_plan_rev(sql: &str) -> bool {
                 if table != "extents" {
                     continue;
                 }
-                if w.get(after).map(String::as_str) != Some("(") || has(bracketed(&w, after)) {
+                if w.get(after).map(String::as_str) != Some("(") || names(bracketed(&w, after)) {
                     return true;
                 }
                 // Every `DO UPDATE SET` of an upsert writes the same row.
@@ -461,7 +494,7 @@ fn writes_plan_rev(sql: &str) -> bool {
                     if x[0] == "do"
                         && x[1] == "update"
                         && x[2] == "set"
-                        && has(set_list(&w, after + k + 3))
+                        && sets_plan_rev(set_list(&w, after + k + 3))
                     {
                         return true;
                     }
@@ -474,7 +507,7 @@ fn writes_plan_rev(sql: &str) -> bool {
                     continue;
                 };
                 let statement = w[after..].iter().take_while(|t| *t != ";");
-                if table == "extents" && statement.into_iter().any(|t| t == "plan_rev") {
+                if table == "extents" && statement.into_iter().any(|t| nm(t) == "plan_rev") {
                     return true;
                 }
             }
@@ -495,7 +528,7 @@ fn writes_plan_rev(sql: &str) -> bool {
                 if w.get(j + 1).map(String::as_str) == Some(".") {
                     j += 2;
                 }
-                if w.get(j).map(String::as_str) == Some("extents")
+                if w.get(j).map(|t| nm(t)) == Some("extents")
                     && w.get(j + 1).map(String::as_str) == Some("as")
                 {
                     return true;
@@ -630,6 +663,10 @@ fn the_scanner_finds_a_statement_however_it_is_written() {
         // Single quotes where a name is expected.
         "const X: &str = \"UPDATE 'extents' SET 'plan_rev' = 2\";",
         "const X: &str = \"INSERT INTO 'extents'('id', 'plan_rev') VALUES (?1, 2)\";",
+        "const X: &str = \"UPDATE extents SET (n, 'plan_rev') = (1, 2)\";",
+        // A literal that reads like a keyword ends nothing.
+        "const X: &str = \"UPDATE extents SET note = 'where', plan_rev = 2 WHERE id = ?1\";",
+        "const X: &str = \"UPDATE extents SET note = ')', 'plan_rev' = 2\";",
         // `format!`: a placeholder may hold the column or the table.
         "let s = format!(\"INSERT OR REPLACE INTO extents({EXTENT_COLS}) VALUES ({v})\");",
         "let s = format!(\"UPDATE extents SET {SET} WHERE id = ?1\");",
@@ -650,6 +687,10 @@ fn the_scanner_finds_a_statement_however_it_is_written() {
         "const X: &str = \"INSERT INTO verifications(extent_id, plan_rev) VALUES (?1, ?2)\";",
         "const X: &str = \"UPDATE verify_raises SET plan_rev = (SELECT plan_rev FROM extents)\";",
         "const X: &str = \"SELECT plan_rev FROM extents\";",
+        // A quoted value is a string, not the column.
+        "const X: &str = \"UPDATE extents SET note = 'plan_rev' WHERE id = ?1\";",
+        "const X: &str = \"UPDATE extents SET note = 'x' || 'plan_rev', n = 1\";",
+        "const X: &str = \"INSERT INTO 'verifications'('extent_id', 'plan_rev') VALUES (?1, ?2)\";",
         "// \"UPDATE extents SET plan_rev = 2\"",
     ] {
         assert!(one(src).is_empty(), "found: {src}");

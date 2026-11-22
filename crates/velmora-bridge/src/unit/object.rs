@@ -327,17 +327,20 @@ impl<S: UnitSql> Unit<S> {
         if call.authenticated && !allows(&head, call.op.is_read()) {
             return Ok(refused(Refused::AccountProblem, false));
         }
-        if fanout_check
+        if call.kind == CallKind::Fanout
             && !matches!(
                 call.op,
                 UnitOp::ReadPlan {
                     reader: Some(_),
+                    generation: Some(_),
                     ..
                 }
             )
         {
-            // Lower numbers are served only to a fan-out read that the
-            // unit's own tables still allow.
+            // A fan-out call is a piece of a granted read, whatever its
+            // numbers: it names its reader and the generation its grant
+            // was made for. With lower numbers it is served only while
+            // the unit's own tables still allow the reader.
             return Ok(refused(Refused::AccessDenied, false));
         }
         self.run(call, &head, fanout_check, now)
@@ -447,7 +450,9 @@ impl<S: UnitSql> Unit<S> {
                         .cat
                         .generation_by_id(&b.id, &GenerationId::new(g.as_str()))
                         .await?
-                        .map(|(_, g)| g),
+                        .map(|(_, g)| g)
+                        // The generation named is one of this key's.
+                        .filter(|g| g.key == *key),
                     None => self.cat.live_generation(&b.id, key).await?,
                 };
                 let Some(generation) = generation else {
