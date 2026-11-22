@@ -2,7 +2,7 @@
 //! `pending_ops` (AM-75) and the per-token backstop counter (ADR §6.3).
 //! Under `VELMORA_D1_PROBE` every directory here is a D1 database.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 
 use sha2::{Digest, Sha256};
@@ -15,7 +15,9 @@ use velmora_bridge::directory::chain::{record_key, TenantChain, Written};
 use velmora_bridge::directory::first_open::{
     first_open, managed_tenant_exists, FirstOpenAnswer, FIRST_OPEN_REASON, REGISTRY_PREFIX,
 };
-use velmora_bridge::directory::gate::{anchored_epoch, is_open, run_gate_if_closed, NotBuilt};
+use velmora_bridge::directory::gate::{
+    anchored_epoch, is_open, run_gate_if_closed, NotBuilt, GATE_ANCHOR_PREFIX,
+};
 use velmora_bridge::directory::record::Tenant;
 use velmora_bridge::directory::store::{ChainKind, PendingOp, SqlDirectory};
 use velmora_bridge::directory::sweep::{
@@ -222,6 +224,81 @@ fn the_first_open_opens_an_empty_directory_once() {
     });
 }
 
+/// Both calls choose their closing epoch before either writes its anchor.
+/// This covers a same-epoch collision, not every read-to-put interleaving.
+#[test]
+fn two_concurrent_first_opens_leave_the_gate_open() {
+    struct YieldBeforeAnchorPut<'a> {
+        records: &'a HookedRecords,
+        anchor_puts: Cell<u32>,
+    }
+
+    impl RecordStore for YieldBeforeAnchorPut<'_> {
+        async fn put_if_absent(&self, key: &str, bytes: Vec<u8>) -> Result<bool> {
+            if key.starts_with(GATE_ANCHOR_PREFIX) {
+                self.anchor_puts.set(self.anchor_puts.get() + 1);
+                // Without a yield the in-memory I/O lets the first call finish alone.
+                tokio::task::yield_now().await;
+            }
+            self.records.put_if_absent(key, bytes).await
+        }
+
+        async fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
+            self.records.get(key).await
+        }
+
+        async fn list(&self, prefix: &str, start_after: &str, limit: u32) -> Result<Vec<String>> {
+            self.records.list(prefix, start_after, limit).await
+        }
+    }
+
+    let db = database();
+    let dir = SqlDirectory { sql: &db };
+    let store = HookedRecords::new();
+    let yielding_store = YieldBeforeAnchorPut {
+        records: &store,
+        anchor_puts: Cell::new(0),
+    };
+    let seal = PlainSeal::new();
+    let chain = TenantChain {
+        store: &yielding_store,
+        seal: &seal,
+    };
+    let kek = kek();
+    block_on(async {
+        locations(&store, &kek).await;
+        note(&dir, A1, ChainKind::Keys, 1, NOW.0).await;
+        assert_eq!(dir.oldest_pending().await.unwrap(), Some(NOW));
+        let (a, b) = tokio::join!(
+            first_open(&chain, &dir, &kek, NOW),
+            first_open(&chain, &dir, &kek, NOW),
+        );
+        assert_eq!(
+            yielding_store.anchor_puts.get(),
+            2,
+            "both calls must reach the anchor put"
+        );
+        let mut opened = 0;
+        for answer in [a.unwrap(), b.unwrap()] {
+            match answer {
+                FirstOpenAnswer::Ran(run) if run.opened => opened += 1,
+                FirstOpenAnswer::Ran(run) if run.closed_over => (),
+                FirstOpenAnswer::AlreadyOpen | FirstOpenAnswer::Moved => (),
+                other => panic!("unexpected first-open answer: {other:?}"),
+            }
+        }
+        assert!(opened <= 1, "{opened} runs reported opening the gate");
+        assert!(is_open(&store, &dir).await.unwrap());
+        assert_eq!(dir.oldest_pending().await.unwrap(), None);
+        let anchor = anchored_epoch(&store).await.unwrap();
+        assert_eq!(
+            first_open(&chain, &dir, &kek, NOW).await.unwrap(),
+            FirstOpenAnswer::AlreadyOpen
+        );
+        assert_eq!(anchored_epoch(&store).await.unwrap(), anchor);
+    });
+}
+
 /// A managed tenant chain refuses the run before anything is written: no
 /// anchor, no gate row.
 #[test]
@@ -343,7 +420,7 @@ fn key_locations_that_do_not_open_keep_the_gate_closed() {
 
 /// A call whose guard passed before another run opened the gate finds it
 /// open at its closing: `None` (the call answers `Moved`), no anchor, and
-/// the gate stays open.
+/// the gate stays open without clearing pending operations.
 #[test]
 fn a_stale_first_open_guard_writes_no_anchor() {
     let db = database();
@@ -361,6 +438,7 @@ fn a_stale_first_open_guard_writes_no_anchor() {
             panic!("no run");
         };
         assert!(run.opened);
+        note(&dir, A1, ChainKind::Keys, 1, NOW.0).await;
         let anchors = store.keys();
         let run = run_gate_if_closed(&chain, &dir, &NotBuilt, FIRST_OPEN_REASON, NOW)
             .await
@@ -368,6 +446,7 @@ fn a_stale_first_open_guard_writes_no_anchor() {
         assert!(run.is_none(), "{run:?}");
         assert_eq!(store.keys(), anchors);
         assert!(is_open(&store, &dir).await.unwrap());
+        assert_eq!(dir.oldest_pending().await.unwrap(), Some(NOW));
         // A closing taken by another call first: `None` too.
         let other = HookedRecords::new();
         let other_chain = TenantChain {
