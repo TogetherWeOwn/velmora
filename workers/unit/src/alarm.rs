@@ -3,8 +3,9 @@
 //!
 //! - [`run`]: the alarm handler. The unit decides what to send
 //!   (`Unit::alarm`): one `stamp_raise` per period with writes under a
-//!   fresh lease, and with an expired lease one `renew` and nothing
-//!   else. They go to the queue bound as [`UNIT_JOB_QUEUE`]. Then the
+//!   fresh lease with at least half of T left, one `renew` instead of
+//!   the raise with less, and with an expired lease one `renew` and
+//!   nothing else. They go to the queue bound as [`UNIT_JOB_QUEUE`]. Then the
 //!   unit records the run (`Unit::alarm_done`) and answers when to fire
 //!   next, which is armed here.
 //! - [`arm`]: after a call, the time the call asked for, armed only when

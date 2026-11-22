@@ -124,9 +124,6 @@ pub struct AlarmStep {
     pub jobs: Vec<String>,
     /// The stamp raise is among them.
     pub raise: bool,
-    /// The first write the raise covers: handed out before the send, and
-    /// pending again if the send fails.
-    pub raised_from: Option<UnixMs>,
     /// The lease when the run was planned: a renewal that lands during
     /// the sends is not counted as one more failed try.
     pub planned_lease: Option<UnixMs>,
@@ -1320,7 +1317,6 @@ impl<S: UnitSql> Unit<S> {
             },
             jobs: Vec::new(),
             raise: false,
-            raised_from: None,
             planned_lease: None,
         };
         self.tables.set(None);
@@ -1328,9 +1324,14 @@ impl<S: UnitSql> Unit<S> {
             Some(cert) if cert == self.own => {}
             _ => return Ok(idle),
         }
-        let Some(row) = self.lease_row()? else {
+        if self.lease_row()?.is_none() {
             return Ok(idle);
-        };
+        }
+        // A raise a dead run handed out is pending again.
+        let sql = self.sql();
+        let mut settle = || store::settle_dead_raise(sql);
+        sql.atomically(&mut settle)?;
+        let row = store::read(sql)?;
         let head = self.head()?;
         let lease = row.lease();
         let closed = self.closed(&head)?;
@@ -1362,21 +1363,16 @@ impl<S: UnitSql> Unit<S> {
             .into_iter()
             .collect::<Option<Vec<_>>>()
             .unwrap_or_default();
-        // The raise is handed out before the send: a write during the
-        // send is then pending a raise of its own.
-        let mut raised_from = None;
+        // The raise is handed out before the send (kept in `raise_from`
+        // until the send ends): a write during the send is then pending a
+        // raise of its own.
         if raise && !jobs.is_empty() {
-            let sql = self.sql();
-            let mut take = || {
-                raised_from = store::take_first_write(sql)?;
-                Ok(())
-            };
+            let mut take = || store::take_first_write(sql);
             sql.atomically(&mut take)?;
         }
         Ok(AlarmStep {
             jobs,
             raise,
-            raised_from,
             planned_lease: row.fresh_until,
             run,
         })
@@ -1403,10 +1399,8 @@ impl<S: UnitSql> Unit<S> {
             failed || step.jobs.len() != step.run.run.len() + usize::from(step.run.send_renew);
         let sql = self.sql();
         let mut run = || {
-            if failed {
-                if let Some(at) = step.raised_from {
-                    store::raise_failed(sql, at)?;
-                }
+            if step.raise && !step.jobs.is_empty() {
+                store::raise_sent(sql, !failed)?;
             }
             store::alarm_ran(sql, step.run.send_renew, step.planned_lease, failed)
         };

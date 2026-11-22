@@ -122,7 +122,9 @@ unit's two jobs, format 2 with the tenant and the unit: `stamp_raise`, once
 per period (5 minutes, est) after the first write since the last raise
 (the stamp's own calls and the cron's bookkeeping do not count), and with an
 expired lease one `renew` and nothing else, retried with a doubling wait
-(60 s to 30 minutes, est). Work that was due stays due; after a renewal the
+(60 s to 30 minutes, est). A raise is handed out only with at least half of
+T left (its consumer reaches the unit later); with less, the alarm sends one
+`renew` instead, other duties run, and the raise follows the renewal. Work that was due stays due; after a renewal the
 alarm is set to now. The alarm is armed only when the wanted time is earlier
 than the armed one. A closed unit runs nothing. Only the stamp raise is due
 on a unit yet: the day close (W7), the sweeps, the hand-out and the report

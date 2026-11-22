@@ -161,8 +161,10 @@ const _: () = assert!(AlarmRules::DEFAULT.valid(&LeaseRules::DEFAULT));
 pub struct AlarmRun {
     /// The duties to run now, in order. Empty when the lease has expired.
     pub run: Vec<Duty>,
-    /// Send one `renew` job (the lease has expired and work is due). The
-    /// unit adds one to its count of renew tries.
+    /// Send one `renew` job: the lease has expired and work is due, or
+    /// less than half of T is left and the stamp raise is due (the raise
+    /// waits for the renewal). The unit adds one to its count of renew
+    /// tries, unless a renewal lands during the run.
     pub send_renew: bool,
     /// Arm at least this early after the run, whatever the duties say
     /// then: the retry of the renewal. `None` = only the due times
@@ -277,7 +279,9 @@ pub const MIN_ALARM_GAP_MS: i64 = 1000;
 /// - a closed unit: `None`; the restore gate's lift arms it again;
 /// - a fresh lease: the earliest due time, at least
 ///   [`MIN_ALARM_GAP_MS`] after `now`; after runs in which a duty
-///   failed, at least the renewal backoff for that many failures;
+///   failed, at least the renewal backoff for that many failures; and
+///   not before `retry_at` when the run asked for a renewal (a lease
+///   with less than half of T left and a raise due);
 /// - an expired lease: the earliest due time, but not before the renewal
 ///   retry (`retry_at`, or without one `now` plus the backoff for
 ///   `renew_tries`). Work that is due never wakes the alarm before the

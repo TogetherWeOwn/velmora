@@ -855,6 +855,59 @@ fn a_revoked_principal_is_not_counted() {
     ));
 }
 
+/// A run that dies during its send (the object reset) leaves its raise
+/// pending: the next run sends it again.
+#[test]
+fn a_raise_of_a_run_that_died_is_sent_again() {
+    let u = fresh();
+    assert!(matches!(
+        request(&u, true, read_plan(), NOW),
+        UnitAnswer::Ok { .. }
+    ));
+    let due = UnixMs(NOW.0 + PERIOD);
+    let step = u.alarm(due).unwrap();
+    assert!(step.raise);
+    assert_eq!(lease_row(&u).raise_from, Some(NOW));
+    // No `alarm_done`: the platform runs the alarm again.
+    let again = UnixMs(due.0 + 1_000);
+    assert!(matches!(renew(&u, again), UnitAnswer::Ok { .. }));
+    let step = u.alarm(again).unwrap();
+    assert!(step.raise, "the dead run's raise is due again");
+    u.alarm_done(again, &step, false).unwrap();
+    let row = lease_row(&u);
+    assert_eq!((row.first_write_at, row.raise_from), (None, None));
+}
+
+/// A listed id that names a principal row (were one ever listed) is kept
+/// on its own: the principal is left as it is, and the count and the
+/// check agree with the listing.
+#[test]
+fn a_listed_id_of_a_principal_row_counts_without_touching_it() {
+    let u = born();
+    let mut p = principal(1);
+    p.id = "PWIRE0000000000001".into();
+    assert!(matches!(
+        worker(
+            &u,
+            UnitOp::ApplyKeys {
+                from_seq: 0,
+                entries: vec![p]
+            },
+            NOW
+        ),
+        UnitAnswer::Ok { .. }
+    ));
+    assert!(matches!(sync(&u, 3, None, NOW), UnitAnswer::Ok { .. }));
+    let a = worker(
+        &u,
+        renew_op(NOW, proven(&u, 1), &["PWIRE0000000000001"]),
+        NOW,
+    );
+    assert!(matches!(a, UnitAnswer::Ok { .. }), "{a:?}");
+    assert_eq!(status_of(&u, "PWIRE0000000000001"), "active");
+    assert_eq!(store::revoked(u.sql()).unwrap(), Some(1));
+}
+
 /// The alarm sends each job as a JavaScript object parsed from its JSON
 /// text. A `serde_json::Value` given to the SDK's `MessageBuilder` goes
 /// through `serde_wasm_bindgen`, which makes a map of it, and a map is

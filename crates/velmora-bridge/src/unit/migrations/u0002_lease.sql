@@ -12,6 +12,8 @@
 -- `failed_runs`: alarm runs in a row in which a duty failed.
 -- `first_write_at`: the unit's time of the first write since the last
 --   stamp raise the alarm asked for; NULL = no write since.
+-- `raise_from`: the first write of a raise the alarm is sending; back
+--   into `first_write_at` if the send fails or the run dies.
 -- Not moved by `sync` (unit_head is): only `renew`, the close, the alarm
 -- and a call that writes.
 CREATE TABLE unit_lease (
@@ -20,7 +22,8 @@ CREATE TABLE unit_lease (
   lease_hi       INTEGER,
   renew_tries    INTEGER NOT NULL DEFAULT 0 CHECK (renew_tries >= 0),
   failed_runs    INTEGER NOT NULL DEFAULT 0 CHECK (failed_runs >= 0),
-  first_write_at INTEGER
+  first_write_at INTEGER,
+  raise_from     INTEGER
 );
 
 INSERT INTO unit_lease(id) VALUES (1);

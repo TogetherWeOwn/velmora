@@ -49,6 +49,8 @@ pub struct LeaseRow {
     pub renew_tries: u32,
     pub failed_runs: u32,
     pub first_write_at: Option<UnixMs>,
+    /// The first write of a raise being sent (`take_first_write`).
+    pub raise_from: Option<UnixMs>,
 }
 
 impl LeaseRow {
@@ -106,14 +108,14 @@ fn count(v: &SqlValue) -> Result<u32> {
 /// a lease never issued.
 pub fn read<S: Sql>(sql: &S) -> Result<LeaseRow> {
     let rows = poll_once(sql.query(
-        "SELECT fresh_until, lease_hi, renew_tries, failed_runs, first_write_at \
+        "SELECT fresh_until, lease_hi, renew_tries, failed_runs, first_write_at, raise_from \
            FROM unit_lease WHERE id = 1",
         &[],
     ))??;
     let Some(r) = rows.first() else {
         return Ok(LeaseRow::default());
     };
-    if r.len() != 5 {
+    if r.len() != 6 {
         return Err(decode("unit_lease"));
     }
     Ok(LeaseRow {
@@ -122,6 +124,7 @@ pub fn read<S: Sql>(sql: &S) -> Result<LeaseRow> {
         renew_tries: count(&r[2])?,
         failed_runs: count(&r[3])?,
         first_write_at: time(&r[4])?,
+        raise_from: time(&r[5])?,
     })
 }
 
@@ -170,29 +173,43 @@ pub fn note_write<S: Sql>(sql: &S, now: UnixMs) -> Result<bool> {
     Ok(n == 1)
 }
 
-/// The alarm hands out the stamp raise: no write is pending a raise any
-/// more. Answers the first write it covers, for [`raise_failed`].
-pub fn take_first_write<S: Sql>(sql: &S) -> Result<Option<UnixMs>> {
-    let row = read(sql)?;
+/// A raise that a run handed out and never settled (the object reset
+/// during its send) is pending again: back into `first_write_at`, the
+/// earlier of the two. The alarm calls this first.
+pub fn settle_dead_raise<S: Sql>(sql: &S) -> Result<()> {
     write_one(
         sql,
-        "UPDATE unit_lease SET first_write_at = NULL WHERE id = 1",
+        "UPDATE unit_lease SET \
+           first_write_at = CASE WHEN raise_from IS NULL THEN first_write_at \
+             WHEN first_write_at IS NULL OR first_write_at > raise_from THEN raise_from \
+             ELSE first_write_at END, \
+           raise_from = NULL WHERE id = 1",
         &[],
-    )?;
-    Ok(row.first_write_at)
+    )
 }
 
-/// The raise handed out by [`take_first_write`] was not sent: the writes
-/// it covered are pending again, from the earlier of `at` and a write
-/// that came meanwhile.
-pub fn raise_failed<S: Sql>(sql: &S, at: UnixMs) -> Result<()> {
+/// The alarm hands out the stamp raise: the writes it covers move from
+/// `first_write_at` to `raise_from`, so a write during the send is
+/// pending a raise of its own.
+pub fn take_first_write<S: Sql>(sql: &S) -> Result<()> {
     write_one(
         sql,
-        "UPDATE unit_lease SET first_write_at = \
-           CASE WHEN first_write_at IS NULL OR first_write_at > ?1 THEN ?1 \
-                ELSE first_write_at END WHERE id = 1",
-        &[SqlValue::Int(at.0)],
+        "UPDATE unit_lease SET raise_from = first_write_at, first_write_at = NULL WHERE id = 1",
+        &[],
     )
+}
+
+/// The send of the raise ended: sent (`raise_from` is done with), or not
+/// (its writes are pending again, from the earlier of the two times).
+pub fn raise_sent<S: Sql>(sql: &S, sent: bool) -> Result<()> {
+    if sent {
+        return write_one(
+            sql,
+            "UPDATE unit_lease SET raise_from = NULL WHERE id = 1",
+            &[],
+        );
+    }
+    settle_dead_raise(sql)
 }
 
 /// What one alarm run did, as the row keeps it: a renew job sent counts
@@ -284,12 +301,23 @@ pub fn revoke_listed<S: Sql>(
     let mut changed = 0;
     for id in ids {
         let rows = poll_once(sql.query(
-            "SELECT status FROM unit_keys WHERE id = ?1",
+            "SELECT status, kind FROM unit_keys WHERE id = ?1",
             &[SqlValue::Text(id.clone())],
         ))??;
-        match rows.first().and_then(|r| r.first()) {
-            Some(SqlValue::Text(status)) if status == "revoked" => {}
-            Some(SqlValue::Text(_)) => {
+        let row = rows.first().map(|r| (r.first(), r.get(1)));
+        // A principal is not a key: the listed id is kept on its own,
+        // so the count and the check agree with the listing.
+        let principal = matches!(row, Some((_, Some(SqlValue::Text(k)))) if k == "principal");
+        match row.map(|(status, _)| status) {
+            _ if principal => {
+                changed += poll_once(sql.exec(
+                    "INSERT INTO unit_revoked_ids(id, listed_at) VALUES (?1, ?2) \
+                     ON CONFLICT(id) DO NOTHING",
+                    &[SqlValue::Text(id.clone()), SqlValue::Int(now.0)],
+                ))?? as usize;
+            }
+            Some(Some(SqlValue::Text(status))) if status == "revoked" => {}
+            Some(Some(SqlValue::Text(_))) => {
                 poll_once(sql.exec(
                     "UPDATE unit_keys SET status = 'revoked' WHERE id = ?1",
                     &[SqlValue::Text(id.clone())],
@@ -316,7 +344,7 @@ pub fn revoke_listed<S: Sql>(
 pub fn enforce_listed<S: Sql>(sql: &S) -> Result<usize> {
     let rows = poll_once(sql.query(
         "SELECT k.id FROM unit_revoked_ids r JOIN unit_keys k ON k.id = r.id \
-          WHERE k.status <> 'revoked'",
+          WHERE k.status <> 'revoked' AND k.kind <> 'principal'",
         &[],
     ))??;
     let mut touched = BTreeSet::new();
