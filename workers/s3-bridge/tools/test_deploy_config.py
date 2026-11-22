@@ -665,6 +665,125 @@ class DeployConfigSwitchesTest(GeneratorCase):
                      self.shipped.replace('binding = "CATALOG"', 'binding = "OTHER"', 1))
 
 
+class KeyBucketsTest(GeneratorCase):
+    """VELMORA_KEYS_A_BUCKET and VELMORA_KEYS_B_BUCKET: the two key
+    buckets of the tenant keys, bound together or not at all."""
+
+    a, b = "velmora-keys-a", "velmora-keys-b"
+    log = "key buckets in the generated config: "
+    cache = 'bucket_name = "velmora-cache-enam"'
+
+    def both(self, a=None, b=None):
+        return {"VELMORA_KEYS_A_BUCKET": self.a if a is None else a,
+                "VELMORA_KEYS_B_BUCKET": self.b if b is None else b}
+
+    def test_unset_or_empty_preserves_the_baseline(self):
+        for env in ({}, {"VELMORA_KEYS_A_BUCKET": "", "VELMORA_KEYS_B_BUCKET": ""}):
+            out, written = self.ok(env)
+            self.assertEqual(written, without_switches(self.shipped))
+            self.assertEqual(out.splitlines().count(self.log + "none"), 1)
+            doc = tomllib.loads(written.decode())
+            self.assertEqual([b["binding"] for b in doc["r2_buckets"]], ["SAFETY", "CACHE"])
+
+    def test_both_set_bind_both_after_the_cache_bucket(self):
+        out, written = self.ok(self.both())
+        text = written.decode()
+        self.assertIn(
+            f'{self.cache}\n\n[[r2_buckets]]\nbinding = "KEYS_A"\nbucket_name = "{self.a}"'
+            f'\n\n[[r2_buckets]]\nbinding = "KEYS_B"\nbucket_name = "{self.b}"\n', text)
+        doc = tomllib.loads(text)
+        baseline = tomllib.loads(without_switches(self.shipped).decode())
+        self.assertEqual(doc["r2_buckets"], baseline["r2_buckets"] + [
+            {"binding": "KEYS_A", "bucket_name": self.a},
+            {"binding": "KEYS_B", "bucket_name": self.b},
+        ])
+        self.assertEqual(doc["env"], baseline["env"])
+        self.assertEqual(doc["vars"], baseline["vars"])
+        self.assertEqual(out.splitlines().count(self.log + "bound"), 1)
+        for name in (self.a, self.b, HOST, DBID):
+            self.assertNotIn(name, out)
+        # The text after the new tables is the shipped text.
+        expected = without_switches(self.shipped).decode().replace(
+            self.cache,
+            f'{self.cache}\n\n[[r2_buckets]]\nbinding = "KEYS_A"\nbucket_name = "{self.a}"'
+            f'\n\n[[r2_buckets]]\nbinding = "KEYS_B"\nbucket_name = "{self.b}"', 1)
+        self.assertEqual(text, expected)
+
+    def test_the_deploy_never_provisions_a_missing_binding(self):
+        deploys = [line for line in self.ci.split("\n")
+                   if "wrangler deploy -c wrangler.deploy.toml" in line]
+        self.assertEqual(len(deploys), 1, deploys)
+        self.assertIn(" --x-provision=false ", deploys[0])
+
+    def test_one_alone_is_refused(self):
+        for env in ({"VELMORA_KEYS_A_BUCKET": self.a}, {"VELMORA_KEYS_B_BUCKET": self.b},
+                    self.both(b="")):
+            with self.subTest(env=env):
+                self.refused(env, "VELMORA_KEYS_A_BUCKET and VELMORA_KEYS_B_BUCKET must be set together")
+
+    def test_invalid_names_are_refused(self):
+        for bad in ("Velmora-keys", "ab", "-keys", "keys-", "a" * 64, self.a + "\n", "keys_a", "keys.a"):
+            for variable, env in (("VELMORA_KEYS_A_BUCKET", self.both(a=bad)),
+                                  ("VELMORA_KEYS_B_BUCKET", self.both(b=bad))):
+                with self.subTest(variable=variable, value=bad):
+                    self.refused(env, f"{variable} must be unset or an R2 bucket name")
+
+    def test_the_same_bucket_twice_is_refused(self):
+        self.refused(self.both(b=self.a),
+                     "VELMORA_KEYS_A_BUCKET and VELMORA_KEYS_B_BUCKET must not be the same bucket")
+
+    def test_a_bucket_the_file_binds_is_refused(self):
+        # Production's buckets, and the dev Worker's (it deletes in them).
+        for variable, env in (("VELMORA_KEYS_A_BUCKET", self.both(a="velmora-safety-enam")),
+                              ("VELMORA_KEYS_B_BUCKET", self.both(b="velmora-cache-enam")),
+                              ("VELMORA_KEYS_A_BUCKET", self.both(a="velmora-cache-dev")),
+                              ("VELMORA_KEYS_B_BUCKET", self.both(b="velmora-safety-dev"))):
+            with self.subTest(variable=variable, env=env):
+                self.refused(env, f"{variable} must not be a bucket the file already binds")
+
+    def test_a_shipped_key_binding_is_refused_whatever_is_asked(self):
+        for binding in ("KEYS_A", "KEYS_B"):
+            for line in (f'binding = "{binding}"', f"binding = '{binding}'"):
+                fixture = add_after(self.shipped, self.cache,
+                                    f'\n[[r2_buckets]]\n{line}\nbucket_name = "shipped-keys"')
+                for env in ({}, self.both()):
+                    with self.subTest(binding=binding, line=line, env=env):
+                        self.refused(env, f"the prod section of the shipped file binds {binding}", fixture)
+
+    def test_the_cache_anchor_is_required_when_set(self):
+        fixture = self.shipped.replace(self.cache, 'bucket_name = "velmora-cache-other"', 1)
+        self.refused(self.both(), "expected exactly one prod CACHE bucket_name line", fixture)
+        # Unset, the anchor is not needed.
+        self.ok({}, fixture)
+
+    def test_a_shipped_key_binding_of_any_kind_is_refused(self):
+        # A service binding: the line pattern catches it.
+        services = add_after(self.shipped, self.cache,
+                             '\n[[services]]\nbinding = "KEYS_A"\nservice = "other"')
+        # A quoted key: only the parsed file shows it.
+        quoted = add_after(self.shipped, self.cache,
+                           '\n[[r2_buckets]]\n"binding" = "KEYS_B"\nbucket_name = "x-keys"')
+        # An inline table of another binding type.
+        inline = add_after(self.shipped, "[build]",
+                           'kv_namespaces = [{ binding = "KEYS_A", id = "0123" }]')
+        for fixture, binding in ((services, "KEYS_A"), (quoted, "KEYS_B"), (inline, "KEYS_A")):
+            for env in ({}, self.both()):
+                with self.subTest(binding=binding, env=env):
+                    self.refused(env, f"the prod section of the shipped file binds {binding}", fixture)
+
+    def test_read_back_refuses_a_key_table_that_is_not_what_was_asked(self):
+        # A line after the cache bucket's name lands in the KEYS_B table.
+        fixture = add_after(self.shipped, self.cache, 'jurisdiction = "eu"')
+        self.refused(self.both(), "the generated config does not carry the expected key bucket bindings",
+                     fixture)
+
+    def test_a_shipped_key_binding_with_a_comment_is_refused(self):
+        # No spaces around `=`, and a comment after the value.
+        fixture = add_after(self.shipped, self.cache,
+                            '\n[[r2_buckets]]\nbinding="KEYS_A" # inline\nbucket_name = "x-keys"')
+        self.refused({}, "the prod section of the shipped file binds KEYS_A", fixture)
+
+
 @unittest.skipUnless(
     os.environ.get("DEPLOY_CONFIG_BASELINE"),
     "set DEPLOY_CONFIG_BASELINE to the ci.yml of the commit to compare with",
