@@ -28,20 +28,24 @@
 //! job (`renew`, `stamp_raise`) runs through the unit client
 //! (`deliver_unit_job`).
 //!
-//! **This build has no unit client and no tenant head reader** (lanes L2
-//! and L3, on the C(b) base): [`client`] and [`heads`] fail every call,
-//! so a `renew_needed`, a `SyncNeeded`, an `Unborn`, a shred's refusal and
+//! **This build has no unit client** (lane L2, on the C(b) base):
+//! [`client`] fails every call, so a `renew_needed`, a `SyncNeeded` and
 //! every unit job are handed back until the dead-letter queue, which
-//! pages. Never acknowledged on a read that was not made.
+//! pages. The tenant heads (an `Unborn` is decided by the verified head)
+//! come from the composition root's door reader (`crate::root`). Never
+//! acknowledged on a read that was not made.
 
+use velmora::rng::SystemRng;
 use velmora_bridge::jobmsg::{JobTenant, Units};
+use velmora_bridge::root::Root;
+use velmora_bridge::service::KeyDispatch;
 use velmora_bridge::sql::SqlCatalog;
 use velmora_bridge::tenant_catalog::{LatestSeqs, TenantCatalog, UnitPort};
 use velmora_bridge::types::JobOutcome;
 use velmora_bridge::unit::{Seqs, TenantId, UnitAnswer, UnitCall, UnitName, UnitReply};
 use velmora_bridge::unit_consumer::{NoClient, Ran, UnitRun};
 use velmora_bridge::unit_lease::client::UnitReplies;
-use velmora_bridge::unit_router::NoHeads;
+use velmora_bridge::unit_router::{KeyRoutes, NoClients, Router};
 use velmora_bridge::{Bridge, BridgeError, Result};
 use worker::wasm_bindgen::JsValue;
 use worker::{Env, Method, ObjectNamespace, Request, RequestInit, Stub};
@@ -51,6 +55,7 @@ use crate::env::{WorkerBridge, WorkerClock};
 use crate::nntp::WorkerConnector;
 use crate::queues::QueueSink;
 use crate::r2::R2Blobs;
+use crate::root::WorkerPorts;
 use velmora_bridge::config::KekRing;
 
 /// The binding of the unit class (a Durable Object namespace).
@@ -192,11 +197,6 @@ pub fn client() -> NoClient {
     NoClient
 }
 
-/// The tenant head reader of this build: none (see the [module](self)).
-pub fn heads() -> NoHeads {
-    NoHeads
-}
-
 /// One run of a job on its unit's bridge, in the isolate's job table as
 /// every job (`crate::jobs::run`).
 pub struct OnUnit<'a> {
@@ -250,6 +250,82 @@ impl UnitRun for OnUnit<'_> {
         // The run once more starts with no refusal of its own.
         self.bridge.catalog.run_again_with(seqs);
         given
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The request router (design round 5, AM-51)
+// ---------------------------------------------------------------------------
+
+/// A request whose claimed access key routes to a managed tenant, served
+/// through the router (`velmora_bridge::service::serve_managed`). `None`:
+/// tenant 0's path, unchanged, which is every request of a Worker without
+/// `UNIT` bound (no route read at all), every request that claims no key
+/// or a key of tenant 0 (the directory names no route for it), and, after
+/// a failed directory read, a key tenant 0's catalogue holds. Any other
+/// key after a failed directory read answers `503` (ADR §8.4, DUR-10:
+/// `service::serve_unrouted`). `skip`: an admin route or a verified
+/// fan-out piece, which never take a key route.
+///
+/// The key routes, the tenant heads and their cache come from the
+/// composition root (`velmora_bridge::root`, `crate::root`). This build
+/// has no unit client for requests (`NoClients`), so a routed request
+/// answers `503` from the router.
+pub async fn route_request(
+    env: &Env,
+    base: &WorkerBridge,
+    units: Units,
+    skip: bool,
+    req: &velmora_bridge::S3Request,
+) -> Option<velmora_bridge::S3Response> {
+    if units != Units::Bound || skip {
+        return None;
+    }
+    // The host first (ADR §8.4 step 1), before any key route is read:
+    // tenant 0's path gives the same refusal.
+    if velmora_bridge::service::request_host_refused(&base.cfg, req).is_some() {
+        return None;
+    }
+    let akid = velmora_bridge::service::claimed_access_key(&base.cfg, req)?;
+    let ports = match WorkerPorts::from_env(env, &base.kek) {
+        Ok(ports) => ports,
+        Err(class) => {
+            // The bridge was built from the same `SAFETY`: not reached.
+            worker::console_error!("alert: unit request ({class})");
+            return None;
+        }
+    };
+    let cache = crate::root::cache();
+    let root = Root::new(&ports, &cache, SystemRng);
+    let route = root.key_routes().tenant_of(&akid).await;
+    let (tenant, floor) =
+        match velmora_bridge::service::dispatch_key_route(route, &base.catalog, &akid).await {
+            KeyDispatch::Managed { tenant, floor } => (tenant, floor),
+            KeyDispatch::TenantZero => return None,
+            // DUR-10: no route could be shown for the key.
+            KeyDispatch::Answer(resp, line) => {
+                log_request(line);
+                return Some(resp);
+            }
+        };
+    let heads = root.heads();
+    let router = Router {
+        maintenance: base.cfg.maintenance,
+        clients: &NoClients,
+        heads: &heads,
+        cache: root.head_cache(),
+        clock: &base.clock,
+    };
+    let (resp, line) =
+        velmora_bridge::service::serve_managed(&router, &base.cfg, &tenant, floor, req).await;
+    log_request(line);
+    Some(resp)
+}
+
+fn log_request(line: velmora_bridge::service::ManagedLine) {
+    match line.alert {
+        true => worker::console_error!("alert: unit request ({})", line.code),
+        false => worker::console_log!("unit request ({})", line.code),
     }
 }
 

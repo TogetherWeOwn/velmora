@@ -61,7 +61,11 @@
 //!   needs to close a door without the tenant key;
 //! - the **private part**, under a key the header names: the TK-derived
 //!   key of a managed tenant, a KEK-derived key for tenant 0, or nothing
-//!   for a global record.
+//!   for a global record and for a managed tenant's tenant-chain record
+//!   that has no tenant key (before its version 1, and the `shredded`
+//!   stub; under `m/t/<t>/` only). The
+//!   owner label in the AAD keeps a keyless tenant record apart from a
+//!   global one, and the header's kind is authenticated by the door.
 //!
 //! The 21-byte header names the KEK version of the door part, the kind
 //! and version of the private key and both lengths. The private part is
@@ -144,6 +148,10 @@ const BUCKET_CONFIG_DIR: &str = "b/";
 /// The owner of a global control record in an AAD. No tenant id can be
 /// it.
 const GLOBAL_OWNER: &str = "-";
+
+/// The one directory whose records a managed tenant may seal with no
+/// tenant key: its tenant chain.
+const KEYLESS_DIR: &str = "m/t/";
 
 const PRIVATE_NONE: u8 = 0;
 const PRIVATE_KEK: u8 = 1;
@@ -676,6 +684,13 @@ pub enum ControlSealer<'a> {
     /// A managed tenant: the private part under its tenant key, whose
     /// tenant and version the record names.
     Managed(&'a TenantKey),
+    /// A managed tenant's record that has no tenant key to seal under: a
+    /// tenant-chain record from before the tenant's key version 1, or the
+    /// `shredded` stub written after every version was destroyed. A door
+    /// part only, under the tenant's chain `m/t/<t>/` and nowhere else,
+    /// bound to the tenant like any of its records. Nothing private may be
+    /// in it.
+    ManagedKeyless(&'a TenantId),
 }
 
 /// Who a control record belongs to, as a reader names it. The reader
@@ -696,11 +711,18 @@ impl ControlOwner<'_> {
         }
     }
 
-    fn private_kind(&self) -> u8 {
+    /// Whether a record of this owner stored under `name` may name
+    /// private-key kind `kind`. A managed tenant's record has its tenant
+    /// key; only a record of its tenant chain (`m/t/<t>/`) may have none
+    /// at all (see [`ControlSealer::ManagedKeyless`]).
+    fn takes_kind(&self, kind: u8, name: &str) -> bool {
         match self {
-            ControlOwner::Global => PRIVATE_NONE,
-            ControlOwner::TenantZero => PRIVATE_KEK,
-            ControlOwner::Managed(_) => PRIVATE_TENANT,
+            ControlOwner::Global => kind == PRIVATE_NONE,
+            ControlOwner::TenantZero => kind == PRIVATE_KEK,
+            ControlOwner::Managed(_) => {
+                kind == PRIVATE_TENANT
+                    || (kind == PRIVATE_NONE && below(name, KEYLESS_DIR, self.label()).is_some())
+            }
         }
     }
 
@@ -733,6 +755,7 @@ impl ControlSealer<'_> {
             ControlSealer::Global => ControlOwner::Global,
             ControlSealer::TenantZero => ControlOwner::TenantZero,
             ControlSealer::Managed(tk) => ControlOwner::Managed(&tk.tenant),
+            ControlSealer::ManagedKeyless(t) => ControlOwner::Managed(t),
         }
     }
 }
@@ -777,8 +800,9 @@ fn len_u32(n: usize) -> Result<u32> {
 /// Seals a control record stored under `name`, which must lie in the
 /// owner's directories: the door part under the control key of the
 /// active KEK, the private part under the key of `sealer`. A global
-/// record takes no private part; tenant 0 and a managed tenant always
-/// have one (it may be empty).
+/// record and a managed tenant's keyless record take no private part;
+/// tenant 0 and a managed tenant under its key always have one (it may be
+/// empty).
 pub fn seal_control<K: Kek, R: FillRandom>(
     kek: &K,
     name: &str,
@@ -791,9 +815,12 @@ pub fn seal_control<K: Kek, R: FillRandom>(
     if !owner.owns(name) {
         return Err(ERR_CONTROL_NAME);
     }
+    if matches!(sealer, ControlSealer::ManagedKeyless(_)) && !owner.takes_kind(PRIVATE_NONE, name) {
+        return Err(ERR_CONTROL_KIND);
+    }
     let (kek_v, kek_bytes) = kek.active();
     let (kind, priv_v) = match sealer {
-        ControlSealer::Global => (PRIVATE_NONE, 0),
+        ControlSealer::Global | ControlSealer::ManagedKeyless(_) => (PRIVATE_NONE, 0),
         ControlSealer::TenantZero => (PRIVATE_KEK, kek_v),
         ControlSealer::Managed(tk) => (PRIVATE_TENANT, tk.version),
     };
@@ -934,7 +961,7 @@ impl<'a> ControlEnvelope<'a> {
         name: &'a str,
         owner: ControlOwner<'a>,
     ) -> Result<OpenedControl<'a>> {
-        if self.kind != owner.private_kind() {
+        if !owner.takes_kind(self.kind, name) {
             return Err(ERR_CONTROL_KIND);
         }
         if !owner.owns(name) {
@@ -1020,6 +1047,139 @@ impl OpenedControl<'_> {
         )
         .map_err(|_| ERR_CONTROL)
     }
+}
+
+// ---------------------------------------------------------------------------
+// Moving keys between the schemes (the move of tenant 0's data)
+// ---------------------------------------------------------------------------
+//
+// Only bucket keys and S3 secrets change scheme: file-key wraps bind the
+// bucket id and the extent id and no tenant, so they stay byte for byte.
+// Each re-wrap opens the wrap it made and compares what it holds with what
+// it started from, in constant time, before it hands the new wrap out.
+// No plaintext key leaves these functions.
+
+fn same_key(a: &DataKey, b: &DataKey) -> bool {
+    bool::from(a.0[..].ct_eq(&b.0[..]))
+}
+
+const ERR_REWRAP: BridgeError = BridgeError::Crypto("re-wrapped key does not match");
+
+/// Re-wraps the scheme-1 BDK of `bucket` (under KEK version
+/// `kek_version_stored`) under `tk`, scheme 2. The row then stores
+/// `tk.version()` beside the new wrap.
+pub fn rewrap_bdk_to_v2<K: Kek, R: FillRandom>(
+    kek: &K,
+    kek_version_stored: u32,
+    bucket: &BucketId,
+    wrapped_v1: &[u8],
+    tk: &TenantKey,
+    rng: &mut R,
+) -> Result<Vec<u8>> {
+    let bdk = super::unwrap_bdk(kek, kek_version_stored, bucket, wrapped_v1)?;
+    let wrapped = wrap_bdk_v2(tk, bucket, &bdk, rng)?;
+    let back = unwrap_bdk_v2(tk, &tk.tenant, tk.version, bucket, &wrapped)?;
+    if !same_key(&bdk, &back) {
+        return Err(ERR_REWRAP);
+    }
+    Ok(wrapped)
+}
+
+/// Re-wraps the scheme-2 BDK of `bucket` of `tk`'s tenant (stored with
+/// key version `tk.version()`) under the **active** KEK, scheme 1: the
+/// reverse move, for a bucket made after the move. Returns the KEK
+/// version to store with it.
+pub fn rewrap_bdk_to_v1<K: Kek, R: FillRandom>(
+    kek: &K,
+    tk: &TenantKey,
+    bucket: &BucketId,
+    wrapped_v2: &[u8],
+    rng: &mut R,
+) -> Result<(u32, Vec<u8>)> {
+    let bdk = unwrap_bdk_v2(tk, &tk.tenant, tk.version, bucket, wrapped_v2)?;
+    let (v, wrapped) = super::wrap_bdk(kek, bucket, &bdk, rng)?;
+    let back = super::unwrap_bdk(kek, v, bucket, wrapped.as_bytes())?;
+    if !same_key(&bdk, &back) {
+        return Err(ERR_REWRAP);
+    }
+    Ok((v, wrapped.to_vec()))
+}
+
+/// Whether a scheme-1 wrap and a scheme-2 wrap of `bucket` hold the same
+/// BDK. `Err` when either does not open.
+#[allow(clippy::too_many_arguments)]
+pub fn same_bdk<K: Kek>(
+    kek: &K,
+    kek_version_v1: u32,
+    wrapped_v1: &[u8],
+    tk: &TenantKey,
+    tenant: &TenantId,
+    tk_version: u32,
+    bucket: &BucketId,
+    wrapped_v2: &[u8],
+) -> Result<bool> {
+    let one = super::unwrap_bdk(kek, kek_version_v1, bucket, wrapped_v1)?;
+    let two = unwrap_bdk_v2(tk, tenant, tk_version, bucket, wrapped_v2)?;
+    Ok(same_key(&one, &two))
+}
+
+fn same_secret_bytes(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && bool::from(a.ct_eq(b))
+}
+
+/// Re-wraps an `ak/v1` secret (under KEK version `kek_version_stored`)
+/// as `ak/v2` of `tenant`, under the active KEK. Same key id, same
+/// secret. Returns the KEK version to store with it.
+pub fn rewrap_secret_to_v2<K: Kek, R: FillRandom>(
+    kek: &K,
+    kek_version_stored: u32,
+    access_key_id: &str,
+    wrapped_v1: &[u8],
+    tenant: &TenantId,
+    rng: &mut R,
+) -> Result<(u32, Vec<u8>)> {
+    let secret = super::unwrap_secret(kek, kek_version_stored, access_key_id, wrapped_v1)?;
+    let (v, wrapped) = wrap_secret_v2(kek, tenant, access_key_id, &secret, rng)?;
+    let back = unwrap_secret_v2(kek, v, tenant, access_key_id, &wrapped)?;
+    if !same_secret_bytes(&secret, &back) {
+        return Err(ERR_REWRAP);
+    }
+    Ok((v, wrapped))
+}
+
+/// Re-wraps an `ak/v2` secret of `tenant` as `ak/v1`: the reverse move,
+/// for a key made after the move.
+pub fn rewrap_secret_to_v1<K: Kek, R: FillRandom>(
+    kek: &K,
+    kek_version_stored: u32,
+    access_key_id: &str,
+    wrapped_v2: &[u8],
+    tenant: &TenantId,
+    rng: &mut R,
+) -> Result<(u32, Vec<u8>)> {
+    let secret = unwrap_secret_v2(kek, kek_version_stored, tenant, access_key_id, wrapped_v2)?;
+    let (v, wrapped) = super::wrap_secret(kek, access_key_id, &secret, rng)?;
+    let back = super::unwrap_secret(kek, v, access_key_id, &wrapped)?;
+    if !same_secret_bytes(&secret, &back) {
+        return Err(ERR_REWRAP);
+    }
+    Ok((v, wrapped))
+}
+
+/// Whether an `ak/v1` wrap and an `ak/v2` wrap of `access_key_id` hold
+/// the same secret. `Err` when either does not open.
+pub fn same_secret<K: Kek>(
+    kek: &K,
+    kek_version_v1: u32,
+    wrapped_v1: &[u8],
+    tenant: &TenantId,
+    kek_version_v2: u32,
+    wrapped_v2: &[u8],
+    access_key_id: &str,
+) -> Result<bool> {
+    let one = super::unwrap_secret(kek, kek_version_v1, access_key_id, wrapped_v1)?;
+    let two = unwrap_secret_v2(kek, kek_version_v2, tenant, access_key_id, wrapped_v2)?;
+    Ok(same_secret_bytes(&one, &two))
 }
 
 #[cfg(test)]

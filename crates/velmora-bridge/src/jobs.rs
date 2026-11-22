@@ -19,14 +19,18 @@
 //!   on until its time has come. So a release does not wait for the
 //!   dispatcher, whose run is bounded.
 //! - The GC job deletes a blob only when the catalogue hands it the key
-//!   (`gc_begin`), and only in the mode `GC_MODE` allows.
+//!   (`gc_begin`), and only in the mode `GC_MODE` allows. With
+//!   `GC_ORPHANS` it also deletes the safety copies of upload parts
+//!   that left their upload and never became part of an object, in
+//!   every bucket and only after the catalogue recorded the delete
+//!   against its proof (`gc_orphan_claim`).
 //! - The eviction job keeps R2 a bounded hot tier. It deletes R2 copies
 //!   of extents that Usenet is proven to hold, never a catalogue row and
 //!   never a pinned copy, so it is not data deletion and `GC_MODE` does
 //!   not apply to it. The only keys it can name are an extent's
 //!   `x/<extent>` and `c/<extent>`.
 
-use crate::config::{GcMode, Maintenance};
+use crate::config::{GcMode, Maintenance, ORPHAN_GRACE_MS};
 use crate::ports::{
     BlobStore, Bridge, Catalog, Clock, JobSink, Kek, Lease, NntpConnector, MAX_QUEUE_DELAY_SECS,
 };
@@ -142,6 +146,13 @@ pub const PACK_LIMIT: u32 = 50;
 pub const MAX_ATTEMPTS: u32 = 50;
 /// GC rows one GC job handles before it re-enqueues itself.
 pub const GC_BATCH: u32 = 50;
+/// Open `gc` rows one run of the scan for orphaned upload parts reads.
+/// Most of them are rows of deleted objects, which it steps over.
+pub const ORPHAN_SCAN: u32 = 500;
+/// Orphaned parts one GC job deletes: the claims of all of them in a
+/// few batches, then a blob delete and a close each, which keeps a job
+/// well inside its subrequests.
+pub const ORPHAN_BATCH: u32 = 100;
 /// Extents one eviction job handles before it re-enqueues itself.
 pub const EVICT_BATCH: u32 = 50;
 /// Least time between two totals of the evictable bytes by the
@@ -372,17 +383,24 @@ where
         }
     }
 
-    /// Handles up to [`GC_BATCH`] due `gc` rows of the tenant of `scope`.
+    /// Handles up to [`GC_BATCH`] due `gc` rows of the tenant of `scope`
+    /// in the mode `GC_MODE` allows, and one window of its orphaned upload
+    /// parts with `GC_ORPHANS` (a unit's catalogue has none yet).
     async fn run_gc(&self, scope: &TenantScope) -> JobOutcome {
-        let disposable_only = match self.cfg.gc_mode {
-            GcMode::Off => return JobOutcome::Ack,
-            GcMode::Disposable => true,
+        // Every step of both is idempotent, so a failed job simply runs
+        // again.
+        let mut outcome = JobOutcome::Ack;
+        let rows = match self.cfg.gc_mode {
+            GcMode::Off => Ok(()),
+            GcMode::Disposable => self.gc_batch(scope, true).await,
         };
-        match self.gc_batch(scope, disposable_only).await {
-            Ok(()) => JobOutcome::Ack,
-            // Every step is idempotent, so the batch simply runs again.
-            Err(_) => RETRY,
+        if rows.is_err() {
+            outcome = RETRY;
         }
+        if self.cfg.gc_orphans && self.orphan_batch(scope).await.is_err() {
+            outcome = RETRY;
+        }
+        outcome
     }
 
     async fn gc_batch(&self, scope: &TenantScope, disposable_only: bool) -> Result<()> {
@@ -432,6 +450,44 @@ where
             }
             GcStep::Done | GcStep::Skipped => Ok(()),
         }
+    }
+
+    /// One window of the scan for orphaned upload parts: deletes the
+    /// safety copies of the parts it finds (the rule is in `sql/gc.rs`).
+    /// The scan has already moved past the window, so a job that runs
+    /// again after an error reads the next one, and the rows that failed
+    /// wait for the next pass.
+    async fn orphan_batch(&self, scope: &TenantScope) -> Result<()> {
+        // As in `gc_batch`: nothing is deleted on a catalogue that is
+        // behind its stamp.
+        if self.catalogue_rolled_back().await? {
+            return Ok(());
+        }
+        let now = self.clock.now();
+        let cutoff = now.plus_ms(-ORPHAN_GRACE_MS);
+        let rows = self
+            .catalog
+            .gc_orphans(now, cutoff, ORPHAN_SCAN, ORPHAN_BATCH)
+            .await?;
+        // The scan read the rows a moment ago; the claim proves each
+        // again in the batch that records its delete, and only then
+        // does a blob go. Claims that an error cut short still granted
+        // what they granted: those blobs go now, and the job fails
+        // after.
+        let (granted, claimed) = self.catalog.gc_orphan_claim(&rows, now, cutoff).await;
+        let mut failed = claimed.err();
+        for (row, _) in rows.iter().zip(granted).filter(|(_, granted)| *granted) {
+            if let Err(e) = self.orphan_row(scope, row).await {
+                failed.get_or_insert(e);
+            }
+        }
+        failed.map_or(Ok(()), Err)
+    }
+
+    /// One orphaned part whose claim was granted.
+    async fn orphan_row(&self, scope: &TenantScope, row: &GcRow) -> Result<()> {
+        delete_blob(&self.safety, &scope.safety_key(&row.extent_id)).await?;
+        self.catalog.gc_orphan_done(row.id, self.clock.now()).await
     }
 
     /// One bounded step of the hot-tier drain; returns the bytes it freed.
@@ -689,7 +745,9 @@ where
             GcMode::Off => false,
             GcMode::Disposable => !self.catalog.gc_due(now, 1, true).await?.is_empty(),
         };
-        if gc_due {
+        // One window of orphaned parts per run, until a pass is through.
+        let orphans_due = self.cfg.gc_orphans && self.catalog.gc_orphans_due(now).await?;
+        if gc_due || orphans_due {
             self.jobs.send(&Job::Gc { v: JOB_VERSION }, 0).await?;
             report.gc_enqueued = true;
         }

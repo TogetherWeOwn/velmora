@@ -1729,6 +1729,18 @@ impl Catalog for MemCatalog {
     async fn gc_done(&self, _: i64, _: UnixMs) -> Result<()> {
         unused()
     }
+    async fn gc_orphans_due(&self, _: UnixMs) -> Result<bool> {
+        unused()
+    }
+    async fn gc_orphans(&self, _: UnixMs, _: UnixMs, _: u32, _: u32) -> Result<Vec<GcRow>> {
+        unused()
+    }
+    async fn gc_orphan_claim(&self, _: &[GcRow], _: UnixMs, _: UnixMs) -> (Vec<bool>, Result<()>) {
+        (Vec::new(), unused())
+    }
+    async fn gc_orphan_done(&self, _: i64, _: UnixMs) -> Result<()> {
+        unused()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1832,12 +1844,14 @@ pub async fn rig(specs: &[Spec]) -> Rig {
     let cfg = BridgeConfig {
         environment: Environment::Dev,
         s3_host: "s3.test".to_string(),
+        s3_hosts: Vec::new(),
         region: "auto".to_string(),
         max_extent_bytes: 16 * 1024 * 1024,
         max_put_bytes: 16 * 1024 * 1024,
         slice_bytes: 8 * 1024 * 1024,
         max_object_extents: 10_000,
         intent_sweep: false,
+        gc_orphans: false,
         records: velmora_bridge::recovery::Layout::flat(),
         packed_plans: false,
         parity: false,

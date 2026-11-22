@@ -481,15 +481,20 @@ fn is_bytecode_explain(sql: &str) -> bool {
 /// here (it is `GuardFailed`); a constraint, any other statement
 /// failure, and the adapters' own refusals of a value by their message.
 fn error_class(message: &str) -> String {
+    // The adapters' own refusals, with the store's prefix taken off: the
+    // native adapter and the Durable Object one both refuse an integer
+    // outside the JS safe range before the statement runs, one as
+    // `integer outside JS safe range`, the other as `do: integer ...`.
+    let message = message.strip_prefix("do: ").unwrap_or(message);
     let own = [
         "too many bound parameters",
         "bound value too large",
-        "do: integer outside JS safe range",
-        "do: number is not a safe integer",
-        "do: named parameter",
-        "do: placeholder number",
-        "do: more than one statement",
-        "do: unexpected result shape",
+        "integer outside JS safe range",
+        "number is not a safe integer",
+        "named parameter",
+        "placeholder number",
+        "more than one statement",
+        "unexpected result shape",
     ];
     if let Some(o) = own.iter().find(|o| message.starts_with(*o)) {
         return (*o).to_string();
