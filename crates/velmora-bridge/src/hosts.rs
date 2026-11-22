@@ -358,10 +358,10 @@ impl HostPicker {
                         break (i, false);
                     }
                 }
-                // A probe from the future (the clock stepped back) is lost.
-                Some(Pick::Probing(since))
-                    if (0..PROBE_WAIT_MS).contains(&now.0.saturating_sub(since.0)) =>
-                {
+                // A probe another invocation started a moment "after"
+                // this one's clock is running; one a whole wait ahead
+                // (the clock stepped back) is lost.
+                Some(Pick::Probing(since)) if now.within(since, PROBE_WAIT_MS) => {
                     d.pause(PROBE_POLL_MS).await;
                     continue;
                 }
@@ -1204,6 +1204,28 @@ mod tests {
         assert_eq!(picker.connect_host(&p, &n).await.unwrap(), "b");
         assert_eq!(n.paused.get(), 0);
         assert_eq!(n.probes(), 3);
+    }
+
+    /// A probe another invocation started on a clock a few milliseconds
+    /// ahead of this one's is running, and is waited for: this connect
+    /// does not probe a second time.
+    #[test]
+    fn a_probe_a_moment_ahead_is_waited_for() {
+        for ahead in [1, 24, 5_000] {
+            let n = net(&[("a", Some(400)), ("b", Some(150))]);
+            let picker = std::rc::Rc::new(HostPicker::new());
+            picker
+                .picks
+                .borrow_mut()
+                .insert("p6".into(), Pick::Probing(UnixMs(n.now().0 + ahead)));
+            *n.finish_probe.borrow_mut() = Some((picker.clone(), "b"));
+            assert_eq!(
+                run(picker.connect_host(&provider("a", &["b"]), &n)).unwrap(),
+                "b"
+            );
+            assert_eq!(n.paused.get(), PROBE_POLL_MS, "{ahead} ms ahead");
+            assert_eq!(n.probes(), 0, "{ahead} ms ahead");
+        }
     }
 
     /// A probe mark from the future (the clock stepped back) is lost, not
