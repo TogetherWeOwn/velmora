@@ -467,6 +467,9 @@ pub struct ExcludedSums {
     pub x_deleted: i64,
     /// Outbox rows by stage.
     pub outbox: BTreeMap<String, i64>,
+    /// Row 1 covers all three tables (`all_x = all_o = all_g = 1`). V2's
+    /// "row 1 minus these" means something only then: V2 fails unless set.
+    pub covered: bool,
 }
 
 /// Sums the excluded rows of `extents` and `outbox` with the copy's own
@@ -474,6 +477,16 @@ pub struct ExcludedSums {
 /// be run at any time, so a resumed copy does not change the answer.
 pub async fn excluded_sums<S: Sql>(frozen: &S, plan: &CopyPlan) -> Result<ExcludedSums, CopyError> {
     let mut sums = ExcludedSums::default();
+    let coverage = frozen
+        .query(
+            "SELECT all_x = 1 AND all_o = 1 AND all_g = 1 FROM usage_global WHERE id = 1",
+            &[],
+        )
+        .await?;
+    sums.covered = matches!(
+        coverage.first().and_then(|r| r.first()),
+        Some(SqlValue::Int(1))
+    );
     if plan.excluded.is_empty() {
         return Ok(sums);
     }

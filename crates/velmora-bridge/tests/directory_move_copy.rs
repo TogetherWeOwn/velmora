@@ -197,6 +197,9 @@ struct Adapter<'a> {
     resent: Cell<u32>,
     /// Imports per table.
     by_table: RefCell<BTreeMap<String, u32>>,
+    /// The Nth import of this table fails unapplied (`false`) or is
+    /// applied with its answer lost (`true`).
+    fault: RefCell<Option<(String, u32, bool)>>,
 }
 
 impl<'a> Adapter<'a> {
@@ -209,6 +212,7 @@ impl<'a> Adapter<'a> {
             imports: Cell::new(0),
             resent: Cell::new(0),
             by_table: RefCell::new(BTreeMap::new()),
+            fault: RefCell::new(None),
         }
     }
 }
@@ -220,6 +224,24 @@ impl UnitImport for Adapter<'_> {
                 return Err(BridgeError::Blob("unit unreachable".into()));
             }
             self.fail_after.set(Some(n - 1));
+        }
+        let mut lose_this = false;
+        {
+            let mut fault = self.fault.borrow_mut();
+            if let Some((table, n, lose)) = fault.as_mut() {
+                if table == batch.table.name() {
+                    if *n == 0 {
+                        let lose = *lose;
+                        *fault = None;
+                        if !lose {
+                            return Err(BridgeError::Blob("unit unreachable".into()));
+                        }
+                        lose_this = true;
+                    } else {
+                        *n -= 1;
+                    }
+                }
+            }
         }
         self.imports.set(self.imports.get() + 1);
         *self
@@ -253,8 +275,8 @@ impl UnitImport for Adapter<'_> {
             } => Imported::Refused(r),
             other => panic!("{other:?}"),
         };
-        if self.lose.get() > 0 {
-            self.lose.set(self.lose.get() - 1);
+        if self.lose.get() > 0 || lose_this {
+            self.lose.set(self.lose.get().saturating_sub(1));
             return Err(BridgeError::Blob("answer lost".into()));
         }
         Ok(answer)
@@ -315,13 +337,19 @@ async fn catalogue(rig: &Rig) -> (Bucket, Bucket) {
 }
 
 async fn catalogue_with_lease(rig: &Rig, lease_until: i64) -> (Bucket, Bucket) {
-    catalogue_with(rig, lease_until, 5, false).await
+    catalogue_with(rig, lease_until, 5, false, 0..23).await
 }
 
 /// As [`catalogue`], the vault's first outbox row leased until
 /// `lease_until`, and the live counters' hour under way at `hour` (its
 /// filed row dropped first when `own_row`).
-async fn catalogue_with(rig: &Rig, lease_until: i64, hour: i64, own_row: bool) -> (Bucket, Bucket) {
+async fn catalogue_with(
+    rig: &Rig,
+    lease_until: i64,
+    hour: i64,
+    own_row: bool,
+    hours: std::ops::Range<i64>,
+) -> (Bucket, Bucket) {
     let (vault, signer) = rig.standard("vault").await;
     let canary = rig.bucket("mq-canary", false).await;
     rig.grant(AKID, &canary, Perm::Rw).await;
@@ -330,6 +358,8 @@ async fn catalogue_with(rig: &Rig, lease_until: i64, hour: i64, own_row: bool) -
         ("vault", "dir/b.bin", 300_000),
         ("vault", "dir/c.bin", 20),
         ("mq-canary", "probe", 50),
+        ("mq-canary", "probe-2", 60),
+        ("mq-canary", "probe-3", 70),
     ] {
         rig.put(&signer, bucket, key, &pattern(n as u8, n))
             .await
@@ -379,11 +409,23 @@ async fn catalogue_with(rig: &Rig, lease_until: i64, hour: i64, own_row: bool) -
         LONG = long_key()
     ));
     // Enough hours for many pages.
-    for h in 0..23 {
+    for h in hours {
         script.push_str(&format!(
             "INSERT INTO usage_hours(hour, posts, verifies, releases, dead, failures) VALUES ({h}, {h}, 0, 0, 0, 0);\n"
         ));
     }
+    // The canary's extents in each safety state, its outbox rows in two
+    // stages (for the excluded sums).
+    script.push_str(&format!(
+        "UPDATE extents SET safety_state = 'released' WHERE id = (SELECT id FROM extents \
+           WHERE bucket_id = '{bc}' ORDER BY id LIMIT 1 OFFSET 1);\n\
+         UPDATE extents SET safety_state = 'deleted' WHERE id = (SELECT id FROM extents \
+           WHERE bucket_id = '{bc}' ORDER BY id LIMIT 1 OFFSET 2);\n\
+         UPDATE outbox SET stage = 'done' WHERE extent_id = (SELECT id FROM extents \
+           WHERE bucket_id = '{bc}' ORDER BY id LIMIT 1 OFFSET 1);\n"
+    ));
+    // Set last: an outbox update of a later hour files the hour under
+    // way (the counters are on in this schema).
     script.push_str(&format!(
         "UPDATE usage_global SET hour = {hour}, h_posts = 7, h_failures = 1 WHERE id = 1;\n"
     ));
@@ -750,7 +792,7 @@ fn the_hour_under_way_is_filed_where_it_falls() {
     for (hour, own_row) in [(5, false), (7, true), (40, true)] {
         block_on(async {
             let rig = rig();
-            let (_, canary) = catalogue_with(&rig, 1, hour, own_row).await;
+            let (_, canary) = catalogue_with(&rig, 1, hour, own_row, 0..23).await;
             let frozen = &rig.bridge.catalog.sql.inner;
             let (zero, owner) = heads();
             let (head, since) = bound(&zero.door, &owner.door).unwrap();
@@ -819,7 +861,28 @@ fn the_excluded_rows_are_summed_for_v2() {
             sums.x_released,
             one("SELECT count(*) FROM extents WHERE bucket_id = ?1 AND safety_state = 'released'")
         );
-        assert!(sums.x_unreleased > 0);
+        assert_eq!(
+            sums.released_bytes,
+            one("SELECT sum(cipher_size) FROM extents WHERE bucket_id = ?1 AND safety_state = 'released'")
+        );
+        assert_eq!(
+            sums.x_deleted,
+            one("SELECT count(*) FROM extents WHERE bucket_id = ?1 AND safety_state = 'deleted'")
+        );
+        assert!(sums.x_unreleased > 0 && sums.x_released > 0 && sums.x_deleted > 0);
+        for stage in ["post", "done"] {
+            assert_eq!(
+                sums.outbox.get(stage).copied().unwrap_or(0),
+                one(&format!(
+                    "SELECT count(*) FROM outbox o JOIN extents e ON e.id = o.extent_id \
+                     WHERE e.bucket_id = ?1 AND o.stage = '{stage}'"
+                )),
+                "{stage}"
+            );
+        }
+        assert_eq!(sums.outbox.len(), 2, "{:?}", sums.outbox);
+        // The fixture's counters are on (row 1 covers every table).
+        assert!(sums.covered);
         let outbox: i64 = sums.outbox.values().sum();
         assert_eq!(
             outbox,
@@ -831,6 +894,56 @@ fn the_excluded_rows_are_summed_for_v2() {
             .await
             .map_err(|e| format!("{e:?}"))
             .unwrap();
-        assert_eq!(none, Default::default());
+        assert_eq!(none.outbox.len() + none.x_unreleased as usize, 0);
     });
+}
+
+/// Many hours: a full page plus the filed hour's own row, the hour before
+/// every row, and a crash at every `usage_hours` batch, unapplied or with
+/// its answer lost.
+#[test]
+fn the_hour_filing_survives_full_pages_and_every_crash() {
+    for (hour, missing) in [(700, true), (300, false), (1, true)] {
+        for (crash_at, lose) in [
+            (None, false),
+            (Some(0), false),
+            (Some(1), true),
+            (Some(2), false),
+            (Some(2), true),
+        ] {
+            block_on(async {
+                let rig = rig();
+                // 1,200 filed hours (hour 2 upward, so hour 1 is before
+                // every row), the hour under way's own row dropped when
+                // `missing`.
+                let (_, canary) = catalogue_with(&rig, 1, hour, missing, 2..1_202).await;
+                let frozen = &rig.bridge.catalog.sql.inner;
+                let (zero, owner) = heads();
+                let (head, since) = bound(&zero.door, &owner.door).unwrap();
+                let u = unit(since);
+                let adapter = Adapter::new(&u, since);
+                if let Some(n) = crash_at {
+                    *adapter.fault.borrow_mut() = Some(("usage_hours".into(), n, lose));
+                }
+                for _ in 0..3 {
+                    let _ = copy_all(
+                        &rig.bridge.catalog.sql,
+                        &adapter,
+                        &Stub { rehomed: None },
+                        &plan(&canary, 500),
+                        &head,
+                        since,
+                        rig.now(),
+                    )
+                    .await;
+                }
+                let ids = canary_ids(frozen, &canary);
+                assert_eq!(
+                    rows(u.sql(), ImportTable::UsageHours),
+                    expected(frozen, ImportTable::UsageHours, &ids, ""),
+                    "hour {hour} missing {missing} crash {crash_at:?} lose {lose}"
+                );
+            });
+        }
+    }
 }
