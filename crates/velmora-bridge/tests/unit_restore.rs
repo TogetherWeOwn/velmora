@@ -8,7 +8,8 @@ use std::cell::RefCell;
 use serde_json::json;
 use velmora_bridge::testkit::{RusqliteSql, ARM_USAGE};
 use velmora_bridge::unit::lift::{
-    ids_hash, AckClass, FindingList, GateRefusal, GateSummary, LiftProof, ReplayId, MAX_PAGE,
+    ids_hash, AckClass, ClassProof, FindingList, GateRefusal, GateSummary, LiftProof, ReplayId,
+    MAX_PAGE,
 };
 use velmora_bridge::unit::restore::{
     drive, Bookmark, PitrStep, PointInTimePort, RestoreRefusal, RestoreTarget, LEASE_TERM_MS,
@@ -538,10 +539,22 @@ fn rid(nonce: &str) -> ReplayId {
     }
 }
 
-fn whole(damaged_total: u64) -> GateSummary {
+/// A complete replay's summary whose only blockers are `damaged`.
+fn whole(damaged: &[String]) -> GateSummary {
+    let mut lists = std::collections::BTreeMap::new();
+    if !damaged.is_empty() {
+        lists.insert(
+            FindingList::Damaged,
+            ClassProof {
+                count: damaged.len() as u64,
+                sha256: ids_hash(damaged),
+            },
+        );
+    }
     GateSummary {
         complete: true,
-        damaged_total,
+        damaged_total: damaged.len() as u64,
+        lists,
         ..GateSummary::default()
     }
 }
@@ -663,7 +676,7 @@ fn a_clean_whole_replay_lifts_with_its_proof_once_the_stamp_is_level() {
         &u,
         UnitOp::GateReport {
             replay_id: rid("n1"),
-            summary: whole(0),
+            summary: whole(&[]),
         },
         t,
     ));
@@ -700,15 +713,15 @@ fn a_lift_naming_another_replay_or_other_ids_is_refused() {
     ));
     ok(worker(
         &u,
-        UnitOp::GateReport {
-            replay_id: rid("n1"),
-            summary: whole(1),
-        },
+        page(FindingList::Damaged, "n1", &ids(&["g_a"])),
         t,
     ));
     ok(worker(
         &u,
-        page(FindingList::Damaged, "n1", &ids(&["g_a"])),
+        UnitOp::GateReport {
+            replay_id: rid("n1"),
+            summary: whole(&ids(&["g_a"])),
+        },
         t,
     ));
     ok(worker(&u, ack("n1", &ids(&["g_a"])), t));
@@ -754,7 +767,7 @@ fn a_restored_unit_lifts_only_with_its_counters_on() {
         &u,
         UnitOp::GateReport {
             replay_id: rid("n1"),
-            summary: whole(0),
+            summary: whole(&[]),
         },
         t,
     ));
@@ -782,15 +795,15 @@ fn blockers_lift_only_when_acknowledged_exactly_by_name() {
     ));
     ok(worker(
         &u,
-        UnitOp::GateReport {
-            replay_id: rid("n1"),
-            summary: whole(2),
-        },
+        page(FindingList::Damaged, "n1", &ids(&["g_a", "g_b"])),
         t,
     ));
     ok(worker(
         &u,
-        page(FindingList::Damaged, "n1", &ids(&["g_a", "g_b"])),
+        UnitOp::GateReport {
+            replay_id: rid("n1"),
+            summary: whole(&ids(&["g_a", "g_b"])),
+        },
         t,
     ));
     ok(worker(&u, ack("n1", &ids(&["g_a"])), t));
@@ -826,15 +839,15 @@ fn blockers_lift_only_when_acknowledged_exactly_by_name() {
     assert_eq!(lift(&u, S + 1, None, t), refused_gate(GateRefusal::Closed));
     ok(worker(
         &u,
-        UnitOp::GateReport {
-            replay_id: rid("n2"),
-            summary: whole(2),
-        },
+        page(FindingList::Damaged, "n2", &ids(&["g_a", "g_b"])),
         t,
     ));
     ok(worker(
         &u,
-        page(FindingList::Damaged, "n2", &ids(&["g_a", "g_b"])),
+        UnitOp::GateReport {
+            replay_id: rid("n2"),
+            summary: whole(&ids(&["g_a", "g_b"])),
+        },
         t,
     ));
     ok(worker(&u, ack("n2", &ids(&["g_b", "g_a", "g_a"])), t));
@@ -858,31 +871,108 @@ fn any_number_of_blockers_is_reported_and_acknowledged_in_pages() {
         t,
     ));
     let all: Vec<String> = (0..350).map(|i| format!("g_{i:04}")).collect();
-    ok(worker(
-        &u,
-        UnitOp::GateReport {
-            replay_id: rid("n1"),
-            summary: whole(350),
-        },
-        t,
-    ));
+    let report = || UnitOp::GateReport {
+        replay_id: rid("n1"),
+        summary: whole(&all),
+    };
     let mut pages = all.chunks(MAX_PAGE);
     ok(worker(
         &u,
         page(FindingList::Damaged, "n1", pages.next().unwrap()),
         t,
     ));
-    // Fewer listed than counted: closed (`Unlisted`) until every page is in.
-    assert_eq!(lift(&u, S + 1, None, t), refused_gate(GateRefusal::Closed));
+    // A page missing: the stored list is not the summary's.
+    ok(worker(&u, report(), t));
+    assert_eq!(
+        lift(&u, S + 1, None, t),
+        refused_gate(GateRefusal::ListMismatch)
+    );
     for chunk in pages {
         ok(worker(&u, page(FindingList::Damaged, "n1", chunk), t));
     }
+    // A page after the summary undoes it: the summary is the last write.
+    assert_eq!(
+        lift(&u, S + 1, None, t),
+        refused_gate(GateRefusal::ListMismatch)
+    );
+    ok(worker(&u, report(), t));
     for chunk in all.chunks(MAX_PAGE) {
         ok(worker(&u, ack("n1", chunk), t));
     }
     let p = proof(&u, t);
     assert_eq!(p.acknowledged[&AckClass::Damaged].count, 350);
     assert!(matches!(lift(&u, S + 1, Some(p), t), UnitAnswer::Ok { .. }));
+}
+
+#[test]
+fn a_lost_page_of_a_list_without_a_total_keeps_the_unit_closed() {
+    let u = closed();
+    let t = BORN + 2000;
+    level_stamp(&u, 4);
+    ok(worker(
+        &u,
+        UnitOp::GateOpen {
+            replay_id: rid("n1"),
+        },
+        t,
+    ));
+    // 150 unreadable records; the second page never arrives.
+    let unreadable: Vec<String> = (0..150).map(|i| format!("m/x/{i:04}")).collect();
+    ok(worker(
+        &u,
+        page(FindingList::Unreadable, "n1", &unreadable[..MAX_PAGE]),
+        t,
+    ));
+    let mut summary = whole(&[]);
+    summary.lists.insert(
+        FindingList::Unreadable,
+        ClassProof {
+            count: 150,
+            sha256: ids_hash(&unreadable),
+        },
+    );
+    ok(worker(
+        &u,
+        UnitOp::GateReport {
+            replay_id: rid("n1"),
+            summary: summary.clone(),
+        },
+        t,
+    ));
+    let first = UnitOp::GateAck {
+        replay_id: rid("n1"),
+        class: AckClass::Unreadable,
+        ids: unreadable[..MAX_PAGE].to_vec(),
+    };
+    ok(worker(&u, first, t));
+    assert_eq!(
+        lift(&u, S + 1, None, t),
+        refused_gate(GateRefusal::ListMismatch)
+    );
+    // A classification whose only page is lost: held rows do not turn
+    // non-live by omission either.
+    let mut classified = summary;
+    classified.classified = true;
+    classified.held_missing_total = 1;
+    classified.lists.insert(
+        FindingList::HeldMissingLive,
+        ClassProof {
+            count: 1,
+            sha256: ids_hash(&ids(&["x_live"])),
+        },
+    );
+    ok(worker(
+        &u,
+        UnitOp::GateReport {
+            replay_id: rid("n1"),
+            summary: classified,
+        },
+        t,
+    ));
+    assert_eq!(
+        lift(&u, S + 1, None, t),
+        refused_gate(GateRefusal::ListMismatch)
+    );
 }
 
 #[test]
@@ -903,7 +993,7 @@ fn a_report_of_an_older_replay_never_lifts() {
         &u,
         UnitOp::GateReport {
             replay_id: rid("n1"),
-            summary: whole(0),
+            summary: whole(&[]),
         },
         t,
     ));
@@ -927,7 +1017,7 @@ fn a_report_of_an_older_replay_never_lifts() {
         &u,
         UnitOp::GateReport {
             replay_id: now,
-            summary: whole(0),
+            summary: whole(&[]),
         },
         t,
     ));

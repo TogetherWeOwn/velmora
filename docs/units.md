@@ -214,7 +214,8 @@ so a gone or unborn unit passes T + 60 s after its birth. The bookmark calls nee
 runs them after the unit's own checks; a restore never answers `ok` (the
 object restarts), and the tool reads the result from the unit's state. An
 answer `failed` of class `pitr_armed` means the restore was armed without
-the restart: the tool treats the unit as restored.
+the restart, which applies it: the tool sends the same restore again until
+it gets no answer, and runs the gate only once the restart is seen.
 
 A unit born from a `restore` token starts with its usage counters off. The
 gate's recount turns them on, and the lift is refused while any is off. A
@@ -230,9 +231,12 @@ discards a report of any other replay id with its ids and
 acknowledgements (such as an old one that a point-in-time restore brought
 back); `gate_blockers` adds the ids of each list of the findings in pages
 of at most 100, so any number can be reported; `gate_report` stores the
-rest (complete, the totals, whether held rows were classified); and
-`gate_ack` acknowledges blocker ids by name, in pages of at most 100.
-Totals count distinct ids. **The `sync` that clears `restoring_since` is
+rest (complete, the totals, whether held rows were classified, and per
+list the count and hash of its ids) and is the last write, since a page
+after it resets it; and `gate_ack` acknowledges blocker ids by name, in
+pages of at most 100. Totals count distinct ids, and a stored list that
+is not what the summary says (a lost or extra page) keeps the unit
+closed. **The `sync` that clears `restoring_since` is
 refused unless the check passes:** the report names this entry; its
 ordinal equals the unit's stamp counter as the gate levelled it; the lift
 decision below opens on its findings, and per class the acknowledged ids
@@ -240,7 +244,9 @@ are exactly the ones the decision needs (the same count, and the same
 SHA-256 over the sorted ids with duplicates removed, UTF-8, each followed
 by `\n`); every usage counter is on; and the `sync` names the lift record's
 proof (its replay id and those counts and hashes), equal to the unit's.
-`gate_status` answers that proof for the lift record. Until the replay
+`gate_status` answers that proof; the tool builds the lift record's
+replay id from its own replay and nonce, and stops if `gate_status` names
+another one. Until the replay
 runs inside the unit, the Worker sends the replay's findings.
 
 A restored unit stays closed until the gate lifts it, and the gate lifts only

@@ -218,6 +218,14 @@ fn ops() -> Vec<UnitOp> {
                 other_bucket_total: 0,
                 held_missing_total: 2,
                 classified: true,
+                lists: [(
+                    FindingList::Damaged,
+                    ClassProof {
+                        count: 1,
+                        sha256: "cd".into(),
+                    },
+                )]
+                .into(),
             },
         },
         UnitOp::GateBlockers {
@@ -291,7 +299,7 @@ fn nested() -> Value {
         "finding_list": every!(FindingList: Damaged, Unreadable, Unpublishable,
             DamagedUnpublished, Twins, OtherBucket, HeldMissing, HeldMissingLive),
         "gate_refusal": every!(GateRefusal: NotRestoring, NoReport, StampNotLevelled, Closed,
-            AckMismatch, CountersOff, ProofMismatch, Malformed),
+            AckMismatch, CountersOff, ProofMismatch, ListMismatch, Malformed),
         "restore_refusal": every!(RestoreRefusal: NotRestoring, WrongToken, LeaseLive,
             LeaseUnknown, TooSoon, Moved, Malformed, NoPointInTime),
     })
@@ -380,6 +388,32 @@ fn every_variant_has_a_sample() {
     assert_eq!(ops.len(), 16, "{ops:?}");
     let readers: std::collections::BTreeSet<_> = ops_readers().into_iter().collect();
     assert_eq!(readers.len(), 2, "both readers have a sample");
+    // The variants that carry data, each with a sample (exhaustive).
+    let mut targets = std::collections::BTreeSet::new();
+    let mut values = std::collections::BTreeSet::new();
+    for op in self::ops() {
+        match op {
+            UnitOp::Restore { target, .. } => {
+                targets.insert(match target {
+                    RestoreTarget::Time { .. } => "time",
+                    RestoreTarget::Bookmark { .. } => "bookmark",
+                });
+            }
+            UnitOp::Import { batch, .. } => {
+                for v in batch.rows.iter().flatten() {
+                    values.insert(match v {
+                        ImportValue::Null => "n",
+                        ImportValue::Int(_) => "i",
+                        ImportValue::Text(_) => "t",
+                        ImportValue::Blob(_) => "b",
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(targets.len(), 2, "{targets:?}");
+    assert_eq!(values.len(), 4, "{values:?}");
     let answers: std::collections::BTreeSet<_> = answers().iter().map(answer_kind).collect();
     assert_eq!(answers.len(), 9, "{answers:?}");
     let reasons: std::collections::BTreeSet<_> = refusals().iter().map(refused_kind).collect();

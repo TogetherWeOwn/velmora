@@ -489,6 +489,12 @@
           "complete": true,
           "damaged_total": 1,
           "held_missing_total": 2,
+          "lists": {
+            "damaged": {
+              "count": 1,
+              "sha256": "cd"
+            }
+          },
           "other_bucket_total": 0
         }
       },
@@ -660,6 +666,7 @@
       "ack_mismatch",
       "counters_off",
       "proof_mismatch",
+      "list_mismatch",
       "malformed"
     ],
     "hold_mode": [

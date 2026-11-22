@@ -13,9 +13,12 @@
 //! - `gate_blockers(replay_id, list, ids)` adds the ids a list of the
 //!   replay holds, in pages of at most [`MAX_PAGE`] ids, so a replay with
 //!   any number of blockers can be reported (no total cap).
-//! - `gate_report(replay_id, summary)` stores the counts that are not
-//!   lists: whether the replay is complete, the totals, and whether its
-//!   held rows were classified.
+//! - `gate_report(replay_id, summary)` stores the rest: whether the
+//!   replay is complete, the totals, whether its held rows were
+//!   classified, and per list the count and hash of its ids. It is the
+//!   last write: a page after it resets the summary, and the lift is
+//!   refused unless every stored list is exactly what it says, so a lost
+//!   or late page keeps the unit closed.
 //! - `gate_ack(replay_id, class, ids)` acknowledges blocker ids by name,
 //!   in pages of at most [`MAX_PAGE`] ids.
 //!
@@ -176,7 +179,10 @@ impl FindingList {
     }
 }
 
-/// What a replay found besides its id lists.
+/// What a replay found besides its id lists, and what each list must
+/// hold: per list, the count and hash of its distinct ids (a list not
+/// named is empty). The unit lifts only when every stored list is exactly
+/// what the summary says, so a page that was lost is found.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GateSummary {
@@ -188,6 +194,9 @@ pub struct GateSummary {
     /// The held rows were classified: `held_missing_live` is their live
     /// class. Otherwise every held row counts as live.
     pub classified: bool,
+    /// Per list, the count and SHA-256 of its distinct ids.
+    #[serde(default)]
+    pub lists: BTreeMap<FindingList, ClassProof>,
 }
 
 /// One class of a lift: how many ids it names and their hash.
@@ -226,6 +235,9 @@ pub enum GateRefusal {
     CountersOff,
     /// The `sync` names no lift, or another one than the unit computes.
     ProofMismatch,
+    /// A stored list is not what the summary says (a page is missing or
+    /// extra), or no summary came after the last page.
+    ListMismatch,
     /// A page above [`MAX_PAGE`] ids, an empty or long id, or a bad nonce.
     Malformed,
 }
@@ -276,8 +288,8 @@ fn stored<S: Sql>(sql: &S) -> Result<Option<(ReplayId, GateSummary)>> {
     )))
 }
 
-/// The findings of the stored report: its summary and its id lists.
-fn findings<S: Sql>(sql: &S, summary: &GateSummary) -> Result<GateFindings> {
+/// The stored id lists, by list.
+fn lists<S: Sql>(sql: &S) -> Result<BTreeMap<FindingList, Vec<String>>> {
     let rows = poll_once(sql.query(
         "SELECT list, id FROM unit_gate_blockers ORDER BY list, id",
         &[],
@@ -290,8 +302,24 @@ fn findings<S: Sql>(sql: &S, summary: &GateSummary) -> Result<GateFindings> {
         let list = FindingList::parse(l).ok_or_else(|| decode("unit_gate_blockers list"))?;
         lists.entry(list).or_default().push(id.clone());
     }
+    Ok(lists)
+}
+
+/// Every stored list is exactly what the summary says.
+fn lists_match(summary: &GateSummary, lists: &BTreeMap<FindingList, Vec<String>>) -> bool {
+    FindingList::ALL.into_iter().all(|l| {
+        let have = lists.get(&l).map(Vec::as_slice).unwrap_or(&[]);
+        match summary.lists.get(&l) {
+            None => have.is_empty(),
+            Some(want) => want.count == have.len() as u64 && want.sha256 == ids_hash(have),
+        }
+    })
+}
+
+/// The findings of the stored report: its summary and its id lists.
+fn findings(summary: &GateSummary, mut lists: BTreeMap<FindingList, Vec<String>>) -> GateFindings {
     let mut take = |l: FindingList| lists.remove(&l).unwrap_or_default();
-    Ok(GateFindings {
+    GateFindings {
         complete: summary.complete,
         damaged_total: summary.damaged_total,
         damaged: take(FindingList::Damaged),
@@ -306,7 +334,7 @@ fn findings<S: Sql>(sql: &S, summary: &GateSummary) -> Result<GateFindings> {
         held_missing_live: summary
             .classified
             .then(|| take(FindingList::HeldMissingLive)),
-    })
+    }
 }
 
 fn acks<S: Sql>(sql: &S) -> Result<Acknowledged> {
@@ -407,6 +435,11 @@ pub fn blockers<S: Sql>(
             ],
         ))??;
     }
+    // A page after the summary undoes it: the summary is the last write.
+    poll_once(sql.exec(
+        "UPDATE unit_gate_report SET summary = ?1 WHERE id = 1",
+        &[SqlValue::Text(json_text(&GateSummary::default())?)],
+    ))??;
     Ok(Ok(()))
 }
 
@@ -462,7 +495,11 @@ pub fn check<S: Sql>(
     if stamp_counter(sql)? != Some(id.ordinal) {
         return Ok(Err(GateRefusal::StampNotLevelled));
     }
-    let found = findings(sql, &summary)?;
+    let stored_lists = lists(sql)?;
+    if !lists_match(&summary, &stored_lists) {
+        return Ok(Err(GateRefusal::ListMismatch));
+    }
+    let found = findings(&summary, stored_lists);
     let acked = acks(sql)?;
     let needed = match gate::lift(&found, &acked) {
         Lift::Clean => Acknowledged::default(),
@@ -516,7 +553,7 @@ pub fn status<S: Sql>(sql: &S, restoring_since: Option<u64>) -> Result<Value> {
     let report = stored(sql)?;
     let decision = match &report {
         Some((_, summary)) => {
-            serde_json::to_value(gate::lift(&findings(sql, summary)?, &acks(sql)?))
+            serde_json::to_value(gate::lift(&findings(summary, lists(sql)?), &acks(sql)?))
                 .map_err(|_| BridgeError::Invalid("unit: lift decision"))?
         }
         None => Value::Null,
