@@ -199,6 +199,14 @@ fn directory_db() -> RusqliteSql {
         "../../../workers/s3-bridge/migrations-directory/0001_directory.sql"
     ))
     .unwrap();
+    db.apply(include_str!(
+        "../../../workers/s3-bridge/migrations-directory/0002_tenant_events.sql"
+    ))
+    .unwrap();
+    db.apply(include_str!(
+        "../../../workers/s3-bridge/migrations-directory/0003_pending_chains_and_caps.sql"
+    ))
+    .unwrap();
     db
 }
 
@@ -822,6 +830,270 @@ fn born_unit(state_seq: u64) -> Rc<Unit<RusqliteSql>> {
     );
     assert!(matches!(born, UnitAnswer::Ok { .. }), "{born:?}");
     Rc::new(unit)
+}
+
+async fn no_born_marker(_: &TenantId, _: u32) -> Result<()> {
+    panic!("held and bring_up do not write a born marker")
+}
+
+#[test]
+fn tenant_held_reads_the_units_own_numbers_once_without_sync_or_renew() {
+    let mut p = ports(active_records(true), None);
+    p.unit = Some(born_unit(1));
+    let cache = RootCache::new();
+    let root = Root::new(&p, &cache, TestRng(3));
+    let units = root.tenant_units(no_born_marker);
+    let tenant = id();
+    use velmora_bridge::directory::finish::{TenantUnits, UnitHolds};
+
+    // The unit is behind the stored head. Read twice across independent
+    // calls to prove the adapter neither syncs nor caches the first read.
+    for count in 1..=2 {
+        assert_eq!(
+            block_on(units.held(&tenant, 0)).unwrap(),
+            UnitHolds::Seq { state_seq: 1 },
+        );
+        let calls = p.objects.calls.borrow();
+        assert_eq!(calls.len(), count);
+        let call = &calls[count - 1];
+        assert_eq!(call.name, UnitName::new(unit_id(), 0));
+        assert_eq!(call.kind, CallKind::Request);
+        assert_eq!(
+            call.seqs,
+            Some(Seqs {
+                state_seq: 0,
+                keys_seq: 0
+            })
+        );
+        assert!(matches!(call.op, UnitOp::Ping {}));
+        assert!(!call.authenticated);
+    }
+}
+
+#[test]
+fn tenant_bring_up_syncs_and_a_separate_marker_call_delegates() {
+    use velmora_bridge::directory::finish::{TenantUnits, UnitHolds};
+    let mut p = ports(active_records(true), None);
+    p.unit = Some(born_unit(1));
+    let cache = RootCache::new();
+    let root = Root::new(&p, &cache, TestRng(3));
+    let tenant = id();
+    let marks = RefCell::new(Vec::new());
+    let units = root.tenant_units(async |tenant: &TenantId, unit| {
+        marks.borrow_mut().push((tenant.clone(), unit));
+        Ok(())
+    });
+    block_on(async {
+        let head = root
+            .heads()
+            .head(&Tenant::Managed(tenant.clone()), 0)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            units.bring_up(&tenant, 0).await.unwrap(),
+            UnitHolds::Seq {
+                state_seq: head.door.seq
+            }
+        );
+        assert!(marks.borrow().is_empty());
+        units.mark_born(&tenant, 0).await.unwrap();
+        assert_eq!(*marks.borrow(), [(tenant, 0)]);
+    });
+}
+
+thread_local! {
+    static CONTROL_ALERTS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+}
+
+fn capture_control_alerts() {
+    CONTROL_ALERTS.with(|lines| lines.borrow_mut().clear());
+    velmora_bridge::trace::log_alerts(|line| {
+        CONTROL_ALERTS.with(|lines| lines.borrow_mut().push(line.into()));
+    });
+}
+
+#[test]
+fn bound_directory_key_target_writes_routes_and_drains_refusal_pages() {
+    use velmora_bridge::directory::store::{KeyRoute, RouteKind, RoutePut};
+    use velmora_bridge::keys::ports::{Applied, KeyTarget};
+    let records = active_records(true);
+    let first = s3_key("AKVL00000001");
+    let second = s3_key("AKVL00000002");
+    plant(&records, 1, KeyOp::Create, &first, false);
+    plant(&records, 2, KeyOp::Create, &second, false);
+    let p = ports(records, Some(directory_db()));
+    let cache = RootCache::new();
+    let root = Root::new(&p, &cache, TestRng(3));
+    let tenant = id();
+    let managed = Tenant::Managed(tenant.clone());
+    let dir = root.directory().unwrap();
+    let entry = |seq, s: Subject| {
+        ChainItem::Subject(Entry {
+            door: s.door,
+            private: Some(s.private),
+            last_seq: seq,
+            private_seq: seq,
+            tk_version: 1,
+            closes: false,
+            opened_seq: seq,
+            rid: None,
+        })
+    };
+    capture_control_alerts();
+    block_on(async {
+        let door = root.heads().head(&managed, 0).await.unwrap().unwrap().door;
+        dir.apply_tenant(&door, NOW).await.unwrap();
+        let ring = root.tenant_keys(&tenant).await.unwrap();
+        let target = root.directory_key_target(&tenant, &ring);
+        assert_eq!(target.keys_seq().await.unwrap(), 0);
+        assert_eq!(
+            target.apply(0, &[entry(1, first)]).await.unwrap(),
+            Applied::Done { keys_seq: 1 }
+        );
+        assert_eq!(
+            dir.route("AKVL00000001").await.unwrap().unwrap().tenant,
+            managed
+        );
+        assert_eq!(
+            dir.put_route(&KeyRoute {
+                akid: second.door.id.clone(),
+                tenant: managed,
+                kind: RouteKind::Internal,
+                owner_ref: None,
+                created_at: NOW,
+            })
+            .await
+            .unwrap(),
+            RoutePut::Inserted
+        );
+        assert!(target.apply(1, &[entry(2, second)]).await.is_err());
+        assert_eq!(target.keys_seq().await.unwrap(), 1);
+        // No additional page from a later successful no-op.
+        target.apply(1, &[]).await.unwrap();
+    });
+    CONTROL_ALERTS
+        .with(|lines| assert_eq!(*lines.borrow(), ["key finisher (directory_route_conflict)"]));
+}
+
+#[test]
+fn unbound_directory_key_target_acknowledges_without_reading_records() {
+    use velmora_bridge::keys::ports::{Applied, KeyTarget};
+    let p = ports(Rc::new(MemRecords::default()), None);
+    let cache = RootCache::new();
+    let root = Root::new(&p, &cache, TestRng(3));
+    let tenant = id();
+    let ring = OneKey(key());
+    let target = root.directory_key_target(&tenant, &ring);
+    block_on(async {
+        assert_eq!(target.keys_seq().await.unwrap(), u64::MAX);
+        assert!(target.closed().await.unwrap().is_empty());
+        assert_eq!(
+            target
+                .apply(
+                    0,
+                    &[ChainItem::Marker {
+                        seq: 1,
+                        marker: Marker::KeysFrozen
+                    }]
+                )
+                .await
+                .unwrap(),
+            Applied::Done { keys_seq: u64::MAX }
+        );
+    });
+}
+
+#[test]
+fn tenant_finish_pages_reach_the_alert_sink() {
+    use velmora_bridge::directory::finish::{finish_tenant, StoreStep, TenantFinisher};
+    use velmora_bridge::keys::ports::ControlChain;
+    use velmora_bridge::pending::{ChainFinisher, ChainKey};
+    let mut p = ports(active_records(true), Some(directory_db()));
+    let tenant = id();
+    p.unit = Some(Rc::new(Unit::new(
+        RusqliteSql::open_in_memory().unwrap(),
+        UnitName::new(unit_id(), 0),
+        "",
+    )));
+    let cache = RootCache::new();
+    let root = Root::new(&p, &cache, TestRng(3));
+    let units = root.tenant_units(no_born_marker);
+    block_on(root.tenant_head(&tenant)).unwrap().unwrap();
+    capture_control_alerts();
+    let run = block_on(finish_tenant(
+        &root.chain(),
+        root.directory().as_ref(),
+        &units,
+        &tenant,
+        NOW,
+    ))
+    .unwrap();
+    assert_eq!(run.units, [(0, StoreStep::Unborn)]);
+    assert_eq!(run.pages, ["unit_unborn"]);
+    // Management callers own the pages of a full report. The head-only
+    // finisher delivers them itself so the sweep does not lose them.
+    CONTROL_ALERTS.with(|lines| assert!(lines.borrow().is_empty()));
+    let finisher = TenantFinisher {
+        chain: root.chain(),
+        dir: root.directory(),
+        units: &units,
+        now: NOW,
+    };
+    let chain = ChainKey {
+        tenant: tenant.clone(),
+        chain: ControlChain::Tenant,
+    };
+    assert_eq!(block_on(finisher.finish(&chain)).unwrap(), run.head);
+    // An unborn answer carries no numbers. A read-only held probe must
+    // report a failure without falling into sync or renewal.
+    use velmora_bridge::directory::finish::TenantUnits;
+    let reads = p.objects.calls.borrow().len();
+    assert!(block_on(units.held(&tenant, 0)).is_err());
+    assert_eq!(p.objects.calls.borrow().len(), reads + 1);
+    CONTROL_ALERTS.with(|lines| assert_eq!(*lines.borrow(), ["tenant finisher (unit_unborn)"]));
+}
+
+#[test]
+fn tenant_finish_pages_a_damaged_row_even_when_the_head_read_fails() {
+    use velmora_bridge::directory::finish::{finish_tenant, ERR_KEY_NOT_HELD};
+    let p = ports(active_records(true), Some(directory_db()));
+    let tenant = id();
+    let cache = RootCache::new();
+    let root = Root::new(&p, &cache, TestRng(3));
+    let dir = root.directory().unwrap();
+    let units = root.tenant_units(no_born_marker);
+    capture_control_alerts();
+    block_on(async {
+        // A doors-only read can seed a directory row without loading the
+        // key the real finisher will need for the private part of the head.
+        let managed = Tenant::Managed(tenant.clone());
+        let door = root.heads().head(&managed, 0).await.unwrap().unwrap().door;
+        dir.apply_tenant(&door, NOW).await.unwrap();
+        p.directory
+            .as_ref()
+            .unwrap()
+            .exec(
+                "UPDATE tenants SET door_json = '{}' WHERE id = ?1",
+                &[SqlValue::Text(tenant.as_str().into())],
+            )
+            .await
+            .unwrap();
+        let err = finish_tenant(&root.chain(), Some(&dir), &units, &tenant, NOW)
+            .await
+            .unwrap_err();
+        let BridgeError::Invalid(expected) = ERR_KEY_NOT_HELD else {
+            unreachable!()
+        };
+        assert!(matches!(err, BridgeError::Invalid(actual) if actual == expected));
+        assert!(p.objects.calls.borrow().is_empty());
+    });
+    CONTROL_ALERTS.with(|lines| {
+        assert_eq!(
+            *lines.borrow(),
+            ["tenant finisher (directory_row_unreadable)"]
+        )
+    });
 }
 
 /// The unit's key rows: (id, held, status, has an owner, has a secret).

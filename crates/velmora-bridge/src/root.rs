@@ -49,6 +49,7 @@
 //! record byte or name of another tenant reaches one.
 
 pub mod client;
+mod control;
 pub mod feed;
 pub mod request;
 

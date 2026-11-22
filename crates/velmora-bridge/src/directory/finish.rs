@@ -147,8 +147,18 @@ pub struct TenantFinish {
     /// Units whose born marker could not be written (the next run tries
     /// again).
     pub born_failed: Vec<u32>,
-    /// Fixed codes of what pages: damage, never an outage.
+    /// Fixed codes of what pages: damage, never an outage. A direct
+    /// `finish_tenant` caller emits these if it keeps the report;
+    /// `TenantFinisher` emits them before returning just the head.
     pub pages: Vec<&'static str>,
+}
+
+impl TenantFinish {
+    fn report_pages(&self) {
+        for code in &self.pages {
+            crate::trace::alert(|| format!("tenant finisher ({code})"));
+        }
+    }
 }
 
 /// Runs the finisher of `tenant`'s chain at `now`. See the
@@ -202,7 +212,12 @@ where
     let head = match chain.head(&managed, 0).await {
         Ok(Some(head)) => head,
         Ok(None) => return Ok(run),
-        Err(e) => return Err(chain_error(e)),
+        Err(e) => {
+            // The caller gets no report on an error; preserve any page
+            // already collected while reading the directory.
+            run.report_pages();
+            return Err(chain_error(e));
+        }
     };
     let h = head.door.seq;
     run.head.seq = h;
@@ -565,6 +580,7 @@ where
             self.now,
         )
         .await?;
+        run.report_pages();
         Ok(run.head)
     }
 }
