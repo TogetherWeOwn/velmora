@@ -459,10 +459,11 @@ a little before the commit; the S3 drill measures
 `getBookmarkForTime`'s offset, and above 30 s the margin becomes twice
 it. A bookmark target is not compared: the only bookmarks are the undo
 bookmark and the pre-migration bookmark, and neither can be taken before
-the lift, with one span open (a design question for the move's
-step 2): between the sync that closes the owner's unit under the move's
-entry and the first import batch there is no move record, and the unit
-cannot tell that entry from a restore's, whatever its birth, so
+the lift, with one span open (a design question for the move): from
+the time the owner's unit is closed with no move record (the move's
+step-2 sync, or a re-creation with a `restore` token under the move's
+entry, AM-53, or under a left entry, P12) until the first import batch,
+the unit cannot tell that entry from a restore's, whatever its birth, so
 `restore_prepare` there goes on to checks 1 to 3. A unit runs no schema
 migration while an import is not lifted
 (`schema::migration_allowed`; code reads N - 1 and N, so it serves
