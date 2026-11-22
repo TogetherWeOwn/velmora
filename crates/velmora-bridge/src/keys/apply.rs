@@ -39,7 +39,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use super::chain::Chain;
 use super::ports::{Applied, ApplyEntry, KeyTarget, MAX_APPLY};
 use super::record::{
-    key_chain, open_chain_record, ChainRecord, Entry, KeyTable, SubjectStatus, TkRing,
+    key_chain, open_chain_record, ChainRecord, Entry, KeyTable, Marker, Rid, SubjectStatus, TkRing,
     ERR_KEY_RECORD,
 };
 
@@ -51,14 +51,15 @@ use crate::types::{BridgeError, Result};
 /// restored between its `keys_seq` and the apply) before the call fails.
 pub const MAX_BEHIND: u32 = 3;
 
-/// What a feed keeps of each record it read: the subject it names, or a
-/// marker. A few bytes per seq, so one run reads each record at most once
+/// What a feed keeps of each record it read: the subject it names, or the
+/// marker it is. A few bytes per seq, so one run reads each record at most once
 /// whatever the stores' lag (a store far behind costs one GET per record
 /// it lacks, once).
 #[derive(Clone, Debug)]
 enum Slot {
-    Subject(String),
-    Marker,
+    /// The subject's id, and the `rid` the record carries.
+    Subject(String, Option<Rid>),
+    Marker(Marker),
 }
 
 /// The store kept answering `Behind`.
@@ -114,8 +115,8 @@ impl<'a, S: RecordStore, K: Kek, T: TkRing> Feed<'a, S, K, T> {
         }
         let bytes = self.chain.get(self.store, seq).await?;
         let slot = match open_chain_record(self.kek, self.ring, self.table.tenant(), seq, &bytes)? {
-            ChainRecord::Key(r) => Slot::Subject(r.door.id),
-            ChainRecord::Marker(_) => Slot::Marker,
+            ChainRecord::Key(r) => Slot::Subject(r.door.id, r.rid),
+            ChainRecord::Marker(m) => Slot::Marker(m.marker),
         };
         self.memo.borrow_mut().insert(seq, slot.clone());
         Ok(slot)
@@ -140,32 +141,46 @@ impl<'a, S: RecordStore, K: Kek, T: TkRing> Feed<'a, S, K, T> {
     async fn page(&self, from: u64, to: u64) -> Result<Vec<ApplyEntry>> {
         let mut out = Vec::with_capacity((to - from) as usize);
         for seq in from + 1..=to {
-            let id = match self.slot(seq).await? {
-                Slot::Marker => {
-                    out.push(ApplyEntry::Marker { seq });
+            let (id, rid) = match self.slot(seq).await? {
+                Slot::Marker(marker) => {
+                    out.push(ApplyEntry::Marker { seq, marker });
                     continue;
                 }
-                Slot::Subject(id) => id,
+                Slot::Subject(id, rid) => (id, rid),
             };
             let head = self.table.get(&id).ok_or(ERR_KEY_RECORD)?;
             let mut entry = head.clone();
             entry.last_seq = seq;
+            // The reservation is the record's, not the head's newest.
+            entry.rid = rid;
             out.push(ApplyEntry::Subject(self.in_force(entry)));
         }
         Ok(out)
     }
 
     /// Holds closed, in `mode`, an entry whose opening the directory may
-    /// not have: the rule of the closing step.
+    /// not have: the rule of the closing step. The held entry drops its
+    /// private part (the secret, the grant limits, the label) and keeps
+    /// its `owner_ref` (AM-72).
     fn hold(mode: Mode, held: u64, closed: &BTreeSet<String>, entry: &mut ApplyEntry) {
-        let (Mode::Closing { acked }, ApplyEntry::Subject(e)) = (mode, entry) else {
+        let (Mode::Closing { acked }, ApplyEntry::Subject(e)) = (mode, &mut *entry) else {
             return;
         };
         let acknowledged =
             e.opened_seq <= acked || (e.opened_seq <= held && !closed.contains(&e.door.id));
-        if !acknowledged && e.door.status != SubjectStatus::Revoked {
-            e.private = None;
+        if acknowledged || e.door.status == SubjectStatus::Revoked {
+            return;
         }
+        // A private part that did not open is held already, with no
+        // identity to keep.
+        let Some(private) = e.private.take() else {
+            return;
+        };
+        let held_entry = e.clone();
+        *entry = ApplyEntry::Held {
+            entry: held_entry,
+            owner_ref: private.owner_ref,
+        };
     }
 
     /// The `m/rk/` revocations the chain does not record yet, at or below
@@ -271,6 +286,54 @@ impl<'a, S: RecordStore, K: Kek, T: TkRing> Feed<'a, S, K, T> {
         } else {
             self.singly(target, reopened).await
         }
+    }
+
+    /// The verified items of the records after `after`, in chain order,
+    /// at most `limit` (and at most [`MAX_APPLY`]), never past the table's
+    /// head, with no gap: one per record, a subject's entry as the head
+    /// holds it, stamped at the record's seq, with the `m/rk/` revocations
+    /// in force, or a [`ApplyEntry::Marker`] in place for a `KeysFrozen` or
+    /// `KeysThawed` record (AM-62). Nothing is held: an entry whose private
+    /// part does not open comes with `private: None`, and the caller sends
+    /// it held or refuses it. Empty when `after` is at or above the head,
+    /// or `limit` is 0. A record that is missing or does not verify is an
+    /// error, never left out.
+    ///
+    /// The read behind the move tool's `OwnerKeys::entries` (step 5(e)'s
+    /// direct apply, the undo's `entries_to`): the items map one to one
+    /// onto the unit's `ApplyEntry`. Nothing is held there; a store's own
+    /// feed, which must hold what the directory may not have, is
+    /// [`Feed::entries_for`].
+    pub async fn entries(&self, after: u64, limit: usize) -> Result<Vec<ApplyEntry>> {
+        let head = self.table.seq();
+        if after >= head || limit == 0 {
+            return Ok(Vec::new());
+        }
+        let take = limit.min(MAX_APPLY) as u64;
+        self.page(after, head.min(after.saturating_add(take))).await
+    }
+
+    /// [`Feed::entries`] as a store at `keys_seq = after` takes them in
+    /// `mode` (AM-71's `KeyFeed`, serving a unit that asks for the records
+    /// after its `keys_seq`): in [`Mode::Closing`], an entry whose newest
+    /// opening the directory has not acknowledged (above `acked`, unless
+    /// the store already holds that opening open at or below `after`) is
+    /// [`ApplyEntry::Held`] with its `owner_ref`; `closed` is the store's
+    /// closed subjects ([`KeyTarget::closed`]). [`Mode::Full`] holds
+    /// nothing. The `m/rk/` revocations below `after` and the second send
+    /// are the bring-up's ([`Feed::bring_up`]), not this read's.
+    pub async fn entries_for(
+        &self,
+        after: u64,
+        limit: usize,
+        mode: Mode,
+        closed: &BTreeSet<String>,
+    ) -> Result<Vec<ApplyEntry>> {
+        let mut out = self.entries(after, limit).await?;
+        for e in &mut out {
+            Self::hold(mode, after, closed, e);
+        }
+        Ok(out)
     }
 
     /// Brings `target` to the head in `mode`. A store that answers

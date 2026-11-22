@@ -70,8 +70,10 @@ struct FakeTarget {
     rows: RefCell<BTreeMap<String, Entry>>,
     down: Cell<bool>,
     applies: Cell<u32>,
-    /// The seqs of the markers it was sent.
-    markers: RefCell<Vec<u64>>,
+    /// The markers it was sent: seq and kind.
+    markers: RefCell<Vec<(u64, Marker)>>,
+    /// The `owner_ref` of every held entry it was sent, by subject.
+    held_owners: RefCell<Vec<(String, Option<String>)>>,
     /// Goes down after this many more applies.
     down_after: Cell<Option<u32>>,
 }
@@ -85,6 +87,7 @@ impl FakeTarget {
             down: Cell::new(false),
             applies: Cell::new(0),
             markers: RefCell::new(Vec::new()),
+            held_owners: RefCell::new(Vec::new()),
             down_after: Cell::new(None),
         }
     }
@@ -159,8 +162,21 @@ impl KeyTarget for FakeTarget {
         for e in entries {
             let e = match e {
                 ApplyEntry::Subject(e) => e,
-                ApplyEntry::Marker { seq } => {
-                    self.markers.borrow_mut().push(*seq);
+                ApplyEntry::Held { entry, owner_ref } => {
+                    // A held entry is the head's with no private part, and
+                    // keeps the identity it had (AM-72).
+                    assert!(
+                        entry.private.is_none(),
+                        "{}: a held entry opens",
+                        self.label
+                    );
+                    self.held_owners
+                        .borrow_mut()
+                        .push((entry.door.id.clone(), owner_ref.clone()));
+                    entry
+                }
+                ApplyEntry::Marker { seq, marker } => {
+                    self.markers.borrow_mut().push((*seq, *marker));
                     continue;
                 }
             };
@@ -1113,6 +1129,7 @@ async fn a_key_is_never_recorded_wider_than_its_principal_at_its_seq() {
                     tk_version: 1,
                     closes: true,
                     opened_seq: 1,
+                    rid: None,
                 },
             );
             w.root.seq.set(3);
@@ -5776,7 +5793,7 @@ async fn a_freeze_the_receipt_does_not_name_is_thawed_before_a_new_one() {
 // apply(from_seq): one entry per record, pages, Behind
 // ---------------------------------------------------------------------------
 
-use velmora_bridge::keys::apply::{apply_direct, ERR_APPLY_BEHIND};
+use velmora_bridge::keys::apply::{apply_direct, Feed, Mode, ERR_APPLY_BEHIND};
 
 /// Plants `subject` at `seq` with `op` (no reservation: a fixture).
 fn plant(w: &World, seq: u64, op: KeyOp, subject: &Subject, frozen_at: Option<u64>) {
@@ -5939,8 +5956,175 @@ async fn markers_hold_their_place_in_the_run() {
     .await
     .unwrap();
     assert_eq!(unit.seq.get(), 7);
-    assert_eq!(*unit.markers.borrow(), vec![4, 6]);
+    assert_eq!(
+        *unit.markers.borrow(),
+        vec![(4, Marker::KeysFrozen), (6, Marker::KeysThawed { ends: 3 })]
+    );
     assert_eq!(unit.rows.borrow().len(), 4);
+}
+
+/// The seqs of `items`, and whether they run from `after + 1` with no gap.
+fn runs_from(after: u64, items: &[ApplyEntry]) -> bool {
+    items
+        .iter()
+        .enumerate()
+        .all(|(i, e)| e.seq() == after + 1 + i as u64)
+}
+
+/// L3's ask (AM-62): the read behind `OwnerKeys::entries` answers the
+/// `KeysFrozen` and `KeysThawed` records in place, as markers of their
+/// kind, in seq order with no gap, page by page, and stops at the head.
+#[tokio::test(flavor = "current_thread")]
+async fn entries_answer_the_freeze_markers_in_place_with_no_gap() {
+    let w = World::new();
+    plant_principals(&w, 3);
+    plant_marker(&w, 4, Marker::KeysFrozen);
+    plant(
+        &w,
+        5,
+        KeyOp::Grants,
+        &principal("PA0001", &[grant("b_09", RW, None)]),
+        Some(3),
+    );
+    plant_marker(&w, 6, Marker::KeysThawed { ends: 3 });
+    plant(&w, 7, KeyOp::Create, &principal("PA0007", &[]), None);
+    let table = head_table(&w).await;
+    let none = Default::default();
+    let feed = Feed::new(&w.store, &w.kek, &w.ring, &table, &none);
+
+    // One read of the whole chain.
+    let all = feed.entries(0, 100).await.unwrap();
+    assert!(runs_from(0, &all));
+    assert_eq!(all.len(), 7);
+    assert_eq!(
+        all[3],
+        ApplyEntry::Marker {
+            seq: 4,
+            marker: Marker::KeysFrozen
+        }
+    );
+    assert_eq!(
+        all[5],
+        ApplyEntry::Marker {
+            seq: 6,
+            marker: Marker::KeysThawed { ends: 3 }
+        }
+    );
+    for (i, e) in all.iter().enumerate() {
+        if i == 3 || i == 5 {
+            continue;
+        }
+        let ApplyEntry::Subject(e) = e else {
+            panic!("seq {}: a subject's record read as a marker", i + 1);
+        };
+        // The head's state, stamped at the record's seq.
+        let mut head = table.get(&e.door.id).unwrap().clone();
+        head.last_seq = e.last_seq;
+        head.rid = None;
+        assert_eq!(*e, head);
+    }
+
+    // Pages of two, as the caller reads them (`after` = the last seq it
+    // got): the same items, every page from `after + 1`, a page ending on
+    // a marker included.
+    let mut paged = Vec::new();
+    let mut after = 0;
+    loop {
+        let page = feed.entries(after, 2).await.unwrap();
+        let Some(last) = page.last().map(ApplyEntry::seq) else {
+            break;
+        };
+        assert!(page.len() <= 2);
+        assert!(runs_from(after, &page), "a gap after {after}");
+        after = last;
+        paged.extend(page);
+    }
+    assert_eq!(after, 7);
+    assert_eq!(paged, all);
+
+    // Past the head, at it, and a zero limit: nothing.
+    assert!(feed.entries(7, 100).await.unwrap().is_empty());
+    assert!(feed.entries(9, 100).await.unwrap().is_empty());
+    assert!(feed.entries(2, 0).await.unwrap().is_empty());
+    // A page from the middle starts on the marker.
+    let mid = feed.entries(3, 1).await.unwrap();
+    assert_eq!(
+        mid,
+        vec![ApplyEntry::Marker {
+            seq: 4,
+            marker: Marker::KeysFrozen
+        }]
+    );
+}
+
+/// A frozen head: the chain ends on its `KeysFrozen` (and the records
+/// after it carry `frozen_at`); the read ends on the marker, and a page
+/// is never larger than [`MAX_APPLY`] whatever the caller asks.
+#[tokio::test(flavor = "current_thread")]
+async fn entries_end_on_a_frozen_head_and_keep_to_a_page() {
+    let w = World::new();
+    plant_principals(&w, 150);
+    plant_marker(&w, 151, Marker::KeysFrozen);
+    let table = head_table(&w).await;
+    assert_eq!(table.frozen_at(), Some(150));
+    let none = Default::default();
+    let feed = Feed::new(&w.store, &w.kek, &w.ring, &table, &none);
+    let first = feed.entries(0, 1_000).await.unwrap();
+    assert_eq!(first.len(), MAX_APPLY);
+    assert!(runs_from(0, &first));
+    let rest = feed.entries(100, 1_000).await.unwrap();
+    assert!(runs_from(100, &rest));
+    assert_eq!(rest.len(), 51);
+    assert_eq!(
+        rest.last(),
+        Some(&ApplyEntry::Marker {
+            seq: 151,
+            marker: Marker::KeysFrozen
+        })
+    );
+    assert!(rest[..50]
+        .iter()
+        .all(|e| matches!(e, ApplyEntry::Subject(_))));
+}
+
+/// A marker record that does not verify, or is gone, fails the read: it
+/// is never left out (which would read as a gap, or as the end).
+#[tokio::test(flavor = "current_thread")]
+async fn a_marker_that_does_not_verify_fails_the_read() {
+    let w = World::new();
+    plant_principals(&w, 2);
+    plant_marker(&w, 3, Marker::KeysFrozen);
+    plant_marker(&w, 4, Marker::KeysThawed { ends: 2 });
+    plant(&w, 5, KeyOp::Create, &principal("PA0005", &[]), None);
+    let table = head_table(&w).await;
+    let none = Default::default();
+    let name = key_chain(&w.t).name(4);
+    let good = w.store.raw(&name).unwrap();
+    let mut bad = good.clone();
+    let last = bad.len() - 1;
+    bad[last] ^= 1;
+    w.store.plant(&name, bad);
+    let feed = Feed::new(&w.store, &w.kek, &w.ring, &table, &none);
+    assert!(feed.entries(0, 100).await.is_err());
+    assert!(feed.entries(3, 100).await.is_err());
+    // Below it the read still answers, up to the record before it.
+    assert_eq!(feed.entries(0, 3).await.unwrap().len(), 3);
+    // A marker record gone from the store.
+    assert!(w.store.lose(&name));
+    let feed = Feed::new(&w.store, &w.kek, &w.ring, &table, &none);
+    assert!(feed.entries(3, 100).await.is_err());
+    // Put back: the read answers again.
+    w.store.plant(&name, good);
+    let feed = Feed::new(&w.store, &w.kek, &w.ring, &table, &none);
+    let tail = feed.entries(3, 100).await.unwrap();
+    assert!(runs_from(3, &tail));
+    assert_eq!(
+        tail[0],
+        ApplyEntry::Marker {
+            seq: 4,
+            marker: Marker::KeysThawed { ends: 2 }
+        }
+    );
 }
 
 /// A store restored between its `keys_seq` and the apply answers
@@ -6575,7 +6759,13 @@ async fn an_older_record_never_opens_a_subject_between_pages() {
         KeyTarget::apply(
             &unit,
             0,
-            &[ApplyEntry::Marker { seq: 1 }, ApplyEntry::Subject(e)],
+            &[
+                ApplyEntry::Marker {
+                    seq: 1,
+                    marker: Marker::KeysFrozen,
+                },
+                ApplyEntry::Subject(e),
+            ],
         )
         .await
         .unwrap();
@@ -6618,7 +6808,6 @@ async fn an_unrecorded_revocation_goes_before_the_pages() {
 /// one call each; with nothing read yet, alone.
 #[tokio::test(flavor = "current_thread")]
 async fn many_reopened_subjects_take_one_run() {
-    use velmora_bridge::keys::apply::{Feed, Mode};
     let w = World::new();
     plant_principals(&w, 250);
     let table = head_table(&w).await;
@@ -6683,6 +6872,164 @@ async fn the_closing_step_never_opens_what_a_partial_directory_holds_closed() {
     let at_dir = directory.row("PX0001").unwrap();
     assert!(at_dir.private.is_some(), "the directory holds it open");
     assert!(at_dir.door.grants.is_empty(), "as the head narrows it");
+}
+
+/// AM-72 (the plane's #246 review, M2): a subject the units hold closed
+/// while the directory is down keeps its identity. The held entry carries
+/// its `owner_ref` and no private part: no secret, no grant limit, no
+/// label. Once the directory is back the full step opens it, and nothing
+/// is held any more.
+#[tokio::test(flavor = "current_thread")]
+async fn a_held_entry_keeps_its_owner_ref_and_nothing_else_private() {
+    let w = World::new();
+    let adm = FakeAdmission::new(&w.root);
+    let mut table = seed(&w, &adm).await;
+    let units = w.units();
+    let env = env!(w, &adm, &units);
+    let mut rng = TestRng(450);
+    // Every create is held at the closing step until the directory has
+    // it, the seed's too: count from here.
+    for u in [&w.root, &w.unit2] {
+        u.held_owners.borrow_mut().clear();
+    }
+    w.directory.down.set(true);
+    let mut p = principal("PR0009", &[grant("b_01", RW, Some("photos/"))]);
+    p.private.label = Some("a label".into());
+    assert_eq!(
+        env.change(&mut table, "i-p9", &KeyRequest::Create(p), &mut rng)
+            .await
+            .unwrap(),
+        KeyAnswer::Unfinished { seq: 3 }
+    );
+    let k = s3_key(&w.t, "AKVL0009", "PR0001", &[grant("b_01", RO, None)]);
+    assert_eq!(
+        env.change(&mut table, "i-k9", &KeyRequest::Create(k), &mut rng)
+            .await
+            .unwrap(),
+        KeyAnswer::Unfinished { seq: 4 }
+    );
+    for u in [&w.root, &w.unit2] {
+        let owners = u.held_owners.borrow();
+        for id in ["PR0009", "AKVL0009"] {
+            let sent: Vec<&Option<String>> = owners
+                .iter()
+                .filter(|(i, _)| i == id)
+                .map(|(_, o)| o)
+                .collect();
+            assert!(!sent.is_empty(), "{}: {id} was not held", u.label);
+            assert!(
+                sent.iter()
+                    .all(|o| o.as_deref() == Some(&format!("member-of-{id}")[..])),
+                "{}: {id} held without its owner_ref",
+                u.label
+            );
+            let row = u.row(id).unwrap();
+            assert!(row.private.is_none(), "{}: {id} opens", u.label);
+            // The door's grant is kept (bucket and access); its limit was
+            // in the private part.
+            assert_eq!(row.door.grants.len(), 1, "{}: {id}", u.label);
+        }
+        // What the directory acknowledged before is not held again.
+        assert!(!owners.iter().any(|(i, _)| i == "PR0001" || i == "AKVL0001"));
+    }
+    w.directory.down.set(false);
+    let held_before = w.root.held_owners.borrow().len();
+    finish_keys(&env, &mut rng).await.unwrap();
+    for u in [&w.root, &w.unit2] {
+        for id in ["PR0009", "AKVL0009"] {
+            let row = u.row(id).unwrap();
+            let private = row.private.as_ref().expect("opened by the full step");
+            assert_eq!(
+                private.owner_ref.as_deref(),
+                Some(&format!("member-of-{id}")[..])
+            );
+        }
+    }
+    assert_eq!(w.root.held_owners.borrow().len(), held_before);
+}
+
+/// The closing step's hold, on its own: with nothing acknowledged every
+/// opening is held, each with its `owner_ref`; with everything
+/// acknowledged nothing is.
+#[tokio::test(flavor = "current_thread")]
+async fn the_closing_step_holds_each_unacknowledged_opening_with_its_owner() {
+    let w = World::new();
+    plant_principals(&w, 3);
+    let table = head_table(&w).await;
+    let none = Default::default();
+    let feed = Feed::new(&w.store, &w.kek, &w.ring, &table, &none);
+    let unit = FakeTarget::new("unit");
+    feed.bring_up(&unit, Mode::Closing { acked: 0 })
+        .await
+        .unwrap();
+    assert_eq!(unit.seq.get(), 3);
+    assert_eq!(
+        *unit.held_owners.borrow(),
+        (1..=3)
+            .map(|n| {
+                let id = format!("PA{n:04}");
+                let owner = format!("member-of-{id}");
+                (id, Some(owner))
+            })
+            .collect::<Vec<_>>()
+    );
+    assert!(unit.rows.borrow().values().all(|r| r.private.is_none()));
+    let unit = FakeTarget::new("unit 2");
+    feed.bring_up(&unit, Mode::Closing { acked: 3 })
+        .await
+        .unwrap();
+    assert!(unit.held_owners.borrow().is_empty());
+    assert!(unit.rows.borrow().values().all(|r| r.private.is_some()));
+}
+
+/// AM-71's `KeyFeed` read: `entries_for` holds, in the closing mode, what
+/// the directory has not acknowledged, each with its `owner_ref`, keeps
+/// open what the store already holds open, holds nothing in full mode, and
+/// keeps the markers in place. `Debug` of a held entry hides the owner.
+#[tokio::test(flavor = "current_thread")]
+async fn entries_for_holds_what_the_directory_lacks_with_its_owner() {
+    let w = World::new();
+    plant_principals(&w, 2);
+    plant_marker(&w, 3, Marker::KeysFrozen);
+    let table = head_table(&w).await;
+    let none = Default::default();
+    let feed = Feed::new(&w.store, &w.kek, &w.ring, &table, &none);
+    let closed = Default::default();
+    // The directory acknowledged seq 1 only.
+    let items = feed
+        .entries_for(0, 100, Mode::Closing { acked: 1 }, &closed)
+        .await
+        .unwrap();
+    assert_eq!(items.len(), 3);
+    assert!(matches!(&items[0], ApplyEntry::Subject(e) if e.private.is_some()));
+    match &items[1] {
+        ApplyEntry::Held { entry, owner_ref } => {
+            assert_eq!(entry.door.id, "PA0002");
+            assert!(entry.private.is_none());
+            assert_eq!(owner_ref.as_deref(), Some("member-of-PA0002"));
+        }
+        other => panic!("not held: {other:?}"),
+    }
+    assert!(items[1].held() && !items[0].held());
+    assert_eq!(
+        items[2],
+        ApplyEntry::Marker {
+            seq: 3,
+            marker: Marker::KeysFrozen
+        }
+    );
+    let shown = format!("{:?}", items[1]);
+    assert!(!shown.contains("member-of"), "{shown}");
+    // A page after the store's seq: the same hold, the same items.
+    let from_one = feed
+        .entries_for(1, 100, Mode::Closing { acked: 1 }, &closed)
+        .await
+        .unwrap();
+    assert_eq!(from_one, items[1..].to_vec());
+    // Full mode holds nothing.
+    let full = feed.entries_for(0, 100, Mode::Full, &closed).await.unwrap();
+    assert_eq!(full, feed.entries(0, 100).await.unwrap());
+    assert!(full.iter().all(|e| !e.held()));
 }
 
 /// Confirmation of the apply (N6): the closing step sends open what the

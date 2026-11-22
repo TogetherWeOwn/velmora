@@ -279,13 +279,33 @@ fn short(s: &str) -> bool {
     !s.is_empty() && s.len() <= MAX_FIELD_LEN
 }
 
+/// A principal id the management plane draws (AM-38, L5-R1): `p_` and
+/// 16 lowercase hex digits. Only a principal, and a `made_by`, may have
+/// one; an access key id stays alphanumeric.
+pub fn is_principal_id(id: &str) -> bool {
+    id.strip_prefix("p_").is_some_and(|hex| {
+        hex.len() == 16
+            && hex
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    })
+}
+
 /// The rules of one subject's state that hold in every record.
 fn check_subject(
     tenant: &TenantId,
     door: &SubjectDoor,
     private: Option<&SubjectPrivate>,
 ) -> Result<()> {
-    let ids_ok = valid_key_id(&door.id) && door.made_by.as_deref().is_none_or(valid_key_id);
+    let id_ok = match door.kind {
+        SubjectKind::Principal => valid_key_id(&door.id) || is_principal_id(&door.id),
+        _ => valid_key_id(&door.id),
+    };
+    let ids_ok = id_ok
+        && door
+            .made_by
+            .as_deref()
+            .is_none_or(|p| valid_key_id(p) || is_principal_id(p));
     let grants_ok = door.grants.len() <= MAX_SUBJECT_GRANTS
         && door.grants.iter().enumerate().all(|(i, g)| {
             short(&g.bucket_id) && !door.grants[..i].iter().any(|h| h.bucket_id == g.bucket_id)
@@ -330,6 +350,58 @@ fn check_subject(
 // Records
 // ---------------------------------------------------------------------------
 
+/// The id of the root unit's reservation whose call wrote a record
+/// (AM-38): 16 random bytes, stored as 32 lowercase hex digits. A record
+/// carries it in its door part, so the unit that applies the record turns
+/// that reservation `applied`, and a call that lost its put can tell its
+/// own record from another call's.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct Rid(pub [u8; 16]);
+
+impl Rid {
+    /// The 32 lowercase hex digits.
+    pub fn hex(&self) -> String {
+        self.0.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// Exactly 32 lowercase hex digits.
+    pub fn parse(text: &str) -> Option<Rid> {
+        let digits = text.as_bytes();
+        if digits.len() != 32 {
+            return None;
+        }
+        let val = |c: u8| match c {
+            b'0'..=b'9' => Some(c - b'0'),
+            b'a'..=b'f' => Some(c - b'a' + 10),
+            _ => None,
+        };
+        let mut out = [0u8; 16];
+        for (i, pair) in digits.as_chunks::<2>().0.iter().enumerate() {
+            out[i] = val(pair[0])? << 4 | val(pair[1])?;
+        }
+        Some(Rid(out))
+    }
+}
+
+impl std::fmt::Debug for Rid {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Rid({})", self.hex())
+    }
+}
+
+impl Serialize for Rid {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        s.serialize_str(&self.hex())
+    }
+}
+
+impl<'de> Deserialize<'de> for Rid {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Rid, D::Error> {
+        let text = String::deserialize(d)?;
+        Rid::parse(&text).ok_or_else(|| serde::de::Error::custom("rid"))
+    }
+}
+
 /// One record of the key chain, opened.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct KeyRecord {
@@ -356,6 +428,9 @@ pub struct KeyRecord {
     /// A record must carry exactly the head's, so no record written
     /// before a freeze lands above it unnoticed.
     pub frozen_at: Option<u64>,
+    /// The reservation whose call wrote the record (AM-38); only on a
+    /// record that opens.
+    pub rid: Option<Rid>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -371,6 +446,8 @@ struct DoorBody {
     private_unchanged: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     frozen_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    rid: Option<Rid>,
 }
 
 /// A record of the key chain that changes no subject (AM-28, AM-54).
@@ -513,7 +590,29 @@ pub fn seal_key_record<K: Kek, T: TkRing, R: FillRandom>(
     frozen_at: Option<u64>,
     rng: &mut R,
 ) -> Result<Vec<u8>> {
-    if frozen_at.is_some_and(|f| f >= seq) {
+    seal_key_record_carrying(
+        kek, ring, tenant, seq, op, at, door, private, closes, frozen_at, None, rng,
+    )
+}
+
+/// [`seal_key_record`], with the `rid` of the reservation whose call
+/// writes it (AM-38). Only a record that opens carries one.
+#[allow(clippy::too_many_arguments)]
+pub fn seal_key_record_carrying<K: Kek, T: TkRing, R: FillRandom>(
+    kek: &K,
+    ring: &T,
+    tenant: &TenantId,
+    seq: u64,
+    op: KeyOp,
+    at: u64,
+    door: &SubjectDoor,
+    private: Option<&SubjectPrivate>,
+    closes: bool,
+    frozen_at: Option<u64>,
+    rid: Option<Rid>,
+    rng: &mut R,
+) -> Result<Vec<u8>> {
+    if frozen_at.is_some_and(|f| f >= seq) || (rid.is_some() && closes) {
         return Err(ERR_KEY_RECORD);
     }
     check_subject(tenant, door, private)?;
@@ -534,6 +633,7 @@ pub fn seal_key_record<K: Kek, T: TkRing, R: FillRandom>(
         closes,
         private_unchanged: private.is_none(),
         frozen_at,
+        rid,
     })
     .map_err(|_| ERR_KEY_RECORD)?;
     let private_body = zeroize::Zeroizing::new(
@@ -636,6 +736,7 @@ pub fn open_chain_record<K: Kek, T: TkRing>(
         || door.tenant != tenant.as_str()
         || door.seq != seq
         || door.frozen_at.is_some_and(|f| f >= seq)
+        || (door.rid.is_some() && door.closes)
     {
         return Err(ERR_KEY_RECORD);
     }
@@ -671,6 +772,7 @@ pub fn open_chain_record<K: Kek, T: TkRing>(
         closes: door.closes,
         private_unchanged: door.private_unchanged,
         frozen_at: door.frozen_at,
+        rid: door.rid,
     }))
 }
 
@@ -714,6 +816,9 @@ pub struct Entry {
     /// create, a re-enable, a widening). A store whose directory has not
     /// acknowledged this seq must not hold the subject open.
     pub opened_seq: u64,
+    /// The `rid` the record at `last_seq` carries (AM-38): the unit that
+    /// applies the entry turns that reservation `applied`.
+    pub rid: Option<Rid>,
 }
 
 impl Entry {
@@ -930,6 +1035,7 @@ impl KeyTable {
                 tk_version,
                 closes: record.closes,
                 opened_seq,
+                rid: record.rid,
             },
         );
         self.seq = record.seq;

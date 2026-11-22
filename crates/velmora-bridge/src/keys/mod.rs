@@ -40,6 +40,7 @@ pub mod locations;
 pub mod moving;
 pub mod ports;
 pub mod record;
+pub mod reserved;
 pub mod revocations;
 pub mod routes;
 pub mod tk;
