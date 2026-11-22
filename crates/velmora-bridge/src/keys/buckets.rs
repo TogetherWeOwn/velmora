@@ -38,7 +38,9 @@
 //!   `restoring`, an unlisted unit) releases the reservation, then revokes
 //!   the orphan grant, and answers the refusal's `409` with its code. When
 //!   the reservation lives on under a later grant, the answer comes from
-//!   it instead; when the release fails, the call answers `503`.
+//!   it instead; when the release fails, or the bucket is already placed
+//!   by a sibling under the same key, nothing is given up and the call
+//!   answers `503`.
 //! - **The answer is `Created` only when the bucket is in force**: both
 //!   records are acknowledged by every door store, on a retry answered
 //!   from the reservation too. Anything less is `Unfinished` (`503`), and

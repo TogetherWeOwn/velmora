@@ -4641,7 +4641,7 @@ impl BucketRecords for RefusedLate<'_, '_> {
 
 /// (Review round 6.) A's put of 3 is refused; before A releases, a
 /// same-key retry places 3 and the unit turns the reservation into bucket
-/// 3. A keeps grant 3 and answers from the reservation.
+/// 3. A gives nothing up and answers 503; the creator keeps grant 3.
 #[tokio::test(flavor = "current_thread")]
 async fn a_refused_put_whose_bucket_a_sibling_placed_keeps_its_grant() {
     let w = World::new();
@@ -4678,18 +4678,8 @@ async fn a_refused_put_whose_bucket_a_sibling_placed_keeps_its_grant() {
     adm.bucket_open.borrow_mut().remove("ib");
     gate_a.set(true);
     let a = fut_a.await.unwrap();
-    assert!(
-        matches!(
-            a,
-            BucketAnswer::Created { grant_seq: 3, .. } | BucketAnswer::Unfinished { grant_seq: 3 }
-        ),
-        "{a:?}"
-    );
+    assert_eq!(a, BucketAnswer::Unfinished { grant_seq: 3 });
     let grants = head_grants(&w, "PR0001").await;
-    eprintln!(
-        "R6a: A answered {a:?}; PR0001 grants at head {grants:?}; placed {:?}",
-        buckets.placed.borrow()
-    );
     assert!(
         grants.iter().any(|g| g == three.as_str()),
         "R6a: bucket 3 is placed and answered {a:?}, but its creator's grant was dropped"
@@ -4742,12 +4732,8 @@ async fn a_refused_finisher_put_whose_bucket_a_retry_placed_keeps_its_grant() {
     adm.bucket_open.borrow_mut().remove("ib");
     gate_f.set(true);
     let f = fut_f.await.unwrap();
-    assert!(
-        matches!(f, CreatorGrant::Placed | CreatorGrant::Busy),
-        "{f:?}"
-    );
+    assert_eq!(f, CreatorGrant::Busy);
     let grants = head_grants(&w, "PR0001").await;
-    eprintln!("R6b: finisher answered {f:?}; PR0001 grants at head {grants:?}");
     assert!(
         grants.iter().any(|g| g == three.as_str()),
         "R6b: bucket 3 is placed (client told Created), but the finisher dropped its creator's grant"
@@ -4803,6 +4789,94 @@ async fn a_refusal_while_a_sibling_placed_the_same_bucket_gives_nothing_up() {
         }
     );
     assert_eq!(buckets.placed.borrow().len(), 1);
+    assert_eq!(
+        head_grants(&w, "PR0001").await,
+        vec!["b_01".to_owned(), three.as_str().to_owned()]
+    );
+}
+
+/// Refuses every `bucket_created` while armed. On its first `is_placed`
+/// it answers, then lets a sibling's placement of bucket 3 land and the
+/// unit turn the reservation into it: between the refused call's
+/// placement check and its release.
+struct RaceAfterCheck<'i, 'a> {
+    inner: &'i FakeBuckets,
+    adm: &'i FakeAdmission<'a>,
+    armed: Cell<bool>,
+}
+
+impl BucketRecords for RaceAfterCheck<'_, '_> {
+    async fn bucket_created(
+        &self,
+        t: &TenantId,
+        bucket: &BucketId,
+        unit: u32,
+        creator: &str,
+        grant_seq: u64,
+    ) -> Result<BucketPut> {
+        if self.armed.get() {
+            return Ok(BucketPut::Refused {
+                status: 409,
+                code: "restoring",
+            });
+        }
+        self.inner
+            .bucket_created(t, bucket, unit, creator, grant_seq)
+            .await
+    }
+    async fn is_placed(&self, t: &TenantId, bucket: &BucketId) -> Result<bool> {
+        let answer = self.inner.is_placed(t, bucket).await?;
+        if self.armed.replace(false) {
+            let three = bucket_id(t, 3);
+            self.inner.placed.borrow_mut().push((
+                three.as_str().to_owned(),
+                1,
+                "PR0001".to_owned(),
+                3,
+            ));
+            self.inner.last_grant_seq.set(3);
+            *self.adm.bucket_done.borrow_mut() = Some((three, 3));
+            self.adm.bucket_open.borrow_mut().remove("ib");
+        }
+        Ok(answer)
+    }
+}
+
+/// (Review round 8.) A sibling places this very bucket after the refused
+/// call's placement check and before its release: the release answers
+/// that the reservation became the bucket, and the call keeps its grant
+/// and answers it.
+#[tokio::test(flavor = "current_thread")]
+async fn a_bucket_placed_between_the_check_and_the_release_keeps_its_grant() {
+    let w = World::new();
+    let adm = FakeAdmission::new(&w.root);
+    let mut table = seed(&w, &adm).await;
+    let units = w.units();
+    let env = env!(w, &adm, &units);
+    let buckets = FakeBuckets::default();
+    let race = RaceAfterCheck {
+        inner: &buckets,
+        adm: &adm,
+        armed: Cell::new(true),
+    };
+    let three = bucket_id(&w.t, 3);
+    let answer = env
+        .create_bucket(
+            &race,
+            &mut table,
+            "ib",
+            &photos("PR0001"),
+            &mut TestRng(8101),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        answer,
+        BucketAnswer::Created {
+            bucket: three.clone(),
+            grant_seq: 3,
+        }
+    );
     assert_eq!(
         head_grants(&w, "PR0001").await,
         vec!["b_01".to_owned(), three.as_str().to_owned()]
