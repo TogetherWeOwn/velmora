@@ -6000,7 +6000,8 @@ impl velmora_bridge::keys::record::TkRing for GoneTwo {
 /// gone version only by AM-11's test; with a partial ring it is blocked.
 #[tokio::test(flavor = "current_thread")]
 async fn the_exit_skips_a_gone_holder_only_when_it_is_lost_for_good() {
-    for partial in [false, true] {
+    // (partial ring, a checkpoint at the holder's seq that cannot be read)
+    for (partial, unreadable_checkpoint) in [(false, false), (true, false), (false, true)] {
         let w = World::new();
         let adm = FakeAdmission::new(&w.root);
         seed(&w, &adm).await;
@@ -6027,13 +6028,20 @@ async fn the_exit_skips_a_gone_holder_only_when_it_is_lost_for_good() {
             key: TenantKey::from_bytes(&w.t, 1, derived("tk")).unwrap(),
             partial,
         };
+        if unreadable_checkpoint {
+            // It may hold PR0004 whole: never taken for lost (AM-11).
+            w.store.plant(
+                &velmora_bridge::keys::checkpoint::checkpoint_name(&w.t, 3),
+                b"not a checkpoint".to_vec(),
+            );
+        }
         let env = env_with!(w, &ring, &adm, &units);
         let env = KeyEnv { gate: &gate, ..env };
         let drops = drop_moved_grants(&env, &["b_01".into()], &mut TestRng(452))
             .await
             .unwrap();
         assert_eq!(drops.written, vec![4, 5], "partial = {partial}");
-        match partial {
+        match partial || unreadable_checkpoint {
             false => assert!(drops.done && drops.blocked.is_empty()),
             true => {
                 assert!(!drops.done);
@@ -6069,6 +6077,29 @@ async fn a_disabled_key_keeps_its_effective_grant_in_d1() {
     let d1 = d1_projection(&head_table(&w).await);
     assert_eq!(d1[0].status, SubjectStatus::Disabled);
     assert_eq!(d1[0].grants, vec![("b_01".to_owned(), RO)]);
+}
+
+/// Final confirmation (LOW 1): a revoked key, and a key under a revoked
+/// principal, reach D1 with no grant.
+#[tokio::test(flavor = "current_thread")]
+async fn a_revoked_key_or_principal_carries_no_grant_to_d1() {
+    for id in ["PR0001", "AKVL0001"] {
+        let w = World::new();
+        let adm = FakeAdmission::new(&w.root);
+        let mut table = seed(&w, &adm).await;
+        let units = w.units();
+        let env = env!(w, &adm, &units);
+        env.change(&mut table, "", &revoke(id), &mut TestRng(460))
+            .await
+            .unwrap();
+        let d1 = d1_projection(&head_table(&w).await);
+        let expect = match id {
+            "PR0001" => SubjectStatus::Disabled,
+            _ => SubjectStatus::Revoked,
+        };
+        assert_eq!(d1[0].status, expect, "{id}");
+        assert!(d1[0].grants.is_empty(), "{id}");
+    }
 }
 
 /// Review r1 (L1, L2): the exit's holders are found again at every head,
