@@ -496,6 +496,26 @@ impl Recorded {
         }
     }
 
+    /// The proof as a unit's request call carries it (L1-5): the Worker
+    /// sends the generation and record name of the [`Recorded`] it holds,
+    /// and the unit's catalogue publishes against them. The unit is the
+    /// Worker's own object, reached only through it, so the proof crosses
+    /// `fetch` as the Worker made it.
+    pub(crate) fn across_unit(generation: GenerationId, key: String) -> Recorded {
+        Recorded { generation, key }
+    }
+
+    /// The unit's catalogue refused the publication of a request call
+    /// and wrote nothing under the id (`unit::request::Published`): the
+    /// Worker turns the proof it kept into the one that deletes. The
+    /// record is the Worker's own, never a name the unit answered.
+    pub(crate) fn refused_on_unit(self) -> Unpublished {
+        Unpublished {
+            generation: self.generation,
+            key: self.key,
+        }
+    }
+
     /// A proof without a record, for catalogue tests that publish rows
     /// directly. Never compiled into the Worker.
     #[cfg(feature = "testkit")]

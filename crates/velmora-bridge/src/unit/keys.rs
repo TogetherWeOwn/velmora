@@ -712,6 +712,44 @@ fn subject<S: Sql>(sql: &S, id: &str) -> Result<Option<Subject>> {
     }))
 }
 
+/// The internal key `id` as the presigned entry point reads it (AM-64):
+/// `None` unless the unit holds a subject of that id of kind `internal`
+/// with its secret. `open`: `active` and not held.
+pub(crate) fn internal_key<S: Sql>(sql: &S, id: &str) -> Result<Option<InternalKey>> {
+    let Some(s) = subject(sql, id)? else {
+        return Ok(None);
+    };
+    if s.kind != KeyKind::Internal {
+        return Ok(None);
+    }
+    let Some((secret_wrapped, kek_version)) = s.secret else {
+        return Ok(None);
+    };
+    Ok(Some(InternalKey {
+        open: s.open,
+        secret_wrapped,
+        kek_version,
+        created_at: s.created_at,
+    }))
+}
+
+/// The internal key's row (see [`internal_key`]). `Debug` hides the
+/// wrapped secret.
+pub(crate) struct InternalKey {
+    pub open: bool,
+    pub secret_wrapped: Vec<u8>,
+    pub kek_version: i64,
+    pub created_at: i64,
+}
+
+impl fmt::Debug for InternalKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("InternalKey")
+            .field("open", &self.open)
+            .finish_non_exhaustive()
+    }
+}
+
 /// A subject's grants as the unit holds them, in record order.
 pub(crate) fn grants_of<S: Sql>(sql: &S, id: &str) -> Result<Vec<KeyGrant>> {
     let rows = poll_once(sql.query(
