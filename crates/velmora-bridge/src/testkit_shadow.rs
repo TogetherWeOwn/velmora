@@ -21,7 +21,10 @@
 //! object, with SQLite as the referee. An error is compared by its class
 //! (a difference fails the run) and keeps SQLite's message, because the
 //! adapter keeps only a class and some tests read the message of a
-//! trigger.
+//! trigger. A connection's own counters (`SELECT total_changes()`,
+//! `last_insert_rowid()`) are always SQLite's: the object's connection
+//! does not live across requests (workerd evicts an idle object), and
+//! the call's transaction is the native savepoint.
 //!
 //! A test that changes the database through
 //! [`super::RusqliteSql::with_conn`] bypasses the port. Before the next
@@ -128,6 +131,21 @@ impl Shadow {
         })
     }
 
+    /// The object's own `total_changes()`, read from it directly.
+    pub(crate) fn object_total_changes(&self) -> i64 {
+        let rows = self.call(
+            json!({"op": "query", "sql": "SELECT total_changes()", "params": []}),
+            |v| Answer::Rows(decode_rows(v)),
+        );
+        match rows {
+            Answer::Rows(r) => match r.first().and_then(|row| row.first()) {
+                Some(SqlValue::Int(n)) => *n,
+                other => panic!("total_changes() answered {other:?}"),
+            },
+            other => panic!("total_changes() answered {other:?}"),
+        }
+    }
+
     /// A change behind the port (`with_conn`, a rolled-back unit call):
     /// the twin is rebuilt from the native database before the next call.
     pub(crate) fn mark_dirty(&self) {
@@ -229,7 +247,19 @@ impl Shadow {
             Err(e) => error_answer(e),
         };
         self.check("query", sql, params, &mine, &remote);
-        match (self.primary_do, remote) {
+        // A connection's counters are SQLite's answer even with the object
+        // as primary. The twin sends each statement as a request of its
+        // own, and workerd evicts an object idle for about 10 s; its next
+        // request opens a new connection, whose `total_changes()` starts
+        // again at 0. A unit call reads the counter before and after its
+        // work (`unit::object::transact`), so a host stall between the two
+        // read a drop and refused a read-only call as
+        // `wrote_without_authentication`. The call's transaction is the
+        // native savepoint, so the native connection's counters are the
+        // ones that span it. In production the call runs in one
+        // `transactionSync` with no await, so the object cannot be
+        // evicted inside it.
+        match (self.primary_do && !engine_counter(sql), remote) {
             (true, Answer::Rows(rows)) => Ok(rows),
             _ => local,
         }

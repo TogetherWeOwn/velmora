@@ -328,6 +328,27 @@ impl RusqliteSql {
         }
     }
 
+    /// Rebuilds the workerd twin's object from this database now, if
+    /// there is a twin: the object is emptied (`deleteAll`) and the copy
+    /// written, so its connection's counters restart, as after workerd
+    /// evicts an idle object. Answers the object's `total_changes()`
+    /// after it; `None` without a twin (or one that stopped).
+    pub fn restart_twin(&self) -> Option<i64> {
+        let shadow = self.shadow.as_ref()?;
+        shadow.mark_dirty();
+        shadow
+            .ready(&self.conn.borrow())
+            .then(|| shadow.object_total_changes())
+    }
+
+    /// The workerd twin's own `total_changes()`, if there is a twin.
+    pub fn twin_total_changes(&self) -> Option<i64> {
+        let shadow = self.shadow.as_ref()?;
+        shadow
+            .ready(&self.conn.borrow())
+            .then(|| shadow.object_total_changes())
+    }
+
     /// Direct access for assertions. A change made here bypasses the
     /// port, so a workerd twin is rebuilt from this database before the
     /// next call.
