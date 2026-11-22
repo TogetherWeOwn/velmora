@@ -920,6 +920,30 @@ async fn a_job_in_the_line_asks_again_when_a_cooldown_ends() {
     assert_eq!(rig.bridge.nntp.live(), 0);
 }
 
+#[tokio::test]
+async fn a_backup_leaving_cooldown_does_not_end_the_first_tiers_wait() {
+    let mut rig = rig(&[spec("bb0", 5), spec("bb1", 5)]).await;
+    rig.bridge.cfg.providers[1].priority = 1;
+    rig.with_timer();
+    let s = rig.seed(1, &marked_plaintext(PLAIN_LEN)).await;
+    let now = rig.bridge.clock.now();
+    rig.bridge.catalog.cool_from("p1", now, now.plus_secs(4));
+    let held = rig.take_slots(0, now.plus_secs(30)).await;
+    let catalog = &rig.bridge.catalog;
+    catalog.line.set(Some(SlotWait::Granted));
+    catalog.line_frees.borrow_mut().extend(held);
+
+    assert_eq!(rig.run_post(&s).await, JobOutcome::Ack);
+
+    {
+        let waits = catalog.line_waits.borrow();
+        assert_eq!(waits.len(), 1, "the backup must not cut the stand short");
+        assert_eq!(waits[0].1, ["p0"]);
+    }
+    assert_eq!(rig.bridge.clock.now().0 - now.0, i64::from(LINE_MS));
+    assert!(all_posted_by(&rig.plan(&s).await, "p0"));
+}
+
 /// The line did not come to the job in the time it had: it is put off
 /// as a job that polled in vain is, without having asked again, with
 /// no attempt spent and nothing loaded.
