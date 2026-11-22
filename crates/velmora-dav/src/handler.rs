@@ -1641,10 +1641,20 @@ impl<U: Upstream, S: StatePort> Ctx<'_, U, S> {
                         .map_err(|e| from_s3(&e))?,
                 )
             };
-            let copied = match self.copy_tree(bucket, &members).await {
-                Ok(copied) => copied,
-                Err(failed) => return Ok(failed_members(bucket, &failed)),
-            };
+            let TreeCopy {
+                versions,
+                mut properties,
+                failed,
+            } = self.copy_tree(bucket, &members).await;
+            if let Some(tag) = &etag {
+                properties.push(copied_file_props(&src_path, &dst_path, tag));
+            }
+            if !failed.is_empty() {
+                if !properties.is_empty() {
+                    self.state(bucket, properties).await?;
+                }
+                return Ok(failed_members(bucket, &failed));
+            }
             // Materialize an implied or depth-zero folder before removing
             // anything from the old destination collection or the source.
             if src_coll && !members.iter().any(|(_, dest)| dest == &dst_path) {
@@ -1663,43 +1673,54 @@ impl<U: Upstream, S: StatePort> Ctx<'_, U, S> {
                 {
                     let code = from_s3::<U::Body>(&e).status;
                     if code != 412 {
-                        // A marker already exists.
+                        if !properties.is_empty() {
+                            self.state(bucket, properties).await?;
+                        }
                         return Ok(failed_members(bucket, &[(dst_path.clone(), code)]));
                     }
+                    // A marker already exists.
                 }
             }
             // Copies may replace same-named keys, but never remove an
             // obsolete destination member until all copies have succeeded.
             let (_, failed) = self.delete_matching_members(bucket, obsolete, 412).await;
             if !failed.is_empty() {
+                if !properties.is_empty() {
+                    self.state(bucket, properties).await?;
+                }
                 return Ok(failed_members(bucket, &failed));
             }
-            let failed = if !is_move {
-                Vec::new()
+            let (removed, failed) = if !is_move {
+                (Vec::new(), Vec::new())
             } else if let Some(etag) = &etag {
-                self.s3
+                if let Err(e) = self
+                    .s3
                     .delete(bucket, &src_path, Some(&Cond::Is(etag.clone())))
                     .await
-                    .map_err(|e| {
-                        let r = from_s3(&e);
-                        if r.status == 412 {
-                            status(409)
-                        } else {
-                            r
-                        }
-                    })?;
-                Vec::new()
+                {
+                    // The destination copy did succeed. Leave the source
+                    // state alone but give the copy its matching properties.
+                    self.state(bucket, properties).await?;
+                    let r = from_s3(&e);
+                    return Err(if r.status == 412 { status(409) } else { r });
+                }
+                (Vec::new(), Vec::new())
             } else {
-                self.delete_matching_members(bucket, copied, 409).await.1
+                self.delete_matching_members(bucket, versions, 409).await
             };
-            let mut ops = vec![Op::PropCopy {
-                from: src_path.clone(),
-                to: dst_path.clone(),
-                tree: src_coll && depth != Some(0),
-                // The bridge preserves the copied source's ETag on the destination.
-                from_etag: etag.clone(),
-                to_etag: etag,
-            }];
+            let mut ops = Vec::new();
+            if src_coll {
+                ops.push(Op::PropCopy {
+                    from: src_path.clone(),
+                    to: dst_path.clone(),
+                    tree: depth != Some(0),
+                    from_etag: None,
+                    to_etag: None,
+                });
+            }
+            // For a complete copy, the collection op clears the old
+            // destination tree first. File state is applied afterward.
+            ops.extend(properties);
             if is_move && failed.is_empty() {
                 ops.push(Op::PropDrop {
                     path: src_path.clone(),
@@ -1709,6 +1730,15 @@ impl<U: Upstream, S: StatePort> Ctx<'_, U, S> {
                     path: src_path.clone(),
                     tree: src_coll,
                 });
+            } else if is_move {
+                // Deleting a marker alone need not remove a collection:
+                // failed descendants can keep it visible. Drop state only
+                // for files whose conditional delete actually succeeded.
+                let files: Vec<_> = removed
+                    .into_iter()
+                    .filter(|key| !key.ends_with('/'))
+                    .collect();
+                ops.extend(forget(&files));
             }
             self.state(bucket, ops).await?;
             if !failed.is_empty() {
@@ -1727,30 +1757,34 @@ impl<U: Upstream, S: StatePort> Ctx<'_, U, S> {
 
     /// Copy the preflighted members. Let the current batch settle, but
     /// schedule no further copies after a failed batch.
-    async fn copy_tree(
-        &self,
-        bucket: &str,
-        members: &[(Entry, String)],
-    ) -> Result<Vec<(String, String)>, Vec<(String, u16)>> {
-        let mut copied = Vec::with_capacity(members.len());
+    async fn copy_tree(&self, bucket: &str, members: &[(Entry, String)]) -> TreeCopy {
+        let mut copied = TreeCopy::default();
         for batch in members.chunks(self.cfg().fan_out.max(1)) {
             let outcomes = join_all(batch.iter().map(|(src, dst)| {
                 let marker_etag = src.key.ends_with('/').then_some(src.etag.as_str());
                 self.s3.copy(bucket, &src.key, dst, None, marker_etag)
             }))
             .await;
-            let mut failed = Vec::new();
-            for ((src, _), result) in batch.iter().zip(outcomes) {
+            for ((src, dst), result) in batch.iter().zip(outcomes) {
                 match result {
-                    Ok(etag) => copied.push((src.key.clone(), etag)),
-                    Err(e) => failed.push((src.key.clone(), from_s3::<U::Body>(&e).status)),
+                    Ok(etag) => {
+                        if !src.key.ends_with('/') {
+                            copied
+                                .properties
+                                .push(copied_file_props(&src.key, dst, &etag));
+                        }
+                        copied.versions.push((src.key.clone(), etag));
+                    }
+                    Err(e) => copied
+                        .failed
+                        .push((src.key.clone(), from_s3::<U::Body>(&e).status)),
                 }
             }
-            if !failed.is_empty() {
-                return Err(failed);
+            if !copied.failed.is_empty() {
+                break;
             }
         }
-        Ok(copied)
+        copied
     }
 
     /// Delete only the listed or copied versions, files before markers.
@@ -2134,6 +2168,24 @@ fn forget(paths: &[String]) -> Vec<Op> {
             ]
         })
         .collect()
+}
+
+fn copied_file_props(from: &str, to: &str, etag: &str) -> Op {
+    // The bridge preserves the copied source's ETag on the destination.
+    Op::PropCopy {
+        from: from.to_owned(),
+        to: to.to_owned(),
+        tree: false,
+        from_etag: Some(etag.to_owned()),
+        to_etag: Some(etag.to_owned()),
+    }
+}
+
+#[derive(Default)]
+struct TreeCopy {
+    versions: Vec<(String, String)>,
+    properties: Vec<Op>,
+    failed: Vec<(String, u16)>,
 }
 
 fn hidden_tree_keys(entries: &[Entry]) -> HashSet<String> {

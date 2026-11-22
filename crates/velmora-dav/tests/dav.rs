@@ -804,6 +804,9 @@ async fn recursive_copy_failure_keeps_obsolete_destination_members() {
     for k in ["src/a", "src/b", "src/c", "dst/a", "dst/old"] {
         assert_eq!(w.s3_put(k, k.as_bytes()).await, 200);
     }
+    w.req("PROPPATCH", "/dav/src/a", &[], SET_X)
+        .await
+        .expect(207);
     w.storage_fault("PUT", "dst/b", support::StorageFault::Fail);
     let r = w
         .req("COPY", "/dav/src/", &[("destination", "/dav/dst/")], b"")
@@ -819,6 +822,29 @@ async fn recursive_copy_failure_keeps_obsolete_destination_members() {
     assert_eq!(r.hrefs().len(), 1);
     assert_eq!(w.s3_get("dst/old").await.1, b"dst/old");
     assert_eq!(w.s3_get("dst/a").await.1, b"src/a");
+    assert!(
+        has_x(&w, "/dav/dst/a").await,
+        "successful member lost its property"
+    );
+}
+
+#[tokio::test]
+async fn recursive_copy_does_not_store_stale_file_properties() {
+    let w = World::new().await;
+    assert_eq!(w.s3_put("src/a", b"old").await, 200);
+    w.req("PROPPATCH", "/dav/src/a", &[], SET_X)
+        .await
+        .expect(207);
+    assert_eq!(w.s3_put("src/a", b"new").await, 200);
+    w.req("COPY", "/dav/src/", &[("destination", "/dav/dst/")], b"")
+        .await
+        .expect(201);
+    assert_eq!(w.s3_get("dst/a").await.1, b"new");
+    assert_eq!(w.s3_put("dst/a", b"old").await, 200);
+    assert!(
+        !has_x(&w, "/dav/dst/a").await,
+        "stale source property was stored at the destination"
+    );
 }
 
 #[tokio::test]
@@ -827,6 +853,9 @@ async fn recursive_overwrite_preserves_an_obsolete_member_changed_during_copy() 
     for k in ["src/a", "dst/a", "dst/old", "dst/obsolete"] {
         assert_eq!(w.s3_put(k, k.as_bytes()).await, 200);
     }
+    w.req("PROPPATCH", "/dav/src/a", &[], SET_X)
+        .await
+        .expect(207);
     w.storage_fault(
         "PUT",
         "dst/a",
@@ -844,6 +873,54 @@ async fn recursive_overwrite_preserves_an_obsolete_member_changed_during_copy() 
     assert_eq!(w.s3_get("dst/old").await.1, b"updated");
     assert_eq!(w.s3_get("dst/a").await.1, b"src/a");
     assert_eq!(w.s3_get("dst/obsolete").await.0, 404);
+    assert!(
+        has_x(&w, "/dav/dst/a").await,
+        "successful member lost its property"
+    );
+}
+
+#[tokio::test]
+async fn partial_move_forgets_only_deleted_file_state() {
+    let w = World::new().await;
+    for key in ["src/a", "src/b"] {
+        assert_eq!(w.s3_put(key, b"old").await, 200);
+        w.req("PROPPATCH", &format!("/dav/{key}"), &[], SET_X)
+            .await
+            .expect(207);
+    }
+    let lock = w
+        .req("LOCK", "/dav/src/b", &[], &lockinfo("exclusive", "me"))
+        .await;
+    let token = lock.expect(200).header("lock-token").unwrap();
+    let ifh = format!("</dav/src/b> ({token})");
+    w.storage_fault(
+        "PUT",
+        "dst/a",
+        StorageFault::Replace {
+            key: "src/a".into(),
+            body: b"newer".to_vec(),
+        },
+    );
+    w.req(
+        "MOVE",
+        "/dav/src/",
+        &[("destination", "/dav/dst/"), ("if", &ifh)],
+        b"",
+    )
+    .await
+    .expect(207);
+    assert_eq!(w.s3_get("src/a").await.1, b"newer");
+    assert_eq!(w.s3_get("src/b").await.0, 404);
+    assert_eq!(w.s3_put("src/a", b"old").await, 200);
+    assert_eq!(w.s3_put("src/b", b"old").await, 200);
+    assert!(has_x(&w, "/dav/src/a").await);
+    assert!(
+        !has_x(&w, "/dav/src/b").await,
+        "deleted member kept its old property"
+    );
+    w.req("PUT", "/dav/src/b", &[], b"unlocked")
+        .await
+        .expect(204);
 }
 
 async fn move_preserves_updated_source(collection: bool) {

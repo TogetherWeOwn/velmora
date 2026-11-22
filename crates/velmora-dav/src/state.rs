@@ -200,8 +200,8 @@ pub enum Op {
         patches: Vec<Patch>,
     },
     /// Replaces the destination properties with rows for `from_etag`
-    /// stamped with `to_etag`. With `tree`, also copies descendant rows
-    /// without changing their stamps.
+    /// stamped with `to_etag`. With `tree`, also copies descendant
+    /// collection rows; copied files each carry their own ETag.
     PropCopy {
         from: String,
         to: String,
@@ -703,11 +703,12 @@ impl<S: Sql> Engine<'_, S> {
         if tree {
             match range_end(path) {
                 Some(end) => rows.extend(self.sql.exec(
-                    "SELECT path, ns, name, value_xml, etag FROM dav_props WHERE path > ?1 AND path < ?2",
+                    "SELECT path, ns, name, value_xml, etag FROM dav_props \
+                     WHERE path > ?1 AND path < ?2 AND etag IS NULL",
                     &[t(path), t(&end)],
                 )?),
                 None if path.is_empty() => rows.extend(self.sql.exec(
-                    "SELECT path, ns, name, value_xml, etag FROM dav_props WHERE path <> ''",
+                    "SELECT path, ns, name, value_xml, etag FROM dav_props WHERE path <> '' AND etag IS NULL",
                     &[],
                 )?),
                 None => {}
