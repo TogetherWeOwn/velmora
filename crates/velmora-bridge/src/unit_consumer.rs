@@ -13,7 +13,7 @@
 //! | `Closed` (restoring, provisioning) | acknowledged; the row stays in the unit's outbox, and its dispatcher sends it again once the unit opens |
 //! | `renew_needed` | renews through the unit client (`UnitClient::renew`), then runs the job once more. A failed renewal hands the message back with the queue's `retry_delay` |
 //! | `SyncNeeded` | syncs through the unit client (`UnitClient::sync`: both chains read and verified, the keys applied, then `sync`), then runs the job once more with the higher of the message's and the unit's new numbers. A failure hands the message back; the dead-letter queue pages once `max_retries` is reached |
-//! | `Unborn` | reads the tenant's verified head. Listed: dead-letter queue and a "catalogue lost" page (rule 7). Not listed: acknowledged, no page. A head read that fails or does not verify hands the message back and never acknowledges |
+//! | `Unborn` | reads the tenant's verified head. Listed by a `live` head: dead-letter queue and a "catalogue lost" page (rule 7). Listed by a `provisioning` head: handed back, no page (an unborn root unit is expected there, AM-58); by a shredding one: acknowledged, no page. Not listed: acknowledged, no page. A head read that fails or does not verify hands the message back and never acknowledges |
 //! | `AccountProblem` while the tenant is `shredding` or `shredded` | acknowledged with a log line, no page (the head says the state; a failed read hands back) |
 //! | any other refusal | dead-letter queue and page |
 //!
@@ -60,6 +60,7 @@
 //! reads or writes a catalogue itself.
 
 use crate::config::Maintenance;
+use crate::directory::record::Lifecycle;
 use crate::jobmsg::{UnitJob, REFUSED_RETRY_DELAY_SECS};
 use crate::ports::{BlobStore, Clock};
 use crate::tenant_catalog::UnitRefusal;
@@ -223,9 +224,18 @@ fn higher(a: Seqs, b: Seqs) -> Seqs {
 }
 
 /// The `Unborn` row: the tenant's verified head decides (rule 7).
+///
+/// Rule 7 pages only for a `live` tenant (AM-58): while the head is
+/// `provisioning`, an unborn root unit is expected, and the message is
+/// handed back with no page; a shred's unit takes no job, and the message
+/// is acknowledged with no page.
 async fn unborn<H: TenantHeads>(heads: &H, unit: &UnitName) -> (Delivery, Line) {
     match read_head(heads, &unit.tenant).await {
-        Ok(Some(head)) if head.lists(unit) => (Delivery::DEAD_LETTER, line("catalogue_lost", true)),
+        Ok(Some(head)) if head.lists(unit) => match head.lifecycle {
+            Lifecycle::Live => (Delivery::DEAD_LETTER, line("catalogue_lost", true)),
+            Lifecycle::Provisioning => (Delivery::HandBack, line("unborn_provisioning", false)),
+            Lifecycle::Shredding | Lifecycle::Shredded => (Delivery::Ack, line("shredding", false)),
+        },
         Ok(_) => (Delivery::Ack, line("unborn_unlisted", false)),
         Err(_) => (Delivery::HandBack, line("unborn_head_unread", false)),
     }
@@ -859,6 +869,17 @@ mod tests {
                 Heads::of(Lifecycle::Live, &[1]),
                 Delivery::Ack,
                 ("unborn_unlisted", false),
+            ),
+            // Rule 7 pages only for a live tenant (AM-58).
+            (
+                Heads::of(Lifecycle::Provisioning, &[0]),
+                Delivery::HandBack,
+                ("unborn_provisioning", false),
+            ),
+            (
+                Heads::of(Lifecycle::Shredding, &[0]),
+                Delivery::Ack,
+                ("shredding", false),
             ),
             // No chain: no record lists the unit.
             (Heads::none(), Delivery::Ack, ("unborn_unlisted", false)),
