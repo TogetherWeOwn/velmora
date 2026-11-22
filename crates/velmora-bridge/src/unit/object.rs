@@ -687,6 +687,17 @@ impl<S: UnitSql> Unit<S> {
             }
         );
         if !stamp_check && self.lease_at(now)? == LeaseAdmit::RenewNeeded {
+            // AM-63: the S3 path's first call, an unauthenticated
+            // `key_row`, is still answered (read-only, marked
+            // `lease_expired`), so that a request whose signature verifies
+            // can renew as a signed call. Any other call, an authenticated
+            // `key_row` included, waits for the renewal.
+            if matches!(call.op, UnitOp::KeyRow { .. })
+                && call.kind == CallKind::Request
+                && !call.authenticated
+            {
+                return self.key_row_expired(call, &head);
+            }
             return Ok(UnitAnswer::RenewNeeded {
                 seqs: head.seqs,
                 why: None,

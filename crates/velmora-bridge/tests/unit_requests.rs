@@ -320,6 +320,74 @@ async fn an_upload_id_is_bound_to_its_bucket_and_key_and_publishes_whole() {
     assert!(rig.live(&beta, "big").await.is_none());
 }
 
+/// Main's #172 take-back on a unit: a PUT whose job the queue refuses
+/// takes its row's mark back with one `unmark_sent` request call, so the
+/// dispatcher sends the row; one the queue takes stays marked.
+#[tokio::test(flavor = "current_thread")]
+async fn a_refused_send_takes_the_mark_back_on_the_unit() {
+    let rig = unit_rig();
+    let (bucket, signer) = rig.standard(BUCKET).await;
+    rig.bridge.jobs.fail.set(true);
+    let before = calls(&rig);
+    rig.put(&signer, BUCKET, "k", b"payload").await.expect(200);
+    let refused = calls(&rig) - before;
+    assert!(rig.live(&bucket, "k").await.is_some());
+    assert_eq!(rig.count("outbox"), 1);
+    assert_eq!(rig.count("outbox WHERE sent_at IS NULL"), 1);
+
+    rig.bridge.jobs.fail.set(false);
+    let before = calls(&rig);
+    rig.put(&signer, BUCKET, "sent", b"payload")
+        .await
+        .expect(200);
+    let taken = calls(&rig) - before;
+    assert_eq!(rig.count("outbox WHERE sent_at = next_at"), 1);
+    assert_eq!(rig.count("outbox WHERE sent_at IS NULL"), 1);
+    // The same PUT, and one call more: the take-back went to the unit.
+    assert_eq!(refused, taken + 1, "{refused} {taken}");
+}
+
+/// `upload_state` on a unit: the part upload and the Complete read the
+/// state alone; an aborted upload's parts are refused `NoSuchUpload`.
+#[tokio::test(flavor = "current_thread")]
+async fn the_upload_state_is_read_on_the_unit() {
+    let rig = unit_rig();
+    let (bucket, signer) = rig.standard(BUCKET).await;
+    let id = create_upload(&rig, &signer, BUCKET, "big").await;
+    let target = UploadTarget {
+        bucket: &bucket.id,
+        key: "big",
+        id: &UploadId::new(&id),
+    };
+    let route = rig.bridge.catalog.unit.as_ref().unwrap();
+    assert_eq!(
+        route.client.upload_state(&target).await.unwrap(),
+        Some(UploadState::Open)
+    );
+    rig.call(
+        &signer,
+        Method::Delete,
+        &path(BUCKET, "big"),
+        &[("uploadId", &id)],
+        &[],
+        b"",
+    )
+    .await
+    .expect(204);
+    assert_ne!(
+        route.client.upload_state(&target).await.unwrap(),
+        Some(UploadState::Open)
+    );
+    upload_part(&rig, &signer, BUCKET, "big", &id, 1, b"late")
+        .await
+        .expect_error(404, "NoSuchUpload");
+    let other = UploadTarget {
+        key: "other",
+        ..target
+    };
+    assert_eq!(route.client.upload_state(&other).await.unwrap(), None);
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn a_complete_whose_answer_is_lost_is_settled_by_the_fence() {
     let rig = unit_rig();

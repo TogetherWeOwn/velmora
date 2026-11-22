@@ -2026,6 +2026,28 @@
       "op": {
         "call": {
           "bucket": "b_00000000000000f1",
+          "key": "k",
+          "m": "upload_state",
+          "upload": "u_00000000000000f1"
+        },
+        "op": "request"
+      },
+      "seqs": {
+        "keys_seq": 3,
+        "state_seq": 7
+      }
+    },
+    {
+      "authenticated": true,
+      "kind": "request",
+      "listed": true,
+      "name": {
+        "tenant": "t_00000000000000f1",
+        "unit": 0
+      },
+      "op": {
+        "call": {
+          "bucket": "b_00000000000000f1",
           "m": "list_uploads",
           "q": {
             "after": [
@@ -3260,6 +3282,35 @@
           "m": "abort_upload",
           "now": 1000,
           "upload": "u_00000000000000f1"
+        },
+        "op": "request"
+      },
+      "seqs": {
+        "keys_seq": 3,
+        "state_seq": 7
+      }
+    },
+    {
+      "authenticated": true,
+      "kind": "request",
+      "listed": true,
+      "name": {
+        "tenant": "t_00000000000000f1",
+        "unit": 0
+      },
+      "op": {
+        "call": {
+          "jobs": [
+            {
+              "extent": "x_000000000000000000000000f1",
+              "generation": "g_0019a00000000f1f1f1f1f1f1f1f1",
+              "stage": "post",
+              "t": "extent",
+              "v": 1
+            }
+          ],
+          "m": "unmark_sent",
+          "mark": 1000
         },
         "op": "request"
       },

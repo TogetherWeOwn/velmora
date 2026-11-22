@@ -304,6 +304,14 @@ impl<P: UnitPort> RequestClient<P> {
         })
         .await
     }
+    pub async fn upload_state(&self, t: &UploadTarget<'_>) -> Result<Option<UploadState>> {
+        self.call(RequestCall::upload_state {
+            bucket: t.bucket.clone(),
+            key: t.key.into(),
+            upload: t.id.clone(),
+        })
+        .await
+    }
     pub async fn list_uploads(
         &self,
         bucket: &BucketId,
@@ -618,6 +626,13 @@ impl<P: UnitPort> RequestClient<P> {
                 }
             }
         }
+    }
+    pub async fn unmark_sent(&self, jobs: &[Job], mark: UnixMs) -> Result<u64> {
+        self.call(RequestCall::unmark_sent {
+            jobs: jobs.to_vec(),
+            mark,
+        })
+        .await
     }
     pub async fn abort_upload(
         &self,

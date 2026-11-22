@@ -212,6 +212,12 @@ pub enum RequestCall {
         key: String,
         upload: UploadId,
     },
+    /// The upload's state alone, without its parts (main's #172 method).
+    upload_state {
+        bucket: BucketId,
+        key: String,
+        upload: UploadId,
+    },
     list_uploads {
         bucket: BucketId,
         q: UploadListQuery,
@@ -350,6 +356,14 @@ pub enum RequestCall {
         upload: UploadId,
         now: UnixMs,
     },
+    // --- the outbox (write)
+    /// The marks of jobs the Worker could not send, taken back (main's
+    /// #172 method; the PUT path's take-back after a failed send). It
+    /// changes `next_at` of rows the unit holds and adds none.
+    unmark_sent {
+        jobs: Vec<Job>,
+        mark: UnixMs,
+    },
     /// Settles a `complete_upload` whose answer was lost: moves the
     /// upload to its next revision while it is still open at `revision`,
     /// and answers whether that applied (then the Complete had not, and
@@ -388,6 +402,7 @@ impl RequestCall {
             RequestCall::touch_read { .. } => "touch_read",
             RequestCall::record_cache_fill { .. } => "record_cache_fill",
             RequestCall::upload { .. } => "upload",
+            RequestCall::upload_state { .. } => "upload_state",
             RequestCall::list_uploads { .. } => "list_uploads",
             RequestCall::upload_extents { .. } => "upload_extents",
             RequestCall::upload_extents_held { .. } => "upload_extents_held",
@@ -417,6 +432,7 @@ impl RequestCall {
             RequestCall::put_upload_part_sliced { .. } => "put_upload_part_sliced",
             RequestCall::complete_upload { .. } => "complete_upload",
             RequestCall::abort_upload { .. } => "abort_upload",
+            RequestCall::unmark_sent { .. } => "unmark_sent",
             RequestCall::fence_upload { .. } => "fence_upload",
         }
     }
@@ -446,6 +462,7 @@ impl RequestCall {
             | RequestCall::touch_read { .. }
             | RequestCall::record_cache_fill { .. }
             | RequestCall::upload { .. }
+            | RequestCall::upload_state { .. }
             | RequestCall::list_uploads { .. }
             | RequestCall::upload_extents { .. }
             | RequestCall::upload_extents_held { .. }
@@ -475,6 +492,7 @@ impl RequestCall {
             | RequestCall::put_upload_part_sliced { .. }
             | RequestCall::complete_upload { .. }
             | RequestCall::abort_upload { .. }
+            | RequestCall::unmark_sent { .. }
             | RequestCall::fence_upload { .. } => false,
         }
     }
@@ -557,6 +575,7 @@ impl RequestCall {
             | RequestCall::unpublished_floor { key: k, .. }
             | RequestCall::object_status { key: k, .. }
             | RequestCall::upload { key: k, .. }
+            | RequestCall::upload_state { key: k, .. }
             | RequestCall::raise_floor { key: k, .. }
             | RequestCall::settle_floor { key: k, .. }
             | RequestCall::delete_object_before { key: k, .. }
@@ -595,6 +614,8 @@ impl RequestCall {
             }
             RequestCall::copy_generation { c, .. } => key(&c.generation.key) && key(&c.source_key),
             RequestCall::open_intents { extents: x, .. } => extents(x.len()),
+            // One job per extent of one publication.
+            RequestCall::unmark_sent { jobs, .. } => extents(jobs.len()),
             RequestCall::intents_generation { slices, .. } => *slices <= MAX_EXTENTS,
             RequestCall::put_upload_part_sliced {
                 key: k, extents: x, ..
@@ -691,6 +712,11 @@ impl RequestCall {
                 key,
                 upload,
             } => answer(Catalog::upload(cat, &target(&bucket, &key, &upload)).await?),
+            RequestCall::upload_state {
+                bucket,
+                key,
+                upload,
+            } => answer(Catalog::upload_state(cat, &target(&bucket, &key, &upload)).await?),
             RequestCall::list_uploads { bucket, q } => {
                 answer(Catalog::list_uploads(cat, &bucket, &q).await?)
             }
@@ -855,6 +881,9 @@ impl RequestCall {
                 upload,
                 now,
             } => answer(Catalog::abort_upload(cat, &target(&bucket, &key, &upload), now).await?),
+            RequestCall::unmark_sent { jobs, mark } => {
+                answer(Catalog::unmark_sent(cat, &jobs, mark).await?)
+            }
             RequestCall::fence_upload {
                 bucket,
                 key,

@@ -45,9 +45,9 @@ use velmora_bridge::unit::{
 use velmora_bridge::unit_lease::lease::{LeaseRefusal, Proven};
 use velmora_bridge::{
     BucketId, CommitGeneration, CompleteUpload, CopyGeneration, ExtentId, ExtentPlacement,
-    ExtentRow, ExtentState, GenerationId, GenerationRow, GenerationState, Lease, ListQuery,
+    ExtentRow, ExtentState, GenerationId, GenerationRow, GenerationState, Job, Lease, ListQuery,
     OutboxStage, Precondition, SafetyState, UnixMs, UploadId, UploadListQuery, UploadPartRow,
-    UploadRow, UploadState, WriteId,
+    UploadRow, UploadState, WriteId, JOB_VERSION,
 };
 
 const GOLDEN: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/golden/unit-wire.json");
@@ -142,6 +142,7 @@ fn request_kind(c: &RequestCall) -> &'static str {
         | RequestCall::touch_read { .. }
         | RequestCall::record_cache_fill { .. }
         | RequestCall::upload { .. }
+        | RequestCall::upload_state { .. }
         | RequestCall::list_uploads { .. }
         | RequestCall::upload_extents { .. }
         | RequestCall::upload_extents_held { .. }
@@ -171,6 +172,7 @@ fn request_kind(c: &RequestCall) -> &'static str {
         | RequestCall::put_upload_part_sliced { .. }
         | RequestCall::complete_upload { .. }
         | RequestCall::abort_upload { .. }
+        | RequestCall::unmark_sent { .. }
         | RequestCall::fence_upload { .. } => c.name(),
     }
 }
@@ -864,6 +866,11 @@ fn requests() -> Vec<RequestCall> {
             key: k(),
             upload: upload_id(),
         },
+        RequestCall::upload_state {
+            bucket: b(),
+            key: k(),
+            upload: upload_id(),
+        },
         RequestCall::list_uploads {
             bucket: b(),
             q: UploadListQuery {
@@ -1027,6 +1034,15 @@ fn requests() -> Vec<RequestCall> {
             key: k(),
             upload: upload_id(),
             now: UnixMs(1_000),
+        },
+        RequestCall::unmark_sent {
+            jobs: vec![Job::Extent {
+                v: JOB_VERSION,
+                extent: x(),
+                generation: gen_id(),
+                stage: OutboxStage::Post,
+            }],
+            mark: UnixMs(1_000),
         },
         RequestCall::fence_upload {
             bucket: b(),
@@ -1267,7 +1283,7 @@ fn every_variant_has_a_sample() {
     let ops: std::collections::BTreeSet<_> = ops().iter().map(op_kind).collect();
     assert_eq!(ops.len(), 30, "{ops:?}");
     let requests: std::collections::BTreeSet<_> = requests().iter().map(request_kind).collect();
-    assert_eq!(requests.len(), 51, "{requests:?}");
+    assert_eq!(requests.len(), 53, "{requests:?}");
     let readers: std::collections::BTreeSet<_> = ops_readers().into_iter().collect();
     assert_eq!(readers.len(), 2, "both readers have a sample");
     // The variants that carry data, each with a sample (exhaustive).

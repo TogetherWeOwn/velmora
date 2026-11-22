@@ -8,6 +8,7 @@ use serde_json::{json, Value};
 use velmora_bridge::testkit::{FixedClock, MemBlobStore, RusqliteSql};
 use velmora_bridge::unit::jobcall::JobCall;
 use velmora_bridge::unit::keys::{Access, KeyEntry, KeyGrant, KeyKind, SubjectStatus};
+use velmora_bridge::unit::request::RequestCall;
 use velmora_bridge::unit::restore::lease_view;
 use velmora_bridge::unit::{
     BirthKind, BirthToken, CallKind, Refused, Seqs, SyncHead, TenantId, TenantState, Unit,
@@ -19,7 +20,7 @@ use velmora_bridge::unit_lease::lease::{LeaseRefusal, LeaseRules, Proven};
 use velmora_bridge::unit_lease::renewal::{prove, ChainNames, Proof, UnitView};
 use velmora_bridge::unit_lease::store;
 use velmora_bridge::unit_lease::UnitStampId;
-use velmora_bridge::{BlobMeta, BlobStore, BucketId, Clock, ExtentId, UnixMs};
+use velmora_bridge::{BlobMeta, BlobStore, BucketId, Clock, ExtentId, UnixMs, UploadId};
 
 const NOW: UnixMs = UnixMs(1_795_000_000_000);
 const T: i64 = LeaseRules::DEFAULT.term_ms;
@@ -299,9 +300,10 @@ fn an_expired_lease_refuses_every_call_but_the_workers_and_writes_nothing() {
         (CallKind::Request, true, UnitOp::Ping {}),
         (CallKind::Request, true, read_plan()),
         (CallKind::Request, false, read_plan()),
+        // AM-63: only the unauthenticated `key_row` is answered (below).
         (
             CallKind::Request,
-            false,
+            true,
             UnitOp::KeyRow {
                 access_key_id: K.into(),
                 presigned: None,
@@ -360,6 +362,83 @@ fn an_expired_lease_refuses_every_call_but_the_workers_and_writes_nothing() {
         NOW,
     );
     assert!(renew_needed(None)(&a), "{a:?}");
+}
+
+fn key_row(u: &Unit<RusqliteSql>, kind: CallKind, authenticated: bool, now: UnixMs) -> UnitAnswer {
+    let seqs = u.head().unwrap().seqs;
+    u.handle(
+        &call(
+            kind,
+            Some(seqs),
+            authenticated,
+            UnitOp::KeyRow {
+                access_key_id: K.into(),
+                presigned: None,
+            },
+        ),
+        now,
+    )
+}
+
+/// AM-63: with an expired lease the unit still answers the S3 path's
+/// first call, an unauthenticated `key_row`, read-only and marked
+/// `lease_expired`, so a request whose signature verifies can renew as a
+/// signed call. Nothing else is served: an authenticated `key_row` and
+/// every write wait for the renewal.
+#[test]
+fn an_expired_lease_answers_the_unauthenticated_key_row_marked_and_serves_nothing_else() {
+    let u = born();
+    assert!(matches!(
+        worker(
+            &u,
+            UnitOp::ApplyKeys {
+                from_seq: 0,
+                entries: vec![principal(1).into(), key(K, 2).into()],
+                answers: vec![],
+            },
+            NOW
+        ),
+        UnitAnswer::Ok { .. }
+    ));
+    let before = changes(&u);
+    let a = key_row(&u, CallKind::Request, false, NOW);
+    let UnitAnswer::Ok { body, .. } = &a else {
+        panic!("{a:?}")
+    };
+    assert_eq!(body["lease_expired"], json!(true), "{body}");
+    assert_eq!(body["key"]["access_key_id"], json!(K), "{body}");
+    assert_eq!(body["state"]["tenant_state"], json!("active"), "{body}");
+    assert_eq!(changes(&u), before, "read-only");
+
+    // Signed, or not a request: the renewal first.
+    assert!(renew_needed(None)(&key_row(
+        &u,
+        CallKind::Request,
+        true,
+        NOW
+    )));
+    assert!(renew_needed(None)(&key_row(&u, CallKind::Job, false, NOW)));
+    // A write in the same state is refused and writes nothing.
+    let seqs = u.head().unwrap().seqs;
+    let write = UnitOp::Request {
+        call: Box::new(RequestCall::abort_upload {
+            bucket: BucketId::new(B1),
+            key: "k".into(),
+            upload: UploadId::new("u_00000000000000e1"),
+            now: NOW,
+        }),
+    };
+    let a = u.handle(&call(CallKind::Request, Some(seqs), true, write), NOW);
+    assert!(renew_needed(None)(&a), "{a:?}");
+    assert_eq!(changes(&u), before, "nothing written");
+
+    // After a renewal the same read is served as usual, not marked.
+    assert!(matches!(renew(&u, NOW), UnitAnswer::Ok { .. }));
+    let a = key_row(&u, CallKind::Request, false, NOW);
+    let UnitAnswer::Ok { body, .. } = &a else {
+        panic!("{a:?}")
+    };
+    assert_eq!(body["lease_expired"], json!(false), "{body}");
 }
 
 #[test]

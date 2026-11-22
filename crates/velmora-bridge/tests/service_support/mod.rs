@@ -636,7 +636,10 @@ impl Catalog for TestCatalog {
         }
     }
     async fn upload_state(&self, t: &UploadTarget<'_>) -> Result<Option<UploadState>> {
-        self.cat.upload_state(t).await
+        match &self.unit {
+            Some(route) => route.client.upload_state(t).await,
+            None => self.cat.upload_state(t).await,
+        }
     }
     async fn list_uploads(
         &self,
@@ -875,7 +878,10 @@ impl Catalog for TestCatalog {
         self.cat.mark_sent(extents, now).await
     }
     async fn unmark_sent(&self, jobs: &[Job], mark: UnixMs) -> Result<u64> {
-        self.cat.unmark_sent(jobs, mark).await
+        match &self.unit {
+            Some(route) => route.client.unmark_sent(jobs, mark).await,
+            None => self.cat.unmark_sent(jobs, mark).await,
+        }
     }
     async fn bury_exhausted(&self, max_attempts: u32, now: UnixMs) -> Result<u64> {
         self.cat.bury_exhausted(max_attempts, now).await
