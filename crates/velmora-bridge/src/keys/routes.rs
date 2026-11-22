@@ -1,8 +1,10 @@
 //! Route records `m/kr/<akid>`: which tenant an access key id belongs to,
 //! put once, before the key's chain record.
 //!
-//! A route never changes, so it can live in a put-once record
-//! beside the directory's `key_routes` row. A Worker whose directory read
+//! A route changes only in the owner move and its undo, which replace the
+//! record conditioned on the ETag they read ([`replace_route`]), so it
+//! lives in a record beside the directory's `key_routes` row that is
+//! otherwise put once. A Worker whose directory read
 //! **failed** reads the route record instead; the unit still decides the
 //! key's status. It is never read on
 //! a directory answer of "no such key", and a missing record is never a
@@ -17,8 +19,8 @@ use velmora::rng::FillRandom;
 use super::record::SubjectKind;
 use crate::crypto::scheme2::{parse_control, seal_control, ControlOwner, ControlSealer, TenantId};
 use crate::ports::Kek;
-use crate::records::RecordStore;
-use crate::recovery::valid_key_id;
+use crate::records::{RecordStore, Tagged};
+use crate::recovery::{valid_key_id, DEFAULT_TENANT};
 use crate::types::{BridgeError, Result};
 
 /// The directory of route records.
@@ -71,17 +73,16 @@ pub async fn put_route<S: RecordStore, K: Kek, R: FillRandom>(
         return Err(ERR_ROUTE);
     }
     let name = route_name(akid);
-    let body = serde_json::to_vec(&RouteBody {
-        v: 1,
-        route: Route {
+    let sealed = seal_route(
+        kek,
+        &Route {
             access_key_id: akid.to_owned(),
             tenant: tenant.as_str().to_owned(),
             kind,
             created_at: at,
         },
-    })
-    .map_err(|_| ERR_ROUTE)?;
-    let sealed = seal_control(kek, &name, &ControlSealer::Global, &body, None, rng)?;
+        rng,
+    )?;
     let put = store.put_if_absent(&name, sealed).await;
     if let Ok(true) = put {
         return Ok(RoutePut::Ours);
@@ -105,17 +106,103 @@ pub async fn read_route<S: RecordStore, K: Kek>(
     if !valid_key_id(akid) {
         return Ok(None);
     }
-    let name = route_name(akid);
-    let Some(bytes) = store.get(&name).await? else {
+    let Some(bytes) = store.get(&route_name(akid)).await? else {
         return Ok(None);
     };
-    let opened = parse_control(&bytes)?.open_door(kek, &name, ControlOwner::Global)?;
-    let body: RouteBody = serde_json::from_slice(opened.door()).map_err(|_| ERR_ROUTE)?;
-    if body.v != 1
-        || body.route.access_key_id != akid
-        || TenantId::parse(&body.route.tenant).is_err()
-    {
+    open_route(kek, akid, &bytes).map(Some)
+}
+
+/// How many times [`replace_route`] reads and replaces before it gives up
+/// on a record that keeps changing under it.
+pub const REPLACE_TRIES: u32 = 4;
+
+/// The conditional replace of the owner move and its undo (ADR addendum
+/// §2.2, DS1 §3.4 step 8(c) and §3.7): the route record of `akid` that
+/// names `from` is replaced, conditioned on the ETag it was read with, by
+/// one that names `to` with `kind` (the key's directory row; a later
+/// window's keymap may change it) and keeps the record's `created_at`.
+/// `from` and `to` are tenant ids as the record stores them: a managed
+/// tenant's, or tenant 0's ([`DEFAULT_TENANT`]), which the undo and the
+/// give-up put routes back to.
+///
+/// `Ok(true)`: the record names `to` with `kind`, replaced by this call or
+/// found so (a retry, or a record that names `to` with another kind is
+/// replaced to `kind`). `Ok(false)`: no record exists, or it names a
+/// third tenant; nothing is written. A record that does not open, or
+/// that names another key id, is an `Err`, and nothing is written. A
+/// replace whose answer was lost is read back: the stored record decides.
+/// A record that changes under every one of [`REPLACE_TRIES`] tries is an
+/// `Err`.
+pub async fn replace_route<S: RecordStore, K: Kek, R: FillRandom>(
+    store: &S,
+    kek: &K,
+    akid: &str,
+    from: &str,
+    to: &str,
+    kind: SubjectKind,
+    rng: &mut R,
+) -> Result<bool> {
+    if !valid_key_id(akid) || !kind.has_secret() || !route_tenant(from) || !route_tenant(to) {
         return Err(ERR_ROUTE);
     }
-    Ok(Some(body.route))
+    let name = route_name(akid);
+    let mut last_err = None;
+    for _ in 0..REPLACE_TRIES {
+        let Some(Tagged { bytes, etag }) = store.get_tagged(&name).await? else {
+            return Ok(false);
+        };
+        let route = open_route(kek, akid, &bytes)?;
+        if route.tenant == to && route.kind == kind {
+            return Ok(true);
+        }
+        if route.tenant != to && route.tenant != from {
+            return Ok(false);
+        }
+        let sealed = seal_route(
+            kek,
+            &Route {
+                access_key_id: akid.to_owned(),
+                tenant: to.to_owned(),
+                kind,
+                created_at: route.created_at,
+            },
+            rng,
+        )?;
+        match store.replace_if_match(&name, &etag, sealed).await {
+            Ok(true) => return Ok(true),
+            // Lost to another write, or the answer was lost: read again.
+            Ok(false) => {}
+            Err(e) => last_err = Some(e),
+        }
+    }
+    Err(last_err.unwrap_or(ERR_ROUTE_CHANGING))
+}
+
+const ERR_ROUTE_CHANGING: BridgeError = BridgeError::Invalid("route record keeps changing");
+
+fn seal_route<K: Kek, R: FillRandom>(kek: &K, route: &Route, rng: &mut R) -> Result<Vec<u8>> {
+    let name = route_name(&route.access_key_id);
+    let body = serde_json::to_vec(&RouteBody {
+        v: 1,
+        route: route.clone(),
+    })
+    .map_err(|_| ERR_ROUTE)?;
+    seal_control(kek, &name, &ControlSealer::Global, &body, None, rng)
+}
+
+fn open_route<K: Kek>(kek: &K, akid: &str, bytes: &[u8]) -> Result<Route> {
+    let name = route_name(akid);
+    let opened = parse_control(bytes)?.open_door(kek, &name, ControlOwner::Global)?;
+    let body: RouteBody = serde_json::from_slice(opened.door()).map_err(|_| ERR_ROUTE)?;
+    if body.v != 1 || body.route.access_key_id != akid || !route_tenant(&body.route.tenant) {
+        return Err(ERR_ROUTE);
+    }
+    Ok(body.route)
+}
+
+/// A tenant a route may name: a managed tenant, or tenant 0 (only after
+/// the undo or a give-up put it back; a key is never created with a route
+/// to tenant 0).
+fn route_tenant(tenant: &str) -> bool {
+    tenant == DEFAULT_TENANT || TenantId::parse(tenant).is_ok()
 }
