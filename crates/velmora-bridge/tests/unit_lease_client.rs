@@ -85,6 +85,8 @@ struct Obj<'a> {
     raise_after_each_read: Cell<bool>,
     /// Calls of this op are answered with this, not by the unit.
     answer_of: RefCell<Option<(&'static str, UnitAnswer)>>,
+    /// The next call of this op is answered with this, once.
+    answer_once: RefCell<Option<(&'static str, UnitAnswer)>>,
     safety: &'a MemBlobStore,
 }
 
@@ -109,6 +111,19 @@ impl UnitReplies for Obj<'_> {
         self.log
             .borrow_mut()
             .push((call.kind, call.listed, op_name(&call.op)));
+        let once = self
+            .answer_once
+            .borrow()
+            .as_ref()
+            .is_some_and(|(op, _)| *op == op_name(&call.op));
+        if once {
+            let (_, answer) = self.answer_once.borrow_mut().take().unwrap();
+            return Ok(UnitReply {
+                answer,
+                lease_left_ms: 0,
+                revoked: None,
+            });
+        }
         if let Some((op, answer)) = self.answer_of.borrow().as_ref() {
             if *op == op_name(&call.op) {
                 return Ok(UnitReply {
@@ -374,7 +389,8 @@ fn create() -> Change {
 fn limits(rig: &Rig<'_>) -> Change {
     Change::SetLimits {
         base_seq: rig.head_seq(),
-        limits: BTreeMap::from([("bytes".to_string(), 1 << 30)]),
+        // A new value each time: the same one again changes nothing.
+        limits: BTreeMap::from([("bytes".to_string(), (1 << 30) + rig.head_seq())]),
         rate_json: None,
     }
 }
@@ -469,6 +485,7 @@ fn with_rig<R>(f: impl FnOnce(&Rig<'_>) -> R) -> R {
             lose_answer_of: Cell::new(None),
             raise_after_each_read: Cell::new(false),
             answer_of: RefCell::new(None),
+            answer_once: RefCell::new(None),
             safety: &safety,
         },
     };
@@ -857,6 +874,7 @@ fn an_unborn_unit_is_reported() {
             lose_answer_of: Cell::new(None),
             raise_after_each_read: Cell::new(false),
             answer_of: RefCell::new(None),
+            answer_once: RefCell::new(None),
             safety: &safety,
         },
     };
@@ -952,10 +970,15 @@ fn unsigned_calls_space_failed_renewals_with_a_backoff() {
         rig.clock.advance_ms(60_000);
         unsigned();
         assert_eq!(reads() - before, 3);
-        // A signed call tries every time.
-        for _ in 0..2 {
-            called(&rig.client(), request(rig.unit_seqs(), UnitOp::Ping {}));
-        }
+        // A signed call waits at most 1 s after a failure (review LOW 1):
+        // two at once make one attempt, one a second later another.
+        let signed = || called(&rig.client(), request(rig.unit_seqs(), UnitOp::Ping {}));
+        rig.clock.advance_ms(1_000);
+        signed();
+        signed();
+        assert_eq!(reads() - before, 4);
+        rig.clock.advance_ms(1_000);
+        signed();
         assert_eq!(reads() - before, 5);
     });
 }
@@ -1167,7 +1190,11 @@ fn an_unexpected_answer_dead_letters_the_job_and_pages() {
             rig.client()
                 .run_job(UnitJob::Renew { at: NOW }, rig.unit_seqs()),
         );
-        assert_eq!((r.delivery, r.pages.len()), (Delivery::Ack, 0), "{r:?}");
+        assert_eq!(
+            (r.delivery, r.code, r.pages.len()),
+            (Delivery::Ack, "shredding", 0),
+            "{r:?}"
+        );
         let r = block_on(
             rig.client()
                 .run_job(UnitJob::StampRaise { at: NOW }, rig.unit_seqs()),
@@ -1181,6 +1208,101 @@ fn an_unexpected_answer_dead_letters_the_job_and_pages() {
                 .run_job(UnitJob::Renew { at: NOW }, rig.unit_seqs()),
         );
         assert_eq!(r.delivery, Delivery::HandBack);
+    });
+}
+
+/// The arms the first review found untested (review M2): each one's
+/// outcome.
+#[test]
+fn every_arm_of_the_jobs_and_the_sync_has_its_outcome() {
+    use velmora_bridge::unit::Refused;
+    with_fresh(|rig| {
+        let c = rig.client();
+        // A key apply answered `keys_behind`: read again, then applied.
+        rig.key_record(3, key(GONE, 3, SubjectStatus::Active));
+        *rig.obj.answer_once.borrow_mut() = Some((
+            "apply_keys",
+            UnitAnswer::KeysBehind {
+                seqs: rig.unit_seqs(),
+            },
+        ));
+        let s = block_on(c.sync(rig.unit_seqs())).unwrap();
+        assert!(
+            matches!(s, Synced::Synced { seqs } if seqs.keys_seq == 3),
+            "{s:?}"
+        );
+        // A `sync` refused as stale (another sync landed): the unit's
+        // numbers are read again, then it syncs.
+        rig.write(limits(rig), Actor::Operator);
+        *rig.obj.answer_once.borrow_mut() = Some((
+            "sync",
+            UnitAnswer::Refused {
+                reason: Refused::StaleSync,
+                alarm: false,
+            },
+        ));
+        let s = block_on(c.sync(rig.unit_seqs())).unwrap();
+        assert!(
+            matches!(s, Synced::Synced { seqs } if seqs.state_seq == 5),
+            "{s:?}"
+        );
+        // A raise job with numbers above the unit's: synced, then raised.
+        let mut ahead = rig.unit_seqs();
+        rig.write(limits(rig), Actor::Operator);
+        ahead.state_seq += 1;
+        let r = block_on(c.run_job(UnitJob::StampRaise { at: NOW }, ahead));
+        assert_eq!((r.delivery, r.code), (Delivery::Ack, "raised"), "{r:?}");
+        assert_eq!(rig.unit_seqs().state_seq, 6);
+    });
+    // A renew job whose renewal is refused for good: acknowledged, paged.
+    with_fresh(|rig| {
+        rig.key_record(3, key(K, 3, SubjectStatus::Revoked));
+        block_on(rig.client().sync(rig.unit_seqs())).unwrap();
+        rig.clock.advance_ms(T + 1);
+        let r = block_on(
+            rig.client()
+                .run_job(UnitJob::Renew { at: NOW }, rig.unit_seqs()),
+        );
+        assert_eq!(
+            (r.delivery, r.code),
+            (Delivery::Ack, "renew_refused"),
+            "{r:?}"
+        );
+        assert_eq!(r.pages, [Page::RevocationsShort { listed: 0, held: 1 }]);
+    });
+    // A raise on a unit whose rollback is recorded: acknowledged, paged.
+    with_fresh(|rig| {
+        let id = rig.client().stamp_id().unwrap();
+        put(rig.safety, &stamp_key(id.as_str(), 1));
+        rig.clock.advance_ms(T + 1);
+        let (r, _) = renewed(&rig.client(), rig.unit_seqs());
+        assert_eq!(r, Renewal::Closed { rolled_back: true });
+        let r = block_on(
+            rig.client()
+                .run_job(UnitJob::StampRaise { at: NOW }, rig.unit_seqs()),
+        );
+        assert_eq!(
+            (r.delivery, r.code),
+            (Delivery::Ack, "rolled_back"),
+            "{r:?}"
+        );
+        assert_eq!(r.pages, [Page::RolledBack]);
+    });
+    // A shredding tenant's unit on the request path: the call says why
+    // it was not renewed (review M1).
+    with_fresh(|rig| {
+        rig.clock.advance_ms(T + 1);
+        *rig.obj.answer_of.borrow_mut() = Some((
+            "job:stamp",
+            UnitAnswer::Refused {
+                reason: Refused::AccountProblem,
+                alarm: false,
+            },
+        ));
+        let (a, pages) = called(&rig.client(), request(rig.unit_seqs(), UnitOp::Ping {}));
+        assert!(matches!(a.reply.answer, UnitAnswer::RenewNeeded { .. }));
+        assert_eq!(a.renewal, Some(Renewal::Shredding));
+        assert!(pages.is_empty());
     });
 }
 

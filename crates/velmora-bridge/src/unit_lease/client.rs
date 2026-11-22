@@ -196,6 +196,9 @@ pub enum Renewal {
     NotListed,
     /// Not renewed, and not retryable here: see the pages.
     Refused,
+    /// The tenant is being shredded: its unit takes no job, and nothing
+    /// pages (AM-50's shredding row).
+    Shredding,
 }
 
 /// What [`UnitClient::sync`] came to.
@@ -225,6 +228,13 @@ pub struct Answered {
     /// Less than half of T is left: renew in the background (rule 12,
     /// [`UnitClient::renew_in_background`]).
     pub renew_due: bool,
+    /// What a renewal this call made came to (`None`: it made none, or
+    /// the spacing held it back). With the reply still `renew_needed`, it
+    /// names the AM-50 row: `Closed`, `Unborn`, `NotListed`, `Shredding`
+    /// or `Refused`.
+    pub renewal: Option<Renewal>,
+    /// What a sync this call made came to.
+    pub synced: Option<Synced>,
 }
 
 /// What the queue does with a `renew` or `stamp_raise` message.
@@ -481,7 +491,7 @@ where
         Ok(match stop {
             Stop::Closed => Flow::Done(Renewal::Closed { rolled_back: false }),
             Stop::Unborn => Flow::Done(Renewal::Unborn),
-            Stop::Shredding => Flow::Done(Renewal::Refused),
+            Stop::Shredding => Flow::Done(Renewal::Shredding),
             // The unit is behind (a newer record, or a rolled-back unit
             // found by the numbers, rule 5): sync it, then prove again.
             Stop::SyncNeeded(unit) => match self.sync(unit).await? {
@@ -615,6 +625,8 @@ where
     async fn call_into(&self, mut call: UnitCall, pages: &mut Vec<Page>) -> Result<Answered> {
         let (mut renewed, mut synced, mut restaled) = (false, false, false);
         let mut refreshed = None;
+        let mut renewal = None;
+        let mut sync_outcome = None;
         loop {
             let reply = self.unit.reply(&call).await?;
             match reply.answer {
@@ -624,27 +636,33 @@ where
                     // isolate's spacing (none while one runs, and after a
                     // failure a backoff up to T). A signed call renews for
                     // itself.
-                    let renewal = match call.authenticated {
-                        true => {
-                            let (renewal, more) = self.renew(seqs).await;
+                    // Signed calls are spaced too, but after a failure by at
+                    // most 1 s: a unit whose renewal fails every time costs
+                    // one proof and one page per second per isolate, not
+                    // one per request.
+                    let max_gap = match call.authenticated {
+                        true => SIGNED_RETRY_MS,
+                        false => self.lease.term_ms,
+                    };
+                    let outcome = match self.renew_spaced_by(seqs, max_gap).await {
+                        Some((renewal, more)) => {
                             pages.extend(more);
                             Some(renewal?)
                         }
-                        false => match self.renew_spaced(seqs).await {
-                            Some((renewal, more)) => {
-                                pages.extend(more);
-                                Some(renewal?)
-                            }
-                            None => None,
-                        },
+                        None => None,
                     };
-                    if matches!(renewal, Some(Renewal::Renewed { .. })) {
+                    let again = matches!(outcome, Some(Renewal::Renewed { .. }));
+                    renewal = outcome;
+                    if again {
                         continue;
                     }
                 }
                 UnitAnswer::SyncNeeded { seqs } if !synced => {
                     synced = true;
-                    if matches!(self.sync(seqs).await?, Synced::Synced { .. }) {
+                    let outcome = self.sync(seqs).await?;
+                    let again = matches!(outcome, Synced::Synced { .. });
+                    sync_outcome = Some(outcome);
+                    if again {
                         continue;
                     }
                 }
@@ -661,6 +679,8 @@ where
                 reply,
                 refreshed,
                 renew_due,
+                renewal,
+                synced: sync_outcome,
             });
         }
     }
@@ -674,9 +694,17 @@ where
     }
 
     async fn renew_spaced(&self, seen: Seqs) -> Option<(Result<Renewal>, Vec<Page>)> {
+        self.renew_spaced_by(seen, self.lease.term_ms).await
+    }
+
+    async fn renew_spaced_by(
+        &self,
+        seen: Seqs,
+        max_gap_ms: i64,
+    ) -> Option<(Result<Renewal>, Vec<Page>)> {
         let guard = self
             .flights
-            .attempt(&self.name, self.clock.now(), self.lease.term_ms)?;
+            .attempt(&self.name, self.clock.now(), max_gap_ms)?;
         let (renewal, pages) = self.renew(seen).await;
         guard.done(matches!(renewal, Ok(Renewal::Renewed { .. })));
         Some((renewal, pages))
@@ -813,6 +841,10 @@ where
     }
 }
 
+/// The longest wait of a signed call's renewal attempt after a failed
+/// one (an unsigned call's is T).
+const SIGNED_RETRY_MS: i64 = 1000;
+
 /// Rounds of a renewal: a sync, a stamp confirmation and a proof that
 /// aged are each one; more than this is a unit that keeps moving.
 const RENEW_ROUNDS: usize = 4;
@@ -925,6 +957,7 @@ fn renewal_result(renewal: Renewal, pages: Vec<Page>) -> JobResult {
         // Paged; a retry would page again and change nothing. The alarm
         // sends `renew` again on its backoff.
         Renewal::Refused => job_result(Delivery::Ack, "renew_refused", pages),
+        Renewal::Shredding => job_result(Delivery::Ack, "shredding", pages),
     }
 }
 
