@@ -11,6 +11,7 @@ pub mod articles;
 pub mod config;
 pub mod copy;
 pub mod crypto;
+pub mod directory;
 pub mod fanout;
 pub mod fetch;
 pub mod gate;
@@ -18,6 +19,7 @@ pub mod hashstate;
 pub mod hosts;
 pub mod ingress;
 pub mod intents;
+pub mod jobmsg;
 pub mod jobs;
 pub mod jobtable;
 pub mod keepalive;
@@ -34,10 +36,12 @@ pub mod replay;
 pub mod service;
 pub mod sql;
 pub mod stamp;
+pub mod tenant;
 pub mod tenant_catalog;
 pub mod trace;
 pub mod types;
 pub mod unit;
+pub mod unit_consumer;
 pub mod verify;
 
 #[cfg(feature = "testkit")]
@@ -48,4 +52,5 @@ pub mod testkit;
 
 pub use config::{BridgeConfig, KekRing, REAL_DATA_READY};
 pub use ports::*;
+pub use tenant::TenantScope;
 pub use types::*;

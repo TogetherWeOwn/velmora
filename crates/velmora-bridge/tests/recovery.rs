@@ -365,7 +365,9 @@ async fn recovery_records_survive_gc_and_eviction() {
     rig.bridge.clock.advance_secs(3 * 24 * 60 * 60);
     for _ in 0..4 {
         assert_eq!(
-            rig.bridge.run_job(&Job::Gc { v: JOB_VERSION }).await,
+            rig.bridge
+                .run_job(&TENANT_ZERO, &Job::Gc { v: JOB_VERSION })
+                .await,
             JobOutcome::Ack
         );
     }
@@ -2402,7 +2404,10 @@ async fn an_unfinished_replay_refuses_writes_without_maintenance() {
         generation: GenerationId::new(row.1.clone()),
         stage: OutboxStage::Post,
     };
-    assert_eq!(rig.bridge.run_job(&job).await, JobOutcome::Ack);
+    assert_eq!(
+        rig.bridge.run_job(&TENANT_ZERO, &job).await,
+        JobOutcome::Ack
+    );
     assert_eq!(outbox(), row);
     assert_eq!(
         rig.bridge.dispatch().await.unwrap(),
@@ -3722,13 +3727,13 @@ async fn the_tenant_layout_puts_every_new_record_under_the_tenant() {
     let (flat, tenant) = by_layout(&rig);
     assert_eq!((flat.len(), tenant.len()), (2, 0), "{flat:?} {tenant:?}");
 
-    write_in(&mut rig, Layout::default_tenant());
+    write_in(&mut rig, Layout::of(&TENANT_ZERO));
     tick(&rig);
     rig.put(&signer, BUCKET, "put", b"put").await.expect(200);
     multipart(&rig, &signer, "parts", 3).await;
     copy(&rig, &signer, "put", "copy").await.expect(200);
     delete(&rig, &signer, "put").await.expect(204);
-    let (plan_of, _) = plan_record_in(&rig, &bucket, "copy", &Layout::default_tenant()).await;
+    let (plan_of, _) = plan_record_in(&rig, &bucket, "copy", &Layout::of(&TENANT_ZERO)).await;
 
     let (still, tenant) = by_layout(&rig);
     assert_eq!(still, flat, "the flat layout got nothing new");
@@ -3743,7 +3748,7 @@ async fn the_tenant_layout_puts_every_new_record_under_the_tenant() {
             Err(BridgeError::Invalid(_))
         ));
         let name = record_name(key).expect("a record name");
-        assert_eq!(name.layout, Layout::default_tenant());
+        assert_eq!(name.layout, Layout::of(&TENANT_ZERO));
         // The same name as the flat layout has, after the directory.
         assert_eq!(key[TENANT.len()..], name.flat()["m/".len()..]);
         kinds.push(name.kind);
@@ -3874,7 +3879,7 @@ async fn random_histories_in_both_layouts_replay_to_the_same_objects() {
                 if mixed && turn.roll(6) == 0 {
                     tenant = !tenant;
                     let layout = if tenant {
-                        Layout::default_tenant()
+                        Layout::of(&TENANT_ZERO)
                     } else {
                         Layout::flat()
                     };
@@ -3912,7 +3917,7 @@ async fn random_histories_in_both_layouts_replay_to_the_same_objects() {
 #[tokio::test(flavor = "current_thread")]
 async fn a_deleted_key_stays_deleted_across_the_layouts() {
     let flat = Layout::flat;
-    let tenant = Layout::default_tenant;
+    let tenant = || Layout::of(&TENANT_ZERO);
     // (key, the layout of the write, of the delete, and of a write
     // after the delete)
     let cases: [(&str, Layout, Layout, Option<Layout>); 4] = [
@@ -3973,8 +3978,8 @@ async fn a_deleted_key_stays_deleted_across_the_layouts() {
 #[tokio::test(flavor = "current_thread")]
 async fn an_article_plan_is_found_in_the_other_layout_than_its_record() {
     for (record, plan) in [
-        (Layout::flat(), Layout::default_tenant()),
-        (Layout::default_tenant(), Layout::flat()),
+        (Layout::flat(), Layout::of(&TENANT_ZERO)),
+        (Layout::of(&TENANT_ZERO), Layout::flat()),
     ] {
         let mut rig = rig();
         write_in(&mut rig, record.clone());
@@ -4033,8 +4038,8 @@ async fn an_article_plan_is_found_in_the_other_layout_than_its_record() {
 #[tokio::test(flavor = "current_thread")]
 async fn a_record_moved_to_the_other_layout_does_not_open() {
     for (from, to) in [
-        (Layout::flat(), Layout::default_tenant()),
-        (Layout::default_tenant(), Layout::flat()),
+        (Layout::flat(), Layout::of(&TENANT_ZERO)),
+        (Layout::of(&TENANT_ZERO), Layout::flat()),
     ] {
         let mut rig = rig();
         write_in(&mut rig, from.clone());
@@ -4079,7 +4084,7 @@ async fn one_id_in_both_layouts_is_replayed_once_and_reported() {
         .await
         .expect(200);
     let (live, extents) = rig.live(&bucket, "k").await.unwrap();
-    let tenant = Layout::default_tenant();
+    let tenant = Layout::of(&TENANT_ZERO);
     velmora_bridge::recovery::write_generation(
         &rig.bridge.catalog,
         &rig.bridge.safety,
@@ -4118,7 +4123,7 @@ async fn one_id_in_both_layouts_is_replayed_once_and_reported() {
 #[tokio::test(flavor = "current_thread")]
 async fn a_flat_name_that_does_not_open_does_not_hide_the_tenant_record() {
     let mut rig = rig();
-    write_in(&mut rig, Layout::default_tenant());
+    write_in(&mut rig, Layout::of(&TENANT_ZERO));
     let (bucket, signer) = rig.standard(BUCKET).await;
     rig.put(&signer, BUCKET, "kept", b"body").await.expect(200);
     tick(&rig);
@@ -4127,7 +4132,7 @@ async fn a_flat_name_that_does_not_open_does_not_hide_the_tenant_record() {
     delete(&rig, &signer, "gone").await.expect(204);
     let (flat, tenant) = by_layout(&rig);
     assert!(flat.is_empty(), "{flat:?}");
-    let root = Layout::default_tenant().root().to_owned();
+    let root = Layout::of(&TENANT_ZERO).root().to_owned();
     let mut real: Vec<String> = tenant
         .into_iter()
         .filter(|k| !k.contains("/art/"))
@@ -4183,7 +4188,7 @@ async fn a_flat_name_that_does_not_open_does_not_hide_the_tenant_record() {
 #[tokio::test(flavor = "current_thread")]
 async fn a_refused_record_of_the_tenant_layout_is_removed_under_its_name() {
     let mut rig = rig();
-    write_in(&mut rig, Layout::default_tenant());
+    write_in(&mut rig, Layout::of(&TENANT_ZERO));
     let (_, signer) = rig.standard(BUCKET).await;
     let id = create_upload(&rig, &signer, "big").await;
     let etag = upload_part(&rig, &signer, "big", &id, 1, b"part one").await;
@@ -4219,7 +4224,7 @@ async fn plan_keys_are_named_in_the_layout_asked_for() {
     use velmora_bridge::recovery::{other_plan_key, plan_keys};
 
     let plain = br#"{"extents":[{"id":"x_1"},{"id":"x_2"}]}"#;
-    let tenant = Layout::default_tenant();
+    let tenant = Layout::of(&TENANT_ZERO);
     assert_eq!(
         plan_keys(plain, &Layout::flat()).unwrap(),
         ["m/art/x_1", "m/art/x_2"]
@@ -4230,8 +4235,14 @@ async fn plan_keys_are_named_in_the_layout_asked_for() {
         [format!("{TENANT}art/x_1"), format!("{TENANT}art/x_2")]
     );
     // Each names the plan of the same extent in the other layout.
-    assert_eq!(other_plan_key("m/art/x_1"), Some(keys[0].clone()));
-    assert_eq!(other_plan_key(&keys[1]).as_deref(), Some("m/art/x_2"));
+    assert_eq!(
+        other_plan_key(&TENANT_ZERO, "m/art/x_1"),
+        Some(keys[0].clone())
+    );
+    assert_eq!(
+        other_plan_key(&TENANT_ZERO, &keys[1]).as_deref(),
+        Some("m/art/x_2")
+    );
     for none in [
         "m/g_1",
         "m/del/g_1",
@@ -4240,6 +4251,9 @@ async fn plan_keys_are_named_in_the_layout_asked_for() {
         "m/tk/t_1",
         "m/x/art/x_1",
     ] {
-        assert_eq!(other_plan_key(none), None, "{none}");
+        assert_eq!(other_plan_key(&TENANT_ZERO, none), None, "{none}");
     }
 }
+
+/// The one tenant there is.
+static TENANT_ZERO: velmora_bridge::TenantScope = velmora_bridge::TenantScope::tenant_zero();

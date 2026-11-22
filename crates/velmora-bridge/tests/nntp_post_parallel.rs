@@ -146,7 +146,10 @@ async fn expired_lease_with_several_sockets_writes_nothing() {
     assert_eq!(rig.bridge.nntp.live(), 0);
 
     let job = rig.job(&s).await;
-    assert_eq!(rig.bridge.post_stage(&thief, &job).await, JobOutcome::Ack);
+    assert_eq!(
+        rig.bridge.post_stage(&TENANT_ZERO, &thief, &job).await,
+        JobOutcome::Ack
+    );
     let done = rig.plan(&s).await;
     assert!(all_posted_by(&done, "p0"));
     assert_eq!(id_set(&done), id_set(&plan));
@@ -991,7 +994,10 @@ async fn a_post_job_leaves_its_timings() {
         stage: OutboxStage::Post,
     };
 
-    assert_eq!(rig.bridge.run_job(&job).await, JobOutcome::Ack);
+    assert_eq!(
+        rig.bridge.run_job(&TENANT_ZERO, &job).await,
+        JobOutcome::Ack
+    );
 
     let trace = trace::take(&s.extent).expect("a record");
     assert_eq!((trace.sockets, trace.articles), (4, 10));
@@ -1015,7 +1021,10 @@ async fn a_slow_renewal_leaves_the_connects_to_the_round() {
     let lease = rig.claim(&s, OutboxStage::Post).await;
     let job = rig.job(&s).await;
     rig.bridge.clock.advance_secs(20);
-    assert_eq!(rig.bridge.post_stage(&lease, &job).await, JobOutcome::Ack);
+    assert_eq!(
+        rig.bridge.post_stage(&TENANT_ZERO, &lease, &job).await,
+        JobOutcome::Ack
+    );
 
     let events = events();
     let plan = events.iter().position(|e| *e == "plan").expect("planned");
@@ -1066,7 +1075,10 @@ async fn an_old_claim_is_renewed_before_any_connect() {
     let job = rig.job(&s).await;
     rig.bridge.clock.advance_secs(20);
     let at = rig.bridge.clock.now();
-    assert_eq!(rig.bridge.post_stage(&lease, &job).await, JobOutcome::Ack);
+    assert_eq!(
+        rig.bridge.post_stage(&TENANT_ZERO, &lease, &job).await,
+        JobOutcome::Ack
+    );
     assert_eq!(*rig.bridge.catalog.renewed_at.borrow(), [at]);
     assert!(all_posted_by(&rig.plan(&s).await, "p0"));
 
@@ -1077,7 +1089,7 @@ async fn an_old_claim_is_renewed_before_any_connect() {
     let job = rig.job(&s).await;
     rig.bridge.clock.advance_secs(20);
     rig.bridge.catalog.take_over(&s.extent);
-    rig.bridge.post_stage(&lease, &job).await;
+    rig.bridge.post_stage(&TENANT_ZERO, &lease, &job).await;
     assert_eq!(rig.bridge.catalog.renewals.get(), 2);
     assert_eq!(rig.bridge.nntp.connects(), connects);
     assert_eq!(rig.servers[0].posted_count().await, posted);
@@ -1092,3 +1104,6 @@ async fn an_old_claim_is_renewed_before_any_connect() {
     );
     assert!(free.await.unwrap().is_some());
 }
+
+/// The one tenant there is.
+static TENANT_ZERO: velmora_bridge::TenantScope = velmora_bridge::TenantScope::tenant_zero();

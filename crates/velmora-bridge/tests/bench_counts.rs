@@ -971,7 +971,7 @@ impl Bench {
         self.hub.set(&label);
         *self.hub.calls.borrow_mut().entry(label).or_default() += 1;
         let t = Instant::now();
-        let outcome = self.bridge.run_job(job).await;
+        let outcome = self.bridge.run_job(&TENANT_ZERO, job).await;
         let us = t.elapsed().as_micros() as u64;
         self.hub.add(|c| {
             c.invocations += 1;
@@ -1256,7 +1256,10 @@ async fn scenario(s: &Scale, trace: Option<File>) -> Bench {
         .await
         .expect("drain set");
     let t = Instant::now();
-    b.bridge.evict_batch(all).await.expect("evict");
+    b.bridge
+        .evict_batch(&TENANT_ZERO, all)
+        .await
+        .expect("evict");
     let us = t.elapsed().as_micros() as u64;
     b.hub.add(|c| {
         c.invocations += 1;
@@ -1340,7 +1343,7 @@ async fn scenario(s: &Scale, trace: Option<File>) -> Bench {
         let sent = b.bridge.jobs.inner.take();
         b.hub.set("stage:cron_idle");
         for s in sent {
-            b.bridge.run_job(&s.job).await;
+            b.bridge.run_job(&TENANT_ZERO, &s.job).await;
             b.hub.add(|c| c.invocations += 1);
         }
         b.hub.set("idle");
@@ -1477,3 +1480,6 @@ async fn bench_counts_full() {
     .expect("counts.json");
     println!("bench: wrote {}", dir.display());
 }
+
+/// The one tenant there is.
+static TENANT_ZERO: velmora_bridge::TenantScope = velmora_bridge::TenantScope::tenant_zero();

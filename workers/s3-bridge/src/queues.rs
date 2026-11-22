@@ -17,6 +17,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use futures_util::future::{join_all, select, Either};
+use velmora_bridge::jobmsg::{JobFormat, JobMessage, JobTenant};
 use velmora_bridge::{
     Backlog, BridgeError, Job, JobSink, Oldest, OutboxStage, Result, UnixMs, MAX_QUEUE_DELAY_SECS,
 };
@@ -123,6 +124,24 @@ pub struct QueueSink {
     /// bound.
     aux: Option<Queue>,
     drop_notify: DropNotify,
+    /// The format of the messages (`JOB_FORMAT`) and the tenant a
+    /// message of `v` 2 names.
+    format: (JobFormat, JobTenant),
+}
+
+/// The message of `job` in `format` for `tenant`; see
+/// [`QueueSink::message`].
+fn message_for<'a>(
+    format: JobFormat,
+    tenant: &'a JobTenant,
+    job: &'a Job,
+) -> Result<JobMessage<'a>> {
+    match format.message(job, tenant) {
+        JobMessage::Plain(_) if tenant.unit().is_some() => Err(BridgeError::Queue(
+            "a unit's job must be sent in the tenant format".into(),
+        )),
+        message => Ok(message),
+    }
 }
 
 /// The binding of the queue for jobs that name no extent: gc, sweep,
@@ -141,6 +160,7 @@ impl QueueSink {
         verify: Vec<Queue>,
         aux: Option<Queue>,
         drop_notify: DropNotify,
+        format: (JobFormat, JobTenant),
     ) -> std::result::Result<Self, &'static str> {
         if post.is_empty() {
             return Err("POST_Q");
@@ -153,7 +173,17 @@ impl QueueSink {
             verify,
             aux,
             drop_notify,
+            format,
         })
+    }
+
+    /// The message that carries `job`. A sink of a managed tenant's unit
+    /// (its tenant fields name a unit) sends `v` 2 only: a `v` 1 message
+    /// names no tenant and is read as tenant 0's, so a job of another
+    /// body version is refused here, never sent as tenant 0's.
+    fn message<'a>(&'a self, job: &'a Job) -> Result<JobMessage<'a>> {
+        let (format, tenant) = &self.format;
+        message_for(*format, tenant, job)
     }
 
     fn shards(&self) -> Shards {
@@ -386,7 +416,7 @@ impl JobSink for QueueSink {
         if self.drop_notify.take() {
             return Ok(());
         }
-        let msg = MessageBuilder::new(job)
+        let msg = MessageBuilder::new(self.message(job)?)
             .content_type(QueueContentType::Json)
             .delay_seconds(delay_secs)
             .build();
@@ -407,6 +437,10 @@ impl JobSink for QueueSink {
         let shards = self.shards();
         let mut sends = Vec::new();
         for (target, batch) in batches(jobs, shards) {
+            let batch: Vec<JobMessage<'_>> = batch
+                .into_iter()
+                .map(|job| self.message(job))
+                .collect::<Result<_>>()?;
             sends.push(self.queue(target).send_batch(batch).await);
         }
         first_error(sends)
@@ -417,6 +451,29 @@ impl JobSink for QueueSink {
 mod tests {
     use super::*;
     use velmora_bridge::{ExtentId, GenerationId, WriteId, JOB_VERSION};
+
+    /// A unit's sink never sends a `v` 1 message, which would be read as
+    /// tenant 0's (tenant 0's sink, which names no unit, is unchanged).
+    #[test]
+    fn a_units_sink_sends_the_tenant_format_only() {
+        let unit = JobTenant::of_unit("t_00000000000000a7", 0, 5, 6).unwrap();
+        let current = Job::Gc { v: JOB_VERSION };
+        let other = Job::Gc { v: JOB_VERSION + 7 };
+        assert!(matches!(
+            message_for(JobFormat::Tenant, &unit, &current),
+            Ok(JobMessage::Tenant(_))
+        ));
+        for (format, job) in [
+            (JobFormat::Tenant, &other),
+            (JobFormat::Plain, &current),
+            (JobFormat::Plain, &other),
+        ] {
+            assert!(
+                message_for(format, &unit, job).is_err(),
+                "{format:?} {job:?}"
+            );
+        }
+    }
 
     fn extent_job(stage: OutboxStage) -> Job {
         Job::Extent {

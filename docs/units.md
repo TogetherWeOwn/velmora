@@ -179,6 +179,29 @@ per unit against the configured cap until the directory's global
 threshold exists (ADR §5.5): with N managed tenants the cache can hold up
 to N times the cap.
 
+The queue consumer runs such a job only when the Worker has the unit
+class bound as `UNIT` (no production config binds it; without it the
+message is refused as `other_tenant`, as before). The reader
+(`jobmsg::admit_for`) admits a format-2 message of a managed tenant that
+names its unit, in that tenant's scope (`TenantScope::managed`: blobs
+`x/<t>/` and `c/<t>/`). The consumer gives the job a bridge of its own
+(`workers/s3-bridge/src/units.rs`): a `TenantCatalog` over the unit
+object's `fetch` with the message's numbers; the configuration from
+`BridgeConfig::for_unit`, which takes the unit's name and sets the stamp
+id `<tenant>.<unit>` (`jobcall::stamp_id`) and the tenant's record layout
+`m/x/<t>/` (never the flat layout); a sink whose messages name the same
+unit and numbers, always in format 2 (it refuses to send a `v` 1 message,
+which would be read as tenant 0's); and the isolate's one byte budget and
+permit gate. Garbage collection names the blob it deletes from the row's
+extent through the job's scope, not from the catalogue's delete list. The
+first refusal decides the delivery (`unit_consumer`): a stale job or a
+closed unit is acknowledged (its outbox row stays, for the unit's alarm
+dispatcher of W2 to send again; that dispatcher is not built yet, so the
+class stays unbound until it is); sync
+needed, unborn and any other refusal go to the dead-letter queue with an
+alert. Unit jobs (`renew`, `stamp_raise`) are not run yet
+(`unit_job_not_run`).
+
 ## Bookmarks
 
 **A bookmark leaves the unit only sealed.** No bookmark is stored or

@@ -41,6 +41,11 @@ fn own() -> UnitName {
     UnitName::new(tenant(), 0)
 }
 
+/// The scope the consumer gives a job of this tenant (`jobmsg::admit_for`).
+fn scope() -> velmora_bridge::TenantScope {
+    velmora_bridge::TenantScope::managed(&tenant()).unwrap()
+}
+
 // ---------------------------------------------------------------------------
 // The unit and the way to it
 // ---------------------------------------------------------------------------
@@ -242,12 +247,17 @@ impl Fx {
             maintenance: Maintenance::Off,
             server_side_copy: false,
             get_fanout_bytes: None,
-            catalogue_id: format!("{}.0", tenant()),
+            // Tenant 0's id: `for_unit` below makes the unit's.
+            catalogue_id: "main".to_string(),
             dev_trust_http: false,
             verify: Default::default(),
             providers,
             admin_token: Secret::new("admin-token-fixture-admin-token-fixture".to_string()),
-        };
+        }
+        // The unit's job configuration, as the consumer makes it.
+        .for_unit(&own())
+        .unwrap();
+        assert_eq!(cfg.catalogue_id, format!("{}.0", tenant()));
         let clock = Rc::new(FixedClock::new(T0));
         let db = Db(Rc::new(RusqliteSql::open_in_memory().unwrap()));
         let unit = Rc::new(Unit::new(db.clone(), own(), ""));
@@ -395,12 +405,20 @@ impl Fx {
         };
         self.bridge
             .safety
-            .put(&extent_id.safety_key(), sealed.ciphertext.clone(), &meta)
+            .put(
+                &scope().safety_key(&extent_id),
+                sealed.ciphertext.clone(),
+                &meta,
+            )
             .await
             .unwrap();
         self.bridge
             .cache
-            .put(&extent_id.cache_key(), sealed.ciphertext.clone(), &meta)
+            .put(
+                &scope().cache_key(&extent_id),
+                sealed.ciphertext.clone(),
+                &meta,
+            )
             .await
             .unwrap();
         self.cat
@@ -458,7 +476,7 @@ impl Fx {
             }
             runs += 1;
             assert!(runs < 200, "the queue does not drain");
-            if let JobOutcome::Retry { delay_secs } = self.bridge.run_job(&job).await {
+            if let JobOutcome::Retry { delay_secs } = self.bridge.run_job(&scope(), &job).await {
                 queue.push((self.clock.now().plus_secs(delay_secs), job));
             }
         }
@@ -527,9 +545,9 @@ async fn eviction_drops_a_released_extents_copies_through_the_unit() {
     fx.pump().await;
     assert_eq!(fx.extent(&o, "safety_state").await, "released");
     let cipher: u64 = fx.extent(&o, "cipher_size").await.parse().unwrap();
-    assert_eq!(fx.bridge.evict_batch(0).await.unwrap(), cipher);
-    assert!(!fx.bridge.safety.contains(&o.extent.safety_key()));
-    assert!(!fx.bridge.cache.contains(&o.extent.cache_key()));
+    assert_eq!(fx.bridge.evict_batch(&scope(), 0).await.unwrap(), cipher);
+    assert!(!fx.bridge.safety.contains(&scope().safety_key(&o.extent)));
+    assert!(!fx.bridge.cache.contains(&scope().cache_key(&o.extent)));
     assert_eq!(fx.extent(&o, "hot_safety_bytes").await, "0");
     assert_eq!(fx.extent(&o, "hot_cache_bytes").await, "0");
 }
@@ -565,17 +583,19 @@ async fn gc_takes_an_overwritten_extent_on_the_unit() {
     assert!(fx.bridge.dispatch().await.unwrap().gc_enqueued);
     fx.bridge.jobs.take();
     assert_eq!(
-        fx.bridge.run_job(&Job::Gc { v: JOB_VERSION }).await,
+        fx.bridge
+            .run_job(&scope(), &Job::Gc { v: JOB_VERSION })
+            .await,
         JobOutcome::Ack
     );
     let done = "SELECT COUNT(*) FROM gc WHERE extent_id = ?1 AND done_at IS NOT NULL";
     let id = [SqlValue::Text(old.extent.as_str().into())];
     assert_eq!(fx.scalar(done, &id).await, "2");
     assert_eq!(fx.extent(&old, "safety_state").await, "deleted");
-    assert!(!fx.bridge.safety.contains(&old.extent.safety_key()));
-    assert!(!fx.bridge.cache.contains(&old.extent.cache_key()));
+    assert!(!fx.bridge.safety.contains(&scope().safety_key(&old.extent)));
+    assert!(!fx.bridge.cache.contains(&scope().cache_key(&old.extent)));
     // The live object keeps its copies.
-    assert!(fx.bridge.safety.contains(&new.extent.safety_key()));
+    assert!(fx.bridge.safety.contains(&scope().safety_key(&new.extent)));
 }
 
 // ---------------------------------------------------------------------------
@@ -600,7 +620,7 @@ async fn a_job_with_lower_numbers_changes_nothing_in_the_unit() {
         matches!(err, BridgeError::Invalid(UNIT_STALE_JOB)),
         "{err:?}"
     );
-    fx.bridge.run_job(&o.job(OutboxStage::Post)).await;
+    fx.bridge.run_job(&scope(), &o.job(OutboxStage::Post)).await;
     // The consumer can tell why: the unit's refusal is kept.
     assert_eq!(fx.bridge.catalog.refusal(), Some(UNIT_STALE_JOB));
     assert_eq!(fx.outbox(&o, "stage").await, "post");
@@ -773,4 +793,35 @@ async fn a_job_call_without_authentication_is_refused() {
             ..
         }
     ));
+}
+
+/// A unit's sweep asks only its tenant's layout whether a generation is
+/// recorded: a record under tenant 0's flat name never counts for it.
+#[tokio::test]
+async fn a_units_generation_record_is_looked_for_in_its_own_layout_only() {
+    use velmora_bridge::recovery::{generation_recorded, Layout};
+    let store = MemBlobStore::new();
+    let id = GenerationId::new("g_00000000000000000000000001");
+    let (bucket, extent) = (BucketId::new("b_0000000000000001"), ExtentId::new("x_0"));
+    let digest: [u8; 32] = <sha2::Sha256 as sha2::Digest>::digest([1u8]).into();
+    let meta = BlobMeta {
+        bucket: &bucket,
+        extent: &extent,
+        cipher_sha256: &digest,
+    };
+    store
+        .put(&Layout::flat().generation_key(&id), vec![1], &meta)
+        .await
+        .unwrap();
+    assert!(!generation_recorded(&store, &scope(), &id).await.unwrap());
+    assert!(
+        generation_recorded(&store, &TenantScope::tenant_zero(), &id)
+            .await
+            .unwrap()
+    );
+    store
+        .put(&Layout::of(&scope()).generation_key(&id), vec![1], &meta)
+        .await
+        .unwrap();
+    assert!(generation_recorded(&store, &scope(), &id).await.unwrap());
 }
