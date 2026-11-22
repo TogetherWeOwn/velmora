@@ -141,7 +141,7 @@ pub struct Grant {
 // Tenants
 // ---------------------------------------------------------------------------
 
-/// The one jurisdiction milestone 1 serves (AM-58): no Durable Object
+/// The one jurisdiction milestone 1 serves (AM-58): no data-location
 /// jurisdiction. Also what an absent `jurisdiction` means.
 pub const JURISDICTION_NONE: &str = "none";
 
