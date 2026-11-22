@@ -39,6 +39,115 @@ fn block_on<F: std::future::Future>(f: F) -> F::Output {
         .block_on(f)
 }
 
+// (closed, epoch, pending_cleared), including deliberately inconsistent rows
+// that a statement must not touch, even if first_open would reject them earlier.
+const FIRST_GATE_STATES: &[Option<(i64, i64, i64)>] = &[
+    None,
+    Some((1, 0, 0)),
+    Some((1, 1, 1)),
+    Some((1, 1, 0)),
+    Some((0, 1, 1)),
+    Some((0, 1, 0)),
+    Some((1, 2, 1)),
+    Some((0, 0, 0)),
+];
+
+async fn seed_first_gate(db: &Db, row: Option<(i64, i64, i64)>) {
+    if let Some((closed, epoch, cleared)) = row {
+        db.exec(
+            "INSERT INTO directory_gate (id, closed, epoch, pending_cleared, reason, closed_at, opened_at) \
+             VALUES (1, ?1, ?2, ?3, 'before', 5, NULL)",
+            &[SqlValue::Int(closed), SqlValue::Int(epoch), SqlValue::Int(cleared)],
+        ).await.unwrap();
+    }
+}
+
+async fn first_gate_snapshot(db: &Db) -> Vec<velmora_bridge::ports::Row> {
+    db.query(
+        "SELECT closed, epoch, pending_cleared, reason, closed_at, opened_at FROM directory_gate WHERE id = 1",
+        &[],
+    ).await.unwrap()
+}
+
+#[test]
+fn first_close_only_advances_fresh_rows_and_clears_pending_once() {
+    block_on(async {
+        for &initial in FIRST_GATE_STATES {
+            let db = database();
+            let dir = SqlDirectory { sql: &db };
+            seed_first_gate(&db, initial).await;
+            let before = first_gate_snapshot(&db).await;
+            let pending = PendingOp {
+                tenant: Tenant::parse(A1).unwrap(),
+                chain: ChainKind::Tenant,
+                seq: 1,
+                kind: "before".into(),
+                created_at: NOW.plus_ms(-1),
+            };
+            dir.add_pending(&pending).await.unwrap();
+            dir.first_close("first", NOW).await.unwrap();
+
+            let (expected, clears) = match initial {
+                None | Some((1, 0, 0)) => (
+                    vec![vec![
+                        SqlValue::Int(1),
+                        SqlValue::Int(1),
+                        SqlValue::Int(1),
+                        SqlValue::Text("first".into()),
+                        SqlValue::Int(NOW.0),
+                        SqlValue::Null,
+                    ]],
+                    true,
+                ),
+                Some((1, 1, 0)) => {
+                    let mut row = before;
+                    row[0][2] = SqlValue::Int(1);
+                    (row, true)
+                }
+                _ => (before, false),
+            };
+            assert_eq!(
+                first_gate_snapshot(&db).await,
+                expected,
+                "initial={initial:?}"
+            );
+            let rows = dir.pending_before(NOW, 10).await.unwrap();
+            if clears {
+                assert!(rows.is_empty(), "initial={initial:?}; pending={rows:?}");
+            } else {
+                assert_eq!(rows, [pending], "initial={initial:?}");
+            }
+        }
+    });
+}
+
+#[test]
+fn first_open_gate_only_opens_closed_epoch_one_after_the_pending_clear() {
+    block_on(async {
+        for &initial in FIRST_GATE_STATES {
+            let db = database();
+            let dir = SqlDirectory { sql: &db };
+            seed_first_gate(&db, initial).await;
+            let mut expected = first_gate_snapshot(&db).await;
+            let should_open = initial == Some((1, 1, 1));
+            if should_open {
+                expected[0][0] = SqlValue::Int(0);
+                expected[0][5] = SqlValue::Int(NOW.0);
+            }
+            assert_eq!(
+                dir.first_open_gate(NOW).await.unwrap(),
+                should_open,
+                "initial={initial:?}"
+            );
+            assert_eq!(
+                first_gate_snapshot(&db).await,
+                expected,
+                "initial={initial:?}"
+            );
+        }
+    });
+}
+
 async fn write(
     chain: &Chain<'_>,
     tenant: &Tenant,

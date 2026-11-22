@@ -2,7 +2,7 @@
 
 mod service_support;
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 
 use futures_util::stream;
 use serde_json::{json, Value};
@@ -16,10 +16,13 @@ use velmora_bridge::keys::locations::{
 };
 use velmora_bridge::keys::tk::KeyBuckets;
 use velmora_bridge::mgmt::setup::{serve_setup, setup_call, SetupCall};
+use velmora_bridge::ports::{Row, Sql, SqlValue};
 use velmora_bridge::records::MemRecords;
 use velmora_bridge::root::{Root, RootCache, RootPorts};
 use velmora_bridge::testkit::{FixedClock, RusqliteSql, TestKek};
-use velmora_bridge::{Body, BridgeConfig, Method, RespBody, S3Request, S3Response, Secret, UnixMs};
+use velmora_bridge::{
+    Body, BridgeConfig, Method, RespBody, Result, S3Request, S3Response, Secret, UnixMs,
+};
 
 const KEY_PATH: &str = "/_admin/setup/key-locations";
 const GATE_PATH: &str = "/_admin/setup/directory-gate";
@@ -36,7 +39,34 @@ struct Ports {
     maintenance: Maintenance,
     kek: TestKek,
     clock: FixedClock,
-    sql: Option<RusqliteSql>,
+    sql: Option<SetupSql>,
+}
+
+struct SetupSql {
+    inner: RusqliteSql,
+    move_on_batch: Cell<bool>,
+}
+
+impl Sql for SetupSql {
+    async fn query(&self, sql: &str, params: &[SqlValue]) -> Result<Vec<Row>> {
+        self.inner.query(sql, params).await
+    }
+
+    async fn exec(&self, sql: &str, params: &[SqlValue]) -> Result<u64> {
+        self.inner.exec(sql, params).await
+    }
+
+    async fn batch(&self, stmts: Vec<(&'static str, Vec<SqlValue>)>) -> Result<Vec<u64>> {
+        if self.move_on_batch.replace(false) {
+            // A competing writer moves the gate between the initial read and
+            // the first-close CAS. Epoch 1 open would answer AlreadyOpen.
+            self.inner.exec(
+                "INSERT INTO directory_gate (id, closed, epoch, reason) VALUES (1, 1, 2, 'competing close')",
+                &[],
+            ).await?;
+        }
+        self.inner.batch(stmts).await
+    }
 }
 
 impl Ports {
@@ -68,12 +98,15 @@ impl Ports {
             sql.apply(migration).unwrap();
         }
         Self {
-            sql: Some(sql),
+            sql: Some(SetupSql {
+                inner: sql,
+                move_on_batch: Cell::new(false),
+            }),
             ..Self::new()
         }
     }
 
-    fn dir(&self) -> SqlDirectory<'_, RusqliteSql> {
+    fn dir(&self) -> SqlDirectory<'_, SetupSql> {
         SqlDirectory {
             sql: self.sql.as_ref().unwrap(),
         }
@@ -116,7 +149,7 @@ impl RootPorts for Ports {
     type Records = MemRecords;
     type KeyStore = MemRecords;
     type Kek = TestKek;
-    type Sql = RusqliteSql;
+    type Sql = SetupSql;
     type Clock = FixedClock;
 
     fn records(&self) -> &MemRecords {
@@ -135,7 +168,7 @@ impl RootPorts for Ports {
         &self.kek
     }
 
-    fn directory(&self) -> Option<&RusqliteSql> {
+    fn directory(&self) -> Option<&SetupSql> {
         self.sql.as_ref()
     }
 
@@ -307,7 +340,13 @@ async fn restore_refuses_both_setup_routes_without_writing() {
         ..Ports::with_closed_directory()
     };
     let sql = ports.directory().unwrap();
-    let store_activity = || (ports.records.lists(), sql.read_stats(), sql.write_steps());
+    let store_activity = || {
+        (
+            ports.records.lists(),
+            sql.inner.read_stats(),
+            sql.inner.write_steps(),
+        )
+    };
     let before = store_activity();
     for path in [KEY_PATH, GATE_PATH] {
         expect_error(&ports.post(path).await, 503, "ServiceUnavailable");
@@ -567,10 +606,11 @@ async fn a_closed_gate_without_tenants_runs_first_open() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn a_closed_gate_with_key_locations_opens_at_epoch_one() {
+async fn a_freshly_migrated_directory_with_key_locations_opens_at_epoch_one() {
     let ports = Ports::with_closed_directory();
     let dir = ports.dir();
     assert_eq!(ports.post(KEY_PATH).await.status, 200);
+    assert_eq!(dir.gate_row().await.unwrap(), None);
 
     assert_eq!(
         json_response(&ports.post(GATE_PATH).await, 200),
@@ -585,11 +625,71 @@ async fn a_stray_gate_anchor_leaves_first_open_closed_and_alerts() {
     let ports = Ports::with_closed_directory();
     assert_eq!(ports.post(KEY_PATH).await.status, 200);
     ports.records.plant("m/dg/x", Vec::new());
+    assert_unexpected_epoch_without_writes(&ports).await;
+}
 
+#[tokio::test(flavor = "current_thread")]
+async fn a_gate_row_closed_at_epoch_two_refuses_first_open_and_alerts() {
+    let ports = Ports::with_closed_directory();
+    assert_eq!(ports.post(KEY_PATH).await.status, 200);
+    ports.records.plant("m/dg/00000000000000000001", Vec::new());
+    ports.dir().mark_closed(2, "fixture", NOW).await.unwrap();
+    assert_unexpected_epoch_without_writes(&ports).await;
+}
+
+async fn assert_unexpected_epoch_without_writes(ports: &Ports) {
+    let dir = ports.dir();
+    let pending = PendingOp {
+        tenant: Tenant::parse("t_00000000000000a1").unwrap(),
+        chain: ChainKind::Tenant,
+        seq: 1,
+        kind: "fixture".into(),
+        created_at: NOW.plus_ms(-1),
+    };
+    dir.add_pending(&pending).await.unwrap();
+    let gate = dir.gate_row().await.unwrap();
+    let puts = ports.records.puts();
+    let names = ports.records.names();
+    let steps = dir.sql.inner.write_steps();
     watch_alerts();
-    expect_error(&ports.post(GATE_PATH).await, 503, "gate_not_opened");
+    expect_error(&ports.post(GATE_PATH).await, 409, "gate_epoch_unexpected");
     assert_eq!(take_alerts().len(), 1);
-    assert!(!is_open(&ports.records, &ports.dir()).await.unwrap());
+    assert_eq!(dir.sql.inner.write_steps(), steps);
+    assert_eq!(dir.gate_row().await.unwrap(), gate);
+    assert!(!is_open(&ports.records, &dir).await.unwrap());
+    assert_eq!(dir.pending_before(NOW, 2).await.unwrap(), [pending]);
+    assert_eq!(ports.records.puts(), puts);
+    assert_eq!(ports.records.names(), names);
+    ports.assert_key_buckets_untouched();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_first_open_record_store_error_has_retry_after() {
+    let ports = Ports::with_closed_directory();
+    ports.records.refuse_lists(true);
+    let resp = ports.post(GATE_PATH).await;
+    expect_error(&resp, 503, "SlowDown");
+    assert_eq!(response_header(&resp, "retry-after"), Some("1"));
+    assert_eq!(ports.dir().gate_row().await.unwrap(), None);
+    ports.assert_writes(0, &[]);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_first_open_that_loses_the_gate_has_retry_after() {
+    let ports = Ports::with_closed_directory();
+    let dir = ports.dir();
+    assert_eq!(ports.post(KEY_PATH).await.status, 200);
+    dir.sql.move_on_batch.set(true);
+    let resp = ports.post(GATE_PATH).await;
+    expect_error(&resp, 503, "SlowDown");
+    assert_eq!(response_header(&resp, "retry-after"), Some("1"));
+    assert!(!dir.sql.move_on_batch.get(), "the forced CAS loss must run");
+    let row = dir.gate_row().await.unwrap().unwrap();
+    assert!(
+        row.closed && row.epoch == 2 && !row.pending_cleared,
+        "{row:?}"
+    );
+    assert_eq!(anchored_epoch(&ports.records).await.unwrap(), (1, 0));
 }
 
 #[tokio::test(flavor = "current_thread")]

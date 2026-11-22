@@ -7,7 +7,7 @@ use std::pin::Pin;
 use sha2::{Digest, Sha256};
 use tokio::sync::Notify;
 use velmora::rng::FillRandom;
-use velmora_bridge::directory::chain::TenantChain;
+use velmora_bridge::directory::chain::{TenantChain, TENANT_CHAIN_PREFIX};
 use velmora_bridge::directory::first_open::{first_open, FirstOpenAnswer};
 use velmora_bridge::directory::gate::{anchored_epoch, is_open, GATE_ANCHOR_PREFIX};
 use velmora_bridge::directory::record::Tenant;
@@ -124,6 +124,7 @@ enum StopAt {
     Never,
     OpenGate,
     FirstWrite,
+    TenantCheck,
     Io(usize),
 }
 
@@ -132,12 +133,14 @@ enum Io {
     Other,
     Write,
     OpenGate,
+    TenantCheck,
 }
 
 /// One stop shared by the two adapters of one attempt, not by both attempts.
 struct Pause {
     stop_at: Cell<StopAt>,
     calls: Cell<usize>,
+    writes: Cell<usize>,
     reached: Notify,
     release: Notify,
 }
@@ -147,6 +150,7 @@ impl Pause {
         Self {
             stop_at: Cell::new(stop_at),
             calls: Cell::new(0),
+            writes: Cell::new(0),
             reached: Notify::new(),
             release: Notify::new(),
         }
@@ -155,10 +159,14 @@ impl Pause {
     async fn before(&self, io: Io) {
         let call = self.calls.get();
         self.calls.set(call + 1);
+        if matches!(io, Io::Write | Io::OpenGate) {
+            self.writes.set(self.writes.get() + 1);
+        }
         let stop = match self.stop_at.get() {
             StopAt::Never => false,
             StopAt::OpenGate => io == Io::OpenGate,
             StopAt::FirstWrite => matches!(io, Io::Write | Io::OpenGate),
+            StopAt::TenantCheck => io == Io::TenantCheck,
             StopAt::Io(k) => call == k,
         };
         if stop {
@@ -199,7 +207,12 @@ impl RecordStore for PausedRecords<'_> {
     }
 
     async fn list(&self, prefix: &str, start_after: &str, limit: u32) -> Result<Vec<String>> {
-        self.pause.before(Io::Other).await;
+        let io = if prefix == TENANT_CHAIN_PREFIX {
+            Io::TenantCheck
+        } else {
+            Io::Other
+        };
+        self.pause.before(io).await;
         self.records.list(prefix, start_after, limit).await
     }
 
@@ -261,6 +274,7 @@ async fn attempt(
     first_open(&chain, &dir, &kek(), now).await
 }
 
+#[derive(Debug, PartialEq, Eq)]
 struct Snapshot {
     gate: Vec<Row>,
     pending: Vec<Row>,
@@ -272,7 +286,7 @@ impl Snapshot {
         Self {
             gate: db
                 .query(
-                    "SELECT id, closed, epoch, reason, closed_at, opened_at FROM directory_gate",
+                    "SELECT id, closed, epoch, reason, closed_at, opened_at, pending_cleared FROM directory_gate WHERE id = 1",
                     &[],
                 )
                 .await
@@ -319,9 +333,9 @@ fn a_losing_first_open_never_closes_an_open_gate_or_empties_pending() {
 
         let b_pause = Pause::new(StopAt::FirstWrite);
         let mut b = std::pin::pin!(attempt(&store, &db, &b_pause, B_NOW));
-        // A contender that finishes without a write is also safe. Otherwise
-        // B's write cannot run until A opens and the create lands.
-        let b_finished = b_pause.wait_or_finish(b.as_mut()).await;
+        if let Some(answer) = b_pause.wait_or_finish(b.as_mut()).await {
+            panic!("B completed before its first write: {answer:?}");
+        }
 
         a_pause.release.notify_one();
         let a_answer = a.await;
@@ -331,14 +345,8 @@ fn a_losing_first_open_never_closes_an_open_gate_or_empties_pending() {
         assert_eq!(before.anchors, [FIRST_ANCHOR]);
         assert_eq!(before.pending, [create_pending_row()]);
 
-        let b_answer = match b_finished {
-            Some(answer) => answer,
-            None => {
-                b_pause.release.notify_one();
-                b.await
-            }
-        };
-        eprintln!("A={a_answer:?}; B={b_answer:?}");
+        b_pause.release.notify_one();
+        assert_eq!(b.await.unwrap(), FirstOpenAnswer::AlreadyOpen);
 
         let after = Snapshot::read(&db, &store).await;
         assert_eq!(after.anchors, [FIRST_ANCHOR], "B added a gate anchor");
@@ -350,6 +358,11 @@ fn a_losing_first_open_never_closes_an_open_gate_or_empties_pending() {
 
 #[test]
 fn first_open_interleaved_at_every_await_point() {
+    check_every_await_point("A", A_NOW, B_NOW);
+    check_every_await_point("B", B_NOW, A_NOW);
+}
+
+fn check_every_await_point(paused: &str, paused_now: UnixMs, other_now: UnixMs) {
     let mut failures = Vec::new();
     let mut covered = 0;
     loop {
@@ -360,13 +373,13 @@ fn first_open_interleaved_at_every_await_point() {
             let dir = SqlDirectory { sql: &db };
             seed(&store, &dir).await;
 
-            let a_pause = Pause::new(StopAt::Io(k));
-            let mut a = std::pin::pin!(attempt(&store, &db, &a_pause, A_NOW));
-            if a_pause.wait_or_finish(a.as_mut()).await.is_some() {
+            let pause = Pause::new(StopAt::Io(k));
+            let mut call = std::pin::pin!(attempt(&store, &db, &pause, paused_now));
+            if pause.wait_or_finish(call.as_mut()).await.is_some() {
                 return false;
             }
 
-            let b_answer = attempt(&store, &db, &Pause::new(StopAt::Never), B_NOW).await;
+            let other_answer = attempt(&store, &db, &Pause::new(StopAt::Never), other_now).await;
             let before = if is_open(&store, &dir).await.unwrap() {
                 create(&store, &dir).await;
                 Some(Snapshot::read(&db, &store).await)
@@ -374,10 +387,20 @@ fn first_open_interleaved_at_every_await_point() {
                 None
             };
 
-            a_pause.release.notify_one();
-            let a_answer = a.await;
+            pause.release.notify_one();
+            let paused_answer = call.await;
             let after = Snapshot::read(&db, &store).await;
             let mut problems = Vec::new();
+            for (answer, problem) in [
+                (&paused_answer, "paused call did not report an open gate"),
+                (&other_answer, "unpaused call did not report an open gate"),
+            ] {
+                if !(matches!(answer, Ok(FirstOpenAnswer::AlreadyOpen))
+                    || matches!(answer, Ok(FirstOpenAnswer::Ran(run)) if run.opened && run.epoch == 1))
+                {
+                    problems.push(problem);
+                }
+            }
             if !gate_open_at_one(&store, &dir).await {
                 problems.push("gate not open at epoch 1");
             }
@@ -395,7 +418,7 @@ fn first_open_interleaved_at_every_await_point() {
             }
             if !problems.is_empty() {
                 failures.push(format!(
-                    "k={k}: {problems:?}; A={a_answer:?}; B={b_answer:?}"
+                    "k={k}, paused={paused}: {problems:?}; paused={paused_answer:?}; unpaused={other_answer:?}"
                 ));
             }
             true
@@ -412,4 +435,143 @@ fn first_open_interleaved_at_every_await_point() {
         failures.len(),
         failures.join("\n")
     );
+}
+
+#[test]
+fn first_open_retry_after_a_lost_success_outranks_a_landed_tenant_create() {
+    block_on(async {
+        let db = database();
+        let store = HookedRecords::new();
+        let dir = SqlDirectory { sql: &db };
+        seed(&store, &dir).await;
+        // Commit the first open, but model its 200 as lost in transit.
+        let answer = attempt(&store, &db, &Pause::new(StopAt::Never), A_NOW)
+            .await
+            .unwrap();
+        assert!(matches!(answer, FirstOpenAnswer::Ran(run) if run.opened && run.epoch == 1));
+        create(&store, &dir).await;
+        let before = Snapshot::read(&db, &store).await;
+        assert_eq!(before.pending, [create_pending_row()]);
+        let retry = Pause::new(StopAt::Never);
+        assert_eq!(
+            attempt(&store, &db, &retry, B_NOW).await.unwrap(),
+            FirstOpenAnswer::AlreadyOpen
+        );
+        assert_eq!(
+            retry.calls.get(),
+            2,
+            "an open gate must short-circuit before listing tenant chains"
+        );
+        assert_eq!(retry.writes.get(), 0);
+        assert_eq!(Snapshot::read(&db, &store).await, before);
+    });
+}
+
+#[test]
+fn a_call_at_its_tenant_check_recognizes_an_open_and_create_since_its_reads() {
+    block_on(async {
+        let db = database();
+        let store = HookedRecords::new();
+        let dir = SqlDirectory { sql: &db };
+        seed(&store, &dir).await;
+
+        let pause = Pause::new(StopAt::TenantCheck);
+        let mut call = std::pin::pin!(attempt(&store, &db, &pause, A_NOW));
+        if let Some(answer) = pause.wait_or_finish(call.as_mut()).await {
+            panic!("A completed before its tenant check: {answer:?}");
+        }
+        assert_eq!(
+            pause.calls.get(),
+            3,
+            "A must have read the row and anchors first"
+        );
+        assert_eq!(dir.gate_row().await.unwrap(), None);
+        assert!(store
+            .list(GATE_ANCHOR_PREFIX, "", 2)
+            .await
+            .unwrap()
+            .is_empty());
+
+        let answer = attempt(&store, &db, &Pause::new(StopAt::Never), B_NOW)
+            .await
+            .unwrap();
+        assert!(matches!(answer, FirstOpenAnswer::Ran(run) if run.opened && run.epoch == 1));
+        create(&store, &dir).await;
+        let before = Snapshot::read(&db, &store).await;
+        assert_eq!(before.pending, [create_pending_row()]);
+        pause.release.notify_one();
+        assert_eq!(call.await.unwrap(), FirstOpenAnswer::AlreadyOpen);
+        assert_eq!(pause.writes.get(), 0);
+        assert_eq!(Snapshot::read(&db, &store).await, before);
+    });
+}
+
+#[test]
+fn invalid_first_open_epochs_and_anchors_are_left_untouched() {
+    const SECOND: &str = "m/dg/00000000000000000002";
+    block_on(async {
+        for (row, anchors) in [
+            (Some((1, 1)), &[][..]),
+            (Some((1, 2)), &[FIRST_ANCHOR][..]),
+            (Some((0, 2)), &[FIRST_ANCHOR][..]),
+            (None, &[SECOND][..]),
+            (Some((0, 1)), &[FIRST_ANCHOR, SECOND][..]),
+            (Some((1, 1)), &["m/dg/0", FIRST_ANCHOR][..]),
+            (Some((1, 1)), &[FIRST_ANCHOR, "m/dg/z"][..]),
+            (Some((0, 1)), &[][..]),
+            (Some((0, 0)), &[][..]),
+        ] {
+            let db = database();
+            let store = HookedRecords::new();
+            let dir = SqlDirectory { sql: &db };
+            seed(&store, &dir).await;
+            for key in anchors {
+                store.plant(key, vec![1]);
+            }
+            if let Some((closed, epoch)) = row {
+                db.exec(
+                    "INSERT INTO directory_gate (id, closed, epoch, reason, closed_at, opened_at, pending_cleared) \
+                     VALUES (1, ?1, ?2, 'fixture', 123, 456, 1)",
+                    &[SqlValue::Int(closed), SqlValue::Int(epoch)],
+                ).await.unwrap();
+            }
+            let before = Snapshot::read(&db, &store).await;
+            let pause = Pause::new(StopAt::Never);
+            let case = format!("row={row:?}, anchors={anchors:?}");
+            assert_eq!(
+                attempt(&store, &db, &pause, NOW).await.unwrap(),
+                FirstOpenAnswer::EpochUnexpected,
+                "{case}"
+            );
+            assert_eq!(pause.writes.get(), 0, "{case}");
+            assert_eq!(Snapshot::read(&db, &store).await, before, "{case}");
+        }
+    });
+}
+
+#[test]
+fn a_first_open_run_drops_its_fence_once_the_gate_opens() {
+    use velmora_bridge::directory::gate::first_open_holds;
+
+    block_on(async {
+        let db = database();
+        let store = HookedRecords::new();
+        let dir = SqlDirectory { sql: &db };
+        assert!(
+            !first_open_holds(&store, &dir).await.unwrap(),
+            "no gate row"
+        );
+        dir.first_close("fixture", NOW).await.unwrap();
+        assert!(
+            !first_open_holds(&store, &dir).await.unwrap(),
+            "missing anchor"
+        );
+        store.plant(FIRST_ANCHOR, vec![1]);
+        assert!(first_open_holds(&store, &dir).await.unwrap());
+        assert!(dir.first_open_gate(NOW).await.unwrap());
+        assert!(
+            !first_open_holds(&store, &dir).await.unwrap(),
+            "gate is open"
+        );
+    });
 }
