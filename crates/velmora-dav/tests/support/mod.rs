@@ -149,6 +149,15 @@ impl Upstream for Up {
 /// SQLite in memory, the same SQL as the Durable Object.
 pub struct MemSql(pub rusqlite::Connection);
 
+impl MemSql {
+    fn transaction<T>(&self, f: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+        let tx = self.0.unchecked_transaction().map_err(|e| e.to_string())?;
+        let result = f()?; // Dropping tx on error restores the pre-batch state.
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(result)
+    }
+}
+
 impl Sql for MemSql {
     fn exec(&self, sql: &str, params: &[Val]) -> Result<Vec<Vec<Val>>, String> {
         let mut stmt = self.0.prepare(sql).map_err(|e| e.to_string())?;
@@ -209,11 +218,13 @@ impl StatePort for States {
         );
         let wire = serde_json::to_string(&ops).unwrap();
         let ops: Vec<Op> = serde_json::from_str(&wire).unwrap();
-        let out = Engine {
-            sql: db.as_ref(),
-            now: self.now.get(),
-        }
-        .run(ops);
+        let out = db.transaction(|| {
+            Engine {
+                sql: db.as_ref(),
+                now: self.now.get(),
+            }
+            .run(ops)
+        });
         let out = out.map(|r| {
             let wire = serde_json::to_string(&r).unwrap();
             serde_json::from_str(&wire).unwrap()

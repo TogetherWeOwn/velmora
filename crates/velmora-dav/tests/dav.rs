@@ -7,6 +7,58 @@ mod support;
 use support::*;
 use velmora_dav::handler::Config;
 
+#[tokio::test]
+async fn state_batch_rolls_back_on_second_op_sql_error() {
+    use velmora_dav::state::{DeadProp, Op, Patch, Reply};
+    use velmora_dav::StatePort;
+
+    let states = States::default();
+    let patch = |path: &str| Op::PropPatch {
+        path: path.into(),
+        etag: None,
+        patches: vec![Patch::Set(DeadProp {
+            ns: "urn:test".into(),
+            name: "label".into(),
+            xml: "<label xmlns=\"urn:test\">saved</label>".into(),
+        })],
+    };
+    let get = |path: &str| Op::PropGet {
+        paths: vec![(path.into(), None)],
+        names: None,
+    };
+
+    assert_eq!(
+        states
+            .call("bucket", vec![patch("existing")])
+            .await
+            .unwrap(),
+        vec![Reply::Patched(vec![200])]
+    );
+    let before = states.call("bucket", vec![get("existing")]).await.unwrap();
+    states.dbs.borrow()["bucket"]
+        .0
+        .execute_batch(
+            "CREATE TRIGGER fail_second_patch BEFORE INSERT ON dav_props
+             WHEN NEW.path = 'fail' BEGIN SELECT RAISE(ABORT, 'second op failed'); END;",
+        )
+        .unwrap();
+
+    let error = states
+        .call("bucket", vec![patch("first"), patch("fail")])
+        .await
+        .unwrap_err();
+    assert_eq!(error, "second op failed");
+    assert_eq!(
+        states.call("bucket", vec![get("first")]).await.unwrap(),
+        vec![Reply::Props(vec![vec![]])],
+        "first op's write must be rolled back"
+    );
+    assert_eq!(
+        states.call("bucket", vec![get("existing")]).await.unwrap(),
+        before
+    );
+}
+
 const PF_BASIC: &[&str] = &[
     "getcontentlength",
     "getetag",

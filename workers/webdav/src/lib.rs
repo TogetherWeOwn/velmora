@@ -23,7 +23,7 @@ use velmora_dav::http::{Body, Request as DavRequest, Response as DavResponse};
 use velmora_dav::s3::{S3Error, Upstream};
 use velmora_dav::state::{Engine, Op, Reply, Sql, Val};
 use worker::js_sys::{self, Reflect};
-use worker::wasm_bindgen::{self, JsCast, JsValue};
+use worker::wasm_bindgen::{self, closure::ScopedClosure, JsCast, JsValue};
 use worker::{
     console_log, durable_object, event, Context, Delay, DurableObject, EncodeBody, Env, Fetcher,
     FixedLengthStream, Headers, Method, ObjectNamespace, Request, RequestInit, Response,
@@ -382,6 +382,40 @@ pub struct DavState {
     state: State,
 }
 
+impl DavState {
+    fn run_batch(&self, ops: Vec<Op>) -> std::result::Result<Vec<Reply>, JsValue> {
+        let storage = self.state.storage();
+        // worker 0.8.7 exposes the raw storage but does not bind transactionSync.
+        let raw: &JsValue = storage.as_raw().as_ref();
+        let transaction: js_sys::Function =
+            Reflect::get(raw, &JsValue::from_str("transactionSync"))?.dyn_into()?;
+        let sql = DoSql(storage.sql());
+        let engine = Engine {
+            sql: &sql,
+            now: (worker::Date::now().as_millis() / 1000) as i64,
+        };
+        let mut ops = Some(ops);
+        let mut replies = None;
+        {
+            // A callback Err becomes a JS throw, not a return value, so storage
+            // sees the failure and rolls back. call1 catches the JS exception
+            // outside the transaction, including errors raised by storage itself.
+            let mut run = || -> std::result::Result<(), JsValue> {
+                let ops = ops.take().ok_or_else(|| JsValue::from_str("batch rerun"))?;
+                replies = Some(
+                    engine
+                        .run(ops)
+                        .map_err(|_| JsValue::from_str("batch failed"))?,
+                );
+                Ok(())
+            };
+            let callback = ScopedClosure::borrow_mut(&mut run);
+            transaction.call1(raw, callback.as_ref())?;
+        }
+        replies.ok_or_else(|| JsValue::from_str("batch did not run"))
+    }
+}
+
 impl DurableObject for DavState {
     fn new(state: State, _env: Env) -> Self {
         DavState { state }
@@ -392,12 +426,7 @@ impl DurableObject for DavState {
         let Ok(ops) = serde_json::from_str::<Vec<Op>>(&raw) else {
             return Ok(Response::empty()?.with_status(400));
         };
-        let sql = DoSql(self.state.storage().sql());
-        let engine = Engine {
-            sql: &sql,
-            now: (worker::Date::now().as_millis() / 1000) as i64,
-        };
-        match engine.run(ops) {
+        match self.run_batch(ops) {
             Ok(replies) => Response::from_json(&replies),
             Err(_) => {
                 console_log!("dav state: storage error");
