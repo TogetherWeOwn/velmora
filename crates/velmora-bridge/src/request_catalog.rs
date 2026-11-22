@@ -21,11 +21,6 @@
 //!   the job path. Every other method (bucket and key administration,
 //!   jobs, replay, restore) is not on a unit's request path and is
 //!   refused ([`ERR_NOT_ON_REQUEST_PATH`]).
-//!
-//! **Not request calls yet:** `upload_state` and `unmark_sent`, main's
-//! two newer methods (L2-4 adds them to `RequestCall`). Until then a
-//! managed tenant's UploadPart and CompleteMultipartUpload fail, and the
-//! PUT path's mark take-back is skipped (it is best effort).
 
 #![allow(clippy::too_many_arguments)]
 
@@ -336,12 +331,12 @@ impl<P: UnitPort + TenantRing, S: Catalog> Catalog for RequestCatalog<P, S> {
     }
 
     async fn upload_state(&self, t: &UploadTarget<'_>) -> Result<Option<UploadState>> {
-        let _ = (t,);
-        Err(not_here("upload_state"))
+        self.verified()?;
+        self.client.upload_state(t).await
     }
     async fn unmark_sent(&self, jobs: &[Job], mark: UnixMs) -> Result<u64> {
-        let _ = (jobs, mark);
-        Err(not_here("unmark_sent"))
+        self.verified()?;
+        self.client.unmark_sent(jobs, mark).await
     }
     async fn gc_orphans_due(&self, now: UnixMs) -> Result<bool> {
         let _ = (now,);

@@ -160,6 +160,14 @@ impl<P: RootPorts, R: FillRandom> TenantHeads for RootUnitHeads<'_, '_, P, R> {
         TenantHeads::head(&self.root.heads(), tenant, known).await
     }
 
+    async fn record_door(
+        &self,
+        tenant: &TenantId,
+        seq: u64,
+    ) -> std::result::Result<Option<TenantDoor>, ChainError> {
+        self.root.heads().record_door(tenant, seq).await
+    }
+
     async fn record(
         &self,
         tenant: &TenantId,

@@ -745,9 +745,9 @@ key version). A bucket delete over S3 answers `403`. After the handler,
 the records of publications the unit refused before running them are
 discarded, and a unit's refusal answers the request when the handler
 failed on it (the table below). A fan-out GET is not split for a managed
-tenant. `upload_state` and `unmark_sent` are not request calls yet: a
-managed tenant's UploadPart and CompleteMultipartUpload fail until they
-are.
+tenant. UploadPart reads `upload_state` from the unit before taking the
+body; a failed post notification clears the unit's sent marks through
+`unmark_sent` so the dispatcher can retry.
 
 ## Requests
 

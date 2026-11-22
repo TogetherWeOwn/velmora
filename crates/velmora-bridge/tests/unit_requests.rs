@@ -34,7 +34,6 @@ use velmora_bridge::unit::{
     BirthKind, BirthToken, CallKind, Refused, Seqs, SyncHead, TenantId, TenantState, Unit,
     UnitAnswer, UnitCall, UnitName, UnitOp,
 };
-use velmora_bridge::unit_lease::lease::Proven;
 use velmora_bridge::*;
 
 const BUCKET: &str = "vault";

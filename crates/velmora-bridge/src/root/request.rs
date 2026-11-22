@@ -159,7 +159,10 @@ impl<P: UnitPorts, R: FillRandom> UnitPort for RequestPort<P, R> {
             .as_deref()
             .filter(|_| key_row && authenticated)
         {
-            let client = root.unit_client(&routed.unit, routed.listed)?;
+            let Ok(client) = root.unit_client(&routed.unit, routed.listed) else {
+                self.keep(RouteRefusal::Unavailable);
+                return Err(ERR_ROUTE_REFUSED);
+            };
             let (answered, pages) = client
                 .key_row_verified(
                     first.clone(),

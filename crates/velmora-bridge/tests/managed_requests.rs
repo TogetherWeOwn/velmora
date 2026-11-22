@@ -423,6 +423,7 @@ struct World {
     safety: Blobs,
     blobs: Blobs,
     article: Article,
+    fail_jobs: Cell<bool>,
 }
 
 impl World {
@@ -601,6 +602,7 @@ impl World {
             cache: Rc::new(RootCache::new()),
             blobs: Blobs::default(),
             article: Article::default(),
+            fail_jobs: Cell::new(false),
         };
         world.renew();
         let root = Root::new(&*world.ports, &world.cache, TestRng(3));
@@ -809,7 +811,10 @@ impl World {
             safety: self.safety.clone(),
             cache: self.blobs.clone(),
             nntp: self.article.clone(),
-            jobs: Jobs::default(),
+            jobs: Jobs {
+                fail: Cell::new(self.fail_jobs.get()),
+                ..Jobs::default()
+            },
             kek: TestKek::new(),
             clock: self.ports.clock.clone(),
             budget: ByteBudget::new(ucfg.inflight_budget_bytes),
@@ -1227,6 +1232,118 @@ fn delete_bucket_over_s3_is_refused_and_writes_nothing() {
     );
     let (resp, _) = w.serve(other, Maintenance::Off);
     assert_s3_error(&resp, 403, "InvalidAccessKeyId");
+}
+
+#[test]
+fn a_managed_multipart_upload_completes_and_takes_back_failed_job_marks() {
+    let w = World::new();
+    let signer = signer();
+    let (created, _) = w.serve(create_multipart(&signer), Maintenance::Off);
+    assert_eq!(created.status, 200);
+    let xml = std::str::from_utf8(&created.body).unwrap();
+    let (_, xml) = xml.split_once("<UploadId>").unwrap();
+    let (upload_id, _) = xml.split_once("</UploadId>").unwrap();
+    let path = object_path();
+    let mut manifest = String::from("<CompleteMultipartUpload>");
+    let mut bytes = Vec::new();
+    for (number, part) in [
+        ("1", vec![b'a'; 5 * 1024 * 1024]),
+        ("2", b"last part".to_vec()),
+    ] {
+        bytes.extend_from_slice(&part);
+        let req = signer.sign(
+            T0,
+            Method::Put,
+            &path,
+            &[("partNumber", number), ("uploadId", upload_id)],
+            &[],
+            part,
+        );
+        let (resp, _) = w.serve(req, Maintenance::Off);
+        assert_eq!(resp.status, 200, "UploadPart {number}");
+        let etag = resp.header("etag").unwrap().replace('"', "&quot;");
+        manifest.push_str(&format!(
+            "<Part><PartNumber>{number}</PartNumber><ETag>{etag}</ETag></Part>"
+        ));
+    }
+    manifest.push_str("</CompleteMultipartUpload>");
+    w.fail_jobs.set(true);
+    let req = signer.sign(
+        T0,
+        Method::Post,
+        &path,
+        &[("uploadId", upload_id)],
+        &[],
+        manifest.into_bytes(),
+    );
+    let (completed, _) = w.serve(req, Maintenance::Off);
+    assert_eq!(completed.status, 200);
+    let completed_xml = std::str::from_utf8(&completed.body).unwrap();
+    assert!(completed_xml.contains("<CompleteMultipartUploadResult"));
+    assert!(w.calls().iter().any(|call| {
+        call.authenticated
+            && matches!(&call.op, UnitOp::Request { call }
+            if matches!(call.as_ref(), RequestCall::unmark_sent { jobs, mark }
+                if jobs.len() == 2 && *mark == T0))
+    }));
+    let outbox = w
+        .ports
+        .unit
+        .sql()
+        .with_conn(|c| {
+            c.query_row(
+                "SELECT COUNT(*), COUNT(sent_at) FROM outbox WHERE stage='post'",
+                [],
+                |row| Ok((row.get::<_, u32>(0)?, row.get::<_, u32>(1)?)),
+            )
+        })
+        .unwrap();
+    assert_eq!(
+        outbox,
+        (2, 0),
+        "the durable post jobs remain and both sent marks are cleared"
+    );
+    let req = signer.sign(T0, Method::Get, &path, &[], &[], Vec::new());
+    let (get, _) = w.serve(req, Maintenance::Off);
+    assert_eq!(get.status, 200);
+    assert!(
+        get.body == bytes,
+        "the multipart object's bytes must match both parts"
+    );
+}
+
+#[test]
+fn a_later_door_only_sync_does_not_need_the_applied_bucket_records_key() {
+    let w = World::new();
+    let seen = w.ports.unit.head().unwrap().seqs;
+    let tenant = Tenant::Managed(id());
+    let root = Root::new(&*w.ports, &w.cache, TestRng(18));
+    let wrote = block_on(root.chain().write(
+        &tenant,
+        &Change::SetLimits {
+            base_seq: seen.state_seq,
+            limits: BTreeMap::from([("fixture-cap".into(), 1)]),
+            rate_json: None,
+        },
+        Actor::Operator,
+        T0,
+        0,
+    ));
+    assert!(matches!(wrote, Ok(Written::Wrote(_))));
+    for store in [&w.ports.keys_a, &w.ports.keys_b] {
+        let names = store.names();
+        assert_eq!(names.len(), 1);
+        assert!(store.lose(&names[0]));
+    }
+    let cold = RootCache::new();
+    let root = Root::new(&*w.ports, &cold, TestRng(19));
+    let client = root.unit_client(&root_unit(), true).unwrap();
+    let (synced, pages) = block_on(client.sync(seen));
+    assert!(pages.is_empty(), "{pages:?}");
+    assert!(
+        matches!(synced, Ok(Synced::Synced { seqs }) if seqs.state_seq == seen.state_seq + 1),
+        "{synced:?}"
+    );
 }
 
 #[test]

@@ -239,10 +239,7 @@ impl KeyFeed for Keys {
         let head = all.keys().next_back().copied().unwrap_or(0);
         Ok(KeyBatch {
             head,
-            entries: all
-                .range(after + 1..)
-                .map(|(_, e)| e.clone().into())
-                .collect(),
+            entries: all.range(after + 1..).map(|(_, e)| e.clone()).collect(),
             answers: vec![],
         })
     }

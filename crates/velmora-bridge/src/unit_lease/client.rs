@@ -126,6 +126,15 @@ pub trait TenantHeads {
         tenant: &TenantId,
         seq: u64,
     ) -> std::result::Result<Option<ReadRecord>, ChainError>;
+
+    /// The already-applied base of a sync: only its verified door is needed.
+    async fn record_door(
+        &self,
+        tenant: &TenantId,
+        seq: u64,
+    ) -> std::result::Result<Option<TenantDoor>, ChainError> {
+        Ok(self.record(tenant, seq).await?.map(|r| r.door))
+    }
 }
 
 /// The key-chain records of a tenant after a seq, verified and in the
@@ -773,8 +782,9 @@ where
                 at_head: true,
             });
         }
-        let read = |seq| self.heads.record(tenant, seq);
-        let base = read(from)
+        let base = self
+            .heads
+            .record_door(tenant, from)
             .await
             .map_err(chain_error)?
             .ok_or(ERR_RECORD_MISSING)?;
@@ -782,13 +792,14 @@ where
         let mut records: Vec<ReadRecord> = Vec::new();
         for seq in from + 1..=to {
             records.push(
-                read(seq)
+                self.heads
+                    .record(tenant, seq)
                     .await
                     .map_err(chain_error)?
                     .ok_or(ERR_RECORD_MISSING)?,
             );
         }
-        let changes = placements::bucket_changes(unit, &base.door, &records)?;
+        let changes = placements::bucket_changes(unit, &base, &records)?;
         let door = records.pop().map(|r| r.door).ok_or(ERR_RECORD_MISSING)?;
         Ok(BucketPart {
             changes,
@@ -1586,6 +1597,13 @@ impl<T: TenantHeads> TenantHeads for &T {
         seq: u64,
     ) -> std::result::Result<Option<ReadRecord>, ChainError> {
         (**self).record(tenant, seq).await
+    }
+    async fn record_door(
+        &self,
+        tenant: &TenantId,
+        seq: u64,
+    ) -> std::result::Result<Option<TenantDoor>, ChainError> {
+        (**self).record_door(tenant, seq).await
     }
 }
 
