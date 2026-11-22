@@ -7,6 +7,7 @@ use std::rc::Rc;
 
 use velmora_bridge::entry::{names_mgmt, ENTRY_HEADER};
 use velmora_bridge::mgmt::adapters::{HeadDoor, NoBucketNames};
+use velmora_bridge::mgmt::events::TenantEventsHandler;
 use velmora_bridge::mgmt::serve::{serve_request, Answer, Either, NotBuilt, MISCONFIGURED};
 use velmora_bridge::mgmt::tenant::TenantReadHandler;
 use velmora_bridge::mgmt::token::{DisabledTokens, TokenHashes};
@@ -32,7 +33,8 @@ pub fn marked(headers: &Headers) -> bool {
 
 /// The answer to a management request. Served: the tenant read, from the
 /// tenant's verified head (the composition root's door reader over
-/// `SAFETY` and the KEK ring). Every other call answers `503` until its
+/// `SAFETY` and the KEK ring), and the tenant's events, from the
+/// directory's feed (`DIRECTORY`). Every other call answers `503` until its
 /// ports are in this Worker ([`NotBuilt`]): principal create needs the
 /// unit client behind the router and the key writer's stores.
 pub async fn answer(env: &Env, bridge: &WorkerBridge, method: &str, req: S3Request) -> Answer {
@@ -71,7 +73,17 @@ pub async fn answer(env: &Env, bridge: &WorkerBridge, method: &str, req: S3Reque
         heads: &heads,
         names: &NoBucketNames,
     };
-    let handlers = Either(TenantReadHandler { heads: &door }, NotBuilt);
+    let directory = root.directory();
+    let handlers = Either(
+        TenantReadHandler { heads: &door },
+        Either(
+            TenantEventsHandler {
+                heads: &door,
+                feed: directory.as_ref(),
+            },
+            NotBuilt,
+        ),
+    );
     serve_request(
         &disabled,
         &hashes,

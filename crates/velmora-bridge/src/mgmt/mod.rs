@@ -7,6 +7,7 @@
 //!
 //! - [`adapters`]: the ports of the handlers over the tenancy plane's
 //!   stores (the tenant head, the root unit, the key chain).
+//! - [`events`]: one tenant's events, from the directory's feed.
 //! - [`gate`]: what every call passes before its handler runs.
 //! - [`idem`]: `Idempotency-Key` for the capped opening calls, through
 //!   the root unit's reservation.
@@ -21,6 +22,7 @@
 //!   records that disable one.
 
 pub mod adapters;
+pub mod events;
 pub mod gate;
 pub mod idem;
 pub mod principal;
