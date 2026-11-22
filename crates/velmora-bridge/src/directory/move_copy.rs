@@ -123,7 +123,11 @@ impl Default for CopyPlan {
     }
 }
 
-/// What one run did to one table.
+/// What one run did to one table. The counts are this run's only: a
+/// resumed run does not see the rows before the unit's cursor, and rows
+/// it read after the last batch it sent are read (and counted) again by
+/// the next run. They are the copy's report, not V1's reference: V1
+/// counts the frozen D1 and the unit itself.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TableCopy {
     pub table: &'static str,

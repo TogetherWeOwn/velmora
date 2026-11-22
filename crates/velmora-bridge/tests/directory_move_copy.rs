@@ -5,7 +5,8 @@
 
 mod service_support;
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
+use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 
 use service_support::*;
@@ -194,6 +195,8 @@ struct Adapter<'a> {
     imports: Cell<u32>,
     /// Batches the unit answered as applied before (sent again).
     resent: Cell<u32>,
+    /// Imports per table.
+    by_table: RefCell<BTreeMap<String, u32>>,
 }
 
 impl<'a> Adapter<'a> {
@@ -205,6 +208,7 @@ impl<'a> Adapter<'a> {
             fail_after: Cell::new(None),
             imports: Cell::new(0),
             resent: Cell::new(0),
+            by_table: RefCell::new(BTreeMap::new()),
         }
     }
 }
@@ -218,6 +222,11 @@ impl UnitImport for Adapter<'_> {
             self.fail_after.set(Some(n - 1));
         }
         self.imports.set(self.imports.get() + 1);
+        *self
+            .by_table
+            .borrow_mut()
+            .entry(batch.table.name().to_string())
+            .or_default() += 1;
         let a = worker(
             self.unit,
             seqs(self.state_seq),
@@ -347,12 +356,22 @@ async fn catalogue_with_lease(rig: &Rig, lease_until: i64) -> (Bucket, Bucket) {
          INSERT INTO gc(id, extent_id, action, due_at) VALUES (1, '{xv}', 'delete_cache', 50), (2, '{xc}', 'delete_cache', 50);\n\
          INSERT INTO usage_recounts(id, started_at, finished_at, rows, adopted, drift, detail) VALUES (1, 1, 2, 3, 0, 0, NULL);\n\
          INSERT INTO uploads(id, bucket_id, key, content_json, user_meta_json, state, initiated_at) VALUES \
-           ('u_v', '{bv}', 'up.bin', '{{}}', '{{}}', 'open', 3), ('u_c', '{bc}', 'up.bin', '{{}}', '{{}}', 'open', 3);\n\
+           ('u_v', '{bv}', 'up.bin', '{{}}', '{{}}', 'open', 3), ('u_c', '{bc}', 'up.bin', '{{}}', '{{}}', 'open', 3), \
+           ('u_a', '{bv}', 'up.bin', '{{}}', '{{}}', 'open', 3), ('u_c1', '{bc}', 'up.bin', '{{}}', '{{}}', 'open', 3), \
+           ('u_c2', '{bc}', 'up.bin', '{{}}', '{{}}', 'open', 3);\n\
          INSERT INTO upload_parts(upload_id, part_number, extent_id, size, etag, uploaded_at) VALUES \
            ('u_v', 1, '{xv}', 5, 'e1', 4), ('u_v', 2, '{xv}', 5, 'e2', 4), ('u_c', 1, '{xc}', 5, 'e1', 4);\n\
          INSERT INTO upload_part_extents(upload_id, part_number, piece, extent_id) VALUES \
            ('u_v', 1, 1, '{xv}'), ('u_c', 1, 1, '{xc}');\n\
          UPDATE outbox SET lease_owner = 'gone-worker', lease_until = {lease_until} WHERE extent_id = '{xv}';\n"
+    ));
+    // The longest key, of the characters JSON escapes: its cursor is
+    // more than twice its length.
+    script.push_str(&format!(
+        "INSERT INTO generations(id, bucket_id, key, state, size, etag, content_json, user_meta_json, \
+         extent_count, created_at) VALUES ('g_long', '{bv}', '{LONG}', 'live', 0, '\"e\"', '{{}}', '{{}}', 0, 1);\n\
+         INSERT INTO objects(bucket_id, key, generation_id) VALUES ('{bv}', '{LONG}', 'g_long');\n",
+        LONG = long_key()
     ));
     // Enough hours for many pages.
     for h in 0..23 {
@@ -364,6 +383,11 @@ async fn catalogue_with_lease(rig: &Rig, lease_until: i64) -> (Bucket, Bucket) {
     rig.bridge.raise_stamp().await.unwrap();
     freeze(&rig.bridge.catalog.sql, 1).await.unwrap();
     (vault, canary)
+}
+
+/// 1024 bytes of `"` and `\`.
+fn long_key() -> String {
+    "\"\\".repeat(512)
 }
 
 fn rows(sql: &RusqliteSql, table: ImportTable) -> Vec<Vec<SqlValue>> {
@@ -519,6 +543,15 @@ fn every_table_arrives_row_for_row_without_the_canary() {
         assert_eq!(by("verify_escalations").excluded, 0);
         assert_eq!(by("outbox").leases_cleared, 1);
         assert_eq!(by("usage_hours").sent, 23);
+        // Uploads sort u_a (vault), u_c, u_c1, u_c2 (canary), u_v (vault):
+        // by 2, the middle page holds canary rows only and sends nothing,
+        // and the last batch follows the first.
+        assert_eq!((by("uploads").sent, by("uploads").excluded), (2, 3));
+        assert_eq!(adapter.by_table.borrow()["uploads"], 2);
+        // The longest key arrived.
+        assert!(rows(u.sql(), ImportTable::Objects)
+            .iter()
+            .any(|r| r[1] == SqlValue::Text(long_key())));
         // The frozen D1 did not change: it still has every canary row.
         assert_eq!(rows(frozen, ImportTable::Buckets).len(), 2);
         // A second run sends nothing more.
