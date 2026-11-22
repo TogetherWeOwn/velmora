@@ -127,6 +127,7 @@ pub async fn read_events<H: TenantHeadRead, F: TenantFeed>(
                 Tenant::Zero => false,
             };
             if !named {
+                crate::trace::alert(|| "mgmt: events: head names another tenant".to_string());
                 return Answer::code(Code::InternalError, None);
             }
             // AM-40: any call while shredding or shredded.
@@ -152,11 +153,17 @@ pub async fn read_events<H: TenantHeadRead, F: TenantFeed>(
     match feed.events(&Tenant::Managed(managed), after, *limit).await {
         Ok(Ok(page)) => match wire_page(page).map(|p| serde_json::to_vec(&p)) {
             Some(Ok(json)) => Answer::json(200, json),
-            _ => Answer::code(Code::InternalError, None),
+            _ => {
+                crate::trace::alert(|| "mgmt: events: event time unreadable".to_string());
+                Answer::code(Code::InternalError, None)
+            }
         },
         Ok(Err(FeedReset)) => Answer::code(Code::FeedReset, None),
         // A row that does not read as an event: damage, `500` (pages).
-        Err(BridgeError::Invalid(_)) => Answer::code(Code::InternalError, None),
+        Err(BridgeError::Invalid(_)) => {
+            crate::trace::alert(|| "mgmt: events: event row unreadable".to_string());
+            Answer::code(Code::InternalError, None)
+        }
         Err(_) => Answer::code(Code::ServiceUnavailable, None),
     }
 }
