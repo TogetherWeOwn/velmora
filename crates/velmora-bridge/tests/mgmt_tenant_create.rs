@@ -13,14 +13,18 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use velmora::rng::FillRandom;
 use velmora_bridge::config::Maintenance;
+use velmora_bridge::crypto::scheme2::{tk_blob_name, wrap_tenant_key, TenantKey, TK_PREFIX};
+use velmora_bridge::directory::gate;
 use velmora_bridge::directory::record::{Lifecycle, Tenant};
-use velmora_bridge::keys::locations::{two_in_account, write_locations};
+use velmora_bridge::directory::store::SqlDirectory;
+use velmora_bridge::keys::locations::{locations_chain, two_in_account, write_locations};
+use velmora_bridge::keys::ports::{ControlChain, ControlIntents};
 use velmora_bridge::keys::tk::{tk_prefix, KeyBuckets};
 use velmora_bridge::mgmt::adapters::RoutedUnit;
 use velmora_bridge::mgmt::serve::{serve_with, Answer, Either, MgmtRequest, NotBuilt};
 use velmora_bridge::mgmt::tenant_create::{
-    born_name, put_tref, read_born, read_tref, tref_name, CreatePorts, TenantCreateHandler,
-    LOCATION_HINT,
+    born_name, call_key_hash, put_tref, read_born, read_tref, tref_name, CreatePorts,
+    TenantCreateHandler, LOCATION_HINT,
 };
 use velmora_bridge::mgmt::token::{DisabledTokens, TokenHashes};
 use velmora_bridge::records::{MemRecords, RecordStore};
@@ -30,7 +34,7 @@ use velmora_bridge::types::Body;
 use velmora_bridge::unit::{CallKind, Unit, UnitAnswer, UnitCall, UnitName, UnitOp, UnitReply};
 use velmora_bridge::unit_lease::client::{Answered, Page};
 use velmora_bridge::unit_router::{HeadCache, RequestClient, RequestClients, Routed, Router};
-use velmora_bridge::{BridgeError, Result, UnixMs};
+use velmora_bridge::{BridgeError, Result, TenantId, UnixMs};
 
 const NOW: UnixMs = UnixMs(1_800_000_000_000);
 const WS: &str = "ws_01JD2Q8V5X";
@@ -80,6 +84,7 @@ type Planted = Vec<(String, Vec<u8>)>;
 #[derive(Default)]
 struct Faults {
     puts: Cell<u64>,
+    tref_reads: Cell<u64>,
     /// The put that fails: refused (nothing stored) or answer lost
     /// (stored, then an error).
     at: Cell<Option<(u64, bool)>>,
@@ -130,6 +135,9 @@ impl RecordStore for Faulty {
         }
     }
     async fn get(&self, name: &str) -> Result<Option<Vec<u8>>> {
+        if name.starts_with("m/tref/") {
+            self.faults.tref_reads.set(self.faults.tref_reads.get() + 1);
+        }
         self.inner.get(name).await
     }
     async fn list(&self, prefix: &str, start_after: &str, limit: u32) -> Result<Vec<String>> {
@@ -143,10 +151,25 @@ struct Ports {
     keys_b: Faulty,
     kek: TestKek,
     clock: FixedClock,
+    directory: Option<RusqliteSql>,
+}
+
+fn closed_directory() -> RusqliteSql {
+    let sql = RusqliteSql::open_in_memory().unwrap();
+    for migration in [
+        include_str!("../../../workers/s3-bridge/migrations-directory/0001_directory.sql"),
+        include_str!("../../../workers/s3-bridge/migrations-directory/0002_tenant_events.sql"),
+        include_str!(
+            "../../../workers/s3-bridge/migrations-directory/0003_pending_chains_and_caps.sql"
+        ),
+    ] {
+        sql.apply(migration).unwrap();
+    }
+    sql
 }
 
 impl Ports {
-    fn new(faults: &Rc<Faults>) -> Ports {
+    fn new(faults: &Rc<Faults>, directory: Option<RusqliteSql>) -> Ports {
         let store = || Faulty {
             inner: MemRecords::new(),
             faults: faults.clone(),
@@ -157,6 +180,7 @@ impl Ports {
             keys_b: store(),
             kek: TestKek::new(),
             clock: FixedClock::new(NOW),
+            directory,
         }
     }
 }
@@ -179,10 +203,77 @@ impl RootPorts for Ports {
         &self.kek
     }
     fn directory(&self) -> Option<&RusqliteSql> {
-        None
+        self.directory.as_ref()
     }
     fn clock(&self) -> &FixedClock {
         &self.clock
+    }
+}
+
+fn tenant_record_name(tenant: &TenantId, seq: u64) -> String {
+    format!("m/t/{}/{seq:020}", tenant.as_str())
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum IntentKind {
+    Send { record_exists: bool },
+    Note { kind: String, record_exists: bool },
+}
+
+type IntentCall = (TenantId, ControlChain, u64, IntentKind);
+
+#[derive(Default)]
+struct IntentLog {
+    calls: RefCell<Vec<IntentCall>>,
+    fail_send_at: Cell<Option<u64>>,
+    fail_note: Cell<bool>,
+}
+
+struct Intents<'a> {
+    records: &'a Faulty,
+    log: &'a IntentLog,
+}
+
+impl ControlIntents for Intents<'_> {
+    async fn send(&self, tenant: &TenantId, chain: ControlChain, seq: u64) -> Result<()> {
+        let record_exists = self.records.raw(&tenant_record_name(tenant, seq)).is_some();
+        self.log.calls.borrow_mut().push((
+            tenant.clone(),
+            chain,
+            seq,
+            IntentKind::Send { record_exists },
+        ));
+        if self.log.fail_send_at.get() == Some(seq) {
+            return Err(BridgeError::Sql("fault: intent not sent".into()));
+        }
+        Ok(())
+    }
+
+    async fn note(
+        &self,
+        tenant: &TenantId,
+        chain: ControlChain,
+        seq: u64,
+        kind: &str,
+    ) -> Result<()> {
+        let record_exists = self.records.raw(&tenant_record_name(tenant, seq)).is_some();
+        self.log.calls.borrow_mut().push((
+            tenant.clone(),
+            chain,
+            seq,
+            IntentKind::Note {
+                kind: kind.to_owned(),
+                record_exists,
+            },
+        ));
+        if self.log.fail_note.get() {
+            return Err(BridgeError::Sql("fault: intent not noted".into()));
+        }
+        Ok(())
+    }
+
+    async fn clear(&self, _: &TenantId, _: ControlChain, _: u64) -> Result<()> {
+        Ok(())
     }
 }
 
@@ -286,26 +377,64 @@ struct World {
     ports: Ports,
     cache: RootCache,
     units: Units,
+    intents: IntentLog,
     rng_seed: Cell<u64>,
 }
 
 impl World {
     fn new() -> World {
-        let w = World::without_locations();
-        futures_executor_block_on(w.locations());
+        Self::without_locations().with_locations()
+    }
+
+    /// An open gate, but no key locations have been recorded.
+    fn without_locations() -> World {
+        let w = Self::with_directory(Some(closed_directory()));
+        futures_executor_block_on(w.open_gate());
+        w.faults.puts.set(0);
         w
     }
 
-    /// A world whose key locations were never recorded.
-    fn without_locations() -> World {
+    fn without_gate() -> World {
+        Self::with_directory(Some(closed_directory())).with_locations()
+    }
+
+    fn without_directory() -> World {
+        Self::with_directory(None).with_locations()
+    }
+
+    fn with_directory(directory: Option<RusqliteSql>) -> World {
         let faults = Rc::new(Faults::default());
         World {
-            ports: Ports::new(&faults),
+            ports: Ports::new(&faults, directory),
             faults,
             cache: RootCache::new(),
             units: Units::default(),
+            intents: IntentLog::default(),
             rng_seed: Cell::new(100),
         }
+    }
+
+    fn with_locations(self) -> Self {
+        futures_executor_block_on(self.locations());
+        self.faults.puts.set(0);
+        self
+    }
+
+    fn directory(&self) -> SqlDirectory<'_, RusqliteSql> {
+        SqlDirectory {
+            sql: self.ports.directory().unwrap(),
+        }
+    }
+
+    async fn close_gate(&self) -> u64 {
+        gate::close(&self.ports.records, &self.directory(), "test_rebuild", NOW)
+            .await
+            .unwrap()
+    }
+
+    async fn open_gate(&self) {
+        let epoch = self.close_gate().await;
+        assert!(self.directory().open_gate(epoch, NOW).await.unwrap());
     }
 
     async fn locations(&self) {
@@ -321,6 +450,10 @@ impl World {
     }
 
     async fn create(&self, body: &Value) -> Answer {
+        self.create_with_key(body, WS).await
+    }
+
+    async fn create_with_key(&self, body: &Value, idempotency_key: &str) -> Answer {
         let root = Root::new(&self.ports, &self.cache, TestRng(9));
         let heads = root.heads();
         let clients = Direct(&self.units);
@@ -332,6 +465,10 @@ impl World {
             clock: &self.ports.clock,
         };
         let unit = RoutedUnit::new(&router);
+        let intents = Intents {
+            records: &self.ports.records,
+            log: &self.intents,
+        };
         let seed = self.rng_seed.get();
         self.rng_seed.set(seed + 1_000);
         let handlers = Either(
@@ -340,6 +477,7 @@ impl World {
                     ports: &self.ports,
                     root: &root,
                     unit: &unit,
+                    intents: &intents,
                 },
                 rng: RefCell::new(Some(TestRng(seed))),
             },
@@ -358,7 +496,7 @@ impl World {
             query: "",
             authorization: Some(&authorization),
             acting: None,
-            idempotency_key: Some(WS),
+            idempotency_key: Some(idempotency_key),
         };
         let a = serve_with(
             &disabled,
@@ -406,6 +544,15 @@ fn json_of(a: &Answer) -> Value {
 
 fn expect(a: &Answer, status: u16, code: &str) {
     assert_eq!((a.status, a.code), (status, code), "{a:?}");
+}
+
+fn assert_create_did_not_start(w: &World) {
+    assert_eq!(w.faults.tref_reads.get(), 0, "no m/tref/ read");
+    assert_eq!(w.faults.puts.get(), 0, "no put in any store");
+    assert!(w.ports.records.names_under("m/tref/").is_empty());
+    assert!(w.ports.records.names_under("m/t/").is_empty());
+    assert!(w.intents.calls.borrow().is_empty());
+    assert!(w.units.calls.borrow().is_empty());
 }
 
 // ---------------------------------------------------------------------------
@@ -480,7 +627,7 @@ fn sign_up_creates_a_live_tenant_and_a_retry_adopts_it() {
 
 #[test]
 fn only_jurisdiction_none_is_served() {
-    let w = World::new();
+    let w = World::without_gate();
     futures_executor_block_on(async {
         for j in ["eu", "us", "fedramp"] {
             let a = w
@@ -488,8 +635,8 @@ fn only_jurisdiction_none_is_served() {
                 .await;
             expect(&a, 400, "jurisdiction_not_served");
         }
-        assert!(w.tenant_of(WS).await.is_none(), "nothing written");
-        assert!(w.ports.records.names_under("m/t/").is_empty());
+        assert_create_did_not_start(&w);
+        w.open_gate().await;
         let a = w
             .create(&json!({"external_ref": WS, "jurisdiction": "none"}))
             .await;
@@ -498,34 +645,30 @@ fn only_jurisdiction_none_is_served() {
 }
 
 #[test]
-fn limits_and_rate_class_go_into_record_1() {
-    let w = World::new();
+fn limits_are_refused_before_any_write() {
+    let w = World::without_gate();
     futures_executor_block_on(async {
         let a = w
             .create(&json!({
                 "external_ref": WS,
                 "limits": {"storage_bytes": 5_000_000_000u64, "upload_24h_bytes": null,
-                           "download_allowance_bytes": 7, "active_keys": 5},
-                "rate_class": "free"
+                           "download_allowance_bytes": 7, "active_keys": 5}
             }))
             .await;
-        expect(&a, 201, "ok");
-        let t = json_of(&a);
-        assert_eq!(
-            t["limits"],
-            json!({"storage_bytes": 5_000_000_000u64, "upload_24h_bytes": null,
-                   "download_allowance_bytes": 7, "active_keys": 5})
-        );
-        let tenant = w.tenant_of(WS).await.unwrap();
-        let root = Root::new(&w.ports, &w.cache, TestRng(3));
-        let door = root
-            .heads()
-            .head(&Tenant::parse(tenant.as_str()).unwrap(), 0)
-            .await
-            .unwrap()
-            .unwrap()
-            .door;
-        assert_eq!(door.rate_json.get("class"), Some(&json!("free")));
+        expect(&a, 400, "limits_not_served");
+        assert_create_did_not_start(&w);
+    });
+}
+
+#[test]
+fn rate_class_is_refused_before_any_write() {
+    let w = World::without_gate();
+    futures_executor_block_on(async {
+        let a = w
+            .create(&json!({"external_ref": WS, "rate_class": "free"}))
+            .await;
+        expect(&a, 400, "rate_class_not_served");
+        assert_create_did_not_start(&w);
     });
 }
 
@@ -541,34 +684,262 @@ fn bad_bodies_are_refused_before_any_write() {
             let a = w.create(&body).await;
             expect(&a, 400, "bad_request");
         }
-        assert!(w
-            .ports
-            .records
-            .names_under("m/")
-            .iter()
-            .all(|n| n.starts_with("m/kl/")));
+        assert_create_did_not_start(&w);
     });
 }
 
 #[test]
-fn without_key_locations_the_create_stops_before_the_key_and_resumes() {
+fn missing_key_locations_stop_create_before_any_write() {
     let w = World::without_locations();
     futures_executor_block_on(async {
         let a = w.create(&signup()).await;
         expect(&a, 503, "service_unavailable");
         assert!(a.retry_after.is_some());
-        // Record 1 and the birth are done; no key, no claim.
-        let tenant = w.tenant_of(WS).await.unwrap();
-        assert_eq!(w.chain_len(&tenant), 1);
-        assert!(w.units.born(&UnitName::new(tenant.clone(), 0)));
-        assert!(w.ports.records.raw(&born_name(&tenant, 0)).is_some());
-        // The locations are recorded: the retry finishes the same tenant.
+        assert_create_did_not_start(&w);
+
         w.locations().await;
-        let again = w.create(&signup()).await;
-        // A retry adopts through `m/tref/` and finishes the create: `200`.
-        expect(&again, 200, "ok");
-        assert_eq!(json_of(&again)["id"], tenant.as_str());
+        expect(&w.create(&signup()).await, 201, "ok");
+        assert_one_live_tenant(&w).await;
         assert_eq!(w.units.provisions(), 1, "born once");
+    });
+}
+
+#[test]
+fn a_closed_gate_stops_create_until_it_opens() {
+    let w = World::without_gate();
+    futures_executor_block_on(async {
+        expect(&w.create(&signup()).await, 503, "service_unavailable");
+        assert_create_did_not_start(&w);
+
+        w.open_gate().await;
+        expect(&w.create(&signup()).await, 201, "ok");
+        assert_one_live_tenant(&w).await;
+    });
+}
+
+#[test]
+fn an_unbound_directory_stops_create_before_any_write() {
+    let w = World::without_directory();
+    futures_executor_block_on(async {
+        expect(&w.create(&signup()).await, 503, "service_unavailable");
+        assert_create_did_not_start(&w);
+    });
+}
+
+#[test]
+fn closing_the_gate_again_blocks_even_a_retry_of_a_live_tenant() {
+    let w = World::new();
+    futures_executor_block_on(async {
+        expect(&w.create(&signup()).await, 201, "ok");
+        let tenant = assert_one_live_tenant(&w).await;
+        w.close_gate().await;
+        let puts = w.faults.puts.get();
+        let tref_reads = w.faults.tref_reads.get();
+        let intents = w.intents.calls.borrow().len();
+        let unit_calls = w.units.calls.borrow().len();
+
+        expect(&w.create(&signup()).await, 503, "service_unavailable");
+        assert_eq!(w.faults.puts.get(), puts);
+        assert_eq!(w.faults.tref_reads.get(), tref_reads);
+        assert_eq!(w.intents.calls.borrow().len(), intents);
+        assert_eq!(w.units.calls.borrow().len(), unit_calls);
+        assert_eq!(w.chain_len(&tenant), 4);
+    });
+}
+
+fn assert_intents_before_records(w: &World, t: &TenantId, head: u64) {
+    let expected: Vec<_> = (1..=head)
+        .flat_map(|seq| {
+            [
+                IntentKind::Send {
+                    record_exists: false,
+                },
+                IntentKind::Note {
+                    kind: "tenant.create".to_owned(),
+                    record_exists: false,
+                },
+            ]
+            .map(|kind| (t.clone(), ControlChain::Tenant, seq, kind))
+        })
+        .collect();
+    assert_eq!(*w.intents.calls.borrow(), expected);
+}
+
+#[test]
+fn each_tenant_record_has_a_send_and_note_before_it_is_written() {
+    let w = World::new();
+    futures_executor_block_on(async {
+        expect(&w.create(&signup()).await, 201, "ok");
+        let tenant = assert_one_live_tenant(&w).await;
+        let t = TenantId::parse(tenant.as_str()).unwrap();
+        let root = Root::new(&w.ports, &w.cache, TestRng(3));
+        let head = root
+            .heads()
+            .head_seq(&Tenant::Managed(t.clone()), 0)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_intents_before_records(&w, &t, head);
+    });
+}
+
+#[test]
+fn a_failed_intent_send_stops_the_record_and_a_retry_finishes() {
+    let clean = World::new();
+    let clean_len = futures_executor_block_on(async {
+        expect(&clean.create(&signup()).await, 201, "ok");
+        let clean_tenant = assert_one_live_tenant(&clean).await;
+        clean.chain_len(&clean_tenant)
+    });
+
+    for seq in 1..=clean_len as u64 {
+        let w = World::new();
+        w.intents.fail_send_at.set(Some(seq));
+        futures_executor_block_on(async {
+            let first = w.create(&signup()).await;
+            assert_eq!(
+                (first.status, first.code),
+                (503, "service_unavailable"),
+                "failed send for seq {seq}"
+            );
+            let tenant = w.tenant_of(WS).await.unwrap();
+            let t = TenantId::parse(tenant.as_str()).unwrap();
+            assert_eq!(w.chain_len(&tenant) as u64, seq - 1);
+            assert!(w.ports.records.raw(&tenant_record_name(&t, seq)).is_none());
+            // No note or later intent follows the failed send.
+            assert_eq!(
+                w.intents.calls.borrow_mut().pop(),
+                Some((
+                    t.clone(),
+                    ControlChain::Tenant,
+                    seq,
+                    IntentKind::Send {
+                        record_exists: false,
+                    },
+                )),
+            );
+            assert_intents_before_records(&w, &t, seq - 1);
+
+            w.intents.fail_send_at.set(None);
+            // The reference was written before any of these intents, so the retry adopts.
+            expect(&w.create(&signup()).await, 200, "ok");
+            assert_eq!(assert_one_live_tenant(&w).await, tenant);
+            assert_eq!(w.chain_len(&tenant), clean_len);
+            assert_intents_before_records(&w, &t, clean_len as u64);
+        });
+    }
+}
+
+#[test]
+fn a_failed_intent_note_does_not_stop_create() {
+    let w = World::new();
+    w.intents.fail_note.set(true);
+    futures_executor_block_on(async {
+        expect(&w.create(&signup()).await, 201, "ok");
+        let tenant = assert_one_live_tenant(&w).await;
+        let t = TenantId::parse(tenant.as_str()).unwrap();
+        assert_intents_before_records(&w, &t, w.chain_len(&tenant) as u64);
+    });
+}
+
+#[test]
+fn every_tenant_record_has_the_idempotency_key_hash() {
+    let w = World::new();
+    futures_executor_block_on(async {
+        // A distinct external reference catches hashing the body field instead of the header.
+        let external_ref = "ws_other";
+        expect(
+            &w.create(&json!({"external_ref": external_ref})).await,
+            201,
+            "ok",
+        );
+        let tenant = w.tenant_of(external_ref).await.unwrap();
+        let t = Tenant::parse(tenant.as_str()).unwrap();
+        let root = Root::new(&w.ports, &w.cache, TestRng(3));
+        let heads = root.heads();
+        let head = heads.head_seq(&t, 0).await.unwrap().unwrap();
+        assert_eq!(head, 4);
+        let expected = call_key_hash(WS);
+        assert_eq!(expected, hash(WS), "lowercase hex SHA-256");
+        for seq in 1..=head {
+            let door = heads.read(&t, seq).await.unwrap().unwrap().door;
+            assert_eq!(
+                door.call_key_hash.as_deref(),
+                Some(expected.as_str()),
+                "seq {seq}"
+            );
+        }
+    });
+}
+
+#[test]
+fn a_key_claim_voided_on_retry_also_has_an_intent_and_the_retry_hash() {
+    let w = World::new();
+    futures_executor_block_on(async {
+        // Leave a claim and its arbiter copy, but no commit.
+        w.ports.keys_b.refuse(TK_PREFIX);
+        expect(&w.create(&signup()).await, 503, "service_unavailable");
+        w.ports.keys_b.allow(TK_PREFIX);
+        let tenant = w.tenant_of(WS).await.unwrap();
+        assert_eq!(w.chain_len(&tenant), 2);
+        let id = TenantId::parse(tenant.as_str()).unwrap();
+        let name = tk_blob_name(&id, 1, 1);
+        let arbiter_copy = w.ports.keys_a.raw(&name).unwrap();
+        let other_key =
+            TenantKey::from_bytes(&id, 1, Sha256::digest(b"other test key").into()).unwrap();
+        let (_, other_copy) = wrap_tenant_key(&w.ports.kek, &other_key, &mut TestRng(8)).unwrap();
+        assert_ne!(arbiter_copy, other_copy);
+        w.ports.keys_b.plant(&name, other_copy);
+
+        let retry_key = "ws_retry";
+        expect(&w.create_with_key(&signup(), retry_key).await, 200, "ok");
+        let t = Tenant::Managed(id.clone());
+        let root = Root::new(&w.ports, &w.cache, TestRng(3));
+        let heads = root.heads();
+        let void = heads.read(&t, 3).await.unwrap().unwrap().door;
+        assert_eq!(void.tk_version, 0, "v1 was not committed");
+        assert_eq!(void.rotating_to, Some(2), "voiding v1 opens v2");
+        let head = heads.head(&t, 0).await.unwrap().unwrap().door;
+        assert_eq!(head.seq, 5);
+        assert_eq!(head.tk_version, 2);
+        assert_eq!(head.lifecycle, Lifecycle::Live);
+        assert_intents_before_records(&w, &id, head.seq);
+        for seq in 1..=head.seq {
+            let expected = call_key_hash(if seq < 3 { WS } else { retry_key });
+            let door = heads.read(&t, seq).await.unwrap().unwrap().door;
+            assert_eq!(
+                door.call_key_hash.as_deref(),
+                Some(expected.as_str()),
+                "seq {seq}"
+            );
+        }
+    });
+}
+
+#[test]
+fn record_one_and_the_provision_token_use_their_own_jurisdiction_forms() {
+    let w = World::new();
+    futures_executor_block_on(async {
+        expect(&w.create(&signup()).await, 201, "ok");
+        let tenant = w.tenant_of(WS).await.unwrap();
+        let t = Tenant::parse(tenant.as_str()).unwrap();
+        let root = Root::new(&w.ports, &w.cache, TestRng(3));
+        let door = root.heads().read(&t, 1).await.unwrap().unwrap().door;
+        assert_eq!(door.jurisdiction, "none");
+        assert!(door.limits.is_empty());
+        assert!(door.rate_json.is_empty());
+
+        let calls = w.units.calls.borrow();
+        let token = calls
+            .iter()
+            .find_map(|call| match &call.op {
+                UnitOp::Provision { token, .. } => Some(token),
+                _ => None,
+            })
+            .expect("a Provision call");
+        assert_eq!(token.name, UnitName::new(tenant, 0));
+        assert_eq!(token.record_seq, 1);
+        assert_eq!(token.jurisdiction, "");
     });
 }
 
@@ -903,9 +1274,12 @@ fn capture(line: &str) {
 #[test]
 fn a_damaged_born_marker_is_a_500_with_an_alert() {
     velmora_bridge::trace::log_alerts(capture);
-    let w = World::without_locations();
+    let w = World::new();
     futures_executor_block_on(async {
+        // Stop after writing the marker, before the tenant becomes live.
+        w.ports.keys_a.refuse(TK_PREFIX);
         expect(&w.create(&signup()).await, 503, "service_unavailable");
+        w.ports.keys_a.allow(TK_PREFIX);
         let tenant = w.tenant_of(WS).await.unwrap();
         let name = born_name(&tenant, 0);
         let mut bytes = w.ports.records.raw(&name).unwrap();
@@ -913,7 +1287,6 @@ fn a_damaged_born_marker_is_a_500_with_an_alert() {
         bytes[last] ^= 1;
         w.ports.records.lose(&name);
         w.ports.records.plant(&name, bytes);
-        w.locations().await;
         ALERTS.with(|a| a.borrow_mut().clear());
         expect(&w.create(&signup()).await, 500, "internal_error");
         let alerts = ALERTS.with(|a| a.borrow().clone());
@@ -927,18 +1300,63 @@ fn a_damaged_born_marker_is_a_500_with_an_alert() {
     });
 }
 
-/// An `m/tref/` record under a KEK version this Worker does not hold yet
-/// (a newer deploy's record) is a failure that may pass: 503, never 500.
-#[test]
-fn a_tref_record_under_a_newer_kek_is_a_503() {
-    use sha2::Digest as _;
-    let newer = TestKek::with_versions(
+fn newer_kek() -> TestKek {
+    TestKek::with_versions(
         2,
         &[
             (1, Sha256::digest(b"kek one").into()),
             (2, Sha256::digest(b"kek two").into()),
         ],
-    );
+    )
+}
+
+#[test]
+fn key_locations_under_a_newer_kek_stop_create_without_alerting() {
+    velmora_bridge::trace::log_alerts(capture);
+    let w = World::without_locations();
+    futures_executor_block_on(async {
+        let mem = MemRecords::new();
+        assert!(
+            write_locations(&mem, &newer_kek(), &two_in_account(), &mut TestRng(1))
+                .await
+                .unwrap()
+        );
+        let name = locations_chain().name(1);
+        w.ports.records.plant(&name, mem.raw(&name).unwrap());
+
+        ALERTS.with(|a| a.borrow_mut().clear());
+        expect(&w.create(&signup()).await, 503, "service_unavailable");
+        assert_create_did_not_start(&w);
+        ALERTS.with(|a| assert!(a.borrow().is_empty(), "{:?}", a.borrow()));
+    });
+}
+
+#[test]
+fn damaged_key_locations_stop_create_and_alert() {
+    velmora_bridge::trace::log_alerts(capture);
+    let w = World::new();
+    futures_executor_block_on(async {
+        w.ports
+            .records
+            .plant(&locations_chain().name(1), b"not a control record".to_vec());
+
+        ALERTS.with(|a| a.borrow_mut().clear());
+        expect(&w.create(&signup()).await, 503, "service_unavailable");
+        assert_create_did_not_start(&w);
+        ALERTS.with(|a| {
+            assert_eq!(
+                *a.borrow(),
+                ["mgmt: tenant create: key locations unreadable"]
+            );
+        });
+    });
+}
+
+/// An `m/tref/` record under a KEK version this Worker does not hold yet
+/// (a newer deploy's record) is a failure that may pass: 503, never 500.
+#[test]
+fn a_tref_record_under_a_newer_kek_is_a_503() {
+    let newer = newer_kek();
     let w = World::new();
     futures_executor_block_on(async {
         let other = velmora_bridge::unit::TenantId::parse("t_00000000000000ee").unwrap();
