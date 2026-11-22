@@ -716,6 +716,96 @@ where
     }
 }
 
+// ---------------------------------------------------------------------------
+// ControlIntents over the queue and the directory
+// ---------------------------------------------------------------------------
+
+/// [`ControlIntents`] of the Worker: the queue message
+/// `apply_control(tenant, chain, seq)` is the durable part, sent through
+/// the root's [`ControlSend`](crate::root::ControlSend) with its delay; the
+/// directory's `pending_ops` row is its visible copy, noted and cleared
+/// only while `DIRECTORY` is bound (AM-75: with it unbound there is no row
+/// to keep, and the message alone finishes the change).
+pub struct QueueIntents<'a, C, Q, T> {
+    pub control: &'a C,
+    pub directory: Option<crate::directory::store::SqlDirectory<'a, Q>>,
+    pub clock: &'a T,
+}
+
+/// A tenant id that is no managed tenant (tenant 0 has no intents here).
+pub const ERR_INTENT_TENANT: BridgeError =
+    BridgeError::Invalid("mgmt: an intent for a tenant that is not managed");
+
+fn intent_chain(chain: crate::keys::ports::ControlChain) -> crate::jobmsg::IntentChain {
+    match chain {
+        crate::keys::ports::ControlChain::Tenant => crate::jobmsg::IntentChain::Tenant,
+        crate::keys::ports::ControlChain::Keys => crate::jobmsg::IntentChain::Keys,
+    }
+}
+
+fn row_chain(chain: crate::keys::ports::ControlChain) -> crate::directory::store::ChainKind {
+    match chain {
+        crate::keys::ports::ControlChain::Tenant => crate::directory::store::ChainKind::Tenant,
+        crate::keys::ports::ControlChain::Keys => crate::directory::store::ChainKind::Keys,
+    }
+}
+
+impl<C, Q, T> ControlIntents for QueueIntents<'_, C, Q, T>
+where
+    C: crate::root::ControlSend,
+    Q: crate::ports::Sql,
+    T: Clock,
+{
+    async fn send(
+        &self,
+        tenant: &crate::TenantId,
+        chain: crate::keys::ports::ControlChain,
+        seq: u64,
+    ) -> Result<()> {
+        let intent = crate::jobmsg::ControlIntent::new(tenant.as_str(), intent_chain(chain), seq)
+            .ok_or(ERR_INTENT_TENANT)?;
+        self.control.send_control(&intent).await
+    }
+
+    async fn note(
+        &self,
+        tenant: &crate::TenantId,
+        chain: crate::keys::ports::ControlChain,
+        seq: u64,
+        kind: &str,
+    ) -> Result<()> {
+        let Some(dir) = &self.directory else {
+            return Ok(());
+        };
+        dir.add_pending(&crate::directory::store::PendingOp {
+            tenant: crate::directory::record::Tenant::Managed(tenant.clone()),
+            chain: row_chain(chain),
+            seq,
+            kind: kind.to_string(),
+            created_at: self.clock.now(),
+        })
+        .await
+    }
+
+    async fn clear(
+        &self,
+        tenant: &crate::TenantId,
+        chain: crate::keys::ports::ControlChain,
+        seq: u64,
+    ) -> Result<()> {
+        let Some(dir) = &self.directory else {
+            return Ok(());
+        };
+        dir.clear_pending(
+            &crate::directory::record::Tenant::Managed(tenant.clone()),
+            row_chain(chain),
+            seq,
+        )
+        .await
+        .map(|_| ())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
