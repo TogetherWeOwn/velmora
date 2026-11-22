@@ -332,17 +332,22 @@ impl<'a, S: RecordStore, K: Kek, T: TkRing> Feed<'a, S, K, T> {
     /// newest opening is at or below `acked` (the directory's `keys_seq`),
     /// or at or below `after` while the store holds the subject open.
     ///
-    /// - `closed` is the store's closed subjects ([`KeyTarget::closed`]) as
-    ///   of `after`. Every record at or below `after` is the store's (the
-    ///   apply has no gap), so a subject whose opening is there and that
-    ///   the store does not hold closed is held open by the store already:
-    ///   sending it open opens nothing new. So a stale or failed `acked`
-    ///   (0) never closes what the store serves open.
-    /// - Across the pages of one sync, `after` moves on while `closed` was
-    ///   read once: every subject this feed sent held counts as closed on
-    ///   the later pages (the store took it closed). Use one `Feed` for the
-    ///   pages of one sync; a new `Feed` needs a `closed` read after the
-    ///   last page applied.
+    /// - **`closed` must be the store's closed subjects
+    ///   ([`KeyTarget::closed`]) read at the same `keys_seq` as the first
+    ///   `after`**: one read that answers both (the unit's `closed` with
+    ///   its `keys_seq`), made again for every round of a sync and never
+    ///   reused across rounds. Every record at or below `after` is the
+    ///   store's (the apply has no gap), so a subject whose opening is
+    ///   there and that the store does not hold closed is held open by the
+    ///   store already: sending it open opens nothing new. So a stale or
+    ///   failed `acked` (0) never closes what the store served open at
+    ///   `after`. A `closed` older than `after` could send open what the
+    ///   directory lacks; one newer than `after` can close what a finisher
+    ///   opened in between (fails safe).
+    /// - Across the pages of one round, `after` moves on while `closed`
+    ///   was read once: every subject this feed sent held counts as closed
+    ///   on the later pages (the store took it closed). Use one `Feed` for
+    ///   the pages of one round.
     ///
     /// The `m/rk/` revocations below `after` and the second send are the
     /// bring-up's ([`Feed::bring_up`]), not this read's.
