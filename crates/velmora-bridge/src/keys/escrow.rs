@@ -231,8 +231,8 @@ pub enum RestoreStep {
 }
 
 /// Puts the tenant key back into every synchronous location of `set`
-/// that lacks it, from the escrow copy, after deciding every location
-/// first:
+/// that lacks it, from the escrow copy, after reading every active
+/// location (asynchronous ones included) first:
 /// - the copy must open under the KEK and hold the key whose check value
 ///   the tenant chain committed (`committed`);
 /// - one location in conflict means nothing is written anywhere, so no
@@ -259,7 +259,11 @@ pub async fn restore_escrow<S: RecordStore, K: Kek>(
         Some((copy.kek_version, copy.name(), copy.blob.clone()));
     // The newest KEK version of a copy this Worker could not open.
     let mut unopened: u32 = 0;
-    for location in set.synchronous() {
+    // Every active location is read (an asynchronous one may hold the
+    // newest name, or a copy in conflict); only synchronous ones are
+    // written.
+    let mut conflict_elsewhere = false;
+    for location in set.active() {
         let store = buckets.get(location)?;
         let mut conflict = false;
         let mut present = false;
@@ -298,13 +302,19 @@ pub async fn restore_escrow<S: RecordStore, K: Kek>(
         } else {
             RestoreStep::Restored
         };
-        decided.push((location, step));
+        if location.synchronous {
+            decided.push((location, step));
+        } else {
+            conflict_elsewhere |= step == RestoreStep::Conflict;
+        }
     }
     let (newest_v, name, blob) =
         newest.unwrap_or((copy.kek_version, copy.name(), copy.blob.clone()));
     // A conflict anywhere, or a copy under a newer KEK than the one we
     // would write, stops every write: no older name beside a newer one.
-    let mut stop = decided.iter().any(|(_, s)| *s == RestoreStep::Conflict) || unopened > newest_v;
+    let mut stop = conflict_elsewhere
+        || decided.iter().any(|(_, s)| *s == RestoreStep::Conflict)
+        || unopened > newest_v;
     let mut out = Vec::new();
     for (location, step) in decided {
         let step = match step {

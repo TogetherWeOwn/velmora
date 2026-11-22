@@ -379,11 +379,16 @@ async fn bring_up_closing<U: KeyTarget>(
     if held >= table.seq() && revoked.is_empty() {
         return Ok(());
     }
+    // What the unit holds closed: an opening it holds open at or below
+    // its own seq was opened there after a directory acknowledged it.
+    let closed: BTreeSet<String> = target.closed().await?.into_iter().collect();
     let none = BTreeSet::new();
     let entries: Vec<Entry> = entries_for(table, held, revoked, &none)
         .into_iter()
         .map(|mut e| {
-            if e.opened_seq > acked && e.door.status != SubjectStatus::Revoked {
+            let acknowledged =
+                e.opened_seq <= acked || (e.opened_seq <= held && !closed.contains(&e.door.id));
+            if !acknowledged && e.door.status != SubjectStatus::Revoked {
                 e.private = None;
             }
             e
@@ -504,6 +509,7 @@ where
             .collect();
         let mut puts = 0;
         let mut caught_up = false;
+        let mut caught_up_in_full = false;
         while puts < MAX_PUTS {
             advance(self.store, self.kek, self.ring, &chain, table).await?;
             // A cached table opens what this ring can open now.
@@ -545,9 +551,16 @@ where
                         // stale: bring the units up once and ask again.
                         Admission::Refused(Refusal::NotSubset | Refusal::CapFull) if !caught_up => {
                             caught_up = true;
-                            let _ = self.apply_all(table, &revoked).await;
+                            caught_up_in_full = self.apply_all(table, &revoked).await.units;
                             puts += 1;
                             continue;
+                        }
+                        // A refusal after a catch-up that did not reach
+                        // every unit in full may still be stale.
+                        Admission::Refused(Refusal::NotSubset | Refusal::CapFull)
+                            if !caught_up_in_full =>
+                        {
+                            return Ok(KeyAnswer::Busy)
                         }
                         Admission::Refused(r) => return Ok(KeyAnswer::Refused(r)),
                         Admission::Admitted { keys_seq } if keys_seq == table.seq() => keys_seq + 1,

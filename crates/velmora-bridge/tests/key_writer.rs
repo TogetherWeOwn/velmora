@@ -2307,3 +2307,92 @@ async fn a_close_after_an_unacknowledged_open_keeps_the_subject_closed() {
     assert_eq!(row.effective_status(), SubjectStatus::Active);
     assert_eq!(joined(&row), vec![grant("b_01", RW, Some("x/"))]);
 }
+
+/// A closing change with the directory unreadable narrows a key the
+/// directory already has; it does not disable it.
+#[tokio::test(flavor = "current_thread")]
+async fn a_narrowing_with_the_directory_down_keeps_an_acknowledged_key_open() {
+    let w = World::new();
+    let adm = FakeAdmission::new(&w.root);
+    let mut table = seed(&w, &adm).await;
+    let units = w.units();
+    let env = env!(w, &adm, &units);
+    let mut rng = TestRng(150);
+    w.directory.down.set(true);
+    let narrow = KeyRequest::SetGrants {
+        id: "AKVL0001".into(),
+        grants: vec![grant("b_01", RO, Some("x/"))],
+        acting: None,
+    };
+    assert_eq!(
+        env.change(&mut table, "n", &narrow, &mut rng)
+            .await
+            .unwrap(),
+        KeyAnswer::Done { seq: 3 }
+    );
+    for unit in [&w.root, &w.unit2] {
+        let row = unit.row("AKVL0001").unwrap();
+        assert_eq!(
+            row.effective_status(),
+            SubjectStatus::Active,
+            "{}",
+            unit.label
+        );
+        assert_eq!(joined(&row), vec![grant("b_01", RO, Some("x/"))]);
+        assert_eq!(unit.status("PR0001"), Some(SubjectStatus::Active));
+    }
+}
+
+/// A unit that missed a narrowing of a principal is brought up by a
+/// finisher while the directory is unreadable: the principal stays
+/// open there, narrowed.
+#[tokio::test(flavor = "current_thread")]
+async fn a_finisher_with_the_directory_down_narrows_without_disabling() {
+    let w = World::new();
+    let adm = FakeAdmission::new(&w.root);
+    let mut table = seed(&w, &adm).await;
+    let units = w.units();
+    let env = env!(w, &adm, &units);
+    let mut rng = TestRng(151);
+    w.unit2.down.set(true);
+    let narrow = KeyRequest::SetGrants {
+        id: "PR0001".into(),
+        grants: vec![grant("b_01", RO, None)],
+        acting: None,
+    };
+    assert_eq!(
+        env.change(&mut table, "n", &narrow, &mut rng)
+            .await
+            .unwrap(),
+        KeyAnswer::Unfinished { seq: 3 }
+    );
+    w.unit2.down.set(false);
+    w.directory.down.set(true);
+    let report = finish_keys(&env, &mut rng).await.unwrap();
+    assert!(report.retry());
+    let row = w.unit2.row("PR0001").unwrap();
+    assert_eq!(row.effective_status(), SubjectStatus::Active);
+    assert_eq!(joined(&row), vec![grant("b_01", RO, None)]);
+    assert_eq!(w.unit2.status("AKVL0001"), Some(SubjectStatus::Active));
+}
+
+/// A refusal that comes after a catch-up that could not reach every
+/// unit in full answers busy, not the refusal.
+#[tokio::test(flavor = "current_thread")]
+async fn a_refusal_after_a_partial_catch_up_answers_busy() {
+    let w = World::new();
+    let adm = FakeAdmission::new(&w.root);
+    let mut table = seed(&w, &adm).await;
+    let units = w.units();
+    let env = env!(w, &adm, &units);
+    let mut rng = TestRng(152);
+    w.root.reset();
+    w.directory.down.set(true);
+    let key = s3_key(&w.t, "AKVL0002", "PR0001", &[grant("b_01", RO, None)]);
+    assert_eq!(
+        env.change(&mut table, "c", &KeyRequest::Create(key), &mut rng)
+            .await
+            .unwrap(),
+        KeyAnswer::Busy
+    );
+}
