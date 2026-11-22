@@ -29,8 +29,8 @@
 //!   [`UnitClient::renew_in_background`] under `waitUntil`). Unsigned
 //!   calls and background renewals go through the isolate's spacing
 //!   ([`InFlight`]): none while one runs, and after a failed attempt a
-//!   backoff from 60 s doubling up to T (rule 11). Signed calls renew for
-//!   themselves.
+//!   backoff from 60 s doubling up to T (rule 11). Signed calls go through
+//!   the same spacing with the backoff capped at 1 s.
 //! - **The two unit jobs** ([`UnitClient::run_job`]): `renew` and
 //!   `stamp_raise`, which the queue consumer hands here (AM-51). Under
 //!   `MAINTENANCE = restore` the consumer acknowledges both without a call
@@ -424,6 +424,7 @@ where
                             _ => seqs = now,
                         },
                         UnitAnswer::Unborn { .. } => return Ok(Renewal::Unborn),
+                        UnitAnswer::Failed { class } => return Err(unit_failed(&class)),
                         _ => return Err(ERR_RENEW_ANSWER),
                     }
                 }
@@ -564,6 +565,7 @@ where
                         break;
                     }
                     UnitAnswer::Unborn { .. } => return Ok(Synced::Unborn),
+                    UnitAnswer::Failed { class } => return Err(unit_failed(&class)),
                     _ => return Err(ERR_KEYS_ANSWER),
                 }
             }
@@ -605,6 +607,7 @@ where
                     Some(now) => unit = now,
                     None => return Ok(Synced::Unborn),
                 },
+                UnitAnswer::Failed { class } => return Err(unit_failed(&class)),
                 _ => return Err(ERR_SYNC_ANSWER),
             }
         }
@@ -634,8 +637,7 @@ where
                     renewed = true;
                     // Rule 11: an unsigned call renews only through the
                     // isolate's spacing (none while one runs, and after a
-                    // failure a backoff up to T). A signed call renews for
-                    // itself.
+                    // failure a backoff up to T).
                     // Signed calls are spaced too, but after a failure by at
                     // most 1 s: a unit whose renewal fails every time costs
                     // one proof and one page per second per isolate, not
@@ -813,6 +815,7 @@ where
             | UnitAnswer::Closed { seqs, .. }
             | UnitAnswer::SyncNeeded { seqs } => Ok(Some(seqs)),
             UnitAnswer::Unborn { .. } => Ok(None),
+            UnitAnswer::Failed { class } => Err(unit_failed(&class)),
             _ => Err(ERR_PING_ANSWER),
         }
     }
@@ -866,6 +869,7 @@ const ERR_KEYS_BELOW: BridgeError =
     BridgeError::Invalid("unit sync: the key chain ends below the unit's keys_seq");
 const ERR_PING_ANSWER: BridgeError = BridgeError::Invalid("unit: unexpected answer to a ping");
 const ERR_STAMP_ANSWER: BridgeError = BridgeError::Invalid("unit: unexpected stamp answer");
+const ERR_STAMP_STALE: BridgeError = BridgeError::Invalid("unit: the stamp call was stale twice");
 const ERR_STOPPED: BridgeError = BridgeError::Invalid("unit: stamp call stopped");
 
 fn chain_error(e: ChainError) -> BridgeError {
@@ -900,6 +904,17 @@ fn unit_state(door: &TenantDoor) -> (TenantState, Option<HoldMode>) {
     }
 }
 
+/// A unit's `Failed` answer: a failure inside the unit (its database), as
+/// `TenantCatalog` reads it: a store failure, handed back (AM-45 counts a
+/// `Failed` answer as a lost one). A fixed class only.
+fn unit_failed(class: &str) -> BridgeError {
+    match class {
+        "guard" => BridgeError::GuardFailed,
+        "catalogue_id" => crate::stamp::ERR_CATALOGUE_ID,
+        _ => BridgeError::Sql("unit: failed".into()),
+    }
+}
+
 /// The delivery of a job whose renewal, sync or raise failed with `e`: an
 /// answer of the unit that no rule expects goes to the dead-letter queue
 /// with a page (AM-50); anything else (a store or a call that failed) is
@@ -920,6 +935,9 @@ fn failed(e: &BridgeError, code: &'static str, mut pages: Vec<Page>) -> JobResul
         (BridgeError::Invalid(a), BridgeError::Invalid(b)) if a == b => Some(*a),
         _ => None,
     });
+    if matches!(e, BridgeError::Invalid(t) if *t == "unit: the stamp call was stale twice") {
+        return job_result(Delivery::Ack, "stale", pages);
+    }
     match hit {
         Some(text) => {
             pages.push(Page::UnitRefused(text));
@@ -1061,10 +1079,13 @@ where
                     reason: Refused::AccountProblem,
                     ..
                 } => return Ok(Step::Stop(Stop::Shredding)),
+                UnitAnswer::Failed { class } => return Err(unit_failed(&class)),
                 _ => return Err(ERR_STAMP_ANSWER),
             }
         }
-        Err(ERR_STAMP_ANSWER)
+        // Stale twice: the unit moved again in between (AM-50: a second
+        // `Stale` is acknowledged; the alarm asks again).
+        Err(ERR_STAMP_STALE)
     }
 
     async fn read_stamp(&self, id: &str) -> Result<Step<StampRead>> {

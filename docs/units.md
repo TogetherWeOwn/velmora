@@ -207,12 +207,15 @@ hand-out, and its writes are due from their own time.
   for a background renewal (`waitUntil`). Unsigned calls and background
   renewals go through the isolate's spacing: none while one runs, and after
   a failed attempt a backoff from 60 s doubling up to T, cleared by a
-  success (rule 11). Signed calls renew for themselves.
+  success (rule 11). Signed calls go through the same spacing with the
+  backoff capped at 1 s.
 - **The `renew` and `stamp_raise` jobs**, which the queue consumer hands to
   the client: a renewal as above; a raise moves the unit's counter, then puts
-  its object, renewing first when the lease ran out. A failed call is handed
-  back with the queue's retry delay; `unborn` goes to the consumer's `Unborn`
-  rule (AM-50). Under `MAINTENANCE = restore` the consumer acknowledges both
+  its object, renewing first when the lease ran out. A failed call, or a
+  unit's `Failed` answer, is handed back with the queue's retry delay; a
+  call that is stale twice is acknowledged; `unborn` goes to the consumer's
+  `Unborn` rule; a refusal no AM-50 row names goes to the dead-letter queue
+  with a page (AM-50). Under `MAINTENANCE = restore` the consumer acknowledges both
   without a call.
 
 **The calls are JSON** (`UnitCall` and `UnitAnswer`, `unit::call`; an

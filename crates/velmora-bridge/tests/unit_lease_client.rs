@@ -1160,10 +1160,12 @@ fn a_renew_job_whose_call_fails_is_handed_back() {
 fn an_unexpected_answer_dead_letters_the_job_and_pages() {
     use velmora_bridge::unit::Refused;
     with_fresh(|rig| {
+        // A refusal no rule expects: dead letter and page.
         *rig.obj.answer_of.borrow_mut() = Some((
             "job:stamp",
-            UnitAnswer::Failed {
-                class: "boom".into(),
+            UnitAnswer::Refused {
+                reason: Refused::Unauthenticated,
+                alarm: false,
             },
         ));
         for job in [UnitJob::Renew { at: NOW }, UnitJob::StampRaise { at: NOW }] {
@@ -1178,6 +1180,39 @@ fn an_unexpected_answer_dead_letters_the_job_and_pages() {
                 "{r:?}"
             );
         }
+        // A failure inside the unit (`Failed`) is a store failure: handed
+        // back, no page (confirmation LOW 1).
+        *rig.obj.answer_of.borrow_mut() = Some((
+            "job:stamp",
+            UnitAnswer::Failed {
+                class: "sql".into(),
+            },
+        ));
+        let r = block_on(
+            rig.client()
+                .run_job(UnitJob::Renew { at: NOW }, rig.unit_seqs()),
+        );
+        assert_eq!(
+            (r.delivery, r.pages.len()),
+            (Delivery::HandBack, 0),
+            "{r:?}"
+        );
+        // Stale twice (the unit moved again): acknowledged, no page.
+        *rig.obj.answer_of.borrow_mut() = Some((
+            "job:stamp",
+            UnitAnswer::Stale {
+                seqs: rig.unit_seqs(),
+            },
+        ));
+        let r = block_on(
+            rig.client()
+                .run_job(UnitJob::Renew { at: NOW }, rig.unit_seqs()),
+        );
+        assert_eq!(
+            (r.delivery, r.code, r.pages.len()),
+            (Delivery::Ack, "stale", 0),
+            "{r:?}"
+        );
         // A tenant that is shredding refuses jobs: acknowledged, no page.
         *rig.obj.answer_of.borrow_mut() = Some((
             "job:stamp",
