@@ -23,8 +23,11 @@
 //! adapter keeps only a class and some tests read the message of a
 //! trigger. A connection's own counters (`SELECT total_changes()`,
 //! `last_insert_rowid()`) are always SQLite's: the object's connection
-//! does not live across requests (workerd evicts an idle object), and
-//! the call's transaction is the native savepoint.
+//! may not live across requests (workerd evicts an object idle for about
+//! 10 s, and a rebuild empties it), and the call's transaction is the
+//! native savepoint. The rows a statement changed are compared instead,
+//! for `query` as for `exec` and `batch`: the object measures them inside
+//! the statement's own request.
 //!
 //! A test that changes the database through
 //! [`super::RusqliteSql::with_conn`] bypasses the port. Before the next
@@ -78,7 +81,8 @@ pub(crate) struct Shadow {
 /// What one call answered.
 #[derive(Debug, PartialEq)]
 enum Answer {
-    Rows(Vec<Row>),
+    /// A query's rows, and the rows it changed (a `RETURNING`, a trigger).
+    Rows(Vec<Row>, u64),
     Changed(u64),
     Batch(Vec<u64>),
     Applied,
@@ -135,10 +139,10 @@ impl Shadow {
     pub(crate) fn object_total_changes(&self) -> i64 {
         let rows = self.call(
             json!({"op": "query", "sql": "SELECT total_changes()", "params": []}),
-            |v| Answer::Rows(decode_rows(v)),
+            |v| Answer::Rows(decode_rows(v), 0),
         );
         match rows {
-            Answer::Rows(r) => match r.first().and_then(|row| row.first()) {
+            Answer::Rows(r, _) => match r.first().and_then(|row| row.first()) {
                 Some(SqlValue::Int(n)) => *n,
                 other => panic!("total_changes() answered {other:?}"),
             },
@@ -232,18 +236,28 @@ impl Shadow {
         }
     }
 
+    /// A query, after it ran natively with `local`, which changed
+    /// `changed` rows there (SQLite's `total_changes()` around it).
     pub(crate) fn query(
         &self,
         sql: &str,
         params: &[SqlValue],
         local: Result<Vec<Row>>,
+        changed: u64,
     ) -> Result<Vec<Row>> {
         let remote = self.call(
-            json!({"op": "query", "sql": sql, "params": encode_params(params)}),
-            |v| Answer::Rows(decode_rows(v)),
+            json!({"op": "query", "sql": sql, "params": encode_params(params), "changed": true}),
+            |v| {
+                Answer::Rows(
+                    decode_rows(v.get("rows").expect("query rows")),
+                    v.get("changed")
+                        .and_then(Value::as_u64)
+                        .expect("query rows changed"),
+                )
+            },
         );
         let mine = match &local {
-            Ok(rows) => Answer::Rows(rows.clone()),
+            Ok(rows) => Answer::Rows(rows.clone(), changed),
             Err(e) => error_answer(e),
         };
         self.check("query", sql, params, &mine, &remote);
@@ -260,7 +274,7 @@ impl Shadow {
         // `transactionSync` with no await, so the object cannot be
         // evicted inside it.
         match (self.primary_do && !engine_counter(sql), remote) {
-            (true, Answer::Rows(rows)) => Ok(rows),
+            (true, Answer::Rows(rows, _)) => Ok(rows),
             _ => local,
         }
     }
@@ -322,20 +336,20 @@ impl Shadow {
             (Answer::Sql(a), Answer::Sql(b)) => error_class(a) == error_class(b),
             // A connection's own counters (`total_changes()`) differ
             // between two databases; only their differences are used.
-            (Answer::Rows(_), Answer::Rows(_)) if engine_counter(sql) => true,
+            (Answer::Rows(_, a), Answer::Rows(_, b)) if engine_counter(sql) => a == b,
             // A plain EXPLAIN lists the engine's bytecode, which differs
             // between two SQLite builds: counted as skipped.
-            (Answer::Rows(_), Answer::Rows(_)) if is_bytecode_explain(sql) => {
+            (Answer::Rows(_, _), Answer::Rows(_, _)) if is_bytecode_explain(sql) => {
                 self.skipped.set(self.skipped.get() + 1);
                 return;
             }
             // A query plan's node ids are the engine's own; its text is
             // what a test reads.
-            (Answer::Rows(a), Answer::Rows(b)) if is_explain(sql) => {
+            (Answer::Rows(a, x), Answer::Rows(b, y)) if is_explain(sql) => {
                 let text = |rows: &Vec<Row>| -> Vec<Option<SqlValue>> {
                     rows.iter().map(|r| r.last().cloned()).collect()
                 };
-                text(a) == text(b)
+                text(a) == text(b) && x == y
             }
             (a, b) => a == b,
         };

@@ -1075,14 +1075,16 @@ fn the_unit_code_holds_no_key_and_reaches_for_no_io() {
 }
 
 /// Rule 11 under the workerd twin. The twin sends each statement of a
-/// call as a request of its own, and the object's connection does not
+/// call as a request of its own, and the object's connection may not
 /// live across requests: workerd evicts an object idle for about 10 s
 /// (a host stall between two statements of one call is enough), and the
 /// twin's rebuild empties it; either way its `total_changes()` restarts.
 /// A read-only call whose object restarts between its two counter reads
 /// is still answered, not refused as `wrote_without_authentication`: the
 /// twin's counters are SQLite's, whose savepoint spans the call
-/// (`testkit_shadow.rs`). Without a twin there is nothing to restart.
+/// (`testkit_shadow.rs`). Without that, this test is refused under the
+/// twin as primary (`SUITE_PRIMARY=do`, the default); with SQLite as
+/// primary, or without a twin, it passes either way.
 #[test]
 fn a_read_only_call_is_answered_when_the_twins_object_restarts_inside_it() {
     let db = RusqliteSql::open_in_memory().unwrap();

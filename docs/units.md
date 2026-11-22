@@ -616,5 +616,12 @@ SQLite's message. Not compared, by design: calls that meet a state with a
 broken foreign key (a test that switched the keys off; they run on SQLite
 alone, are counted, and the twin is rebuilt at the next whole state), plain
 `EXPLAIN` bytecode (counted as skipped), and `total_changes()` and
-`last_insert_rowid()`, which are each connection's own counters. Then
-`unit-smoke.py` drives the unit class itself in the same workerd.
+`last_insert_rowid()`, which are each connection's own counters. Those two
+are answered by SQLite even with the object as primary: the twin sends each
+statement as a request of its own, and workerd evicts an object idle for
+about 10 s, which restarts its counters (a host stall inside one call was
+enough to refuse a read-only call as `wrote_without_authentication`). In
+production a call is one `transactionSync` with no await, on one
+connection. Rows changed are compared for every statement instead,
+`query` included. Then `unit-smoke.py` drives the unit class itself in the
+same workerd.
