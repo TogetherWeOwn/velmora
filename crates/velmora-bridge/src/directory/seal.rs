@@ -352,6 +352,7 @@ fn empty_private() -> Result<Vec<u8>> {
     serde_json::to_vec(&TenantPrivate {
         v: RECORD_FORMAT,
         external_ref: None,
+        bucket_created: None,
     })
     .map_err(|_| ERR_ENCODE)
 }
