@@ -718,7 +718,9 @@ async fn answers() -> Answers {
 /// No answer of the S3 surface says a word of the list.
 #[tokio::test(flavor = "current_thread")]
 async fn no_s3_answer_names_the_back_end() {
-    let all = answers().await;
+    // On the heap: in a debug build the whole run's future, with the
+    // unit rig's catalogue, outgrows a test thread's 2 MiB stack.
+    let all = Box::pin(answers()).await;
     let supplied = [
         BUCKET,
         KEY,

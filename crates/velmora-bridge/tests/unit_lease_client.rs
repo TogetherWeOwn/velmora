@@ -18,14 +18,14 @@ use velmora_bridge::recovery::Unpublished;
 use velmora_bridge::stamp::stamp_key;
 use velmora_bridge::testkit::{FixedClock, MemBlobStore, RusqliteSql};
 use velmora_bridge::unit::jobcall::JobCall;
-use velmora_bridge::unit::keys::{Access, KeyEntry, KeyGrant, KeyKind, SubjectStatus};
+use velmora_bridge::unit::keys::{Access, ApplyEntry, KeyEntry, KeyGrant, KeyKind, SubjectStatus};
 use velmora_bridge::unit::{
     BirthKind, BirthToken, CallKind, Seqs, TenantId, TenantState, Unit, UnitAnswer, UnitCall,
     UnitName, UnitOp, UnitReply,
 };
 use velmora_bridge::unit_lease::client::{
-    Delivery, InFlight, KeyBatch, KeyFeed, KeyFinisher, Page, RecordNames, Renewal, Synced,
-    UnitClient, UnitReplies,
+    Answered, Delivery, InFlight, KeyBatch, KeyFeed, KeyFinisher, Page, RecordNames, Renewal,
+    Synced, UnitClient, UnitReplies,
 };
 use velmora_bridge::unit_lease::lease::LeaseRules;
 use velmora_bridge::unit_lease::renewal::ChainNames;
@@ -155,7 +155,7 @@ impl UnitReplies for Obj<'_> {
 
 /// The key chain as the Worker reads it: entries by seq.
 #[derive(Default)]
-struct Keys(RefCell<BTreeMap<u64, KeyEntry>>);
+struct Keys(RefCell<BTreeMap<u64, ApplyEntry>>);
 
 impl KeyFeed for Keys {
     async fn after(&self, t: &TenantId, after: u64) -> Result<KeyBatch> {
@@ -320,8 +320,8 @@ impl<'a> Rig<'a> {
     }
 
     /// A key-chain record at `seq`, with its name in the safety bucket.
-    fn key_record(&self, seq: u64, entry: KeyEntry) {
-        self.keys.0.borrow_mut().insert(seq, entry);
+    fn key_record(&self, seq: u64, entry: impl Into<ApplyEntry>) {
+        self.keys.0.borrow_mut().insert(seq, entry.into());
         put(self.safety, &RecordNames.key_record(tid(), seq));
     }
 
@@ -944,13 +944,9 @@ fn unsigned_calls_space_failed_renewals_with_a_backoff() {
         block_on(rig.client().sync(rig.unit_seqs())).unwrap();
         rig.clock.advance_ms(T + 1);
         let unsigned = || {
-            // The key-row fetch: one of the two unsigned calls (rule 11).
-            let mut c = request(
-                rig.unit_seqs(),
-                UnitOp::KeyRow {
-                    access_key_id: K.into(),
-                },
-            );
+            // An unsigned call (rule 11). Not `key_row`: with an expired
+            // lease the unit answers it, marked (AM-63).
+            let mut c = request(rig.unit_seqs(), UnitOp::Ping {});
             c.authenticated = false;
             called(&rig.client(), c)
         };
@@ -990,13 +986,9 @@ fn a_transient_failure_delays_unsigned_renewals_by_the_first_backoff_only() {
     with_fresh(|rig| {
         rig.clock.advance_ms(T + 1);
         let unsigned = || {
-            // The key-row fetch: one of the two unsigned calls (rule 11).
-            let mut c = request(
-                rig.unit_seqs(),
-                UnitOp::KeyRow {
-                    access_key_id: K.into(),
-                },
-            );
+            // An unsigned call (rule 11). Not `key_row`: with an expired
+            // lease the unit answers it, marked (AM-63).
+            let mut c = request(rig.unit_seqs(), UnitOp::Ping {});
             c.authenticated = false;
             block_on(rig.client().call(c))
         };
@@ -1011,15 +1003,21 @@ fn a_transient_failure_delays_unsigned_renewals_by_the_first_backoff_only() {
         rig.clock.advance_ms(60_000);
         let (a, p) = unsigned();
         let a = a.unwrap();
+        // Renewed, and the call ran again (an unsigned ping is then
+        // refused as unauthenticated: past the lease check).
+        let renewed = |a: &Answered| {
+            matches!(a.renewal, Some(Renewal::Renewed { .. }))
+                && !matches!(a.reply.answer, UnitAnswer::RenewNeeded { .. })
+        };
         assert!(
-            matches!(a.reply.answer, UnitAnswer::Ok { .. }),
+            renewed(&a),
             "recovered after 60 s: {a:?} {p:?} {:?}",
             rig.calls()
         );
         // Cleared: a later expiry is renewed at once.
         rig.clock.advance_ms(T + 1);
         let (a, _) = unsigned();
-        assert!(matches!(a.unwrap().reply.answer, UnitAnswer::Ok { .. }));
+        assert!(renewed(&a.unwrap()));
     });
 }
 

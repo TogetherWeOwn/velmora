@@ -29,7 +29,9 @@
 //!   expired lease every call but the Worker's own (`sync`, `renew`, the
 //!   key apply, the import, the gate's and the restore's) and the stamp
 //!   check of a job (`stamp`, `stamp_rolled_back`) answers
-//!   [`UnitAnswer::RenewNeeded`]. `renew` sets the lease from a proof,
+//!   [`UnitAnswer::RenewNeeded`], but for an unauthenticated `key_row` of
+//!   a request, which is answered read-only and marked `lease_expired`
+//!   (AM-63: for the signature check only). `renew` sets the lease from a proof,
 //!   after it applied the revocations the proof listed; the `sync` that
 //!   sets a `restoring` entry closes it. Every answer leaves the unit as a
 //!   [`UnitReply`] with `lease_left_ms`, and `revoked` once it holds keys.
@@ -49,6 +51,7 @@ use base64::Engine as _;
 use serde_json::{json, Value};
 
 use super::birth::{check_token, BirthKind, BirthToken, ProvisionRefusal};
+use super::buckets;
 use super::call::{
     Closed, HoldMode, Reader, Refused, SyncHead, TenantState, UnitAnswer, UnitCall, UnitOp,
     UnitReply,
@@ -60,7 +63,7 @@ use super::import::{
     Seal,
 };
 use super::jobcall::JobCall;
-use super::keys::{self, Applied, KeptAnswer, KeyEntry};
+use super::keys::{self, Applied, ApplyEntry, KeptAnswer};
 use super::lift::{self, GateRefusal};
 use super::name::UnitName;
 use super::recount::{self, RecountCall};
@@ -654,6 +657,9 @@ impl<S: UnitSql> Unit<S> {
                         "t0_seq": record.map(|m| m.t0_seq),
                         "since_seq": record.map(|m| m.since_seq),
                         "move_lifted": record.map(|m| m.move_lifted),
+                        // AM-67: the floor the tenant chain keeps is raised
+                        // from it (null until a `move` report lifted).
+                        "lifted_at": import::move_lifted_at(self.sql())?,
                         "schema_tables": schema::tables(self.sql())?,
                     }))
                 });
@@ -683,6 +689,17 @@ impl<S: UnitSql> Unit<S> {
             }
         );
         if !stamp_check && self.lease_at(now)? == LeaseAdmit::RenewNeeded {
+            // AM-63: the S3 path's first call, an unauthenticated
+            // `key_row`, is still answered (read-only, marked
+            // `lease_expired`), so that a request whose signature verifies
+            // can renew as a signed call. Any other call, an authenticated
+            // `key_row` included, waits for the renewal.
+            if matches!(call.op, UnitOp::KeyRow { .. })
+                && call.kind == CallKind::Request
+                && !call.authenticated
+            {
+                return self.key_row_expired(call, &head);
+            }
             return Ok(UnitAnswer::RenewNeeded {
                 seqs: head.seqs,
                 why: None,
@@ -707,6 +724,21 @@ impl<S: UnitSql> Unit<S> {
                 return Ok(refused(Refused::AccountProblem, false));
             }
             return self.run(call, &head, false, now);
+        }
+        // A request call (L1-5, AM-64): only after SigV4, with the
+        // caller's numbers (checked above as a request's); the tenant's
+        // state decides it as it does an S3 call.
+        if let UnitOp::Request { call: rc } = &call.op {
+            if call.kind != CallKind::Request || !call.authenticated {
+                return Ok(refused(Refused::Unauthenticated, false));
+            }
+            if !allows(&head, rc.is_read()) {
+                return Ok(refused(Refused::AccountProblem, false));
+            }
+            if let Err(r) = rc.check() {
+                return Ok(refused(Refused::Request(r), true));
+            }
+            return self.request(&head, rc, now);
         }
         // A fan-out read names a grant: it is never a cold read, so it
         // is refused without `authenticated` (rule 11).
@@ -799,12 +831,15 @@ impl<S: UnitSql> Unit<S> {
         });
         match &call.op {
             UnitOp::Ping {} => Ok(Ok(state)),
-            UnitOp::KeyRow { access_key_id } => {
-                let row = self.cat.access_key(access_key_id).await?;
-                Ok(Ok(
-                    json!({ "key": row.as_ref().map(key_json), "state": state }),
-                ))
-            }
+            UnitOp::KeyRow {
+                access_key_id,
+                presigned,
+            } => Ok(Ok(self.key_row(
+                access_key_id,
+                presigned.as_ref(),
+                state,
+                false,
+            )?)),
             UnitOp::ReadPlan {
                 bucket,
                 key,
@@ -934,10 +969,150 @@ impl<S: UnitSql> Unit<S> {
             | UnitOp::Release { .. }
             | UnitOp::BindBucket { .. }
             | UnitOp::ReleaseBound { .. }
-            | UnitOp::BucketBinding { .. } => {
+            | UnitOp::BucketBinding { .. }
+            | UnitOp::BucketClose { .. }
+            | UnitOp::Request { .. } => {
                 Err(BridgeError::Invalid("worker call routed as an operation"))
             }
         }
+    }
+
+    /// The body of a `key_row` answer: the key's row (the internal key's
+    /// with `presigned`, and the presigned check), the tenant's state, and
+    /// `lease_expired` (AM-63): set only when the unit answers it under an
+    /// expired lease ([`Unit::key_row_expired`]), for the signature check
+    /// alone. Read-only.
+    fn key_row(
+        &self,
+        access_key_id: &str,
+        presigned: Option<&super::request::Presigned>,
+        state: Value,
+        lease_expired: bool,
+    ) -> Result<Value> {
+        Ok(match presigned {
+            None => {
+                let row = poll_once(self.cat.access_key(access_key_id))??;
+                json!({
+                    "key": row.as_ref().map(key_json),
+                    "state": state,
+                    "lease_expired": lease_expired,
+                })
+            }
+            Some(p) => {
+                let (key, check) =
+                    super::request::presigned_check(self.sql(), &self.cat, access_key_id, p)?;
+                json!({
+                    "key": key,
+                    "state": state,
+                    "lease_expired": lease_expired,
+                    "presigned": check,
+                })
+            }
+        })
+    }
+
+    /// AM-63's `key_row` under an expired lease: the same read, in a
+    /// read-only transaction, marked `lease_expired`. The Worker uses the
+    /// row only to check the signature, renews as a signed call, and
+    /// reads `key_row` again before it serves. Only an unauthenticated
+    /// `request` call's `key_row` is answered so; the lease check
+    /// (rule 12, `unit_lease`) calls this in place of `renew_needed`.
+    pub fn key_row_expired(&self, call: &UnitCall, head: &Head) -> Result<UnitAnswer> {
+        let UnitOp::KeyRow {
+            access_key_id,
+            presigned,
+        } = &call.op
+        else {
+            return Ok(refused(Refused::Unauthenticated, false));
+        };
+        if call.authenticated || call.kind != CallKind::Request {
+            return Ok(refused(Refused::Unauthenticated, false));
+        }
+        let state = json!({
+            "tenant_state": head.tenant_state.as_str(),
+            "tenant_mode": head.tenant_mode.map(HoldMode::as_str),
+        });
+        let mut op = || {
+            Ok(Ok(self.key_row(
+                access_key_id,
+                presigned.as_ref(),
+                state.clone(),
+                true,
+            )?))
+        };
+        Ok(match transact(self.sql(), false, &mut op)? {
+            Ok(body) => UnitAnswer::Ok {
+                seqs: head.seqs,
+                body,
+            },
+            Err(reason) => refused(reason, true),
+        })
+    }
+
+    /// A request call (L1-5): one transaction. A write that adds rows to
+    /// a closing bucket is refused `not_found` (AM-57); a call that grows
+    /// the database takes the size guard first (ADR §2.6).
+    fn request(
+        &self,
+        head: &Head,
+        rc: &super::request::RequestCall,
+        now: UnixMs,
+    ) -> Result<UnitAnswer> {
+        let sql = self.sql();
+        let grows = rc.grows();
+        let database_size = match rc.adds_rows() {
+            true => sql.database_size()?,
+            false => 0,
+        };
+        let mut op = || -> Result<std::result::Result<Value, Refused>> {
+            // A closing bucket, or one whose row a `sync` dropped since
+            // the request looked it up (AM-57): `NoSuchBucket`.
+            if let Some(b) = rc.bucket_written() {
+                if buckets::is_closing(sql, b.as_str())? || !keys::bucket_exists(sql, b.as_str())? {
+                    return Ok(Err(Refused::NotFound));
+                }
+            }
+            // Above the hard ceiling nothing adds a row, so the platform's
+            // stop is never met (ADR §2.6); below it deletes and smaller
+            // overwrites pass the guard.
+            if rc.adds_rows() && database_size >= self.size.hard_bytes {
+                return Ok(Err(Refused::Size(size::SizeRefusal::DatabaseFull)));
+            }
+            if let Some(adding) = grows {
+                if !self.smaller_overwrite(rc)? {
+                    if let Err(r) = size::admit(sql, self.size, database_size, adding)? {
+                        return Ok(Err(Refused::Size(r)));
+                    }
+                }
+            }
+            Ok(Ok(poll_once(rc.clone().run(&self.cat))??))
+        };
+        // AM-48: a request call that changed a row makes the stamp raise
+        // due, as a job's does.
+        Ok(match self.transact_noted(now, &mut op)? {
+            Ok(body) => UnitAnswer::Ok {
+                seqs: head.seqs,
+                body,
+            },
+            Err(reason) => {
+                // The size guard pages, as on the import (ADR §2.6).
+                let alarm = matches!(reason, Refused::AwaitedInside | Refused::Size(_));
+                refused(reason, alarm)
+            }
+        })
+    }
+
+    /// A publication that replaces a live generation of at least as many
+    /// extents: a smaller overwrite, which goes on at the size guard (ADR
+    /// §2.6). Read in the call's transaction.
+    fn smaller_overwrite(&self, rc: &super::request::RequestCall) -> Result<bool> {
+        use super::request::RequestCall as R;
+        let (R::commit_generation { c, .. } | R::commit_sliced { c, .. }) = rc else {
+            return Ok(false);
+        };
+        let g = &c.generation;
+        let live = poll_once(self.cat.live_generation(&g.bucket_id, &g.key))??;
+        Ok(live.is_some_and(|l| c.extents.len() <= l.extent_count as usize))
     }
 
     /// The third case of rule 5: a sub-request under an earlier grant is
@@ -1003,7 +1178,11 @@ impl<S: UnitSql> Unit<S> {
                 token,
                 target,
                 expect_undo,
-            } => (token.record_seq, Some((token, target, expect_undo))),
+                floor_ms,
+            } => (
+                token.record_seq,
+                Some((token, target, expect_undo, *floor_ms)),
+            ),
             _ => return Ok(PitrStep::Answer(self.handle(call, now))),
         };
         if call.name != self.own {
@@ -1031,7 +1210,7 @@ impl<S: UnitSql> Unit<S> {
         }
         let head = self.head()?;
         let no = |r: RestoreRefusal| Ok(PitrStep::Answer(refused(Refused::Restore(r), false)));
-        if let Some((token, _, expect_undo)) = restore {
+        if let Some((token, _, expect_undo, floor_ms)) = restore {
             // The token is a restore certificate for this unit and this
             // entry; the Worker verified its seal.
             let ours = token.kind == BirthKind::Restore
@@ -1048,8 +1227,11 @@ impl<S: UnitSql> Unit<S> {
             if expect_undo.0.is_empty() || expect_undo.0.len() > restore::MAX_BOOKMARK {
                 return no(RestoreRefusal::Malformed);
             }
+            if i64::try_from(floor_ms).is_err() {
+                return no(RestoreRefusal::Malformed);
+            }
         }
-        if let Some((_, restore::RestoreTarget::Bookmark { bookmark }, _)) = &restore {
+        if let Some((_, restore::RestoreTarget::Bookmark { bookmark }, _, _)) = &restore {
             if bookmark.0.is_empty() || bookmark.0.len() > restore::MAX_BOOKMARK {
                 return no(RestoreRefusal::Malformed);
             }
@@ -1060,19 +1242,26 @@ impl<S: UnitSql> Unit<S> {
         if import::unlifted_import(self.sql())? {
             return no(RestoreRefusal::MoveNotLifted);
         }
-        // Open (design question, 4c review): between the close by a
-        // move's entry and its first batch there is no move record, and
-        // the unit cannot tell that entry from a restore's, so an undo
-        // bookmark can still be taken in that span.
+        // Between the close by a move's entry and its first batch there
+        // is no move record, and the unit cannot tell that entry from a
+        // restore's, so an undo bookmark can still be taken in that span.
+        // A later time restore into the seal-to-lift span is refused by
+        // the floor the tenant chain keeps (AM-67), which no unit restore
+        // takes back.
         let born_at = self.born_at()?;
-        if let Some((_, restore::RestoreTarget::Time { at_ms }, _)) = &restore {
+        if let Some((_, restore::RestoreTarget::Time { at_ms }, _, floor_ms)) = &restore {
             // Never back into the owner move's window: a time before the
-            // move's lift would bring back its unused seal. The lift's
-            // time is the call's clock, a little before its commit: a
-            // margin covers it.
-            if import::move_lifted_at(self.sql())?
-                .is_some_and(|lifted| *at_ms < lifted.saturating_add(restore::LIFT_SLACK_MS))
-            {
+            // move's lift would bring back its unused seal. The floor is
+            // the later of the unit's own `lifted_at` and the one the
+            // verified head names (AM-67); the lift's time is the call's
+            // clock, a little before its commit: a margin covers it.
+            let own = import::move_lifted_at(self.sql())?;
+            let named = i64::try_from(*floor_ms).ok().filter(|f| *f > 0);
+            let floor = match (own, named) {
+                (Some(a), Some(b)) => Some(a.max(b)),
+                (a, b) => a.or(b),
+            };
+            if floor.is_some_and(|f| *at_ms < f.saturating_add(restore::LIFT_SLACK_MS)) {
                 return no(RestoreRefusal::BeforeMoveLift);
             }
             // Never back before this incarnation's birth (AM-46), with the
@@ -1089,7 +1278,7 @@ impl<S: UnitSql> Unit<S> {
         }
         Ok(match restore {
             None => PitrStep::Prepare { seqs: head.seqs },
-            Some((_, target, expect_undo)) => PitrStep::Restore {
+            Some((_, target, expect_undo, _)) => PitrStep::Restore {
                 target: target.clone(),
                 expect_undo: expect_undo.clone(),
             },
@@ -1115,7 +1304,7 @@ impl<S: UnitSql> Unit<S> {
         &self,
         head: &Head,
         from_seq: u64,
-        entries: &[KeyEntry],
+        entries: &[ApplyEntry],
         answers: &[KeptAnswer],
         now: UnixMs,
     ) -> Result<UnitAnswer> {
@@ -1327,6 +1516,25 @@ impl<S: UnitSql> Unit<S> {
             seqs: head.seqs,
             body,
         };
+        if let UnitOp::BucketClose { bucket_id } = &call.op {
+            // A write: an active tenant only (a hold or a deletion refuses
+            // it, as any opening write).
+            if !allows(head, false) {
+                return Ok(refused(Refused::AccountProblem, false));
+            }
+            let mut op = || {
+                Ok(buckets::close(sql, bucket_id, now)?
+                    .map(|newly| json!({ "closing": true, "newly": newly }))
+                    .map_err(Refused::Buckets))
+            };
+            // AM-48: a close that marked the bucket makes the raise due
+            // (the Worker raises the stamp before the `DropBucket`
+            // record, ADR §6.2).
+            return Ok(match self.transact_noted(now, &mut op)? {
+                Ok(body) => ok(body),
+                Err(reason) => refused(reason, false),
+            });
+        }
         if let UnitOp::ResolveActing { acting } = &call.op {
             // Read-only: run as an unauthenticated transaction, so a write
             // in it is refused and rolled back.
@@ -1674,17 +1882,19 @@ impl<S: UnitSql> Unit<S> {
         let mut outcome: Option<std::result::Result<UnixMs, LeaseRefusal>> = None;
         let mut applied = 0;
         let mut run = || -> Result<()> {
-            let stamp = poll_once(self.cat.stamp(&stamp_id))??;
-            if stamp.rolled_back {
-                outcome = Some(Err(LeaseRefusal::RolledBack));
-                return Ok(());
-            }
+            // The listed revocations first: each is a fact of `m/rk/`,
+            // kept whatever the lease comes to (a rolled-back unit too).
             match store::revoke_listed(sql, listed, now)? {
                 Ok(n) => applied = n,
                 Err(_) => {
                     outcome = Some(Err(LeaseRefusal::BadList));
                     return Ok(());
                 }
+            }
+            let stamp = poll_once(self.cat.stamp(&stamp_id))??;
+            if stamp.rolled_back {
+                outcome = Some(Err(LeaseRefusal::RolledBack));
+                return Ok(());
             }
             let own = Proven {
                 state_seq: head.seqs.state_seq,

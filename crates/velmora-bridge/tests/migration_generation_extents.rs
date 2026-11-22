@@ -132,6 +132,9 @@ async fn reads(
 
 #[tokio::test(flavor = "current_thread")]
 async fn backfill_gives_existing_objects_the_reads_they_had() {
+    if tenant_zero_only("rewinds tenant 0's catalogue migrations; a unit has its own schema") {
+        return;
+    }
     let rig = rig();
     let (bucket, signer) = rig.standard(BUCKET).await;
     let one = pattern(1, 123_456);
@@ -412,6 +415,9 @@ fn statements(script: &str) -> Vec<String> {
 /// covered after every one of them.
 #[tokio::test(flavor = "current_thread")]
 async fn the_article_rule_holds_after_every_statement_of_its_replacement() {
+    if tenant_zero_only("rewinds tenant 0's catalogue migrations; a unit has its own schema") {
+        return;
+    }
     let rig = rig();
     let (bucket, signer) = rig.standard(BUCKET).await;
     rig.put(&signer, BUCKET, "one", &pattern(1, 1000))
