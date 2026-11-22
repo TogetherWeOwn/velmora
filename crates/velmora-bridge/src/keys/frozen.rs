@@ -34,7 +34,7 @@ use super::record::{
     key_chain, open_chain_record, seal_key_record, seal_marker_record, Access, ChainRecord, Entry,
     Grant, KeyOp, KeyTable, Marker, SubjectKind, SubjectStatus, TkRing, ERR_KEY_RECORD,
 };
-use super::writer::KeyEnv;
+use super::writer::{lost_subjects, KeyEnv};
 use crate::crypto::scheme2::TenantId;
 use crate::ports::{Clock, Kek};
 use crate::records::RecordStore;
@@ -114,7 +114,8 @@ pub struct D1Key {
     /// recorded; `disabled` otherwise.
     pub status: SubjectStatus,
     /// The effective grant: per bucket, the lower access of the key and
-    /// every principal up its chain. Empty unless `active`.
+    /// every principal up its chain, also for a `disabled` key. Empty for
+    /// a `revoked` key, or when a private part on the chain is closed.
     pub grants: Vec<(String, Access)>,
     /// Grants left out because the key or a principal limits them by a
     /// prefix, an expiry or an IP list (D1 cannot state one; AM-18 makes
@@ -309,6 +310,9 @@ where
     let mut table = read.table.clone();
     let mut out = ExitDrops::default();
     let mut lost = 0;
+    // A closed holder is dead only when its private part is lost for good
+    // (AM-11's test: a full ring, and no checkpoint that may hold it).
+    let gone = lost_subjects(env.store, env.kek, env.ring, &table).await;
     // The holders are found again at every head: on an exit that is not
     // frozen (a give-up), a subject may gain a listed grant meanwhile.
     loop {
@@ -321,7 +325,7 @@ where
                 // and no record can be written for them on a frozen chain.
                 let dead = e.door.status == SubjectStatus::Revoked
                     || read.revoked.contains(&e.door.id)
-                    || (e.private.is_none() && env.ring.gone(e.tk_version));
+                    || (e.private.is_none() && gone.get(&e.door.id) == Some(&e.private_seq));
                 !dead
                     && e.door
                         .grants
@@ -426,10 +430,12 @@ fn principal_chain<'a>(table: &'a KeyTable, key: &Entry) -> Option<Vec<&'a Entry
             return None;
         }
         let p = table.get(id)?;
-        let usable = p.door.kind == SubjectKind::Principal
-            && p.door.status == SubjectStatus::Active
+        // Its grants must be readable whole; its status decides only the
+        // key's status, not its grant.
+        let readable = p.door.kind == SubjectKind::Principal
+            && p.door.status != SubjectStatus::Revoked
             && p.private.is_some();
-        if !usable {
+        if !readable {
             return None;
         }
         out.push(p);
@@ -455,16 +461,22 @@ pub fn d1_projection(table: &KeyTable) -> Vec<D1Key> {
         })
         .map(|e| {
             let principals = principal_chain(table, e);
+            let all_active = principals
+                .as_ref()
+                .is_some_and(|ps| ps.iter().all(|p| p.door.status == SubjectStatus::Active));
             let open = e.door.status == SubjectStatus::Active && e.private.is_some();
-            let status = match (e.door.status, open, &principals) {
-                (SubjectStatus::Revoked, _, _) => SubjectStatus::Revoked,
-                (_, true, Some(_)) => SubjectStatus::Active,
+            let status = match (e.door.status, open && all_active) {
+                (SubjectStatus::Revoked, _) => SubjectStatus::Revoked,
+                (_, true) => SubjectStatus::Active,
                 _ => SubjectStatus::Disabled,
             };
+            // The grant is the key's effective grant whatever its status
+            // (AM-28): a disabled key keeps it for a re-enable. None for a
+            // revoked key, a closed private part or an unreadable chain.
             let mut grants = Vec::new();
             let mut limited_dropped = 0;
-            if let (SubjectStatus::Active, Some(principals), Some(subject)) =
-                (status, &principals, e.subject())
+            if let (false, Some(principals), Some(subject)) =
+                (status == SubjectStatus::Revoked, &principals, e.subject())
             {
                 for g in subject.grants() {
                     let mut access = Some(g.access);

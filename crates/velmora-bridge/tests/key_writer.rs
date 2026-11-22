@@ -5923,6 +5923,154 @@ async fn a_bucket_create_whose_put_is_lost_reads_tenant_zero_again() {
     assert_eq!(buckets.calls.get(), 0);
 }
 
+/// Second confirmation (LOW 4): a revoke that read the move's window and
+/// finds the undo's `d1` after its `m/rk/` put takes the post-undo path:
+/// tenant 0's for a moved key, the tenant's own for its internal key.
+#[tokio::test(flavor = "current_thread")]
+async fn a_revoke_that_read_moving_and_finds_the_undo_takes_its_path() {
+    let w = World::new();
+    let adm = FakeAdmission::new(&w.root);
+    let mut table = seed(&w, &adm).await;
+    let units = w.units();
+    let gate = moved_gate(&w);
+    let env = env_gate!(w, &adm, &units, &gate);
+    let mut rng = TestRng(450);
+    let mut internal = subject("AKIN0001", SubjectKind::Internal, None, &[]);
+    let (v, wrapped) =
+        wrap_secret_v2(&kek(), &w.t, "AKIN0001", b"internal", &mut TestRng(9)).unwrap();
+    internal.door.secret_kek_version = Some(v);
+    internal.private.secret_wrapped = Some(wrapped);
+    env.change(&mut table, "i-in", &KeyRequest::Create(internal), &mut rng)
+        .await
+        .unwrap();
+    let head = w.head();
+    for (id, answer, call) in [
+        (
+            "AKVL0001",
+            KeyAnswer::RevokedOffChain,
+            "zero_revoke AKVL0001",
+        ),
+        (
+            "AKIN0001",
+            KeyAnswer::RevokedOffChain,
+            "refuse_in_d1 AKIN0001",
+        ),
+    ] {
+        gate.calls.borrow_mut().clear();
+        gate.set_zero(ZeroHead::Moving { to: w.t.clone() });
+        *gate.then.borrow_mut() = Some((1, ZeroHead::Undone { to: w.t.clone() }));
+        assert_eq!(
+            env.change(&mut table, "", &revoke(id), &mut rng)
+                .await
+                .unwrap(),
+            answer,
+            "{id}"
+        );
+        assert_eq!(*gate.calls.borrow(), vec![call]);
+    }
+    assert_eq!(w.head(), head, "no revoke record");
+    assert!(w
+        .store
+        .raw(&tenant_revocation_name(&w.t, "AKIN0001"))
+        .is_some());
+}
+
+/// A ring that holds v1, marks v2 gone, and may report itself partial.
+struct GoneTwo {
+    key: TenantKey,
+    partial: bool,
+}
+
+impl velmora_bridge::keys::record::TkRing for GoneTwo {
+    fn current(&self) -> Option<&TenantKey> {
+        Some(&self.key)
+    }
+    fn key(&self, v: u32) -> Option<&TenantKey> {
+        (v == 1).then_some(&self.key)
+    }
+    fn gone(&self, v: u32) -> bool {
+        v == 2
+    }
+    fn partial(&self) -> bool {
+        self.partial
+    }
+}
+
+/// Second confirmation (LOW 1): the exit skips a holder sealed under a
+/// gone version only by AM-11's test; with a partial ring it is blocked.
+#[tokio::test(flavor = "current_thread")]
+async fn the_exit_skips_a_gone_holder_only_when_it_is_lost_for_good() {
+    for partial in [false, true] {
+        let w = World::new();
+        let adm = FakeAdmission::new(&w.root);
+        seed(&w, &adm).await;
+        let units = w.units();
+        let gate = moved_gate(&w);
+        let v2 = OneKey(TenantKey::from_bytes(&w.t, 2, derived("tk v2")).unwrap());
+        let p4 = principal("PR0004", &[grant("b_01", RW, None)]);
+        let bytes = seal_key_record(
+            &w.kek,
+            &v2,
+            &w.t,
+            3,
+            KeyOp::Create,
+            3,
+            &p4.door,
+            Some(&p4.private),
+            false,
+            None,
+            &mut TestRng(451),
+        )
+        .unwrap();
+        w.store.plant(&key_chain(&w.t).name(3), bytes);
+        let ring = GoneTwo {
+            key: TenantKey::from_bytes(&w.t, 1, derived("tk")).unwrap(),
+            partial,
+        };
+        let env = env_with!(w, &ring, &adm, &units);
+        let env = KeyEnv { gate: &gate, ..env };
+        let drops = drop_moved_grants(&env, &["b_01".into()], &mut TestRng(452))
+            .await
+            .unwrap();
+        assert_eq!(drops.written, vec![4, 5], "partial = {partial}");
+        match partial {
+            false => assert!(drops.done && drops.blocked.is_empty()),
+            true => {
+                assert!(!drops.done);
+                assert_eq!(drops.blocked, vec!["PR0004".to_owned()]);
+            }
+        }
+    }
+}
+
+/// Second confirmation (LOW 3): a disabled key reaches D1 with its
+/// effective grant, so a re-enable on tenant 0's path finds it.
+#[tokio::test(flavor = "current_thread")]
+async fn a_disabled_key_keeps_its_effective_grant_in_d1() {
+    let w = World::new();
+    let adm = FakeAdmission::new(&w.root);
+    let mut table = seed(&w, &adm).await;
+    let units = w.units();
+    let env = env!(w, &adm, &units);
+    let mut rng = TestRng(453);
+    env.change(&mut table, "", &disable("AKVL0001"), &mut rng)
+        .await
+        .unwrap();
+    let d1 = d1_projection(&head_table(&w).await);
+    assert_eq!(d1[0].status, SubjectStatus::Disabled);
+    assert_eq!(d1[0].grants, vec![("b_01".to_owned(), RO)]);
+    // Also under a disabled principal.
+    env.change(&mut table, "", &enable("AKVL0001"), &mut rng)
+        .await
+        .unwrap();
+    env.change(&mut table, "", &disable("PR0001"), &mut rng)
+        .await
+        .unwrap();
+    let d1 = d1_projection(&head_table(&w).await);
+    assert_eq!(d1[0].status, SubjectStatus::Disabled);
+    assert_eq!(d1[0].grants, vec![("b_01".to_owned(), RO)]);
+}
+
 /// Review r1 (L1, L2): the exit's holders are found again at every head,
 /// so one that gains a listed grant during the run is dropped too; a
 /// holder whose private part does not open is reported, not retried.

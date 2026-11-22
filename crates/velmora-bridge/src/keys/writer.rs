@@ -539,7 +539,7 @@ fn closed_subjects(table: &KeyTable) -> Vec<String> {
 /// still carry it. Anything less is a closed subject to retry. One pass
 /// over the checkpoints, only when some subject is a candidate. Each
 /// lost subject with the `private_seq` it was decided at.
-async fn lost_subjects<S: RecordStore, K: Kek, T: TkRing>(
+pub(super) async fn lost_subjects<S: RecordStore, K: Kek, T: TkRing>(
     store: &S,
     kek: &K,
     ring: &T,

@@ -17,7 +17,8 @@
 //!
 //! | Tenant 0 | `<t>`'s chain | Change | Answer |
 //! |---|---|---|---|
-//! | `d1`, undone to `<t>` | any | revoke of a key `<t>` holds | tenant 0's path: flat `m/rk/<akid>`, then D1; `200` once D1 refuses it (AM-54 LOW 3) |
+//! | `d1`, undone to `<t>` | any | revoke of a key `<t>` holds, but its internal key | tenant 0's path: flat `m/rk/<akid>`, then D1; `200` once D1 refuses it (AM-54 LOW 3) |
+//! | `d1`, undone to `<t>` | any | revoke of `<t>`'s internal key (D1 never holds it) | as on a frozen chain: `m/rk/<t>/<akid>`, `200` once D1 refuses it |
 //! | `d1`, undone to `<t>` | any | anything else | `409 key_moved`, nothing put |
 //! | `d1`, no move | any | status or grant change of a key whose `m/kr/` is not `<t>`'s | an existing `m/rk/<t>/<akid>` applied to D1, then `409 key_moved` (AM-31; first, also when frozen: AM-54 LOW 2) |
 //! | any | frozen | revoke of a key `<t>` holds | `m/rk/<t>/<akid>`, no record; tenant 0 read again: `d1` (undone to `<t>`, or no move) → applied to D1, `200`; else `503` |
