@@ -601,7 +601,17 @@ impl<S: UnitSql> Unit<S> {
                     "state": state,
                 })))
             }
-            UnitOp::Job { call } => Ok(Ok(call.clone().run(&self.cat).await?)),
+            UnitOp::Job { call } => {
+                // The stamp row of a unit carries its own name (ADR §8.5):
+                // a Worker configured with another id raises nothing here.
+                if call
+                    .stamp_id()
+                    .is_some_and(|id| id != super::jobcall::stamp_id(&self.own))
+                {
+                    return Err(crate::stamp::ERR_CATALOGUE_ID);
+                }
+                Ok(Ok(call.clone().run(&self.cat).await?))
+            }
             UnitOp::Provision { .. }
             | UnitOp::Sync { .. }
             | UnitOp::ApplyKeys { .. }
@@ -1056,6 +1066,7 @@ fn failed(e: &BridgeError) -> UnitAnswer {
     let class = match e {
         BridgeError::Sql(_) => "sql",
         BridgeError::GuardFailed => "guard",
+        e if crate::stamp::is_catalogue_id_error(e) => "catalogue_id",
         BridgeError::Invalid(_) => "invalid",
         _ => "other",
     };

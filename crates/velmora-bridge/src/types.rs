@@ -1903,7 +1903,8 @@ impl<'de> Deserialize<'de> for RecountState {
             adopt: bool,
         }
         let w = Wire::deserialize(d)?;
-        let table = ["extents", "outbox", "generations", "finish"]
+        // "" while no recount is running.
+        let table = ["", "extents", "outbox", "generations", "finish"]
             .into_iter()
             .find(|t| *t == w.table)
             .ok_or_else(|| serde::de::Error::custom("not a recount table"))?;

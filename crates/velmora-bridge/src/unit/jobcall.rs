@@ -259,6 +259,17 @@ pub enum JobCall {
 }
 
 impl JobCall {
+    /// The rollback-stamp id a stamp call names, if it is one: it must be
+    /// the unit's own (ADR §8.5).
+    pub fn stamp_id(&self) -> Option<&str> {
+        match self {
+            JobCall::stamp { catalogue }
+            | JobCall::stamp_advance { catalogue, .. }
+            | JobCall::stamp_rolled_back { catalogue, .. } => Some(catalogue),
+            _ => None,
+        }
+    }
+
     /// The method's name.
     pub fn name(&self) -> &'static str {
         match self {
@@ -523,6 +534,11 @@ impl JobCall {
             } => answer(Catalog::mark_posted(cat, &l, idx, &provider, now).await?),
         }
     }
+}
+
+/// A unit's rollback-stamp id: `<tenant>.<unit>` (ADR §8.5).
+pub fn stamp_id(name: &super::name::UnitName) -> String {
+    format!("{}.{}", name.tenant, name.unit)
 }
 
 fn answer<T: Serialize>(v: T) -> Result<Value> {

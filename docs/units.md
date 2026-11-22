@@ -171,6 +171,13 @@ higher is `sync_needed`), is `authenticated`, is refused while the unit is
 closed, and is refused for a tenant being shredded. Provider permits and
 provider health are not a unit's: they stay in the shared database, which
 every tenant's jobs use. The request path does not use `TenantCatalog`.
+A refusal (`sync_needed`, a stale job, closed, unborn) comes back as a
+typed error, and the first one is kept (`TenantCatalog::refusal`) so the
+consumer can re-read the heads and run the job again or drop it. Stamp
+calls must name the unit's own stamp id, `<tenant>.<unit>`. Eviction runs
+per unit against the configured cap until the directory's global
+threshold exists (ADR §5.5): with N managed tenants the cache can hold up
+to N times the cap.
 
 ## Bookmarks
 

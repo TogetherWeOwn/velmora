@@ -384,9 +384,13 @@ fn document() -> Value {
     let calls: Vec<Value> = ops()
         .into_iter()
         .map(|op| {
+            let kind = match op {
+                UnitOp::Job { .. } => CallKind::Job,
+                _ => CallKind::Worker,
+            };
             let c = UnitCall {
                 name: name(),
-                kind: CallKind::Worker,
+                kind,
                 seqs: Some(seqs()),
                 authenticated: true,
                 listed: true,

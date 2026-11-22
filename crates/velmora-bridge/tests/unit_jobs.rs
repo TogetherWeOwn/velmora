@@ -17,7 +17,8 @@ use velmora_bridge::crypto::{seal_extent, unwrap_bdk, wrap_bdk, DataKey};
 use velmora_bridge::ingress::ByteBudget;
 use velmora_bridge::sql::SqlCatalog;
 use velmora_bridge::tenant_catalog::{
-    TenantCatalog, UnitPort, NOT_ON_UNIT, UNIT_CLOSED, UNIT_STALE_JOB,
+    TenantCatalog, UnitPort, NOT_ON_UNIT, UNIT_CLOSED, UNIT_REFUSED, UNIT_STALE_JOB,
+    UNIT_SYNC_NEEDED,
 };
 use velmora_bridge::testkit::{
     FakeJobs, FixedClock, MemBlobStore, PublishUnrecorded, RusqliteSql, TestKek,
@@ -542,6 +543,10 @@ async fn the_dispatcher_finds_a_lost_message_in_the_unit() {
     fx.clock.advance_secs(300);
     let report = fx.bridge.dispatch().await.unwrap();
     assert_eq!(report.enqueued, 1);
+    // The usage recount's state reads back through the unit while idle.
+    assert!(!report.recount_failed, "{report:?}");
+    let (state, _) = fx.bridge.catalog.usage_recounts().await.unwrap();
+    assert!(!state.running);
     assert_eq!(fx.bridge.jobs.sent()[0].job, o.job(OutboxStage::Post));
     fx.pump().await;
     assert_eq!(fx.outbox(&o, "stage").await, "done");
@@ -596,6 +601,8 @@ async fn a_job_with_lower_numbers_changes_nothing_in_the_unit() {
         "{err:?}"
     );
     fx.bridge.run_job(&o.job(OutboxStage::Post)).await;
+    // The consumer can tell why: the unit's refusal is kept.
+    assert_eq!(fx.bridge.catalog.refusal(), Some(UNIT_STALE_JOB));
     assert_eq!(fx.outbox(&o, "stage").await, "post");
     assert_eq!(fx.outbox(&o, "attempts").await, "0");
     assert_eq!(fx.server.posted_count().await, 0);
@@ -649,6 +656,111 @@ async fn the_request_path_is_not_served_through_the_job_catalogue() {
             keys_seq: 0,
         }),
         authenticated: true,
+        listed: true,
+        op: UnitOp::Job {
+            call: velmora_bridge::unit::jobcall::JobCall::evictable_bytes {},
+        },
+    };
+    assert!(matches!(
+        fx.unit.handle(&call, fx.clock.now()),
+        UnitAnswer::Refused {
+            reason: velmora_bridge::unit::Refused::Unauthenticated,
+            ..
+        }
+    ));
+}
+
+#[tokio::test]
+async fn a_job_with_higher_numbers_needs_a_sync() {
+    let fx = Fx::with(GcMode::Disposable, 4).await;
+    let bucket = fx.bucket("scratch").await;
+    let o = fx.put(&bucket, "a/x.bin", b"x").await;
+    let err = fx
+        .bridge
+        .catalog
+        .job_extent(&o.extent, &o.generation)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, BridgeError::Invalid(UNIT_SYNC_NEEDED)),
+        "{err:?}"
+    );
+    assert_eq!(fx.bridge.catalog.refusal(), Some(UNIT_SYNC_NEEDED));
+}
+
+#[tokio::test]
+async fn a_stamp_under_another_id_than_the_units_is_refused() {
+    let fx = Fx::new().await;
+    let err = fx.bridge.catalog.stamp("main").await.unwrap_err();
+    assert!(
+        velmora_bridge::stamp::is_catalogue_id_error(&err),
+        "{err:?}"
+    );
+    let own = format!("{}.0", tenant());
+    fx.bridge.catalog.stamp(&own).await.unwrap();
+}
+
+#[tokio::test]
+async fn jobs_run_for_a_suspended_tenant_and_not_for_a_shred() {
+    let fx = Fx::new().await;
+    let bucket = fx.bucket("scratch").await;
+    let o = fx.put(&bucket, "a/x.bin", b"x").await;
+    let state = |s: TenantState, mode: Option<velmora_bridge::unit::call::HoldMode>| {
+        let a = worker(
+            &fx.unit,
+            UnitOp::Sync {
+                head: SyncHead {
+                    seqs: Seqs {
+                        state_seq: 3,
+                        keys_seq: 0,
+                    },
+                    tenant_state: s,
+                    tenant_mode: mode,
+                    restoring_since: None,
+                    lift: None,
+                },
+            },
+            fx.clock.now(),
+        );
+        assert!(matches!(a, UnitAnswer::Ok { .. }), "{a:?}");
+    };
+    for (s, mode) in [
+        (
+            TenantState::Suspended,
+            Some(velmora_bridge::unit::call::HoldMode::Locked),
+        ),
+        (TenantState::Deleting, None),
+    ] {
+        state(s, mode);
+        assert!(fx
+            .bridge
+            .catalog
+            .job_extent(&o.extent, &o.generation)
+            .await
+            .unwrap()
+            .is_some());
+    }
+    state(TenantState::Shredding, None);
+    let err = fx
+        .bridge
+        .catalog
+        .job_extent(&o.extent, &o.generation)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, BridgeError::Invalid(UNIT_REFUSED)), "{err:?}");
+}
+
+#[tokio::test]
+async fn a_job_call_without_authentication_is_refused() {
+    let fx = Fx::new().await;
+    let call = UnitCall {
+        name: own(),
+        kind: CallKind::Job,
+        seqs: Some(Seqs {
+            state_seq: 3,
+            keys_seq: 0,
+        }),
+        authenticated: false,
         listed: true,
         op: UnitOp::Job {
             call: velmora_bridge::unit::jobcall::JobCall::evictable_bytes {},

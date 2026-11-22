@@ -51,6 +51,8 @@ pub struct TenantCatalog<P: UnitPort, S: Catalog> {
     shared: S,
     name: UnitName,
     seqs: Seqs,
+    /// The first refusal the unit gave (one of the `UNIT_*` texts).
+    refusal: std::cell::Cell<Option<&'static str>>,
 }
 
 impl<P: UnitPort, S: Catalog> TenantCatalog<P, S> {
@@ -61,7 +63,23 @@ impl<P: UnitPort, S: Catalog> TenantCatalog<P, S> {
             shared,
             name,
             seqs,
+            refusal: std::cell::Cell::new(None),
         }
+    }
+
+    /// The first refusal the unit gave since this catalogue was made: the
+    /// job code turns every error into a retry, so the consumer reads it
+    /// here after `run_job` and re-reads the heads, then runs the job
+    /// again with fresh numbers or drops it (ADR §2.4 rule 5).
+    pub fn refusal(&self) -> Option<&'static str> {
+        self.refusal.get()
+    }
+
+    fn refused(&self, why: &'static str) -> BridgeError {
+        if self.refusal.get().is_none() {
+            self.refusal.set(Some(why));
+        }
+        BridgeError::Invalid(why)
     }
 
     pub fn shared(&self) -> &S {
@@ -80,22 +98,23 @@ impl<P: UnitPort, S: Catalog> TenantCatalog<P, S> {
         match self.port.call(&c).await? {
             UnitAnswer::Ok { body, .. } => serde_json::from_value(body)
                 .map_err(|_| BridgeError::Sql("unit: job answer does not decode".into())),
-            UnitAnswer::SyncNeeded { .. } => Err(BridgeError::Invalid(UNIT_SYNC_NEEDED)),
+            UnitAnswer::SyncNeeded { .. } => Err(self.refused(UNIT_SYNC_NEEDED)),
             UnitAnswer::Refused {
                 reason: Refused::Identity(identity::Refusal::StaleJob),
                 ..
             }
-            | UnitAnswer::Stale { .. } => Err(BridgeError::Invalid(UNIT_STALE_JOB)),
-            UnitAnswer::Closed { .. } => Err(BridgeError::Invalid(UNIT_CLOSED)),
-            UnitAnswer::Unborn { .. } => Err(BridgeError::Invalid(UNIT_UNBORN)),
+            | UnitAnswer::Stale { .. } => Err(self.refused(UNIT_STALE_JOB)),
+            UnitAnswer::Closed { .. } => Err(self.refused(UNIT_CLOSED)),
+            UnitAnswer::Unborn { .. } => Err(self.refused(UNIT_UNBORN)),
             UnitAnswer::Failed { class } => Err(match class.as_str() {
                 "guard" => BridgeError::GuardFailed,
+                "catalogue_id" => crate::stamp::ERR_CATALOGUE_ID,
                 "invalid" => BridgeError::Invalid("unit: invalid"),
                 _ => BridgeError::Sql(format!("unit: {class}")),
             }),
             UnitAnswer::Refused { .. }
             | UnitAnswer::KeysBehind { .. }
-            | UnitAnswer::UndoBookmark { .. } => Err(BridgeError::Invalid(UNIT_REFUSED)),
+            | UnitAnswer::UndoBookmark { .. } => Err(self.refused(UNIT_REFUSED)),
         }
     }
 }
@@ -525,12 +544,25 @@ impl<P: UnitPort, S: Catalog> Catalog for TenantCatalog<P, S> {
         permits: &[Permit],
         now: UnixMs,
     ) -> Result<(bool, Vec<bool>)> {
-        let lease = self.renew(l, now).await?;
-        let mut held = Vec::with_capacity(permits.len());
-        for p in permits {
-            held.push(self.shared.renew_permit(p, now).await?);
-        }
-        Ok((lease, held))
+        debug_assert!(permits.iter().all(|p| p.class != PermitClass::Drill));
+        let held = async {
+            let mut held = Vec::with_capacity(permits.len());
+            for p in permits {
+                held.push(self.shared.renew_permit(p, now).await?);
+            }
+            Ok::<_, BridgeError>(held)
+        };
+        let (lease, held) = futures_util::future::join(self.renew(l, now), held).await;
+        Ok((lease?, held?))
+    }
+
+    /// A permit's gate is told at once, as the shared catalogue does.
+    fn forget_permit(&self, p: &Permit) {
+        self.shared.forget_permit(p)
+    }
+
+    async fn provider_status(&self, now: UnixMs) -> Result<Vec<ProviderLoad>> {
+        self.shared.provider_status(now).await
     }
 
     async fn create_bucket(&self, b: &Bucket) -> Result<Guard<()>> {

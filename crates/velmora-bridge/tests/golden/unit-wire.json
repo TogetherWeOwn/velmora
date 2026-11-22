@@ -571,7 +571,7 @@
     },
     {
       "authenticated": true,
-      "kind": "worker",
+      "kind": "job",
       "listed": true,
       "name": {
         "tenant": "t_00000000000000f1",
@@ -595,7 +595,7 @@
     },
     {
       "authenticated": true,
-      "kind": "worker",
+      "kind": "job",
       "listed": true,
       "name": {
         "tenant": "t_00000000000000f1",
