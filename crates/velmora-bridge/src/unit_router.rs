@@ -228,7 +228,9 @@ pub enum RouteRefusal {
     Unavailable,
     /// The unit is closed (restoring or provisioning).
     Closed,
-    /// A listed unit is unborn: the Worker pages "catalogue lost" (rule 7).
+    /// A listed unit of a `live` tenant is unborn: the Worker pages
+    /// "catalogue lost" (rule 7; AM-58: not while `provisioning`, which
+    /// answers `Unavailable`).
     CatalogueLost,
     /// The unit still refused the numbers after the client's one fix.
     NotFresh,
@@ -404,6 +406,12 @@ impl HeadCache {
         );
     }
 
+    /// The lifecycle of the head this isolate holds for `tenant`, of any
+    /// age.
+    fn lifecycle(&self, tenant: &TenantId) -> Option<Lifecycle> {
+        self.heads.borrow().get(tenant).map(|c| c.view.lifecycle)
+    }
+
     /// A unit of `tenant` answered `seqs`: keep its `keys_seq`; a
     /// `state_seq` above the cached head's means the head moved, and it
     /// is read again on the next route.
@@ -501,6 +509,13 @@ impl<C: RequestClients, H: TenantHeads, T: Clock> UnitRouter for Router<'_, C, H
             return (Err(RouteRefusal::Unavailable), pages);
         };
         let tenant = &routed.unit.tenant;
+        // Rule 7 pages only for a live tenant (AM-58): while the head is
+        // `provisioning` an unborn root unit is expected, and any other
+        // tenant's unborn unit answers `503` with no page too.
+        let lost = match self.cache.lifecycle(tenant) {
+            Some(Lifecycle::Live) => RouteRefusal::CatalogueLost,
+            _ => RouteRefusal::Unavailable,
+        };
         if let Some(seqs) = answered.refreshed {
             self.cache.answered(tenant, seqs);
         }
@@ -510,9 +525,7 @@ impl<C: RequestClients, H: TenantHeads, T: Clock> UnitRouter for Router<'_, C, H
             (Some(Renewal::Closed { .. }), _) | (_, Some(Synced::LiftPending { .. })) => {
                 Some(RouteRefusal::Closed)
             }
-            (Some(Renewal::Unborn), _) | (_, Some(Synced::Unborn)) => {
-                Some(RouteRefusal::CatalogueLost)
-            }
+            (Some(Renewal::Unborn), _) | (_, Some(Synced::Unborn)) => Some(lost),
             (Some(Renewal::NotListed), _) | (_, Some(Synced::NotListed)) => {
                 Some(RouteRefusal::NotPlaced)
             }
@@ -521,7 +534,7 @@ impl<C: RequestClients, H: TenantHeads, T: Clock> UnitRouter for Router<'_, C, H
         };
         let result = match &answered.reply.answer {
             UnitAnswer::Closed { .. } => Err(RouteRefusal::Closed),
-            UnitAnswer::Unborn { listed: true } => Err(RouteRefusal::CatalogueLost),
+            UnitAnswer::Unborn { listed: true } => Err(lost),
             UnitAnswer::Unborn { listed: false } => Err(RouteRefusal::NotPlaced),
             UnitAnswer::Stale { .. }
             | UnitAnswer::SyncNeeded { .. }

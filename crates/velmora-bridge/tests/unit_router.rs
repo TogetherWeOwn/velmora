@@ -668,6 +668,24 @@ async fn closed_unborn_stale_and_an_unreachable_unit_are_refusals() {
             Err(want)
         );
     }
+    // AM-58: a provisioning tenant's unborn root unit is expected, so
+    // it answers 503 with no page.
+    let provisioning = Heads::of(vec![Some(Some(test_door(
+        &tenant(),
+        1,
+        Lifecycle::Provisioning,
+        &[0],
+    )))]);
+    let clients = Clients::answering(vec![answered(UnitAnswer::Unborn { listed: true }, None)]);
+    let cache = HeadCache::default();
+    let r = router(Maintenance::Off, &clients, &provisioning, &cache, &clock);
+    let routed = r.route(&tenant(), None, NONE).await.unwrap();
+    assert_eq!(
+        r.call(&routed, CallKind::Request, true, UnitOp::Ping {})
+            .await
+            .0,
+        Err(RouteRefusal::Unavailable)
+    );
     assert!(RouteRefusal::CatalogueLost.alert());
     assert!(!RouteRefusal::Closed.alert());
     let clients = Clients::default();
