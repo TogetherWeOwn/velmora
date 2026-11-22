@@ -45,8 +45,11 @@ use crate::ports::{
 use crate::recovery::{id_after, write_generation};
 use crate::types::{
     Body, Bucket, CommitGeneration, ExtentId, ExtentRow, ExtentState, GenerationId, GenerationRow,
-    GenerationState, Precondition, S3Request, S3Response, SafetyState, WriteId,
+    GenerationState, Job, OutboxStage, Precondition, S3Request, S3Response, SafetyState, WriteId,
+    JOB_VERSION,
 };
+
+const EARLY_WAKE_MARGIN_MS: i64 = 500;
 
 /// How often a PUT is published before it answers `SlowDown`: once
 /// under the id it minted, then under ids minted after whatever was
@@ -216,7 +219,7 @@ async fn put<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: 
         now,
     };
     let mut attempts = 0;
-    let generation_id = loop {
+    loop {
         // A conditional PUT that lost the key to another write, or to a
         // delete, ends here with `412` or `404`: before a record exists
         // under this id, and after the record of an earlier attempt was
@@ -241,13 +244,37 @@ async fn put<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: 
         )
         .await
         .map_err(|_| internal())?;
-        let refused = match bridge
-            .catalog
-            .commit_generation(&commit, condition.as_ref(), record)
-            .await
-            .map_err(|_| internal())?
-        {
-            PublishOutcome::Applied => break commit.generation.id.clone(),
+        let wake = Job::Extent {
+            v: JOB_VERSION,
+            extent: extent_id.clone(),
+            generation: commit.generation.id.clone(),
+            stage: OutboxStage::Post,
+        };
+        let t0 = bridge.clock.now();
+        let (published, sent) = futures_util::future::join(
+            bridge
+                .catalog
+                .commit_generation(&commit, condition.as_ref(), record),
+            bridge.jobs.send(&wake, 1),
+        )
+        .await;
+        let sent_ok = sent.is_ok();
+        let refused = match published.map_err(|_| internal())? {
+            PublishOutcome::Applied => {
+                // The one-second delay starts at acceptance, after t0.
+                // The Workers clock ticks at I/O: t0 bounds the start
+                // from below, and this read bounds commit completion
+                // from above. Under 500 ms the row is visible before
+                // delivery, with 500 ms of margin for delay rounding.
+                if !sent_ok || bridge.clock.now().0 - t0.0 >= EARLY_WAKE_MARGIN_MS {
+                    // A duplicate costs an empty claim. If this send fails,
+                    // send_post_jobs unmarks the row for the dispatcher.
+                    send_post_jobs(bridge, &commit.generation.id, vec![extent_id], commit.now)
+                        .await;
+                }
+                break;
+            }
+            // Neither outcome wrote a row this attempt's job can claim.
             PublishOutcome::Refused(record) | PublishOutcome::Fenced(record) => record,
         };
         // The key already carries a newer id: a commit that landed after
@@ -277,9 +304,7 @@ async fn put<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: 
             e.generation_id = Some(id.clone());
         }
         commit.generation.id = id;
-    };
-
-    send_post_jobs(bridge, &generation_id, vec![extent_id], commit.now).await;
+    }
 
     let checksum = match checksum {
         Some((algorithm, value)) => {

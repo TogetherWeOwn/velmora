@@ -76,14 +76,22 @@ impl NntpConnector for NoNntp {
 pub struct Jobs {
     pub inner: FakeJobs,
     pub fail: Cell<bool>,
+    pub send_delays: RefCell<Vec<u32>>,
+    pub send_trip: Tripwire,
 }
 
 impl JobSink for Jobs {
     async fn send(&self, job: &Job, delay_secs: u32) -> Result<()> {
+        self.send_delays.borrow_mut().push(delay_secs);
         if self.fail.get() {
             return Err(BridgeError::Queue("queue down".into()));
         }
-        self.inner.send(job, delay_secs).await
+        self.send_trip
+            .guard(
+                || BridgeError::Queue("queue down".into()),
+                self.inner.send(job, delay_secs),
+            )
+            .await
     }
     async fn send_many(&self, jobs: &[Job]) -> Result<()> {
         if self.fail.get() {
@@ -473,6 +481,8 @@ pub struct FailSql {
     pub fail_writes: Cell<bool>,
     /// Fails the next batch that publishes a generation, once.
     pub fail_publish: Cell<Option<PublishFault>>,
+    /// A wire just for batches that publish a generation.
+    pub publish_trip: Tripwire,
     fail_next_batch: Cell<bool>,
     /// Fails every statement (read or write) whose text contains the
     /// string, after letting the given number of them through.
@@ -622,7 +632,12 @@ impl Sql for FailSql {
                 None => {}
             }
         }
-        self.trip.guard(sql_down, self.inner.batch(stmts)).await
+        let batch = self.trip.guard(sql_down, self.inner.batch(stmts));
+        if publishes {
+            self.publish_trip.guard(sql_down, batch).await
+        } else {
+            batch.await
+        }
     }
 }
 
@@ -700,6 +715,7 @@ pub fn rig_with_budget<N: NntpConnector + 'static>(
                 inner: RusqliteSql::with_schema().unwrap(),
                 fail_writes: Cell::new(false),
                 fail_publish: Cell::new(None),
+                publish_trip: Tripwire::default(),
                 fail_next_batch: Cell::new(false),
                 fail_matching: RefCell::new(None),
                 before_matching: RefCell::new(None),
