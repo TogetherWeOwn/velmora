@@ -23,6 +23,13 @@ fn t1() -> Tenant {
     Tenant::parse("t_00000000000000a1").unwrap()
 }
 
+/// A BDK wrap of the scheme-2 form (`0x02`, 73 bytes).
+fn wrap() -> Vec<u8> {
+    let mut w = vec![7; velmora_bridge::crypto::WRAPPED_KEY_LEN];
+    w[0] = velmora_bridge::crypto::scheme2::WRAP_VERSION_2;
+    w
+}
+
 fn block_on<F: std::future::Future>(f: F) -> F::Output {
     tokio::runtime::Builder::new_current_thread()
         .build()
@@ -279,6 +286,8 @@ fn a_whole_field_change_never_erases_a_concurrent_bucket() {
             unit: 0,
             creator: "p_owner".into(),
             grant_seq: 1,
+            name: "photos".into(),
+            bdk_wrapped: wrap(),
         },
         Actor::Customer,
     );
@@ -545,7 +554,13 @@ fn the_shredded_stub_needs_no_tenant_key() {
         assert_eq!(older.door.state(), TenantState::Active);
         // Nothing follows the stub.
         let w = chain
-            .write(&t1(), &Change::UndoDeletion, Actor::Operator, due, 0)
+            .write(
+                &t1(),
+                &Change::UndoDeletion { deletion_seq: 5 },
+                Actor::Operator,
+                due,
+                0,
+            )
             .await;
         let Err(ChainError::Refused(r)) = w else {
             panic!("{w:?}")
