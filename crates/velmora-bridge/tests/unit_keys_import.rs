@@ -102,7 +102,7 @@ fn born() -> Unit<RusqliteSql> {
     u.sql()
         .apply(&format!(
             "INSERT INTO buckets(id, name, owner, bdk_wrapped, kek_version, created_at) \
-               VALUES ('{B1}', 'alpha', 'o', x'00', 1, 1);"
+               VALUES ('{B1}', 'alpha', 'o', x'02', 1, 1);"
         ))
         .unwrap();
     u
@@ -131,6 +131,7 @@ fn principal(seq: u64, status: SubjectStatus, grants: Vec<KeyGrant>) -> KeyEntry
         secret_kek_version: None,
         owner_ref: Some("member-1".into()),
         last_seq: seq,
+        rid: None,
     }
 }
 
@@ -147,11 +148,19 @@ fn key(seq: u64, status: SubjectStatus, grants: Vec<KeyGrant>) -> KeyEntry {
         secret_kek_version: Some(1),
         owner_ref: Some("member-1".into()),
         last_seq: seq,
+        rid: None,
     }
 }
 
 fn apply(u: &Unit<RusqliteSql>, from_seq: u64, entries: Vec<KeyEntry>) -> UnitAnswer {
-    worker(u, UnitOp::ApplyKeys { from_seq, entries })
+    worker(
+        u,
+        UnitOp::ApplyKeys {
+            from_seq,
+            entries,
+            answers: vec![],
+        },
+    )
 }
 
 fn keys_seq(u: &Unit<RusqliteSql>) -> u64 {
@@ -414,7 +423,7 @@ fn the_served_grant_is_the_keys_own_inside_its_principals() {
     u.sql()
         .apply(
             "INSERT INTO buckets(id, name, owner, bdk_wrapped, kek_version, created_at) \
-               VALUES ('b_00000000000000d3', 'gamma', 'o', x'00', 1, 1);",
+               VALUES ('b_00000000000000d3', 'gamma', 'o', x'02', 1, 1);",
         )
         .unwrap();
     let b3 = "b_00000000000000d3";
@@ -522,6 +531,7 @@ fn a_key_entry_reads_back_from_its_json_and_hides_its_secret_in_debug() {
         UnitOp::ApplyKeys {
             from_seq: 1,
             entries: vec![e.clone()],
+            answers: vec![],
         },
     );
     let text = serde_json::to_string(&c).unwrap();
@@ -544,6 +554,7 @@ fn apply_is_a_worker_call_only() {
             UnitOp::ApplyKeys {
                 from_seq: 0,
                 entries: vec![principal(1, SubjectStatus::Active, vec![])],
+                answers: vec![],
             },
         ),
         NOW,
@@ -580,6 +591,7 @@ fn moving(seq: u64) -> MoveHead {
         seq,
         selector: "moving".into(),
         to: Some(tenant()),
+        flips: 0,
     }
 }
 
@@ -633,8 +645,15 @@ fn import(
     )
 }
 
+/// A scheme-2 BDK wrap's shape: 73 bytes after the version byte 0x02.
+fn bdk() -> ImportValue {
+    let mut w = vec![0; 73];
+    w[0] = 0x02;
+    ImportValue::Blob(w)
+}
+
 fn bucket_row(id: &str, name: &str) -> Vec<ImportValue> {
-    vec![t(id), t(name), t(P), b(73), i(1), i(0), i(10)]
+    vec![t(id), t(name), t(P), bdk(), i(1), i(0), i(10)]
 }
 
 const G: &str = "g_0019a00000000d1d1d1d1d1d1d1d1";
@@ -763,6 +782,7 @@ fn an_import_runs_only_inside_the_move_window_of_this_unit() {
                 seq: 10,
                 selector: "d1".into(),
                 to: None,
+                flips: 0,
             },
             SINCE,
         ),
@@ -771,6 +791,7 @@ fn an_import_runs_only_inside_the_move_window_of_this_unit() {
                 seq: 10,
                 selector: "moved".into(),
                 to: Some(tenant()),
+                flips: 0,
             },
             SINCE,
         ),
@@ -780,6 +801,7 @@ fn an_import_runs_only_inside_the_move_window_of_this_unit() {
                 seq: 10,
                 selector: "moving".into(),
                 to: Some(TenantId::parse("t_0000000000000d02").unwrap()),
+                flips: 0,
             },
             SINCE,
         ),
@@ -935,7 +957,7 @@ fn batches_apply_once_and_in_order_and_the_import_resumes_by_cursor() {
     let progress = ok_body(worker(&u, UnitOp::ImportProgress {}));
     assert_eq!(
         progress,
-        json!({ "tables": [{ "table": "buckets", "cursor": "b2", "rows": 3 }] })
+        json!({ "tables": [{ "table": "buckets", "cursor": "b2", "rows": 3 }], "sealed": null })
     );
 }
 

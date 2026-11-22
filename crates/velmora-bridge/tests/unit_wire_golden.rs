@@ -13,17 +13,25 @@
 
 use serde_json::{json, Value};
 use velmora_bridge::unit::call::{Closed, HoldMode};
+use velmora_bridge::unit::export::{ExportMode, ExportRefusal, ExportTable, KeyTable};
 use velmora_bridge::unit::identity::Refusal as IdentityRefusal;
 use velmora_bridge::unit::identity::Refusal;
 use velmora_bridge::unit::import::{
-    ImportBatch, ImportRefusal, ImportTable, ImportValue, MoveHead,
+    ImportBatch, ImportCount, ImportRefusal, ImportTable, ImportValue, MoveHead,
 };
 use velmora_bridge::unit::jobcall::JobCall;
-use velmora_bridge::unit::keys::{Access, KeyEntry, KeyGrant, KeyKind, KeyRefusal, SubjectStatus};
+use velmora_bridge::unit::keys::{
+    Access, KeptAnswer, KeyEntry, KeyGrant, KeyKind, KeyRefusal, SubjectStatus,
+};
 use velmora_bridge::unit::lift::{
-    AckClass, ClassProof, FindingList, GateRefusal, GateSummary, LiftProof, ReplayId,
+    AckClass, ClassProof, FindingList, GateRefusal, GateSummary, LiftProof, ReplayId, ReportKind,
+};
+use velmora_bridge::unit::recount::{RecountCall, RecountRefusal};
+use velmora_bridge::unit::reserve::{
+    Acting, Admit, Binding, Hash32, Opening, PrincipalView, ReserveRefusal, Rid,
 };
 use velmora_bridge::unit::restore::{Bookmark, RestoreRefusal, RestoreTarget};
+use velmora_bridge::unit::size::SizeRefusal;
 use velmora_bridge::unit::{
     BirthKind, BirthToken, CallKind, ProvisionRefusal, Reader, Refused, Seqs, SyncHead, TenantId,
     TenantState, UnitAnswer, UnitCall, UnitName, UnitOp,
@@ -73,13 +81,23 @@ fn op_kind(op: &UnitOp) -> &'static str {
         UnitOp::HeldKeys {} => "held_keys",
         UnitOp::Import { .. } => "import",
         UnitOp::ImportProgress {} => "import_progress",
+        UnitOp::ImportSeal { .. } => "import_seal",
+        UnitOp::Export { .. } => "export",
         UnitOp::RestorePrepare { .. } => "restore_prepare",
         UnitOp::Restore { .. } => "restore",
         UnitOp::GateOpen { .. } => "gate_open",
+        UnitOp::GateOpenMove { .. } => "gate_open_move",
         UnitOp::GateReport { .. } => "gate_report",
         UnitOp::GateBlockers { .. } => "gate_blockers",
         UnitOp::GateAck { .. } => "gate_ack",
         UnitOp::GateStatus {} => "gate_status",
+        UnitOp::Recount { .. } => "recount",
+        UnitOp::Reserve { .. } => "reserve",
+        UnitOp::ResolveActing { .. } => "resolve_acting",
+        UnitOp::Release { .. } => "release",
+        UnitOp::BindBucket { .. } => "bind_bucket",
+        UnitOp::ReleaseBound { .. } => "release_bound",
+        UnitOp::BucketBinding { .. } => "bucket_binding",
         UnitOp::Job { .. } => "job",
         UnitOp::ReadPlan { .. } => "read_plan",
     }
@@ -117,6 +135,10 @@ fn refused_kind(r: &Refused) -> &'static str {
         Refused::Import(_) => "import",
         Refused::Restore(_) => "restore",
         Refused::Gate(_) => "gate",
+        Refused::Export(_) => "export",
+        Refused::Recount(_) => "recount",
+        Refused::Reserve(_) => "reserve",
+        Refused::Size(_) => "size",
     }
 }
 
@@ -169,6 +191,12 @@ fn ops() -> Vec<UnitOp> {
                 secret_kek_version: Some(1),
                 owner_ref: Some("m_1".into()),
                 last_seq: 3,
+                rid: Some(Rid([0x11; 16])),
+            }],
+            answers: vec![KeptAnswer {
+                rid: Rid([0x11; 16]),
+                status: 201,
+                body: r#"{"id":"AKGOLDEN000000000001","secret_access_key":null}"#.into(),
             }],
         },
         UnitOp::HeldKeys {},
@@ -177,6 +205,7 @@ fn ops() -> Vec<UnitOp> {
                 seq: 11,
                 selector: "moving".into(),
                 to: Some(name().tenant),
+                flips: 0,
             },
             since: 7,
             batch: ImportBatch {
@@ -199,6 +228,34 @@ fn ops() -> Vec<UnitOp> {
             },
         },
         UnitOp::ImportProgress {},
+        UnitOp::ImportSeal {
+            head: MoveHead {
+                seq: 12,
+                selector: "moving".into(),
+                to: Some(name().tenant),
+                flips: 1,
+            },
+            since: 7,
+            tables: vec![ImportCount {
+                table: ImportTable::Objects,
+                rows: 2,
+            }],
+        },
+        UnitOp::Export {
+            table: ExportTable::Data(ImportTable::Objects),
+            after: Some(vec![
+                ImportValue::Text("b_00000000000000f1".into()),
+                ImportValue::Text("a/b".into()),
+            ]),
+            limit: 500,
+            mode: ExportMode::Rows,
+        },
+        UnitOp::Export {
+            table: ExportTable::Keys(KeyTable::UnitKeyGrants),
+            after: None,
+            limit: 100,
+            mode: ExportMode::Hash,
+        },
         UnitOp::RestorePrepare { since: 7 },
         UnitOp::Restore {
             token: token(),
@@ -213,6 +270,15 @@ fn ops() -> Vec<UnitOp> {
             expect_undo: Bookmark("bm-1".into()),
         },
         UnitOp::GateOpen { replay_id: rid() },
+        UnitOp::GateOpenMove {
+            replay_id: rid(),
+            head: MoveHead {
+                seq: 12,
+                selector: "moving".into(),
+                to: Some(name().tenant),
+                flips: 1,
+            },
+        },
         UnitOp::GateReport {
             replay_id: rid(),
             summary: GateSummary {
@@ -242,6 +308,83 @@ fn ops() -> Vec<UnitOp> {
             ids: vec!["g_1".into()],
         },
         UnitOp::GateStatus {},
+        UnitOp::Recount {
+            call: RecountCall::Start {},
+            head: None,
+        },
+        UnitOp::Recount {
+            call: RecountCall::Step { chunk: 500 },
+            head: Some(MoveHead {
+                seq: 11,
+                selector: "moving".into(),
+                to: Some(name().tenant),
+                flips: 0,
+            }),
+        },
+        UnitOp::Reserve {
+            key_hash: Hash32([0x22; 32]),
+            fingerprint: Hash32([0x33; 32]),
+            rid: Rid([0x44; 16]),
+            acting: Some(Acting::OwnerRef("m_1".into())),
+            opening: Opening::Key {
+                kind: KeyKind::S3,
+                id: "AKGOLDEN000000000002".into(),
+                grants: vec![KeyGrant {
+                    bucket_id: "b_00000000000000f1".into(),
+                    access: Access::Ro,
+                    expires_at: None,
+                    prefix: None,
+                    ip_list: vec![],
+                }],
+            },
+        },
+        UnitOp::Reserve {
+            key_hash: Hash32([0x22; 32]),
+            fingerprint: Hash32([0x33; 32]),
+            rid: Rid([0x45; 16]),
+            acting: None,
+            opening: Opening::Principal {
+                id: "p_2".into(),
+                owner_ref: "m_2".into(),
+                grants: vec![],
+            },
+        },
+        UnitOp::Reserve {
+            key_hash: Hash32([0x22; 32]),
+            fingerprint: Hash32([0x33; 32]),
+            rid: Rid([0x46; 16]),
+            acting: Some(Acting::Principal("p_1".into())),
+            opening: Opening::Grants {
+                subject: "AKGOLDEN000000000001".into(),
+                grants: vec![],
+            },
+        },
+        UnitOp::Reserve {
+            key_hash: Hash32([0x22; 32]),
+            fingerprint: Hash32([0x33; 32]),
+            rid: Rid([0x47; 16]),
+            acting: Some(Acting::OwnerRef("m_1".into())),
+            opening: Opening::Bucket {
+                name: "alpha".into(),
+                unit: 0,
+            },
+        },
+        UnitOp::ResolveActing {
+            acting: Acting::OwnerRef("m_1".into()),
+        },
+        UnitOp::Release {
+            rid: Rid([0x44; 16]),
+        },
+        UnitOp::BindBucket {
+            rid: Rid([0x47; 16]),
+            expected: None,
+            grant_seq: 4,
+        },
+        UnitOp::ReleaseBound {
+            rid: Rid([0x47; 16]),
+            bound: Some(4),
+        },
+        UnitOp::BucketBinding { grant_seq: 4 },
         UnitOp::Job {
             call: JobCall::claim {
                 extent: ExtentId::new("x_000000000000000000000000f1"),
@@ -317,7 +460,12 @@ fn nested() -> Value {
         "subject_status": every!(SubjectStatus: Active, Disabled, Revoked),
         "access": every!(Access: Ro, Rw),
         "key_refusal": every!(KeyRefusal: Gap, Malformed),
-        "import_refusal": every!(ImportRefusal: NotBound, Shape, OutOfOrder),
+        "import_refusal": every!(ImportRefusal: NotBound, Shape, OutOfOrder, Sealed,
+            CountMismatch),
+        "export_refusal": every!(ExportRefusal: NotRestoring, HashOnly, Malformed),
+        "export_mode": every!(ExportMode: Hash, Rows),
+        "key_table": every!(KeyTable: UnitKeys, UnitKeyGrants),
+        "report_kind": every!(ReportKind: Restore, Move),
         "import_table": every!(ImportTable: Buckets, Generations, Objects, Extents,
             GenerationExtents, Articles, Verifications, VerifyRaises, VerifyEscalations, Outbox,
             Uploads, UploadParts, UploadPartExtents, Gc, UsageHours, UsageRecounts),
@@ -326,9 +474,18 @@ fn nested() -> Value {
         "finding_list": every!(FindingList: Damaged, Unreadable, Unpublishable,
             DamagedUnpublished, Twins, OtherBucket, HeldMissing, HeldMissingLive),
         "gate_refusal": every!(GateRefusal: NotRestoring, NoReport, StampNotLevelled, Closed,
-            AckMismatch, CountersOff, ProofMismatch, ListMismatch, Malformed),
+            AckMismatch, CountersOff, ProofMismatch, ListMismatch, Malformed, MoveNotBound,
+            ImportNotSealed, MoveNotEmpty),
         "restore_refusal": every!(RestoreRefusal: NotRestoring, WrongToken, LeaseLive,
-            LeaseUnknown, TooSoon, Moved, Malformed, NoPointInTime),
+            LeaseUnknown, TooSoon, Moved, Malformed, NoPointInTime, BeforeMoveLift),
+        "recount_refusal": every!(RecountRefusal: NotRestoring, ImportNotSealed, MoveNotBound),
+        "reserve_refusal": every!(ReserveRefusal: CapReached, GrantNotHeld,
+            GrantLimitsNotServed, TooManyGrants, ActingPrincipalUnknown,
+            ActingPrincipalInactive, ActingPrincipalHeld, OwnerRefAmbiguous,
+            BucketAlreadyExists, PrincipalExists, Conflict, InternalKeyRefused, NotFound, RidTaken,
+            Malformed),
+        "size_refusal": every!(SizeRefusal: DatabaseFull, TooManyExtents),
+        "reservation_bodies": reservation_bodies(),
     })
 }
 
@@ -348,7 +505,84 @@ fn refusals() -> Vec<Refused> {
         Refused::Import(ImportRefusal::OutOfOrder),
         Refused::Restore(RestoreRefusal::Moved),
         Refused::Gate(GateRefusal::AckMismatch),
+        Refused::Export(ExportRefusal::HashOnly),
+        Refused::Recount(RecountRefusal::ImportNotSealed),
+        Refused::Reserve(ReserveRefusal::GrantLimitsNotServed),
+        Refused::Size(SizeRefusal::TooManyExtents),
     ]
+}
+
+/// The bodies of the reservation calls' `ok` answers (exhaustive over
+/// what an ask and a binding read answer).
+fn reservation_bodies() -> Value {
+    let principal = PrincipalView {
+        id: "p_1".into(),
+        status: SubjectStatus::Active,
+        held: false,
+        grants: vec![],
+    };
+    let admits = vec![
+        Admit::Admitted {
+            rid: Rid([0x44; 16]),
+            keys_seq: 3,
+            again: false,
+            scope: Some("p_1".into()),
+            bound: None,
+            subject: Some("AKGOLDEN000000000002".into()),
+            unit: None,
+        },
+        Admit::Applied {
+            status: Some(201),
+            body: Some("{}".into()),
+            subject: Some("AKGOLDEN000000000002".into()),
+            bucket: None,
+            grant_seq: None,
+        },
+        Admit::Reused,
+        Admit::Narrowing { keys_seq: 3 },
+        Admit::NotOpen { open: None },
+        Admit::NotOpen {
+            open: Some((Rid([0x44; 16]), 3)),
+        },
+        Admit::Exists(principal),
+        Admit::Refused(ReserveRefusal::CapReached),
+        Admit::RefusedDrop(ReserveRefusal::GrantNotHeld, Rid([0x44; 16])),
+    ];
+    let mut kinds = std::collections::BTreeSet::new();
+    for a in &admits {
+        kinds.insert(match a {
+            Admit::Admitted { .. } => "admitted",
+            Admit::Applied { .. } => "applied",
+            Admit::Reused => "reused",
+            Admit::Narrowing { .. } => "narrowing",
+            Admit::NotOpen { .. } => "not_open",
+            Admit::Exists(_) => "exists",
+            Admit::Refused(_) => "refused",
+            Admit::RefusedDrop(..) => "refused_drop",
+        });
+    }
+    assert_eq!(kinds.len(), 8);
+    let bindings = [
+        Binding::Open {
+            rid: Rid([0x47; 16]),
+            name: "alpha".into(),
+            creator: "p_1".into(),
+            unit: 0,
+        },
+        Binding::Created {
+            bucket: "b_00000000000000f1".into(),
+        },
+        Binding::None,
+    ];
+    for b in &bindings {
+        match b {
+            Binding::Open { .. } | Binding::Created { .. } | Binding::None => {}
+        }
+    }
+    json!({
+        "admits": admits.iter().map(Admit::body).collect::<Vec<_>>(),
+        "bindings": bindings.iter().map(Binding::body).collect::<Vec<_>>(),
+    })
 }
 
 fn answers() -> Vec<UnitAnswer> {
@@ -416,7 +650,7 @@ fn document() -> Value {
 #[test]
 fn every_variant_has_a_sample() {
     let ops: std::collections::BTreeSet<_> = ops().iter().map(op_kind).collect();
-    assert_eq!(ops.len(), 17, "{ops:?}");
+    assert_eq!(ops.len(), 27, "{ops:?}");
     let readers: std::collections::BTreeSet<_> = ops_readers().into_iter().collect();
     assert_eq!(readers.len(), 2, "both readers have a sample");
     // The variants that carry data, each with a sample (exhaustive).
@@ -448,7 +682,7 @@ fn every_variant_has_a_sample() {
     let answers: std::collections::BTreeSet<_> = answers().iter().map(answer_kind).collect();
     assert_eq!(answers.len(), 9, "{answers:?}");
     let reasons: std::collections::BTreeSet<_> = refusals().iter().map(refused_kind).collect();
-    assert_eq!(reasons.len(), 14, "{reasons:?}");
+    assert_eq!(reasons.len(), 18, "{reasons:?}");
 }
 
 #[test]

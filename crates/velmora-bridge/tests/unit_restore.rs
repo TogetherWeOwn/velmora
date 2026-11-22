@@ -6,11 +6,12 @@
 use std::cell::RefCell;
 
 use serde_json::json;
-use velmora_bridge::testkit::{RusqliteSql, ARM_USAGE};
+use velmora_bridge::testkit::RusqliteSql;
 use velmora_bridge::unit::lift::{
     ids_hash, AckClass, ClassProof, FindingList, GateRefusal, GateSummary, LiftProof, ReplayId,
     MAX_PAGE,
 };
+use velmora_bridge::unit::recount::{RecountCall, RecountRefusal};
 use velmora_bridge::unit::restore::{
     drive, Bookmark, PitrStep, PointInTimePort, RestoreRefusal, RestoreTarget, LEASE_TERM_MS,
     RESTORE_MARGIN_MS,
@@ -775,10 +776,53 @@ fn a_restored_unit_lifts_only_with_its_counters_on() {
         lift(&u, S + 1, None, t),
         refused_gate(GateRefusal::CountersOff)
     );
-    // The gate's recount turns them on (AM-3).
-    u.sql().apply(ARM_USAGE).unwrap();
+    // The gate's recount turns them on (AM-3, AM-27): `Recount`, a unit
+    // call, as jobs are refused while the unit is closed. No import was
+    // bound to this unit, so it is the gate's and needs no seal.
+    let started = ok(worker(
+        &u,
+        UnitOp::Recount {
+            call: RecountCall::Start {},
+            head: None,
+        },
+        t,
+    ));
+    assert_eq!(started["started"], json!(true));
+    assert_eq!(started["counters_on"], json!(false));
+    let mut on = false;
+    for _ in 0..10 {
+        let step = ok(worker(
+            &u,
+            UnitOp::Recount {
+                call: RecountCall::Step { chunk: 100 },
+                head: None,
+            },
+            t,
+        ));
+        if step["counters_on"] == json!(true) {
+            assert!(step["finished"].is_object(), "{step}");
+            on = true;
+            break;
+        }
+    }
+    assert!(on, "the recount ends and turns the counters on");
     let p = proof(&u, t);
     assert!(matches!(lift(&u, S + 1, Some(p), t), UnitAnswer::Ok { .. }));
+    // An open unit's counters are the cron's: `Recount` is refused.
+    assert_eq!(
+        worker(
+            &u,
+            UnitOp::Recount {
+                call: RecountCall::Start {},
+                head: None,
+            },
+            t,
+        ),
+        UnitAnswer::Refused {
+            reason: Refused::Recount(RecountRefusal::NotRestoring),
+            alarm: false,
+        }
+    );
 }
 
 #[test]

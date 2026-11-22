@@ -52,6 +52,10 @@ use crate::types::{BridgeError, Result, UnixMs};
 pub const LEASE_TERM_MS: i64 = 600_000;
 /// The margin after T and after the latest lease, before a restore.
 pub const RESTORE_MARGIN_MS: i64 = 60_000;
+/// The margin after the owner move's lift within which a restore to a
+/// time is still refused: the lift's recorded time is its call's clock,
+/// a little before the commit (est).
+pub const LIFT_SLACK_MS: i64 = 60_000;
 /// The longest bookmark the unit takes back (est).
 pub const MAX_BOOKMARK: usize = 1024;
 
@@ -102,6 +106,8 @@ pub enum RestoreRefusal {
     /// The call reached a unit without point-in-time storage (natively,
     /// through `handle`): restores go through the object class.
     NoPointInTime,
+    /// A time target before the owner move's lift (the move's window).
+    BeforeMoveLift,
 }
 
 /// The lease as the restore checks read it: `fresh_until` and the latest

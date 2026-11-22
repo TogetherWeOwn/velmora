@@ -64,4 +64,8 @@ impl UnitSql for DoSql {
     fn apply_script(&self, script: &str) -> Result<()> {
         self.apply(script)
     }
+
+    fn database_size(&self) -> Result<u64> {
+        DoSql::database_size(self)
+    }
 }

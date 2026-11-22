@@ -36,8 +36,9 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 use super::object::poll_once;
+use super::reserve::{self, Rid};
 use crate::ports::{Sql, SqlValue};
-use crate::types::{BridgeError, Result};
+use crate::types::{BridgeError, Result, UnixMs};
 
 /// The most entries one call may carry (est): a page of the chain.
 pub const MAX_ENTRIES: usize = 100;
@@ -66,7 +67,7 @@ impl KeyKind {
         }
     }
 
-    fn parse(s: &str) -> Option<KeyKind> {
+    pub(crate) fn parse(s: &str) -> Option<KeyKind> {
         Some(match s {
             "s3" => KeyKind::S3,
             "app_password" => KeyKind::AppPassword,
@@ -94,7 +95,7 @@ impl SubjectStatus {
         }
     }
 
-    fn parse(s: &str) -> Option<SubjectStatus> {
+    pub(crate) fn parse(s: &str) -> Option<SubjectStatus> {
         Some(match s {
             "active" => SubjectStatus::Active,
             "disabled" => SubjectStatus::Disabled,
@@ -158,8 +159,23 @@ impl fmt::Debug for KeyGrant {
 impl KeyGrant {
     /// A grant the catalogue's `grants` can state: no prefix, no address
     /// list, no expiry.
-    fn whole(&self) -> bool {
+    pub(crate) fn whole(&self) -> bool {
         self.prefix.is_none() && self.ip_list.is_empty() && self.expires_at.is_none()
+    }
+
+    /// Whether this grant allows everything `other` allows: the same
+    /// bucket, access no lower, and each limit absent or no narrower
+    /// (the same prefix, an expiry no earlier, the same address list).
+    pub(crate) fn covers(&self, other: &KeyGrant) -> bool {
+        self.bucket_id == other.bucket_id
+            && self.access >= other.access
+            && (self.prefix.is_none() || self.prefix == other.prefix)
+            && match (self.expires_at, other.expires_at) {
+                (None, _) => true,
+                (Some(mine), Some(theirs)) => mine >= theirs,
+                (Some(_), None) => false,
+            }
+            && (self.ip_list.is_empty() || self.ip_list == other.ip_list)
     }
 }
 
@@ -190,6 +206,30 @@ pub struct KeyEntry {
     pub owner_ref: Option<String>,
     /// The seq of the record this entry is.
     pub last_seq: u64,
+    /// The `rid` of the reservation whose call wrote this record (AM-38):
+    /// the apply turns that reservation `applied`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rid: Option<Rid>,
+}
+
+/// The answer to keep for a reservation whose record an apply holds
+/// (AM-38): the Worker's first answer to the call, cleaned of every
+/// secret. Kept once; `Debug` shows the status only.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KeptAnswer {
+    pub rid: Rid,
+    pub status: u16,
+    pub body: String,
+}
+
+impl fmt::Debug for KeptAnswer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("KeptAnswer")
+            .field("rid", &self.rid)
+            .field("status", &self.status)
+            .finish_non_exhaustive()
+    }
 }
 
 impl fmt::Debug for KeyEntry {
@@ -221,11 +261,14 @@ pub enum KeyRefusal {
 /// What an apply did.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Applied {
-    /// Applied; the unit's `keys_seq` is now this.
+    /// Applied; the unit's `keys_seq` is now this. `reserved`: the
+    /// reservations it turned `applied`; `kept`: the answers it kept.
     Done {
         keys_seq: u64,
         applied: u64,
         skipped: u64,
+        reserved: u64,
+        kept: u64,
     },
     /// The base is above the unit's `keys_seq`: nothing was done; read
     /// again from `keys_seq + 1`.
@@ -303,12 +346,24 @@ struct Row {
 /// `keys_seq` is the unit's own. Writes `unit_keys`, `unit_key_grants`
 /// and the effective `access_keys` and `grants`; the caller moves
 /// `unit_head.keys_seq` to the answer's number.
+///
+/// The reservations (AM-38, ADR §2.5): an entry that carries a `rid`
+/// turns that reservation `applied` (the unit now holds its record,
+/// whether this call wrote it or found it), and `answers` are kept for
+/// the reservations that are applied and have none yet. A principal
+/// whose record closes or narrows it (any status but `active`, a grant
+/// it held that no grant of the record covers, or a held record, which
+/// may lack its private grant parts) has its other open reservations
+/// that are not bound to a creator grant cancelled, and their cap slots
+/// given back.
 pub fn apply<S: Sql>(
     sql: &S,
     keys_seq: u64,
     from_seq: u64,
     entries: &[KeyEntry],
     tenant_zero: bool,
+    answers: &[KeptAnswer],
+    now: UnixMs,
 ) -> Result<Applied> {
     if from_seq > keys_seq {
         return Ok(Applied::Behind { keys_seq });
@@ -317,9 +372,27 @@ pub fn apply<S: Sql>(
         return Ok(Applied::Refused(r));
     }
     let mut touched = BTreeSet::new();
-    let (mut applied, mut skipped) = (0, 0);
+    let (mut applied, mut skipped, mut reserved) = (0, 0, 0);
     for e in entries {
         let row = stored(sql, &e.id)?;
+        // What a principal held before this record: a record that closes
+        // or narrows it cancels its open reservations (§2.5).
+        if e.kind == KeyKind::Principal {
+            if let Some(r) = &row {
+                let before = grants_of(sql, &e.id)?;
+                // A held record may come without its private grant parts:
+                // it never counts as keeping a limited grant.
+                let kept = !e.held
+                    && e.status == SubjectStatus::Active
+                    && r.status == SubjectStatus::Active
+                    && before
+                        .iter()
+                        .all(|old| e.grants.iter().any(|new| new.covers(old)));
+                if !kept && (e.last_seq > r.last_seq || e.status == SubjectStatus::Revoked) {
+                    reserve::cancel_open(sql, &e.id, e.rid.as_ref())?;
+                }
+            }
+        }
         let write = match &row {
             None => true,
             Some(r) => e.last_seq > r.last_seq || (e.last_seq == r.last_seq && r.held && !e.held),
@@ -342,13 +415,29 @@ pub fn apply<S: Sql>(
         } else {
             skipped += 1;
         }
+        // The unit holds this record now (written here or before): its
+        // reservation is applied before a later entry of the same call
+        // can cancel it.
+        if let Some(rid) = &e.rid {
+            if reserve::applied(sql, rid, &e.id, now)? {
+                reserved += 1;
+            }
+        }
     }
     project(sql, &touched)?;
+    let mut kept = 0;
+    for a in answers {
+        if reserve::keep_answer(sql, &a.rid, a.status, &a.body)? {
+            kept += 1;
+        }
+    }
     let last = from_seq + entries.len() as u64;
     Ok(Applied::Done {
         keys_seq: keys_seq.max(last),
         applied,
         skipped,
+        reserved,
+        kept,
     })
 }
 
@@ -398,6 +487,50 @@ fn stored<S: Sql>(sql: &S, id: &str) -> Result<Option<Row>> {
     }))
 }
 
+/// The values of a subject's `unit_keys` row and of its `unit_key_grants`
+/// rows, in schema order, as the entry states them with `status`: what
+/// the apply writes, and what the move's V6 hashes from the chain
+/// (`unit::export::chain_key_rows`).
+pub(crate) fn entry_values(
+    e: &KeyEntry,
+    status: SubjectStatus,
+) -> Result<(Vec<SqlValue>, Vec<Vec<SqlValue>>)> {
+    let opt_text = |s: &Option<String>| s.clone().map_or(SqlValue::Null, SqlValue::Text);
+    let row = vec![
+        SqlValue::Text(e.id.clone()),
+        SqlValue::Text(e.kind.as_str().into()),
+        SqlValue::Text(status.as_str().into()),
+        SqlValue::Int(i64::from(e.held)),
+        opt_text(&e.made_by),
+        int(e.created_at)?,
+        e.secret_wrapped
+            .clone()
+            .map_or(SqlValue::Null, SqlValue::Blob),
+        e.secret_kek_version
+            .map_or(SqlValue::Null, |v| SqlValue::Int(i64::from(v))),
+        opt_text(&e.owner_ref),
+        int(e.last_seq)?,
+    ];
+    let mut grants = Vec::with_capacity(e.grants.len());
+    for (i, g) in e.grants.iter().enumerate() {
+        let ips =
+            serde_json::to_string(&g.ip_list).map_err(|_| BridgeError::Invalid("unit: ip list"))?;
+        grants.push(vec![
+            SqlValue::Text(e.id.clone()),
+            SqlValue::Int(i as i64),
+            SqlValue::Text(g.bucket_id.clone()),
+            SqlValue::Text(g.access.as_str().into()),
+            match g.expires_at {
+                Some(t) => int(t)?,
+                None => SqlValue::Null,
+            },
+            opt_text(&g.prefix),
+            SqlValue::Text(ips),
+        ]);
+    }
+    Ok((row, grants))
+}
+
 /// Writes the subject's row and grants as the entry states them; a row
 /// that was revoked stays revoked.
 fn put<S: Sql>(sql: &S, e: &KeyEntry, was_revoked: bool) -> Result<()> {
@@ -406,10 +539,9 @@ fn put<S: Sql>(sql: &S, e: &KeyEntry, was_revoked: bool) -> Result<()> {
     } else {
         e.status
     };
-    let opt_text = |s: &Option<String>| s.clone().map_or(SqlValue::Null, SqlValue::Text);
-    poll_once(
-        sql.exec(
-            "INSERT INTO unit_keys(id, kind, status, held, made_by, created_at, secret_wrapped, \
+    let (row, grants) = entry_values(e, status)?;
+    poll_once(sql.exec(
+        "INSERT INTO unit_keys(id, kind, status, held, made_by, created_at, secret_wrapped, \
            secret_kek_version, owner_ref, last_seq) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) \
          ON CONFLICT(id) DO UPDATE SET kind = excluded.kind, status = excluded.status, \
@@ -417,45 +549,17 @@ fn put<S: Sql>(sql: &S, e: &KeyEntry, was_revoked: bool) -> Result<()> {
            secret_wrapped = excluded.secret_wrapped, \
            secret_kek_version = excluded.secret_kek_version, owner_ref = excluded.owner_ref, \
            last_seq = excluded.last_seq",
-            &[
-                SqlValue::Text(e.id.clone()),
-                SqlValue::Text(e.kind.as_str().into()),
-                SqlValue::Text(status.as_str().into()),
-                SqlValue::Int(i64::from(e.held)),
-                opt_text(&e.made_by),
-                int(e.created_at)?,
-                e.secret_wrapped
-                    .clone()
-                    .map_or(SqlValue::Null, SqlValue::Blob),
-                e.secret_kek_version
-                    .map_or(SqlValue::Null, |v| SqlValue::Int(i64::from(v))),
-                opt_text(&e.owner_ref),
-                int(e.last_seq)?,
-            ],
-        ),
-    )??;
+        &row,
+    ))??;
     poll_once(sql.exec(
         "DELETE FROM unit_key_grants WHERE subject_id = ?1",
         &[SqlValue::Text(e.id.clone())],
     ))??;
-    for (i, g) in e.grants.iter().enumerate() {
-        let ips =
-            serde_json::to_string(&g.ip_list).map_err(|_| BridgeError::Invalid("unit: ip list"))?;
+    for g in &grants {
         poll_once(sql.exec(
             "INSERT INTO unit_key_grants(subject_id, idx, bucket_id, access, expires_at, prefix, \
                ip_list) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            &[
-                SqlValue::Text(e.id.clone()),
-                SqlValue::Int(i as i64),
-                SqlValue::Text(g.bucket_id.clone()),
-                SqlValue::Text(g.access.as_str().into()),
-                match g.expires_at {
-                    Some(t) => int(t)?,
-                    None => SqlValue::Null,
-                },
-                opt_text(&g.prefix),
-                SqlValue::Text(ips),
-            ],
+            g,
         ))??;
     }
     Ok(())
@@ -506,15 +610,14 @@ fn subject<S: Sql>(sql: &S, id: &str) -> Result<Option<Subject>> {
     }))
 }
 
-/// A subject's grants that the catalogue can state, per bucket, with the
-/// widest access among them.
-fn whole_grants<S: Sql>(sql: &S, id: &str) -> Result<Vec<(String, Access)>> {
+/// A subject's grants as the unit holds them, in record order.
+pub(crate) fn grants_of<S: Sql>(sql: &S, id: &str) -> Result<Vec<KeyGrant>> {
     let rows = poll_once(sql.query(
         "SELECT bucket_id, access, expires_at, prefix, ip_list FROM unit_key_grants \
           WHERE subject_id = ?1 ORDER BY idx",
         &[SqlValue::Text(id.to_string())],
     ))??;
-    let mut out: Vec<(String, Access)> = Vec::new();
+    let mut out = Vec::with_capacity(rows.len());
     for r in rows {
         let (SqlValue::Text(bucket), SqlValue::Text(access), SqlValue::Text(ips)) =
             (&r[0], &r[1], &r[4])
@@ -536,6 +639,16 @@ fn whole_grants<S: Sql>(sql: &S, id: &str) -> Result<Vec<(String, Access)>> {
             },
             ip_list: serde_json::from_str(ips).map_err(|_| decode("unit_key_grants ip_list"))?,
         };
+        out.push(g);
+    }
+    Ok(out)
+}
+
+/// A subject's grants that the catalogue can state, per bucket, with the
+/// widest access among them.
+fn whole_grants<S: Sql>(sql: &S, id: &str) -> Result<Vec<(String, Access)>> {
+    let mut out: Vec<(String, Access)> = Vec::new();
+    for g in grants_of(sql, id)? {
         if !g.whole() {
             continue;
         }
@@ -545,6 +658,46 @@ fn whole_grants<S: Sql>(sql: &S, id: &str) -> Result<Vec<(String, Access)>> {
         }
     }
     Ok(out)
+}
+
+/// The effective grant of the principal `id` (ADR §6.2), per bucket:
+/// its unlimited grants, each lowered to what every principal up its
+/// `made_by` chain holds. `None` when it, or one up its chain, is not an
+/// open principal (or the chain is too deep or circular): it holds
+/// nothing then.
+pub(crate) fn principal_effective<S: Sql>(
+    sql: &S,
+    id: &str,
+) -> Result<Option<Vec<(String, Access)>>> {
+    let mut grants: Option<Vec<(String, Access)>> = None;
+    let mut up = Some(id.to_string());
+    let mut seen = BTreeSet::new();
+    while let Some(p) = up {
+        if seen.len() >= MAX_DEPTH || !seen.insert(p.clone()) {
+            return Ok(None);
+        }
+        let Some(ps) = subject(sql, &p)? else {
+            return Ok(None);
+        };
+        if ps.kind != KeyKind::Principal || !ps.open {
+            return Ok(None);
+        }
+        let theirs = whole_grants(sql, &p)?;
+        grants = Some(match grants {
+            None => theirs,
+            Some(mine) => mine
+                .into_iter()
+                .filter_map(|(b, a)| {
+                    theirs
+                        .iter()
+                        .find(|(pb, _)| *pb == b)
+                        .map(|(_, pa)| (b, a.min(*pa)))
+                })
+                .collect(),
+        });
+        up = ps.made_by;
+    }
+    Ok(grants)
 }
 
 /// Rebuilds the effective rows of every subject with a grant on one of
