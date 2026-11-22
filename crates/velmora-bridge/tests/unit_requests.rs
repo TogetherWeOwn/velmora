@@ -436,6 +436,7 @@ fn born_with(limits: SizeLimits) -> Unit<RusqliteSql> {
     );
     assert!(matches!(a, UnitAnswer::Ok { .. }), "{a:?}");
     sync(&u, s(3, 0), TenantState::Active, None);
+    renew(&u);
     u.sql()
         .apply(&format!(
             "INSERT INTO buckets(id, name, owner, bdk_wrapped, kek_version, created_at) \
@@ -443,6 +444,27 @@ fn born_with(limits: SizeLimits) -> Unit<RusqliteSql> {
         ))
         .unwrap();
     u
+}
+
+/// The Worker's renewal at `NOW` (rule 12, `unit_lease_wiring.rs`): on
+/// this line a born unit has a lease table, so a request call needs a
+/// fresh lease. It holds for T from `NOW`, which every call here uses.
+fn renew(u: &Unit<RusqliteSql>) {
+    let seqs = u.head().unwrap().seqs;
+    let a = worker(
+        u,
+        UnitOp::Renew {
+            proof_start: NOW,
+            proven: velmora_bridge::unit_lease::lease::Proven {
+                state_seq: seqs.state_seq,
+                keys_seq: seqs.keys_seq,
+                stamp_counter: None,
+                revoked: 0,
+            },
+            revocations: Vec::new(),
+        },
+    );
+    assert!(matches!(a, UnitAnswer::Ok { .. }), "renew: {a:?}");
 }
 
 fn born() -> Unit<RusqliteSql> {

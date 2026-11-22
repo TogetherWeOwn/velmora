@@ -249,6 +249,19 @@ impl TestCatalog {
             },
         });
         assert!(matches!(synced, UnitAnswer::Ok { .. }), "{synced:?}");
+        // On this line a born unit has a lease table: the Worker's
+        // renewal (rule 12) at the rig's time, which every call uses.
+        let renewed = worker(UnitOp::Renew {
+            proof_start: T0,
+            proven: velmora_bridge::unit_lease::lease::Proven {
+                state_seq: UNIT_SEQS.state_seq,
+                keys_seq: UNIT_SEQS.keys_seq,
+                stamp_counter: None,
+                revoked: 0,
+            },
+            revocations: Vec::new(),
+        });
+        assert!(matches!(renewed, UnitAnswer::Ok { .. }), "{renewed:?}");
         let client = RequestClient::new(
             LocalUnit {
                 unit: Rc::clone(&unit),
@@ -1876,7 +1889,10 @@ impl<N: NntpConnector + 'static> Rig<N> {
     }
 
     pub async fn send(&self, req: Req) -> Resp {
-        let resp = Rc::clone(&self.bridge).handle(req.into_request()).await;
+        // On the heap: the handler's future is larger than a test
+        // thread's stack once the catalogue is the unit's (a Worker runs
+        // it boxed, under `waitUntil`).
+        let resp = Box::pin(Rc::clone(&self.bridge).handle(req.into_request())).await;
         Resp::collect(resp).await
     }
 
@@ -1927,7 +1943,7 @@ impl<N: NntpConnector + 'static> Rig<N> {
                 .boxed_local(),
             },
         };
-        let resp = Rc::clone(&self.bridge).handle(request).await;
+        let resp = Box::pin(Rc::clone(&self.bridge).handle(request)).await;
         (Resp::collect(resp).await, polled.get())
     }
 
