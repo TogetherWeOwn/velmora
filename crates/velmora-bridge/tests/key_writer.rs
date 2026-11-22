@@ -12,7 +12,7 @@
 //! - an opening change with no reservation writes nothing.
 
 use std::cell::{Cell, RefCell};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use sha2::{Digest, Sha256};
 use velmora::rng::FillRandom;
@@ -7000,7 +7000,7 @@ async fn entries_for_holds_what_the_directory_lacks_with_its_owner() {
     let feed = Feed::new(&w.store, &w.kek, &w.ring, &table, &none);
     // The directory acknowledged seq 1 only.
     let items = feed
-        .entries_for(0, 100, Mode::Closing { acked: 1 })
+        .entries_for(0, 100, Mode::Closing { acked: 1 }, &none)
         .await
         .unwrap();
     assert_eq!(items.len(), 3);
@@ -7025,27 +7025,28 @@ async fn entries_for_holds_what_the_directory_lacks_with_its_owner() {
     assert!(!shown.contains("member-of"), "{shown}");
     // A page after the store's seq: the same hold, the same items.
     let from_one = feed
-        .entries_for(1, 100, Mode::Closing { acked: 1 })
+        .entries_for(1, 100, Mode::Closing { acked: 1 }, &none)
         .await
         .unwrap();
     assert_eq!(from_one, items[1..].to_vec());
     // Full mode holds nothing.
-    let full = feed.entries_for(0, 100, Mode::Full).await.unwrap();
+    let full = feed.entries_for(0, 100, Mode::Full, &none).await.unwrap();
     assert_eq!(full, feed.entries(0, 100).await.unwrap());
     assert!(full.iter().all(|e| !e.held()));
 }
 
-/// Confirmation r1 of the held owner_ref (MEDIUM): `after` is a page
-/// cursor, not what the store holds open. A subject opened at 1 (not
-/// acknowledged) with a later record at 2 is held on every page that
-/// carries it, whatever the cursor: read from 1, or page by page.
+/// Confirmations 1 and 2 of the held owner_ref: `after` is a page cursor
+/// and `closed` is read once per sync. A subject opened at 1 while the
+/// directory lacks it is held on every page that carries it; one the
+/// store holds open (its opening at or below the store's seq, not closed)
+/// stays open even when `acked` is 0 (a failed directory read).
 #[tokio::test(flavor = "current_thread")]
-async fn entries_for_holds_by_the_directory_alone_whatever_the_cursor() {
+async fn entries_for_holds_across_pages_and_never_closes_what_the_store_serves() {
     let w = World::new();
     let x = principal("PA0001", &[grant("b_01", RO, None)]);
     plant(&w, 1, KeyOp::Create, &x, None);
-    // A narrowing at 2 (a closing record): it opens nothing, so the
-    // newest opening stays 1.
+    // A narrowing at 2 and a disable at 3 (closing records): they open
+    // nothing, so the newest opening stays 1.
     let narrowed = principal("PA0001", &[]);
     let bytes = seal_key_record(
         &w.kek,
@@ -7062,20 +7063,41 @@ async fn entries_for_holds_by_the_directory_alone_whatever_the_cursor() {
     )
     .unwrap();
     w.store.plant(&key_chain(&w.t).name(2), bytes);
+    let mut off = narrowed.clone();
+    off.door.status = SubjectStatus::Disabled;
+    plant(&w, 3, KeyOp::Status, &off, None);
     let table = head_table(&w).await;
     assert_eq!(table.get("PA0001").unwrap().opened_seq, 1);
-    let none = Default::default();
-    let feed = Feed::new(&w.store, &w.kek, &w.ring, &table, &none);
+    let none: BTreeSet<String> = Default::default();
     let closing = Mode::Closing { acked: 0 };
-    let from_one = feed.entries_for(1, 1, closing).await.unwrap();
-    assert!(matches!(from_one[..], [ApplyEntry::Held { .. }]));
-    let first = feed.entries_for(0, 1, closing).await.unwrap();
-    let second = feed.entries_for(1, 1, closing).await.unwrap();
-    assert!(first.iter().chain(&second).all(ApplyEntry::held));
-    // Acknowledged at 2: open on every page.
-    let acked = Mode::Closing { acked: 2 };
+
+    // A store from 0, page by page, one record each, `closed` read once
+    // (empty): seq 1 is held, and so are 2 and 3 on the later pages.
+    let feed = Feed::new(&w.store, &w.kek, &w.ring, &table, &none);
+    let mut after = 0;
+    while after < 3 {
+        let page = feed.entries_for(after, 1, closing, &none).await.unwrap();
+        assert!(page.iter().all(ApplyEntry::held), "seq {}", after + 1);
+        after += 1;
+    }
+    // A new feed for a store at 1 that holds PA0001 closed: held.
+    let mut closed = BTreeSet::new();
+    closed.insert("PA0001".to_owned());
+    let feed = Feed::new(&w.store, &w.kek, &w.ring, &table, &none);
+    let page = feed.entries_for(1, 100, closing, &closed).await.unwrap();
+    assert!(page.iter().all(ApplyEntry::held));
+
+    // A store at 1 that serves PA0001 open (acknowledged before), with a
+    // failed directory read (`acked` 0): the narrowings go open, and the
+    // store keeps serving it.
+    let feed = Feed::new(&w.store, &w.kek, &w.ring, &table, &none);
+    let page = feed.entries_for(1, 100, closing, &none).await.unwrap();
+    assert_eq!(page.len(), 2);
+    assert!(page.iter().all(|e| !e.held()));
+    // Acknowledged: open on every page from 0.
+    let feed = Feed::new(&w.store, &w.kek, &w.ring, &table, &none);
     assert!(feed
-        .entries_for(0, 100, acked)
+        .entries_for(0, 100, Mode::Closing { acked: 1 }, &none)
         .await
         .unwrap()
         .iter()

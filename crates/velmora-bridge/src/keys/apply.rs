@@ -88,6 +88,9 @@ pub struct Feed<'a, S, K, T> {
     table: &'a KeyTable,
     revoked: &'a BTreeSet<String>,
     memo: RefCell<BTreeMap<u64, Slot>>,
+    /// The subjects [`Feed::entries_for`] sent held: a store that took one
+    /// holds it closed from then on, whatever its `closed` read said.
+    held_sent: RefCell<BTreeSet<String>>,
 }
 
 impl<'a, S: RecordStore, K: Kek, T: TkRing> Feed<'a, S, K, T> {
@@ -106,6 +109,7 @@ impl<'a, S: RecordStore, K: Kek, T: TkRing> Feed<'a, S, K, T> {
             table,
             revoked,
             memo: RefCell::new(BTreeMap::new()),
+            held_sent: RefCell::new(BTreeSet::new()),
         }
     }
 
@@ -320,27 +324,43 @@ impl<'a, S: RecordStore, K: Kek, T: TkRing> Feed<'a, S, K, T> {
         self.page(after, head.min(after.saturating_add(take))).await
     }
 
-    /// [`Feed::entries`] as a store takes them in `mode` (AM-71's
-    /// `KeyFeed`, serving a unit that asks for the records after its
-    /// `keys_seq`, page by page): in [`Mode::Closing`], every entry whose
-    /// newest opening is above `acked` (the directory's `keys_seq`) is
-    /// [`ApplyEntry::Held`] with its `owner_ref`. The hold is by the
-    /// directory's acknowledgement alone: `after` is a page cursor, not
-    /// what the store holds open, so nothing the directory may lack is sent
-    /// open (a store that already held it open gets it closed, which fails
-    /// safe; the full step opens it). [`Mode::Full`] holds nothing. The
-    /// `m/rk/` revocations below the store's seq and the second send are
-    /// the bring-up's ([`Feed::bring_up`]), not this read's.
+    /// [`Feed::entries`] as a store at `keys_seq = after` takes them in
+    /// `mode` (AM-71's `KeyFeed`: a unit asking for the records after its
+    /// `keys_seq`, page by page). [`Mode::Full`] holds nothing. In
+    /// [`Mode::Closing`] the closing step's rule (as [`Feed::bring_up`]):
+    /// an entry is [`ApplyEntry::Held`], with its `owner_ref`, unless its
+    /// newest opening is at or below `acked` (the directory's `keys_seq`),
+    /// or at or below `after` while the store holds the subject open.
+    ///
+    /// - `closed` is the store's closed subjects ([`KeyTarget::closed`]) as
+    ///   of `after`. Every record at or below `after` is the store's (the
+    ///   apply has no gap), so a subject whose opening is there and that
+    ///   the store does not hold closed is held open by the store already:
+    ///   sending it open opens nothing new. So a stale or failed `acked`
+    ///   (0) never closes what the store serves open.
+    /// - Across the pages of one sync, `after` moves on while `closed` was
+    ///   read once: every subject this feed sent held counts as closed on
+    ///   the later pages (the store took it closed). Use one `Feed` for the
+    ///   pages of one sync; a new `Feed` needs a `closed` read after the
+    ///   last page applied.
+    ///
+    /// The `m/rk/` revocations below `after` and the second send are the
+    /// bring-up's ([`Feed::bring_up`]), not this read's.
     pub async fn entries_for(
         &self,
         after: u64,
         limit: usize,
         mode: Mode,
+        closed: &BTreeSet<String>,
     ) -> Result<Vec<ApplyEntry>> {
         let mut out = self.entries(after, limit).await?;
-        let none = BTreeSet::new();
+        let mut held_sent = self.held_sent.borrow_mut();
+        let closed: BTreeSet<String> = closed.union(&held_sent).cloned().collect();
         for e in &mut out {
-            Self::hold(mode, 0, &none, e);
+            Self::hold(mode, after, &closed, e);
+            if let ApplyEntry::Held { entry, .. } = e {
+                held_sent.insert(entry.door.id.clone());
+            }
         }
         Ok(out)
     }
