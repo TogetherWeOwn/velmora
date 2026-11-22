@@ -51,7 +51,7 @@ pub async fn answer(env: &Env, bridge: &WorkerBridge, method: &str, req: S3Reque
     velmora_bridge::trace::log_alerts(|line| console_error!("alert: {line}"));
     let disabled = DISABLED.with(Rc::clone);
     let now = velmora_bridge::ports::Clock::now(&bridge.clock);
-    let ports = match crate::root::WorkerPorts::from_env(env, &bridge.kek) {
+    let ports = match crate::root::WorkerPorts::from_env(env, bridge) {
         Ok(ports) => ports,
         Err(reason) => {
             // Only SAFETY is required, and the reason names the binding.

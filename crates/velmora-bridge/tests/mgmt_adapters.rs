@@ -909,13 +909,21 @@ async fn the_root_units_key_target_reads_and_applies_through_the_router() {
         keys.apply(4, &[next]).await.unwrap(),
         Applied::Behind { keys_seq: 1 }
     );
-    // A marker has no wire form yet: nothing is sent.
+    // A marker goes as a marker item (AM-62): it holds its seq's place.
     let calls = s.log.borrow().len();
-    assert!(keys
-        .apply(1, &[ApplyEntry::Marker { seq: 2 }])
+    assert_eq!(
+        keys.apply(
+            1,
+            &[ApplyEntry::Marker {
+                seq: 2,
+                marker: velmora_bridge::keys::record::Marker::KeysFrozen,
+            }],
+        )
         .await
-        .is_err());
-    assert_eq!(s.log.borrow().len(), calls);
+        .unwrap(),
+        Applied::Done { keys_seq: 2 }
+    );
+    assert_eq!(s.log.borrow().len(), calls + 1);
 }
 
 fn private() -> SubjectPrivate {
@@ -956,12 +964,19 @@ fn entry(id: &str, seq: u64, private: Option<SubjectPrivate>) -> Entry {
     }
 }
 
+fn wire(item: &ApplyEntry) -> velmora_bridge::unit::keys::KeyEntry {
+    match unit_entry(item).unwrap() {
+        velmora_bridge::unit::keys::ApplyEntry::Key(k) => k,
+        other => panic!("not a key item: {other:?}"),
+    }
+}
+
 #[test]
 fn a_held_entry_is_sent_without_its_private_part() {
     let mut e = entry("k_held", 3, None);
     e.door.kind = SubjectKind::S3;
     e.door.secret_kek_version = Some(1);
-    let w = unit_entry(&ApplyEntry::Subject(e.clone())).unwrap();
+    let w = wire(&ApplyEntry::Subject(e.clone()));
     assert!(w.held);
     assert_eq!(w.secret_wrapped, None);
     assert_eq!(w.secret_kek_version, None);
@@ -973,12 +988,37 @@ fn a_held_entry_is_sent_without_its_private_part() {
     p.grants[0].prefix = Some("docs/".into());
     p.secret_wrapped = Some(vec![9; 4]);
     e.private = Some(p);
-    let w = unit_entry(&ApplyEntry::Subject(e.clone())).unwrap();
+    let w = wire(&ApplyEntry::Subject(e.clone()));
     assert!(!w.held);
     assert_eq!(w.secret_kek_version, Some(1));
     assert_eq!(w.secret_wrapped, Some(vec![9; 4]));
     assert_eq!(w.owner_ref.as_deref(), Some("member-9"));
     assert_eq!(w.grants[0].prefix.as_deref(), Some("docs/"));
+    // The closing step's hold (AM-72): held, nothing of the private part,
+    // but the principal keeps its `owner_ref`, so the unit still finds it
+    // by its member.
+    let mut held = e.clone();
+    held.door.kind = SubjectKind::Principal;
+    held.private = None;
+    let w = wire(&ApplyEntry::Held {
+        entry: held.clone(),
+        owner_ref: Some("member-9".into()),
+    });
+    assert!(w.held);
+    assert_eq!(w.secret_wrapped, None);
+    assert_eq!(w.secret_kek_version, None);
+    assert_eq!(w.owner_ref.as_deref(), Some("member-9"));
+    assert_eq!(w.grants[0].prefix, None);
+    // A held form that still carried a private part sends none of it.
+    held.private = e.private.clone();
+    let w = wire(&ApplyEntry::Held {
+        entry: held,
+        owner_ref: Some("member-9".into()),
+    });
+    assert!(w.held);
+    assert_eq!(w.secret_wrapped, None);
+    assert_eq!(w.secret_kek_version, None);
+    assert_eq!(w.grants[0].prefix, None);
     // A private part naming other buckets than the door is damage.
     let mut bad = e;
     bad.private.as_mut().unwrap().grants[0].bucket_id = B2.into();

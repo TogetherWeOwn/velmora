@@ -160,6 +160,7 @@ fn restore_op(kind: BirthKind, seq: u64, target: RestoreTarget, undo: &str) -> U
         token: token(kind, seq),
         target,
         expect_undo: Bookmark(undo.into()),
+        floor_ms: 0,
     }
 }
 

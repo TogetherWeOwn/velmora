@@ -194,6 +194,17 @@ fn ready() -> Unit<RusqliteSql> {
     u
 }
 
+/// A bucket row on the unit (the unit refuses a grant on an id it holds
+/// no row for, AM-61, before any reservation).
+fn add_bucket(u: &Unit<RusqliteSql>, id: &str, name: &str) {
+    u.sql()
+        .apply(&format!(
+            "INSERT INTO buckets(id, name, owner, bdk_wrapped, kek_version, created_at) \
+               VALUES ('{id}', '{name}', 'o', x'02', 1, 1);"
+        ))
+        .unwrap();
+}
+
 // ---------------------------------------------------------------------------
 // Fakes of the ports
 // ---------------------------------------------------------------------------
@@ -367,7 +378,7 @@ impl<'a> Chain<'a> {
     }
 
     fn apply(&self, from_seq: u64, held: bool, answers: &[KeptAnswer]) {
-        let entries: Vec<KeyEntry> = self
+        let entries: Vec<velmora_bridge::unit::keys::ApplyEntry> = self
             .records
             .borrow()
             .iter()
@@ -375,7 +386,7 @@ impl<'a> Chain<'a> {
             .map(|r| {
                 let mut e = entry(&r.principal, r.seq, r.rid, r.made_by.clone());
                 e.held = held;
-                e
+                velmora_bridge::unit::keys::ApplyEntry::Key(e)
             })
             .collect();
         if entries.is_empty() {
@@ -831,6 +842,7 @@ async fn a_member_creates_a_principal_within_its_own_grants() {
 #[tokio::test(flavor = "current_thread")]
 async fn grants_outside_the_acting_principals_are_refused_with_no_row() {
     let u = ready();
+    add_bucket(&u, B2, "beta");
     let w = World::new(&u);
     let body = with_grants(json!([{"bucket_id": B2, "access": "rw"}]));
     let a = w.send(CONFIRMED, Some(OWNER), Some(KEY), &body).await;
@@ -854,6 +866,9 @@ async fn an_unknown_acting_member_is_refused() {
 #[tokio::test(flavor = "current_thread")]
 async fn a_grant_on_a_bucket_that_is_not_placed_is_refused_with_no_row() {
     let u = ready();
+    // The unit holds a row, so its own check passes; the head does not
+    // place the id, so the handler's does not.
+    add_bucket(&u, B3, "gamma");
     let w = World::new(&u);
     w.chain.acting_holds_b3();
     let body = with_grants(json!([{"bucket_id": B3, "access": "ro"}]));
@@ -861,6 +876,22 @@ async fn a_grant_on_a_bucket_that_is_not_placed_is_refused_with_no_row() {
     expect_code(&a, 404, "bucket_not_found", None);
     assert_eq!(w.root.asks.borrow().len(), 1);
     assert_eq!(w.root.releases.get(), 1);
+    assert!(reservations(&u).is_empty());
+    assert_eq!(w.chain.count(NEW_OWNER), 0);
+}
+
+/// A grant on an id the unit holds no row for: the unit refuses it before
+/// any reservation (AM-61), so nothing is given back.
+#[tokio::test(flavor = "current_thread")]
+async fn a_grant_on_an_id_with_no_unit_row_is_refused_before_a_reservation() {
+    let u = ready();
+    let w = World::new(&u);
+    w.chain.acting_holds_b3();
+    let body = with_grants(json!([{"bucket_id": B3, "access": "ro"}]));
+    let a = w.send(CONFIRMED, Some(OWNER), Some(KEY), &body).await;
+    expect_code(&a, 404, "bucket_not_found", None);
+    assert_eq!(w.root.asks.borrow().len(), 1);
+    assert_eq!(w.root.releases.get(), 0);
     assert!(reservations(&u).is_empty());
     assert_eq!(w.chain.count(NEW_OWNER), 0);
 }
@@ -1374,6 +1405,7 @@ async fn only_the_call_that_made_a_reservation_gives_it_back() {
     assert_eq!(reservations(&u), vec![("reserved".into(), None)]);
 
     // A bucket that is not placed, on a first ask: given back.
+    add_bucket(&u, B3, "gamma");
     w.chain.acting_holds_b3();
     let body =
         json!({"owner_ref": "usr_2", "grants": [{"bucket_id": B3, "access": "ro"}]}).to_string();

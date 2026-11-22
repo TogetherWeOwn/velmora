@@ -28,12 +28,12 @@
 //! job (`renew`, `stamp_raise`) runs through the unit client
 //! (`deliver_unit_job`).
 //!
-//! **This build has no unit client** (lane L2, on the C(b) base):
-//! [`client`] fails every call, so a `renew_needed`, a `SyncNeeded` and
-//! every unit job are handed back until the dead-letter queue, which
-//! pages. The tenant heads (an `Unborn` is decided by the verified head)
-//! come from the composition root's door reader (`crate::root`). Never
-//! acknowledged on a read that was not made.
+//! The unit client is L2's `UnitClient`, built by the composition root
+//! (`Root::unit_client`, `listed = false` for job calls, AM-50) over the
+//! isolate's renewal state, with the root's key feed and finisher. The
+//! tenant heads (an `Unborn` is decided by the verified head) come from
+//! the root's door reader (`crate::root`). Never acknowledged on a read
+//! that was not made.
 
 use velmora::rng::SystemRng;
 use velmora_bridge::jobmsg::{JobTenant, Units};
@@ -43,9 +43,9 @@ use velmora_bridge::sql::SqlCatalog;
 use velmora_bridge::tenant_catalog::{LatestSeqs, TenantCatalog, UnitPort};
 use velmora_bridge::types::JobOutcome;
 use velmora_bridge::unit::{Seqs, TenantId, UnitAnswer, UnitCall, UnitName, UnitReply};
-use velmora_bridge::unit_consumer::{NoClient, Ran, UnitRun};
+use velmora_bridge::unit_consumer::{Ran, UnitRun};
 use velmora_bridge::unit_lease::client::UnitReplies;
-use velmora_bridge::unit_router::{KeyRoutes, NoClients, Router};
+use velmora_bridge::unit_router::KeyRoutes;
 use velmora_bridge::{Bridge, BridgeError, Result};
 use worker::wasm_bindgen::JsValue;
 use worker::{Env, Method, ObjectNamespace, Request, RequestInit, Stub};
@@ -87,7 +87,7 @@ pub struct UnitStub {
 impl UnitStub {
     /// The object named `<tenant>/<unit>` in `namespace`, the name a unit
     /// is made under (`UnitName::object_name`).
-    fn new(namespace: &ObjectNamespace, name: &UnitName) -> Result<UnitStub> {
+    pub(crate) fn new(namespace: &ObjectNamespace, name: &UnitName) -> Result<UnitStub> {
         let stub = namespace
             .id_from_name(&name.object_name())
             .and_then(|id| id.get_stub())
@@ -189,14 +189,6 @@ pub fn unit_bridge(
     })
 }
 
-/// The unit client of this build: none yet (see the [module](self)). L2's
-/// `UnitClient` implements the consumer's port
-/// (`velmora_bridge::unit_consumer::ConsumerClient`); it is wired here
-/// once its bodies are built.
-pub fn client() -> NoClient {
-    NoClient
-}
-
 /// One run of a job on its unit's bridge, in the isolate's job table as
 /// every job (`crate::jobs::run`).
 pub struct OnUnit<'a> {
@@ -267,10 +259,10 @@ impl UnitRun for OnUnit<'_> {
 /// `service::serve_unrouted`). `skip`: an admin route or a verified
 /// fan-out piece, which never take a key route.
 ///
-/// The key routes, the tenant heads and their cache come from the
-/// composition root (`velmora_bridge::root`, `crate::root`). This build
-/// has no unit client for requests (`NoClients`), so a routed request
-/// answers `503` from the router.
+/// The key routes, the tenant heads and their cache, and the unit clients
+/// come from the composition root (`velmora_bridge::root`, `crate::root`;
+/// AM-71: one renewal state per isolate, `UnitClient::call` the only
+/// retry layer).
 pub async fn route_request(
     env: &Env,
     base: &WorkerBridge,
@@ -287,7 +279,7 @@ pub async fn route_request(
         return None;
     }
     let akid = velmora_bridge::service::claimed_access_key(&base.cfg, req)?;
-    let ports = match WorkerPorts::from_env(env, &base.kek) {
+    let ports = match WorkerPorts::from_env(env, base) {
         Ok(ports) => ports,
         Err(class) => {
             // The bridge was built from the same `SAFETY`: not reached.
@@ -309,13 +301,8 @@ pub async fn route_request(
             }
         };
     let heads = root.heads();
-    let router = Router {
-        maintenance: base.cfg.maintenance,
-        clients: &NoClients,
-        heads: &heads,
-        cache: root.head_cache(),
-        clock: &base.clock,
-    };
+    let clients = root.clients();
+    let router = root.router(base.cfg.maintenance, &clients, &heads);
     let (resp, line) =
         velmora_bridge::service::serve_managed(&router, &base.cfg, &tenant, floor, req).await;
     log_request(line);

@@ -962,6 +962,7 @@ fn a_restore_born_unit_lifts_a_move_only_with_its_counters_on() {
                 },
                 target: RestoreTarget::Time { at_ms },
                 expect_undo: Bookmark("undo".into()),
+                floor_ms: 0,
             },
         );
         match u.pitr_step(&c, NOW) {
@@ -1020,6 +1021,7 @@ fn record(u: &Unit<RusqliteSql>) -> Value {
         "t0_seq": p["t0_seq"],
         "since_seq": p["since_seq"],
         "move_lifted": p["move_lifted"],
+        "lifted_at": p["lifted_at"],
     })
 }
 
@@ -1033,6 +1035,7 @@ fn import_progress_answers_the_moves_record() {
     assert_eq!(
         keys,
         [
+            "lifted_at",
             "move_lifted",
             "schema_tables",
             "sealed",
@@ -1044,7 +1047,7 @@ fn import_progress_answers_the_moves_record() {
     assert_eq!(p["tables"], json!([]));
     assert_eq!(
         record(&u),
-        json!({ "sealed": null, "t0_seq": null, "since_seq": null, "move_lifted": null })
+        json!({ "sealed": null, "t0_seq": null, "since_seq": null, "move_lifted": null, "lifted_at": null })
     );
     // The unit's tables, with SQLite's own left out.
     let tables: Vec<String> = serde_json::from_value(p["schema_tables"].clone()).unwrap();
@@ -1058,12 +1061,12 @@ fn import_progress_answers_the_moves_record() {
     fill(&u, &["a"]);
     assert_eq!(
         record(&u),
-        json!({ "sealed": null, "t0_seq": 10, "since_seq": S, "move_lifted": false })
+        json!({ "sealed": null, "t0_seq": 10, "since_seq": S, "move_lifted": false, "lifted_at": null })
     );
     ok(seal(&u, moving(10), counts(&u)));
     assert_eq!(
         record(&u),
-        json!({ "sealed": F + 1, "t0_seq": 10, "since_seq": S, "move_lifted": false })
+        json!({ "sealed": F + 1, "t0_seq": 10, "since_seq": S, "move_lifted": false, "lifted_at": null })
     );
     // The `move` report binds the newer head; the lift uses the seal up.
     let id = rid(S, 0, "m1");
@@ -1080,11 +1083,12 @@ fn import_progress_answers_the_moves_record() {
     ok(sync_to(&u, S + 1, None, Some(p)));
     assert_eq!(
         record(&u),
-        json!({ "sealed": F + 1, "t0_seq": 11, "since_seq": S, "move_lifted": true })
+        json!({ "sealed": F + 1, "t0_seq": 11, "since_seq": S, "move_lifted": true, "lifted_at": NOW.0 })
     );
     // The record stays after the move, under any later entry (AM-47).
     ok(sync_to(&u, S + 2, Some(S + 2), None));
     assert_eq!(progress(&u)["move_lifted"], json!(true));
+    assert_eq!(progress(&u)["lifted_at"], json!(NOW.0));
     assert_eq!(progress(&u)["tables"].as_array().unwrap().len(), 3);
 }
 
@@ -1126,6 +1130,15 @@ fn prepare(u: &Unit<RusqliteSql>, since: u64) -> Option<(Refused, bool)> {
 }
 
 fn restore_at(u: &Unit<RusqliteSql>, since: u64, at_ms: i64) -> Option<(Refused, bool)> {
+    restore_floor(u, since, at_ms, 0)
+}
+
+fn restore_floor(
+    u: &Unit<RusqliteSql>,
+    since: u64,
+    at_ms: i64,
+    floor_ms: u64,
+) -> Option<(Refused, bool)> {
     let c = call_on(
         &own(),
         CallKind::Worker,
@@ -1141,12 +1154,63 @@ fn restore_at(u: &Unit<RusqliteSql>, since: u64, at_ms: i64) -> Option<(Refused,
             },
             target: RestoreTarget::Time { at_ms },
             expect_undo: Bookmark("undo".into()),
+            floor_ms,
         },
     );
     match u.pitr_step(&c, NOW) {
         PitrStep::Answer(a) => refusal(&a),
         other => panic!("armed: {other:?}"),
     }
+}
+
+/// AM-67: the move floor the tenant chain keeps (`move_floors`), named
+/// by every `restore` call. It holds when the unit's own record is gone
+/// (a first restore took `unit_import_move` away): a time target before
+/// the later of the two floors + 60 s is refused with `before_move_lift`.
+#[test]
+fn a_time_restore_before_the_chains_move_floor_is_refused() {
+    let before_lift = Some((Refused::Restore(RestoreRefusal::BeforeMoveLift), false));
+    // Past the floors the restore checks go on to the lease checks: the
+    // unit has its lease table (u0002) and closed just now, so too soon.
+    let too_soon = Some((Refused::Restore(RestoreRefusal::TooSoon), false));
+    // No move record in the unit (as after a restore to a bookmark taken
+    // before the move's first batch): only the named floor holds.
+    let u = closed_for_the_move();
+    let floor = NOW.0 + 3_600_000;
+    for at_ms in [NOW.0 + LIFT_SLACK_MS, floor, floor + LIFT_SLACK_MS - 1] {
+        assert_eq!(
+            restore_floor(&u, S, at_ms, floor as u64),
+            before_lift,
+            "{at_ms}"
+        );
+    }
+    assert_eq!(
+        restore_floor(&u, S, floor + LIFT_SLACK_MS, floor as u64),
+        too_soon
+    );
+    // No floor named (0) and no record: the birth floor only.
+    assert_eq!(restore_floor(&u, S, NOW.0 + LIFT_SLACK_MS, 0), too_soon);
+    // A floor that is no time: malformed, before anything else.
+    assert_eq!(
+        restore_floor(&u, S, NOW.0 + LIFT_SLACK_MS, u64::MAX),
+        Some((Refused::Restore(RestoreRefusal::Malformed), false))
+    );
+    // With the unit's own lift, the later of the two holds: a named floor
+    // below the lift does not lower it.
+    let u = closed_for_the_move();
+    fill(&u, &["a"]);
+    lift_the_move(&u);
+    let s2 = S + 2;
+    ok(sync_to(&u, s2, Some(s2), None));
+    assert_eq!(
+        restore_floor(&u, s2, NOW.0 + LIFT_SLACK_MS - 1, 1),
+        before_lift
+    );
+    assert_eq!(restore_floor(&u, s2, NOW.0 + LIFT_SLACK_MS, 1), too_soon);
+    assert_eq!(
+        restore_floor(&u, s2, NOW.0 + LIFT_SLACK_MS, floor as u64),
+        before_lift
+    );
 }
 
 #[test]
@@ -1199,8 +1263,9 @@ fn a_restore_to_a_time_before_the_units_birth_is_refused() {
 fn the_first_batch_closes_the_undo_bookmark_and_the_span_before_it_is_open() {
     // The move's step 2 re-creates an unborn owner unit with a `restore`
     // token under its entry (AM-53). Before the first batch there is no
-    // move record: the restore checks go on (an open design question,
-    // 4c review). From the first batch on, no undo bookmark (AM-46).
+    // move record: the restore checks go on (the chain's move floor,
+    // AM-67, covers a later time restore). From the first batch on, no
+    // undo bookmark (AM-46).
     let u = Unit::new(RusqliteSql::open_in_memory().unwrap(), own(), "");
     let token = BirthToken {
         name: own(),
@@ -1641,7 +1706,7 @@ fn the_key_tables_are_hashed_only_and_equal_the_chains_projection() {
         &u,
         UnitOp::ApplyKeys {
             from_seq: 0,
-            entries: entries.clone(),
+            entries: entries.iter().cloned().map(Into::into).collect(),
             answers: vec![],
         },
     );

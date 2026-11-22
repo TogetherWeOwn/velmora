@@ -22,7 +22,10 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use futures_util::future::{join_all, select, Either};
-use velmora_bridge::jobmsg::{JobFormat, JobMessage, JobTenant};
+use velmora_bridge::jobmsg::{
+    ControlIntent, JobFormat, JobMessage, JobTenant, APPLY_CONTROL_DELAY_SECS,
+};
+use velmora_bridge::root::ControlSend;
 use velmora_bridge::tenant_catalog::LatestSeqs;
 use velmora_bridge::{
     Backlog, BridgeError, Job, JobSink, Oldest, OutboxStage, Result, UnixMs, MAX_QUEUE_DELAY_SECS,
@@ -483,6 +486,20 @@ impl JobSink for QueueSink {
             sends.push(self.queue(target).send_batch(batch).await);
         }
         first_error(sends)
+    }
+}
+
+/// A control intent (`apply_control`, ADR §2.5 step 1) with its delay,
+/// on the queue of the jobs that name no extent (the first verify queue
+/// when [`AUX_Q`] is not bound). Every queue's consumer reads it.
+impl ControlSend for QueueSink {
+    async fn send_control(&self, intent: &ControlIntent) -> Result<()> {
+        check_delay(APPLY_CONTROL_DELAY_SECS)?;
+        let msg = MessageBuilder::new(intent.message())
+            .content_type(QueueContentType::Json)
+            .delay_seconds(APPLY_CONTROL_DELAY_SECS)
+            .build();
+        self.queue(Lane::Aux).send(msg).await.map_err(send_err)
     }
 }
 

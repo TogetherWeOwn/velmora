@@ -316,12 +316,10 @@ fn a_blob_is_named_without_a_scope_only_at_the_listed_places() {
             // The delete list the catalogue makes for garbage
             // collection: rows carry no tenant yet.
             ("bridge/sql/gc.rs", 2),
-            // KNOWN, for L4: the owner move's own names of a managed
-            // tenant's blobs (`tenant_safety_key`, `tenant_cache_key`:
-            // two definitions and one call). L4's line has no
-            // `TenantScope`; the two lines met first in the management
-            // line's merge. They must become scope calls when L4's line
-            // takes `tenant.rs`; listed here so the count cannot grow.
+            // The move of tenant 0's data names the managed tenant's
+            // copies by its id, never by the flat layout
+            // (`tenant_safety_key`, `tenant_cache_key`): two definitions
+            // and one call.
             ("bridge/keys/moving.rs", 3),
         ],
     );
@@ -399,19 +397,10 @@ fn a_blob_is_named_without_a_scope_only_at_the_listed_places() {
             assert!(!all[job_path].contains(named), "{job_path}: {named}");
         }
     }
-    // And no name of the two families is written out by hand, but for
-    // the one KNOWN place above (L4's owner move, once each).
+    // And no name of the two families is written out by hand.
     for family in ["\"x/", "\"c/"] {
         let found = uses(&all, family);
-        assert_eq!(
-            found.get("bridge/keys/moving.rs").copied(),
-            Some(1),
-            "{family}"
-        );
-        let files: Vec<&String> = found
-            .keys()
-            .filter(|f| *f != "bridge/keys/moving.rs")
-            .collect();
+        let files: Vec<&String> = found.keys().collect();
         assert_eq!(files, ["bridge/tenant.rs", "bridge/types.rs"], "{family}");
     }
 }

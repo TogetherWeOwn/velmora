@@ -64,7 +64,7 @@ use crate::types::{BridgeError, Result, UnixMs};
 use crate::unit::call::HoldMode;
 use crate::unit::identity::Refusal;
 use crate::unit::jobcall::JobCall;
-use crate::unit::keys::{KeptAnswer, KeyEntry, MAX_ENTRIES};
+use crate::unit::keys::{ApplyEntry, KeptAnswer, MAX_ENTRIES};
 use crate::unit::{
     CallKind, Refused, Seqs, SyncHead, TenantId, TenantState, UnitAnswer, UnitCall, UnitName,
     UnitOp, UnitReply,
@@ -122,8 +122,9 @@ pub trait KeyFeed {
 pub struct KeyBatch {
     /// The chain's head seq (`after` when nothing follows it).
     pub head: u64,
-    /// The entries after `after`, up to `head`.
-    pub entries: Vec<KeyEntry>,
+    /// The items after `after`, up to `head`: a subject's entry, or a
+    /// marker for a record that changes no subject (AM-62).
+    pub entries: Vec<ApplyEntry>,
     /// The answers kept for the reservations whose records these are
     /// (AM-38), if the feed has them.
     pub answers: Vec<KeptAnswer>,
@@ -532,10 +533,10 @@ where
             // unit's own `keys_seq`; every page must move it on.
             let mut behind = false;
             while unit.keys_seq < batch.head {
-                let page: Vec<KeyEntry> = batch
+                let page: Vec<ApplyEntry> = batch
                     .entries
                     .iter()
-                    .filter(|e| e.last_seq > unit.keys_seq)
+                    .filter(|e| e.seq() > unit.keys_seq)
                     .take(MAX_ENTRIES)
                     .cloned()
                     .collect();
@@ -545,7 +546,11 @@ where
                 let answers: Vec<KeptAnswer> = batch
                     .answers
                     .iter()
-                    .filter(|a| page.iter().any(|e| e.rid.as_ref() == Some(&a.rid)))
+                    .filter(|a| {
+                        page.iter()
+                            .filter_map(ApplyEntry::key)
+                            .any(|e| e.rid.as_ref() == Some(&a.rid))
+                    })
                     .cloned()
                     .collect();
                 let op = UnitOp::ApplyKeys {
