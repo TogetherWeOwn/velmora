@@ -103,6 +103,7 @@ struct Move {
     unit: FakeUnit,
     routes: FakeRoutes,
     since: u64,
+    zero_seq: u64,
 }
 
 impl Move {
@@ -137,6 +138,7 @@ impl Move {
         let k = keys();
         let window = Window {
             owner: &owner(),
+            zero_seq: self.zero_seq,
             since: self.since,
             keys: &k,
         };
@@ -157,6 +159,7 @@ impl Move {
         let k = keys();
         let window = Window {
             owner: &owner(),
+            zero_seq: self.zero_seq,
             since: self.since,
             keys: &k,
         };
@@ -228,6 +231,7 @@ async fn window() -> Move {
         unit: FakeUnit::default(),
         routes: FakeRoutes::default(),
         since: 0,
+        zero_seq: 0,
     };
     let zero = Tenant::zero();
     m.write(
@@ -269,15 +273,17 @@ async fn window() -> Move {
     ] {
         m.write(&o, change, actor).await;
     }
-    m.write(
-        &zero,
-        Change::StartMove {
-            to: o.clone(),
-            catalogue_id_frozen: "main".into(),
-        },
-        Actor::MoveTool,
-    )
-    .await;
+    m.zero_seq = m
+        .write(
+            &zero,
+            Change::StartMove {
+                to: o.clone(),
+                catalogue_id_frozen: "main".into(),
+            },
+            Actor::MoveTool,
+        )
+        .await
+        .seq;
     let closed = m
         .write(&o, Change::SetRestoring { unit: 0 }, Actor::Operator)
         .await;
@@ -435,11 +441,15 @@ fn the_move_is_given_up_before_its_routes() {
         for akid in KEYS {
             assert!(m.route_row(akid).await.is_zero());
         }
-        // Run again: nothing more.
+        // Run again: nothing more is written, and the answer is the same
+        // (a re-run after a lost answer still learns the level step).
         let n = m.records();
         assert_eq!(
             m.give_up().await.map_err(|e| format!("{e:?}")).unwrap(),
-            None
+            Some(GaveUp {
+                catalogue_id_frozen: "main".into(),
+                stamp_put: true
+            })
         );
         assert_eq!(m.records(), n);
         // And the flip no longer runs.
@@ -543,18 +553,125 @@ fn the_flip_needs_this_windows_marker_and_a_later_window_is_not_this_one() {
         assert!(m.flip().await.is_err());
         m.routes.fail_after.set(None);
         m.give_up().await.map_err(|e| format!("{e:?}")).unwrap();
-        m.write(
-            &Tenant::zero(),
-            Change::StartMove {
-                to: owner(),
-                catalogue_id_frozen: "main".into(),
-            },
-            Actor::MoveTool,
-        )
-        .await;
+        let w2 = m
+            .write(
+                &Tenant::zero(),
+                Change::StartMove {
+                    to: owner(),
+                    catalogue_id_frozen: "main".into(),
+                },
+                Actor::MoveTool,
+            )
+            .await;
         let o = m.head(&owner()).await;
         assert!(o.restoring_entry(0).is_some());
+        // A stale run of the first window: the flip does not act, and the
+        // give-up answers what the first window left, touching nothing.
+        let n = m.records();
+        let r = m.flip().await;
+        assert!(matches!(r, Err(FlipError::NotThisMove)), "{r:?}");
+        let g = m.give_up().await.map_err(|e| format!("{e:?}")).unwrap();
+        assert_eq!(g.map(|g| g.stamp_put), Some(true));
+        assert_eq!(m.records(), n);
+        assert_eq!(m.selector().await, Selector::Moving);
+        // The second window, named by its own record, is not the first's
+        // entry either: the owner's entry is the give-up's, set after the
+        // first window's lift.
+        let mut m2 = m;
+        m2.zero_seq = w2.seq;
+        let r = m2.flip().await;
+        assert!(matches!(r, Err(FlipError::OtherWindow { .. })), "{r:?}");
+        m2.since = o.restoring_entry(0).unwrap().since_seq;
+        let f = m2.flip().await.map_err(|e| format!("{e:?}")).unwrap();
+        assert!(f.wrote);
+    });
+}
+
+#[test]
+fn the_pre_pass_refuses_a_key_with_no_route_row_before_any_write() {
+    block_on(async {
+        let m = window().await;
+        m.db.apply(&format!(
+            "DELETE FROM key_routes WHERE akid = '{}';",
+            KEYS[1]
+        ))
+        .unwrap();
+        let n = m.records();
+        let r = m.flip().await;
+        assert!(
+            matches!(&r, Err(FlipError::RouteRow(k)) if k == KEYS[1]),
+            "{r:?}"
+        );
+        assert_eq!(m.records(), n);
+        assert!(!m.stamp_put().await);
+        assert!(m.routes.records.borrow().is_empty());
+    });
+}
+
+#[test]
+fn a_missing_entry_counts_as_lifted_only_if_this_window_set_it() {
+    block_on(async {
+        let mut m = window().await;
+        // Lifted by a run that stopped in (c).
+        m.routes.fail_after.set(Some(0));
+        assert!(m.flip().await.is_err());
+        m.routes.fail_after.set(None);
+        // A window that names another seq for its entry: the record there
+        // did not set one.
+        let real = m.since;
+        m.since = real - 1;
         let r = m.flip().await;
         assert!(matches!(r, Err(FlipError::OtherWindow { .. })), "{r:?}");
+        m.since = real;
+        m.flip().await.map_err(|e| format!("{e:?}")).unwrap();
+    });
+}
+
+#[test]
+fn a_give_up_landing_before_the_flip_record_stops_the_flip() {
+    use velmora_bridge::directory::chain::{record_key, ControlSeal};
+    use velmora_bridge::directory::record::TenantRecord;
+    use velmora_bridge::directory::transition::{next, Outcome};
+    block_on(async {
+        let m = window().await;
+        // A give-up of tenant 0, sealed as another writer would, put just
+        // before this run's flip record.
+        let head = m.chain().head(&Tenant::zero(), 0).await.unwrap().unwrap();
+        let record = TenantRecord {
+            door: head.door,
+            private: head.private.unwrap(),
+        };
+        let Ok(Outcome::Next(gave_up)) = next(
+            &Tenant::zero(),
+            Some(&record),
+            &Change::GiveUpMove,
+            Actor::MoveTool,
+            m.rig.now(),
+        ) else {
+            panic!("give-up record");
+        };
+        let name = record_key(&Tenant::zero(), gave_up.door.seq);
+        let sealed = m
+            .seal
+            .seal(
+                &name,
+                &Tenant::zero(),
+                gave_up.door.tk_version,
+                &serde_json::to_vec(&gave_up.door).unwrap(),
+                &serde_json::to_vec(&gave_up.private).unwrap(),
+            )
+            .unwrap();
+        let mut planted = Some((name, sealed));
+        let zero_prefix = "m/t/t_0000000000000000/".to_string();
+        m.store.before_put(move |key, objects| {
+            if key.starts_with(&zero_prefix) {
+                if let Some((name, sealed)) = planted.take() {
+                    objects.insert(name, sealed);
+                }
+            }
+        });
+        let r = m.flip().await;
+        assert!(r.is_err(), "{r:?}");
+        assert_eq!(m.selector().await, Selector::D1);
     });
 }

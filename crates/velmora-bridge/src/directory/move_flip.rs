@@ -106,6 +106,12 @@ pub trait RouteRecords {
 pub struct Window<'a> {
     /// The owner's tenant.
     pub owner: &'a Tenant,
+    /// The seq of a tenant-0 record of this window: `moving` into the
+    /// owner (the copy's [`super::move_copy::bound`] answers it as
+    /// `MoveHead.seq`). The window is the run of `moving` records from it;
+    /// a record that ends the run (`d1`, `moved`) ends the window, so a run
+    /// of an older window never acts on a later one.
+    pub zero_seq: u64,
     /// The `since_seq` of the owner's root-unit `restoring` entry that the
     /// window set (the copy's [`super::move_copy::bound`]).
     pub since: u64,
@@ -122,26 +128,70 @@ pub struct Flipped {
     pub wrote: bool,
 }
 
-/// The tenant-0 head, verified to be this move's: `moving` into the owner,
-/// or `moved` into it when `flipped` is allowed.
-async fn zero_head<S: RecordStore, C: ControlSeal>(
+/// The most tenant-0 records one window may hold: the walk of
+/// [`window_state`] reads each.
+pub const MAX_WINDOW_RECORDS: u64 = 256;
+
+/// Where this window stands, from tenant 0's chain.
+// Short-lived: made and matched in one call, never stored.
+#[allow(clippy::large_enum_variant)]
+enum WindowState {
+    /// Open: tenant 0's head, `moving` into the owner.
+    Open(TenantDoor),
+    /// Flipped, at this stamp.
+    Flipped(u64),
+    /// Given up; the catalogue the window froze.
+    GivenUp(String),
+}
+
+/// Walks tenant 0's records from `window.zero_seq` to the head: a run of
+/// `moving` records into the owner, then at most one record that ended it.
+async fn window_state<S: RecordStore, C: ControlSeal>(
     chain: &TenantChain<'_, S, C>,
-    owner: &Tenant,
-    flipped: bool,
-) -> Result<TenantDoor, FlipError> {
+    window: &Window<'_>,
+) -> Result<WindowState, FlipError> {
     let head = chain
         .head(&Tenant::Zero, 0)
         .await?
-        .ok_or(FlipError::NotThisMove)?;
-    let ours = head.door.tenant_zero.as_ref().is_some_and(|z| {
-        let to_owner = z.moved.as_ref().is_some_and(|m| m.to == *owner);
-        let state = z.selector == Selector::Moving || (flipped && z.selector == Selector::Moved);
-        to_owner && state
-    });
-    match ours {
-        true => Ok(head.door),
-        false => Err(FlipError::NotThisMove),
+        .ok_or(FlipError::NotThisMove)?
+        .door;
+    if head.seq < window.zero_seq || head.seq - window.zero_seq >= MAX_WINDOW_RECORDS {
+        return Err(FlipError::NotThisMove);
     }
+    let mut frozen: Option<String> = None;
+    for seq in window.zero_seq..=head.seq {
+        let door = match seq == head.seq {
+            true => head.clone(),
+            false => {
+                chain
+                    .read(&Tenant::Zero, seq)
+                    .await?
+                    .ok_or(FlipError::Chain(ChainError::Damaged(
+                        "window_record_missing",
+                    )))?
+                    .door
+            }
+        };
+        let z = door.tenant_zero.as_ref().ok_or(FlipError::NotThisMove)?;
+        let to_owner = z.moved.as_ref().filter(|m| m.to == *window.owner);
+        match (z.selector, to_owner, &frozen) {
+            (Selector::Moving, Some(m), _) => {
+                frozen = Some(m.catalogue_id_frozen.clone());
+                if seq == head.seq {
+                    return Ok(WindowState::Open(door));
+                }
+            }
+            (Selector::Moved, Some(m), Some(_)) => {
+                return m
+                    .stamp
+                    .map(WindowState::Flipped)
+                    .ok_or(FlipError::NotThisMove)
+            }
+            (Selector::D1, _, Some(f)) => return Ok(WindowState::GivenUp(f.clone())),
+            _ => return Err(FlipError::NotThisMove),
+        }
+    }
+    Err(FlipError::NotThisMove)
 }
 
 async fn owner_head<S: RecordStore, C: ControlSeal>(
@@ -182,17 +232,19 @@ where
     U: UnitSync,
     R: RouteRecords,
 {
-    let zero = zero_head(chain, window.owner, true).await?;
-    let z = zero.tenant_zero.as_ref().expect("checked by zero_head");
-    let m = z.moved.as_ref().expect("checked by zero_head");
-    if z.selector == Selector::Moved {
+    let zero = match window_state(chain, window).await? {
+        WindowState::Open(zero) => zero,
         // Flipped already: nothing to do, nothing to undo here.
-        let stamp = m.stamp.ok_or(FlipError::NotThisMove)?;
-        return Ok(Flipped {
-            stamp,
-            wrote: false,
-        });
-    }
+        WindowState::Flipped(stamp) => {
+            return Ok(Flipped {
+                stamp,
+                wrote: false,
+            })
+        }
+        WindowState::GivenUp(_) => return Err(FlipError::NotThisMove),
+    };
+    let z = zero.tenant_zero.as_ref().expect("checked by window_state");
+    let m = z.moved.as_ref().expect("checked by window_state");
     // The whole window is checked before the first write.
     let owner = owner_head(chain, window.owner).await?;
     let lifted = window_entry(chain, &owner, window).await?;
@@ -240,9 +292,9 @@ where
 
     // (d) Tenant 0: moved, at the stamp's counter, on the head this run
     // checked (a give-up and a new window in between stop it).
-    let now_zero = zero_head(chain, window.owner, false).await?;
-    if now_zero.seq != zero.seq {
-        return Err(FlipError::NotThisMove);
+    match window_state(chain, window).await? {
+        WindowState::Open(now_zero) if now_zero.seq == zero.seq => {}
+        _ => return Err(FlipError::NotThisMove),
     }
     let wrote = matches!(
         chain
@@ -353,18 +405,25 @@ where
     U: UnitSync,
     R: RouteRecords,
 {
-    let zero = match zero_head(chain, window.owner, false).await {
-        Ok(zero) => zero,
-        // Given up by an earlier run: tenant 0 is on its D1 with no move.
-        Err(FlipError::NotThisMove) if given_up(chain).await? => return Ok(None),
-        Err(e) => return Err(e),
+    let zero = match window_state(chain, window).await? {
+        WindowState::Open(zero) => zero,
+        // Given up by an earlier run: answer again what it left to do.
+        WindowState::GivenUp(frozen_id) => {
+            let stamp_put = stamp_put(frozen, safety, &frozen_id).await?;
+            return Ok(Some(GaveUp {
+                catalogue_id_frozen: frozen_id,
+                stamp_put,
+            }));
+        }
+        // The way back after the flip is the reverse move.
+        WindowState::Flipped(_) => return Err(FlipError::NotThisMove),
     };
     let frozen_id = zero
         .tenant_zero
         .as_ref()
         .and_then(|z| z.moved.as_ref())
         .map(|m| m.catalogue_id_frozen.clone())
-        .expect("checked by zero_head");
+        .expect("checked by window_state");
     let mut put = Vec::new();
     for akid in window.keys {
         if routes.get(akid).await?.as_deref() == Some(window.owner.as_str()) {
@@ -410,12 +469,7 @@ where
             }
         }
     }
-    // Whether (a) ran, read before tenant 0's record forgets the window.
-    let counter = stamp_row(frozen).await?.map(|(c, _)| c);
-    let stamp_put = safety
-        .head(&legacy_stamp_key(&frozen_id, counter))
-        .await?
-        .is_some();
+    let stamp_put = stamp_put(frozen, safety, &frozen_id).await?;
     chain
         .write(
             &zero_tenant,
@@ -431,16 +485,16 @@ where
     }))
 }
 
-/// Tenant 0 on its D1 with no move open.
-async fn given_up<S: RecordStore, C: ControlSeal>(
-    chain: &TenantChain<'_, S, C>,
+/// Whether (a) put the legacy stamp of the frozen catalogue `frozen_id`
+/// (the stamp one above the stamp row's counter).
+async fn stamp_put<F: Sql, B: BlobStore>(
+    frozen: &F,
+    safety: &B,
+    frozen_id: &str,
 ) -> Result<bool, FlipError> {
-    let Some(head) = chain.head(&Tenant::Zero, 0).await? else {
-        return Ok(false);
-    };
-    Ok(head
-        .door
-        .tenant_zero
-        .as_ref()
-        .is_some_and(|z| z.selector == Selector::D1 && (z.moved.is_none() || z.undone())))
+    let counter = stamp_row(frozen).await?.map(|(c, _)| c);
+    Ok(safety
+        .head(&legacy_stamp_key(frozen_id, counter))
+        .await?
+        .is_some())
 }
