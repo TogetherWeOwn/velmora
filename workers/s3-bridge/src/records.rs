@@ -34,10 +34,12 @@ use worker::wasm_bindgen_futures::JsFuture;
 use worker::worker_sys::R2Bucket as EdgeBucket;
 use worker::{Bucket, Headers};
 
-/// The largest record that is stored or read: 32 MiB, far above a key
-/// checkpoint of 10,000 subjects (about 5 MiB) and far below the memory
-/// of an isolate (128 MB).
-pub const MAX_RECORD_BYTES: u64 = 32 << 20;
+/// The largest record that is stored or read: 16 MiB, about 32,000
+/// subjects in a key checkpoint (about 0.5 KiB each). A read holds the
+/// record several times (the JS buffer, the bytes, the opened text, the
+/// parsed table), which stays inside the 128 MB of an isolate at this
+/// size.
+pub const MAX_RECORD_BYTES: u64 = 16 << 20;
 
 /// The most names R2 answers in one page (it refuses a larger limit).
 pub const R2_LIST_MAX: u32 = 1000;

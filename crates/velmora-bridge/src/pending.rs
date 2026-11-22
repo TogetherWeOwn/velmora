@@ -55,8 +55,9 @@ pub const SWEEP_AGE_MS: i64 = 2 * 60 * 1000;
 /// Chains one pass finishes at most.
 pub const SWEEP_CHAINS: u32 = 100;
 
-/// A chain of a tenant: the key the sweep goes in order of (the tenant,
-/// then its tenant chain before its key chain).
+/// A chain of a tenant: the key the sweep goes in order of: the tenant,
+/// then its key chain before its tenant chain, the order of the
+/// directory's `pending_ops` key (`tenant`, `chain` as `k` or `t`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ChainKey {
     pub tenant: TenantId,
@@ -66,8 +67,8 @@ pub struct ChainKey {
 impl ChainKey {
     fn order(&self) -> (&TenantId, u8) {
         let chain = match self.chain {
-            ControlChain::Tenant => 0,
-            ControlChain::Keys => 1,
+            ControlChain::Keys => 0,
+            ControlChain::Tenant => 1,
         };
         (&self.tenant, chain)
     }
@@ -89,7 +90,12 @@ impl PartialOrd for ChainKey {
 #[allow(async_fn_in_trait)]
 pub trait PendingRows {
     /// Up to `limit` distinct chains, in key order and after `after`,
-    /// that have at least one row noted at or before `cutoff`.
+    /// that have at least one row noted at or before `cutoff`. It reads
+    /// O(`limit`) index entries, not the rows of a chain: a chain can hold
+    /// many rows while a subject is closed or a store is down. In SQL: step
+    /// from chain to chain on the key `(tenant, chain, seq)`, one probe of
+    /// an index on `(tenant, chain, created_at)` per chain for a row at or
+    /// before `cutoff`.
     async fn chains_noted_by(
         &self,
         cutoff: UnixMs,
@@ -138,6 +144,18 @@ pub struct SweepReport {
     /// `None` when this pass reached the last chain (the next one starts
     /// from the first).
     pub next_after: Option<ChainKey>,
+}
+
+impl crate::keys::writer::FinishReport {
+    /// The head this run of the key-chain finisher read, as the sweep
+    /// takes it: complete only when the chain was read to its head and
+    /// every revocation of `m/rk/` has its chain record.
+    pub fn chain_head(&self) -> ChainHead {
+        ChainHead {
+            seq: self.head,
+            complete: self.append_failed.is_empty() && !self.failed.iter().any(|l| l == "chain"),
+        }
+    }
 }
 
 /// One pass of the sweep at `now`, after the chain `after` (the

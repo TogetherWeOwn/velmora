@@ -166,8 +166,9 @@ async fn rows_above_a_complete_head_are_dropped_and_the_others_left() {
     );
     assert_eq!(rows.seqs_of(&keys), [4, 5, 7]);
     assert_eq!(rows.seqs_of(&state), [2]);
-    // Each chain once, in key order (the tenant chain first).
-    assert_eq!(*f.calls.borrow(), [state, keys]);
+    // Each chain once, in key order (`k` before `t`, as the directory's
+    // key sorts them).
+    assert_eq!(*f.calls.borrow(), [keys, state]);
     assert_eq!(
         *rows.asked.borrow(),
         [(UnixMs(NOW.0 - SWEEP_AGE_MS), None, SWEEP_CHAINS)]
@@ -305,4 +306,48 @@ async fn a_row_noted_again_after_the_cutoff_stays() {
     let report = sweep(&rows, &f, NOW, None).await.unwrap();
     assert_eq!(report.dropped, 1);
     assert_eq!(rows.seqs_of(&key(4, ControlChain::Keys)), [6]);
+}
+
+#[test]
+fn a_finisher_run_is_complete_only_without_a_failed_append_or_chain_read() {
+    use velmora_bridge::keys::writer::FinishReport;
+    let clean = FinishReport {
+        head: 9,
+        failed: vec!["unit 2".into()],
+        closed: vec!["k1".into()],
+        ..FinishReport::default()
+    };
+    // A store that did not acknowledge, or a closed subject, leaves the
+    // head complete: the rows above it are still unrecorded changes.
+    assert_eq!(
+        clean.chain_head(),
+        ChainHead {
+            seq: 9,
+            complete: true
+        }
+    );
+    let append = FinishReport {
+        head: 9,
+        append_failed: vec!["AKID".into()],
+        ..FinishReport::default()
+    };
+    assert_eq!(
+        append.chain_head(),
+        ChainHead {
+            seq: 9,
+            complete: false
+        }
+    );
+    let unread = FinishReport {
+        head: 4,
+        failed: vec!["chain".into()],
+        ..FinishReport::default()
+    };
+    assert_eq!(
+        unread.chain_head(),
+        ChainHead {
+            seq: 4,
+            complete: false
+        }
+    );
 }
