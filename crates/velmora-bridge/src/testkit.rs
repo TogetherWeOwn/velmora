@@ -764,11 +764,23 @@ impl Kek for TestKek {
 
 /// Catalogue tests publish rows that no request recorded. These
 /// make the proof the catalogue asks for ([`Recorded::for_test`]) and
-/// answer as a guarded batch does.
+/// answer as a guarded batch does. No job is sent for what they publish:
+/// like a caller whose send failed, they take the marks of the new outbox
+/// rows back, so the next dispatcher run sends the jobs.
 #[allow(async_fn_in_trait)]
 pub trait PublishUnrecorded: Catalog {
     async fn publish(&self, c: &CommitGeneration) -> Result<Guard<()>> {
         self.publish_if(c, None).await
+    }
+
+    /// The publication alone, as a caller whose send succeeded leaves
+    /// it: the new outbox rows stay marked as sent.
+    async fn publish_sent(&self, c: &CommitGeneration) -> Result<Guard<()>> {
+        let record = Recorded::for_test(&c.generation.id);
+        Ok(match self.commit_generation(c, None, record).await? {
+            PublishOutcome::Applied => Guard::Applied(()),
+            PublishOutcome::Refused(_) | PublishOutcome::Fenced(_) => Guard::Lost,
+        })
     }
 
     /// [`Self::publish`] under the condition of a conditional write.
@@ -779,7 +791,12 @@ pub trait PublishUnrecorded: Catalog {
     ) -> Result<Guard<()>> {
         let record = Recorded::for_test(&c.generation.id);
         Ok(match self.commit_generation(c, condition, record).await? {
-            PublishOutcome::Applied => Guard::Applied(()),
+            PublishOutcome::Applied => {
+                let ids = c.extents.iter().map(|e| e.id.clone());
+                self.unmark_sent(&post_jobs(ids, &c.generation.id), c.now)
+                    .await?;
+                Guard::Applied(())
+            }
             PublishOutcome::Refused(_) | PublishOutcome::Fenced(_) => Guard::Lost,
         })
     }
@@ -824,7 +841,12 @@ pub trait PublishUnrecorded: Catalog {
                 .complete_upload(t, revision, digest, c, condition, record)
                 .await?
             {
-                PublishOutcome::Applied => Guard::Applied(()),
+                PublishOutcome::Applied => {
+                    let ids = c.placements.iter().map(|p| p.extent_id.clone());
+                    self.unmark_sent(&post_jobs(ids, &c.generation.id), c.now)
+                        .await?;
+                    Guard::Applied(())
+                }
                 PublishOutcome::Refused(_) | PublishOutcome::Fenced(_) => Guard::Lost,
             },
         )
@@ -844,3 +866,19 @@ pub trait PublishUnrecorded: Catalog {
 }
 
 impl<C: Catalog> PublishUnrecorded for C {}
+
+/// The post job of each of `extents` of `generation`.
+pub fn post_jobs(
+    extents: impl IntoIterator<Item = ExtentId>,
+    generation: &crate::types::GenerationId,
+) -> Vec<Job> {
+    extents
+        .into_iter()
+        .map(|extent| Job::Extent {
+            v: crate::types::JOB_VERSION,
+            extent,
+            generation: generation.clone(),
+            stage: crate::types::OutboxStage::Post,
+        })
+        .collect()
+}

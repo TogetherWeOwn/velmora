@@ -1104,7 +1104,14 @@ async fn dispatch_recovers_a_message_lost_between_stages() {
 
     // Too early: the verify row is not due, so the tick sends nothing.
     assert_eq!(fx.bridge.dispatch().await.unwrap().enqueued, 0);
-    fx.clock.advance_secs(300);
+    // Due, but marked as sent by the hand-over: the message may be
+    // waiting in its queue, so the row is left alone until the resend
+    // timeout, counted from the time the row was due.
+    let due = UnixMs(fx.outbox(&o, "next_at").await.parse().unwrap());
+    assert_eq!(fx.outbox(&o, "sent_at").await, due.0.to_string());
+    fx.clock.set(due.plus_secs(RESEND_SECS).plus_ms(-1));
+    assert_eq!(fx.bridge.dispatch().await.unwrap().enqueued, 0);
+    fx.clock.set(due.plus_secs(RESEND_SECS));
     assert_eq!(fx.bridge.dispatch().await.unwrap().enqueued, 1);
     assert_eq!(fx.bridge.jobs.sent()[0].job, o.job(OutboxStage::Verify));
     fx.pump().await;
@@ -2029,10 +2036,13 @@ async fn dispatch_sends_a_due_row_once() {
     fx.clock.set(at(300));
     assert_eq!(fx.tick().await.0, []);
 
-    // One is posted, and its hand-over to verify is lost.
-    fx.bridge.jobs.drop_next(1);
+    // One is posted, and the queue refuses its hand-over to verify: the
+    // row is left unmarked.
+    fx.bridge.jobs.fail_after(Some(0));
     assert_eq!(fx.bridge.run_job(&post(&moved)).await, JobOutcome::Ack);
+    fx.bridge.jobs.fail_after(None);
     assert_eq!(fx.outbox(&moved, "stage").await, "verify");
+    assert_eq!(fx.outbox(&moved, "sent_at").await, "NULL");
     // One is claimed by a job that dies.
     let claim = fx
         .bridge
@@ -2320,9 +2330,10 @@ async fn each_kind_of_queue_has_its_own_wait() {
     let bucket = fx.bucket("scratch", true).await;
     let posting = fx.put(&bucket, "posting", b"tiny").await;
     let verifying = fx.put(&bucket, "verifying", b"tiny").await;
-    // One extent is posted; its hand-over to verify is lost.
-    fx.bridge.jobs.drop_next(1);
+    // One extent is posted; the queue refuses its hand-over to verify.
+    fx.bridge.jobs.fail_after(Some(0));
     let posted = fx.bridge.run_job(&verifying.job(OutboxStage::Post)).await;
+    fx.bridge.jobs.fail_after(None);
     assert_eq!(posted, JobOutcome::Ack);
     assert_eq!(fx.outbox(&verifying, "stage").await, "verify");
     let due = UnixMs(fx.outbox(&verifying, "next_at").await.parse().unwrap());
@@ -2508,10 +2519,11 @@ async fn a_wake_up_that_cannot_be_sent_on_is_retried() {
 }
 
 /// The dispatcher runs at the very moment a release is due, before the
-/// wake-up is delivered: that costs one duplicate job and one mark, and
-/// the extent is released once.
+/// wake-up is delivered: the row was marked as sent when the verify job
+/// sent the wake-up, so that costs no second job and no write, and the
+/// extent is released once.
 #[tokio::test]
-async fn a_dispatcher_run_ahead_of_the_wake_up_costs_one_duplicate() {
+async fn a_dispatcher_run_ahead_of_the_wake_up_costs_nothing() {
     let mut fx = Fx::new().await;
     fx.bridge.cfg.safety_min_age_secs = DAY_SECS;
     let due = T0.plus_secs(DAY_SECS);
@@ -2526,23 +2538,88 @@ async fn a_dispatcher_run_ahead_of_the_wake_up_costs_one_duplicate() {
     fx.pump_to(&mut queue, due.plus_ms(-1)).await;
     assert_eq!(queue, [(due, o.wake(OutboxStage::Release, due))]);
 
-    fx.clock.set(due);
-    let release = o.job(OutboxStage::Release);
-    assert_eq!(fx.tick().await.0, std::slice::from_ref(&release));
+    // The mark is the time the row is due: a mark from before it would
+    // be out of date the moment the row is due.
     assert_eq!(fx.outbox(&o, "sent_at").await, due.0.to_string());
-    // The row is marked, so the runs that follow leave it alone while
-    // the wake-up waits for a free consumer.
+    fx.clock.set(due);
+    count_outbox_writes(&fx).await;
+    assert_eq!(fx.tick().await.0, []);
+    // The runs that follow leave it alone too while the wake-up waits
+    // for a free consumer.
     fx.clock.advance_secs(TICK_SECS);
     assert_eq!(fx.tick().await.0, []);
+    assert_eq!(outbox_writes(&fx).await, 0);
 
     assert_eq!(fx.pump_to(&mut queue, fx.clock.now()).await, 1);
     assert_eq!(fx.extent(&o, "safety_state").await, "released");
     assert_eq!(fx.outbox(&o, "stage").await, "done");
-    // The dispatcher's job comes last and finds nothing to do.
-    let before = fx.dump().await;
-    assert_eq!(fx.bridge.run_job(&release).await, JobOutcome::Ack);
-    assert_eq!(fx.dump().await, before);
     assert_eq!(fx.tick().await.0, []);
+}
+
+/// A wake-up that is lost after the queue took it: the release is sent
+/// again by the dispatcher at the resend timeout after it was due, and
+/// not before.
+#[tokio::test]
+async fn a_lost_wake_up_is_made_up_for_at_the_resend_timeout() {
+    let mut fx = Fx::new().await;
+    fx.bridge.cfg.safety_min_age_secs = DAY_SECS;
+    let due = T0.plus_secs(DAY_SECS);
+    let bucket = fx.bucket("scratch", true).await;
+    let o = fx.put(&bucket, "k", b"tiny").await;
+    fx.bridge
+        .jobs
+        .send(&o.job(OutboxStage::Post), 0)
+        .await
+        .unwrap();
+    let mut queue = Vec::new();
+    fx.pump_to(&mut queue, due.plus_ms(-1)).await;
+    assert_eq!(queue, [(due, o.wake(OutboxStage::Release, due))]);
+    // The wake-up is gone.
+    queue.clear();
+
+    let release = o.job(OutboxStage::Release);
+    fx.clock.set(due.plus_secs(RESEND_SECS).plus_ms(-1));
+    assert_eq!(fx.tick().await.0, []);
+    fx.clock.set(due.plus_secs(RESEND_SECS));
+    assert_eq!(fx.tick().await.0, std::slice::from_ref(&release));
+    assert_eq!(fx.bridge.run_job(&release).await, JobOutcome::Ack);
+    assert_eq!(fx.extent(&o, "safety_state").await, "released");
+    assert_eq!(fx.outbox(&o, "stage").await, "done");
+}
+
+/// A hand-over the queue refuses leaves the row unmarked, at every
+/// stage: the next dispatcher run sends the job as soon as it is due.
+#[tokio::test]
+async fn a_refused_hand_over_is_sent_by_the_next_dispatcher_run() {
+    let fx = Fx::new().await;
+    let bucket = fx.bucket("scratch", true).await;
+    let o = fx.put(&bucket, "k", b"tiny").await;
+
+    // Post to verify.
+    fx.bridge.jobs.fail_after(Some(0));
+    let post = o.job(OutboxStage::Post);
+    assert_eq!(fx.bridge.run_job(&post).await, JobOutcome::Ack);
+    assert_eq!(fx.outbox(&o, "stage").await, "verify");
+    assert_eq!(fx.outbox(&o, "sent_at").await, "NULL");
+    fx.bridge.jobs.fail_after(None);
+    fx.clock
+        .set(UnixMs(fx.outbox(&o, "next_at").await.parse().unwrap()));
+    let verify = o.job(OutboxStage::Verify);
+    assert_eq!(fx.tick().await.0, std::slice::from_ref(&verify));
+
+    // Verify to release.
+    fx.bridge.jobs.fail_after(Some(0));
+    assert_eq!(fx.bridge.run_job(&verify).await, JobOutcome::Ack);
+    assert_eq!(fx.outbox(&o, "stage").await, "release");
+    assert_eq!(fx.outbox(&o, "sent_at").await, "NULL");
+    fx.bridge.jobs.fail_after(None);
+    fx.clock
+        .set(UnixMs(fx.outbox(&o, "next_at").await.parse().unwrap()));
+    let release = o.job(OutboxStage::Release);
+    assert_eq!(fx.tick().await.0, std::slice::from_ref(&release));
+    assert_eq!(fx.bridge.run_job(&release).await, JobOutcome::Ack);
+    assert_eq!(fx.outbox(&o, "stage").await, "done");
+    assert_eq!(fx.server.posted_count().await, 1);
 }
 
 /// A queue that refuses a batch ends the sending, not the checks after

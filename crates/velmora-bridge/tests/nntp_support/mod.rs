@@ -1702,6 +1702,9 @@ impl Catalog for MemCatalog {
     async fn mark_sent(&self, _: &[ExtentId], _: UnixMs) -> Result<u64> {
         unused()
     }
+    async fn unmark_sent(&self, _: &[Job], _: UnixMs) -> Result<u64> {
+        Ok(0)
+    }
     async fn bury_exhausted(&self, _: u32, _: UnixMs) -> Result<u64> {
         unused()
     }
