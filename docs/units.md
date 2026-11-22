@@ -299,9 +299,10 @@ the unit. It also answers `schema_tables`, every table the unit holds
 (SQLite's and the platform's own left out), for the reverse move's
 preflight. A window's copy resumes only an import whose `t0_seq` is at or
 above its own first record (AM-53); a second move reads it before step 0
-(P12). On an unborn unit, `import_progress` answers `unborn` with
-`listed = false` whatever the call says: the move tool decides an unborn
-unit from the heads it read first (P12), so this read never pages. Every imported key value must
+(P12). On an unborn unit, `import_progress` answers `unborn` and makes
+nothing; `listed` is as the call says (rule 7). P12 reads both heads
+first and sends `listed = false` where they say an unborn unit is
+expected (the day-30 `deleteAll()`); every other read keeps the page. Every imported key value must
 be of its column's class (text, or integer where declared), so the unit
 never holds a key that `export` cannot page after.
 
@@ -436,7 +437,8 @@ refuses and arms nothing. The lease is the latest of `lease_hi` and
 `fresh_until`; a unit without a lease table is refused (its lease is not
 known), and one with the table but no row never issued a lease. A unit
 born from a `restore` token has `closed_at` = its birth and no lease row,
-so a gone or unborn unit passes T + 60 s after its birth. The bookmark calls need the object's storage, so the object class
+so it would pass checks 2 and 3 at T + 60 s after its birth; it is
+refused `never_opened` while still under its birth entry (below). The bookmark calls need the object's storage, so the object class
 runs them after the unit's own checks; a restore never answers `ok` (the
 object restarts), and the tool reads the result from the unit's state. An
 answer `failed` of class `pitr_armed` means the restore was armed without
@@ -447,7 +449,12 @@ it gets no answer, and runs the gate only once the restart is seen.
 While an import exists that no `move` report has lifted
 (`unit_import_move` with `move_lifted = 0`), `restore_prepare` is refused
 with `move_not_lifted`, so no undo bookmark from before the lift exists;
-`restore`, which needs that bookmark, is refused the same way. Once
+`restore`, which needs that bookmark, is refused the same way. Both are
+also refused with `never_opened` while a unit born from a `restore`
+token is still closed under the entry it was born under: it has never
+served a request, so there is no state to go back to, and the move's
+step 2 re-creates an unborn owner unit that way, so a bookmark then
+would predate the move's first batch (and its move record). Once
 lifted, `restore` refuses a time target before `lifted_at` + 60 s (est)
 with `before_move_lift`. It also refuses a time target before the unit's
 own `born_at` + 60 s (est) with `before_birth`: a rebirth (a dump restore
@@ -458,7 +465,10 @@ a little before the commit; the S3 drill measures
 `getBookmarkForTime`'s offset, and above 30 s the margin becomes twice
 it. A bookmark target is not compared: the only bookmarks are the undo
 bookmark and the pre-migration bookmark, and neither can be taken before
-the lift. A unit runs no schema migration while an import is not lifted
+the lift. A unit born from a `birth` token and closed by the move's
+entry has no move record until the first batch, and the unit cannot
+tell that entry from a restore's: that span is open (a design question
+for the move's step 2). A unit runs no schema migration while an import is not lifted
 (`schema::migration_allowed`; code reads N - 1 and N, so it serves
 without migrating), and the move window runs under the merge freeze.
 Every state before the lift is a closed unit in mid-move that never
@@ -533,7 +543,9 @@ by the restore gate. So a tool that re-runs 8(b) first reads the unit
 V9 (8(b2)) runs before 8(c). Otherwise: a lost or `failed` answer sends
 the same `sync` again; `keys_not_applied` means apply the keys and send
 it again, `stale_sync` read the head again, `counters_off` run
-`recount`, each once per entry; only `not_restoring`, `no_report`,
+`recount`, each once per entry. If the same refusal comes back after
+its fix while the owner tenant's chain heads have not moved since the
+fix, the window stops; a higher head allows one more fix. Only `not_restoring`, `no_report`,
 `stamp_not_levelled` and `proof_mismatch` re-enter, once per window; any
 other refusal stops the window. The unit keeps the time of that lift, and refuses a
 restore to a time before it, or less than 60 s (est) after it, as the

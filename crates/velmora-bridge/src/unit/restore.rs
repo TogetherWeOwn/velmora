@@ -28,8 +28,10 @@
 //!    unit wrote nothing since `restore_prepare`. A refusal here means the
 //!    tool runs `restore_prepare` again.
 //! 5. (AM-46) both calls are refused while an import exists that no
-//!    `move` report has lifted (`move_not_lifted`), so no undo bookmark
-//!    from before the move's lift exists; `restore` refuses a time target
+//!    `move` report has lifted (`move_not_lifted`), or while a unit born
+//!    from a `restore` token is still closed under that entry
+//!    (`never_opened`), so no undo bookmark from before the move's lift
+//!    exists; `restore` refuses a time target
 //!    before the move's lift (`before_move_lift`) or before the unit's
 //!    birth (`before_birth`), each with [`LIFT_SLACK_MS`].
 //!
@@ -119,6 +121,11 @@ pub enum RestoreRefusal {
     /// The unit is closed mid-move and has never served a request; the
     /// move's own give-up or lift ends this.
     MoveNotLifted,
+    /// The unit was born from a `restore` token and is still closed
+    /// under that entry: it never served a request, so it has no state to
+    /// go back to, and an undo bookmark of it would predate a move's
+    /// first batch (AM-46).
+    NeverOpened,
     /// A time target before this incarnation's birth (AM-46): it would
     /// bring back the unit that was replaced (a dump restore into a gone
     /// or unborn unit, or a re-creation after `deleteAll()`).

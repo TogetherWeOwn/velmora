@@ -61,8 +61,9 @@ S = {"state_seq": 3, "keys_seq": 0}
 check("unborn, not listed", unit_post(0, call(0, "request", PING, (3, 0), listed=False)),
       {"answer": "unborn", "listed": False})
 check("unborn, listed", unit_post(0, call(0, "request", PING, (3, 0))), {"answer": "unborn", "listed": True})
-# P12 (AM-47): the move tool's read of import state never pages.
-check("import_progress on an unborn unit", unit_post(0, call(0, "worker", {"op": "import_progress"})),
+# P12 (AM-47): the move tool reads import state with listed = false where
+# its heads expect an unborn unit; the unit answers as the call says.
+check("import_progress on an unborn unit", unit_post(0, call(0, "worker", {"op": "import_progress"}, listed=False)),
       {"answer": "unborn", "listed": False})
 
 # An object without a name matches no call.

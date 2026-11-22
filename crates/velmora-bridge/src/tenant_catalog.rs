@@ -88,7 +88,8 @@ impl<P: UnitPort, S: Catalog> TenantCatalog<P, S> {
 
     /// With [`UNIT_STALE`]: the unit's numbers, which the job runs once
     /// more with (AM-50). They stand for the chain heads: the unit refuses
-    /// every job once its lease has expired, so they are at most T old.
+    /// every job once its lease has expired (the re-run meets that check),
+    /// so a re-run that is not refused ran on numbers at most T old.
     pub fn stale_seqs(&self) -> Option<Seqs> {
         self.stale.get()
     }

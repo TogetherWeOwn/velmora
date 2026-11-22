@@ -444,14 +444,45 @@ fn restore_checks_its_token_and_that_nothing_moved_since_prepare() {
 }
 
 #[test]
-fn a_unit_born_from_a_restore_token_passes_the_wait_from_its_birth() {
+fn a_unit_born_closed_takes_no_undo_bookmark_under_its_birth_entry() {
+    // AM-46: it never served a request, so there is nothing to go back
+    // to (the history before its birth is refused by `before_birth`).
     let u = provision(BirthKind::Restore, S);
     let pitr = FakePitr::new("bm-born");
+    for at in [
+        ready_at(BORN) - 1,
+        ready_at(BORN),
+        ready_at(BORN) + 86_400_000,
+    ] {
+        assert_eq!(
+            run(&u, UnitOp::RestorePrepare { since: S }, at, &pitr),
+            refused_restore(RestoreRefusal::NeverOpened)
+        );
+    }
+    let at = RestoreTarget::Time {
+        at_ms: BORN + LIFT_SLACK_MS,
+    };
     assert_eq!(
         run(
             &u,
-            UnitOp::RestorePrepare { since: S },
-            ready_at(BORN) - 1,
+            restore_op(BirthKind::Restore, S, at, "bm-born"),
+            ready_at(BORN),
+            &pitr
+        ),
+        refused_restore(RestoreRefusal::NeverOpened)
+    );
+    assert!(pitr.restored.borrow().is_empty());
+    // Under a later entry the wait runs from that entry's close.
+    let later = BORN + 5_000;
+    assert!(matches!(
+        sync(&u, S + 1, Some(S + 1), later),
+        UnitAnswer::Ok { .. }
+    ));
+    assert_eq!(
+        run(
+            &u,
+            UnitOp::RestorePrepare { since: S + 1 },
+            ready_at(later) - 1,
             &pitr
         ),
         refused_restore(RestoreRefusal::TooSoon)
@@ -459,8 +490,8 @@ fn a_unit_born_from_a_restore_token_passes_the_wait_from_its_birth() {
     assert!(matches!(
         run(
             &u,
-            UnitOp::RestorePrepare { since: S },
-            ready_at(BORN),
+            UnitOp::RestorePrepare { since: S + 1 },
+            ready_at(later),
             &pitr
         ),
         UnitAnswer::UndoBookmark { .. }

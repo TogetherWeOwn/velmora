@@ -1087,16 +1087,15 @@ fn import_progress_answers_the_moves_record() {
 }
 
 #[test]
-fn import_progress_on_an_unborn_unit_never_pages() {
+fn import_progress_on_an_unborn_unit_answers_as_the_call_says_and_makes_nothing() {
     let u = Unit::new(RusqliteSql::open_in_memory().unwrap(), own(), "");
-    // P12: the tool decides an unborn unit from the heads it read first.
+    // P12 sends `listed = false` where its heads expect an unborn unit;
+    // any other read of import state keeps rule 7's page.
     let mut c = call_on(&own(), CallKind::Worker, None, UnitOp::ImportProgress {});
-    assert_eq!(u.handle(&c, NOW), UnitAnswer::Unborn { listed: false });
     c.listed = false;
     assert_eq!(u.handle(&c, NOW), UnitAnswer::Unborn { listed: false });
-    // Any other call keeps what the call says (rule 7).
-    let ping = call_on(&own(), CallKind::Request, seqs(3, 0), UnitOp::Ping {});
-    assert_eq!(u.handle(&ping, NOW), UnitAnswer::Unborn { listed: true });
+    c.listed = true;
+    assert_eq!(u.handle(&c, NOW), UnitAnswer::Unborn { listed: true });
     // And nothing was made.
     assert!(!u
         .sql()
@@ -1179,8 +1178,8 @@ fn no_undo_bookmark_and_no_migration_while_an_import_is_not_lifted() {
 #[test]
 fn a_restore_to_a_time_before_the_units_birth_is_refused() {
     // A unit born from a `restore` token (a re-creation after
-    // `deleteAll()`), with no import: its history before the birth is
-    // another incarnation's.
+    // `deleteAll()`), with no import, under a later entry: its history
+    // before the birth is another incarnation's.
     let u = born_as(own(), BirthKind::Restore);
     let before_birth = Some((Refused::Restore(RestoreRefusal::BeforeBirth), false));
     for at_ms in [0, NOW.0 - 1, NOW.0, NOW.0 + LIFT_SLACK_MS - 1] {
@@ -1190,6 +1189,70 @@ fn a_restore_to_a_time_before_the_units_birth_is_refused() {
         restore_at(&u, S, NOW.0 + LIFT_SLACK_MS),
         Some((Refused::Restore(RestoreRefusal::LeaseUnknown), false))
     );
+}
+
+#[test]
+fn a_unit_born_closed_takes_no_undo_bookmark_before_the_moves_first_batch() {
+    // The move's step 2 re-creates an unborn owner unit with a `restore`
+    // token under its entry (AM-53). Before the first batch there is no
+    // move record, so only the birth tells the unit that it never served:
+    // no undo bookmark is taken (AM-46; review r1 MEDIUM).
+    let u = Unit::new(RusqliteSql::open_in_memory().unwrap(), own(), "");
+    let token = BirthToken {
+        name: own(),
+        jurisdiction: String::new(),
+        record_seq: S,
+        schema_version: velmora_bridge::unit::schema::SCHEMA_VERSION,
+        key_scheme: 2,
+        kind: BirthKind::Restore,
+    };
+    let a = u.handle(
+        &call_on(
+            &own(),
+            CallKind::Worker,
+            seqs(S, 0),
+            UnitOp::Provision {
+                token,
+                sealed: b"sealed".to_vec(),
+            },
+        ),
+        NOW,
+    );
+    assert!(matches!(a, UnitAnswer::Ok { .. }), "{a:?}");
+    // A lease table with no row, and far past T + 60 s: checks 1 to 3
+    // would pass.
+    u.sql()
+        .apply("CREATE TABLE unit_lease (id INTEGER PRIMARY KEY, fresh_until INTEGER, lease_hi INTEGER)")
+        .unwrap();
+    let never = Some((Refused::Restore(RestoreRefusal::NeverOpened), false));
+    let late = UnixMs(NOW.0 + 86_400_000);
+    let c = call_on(
+        &own(),
+        CallKind::Worker,
+        None,
+        UnitOp::RestorePrepare { since: S },
+    );
+    match u.pitr_step(&c, late) {
+        PitrStep::Answer(a) => assert_eq!(refusal(&a), never),
+        other => panic!("prepared: {other:?}"),
+    }
+    // The first batch binds the move: then `move_not_lifted`.
+    ok(import(
+        &u,
+        batch(
+            ImportTable::Buckets,
+            None,
+            "c1",
+            vec![bucket_row(B1, "alpha", P)],
+        ),
+    ));
+    match u.pitr_step(&c, late) {
+        PitrStep::Answer(a) => assert_eq!(
+            refusal(&a),
+            Some((Refused::Restore(RestoreRefusal::MoveNotLifted), false))
+        ),
+        other => panic!("prepared: {other:?}"),
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -159,10 +159,11 @@ impl<S: UnitSql> Unit<S> {
         let UnitOp::Provision { token, sealed } = &call.op else {
             let Some(cert) = born else {
                 // Rule 7: nothing is made, nothing is written. The move
-                // tool's read of import state (P12) decides an unborn unit
-                // from the heads it read first, so that read never pages.
-                let listed = call.listed && !matches!(call.op, UnitOp::ImportProgress {});
-                return Ok(UnitAnswer::Unborn { listed });
+                // tool's P12 read of `import_progress` sends `listed =
+                // false` where its heads say an unborn unit is expected.
+                return Ok(UnitAnswer::Unborn {
+                    listed: call.listed,
+                });
             };
             if cert != self.own {
                 // The certificate names another unit than the object: a
@@ -210,15 +211,21 @@ impl<S: UnitSql> Unit<S> {
             .ok_or_else(|| decode("unit_birth name"))
     }
 
-    /// The unit's clock at its birth (`unit_birth.born_at`).
-    fn born_at(&self) -> Result<i64> {
-        let rows = poll_once(
-            self.sql()
-                .query("SELECT born_at FROM unit_birth WHERE id = 1", &[]),
-        )??;
-        match rows.first().and_then(|r| r.first()) {
-            Some(SqlValue::Int(t)) => Ok(*t),
-            _ => Err(decode("unit_birth born_at")),
+    /// The unit's birth: its clock then (`born_at`), and, for a unit
+    /// born from a `restore` token, the entry it was born closed under.
+    fn birth_facts(&self) -> Result<(i64, Option<u64>)> {
+        let rows = poll_once(self.sql().query(
+            "SELECT born_at, kind, record_seq FROM unit_birth WHERE id = 1",
+            &[],
+        ))??;
+        let Some(r) = rows.first() else {
+            return Err(decode("unit_birth"));
+        };
+        match (&r[0], &r[1], &r[2]) {
+            (SqlValue::Int(t), SqlValue::Text(kind), SqlValue::Int(seq)) if *seq >= 0 => {
+                Ok((*t, (kind == "restore").then_some(*seq as u64)))
+            }
+            _ => Err(decode("unit_birth")),
         }
     }
 
@@ -841,6 +848,17 @@ impl<S: UnitSql> Unit<S> {
         if import::unlifted_import(self.sql())? {
             return no(RestoreRefusal::MoveNotLifted);
         }
+        // A unit born closed (a `restore` token) and still under that
+        // entry has never served a request, so there is no state of it
+        // to go back to: the history before its birth is refused below,
+        // and an undo bookmark taken now would be one from before a
+        // move's first batch (the move's step 2 re-creates the owner's
+        // unit under its entry), which would bring back a unit with no
+        // move record after the lift (AM-46).
+        let (born_at, born_closed_under) = self.birth_facts()?;
+        if born_closed_under.is_some() && head.restoring_since == born_closed_under {
+            return no(RestoreRefusal::NeverOpened);
+        }
         if let Some((_, restore::RestoreTarget::Time { at_ms }, _)) = &restore {
             // Never back into the owner move's window: a time before the
             // move's lift would bring back its unused seal. The lift's
@@ -853,7 +871,7 @@ impl<S: UnitSql> Unit<S> {
             }
             // Never back before this incarnation's birth (AM-46), with the
             // same margin: the birth's time is its call's clock too.
-            if *at_ms < self.born_at()?.saturating_add(restore::LIFT_SLACK_MS) {
+            if *at_ms < born_at.saturating_add(restore::LIFT_SLACK_MS) {
                 return no(RestoreRefusal::BeforeBirth);
             }
         }
