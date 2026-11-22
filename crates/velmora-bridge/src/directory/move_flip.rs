@@ -736,7 +736,7 @@ where
             Some(r) => r,
         };
         let heads = (head_of(chain, window.owner).await?.seq, keys.head().await?);
-        last = Some(refusal.clone());
+        last = Some(refusal);
         match refusal {
             UnitRefused::KeysNotApplied if may(fixed.keys, heads) => {
                 fixed.keys = Some(heads);
