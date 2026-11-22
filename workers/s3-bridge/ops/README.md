@@ -1451,8 +1451,8 @@ slot rows out of the catalogue's write path.
 
 `SLOT_WAIT = "poll"` (the default): a post, verify or release job that
 finds every slot it could use taken keeps its claim and asks again
-every two seconds or more, for up to two minutes from its claim, and is
-then put off and delivered again.
+every two seconds or more, for a little over two minutes from its claim,
+and is then put off and delivered again.
 
 `SLOT_WAIT = "push"` with `PERMITS = "do"`: the job asks once to wait.
 The gate keeps a line of the sessions that wait, first come first, and

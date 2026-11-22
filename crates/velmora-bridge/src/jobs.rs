@@ -208,16 +208,16 @@ pub fn low_watermark(cap: u64) -> u64 {
 /// delivered again 15 to 60 s later (a claim, a put-off and a queue
 /// delivery each time).
 ///
-/// One permit lifetime: a slot whose holder is gone without releasing
-/// it frees when its permit expires, so by then every slot has been
-/// released, renewed by a job that is still at work, or freed. A job
-/// that has seen none come free in that time gives its row back as
-/// before. Counted from the claim, so it bounds the waits of one job
-/// together, whatever the number of backbones it asks: with the
-/// longest invocation that succeeded in a day of production (393 s) the
-/// job still ends well before its invocation gives it up
-/// ([`JOB_WAIT_MS`](crate::jobtable::JOB_WAIT_MS)).
-pub const SLOT_WAIT_MS: i64 = PERMIT_SECS as i64 * 1000;
+/// One permit lifetime, plus the gate's restart clock-skew allowance
+/// and one minimum polling interval. A restarted gate can wait out the
+/// full lifetime plus skew before handing out a slot; the job needs
+/// time to ask again once that hold ends. Counted from the claim, so it
+/// bounds the waits of one job together, whatever the number of
+/// backbones it asks. With the longest invocation that succeeded in a
+/// day of production (393 s), the job still ends well before its
+/// invocation gives it up ([`JOB_WAIT_MS`](crate::jobtable::JOB_WAIT_MS)).
+pub const SLOT_WAIT_MS: i64 =
+    PERMIT_SECS as i64 * 1000 + crate::gate::SKEW_MS + SLOT_POLL_MS as i64;
 const _: () = assert!(SLOT_WAIT_MS + 393_000 < crate::jobtable::JOB_WAIT_MS);
 /// How long a job that waits for a slot sleeps at least before it asks
 /// again. A slot is held for a second or more by the shortest job there

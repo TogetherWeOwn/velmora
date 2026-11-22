@@ -700,8 +700,8 @@ async fn a_job_without_a_slot_does_not_load_the_extent() {
 /// The same with a timer on the host: the job waits under its claim.
 /// The slots free when their permits expire, half a permit lifetime
 /// after the claim; the job then loads the extent and posts it, in the
-/// run that claimed it. Slots that stay taken put it off after one
-/// permit lifetime, with no attempt spent and nothing loaded.
+/// run that claimed it. Slots that stay taken put it off after the
+/// claim's slot-wait window, with no attempt spent and nothing loaded.
 #[tokio::test]
 async fn a_job_without_a_slot_waits_for_one_under_its_claim() {
     let mut rig = rig(&[spec("bb0", 5), spec("bb1", 5)]).await;
@@ -844,8 +844,8 @@ async fn a_cooldown_that_begins_during_the_wait_puts_the_job_off() {
 
 /// Where the slots have a line the job stands in it and does not ask
 /// while it waits: it is refused once, waits for the first tier only
-/// and for what is left of one permit lifetime from its claim, and
-/// asks again when a slot is its own. It posts in the run that claimed
+/// and for what is left of the slot-wait window from its claim. It
+/// asks again when a slot is its own and posts in the run that claimed
 /// it.
 #[tokio::test]
 async fn a_job_in_the_line_asks_again_when_a_slot_is_its_own() {

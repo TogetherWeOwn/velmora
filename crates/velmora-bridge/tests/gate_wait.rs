@@ -126,6 +126,8 @@ struct World {
     /// Each invocation's last grant from the line, in delivery order.
     grants: RefCell<BTreeMap<String, u64>>,
     grant_sequence: Cell<u64>,
+    /// A wake sent by the caller cannot reach the gate until this time.
+    wake_delayed_until: Cell<Option<i64>>,
     /// The gate runs code from before the line: it cannot read a
     /// request to wait.
     old_code: Cell<bool>,
@@ -165,6 +167,7 @@ impl World {
             pushed: Cell::new(0),
             grants: RefCell::default(),
             grant_sequence: Cell::new(0),
+            wake_delayed_until: Cell::new(None),
             old_code: Cell::new(false),
             fail_release: Cell::new(false),
         })
@@ -451,9 +454,16 @@ impl GateSession for Line {
         {
             return Ok(GateReply::failed(request.id));
         }
-        let gate = self.world.gate().await;
         let id = request.id;
         let wake = request.ops.is_empty();
+        if let Some(until) = self.world.wake_delayed_until.get().filter(|_| wake) {
+            core::future::poll_fn(|_| match self.world.now.get() >= until {
+                true => Poll::Ready(()),
+                false => Poll::Pending,
+            })
+            .await;
+        }
+        let gate = self.world.gate().await;
         let reply = gate
             .handle(Some(self.id), request, self.world.now())
             .await
@@ -1124,6 +1134,26 @@ async fn a_restart_ends_the_line_and_the_jobs_ask_again() {
     let (sessions, opened) = (w.sessions(), w.opens.get());
     assert!(take(&a, &w, &p, JOB, "job-a").await.is_some());
     assert_eq!((w.sessions(), w.opens.get()), (sessions, opened));
+}
+
+#[tokio::test]
+async fn the_default_job_wait_outlasts_the_restart_hold() {
+    let Full { w, p, .. } = full().await;
+    w.restart();
+    let (sleep, on) = (w.sleeper(), [&p]);
+    let a = w.pushing("a", core::slice::from_ref(&p));
+    let margin = i64::from(jobs::SLOT_POLL_MS) - 1;
+    w.wake_delayed_until
+        .set(Some(w.now().0 + JOB_MS + SKEW_MS + margin));
+    let mut waiting = wait(&a, &on, "job-a", jobs::SLOT_WAIT_MS, &sleep);
+    assert_eq!(turn(&mut waiting), None);
+
+    w.pass(JOB_MS + SKEW_MS - 1);
+    assert_eq!(turn(&mut waiting), None, "the job is still in the line");
+    w.pass(1);
+    assert_eq!(turn(&mut waiting), None, "the wake is still in flight");
+    w.pass(margin);
+    assert_eq!(turn(&mut waiting), Some(SlotWait::Granted));
 }
 
 /// After a restart no job gets a slot while a read of the old object

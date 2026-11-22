@@ -2015,8 +2015,8 @@ async fn a_job_whose_time_in_the_line_ran_out_is_put_off_without_an_attempt() {
 }
 
 /// The slots stay taken (their holder is at work and renews them): the
-/// job waits one permit lifetime from its claim and no longer, then is
-/// put off as a job without a timer is at once. The row's attempts are
+/// job waits out the slot-wait window from its claim, then is put off
+/// as a job without a timer is at once. The row's attempts are
 /// what they were before the claim, and the row says where the job got
 /// to.
 #[tokio::test]

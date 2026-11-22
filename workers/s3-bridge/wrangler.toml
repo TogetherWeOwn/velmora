@@ -178,7 +178,8 @@ RECOVERY_COPY = "off"
 PERMITS = "do"
 # poll | push. What a post, verify or release job does when every
 # connection slot it could use is taken. poll: it asks again every two
-# seconds or more for up to two minutes, then is put off and redelivered.
+# seconds or more for a little over two minutes, then is put off and
+# redelivered.
 # push: where the permits come from the gate (PERMITS do) it waits on its
 # gate session instead, in a line the gate keeps first come first, and
 # the gate sends it the slot the moment one comes free: no asking, and no
