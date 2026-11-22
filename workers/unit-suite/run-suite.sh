@@ -23,6 +23,9 @@
 #   SUITE_KEEP       directory to keep the logs in (cargo, twin, workerd)
 #   CARGO_TARGET_DIR and the other cargo variables are passed through.
 #
+# The directory's tests (tests/directory_*.rs) run with no twin: the
+# directory is a D1 database, not a unit (testkit_shadow.rs).
+#
 # Without arguments every test target of velmora-bridge runs
 # (`--no-fail-fast --lib --tests`). Then unit-smoke.py drives the unit's
 # Durable Object class itself in the same workerd. The script exits

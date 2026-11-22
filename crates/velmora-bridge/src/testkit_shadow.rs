@@ -90,10 +90,25 @@ enum Answer {
     Sql(String),
 }
 
+/// Whether this test binary is one of the directory's
+/// (`tests/directory_*.rs`, named `directory_<name>-<hash>` by cargo).
+fn directory_test() -> bool {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+        .is_some_and(|n| n.starts_with("directory_"))
+}
+
 impl Shadow {
     /// A twin, when `VELMORA_SQL_SHADOW` is set.
     pub(crate) fn from_env() -> Option<Shadow> {
         let bases = std::env::var("VELMORA_SQL_SHADOW").ok()?;
+        // The directory is a D1 database, not a unit: Durable Object
+        // SQLite is the wrong engine for it, so its tests
+        // (`tests/directory_*.rs`) run natively only.
+        if directory_test() {
+            return None;
+        }
         let bases: Vec<&str> = bases
             .split(',')
             .map(str::trim)
