@@ -22,7 +22,8 @@ use velmora_s3_proto::{ErrorCode, StoredChecksum, UploadValidator};
 
 use super::common::{
     authenticate, check_precondition, checksum_json, conditional_gate, discard_before_retry,
-    from_proto, hold_precondition, internal, metadata_json, restore_gate, s3_error, writes_refused,
+    from_proto, hold_precondition, internal, metadata_json, restore_gate, s3_error, send_post_jobs,
+    writes_refused,
 };
 use super::slices::{store_slices, SliceError, SliceSink};
 use crate::crypto::{seal_extent, unwrap_bdk};
@@ -34,8 +35,7 @@ use crate::ports::{
 use crate::recovery::{id_after, write_generation};
 use crate::types::{
     Body, Bucket, CommitGeneration, ExtentId, ExtentRow, ExtentState, GenerationId, GenerationRow,
-    GenerationState, Job, OutboxStage, Precondition, S3Request, S3Response, SafetyState, WriteId,
-    JOB_VERSION,
+    GenerationState, Precondition, S3Request, S3Response, SafetyState, WriteId,
 };
 
 /// How often a PUT is published before it answers `SlowDown`: once
@@ -273,20 +273,7 @@ async fn put<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: 
     };
     drop(charge);
 
-    // The commit wrote the posting obligation; the queue message is only a
-    // wake-up. If it is lost the dispatcher finds the outbox row.
-    let _ = bridge
-        .jobs
-        .send(
-            &Job::Extent {
-                v: JOB_VERSION,
-                extent: extent_id,
-                generation: generation_id,
-                stage: OutboxStage::Post,
-            },
-            0,
-        )
-        .await;
+    send_post_jobs(bridge, &generation_id, vec![extent_id], commit.now).await;
 
     let checksum = match checksum {
         Some((algorithm, value)) => {
@@ -598,19 +585,8 @@ async fn put_sliced<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: K
     let _ = bridge.raise_stamp().await;
     drop(charge);
 
-    // The commit wrote the posting obligations; the queue messages are
-    // only a wake-up. If they are lost the dispatcher finds the rows.
-    let jobs: Vec<Job> = commit
-        .extents
-        .iter()
-        .map(|e| Job::Extent {
-            v: JOB_VERSION,
-            extent: e.id.clone(),
-            generation: commit.generation.id.clone(),
-            stage: OutboxStage::Post,
-        })
-        .collect();
-    let _ = bridge.jobs.send_many(&jobs).await;
+    let rows = commit.extents.iter().map(|e| e.id.clone()).collect();
+    send_post_jobs(bridge, &commit.generation.id, rows, commit.now).await;
 
     let checksum = match checksum {
         Some((algorithm, value)) => {
