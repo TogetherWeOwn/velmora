@@ -284,7 +284,8 @@ pub enum ListRefused {
 
 /// Applies the ids a renewal listed (`m/rk/<t>/<id>`): a key row is
 /// revoked (and the catalogue's served rows rebuilt, down its `made_by`
-/// chain), an id without a row is kept in `unit_revoked_ids`. Setting
+/// chain), an id without a row, or one that names a principal row (left
+/// as it is), is kept in `unit_revoked_ids`. Setting
 /// `revoked` twice changes nothing. Answers how many ids changed.
 pub fn revoke_listed<S: Sql>(
     sql: &S,

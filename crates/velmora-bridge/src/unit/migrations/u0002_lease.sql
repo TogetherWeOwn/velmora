@@ -29,7 +29,8 @@ CREATE TABLE unit_lease (
 INSERT INTO unit_lease(id) VALUES (1);
 
 -- An access key id that a renewal listed under `m/rk/<t>/` and that the
--- unit holds no key row for: it counts as revoked (ADR §2.4 rule 12,
+-- unit holds no key row for (or that names a principal row, which is not
+-- a key and is left as it is): it counts as revoked (ADR §2.4 rule 12,
 -- SEC-6), and a key row that arrives for it later is revoked at once (a
 -- revocation overrides every key-chain status). Put-only.
 CREATE TABLE unit_revoked_ids (

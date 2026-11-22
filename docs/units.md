@@ -145,8 +145,9 @@ mode, `restoring_since` and `closed_at`; moved by
 `unit_key_grants` (the key chain); the gate report and its
 acknowledgements; the lease and the alarm's counters in
 `unit_lease` (`fresh_until`, `lease_hi`, `renew_tries`, `failed_runs`,
-`first_write_at`; migration `u0002`), and revocations listed for a key the
-unit does not hold in `unit_revoked_ids`; and the stamp counter.
+`first_write_at`, `raise_from`; migration `u0002`), and revocations listed
+for a key the unit does not hold, or for an id that names a principal row,
+in `unit_revoked_ids`; and the stamp counter.
 
 **The write mark** (`unit_lease::mark`): the unit's catalogue and every
 table of the unit are reached only through `MarkedSql`, which counts every

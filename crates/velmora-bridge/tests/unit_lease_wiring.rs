@@ -855,6 +855,35 @@ fn a_revoked_principal_is_not_counted() {
     ));
 }
 
+/// An alarm wake with nothing to send writes nothing, on an idle unit
+/// and on a closed one (a restore's check 4 and a dump's mark need it).
+#[test]
+fn an_idle_or_closed_alarm_wake_writes_nothing() {
+    let u = fresh();
+    let m = u.mark();
+    let step = u.alarm(UnixMs(NOW.0 + 1_000)).unwrap();
+    assert!(step.jobs.is_empty());
+    assert_eq!(
+        u.alarm_done(UnixMs(NOW.0 + 1_000), &step, false).unwrap(),
+        None
+    );
+    assert_eq!(u.mark(), m, "an idle wake");
+
+    assert!(matches!(
+        request(&u, true, read_plan(), NOW),
+        UnitAnswer::Ok { .. }
+    ));
+    let due = UnixMs(NOW.0 + PERIOD);
+    let _dead = u.alarm(due).unwrap();
+    assert!(matches!(sync(&u, 4, Some(4), due), UnitAnswer::Ok { .. }));
+    let m = u.mark();
+    let later = UnixMs(due.0 + 1_000);
+    let step = u.alarm(later).unwrap();
+    assert!(step.jobs.is_empty());
+    assert_eq!(u.alarm_done(later, &step, false).unwrap(), None);
+    assert_eq!(u.mark(), m, "a closed wake, even with a dead run's raise");
+}
+
 /// A run that dies during its send (the object reset) leaves its raise
 /// pending: the next run sends it again.
 #[test]

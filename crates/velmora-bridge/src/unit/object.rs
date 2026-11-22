@@ -1324,17 +1324,21 @@ impl<S: UnitSql> Unit<S> {
             Some(cert) if cert == self.own => {}
             _ => return Ok(idle),
         }
-        if self.lease_row()?.is_none() {
+        let Some(mut row) = self.lease_row()? else {
             return Ok(idle);
-        }
-        // A raise a dead run handed out is pending again.
+        };
         let sql = self.sql();
-        let mut settle = || store::settle_dead_raise(sql);
-        sql.atomically(&mut settle)?;
-        let row = store::read(sql)?;
         let head = self.head()?;
         let lease = row.lease();
         let closed = self.closed(&head)?;
+        // A raise a dead run handed out is pending again. Written only
+        // then, and not on a closed unit: an idle or closed wake writes
+        // nothing (a restore's check 4, a dump's mark).
+        if row.raise_from.is_some() && !closed {
+            let mut settle = || store::settle_dead_raise(sql);
+            sql.atomically(&mut settle)?;
+            row = store::read(sql)?;
+        }
         let run = alarm::on_alarm(
             now,
             &row.at(&lease, closed),
