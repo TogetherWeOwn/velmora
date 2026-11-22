@@ -72,7 +72,7 @@ use crate::ports::{Catalog, Sql, SqlValue};
 use crate::sql::SqlCatalog;
 use crate::types::{BridgeError, BucketId, ExtentId, GenerationId, KeyStatus, Result, UnixMs};
 use crate::unit_lease::alarm::{self, AlarmRules, AlarmRun, Dues, Duty};
-use crate::unit_lease::handout::{self, Handout};
+use crate::unit_lease::handout::{self, Handout, HandoutRules};
 use crate::unit_lease::job::{self, UnitJobKind};
 use crate::unit_lease::lease::{Admit as LeaseAdmit, LeaseRefusal, LeaseRules, Proven};
 use crate::unit_lease::mark::{Mark, MarkedSql, WriteMark};
@@ -179,6 +179,8 @@ pub struct Unit<S: UnitSql> {
     jurisdiction: String,
     /// Where the size guard stands (ADR §2.6).
     size: SizeLimits,
+    /// What the Worker's configuration says about the alarm's hand-out.
+    handout_rules: HandoutRules,
     lease_rules: LeaseRules,
     alarm_rules: AlarmRules,
     /// The earliest time a call of this wake asked the alarm to be armed
@@ -204,7 +206,15 @@ impl<S: UnitSql> Unit<S> {
             wake: Cell::new(None),
             tables: Cell::new(None),
             size: SizeLimits::default(),
+            handout_rules: HandoutRules::ROWS_ONLY,
         }
+    }
+
+    /// The same unit with the hand-out at `rules` (the object class reads
+    /// them from the Worker's environment).
+    pub fn with_handout(mut self, rules: HandoutRules) -> Self {
+        self.handout_rules = rules;
+        self
     }
 
     /// The same unit with the size guard at `limits` (tests lower it).
@@ -1633,6 +1643,13 @@ impl<S: UnitSql> Unit<S> {
             other => other?,
         }
         let head = synced.ok_or_else(|| decode("unit_head"))?;
+        // The lift opens the unit: what waited while it was closed (rows
+        // a job left as `Closed`, the import's outbox) is due, so the alarm
+        // runs now. Its lease was ended at the close: it sends `renew`, and
+        // the renewal arms the hand-out (RD-9; AM-50's `Closed` row).
+        if lifting {
+            self.want_wake(Some(now));
+        }
         Ok(UnitAnswer::Ok {
             seqs: head.seqs,
             body: json!({ "synced": head.seqs.state_seq }),
@@ -1738,9 +1755,19 @@ impl<S: UnitSql> Unit<S> {
         .into_iter()
         .flatten()
         .min();
+        // A tenant that is being shredded takes no job (AM-50: they are
+        // acknowledged and their rows stay): nothing is handed out.
+        let shredding = matches!(
+            self.head()?.tenant_state,
+            TenantState::Shredding | TenantState::Shredded
+        );
+        let handout = match shredding {
+            true => None,
+            false => handout::due_at(&self.cat, &self.handout_rules)?,
+        };
         Ok(Dues::none()
             .with(Duty::StampRaise, raise)
-            .with(Duty::HandOut, handout::due_at(&self.cat)?))
+            .with(Duty::HandOut, handout))
     }
 
     /// Whether the unit takes no `renew` and no job: a `restoring` entry,
@@ -1823,7 +1850,7 @@ impl<S: UnitSql> Unit<S> {
                 // Tenant 0 has no job form: nothing is handed out for it.
                 Duty::HandOut if !self.own.tenant.is_zero() => {
                     let mut plan = || {
-                        out = handout::plan(&self.cat, now)?;
+                        out = handout::plan(&self.cat, now, &self.handout_rules)?;
                         Ok(())
                     };
                     sql.atomically(&mut plan)?;

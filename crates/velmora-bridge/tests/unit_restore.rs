@@ -686,9 +686,13 @@ fn a_clean_whole_replay_lifts_with_its_proof_once_the_stamp_is_level() {
     );
     let p = proof(&u, t);
     assert_eq!(p.replay_id, rid("n1"));
+    let _ = u.take_wake();
     assert!(matches!(lift(&u, S + 1, Some(p), t), UnitAnswer::Ok { .. }));
     let h = u.head().unwrap();
     assert_eq!((h.restoring_since, h.closed_at), (None, None));
+    // The lift asks for the alarm at once: what waited while the unit was
+    // closed is due (AM-50's `Closed` row).
+    assert_eq!(u.take_wake(), Some(UnixMs(t)));
     // The report is gone with the entry.
     assert_eq!(
         ok(worker(&u, UnitOp::GateStatus {}, t))["replay_id"],

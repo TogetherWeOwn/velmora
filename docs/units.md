@@ -134,22 +134,29 @@ unit's outbox to the directory) is not built yet.
 alarm also does tenant 0's cron work for the unit. It buries exhausted
 outbox rows, then sends the due rows as `extent` jobs (as many as tenant
 0's dispatcher sends in one run), one `gc` job while a GC row of a
-disposable bucket is due, and one `evict` job per eviction-check period
-while the unit holds evictable bytes. The consumer holds the
-configuration: `gc` does nothing with `GC_MODE` off, and `evict` takes the
-cap's excess itself. The hand-out is due when `Catalog::due` would take a
-row (with tenant 0's resend window, as a unit cannot ask the queues for
-their backlog), a GC row is due, or the eviction check is due, and never
-sooner than 60 s (est) after the last hand-out. An idle unit has nothing
-due. Every message goes through `velmora_bridge::routing`, as tenant 0's:
-an extent's job to its shard of the post or verify queues, everything else,
-the unit's own `renew` and `stamp_raise` included, to the queue bound as
-`AUX_Q`, or to the first verify queue where `AUX_Q` is not bound. The jobs
-are format 2, with the tenant, the unit and its numbers. After the sends
-the rows of the batches that went through are marked, and the run is
-recorded only when every send went through. The write-intent sweep is not
-handed out: tenant 0's is gated by `INTENT_SWEEP`, which only the Worker's
-configuration holds and its consumer does not check.
+disposable bucket is due and `GC_MODE` is `disposable`, and one `evict` job
+per eviction-check period while the unit's evictable bytes are above
+`HOT_CAP_BYTES`, as tenant 0's dispatcher. The object class runs in the
+Worker and reads those two variables from its environment; the unit holds
+no configuration. The hand-out is due when `Catalog::due` would take a row
+(with tenant 0's resend window, as a unit cannot ask the queues for their
+backlog; read from a bounded window of each stage, never late), a GC row is
+due while GC runs, or the eviction check is due while the cap is set and a
+byte is evictable, and never sooner than 60 s (est) after the last
+hand-out. A unit with an empty outbox and no cache has nothing due; one
+that holds cache wakes once per eviction-check period to take its total. A
+tenant that is being shredded hands out nothing (its jobs are refused).
+The lift of a `restoring` entry asks for the alarm at once, so what waited
+while the unit was closed is handed out after its renewal. Every message
+goes through `velmora_bridge::routing`, as tenant 0's: an extent's job to
+its shard of the post or verify queues, everything else, the unit's own
+`renew` and `stamp_raise` included, to the queue bound as `AUX_Q`, or to
+the first verify queue where `AUX_Q` is not bound. The jobs are format 2,
+with the tenant, the unit and its numbers. After the sends the rows of the
+batches that went through are marked, and the run is recorded only when
+every send went through. The write-intent sweep is not handed out: tenant
+0's is gated by `INTENT_SWEEP`, which only the Worker's configuration
+holds and its consumer does not check.
 
 **What makes the alarm's raise due** (ADR §8.5, AM-48). Every committed S3
 or job call that changed a row, and every reservation call that changed one

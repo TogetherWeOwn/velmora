@@ -8,17 +8,20 @@
 //!
 //! - **When it is due** ([`due_at`]): the earliest time an outbox row is
 //!   due (the same condition as `Catalog::due`, with tenant 0's resend
-//!   window for a queue whose backlog is not known), a GC row is due, or
-//!   the eviction check is due while the unit holds evictable bytes; and
-//!   never sooner than [`HANDOUT_PERIOD_MS`] after the last hand-out, the
-//!   cadence of tenant 0's cron. An idle unit has nothing due and costs
-//!   nothing.
+//!   window for a queue whose backlog is not known; from a bounded window
+//!   of each stage, never late), a GC row is due while `GC_MODE` runs, or
+//!   the eviction check is due while the cap is set and the unit holds
+//!   evictable bytes; and never sooner than [`HANDOUT_PERIOD_MS`] after
+//!   the last hand-out, the cadence of tenant 0's cron. A unit with
+//!   nothing in its outbox and no cache has nothing due; one that holds
+//!   cache wakes once per eviction-check period to take its total.
 //! - **What it sends** ([`plan`]): exhausted rows are buried first, then
 //!   up to [`crate::jobs::DISPATCH_LIMIT`] due rows as `extent` jobs, one
-//!   `gc` job while a GC row is due, and one `evict` job per
-//!   [`crate::jobs::EVICT_CHECK_SECS`] while the unit holds evictable
-//!   bytes. The consumer holds the configuration: a `gc` job does nothing
-//!   with `GC_MODE` off, and an `evict` job takes the cap's excess itself.
+//!   `gc` job while a GC row is due and `GC_MODE` runs, and one `evict`
+//!   job per [`crate::jobs::EVICT_CHECK_SECS`] while the unit's evictable
+//!   bytes are above `HOT_CAP_BYTES`, as tenant 0's dispatcher. The
+//!   object class reads both from the Worker's environment
+//!   ([`HandoutRules`]).
 //! - **Where it goes** ([`route`]): every message through
 //!   [`crate::routing`], as tenant 0's: an extent's job to its shard, the
 //!   rest and the unit's own `renew` and `stamp_raise` to `AUX_Q`, or to
@@ -79,31 +82,112 @@ fn one_time<S: Sql>(sql: &S, stmt: &str, params: &[SqlValue]) -> Result<Option<U
     }
 }
 
+/// What the Worker's configuration says about the hand-out. The unit's
+/// object class runs in the Worker and reads them from its environment
+/// ([`HandoutRules::from_vars`]); a unit never reads a configuration.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HandoutRules {
+    /// `GC_MODE = disposable`: `gc` jobs run. Off, a GC row is never
+    /// handed out (tenant 0's dispatcher sends none either).
+    pub gc: bool,
+    /// `HOT_CAP_BYTES`: an `evict` job is sent only above it. `None` = no
+    /// eviction is handed out.
+    pub hot_cap_bytes: Option<u64>,
+}
+
+impl HandoutRules {
+    /// Hands out outbox rows only: no GC, no eviction.
+    pub const ROWS_ONLY: HandoutRules = HandoutRules {
+        gc: false,
+        hot_cap_bytes: None,
+    };
+
+    /// The rules of the Worker's variables, with `BridgeConfig`'s
+    /// meanings. A value that does not parse turns its part off (fail
+    /// toward doing less: GC deletes, and eviction only frees cache).
+    pub fn from_vars(get: impl Fn(&str) -> Option<String>) -> HandoutRules {
+        let gc = get("GC_MODE").is_some_and(|v| v == "disposable");
+        let hot_cap_bytes = match get("HOT_CAP_BYTES") {
+            Some(v) if !v.trim().is_empty() => v
+                .trim()
+                .parse::<u64>()
+                .ok()
+                .filter(|cap| i64::try_from(*cap).is_ok()),
+            _ => Some(crate::config::DEFAULT_HOT_CAP_BYTES),
+        };
+        HandoutRules { gc, hot_cap_bytes }
+    }
+}
+
+/// Outbox rows of one stage that [`due_at`] reads, at most: the earliest
+/// by `next_at`, along the `outbox_due` index.
+pub const DUE_WINDOW: u32 = 500;
+
+/// GC rows [`due_at`] looks at, at most, by `due_at`.
+const GC_WINDOW: u32 = 500;
+
 /// When the hand-out is next due; `None` = nothing waits. See the
-/// [module](self).
-pub fn due_at<S: Sql>(cat: &SqlCatalog<S>) -> Result<Option<UnixMs>> {
+/// [module](self). Bounded: at most [`DUE_WINDOW`] rows per outbox stage
+/// and a bounded GC look. Never late: a row past a full window has a
+/// `next_at` at or after the window's last one, which then stands for it
+/// (an early wake finds nothing and records its run).
+pub fn due_at<S: Sql>(cat: &SqlCatalog<S>, rules: &HandoutRules) -> Result<Option<UnixMs>> {
     let sql = &cat.sql;
-    // The earliest time `Catalog::due` would take a row: its `next_at`,
-    // after its lease, and after its mark's resend window when the mark
-    // is at or after `next_at`.
-    let outbox = one_time(
-        sql,
-        "SELECT min(max(next_at, \
-             CASE WHEN lease_until IS NULL THEN next_at ELSE lease_until + 1 END, \
-             CASE WHEN sent_at IS NULL OR sent_at < next_at THEN next_at \
-                  ELSE sent_at + ?1 END)) \
-           FROM outbox WHERE stage IN ('post', 'verify', 'release')",
-        &[SqlValue::Int(RESEND_MS)],
-    )?;
-    // As `gc_due(.., disposable_only = true)`: the only mode that runs.
-    let gc = one_time(
-        sql,
-        "SELECT min(gc.due_at) FROM gc WHERE gc.done_at IS NULL \
-           AND EXISTS (SELECT 1 FROM extents e JOIN buckets b ON b.id = e.bucket_id \
-                       WHERE e.id = gc.extent_id AND b.disposable = 1)",
-        &[],
-    )?;
-    let evict = if poll_once(cat.evictable_bytes())?? > 0 {
+    let mut outbox: Option<UnixMs> = None;
+    for stage in ["post", "verify", "release"] {
+        let rows = poll_once(sql.query(
+            "SELECT next_at, lease_until, sent_at FROM outbox \
+              WHERE stage = ?1 ORDER BY next_at, rowid LIMIT ?2",
+            &[
+                SqlValue::Text(stage.into()),
+                SqlValue::Int(i64::from(DUE_WINDOW)),
+            ],
+        ))??;
+        let mut last = None;
+        for r in &rows {
+            let int = |v: &SqlValue| match v {
+                SqlValue::Int(n) => Ok(Some(*n)),
+                SqlValue::Null => Ok(None),
+                _ => Err(decode("outbox")),
+            };
+            let next_at = int(&r[0])?.ok_or(decode("outbox next_at"))?;
+            // The earliest time `Catalog::due` would take it: its
+            // `next_at`, after its lease, and after its mark's resend
+            // window when the mark is at or after `next_at`.
+            let mut at = next_at;
+            if let Some(until) = int(&r[1])? {
+                at = at.max(until.saturating_add(1));
+            }
+            if let Some(sent) = int(&r[2])?.filter(|sent| *sent >= next_at) {
+                at = at.max(sent.saturating_add(RESEND_MS));
+            }
+            outbox = Some(outbox.map_or(UnixMs(at), |o| UnixMs(o.0.min(at))));
+            last = Some(next_at);
+        }
+        if rows.len() >= DUE_WINDOW as usize {
+            if let Some(last) = last {
+                outbox = Some(outbox.map_or(UnixMs(last), |o| UnixMs(o.0.min(last))));
+            }
+        }
+    }
+    // As `gc_due(.., disposable_only = true)`, the only mode that runs,
+    // and only while it runs.
+    let gc = if rules.gc {
+        one_time(
+            sql,
+            "SELECT min(g.due_at) FROM \
+               (SELECT due_at, extent_id FROM gc WHERE done_at IS NULL \
+                 ORDER BY due_at LIMIT ?1) g \
+              WHERE EXISTS (SELECT 1 FROM extents e JOIN buckets b ON b.id = e.bucket_id \
+                            WHERE e.id = g.extent_id AND b.disposable = 1)",
+            &[SqlValue::Int(i64::from(GC_WINDOW))],
+        )?
+    } else {
+        None
+    };
+    // The eviction check, while the cap is set and any byte is evictable
+    // (one row read): once per period, as tenant 0's.
+    let evict = if rules.hot_cap_bytes.is_some() && any_evictable(sql)? {
         let checked = one_time(sql, "SELECT v FROM meta WHERE k = 'hot_checked_at'", &[])?;
         Some(checked.map_or(UnixMs(0), |at| UnixMs(at.0.saturating_add(EVICT_EVERY_MS))))
     } else {
@@ -119,6 +203,17 @@ pub fn due_at<S: Sql>(cat: &SqlCatalog<S>) -> Result<Option<UnixMs>> {
     }))
 }
 
+/// Whether any extent has evictable bytes (the `extents_evictable`
+/// predicate, one row).
+fn any_evictable<S: Sql>(sql: &S) -> Result<bool> {
+    let rows = poll_once(sql.query(
+        "SELECT 1 FROM extents WHERE hot_cache_bytes > 0 \
+           OR (hot_safety_bytes > 0 AND safety_state NOT IN ('held', 'releasing')) LIMIT 1",
+        &[],
+    ))??;
+    Ok(!rows.is_empty())
+}
+
 /// What one hand-out sends.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Handout {
@@ -131,7 +226,7 @@ pub struct Handout {
 
 /// The work of a hand-out at `now` (it buries exhausted rows first, one
 /// write). See the [module](self).
-pub fn plan<S: Sql>(cat: &SqlCatalog<S>, now: UnixMs) -> Result<Handout> {
+pub fn plan<S: Sql>(cat: &SqlCatalog<S>, now: UnixMs, rules: &HandoutRules) -> Result<Handout> {
     // Buried first, so an exhausted row is not sent once more.
     poll_once(cat.bury_exhausted(MAX_ATTEMPTS, now))??;
     let due = poll_once(cat.due(now, RESEND, DISPATCH_LIMIT))??;
@@ -144,15 +239,22 @@ pub fn plan<S: Sql>(cat: &SqlCatalog<S>, now: UnixMs) -> Result<Handout> {
             stage: row.stage,
         })
         .collect();
-    if !poll_once(cat.gc_due(now, 1, true))??.is_empty() {
+    if rules.gc && !poll_once(cat.gc_due(now, 1, true))??.is_empty() {
         jobs.push(Job::Gc { v: JOB_VERSION });
     }
-    let evict_check = poll_once(cat.hot_check_due(now, EVICT_EVERY_MS))??;
-    if evict_check && poll_once(cat.evictable_bytes())?? > 0 {
-        jobs.push(Job::Evict {
-            v: JOB_VERSION,
-            remaining: 0,
-        });
+    // As tenant 0's: one total per period, and a job only above the cap.
+    let evict_check = match rules.hot_cap_bytes {
+        Some(_) => poll_once(cat.hot_check_due(now, EVICT_EVERY_MS))??,
+        None => false,
+    };
+    if evict_check {
+        let over = poll_once(cat.evictable_bytes())?? > rules.hot_cap_bytes.unwrap_or(u64::MAX);
+        if over {
+            jobs.push(Job::Evict {
+                v: JOB_VERSION,
+                remaining: 0,
+            });
+        }
     }
     Ok(Handout { jobs, evict_check })
 }

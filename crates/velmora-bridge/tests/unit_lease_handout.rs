@@ -8,13 +8,19 @@ use velmora_bridge::routing::{Lane, Shards};
 use velmora_bridge::sql::SqlCatalog;
 use velmora_bridge::testkit::RusqliteSql;
 use velmora_bridge::unit_lease::handout::{
-    binding, done, due_at, plan, route, unit_job_lane, Handout, HANDOUT_PERIOD_MS, SEND_BATCH,
+    binding, done, due_at, plan, route, unit_job_lane, Handout, HandoutRules, DUE_WINDOW,
+    HANDOUT_PERIOD_MS, SEND_BATCH,
 };
 use velmora_bridge::{
     Catalog, ExtentId, GenerationId, Job, OutboxStage, Resend, UnixMs, JOB_VERSION,
 };
 
 const NOW: UnixMs = UnixMs(1_800_000_000_000);
+/// GC on, and a cap of one byte: everything the hand-out can send.
+const ALL: HandoutRules = HandoutRules {
+    gc: true,
+    hot_cap_bytes: Some(1),
+};
 const B1: &str = "b_00000000000000e1";
 const G1: &str = "g_0019a00000000e1e1e1e1e1e1e1e1";
 const RESEND_MS: i64 = RESEND_SECS as i64 * 1000;
@@ -85,7 +91,7 @@ fn due_rows(cat: &SqlCatalog<RusqliteSql>, at: i64) -> usize {
 /// The hand-out is due exactly when `Catalog::due` would take its first
 /// row, and not a millisecond before.
 fn due_exactly(cat: &SqlCatalog<RusqliteSql>, want: i64) {
-    assert_eq!(due_at(cat).unwrap(), Some(UnixMs(want)));
+    assert_eq!(due_at(cat, &ALL).unwrap(), Some(UnixMs(want)));
     assert_eq!(due_rows(cat, want - 1), 0, "before {want}");
     assert!(due_rows(cat, want) > 0, "at {want}");
 }
@@ -97,13 +103,13 @@ fn due_exactly(cat: &SqlCatalog<RusqliteSql>, want: i64) {
 #[test]
 fn an_idle_unit_has_no_hand_out_due() {
     let cat = catalogue(2, false);
-    assert_eq!(due_at(&cat).unwrap(), None);
+    assert_eq!(due_at(&cat, &ALL).unwrap(), None);
     // Rows that no dispatcher sends (done, cancelled, dead) wait for
     // nothing.
     for (n, stage) in [(0, "done"), (1, "dead")] {
         outbox(&cat, n, stage, NOW.0);
     }
-    assert_eq!(due_at(&cat).unwrap(), None);
+    assert_eq!(due_at(&cat, &ALL).unwrap(), None);
 }
 
 /// A row's due time is its `next_at`, after its lease, and after its
@@ -143,10 +149,10 @@ fn the_earliest_work_decides_after_one_period_since_the_last_run() {
     outbox(&cat, 0, "post", NOW.0 + 9_000);
     outbox(&cat, 1, "verify", NOW.0 + 3_000);
     outbox(&cat, 2, "release", NOW.0 + 7_000);
-    assert_eq!(due_at(&cat).unwrap(), Some(UnixMs(NOW.0 + 3_000)));
+    assert_eq!(due_at(&cat, &ALL).unwrap(), Some(UnixMs(NOW.0 + 3_000)));
     block_on(cat.record_dispatch(NOW)).unwrap();
     assert_eq!(
-        due_at(&cat).unwrap(),
+        due_at(&cat, &ALL).unwrap(),
         Some(UnixMs(NOW.0 + HANDOUT_PERIOD_MS))
     );
 }
@@ -163,12 +169,12 @@ fn a_gc_row_is_due_only_where_gc_can_run() {
         NOW.0 + 4_000
     );
     exec(&cat, &gc);
-    assert_eq!(due_at(&cat).unwrap(), None);
+    assert_eq!(due_at(&cat, &ALL).unwrap(), None);
     let cat = catalogue(1, true);
     exec(&cat, &gc);
-    assert_eq!(due_at(&cat).unwrap(), Some(UnixMs(NOW.0 + 4_000)));
+    assert_eq!(due_at(&cat, &ALL).unwrap(), Some(UnixMs(NOW.0 + 4_000)));
     exec(&cat, "UPDATE gc SET done_at = 1");
-    assert_eq!(due_at(&cat).unwrap(), None);
+    assert_eq!(due_at(&cat, &ALL).unwrap(), None);
 }
 
 /// With evictable bytes the eviction check is due every
@@ -176,12 +182,16 @@ fn a_gc_row_is_due_only_where_gc_can_run() {
 #[test]
 fn the_eviction_check_is_due_while_bytes_are_evictable() {
     let cat = catalogue(1, false);
-    assert_eq!(due_at(&cat).unwrap(), None, "nothing evictable");
+    assert_eq!(due_at(&cat, &ALL).unwrap(), None, "nothing evictable");
     exec(&cat, "UPDATE extents SET hot_cache_bytes = 10");
     assert!(block_on(cat.evictable_bytes()).unwrap() > 0);
-    assert_eq!(due_at(&cat).unwrap(), Some(UnixMs(0)), "never checked");
+    assert_eq!(
+        due_at(&cat, &ALL).unwrap(),
+        Some(UnixMs(0)),
+        "never checked"
+    );
     block_on(cat.hot_checked(NOW)).unwrap();
-    assert_eq!(due_at(&cat).unwrap(), Some(UnixMs(NOW.0 + EVICT_MS)));
+    assert_eq!(due_at(&cat, &ALL).unwrap(), Some(UnixMs(NOW.0 + EVICT_MS)));
 }
 
 // ---------------------------------------------------------------------------
@@ -210,7 +220,7 @@ fn a_hand_out_sends_the_due_rows_and_buries_the_exhausted() {
             NOW.0
         ),
     );
-    let h = plan(&cat, NOW).unwrap();
+    let h = plan(&cat, NOW, &ALL).unwrap();
     let extents: Vec<&Job> = h
         .jobs
         .iter()
@@ -247,7 +257,7 @@ fn only_what_was_sent_is_marked_and_a_failed_run_is_not_recorded() {
     let cat = catalogue(2, false);
     outbox(&cat, 0, "post", NOW.0);
     outbox(&cat, 1, "post", NOW.0);
-    let h = plan(&cat, NOW).unwrap();
+    let h = plan(&cat, NOW, &ALL).unwrap();
     assert_eq!(h.jobs.len(), 2);
     let first = match &h.jobs[0] {
         Job::Extent { extent, .. } => extent.as_str().to_string(),
@@ -270,7 +280,7 @@ fn only_what_was_sent_is_marked_and_a_failed_run_is_not_recorded() {
     // The row that was not sent is due again at once.
     assert_eq!(due_rows(&cat, NOW.0 + 1), 1);
     // Every send through: the run is recorded.
-    let h = plan(&cat, UnixMs(NOW.0 + 1)).unwrap();
+    let h = plan(&cat, UnixMs(NOW.0 + 1), &ALL).unwrap();
     done(&cat, UnixMs(NOW.0 + 1), &h, &vec![true; h.jobs.len()]).unwrap();
     assert_eq!(
         block_on(cat.outbox_stats()).unwrap().last_dispatch_at,
@@ -387,4 +397,96 @@ fn an_empty_run_sends_nothing() {
     )
     .unwrap();
     assert!(out.is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// The Worker's rules, and the bounds (review: GC off, the cap, the window)
+// ---------------------------------------------------------------------------
+
+/// With `GC_MODE` off a GC row is never due and never handed out, as
+/// tenant 0's dispatcher sends none (else the unit woke every minute for
+/// ever).
+#[test]
+fn with_gc_off_a_gc_row_is_not_handed_out() {
+    let off = HandoutRules { gc: false, ..ALL };
+    let cat = catalogue(1, true);
+    exec(
+        &cat,
+        &format!(
+            "INSERT INTO gc(extent_id, action, due_at) VALUES ('{}', 'delete_cache', {})",
+            ext(0),
+            NOW.0
+        ),
+    );
+    assert_eq!(due_at(&cat, &off).unwrap(), None);
+    assert!(plan(&cat, NOW, &off).unwrap().jobs.is_empty());
+    assert_eq!(due_at(&cat, &ALL).unwrap(), Some(NOW));
+}
+
+/// An `evict` job goes out only above the cap; the check is recorded
+/// either way, and without a cap there is no check.
+#[test]
+fn evict_is_sent_only_above_the_cap() {
+    let cat = catalogue(1, false);
+    exec(&cat, "UPDATE extents SET hot_cache_bytes = 10");
+    let under = HandoutRules {
+        hot_cap_bytes: Some(10),
+        ..ALL
+    };
+    let h = plan(&cat, NOW, &under).unwrap();
+    assert!(h.evict_check);
+    assert!(!h.jobs.iter().any(|j| matches!(j, Job::Evict { .. })));
+    done(&cat, NOW, &h, &vec![true; h.jobs.len()]).unwrap();
+    assert_eq!(
+        due_at(&cat, &under).unwrap(),
+        Some(UnixMs((NOW.0 + EVICT_MS).max(NOW.0 + HANDOUT_PERIOD_MS)))
+    );
+    let over = HandoutRules {
+        hot_cap_bytes: Some(9),
+        ..ALL
+    };
+    let later = UnixMs(NOW.0 + EVICT_MS);
+    let h = plan(&cat, later, &over).unwrap();
+    assert!(h.jobs.iter().any(|j| matches!(j, Job::Evict { .. })));
+    let none = HandoutRules {
+        hot_cap_bytes: None,
+        ..ALL
+    };
+    assert_eq!(due_at(&catalogue(0, false), &none).unwrap(), None);
+    let cat = catalogue(1, false);
+    exec(&cat, "UPDATE extents SET hot_cache_bytes = 10");
+    assert_eq!(due_at(&cat, &none).unwrap(), None, "no cap, no check");
+}
+
+/// A stage with more rows than the window: the time read is never later
+/// than the row past the window, and the read stays bounded.
+#[test]
+fn the_due_time_is_bounded_and_never_late() {
+    let n = DUE_WINDOW + 50;
+    let cat = catalogue(n, false);
+    // The window is held by fresh marks; the row after it is due at once.
+    for i in 0..n {
+        let held = i < DUE_WINDOW;
+        exec(
+            &cat,
+            &format!(
+                "INSERT INTO outbox(extent_id, generation_id, stage, next_at, updated_at, sent_at) \
+                   VALUES ('{}', '{G1}', 'post', {}, 1, {})",
+                ext(i),
+                NOW.0 + i64::from(i),
+                if held {
+                    (NOW.0 + 100_000).to_string()
+                } else {
+                    "NULL".into()
+                }
+            ),
+        );
+    }
+    cat.sql.reset_read_stats();
+    let at = due_at(&cat, &ALL).unwrap().unwrap();
+    let rows = cat.sql.read_stats().rows;
+    let first_free = NOW.0 + i64::from(DUE_WINDOW);
+    assert!(at.0 <= first_free, "{at:?} after {first_free}");
+    assert!(due_rows(&cat, first_free) > 0);
+    assert!(rows <= u64::from(DUE_WINDOW) + 20, "{rows} rows read");
 }

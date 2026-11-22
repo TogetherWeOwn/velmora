@@ -1042,6 +1042,40 @@ fn the_alarm_hands_out_due_rows_and_marks_only_what_was_sent() {
     assert!(step.run.send_renew);
 }
 
+/// A tenant that is being shredded takes no job: nothing is handed out,
+/// whatever its outbox holds (review LOW 2).
+#[test]
+fn a_shredding_tenant_hands_out_nothing() {
+    let u = fresh();
+    u.sql()
+        .with_conn(|c| {
+            c.execute_batch(&format!(
+                "INSERT INTO outbox(extent_id, generation_id, stage, next_at, updated_at) \
+                   VALUES ('x_000000000000000000000000e1', 'g_0019a00000000e1e1e1e1e1e1e1e1', \
+                           'post', {}, 1)",
+                NOW.0
+            ))
+        })
+        .unwrap();
+    let at = UnixMs(NOW.0 + 1_000);
+    assert!(!u.alarm(at).unwrap().handout.jobs.is_empty());
+    let u = fresh();
+    u.sql()
+        .with_conn(|c| {
+            c.execute_batch(&format!(
+                "INSERT INTO outbox(extent_id, generation_id, stage, next_at, updated_at) \
+                   VALUES ('x_000000000000000000000000e1', 'g_0019a00000000e1e1e1e1e1e1e1e1', \
+                           'post', {}, 1); \
+                 UPDATE unit_head SET tenant_state = 'shredding'",
+                NOW.0
+            ))
+        })
+        .unwrap();
+    let step = u.alarm(at).unwrap();
+    assert!(step.handout.jobs.is_empty());
+    assert!(step.run.run.is_empty(), "{:?}", step.run);
+}
+
 /// A principal is not a key: `m/rk/` never names one, so a revoked
 /// principal must not raise the count the proof compares with.
 #[test]
