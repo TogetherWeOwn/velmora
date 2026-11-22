@@ -113,8 +113,9 @@ pub const REFUSED_RETRY_DELAY_SECS: u32 = 0;
 /// Name of the configuration switch of the writers' format.
 pub const JOB_FORMAT_VAR: &str = "JOB_FORMAT";
 
-/// The kinds (`t`) of a [`Job`], in either format. A test holds that
-/// every variant's tag is listed.
+/// The kinds (`t`) of a [`Job`], in either format. It only names a
+/// refusal (`unknown_kind` or `bad_body`): the parse alone decides what
+/// runs, so a kind missing here cannot stop a job.
 pub const JOB_KINDS: [&str; 6] = ["extent", "wake", "gc", "evict", "sweep", "recovery_copy"];
 
 /// The kinds (`t`) of a [`UnitJob`]: format 2 only. No [`Job`] kind has
@@ -488,18 +489,21 @@ pub fn read_unit_job(body: &Value) -> std::result::Result<(UnitJob, JobTenant), 
     if is_unitless_tenant(&tenant) && numbers.unit.is_some() {
         return Err(Refusal::UnitOfTenantZero);
     }
-    match fields.get("t").and_then(Value::as_str) {
-        Some(kind) if UNIT_JOB_KINDS.contains(&kind) => {}
-        _ => return Err(Refusal::UnknownKind),
-    }
     let mut rest = fields.clone();
     for name in TENANT_FIELDS {
         rest.remove(name);
     }
+    // The parse decides; the list of kinds only names the refusal.
     let job = match serde_json::from_value::<UnitBody>(Value::Object(rest)) {
         Ok(UnitBody::Renew { at, .. }) => UnitJob::Renew { at },
         Ok(UnitBody::StampRaise { at, .. }) => UnitJob::StampRaise { at },
-        Err(_) => return Err(Refusal::BadBody),
+        Err(_) => {
+            let kind = fields.get("t").and_then(Value::as_str);
+            return Err(match kind.is_some_and(|k| UNIT_JOB_KINDS.contains(&k)) {
+                true => Refusal::BadBody,
+                false => Refusal::UnknownKind,
+            });
+        }
     };
     let Some(unit) = numbers.unit else {
         return Err(Refusal::NoUnit);
@@ -718,15 +722,12 @@ fn tenant_message(
     if served.is_tenant_zero() && numbers.unit.is_some() {
         return Err(Refusal::UnitOfTenantZero);
     }
-    match fields.get("t").and_then(Value::as_str) {
-        Some(kind) if JOB_KINDS.contains(&kind) => {}
-        // A unit job of the served tenant. The served tenant is tenant
-        // 0, which has no unit, so a well-formed one is refused here
-        // too: the reader says whether it was well formed.
-        Some(kind) if UNIT_JOB_KINDS.contains(&kind) => {
-            return Err(read_unit_job(body).err().unwrap_or(Refusal::NoUnit));
-        }
-        _ => return Err(Refusal::UnknownKind),
+    let kind = fields.get("t").and_then(Value::as_str);
+    // A unit job of the served tenant. The served tenant is tenant 0,
+    // which has no unit, so a well-formed one is refused here too: the
+    // reader says whether it was well formed.
+    if kind.is_some_and(|kind| UNIT_JOB_KINDS.contains(&kind)) {
+        return Err(read_unit_job(body).err().unwrap_or(Refusal::NoUnit));
     }
     // The body without the tenant fields is a body of the current
     // version; `Job` refuses any field it does not know.
@@ -735,7 +736,14 @@ fn tenant_message(
         job.remove(name);
     }
     job.insert("v".to_string(), Value::from(JOB_VERSION));
-    let job = serde_json::from_value::<Job>(Value::Object(job)).map_err(|_| Refusal::BadBody)?;
+    // The parse decides what runs; the list of kinds only names the
+    // refusal, so a kind left out of it can never stop a job.
+    let job = serde_json::from_value::<Job>(Value::Object(job)).map_err(|_| {
+        match kind.is_some_and(|kind| JOB_KINDS.contains(&kind)) {
+            true => Refusal::BadBody,
+            false => Refusal::UnknownKind,
+        }
+    })?;
     Ok((
         job,
         JobTenant {
