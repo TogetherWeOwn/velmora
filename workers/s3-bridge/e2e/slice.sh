@@ -714,7 +714,7 @@ listed_key() {
   local after='' page
   while :; do
     page=$(adm "GET /_admin/keys" "$BASE/_admin/keys${after:+?after=$after}")
-    jq -e '(.keys | type == "array") and all(.keys[]; keys == ["access_key_id", "created_at", "grants", "status"])' >/dev/null <<<"$page" ||
+    jq -e '(.keys | type == "array") and all(.keys[]; keys == ["access_key_id", "created_at", "grants", "kind", "status"])' >/dev/null <<<"$page" ||
       fail "GET /_admin/keys" "a key list without a secret" "fields: $(jq -c '[.keys[0] | keys?]' <<<"$page" 2>&1)"
     if jq -e --arg id "$1" '.keys | map(select(.access_key_id == $id)) | length > 0' >/dev/null <<<"$page"; then
       jq -c --arg id "$1" '.keys[] | select(.access_key_id == $id)' <<<"$page"
@@ -726,7 +726,7 @@ listed_key() {
 }
 json=$(listed_key "$RK_ID") || fail "GET /_admin/keys" "the second key listed" "absent"
 jcheck "the second key is listed as read-only on $SB" \
-  "(.grants == [{\"bucket\": \"$SB\", \"perm\": \"ro\"}]) and .status == \"active\" and (.created_at | type == \"number\")" "$json"
+  "(.grants == [{\"bucket\": \"$SB\", \"perm\": \"ro\"}]) and .status == \"active\" and .kind == \"s3\" and (.created_at | type == \"number\")" "$json"
 code=$(adm_code -X DELETE "$BASE/_admin/keys/$RK_ID")
 [[ $code == 204 ]] || fail "DELETE /_admin/keys/<second key>" "HTTP 204" "HTTP $code $(<"$T/adm.out")"
 # Refused on the very next request: signed, and the URL presigned before.

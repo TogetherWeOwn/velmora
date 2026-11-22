@@ -340,6 +340,9 @@ jobs:
       - name: Test the wasm section stripper
         working-directory: workers/s3-bridge
         run: python3 -I tools/test_strip_wasm.py
+      - name: Test the entry module (entry.mjs)
+        working-directory: workers/s3-bridge
+        run: node --test test/*.test.mjs
       # The script of the deploy job's "Generate the production wrangler
       # config" step, taken from this file and run on the shipped
       # wrangler.toml with made-up values. No credential, no network.
