@@ -10,6 +10,9 @@
 //! - [`chain`]: the chain `m/t/<tenant>/<seq>` in R2, its head, its reader
 //!   and its put-once writer, over two ports (a record store with
 //!   put-if-absent, and the two-part control seal);
+//! - [`seal`]: the real control seal of the chain over key scheme 2
+//!   ([`seal::ChainSeal`]), with the tenant keys the composition root
+//!   loaded ([`seal::SealKeys`]);
 //! - [`store`]: the directory database (`migrations-directory/`): tenant
 //!   rows copied from chain heads, unit rows, key routes, pending
 //!   operations and the gate;
@@ -31,6 +34,7 @@ pub mod fence;
 pub mod gate;
 pub mod port;
 pub mod record;
+pub mod seal;
 pub mod store;
 pub mod tenant_zero;
 pub mod transition;
