@@ -134,7 +134,7 @@ fn born() -> Unit<RusqliteSql> {
     u.sql()
         .apply(&format!(
             "INSERT INTO buckets(id, name, owner, bdk_wrapped, kek_version, created_at) \
-               VALUES ('{B1}', 'alpha', 'o', x'00', 1, 1); \
+               VALUES ('{B1}', 'alpha', 'o', x'02', 1, 1); \
              INSERT INTO generations(id, bucket_id, key, state, size, etag, content_json, \
                user_meta_json, extent_count, created_at) \
                VALUES ('g_0019a00000000e1e1e1e1e1e1e1e1', '{B1}', 'k', 'live', 20, \
