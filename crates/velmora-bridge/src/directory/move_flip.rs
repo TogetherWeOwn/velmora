@@ -521,7 +521,13 @@ where
         let gave_up =
             give_up_after_v9(chain, frozen, safety, dir, unit, routes, keys, window, now).await;
         return match (recorded, gave_up) {
-            (false, Err(FlipError::V9GiveUp(e))) => Err(FlipError::V9Unrecorded(e)),
+            // Unrecorded only while the window is still open: once tenant
+            // 0's `d1` record landed, a re-run of step 8 only finishes the
+            // give-up.
+            (false, Err(FlipError::V9GiveUp(e))) => match window_state(chain, window).await {
+                Ok(WindowState::Open(_)) | Err(_) => Err(FlipError::V9Unrecorded(e)),
+                Ok(_) => Err(FlipError::V9GiveUp(e)),
+            },
             (_, r) => r,
         };
     }

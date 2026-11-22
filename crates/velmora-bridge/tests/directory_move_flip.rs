@@ -2163,8 +2163,52 @@ fn an_unrecorded_v9_failure_says_so() {
         let m = window().await;
         m.unit.v9_ok.set(false);
         m.receipt.fail.set(99);
+        // A give-up stopping after tenant 0's d1 record: not unrecorded.
         m.keys.fail_grants.set(1);
         let r = m.flip().await;
+        assert!(matches!(r, Err(FlipError::V9GiveUp(_))), "{r:?}");
+        // One stopping before it (the unit cannot be closed again): the
+        // window is still open, and the error says the failure is not
+        // recorded.
+        let m = window().await;
+        m.unit.v9_ok.set(false);
+        m.receipt.fail.set(99);
+        // Every put of tenant 0's record is taken first by another writer.
+        let zero_prefix = "m/t/t_0000000000000000/".to_string();
+        m.store.before_put(move |key, objects| {
+            if key.starts_with(&zero_prefix) {
+                objects.insert(key.to_string(), b"other".to_vec());
+            }
+        });
+        let r = m.flip().await;
         assert!(matches!(r, Err(FlipError::V9Unrecorded(_))), "{r:?}");
+        assert_eq!(m.unit.v9_runs.get(), 1);
+    });
+}
+
+/// AM-45: a head that keeps moving is bounded; the last refusal comes
+/// back for the receipt.
+#[test]
+fn a_head_that_keeps_moving_is_bounded() {
+    block_on(async {
+        let m = window().await;
+        *m.unit.grow_keys.borrow_mut() = Some(Rc::clone(&m.keys.chain));
+        m.unit.lift_answers.borrow_mut().extend(std::iter::repeat_n(
+            UnitRefused::Gate(GateRefusal::CountersOff),
+            40,
+        ));
+        let r = m.flip().await;
+        assert!(
+            matches!(
+                r,
+                Err(FlipError::SyncRefused(UnitRefused::Gate(
+                    GateRefusal::CountersOff
+                )))
+            ),
+            "{r:?}"
+        );
+        assert_eq!(m.unit.recounts.get(), 16);
+        assert!(m.routes.records.borrow().is_empty());
+        assert_eq!(m.selector().await, Selector::Moving);
     });
 }

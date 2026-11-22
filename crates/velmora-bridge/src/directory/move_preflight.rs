@@ -416,7 +416,11 @@ pub fn p12(zero: &TenantDoor, owner_head: &TenantDoor, unit: u32, view: &UnitVie
             // lifted and given up (V9) never raised `flips`, so its seal is
             // `flips + 1`; a move that flipped (and was undone) sealed at
             // or below `flips`. A later move into another tenant that gave
-            // up clears `move` and leaves the undo copy here.
+            // up clears `move` and leaves the undo copy here. After a later
+            // flip into another tenant a lifted give-up's seal falls at or
+            // below `flips` too and is answered as the undo copy: the
+            // cautious answer (the owner is asked for G6; nothing is
+            // emptied without it).
             let given_up_seal = z.flips.checked_add(1);
             let flipped_seal = state.sealed.is_some_and(|s| s <= z.flips);
             match (state.move_lifted, &z.moved) {
