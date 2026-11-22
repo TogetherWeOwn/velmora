@@ -2970,6 +2970,8 @@ fn the_move_floor_only_rises() {
         Actor::MoveTool,
     );
     apply(&owner, floor(&undone, 0, 10), Actor::MoveTool);
+    // A later move into another tenant: this tenant's exit (an undo's day
+    // 30, a give-up finished late) still raises its floor (review b1 r1).
     let mut elsewhere = moving.clone();
     if let Some(m) = elsewhere
         .door
@@ -2979,10 +2981,19 @@ fn the_move_floor_only_rises() {
     {
         m.to = Tenant::parse("t_00000000000000b2").unwrap();
     }
-    assert_eq!(
-        refused(&owner, floor(&elsewhere, 0, 10), Actor::MoveTool),
-        NOT_MOVING_HERE
-    );
+    apply(&owner, floor(&elsewhere, 0, 10), Actor::MoveTool);
+    apply(&owner, floor(&elsewhere, 0, 10), Actor::RestoreTool);
+    let mut flipped_elsewhere = flipped.clone();
+    if let Some(m) = flipped_elsewhere
+        .door
+        .tenant_zero
+        .as_mut()
+        .and_then(|z| z.moved.as_mut())
+    {
+        m.to = Tenant::parse("t_00000000000000b2").unwrap();
+    }
+    apply(&owner, floor(&flipped_elsewhere, 0, 10), Actor::RestoreTool);
+    // A head that is not tenant 0's.
     assert_eq!(
         refused(&owner, floor(&owner, 0, 10), Actor::MoveTool),
         NOT_MOVING_HERE
