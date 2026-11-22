@@ -449,7 +449,7 @@ impl Binding {
 }
 
 /// An id as the key chain names a subject or a bucket.
-fn valid_id(id: &str) -> bool {
+pub(crate) fn valid_id(id: &str) -> bool {
     (1..=128).contains(&id.len()) && id.bytes().all(|b| b.is_ascii_graphic())
 }
 
@@ -462,7 +462,7 @@ pub fn valid_owner_ref(r: &str) -> bool {
 
 /// An S3 bucket name as the catalogue holds one: 3 to 63 of
 /// `[a-z0-9.-]`, a letter or digit at each end.
-fn valid_bucket_name(n: &str) -> bool {
+pub(crate) fn valid_bucket_name(n: &str) -> bool {
     let b = n.as_bytes();
     (3..=63).contains(&b.len())
         && b.iter()

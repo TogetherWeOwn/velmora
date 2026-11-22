@@ -241,6 +241,55 @@ as `account_problem`. The Worker answers the contract's code for the
 tenant's state (`409 tenant_read_only` or `409 tenant_unavailable`),
 never `403`. The other reservation calls run in any state.
 
+## Buckets
+
+A managed tenant's bucket rows come only from its tenant chain (AM-57;
+`unit::buckets`). The Worker's `sync` carries, besides the head's numbers
+and state, every bucket change of the tenant records it moves past, for
+buckets placed on this unit, in seq order: `created{seq, bucket_id,
+grant_seq, creator, name, bdk_wrapped, tk_version, written_at}`,
+`dropped{seq, bucket_id}` and `unplaced{seq, buckets}`, and the list of
+bucket ids the head places on this unit. `name` and `bdk_wrapped` come
+from the record's private part. In the `sync`'s transaction the unit:
+
+1. makes each created bucket's row (`created_at` = the record's
+   `written_at`) and turns the reservation bound to `grant_seq`, if one
+   is left, `applied` (no answer is kept: the Worker builds it from the
+   chain). A row with the same id and name changes nothing; another name
+   for the id, or the name for another id, refuses the `sync`
+   (`created_conflict`, alarm). A row of the other key scheme is refused
+   by the scheme triggers;
+2. drops each dropped bucket's row (its grants first) if it is closing
+   and holds nothing. A row that is not closing is marked closing first;
+   one that still holds something is kept closing with the record's seq,
+   the rest of the `sync` applies, and the answer names it for the
+   operator's page (`drop_not_closed`). No object is deleted for it;
+3. for `unplaced`, removes nothing while the unit's `restoring` entry is
+   set, and otherwise drops those rows as in 2;
+4. checks that its bucket rows, less the closing rows a `dropped` or
+   `unplaced` named, equal the head's list, only while the `restoring`
+   entry is not set and in the `sync` that clears it. A difference
+   refuses the whole `sync` (`placements_off`, alarm); the Worker reads
+   the chain again and sends it once more, and the same refusal again
+   stops and pages.
+
+"Holds nothing" is the catalogue's rule for a bucket delete: no
+generation, object, key floor, upload or extent names the bucket. That
+is stricter than "no object and no open upload": a bucket whose deleted
+objects still wait for the collector stays closing until they are gone,
+so no row that names data on the backbone loses its bucket and BDK.
+
+Bucket delete is close, then record, then drop. `bucket_close(bucket_id)`
+(a Worker call, in an active tenant) answers `bucket_not_empty` if the
+bucket holds anything and `bucket_not_found` if the unit has no such
+row; otherwise it marks the bucket closing (once), and every write into
+it answers `NoSuchBucket` from then on (`buckets::is_closing`, for the
+request path). Then the `DropBucket` record, then `sync`. A closing
+bucket whose record never came stays closed and empty, and its name
+taken, until a delete retry completes it. The `sync` arm that carries
+the changes, and the stamp raise after `bucket_close` (AM-48), are the
+Worker's (L2).
+
 ## Key scheme
 
 The key scheme follows the tenant (rule 13): tenant 0 is scheme 1, every

@@ -34,6 +34,7 @@ use base64::Engine as _;
 use serde_json::{json, Value};
 
 use super::birth::{check_token, BirthKind, BirthToken, ProvisionRefusal};
+use super::buckets;
 use super::call::{
     Closed, HoldMode, Reader, Refused, SyncHead, TenantState, UnitAnswer, UnitCall, UnitOp,
 };
@@ -717,7 +718,8 @@ impl<S: UnitSql> Unit<S> {
             | UnitOp::Release { .. }
             | UnitOp::BindBucket { .. }
             | UnitOp::ReleaseBound { .. }
-            | UnitOp::BucketBinding { .. } => {
+            | UnitOp::BucketBinding { .. }
+            | UnitOp::BucketClose { .. } => {
                 Err(BridgeError::Invalid("worker call routed as an operation"))
             }
         }
@@ -1117,6 +1119,22 @@ impl<S: UnitSql> Unit<S> {
             seqs: head.seqs,
             body,
         };
+        if let UnitOp::BucketClose { bucket_id } = &call.op {
+            // A write: an active tenant only (a hold or a deletion refuses
+            // it, as any opening write).
+            if !allows(head, false) {
+                return Ok(refused(Refused::AccountProblem, false));
+            }
+            let mut op = || {
+                Ok(buckets::close(sql, bucket_id, now)?
+                    .map(|newly| json!({ "closing": true, "newly": newly }))
+                    .map_err(Refused::Buckets))
+            };
+            return Ok(match transact(sql, true, &mut op)? {
+                Ok(body) => ok(body),
+                Err(reason) => refused(reason, false),
+            });
+        }
         if let UnitOp::ResolveActing { acting } = &call.op {
             // Read-only: run as an unauthenticated transaction, so a write
             // in it is refused and rolled back.

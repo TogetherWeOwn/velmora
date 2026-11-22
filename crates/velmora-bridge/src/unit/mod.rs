@@ -25,6 +25,7 @@
 //! Nothing here holds a key or reaches the network (rules 3 and 4).
 
 pub mod birth;
+pub mod buckets;
 pub mod call;
 pub mod export;
 pub mod gate;

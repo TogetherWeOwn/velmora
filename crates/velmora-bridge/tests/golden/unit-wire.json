@@ -164,6 +164,13 @@
       "reason": {
         "size": "too_many_extents"
       }
+    },
+    {
+      "alarm": false,
+      "answer": "refused",
+      "reason": {
+        "buckets": "not_empty"
+      }
     }
   ],
   "calls": [
@@ -974,6 +981,23 @@
     },
     {
       "authenticated": true,
+      "kind": "worker",
+      "listed": true,
+      "name": {
+        "tenant": "t_00000000000000f1",
+        "unit": 0
+      },
+      "op": {
+        "bucket_id": "b_00000000000000f1",
+        "op": "bucket_close"
+      },
+      "seqs": {
+        "keys_seq": 3,
+        "state_seq": 7
+      }
+    },
+    {
+      "authenticated": true,
       "kind": "job",
       "listed": true,
       "name": {
@@ -1099,6 +1123,38 @@
     "birth_kind": [
       "birth",
       "restore"
+    ],
+    "bucket_change": [
+      {
+        "bdk_wrapped": "Agc=",
+        "bucket_id": "b_00000000000000f1",
+        "change": "created",
+        "creator": "p_1",
+        "grant_seq": 4,
+        "name": "golden",
+        "seq": 8,
+        "tk_version": 1,
+        "written_at": 5
+      },
+      {
+        "bucket_id": "b_00000000000000f1",
+        "change": "dropped",
+        "seq": 9
+      },
+      {
+        "buckets": [
+          "b_00000000000000f2"
+        ],
+        "change": "unplaced",
+        "seq": 10
+      }
+    ],
+    "bucket_refusal": [
+      "not_empty",
+      "not_found",
+      "placements_off",
+      "created_conflict",
+      "malformed"
     ],
     "call_kind": [
       "request",

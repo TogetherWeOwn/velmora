@@ -1563,6 +1563,59 @@ fn a_bucket_name_is_held_by_one_call_and_never_by_an_existing_bucket() {
     ok(worker(&u, bucket(3, 3, "beta")));
 }
 
+/// AM-57: the `created` change a `sync` carries makes the bucket's row
+/// and turns the reservation bound to its creator grant `applied`; one
+/// whose reservation is gone still makes its row.
+#[test]
+fn a_created_bucket_record_applies_its_bound_reservation() {
+    use velmora_bridge::unit::buckets::{self, BucketChange};
+    let u = ready();
+    ok(worker(&u, bucket(1, 1, "beta")));
+    ok(worker(
+        &u,
+        UnitOp::BindBucket {
+            rid: rid(1),
+            expected: None,
+            grant_seq: 4,
+        },
+    ));
+    let created = |seq, id: &str, name: &str, grant_seq| BucketChange::Created {
+        seq,
+        bucket_id: id.into(),
+        grant_seq,
+        creator: P.into(),
+        name: name.into(),
+        bdk_wrapped: vec![0x02, 1],
+        tk_version: 1,
+        written_at: 9,
+    };
+    let done = buckets::apply(
+        u.sql(),
+        &[created(5, "b_00000000000000f3", "beta", 4)],
+        false,
+        NOW,
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!((done.created, done.reserved), (1, 1));
+    assert_eq!(
+        ok(worker(&u, UnitOp::BucketBinding { grant_seq: 4 })),
+        json!({ "binding": "created", "bucket": "b_00000000000000f3" })
+    );
+    let replay = ok(worker(&u, bucket(1, 1, "beta")));
+    assert_eq!(replay["applied"]["bucket"], json!("b_00000000000000f3"));
+    // No reservation left for seq 7: the row is made all the same.
+    let done = buckets::apply(
+        u.sql(),
+        &[created(6, "b_00000000000000f4", "delta", 7)],
+        false,
+        NOW,
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!((done.created, done.reserved), (1, 0));
+}
+
 #[test]
 fn a_bucket_reservation_binds_once_and_the_finisher_fences_an_unbound_grant() {
     let u = ready();

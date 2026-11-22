@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::birth::{BirthToken, ProvisionRefusal};
+use super::buckets::BucketRefusal;
 use super::export::{ExportMode, ExportRefusal, ExportTable};
 use super::identity::{CallKind, Refusal, Seqs};
 use super::import::{ImportBatch, ImportCount, ImportRefusal, ImportValue, MoveHead};
@@ -286,6 +287,11 @@ pub enum UnitOp {
     /// What the reservations say of the creator grant `grant_seq`; an
     /// answer of none fences it. A Worker call.
     BucketBinding { grant_seq: u64 },
+    /// Bucket delete's first step (ADR §6.2, AM-57): `bucket_not_empty`
+    /// if the bucket holds anything, otherwise it is marked closing and
+    /// every write into it answers `NoSuchBucket`. Then the `DropBucket`
+    /// record, then `sync`. A Worker call, on an open unit.
+    BucketClose { bucket_id: String },
     /// One catalogue method of the job path (W2-jobs). A `job` call:
     /// the job's numbers must equal the unit's, and it is
     /// `authenticated`.
@@ -346,6 +352,7 @@ impl UnitOp {
                 | UnitOp::BindBucket { .. }
                 | UnitOp::ReleaseBound { .. }
                 | UnitOp::BucketBinding { .. }
+                | UnitOp::BucketClose { .. }
         )
     }
 
@@ -359,6 +366,7 @@ impl UnitOp {
                 | UnitOp::BindBucket { .. }
                 | UnitOp::ReleaseBound { .. }
                 | UnitOp::BucketBinding { .. }
+                | UnitOp::BucketClose { .. }
         )
     }
 
@@ -434,6 +442,8 @@ pub enum Refused {
     Reserve(ReserveRefusal),
     /// The size guard refused a call that adds extents (ADR §2.6).
     Size(SizeRefusal),
+    /// A bucket call, or a `sync`'s bucket part, was refused (AM-57).
+    Buckets(BucketRefusal),
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

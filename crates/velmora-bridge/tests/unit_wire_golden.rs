@@ -12,6 +12,7 @@
 //! To write the file after a deliberate change: `UNIT_WIRE_GOLDEN=write`.
 
 use serde_json::{json, Value};
+use velmora_bridge::unit::buckets::{BucketChange, BucketRefusal};
 use velmora_bridge::unit::call::{Closed, HoldMode};
 use velmora_bridge::unit::export::{ExportMode, ExportRefusal, ExportTable, KeyTable};
 use velmora_bridge::unit::identity::Refusal as IdentityRefusal;
@@ -99,6 +100,7 @@ fn op_kind(op: &UnitOp) -> &'static str {
         UnitOp::BindBucket { .. } => "bind_bucket",
         UnitOp::ReleaseBound { .. } => "release_bound",
         UnitOp::BucketBinding { .. } => "bucket_binding",
+        UnitOp::BucketClose { .. } => "bucket_close",
         UnitOp::Job { .. } => "job",
         UnitOp::ReadPlan { .. } => "read_plan",
     }
@@ -140,6 +142,7 @@ fn refused_kind(r: &Refused) -> &'static str {
         Refused::Recount(_) => "recount",
         Refused::Reserve(_) => "reserve",
         Refused::Size(_) => "size",
+        Refused::Buckets(_) => "buckets",
     }
 }
 
@@ -399,6 +402,9 @@ fn ops() -> Vec<UnitOp> {
             bound: Some(4),
         },
         UnitOp::BucketBinding { grant_seq: 4 },
+        UnitOp::BucketClose {
+            bucket_id: "b_00000000000000f1".into(),
+        },
         UnitOp::Job {
             call: JobCall::claim {
                 extent: ExtentId::new("x_000000000000000000000000f1"),
@@ -500,6 +506,31 @@ fn nested() -> Value {
             BucketAlreadyExists, PrincipalExists, Conflict, InternalKeyRefused, NotFound, BucketNotFound, RidTaken,
             Malformed),
         "size_refusal": every!(SizeRefusal: DatabaseFull, TooManyExtents),
+        "bucket_refusal": every!(BucketRefusal: NotEmpty, NotFound, PlacementsOff,
+            CreatedConflict, Malformed),
+        // AM-57: the bucket changes a `sync` carries (the `sync` arm is
+        // L2's; the form is pinned here).
+        "bucket_change": serde_json::to_value(vec![
+            BucketChange::Created {
+                seq: 8,
+                bucket_id: "b_00000000000000f1".into(),
+                grant_seq: 4,
+                creator: "p_1".into(),
+                name: "golden".into(),
+                bdk_wrapped: vec![2, 7],
+                tk_version: 1,
+                written_at: 5,
+            },
+            BucketChange::Dropped {
+                seq: 9,
+                bucket_id: "b_00000000000000f1".into(),
+            },
+            BucketChange::Unplaced {
+                seq: 10,
+                buckets: vec!["b_00000000000000f2".into()],
+            },
+        ])
+        .unwrap(),
         "reservation_bodies": reservation_bodies(),
     })
 }
@@ -524,6 +555,7 @@ fn refusals() -> Vec<Refused> {
         Refused::Recount(RecountRefusal::ImportNotSealed),
         Refused::Reserve(ReserveRefusal::GrantLimitsNotServed),
         Refused::Size(SizeRefusal::TooManyExtents),
+        Refused::Buckets(BucketRefusal::NotEmpty),
     ]
 }
 
@@ -665,7 +697,7 @@ fn document() -> Value {
 #[test]
 fn every_variant_has_a_sample() {
     let ops: std::collections::BTreeSet<_> = ops().iter().map(op_kind).collect();
-    assert_eq!(ops.len(), 27, "{ops:?}");
+    assert_eq!(ops.len(), 28, "{ops:?}");
     let readers: std::collections::BTreeSet<_> = ops_readers().into_iter().collect();
     assert_eq!(readers.len(), 2, "both readers have a sample");
     // The variants that carry data, each with a sample (exhaustive).
@@ -697,7 +729,7 @@ fn every_variant_has_a_sample() {
     let answers: std::collections::BTreeSet<_> = answers().iter().map(answer_kind).collect();
     assert_eq!(answers.len(), 9, "{answers:?}");
     let reasons: std::collections::BTreeSet<_> = refusals().iter().map(refused_kind).collect();
-    assert_eq!(reasons.len(), 18, "{reasons:?}");
+    assert_eq!(reasons.len(), 19, "{reasons:?}");
 }
 
 #[test]
