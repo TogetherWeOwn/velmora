@@ -24,7 +24,7 @@ mod shadow;
 pub use crate::meter::{Tally, WriteOp, WriteReport};
 use crate::ports::{
     BlobMeta, BlobStore, Catalog, Clock, Guard, JobSink, Kek, PublishOutcome, Row, Sql, SqlValue,
-    UploadTarget, MAX_QUEUE_DELAY_SECS, MAX_SQL_PARAMS, MAX_SQL_VALUE_BYTES,
+    UploadTarget, MAX_QUEUE_DELAY_SECS, MAX_SQL_INT, MAX_SQL_PARAMS, MAX_SQL_VALUE_BYTES,
 };
 use crate::recovery::{is_protected_key, tombstone_id, Recorded, Unpublished, ERR_RECORD_DELETE};
 use crate::types::{
@@ -133,6 +133,10 @@ pub struct RusqliteSql {
     /// The twin in workerd, when `VELMORA_SQL_SHADOW` is set
     /// (`testkit_shadow.rs`).
     shadow: Option<Shadow>,
+    /// The virtual-machine steps of the statements run through
+    /// [`Sql::exec`] and [`Sql::batch`] since the last reset, those of a
+    /// refused batch included.
+    write_steps: Cell<u64>,
 }
 
 /// The cost of the statements run through [`Sql::query`]: how many (one
@@ -198,20 +202,42 @@ fn check_params(params: &[SqlValue]) -> Result<()> {
             "bound value too large: {n} > {MAX_SQL_VALUE_BYTES}"
         )));
     }
+    // And an integer that a JS number does not hold exactly.
+    let unsafe_int =
+        |v: &SqlValue| matches!(v, SqlValue::Int(i) if !(-MAX_SQL_INT..=MAX_SQL_INT).contains(i));
+    if params.iter().any(unsafe_int) {
+        return Err(BridgeError::Sql("integer outside JS safe range".into()));
+    }
     Ok(())
 }
 
 /// Steps one statement to completion like D1 `run()`: `RETURNING` and
 /// `SELECT` are accepted and their rows discarded. Returns rows changed.
-fn run_to_completion(conn: &Connection, sql: &str, params: &[SqlValue]) -> Result<u64> {
+fn run_to_completion(
+    conn: &Connection,
+    sql: &str,
+    params: &[SqlValue],
+    steps: &Cell<u64>,
+) -> Result<u64> {
     check_params(params)?;
     let before = conn.total_changes();
     let mut stmt = conn.prepare(sql).map_err(map_err)?;
     let mut rows = stmt
         .query(params_from_iter(params.iter().map(to_value)))
         .map_err(map_err)?;
-    while rows.next().map_err(map_err)?.is_some() {}
+    let mut done = Ok(());
+    while done.is_ok() {
+        match rows.next() {
+            Ok(Some(_)) => {}
+            Ok(None) => break,
+            Err(e) => done = Err(map_err(e)),
+        }
+    }
     drop(rows);
+    // A statement that failed spent its steps too.
+    let spent = u64::try_from(stmt.get_status(StatementStatus::VmStep)).unwrap_or(0);
+    steps.set(steps.get() + spent);
+    done?;
     Ok(conn.total_changes().saturating_sub(before))
 }
 
@@ -226,6 +252,7 @@ impl RusqliteSql {
             meter: RefCell::new(None),
             reads: Cell::new(ReadStats::default()),
             shadow: Shadow::from_env(),
+            write_steps: Cell::new(0),
         })
     }
 
@@ -236,6 +263,17 @@ impl RusqliteSql {
 
     pub fn reset_read_stats(&self) {
         self.reads.set(ReadStats::default());
+    }
+
+    /// The virtual-machine steps `exec` and `batch` have spent since the
+    /// last [`Self::reset_write_steps`]. They grow with the rows a
+    /// statement has to visit, a guard that only reads included.
+    pub fn write_steps(&self) -> u64 {
+        self.write_steps.get()
+    }
+
+    pub fn reset_write_steps(&self) {
+        self.write_steps.set(0);
     }
 
     /// Starts counting rows written as D1 bills them (see
@@ -328,6 +366,29 @@ impl RusqliteSql {
         }
     }
 
+    /// Rebuilds the workerd twin's object from this database now, if
+    /// there is a twin: the object is emptied (`deleteAll`) and the copy
+    /// written, so its connection's counters restart, as after workerd
+    /// evicts an idle object. Answers the object's `total_changes()`
+    /// after it; `None` without a twin, with one that stopped, or when
+    /// this database's state breaks a foreign key (the twin is then
+    /// rebuilt at the next whole state).
+    pub fn restart_twin(&self) -> Option<i64> {
+        let shadow = self.shadow.as_ref()?;
+        shadow.mark_dirty();
+        shadow
+            .ready(&self.conn.borrow())
+            .then(|| shadow.object_total_changes())
+    }
+
+    /// The workerd twin's own `total_changes()`, if there is a twin.
+    pub fn twin_total_changes(&self) -> Option<i64> {
+        let shadow = self.shadow.as_ref()?;
+        shadow
+            .ready(&self.conn.borrow())
+            .then(|| shadow.object_total_changes())
+    }
+
     /// Direct access for assertions. A change made here bypasses the
     /// port, so a workerd twin is rebuilt from this database before the
     /// next call.
@@ -395,7 +456,7 @@ impl RusqliteSql {
         if let Some(m) = meter.as_mut() {
             m.discard();
         }
-        let changed = match run_to_completion(&conn, sql, params) {
+        let changed = match run_to_completion(&conn, sql, params, &self.write_steps) {
             Ok(n) => n,
             Err(e) => {
                 if let Some(m) = meter.as_mut() {
@@ -428,7 +489,7 @@ impl RusqliteSql {
         for (sql, params) in stmts {
             // On error `tx` drops here, which rolls back; nothing of the
             // batch was written, so nothing of it is metered.
-            match run_to_completion(&tx, sql, params) {
+            match run_to_completion(&tx, sql, params, &self.write_steps) {
                 Ok(n) => changed.push(n),
                 Err(e) => {
                     if let Some(m) = meter.as_mut() {
@@ -454,9 +515,11 @@ impl RusqliteSql {
 impl Sql for RusqliteSql {
     async fn query(&self, sql: &str, params: &[SqlValue]) -> Result<Vec<Row>> {
         let twin = self.twin_ready();
+        let before = self.conn.borrow().total_changes();
         let local = self.query_local(sql, params);
+        let changed = self.conn.borrow().total_changes().saturating_sub(before);
         match (twin, &self.shadow) {
-            (true, Some(shadow)) => shadow.query(sql, params, local),
+            (true, Some(shadow)) => shadow.query(sql, params, local, changed),
             _ => local,
         }
     }

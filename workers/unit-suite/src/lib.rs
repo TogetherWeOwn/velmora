@@ -7,7 +7,9 @@
 //! a fresh one.
 //!
 //! The body is JSON: `{"op":"apply","script":…}`,
-//! `{"op":"query"|"exec","sql":…,"params":[…]}` or
+//! `{"op":"query"|"exec","sql":…,"params":[…]}` (a `query` with
+//! `"changed":true` answers `{"rows":…,"changed":<n>}`, the rows the
+//! statement changed, measured in the request) or
 //! `{"op":"batch","stmts":[[sql,[…]],…]}`, or `{"op":"rebuild",
 //! "stmts":…}`: the object is emptied (`deleteAll`) and the statements
 //! run as one batch with foreign keys checked at its end (a copy of the
@@ -134,6 +136,16 @@ impl SuiteDb {
         })
     }
 
+    async fn total_changes(&self) -> velmora_bridge::Result<i64> {
+        match self.sql.query("SELECT total_changes()", &[]).await?.first() {
+            Some(row) => match row.first() {
+                Some(SqlValue::Int(n)) => Ok(*n),
+                _ => Err(BridgeError::Sql("suite: total_changes".into())),
+            },
+            None => Err(BridgeError::Sql("suite: total_changes".into())),
+        }
+    }
+
     async fn run(&self, body: &Value) -> velmora_bridge::Result<Option<Value>> {
         let text = |k: &str| body.get(k).and_then(Value::as_str);
         Ok(Some(match text("op") {
@@ -148,7 +160,16 @@ impl SuiteDb {
                 let (Some(sql), Some(params)) = (text("sql"), params(body.get("params"))) else {
                     return Ok(None);
                 };
-                encode_rows(&self.sql.query(sql, &params).await?)
+                if body.get("changed").and_then(Value::as_bool) != Some(true) {
+                    return Ok(Some(encode_rows(&self.sql.query(sql, &params).await?)));
+                }
+                // The rows the statement changed (a `RETURNING`, a
+                // trigger), measured inside this one request: the
+                // connection's counter cannot restart in between.
+                let before = self.total_changes().await?;
+                let rows = self.sql.query(sql, &params).await?;
+                let changed = self.total_changes().await? - before;
+                json!({ "rows": encode_rows(&rows), "changed": changed })
             }
             Some("exec") => {
                 let (Some(sql), Some(params)) = (text("sql"), params(body.get("params"))) else {

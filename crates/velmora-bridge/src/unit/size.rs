@@ -29,6 +29,11 @@ use crate::types::{BridgeError, Result};
 pub const GUARD_BYTES: u64 = 8_000_000_000;
 /// The guard's extent count (ADR §2.6: 3.4 M at 2,378 B an extent).
 pub const GUARD_EXTENTS: u64 = 3_400_000;
+/// The hard ceiling (est), between the guard and the platform's 10 GB:
+/// above it no request call that adds a row runs, not even a delete's
+/// floor or a smaller overwrite, so `SQLITE_FULL` is never reached and
+/// the calls that free space (GC, aborts, settles) still run.
+pub const HARD_BYTES: u64 = 9_000_000_000;
 
 /// Where the guard stands. Tests lower it (ADR §8.2: "tested in W2
 /// against a lowered limit").
@@ -36,6 +41,8 @@ pub const GUARD_EXTENTS: u64 = 3_400_000;
 pub struct SizeLimits {
     pub bytes: u64,
     pub extents: u64,
+    /// [`HARD_BYTES`].
+    pub hard_bytes: u64,
 }
 
 impl Default for SizeLimits {
@@ -43,6 +50,7 @@ impl Default for SizeLimits {
         SizeLimits {
             bytes: GUARD_BYTES,
             extents: GUARD_EXTENTS,
+            hard_bytes: HARD_BYTES,
         }
     }
 }

@@ -64,7 +64,7 @@ use crate::types::{BridgeError, Result, UnixMs};
 use crate::unit::call::HoldMode;
 use crate::unit::identity::Refusal;
 use crate::unit::jobcall::JobCall;
-use crate::unit::keys::{KeptAnswer, KeyEntry, MAX_ENTRIES};
+use crate::unit::keys::{ApplyEntry, KeptAnswer, MAX_ENTRIES};
 use crate::unit::{
     CallKind, Refused, Seqs, SyncHead, TenantId, TenantState, UnitAnswer, UnitCall, UnitName,
     UnitOp, UnitReply,
@@ -112,9 +112,24 @@ pub trait TenantHeads {
 /// form the unit applies them (L4's reader and apply feed, AM-12).
 #[allow(async_fn_in_trait)]
 pub trait KeyFeed {
-    /// The records of `m/k/<tenant>/` after `after`, one entry per record
-    /// in chain order, up to the chain's head.
-    async fn after(&self, tenant: &TenantId, after: u64) -> Result<KeyBatch>;
+    /// `acked` of AM-71: the directory's `keys_seq` for the tenant, read
+    /// once per sync before the entries. A failed read is 0; with
+    /// `DIRECTORY` unbound, `u64::MAX`.
+    async fn acked(&self, tenant: &TenantId) -> u64;
+    /// The records of `m/k/<tenant>/` after `after`, one item per record
+    /// in chain order, up to the chain's head, as a store takes them in
+    /// closing mode (L4's `Feed::entries_for(after, limit,
+    /// Mode::Closing { acked }, closed)`): an entry whose newest opening
+    /// is above `acked` is sent held. `closed`: the subjects the unit
+    /// holds closed (`held_keys`), which `sync` reads from the unit before
+    /// the feed.
+    async fn after(
+        &self,
+        tenant: &TenantId,
+        after: u64,
+        acked: u64,
+        closed: &[String],
+    ) -> Result<KeyBatch>;
 }
 
 /// What [`KeyFeed::after`] read.
@@ -122,8 +137,9 @@ pub trait KeyFeed {
 pub struct KeyBatch {
     /// The chain's head seq (`after` when nothing follows it).
     pub head: u64,
-    /// The entries after `after`, up to `head`.
-    pub entries: Vec<KeyEntry>,
+    /// The items after `after`, up to `head`: one per record, a subject's
+    /// entry in head state or a marker (AM-62).
+    pub entries: Vec<ApplyEntry>,
     /// The answers kept for the reservations whose records these are
     /// (AM-38), if the feed has them.
     pub answers: Vec<KeptAnswer>,
@@ -513,6 +529,8 @@ where
     pub async fn sync(&self, seen: Seqs) -> Result<Synced> {
         let tenant = &self.name.tenant;
         let mut unit = seen;
+        // AM-71: the directory's acknowledgement, once per sync.
+        let acked = self.keys.acked(tenant).await;
         for _ in 0..SYNC_ROUNDS {
             let door = match self.heads.head(tenant, unit.state_seq).await {
                 Ok(Some(door)) => door,
@@ -524,7 +542,16 @@ where
             }
             // The key chain first: `sync` refuses a `keys_seq` the unit's
             // rows do not hold (`keys_not_applied`).
-            let batch = self.keys.after(tenant, unit.keys_seq).await?;
+            // The subjects the unit holds closed, read before the feed
+            // (AM-71), so one the ring now opens is sent again.
+            let closed = match self.held_keys(unit).await? {
+                Some(closed) => closed,
+                None => return Ok(Synced::Unborn),
+            };
+            let batch = self
+                .keys
+                .after(tenant, unit.keys_seq, acked, &closed)
+                .await?;
             if batch.head < unit.keys_seq {
                 return Err(ERR_KEYS_BELOW);
             }
@@ -532,10 +559,10 @@ where
             // unit's own `keys_seq`; every page must move it on.
             let mut behind = false;
             while unit.keys_seq < batch.head {
-                let page: Vec<KeyEntry> = batch
+                let page: Vec<ApplyEntry> = batch
                     .entries
                     .iter()
-                    .filter(|e| e.last_seq > unit.keys_seq)
+                    .filter(|e| e.seq() > unit.keys_seq)
                     .take(MAX_ENTRIES)
                     .cloned()
                     .collect();
@@ -545,7 +572,11 @@ where
                 let answers: Vec<KeptAnswer> = batch
                     .answers
                     .iter()
-                    .filter(|a| page.iter().any(|e| e.rid.as_ref() == Some(&a.rid)))
+                    .filter(|a| {
+                        page.iter()
+                            .filter_map(ApplyEntry::key)
+                            .any(|e| e.rid.as_ref() == Some(&a.rid))
+                    })
                     .cloned()
                     .collect();
                 let op = UnitOp::ApplyKeys {
@@ -820,6 +851,25 @@ where
         }
     }
 
+    /// The subjects the unit holds closed (`held_keys`, a Worker call).
+    /// `None` = unborn.
+    async fn held_keys(&self, seqs: Seqs) -> Result<Option<Vec<String>>> {
+        let call = self.worker_call(seqs, UnitOp::HeldKeys {});
+        match self.unit.reply(&call).await?.answer {
+            UnitAnswer::Ok { body, .. } => match body.get("held").and_then(Value::as_array) {
+                Some(ids) => ids
+                    .iter()
+                    .map(|v| v.as_str().map(str::to_string).ok_or(ERR_HELD_ANSWER))
+                    .collect::<Result<Vec<_>>>()
+                    .map(Some),
+                None => Err(ERR_HELD_ANSWER),
+            },
+            UnitAnswer::Unborn { .. } => Ok(None),
+            UnitAnswer::Failed { class } => Err(unit_failed(&class)),
+            _ => Err(ERR_HELD_ANSWER),
+        }
+    }
+
     fn worker_call(&self, seqs: Seqs, op: UnitOp) -> UnitCall {
         UnitCall {
             name: self.name.clone(),
@@ -867,6 +917,8 @@ const ERR_KEYS_STUCK: BridgeError =
     BridgeError::Invalid("unit sync: a key apply did not move the unit's keys_seq");
 const ERR_KEYS_BELOW: BridgeError =
     BridgeError::Invalid("unit sync: the key chain ends below the unit's keys_seq");
+const ERR_HELD_ANSWER: BridgeError =
+    BridgeError::Invalid("unit sync: unexpected answer to held_keys");
 const ERR_PING_ANSWER: BridgeError = BridgeError::Invalid("unit: unexpected answer to a ping");
 const ERR_STAMP_ANSWER: BridgeError = BridgeError::Invalid("unit: unexpected stamp answer");
 const ERR_STAMP_STALE: BridgeError = BridgeError::Invalid("unit: the stamp call was stale twice");
@@ -928,6 +980,7 @@ fn failed(e: &BridgeError, code: &'static str, mut pages: Vec<Page>) -> JobResul
         ERR_KEYS_GAP,
         ERR_KEYS_BELOW,
         ERR_PING_ANSWER,
+        ERR_HELD_ANSWER,
         ERR_STAMP_ANSWER,
         ERR_LEASE_EXPIRED,
     ];
@@ -1179,8 +1232,17 @@ impl<T: TenantHeads> TenantHeads for &T {
 }
 
 impl<T: KeyFeed> KeyFeed for &T {
-    async fn after(&self, tenant: &TenantId, after: u64) -> Result<KeyBatch> {
-        (**self).after(tenant, after).await
+    async fn acked(&self, tenant: &TenantId) -> u64 {
+        (**self).acked(tenant).await
+    }
+    async fn after(
+        &self,
+        tenant: &TenantId,
+        after: u64,
+        acked: u64,
+        closed: &[String],
+    ) -> Result<KeyBatch> {
+        (**self).after(tenant, after, acked, closed).await
     }
 }
 

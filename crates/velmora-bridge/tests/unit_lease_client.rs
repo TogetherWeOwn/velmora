@@ -18,14 +18,14 @@ use velmora_bridge::recovery::Unpublished;
 use velmora_bridge::stamp::stamp_key;
 use velmora_bridge::testkit::{FixedClock, MemBlobStore, RusqliteSql};
 use velmora_bridge::unit::jobcall::JobCall;
-use velmora_bridge::unit::keys::{Access, KeyEntry, KeyGrant, KeyKind, SubjectStatus};
+use velmora_bridge::unit::keys::{Access, ApplyEntry, KeyEntry, KeyGrant, KeyKind, SubjectStatus};
 use velmora_bridge::unit::{
     BirthKind, BirthToken, CallKind, Seqs, TenantId, TenantState, Unit, UnitAnswer, UnitCall,
     UnitName, UnitOp, UnitReply,
 };
 use velmora_bridge::unit_lease::client::{
-    Delivery, InFlight, KeyBatch, KeyFeed, KeyFinisher, Page, RecordNames, Renewal, Synced,
-    UnitClient, UnitReplies,
+    Answered, Delivery, InFlight, KeyBatch, KeyFeed, KeyFinisher, Page, RecordNames, Renewal,
+    Synced, UnitClient, UnitReplies,
 };
 use velmora_bridge::unit_lease::lease::LeaseRules;
 use velmora_bridge::unit_lease::renewal::ChainNames;
@@ -155,11 +155,28 @@ impl UnitReplies for Obj<'_> {
 
 /// The key chain as the Worker reads it: entries by seq.
 #[derive(Default)]
-struct Keys(RefCell<BTreeMap<u64, KeyEntry>>);
+struct Keys(
+    RefCell<BTreeMap<u64, ApplyEntry>>,
+    /// What `acked` answers.
+    Cell<u64>,
+    /// Every `after` call: its base, `acked` and `closed`.
+    RefCell<Vec<(u64, u64, Vec<String>)>>,
+);
 
 impl KeyFeed for Keys {
-    async fn after(&self, t: &TenantId, after: u64) -> Result<KeyBatch> {
+    async fn acked(&self, t: &TenantId) -> u64 {
         assert_eq!(t, &tenant());
+        self.1.get()
+    }
+    async fn after(
+        &self,
+        t: &TenantId,
+        after: u64,
+        acked: u64,
+        closed: &[String],
+    ) -> Result<KeyBatch> {
+        assert_eq!(t, &tenant());
+        self.2.borrow_mut().push((after, acked, closed.to_vec()));
         let all = self.0.borrow();
         // The chain's own head, whatever `after` says.
         let head = all.keys().next_back().copied().unwrap_or(0);
@@ -320,8 +337,8 @@ impl<'a> Rig<'a> {
     }
 
     /// A key-chain record at `seq`, with its name in the safety bucket.
-    fn key_record(&self, seq: u64, entry: KeyEntry) {
-        self.keys.0.borrow_mut().insert(seq, entry);
+    fn key_record(&self, seq: u64, entry: impl Into<ApplyEntry>) {
+        self.keys.0.borrow_mut().insert(seq, entry.into());
         put(self.safety, &RecordNames.key_record(tid(), seq));
     }
 
@@ -588,7 +605,7 @@ fn sync_brings_a_new_unit_to_both_chain_heads() {
         assert_eq!(rig.unit_seqs(), want);
         let head = rig.obj.unit.head().unwrap();
         assert_eq!(head.tenant_state, TenantState::Active);
-        assert_eq!(rig.calls(), ["apply_keys", "sync"]);
+        assert_eq!(rig.calls(), ["held_keys", "apply_keys", "sync"]);
     });
 }
 
@@ -657,14 +674,15 @@ fn a_head_that_clears_the_entry_leaves_the_lift_to_the_tool() {
     });
 }
 
-/// A key chain that ends below what the unit holds is damage: no call.
+/// A key chain that ends below what the unit holds is damage: no write
+/// (only the read of the unit's closed subjects).
 #[test]
 fn a_key_chain_below_the_unit_is_an_error() {
     with_fresh(|rig| {
         rig.keys.0.borrow_mut().clear();
         rig.obj.log.borrow_mut().clear();
         assert!(block_on(rig.client().sync(rig.unit_seqs())).is_err());
-        assert!(rig.calls().is_empty());
+        assert_eq!(rig.calls(), ["held_keys"]);
     });
 }
 
@@ -909,6 +927,30 @@ fn a_renewal_from_old_numbers_takes_the_units() {
     });
 }
 
+/// AM-71: `sync` reads the directory's `acked` once, and the unit's
+/// closed subjects before each feed read, and hands both to the feed.
+#[test]
+fn a_sync_hands_the_feed_the_directorys_ack_and_the_units_closed_subjects() {
+    with_fresh(|rig| {
+        rig.keys.1.set(7);
+        rig.keys.2.borrow_mut().clear();
+        let mut held = key(K, 3, SubjectStatus::Active);
+        held.held = true;
+        rig.key_record(3, held);
+        block_on(rig.client().sync(rig.unit_seqs())).unwrap();
+        let calls = rig.keys.2.borrow().clone();
+        assert!(!calls.is_empty());
+        assert!(calls.iter().all(|(_, acked, _)| *acked == 7), "{calls:?}");
+        assert!(calls[0].2.is_empty(), "nothing held before: {calls:?}");
+        // Now the unit holds K closed: the next sync names it.
+        rig.keys.2.borrow_mut().clear();
+        rig.key_record(4, key(K, 4, SubjectStatus::Active));
+        block_on(rig.client().sync(rig.unit_seqs())).unwrap();
+        let calls = rig.keys.2.borrow().clone();
+        assert_eq!(calls[0].2, vec![K.to_string()], "{calls:?}");
+    });
+}
+
 /// A key backlog longer than the unit takes in one apply goes in pages,
 /// each from the unit's own `keys_seq` (review finding 1).
 #[test]
@@ -944,13 +986,9 @@ fn unsigned_calls_space_failed_renewals_with_a_backoff() {
         block_on(rig.client().sync(rig.unit_seqs())).unwrap();
         rig.clock.advance_ms(T + 1);
         let unsigned = || {
-            // The key-row fetch: one of the two unsigned calls (rule 11).
-            let mut c = request(
-                rig.unit_seqs(),
-                UnitOp::KeyRow {
-                    access_key_id: K.into(),
-                },
-            );
+            // An unsigned call (rule 11). Not `key_row`: with an expired
+            // lease the unit answers it, marked (AM-63).
+            let mut c = request(rig.unit_seqs(), UnitOp::Ping {});
             c.authenticated = false;
             called(&rig.client(), c)
         };
@@ -990,13 +1028,9 @@ fn a_transient_failure_delays_unsigned_renewals_by_the_first_backoff_only() {
     with_fresh(|rig| {
         rig.clock.advance_ms(T + 1);
         let unsigned = || {
-            // The key-row fetch: one of the two unsigned calls (rule 11).
-            let mut c = request(
-                rig.unit_seqs(),
-                UnitOp::KeyRow {
-                    access_key_id: K.into(),
-                },
-            );
+            // An unsigned call (rule 11). Not `key_row`: with an expired
+            // lease the unit answers it, marked (AM-63).
+            let mut c = request(rig.unit_seqs(), UnitOp::Ping {});
             c.authenticated = false;
             block_on(rig.client().call(c))
         };
@@ -1011,15 +1045,21 @@ fn a_transient_failure_delays_unsigned_renewals_by_the_first_backoff_only() {
         rig.clock.advance_ms(60_000);
         let (a, p) = unsigned();
         let a = a.unwrap();
+        // Renewed, and the call ran again (an unsigned ping is then
+        // refused as unauthenticated: past the lease check).
+        let renewed = |a: &Answered| {
+            matches!(a.renewal, Some(Renewal::Renewed { .. }))
+                && !matches!(a.reply.answer, UnitAnswer::RenewNeeded { .. })
+        };
         assert!(
-            matches!(a.reply.answer, UnitAnswer::Ok { .. }),
+            renewed(&a),
             "recovered after 60 s: {a:?} {p:?} {:?}",
             rig.calls()
         );
         // Cleared: a later expiry is renewed at once.
         rig.clock.advance_ms(T + 1);
         let (a, _) = unsigned();
-        assert!(matches!(a.unwrap().reply.answer, UnitAnswer::Ok { .. }));
+        assert!(renewed(&a.unwrap()));
     });
 }
 
@@ -1409,7 +1449,15 @@ fn a_request_on_an_expired_lease_renews_and_runs_once_more() {
         assert!(!a.renew_due);
         assert_eq!(
             rig.calls(),
-            ["apply_keys", "sync", "ping", "job:stamp", "renew", "ping"]
+            [
+                "held_keys",
+                "apply_keys",
+                "sync",
+                "ping",
+                "job:stamp",
+                "renew",
+                "ping"
+            ]
         );
     });
 }

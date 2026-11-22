@@ -49,7 +49,7 @@
 //! [`TK_CACHE_MS`].
 
 use std::cell::RefCell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 
 use velmora::rng::FillRandom;
@@ -94,6 +94,14 @@ pub const ERR_TK_VOIDS: BridgeError =
     BridgeError::Crypto("tenant key copies disagree again and again");
 /// A location the set names has no binding.
 pub const ERR_TK_UNBOUND: BridgeError = BridgeError::Invalid("key location has no binding");
+/// The tenant chain keeps no check value for the version: it is not
+/// committed, and is never loaded (ADR §3.2, AM-10).
+pub const ERR_TK_NOT_COMMITTED: BridgeError = BridgeError::Crypto(NOT_COMMITTED);
+const NOT_COMMITTED: &str = "tenant key version is not committed";
+/// The version that new records are sealed under is marked gone: a
+/// tenant chain that says so is damaged or misread.
+pub const ERR_TK_CURRENT_GONE: BridgeError =
+    BridgeError::Crypto("the current tenant key version is marked gone");
 
 const FOREIGN: &str = "tenant key directory holds a name that is no key blob";
 
@@ -186,6 +194,26 @@ pub enum Commit {
     Stopped,
 }
 
+/// What the verified head of the tenant chain says of one key version.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KeyCheck {
+    /// Committed with this check value (`key_checks[version]`, written at
+    /// the commit and never removed): a load is pinned to it.
+    Committed([u8; KCV_LEN]),
+    /// A record marks the version `retired` or `lost` (AM-11): it is never
+    /// loaded again. Only the operator plane writes `lost`.
+    Gone,
+    /// Not committed, or not yet: never loaded.
+    NotCommitted,
+}
+
+/// A key version that a record marks retired or lost (ADR §3.5, AM-11):
+/// an outcome, not an error. Every other load error is transient.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KeyVersionGone {
+    pub version: u32,
+}
+
 /// The claim and the commit of a key version: records of the tenant
 /// chain, written by its owner.
 #[allow(async_fn_in_trait)]
@@ -204,6 +232,9 @@ pub trait KeyVersionClaims {
     /// of its key. A commit of the same version with another `kcv` is
     /// refused (an `Err`).
     async fn commit(&self, tenant: &TenantId, version: u32, kcv: [u8; KCV_LEN]) -> Result<Commit>;
+    /// What the verified head keeps for `version`: its committed check
+    /// value, or that it is gone or not committed (ADR §3.2, AM-10).
+    async fn committed_kcv(&self, tenant: &TenantId, version: u32) -> Result<KeyCheck>;
 }
 
 // ---------------------------------------------------------------------------
@@ -507,6 +538,111 @@ impl TkCache {
     }
 }
 
+/// A key version as [`TkCache::load_committed`] found it.
+#[derive(Clone, Debug)]
+pub enum Loaded {
+    Key(Rc<TenantKey>),
+    Gone(KeyVersionGone),
+}
+
+impl TkCache {
+    /// Key version `version` of `tenant`, pinned to the check value that
+    /// the verified head of its tenant chain committed for it. A version
+    /// the head does not hold as committed is refused
+    /// ([`ERR_TK_NOT_COMMITTED`]) before any location is read; a gone one
+    /// is answered as such.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn load_committed<S: RecordStore, K: Kek, T: Clock, C: KeyVersionClaims>(
+        &self,
+        set: &KeyLocations,
+        buckets: &KeyBuckets<'_, S>,
+        kek: &K,
+        clock: &T,
+        claims: &C,
+        tenant: &TenantId,
+        version: u32,
+    ) -> Result<Loaded> {
+        match claims.committed_kcv(tenant, version).await? {
+            KeyCheck::Committed(kcv) => Ok(Loaded::Key(
+                self.load(set, buckets, kek, clock, tenant, version, kcv)
+                    .await?,
+            )),
+            KeyCheck::Gone => {
+                // Nothing of a gone version is kept.
+                self.keys.borrow_mut().remove(&(tenant.clone(), version));
+                Ok(Loaded::Gone(KeyVersionGone { version }))
+            }
+            KeyCheck::NotCommitted => Err(ERR_TK_NOT_COMMITTED),
+        }
+    }
+}
+
+/// A ring as [`load_ring`] built it.
+pub struct RingLoad {
+    pub ring: LoadedRing,
+    /// Older versions that did not load now (a store or KEK error):
+    /// records sealed under them stay closed, the ring is partial
+    /// ([`TkRing::partial`]), and the caller retries.
+    pub failed: Vec<u32>,
+    /// Older versions asked for that the head does not hold as committed:
+    /// never loaded, and no reason to retry (the caller names versions
+    /// from `key_checks`).
+    pub not_committed: Vec<u32>,
+}
+
+/// The ring of `tenant`: `current` (the head's `tk_version`) and the
+/// `older` versions, each pinned to its own committed check value. Gone
+/// versions are marked gone in the ring. A current version that does not
+/// load fails the call.
+#[allow(clippy::too_many_arguments)]
+pub async fn load_ring<S: RecordStore, K: Kek, T: Clock, C: KeyVersionClaims>(
+    cache: &TkCache,
+    set: &KeyLocations,
+    buckets: &KeyBuckets<'_, S>,
+    kek: &K,
+    clock: &T,
+    claims: &C,
+    tenant: &TenantId,
+    current: u32,
+    older: &[u32],
+) -> Result<RingLoad> {
+    let current_key = match cache
+        .load_committed(set, buckets, kek, clock, claims, tenant, current)
+        .await?
+    {
+        Loaded::Key(key) => key,
+        Loaded::Gone(_) => return Err(ERR_TK_CURRENT_GONE),
+    };
+    let mut others = Vec::new();
+    let mut gone = BTreeSet::new();
+    let mut failed = Vec::new();
+    let mut not_committed = Vec::new();
+    let wanted: BTreeSet<u32> = older.iter().copied().filter(|v| *v != current).collect();
+    for version in wanted {
+        match cache
+            .load_committed(set, buckets, kek, clock, claims, tenant, version)
+            .await
+        {
+            Ok(Loaded::Key(key)) => others.push(key),
+            Ok(Loaded::Gone(g)) => {
+                gone.insert(g.version);
+            }
+            // A marker or a foreign name refuses the tenant: no ring.
+            Err(e) if is_foreign(&e) => return Err(e),
+            Err(BridgeError::Crypto(m)) if m == NOT_COMMITTED => not_committed.push(version),
+            Err(_) => failed.push(version),
+        }
+    }
+    let ring = LoadedRing::new(current_key, others)?
+        .with_gone(gone)
+        .with_partial(!failed.is_empty());
+    Ok(RingLoad {
+        ring,
+        failed,
+        not_committed,
+    })
+}
+
 /// Key version `version` of `tenant` with the committed check value
 /// `pinned`, from the first synchronous location that holds a copy that
 /// opens (the arbiter first), with the KEK version of that copy. A marker
@@ -609,6 +745,8 @@ async fn load_from<S: RecordStore, K: Kek>(
 pub struct LoadedRing {
     current: Rc<TenantKey>,
     others: Vec<Rc<TenantKey>>,
+    gone: BTreeSet<u32>,
+    partial: bool,
 }
 
 impl LoadedRing {
@@ -624,7 +762,29 @@ impl LoadedRing {
                 "tenant keys of another tenant in a ring",
             ));
         }
-        Ok(LoadedRing { current, others })
+        Ok(LoadedRing {
+            current,
+            others,
+            gone: BTreeSet::new(),
+            partial: false,
+        })
+    }
+
+    /// The ring with `gone` marked gone (AM-11). A version the ring holds
+    /// a key for is never gone.
+    pub fn with_gone(mut self, gone: BTreeSet<u32>) -> LoadedRing {
+        self.gone = gone
+            .into_iter()
+            .filter(|v| self.key(*v).is_none())
+            .collect();
+        self
+    }
+
+    /// The ring with `partial` set when a committed version did not load
+    /// now ([`TkRing::partial`]).
+    pub fn with_partial(mut self, partial: bool) -> LoadedRing {
+        self.partial = partial;
+        self
     }
 }
 
@@ -638,5 +798,13 @@ impl TkRing for LoadedRing {
             .chain(self.others.iter())
             .find(|k| k.version() == version)
             .map(|k| &**k)
+    }
+
+    fn gone(&self, version: u32) -> bool {
+        self.gone.contains(&version)
+    }
+
+    fn partial(&self) -> bool {
+        self.partial
     }
 }

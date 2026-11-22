@@ -353,6 +353,41 @@ impl<P: UnitPort, S: Catalog> Catalog for TenantCatalog<P, S> {
         })
         .await
     }
+    // Upload parts that left their upload (`GC_ORPHANS`): the unit's
+    // catalogue does record them (its uploads write `gc` rows, and the
+    // move's import copies tenant 0's), but the orphan scan has no
+    // `JobCall` yet. So nothing is due and a scan finds nothing here: the
+    // parts' safety copies are kept until the unit job path collects
+    // them (a follow-up; storage only, no loss).
+    async fn gc_orphans_due(&self, _now: UnixMs) -> Result<bool> {
+        Ok(false)
+    }
+    async fn gc_orphans(
+        &self,
+        _now: UnixMs,
+        _cutoff: UnixMs,
+        _scan: u32,
+        _limit: u32,
+    ) -> Result<Vec<GcRow>> {
+        Ok(Vec::new())
+    }
+    async fn gc_orphan_claim(
+        &self,
+        rows: &[GcRow],
+        _now: UnixMs,
+        _cutoff: UnixMs,
+    ) -> (Vec<bool>, Result<()>) {
+        match rows.is_empty() {
+            true => (Vec::new(), Ok(())),
+            false => (
+                vec![false; rows.len()],
+                Err(BridgeError::NotImplemented(NOT_ON_UNIT)),
+            ),
+        }
+    }
+    async fn gc_orphan_done(&self, _id: i64, _now: UnixMs) -> Result<()> {
+        Err(BridgeError::NotImplemented(NOT_ON_UNIT))
+    }
     async fn hold_intent_fence(
         &self,
         write: &WriteId,

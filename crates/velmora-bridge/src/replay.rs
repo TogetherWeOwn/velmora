@@ -77,7 +77,8 @@ impl Default for ReplayLimits {
 }
 
 /// Where a manifest's generation stands in the catalogue.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ReplayProbe {
     Absent,
     /// The generation row exists: it was published in full.

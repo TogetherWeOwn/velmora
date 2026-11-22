@@ -253,6 +253,9 @@ fn load(vars: &BTreeMap<String, String>) -> std::result::Result<BridgeConfig, Co
 #[test]
 fn config_loads_from_documented_vars() {
     let (prod, dev) = wrangler_vars();
+    // The file sets no GC_ORPHANS, in either environment: the collector
+    // of orphaned upload parts is turned on by the operator alone.
+    assert!(!prod.contains_key("GC_ORPHANS") && !dev.contains_key("GC_ORPHANS"));
 
     // Until deploy fills in the account subdomain, prod refuses to start.
     let mut shipped = with_secrets(prod.clone(), &prod_providers());
@@ -305,6 +308,8 @@ fn config_loads_from_documented_vars() {
     assert_eq!(cfg.max_put_bytes, MAX_PUT_BYTES_LIMIT);
     assert_eq!(cfg.slice_bytes, DEFAULT_SLICE_BYTES);
     assert!(!cfg.intent_sweep);
+    // Upload parts that left their upload are not collected.
+    assert!(!cfg.gc_orphans);
     // One object holds at most 10 000 extents unless the variable says
     // fewer.
     assert_eq!(cfg.max_object_extents, 10_000);
@@ -322,6 +327,7 @@ fn config_loads_from_documented_vars() {
         (cfg.max_put_bytes, cfg.slice_bytes, cfg.intent_sweep),
         (MAX_PUT_BYTES_LIMIT, DEFAULT_SLICE_BYTES, true)
     );
+    assert!(!cfg.gc_orphans);
     // Dev sets no job budget: jobs and requests share the one limit.
     assert_eq!(cfg.job_budget_bytes, cfg.inflight_budget_bytes);
     // Absent or empty is the default; any other size is taken as given.
@@ -803,6 +809,10 @@ fn config_rejects_invalid_and_unsafe_values() {
         ("INTENT_SWEEP", "1"),
         ("INTENT_SWEEP", "ON"),
         ("INTENT_SWEEP", "disposable"),
+        ("GC_ORPHANS", "1"),
+        ("GC_ORPHANS", "ON"),
+        ("GC_ORPHANS", "true"),
+        ("GC_ORPHANS", "disposable"),
         ("PARITY", "1"),
         ("PARITY", "ON"),
         ("PARITY", "true"),
@@ -875,6 +885,24 @@ fn config_rejects_invalid_and_unsafe_values() {
         assert_eq!(cfg.max_put_bytes.to_string(), put);
         assert_eq!(cfg.slice_bytes.to_string(), slice);
         assert_eq!(cfg.intent_sweep, sweep.trim() == "on");
+    }
+    // The collector of orphaned upload parts: its own switch, whatever
+    // GC_MODE says.
+    for (orphans, on) in [
+        ("off", false),
+        ("", false),
+        ("  ", false),
+        ("on", true),
+        (" on ", true),
+    ] {
+        for mode in ["off", "disposable"] {
+            let mut tuned = prod.clone();
+            tuned.insert("GC_ORPHANS".into(), orphans.into());
+            tuned.insert("GC_MODE".into(), mode.into());
+            let cfg = load(&tuned).unwrap();
+            assert_eq!(cfg.gc_orphans, on, "{orphans:?}");
+            assert_eq!(cfg.gc_mode == GcMode::Disposable, mode == "disposable");
+        }
     }
     for n in ["1", "10000"] {
         let mut capped = prod.clone();
@@ -1895,6 +1923,38 @@ async fn sql_rejects_more_than_100_params_like_d1() {
         count(&db, "gc"),
         0,
         "an over-limit statement rolls back its batch"
+    );
+
+    // An integer crosses to D1 as a JS number: one that a number does
+    // not hold exactly is refused, by the fixture as by the adapter.
+    for ok in [MAX_SQL_INT, -MAX_SQL_INT, 0] {
+        db.query("SELECT ?1", &[SqlValue::Int(ok)]).await.unwrap();
+    }
+    for bad in [MAX_SQL_INT + 1, -MAX_SQL_INT - 1, i64::MAX, i64::MIN] {
+        for err in [
+            db.query("SELECT ?1", &[SqlValue::Int(bad)])
+                .await
+                .unwrap_err(),
+            db.exec(INSERT_GC_MARKER, &[text("x_a"), SqlValue::Int(bad)])
+                .await
+                .unwrap_err(),
+            db.batch(vec![
+                (INSERT_GC_MARKER, vec![text("x_a"), SqlValue::Int(T0.0)]),
+                (INSERT_GC_MARKER, vec![text("x_b"), SqlValue::Int(bad)]),
+            ])
+            .await
+            .unwrap_err(),
+        ] {
+            assert!(
+                matches!(&err, BridgeError::Sql(m) if m.contains("outside JS safe range")),
+                "{bad}: {err:?}"
+            );
+        }
+    }
+    assert_eq!(
+        count(&db, "gc"),
+        0,
+        "an out-of-range integer rolls back its batch"
     );
 }
 

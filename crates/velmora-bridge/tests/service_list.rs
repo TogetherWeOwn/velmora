@@ -831,7 +831,11 @@ async fn a_page_reads_in_step_with_max_keys() {
             let p = page(&list(&rig, &signer, BUCKET, &q).await);
             let cost = sql.read_stats();
             assert_eq!(cost.queries - auth, 1, "max-keys {max}");
-            assert!(cost.rows <= max + 1 + 3, "max-keys {max}: {}", cost.rows);
+            // D1's billed rows. A unit reads its own head on every call,
+            // on Durable Object SQLite: not this budget.
+            if !on_unit() {
+                assert!(cost.rows <= max + 1 + 3, "max-keys {max}: {}", cost.rows);
+            }
             assert!(p.keys.is_empty());
             seen.extend(p.prefixes);
             // A token is bound to its page size: start each size afresh.

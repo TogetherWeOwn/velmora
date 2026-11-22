@@ -163,7 +163,7 @@ fn apply(u: &Unit<RusqliteSql>, entries: Vec<KeyEntry>, answers: Vec<KeptAnswer>
         u,
         UnitOp::ApplyKeys {
             from_seq,
-            entries,
+            entries: entries.into_iter().map(Into::into).collect(),
             answers,
         },
     ))
@@ -196,7 +196,7 @@ fn ready() -> Unit<RusqliteSql> {
     u.sql()
         .apply(&format!(
             "INSERT INTO buckets(id, name, owner, bdk_wrapped, kek_version, created_at) \
-               VALUES ('{B1}', 'alpha', 'o', x'02', 1, 1);"
+               VALUES ('{B1}', 'alpha', 'o', x'02', 1, 1), ('{B2}', 'held-two', 'o', x'02', 1, 1);"
         ))
         .unwrap();
     apply(
@@ -594,7 +594,6 @@ fn a_grant_wider_than_the_acting_principals_is_refused() {
     let ask = |grants| reserve_op(1, 1, 1, by_owner(), new_key("AK1", grants));
     for grants in [
         vec![grant(B2, Access::Rw)],
-        vec![grant("b_00000000000000f9", Access::Ro)],
         vec![grant(B1, Access::Rw), grant(B2, Access::Rw)],
     ] {
         assert_eq!(
@@ -602,6 +601,14 @@ fn a_grant_wider_than_the_acting_principals_is_refused() {
             Some(ReserveRefusal::GrantNotHeld)
         );
     }
+    // A bucket the unit does not hold: named as such (AM-61).
+    assert_eq!(
+        refused(&worker(
+            &u,
+            ask(vec![grant("b_00000000000000f9", Access::Ro)])
+        )),
+        Some(ReserveRefusal::BucketNotFound)
+    );
     assert!(matches!(
         worker(&u, ask(vec![grant(B1, Access::Rw), grant(B2, Access::Ro)])),
         UnitAnswer::Ok { .. }
@@ -934,6 +941,229 @@ fn a_record_that_narrows_or_closes_the_principal_cancels_its_open_reservations()
         vec![],
     );
     assert_eq!(state_of(&u, 2), None);
+}
+
+/// AM-61: a bucket id the unit holds no bucket row for.
+const ORPHAN: &str = "b_00000000000000f9";
+
+/// AM-61: a record whose only change drops grants on bucket ids the unit
+/// holds no row for narrows nothing, so it cancels no reservation; a
+/// record that also drops a grant on a bucket the unit holds does.
+#[test]
+fn dropping_only_a_grant_on_a_bucket_the_unit_does_not_hold_cancels_nothing() {
+    let u = ready();
+    // The principal gains a grant on a bucket the unit does not hold (a
+    // widening, which cancels nothing).
+    apply(
+        &u,
+        vec![principal_entry(
+            P,
+            OWNER,
+            2,
+            SubjectStatus::Active,
+            false,
+            vec![
+                grant(B1, Access::Rw),
+                grant(B2, Access::Ro),
+                grant(ORPHAN, Access::Rw),
+            ],
+        )],
+        vec![],
+    );
+    ok(worker(
+        &u,
+        reserve_op(
+            1,
+            1,
+            1,
+            by_owner(),
+            new_key("AK1", vec![grant(B1, Access::Ro)]),
+        ),
+    ));
+    // The orphan grant is dropped, or narrowed: the reservation stays.
+    for (seq, orphan) in [(3, vec![grant(ORPHAN, Access::Ro)]), (4, vec![])] {
+        let mut grants = vec![grant(B1, Access::Rw), grant(B2, Access::Ro)];
+        grants.extend(orphan);
+        apply(
+            &u,
+            vec![principal_entry(
+                P,
+                OWNER,
+                seq,
+                SubjectStatus::Active,
+                false,
+                grants,
+            )],
+            vec![],
+        );
+        assert_eq!(state_of(&u, 1).as_deref(), Some("reserved"), "seq {seq}");
+    }
+    // A grant on a bucket the unit holds is dropped too: cancelled.
+    apply(
+        &u,
+        vec![principal_entry(
+            P,
+            OWNER,
+            5,
+            SubjectStatus::Active,
+            false,
+            vec![grant(B1, Access::Rw)],
+        )],
+        vec![],
+    );
+    assert_eq!(state_of(&u, 1), None);
+}
+
+/// AM-61: an ask that grants on a bucket id the unit holds no row for is
+/// refused `bucket_not_found` (key create, principal create, widening),
+/// before the subset rule, and nothing is kept.
+#[test]
+fn a_grant_on_a_bucket_the_unit_does_not_hold_is_refused_as_not_found() {
+    let u = ready();
+    let not_found = Some(ReserveRefusal::BucketNotFound);
+    assert_eq!(
+        refused(&worker(
+            &u,
+            reserve_op(
+                1,
+                1,
+                1,
+                by_owner(),
+                new_key(
+                    "AK1",
+                    vec![grant(B1, Access::Ro), grant(ORPHAN, Access::Ro)]
+                ),
+            ),
+        )),
+        not_found
+    );
+    assert_eq!(
+        refused(&worker(
+            &u,
+            reserve_op(
+                2,
+                2,
+                2,
+                by_owner(),
+                Opening::Principal {
+                    id: "p_new".into(),
+                    owner_ref: "member-9".into(),
+                    grants: vec![grant(ORPHAN, Access::Ro)],
+                },
+            ),
+        )),
+        not_found
+    );
+    // A widening of a held key onto it.
+    ok(worker(
+        &u,
+        reserve_op(
+            3,
+            3,
+            3,
+            by_owner(),
+            new_key("AK3", vec![grant(B1, Access::Ro)]),
+        ),
+    ));
+    apply(
+        &u,
+        vec![key_entry(
+            "AK3",
+            2,
+            vec![grant(B1, Access::Ro)],
+            Some(rid(3)),
+        )],
+        vec![],
+    );
+    assert_eq!(
+        refused(&worker(
+            &u,
+            reserve_op(
+                4,
+                4,
+                4,
+                by_owner(),
+                Opening::Grants {
+                    subject: "AK3".into(),
+                    grants: vec![grant(B1, Access::Ro), grant(ORPHAN, Access::Ro)],
+                },
+            ),
+        )),
+        not_found
+    );
+    assert_eq!(state_of(&u, 1), None);
+    assert_eq!(state_of(&u, 2), None);
+    assert_eq!(state_of(&u, 4), None);
+}
+
+fn row_keys_seq(u: &Unit<RusqliteSql>, r: u8) -> i64 {
+    u.sql()
+        .with_conn(|c| {
+            c.query_row(
+                "SELECT keys_seq FROM unit_reservations WHERE rid = ?1",
+                [rid(r).0.to_vec()],
+                |row| row.get(0),
+            )
+        })
+        .unwrap()
+}
+
+/// AM-55: a re-ask answers the first `rid` and the unit's current
+/// `keys_seq`, and the row keeps that seq (the Worker then reads exactly
+/// `keys_seq + 1`). In a locked tenant the re-ask is answered `not_open`
+/// with the row's `rid` and writes nothing.
+#[test]
+fn a_re_ask_keeps_the_current_keys_seq_and_writes_nothing_in_a_locked_tenant() {
+    let u = ready();
+    let ask = |r| {
+        reserve_op(
+            1,
+            1,
+            r,
+            by_owner(),
+            new_key("AK1", vec![grant(B1, Access::Ro)]),
+        )
+    };
+    assert_eq!(ok(worker(&u, ask(1)))["admitted"]["keys_seq"], json!(1));
+    assert_eq!(row_keys_seq(&u, 1), 1);
+    // Another record lands first (seq 2): the re-ask answers 2, the row
+    // keeps 2, and the re-ask's own rid is ignored.
+    apply(&u, vec![key_entry("AKX", 2, vec![], None)], vec![]);
+    let again = ok(worker(&u, ask(7)));
+    assert_eq!(again["admitted"]["rid"], json!(rid(1).hex()));
+    assert_eq!(again["admitted"]["keys_seq"], json!(2));
+    assert_eq!(row_keys_seq(&u, 1), 2);
+    assert_eq!(state_of(&u, 7), None);
+    // Locked: `not_open`, with the rid and the current seq; nothing kept.
+    let h = u.head().unwrap();
+    assert!(matches!(
+        worker(
+            &u,
+            UnitOp::Sync {
+                head: SyncHead {
+                    seqs: Seqs {
+                        state_seq: h.seqs.state_seq + 1,
+                        keys_seq: h.seqs.keys_seq,
+                    },
+                    tenant_mode: Some(velmora_bridge::unit::call::HoldMode::Locked),
+                    tenant_state: TenantState::Suspended,
+                    restoring_since: None,
+                    lift: None,
+                },
+            },
+        ),
+        UnitAnswer::Ok { .. }
+    ));
+    apply(&u, vec![key_entry("AKY", 3, vec![], None)], vec![]);
+    let before = u.sql().with_conn(|c| c.total_changes());
+    assert_eq!(
+        ok(worker(&u, ask(8))),
+        json!({ "not_open": { "rid": rid(1).hex(), "keys_seq": 3 } })
+    );
+    assert_eq!(u.sql().with_conn(|c| c.total_changes()), before);
+    assert_eq!(row_keys_seq(&u, 1), 2);
+    assert_eq!(state_of(&u, 1).as_deref(), Some("reserved"));
+    assert_eq!(rows(&u), 1);
 }
 
 #[test]
@@ -1361,6 +1591,59 @@ fn a_bucket_name_is_held_by_one_call_and_never_by_an_existing_bucket() {
     // Released: free again.
     ok(worker(&u, UnitOp::Release { rid: rid(2) }));
     ok(worker(&u, bucket(3, 3, "beta")));
+}
+
+/// AM-57: the `created` change a `sync` carries makes the bucket's row
+/// and turns the reservation bound to its creator grant `applied`; one
+/// whose reservation is gone still makes its row.
+#[test]
+fn a_created_bucket_record_applies_its_bound_reservation() {
+    use velmora_bridge::unit::buckets::{self, BucketChange};
+    let u = ready();
+    ok(worker(&u, bucket(1, 1, "beta")));
+    ok(worker(
+        &u,
+        UnitOp::BindBucket {
+            rid: rid(1),
+            expected: None,
+            grant_seq: 4,
+        },
+    ));
+    let created = |seq, id: &str, name: &str, grant_seq| BucketChange::Created {
+        seq,
+        bucket_id: id.into(),
+        grant_seq,
+        creator: P.into(),
+        name: name.into(),
+        bdk_wrapped: vec![0x02, 1],
+        tk_version: 1,
+        written_at: 9,
+    };
+    let done = buckets::apply(
+        u.sql(),
+        &[created(5, "b_00000000000000f3", "beta", 4)],
+        false,
+        NOW,
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!((done.created, done.reserved), (1, 1));
+    assert_eq!(
+        ok(worker(&u, UnitOp::BucketBinding { grant_seq: 4 })),
+        json!({ "binding": "created", "bucket": "b_00000000000000f3" })
+    );
+    let replay = ok(worker(&u, bucket(1, 1, "beta")));
+    assert_eq!(replay["applied"]["bucket"], json!("b_00000000000000f3"));
+    // No reservation left for seq 7: the row is made all the same.
+    let done = buckets::apply(
+        u.sql(),
+        &[created(6, "b_00000000000000f4", "delta", 7)],
+        false,
+        NOW,
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!((done.created, done.reserved), (1, 0));
 }
 
 #[test]
@@ -1858,7 +2141,7 @@ fn the_key_chain_apply_and_the_import_refuse_the_other_schemes_wrap() {
         &u,
         UnitOp::ApplyKeys {
             from_seq: 1,
-            entries: vec![bad],
+            entries: vec![bad.into()],
             answers: vec![],
         },
     );
@@ -1930,7 +2213,7 @@ fn import_buckets(u: &Unit<RusqliteSql>, scheme: u8) -> UnitAnswer {
                 after: None,
                 cursor: "c1".into(),
                 rows: vec![vec![
-                    t(B2),
+                    t("b_00000000000000f3"),
                     t("beta"),
                     t(P),
                     ImportValue::Blob(wrap),
@@ -2005,6 +2288,7 @@ fn the_size_guard_refuses_a_batch_that_would_pass_the_extent_count() {
     let u = move_unit_with(SizeLimits {
         bytes: u64::MAX,
         extents: 3,
+        ..SizeLimits::default()
     });
     let a = import_extents(&u, None, "c1", extent_rows(0, 2));
     assert!(matches!(a, UnitAnswer::Ok { .. }), "{a:?}");
@@ -2029,6 +2313,7 @@ fn the_size_guard_refuses_any_batch_once_the_database_is_at_its_size() {
     let u = move_unit_with(SizeLimits {
         bytes: size,
         extents: u64::MAX,
+        ..SizeLimits::default()
     });
     assert_eq!(
         import_buckets(&u, 0x02),

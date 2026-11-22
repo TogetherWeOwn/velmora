@@ -179,6 +179,20 @@
       "reason": {
         "size": "too_many_extents"
       }
+    },
+    {
+      "alarm": false,
+      "answer": "refused",
+      "reason": {
+        "buckets": "not_empty"
+      }
+    },
+    {
+      "alarm": false,
+      "answer": "refused",
+      "reason": {
+        "request": "out_of_bounds"
+      }
     }
   ],
   "calls": [
@@ -317,6 +331,28 @@
         "unit": 0
       },
       "op": {
+        "access_key_id": "AKGOLDENINTERNAL0001",
+        "op": "key_row",
+        "presigned": {
+          "bucket": "alpha",
+          "create_only": true,
+          "principal": "p_1"
+        }
+      },
+      "seqs": {
+        "keys_seq": 3,
+        "state_seq": 7
+      }
+    },
+    {
+      "authenticated": true,
+      "kind": "worker",
+      "listed": true,
+      "name": {
+        "tenant": "t_00000000000000f1",
+        "unit": 0
+      },
+      "op": {
         "answers": [
           {
             "body": "{\"id\":\"AKGOLDEN000000000001\",\"secret_access_key\":null}",
@@ -348,6 +384,14 @@
             "secret_kek_version": 1,
             "secret_wrapped": "Agk=",
             "status": "active"
+          },
+          {
+            "marker": "keys_frozen",
+            "seq": 4
+          },
+          {
+            "marker": "keys_thawed",
+            "seq": 5
           }
         ],
         "from_seq": 2,
@@ -549,6 +593,7 @@
       },
       "op": {
         "expect_undo": "bm-1",
+        "floor_ms": 900,
         "op": "restore",
         "target": {
           "at_ms": 1000,
@@ -581,6 +626,7 @@
       },
       "op": {
         "expect_undo": "bm-1",
+        "floor_ms": 0,
         "op": "restore",
         "target": {
           "bookmark": "bm-0",
@@ -1006,6 +1052,23 @@
     },
     {
       "authenticated": true,
+      "kind": "worker",
+      "listed": true,
+      "name": {
+        "tenant": "t_00000000000000f1",
+        "unit": 0
+      },
+      "op": {
+        "bucket_id": "b_00000000000000f1",
+        "op": "bucket_close"
+      },
+      "seqs": {
+        "keys_seq": 3,
+        "state_seq": 7
+      }
+    },
+    {
+      "authenticated": true,
       "kind": "job",
       "listed": true,
       "name": {
@@ -1065,6 +1128,27 @@
     },
     {
       "authenticated": true,
+      "kind": "request",
+      "listed": true,
+      "name": {
+        "tenant": "t_00000000000000f1",
+        "unit": 0
+      },
+      "op": {
+        "call": {
+          "bucket": "b_00000000000000f1",
+          "key": "k",
+          "m": "live_generation"
+        },
+        "op": "request"
+      },
+      "seqs": {
+        "keys_seq": 3,
+        "state_seq": 7
+      }
+    },
+    {
+      "authenticated": true,
       "kind": "worker",
       "listed": true,
       "name": {
@@ -1114,6 +1198,24 @@
       }
     }
   ],
+  "import_progress": {
+    "lifted": {
+      "lifted_at": 1795000000000,
+      "move_lifted": true,
+      "sealed": 1,
+      "since_seq": 7,
+      "t0_seq": 11,
+      "tables": []
+    },
+    "never_bound": {
+      "lifted_at": null,
+      "move_lifted": null,
+      "sealed": null,
+      "since_seq": null,
+      "t0_seq": null,
+      "tables": []
+    }
+  },
   "nested": {
     "access": [
       "ro",
@@ -1131,6 +1233,38 @@
     "birth_kind": [
       "birth",
       "restore"
+    ],
+    "bucket_change": [
+      {
+        "bdk_wrapped": "Agc=",
+        "bucket_id": "b_00000000000000f1",
+        "change": "created",
+        "creator": "p_1",
+        "grant_seq": 4,
+        "name": "golden",
+        "seq": 8,
+        "tk_version": 1,
+        "written_at": 5
+      },
+      {
+        "bucket_id": "b_00000000000000f1",
+        "change": "dropped",
+        "seq": 9
+      },
+      {
+        "buckets": [
+          "b_00000000000000f2"
+        ],
+        "change": "unplaced",
+        "seq": 10
+      }
+    ],
+    "bucket_refusal": [
+      "not_empty",
+      "not_found",
+      "placements_off",
+      "created_conflict",
+      "malformed"
     ],
     "call_kind": [
       "request",
@@ -1233,6 +1367,23 @@
       "revocations_unapplied",
       "bad_list"
     ],
+    "precondition": [
+      "absent",
+      "exists",
+      {
+        "etag": "\"e1\""
+      }
+    ],
+    "presign_refusal": [
+      "not_internal",
+      "key_inactive",
+      "malformed",
+      "principal_unknown",
+      "principal_inactive",
+      "principal_held",
+      "no_such_bucket",
+      "no_grant"
+    ],
     "provision_refusal": [
       "born_before",
       "not_the_listing_record",
@@ -1244,6 +1395,11 @@
       "already_born",
       "no_numbers"
     ],
+    "published": [
+      "applied",
+      "refused",
+      "fenced"
+    ],
     "recount_refusal": [
       "not_restoring",
       "import_not_sealed",
@@ -1252,6 +1408,9 @@
     "report_kind": [
       "restore",
       "move"
+    ],
+    "request_refusal": [
+      "out_of_bounds"
     ],
     "reservation_bodies": {
       "admits": [
@@ -1332,6 +1491,7 @@
       "conflict",
       "internal_key_refused",
       "not_found",
+      "bucket_not_found",
       "rid_taken",
       "malformed"
     ],
@@ -1383,6 +1543,1800 @@
     {
       "answer": "renew_needed",
       "lease_left_ms": 0,
+      "seqs": {
+        "keys_seq": 3,
+        "state_seq": 7
+      }
+    }
+  ],
+  "requests": [
+    {
+      "authenticated": true,
+      "kind": "request",
+      "listed": true,
+      "name": {
+        "tenant": "t_00000000000000f1",
+        "unit": 0
+      },
+      "op": {
+        "call": {
+          "akid": "AKGOLDEN000000000001",
+          "m": "access_key"
+        },
+        "op": "request"
+      },
+      "seqs": {
+        "keys_seq": 3,
+        "state_seq": 7
+      }
+    },
+    {
+      "authenticated": true,
+      "kind": "request",
+      "listed": true,
+      "name": {
+        "tenant": "t_00000000000000f1",
+        "unit": 0
+      },
+      "op": {
+        "call": {
+          "akid": "AKGOLDEN000000000001",
+          "bucket": "b_00000000000000f1",
+          "m": "grant"
+        },
+        "op": "request"
+      },
+      "seqs": {
+        "keys_seq": 3,
+        "state_seq": 7
+      }
+    },
+    {
+      "authenticated": true,
+      "kind": "request",
+      "listed": true,
+      "name": {
+        "tenant": "t_00000000000000f1",
+        "unit": 0
+      },
+      "op": {
+        "call": {
+          "m": "bucket_by_name",
+          "name": "alpha"
+        },
+        "op": "request"
+      },
+      "seqs": {
+        "keys_seq": 3,
+        "state_seq": 7
+      }
+    },
+    {
+      "authenticated": true,
+      "kind": "request",
+      "listed": true,
+      "name": {
+        "tenant": "t_00000000000000f1",
+        "unit": 0
+      },
+      "op": {
+        "call": {
+          "akid": "AKGOLDEN000000000001",
+          "m": "buckets_for"
+        },
+        "op": "request"
+      },
+      "seqs": {
+        "keys_seq": 3,
+        "state_seq": 7
+      }
+    },
+    {
+      "authenticated": true,
+      "kind": "request",
+      "listed": true,
+      "name": {
+        "tenant": "t_00000000000000f1",
+        "unit": 0
+      },
+      "op": {
+        "call": {
+          "bucket": "b_00000000000000f1",
+          "m": "bucket_in_use"
+        },
+        "op": "request"
+      },
+      "seqs": {
+        "keys_seq": 3,
+        "state_seq": 7
+      }
+    },
+    {
+      "authenticated": true,
+      "kind": "request",
+      "listed": true,
+      "name": {
+        "tenant": "t_00000000000000f1",
+        "unit": 0
+      },
+      "op": {
+        "call": {
+          "bucket": "b_00000000000000f1",
+          "key": "k",
+          "m": "live_object"
+        },
+        "op": "request"
+      },
+      "seqs": {
+        "keys_seq": 3,
+        "state_seq": 7
+      }
+    },
+    {
+      "authenticated": true,
+      "kind": "request",
+      "listed": true,
+      "name": {
+        "tenant": "t_00000000000000f1",
+        "unit": 0
+      },
+      "op": {
+        "call": {
+          "bucket": "b_00000000000000f1",
+          "key": "k",
+          "m": "live_generation"
+        },
+        "op": "request"
+      },
+      "seqs": {
+        "keys_seq": 3,
+        "state_seq": 7
+      }
+    },
+    {
+      "authenticated": true,
+      "kind": "request",
+      "listed": true,
+      "name": {
+        "tenant": "t_00000000000000f1",
+        "unit": 0
+      },
+      "op": {
+        "call": {
+          "bucket": "b_00000000000000f1",
+          "generation": "g_0019a00000000f1f1f1f1f1f1f1f1",
+          "m": "generation_by_id"
+        },
+        "op": "request"
+      },
+      "seqs": {
+        "keys_seq": 3,
+        "state_seq": 7
+      }
+    },
+    {
+      "authenticated": true,
+      "kind": "request",
+      "listed": true,
+      "name": {
+        "tenant": "t_00000000000000f1",
+        "unit": 0
+      },
+      "op": {
+        "call": {
+          "end": 10,
+          "generation": "g_0019a00000000f1f1f1f1f1f1f1f1",
+          "m": "extents_in",
+          "start": 0
+        },
+        "op": "request"
+      },
+      "seqs": {
+        "keys_seq": 3,
+        "state_seq": 7
+      }
+    },
+    {
+      "authenticated": true,
+      "kind": "request",
+      "listed": true,
+      "name": {
+        "tenant": "t_00000000000000f1",
+        "unit": 0
+      },
+      "op": {
+        "call": {
+          "bucket": "b_00000000000000f1",
+          "key": "k",
+          "m": "newest_id"
+        },
+        "op": "request"
+      },
+      "seqs": {
+        "keys_seq": 3,
+        "state_seq": 7
+      }
+    },
+    {
+      "authenticated": true,
+      "kind": "request",
+      "listed": true,
+      "name": {
+        "tenant": "t_00000000000000f1",
+        "unit": 0
+      },
+      "op": {
+        "call": {
+          "bucket": "b_00000000000000f1",
+          "key": "k",
+          "m": "unpublished_floor"
+        },
+        "op": "request"
+      },
+      "seqs": {
+        "keys_seq": 3,
+        "state_seq": 7
+      }
+    },
+    {
+      "authenticated": true,
+      "kind": "request",
+      "listed": true,
+      "name": {
+        "tenant": "t_00000000000000f1",
+        "unit": 0
+      },
+      "op": {
+        "call": {
+          "bucket": "b_00000000000000f1",
+          "keys": [
+            "k",
+            "l"
+          ],
+          "m": "key_heads"
+        },
+        "op": "request"
+      },
+      "seqs": {
+        "keys_seq": 3,
+        "state_seq": 7
+      }
+    },
+    {
+      "authenticated": true,
+      "kind": "request",
+      "listed": true,
+      "name": {
+        "tenant": "t_00000000000000f1",
+        "unit": 0
+      },
+      "op": {
+        "call": {
+          "bucket": "b_00000000000000f1",
+          "m": "list",
+          "q": {
+            "after": "p/a",
+            "delimiter": "/",
+            "max_keys": 1000,
+            "prefix": "p/",
+            "skip_prefix": null
+          }
+        },
+        "op": "request"
+      },
+      "seqs": {
+        "keys_seq": 3,
+        "state_seq": 7
+      }
+    },
+    {
+      "authenticated": true,
+      "kind": "request",
+      "listed": true,
+      "name": {
+        "tenant": "t_00000000000000f1",
+        "unit": 0
+      },
+      "op": {
+        "call": {
+          "bucket": "b_00000000000000f1",
+          "m": "list_heads",
+          "q": {
+            "after": "p/a",
+            "delimiter": "/",
+            "max_keys": 1000,
+            "prefix": "p/",
+            "skip_prefix": null
+          }
+        },
+        "op": "request"
+      },
+      "seqs": {
+        "keys_seq": 3,
+        "state_seq": 7
+      }
+    },
+    {
+      "authenticated": true,
+      "kind": "request",
+      "listed": true,
+      "name": {
+        "tenant": "t_00000000000000f1",
+        "unit": 0
+      },
+      "op": {
+        "call": {
+          "bucket": "b_00000000000000f1",
+          "key": "k",
+          "m": "object_status"
+        },
+        "op": "request"
+      },
+      "seqs": {
+        "keys_seq": 3,
+        "state_seq": 7
+      }
+    },
+    {
+      "authenticated": true,
+      "kind": "request",
+      "listed": true,
+      "name": {
+        "tenant": "t_00000000000000f1",
+        "unit": 0
+      },
+      "op": {
+        "call": {
+          "g": {
+            "bucket_id": "b_00000000000000f1",
+            "checksum_json": null,
+            "content_json": "{}",
+            "created_at": 1000,
+            "etag": "\"e1\"",
+            "extent_count": 1,
+            "id": "g_0019a00000000f1f1f1f1f1f1f1f1",
+            "key": "k",
+            "retired_at": null,
+            "size": 3,
+            "state": "live",
+            "user_meta_json": "{}"
+          },
+          "m": "replay_probe"
+        },
+        "op": "request"
+      },
+      "seqs": {
+        "keys_seq": 3,
+        "state_seq": 7
+      }
+    },
+    {
+      "authenticated": true,
+      "kind": "request",
+      "listed": true,
+      "name": {
+        "tenant": "t_00000000000000f1",
+        "unit": 0
+      },
+      "op": {
+        "call": {
+          "m": "restore_pending"
+        },
+        "op": "request"
+      },
+      "seqs": {
+        "keys_seq": 3,
+        "state_seq": 7
+      }
+    },
+    {
+      "authenticated": true,
+      "kind": "request",
+      "listed": true,
+      "name": {
+        "tenant": "t_00000000000000f1",
+        "unit": 0
+      },
+      "op": {
+        "call": {
+          "extent": "x_000000000000000000000000f1",
+          "m": "articles"
+        },
+        "op": "request"
+      },
+      "seqs": {
+        "keys_seq": 3,
+        "state_seq": 7
+      }
+    },
+    {
+      "authenticated": true,
+      "kind": "request",
+      "listed": true,
+      "name": {
+        "tenant": "t_00000000000000f1",
+        "unit": 0
+      },
+      "op": {
+        "call": {
+          "extent": "x_000000000000000000000000f1",
+          "from_cache": true,
+          "m": "touch_read",
+          "min_gap_ms": 60000,
+          "now": 1000
+        },
+        "op": "request"
+      },
+      "seqs": {
+        "keys_seq": 3,
+        "state_seq": 7
+      }
+    },
+    {
+      "authenticated": true,
+      "kind": "request",
+      "listed": true,
+      "name": {
+        "tenant": "t_00000000000000f1",
+        "unit": 0
+      },
+      "op": {
+        "call": {
+          "extent": "x_000000000000000000000000f1",
+          "m": "record_cache_fill",
+          "now": 1000
+        },
+        "op": "request"
+      },
+      "seqs": {
+        "keys_seq": 3,
+        "state_seq": 7
+      }
+    },
+    {
+      "authenticated": true,
+      "kind": "request",
+      "listed": true,
+      "name": {
+        "tenant": "t_00000000000000f1",
+        "unit": 0
+      },
+      "op": {
+        "call": {
+          "bucket": "b_00000000000000f1",
+          "key": "k",
+          "m": "upload",
+          "upload": "u_00000000000000f1"
+        },
+        "op": "request"
+      },
+      "seqs": {
+        "keys_seq": 3,
+        "state_seq": 7
+      }
+    },
+    {
+      "authenticated": true,
+      "kind": "request",
+      "listed": true,
+      "name": {
+        "tenant": "t_00000000000000f1",
+        "unit": 0
+      },
+      "op": {
+        "call": {
+          "bucket": "b_00000000000000f1",
+          "key": "k",
+          "m": "upload_state",
+          "upload": "u_00000000000000f1"
+        },
+        "op": "request"
+      },
+      "seqs": {
+        "keys_seq": 3,
+        "state_seq": 7
+      }
+    },
+    {
+      "authenticated": true,
+      "kind": "request",
+      "listed": true,
+      "name": {
+        "tenant": "t_00000000000000f1",
+        "unit": 0
+      },
+      "op": {
+        "call": {
+          "bucket": "b_00000000000000f1",
+          "m": "list_uploads",
+          "q": {
+            "after": [
+              "k",
+              "u_1"
+            ],
+            "limit": 1000,
+            "prefix": "",
+            "skip_prefix": null
+          }
+        },
+        "op": "request"
+      },
+      "seqs": {
+        "keys_seq": 3,
+        "state_seq": 7
+      }
+    },
+    {
+      "authenticated": true,
+      "kind": "request",
+      "listed": true,
+      "name": {
+        "tenant": "t_00000000000000f1",
+        "unit": 0
+      },
+      "op": {
+        "call": {
+          "bucket": "b_00000000000000f1",
+          "key": "k",
+          "limit": 10001,
+          "m": "upload_extents",
+          "upload": "u_00000000000000f1"
+        },
+        "op": "request"
+      },
+      "seqs": {
+        "keys_seq": 3,
+        "state_seq": 7
+      }
+    },
+    {
+      "authenticated": true,
+      "kind": "request",
+      "listed": true,
+      "name": {
+        "tenant": "t_00000000000000f1",
+        "unit": 0
+      },
+      "op": {
+        "call": {
+          "except": 2,
+          "m": "upload_extents_held",
+          "upload": "u_00000000000000f1"
+        },
+        "op": "request"
+      },
+      "seqs": {
+        "keys_seq": 3,
+        "state_seq": 7
+      }
+    },
+    {
+      "authenticated": true,
+      "kind": "request",
+      "listed": true,
+      "name": {
+        "tenant": "t_00000000000000f1",
+        "unit": 0
+      },
+      "op": {
+        "call": {
+          "m": "outbox_stats"
+        },
+        "op": "request"
+      },
+      "seqs": {
+        "keys_seq": 3,
+        "state_seq": 7
+      }
+    },
+    {
+      "authenticated": true,
+      "kind": "request",
+      "listed": true,
+      "name": {
+        "tenant": "t_00000000000000f1",
+        "unit": 0
+      },
+      "op": {
+        "call": {
+          "m": "intent_stats",
+          "open_before": 1000
+        },
+        "op": "request"
+      },
+      "seqs": {
+        "keys_seq": 3,
+        "state_seq": 7
+      }
+    },
+    {
+      "authenticated": true,
+      "kind": "request",
+      "listed": true,
+      "name": {
+        "tenant": "t_00000000000000f1",
+        "unit": 0
+      },
+      "op": {
+        "call": {
+          "m": "usage_counters"
+        },
+        "op": "request"
+      },
+      "seqs": {
+        "keys_seq": 3,
+        "state_seq": 7
+      }
+    },
+    {
+      "authenticated": true,
+      "kind": "request",
+      "listed": true,
+      "name": {
+        "tenant": "t_00000000000000f1",
+        "unit": 0
+      },
+      "op": {
+        "call": {
+          "hours": 24,
+          "m": "usage_snapshot"
+        },
+        "op": "request"
+      },
+      "seqs": {
+        "keys_seq": 3,
+        "state_seq": 7
+      }
+    },
+    {
+      "authenticated": true,
+      "kind": "request",
+      "listed": true,
+      "name": {
+        "tenant": "t_00000000000000f1",
+        "unit": 0
+      },
+      "op": {
+        "call": {
+          "after": "",
+          "limit": 200,
+          "m": "usage_buckets"
+        },
+        "op": "request"
+      },
+      "seqs": {
+        "keys_seq": 3,
+        "state_seq": 7
+      }
+    },
+    {
+      "authenticated": true,
+      "kind": "request",
+      "listed": true,
+      "name": {
+        "tenant": "t_00000000000000f1",
+        "unit": 0
+      },
+      "op": {
+        "call": {
+          "m": "usage_recounts"
+        },
+        "op": "request"
+      },
+      "seqs": {
+        "keys_seq": 3,
+        "state_seq": 7
+      }
+    },
+    {
+      "authenticated": true,
+      "kind": "request",
+      "listed": true,
+      "name": {
+        "tenant": "t_00000000000000f1",
+        "unit": 0
+      },
+      "op": {
+        "call": {
+          "m": "hot_stats"
+        },
+        "op": "request"
+      },
+      "seqs": {
+        "keys_seq": 3,
+        "state_seq": 7
+      }
+    },
+    {
+      "authenticated": true,
+      "kind": "request",
+      "listed": true,
+      "name": {
+        "tenant": "t_00000000000000f1",
+        "unit": 0
+      },
+      "op": {
+        "call": {
+          "extent": "x_000000000000000000000000f1",
+          "m": "hot_seq"
+        },
+        "op": "request"
+      },
+      "seqs": {
+        "keys_seq": 3,
+        "state_seq": 7
+      }
+    },
+    {
+      "authenticated": true,
+      "kind": "request",
+      "listed": true,
+      "name": {
+        "tenant": "t_00000000000000f1",
+        "unit": 0
+      },
+      "op": {
+        "call": {
+          "c": {
+            "extents": [
+              {
+                "article_count": null,
+                "bucket_id": "b_00000000000000f1",
+                "cipher_sha256": [
+                  7,
+                  7,
+                  7,
+                  7,
+                  7,
+                  7,
+                  7,
+                  7,
+                  7,
+                  7,
+                  7,
+                  7,
+                  7,
+                  7,
+                  7,
+                  7,
+                  7,
+                  7,
+                  7,
+                  7,
+                  7,
+                  7,
+                  7,
+                  7,
+                  7,
+                  7,
+                  7,
+                  7,
+                  7,
+                  7,
+                  7,
+                  7
+                ],
+                "cipher_size": 19,
+                "created_at": 1000,
+                "generation_id": "g_0019a00000000f1f1f1f1f1f1f1f1",
+                "id": "x_000000000000000000000000f1",
+                "key_mode": 1,
+                "last_verified_at": null,
+                "media_header": [
+                  1,
+                  2
+                ],
+                "plain_md5": [
+                  5,
+                  5,
+                  5,
+                  5,
+                  5,
+                  5,
+                  5,
+                  5,
+                  5,
+                  5,
+                  5,
+                  5,
+                  5,
+                  5,
+                  5,
+                  5
+                ],
+                "plain_offset": 0,
+                "plain_sha256": [
+                  6,
+                  6,
+                  6,
+                  6,
+                  6,
+                  6,
+                  6,
+                  6,
+                  6,
+                  6,
+                  6,
+                  6,
+                  6,
+                  6,
+                  6,
+                  6,
+                  6,
+                  6,
+                  6,
+                  6,
+                  6,
+                  6,
+                  6,
+                  6,
+                  6,
+                  6,
+                  6,
+                  6,
+                  6,
+                  6,
+                  6,
+                  6
+                ],
+                "plain_size": 3,
+                "plan_rev": 0,
+                "release_evidence": null,
+                "released_at": null,
+                "safety_state": "held",
+                "seq": 0,
+                "state": "committed",
+                "wrapped_file_key": [
+                  3,
+                  4
+                ]
+              }
+            ],
+            "generation": {
+              "bucket_id": "b_00000000000000f1",
+              "checksum_json": null,
+              "content_json": "{}",
+              "created_at": 1000,
+              "etag": "\"e1\"",
+              "extent_count": 1,
+              "id": "g_0019a00000000f1f1f1f1f1f1f1f1",
+              "key": "k",
+              "retired_at": null,
+              "size": 3,
+              "state": "live",
+              "user_meta_json": "{}"
+            },
+            "now": 1000
+          },
+          "condition": "absent",
+          "m": "commit_generation",
+          "record": {
+            "generation": "g_0019a00000000f1f1f1f1f1f1f1f1",
+            "key": "r/g_0019a00000000f1f1f1f1f1f1f1f1"
+          }
+        },
+        "op": "request"
+      },
+      "seqs": {
+        "keys_seq": 3,
+        "state_seq": 7
+      }
+    },
+    {
+      "authenticated": true,
+      "kind": "request",
+      "listed": true,
+      "name": {
+        "tenant": "t_00000000000000f1",
+        "unit": 0
+      },
+      "op": {
+        "call": {
+          "c": {
+            "extents": [
+              {
+                "article_count": null,
+                "bucket_id": "b_00000000000000f1",
+                "cipher_sha256": [
+                  7,
+                  7,
+                  7,
+                  7,
+                  7,
+                  7,
+                  7,
+                  7,
+                  7,
+                  7,
+                  7,
+                  7,
+                  7,
+                  7,
+                  7,
+                  7,
+                  7,
+                  7,
+                  7,
+                  7,
+                  7,
+                  7,
+                  7,
+                  7,
+                  7,
+                  7,
+                  7,
+                  7,
+                  7,
+                  7,
+                  7,
+                  7
+                ],
+                "cipher_size": 19,
+                "created_at": 1000,
+                "generation_id": "g_0019a00000000f1f1f1f1f1f1f1f1",
+                "id": "x_000000000000000000000000f1",
+                "key_mode": 1,
+                "last_verified_at": null,
+                "media_header": [
+                  1,
+                  2
+                ],
+                "plain_md5": [
+                  5,
+                  5,
+                  5,
+                  5,
+                  5,
+                  5,
+                  5,
+                  5,
+                  5,
+                  5,
+                  5,
+                  5,
+                  5,
+                  5,
+                  5,
+                  5
+                ],
+                "plain_offset": 0,
+                "plain_sha256": [
+                  6,
+                  6,
+                  6,
+                  6,
+                  6,
+                  6,
+                  6,
+                  6,
+                  6,
+                  6,
+                  6,
+                  6,
+                  6,
+                  6,
+                  6,
+                  6,
+                  6,
+                  6,
+                  6,
+                  6,
+                  6,
+                  6,
+                  6,
+                  6,
+                  6,
+                  6,
+                  6,
+                  6,
+                  6,
+                  6,
+                  6,
+                  6
+                ],
+                "plain_size": 3,
+                "plan_rev": 0,
+                "release_evidence": null,
+                "released_at": null,
+                "safety_state": "held",
+                "seq": 0,
+                "state": "committed",
+                "wrapped_file_key": [
+                  3,
+                  4
+                ]
+              }
+            ],
+            "generation": {
+              "bucket_id": "b_00000000000000f1",
+              "checksum_json": null,
+              "content_json": "{}",
+              "created_at": 1000,
+              "etag": "\"e1\"",
+              "extent_count": 1,
+              "id": "g_0019a00000000f1f1f1f1f1f1f1f1",
+              "key": "k",
+              "retired_at": null,
+              "size": 3,
+              "state": "live",
+              "user_meta_json": "{}"
+            },
+            "now": 1000
+          },
+          "condition": null,
+          "m": "commit_sliced",
+          "record": {
+            "generation": "g_0019a00000000f1f1f1f1f1f1f1f1",
+            "key": "r/g_0019a00000000f1f1f1f1f1f1f1f1"
+          },
+          "write": "w_00000000000000f1"
+        },
+        "op": "request"
+      },
+      "seqs": {
+        "keys_seq": 3,
+        "state_seq": 7
+      }
+    },
+    {
+      "authenticated": true,
+      "kind": "request",
+      "listed": true,
+      "name": {
+        "tenant": "t_00000000000000f1",
+        "unit": 0
+      },
+      "op": {
+        "call": {
+          "c": {
+            "generation": {
+              "bucket_id": "b_00000000000000f1",
+              "checksum_json": null,
+              "content_json": "{}",
+              "created_at": 1000,
+              "etag": "\"e1\"",
+              "extent_count": 1,
+              "id": "g_0019a00000000f1f1f1f1f1f1f1f1",
+              "key": "k",
+              "retired_at": null,
+              "size": 3,
+              "state": "live",
+              "user_meta_json": "{}"
+            },
+            "now": 1000,
+            "source": "g_0019a00000000e1e1e1e1e1e1e1e1",
+            "source_key": "src"
+          },
+          "condition": {
+            "etag": "\"e1\""
+          },
+          "m": "copy_generation",
+          "record": {
+            "generation": "g_0019a00000000f1f1f1f1f1f1f1f1",
+            "key": "r/g_0019a00000000f1f1f1f1f1f1f1f1"
+          }
+        },
+        "op": "request"
+      },
+      "seqs": {
+        "keys_seq": 3,
+        "state_seq": 7
+      }
+    },
+    {
+      "authenticated": true,
+      "kind": "request",
+      "listed": true,
+      "name": {
+        "tenant": "t_00000000000000f1",
+        "unit": 0
+      },
+      "op": {
+        "call": {
+          "extents": [
+            "x_000000000000000000000000f1"
+          ],
+          "m": "open_intents",
+          "now": 1000,
+          "write": "w_00000000000000f1"
+        },
+        "op": "request"
+      },
+      "seqs": {
+        "keys_seq": 3,
+        "state_seq": 7
+      }
+    },
+    {
+      "authenticated": true,
+      "kind": "request",
+      "listed": true,
+      "name": {
+        "tenant": "t_00000000000000f1",
+        "unit": 0
+      },
+      "op": {
+        "call": {
+          "generation": "g_0019a00000000f1f1f1f1f1f1f1f1",
+          "m": "intents_generation",
+          "slices": 2,
+          "write": "w_00000000000000f1"
+        },
+        "op": "request"
+      },
+      "seqs": {
+        "keys_seq": 3,
+        "state_seq": 7
+      }
+    },
+    {
+      "authenticated": true,
+      "kind": "request",
+      "listed": true,
+      "name": {
+        "tenant": "t_00000000000000f1",
+        "unit": 0
+      },
+      "op": {
+        "call": {
+          "m": "abandon_intents",
+          "write": "w_00000000000000f1"
+        },
+        "op": "request"
+      },
+      "seqs": {
+        "keys_seq": 3,
+        "state_seq": 7
+      }
+    },
+    {
+      "authenticated": true,
+      "kind": "request",
+      "listed": true,
+      "name": {
+        "tenant": "t_00000000000000f1",
+        "unit": 0
+      },
+      "op": {
+        "call": {
+          "bucket": "b_00000000000000f1",
+          "generation": true,
+          "id": "g_0019a00000000f1f1f1f1f1f1f1f1",
+          "key": "k",
+          "m": "raise_floor"
+        },
+        "op": "request"
+      },
+      "seqs": {
+        "keys_seq": 3,
+        "state_seq": 7
+      }
+    },
+    {
+      "authenticated": true,
+      "kind": "request",
+      "listed": true,
+      "name": {
+        "tenant": "t_00000000000000f1",
+        "unit": 0
+      },
+      "op": {
+        "call": {
+          "bucket": "b_00000000000000f1",
+          "id": "g_0019a00000000f1f1f1f1f1f1f1f1",
+          "key": "k",
+          "m": "settle_floor"
+        },
+        "op": "request"
+      },
+      "seqs": {
+        "keys_seq": 3,
+        "state_seq": 7
+      }
+    },
+    {
+      "authenticated": true,
+      "kind": "request",
+      "listed": true,
+      "name": {
+        "tenant": "t_00000000000000f1",
+        "unit": 0
+      },
+      "op": {
+        "call": {
+          "bucket": "b_00000000000000f1",
+          "ids": [
+            [
+              "k",
+              "g_0019a00000000f1f1f1f1f1f1f1f1"
+            ]
+          ],
+          "m": "raise_floors"
+        },
+        "op": "request"
+      },
+      "seqs": {
+        "keys_seq": 3,
+        "state_seq": 7
+      }
+    },
+    {
+      "authenticated": true,
+      "kind": "request",
+      "listed": true,
+      "name": {
+        "tenant": "t_00000000000000f1",
+        "unit": 0
+      },
+      "op": {
+        "call": {
+          "bucket": "b_00000000000000f1",
+          "ids": [
+            [
+              "k",
+              "g_0019a00000000f1f1f1f1f1f1f1f1"
+            ]
+          ],
+          "m": "settle_floors"
+        },
+        "op": "request"
+      },
+      "seqs": {
+        "keys_seq": 3,
+        "state_seq": 7
+      }
+    },
+    {
+      "authenticated": true,
+      "kind": "request",
+      "listed": true,
+      "name": {
+        "tenant": "t_00000000000000f1",
+        "unit": 0
+      },
+      "op": {
+        "call": {
+          "before": "g_0019a00000000f1f1f1f1f1f1f1f1",
+          "bucket": "b_00000000000000f1",
+          "key": "k",
+          "m": "delete_object_before",
+          "now": 1000
+        },
+        "op": "request"
+      },
+      "seqs": {
+        "keys_seq": 3,
+        "state_seq": 7
+      }
+    },
+    {
+      "authenticated": true,
+      "kind": "request",
+      "listed": true,
+      "name": {
+        "tenant": "t_00000000000000f1",
+        "unit": 0
+      },
+      "op": {
+        "call": {
+          "before": "g_0019a00000000f1f1f1f1f1f1f1f1",
+          "bucket": "b_00000000000000f1",
+          "condition": "exists",
+          "key": "k",
+          "m": "delete_object_if",
+          "now": 1000
+        },
+        "op": "request"
+      },
+      "seqs": {
+        "keys_seq": 3,
+        "state_seq": 7
+      }
+    },
+    {
+      "authenticated": true,
+      "kind": "request",
+      "listed": true,
+      "name": {
+        "tenant": "t_00000000000000f1",
+        "unit": 0
+      },
+      "op": {
+        "call": {
+          "bucket": "b_00000000000000f1",
+          "deletes": [
+            [
+              "k",
+              "g_0019a00000000f1f1f1f1f1f1f1f1",
+              1000
+            ]
+          ],
+          "m": "delete_objects_before"
+        },
+        "op": "request"
+      },
+      "seqs": {
+        "keys_seq": 3,
+        "state_seq": 7
+      }
+    },
+    {
+      "authenticated": true,
+      "kind": "request",
+      "listed": true,
+      "name": {
+        "tenant": "t_00000000000000f1",
+        "unit": 0
+      },
+      "op": {
+        "call": {
+          "m": "create_upload",
+          "u": {
+            "bucket_id": "b_00000000000000f1",
+            "complete_digest": null,
+            "completed_generation_id": null,
+            "content_json": "{}",
+            "id": "u_00000000000000f1",
+            "initiated_at": 1000,
+            "key": "k",
+            "result_etag": null,
+            "revision": 0,
+            "state": "open",
+            "user_meta_json": "{}"
+          }
+        },
+        "op": "request"
+      },
+      "seqs": {
+        "keys_seq": 3,
+        "state_seq": 7
+      }
+    },
+    {
+      "authenticated": true,
+      "kind": "request",
+      "listed": true,
+      "name": {
+        "tenant": "t_00000000000000f1",
+        "unit": 0
+      },
+      "op": {
+        "call": {
+          "bucket": "b_00000000000000f1",
+          "extent": {
+            "article_count": null,
+            "bucket_id": "b_00000000000000f1",
+            "cipher_sha256": [
+              7,
+              7,
+              7,
+              7,
+              7,
+              7,
+              7,
+              7,
+              7,
+              7,
+              7,
+              7,
+              7,
+              7,
+              7,
+              7,
+              7,
+              7,
+              7,
+              7,
+              7,
+              7,
+              7,
+              7,
+              7,
+              7,
+              7,
+              7,
+              7,
+              7,
+              7,
+              7
+            ],
+            "cipher_size": 19,
+            "created_at": 1000,
+            "generation_id": "g_0019a00000000f1f1f1f1f1f1f1f1",
+            "id": "x_000000000000000000000000f1",
+            "key_mode": 1,
+            "last_verified_at": null,
+            "media_header": [
+              1,
+              2
+            ],
+            "plain_md5": [
+              5,
+              5,
+              5,
+              5,
+              5,
+              5,
+              5,
+              5,
+              5,
+              5,
+              5,
+              5,
+              5,
+              5,
+              5,
+              5
+            ],
+            "plain_offset": 0,
+            "plain_sha256": [
+              6,
+              6,
+              6,
+              6,
+              6,
+              6,
+              6,
+              6,
+              6,
+              6,
+              6,
+              6,
+              6,
+              6,
+              6,
+              6,
+              6,
+              6,
+              6,
+              6,
+              6,
+              6,
+              6,
+              6,
+              6,
+              6,
+              6,
+              6,
+              6,
+              6,
+              6,
+              6
+            ],
+            "plain_size": 3,
+            "plan_rev": 0,
+            "release_evidence": null,
+            "released_at": null,
+            "safety_state": "held",
+            "seq": 0,
+            "state": "committed",
+            "wrapped_file_key": [
+              3,
+              4
+            ]
+          },
+          "key": "k",
+          "m": "put_upload_part",
+          "now": 1000,
+          "part": {
+            "etag": "\"e1\"",
+            "extent_id": "x_000000000000000000000000f1",
+            "part_number": 1,
+            "size": 3,
+            "upload_id": "u_00000000000000f1",
+            "uploaded_at": 1000
+          },
+          "upload": "u_00000000000000f1"
+        },
+        "op": "request"
+      },
+      "seqs": {
+        "keys_seq": 3,
+        "state_seq": 7
+      }
+    },
+    {
+      "authenticated": true,
+      "kind": "request",
+      "listed": true,
+      "name": {
+        "tenant": "t_00000000000000f1",
+        "unit": 0
+      },
+      "op": {
+        "call": {
+          "bucket": "b_00000000000000f1",
+          "extents": [
+            {
+              "article_count": null,
+              "bucket_id": "b_00000000000000f1",
+              "cipher_sha256": [
+                7,
+                7,
+                7,
+                7,
+                7,
+                7,
+                7,
+                7,
+                7,
+                7,
+                7,
+                7,
+                7,
+                7,
+                7,
+                7,
+                7,
+                7,
+                7,
+                7,
+                7,
+                7,
+                7,
+                7,
+                7,
+                7,
+                7,
+                7,
+                7,
+                7,
+                7,
+                7
+              ],
+              "cipher_size": 19,
+              "created_at": 1000,
+              "generation_id": "g_0019a00000000f1f1f1f1f1f1f1f1",
+              "id": "x_000000000000000000000000f1",
+              "key_mode": 1,
+              "last_verified_at": null,
+              "media_header": [
+                1,
+                2
+              ],
+              "plain_md5": [
+                5,
+                5,
+                5,
+                5,
+                5,
+                5,
+                5,
+                5,
+                5,
+                5,
+                5,
+                5,
+                5,
+                5,
+                5,
+                5
+              ],
+              "plain_offset": 0,
+              "plain_sha256": [
+                6,
+                6,
+                6,
+                6,
+                6,
+                6,
+                6,
+                6,
+                6,
+                6,
+                6,
+                6,
+                6,
+                6,
+                6,
+                6,
+                6,
+                6,
+                6,
+                6,
+                6,
+                6,
+                6,
+                6,
+                6,
+                6,
+                6,
+                6,
+                6,
+                6,
+                6,
+                6
+              ],
+              "plain_size": 3,
+              "plan_rev": 0,
+              "release_evidence": null,
+              "released_at": null,
+              "safety_state": "held",
+              "seq": 0,
+              "state": "committed",
+              "wrapped_file_key": [
+                3,
+                4
+              ]
+            }
+          ],
+          "key": "k",
+          "m": "put_upload_part_sliced",
+          "now": 1000,
+          "part": {
+            "etag": "\"e1\"",
+            "extent_id": "x_000000000000000000000000f1",
+            "part_number": 1,
+            "size": 3,
+            "upload_id": "u_00000000000000f1",
+            "uploaded_at": 1000
+          },
+          "upload": "u_00000000000000f1",
+          "write": "w_00000000000000f1"
+        },
+        "op": "request"
+      },
+      "seqs": {
+        "keys_seq": 3,
+        "state_seq": 7
+      }
+    },
+    {
+      "authenticated": true,
+      "kind": "request",
+      "listed": true,
+      "name": {
+        "tenant": "t_00000000000000f1",
+        "unit": 0
+      },
+      "op": {
+        "call": {
+          "bucket": "b_00000000000000f1",
+          "c": {
+            "generation": {
+              "bucket_id": "b_00000000000000f1",
+              "checksum_json": null,
+              "content_json": "{}",
+              "created_at": 1000,
+              "etag": "\"e1\"",
+              "extent_count": 1,
+              "id": "g_0019a00000000f1f1f1f1f1f1f1f1",
+              "key": "k",
+              "retired_at": null,
+              "size": 3,
+              "state": "live",
+              "user_meta_json": "{}"
+            },
+            "now": 1000,
+            "placements": [
+              {
+                "extent_id": "x_000000000000000000000000f1",
+                "plain_offset": 0,
+                "seq": 0
+              }
+            ]
+          },
+          "condition": null,
+          "digest": [
+            9,
+            9,
+            9,
+            9,
+            9,
+            9,
+            9,
+            9,
+            9,
+            9,
+            9,
+            9,
+            9,
+            9,
+            9,
+            9,
+            9,
+            9,
+            9,
+            9,
+            9,
+            9,
+            9,
+            9,
+            9,
+            9,
+            9,
+            9,
+            9,
+            9,
+            9,
+            9
+          ],
+          "key": "k",
+          "m": "complete_upload",
+          "record": {
+            "generation": "g_0019a00000000f1f1f1f1f1f1f1f1",
+            "key": "r/g_0019a00000000f1f1f1f1f1f1f1f1"
+          },
+          "revision": 1,
+          "upload": "u_00000000000000f1"
+        },
+        "op": "request"
+      },
+      "seqs": {
+        "keys_seq": 3,
+        "state_seq": 7
+      }
+    },
+    {
+      "authenticated": true,
+      "kind": "request",
+      "listed": true,
+      "name": {
+        "tenant": "t_00000000000000f1",
+        "unit": 0
+      },
+      "op": {
+        "call": {
+          "bucket": "b_00000000000000f1",
+          "key": "k",
+          "m": "abort_upload",
+          "now": 1000,
+          "upload": "u_00000000000000f1"
+        },
+        "op": "request"
+      },
+      "seqs": {
+        "keys_seq": 3,
+        "state_seq": 7
+      }
+    },
+    {
+      "authenticated": true,
+      "kind": "request",
+      "listed": true,
+      "name": {
+        "tenant": "t_00000000000000f1",
+        "unit": 0
+      },
+      "op": {
+        "call": {
+          "jobs": [
+            {
+              "extent": "x_000000000000000000000000f1",
+              "generation": "g_0019a00000000f1f1f1f1f1f1f1f1",
+              "stage": "post",
+              "t": "extent",
+              "v": 1
+            }
+          ],
+          "m": "unmark_sent",
+          "mark": 1000
+        },
+        "op": "request"
+      },
+      "seqs": {
+        "keys_seq": 3,
+        "state_seq": 7
+      }
+    },
+    {
+      "authenticated": true,
+      "kind": "request",
+      "listed": true,
+      "name": {
+        "tenant": "t_00000000000000f1",
+        "unit": 0
+      },
+      "op": {
+        "call": {
+          "bucket": "b_00000000000000f1",
+          "key": "k",
+          "m": "fence_upload",
+          "revision": 1,
+          "upload": "u_00000000000000f1"
+        },
+        "op": "request"
+      },
       "seqs": {
         "keys_seq": 3,
         "state_seq": 7

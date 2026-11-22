@@ -8,6 +8,7 @@ use serde_json::{json, Value};
 use velmora_bridge::testkit::{FixedClock, MemBlobStore, RusqliteSql};
 use velmora_bridge::unit::jobcall::JobCall;
 use velmora_bridge::unit::keys::{Access, KeyEntry, KeyGrant, KeyKind, SubjectStatus};
+use velmora_bridge::unit::request::RequestCall;
 use velmora_bridge::unit::restore::lease_view;
 use velmora_bridge::unit::{
     AlarmSent, BirthKind, BirthToken, CallKind, Refused, Seqs, SyncHead, TenantId, TenantState,
@@ -19,7 +20,7 @@ use velmora_bridge::unit_lease::lease::{LeaseRefusal, LeaseRules, Proven};
 use velmora_bridge::unit_lease::renewal::{prove, ChainNames, Proof, UnitView};
 use velmora_bridge::unit_lease::store;
 use velmora_bridge::unit_lease::UnitStampId;
-use velmora_bridge::{BlobMeta, BlobStore, BucketId, Clock, ExtentId, UnixMs};
+use velmora_bridge::{BlobMeta, BlobStore, BucketId, Clock, ExtentId, UnixMs, UploadId};
 
 const NOW: UnixMs = UnixMs(1_795_000_000_000);
 const T: i64 = LeaseRules::DEFAULT.term_ms;
@@ -28,6 +29,7 @@ const P: &str = "p_owner";
 const K: &str = "AKWIRE00000000000001";
 const GONE: &str = "AKWIRE00000000000099";
 const B1: &str = "b_00000000000000e1";
+const B2: &str = "b_00000000000000e2";
 
 fn tenant() -> TenantId {
     TenantId::parse("t_0000000000000e01").unwrap()
@@ -299,11 +301,13 @@ fn an_expired_lease_refuses_every_call_but_the_workers_and_writes_nothing() {
         (CallKind::Request, true, UnitOp::Ping {}),
         (CallKind::Request, true, read_plan()),
         (CallKind::Request, false, read_plan()),
+        // AM-63: only the unauthenticated `key_row` is answered (below).
         (
             CallKind::Request,
-            false,
+            true,
             UnitOp::KeyRow {
                 access_key_id: K.into(),
+                presigned: None,
             },
         ),
     ] {
@@ -331,7 +335,7 @@ fn an_expired_lease_refuses_every_call_but_the_workers_and_writes_nothing() {
             &u,
             UnitOp::ApplyKeys {
                 from_seq: 0,
-                entries: vec![principal(1)],
+                entries: vec![principal(1).into()],
                 answers: vec![],
             },
             NOW
@@ -359,6 +363,83 @@ fn an_expired_lease_refuses_every_call_but_the_workers_and_writes_nothing() {
         NOW,
     );
     assert!(renew_needed(None)(&a), "{a:?}");
+}
+
+fn key_row(u: &Unit<RusqliteSql>, kind: CallKind, authenticated: bool, now: UnixMs) -> UnitAnswer {
+    let seqs = u.head().unwrap().seqs;
+    u.handle(
+        &call(
+            kind,
+            Some(seqs),
+            authenticated,
+            UnitOp::KeyRow {
+                access_key_id: K.into(),
+                presigned: None,
+            },
+        ),
+        now,
+    )
+}
+
+/// AM-63: with an expired lease the unit still answers the S3 path's
+/// first call, an unauthenticated `key_row`, read-only and marked
+/// `lease_expired`, so a request whose signature verifies can renew as a
+/// signed call. Nothing else is served: an authenticated `key_row` and
+/// every write wait for the renewal.
+#[test]
+fn an_expired_lease_answers_the_unauthenticated_key_row_marked_and_serves_nothing_else() {
+    let u = born();
+    assert!(matches!(
+        worker(
+            &u,
+            UnitOp::ApplyKeys {
+                from_seq: 0,
+                entries: vec![principal(1).into(), key(K, 2).into()],
+                answers: vec![],
+            },
+            NOW
+        ),
+        UnitAnswer::Ok { .. }
+    ));
+    let before = changes(&u);
+    let a = key_row(&u, CallKind::Request, false, NOW);
+    let UnitAnswer::Ok { body, .. } = &a else {
+        panic!("{a:?}")
+    };
+    assert_eq!(body["lease_expired"], json!(true), "{body}");
+    assert_eq!(body["key"]["access_key_id"], json!(K), "{body}");
+    assert_eq!(body["state"]["tenant_state"], json!("active"), "{body}");
+    assert_eq!(changes(&u), before, "read-only");
+
+    // Signed, or not a request: the renewal first.
+    assert!(renew_needed(None)(&key_row(
+        &u,
+        CallKind::Request,
+        true,
+        NOW
+    )));
+    assert!(renew_needed(None)(&key_row(&u, CallKind::Job, false, NOW)));
+    // A write in the same state is refused and writes nothing.
+    let seqs = u.head().unwrap().seqs;
+    let write = UnitOp::Request {
+        call: Box::new(RequestCall::abort_upload {
+            bucket: BucketId::new(B1),
+            key: "k".into(),
+            upload: UploadId::new("u_00000000000000e1"),
+            now: NOW,
+        }),
+    };
+    let a = u.handle(&call(CallKind::Request, Some(seqs), true, write), NOW);
+    assert!(renew_needed(None)(&a), "{a:?}");
+    assert_eq!(changes(&u), before, "nothing written");
+
+    // After a renewal the same read is served as usual, not marked.
+    assert!(matches!(renew(&u, NOW), UnitAnswer::Ok { .. }));
+    let a = key_row(&u, CallKind::Request, false, NOW);
+    let UnitAnswer::Ok { body, .. } = &a else {
+        panic!("{a:?}")
+    };
+    assert_eq!(body["lease_expired"], json!(false), "{body}");
 }
 
 #[test]
@@ -433,7 +514,7 @@ fn renew_applies_the_listed_revocations_and_counts_each_id_once() {
             &u,
             UnitOp::ApplyKeys {
                 from_seq: 0,
-                entries: vec![principal(1), key(K, 2)],
+                entries: vec![principal(1).into(), key(K, 2).into()],
                 answers: vec![],
             },
             NOW
@@ -458,7 +539,7 @@ fn renew_applies_the_listed_revocations_and_counts_each_id_once() {
         &u,
         UnitOp::ApplyKeys {
             from_seq: 2,
-            entries: vec![key(GONE, 3)],
+            entries: vec![key(GONE, 3).into()],
             answers: vec![],
         },
         NOW,
@@ -555,6 +636,12 @@ fn a_recorded_rollback_closes_the_lease_at_once_and_refuses_renewal() {
     p.stamp_counter = Some(1);
     let a = worker(&u, renew_op(NOW, p, &[]), NOW);
     assert!(renew_needed(Some(LeaseRefusal::RolledBack))(&a), "{a:?}");
+    // The revocations a refused renewal listed are kept all the same.
+    let mut p = proven(&u, 1);
+    p.stamp_counter = Some(1);
+    let a = worker(&u, renew_op(NOW, p, &[GONE]), NOW);
+    assert!(renew_needed(Some(LeaseRefusal::RolledBack))(&a), "{a:?}");
+    assert!(store::holds_revoked(u.sql(), GONE).unwrap());
 }
 
 #[test]
@@ -589,7 +676,7 @@ fn every_answer_carries_the_lease_left_and_the_revoked_count_once_keys_exist() {
             &u,
             UnitOp::ApplyKeys {
                 from_seq: 0,
-                entries: vec![principal(1)],
+                entries: vec![principal(1).into()],
                 answers: vec![],
             },
             NOW
@@ -687,6 +774,90 @@ fn the_first_write_since_the_raise_asks_for_the_alarm_once() {
     assert_eq!(u.take_wake(), None);
 }
 
+fn request_call(call: RequestCall) -> UnitOp {
+    UnitOp::Request {
+        call: Box::new(call),
+    }
+}
+
+/// AM-48: an S3 request call that changed a row (L1-5, `Unit::request`)
+/// makes the raise due like a job's; a read and a refused write do not.
+#[test]
+fn a_request_write_makes_the_raise_due_and_a_read_or_a_refusal_does_not() {
+    let u = fresh();
+    let _ = u.take_wake();
+    let read = request_call(RequestCall::live_generation {
+        bucket: BucketId::new(B1),
+        key: "k".into(),
+    });
+    assert!(matches!(
+        request(&u, true, read, NOW),
+        UnitAnswer::Ok { .. }
+    ));
+    assert_eq!(lease_row(&u).first_write_at, None);
+    assert_eq!(u.take_wake(), None);
+    // Out of bounds: refused before it runs.
+    let refused = request_call(RequestCall::raise_floor {
+        bucket: BucketId::new(B1),
+        key: "k".repeat(2_000),
+        id: velmora_bridge::GenerationId::new("g_0019a00000000e1e1e1e1e1e1e1e2"),
+        generation: true,
+    });
+    assert!(matches!(
+        request(&u, true, refused, NOW),
+        UnitAnswer::Refused { .. }
+    ));
+    assert_eq!(lease_row(&u).first_write_at, None);
+    assert_eq!(u.take_wake(), None);
+    // A floor: a write.
+    let write = request_call(RequestCall::raise_floor {
+        bucket: BucketId::new(B1),
+        key: "k".into(),
+        id: velmora_bridge::GenerationId::new("g_0019a00000000e1e1e1e1e1e1e1e2"),
+        generation: true,
+    });
+    let a = request(&u, true, write, NOW);
+    assert!(matches!(a, UnitAnswer::Ok { .. }), "{a:?}");
+    assert_eq!(lease_row(&u).first_write_at, Some(NOW));
+    assert_eq!(u.take_wake(), Some(UnixMs(NOW.0 + PERIOD)));
+}
+
+/// AM-48: a `bucket_close` that marked the bucket makes the raise due; a
+/// refused one (the bucket holds data) does not.
+#[test]
+fn a_bucket_close_makes_the_raise_due_and_a_refused_one_does_not() {
+    let u = fresh();
+    let _ = u.take_wake();
+    let close = || {
+        worker(
+            &u,
+            UnitOp::BucketClose {
+                bucket_id: B1.into(),
+            },
+            NOW,
+        )
+    };
+    assert!(matches!(close(), UnitAnswer::Refused { .. }), "B1 holds k");
+    assert_eq!(lease_row(&u).first_write_at, None);
+    assert_eq!(u.take_wake(), None);
+    u.sql()
+        .apply(&format!(
+            "INSERT INTO buckets(id, name, owner, bdk_wrapped, kek_version, created_at) \
+               VALUES ('{B2}', 'beta', 'o', x'02', 1, 1);"
+        ))
+        .unwrap();
+    let a = worker(
+        &u,
+        UnitOp::BucketClose {
+            bucket_id: B2.into(),
+        },
+        NOW,
+    );
+    assert!(matches!(a, UnitAnswer::Ok { .. }), "{a:?}");
+    assert_eq!(lease_row(&u).first_write_at, Some(NOW));
+    assert_eq!(u.take_wake(), Some(UnixMs(NOW.0 + PERIOD)));
+}
+
 /// A fresh unit holding the principal `P` (its owner ref `member-1`).
 fn fresh_with_principal() -> Unit<RusqliteSql> {
     let u = fresh();
@@ -694,7 +865,7 @@ fn fresh_with_principal() -> Unit<RusqliteSql> {
         &u,
         UnitOp::ApplyKeys {
             from_seq: 0,
-            entries: vec![principal(1)],
+            entries: vec![principal(1).into()],
             answers: vec![],
         },
         NOW,
@@ -1088,7 +1259,7 @@ fn a_revoked_principal_is_not_counted() {
             &u,
             UnitOp::ApplyKeys {
                 from_seq: 0,
-                entries: vec![gone],
+                entries: vec![gone.into()],
                 answers: vec![],
             },
             NOW
@@ -1195,7 +1366,7 @@ fn a_listed_id_of_a_principal_row_counts_without_touching_it() {
             &u,
             UnitOp::ApplyKeys {
                 from_seq: 0,
-                entries: vec![p],
+                entries: vec![p.into()],
                 answers: vec![],
             },
             NOW
