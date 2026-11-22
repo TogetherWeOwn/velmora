@@ -341,46 +341,15 @@ impl UnitImport for Adapter<'_> {
         Ok(answer)
     }
 
-    /// From the unit's own `ImportProgress`, and its `unit_import_move`
-    /// row for the tenant-0 seq (L1 is asked to answer it in
-    /// `ImportProgress`; read from the unit's table until then).
+    /// The unit's own `ImportProgress` answer, mapped by the move's own
+    /// reader (`t0_seq`, `sealed`, `lifted_at` and the tables' rows all
+    /// come from the answer).
     async fn import_state(&self) -> Result<Option<ImportState>> {
         let a = worker(self.unit, seqs(self.state_seq), UnitOp::ImportProgress {});
         let UnitAnswer::Ok { body, .. } = a else {
             panic!("{a:?}")
         };
-        let t0_seq = ready(
-            self.unit
-                .sql()
-                .query("SELECT t0_seq FROM unit_import_move WHERE id = 1", &[]),
-        )
-        .unwrap()
-        .first()
-        .and_then(|r| match r.first() {
-            Some(SqlValue::Int(n)) => Some(*n as u64),
-            _ => None,
-        });
-        let tables: Vec<ImportCount> = body["tables"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|t| ImportCount {
-                table: ImportTable::ALL
-                    .into_iter()
-                    .find(|x| x.name() == t["table"].as_str().unwrap())
-                    .unwrap(),
-                rows: t["rows"].as_u64().unwrap(),
-            })
-            .collect();
-        if t0_seq.is_none() && tables.is_empty() {
-            return Ok(None);
-        }
-        Ok(Some(ImportState {
-            t0_seq,
-            sealed: body["sealed"].as_u64(),
-            lifted_at: body["lifted_at"].as_i64().map(velmora_bridge::UnixMs),
-            tables,
-        }))
+        ImportState::from_progress(&body)
     }
 }
 
@@ -946,6 +915,22 @@ fn a_crash_or_a_lost_answer_resumes_from_the_units_progress() {
             .map(|t| rows(u.sql(), *t).len())
             .sum();
         assert!(partial > 0);
+        // The resume is told this window's import from the unit's answer
+        // alone: its `t0_seq` is the one the unit bound (without it the
+        // copy would take the import as an earlier window's and stop).
+        let state = adapter.import_state().await.unwrap().unwrap();
+        let bound_t0 = ready(
+            u.sql()
+                .query("SELECT t0_seq FROM unit_import_move WHERE id = 1", &[]),
+        )
+        .unwrap();
+        assert_eq!(
+            state.t0_seq.map(|t| SqlValue::Int(t as i64)).as_ref(),
+            bound_t0.first().and_then(|r| r.first())
+        );
+        assert!(state.t0_seq.is_some_and(|t| t >= WINDOW_START), "{state:?}");
+        assert_eq!(state.lifted_at, None);
+        assert_eq!(state.sealed, None);
         adapter.fail_after.set(None);
         copy_all(
             &rig.bridge.catalog.sql,
@@ -1334,7 +1319,10 @@ impl velmora_bridge::directory::move_flip::OwnerUnit for LiftCalls<'_> {
     async fn move_import(
         &self,
     ) -> Result<Option<velmora_bridge::directory::move_copy::ImportState>> {
-        unimplemented!("not a lift call")
+        match worker(self.unit, seqs(self.state_seq), UnitOp::ImportProgress {}) {
+            UnitAnswer::Ok { body, .. } => ImportState::from_progress(&body),
+            other => panic!("{other:?}"),
+        }
     }
     async fn v9(&self) -> Result<bool> {
         unimplemented!("not a lift call")
@@ -1421,6 +1409,16 @@ fn the_move_report_lifts_the_real_unit_only_after_the_seal() {
             },
         );
         assert!(matches!(lifted, UnitAnswer::Ok { .. }), "{lifted:?}");
+        // AM-67, step 8(b1): the lift time the unit stored reaches the
+        // move's reader, the floor it writes into `move_floors[0]`.
+        use velmora_bridge::directory::move_flip::OwnerUnit;
+        let lifted = calls.move_import().await.unwrap().unwrap();
+        assert_eq!(lifted.lifted_at, Some(UNIT_NOW));
+        assert_eq!(lifted.sealed, Some(move_ordinal(&zero.door).unwrap()));
+        assert!(
+            lifted.t0_seq.is_some_and(|t| t >= WINDOW_START),
+            "{lifted:?}"
+        );
     });
 }
 
