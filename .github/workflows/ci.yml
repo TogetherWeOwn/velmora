@@ -730,11 +730,13 @@ jobs:
           set -euo pipefail
           bash bundle.sh
           python3 -I tools/strip_wasm.py check build/index_bg.wasm
-          # The digest of what ships, and the compiler that built it: the
-          # merge runbook compares them with the live version's run to
+          # The digest of every file wrangler uploads or bundles (the wasm,
+          # the JS glue and the shim entry point), and the compiler that
+          # built them. Wrangler itself is pinned by package-lock.json. The
+          # merge runbook compares these with the live version's run to
           # tell a deploy of the same bytes from a changed one.
           rustc --version
-          sha256sum build/index_bg.wasm build/index.js | tee -a "$GITHUB_STEP_SUMMARY"
+          (cd build && find . -type f | sort | xargs sha256sum) | tee -a "$GITHUB_STEP_SUMMARY"
       - name: Install pinned wrangler (npm ci)
         if: steps.fresh.outputs.fresh == 'true'
         working-directory: workers/s3-bridge
