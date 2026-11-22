@@ -135,8 +135,9 @@ fn a_scope_is_made_only_at_the_listed_places() {
             // tenant 0, a unit job of tenant 0, a managed tenant with no
             // unit), whether a unit job names tenant 0, which has no unit
             // (one, compared by id; no scope is made from it), and its
-            // tests (four).
-            ("bridge/jobmsg.rs", 10),
+            // tests (four), and the tenant a control intent must not name
+            // (one).
+            ("bridge/jobmsg.rs", 11),
             // The queue sink: the tenant its messages name.
             ("worker/env.rs", 1),
             // Whether a scope is tenant 0, whose layouts alone include
@@ -158,7 +159,7 @@ fn a_scope_is_made_only_at_the_listed_places() {
     );
     // The reader of a message makes the scope of the job path, and the
     // consumer takes it from there: it makes none of its own.
-    assert_eq!(found.get("bridge/jobmsg.rs"), Some(&10));
+    assert_eq!(found.get("bridge/jobmsg.rs"), Some(&11));
     assert_eq!(found.get("worker/lib.rs"), None);
 }
 
