@@ -34,6 +34,7 @@ use velmora_mgmt_types::Code;
 
 use crate::directory::chain::ChainError;
 use crate::directory::record::{TenantDoor as Door, TenantState};
+use crate::keys::checkpoint::read_key_chain;
 use crate::keys::gate::MoveGate;
 use crate::keys::ports::{
     Applied, ApplyEntry, ControlIntents, KeptAnswer as ChainKept, KeyAdmission, KeyTarget, Refusal,
@@ -504,6 +505,26 @@ impl<'e, 'a, S, K, T, A, I, U, D, C, G, R> KeyChain<'e, 'a, S, K, T, A, I, U, D,
             rng: RefCell::new(Some(rng)),
         }
     }
+
+    /// With a key table of the tenant read earlier (an isolate's cache):
+    /// each call brings it to the chain's head first.
+    pub fn with_table(
+        env: &'e KeyEnv<'a, S, K, T, A, I, U, D, C, G>,
+        table: KeyTable,
+        rng: R,
+    ) -> Self {
+        KeyChain {
+            env,
+            table: RefCell::new(Some(table)),
+            rng: RefCell::new(Some(rng)),
+        }
+    }
+
+    /// The key table as the last call left it (to keep for the next
+    /// request of the isolate).
+    pub fn into_table(self) -> Option<KeyTable> {
+        self.table.into_inner()
+    }
 }
 
 /// A principal create's subject: kind `principal`, active, no secret, the
@@ -607,12 +628,21 @@ where
     }
 
     /// The table, taken out for one call (no borrow is held across an
-    /// await); [`Self::put_back`] returns it.
-    fn take_table(&self) -> KeyTable {
-        self.table
-            .borrow_mut()
-            .take()
-            .unwrap_or_else(|| KeyTable::empty(self.env.tenant.clone()))
+    /// await); [`Self::put_back`] returns it. A first call reads the chain
+    /// from its newest checkpoint that holds (ADR §8.5), not from seq 1;
+    /// the writer then brings it to the head.
+    async fn take_table(&self) -> Result<KeyTable> {
+        let held = self.table.borrow_mut().take();
+        match held {
+            Some(table) => Ok(table),
+            None => {
+                Ok(
+                    read_key_chain(self.env.store, self.env.kek, self.env.ring, self.env.tenant)
+                        .await?
+                        .table,
+                )
+            }
+        }
     }
 
     fn put_back(&self, table: KeyTable) {
@@ -649,7 +679,7 @@ where
         above: u64,
     ) -> Result<Option<RecordedPrincipal>> {
         self.check(tenant)?;
-        let mut table = self.take_table();
+        let mut table = self.take_table().await?;
         let found = self.env.carrying(&mut table, &ChainRid(rid.0), above).await;
         let out = match found {
             // A record of the reservation names a subject the table does
@@ -672,7 +702,7 @@ where
 
     async fn finish(&self, tenant: &TenantId, id: &str) -> Result<ChainWrite> {
         self.check(tenant)?;
-        let mut table = self.take_table();
+        let mut table = self.take_table().await?;
         let found = self.env.finish_subject(&mut table, id).await;
         let out = match found {
             Ok(Finished::Done { .. }) => Ok(Self::done(&table, id)),
@@ -696,7 +726,9 @@ where
                 "mgmt: the create is not its reservation's",
             ));
         }
+        let mut table = self.take_table().await?;
         let Some(mut rng) = self.rng.borrow_mut().take() else {
+            self.put_back(table);
             return Err(BridgeError::Invalid("mgmt: no random source"));
         };
         let subject = principal_subject(principal);
@@ -710,7 +742,6 @@ where
             keys_seq: principal.seq - 1,
             answer: &kept,
         };
-        let mut table = self.take_table();
         let written = self
             .env
             .create_reserved(&mut table, &subject, reserved, &mut rng)
