@@ -33,7 +33,7 @@
 //! owner's tenant and the unit's `restoring` entry is the one named
 //! ([`crate::unit::import`]); [`bound`] builds both from the two heads.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use super::record::{Selector, TenantDoor};
 use crate::ports::{Sql, SqlValue};
@@ -227,7 +227,24 @@ impl<S: Sql, U: UnitImport, T: RowTransform> Copier<'_, S, U, T> {
             None => None,
         };
         let keys = key_columns(table);
-        let page_size = self.plan.page.clamp(1, PAGE);
+        // The hour under way of the frozen D1's live counters (AM-17) is
+        // filed into `usage_hours` where it falls in hour order: added to
+        // its own hour's row, or as a row of its own. One that falls at or
+        // before the unit's cursor was filed by an earlier run.
+        let mut hour = match table {
+            ImportTable::UsageHours => self.hour_under_way().await?,
+            _ => None,
+        };
+        if let (Some((h, _)), Some(pos)) = (&hour, &position) {
+            if matches!(pos.first(), Some(ImportValue::Int(c)) if c >= h) {
+                hour = None;
+            }
+        }
+        // Room in a full page for the filed hour's own row.
+        let page_size = match table {
+            ImportTable::UsageHours => self.plan.page.clamp(1, PAGE - 1),
+            _ => self.plan.page.clamp(1, PAGE),
+        };
         loop {
             let params: Vec<SqlValue> = position.iter().flatten().map(to_sql).collect();
             let select = select_page(table, position.is_some(), page_size);
@@ -247,6 +264,19 @@ impl<S: Sql, U: UnitImport, T: RowTransform> Copier<'_, S, U, T> {
                     continue;
                 }
                 self.change(table, &mut row, &mut done)?;
+                if let Some((h, counts)) = hour {
+                    let at = match row.first() {
+                        Some(ImportValue::Int(at)) => *at,
+                        _ => return Err(BridgeError::Invalid("move copy: hour").into()),
+                    };
+                    if at == h {
+                        add_hour(&mut row, &counts)?;
+                        hour = None;
+                    } else if at > h {
+                        rows.push(hour_row(h, &counts));
+                        hour = None;
+                    }
+                }
                 rows.push(row);
             }
             let Some(last) = last else { break };
@@ -254,25 +284,81 @@ impl<S: Sql, U: UnitImport, T: RowTransform> Copier<'_, S, U, T> {
             if cursor.len() > MAX_CURSOR {
                 return Err(CopyError::CursorTooLong { table });
             }
-            if !rows.is_empty() {
-                let batch = ImportBatch {
-                    table,
-                    columns: table.columns().iter().map(|c| c.to_string()).collect(),
-                    after: after.clone(),
-                    cursor: cursor.clone(),
-                    rows,
-                };
-                let n = batch.rows.len() as u64;
-                done.unit_rows = self.send(&batch).await?;
-                done.sent += n;
-                after = Some(cursor);
-            }
+            self.send_rows(table, &mut after, cursor, rows, &mut done)
+                .await?;
             position = Some(last);
             if page.len() < page_size {
                 break;
             }
         }
+        // After every hour filed: the hour under way as the last batch.
+        if let Some((h, counts)) = hour {
+            let cursor = encode_cursor(&[ImportValue::Int(h)]);
+            self.send_rows(
+                table,
+                &mut after,
+                cursor,
+                vec![hour_row(h, &counts)],
+                &mut done,
+            )
+            .await?;
+        }
         Ok(done)
+    }
+
+    /// Sends `rows` (if any) as the batch after `after`, ending at
+    /// `cursor`, and moves `after` on.
+    async fn send_rows(
+        &self,
+        table: ImportTable,
+        after: &mut Option<String>,
+        cursor: String,
+        rows: Vec<Vec<ImportValue>>,
+        done: &mut TableCopy,
+    ) -> Result<(), CopyError> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let batch = ImportBatch {
+            table,
+            columns: table.columns().iter().map(|c| c.to_string()).collect(),
+            after: after.clone(),
+            cursor: cursor.clone(),
+            rows,
+        };
+        let n = batch.rows.len() as u64;
+        done.unit_rows = self.send(&batch).await?;
+        done.sent += n;
+        *after = Some(cursor);
+        Ok(())
+    }
+
+    /// The frozen D1's hour under way: `(hour, [posts, verifies, releases,
+    /// dead, failures])` of live row 1, as `usage::off` files it (an hour
+    /// with no event is not filed).
+    async fn hour_under_way(&self) -> Result<Option<(i64, [i64; 5])>, CopyError> {
+        let rows = self
+            .frozen
+            .query(
+                "SELECT hour, h_posts, h_verifies, h_releases, h_dead, h_failures \
+                 FROM usage_global WHERE id = 1 AND hour > 0 \
+                 AND h_posts + h_verifies + h_releases + h_dead + h_failures > 0",
+                &[],
+            )
+            .await?;
+        let Some(row) = rows.first() else {
+            return Ok(None);
+        };
+        let int = |i: usize| match row.get(i) {
+            Some(SqlValue::Int(n)) => Ok(*n),
+            _ => Err(CopyError::Store(BridgeError::Invalid(
+                "move copy: usage_global row",
+            ))),
+        };
+        Ok(Some((
+            int(0)?,
+            [int(1)?, int(2)?, int(3)?, int(4)?, int(5)?],
+        )))
     }
 
     /// Whether the row belongs to an excluded bucket. `bucket` is the
@@ -365,6 +451,84 @@ impl<S: Sql, U: UnitImport, T: RowTransform> Copier<'_, S, U, T> {
             "move copy: no try was made",
         ))))
     }
+}
+
+/// What the excluded rows add to the frozen D1's live state counters
+/// (`usage_global` row 1): V2 compares the unit's recount with row 1
+/// minus these (DS1 §3.5 V2, AM-17). The extent counters follow the
+/// extent triggers of migration 0020 (by `safety_state`, bytes by
+/// `cipher_size`), the outbox counters count rows by `stage`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ExcludedSums {
+    pub x_unreleased: i64,
+    pub unreleased_bytes: i64,
+    pub x_released: i64,
+    pub released_bytes: i64,
+    pub x_deleted: i64,
+    /// Outbox rows by stage.
+    pub outbox: BTreeMap<String, i64>,
+}
+
+/// Sums the excluded rows of `extents` and `outbox` with the copy's own
+/// bounded pages and exclusion rule. It reads the frozen D1 only and can
+/// be run at any time, so a resumed copy does not change the answer.
+pub async fn excluded_sums<S: Sql>(frozen: &S, plan: &CopyPlan) -> Result<ExcludedSums, CopyError> {
+    let mut sums = ExcludedSums::default();
+    if plan.excluded.is_empty() {
+        return Ok(sums);
+    }
+    let page_size = plan.page.clamp(1, PAGE);
+    for table in [ImportTable::Extents, ImportTable::Outbox] {
+        let keys = key_columns(table);
+        let width = table.columns().len();
+        let mut position: Option<Vec<ImportValue>> = None;
+        loop {
+            let params: Vec<SqlValue> = position.iter().flatten().map(to_sql).collect();
+            let page = frozen
+                .query(&select_page(table, position.is_some(), page_size), &params)
+                .await?;
+            for raw in &page {
+                if raw.len() != width + 1 {
+                    return Err(BridgeError::Invalid("move copy: page row shape").into());
+                }
+                let row: Vec<ImportValue> = raw[..width].iter().map(from_sql).collect();
+                position = Some(key_of(table, keys, &row));
+                let theirs = matches!(&raw[width], SqlValue::Text(b) if plan.excluded.contains(b));
+                if !theirs {
+                    continue;
+                }
+                let text = |name: &str| match column(table, &row, name) {
+                    Some(ImportValue::Text(t)) => t.clone(),
+                    _ => String::new(),
+                };
+                match table {
+                    ImportTable::Extents => {
+                        let size = match column(table, &row, "cipher_size") {
+                            Some(ImportValue::Int(n)) => *n,
+                            _ => 0,
+                        };
+                        match text("safety_state").as_str() {
+                            "held" | "releasing" => {
+                                sums.x_unreleased += 1;
+                                sums.unreleased_bytes += size;
+                            }
+                            "released" => {
+                                sums.x_released += 1;
+                                sums.released_bytes += size;
+                            }
+                            "deleted" => sums.x_deleted += 1,
+                            _ => {}
+                        }
+                    }
+                    _ => *sums.outbox.entry(text("stage")).or_default() += 1,
+                }
+            }
+            if page.len() < page_size {
+                break;
+            }
+        }
+    }
+    Ok(sums)
 }
 
 /// The primary key of each imported table, in index order: what a page
@@ -464,6 +628,32 @@ fn set(table: ImportTable, row: &mut [ImportValue], name: &str, value: ImportVal
     if let Some(slot) = index(table, name).and_then(|i| row.get_mut(i)) {
         *slot = value;
     }
+}
+
+/// A `usage_hours` row of the hour under way.
+fn hour_row(hour: i64, counts: &[i64; 5]) -> Vec<ImportValue> {
+    std::iter::once(hour)
+        .chain(counts.iter().copied())
+        .map(ImportValue::Int)
+        .collect()
+}
+
+/// Adds the hour under way to its hour's filed row, as the upsert of
+/// `usage::off` does.
+fn add_hour(row: &mut [ImportValue], counts: &[i64; 5]) -> Result<(), CopyError> {
+    for (slot, add) in row.iter_mut().skip(1).zip(counts) {
+        match slot {
+            ImportValue::Int(n) => {
+                *n = n
+                    .checked_add(*add)
+                    .ok_or(CopyError::Store(BridgeError::Invalid(
+                        "move copy: hour sum",
+                    )))?;
+            }
+            _ => return Err(BridgeError::Invalid("move copy: hour row").into()),
+        }
+    }
+    Ok(())
 }
 
 fn key_of(table: ImportTable, keys: &[&str], row: &[ImportValue]) -> Vec<ImportValue> {

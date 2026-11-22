@@ -314,9 +314,14 @@ async fn catalogue(rig: &Rig) -> (Bucket, Bucket) {
     catalogue_with_lease(rig, 1).await
 }
 
-/// As [`catalogue`], the vault's first outbox row leased until
-/// `lease_until`.
 async fn catalogue_with_lease(rig: &Rig, lease_until: i64) -> (Bucket, Bucket) {
+    catalogue_with(rig, lease_until, 5, false).await
+}
+
+/// As [`catalogue`], the vault's first outbox row leased until
+/// `lease_until`, and the live counters' hour under way at `hour` (its
+/// filed row dropped first when `own_row`).
+async fn catalogue_with(rig: &Rig, lease_until: i64, hour: i64, own_row: bool) -> (Bucket, Bucket) {
     let (vault, signer) = rig.standard("vault").await;
     let canary = rig.bucket("mq-canary", false).await;
     rig.grant(AKID, &canary, Perm::Rw).await;
@@ -378,6 +383,12 @@ async fn catalogue_with_lease(rig: &Rig, lease_until: i64) -> (Bucket, Bucket) {
         script.push_str(&format!(
             "INSERT INTO usage_hours(hour, posts, verifies, releases, dead, failures) VALUES ({h}, {h}, 0, 0, 0, 0);\n"
         ));
+    }
+    script.push_str(&format!(
+        "UPDATE usage_global SET hour = {hour}, h_posts = 7, h_failures = 1 WHERE id = 1;\n"
+    ));
+    if own_row {
+        script.push_str(&format!("DELETE FROM usage_hours WHERE hour = {hour};\n"));
     }
     sql.apply(&script).unwrap();
     rig.bridge.raise_stamp().await.unwrap();
@@ -445,8 +456,34 @@ fn expected(
             _ => by("bucket_id") || by("generation_id") || by("extent_id") || by("upload_id"),
         }
     };
-    rows(sql, table)
-        .into_iter()
+    let mut all = rows(sql, table);
+    if table == ImportTable::UsageHours {
+        // The hour under way, filed as `usage::off` files it.
+        let g = ready(sql.query(
+            "SELECT hour, h_posts, h_verifies, h_releases, h_dead, h_failures FROM usage_global WHERE id = 1",
+            &[],
+        ))
+        .unwrap();
+        let int = |v: &SqlValue| match v {
+            SqlValue::Int(n) => *n,
+            other => panic!("{other:?}"),
+        };
+        let g: Vec<i64> = g[0].iter().map(int).collect();
+        if g[0] > 0 && g[1..].iter().sum::<i64>() > 0 {
+            match all.iter_mut().find(|r| int(&r[0]) == g[0]) {
+                Some(r) => {
+                    for i in 1..6 {
+                        r[i] = SqlValue::Int(int(&r[i]) + g[i]);
+                    }
+                }
+                None => {
+                    all.push(g.iter().map(|n| SqlValue::Int(*n)).collect());
+                    all.sort_by_key(|r| int(&r[0]));
+                }
+            }
+        }
+    }
+    all.into_iter()
         .filter(|r| !theirs(r))
         .map(|mut r| {
             match table {
@@ -705,5 +742,95 @@ fn a_live_lease_stops_the_copy_before_the_outbox() {
         // The tables before the outbox were copied; a run after the
         // drain finishes goes on from there.
         assert!(!rows(u.sql(), ImportTable::Extents).is_empty());
+    });
+}
+
+#[test]
+fn the_hour_under_way_is_filed_where_it_falls() {
+    for (hour, own_row) in [(5, false), (7, true), (40, true)] {
+        block_on(async {
+            let rig = rig();
+            let (_, canary) = catalogue_with(&rig, 1, hour, own_row).await;
+            let frozen = &rig.bridge.catalog.sql.inner;
+            let (zero, owner) = heads();
+            let (head, since) = bound(&zero.door, &owner.door).unwrap();
+            let u = unit(since);
+            let adapter = Adapter::new(&u, since);
+            for page in [2, 500] {
+                copy_all(
+                    &rig.bridge.catalog.sql,
+                    &adapter,
+                    &Stub { rehomed: None },
+                    &plan(&canary, page),
+                    &head,
+                    since,
+                    rig.now(),
+                )
+                .await
+                .map_err(|e| format!("{e:?}"))
+                .unwrap();
+            }
+            let ids = canary_ids(frozen, &canary);
+            let got = rows(u.sql(), ImportTable::UsageHours);
+            assert_eq!(
+                got,
+                expected(frozen, ImportTable::UsageHours, &ids, ""),
+                "{hour}"
+            );
+            let filed = got
+                .iter()
+                .find(|r| r[0] == SqlValue::Int(hour))
+                .expect("the hour under way is filed");
+            let base = if own_row { 0 } else { hour };
+            assert_eq!(filed[1], SqlValue::Int(base + 7), "{hour}");
+            assert_eq!(filed[5], SqlValue::Int(1), "{hour}");
+            assert_eq!(got.len(), if own_row && hour == 40 { 24 } else { 23 });
+        });
+    }
+}
+
+#[test]
+fn the_excluded_rows_are_summed_for_v2() {
+    use velmora_bridge::directory::move_copy::excluded_sums;
+    block_on(async {
+        let rig = rig();
+        let (_, canary) = catalogue(&rig).await;
+        let frozen = &rig.bridge.catalog.sql.inner;
+        let id = SqlValue::Text(canary.id.as_str().into());
+        let one = |q: &str| match &ready(frozen.query(q, std::slice::from_ref(&id))).unwrap()[0][0]
+        {
+            SqlValue::Int(n) => *n,
+            SqlValue::Null => 0,
+            other => panic!("{other:?}"),
+        };
+        let sums = excluded_sums(&rig.bridge.catalog.sql, &plan(&canary, 2))
+            .await
+            .map_err(|e| format!("{e:?}"))
+            .unwrap();
+        assert_eq!(
+            sums.x_unreleased,
+            one("SELECT count(*) FROM extents WHERE bucket_id = ?1 AND safety_state IN ('held', 'releasing')")
+        );
+        assert_eq!(
+            sums.unreleased_bytes,
+            one("SELECT sum(cipher_size) FROM extents WHERE bucket_id = ?1 AND safety_state IN ('held', 'releasing')")
+        );
+        assert_eq!(
+            sums.x_released,
+            one("SELECT count(*) FROM extents WHERE bucket_id = ?1 AND safety_state = 'released'")
+        );
+        assert!(sums.x_unreleased > 0);
+        let outbox: i64 = sums.outbox.values().sum();
+        assert_eq!(
+            outbox,
+            one("SELECT count(*) FROM outbox o JOIN extents e ON e.id = o.extent_id WHERE e.bucket_id = ?1")
+        );
+        assert!(outbox > 0);
+        // Nothing excluded: nothing summed.
+        let none = excluded_sums(&rig.bridge.catalog.sql, &CopyPlan::default())
+            .await
+            .map_err(|e| format!("{e:?}"))
+            .unwrap();
+        assert_eq!(none, Default::default());
     });
 }
