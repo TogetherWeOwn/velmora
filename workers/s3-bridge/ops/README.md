@@ -648,7 +648,8 @@ Create the directory database once by hand with
 reads it.
 
 Create the two key buckets once by hand before you set their variables
-(a deploy that binds a bucket that does not exist fails and rolls back),
+(Cloudflare refuses the upload of a version that binds a bucket that
+does not exist, so the deploy fails and the version before stays live),
 for example `wrangler r2 bucket create velmora-keys-a --location enam`
 and `wrangler r2 bucket create velmora-keys-b --location enam`. They hold
 wrapped tenant keys only. The bindings are unused until Worker code
