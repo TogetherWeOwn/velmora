@@ -34,6 +34,7 @@ pub mod replay;
 pub mod service;
 pub mod sql;
 pub mod stamp;
+pub mod tenant_catalog;
 pub mod trace;
 pub mod types;
 pub mod unit;

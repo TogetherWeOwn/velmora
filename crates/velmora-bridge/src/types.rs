@@ -369,7 +369,7 @@ impl VerifyKind {
 
 /// A backbone that is read in full for every extent for a while
 /// (`verify_escalations`): a full read of a sampled extent failed there.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct VerifyEscalation {
     /// The label as it is compared: trimmed, lower case.
     pub backbone: String,
@@ -823,7 +823,7 @@ impl ByteSpan {
 }
 
 /// `buckets` row.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Bucket {
     pub id: BucketId,
     pub name: String,
@@ -890,7 +890,7 @@ pub struct GenerationRow {
 }
 
 /// `extents` row. `Debug` hides the wrapped file key.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ExtentRow {
     pub id: ExtentId,
     pub bucket_id: BucketId,
@@ -948,7 +948,7 @@ impl fmt::Debug for ExtentRow {
 }
 
 /// `articles` row.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ArticleRow {
     pub extent_id: ExtentId,
     pub idx: u32,
@@ -999,7 +999,7 @@ pub fn valid_yenc_name(name: &str) -> bool {
 }
 
 /// `verifications` row.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct VerificationRow {
     pub extent_id: ExtentId,
     pub backbone: String,
@@ -1013,7 +1013,7 @@ pub struct VerificationRow {
 }
 
 /// Latest verification per backbone for the extent's current `plan_rev`.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, serde::Deserialize)]
 pub struct BackboneStatus {
     pub backbone: String,
     pub provider_id: String,
@@ -1069,7 +1069,7 @@ pub struct PartExtent {
 }
 
 /// `gc` row.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct GcRow {
     pub id: i64,
     pub extent_id: ExtentId,
@@ -1079,14 +1079,14 @@ pub struct GcRow {
 }
 
 /// Which blob store a GC step addresses.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum BlobStoreKind {
     Safety,
     Cache,
 }
 
 /// What `Catalog::gc_begin` decided for one row.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum GcStep {
     /// Delete this blob, then call `gc_done`.
     DeleteBlob { store: BlobStoreKind, key: String },
@@ -1097,7 +1097,7 @@ pub enum GcStep {
 }
 
 /// One due outbox row (dispatcher input).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct DueRow {
     pub extent_id: ExtentId,
     pub generation_id: GenerationId,
@@ -1105,7 +1105,7 @@ pub struct DueRow {
 }
 
 /// What a queue job needs about its extent.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct JobExtent {
     pub extent: ExtentRow,
     pub bucket: Bucket,
@@ -1242,7 +1242,7 @@ pub struct HotStats {
 
 /// An evictable extent as the catalogue listed it. `begin_evict` refuses
 /// it if anything here has changed since.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct EvictCandidate {
     pub extent: ExtentId,
     /// Bytes of the released safety copy still in R2.
@@ -1496,7 +1496,7 @@ pub struct Backlog {
 
 /// How long the dispatcher leaves a row alone after it sent a job for
 /// it (`Catalog::due`), by the kind of queue the job went to.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Resend {
     /// Seconds for a row in `post`.
     pub post_secs: u32,
@@ -1519,7 +1519,7 @@ impl Resend {
 // ---------------------------------------------------------------------------
 
 /// What the fence of a sweep found (`Catalog::fence_intents`).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum IntentFence {
     /// The rows are `sweeping`: no publication of this write can commit
     /// any more. `generation` is the id its recovery record would have.
@@ -1864,7 +1864,7 @@ pub struct UsageHour {
 }
 
 /// A finished recount of the usage counters.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, serde::Deserialize)]
 pub struct UsageRecount {
     pub started_at: UnixMs,
     pub finished_at: UnixMs,
@@ -1890,8 +1890,36 @@ pub struct RecountState {
     pub adopt: bool,
 }
 
+/// Read back with [`RecountState::table`] as one of its four names.
+impl<'de> Deserialize<'de> for RecountState {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wire {
+            running: bool,
+            started_at: UnixMs,
+            rows_seen: u64,
+            table: String,
+            adopt: bool,
+        }
+        let w = Wire::deserialize(d)?;
+        // "" while no recount is running.
+        let table = ["", "extents", "outbox", "generations", "finish"]
+            .into_iter()
+            .find(|t| *t == w.table)
+            .ok_or_else(|| serde::de::Error::custom("not a recount table"))?;
+        Ok(RecountState {
+            running: w.running,
+            started_at: w.started_at,
+            rows_seen: w.rows_seen,
+            table,
+            adopt: w.adopt,
+        })
+    }
+}
+
 /// What one step of a recount did.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, serde::Deserialize)]
 pub struct RecountStep {
     /// No recount is running; nothing was done.
     pub idle: bool,

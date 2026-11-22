@@ -417,6 +417,21 @@ impl<S: UnitSql> Unit<S> {
                 why: Closed::Provisioning,
             });
         }
+        // A job call (W2-jobs): only from the consumer, authenticated,
+        // with the job's numbers (checked above as a job's); it runs in
+        // any tenant state but a shred.
+        if let UnitOp::Job { .. } = &call.op {
+            if call.kind != CallKind::Job || !call.authenticated {
+                return Ok(refused(Refused::Unauthenticated, false));
+            }
+            if matches!(
+                head.tenant_state,
+                TenantState::Shredding | TenantState::Shredded
+            ) {
+                return Ok(refused(Refused::AccountProblem, false));
+            }
+            return self.run(call, &head, false, now);
+        }
         // A fan-out read names a grant: it is never a cold read, so it
         // is refused without `authenticated` (rule 11).
         if !call.authenticated && (!call.op.read_only() || call.kind == CallKind::Fanout) {
@@ -585,6 +600,17 @@ impl<S: UnitSql> Unit<S> {
                     "key_row": key_row,
                     "state": state,
                 })))
+            }
+            UnitOp::Job { call } => {
+                // The stamp row of a unit carries its own name (ADR §8.5):
+                // a Worker configured with another id raises nothing here.
+                if call
+                    .stamp_id()
+                    .is_some_and(|id| id != super::jobcall::stamp_id(&self.own))
+                {
+                    return Err(crate::stamp::ERR_CATALOGUE_ID);
+                }
+                Ok(Ok(call.clone().run(&self.cat).await?))
             }
             UnitOp::Provision { .. }
             | UnitOp::Sync { .. }
@@ -1040,6 +1066,7 @@ fn failed(e: &BridgeError) -> UnitAnswer {
     let class = match e {
         BridgeError::Sql(_) => "sql",
         BridgeError::GuardFailed => "guard",
+        e if crate::stamp::is_catalogue_id_error(e) => "catalogue_id",
         BridgeError::Invalid(_) => "invalid",
         _ => "other",
     };

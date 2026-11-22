@@ -571,6 +571,65 @@
     },
     {
       "authenticated": true,
+      "kind": "job",
+      "listed": true,
+      "name": {
+        "tenant": "t_00000000000000f1",
+        "unit": 0
+      },
+      "op": {
+        "call": {
+          "extent": "x_000000000000000000000000f1",
+          "generation": "g_0019a00000000f1f1f1f1f1f1f1f1",
+          "m": "claim",
+          "now": 1000,
+          "owner": "job-1",
+          "stage": "verify"
+        },
+        "op": "job"
+      },
+      "seqs": {
+        "keys_seq": 3,
+        "state_seq": 7
+      }
+    },
+    {
+      "authenticated": true,
+      "kind": "job",
+      "listed": true,
+      "name": {
+        "tenant": "t_00000000000000f1",
+        "unit": 0
+      },
+      "op": {
+        "call": {
+          "l": {
+            "attempts": 1,
+            "claimed_at": 900,
+            "cursor": 0,
+            "extent": "x_000000000000000000000000f1",
+            "generation": "g_0019a00000000f1f1f1f1f1f1f1f1",
+            "stage": "post",
+            "token": 3
+          },
+          "m": "mark_posted_many",
+          "now": 1000,
+          "posted": [
+            [
+              0,
+              "p0"
+            ]
+          ]
+        },
+        "op": "job"
+      },
+      "seqs": {
+        "keys_seq": 3,
+        "state_seq": 7
+      }
+    },
+    {
+      "authenticated": true,
       "kind": "worker",
       "listed": true,
       "name": {

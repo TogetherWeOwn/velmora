@@ -18,6 +18,7 @@ use velmora_bridge::unit::identity::Refusal;
 use velmora_bridge::unit::import::{
     ImportBatch, ImportRefusal, ImportTable, ImportValue, MoveHead,
 };
+use velmora_bridge::unit::jobcall::JobCall;
 use velmora_bridge::unit::keys::{Access, KeyEntry, KeyGrant, KeyKind, KeyRefusal, SubjectStatus};
 use velmora_bridge::unit::lift::{
     AckClass, ClassProof, FindingList, GateRefusal, GateSummary, LiftProof, ReplayId,
@@ -27,6 +28,7 @@ use velmora_bridge::unit::{
     BirthKind, BirthToken, CallKind, ProvisionRefusal, Reader, Refused, Seqs, SyncHead, TenantId,
     TenantState, UnitAnswer, UnitCall, UnitName, UnitOp,
 };
+use velmora_bridge::{ExtentId, GenerationId, Lease, OutboxStage, UnixMs};
 
 const GOLDEN: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/golden/unit-wire.json");
 
@@ -78,6 +80,7 @@ fn op_kind(op: &UnitOp) -> &'static str {
         UnitOp::GateBlockers { .. } => "gate_blockers",
         UnitOp::GateAck { .. } => "gate_ack",
         UnitOp::GateStatus {} => "gate_status",
+        UnitOp::Job { .. } => "job",
         UnitOp::ReadPlan { .. } => "read_plan",
     }
 }
@@ -239,6 +242,30 @@ fn ops() -> Vec<UnitOp> {
             ids: vec!["g_1".into()],
         },
         UnitOp::GateStatus {},
+        UnitOp::Job {
+            call: JobCall::claim {
+                extent: ExtentId::new("x_000000000000000000000000f1"),
+                generation: GenerationId::new("g_0019a00000000f1f1f1f1f1f1f1f1"),
+                stage: OutboxStage::Verify,
+                owner: "job-1".into(),
+                now: UnixMs(1_000),
+            },
+        },
+        UnitOp::Job {
+            call: JobCall::mark_posted_many {
+                l: Lease {
+                    extent: ExtentId::new("x_000000000000000000000000f1"),
+                    generation: GenerationId::new("g_0019a00000000f1f1f1f1f1f1f1f1"),
+                    stage: OutboxStage::Post,
+                    token: 3,
+                    attempts: 1,
+                    cursor: 0,
+                    claimed_at: UnixMs(900),
+                },
+                posted: vec![(0, "p0".into())],
+                now: UnixMs(1_000),
+            },
+        },
         UnitOp::ReadPlan {
             bucket: "alpha".into(),
             key: "k".into(),
@@ -357,9 +384,13 @@ fn document() -> Value {
     let calls: Vec<Value> = ops()
         .into_iter()
         .map(|op| {
+            let kind = match op {
+                UnitOp::Job { .. } => CallKind::Job,
+                _ => CallKind::Worker,
+            };
             let c = UnitCall {
                 name: name(),
-                kind: CallKind::Worker,
+                kind,
                 seqs: Some(seqs()),
                 authenticated: true,
                 listed: true,
@@ -385,7 +416,7 @@ fn document() -> Value {
 #[test]
 fn every_variant_has_a_sample() {
     let ops: std::collections::BTreeSet<_> = ops().iter().map(op_kind).collect();
-    assert_eq!(ops.len(), 16, "{ops:?}");
+    assert_eq!(ops.len(), 17, "{ops:?}");
     let readers: std::collections::BTreeSet<_> = ops_readers().into_iter().collect();
     assert_eq!(readers.len(), 2, "both readers have a sample");
     // The variants that carry data, each with a sample (exhaustive).
