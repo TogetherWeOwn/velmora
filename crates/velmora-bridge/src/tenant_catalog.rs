@@ -487,6 +487,9 @@ impl<P: UnitPort, S: Catalog> Catalog for TenantCatalog<P, S> {
         _now: UnixMs,
         _cutoff: UnixMs,
     ) -> (Vec<bool>, Result<()>) {
+        if rows.is_empty() {
+            return (Vec::new(), Ok(()));
+        }
         (
             vec![false; rows.len()],
             Err(BridgeError::NotImplemented(NOT_ON_UNIT)),

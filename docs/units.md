@@ -453,10 +453,10 @@ provider health are not a unit's: they stay in the shared database, which
 every tenant's jobs use. The request path does not use `TenantCatalog`.
 A refusal (`sync_needed`, stale, a job with no numbers, closed, unborn)
 comes back as a typed error, and the first one is kept
-(`TenantCatalog::refusal`). With `stale`, `TenantCatalog::stale_seqs`
-holds the unit's numbers, and `latest_seqs` holds the numbers of the
-unit's latest `ok` or `stale` answer in the run, for a follow-up job
-(never below the job's own).
+(`TenantCatalog::refusal`). With `stale`, the refusal is
+`UnitRefusal::Stale(seqs)` with the unit's numbers, and
+`TenantCatalog::latest` holds the highest numbers the unit answered in
+the run, for a follow-up job (never below the job's own).
 
 **What the consumer does with a unit's answer to a job call (AM-50):**
 

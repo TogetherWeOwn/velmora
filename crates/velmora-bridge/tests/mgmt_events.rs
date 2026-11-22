@@ -66,7 +66,9 @@ struct Heads {
 impl TenantHeads for Heads {
     async fn head(&self, t: &TenantId, _: u64) -> Result<Option<Door>, ChainError> {
         if self.down.get() {
-            return Err(ChainError::Damaged("fake: down"));
+            return Err(ChainError::Store(velmora_bridge::BridgeError::Sql(
+                "fake: down".into(),
+            )));
         }
         Ok(self
             .tenants

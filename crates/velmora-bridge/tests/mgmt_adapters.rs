@@ -248,7 +248,9 @@ impl TenantHeads for Heads {
     async fn head(&self, t: &TenantId, _: u64) -> std::result::Result<Option<Door>, ChainError> {
         self.reads.set(self.reads.get() + 1);
         if self.down.get() {
-            return Err(ChainError::Damaged("fake: down"));
+            return Err(ChainError::Store(velmora_bridge::BridgeError::Sql(
+                "fake: down".into(),
+            )));
         }
         Ok(self.door.borrow().clone().filter(|_| t.as_str() == TENANT))
     }
@@ -565,6 +567,7 @@ impl Stores {
         )
         .await;
         assert!(unit.take_pages().is_empty());
+        assert!(unit.take_alerts().is_empty());
         a
     }
 }
@@ -1060,4 +1063,38 @@ async fn the_key_chain_serves_its_own_tenant_and_reservation_only() {
         chain.finish(&tenant(), &p.id).await.unwrap(),
         ChainWrite::Done(r) if r.id == p.id
     ));
+}
+
+/// Rule 7: a listed root unit that is unborn pages "catalogue lost" for a
+/// `live` tenant, and never while the head is `provisioning` (AM-58).
+#[tokio::test(flavor = "current_thread")]
+async fn an_unborn_root_unit_of_a_live_tenant_pages() {
+    let unborn = Unit::new(RusqliteSql::open_in_memory().unwrap(), own(), "");
+    let log = RefCell::new(Vec::new());
+    let down = Cell::new(false);
+    let clients = Direct {
+        unit: &unborn,
+        log: &log,
+        down: &down,
+    };
+    let clock = FixedClock::new(NOW);
+    for (lifecycle, alerts) in [
+        (Lifecycle::Live, vec![RouteRefusal::CatalogueLost]),
+        (Lifecycle::Provisioning, vec![]),
+    ] {
+        let heads = Heads::live();
+        heads.with(|d| d.lifecycle = lifecycle);
+        let cache = HeadCache::default();
+        let router = Router {
+            maintenance: Maintenance::Off,
+            clients: &clients,
+            heads: &heads,
+            cache: &cache,
+            clock: &clock,
+        };
+        let unit = RoutedUnit::new(&router);
+        assert!(unit.keys(tenant()).keys_seq().await.is_err());
+        assert_eq!(unit.take_alerts(), alerts, "{lifecycle:?}");
+        assert!(unit.take_alerts().is_empty(), "taken once");
+    }
 }
