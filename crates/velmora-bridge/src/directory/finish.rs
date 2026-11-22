@@ -8,8 +8,9 @@
 //! - **closing** (the records the directory does not hold close any door,
 //!   [`super::transition::write_order`]): every listed unit, the root unit
 //!   first, then the directory, and the directory only once every unit
-//!   holds the head (so a closing a unit missed stays above the row and
-//!   the next run takes the closing order again);
+//!   holds at least the seq the directory step writes (the head, or the
+//!   end of a far window), so a closing a unit missed stays above the row
+//!   and the next run takes the closing order again;
 //! - **opening**: the directory first, and the units only once the
 //!   directory holds the head. An opening head over closings the directory
 //!   does not hold takes the opening order when every unit already holds

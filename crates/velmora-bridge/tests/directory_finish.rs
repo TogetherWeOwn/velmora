@@ -1288,6 +1288,57 @@ fn a_far_row_with_an_opening_window_takes_the_closing_order() {
     });
 }
 
+/// A record inside a far window that does not read: not a far window
+/// that read, so the head's own record decides; an opening head waits,
+/// and the damage pages.
+#[test]
+fn a_damaged_record_in_a_far_window_leaves_the_order_to_the_head() {
+    let db = database();
+    let store = HookedRecords::new();
+    let seal = PlainSeal::new();
+    let chain = TenantChain {
+        store: &store,
+        seal: &seal,
+    };
+    let dir = SqlDirectory { sql: &db };
+    let units = Units::new(&db);
+    block_on(async {
+        active(&chain, A1).await;
+        let limit = |base: u64, v: u64| Change::SetLimits {
+            base_seq: base,
+            limits: BTreeMap::from([("storage_bytes".to_string(), v)]),
+            rate_json: None,
+        };
+        let first = write(&chain, A1, limit(4, 1), Actor::Operator).await;
+        units.head.set(first);
+        finish_tenant(&chain, Some(&dir), &units, &tid(A1), NOW)
+            .await
+            .unwrap();
+        let mut head = first;
+        while head < first + MAX_FINISH_RECORDS + 2 {
+            head = write(&chain, A1, limit(head, head), Actor::Operator).await;
+        }
+        store.plant(
+            &velmora_bridge::directory::chain::record_key(&t(A1), first + 10),
+            vec![0xde, 0xad],
+        );
+        units.head.set(head);
+        units.take_log();
+        let run = finish_tenant(&chain, Some(&dir), &units, &tid(A1), NOW)
+            .await
+            .unwrap();
+        assert_eq!(run.order, Some(WriteOrder::Opening));
+        assert_eq!(run.units, vec![(0, StoreStep::Waiting)]);
+        assert!(units.take_log().is_empty());
+        assert_eq!(run.directory, StoreStep::Failed);
+        assert!(
+            run.pages.contains(&"tenant_record_damaged"),
+            "{:?}",
+            run.pages
+        );
+    });
+}
+
 /// A row ahead of its chain is damage: it pages, the directory step does
 /// not run, and the head's own record decides the order.
 #[test]
