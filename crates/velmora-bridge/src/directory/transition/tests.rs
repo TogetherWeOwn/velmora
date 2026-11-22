@@ -35,6 +35,7 @@ fn create_bucket(k: u64, unit: u32) -> Change {
         grant_seq: k,
         name: format!("bucket-{k}"),
         bdk_wrapped: wrap(k as u8),
+        tk_version: 1,
     }
 }
 
@@ -2658,6 +2659,7 @@ fn a_bucket_create_carries_its_name_and_wrap_in_the_private_part() {
         grant_seq: 3,
         name: name.into(),
         bdk_wrapped: w,
+        tk_version: 1,
     };
     for bad in ["ab", "Photos", "a.b", "-ab", "ab-", &"a".repeat(64), ""] {
         assert_eq!(
@@ -2826,4 +2828,109 @@ fn the_stub_keeps_the_creation_time_only() {
     assert_eq!(stub.door.undone_deletion_seq, None);
     assert_eq!(stub.door.deletion, None);
     assert_eq!(stub.private.bucket_created, None);
+}
+
+/// Review r1 LOW 2: the wrap is bound to the key version it was made
+/// under, and the record keeps that version beside it.
+#[test]
+fn a_bucket_create_is_bound_to_the_key_version_of_its_wrap() {
+    let a = active();
+    let with = |v: u32| match create_bucket(1, 0) {
+        Change::CreateBucket {
+            bucket,
+            unit,
+            creator,
+            grant_seq,
+            name,
+            bdk_wrapped,
+            ..
+        } => Change::CreateBucket {
+            bucket,
+            unit,
+            creator,
+            grant_seq,
+            name,
+            bdk_wrapped,
+            tk_version: v,
+        },
+        _ => unreachable!(),
+    };
+    assert_eq!(refused(&a, with(2), Actor::Customer), VERSION);
+    assert_eq!(refused(&a, with(0), Actor::Customer), VERSION);
+    let c = apply(&a, with(1), Actor::Customer);
+    assert_eq!(c.private.bucket_created.as_ref().unwrap().tk_version, 1);
+    // A rotation committed between the wrap and the put: wrap again.
+    let r = apply(
+        &a,
+        Change::ClaimKeyVersion { version: 2 },
+        Actor::RotationJob,
+    );
+    let r = apply(&r, commit(2), Actor::RotationJob);
+    assert_eq!(refused(&r, with(1), Actor::Customer), VERSION);
+    let c = apply(&r, with(2), Actor::Customer);
+    assert_eq!(c.private.bucket_created.unwrap().tk_version, 2);
+    // The read-back of a create that landed is unchanged under any version.
+    let landed = apply(&a, with(1), Actor::Customer);
+    let landed = apply(
+        &landed,
+        Change::ClaimKeyVersion { version: 2 },
+        Actor::RotationJob,
+    );
+    let landed = apply(&landed, commit(2), Actor::RotationJob);
+    unchanged(&landed, with(1), Actor::Customer);
+}
+
+/// Review r1 LOW 4 and 5: a floor far ahead of the clock is refused; an
+/// undo naming another deletion is `deletion_not_requested` for every
+/// actor that may undo at all.
+#[test]
+fn a_floor_ahead_of_the_clock_and_an_undo_of_another_deletion_are_refused() {
+    let owner = active();
+    let moving = moving();
+    let floor = |ms| Change::SetMoveFloor {
+        unit: 0,
+        floor: UnixMs(ms),
+        zero: Box::new(moving.door.clone()),
+    };
+    assert_eq!(
+        refused(
+            &owner,
+            floor(NOW.0 + MAX_FLOOR_AHEAD_MS + 1),
+            Actor::MoveTool
+        ),
+        INVALID
+    );
+    apply(&owner, floor(NOW.0 + MAX_FLOOR_AHEAD_MS), Actor::MoveTool);
+
+    let od = apply(
+        &owner,
+        delete_by(
+            Actor::Operator,
+            DeletionReason::Operator(OperatorReason::Abuse),
+            DAY,
+            3,
+        ),
+        Actor::Operator,
+    );
+    let seq = od.door.deletion.as_ref().unwrap().seq;
+    // The customer may not undo this one, but its late retry of another
+    // deletion is answered as AM-38 case 4 says.
+    assert_eq!(
+        refused(
+            &od,
+            Change::UndoDeletion {
+                deletion_seq: seq - 1
+            },
+            Actor::Customer
+        ),
+        NOT_REQUESTED
+    );
+    assert_eq!(
+        refused(
+            &od,
+            Change::UndoDeletion { deletion_seq: seq },
+            Actor::Customer
+        ),
+        FORBIDDEN
+    );
 }

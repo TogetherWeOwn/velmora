@@ -288,6 +288,7 @@ fn a_whole_field_change_never_erases_a_concurrent_bucket() {
             grant_seq: 1,
             name: "photos".into(),
             bdk_wrapped: wrap(),
+            tk_version: 1,
         },
         Actor::Customer,
     );
@@ -926,5 +927,97 @@ fn a_lost_answer_over_another_writers_record_is_a_lost_race() {
         assert!(r.door.holds.operator.is_some());
         assert!(r.door.deletion.is_some());
         assert_eq!(store.keys().len(), 6);
+    });
+}
+
+/// Review r1 MEDIUM 1: a move floor is checked against tenant 0's head as
+/// its chain holds it, never one the caller passes.
+#[test]
+fn a_move_floor_is_bound_to_tenant_zeros_own_head() {
+    let store = HookedRecords::new();
+    let seal = PlainSeal::new();
+    let chain = TenantChain {
+        store: &store,
+        seal: &seal,
+    };
+    block_on(async {
+        active(&chain).await;
+        let head = chain.head(&t1(), 0).await.unwrap().unwrap().door;
+        // A hand-built tenant 0 head is not taken through plain write.
+        let mut forged = head.clone();
+        forged.tenant = Tenant::zero();
+        let w = chain
+            .write(
+                &t1(),
+                &Change::SetMoveFloor {
+                    unit: 0,
+                    floor: UnixMs(10),
+                    zero: Box::new(forged),
+                },
+                Actor::MoveTool,
+                UnixMs(20),
+                0,
+            )
+            .await;
+        assert!(
+            matches!(&w, Err(ChainError::Refused(r)) if r.code == "invalid_change"),
+            "{w:?}"
+        );
+        // No tenant 0 chain: refused.
+        let w = chain
+            .set_move_floor(&t1(), 0, UnixMs(10), Actor::MoveTool, UnixMs(20), 0)
+            .await;
+        assert!(
+            matches!(&w, Err(ChainError::Refused(r)) if r.code == "no_move_to_tenant"),
+            "{w:?}"
+        );
+        // Tenant 0 `d1` with no move: a give-up's exit; the floor rises.
+        chain
+            .write(
+                &Tenant::zero(),
+                &Change::CreateTenantZero {
+                    jurisdiction: "us".into(),
+                },
+                Actor::Operator,
+                UnixMs(1),
+                0,
+            )
+            .await
+            .unwrap();
+        let w = chain
+            .set_move_floor(&t1(), 0, UnixMs(10), Actor::MoveTool, UnixMs(20), 0)
+            .await
+            .unwrap();
+        let Written::Wrote(r) = w else {
+            panic!("{w:?}")
+        };
+        assert_eq!(r.door.move_floors.get(&0), Some(&UnixMs(10)));
+        // Once more: unchanged.
+        let w = chain
+            .set_move_floor(&t1(), 0, UnixMs(10), Actor::RestoreTool, UnixMs(20), 0)
+            .await
+            .unwrap();
+        assert!(matches!(w, Written::Unchanged(_)), "{w:?}");
+        // A move into another tenant: refused.
+        chain
+            .write(
+                &Tenant::zero(),
+                &Change::StartMove {
+                    to: Tenant::parse("t_00000000000000b2").unwrap(),
+                    catalogue_id_frozen: "main".into(),
+                },
+                Actor::MoveTool,
+                UnixMs(2),
+                0,
+            )
+            .await
+            .unwrap();
+        let w = chain
+            .set_move_floor(&t1(), 0, UnixMs(11), Actor::MoveTool, UnixMs(20), 0)
+            .await;
+        assert!(
+            matches!(&w, Err(ChainError::Refused(r)) if r.code == "no_move_to_tenant"),
+            "{w:?}"
+        );
     });
 }

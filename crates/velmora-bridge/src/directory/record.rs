@@ -420,6 +420,9 @@ pub struct BucketSecrets {
     pub name: String,
     #[serde(with = "b64")]
     pub bdk_wrapped: Vec<u8>,
+    /// The tenant key version the wrap is bound to (its AAD names it):
+    /// the record's `tk_version` when it was written.
+    pub tk_version: u32,
 }
 
 impl fmt::Debug for BucketSecrets {
@@ -428,6 +431,7 @@ impl fmt::Debug for BucketSecrets {
         f.debug_struct("BucketSecrets")
             .field("name_len", &self.name.len())
             .field("bdk_wrapped_len", &self.bdk_wrapped.len())
+            .field("tk_version", &self.tk_version)
             .finish()
     }
 }
