@@ -48,12 +48,18 @@ impl TBody {
     }
 }
 
+pub enum StorageFault {
+    Fail,
+    Replace { key: String, body: Vec<u8> },
+}
+
 /// The storage Worker in process, reached as through `DavEntry`.
 pub struct Up {
     pub rig: Rc<Rig>,
     uuids: Cell<u64>,
     /// Every request sent: method and target.
     pub sent: RefCell<Vec<(String, String)>>,
+    fault: RefCell<Option<(&'static str, String, StorageFault)>>,
     /// Requests sent with no entry marker (as the default entrypoint
     /// would): an app password must then be refused.
     pub unmarked: Cell<bool>,
@@ -109,8 +115,28 @@ impl Upstream for Up {
             body,
         };
         let bridge = Rc::clone(&self.rig.bridge);
+        let mut pending = self.fault.borrow_mut();
+        let fault = if pending
+            .as_ref()
+            .is_some_and(|(m, p, _)| *m == method && p == target)
+        {
+            pending.take().map(|(_, _, fault)| fault)
+        } else {
+            None
+        };
         Box::pin(async move {
+            if matches!(fault, Some(StorageFault::Fail)) {
+                return Err(S3Error {
+                    status: 500,
+                    code: "InternalError".into(),
+                });
+            }
             let resp = Resp::collect(bridge.handle(req).await).await;
+            if let Some(StorageFault::Replace { key, body }) = fault {
+                assert_eq!(resp.status, 200);
+                let signer = Signer::new(S3KEY, S3KEY_SECRET);
+                assert_eq!(self.rig.put(&signer, BUCKET, &key, &body).await.status, 200);
+            }
             Ok(Response {
                 status: resp.status,
                 headers: resp.headers,
@@ -322,6 +348,7 @@ impl World {
                     rig: Rc::clone(&rig),
                     uuids: Cell::new(0),
                     sent: RefCell::new(Vec::new()),
+                    fault: RefCell::new(None),
                     unmarked: Cell::new(false),
                     most_slots: Cell::new(0),
                 },
@@ -399,6 +426,18 @@ impl World {
             headers: resp.headers,
             body,
         }
+    }
+
+    /// Inject one failure, or an S3 write after a successful response but
+    /// before the gateway receives it.
+    pub fn storage_fault(&self, method: &'static str, key: &str, fault: StorageFault) {
+        let target = service_support::path(BUCKET, key);
+        assert!(self
+            .dav
+            .up
+            .fault
+            .replace(Some((method, target, fault)))
+            .is_none());
     }
 
     /// The object as the S3 entry point sees it: status, body, ETag.

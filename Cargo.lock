@@ -1601,6 +1601,7 @@ dependencies = [
  "tokio",
  "velmora",
  "velmora-bridge",
+ "velmora-s3-proto",
 ]
 
 [[package]]

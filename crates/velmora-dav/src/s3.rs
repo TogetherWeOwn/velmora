@@ -461,7 +461,8 @@ impl<'a, U: Upstream> S3<'a, U> {
         Ok(header(&resp.headers, "etag").unwrap_or_default().to_owned())
     }
 
-    /// CopyObject in one bucket. Answers the new ETag.
+    /// CopyObject in one bucket. The bridge returns the ETag of the
+    /// source generation it copied, also the ETag of the new object.
     pub async fn copy(
         &self,
         bucket: &str,
@@ -494,22 +495,33 @@ impl<'a, U: Upstream> S3<'a, U> {
                 code: text_of(&doc, "Code").unwrap_or_default(),
             });
         }
-        Ok(text_of(&doc, "ETag").unwrap_or_default())
+        text_of(&doc, "ETag")
+            .filter(|tag| tag.starts_with('"') && tag.ends_with('"') && tag.len() >= 2)
+            .ok_or_else(|| S3Error {
+                status: 502,
+                code: String::new(),
+            })
     }
 
-    /// DeleteObject; a key that is not there is no error.
-    pub async fn delete(&self, bucket: &str, key: &str) -> Result<(), S3Error> {
+    /// DeleteObject, optionally with a condition. An unconditional delete
+    /// of an absent key is no error.
+    pub async fn delete(
+        &self,
+        bucket: &str,
+        key: &str,
+        cond: Option<&Cond>,
+    ) -> Result<(), S3Error> {
         let resp = self
             .call(
                 "DELETE",
                 &format!("/{bucket}/{key}"),
                 &[],
-                Vec::new(),
+                cond.map(|c| vec![c.header()]).unwrap_or_default(),
                 Body::Empty,
                 None,
             )
             .await?;
-        if (200..300).contains(&resp.status) || resp.status == 404 {
+        if (200..300).contains(&resp.status) || (cond.is_none() && resp.status == 404) {
             Ok(())
         } else {
             Err(error_of(self.up, resp).await)

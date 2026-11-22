@@ -188,7 +188,11 @@ impl IfHeader {
     /// `state(Some(tag))` a tagged resource (a resource that does not
     /// exist, or one outside this server, has no etag and no locks).
     pub fn evaluate(&self, state: impl Fn(Option<&str>) -> State) -> bool {
-        self.lists.iter().any(|list| {
+        self.matching_list(state).is_some()
+    }
+
+    pub(crate) fn matching_list(&self, state: impl Fn(Option<&str>) -> State) -> Option<&List> {
+        self.lists.iter().find(|list| {
             let s = state(list.tag.as_deref());
             list.conditions.iter().all(|c| {
                 let held = match &c.cond {
