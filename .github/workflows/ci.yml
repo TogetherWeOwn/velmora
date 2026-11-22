@@ -42,8 +42,8 @@ jobs:
   rust-test:
     name: rust test (native)
     runs-on: ubuntu-latest
-    # 30, not 20: with a cold build cache (any Cargo.lock change empties
-    # it for main) `cargo test --workspace` alone takes about 16 min, and
+    # 30, not 20: after a Cargo.lock change main restores only a partial
+    # cache, so `cargo test --workspace` alone takes about 16 min, and
     # the job ran out at 20 min twice on main 7eff9bf.
     timeout-minutes: 30
     steps:
