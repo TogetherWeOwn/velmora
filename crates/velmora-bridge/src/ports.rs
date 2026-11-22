@@ -1607,8 +1607,12 @@ pub trait Catalog {
     ) -> Result<bool> {
         Err(BridgeError::Invalid("this catalogue has no scrub"))
     }
-    /// Whether any counting copy still has an unresolved check failure.
-    async fn scrub_has_loss(&self, _extent: &ExtentId, _backbones: &[String]) -> Result<bool> {
+    /// Labels of counting copies that still have an unresolved check failure.
+    async fn scrub_has_loss(
+        &self,
+        _extent: &ExtentId,
+        _backbones: &[String],
+    ) -> Result<Vec<String>> {
         Err(BridgeError::Invalid("this catalogue has no scrub"))
     }
     /// Remove the schedules of a tombstoned extent under the scrub lease.

@@ -1015,7 +1015,7 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
     ) -> Result<bool> {
         scrub::advance(self, token, extent, updates).await
     }
-    async fn scrub_has_loss(&self, extent: &ExtentId, backbones: &[String]) -> Result<bool> {
+    async fn scrub_has_loss(&self, extent: &ExtentId, backbones: &[String]) -> Result<Vec<String>> {
         scrub::has_loss(self, extent, backbones).await
     }
     async fn scrub_retire(&self, token: u64, extent: &ExtentId) -> Result<bool> {

@@ -219,6 +219,8 @@ struct Walk<'w, 's, C: Catalog, N: NntpConnector, T: Clock> {
     stats: &'w mut Vec<ProviderSession<'s, C, N, T>>,
     /// Providers that refused this run's login: not asked again in it.
     refused: Vec<String>,
+    /// Backbones whose scheduled check could not finish in this run.
+    unavailable: Vec<String>,
     /// Re-pins of this run for a loss on a backbone under an incident.
     blocked_repins: u32,
     /// Separate recovery streaks; a check of A never clears B's block.
@@ -344,6 +346,7 @@ where
             completed_checks: false,
             stats: &mut stats,
             refused: Vec::new(),
+            unavailable: Vec::new(),
             blocked_repins: 0,
             clean,
         };
@@ -469,7 +472,7 @@ where
         // An extent this run has looked at is not looked at again in it,
         // whatever it left on the row (a write that did not land, say).
         let mut seen: Vec<crate::types::ExtentId> = Vec::new();
-        loop {
+        'pages: loop {
             let left = cfg.extents_per_run - taken;
             if left == 0 {
                 return ScrubEnd::Quota;
@@ -478,9 +481,14 @@ where
             if now >= deadline {
                 return ScrubEnd::Time;
             }
+            let available: Vec<_> = backbones
+                .iter()
+                .filter(|name| !walk.unavailable.contains(name))
+                .cloned()
+                .collect();
             let due = self
                 .catalog
-                .scrub_due(&backbones, now, left.min(SCRUB_PAGE));
+                .scrub_due(&available, now, left.min(SCRUB_PAGE));
             let page = match self.idle(reader, walk.stats, due).await {
                 Ok(page) => page,
                 Err(_) => return ScrubEnd::Stopped,
@@ -501,9 +509,9 @@ where
                 if self.clock.now() >= deadline {
                     return ScrubEnd::Time;
                 }
-                taken += 1;
+                let unavailable = walk.unavailable.len();
                 match self.scrub_one(reader, candidate, &backbones, walk).await {
-                    Ok(()) => {}
+                    Ok(observed) => taken += u32::from(observed),
                     Err(Halt::Busy) => return ScrubEnd::Busy,
                     Err(Halt::Stopped) => return ScrubEnd::Stopped,
                     // Handled where it arises; never reaches here.
@@ -511,6 +519,11 @@ where
                 }
                 if walk.run.incident.is_some() {
                     return ScrubEnd::Incident;
+                }
+                if walk.unavailable.len() != unavailable {
+                    // The rest of this page may be an unavailable copy's
+                    // backlog. Fetch again without that backbone.
+                    continue 'pages;
                 }
             }
         }
@@ -521,15 +534,12 @@ where
         reader: &mut ColdReader<'s, C, N, T>,
         walk: &mut Walk<'_, 's, C, N, T>,
         extent: &ExtentRow,
-        (result, next_in_secs): (ScrubResult, u64),
+        (result, next): (ScrubResult, Option<UnixMs>),
     ) -> core::result::Result<(), Halt> {
         let token = walk.token;
         let now = self.clock.now();
         // Released-copy deadlines live in scrub_copies. Only the repair
         // watch puts an extent-wide deadline on the extent row.
-        let next = (next_in_secs != 0).then(|| {
-            now.plus_ms(i64::try_from(next_in_secs.saturating_mul(1000)).unwrap_or(i64::MAX))
-        });
         let write = self
             .catalog
             .scrub_record(token, &extent.id, result, now, next);
@@ -550,56 +560,55 @@ where
         candidate: &ScrubCandidate,
         backbones: &[String],
         walk: &mut Walk<'_, 's, C, N, T>,
-    ) -> core::result::Result<(), Halt> {
+    ) -> core::result::Result<bool, Halt> {
         let cfg = &self.cfg.scrub;
         let token = walk.token;
         let extent = &candidate.extent;
         let confirm = i64::from(cfg.confirm_secs) * 1000;
+        let now = self.clock.now();
+        let watch_due = candidate.watch_at.is_some_and(|at| at <= now);
         if extent.safety_state == SafetyState::Deleted {
             let retire = self.catalog.scrub_retire(token, &extent.id);
             self.idle(reader, walk.stats, retire).await?;
-            return Ok(());
+            return Ok(false);
         }
         if extent.safety_state != SafetyState::Released {
-            // A still-held repair is watched separately. Do not count any
-            // of its copy checks complete while it is held.
-            if !candidate.checks.is_empty() {
-                let next = self.clock.now().plus_ms(confirm);
-                let updates: Vec<_> = candidate
-                    .checks
-                    .iter()
-                    .map(|check| (check.clone(), next, check.loss_at))
-                    .collect();
-                self.advance_checks(reader, walk, extent, &updates).await?;
-            }
-            if candidate.watch
-                && matches!(
-                    extent.safety_state,
-                    SafetyState::Held | SafetyState::Releasing
-                )
-                && matches!(
-                    candidate.last,
-                    Some(
-                        ScrubResult::Repairing | ScrubResult::Stalled | ScrubResult::Unrecoverable
-                    )
-                )
-            {
+            // A held repair is watched separately. Postpone due copy
+            // checks to its current (or newly scheduled) repair watch
+            // without advancing their phases or clearing their losses.
+            let (next_watch, watched) = if !watch_due {
+                (candidate.watch_at, false)
+            } else if matches!(
+                extent.safety_state,
+                SafetyState::Held | SafetyState::Releasing
+            ) && matches!(
+                candidate.last,
+                Some(ScrubResult::Repairing | ScrubResult::Stalled | ScrubResult::Unrecoverable)
+            ) {
                 let plan = self.catalog.articles(&extent.id);
                 let plan = self.idle(reader, walk.stats, plan).await?;
-                return self.watch_repair(reader, walk, candidate, plan).await;
-            }
-            if candidate.watch {
+                let next = self.watch_repair(reader, walk, candidate, plan).await?;
+                (next, next.is_some())
+            } else {
                 self.catalog.scrub_drop(token, &extent.id).await?;
-            }
-            return Ok(());
+                (None, false)
+            };
+            let next = next_watch.unwrap_or_else(|| self.clock.now().plus_ms(confirm));
+            let updates: Vec<_> = candidate
+                .checks
+                .iter()
+                .map(|check| (check.clone(), next, check.loss_at))
+                .collect();
+            self.advance_checks(reader, walk, extent, &updates).await?;
+            return Ok(watched);
         }
-        if candidate.watch {
+        if watch_due {
             // A completed repair (or an old extent-wide deadline) is not
             // evidence that any copy's scheduled read-back has passed.
             self.catalog.scrub_drop(token, &extent.id).await?;
         }
         if candidate.checks.is_empty() {
-            return Ok(());
+            return Ok(false);
         }
         let live = self.catalog.scrub_live(&extent.id);
         let live = self.idle(reader, walk.stats, live).await?;
@@ -632,9 +641,9 @@ where
                 })
                 .collect();
             self.advance_checks(reader, walk, extent, &updates).await?;
-            return self
-                .scrub_record_one(reader, walk, extent, (ScrubResult::Skipped, 0))
-                .await;
+            self.scrub_record_one(reader, walk, extent, (ScrubResult::Skipped, None))
+                .await?;
+            return Ok(false);
         };
         let parity = stored
             .parity_plan(&extent.id, extent.cipher_size)
@@ -652,8 +661,9 @@ where
             prior_loss,
             confirmed,
         } = self.check_copies(reader, walk, candidate, &plan).await?;
+        let observed_any = !observed.is_empty();
         walk.deferred_checks |= busy || deferred;
-        walk.completed_checks |= !observed.is_empty();
+        walk.completed_checks |= observed_any;
         walk.breaker.note(&observed);
         for backbone in &walk.blocked {
             let checks = || observed.iter().filter(|check| &check.backbone == backbone);
@@ -667,12 +677,10 @@ where
                 }
             }
         }
-        if lacking.is_empty() && (observed.is_empty() || busy || deferred) {
+        if lacking.is_empty() && (!observed_any || busy || deferred) {
             if let Some(at) = prior_loss {
                 self.alert_deferred(extent, at);
-                return Ok(());
-            }
-            if deferred {
+            } else if deferred {
                 if candidate.last == Some(ScrubResult::Deferred) {
                     crate::trace::alert(|| {
                         format!(
@@ -681,24 +689,20 @@ where
                         )
                     });
                 }
-                return self
-                    .scrub_record_one(reader, walk, extent, (ScrubResult::Deferred, 0))
-                    .await;
+                self.scrub_record_one(reader, walk, extent, (ScrubResult::Deferred, None))
+                    .await?;
             }
-            // Only the busy copy was deferred; keep working through the
-            // due list so one outage cannot starve other backbones.
-            return Ok(());
+            return Ok(observed_any);
         }
         walk.run.checked += 1;
         if lacking.is_empty() {
             let unresolved = self.catalog.scrub_has_loss(&extent.id, backbones);
-            if prior_loss.is_none() && !self.idle(reader, walk.stats, unresolved).await? {
+            if prior_loss.is_none() && self.idle(reader, walk.stats, unresolved).await?.is_empty() {
                 walk.run.ok += 1;
-                return self
-                    .scrub_record_one(reader, walk, extent, (ScrubResult::Ok, 0))
-                    .await;
+                self.scrub_record_one(reader, walk, extent, (ScrubResult::Ok, None))
+                    .await?;
             }
-            return Ok(());
+            return Ok(true);
         }
         let data = &plan[..data_count];
         let tripped = walk.breaker.tripped();
@@ -723,9 +727,9 @@ where
 
         if confirmed.is_empty() {
             walk.run.suspect += 1;
-            return self
-                .scrub_record_one(reader, walk, extent, (ScrubResult::Suspect, 0))
-                .await;
+            self.scrub_record_one(reader, walk, extent, (ScrubResult::Suspect, None))
+                .await?;
+            return Ok(true);
         }
         // Held back from a re-pin, not from the finding: an extent with
         // no intact copy anywhere is still said to be unrecoverable.
@@ -733,17 +737,25 @@ where
         let may_repin = tripped.is_empty()
             && (!under_incident || walk.blocked_repins < BLOCKED_REPINS_PER_RUN)
             && walk.run.repaired < cfg.repairs_per_run;
+        // Confirmation gates repair, not what verify must read in full.
+        // Include losses from this visit and any still on record, even
+        // when their checks were not due on this visit.
+        let unresolved = self.catalog.scrub_has_loss(&extent.id, backbones);
+        let mut unread = lacking;
+        unread.extend(self.idle(reader, walk.stats, unresolved).await?);
+        unread.sort_unstable();
+        unread.dedup();
         let repaired = walk.run.repaired;
         let found = self
-            .repair_read(reader, walk, extent, data.to_vec(), confirmed)
+            .repair_read(reader, walk, extent, data.to_vec(), unread)
             .await?;
         let mut loss = candidate.clone();
         loss.last_scrubbed_at = prior_loss;
-        let done = self.repair(reader, walk, &loss, found, may_repin).await;
+        self.repair(reader, walk, &loss, found, may_repin).await?;
         if under_incident && walk.run.repaired > repaired {
             walk.blocked_repins += 1;
         }
-        done
+        Ok(true)
     }
 
     async fn advance_checks<'s>(
@@ -777,6 +789,9 @@ where
         let mut out = CopyChecks::default();
         let mut updates = Vec::with_capacity(candidate.checks.len());
         for check in &candidate.checks {
+            if walk.unavailable.contains(&check.backbone) {
+                continue;
+            }
             let Some((_, providers)) = groups.iter().find(|(name, _)| *name == check.backbone)
             else {
                 continue;
@@ -788,11 +803,8 @@ where
                     Ok(charge) => Some(charge),
                     Err(_) => {
                         out.busy = true;
-                        updates.push((
-                            check.clone(),
-                            self.clock.now().plus_ms(confirm),
-                            check.loss_at,
-                        ));
+                        out.prior_loss = out.prior_loss.into_iter().chain(check.loss_at).min();
+                        walk.unavailable.push(check.backbone.clone());
                         continue;
                     }
                 }
@@ -844,12 +856,12 @@ where
                 Ok(Presence::Unknown) => {
                     out.busy = true;
                     out.prior_loss = out.prior_loss.into_iter().chain(check.loss_at).min();
-                    updates.push((check.clone(), now.plus_ms(confirm), check.loss_at));
+                    walk.unavailable.push(check.backbone.clone());
                 }
                 Err(Halt::Deferred) => {
                     out.deferred = true;
                     out.prior_loss = out.prior_loss.into_iter().chain(check.loss_at).min();
-                    updates.push((check.clone(), now.plus_ms(confirm), check.loss_at));
+                    walk.unavailable.push(check.backbone.clone());
                 }
                 Err(halt) => return Err(halt),
             }
@@ -1203,7 +1215,7 @@ where
                 )
             });
             return self
-                .scrub_record_one(reader, walk, extent, (ScrubResult::Unrecoverable, 0))
+                .scrub_record_one(reader, walk, extent, (ScrubResult::Unrecoverable, None))
                 .await;
         };
         // A backbone that lacks articles and that no provider posts to:
@@ -1234,7 +1246,7 @@ where
             // re-pins: looked at again later.
             walk.run.suspect += 1;
             return self
-                .scrub_record_one(reader, walk, extent, (ScrubResult::Suspect, 0))
+                .scrub_record_one(reader, walk, extent, (ScrubResult::Suspect, None))
                 .await;
         }
         let now = self.clock.now();
@@ -1263,7 +1275,7 @@ where
         if source == RepairSource::Cache && !self.put_safety(extent, cipher.clone()).await {
             walk.run.suspect += 1;
             return self
-                .scrub_record_one(reader, walk, extent, (ScrubResult::Suspect, 0))
+                .scrub_record_one(reader, walk, extent, (ScrubResult::Suspect, None))
                 .await;
         }
         let repinned = self
@@ -1320,7 +1332,7 @@ where
         // Refused: the extent is no longer released and done, or no live
         // object holds it, or the lease is gone. Looked at again later.
         walk.run.suspect += 1;
-        self.scrub_record_one(reader, walk, extent, (ScrubResult::Suspect, 0))
+        self.scrub_record_one(reader, walk, extent, (ScrubResult::Suspect, None))
             .await
     }
 
@@ -1374,10 +1386,15 @@ where
         walk: &mut Walk<'_, 's, C, N, T>,
         candidate: &ScrubCandidate,
         plan: Vec<ArticleRow>,
-    ) -> core::result::Result<(), Halt> {
+    ) -> core::result::Result<Option<UnixMs>, Halt> {
         let extent = &candidate.extent;
         let cfg = &self.cfg.scrub;
         let bound = repair_bound_secs(self.cfg.safety_min_age_secs, cfg.confirm_secs);
+        let after = |secs: u64| {
+            self.clock
+                .now()
+                .plus_ms(i64::try_from(secs.saturating_mul(1000)).unwrap_or(i64::MAX))
+        };
         // An early look: the re-pin could not write the copy and asked to
         // be looked at again after the confirm interval. Before the bound
         // the repair has not stalled; it only needs its copy.
@@ -1393,7 +1410,7 @@ where
         // is read or written for it again.
         if !self.catalog.scrub_live(&extent.id).await? {
             self.catalog.scrub_drop(walk.token, &extent.id).await?;
-            return Ok(());
+            return Ok(None);
         }
         // One charge for all this holds at once: the safety copy read
         // back, or a read from Usenet and the copy written from it.
@@ -1422,11 +1439,11 @@ where
                 }
                 ColdFetch::Busy => return Err(Halt::Busy),
                 ColdFetch::Interrupted => {
-                    let next = self.clock.now().plus_ms(i64::from(cfg.confirm_secs) * 1000);
+                    let next = after(u64::from(cfg.confirm_secs));
                     self.catalog
                         .scrub_defer(walk.token, &extent.id, next)
                         .await?;
-                    return Ok(());
+                    return Ok(Some(next));
                 }
             };
             reader.hang_up().await;
@@ -1441,15 +1458,10 @@ where
                             extent.id.as_str()
                         )
                     });
-                    let confirm = u64::from(cfg.confirm_secs);
-                    return self
-                        .scrub_record_one(
-                            reader,
-                            walk,
-                            extent,
-                            (ScrubResult::Unrecoverable, confirm),
-                        )
-                        .await;
+                    let next = Some(after(u64::from(cfg.confirm_secs)));
+                    self.scrub_record_one(reader, walk, extent, (ScrubResult::Unrecoverable, next))
+                        .await?;
+                    return Ok(next);
                 }
             }
         }
@@ -1463,13 +1475,13 @@ where
                             extent.id.as_str()
                         )
                     });
-                    self.clock.now().plus_ms(i64::from(cfg.confirm_secs) * 1000)
+                    after(u64::from(cfg.confirm_secs))
                 }
             };
             self.catalog
                 .scrub_defer(walk.token, &extent.id, next)
                 .await?;
-            return Ok(());
+            return Ok(Some(next));
         }
         walk.run.stalled += 1;
         crate::trace::alert(|| {
@@ -1485,12 +1497,14 @@ where
         });
         // A copy that could not be written is tried again soon, not at
         // the next bound.
-        let next = match kept || rewrote {
-            true => bound,
-            false => u64::from(cfg.confirm_secs),
-        };
+        let next = Some(after(if kept || rewrote {
+            bound
+        } else {
+            u64::from(cfg.confirm_secs)
+        }));
         self.scrub_record_one(reader, walk, extent, (ScrubResult::Stalled, next))
-            .await
+            .await?;
+        Ok(next)
     }
 }
 

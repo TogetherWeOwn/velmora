@@ -591,15 +591,101 @@ async fn a_copy_pass_cannot_clear_or_confirm_another_backbones_loss() {
     assert_eq!(w.scrub().await.repaired, 1);
     assert_eq!(w.scalar(
         "SELECT group_concat(backbone) FROM verifications WHERE extent_id = ?1 AND provider_id = 'scrub'", &o.extent,
-    ).await, "alpha");
-    assert_ne!(
+    ).await, "alpha,beta");
+    assert_eq!(
         w.scalar(
             "SELECT stat_loss_at FROM scrub_copies WHERE extent_id = ?1 AND backbone = 'beta'",
             &o.extent
         )
         .await,
-        "NULL"
+        "NULL",
+        "re-pin handed beta's loss to the verify job"
     );
+}
+
+async fn light_verify_waits_for_alpha_full_read(alpha_failed_earlier: bool) {
+    let w = world_with(|cfg| {
+        cfg.verify.mode = velmora_bridge::config::VerifyMode::Light;
+        cfg.verify.sample_ppm = 0;
+    })
+    .await;
+    let o = w.released("mixed-loss", 19).await;
+    let plan = w.plan(&o).await;
+    let alpha_corrupt = &plan[1].message_id;
+    let mut original = Vec::new();
+    let mut client = w.client(0).await;
+    client
+        .article_to(alpha_corrupt, &mut original)
+        .await
+        .unwrap();
+    client.quit().await;
+    let headers = original.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+    let body = &original[headers + 4..];
+    assert!(w.bridge().safety.lose(&o.extent.safety_key()));
+    assert!(
+        w.servers[0]
+            .replace_posted_body(alpha_corrupt, b"not yEnc\r\n")
+            .await
+    );
+
+    let now = w.bridge().clock.now();
+    let confirm = w.bridge().cfg.scrub.confirm_secs;
+    let later = now.plus_secs(100 * DAY_SECS);
+    if alpha_failed_earlier {
+        w.set_clocks(&o, "alpha", later, now).await;
+        assert_eq!(w.scrub().await.suspect, 1);
+        // A persisted failure must count even when its full retry is not due.
+        w.set_clocks(&o, "alpha", later, later).await;
+    } else {
+        w.set_clocks(&o, "alpha", later, now.plus_secs(confirm))
+            .await;
+    }
+    w.set_clocks(&o, "beta", now, later).await;
+    w.hide(1, &o, 0).await;
+    assert_eq!(w.scrub().await.suspect, 1);
+    w.advance_secs(confirm);
+    assert_eq!(
+        w.scrub().await.repaired,
+        1,
+        "mixed read reconstructs from both backbones"
+    );
+    assert_eq!(w.stage(&o).await, "verify");
+    w.servers[1].unhide(&plan[0].message_id).await;
+    for _ in 0..3 {
+        let stage = w.stage(&o).await;
+        if stage == "done" || stage == "dead" {
+            break;
+        }
+        w.advance_secs(3600);
+        w.run(&o, OutboxStage::parse(&stage).unwrap()).await;
+    }
+    assert_eq!(
+        w.safety_state(&o).await,
+        "held",
+        "alpha STAT cannot clear its failed full read"
+    );
+    assert!(w.has_safety(&o));
+    assert!(w.servers[0].replace_posted_body(alpha_corrupt, body).await);
+    for _ in 0..12 {
+        let stage = w.stage(&o).await;
+        if stage == "done" || stage == "dead" {
+            break;
+        }
+        w.advance_secs(3600);
+        w.run(&o, OutboxStage::parse(&stage).unwrap()).await;
+    }
+    assert_eq!(w.stage(&o).await, "done");
+    assert_eq!(w.safety_state(&o).await, "released");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn light_verify_cannot_release_after_an_unconfirmed_full_failure_in_the_repair_visit() {
+    light_verify_waits_for_alpha_full_read(false).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn light_verify_cannot_release_with_a_full_failure_from_an_earlier_visit() {
+    light_verify_waits_for_alpha_full_read(true).await;
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -948,6 +1034,7 @@ async fn a_provider_without_a_free_slot_defers_only_its_own_check() {
     let db = &w.bridge().catalog.sql.inner;
     db.meter_writes().unwrap();
     let before = db.writes();
+    let beta_due = w.clocks(&o, "beta").await;
 
     let run = w.scrub().await;
     assert_eq!((run.checked, run.ended), (1, ScrubEnd::Idle));
@@ -964,10 +1051,7 @@ async fn a_provider_without_a_free_slot_defers_only_its_own_check() {
         w.clocks(&o, "alpha").await.0 > now,
         "alpha completed independently"
     );
-    assert_eq!(
-        w.clocks(&o, "beta").await.0,
-        now.plus_secs(w.bridge().cfg.scrub.confirm_secs)
-    );
+    assert_eq!(w.clocks(&o, "beta").await, beta_due);
     // A run with only this partial result still completes alpha's check.
     w.set_clocks(&o, "alpha", now, later).await;
     w.set_clocks(&o, "beta", now, later).await;
@@ -976,6 +1060,66 @@ async fn a_provider_without_a_free_slot_defers_only_its_own_check() {
     assert!(!alerts()
         .iter()
         .any(|alert| alert.starts_with("scrub-no-progress")));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn an_unreachable_backbone_backlog_cannot_spend_the_run_quota() {
+    let mut w = world_with(|cfg| cfg.scrub.extents_per_run = 8).await;
+    let mut backlog = Vec::new();
+    for i in 0..9 {
+        backlog.push(w.released(&format!("beta-{i}"), i).await);
+    }
+    let healthy = w.released("alpha-only", 10).await;
+    let due = w.bridge().clock.now();
+    let later = due.plus_secs(100 * DAY_SECS);
+    for o in &backlog {
+        w.set_clocks(o, "alpha", later, later).await;
+        w.set_clocks(o, "beta", due, later).await;
+    }
+    w.set_clocks(&healthy, "beta", later, later).await;
+    w.advance_secs(1);
+    w.set_clocks(&healthy, "alpha", w.bridge().clock.now(), later)
+        .await;
+    // Drop the listener at the address the configured beta provider uses.
+    drop(std::mem::replace(&mut w.servers[1], server().await));
+
+    let run = w.scrub().await;
+    assert_eq!((run.checked, run.ok, run.ended), (1, 1, ScrubEnd::Idle));
+    assert_eq!(w.result(&healthy).await, "ok");
+    for o in &backlog {
+        assert_eq!(w.clocks(o, "beta").await, (due, later));
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn held_copy_checks_wait_for_the_repair_watch() {
+    let w = world_with(|cfg| cfg.scrub.extents_per_run = 1).await;
+    let held = w.released("held", 10).await;
+    let healthy = w.released("healthy", 11).await;
+    let now = w.bridge().clock.now();
+    let watch = now.plus_secs(10 * 3600);
+    let later = now.plus_secs(100 * DAY_SECS);
+    let c = &w.bridge().catalog;
+    let token = c.scrub_take(now, now.plus_secs(60)).await.unwrap().unwrap();
+    assert!(c
+        .scrub_repin(token, &held.extent, (now, watch), &[])
+        .await
+        .unwrap());
+    assert!(c.scrub_free(token, now).await.unwrap());
+    w.set_clocks(&held, "alpha", now, later).await;
+    w.advance_secs(1);
+    w.set_clocks(&healthy, "alpha", w.bridge().clock.now(), later)
+        .await;
+
+    let run = w.scrub().await;
+    assert_eq!((run.checked, run.ok), (1, 1));
+    assert_eq!(w.clocks(&held, "alpha").await, (watch, later));
+    assert_eq!(w.safety_state(&held).await, "held");
+    w.advance_secs(10 * 3600 - 1);
+    w.scrub().await;
+    let next_watch = UnixMs(w.next_at(&held).await.unwrap());
+    assert!(next_watch > watch);
+    assert_eq!(w.clocks(&held, "alpha").await, (next_watch, later));
 }
 
 /// The breaker: 8 extents of 8 lacking articles on one backbone is a
@@ -1293,6 +1437,44 @@ async fn a_healthy_check_writes_its_result_and_the_run_its_slots() {
         spent.table("provider_permits") + spent.table("provider_health")
     };
     assert_eq!(slots, one, "a run of 4 takes the slots a run of 1 does");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn write_meter_separates_enrollment_from_independent_copy_checks() {
+    let w = world().await;
+    let o = w.released_unenrolled("meter", 71).await;
+    let c = &w.bridge().catalog;
+    let now = w.bridge().clock.now();
+    let interval = i64::from(DAY_SECS) * 1000;
+    let db = &c.sql.inner;
+    db.meter_writes().unwrap();
+    let token = c.scrub_take(now, now.plus_secs(60)).await.unwrap().unwrap();
+    let before = db.writes();
+    c.scrub_enroll(
+        token,
+        &["alpha".into(), "beta".into()],
+        now,
+        [30 * interval, 90 * interval],
+    )
+    .await
+    .unwrap();
+    let spent = db.writes().since(&before);
+    let enrollment = spent.table("extents") + spent.table("scrub_copies");
+    println!("rows written per initial enrollment: {enrollment} (excluding run state)");
+    assert_eq!(enrollment, 7);
+    assert!(c.scrub_free(token, now).await.unwrap());
+    let later = now.plus_secs(100 * DAY_SECS);
+    w.set_clocks(&o, "beta", later, later).await;
+    for (stat, full, kind) in [(now, later, "STAT"), (later, now, "BODY")] {
+        w.set_clocks(&o, "alpha", stat, full).await;
+        let before = db.writes();
+        assert_eq!(w.scrub().await.ok, 1);
+        let spent = db.writes().since(&before);
+        let rows = spent.table("extents") + spent.table("scrub_copies");
+        let overhead = spent.billed() - rows;
+        println!("rows written per one-copy {kind} visit: {rows} (+{overhead} per run)");
+        assert_eq!(rows, 4);
+    }
 }
 
 /// While an incident on a backbone stands, a confirmed loss there is not
@@ -1960,30 +2142,30 @@ async fn the_eviction_job_keeps_the_safety_copy_of_an_extent_re_pinned_under_it(
     assert!(w.has_safety(&o), "the safety copy stays");
 }
 
-/// A read that breaks off while every backbone says it holds every
-/// article is recorded `deferred`, looked at again after the confirm
-/// interval, and the run goes on with the next extent.
+/// A BODY interruption defers the first extent without changing the due
+/// clocks. After both backbones fail, the rest of their backlog waits for
+/// the next run rather than repeating the same probes.
 #[tokio::test(flavor = "current_thread")]
-async fn a_read_that_breaks_off_is_deferred_and_the_run_goes_on() {
+async fn a_read_that_breaks_off_leaves_its_backbone_due_for_the_next_run() {
     let w = world().await;
     let a = w.released("a", 205).await;
     let b = w.released("b", 206).await;
+    let first_due = w.bridge().clock.now();
     w.full_checks_now(&a).await;
+    w.advance_secs(1);
     w.full_checks_now(&b).await;
     for s in &w.servers {
         s.drop_next_bodies(1000).await;
     }
     let run = w.scrub().await;
-    for s in &w.servers {
+    assert_eq!((run.checked, run.ended), (0, ScrubEnd::Idle));
+    assert_eq!(w.result(&a).await, "deferred");
+    assert_eq!(w.result(&b).await, "NULL");
+    for (s, backbone) in w.servers.iter().zip(["alpha", "beta"]) {
+        assert_eq!(w.clocks(&a, backbone).await.1, first_due);
+        assert_eq!(w.clocks(&b, backbone).await.1, first_due.plus_secs(1));
         s.drop_next_bodies(0).await;
     }
-    let results = [w.result(&a).await, w.result(&b).await];
-    assert_ne!(run.ended, ScrubEnd::Busy, "{results:?}");
-    assert!(
-        results.iter().all(|r| r == "deferred"),
-        "both looked at, neither recorded as a loss: {results:?}"
-    );
-    w.advance_secs(3600);
     let again = w.scrub().await;
     assert_eq!(again.ok, 2);
 }

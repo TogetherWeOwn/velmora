@@ -234,7 +234,7 @@ pub(super) async fn enroll<S: Sql>(
 
 pub(crate) fn due_sql() -> String {
     format!(
-        "SELECT {EXTENT_COLS}, scrub_result, last_scrubbed_at, stat_at, full_at, \
+        "SELECT {EXTENT_COLS}, scrub_result, last_scrubbed_at, scrub_next_at, stat_at, full_at, \
            stat_loss_at, full_loss_at, stat_phase_at, full_phase_at \
          FROM scrub_copies s INDEXED BY scrub_copies_due CROSS JOIN extents e ON e.id = s.extent_id \
          WHERE s.backbone = ?1 AND MIN(stat_at, full_at) <= ?2 \
@@ -261,18 +261,19 @@ pub(crate) fn range_queries() -> [String; 4] {
 
 fn parse_candidate(mut row: crate::ports::Row) -> Result<(ScrubCandidate, Cols)> {
     let width = EXTENT_COLS.split(',').count();
-    if row.len() < width + 2 {
+    if row.len() < width + 3 {
         return Err(BridgeError::Sql("row decode: scrub columns".into()));
     }
     let mut extra = Cols::new(row.split_off(width));
     let last = extra.opt_text()?.as_deref().and_then(ScrubResult::parse);
     let last_scrubbed_at = extra.opt_ms()?;
+    let watch_at = extra.opt_ms()?;
     Ok((
         ScrubCandidate {
             extent: extent_row(row)?,
             last,
             last_scrubbed_at,
-            watch: false,
+            watch_at,
             checks: Vec::new(),
         },
         extra,
@@ -289,12 +290,11 @@ pub(super) async fn due<S: Sql>(
     let page = SqlValue::Int(i64::from(limit));
     let mut grouped = HashMap::new();
     for row in c.sql.query(&watch_sql(), &[ms(now), page.clone()]).await? {
-        let (mut candidate, mut extra) = parse_candidate(row)?;
-        candidate.watch = true;
-        grouped.insert(
-            candidate.extent.id.clone(),
-            (UnixMs(extra.num()?), candidate),
-        );
+        let (candidate, _) = parse_candidate(row)?;
+        let watch_at = candidate.watch_at.ok_or_else(|| {
+            BridgeError::Sql("row decode: due repair watch has no deadline".into())
+        })?;
+        grouped.insert(candidate.extent.id.clone(), (watch_at, candidate));
     }
     let sql = due_sql();
     for backbone in backbones {
@@ -380,17 +380,17 @@ pub(super) async fn has_loss<S: Sql>(
     c: &SqlCatalog<S>,
     extent: &ExtentId,
     backbones: &[String],
-) -> Result<bool> {
+) -> Result<Vec<String>> {
     let rows = c
         .sql
         .query(
-            "SELECT 1 FROM json_each(?2) j CROSS JOIN scrub_copies s \
+            "SELECT s.backbone FROM json_each(?2) j CROSS JOIN scrub_copies s \
          ON s.extent_id = ?1 AND s.backbone = j.value \
-         WHERE s.stat_loss_at IS NOT NULL OR s.full_loss_at IS NOT NULL LIMIT 1",
+         WHERE s.stat_loss_at IS NOT NULL OR s.full_loss_at IS NOT NULL",
             &[text(extent.as_str()), json(&backbones)?],
         )
         .await?;
-    Ok(!rows.is_empty())
+    rows.into_iter().map(|row| Cols::new(row).text()).collect()
 }
 
 pub(super) async fn retire<S: Sql>(

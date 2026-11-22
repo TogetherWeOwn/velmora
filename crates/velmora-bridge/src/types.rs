@@ -1634,7 +1634,7 @@ pub struct ScrubCandidate {
     /// `None` = never checked, or a value this version does not know.
     pub last: Option<ScrubResult>,
     pub last_scrubbed_at: Option<UnixMs>,
-    pub watch: bool,
+    pub watch_at: Option<UnixMs>,
     pub checks: Vec<ScrubCheck>,
 }
 
