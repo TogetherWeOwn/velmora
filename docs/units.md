@@ -46,6 +46,17 @@ database, so they run natively in tests); the Durable Object class, the
      Whatever its numbers, a fan-out call names its reader and the
      generation its grant was made for, and reads that generation of that
      key, not the one live now.
+   - **The key-chain apply names its base** (`apply(from_seq, entries)`,
+     `unit::keys`). `from_seq` is the exclusive base, and the entries,
+     one per record, run without a gap from `from_seq + 1`; a gap is
+     refused. A base above the unit's `keys_seq` is answered
+     `keys_behind` with the unit's numbers, and the caller reads again
+     from the unit's seq + 1. Each entry is compared, per subject, with
+     that row's `last_seq`: an entry at or below it is skipped, except an
+     entry that revokes, and one that opens at the same seq a row held
+     closed (the bring-up's second send). `revoked` is final. The apply
+     is the one way `keys_seq` moves; `sync` refuses a `keys_seq` above
+     the unit's (`keys_not_applied`).
 6. **Birth certificate.** A unit is made only by `provision(token)`. The
    token names the tenant, the unit, the jurisdiction, the record seq, the
    schema version, the key scheme and its kind (`birth` or `restore`), and is
@@ -83,6 +94,80 @@ Rules 8 to 10 and 12 (one alarm, jobs that name their tenant, the unit's
 outbox to the directory, the freshness lease) are not built yet. Until the
 lease exists, a unit is not bound anywhere: the lease is what closes a unit
 that a point-in-time restore took back to an older state.
+
+**The calls are JSON** (`UnitCall` and `UnitAnswer`, `unit::call`). Every
+answer is to carry `lease_left_ms`, and an answer of a unit that holds
+keys `revoked` (rule 12; with the lease). Until the class is bound
+(stage C(b)) the format may change. After it, these types only gain
+fields, in two deploys, reader first, and a golden-JSON test pins each
+variant.
+
+**What a unit keeps besides the catalogue:** `unit_birth` (the
+certificate); `unit_head` (`state_seq`, `keys_seq`, the tenant state and
+mode, `restoring_since` and, with the restore call, `closed_at`; moved by
+`sync`, and `keys_seq` by the key apply); `unit_keys` and
+`unit_key_grants` (the key chain); the lease and the alarm's counters in
+`unit_lease`, and revocations listed for a key the unit does not hold as
+tombstones (with the lease); and the stamp counter.
+
+## Keys
+
+The unit holds its tenant's key chain as the Worker read and verified it
+(`unit_keys`, `unit_key_grants`): every key, app password, principal and
+internal key, its status, `made_by`, grants (bucket, access, expiry,
+prefix, address list) and the seq of its newest record. A subject is
+`held` when the Worker could not open its private part, or the directory
+has not acknowledged its opening record: a held subject is never served.
+
+The catalogue's own `access_keys` and `grants`, which the S3 path reads,
+are built from these rows in the same call, for every subject the call
+touched and every key made under one of them: the **effective grant**. A
+key is served only while it is `active`, not held, has its secret, and
+every principal up its `made_by` chain is `active` and not held. A grant
+is served only on a bucket this unit holds, only without a prefix,
+address list or expiry (the catalogue's `grants` cannot state them; such a
+grant is not served until the check that can), and only while every
+principal up the chain holds such a grant on that bucket; its access is
+the lowest along the chain. The internal key is not served from these
+rows: it signs presigned URLs only, which they cannot say. A key or an
+app password outside tenant 0 must name its principal. Everything else
+fails closed.
+
+## Import
+
+The owner move fills the owner's root unit `<t>/0` from the frozen D1
+with `import` batches (`unit::import`). A batch is accepted only while the
+unit is the root unit of a tenant other than tenant 0; its own `restoring`
+entry is set and the batch names that entry's `since_seq`; tenant 0's
+verified head, passed by the Worker, says `moving` with `move.to` = this
+tenant and is not older than a head an import was already bound to; and
+the caller's numbers equal the unit's (as a job's). That binds the import
+to this one move: no other tenant is filled, and no import runs outside a
+window.
+
+A batch is one table, its column list (the unit's own, in schema order),
+at most 500 rows (est) of values with their type class, the cursor of the
+batch it follows and its own. It is applied once and in order; the last
+batch sent again changes nothing, so the import resumes by table and
+cursor. It fills the data tables only. The keys come by the key apply
+(so `keys_seq` and the keys agree). The usage counters `usage_global` and
+`usage_buckets` are the unit's own: its triggers count each imported row
+while the counters are on, and the recount fills them when they are off.
+An `outbox` row must come with its lease cleared, and an extent's
+`plan_rev` is bound through `plan_rev::bound`.
+
+## Bookmarks
+
+**A bookmark leaves the unit only sealed.** No bookmark is stored or
+logged in clear: not in a record, a receipt, a log line, a directory row
+or an answer that the Worker keeps. Two leave the unit: the restore's undo
+bookmark, and the pre-migration bookmark inside a dump. Both are sealed in
+the Worker under `HKDF(TK, catalog-backup/v1)` (tenant 0: a key derived
+from the KEK) under `cb/<t>/<unit>/`; the 30-day lifecycle and the shred's
+purge delete that prefix. The platform keeps each object's point-in-time
+history for 30 days across `deleteAll()`, and the API reaches it only with
+a bookmark taken before the delete; with no readable bookmark outside the
+unit, the history ends with the platform's retention.
 
 ## Tenant state
 
