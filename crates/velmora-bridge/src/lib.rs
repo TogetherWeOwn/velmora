@@ -35,6 +35,7 @@ pub mod remote;
 pub mod replay;
 pub mod service;
 pub mod sql;
+pub mod sql_bind;
 pub mod stamp;
 pub mod tenant;
 pub mod tenant_catalog;

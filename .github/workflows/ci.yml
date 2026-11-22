@@ -262,6 +262,7 @@ jobs:
     timeout-minutes: 5
     outputs:
       bridge: ${{ steps.filter.outputs.bridge }}
+      unit: ${{ steps.filter.outputs.unit }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -275,6 +276,7 @@ jobs:
           set -euo pipefail
           if [ "$CI_EVENT_NAME" != "pull_request" ]; then
             echo "bridge=true" >> "$GITHUB_OUTPUT"
+            echo "unit=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           changed=$(git diff --name-only HEAD^1 HEAD)
@@ -282,6 +284,13 @@ jobs:
             echo "bridge=true" >> "$GITHUB_OUTPUT"
           else
             echo "bridge=false" >> "$GITHUB_OUTPUT"
+          fi
+          # The unit's code, the twin that compares it with SQLite, the
+          # pinned workerd and the catalogue migrations a unit applies.
+          if grep -qE '^(Cargo\.toml|Cargo\.lock|\.github/workflows/ci\.yml|workers/unit/|workers/unit-suite/|workers/s3-bridge/package-lock\.json|workers/s3-bridge/migrations/|crates/velmora-bridge/src/(unit|unit_lease)/|crates/velmora-bridge/src/(sql_bind|testkit|testkit_shadow)\.rs$|crates/velmora-bridge/tests/(unit_core|sql_binding|d1_binding)\.rs$)' <<< "$changed"; then
+            echo "unit=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "unit=false" >> "$GITHUB_OUTPUT"
           fi
 
   # S3 bridge core: contract tests (rusqlite Sql, in-memory blobs, fakes)
@@ -313,6 +322,40 @@ jobs:
       - run: cargo test --locked -p velmora-s3-proto -p velmora-bridge
       - run: cargo clippy --locked -p velmora-s3-proto -p velmora-bridge --all-targets --features velmora-bridge/testkit -- -D warnings
       - run: cargo build --locked -p velmora-test-nntp --bin fakesrv
+
+  # The unit's core rules and the value binding on Durable Object SQLite
+  # in workerd (workers/unit-suite/run-suite.sh): every call of these
+  # test targets is also asked of a SQLite Durable Object and compared,
+  # and the unit object smoke runs after them. About 2 minutes of tests.
+  # The whole bridge suite on the twin (about 70 minutes) is not here:
+  # it runs nightly on main (unit-suite.yml).
+  unit-core:
+    name: unit core (workerd)
+    needs: changes
+    if: needs.changes.outputs.unit == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust stable
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update --target wasm32-unknown-unknown
+          rustup default stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Install pinned worker-build 0.8.7
+        run: cargo install --locked worker-build --version 0.8.7
+      # The pinned workerd comes from the deploy tooling's lockfile.
+      - name: Install the pinned deploy tooling
+        working-directory: workers/s3-bridge
+        run: npm ci --silent
+      - name: Unit core, binding and object smoke (workerd twin)
+        env:
+          SUITE_INSTANCES: "2"
+        run: bash workers/unit-suite/run-suite.sh --test unit_core --test sql_binding --test d1_binding
 
   # The S3 Worker bundle: wasm clippy with the request-target lint
   # (workers/s3-bridge/clippy.toml bans worker::Request::url), worker-build, size budget.
@@ -477,7 +520,7 @@ jobs:
 
   ci-ok:
     name: ci-ok
-    needs: [rust-test, rust-wasm, rust-worker-pinned-tls, rust-msrv, cargo-deny, public-pr-security, changes, bridge-native, worker-build, worker-e2e, console-test, alerts-test]
+    needs: [rust-test, rust-wasm, rust-worker-pinned-tls, rust-msrv, cargo-deny, public-pr-security, changes, bridge-native, worker-build, worker-e2e, unit-core, console-test, alerts-test]
     if: ${{ always() }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -487,16 +530,19 @@ jobs:
           # A private PR skips the caller but fails ci-ok without scanning.
           # The path-filtered bridge jobs must succeed when the filter says
           # bridge=true and must be skipped (not failed or cancelled) when it
-          # says bridge=false; the filter job itself must succeed.
-          if ! jq -e --arg event "$CI_EVENT_NAME" --arg bridge "$BRIDGE" '
+          # says bridge=false; the filter job itself must succeed. The unit
+          # job follows its own filter (unit) the same way.
+          if ! jq -e --arg event "$CI_EVENT_NAME" --arg bridge "$BRIDGE" --arg unit "$UNIT" '
             . as $n |
             ["bridge-native", "worker-build", "worker-e2e"] as $filtered |
             ($n | length) > 1 and
             $n["public-pr-security"].result == (if $event == "pull_request" then "success" else "skipped" end) and
             $n.changes.result == "success" and
             ($bridge == "true" or $bridge == "false") and
+            ($unit == "true" or $unit == "false") and
             all($filtered[]; $n[.].result == (if $bridge == "true" then "success" else "skipped" end)) and
-            ($n | del(.["public-pr-security"]) | del(.[$filtered[]]) | all(.[]; .result == "success"))
+            $n["unit-core"].result == (if $unit == "true" then "success" else "skipped" end) and
+            ($n | del(.["public-pr-security"]) | del(.[$filtered[]]) | del(.["unit-core"]) | all(.[]; .result == "success"))
           ' <<< "$NEEDS_JSON" > /dev/null; then
             echo "ci-ok: a required job did not succeed"
             exit 1
@@ -506,6 +552,7 @@ jobs:
           NEEDS_JSON: ${{ toJSON(needs) }}
           CI_EVENT_NAME: ${{ github.event_name }}
           BRIDGE: ${{ needs.changes.outputs.bridge }}
+          UNIT: ${{ needs.changes.outputs.unit }}
 
   # Production deploy of the S3 Worker after ci-ok on a push to main, in two
   # jobs. They depend on ci-ok, never the reverse, and are not part of

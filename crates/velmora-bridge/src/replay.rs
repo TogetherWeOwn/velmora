@@ -572,6 +572,14 @@ impl<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>
                 let mut packed = None;
                 let mut parity = None;
                 let plan = match record {
+                    // A record of a revision this code does not know is
+                    // written from in no way: it is reported, and
+                    // `unreadable` keeps the unit closed (the plan_rev
+                    // contract, part 3).
+                    Some(record) if !crate::plan_rev::readable(record.plan_rev) => {
+                        unopened.extend(read.name.clone());
+                        None
+                    }
                     Some(record) => match record.rows(state) {
                         Ok(rows) => {
                             row.plan_rev = record.plan_rev;

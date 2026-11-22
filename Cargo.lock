@@ -1601,6 +1601,7 @@ dependencies = [
  "serde_json",
  "velmora",
  "velmora-bridge",
+ "velmora-unit-do",
  "worker",
 ]
 
