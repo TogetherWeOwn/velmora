@@ -909,6 +909,179 @@ else: the objects are ordinary generations, which it reads, posts,
 verifies and replays. It answers `EntityTooLarge` to a new PutObject
 above one extent.
 
+## Upload parts that left their upload
+
+Three things take a part out of a multipart upload for good: the part
+is uploaded again under its number, the upload is aborted, or
+CompleteMultipartUpload leaves the part out of its list. Such a part
+was never posted. Its ciphertext stays in `SAFETY` (`x/<extent id>`),
+and `GC_MODE` takes it only in a disposable bucket.
+
+`GC_ORPHANS = "on"` (its own switch, in every bucket, whatever
+`GC_MODE` says) deletes these copies and nothing else. The copy of an
+extent goes when all of this holds in one batch of the catalogue:
+
+1. the extent has an open `delete_safety` row in `gc`. For an extent
+   that is still `staged`, only the three writes above queue one, in
+   the batch that takes the part out of the upload, dated with that
+   moment;
+2. that moment is 31 days ago or more;
+3. the extent is `staged` and has no generation: no object was ever
+   made of it;
+4. no `generation_extents` row names it: no object and no server-side
+   copy reads it;
+5. no part of an open upload names it. An upload in progress keeps
+   every part it lists, however old it is;
+6. no replay is under way, the catalogue is not behind its rollback
+   stamp, and the last replay ended 31 days ago or more ("After a
+   restore" below);
+7. no key that could still get an object made of the part has a write
+   whose outcome is not known (below).
+
+**Why 31 days.** Nothing a request or a job does brings a dropped part
+back: its extent id is never issued again, and only an open upload
+that lists an extent can publish it. A database taken back to before
+the drop does list it. Time Travel reaches 30 days, so a part that was
+dropped longer ago is dropped in every state the database can return
+to, as long as it was not restored in that time ("After a restore"
+below); the 31st day is the margin between the clocks. A database taken
+back to before a part was collected still has the part dropped with
+its row open, and the collector deletes the absent copy once more.
+
+**A write whose outcome is not known.** CompleteMultipartUpload stores
+its recovery record, which names the parts it was given, before its
+batch runs. If the batch does not run and the record cannot be removed
+either, the request answers 5xx, the upload stays open, and the record
+stays: a replay would publish it. The catalogue marks the key before
+any such record is stored (`key_floors.unpublished`), and only a write
+or a delete of the key that was acknowledged takes the mark away. While
+the key of an upload is marked, the collector leaves the parts of that
+upload. For a part that was uploaded again, and for the slices after
+the first of a part above one extent, the catalogue no longer knows
+the upload: those wait until no key of their bucket that an upload was
+ever begun on is marked. The catalogue asks that of a bucket once a
+day at most and keeps the answer for that day (`scan_cursors`, key
+`orphans:bucket:<bucket id>`, value `clean:<time>` or `marked:<time>`
+in milliseconds). A key that is marked after a bucket was found clean
+holds nothing back that day, and need not: its record was stored then,
+from a part list that a part dropped 31 days earlier is not in. The
+marked keys:
+
+```
+npx wrangler d1 execute <db> --remote --command \
+  "SELECT b.name, f.key, f.floor_id FROM key_floors f JOIN buckets b ON b.id = f.bucket_id WHERE f.unpublished <> 0"
+```
+
+To let the parts go, settle the key: PUT the object again, or DELETE
+the key (a delete of a marked key stores a tombstone also when the key
+has no object). The parts of that key's upload go with the pass after
+that. The others go with the first pass after the answer about their
+bucket is a day old. What holds a bucket's parts back now:
+
+```
+npx wrangler d1 execute <db> --remote --command \
+  "SELECT k, v FROM scan_cursors WHERE k LIKE 'orphans%'"
+```
+
+`orphans:bucket:<bucket id>` = `marked:<time>` means the parts of
+unknown uploads in that bucket wait for a marked key, as found at that
+time. `orphans` is the position of the scan (`rest:<time>`: the next
+pass starts then).
+
+**Before turning it on.**
+
+1. A record stored before the catalogue had `key_floors` (migration
+   0007) set no mark. Such a record names only parts that were stored
+   before it. This must print 0:
+
+   ```
+   npx wrangler d1 execute <db> --remote --command \
+     "SELECT COUNT(*) FROM extents WHERE state = 'staged' AND created_at < COALESCE((SELECT CAST(strftime('%s', applied_at) AS INTEGER) * 1000 FROM d1_migrations WHERE name = '0007_key_floors.sql'), 9007199254740991)"
+   ```
+
+   A database with no row for that migration in `d1_migrations` (it
+   was applied by hand, or the database was imported) counts every
+   staged extent: put the time the migration was applied in place of
+   the subquery.
+
+   The Worker version that came with that migration is the first one
+   that sets the mark. A version from before it may have served for a
+   while after the migration was applied, and serves again after a
+   Worker rollback: put the time from which only versions with the
+   mark have served in place of `applied_at` when it is the later one.
+
+   If it does not, leave the switch off until every key that had an
+   upload before that time has been written again: PUT an object
+   to it, and DELETE that object after if the key should hold none. A
+   DELETE alone is not enough there: such a key carries no mark, and
+   on a key with no object and no mark a delete stores nothing, so the
+   old record would stay the newest one of the key.
+2. Run it on a deployed test environment, with `GC_ORPHANS = "on"`
+   and `GC_MODE` off there: with `GC_MODE=disposable` the older
+   collector deletes a dropped part in a bucket flagged disposable as
+   soon as it is dropped, and the run would show nothing about this
+   one. Abort an upload, upload a part twice and keep one upload open.
+   Then delete the row `orphans` of `scan_cursors` on that environment
+   (the scan rests a day after a pass, and a database used before may
+   hold a row from then) and wait until the row is back and reads
+   `rest:<ms>`: the collector has then made a pass since the parts
+   were dropped (the first cron run of a new deployment can be a
+   quarter of an hour away). The copies of the dropped parts are still
+   in `SAFETY` (`x/<extent id>`): the grace period holds them. Then
+   date the `gc` rows of the dropped parts 31 days back, delete the
+   row `orphans` again, and wait for a cron run. Then see both: the
+   copies of the dropped parts are gone from `SAFETY` and their
+   extents say `deleted` with the `gc` row closed, so the collector
+   did run; and the open upload completes and reads back.
+
+**What it costs.** While nothing is due, one row read per cron run. A
+pass reads the open `gc` rows in windows of 500, oldest first, and a
+job takes at most 100 parts; each part is one delete in `SAFETY` and
+three rows written (the extent, the usage counter, the `gc` row), plus
+one row per job for the position of the scan. After a pass over every
+due row the next one starts a day later. With `GC_MODE` off the rows
+of deleted and replaced objects stay open, and every pass reads them
+again: one row read for each, plus one for its extent, once a day. The
+parts whose upload is no longer known (point 7) need one statement per
+bucket that reads every row of `uploads`, about two rows read per
+upload ever begun. It runs once a day per bucket, whatever the number
+of parts and jobs, and also while a marked key holds such parts back:
+those are then refused for the rest of the day without another read of
+the uploads. Two jobs that run at the same moment on an answer that is
+a day old both ask: the read is then done once for each of them.
+
+**After a restore.** Time Travel cannot reach back past the 31 days on
+the history the database is on. It can return to a state of a history
+that an earlier restore left, for 30 days after that restore, and such
+a state may list in an open upload a part that was dropped, and since
+collected, on the history that was kept. So the collector deletes
+nothing until 31 days after the last replay ended
+(`SELECT state, finished_at FROM restore_state`): a catalogue that was
+taken back takes no write before a replay has run to its end, and by
+then every state of a history left before it is out of reach.
+
+It cannot see a restore that was undone before the replay after it
+ended, or in the minutes after it ended and before the next cron run
+raised the rollback stamp: the catalogue that is brought back holds no
+trace of the time it was away. So two rules stay as well, for every
+Time Travel restore, also one that undoes another, and also one that
+the rollback check did not report:
+
+1. set `GC_ORPHANS` to off and leave it off for 31 days;
+2. run the replay to its end before the switch goes back on. A restore
+   can take away the mark of a write whose outcome is not known while
+   its record stays; the replay publishes such a record and takes its
+   parts into the object, so they are not collected.
+
+A database loaded from an export file that is older than 31 days can
+list, in an open upload, a part whose copy was collected since. The
+replay counts such rows in `held_missing_total`; abort the uploads they
+belong to. A catalogue rebuilt from the records alone does not know the
+parts that were not collected yet: their copies stay in `SAFETY`.
+
+With the switch off nothing is deleted, and the rows stay for a later
+run with the switch on.
+
 ## Packed article plans
 
 The article plan of an extent (where its ciphertext is on Usenet) is
