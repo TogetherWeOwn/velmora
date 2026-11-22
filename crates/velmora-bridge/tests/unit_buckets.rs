@@ -13,6 +13,7 @@ use velmora_bridge::unit::{
     BirthKind, BirthToken, CallKind, Refused, Seqs, SyncHead, TenantId, TenantState, Unit,
     UnitAnswer, UnitCall, UnitName, UnitOp,
 };
+use velmora_bridge::unit_lease::lease::Proven;
 use velmora_bridge::{Sql, UnixMs};
 
 const NOW: UnixMs = UnixMs(1_795_000_000_000);
@@ -89,6 +90,23 @@ fn ready() -> Unit<RusqliteSql> {
         sync(&u, TenantState::Active, None),
         UnitAnswer::Ok { .. }
     ));
+    // Rule 12 (the unit lease, u0002): the Worker's renewal at NOW, so the
+    // unit serves for T; every call of these tests runs at NOW.
+    let h = u.head().unwrap();
+    let renewed = worker(
+        &u,
+        UnitOp::Renew {
+            proof_start: NOW,
+            proven: Proven {
+                state_seq: h.seqs.state_seq,
+                keys_seq: h.seqs.keys_seq,
+                stamp_counter: None,
+                revoked: 0,
+            },
+            revocations: Vec::new(),
+        },
+    );
+    assert!(matches!(renewed, UnitAnswer::Ok { .. }), "{renewed:?}");
     u
 }
 
