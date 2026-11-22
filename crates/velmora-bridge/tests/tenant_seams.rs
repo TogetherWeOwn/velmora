@@ -510,6 +510,10 @@ fn the_catalogue_id_is_read_in_one_place() {
 fn the_directory_is_asked_by_nothing() {
     let all = all();
     const DIRECTORY: &str = "bridge/directory/port.rs";
+    // The request router of a managed tenant's units (`unit_router`,
+    // design round 5) is another port, with a `route` of its own: only it
+    // and its one caller may say `.route(`.
+    const UNIT_ROUTER: [&str; 2] = ["bridge/unit_router.rs", "bridge/service/mod.rs"];
     for name in ["Directory", "SingleTenant", "directory::port", ".route("] {
         let found = uses(&all, name);
         // The directory module's own files (its store, gate and the
@@ -517,6 +521,7 @@ fn the_directory_is_asked_by_nothing() {
         let files: Vec<&String> = found
             .keys()
             .filter(|f| *f != DIRECTORY && !f.starts_with("bridge/directory/"))
+            .filter(|f| !(name == ".route(" && UNIT_ROUTER.contains(&f.as_str())))
             .collect();
         assert!(files.is_empty(), "{name}: {files:?}");
     }

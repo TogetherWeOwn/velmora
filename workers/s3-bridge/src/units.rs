@@ -41,7 +41,9 @@ use velmora_bridge::types::JobOutcome;
 use velmora_bridge::unit::{Seqs, TenantId, UnitAnswer, UnitCall, UnitName, UnitReply};
 use velmora_bridge::unit_consumer::{NoClient, UnitRun};
 use velmora_bridge::unit_lease::client::UnitReplies;
-use velmora_bridge::unit_router::NoHeads;
+use velmora_bridge::unit_router::{
+    HeadCache, KeyRoutes, KeyTenant, NoClients, NoHeads, NoRoutes, Router,
+};
 use velmora_bridge::{Bridge, BridgeError, Result};
 use worker::wasm_bindgen::JsValue;
 use worker::{Env, Method, ObjectNamespace, Request, RequestInit, Stub};
@@ -274,4 +276,62 @@ mod tests {
         }
         assert!(decode_answer("{}").is_err());
     }
+}
+
+// ---------------------------------------------------------------------------
+// The request router (design round 5, AM-51)
+// ---------------------------------------------------------------------------
+
+/// The key routes of this build: none (see `velmora_bridge::unit_router`).
+pub fn routes() -> NoRoutes {
+    NoRoutes
+}
+
+thread_local! {
+    /// The tenant heads this isolate read (`unit_router::HeadCache`).
+    static HEADS: std::rc::Rc<HeadCache> = std::rc::Rc::default();
+}
+
+/// A request whose claimed access key routes to a managed tenant, served
+/// through the router (`velmora_bridge::service::serve_managed`). `None`:
+/// tenant 0's path, unchanged, which is every request of a Worker without
+/// `UNIT` bound (no route read at all), every request that claims no key
+/// or a key of tenant 0, and every request whose route read failed (ADR
+/// §8.4, DUR-10). `skip`: an admin route or a verified fan-out piece,
+/// which never take a key route.
+///
+/// This build has no key routes, no head reader and no unit client for
+/// requests (`NoRoutes`, `NoHeads`, `NoClients`), so it always answers
+/// `None`; the adapters come with the directory binding and the unit
+/// client's bodies.
+pub async fn route_request(
+    base: &WorkerBridge,
+    units: Units,
+    skip: bool,
+    req: &velmora_bridge::S3Request,
+) -> Option<velmora_bridge::S3Response> {
+    if units != Units::Bound || skip {
+        return None;
+    }
+    let akid = velmora_bridge::service::claimed_access_key(&base.cfg, req)?;
+    let tenant = match routes().tenant_of(&akid).await {
+        Ok(KeyTenant::Managed(tenant)) => tenant,
+        Ok(KeyTenant::Zero) | Err(_) => return None,
+    };
+    let cache = HEADS.with(std::rc::Rc::clone);
+    let heads = heads();
+    let router = Router {
+        maintenance: base.cfg.maintenance,
+        clients: &NoClients,
+        heads: &heads,
+        cache: &cache,
+        now: velmora_bridge::ports::Clock::now(&base.clock),
+    };
+    let (resp, line) =
+        velmora_bridge::service::serve_managed(&router, base.cfg.maintenance, &tenant, req).await;
+    match line.alert {
+        true => worker::console_error!("alert: unit request ({})", line.code),
+        false => worker::console_log!("unit request ({})", line.code),
+    }
+    Some(resp)
 }

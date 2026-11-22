@@ -113,11 +113,24 @@ pub(super) fn unavailable() -> S3Response {
 
 /// `503 ServiceUnavailable` with `Retry-After` for a write: nothing is
 /// published while the catalogue is being restored.
-pub(super) fn writes_refused() -> S3Response {
+pub fn writes_refused() -> S3Response {
     let mut resp = S3Response::error(
         503,
         "ServiceUnavailable",
         "Writes are refused until the catalogue has been restored. Please try again later.",
+    );
+    resp.headers.push(("retry-after".into(), "30".into()));
+    resp
+}
+
+/// `503 ServiceUnavailable` with `Retry-After` for a managed tenant's
+/// request the router could not take to its unit (`service::serve_managed`).
+/// The body names no cause: the log line does.
+pub(super) fn unit_refused() -> S3Response {
+    let mut resp = S3Response::error(
+        503,
+        "ServiceUnavailable",
+        "The service cannot take this request right now. Please try again.",
     );
     resp.headers.push(("retry-after".into(), "30".into()));
     resp
@@ -355,6 +368,23 @@ impl Authority for OneKey {
 /// The access key id the request claims, from the `Authorization` header
 /// or a presigned query. Only used to look the key up; the verifier
 /// parses the credential strictly.
+/// The access key id a request claims (its `Authorization` header or its
+/// presigned query), for the request router only (`unit_router`): it
+/// picks the tenant whose catalogue then verifies the signature. `None`
+/// for a request that claims none or does not parse.
+pub fn claimed_access_key(cfg: &BridgeConfig, req: &S3Request) -> Option<String> {
+    let policy = policy(cfg).ok()?;
+    let target = Target::parse(&req.raw_target, &policy).ok()?;
+    let fields: Vec<(&str, &str)> = req
+        .headers
+        .iter()
+        .filter(|(n, _)| !edge_header(n))
+        .map(|(n, v)| (n.as_str(), v.as_str()))
+        .collect();
+    let headers = Headers::new(&fields, &policy).ok()?;
+    claimed_key(&headers, &target)
+}
+
 fn claimed_key(headers: &Headers, target: &Target) -> Option<String> {
     let credential = match headers.get("authorization") {
         Some(value) => value

@@ -426,6 +426,25 @@ head reader are wired, the Worker uses `NoClient` and `NoHeads`, so the
 arms that need them hand the message back, and `UNIT` stays unbound until
 the build that has both and the unit's alarm dispatcher.
 
+A managed tenant's S3 requests reach its units through the request
+router (`unit_router`, ADR §2.7), which the management plane uses too.
+Only a Worker with `UNIT` bound takes a key route; unbound, every
+request takes tenant 0's path with no added read. The claimed access key
+id picks the tenant (`KeyRoutes`; tenant 0's keys, unknown keys and a
+failed route read keep tenant 0's path, §8.4). The tenant's verified head
+(cached per isolate for under 60 s, read again from the seq it knew)
+names the unit: the root unit for a call with no bucket, the unit of the
+bucket's placement, or the root unit for a bucket with none. The unit
+must be listed. A routed call goes through the unit's client (L2's
+`UnitClient::call`, which runs rule 5) with the head's `state_seq`, the
+highest `keys_seq` a unit of the tenant answered, and `listed`. Under
+`MAINTENANCE=restore` every request that writes answers `503` before any
+head read or unit call. This build has no S3 request operations on a
+unit, and no key routes, head reader or unit client in the Worker, so a
+routed request answers `503` and in practice every request takes tenant
+0's path. A routed request's `503` comes before its signature is checked:
+it tells the caller only that the key id routes to a managed tenant.
+
 ## Bookmarks
 
 **A bookmark leaves the unit only sealed.** No bookmark is stored or
