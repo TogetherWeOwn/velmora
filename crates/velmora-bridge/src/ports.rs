@@ -1385,7 +1385,8 @@ pub trait Catalog {
     /// slot goes to the caller that waited longest. If there is no
     /// event, the client asks again at the wake time the gate gave,
     /// with an empty request under the same id: a slot can expire
-    /// unrenewed without an event. On [`SlotWait::Granted`], the slot
+    /// unrenewed without an event. A zero wake means ask immediately
+    /// on the now-attached session. On [`SlotWait::Granted`], the slot
     /// is pocketed and the holder's next acquire on that provider
     /// tries to renew and use it first. If renewal fails, acquire
     /// takes its normal path and can return `None`. Elsewhere
@@ -1399,8 +1400,8 @@ pub trait Catalog {
     ) -> Result<SlotWait> {
         Ok(SlotWait::Unsupported)
     }
-    /// `holder` has stopped: a slot that came to it from a line
-    /// ([`Self::await_permit`]) and that it never took is given up,
+    /// `holder` stopped or is about to wait again: a slot that came to it
+    /// from a line ([`Self::await_permit`]) and that it never took is given up,
     /// with nothing awaited, so that it goes to the next in the line
     /// and does not lie until it runs out.
     fn leave_line(&self, _holder: &str) {}
