@@ -25,11 +25,27 @@
 //! `VELMORA_KEK_<v>`). Tenant keys come only from [`SealKeys`], which the
 //! composition root fills with keys that the key loader
 //! ([`crate::keys::tk::TkCache::load`]) unwrapped from the key buckets
-//! under the check value the chain committed. The seal itself does no I/O
-//! ([`ControlSeal`]): a record under a version it does not hold answers
-//! [`SealError::KeyNotHeld`], the root loads that version, and reads
-//! again. [`ChainSeal::door`] opens a door part alone, so that the root
-//! can read which version and check value to load.
+//! under the check value the chain committed. That holds for the record
+//! that commits a new version too: `keys::tk::create_key_version` stores
+//! the new key's blobs before it asks the chain to commit, so the commit's
+//! writer loads the key it seals under by the check value it commits.
+//!
+//! **A key is used only for the check value its record names.** Each
+//! record under version `v` carries the committed check value of `v` in
+//! its door part (`key_checks`, set by the record that commits `v`). The
+//! seal takes only a held key with that check value, and refuses to seal
+//! otherwise; the reader opens only with it, and asks for a load
+//! ([`SealError::KeyNotHeld`]) when no held key has it. So no record is
+//! ever sealed under a key that a pinned loader would not give back, and
+//! no other key of the version is ever tried.
+//!
+//! **A key is held for at most [`TK_CACHE_MS`]**, as in the loader's own
+//! cache (the shred's settle time counts on it, ADR §3.3): an older one
+//! is dropped on the next use, and a record under it asks for a load.
+//!
+//! The seal does no I/O ([`ControlSeal`]): the root loads the version a
+//! record asks for and reads again. [`ChainSeal::door`] opens a door part
+//! alone, so that the root can read which version and check value to load.
 //!
 //! [`DoorSeal`] is the read-only form for readers that need door parts
 //! only (the router's tenant heads): the KEK alone, no tenant key, no
@@ -45,14 +61,15 @@ use std::rc::Rc;
 use velmora::rng::FillRandom;
 use zeroize::Zeroizing;
 
-use super::chain::{ControlSeal, OpenedParts, SealError};
-use super::record::{Tenant, TenantPrivate, RECORD_FORMAT};
+use super::chain::{seal_version, ControlSeal, OpenedParts, SealError};
+use super::record::{Tenant, TenantDoor, TenantPrivate, RECORD_FORMAT};
 use crate::crypto::scheme2::{
     parse_control, seal_control, ControlOwner, ControlSealer, OpenedControl, PrivateKeyRef,
-    TenantKey,
+    TenantKey, KCV_LEN,
 };
-use crate::ports::Kek;
-use crate::types::{BridgeError, Result};
+use crate::keys::tk::TK_CACHE_MS;
+use crate::ports::{Clock, Kek};
+use crate::types::{BridgeError, Result, UnixMs};
 use crate::TenantId;
 
 const ERR_KEY_NOT_HELD: BridgeError = BridgeError::Crypto("tenant key version not held");
@@ -62,31 +79,43 @@ const ERR_ZERO_VERSION: BridgeError =
 const ERR_PRIVATE_WITHOUT_KEY: BridgeError =
     BridgeError::Crypto("private part without a tenant key");
 const ERR_KEK_NOT_HELD: BridgeError =
-    BridgeError::Crypto("control record names a KEK version not held");
-const ERR_KEY_OTHER: BridgeError =
-    BridgeError::Crypto("tenant key is not of the tenant and version it is held as");
+    BridgeError::Crypto("control record names a KEK version not held yet");
+const ERR_KEY_VERSION_ZERO: BridgeError = BridgeError::Crypto("tenant key version 0 is no key");
 const ERR_ENCODE: BridgeError = BridgeError::Crypto("empty private part does not encode");
+const ERR_DOOR: BridgeError =
+    BridgeError::Crypto("door part is not a record of this tenant at this key version");
+const ERR_NO_CHECK: BridgeError =
+    BridgeError::Crypto("door part names no committed check value for its key version");
 
-/// The tenant keys a [`ChainSeal`] may use, by tenant and version, and
-/// the versions known to be gone for good (retired, or destroyed by a
-/// shred). One per isolate or per invocation; the composition root fills
-/// it. Holds `Rc`s of the loader's keys, so a key is never copied here.
+/// The tenant keys a [`ChainSeal`] may use, by tenant, version and check
+/// value, each with the time it was held, and the versions known to be
+/// gone for good (retired, or destroyed by a shred). The composition root
+/// fills it. Holds `Rc`s of the loader's keys, so a key is never copied
+/// here.
 #[derive(Default)]
 pub struct SealKeys {
     tenants: RefCell<BTreeMap<TenantId, Held>>,
 }
 
+/// The keys of one version, by check value, each with when it was held.
+type ByCheck = BTreeMap<[u8; KCV_LEN], (Rc<TenantKey>, UnixMs)>;
+
 #[derive(Default)]
 struct Held {
-    keys: BTreeMap<u32, Rc<TenantKey>>,
+    /// By version, then check value.
+    keys: BTreeMap<u32, ByCheck>,
     gone: BTreeSet<u32>,
 }
 
-/// What [`SealKeys`] knows of one version.
+/// What [`SealKeys`] knows of one version and check value.
 enum Version {
     Held(Rc<TenantKey>),
     Gone,
     Unknown,
+}
+
+fn fresh(at: UnixMs, now: UnixMs) -> bool {
+    now.0 >= at.0 && now.0 - at.0 < TK_CACHE_MS
 }
 
 impl SealKeys {
@@ -94,24 +123,28 @@ impl SealKeys {
         Self::default()
     }
 
-    /// Holds `key` as its own tenant's key of its own version (the key
-    /// carries both). A version marked gone is not taken back: `Err`.
-    pub fn hold(&self, key: Rc<TenantKey>) -> Result<()> {
+    /// Holds `key` as its own tenant's key of its own version and check
+    /// value (the key carries all three), from `now` for at most
+    /// [`TK_CACHE_MS`]. A version marked gone is not taken back: `Err`.
+    pub fn hold(&self, key: Rc<TenantKey>, now: UnixMs) -> Result<()> {
         if key.version() == 0 {
-            return Err(ERR_KEY_OTHER);
+            return Err(ERR_KEY_VERSION_ZERO);
         }
         let mut tenants = self.tenants.borrow_mut();
         let held = tenants.entry(key.tenant().clone()).or_default();
         if held.gone.contains(&key.version()) {
             return Err(ERR_KEY_GONE);
         }
-        held.keys.insert(key.version(), key);
+        held.keys
+            .entry(key.version())
+            .or_default()
+            .insert(key.check_value(), (key, now));
         Ok(())
     }
 
     /// Marks `version` of `tenant` gone for good: a record under it opens
-    /// its door part only, and nothing is sealed under it again. Drops the
-    /// key if one was held. Version 0 is no key and is ignored.
+    /// its door part only, and nothing is sealed under it again. Drops
+    /// every key held for it. Version 0 is no key and is ignored.
     pub fn gone(&self, tenant: &TenantId, version: u32) {
         if version == 0 {
             return;
@@ -122,44 +155,62 @@ impl SealKeys {
         held.gone.insert(version);
     }
 
-    /// Drops everything held for `tenant` (a shred, a refused load).
+    /// Drops every key held for `tenant` (a refused load). The versions
+    /// marked gone stay gone.
     pub fn forget(&self, tenant: &TenantId) {
-        self.tenants.borrow_mut().remove(tenant);
+        if let Some(held) = self.tenants.borrow_mut().get_mut(tenant) {
+            held.keys.clear();
+        }
     }
 
-    /// Whether `version` of `tenant` is held.
-    pub fn holds(&self, tenant: &TenantId, version: u32) -> bool {
-        matches!(self.version(tenant, version), Version::Held(_))
+    /// Whether a key of `version` of `tenant` with check value `kcv` is
+    /// held and fresh at `now`.
+    pub fn holds(&self, tenant: &TenantId, version: u32, kcv: &[u8; KCV_LEN], now: UnixMs) -> bool {
+        matches!(self.version(tenant, version, kcv, now), Version::Held(_))
     }
 
-    fn version(&self, tenant: &TenantId, version: u32) -> Version {
-        let tenants = self.tenants.borrow();
-        let Some(held) = tenants.get(tenant) else {
+    fn version(
+        &self,
+        tenant: &TenantId,
+        version: u32,
+        kcv: &[u8; KCV_LEN],
+        now: UnixMs,
+    ) -> Version {
+        let mut tenants = self.tenants.borrow_mut();
+        let Some(held) = tenants.get_mut(tenant) else {
             return Version::Unknown;
         };
         if held.gone.contains(&version) {
             return Version::Gone;
         }
-        match held.keys.get(&version) {
-            Some(key) => Version::Held(key.clone()),
+        let Some(keys) = held.keys.get_mut(&version) else {
+            return Version::Unknown;
+        };
+        // No key outlives its time here, whatever it is asked for.
+        keys.retain(|_, (_, at)| fresh(*at, now));
+        match keys.get(kcv) {
+            Some((key, _)) => Version::Held(key.clone()),
             None => Version::Unknown,
         }
     }
 }
 
 /// The tenant chain's seal: the KEK ring, the tenant keys the root
-/// loaded, and the system CSPRNG (any [`FillRandom`] in tests).
-pub struct ChainSeal<'a, K, R> {
+/// loaded, the clock their age is judged by, and the system CSPRNG (any
+/// [`FillRandom`] in tests).
+pub struct ChainSeal<'a, K, R, T> {
     kek: &'a K,
     keys: &'a SealKeys,
+    clock: &'a T,
     rng: RefCell<R>,
 }
 
-impl<'a, K: Kek, R: FillRandom> ChainSeal<'a, K, R> {
-    pub fn new(kek: &'a K, keys: &'a SealKeys, rng: R) -> Self {
+impl<'a, K: Kek, R: FillRandom, T: Clock> ChainSeal<'a, K, R, T> {
+    pub fn new(kek: &'a K, keys: &'a SealKeys, clock: &'a T, rng: R) -> Self {
         ChainSeal {
             kek,
             keys,
+            clock,
             rng: RefCell::new(rng),
         }
     }
@@ -223,6 +274,17 @@ impl<K: Kek> ControlSeal for DoorSeal<'_, K> {
     }
 }
 
+/// A KEK version this Worker does not hold. Newer than its active one: a
+/// record of a newer deploy, a failure that may pass. Older: a version
+/// this deploy no longer carries, or a changed header byte; either way
+/// the record cannot be read here, which is damage and pages.
+fn kek_not_held<K: Kek>(kek: &K, v: u32) -> SealError {
+    match v > kek.active().0 {
+        true => SealError::Failed(ERR_KEK_NOT_HELD),
+        false => SealError::Damaged,
+    }
+}
+
 /// Opens the door part of a chain record: the whole record is proven.
 fn open_door<'b, K: Kek>(
     kek: &K,
@@ -231,10 +293,8 @@ fn open_door<'b, K: Kek>(
     sealed: &'b [u8],
 ) -> std::result::Result<OpenedControl<'b>, SealError> {
     let env = parse_control(sealed).map_err(|_| SealError::Damaged)?;
-    // A KEK version this Worker does not hold is its configuration, not
-    // damage of the record: it may pass with the next deploy.
     if kek.version(env.kek_version()).is_none() {
-        return Err(SealError::Failed(ERR_KEK_NOT_HELD));
+        return Err(kek_not_held(kek, env.kek_version()));
     }
     env.open_door(kek, name, owner(tenant))
         .map_err(|_| SealError::Damaged)
@@ -256,7 +316,27 @@ fn empty_private() -> Result<Vec<u8>> {
     .map_err(|_| ERR_ENCODE)
 }
 
-impl<K: Kek, R: FillRandom> ControlSeal for ChainSeal<'_, K, R> {
+/// The check value a door part names for key version `v`.
+fn committed_check(door: &TenantDoor, v: u32) -> Option<[u8; KCV_LEN]> {
+    let text = door.key_checks.get(&v)?;
+    if text.len() != 2 * KCV_LEN {
+        return None;
+    }
+    let mut out = [0u8; KCV_LEN];
+    for (i, byte) in out.iter_mut().enumerate() {
+        let pair = text.get(2 * i..2 * i + 2)?;
+        if !pair
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            return None;
+        }
+        *byte = u8::from_str_radix(pair, 16).ok()?;
+    }
+    Some(out)
+}
+
+impl<K: Kek, R: FillRandom, T: Clock> ControlSeal for ChainSeal<'_, K, R, T> {
     fn seal(
         &self,
         name: &str,
@@ -265,6 +345,12 @@ impl<K: Kek, R: FillRandom> ControlSeal for ChainSeal<'_, K, R> {
         door: &[u8],
         private: &[u8],
     ) -> Result<Vec<u8>> {
+        // The seal checks what it is asked to seal against the door part:
+        // the tenant, and the key version the door's own fields name.
+        let parsed: TenantDoor = serde_json::from_slice(door).map_err(|_| ERR_DOOR)?;
+        if &parsed.tenant != tenant || seal_version(&parsed) != key_version {
+            return Err(ERR_DOOR);
+        }
         let mut rng = self.rng.borrow_mut();
         let rng = &mut *rng;
         match tenant {
@@ -294,23 +380,21 @@ impl<K: Kek, R: FillRandom> ControlSeal for ChainSeal<'_, K, R> {
                     rng,
                 )
             }
-            Tenant::Managed(t) => match self.keys.version(t, key_version) {
-                Version::Held(tk) => {
-                    if tk.tenant() != t || tk.version() != key_version {
-                        return Err(ERR_KEY_OTHER);
-                    }
-                    seal_control(
+            Tenant::Managed(t) => {
+                let kcv = committed_check(&parsed, key_version).ok_or(ERR_NO_CHECK)?;
+                match self.keys.version(t, key_version, &kcv, self.clock.now()) {
+                    Version::Held(tk) => seal_control(
                         self.kek,
                         name,
                         &ControlSealer::Managed(&tk),
                         door,
                         Some(private),
                         rng,
-                    )
+                    ),
+                    Version::Gone => Err(ERR_KEY_GONE),
+                    Version::Unknown => Err(ERR_KEY_NOT_HELD),
                 }
-                Version::Gone => Err(ERR_KEY_GONE),
-                Version::Unknown => Err(ERR_KEY_NOT_HELD),
-            },
+            }
         }
     }
 
@@ -327,7 +411,7 @@ impl<K: Kek, R: FillRandom> ControlSeal for ChainSeal<'_, K, R> {
         match (tenant, opened.private_key()) {
             (Tenant::Zero, PrivateKeyRef::Kek(v)) => {
                 if self.kek.version(v).is_none() {
-                    return Err(SealError::Failed(ERR_KEK_NOT_HELD));
+                    return Err(kek_not_held(self.kek, v));
                 }
                 let private = opened
                     .open_private_tenant_zero(self.kek)
@@ -343,27 +427,35 @@ impl<K: Kek, R: FillRandom> ControlSeal for ChainSeal<'_, K, R> {
                 private: Some(Zeroizing::new(empty_private().map_err(SealError::Failed)?)),
                 key_version: 0,
             }),
-            (Tenant::Managed(t), PrivateKeyRef::Tenant(v)) => match self.keys.version(t, v) {
-                Version::Held(tk) => {
-                    // The whole record is proven by the door, and this is
-                    // the key the chain committed for `v`: a private part
-                    // that does not open under it is damage.
-                    let private = opened
-                        .open_private_managed(&tk)
-                        .map_err(|_| SealError::Damaged)?;
-                    Ok(OpenedParts {
+            (Tenant::Managed(t), PrivateKeyRef::Tenant(v)) => {
+                // A record under `v` names the check value committed for
+                // `v`; only the key with that value is tried. A record
+                // that names none was not written by this seal.
+                let parsed: TenantDoor =
+                    serde_json::from_slice(&door).map_err(|_| SealError::Damaged)?;
+                let kcv = committed_check(&parsed, v).ok_or(SealError::Damaged)?;
+                match self.keys.version(t, v, &kcv, self.clock.now()) {
+                    Version::Held(tk) => {
+                        // The door proves the whole record, and this is the
+                        // key the chain committed for `v`: a private part
+                        // that does not open under it is damage.
+                        let private = opened
+                            .open_private_managed(&tk)
+                            .map_err(|_| SealError::Damaged)?;
+                        Ok(OpenedParts {
+                            door,
+                            private: Some(private),
+                            key_version: v,
+                        })
+                    }
+                    Version::Gone => Ok(OpenedParts {
                         door,
-                        private: Some(private),
+                        private: None,
                         key_version: v,
-                    })
+                    }),
+                    Version::Unknown => Err(SealError::KeyNotHeld { version: v }),
                 }
-                Version::Gone => Ok(OpenedParts {
-                    door,
-                    private: None,
-                    key_version: v,
-                }),
-                Version::Unknown => Err(SealError::KeyNotHeld { version: v }),
-            },
+            }
             // `open_door` admits no other kind for these owners.
             _ => Err(SealError::Damaged),
         }
