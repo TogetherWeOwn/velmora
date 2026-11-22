@@ -10,6 +10,8 @@
 //! - vars `S3_HOST` (the storage Worker's `S3_HOST`, which every request
 //!   is signed for), `S3_REGION`, and `DAV_REALM` (the name clients show
 //!   at login; default `WebDAV`).
+//! - `DAV_ENABLED` is off by default. Only set it to `true` for an
+//!   approved gateway deployment; otherwise all gateway requests return 404.
 //!
 //! Logs carry the method, the status and the time taken; never a path,
 //! a header or a body (the Authorization header holds the password).
