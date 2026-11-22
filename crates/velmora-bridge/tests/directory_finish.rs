@@ -1166,6 +1166,82 @@ fn a_far_row_with_a_closing_head_takes_the_closing_order() {
     });
 }
 
+/// A head exactly one past the window: the interval is read whole (the
+/// head is read anyway), so an opening head over a closing every unit
+/// holds goes to the directory first. A row further behind, whose window
+/// holds no closing and whose head opens, takes the closing order (the
+/// records past the window may close).
+#[test]
+fn the_window_takes_an_adjacent_head_and_a_far_row_takes_the_closing_order() {
+    let db = database();
+    let store = HookedRecords::new();
+    let seal = PlainSeal::new();
+    let chain = TenantChain {
+        store: &store,
+        seal: &seal,
+    };
+    let dir = SqlDirectory { sql: &db };
+    let units = Units::new(&db);
+    block_on(async {
+        active(&chain, A1).await;
+        units.head.set(4);
+        finish_tenant(&chain, Some(&dir), &units, &tid(A1), NOW)
+            .await
+            .unwrap();
+        // Records 5 to 103 widen a limit (opening), 104 locks, 105 lifts.
+        let mut head = 4;
+        while head < 3 + MAX_FINISH_RECORDS {
+            head = write(
+                &chain,
+                A1,
+                Change::SetLimits {
+                    base_seq: head,
+                    limits: BTreeMap::from([("storage_bytes".to_string(), head)]),
+                    rate_json: None,
+                },
+                Actor::Operator,
+            )
+            .await;
+        }
+        let locked = write(&chain, A1, hold(HoldMode::Locked), Actor::Operator).await;
+        let lifted = write(
+            &chain,
+            A1,
+            Change::SetOperatorHold { hold: None },
+            Actor::Operator,
+        )
+        .await;
+        assert_eq!(lifted - 4, MAX_FINISH_RECORDS + 1);
+        units
+            .held_answers
+            .borrow_mut()
+            .insert(0, Answer::Seq(locked));
+        units.head.set(lifted);
+        units.take_log();
+        let run = finish_tenant(&chain, Some(&dir), &units, &tid(A1), NOW)
+            .await
+            .unwrap();
+        assert_eq!(run.order, Some(WriteOrder::Opening));
+        assert_eq!(run.directory, StoreStep::Holds(lifted));
+        assert_eq!(units.take_log(), vec![(0, Some(lifted))]);
+
+        // Far: the row is gone, the window (1..=100) holds no closing and
+        // the head opens.
+        db.exec("DELETE FROM units", &[]).await.unwrap();
+        db.exec("DELETE FROM tenants", &[]).await.unwrap();
+        units
+            .held_answers
+            .borrow_mut()
+            .insert(0, Answer::Seq(lifted));
+        let run = finish_tenant(&chain, Some(&dir), &units, &tid(A1), NOW)
+            .await
+            .unwrap();
+        assert_eq!(run.order, Some(WriteOrder::Closing));
+        assert_eq!(units.take_log(), vec![(0, None)]);
+        assert_eq!(run.directory, StoreStep::Holds(MAX_FINISH_RECORDS));
+    });
+}
+
 /// A row ahead of its chain is damage: it pages, the directory step does
 /// not run, and the head's own record decides the order.
 #[test]

@@ -11,12 +11,19 @@
 //!   holds the head (so a closing a unit missed stays above the row and
 //!   the next run takes the closing order again);
 //! - **opening**: the directory first, and the units only once the
-//!   directory holds the head. Where the row or the records are not known,
-//!   the head's own record decides, and an opening head waits. An opening
-//!   head over closings the directory does not hold takes the opening
-//!   order when every unit already holds those closings
-//!   ([`TenantUnits::held`]), and the closing order otherwise: a unit takes
-//!   only the head, and a closing does not wait on the directory.
+//!   directory holds the head. An opening head over closings the directory
+//!   does not hold takes the opening order when every unit already holds
+//!   those closings ([`TenantUnits::held`]), and the closing order
+//!   otherwise: a unit takes only the head, and a closing does not wait
+//!   on the directory.
+//!
+//! Where the directory row was not read (or is ahead, or a record did not
+//! read), the head's own record decides, and an opening head waits. Where
+//! the row is further behind than one run reads ([`MAX_FINISH_RECORDS`]),
+//! the records past the window are not known, and the run takes the
+//! closing order. In both, an opening may reach a unit before the
+//! directory only as the lease renewal (ADR §2.4 rule 12) may bring it
+//! there anyway.
 //!
 //! The directory step copies the head's door into the `tenants` and
 //! `units` rows ([`SqlDirectory::apply_tenant`], idempotent by seq). Before
@@ -50,7 +57,8 @@ use crate::types::{BridgeError, Result, UnixMs};
 /// The most records of the chain one run reads for the directory step:
 /// the events of a row that is further behind are appended over the next
 /// runs, and the row is raised to the last record read. Such a run takes
-/// its order from the records it read and the head's own record.
+/// the closing order. A window that ends just below the head takes the
+/// head too.
 pub const MAX_FINISH_RECORDS: u64 = 100;
 
 /// The chain a [`TenantFinisher`] was asked to finish is a key chain.
@@ -212,7 +220,12 @@ where
             readable = true;
             steps.push((None, head.clone()));
         } else {
-            let to = h.min(s.saturating_add(MAX_FINISH_RECORDS));
+            // The head is read already: a window that ends just below it
+            // takes it too, so the interval is whole.
+            let to = match h - s <= MAX_FINISH_RECORDS + 1 {
+                true => h,
+                false => s + MAX_FINISH_RECORDS,
+            };
             far = to < h;
             match read_steps(chain, &managed, s, to, &head).await {
                 Ok(read) => {
@@ -226,16 +239,20 @@ where
     }
 
     // The order: closing when a record the directory does not hold
-    // closes a door that the units may not have closed yet. Where those
-    // records are not all known (no row was read, it is ahead, a record
-    // did not read, or the row is further behind than one run reads), the
-    // head's own record decides too (AM-75: "when the head's record
-    // opens"). So an opening never reaches a unit before the directory
-    // holds it, unless a closing below it is still outstanding at a unit:
-    // a unit takes only the head, and a closing does not wait on the
-    // directory (ADR §2.5). A closing below an opening head that is not
-    // known reaches the units by the lease renewal (ADR §2.4 rule 12,
-    // within T) or a later run.
+    // closes a door that the units may not have closed yet.
+    // - Every record from the row to the head read: closing if one closes;
+    //   but an opening head over closings every unit already holds
+    //   ([`TenantUnits::held`]) takes the opening order.
+    // - The row was not read, is ahead, or a record did not read (the
+    //   directory is down or damaged): the head's own record decides
+    //   (AM-75: "when the head's record opens"). A closing below an
+    //   opening head then reaches the units by the lease renewal (ADR §2.4
+    //   rule 12, within T) or a later run.
+    // - The row is further behind than one run reads: the records past
+    //   the window are not known and may close, so the closing order; a
+    //   closing never waits on the directory (ADR §2.5), and the cost is
+    //   an opening that may reach a unit before the directory, as every
+    //   lease renewal may bring it there.
     let known = matches!(row, Row::Seq(_)) && readable && !far;
     let provisioning = head.door.lifecycle == Lifecycle::Provisioning;
     // A head in a shred closes, also where its records below are purged
@@ -250,15 +267,14 @@ where
     if matches!(
         head.door.lifecycle,
         Lifecycle::Shredding | Lifecycle::Shredded
-    ) || (!known && head_closes(chain, &managed, &head, &mut run.pages).await)
+    ) || far
+        || (!known && head_closes(chain, &managed, &head, &mut run.pages).await)
     {
         last_closing = Some(h);
     }
     let order = match last_closing {
         None => WriteOrder::Opening,
         Some(c) if c == h => WriteOrder::Closing,
-        // Records between what one run read and the head are not known:
-        // one of them may close.
         Some(_) if !known => WriteOrder::Closing,
         // An opening head over closings: if every unit holds them already,
         // only openings are left, and the directory goes first.
@@ -380,9 +396,10 @@ async fn units_hold_at_least<U: TenantUnits>(
 }
 
 /// Whether the head's own record closes a door against the record before
-/// it (one read). A head in a shred closes. A record before it that does
-/// not read counts as not closing: the units then wait for the directory,
-/// and damage pages.
+/// it (one read). A head in a shred closes. A record before it that the
+/// store does not give now counts as closing (a closing does not wait on
+/// the directory); one that is missing or damaged pages and counts as not
+/// closing, so the units wait for a directory that can be read.
 async fn head_closes<S: RecordStore, C: ControlSeal>(
     chain: &TenantChain<'_, S, C>,
     tenant: &Tenant,
@@ -403,7 +420,8 @@ async fn head_closes<S: RecordStore, C: ControlSeal>(
                 pages.push("tenant_record_missing");
                 return false;
             }
-            Err(ChainError::Store(_)) | Err(ChainError::KeyNotHeld { .. }) => return false,
+            // Not read now: it may close, and a closing does not wait.
+            Err(ChainError::Store(_)) | Err(ChainError::KeyNotHeld { .. }) => return true,
             Err(_) => {
                 pages.push("tenant_record_damaged");
                 return false;
