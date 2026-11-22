@@ -469,7 +469,8 @@ fn the_unfenced_operational_tables_keep_their_columns() {
         for dir in ["migrations", "migrations-next"] {
             for entry in std::fs::read_dir(root.join(dir)).unwrap() {
                 let path = entry.unwrap().path();
-                let text = std::fs::read_to_string(&path).unwrap();
+                // SQLite names are case-insensitive.
+                let text = std::fs::read_to_string(&path).unwrap().to_ascii_lowercase();
                 if OPERATIONAL_TABLES.iter().any(|t| text.contains(t)) {
                     touching.push(format!(
                         "{dir}/{}",
