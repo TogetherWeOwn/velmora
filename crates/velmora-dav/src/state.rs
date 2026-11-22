@@ -189,10 +189,13 @@ pub enum Op {
     },
     /// Dead properties of each `(path, etag)`; rows with a different
     /// stamp are skipped, not deleted. `names`: only these (`None`: all).
-    /// Replies `Full` rather than returning a partial result over the budget.
+    /// `names_only` omits values. Replies `Full` rather than returning a
+    /// partial result over the budget.
     PropGet {
         paths: Vec<(String, Option<String>)>,
         names: Option<Vec<(String, String)>>,
+        #[serde(default)]
+        names_only: bool,
     },
     PropPatch {
         path: String,
@@ -610,17 +613,24 @@ impl<S: Sql> Engine<'_, S> {
                 }
                 Ok(Reply::Done)
             }
-            Op::PropGet { paths, names } => {
+            Op::PropGet {
+                paths,
+                names,
+                names_only,
+            } => {
                 let mut out = Vec::with_capacity(paths.len());
                 let mut remaining = MAX_PROPFIND_PROP_BYTES;
-                // Read no more than one resource's rows at a time. Apply
-                // the request-wide limit before retaining a value for reply.
+                let select = if names_only {
+                    "SELECT ns, name, '' FROM dav_props WHERE path = ?1 AND etag IS ?2 ORDER BY ns, name"
+                } else {
+                    "SELECT ns, name, value_xml FROM dav_props \
+                     WHERE path = ?1 AND etag IS ?2 ORDER BY ns, name"
+                };
+                // Read one resource at a time; propname does not read XML.
                 for (path, etag) in &paths {
-                    let rows = self.sql.exec(
-                        "SELECT ns, name, value_xml FROM dav_props \
-                         WHERE path = ?1 AND etag IS ?2 ORDER BY ns, name",
-                        &[t(path), etag.as_deref().map_or(Val::Null, t)],
-                    )?;
+                    let rows = self
+                        .sql
+                        .exec(select, &[t(path), etag.as_deref().map_or(Val::Null, t)])?;
                     let mut props = Vec::new();
                     for row in rows {
                         let Ok([Val::Text(ns), Val::Text(name), Val::Text(xml)]) =
@@ -634,7 +644,12 @@ impl<S: Sql> Engine<'_, S> {
                         }) {
                             continue;
                         }
-                        let Some(left) = remaining.checked_sub(xml.len()) else {
+                        let bytes = if names_only {
+                            ns.len() + name.len()
+                        } else {
+                            xml.len()
+                        };
+                        let Some(left) = remaining.checked_sub(bytes) else {
                             return Ok(Reply::Full);
                         };
                         remaining = left;

@@ -893,6 +893,7 @@ impl<U: Upstream, S: StatePort> Ctx<'_, U, S> {
                         .map(|r| (r.key.clone(), r.etag.clone()))
                         .collect(),
                     names: want.dead_names(),
+                    names_only: matches!(want, Want::PropName),
                 });
             }
             let replies = self.state(bucket, ops).await?;
@@ -1586,13 +1587,26 @@ impl<U: Upstream, S: StatePort> Ctx<'_, U, S> {
         }
         // Plan and validate every mapped key before changing either tree.
         let mut members = Vec::new();
+        let mut markers = Vec::new();
         if src_coll && depth != Some(0) {
             let entries = self.list_tree(bucket, &src_path).await?;
             let hidden = hidden_tree_keys(&entries);
             if is_move && !hidden.is_empty() {
                 return Err(hidden_folder());
             }
-            for entry in entries.into_iter().filter(|e| !hidden.contains(&e.key)) {
+            for entry in entries {
+                if hidden.contains(&entry.key) {
+                    // The hidden object bytes are never copied, but its
+                    // addressable collection prefixes can still be visible.
+                    if let Some(suffix) =
+                        visible_collection_prefix(&entry.key).strip_prefix(&src_path)
+                    {
+                        if !suffix.is_empty() {
+                            markers.push(format!("{dst_path}{suffix}"));
+                        }
+                    }
+                    continue;
+                }
                 let suffix = entry
                     .key
                     .strip_prefix(&src_path)
@@ -1603,6 +1617,14 @@ impl<U: Upstream, S: StatePort> Ctx<'_, U, S> {
                 }
                 members.push((entry, dest));
             }
+            markers = empty_copy_markers(markers, &members);
+        }
+        // Materialize the root of an implied or depth-zero collection.
+        if src_coll && !members.iter().any(|(_, dest)| dest == &dst_path) {
+            markers.push(dst_path.clone());
+        }
+        if markers.iter().any(|key| !storable_key(key)) {
+            return Err(status(409));
         }
         let holder = self
             .begin_write(bucket, checks, ifh.as_ref(), (&src_path, &src))
@@ -1620,6 +1642,7 @@ impl<U: Upstream, S: StatePort> Ctx<'_, U, S> {
                 require_visible_tree(&entries)?;
                 let mut new_keys = HashSet::from([dst_path.as_str()]);
                 new_keys.extend(members.iter().map(|(_, dest)| dest.as_str()));
+                new_keys.extend(markers.iter().map(String::as_str));
                 obsolete.extend(
                     entries
                         .into_iter()
@@ -1655,14 +1678,13 @@ impl<U: Upstream, S: StatePort> Ctx<'_, U, S> {
                 }
                 return Ok(failed_members(bucket, &failed));
             }
-            // Materialize an implied or depth-zero folder before removing
-            // anything from the old destination collection or the source.
-            if src_coll && !members.iter().any(|(_, dest)| dest == &dst_path) {
+            // Materialize empty collections before deleting anything.
+            for marker in &markers {
                 if let Err(e) = self
                     .s3
                     .put(
                         bucket,
-                        &dst_path,
+                        marker,
                         Body::Empty,
                         0,
                         "application/x-directory",
@@ -1676,7 +1698,7 @@ impl<U: Upstream, S: StatePort> Ctx<'_, U, S> {
                         if !properties.is_empty() {
                             self.state(bucket, properties).await?;
                         }
-                        return Ok(failed_members(bucket, &[(dst_path.clone(), code)]));
+                        return Ok(failed_members(bucket, &[(marker.clone(), code)]));
                     }
                     // A marker already exists.
                 }
@@ -2186,6 +2208,35 @@ struct TreeCopy {
     versions: Vec<(String, String)>,
     properties: Vec<Op>,
     failed: Vec<(String, u16)>,
+}
+
+fn visible_collection_prefix(key: &str) -> &str {
+    let bytes = key
+        .split_inclusive('/')
+        .take_while(|part| part.strip_suffix('/').is_some_and(path::addressable))
+        .map(str::len)
+        .sum();
+    &key[..bytes]
+}
+
+fn empty_copy_markers(mut candidates: Vec<String>, members: &[(Entry, String)]) -> Vec<String> {
+    candidates.sort_unstable();
+    candidates.dedup();
+    let mut keys: Vec<_> = members.iter().map(|(_, key)| key.as_str()).collect();
+    keys.sort_unstable();
+    candidates
+        .iter()
+        .enumerate()
+        .filter_map(|(i, prefix)| {
+            // A copied member or a deeper marker already implies this folder.
+            let first = keys.partition_point(|key| *key < prefix.as_str());
+            let implied = keys.get(first).is_some_and(|key| key.starts_with(prefix))
+                || candidates
+                    .get(i + 1)
+                    .is_some_and(|key| key.starts_with(prefix));
+            (!implied).then(|| prefix.clone())
+        })
+        .collect()
 }
 
 fn hidden_tree_keys(entries: &[Entry]) -> HashSet<String> {

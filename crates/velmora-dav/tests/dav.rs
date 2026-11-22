@@ -90,6 +90,7 @@ async fn state_batch_rolls_back_on_second_op_sql_error() {
     let get = |path: &str| Op::PropGet {
         paths: vec![(path.into(), None)],
         names: None,
+        names_only: false,
     };
 
     assert_eq!(
@@ -461,6 +462,19 @@ async fn propfind_refuses_more_than_16_mib_of_dead_properties() {
     assert_eq!(r.status, 507);
     assert!(!r.text().contains("multistatus"));
 
+    let r = w
+        .req(
+            "PROPFIND",
+            "/dav/docs/",
+            &[("depth", "1")],
+            br#"<D:propfind xmlns:D="DAV:"><D:propname/></D:propfind>"#,
+        )
+        .await;
+    r.expect(207);
+    assert_eq!(r.hrefs().len(), 68);
+    assert!(r.text().contains(r#"<a xmlns="urn:test"/>"#));
+    assert!(!r.text().contains(&value));
+
     // Check the state boundary, not just the HTTP status: no property
     // bytes are returned to the gateway when the budget is exhausted.
     use velmora_dav::state::{Engine, Op, Reply};
@@ -475,7 +489,11 @@ async fn propfind_refuses_more_than_16_mib_of_dead_properties() {
         sql: db.as_ref(),
         now: w.dav.state.now.get(),
     }
-    .run(vec![Op::PropGet { paths, names: None }])
+    .run(vec![Op::PropGet {
+        paths,
+        names: None,
+        names_only: false,
+    }])
     .unwrap();
     assert!(matches!(replies.as_slice(), [Reply::Full]));
 
@@ -753,6 +771,27 @@ async fn recursive_copy_omits_hidden_source_objects() {
     let copied: Vec<_> = w.s3_list("out/").await.into_iter().map(|e| e.0).collect();
     assert_eq!(copied, ["out/", "out/visible", "out/x/child"]);
     assert_eq!(w.s3_list("docs/").await, before);
+}
+
+#[tokio::test]
+async fn recursive_copy_materializes_visible_folders_without_hidden_bytes() {
+    let w = World::new().await;
+    for key in ["src/empty/", "src/deep/empty//backup"] {
+        assert_eq!(w.s3_put(key, b"hidden bytes").await, 200);
+    }
+    let visible = w.req("PROPFIND", "/dav/src/", &[("depth", "1")], b"").await;
+    visible.expect(207);
+    assert_eq!(
+        visible.hrefs(),
+        ["/dav/src/", "/dav/src/deep/", "/dav/src/empty/"]
+    );
+    w.req("COPY", "/dav/src/", &[("destination", "/dav/dst/")], b"")
+        .await
+        .expect(201);
+    assert_eq!(w.s3_get("dst/empty/").await.0, 200);
+    assert_eq!(w.s3_get("dst/empty/").await.1, b"");
+    assert_eq!(w.s3_get("dst/deep/empty/").await.0, 200);
+    assert_eq!(w.s3_get("dst/deep/empty//backup").await.0, 404);
 }
 
 #[tokio::test]
