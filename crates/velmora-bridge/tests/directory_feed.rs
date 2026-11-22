@@ -386,6 +386,8 @@ fn the_shred_purges_one_tenants_events_and_marks_them() {
 struct PruneDuringRead<'a> {
     db: &'a Db,
     cutoff: UnixMs,
+    /// The rows the prune step takes.
+    rows: u32,
     armed: std::cell::Cell<bool>,
 }
 
@@ -398,7 +400,7 @@ impl Sql for PruneDuringRead<'_> {
         let rows = self.db.query(sql, params).await?;
         if sql == TENANT_RANGE && self.armed.replace(false) {
             SqlDirectory { sql: self.db }
-                .prune_events(self.cutoff, 1)
+                .prune_events(self.cutoff, self.rows)
                 .await?;
         }
         Ok(rows)
@@ -432,12 +434,15 @@ fn a_prune_during_a_read_resets_a_position_and_never_a_read_without_one() {
         let racing = PruneDuringRead {
             db: &db,
             cutoff,
+            rows: 1,
             armed: std::cell::Cell::new(true),
         };
         let r = SqlDirectory { sql: &racing };
-        // Without `after`: the page as read, no reset.
+        // Without `after`: no reset; the row the prune took meanwhile is
+        // dropped, so the position is never below the new mark.
         let p = r.tenant_events(&t(A1), None, 10).await.unwrap().unwrap();
-        assert_eq!(seqs(&p), [1, 2, 3]);
+        assert_eq!(seqs(&p), [2, 3]);
+        assert_eq!(p.position, pos(0, 3));
         // The prune ran: seq 1 is gone, the mark is 1.
         let after = dir.tenant_events(&t(A1), None, 10).await.unwrap().unwrap();
         assert_eq!(seqs(&after), [2, 3]);
@@ -446,6 +451,7 @@ fn a_prune_during_a_read_resets_a_position_and_never_a_read_without_one() {
         let racing = PruneDuringRead {
             db: &db,
             cutoff: UnixMs(NOW.0 + 1),
+            rows: 1,
             armed: std::cell::Cell::new(true),
         };
         let r = SqlDirectory { sql: &racing };
@@ -453,5 +459,68 @@ fn a_prune_during_a_read_resets_a_position_and_never_a_read_without_one() {
             r.tenant_events(&t(A1), Some(pos(0, 1)), 10).await.unwrap(),
             Err(FeedReset)
         );
+    });
+}
+
+/// A first page whose only row the prune took during the read answers the
+/// prune mark, and the next read from it is not reset and skips nothing.
+#[test]
+fn a_first_page_pruned_during_the_read_answers_the_mark() {
+    block_on(async {
+        let db = database();
+        let dir = SqlDirectory { sql: &db };
+        let old = NOW.0 - EVENT_KEEP_MS - 1;
+        append(&dir, A1, "t/1", old).await;
+        append(&dir, A1, "t/2", NOW.0).await;
+        let racing = PruneDuringRead {
+            db: &db,
+            cutoff: UnixMs(NOW.0 - EVENT_KEEP_MS),
+            rows: 1,
+            armed: std::cell::Cell::new(true),
+        };
+        let r = SqlDirectory { sql: &racing };
+        let p = r.tenant_events(&t(A1), None, 1).await.unwrap().unwrap();
+        assert!(p.items.is_empty());
+        assert_eq!(p.position, pos(0, 1));
+        let next = page(&dir, A1, Some(p.position), 10).await.unwrap();
+        assert_eq!(seqs(&next), [2]);
+    });
+}
+
+/// Review c4: the prune takes rows past the end of a first page cut short
+/// by `limit`; the page answers the mark, never the head, so the kept rows
+/// after it are read next (alone, and with another tenant's rows mixed in).
+#[test]
+fn a_prune_past_a_short_first_page_skips_nothing_kept() {
+    block_on(async {
+        let old = NOW.0 - EVENT_KEEP_MS - 1;
+        for (layout, want_pos, want_next) in [
+            // a1: 1, 2 old, 3 young.
+            (vec![(A1, old), (A1, old), (A1, NOW.0)], 2, vec![3]),
+            // a1 at 1, 3, 5 (5 young), b2 at 2, 4 (old).
+            (
+                vec![(A1, old), (B2, old), (A1, old), (B2, old), (A1, NOW.0)],
+                3,
+                vec![5],
+            ),
+        ] {
+            let db = database();
+            let dir = SqlDirectory { sql: &db };
+            for (i, (tenant, at)) in layout.into_iter().enumerate() {
+                append(&dir, tenant, &format!("t/{}", i + 1), at).await;
+            }
+            let racing = PruneDuringRead {
+                db: &db,
+                cutoff: UnixMs(NOW.0 - EVENT_KEEP_MS),
+                rows: 10,
+                armed: std::cell::Cell::new(true),
+            };
+            let r = SqlDirectory { sql: &racing };
+            let p = r.tenant_events(&t(A1), None, 1).await.unwrap().unwrap();
+            assert!(p.items.is_empty());
+            assert_eq!(p.position, pos(0, want_pos));
+            let next = page(&dir, A1, Some(p.position), 10).await.unwrap();
+            assert_eq!(seqs(&next), want_next);
+        }
     });
 }

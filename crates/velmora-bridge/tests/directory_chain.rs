@@ -1022,3 +1022,89 @@ fn a_move_floor_is_bound_to_tenant_zeros_own_head() {
         assert_eq!(r.door.move_floors.get(&0), Some(&UnixMs(11)));
     });
 }
+
+/// AM-79: a management call's record names the SHA-256 of its
+/// `Idempotency-Key`; the next record does not, a retry the head already
+/// carries writes nothing and keeps it, and a hash of another form is
+/// refused before any write.
+#[test]
+fn a_call_names_its_key_hash_in_its_own_record_only() {
+    let store = HookedRecords::new();
+    let seal = PlainSeal::new();
+    let chain = TenantChain {
+        store: &store,
+        seal: &seal,
+    };
+    block_on(async {
+        active(&chain).await;
+        let key = "ab".repeat(32);
+        let w = chain
+            .write_keyed(
+                &t1(),
+                &hold(HoldMode::ReadOnly),
+                Actor::Operator,
+                NOW,
+                0,
+                Some(&key),
+            )
+            .await
+            .unwrap();
+        let Written::Wrote(r) = w else {
+            panic!("the hold did not write");
+        };
+        assert_eq!(r.door.call_key_hash.as_deref(), Some(key.as_str()));
+        let read = chain.read(&t1(), r.door.seq).await.unwrap().unwrap();
+        assert_eq!(read.door.call_key_hash.as_deref(), Some(key.as_str()));
+        // The retry: nothing written, the head keeps the hash.
+        let again = chain
+            .write_keyed(
+                &t1(),
+                &hold(HoldMode::ReadOnly),
+                Actor::Operator,
+                NOW,
+                0,
+                Some(&key),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(again, Written::Unchanged(ref h) if h.door.seq == r.door.seq));
+        // The next record, by a job: none.
+        let Written::Wrote(n) = chain
+            .write(
+                &t1(),
+                &Change::ClaimKeyVersion { version: 2 },
+                Actor::RotationJob,
+                NOW,
+                0,
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("the claim did not write");
+        };
+        assert_eq!(n.door.call_key_hash, None);
+        let before = store.keys().len();
+        for bad in [
+            "AB".repeat(32),
+            "ab".repeat(31),
+            "zz".repeat(32),
+            String::new(),
+        ] {
+            let e = chain
+                .write_keyed(
+                    &t1(),
+                    &hold(HoldMode::Locked),
+                    Actor::Operator,
+                    NOW,
+                    0,
+                    Some(&bad),
+                )
+                .await;
+            assert!(
+                matches!(e, Err(ChainError::Refused(r)) if r.status == 400 && r.code == "invalid_change"),
+                "{bad}"
+            );
+        }
+        assert_eq!(store.keys().len(), before);
+    });
+}

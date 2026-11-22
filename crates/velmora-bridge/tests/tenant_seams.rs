@@ -163,9 +163,12 @@ fn a_scope_is_made_only_at_the_listed_places() {
     assert_eq!(found.get("worker/lib.rs"), None);
 }
 
-/// A managed tenant's scope is made in one place: the reader of a queue
-/// message, for a message that names the tenant's unit while the unit
-/// class is bound (`jobmsg::admit_for`).
+/// A managed tenant's scope is made in one place on the job path: the
+/// reader of a queue message, for a message that names the tenant's unit
+/// while the unit class is bound (`jobmsg::admit_for`). Off the job path,
+/// the move of tenant 0's data names the managed tenant's copies through
+/// its scope too (`keys::moving`, once), so that no name of the two
+/// families is written out by hand.
 #[test]
 fn a_managed_scope_is_made_only_by_the_reader() {
     let all = all();
@@ -174,7 +177,10 @@ fn a_managed_scope_is_made_only_by_the_reader() {
     found.remove(TENANT);
     assert_eq!(
         found.into_iter().collect::<Vec<_>>(),
-        [("bridge/jobmsg.rs".to_string(), 1)]
+        [
+            ("bridge/jobmsg.rs".to_string(), 1),
+            ("bridge/keys/moving.rs".to_string(), 1)
+        ]
     );
 }
 
@@ -539,7 +545,7 @@ fn the_directory_is_asked_by_nothing() {
     ];
     // The composition root (`root`, L6-5) is the one reader of the
     // directory's store for that router: its key routes
-    // (`SqlDirectory::route`, ADR §8.4 step 2). The request path builds
+    // (`SqlDirectory::route_tenant`, ADR §8.4 step 2). The request path builds
     // it only with `UNIT` bound (off as shipped), and the management
     // entry (no production binding) for every request, whose handlers
     // read stores after the token gate; it names the store, never the
@@ -574,7 +580,7 @@ fn the_directory_is_asked_by_nothing() {
             .keys()
             .filter(|f| *f != DIRECTORY && !f.starts_with("bridge/directory/"))
             .filter(|f| !(name == ".route(" && UNIT_ROUTER.contains(&f.as_str())))
-            .filter(|f| !(*f == ROOT && matches!(name, "Directory" | ".route(")))
+            .filter(|f| !(*f == ROOT && name == "Directory"))
             .filter(|f| !(*f == EVENTS && name == "Directory"))
             .collect();
         assert!(files.is_empty(), "{name}: {files:?}");

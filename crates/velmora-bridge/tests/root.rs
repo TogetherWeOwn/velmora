@@ -400,7 +400,37 @@ fn key_routes_read_the_directory_then_the_route_record() {
             }
         );
     });
-    // No directory bound: the same.
+    // A route read from its record is kept too: the record gone, the next
+    // request still routes without a read.
+    let kept = Rc::new(MemRecords::default());
+    let p_kept = ports(kept.clone(), false, None);
+    let kept_cache = RootCache::new();
+    let root = Root::new(&p_kept, &kept_cache, TestRng(6));
+    block_on(async {
+        put_route(
+            &*kept,
+            &p_kept.kek,
+            &id(),
+            AKID,
+            SubjectKind::S3,
+            1,
+            &mut TestRng(7),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            root.key_routes().tenant_of(AKID).await.unwrap(),
+            KeyTenant::Managed { .. }
+        ));
+    });
+    let empty = ports(Rc::new(MemRecords::default()), false, None);
+    let root = Root::new(&empty, &kept_cache, TestRng(8));
+    assert!(matches!(
+        block_on(root.key_routes().tenant_of(AKID)).unwrap(),
+        KeyTenant::Managed { .. }
+    ));
+    // No directory bound, a cold isolate: the route record decides.
+    let cache = RootCache::new();
     let p = ports(records, false, None);
     let root = Root::new(&p, &cache, TestRng(4));
     block_on(async {

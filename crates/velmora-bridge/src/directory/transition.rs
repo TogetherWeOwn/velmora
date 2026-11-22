@@ -379,6 +379,8 @@ pub fn next(
     // that places moved buckets names them.
     door.bucket_created = None;
     door.buckets_moved_in = None;
+    // The call that writes this record names its own key (AM-79).
+    door.call_key_hash = None;
     let mut private = head.private.clone();
     private.bucket_created = None;
 
@@ -1181,6 +1183,7 @@ fn first(tenant: &Tenant, change: &Change, actor: Actor, now: UnixMs) -> Result<
         jurisdiction: jurisdiction.to_string(),
         location_hint: None,
         tenant_zero: None,
+        call_key_hash: None,
     };
     match change {
         Change::Create {
@@ -1398,10 +1401,12 @@ fn shredded_stub(h: &TenantDoor) -> TenantDoor {
         jurisdiction: h.jurisdiction.clone(),
         location_hint: None,
         tenant_zero: None,
+        call_key_hash: None,
     }
 }
 
-fn valid_key_hash(hash: &str) -> bool {
+/// 64 lowercase hex digits: the SHA-256 of an `Idempotency-Key`.
+pub fn valid_key_hash(hash: &str) -> bool {
     hash.len() == 64
         && hash
             .bytes()
