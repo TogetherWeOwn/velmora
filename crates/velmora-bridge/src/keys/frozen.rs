@@ -44,6 +44,11 @@ use crate::types::Result;
 /// estimate; a dial). The tool runs it again.
 pub const MAX_OPERATOR_PUTS: u32 = 8;
 
+/// Records one [`drop_moved_grants`] run writes at most (an estimate; a
+/// dial): every subject of a tenant holds at most 64 grants, and the
+/// owner tenant has a few dozen subjects.
+pub const MAX_EXIT_RECORDS: usize = 1024;
+
 /// How far up a `made_by` chain the projection looks; a deeper or
 /// circular chain is not carried open (the unit's rule, `unit::keys`).
 pub const MAX_PRINCIPAL_DEPTH: usize = 8;
@@ -91,6 +96,12 @@ pub struct ExitDrops {
     pub in_force: bool,
     /// `not_moved_in`, `not_placed`: refused before any record.
     pub refused: Option<&'static str>,
+    /// Subjects that hold a listed grant but whose private part does not
+    /// open now (a key version not loaded, or gone: AM-11): no record may
+    /// drop a prefix, an IP list or a secret, so they are left, and the
+    /// exit cannot go on to `UnplaceMovedBuckets` until they are dealt
+    /// with. An attention condition: page, do not retry blindly.
+    pub blocked: Vec<String>,
 }
 
 /// One key as D1 gets it from `<t>`'s chain at `K_u` (ADR §6.2, AM-28).
@@ -297,60 +308,73 @@ where
     let read = read_key_chain(env.store, env.kek, env.ring, env.tenant).await?;
     let mut table = read.table;
     let mut out = ExitDrops::default();
-    let holds = |table: &KeyTable, id: &str| {
-        table.get(id).is_some_and(|e| {
-            e.door.status != SubjectStatus::Revoked
-                && e.door
-                    .grants
-                    .iter()
-                    .any(|g| listed.contains(g.bucket_id.as_str()))
-        })
-    };
-    let ids: Vec<String> = table
-        .entries()
-        .filter(|e| holds(&table, &e.door.id))
-        .map(|e| e.door.id.clone())
-        .collect();
-    'subjects: for id in ids {
-        for _ in 0..MAX_OPERATOR_PUTS {
-            advance(env.store, env.kek, env.ring, &chain, &mut table).await?;
-            if !holds(&table, &id) {
-                continue 'subjects;
-            }
-            let Some(subject) = table.get(&id).and_then(Entry::subject) else {
-                // A grant change needs the private part open: never drop
-                // a prefix, an IP list or a secret.
-                return Ok(out);
-            };
-            let grants: Vec<Grant> = subject
-                .grants()
-                .into_iter()
-                .filter(|g| !listed.contains(g.bucket_id.as_str()))
-                .collect();
-            let mut next = subject.clone();
-            next.set_grants(&grants);
-            table.admits(KeyOp::Grants, &next.door, Some(&next.private))?;
-            let seq = table.seq() + 1;
-            let bytes = seal_key_record(
-                env.kek,
-                env.ring,
-                env.tenant,
-                seq,
-                KeyOp::Grants,
-                env.now(),
-                &next.door,
-                Some(&next.private),
-                true,
-                table.frozen_at(),
-                rng,
-            )?;
-            if chain.put(env.store, seq, bytes.clone()).await? == Put::Written {
+    let mut lost = 0;
+    // The holders are found again at every head: on an exit that is not
+    // frozen (a give-up), a subject may gain a listed grant meanwhile.
+    loop {
+        advance(env.store, env.kek, env.ring, &chain, &mut table).await?;
+        let next = table
+            .entries()
+            .filter(|e| {
+                e.door.status != SubjectStatus::Revoked
+                    && e.door
+                        .grants
+                        .iter()
+                        .any(|g| listed.contains(g.bucket_id.as_str()))
+                    && !out.blocked.contains(&e.door.id)
+            })
+            .map(|e| (e.door.id.clone(), e.subject()))
+            .next();
+        let Some((id, subject)) = next else {
+            break;
+        };
+        // A grant change needs the private part open.
+        let Some(subject) = subject else {
+            out.blocked.push(id);
+            continue;
+        };
+        let grants: Vec<Grant> = subject
+            .grants()
+            .into_iter()
+            .filter(|g| !listed.contains(g.bucket_id.as_str()))
+            .collect();
+        let mut next = subject.clone();
+        next.set_grants(&grants);
+        table.admits(KeyOp::Grants, &next.door, Some(&next.private))?;
+        let seq = table.seq() + 1;
+        let bytes = seal_key_record(
+            env.kek,
+            env.ring,
+            env.tenant,
+            seq,
+            KeyOp::Grants,
+            env.now(),
+            &next.door,
+            Some(&next.private),
+            true,
+            table.frozen_at(),
+            rng,
+        )?;
+        match chain.put(env.store, seq, bytes.clone()).await? {
+            Put::Written => {
                 let record = open_chain_record(env.kek, env.ring, env.tenant, seq, &bytes)?;
                 table.apply_chain(&record)?;
                 out.written.push(seq);
-                continue 'subjects;
+                // Bounded: a run that keeps meeting new holders stops, and
+                // the tool runs it again.
+                if out.written.len() > MAX_EXIT_RECORDS {
+                    return Ok(out);
+                }
+            }
+            Put::Lost => {
+                lost += 1;
+                if lost >= MAX_OPERATOR_PUTS {
+                    return Ok(out);
+                }
             }
         }
+    }
+    if !out.blocked.is_empty() {
         return Ok(out);
     }
     out.done = true;

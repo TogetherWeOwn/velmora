@@ -425,10 +425,11 @@ where
         let mut puts = 0;
         let mut caught_up = false;
         let mut caught_up_in_full = false;
-        let Ok(zero) = self.gate.zero_head().await else {
-            return Ok(Some(BucketAnswer::Busy));
-        };
         while puts < MAX_PUTS {
+            // For every attempt, as in `change`.
+            let Ok(zero) = self.gate.zero_head().await else {
+                return Ok(Some(BucketAnswer::Busy));
+            };
             let revoked: BTreeSet<String> = list_tenant_revocations(self.store, self.tenant)
                 .await?
                 .into_iter()

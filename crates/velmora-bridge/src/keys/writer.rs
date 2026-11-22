@@ -643,14 +643,16 @@ where
         rng: &mut R,
     ) -> Result<KeyAnswer> {
         let chain = key_chain(self.tenant);
-        // Tenant 0's head first (AM-28): it decides where a revoke goes.
-        let Ok(zero) = self.gate.zero_head().await else {
-            return Ok(KeyAnswer::Busy);
-        };
         let mut puts = 0;
         let mut caught_up = false;
         let mut caught_up_in_full = false;
         while puts < MAX_PUTS {
+            // Tenant 0's head first (AM-28), for every attempt: a put lost
+            // to a give-up's or the move's record must see the head that
+            // record goes with.
+            let Ok(zero) = self.gate.zero_head().await else {
+                return Ok(KeyAnswer::Busy);
+            };
             // Read for every attempt: a retry validates against the
             // revocations as they are now.
             let mut revoked: BTreeSet<String> = list_tenant_revocations(self.store, self.tenant)
@@ -879,8 +881,11 @@ where
         id: &str,
         rng: &mut R,
     ) -> Result<KeyAnswer> {
-        if table.get(id).is_none() {
-            return Ok(KeyAnswer::Refused(Refusal::NotFound));
+        // The gate sends only a key's revoke here; anything else is 503.
+        match table.get(id) {
+            None => return Ok(KeyAnswer::Refused(Refusal::NotFound)),
+            Some(e) if !e.door.kind.has_secret() => return Ok(KeyAnswer::Frozen),
+            Some(_) => {}
         }
         put_tenant_revocation(self.store, self.kek, self.tenant, id, self.now(), rng).await?;
         revoked.insert(id.to_owned());

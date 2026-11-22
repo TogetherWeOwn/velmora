@@ -20,7 +20,7 @@
 //! | `d1`, undone to `<t>` | any | revoke of a key `<t>` holds | tenant 0's path: flat `m/rk/<akid>`, then D1; `200` once D1 refuses it (AM-54 LOW 3) |
 //! | `d1`, undone to `<t>` | any | anything else | `409 key_moved`, nothing put |
 //! | `d1`, no move | any | status or grant change of a key whose `m/kr/` is not `<t>`'s | an existing `m/rk/<t>/<akid>` applied to D1, then `409 key_moved` (AM-31; first, also when frozen: AM-54 LOW 2) |
-//! | any | frozen | revoke | `m/rk/<t>/<akid>`, no record; tenant 0 read again: undone to `<t>` → applied to D1, `200`; else `503` |
+//! | any | frozen | revoke of a key `<t>` holds | `m/rk/<t>/<akid>`, no record; tenant 0 read again: `d1` (undone to `<t>`, or no move) → applied to D1, `200`; else `503` |
 //! | any | frozen | anything else | `503` |
 //! | `moving` to `<t>` | not frozen | anything but a revoke | `503` (AM-31: only the move tool's records and revokes) |
 //!
@@ -145,8 +145,10 @@ pub fn decide(f: &Facts<'_>) -> Gate {
         _ => {}
     }
     if f.frozen {
-        return match f.kind {
-            ChangeKind::Revoke => Gate::FrozenRevoke,
+        // Only a key's revoke has an `m/rk/` that every store and D1 honour;
+        // a principal's revoke is any other change here.
+        return match (f.kind, f.key_held) {
+            (ChangeKind::Revoke, true) => Gate::FrozenRevoke,
             _ => Gate::Unavailable,
         };
     }
@@ -292,6 +294,12 @@ mod tests {
         let mut f = facts(&us, &undone, true, Revoke, None);
         f.key_held = false;
         assert_eq!(decide(&f), Gate::KeyMoved { pre_apply: false });
+        // Frozen: a principal's revoke has no m/rk/ that D1 honours.
+        for zero in [ZeroHead::D1, ZeroHead::Moved { to: us.clone() }] {
+            let mut f = facts(&us, &zero, true, Revoke, None);
+            f.key_held = false;
+            assert_eq!(decide(&f), Gate::Unavailable);
+        }
         // d1, no move: a key routed elsewhere is key_moved first, also
         // frozen (AM-54 LOW 2).
         for frozen in [false, true] {

@@ -5226,14 +5226,18 @@ async fn a_revoke_during_the_freeze_wins_and_applies_itself_to_d1_after_the_undo
             .unwrap(),
         KeyAnswer::Frozen
     );
-    // A revoke of a subject the chain does not hold.
+    // A revoke of a subject the chain does not hold: 503, nothing put.
     *gate.d1_down.borrow_mut() = false;
     assert_eq!(
         env.change(&mut table, "", &revoke("AKVL0404"), &mut rng)
             .await
             .unwrap(),
-        KeyAnswer::Refused(Refusal::NotFound)
+        KeyAnswer::Frozen
     );
+    assert!(w
+        .store
+        .raw(&tenant_revocation_name(&w.t, "AKVL0404"))
+        .is_none());
     assert_eq!(w.head(), 3);
 }
 
@@ -5706,4 +5710,187 @@ async fn a_freeze_the_receipt_does_not_name_is_thawed_before_a_new_one() {
         })
     );
     assert_eq!(head_table(&w).await.frozen_at(), Some(4));
+}
+
+/// Review r1 (M1): on a frozen chain a principal's revoke has no `m/rk/`
+/// that D1 honours, so it is 503 with nothing put, whatever tenant 0's
+/// head becomes.
+#[tokio::test(flavor = "current_thread")]
+async fn a_principal_revoke_on_a_frozen_chain_is_503_and_puts_nothing() {
+    let w = World::new();
+    let adm = FakeAdmission::new(&w.root);
+    let mut table = seed(&w, &adm).await;
+    let units = w.units();
+    let gate = moved_gate(&w);
+    let env = env_gate!(w, &adm, &units, &gate);
+    let mut rng = TestRng(410);
+    freeze_keys(&env, None, &mut rng).await.unwrap();
+    for (zero, then) in [
+        (ZeroHead::D1, None),
+        (
+            ZeroHead::Moved { to: w.t.clone() },
+            Some((1, ZeroHead::Undone { to: w.t.clone() })),
+        ),
+    ] {
+        gate.set_zero(zero);
+        *gate.then.borrow_mut() = then;
+        assert_eq!(
+            env.change(&mut table, "", &revoke("PR0001"), &mut rng)
+                .await
+                .unwrap(),
+            KeyAnswer::Frozen
+        );
+    }
+    assert!(w
+        .store
+        .raw(&tenant_revocation_name(&w.t, "PR0001"))
+        .is_none());
+    assert!(gate.calls.borrow().is_empty());
+    assert_eq!(w.head(), 3);
+    // A key's revoke with tenant 0 at d1 and no move applies itself.
+    gate.set_zero(ZeroHead::Moved { to: w.t.clone() });
+    *gate.then.borrow_mut() = Some((1, ZeroHead::D1));
+    assert_eq!(
+        env.change(&mut table, "", &revoke("AKVL0001"), &mut rng)
+            .await
+            .unwrap(),
+        KeyAnswer::RevokedOffChain
+    );
+    assert_eq!(*gate.calls.borrow(), vec!["refuse_in_d1 AKVL0001"]);
+}
+
+/// A store that plants `bytes` at `at` just before the first put there:
+/// another writer's record wins the seq.
+struct PlantFirst<'a> {
+    inner: &'a MemRecords,
+    at: String,
+    bytes: RefCell<Option<Vec<u8>>>,
+}
+
+impl RecordStore for PlantFirst<'_> {
+    async fn put_if_absent(&self, name: &str, bytes: Vec<u8>) -> Result<bool> {
+        if name == self.at {
+            if let Some(b) = self.bytes.borrow_mut().take() {
+                self.inner.plant(name, b);
+            }
+        }
+        self.inner.put_if_absent(name, bytes).await
+    }
+    async fn get(&self, name: &str) -> Result<Option<Vec<u8>>> {
+        self.inner.get(name).await
+    }
+    async fn list(&self, p: &str, a: &str, l: u32) -> Result<Vec<String>> {
+        self.inner.list(p, a, l).await
+    }
+}
+
+fn sealed(w: &World, seq: u64, op: KeyOp, subject: &Subject) -> Vec<u8> {
+    seal_key_record(
+        &w.kek,
+        &w.ring,
+        &w.t,
+        seq,
+        op,
+        seq,
+        &subject.door,
+        Some(&subject.private),
+        false,
+        None,
+        &mut TestRng(30_000 + seq),
+    )
+    .unwrap()
+}
+
+/// Review r1 (M2): a writer whose put is lost reads tenant 0's head again:
+/// a revoke that read `moving` and lost its seq to the give-up's record is
+/// decided by the give-up's `d1` head (AM-31's pre-apply), not written
+/// into the chain of a tenant that no longer serves the key.
+#[tokio::test(flavor = "current_thread")]
+async fn a_lost_put_reads_tenant_zeros_head_again() {
+    let w = World::new();
+    let adm = FakeAdmission::new(&w.root);
+    let mut table = seed(&w, &adm).await;
+    let units = w.units();
+    let gate = moved_gate(&w);
+    gate.set_zero(ZeroHead::Moving { to: w.t.clone() });
+    *gate.then.borrow_mut() = Some((1, ZeroHead::D1));
+    assert!(w.store.lose(&route_name("AKVL0001")));
+    let store = PlantFirst {
+        inner: &w.store,
+        at: key_chain(&w.t).name(3),
+        bytes: RefCell::new(Some(sealed(
+            &w,
+            3,
+            KeyOp::Create,
+            &principal("PR0003", &[]),
+        ))),
+    };
+    let env = env_gate!(w, &adm, &units, &gate, &store);
+    assert_eq!(
+        env.change(&mut table, "", &revoke("AKVL0001"), &mut TestRng(420))
+            .await
+            .unwrap(),
+        KeyAnswer::KeyMoved
+    );
+    assert_eq!(w.head(), 3, "no revoke record after the give-up");
+    assert_eq!(*gate.calls.borrow(), vec!["refuse_in_d1 AKVL0001"]);
+}
+
+/// Review r1 (L1, L2): the exit's holders are found again at every head,
+/// so one that gains a listed grant during the run is dropped too; a
+/// holder whose private part does not open is reported, not retried.
+#[tokio::test(flavor = "current_thread")]
+async fn the_exit_finds_new_holders_and_reports_blocked_ones() {
+    let w = World::new();
+    let adm = FakeAdmission::new(&w.root);
+    seed(&w, &adm).await;
+    let units = w.units();
+    let gate = moved_gate(&w);
+    // A subject gains b_01 just as the exit writes its first record.
+    let store = PlantFirst {
+        inner: &w.store,
+        at: key_chain(&w.t).name(3),
+        bytes: RefCell::new(Some(sealed(
+            &w,
+            3,
+            KeyOp::Create,
+            &principal("PR0003", &[grant("b_01", RW, None)]),
+        ))),
+    };
+    let env = env_gate!(w, &adm, &units, &gate, &store);
+    let mut rng = TestRng(430);
+    let drops = drop_moved_grants(&env, &["b_01".into()], &mut rng)
+        .await
+        .unwrap();
+    assert_eq!(drops.written, vec![4, 5, 6]);
+    assert!(drops.done && drops.blocked.is_empty());
+    let head = head_table(&w).await;
+    for id in ["AKVL0001", "PR0001", "PR0003"] {
+        assert!(head.get(id).unwrap().door.grants.is_empty(), "{id}");
+    }
+    // A holder sealed under a key version this ring does not hold.
+    let other = OneKey(TenantKey::from_bytes(&w.t, 2, derived("tk v2")).unwrap());
+    let p4 = principal("PR0004", &[grant("b_01", RW, None)]);
+    let bytes = seal_key_record(
+        &w.kek,
+        &other,
+        &w.t,
+        7,
+        KeyOp::Create,
+        7,
+        &p4.door,
+        Some(&p4.private),
+        false,
+        None,
+        &mut rng,
+    )
+    .unwrap();
+    w.store.plant(&key_chain(&w.t).name(7), bytes);
+    let env = env_gate!(w, &adm, &units, &gate);
+    let drops = drop_moved_grants(&env, &["b_01".into()], &mut rng)
+        .await
+        .unwrap();
+    assert!(drops.written.is_empty());
+    assert_eq!(drops.blocked, vec!["PR0004".to_owned()]);
+    assert!(!drops.done);
 }
