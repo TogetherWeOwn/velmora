@@ -6,14 +6,15 @@
 use std::cell::RefCell;
 
 use serde_json::json;
-use velmora_bridge::testkit::{RusqliteSql, ARM_USAGE};
+use velmora_bridge::testkit::RusqliteSql;
 use velmora_bridge::unit::lift::{
     ids_hash, AckClass, ClassProof, FindingList, GateRefusal, GateSummary, LiftProof, ReplayId,
     MAX_PAGE,
 };
+use velmora_bridge::unit::recount::{RecountCall, RecountRefusal};
 use velmora_bridge::unit::restore::{
     drive, Bookmark, PitrStep, PointInTimePort, RestoreRefusal, RestoreTarget, LEASE_TERM_MS,
-    RESTORE_MARGIN_MS,
+    LIFT_SLACK_MS, RESTORE_MARGIN_MS,
 };
 use velmora_bridge::unit::{
     poll_once, BirthKind, BirthToken, CallKind, Refused, Seqs, SyncHead, TenantId, TenantState,
@@ -163,6 +164,7 @@ fn restore_op(kind: BirthKind, seq: u64, target: RestoreTarget, undo: &str) -> U
         token: token(kind, seq),
         target,
         expect_undo: Bookmark(undo.into()),
+        floor_ms: 0,
     }
 }
 
@@ -351,7 +353,9 @@ fn a_restore_armed_without_the_restart_says_so() {
     let op = restore_op(
         BirthKind::Restore,
         S,
-        RestoreTarget::Time { at_ms: 1 },
+        RestoreTarget::Time {
+            at_ms: BORN + LIFT_SLACK_MS,
+        },
         "bm-undo",
     );
     let a = poll_once(drive(step(&u, op, ready_at(BORN + 1000)), &pitr)).unwrap();
@@ -368,7 +372,9 @@ fn restore_checks_its_token_and_that_nothing_moved_since_prepare() {
     let u = closed();
     let t = ready_at(BORN + 1000);
     let pitr = FakePitr::new("bm-undo");
-    let at = RestoreTarget::Time { at_ms: BORN + 500 };
+    let at = RestoreTarget::Time {
+        at_ms: BORN + LIFT_SLACK_MS + 500,
+    };
     assert_eq!(
         run(
             &u,
@@ -423,7 +429,7 @@ fn restore_checks_its_token_and_that_nothing_moved_since_prepare() {
     );
     assert_eq!(
         *pitr.restored.borrow(),
-        vec![format!("bm-at-{}", BORN + 500)]
+        vec![format!("bm-at-{}", BORN + LIFT_SLACK_MS + 500)]
     );
     // An undo goes back to the sealed undo bookmark, unsealed by the tool.
     let back = RestoreTarget::Bookmark {
@@ -775,10 +781,53 @@ fn a_restored_unit_lifts_only_with_its_counters_on() {
         lift(&u, S + 1, None, t),
         refused_gate(GateRefusal::CountersOff)
     );
-    // The gate's recount turns them on (AM-3).
-    u.sql().apply(ARM_USAGE).unwrap();
+    // The gate's recount turns them on (AM-3, AM-27): `Recount`, a unit
+    // call, as jobs are refused while the unit is closed. No import was
+    // bound to this unit, so it is the gate's and needs no seal.
+    let started = ok(worker(
+        &u,
+        UnitOp::Recount {
+            call: RecountCall::Start {},
+            head: None,
+        },
+        t,
+    ));
+    assert_eq!(started["started"], json!(true));
+    assert_eq!(started["counters_on"], json!(false));
+    let mut on = false;
+    for _ in 0..10 {
+        let step = ok(worker(
+            &u,
+            UnitOp::Recount {
+                call: RecountCall::Step { chunk: 100 },
+                head: None,
+            },
+            t,
+        ));
+        if step["counters_on"] == json!(true) {
+            assert!(step["finished"].is_object(), "{step}");
+            on = true;
+            break;
+        }
+    }
+    assert!(on, "the recount ends and turns the counters on");
     let p = proof(&u, t);
     assert!(matches!(lift(&u, S + 1, Some(p), t), UnitAnswer::Ok { .. }));
+    // An open unit's counters are the cron's: `Recount` is refused.
+    assert_eq!(
+        worker(
+            &u,
+            UnitOp::Recount {
+                call: RecountCall::Start {},
+                head: None,
+            },
+            t,
+        ),
+        UnitAnswer::Refused {
+            reason: Refused::Recount(RecountRefusal::NotRestoring),
+            alarm: false,
+        }
+    );
 }
 
 #[test]

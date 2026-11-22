@@ -172,6 +172,8 @@ impl KeyUnit for FakeUnit {
             keys_seq: self.keys_seq.get(),
             applied: entries.len() as u64,
             skipped: 0,
+            reserved: 0,
+            kept: 0,
         })
     }
 
@@ -343,6 +345,7 @@ fn entry(id: &str, status: SubjectStatus, seq: u64) -> KeyEntry {
         secret_kek_version: Some(1),
         owner_ref: None,
         last_seq: seq,
+        rid: None,
     }
 }
 

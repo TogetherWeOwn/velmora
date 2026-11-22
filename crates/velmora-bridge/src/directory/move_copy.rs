@@ -146,14 +146,78 @@ pub struct ImportState {
     pub sealed: Option<u64>,
     /// `unit_import_move.move_lifted` (AM-47): `Some(true)` once the move's
     /// lift landed (an undone move's 30-day copy), `Some(false)` before it
-    /// (a give-up that did not reach its `deleteAll()`); `None`: the unit
-    /// did not say (L1 package 4c).
+    /// (a give-up that did not reach its `deleteAll()`); `None`: no move
+    /// record (`ImportProgress.move_lifted` null).
     pub move_lifted: Option<bool>,
     /// When the move's lift landed in the unit (`ImportProgress.lifted_at`,
     /// the unit's clock), once `move_lifted`. `None`: not lifted, or the
     /// unit did not say.
     pub lifted_at: Option<UnixMs>,
     pub tables: Vec<ImportCount>,
+}
+
+impl ImportState {
+    /// The unit's `ImportProgress` answer body (`{tables: [{table,
+    /// cursor, rows}], sealed, t0_seq, since_seq, move_lifted, lifted_at,
+    /// schema_tables}`) as the move reads it: `t0_seq` binds the import to
+    /// its window (so a resumed copy after a crash continues this
+    /// window's import and gives up on an earlier one's), `lifted_at`
+    /// feeds step 8(b1). `None`: no import was ever bound to the unit (no
+    /// move record and no table progress).
+    ///
+    /// Fails closed: a field of the wrong type, an unknown table, a table
+    /// twice, or a `lifted_at` without `move_lifted: true` is
+    /// [`BridgeError::Invalid`], never read as "not said".
+    pub fn from_progress(body: &serde_json::Value) -> crate::types::Result<Option<ImportState>> {
+        use serde_json::Value;
+        const BAD: BridgeError = BridgeError::Invalid("import_progress");
+        fn opt_u64(v: Option<&Value>) -> crate::types::Result<Option<u64>> {
+            match v {
+                None | Some(Value::Null) => Ok(None),
+                Some(v) => v.as_u64().map(Some).ok_or(BAD),
+            }
+        }
+        let obj = body.as_object().ok_or(BAD)?;
+        let t0_seq = opt_u64(obj.get("t0_seq"))?;
+        let sealed = opt_u64(obj.get("sealed"))?;
+        let move_lifted = match obj.get("move_lifted") {
+            None | Some(Value::Null) => None,
+            Some(v) => Some(v.as_bool().ok_or(BAD)?),
+        };
+        let lifted_at = match obj.get("lifted_at") {
+            None | Some(Value::Null) => None,
+            Some(v) => Some(UnixMs(v.as_i64().ok_or(BAD)?)),
+        };
+        if lifted_at.is_some() && move_lifted != Some(true) {
+            return Err(BAD);
+        }
+        let mut seen = BTreeSet::new();
+        let mut tables = Vec::new();
+        for t in obj.get("tables").and_then(Value::as_array).ok_or(BAD)? {
+            let name = t.get("table").and_then(Value::as_str).ok_or(BAD)?;
+            let table = ImportTable::parse(name).ok_or(BAD)?;
+            if !seen.insert(name) {
+                return Err(BAD);
+            }
+            let rows = t.get("rows").and_then(Value::as_u64).ok_or(BAD)?;
+            tables.push(ImportCount { table, rows });
+        }
+        if t0_seq.is_none()
+            && sealed.is_none()
+            && move_lifted.is_none()
+            && lifted_at.is_none()
+            && tables.is_empty()
+        {
+            return Ok(None);
+        }
+        Ok(Some(ImportState {
+            t0_seq,
+            sealed,
+            move_lifted,
+            lifted_at,
+            tables,
+        }))
+    }
 }
 
 /// The unit's answer to `ImportSeal`.
@@ -989,5 +1053,111 @@ mod tests {
         let c = encode_cursor(&key);
         assert_eq!(decode_cursor(&c), Some(key));
         assert_eq!(decode_cursor("not json"), None);
+    }
+
+    /// `ImportProgress` as L1's unit answers it (#231, package 4e).
+    fn progress(t0: Value, sealed: Value, lifted: Value, at: Value, tables: Value) -> Value {
+        serde_json::json!({
+            "tables": tables,
+            "sealed": sealed,
+            "t0_seq": t0,
+            "since_seq": 7,
+            "move_lifted": lifted,
+            "lifted_at": at,
+            "schema_tables": ["buckets"],
+        })
+    }
+    use serde_json::{json, Value};
+
+    #[test]
+    fn import_progress_maps_t0_seq_and_lifted_at() {
+        let body = progress(
+            json!(11),
+            json!(3),
+            json!(true),
+            json!(1_795_000_000_000i64),
+            json!([{"table": "buckets", "cursor": "[\"b\"]", "rows": 2}]),
+        );
+        assert_eq!(
+            ImportState::from_progress(&body).unwrap(),
+            Some(ImportState {
+                t0_seq: Some(11),
+                sealed: Some(3),
+                move_lifted: Some(true),
+                lifted_at: Some(UnixMs(1_795_000_000_000)),
+                tables: vec![ImportCount {
+                    table: ImportTable::Buckets,
+                    rows: 2
+                }],
+            })
+        );
+        // Bound but not lifted (a resumed copy): t0_seq still read.
+        let body = progress(json!(11), json!(null), json!(false), json!(null), json!([]));
+        let s = ImportState::from_progress(&body).unwrap().unwrap();
+        assert_eq!(
+            (s.t0_seq, s.sealed, s.move_lifted, s.lifted_at),
+            (Some(11), None, Some(false), None)
+        );
+        // Nothing ever bound.
+        let body = progress(
+            json!(null),
+            json!(null),
+            json!(null),
+            json!(null),
+            json!([]),
+        );
+        assert_eq!(ImportState::from_progress(&body).unwrap(), None);
+    }
+
+    #[test]
+    fn a_malformed_import_progress_is_refused_not_read_as_unsaid() {
+        let t = json!([]);
+        for body in [
+            json!([]),
+            progress(
+                json!("11"),
+                json!(null),
+                json!(false),
+                json!(null),
+                t.clone(),
+            ),
+            progress(json!(-1), json!(null), json!(false), json!(null), t.clone()),
+            progress(json!(11), json!(1.5), json!(false), json!(null), t.clone()),
+            progress(json!(11), json!(1), json!("yes"), json!(null), t.clone()),
+            progress(json!(11), json!(1), json!(true), json!("now"), t.clone()),
+            // A lift time without the lift.
+            progress(json!(11), json!(1), json!(false), json!(5), t.clone()),
+            progress(json!(11), json!(1), json!(null), json!(5), t.clone()),
+            progress(json!(11), json!(1), json!(true), json!(5), json!(null)),
+            progress(
+                json!(11),
+                json!(1),
+                json!(true),
+                json!(5),
+                json!([{"table": "nope", "rows": 1}]),
+            ),
+            progress(
+                json!(11),
+                json!(1),
+                json!(true),
+                json!(5),
+                json!([{"table": "buckets", "rows": -1}]),
+            ),
+            progress(
+                json!(11),
+                json!(1),
+                json!(true),
+                json!(5),
+                json!([{"table": "buckets", "rows": 1}, {"table": "buckets", "rows": 1}]),
+            ),
+        ] {
+            assert!(
+                matches!(
+                    ImportState::from_progress(&body),
+                    Err(BridgeError::Invalid("import_progress"))
+                ),
+                "{body}"
+            );
+        }
     }
 }

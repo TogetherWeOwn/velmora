@@ -227,6 +227,7 @@ impl FakeKeys {
             secret_kek_version: Some(1),
             owner_ref: Some("m_owner".into()),
             last_seq: seq,
+            rid: None,
         }));
         seq
     }
@@ -284,6 +285,7 @@ impl OwnerKeys for FakeKeys {
             secret_kek_version: None,
             owner_ref: None,
             last_seq: seq,
+            rid: None,
         }));
         Ok(())
     }
