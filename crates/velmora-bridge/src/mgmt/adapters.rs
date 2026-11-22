@@ -136,6 +136,12 @@ impl<H: TenantHeads, N: BucketNames> HeadDoor<'_, H, N> {
     }
 }
 
+impl<H: TenantHeads, N: BucketNames> crate::mgmt::tenant::TenantHeadRead for HeadDoor<'_, H, N> {
+    async fn door(&self, tenant: &TenantId) -> Result<Option<Door>> {
+        self.head(tenant).await
+    }
+}
+
 impl<H: TenantHeads, N: BucketNames> TenantDoor for HeadDoor<'_, H, N> {
     async fn state(&self, tenant: &TenantId) -> Result<Option<DoorState>> {
         Ok(self.head(tenant).await?.as_ref().map(door_state))
