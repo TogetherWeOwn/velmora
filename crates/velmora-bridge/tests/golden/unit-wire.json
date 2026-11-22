@@ -143,6 +143,27 @@
       "reason": {
         "export": "hash_only"
       }
+    },
+    {
+      "alarm": false,
+      "answer": "refused",
+      "reason": {
+        "recount": "import_not_sealed"
+      }
+    },
+    {
+      "alarm": false,
+      "answer": "refused",
+      "reason": {
+        "reserve": "grant_limits_not_served"
+      }
+    },
+    {
+      "alarm": false,
+      "answer": "refused",
+      "reason": {
+        "size": "too_many_extents"
+      }
     }
   ],
   "calls": [
@@ -254,6 +275,13 @@
         "unit": 0
       },
       "op": {
+        "answers": [
+          {
+            "body": "{\"id\":\"AKGOLDEN000000000001\",\"secret_access_key\":null}",
+            "rid": "11111111111111111111111111111111",
+            "status": 201
+          }
+        ],
         "entries": [
           {
             "created_at": 5,
@@ -274,6 +302,7 @@
             "last_seq": 3,
             "made_by": "p_1",
             "owner_ref": "m_1",
+            "rid": "11111111111111111111111111111111",
             "secret_kek_version": 1,
             "secret_wrapped": "Agk=",
             "status": "active"
@@ -682,6 +711,259 @@
     },
     {
       "authenticated": true,
+      "kind": "worker",
+      "listed": true,
+      "name": {
+        "tenant": "t_00000000000000f1",
+        "unit": 0
+      },
+      "op": {
+        "call": {
+          "start": {}
+        },
+        "head": null,
+        "op": "recount"
+      },
+      "seqs": {
+        "keys_seq": 3,
+        "state_seq": 7
+      }
+    },
+    {
+      "authenticated": true,
+      "kind": "worker",
+      "listed": true,
+      "name": {
+        "tenant": "t_00000000000000f1",
+        "unit": 0
+      },
+      "op": {
+        "call": {
+          "step": {
+            "chunk": 500
+          }
+        },
+        "head": {
+          "flips": 0,
+          "selector": "moving",
+          "seq": 11,
+          "to": "t_00000000000000f1"
+        },
+        "op": "recount"
+      },
+      "seqs": {
+        "keys_seq": 3,
+        "state_seq": 7
+      }
+    },
+    {
+      "authenticated": true,
+      "kind": "worker",
+      "listed": true,
+      "name": {
+        "tenant": "t_00000000000000f1",
+        "unit": 0
+      },
+      "op": {
+        "acting": {
+          "owner_ref": "m_1"
+        },
+        "fingerprint": "3333333333333333333333333333333333333333333333333333333333333333",
+        "key_hash": "2222222222222222222222222222222222222222222222222222222222222222",
+        "op": "reserve",
+        "opening": {
+          "class": "key",
+          "grants": [
+            {
+              "access": "ro",
+              "bucket_id": "b_00000000000000f1",
+              "expires_at": null,
+              "ip_list": [],
+              "prefix": null
+            }
+          ],
+          "id": "AKGOLDEN000000000002",
+          "kind": "s3"
+        },
+        "rid": "44444444444444444444444444444444"
+      },
+      "seqs": {
+        "keys_seq": 3,
+        "state_seq": 7
+      }
+    },
+    {
+      "authenticated": true,
+      "kind": "worker",
+      "listed": true,
+      "name": {
+        "tenant": "t_00000000000000f1",
+        "unit": 0
+      },
+      "op": {
+        "acting": null,
+        "fingerprint": "3333333333333333333333333333333333333333333333333333333333333333",
+        "key_hash": "2222222222222222222222222222222222222222222222222222222222222222",
+        "op": "reserve",
+        "opening": {
+          "class": "principal",
+          "grants": [],
+          "id": "p_2",
+          "owner_ref": "m_2"
+        },
+        "rid": "45454545454545454545454545454545"
+      },
+      "seqs": {
+        "keys_seq": 3,
+        "state_seq": 7
+      }
+    },
+    {
+      "authenticated": true,
+      "kind": "worker",
+      "listed": true,
+      "name": {
+        "tenant": "t_00000000000000f1",
+        "unit": 0
+      },
+      "op": {
+        "acting": {
+          "principal": "p_1"
+        },
+        "fingerprint": "3333333333333333333333333333333333333333333333333333333333333333",
+        "key_hash": "2222222222222222222222222222222222222222222222222222222222222222",
+        "op": "reserve",
+        "opening": {
+          "class": "grants",
+          "grants": [],
+          "subject": "AKGOLDEN000000000001"
+        },
+        "rid": "46464646464646464646464646464646"
+      },
+      "seqs": {
+        "keys_seq": 3,
+        "state_seq": 7
+      }
+    },
+    {
+      "authenticated": true,
+      "kind": "worker",
+      "listed": true,
+      "name": {
+        "tenant": "t_00000000000000f1",
+        "unit": 0
+      },
+      "op": {
+        "acting": {
+          "owner_ref": "m_1"
+        },
+        "fingerprint": "3333333333333333333333333333333333333333333333333333333333333333",
+        "key_hash": "2222222222222222222222222222222222222222222222222222222222222222",
+        "op": "reserve",
+        "opening": {
+          "class": "bucket",
+          "name": "alpha",
+          "unit": 0
+        },
+        "rid": "47474747474747474747474747474747"
+      },
+      "seqs": {
+        "keys_seq": 3,
+        "state_seq": 7
+      }
+    },
+    {
+      "authenticated": true,
+      "kind": "worker",
+      "listed": true,
+      "name": {
+        "tenant": "t_00000000000000f1",
+        "unit": 0
+      },
+      "op": {
+        "acting": {
+          "owner_ref": "m_1"
+        },
+        "op": "resolve_acting"
+      },
+      "seqs": {
+        "keys_seq": 3,
+        "state_seq": 7
+      }
+    },
+    {
+      "authenticated": true,
+      "kind": "worker",
+      "listed": true,
+      "name": {
+        "tenant": "t_00000000000000f1",
+        "unit": 0
+      },
+      "op": {
+        "op": "release",
+        "rid": "44444444444444444444444444444444"
+      },
+      "seqs": {
+        "keys_seq": 3,
+        "state_seq": 7
+      }
+    },
+    {
+      "authenticated": true,
+      "kind": "worker",
+      "listed": true,
+      "name": {
+        "tenant": "t_00000000000000f1",
+        "unit": 0
+      },
+      "op": {
+        "expected": null,
+        "grant_seq": 4,
+        "op": "bind_bucket",
+        "rid": "47474747474747474747474747474747"
+      },
+      "seqs": {
+        "keys_seq": 3,
+        "state_seq": 7
+      }
+    },
+    {
+      "authenticated": true,
+      "kind": "worker",
+      "listed": true,
+      "name": {
+        "tenant": "t_00000000000000f1",
+        "unit": 0
+      },
+      "op": {
+        "bound": 4,
+        "op": "release_bound",
+        "rid": "47474747474747474747474747474747"
+      },
+      "seqs": {
+        "keys_seq": 3,
+        "state_seq": 7
+      }
+    },
+    {
+      "authenticated": true,
+      "kind": "worker",
+      "listed": true,
+      "name": {
+        "tenant": "t_00000000000000f1",
+        "unit": 0
+      },
+      "op": {
+        "grant_seq": 4,
+        "op": "bucket_binding"
+      },
+      "seqs": {
+        "keys_seq": 3,
+        "state_seq": 7
+      }
+    },
+    {
+      "authenticated": true,
       "kind": "job",
       "listed": true,
       "name": {
@@ -910,9 +1192,84 @@
       "already_born",
       "no_numbers"
     ],
+    "recount_refusal": [
+      "not_restoring",
+      "import_not_sealed",
+      "move_not_bound"
+    ],
     "report_kind": [
       "restore",
       "move"
+    ],
+    "reservation_bodies": {
+      "admits": [
+        {
+          "admitted": {
+            "again": false,
+            "bound": null,
+            "keys_seq": 3,
+            "rid": "44444444444444444444444444444444",
+            "scope": "p_1"
+          }
+        },
+        {
+          "applied": {
+            "body": "{}",
+            "bucket": null,
+            "grant_seq": null,
+            "status": 201,
+            "subject": "AKGOLDEN000000000002"
+          }
+        },
+        {
+          "reused": true
+        },
+        {
+          "narrowing": true
+        },
+        {
+          "exists": {
+            "grants": [],
+            "held": false,
+            "id": "p_1",
+            "status": "active"
+          }
+        },
+        null,
+        null
+      ],
+      "bindings": [
+        {
+          "binding": "open",
+          "creator": "p_1",
+          "name": "alpha",
+          "rid": "47474747474747474747474747474747",
+          "unit": 0
+        },
+        {
+          "binding": "created",
+          "bucket": "b_00000000000000f1"
+        },
+        {
+          "binding": "none"
+        }
+      ]
+    },
+    "reserve_refusal": [
+      "cap_reached",
+      "grant_not_held",
+      "grant_limits_not_served",
+      "too_many_grants",
+      "acting_principal_unknown",
+      "acting_principal_inactive",
+      "acting_principal_held",
+      "owner_ref_ambiguous",
+      "bucket_already_exists",
+      "principal_exists",
+      "conflict",
+      "not_found",
+      "rid_taken",
+      "malformed"
     ],
     "restore_refusal": [
       "not_restoring",
@@ -922,7 +1279,12 @@
       "too_soon",
       "moved",
       "malformed",
-      "no_point_in_time"
+      "no_point_in_time",
+      "before_move_lift"
+    ],
+    "size_refusal": [
+      "database_full",
+      "too_many_extents"
     ],
     "subject_status": [
       "active",

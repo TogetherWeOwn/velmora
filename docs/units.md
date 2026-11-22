@@ -106,7 +106,9 @@ variant.
 certificate); `unit_head` (`state_seq`, `keys_seq`, the tenant state and
 mode, `restoring_since` and `closed_at`; moved by
 `sync`, and `keys_seq` by the key apply); `unit_keys` and
-`unit_key_grants` (the key chain); the gate report and its
+`unit_key_grants` (the key chain); the reservations of capped opening
+calls and the fenced creator-grant seqs (`unit_reservations`,
+`unit_bucket_fences`); the gate report and its
 acknowledgements; the lease and the alarm's counters in
 `unit_lease`, and revocations listed for a key the unit does not hold as
 tombstones (with the lease); and the stamp counter.
@@ -134,7 +136,95 @@ rows: it signs presigned URLs only, which they cannot say. A key or an
 app password outside tenant 0 must name its principal. Everything else
 fails closed. **Milestone 1 serves unlimited grants only:** a key or
 principal grant with a prefix, an expiry or an address list is refused
-at use (AM-18).
+at use, and at its reservation (`grant_limits_not_served`, below).
+
+## Reservations
+
+A capped opening call (create an S3 key, an app password, a principal or
+a bucket; a widening grant change) first asks the tenant's root unit for
+a reservation (`reserve`, `unit::reserve`), before any intent or record.
+The Worker sends SHA-256 of the request's `Idempotency-Key`, the
+request's fingerprint, a fresh random 16-byte `rid`, the acting
+principal (as `Kofra-Acting-Owner-Ref` named it, or by id) and the
+change. In one transaction the unit:
+
+1. refuses a malformed ask, more than 64 grants, and any grant with a
+   prefix, an expiry or an address list (`grant_limits_not_served`);
+2. resolves the acting principal in its own key rows, by `owner_ref`
+   among the principals that are not revoked (an index serves it; two
+   such principals for one `owner_ref` are never resolved, and alarm):
+   none is `acting_principal_unknown`;
+3. reads the row of the scope (the principal's id, or `''` for none; the
+   key hash). Another fingerprint is `reused`. An `applied` row answers
+   its kept answer. A `reserved` row is asked again: checked again at the
+   unit's head, answered with its own `rid` and `again`; if the check now
+   fails, the refusal leaves no row. A bound bucket reservation is
+   answered whatever its creator is now;
+4. otherwise: a grant change that is a narrowing of the subject's
+   current grants (each new grant inside an unlimited current grant on
+   the same bucket, access no higher) is answered `narrowing` and takes
+   nothing; the acting principal must be `active`
+   (`acting_principal_inactive`) and not held (`503`); a principal create
+   that finds a principal of that `owner_ref` that is not revoked answers
+   it (`exists`: the Worker answers `200` when the grant sets are equal,
+   `409 principal_exists` otherwise); the id it makes must be new; the
+   bucket name must be no bucket's and held by no other open call; the
+   `owner_ref` of a principal create held by no other open call; every
+   grant no wider than the acting principal's effective grant (bucket
+   and access; a sign-up principal without an acting principal has none);
+   then the caps: 30 capped changes an hour, 50 bucket creates a day, 20
+   active S3 keys and 20 app passwords (open reservations count). Then
+   the row is kept `reserved`.
+
+The answer carries the unit's `keys_seq`: the call's record is exactly
+`keys_seq + 1` and carries the `rid` in its door part. On an answer with
+`again`, the Worker reads the chain above `keys_seq` for that `rid`: a
+record that carries it is the finisher's to apply
+(`409 idempotency_key_in_use`). The key-chain apply turns the row
+`applied` when it holds a record that carries its `rid` for its subject,
+and keeps the answer the Worker passes with it (once; a 2xx status and a
+JSON object of at most 16 KiB with no `secret_access_key`, or none is
+kept and the Worker builds the answer from the chain). A record that
+closes or narrows a principal (any status but `active`, or a grant it
+held that the record does not hold the same) cancels that principal's
+other open reservations. A bucket reservation is bound to its creator
+grant's seq (`bind_bucket`, a compare-and-set; `release_bound`); the
+finisher's `bucket_binding` read answers `open`, `created` or `none`, and
+`none` fences the seq for good. The apply of the tenant record
+`bucket_created` turns the reservation bound to its seq into the bucket
+(`reserve::bucket_created`; the tenant-record apply calls it in its
+transaction). `release` drops a `reserved` row. Each ask sweeps first: a
+`reserved` row goes after 1 hour, an `applied` one 24 hours after its
+apply. `resolve_acting` reads the acting principal of `objects.list` and
+`objects.presign` (refused unless active and not held) and writes
+nothing. The reservation calls run on an open unit, `authenticated`; an
+ask needs an `active` tenant, the others run in any state.
+
+## Key scheme
+
+The key scheme follows the tenant (rule 13): tenant 0 is scheme 1, every
+other tenant scheme 2, fixed by the birth certificate. A trigger on
+insert and on update of every wrap that names a scheme
+(`buckets.bdk_wrapped`, `access_keys.secret_wrapped`,
+`unit_keys.secret_wrapped`) refuses a value that is not a blob or whose
+first byte is not the certificate's scheme (`0x01` or `0x02`), so a
+scheme-1 wrap can never sit in a managed tenant's unit and survive its
+shred. The call fails whole and answers the failure class `key_scheme`;
+the Worker pages. An extent's file key is wrapped under the bucket's
+key, with the same byte in both schemes, and is not checked.
+
+## Size guard
+
+A Durable Object's SQLite stops at 10 GB. At 8 GB of database (the
+object's `databaseSize`) or 3.4 M extents, a call that adds extents is
+refused before it writes (`size`: `database_full` or
+`too_many_extents`, with an alarm): the Worker answers `503 SlowDown` and
+pages. Reads, deletes and smaller overwrites go on. The extent count is
+the usage counters' while they are on (one row read), and the rows the
+move's import took while they are off. Today the move's import batches
+are the calls that add extents to a unit; the request path's write
+admission takes the same check when it moves into the unit. Tests run it
+against a lowered limit.
 
 ## Import
 
@@ -342,12 +432,26 @@ by the restore gate. So a tool that re-runs 8(b) first reads the unit:
 if its `restoring_since` is already empty, the lift landed and 8(c)
 follows; a `keys_not_applied` answer means apply the keys and send the
 `sync` again, and `stale_sync` means read the head again. Only a gate
-refusal re-enters. Not covered: a rollback of the unit to a point between
-the seal and the lift brings back an unused seal (a design question). No
-other kind of lift exists.
+refusal re-enters. The unit keeps the time of that lift, and refuses a
+restore to a time before it (`before_move_lift`): a rollback into the
+move's window would bring back an unused seal. A restore to an undo
+bookmark is not compared (a bookmark names no time); a platform rollback
+of the object is outside the unit. The move's import record (the seal,
+the tenant-0 seq, the lift) stays until `deleteAll()`. No other kind of
+lift exists.
 
-A unit born from a `restore` token cannot lift until `recount` (AM-27)
-turns its counters on; that call is not built yet.
+**Recount** (`recount`, `unit::recount`, AM-27). A unit born from a
+`restore` token starts with its usage counters off, and the lift is
+refused while any is off; jobs are refused while the unit is closed, so
+the cron's recount cannot run. `recount{start}` begins a pass of the
+catalogue's recount that adopts its figures, and `recount{step}` runs
+one bounded chunk, one transaction each; the pass's last step adopts its
+figures and turns every counter on. It is accepted only while the
+unit's `restoring` entry is set. It is the move's when the import filled
+the entry the unit is closed under: then it also needs the seal, tenant
+0's verified head moving here, not older than the import's, with `flips
++ 1` equal to the sealed ordinal, and the unit's numbers, as a `move`
+report does. Any other `recount` is the restore gate's.
 
 A restored unit stays closed until the gate lifts it, and the gate lifts only
 on a whole, clean replay (`unit::gate`): no damaged generation, no held row

@@ -676,15 +676,25 @@ pub fn move_lifted<S: Sql>(sql: &S) -> Result<bool> {
 }
 
 /// Uses the seal up: called in the `sync` that a `move` report lifted.
-pub fn mark_move_lifted<S: Sql>(sql: &S) -> Result<()> {
+pub fn mark_move_lifted<S: Sql>(sql: &S, now: crate::types::UnixMs) -> Result<()> {
     let n = poll_once(sql.exec(
-        "UPDATE unit_import_move SET move_lifted = 1 WHERE id = 1 AND final = 1",
-        &[],
+        "UPDATE unit_import_move SET move_lifted = 1, lifted_at = ?1 WHERE id = 1 AND final = 1",
+        &[SqlValue::Int(now.0)],
     ))??;
     if n != 1 {
         return Err(decode("unit_import_move seal"));
     }
     Ok(())
+}
+
+/// The unit's time of the move's lift, once a `move` report lifted it.
+pub fn move_lifted_at<S: Sql>(sql: &S) -> Result<Option<i64>> {
+    let rows = poll_once(sql.query("SELECT lifted_at FROM unit_import_move WHERE id = 1", &[]))??;
+    match rows.first().and_then(|r| r.first()) {
+        None | Some(SqlValue::Null) => Ok(None),
+        Some(SqlValue::Int(t)) => Ok(Some(*t)),
+        Some(_) => Err(decode("unit_import_move lifted_at")),
+    }
 }
 
 /// The newest tenant-0 head seq the import was bound to, if any.

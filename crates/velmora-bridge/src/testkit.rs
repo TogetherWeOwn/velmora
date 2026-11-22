@@ -517,6 +517,19 @@ impl crate::unit::UnitSql for RusqliteSql {
     fn apply_script(&self, script: &str) -> Result<()> {
         self.apply(script)
     }
+
+    /// The local database's pages times their size (a twin is not
+    /// asked: its file is the object's own).
+    fn database_size(&self) -> Result<u64> {
+        let conn = self.conn.borrow();
+        let pragma = |name: &str| -> Result<u64> {
+            let n: i64 = conn
+                .query_row(&format!("PRAGMA {name}"), [], |r| r.get(0))
+                .map_err(map_err)?;
+            u64::try_from(n).map_err(|_| BridgeError::Sql(format!("{name} negative")))
+        };
+        Ok(pragma("page_count")? * pragma("page_size")?)
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -630,9 +630,9 @@ pub fn ack<S: Sql>(
 /// After the lift check passed, in the `sync` that clears the entry: a
 /// `move` report uses the seal up (no other `move` report is taken), and
 /// the report is forgotten.
-pub fn lifted<S: Sql>(sql: &S) -> Result<()> {
+pub fn lifted<S: Sql>(sql: &S, now: crate::types::UnixMs) -> Result<()> {
     if stored(sql)?.is_some_and(|r| r.kind == ReportKind::Move) {
-        super::import::mark_move_lifted(sql)?;
+        super::import::mark_move_lifted(sql, now)?;
     }
     clear(sql)
 }
@@ -772,7 +772,7 @@ fn stamp_counter<S: Sql>(sql: &S) -> Result<Option<u64>> {
     }
 }
 
-fn counters_on<S: Sql>(sql: &S) -> Result<bool> {
+pub(crate) fn counters_on<S: Sql>(sql: &S) -> Result<bool> {
     let rows = poll_once(sql.query(
         "SELECT all_x = 1 AND all_o = 1 AND all_g = 1 FROM usage_global WHERE id = 1",
         &[],

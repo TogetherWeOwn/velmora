@@ -16,6 +16,8 @@ use velmora_bridge::unit::keys::{Access, KeyEntry, KeyGrant, KeyKind, SubjectSta
 use velmora_bridge::unit::lift::{
     ids_hash, ClassProof, FindingList, GateRefusal, GateSummary, LiftProof, ReplayId,
 };
+use velmora_bridge::unit::recount::{RecountCall, RecountRefusal};
+use velmora_bridge::unit::restore::{Bookmark, PitrStep, RestoreRefusal, RestoreTarget};
 use velmora_bridge::unit::{
     BirthKind, BirthToken, CallKind, Refused, Seqs, SyncHead, TenantId, TenantState, Unit,
     UnitAnswer, UnitCall, UnitName, UnitOp,
@@ -194,8 +196,15 @@ fn refusal(a: &UnitAnswer) -> Option<(Refused, bool)> {
     }
 }
 
+/// A scheme-2 BDK wrap's shape: 73 bytes after the version byte 0x02.
+fn bdk() -> ImportValue {
+    let mut w = vec![7; 73];
+    w[0] = 0x02;
+    ImportValue::Blob(w)
+}
+
 fn bucket_row(id: &str, name: &str, owner: &str) -> Vec<ImportValue> {
-    vec![t(id), t(name), t(owner), b(73), i(2), i(0), i(10)]
+    vec![t(id), t(name), t(owner), bdk(), i(2), i(0), i(10)]
 }
 
 fn generation_row(meta: &str) -> Vec<ImportValue> {
@@ -823,9 +832,25 @@ fn a_move_report_carries_the_units_numbers() {
     assert!(matches!(ahead, UnitAnswer::SyncNeeded { .. }), "{ahead:?}");
 }
 
+fn recount(call: RecountCall, head: Option<MoveHead>) -> UnitOp {
+    UnitOp::Recount { call, head }
+}
+
+fn recount_refused(r: RecountRefusal) -> Option<(Refused, bool)> {
+    Some((Refused::Recount(r), false))
+}
+
 #[test]
 fn a_restore_born_unit_lifts_a_move_only_with_its_counters_on() {
     let u = born_as(own(), BirthKind::Restore);
+    fill(&u, &["a"]);
+    let start = |head| recount(RecountCall::Start {}, head);
+    // The import filled this entry: the recount is the move's, and needs
+    // the seal (AM-27, AM-29).
+    assert_eq!(
+        refusal(&numbered(&u, start(Some(moving(10))))),
+        recount_refused(RecountRefusal::ImportNotSealed)
+    );
     ok(seal(&u, moving(10), counts(&u)));
     let id = rid(S, 0, "m1");
     ok(open_move(&u, id.clone(), moving(10)));
@@ -836,8 +861,108 @@ fn a_restore_born_unit_lifts_a_move_only_with_its_counters_on() {
             summary: empty_summary(),
         },
     ));
-    // `Recount` (AM-27) turns them on; until then the lift is refused.
+    // Until `Recount` turns them on, the lift is refused.
     assert_eq!(status(&u)["lift"]["refused"], json!("counters_off"));
+    // Bound as the move report is: tenant 0's head, this window, moving
+    // here, not older than seen; numbered as an import batch.
+    assert_eq!(
+        refusal(&numbered(&u, start(None))),
+        recount_refused(RecountRefusal::MoveNotBound)
+    );
+    let mut other_window = moving(10);
+    other_window.flips = F + 1;
+    assert_eq!(
+        refusal(&numbered(&u, start(Some(other_window)))),
+        recount_refused(RecountRefusal::ImportNotSealed)
+    );
+    let mut d1 = moving(10);
+    d1.selector = "d1".into();
+    let mut elsewhere = moving(10);
+    elsewhere.to = Some(TenantId::parse("t_0000000000000e02").unwrap());
+    for head in [d1, elsewhere, moving(9)] {
+        assert_eq!(
+            refusal(&numbered(&u, start(Some(head)))),
+            recount_refused(RecountRefusal::MoveNotBound)
+        );
+    }
+    assert_eq!(
+        refusal(&worker(&u, start(Some(moving(10))))),
+        Some((Refused::Identity(Refusal::StaleJob), false))
+    );
+    let started = ok(numbered(&u, start(Some(moving(10)))));
+    assert_eq!(started["started"], json!(true));
+    let mut on = false;
+    for _ in 0..10 {
+        let step = ok(numbered(
+            &u,
+            recount(RecountCall::Step { chunk: 1 }, Some(moving(10))),
+        ));
+        if step["counters_on"] == json!(true) {
+            on = true;
+            break;
+        }
+    }
+    assert!(on, "the recount ends and turns the counters on");
+    // The pass counted what the import brought.
+    let live: i64 = u
+        .sql()
+        .with_conn(|c| {
+            c.query_row(
+                "SELECT live_objects FROM usage_buckets WHERE kind = 1 AND bucket_id = ?1",
+                [B1],
+                |r| r.get(0),
+            )
+        })
+        .unwrap();
+    assert_eq!(live, 1);
+    let p = proof(&u);
+    assert!(matches!(
+        sync_to(&u, S + 1, None, Some(p)),
+        UnitAnswer::Ok { .. }
+    ));
+    assert_eq!(
+        refusal(&numbered(&u, start(Some(moving(10))))),
+        recount_refused(RecountRefusal::NotRestoring)
+    );
+    // A later restore of this unit never goes back into the move's
+    // window: a time before the lift is refused; a time after it goes on
+    // to the lease checks.
+    let s2 = S + 2;
+    assert!(matches!(
+        sync_to(&u, s2, Some(s2), None),
+        UnitAnswer::Ok { .. }
+    ));
+    let restore = |at_ms| {
+        let c = call_on(
+            &own(),
+            CallKind::Worker,
+            None,
+            UnitOp::Restore {
+                token: BirthToken {
+                    name: own(),
+                    jurisdiction: String::new(),
+                    record_seq: s2,
+                    schema_version: velmora_bridge::unit::schema::SCHEMA_VERSION,
+                    key_scheme: 2,
+                    kind: BirthKind::Restore,
+                },
+                target: RestoreTarget::Time { at_ms },
+                expect_undo: Bookmark("undo".into()),
+            },
+        );
+        match u.pitr_step(&c, NOW) {
+            PitrStep::Answer(a) => refusal(&a),
+            other => panic!("armed: {other:?}"),
+        }
+    };
+    assert_eq!(
+        restore(NOW.0 - 1),
+        Some((Refused::Restore(RestoreRefusal::BeforeMoveLift), false))
+    );
+    assert_eq!(
+        restore(NOW.0),
+        Some((Refused::Restore(RestoreRefusal::LeaseUnknown), false))
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1095,7 +1220,7 @@ fn export_pages_in_key_order_and_its_hash_is_the_rows_without_excluded_columns()
     }
     // The wraps leave as stored, still wrapped, in rows mode.
     let r = ok(worker(&u, export_op(buckets, None, 10, ExportMode::Rows)));
-    assert_eq!(rows_of(&r)[0][3], b(73));
+    assert_eq!(rows_of(&r)[0][3], bdk());
     // An empty table: no rows, no last key, the digest of nothing.
     let gc = ExportTable::Data(ImportTable::Gc);
     let e = ok(worker(&u, export_op(gc, None, 10, ExportMode::Hash)));
@@ -1181,6 +1306,7 @@ fn principal(seq: u64, grants: Vec<KeyGrant>) -> KeyEntry {
         secret_kek_version: None,
         owner_ref: Some("member-1".into()),
         last_seq: seq,
+        rid: None,
     }
 }
 
@@ -1197,6 +1323,7 @@ fn key(id: &str, seq: u64, status: SubjectStatus, grants: Vec<KeyGrant>) -> KeyE
         secret_kek_version: Some(1),
         owner_ref: Some("member-1".into()),
         last_seq: seq,
+        rid: None,
     }
 }
 
@@ -1228,6 +1355,7 @@ fn the_key_tables_are_hashed_only_and_equal_the_chains_projection() {
         UnitOp::ApplyKeys {
             from_seq: 0,
             entries: entries.clone(),
+            answers: vec![],
         },
     );
     assert!(matches!(a, UnitAnswer::Ok { .. }), "{a:?}");

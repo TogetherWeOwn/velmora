@@ -15,10 +15,13 @@ use super::export::{ExportMode, ExportRefusal, ExportTable};
 use super::identity::{CallKind, Refusal, Seqs};
 use super::import::{ImportBatch, ImportCount, ImportRefusal, ImportValue, MoveHead};
 use super::jobcall::JobCall;
-use super::keys::{KeyEntry, KeyRefusal};
+use super::keys::{KeptAnswer, KeyEntry, KeyRefusal};
 use super::lift::{AckClass, FindingList, GateRefusal, GateSummary, LiftProof, ReplayId};
 use super::name::UnitName;
+use super::recount::{RecountCall, RecountRefusal};
+use super::reserve::{Acting, Hash32, Opening, ReserveRefusal, Rid};
 use super::restore::{Bookmark, RestoreRefusal, RestoreTarget};
+use super::size::SizeRefusal;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -155,6 +158,10 @@ pub enum UnitOp {
     ApplyKeys {
         from_seq: u64,
         entries: Vec<KeyEntry>,
+        /// The answers to keep for the reservations whose records these
+        /// are (AM-38).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        answers: Vec<KeptAnswer>,
     },
     /// The subjects the unit holds closed (`KeyTarget::closed`). A
     /// Worker call.
@@ -231,6 +238,49 @@ pub enum UnitOp {
     /// The stored report and whether a lift would pass now, with the
     /// counts and hashes for the lift record. A Worker call.
     GateStatus {},
+    /// One step of the usage recount of a closed unit (AM-27): the
+    /// restore gate's, or the move's with tenant 0's verified head,
+    /// numbered as an import batch. A Worker call.
+    Recount {
+        call: RecountCall,
+        #[serde(default)]
+        head: Option<MoveHead>,
+    },
+    /// The reservation of a capped opening call (ADR §2.5 step 0, AM-38):
+    /// the `Idempotency-Key`'s hash, the request's fingerprint, a fresh
+    /// `rid` (kept only by a new reservation), the acting principal and
+    /// the change. A Worker call, `authenticated`, on an open unit.
+    Reserve {
+        key_hash: Hash32,
+        fingerprint: Hash32,
+        rid: Rid,
+        #[serde(default)]
+        acting: Option<Acting>,
+        opening: Opening,
+    },
+    /// The acting principal of `objects.list` and `objects.presign`
+    /// (AM-35), read-only. A Worker call.
+    ResolveActing { acting: Acting },
+    /// Releases the `reserved` reservation `rid`. A Worker call.
+    Release { rid: Rid },
+    /// Binds the bucket reservation `rid` to the creator grant
+    /// `grant_seq` while it is bound to `expected`. A Worker call.
+    BindBucket {
+        rid: Rid,
+        #[serde(default)]
+        expected: Option<u64>,
+        grant_seq: u64,
+    },
+    /// Releases the bucket reservation `rid` while it is bound to
+    /// `bound`. A Worker call.
+    ReleaseBound {
+        rid: Rid,
+        #[serde(default)]
+        bound: Option<u64>,
+    },
+    /// What the reservations say of the creator grant `grant_seq`; an
+    /// answer of none fences it. A Worker call.
+    BucketBinding { grant_seq: u64 },
     /// One catalogue method of the job path (W2-jobs). A `job` call:
     /// the job's numbers must equal the unit's, and it is
     /// `authenticated`.
@@ -284,6 +334,26 @@ impl UnitOp {
                 | UnitOp::GateBlockers { .. }
                 | UnitOp::GateAck { .. }
                 | UnitOp::GateStatus {}
+                | UnitOp::Recount { .. }
+                | UnitOp::Reserve { .. }
+                | UnitOp::ResolveActing { .. }
+                | UnitOp::Release { .. }
+                | UnitOp::BindBucket { .. }
+                | UnitOp::ReleaseBound { .. }
+                | UnitOp::BucketBinding { .. }
+        )
+    }
+
+    /// The reservation calls (ADR §2.5 step 0): on an open unit only.
+    pub fn reservation_call(&self) -> bool {
+        matches!(
+            self,
+            UnitOp::Reserve { .. }
+                | UnitOp::ResolveActing { .. }
+                | UnitOp::Release { .. }
+                | UnitOp::BindBucket { .. }
+                | UnitOp::ReleaseBound { .. }
+                | UnitOp::BucketBinding { .. }
         )
     }
 
@@ -350,6 +420,13 @@ pub enum Refused {
     Gate(GateRefusal),
     /// An export was refused (AM-26).
     Export(ExportRefusal),
+    /// A recount was refused (AM-27).
+    Recount(RecountRefusal),
+    /// A reservation, or the read of an acting principal, was refused
+    /// (ADR §2.5 step 0, AM-18, AM-35, AM-38).
+    Reserve(ReserveRefusal),
+    /// The size guard refused a call that adds extents (ADR §2.6).
+    Size(SizeRefusal),
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

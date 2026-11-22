@@ -68,6 +68,9 @@ impl UnitSql for Db {
     fn apply_script(&self, script: &str) -> Result<()> {
         self.0.apply_script(script)
     }
+    fn database_size(&self) -> Result<u64> {
+        self.0.database_size()
+    }
 }
 
 /// The unit, reached as through `fetch`: the call and the answer cross
@@ -331,8 +334,15 @@ impl Fx {
             disposable: true,
             created_at: T0,
         };
+        // A managed tenant's unit holds only scheme-2 BDK wraps (rule 13).
+        // The scheme-2 wrap is the key lane's and not on this branch: the
+        // unit gets this wrap's bytes under the scheme-2 version byte, and
+        // the test keeps the scheme-1 wrap for its own seal. The job path
+        // never opens a BDK.
+        let mut held = bucket.clone();
+        held.bdk_wrapped[0] = 0x02;
         assert_eq!(
-            self.cat.create_bucket(&bucket).await.unwrap(),
+            self.cat.create_bucket(&held).await.unwrap(),
             Guard::Applied(())
         );
         bucket

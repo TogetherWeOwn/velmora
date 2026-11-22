@@ -105,7 +105,7 @@ fn ready() -> Unit<RusqliteSql> {
     u.sql()
         .apply(
             "INSERT INTO buckets(id, name, owner, bdk_wrapped, kek_version, created_at) \
-               VALUES ('b_00000000000000c1', 'alpha', 'o', x'00', 1, 1); \
+               VALUES ('b_00000000000000c1', 'alpha', 'o', x'02', 1, 1); \
              INSERT INTO generations(id, bucket_id, key, state, size, etag, content_json, \
                user_meta_json, extent_count, created_at) \
                VALUES ('g_0019a00000000c1c1c1c1c1c1c1c1', 'b_00000000000000c1', 'k', 'live', 20, \
@@ -122,7 +122,7 @@ fn ready() -> Unit<RusqliteSql> {
                  'g_0019a00000000c1c1c1c1c1c1c1c1', 'committed', 1, 10, 10, 10, zeroblob(48), zeroblob(16), \
                  zeroblob(32), zeroblob(32), 'held', 1); \
              INSERT INTO access_keys(access_key_id, principal, secret_wrapped, kek_version, \
-               status, created_at) VALUES ('AKUNITCORE0000000001', 'p', x'01', 1, 'active', 1); \
+               status, created_at) VALUES ('AKUNITCORE0000000001', 'p', x'02', 1, 'active', 1); \
              INSERT INTO grants(access_key_id, bucket_id, perm) \
                VALUES ('AKUNITCORE0000000001', 'b_00000000000000c1', 'ro');",
         )

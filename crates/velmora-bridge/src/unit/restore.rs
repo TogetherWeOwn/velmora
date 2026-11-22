@@ -102,6 +102,8 @@ pub enum RestoreRefusal {
     /// The call reached a unit without point-in-time storage (natively,
     /// through `handle`): restores go through the object class.
     NoPointInTime,
+    /// A time target before the owner move's lift (the move's window).
+    BeforeMoveLift,
 }
 
 /// The lease as the restore checks read it: `fresh_until` and the latest
