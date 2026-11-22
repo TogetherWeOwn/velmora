@@ -711,9 +711,10 @@ fn a_clean_whole_replay_lifts_with_its_proof_once_the_stamp_is_level() {
     );
 }
 
-/// An empty closing bucket unplaced on entry to restore or during it is swept only after the lift.
+/// An empty closing bucket unplaced on entry to restore or during it stays
+/// until the proven lift, which sweeps it without another sync.
 #[test]
-fn an_unplaced_closing_bucket_survives_restore_until_a_later_sync() {
+fn the_proven_lift_sweeps_an_unplaced_closing_bucket() {
     use velmora_bridge::unit::buckets::{self, BucketChange};
     use velmora_bridge::unit_lease::lease::Proven;
 
@@ -822,12 +823,11 @@ fn an_unplaced_closing_bucket_survives_restore_until_a_later_sync() {
             },
             t,
         ));
-        ok(lift(&u, S + 2, Some(proof(&u, t)), t));
-        assert_eq!(u.head().unwrap().restoring_since, None);
+        let p = proof(&u, t);
         assert_retained();
-
-        sync_buckets(S + 3, None, vec![], vec![]);
-        assert_eq!(u.head().unwrap().seqs.state_seq, S + 3);
+        ok(lift(&u, S + 2, Some(p), t));
+        let h = u.head().unwrap();
+        assert_eq!((h.seqs.state_seq, h.restoring_since), (S + 2, None));
         assert_eq!(buckets::count(u.sql()).unwrap(), 0);
         assert!(!buckets::is_closing(u.sql(), BUCKET).unwrap());
     }

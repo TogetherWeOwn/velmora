@@ -19,8 +19,9 @@
 //!   key-chain records after the unit's `keys_seq` ([`KeyFeed`], with the
 //!   directory's ack and the unit's closed subjects, AM-71): first the key
 //!   apply (AM-12), then `sync` with both heads and the bucket part of the
-//!   records it moves past (AM-57, [`super::placements`]), in steps of at
-//!   most [`MAX_SYNC_RECORDS`] records. The `sync` that
+//!   records it moves past (AM-57, [`super::placements`]), in steps of
+//!   (normally) at most [`MAX_SYNC_RECORDS`] records, each with the head's
+//!   tenant state. The `sync` that
 //!   would lift a `restoring` entry is the restore tool's (AM-45): it
 //!   carries the lift, which no record here has, so the client reports
 //!   [`Synced::LiftPending`] and changes nothing.
@@ -654,9 +655,12 @@ where
             }
             // AM-57: the bucket part, from the records after the unit's
             // `state_seq` up to the head or the step's last record.
+            // The tenant's state is always the head's, also on a step: a
+            // record below the head may allow what both the unit's own and
+            // the head's state refuse (a hold lifted and set again).
+            let (tenant_state, tenant_mode) = unit_state(&door);
             let part = self.bucket_part(tenant, unit.state_seq, door).await?;
             let target = &part.door;
-            let (tenant_state, tenant_mode) = unit_state(target);
             let restoring_since = target.restoring_entry(self.name.unit).map(|r| r.since_seq);
             let next = SyncHead {
                 seqs: Seqs {
@@ -736,8 +740,9 @@ where
     }
 
     /// The bucket part of a `sync` from the unit at `from` towards `head`
-    /// (AM-57): the records `from + 1` up to `head`, at most
-    /// [`MAX_SYNC_RECORDS`] of them, read and verified, and the record at
+    /// (AM-57): the records `from + 1` up to the step's end (at most
+    /// [`MAX_SYNC_RECORDS`] of them, or up to [`MAX_SYNC_EXTEND`] when no
+    /// record within that may end a step), read and verified, and the record at
     /// `from` to compare the first one with. One read per record; none
     /// when the unit is at the head (or past it: the unit then refuses
     /// the `sync` as stale and the head is read again).
@@ -756,33 +761,73 @@ where
                 at_head: true,
             });
         }
-        let to = head.seq.min(from.saturating_add(MAX_SYNC_RECORDS));
         let read = |seq| self.heads.record(tenant, seq);
         let base = read(from)
             .await
             .map_err(chain_error)?
             .ok_or(ERR_RECORD_MISSING)?;
-        // A step ends at every record that changes this unit's
-        // `restoring` entry, and that record is a step of its own: the
-        // unit judges "restoring" from a step's two ends, so a removal
-        // before the change (an operator's `SetUnits`) must not be judged
-        // under it, nor one after a lift.
+        // Where a step may end. The unit judges "restoring" from a step's
+        // two ends (an `unplaced` removes nothing while an entry is set
+        // at either end), and clears an entry only with the restore
+        // tool's lift proof. So a step ends at the furthest record within
+        // MAX_SYNC_RECORDS that
+        // (a) is the head, or does not end an entry the unit holds at
+        //     the start (a step that lifts would wait for a proof no
+        //     record carries; an entry replaced by another is fine), and
+        // (b) leaves no removal of several placements made outside an
+        //     entry (an operator's `SetUnits`) inside a step with an
+        //     entry at either end.
+        // When no record within the bound passes (a) and (b), the
+        // furthest passing (a) is taken (a removal between two restores
+        // is then judged under the entry: the lift's placement check
+        // pages); then the first passing (a) up to MAX_SYNC_EXTEND
+        // records. A unit beyond that pages.
         let entry = |d: &TenantDoor| d.restoring_entry(unit).map(|r| r.since_seq);
+        let start = entry(&base.door);
+        let cap = head.seq.min(from.saturating_add(MAX_SYNC_RECORDS));
+        let hard = head.seq.min(from.saturating_add(MAX_SYNC_EXTEND));
         let mut records: Vec<ReadRecord> = Vec::new();
-        for seq in from + 1..=to {
+        // Per record read: whether the step up to it passes (a), (b).
+        let mut ok: Vec<(bool, bool)> = Vec::new();
+        let mut free_removal = false;
+        let mut chosen: Option<usize> = None;
+        for seq in from + 1..=hard {
             let r = read(seq)
                 .await
                 .map_err(chain_error)?
                 .ok_or(ERR_RECORD_MISSING)?;
-            let before = records.last().map_or(&base.door, |p| &p.door);
-            if entry(&r.door) != entry(before) {
-                if records.is_empty() {
-                    records.push(r);
+            let prev = records.last().map_or(&base.door, |p| &p.door);
+            if entry(prev).is_none() {
+                let before = placements::placed(prev, unit);
+                let after = placements::placed(&r.door, unit);
+                if before.iter().filter(|b| !after.contains(b)).count() > 1 {
+                    free_removal = true;
                 }
+            }
+            let end = entry(&r.door);
+            let a = seq == head.seq || !(start.is_some() && end.is_none());
+            let b = !(free_removal && (start.is_some() || end.is_some()));
+            records.push(r);
+            ok.push((a, b));
+            if seq > cap && a {
+                // Past the bound: the first record that passes (a).
+                chosen = Some(records.len() - 1);
                 break;
             }
-            records.push(r);
+            if seq == cap {
+                chosen = ok
+                    .iter()
+                    .rposition(|&(a, b)| a && b)
+                    .or_else(|| ok.iter().rposition(|&(a, _)| a));
+                if chosen.is_some() {
+                    break;
+                }
+            }
         }
+        let Some(end) = chosen else {
+            return Err(ERR_SYNC_NO_STEP);
+        };
+        records.truncate(end + 1);
         let changes = placements::bucket_changes(unit, &base.door, &records)?;
         let door = records.pop().map(|r| r.door).ok_or(ERR_RECORD_MISSING)?;
         Ok(BucketPart {
@@ -860,7 +905,11 @@ where
                     // otherwise answer `renew_needed`. Its pages are its
                     // own caller's.
                     if self.flights.running(&self.name) {
-                        if let Some(waited) = self.flights.wait(&self.name, RENEW_WAIT_MS).await {
+                        if let Some(waited) = self
+                            .flights
+                            .wait(&self.name, RENEW_WAIT_MS, &self.clock)
+                            .await
+                        {
                             renewal = waited.renewal;
                             if waited.renewed {
                                 continue;
@@ -1114,13 +1163,18 @@ const RENEW_ROUNDS: usize = 4;
 /// Rounds of a sync: a key apply behind, a unit that moved, and one
 /// `placements_off` read again.
 const SYNC_ROUNDS: usize = 4;
-/// The most tenant records one `sync` step reads for its bucket part
-/// (est): a unit further behind is brought up in steps.
+/// The most tenant records one `sync` step normally reads for its
+/// bucket part (est): a unit further behind is brought up in steps (see
+/// [`MAX_SYNC_EXTEND`] for the one exception).
 pub const MAX_SYNC_RECORDS: u64 = 32;
 /// The most steps of one sync (est): `MAX_SYNC_RECORDS` times this many
 /// records at most per call; a unit further behind is brought up the
 /// rest of the way by the next one (each step is kept).
 pub const MAX_SYNC_STEPS: usize = 8;
+/// The most records one step may read to reach a record it may end at
+/// (est): past `MAX_SYNC_RECORDS` only when no record within it may end
+/// a step (a lift with no later entry within the bound).
+pub const MAX_SYNC_EXTEND: u64 = 128;
 
 /// One `sync` step's bucket part (AM-57).
 struct BucketPart {
@@ -1179,6 +1233,15 @@ const ERR_BUCKETS_REFUSED: BridgeError =
     BridgeError::Invalid("unit sync: the unit refused the bucket records");
 const ERR_RECORD_MISSING: BridgeError =
     BridgeError::Invalid("unit sync: a tenant record below the head is missing");
+/// Definitive damage of the tenant chain (it pages; a key version not
+/// held yet, a store failure or a busy chain may pass and are retried).
+const ERR_CHAIN_DAMAGED: BridgeError =
+    BridgeError::Invalid("unit sync: the tenant chain is damaged");
+const ERR_PRIVATE_UNREADABLE: BridgeError =
+    BridgeError::Invalid("unit sync: the head's private part is unreadable");
+const ERR_SYNC_NO_STEP: BridgeError = BridgeError::Invalid(
+    "unit sync: no record within the bound may end a step (a lift far before the next entry)",
+);
 const ERR_SYNC_FAR_BEHIND: BridgeError =
     BridgeError::Invalid("unit sync: the unit is far behind; brought up part of the way");
 const ERR_NOT_KEY_ROW: BridgeError =
@@ -1193,13 +1256,11 @@ const ERR_STOPPED: BridgeError = BridgeError::Invalid("unit: stamp call stopped"
 fn chain_error(e: ChainError) -> BridgeError {
     match e {
         ChainError::Store(e) => e,
-        ChainError::Damaged(_) => BridgeError::Invalid("unit sync: the tenant chain is damaged"),
+        ChainError::Damaged(_) => ERR_CHAIN_DAMAGED,
         ChainError::KeyNotHeld { .. } => {
             BridgeError::Invalid("unit sync: a tenant key version is not held yet")
         }
-        ChainError::PrivateUnreadable => {
-            BridgeError::Invalid("unit sync: the head's private part is unreadable")
-        }
+        ChainError::PrivateUnreadable => ERR_PRIVATE_UNREADABLE,
         ChainError::Refused(_) | ChainError::Busy => {
             BridgeError::Invalid("unit sync: the chain read failed")
         }
@@ -1251,6 +1312,9 @@ fn failed(e: &BridgeError, code: &'static str, mut pages: Vec<Page>) -> JobResul
         ERR_BUCKETS_REFUSED,
         ERR_RECORD_MISSING,
         placements::ERR_BUCKET_SECRETS,
+        ERR_SYNC_NO_STEP,
+        ERR_CHAIN_DAMAGED,
+        ERR_PRIVATE_UNREADABLE,
         placements::ERR_RECORD_ORDER,
         ERR_STAMP_ANSWER,
         ERR_LEASE_EXPIRED,
@@ -1692,9 +1756,11 @@ impl InFlight {
 
     /// Rule 12's waiter (AM-63): waits for the renewal of `name` that runs
     /// in this isolate, for at most `max_ms`, looking every
-    /// [`RENEW_POLL_MS`] on the caller's own timer. `None`: none runs, the
-    /// wait ran out, or this state has no timer (then nothing waits).
-    pub async fn wait(&self, name: &UnitName, max_ms: u64) -> Option<Waited> {
+    /// [`RENEW_POLL_MS`] on the caller's own timer, until `clock` passes
+    /// the deadline (a late timer does not stretch it) or the slices are
+    /// spent. `None`: none runs, the wait ran out, or this state has no
+    /// timer (then nothing waits).
+    pub async fn wait<C: Clock>(&self, name: &UnitName, max_ms: u64, clock: &C) -> Option<Waited> {
         let sleep = self.sleep.clone()?;
         let notice = self
             .flights
@@ -1702,11 +1768,18 @@ impl InFlight {
             .running
             .get(&name.object_name())
             .cloned()?;
+        let deadline = clock
+            .now()
+            .0
+            .saturating_add(i64::try_from(max_ms).unwrap_or(i64::MAX));
         let mut waited_ms = 0;
         while waited_ms < max_ms {
             let slice = RENEW_POLL_MS.min(max_ms - waited_ms);
             sleep(slice).await;
             waited_ms += slice;
+            if clock.now().0 > deadline {
+                return None;
+            }
             if let Some(w) = notice.ended() {
                 return Some(w);
             }

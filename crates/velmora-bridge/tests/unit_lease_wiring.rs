@@ -1533,8 +1533,9 @@ fn renewal_removes_a_listed_principals_key_grants() {
     );
 }
 
-/// A listed principal that the unit does not yet hold stays revoked when
-/// the key chain later supplies it as active, so its key gains no grant.
+/// A principal listed before its row exists stays revoked when the key chain
+/// later supplies it as active. Its key gains no effective grants, and the
+/// request for its grant on the bucket returns null.
 #[test]
 fn a_listed_principal_stays_revoked_when_its_records_arrive() {
     let u = born();
@@ -1568,6 +1569,26 @@ fn a_listed_principal_stays_revoked_when_its_records_arrive() {
     assert_eq!(status_of(&u, K), "active");
     assert_eq!(effective_grants_for(&u, K), 0);
     assert_eq!(store::revoked(u.sql()).unwrap(), Some(1));
+
+    let seqs = u.head().unwrap().seqs;
+    assert_eq!(
+        u.handle(
+            &call(
+                CallKind::Request,
+                Some(seqs),
+                true,
+                request_call(RequestCall::grant {
+                    akid: K.into(),
+                    bucket: BucketId::new(B1),
+                }),
+            ),
+            NOW,
+        ),
+        UnitAnswer::Ok {
+            seqs,
+            body: json!(null),
+        }
+    );
 }
 
 /// The alarm sends each job as a JavaScript object parsed from its JSON

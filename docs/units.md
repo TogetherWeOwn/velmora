@@ -226,7 +226,12 @@ hand-out, and its writes are due from their own time.
   record before held this unit's `restoring` entry, else `dropped`, or
   `unplaced` for several at once), and the head's placement list for this
   unit. A unit more than 32 records (est) behind is brought up in steps,
-  each a `sync` to a record of the chain, at most 8 steps per sync. Each
+  each a `sync` to a record of the chain, at most 8 steps per sync. A
+  step carries the head's tenant state (never a looser one of a record
+  below it), and ends at the furthest record that neither ends an entry
+  the unit holds (that needs the restore tool's lift proof) nor leaves an
+  operator's removal of several placements under an entry at either end
+  of the step. Each
   `sync` names the unit's `state_seq` its part was built from
   (`from_seq`); a unit at another seq refuses it `stale_sync` and the
   Worker reads again, so a part from another base (a second isolate's
@@ -439,11 +444,11 @@ from the record's private part. In the `sync`'s transaction the unit:
    `~dropped/<bucket_id>`, so that a later `created` can take the name;
    the rest of the `sync` applies, and the answer names it for the
    operator's page (`drop_not_closed`). No object is deleted for it;
-2a. on every `sync` with no `restoring` entry at either end (after the
-   changes, before the check) and on the gate's last call after §8.6
-   step 7.4, drops each closing row the head does not place once it holds
-   nothing (`buckets::sweep_closing`); a unit under an entry keeps its
-   closing rows too, as the 30-day copy keeps its rows;
+2a. on every `sync` that leaves no `restoring` entry (the lift
+   included; after the changes, before the check) and on the gate's last
+   call after §8.6 step 7.4, drops each closing row the head does not
+   place once it holds nothing (`buckets::sweep_closing`); a unit under an
+   entry keeps its closing rows too, as the 30-day copy keeps its rows;
 3. for `unplaced`, removes nothing while the unit's `restoring` entry is
    set, and otherwise drops those rows as in 2;
 4. checks that its bucket rows, less every closing row the head does not

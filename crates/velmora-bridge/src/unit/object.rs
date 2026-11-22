@@ -1907,10 +1907,11 @@ impl<S: UnitSql> Unit<S> {
                     return Err(BridgeError::Invalid(ROLLBACK));
                 }
             }
-            // Not while an entry is set at either end: the 30-day copy
-            // keeps its rows, a closing one too (AM-57 (3)); the gate's
-            // last call sweeps after the lift.
-            if !restoring {
+            // Not while an entry stays or is set: the 30-day copy keeps
+            // its rows, a closing one too (AM-57 (3)). The sync that lifts
+            // the entry (its proof checked above) sweeps, as any sync with
+            // no entry after it.
+            if next.restoring_since.is_none() {
                 buckets::sweep_closing(sql, &next.placed)?;
             }
             if next.restoring_since.is_none() && !buckets::placement_check(sql, &next.placed)? {
