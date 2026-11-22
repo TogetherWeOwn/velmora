@@ -28,10 +28,7 @@
 //!    (`400 bad_request` without it): only sign-up, with no member yet,
 //!    creates without one, and then the list is empty.
 //! 2. The tenant: none, `404 tenant_not_found`; `restoring`,
-//!    `409 tenant_restoring`; `provisioning`, `503`. Every grant names a
-//!    bucket the head places (`404 bucket_not_found` otherwise), so no
-//!    grant names a bucket id that is not one yet (a derived id is
-//!    predictable).
+//!    `409 tenant_restoring`; `provisioning`, `503`.
 //! 3. The ask: the key hash and the fingerprint of the request, a fresh
 //!    random `rid`, the acting header, and the principal with a fresh id.
 //!    What the unit answers:
@@ -40,19 +37,31 @@
 //!      (`again`), the call first reads the chain above `keys_seq`: a
 //!      record that carries the `rid` is being applied, so
 //!      `409 idempotency_key_in_use` with `Retry-After: 30`.
-//!    - `applied`: the answer the unit kept (cleaned of any secret), or,
-//!      if the record was applied with none (by the finisher), the
-//!      principal as the chain holds it now, `201`.
+//!    - `applied`: the unit holds the record, perhaps closed (AM-9: the
+//!      directory has not acknowledged it). The stores are brought to the
+//!      head first ([`PrincipalChain::finish`], DUR-7), and only once every
+//!      door store holds the principal open is the answer sent: the one
+//!      the unit kept (cleaned of any secret), or, if the record was
+//!      applied with none (by the finisher), the principal as the chain
+//!      holds it, `201`. Before that, `503`.
 //!    - `exists`: a principal that is not revoked holds the `owner_ref`:
-//!      `200` with it when its grants equal the request's as a set,
+//!      `200` with it when its grants equal the request's as a set (a
+//!      held one only once the stores hold it open, as above),
 //!      `409 principal_exists` otherwise. Nothing is kept.
 //!    - `reused`: `422 idempotency_key_reused`.
 //!    - a held, deleting or shredded tenant: `409 tenant_read_only` or
-//!      `tenant_unavailable` from the tenant's state, or
+//!      `tenant_unavailable` from the tenant's state read again, or
 //!      `409 idempotency_key_in_use` when the unit found the call's own
 //!      reservation and a record of it exists.
 //!    - a refusal: its contract code ([`refusal`]); `rid_taken` draws a
 //!      new `rid` and asks again.
+//!
+//!    Once admitted, every grant must name a bucket the head places
+//!    (`404 bucket_not_found` otherwise), so no grant names a bucket id
+//!    that is not one yet (a derived id is predictable). The check comes
+//!    after the ask, so a bucket deleted since never hides a kept answer.
+//!    A refusal after the ask gives the reservation back only when this
+//!    call made it and no record carries its `rid`.
 //! 4. The record, through [`PrincipalChain::create`], with the answer the
 //!    root unit keeps: `201` with the principal once every door store
 //!    acknowledged; `503` when the record is written and a store is not
@@ -237,12 +246,23 @@ pub trait PrincipalChain {
         rid: &Rid,
         above: u64,
     ) -> Result<Option<RecordedPrincipal>>;
-    /// The principal `id` as the chain's head holds it.
-    async fn principal(&self, tenant: &TenantId, id: &str) -> Result<Option<RecordedPrincipal>>;
+    /// The idempotent path of a principal the head already holds (§2.5,
+    /// DUR-7): brings every store to the head, the subject open only once
+    /// the directory acknowledged it, and waits for each. [`ChainWrite::Done`]
+    /// with the principal as the head holds it only when every door store
+    /// holds it open; [`ChainWrite::Unfinished`] while any store does not
+    /// (the directory down: the units hold it closed, AM-9). A subject the
+    /// head does not hold is [`ChainWrite::Busy`]. Writes no record of a
+    /// create.
+    async fn finish(&self, tenant: &TenantId, id: &str) -> Result<ChainWrite>;
     /// The opening order of §2.5 from step 1: the intent, the record at
     /// exactly `principal.seq` (a put that loses to a record carrying the
     /// same `rid` reads that record and never writes its own bytes), then
-    /// the stores, the root unit's apply keeping `answer`.
+    /// the stores. `answer` is kept by the root unit's **full** apply, the
+    /// one after the directory acknowledged, never by the apply that holds
+    /// the subject closed: a unit whose reservation is `applied` with an
+    /// answer then holds the principal open. [`ChainWrite::Done`] only once
+    /// every door store holds the principal open.
     async fn create(
         &self,
         tenant: &TenantId,
@@ -475,6 +495,85 @@ fn stored(status: u16, body: Vec<u8>) -> Answer {
     Answer::json(status, body)
 }
 
+/// The answer when the unit refuses an opening ask for the tenant's state:
+/// the state read again now (the unit's refusal may follow a change the
+/// first read did not see). A head that still says the tenant is open
+/// cannot explain the refusal: `503`.
+async fn state_answer<D: TenantDoor>(door: &D, tenant: &TenantId) -> Answer {
+    match door.state(tenant).await {
+        Ok(Some(DoorState::ReadOnly)) => code(Code::TenantReadOnly, None),
+        Ok(Some(DoorState::Unavailable)) => code(Code::TenantUnavailable, None),
+        Ok(Some(DoorState::Restoring)) => code(Code::TenantRestoring, Some(RETRY_AFTER_SECS)),
+        Ok(None) => code(Code::TenantNotFound, None),
+        Ok(Some(DoorState::Open | DoorState::Provisioning)) | Err(_) => unavailable(),
+    }
+}
+
+/// Whether every grant names a bucket the head places.
+async fn placed<D: TenantDoor>(door: &D, tenant: &TenantId, grants: &[KeyGrant]) -> Result<bool> {
+    if grants.is_empty() {
+        return Ok(true);
+    }
+    let ids: Vec<String> = grants.iter().map(|g| g.bucket_id.clone()).collect();
+    let names = door.bucket_names(tenant, &ids).await?;
+    if names.len() != ids.len() {
+        return Err(crate::types::BridgeError::Sql(
+            "bucket names: wrong count".into(),
+        ));
+    }
+    Ok(names.iter().all(Option::is_some))
+}
+
+/// The idempotent path (DUR-7): `answer` only once every door store holds
+/// the principal `subject` open; `503` before. `kept`: the answer the
+/// unit kept, sent as kept (cleaned again); without one, the principal as
+/// the head holds it, with `status`.
+async fn finished<D: TenantDoor, K: PrincipalChain>(
+    door: &D,
+    chain: &K,
+    tenant: &TenantId,
+    subject: &str,
+    kept: Option<(u16, Vec<u8>)>,
+    status: u16,
+    owner_ref: Option<&str>,
+) -> Answer {
+    let p = match chain.finish(tenant, subject).await {
+        Ok(ChainWrite::Done(p)) => p,
+        _ => return unavailable(),
+    };
+    if let Some((kept_status, body)) = kept {
+        return reply(idem::next(Reservation::Applied {
+            status: kept_status,
+            body,
+        }));
+    }
+    let owner_ref = owner_ref.unwrap_or(&p.owner_ref);
+    match principal_json(door, tenant, &p.id, owner_ref, p.status, &p.grants).await {
+        Ok(json) => stored(status, json),
+        Err(_) => unavailable(),
+    }
+}
+
+/// Gives the reservation back after a refusal that left no record, but
+/// only when this call made it (`again` unset) and no record carries its
+/// `rid`: another call under the same reservation may be writing one.
+/// Best effort: the unit's sweep releases it after 1 hour anyway.
+async fn give_back<U: RootUnit, K: PrincipalChain>(
+    unit: &U,
+    chain: &K,
+    tenant: &TenantId,
+    rid: &Rid,
+    again: bool,
+    keys_seq: u64,
+) {
+    if again {
+        return;
+    }
+    if let Ok(None) = chain.carrying(tenant, rid, keys_seq).await {
+        let _ = unit.release(tenant, rid).await;
+    }
+}
+
 /// Runs a principal create. Every answer is final for this request; the
 /// caller sends it as it is.
 pub async fn create_principal<D, U, K, R>(
@@ -504,30 +603,18 @@ where
         return code(Code::TenantNotFound, None);
     };
 
-    // 2. The tenant, and the buckets the grants name.
-    let state = match ports.door.state(&tenant).await {
-        Ok(Some(state)) => state,
+    // 2. The tenant. The buckets of the grants are checked once the unit
+    //    has said this is no retry of a create it kept (a bucket deleted
+    //    since never hides a kept answer).
+    match ports.door.state(&tenant).await {
+        Ok(Some(DoorState::Restoring)) => {
+            return code(Code::TenantRestoring, Some(RETRY_AFTER_SECS))
+        }
+        Ok(Some(DoorState::Provisioning)) | Err(_) => return unavailable(),
         Ok(None) => return code(Code::TenantNotFound, None),
-        Err(_) => return unavailable(),
-    };
-    match state {
-        DoorState::Restoring => return code(Code::TenantRestoring, Some(RETRY_AFTER_SECS)),
-        DoorState::Provisioning => return unavailable(),
-        DoorState::Open | DoorState::ReadOnly | DoorState::Unavailable => {}
+        Ok(Some(DoorState::Open | DoorState::ReadOnly | DoorState::Unavailable)) => {}
     }
     let grants: Vec<KeyGrant> = body.grants.iter().map(unit_grant).collect();
-    if !grants.is_empty() {
-        let ids: Vec<String> = grants.iter().map(|g| g.bucket_id.clone()).collect();
-        match ports.door.bucket_names(&tenant, &ids).await {
-            Ok(names) if names.len() == ids.len() && names.iter().all(Option::is_some) => {}
-            Ok(names) if names.len() == ids.len() => return code(Code::BucketNotFound, None),
-            Ok(_) | Err(_) => return unavailable(),
-        }
-    }
-    let state_code = || match state {
-        DoorState::ReadOnly => code(Code::TenantReadOnly, None),
-        _ => code(Code::TenantUnavailable, None),
-    };
 
     // 3. The ask.
     let idem = IdemRequest::new(
@@ -563,7 +650,7 @@ where
             Ok(answer) => answer,
             Err(_) => return unavailable(),
         };
-        let (rid, keys_seq, scope, subject) = match answer {
+        let (rid, keys_seq, again, scope, subject) = match answer {
             ReserveAnswer::Admitted {
                 rid,
                 keys_seq,
@@ -573,60 +660,47 @@ where
             } => {
                 if again {
                     match ports.chain.carrying(&tenant, &rid, keys_seq).await {
-                        Ok(Some(_)) => {
-                            return reply(idem::next(Reservation::InUse));
-                        }
+                        Ok(Some(_)) => return reply(idem::next(Reservation::InUse)),
                         Ok(None) => {}
                         Err(_) => return unavailable(),
                     }
                 }
-                (
-                    rid,
-                    keys_seq,
-                    scope,
-                    subject.unwrap_or_else(|| drawn_id.clone()),
-                )
+                let subject = subject.unwrap_or_else(|| drawn_id.clone());
+                (rid, keys_seq, again, scope, subject)
             }
+            // The unit holds the record, perhaps closed (the directory
+            // not yet acknowledged it): the stores are brought up first.
             ReserveAnswer::Applied {
-                status: Some(status),
-                body: Some(kept),
-                ..
-            } => {
-                return reply(idem::next(Reservation::Applied {
-                    status,
-                    body: kept.into_bytes(),
-                }))
-            }
-            ReserveAnswer::Applied {
+                status,
+                body: kept,
                 subject: Some(subject),
-                ..
             } => {
-                // Applied by the finisher, with no answer kept: the
-                // principal as the chain holds it now.
-                let p = match ports.chain.principal(&tenant, &subject).await {
-                    Ok(Some(p)) => p,
-                    Ok(None) => return internal(),
-                    Err(_) => return unavailable(),
+                let kept = match (status, kept) {
+                    (Some(status), Some(kept)) => Some((status, kept.into_bytes())),
+                    (None, None) => None,
+                    _ => return internal(),
                 };
-                return match principal_json(
-                    ports.door,
-                    &tenant,
-                    &p.id,
-                    &p.owner_ref,
-                    p.status,
-                    &p.grants,
-                )
-                .await
-                {
-                    Ok(json) => stored(201, json),
-                    Err(_) => unavailable(),
-                };
+                return finished(ports.door, ports.chain, &tenant, &subject, kept, 201, None).await;
             }
             ReserveAnswer::Applied { .. } => return internal(),
             ReserveAnswer::Reused => return reply(idem::next(Reservation::Reused)),
             ReserveAnswer::Exists(found) => {
                 if found.status == SubjectStatus::Revoked || !same_grants(&found.grants, &grants) {
                     return code(Code::PrincipalExists, None);
+                }
+                if found.held {
+                    // Not yet acknowledged by the directory (AM-9): answered
+                    // only once every door store holds it open.
+                    return finished(
+                        ports.door,
+                        ports.chain,
+                        &tenant,
+                        &found.id,
+                        None,
+                        200,
+                        Some(&body.owner_ref),
+                    )
+                    .await;
                 }
                 return match principal_json(
                     ports.door,
@@ -645,11 +719,11 @@ where
             ReserveAnswer::NotOpen { rid, keys_seq } => {
                 return match ports.chain.carrying(&tenant, &rid, keys_seq).await {
                     Ok(Some(_)) => reply(idem::next(Reservation::InUse)),
-                    Ok(None) => state_code(),
+                    Ok(None) => state_answer(ports.door, &tenant).await,
                     Err(_) => unavailable(),
                 };
             }
-            ReserveAnswer::AccountProblem => return state_code(),
+            ReserveAnswer::AccountProblem => return state_answer(ports.door, &tenant).await,
             ReserveAnswer::Refused(ReserveRefusal::RidTaken) => continue,
             ReserveAnswer::Refused(r) => {
                 return match refusal(r) {
@@ -659,6 +733,17 @@ where
             }
             ReserveAnswer::Unavailable => return unavailable(),
         };
+
+        // Every grant names a bucket the head places, so no grant names a
+        // bucket id that is not one yet (a derived id is predictable).
+        match placed(ports.door, &tenant, &grants).await {
+            Ok(true) => {}
+            Ok(false) => {
+                give_back(ports.unit, ports.chain, &tenant, &rid, again, keys_seq).await;
+                return code(Code::BucketNotFound, None);
+            }
+            Err(_) => return unavailable(),
+        }
 
         // 4. The record and the stores, with the answer the unit keeps.
         let Ok(json) = principal_json(
@@ -717,8 +802,7 @@ where
             Ok(ChainWrite::Unfinished) | Ok(ChainWrite::Busy) | Err(_) => return unavailable(),
             Ok(ChainWrite::Lost) => continue,
             Ok(ChainWrite::Refused(c)) => {
-                // No record of this reservation: give its slot back.
-                let _ = ports.unit.release(&tenant, &rid).await;
+                give_back(ports.unit, ports.chain, &tenant, &rid, again, keys_seq).await;
                 return code(c, c.retry_after().then_some(RETRY_AFTER_SECS));
             }
         }

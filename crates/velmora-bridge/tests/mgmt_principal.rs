@@ -168,7 +168,7 @@ fn ready() -> Unit<RusqliteSql> {
 
 struct Door {
     state: Cell<Option<DoorState>>,
-    buckets: BTreeMap<String, String>,
+    buckets: RefCell<BTreeMap<String, String>>,
     down: Cell<bool>,
 }
 
@@ -176,10 +176,12 @@ impl Door {
     fn new() -> Door {
         Door {
             state: Cell::new(Some(DoorState::Open)),
-            buckets: [(B1, "alpha"), (B2, "beta")]
-                .into_iter()
-                .map(|(a, b)| (a.to_string(), b.to_string()))
-                .collect(),
+            buckets: RefCell::new(
+                [(B1, "alpha"), (B2, "beta")]
+                    .into_iter()
+                    .map(|(a, b)| (a.to_string(), b.to_string()))
+                    .collect(),
+            ),
             down: Cell::new(false),
         }
     }
@@ -201,7 +203,10 @@ impl TenantDoor for Door {
         if self.down.get() {
             return Err(down());
         }
-        Ok(ids.iter().map(|id| self.buckets.get(id).cloned()).collect())
+        Ok(ids
+            .iter()
+            .map(|id| self.buckets.borrow().get(id).cloned())
+            .collect())
     }
 }
 
@@ -259,12 +264,21 @@ struct Record {
 struct Chain<'a> {
     unit: &'a Unit<RusqliteSql>,
     records: RefCell<Vec<Record>>,
+    /// The highest seq the unit holds in full (open).
+    open_upto: Cell<u64>,
+    /// The directory cannot be reached: the units get new records held
+    /// closed only (AM-9), and nothing is in force.
+    directory_down: Cell<bool>,
     /// The next create writes its record and stops before the stores.
     crash_after_record: Cell<bool>,
     /// Records another call puts first, one per create, before its put.
     races: RefCell<Vec<RecordedPrincipal>>,
     /// The next create is refused before any record.
     refuse: Cell<Option<velmora_mgmt_types::Code>>,
+    /// The next create cannot record now (nothing written).
+    busy: Cell<bool>,
+    /// The chain cannot be read.
+    unreadable: Cell<bool>,
     creates: Cell<u32>,
 }
 
@@ -273,9 +287,13 @@ impl<'a> Chain<'a> {
         let chain = Chain {
             unit,
             records: RefCell::new(Vec::new()),
+            open_upto: Cell::new(0),
+            directory_down: Cell::new(false),
             crash_after_record: Cell::new(false),
             races: RefCell::new(Vec::new()),
             refuse: Cell::new(None),
+            busy: Cell::new(false),
+            unreadable: Cell::new(false),
             creates: Cell::new(0),
         };
         // Seq 1: the acting principal.
@@ -289,7 +307,7 @@ impl<'a> Chain<'a> {
             None,
             None,
         );
-        chain.bring_up(&[]);
+        assert!(chain.bring_up(&[]));
         chain
     }
 
@@ -308,15 +326,17 @@ impl<'a> Chain<'a> {
         seq
     }
 
-    /// Applies every record the unit lacks, with the answers given.
-    fn bring_up(&self, answers: &[KeptAnswer]) {
-        let from_seq = unit_keys_seq(self.unit);
+    fn apply(&self, from_seq: u64, held: bool, answers: &[KeptAnswer]) {
         let entries: Vec<KeyEntry> = self
             .records
             .borrow()
             .iter()
             .filter(|r| r.seq > from_seq)
-            .map(|r| entry(&r.principal, r.seq, r.rid, r.made_by.clone()))
+            .map(|r| {
+                let mut e = entry(&r.principal, r.seq, r.rid, r.made_by.clone());
+                e.held = held;
+                e
+            })
             .collect();
         if entries.is_empty() {
             return;
@@ -330,6 +350,39 @@ impl<'a> Chain<'a> {
             NOW,
         );
         assert!(matches!(a, UnitAnswer::Ok { .. }), "apply: {a:?}");
+    }
+
+    /// The writer's bring-up: the units get every record (held closed
+    /// while the directory is down), then, once the directory has them,
+    /// the units in full with the answers. `true`: in force everywhere.
+    fn bring_up(&self, answers: &[KeptAnswer]) -> bool {
+        self.apply(unit_keys_seq(self.unit), true, &[]);
+        if self.directory_down.get() {
+            return false;
+        }
+        self.apply(self.open_upto.get(), false, answers);
+        self.open_upto.set(self.head());
+        true
+    }
+
+    /// A grant change of the acting principal: it also holds `ro` on B3,
+    /// which no bucket is.
+    fn acting_holds_b3(&self) {
+        self.push(
+            RecordedPrincipal {
+                id: P.into(),
+                owner_ref: OWNER.into(),
+                status: SubjectStatus::Active,
+                grants: vec![
+                    grant(B1, Access::Rw),
+                    grant(B2, Access::Ro),
+                    grant(B3, Access::Ro),
+                ],
+            },
+            None,
+            None,
+        );
+        assert!(self.bring_up(&[]));
     }
 
     fn count(&self, owner_ref: &str) -> usize {
@@ -348,6 +401,9 @@ impl PrincipalChain for Chain<'_> {
         rid: &Rid,
         above: u64,
     ) -> Result<Option<RecordedPrincipal>> {
+        if self.unreadable.get() {
+            return Err(down());
+        }
         Ok(self
             .records
             .borrow()
@@ -356,14 +412,24 @@ impl PrincipalChain for Chain<'_> {
             .map(|r| r.principal.clone()))
     }
 
-    async fn principal(&self, _t: &TenantId, id: &str) -> Result<Option<RecordedPrincipal>> {
-        Ok(self
+    async fn finish(&self, _t: &TenantId, id: &str) -> Result<ChainWrite> {
+        if self.unreadable.get() {
+            return Err(down());
+        }
+        let Some(p) = self
             .records
             .borrow()
             .iter()
             .rev()
             .find(|r| r.principal.id == id)
-            .map(|r| r.principal.clone()))
+            .map(|r| r.principal.clone())
+        else {
+            return Ok(ChainWrite::Busy);
+        };
+        Ok(match self.bring_up(&[]) {
+            true => ChainWrite::Done(p),
+            false => ChainWrite::Unfinished,
+        })
     }
 
     async fn create(
@@ -376,14 +442,19 @@ impl PrincipalChain for Chain<'_> {
         if let Some(code) = self.refuse.take() {
             return Ok(ChainWrite::Refused(code));
         }
+        if self.busy.take() {
+            return Ok(ChainWrite::Busy);
+        }
         if let Some(other) = self.races.borrow_mut().pop() {
             self.push(other, None, None);
         }
         if p.seq != self.head() + 1 {
             // Lost: to a record of this reservation, or to another.
             if let Some(own) = self.carrying(t, &p.rid, p.seq - 1).await? {
-                self.bring_up(&[]);
-                return Ok(ChainWrite::Done(own));
+                return Ok(match self.bring_up(&[]) {
+                    true => ChainWrite::Done(own),
+                    false => ChainWrite::Unfinished,
+                });
             }
             // The writer brings the stores to the head before it asks
             // again.
@@ -400,8 +471,10 @@ impl PrincipalChain for Chain<'_> {
         if self.crash_after_record.take() {
             return Ok(ChainWrite::Unfinished);
         }
-        self.bring_up(std::slice::from_ref(answer));
-        Ok(ChainWrite::Done(recorded))
+        Ok(match self.bring_up(std::slice::from_ref(answer)) {
+            true => ChainWrite::Done(recorded),
+            false => ChainWrite::Unfinished,
+        })
     }
 }
 
@@ -463,6 +536,22 @@ impl<'a> World<'a> {
         key: Option<&str>,
         body: &str,
     ) -> Answer {
+        let bytes = body.as_bytes().to_vec();
+        let body = Body::Stream {
+            declared_len: Some(bytes.len() as u64),
+            stream: futures_util::stream::iter(vec![Ok(bytes)]).boxed_local(),
+        };
+        self.send_body(path, token, acting, key, body).await
+    }
+
+    async fn send_body(
+        &self,
+        path: &str,
+        token: &str,
+        acting: Option<&str>,
+        key: Option<&str>,
+        body: Body,
+    ) -> Answer {
         let handlers = PrincipalHandlers {
             ports: PrincipalPorts {
                 door: &self.door,
@@ -480,11 +569,6 @@ impl<'a> World<'a> {
             authorization: Some(&authorization),
             acting,
             idempotency_key: key,
-        };
-        let bytes = body.as_bytes().to_vec();
-        let body = Body::Stream {
-            declared_len: Some(bytes.len() as u64),
-            stream: futures_util::stream::iter(vec![Ok(bytes)]).boxed_local(),
         };
         serve_with(
             &disabled,
@@ -718,15 +802,21 @@ async fn an_unknown_acting_member_is_refused() {
     expect_code(&a, 403, "acting_principal_unknown", None);
 }
 
-/// A grant on a bucket id the head does not place: `404`, before any ask.
+/// A grant on a bucket id the head does not place, even one the acting
+/// principal holds (an orphan creator grant on a derived id): `404`, and
+/// the reservation is given back.
 #[tokio::test(flavor = "current_thread")]
-async fn a_grant_on_a_bucket_that_is_not_placed_is_refused_before_the_ask() {
+async fn a_grant_on_a_bucket_that_is_not_placed_is_refused_with_no_row() {
     let u = ready();
     let w = World::new(&u);
+    w.chain.acting_holds_b3();
     let body = with_grants(json!([{"bucket_id": B3, "access": "ro"}]));
     let a = w.send(CONFIRMED, Some(OWNER), Some(KEY), &body).await;
     expect_code(&a, 404, "bucket_not_found", None);
-    assert!(w.root.asks.borrow().is_empty());
+    assert_eq!(w.root.asks.borrow().len(), 1);
+    assert_eq!(w.root.releases.get(), 1);
+    assert!(reservations(&u).is_empty());
+    assert_eq!(w.chain.count(NEW_OWNER), 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -769,15 +859,52 @@ async fn bodies_that_are_not_a_create_are_refused_before_the_ask() {
     assert!(w.root.asks.borrow().is_empty());
 }
 
+/// The body is read at most to 16 KiB: a declared length above it is
+/// refused before the stream is polled, and a stream with no length is
+/// refused at the chunk that crosses it, before the next one is polled.
+/// The body would otherwise be a valid create padded with whitespace.
 #[tokio::test(flavor = "current_thread")]
-async fn a_body_over_16_kib_is_refused() {
+async fn a_body_over_16_kib_is_refused_without_reading_on() {
     let u = ready();
     let w = World::new(&u);
-    let pad = "x".repeat(16 * 1024);
-    let body = format!("{{\"owner_ref\": \"u\", \"grants\": [], \"pad\": \"{pad}\"}}");
-    let a = w.send(CONFIRMED, None, Some(KEY), &body).await;
+    let path = format!("/v1/tenants/{TENANT}/principals");
+    let never = || -> Result<Vec<u8>> { panic!("polled past the limit") };
+    let declared = Body::Stream {
+        declared_len: Some(16 * 1024 + 1),
+        stream: futures_util::stream::iter(std::iter::from_fn(move || Some(never()))).boxed_local(),
+    };
+    let a = w
+        .send_body(&path, CONFIRMED, None, Some(KEY), declared)
+        .await;
     expect_code(&a, 400, "bad_request", None);
-    assert!(w.root.asks.borrow().is_empty());
+
+    let head = br#"{"owner_ref": "usr_1", "grants": []"#.to_vec();
+    let chunks: Vec<Result<Vec<u8>>> =
+        vec![Ok(head), Ok(vec![b' '; 8 * 1024]), Ok(vec![b' '; 8 * 1024])];
+    let streamed = Body::Stream {
+        declared_len: None,
+        stream: futures_util::stream::iter(chunks)
+            .chain(futures_util::stream::iter(std::iter::from_fn(move || {
+                Some(never())
+            })))
+            .boxed_local(),
+    };
+    let a = w
+        .send_body(&path, CONFIRMED, None, Some(KEY), streamed)
+        .await;
+    expect_code(&a, 400, "bad_request", None);
+
+    // The same body under the limit is a create.
+    let mut ok = br#"{"owner_ref": "usr_1", "grants": []"#.to_vec();
+    ok.extend(vec![b' '; 16 * 1024 - ok.len() - 1]);
+    ok.push(b'}');
+    let fits = Body::Stream {
+        declared_len: None,
+        stream: futures_util::stream::iter(vec![Ok(ok)]).boxed_local(),
+    };
+    let a = w.send_body(&path, CONFIRMED, None, Some(KEY), fits).await;
+    assert_eq!(a.status, 201, "{a:?}");
+    assert_eq!(w.root.asks.borrow().len(), 1);
 }
 
 /// The standard token never creates a principal (`principals:write` is
@@ -854,7 +981,7 @@ async fn a_create_that_stopped_after_its_record_is_finished_not_repeated() {
     assert_eq!(w.chain.creates.get(), 1);
 
     // The finisher applies the record; it keeps no answer.
-    w.chain.bring_up(&[]);
+    assert!(w.chain.bring_up(&[]));
     let a = w.send(CONFIRMED, None, Some(KEY), &signup()).await;
     assert_eq!(a.status, 201, "{a:?}");
     let id = w.chain.records.borrow()[1].principal.id.clone();
@@ -1061,48 +1188,212 @@ fn the_units_answers_are_read() {
     );
 }
 
-/// Every refusal of the unit is a contract code, or `500` when it is not
-/// the request's; none is `bad_request`, which would blame the caller for
-/// an ask this Worker built.
+/// Every refusal of the unit, with its contract code and `Retry-After`
+/// (AM-40), or `None` (`500`) where it is not the request's; none is
+/// `bad_request`, which would blame the caller for an ask this Worker
+/// built.
 #[test]
-fn every_refusal_maps_to_a_contract_code() {
+fn every_refusal_maps_to_its_contract_code() {
+    use velmora_mgmt_types::Code as C;
     use ReserveRefusal::*;
-    let all = [
-        CapReached,
-        GrantNotHeld,
-        GrantLimitsNotServed,
-        TooManyGrants,
-        ActingPrincipalUnknown,
-        ActingPrincipalInactive,
-        ActingPrincipalHeld,
-        OwnerRefAmbiguous,
-        BucketAlreadyExists,
-        PrincipalExists,
-        Conflict,
-        InternalKeyRefused,
-        NotFound,
-        RidTaken,
-        Malformed,
+    let table = [
+        (
+            CapReached,
+            Some((C::CapReached, Some(CAP_RETRY_AFTER_SECS))),
+        ),
+        (GrantNotHeld, Some((C::GrantNotHeld, None))),
+        (GrantLimitsNotServed, Some((C::GrantLimitsNotServed, None))),
+        (TooManyGrants, Some((C::GrantLimitReached, None))),
+        (
+            ActingPrincipalUnknown,
+            Some((C::ActingPrincipalUnknown, None)),
+        ),
+        (
+            ActingPrincipalInactive,
+            Some((C::ActingPrincipalInactive, None)),
+        ),
+        (ActingPrincipalHeld, Some((C::ServiceUnavailable, Some(5)))),
+        (PrincipalExists, Some((C::PrincipalExists, None))),
+        (InternalKeyRefused, Some((C::InternalKeyRefused, None))),
+        (OwnerRefAmbiguous, None),
+        (BucketAlreadyExists, None),
+        (Conflict, None),
+        (NotFound, None),
+        (RidTaken, None),
+        (Malformed, None),
     ];
-    for r in all {
-        match refusal(r) {
-            Some((code, retry_after)) => {
-                assert_eq!(code.retry_after(), retry_after.is_some(), "{r:?}");
-                assert_ne!(code, velmora_mgmt_types::Code::BadRequest, "{r:?}");
-            }
-            None => assert!(matches!(
-                r,
-                OwnerRefAmbiguous
-                    | Conflict
-                    | BucketAlreadyExists
-                    | NotFound
-                    | Malformed
-                    | RidTaken
-            )),
+    for (r, want) in table {
+        assert_eq!(refusal(r), want, "{r:?}");
+        if let Some((code, retry_after)) = want {
+            assert_eq!(code.retry_after(), retry_after.is_some(), "{r:?}");
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Review round 1: the held phase, the bucket check, the state code
+// ---------------------------------------------------------------------------
+
+/// The directory is down: the record is written and the units hold the
+/// principal closed (AM-9), so the call answers `503`, and so does every
+/// retry, under its own key (`applied` at the unit) or another
+/// (`exists`, held), until the directory acknowledges. Then both answer:
+/// the retry `201`, the other key `200`.
+#[tokio::test(flavor = "current_thread")]
+async fn no_success_while_the_directory_lacks_the_principal() {
+    let u = ready();
+    let w = World::new(&u);
+    w.chain.directory_down.set(true);
+    let a = w.send(CONFIRMED, None, Some(KEY), &signup()).await;
+    expect_code(&a, 503, "service_unavailable", Some(5));
+    // The unit holds it, closed, and its reservation is applied with no
+    // answer.
+    let held: bool = u
+        .sql()
+        .with_conn(|c| {
+            c.query_row(
+                "SELECT held FROM unit_keys WHERE owner_ref = ?1",
+                [NEW_OWNER],
+                |r| r.get(0),
+            )
+        })
+        .unwrap();
+    assert!(held);
+    assert_eq!(reservations(&u), vec![("applied".into(), None)]);
+
+    let retry = w.send(CONFIRMED, None, Some(KEY), &signup()).await;
+    expect_code(&retry, 503, "service_unavailable", Some(5));
+    let other = w.send(CONFIRMED, None, Some("other-key"), &signup()).await;
+    expect_code(&other, 503, "service_unavailable", Some(5));
+    assert_eq!(w.chain.count(NEW_OWNER), 1);
+    assert_eq!(w.chain.creates.get(), 1);
+
+    w.chain.directory_down.set(false);
+    let other = w.send(CONFIRMED, None, Some("other-key"), &signup()).await;
+    assert_eq!(other.status, 200, "{other:?}");
+    let retry = w.send(CONFIRMED, None, Some(KEY), &signup()).await;
+    assert_eq!(retry.status, 201, "{retry:?}");
+    assert_eq!(json_of(&retry), json_of(&other));
     assert_eq!(
-        refusal(ActingPrincipalHeld),
-        Some((velmora_mgmt_types::Code::ServiceUnavailable, Some(5)))
+        unit_principal(&u, NEW_OWNER).map(|p| p.1),
+        Some("active".into())
     );
+    assert_eq!(w.chain.count(NEW_OWNER), 1);
+}
+
+/// A kept answer is sent only once the stores hold the principal open.
+#[tokio::test(flavor = "current_thread")]
+async fn a_kept_answer_waits_for_the_stores() {
+    let u = ready();
+    let w = World::new(&u);
+    let first = w.send(CONFIRMED, None, Some(KEY), &signup()).await;
+    assert_eq!(first.status, 201);
+    w.chain.unreadable.set(true);
+    let retry = w.send(CONFIRMED, None, Some(KEY), &signup()).await;
+    expect_code(&retry, 503, "service_unavailable", Some(5));
+    w.chain.unreadable.set(false);
+    assert_eq!(w.send(CONFIRMED, None, Some(KEY), &signup()).await, first);
+}
+
+/// A bucket deleted after the create never hides the kept answer.
+#[tokio::test(flavor = "current_thread")]
+async fn a_bucket_deleted_since_does_not_hide_the_kept_answer() {
+    let u = ready();
+    let w = World::new(&u);
+    let body = with_grants(json!([{"bucket_id": B1, "access": "rw"}]));
+    let first = w.send(CONFIRMED, Some(OWNER), Some(KEY), &body).await;
+    assert_eq!(first.status, 201, "{first:?}");
+    w.door.buckets.borrow_mut().remove(B1);
+    let retry = w.send(CONFIRMED, Some(OWNER), Some(KEY), &body).await;
+    assert_eq!(retry, first);
+}
+
+/// A refusal after a re-ask leaves the reservation alone: another call
+/// under it may be writing its record. A first ask's refusal gives it
+/// back.
+#[tokio::test(flavor = "current_thread")]
+async fn only_the_call_that_made_a_reservation_gives_it_back() {
+    let u = ready();
+    let w = World::new(&u);
+    w.chain.busy.set(true);
+    let a = w.send(CONFIRMED, None, Some(KEY), &signup()).await;
+    expect_code(&a, 503, "service_unavailable", Some(5));
+    assert_eq!(w.root.releases.get(), 0);
+    w.chain
+        .refuse
+        .set(Some(velmora_mgmt_types::Code::TenantUnavailable));
+    let a = w.send(CONFIRMED, None, Some(KEY), &signup()).await;
+    expect_code(&a, 409, "tenant_unavailable", None);
+    assert_eq!(w.root.releases.get(), 0, "a re-ask never releases");
+    assert_eq!(reservations(&u), vec![("reserved".into(), None)]);
+
+    // A bucket that is not placed, on a first ask: given back.
+    w.chain.acting_holds_b3();
+    let body =
+        json!({"owner_ref": "usr_2", "grants": [{"bucket_id": B3, "access": "ro"}]}).to_string();
+    let a = w.send(CONFIRMED, Some(OWNER), Some("key-2"), &body).await;
+    expect_code(&a, 404, "bucket_not_found", None);
+    assert_eq!(w.root.releases.get(), 1);
+    assert_eq!(reservations(&u).len(), 1);
+}
+
+/// The unit refuses for the tenant's state while the head still says
+/// open: no state code can be told, `503`.
+#[tokio::test(flavor = "current_thread")]
+async fn a_state_refusal_the_head_does_not_explain_answers_503() {
+    let u = ready();
+    let w = World::new(&u);
+    sync(&u, TenantState::Suspended);
+    let a = w.send(CONFIRMED, None, Some(KEY), &signup()).await;
+    expect_code(&a, 503, "service_unavailable", Some(5));
+}
+
+/// A held tenant, and the call's own record exists: the finisher applies
+/// it, `409 idempotency_key_in_use`.
+#[tokio::test(flavor = "current_thread")]
+async fn a_held_tenant_with_the_calls_record_answers_in_use() {
+    let u = ready();
+    let w = World::new(&u);
+    w.chain.crash_after_record.set(true);
+    let a = w.send(CONFIRMED, None, Some(KEY), &signup()).await;
+    expect_code(&a, 503, "service_unavailable", Some(5));
+    sync(&u, TenantState::Suspended);
+    w.door.state.set(Some(DoorState::ReadOnly));
+    let a = w.send(CONFIRMED, None, Some(KEY), &signup()).await;
+    expect_code(&a, 409, "idempotency_key_in_use", Some(30));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_chain_that_cannot_be_read_answers_503() {
+    let u = ready();
+    let w = World::new(&u);
+    w.chain.busy.set(true);
+    assert_eq!(
+        w.send(CONFIRMED, None, Some(KEY), &signup()).await.status,
+        503
+    );
+    // The re-ask must read the chain for its rid: it cannot.
+    w.chain.unreadable.set(true);
+    let a = w.send(CONFIRMED, None, Some(KEY), &signup()).await;
+    expect_code(&a, 503, "service_unavailable", Some(5));
+    assert_eq!(w.chain.creates.get(), 1);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn more_than_64_grants_are_refused() {
+    let u = ready();
+    let w = World::new(&u);
+    let grants: Vec<Value> = (0..65)
+        .map(|i| json!({"bucket_id": format!("b_{i:016x}"), "access": "ro"}))
+        .collect();
+    let a = w
+        .send(
+            CONFIRMED,
+            Some(OWNER),
+            Some(KEY),
+            &with_grants(json!(grants)),
+        )
+        .await;
+    expect_code(&a, 409, "grant_limit_reached", None);
+    assert!(w.root.asks.borrow().is_empty());
 }
