@@ -24,8 +24,8 @@
 //!   and places the bound one's bucket. A call that dies between its put
 //!   and its bind leaves an unbound grant, which is never placed: the
 //!   finisher's `Binding::None` fences its seq before it revokes it, so a
-//!   late bind fails. A bound grant its creator no longer holds is never
-//!   placed either, unless its bucket already is: then that is the answer.
+//!   late bind fails. A bound grant is always placed: a call gives one up
+//!   only by releasing its reservation first.
 //! - **A grant on the id that K derives, held by any other subject before
 //!   the create, is dropped first** (closing records), so the new bucket
 //!   is reachable by its creator alone (A7).
@@ -53,6 +53,12 @@
 //!   grant's put has landed (a put stalled past the 30 s delay) answers
 //!   `NotOne`; if that call then dies before its bind, the unbound grant
 //!   opens nothing and is left until a later finisher run names its seq.
+//!   A call that binds and then dies before `bucket_created` is finished
+//!   by the finisher of its intent (the reservation is open and bound).
+//!   Two calls under one key that overlap a refusal: one releases and
+//!   revokes; a sibling whose `bucket_created` lands just after places a
+//!   bucket its creator no longer holds (exclusive same-key calls at the
+//!   root unit would close this; it needs the unit's reservation lease).
 //!   A retry within the delay after a failed bind counts the unbound grant
 //!   against the 64-grant cap, so a creator at 63 grants may be refused
 //!   `too_many_grants` until the finisher revokes it.
@@ -297,22 +303,24 @@ where
                 }
             }
             Some(BucketPut::Refused { status, code }) => {
-                // When the revoke cannot be written now, the finisher
-                // revokes the grant: its reservation is released, and a
-                // retry never places a bound grant its creator lost.
-                let _ = self
-                    .drop_grant(table, request.creator, bucket.as_str(), rng)
-                    .await;
-                // Answered only once the reservation is released, so no
-                // finisher can make the refused create a bucket later.
-                match self
+                // The reservation goes first: once it is released no retry
+                // or finisher works under it, and only then is the grant
+                // revoked. A release that fails keeps both, and the call
+                // answers 503: a retry or the finisher decides it again.
+                if self
                     .admission
                     .release_bound(self.tenant, idempotency_key, Some(k))
                     .await
+                    .is_err()
                 {
-                    Ok(()) => Placing::Done(BucketAnswer::StateRefused { status, code }),
-                    Err(_) => Placing::Done(BucketAnswer::Unfinished { grant_seq: k }),
+                    return Placing::Done(BucketAnswer::Unfinished { grant_seq: k });
                 }
+                // When the revoke cannot be written now, the finisher
+                // revokes it: no open reservation is bound to it.
+                let _ = self
+                    .drop_grant(table, request.creator, bucket.as_str(), rng)
+                    .await;
+                Placing::Done(BucketAnswer::StateRefused { status, code })
             }
             None => {
                 let _ = self.apply_all(table, revoked).await;
@@ -445,22 +453,11 @@ where
                 if !is_creator_grant(self.tenant, &record) || record.door.id != request.creator {
                     return Err(ERR_BINDING);
                 }
-                let bucket = bucket_id(self.tenant, k);
-                // Placed already: that is the bucket, whatever became of
-                // its grant since.
-                let placed = records.is_placed(self.tenant, &bucket).await?;
-                let held = table
-                    .get(request.creator)
-                    .is_some_and(|e| e.door.grants.iter().any(|g| g.bucket_id == bucket.as_str()));
-                if !placed && !held {
-                    // A bound grant its creator no longer holds (revoked
-                    // after a refusal) is never placed.
-                    if only.is_some() {
-                        return Ok(None);
-                    }
-                    spent.insert(k);
-                    continue;
-                }
+                // It is placed whatever became of its grant since: a grant
+                // dropped after the create was recorded is a later change,
+                // in force on its own (ADR §2.5 step 0, order (b)). A call
+                // that gives the grant up releases the reservation first,
+                // so a bound reservation always means the create goes on.
                 match self
                     .place(records, table, &revoked, idempotency_key, request, k, rng)
                     .await

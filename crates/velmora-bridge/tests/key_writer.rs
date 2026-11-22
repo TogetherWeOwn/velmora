@@ -3953,10 +3953,10 @@ async fn a_created_retry_waits_for_the_tenant_chain_in_force() {
     );
 }
 
-/// A bound grant its creator no longer holds (revoked since) is never
-/// placed: the retry writes a new grant.
+/// A bound grant dropped after the create was recorded is a later change:
+/// the retry places that grant's bucket and writes no second grant.
 #[tokio::test(flavor = "current_thread")]
-async fn a_bound_grant_that_was_revoked_is_never_placed() {
+async fn a_bound_grant_dropped_since_is_still_placed() {
     let w = World::new();
     let adm = FakeAdmission::new(&w.root);
     let mut table = seed(&w, &adm).await;
@@ -3985,12 +3985,13 @@ async fn a_bound_grant_that_was_revoked_is_never_placed() {
             .await
             .unwrap(),
         BucketAnswer::Created {
-            bucket: bucket_id(&w.t, 5),
-            grant_seq: 5,
+            bucket: bucket_id(&w.t, 3),
+            grant_seq: 3,
         }
     );
     assert_eq!(buckets.placed.borrow().len(), 1);
-    assert_eq!(buckets.placed.borrow()[0].3, 5);
+    assert_eq!(buckets.placed.borrow()[0].3, 3);
+    assert_eq!(w.head(), 4, "no second grant");
 }
 
 /// The finisher of an open bound grant runs the create again under its
@@ -4274,11 +4275,43 @@ async fn a_stalled_bind_never_binds_a_grant_the_finisher_revoked() {
         .contains(&bucket.as_str().to_owned()));
 }
 
-/// A refusal whose reservation could not be released answers unfinished,
-/// not the `409`; and the finisher never makes a refused create a bucket:
-/// its grant was dropped, so the finisher revokes and releases.
+/// A refusal releases the reservation before it revokes the grant and
+/// answers the `409`; that create never becomes a bucket, the finisher
+/// revokes. A refusal whose release failed answers `503` and keeps both,
+/// so the create may still finish later, by the finisher.
 #[tokio::test(flavor = "current_thread")]
 async fn a_refused_create_never_becomes_a_bucket_later() {
+    let w = World::new();
+    let adm = FakeAdmission::new(&w.root);
+    let mut table = seed(&w, &adm).await;
+    let units = w.units();
+    let env = env!(w, &adm, &units);
+    let buckets = FakeBuckets::default();
+    let mut rng = TestRng(991);
+    buckets.refuse.set(Some((409, "restoring")));
+    assert_eq!(
+        env.create_bucket(&buckets, &mut table, "ib", &photos("PR0001"), &mut rng)
+            .await
+            .unwrap(),
+        BucketAnswer::StateRefused {
+            status: 409,
+            code: "restoring"
+        }
+    );
+    buckets.refuse.set(None);
+    let mut fin = table.clone();
+    assert!(matches!(
+        finish_creator_grant(&env, &buckets, &mut fin, 3, &mut rng)
+            .await
+            .unwrap(),
+        CreatorGrant::Revoked { .. }
+    ));
+    assert!(buckets.placed.borrow().is_empty());
+    assert_eq!(head_grants(&w, "PR0001").await, vec!["b_01".to_owned()]);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_refusal_whose_release_failed_answers_503_and_may_finish() {
     let w = World::new();
     let adm = FakeAdmission::new(&w.root);
     let mut table = seed(&w, &adm).await;
@@ -4295,17 +4328,20 @@ async fn a_refused_create_never_becomes_a_bucket_later() {
         BucketAnswer::Unfinished { grant_seq: 3 }
     );
     adm.release_down.set(false);
+    assert_eq!(
+        head_grants(&w, "PR0001").await,
+        vec!["b_01".to_owned(), bucket_id(&w.t, 3).as_str().to_owned()],
+        "the grant is kept with its reservation"
+    );
     buckets.refuse.set(None);
     let mut fin = table.clone();
-    assert!(matches!(
+    assert_eq!(
         finish_creator_grant(&env, &buckets, &mut fin, 3, &mut rng)
             .await
             .unwrap(),
-        CreatorGrant::Revoked { .. }
-    ));
-    assert!(buckets.placed.borrow().is_empty());
-    assert!(adm.bucket_open.borrow().is_empty(), "released");
-    assert_eq!(head_grants(&w, "PR0001").await, vec!["b_01".to_owned()]);
+        CreatorGrant::Placed
+    );
+    assert_eq!(buckets.placed.borrow().len(), 1);
 }
 
 /// Releases the reservation inside `bucket_binding`, after answering it:
@@ -4381,4 +4417,97 @@ async fn the_finisher_never_reserves_afresh() {
         adm.bucket_open.borrow().is_empty(),
         "no fresh reservation left"
     );
+}
+
+/// `bucket_created` waits for its gate once (review round 4).
+struct GatedBuckets<'i, 'g> {
+    inner: &'i FakeBuckets,
+    gate: RefCell<Option<&'g Cell<bool>>>,
+}
+
+impl BucketRecords for GatedBuckets<'_, '_> {
+    async fn bucket_created(
+        &self,
+        t: &TenantId,
+        bucket: &BucketId,
+        unit: u32,
+        creator: &str,
+        grant_seq: u64,
+    ) -> Result<BucketPut> {
+        let g = self.gate.borrow_mut().take();
+        if let Some(g) = g {
+            until(g).await;
+        }
+        self.inner
+            .bucket_created(t, bucket, unit, creator, grant_seq)
+            .await
+    }
+    async fn is_placed(&self, t: &TenantId, bucket: &BucketId) -> Result<bool> {
+        self.inner.is_placed(t, bucket).await
+    }
+}
+
+/// (Review round 4.) A call parked in `bucket_created`, an ordinary drop
+/// of its grant, and a retry under the same key: the retry places the
+/// bound grant's bucket, not a second one.
+#[tokio::test(flavor = "current_thread")]
+async fn an_inflight_place_and_a_retry_after_a_drop_place_one_bucket() {
+    let w = World::new();
+    let adm = FakeAdmission::new(&w.root);
+    let mut table_a = seed(&w, &adm).await;
+    let units = w.units();
+    let buckets = FakeBuckets::default();
+    let gate_a = Cell::new(false);
+    let gate_b = Cell::new(false);
+    let gb_a = GatedBuckets {
+        inner: &buckets,
+        gate: RefCell::new(Some(&gate_a)),
+    };
+    let gb_b = GatedBuckets {
+        inner: &buckets,
+        gate: RefCell::new(Some(&gate_b)),
+    };
+    let env = env!(w, &adm, &units);
+    let req = photos("PR0001");
+    let mut rng_a = TestRng(4001);
+    let mut fut_a: BoxFut<'_, _> =
+        Box::pin(env.create_bucket(&gb_a, &mut table_a, "ib", &req, &mut rng_a));
+    assert!(
+        poll_once(&mut fut_a).is_none(),
+        "A parked in bucket_created"
+    );
+    // An ordinary DropGrant of the creator grant on bucket(3).
+    let mut table_c = table(&w);
+    let drop = KeyRequest::DropGrant {
+        id: "PR0001".into(),
+        bucket_id: bucket_id(&w.t, 3).as_str().to_owned(),
+    };
+    let dropped = env
+        .change(&mut table_c, "", &drop, &mut TestRng(4002))
+        .await
+        .unwrap();
+    assert_eq!(dropped, KeyAnswer::Done { seq: 4 });
+    // A retry under the same key, parked in its own bucket_created.
+    let mut table_b = table(&w);
+    let mut rng_b = TestRng(4003);
+    let mut fut_b: BoxFut<'_, _> =
+        Box::pin(env.create_bucket(&gb_b, &mut table_b, "ib", &req, &mut rng_b));
+    let early_b = poll_once(&mut fut_b);
+    gate_a.set(true);
+    let a = fut_a.await.unwrap();
+    gate_b.set(true);
+    let b = match early_b {
+        Some(r) => r.unwrap(),
+        None => fut_b.await.unwrap(),
+    };
+    assert_eq!(
+        buckets.placed.borrow().len(),
+        1,
+        "two buckets for one create"
+    );
+    let three = BucketAnswer::Created {
+        bucket: bucket_id(&w.t, 3),
+        grant_seq: 3,
+    };
+    assert_eq!((a, b), (three.clone(), three));
 }
