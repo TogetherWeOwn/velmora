@@ -550,6 +550,58 @@ pub async fn run_gate<S: RecordStore, C: ControlSeal, Q: Sql, G: GateSteps>(
     now: UnixMs,
 ) -> Result<GateRun> {
     let epoch = close(chain.store, dir, reason, now).await?;
+    run_from(chain, dir, steps, epoch, now).await
+}
+
+/// [`run_gate`] only over a gate that is still closed at `seen`, the
+/// epoch the caller's guard read (`0`: never closed): checked again right
+/// before the closing's anchor is put, so a run whose guard passed while
+/// another run was under way does not close the gate that run opened
+/// (AM-78, the first open). `None`: the gate moved on since; nothing was
+/// written. The check and the put are two calls, so two guards may still
+/// both pass within one round trip: the caller runs one call at a time.
+pub async fn run_gate_closed_at<S: RecordStore, C: ControlSeal, Q: Sql, G: GateSteps>(
+    chain: &TenantChain<'_, S, C>,
+    dir: &SqlDirectory<'_, Q>,
+    steps: &G,
+    reason: &str,
+    now: UnixMs,
+    seen: u64,
+) -> Result<Option<GateRun>> {
+    let (anchored, _) = anchored_epoch(chain.store).await?;
+    let row = dir.gate().await?;
+    if anchored != seen || row.epoch != seen || !row.closed {
+        return Ok(None);
+    }
+    let epoch = seen
+        .checked_add(1)
+        .filter(|&e| e <= MAX_EPOCH)
+        .ok_or(BridgeError::Invalid("gate epoch out of range"))?;
+    let body = serde_json::to_vec(&serde_json::json!({
+        "epoch": epoch,
+        "closed_at": now.0,
+    }))
+    .map_err(|_| BridgeError::Invalid("gate anchor"))?;
+    // Put once: of two runs that saw the same epoch, one closes.
+    if !chain.store.put_if_absent(&anchor_key(epoch), body).await? {
+        return Ok(None);
+    }
+    dir.mark_closed(epoch, reason, now).await?;
+    let row = dir.gate().await?;
+    if !row.closed || row.epoch < epoch {
+        return Err(BridgeError::Invalid("gate row did not take the closing"));
+    }
+    run_from(chain, dir, steps, epoch, now).await.map(Some)
+}
+
+/// The steps of a run that closed the gate at `epoch`.
+async fn run_from<S: RecordStore, C: ControlSeal, Q: Sql, G: GateSteps>(
+    chain: &TenantChain<'_, S, C>,
+    dir: &SqlDirectory<'_, Q>,
+    steps: &G,
+    epoch: u64,
+    now: UnixMs,
+) -> Result<GateRun> {
     let mut run = GateRun {
         epoch,
         tenants: TenantStep::default(),

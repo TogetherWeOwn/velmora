@@ -7,9 +7,12 @@
 //!
 //! - **closing** (the records the directory does not hold close any door,
 //!   [`super::transition::write_order`]): every listed unit, the root unit
-//!   first, then the directory;
+//!   first, then the directory, and the directory only once every unit
+//!   holds the head (so a closing a unit missed stays above the row and
+//!   the next run takes the closing order again);
 //! - **opening**: the directory first, and the units only once the
-//!   directory holds the head.
+//!   directory holds the head. Where the row or the records are not known,
+//!   the head's own record decides, and an opening head waits.
 //!
 //! The directory step copies the head's door into the `tenants` and
 //! `units` rows ([`SqlDirectory::apply_tenant`], idempotent by seq). Before
@@ -42,8 +45,8 @@ use crate::types::{BridgeError, Result, UnixMs};
 
 /// The most records of the chain one run reads for the directory step:
 /// the events of a row that is further behind are appended over the next
-/// runs, and the row is raised to the last record read. Such a run brings
-/// the units up first (the closing order), whatever the records say.
+/// runs, and the row is raised to the last record read. Such a run takes
+/// its order from the records it read and the head's own record.
 pub const MAX_FINISH_RECORDS: u64 = 100;
 
 /// The chain a [`TenantFinisher`] was asked to finish is a key chain.
@@ -82,11 +85,15 @@ pub trait TenantUnits {
 pub enum StoreStep {
     /// The store holds this seq now.
     Holds(u64),
-    /// Not run: an opening whose directory step did not reach the head.
+    /// Not run: the order holds it back. An opening's units wait for the
+    /// directory to hold the head; a closing's directory waits for every
+    /// listed unit to hold it.
     Waiting,
     /// No directory is bound.
     Unbound,
-    /// The unit is not born, and the head is not `provisioning`.
+    /// The unit is not born. Under a `provisioning` head this is expected
+    /// and counts as holding the head; past it, it pages (`unit_unborn`)
+    /// and holds nothing.
     Unborn,
     /// The store failed; the next run tries again.
     Failed,
@@ -198,32 +205,51 @@ where
         }
     }
 
-    // A failed, unbound or unreadable directory, or one too far behind
-    // to read whole, takes the closing order: what closes reaches the
-    // units now.
-    let order = match (&row, readable) {
-        (Row::Seq(_), true) if !far => {
-            let closes = steps.iter().any(|(prev, r)| {
-                write_order(prev.as_ref().map(|p| &p.door), &r.door) == WriteOrder::Closing
-            });
-            match closes {
-                true => WriteOrder::Closing,
-                false => WriteOrder::Opening,
-            }
-        }
-        _ => WriteOrder::Closing,
+    // The order: closing when a record the directory does not hold
+    // closes a door. Where those records are not all known (no row was
+    // read, it is ahead, a record did not read, or the row is further
+    // behind than one run reads), the head's own record decides too
+    // (AM-75: "when the head's record opens"). So an opening never reaches
+    // a unit before the directory holds it; a closing below an opening
+    // head then reaches the units by the lease renewal (ADR §2.4 rule 12,
+    // within T) or a later run.
+    let known = matches!(row, Row::Seq(_)) && readable && !far;
+    let mut closes = steps.iter().any(|(prev, r)| {
+        write_order(prev.as_ref().map(|p| &p.door), &r.door) == WriteOrder::Closing
+    });
+    if !known && !closes {
+        closes = head_closes(chain, &managed, &head, &mut run.pages).await;
+    }
+    let order = match closes {
+        true => WriteOrder::Closing,
+        false => WriteOrder::Opening,
     };
     run.order = Some(order);
+    let provisioning = head.door.lifecycle == Lifecycle::Provisioning;
 
     if order == WriteOrder::Closing {
         bring_units(units, tenant, &head, &mut run).await;
     }
+    // A closing reaches the directory only once every listed unit holds
+    // the head, so a run whose unit step failed leaves the closing record
+    // above the row, and the next run takes the closing order again.
+    let units_hold = run.units.iter().all(|(_, step)| match step {
+        StoreStep::Holds(seq) => *seq >= h,
+        StoreStep::Unborn => provisioning,
+        _ => false,
+    });
     if let (Some(d), Row::Seq(s), true) = (dir, &row, readable) {
-        run.directory = directory_step(d, *s, h, &steps, now, &mut run.events).await;
+        run.directory = match order == WriteOrder::Opening || units_hold {
+            true => directory_step(d, *s, h, &steps, now, &mut run.events).await,
+            false => StoreStep::Waiting,
+        };
     }
     if order == WriteOrder::Opening {
-        match run.directory {
-            StoreStep::Holds(seq) if seq == h => bring_units(units, tenant, &head, &mut run).await,
+        match (dir, run.directory) {
+            (None, _) => bring_units(units, tenant, &head, &mut run).await,
+            (Some(_), StoreStep::Holds(seq)) if seq == h => {
+                bring_units(units, tenant, &head, &mut run).await
+            }
             _ => {
                 run.units = head
                     .door
@@ -236,11 +262,13 @@ where
     }
 
     // Clear what every store holds.
+    // A unit whose born marker is not written holds back the clear: the
+    // rows keep the finisher running until it is.
     if let (Some(d), StoreStep::Holds(held)) = (dir, run.directory) {
-        let provisioning = head.door.lifecycle == Lifecycle::Provisioning;
         let mut floor = Some(held);
-        for (_, step) in &run.units {
+        for (unit, step) in &run.units {
             floor = match (floor, step) {
+                _ if run.born_failed.contains(unit) => None,
                 (Some(f), StoreStep::Holds(seq)) => Some(f.min(*seq)),
                 (Some(f), StoreStep::Unborn) if provisioning => Some(f),
                 _ => None,
@@ -283,6 +311,40 @@ fn chain_error(e: ChainError) -> BridgeError {
         ChainError::KeyNotHeld { .. } => ERR_KEY_NOT_HELD,
         _ => ERR_CHAIN_DAMAGED,
     }
+}
+
+/// Whether the head's own record closes a door against the record before
+/// it (one read). A head in a shred closes. A record before it that does
+/// not read counts as not closing: the units then wait for the directory,
+/// and damage pages.
+async fn head_closes<S: RecordStore, C: ControlSeal>(
+    chain: &TenantChain<'_, S, C>,
+    tenant: &Tenant,
+    head: &ReadRecord,
+    pages: &mut Vec<&'static str>,
+) -> bool {
+    if matches!(
+        head.door.lifecycle,
+        Lifecycle::Shredding | Lifecycle::Shredded
+    ) {
+        return true;
+    }
+    let prev = match head.door.seq {
+        1 => None,
+        seq => match chain.read(tenant, seq - 1).await {
+            Ok(Some(r)) => Some(r),
+            Ok(None) => {
+                pages.push("tenant_record_missing");
+                return false;
+            }
+            Err(ChainError::Store(_)) | Err(ChainError::KeyNotHeld { .. }) => return false,
+            Err(_) => {
+                pages.push("tenant_record_damaged");
+                return false;
+            }
+        },
+    };
+    write_order(prev.as_ref().map(|p| &p.door), &head.door) == WriteOrder::Closing
 }
 
 /// The records `s + 1` to `to`, each with the record before it (`None`
@@ -368,8 +430,14 @@ async fn bring_units<U: TenantUnits>(
                 }
                 StoreStep::Holds(state_seq)
             }
-            Ok(UnitHolds::Unborn) if provisioning => StoreStep::Unborn,
-            Ok(UnitHolds::Unborn) => StoreStep::Unborn,
+            Ok(UnitHolds::Unborn) => {
+                // Past provisioning a listed unit that is not born has lost
+                // its catalogue (or was never made): it pages.
+                if !provisioning {
+                    run.pages.push("unit_unborn");
+                }
+                StoreStep::Unborn
+            }
             Err(_) => StoreStep::Failed,
         };
         run.units.push((unit, step));

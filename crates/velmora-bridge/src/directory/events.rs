@@ -76,7 +76,9 @@ pub fn tenant_events(prev: Option<&ReadRecord>, record: &ReadRecord) -> Vec<NewE
     }
     let mut out: Vec<(&'static str, Map<String, Value>)> = Vec::new();
     match (before.holds.mode(), door.holds.mode()) {
-        (old, Some(mode)) if old != Some(mode) => {
+        // Placed, or made stricter; a hold made less strict while one
+        // stands says nothing.
+        (old, Some(mode)) if old.is_none_or(|o| mode > o) => {
             let mut data = Map::new();
             data.insert("mode".into(), Value::from(hold_mode(mode)));
             out.push(("tenant.suspended", data));

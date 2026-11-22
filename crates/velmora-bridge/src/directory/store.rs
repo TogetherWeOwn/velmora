@@ -569,7 +569,26 @@ impl<S: Sql> SqlDirectory<'_, S> {
             return Ok(RoutePut::Inserted);
         }
         match self.route(&route.akid).await? {
-            Some(old) if old.tenant == route.tenant && old.kind == route.kind => Ok(RoutePut::Same),
+            Some(old) if old.tenant == route.tenant && old.kind == route.kind => {
+                // A route stored while the key's private part did not open
+                // has no `owner_ref`: a later put that knows it fills it in,
+                // once. Nothing else of a route changes.
+                if old.owner_ref.is_none() && route.owner_ref.is_some() {
+                    self.sql
+                        .exec(
+                            "UPDATE key_routes SET owner_ref = ?2 WHERE akid = ?1 AND owner_ref IS NULL \
+                             AND tenant = ?3 AND kind = ?4",
+                            &[
+                                SqlValue::Text(route.akid.clone()),
+                                opt_text(route.owner_ref.as_deref()),
+                                SqlValue::Text(route.tenant.as_str().to_string()),
+                                SqlValue::Text(route.kind.as_str().to_string()),
+                            ],
+                        )
+                        .await?;
+                }
+                Ok(RoutePut::Same)
+            }
             Some(_) => Ok(RoutePut::Conflict),
             None => Ok(RoutePut::NoTenant),
         }

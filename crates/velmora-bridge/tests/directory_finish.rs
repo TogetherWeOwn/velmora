@@ -759,7 +759,7 @@ fn a_row_far_behind_is_raised_in_steps() {
 }
 
 /// A row ahead of its chain is damage: it pages, the directory step does
-/// not run, and the units still get the head.
+/// not run, and the head's own record decides the order.
 #[test]
 fn a_row_ahead_of_the_chain_pages() {
     let db = database();
@@ -777,6 +777,7 @@ fn a_row_ahead_of_the_chain_pages() {
         finish_tenant(&chain, Some(&dir), &units, &tid(A1), NOW)
             .await
             .unwrap();
+        units.take_log();
         // A record that the row holds goes missing from R2.
         assert!(store.lose(&velmora_bridge::directory::chain::record_key(&t(A1), 4)));
         units.head.set(3);
@@ -790,7 +791,10 @@ fn a_row_ahead_of_the_chain_pages() {
             run.pages
         );
         assert_eq!(run.directory, StoreStep::Failed);
-        assert_eq!(run.units, vec![(0, StoreStep::Holds(3))]);
+        // The head's own record (a key commit) opens: the units wait.
+        assert_eq!(run.order, Some(WriteOrder::Opening));
+        assert_eq!(run.units, vec![(0, StoreStep::Waiting)]);
+        assert!(units.take_log().is_empty());
         assert_eq!(row_seq(&db, A1).await, Some(4));
     });
 }
@@ -1029,13 +1033,7 @@ fn target<'a>(
     kek: &'a TestKek,
     ring: &'a OneKey,
 ) -> DirectoryKeys<'a, Db, HookedRecords, TestKek, OneKey> {
-    DirectoryKeys {
-        dir: SqlDirectory { sql: db },
-        tenant,
-        store,
-        kek,
-        ring,
-    }
+    DirectoryKeys::new(SqlDirectory { sql: db }, tenant, store, kek, ring)
 }
 
 /// Brought up by the writer's own feed: one route per access key and app

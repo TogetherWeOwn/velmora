@@ -38,6 +38,8 @@
 //! subject, and `apply` answers `Done` and writes nothing, so AM-9 holds
 //! nothing back.
 
+use std::cell::RefCell;
+
 use super::events::key_events;
 use super::record::Tenant;
 use super::store::{KeyRoute, RouteKind, RoutePut, SqlDirectory};
@@ -91,7 +93,10 @@ pub fn is(e: &BridgeError, of: &BridgeError) -> bool {
 }
 
 /// The directory as one managed tenant's key-chain target. See the
-/// [module](self).
+/// [module](self). Made with [`DirectoryKeys::new`]; after the writer or
+/// the finisher used it, the caller raises an alert for every code
+/// [`DirectoryKeys::take_pages`] answers (the writer keeps only whether a
+/// store acknowledged).
 pub struct DirectoryKeys<'a, Q, S, K, T> {
     pub dir: SqlDirectory<'a, Q>,
     pub tenant: &'a TenantId,
@@ -99,6 +104,45 @@ pub struct DirectoryKeys<'a, Q, S, K, T> {
     pub store: &'a S,
     pub kek: &'a K,
     pub ring: &'a T,
+    pages: RefCell<Vec<&'static str>>,
+}
+
+/// The page code of a route to another tenant or of another kind.
+pub const PAGE_ROUTE_CONFLICT: &str = "directory_route_conflict";
+
+/// The page code of a key id that does not fit its kind.
+pub const PAGE_ROUTE_WRONG_KIND: &str = "directory_route_wrong_kind";
+
+impl<'a, Q, S, K, T> DirectoryKeys<'a, Q, S, K, T> {
+    pub fn new(
+        dir: SqlDirectory<'a, Q>,
+        tenant: &'a TenantId,
+        store: &'a S,
+        kek: &'a K,
+        ring: &'a T,
+    ) -> Self {
+        DirectoryKeys {
+            dir,
+            tenant,
+            store,
+            kek,
+            ring,
+            pages: RefCell::new(Vec::new()),
+        }
+    }
+
+    /// The page codes the applies met since the last call, oldest first,
+    /// each once: fixed codes, with the tenant as the only other fact.
+    pub fn take_pages(&self) -> Vec<&'static str> {
+        std::mem::take(&mut *self.pages.borrow_mut())
+    }
+
+    fn page(&self, code: &'static str) {
+        let mut pages = self.pages.borrow_mut();
+        if !pages.contains(&code) {
+            pages.push(code);
+        }
+    }
 }
 
 impl<Q: Sql, S: RecordStore, K: Kek, T: TkRing> DirectoryKeys<'_, Q, S, K, T> {
@@ -183,8 +227,14 @@ impl<Q: Sql, S: RecordStore, K: Kek, T: TkRing> KeyTarget for DirectoryKeys<'_, 
             match self.dir.put_route(&route).await? {
                 RoutePut::Inserted | RoutePut::Same => {}
                 RoutePut::NoTenant => return Err(ERR_NO_TENANT_ROW),
-                RoutePut::Conflict => return Err(ERR_ROUTE_CONFLICT),
-                RoutePut::WrongKind => return Err(ERR_ROUTE_WRONG_KIND),
+                RoutePut::Conflict => {
+                    self.page(PAGE_ROUTE_CONFLICT);
+                    return Err(ERR_ROUTE_CONFLICT);
+                }
+                RoutePut::WrongKind => {
+                    self.page(PAGE_ROUTE_WRONG_KIND);
+                    return Err(ERR_ROUTE_WRONG_KIND);
+                }
             }
         }
         if !self.dir.raise_keys_seq(&self.row_tenant(), last).await? {
@@ -193,6 +243,7 @@ impl<Q: Sql, S: RecordStore, K: Kek, T: TkRing> KeyTarget for DirectoryKeys<'_, 
             if now < last {
                 return Err(ERR_KEYS_SEQ_NOT_RAISED);
             }
+            return Ok(Applied::Done { keys_seq: now });
         }
         Ok(Applied::Done { keys_seq: last })
     }
