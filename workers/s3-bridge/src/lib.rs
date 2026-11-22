@@ -27,6 +27,7 @@ mod r2;
 /// The put-once store of control records over R2; bound by no
 /// configuration yet.
 pub mod records;
+mod root;
 mod units;
 
 /// The unit's Durable Object class (`docs/units.md`). Exported so that
@@ -245,7 +246,7 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
     let units = units::units(&env);
     let resp = ingress::front(incoming.req, &bridge.cfg, incoming.https, |req| async {
         if let Some(resp) =
-            units::route_request(&bridge, units, admin || internal.get(), &req).await
+            units::route_request(&env, &bridge, units, admin || internal.get(), &req).await
         {
             return resp;
         }
@@ -303,7 +304,7 @@ async fn queue(batch: MessageBatch<serde_json::Value>, env: Env, _ctx: Context) 
         let (scope, job, tenant) = match admission {
             Admission::Run { scope, job, tenant } => (scope, job, tenant),
             Admission::Unit { job, tenant } => {
-                match run_unit_job(&bridge, job, &tenant).await {
+                match run_unit_job(&env, &bridge, job, &tenant).await {
                     Delivery::Ack => msg.ack(),
                     Delivery::Retry { delay_secs } => msg.retry_with_options(
                         &QueueRetryOptionsBuilder::new()
@@ -466,13 +467,25 @@ async fn run_on_unit(
         scope,
         job,
     };
+    // The tenant heads: door parts through the composition root.
+    let ports = match root::WorkerPorts::from_env(env, &bridge.kek) {
+        Ok(ports) => ports,
+        Err(class) => {
+            console_error!("alert: unit job not run ({class}): to the dead-letter queue");
+            return Delivery::Retry {
+                delay_secs: REFUSED_RETRY_DELAY_SECS,
+            };
+        }
+    };
+    let cache = root::cache();
+    let root = velmora_bridge::root::Root::new(&ports, &cache, velmora::rng::SystemRng);
     let (delivery, lines) = velmora_bridge::unit_consumer::deliver(
         bridge.cfg.maintenance,
         &name,
         seqs,
         &run,
         &units::client(),
-        &units::heads(),
+        &root.heads(),
     )
     .await;
     log_unit_lines(&lines);
@@ -482,6 +495,7 @@ async fn run_on_unit(
 /// A unit job (`renew`, `stamp_raise`) of a managed tenant: through the
 /// unit client, never through `run_job`.
 async fn run_unit_job(
+    env: &Env,
     bridge: &env::WorkerBridge,
     job: velmora_bridge::jobmsg::UnitJob,
     tenant: &JobTenant,
@@ -503,13 +517,24 @@ async fn run_unit_job(
         state_seq: tenant.state_seq(),
         keys_seq: tenant.keys_seq(),
     };
+    let ports = match root::WorkerPorts::from_env(env, &bridge.kek) {
+        Ok(ports) => ports,
+        Err(class) => {
+            console_error!("alert: unit job not run ({class}): to the dead-letter queue");
+            return Delivery::Retry {
+                delay_secs: REFUSED_RETRY_DELAY_SECS,
+            };
+        }
+    };
+    let cache = root::cache();
+    let root = velmora_bridge::root::Root::new(&ports, &cache, velmora::rng::SystemRng);
     let (delivery, lines) = velmora_bridge::unit_consumer::deliver_unit_job(
         bridge.cfg.maintenance,
         job,
         &name,
         seqs,
         &units::client(),
-        &units::heads(),
+        &root.heads(),
     )
     .await;
     log_unit_lines(&lines);

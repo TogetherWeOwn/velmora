@@ -36,6 +36,7 @@ pub mod records;
 pub mod recovery;
 pub mod remote;
 pub mod replay;
+pub mod root;
 pub mod service;
 pub mod sql;
 pub mod sql_bind;

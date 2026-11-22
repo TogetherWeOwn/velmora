@@ -423,6 +423,37 @@ pub async fn serve_managed<R: crate::unit_router::UnitRouter>(
     }
 }
 
+/// A request whose claimed key no route names while the directory could
+/// not be read (`unit_router::KeyTenant::Unrouted`, or a failed route
+/// read): ADR §8.4 (DUR-10). A key tenant 0's catalogue holds takes
+/// tenant 0's path (`None`), where its signature is checked as always.
+/// Any other key, and a catalogue that cannot be read, answers `503`
+/// with `Retry-After` before the signature is checked, as tenant 0 does
+/// in a D1 outage: a route may exist that the directory could not show,
+/// so `403 InvalidAccessKeyId` would be a wrong answer.
+pub async fn serve_unrouted<C: crate::ports::Catalog>(
+    catalog: &C,
+    access_key_id: &str,
+) -> Option<(S3Response, ManagedLine)> {
+    match catalog.access_key_exists(access_key_id).await {
+        Ok(true) => None,
+        Ok(false) => Some((
+            common::unit_refused(),
+            ManagedLine {
+                code: "key_route_unreadable",
+                alert: false,
+            },
+        )),
+        Err(_) => Some((
+            common::unit_refused(),
+            ManagedLine {
+                code: "key_route_and_catalogue_unreadable",
+                alert: false,
+            },
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{classify, Route};

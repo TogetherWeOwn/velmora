@@ -174,6 +174,12 @@ pub enum KeyTenant {
     /// 5, §8.4 step 2). Zeros when the route came from the `m/kr/` record
     /// (a failed directory read), which carries none.
     Managed { tenant: TenantId, floor: Seqs },
+    /// No route names the key, and the directory could not be read (the
+    /// route record was the answer): ADR §8.4 (DUR-10). Tenant 0's path
+    /// only for a key tenant 0's catalogue holds; any other key answers
+    /// `503`, not `403 InvalidAccessKeyId`, since a route may exist that
+    /// the directory could not show.
+    Unrouted,
 }
 
 /// An access key id to its tenant: the directory's `key_routes` row, or
