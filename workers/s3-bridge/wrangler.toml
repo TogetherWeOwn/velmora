@@ -165,7 +165,9 @@ RECOVERY_COPY = "off"
 # slot row of it, and gives the rows back only once nothing it handed out
 # is live. Change it in a deploy of its own, with the provider limits and
 # pools unchanged in that deploy. See "Permit gate" in ops/README.md.
-PERMITS = "d1"
+# Production: "do" since deploy 4 of "Shipping the gate"; to undo it,
+# set "d1" again (the gates hand their slot rows back).
+PERMITS = "do"
 # Optional vars and their defaults (production sets POST_SOCKETS and COLD_SOCKETS explicitly):
 #   SLICE_BYTES (8388608, 8 MiB): the slice of a PutObject or UploadPart body above MAX_EXTENT_BYTES; at most MAX_EXTENT_BYTES.
 #   MAX_OBJECT_EXTENTS (10000): most extents one object is made of, 1 to 10000. CompleteMultipartUpload, and an UploadPart
@@ -240,8 +242,8 @@ binding = "SELF"
 service = "velmora-s3"
 
 # The permit gate (src/gate.rs, class PermitGate) is declared and bound
-# here, but this Worker still takes its permits from the catalogue
-# (PERMITS = "d1" above) until PERMITS = "do" ships in a deploy of its own.
+# here, and this Worker takes its permits from it (PERMITS = "do" above,
+# deploy 4 below, shipped in a deploy of its own).
 # Declaring a Durable Object class is a deploy that can never be rolled
 # back past, so the class, its binding and PERMITS = "do" each come in a
 # deploy of their own, in this order (see "Shipping the gate" in
