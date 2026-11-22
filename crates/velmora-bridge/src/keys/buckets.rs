@@ -77,13 +77,14 @@ use velmora::rng::FillRandom;
 
 use super::chain::Put;
 use super::checkpoint::{advance, reopen_closed, reopen_from_checkpoints};
+use super::gate::{decide, ChangeKind, Facts, Gate, MoveGate};
 use super::ports::{
     BucketAdmission, BucketPut, BucketRecords, BucketReservation, ControlChain, ControlIntents,
     KeyAdmission, KeyTarget, Refusal,
 };
 use super::record::{
-    key_chain, open_key_record, seal_key_record, Access, Grant, KeyOp, KeyRecord, KeyTable,
-    SubjectKind, SubjectStatus, TkRing, MAX_SUBJECT_GRANTS,
+    key_chain, open_chain_record, open_key_record, seal_key_record, Access, ChainRecord, Grant,
+    KeyOp, KeyRecord, KeyTable, SubjectKind, SubjectStatus, TkRing, MAX_SUBJECT_GRANTS,
 };
 use super::revocations::list_tenant_revocations;
 use super::writer::{Class, KeyAnswer, KeyEnv, KeyRequest, MAX_PUTS};
@@ -152,6 +153,9 @@ pub enum CreatorGrant {
     /// A step could not be done now (a store, or a private part that does
     /// not open): retry the message.
     Busy,
+    /// `<t>`'s key chain is frozen (AM-28): nothing can be decided until
+    /// the thaw. Done for this message: the grant opens nothing.
+    Frozen,
 }
 
 /// The creator grant on `bucket`: `rw`, the whole bucket, no expiry and
@@ -216,7 +220,7 @@ enum Placing {
     Spent,
 }
 
-impl<S, K, T, A, I, U, D, C> KeyEnv<'_, S, K, T, A, I, U, D, C>
+impl<S, K, T, A, I, U, D, C, G> KeyEnv<'_, S, K, T, A, I, U, D, C, G>
 where
     S: RecordStore,
     K: Kek,
@@ -226,6 +230,7 @@ where
     U: KeyTarget,
     D: KeyTarget,
     C: Clock,
+    G: MoveGate,
 {
     /// Revokes the grant on `bucket` of `subject` with a closing record:
     /// the seq of the record that carries it (the head when it already
@@ -244,7 +249,14 @@ where
         // A closing change: the idempotency key is not used.
         match self.change(table, "", &request, rng).await {
             Ok(KeyAnswer::Done { seq } | KeyAnswer::Unfinished { seq }) => Some(seq),
-            Ok(KeyAnswer::Refused(_) | KeyAnswer::Busy) | Err(_) => None,
+            Ok(
+                KeyAnswer::Refused(_)
+                | KeyAnswer::Busy
+                | KeyAnswer::KeyMoved
+                | KeyAnswer::RevokedOffChain
+                | KeyAnswer::Frozen,
+            )
+            | Err(_) => None,
         }
     }
 
@@ -413,6 +425,9 @@ where
         let mut puts = 0;
         let mut caught_up = false;
         let mut caught_up_in_full = false;
+        let Ok(zero) = self.gate.zero_head().await else {
+            return Ok(Some(BucketAnswer::Busy));
+        };
         while puts < MAX_PUTS {
             let revoked: BTreeSet<String> = list_tenant_revocations(self.store, self.tenant)
                 .await?
@@ -421,6 +436,29 @@ where
             advance(self.store, self.kek, self.ring, &chain, table).await?;
             reopen_closed(self.store, self.kek, self.ring, &chain, table).await?;
             let _ = reopen_from_checkpoints(self.store, self.kek, self.ring, table).await;
+            // The move rules (AM-28, AM-31), against this head: a frozen
+            // chain, or a tenant whose keys are tenant 0's or being moved,
+            // takes no creator grant.
+            let rules = decide(&Facts {
+                tenant: self.tenant,
+                zero: &zero,
+                frozen: table.frozen_at().is_some(),
+                kind: ChangeKind::Create,
+                key_held: false,
+                routed_here: None,
+            });
+            match rules {
+                Gate::Go => {}
+                Gate::KeyMoved { .. } => {
+                    return Ok(Some(BucketAnswer::StateRefused {
+                        status: 409,
+                        code: "key_moved",
+                    }))
+                }
+                Gate::ZeroRevoke | Gate::FrozenRevoke | Gate::Unavailable => {
+                    return Ok(Some(BucketAnswer::Busy))
+                }
+            }
 
             // Reservation first: a retry of a create is answered from it,
             // whatever the creator's state is now.
@@ -590,6 +628,7 @@ where
                 &next.door,
                 Some(&next.private),
                 false,
+                table.frozen_at(),
                 rng,
             )?;
             match chain.put(self.store, k, bytes.clone()).await? {
@@ -676,8 +715,8 @@ where
 ///   released.
 /// - No open reservation is bound to it: the answer fences the seq, and
 ///   the grant, an orphan for good, is revoked.
-pub async fn finish_creator_grant<S, K, T, A, I, U, D, C, B, R>(
-    env: &KeyEnv<'_, S, K, T, A, I, U, D, C>,
+pub async fn finish_creator_grant<S, K, T, A, I, U, D, C, G, B, R>(
+    env: &KeyEnv<'_, S, K, T, A, I, U, D, C, G>,
     records: &B,
     table: &mut KeyTable,
     seq: u64,
@@ -692,6 +731,7 @@ where
     U: KeyTarget,
     D: KeyTarget,
     C: Clock,
+    G: MoveGate,
     B: BucketRecords,
     R: FillRandom,
 {
@@ -701,9 +741,20 @@ where
     let Some(bytes) = env.store.get(&chain.name(seq)).await? else {
         return Ok(CreatorGrant::NotOne);
     };
-    let record = open_key_record(env.kek, env.ring, env.tenant, seq, &bytes)?;
+    let record = match open_chain_record(env.kek, env.ring, env.tenant, seq, &bytes)? {
+        ChainRecord::Key(record) => record,
+        ChainRecord::Marker(_) => return Ok(CreatorGrant::NotOne),
+    };
     if !is_creator_grant(env.tenant, &record) {
         return Ok(CreatorGrant::NotOne);
+    }
+    // A frozen chain takes no record (AM-28): the grant's bucket is not
+    // placed, so it opens nothing, and the undo's D1 build carries no
+    // principal. The grant is decided again after the thaw, by the
+    // finisher of a later intent.
+    advance(env.store, env.kek, env.ring, &chain, table).await?;
+    if table.frozen_at().is_some() {
+        return Ok(CreatorGrant::Frozen);
     }
     let bucket = bucket_id(env.tenant, seq);
     let creator = record.door.id.as_str();

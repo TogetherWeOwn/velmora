@@ -33,6 +33,8 @@ pub mod buckets;
 pub mod chain;
 pub mod checkpoint;
 pub mod escrow;
+pub mod frozen;
+pub mod gate;
 pub mod locations;
 pub mod moving;
 pub mod ports;

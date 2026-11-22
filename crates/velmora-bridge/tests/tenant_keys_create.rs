@@ -561,6 +561,7 @@ async fn an_escrow_copy_restores_a_tenant_after_both_key_buckets_lost_its_key() 
         &door,
         Some(&private),
         false,
+        None,
         &mut rng,
     )
     .unwrap();

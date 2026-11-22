@@ -62,6 +62,7 @@ use super::checkpoint::{
     advance, checkpoint_holds, checkpoint_name, read_key_chain, reopen_closed,
     reopen_from_checkpoints, seal_checkpoint, CHECKPOINT_EVERY,
 };
+use super::gate::{decide, needs_route, ChangeKind, Facts, Gate, MoveGate, ZeroHead};
 use super::ports::{
     Admission, ControlChain, ControlIntents, KeyAdmission, KeyTarget, OpeningChange, Refusal,
 };
@@ -70,7 +71,7 @@ use super::record::{
     Subject, SubjectDoor, SubjectPrivate, SubjectStatus, TkRing,
 };
 use super::revocations::{list_tenant_revocations, put_tenant_revocation};
-use super::routes::{put_route, RoutePut};
+use super::routes::{put_route, read_route, RoutePut};
 use crate::crypto::scheme2::{unwrap_secret_v2, TenantId};
 use crate::ports::{Clock, Kek};
 use crate::records::RecordStore;
@@ -118,6 +119,18 @@ pub enum KeyAnswer {
     /// The record `seq` is written, but a door store did not acknowledge:
     /// `503`. The change takes effect within the bound of the finishers.
     Unfinished { seq: u64 },
+    /// `409 key_moved`: the key is tenant 0's for now (AM-20, AM-28,
+    /// AM-31). Nothing was put, but an existing `m/rk/<t>/<akid>` of the
+    /// key was applied to D1 first.
+    KeyMoved,
+    /// `200`: a revoke in force with no key-chain record: its `m/rk/` is
+    /// stored and D1 refuses the key (tenant 0's path after an undo,
+    /// AM-54 LOW 3; or the self-apply of a frozen chain, AM-28).
+    RevokedOffChain,
+    /// `503` with `Retry-After`: `<t>`'s key chain is frozen (AM-28). For
+    /// a revoke, its `m/rk/<t>/<akid>` is stored and wins in every store;
+    /// only its chain record is refused.
+    Frozen,
 }
 
 /// Which grant limits a writer records.
@@ -154,7 +167,7 @@ fn adds_limits(new: &[Grant], current: &[Grant]) -> bool {
 }
 
 /// Everything a key change talks to.
-pub struct KeyEnv<'a, S, K, T, A, I, U, D, C> {
+pub struct KeyEnv<'a, S, K, T, A, I, U, D, C, G> {
     pub store: &'a S,
     pub kek: &'a K,
     pub ring: &'a T,
@@ -167,6 +180,9 @@ pub struct KeyEnv<'a, S, K, T, A, I, U, D, C> {
     pub clock: &'a C,
     /// The Worker sets [`Limits::NotServed`] in milestone 1.
     pub limits: Limits,
+    /// Tenant 0's head and the tenant head, read for every change
+    /// ([`super::gate`]).
+    pub gate: &'a G,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -500,7 +516,7 @@ async fn bring_up<U: KeyTarget>(
 #[derive(Clone, Copy)]
 pub(super) struct Acks {
     /// Every unit holds the head, with what does not close held closed.
-    closed: bool,
+    pub(super) closed: bool,
     /// The directory holds the head.
     directory: bool,
     /// Every unit holds the head in full (only after the directory).
@@ -551,7 +567,7 @@ async fn lost_subjects<S: RecordStore, K: Kek, T: TkRing>(
         .collect()
 }
 
-impl<S, K, T, A, I, U, D, C> KeyEnv<'_, S, K, T, A, I, U, D, C>
+impl<S, K, T, A, I, U, D, C, G> KeyEnv<'_, S, K, T, A, I, U, D, C, G>
 where
     S: RecordStore,
     K: Kek,
@@ -561,6 +577,7 @@ where
     U: KeyTarget,
     D: KeyTarget,
     C: Clock,
+    G: MoveGate,
 {
     pub(super) fn now(&self) -> u64 {
         u64::try_from(self.clock.now().0).unwrap_or(0)
@@ -626,6 +643,10 @@ where
         rng: &mut R,
     ) -> Result<KeyAnswer> {
         let chain = key_chain(self.tenant);
+        // Tenant 0's head first (AM-28): it decides where a revoke goes.
+        let Ok(zero) = self.gate.zero_head().await else {
+            return Ok(KeyAnswer::Busy);
+        };
         let mut puts = 0;
         let mut caught_up = false;
         let mut caught_up_in_full = false;
@@ -641,6 +662,39 @@ where
             reopen_closed(self.store, self.kek, self.ring, &chain, table).await?;
             // Best effort: a closing change never waits on a checkpoint.
             let _ = reopen_from_checkpoints(self.store, self.kek, self.ring, table).await;
+            // The move rules, against this head: a writer that lost its
+            // put reads the head again and checks again, so no record from
+            // before a freeze lands above it.
+            match self.move_rules(&zero, table, request).await {
+                Gate::Go => {}
+                Gate::KeyMoved { pre_apply } => {
+                    let id = subject_of(request);
+                    if pre_apply
+                        && revoked.contains(id)
+                        && self.gate.refuse_in_d1(id).await.is_err()
+                    {
+                        return Ok(KeyAnswer::Busy);
+                    }
+                    return Ok(KeyAnswer::KeyMoved);
+                }
+                Gate::ZeroRevoke => {
+                    return Ok(match self.gate.zero_revoke(subject_of(request)).await {
+                        Ok(()) => KeyAnswer::RevokedOffChain,
+                        Err(_) => KeyAnswer::Busy,
+                    })
+                }
+                Gate::FrozenRevoke => {
+                    return self
+                        .frozen_revoke(table, &mut revoked, subject_of(request), rng)
+                        .await
+                }
+                Gate::Unavailable => {
+                    return Ok(match table.frozen_at() {
+                        Some(_) => KeyAnswer::Frozen,
+                        None => KeyAnswer::Busy,
+                    })
+                }
+            }
             let plan = match plan(self.kek, table, &revoked, request, self.limits) {
                 Planned::Refused(r) => return Ok(KeyAnswer::Refused(r)),
                 Planned::Busy => return Ok(KeyAnswer::Busy),
@@ -755,6 +809,7 @@ where
                 &plan.door,
                 plan.private.as_ref(),
                 plan.closes(),
+                table.frozen_at(),
                 rng,
             )?;
             match chain.put(self.store, seq, bytes.clone()).await? {
@@ -771,6 +826,98 @@ where
             return Ok(self.answer(plan.class, table, seq, acks).await);
         }
         Ok(KeyAnswer::Busy)
+    }
+}
+
+impl<S, K, T, A, I, U, D, C, G> KeyEnv<'_, S, K, T, A, I, U, D, C, G>
+where
+    S: RecordStore,
+    K: Kek,
+    T: TkRing,
+    A: KeyAdmission,
+    I: ControlIntents,
+    U: KeyTarget,
+    D: KeyTarget,
+    C: Clock,
+    G: MoveGate,
+{
+    /// The move rules for `request` at `table`'s head ([`super::gate`]).
+    async fn move_rules(&self, zero: &ZeroHead, table: &KeyTable, request: &KeyRequest) -> Gate {
+        let kind = change_kind(request);
+        let id = subject_of(request);
+        let key_held =
+            kind != ChangeKind::Create && table.get(id).is_some_and(|e| e.door.kind.has_secret());
+        // A missing or unverifiable route is not this tenant's (AM-31).
+        let routed_here = match needs_route(zero, kind, key_held) {
+            false => None,
+            true => Some(matches!(
+                read_route(self.store, self.kek, id).await,
+                Ok(Some(r)) if r.tenant == self.tenant.as_str()
+            )),
+        };
+        decide(&Facts {
+            tenant: self.tenant,
+            zero,
+            frozen: table.frozen_at().is_some(),
+            kind,
+            key_held,
+            routed_here,
+        })
+    }
+
+    /// A revoke on a frozen chain (AM-28): `m/rk/<t>/<akid>` is put (a
+    /// revocation always wins), the chain record is refused, and tenant
+    /// 0's head is read again. If it has become `d1` (after the undo, or a
+    /// give-up), D1 is the store that serves the key: the revocation is
+    /// applied to it here, and the answer is `200` once D1 refuses the
+    /// key. Otherwise `503`; the stores get the revocation from its
+    /// `m/rk/`, and the finisher records it after the thaw.
+    async fn frozen_revoke<R: FillRandom>(
+        &self,
+        table: &KeyTable,
+        revoked: &mut BTreeSet<String>,
+        id: &str,
+        rng: &mut R,
+    ) -> Result<KeyAnswer> {
+        if table.get(id).is_none() {
+            return Ok(KeyAnswer::Refused(Refusal::NotFound));
+        }
+        put_tenant_revocation(self.store, self.kek, self.tenant, id, self.now(), rng).await?;
+        revoked.insert(id.to_owned());
+        // Best effort: a unit that still holds the key closes it by the
+        // override.
+        let _ = self.apply_all(table, revoked).await;
+        let to_d1 = match self.gate.zero_head().await {
+            Ok(ZeroHead::Undone { to }) => to == *self.tenant,
+            Ok(ZeroHead::D1) => true,
+            _ => false,
+        };
+        if to_d1 && self.gate.refuse_in_d1(id).await.is_ok() {
+            return Ok(KeyAnswer::RevokedOffChain);
+        }
+        Ok(KeyAnswer::Frozen)
+    }
+}
+
+/// The subject a request names.
+fn subject_of(request: &KeyRequest) -> &str {
+    match request {
+        KeyRequest::Create(s) => &s.door.id,
+        KeyRequest::SetStatus { id, .. }
+        | KeyRequest::SetGrants { id, .. }
+        | KeyRequest::DropGrant { id, .. } => id,
+    }
+}
+
+/// The gate's class of a request.
+fn change_kind(request: &KeyRequest) -> ChangeKind {
+    match request {
+        KeyRequest::Create(_) => ChangeKind::Create,
+        KeyRequest::SetStatus {
+            status: SubjectStatus::Revoked,
+            ..
+        } => ChangeKind::Revoke,
+        _ => ChangeKind::Other,
     }
 }
 
@@ -819,6 +966,10 @@ pub struct FinishReport {
     /// part (a revoked one stays revoked), not retried, so their pending
     /// rows clear; one page each.
     pub gone: Vec<String>,
+    /// The head carries the undo's freeze (AM-28): no record was
+    /// appended; an `m/rk/` revocation without its chain record counts as
+    /// done, and the `pending_ops` rows are cleared.
+    pub frozen: bool,
 }
 
 impl FinishReport {
@@ -835,8 +986,8 @@ impl FinishReport {
 /// does not open: the record keeps the one before). `Some(Some(seq))`:
 /// written at `seq`; `Some(None)`: the head already carries it (or a
 /// revoke, or no such subject); `None`: it could not be written.
-async fn append_status<S, K, T, A, I, U, D, C, R>(
-    env: &KeyEnv<'_, S, K, T, A, I, U, D, C>,
+async fn append_status<S, K, T, A, I, U, D, C, G, R>(
+    env: &KeyEnv<'_, S, K, T, A, I, U, D, C, G>,
     table: &mut KeyTable,
     id: &str,
     status: SubjectStatus,
@@ -852,6 +1003,7 @@ where
     U: KeyTarget,
     D: KeyTarget,
     C: Clock,
+    G: MoveGate,
     R: FillRandom,
 {
     let chain = key_chain(env.tenant);
@@ -859,6 +1011,12 @@ where
         advance(env.store, env.kek, env.ring, &chain, table)
             .await
             .ok()?;
+        // A frozen head takes no record (AM-28): a revocation is done by
+        // its `m/rk/`, which every store applies; a gone version's subject
+        // stays closed, so disabled, until the thaw.
+        if table.frozen_at().is_some() {
+            return Some(None);
+        }
         let entry = match table.get(id) {
             None => return Some(None),
             Some(e) if e.door.status == SubjectStatus::Revoked || e.door.status == status => {
@@ -892,6 +1050,7 @@ where
             &door,
             private.as_ref(),
             true,
+            None,
             rng,
         )
         .ok()?;
@@ -913,8 +1072,8 @@ where
 /// catch-up and the pending sweep all call it. An `Err` (the chain could
 /// not be read), or a report that asks for a retry, makes the queue
 /// retry.
-pub async fn finish_keys<S, K, T, A, I, U, D, C, R>(
-    env: &KeyEnv<'_, S, K, T, A, I, U, D, C>,
+pub async fn finish_keys<S, K, T, A, I, U, D, C, G, R>(
+    env: &KeyEnv<'_, S, K, T, A, I, U, D, C, G>,
     rng: &mut R,
 ) -> Result<FinishReport>
 where
@@ -926,6 +1085,7 @@ where
     U: KeyTarget,
     D: KeyTarget,
     C: Clock,
+    G: MoveGate,
     R: FillRandom,
 {
     let chain = key_chain(env.tenant);
@@ -1039,6 +1199,7 @@ where
     }
 
     report.head = table.seq();
+    report.frozen = table.frozen_at().is_some();
     // Gone: decided above, and still closed with the same private part
     // under a gone version (a disable record keeps both). A record that
     // landed since makes it an ordinary closed subject, retried.

@@ -29,10 +29,10 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use velmora::rng::FillRandom;
 
-use super::chain::{parse_seq, seq_name, Chain, LIST_PAGE};
+use super::chain::{parse_seq, seq_name, Chain, ERR_CHAIN_BEHIND, LIST_PAGE};
 use super::record::{
-    key_chain, open_key_record, Entry, KeyRecord, KeyTable, SubjectDoor, SubjectPrivate,
-    SubjectStatus, TkRing,
+    key_chain, open_chain_record, open_key_record, ChainRecord, Entry, KeyTable, SubjectDoor,
+    SubjectPrivate, SubjectStatus, TkRing,
 };
 use super::revocations::list_tenant_revocations;
 use crate::crypto::scheme2::{
@@ -67,6 +67,9 @@ struct CheckpointDoor {
     /// SHA-256 of the chain record at `seq`, lowercase hex.
     record_sha256: String,
     subjects: Vec<DoorEntry>,
+    /// The table's freeze at `seq` (AM-28).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    frozen_at: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -130,6 +133,7 @@ pub fn seal_checkpoint<K: Kek, T: TkRing, R: FillRandom>(
                 open: e.private.is_some(),
             })
             .collect(),
+        frozen_at: table.frozen_at(),
     };
     let private = CheckpointPrivate {
         v: CHECKPOINT_VERSION,
@@ -176,7 +180,8 @@ pub fn open_checkpoint<K: Kek, T: TkRing>(
     let fits = door.v == CHECKPOINT_VERSION
         && door.tenant == tenant.as_str()
         && door.seq == seq
-        && door.record_sha256 == hex(&Sha256::digest(record));
+        && door.record_sha256 == hex(&Sha256::digest(record))
+        && door.frozen_at.is_none_or(|f| f < seq);
     let PrivateKeyRef::Tenant(version) = opened.private_key() else {
         return None;
     };
@@ -229,7 +234,12 @@ pub fn open_checkpoint<K: Kek, T: TkRing>(
     if !privates.is_empty() {
         return None;
     }
-    Some(KeyTable::from_parts(tenant.clone(), seq, subjects))
+    Some(KeyTable::from_parts(
+        tenant.clone(),
+        seq,
+        subjects,
+        door.frozen_at,
+    ))
 }
 
 /// The seqs of `tenant`'s checkpoints, oldest first.
@@ -308,8 +318,23 @@ pub async fn read_key_chain<S: RecordStore, K: Kek, T: TkRing>(
     ring: &T,
     tenant: &TenantId,
 ) -> Result<KeyRead> {
+    read_key_chain_to(store, kek, ring, tenant, u64::MAX).await
+}
+
+/// [`read_key_chain`] up to `upto` and never further: from the newest
+/// checkpoint at or below it. A chain whose head is below `upto` (and
+/// `upto` is not `u64::MAX`) is behind: [`ERR_CHAIN_BEHIND`]. The undo's
+/// D1 build reads `<t>`'s chain to `K_u` this way (AM-28).
+pub async fn read_key_chain_to<S: RecordStore, K: Kek, T: TkRing>(
+    store: &S,
+    kek: &K,
+    ring: &T,
+    tenant: &TenantId,
+    upto: u64,
+) -> Result<KeyRead> {
     let chain = key_chain(tenant);
-    let checkpoints = list_checkpoints(store, tenant).await?;
+    let mut checkpoints = list_checkpoints(store, tenant).await?;
+    checkpoints.retain(|s| *s <= upto);
     let mut skipped = Vec::new();
     // Candidates, newest first, then the start of the chain.
     let mut candidates: Vec<Option<u64>> = checkpoints.iter().rev().map(|s| Some(*s)).collect();
@@ -339,8 +364,11 @@ pub async fn read_key_chain<S: RecordStore, K: Kek, T: TkRing>(
             }
         };
         reopen_closed(store, kek, ring, &chain, &mut table).await?;
-        match advance(store, kek, ring, &chain, &mut table).await {
+        match advance_to(store, kek, ring, &chain, &mut table, upto).await {
             Ok(_) => {
+                if upto != u64::MAX && table.seq() < upto {
+                    return Err(ERR_CHAIN_BEHIND);
+                }
                 if let Some(seq) = candidate {
                     reopen_from_older(store, kek, ring, tenant, &checkpoints, seq, &mut table)
                         .await?;
@@ -545,13 +573,26 @@ pub async fn advance<S: RecordStore, K: Kek, T: TkRing>(
     ring: &T,
     chain: &Chain,
     table: &mut KeyTable,
-) -> Result<Vec<KeyRecord>> {
-    let head = chain.head(store, table.seq()).await?;
+) -> Result<Vec<ChainRecord>> {
+    advance_to(store, kek, ring, chain, table, u64::MAX).await
+}
+
+/// Brings `table` up to `upto`, never further: to the head when the
+/// head is lower. Returns the records it folded in.
+pub async fn advance_to<S: RecordStore, K: Kek, T: TkRing>(
+    store: &S,
+    kek: &K,
+    ring: &T,
+    chain: &Chain,
+    table: &mut KeyTable,
+    upto: u64,
+) -> Result<Vec<ChainRecord>> {
+    let head = chain.head(store, table.seq()).await?.min(upto);
     let mut folded = Vec::new();
     for seq in table.seq() + 1..=head {
         let bytes = chain.get(store, seq).await?;
-        let record = open_key_record(kek, ring, table.tenant(), seq, &bytes)?;
-        table.apply(&record)?;
+        let record = open_chain_record(kek, ring, table.tenant(), seq, &bytes)?;
+        table.apply_chain(&record)?;
         folded.push(record);
     }
     Ok(folded)

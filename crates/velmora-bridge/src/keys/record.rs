@@ -49,6 +49,10 @@ pub const ERR_KEY_RECORD: BridgeError = BridgeError::Invalid("key record is malf
 /// valid writes nothing.
 pub const ERR_KEY_TRANSITION: BridgeError =
     BridgeError::Invalid("key change is not valid at the chain head");
+/// The record at a seq is a marker ([`Marker`]), not a change to a
+/// subject: a caller that needs a subject's record at that seq has the
+/// wrong seq.
+pub const ERR_KEY_MARKER: BridgeError = BridgeError::Invalid("key record is a marker");
 
 /// The key chain of `tenant`.
 pub fn key_chain(tenant: &TenantId) -> Chain {
@@ -347,6 +351,11 @@ pub struct KeyRecord {
     /// the one it had before (a closing status change whose writer could
     /// not open it).
     pub private_unchanged: bool,
+    /// The freeze in force at the head this record was written on (AM-28):
+    /// `K_u` of the newest `KeysFrozen` not yet ended by a `KeysThawed`.
+    /// A record must carry exactly the head's, so no record written
+    /// before a freeze lands above it unnoticed.
+    pub frozen_at: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -360,6 +369,68 @@ struct DoorBody {
     subject: SubjectDoor,
     closes: bool,
     private_unchanged: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    frozen_at: Option<u64>,
+}
+
+/// A record of the key chain that changes no subject (AM-28, AM-54).
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Marker {
+    /// The undo's key freeze. `K_u` is this record's seq − 1, and this
+    /// record and every later one carry `frozen_at = K_u` until a
+    /// [`Marker::KeysThawed`] ends it. Only on a head without a freeze.
+    KeysFrozen,
+    /// Ends the freeze at `ends` (= its `K_u`). Only on a head whose
+    /// `frozen_at` is `ends`; it and every later record carry none.
+    KeysThawed { ends: u64 },
+}
+
+/// A marker record, opened.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MarkerRecord {
+    pub seq: u64,
+    /// Unix ms the writer recorded it.
+    pub at: u64,
+    pub marker: Marker,
+    /// `Some(seq − 1)` on `KeysFrozen`, `None` on `KeysThawed`.
+    pub frozen_at: Option<u64>,
+}
+
+/// One record of the key chain: a change to a subject, or a marker.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ChainRecord {
+    Key(KeyRecord),
+    Marker(MarkerRecord),
+}
+
+impl ChainRecord {
+    pub fn seq(&self) -> u64 {
+        match self {
+            ChainRecord::Key(r) => r.seq,
+            ChainRecord::Marker(m) => m.seq,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MarkerBody {
+    v: u32,
+    tenant: String,
+    seq: u64,
+    at: u64,
+    marker: Marker,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    frozen_at: Option<u64>,
+}
+
+/// Whether a marker's `frozen_at` is the one its kind must carry.
+fn marker_fits(m: &MarkerBody) -> bool {
+    match m.marker {
+        Marker::KeysFrozen => m.seq >= 1 && m.frozen_at == Some(m.seq - 1),
+        Marker::KeysThawed { ends } => m.frozen_at.is_none() && ends < m.seq,
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -425,7 +496,9 @@ impl TkRing for NoKeys {
 /// writer could not open the subject's private part: the record then
 /// carries none and says so ([`KeyRecord::private_unchanged`]), and a
 /// reader keeps the private part the subject had before. `closes` is the
-/// writer's class of the change.
+/// writer's class of the change. `frozen_at` is the head's
+/// ([`KeyTable::frozen_at`]): a record that carries another one breaks
+/// the chain.
 #[allow(clippy::too_many_arguments)]
 pub fn seal_key_record<K: Kek, T: TkRing, R: FillRandom>(
     kek: &K,
@@ -437,8 +510,12 @@ pub fn seal_key_record<K: Kek, T: TkRing, R: FillRandom>(
     door: &SubjectDoor,
     private: Option<&SubjectPrivate>,
     closes: bool,
+    frozen_at: Option<u64>,
     rng: &mut R,
 ) -> Result<Vec<u8>> {
+    if frozen_at.is_some_and(|f| f >= seq) {
+        return Err(ERR_KEY_RECORD);
+    }
     check_subject(tenant, door, private)?;
     let closing_status = op == KeyOp::Status && door.status != SubjectStatus::Active && closes;
     if (private.is_none() && !closing_status) || !closes_fits(op, door.status, closes) {
@@ -456,6 +533,7 @@ pub fn seal_key_record<K: Kek, T: TkRing, R: FillRandom>(
         subject: door.clone(),
         closes,
         private_unchanged: private.is_none(),
+        frozen_at,
     })
     .map_err(|_| ERR_KEY_RECORD)?;
     let private_body = zeroize::Zeroizing::new(
@@ -477,24 +555,90 @@ pub fn seal_key_record<K: Kek, T: TkRing, R: FillRandom>(
     )
 }
 
-/// Opens the record stored at `seq` of `tenant`'s key chain. An error
-/// means the door part does not open or breaks a rule: the reader stops.
-pub fn open_key_record<K: Kek, T: TkRing>(
+/// Seals the marker `marker` at `seq` (AM-28): door part only in
+/// substance, with an empty private part under the ring's current key
+/// version (every record of a managed tenant has one).
+pub fn seal_marker_record<K: Kek, T: TkRing, R: FillRandom>(
+    kek: &K,
+    ring: &T,
+    tenant: &TenantId,
+    seq: u64,
+    at: u64,
+    marker: Marker,
+    rng: &mut R,
+) -> Result<Vec<u8>> {
+    let body = MarkerBody {
+        v: KEY_RECORD_VERSION,
+        tenant: tenant.as_str().to_owned(),
+        seq,
+        at,
+        marker,
+        frozen_at: match marker {
+            Marker::KeysFrozen => Some(seq.checked_sub(1).ok_or(ERR_KEY_RECORD)?),
+            Marker::KeysThawed { .. } => None,
+        },
+    };
+    if !marker_fits(&body) {
+        return Err(ERR_KEY_RECORD);
+    }
+    let tk = ring
+        .current()
+        .ok_or(BridgeError::Crypto("tenant key unavailable"))?;
+    let door = serde_json::to_vec(&body).map_err(|_| ERR_KEY_RECORD)?;
+    let name = key_chain(tenant).name(seq);
+    seal_control(
+        kek,
+        &name,
+        &ControlSealer::Managed(tk),
+        &door,
+        Some(&[]),
+        rng,
+    )
+}
+
+/// Opens the record stored at `seq` of `tenant`'s key chain, a subject's
+/// or a marker. An error means the door part does not open or breaks a
+/// rule: the reader stops.
+pub fn open_chain_record<K: Kek, T: TkRing>(
     kek: &K,
     ring: &T,
     tenant: &TenantId,
     seq: u64,
     bytes: &[u8],
-) -> Result<KeyRecord> {
+) -> Result<ChainRecord> {
     let name = key_chain(tenant).name(seq);
     let opened = parse_control(bytes)?.open_door(kek, &name, ControlOwner::Managed(tenant))?;
-    let door: DoorBody = serde_json::from_slice(opened.door()).map_err(|_| ERR_KEY_RECORD)?;
-    if door.v != KEY_RECORD_VERSION || door.tenant != tenant.as_str() || door.seq != seq {
-        return Err(ERR_KEY_RECORD);
-    }
     let PrivateKeyRef::Tenant(tk_version) = opened.private_key() else {
         return Err(ERR_KEY_RECORD);
     };
+    let door: DoorBody = match serde_json::from_slice(opened.door()) {
+        Ok(door) => door,
+        // Not a subject's record: a marker, or nothing this code wrote.
+        Err(_) => {
+            let m: MarkerBody =
+                serde_json::from_slice(opened.door()).map_err(|_| ERR_KEY_RECORD)?;
+            if m.v != KEY_RECORD_VERSION
+                || m.tenant != tenant.as_str()
+                || m.seq != seq
+                || !marker_fits(&m)
+            {
+                return Err(ERR_KEY_RECORD);
+            }
+            return Ok(ChainRecord::Marker(MarkerRecord {
+                seq,
+                at: m.at,
+                marker: m.marker,
+                frozen_at: m.frozen_at,
+            }));
+        }
+    };
+    if door.v != KEY_RECORD_VERSION
+        || door.tenant != tenant.as_str()
+        || door.seq != seq
+        || door.frozen_at.is_some_and(|f| f >= seq)
+    {
+        return Err(ERR_KEY_RECORD);
+    }
     check_subject(tenant, &door.subject, None)?;
     // A private part that does not open, or opens into something that
     // does not match its door part, is folded as closed.
@@ -517,7 +661,7 @@ pub fn open_key_record<K: Kek, T: TkRing>(
         true => None,
         false => private,
     };
-    Ok(KeyRecord {
+    Ok(ChainRecord::Key(KeyRecord {
         seq,
         op: door.op,
         at: door.at,
@@ -526,7 +670,25 @@ pub fn open_key_record<K: Kek, T: TkRing>(
         tk_version,
         closes: door.closes,
         private_unchanged: door.private_unchanged,
-    })
+        frozen_at: door.frozen_at,
+    }))
+}
+
+/// Opens the record stored at `seq` of `tenant`'s key chain as a
+/// subject's record. A marker at `seq` is [`ERR_KEY_MARKER`]; any other
+/// error means the door part does not open or breaks a rule: the reader
+/// stops.
+pub fn open_key_record<K: Kek, T: TkRing>(
+    kek: &K,
+    ring: &T,
+    tenant: &TenantId,
+    seq: u64,
+    bytes: &[u8],
+) -> Result<KeyRecord> {
+    match open_chain_record(kek, ring, tenant, seq, bytes)? {
+        ChainRecord::Key(r) => Ok(r),
+        ChainRecord::Marker(_) => Err(ERR_KEY_MARKER),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -580,6 +742,8 @@ pub struct KeyTable {
     tenant: TenantId,
     seq: u64,
     subjects: BTreeMap<String, Entry>,
+    /// The head's freeze (AM-28): `K_u` of a `KeysFrozen` not yet thawed.
+    frozen_at: Option<u64>,
 }
 
 impl KeyTable {
@@ -589,6 +753,7 @@ impl KeyTable {
             tenant,
             seq: 0,
             subjects: BTreeMap::new(),
+            frozen_at: None,
         }
     }
 
@@ -596,12 +761,21 @@ impl KeyTable {
         tenant: TenantId,
         seq: u64,
         subjects: BTreeMap<String, Entry>,
+        frozen_at: Option<u64>,
     ) -> KeyTable {
         KeyTable {
             tenant,
             seq,
             subjects,
+            frozen_at,
         }
+    }
+
+    /// The head's freeze: `Some(K_u)` from a `KeysFrozen` until its
+    /// `KeysThawed` (AM-28). While it is set, a writer refuses every
+    /// change but the exit's own grant removals and the thaw.
+    pub fn frozen_at(&self) -> Option<u64> {
+        self.frozen_at
     }
 
     pub fn tenant(&self) -> &TenantId {
@@ -687,9 +861,35 @@ impl KeyTable {
         Ok(())
     }
 
+    /// Folds the next record of either kind into the table.
+    pub fn apply_chain(&mut self, record: &ChainRecord) -> Result<()> {
+        match record {
+            ChainRecord::Key(r) => self.apply(r),
+            ChainRecord::Marker(m) => self.apply_marker(m),
+        }
+    }
+
+    /// Folds the next record, a marker, into the table: a freeze only on
+    /// a head without one, a thaw only of the freeze in force.
+    pub fn apply_marker(&mut self, record: &MarkerRecord) -> Result<()> {
+        if record.seq != self.seq + 1 {
+            return Err(ERR_KEY_RECORD);
+        }
+        let next = match (record.marker, self.frozen_at) {
+            (Marker::KeysFrozen, None) if record.frozen_at == Some(self.seq) => Some(self.seq),
+            (Marker::KeysThawed { ends }, Some(f)) if ends == f && record.frozen_at.is_none() => {
+                None
+            }
+            _ => return Err(ERR_KEY_RECORD),
+        };
+        self.frozen_at = next;
+        self.seq = record.seq;
+        Ok(())
+    }
+
     /// Folds the next record into the table.
     pub fn apply(&mut self, record: &KeyRecord) -> Result<()> {
-        if record.seq != self.seq + 1 {
+        if record.seq != self.seq + 1 || record.frozen_at != self.frozen_at {
             return Err(ERR_KEY_RECORD);
         }
         // A restate moves a private part to a newer key version, never

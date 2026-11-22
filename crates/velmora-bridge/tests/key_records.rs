@@ -139,6 +139,7 @@ fn seal(
         Some(&subject.private),
         // Closing statuses are classed closing, as the writer does.
         op == KeyOp::Status && subject.door.status != SubjectStatus::Active,
+        None,
         &mut rng,
     )
     .unwrap()
@@ -261,6 +262,7 @@ fn principal_record_round_trips_and_opens_door_without_tenant_key() {
             tk_version: 1,
             closes: false,
             private_unchanged: false,
+            frozen_at: None,
         }
     );
     let closed = open_key_record(&kek, &NoKeys, &t, 1, &bytes).unwrap();
@@ -299,6 +301,7 @@ fn fold(table: &mut KeyTable, op: KeyOp, subject: &Subject) {
             tk_version: 1,
             closes: false,
             private_unchanged: false,
+            frozen_at: None,
         })
         .unwrap();
 }
