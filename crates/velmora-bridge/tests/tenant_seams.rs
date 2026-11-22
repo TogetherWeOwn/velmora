@@ -508,7 +508,16 @@ fn the_catalogue_id_is_read_in_one_place() {
 fn the_directory_is_asked_by_nothing() {
     let all = all();
     const DIRECTORY: &str = "bridge/directory/port.rs";
-    for name in ["Directory", "SingleTenant", "directory::", ".route("] {
+    // The port's paths: the tenant chain's reader (`directory::chain`,
+    // `directory::record`), which the unit client reads heads with, is not
+    // the port.
+    for name in [
+        "Directory",
+        "SingleTenant",
+        "directory::port",
+        "directory::{",
+        ".route(",
+    ] {
         let found = uses(&all, name);
         // The directory module's own files (its store, gate and the
         // re-export) are not callers of the port.
