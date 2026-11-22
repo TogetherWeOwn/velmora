@@ -68,8 +68,9 @@ use super::ports::{
     Admission, ControlChain, ControlIntents, KeyAdmission, KeyTarget, OpeningChange, Refusal,
 };
 use super::record::{
-    grants_narrow, key_chain, open_key_record, seal_key_record, Entry, Grant, KeyOp, KeyTable,
-    Subject, SubjectDoor, SubjectKind, SubjectPrivate, SubjectStatus, TkRing,
+    call_key_digest, grants_narrow, key_chain, open_key_record, seal_key_record,
+    seal_key_record_for_call, Entry, Grant, KeyOp, KeyTable, Subject, SubjectDoor, SubjectKind,
+    SubjectPrivate, SubjectStatus, TkRing,
 };
 use super::revocations::{list_tenant_revocations, put_tenant_revocation};
 use super::routes::{put_route, read_route, RoutePut};
@@ -572,7 +573,8 @@ where
         request: &KeyRequest,
         rng: &mut R,
     ) -> Result<KeyAnswer> {
-        self.change_inner(table, idempotency_key, request, false, rng)
+        let call_key_hash = (!idempotency_key.is_empty()).then(|| call_key_digest(idempotency_key));
+        self.change_inner(table, idempotency_key, request, false, call_key_hash, rng)
             .await
     }
 
@@ -583,14 +585,28 @@ where
     /// change classed closing by an older head (see
     /// [`super::reserved::ReservedAnswer::Closes`]) that a newer head makes
     /// a widening is never recorded without its reservation; the caller's
-    /// retry reserves again.
+    /// retry reserves again. `call_key_hash` is the SHA-256 of this call's
+    /// `Idempotency-Key`, not the reservation id or the request fingerprint.
     pub async fn change_closing<R: FillRandom>(
         &self,
         table: &mut KeyTable,
         request: &KeyRequest,
+        call_key_hash: [u8; 32],
         rng: &mut R,
     ) -> Result<KeyAnswer> {
-        self.change_inner(table, "", request, true, rng).await
+        self.change_closing_inner(table, request, Some(call_key_hash), rng)
+            .await
+    }
+
+    pub(super) async fn change_closing_inner<R: FillRandom>(
+        &self,
+        table: &mut KeyTable,
+        request: &KeyRequest,
+        call_key_hash: Option<[u8; 32]>,
+        rng: &mut R,
+    ) -> Result<KeyAnswer> {
+        self.change_inner(table, "", request, true, call_key_hash, rng)
+            .await
     }
 
     async fn change_inner<R: FillRandom>(
@@ -599,6 +615,7 @@ where
         idempotency_key: &str,
         request: &KeyRequest,
         closing_only: bool,
+        call_key_hash: Option<[u8; 32]>,
         rng: &mut R,
     ) -> Result<KeyAnswer> {
         let chain = key_chain(self.tenant);
@@ -791,7 +808,7 @@ where
                 }
             }
 
-            let bytes = seal_key_record(
+            let bytes = seal_key_record_for_call(
                 self.kek,
                 self.ring,
                 self.tenant,
@@ -802,6 +819,8 @@ where
                 plan.private.as_ref(),
                 plan.closes(),
                 table.frozen_at(),
+                None,
+                call_key_hash,
                 rng,
             )?;
             match chain.put(self.store, seq, bytes.clone()).await? {

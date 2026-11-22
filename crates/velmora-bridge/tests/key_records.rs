@@ -2,7 +2,9 @@ use std::cell::Cell;
 
 use sha2::{Digest, Sha256};
 use velmora::rng::FillRandom;
-use velmora_bridge::crypto::scheme2::{wrap_secret_v2, TenantId, TenantKey};
+use velmora_bridge::crypto::scheme2::{
+    parse_control, seal_control, wrap_secret_v2, ControlOwner, ControlSealer, TenantId, TenantKey,
+};
 use velmora_bridge::keys::chain::Put;
 use velmora_bridge::keys::checkpoint::{
     checkpoint_name, open_checkpoint, read_key_chain, seal_checkpoint,
@@ -264,6 +266,7 @@ fn principal_record_round_trips_and_opens_door_without_tenant_key() {
             private_unchanged: false,
             frozen_at: None,
             rid: None,
+            call_key_hash: None,
         }
     );
     let closed = open_key_record(&kek, &NoKeys, &t, 1, &bytes).unwrap();
@@ -274,6 +277,48 @@ fn principal_record_round_trips_and_opens_door_without_tenant_key() {
             ..opened
         }
     );
+}
+
+#[test]
+fn malformed_call_key_hashes_fail_the_verified_door_read() {
+    let (kek, t, ring) = (kek(), tenant(1), ring(1, 1, "tk1"));
+    let name = key_chain(&t).name(1);
+    let bytes = seal(
+        &kek,
+        &ring,
+        &t,
+        1,
+        KeyOp::Create,
+        &principal(PRINCIPAL, &[]),
+    );
+    let opened = parse_control(&bytes)
+        .unwrap()
+        .open_door(&kek, &name, ControlOwner::Managed(&t))
+        .unwrap();
+    let mut door: serde_json::Value = serde_json::from_slice(opened.door()).unwrap();
+    assert!(door.get("call_key_hash").is_none());
+    let mut rng = TestRng::new("invalid call digest");
+    for bad in [
+        "a".repeat(63),
+        "a".repeat(65),
+        "A".repeat(64),
+        "g".repeat(64),
+    ] {
+        door["call_key_hash"] = bad.into();
+        let bytes = seal_control(
+            &kek,
+            &name,
+            &ControlSealer::Managed(&ring.0),
+            &serde_json::to_vec(&door).unwrap(),
+            Some(&[]),
+            &mut rng,
+        )
+        .unwrap();
+        assert!(matches!(
+            open_key_record(&kek, &NoKeys, &t, 1, &bytes),
+            Err(BridgeError::Invalid("key record is malformed"))
+        ));
+    }
 }
 
 #[test]
@@ -304,6 +349,7 @@ fn fold(table: &mut KeyTable, op: KeyOp, subject: &Subject) {
             private_unchanged: false,
             frozen_at: None,
             rid: None,
+            call_key_hash: None,
         })
         .unwrap();
 }

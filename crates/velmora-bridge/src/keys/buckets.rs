@@ -83,8 +83,9 @@ use super::ports::{
     KeyAdmission, KeyTarget, Refusal,
 };
 use super::record::{
-    key_chain, open_chain_record, open_key_record, seal_key_record, Access, ChainRecord, Grant,
-    KeyOp, KeyRecord, KeyTable, SubjectKind, SubjectStatus, TkRing, MAX_SUBJECT_GRANTS,
+    call_key_digest, key_chain, open_chain_record, open_key_record, parse_call_key_hash,
+    seal_key_record_for_call, Access, ChainRecord, Grant, KeyOp, KeyRecord, KeyTable, SubjectKind,
+    SubjectStatus, TkRing, ERR_KEY_RECORD, MAX_SUBJECT_GRANTS,
 };
 use super::revocations::list_tenant_revocations;
 use super::writer::{Class, KeyAnswer, KeyEnv, KeyRequest, MAX_PUTS};
@@ -184,6 +185,16 @@ fn is_creator_grant(tenant: &crate::TenantId, record: &KeyRecord) -> bool {
             .any(|g| g.bucket_id == bucket.as_str())
 }
 
+/// The verified record is authoritative for its placement, including
+/// older creator grants that have no digest.
+fn recorded_call_key_hash(record: &KeyRecord) -> Result<Option<[u8; 32]>> {
+    record
+        .call_key_hash
+        .as_deref()
+        .map(|hash| parse_call_key_hash(hash).ok_or(ERR_KEY_RECORD))
+        .transpose()
+}
+
 /// The creator as the head holds it: an active principal with room for
 /// one more grant, its private part open.
 enum Creator {
@@ -209,6 +220,12 @@ fn creator_at_head(table: &KeyTable, revoked: &BTreeSet<String>, id: &str) -> Cr
         Some(subject) => Creator::Ok(subject),
         None => Creator::Busy,
     }
+}
+
+/// The reservation lookup value and the independently sourced event digest.
+struct BucketCall<'a> {
+    idempotency_key: &'a str,
+    call_key_hash: Option<[u8; 32]>,
 }
 
 /// How placing a written creator grant's bucket ended.
@@ -240,14 +257,17 @@ where
         table: &mut KeyTable,
         subject: &str,
         bucket: &str,
+        call_key_hash: Option<[u8; 32]>,
         rng: &mut R,
     ) -> Option<u64> {
         let request = KeyRequest::DropGrant {
             id: subject.to_owned(),
             bucket_id: bucket.to_owned(),
         };
-        // A closing change: the idempotency key is not used.
-        match self.change(table, "", &request, rng).await {
+        match self
+            .change_closing_inner(table, &request, call_key_hash, rng)
+            .await
+        {
             Ok(KeyAnswer::Done { seq } | KeyAnswer::Unfinished { seq }) => Some(seq),
             Ok(
                 KeyAnswer::Refused(_)
@@ -277,11 +297,19 @@ where
         records: &B,
         request: &BucketRequest<'_>,
         k: u64,
+        call_key_hash: Option<[u8; 32]>,
     ) -> Option<BucketPut> {
         let bucket = bucket_id(self.tenant, k);
         for _ in 0..MAX_PUTS {
             if let Ok(p) = records
-                .bucket_created(self.tenant, &bucket, request.unit, request.creator, k)
+                .bucket_created(
+                    self.tenant,
+                    &bucket,
+                    request.unit,
+                    request.creator,
+                    k,
+                    call_key_hash,
+                )
                 .await
             {
                 return Some(p);
@@ -298,13 +326,20 @@ where
         records: &B,
         table: &mut KeyTable,
         revoked: &BTreeSet<String>,
-        idempotency_key: &str,
+        call: &BucketCall<'_>,
         request: &BucketRequest<'_>,
         k: u64,
+        placement_hash: Option<[u8; 32]>,
         rng: &mut R,
     ) -> Placing {
+        // Only a new key-chain write uses this call's digest; the tenant
+        // placement takes the digest of the grant it places.
+        let &BucketCall {
+            idempotency_key,
+            call_key_hash,
+        } = call;
         let bucket = bucket_id(self.tenant, k);
-        match self.put_bucket(records, request, k).await {
+        match self.put_bucket(records, request, k, placement_hash).await {
             Some(BucketPut::Placed { in_force }) => {
                 let keys = self.keys_in_force(table, revoked).await;
                 Placing::Done(match keys && in_force {
@@ -317,7 +352,7 @@ where
             }
             Some(BucketPut::OrderLost) => {
                 match self
-                    .drop_grant(table, request.creator, bucket.as_str(), rng)
+                    .drop_grant(table, request.creator, bucket.as_str(), call_key_hash, rng)
                     .await
                 {
                     Some(_) => Placing::Again,
@@ -348,7 +383,7 @@ where
                     Err(_) => Placing::Done(BucketAnswer::Unfinished { grant_seq: k }),
                     Ok(true) => {
                         let _ = self
-                            .drop_grant(table, request.creator, bucket.as_str(), rng)
+                            .drop_grant(table, request.creator, bucket.as_str(), call_key_hash, rng)
                             .await;
                         Placing::Done(BucketAnswer::StateRefused { status, code })
                     }
@@ -363,7 +398,13 @@ where
                         Ok(true) => Placing::Spent,
                         Ok(false) => {
                             let _ = self
-                                .drop_grant(table, request.creator, bucket.as_str(), rng)
+                                .drop_grant(
+                                    table,
+                                    request.creator,
+                                    bucket.as_str(),
+                                    call_key_hash,
+                                    rng,
+                                )
                                 .await;
                             Placing::Spent
                         }
@@ -380,8 +421,8 @@ where
 
     /// Creates a bucket of a managed tenant under `idempotency_key`: the
     /// creator grant first, then `bucket_created` through `records`.
-    /// `table` is the caller's copy of the key table, as for
-    /// [`KeyEnv::change`].
+    /// This legacy entry point takes the exact `Idempotency-Key` header,
+    /// not a reservation handle. `table` is the caller's cached key table.
     pub async fn create_bucket<B: BucketRecords, R: FillRandom>(
         &self,
         records: &B,
@@ -390,8 +431,35 @@ where
         request: &BucketRequest<'_>,
         rng: &mut R,
     ) -> Result<BucketAnswer> {
+        self.create_bucket_keyed(
+            records,
+            table,
+            idempotency_key,
+            call_key_digest(idempotency_key),
+            request,
+            rng,
+        )
+        .await
+    }
+
+    /// Like [`Self::create_bucket`], with the call's SHA-256 passed
+    /// explicitly. `reservation_key` is the lookup value the admission
+    /// adapter uses, not the source of the event digest.
+    pub async fn create_bucket_keyed<B: BucketRecords, R: FillRandom>(
+        &self,
+        records: &B,
+        table: &mut KeyTable,
+        reservation_key: &str,
+        call_key_hash: [u8; 32],
+        request: &BucketRequest<'_>,
+        rng: &mut R,
+    ) -> Result<BucketAnswer> {
+        let call = BucketCall {
+            idempotency_key: reservation_key,
+            call_key_hash: Some(call_key_hash),
+        };
         Ok(self
-            .create(records, table, idempotency_key, request, None, rng)
+            .create(records, table, call, request, None, rng)
             .await?
             .unwrap_or(BucketAnswer::Busy))
     }
@@ -404,11 +472,15 @@ where
         &self,
         records: &B,
         table: &mut KeyTable,
-        idempotency_key: &str,
+        call: BucketCall<'_>,
         request: &BucketRequest<'_>,
         only: Option<u64>,
         rng: &mut R,
     ) -> Result<Option<BucketAnswer>> {
+        let BucketCall {
+            idempotency_key,
+            call_key_hash,
+        } = call;
         let chain = key_chain(self.tenant);
         let reservation = BucketReservation {
             name: request.name,
@@ -477,7 +549,10 @@ where
                     }
                     // In force only when both chains' stores have it. A
                     // bucket deleted since is a conflict for an old retry.
-                    let in_force = match self.put_bucket(records, request, grant_seq).await {
+                    let in_force = match self
+                        .put_bucket(records, request, grant_seq, call_key_hash)
+                        .await
+                    {
                         Some(BucketPut::Placed { in_force }) => in_force,
                         Some(BucketPut::OrderLost | BucketPut::Refused { .. }) => {
                             return Ok(Some(BucketAnswer::Refused(Refusal::Conflict)))
@@ -536,7 +611,16 @@ where
                 // that gives the grant up releases the reservation first,
                 // so a bound reservation always means the create goes on.
                 match self
-                    .place(records, table, &revoked, idempotency_key, request, k, rng)
+                    .place(
+                        records,
+                        table,
+                        &revoked,
+                        &call,
+                        request,
+                        k,
+                        recorded_call_key_hash(&record)?,
+                        rng,
+                    )
                     .await
                 {
                     Placing::Done(answer) => return Ok(Some(answer)),
@@ -596,7 +680,7 @@ where
             if !holders.is_empty() {
                 for holder in holders {
                     if self
-                        .drop_grant(table, &holder, bucket.as_str(), rng)
+                        .drop_grant(table, &holder, bucket.as_str(), call_key_hash, rng)
                         .await
                         .is_none()
                     {
@@ -620,7 +704,7 @@ where
             let mut next = subject.clone();
             next.set_grants(&grants);
             table.admits(KeyOp::Grants, &next.door, Some(&next.private))?;
-            let bytes = seal_key_record(
+            let bytes = seal_key_record_for_call(
                 self.kek,
                 self.ring,
                 self.tenant,
@@ -631,6 +715,8 @@ where
                 Some(&next.private),
                 false,
                 table.frozen_at(),
+                None,
+                call_key_hash,
                 rng,
             )?;
             match chain.put(self.store, k, bytes.clone()).await? {
@@ -663,7 +749,7 @@ where
                 }
                 Ok(false) => {
                     if self
-                        .drop_grant(table, request.creator, bucket.as_str(), rng)
+                        .drop_grant(table, request.creator, bucket.as_str(), call_key_hash, rng)
                         .await
                         .is_none()
                     {
@@ -678,7 +764,16 @@ where
                 }
             }
             match self
-                .place(records, table, &revoked, idempotency_key, request, k, rng)
+                .place(
+                    records,
+                    table,
+                    &revoked,
+                    &call,
+                    request,
+                    k,
+                    call_key_hash,
+                    rng,
+                )
                 .await
             {
                 Placing::Done(answer) => return Ok(Some(answer)),
@@ -781,8 +876,15 @@ where
                 creator,
                 unit,
             };
+            // The binding's lookup value need not be the original header.
+            // Resume the same call using its verified creator grant. An
+            // older unkeyed grant resumes without inventing a digest.
+            let call = BucketCall {
+                idempotency_key: &idempotency_key,
+                call_key_hash: recorded_call_key_hash(&record)?,
+            };
             match env
-                .create(records, table, &idempotency_key, &request, Some(seq), rng)
+                .create(records, table, call, &request, Some(seq), rng)
                 .await?
             {
                 Some(BucketAnswer::Created { grant_seq, .. }) if grant_seq == seq => {
@@ -805,7 +907,10 @@ where
             }
         }
     }
-    let Some(revoke) = env.drop_grant(table, creator, bucket.as_str(), rng).await else {
+    let Some(revoke) = env
+        .drop_grant(table, creator, bucket.as_str(), None, rng)
+        .await
+    else {
         return Ok(CreatorGrant::Busy);
     };
     if let Some(key) = release {

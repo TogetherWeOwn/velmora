@@ -404,8 +404,11 @@ pub enum BucketPut {
 /// not placed, `grant_seq` above `last_grant_seq`).
 #[allow(async_fn_in_trait)]
 pub trait BucketRecords {
-    /// Records `bucket_created{bucket, unit, creator, grant_seq}`. An
-    /// `Err` says nothing about whether it was recorded.
+    /// Records `bucket_created{bucket, unit, creator, grant_seq}`. The
+    /// tenant door carries the management call's digest (AM-79), the same
+    /// SHA-256 used on the creator grant (`None` for older, unkeyed
+    /// grants). An `Err` says nothing about
+    /// whether it was recorded.
     async fn bucket_created(
         &self,
         tenant: &TenantId,
@@ -413,6 +416,7 @@ pub trait BucketRecords {
         unit: u32,
         creator: &str,
         grant_seq: u64,
+        call_key_hash: Option<[u8; 32]>,
     ) -> Result<BucketPut>;
     /// Whether the verified head places `bucket`.
     async fn is_placed(&self, tenant: &TenantId, bucket: &BucketId) -> Result<bool>;

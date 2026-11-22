@@ -9,7 +9,7 @@
 //!
 //! | Part | Fields |
 //! |---|---|
-//! | door (control key) | seq, op, time, subject id, kind, status, `made_by`, per bucket id the access and the expiry, creation time, KEK version of the secret |
+//! | door (control key) | seq, op, time, subject id, kind, status, `made_by`, per bucket id the access and the expiry, creation time, KEK version of the secret, optional `call_key_hash` |
 //! | private (tenant key) | `owner_ref`, label, per bucket id the prefix and the IP list, the wrapped secret |
 //!
 //! A record whose door part does not open stops every reader: the chain
@@ -22,6 +22,7 @@
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use velmora::rng::FillRandom;
 
 use super::chain::Chain;
@@ -431,6 +432,29 @@ pub struct KeyRecord {
     /// The reservation whose call wrote the record (AM-38); only on a
     /// record that opens.
     pub rid: Option<Rid>,
+    /// The SHA-256 of the writing call's `Idempotency-Key`, in lowercase
+    /// hex (AM-79). Event builders use it as `data.key_hash`. It belongs
+    /// to this record only, not to the subject or its checkpoint.
+    pub call_key_hash: Option<String>,
+}
+
+/// Digest the exact header bytes on the legacy paths that still take a raw key.
+pub(super) fn call_key_digest(key: &str) -> [u8; 32] {
+    Sha256::digest(key.as_bytes()).into()
+}
+
+pub(super) fn parse_call_key_hash(hash: &str) -> Option<[u8; 32]> {
+    let digits: &[u8; 64] = hash.as_bytes().try_into().ok()?;
+    let val = |c| match c {
+        b'0'..=b'9' => Some(c - b'0'),
+        b'a'..=b'f' => Some(c - b'a' + 10),
+        _ => None,
+    };
+    let mut out = [0; 32];
+    for (byte, [hi, lo]) in out.iter_mut().zip(digits.as_chunks::<2>().0) {
+        *byte = (val(*hi)? << 4) | val(*lo)?;
+    }
+    Some(out)
 }
 
 #[derive(Serialize, Deserialize)]
@@ -448,6 +472,8 @@ struct DoorBody {
     frozen_at: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     rid: Option<Rid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    call_key_hash: Option<String>,
 }
 
 /// A record of the key chain that changes no subject (AM-28, AM-54).
@@ -477,7 +503,7 @@ pub struct MarkerRecord {
 /// One record of the key chain: a change to a subject, or a marker.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ChainRecord {
-    Key(KeyRecord),
+    Key(Box<KeyRecord>),
     Marker(MarkerRecord),
 }
 
@@ -612,6 +638,29 @@ pub fn seal_key_record_carrying<K: Kek, T: TkRing, R: FillRandom>(
     rid: Option<Rid>,
     rng: &mut R,
 ) -> Result<Vec<u8>> {
+    seal_key_record_for_call(
+        kek, ring, tenant, seq, op, at, door, private, closes, frozen_at, rid, None, rng,
+    )
+}
+
+/// Seals the writing call's digest as record-local metadata. A call that
+/// closes carries its hash but has no reservation.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn seal_key_record_for_call<K: Kek, T: TkRing, R: FillRandom>(
+    kek: &K,
+    ring: &T,
+    tenant: &TenantId,
+    seq: u64,
+    op: KeyOp,
+    at: u64,
+    door: &SubjectDoor,
+    private: Option<&SubjectPrivate>,
+    closes: bool,
+    frozen_at: Option<u64>,
+    rid: Option<Rid>,
+    call_key_hash: Option<[u8; 32]>,
+    rng: &mut R,
+) -> Result<Vec<u8>> {
     if frozen_at.is_some_and(|f| f >= seq) || (rid.is_some() && closes) {
         return Err(ERR_KEY_RECORD);
     }
@@ -634,6 +683,7 @@ pub fn seal_key_record_carrying<K: Kek, T: TkRing, R: FillRandom>(
         private_unchanged: private.is_none(),
         frozen_at,
         rid,
+        call_key_hash: call_key_hash.map(|hash| hash.iter().map(|b| format!("{b:02x}")).collect()),
     })
     .map_err(|_| ERR_KEY_RECORD)?;
     let private_body = zeroize::Zeroizing::new(
@@ -737,6 +787,10 @@ pub fn open_chain_record<K: Kek, T: TkRing>(
         || door.seq != seq
         || door.frozen_at.is_some_and(|f| f >= seq)
         || (door.rid.is_some() && door.closes)
+        || door
+            .call_key_hash
+            .as_deref()
+            .is_some_and(|h| parse_call_key_hash(h).is_none())
     {
         return Err(ERR_KEY_RECORD);
     }
@@ -762,7 +816,7 @@ pub fn open_chain_record<K: Kek, T: TkRing>(
         true => None,
         false => private,
     };
-    Ok(ChainRecord::Key(KeyRecord {
+    Ok(ChainRecord::Key(Box::new(KeyRecord {
         seq,
         op: door.op,
         at: door.at,
@@ -773,7 +827,8 @@ pub fn open_chain_record<K: Kek, T: TkRing>(
         private_unchanged: door.private_unchanged,
         frozen_at: door.frozen_at,
         rid: door.rid,
-    }))
+        call_key_hash: door.call_key_hash,
+    })))
 }
 
 /// Opens the record stored at `seq` of `tenant`'s key chain as a
@@ -788,7 +843,7 @@ pub fn open_key_record<K: Kek, T: TkRing>(
     bytes: &[u8],
 ) -> Result<KeyRecord> {
     match open_chain_record(kek, ring, tenant, seq, bytes)? {
-        ChainRecord::Key(r) => Ok(r),
+        ChainRecord::Key(r) => Ok(*r),
         ChainRecord::Marker(_) => Err(ERR_KEY_MARKER),
     }
 }
