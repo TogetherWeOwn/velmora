@@ -128,8 +128,10 @@ pub async fn audit<S: RecordStore, K: Kek>(
 
 /// One bounded page of the audit: the names after `after` (`m/tk/` for
 /// the first page), at most `limit` per location, cut at a tenant's
-/// boundary so that every copy of a tenant's key versions is compared in
-/// one page. Returns the cursor of the next page, `None` at the end.
+/// boundary when the page holds more than one tenant. A tenant that
+/// fills a page alone is cut inside it, so the page's own comparison may
+/// miss a split across its pages: [`audit`] compares again over every
+/// page. Returns the cursor of the next page, `None` at the end.
 pub async fn audit_page<S: RecordStore, K: Kek>(
     set: &KeyLocations,
     buckets: &KeyBuckets<'_, S>,

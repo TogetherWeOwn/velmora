@@ -253,8 +253,12 @@ pub async fn restore_escrow<S: RecordStore, K: Kek>(
         return Err(ERR_ESCROW_KEY);
     }
     let mut decided = Vec::new();
-    // The newest copy of the key that opens, wherever it is.
-    let mut newest: Option<(u32, String, Vec<u8>)> = None;
+    // The newest copy of the key that opens, wherever it is; the escrow
+    // copy counts as one.
+    let mut newest: Option<(u32, String, Vec<u8>)> =
+        Some((copy.kek_version, copy.name(), copy.blob.clone()));
+    // The newest KEK version of a copy this Worker could not open.
+    let mut unopened: u32 = 0;
     for location in set.synchronous() {
         let store = buckets.get(location)?;
         let mut conflict = false;
@@ -272,6 +276,7 @@ pub async fn restore_escrow<S: RecordStore, K: Kek>(
             }
             if kek.version(v).is_none() {
                 unverified = true;
+                unopened = unopened.max(v);
                 continue;
             }
             // A copy that does not open is not a copy of the key.
@@ -295,11 +300,11 @@ pub async fn restore_escrow<S: RecordStore, K: Kek>(
         };
         decided.push((location, step));
     }
-    let (name, blob) = match newest {
-        Some((_, name, bytes)) => (name, bytes),
-        None => (copy.name(), copy.blob.clone()),
-    };
-    let mut stop = decided.iter().any(|(_, s)| *s == RestoreStep::Conflict);
+    let (newest_v, name, blob) =
+        newest.unwrap_or((copy.kek_version, copy.name(), copy.blob.clone()));
+    // A conflict anywhere, or a copy under a newer KEK than the one we
+    // would write, stops every write: no older name beside a newer one.
+    let mut stop = decided.iter().any(|(_, s)| *s == RestoreStep::Conflict) || unopened > newest_v;
     let mut out = Vec::new();
     for (location, step) in decided {
         let step = match step {
@@ -311,7 +316,17 @@ pub async fn restore_escrow<S: RecordStore, K: Kek>(
                 } else {
                     // Someone put it in between: read it back.
                     match store.get(&name).await? {
-                        Some(b) if tk_blob_check_value(&b).is_ok_and(|k| k == copy.kcv) => {
+                        Some(b)
+                            if tk_blob_check_value(&b).is_ok_and(|k| k == copy.kcv)
+                                && unwrap_tenant_key(
+                                    kek,
+                                    newest_v,
+                                    &copy.tenant,
+                                    copy.version,
+                                    &b,
+                                )
+                                .is_ok_and(|k| k.check_value() == copy.kcv) =>
+                        {
                             RestoreStep::Present
                         }
                         _ => RestoreStep::Conflict,
