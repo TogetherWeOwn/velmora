@@ -195,6 +195,7 @@ impl Fx {
             slice_bytes: 8 * 1024 * 1024,
             max_object_extents: 10_000,
             intent_sweep: false,
+            gc_orphans: false,
             records: velmora_bridge::recovery::Layout::flat(),
             packed_plans: false,
             parity: false,
