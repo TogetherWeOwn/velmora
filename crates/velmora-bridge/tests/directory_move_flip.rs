@@ -585,7 +585,7 @@ impl Move {
             &self.keys,
             &self.receipt,
             &window,
-            self.rig.now(),
+            &self.rig.bridge.clock,
         )
         .await
     }
@@ -1412,8 +1412,7 @@ fn the_lift_opens_one_move_report_for_the_units_entry() {
         let r = m.unit.report.borrow().clone().unwrap();
         assert_eq!((r.since, r.ordinal, r.nonce.as_str()), (m.since, 2, "n1"));
         // The lift record names the entry and the report, by the move
-        // tool; it is the record below tenant 0's flip on the owner.
-        let o = m.head(&owner()).await;
+        // tool; the move floor (b1) and tenant 0's flip follow it.
         let l = m.lift_record().await.unwrap();
         assert_eq!((l.unit, l.since_seq), (0, m.since));
         assert_eq!(l.proof.replay_id, r);
@@ -1480,7 +1479,6 @@ fn a_refused_sync_re_enters_under_a_new_entry() {
         // The first lift, the re-entry's entry, the second lift, the
         // floor, the flip.
         assert_eq!(m.records(), before + 5);
-        let o = m.head(&owner()).await;
         let l = m.lift_record().await.unwrap();
         assert!(l.since_seq > m.since);
         // The second report names the new entry.
@@ -2296,5 +2294,44 @@ fn an_exit_that_empties_the_unit_raises_its_floor() {
         assert_eq!(m.records(), n);
         let row = m.dir().tenant(&owner()).await.unwrap().unwrap();
         assert_eq!(row.door.move_floors.get(&0), Some(&emptied));
+    });
+}
+
+/// Review b1 r1 MEDIUM: an exit of this owner's move that runs after a
+/// later move into another tenant began still raises the owner's floor
+/// (writer 2), and so does the restore tool (writer 3).
+#[test]
+fn an_exit_after_a_later_move_elsewhere_still_raises_the_floor() {
+    block_on(async {
+        let m = window().await;
+        m.give_up().await.map_err(|e| format!("{e:?}")).unwrap();
+        // A later window into another tenant.
+        let other = Tenant::parse("t_00000000000000b2").unwrap();
+        m.chain()
+            .write(
+                &Tenant::zero(),
+                &Change::StartMove {
+                    to: other,
+                    catalogue_id_frozen: velmora_bridge::config::DEFAULT_CATALOGUE_ID.into(),
+                },
+                Actor::MoveTool,
+                m.rig.now(),
+                0,
+            )
+            .await
+            .unwrap();
+        assert_eq!(m.selector().await, Selector::Moving);
+        let emptied = UnixMs(m.rig.now().0 + 1_000);
+        let o = floor_after_empty(&m.chain(), &m.dir(), &owner(), 0, emptied)
+            .await
+            .map_err(|e| format!("{e:?}"))
+            .unwrap();
+        assert_eq!(o.move_floors.get(&0), Some(&emptied));
+        let raised = UnixMs(emptied.0 + 1);
+        m.chain()
+            .set_move_floor(&owner(), 0, raised, Actor::RestoreTool, raised, 0)
+            .await
+            .unwrap();
+        assert_eq!(m.head(&owner()).await.move_floors.get(&0), Some(&raised));
     });
 }

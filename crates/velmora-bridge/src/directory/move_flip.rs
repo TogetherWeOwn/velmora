@@ -74,7 +74,7 @@ use super::move_window::window_start;
 use super::record::{Lifecycle, Selector, Tenant, TenantDoor};
 use super::store::{RouteKind, SqlDirectory};
 use super::transition::{Actor, Change, MAX_MOVED_BUCKETS};
-use crate::ports::{BlobStore, Sql, SqlValue};
+use crate::ports::{BlobStore, Clock, Sql, SqlValue};
 use crate::records::RecordStore;
 use crate::types::{BridgeError, UnixMs};
 use crate::unit::call::Refused as UnitRefused;
@@ -435,9 +435,11 @@ fn door_of(written: Written) -> TenantDoor {
 
 /// Runs step 8, from wherever an earlier run stopped. `frozen` and
 /// `safety` hold the frozen catalogue and its stamp; `dir` the directory;
-/// `keys` the owner's key chain.
+/// `keys` the owner's key chain; `clock` the tool's clock, read at the
+/// start and again for (b1), whose record is checked against the time the
+/// unit's lift landed, later in the same run.
 #[allow(clippy::too_many_arguments)]
-pub async fn flip<S, C, F, B, Q, U, R, K, M>(
+pub async fn flip<S, C, F, B, Q, U, R, K, M, T>(
     chain: &TenantChain<'_, S, C>,
     frozen: &F,
     safety: &B,
@@ -447,7 +449,7 @@ pub async fn flip<S, C, F, B, Q, U, R, K, M>(
     keys: &K,
     receipt: &M,
     window: &Window<'_>,
-    now: UnixMs,
+    clock: &T,
 ) -> Result<Flipped, FlipError>
 where
     S: RecordStore,
@@ -459,7 +461,9 @@ where
     R: RouteRecords,
     K: OwnerKeys,
     M: MoveReceipt,
+    T: Clock,
 {
+    let now = clock.now();
     let zero = match window_state(chain, window).await? {
         WindowState::Open(zero) => zero,
         // Flipped already: the directory's copy of the selector, which a
@@ -509,8 +513,9 @@ where
     // (b) The owner's root unit opens through the move's lift.
     let owner = open_unit(chain, dir, unit, keys, &zero, window, now).await?;
 
-    // (b1) The move floor, from the unit's own lift time.
-    move_floor(chain, dir, unit, &owner, now).await?;
+    // (b1) The move floor, from the unit's own lift time, under a clock
+    // read now: the lift may have landed minutes after the run began.
+    move_floor(chain, dir, unit, &owner, clock.now()).await?;
 
     // (b2) V9, once the unit is open; a run that already put a route
     // passed it. A failure gives the move up at once, in the order of DS1
