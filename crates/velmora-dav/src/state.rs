@@ -185,8 +185,8 @@ pub enum Op {
         path: String,
         tree: bool,
     },
-    /// Dead properties of each `(path, etag)`; rows stamped with another
-    /// etag are stale and dropped. `names`: only these (`None`: all).
+    /// Dead properties of each `(path, etag)`; rows with a different
+    /// stamp are skipped, not deleted. `names`: only these (`None`: all).
     PropGet {
         paths: Vec<(String, Option<String>)>,
         names: Option<Vec<(String, String)>>,
@@ -580,10 +580,10 @@ impl<S: Sql> Engine<'_, S> {
             Op::PropGet { paths, names } => {
                 let mut out = Vec::with_capacity(paths.len());
                 for (path, etag) in &paths {
-                    self.drop_stale(path, etag.as_deref())?;
                     let rows = self.sql.exec(
-                        "SELECT ns, name, value_xml FROM dav_props WHERE path = ?1 ORDER BY ns, name",
-                        &[t(path)],
+                        "SELECT ns, name, value_xml FROM dav_props \
+                         WHERE path = ?1 AND etag IS ?2 ORDER BY ns, name",
+                        &[t(path), etag.as_deref().map_or(Val::Null, t)],
                     )?;
                     let props: Vec<DeadProp> = rows
                         .iter()
@@ -642,6 +642,8 @@ impl<S: Sql> Engine<'_, S> {
                 Ok(Reply::Done)
             }
             Op::PropRestamp { path, from, to } => {
+                // Leave other stamps alone. A write lease blocks new LOCKs,
+                // not other saves, so a different stamp might be newer.
                 self.sql.exec(
                     "UPDATE dav_props SET etag = ?3 WHERE path = ?1 AND etag = ?2",
                     &[t(&path), t(&from), t(&to)],
@@ -692,14 +694,12 @@ impl<S: Sql> Engine<'_, S> {
         Ok(())
     }
 
-    /// Rows stamped with an etag that is no longer the object's.
+    /// Reclaim mismatched rows before replacing properties under the write lease.
     fn drop_stale(&self, path: &str, etag: Option<&str>) -> Result<(), String> {
-        if let Some(etag) = etag {
-            self.sql.exec(
-                "DELETE FROM dav_props WHERE path = ?1 AND etag IS NOT NULL AND etag <> ?2",
-                &[t(path), t(etag)],
-            )?;
-        }
+        self.sql.exec(
+            "DELETE FROM dav_props WHERE path = ?1 AND etag IS NOT ?2",
+            &[t(path), etag.map_or(Val::Null, t)],
+        )?;
         Ok(())
     }
 

@@ -1340,6 +1340,39 @@ async fn a_webdav_overwrite_keeps_dead_properties() {
 }
 
 #[tokio::test]
+async fn propfind_between_publish_and_restamp_keeps_dead_properties() {
+    use velmora_dav::state::{Engine, Op, Reply};
+
+    let w = World::new().await;
+    w.req("PUT", "/dav/report", &[], b"old").await.expect(201);
+    w.req("PROPPATCH", "/dav/report", &[], SET_X)
+        .await
+        .expect(207);
+    let old = w.s3_get("report").await.2.unwrap();
+
+    // Publish the new bytes but leave the properties at the old stamp,
+    // as they are between a WebDAV PUT's storage and state calls.
+    assert_eq!(w.s3_put("report", b"new").await, 200);
+    let new = w.s3_get("report").await.2.unwrap();
+    assert_ne!(old, new);
+    assert!(!has_x(&w, "/dav/report").await);
+
+    let db = w.dav.state.dbs.borrow().values().next().unwrap().clone();
+    let replies = Engine {
+        sql: db.as_ref(),
+        now: w.dav.state.now.get(),
+    }
+    .run(vec![Op::PropRestamp {
+        path: "report".to_owned(),
+        from: old,
+        to: new,
+    }])
+    .unwrap();
+    assert_eq!(replies, vec![Reply::Done]);
+    assert!(has_x(&w, "/dav/report").await, "restamp lost the property");
+}
+
+#[tokio::test]
 async fn locks_work_on_a_deep_path() {
     let w = World::new().await;
     let mut path = String::from("/dav/");
