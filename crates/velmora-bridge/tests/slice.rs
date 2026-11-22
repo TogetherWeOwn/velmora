@@ -1587,6 +1587,17 @@ async fn slice_acceptance() {
                 .collect::<Vec<_>>()
         ),
     );
+    // The queue took the message, so the row is marked as sent: the
+    // dispatcher leaves it alone until the mark has aged.
+    let report = rig
+        .bridge
+        .dispatch()
+        .await
+        .unwrap_or_else(|e| fail(s, "Bridge::dispatch", "Ok", e));
+    expect_eq(s, "jobs sent again at once", 0, report.enqueued);
+    rig.bridge
+        .clock
+        .advance_secs(velmora_bridge::jobs::RESEND_SECS);
     let report = rig
         .bridge
         .dispatch()
@@ -2013,7 +2024,8 @@ async fn rebuild_from_usenet(packed_plans: &str) {
     // A release keeps the copy in R2 until the hot tier evicts it. Evict
     // all that may go, so that the replay meets extents with a copy
     // (still pinned) and without one.
-    let all = u64::MAX / 2;
+    // More than any tier holds, and still an integer the database takes.
+    let all = MAX_SQL_INT as u64;
     rig.bridge
         .catalog
         .hot_drain_set(all)
@@ -2628,7 +2640,11 @@ async fn parts_completed_late_keep_their_safety_copy_for_the_minimum_age() {
         );
     }
 
-    rig.bridge.clock.set(UnixMs(last));
+    // The pump above dropped the wake-ups the verify jobs sent, so the
+    // releases are sent by the dispatcher, once their marks have aged.
+    rig.bridge
+        .clock
+        .set(UnixMs(last).plus_secs(velmora_bridge::jobs::RESEND_SECS));
     rig.tick(s).await;
     for (_, stage, .., safety) in rig.soaks() {
         expect_eq(
@@ -2798,7 +2814,8 @@ async fn a_backfill_packs_posted_plans_and_they_read_from_usenet() {
     // Cold: no cache, and no safety copy where the hot tier may drop it.
     let s = "backfill cold read";
     rig.pump(s).await;
-    let all = u64::MAX / 2;
+    // More than any tier holds, and still an integer the database takes.
+    let all = MAX_SQL_INT as u64;
     rig.bridge
         .catalog
         .hot_drain_set(all)
