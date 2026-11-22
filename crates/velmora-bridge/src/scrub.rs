@@ -545,7 +545,7 @@ where
                     candidate.last,
                     Some(ScrubResult::Suspect | ScrubResult::Unrecoverable)
                 ) {
-                    return self.defer_seen(token, candidate, confirm).await;
+                    return self.defer_seen(reader, walk, candidate, confirm).await;
                 }
                 if candidate.last == Some(ScrubResult::Deferred) {
                     crate::trace::alert(|| {
@@ -963,12 +963,14 @@ where
     /// once that is more than two confirm intervals old is said
     /// (`scrub-deferred`): the looks since broke off, or the scrub did not
     /// reach the extent (paused, or runs that ended early).
-    async fn defer_seen(
-        &self,
-        token: u64,
+    async fn defer_seen<'s>(
+        &'s self,
+        reader: &mut ColdReader<'s, C, N, T>,
+        walk: &mut Walk<'_, 's, C, N, T>,
         candidate: &ScrubCandidate,
         confirm: u64,
     ) -> core::result::Result<(), Halt> {
+        let token = walk.token;
         let now = self.clock.now();
         let confirm_ms = i64::try_from(confirm * 1000).unwrap_or(i64::MAX);
         let stale = candidate
@@ -982,9 +984,11 @@ where
                 )
             });
         }
-        self.catalog
-            .scrub_defer(token, &candidate.extent.id, now.plus_ms(confirm_ms))
-            .await?;
+        // Under the sessions' timer, like every catalogue write of a run.
+        let write = self
+            .catalog
+            .scrub_defer(token, &candidate.extent.id, now.plus_ms(confirm_ms));
+        self.idle(reader, walk.stats, write).await?;
         Ok(())
     }
 
@@ -1023,7 +1027,7 @@ where
                 Ok(stored) => stored,
                 // A blob store did not answer: not "no copy". Looked at
                 // again later, the loss still on record (confirmed).
-                Err(()) => return self.defer_seen(token, candidate, confirm).await,
+                Err(()) => return self.defer_seen(reader, walk, candidate, confirm).await,
             },
         };
         let Some(cipher) = cipher else {
@@ -1031,7 +1035,7 @@ where
                 // The read broke off: Usenet may well hold it. Not
                 // unrecoverable on that, and still confirmed: the next
                 // look that finds the loss again repairs it.
-                return self.defer_seen(token, candidate, confirm).await;
+                return self.defer_seen(reader, walk, candidate, confirm).await;
             }
             walk.run.unrecoverable += 1;
             crate::trace::alert(|| {
