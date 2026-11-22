@@ -18,7 +18,7 @@ use velmora_bridge::ingress::ByteBudget;
 use velmora_bridge::sql::SqlCatalog;
 use velmora_bridge::tenant_catalog::{
     TenantCatalog, UnitPort, UnitRefusal, NOT_ON_UNIT, UNIT_ACCOUNT_PROBLEM, UNIT_CLOSED,
-    UNIT_STALE_JOB, UNIT_SYNC_NEEDED,
+    UNIT_STALE, UNIT_STALE_JOB, UNIT_SYNC_NEEDED,
 };
 use velmora_bridge::testkit::{
     FakeJobs, FixedClock, MemBlobStore, PublishUnrecorded, RusqliteSql, TestKek,
@@ -643,29 +643,104 @@ async fn gc_takes_an_overwritten_extent_on_the_unit() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn a_job_with_lower_numbers_changes_nothing_in_the_unit() {
+async fn a_job_with_lower_numbers_changes_nothing_and_gets_the_units_numbers() {
     // The unit holds seq 3; the job carries 2.
     let fx = Fx::with(GcMode::Disposable, 2).await;
     let bucket = fx.bucket("scratch").await;
     let o = fx.put(&bucket, "a/x.bin", &plaintext()).await;
-    // The unit refuses the job's first call; the consumer reads the
-    // heads and runs it again or drops it (rule 5).
+    // The unit answers its own numbers and does nothing (AM-50).
     let err = fx
         .bridge
         .catalog
         .job_extent(&o.extent, &o.generation)
         .await
         .unwrap_err();
+    assert!(matches!(err, BridgeError::Invalid(UNIT_STALE)), "{err:?}");
+    let unit_seqs = Seqs {
+        state_seq: 3,
+        keys_seq: 0,
+    };
+    assert_eq!(
+        fx.bridge.catalog.refusal(),
+        Some(UnitRefusal::Stale(unit_seqs))
+    );
+    assert_eq!(fx.bridge.catalog.latest().get(), unit_seqs);
+    fx.bridge.run_job(&scope(), &o.job(OutboxStage::Post)).await;
+    // The consumer can tell why: the unit's refusal is kept.
+    assert_eq!(
+        fx.bridge.catalog.refusal(),
+        Some(UnitRefusal::Stale(unit_seqs))
+    );
+    assert_eq!(fx.outbox(&o, "stage").await, "post");
+    assert_eq!(fx.outbox(&o, "attempts").await, "0");
+    assert_eq!(fx.server.posted_count().await, 0);
+    // Run once more with the unit's numbers: it goes through.
+    let again = TenantCatalog::new(
+        Local {
+            unit: Rc::clone(&fx.unit),
+            clock: Rc::clone(&fx.clock),
+            calls: Rc::default(),
+        },
+        SqlCatalog::new(RusqliteSql::with_schema().unwrap()),
+        own(),
+        unit_seqs,
+    );
+    again.job_extent(&o.extent, &o.generation).await.unwrap();
+    assert_eq!(again.refusal(), None);
+    assert_eq!(again.latest().get(), unit_seqs);
+}
+
+#[tokio::test]
+async fn a_job_with_no_numbers_is_refused_and_is_not_stale() {
+    let fx = Fx::new().await;
+    let call = UnitCall {
+        name: own(),
+        kind: CallKind::Job,
+        seqs: None,
+        authenticated: true,
+        listed: false,
+        op: UnitOp::Job {
+            call: velmora_bridge::unit::jobcall::JobCall::evictable_bytes {},
+        },
+    };
+    assert_eq!(
+        fx.unit.handle(&call, fx.clock.now()),
+        UnitAnswer::Refused {
+            reason: velmora_bridge::unit::Refused::Identity(
+                velmora_bridge::unit::identity::Refusal::StaleJob
+            ),
+            alarm: false,
+        }
+    );
+    // Through the job catalogue it is UNIT_STALE_JOB, never UNIT_STALE:
+    // the consumer pages for it instead of running it again (AM-50).
+    struct NoNumbers(Local);
+    impl UnitPort for NoNumbers {
+        async fn call(&self, call: &UnitCall) -> Result<UnitAnswer> {
+            let mut c = call.clone();
+            c.seqs = None;
+            self.0.call(&c).await
+        }
+    }
+    let cat = TenantCatalog::new(
+        NoNumbers(Local {
+            unit: Rc::clone(&fx.unit),
+            clock: Rc::clone(&fx.clock),
+            calls: Rc::default(),
+        }),
+        SqlCatalog::new(RusqliteSql::with_schema().unwrap()),
+        own(),
+        Seqs {
+            state_seq: 3,
+            keys_seq: 0,
+        },
+    );
+    let err = cat.evictable_bytes().await.unwrap_err();
     assert!(
         matches!(err, BridgeError::Invalid(UNIT_STALE_JOB)),
         "{err:?}"
     );
-    fx.bridge.run_job(&scope(), &o.job(OutboxStage::Post)).await;
-    // The consumer can tell why: the unit's refusal is kept.
-    assert_eq!(fx.bridge.catalog.refusal(), Some(UnitRefusal::StaleJob));
-    assert_eq!(fx.outbox(&o, "stage").await, "post");
-    assert_eq!(fx.outbox(&o, "attempts").await, "0");
-    assert_eq!(fx.server.posted_count().await, 0);
+    assert_eq!(cat.refusal(), Some(UnitRefusal::StaleJob));
 }
 
 #[tokio::test]
@@ -916,10 +991,7 @@ async fn job_calls_are_unlisted_and_keep_the_units_latest_numbers() {
         seqs(3, 1),
     );
     let err = cat.evictable_bytes().await.unwrap_err();
-    assert!(
-        matches!(err, BridgeError::Invalid(UNIT_STALE_JOB)),
-        "{err:?}"
-    );
+    assert!(matches!(err, BridgeError::Invalid(UNIT_STALE)), "{err:?}");
     assert_eq!(cat.refusal(), Some(UnitRefusal::Stale(seqs(5, 2))));
     assert_eq!(cat.latest().get(), seqs(5, 2));
     cat.run_again_with(seqs(5, 2));

@@ -1352,3 +1352,63 @@ fn a_bare_tenant_name_is_a_stray() {
         assert!(chain_tenants(&store).await.is_err());
     });
 }
+
+/// D1 and Durable Object SQLite refuse a LIKE or GLOB pattern over 50
+/// bytes (`SQLITE_LIMIT_LIKE_PATTERN_LENGTH`), so a CHECK with a longer one
+/// fails every insert there while it passes on a stock SQLite. No pattern
+/// literal in the directory's migrations is longer.
+#[test]
+fn no_pattern_in_the_directory_schema_is_over_fifty_bytes() {
+    let sql = include_str!("../../../workers/s3-bridge/migrations-directory/0001_directory.sql");
+    let upper = sql.to_ascii_uppercase();
+    let mut found = 0;
+    for word in ["GLOB '", "LIKE '"] {
+        let mut from = 0;
+        while let Some(i) = upper[from..].find(word) {
+            let start = from + i + word.len();
+            let len = sql[start..].find('\'').expect("closed literal");
+            assert!(
+                len <= 50,
+                "pattern of {len} bytes: {}",
+                &sql[start..start + len]
+            );
+            found += 1;
+            from = start + len;
+        }
+    }
+    assert!(found > 0);
+}
+
+/// The tenant id CHECK still takes only `t_` and 16 lowercase hex digits.
+#[test]
+fn the_tenant_id_check_takes_only_the_minted_form() {
+    use velmora_bridge::ports::{Sql, SqlValue};
+    block_on(async {
+        let db = database();
+        let insert = |id: &str| {
+            let id = id.to_string();
+            let db = &db;
+            async move {
+                db.exec(
+                    "INSERT INTO tenants (id, record_seq, state, jurisdiction, door_json, \
+                     updated_at, synthetic, tk_version) VALUES (?1, 1, 'active', 'us', '{}', 1, 0, 0)",
+                    &[SqlValue::Text(id)],
+                )
+                .await
+            }
+        };
+        insert("t_00000000000000a1").await.unwrap();
+        insert("t_0000000000000000").await.unwrap();
+        for bad in [
+            "t_00000000000000A1",
+            "t_00000000000000a",
+            "t_00000000000000a12",
+            "u_00000000000000a1",
+            "t_00000000000000g1",
+            "t_0000000000000_a1",
+            "",
+        ] {
+            assert!(insert(bad).await.is_err(), "{bad:?}");
+        }
+    });
+}
