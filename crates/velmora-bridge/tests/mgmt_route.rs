@@ -18,7 +18,7 @@ const INVALID_TENANTS: [&str; 5] = [
     "",
 ];
 
-fn cases() -> [(&'static str, String, Call, Scope); 33] {
+fn cases() -> [(&'static str, String, Call, Scope); 34] {
     let tenant_path = format!("/v1/tenants/{TENANT}");
     [
         (
@@ -286,6 +286,14 @@ fn cases() -> [(&'static str, String, Call, Scope); 33] {
                 tenant: TENANT.into(),
             },
             Scope::UsageRead,
+        ),
+        (
+            "GET",
+            format!("{tenant_path}/events"),
+            Call::TenantEvents {
+                tenant: TENANT.into(),
+            },
+            Scope::EventsRead,
         ),
     ]
 }

@@ -38,13 +38,21 @@
 //! | GET | `/v1/tenants/{t}/uploads/{u}/parts` | `objects.multipart_parts` | `objects:list` |
 //! | GET | `/v1/tenants/{t}/usage` | usage totals | `usage:read` |
 //! | GET | `/v1/tenants/{t}/usage/days`, `/v1/tenants/{t}/usage/downloads`, `/v1/tenants/{t}/usage/buckets` | usage by day, downloads, per bucket | `usage:read` |
+//! | GET | `/v1/tenants/{t}/events` | one tenant's part of the event feed (`?after=&limit=`) | `events:read` |
 //! | GET | `/v1/events` | the event feed (`?after=`) | `events:read` |
 //!
 //! The paths are the contract with `kofra-api` (design answer L5-1); the
-//! call list and the scopes are the tenancy design's. Four reads were
+//! call list and the scopes are the tenancy design's. The paths, bodies,
+//! codes and positions of the calls `kofra-api` makes are in the crate
+//! `velmora_mgmt_types`, which both sides build from. Five reads were
 //! added for the calls `kofra-api`'s storage port makes: the tenant's
-//! reach, one bucket, one key, and usage per bucket. Each is read-only
-//! and on `tenants:read` or `usage:read`, as the list it reads from.
+//! reach, one bucket, one key, usage per bucket and the tenant's events.
+//! Each is read-only and on `tenants:read`, `usage:read` or
+//! `events:read`, as the list it reads from. The query each call takes
+//! (`?name=` and `?kind=` on the lists among them) is checked in
+//! [`crate::mgmt::request`].
+
+use velmora_mgmt_types::ids::{valid_bucket_id, valid_principal_id, valid_tenant_id};
 
 use crate::mgmt::token::Scope;
 use crate::recovery::{valid_key_id, DEFAULT_TENANT};
@@ -61,6 +69,7 @@ pub enum Call {
     TenantDelete { tenant: String },
     TenantRestore { tenant: String },
     TenantReach { tenant: String },
+    TenantEvents { tenant: String },
     BucketList { tenant: String },
     BucketCreate { tenant: String },
     BucketRead { tenant: String, bucket: String },
@@ -103,6 +112,7 @@ impl Call {
             | BucketRead { .. }
             | KeyList { .. }
             | KeyRead { .. } => Scope::TenantsRead,
+            TenantEvents { .. } => Scope::EventsRead,
             TenantDelete { .. } | TenantRestore { .. } => Scope::TenantsDelete,
             BucketCreate { .. } | BucketUpdate { .. } => Scope::BucketsWrite,
             BucketDelete { .. } => Scope::BucketsDelete,
@@ -152,6 +162,7 @@ impl Call {
             | TenantDelete { tenant }
             | TenantRestore { tenant }
             | TenantReach { tenant }
+            | TenantEvents { tenant }
             | BucketList { tenant }
             | BucketCreate { tenant }
             | BucketRead { tenant, .. }
@@ -209,7 +220,10 @@ impl NoCall {
 }
 
 /// Whether `path` (no query) is under the management prefix: `/v1` or
-/// `/v1/...`. The public handler refuses every such path.
+/// `/v1/...`. The public handler has no `/v1` router and serves no
+/// management call on any host: there a `/v1/...` path is an S3 path (on
+/// S3 hosts `v1` is no valid bucket name) or, on label hosts, an object
+/// key. Only the management entry point serves these paths.
 pub fn is_management_path(path: &str) -> bool {
     path == PREFIX
         || path
@@ -248,6 +262,10 @@ pub fn route(method: &str, path: &str) -> Result<Call, NoCall> {
             let tenant = t(tn)?;
             (method == "GET").then_some(Call::TenantReach { tenant })
         }
+        ["tenants", tn, "events"] => {
+            let tenant = t(tn)?;
+            (method == "GET").then_some(Call::TenantEvents { tenant })
+        }
         ["tenants", tn, "restore"] => {
             let tenant = t(tn)?;
             (method == "POST").then_some(Call::TenantRestore { tenant })
@@ -261,7 +279,7 @@ pub fn route(method: &str, path: &str) -> Result<Call, NoCall> {
             }
         }
         ["tenants", tn, "buckets", b] => {
-            let (tenant, bucket) = (t(tn)?, id(b, bucket_id)?);
+            let (tenant, bucket) = (t(tn)?, id(b, valid_bucket_id)?);
             match method {
                 "GET" => Some(Call::BucketRead { tenant, bucket }),
                 "PATCH" => Some(Call::BucketUpdate { tenant, bucket }),
@@ -295,7 +313,7 @@ pub fn route(method: &str, path: &str) -> Result<Call, NoCall> {
             (method == "POST").then_some(Call::PrincipalCreate { tenant })
         }
         ["tenants", tn, "principals", p] => {
-            let (tenant, principal) = (t(tn)?, id(p, principal_id)?);
+            let (tenant, principal) = (t(tn)?, id(p, valid_principal_id)?);
             match method {
                 "PATCH" => Some(Call::PrincipalUpdate { tenant, principal }),
                 "DELETE" => Some(Call::PrincipalRevoke { tenant, principal }),
@@ -303,7 +321,7 @@ pub fn route(method: &str, path: &str) -> Result<Call, NoCall> {
             }
         }
         ["tenants", tn, "principals", p, "disable"] => {
-            let (tenant, principal) = (t(tn)?, id(p, principal_id)?);
+            let (tenant, principal) = (t(tn)?, id(p, valid_principal_id)?);
             (method == "POST").then_some(Call::PrincipalDisable { tenant, principal })
         }
         ["tenants", tn, "objects", verb] => {
@@ -354,28 +372,12 @@ pub fn route(method: &str, path: &str) -> Result<Call, NoCall> {
 }
 
 /// A tenant id this plane serves: `t_` and 16 lowercase hex characters,
-/// and not tenant 0.
+/// and not tenant 0 (the contract's form).
 pub fn tenant_id(s: &str) -> Option<&str> {
-    let hex = s.strip_prefix("t_")?;
-    let ok = hex.len() == 16 && hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
-    (ok && s != DEFAULT_TENANT).then_some(s)
-}
-
-/// `b_` and 16 lowercase hex characters, as the catalogue mints them.
-fn bucket_id(s: &str) -> bool {
-    s.strip_prefix("b_")
-        .is_some_and(|h| h.len() == 16 && h.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')))
+    (valid_tenant_id(s) && s != DEFAULT_TENANT).then_some(s)
 }
 
 /// 32 lowercase hex characters, as the catalogue mints upload ids.
 fn upload_id(s: &str) -> bool {
     s.len() == 32 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
-}
-
-/// A principal's key-chain id is opaque here: 1 to 64 ASCII letters,
-/// digits, `_` or `-`. Its form is the key chain's.
-fn principal_id(s: &str) -> bool {
-    (1..=64).contains(&s.len())
-        && s.bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
