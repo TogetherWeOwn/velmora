@@ -530,7 +530,8 @@ pub fn holds_head(run: &crate::directory::finish::TenantFinish) -> Option<u64> {
     let holds = |s: &StoreStep| match s {
         StoreStep::Holds(seq) => *seq >= head,
         StoreStep::Unbound => true,
-        StoreStep::Waiting | StoreStep::Failed => false,
+        // The create reply requires a live head, not a provisioning one.
+        StoreStep::Waiting | StoreStep::Unborn | StoreStep::Failed => false,
     };
     (head > 0
         && run.head.complete
@@ -1068,6 +1069,7 @@ mod tests {
                 .collect(),
             events: 0,
             cleared_to: None,
+            born_failed: vec![],
             pages: vec![],
         }
     }
@@ -1089,6 +1091,7 @@ mod tests {
             run(5, true, Holds(5), vec![Holds(4)]),
             run(5, true, Holds(5), vec![Holds(5), Waiting]),
             run(5, true, Holds(5), vec![Failed]),
+            run(5, true, Holds(5), vec![Unborn]),
             run(5, true, Holds(5), vec![]),
             run(5, false, Holds(5), vec![Holds(5)]),
             run(0, true, Unbound, vec![Holds(0)]),

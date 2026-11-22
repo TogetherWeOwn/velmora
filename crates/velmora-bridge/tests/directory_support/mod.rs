@@ -42,24 +42,6 @@ pub const MIGRATIONS: [(&str, &str); 3] = [
     ),
 ];
 
-/// Every table of the schema, children before parents, for the probe's
-/// reset.
-const TABLES: [&str; 13] = [
-    "units",
-    "key_routes",
-    "bucket_index",
-    "tenants",
-    "key_locations",
-    "pending_ops",
-    "shred_slots",
-    "registry",
-    "directory_gate",
-    "tenant_events",
-    "feed_epoch",
-    "tenant_feed_pruned",
-    "token_caps",
-];
-
 /// A directory database for one test.
 #[allow(clippy::large_enum_variant)]
 pub enum Db {
@@ -70,6 +52,13 @@ pub enum Db {
 /// Whether this run is on D1.
 pub fn on_d1() -> bool {
     std::env::var("VELMORA_D1_PROBE").is_ok_and(|v| !v.is_empty())
+}
+
+/// Whether this run has the unit suite's workerd twin (every native
+/// database is also a Durable Object SQLite database, compared call by
+/// call; `crates/velmora-bridge/src/testkit_shadow.rs` where it exists).
+pub fn under_twin() -> bool {
+    std::env::var("VELMORA_SQL_SHADOW").is_ok_and(|v| !v.is_empty())
 }
 
 /// A fresh directory database with the whole schema.
@@ -118,28 +107,140 @@ impl Sql for Db {
 }
 
 /// The schema as single statements: the probe runs each one on its own
-/// (D1's `exec` takes one statement per line). The directory's
-/// migrations hold no trigger, so a statement ends at the first `;`.
+/// (one statement per `prepare`).
 pub fn statements() -> Vec<String> {
+    MIGRATIONS
+        .iter()
+        .flat_map(|(_, sql)| split_sql(sql))
+        .collect()
+}
+
+/// The catalogue's migrations (`workers/s3-bridge/migrations`), in order.
+pub fn catalogue_migrations() -> Vec<(String, String)> {
+    let dir = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../workers/s3-bridge/migrations"
+    );
+    let mut files: Vec<(String, String)> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.extension().is_some_and(|x| x == "sql"))
+        .map(|p| {
+            (
+                p.file_name().unwrap().to_string_lossy().into_owned(),
+                std::fs::read_to_string(&p).unwrap(),
+            )
+        })
+        .collect();
+    files.sort();
+    files
+}
+
+/// Splits a migration into its statements: on `;` outside a string, a
+/// quoted name and a comment, and outside a trigger's body (`BEGIN` …
+/// `END`, with every `CASE` … `END` inside it). Comments are dropped.
+pub fn split_sql(sql: &str) -> Vec<String> {
     let mut out = Vec::new();
-    for (name, sql) in MIGRATIONS {
-        assert!(
-            !sql.to_ascii_uppercase().contains("CREATE TRIGGER"),
-            "{name}: the probe's split takes no trigger"
-        );
-        let body: String = sql
-            .lines()
-            .map(|l| l.split("--").next().unwrap_or(""))
-            .collect::<Vec<_>>()
-            .join("\n");
-        for stmt in body.split(';') {
-            let stmt = stmt.trim();
-            if !stmt.is_empty() {
-                out.push(stmt.to_string());
+    let mut cur = String::new();
+    let mut word = String::new();
+    let mut depth: i32 = 0;
+    let mut trigger = false;
+    let mut words = 0;
+    let chars: Vec<char> = sql.chars().collect();
+    let mut i = 0;
+    let end_word = |word: &mut String, depth: &mut i32, trigger: &mut bool, words: &mut i32| {
+        if word.is_empty() {
+            return;
+        }
+        let w = word.to_ascii_uppercase();
+        *words += 1;
+        if *words == 2 && w == "TRIGGER" {
+            *trigger = true;
+        }
+        if *trigger {
+            match w.as_str() {
+                "BEGIN" | "CASE" => *depth += 1,
+                "END" => *depth -= 1,
+                _ => {}
             }
         }
+        word.clear();
+    };
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '-' && chars.get(i + 1) == Some(&'-') {
+            end_word(&mut word, &mut depth, &mut trigger, &mut words);
+            while i < chars.len() && chars[i] != '\n' {
+                i += 1;
+            }
+            cur.push('\n');
+            continue;
+        }
+        if c == '\'' || c == '"' {
+            end_word(&mut word, &mut depth, &mut trigger, &mut words);
+            cur.push(c);
+            i += 1;
+            while i < chars.len() {
+                cur.push(chars[i]);
+                if chars[i] == c {
+                    if chars.get(i + 1) == Some(&c) {
+                        cur.push(c);
+                        i += 2;
+                        continue;
+                    }
+                    break;
+                }
+                i += 1;
+            }
+            i += 1;
+            continue;
+        }
+        if c.is_ascii_alphanumeric() || c == '_' {
+            word.push(c);
+        } else {
+            end_word(&mut word, &mut depth, &mut trigger, &mut words);
+        }
+        if c == ';' && depth <= 0 {
+            let stmt = cur.trim().to_string();
+            if !stmt.is_empty() {
+                out.push(stmt);
+            }
+            cur.clear();
+            depth = 0;
+            trigger = false;
+            words = 0;
+        } else {
+            cur.push(c);
+        }
+        i += 1;
+    }
+    end_word(&mut word, &mut depth, &mut trigger, &mut words);
+    let stmt = cur.trim().to_string();
+    if !stmt.is_empty() {
+        out.push(stmt);
     }
     out
+}
+
+/// A fresh catalogue database with the catalogue's whole schema, its
+/// triggers included: native SQLite, or D1 through the probe.
+pub fn catalogue_database() -> Db {
+    match std::env::var("VELMORA_D1_PROBE") {
+        Ok(base) if !base.is_empty() => {
+            let schema: Vec<String> = catalogue_migrations()
+                .iter()
+                .flat_map(|(_, sql)| split_sql(sql))
+                .collect();
+            Db::D1(D1Probe::take_with(&base, schema))
+        }
+        _ => {
+            let db = RusqliteSql::open_in_memory().unwrap();
+            for (_, sql) in catalogue_migrations() {
+                db.apply(&sql).unwrap();
+            }
+            Db::Native(db)
+        }
+    }
 }
 
 /// One test at a time holds the probe's databases.
@@ -169,6 +270,10 @@ fn sql_err(msg: &str) -> BridgeError {
 
 impl D1Probe {
     fn take(base: &str) -> D1Probe {
+        Self::take_with(base, statements())
+    }
+
+    fn take_with(base: &str, schema: Vec<String>) -> D1Probe {
         let held = HELD.with(|h| h.get());
         assert!(held < 2, "the probe holds two databases");
         let lock = match held {
@@ -187,7 +292,7 @@ impl D1Probe {
             _lock: lock,
         };
         let answer = probe
-            .call("/reset", &json!({"drop": TABLES, "schema": statements()}))
+            .call("/wipe", &json!({ "schema": schema }))
             .expect("probe reset");
         assert_eq!(answer["ok"], json!(true), "probe reset: {answer}");
         probe

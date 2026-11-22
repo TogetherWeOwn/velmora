@@ -98,7 +98,12 @@ fn fail(status: u16, code: &'static str, message: &'static str) -> S3Response {
 }
 
 fn unavailable() -> S3Response {
-    fail(503, "SlowDown", "Not available now; retry shortly.")
+    let mut resp = fail(503, "SlowDown", "Not available now; retry shortly.");
+    resp.headers.push((
+        "retry-after".into(),
+        super::gate::RETRY_AFTER_SECS.to_string(),
+    ));
+    resp
 }
 
 /// Whether the request carries a body: a declared length above 0, or a
@@ -250,11 +255,21 @@ where
                 "A managed tenant chain exists; nothing was run.",
             )
         }
-        Ok(FirstOpenAnswer::Ran(run)) if run.opened => json_response(
-            200,
-            &json!({ "gate": "open", "ran": true, "epoch": run.epoch }),
-        ),
         Ok(FirstOpenAnswer::Ran(run)) => {
+            if run.anchor_strays != 0 {
+                crate::trace::alert(|| "setup: first open found stray gate anchors".to_string());
+            }
+            if run.tenants.damaged() {
+                crate::trace::alert(|| {
+                    "setup: first open found a damaged tenant chain".to_string()
+                });
+            }
+            if run.opened {
+                return json_response(
+                    200,
+                    &json!({ "gate": "open", "ran": true, "epoch": run.epoch }),
+                );
+            }
             // The step names and their problem codes are fixed words.
             let not_done: Vec<Value> = run
                 .steps
@@ -273,6 +288,6 @@ where
                 }),
             )
         }
-        Err(_) => unavailable(),
+        Ok(FirstOpenAnswer::Moved) | Err(_) => unavailable(),
     }
 }

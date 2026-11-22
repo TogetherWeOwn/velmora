@@ -820,6 +820,13 @@ impl crate::directory::finish::TenantUnits for NoTenantUnits {
     ) -> Result<crate::directory::finish::UnitHolds> {
         Err(BridgeError::NotImplemented("TenantUnits"))
     }
+    async fn held(
+        &self,
+        _tenant: &crate::TenantId,
+        _unit: u32,
+    ) -> Result<crate::directory::finish::UnitHolds> {
+        Err(BridgeError::NotImplemented("TenantUnits"))
+    }
     async fn mark_born(&self, _tenant: &crate::TenantId, _unit: u32) -> Result<()> {
         Err(BridgeError::NotImplemented("TenantUnits"))
     }

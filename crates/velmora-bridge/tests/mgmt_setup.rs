@@ -526,7 +526,6 @@ async fn an_open_gate_stays_open_and_keeps_pending_ops() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-#[ignore = "waits for L3-E first_open bodies"]
 async fn a_managed_tenant_chain_refuses_first_open_and_alerts() {
     let ports = Ports::with_closed_directory();
     let dir = ports.dir();
@@ -543,31 +542,78 @@ async fn a_managed_tenant_chain_refuses_first_open_and_alerts() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-#[ignore = "waits for L3-E first_open bodies"]
+async fn a_first_open_lookup_failure_returns_retry_after() {
+    let ports = Ports::with_closed_directory();
+    ports.records.refuse_lists(true);
+
+    let resp = ports.post(GATE_PATH).await;
+    expect_error(&resp, 503, "SlowDown");
+    let retry_after = resp.headers.iter().find_map(|(name, value)| {
+        name.eq_ignore_ascii_case("retry-after")
+            .then_some(value.as_str())
+    });
+    assert_eq!(retry_after, Some("5"));
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn a_closed_gate_without_tenants_runs_first_open() {
     let ports = Ports::with_closed_directory();
     let dir = ports.dir();
     assert!(!is_open(&ports.records, &dir).await.unwrap());
 
-    let resp = ports.post(GATE_PATH).await;
-    let opened = match resp.status {
-        200 => true,
-        503 => false,
-        status => panic!("expected a first-open run response (200 or 503), got {status}"),
-    };
-    let body = json_response(&resp, resp.status);
-    if opened {
-        assert_eq!(body["gate"], "open");
-        assert_eq!(body["ran"], true);
-    } else {
-        assert_eq!(body["error"], "gate_not_opened");
-    }
-    let (epoch, strays) = anchored_epoch(&ports.records).await.unwrap();
-    assert_eq!((epoch, strays), (1, 0));
-    assert_eq!(body["epoch"], epoch);
-    assert_eq!(dir.gate().await.unwrap().epoch, epoch);
-    assert_eq!(is_open(&ports.records, &dir).await.unwrap(), opened);
+    let body = json_response(&ports.post(GATE_PATH).await, 503);
+    assert_eq!(body["error"], "gate_not_opened");
+    assert_eq!(body["epoch"], 1);
+    assert_eq!(
+        body["not_done"],
+        json!([{"step": "key_locations_and_registry", "problems": ["key_locations_absent"]}])
+    );
+    assert_eq!(anchored_epoch(&ports.records).await.unwrap(), (1, 0));
+    assert_eq!(dir.gate().await.unwrap().epoch, 1);
+    assert!(!is_open(&ports.records, &dir).await.unwrap());
     assert_eq!(ports.records.puts(), 1);
     assert_eq!(ports.records.names().len(), 1);
+
     ports.assert_key_buckets_untouched();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_closed_gate_with_key_locations_opens_at_epoch_one() {
+    let ports = Ports::with_closed_directory();
+    let dir = ports.dir();
+    assert_eq!(ports.post(KEY_PATH).await.status, 200);
+
+    assert_eq!(
+        json_response(&ports.post(GATE_PATH).await, 200),
+        json!({"gate": "open", "ran": true, "epoch": 1})
+    );
+    assert_eq!(anchored_epoch(&ports.records).await.unwrap(), (1, 0));
+    assert!(is_open(&ports.records, &dir).await.unwrap());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_stray_gate_anchor_leaves_first_open_closed_and_alerts() {
+    let ports = Ports::with_closed_directory();
+    assert_eq!(ports.post(KEY_PATH).await.status, 200);
+    ports.records.plant("m/dg/x", Vec::new());
+
+    watch_alerts();
+    expect_error(&ports.post(GATE_PATH).await, 503, "gate_not_opened");
+    assert_eq!(take_alerts().len(), 1);
+    assert!(!is_open(&ports.records, &ports.dir()).await.unwrap());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_damaged_tenant_zero_chain_leaves_first_open_closed_and_alerts() {
+    let ports = Ports::with_closed_directory();
+    assert_eq!(ports.post(KEY_PATH).await.status, 200);
+    ports.records.plant(
+        "m/t/t_0000000000000000/00000000000000000001",
+        b"damaged tenant record".to_vec(),
+    );
+
+    watch_alerts();
+    expect_error(&ports.post(GATE_PATH).await, 503, "gate_not_opened");
+    assert_eq!(take_alerts().len(), 1);
+    assert!(!is_open(&ports.records, &ports.dir()).await.unwrap());
 }
