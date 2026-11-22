@@ -337,9 +337,40 @@ mod tests {
                 SqlValue::Text("-7".into()),
             ]
         );
-        for unsafe_int in [MAX_SAFE_INT + 1, -MAX_SAFE_INT - 1, i64::MAX, i64::MIN] {
+        // Both edges bind; 2^53 and 2^53 + 1, either sign, are refused
+        // at bind, before any call (AM-22): 2^53 is exact in a double but
+        // not safe, because 2^53 + 1 rounds to it.
+        let (_, edges) = d1_bound(
+            "SELECT ?1, ?2",
+            &[SqlValue::Int(MAX_SAFE_INT), SqlValue::Int(-MAX_SAFE_INT)],
+        )
+        .unwrap();
+        assert_eq!(
+            edges,
+            [
+                SqlValue::Text("9007199254740991".into()),
+                SqlValue::Text("-9007199254740991".into()),
+            ]
+        );
+        for unsafe_int in [
+            MAX_SAFE_INT + 1,
+            -MAX_SAFE_INT - 1,
+            MAX_SAFE_INT + 2,
+            -MAX_SAFE_INT - 2,
+            i64::MAX,
+            i64::MIN,
+        ] {
             assert!(
                 d1_bound("SELECT ?1", &[SqlValue::Int(unsafe_int)]).is_err(),
+                "{unsafe_int}"
+            );
+            // One unsafe value refuses the whole statement.
+            assert!(
+                d1_bound(
+                    "SELECT ?1, ?2",
+                    &[SqlValue::Int(1), SqlValue::Int(unsafe_int)]
+                )
+                .is_err(),
                 "{unsafe_int}"
             );
         }
@@ -356,7 +387,20 @@ mod tests {
         let now = 1_794_000_000_000_i64; // a millisecond timestamp
         assert_eq!(number_to_int(now as f64).unwrap(), now);
         assert_eq!(number_to_int(MAX_SAFE_INT as f64).unwrap(), MAX_SAFE_INT);
-        for bad in [1.5, f64::NAN, f64::INFINITY, 9_007_199_254_740_992.0] {
+        assert_eq!(
+            number_to_int(-(MAX_SAFE_INT as f64)).unwrap(),
+            -MAX_SAFE_INT
+        );
+        // A stored value outside the range is refused on read, never
+        // rounded (AM-22 rule 3); 2^53 + 1 arrives as 2^53.
+        for bad in [
+            1.5,
+            f64::NAN,
+            f64::INFINITY,
+            9_007_199_254_740_992.0,
+            -9_007_199_254_740_992.0,
+            i64::MAX as f64,
+        ] {
             assert!(number_to_int(bad).is_err(), "{bad}");
         }
         assert_eq!(number_to_byte(255.0).unwrap(), 255);

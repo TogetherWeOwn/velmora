@@ -263,8 +263,31 @@ mod tests {
     fn unsafe_integers_are_refused_both_ways() {
         assert!(int_to_number(MAX_SAFE_INT).is_ok());
         assert!(int_to_number(-MAX_SAFE_INT).is_ok());
-        assert!(int_to_number(MAX_SAFE_INT + 1).is_err());
+        assert_eq!(
+            int_to_number(MAX_SAFE_INT).unwrap(),
+            9_007_199_254_740_991.0
+        );
+        // Refused at bind (AM-22): ±2^53 and ±(2^53 + 1).
+        for unsafe_int in [
+            MAX_SAFE_INT + 1,
+            -MAX_SAFE_INT - 1,
+            MAX_SAFE_INT + 2,
+            -MAX_SAFE_INT - 2,
+            i64::MAX,
+            i64::MIN,
+        ] {
+            assert!(int_to_number(unsafe_int).is_err(), "{unsafe_int}");
+        }
+        assert_eq!(
+            number_to_int(9_007_199_254_740_991.0).unwrap(),
+            MAX_SAFE_INT
+        );
+        assert_eq!(
+            number_to_int(-9_007_199_254_740_991.0).unwrap(),
+            -MAX_SAFE_INT
+        );
         assert!(number_to_int(9_007_199_254_740_992.0).is_err());
+        assert!(number_to_int(-9_007_199_254_740_992.0).is_err());
         assert!(number_to_int(2.5).is_err());
         assert!(number_to_int(f64::NAN).is_err());
         assert_eq!(number_to_int(-42.0).unwrap(), -42);
