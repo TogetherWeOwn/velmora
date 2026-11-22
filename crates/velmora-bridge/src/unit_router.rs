@@ -16,8 +16,14 @@
 //! uses [`NoHeads`], which fails every read, so the consumer hands the
 //! message back and never acknowledges on a head it could not read.
 
-use crate::types::{BridgeError, Result};
-use crate::unit::{CallKind, Seqs, TenantId, TenantState, UnitAnswer, UnitName, UnitOp};
+use std::cell::RefCell;
+use std::collections::HashMap;
+
+use crate::config::Maintenance;
+use crate::tenant_catalog::UnitPort;
+use crate::types::{BridgeError, Result, UnixMs};
+use crate::unit::{CallKind, Seqs, TenantId, TenantState, UnitAnswer, UnitCall, UnitName, UnitOp};
+use crate::unit_consumer::ConsumerClient;
 
 /// What the consumer and the router take from a tenant's verified head.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -84,6 +90,20 @@ pub enum KeyTenant {
 #[allow(async_fn_in_trait)]
 pub trait KeyRoutes {
     async fn tenant_of(&self, access_key_id: &str) -> Result<KeyTenant>;
+}
+
+/// No key routes in this build: every read fails, so every request takes
+/// tenant 0's path (ADR §8.4, a failed route read, DUR-10).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NoRoutes;
+
+/// The error of [`NoRoutes`].
+pub const NO_KEY_ROUTES: &str = "no key routes in this build";
+
+impl KeyRoutes for NoRoutes {
+    async fn tenant_of(&self, _: &str) -> Result<KeyTenant> {
+        Err(BridgeError::NotImplemented(NO_KEY_ROUTES))
+    }
 }
 
 /// A unit the router chose, and what every call to it carries.
@@ -174,4 +194,176 @@ pub trait UnitRouter {
 /// the three reads (`UnitOp::is_read`).
 pub fn writes(kind: CallKind, op: &UnitOp) -> bool {
     kind == CallKind::Request && !op.is_read()
+}
+
+// ---------------------------------------------------------------------------
+// The router
+// ---------------------------------------------------------------------------
+
+/// How long an isolate uses a tenant head it read: the 60 s of ADR §8.4
+/// ("any mutable fact cached ... used for at most 60 s"), never extended
+/// because of an error.
+pub const HEAD_MAX_AGE_MS: i64 = 60_000;
+
+/// The heads an isolate read, per tenant, with the time each was read.
+#[derive(Debug, Default)]
+pub struct HeadCache {
+    heads: RefCell<HashMap<TenantId, (HeadView, UnixMs)>>,
+}
+
+/// At most this many tenants are kept; past it the cache is emptied (an
+/// isolate that serves that many tenants re-reads their heads).
+const HEAD_CACHE_TENANTS: usize = 1024;
+
+impl HeadCache {
+    fn get(&self, tenant: &TenantId, now: UnixMs) -> Option<HeadView> {
+        let heads = self.heads.borrow();
+        let (head, at) = heads.get(tenant)?;
+        // A clock that went back counts as old.
+        (now.0 >= at.0 && now.0 - at.0 < HEAD_MAX_AGE_MS).then(|| head.clone())
+    }
+
+    fn put(&self, tenant: &TenantId, head: HeadView, now: UnixMs) {
+        let mut heads = self.heads.borrow_mut();
+        if heads.len() >= HEAD_CACHE_TENANTS && !heads.contains_key(tenant) {
+            heads.clear();
+        }
+        heads.insert(tenant.clone(), (head, now));
+    }
+
+    fn forget(&self, tenant: &TenantId) {
+        self.heads.borrow_mut().remove(tenant);
+    }
+}
+
+/// The way to one unit's object (the Worker's `UnitStub`).
+pub trait UnitPorts {
+    type Port: UnitPort;
+    /// `Err`: the object cannot be named or reached.
+    fn open(&self, unit: &UnitName) -> Result<Self::Port>;
+}
+
+/// The router of one request (or one management call): the isolate's
+/// head cache, the ports, and the request's clock reading.
+pub struct Router<'a, P, H, C> {
+    pub maintenance: Maintenance,
+    pub ports: &'a P,
+    pub heads: &'a H,
+    pub client: &'a C,
+    pub cache: &'a HeadCache,
+    pub now: UnixMs,
+}
+
+/// The root unit of a tenant: unit 0 (ADR §2.5).
+const ROOT_UNIT: u32 = 0;
+
+impl<P: UnitPorts, H: TenantHeads, C: ConsumerClient> Router<'_, P, H, C> {
+    async fn head(
+        &self,
+        tenant: &TenantId,
+        fresh: bool,
+    ) -> std::result::Result<HeadView, RouteRefusal> {
+        if !fresh {
+            if let Some(head) = self.cache.get(tenant, self.now) {
+                return Ok(head);
+            }
+        }
+        self.cache.forget(tenant);
+        let head = self
+            .heads
+            .head(tenant)
+            .await
+            .map_err(|_| RouteRefusal::Unavailable)?;
+        self.cache.put(tenant, head.clone(), self.now);
+        Ok(head)
+    }
+}
+
+impl<P: UnitPorts, H: TenantHeads, C: ConsumerClient> UnitRouter for Router<'_, P, H, C> {
+    async fn route(
+        &self,
+        tenant: &TenantId,
+        bucket: Option<&str>,
+    ) -> std::result::Result<Routed, RouteRefusal> {
+        if tenant.is_zero() {
+            // Tenant 0's catalogue is D1 (or, after the move, unit 0 by
+            // its own record): never through this router in this build.
+            return Err(RouteRefusal::NotPlaced);
+        }
+        let head = self.head(tenant, false).await?;
+        let root = UnitName::new(tenant.clone(), ROOT_UNIT);
+        if !head.lists(&root) {
+            return Err(RouteRefusal::NotPlaced);
+        }
+        // The root unit's placement list is not read by this build: only
+        // a tenant whose head lists the root unit alone has a known place
+        // for every bucket.
+        if bucket.is_some() && head.units != [ROOT_UNIT] {
+            return Err(RouteRefusal::NotPlaced);
+        }
+        Ok(Routed {
+            unit: root,
+            seqs: head.seqs,
+            listed: true,
+        })
+    }
+
+    async fn call(
+        &self,
+        routed: &Routed,
+        kind: CallKind,
+        authenticated: bool,
+        op: UnitOp,
+    ) -> std::result::Result<UnitAnswer, RouteRefusal> {
+        if self.maintenance == Maintenance::Restore && writes(kind, &op) {
+            return Err(RouteRefusal::Maintenance);
+        }
+        let port = self
+            .ports
+            .open(&routed.unit)
+            .map_err(|_| RouteRefusal::Unavailable)?;
+        let mut seqs = routed.seqs;
+        let mut again = false;
+        loop {
+            let call = UnitCall {
+                name: routed.unit.clone(),
+                kind,
+                seqs: Some(seqs),
+                authenticated,
+                listed: routed.listed,
+                op: op.clone(),
+            };
+            let answer = port
+                .call(&call)
+                .await
+                .map_err(|_| RouteRefusal::Unavailable)?;
+            match answer {
+                UnitAnswer::Closed { .. } => return Err(RouteRefusal::Closed),
+                UnitAnswer::Unborn { listed: true } => return Err(RouteRefusal::CatalogueLost),
+                // The router names only listed units; an unlisted answer
+                // is a unit that does not exist.
+                UnitAnswer::Unborn { listed: false } => return Err(RouteRefusal::NotPlaced),
+                // A request with lower numbers: refresh and retry once
+                // (rule 5).
+                UnitAnswer::Stale { .. } if kind == CallKind::Request && !again => {
+                    seqs = self.head(&routed.unit.tenant, true).await?.seqs;
+                }
+                // The caller knows a newer record: `sync` first (rule 5).
+                UnitAnswer::SyncNeeded { .. } if kind == CallKind::Request && !again => {
+                    seqs = self
+                        .client
+                        .sync(&routed.unit)
+                        .await
+                        .map_err(|_| RouteRefusal::NotFresh)?;
+                }
+                UnitAnswer::Stale { .. } | UnitAnswer::SyncNeeded { .. }
+                    if kind == CallKind::Request =>
+                {
+                    return Err(RouteRefusal::NotFresh)
+                }
+                other => return Ok(other),
+            }
+            again = true;
+        }
+    }
 }

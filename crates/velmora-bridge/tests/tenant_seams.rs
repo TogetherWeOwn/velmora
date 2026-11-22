@@ -435,14 +435,21 @@ fn the_catalogue_id_is_read_in_one_place() {
 }
 
 /// The directory is a port and one adapter, and nothing asks it yet: no
-/// request and no job is routed by it.
+/// request and no job is routed by it. The request router of a managed
+/// tenant's units (`unit_router`, design round 5) is another port, with
+/// a `route` of its own; only it and its one caller may say `.route(`.
 #[test]
 fn the_directory_is_asked_by_nothing() {
     let all = all();
     const DIRECTORY: &str = "bridge/directory.rs";
+    const UNIT_ROUTER: [&str; 2] = ["bridge/unit_router.rs", "bridge/service/mod.rs"];
     for name in ["Directory", "SingleTenant", "directory::", ".route("] {
         let found = uses(&all, name);
-        let files: Vec<&String> = found.keys().filter(|f| *f != DIRECTORY).collect();
+        let files: Vec<&String> = found
+            .keys()
+            .filter(|f| *f != DIRECTORY)
+            .filter(|f| !(name == ".route(" && UNIT_ROUTER.contains(&f.as_str())))
+            .collect();
         assert!(files.is_empty(), "{name}: {files:?}");
     }
     // One method, and one adapter.

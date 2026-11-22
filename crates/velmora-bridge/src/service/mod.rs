@@ -310,6 +310,113 @@ where
     }
 }
 
+// ---------------------------------------------------------------------------
+// A managed tenant's request (design round 5, AM-51)
+// ---------------------------------------------------------------------------
+
+pub use common::{claimed_access_key, writes_refused};
+
+impl Route<'_> {
+    /// The operation changes stored state: the maintenance gate refuses
+    /// it (`open_gate`, and for a unit `serve_managed`).
+    pub fn writes(&self) -> bool {
+        matches!(
+            self,
+            Route::CreateBucket { .. }
+                | Route::DeleteBucket { .. }
+                | Route::DeleteObjects { .. }
+                | Route::PutObject { .. }
+                | Route::DeleteObject { .. }
+                | Route::CreateMultipartUpload { .. }
+                | Route::UploadPart { .. }
+                | Route::CompleteMultipartUpload { .. }
+                | Route::AbortMultipartUpload { .. }
+        )
+    }
+
+    /// The bucket the operation names, raw.
+    pub fn bucket(&self) -> Option<&str> {
+        match *self {
+            Route::Admin { .. } | Route::ListBuckets | Route::NotImplemented => None,
+            Route::CreateBucket { bucket }
+            | Route::DeleteBucket { bucket }
+            | Route::HeadBucket { bucket }
+            | Route::GetBucketLocation { bucket }
+            | Route::ListObjects { bucket }
+            | Route::DeleteObjects { bucket }
+            | Route::ListMultipartUploads { bucket }
+            | Route::PutObject { bucket, .. }
+            | Route::GetObject { bucket, .. }
+            | Route::HeadObject { bucket, .. }
+            | Route::DeleteObject { bucket, .. }
+            | Route::CreateMultipartUpload { bucket, .. }
+            | Route::UploadPart { bucket, .. }
+            | Route::CompleteMultipartUpload { bucket, .. }
+            | Route::AbortMultipartUpload { bucket, .. }
+            | Route::ListParts { bucket, .. } => Some(bucket),
+        }
+    }
+}
+
+/// The fixed code of a managed tenant's request that the unit cannot take
+/// yet: the unit has no S3 request operations in this build.
+pub const UNIT_REQUESTS_NOT_BUILT: &str = "unit_requests_not_built";
+
+/// What became of a managed tenant's request, for the log line: a fixed
+/// code, and whether it pages.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ManagedLine {
+    pub code: &'static str,
+    pub alert: bool,
+}
+
+/// A request whose access key routes to the managed tenant `tenant`
+/// (`unit_router::KeyRoutes`), through `router` to its unit.
+///
+/// Under `MAINTENANCE=restore` a request that writes ([`Route::writes`])
+/// answers `503` with `Retry-After` before anything is read: no unit
+/// call, no head read (AM-50; DS1 §3.4 from 8(b) to step 9). Any other
+/// request is routed to its unit ([`crate::unit_router::UnitRouter::route`]);
+/// a refusal answers `503`. This build has no S3 request operations on a
+/// unit, so a routed request answers `503` ([`UNIT_REQUESTS_NOT_BUILT`])
+/// as well, and the signature is never checked: nothing is read or
+/// written for it.
+pub async fn serve_managed<R: crate::unit_router::UnitRouter>(
+    router: &R,
+    maintenance: crate::config::Maintenance,
+    tenant: &crate::unit::TenantId,
+    req: &S3Request,
+) -> (S3Response, ManagedLine) {
+    let route = classify(&req.method, &req.raw_target);
+    let line = |code, alert| ManagedLine { code, alert };
+    match route {
+        Route::NotImplemented => {
+            return (
+                S3Response::not_implemented(),
+                line("not_implemented", false),
+            )
+        }
+        // The admin plane takes its bearer, never an access key.
+        Route::Admin { .. } => {
+            return (
+                common::s3_error(velmora_s3_proto::ErrorCode::AccessDenied),
+                line("admin_with_key", false),
+            )
+        }
+        _ => {}
+    }
+    if maintenance == crate::config::Maintenance::Restore && route.writes() {
+        return (writes_refused(), line("maintenance", false));
+    }
+    match router.route(tenant, route.bucket()).await {
+        Err(refusal) => (
+            common::unit_refused(),
+            line(refusal.code(), refusal.alert()),
+        ),
+        Ok(_) => (common::unit_refused(), line(UNIT_REQUESTS_NOT_BUILT, false)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{classify, Route};

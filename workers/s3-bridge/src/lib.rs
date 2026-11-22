@@ -226,7 +226,15 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
         )
         .is_ok(),
     );
+    // Off as shipped: without the unit binding no request takes a key
+    // route, and tenant 0's path is unchanged.
+    let units = units::units(&env);
     let resp = ingress::front(incoming.req, &bridge.cfg, incoming.https, |req| async {
+        if let Some(resp) =
+            units::route_request(&env, &bridge, units, admin || internal.get(), &req).await
+        {
+            return resp;
+        }
         let resp = handle_detached(&ctx, Rc::clone(&bridge), req).await;
         // A deferred document: buffered when it is done soon, else
         // streamed with keepalive whitespace.

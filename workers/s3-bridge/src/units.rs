@@ -40,7 +40,9 @@ use velmora_bridge::tenant_catalog::{LatestSeqs, TenantCatalog, UnitPort, UnitRe
 use velmora_bridge::types::JobOutcome;
 use velmora_bridge::unit::{Seqs, TenantId, UnitAnswer, UnitCall, UnitName};
 use velmora_bridge::unit_consumer::{NoClient, UnitRun};
-use velmora_bridge::unit_router::NoHeads;
+use velmora_bridge::unit_router::{
+    HeadCache, KeyRoutes, KeyTenant, NoHeads, NoRoutes, Router, UnitPorts,
+};
 use velmora_bridge::{Bridge, BridgeError, Result};
 use worker::wasm_bindgen::JsValue;
 use worker::{Env, Method, ObjectNamespace, Request, RequestInit, Stub};
@@ -81,7 +83,7 @@ pub struct UnitStub {
 impl UnitStub {
     /// The object named `<tenant>/<unit>` in `namespace`, the name a unit
     /// is made under (`UnitName::object_name`).
-    fn new(namespace: &ObjectNamespace, name: &UnitName) -> Result<UnitStub> {
+    pub(crate) fn new(namespace: &ObjectNamespace, name: &UnitName) -> Result<UnitStub> {
         let stub = namespace
             .id_from_name(&name.object_name())
             .and_then(|id| id.get_stub())
@@ -200,4 +202,74 @@ impl UnitRun for OnUnit<'_> {
         crate::log_post_trace(self.job, &outcome);
         (outcome, self.bridge.catalog.refusal())
     }
+}
+
+// ---------------------------------------------------------------------------
+// The request router (design round 5, AM-51)
+// ---------------------------------------------------------------------------
+
+/// The unit objects of the bound class.
+pub struct WorkerPorts {
+    namespace: ObjectNamespace,
+}
+
+impl UnitPorts for WorkerPorts {
+    type Port = UnitStub;
+    fn open(&self, unit: &UnitName) -> Result<UnitStub> {
+        UnitStub::new(&self.namespace, unit)
+    }
+}
+
+/// The key routes of this build: none (see `velmora_bridge::unit_router`).
+pub fn routes() -> NoRoutes {
+    NoRoutes
+}
+
+thread_local! {
+    /// The tenant heads this isolate read (`unit_router::HeadCache`).
+    static HEADS: std::rc::Rc<HeadCache> = std::rc::Rc::default();
+}
+
+/// A request whose claimed access key routes to a managed tenant, served
+/// through the router (`velmora_bridge::service::serve_managed`). `None`:
+/// tenant 0's path, unchanged, which is every request of a Worker without
+/// `UNIT` bound (no route read at all), every request that claims no key
+/// or a key of tenant 0, and every request whose route read failed (ADR
+/// §8.4, DUR-10). `skip`: an admin route or a verified fan-out piece,
+/// which never take a key route.
+pub async fn route_request(
+    env: &Env,
+    base: &WorkerBridge,
+    units: Units,
+    skip: bool,
+    req: &velmora_bridge::S3Request,
+) -> Option<velmora_bridge::S3Response> {
+    if units != Units::Bound || skip {
+        return None;
+    }
+    let akid = velmora_bridge::service::claimed_access_key(&base.cfg, req)?;
+    let tenant = match routes().tenant_of(&akid).await {
+        Ok(KeyTenant::Managed(tenant)) => tenant,
+        Ok(KeyTenant::Zero) | Err(_) => return None,
+    };
+    let ports = WorkerPorts {
+        namespace: env.durable_object(UNIT_BINDING).ok()?,
+    };
+    let cache = HEADS.with(std::rc::Rc::clone);
+    let (heads, client) = (heads(), client());
+    let router = Router {
+        maintenance: base.cfg.maintenance,
+        ports: &ports,
+        heads: &heads,
+        client: &client,
+        cache: &cache,
+        now: velmora_bridge::ports::Clock::now(&base.clock),
+    };
+    let (resp, line) =
+        velmora_bridge::service::serve_managed(&router, base.cfg.maintenance, &tenant, req).await;
+    match line.alert {
+        true => worker::console_error!("alert: unit request ({})", line.code),
+        false => worker::console_log!("unit request ({})", line.code),
+    }
+    Some(resp)
 }
