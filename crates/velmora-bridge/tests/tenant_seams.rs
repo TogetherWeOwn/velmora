@@ -543,6 +543,15 @@ fn the_directory_is_asked_by_nothing() {
         root.matches("SqlDirectory").count(),
         "the root names the directory's store only"
     );
+    // The control root speaks the separate key-chain target, not the
+    // request-routing port. Strip only the target type names to keep the
+    // `Directory` token check active for this file, too.
+    const CONTROL: &str = "bridge/root/control.rs";
+    let mut control = all[CONTROL].clone();
+    for allowed in ["RootDirectoryKeys", "UnboundDirectory", "DirectoryKeys"] {
+        control = control.replace(allowed, "");
+    }
+    assert!(!control.contains("Directory"));
     // The port's paths: the tenant chain's reader (`directory::chain`,
     // `directory::record`), which the unit client reads heads with, is not
     // the port.
@@ -560,7 +569,7 @@ fn the_directory_is_asked_by_nothing() {
             .keys()
             .filter(|f| *f != DIRECTORY && !f.starts_with("bridge/directory/"))
             .filter(|f| !(name == ".route(" && UNIT_ROUTER.contains(&f.as_str())))
-            .filter(|f| !(*f == ROOT && name == "Directory"))
+            .filter(|f| !(name == "Directory" && (*f == ROOT || *f == CONTROL)))
             .collect();
         assert!(files.is_empty(), "{name}: {files:?}");
     }

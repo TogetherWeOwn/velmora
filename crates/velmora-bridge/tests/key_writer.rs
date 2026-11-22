@@ -844,6 +844,83 @@ async fn a_new_key_is_in_the_chain_first_and_then_in_every_store() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn an_unbound_root_directory_does_not_hold_a_new_key_closed() {
+    use velmora_bridge::keys::tk::KeyBuckets;
+    use velmora_bridge::root::{Root, RootCache, RootPorts};
+    use velmora_bridge::testkit::RusqliteSql;
+
+    struct UnboundPorts<'a>(&'a World);
+    impl RootPorts for UnboundPorts<'_> {
+        type Records = MemRecords;
+        type KeyStore = MemRecords;
+        type Kek = TestKek;
+        type Sql = RusqliteSql;
+        type Clock = FixedClock;
+
+        fn records(&self) -> &MemRecords {
+            &self.0.store
+        }
+        fn key_buckets(&self) -> KeyBuckets<'_, MemRecords> {
+            KeyBuckets {
+                by_name: Vec::new(),
+            }
+        }
+        fn kek(&self) -> &TestKek {
+            &self.0.kek
+        }
+        fn directory(&self) -> Option<&RusqliteSql> {
+            None
+        }
+        fn clock(&self) -> &FixedClock {
+            &self.0.clock
+        }
+    }
+
+    let w = World::new();
+    let cache = RootCache::new();
+    let ports = UnboundPorts(&w);
+    let root = Root::new(&ports, &cache, TestRng(7));
+    let target = root.directory_key_target(&w.t, &w.ring);
+    let adm = FakeAdmission::new(&w.root);
+    let units = w.units();
+    let env = KeyEnv {
+        store: root.records(),
+        kek: root.kek(),
+        ring: &w.ring,
+        tenant: &w.t,
+        admission: &adm,
+        intents: &w.intents,
+        units: &units,
+        directory: &target,
+        clock: root.clock(),
+        limits: Limits::Recorded,
+        gate: &FakeGate::before_move(),
+    };
+    let mut table = table(&w);
+    let mut rng = TestRng(1);
+    let principal = principal("PR0001", &[grant("b_01", RW, None)]);
+    let key = s3_key(&w.t, "AKVL0001", "PR0001", &[grant("b_01", RO, None)]);
+    for (seq, request) in [(1, principal), (2, key)] {
+        assert_eq!(
+            env.change(
+                &mut table,
+                &format!("idem-{seq}"),
+                &KeyRequest::Create(request),
+                &mut rng
+            )
+            .await
+            .unwrap(),
+            KeyAnswer::Done { seq },
+        );
+    }
+    for unit in units {
+        let got = unit.row("AKVL0001").unwrap();
+        assert_eq!(got.door.status, SubjectStatus::Active);
+        assert!(got.private.unwrap().secret_wrapped.is_some());
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn closing_changes_take_effect_with_the_directory_down() {
     let w = World::new();
     let adm = FakeAdmission::new(&w.root);

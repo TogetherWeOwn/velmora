@@ -798,10 +798,10 @@ where
         job_result(Delivery::HandBack, "raise_failed", pages)
     }
 
-    /// The unit's numbers, from a read-only request call with the lowest
-    /// numbers: every answer to it but `unborn` carries the unit's own.
-    /// `None` = unborn.
-    async fn unit_seqs(&self) -> Result<Option<Seqs>> {
+    /// The unit's numbers, from one read-only request call with the lowest
+    /// numbers. No renew, sync, retry or cache. `None` = unborn; a response
+    /// without usable numbers is an error otherwise.
+    pub(crate) async fn unit_seqs(&self) -> Result<Option<Seqs>> {
         let call = UnitCall {
             name: self.name.clone(),
             kind: CallKind::Request,
