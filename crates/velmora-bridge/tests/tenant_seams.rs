@@ -310,6 +310,13 @@ fn a_blob_is_named_without_a_scope_only_at_the_listed_places() {
             // The delete list the catalogue makes for garbage
             // collection: rows carry no tenant yet.
             ("bridge/sql/gc.rs", 2),
+            // KNOWN, for L4: the owner move's own names of a managed
+            // tenant's blobs (`tenant_safety_key`, `tenant_cache_key`:
+            // two definitions and one call). L4's line has no
+            // `TenantScope`; the two lines met first in the management
+            // line's merge. They must become scope calls when L4's line
+            // takes `tenant.rs`; listed here so the count cannot grow.
+            ("bridge/keys/moving.rs", 3),
         ],
     );
     for job_path in [
@@ -386,10 +393,19 @@ fn a_blob_is_named_without_a_scope_only_at_the_listed_places() {
             assert!(!all[job_path].contains(named), "{job_path}: {named}");
         }
     }
-    // And no name of the two families is written out by hand.
+    // And no name of the two families is written out by hand, but for
+    // the one KNOWN place above (L4's owner move, once each).
     for family in ["\"x/", "\"c/"] {
         let found = uses(&all, family);
-        let files: Vec<&String> = found.keys().collect();
+        assert_eq!(
+            found.get("bridge/keys/moving.rs").copied(),
+            Some(1),
+            "{family}"
+        );
+        let files: Vec<&String> = found
+            .keys()
+            .filter(|f| *f != "bridge/keys/moving.rs")
+            .collect();
         assert_eq!(files, ["bridge/tenant.rs", "bridge/types.rs"], "{family}");
     }
 }
@@ -513,8 +529,14 @@ fn the_directory_is_asked_by_nothing() {
     const DIRECTORY: &str = "bridge/directory/port.rs";
     // The request router of a managed tenant's units (`unit_router`,
     // design round 5) is another port, with a `route` of its own: only it
-    // and its one caller may say `.route(`.
-    const UNIT_ROUTER: [&str; 2] = ["bridge/unit_router.rs", "bridge/service/mod.rs"];
+    // and its callers may say `.route(`.
+    // The management plane's root-unit adapter (L5-R4) is the second
+    // caller.
+    const UNIT_ROUTER: [&str; 3] = [
+        "bridge/unit_router.rs",
+        "bridge/service/mod.rs",
+        "bridge/mgmt/adapters.rs",
+    ];
     // The composition root (`root`, L6-5) is the one reader of the
     // directory's store for that router: its key routes
     // (`SqlDirectory::route`, ADR §8.4 step 2). It runs only with `UNIT`

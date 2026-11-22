@@ -466,7 +466,9 @@ impl<P: UnitPort, S: Catalog> Catalog for TenantCatalog<P, S> {
         self.unit(JobCall::gc_done { id, now }).await
     }
     // The orphaned-part scan (`GC_ORPHANS`, main's #166) is not a unit job
-    // call: `run_gc` runs it for tenant 0 only, so a unit has none due.
+    // call yet: on a unit it is never due and finds nothing, so a unit's
+    // orphaned parts stay (stored, never lost) until the unit lanes add
+    // the call. Nothing is claimed or deleted for a unit here.
     async fn gc_orphans_due(&self, _now: UnixMs) -> Result<bool> {
         Ok(false)
     }
@@ -477,7 +479,7 @@ impl<P: UnitPort, S: Catalog> Catalog for TenantCatalog<P, S> {
         _scan: u32,
         _limit: u32,
     ) -> Result<Vec<GcRow>> {
-        Err(BridgeError::NotImplemented(NOT_ON_UNIT))
+        Ok(Vec::new())
     }
     async fn gc_orphan_claim(
         &self,

@@ -657,7 +657,10 @@ async fn a_job_with_lower_numbers_changes_nothing_and_gets_the_units_numbers() {
         .job_extent(&o.extent, &o.generation)
         .await
         .unwrap_err();
-    assert!(matches!(err, BridgeError::Invalid(UNIT_STALE_JOB)), "{err:?}");
+    assert!(
+        matches!(err, BridgeError::Invalid(UNIT_STALE_JOB)),
+        "{err:?}"
+    );
     let unit_seqs = Seqs {
         state_seq: 3,
         keys_seq: 0,
@@ -993,7 +996,10 @@ async fn job_calls_are_unlisted_and_keep_the_units_latest_numbers() {
         seqs(3, 1),
     );
     let err = cat.evictable_bytes().await.unwrap_err();
-    assert!(matches!(err, BridgeError::Invalid(UNIT_STALE_JOB)), "{err:?}");
+    assert!(
+        matches!(err, BridgeError::Invalid(UNIT_STALE_JOB)),
+        "{err:?}"
+    );
     assert_eq!(cat.refusal(), Some(UnitRefusal::Stale(seqs(5, 2))));
     assert_eq!(cat.latest().get(), seqs(5, 2));
     cat.run_again_with(seqs(5, 2));

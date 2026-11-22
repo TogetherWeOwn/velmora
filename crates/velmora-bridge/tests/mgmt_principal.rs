@@ -26,6 +26,7 @@ use velmora_bridge::unit::{
     BirthKind, BirthToken, CallKind, Refused, Seqs, SyncHead, TenantId, TenantState, Unit,
     UnitAnswer, UnitCall, UnitName, UnitOp,
 };
+use velmora_bridge::unit_lease::lease::Proven;
 use velmora_bridge::{BridgeError, Result, UnixMs};
 
 const NOW: UnixMs = UnixMs(1_795_000_000_000);
@@ -79,6 +80,36 @@ fn worker_call(op: UnitOp) -> UnitCall {
     }
 }
 
+/// One Worker call at `now`, as the Worker makes it under rule 12: an
+/// answer `renew_needed` (the lease ran out, or none was taken yet) is
+/// followed by a renewal at `now` and the same call once more.
+fn at(u: &Unit<RusqliteSql>, c: &UnitCall, now: UnixMs) -> UnitAnswer {
+    match u.handle(c, now) {
+        UnitAnswer::RenewNeeded { why: None, .. } => {
+            renew(u, now);
+            u.handle(c, now)
+        }
+        a => a,
+    }
+}
+
+/// The Worker's renewal at `now` (rule 12): the lease then holds for T.
+fn renew(u: &Unit<RusqliteSql>, now: UnixMs) {
+    let seqs = u.head().unwrap().seqs;
+    let op = UnitOp::Renew {
+        proof_start: now,
+        proven: Proven {
+            state_seq: seqs.state_seq,
+            keys_seq: seqs.keys_seq,
+            stamp_counter: None,
+            revoked: 0,
+        },
+        revocations: Vec::new(),
+    };
+    let a = u.handle(&worker_call(op), now);
+    assert!(matches!(a, UnitAnswer::Ok { .. }), "renew: {a:?}");
+}
+
 fn grant(bucket: &str, access: Access) -> KeyGrant {
     KeyGrant {
         bucket_id: bucket.into(),
@@ -112,7 +143,8 @@ fn unit_keys_seq(u: &Unit<RusqliteSql>) -> u64 {
 
 fn sync(u: &Unit<RusqliteSql>, state: TenantState) {
     let h = u.head().unwrap();
-    let a = u.handle(
+    let a = at(
+        u,
         &worker_call(UnitOp::Sync {
             head: SyncHead {
                 seqs: Seqs {
@@ -238,15 +270,20 @@ impl RootUnit for Root<'_> {
             return Err(down());
         }
         self.asks.borrow_mut().push(op.clone());
-        Ok(reserve_answer(
-            &self.unit.handle(&worker_call(op.clone()), self.now.get()),
-        ))
+        Ok(reserve_answer(&at(
+            self.unit,
+            &worker_call(op.clone()),
+            self.now.get(),
+        )))
     }
 
     async fn release(&self, _t: &TenantId, rid: &Rid) -> Result<()> {
         self.releases.set(self.releases.get() + 1);
-        self.unit
-            .handle(&worker_call(UnitOp::Release { rid: *rid }), self.now.get());
+        at(
+            self.unit,
+            &worker_call(UnitOp::Release { rid: *rid }),
+            self.now.get(),
+        );
         Ok(())
     }
 }
@@ -344,7 +381,8 @@ impl<'a> Chain<'a> {
         if entries.is_empty() {
             return;
         }
-        let a = self.unit.handle(
+        let a = at(
+            self.unit,
             &worker_call(UnitOp::ApplyKeys {
                 from_seq,
                 entries,

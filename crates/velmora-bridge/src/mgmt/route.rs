@@ -55,7 +55,7 @@
 use velmora_mgmt_types::ids::{valid_bucket_id, valid_principal_id, valid_tenant_id};
 
 use crate::mgmt::token::Scope;
-use crate::recovery::{valid_key_id, DEFAULT_TENANT};
+use crate::recovery::valid_key_id;
 
 /// The prefix of every management path.
 pub const PREFIX: &str = "/v1";
@@ -372,9 +372,10 @@ pub fn route(method: &str, path: &str) -> Result<Call, NoCall> {
 }
 
 /// A tenant id this plane serves: `t_` and 16 lowercase hex characters,
-/// and not tenant 0 (the contract's form).
+/// and not tenant 0 (the contract's form; the managed tenant id of the
+/// control seal, which refuses tenant 0).
 pub fn tenant_id(s: &str) -> Option<&str> {
-    (valid_tenant_id(s) && s != DEFAULT_TENANT).then_some(s)
+    (valid_tenant_id(s) && crate::TenantId::parse(s).is_ok()).then_some(s)
 }
 
 /// 32 lowercase hex characters, as the catalogue mints upload ids.

@@ -295,7 +295,10 @@ impl T {
         assert_eq!(report.gc_enqueued, !jobs.is_empty());
         assert!(jobs.len() <= 1);
         for job in &jobs {
-            assert_eq!(self.rig.bridge.run_job(&TENANT_ZERO, job).await, JobOutcome::Ack);
+            assert_eq!(
+                self.rig.bridge.run_job(&TENANT_ZERO, job).await,
+                JobOutcome::Ack
+            );
         }
         !jobs.is_empty()
     }
@@ -571,7 +574,10 @@ async fn off_by_default_and_nothing_is_deleted_while_off() {
     // (sent before the switch went off) does nothing.
     assert!(!t.tick().await);
     let job = Job::Gc { v: 1 };
-    assert_eq!(t.rig.bridge.run_job(&TENANT_ZERO, &job).await, JobOutcome::Ack);
+    assert_eq!(
+        t.rig.bridge.run_job(&TENANT_ZERO, &job).await,
+        JobOutcome::Ack
+    );
     assert_eq!(t.blobs(), blobs);
     assert_eq!(
         t.count("SELECT COUNT(*) FROM gc WHERE done_at IS NOT NULL"),
@@ -1870,7 +1876,10 @@ async fn a_blob_delete_that_fails_is_repeated_by_the_next_pass() {
         1
     );
     // The job that runs again reads the rest of the pass: nothing.
-    assert_eq!(t.rig.bridge.run_job(&TENANT_ZERO, &job).await, JobOutcome::Ack);
+    assert_eq!(
+        t.rig.bridge.run_job(&TENANT_ZERO, &job).await,
+        JobOutcome::Ack
+    );
     assert_eq!(t.blobs().len(), 1);
 
     *t.rig.bridge.safety.fail_delete.borrow_mut() = None;
@@ -1899,7 +1908,10 @@ async fn nothing_is_deleted_on_a_catalogue_behind_its_stamp() {
 
     // The job on its own: it compares the stamp before it reads a row.
     let job = Job::Gc { v: 1 };
-    assert_eq!(t.rig.bridge.run_job(&TENANT_ZERO, &job).await, JobOutcome::Ack);
+    assert_eq!(
+        t.rig.bridge.run_job(&TENANT_ZERO, &job).await,
+        JobOutcome::Ack
+    );
     assert_eq!(t.blobs(), blobs);
     assert_eq!(
         t.count("SELECT COUNT(*) FROM scan_cursors WHERE k = 'orphans'"),
@@ -2247,7 +2259,10 @@ async fn rows_written_per_collected_part() {
         let sql = &t.catalog().sql;
         sql.meter_writes().unwrap();
         let job = Job::Gc { v: 1 };
-        assert_eq!(t.rig.bridge.run_job(&TENANT_ZERO, &job).await, JobOutcome::Ack);
+        assert_eq!(
+            t.rig.bridge.run_job(&TENANT_ZERO, &job).await,
+            JobOutcome::Ack
+        );
         assert!(t.blobs().is_empty());
         let writes = sql.writes();
         let by = |needle: &str| -> u64 {

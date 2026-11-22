@@ -384,9 +384,9 @@ where
     }
 
     /// Handles up to [`GC_BATCH`] due `gc` rows of the tenant of `scope`
-    /// in the mode `GC_MODE` allows and, for tenant 0, one window of
-    /// orphaned upload parts with `GC_ORPHANS` (the orphan scan is not a
-    /// unit job call: a managed tenant's unit has no such rows yet).
+    /// in the mode `GC_MODE` allows, and one window of orphaned upload
+    /// parts with `GC_ORPHANS` (on a unit the scan finds none yet: it is
+    /// not a unit job call, `tenant_catalog`).
     async fn run_gc(&self, scope: &TenantScope) -> JobOutcome {
         // Every step of both is idempotent, so a failed job simply runs
         // again.
@@ -398,10 +398,7 @@ where
         if rows.is_err() {
             outcome = RETRY;
         }
-        if self.cfg.gc_orphans
-            && scope.is_tenant_zero()
-            && self.orphan_batch().await.is_err()
-        {
+        if self.cfg.gc_orphans && self.orphan_batch(scope).await.is_err() {
             outcome = RETRY;
         }
         outcome
@@ -461,7 +458,7 @@ where
     /// The scan has already moved past the window, so a job that runs
     /// again after an error reads the next one, and the rows that failed
     /// wait for the next pass.
-    async fn orphan_batch(&self) -> Result<()> {
+    async fn orphan_batch(&self, scope: &TenantScope) -> Result<()> {
         // As in `gc_batch`: nothing is deleted on a catalogue that is
         // behind its stamp.
         if self.catalogue_rolled_back().await? {
@@ -481,7 +478,7 @@ where
         let (granted, claimed) = self.catalog.gc_orphan_claim(&rows, now, cutoff).await;
         let mut failed = claimed.err();
         for (row, _) in rows.iter().zip(granted).filter(|(_, granted)| *granted) {
-            if let Err(e) = self.orphan_row(row).await {
+            if let Err(e) = self.orphan_row(scope, row).await {
                 failed.get_or_insert(e);
             }
         }
@@ -489,8 +486,8 @@ where
     }
 
     /// One orphaned part whose claim was granted.
-    async fn orphan_row(&self, row: &GcRow) -> Result<()> {
-        delete_blob(&self.safety, &row.extent_id.safety_key()).await?;
+    async fn orphan_row(&self, scope: &TenantScope, row: &GcRow) -> Result<()> {
+        delete_blob(&self.safety, &scope.safety_key(&row.extent_id)).await?;
         self.catalog.gc_orphan_done(row.id, self.clock.now()).await
     }
 
