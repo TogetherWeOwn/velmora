@@ -13,17 +13,19 @@
 //! and nothing holds a key (rule 3).
 
 use velmora_bridge::unit::identity::Refusal;
+use velmora_bridge::unit::restore::{self, PointInTimePort};
 use velmora_bridge::unit::{Refused, Unit, UnitAnswer, UnitCall, UnitName};
 use velmora_bridge::UnixMs;
 use worker::js_sys::Reflect;
 use worker::wasm_bindgen::{self, JsValue};
 use worker::{durable_object, Date, DurableObject, Env, Method, Request, Response, State};
 
-use crate::DoSql;
+use crate::{DoSql, PointInTime};
 
 #[durable_object]
 pub struct UnitObject {
     unit: Option<Unit<DoSql>>,
+    pitr: PointInTime,
 }
 
 impl DurableObject for UnitObject {
@@ -31,7 +33,8 @@ impl DurableObject for UnitObject {
         let name = state.id().name().and_then(|n| UnitName::parse(&n));
         let jurisdiction = jurisdiction(&state);
         let unit = name.map(|own| Unit::new(DoSql::new(&state.storage()), own, &jurisdiction));
-        UnitObject { unit }
+        let pitr = PointInTime::new(&state);
+        UnitObject { unit, pitr }
     }
 
     async fn fetch(&self, mut req: Request) -> worker::Result<Response> {
@@ -46,8 +49,14 @@ impl DurableObject for UnitObject {
         else {
             return Response::error("not a unit call", 400);
         };
+        let now = UnixMs(Date::now().as_millis() as i64);
         let answer = match &self.unit {
-            Some(unit) => unit.handle(&call, UnixMs(Date::now().as_millis() as i64)),
+            // The two restore calls need the object's storage: the unit
+            // checks first, then the bookmark calls run here (AM-2).
+            Some(unit) if call.op.restore_call() => {
+                restore::drive(unit.pitr_step(&call, now), &self.pitr).await
+            }
+            Some(unit) => unit.handle(&call, now),
             None => UnitAnswer::Refused {
                 reason: Refused::Identity(Refusal::WrongName),
                 alarm: true,
@@ -66,4 +75,18 @@ fn jurisdiction(state: &State) -> String {
         .and_then(|id| Reflect::get(&id, &JsValue::from_str("jurisdiction")).ok())
         .and_then(|j| j.as_string())
         .unwrap_or_default()
+}
+
+impl PointInTimePort for PointInTime {
+    async fn current(&self) -> velmora_bridge::Result<String> {
+        PointInTime::current(self).await
+    }
+
+    async fn at(&self, unix_ms: i64) -> velmora_bridge::Result<String> {
+        PointInTime::at(self, unix_ms).await
+    }
+
+    async fn restore_now(&self, bookmark: &str) -> velmora_bridge::Result<()> {
+        PointInTime::restore_now(self, bookmark).await
+    }
 }

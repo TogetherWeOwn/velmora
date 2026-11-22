@@ -101,6 +101,21 @@ check("a read plan of a missing bucket", unit_post(0, call(0, "request", {"op": 
 check("an unknown field beside an operation", unit_post(0, dict(call(0, "request", PING, (3, 0)), op={"op": "ping", "evil": 1})),
       None)
 
+# The restore calls go through the class (AM-2): an open unit refuses
+# both, and nothing is armed.
+check("restore_prepare on an open unit", unit_post(0, call(0, "worker", {"op": "restore_prepare", "since": 3})),
+      {"answer": "refused", "reason": {"restore": "not_restoring"}, "alarm": False})
+rtoken = dict(token, kind="restore")
+check("restore on an open unit", unit_post(0, call(0, "worker", {"op": "restore", "token": rtoken,
+      "target": {"to": "time", "at_ms": 1}, "expect_undo": "bm"})),
+      {"answer": "refused", "reason": {"restore": "not_restoring"}, "alarm": False})
+check("a restore entry closes the unit", unit_post(0, call(0, "worker", {"op": "sync", "head": {"seqs": {"state_seq": 4, "keys_seq": 0},
+      "tenant_state": "active", "restoring_since": 4}})), {"answer": "ok", "seqs": {"state_seq": 4, "keys_seq": 0}, "body": {"synced": 4}})
+check("restore_prepare too soon after the close", unit_post(0, call(0, "worker", {"op": "restore_prepare", "since": 4})),
+      {"answer": "refused", "reason": {"restore": "too_soon"}, "alarm": False})
+check("the entry is not cleared without the lift check", unit_post(0, call(0, "worker", {"op": "sync", "head": {"seqs": {"state_seq": 5, "keys_seq": 0},
+      "tenant_state": "active"}})), {"answer": "refused", "reason": {"gate": "no_report"}, "alarm": False})
+
 # The whole-call transaction.
 atomic = post("/atomic/smoke", {}).get("ok", {})
 check("a call keeps its writes", atomic["kept"], {"ok": True, "rows": [1]})

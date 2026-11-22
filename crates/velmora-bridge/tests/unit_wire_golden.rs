@@ -1,0 +1,327 @@
+//! The golden JSON of the unit's wire format (`docs/units.md`, "The
+//! calls are JSON"; amendment AM-5).
+//!
+//! One sample of every variant of `UnitOp` and `UnitAnswer` (and of the
+//! refusals), serialised, must equal `tests/golden/unit-wire.json` byte
+//! for byte, and must read back to the same value. After the class is
+//! bound (stage C(b)) these types only gain fields, in two deploys,
+//! reader first: a change to this file is then a format change, made on
+//! purpose. The `kind` functions are exhaustive matches, so a new variant
+//! does not compile until it has a sample here.
+//!
+//! To write the file after a deliberate change: `UNIT_WIRE_GOLDEN=write`.
+
+use serde_json::{json, Value};
+use velmora_bridge::unit::call::{Closed, HoldMode};
+use velmora_bridge::unit::gate::GateFindings;
+use velmora_bridge::unit::identity::Refusal;
+use velmora_bridge::unit::import::{
+    ImportBatch, ImportRefusal, ImportTable, ImportValue, MoveHead,
+};
+use velmora_bridge::unit::keys::{Access, KeyEntry, KeyGrant, KeyKind, KeyRefusal, SubjectStatus};
+use velmora_bridge::unit::lift::{AckClass, GateRefusal, ReplayId};
+use velmora_bridge::unit::restore::{Bookmark, RestoreRefusal, RestoreTarget};
+use velmora_bridge::unit::{
+    BirthKind, BirthToken, CallKind, ProvisionRefusal, Reader, Refused, Seqs, SyncHead, TenantId,
+    TenantState, UnitAnswer, UnitCall, UnitName, UnitOp,
+};
+
+const GOLDEN: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/golden/unit-wire.json");
+
+fn name() -> UnitName {
+    UnitName::new(TenantId::parse("t_00000000000000f1").unwrap(), 0)
+}
+
+fn seqs() -> Seqs {
+    Seqs {
+        state_seq: 7,
+        keys_seq: 3,
+    }
+}
+
+fn rid() -> ReplayId {
+    ReplayId {
+        since: 7,
+        ordinal: 4,
+        nonce: "n1".into(),
+    }
+}
+
+fn token() -> BirthToken {
+    BirthToken {
+        name: name(),
+        jurisdiction: "eu".into(),
+        record_seq: 7,
+        schema_version: 26,
+        key_scheme: 2,
+        kind: BirthKind::Restore,
+    }
+}
+
+/// Exhaustive: a new operation does not compile without a sample.
+fn op_kind(op: &UnitOp) -> &'static str {
+    match op {
+        UnitOp::Provision { .. } => "provision",
+        UnitOp::Sync { .. } => "sync",
+        UnitOp::Ping {} => "ping",
+        UnitOp::KeyRow { .. } => "key_row",
+        UnitOp::ApplyKeys { .. } => "apply_keys",
+        UnitOp::HeldKeys {} => "held_keys",
+        UnitOp::Import { .. } => "import",
+        UnitOp::ImportProgress {} => "import_progress",
+        UnitOp::RestorePrepare { .. } => "restore_prepare",
+        UnitOp::Restore { .. } => "restore",
+        UnitOp::GateOpen { .. } => "gate_open",
+        UnitOp::GateReport { .. } => "gate_report",
+        UnitOp::GateAck { .. } => "gate_ack",
+        UnitOp::GateStatus {} => "gate_status",
+        UnitOp::ReadPlan { .. } => "read_plan",
+    }
+}
+
+/// Exhaustive: a new answer does not compile without a sample.
+fn answer_kind(a: &UnitAnswer) -> &'static str {
+    match a {
+        UnitAnswer::Ok { .. } => "ok",
+        UnitAnswer::SyncNeeded { .. } => "sync_needed",
+        UnitAnswer::Stale { .. } => "stale",
+        UnitAnswer::KeysBehind { .. } => "keys_behind",
+        UnitAnswer::Refused { .. } => "refused",
+        UnitAnswer::UndoBookmark { .. } => "undo_bookmark",
+        UnitAnswer::Unborn { .. } => "unborn",
+        UnitAnswer::Closed { .. } => "closed",
+        UnitAnswer::Failed { .. } => "failed",
+    }
+}
+
+/// Exhaustive over the refusal reasons.
+fn refused_kind(r: &Refused) -> &'static str {
+    match r {
+        Refused::Identity(_) => "identity",
+        Refused::Provision(_) => "provision",
+        Refused::Unauthenticated => "unauthenticated",
+        Refused::WroteWithoutAuthentication => "wrote_without_authentication",
+        Refused::AwaitedInside => "awaited_inside",
+        Refused::StaleSync => "stale_sync",
+        Refused::KeysNotApplied => "keys_not_applied",
+        Refused::AccountProblem => "account_problem",
+        Refused::AccessDenied => "access_denied",
+        Refused::NotFound => "not_found",
+        Refused::Keys(_) => "keys",
+        Refused::Import(_) => "import",
+        Refused::Restore(_) => "restore",
+        Refused::Gate(_) => "gate",
+    }
+}
+
+fn ops() -> Vec<UnitOp> {
+    vec![
+        UnitOp::Provision {
+            token: token(),
+            sealed: vec![1, 2, 3],
+        },
+        UnitOp::Sync {
+            head: SyncHead {
+                seqs: seqs(),
+                tenant_state: TenantState::Suspended,
+                tenant_mode: Some(HoldMode::ReadOnly),
+                restoring_since: Some(7),
+            },
+        },
+        UnitOp::Ping {},
+        UnitOp::KeyRow {
+            access_key_id: "AKGOLDEN000000000001".into(),
+        },
+        UnitOp::ApplyKeys {
+            from_seq: 2,
+            entries: vec![KeyEntry {
+                id: "AKGOLDEN000000000001".into(),
+                kind: KeyKind::S3,
+                status: SubjectStatus::Active,
+                held: false,
+                made_by: Some("p_1".into()),
+                grants: vec![KeyGrant {
+                    bucket_id: "b_00000000000000f1".into(),
+                    access: Access::Ro,
+                    expires_at: Some(9),
+                    prefix: Some("a/".into()),
+                    ip_list: vec!["192.0.2.0/24".into()],
+                }],
+                created_at: 5,
+                secret_wrapped: Some(vec![2, 9]),
+                secret_kek_version: Some(1),
+                owner_ref: Some("m_1".into()),
+                last_seq: 3,
+            }],
+        },
+        UnitOp::HeldKeys {},
+        UnitOp::Import {
+            head: MoveHead {
+                seq: 11,
+                selector: "moving".into(),
+                to: Some(name().tenant),
+            },
+            since: 7,
+            batch: ImportBatch {
+                table: ImportTable::UsageHours,
+                columns: ImportTable::UsageHours
+                    .columns()
+                    .iter()
+                    .map(|c| c.to_string())
+                    .collect(),
+                after: Some("c1".into()),
+                cursor: "c2".into(),
+                rows: vec![vec![
+                    ImportValue::Int(1),
+                    ImportValue::Null,
+                    ImportValue::Text("t".into()),
+                    ImportValue::Blob(vec![255]),
+                    ImportValue::Int(0),
+                    ImportValue::Int(0),
+                ]],
+            },
+        },
+        UnitOp::ImportProgress {},
+        UnitOp::RestorePrepare { since: 7 },
+        UnitOp::Restore {
+            token: token(),
+            target: RestoreTarget::Time { at_ms: 1_000 },
+            expect_undo: Bookmark("bm-1".into()),
+        },
+        UnitOp::Restore {
+            token: token(),
+            target: RestoreTarget::Bookmark {
+                bookmark: Bookmark("bm-0".into()),
+            },
+            expect_undo: Bookmark("bm-1".into()),
+        },
+        UnitOp::GateOpen { replay_id: rid() },
+        UnitOp::GateReport {
+            replay_id: rid(),
+            findings: GateFindings {
+                complete: true,
+                damaged_total: 1,
+                damaged: vec!["g_1".into()],
+                held_missing_live: Some(vec![]),
+                ..GateFindings::default()
+            },
+        },
+        UnitOp::GateAck {
+            replay_id: rid(),
+            class: AckClass::Damaged,
+            ids: vec!["g_1".into()],
+        },
+        UnitOp::GateStatus {},
+        UnitOp::ReadPlan {
+            bucket: "alpha".into(),
+            key: "k".into(),
+            start: 0,
+            end: 10,
+            access_key_id: Some("AKGOLDEN000000000001".into()),
+            reader: Some(Reader::Key {
+                access_key_id: "AKGOLDEN000000000001".into(),
+            }),
+            generation: Some("g_1".into()),
+        },
+    ]
+}
+
+fn refusals() -> Vec<Refused> {
+    vec![
+        Refused::Identity(Refusal::WrongName),
+        Refused::Provision(ProvisionRefusal::AlreadyBorn),
+        Refused::Unauthenticated,
+        Refused::WroteWithoutAuthentication,
+        Refused::AwaitedInside,
+        Refused::StaleSync,
+        Refused::KeysNotApplied,
+        Refused::AccountProblem,
+        Refused::AccessDenied,
+        Refused::NotFound,
+        Refused::Keys(KeyRefusal::Gap),
+        Refused::Import(ImportRefusal::OutOfOrder),
+        Refused::Restore(RestoreRefusal::Moved),
+        Refused::Gate(GateRefusal::AckMismatch),
+    ]
+}
+
+fn answers() -> Vec<UnitAnswer> {
+    let mut out = vec![
+        UnitAnswer::Ok {
+            seqs: seqs(),
+            body: json!({ "synced": 7 }),
+        },
+        UnitAnswer::SyncNeeded { seqs: seqs() },
+        UnitAnswer::Stale { seqs: seqs() },
+        UnitAnswer::KeysBehind { seqs: seqs() },
+        UnitAnswer::UndoBookmark {
+            seqs: seqs(),
+            bookmark: Bookmark("bm-1".into()),
+        },
+        UnitAnswer::Unborn { listed: true },
+        UnitAnswer::Closed {
+            seqs: seqs(),
+            why: Closed::Restoring,
+        },
+        UnitAnswer::Failed {
+            class: "sql".into(),
+        },
+    ];
+    out.extend(refusals().into_iter().map(|reason| UnitAnswer::Refused {
+        reason,
+        alarm: false,
+    }));
+    out
+}
+
+fn document() -> Value {
+    let calls: Vec<Value> = ops()
+        .into_iter()
+        .map(|op| {
+            let c = UnitCall {
+                name: name(),
+                kind: CallKind::Worker,
+                seqs: Some(seqs()),
+                authenticated: true,
+                listed: true,
+                op,
+            };
+            // Each reads back to itself.
+            let v = serde_json::to_value(&c).unwrap();
+            assert_eq!(serde_json::from_value::<UnitCall>(v.clone()).unwrap(), c);
+            v
+        })
+        .collect();
+    let answers: Vec<Value> = answers()
+        .into_iter()
+        .map(|a| {
+            let v = serde_json::to_value(&a).unwrap();
+            assert_eq!(serde_json::from_value::<UnitAnswer>(v.clone()).unwrap(), a);
+            v
+        })
+        .collect();
+    json!({ "calls": calls, "answers": answers })
+}
+
+#[test]
+fn every_variant_has_a_sample() {
+    let ops: std::collections::BTreeSet<_> = ops().iter().map(op_kind).collect();
+    assert_eq!(ops.len(), 15, "{ops:?}");
+    let answers: std::collections::BTreeSet<_> = answers().iter().map(answer_kind).collect();
+    assert_eq!(answers.len(), 9, "{answers:?}");
+    let reasons: std::collections::BTreeSet<_> = refusals().iter().map(refused_kind).collect();
+    assert_eq!(reasons.len(), 14, "{reasons:?}");
+}
+
+#[test]
+fn the_wire_format_is_the_golden_file() {
+    let text = serde_json::to_string_pretty(&document()).unwrap() + "\n";
+    if std::env::var("UNIT_WIRE_GOLDEN").as_deref() == Ok("write") {
+        std::fs::write(GOLDEN, &text).unwrap();
+    }
+    let golden = std::fs::read_to_string(GOLDEN).expect("tests/golden/unit-wire.json");
+    assert_eq!(
+        text, golden,
+        "the unit wire format changed: see the module doc"
+    );
+}

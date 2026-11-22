@@ -104,9 +104,10 @@ variant.
 
 **What a unit keeps besides the catalogue:** `unit_birth` (the
 certificate); `unit_head` (`state_seq`, `keys_seq`, the tenant state and
-mode, `restoring_since` and, with the restore call, `closed_at`; moved by
+mode, `restoring_since` and `closed_at`; moved by
 `sync`, and `keys_seq` by the key apply); `unit_keys` and
-`unit_key_grants` (the key chain); the lease and the alarm's counters in
+`unit_key_grants` (the key chain); the gate report and its
+acknowledgements; the lease and the alarm's counters in
 `unit_lease`, and revocations listed for a key the unit does not hold as
 tombstones (with the lease); and the stamp counter.
 
@@ -185,7 +186,54 @@ it after the signature verifies. A missing bucket is answered with the key
 row too: a missing bucket and a missing grant both answer `AccessDenied`,
 after the signature.
 
+## Restore
+
+A unit is rolled back only by the restore procedure, in two calls
+(`unit::restore`), and **it never closes itself for one**: both are
+refused unless it is already closed.
+
+1. `restore_prepare(since)` answers the unit's current bookmark, the undo
+   bookmark. The tool seals it (see "Bookmarks") before the second call.
+2. `restore(token, target, expect_undo)`: the target is a time, which the
+   unit turns into a bookmark itself, or an unsealed undo bookmark when an
+   earlier restore is undone. The token is a `restore` certificate for
+   this unit and entry.
+
+Before anything is armed, the unit checks that its `restoring` entry is
+set at the seq named (the token's); that its lease has expired; that its
+clock is at least max(`closed_at` + T, `lease_hi`) + 60 s, where
+`closed_at` is its own time of the `sync` that set the entry and
+`lease_hi` the latest `fresh_until` it ever held; and, for `restore`, that
+its current bookmark is still `expect_undo` (it wrote nothing since
+`restore_prepare`; on a refusal the tool prepares again). Any failure
+refuses and arms nothing. A unit born from a `restore` token has
+`closed_at` = its birth and no lease, so a gone or unborn unit passes at
+birth. The bookmark calls need the object's storage, so the object class
+runs them after the unit's own checks; a restore never answers `ok` (the
+object restarts), and the tool reads the result from the unit's state.
+
+A unit born from a `restore` token starts with its usage counters off. The
+gate's recount turns them on, and the lift is refused while any is off. A
+unit born from a `birth` token starts with them on.
+
 ## Restore gate
+
+**The lift is checked inside the unit, against one replay of this
+restore** (`unit::lift`). The gate's final replay has a replay id: the
+entry's `since_seq` S, the stamp ordinal raised before the restore, and a
+nonce from the tool. The unit keeps one report: `gate_open` starts it and
+discards a report of any other replay id with its acknowledgements (such
+as an old one that a point-in-time restore brought back), `gate_report`
+stores what the replay found, and `gate_ack` acknowledges blocker ids by
+name, in pages of at most 100. **The `sync` that clears `restoring_since`
+is refused unless the check passes:** the report names this entry; its
+ordinal equals the unit's stamp counter as the gate levelled it; the lift
+decision below opens on its findings, and per class the acknowledged ids
+are exactly the ones the decision needs (the same count, and the same
+SHA-256 over the sorted ids with duplicates removed, UTF-8, each followed
+by `\n`); and every usage counter is on. `gate_status` answers the counts
+and hashes for the lift record. Until the replay runs inside the unit, the
+Worker sends the replay's findings with `gate_report`.
 
 A restored unit stays closed until the gate lifts it, and the gate lifts only
 on a whole, clean replay (`unit::gate`): no damaged generation, no held row

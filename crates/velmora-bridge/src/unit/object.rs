@@ -40,7 +40,9 @@ use super::call::{
 use super::identity::{self, CallKind, Seqs, Verdict};
 use super::import::{self, ImportBatch, ImportRefusal, ImportTable, Imported, MoveHead};
 use super::keys::{self, Applied, KeyEntry};
+use super::lift::{self, GateRefusal};
 use super::name::UnitName;
+use super::restore::{self, PitrStep, RestoreRefusal};
 use super::schema;
 use crate::ports::{Catalog, Sql, SqlValue};
 use crate::sql::SqlCatalog;
@@ -85,6 +87,9 @@ pub struct Head {
     pub tenant_state: TenantState,
     pub tenant_mode: Option<HoldMode>,
     pub restoring_since: Option<u64>,
+    /// The unit's time of the `sync` that set `restoring_since` (a
+    /// restore birth: its birth); none while the entry is not set.
+    pub closed_at: Option<i64>,
 }
 
 /// One unit over its database.
@@ -186,7 +191,7 @@ impl<S: UnitSql> Unit<S> {
 
     pub fn head(&self) -> Result<Head> {
         let rows = poll_once(self.sql().query(
-            "SELECT state_seq, keys_seq, tenant_state, tenant_mode, restoring_since \
+            "SELECT state_seq, keys_seq, tenant_state, tenant_mode, restoring_since, closed_at \
                FROM unit_head WHERE id = 1",
             &[],
         ))??;
@@ -209,6 +214,11 @@ impl<S: UnitSql> Unit<S> {
             SqlValue::Int(n) if *n >= 0 => Some(*n as u64),
             _ => return Err(decode("restoring_since")),
         };
+        let closed_at = match &row[5] {
+            SqlValue::Null => None,
+            SqlValue::Int(n) => Some(*n),
+            _ => return Err(decode("closed_at")),
+        };
         Ok(Head {
             seqs: Seqs {
                 state_seq: u(0)?,
@@ -217,6 +227,7 @@ impl<S: UnitSql> Unit<S> {
             tenant_state,
             tenant_mode,
             restoring_since,
+            closed_at,
         })
     }
 
@@ -265,11 +276,17 @@ impl<S: UnitSql> Unit<S> {
             ))??;
             let head = poll_once(sql.exec(
                 "INSERT INTO unit_head(id, state_seq, keys_seq, tenant_state, tenant_mode, \
-                   restoring_since) VALUES (1, ?1, 0, 'provisioning', NULL, ?2)",
+                   restoring_since, closed_at) VALUES (1, ?1, 0, 'provisioning', NULL, ?2, ?3)",
                 &[
                     int_param(token.record_seq)?,
                     match restoring {
                         Some(s) => int_param(s)?,
+                        None => SqlValue::Null,
+                    },
+                    // A unit born closed has been closed since its birth,
+                    // and has never issued a lease (AM-2).
+                    match restoring {
+                        Some(_) => SqlValue::Int(now.0),
                         None => SqlValue::Null,
                     },
                 ],
@@ -312,7 +329,49 @@ impl<S: UnitSql> Unit<S> {
         // The Worker's own calls run whatever the unit's state: they copy
         // verified records, or (the import) fill a closed unit.
         match &call.op {
-            UnitOp::Sync { head: next } => return self.sync(&head, next),
+            UnitOp::Sync { head: next } => return self.sync(&head, next, now),
+            UnitOp::RestorePrepare { .. } | UnitOp::Restore { .. } => {
+                // Restores need the object's storage: the object class
+                // runs them through `pitr_step`.
+                return Ok(refused(
+                    Refused::Restore(RestoreRefusal::NoPointInTime),
+                    false,
+                ));
+            }
+            UnitOp::GateOpen { replay_id } => {
+                return self.gate_write(&head, &mut || {
+                    Ok(lift::open(self.sql(), head.restoring_since, replay_id)?
+                        .map(|opened| json!({ "opened": opened })))
+                })
+            }
+            UnitOp::GateReport {
+                replay_id,
+                findings,
+            } => {
+                return self.gate_write(&head, &mut || {
+                    Ok(
+                        lift::report(self.sql(), head.restoring_since, replay_id, findings)?
+                            .map(|()| json!({ "reported": true })),
+                    )
+                })
+            }
+            UnitOp::GateAck {
+                replay_id,
+                class,
+                ids,
+            } => {
+                return self.gate_write(&head, &mut || {
+                    Ok(
+                        lift::ack(self.sql(), head.restoring_since, replay_id, *class, ids)?
+                            .map(|()| json!({ "acknowledged": ids.len() })),
+                    )
+                })
+            }
+            UnitOp::GateStatus {} => {
+                return self.read_only(&head, &mut || {
+                    lift::status(self.sql(), head.restoring_since)
+                })
+            }
             UnitOp::ApplyKeys { from_seq, entries } => {
                 return self.apply_keys(&head, *from_seq, entries)
             }
@@ -523,7 +582,13 @@ impl<S: UnitSql> Unit<S> {
             | UnitOp::ApplyKeys { .. }
             | UnitOp::HeldKeys {}
             | UnitOp::Import { .. }
-            | UnitOp::ImportProgress {} => {
+            | UnitOp::ImportProgress {}
+            | UnitOp::RestorePrepare { .. }
+            | UnitOp::Restore { .. }
+            | UnitOp::GateOpen { .. }
+            | UnitOp::GateReport { .. }
+            | UnitOp::GateAck { .. }
+            | UnitOp::GateStatus {} => {
                 Err(BridgeError::Invalid("worker call routed as an operation"))
             }
         }
@@ -555,6 +620,106 @@ impl<S: UnitSql> Unit<S> {
                 Ok(self.cat.grant(access_key_id, bucket).await?.is_some())
             }
         }
+    }
+
+    /// A gate call that writes: one transaction; a refusal keeps nothing.
+    fn gate_write(
+        &self,
+        head: &Head,
+        f: &mut dyn FnMut() -> Result<std::result::Result<Value, GateRefusal>>,
+    ) -> Result<UnitAnswer> {
+        let mut op = || Ok(f()?.map_err(Refused::Gate));
+        Ok(match transact(self.sql(), true, &mut op)? {
+            Ok(body) => UnitAnswer::Ok {
+                seqs: head.seqs,
+                body,
+            },
+            Err(reason) => refused(reason, false),
+        })
+    }
+
+    /// The restore calls (AM-2): the unit's own checks 1 to 3, read-only,
+    /// and what the object class does next with its storage
+    /// ([`restore::drive`]). Every other call is answered as by
+    /// [`Unit::handle`].
+    pub fn pitr_step(&self, call: &UnitCall, now: UnixMs) -> PitrStep {
+        match self.pitr_checks(call, now) {
+            Ok(step) => step,
+            Err(e) => PitrStep::Answer(failed(&e)),
+        }
+    }
+
+    fn pitr_checks(&self, call: &UnitCall, now: UnixMs) -> Result<PitrStep> {
+        let (since, restore) = match &call.op {
+            UnitOp::RestorePrepare { since } => (*since, None),
+            UnitOp::Restore {
+                token,
+                target,
+                expect_undo,
+            } => (token.record_seq, Some((token, target, expect_undo))),
+            _ => return Ok(PitrStep::Answer(self.handle(call, now))),
+        };
+        if call.name != self.own {
+            return Ok(PitrStep::Answer(refused(
+                Refused::Identity(identity::Refusal::WrongName),
+                true,
+            )));
+        }
+        match self.born()? {
+            None => {
+                return Ok(PitrStep::Answer(UnitAnswer::Unborn {
+                    listed: call.listed,
+                }))
+            }
+            Some(cert) if cert != self.own => {
+                return Ok(PitrStep::Answer(refused(
+                    Refused::Identity(identity::Refusal::WrongName),
+                    true,
+                )))
+            }
+            Some(_) => {}
+        }
+        if call.kind != CallKind::Worker {
+            return Ok(PitrStep::Answer(refused(Refused::Unauthenticated, false)));
+        }
+        let head = self.head()?;
+        let no = |r: RestoreRefusal| Ok(PitrStep::Answer(refused(Refused::Restore(r), false)));
+        if let Some((token, _, expect_undo)) = restore {
+            // The token is a restore certificate for this unit and this
+            // entry; the Worker verified its seal.
+            let ours = token.kind == BirthKind::Restore
+                && check_token(
+                    &self.own,
+                    &self.jurisdiction,
+                    token,
+                    Some(head.seqs.state_seq),
+                )
+                .is_ok();
+            if !ours {
+                return no(RestoreRefusal::WrongToken);
+            }
+            if expect_undo.0.is_empty() || expect_undo.0.len() > restore::MAX_BOOKMARK {
+                return no(RestoreRefusal::Malformed);
+            }
+        }
+        if let Some((_, restore::RestoreTarget::Bookmark { bookmark }, _)) = &restore {
+            if bookmark.0.is_empty() || bookmark.0.len() > restore::MAX_BOOKMARK {
+                return no(RestoreRefusal::Malformed);
+            }
+        }
+        let lease = restore::lease_view(self.sql())?;
+        if let Err(r) =
+            restore::closed_long_enough(head.restoring_since, head.closed_at, lease, since, now)
+        {
+            return no(r);
+        }
+        Ok(match restore {
+            None => PitrStep::Prepare { seqs: head.seqs },
+            Some((_, target, expect_undo)) => PitrStep::Restore {
+                target: target.clone(),
+                expect_undo: expect_undo.clone(),
+            },
+        })
     }
 
     /// A Worker call that only reads: run as an unauthenticated
@@ -701,7 +866,7 @@ impl<S: UnitSql> Unit<S> {
     /// The key records themselves are applied by the key-chain apply; until
     /// it exists here, a `keys_seq` above the unit's is refused, so the
     /// unit never claims a key table it does not hold.
-    fn sync(&self, head: &Head, next: &SyncHead) -> Result<UnitAnswer> {
+    fn sync(&self, head: &Head, next: &SyncHead, now: UnixMs) -> Result<UnitAnswer> {
         if next.seqs.state_seq < head.seqs.state_seq || next.seqs.keys_seq < head.seqs.keys_seq {
             return Ok(refused(Refused::StaleSync, false));
         }
@@ -713,11 +878,30 @@ impl<S: UnitSql> Unit<S> {
             return Err(BridgeError::Invalid("sync: mode without suspension"));
         }
         let sql = self.sql();
+        // The entry's close time: kept while the same entry stays, the
+        // unit's clock when an entry is set (or changed), none once
+        // cleared.
+        let closed_at = match (head.restoring_since, next.restoring_since) {
+            (_, None) => None,
+            (Some(was), Some(s)) if was == s => head.closed_at.or(Some(now.0)),
+            (_, Some(_)) => Some(now.0),
+        };
+        let lifting = head.restoring_since.is_some() && next.restoring_since.is_none();
         let mut synced = None;
+        let mut why = None;
         let mut run = || -> Result<()> {
+            if lifting {
+                // AM-2: the entry is cleared only on the unit's own lift
+                // check, against the report of this restore's replay.
+                if let Err(r) = lift::check(sql, head.restoring_since)? {
+                    why = Some(r);
+                    return Err(BridgeError::Invalid(ROLLBACK));
+                }
+                lift::clear(sql)?;
+            }
             let n = poll_once(sql.exec(
                 "UPDATE unit_head SET state_seq = ?1, tenant_state = ?2, tenant_mode = ?3, \
-                   restoring_since = ?4 WHERE id = 1",
+                   restoring_since = ?4, closed_at = ?5 WHERE id = 1",
                 &[
                     int_param(next.seqs.state_seq)?,
                     SqlValue::Text(next.tenant_state.as_str().into()),
@@ -729,6 +913,7 @@ impl<S: UnitSql> Unit<S> {
                         Some(s) => int_param(s)?,
                         None => SqlValue::Null,
                     },
+                    closed_at.map_or(SqlValue::Null, SqlValue::Int),
                 ],
             ))??;
             if n != 1 {
@@ -738,7 +923,13 @@ impl<S: UnitSql> Unit<S> {
             synced = Some(self.head()?);
             Ok(())
         };
-        sql.atomically(&mut run)?;
+        match sql.atomically(&mut run) {
+            Err(BridgeError::Invalid(ROLLBACK)) => {
+                let r = why.ok_or(BridgeError::Invalid("rollback without a reason"))?;
+                return Ok(refused(Refused::Gate(r), false));
+            }
+            other => other?,
+        }
         let head = synced.ok_or_else(|| decode("unit_head"))?;
         Ok(UnitAnswer::Ok {
             seqs: head.seqs,
