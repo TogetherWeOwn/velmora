@@ -293,6 +293,9 @@ enum FinishOutcome {
     Ready,
     Pending,
     Failed,
+    /// The stores hold the record before the head (another call's record
+    /// landed after the finisher ran).
+    Behind,
 }
 
 struct Stores<'r, 'a> {
@@ -302,20 +305,22 @@ struct Stores<'r, 'a> {
 }
 
 impl TenantStores for Stores<'_, '_> {
-    async fn finish(&self, tenant: &TenantId) -> Result<bool> {
+    async fn finish(&self, tenant: &TenantId) -> Result<Option<u64>> {
         // Read the door now, not after the handler has returned.
-        let lifecycle = self
+        let head = self
             .root
             .heads()
             .head(&Tenant::Managed(tenant.clone()), 0)
             .await
-            .expect("read the head at finish")
-            .map(|head| head.door.lifecycle);
+            .expect("read the head at finish");
+        let seq = head.as_ref().map_or(0, |head| head.door.seq);
+        let lifecycle = head.map(|head| head.door.lifecycle);
         self.calls.borrow_mut().push((tenant.clone(), lifecycle));
         match self.outcome {
-            FinishOutcome::Ready => Ok(true),
-            FinishOutcome::Pending => Ok(false),
+            FinishOutcome::Ready => Ok(Some(seq)),
+            FinishOutcome::Pending => Ok(None),
             FinishOutcome::Failed => Err(BridgeError::Sql("fake: finish failed".into())),
+            FinishOutcome::Behind => Ok(Some(seq.saturating_sub(1))),
         }
     }
 }
@@ -708,6 +713,14 @@ fn stores_not_yet_at_the_head_leave_a_live_tenant_for_retry() {
 #[test]
 fn a_store_finish_error_leaves_a_live_tenant_for_retry() {
     assert_store_failure_is_retryable(FinishOutcome::Failed);
+}
+
+/// The stores hold less than the head read after the finisher (another
+/// call's record landed in between): no answer from a head they do not
+/// hold.
+#[test]
+fn a_head_past_what_the_stores_hold_is_not_answered() {
+    assert_store_failure_is_retryable(FinishOutcome::Behind);
 }
 
 #[test]

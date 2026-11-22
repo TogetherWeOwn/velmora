@@ -513,10 +513,31 @@ impl<P: RootPorts, R: FillRandom, I: ControlIntents> KeyVersionClaims
 #[allow(async_fn_in_trait)]
 pub trait TenantStores {
     /// Brings the directory and every listed unit of `tenant` to its
-    /// chain's head. `Ok(true)`: every store holds the head (an unbound
-    /// directory counts as holding it). `Ok(false)` or `Err`: not yet; the
-    /// call answers `503` and the intent's message finishes it.
-    async fn finish(&self, tenant: &crate::TenantId) -> Result<bool>;
+    /// chain's head. `Ok(Some(seq))`: every store holds the chain up to
+    /// `seq` (an unbound directory counts as holding it). `Ok(None)` or
+    /// `Err`: not yet; the call answers `503` and the intent's message
+    /// finishes it.
+    async fn finish(&self, tenant: &crate::TenantId) -> Result<Option<u64>>;
+}
+
+/// The seq every store holds after a finisher run: the head it read, when
+/// the chain was read to its end, the directory holds it (or is unbound),
+/// and every listed unit holds it; `None` otherwise (a store waiting or
+/// failed, a unit below the head, no unit, an empty or incomplete head).
+pub fn holds_head(run: &crate::directory::finish::TenantFinish) -> Option<u64> {
+    use crate::directory::finish::StoreStep;
+    let head = run.head.seq;
+    let holds = |s: &StoreStep| match s {
+        StoreStep::Holds(seq) => *seq >= head,
+        StoreStep::Unbound => true,
+        StoreStep::Waiting | StoreStep::Failed => false,
+    };
+    (head > 0
+        && run.head.complete
+        && holds(&run.directory)
+        && !run.units.is_empty()
+        && run.units.iter().all(|(_, s)| holds(s)))
+    .then_some(head)
 }
 
 /// [`TenantStores`] over `directory::finish::finish_tenant`, with the
@@ -532,25 +553,15 @@ where
     R: FillRandom,
     U: crate::directory::finish::TenantUnits,
 {
-    async fn finish(&self, tenant: &crate::TenantId) -> Result<bool> {
-        use crate::directory::finish::{finish_tenant, StoreStep};
+    async fn finish(&self, tenant: &crate::TenantId) -> Result<Option<u64>> {
+        use crate::directory::finish::finish_tenant;
         let dir = self.root.directory();
         let now = self.root.clock().now();
         let run = finish_tenant(&self.root.chain(), dir.as_ref(), self.units, tenant, now).await?;
         for page in &run.pages {
             crate::trace::alert(|| format!("mgmt: tenant create: finisher: {page}"));
         }
-        let head = run.head.seq;
-        let holds = |s: &StoreStep| match s {
-            StoreStep::Holds(seq) => *seq >= head,
-            StoreStep::Unbound => true,
-            StoreStep::Waiting | StoreStep::Failed => false,
-        };
-        Ok(head > 0
-            && run.head.complete
-            && holds(&run.directory)
-            && !run.units.is_empty()
-            && run.units.iter().all(|(_, s)| holds(s)))
+        Ok(holds_head(&run))
     }
 }
 
@@ -766,8 +777,7 @@ where
                 return Ok(Answer::code(Code::ExternalRefRetired, None))
             }
             Lifecycle::Live => {
-                stores_hold(ports.stores, &chain_tenant).await?;
-                return answer(tenant.as_str(), door, 200);
+                return finish(root, ports.stores, &chain_tenant, &tenant, &t, 200).await;
             }
             Lifecycle::Provisioning => {}
         }
@@ -861,17 +871,12 @@ async fn head<P: RootPorts, R: FillRandom>(
 
 /// The head after the last step: `201` with the tenant once it is
 /// `live`; `503` while another create still holds a step.
-/// Step 3 before a `live` answer: `503` until every store holds the head.
-async fn stores_hold<F: TenantStores>(
-    stores: &F,
-    tenant: &crate::TenantId,
-) -> std::result::Result<(), Stop> {
-    match stores.finish(tenant).await {
-        Ok(true) => Ok(()),
-        Ok(false) | Err(_) => Err(unavailable()),
-    }
-}
-
+/// The answer after the last step. A `live` head is answered only after
+/// step 3, and only from a head that every store holds: the head is read
+/// after the finisher ran, and a head above the seq the stores hold
+/// (another call wrote a record in between) answers `503`, as does a
+/// finisher that did not finish. `503` while another create still holds a
+/// step.
 async fn finish<P: RootPorts, R: FillRandom, F: TenantStores>(
     root: &Root<'_, P, R>,
     stores: &F,
@@ -882,19 +887,22 @@ async fn finish<P: RootPorts, R: FillRandom, F: TenantStores>(
 ) -> std::result::Result<Answer, Stop> {
     let door = head(root, t).await?.ok_or_else(unavailable)?;
     match door.lifecycle {
-        Lifecycle::Live => {
-            stores_hold(stores, chain_tenant).await?;
-            // The head the stores hold: read again, so the answer is
-            // never older than what they were brought to.
-            let door = head(root, t).await?.ok_or_else(unavailable)?;
-            match door.lifecycle {
-                Lifecycle::Live => answer(tenant.as_str(), &door, status),
-                Lifecycle::Shredding | Lifecycle::Shredded => {
-                    Ok(Answer::code(Code::ExternalRefRetired, None))
-                }
-                Lifecycle::Provisioning => Err(unavailable()),
-            }
+        Lifecycle::Live => {}
+        Lifecycle::Shredding | Lifecycle::Shredded => {
+            return Ok(Answer::code(Code::ExternalRefRetired, None))
         }
+        Lifecycle::Provisioning => return Err(unavailable()),
+    }
+    let held = match stores.finish(chain_tenant).await {
+        Ok(Some(seq)) => seq,
+        Ok(None) | Err(_) => return Err(unavailable()),
+    };
+    let door = head(root, t).await?.ok_or_else(unavailable)?;
+    if door.seq > held {
+        return Err(unavailable());
+    }
+    match door.lifecycle {
+        Lifecycle::Live => answer(tenant.as_str(), &door, status),
         Lifecycle::Shredding | Lifecycle::Shredded => {
             Ok(Answer::code(Code::ExternalRefRetired, None))
         }
@@ -1039,5 +1047,66 @@ where
         let answer = create_tenant(&self.ports, body, key, &mut rng).await;
         *self.rng.borrow_mut() = Some(rng);
         answer
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::directory::finish::{StoreStep, TenantFinish};
+    use crate::pending::ChainHead;
+
+    fn run(seq: u64, complete: bool, directory: StoreStep, units: Vec<StoreStep>) -> TenantFinish {
+        TenantFinish {
+            head: ChainHead { seq, complete },
+            order: None,
+            directory,
+            units: units
+                .into_iter()
+                .enumerate()
+                .map(|(i, s)| (i as u32, s))
+                .collect(),
+            events: 0,
+            cleared_to: None,
+            pages: vec![],
+        }
+    }
+
+    #[test]
+    fn every_store_must_hold_the_head() {
+        use StoreStep::*;
+        // Held: the directory at the head or unbound, every unit at it.
+        assert_eq!(holds_head(&run(5, true, Holds(5), vec![Holds(5)])), Some(5));
+        assert_eq!(
+            holds_head(&run(5, true, Unbound, vec![Holds(5), Holds(6)])),
+            Some(5)
+        );
+        // Not held.
+        for r in [
+            run(5, true, Waiting, vec![Holds(5)]),
+            run(5, true, Failed, vec![Holds(5)]),
+            run(5, true, Holds(4), vec![Holds(5)]),
+            run(5, true, Holds(5), vec![Holds(4)]),
+            run(5, true, Holds(5), vec![Holds(5), Waiting]),
+            run(5, true, Holds(5), vec![Failed]),
+            run(5, true, Holds(5), vec![]),
+            run(5, false, Holds(5), vec![Holds(5)]),
+            run(0, true, Unbound, vec![Holds(0)]),
+        ] {
+            assert_eq!(holds_head(&r), None, "{r:?}");
+        }
+    }
+
+    #[test]
+    fn one_function_spells_the_jurisdiction() {
+        let f = Jurisdiction::None.forms();
+        assert_eq!((f.record, f.token), ("none", ""));
+        assert_eq!(Jurisdiction::of_request(None), Some(Jurisdiction::None));
+        assert_eq!(
+            Jurisdiction::of_request(Some("none")),
+            Some(Jurisdiction::None)
+        );
+        assert_eq!(Jurisdiction::of_request(Some("eu")), None);
+        assert_eq!(Jurisdiction::of_request(Some("")), None);
     }
 }
