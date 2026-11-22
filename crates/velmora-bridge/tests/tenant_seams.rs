@@ -544,7 +544,11 @@ fn the_directory_is_asked_by_nothing() {
     // (`SqlDirectory::tenant_events`, AM-37): the store again, never the
     // port.
     const EVENTS: &str = "bridge/mgmt/events.rs";
-    for file in [ROOT, EVENTS] {
+    // The management plane's control intents note and clear the
+    // directory's `pending_ops` rows (`SqlDirectory::add_pending`, AM-75):
+    // the store, never the port.
+    const INTENTS: &str = "bridge/mgmt/adapters.rs";
+    for file in [ROOT, EVENTS, INTENTS] {
         let text = &all[file];
         assert_eq!(
             text.matches("Directory").count(),
@@ -571,6 +575,7 @@ fn the_directory_is_asked_by_nothing() {
             .filter(|f| !(name == ".route(" && UNIT_ROUTER.contains(&f.as_str())))
             .filter(|f| !(*f == ROOT && name == "Directory"))
             .filter(|f| !(*f == EVENTS && name == "Directory"))
+            .filter(|f| !(*f == INTENTS && name == "Directory"))
             .collect();
         assert!(files.is_empty(), "{name}: {files:?}");
     }
