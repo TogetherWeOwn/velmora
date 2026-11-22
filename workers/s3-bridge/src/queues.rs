@@ -17,6 +17,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use futures_util::future::{join_all, select, Either};
+use velmora_bridge::jobmsg::{JobFormat, JobMessage, JobTenant};
 use velmora_bridge::{
     Backlog, BridgeError, Job, JobSink, Oldest, OutboxStage, Result, UnixMs, MAX_QUEUE_DELAY_SECS,
 };
@@ -123,6 +124,9 @@ pub struct QueueSink {
     /// bound.
     aux: Option<Queue>,
     drop_notify: DropNotify,
+    /// The format of the messages (`JOB_FORMAT`) and the tenant a
+    /// message of `v` 2 names.
+    format: (JobFormat, JobTenant),
 }
 
 /// The binding of the queue for jobs that name no extent: gc, sweep,
@@ -141,6 +145,7 @@ impl QueueSink {
         verify: Vec<Queue>,
         aux: Option<Queue>,
         drop_notify: DropNotify,
+        format: (JobFormat, JobTenant),
     ) -> std::result::Result<Self, &'static str> {
         if post.is_empty() {
             return Err("POST_Q");
@@ -153,7 +158,14 @@ impl QueueSink {
             verify,
             aux,
             drop_notify,
+            format,
         })
+    }
+
+    /// The message that carries `job`.
+    fn message<'a>(&'a self, job: &'a Job) -> JobMessage<'a> {
+        let (format, tenant) = &self.format;
+        format.message(job, tenant)
     }
 
     fn shards(&self) -> Shards {
@@ -386,7 +398,7 @@ impl JobSink for QueueSink {
         if self.drop_notify.take() {
             return Ok(());
         }
-        let msg = MessageBuilder::new(job)
+        let msg = MessageBuilder::new(self.message(job))
             .content_type(QueueContentType::Json)
             .delay_seconds(delay_secs)
             .build();
@@ -407,6 +419,8 @@ impl JobSink for QueueSink {
         let shards = self.shards();
         let mut sends = Vec::new();
         for (target, batch) in batches(jobs, shards) {
+            let batch: Vec<JobMessage<'_>> =
+                batch.into_iter().map(|job| self.message(job)).collect();
             sends.push(self.queue(target).send_batch(batch).await);
         }
         first_error(sends)
