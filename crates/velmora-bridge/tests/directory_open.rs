@@ -18,7 +18,9 @@ use velmora_bridge::directory::first_open::{
 use velmora_bridge::directory::gate::{anchored_epoch, is_open, run_gate_if_closed, NotBuilt};
 use velmora_bridge::directory::record::Tenant;
 use velmora_bridge::directory::store::{ChainKind, PendingOp, SqlDirectory};
-use velmora_bridge::directory::sweep::{DROP_ABOVE, NEXT_CHAIN};
+use velmora_bridge::directory::sweep::{
+    DROP_ABOVE, NEXT_CHAIN, NEXT_CHAIN_SAME_TENANT, NEXT_TENANT,
+};
 use velmora_bridge::directory::testing::{HookedRecords, PlainSeal};
 use velmora_bridge::directory::transition::{Actor, Change};
 use velmora_bridge::keys::locations::{two_in_account, write_locations};
@@ -689,6 +691,19 @@ fn the_sweep_and_the_backstop_read_through_an_index() {
                     .contains("sqlite_autoindex_pending_ops_1 (tenant=? AND chain=? AND seq<?)")),
             "{clear:?}"
         );
+        let same = plan(
+            &db,
+            "NEXT_CHAIN_SAME_TENANT",
+            NEXT_CHAIN_SAME_TENANT,
+            &[text(A1), text("k")],
+        )
+        .await;
+        assert!(
+            same.iter().any(|l| l.contains("(tenant=? AND chain>?)")),
+            "{same:?}"
+        );
+        let later = plan(&db, "NEXT_TENANT", NEXT_TENANT, &[text(A1), text("k")]).await;
+        assert!(later.iter().any(|l| l.contains("(tenant>?)")), "{later:?}");
         plan(
             &db,
             "DROP_ABOVE",

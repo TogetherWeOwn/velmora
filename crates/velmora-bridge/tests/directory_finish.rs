@@ -141,6 +141,9 @@ struct Units<'a> {
     log: RefCell<Vec<(u32, Option<u64>)>>,
     born: RefCell<Vec<u32>>,
     born_fails: Cell<bool>,
+    /// What `held` answers per unit (default: the head), and who was asked.
+    held_answers: RefCell<BTreeMap<u32, Answer>>,
+    held_log: RefCell<Vec<u32>>,
 }
 
 impl<'a> Units<'a> {
@@ -152,6 +155,8 @@ impl<'a> Units<'a> {
             log: RefCell::new(Vec::new()),
             born: RefCell::new(Vec::new()),
             born_fails: Cell::new(false),
+            held_answers: RefCell::new(BTreeMap::new()),
+            held_log: RefCell::new(Vec::new()),
         }
     }
 
@@ -175,6 +180,24 @@ impl TenantUnits for Units<'_> {
         self.log.borrow_mut().push((unit, row));
         let a = self
             .answers
+            .borrow()
+            .get(&unit)
+            .copied()
+            .unwrap_or(Answer::Head);
+        match a {
+            Answer::Head => Ok(UnitHolds::Seq {
+                state_seq: self.head.get(),
+            }),
+            Answer::Seq(n) => Ok(UnitHolds::Seq { state_seq: n }),
+            Answer::Unborn => Ok(UnitHolds::Unborn),
+            Answer::Fail => Err(BridgeError::Invalid("unit down")),
+        }
+    }
+
+    async fn held(&self, _tenant: &TenantId, unit: u32) -> Result<UnitHolds> {
+        self.held_log.borrow_mut().push(unit);
+        let a = self
+            .held_answers
             .borrow()
             .get(&unit)
             .copied()
@@ -474,10 +497,13 @@ fn a_failed_closing_keeps_closing_order_under_an_opening_head() {
         )
         .await;
         units.answer(0, Answer::Head);
+        // The unit still holds the record before the closing.
+        units.held_answers.borrow_mut().insert(0, Answer::Seq(old));
         units.head.set(opened);
         let run = finish_tenant(&chain, Some(&dir), &units, &tid(A1), NOW)
             .await
             .unwrap();
+        assert_eq!(*units.held_log.borrow(), [0]);
         assert_eq!(run.order, Some(WriteOrder::Closing));
         assert_eq!(run.units, [(0, StoreStep::Holds(opened))]);
         assert_eq!(units.take_log(), [(0, Some(old))]);
@@ -495,6 +521,85 @@ fn a_failed_closing_keeps_closing_order_under_an_opening_head() {
                 ("tenant.resumed".into(), format!("t/{opened}"), json!({})),
             ]
         );
+    });
+}
+
+/// A closing every unit already holds, whose directory write failed, does
+/// not pull a later opening ahead of the directory: the opening head goes
+/// to the directory first (AM-75). A unit that cannot be read keeps the
+/// closing order.
+#[test]
+fn a_closing_the_units_hold_lets_a_later_opening_go_to_the_directory_first() {
+    let db = database();
+    let flaky = Flaky::new(&db);
+    let store = HookedRecords::new();
+    let seal = PlainSeal::new();
+    let chain = TenantChain {
+        store: &store,
+        seal: &seal,
+    };
+    let dir = SqlDirectory { sql: &flaky };
+    let units = Units::new(&db);
+    block_on(async {
+        tenant_row(&db, &store, &seal, A1).await;
+        let old = row_seq(&db, A1).await.unwrap();
+        let closed = write(&chain, A1, hold(HoldMode::Locked), Actor::Operator).await;
+        units.head.set(closed);
+        flaky.fail(Some("INSERT INTO tenants"));
+        let run = finish_tenant(&chain, Some(&dir), &units, &tid(A1), NOW)
+            .await
+            .unwrap();
+        assert_eq!(run.units, [(0, StoreStep::Holds(closed))]);
+        assert_eq!(run.directory, StoreStep::Failed);
+        flaky.fail(None);
+        assert_eq!(row_seq(&db, A1).await, Some(old));
+        units.take_log();
+
+        let opened = write(
+            &chain,
+            A1,
+            Change::SetOperatorHold { hold: None },
+            Actor::Operator,
+        )
+        .await;
+        // The unit holds the closing; it is read, not brought up.
+        units
+            .held_answers
+            .borrow_mut()
+            .insert(0, Answer::Seq(closed));
+        units.head.set(opened);
+        let run = finish_tenant(&chain, Some(&dir), &units, &tid(A1), NOW)
+            .await
+            .unwrap();
+        assert_eq!(run.order, Some(WriteOrder::Opening));
+        assert_eq!(run.directory, StoreStep::Holds(opened));
+        // Brought up only after the directory held the head.
+        assert_eq!(units.take_log(), [(0, Some(opened))]);
+
+        // A unit that cannot be read: the closing order.
+        let closed2 = write(&chain, A1, hold(HoldMode::ReadOnly), Actor::Operator).await;
+        units.head.set(closed2);
+        flaky.fail(Some("INSERT INTO tenants"));
+        finish_tenant(&chain, Some(&dir), &units, &tid(A1), NOW)
+            .await
+            .unwrap();
+        flaky.fail(None);
+        let opened2 = write(
+            &chain,
+            A1,
+            Change::SetOperatorHold { hold: None },
+            Actor::Operator,
+        )
+        .await;
+        units.held_answers.borrow_mut().insert(0, Answer::Fail);
+        units.head.set(opened2);
+        units.take_log();
+        let run = finish_tenant(&chain, Some(&dir), &units, &tid(A1), NOW)
+            .await
+            .unwrap();
+        assert_eq!(run.order, Some(WriteOrder::Closing));
+        assert_eq!(units.take_log(), [(0, Some(opened))]);
+        assert_eq!(run.directory, StoreStep::Holds(opened2));
     });
 }
 
@@ -985,6 +1090,8 @@ fn a_row_far_behind_is_raised_in_steps() {
             head = write(&chain, A1, Change::SetBillingHold { mode }, Actor::Billing).await;
         }
         units.head.set(head);
+        // The unit holds only the creation: the closings are outstanding.
+        units.held_answers.borrow_mut().insert(0, Answer::Seq(4));
         let run = finish_tenant(&chain, Some(&dir), &units, &tid(A1), NOW)
             .await
             .unwrap();

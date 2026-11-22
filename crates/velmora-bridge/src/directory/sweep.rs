@@ -29,13 +29,19 @@ pub const NEXT_CHAIN: &str = "SELECT p.tenant, p.chain, \
      FROM pending_ops p WHERE (p.tenant, p.chain, p.seq) > (?1, ?2, 9007199254740991) \
      ORDER BY p.tenant, p.chain, p.seq LIMIT 1";
 
-/// The next chain after a key, on the first two columns only: the way past
-/// a chain whose row holds a seq the whole-key seek does not pass (above
-/// `MAX_SQL_INT`, or not an integer: damage). It reads the rows of that
-/// chain, so it runs only then.
-pub const NEXT_CHAIN_PAST: &str = "SELECT p.tenant, p.chain, \
+/// The way past a chain whose row holds a seq the whole-key seek does not
+/// pass (above `MAX_SQL_INT`, or not an integer: damage), in two seeks
+/// that skip the chain's rows: a later chain of the same tenant, else the
+/// first chain of a later tenant. They run only then.
+pub const NEXT_CHAIN_SAME_TENANT: &str = "SELECT p.tenant, p.chain, \
      (SELECT MIN(q.created_at) FROM pending_ops q WHERE q.tenant = p.tenant AND q.chain = p.chain) \
-     FROM pending_ops p WHERE (p.tenant, p.chain) > (?1, ?2) ORDER BY p.tenant, p.chain LIMIT 1";
+     FROM pending_ops p WHERE p.tenant = ?1 AND p.chain > ?2 ORDER BY p.chain LIMIT 1";
+
+/// See [`NEXT_CHAIN_SAME_TENANT`]. `?2 = ?2` only takes the second
+/// parameter, which every next-chain statement is bound with.
+pub const NEXT_TENANT: &str = "SELECT p.tenant, p.chain, \
+     (SELECT MIN(q.created_at) FROM pending_ops q WHERE q.tenant = p.tenant AND q.chain = p.chain) \
+     FROM pending_ops p WHERE p.tenant > ?1 AND ?2 = ?2 ORDER BY p.tenant, p.chain LIMIT 1";
 
 /// The rows of one chain above a head, noted at or before a cutoff.
 pub const DROP_ABOVE: &str = "DELETE FROM pending_ops WHERE tenant = ?1 AND chain = ?2 \
@@ -102,7 +108,10 @@ impl<S: Sql> PendingRows for SqlDirectory<'_, S> {
                 .as_ref()
                 .is_some_and(|(t, c, _)| (t, c) == (&cursor.0, &cursor.1))
             {
-                next = self.next_chain(NEXT_CHAIN_PAST, &cursor).await?;
+                next = match self.next_chain(NEXT_CHAIN_SAME_TENANT, &cursor).await? {
+                    Some(n) => Some(n),
+                    None => self.next_chain(NEXT_TENANT, &cursor).await?,
+                };
                 if next
                     .as_ref()
                     .is_some_and(|(t, c, _)| (t, c) == (&cursor.0, &cursor.1))

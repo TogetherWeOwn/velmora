@@ -12,7 +12,11 @@
 //!   the next run takes the closing order again);
 //! - **opening**: the directory first, and the units only once the
 //!   directory holds the head. Where the row or the records are not known,
-//!   the head's own record decides, and an opening head waits.
+//!   the head's own record decides, and an opening head waits. An opening
+//!   head over closings the directory does not hold takes the opening
+//!   order when every unit already holds those closings
+//!   ([`TenantUnits::held`]), and the closing order otherwise: a unit takes
+//!   only the head, and a closing does not wait on the directory.
 //!
 //! The directory step copies the head's door into the `tenants` and
 //! `units` rows ([`SqlDirectory::apply_tenant`], idempotent by seq). Before
@@ -74,6 +78,12 @@ pub trait TenantUnits {
     /// that waits for the restore tool's proof, AM-45) answers its own
     /// seq. An `Err`: the unit could not be reached.
     async fn bring_up(&self, tenant: &TenantId, unit: u32) -> Result<UnitHolds>;
+    /// What `unit` of `tenant` holds of the tenant chain, read without
+    /// bringing it up (the unit's own numbers, rule 5). The finisher asks
+    /// it only for an opening head over closings the directory does not
+    /// hold: if every unit holds them, the opening goes to the directory
+    /// first. An `Err`: the unit could not be read (the closing order).
+    async fn held(&self, tenant: &TenantId, unit: u32) -> Result<UnitHolds>;
     /// Writes `unit`'s born marker if it is missing (ADR §2.4 rule 6),
     /// once the unit answered born. Idempotent; the finisher calls it for
     /// every born unit it brings up.
@@ -206,31 +216,47 @@ where
     }
 
     // The order: closing when a record the directory does not hold
-    // closes a door. Where those records are not all known (no row was
-    // read, it is ahead, a record did not read, or the row is further
-    // behind than one run reads), the head's own record decides too
-    // (AM-75: "when the head's record opens"). So an opening never reaches
-    // a unit before the directory holds it; a closing below an opening
-    // head then reaches the units by the lease renewal (ADR §2.4 rule 12,
+    // closes a door that the units may not have closed yet. Where those
+    // records are not all known (no row was read, it is ahead, a record
+    // did not read, or the row is further behind than one run reads), the
+    // head's own record decides too (AM-75: "when the head's record
+    // opens"). So an opening never reaches a unit before the directory
+    // holds it, unless a closing below it is still outstanding at a unit:
+    // a unit takes only the head, and a closing does not wait on the
+    // directory (ADR §2.5). A closing below an opening head that is not
+    // known reaches the units by the lease renewal (ADR §2.4 rule 12,
     // within T) or a later run.
     let known = matches!(row, Row::Seq(_)) && readable && !far;
+    let provisioning = head.door.lifecycle == Lifecycle::Provisioning;
     // A head in a shred closes, also where its records below are purged
     // and only the stub is read.
-    let mut closes = matches!(
+    let mut last_closing = steps
+        .iter()
+        .filter(|(prev, r)| {
+            write_order(prev.as_ref().map(|p| &p.door), &r.door) == WriteOrder::Closing
+        })
+        .map(|(_, r)| r.door.seq)
+        .max();
+    if matches!(
         head.door.lifecycle,
         Lifecycle::Shredding | Lifecycle::Shredded
-    ) || steps.iter().any(|(prev, r)| {
-        write_order(prev.as_ref().map(|p| &p.door), &r.door) == WriteOrder::Closing
-    });
-    if !known && !closes {
-        closes = head_closes(chain, &managed, &head, &mut run.pages).await;
+    ) || (!known
+        && last_closing.is_none()
+        && head_closes(chain, &managed, &head, &mut run.pages).await)
+    {
+        last_closing = Some(h);
     }
-    let order = match closes {
-        true => WriteOrder::Closing,
-        false => WriteOrder::Opening,
+    let order = match last_closing {
+        None => WriteOrder::Opening,
+        Some(c) if c == h => WriteOrder::Closing,
+        // An opening head over closings: if every unit holds them already,
+        // only openings are left, and the directory goes first.
+        Some(c) => match units_hold_at_least(units, tenant, &head, c, provisioning).await {
+            true => WriteOrder::Opening,
+            false => WriteOrder::Closing,
+        },
     };
     run.order = Some(order);
-    let provisioning = head.door.lifecycle == Lifecycle::Provisioning;
 
     if order == WriteOrder::Closing {
         bring_units(units, tenant, &head, &mut run).await;
@@ -316,6 +342,30 @@ fn chain_error(e: ChainError) -> BridgeError {
         ChainError::KeyNotHeld { .. } => ERR_KEY_NOT_HELD,
         _ => ERR_CHAIN_DAMAGED,
     }
+}
+
+/// Whether every unit the head lists holds the tenant chain at `seq` or
+/// above, as read without bringing it up ([`TenantUnits::held`]). An unborn
+/// unit counts under a `provisioning` head; a unit that cannot be read
+/// does not.
+async fn units_hold_at_least<U: TenantUnits>(
+    units: &U,
+    tenant: &TenantId,
+    head: &ReadRecord,
+    seq: u64,
+    provisioning: bool,
+) -> bool {
+    for &unit in &head.door.units {
+        let holds = match units.held(tenant, unit).await {
+            Ok(UnitHolds::Seq { state_seq }) => state_seq >= seq,
+            Ok(UnitHolds::Unborn) => provisioning,
+            Err(_) => false,
+        };
+        if !holds {
+            return false;
+        }
+    }
+    true
 }
 
 /// Whether the head's own record closes a door against the record before
