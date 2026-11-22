@@ -49,8 +49,10 @@ use crate::types::{BridgeError, Result};
 
 /// The most rows one batch may carry (est).
 pub const MAX_ROWS: usize = 500;
-/// The longest cursor (est).
-pub const MAX_CURSOR: usize = 512;
+/// The longest cursor. The move's copy names the primary key of the last
+/// row it read, as typed JSON: for `objects` that is a bucket id and an
+/// object key of up to 1024 bytes, which JSON escaping can double.
+pub const MAX_CURSOR: usize = 4096;
 
 /// The verified head of tenant 0, as far as the import reads it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
