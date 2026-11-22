@@ -3,7 +3,7 @@ name: unit suite
 # The whole velmora-bridge suite on the workerd twin
 # (workers/unit-suite/run-suite.sh): every catalogue call of every test is
 # also asked of a SQLite Durable Object and compared. About 70 minutes, so
-# it is not a pull request check; `ci.yml` runs the unit core part of it
+# it is not a required pull request check; `ci.yml` runs the unit core part of it
 # (`unit-core`) on the pull requests that touch the unit, and requires
 # it. This one runs too on those pull requests, as a check that is not
 # required (not in ci-ok), nightly on main, and by hand. A failed night
