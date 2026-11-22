@@ -316,6 +316,7 @@ mod tests {
         fn of(state: TenantState, units: &[u32]) -> Heads {
             Heads(
                 Some(HeadView {
+                    seqs: seqs(3, 1),
                     state,
                     units: units.to_vec(),
                 }),
