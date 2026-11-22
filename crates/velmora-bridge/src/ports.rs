@@ -552,8 +552,9 @@ pub struct Permit {
 /// How a job's wait for a slot ended ([`Catalog::await_permit`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SlotWait {
-    /// A slot is the holder's: its next acquire on that provider
-    /// returns it.
+    /// A slot is pocketed for the holder. Its next acquire on that
+    /// provider tries to renew and use it first. If renewal fails,
+    /// acquire takes the normal path and can return `None`.
     Granted,
     /// The time ran out. Nothing is held.
     Elapsed,
@@ -1380,10 +1381,15 @@ pub trait Catalog {
     async fn release_permit(&self, p: &Permit) -> Result<()>;
     /// Waits up to `ms` for a job slot on one of `providers` to be
     /// `holder`'s, where the slots are handed out by something that
-    /// keeps a line (a permit gate with `SLOT_WAIT = "push"`): no
-    /// call is made while it waits, and the slot comes to the caller
-    /// that waited longest. Elsewhere [`SlotWait::Unsupported`], at
-    /// once.
+    /// keeps a line (a permit gate with `SLOT_WAIT = "push"`). The
+    /// slot goes to the caller that waited longest. If there is no
+    /// event, the client asks again at the wake time the gate gave,
+    /// with an empty request under the same id: a slot can expire
+    /// unrenewed without an event. On [`SlotWait::Granted`], the slot
+    /// is pocketed and the holder's next acquire on that provider
+    /// tries to renew and use it first. If renewal fails, acquire
+    /// takes its normal path and can return `None`. Elsewhere
+    /// [`SlotWait::Unsupported`] is returned at once.
     async fn await_permit(
         &self,
         _providers: &[&ProviderConfig],
