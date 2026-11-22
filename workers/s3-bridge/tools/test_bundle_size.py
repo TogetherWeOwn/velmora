@@ -42,7 +42,8 @@ class Config(unittest.TestCase):
             got = bs.strip_build_table(f.read())
         self.assertNotIn("[build]", [line.strip() for line in got.split("\n")])
         self.assertNotIn('command = "cargo install -q --locked worker-build', got)
-        self.assertIn('main = "build/worker/shim.mjs"', got)
+        # entry.mjs wraps the Rust Worker (its named entrypoints, #186).
+        self.assertIn('main = "entry.mjs"', got)
 
 
 class Measure(unittest.TestCase):
