@@ -481,6 +481,48 @@ async fn the_minimum_age_never_ends_before_it_would_from_the_upload() {
     assert_eq!(rig.outbox(&s).next_at, later.plus_secs(day));
 }
 
+/// Without a minimum age (`SAFETY_MIN_AGE_SECS = 0`, as production ships)
+/// the release is due the moment two backbones pass verify, and is sent
+/// at once. It still decides on its own reads: every backbone that counts
+/// is asked again with `STAT`, and those rows are the evidence.
+#[tokio::test]
+async fn without_a_minimum_age_the_release_follows_verify_and_asks_again() {
+    let rig = two_backbone_rig().await;
+    assert_eq!(rig.bridge.cfg.safety_min_age_secs, 0);
+    let (s, _) = rig.posted(12).await;
+    rig.propagate(&s, 0, 1).await;
+    let verified = rig.bridge.clock.now();
+
+    assert_eq!(rig.run(&s, OutboxStage::Verify).await, JobOutcome::Ack);
+    let outbox = rig.outbox(&s);
+    assert_eq!(
+        (outbox.stage, outbox.next_at),
+        (OutboxStage::Release, verified)
+    );
+    assert_eq!(rig.sent_stages(), [(OutboxStage::Release, 0)]);
+    assert!(rig.safety_held(&s));
+    let at_verify = rig.rows(&s).len();
+    assert_eq!(at_verify, 2);
+
+    rig.bridge.clock.advance_secs(1);
+    let now = rig.bridge.clock.now();
+    assert_eq!(rig.run(&s, OutboxStage::Release).await, JobOutcome::Ack);
+    let extent = rig.bridge.catalog.extent(&s.extent);
+    assert_eq!(extent.safety_state, SafetyState::Released);
+    assert_eq!(extent.released_at, Some(now));
+    let fresh: Vec<_> = rig.rows(&s)[at_verify..]
+        .iter()
+        .map(|r| (r.backbone.clone(), r.kind, r.result, r.verified_at))
+        .collect();
+    assert_eq!(
+        fresh,
+        [
+            ("bb0".to_string(), VerifyKind::Stat, VerifyResult::Ok, now),
+            ("bb1".to_string(), VerifyKind::Stat, VerifyResult::Ok, now),
+        ]
+    );
+}
+
 #[tokio::test]
 async fn release_unpins_the_safety_copy_on_fresh_evidence() {
     let rig = two_backbone_rig().await;

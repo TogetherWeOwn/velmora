@@ -269,7 +269,9 @@ fn config_loads_from_documented_vars() {
     assert_eq!(cfg.max_extent_bytes, 16 * 1024 * 1024);
     assert_eq!(cfg.inflight_budget_bytes, 48 * 1024 * 1024);
     assert_eq!(cfg.job_budget_bytes, 72 * 1024 * 1024);
-    assert_eq!(cfg.safety_min_age_secs, 86_400);
+    // No wait after the two-backbone verify: the release job's own STAT
+    // of every backbone that counts is the last check.
+    assert_eq!(cfg.safety_min_age_secs, 0);
     assert_eq!(cfg.verify_delay_secs, 120);
     assert_eq!(
         cfg.newsgroups,

@@ -1,0 +1,642 @@
+//! Tenant keys: creating a key version, loading a key, and the cache.
+//!
+//! A tenant key (TK) lives only in the key buckets, as
+//! `m/tk/<t>/<n>.<v>`: version `n` of the tenant's key, wrapped under KEK
+//! version `v` ([`crate::crypto::scheme2`]). The set of key buckets is
+//! the head of the key-location chain ([`super::locations`]).
+//!
+//! # Creating version `m`
+//!
+//! The first key of a tenant uses the same procedure as any later one.
+//!
+//! 1. **Claim first, before any blob.** The claim is a record of the
+//!    tenant chain ([`KeyVersionClaims`]); a claim that is already open
+//!    (a run that died, or a concurrent one) is resumed, not replaced.
+//! 2. **Create in the arbiter only.** If the arbiter already holds a
+//!    blob of version `m`, it is adopted. Otherwise a fresh key is put
+//!    there with put-if-absent, and the bytes read back are adopted,
+//!    whoever wrote them. Two runs therefore end with the same key.
+//! 3. **Copy** the adopted bytes to every other synchronous location,
+//!    with put-if-absent, and compare the check value of every copy.
+//! 4. **A version whose copies disagree is void.** It is never used and
+//!    nothing is deleted: the claim moves to `m + 1` and the run starts
+//!    again at step 2.
+//! 5. **Commit**, with the key's check value, which the tenant chain
+//!    keeps: from then on that check value is the key of version `m`. A
+//!    commit that a concurrent run made already counts.
+//!
+//! **Two runs under different active KEK versions** (during a KEK
+//! rotation) put different names, `<m>.<v>` and `<m>.<v+1>`, so the
+//! arbiter's put-if-absent cannot decide between them. Each run reads
+//! every copy of `m` back after its put; one that finds two keys voids
+//! `m`. If the other run committed first, the void is refused and this
+//! run fails, leaving a stray blob: readers take only the copy whose
+//! check value the commit pinned, and the audit reports the stray.
+//!
+//! Before each write the writer lists the tenant's directory in the
+//! location: any name that is no key blob (a shred marker among them)
+//! stops it. A writer always loses to a marker, and never deletes what
+//! it lost to.
+//!
+//! # Loading
+//!
+//! One list of `m/tk/<t>/` and one get, in the arbiter first, then in
+//! each other active location. A name that is no key blob means the
+//! tenant is refused. No copy in any location, with no such name, is a
+//! loss: the loader fails and the caller alarms. The caller names the
+//! check value the commit pinned, and only a copy with that value is ever
+//! taken. An unwrapped key is kept per isolate for at most
+//! [`TK_CACHE_MS`].
+
+use std::cell::RefCell;
+use std::collections::BTreeMap;
+use std::rc::Rc;
+
+use velmora::rng::FillRandom;
+
+use super::locations::{KeyLocation, KeyLocations};
+use super::record::TkRing;
+use crate::crypto::scheme2::{
+    tk_blob_check_value, tk_blob_name, unwrap_tenant_key, wrap_tenant_key, TenantId, TenantKey,
+    KCV_LEN, TK_PREFIX,
+};
+use crate::ports::{Clock, Kek};
+use crate::records::RecordStore;
+use crate::types::{BridgeError, Result, UnixMs};
+
+/// How long an isolate keeps an unwrapped tenant key.
+pub const TK_CACHE_MS: i64 = 60_000;
+/// Voided versions one creation run accepts before it stops and alarms.
+pub const MAX_VOIDS: u32 = 3;
+/// Names per list call.
+const PAGE: u32 = 1000;
+
+/// A name below the tenant's key directory that is no key blob: a shred
+/// marker, or something no writer of this code put there. Writers stop;
+/// loaders refuse the tenant.
+pub const ERR_TK_FOREIGN: BridgeError = BridgeError::Crypto(FOREIGN);
+/// No copy of the key version in any location, and no marker: a loss.
+pub const ERR_TK_MISSING: BridgeError = BridgeError::Crypto("tenant key is missing");
+/// The set has no synchronous location besides the arbiter: a key is
+/// never created with one copy.
+pub const ERR_TK_ONE_COPY: BridgeError =
+    BridgeError::Invalid("a tenant key needs two synchronous key locations");
+/// Copies of the key exist, but this Worker holds no KEK version that
+/// opens them: not a loss.
+pub const ERR_TK_NO_KEK: BridgeError =
+    BridgeError::Crypto("tenant key copies are under a KEK this Worker lacks");
+/// The tenant state does not admit a key version (the claim or the
+/// commit was refused).
+pub const ERR_TK_REFUSED: BridgeError =
+    BridgeError::Invalid("tenant state does not admit a key version");
+/// Copies disagreed [`MAX_VOIDS`] times in one run.
+pub const ERR_TK_VOIDS: BridgeError =
+    BridgeError::Crypto("tenant key copies disagree again and again");
+/// A location the set names has no binding.
+pub const ERR_TK_UNBOUND: BridgeError = BridgeError::Invalid("key location has no binding");
+
+const FOREIGN: &str = "tenant key directory holds a name that is no key blob";
+
+/// Whether `e` is [`ERR_TK_FOREIGN`].
+pub fn is_foreign(e: &BridgeError) -> bool {
+    matches!(e, BridgeError::Crypto(m) if *m == FOREIGN)
+}
+
+/// The directory of `tenant`'s key blobs.
+pub fn tk_prefix(tenant: &TenantId) -> String {
+    format!("{TK_PREFIX}{tenant}/")
+}
+
+/// `(key version, KEK version)` of a key blob name of `tenant`; `None`
+/// for any other name.
+pub fn parse_tk_name(tenant: &TenantId, name: &str) -> Option<(u32, u32)> {
+    let rest = name.strip_prefix(&tk_prefix(tenant))?;
+    let (n, v) = rest.split_once('.')?;
+    let num = |s: &str| {
+        (!s.is_empty()
+            && s.len() <= 10
+            && s.bytes().all(|b| b.is_ascii_digit())
+            && !s.starts_with('0'))
+        .then(|| s.parse::<u32>().ok())
+        .flatten()
+    };
+    Some((num(n)?, num(v)?))
+}
+
+/// The key buckets by binding name.
+pub struct KeyBuckets<'a, S> {
+    pub by_name: Vec<(&'a str, &'a S)>,
+}
+
+impl<'a, S: RecordStore> KeyBuckets<'a, S> {
+    pub fn get(&self, location: &KeyLocation) -> Result<&'a S> {
+        self.by_name
+            .iter()
+            .find(|(n, _)| *n == location.name)
+            .map(|(_, s)| *s)
+            .ok_or(ERR_TK_UNBOUND)
+    }
+}
+
+/// Every key blob name of `tenant` in one location, with its versions.
+/// Refuses with [`ERR_TK_FOREIGN`] when any other name is there.
+pub async fn list_tenant_blobs<S: RecordStore>(
+    store: &S,
+    tenant: &TenantId,
+) -> Result<Vec<(String, u32, u32)>> {
+    let prefix = tk_prefix(tenant);
+    let mut after = prefix.clone();
+    let mut out = Vec::new();
+    loop {
+        let names = store.list(&prefix, &after, PAGE).await?;
+        for name in &names {
+            let (n, v) = parse_tk_name(tenant, name).ok_or(ERR_TK_FOREIGN)?;
+            out.push((name.clone(), n, v));
+        }
+        match names.last() {
+            Some(last) if names.len() >= PAGE as usize => after.clone_from(last),
+            _ => return Ok(out),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Claims
+// ---------------------------------------------------------------------------
+
+/// The answer of a claim.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Claim {
+    /// Version `m` is claimed: by this call, or by an open claim it found.
+    Claimed(u32),
+    /// The committed version is already above the caller's base: a run
+    /// whose commit answer was lost, or another run, committed `version`
+    /// with this check value. Nothing is claimed.
+    Committed { version: u32, kcv: [u8; KCV_LEN] },
+    /// The tenant state does not admit it (`deleting`, `restoring`, …).
+    Refused,
+}
+
+/// The answer of a commit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Commit {
+    /// Committed, by this call or by a concurrent run.
+    Committed,
+    /// The tenant moved on (`deleting` or beyond): stop. The blob stays.
+    Stopped,
+}
+
+/// The claim and the commit of a key version: records of the tenant
+/// chain, written by its owner.
+#[allow(async_fn_in_trait)]
+pub trait KeyVersionClaims {
+    /// Claims key version `from + 1`, where `from` is the committed
+    /// version the caller started from (0 for a new tenant). Answers the
+    /// open claim when there is one, and [`Claim::Committed`] when the
+    /// committed version is already above `from`, so a run repeated after
+    /// a lost commit answer never starts a second version.
+    async fn claim(&self, tenant: &TenantId, from: u32) -> Result<Claim>;
+    /// Voids the open claim `version` and claims `version + 1`. Refuses
+    /// (an `Err`) when `version` is not the open claim, a committed one
+    /// included.
+    async fn void(&self, tenant: &TenantId, version: u32) -> Result<Claim>;
+    /// Commits the open claim `version`, pinning `kcv`, the check value
+    /// of its key. A commit of the same version with another `kcv` is
+    /// refused (an `Err`).
+    async fn commit(&self, tenant: &TenantId, version: u32, kcv: [u8; KCV_LEN]) -> Result<Commit>;
+}
+
+// ---------------------------------------------------------------------------
+// Creating a key version
+// ---------------------------------------------------------------------------
+
+/// What a creation run did.
+#[derive(Debug)]
+pub struct Created {
+    /// The committed key, as the arbiter holds it.
+    pub key: TenantKey,
+    /// The KEK version of the blob.
+    pub kek_version: u32,
+    /// Versions voided on the way (an alarm each).
+    pub voided: Vec<u32>,
+    /// Whether this run's own key was the one adopted.
+    pub generated_here: bool,
+}
+
+/// Adopts or creates version `m` in the arbiter. `Ok(None)`: the
+/// arbiter's copies of `m` disagree, so `m` is void.
+async fn adopt_in_arbiter<S: RecordStore, K: Kek, R: FillRandom>(
+    arbiter: &S,
+    kek: &K,
+    tenant: &TenantId,
+    m: u32,
+    rng: &mut R,
+) -> Result<Option<(String, Vec<u8>, bool)>> {
+    let of_m = |blobs: Vec<(String, u32, u32)>| -> Vec<(String, u32)> {
+        blobs
+            .into_iter()
+            .filter(|(_, n, _)| *n == m)
+            .map(|(name, _, v)| (name, v))
+            .collect()
+    };
+    let mut generated = false;
+    let existing = of_m(list_tenant_blobs(arbiter, tenant).await?);
+    if existing.is_empty() {
+        let key = TenantKey::generate(tenant, m, rng)?;
+        let (v, blob) = wrap_tenant_key(kek, &key, rng)?;
+        let name = tk_blob_name(tenant, m, v);
+        generated = match arbiter.put_if_absent(&name, blob.clone()).await {
+            Ok(stored) => stored,
+            // The answer was lost: the bytes read back decide.
+            Err(e) => match arbiter.get(&name).await? {
+                Some(b) => b == blob,
+                None => return Err(e),
+            },
+        };
+    }
+    // Read every copy of `m` back, ours or another run's: they must all
+    // hold the same key.
+    let mut copies = Vec::new();
+    for (name, v) in of_m(list_tenant_blobs(arbiter, tenant).await?) {
+        let bytes = arbiter.get(&name).await?.ok_or(ERR_TK_MISSING)?;
+        copies.push((tk_blob_check_value(&bytes)?, name, v, bytes));
+    }
+    if copies.windows(2).any(|w| w[0].0 != w[1].0) {
+        return Ok(None);
+    }
+    // The copy under the active KEK, else the newest one this Worker
+    // holds a KEK for.
+    let active = kek.active().0;
+    let held = !copies.is_empty();
+    let chosen = copies
+        .into_iter()
+        .filter(|(_, _, v, _)| kek.version(*v).is_some())
+        .max_by_key(|(_, _, v, _)| (*v == active, *v))
+        .ok_or(match held {
+            true => ERR_TK_NO_KEK,
+            false => ERR_TK_MISSING,
+        })?;
+    Ok(Some((chosen.1, chosen.3, generated)))
+}
+
+/// Copies `bytes` to `store` under `name`, and checks that every copy of
+/// version `m` there has the same check value, and that the copy under
+/// `name` opens as that key. `Ok(false)`: they disagree. A marker in the
+/// location stops it before the put.
+async fn copy_to<S: RecordStore, K: Kek>(
+    store: &S,
+    kek: &K,
+    tenant: &TenantId,
+    m: u32,
+    name: &str,
+    bytes: &[u8],
+) -> Result<bool> {
+    let kcv = tk_blob_check_value(bytes)?;
+    list_tenant_blobs(store, tenant).await?;
+    let put = store.put_if_absent(name, bytes.to_vec()).await;
+    if let Err(e) = put {
+        // A lost answer: the copy may be there.
+        if store.get(name).await?.is_none() {
+            return Err(e);
+        }
+    }
+    for (other, n, v) in list_tenant_blobs(store, tenant).await? {
+        if n != m {
+            continue;
+        }
+        let there = store.get(&other).await?.ok_or(ERR_TK_MISSING)?;
+        if tk_blob_check_value(&there)? != kcv {
+            return Ok(false);
+        }
+        // The copy this location counts with: it must open as the key,
+        // not only carry its check value.
+        let opens = there == bytes
+            || unwrap_tenant_key(kek, v, tenant, m, &there).is_ok_and(|k| k.check_value() == kcv);
+        if other == name && !opens {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Creates key version `from + 1` of `tenant` (its first one, with
+/// `from` 0, included) in the locations of `set`, and commits it.
+/// Resumable: a run that died is finished by running it again with the
+/// same `from`, and ends with the version that was committed.
+pub async fn create_key_version<S, K, C, R>(
+    set: &KeyLocations,
+    buckets: &KeyBuckets<'_, S>,
+    claims: &C,
+    kek: &K,
+    tenant: &TenantId,
+    from: u32,
+    rng: &mut R,
+) -> Result<Created>
+where
+    S: RecordStore,
+    K: Kek,
+    C: KeyVersionClaims,
+    R: FillRandom,
+{
+    // Two key buckets, or none: a key is never created with one copy.
+    if set.synchronous_copies().is_empty() {
+        return Err(ERR_TK_ONE_COPY);
+    }
+    let mut voided = Vec::new();
+    let mut claim = claims.claim(tenant, from).await?;
+    loop {
+        let m = match claim {
+            Claim::Claimed(m) => m,
+            Claim::Committed { version, kcv } => {
+                // Adopt the committed key, by the loader's own rules.
+                let (key, v) = load_pinned(set, buckets, kek, tenant, version, kcv).await?;
+                return Ok(Created {
+                    key,
+                    kek_version: v,
+                    voided,
+                    generated_here: false,
+                });
+            }
+            Claim::Refused => return Err(ERR_TK_REFUSED),
+        };
+        let arbiter = buckets.get(set.arbiter())?;
+        let adopted = adopt_in_arbiter(arbiter, kek, tenant, m, rng).await?;
+        let mut agree = adopted.is_some();
+        if let Some((name, bytes, _)) = &adopted {
+            for location in set.synchronous_copies() {
+                let store = buckets.get(location)?;
+                if !copy_to(store, kek, tenant, m, name, bytes).await? {
+                    agree = false;
+                    break;
+                }
+            }
+        }
+        if !agree {
+            voided.push(m);
+            if voided.len() as u32 >= MAX_VOIDS {
+                return Err(ERR_TK_VOIDS);
+            }
+            claim = claims.void(tenant, m).await?;
+            continue;
+        }
+        let (name, bytes, generated_here) = adopted.ok_or(ERR_TK_MISSING)?;
+        // A marker that arrived during the run wins, and a copy of `m`
+        // that another run put since must agree: check every synchronous
+        // location once more before the commit.
+        let kcv = tk_blob_check_value(&bytes)?;
+        let mut split = false;
+        for location in set.synchronous() {
+            let store = buckets.get(location)?;
+            for (other, n, _) in list_tenant_blobs(store, tenant).await? {
+                if n == m {
+                    let there = store.get(&other).await?.ok_or(ERR_TK_MISSING)?;
+                    split |= tk_blob_check_value(&there)? != kcv;
+                }
+            }
+        }
+        if split {
+            voided.push(m);
+            if voided.len() as u32 >= MAX_VOIDS {
+                return Err(ERR_TK_VOIDS);
+            }
+            claim = claims.void(tenant, m).await?;
+            continue;
+        }
+        let kek_version = parse_tk_name(tenant, &name).ok_or(ERR_TK_MISSING)?.1;
+        let key = unwrap_tenant_key(kek, kek_version, tenant, m, &bytes)?;
+        return match claims.commit(tenant, m, key.check_value()).await? {
+            Commit::Committed => Ok(Created {
+                key,
+                kek_version,
+                voided,
+                generated_here,
+            }),
+            Commit::Stopped => Err(ERR_TK_REFUSED),
+        };
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Loading and the cache
+// ---------------------------------------------------------------------------
+
+/// Unwrapped tenant keys of one isolate, each for at most
+/// [`TK_CACHE_MS`].
+#[derive(Default)]
+pub struct TkCache {
+    keys: RefCell<BTreeMap<(TenantId, u32), Cached>>,
+    /// Bumped by every `forget` of a tenant: a load that overlapped one
+    /// is not cached.
+    forgotten: RefCell<BTreeMap<TenantId, u64>>,
+}
+
+/// A key and the time it was loaded.
+type Cached = (Rc<TenantKey>, UnixMs);
+
+impl TkCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Drops every key of `tenant` (a shred, a refused load).
+    pub fn forget(&self, tenant: &TenantId) {
+        self.keys.borrow_mut().retain(|(t, _), _| t != tenant);
+        *self
+            .forgotten
+            .borrow_mut()
+            .entry(tenant.clone())
+            .or_default() += 1;
+    }
+
+    fn generation(&self, tenant: &TenantId) -> u64 {
+        self.forgotten.borrow().get(tenant).copied().unwrap_or(0)
+    }
+
+    /// How many keys are held (tests).
+    pub fn len(&self) -> usize {
+        self.keys.borrow().len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.keys.borrow().is_empty()
+    }
+
+    /// Key version `version` of `tenant`: from the cache while it is
+    /// fresh, else from the first synchronous location that holds it.
+    /// `pinned` is the check value the tenant chain committed for the
+    /// version: only that key is ever taken.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn load<S: RecordStore, K: Kek, T: Clock>(
+        &self,
+        set: &KeyLocations,
+        buckets: &KeyBuckets<'_, S>,
+        kek: &K,
+        clock: &T,
+        tenant: &TenantId,
+        version: u32,
+        pinned: [u8; KCV_LEN],
+    ) -> Result<Rc<TenantKey>> {
+        let now = clock.now();
+        let id = (tenant.clone(), version);
+        let fresh = |at: &UnixMs| now.0 >= at.0 && now.0 - at.0 < TK_CACHE_MS;
+        // No key outlives its time here, whoever it belongs to.
+        self.keys.borrow_mut().retain(|_, (_, at)| fresh(at));
+        if let Some((key, _)) = self.keys.borrow().get(&id) {
+            if pinned == key.check_value() {
+                return Ok(key.clone());
+            }
+        }
+        self.keys.borrow_mut().remove(&id);
+        let generation = self.generation(tenant);
+        match load_pinned(set, buckets, kek, tenant, version, pinned).await {
+            // Another load refused the tenant while this one read: its
+            // answer wins.
+            Ok(_) if self.generation(tenant) != generation => Err(ERR_TK_FOREIGN),
+            Ok((key, _)) => {
+                let key = Rc::new(key);
+                self.keys.borrow_mut().insert(id, (key.clone(), now));
+                Ok(key)
+            }
+            Err(e) => {
+                if is_foreign(&e) {
+                    self.forget(tenant);
+                }
+                Err(e)
+            }
+        }
+    }
+}
+
+/// Key version `version` of `tenant` with the committed check value
+/// `pinned`, from the first synchronous location that holds a copy that
+/// opens (the arbiter first), with the KEK version of that copy. A marker
+/// or a foreign name in a location refuses the tenant at once; any other
+/// failure moves on to the next location, and the last one is the answer
+/// when none holds the key.
+async fn load_pinned<S: RecordStore, K: Kek>(
+    set: &KeyLocations,
+    buckets: &KeyBuckets<'_, S>,
+    kek: &K,
+    tenant: &TenantId,
+    version: u32,
+    pinned: [u8; KCV_LEN],
+) -> Result<(TenantKey, u32)> {
+    let mut last_err = ERR_TK_MISSING;
+    let synchronous = set.synchronous();
+    for (i, location) in synchronous.iter().enumerate() {
+        let store = buckets.get(location)?;
+        match load_from(store, kek, tenant, version, pinned).await {
+            Ok(Some(found)) => {
+                // A marker or a foreign name in any other synchronous
+                // location refuses the tenant too; other failures there
+                // do not stop a key that opened.
+                for other in synchronous.iter().skip(i + 1) {
+                    if let Err(e) = list_tenant_blobs(buckets.get(other)?, tenant).await {
+                        if is_foreign(&e) {
+                            return Err(e);
+                        }
+                    }
+                }
+                return Ok(found);
+            }
+            Ok(None) => {}
+            Err(e) if is_foreign(&e) => return Err(e),
+            Err(e) => last_err = e,
+        }
+    }
+    Err(last_err)
+}
+
+/// Version `version` of `tenant`'s key from one location, with the KEK
+/// version of the copy that opened; `None` when the location holds no
+/// copy. An `Err` when copies exist and none opens.
+async fn load_from<S: RecordStore, K: Kek>(
+    store: &S,
+    kek: &K,
+    tenant: &TenantId,
+    version: u32,
+    pinned: [u8; KCV_LEN],
+) -> Result<Option<(TenantKey, u32)>> {
+    // Every copy of the version, under any KEK version: the check value
+    // needs no key.
+    let mut copies = Vec::new();
+    let mut damaged = None;
+    for (name, n, v) in list_tenant_blobs(store, tenant).await? {
+        if n != version {
+            continue;
+        }
+        let bytes = match store.get(&name).await {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => continue,
+            // A failed read: the other copies are still tried.
+            Err(e) => {
+                damaged = Some(e);
+                continue;
+            }
+        };
+        match tk_blob_check_value(&bytes) {
+            Ok(kcv) => copies.push((kcv, v, bytes)),
+            // A damaged copy is corruption, not a missing key.
+            Err(e) => damaged = Some(e),
+        }
+    }
+    // Only the committed key: a stray copy of the version is never taken.
+    copies.retain(|(kcv, _, _)| *kcv == pinned);
+    // The copy under the active KEK first, then the newer ones this
+    // Worker holds a KEK for; the first that opens.
+    let active = kek.active().0;
+    let held = copies.len();
+    copies.retain(|(_, v, _)| kek.version(*v).is_some());
+    if held > 0 && copies.is_empty() {
+        return Err(ERR_TK_NO_KEK);
+    }
+    copies.sort_by_key(|(_, v, _)| (*v != active, std::cmp::Reverse(*v)));
+    let mut last_err = damaged;
+    for (_, v, bytes) in copies {
+        match unwrap_tenant_key(kek, v, tenant, version, &bytes) {
+            Ok(key) => return Ok(Some((key, v))),
+            Err(e) => last_err = Some(e),
+        }
+    }
+    match last_err {
+        Some(e) => Err(e),
+        None => Ok(None),
+    }
+}
+
+/// The keys of one tenant a reader holds, by version, with the one new
+/// records are sealed under.
+pub struct LoadedRing {
+    current: Rc<TenantKey>,
+    others: Vec<Rc<TenantKey>>,
+}
+
+impl LoadedRing {
+    /// `current` must be the committed version; `others` older ones.
+    pub fn new(current: Rc<TenantKey>, others: Vec<Rc<TenantKey>>) -> Result<LoadedRing> {
+        let same_tenant = others.iter().all(|k| k.tenant() == current.tenant());
+        let mut versions: Vec<u32> = others.iter().map(|k| k.version()).collect();
+        versions.push(current.version());
+        versions.sort_unstable();
+        let distinct = versions.windows(2).all(|w| w[0] != w[1]);
+        if !same_tenant || !distinct {
+            return Err(BridgeError::Crypto(
+                "tenant keys of another tenant in a ring",
+            ));
+        }
+        Ok(LoadedRing { current, others })
+    }
+}
+
+impl TkRing for LoadedRing {
+    fn current(&self) -> Option<&TenantKey> {
+        Some(&self.current)
+    }
+
+    fn key(&self, version: u32) -> Option<&TenantKey> {
+        std::iter::once(&self.current)
+            .chain(self.others.iter())
+            .find(|k| k.version() == version)
+            .map(|k| &**k)
+    }
+}
