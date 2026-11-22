@@ -39,7 +39,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use super::chain::Chain;
 use super::ports::{Applied, ApplyEntry, KeyTarget, MAX_APPLY};
 use super::record::{
-    key_chain, open_chain_record, ChainRecord, Entry, KeyTable, Rid, SubjectStatus, TkRing,
+    key_chain, open_chain_record, ChainRecord, Entry, KeyTable, Marker, Rid, SubjectStatus, TkRing,
     ERR_KEY_RECORD,
 };
 
@@ -51,15 +51,15 @@ use crate::types::{BridgeError, Result};
 /// restored between its `keys_seq` and the apply) before the call fails.
 pub const MAX_BEHIND: u32 = 3;
 
-/// What a feed keeps of each record it read: the subject it names, or a
-/// marker. A few bytes per seq, so one run reads each record at most once
+/// What a feed keeps of each record it read: the subject it names, or the
+/// marker it is. A few bytes per seq, so one run reads each record at most once
 /// whatever the stores' lag (a store far behind costs one GET per record
 /// it lacks, once).
 #[derive(Clone, Debug)]
 enum Slot {
     /// The subject's id, and the `rid` the record carries.
     Subject(String, Option<Rid>),
-    Marker,
+    Marker(Marker),
 }
 
 /// The store kept answering `Behind`.
@@ -116,7 +116,7 @@ impl<'a, S: RecordStore, K: Kek, T: TkRing> Feed<'a, S, K, T> {
         let bytes = self.chain.get(self.store, seq).await?;
         let slot = match open_chain_record(self.kek, self.ring, self.table.tenant(), seq, &bytes)? {
             ChainRecord::Key(r) => Slot::Subject(r.door.id, r.rid),
-            ChainRecord::Marker(_) => Slot::Marker,
+            ChainRecord::Marker(m) => Slot::Marker(m.marker),
         };
         self.memo.borrow_mut().insert(seq, slot.clone());
         Ok(slot)
@@ -142,8 +142,8 @@ impl<'a, S: RecordStore, K: Kek, T: TkRing> Feed<'a, S, K, T> {
         let mut out = Vec::with_capacity((to - from) as usize);
         for seq in from + 1..=to {
             let (id, rid) = match self.slot(seq).await? {
-                Slot::Marker => {
-                    out.push(ApplyEntry::Marker { seq });
+                Slot::Marker(marker) => {
+                    out.push(ApplyEntry::Marker { seq, marker });
                     continue;
                 }
                 Slot::Subject(id, rid) => (id, rid),
@@ -274,6 +274,29 @@ impl<'a, S: RecordStore, K: Kek, T: TkRing> Feed<'a, S, K, T> {
         } else {
             self.singly(target, reopened).await
         }
+    }
+
+    /// The verified items of the records after `after`, in chain order,
+    /// at most `limit` (and at most [`MAX_APPLY`]), never past the table's
+    /// head, with no gap: one per record, a subject's entry as the head
+    /// holds it, stamped at the record's seq, with the `m/rk/` revocations
+    /// in force, or a [`ApplyEntry::Marker`] in place for a `KeysFrozen` or
+    /// `KeysThawed` record (AM-62). Nothing is held: an entry whose private
+    /// part does not open comes with `private: None`, and the caller sends
+    /// it held or refuses it. Empty when `after` is at or above the head,
+    /// or `limit` is 0. A record that is missing or does not verify is an
+    /// error, never left out.
+    ///
+    /// This is the read behind the move tool's `OwnerKeys::entries`
+    /// (step 5(e)'s direct apply, the undo's `entries_to`): the items map
+    /// one to one onto the unit's `ApplyEntry`.
+    pub async fn entries(&self, after: u64, limit: usize) -> Result<Vec<ApplyEntry>> {
+        let head = self.table.seq();
+        if after >= head || limit == 0 {
+            return Ok(Vec::new());
+        }
+        let take = limit.min(MAX_APPLY) as u64;
+        self.page(after, head.min(after.saturating_add(take))).await
     }
 
     /// Brings `target` to the head in `mode`. A store that answers
