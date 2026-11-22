@@ -885,6 +885,8 @@ jobs:
           VELMORA_CATALOGUE_ID: ${{ vars.VELMORA_CATALOGUE_ID }}
           VELMORA_JOB_FORMAT: ${{ vars.VELMORA_JOB_FORMAT }}
           VELMORA_DIRECTORY_D1_ID: ${{ vars.VELMORA_DIRECTORY_D1_ID }}
+          VELMORA_KEYS_A_BUCKET: ${{ vars.VELMORA_KEYS_A_BUCKET }}
+          VELMORA_KEYS_B_BUCKET: ${{ vars.VELMORA_KEYS_B_BUCKET }}
         run: |
           set -euo pipefail
           python3 -I - wrangler.toml wrangler.deploy.toml <<'PY'
@@ -932,6 +934,19 @@ jobs:
               sys.exit("VELMORA_DIRECTORY_D1_ID must be unset or a lowercase UUID")
           if directory == dbid:
               sys.exit("VELMORA_DIRECTORY_D1_ID must not be the catalogue database")
+          # The two key buckets of the tenant keys: KEYS_A creates, KEYS_B
+          # holds the synchronous copy. Both or neither; each bucket must
+          # exist before the variables are set.
+          keys_a = os.environ.get("VELMORA_KEYS_A_BUCKET", "")
+          keys_b = os.environ.get("VELMORA_KEYS_B_BUCKET", "")
+          r2_name = re.compile(r"[a-z0-9][a-z0-9-]{1,61}[a-z0-9]")
+          for name, value in (("VELMORA_KEYS_A_BUCKET", keys_a), ("VELMORA_KEYS_B_BUCKET", keys_b)):
+              if value and not r2_name.fullmatch(value):
+                  sys.exit(f"{name} must be unset or an R2 bucket name")
+          if bool(keys_a) != bool(keys_b):
+              sys.exit("VELMORA_KEYS_A_BUCKET and VELMORA_KEYS_B_BUCKET must be set together")
+          if keys_a and keys_a == keys_b:
+              sys.exit("VELMORA_KEYS_A_BUCKET and VELMORA_KEYS_B_BUCKET must not be the same bucket")
 
           with open(src, encoding="utf-8") as f:
               lines = f.read().split("\n")
@@ -974,6 +989,16 @@ jobs:
                   for line in lines[:end])
                   or any(db.get("binding") == "DIRECTORY" for db in shipped_d1)):
               sys.exit("the prod section of the shipped file binds DIRECTORY")
+          shipped_r2 = shipped_prod.get("r2_buckets", [])
+          for binding in ("KEYS_A", "KEYS_B"):
+              if (any(re.fullmatch(rf'''\s*binding\s*=\s*["']{binding}["']\s*(?:#.*)?''', line)
+                      for line in lines[:end])
+                      or any(b.get("binding") == binding for b in shipped_r2)):
+                  sys.exit(f"the prod section of the shipped file binds {binding}")
+          bound_buckets = {b.get("bucket_name") for b in shipped_r2}
+          for name, value in (("VELMORA_KEYS_A_BUCKET", keys_a), ("VELMORA_KEYS_B_BUCKET", keys_b)):
+              if value and value in bound_buckets:
+                  sys.exit(f"{name} must not be a bucket the Worker already binds")
           entries = hosts.split(",") if hosts else []
           seen = {host}
           classes = []
@@ -1054,6 +1079,18 @@ jobs:
               lines[anchors[0]] += '\n\n[[d1_databases]]' + "".join(
                   f'\n{key} = "{value}"' for key, value in directory_table[0].items()
               )
+          keys_tables = []
+          if keys_a:
+              cache_line = [i for i in range(end)
+                            if lines[i].strip() == 'bucket_name = "velmora-cache-enam"']
+              if len(cache_line) != 1:
+                  sys.exit("expected exactly one prod CACHE bucket_name line")
+              keys_tables = [{"binding": "KEYS_A", "bucket_name": keys_a},
+                             {"binding": "KEYS_B", "bucket_name": keys_b}]
+              lines[cache_line[0]] += "".join(
+                  f'\n\n[[r2_buckets]]\nbinding = "{t["binding"]}"\nbucket_name = "{t["bucket_name"]}"'
+                  for t in keys_tables
+              )
           builds = [i for i in range(end) if lines[i].strip() == "[build]"]
           if len(builds) != 1:
               sys.exit(f"expected exactly one prod [build] table, found {len(builds)}")
@@ -1085,6 +1122,11 @@ jobs:
                   or [db for db in actual_d1 if db.get("binding") == "CATALOG"] != expected_catalogue
                   or [db for db in actual_d1 if db.get("binding") == "DIRECTORY"] != directory_table):
               sys.exit("the generated config does not carry the expected D1 bindings")
+          actual_r2 = prod.get("r2_buckets", [])
+          if ([b for b in actual_r2 if b.get("binding") in ("KEYS_A", "KEYS_B")] != keys_tables
+                  or [b for b in actual_r2 if b.get("binding") not in ("KEYS_A", "KEYS_B")]
+                  != [b for b in shipped_r2 if b.get("binding") not in ("KEYS_A", "KEYS_B")]):
+              sys.exit("the generated config does not carry the expected key bucket bindings")
           with open(dst, "w", encoding="utf-8") as f:
               f.write(text)
           print(f"wrangler.deploy.toml: prod placeholders substituted, prod [build] removed, recovery copy {copy}, verify mode {mode}")
@@ -1092,6 +1134,7 @@ jobs:
           print(f"catalogue id in the generated config: {catalogue or 'main (default)'}")
           print(f"job format in the generated config: {job_format or '1 (default)'}")
           print(f"directory database in the generated config: {'bound' if directory else 'none'}")
+          print(f"key buckets in the generated config: {'bound' if keys_a else 'none'}")
           print(f"record layout in the generated config: {layout}")
           class_list = f" ({','.join(classes)})" if classes else ""
           print(f"extra S3 hosts in the generated config: {len(classes)}{class_list}")

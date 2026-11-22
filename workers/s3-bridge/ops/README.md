@@ -620,6 +620,7 @@ environment, and the deploy job reads the same repository values.
 | `VELMORA_FLOOR_VERSION` | Sets the earliest automatic rollback target by Worker version UUID and creation time. Unset disables this comparison. |
 | `VELMORA_CATALOGUE_MIGRATIONS` | `on` (default) applies catalogue migrations. `off` checks that none are pending and refuses the deploy if any are. |
 | `VELMORA_DIRECTORY_D1_ID` | Binds the directory D1 database by lowercase UUID and applies its migrations. Unset leaves it unbound. |
+| `VELMORA_KEYS_A_BUCKET`, `VELMORA_KEYS_B_BUCKET` | Bind the two key buckets of the tenant keys as `KEYS_A` (the bucket that creates a key version) and `KEYS_B` (its synchronous copy), by R2 bucket name. Set both or neither; they must differ from each other and from the buckets the Worker already binds. Unset leaves both unbound. |
 
 For a switch deploy, set the variable and re-run the deploy job of the
 tip commit's push run. During a freeze, use branch protection to hold
@@ -645,6 +646,13 @@ Create the directory database once by hand with
 `wrangler d1 create velmora-directory --location enam`. Set its id as
 `VELMORA_DIRECTORY_D1_ID`. The binding is unused until Worker code
 reads it.
+
+Create the two key buckets once by hand before you set their variables
+(a deploy that binds a bucket that does not exist fails and rolls back),
+for example `wrangler r2 bucket create velmora-keys-a --location enam`
+and `wrangler r2 bucket create velmora-keys-b --location enam`. They hold
+wrapped tenant keys only. The bindings are unused until Worker code
+reads them.
 
 Migration files are append-only. Give each new SQL file a name
 `NNNN_<snake>.sql` with a number higher than all existing numbers in
