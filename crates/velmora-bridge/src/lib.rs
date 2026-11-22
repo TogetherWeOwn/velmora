@@ -23,6 +23,7 @@ pub mod jobtable;
 pub mod keepalive;
 pub mod keys;
 pub mod parity;
+pub mod pending;
 pub mod plan;
 mod pool;
 pub mod ports;

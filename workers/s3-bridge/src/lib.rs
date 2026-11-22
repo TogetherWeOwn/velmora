@@ -22,6 +22,9 @@ mod metrics;
 mod nntp;
 mod queues;
 mod r2;
+/// The put-once store of control records over R2; bound by no
+/// configuration yet.
+pub mod records;
 
 use std::cell::RefCell;
 use std::future::poll_fn;
