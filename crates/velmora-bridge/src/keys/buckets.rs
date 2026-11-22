@@ -327,16 +327,23 @@ where
                             .await;
                         Placing::Done(BucketAnswer::StateRefused { status, code })
                     }
-                    // The reservation lives on under a later grant (a
+                    // The reservation lives on: under a later grant (a
                     // sibling or the finisher took a new K after this one
-                    // lost its order) or became the bucket: this grant is
-                    // an orphan, and the answer comes from the reservation.
-                    Ok(false) => {
-                        let _ = self
-                            .drop_grant(table, request.creator, bucket.as_str(), rng)
-                            .await;
-                        Placing::Spent
-                    }
+                    // lost its order), or it became a bucket. If that
+                    // bucket is this grant's (a sibling placed it after
+                    // the state cleared), the grant stays; otherwise this
+                    // grant is an orphan. Either way the answer comes from
+                    // the reservation.
+                    Ok(false) => match records.is_placed(self.tenant, &bucket).await {
+                        Ok(true) => Placing::Spent,
+                        Ok(false) => {
+                            let _ = self
+                                .drop_grant(table, request.creator, bucket.as_str(), rng)
+                                .await;
+                            Placing::Spent
+                        }
+                        Err(_) => Placing::Done(BucketAnswer::Unfinished { grant_seq: k }),
+                    },
                 }
             }
             None => {

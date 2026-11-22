@@ -4546,6 +4546,12 @@ async fn a_refusal_after_a_sibling_took_a_new_k_answers_its_bucket() {
     let a = fut_a.await.unwrap();
     assert!(matches!(a, BucketAnswer::Created { .. }), "{a:?}");
     assert_eq!(buckets.placed.borrow().len(), 1);
+    let placed = buckets.placed.borrow()[0].0.clone();
+    assert_eq!(
+        head_grants(&w, "PR0001").await,
+        vec!["b_01".to_owned(), placed],
+        "the creator holds the placed bucket, and grant 3 is revoked"
+    );
     let a_refused = matches!(a, BucketAnswer::StateRefused { .. });
     assert!(
         !(a_refused && !buckets.placed.borrow().is_empty()),
@@ -4586,9 +4592,154 @@ async fn a_refusal_after_the_finisher_took_a_new_k_answers_its_bucket() {
     let a = fut_a.await.unwrap();
     assert!(matches!(a, BucketAnswer::Created { .. }), "{a:?}");
     assert_eq!(buckets.placed.borrow().len(), 1);
+    let placed = buckets.placed.borrow()[0].0.clone();
+    assert_eq!(
+        head_grants(&w, "PR0001").await,
+        vec!["b_01".to_owned(), placed],
+        "the creator holds the placed bucket, and grant 3 is revoked"
+    );
     let a_refused = matches!(a, BucketAnswer::StateRefused { .. });
     assert!(
         !(a_refused && !buckets.placed.borrow().is_empty()),
         "R5c: the client got 409 while its create's bucket exists"
+    );
+}
+
+/// The tenant chain decided `bucket_created` Refused (restoring) for the
+/// first call; its answer reaches the caller only once the gate opens.
+/// Later calls pass through.
+struct RefusedLate<'i, 'g> {
+    inner: &'i FakeBuckets,
+    gate: RefCell<Option<&'g Cell<bool>>>,
+}
+
+impl BucketRecords for RefusedLate<'_, '_> {
+    async fn bucket_created(
+        &self,
+        t: &TenantId,
+        bucket: &BucketId,
+        unit: u32,
+        creator: &str,
+        grant_seq: u64,
+    ) -> Result<BucketPut> {
+        let g = self.gate.borrow_mut().take();
+        if let Some(g) = g {
+            until(g).await;
+            return Ok(BucketPut::Refused {
+                status: 409,
+                code: "restoring",
+            });
+        }
+        self.inner
+            .bucket_created(t, bucket, unit, creator, grant_seq)
+            .await
+    }
+    async fn is_placed(&self, t: &TenantId, bucket: &BucketId) -> Result<bool> {
+        self.inner.is_placed(t, bucket).await
+    }
+}
+
+/// (Review round 6.) A's put of 3 is refused; before A releases, a same-key retry
+/// places 3 and the unit turns the reservation into bucket 3. A's
+/// release_bound answers Ok(false) ("became the bucket"), A drops grant 3
+/// as an orphan, then answers Created{3} from the reservation.
+#[tokio::test(flavor = "current_thread")]
+async fn a_refused_put_whose_bucket_a_sibling_placed_keeps_its_grant() {
+    let w = World::new();
+    let adm = FakeAdmission::new(&w.root);
+    let mut table_a = seed(&w, &adm).await;
+    let units = w.units();
+    let buckets = FakeBuckets::default();
+    let gate_a = Cell::new(false);
+    let late = RefusedLate {
+        inner: &buckets,
+        gate: RefCell::new(Some(&gate_a)),
+    };
+    let env = env!(w, &adm, &units);
+    let req = photos("PR0001");
+    let mut rng_a = TestRng(6101);
+    let mut fut_a: BoxFut<'_, _> =
+        Box::pin(env.create_bucket(&late, &mut table_a, "ib", &req, &mut rng_a));
+    assert!(
+        poll_once(&mut fut_a).is_none(),
+        "A parked in bucket_created(3)"
+    );
+    let mut table_b = table(&w);
+    let b = env
+        .create_bucket(&buckets, &mut table_b, "ib", &req, &mut TestRng(6102))
+        .await
+        .unwrap();
+    let three = bucket_id(&w.t, 3);
+    assert!(
+        matches!(b, BucketAnswer::Created { grant_seq: 3, .. }),
+        "{b:?}"
+    );
+    // The unit applies bucket_created(3): the reservation becomes the bucket.
+    *adm.bucket_done.borrow_mut() = Some((three.clone(), 3));
+    adm.bucket_open.borrow_mut().remove("ib");
+    gate_a.set(true);
+    let a = fut_a.await.unwrap();
+    let grants = head_grants(&w, "PR0001").await;
+    eprintln!(
+        "R6a: A answered {a:?}; PR0001 grants at head {grants:?}; placed {:?}",
+        buckets.placed.borrow()
+    );
+    assert!(
+        grants.iter().any(|g| g == three.as_str()),
+        "R6a: bucket 3 is placed and answered {a:?}, but its creator's grant was dropped"
+    );
+}
+
+/// (Review round 6.) as R6a with A being the finisher of intent 3.
+#[tokio::test(flavor = "current_thread")]
+async fn a_refused_finisher_put_whose_bucket_a_retry_placed_keeps_its_grant() {
+    let w = World::new();
+    let adm = FakeAdmission::new(&w.root);
+    let mut table0 = seed(&w, &adm).await;
+    let units = w.units();
+    let buckets = FakeBuckets::default();
+    let env = env!(w, &adm, &units);
+    let req = photos("PR0001");
+    // A client call writes and binds 3, then the tenant chain is down.
+    buckets.down.set(true);
+    assert_eq!(
+        env.create_bucket(&buckets, &mut table0, "ib", &req, &mut TestRng(6201))
+            .await
+            .unwrap(),
+        BucketAnswer::Unfinished { grant_seq: 3 }
+    );
+    buckets.down.set(false);
+    let gate_f = Cell::new(false);
+    let late = RefusedLate {
+        inner: &buckets,
+        gate: RefCell::new(Some(&gate_f)),
+    };
+    let mut fin = table(&w);
+    let mut rng_f = TestRng(6202);
+    let mut fut_f: BoxFut<'_, _> =
+        Box::pin(finish_creator_grant(&env, &late, &mut fin, 3, &mut rng_f));
+    assert!(
+        poll_once(&mut fut_f).is_none(),
+        "finisher parked in bucket_created(3)"
+    );
+    let mut table_b = table(&w);
+    let b = env
+        .create_bucket(&buckets, &mut table_b, "ib", &req, &mut TestRng(6203))
+        .await
+        .unwrap();
+    let three = bucket_id(&w.t, 3);
+    assert!(
+        matches!(b, BucketAnswer::Created { grant_seq: 3, .. }),
+        "{b:?}"
+    );
+    *adm.bucket_done.borrow_mut() = Some((three.clone(), 3));
+    adm.bucket_open.borrow_mut().remove("ib");
+    gate_f.set(true);
+    let f = fut_f.await.unwrap();
+    let grants = head_grants(&w, "PR0001").await;
+    eprintln!("R6b: finisher answered {f:?}; PR0001 grants at head {grants:?}");
+    assert!(
+        grants.iter().any(|g| g == three.as_str()),
+        "R6b: bucket 3 is placed (client told Created), but the finisher dropped its creator's grant"
     );
 }
