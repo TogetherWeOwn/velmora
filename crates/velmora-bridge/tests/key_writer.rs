@@ -1113,6 +1113,7 @@ async fn a_key_is_never_recorded_wider_than_its_principal_at_its_seq() {
                     tk_version: 1,
                     closes: true,
                     opened_seq: 1,
+                    rid: None,
                 },
             );
             w.root.seq.set(3);

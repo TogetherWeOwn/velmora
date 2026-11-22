@@ -31,7 +31,7 @@ use velmora::rng::FillRandom;
 
 use super::chain::{parse_seq, seq_name, Chain, ERR_CHAIN_BEHIND, LIST_PAGE};
 use super::record::{
-    key_chain, open_chain_record, open_key_record, ChainRecord, Entry, KeyTable, SubjectDoor,
+    key_chain, open_chain_record, open_key_record, ChainRecord, Entry, KeyTable, Rid, SubjectDoor,
     SubjectPrivate, SubjectStatus, TkRing,
 };
 use super::revocations::list_tenant_revocations;
@@ -83,6 +83,9 @@ struct DoorEntry {
     opened_seq: u64,
     /// Whether the private part below holds this subject.
     open: bool,
+    /// The `rid` of the record at `last_seq` (AM-38).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    rid: Option<Rid>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -131,6 +134,7 @@ pub fn seal_checkpoint<K: Kek, T: TkRing, R: FillRandom>(
                 closes: e.closes,
                 opened_seq: e.opened_seq,
                 open: e.private.is_some(),
+                rid: e.rid,
             })
             .collect(),
         frozen_at: table.frozen_at(),
@@ -210,7 +214,8 @@ pub fn open_checkpoint<K: Kek, T: TkRing>(
             && d.last_seq <= seq
             && d.private_seq != 0
             && d.private_seq <= d.last_seq
-            && d.opened_seq <= d.last_seq;
+            && d.opened_seq <= d.last_seq
+            && (d.rid.is_none() || !d.closes);
         if !seqs_fit || subjects.contains_key(&d.door.id) {
             return None;
         }
@@ -226,6 +231,7 @@ pub fn open_checkpoint<K: Kek, T: TkRing>(
                 tk_version: d.tk_version,
                 closes: d.closes,
                 opened_seq: d.opened_seq,
+                rid: d.rid,
             },
         );
     }

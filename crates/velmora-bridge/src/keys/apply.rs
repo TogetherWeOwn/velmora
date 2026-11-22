@@ -39,7 +39,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use super::chain::Chain;
 use super::ports::{Applied, ApplyEntry, KeyTarget, MAX_APPLY};
 use super::record::{
-    key_chain, open_chain_record, ChainRecord, Entry, KeyTable, SubjectStatus, TkRing,
+    key_chain, open_chain_record, ChainRecord, Entry, KeyTable, Rid, SubjectStatus, TkRing,
     ERR_KEY_RECORD,
 };
 
@@ -57,7 +57,8 @@ pub const MAX_BEHIND: u32 = 3;
 /// it lacks, once).
 #[derive(Clone, Debug)]
 enum Slot {
-    Subject(String),
+    /// The subject's id, and the `rid` the record carries.
+    Subject(String, Option<Rid>),
     Marker,
 }
 
@@ -114,7 +115,7 @@ impl<'a, S: RecordStore, K: Kek, T: TkRing> Feed<'a, S, K, T> {
         }
         let bytes = self.chain.get(self.store, seq).await?;
         let slot = match open_chain_record(self.kek, self.ring, self.table.tenant(), seq, &bytes)? {
-            ChainRecord::Key(r) => Slot::Subject(r.door.id),
+            ChainRecord::Key(r) => Slot::Subject(r.door.id, r.rid),
             ChainRecord::Marker(_) => Slot::Marker,
         };
         self.memo.borrow_mut().insert(seq, slot.clone());
@@ -140,16 +141,18 @@ impl<'a, S: RecordStore, K: Kek, T: TkRing> Feed<'a, S, K, T> {
     async fn page(&self, from: u64, to: u64) -> Result<Vec<ApplyEntry>> {
         let mut out = Vec::with_capacity((to - from) as usize);
         for seq in from + 1..=to {
-            let id = match self.slot(seq).await? {
+            let (id, rid) = match self.slot(seq).await? {
                 Slot::Marker => {
                     out.push(ApplyEntry::Marker { seq });
                     continue;
                 }
-                Slot::Subject(id) => id,
+                Slot::Subject(id, rid) => (id, rid),
             };
             let head = self.table.get(&id).ok_or(ERR_KEY_RECORD)?;
             let mut entry = head.clone();
             entry.last_seq = seq;
+            // The reservation is the record's, not the head's newest.
+            entry.rid = rid;
             out.push(ApplyEntry::Subject(self.in_force(entry)));
         }
         Ok(out)
