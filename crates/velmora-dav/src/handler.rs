@@ -1588,7 +1588,9 @@ impl<U: Upstream, S: StatePort> Ctx<'_, U, S> {
                     from: src_path.clone(),
                     to: dst_path.clone(),
                     tree: false,
-                    etag: Some(etag),
+                    // The bridge preserves the copied source's ETag on the destination.
+                    from_etag: Some(etag.clone()),
+                    to_etag: Some(etag),
                 }];
                 if is_move {
                     ops.push(Op::PropDrop {
@@ -1627,7 +1629,8 @@ impl<U: Upstream, S: StatePort> Ctx<'_, U, S> {
                 from: src_path.clone(),
                 to: dst_path.clone(),
                 tree: depth != Some(0),
-                etag: None,
+                from_etag: None,
+                to_etag: None,
             }];
             if is_move && failed.is_empty() {
                 ops.push(Op::PropDrop {

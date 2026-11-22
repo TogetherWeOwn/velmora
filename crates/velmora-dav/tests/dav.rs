@@ -901,6 +901,31 @@ async fn proppatch_preserves_the_nearest_xml_language() {
 }
 
 #[tokio::test]
+async fn copy_does_not_revive_dead_properties_after_an_s3_overwrite() {
+    let w = World::new().await;
+    assert_eq!(w.s3_put("report", b"old").await, 200);
+    w.req("PROPPATCH", "/dav/report", &[], SET_X)
+        .await
+        .expect(207);
+    assert!(has_x(&w, "/dav/report").await);
+    assert_eq!(w.s3_put("report", b"new").await, 200);
+
+    w.req(
+        "COPY",
+        "/dav/report",
+        &[("destination", "/dav/copied")],
+        b"",
+    )
+    .await
+    .expect(201);
+    assert_eq!(w.s3_get("copied").await.1, b"new");
+    assert!(
+        !has_x(&w, "/dav/copied").await,
+        "copy revived a stale property"
+    );
+}
+
+#[tokio::test]
 async fn large_puts_go_up_in_parts() {
     let part = 5 * MIB;
     let w = World::with(Config {

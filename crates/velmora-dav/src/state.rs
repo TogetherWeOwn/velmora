@@ -196,13 +196,15 @@ pub enum Op {
         etag: Option<String>,
         patches: Vec<Patch>,
     },
-    /// Copies the dead properties of `from` (and under it with `tree`) to
-    /// `to`, replacing what is there; `etag` restamps a single copy.
+    /// Replaces the destination properties with rows for `from_etag`
+    /// stamped with `to_etag`. With `tree`, also copies descendant rows
+    /// without changing their stamps.
     PropCopy {
         from: String,
         to: String,
         tree: bool,
-        etag: Option<String>,
+        from_etag: Option<String>,
+        to_etag: Option<String>,
     },
     PropDrop {
         path: String,
@@ -611,28 +613,23 @@ impl<S: Sql> Engine<'_, S> {
                 from,
                 to,
                 tree,
-                etag,
+                from_etag,
+                to_etag,
             } => {
                 self.prop_drop(&to, tree)?;
-                let rows = self.prop_rows(&from, tree)?;
+                let rows = self.prop_rows(&from, tree, from_etag.as_deref())?;
                 for r in rows {
                     let path = r[0].text();
                     let dest = format!("{to}{}", &path[from.len()..]);
-                    let stamp = if path == from && etag.is_some() {
-                        etag.clone()
+                    let stamp = if path == from {
+                        to_etag.as_deref().map_or(Val::Null, t)
                     } else {
-                        r[4].opt_text()
+                        r[4].clone()
                     };
                     self.sql.exec(
                         "INSERT OR REPLACE INTO dav_props (path, ns, name, value_xml, etag) \
                          VALUES (?1, ?2, ?3, ?4, ?5)",
-                        &[
-                            t(&dest),
-                            r[1].clone(),
-                            r[2].clone(),
-                            r[3].clone(),
-                            stamp.as_deref().map_or(Val::Null, t),
-                        ],
+                        &[t(&dest), r[1].clone(), r[2].clone(), r[3].clone(), stamp],
                     )?;
                 }
                 Ok(Reply::Done)
@@ -653,10 +650,15 @@ impl<S: Sql> Engine<'_, S> {
         }
     }
 
-    fn prop_rows(&self, path: &str, tree: bool) -> Result<Vec<Vec<Val>>, String> {
+    fn prop_rows(
+        &self,
+        path: &str,
+        tree: bool,
+        etag: Option<&str>,
+    ) -> Result<Vec<Vec<Val>>, String> {
         let mut rows = self.sql.exec(
-            "SELECT path, ns, name, value_xml, etag FROM dav_props WHERE path = ?1",
-            &[t(path)],
+            "SELECT path, ns, name, value_xml, etag FROM dav_props WHERE path = ?1 AND etag IS ?2",
+            &[t(path), etag.map_or(Val::Null, t)],
         )?;
         if tree {
             match range_end(path) {
