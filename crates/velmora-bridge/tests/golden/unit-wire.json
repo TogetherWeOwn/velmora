@@ -1267,6 +1267,14 @@
         ],
         "change": "unplaced",
         "seq": 10
+      },
+      {
+        "buckets": [
+          "b_00000000000000f3",
+          "b_00000000000000f4"
+        ],
+        "change": "removed",
+        "seq": 11
       }
     ],
     "bucket_refusal": [

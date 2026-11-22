@@ -31,7 +31,8 @@ use velmora_bridge::unit::{
 };
 use velmora_bridge::unit_lease::client::{
     lease_expired, Answered, Delivery, InFlight, KeyBatch, KeyFeed, KeyFinisher, Page, RecordNames,
-    Renewal, Sleep, Synced, TenantHeads, UnitClient, UnitReplies, RENEW_POLL_MS, RENEW_WAIT_MS,
+    Renewal, Sleep, Synced, TenantHeads, UnitClient, UnitReplies, MAX_SYNC_RECORDS, RENEW_POLL_MS,
+    RENEW_WAIT_MS,
 };
 use velmora_bridge::unit_lease::lease::LeaseRules;
 use velmora_bridge::unit_lease::renewal::ChainNames;
@@ -80,6 +81,7 @@ struct SyncAttempt {
     to_seq: u64,
     tenant_state: TenantState,
     tenant_mode: Option<velmora_bridge::unit::call::HoldMode>,
+    restoring_since: Option<u64>,
     answer: UnitAnswer,
 }
 
@@ -170,6 +172,7 @@ impl UnitReplies for Obj<'_> {
                 to_seq: head.seqs.state_seq,
                 tenant_state: head.tenant_state,
                 tenant_mode: head.tenant_mode,
+                restoring_since: head.restoring_since,
                 answer: reply.answer.clone(),
             });
             if let Some(hook) = self.after_sync_reply.borrow_mut().take() {
@@ -805,6 +808,75 @@ fn sync_keeps_reads_locked_through_an_active_intermediate_record() {
     });
 }
 
+/// With a 33-record backlog, every step carries the head's restore entry and closes reads immediately.
+#[test]
+fn sync_closes_reads_for_restore_before_reaching_the_entry_record() {
+    use velmora_bridge::unit::call::Closed;
+    use velmora_bridge::unit::request::RequestCall;
+
+    with_fresh(|rig| {
+        let client = rig.client();
+        let (bucket, _) = write_bucket_creation(rig, 1, "client-read");
+        synced(&client, rig.unit_seqs());
+        let before = rig.unit_seqs();
+        assert_eq!(rig.obj.unit.head().unwrap().restoring_since, None);
+        let now = rig.clock.now();
+        let read = move |unit: &Unit<RusqliteSql>| {
+            unit.handle(
+                &request(
+                    unit.head().unwrap().seqs,
+                    UnitOp::Request {
+                        call: Box::new(RequestCall::live_generation {
+                            bucket: bucket.clone(),
+                            key: "missing".into(),
+                        }),
+                    },
+                ),
+                now,
+            )
+        };
+        let open = read(&rig.obj.unit);
+        assert!(matches!(open, UnitAnswer::Ok { .. }), "{open:?}");
+        rig.obj.sync_attempts.borrow_mut().clear();
+
+        for _ in 0..32 {
+            rig.write(limits(rig), Actor::Operator);
+        }
+        let middle = Seqs {
+            state_seq: before.state_seq + 32,
+            ..before
+        };
+        rig.write(Change::SetRestoring { unit: 0 }, Actor::Operator);
+        let want = Seqs {
+            state_seq: middle.state_seq + 1,
+            ..before
+        };
+        *rig.obj.after_sync_reply.borrow_mut() = Some(Box::new(move |unit| {
+            assert_eq!(unit.head().unwrap().seqs, middle);
+            assert_eq!(
+                read(unit),
+                UnitAnswer::Closed {
+                    seqs: middle,
+                    why: Closed::Restoring,
+                },
+            );
+        }));
+
+        assert_eq!(synced(&client, before), Synced::Synced { seqs: want });
+        assert!(rig.obj.after_sync_reply.borrow().is_none());
+        assert_restore_steps(
+            rig,
+            before,
+            &[middle.state_seq, want.state_seq],
+            want.state_seq,
+        );
+        assert_eq!(
+            rig.obj.unit.head().unwrap().restoring_since,
+            Some(want.state_seq)
+        );
+    });
+}
+
 /// A unit the head does not list is never called.
 #[test]
 fn a_unit_the_head_does_not_list_is_not_synced() {
@@ -847,51 +919,91 @@ fn a_head_that_clears_the_entry_leaves_the_lift_to_the_tool() {
     });
 }
 
-/// A sync can replace restore A with restore B without stopping at A's
-/// intervening lift, which would require the restore tool's proof.
+fn assert_restore_steps(rig: &Rig<'_>, before: Seqs, targets: &[u64], since: u64) {
+    let attempts = rig.obj.sync_attempts.borrow();
+    assert_eq!(attempts.len(), targets.len(), "sync dispatch count");
+    let mut from = before.state_seq;
+    for (attempt, &to) in attempts.iter().zip(targets) {
+        assert_eq!((attempt.from_seq, attempt.to_seq), (from, to));
+        assert_eq!(attempt.restoring_since, Some(since), "step to {to}");
+        assert!(
+            matches!(attempt.answer, UnitAnswer::Ok { .. }),
+            "step to {to}: {:?}",
+            attempt.answer
+        );
+        from = to;
+    }
+}
+
+fn start_restore(rig: &Rig<'_>) -> Seqs {
+    rig.write(Change::SetRestoring { unit: 0 }, Actor::Operator);
+    let since = rig.head_seq();
+    let before = rig.unit_seqs();
+    let restored = Seqs {
+        state_seq: since,
+        ..before
+    };
+    assert_eq!(
+        synced(&rig.client(), before),
+        Synced::Synced { seqs: restored }
+    );
+    assert_eq!(rig.obj.unit.head().unwrap().restoring_since, Some(since));
+    rig.obj.sync_attempts.borrow_mut().clear();
+    restored
+}
+
+fn write_lift(rig: &Rig<'_>, since_seq: u64) {
+    rig.write(
+        Change::LiftRestoring { unit: 0, since_seq },
+        Actor::RestoreTool,
+    );
+}
+
+/// A sync replaces restore A with the head's restore B without stopping at A's lift.
 #[test]
 fn sync_passes_an_intermediate_lift_when_the_head_has_a_new_restore() {
     with_fresh(|rig| {
-        let client = rig.client();
-        rig.write(Change::SetRestoring { unit: 0 }, Actor::Operator);
-        let a = rig.head_seq();
-        synced(&client, rig.unit_seqs());
-        let before = rig.unit_seqs();
-        assert_eq!(before.state_seq, a);
-        assert_eq!(rig.obj.unit.head().unwrap().restoring_since, Some(a));
-        rig.obj.sync_attempts.borrow_mut().clear();
-
-        rig.write(
-            Change::LiftRestoring {
-                unit: 0,
-                since_seq: a,
-            },
-            Actor::RestoreTool,
-        );
+        let before = start_restore(rig);
+        write_lift(rig, before.state_seq);
         rig.write(Change::SetRestoring { unit: 0 }, Actor::Operator);
         let b = rig.head_seq();
-        assert_eq!(b, a + 2);
         rig.write(limits(rig), Actor::Operator);
         let want = Seqs {
             state_seq: rig.head_seq(),
             ..before
         };
 
-        let result = synced(&client, before);
-        let attempts = rig.obj.sync_attempts.borrow();
-        let first = attempts.first().expect("expected a sync dispatch");
-        assert_eq!(first.from_seq, a);
-        assert!(
-            (b..=want.state_seq).contains(&first.to_seq),
-            "first sync targeted {}, before replacing restore A with B at {b}",
-            first.to_seq,
-        );
-        assert!(
-            matches!(first.answer, UnitAnswer::Ok { .. }),
-            "{:?}",
-            first.answer
-        );
-        assert_eq!(result, Synced::Synced { seqs: want });
+        assert_eq!(synced(&rig.client(), before), Synced::Synced { seqs: want });
+        assert_restore_steps(rig, before, &[want.state_seq], b);
+        let head = rig.obj.unit.head().unwrap();
+        assert_eq!(head.seqs, want);
+        assert_eq!(head.restoring_since, Some(b));
+    });
+}
+
+/// A lift followed by 130 ordinary records does not block catch-up to the next restore entry.
+#[test]
+fn sync_replaces_restore_across_a_long_gap_after_the_lift() {
+    with_fresh(|rig| {
+        let before = start_restore(rig);
+        write_lift(rig, before.state_seq);
+        for _ in 0..130 {
+            rig.write(limits(rig), Actor::Operator);
+        }
+        rig.write(Change::SetRestoring { unit: 0 }, Actor::Operator);
+        let b = rig.head_seq();
+        rig.write(limits(rig), Actor::Operator);
+        let want = Seqs {
+            state_seq: rig.head_seq(),
+            ..before
+        };
+        let targets: Vec<_> = (1..=4)
+            .map(|step| before.state_seq + step * MAX_SYNC_RECORDS)
+            .chain([want.state_seq])
+            .collect();
+
+        assert_eq!(synced(&rig.client(), before), Synced::Synced { seqs: want });
+        assert_restore_steps(rig, before, &targets, b);
         let head = rig.obj.unit.head().unwrap();
         assert_eq!(head.seqs, want);
         assert_eq!(head.restoring_since, Some(b));
@@ -974,69 +1086,90 @@ fn sync_creates_the_bucket_from_the_tenant_record() {
     });
 }
 
-/// A `SetUnits` that unplaces multiple buckets must finish in an open
-/// sync step, dropping both empty buckets before the restore preserves rows.
-#[test]
-fn sync_drops_unplaced_buckets_before_entering_restore() {
-    with_fresh(|rig| {
-        let (x, _) = write_bucket_creation(rig, 1, "client-bucket-x");
-        let (y, _) = write_bucket_creation(rig, 2, "client-bucket-y");
-        let client = rig.client();
-        synced(&client, rig.unit_seqs());
-        let before = rig.unit_seqs();
-        let bucket_rows = || {
-            rig.obj.unit.sql().with_conn(|conn| {
-                conn.query_row(
-                    "SELECT COUNT(*) FROM buckets WHERE id IN (?1, ?2)",
-                    [x.as_str(), y.as_str()],
-                    |r| r.get::<_, i64>(0),
-                )
-                .unwrap()
-            })
-        };
-        assert_eq!(bucket_rows(), 2);
-        rig.obj.sync_attempts.borrow_mut().clear();
+fn place_two_buckets(rig: &Rig<'_>) -> [BucketId; 2] {
+    let (x, _) = write_bucket_creation(rig, 1, "client-bucket-x");
+    let (y, _) = write_bucket_creation(rig, 2, "client-bucket-y");
+    synced(&rig.client(), rig.unit_seqs());
+    let ids = [x, y];
+    assert_eq!(bucket_rows(rig, &ids), 2);
+    rig.obj.sync_attempts.borrow_mut().clear();
+    ids
+}
 
-        rig.write(
-            Change::SetUnits {
-                base_seq: before.state_seq,
-                units: vec![0],
-                placements: vec![],
-            },
-            Actor::Operator,
-        );
+fn bucket_rows(rig: &Rig<'_>, [x, y]: &[BucketId; 2]) -> i64 {
+    rig.obj.unit.sql().with_conn(|conn| {
+        conn.query_row(
+            "SELECT COUNT(*) FROM buckets WHERE id IN (?1, ?2)",
+            [x.as_str(), y.as_str()],
+            |r| r.get(0),
+        )
+        .unwrap()
+    })
+}
+
+fn write_remove_placements(rig: &Rig<'_>) {
+    rig.write(
+        Change::SetUnits {
+            base_seq: rig.head_seq(),
+            units: vec![0],
+            placements: vec![],
+        },
+        Actor::Operator,
+    );
+}
+
+fn assert_both_buckets_dropped(rig: &Rig<'_>, ids: &[BucketId; 2]) {
+    let attempts = rig.obj.sync_attempts.borrow();
+    let answer = &attempts[0].answer;
+    assert!(
+        matches!(answer, UnitAnswer::Ok { body, .. } if body["buckets"]["dropped"] == 2),
+        "{answer:?}"
+    );
+    assert_eq!(bucket_rows(rig, ids), 0);
+}
+
+/// One step applies `SetUnits` removals even as it enters restoring.
+#[test]
+fn sync_drops_removed_buckets_while_entering_restore() {
+    with_fresh(|rig| {
+        let ids = place_two_buckets(rig);
+        let before = rig.unit_seqs();
+        write_remove_placements(rig);
         rig.write(Change::SetRestoring { unit: 0 }, Actor::Operator);
         let want = Seqs {
             state_seq: before.state_seq + 2,
             ..before
         };
-        assert_eq!(synced(&client, before), Synced::Synced { seqs: want });
-        let attempts = rig.obj.sync_attempts.borrow();
-        let [removal, restore] = attempts.as_slice() else {
-            panic!("expected two sync dispatches, got {}", attempts.len());
-        };
-        assert_eq!(
-            (removal.from_seq, removal.to_seq),
-            (before.state_seq, before.state_seq + 1)
-        );
-        assert_eq!(
-            (restore.from_seq, restore.to_seq),
-            (before.state_seq + 1, want.state_seq)
-        );
-        assert!(
-            matches!(&removal.answer, UnitAnswer::Ok { body, .. } if body["buckets"]["dropped"] == 2),
-            "{:?}",
-            removal.answer
-        );
-        assert!(
-            matches!(restore.answer, UnitAnswer::Ok { .. }),
-            "{:?}",
-            restore.answer
-        );
+
+        assert_eq!(synced(&rig.client(), before), Synced::Synced { seqs: want });
+        assert_restore_steps(rig, before, &[want.state_seq], want.state_seq);
+        assert_both_buckets_dropped(rig, &ids);
         let head = rig.obj.unit.head().unwrap();
         assert_eq!(head.seqs, want);
         assert_eq!(head.restoring_since, Some(want.state_seq));
-        assert_eq!(bucket_rows(), 0);
+    });
+}
+
+/// One step replaces restore A with B and drops both placements removed between the entries.
+#[test]
+fn sync_drops_buckets_removed_between_restore_entries() {
+    with_fresh(|rig| {
+        let ids = place_two_buckets(rig);
+        let before = start_restore(rig);
+        write_lift(rig, before.state_seq);
+        write_remove_placements(rig);
+        rig.write(Change::SetRestoring { unit: 0 }, Actor::Operator);
+        let want = Seqs {
+            state_seq: before.state_seq + 3,
+            ..before
+        };
+
+        assert_eq!(synced(&rig.client(), before), Synced::Synced { seqs: want });
+        assert_restore_steps(rig, before, &[want.state_seq], want.state_seq);
+        assert_both_buckets_dropped(rig, &ids);
+        let head = rig.obj.unit.head().unwrap();
+        assert_eq!(head.seqs, want);
+        assert_eq!(head.restoring_since, Some(want.state_seq));
     });
 }
 
@@ -2451,6 +2584,29 @@ fn a_late_first_timer_slice_ends_the_wait_and_returns_renew_needed() {
         assert_eq!(*slept.borrow(), [RENEW_POLL_MS]);
         assert_eq!(rig.calls(), ["ping", "job:stamp", "ping", "renew", "ping"]);
     });
+}
+
+/// After a first slice uses 4,990 ms, the waiter requests only the 10 ms left before its deadline.
+#[test]
+fn a_waiter_caps_its_next_slice_at_the_time_left() {
+    let clock = FixedClock::new(NOW);
+    let slices = Rc::new(RefCell::new(Vec::new()));
+    let sleep: Sleep = Rc::new({
+        let clock = clock.clone();
+        let slices = Rc::clone(&slices);
+        move |ms| {
+            let mut slices = slices.borrow_mut();
+            let elapsed = if slices.is_empty() { 4_990 } else { ms as i64 };
+            slices.push(ms);
+            clock.advance_ms(elapsed);
+            Box::pin(std::future::ready(()))
+        }
+    });
+    let flights = InFlight::with_sleep(sleep);
+    let _renewing = flights.begin(&own()).unwrap();
+    assert!(block_on(flights.wait(&own(), RENEW_WAIT_MS, &clock)).is_none());
+    assert_eq!(*slices.borrow(), [RENEW_POLL_MS, 10]);
+    assert_eq!(clock.now(), UnixMs(NOW.0 + 5_000));
 }
 
 /// A client using the default timerless isolate state does not wait.

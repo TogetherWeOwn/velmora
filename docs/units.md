@@ -224,14 +224,13 @@ hand-out, and its writes are due from their own time.
   unit is `created`, with the name and wrapped key from its private part;
   a placement on this unit that a record removes is `unplaced` when the
   record before held this unit's `restoring` entry, else `dropped`, or
-  `unplaced` for several at once), and the head's placement list for this
-  unit. A unit more than 32 records (est) behind is brought up in steps,
-  each a `sync` to a record of the chain, at most 8 steps per sync. A
-  step carries the head's tenant state (never a looser one of a record
-  below it), and ends at the furthest record that neither ends an entry
-  the unit holds (that needs the restore tool's lift proof) nor leaves an
-  operator's removal of several placements under an entry at either end
-  of the step. Each
+  `removed` for several at once: `dropped` and `removed` apply whatever
+  entry the unit holds), and the placement list for this unit. A unit more than 32 records (est) behind is brought up in steps,
+  each a `sync` to a record of the chain, at most 8 steps per sync. Every
+  step carries the head's admission: its tenant state and mode and this
+  unit's `restoring` entry (never a looser state of a record below it,
+  and never a lift, which only the restore tool's proof makes), with the
+  step's own bucket changes and placement list. Each
   `sync` names the unit's `state_seq` its part was built from
   (`from_seq`); a unit at another seq refuses it `stale_sync` and the
   Worker reads again, so a part from another base (a second isolate's

@@ -165,12 +165,24 @@ fn removing_one_placement_from_a_previously_restoring_unit_emits_an_unplace() {
     );
 }
 
-/// Several local removals are grouped into one `Unplaced` with just the removed ids.
+/// Several removals use `Removed` outside an entry and `Unplaced` under one.
 #[test]
-fn removing_several_local_placements_emits_one_unplace() {
-    let from = door(10, &[(C, HERE), (B, HERE), (A, HERE)]);
+fn removing_several_local_placements_uses_the_preceding_doors_entry() {
+    let mut from = door(10, &[(C, HERE), (B, HERE), (A, HERE)]);
     let removed = record(door(11, &[(B, HERE)]));
 
+    assert_eq!(
+        bucket_changes(HERE, &from, std::slice::from_ref(&removed)).unwrap(),
+        vec![BucketChange::Removed {
+            seq: 11,
+            buckets: vec![A.into(), C.into()],
+        }]
+    );
+
+    from.restoring = vec![Restoring {
+        unit: HERE,
+        since_seq: 9,
+    }];
     assert_eq!(
         bucket_changes(HERE, &from, &[removed]).unwrap(),
         vec![BucketChange::Unplaced {

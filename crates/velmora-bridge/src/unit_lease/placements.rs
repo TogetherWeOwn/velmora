@@ -13,9 +13,9 @@
 //!   the record before it held this unit's `restoring` entry (only
 //!   `UnplaceMovedBuckets` removes placements then: `DropBucket` and
 //!   `SetUnits` are refused while an entry is set), else `dropped` for
-//!   one bucket (`DropBucket`), and `unplaced` for several at once (an
-//!   operator's `SetUnits`; outside a `restoring` entry the unit drops
-//!   each as it drops a `dropped`).
+//!   one bucket (`DropBucket`), and `removed` for several at once (an
+//!   operator's `SetUnits`: the unit drops each as a `dropped`, whatever
+//!   entry it holds when it applies them).
 //!
 //! A placement added without a `bucket_created` (the owner's moved
 //! buckets, `PlaceMovedBuckets`) makes no change: their rows come through
@@ -87,13 +87,19 @@ pub fn bucket_changes(
             }
         }
         let removed: Vec<String> = before.difference(&after).cloned().collect();
+        let under_entry = prev.restoring_entry(unit).is_some();
         match removed.len() {
             0 => {}
-            1 if prev.restoring_entry(unit).is_none() => changes.push(BucketChange::Dropped {
+            // Under an entry only `UnplaceMovedBuckets` removes placements.
+            _ if under_entry => changes.push(BucketChange::Unplaced {
+                seq: door.seq,
+                buckets: removed,
+            }),
+            1 => changes.push(BucketChange::Dropped {
                 seq: door.seq,
                 bucket_id: removed.into_iter().next().unwrap_or_default(),
             }),
-            _ => changes.push(BucketChange::Unplaced {
+            _ => changes.push(BucketChange::Removed {
                 seq: door.seq,
                 buckets: removed,
             }),

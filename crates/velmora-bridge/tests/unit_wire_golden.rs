@@ -683,6 +683,10 @@ fn nested() -> Value {
                 seq: 10,
                 buckets: vec!["b_00000000000000f2".into()],
             },
+            BucketChange::Removed {
+                seq: 11,
+                buckets: vec!["b_00000000000000f3".into(), "b_00000000000000f4".into()],
+            },
         ])
         .unwrap(),
         "reservation_bodies": reservation_bodies(),

@@ -567,6 +567,26 @@ fn the_bucket_part_of_a_sync_is_shape_checked_first() {
     assert_eq!(ok(&[], &placed(&[""])), Err(Malformed));
 }
 
+/// `Removed` rejects an empty list or a list containing an invalid bucket ID.
+#[test]
+fn a_removed_change_rejects_empty_and_malformed_bucket_lists() {
+    let check = |list: &[&str]| {
+        buckets::check_shape(
+            &[BucketChange::Removed {
+                seq: 4,
+                buckets: placed(list),
+            }],
+            &[],
+            3,
+            4,
+        )
+    };
+    assert_eq!(check(&[B1, B2]), Ok(()));
+    for list in [&[][..], &[B1, "bad id"]] {
+        assert_eq!(check(list), Err(BucketRefusal::Malformed), "{list:?}");
+    }
+}
+
 #[test]
 fn a_bucket_change_reads_back_from_its_json_and_shows_no_name_or_wrap() {
     let c = created(4, B1, "secret-name", 2);
@@ -891,6 +911,47 @@ fn a_sync_unplace_preserves_bucket_rows_while_restoring() {
     assert_eq!(ids(&u), placed(&[B1]));
     assert_eq!(name_of(&u, B1), "alpha");
     assert!(!closing(&u, B1));
+}
+
+/// `Removed` drops empty rows and keeps occupied rows closing, with or without a retained restore entry.
+#[test]
+fn a_sync_removal_drops_empty_rows_and_keeps_occupied_rows_closing() {
+    for restoring in [None, Some(8)] {
+        let u = ready();
+        ok_body(sync_buckets(
+            &u,
+            7,
+            None,
+            vec![
+                created(5, B1, "alpha", 2),
+                created(6, B2, "beta", 3),
+                created(7, B3, "gamma", 4),
+            ],
+            &[B1, B2, B3],
+        ));
+        ok_body(sync_buckets(&u, 8, restoring, vec![], &[B1, B2, B3]));
+        assert_eq!(u.head().unwrap().restoring_since, restoring);
+        hold_something(&u, B3);
+
+        let body = ok_body(sync_buckets(
+            &u,
+            9,
+            restoring,
+            vec![BucketChange::Removed {
+                seq: 9,
+                buckets: placed(&[B1, B2, B3]),
+            }],
+            &[],
+        ));
+        assert_eq!(body["buckets"]["dropped"], json!(2));
+        assert_eq!(body["buckets"]["drop_not_closed"], json!([B3]));
+        assert_eq!(ids(&u), placed(&[B3]));
+        assert!(closing(&u, B3));
+        assert_eq!(name_of(&u, B3), format!("~dropped/{B3}"));
+        let head = u.head().unwrap();
+        assert_eq!(head.seqs.state_seq, 9);
+        assert_eq!(head.restoring_since, restoring);
+    }
 }
 
 /// A sync based on an old sequence is refused without changing the head or rows, even with a valid bucket part.
