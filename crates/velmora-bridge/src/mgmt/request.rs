@@ -16,7 +16,8 @@
 //!   `objects/list` is a read, though it is a `POST`. A value of the wrong
 //!   form answers `400 bad_request`; on a read, the key is not used.
 //! - **The query** is parsed for the call ([`CallQuery`]). A call that
-//!   takes none refuses one. A parameter a call does not take, a repeated
+//!   takes none refuses one. The one exception is usage downloads (outside
+//!   the contract, `?period=`), whose handler gets its query raw. A parameter a call does not take, a repeated
 //!   one, a value that does not decode, a `limit` out of 1 to 1,000 and a
 //!   hold out of 7 to 3,650 days answer `400 bad_request`. On the lists
 //!   of the contract, an `after` that is not that list's position answers
@@ -62,8 +63,8 @@ pub enum CallQuery {
     UsageDays(UsageDaysQuery),
     /// Any other list: `?after=&limit=`.
     List(List),
-    /// A call outside the contract whose query its handler parses (usage
-    /// downloads, `?period=`; the parts of an upload): the raw query.
+    /// Usage downloads (outside the contract, `?period=`): the raw query,
+    /// which its handler parses.
     Raw(String),
 }
 
@@ -172,11 +173,11 @@ fn call_query(call: &Call, query: &str) -> Result<CallQuery, Code> {
             list.after_as(EventPosition::parse)?;
             CallQuery::List(list)
         }
-        // The global feed: a list; its handler parses the position.
-        Events => CallQuery::List(List::parse(query)?),
-        // Not calls of the contract, with queries of their own (usage
-        // downloads takes `?period=`): their handlers parse them.
-        UsageDownloads { .. } | UploadParts { .. } => CallQuery::Raw(query.to_string()),
+        // The global feed and the parts of an upload: lists outside the
+        // contract; their handlers parse the position.
+        Events | UploadParts { .. } => CallQuery::List(List::parse(query)?),
+        // Usage downloads takes `?period=`: its handler parses its query.
+        UsageDownloads { .. } => CallQuery::Raw(query.to_string()),
         _ if query.is_empty() => CallQuery::None,
         _ => return Err(Code::BadRequest),
     })

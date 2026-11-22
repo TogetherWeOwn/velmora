@@ -131,9 +131,9 @@ fn every_call_says_what_it_needs() {
                 "{method} {path}: key {bad:?}"
             );
         }
-        // A call refuses a parameter it does not take; the two calls whose
-        // handlers parse their own query get it raw.
-        if matches!(c, Call::UsageDownloads { .. } | Call::UploadParts { .. }) {
+        // A call refuses a parameter it does not take; usage downloads,
+        // whose handler parses its own query, gets it raw.
+        if matches!(c, Call::UsageDownloads { .. }) {
             assert_eq!(
                 check(&c, "period=2026-11", Some(ACTING), None).map(|c| c.query),
                 Ok(CallQuery::Raw("period=2026-11".into()))
