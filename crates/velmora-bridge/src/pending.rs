@@ -95,7 +95,8 @@ pub trait PendingRows {
     /// whatever the rows' ages or how many rows a chain holds: in SQL,
     /// step from chain to chain on the key `(tenant, chain, seq)`, and
     /// take each chain's oldest row from an index on `(tenant, chain,
-    /// created_at)`.
+    /// created_at)` (the column of `pending_ops` in
+    /// `migrations-directory/0001_directory.sql`).
     async fn chains_after(
         &self,
         after: Option<&ChainKey>,
@@ -158,7 +159,10 @@ impl crate::keys::writer::FinishReport {
 }
 
 /// One pass of the sweep at `now`, after the chain `after` (the
-/// `next_after` of the pass before). An `Err` only when the chains could
+/// `next_after` of the pass before). The caller stores `next_after`
+/// durably between passes (an isolate's memory does not outlive a cron
+/// run; a directory row will do): a caller that passes `None` every time
+/// only ever reaches the first [`SWEEP_CHAINS`] chains. An `Err` only when the chains could
 /// not be read.
 pub async fn sweep<P: PendingRows, F: ChainFinisher>(
     rows: &P,
