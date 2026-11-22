@@ -222,10 +222,23 @@ pub const MAX_COLD_SOCKETS: u32 = 8;
 /// charges plaintext plus ciphertext and the ciphertext is copied once
 /// more when it is handed to the blob store. A job holds about what it
 /// charges. The budget weighs a request byte at `JOB_BUDGET_BYTES /
-/// INFLIGHT_BUDGET_BYTES` job bytes, so a ratio above 3/2 would only let
-/// jobs charge memory that requests alone could never reach.
+/// INFLIGHT_BUDGET_BYTES` job bytes. Up to 3/2 that weight is what a
+/// request holds; above it, jobs may charge more than requests alone
+/// could reach, which only [`MAX_JOB_BUDGET_BYTES`] allows.
 pub const MAX_JOB_BUDGET_NUM: u64 = 3;
 pub const MAX_JOB_BUDGET_DEN: u64 = 2;
+/// `JOB_BUDGET_BYTES` may be up to this much (89 MiB) whatever
+/// `INFLIGHT_BUDGET_BYTES` is, when 3/2 of that is less.
+///
+/// It is what three post jobs of a full extent with parity (28.88 MiB
+/// each at 6 sockets) and a verify job charge at once, so that one post
+/// queue's three invocations run together in their isolate with parity
+/// as they do without it. It is set from a measurement of the peak
+/// memory of such an isolate, not from the charges alone: raise it only
+/// after measuring again. A job holds about what it charges, and a
+/// request is weighed at more than the 1.5 bytes it holds, so in any
+/// mix the charges stand for at most this much memory.
+pub const MAX_JOB_BUDGET_BYTES: u64 = 89 * 1024 * 1024;
 
 /// Propagation grace when `PROPAGATION_GRACE_SECS` is unset: six hours.
 pub const DEFAULT_PROPAGATION_GRACE_SECS: u32 = 21_600;
@@ -914,7 +927,8 @@ impl BridgeConfig {
             .find(fits)
             .ok_or_else(|| ConfigError::Invalid("INFLIGHT_BUDGET_BYTES".into()))?;
         // Never under the request limit, and never more than half as much
-        // again (see `MAX_JOB_BUDGET_NUM`).
+        // again (see `MAX_JOB_BUDGET_NUM`) or `MAX_JOB_BUDGET_BYTES`,
+        // whichever is more.
         let job_budget_bytes: u64 = match get("JOB_BUDGET_BYTES") {
             Some(v) if !v.trim().is_empty() => v
                 .trim()
@@ -922,7 +936,8 @@ impl BridgeConfig {
                 .map_err(|_| ConfigError::Invalid("JOB_BUDGET_BYTES".into()))?,
             _ => inflight_budget_bytes,
         };
-        let job_budget_max = inflight_budget_bytes / MAX_JOB_BUDGET_DEN * MAX_JOB_BUDGET_NUM;
+        let job_budget_max = (inflight_budget_bytes / MAX_JOB_BUDGET_DEN * MAX_JOB_BUDGET_NUM)
+            .max(MAX_JOB_BUDGET_BYTES);
         if job_budget_bytes < inflight_budget_bytes || job_budget_bytes > job_budget_max {
             return Err(ConfigError::Invalid("JOB_BUDGET_BYTES".into()));
         }

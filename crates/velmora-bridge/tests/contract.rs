@@ -16,7 +16,7 @@ use sha2::{Digest, Sha256};
 use velmora_bridge::config::{
     BridgeConfig, ConfigError, Environment, GcMode, KekRing, Maintenance, DEFAULT_COLD_SOCKETS,
     DEFAULT_HOT_CAP_BYTES, DEFAULT_POST_SOCKETS, DEFAULT_SLICE_BYTES, MAX_EXTENT_BYTES_LIMIT,
-    MAX_PUT_BYTES_LIMIT,
+    MAX_JOB_BUDGET_BYTES, MAX_PUT_BYTES_LIMIT,
 };
 use velmora_bridge::ingress::ByteBudget;
 use velmora_bridge::jobs::RESEND_SECS;
@@ -271,7 +271,7 @@ fn config_loads_from_documented_vars() {
     assert_eq!(cfg.required_backbones, 2);
     assert_eq!(cfg.max_extent_bytes, 16 * 1024 * 1024);
     assert_eq!(cfg.inflight_budget_bytes, 48 * 1024 * 1024);
-    assert_eq!(cfg.job_budget_bytes, 72 * 1024 * 1024);
+    assert_eq!(cfg.job_budget_bytes, 89 * 1024 * 1024);
     // No wait after the two-backbone verify: the release job's own STAT
     // of every backbone that counts is the last check.
     assert_eq!(cfg.safety_min_age_secs, 0);
@@ -973,8 +973,11 @@ fn config_rejects_invalid_and_unsafe_values() {
             "{short}"
         );
     }
-    // The job budget: from the request budget to 1.5 times it.
-    for bad in ["50331647", "75497473", "72MiB", "-1"] {
+    // The job budget: from the request budget to 1.5 times it or
+    // MAX_JOB_BUDGET_BYTES (89 MiB), whichever is more. At the shipped
+    // 48 MiB request budget that is 89 MiB, not 72.
+    assert_eq!(MAX_JOB_BUDGET_BYTES, 93_323_264);
+    for bad in ["50331647", "93323265", "72MiB", "-1"] {
         assert_eq!(
             set(&prod, "JOB_BUDGET_BYTES", bad),
             invalid("JOB_BUDGET_BYTES"),
@@ -984,11 +987,24 @@ fn config_rejects_invalid_and_unsafe_values() {
     for (good, want) in [
         ("50331648", 50_331_648),
         ("75497472", 75_497_472),
+        ("75497473", 75_497_473),
+        ("93323264", 93_323_264),
         ("", 50_331_648),
     ] {
         let mut vars = with_secrets(prod.clone(), PROVIDER_TLS);
         vars.insert("JOB_BUDGET_BYTES".into(), good.into());
         assert_eq!(load(&vars).unwrap().job_budget_bytes, want, "{good:?}");
+    }
+    // A request budget whose 1.5 times is above 89 MiB keeps that bound:
+    // 64 MiB allows 96 MiB and not a byte more.
+    for (job, ok) in [("100663296", true), ("100663297", false)] {
+        let mut vars = with_secrets(prod.clone(), PROVIDER_TLS);
+        vars.insert("INFLIGHT_BUDGET_BYTES".into(), "67108864".into());
+        vars.insert("JOB_BUDGET_BYTES".into(), job.into());
+        match ok {
+            true => assert_eq!(load(&vars).unwrap().job_budget_bytes, 100_663_296),
+            false => assert_eq!(load(&vars).unwrap_err(), invalid("JOB_BUDGET_BYTES")),
+        }
     }
     assert_eq!(
         set(&prod, "SAFETY_MIN_AGE_SECS", "-1"),
@@ -2882,14 +2898,18 @@ fn provider_pool_settings_fail_closed() {
 }
 
 /// The shipped `POST_SOCKETS` and `JOB_BUDGET_BYTES` let three post jobs
-/// of full-size extents and a verify job share one isolate's byte budget.
-/// The queue's invocations share isolates, so with a larger socket count
-/// or a smaller job budget a post job waits for another.
+/// of full-size extents and a verify job share one isolate's byte budget,
+/// with parity (`PARITY`) and without. The queue's invocations share
+/// isolates, so with a larger socket count or a smaller job budget a post
+/// job waits for another: with parity at 72 MiB only two fitted, and
+/// posting was 20% slower than without.
 #[test]
 fn three_post_jobs_and_a_verify_job_fit_the_shipped_budget() {
     use velmora::media::{FileKey, Profile, Sealer};
     use velmora::rng::SystemRng;
-    use velmora_bridge::jobs::job_bytes;
+    use velmora_bridge::articles::article_spans;
+    use velmora_bridge::jobs::{job_bytes, parity_job_bytes};
+    use velmora_bridge::parity::parity_count;
 
     let (prod, _) = wrangler_vars();
     let budget: u64 = prod["JOB_BUDGET_BYTES"].parse().unwrap();
@@ -2899,20 +2919,40 @@ fn three_post_jobs_and_a_verify_job_fit_the_shipped_budget() {
     let sealer = Sealer::random(&Profile::drive(), &key, &mut SystemRng).unwrap();
     let cipher_size = sealer.seal_to_vec(&vec![0u8; max_extent]).unwrap().len() as u64;
 
-    let post = job_bytes(OutboxStage::Post, cipher_size, sockets);
+    // What `run_leased` charges a post job of a new plan with the switch
+    // on: the job, and the parity of its articles.
+    let plain = job_bytes(OutboxStage::Post, cipher_size, sockets);
+    let parity = parity_count(article_spans(cipher_size).len());
+    let with_parity = plain + parity_job_bytes(cipher_size, parity);
     let verify = job_bytes(OutboxStage::Verify, cipher_size, sockets);
-    assert!(
-        3 * post + verify <= budget,
-        "three post jobs ({post} B each) and a verify job ({verify} B) exceed {budget} B"
+    assert_eq!(
+        (parity, plain),
+        (4, 23_072_816),
+        "a 16 MiB extent at 6 sockets"
     );
-    let jobs =
-        ByteBudget::new(prod["INFLIGHT_BUDGET_BYTES"].parse().unwrap()).with_job_capacity(budget);
-    let held: Vec<_> = [post, post, post, verify]
-        .into_iter()
-        .map(|bytes| jobs.try_charge_job(bytes).expect("fits"))
-        .collect();
-    assert!(jobs.try_charge_job(post).is_none());
-    drop(held);
+    assert_eq!(
+        with_parity, 30_284_016,
+        "28.88 MiB with its 4 parity shards"
+    );
+    for post in [plain, with_parity] {
+        assert!(
+            3 * post + verify <= budget,
+            "three post jobs ({post} B each) and a verify job ({verify} B) exceed {budget} B"
+        );
+        let jobs = ByteBudget::new(prod["INFLIGHT_BUDGET_BYTES"].parse().unwrap())
+            .with_job_capacity(budget);
+        let held: Vec<_> = [post, post, post, verify]
+            .into_iter()
+            .map(|bytes| jobs.try_charge_job(bytes).expect("fits"))
+            .collect();
+        assert!(jobs.try_charge_job(post).is_none());
+        drop(held);
+    }
+    // The shipped budget is the most a deployment may set, and no more
+    // than the three jobs with parity and the verify job need, rounded
+    // up to a MiB: it was measured at that value.
+    assert_eq!(budget, MAX_JOB_BUDGET_BYTES);
+    assert_eq!(budget, (3 * with_parity + verify).div_ceil(1 << 20) << 20);
 }
 
 /// The queue tables of the shipped `wrangler.toml`: producers as
