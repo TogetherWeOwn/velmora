@@ -327,6 +327,11 @@ pub async fn route_request(
     if units != Units::Bound || skip {
         return None;
     }
+    // The host first (ADR §8.4 step 1), before any key route is read:
+    // tenant 0's path gives the same refusal.
+    if velmora_bridge::service::request_host_refused(&base.cfg, req).is_some() {
+        return None;
+    }
     let akid = velmora_bridge::service::claimed_access_key(&base.cfg, req)?;
     let tenant = match routes().tenant_of(&akid).await {
         Ok(KeyTenant::Managed { tenant, floor }) => (tenant, floor),

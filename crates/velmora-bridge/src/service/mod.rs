@@ -314,7 +314,7 @@ where
 // A managed tenant's request (design round 5, AM-51)
 // ---------------------------------------------------------------------------
 
-pub use common::{claimed_access_key, writes_refused};
+pub use common::{claimed_access_key, request_host_refused, writes_refused};
 
 impl Route<'_> {
     /// The operation changes stored state: the maintenance gate refuses

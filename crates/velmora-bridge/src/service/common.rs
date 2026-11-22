@@ -365,13 +365,10 @@ impl Authority for OneKey {
     }
 }
 
-/// The access key id the request claims, from the `Authorization` header
-/// or a presigned query. Only used to look the key up; the verifier
-/// parses the credential strictly.
 /// [`host_refused`] for a raw request, before anything else is parsed
-/// (the router of a managed tenant's requests, `service::serve_managed`).
-/// A request with no `Host` is not refused here.
-pub(super) fn request_host_refused(cfg: &BridgeConfig, req: &S3Request) -> Option<S3Response> {
+/// (the request router: `service::serve_managed`, and the Worker before
+/// it reads a key route). A request with no `Host` is not refused here.
+pub fn request_host_refused(cfg: &BridgeConfig, req: &S3Request) -> Option<S3Response> {
     req.headers
         .iter()
         .find(|(name, _)| name.eq_ignore_ascii_case("host"))
@@ -395,6 +392,9 @@ pub fn claimed_access_key(cfg: &BridgeConfig, req: &S3Request) -> Option<String>
     claimed_key(&headers, &target)
 }
 
+/// The access key id the request claims, from the `Authorization` header
+/// or a presigned query. Only used to look the key up; the verifier
+/// parses the credential strictly.
 fn claimed_key(headers: &Headers, target: &Target) -> Option<String> {
     let credential = match headers.get("authorization") {
         Some(value) => value

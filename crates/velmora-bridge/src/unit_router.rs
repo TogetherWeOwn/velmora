@@ -285,12 +285,13 @@ pub trait UnitRouter {
 
 /// A call to a unit that writes on a caller's behalf, for the maintenance
 /// gate: a `Request` call of any op but the three reads
-/// (`UnitOp::is_read`), and the reservation calls that change rows
-/// (`Reserve`, `BindBucket`, `Release`, `ReleaseBound`), which the
-/// management plane sends as Worker calls. The tools' own calls (`sync`,
-/// the key apply, the import and the gate) and the reservation reads
-/// (`ResolveActing`, `BucketBinding`) pass: the owner move's window runs
-/// on them (DS1 §3.4).
+/// (`UnitOp::is_read`), and the reservation calls that can change rows
+/// (`Reserve`, `BindBucket`, `Release`, `ReleaseBound`, and
+/// `BucketBinding`, which can write a fence), which the management plane
+/// sends as Worker calls. The tools' own calls (`sync`, the key apply,
+/// the import, the gate, the restore calls, `renew`, `Recount`, `Export`)
+/// and `ResolveActing` pass: the owner move's window runs on them (DS1
+/// §3.4).
 pub fn writes(kind: CallKind, op: &UnitOp) -> bool {
     let reserves = matches!(
         op,
@@ -298,6 +299,7 @@ pub fn writes(kind: CallKind, op: &UnitOp) -> bool {
             | UnitOp::BindBucket { .. }
             | UnitOp::Release { .. }
             | UnitOp::ReleaseBound { .. }
+            | UnitOp::BucketBinding { .. }
     );
     reserves || (kind == CallKind::Request && !op.is_read())
 }

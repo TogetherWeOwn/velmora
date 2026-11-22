@@ -449,8 +449,8 @@ async fn the_key_routes_numbers_are_a_floor() {
 }
 
 /// The management plane's reservation writes are Worker calls: the
-/// maintenance gate refuses them too (review of L6-2, MEDIUM); the
-/// reservation reads pass.
+/// maintenance gate refuses them too (review of L6-2, MEDIUM); the tools'
+/// own calls pass.
 #[tokio::test]
 async fn under_restore_the_reservation_writes_are_refused() {
     use velmora_bridge::unit::call::UnitOp as Op;
@@ -460,9 +460,12 @@ async fn under_restore_the_reservation_writes_are_refused() {
     let cache = HeadCache::default();
     let r = router(Maintenance::Restore, &clients, &heads, &cache, &clock);
     let routed = r.route(&tenant(), None, NONE).await.unwrap();
-    let writes = [Op::Release {
-        rid: velmora_bridge::unit::reserve::Rid([7; 16]),
-    }];
+    let writes = [
+        Op::Release {
+            rid: velmora_bridge::unit::reserve::Rid([7; 16]),
+        },
+        Op::BucketBinding { grant_seq: 1 },
+    ];
     for op in writes {
         assert!(
             velmora_bridge::unit_router::writes(CallKind::Worker, &op),
@@ -474,10 +477,11 @@ async fn under_restore_the_reservation_writes_are_refused() {
         );
     }
     assert_eq!(clients.made.get(), 0);
-    let read = Op::BucketBinding { grant_seq: 1 };
+    // The tools' own calls pass: the move's window runs on them.
+    let import_progress = Op::ImportProgress {};
     assert!(!velmora_bridge::unit_router::writes(
         CallKind::Worker,
-        &read
+        &import_progress
     ));
 }
 
