@@ -76,6 +76,8 @@ struct Store {
     saves: Rc<Cell<u32>>,
     /// The storage is down: nothing is saved.
     down: Rc<Cell<bool>>,
+    /// The next save gives another gate event a turn.
+    pause: Rc<Cell<bool>>,
 }
 
 impl GateStore for Store {
@@ -85,6 +87,9 @@ impl GateStore for Store {
     async fn save(&self, record: &GateRecord) -> Result<()> {
         if self.down.get() {
             return Err(BridgeError::Invalid("the storage is down"));
+        }
+        if self.pause.replace(false) {
+            Aside(false).await;
         }
         self.saves.set(self.saves.get() + 1);
         *self.record.borrow_mut() = Some(record.clone());
@@ -621,6 +626,97 @@ impl GateTransport for Wire {
         let reply = gate.handle(None, request, self.0.now()).await;
         self.0.deliver(&gate).await;
         Ok(on_the_wire(&reply?))
+    }
+}
+
+#[tokio::test]
+async fn a_slot_freed_while_joining_is_found_by_an_immediate_wake() {
+    enum Event {
+        Quiet,
+        Release,
+        Close,
+        Expire,
+    }
+    for event in [Event::Quiet, Event::Release, Event::Close, Event::Expire] {
+        let w = World::new();
+        let a = provider("a", 2);
+        let pooled = |id| {
+            let mut p = provider(id, 2);
+            p.pool = Some("shared".into());
+            p.pool_max_conns = Some(2);
+            p
+        };
+        let (b, c) = (pooled("b"), pooled("c"));
+        let holder_a = w.pushing("hold-a", core::slice::from_ref(&a));
+        let holder_c = w.pushing("hold-c", core::slice::from_ref(&c));
+        let slot_a = take(&holder_a, &w, &a, JOB, "hold-a").await.unwrap();
+        let age_a = 10_000;
+        w.pass(age_a);
+        take(&holder_c, &w, &c, JOB, "hold-c").await.unwrap();
+
+        let wire = Wire(w.clone(), "joining".into());
+        let mut opening = Box::pin(wire.open(GateRequest {
+            id: 1,
+            gate: w.name.clone(),
+            ops: vec![GateOp::Wait {
+                wants: vec![
+                    GateWant {
+                        provider: GateProvider::from(&a),
+                        peers: vec![],
+                    },
+                    GateWant {
+                        provider: GateProvider::from(&b),
+                        peers: vec![GateProvider::from(&c)],
+                    },
+                ],
+                holder: "joining".into(),
+                ms: JOB_MS,
+            }],
+        }));
+        // The first try on A has already missed when B's ownership save
+        // yields. C holds the shared pool's only job slot, so B misses too.
+        w.store.pause.set(true);
+        let mut cx = core::task::Context::from_waker(futures_util::task::noop_waker_ref());
+        assert!(opening.as_mut().poll(&mut cx).is_pending());
+        assert!(!w.store.pause.get());
+        match event {
+            Event::Quiet => {}
+            Event::Release => holder_a.release_permit(&slot_a).await.unwrap(),
+            Event::Close => w.end("hold-a").await,
+            Event::Expire => {
+                w.pass(JOB_MS - age_a + 1);
+                assert_eq!(w.held("a").await, 0);
+            }
+        }
+        let (session, reply) = opening.await.unwrap();
+        assert!(
+            reply.waiting,
+            "the joining session gets no pushed grant: {reply:?}"
+        );
+        assert_eq!(reply.answers, [GateAnswer::Acquired(None)]);
+        if matches!(event, Event::Quiet) {
+            assert_eq!(reply.wake, Some(JOB_MS - age_a + 1));
+        } else {
+            assert_eq!(reply.wake, Some(0));
+            let reply = session
+                .call(GateRequest {
+                    id: 1,
+                    gate: w.name.clone(),
+                    ops: vec![],
+                })
+                .await
+                .unwrap();
+            assert!(!reply.waiting);
+            assert!(
+                matches!(reply.answers.as_slice(), [GateAnswer::Acquired(Some(slot))] if slot.provider == "a")
+            );
+            assert_eq!(w.held("a").await, 1);
+            assert_eq!(w.held("b").await, 0);
+            assert_eq!(w.held("c").await, 1);
+            session.close();
+            assert_eq!(w.held("a").await, 0);
+            assert_eq!(w.held("c").await, 1);
+        }
     }
 }
 

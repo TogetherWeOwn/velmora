@@ -441,11 +441,11 @@ pub struct GateReply {
     /// with its slot follows under the id of the request that asked.
     #[serde(default)]
     pub waiting: bool,
-    /// With `waiting`: in how many milliseconds a slot can next run out
-    /// with no word to the gate (a holder that stopped renewing, the
-    /// wait after a restart). The caller asks again then, with a
-    /// request of no questions; a gate that has left memory wakes for
-    /// nothing else.
+    /// With `waiting`: when to ask again with no questions, in milliseconds.
+    /// Zero means ask immediately once the session is attached. Otherwise
+    /// this is when a slot can next run out with no word to the gate (a
+    /// holder stopped renewing, or the wait after a restart). A gate that
+    /// has left memory wakes for nothing else.
     #[serde(default)]
     pub wake: Option<i64>,
 }
@@ -912,6 +912,8 @@ pub trait GateStore {
 struct Inner {
     name: Option<String>,
     core: Core,
+    /// Changes whenever a release, session close, or expiry frees a slot.
+    freed: u64,
     /// The record as it should be stored.
     record: GateRecord,
     /// The record as the last finished save left it.
@@ -1071,6 +1073,7 @@ impl<S: Sql, D: GateStore> Gate<S, D> {
             *inner = Some(Inner {
                 name: None,
                 core: Core::restored(now, sessions),
+                freed: 0,
                 saved,
                 record,
                 seize_tried: BTreeMap::new(),
@@ -1092,7 +1095,7 @@ impl<S: Sql, D: GateStore> Gate<S, D> {
     /// after every request on the session, before its reply leaves.
     pub fn session(&self, id: u64, now: UnixMs) -> SessionState {
         let held = match self.started() {
-            true => self.with(|i| i.core.of_session(id, now.0)),
+            true => self.with(|i| i.of_session(id, now.0)),
             false => Vec::new(),
         };
         let wait = match self.started() {
@@ -1114,7 +1117,7 @@ impl<S: Sql, D: GateStore> Gate<S, D> {
     pub fn close(&self, id: u64) {
         if self.started() {
             self.with(|i| {
-                i.core.close(id);
+                i.freeing(|core| core.close(id));
                 i.pushes.retain(|(session, _)| *session != id);
             });
         }
@@ -1176,7 +1179,7 @@ impl<S: Sql, D: GateStore> Gate<S, D> {
                         let reply = GateReply {
                             id: waiter.id,
                             answers: vec![GateAnswer::Acquired(permit)],
-                            load: i.core.load(now),
+                            load: i.freeing(|core| core.load(now)),
                             unowned,
                             failed: false,
                             waiting: false,
@@ -1185,7 +1188,7 @@ impl<S: Sql, D: GateStore> Gate<S, D> {
                         i.pushes.push((session, reply));
                     }
                     // Its session ended while the slot was taken.
-                    (false, Some(permit)) => i.core.release(&permit, session),
+                    (false, Some(permit)) => i.release(&permit, session),
                     (false, None) => {}
                 });
                 break;
@@ -1382,7 +1385,8 @@ impl<S: Sql, D: GateStore> Gate<S, D> {
         // Nothing free: nothing is promised, and the horizon stays. A
         // class that only ever asked has no slot to wait out after a
         // deploy.
-        let free = self.with(|i| i.core.free(p, peers, background, holder, now, warm));
+        let free =
+            self.with(|i| i.freeing(|core| core.free(p, peers, background, holder, now, warm)));
         if free.is_none() {
             return Ok(Ok(None));
         }
@@ -1402,9 +1406,12 @@ impl<S: Sql, D: GateStore> Gate<S, D> {
             if horizon < now.0 + ttl_ms(background) {
                 return Ok(None);
             }
+            let before = i.core.held.len();
             let taken = i
                 .core
                 .acquire(p, peers, background, (holder, session), now, warm);
+            // Compare as if the new slot had already been held before pruning.
+            i.note_freed(before + usize::from(taken.is_some()));
             let Some(permit) = taken else {
                 return Ok(None);
             };
@@ -1413,11 +1420,11 @@ impl<S: Sql, D: GateStore> Gate<S, D> {
             let state = SessionState {
                 id: session,
                 seen: now.0,
-                held: i.core.of_session(session, now.0),
+                held: i.of_session(session, now.0),
                 wait: None,
             };
             if !state.fits() {
-                i.core.release(&permit, session);
+                i.release(&permit, session);
                 return Ok(None);
             }
             Ok(Some(permit))
@@ -1447,7 +1454,7 @@ impl<S: Sql, D: GateStore> Gate<S, D> {
                         };
                         horizon >= now.0 + ttl_ms(background)
                     });
-                    covered && i.core.renew(p, session, now)
+                    covered && i.freeing(|core| core.renew(p, session, now))
                 })
                 .collect()
         }))
@@ -1484,8 +1491,9 @@ impl<S: Sql, D: GateStore> Gate<S, D> {
         // be, and from here on nothing is owned, so nothing is handed
         // out until the rows have been seized again.
         let idle = self.with(|i| {
-            let idle =
-                i.record.mode == GateMode::Retired && i.core.live(now) == 0 && warm == Warm::Done;
+            let idle = i.record.mode == GateMode::Retired
+                && i.freeing(|core| core.live(now)) == 0
+                && warm == Warm::Done;
             if idle {
                 i.record.seized.clear();
             }
@@ -1535,11 +1543,12 @@ impl<S: Sql, D: GateStore> Gate<S, D> {
         self.serve(now).await;
         let (mut taken, mut unowned) = (Vec::new(), false);
         let asked = (session, request.id, request.ops.as_slice());
+        let freed = self.with(|i| i.freed);
         let answers = self.answer(asked, now, &mut taken, &mut unowned).await;
         if let (Err(_), Some(session)) = (&answers, session) {
             // The caller learns of none of them, nor that it waits.
             self.with(|i| {
-                taken.iter().for_each(|p| i.core.release(p, session));
+                taken.iter().for_each(|p| i.release(p, session));
                 if i.core.waiter(session).is_some_and(|w| w.id == request.id) {
                     i.core.unlist(session);
                 }
@@ -1561,18 +1570,24 @@ impl<S: Sql, D: GateStore> Gate<S, D> {
         if let Some(reply) = served {
             return Ok(reply);
         }
-        let waiting =
-            session.is_some_and(|session| self.with(|i| i.core.waiter(session).is_some()));
+        let (waiting, load, freed_while_answering) = self.with(|i| {
+            let waiting = session.is_some_and(|session| i.core.waiter(session).is_some());
+            let load = i.freeing(|core| core.load(now));
+            (waiting, load, i.freed != freed)
+        });
         Ok(GateReply {
             id: request.id,
             answers,
-            load: self.with(|i| i.core.load(now)),
+            load,
             unowned,
             failed: false,
             waiting,
-            wake: match waiting {
-                true => self.wake(now),
-                false => None,
+            wake: match (waiting, freed_while_answering) {
+                // A slot may have come free before this session joined
+                // the line. Serve on its next request, once attached.
+                (true, true) => Some(0),
+                (true, false) => self.wake(now),
+                (false, _) => None,
             },
         })
     }
@@ -1614,7 +1629,7 @@ impl<S: Sql, D: GateStore> Gate<S, D> {
                 }),
                 GateOp::Release { permits } => {
                     if let Some(session) = session {
-                        self.with(|i| permits.iter().for_each(|p| i.core.release(p, session)));
+                        self.with(|i| permits.iter().for_each(|p| i.release(p, session)));
                         // Before a later question of this request can
                         // take what it gave back.
                         self.serve(now).await;
@@ -1657,7 +1672,7 @@ impl<S: Sql, D: GateStore> Gate<S, D> {
                         let state = SessionState {
                             id: session,
                             seen: now.0,
-                            held: i.core.of_session(session, now.0),
+                            held: i.of_session(session, now.0),
                             wait: i.core.waiter(session).cloned(),
                         };
                         if !state.fits() {
@@ -1666,7 +1681,7 @@ impl<S: Sql, D: GateStore> Gate<S, D> {
                     });
                     GateAnswer::Acquired(permit)
                 }
-                GateOp::Load => GateAnswer::Load(self.with(|i| i.core.load(now))),
+                GateOp::Load => GateAnswer::Load(self.with(|i| i.freeing(|core| core.load(now)))),
                 GateOp::Activate { providers } => {
                     GateAnswer::Activated(self.activate(providers, now).await?)
                 }
@@ -1686,6 +1701,28 @@ impl<S: Sql, D: GateStore> Gate<S, D> {
 struct Unowned;
 
 impl Inner {
+    /// Runs a core operation that can remove held slots but takes none.
+    fn freeing<R>(&mut self, f: impl FnOnce(&mut Core) -> R) -> R {
+        let before = self.core.held.len();
+        let out = f(&mut self.core);
+        self.note_freed(before);
+        out
+    }
+
+    fn note_freed(&mut self, before: usize) {
+        if self.core.held.len() < before {
+            self.freed = self.freed.wrapping_add(1);
+        }
+    }
+
+    fn of_session(&mut self, session: u64, now: i64) -> Vec<Held> {
+        self.freeing(|core| core.of_session(session, now))
+    }
+
+    fn release(&mut self, permit: &GatePermit, session: u64) {
+        self.freeing(|core| core.release(permit, session));
+    }
+
     /// Every slot row of this part of `p` is the gate's.
     fn owned(&self, p: &GateProvider) -> bool {
         self.record
@@ -2620,6 +2657,7 @@ impl<T: GateTransport> GateClient<T> {
             };
             reply = match reply.wake {
                 None => session.pushed(id).await?,
+                Some(0) => session.call(again).await?,
                 Some(ms) => {
                     let nap = sleep(u32::try_from(ms).unwrap_or(u32::MAX));
                     match select(Box::pin(session.pushed(id)), nap).await {
