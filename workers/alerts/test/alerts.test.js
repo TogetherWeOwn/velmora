@@ -4,7 +4,7 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
 import { FakeD1, FakeBucket, FakeEmail } from "./d1.js";
-import { evaluate, DEFAULTS } from "../src/checks.js";
+import { evaluate, figures, setting, DEFAULTS } from "../src/checks.js";
 import { SQL, newestExport, readSnapshot } from "../src/catalog.js";
 import * as store from "../src/store.js";
 import worker, { tick, ingest, digest } from "../src/index.js";
@@ -109,10 +109,101 @@ test("catalogue readings are SELECTs only, and read the oldest due rows", async 
   assert.equal(s.releaseHead, null);
   assert.equal(s.deadRows, 1);
   assert.deepEqual(s.providers, [{ id: "p1", coolingUntil: T0 + HOUR, reason: "login" }]);
+  assert.ok(e.CATALOG.log.includes(SQL.scrub));
   for (const sql of e.CATALOG.log) assert.match(sql, /^SELECT /, "catalogue is never written");
   // The head reading rides the outbox_due index.
   const plan = e.CATALOG.db.prepare(`EXPLAIN QUERY PLAN ${SQL.head}`).all("post", T0);
   assert.match(plan.map((r) => r.detail).join(" "), /USING (COVERING )?INDEX outbox_due/);
+});
+
+test("a fresh scrub state raises no scrub condition", async () => {
+  const e = env();
+  const r = await tick(e, T0);
+  assert.deepEqual(r.conditions, []);
+  assert.deepEqual(r.snap.scrub, {
+    runs: 0, checked: 0, unrecoverable: 0, stalled: 0,
+    lastRunAt: null, lastUnrecoverableAt: null, lastIncidentAt: null, incident: [],
+  });
+  assert.ok(figures(r.snap).includes("scrub: runs 0, checked 0, unrecoverable 0, stalled 0, breaker on: none, last run: never"));
+});
+
+test("scrub unrecoverable alerts at once within its window", async () => {
+  const e = env();
+  e.CATALOG.db.prepare("UPDATE scrub_state SET unrecoverable = 2, last_unrecoverable_at = ? WHERE id = 1")
+    .run(T0 - 6 * HOUR);
+  const s = await readSnapshot(e, T0);
+  const [c] = evaluate(s, e);
+  assert.equal(c.key, "scrub-unrecoverable");
+  assert.equal(c.forMs, 0);
+  assert.match(c.detail, /6\.0 h ago.*2 finding/);
+  assert.match(c.detail, /clears when no re-check has found an unrecoverable extent for 6\.0 h/);
+  assert.ok(c.detail.includes("Check the digest's unrecoverable total and run SELECT id FROM extents WHERE scrub_result = 'unrecoverable'"));
+  assert.deepEqual(evaluate({ ...s, now: T0 + 1 }, e), []);
+  assert.deepEqual(evaluate(s, { SCRUB_UNRECOVERABLE_WINDOW_SECS: "3600" }), []);
+});
+
+test("scrub unrecoverable uses a one-hour floor even with a zero window", async () => {
+  const e = env({ SCRUB_UNRECOVERABLE_WINDOW_SECS: "0" });
+  e.CATALOG.db.prepare("UPDATE scrub_state SET last_unrecoverable_at = ? WHERE id = 1").run(T0 - 30 * MIN);
+  const s = await readSnapshot(e, T0);
+  assert.deepEqual(evaluate(s, e).map((c) => c.key), ["scrub-unrecoverable"]);
+  assert.deepEqual(evaluate({ ...s, now: T0 + 30 * MIN + 1 }, e), []);
+});
+
+test("scrub breaker alerts with the affected backbones", async () => {
+  const e = env();
+  const update = e.CATALOG.db.prepare("UPDATE scrub_state SET last_incident = ?, last_incident_at = ? WHERE id = 1");
+  update.run('["highwinds"]', T0 - HOUR);
+  const [c] = evaluate(await readSnapshot(e, T0), e);
+  assert.equal(c.key, "scrub-incident");
+  assert.equal(c.forMs, 0);
+  assert.match(c.detail, /highwinds/);
+  assert.ok(c.detail.includes(`Repairs there are held to one a run (last trip ${new Date(T0 - HOUR).toISOString()}).`));
+  update.run('["highwinds"]', null);
+  const [unknown] = evaluate(await readSnapshot(e, T0), e);
+  assert.match(unknown.detail, /\(last trip unknown\)/);
+  for (const raw of [null, "[]", "not json", "{}", '["highwinds", 3]']) {
+    update.run(raw, T0 - HOUR);
+    assert.deepEqual(evaluate(await readSnapshot(e, T0), e), [], String(raw));
+  }
+});
+
+test("scrub stopped is opt-in and needs an old or missing run", async () => {
+  const e = env();
+  const update = e.CATALOG.db.prepare("UPDATE scrub_state SET last_run_at = ? WHERE id = 1");
+  update.run(T0 - 2 * HOUR);
+  assert.deepEqual(evaluate(await readSnapshot(e, T0), e), []);
+  e.SCRUB_STALE_SECS = "3600";
+  for (const [lastRunAt, detail] of [[T0 - 2 * HOUR, /2\.0 h ago/], [null, /never ran/]]) {
+    update.run(lastRunAt);
+    const [c] = evaluate(await readSnapshot(e, T0), e);
+    assert.equal(c.key, "scrub-stopped");
+    assert.equal(c.forMs, 0);
+    assert.match(c.detail, detail);
+    assert.match(c.detail, /threshold 1\.0 h/);
+  }
+  update.run(T0 - HOUR);
+  assert.deepEqual(evaluate(await readSnapshot(e, T0), e), []);
+  assert.deepEqual(evaluate(await readSnapshot(e, T0 + 1), e).map((c) => c.key), ["scrub-stopped"]);
+});
+
+test("scrub stopped detects the missing table or row when enabled", async () => {
+  for (const sql of ["DROP TABLE scrub_state", "DELETE FROM scrub_state"]) {
+    const e = env();
+    e.CATALOG.db.exec(sql);
+    const r = await tick(e, T0);
+    assert.deepEqual(r.conditions, []);
+    assert.deepEqual(r.snap.errors, []);
+    assert.equal(r.snap.scrub, null);
+    assert.equal(r.snap.scrubMissing, true);
+    assert.ok(figures(r.snap).includes("scrub: not deployed (no scrub_state)"));
+    e.SCRUB_STALE_SECS = "3600";
+    const enabled = await tick(e, T0 + 5 * MIN);
+    assert.deepEqual(enabled.conditions, ["scrub-stopped"]);
+    assert.ok(e.ALERT_EMAIL.sent[0].text.includes("The catalogue has no scrub_state table or no row in it (migration 0023 not applied, or its row removed) while SCRUB_STALE_SECS is set."));
+  }
+  const e = env({ CATALOG: undefined, SCRUB_STALE_SECS: "3600" });
+  assert.deepEqual((await tick(e, T0)).conditions, []);
 });
 
 test("a failed reading is named, the others still count", async () => {
@@ -212,6 +303,130 @@ test("event alerts expire after two hours without a report, never before their e
 });
 
 // ---- index.js ----
+
+test("tick: the first stalled scrub reading is quiet and a rise stays active for six hours", async () => {
+  const e = env();
+  e.CATALOG.db.exec("UPDATE scrub_state SET stalled = 2 WHERE id = 1");
+  const first = await tick(e, T0);
+  assert.deepEqual(first.conditions, []);
+  assert.equal(first.sent, 0);
+  assert.deepEqual(await store.getMeta(e.STATE, "scrub_stalled"), { seen: 2, roseAt: null });
+  e.CATALOG.db.exec("UPDATE scrub_state SET stalled = 5 WHERE id = 1");
+  const next = await tick(e, T0 + 5 * MIN);
+  assert.deepEqual(next.conditions, ["scrub-stalled"]);
+  assert.equal(next.sent, 1);
+  assert.equal(e.ALERT_EMAIL.sent[0].subject, "[velmora] Scrub repair stalled");
+  assert.ok(e.ALERT_EMAIL.sent[0].text.includes(
+    "A scrub repair was still pinned in R2 at its bound when the scrub last looked (the stalled total rose 0 min ago; 5 in all; a total of findings, not of current pins). " +
+    "The scrub-stalled line in the S3 Worker log names the extent and says whether the safety copy is intact, written again or missing; " +
+    "its outbox row says why (normally in stage verify; dead once its attempts ran out). " +
+    "This alert clears 6.0 h after the last rise.",
+  ));
+  assert.deepEqual(await store.getMeta(e.STATE, "scrub_stalled"), { seen: 5, roseAt: T0 + 5 * MIN });
+  const same = await tick(e, T0 + 10 * MIN);
+  assert.deepEqual(same.conditions, ["scrub-stalled"]);
+  assert.equal(e.ALERT_EMAIL.sent.length, 1);
+  const row = e.STATE.prepare("SELECT active FROM alerts WHERE key = 'scrub-stalled'");
+  assert.equal((await row.first()).active, 1);
+  const end = T0 + 5 * MIN + 6 * HOUR;
+  assert.deepEqual((await tick(e, end)).conditions, ["scrub-stalled"]);
+  assert.deepEqual((await tick(e, end + 1)).conditions, []);
+  assert.equal((await row.first()).active, 0);
+});
+
+test("tick: a lower stalled scrub total lowers seen and allows a later rise to alert", async () => {
+  const e = env();
+  e.CATALOG.db.exec("UPDATE scrub_state SET stalled = 5 WHERE id = 1");
+  await tick(e, T0);
+  e.CATALOG.db.exec("UPDATE scrub_state SET stalled = 2 WHERE id = 1");
+  const lower = await tick(e, T0 + 5 * MIN);
+  assert.deepEqual(lower.conditions, []);
+  assert.equal(lower.sent, 0);
+  assert.deepEqual(await store.getMeta(e.STATE, "scrub_stalled"), { seen: 2, roseAt: null });
+  e.CATALOG.db.exec("UPDATE scrub_state SET stalled = 3 WHERE id = 1");
+  const rise = await tick(e, T0 + 10 * MIN);
+  assert.deepEqual(rise.conditions, ["scrub-stalled"]);
+  assert.equal(rise.sent, 1);
+  assert.deepEqual(await store.getMeta(e.STATE, "scrub_stalled"), { seen: 3, roseAt: T0 + 10 * MIN });
+  e.CATALOG.db.exec("UPDATE scrub_state SET stalled = 2 WHERE id = 1");
+  assert.equal((await tick(e, T0 + 15 * MIN)).sent, 0);
+  assert.deepEqual(await store.getMeta(e.STATE, "scrub_stalled"), { seen: 2, roseAt: T0 + 10 * MIN });
+});
+
+test("tick: a failed scrub-stalled email is retried on the next tick", async () => {
+  const e = env();
+  await tick(e, T0);
+  e.CATALOG.db.exec("UPDATE scrub_state SET stalled = 1 WHERE id = 1");
+  e.ALERT_EMAIL.fail = "E_RECIPIENT_NOT_ALLOWED";
+  const failed = await tick(e, T0 + 5 * MIN);
+  assert.deepEqual(failed.conditions, ["scrub-stalled"]);
+  assert.equal(failed.sendFailures, 1);
+  assert.equal(e.ALERT_EMAIL.sent.length, 0);
+  assert.deepEqual(await store.getMeta(e.STATE, "scrub_stalled"), { seen: 1, roseAt: T0 + 5 * MIN });
+  e.ALERT_EMAIL.fail = null;
+  const retried = await tick(e, T0 + 10 * MIN);
+  assert.deepEqual(retried.conditions, ["scrub-stalled"]);
+  assert.equal(retried.sent, 1);
+  assert.deepEqual(await store.getMeta(e.STATE, "scrub_stalled"), { seen: 1, roseAt: T0 + 5 * MIN });
+});
+
+test("tick: hourly scrub stalls keep one active run and back off emails", async () => {
+  const e = env();
+  await tick(e, T0 - 5 * MIN);
+  const update = e.CATALOG.db.prepare("UPDATE scrub_state SET stalled = ? WHERE id = 1");
+  const sentAt = [];
+  for (let hour = 0; hour < 12; hour++) {
+    update.run(hour + 1);
+    const now = T0 + hour * HOUR;
+    const rise = await tick(e, now);
+    assert.deepEqual(rise.conditions, ["scrub-stalled"]);
+    if (rise.sent) sentAt.push(hour);
+    assert.deepEqual(await store.getMeta(e.STATE, "scrub_stalled"), { seen: hour + 1, roseAt: now });
+    assert.deepEqual((await tick(e, now + 5 * MIN)).conditions, ["scrub-stalled"]);
+  }
+  assert.deepEqual(sentAt, [0, 1, 3, 7]);
+  assert.equal(e.ALERT_EMAIL.sent.length, 4);
+});
+
+test("tick: a zero stalled window is floored at one hour", async () => {
+  const e = env({ SCRUB_STALLED_WINDOW_SECS: "0" });
+  await tick(e, T0 - 5 * MIN);
+  e.CATALOG.db.exec("UPDATE scrub_state SET stalled = 1 WHERE id = 1");
+  assert.equal((await tick(e, T0)).sent, 1);
+  assert.deepEqual((await tick(e, T0 + HOUR)).conditions, ["scrub-stalled"]);
+  assert.deepEqual((await tick(e, T0 + HOUR + 1)).conditions, []);
+});
+
+test("tick: a failed scrub reading keeps scrub keys and the last stalled total", async () => {
+  const e = env({ SCRUB_STALE_SECS: "3600" });
+  e.CATALOG.db.prepare("UPDATE scrub_state SET stalled = 2, last_unrecoverable_at = ?, last_incident = ? WHERE id = 1")
+    .run(T0, '["highwinds"]');
+  await tick(e, T0);
+  e.CATALOG.db.exec("UPDATE scrub_state SET stalled = 3 WHERE id = 1");
+  const active = await tick(e, T0 + 5 * MIN);
+  assert.deepEqual(active.conditions, ["scrub-unrecoverable", "scrub-incident", "scrub-stalled", "scrub-stopped"]);
+  e.CATALOG.db.exec("ALTER TABLE scrub_state RENAME COLUMN stalled TO old_stalled");
+  const r = await tick(e, T0 + 10 * MIN);
+  assert.deepEqual(r.conditions, ["check-error"]);
+  assert.equal(r.snap.errors.length, 1);
+  assert.match(r.snap.errors[0], /^scrub state: no such column: stalled/);
+  assert.equal(r.snap.scrubMissing, false);
+  assert.ok(figures(r.snap).includes("scrub: could not read"));
+  assert.deepEqual(await store.getMeta(e.STATE, "scrub_stalled"), { seen: 3, roseAt: T0 + 5 * MIN });
+  for (const key of active.conditions) {
+    const row = await e.STATE.prepare("SELECT active FROM alerts WHERE key = ?1").bind(key).first();
+    assert.equal(row.active, 1, key);
+  }
+});
+
+test("tick: a missing scrub table leaves the stalled metadata unchanged", async () => {
+  const e = env();
+  await store.setMeta(e.STATE, "scrub_stalled", { seen: 3, roseAt: T0 });
+  e.CATALOG.db.exec("DROP TABLE scrub_state");
+  const result = await tick(e, T0 + 5 * MIN);
+  assert.equal(result.snap.scrubMissing, true);
+  assert.deepEqual(await store.getMeta(e.STATE, "scrub_stalled"), { seen: 3, roseAt: T0 });
+});
 
 test("tick: a stalled post head emails once after 30 + 30 min, then clears", async () => {
   const e = env();
@@ -561,4 +776,34 @@ test("a report's email states the one-hour wait", async () => {
   const a = { source: "ci", key: "deploy-failed", title: "t" };
   for (let h = 0; h < 3; h++) await ingest(req(a), e, T0 + h * HOUR);
   assert.match(e.ALERT_EMAIL.sent[2].text, new RegExp(`not before ${new Date(T0 + 3 * HOUR).toISOString().replace(".000Z", "Z")}`));
+});
+
+test("a negative setting falls back to the default, or to the floor when one is given", () => {
+  assert.equal(setting({ POST_STALL_SECS: "-5" }, "POST_STALL_SECS"), DEFAULTS.POST_STALL_SECS);
+  assert.equal(setting({ POST_STALL_SECS: "0" }, "POST_STALL_SECS"), 0);
+  assert.equal(setting({ SCRUB_STALLED_WINDOW_SECS: "-5" }, "SCRUB_STALLED_WINDOW_SECS", 3600), 3600);
+  assert.equal(setting({ SCRUB_STALLED_WINDOW_SECS: "7200" }, "SCRUB_STALLED_WINDOW_SECS", 3600), 7200);
+});
+
+test("tick: a stall after the last one's window is a new alert, not a late reminder", async () => {
+  const e = env({ SCRUB_STALLED_WINDOW_SECS: "3600" });
+  const set = (n) => e.CATALOG.db.prepare("UPDATE scrub_state SET stalled = ? WHERE id = 1").run(n);
+  set(0);
+  await tick(e, T0);
+  set(1);
+  for (let t = 5; t <= 65; t += 5) await tick(e, T0 + t * MIN);
+  const before = e.ALERT_EMAIL.sent.length;
+  assert.ok(before >= 1);
+  // The next rise lands on the first tick past the window. As a new run
+  // it is emailed once the hour between emails allows, inside its own
+  // window; as a reminder of the old run its backoff would let the
+  // window end first.
+  set(2);
+  let held = false;
+  for (let t = 66; t <= 126; t += 5) {
+    const r = await tick(e, T0 + t * MIN);
+    held ||= r.conditions.includes("scrub-stalled");
+  }
+  assert.ok(held);
+  assert.equal(e.ALERT_EMAIL.sent.length, before + 1, "the new stall is emailed");
 });

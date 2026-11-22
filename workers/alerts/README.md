@@ -6,7 +6,7 @@ and changing it never redeploys the S3 Worker.
 
 ## What it watches
 
-Every 5 minutes it takes a few index-only readings of the S3 Worker's
+Every 5 minutes it takes a few readings along indexes in the S3 Worker's
 catalogue. Each statement reads at most 20 rows (measured), and nothing is
 ever written there. Each condition below emails when it holds:
 
@@ -19,7 +19,20 @@ ever written there. Each condition below emails when it holds:
 | `outbox-dead` | outbox rows are in stage `dead` | at once |
 | `provider-cooldown:<id>` | a provider is cooling (skipped) | 15 min |
 | `catalog-export-stale` | the newest export manifest in the export bucket is over 26 h old (listed hourly) | at once |
+| `scrub-unrecoverable` | the scrub found an extent with no intact copy within `SCRUB_UNRECOVERABLE_WINDOW_SECS` (6 h, minimum 1 h) | at once |
+| `scrub-incident` | the scrub breaker is holding repairs back on one or more backbones | at once |
+| `scrub-stalled` | the total of repairs still pinned at their bound rose within `SCRUB_STALLED_WINDOW_SECS` (6 h, minimum 1 h) | at once |
+| `scrub-stopped` | `SCRUB_STALE_SECS` is enabled and the scrub state is missing, the scrub never ran, or its last run is older than the threshold | at once |
 | `check-error` | a reading failed (its check did not run) | 15 min |
+
+The unrecoverable alert clears when no re-check has found an unrecoverable
+extent for the configured window. The extent may still be unrecoverable.
+Check the digest's unrecoverable total and run
+`SELECT id FROM extents WHERE scrub_result = 'unrecoverable'`. Keep
+`SCRUB_UNRECOVERABLE_WINDOW_SECS` at least 3 × the scrub's
+`SCRUB_CONFIRM_SECS` (1 h by default) plus margin for delayed re-checks.
+Set `SCRUB_STALE_SECS` to 3600, for example, once `SCRUB=on`. The
+scrub runs every 5 minutes.
 
 It also takes reports on `POST /v1/alert` (bearer `INGEST_TOKEN`) from:
 
@@ -67,7 +80,8 @@ destination address. That is free on every plan, and needs no sending
 domain. The rest:
 
 - 8,640 cron runs a month;
-- under 100,000 catalogue rows read a month;
+- under 100,000 catalogue rows read a month for the other checks, plus
+  one scrub row per tick (8,640 a month) and one per daily digest;
 - a few thousand writes to the Worker's own D1;
 - about 720 R2 list calls a month.
 
@@ -100,7 +114,10 @@ All of it is well inside the included usage.
    `ALERTS_INGEST_URL` (this Worker's URL) and the secret
    `ALERTS_INGEST_TOKEN` (the same token).
 
-The thresholds are vars; their defaults are in `src/checks.js`.
+Set thresholds as Worker vars. `SCRUB_UNRECOVERABLE_WINDOW_SECS` and
+`SCRUB_STALLED_WINDOW_SECS` default to 21600 with a floor of 3600.
+`SCRUB_STALE_SECS` defaults to 0 (off).
+See `wrangler.toml` for the optional vars and their defaults.
 
 ## Tests
 
