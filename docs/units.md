@@ -133,8 +133,9 @@ jobs through `TenantCatalog`. Rules 9 and 10 (jobs that name their tenant,
 the unit's outbox to the directory) are not built yet.
 
 **What makes the alarm's raise due** (ADR §8.5, AM-48). Every committed S3
-or job call that changed a row, and every reservation call, makes the raise
-due. These do not: the stamp's own calls (`stamp`, `stamp_advance`,
+or job call that changed a row, and every reservation call that changed one
+(a reservation, its drop, a release, a binding, a grant's fence), makes the
+raise due: a call that wrote nothing leaves nothing for a rollback to lose. These do not: the stamp's own calls (`stamp`, `stamp_advance`,
 `stamp_rolled_back`), the dispatcher's run time (`record_dispatch`) and the
 scan cursors (`set_cursor`). Nor do the Worker's own calls: `renew`, `sync`,
 the key-chain apply, `import`, `ImportSeal`, `Recount`, `Export`, the gate
