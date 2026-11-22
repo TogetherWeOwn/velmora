@@ -3,9 +3,9 @@
 //! against fakes before the unit and the directory exist (tenant
 //! side) exist.
 
-use super::record::{Entry, KeyOp, Subject};
+use super::record::{Entry, KeyOp, Rid, Subject};
 use crate::crypto::scheme2::TenantId;
-use crate::types::{BucketId, Result};
+use crate::types::{BridgeError, BucketId, Result};
 
 /// The most entries one apply carries (AM-12; an estimate, a page of
 /// the chain).
@@ -41,6 +41,29 @@ impl ApplyEntry {
         }
     }
 }
+
+/// The answer a reservation keeps (AM-38): the Worker's first answer to a
+/// reserved call, cleaned of every secret, which a retry under the same
+/// reservation gets again. Only the root unit keeps one, and only from its
+/// full apply ([`KeyTarget::apply_kept`]). `Debug` shows no body.
+#[derive(Clone, PartialEq, Eq)]
+pub struct KeptAnswer {
+    pub rid: Rid,
+    pub status: u16,
+    pub body: String,
+}
+
+impl std::fmt::Debug for KeptAnswer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KeptAnswer")
+            .field("rid", &self.rid)
+            .field("status", &self.status)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The answer of a store that keeps no answers to a call that has some.
+pub const ERR_NO_KEPT: BridgeError = BridgeError::Invalid("this key store keeps no answers");
 
 /// What a store answered an apply.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -84,6 +107,24 @@ pub trait KeyTarget {
     ///
     /// The directory follows the same rule for what it holds of a key.
     async fn apply(&self, from_seq: u64, entries: &[ApplyEntry]) -> Result<Applied>;
+    /// [`KeyTarget::apply`] that also keeps `answers` (AM-38), in the same
+    /// transaction: each for the reservation of its `rid` once that is
+    /// `applied` (an entry of this call or an earlier one carried the
+    /// `rid`) and has no answer yet. The root unit implements it; the
+    /// writer calls it only once the directory acknowledged the record and
+    /// every unit holds it in full. The default refuses any answer
+    /// ([`ERR_NO_KEPT`]) and applies nothing then.
+    async fn apply_kept(
+        &self,
+        from_seq: u64,
+        entries: &[ApplyEntry],
+        answers: &[KeptAnswer],
+    ) -> Result<Applied> {
+        if !answers.is_empty() {
+            return Err(ERR_NO_KEPT);
+        }
+        self.apply(from_seq, entries).await
+    }
 }
 
 /// Why an opening change was refused before any record.

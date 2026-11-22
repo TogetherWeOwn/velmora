@@ -438,6 +438,7 @@ fn private_unchanged_requires_a_prior_entry() {
         closes: false,
         private_unchanged: true,
         frozen_at: None,
+        rid: None,
     };
     let mut table = KeyTable::empty(w.tenant.clone());
     assert!(table.apply(&record).is_err());
