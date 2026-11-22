@@ -227,6 +227,7 @@ fn ops() -> Vec<UnitOp> {
         },
         UnitOp::Sync {
             head: SyncHead {
+                from_seq: seqs().state_seq - 1,
                 seqs: seqs(),
                 tenant_state: TenantState::Suspended,
                 tenant_mode: Some(HoldMode::ReadOnly),
@@ -242,6 +243,8 @@ fn ops() -> Vec<UnitOp> {
                     )]
                     .into(),
                 }),
+                buckets: vec![],
+                placed: vec![bucket_id().to_string()],
             },
         },
         UnitOp::Renew {
@@ -679,6 +682,10 @@ fn nested() -> Value {
             BucketChange::Unplaced {
                 seq: 10,
                 buckets: vec!["b_00000000000000f2".into()],
+            },
+            BucketChange::Removed {
+                seq: 11,
+                buckets: vec!["b_00000000000000f3".into(), "b_00000000000000f4".into()],
             },
         ])
         .unwrap(),
@@ -1155,7 +1162,10 @@ fn answers() -> Vec<UnitAnswer> {
     let mut out = vec![
         UnitAnswer::Ok {
             seqs: seqs(),
-            body: json!({ "synced": 7 }),
+            body: json!({
+                "synced": 7,
+                "buckets": { "created": 0, "dropped": 0, "drop_not_closed": [] },
+            }),
         },
         UnitAnswer::SyncNeeded { seqs: seqs() },
         UnitAnswer::Stale { seqs: seqs() },
@@ -1329,6 +1339,38 @@ fn the_wire_format_is_the_golden_file() {
         text, golden,
         "the unit wire format changed: see the module doc"
     );
+}
+
+/// Sync accepts an omitted bucket delta, but requires the base sequence and placements.
+#[test]
+fn sync_defaults_to_no_bucket_changes_but_requires_the_base_and_placements() {
+    let from_seq = seqs().state_seq - 1;
+    let wire = json!({
+        "op": "sync",
+        "head": {
+            "from_seq": from_seq,
+            "seqs": seqs(),
+            "tenant_state": "active",
+            "placed": [],
+        },
+    });
+    let UnitOp::Sync { head } = serde_json::from_value(wire.clone()).unwrap() else {
+        panic!("expected a sync operation");
+    };
+    assert_eq!(head.from_seq, from_seq);
+    assert!(head.buckets.is_empty());
+    assert!(head.placed.is_empty());
+
+    for field in ["from_seq", "placed"] {
+        let mut wire = wire.clone();
+        wire["head"].as_object_mut().unwrap().remove(field).unwrap();
+        let err = serde_json::from_value::<UnitOp>(wire).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains(&format!("missing field `{field}`")),
+            "{err}"
+        );
+    }
 }
 
 fn ops_readers() -> Vec<&'static str> {

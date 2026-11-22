@@ -241,11 +241,14 @@ impl TestCatalog {
         assert!(matches!(born, UnitAnswer::Ok { .. }), "{born:?}");
         let synced = worker(UnitOp::Sync {
             head: SyncHead {
+                from_seq: UNIT_SEQS.state_seq,
                 seqs: UNIT_SEQS,
                 tenant_state: TenantState::Active,
                 tenant_mode: None,
                 restoring_since: None,
                 lift: None,
+                buckets: vec![],
+                placed: vec![],
             },
         });
         assert!(matches!(synced, UnitAnswer::Ok { .. }), "{synced:?}");

@@ -68,6 +68,7 @@ fn sync(u: &Unit<RusqliteSql>, state_seq: u64, restoring: Option<u64>, at: i64) 
         u,
         UnitOp::Sync {
             head: SyncHead {
+                from_seq: u.head().unwrap().seqs.state_seq,
                 seqs: Seqs {
                     state_seq,
                     keys_seq: 0,
@@ -76,6 +77,8 @@ fn sync(u: &Unit<RusqliteSql>, state_seq: u64, restoring: Option<u64>, at: i64) 
                 tenant_mode: None,
                 restoring_since: restoring,
                 lift: None,
+                buckets: vec![],
+                placed: vec![],
             },
         },
         at,
@@ -202,6 +205,44 @@ fn the_close_time_is_the_syncs_that_set_the_entry() {
     // A restore birth is closed since its birth.
     let r = provision(BirthKind::Restore, S);
     assert_eq!(closed_at(&r), Some(BORN));
+}
+
+/// A stale restore entry cannot replace the current one even if the sync's base is current.
+#[test]
+fn sync_refuses_an_older_restore_entry_without_writing() {
+    let u = closed();
+    let before = u.head().unwrap();
+    assert_eq!(before.restoring_since, Some(S));
+    let total_changes = || u.sql().with_conn(|conn| conn.total_changes());
+    let writes = total_changes();
+
+    assert_eq!(
+        sync(&u, S + 1, Some(S - 1), BORN + 2000),
+        UnitAnswer::Refused {
+            reason: Refused::StaleSync,
+            alarm: false,
+        }
+    );
+    assert_eq!(u.head().unwrap(), before);
+    assert_eq!(total_changes(), writes);
+
+    assert!(matches!(
+        sync(&u, S + 1, Some(S), BORN + 3000),
+        UnitAnswer::Ok { .. }
+    ));
+    let same = u.head().unwrap();
+    assert_eq!(same.seqs.state_seq, S + 1);
+    assert_eq!(same.restoring_since, Some(S));
+    assert_eq!(same.closed_at, before.closed_at);
+
+    assert!(matches!(
+        sync(&u, S + 2, Some(S + 2), BORN + 4000),
+        UnitAnswer::Ok { .. }
+    ));
+    let newer = u.head().unwrap();
+    assert_eq!(newer.seqs.state_seq, S + 2);
+    assert_eq!(newer.restoring_since, Some(S + 2));
+    assert_eq!(newer.closed_at, Some(BORN + 4000));
 }
 
 #[test]
@@ -589,6 +630,7 @@ fn lift(u: &Unit<RusqliteSql>, state_seq: u64, lift: Option<LiftProof>, at: i64)
         u,
         UnitOp::Sync {
             head: SyncHead {
+                from_seq: u.head().unwrap().seqs.state_seq,
                 seqs: Seqs {
                     state_seq,
                     keys_seq: 0,
@@ -597,6 +639,8 @@ fn lift(u: &Unit<RusqliteSql>, state_seq: u64, lift: Option<LiftProof>, at: i64)
                 tenant_mode: None,
                 restoring_since: None,
                 lift,
+                buckets: vec![],
+                placed: vec![],
             },
         },
         at,
@@ -691,14 +735,140 @@ fn a_clean_whole_replay_lifts_with_its_proof_once_the_stamp_is_level() {
     );
     let p = proof(&u, t);
     assert_eq!(p.replay_id, rid("n1"));
+    let _ = u.take_wake();
     assert!(matches!(lift(&u, S + 1, Some(p), t), UnitAnswer::Ok { .. }));
     let h = u.head().unwrap();
     assert_eq!((h.restoring_since, h.closed_at), (None, None));
+    // The lift asks for the alarm at once: what waited while the unit was
+    // closed is due (AM-50's `Closed` row).
+    assert_eq!(u.take_wake(), Some(UnixMs(t)));
     // The report is gone with the entry.
     assert_eq!(
         ok(worker(&u, UnitOp::GateStatus {}, t))["replay_id"],
         json!(null)
     );
+}
+
+/// An empty closing bucket unplaced on entry to restore or during it stays
+/// until the proven lift, which sweeps it without another sync.
+#[test]
+fn the_proven_lift_sweeps_an_unplaced_closing_bucket() {
+    use velmora_bridge::unit::buckets::{self, BucketChange};
+    use velmora_bridge::unit_lease::lease::Proven;
+
+    const BUCKET: &str = "b_00000000000000e1";
+    let t = BORN + 2000;
+    for unplace_on_entry in [true, false] {
+        let u = provision(BirthKind::Birth, 3);
+        let sync_buckets = |state_seq, restoring_since, buckets, placed| {
+            ok(worker(
+                &u,
+                UnitOp::Sync {
+                    head: SyncHead {
+                        from_seq: u.head().unwrap().seqs.state_seq,
+                        seqs: Seqs {
+                            state_seq,
+                            keys_seq: 0,
+                        },
+                        tenant_state: TenantState::Active,
+                        tenant_mode: None,
+                        restoring_since,
+                        lift: None,
+                        buckets,
+                        placed,
+                    },
+                },
+                t,
+            ))
+        };
+        sync_buckets(
+            4,
+            None,
+            vec![BucketChange::Created {
+                seq: 4,
+                bucket_id: BUCKET.into(),
+                grant_seq: 1,
+                creator: "p_owner".into(),
+                name: "alpha".into(),
+                bdk_wrapped: vec![2, 9, 9],
+                tk_version: 1,
+                written_at: u64::try_from(t).unwrap(),
+            }],
+            vec![BUCKET.into()],
+        );
+        ok(worker(
+            &u,
+            UnitOp::Renew {
+                proof_start: UnixMs(t),
+                proven: Proven {
+                    state_seq: 4,
+                    keys_seq: 0,
+                    stamp_counter: None,
+                    revoked: 0,
+                },
+                revocations: vec![],
+            },
+            t,
+        ));
+        assert_eq!(
+            ok(worker(
+                &u,
+                UnitOp::BucketClose {
+                    bucket_id: BUCKET.into()
+                },
+                t
+            )),
+            json!({ "closing": true, "newly": true })
+        );
+        let assert_retained = || {
+            assert_eq!(buckets::count(u.sql()).unwrap(), 1);
+            assert!(buckets::is_closing(u.sql(), BUCKET).unwrap());
+        };
+        for state_seq in [S, S + 1] {
+            let unplace = if unplace_on_entry { S } else { S + 1 };
+            let changes = if state_seq == unplace {
+                vec![BucketChange::Unplaced {
+                    seq: state_seq,
+                    buckets: vec![BUCKET.into()],
+                }]
+            } else {
+                vec![]
+            };
+            let placed = if state_seq < unplace {
+                vec![BUCKET.into()]
+            } else {
+                vec![]
+            };
+            let body = sync_buckets(state_seq, Some(S), changes, placed);
+            assert_eq!(body["buckets"]["dropped"], json!(0));
+            assert_retained();
+        }
+
+        let replay_id = rid("n1");
+        ok(worker(
+            &u,
+            UnitOp::GateOpen {
+                replay_id: replay_id.clone(),
+            },
+            t,
+        ));
+        level_stamp(&u, replay_id.ordinal);
+        ok(worker(
+            &u,
+            UnitOp::GateReport {
+                replay_id,
+                summary: whole(&[]),
+            },
+            t,
+        ));
+        let p = proof(&u, t);
+        assert_retained();
+        ok(lift(&u, S + 2, Some(p), t));
+        let h = u.head().unwrap();
+        assert_eq!((h.seqs.state_seq, h.restoring_since), (S + 2, None));
+        assert_eq!(buckets::count(u.sql()).unwrap(), 0);
+        assert!(!buckets::is_closing(u.sql(), BUCKET).unwrap());
+    }
 }
 
 #[test]

@@ -73,25 +73,30 @@ fn numbered(u: &Unit<RusqliteSql>, op: UnitOp) -> UnitAnswer {
     u.handle(&call_on(u.name(), CallKind::Worker, Some(s), op), NOW)
 }
 
+mod unit_bucket_support;
+
 fn sync_to(
     u: &Unit<RusqliteSql>,
     state_seq: u64,
     restoring: Option<u64>,
     lift: Option<LiftProof>,
 ) -> UnitAnswer {
-    let keys_seq = u.head().unwrap().seqs.keys_seq;
+    let current = u.head().unwrap().seqs;
     worker(
         u,
         UnitOp::Sync {
             head: SyncHead {
+                from_seq: current.state_seq,
                 seqs: Seqs {
                     state_seq,
-                    keys_seq,
+                    keys_seq: current.keys_seq,
                 },
                 tenant_state: TenantState::Active,
                 tenant_mode: None,
                 restoring_since: restoring,
                 lift,
+                buckets: vec![],
+                placed: unit_bucket_support::fixture_placements(u.sql()),
             },
         },
     )

@@ -140,11 +140,37 @@ expired lease one `renew` and nothing else, retried with a doubling wait
 T left (its consumer reaches the unit later); with less, the alarm sends one
 `renew` instead, other duties run, and the raise follows the renewal. Work that was due stays due; after a renewal the
 alarm is set to now. The alarm is armed only when the wanted time is earlier
-than the armed one. A closed unit runs nothing. Only the stamp raise is due
-on a unit yet: the day close (W7), the sweeps, the hand-out and the report
-to the directory are not built here, and the Worker's cron runs a unit's
-jobs through `TenantCatalog`. Rules 9 and 10 (jobs that name their tenant,
-the unit's outbox to the directory) are not built yet.
+than the armed one. A closed unit runs nothing. The day close (W7), the
+sweeps and the report to the directory are not built here. Rule 10 (the
+unit's outbox to the directory) is not built yet.
+
+**The hand-out** (`unit_lease::handout`, AM-49): under a fresh lease the
+alarm also does tenant 0's cron work for the unit. It buries exhausted
+outbox rows, then sends the due rows as `extent` jobs (as many as tenant
+0's dispatcher sends in one run), one `gc` job while a GC row of a
+disposable bucket is due and `GC_MODE` is `disposable`, and one `evict` job
+per eviction-check period while the unit's evictable bytes are above
+`HOT_CAP_BYTES`, as tenant 0's dispatcher. The object class runs in the
+Worker and reads those two variables from its environment; the unit holds
+no configuration. The hand-out is due when `Catalog::due` would take a row
+(with tenant 0's resend window, as a unit cannot ask the queues for their
+backlog; read from a bounded window of each stage, never late), a GC row is
+due while GC runs, or the eviction check is due while the cap is set and a
+byte is evictable, and never sooner than 60 s (est) after the last
+hand-out. A unit with an empty outbox and no cache has nothing due; one
+that holds cache wakes once per eviction-check period to take its total. A
+tenant that is being shredded hands out nothing (its jobs are refused).
+The lift of a `restoring` entry asks for the alarm at once, so what waited
+while the unit was closed is handed out after its renewal. Every message
+goes through `velmora_bridge::routing`, as tenant 0's: an extent's job to
+its shard of the post or verify queues, everything else, the unit's own
+`renew` and `stamp_raise` included, to the queue bound as `AUX_Q`, or to
+the first verify queue where `AUX_Q` is not bound. The jobs are format 2,
+with the tenant, the unit and its numbers. After the sends the rows of the
+batches that went through are marked, and the run is recorded only when
+every send went through. The write-intent sweep is not handed out: tenant
+0's is gated by `INTENT_SWEEP`, which only the Worker's configuration
+holds and its consumer does not check.
 
 **What makes the alarm's raise due** (ADR §8.5, AM-48). Every committed S3
 or job call that changed a row, and every reservation call that changed one
@@ -159,7 +185,12 @@ calls and `provision`. A rollback that loses one of these shows as
 `SyncNeeded` or an expired lease, or the tool runs it again, and a raise
 must not make the next one due. Read stamps (`touch_read`) count. The alarm
 sends a raise only while at least T/2 of the lease is left; with less, it
-sends `renew` and sends the raise after that renewal.
+sends `renew` and sends the raise after that renewal. The unit clears its
+pending raise only when the stamp call lands, not when the message is sent:
+the alarm keeps the hand-out time in `raise_from`, a `stamp_advance` that
+moves the counter clears it in its own transaction, and a raise that has not
+landed one period after its hand-out is due again. A failed send undoes the
+hand-out, and its writes are due from their own time.
 
 **The unit client** (`unit_lease::client`, the Worker's side of rules 5 and
 12; AM-50, AM-51). A unit does no I/O, so the Worker reads for it:
@@ -175,15 +206,44 @@ sends `renew` and sends the raise after that renewal.
   unchanged the rollback is recorded, the unit closes and the client pages
   (again at every look while it stays closed). Revocations the unit did not
   hold are applied with the renewal, and the key chain's finisher is told
-  once, before the call (SEC-6). More revocations held than listed renews
-  nothing and pages. The pages come back with an error too.
+  once, before the call (SEC-6). A revocation is a name under
+  `m/rk/<t>/` that is an access key id or a principal's plane id
+  (`p_` and 16 hex, AM-72): a listed principal's row is set `revoked`,
+  and the keys it made lose their effective grant while their rows keep
+  their status. More revocations held than listed renews nothing and
+  pages. The pages come back with an error too.
 - **`sync`.** The tenant chain's verified head and the key-chain records
   after the unit's `keys_seq`: first the key apply (AM-12, in pages of at
-  most 100 records, each from the unit's own `keys_seq`), then `sync` at
-  both heads, with the head's state, mode and this unit's `restoring` entry.
-  A head that clears the entry is not sent as a lift: only the restore
-  tool's `sync` carries the lift proof (AM-45); the client reports it and
-  changes nothing. A unit the head does not list is not called.
+  most 100 records, each from the unit's own `keys_seq`; the feed gets the
+  directory's acknowledged `keys_seq`, read once per sync, and the
+  subjects the unit holds closed, read before each feed read, AM-71), then
+  `sync` at both heads, with the head's state, mode and this unit's
+  `restoring` entry, and the bucket part (AM-57): the bucket changes of
+  the records after the unit's `state_seq` for the buckets placed on this
+  unit (`unit_lease::placements`: a record that creates a bucket on this
+  unit is `created`, with the name and wrapped key from its private part;
+  a placement on this unit that a record removes is `unplaced` when the
+  record before held this unit's `restoring` entry, else `dropped`, or
+  `removed` for several at once: `dropped` and `removed` apply whatever
+  entry the unit holds), and the placement list for this unit. A unit more than 32 records (est) behind is brought up in steps,
+  each a `sync` to a record of the chain, at most 8 steps per sync. Every
+  step carries the head's admission: its tenant state and mode and this
+  unit's `restoring` entry (never a looser state of a record below it,
+  and never a lift, which only the restore tool's proof makes), with the
+  step's own bucket changes and placement list. Each
+  `sync` names the unit's `state_seq` its part was built from
+  (`from_seq`); a unit at another seq refuses it `stale_sync` and the
+  Worker reads again, so a part from another base (a second isolate's
+  `sync` first, or a restore in between) is never applied. A `sync`
+  carrying an older `restoring` entry than the unit holds is refused the
+  same way, and the client reads the head again when the unit moved during
+  its key apply.
+  `placements_off` reads the chain again and sends once more; the same
+  refusal again pages. A `sync` that kept a bucket closing because it
+  still holds something pages `drop_not_closed`. A head that clears the
+  entry is not sent as a lift: only the restore tool's `sync` carries the
+  lift proof (AM-45); the client reports it and changes nothing. A unit
+  the head does not list is not called.
 - **The request path** (rule 5): `renew_needed` renews, `sync_needed`
   syncs, a lower request number takes the unit's numbers; each fix runs once
   and the call runs once more. An answer with less than half of T left asks
@@ -191,7 +251,28 @@ sends `renew` and sends the raise after that renewal.
   renewals go through the isolate's spacing: none while one runs, and after
   a failed attempt a backoff from 60 s doubling up to T, cleared by a
   success (rule 11). Signed calls go through the same spacing with the
-  backoff capped at 1 s.
+  backoff capped at 1 s. A `sync_needed` sync takes the same spacing under
+  its own key (it reads up to 32 records, and an unsigned call can cause
+  it), so a sync that keeps failing (`placements_off`, damage) is read
+  and paged at that pace; the backoff counts from the failure's end, and
+  a sync that brought a far-behind unit part of the way is no failure. A
+  call that meets a running sync of its unit waits for it as for a
+  renewal (at most 5 s) and runs once more if it synced. A call answered `renew_needed` that finds a
+  renewal of its unit running in its isolate waits for it, at most 5 s
+  (est), and runs once more if it renewed; otherwise it answers
+  `renew_needed` (rule 12, AM-63). The waiting call looks every 50 ms
+  (est) on its own timer, so it never resumes in the renewing request's
+  turn. The state (renewals in flight, the backoff, the waiter and the
+  isolate's timer) is one `InFlight` per isolate (AM-71); without a timer
+  nothing waits. Background renewals do not wait. A queued `renew` job
+  takes the same slot: with a renewal of the unit running it is
+  acknowledged (`renewing`), and a stamp raise that needs one is handed
+  back.
+- **`key_row` after the signature** (AM-63): a `key_row` the unit
+  answered marked `lease_expired` is used only to check the signature.
+  `key_row_verified` then renews as a signed call and reads `key_row`
+  again, signed; the request goes on only with that row, so a revocation
+  is applied before the key serves.
 - **The `renew` and `stamp_raise` jobs**, which the queue consumer hands to
   the client: a renewal as above; a raise moves the unit's counter, then puts
   its object, renewing first when the lease ran out. A failed call, or a
@@ -371,9 +452,11 @@ from the record's private part. In the `sync`'s transaction the unit:
    `~dropped/<bucket_id>`, so that a later `created` can take the name;
    the rest of the `sync` applies, and the answer names it for the
    operator's page (`drop_not_closed`). No object is deleted for it;
-2a. on every `sync` (after the changes, before the check) and on the
-   gate's last call after §8.6 step 7.4, drops each closing row the head
-   does not place once it holds nothing (`buckets::sweep_closing`);
+2a. on every `sync` that leaves no `restoring` entry (the lift
+   included; after the changes, before the check) and on the gate's last
+   call after §8.6 step 7.4, drops each closing row the head does not
+   place once it holds nothing (`buckets::sweep_closing`); a unit under an
+   entry keeps its closing rows too, as the 30-day copy keeps its rows;
 3. for `unplaced`, removes nothing while the unit's `restoring` entry is
    set, and otherwise drops those rows as in 2;
 4. checks that its bucket rows, less every closing row the head does not
@@ -400,9 +483,9 @@ row; otherwise it marks the bucket closing (once), and every write into
 it answers `NoSuchBucket` from then on (`buckets::is_closing`, for the
 request path). Then the `DropBucket` record, then `sync`. A closing
 bucket whose record never came stays closed and empty, and its name
-taken, until a delete retry completes it. The `sync` arm that carries
-the changes, and the stamp raise after `bucket_close` (AM-48), are the
-Worker's (L2). Until the request path asks `is_closing` before a write
+taken, until a delete retry completes it. The Worker's `sync` carries
+the changes (the unit client, above); `bucket_close` makes the stamp
+raise due (AM-48). Until the request path asks `is_closing` before a write
 (`RequestCall`, L1 package 5), a write into a closing bucket is not
 refused; a drop still keeps every row that holds data. Package 5 also
 leaves closing rows out of ListBuckets and HeadBucket: a kept row keeps
