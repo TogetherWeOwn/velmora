@@ -25,12 +25,17 @@
 //! - `replace_if_match` is one R2 put with the condition
 //!   `onlyIf: { etagMatches: <etag> }` (L3-Q21, L4's `RecordStore`
 //!   replace, #244). R2 evaluates it against the committed object, so of
-//!   competing replaces against one ETag at most one stores (each store
-//!   gives the object a new ETag). A failed condition (another ETag, or
-//!   no object) answers `null`: `Ok(false)`, and nothing changed. Any
-//!   other failure is an error, which says nothing about whether the
-//!   bytes were stored; the caller reads the name back. A record above
-//!   [`MAX_RECORD_BYTES`] and an empty ETag are refused before the put.
+//!   competing replaces against one ETag at most one stores (a store of
+//!   other bytes gives the object a new ETag: R2's ETag is the MD5 of a
+//!   single-part body, and a sealed route carries a fresh nonce). A
+//!   failed condition (another ETag, or no object) answers `null`:
+//!   `Ok(false)`, and nothing changed. Any other failure is an error,
+//!   which says nothing about whether the bytes were stored; the caller
+//!   reads the name back. A record above [`MAX_RECORD_BYTES`], and an
+//!   ETag that is not a bare R2 ETag (empty, the wildcard `*`, quoted,
+//!   weak or a list), are refused before the put. One-winner under
+//!   concurrency is R2's documented rule; the race probe on real R2 is
+//!   not run yet.
 //!
 //! Errors are `BridgeError::Blob` with a class only: no name, no bytes,
 //! no R2 message.
@@ -164,8 +169,10 @@ impl RecordStore for R2Records {
         if bytes.len() as u64 > MAX_RECORD_BYTES {
             return Err(BridgeError::Blob("records: record too large".into()));
         }
-        if etag.is_empty() {
-            return Err(BridgeError::Blob("records: replace with no etag".into()));
+        if !bare_etag(etag) {
+            return Err(BridgeError::Blob(
+                "records: replace with no bare etag".into(),
+            ));
         }
         let stored = self
             .bucket
@@ -177,6 +184,13 @@ impl RecordStore for R2Records {
         // `None`: the condition failed (another ETag, or no object).
         Ok(stored.is_some())
     }
+}
+
+/// A bare R2 ETag: hex digits, and `-` (a multipart ETag's part count).
+/// Never empty, never the wildcard `*` (which would match any object),
+/// never quoted, weak or a list.
+fn bare_etag(etag: &str) -> bool {
+    !etag.is_empty() && etag.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-')
 }
 
 /// The condition of a replace: the stored object's ETag is `etag`.
@@ -212,6 +226,26 @@ mod tests {
         assert_eq!(c.etag_does_not_match, None);
         assert_eq!(c.uploaded_before, None);
         assert_eq!(c.uploaded_after, None);
+    }
+
+    /// Only a bare ETag conditions a replace: the wildcard would match any
+    /// stored object (a lost update).
+    #[test]
+    fn only_a_bare_etag_conditions_a_replace() {
+        for good in ["0123456789abcdef0123456789abcdef", "d41d8cd98f00b204-3"] {
+            assert!(bare_etag(good), "{good}");
+        }
+        for bad in [
+            "",
+            "*",
+            "\"abc\"",
+            "W/\"abc\"",
+            "abc, def",
+            "abc def",
+            "xyz",
+        ] {
+            assert!(!bare_etag(bad), "{bad}");
+        }
     }
 
     #[test]
