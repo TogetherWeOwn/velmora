@@ -425,7 +425,8 @@ fails the job before the deploy). Step 2 in production:
    `VELMORA_RECOVERY_PREFIX` and `VELMORA_VERIFY_MODE`): the run in
    step 5 deploys their values of now, not those of the serving deploy.
    Compare them with what the serving version carries:
-   `wrangler versions view <id>` lists its variables and bindings. Put
+   `wrangler versions view <id> --json` lists its variables and
+   bindings in full (without `--json` long values are cut). Put
    any difference right, or confirm it is meant, before going on. Then
    set `VELMORA_RECORD_LAYOUT` to `tenant` in the `production`
    environment.
