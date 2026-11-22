@@ -626,11 +626,6 @@ impl BridgeConfig {
     ///   layout, which the recovery copy and the replay read as tenant
     ///   0's.
     ///
-    /// Every other setting is tenant 0's, `maintenance` included (AM-50):
-    /// under `restore` a unit's jobs make no unit call and its writes
-    /// answer `503`, which the owner move's window depends on (DS1 §3.4
-    /// from 8(b) to step 9).
-    ///
     /// Refused for tenant 0, which has no unit.
     pub fn for_unit(&self, unit: &crate::unit::UnitName) -> Result<BridgeConfig, ConfigError> {
         if unit.tenant.is_zero() {

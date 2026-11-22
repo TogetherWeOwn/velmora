@@ -42,7 +42,6 @@ pub mod trace;
 pub mod types;
 pub mod unit;
 pub mod unit_consumer;
-pub mod unit_router;
 pub mod verify;
 
 #[cfg(feature = "testkit")]

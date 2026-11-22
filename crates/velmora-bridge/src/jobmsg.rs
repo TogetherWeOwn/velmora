@@ -81,13 +81,13 @@
 //! this one on knows them ([`read_unit_job`]), long before a unit can
 //! write one.
 //!
-//! A Worker with the unit class bound admits a well-formed one of a
-//! managed tenant as [`Admission::Unit`]; the consumer runs it through
-//! the unit client (`unit_consumer::deliver_unit_job`). It is refused
-//! here as [`Refusal::OtherTenant`] for a unit of another tenant when the
-//! unit class is not bound, [`Refusal::UnitOfTenantZero`] or
-//! [`Refusal::NoUnit`] for tenant 0, and [`Refusal::BadBody`] when its
-//! fields are not those of its kind. A lost
+//! No build runs them yet: the Worker side of the renewal (prove, then
+//! `renew`) and of the raise is not built. A unit job is therefore
+//! refused here, as [`Refusal::OtherTenant`] for a unit of another
+//! tenant when the unit class is not bound, [`Refusal::UnitJobNotRun`]
+//! for a well-formed one of a managed tenant when it is,
+//! [`Refusal::UnitOfTenantZero`] or [`Refusal::NoUnit`] for tenant 0, and
+//! [`Refusal::BadBody`] when its fields are not those of its kind. A lost
 //! `renew` closes the unit when its lease runs out (an outage, never a
 //! wrong answer); the alarm's backoff sends it again.
 //!
@@ -580,8 +580,7 @@ impl FormatCount {
             Admission::Run { tenant: None, .. } => 0,
             Admission::Run {
                 tenant: Some(_), ..
-            }
-            | Admission::Unit { .. } => 1,
+            } => 1,
             Admission::Refused(_) => 2,
             Admission::Malformed => return None,
         };
@@ -619,9 +618,6 @@ pub enum Admission {
         job: Job,
         tenant: Option<JobTenant>,
     },
-    /// A unit job of a managed tenant, with the unit class bound: run
-    /// through the unit client, never through `run_job`.
-    Unit { job: UnitJob, tenant: JobTenant },
     /// Not a job: acknowledged and dropped, as before this module. The
     /// dispatcher sends its row again.
     Malformed,
@@ -646,7 +642,7 @@ pub enum Disposition {
 impl Admission {
     pub fn disposition(&self) -> Disposition {
         match self {
-            Admission::Run { .. } | Admission::Unit { .. } => Disposition::Run,
+            Admission::Run { .. } => Disposition::Run,
             Admission::Malformed => Disposition::Drop,
             Admission::Refused(_) => Disposition::Refuse,
         }
@@ -672,6 +668,9 @@ pub enum Refusal {
     /// A unit job ([`UnitJob`]), or a job of a managed tenant, that
     /// names no unit.
     NoUnit,
+    /// A well-formed unit job ([`UnitJob`]) of a managed tenant: this
+    /// build does not run unit jobs.
+    UnitJobNotRun,
 }
 
 impl Refusal {
@@ -684,6 +683,7 @@ impl Refusal {
             Refusal::BadBody => "bad_body",
             Refusal::UnknownKind => "unknown_kind",
             Refusal::NoUnit => "no_unit",
+            Refusal::UnitJobNotRun => "unit_job_not_run",
         }
     }
 }
@@ -724,30 +724,22 @@ pub fn admit_for(body: &Value, units: Units) -> Admission {
         };
     }
     match tenant_message(body, units, scope) {
-        Ok(Admitted::Job(scope, job, tenant)) => Admission::Run {
+        Ok((scope, job, tenant)) => Admission::Run {
             scope,
             job,
             tenant: Some(tenant),
         },
-        Ok(Admitted::Unit(job, tenant)) => Admission::Unit { job, tenant },
         Err(refusal) => Admission::Refused(refusal),
     }
 }
 
-/// What [`tenant_message`] admits.
-#[derive(Debug, PartialEq)]
-enum Admitted {
-    Job(TenantScope, Job, JobTenant),
-    Unit(UnitJob, JobTenant),
-}
-
 /// A `v` 2 message of a tenant this Worker serves as the job's scope, its
-/// job and its tenant fields, or a unit job. `zero` is tenant 0's scope.
+/// job and its tenant fields. `zero` is tenant 0's scope.
 fn tenant_message(
     body: &Value,
     units: Units,
     zero: TenantScope,
-) -> std::result::Result<Admitted, Refusal> {
+) -> std::result::Result<(TenantScope, Job, JobTenant), Refusal> {
     let Some(fields) = body.as_object() else {
         return Err(Refusal::BadBody);
     };
@@ -776,14 +768,14 @@ fn tenant_message(
         return Err(Refusal::UnitOfTenantZero);
     }
     let kind = fields.get("t").and_then(Value::as_str);
-    // A unit job: run through the unit client, never as a `Job`. The
-    // reader says whether it was well formed.
+    // A unit job: no build runs one yet. The reader says whether it was
+    // well formed.
     if kind.is_some_and(|kind| UNIT_JOB_KINDS.contains(&kind)) {
-        return match read_unit_job(body) {
-            Err(refusal) => Err(refusal),
-            Ok(_) if scope.is_tenant_zero() => Err(Refusal::NoUnit),
-            Ok((job, tenant)) => Ok(Admitted::Unit(job, tenant)),
-        };
+        return Err(match read_unit_job(body) {
+            Err(refusal) => refusal,
+            Ok(_) if scope.is_tenant_zero() => Refusal::NoUnit,
+            Ok(_) => Refusal::UnitJobNotRun,
+        });
     }
     if !scope.is_tenant_zero() && numbers.unit.is_none() {
         return Err(Refusal::NoUnit);
@@ -803,7 +795,7 @@ fn tenant_message(
             false => Refusal::UnknownKind,
         }
     })?;
-    Ok(Admitted::Job(
+    Ok((
         scope,
         job,
         JobTenant {
@@ -946,6 +938,7 @@ mod tests {
             Refusal::BadBody,
             Refusal::UnknownKind,
             Refusal::NoUnit,
+            Refusal::UnitJobNotRun,
         ];
         let codes: std::collections::BTreeSet<_> = all.iter().map(|r| r.code()).collect();
         assert_eq!(codes.len(), all.len());
@@ -1050,20 +1043,15 @@ mod tests {
         }
     }
 
-    /// A unit job (renew, stamp_raise): with units bound a well-formed one
-    /// is admitted for the unit client, a malformed one says why.
+    /// A unit job (renew, stamp_raise) is never run by this build: with
+    /// units bound a well-formed one says so, a malformed one says why.
     #[test]
-    fn unit_jobs_are_admitted_with_units_bound_only() {
+    fn unit_jobs_are_refused_with_units_bound_too() {
         let renew = json!({"t": "renew", "v": 2, "at": 1_800_000_000_000_i64, "tenant": MANAGED,
                            "unit": 0, "state_seq": 1, "keys_seq": 1});
-        let (job, tenant) = read_unit_job(&renew).unwrap();
         assert_eq!(
             admit_for(&renew, Units::Bound),
-            Admission::Unit { job, tenant }
-        );
-        assert_eq!(
-            admit_for(&renew, Units::Bound).disposition(),
-            Disposition::Run
+            Admission::Refused(Refusal::UnitJobNotRun)
         );
         assert_eq!(
             admit_for(&renew, Units::Unbound),
