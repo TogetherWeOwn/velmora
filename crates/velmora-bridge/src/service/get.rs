@@ -1089,8 +1089,11 @@ where
             }
             self.hang_up().await;
         }
-        if let Some(writing) = self.put.take() {
+        // A timed charge can stop waiting here; leave the write in
+        // place for the reader's cleanup unless it has finished.
+        if let Some(writing) = self.put.as_mut() {
             writing.await;
+            self.put = None;
         }
     }
 
@@ -1246,6 +1249,9 @@ where
         // filled it in the meantime.
         let waiter = WAITERS.fetch_add(1, Ordering::Relaxed);
         let deadline = bridge.clock.now().plus_ms(i64::from(COLD_WAIT_MS));
+        let remaining = |slept| {
+            (deadline.0 - bridge.clock.now().0).min(i64::from(COLD_WAIT_MS.saturating_sub(slept)))
+        };
         self.until = Some(deadline);
         let mut slept = 0u32;
         let mut attempt = 0u64;
@@ -1361,9 +1367,7 @@ where
                 if room.try_charge_in_turn(both).is_some() {
                     break;
                 }
-                let now = bridge.clock.now();
-                let left = (deadline.0 - now.0).min(i64::from(COLD_WAIT_MS.saturating_sub(slept)));
-                let Ok(left @ 1..) = u32::try_from(left) else {
+                let Ok(left @ 1..) = u32::try_from(remaining(slept)) else {
                     return Err(ReadFail::Busy);
                 };
                 let listed = async {
@@ -1389,12 +1393,27 @@ where
             if bridge.clock.now() >= deadline {
                 return Err(ReadFail::Busy);
             }
-            // Not in the cache: charge the read and any rebuild together
-            // in turn, then hand the rebuild's part to the reader.
-            work = self.step(both, lean.saturating_add(rebuild)).await?;
-            if rebuild > 0 {
-                spare = Some(work.split_off(rebuild));
+            if rebuild == 0 {
+                work = self.step(need, lean).await?;
+                continue;
             }
+            // Another request may have taken the room while the cache
+            // was checked. Bound this wait by the same retry allowance.
+            let Ok(left @ 1..) = u32::try_from(remaining(slept)) else {
+                return Err(ReadFail::Busy);
+            };
+            {
+                let charge = core::pin::pin!(self.step(both, lean.saturating_add(rebuild)));
+                let timeout = core::pin::pin!(async { sleep(left).await });
+                work = match select(charge, timeout).await {
+                    Either::Left((found, _)) => found?,
+                    Either::Right(_) => return Err(ReadFail::Busy),
+                };
+            }
+            if bridge.clock.now() >= deadline {
+                return Err(ReadFail::Busy);
+            }
+            spare = Some(work.split_off(rebuild));
         }
     }
 }

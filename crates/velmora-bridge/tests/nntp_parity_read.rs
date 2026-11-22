@@ -11,7 +11,9 @@ use std::cell::Cell;
 use std::rc::Rc;
 use velmora::rng::SystemRng;
 use velmora::yenc::decode_part_to;
-use velmora_bridge::fetch::{cold_rebuild_bytes, cold_step_bytes, ColdFetch, ColdStats};
+use velmora_bridge::fetch::{
+    cold_rebuild_bytes, cold_step_bytes, ColdFetch, ColdStats, COLD_WAIT_MS,
+};
 use velmora_bridge::ingress::{ByteBudget, Sleeper, CHARGE_POLL_MS};
 use velmora_bridge::parity;
 use velmora_bridge::*;
@@ -300,6 +302,15 @@ async fn cold_get_reads_data_from_the_waiting_provider_of_a_shared_pool() {
 /// than download without enough room again.
 #[tokio::test]
 async fn cold_get_downloads_only_once_more_when_retry_rebuild_room_is_taken() {
+    cold_get_with_retry_rebuild_room_taken(false).await;
+}
+
+#[tokio::test]
+async fn cold_get_does_not_retry_when_rebuild_room_arrives_after_deadline() {
+    cold_get_with_retry_rebuild_room_taken(true).await;
+}
+
+async fn cold_get_with_retry_rebuild_room_taken(expired: bool) {
     let polls = Rc::new(Cell::new(0u32));
     let released = Rc::new(Cell::new(0u32));
     let sleeper: Sleeper = {
@@ -363,6 +374,9 @@ async fn cold_get_downloads_only_once_more_when_retry_rebuild_room_is_taken() {
             base + rebuild,
             "the retry waits without its charge"
         );
+        if expired {
+            bridge.clock.advance_ms(i64::from(COLD_WAIT_MS) + 1);
+        }
         drop(taken);
         released.set(u32::MAX);
     };
@@ -373,8 +387,6 @@ async fn cold_get_downloads_only_once_more_when_retry_rebuild_room_is_taken() {
     .await
     .expect("the cold GET and competitor finish");
 
-    response.expect(200);
-    assert!(response.body == body);
     let bodies = bridge
         .nntp
         .calls()
@@ -382,8 +394,18 @@ async fn cold_get_downloads_only_once_more_when_retry_rebuild_room_is_taken() {
         .filter(|call| call.0 == "body")
         .count();
     // Each pass makes four data requests (including the second ask for
-    // the lost article); only the second pass fetches a parity article.
-    assert_eq!(bodies, 4 + 5, "a third full download was made");
+    // the lost article); only a second pass fetches a parity article.
+    if expired {
+        assert_eq!(
+            (response.status, response.code().as_str()),
+            (503, "SlowDown")
+        );
+        assert_eq!(bodies, 4, "a full download started past the deadline");
+    } else {
+        response.expect(200);
+        assert!(response.body == body);
+        assert_eq!(bodies, 4 + 5, "a third full download was made");
+    }
     assert_eq!(budget.in_use(), 0);
 }
 
