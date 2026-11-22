@@ -99,7 +99,10 @@ INFLIGHT_BUDGET_BYTES = "50331648"   # 48 MiB per isolate: what requests may cha
 # job charges under this limit, a request under INFLIGHT_BUDGET_BYTES. It
 # may be up to 1.5 times INFLIGHT_BUDGET_BYTES: a request holds up to 1.5
 # bytes per byte it charges (the upload's ciphertext is copied once more
-# on its way to R2), a job holds about what it charges.
+# on its way to R2), a job holds about what it charges. An upload of at
+# most MAX_EXTENT_BYTES is sealed and stored while it arrives and charges
+# a window of 512 KiB whatever its length; a slice, a copied part and a
+# download charge what they hold.
 JOB_BUDGET_BYTES = "75497472"        # 72 MiB per isolate
 GC_MODE = "off"                      # off | disposable
 HOT_CAP_BYTES = "107374182400"       # 100 GiB of evictable R2 bytes; pinned (unverified) bytes are never counted or evicted

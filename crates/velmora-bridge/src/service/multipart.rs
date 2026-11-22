@@ -10,8 +10,10 @@
 //! - **Create** stores the upload row (state `open`, revision 0) with the
 //!   object metadata of the request.
 //! - **UploadPart** seals the body like a single PUT into a fresh extent,
-//!   stores the ciphertext in the safety store and records it as a staged
-//!   part. A body above one extent is stored as slices, like a PutObject
+//!   stores the ciphertext in the safety store while the body arrives
+//!   and records it as a staged part once the store holds all of it. A
+//!   refused body leaves no blob and no part. A body above one extent is
+//!   stored as slices, like a PutObject
 //!   of that length, and the part is the list of their extents. Nothing
 //!   is posted before Complete.
 //! - **Complete** validates the listed parts against the upload as read at
@@ -49,21 +51,23 @@ use velmora_s3_proto::{
 use zeroize::Zeroizing;
 
 use crate::config::{BridgeConfig, Maintenance};
-use crate::crypto::{seal_extent, unwrap_bdk, unwrap_secret};
+use velmora::media::HEADER_SIZE;
+
+use crate::crypto::{seal_extent, unwrap_bdk, unwrap_secret, WrappedKey};
 use crate::ingress::{
     body_is_empty, declared_length, read_upload, upload_lengths, Charge, IngressError,
-    UploadLengths, UploadReadError,
+    SealedUpload, UploadLengths, UploadReadError,
 };
 use crate::intents::WRITER_MAX_AGE_MS;
 use crate::ports::{
     BlobMeta, BlobStore, Bridge, Catalog, Clock, Guard, JobSink, Kek, NntpConnector,
-    PublishOutcome, UploadTarget,
+    PublishOutcome, StreamMeta, UploadTarget,
 };
 use crate::recovery::{id_after, write_generation};
 use crate::service::common::{
     auth_refused, check_precondition, discard_refused, discard_unless_present, header_refused,
-    hold_precondition, host_refused, precondition, restore_gate, send_post_jobs, writes_refused,
-    REGION_ALIASES,
+    hold_precondition, host_refused, precondition, restore_gate, send_post_jobs, store_streamed,
+    writes_refused, REGION_ALIASES,
 };
 use crate::service::slices::{store_slices, SliceError, SliceSink};
 use crate::types::{
@@ -665,6 +669,18 @@ pub(super) async fn upload_part<
     respond(upload_part_inner(bridge, req).await)
 }
 
+/// One part body stored as one extent in the safety store: what its
+/// catalogue row records.
+struct StoredPart {
+    plain_size: u64,
+    cipher_size: u64,
+    media_header: [u8; HEADER_SIZE as usize],
+    wrapped_file_key: WrappedKey,
+    plain_md5: [u8; 16],
+    plain_sha256: [u8; 32],
+    cipher_sha256: [u8; 32],
+}
+
 async fn upload_part_inner<C, B, N, J, K, T>(
     bridge: &Bridge<C, B, N, J, K, T>,
     req: S3Request,
@@ -699,11 +715,48 @@ where
         return Err(ErrorCode::NoSuchUpload.into());
     }
 
-    // Plaintext and ciphertext live together while sealing: the charge
-    // covers both and is held until the ciphertext has been handed over.
+    // A fresh id per seal: the key wrap binds the id, never a version.
+    let extent_id = ExtentId::mint(random()?);
+    let bdk = || {
+        unwrap_bdk(
+            &bridge.kek,
+            a.bucket.kek_version,
+            &a.bucket.id,
+            &a.bucket.bdk_wrapped,
+        )
+    };
     // For aws-chunked bodies every length below is the decoded one.
-    let (body, charge) = if copy {
-        copied_part(bridge, &a, &req.headers, req.body).await?
+    let stored = if copy {
+        // Plaintext and ciphertext live together while sealing: the
+        // charge covers both and is held until the ciphertext has been
+        // handed over.
+        let (body, charge) = copied_part(bridge, &a, &req.headers, req.body).await?;
+        let sealed = seal_extent(&bdk()?, &a.bucket.id, &extent_id, &body, &mut SystemRng)?;
+        let plain_size = body.len() as u64;
+        drop(body);
+        let cipher_size = sealed.ciphertext.len() as u64;
+        bridge
+            .safety
+            .put(
+                &extent_id.safety_key(),
+                sealed.ciphertext,
+                &BlobMeta {
+                    bucket: &a.bucket.id,
+                    extent: &extent_id,
+                    cipher_sha256: &sealed.cipher_sha256,
+                },
+            )
+            .await?;
+        drop(charge);
+        StoredPart {
+            plain_size,
+            cipher_size,
+            media_header: sealed.media_header,
+            wrapped_file_key: sealed.wrapped_file_key,
+            plain_md5: sealed.plain_md5,
+            plain_sha256: sealed.plain_sha256,
+            cipher_sha256: sealed.cipher_sha256,
+        }
     } else {
         // A part may be as long as a PutObject. Above one extent it is
         // stored as slices, never read whole.
@@ -711,26 +764,39 @@ where
         if lengths.decoded > bridge.cfg.max_extent_bytes {
             return sliced_part(bridge, &a, &target, number, req.body, lengths).await;
         }
-        let mut validator = UploadValidator::new(&a.headers, &a.verified, &a.policy)?;
-        let charge = bridge.budget.charge_body(lengths.decoded).await?;
-        let body = read_upload(req.body, lengths, &charge, &mut validator).await?;
-        validator.finish()?;
-        (body, charge)
+        let validator = UploadValidator::new(&a.headers, &a.verified, &a.policy)?;
+        let bdk = bdk()?;
+        // Nothing of the body is read before this charge is held. The
+        // body is sealed and stored while it arrives, and the stored
+        // copy is whole only if the validator accepted the body.
+        let charge = bridge.budget.charge_stream(lengths.decoded).await?;
+        let SealedUpload { decoded, sealed } = store_streamed(
+            &bridge.safety,
+            req.body,
+            lengths,
+            validator,
+            &bdk,
+            StreamMeta {
+                bucket: &a.bucket.id,
+                extent: &extent_id,
+            },
+            &charge,
+        )
+        .await?;
+        drop(charge);
+        StoredPart {
+            plain_size: decoded.length(),
+            cipher_size: sealed.cipher_size,
+            media_header: sealed.media_header,
+            wrapped_file_key: sealed.wrapped_file_key,
+            plain_md5: *decoded.md5(),
+            plain_sha256: *decoded.sha256(),
+            cipher_sha256: sealed.cipher_sha256,
+        }
     };
-    let declared = body.len() as u64;
-
-    let bdk = unwrap_bdk(
-        &bridge.kek,
-        a.bucket.kek_version,
-        &a.bucket.id,
-        &a.bucket.bdk_wrapped,
-    )?;
-    // A fresh id per seal: the key wrap binds the id, never a version.
-    let extent_id = ExtentId::mint(random()?);
-    let sealed = seal_extent(&bdk, &a.bucket.id, &extent_id, &body, &mut SystemRng)?;
-    drop(body);
+    let declared = stored.plain_size;
     let now = bridge.clock.now();
-    let etag = format!("\"{}\"", hex(&sealed.plain_md5));
+    let etag = format!("\"{}\"", hex(&stored.plain_md5));
     let extent = ExtentRow {
         id: extent_id.clone(),
         bucket_id: a.bucket.id.clone(),
@@ -739,13 +805,13 @@ where
         seq: None,
         plain_offset: None,
         plain_size: declared,
-        cipher_size: sealed.ciphertext.len() as u64,
-        media_header: sealed.media_header.to_vec(),
+        cipher_size: stored.cipher_size,
+        media_header: stored.media_header.to_vec(),
         key_mode: KEY_MODE_RANDOM,
-        wrapped_file_key: Some(sealed.wrapped_file_key.to_vec()),
-        plain_md5: sealed.plain_md5,
-        plain_sha256: sealed.plain_sha256,
-        cipher_sha256: sealed.cipher_sha256,
+        wrapped_file_key: Some(stored.wrapped_file_key.to_vec()),
+        plain_md5: stored.plain_md5,
+        plain_sha256: stored.plain_sha256,
+        cipher_sha256: stored.cipher_sha256,
         safety_state: SafetyState::Held,
         article_count: None,
         plan_rev: 0,
@@ -754,20 +820,6 @@ where
         released_at: None,
         created_at: now,
     };
-    let safety_key = extent_id.safety_key();
-    bridge
-        .safety
-        .put(
-            &safety_key,
-            sealed.ciphertext,
-            &BlobMeta {
-                bucket: &a.bucket.id,
-                extent: &extent_id,
-                cipher_sha256: &extent.cipher_sha256,
-            },
-        )
-        .await?;
-    drop(charge);
 
     let part = UploadPartRow {
         upload_id: id.clone(),

@@ -5,6 +5,13 @@
 //! corrupted upload is refused rather than stored. A ranged `get` returns
 //! exactly the span or fails. Errors carry the operation class only.
 //!
+//! `put_stream` hands R2 a stream of a fixed length, so the blob is not
+//! held in memory. R2 stores nothing when the stream fails or ends at
+//! another length. It cannot be given a digest before the bytes exist,
+//! so the answer carries the size and the MD5 R2 reports (the etag of an
+//! object written by one put) and the caller compares them with what it
+//! sent. The custom metadata of such a blob has no `cipher-sha256`.
+//!
 //! Dev only: `DEV_TOMBSTONE_PUT_DELAY_MS` makes every put of a tombstone
 //! record to the safety store wait that long first (a slow store), so the
 //! local acceptance run can make a DeleteObjects outlast a client's read
@@ -12,16 +19,21 @@
 
 use std::collections::HashMap;
 
+use futures_util::StreamExt;
+
 use velmora_bridge::recovery::{
     is_protected_key, record_name, RecordKind, Unpublished, ERR_RECORD_DELETE,
 };
-use velmora_bridge::{BlobEntry, BlobMeta, BlobStore, BridgeError, ByteSpan, Result};
+use velmora_bridge::{
+    BlobEntry, BlobMeta, BlobStore, BridgeError, ByteSpan, ByteStream, PutReceipt, Result,
+    StreamMeta,
+};
 use worker::js_sys::{ArrayBuffer, Object, Promise, Reflect, Uint8Array};
 use worker::wasm_bindgen::prelude::wasm_bindgen;
 use worker::wasm_bindgen::{JsCast, JsValue};
 use worker::wasm_bindgen_futures::JsFuture;
 use worker::web_sys::ReadableStream;
-use worker::{Bucket, Range};
+use worker::{Bucket, FixedLengthStream, Range};
 
 /// R2 range offsets travel as JS numbers (workers-rs panics above this).
 const MAX_SAFE_OFFSET: u64 = (1 << 53) - 1;
@@ -87,6 +99,28 @@ fn custom_metadata(meta: &BlobMeta<'_>) -> HashMap<String, String> {
         ("extent".to_string(), meta.extent.as_str().to_string()),
         ("cipher-sha256".to_string(), hex(meta.cipher_sha256)),
     ])
+}
+
+fn stream_metadata(meta: &StreamMeta<'_>) -> HashMap<String, String> {
+    HashMap::from([
+        ("bucket".to_string(), meta.bucket.as_str().to_string()),
+        ("extent".to_string(), meta.extent.as_str().to_string()),
+    ])
+}
+
+/// The MD5 an etag names: exactly 32 hex digits, or nothing.
+fn etag_md5(etag: &str) -> Option<[u8; 16]> {
+    let raw = etag.as_bytes();
+    if raw.len() != 32 {
+        return None;
+    }
+    let mut out = [0u8; 16];
+    for (i, byte) in out.iter_mut().enumerate() {
+        let hi = char::from(raw[2 * i]).to_digit(16)?;
+        let lo = char::from(raw[2 * i + 1]).to_digit(16)?;
+        *byte = u8::try_from(hi * 16 + lo).ok()?;
+    }
+    Some(out)
 }
 
 /// The R2 range for a non-empty span; refuses offsets R2 cannot address.
@@ -265,6 +299,33 @@ impl BlobStore for R2Blobs {
         Ok(())
     }
 
+    async fn put_stream(
+        &self,
+        key: &str,
+        len: u64,
+        body: ByteStream,
+        meta: &StreamMeta<'_>,
+    ) -> Result<PutReceipt> {
+        // The cause of a failed piece stays with the caller; R2 only has
+        // to see that the stream failed.
+        let pieces = body.map(|piece| piece.map_err(|_| worker::Error::from("stream failed")));
+        let object = self
+            .bucket
+            .put(key, FixedLengthStream::wrap(pieces, len))
+            .custom_metadata(stream_metadata(meta))
+            .execute()
+            .await
+            .map_err(blob_err("put"))?
+            // Absent only for a conditional put, which this is not.
+            .ok_or_else(|| BridgeError::Blob("r2: put returned no object".into()))?;
+        let md5 = etag_md5(&object.etag())
+            .ok_or_else(|| BridgeError::Blob("r2: put returned no md5".into()))?;
+        Ok(PutReceipt {
+            size: object.size(),
+            md5,
+        })
+    }
+
     async fn get(&self, key: &str, span: Option<ByteSpan>) -> Result<Option<Vec<u8>>> {
         let mut req = self.bucket.get(key);
         match span {
@@ -404,6 +465,37 @@ mod tests {
         assert_eq!(m["bucket"], "b_0123456789abcdef");
         assert_eq!(m["extent"], extent.as_str());
         assert_eq!(m["cipher-sha256"], "ab".repeat(32));
+    }
+
+    #[test]
+    fn a_streamed_blob_names_bucket_and_extent_only() {
+        let bucket = BucketId::new("b_0123456789abcdef");
+        let extent = ExtentId::new("e_00112233445566778899aabbccddeeff");
+        let m = stream_metadata(&StreamMeta {
+            bucket: &bucket,
+            extent: &extent,
+        });
+        assert_eq!(m.len(), 2);
+        assert_eq!(m["bucket"], "b_0123456789abcdef");
+        assert_eq!(m["extent"], extent.as_str());
+    }
+
+    #[test]
+    fn an_etag_is_an_md5_only_when_it_is_32_hex_digits() {
+        let md5 = etag_md5("d41d8cd98f00b204e9800998ecf8427e").unwrap();
+        assert_eq!(hex(&md5), "d41d8cd98f00b204e9800998ecf8427e");
+        assert_eq!(etag_md5("D41D8CD98F00B204E9800998ECF8427E"), Some(md5));
+        for bad in [
+            "",
+            "d41d8cd98f00b204e9800998ecf8427",
+            "d41d8cd98f00b204e9800998ecf8427e0",
+            "d41d8cd98f00b204e9800998ecf8427g",
+            "\"d41d8cd98f00b204e9800998ecf842\"",
+            "d41d8cd98f00b204e9800998ecf842-2",
+            "+41d8cd98f00b204e9800998ecf8427e",
+        ] {
+            assert_eq!(etag_md5(bad), None, "{bad}");
+        }
     }
 
     #[test]

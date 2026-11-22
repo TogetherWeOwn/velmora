@@ -12,15 +12,20 @@ use velmora_s3_proto::{
 };
 use zeroize::Zeroizing;
 
+use velmora::rng::SystemRng;
+use velmora_s3_proto::UploadValidator;
+
 use crate::config::{BridgeConfig, Maintenance, REAL_DATA_READY};
-use crate::crypto::unwrap_secret;
-use crate::ingress::IngressError;
-use crate::ports::{BlobStore, Bridge, Catalog, Clock, JobSink, Kek, NntpConnector};
+use crate::crypto::{unwrap_secret, DataKey, ExtentSealer};
+use crate::ingress::{
+    seal_upload, Charge, IngressError, SealedUpload, UploadLengths, UploadReadError,
+};
+use crate::ports::{BlobStore, Bridge, Catalog, Clock, JobSink, Kek, NntpConnector, StreamMeta};
 use crate::recovery::{discard_generation, revocation_recorded, Unpublished};
 use crate::replay::ReplayProbe;
 use crate::types::{
-    Bucket, BucketId, ExtentId, GenerationId, GenerationRow, Job, KeyStatus, OutboxStage, Perm,
-    Precondition, PreconditionError, RespBody, S3Request, S3Response, UnixMs, JOB_VERSION,
+    Body, Bucket, BucketId, ExtentId, GenerationId, GenerationRow, Job, KeyStatus, OutboxStage,
+    Perm, Precondition, PreconditionError, RespBody, S3Request, S3Response, UnixMs, JOB_VERSION,
 };
 
 /// Longest accepted origin-form target: a 1024-byte key with every byte
@@ -871,5 +876,67 @@ pub(super) async fn send_post_jobs<C, B, N, J, K, T>(
     }
     if refused {
         let _ = bridge.catalog.unmark_sent(&jobs, now).await;
+    }
+}
+
+/// Stores one upload body as one extent in the safety store **while the
+/// body arrives**: each chunk is decoded, sealed and handed to the store
+/// as it comes, so sealing runs beside the store's write instead of
+/// before it, and only a window of the body is in memory (charge
+/// [`crate::ingress::ByteBudget::charge_stream`] first).
+///
+/// What holds, as for a body that is read whole and then stored:
+///
+/// - **No blob for a refused body.** The stream's final chunk leaves
+///   only after the validator accepted the whole body
+///   ([`seal_upload`]), and the store keeps nothing of a stream that did
+///   not end whole ([`BlobStore::put_stream`]). The refusal is answered
+///   as it would be before any byte was stored.
+/// - **The stored copy is checked before anything names it.** The store
+///   cannot be told the digest up front, so its own size and MD5 of what
+///   it holds are compared with what was sealed. If they differ the
+///   answer is `500` and the blob stays an unreferenced orphan, as after
+///   a failed catalogue write: a handler never deletes from the safety
+///   store.
+/// - **One attempt.** A store that fails ends the request with `500`
+///   and the client sends the body again.
+///
+/// The extent `blob` names must be newly minted (see [`ExtentSealer`]).
+/// `charge` is the one taken for this body.
+pub(super) async fn store_streamed<B: BlobStore>(
+    safety: &B,
+    body: Body,
+    lengths: UploadLengths,
+    validator: UploadValidator,
+    bdk: &DataKey,
+    blob: StreamMeta<'_>,
+    charge: &Charge,
+) -> Result<SealedUpload, UploadReadError> {
+    let sealer = ExtentSealer::begin(
+        bdk,
+        blob.bucket,
+        blob.extent,
+        lengths.decoded,
+        &mut SystemRng,
+    )
+    .map_err(|_| IngressError::Internal)?;
+    let cipher_size = sealer.cipher_size();
+    let (stream, seal) = seal_upload(body, lengths, validator, sealer, charge)?;
+    let receipt = safety
+        .put_stream(&blob.extent.safety_key(), cipher_size, stream, &blob)
+        .await;
+    match (receipt, seal.outcome()) {
+        // The body was refused: that is the answer, whatever the store
+        // made of the stream that ended in an error.
+        (_, Err(Some(refused))) => Err(refused),
+        (Ok(receipt), Ok(upload))
+            if receipt.size == upload.sealed.cipher_size
+                && receipt.md5 == upload.sealed.cipher_md5 =>
+        {
+            Ok(upload)
+        }
+        // The store failed, stopped reading, or holds other bytes than
+        // were sealed.
+        _ => Err(IngressError::Internal.into()),
     }
 }
