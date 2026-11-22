@@ -1,5 +1,5 @@
 //! One example per call of the contract: the request a caller sends and
-//! the answer velmora gives. A caller's contract tests can build a fake
+//! the answer the plane gives. A caller's contract tests can build a fake
 //! plane from them; this crate's tests parse each body into its type and
 //! back.
 //!

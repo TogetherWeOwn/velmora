@@ -631,6 +631,8 @@ fn the_code_table() {
                 "bad_request",
                 "grant_limits_not_served",
                 "jurisdiction_not_served",
+                "limits_not_served",
+                "rate_class_not_served",
                 "idempotency_key_required",
                 "invalid_position",
             ][..],
@@ -664,6 +666,8 @@ fn the_code_table() {
                 "bucket_already_exists",
                 "bucket_not_empty",
                 "key_limit_reached",
+                "bucket_limit_reached",
+                "upload_limit_reached",
                 "grant_limit_reached",
                 "feed_reset",
                 "deletion_already_requested",
@@ -716,6 +720,8 @@ fn the_kofra_api_mapping() {
         "bad_request",
         "grant_limits_not_served",
         "jurisdiction_not_served",
+        "limits_not_served",
+        "rate_class_not_served",
         "idempotency_key_required",
         "unauthenticated",
         "insufficient_scope",
@@ -743,6 +749,20 @@ fn the_kofra_api_mapping() {
     assert_eq!(m("external_ref_retired"), K::TenancyGone);
     assert_eq!(m("idempotency_key_in_use"), K::IdempotencyKeyInUse);
     assert_eq!(m("cap_reached"), K::Busy);
+    // Absolute limits (AM-73): a 409 of their own, never the retryable
+    // 429, and sign-up pages on each.
+    assert_eq!(m("bucket_limit_reached"), K::BucketLimitReached);
+    assert_eq!(m("upload_limit_reached"), K::UploadLimitReached);
+    assert_eq!(m("key_limit_reached"), K::KeyLimitReached);
+    for c in [
+        Code::BucketLimitReached,
+        Code::UploadLimitReached,
+        Code::KeyLimitReached,
+    ] {
+        assert_eq!(c.status(), 409, "{}", c.as_str());
+        assert!(!c.retry_after(), "{}", c.as_str());
+        assert_eq!(c.tenancy(), TenancyMapping::RetryAndPage, "{}", c.as_str());
+    }
     for c in ["tenant_restoring", "key_moved", "service_unavailable"] {
         assert_eq!(m(c), K::Unavailable, "{c}");
     }
@@ -862,7 +882,7 @@ fn positions_of_the_lists() {
 fn the_code_table_literally() {
     use KofraMapping as K;
     use TenancyMapping as TM;
-    let table: [(&str, u16, bool, KofraMapping, TenancyMapping); 39] = [
+    let table: [(&str, u16, bool, KofraMapping, TenancyMapping); 43] = [
         ("bad_request", 400, false, K::Upstream, TM::RetryAndPage),
         (
             "grant_limits_not_served",
@@ -873,6 +893,20 @@ fn the_code_table_literally() {
         ),
         (
             "jurisdiction_not_served",
+            400,
+            false,
+            K::Upstream,
+            TM::RetryAndPage,
+        ),
+        (
+            "limits_not_served",
+            400,
+            false,
+            K::Upstream,
+            TM::RetryAndPage,
+        ),
+        (
+            "rate_class_not_served",
             400,
             false,
             K::Upstream,
@@ -983,6 +1017,20 @@ fn the_code_table_literally() {
             409,
             false,
             K::KeyLimitReached,
+            TM::RetryAndPage,
+        ),
+        (
+            "bucket_limit_reached",
+            409,
+            false,
+            K::BucketLimitReached,
+            TM::RetryAndPage,
+        ),
+        (
+            "upload_limit_reached",
+            409,
+            false,
+            K::UploadLimitReached,
             TM::RetryAndPage,
         ),
         (
