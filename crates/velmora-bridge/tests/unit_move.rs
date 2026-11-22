@@ -601,6 +601,31 @@ fn a_move_report_lifts_only_under_the_imports_binding() {
         refusal(&open_move(&u, rid(S, 0, "m2"), moving(11))),
         gate_refused(GateRefusal::NotRestoring)
     );
+    // The lift used the seal up: under a later entry (a restore of the
+    // owner's unit), the window's head opens no move report, and only the
+    // restore gate can lift.
+    let later = S + 5;
+    ok(sync_to(&u, later, Some(later), None));
+    assert_eq!(
+        refusal(&open_move(&u, rid(later, 0, "m3"), moving(11))),
+        gate_refused(GateRefusal::MoveNotBound)
+    );
+    let r = rid(later, 2, "r1");
+    raise_stamp(&u, 2);
+    ok(worker(
+        &u,
+        UnitOp::GateOpen {
+            replay_id: r.clone(),
+        },
+    ));
+    ok(worker(
+        &u,
+        UnitOp::GateReport {
+            replay_id: r.clone(),
+            summary: empty_summary(),
+        },
+    ));
+    assert_eq!(proof(&u).replay_id, r);
 }
 
 #[test]
@@ -631,24 +656,30 @@ fn a_raise_between_the_report_and_the_lift_re_enters_under_a_new_entry() {
     ok(sync_to(&u, s2, Some(s2), None));
     // The old report names the old entry.
     assert_eq!(status(&u)["lift"]["refused"], json!("no_report"));
-    // The seal survives; the import's own binding (the first S) does not
-    // take a batch under the new entry.
-    let b = numbered(
-        &u,
-        UnitOp::Import {
-            head: moving(12),
-            since: s2,
-            batch: batch(
-                ImportTable::Objects,
-                Some("c1"),
-                "c2",
-                vec![object_row("z")],
-            ),
-        },
-    );
+    // The seal survives: a resumed copy is told the import is done, under
+    // either entry.
+    for since in [S, s2] {
+        let b = numbered(
+            &u,
+            UnitOp::Import {
+                head: moving(12),
+                since,
+                batch: batch(
+                    ImportTable::Objects,
+                    Some("c1"),
+                    "c2",
+                    vec![object_row("z")],
+                ),
+            },
+        );
+        assert_eq!(
+            refusal(&b),
+            Some((Refused::Import(ImportRefusal::Sealed), false))
+        );
+    }
     assert_eq!(
-        refusal(&b),
-        Some((Refused::Import(ImportRefusal::NotBound), true))
+        ok(worker(&u, UnitOp::ImportProgress {}))["sealed"],
+        json!(F + 1)
     );
     let second = rid(s2, 1, "m2");
     assert_eq!(
@@ -697,6 +728,53 @@ fn a_move_import_that_is_not_sealed_never_lifts() {
         gate_refused(GateRefusal::ImportNotSealed)
     );
     assert_eq!(u.head().unwrap().restoring_since, Some(S));
+    // The rule binds the move's own entry: under a later entry (a
+    // restore), the gate's report decides.
+    let later = S + 3;
+    ok(sync_to(&u, later, Some(later), None));
+    let r = rid(later, 3, "r2");
+    ok(worker(
+        &u,
+        UnitOp::GateOpen {
+            replay_id: r.clone(),
+        },
+    ));
+    ok(worker(
+        &u,
+        UnitOp::GateReport {
+            replay_id: r.clone(),
+            summary: empty_summary(),
+        },
+    ));
+    assert_eq!(proof(&u).replay_id, r);
+}
+
+#[test]
+fn an_imported_key_must_be_of_its_columns_class() {
+    let u = closed_for_the_move();
+    fill(&u, &[]);
+    let mut null_id = bucket_row(B1, "x", P);
+    null_id[0] = N;
+    let mut blob_id = bucket_row(B1, "x", P);
+    blob_id[0] = b(4);
+    let text_seq = vec![t(G), t("1"), N, i(0)];
+    for (table, row) in [
+        (ImportTable::Buckets, null_id),
+        (ImportTable::Buckets, blob_id),
+        (ImportTable::GenerationExtents, text_seq),
+        (ImportTable::Objects, vec![t(B1), i(7), t(G)]),
+    ] {
+        let after = match table {
+            ImportTable::Buckets => Some("c1"),
+            _ => None,
+        };
+        let a = import(&u, batch(table, after, "c9", vec![row]));
+        assert_eq!(
+            refusal(&a),
+            Some((Refused::Import(ImportRefusal::Shape), false)),
+            "{table:?}"
+        );
+    }
 }
 
 #[test]

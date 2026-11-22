@@ -494,7 +494,7 @@ fn move_bound<S: Sql>(
     managed_root: bool,
     id: &ReplayId,
 ) -> Result<std::result::Result<u64, GateRefusal>> {
-    if !managed_root {
+    if !managed_root || super::import::move_lifted(sql)? {
         return Ok(Err(GateRefusal::MoveNotBound));
     }
     let Some(move_ordinal) = super::import::sealed(sql)? else {
@@ -627,6 +627,16 @@ pub fn ack<S: Sql>(
     Ok(Ok(()))
 }
 
+/// After the lift check passed, in the `sync` that clears the entry: a
+/// `move` report uses the seal up (no other `move` report is taken), and
+/// the report is forgotten.
+pub fn lifted<S: Sql>(sql: &S) -> Result<()> {
+    if stored(sql)?.is_some_and(|r| r.kind == ReportKind::Move) {
+        super::import::mark_move_lifted(sql)?;
+    }
+    clear(sql)
+}
+
 /// Forgets the report, its blocker ids and its acknowledgements.
 pub fn clear<S: Sql>(sql: &S) -> Result<()> {
     poll_once(sql.exec("DELETE FROM unit_gate_acks", &[]))??;
@@ -653,9 +663,10 @@ pub fn check<S: Sql>(
     if id.since != since {
         return Ok(Err(GateRefusal::NoReport));
     }
-    // A move's import that is not sealed keeps the unit closed, whatever
-    // the report: a partial import is never lifted.
-    if super::import::started(sql)? && super::import::sealed(sql)?.is_none() {
+    // A move's import that is not sealed keeps the move's entry closed,
+    // whatever the report: a partial import is never lifted. (A later
+    // entry, a restore's, is the gate's to judge.)
+    if super::import::import_since(sql)? == Some(since) && super::import::sealed(sql)?.is_none() {
         return Ok(Err(GateRefusal::ImportNotSealed));
     }
     match kind {

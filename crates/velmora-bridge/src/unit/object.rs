@@ -877,6 +877,11 @@ impl<S: UnitSql> Unit<S> {
         if let Some(answer) = self.move_numbers(call, head) {
             return Ok(answer);
         }
+        // A sealed import takes no batch, under any entry: its own code,
+        // so a resumed copy knows the import is done (AM-29).
+        if import::sealed(self.sql())?.is_some() {
+            return Ok(refused(Refused::Import(ImportRefusal::Sealed), false));
+        }
         if !import::bound_to_move(
             &self.own.tenant,
             self.own.unit,
@@ -1062,7 +1067,7 @@ impl<S: UnitSql> Unit<S> {
                     why = Some(r);
                     return Err(BridgeError::Invalid(ROLLBACK));
                 }
-                lift::clear(sql)?;
+                lift::lifted(sql)?;
             }
             let n = poll_once(sql.exec(
                 "UPDATE unit_head SET state_seq = ?1, tenant_state = ?2, tenant_mode = ?3, \

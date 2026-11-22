@@ -167,9 +167,13 @@ numbered as a batch, and names every import table once with the rows the
 unit took (0 for a table without a batch); a count that is not the
 unit's refuses it, so a lost batch is found. It records
 `move_ordinal` = tenant 0's `flips + 1` (the head carries `flips`), and
-from then on no batch is taken, not even the last one sent again. The
-seal survives a new `restoring` entry; `deleteAll()` clears it. While a
-move's import is not sealed, no lift passes, whatever the report.
+from then on no batch is taken, not even the last one sent again, under
+any entry: the refusal is its own code, `sealed`, so a resumed copy knows
+the import is done. The seal survives a new `restoring` entry;
+`deleteAll()` clears it. While a move's import is not sealed, the move's
+entry is not lifted, whatever the report. Every imported key value must
+be of its column's class (text, or integer where declared), so the unit
+never holds a key that `export` cannot page after.
 
 In a unit, every `tenant_id` column (such as
 `upload_part_extents.tenant_id`) is a legacy default and is not
@@ -331,7 +335,10 @@ summary but a complete, empty one. The lift check reads the binding the
 unit holds again (root unit, seal, stamp counter, empty summary). If a
 stamp raise lands between the report and the lift record, the `sync` is
 refused; the tool writes a new `restoring` entry, syncs the unit to it,
-and opens a new report under it. No other kind of lift exists.
+and opens a new report under it. The lift a `move` report passes uses the
+seal up: no other `move` report is taken after it, so a later entry (a
+restore of the owner's unit) is lifted only by the restore gate. No other
+kind of lift exists.
 
 A unit born from a `restore` token cannot lift until `recount` (AM-27)
 turns its counters on; that call is not built yet.

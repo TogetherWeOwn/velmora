@@ -514,11 +514,11 @@ pub fn apply<S: Sql>(
     head: &MoveHead,
     batch: &ImportBatch,
 ) -> Result<Imported> {
-    if !move_seq_ok(sql, since, head.seq)? {
-        return Ok(Imported::Refused(ImportRefusal::NotBound));
-    }
     if sealed(sql)?.is_some() {
         return Ok(Imported::Refused(ImportRefusal::Sealed));
+    }
+    if !move_seq_ok(sql, since, head.seq)? {
+        return Ok(Imported::Refused(ImportRefusal::NotBound));
     }
     let t = batch.table;
     let want = t.columns();
@@ -651,13 +651,39 @@ pub fn sealed<S: Sql>(sql: &S) -> Result<Option<u64>> {
     }
 }
 
-/// Whether an import was ever bound to this unit (a batch or a finish).
-pub fn started<S: Sql>(sql: &S) -> Result<bool> {
-    let rows = poll_once(sql.query("SELECT count(*) FROM unit_import_move WHERE id = 1", &[]))??;
-    Ok(matches!(
-        rows.first().and_then(|r| r.first()),
-        Some(SqlValue::Int(1))
-    ))
+/// The `since_seq` of the entry the import filled (its first S), if an
+/// import was ever bound to this unit.
+pub fn import_since<S: Sql>(sql: &S) -> Result<Option<u64>> {
+    let rows = poll_once(sql.query("SELECT since_seq FROM unit_import_move WHERE id = 1", &[]))??;
+    match rows.first().and_then(|r| r.first()) {
+        None => Ok(None),
+        Some(SqlValue::Int(n)) => u64::try_from(*n)
+            .map(Some)
+            .map_err(|_| decode("unit_import_move since_seq")),
+        Some(_) => Err(decode("unit_import_move since_seq")),
+    }
+}
+
+/// Whether a `move` report has lifted this unit (the seal is used up).
+pub fn move_lifted<S: Sql>(sql: &S) -> Result<bool> {
+    let rows = poll_once(sql.query("SELECT move_lifted FROM unit_import_move WHERE id = 1", &[]))??;
+    match rows.first().and_then(|r| r.first()) {
+        None => Ok(false),
+        Some(SqlValue::Int(n)) => Ok(*n == 1),
+        Some(_) => Err(decode("unit_import_move move_lifted")),
+    }
+}
+
+/// Uses the seal up: called in the `sync` that a `move` report lifted.
+pub fn mark_move_lifted<S: Sql>(sql: &S) -> Result<()> {
+    let n = poll_once(sql.exec(
+        "UPDATE unit_import_move SET move_lifted = 1 WHERE id = 1 AND final = 1",
+        &[],
+    ))??;
+    if n != 1 {
+        return Err(decode("unit_import_move seal"));
+    }
+    Ok(())
 }
 
 /// The newest tenant-0 head seq the import was bound to, if any.
@@ -739,6 +765,12 @@ fn move_seq_ok<S: Sql>(sql: &S, since: u64, t0_seq: u64) -> Result<bool> {
 /// here.
 fn params(t: ImportTable, row: &[ImportValue]) -> Result<Option<Vec<SqlValue>>> {
     let col = |name: &str| t.columns().iter().position(|c| *c == name).map(|i| &row[i]);
+    // Every key value of its column's class: the unit never holds a key
+    // that `export` cannot page after (a null, a blob, or the other class).
+    let table = super::export::ExportTable::Data(t);
+    if !table.is_key(&super::export::key_of(table, row)) {
+        return Ok(None);
+    }
     match t {
         // Leases are cleared before the window (P11); a leased row would
         // hand a job to a holder that no longer exists.
