@@ -14,6 +14,11 @@
 //!   now ([`after_renew`]). The next run does the due work, **the day
 //!   close first**.
 //!
+//! - **A stamp raise is handed out only under a lease with at least half
+//!   of T left.** Its consumer reaches the unit later; under a lease that
+//!   runs out first it would be refused, and nothing would be due to ask
+//!   again. With less left the alarm sends one `renew` instead, and the
+//!   raise follows the renewal.
 //! - **A closed unit runs nothing and asks for nothing.** A unit that is
 //!   `restoring`, behind its stamp, or `UNBORN` refuses `renew` (§8.6
 //!   step 2), so a renew job would only be refused; the restore gate's
@@ -32,7 +37,7 @@
 
 use crate::types::UnixMs;
 
-use super::lease::{FreshLease, LeaseRules};
+use super::lease::{Admit, FreshLease, LeaseRules};
 
 /// The work an alarm run hands out, in the order it runs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -208,12 +213,38 @@ pub fn on_alarm(
             retry_at: None,
         };
     }
-    if unit.lease.is_fresh(now, lease_rules) {
-        return AlarmRun {
-            run: due,
-            send_renew: false,
-            retry_at: None,
-        };
+    match unit.lease.admit(now, lease_rules) {
+        Admit::Fresh {
+            renew_soon: false, ..
+        } => {
+            return AlarmRun {
+                run: due,
+                send_renew: false,
+                retry_at: None,
+            }
+        }
+        // Less than half of T left: the stamp raise is not handed out,
+        // because its consumer may reach the unit after the lease ran out
+        // and be refused, with nothing left due to ask again. A renewal
+        // goes first; once it lands the raise is due at once
+        // (`after_renew`). Other duties run.
+        Admit::Fresh {
+            renew_soon: true, ..
+        } => {
+            let run: Vec<Duty> = due.into_iter().filter(|d| *d != Duty::StampRaise).collect();
+            let waits = run.len() < dues.due_at(now).len();
+            return AlarmRun {
+                run,
+                send_renew: waits,
+                retry_at: waits.then(|| {
+                    UnixMs(
+                        now.0
+                            .saturating_add(renew_retry_ms(unit.renew_tries, rules)),
+                    )
+                }),
+            };
+        }
+        Admit::RenewNeeded => {}
     }
     AlarmRun {
         run: Vec::new(),
@@ -265,11 +296,14 @@ pub fn next_alarm(
     }
     let earliest = dues.earliest()?;
     let gap = if unit.lease.is_fresh(now, lease_rules) {
-        // Work that keeps failing backs off like a renewal does.
-        match unit.failed_runs {
+        // Work that keeps failing backs off like a renewal does, and a
+        // renewal asked for under a lease that is running low waits for
+        // its retry.
+        let failing = match unit.failed_runs {
             0 => MIN_ALARM_GAP_MS,
             n => renew_retry_ms(n - 1, rules),
-        }
+        };
+        failing.max(retry_at.map_or(0, |at| at.0.saturating_sub(now.0)))
     } else {
         retry_at.map_or_else(
             || renew_retry_ms(unit.renew_tries, rules),

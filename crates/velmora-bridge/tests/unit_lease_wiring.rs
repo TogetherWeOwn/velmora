@@ -193,7 +193,8 @@ fn changes(u: &Unit<RusqliteSql>) -> u64 {
 }
 
 fn lease_row(u: &Unit<RusqliteSql>) -> store::LeaseRow {
-    store::read(u.sql()).unwrap().expect("the lease table")
+    assert!(store::present(u.sql()).unwrap(), "the lease's tables");
+    store::read(u.sql()).unwrap()
 }
 
 fn renew_needed(why: Option<LeaseRefusal>) -> impl Fn(&UnitAnswer) -> bool {
@@ -759,11 +760,123 @@ fn a_failed_send_keeps_the_work_due_and_backs_off() {
     assert_eq!(row.first_write_at, Some(NOW), "still due");
     assert_eq!(row.failed_runs, 1);
     assert!(next.0 >= due.0 + MIN_ALARM_GAP_MS);
-    // A run in which everything was sent resets the count.
+    // A run in which everything was sent resets the count (renewed
+    // first: by now less than half of T is left).
+    assert!(matches!(renew(&u, next), UnitAnswer::Ok { .. }));
     let step = u.alarm(next).unwrap();
     assert!(step.raise);
     u.alarm_done(next, &step, false).unwrap();
-    assert_eq!(lease_row(&u).failed_runs, 0);
+    let row = lease_row(&u);
+    assert_eq!((row.failed_runs, row.first_write_at), (0, None));
+}
+
+/// The raise is handed out only while half of T is left: its consumer
+/// reaches the unit later, and a refused raise would never be asked for
+/// again. With less left the alarm renews first.
+#[test]
+fn a_raise_waits_for_a_renewal_when_the_lease_runs_low() {
+    let u = fresh();
+    let write = UnixMs(NOW.0 + 60_000);
+    assert!(matches!(
+        request(&u, true, read_plan(), write),
+        UnitAnswer::Ok { .. }
+    ));
+    let due = UnixMs(write.0 + PERIOD);
+    let step = u.alarm(due).unwrap();
+    assert!(!step.raise);
+    assert_eq!(step.jobs, vec![job_text(UnitJobKind::Renew, &u, due)]);
+    let next = u.alarm_done(due, &step, false).unwrap().unwrap();
+    assert_eq!(next.0, due.0 + AlarmRules::DEFAULT.renew_retry_ms);
+    assert_eq!(lease_row(&u).first_write_at, Some(write), "still due");
+    let _ = u.take_wake();
+    assert!(matches!(renew(&u, due), UnitAnswer::Ok { .. }));
+    assert_eq!(u.take_wake(), Some(due));
+    let step = u.alarm(due).unwrap();
+    assert_eq!(step.jobs, vec![job_text(UnitJobKind::StampRaise, &u, due)]);
+}
+
+/// A write while the raise is being sent is pending a raise of its own,
+/// and a renewal during the sends does not count as a failed try.
+#[test]
+fn what_happens_during_the_sends_is_kept() {
+    let u = fresh();
+    assert!(matches!(
+        request(&u, true, read_plan(), NOW),
+        UnitAnswer::Ok { .. }
+    ));
+    let due = UnixMs(NOW.0 + PERIOD);
+    let step = u.alarm(due).unwrap();
+    assert!(step.raise);
+    let during = UnixMs(due.0 + 10);
+    assert!(matches!(
+        request(&u, true, read_plan(), during),
+        UnitAnswer::Ok { .. }
+    ));
+    assert_eq!(
+        u.alarm_done(during, &step, false).unwrap(),
+        Some(UnixMs(during.0 + PERIOD))
+    );
+    assert_eq!(lease_row(&u).first_write_at, Some(during));
+
+    // The renew the alarm sends lands before the run is recorded.
+    let late = UnixMs(during.0 + PERIOD + 1);
+    assert!(late.0 > NOW.0 + T, "the lease has run out");
+    let step = u.alarm(late).unwrap();
+    assert!(step.run.send_renew);
+    assert!(matches!(renew(&u, late), UnitAnswer::Ok { .. }));
+    u.alarm_done(late, &step, false).unwrap();
+    assert_eq!(lease_row(&u).renew_tries, 0);
+}
+
+/// A principal is not a key: `m/rk/` never names one, so a revoked
+/// principal must not raise the count the proof compares with.
+#[test]
+fn a_revoked_principal_is_not_counted() {
+    let u = born();
+    let mut gone = principal(1);
+    gone.status = SubjectStatus::Revoked;
+    assert!(matches!(
+        worker(
+            &u,
+            UnitOp::ApplyKeys {
+                from_seq: 0,
+                entries: vec![gone]
+            },
+            NOW
+        ),
+        UnitAnswer::Ok { .. }
+    ));
+    assert_eq!(status_of(&u, P), "revoked");
+    assert_eq!(store::revoked(u.sql()).unwrap(), Some(0));
+    assert!(matches!(sync(&u, 3, None, NOW), UnitAnswer::Ok { .. }));
+    assert!(matches!(
+        worker(&u, renew_op(NOW, proven(&u, 0), &[]), NOW),
+        UnitAnswer::Ok { .. }
+    ));
+}
+
+/// The alarm sends each job as a JavaScript object parsed from its JSON
+/// text. A `serde_json::Value` given to the SDK's `MessageBuilder` goes
+/// through `serde_wasm_bindgen`, which makes a map of it, and a map is
+/// sent as `{}`.
+#[test]
+fn the_alarm_sends_raw_parsed_json() {
+    let src = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../workers/unit/src/alarm.rs"
+    ))
+    .unwrap();
+    assert!(src.contains("js_sys::JSON::parse(text)"));
+    assert!(src.contains(".send_raw("));
+    for (n, line) in src.lines().enumerate() {
+        assert!(
+            !line
+                .replace("RawMessageBuilder", "")
+                .contains("MessageBuilder"),
+            "alarm.rs:{}: {line}",
+            n + 1
+        );
+    }
 }
 
 #[test]

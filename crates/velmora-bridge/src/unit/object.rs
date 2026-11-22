@@ -124,6 +124,12 @@ pub struct AlarmStep {
     pub jobs: Vec<String>,
     /// The stamp raise is among them.
     pub raise: bool,
+    /// The first write the raise covers: handed out before the send, and
+    /// pending again if the send fails.
+    pub raised_from: Option<UnixMs>,
+    /// The lease when the run was planned: a renewal that lands during
+    /// the sends is not counted as one more failed try.
+    pub planned_lease: Option<UnixMs>,
 }
 
 /// One unit over its database.
@@ -139,6 +145,8 @@ pub struct Unit<S: UnitSql> {
     /// The earliest time a call of this wake asked the alarm to be armed
     /// for; the object class takes it after the call ([`Unit::take_wake`]).
     wake: Cell<Option<UnixMs>>,
+    /// Whether the lease's tables exist, looked up once per call.
+    tables: Cell<Option<bool>>,
 }
 
 impl<S: UnitSql> Unit<S> {
@@ -155,6 +163,7 @@ impl<S: UnitSql> Unit<S> {
             lease_rules: LeaseRules::DEFAULT,
             alarm_rules: AlarmRules::DEFAULT,
             wake: Cell::new(None),
+            tables: Cell::new(None),
         }
     }
 
@@ -211,6 +220,7 @@ impl<S: UnitSql> Unit<S> {
     /// One call. Never panics on a caller's input; a failure of the
     /// database is [`UnitAnswer::Failed`] with a class only.
     pub fn handle(&self, call: &UnitCall, now: UnixMs) -> UnitAnswer {
+        self.tables.set(None);
         match self.dispatch(call, now) {
             Ok(answer) => answer,
             Err(e) => failed(&e),
@@ -254,13 +264,38 @@ impl<S: UnitSql> Unit<S> {
             Admit::Fresh { left_ms, .. } => u64::try_from(left_ms).unwrap_or(0),
             Admit::RenewNeeded => 0,
         };
-        Ok((left, store::revoked(self.sql())?))
+        let revoked = if self.has_tables()? {
+            store::revoked(self.sql())?
+        } else {
+            None
+        };
+        Ok((left, revoked))
     }
 
-    /// The lease at `now`. No lease table (a unit born before `u0002`)
-    /// reads as expired: such a unit is never served (fail closed).
+    /// Whether the unit has the lease's tables ([`store::present`]), as
+    /// looked up once in this call.
+    fn has_tables(&self) -> Result<bool> {
+        if let Some(known) = self.tables.get() {
+            return Ok(known);
+        }
+        let known = store::present(self.sql())?;
+        self.tables.set(Some(known));
+        Ok(known)
+    }
+
+    /// The lease row; `None` without the lease's tables (a unit born
+    /// before `u0002`).
+    fn lease_row(&self) -> Result<Option<store::LeaseRow>> {
+        if !self.has_tables()? {
+            return Ok(None);
+        }
+        store::read(self.sql()).map(Some)
+    }
+
+    /// The lease at `now`. No lease table reads as expired: such a unit is
+    /// never served (fail closed).
     fn lease_at(&self, now: UnixMs) -> Result<Admit> {
-        Ok(match store::read(self.sql())? {
+        Ok(match self.lease_row()? {
             Some(row) => row.lease().admit(now, &self.lease_rules),
             None => Admit::RenewNeeded,
         })
@@ -862,6 +897,7 @@ impl<S: UnitSql> Unit<S> {
     /// ([`restore::drive`]). Every other call is answered as by
     /// [`Unit::handle`].
     pub fn pitr_step(&self, call: &UnitCall, now: UnixMs) -> PitrStep {
+        self.tables.set(None);
         match self.pitr_checks(call, now) {
             Ok(step) => step,
             Err(e) => PitrStep::Answer(failed(&e)),
@@ -991,7 +1027,11 @@ impl<S: UnitSql> Unit<S> {
                     Ok(Ok(json!({
                         "applied": applied,
                         "skipped": skipped,
-                        "revoked": store::revoked(sql)?.unwrap_or(0),
+                        "revoked": if self.has_tables()? {
+                            store::revoked(sql)?.unwrap_or(0)
+                        } else {
+                            0
+                        },
                     })))
                 }
             }
@@ -1122,7 +1162,7 @@ impl<S: UnitSql> Unit<S> {
             }
             // The close of §8.6 step 2: a `restoring` entry ends the
             // lease at once (`lease_hi` is kept for the restore's wait).
-            if next.restoring_since.is_some() && store::read(sql)?.is_some() {
+            if next.restoring_since.is_some() && self.has_tables()? {
                 store::close(sql)?;
             }
             let n = poll_once(sql.exec(
@@ -1188,7 +1228,7 @@ impl<S: UnitSql> Unit<S> {
             return no(LeaseRefusal::Restoring);
         }
         let sql = self.sql();
-        let Some(row) = store::read(sql)? else {
+        let Some(row) = self.lease_row()? else {
             return no(LeaseRefusal::NoLeaseTable);
         };
         let stamp_id = super::jobcall::stamp_id(&self.own);
@@ -1235,9 +1275,8 @@ impl<S: UnitSql> Unit<S> {
         match outcome.ok_or(BridgeError::Invalid("renew without an outcome"))? {
             Ok(until) => {
                 // Work that waited for the renewal runs at once (RD-9).
-                if let Some(after) = store::read(sql)? {
-                    self.want_wake(alarm::after_renew(now, &self.dues(&after)));
-                }
+                let after = store::read(sql)?;
+                self.want_wake(alarm::after_renew(now, &self.dues(&after)));
                 Ok(UnitAnswer::Ok {
                     seqs: head.seqs,
                     body: json!({ "fresh_until": until.0, "applied": applied }),
@@ -1281,12 +1320,15 @@ impl<S: UnitSql> Unit<S> {
             },
             jobs: Vec::new(),
             raise: false,
+            raised_from: None,
+            planned_lease: None,
         };
+        self.tables.set(None);
         match self.born()? {
             Some(cert) if cert == self.own => {}
             _ => return Ok(idle),
         }
-        let Some(row) = store::read(self.sql())? else {
+        let Some(row) = self.lease_row()? else {
             return Ok(idle);
         };
         let head = self.head()?;
@@ -1316,12 +1358,26 @@ impl<S: UnitSql> Unit<S> {
         if run.send_renew {
             jobs.push(job::message(UnitJobKind::Renew, &self.own, head.seqs, now));
         }
+        let jobs = jobs
+            .into_iter()
+            .collect::<Option<Vec<_>>>()
+            .unwrap_or_default();
+        // The raise is handed out before the send: a write during the
+        // send is then pending a raise of its own.
+        let mut raised_from = None;
+        if raise && !jobs.is_empty() {
+            let sql = self.sql();
+            let mut take = || {
+                raised_from = store::take_first_write(sql)?;
+                Ok(())
+            };
+            sql.atomically(&mut take)?;
+        }
         Ok(AlarmStep {
-            jobs: jobs
-                .into_iter()
-                .collect::<Option<Vec<_>>>()
-                .unwrap_or_default(),
+            jobs,
             raise,
+            raised_from,
+            planned_lease: row.fresh_until,
             run,
         })
     }
@@ -1338,6 +1394,7 @@ impl<S: UnitSql> Unit<S> {
         step: &AlarmStep,
         failed: bool,
     ) -> Result<Option<UnixMs>> {
+        self.tables.set(None);
         if step.run.run.is_empty() && !step.run.send_renew {
             // Woken for nothing: arm what is due, if anything.
             return self.alarm_next(now, None);
@@ -1345,18 +1402,26 @@ impl<S: UnitSql> Unit<S> {
         let failed =
             failed || step.jobs.len() != step.run.run.len() + usize::from(step.run.send_renew);
         let sql = self.sql();
-        let mut run = || store::alarm_ran(sql, step.run.send_renew, step.raise && !failed, failed);
+        let mut run = || {
+            if failed {
+                if let Some(at) = step.raised_from {
+                    store::raise_failed(sql, at)?;
+                }
+            }
+            store::alarm_ran(sql, step.run.send_renew, step.planned_lease, failed)
+        };
         sql.atomically(&mut run)?;
         self.alarm_next(now, step.run.retry_at)
     }
 
     fn alarm_next(&self, now: UnixMs, retry_at: Option<UnixMs>) -> Result<Option<UnixMs>> {
-        let Some(row) = store::read(self.sql())? else {
+        match self.born()? {
+            Some(cert) if cert == self.own => {}
+            _ => return Ok(None),
+        }
+        let Some(row) = self.lease_row()? else {
             return Ok(None);
         };
-        if self.born()?.is_none() {
-            return Ok(None);
-        }
         let head = self.head()?;
         let lease = row.lease();
         let closed = self.closed(&head)?;

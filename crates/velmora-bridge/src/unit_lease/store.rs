@@ -5,15 +5,18 @@
 //! marked database. They only read and write the unit's SQLite: no I/O
 //! (rule 4), every future is polled once.
 //!
-//! - [`read`]: the lease row, `None` when the unit has no lease table (a
-//!   unit born before `u0002`): its lease is not known, so it is treated
-//!   as expired and its `renew` fails (fail closed).
+//! - [`present`]: whether the unit has the lease's tables (and its key
+//!   table). A unit born before `u0002` has not: its lease is not known,
+//!   so it is treated as expired and its `renew` fails (fail closed). The
+//!   unit asks once per call; the functions below assume the tables.
+//! - [`read`]: the lease row.
 //! - [`renewed`], [`close`]: the two moves of `fresh_until`. `lease_hi`
 //!   only grows, and a close keeps it (AM-2 check 3).
 //! - [`note_write`]: the first write since the last stamp raise the alarm
 //!   asked for (the due time of [`super::alarm::Duty::StampRaise`]).
 //! - [`revoked`]: the revoked keys the unit holds, counted once per id:
-//!   revoked key rows and listed ids it holds no row for. This is the
+//!   revoked key rows (not principals: `m/rk/` names access keys only) and
+//!   listed ids it holds no row for. This is the
 //!   number every answer carries and the renewal proof compares with the
 //!   listing of `m/rk/<t>/` (SEC-6).
 //! - [`revoke_listed`]: applies the ids a renewal listed: a key row is
@@ -70,14 +73,17 @@ fn decode(what: &'static str) -> BridgeError {
     BridgeError::Sql(format!("unit: row decode: {what}"))
 }
 
-fn has_table<S: Sql>(sql: &S, name: &str) -> Result<bool> {
+/// Whether the unit has `unit_lease`, `unit_revoked_ids` and `unit_keys`
+/// (one look at the schema).
+pub fn present<S: Sql>(sql: &S) -> Result<bool> {
     let rows = poll_once(sql.query(
-        "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
-        &[SqlValue::Text(name.into())],
+        "SELECT count(*) FROM sqlite_master WHERE type = 'table' \
+           AND name IN ('unit_lease', 'unit_revoked_ids', 'unit_keys')",
+        &[],
     ))??;
     Ok(matches!(
         rows.first().and_then(|r| r.first()),
-        Some(SqlValue::Int(1))
+        Some(SqlValue::Int(3))
     ))
 }
 
@@ -96,30 +102,27 @@ fn count(v: &SqlValue) -> Result<u32> {
     }
 }
 
-/// The lease row. `None` = no lease table: a unit born before `u0002`.
-/// A table without its row reads as a lease never issued.
-pub fn read<S: Sql>(sql: &S) -> Result<Option<LeaseRow>> {
-    if !has_table(sql, "unit_lease")? {
-        return Ok(None);
-    }
+/// The lease row ([`present`] first). A table without its row reads as
+/// a lease never issued.
+pub fn read<S: Sql>(sql: &S) -> Result<LeaseRow> {
     let rows = poll_once(sql.query(
         "SELECT fresh_until, lease_hi, renew_tries, failed_runs, first_write_at \
            FROM unit_lease WHERE id = 1",
         &[],
     ))??;
     let Some(r) = rows.first() else {
-        return Ok(Some(LeaseRow::default()));
+        return Ok(LeaseRow::default());
     };
     if r.len() != 5 {
         return Err(decode("unit_lease"));
     }
-    Ok(Some(LeaseRow {
+    Ok(LeaseRow {
         fresh_until: time(&r[0])?,
         lease_hi: time(&r[1])?,
         renew_tries: count(&r[2])?,
         failed_runs: count(&r[3])?,
         first_write_at: time(&r[4])?,
-    }))
+    })
 }
 
 fn write_one<S: Sql>(sql: &S, stmt: &str, params: &[SqlValue]) -> Result<()> {
@@ -167,35 +170,64 @@ pub fn note_write<S: Sql>(sql: &S, now: UnixMs) -> Result<bool> {
     Ok(n == 1)
 }
 
-/// What one alarm run did, as the row keeps it: a renew job sent (one
-/// more try), the stamp raise asked for (no write since), a duty that
-/// failed (one more failed run) or none (reset).
-pub fn alarm_ran<S: Sql>(sql: &S, sent_renew: bool, raised: bool, failed: bool) -> Result<()> {
+/// The alarm hands out the stamp raise: no write is pending a raise any
+/// more. Answers the first write it covers, for [`raise_failed`].
+pub fn take_first_write<S: Sql>(sql: &S) -> Result<Option<UnixMs>> {
+    let row = read(sql)?;
+    write_one(
+        sql,
+        "UPDATE unit_lease SET first_write_at = NULL WHERE id = 1",
+        &[],
+    )?;
+    Ok(row.first_write_at)
+}
+
+/// The raise handed out by [`take_first_write`] was not sent: the writes
+/// it covered are pending again, from the earlier of `at` and a write
+/// that came meanwhile.
+pub fn raise_failed<S: Sql>(sql: &S, at: UnixMs) -> Result<()> {
+    write_one(
+        sql,
+        "UPDATE unit_lease SET first_write_at = \
+           CASE WHEN first_write_at IS NULL OR first_write_at > ?1 THEN ?1 \
+                ELSE first_write_at END WHERE id = 1",
+        &[SqlValue::Int(at.0)],
+    )
+}
+
+/// What one alarm run did, as the row keeps it: a renew job sent counts
+/// one more try unless a renewal landed since the run was planned (the
+/// lease is no longer `planned_lease`); a duty that failed counts one more
+/// failed run, a run without one resets the count.
+pub fn alarm_ran<S: Sql>(
+    sql: &S,
+    sent_renew: bool,
+    planned_lease: Option<UnixMs>,
+    failed: bool,
+) -> Result<()> {
     write_one(
         sql,
         "UPDATE unit_lease SET \
-           renew_tries = renew_tries + ?1, \
-           first_write_at = CASE WHEN ?2 = 1 THEN NULL ELSE first_write_at END, \
+           renew_tries = renew_tries + CASE WHEN ?1 = 1 AND fresh_until IS ?2 THEN 1 ELSE 0 END, \
            failed_runs = CASE WHEN ?3 = 1 THEN failed_runs + 1 ELSE 0 END \
          WHERE id = 1",
         &[
             SqlValue::Int(i64::from(sent_renew)),
-            SqlValue::Int(i64::from(raised)),
+            planned_lease.map_or(SqlValue::Null, |t| SqlValue::Int(t.0)),
             SqlValue::Int(i64::from(failed)),
         ],
     )
 }
 
 /// The revoked keys the unit holds, each id once: key rows that are
-/// `revoked`, and listed ids without a row. `None` = the unit holds no
-/// key and no listed id (its answers carry no `revoked`).
+/// `revoked` (a principal is not a key: `m/rk/` never names one, so
+/// counting it would make every renewal short), and listed ids without a
+/// row. `None` = the unit holds no key and no listed id (its answers
+/// carry no `revoked`). [`present`] first.
 pub fn revoked<S: Sql>(sql: &S) -> Result<Option<u64>> {
-    if !has_table(sql, "unit_revoked_ids")? || !has_table(sql, "unit_keys")? {
-        return Ok(None);
-    }
     let rows = poll_once(sql.query(
         "SELECT (SELECT count(*) FROM ( \
-                   SELECT id FROM unit_keys WHERE status = 'revoked' \
+                   SELECT id FROM unit_keys WHERE status = 'revoked' AND kind <> 'principal' \
                    UNION SELECT id FROM unit_revoked_ids)), \
                 EXISTS (SELECT 1 FROM unit_keys) OR EXISTS (SELECT 1 FROM unit_revoked_ids)",
         &[],
@@ -212,7 +244,8 @@ pub fn revoked<S: Sql>(sql: &S) -> Result<Option<u64>> {
 /// listed id.
 pub fn holds_revoked<S: Sql>(sql: &S, id: &str) -> Result<bool> {
     let rows = poll_once(sql.query(
-        "SELECT EXISTS (SELECT 1 FROM unit_keys WHERE id = ?1 AND status = 'revoked') \
+        "SELECT EXISTS (SELECT 1 FROM unit_keys WHERE id = ?1 AND status = 'revoked' \
+                            AND kind <> 'principal') \
              OR EXISTS (SELECT 1 FROM unit_revoked_ids WHERE id = ?1)",
         &[SqlValue::Text(id.to_string())],
     ))??;

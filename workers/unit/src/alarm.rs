@@ -22,7 +22,7 @@ use velmora_bridge::unit_lease::alarm::{rearm, Rearm};
 use velmora_bridge::UnixMs;
 use worker::js_sys;
 use worker::wasm_bindgen::JsValue;
-use worker::{Date, Env, MessageBuilder, QueueContentType, ScheduledTime, State};
+use worker::{Date, Env, QueueContentType, RawMessageBuilder, ScheduledTime, State};
 
 use crate::DoSql;
 
@@ -56,12 +56,15 @@ pub async fn run(
         match env.queue(UNIT_JOB_QUEUE) {
             Ok(queue) => {
                 for text in &step.jobs {
-                    let sent = match serde_json::from_str::<serde_json::Value>(text) {
+                    // The message's JSON text, parsed by JavaScript into a
+                    // plain object: a `serde_json::Value` would go through
+                    // `serde_wasm_bindgen`, which makes a map of an
+                    // object, and a map is sent as `{}`.
+                    let sent = match js_sys::JSON::parse(text) {
                         Ok(body) => queue
-                            .send(
-                                MessageBuilder::new(body)
-                                    .content_type(QueueContentType::Json)
-                                    .build(),
+                            .send_raw(
+                                RawMessageBuilder::new(body)
+                                    .build_with_content_type(QueueContentType::Json),
                             )
                             .await
                             .is_ok(),
