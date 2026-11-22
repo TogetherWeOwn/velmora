@@ -38,7 +38,7 @@ use std::time::Duration;
 
 use velmora_bridge::sql_bind::cast_bound;
 use velmora_bridge::{
-    is_tx_guard_violation, BridgeError, Result, Row, Sql, SqlValue, MAX_SQL_PARAMS,
+    is_tx_guard_violation, BridgeError, Result, Row, Sql, SqlValue, MAX_SQL_INT, MAX_SQL_PARAMS,
 };
 use worker::js_sys::{self, Array, ArrayBuffer, Promise, Reflect, Uint8Array};
 use worker::wasm_bindgen::{JsCast, JsValue};
@@ -47,7 +47,7 @@ use worker::worker_sys::{D1Database as D1Sys, D1PreparedStatement};
 use worker::D1Database;
 
 /// Largest integer a JS number holds exactly (`Number.MAX_SAFE_INTEGER`).
-const MAX_SAFE_INT: i64 = (1 << 53) - 1;
+const MAX_SAFE_INT: i64 = MAX_SQL_INT;
 
 /// The class of a statement D1 refused because the database is over its
 /// budget of the last ten seconds.

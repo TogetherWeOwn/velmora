@@ -13,6 +13,8 @@
 //! - [`store`]: the directory database (`migrations-directory/`): tenant
 //!   rows copied from chain heads, unit rows, key routes, pending
 //!   operations and the gate;
+//! - [`feed`]: the event feed of the management plane in the directory,
+//!   its per-tenant read, its epochs and its prune;
 //! - [`gate`]: the directory gate and the rebuild of the tenant rows from
 //!   the chains, and the read-only comparison of the two;
 //! - [`fence`]: the move's freeze of tenant 0's D1 catalogue: the cutover
@@ -27,6 +29,7 @@
 //! it and no record is written by it in production.
 
 pub mod chain;
+pub mod feed;
 pub mod fence;
 pub mod gate;
 pub mod port;

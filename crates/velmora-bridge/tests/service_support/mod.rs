@@ -901,6 +901,29 @@ impl Catalog for TestCatalog {
     async fn gc_due(&self, now: UnixMs, limit: u32, disposable_only: bool) -> Result<Vec<GcRow>> {
         self.cat.gc_due(now, limit, disposable_only).await
     }
+    async fn gc_orphans_due(&self, now: UnixMs) -> Result<bool> {
+        self.cat.gc_orphans_due(now).await
+    }
+    async fn gc_orphans(
+        &self,
+        now: UnixMs,
+        cutoff: UnixMs,
+        scan: u32,
+        limit: u32,
+    ) -> Result<Vec<GcRow>> {
+        self.cat.gc_orphans(now, cutoff, scan, limit).await
+    }
+    async fn gc_orphan_claim(
+        &self,
+        rows: &[GcRow],
+        now: UnixMs,
+        cutoff: UnixMs,
+    ) -> (Vec<bool>, Result<()>) {
+        self.cat.gc_orphan_claim(rows, now, cutoff).await
+    }
+    async fn gc_orphan_done(&self, id: i64, now: UnixMs) -> Result<()> {
+        self.cat.gc_orphan_done(id, now).await
+    }
     async fn gc_begin(&self, row: &GcRow, now: UnixMs) -> Result<GcStep> {
         self.cat.gc_begin(row, now).await
     }
@@ -1692,6 +1715,7 @@ pub fn config(providers: Vec<ProviderConfig>) -> BridgeConfig {
         slice_bytes: 8 * 1024 * 1024,
         max_object_extents: 10_000,
         intent_sweep: false,
+        gc_orphans: false,
         records: velmora_bridge::recovery::Layout::flat(),
         packed_plans: false,
         parity: false,

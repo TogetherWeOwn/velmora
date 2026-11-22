@@ -12,8 +12,11 @@ use velmora_bridge::directory::store::{
 };
 use velmora_bridge::directory::testing::{HookedRecords, PlainSeal};
 use velmora_bridge::directory::transition::{Actor, Change, OperatorHoldRequest, KEY_CHECK_LEN};
-use velmora_bridge::testkit::RusqliteSql;
+use velmora_bridge::ports::{Sql, SqlValue};
 use velmora_bridge::{Result, UnixMs};
+
+mod directory_support;
+use directory_support::{database, Db, MIGRATIONS};
 
 const NOW: UnixMs = UnixMs(1_800_000_000_000);
 const DAY: i64 = 24 * 3_600_000;
@@ -27,22 +30,13 @@ const ROOT_UNIT: UnitRow = UnitRow {
 };
 
 type Chain<'a> = TenantChain<'a, HookedRecords, PlainSeal>;
-type Directory<'a> = SqlDirectory<'a, RusqliteSql>;
+type Directory<'a> = SqlDirectory<'a, Db>;
 
 fn block_on<F: std::future::Future>(f: F) -> F::Output {
     tokio::runtime::Builder::new_current_thread()
         .build()
         .unwrap()
         .block_on(f)
-}
-
-fn database() -> RusqliteSql {
-    let db = RusqliteSql::open_in_memory().unwrap();
-    db.apply(include_str!(
-        "../../../workers/s3-bridge/migrations-directory/0001_directory.sql"
-    ))
-    .unwrap();
-    db
 }
 
 async fn write(
@@ -399,15 +393,13 @@ fn a_shredded_tenant_keeps_its_row_and_loses_its_routes() {
             TenantState::Shredded
         );
         let state = db
-            .with_conn(|c| {
-                c.query_row(
-                    "SELECT state FROM tenants WHERE id = ?1",
-                    [t.as_str()],
-                    |r| r.get::<_, String>(0),
-                )
-            })
+            .query(
+                "SELECT state FROM tenants WHERE id = ?1",
+                &[SqlValue::Text(t.as_str().into())],
+            )
+            .await
             .unwrap();
-        assert_eq!(state, "shredded");
+        assert_eq!(state, [vec![SqlValue::Text("shredded".into())]]);
         assert_eq!(dir.route("AKIA1").await.unwrap(), None);
     });
 }
@@ -533,12 +525,11 @@ fn a_restored_gate_row_does_not_open_the_gate() {
         // the moment before (the row says open at the old epoch).
         let closed = close(&store, &dir, "before_restore", NOW).await.unwrap();
         assert_eq!(closed, epoch + 1);
-        db.with_conn(|c| {
-            c.execute(
-                "UPDATE directory_gate SET closed = 0, epoch = ?1",
-                [epoch as i64],
-            )
-        })
+        db.raw_exec(
+            "UPDATE directory_gate SET closed = 0, epoch = ?1",
+            &[SqlValue::Int(epoch as i64)],
+        )
+        .await
         .unwrap();
         assert!(!is_open(&store, &dir).await.unwrap());
         // The next closing takes an epoch above every anchor, not the
@@ -933,10 +924,18 @@ fn a_damaged_row_is_rewritten_by_the_gate() {
             active(&chain, t).await;
             dir.apply_tenant(&head(&chain, t).await, NOW).await.unwrap();
         }
-        db.with_conn(|c| c.execute("UPDATE tenants SET door_json = '{' WHERE id = ?1", [A1]))
-            .unwrap();
-        db.with_conn(|c| c.execute("UPDATE tenants SET state = 'deleting' WHERE id = ?1", [B2]))
-            .unwrap();
+        db.raw_exec(
+            "UPDATE tenants SET door_json = '{' WHERE id = ?1",
+            &[SqlValue::Text(A1.into())],
+        )
+        .await
+        .unwrap();
+        db.raw_exec(
+            "UPDATE tenants SET state = 'deleting' WHERE id = ?1",
+            &[SqlValue::Text(B2.into())],
+        )
+        .await
+        .unwrap();
         // `tenant()` refuses a damaged row; the gate's read does not.
         assert!(dir.tenant(&a).await.is_err());
         let found = compare_tenants(&chain, &dir).await.unwrap();
@@ -1119,10 +1118,18 @@ fn rows_that_do_not_read_are_written_again() {
             active(&chain, t).await;
             dir.apply_tenant(&head(&chain, t).await, NOW).await.unwrap();
         }
-        db.with_conn(|c| c.execute("UPDATE tenants SET record_seq = 'x' WHERE id = ?1", [A1]))
-            .unwrap();
-        db.with_conn(|c| c.execute("INSERT INTO units (tenant, unit) VALUES (?1, 'y')", [B2]))
-            .unwrap();
+        db.raw_exec(
+            "UPDATE tenants SET record_seq = 'x' WHERE id = ?1",
+            &[SqlValue::Text(A1.into())],
+        )
+        .await
+        .unwrap();
+        db.raw_exec(
+            "INSERT INTO units (tenant, unit) VALUES (?1, 'y')",
+            &[SqlValue::Text(B2.into())],
+        )
+        .await
+        .unwrap();
         let found = compare_tenants(&chain, &dir).await.unwrap();
         assert!(
             found.contains(&Difference::Unreadable(a.clone())),
@@ -1359,7 +1366,7 @@ fn a_bare_tenant_name_is_a_stray() {
 /// literal in the directory's migrations is longer.
 #[test]
 fn no_pattern_in_the_directory_schema_is_over_fifty_bytes() {
-    let sql = include_str!("../../../workers/s3-bridge/migrations-directory/0001_directory.sql");
+    let sql: String = MIGRATIONS.iter().map(|(_, sql)| *sql).collect();
     let upper = sql.to_ascii_uppercase();
     let mut found = 0;
     for word in ["GLOB '", "LIKE '"] {
@@ -1382,7 +1389,6 @@ fn no_pattern_in_the_directory_schema_is_over_fifty_bytes() {
 /// The tenant id CHECK still takes only `t_` and 16 lowercase hex digits.
 #[test]
 fn the_tenant_id_check_takes_only_the_minted_form() {
-    use velmora_bridge::ports::{Sql, SqlValue};
     block_on(async {
         let db = database();
         let insert = |id: &str| {
@@ -1409,6 +1415,48 @@ fn the_tenant_id_check_takes_only_the_minted_form() {
             "",
         ] {
             assert!(insert(bad).await.is_err(), "{bad:?}");
+        }
+    });
+}
+
+/// The tests apply every migration of the directory's folder, in order.
+#[test]
+fn the_tests_apply_every_directory_migration() {
+    let dir = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../workers/s3-bridge/migrations-directory"
+    );
+    let mut files: Vec<String> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .filter(|n| n.ends_with(".sql"))
+        .collect();
+    files.sort();
+    let listed: Vec<&str> = MIGRATIONS.iter().map(|(name, _)| *name).collect();
+    assert_eq!(files, listed);
+}
+
+/// What the D1 run guards against: D1 refuses a GLOB pattern over 50
+/// bytes, which a stock SQLite takes. Under `VELMORA_D1_PROBE` this shows
+/// that the run is on D1's engine; natively, that the engine differs.
+#[test]
+fn d1_refuses_the_pattern_that_sqlite_takes() {
+    block_on(async {
+        let db = database();
+        let pattern = format!("t_{}", "[0-9a-f]".repeat(16));
+        assert!(pattern.len() > 50);
+        let answer = db
+            .query(
+                "SELECT ?1 GLOB ?2",
+                &[
+                    SqlValue::Text("t_00000000000000a1".into()),
+                    SqlValue::Text(pattern),
+                ],
+            )
+            .await;
+        match directory_support::on_d1() {
+            true => assert!(answer.is_err(), "{answer:?}"),
+            false => assert_eq!(answer.unwrap(), [vec![SqlValue::Int(1)]]),
         }
     });
 }

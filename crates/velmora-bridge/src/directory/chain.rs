@@ -313,8 +313,9 @@ impl<S: RecordStore, C: ControlSeal> TenantChain<'_, S, C> {
     /// Validates `change` against the head and writes the record that
     /// follows it. See the [module](self).
     ///
-    /// Not for [`Change::PlaceMovedBuckets`]: that change is bound to
-    /// tenant 0's head, which only [`Self::place_moved_buckets`] reads.
+    /// Not for [`Change::PlaceMovedBuckets`] or [`Change::SetMoveFloor`]:
+    /// those changes are bound to tenant 0's head, which only
+    /// [`Self::place_moved_buckets`] and [`Self::set_move_floor`] read.
     pub async fn write(
         &self,
         tenant: &Tenant,
@@ -323,7 +324,10 @@ impl<S: RecordStore, C: ControlSeal> TenantChain<'_, S, C> {
         now: UnixMs,
         known: u64,
     ) -> Result<Written, ChainError> {
-        if matches!(change, Change::PlaceMovedBuckets { .. }) {
+        if matches!(
+            change,
+            Change::PlaceMovedBuckets { .. } | Change::SetMoveFloor { .. }
+        ) {
             return Err(ChainError::Refused(Refusal {
                 status: 400,
                 code: "invalid_change",
@@ -369,6 +373,41 @@ impl<S: RecordStore, C: ControlSeal> TenantChain<'_, S, C> {
                 .try_write(tenant, &change, Actor::MoveTool, now, known)
                 .await?
             {
+                Try::Done(written) => return Ok(written),
+                Try::Lost(seq) => known = seq,
+            }
+        }
+        Err(ChainError::Busy)
+    }
+
+    /// Raises the move floor of `unit` of `tenant` to `floor` (AM-67): the
+    /// move tool's step 8(b1) and its `deleteAll()` exits, and the restore
+    /// tool before a `restore`. Tenant 0's head is read from its own chain
+    /// before every try, so the change is checked against a verified head,
+    /// never one the caller holds.
+    pub async fn set_move_floor(
+        &self,
+        tenant: &Tenant,
+        unit: u32,
+        floor: UnixMs,
+        actor: Actor,
+        now: UnixMs,
+        known: u64,
+    ) -> Result<Written, ChainError> {
+        let mut known = known;
+        for _ in 0..MAX_PUT_TRIES {
+            let Some(zero) = self.head(&Tenant::Zero, 0).await? else {
+                return Err(ChainError::Refused(Refusal {
+                    status: 409,
+                    code: "no_move_to_tenant",
+                }));
+            };
+            let change = Change::SetMoveFloor {
+                unit,
+                floor,
+                zero: Box::new(zero.door),
+            };
+            match self.try_write(tenant, &change, actor, now, known).await? {
                 Try::Done(written) => return Ok(written),
                 Try::Lost(seq) => known = seq,
             }
@@ -454,6 +493,7 @@ fn empty_private() -> TenantPrivate {
     TenantPrivate {
         v: RECORD_FORMAT,
         external_ref: None,
+        bucket_created: None,
     }
 }
 
