@@ -72,6 +72,7 @@ use crate::ports::{Catalog, Sql, SqlValue};
 use crate::sql::SqlCatalog;
 use crate::types::{BridgeError, BucketId, ExtentId, GenerationId, KeyStatus, Result, UnixMs};
 use crate::unit_lease::alarm::{self, AlarmRules, AlarmRun, Dues, Duty};
+use crate::unit_lease::handout::{self, Handout};
 use crate::unit_lease::job::{self, UnitJobKind};
 use crate::unit_lease::lease::{Admit as LeaseAdmit, LeaseRefusal, LeaseRules, Proven};
 use crate::unit_lease::mark::{Mark, MarkedSql, WriteMark};
@@ -138,6 +139,34 @@ pub struct AlarmStep {
     /// The lease when the run was planned: a renewal that lands during
     /// the sends is not counted as one more failed try.
     pub planned_lease: Option<UnixMs>,
+    /// The unit's numbers: the hand-out's jobs carry them (format 2).
+    pub seqs: Seqs,
+    /// The due work handed out ([`Duty::HandOut`]): sent by the object
+    /// class through `velmora_bridge::routing`, after [`AlarmStep::jobs`].
+    pub handout: Handout,
+    /// The first write the raise covers (`first_write_at` before the
+    /// hand-out): pending again if its send fails.
+    pub covered: Option<UnixMs>,
+}
+
+/// What the object class sent of an [`AlarmStep`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AlarmSent {
+    /// A send of [`AlarmStep::jobs`] was refused (or the unit has no job
+    /// form: tenant 0).
+    pub failed: bool,
+    /// For each job of [`AlarmStep::handout`], whether it was sent.
+    pub handed_out: Vec<bool>,
+}
+
+impl AlarmSent {
+    /// Every send of `step` went through (`true`) or none did (`false`).
+    pub fn all(step: &AlarmStep, sent: bool) -> AlarmSent {
+        AlarmSent {
+            failed: !sent,
+            handed_out: vec![sent; step.handout.jobs.len()],
+        }
+    }
 }
 
 /// One unit over its database.
@@ -741,6 +770,12 @@ impl<S: UnitSql> Unit<S> {
                 // unit is behind its stamp and needs the gate (§8.6).
                 if recorded_rollback(&call.op, body) {
                     store::close(sql)?;
+                }
+                // A raise of the counter covers every write before it:
+                // the alarm's pending raise is cleared now, not when its
+                // message was sent (AM-48).
+                if raised_counter(&call.op, body) && self.has_tables()? {
+                    store::raise_landed(sql)?;
                 }
             }
             Ok(out)
@@ -1677,7 +1712,7 @@ impl<S: UnitSql> Unit<S> {
             Ok(until) => {
                 // Work that waited for the renewal runs at once (RD-9).
                 let after = store::read(sql)?;
-                self.want_wake(alarm::after_renew(now, &self.dues(&after)));
+                self.want_wake(alarm::after_renew(now, &self.dues(&after)?));
                 Ok(UnitAnswer::Ok {
                     seqs: head.seqs,
                     body: json!({ "fresh_until": until.0, "applied": applied }),
@@ -1687,15 +1722,25 @@ impl<S: UnitSql> Unit<S> {
         }
     }
 
-    /// When each duty of the alarm is due. Only the stamp raise is built
-    /// (§8.5); the day close (W7), the sweeps, the job hand-out and the
-    /// report to the directory are not due on a unit yet: the Worker's
-    /// cron runs the jobs of a unit through `TenantCatalog`.
-    fn dues(&self, row: &store::LeaseRow) -> Dues {
-        Dues::none().with(
-            Duty::StampRaise,
+    /// When each duty of the alarm is due: the stamp raise (§8.5), one
+    /// period after the first write since the last raise, or one period
+    /// after a raise that was handed out and has not landed (AM-48); and
+    /// the hand-out of the unit's due work (`unit_lease::handout`). The
+    /// day close (W7), the sweeps and the report to the directory are not
+    /// due on a unit yet.
+    fn dues(&self, row: &store::LeaseRow) -> Result<Dues> {
+        let period = self.alarm_rules.stamp_period_ms;
+        let pending = row.raise_from.map(|at| UnixMs(at.0.saturating_add(period)));
+        let raise = [
             alarm::stamp_raise_due(row.first_write_at, &self.alarm_rules),
-        )
+            pending,
+        ]
+        .into_iter()
+        .flatten()
+        .min();
+        Ok(Dues::none()
+            .with(Duty::StampRaise, raise)
+            .with(Duty::HandOut, handout::due_at(&self.cat)?))
     }
 
     /// Whether the unit takes no `renew` and no job: a `restoring` entry,
@@ -1722,6 +1767,12 @@ impl<S: UnitSql> Unit<S> {
             jobs: Vec::new(),
             raise: false,
             planned_lease: None,
+            seqs: Seqs {
+                state_seq: 0,
+                keys_seq: 0,
+            },
+            handout: Handout::default(),
+            covered: None,
         };
         self.tables.set(None);
         match self.born()? {
@@ -1735,33 +1786,50 @@ impl<S: UnitSql> Unit<S> {
         let head = self.head()?;
         let lease = row.lease();
         let closed = self.closed(&head)?;
-        // A raise a dead run handed out is pending again. Written only
-        // then, and not on a closed unit: an idle or closed wake writes
-        // nothing (a restore's check 4, a dump's mark).
-        if row.raise_from.is_some() && !closed {
-            let mut settle = || store::settle_dead_raise(sql);
+        // A raise handed out a period ago that has not landed is pending
+        // again. Written only then, and not on a closed unit: an idle or
+        // closed wake writes nothing (a restore's check 4, a dump's mark).
+        let period = self.alarm_rules.stamp_period_ms;
+        if row
+            .raise_from
+            .is_some_and(|at| at.0.saturating_add(period) <= now.0)
+            && !closed
+        {
+            let mut settle = || store::settle_dead_raise(sql, now, period).map(|_| ());
             sql.atomically(&mut settle)?;
             row = store::read(sql)?;
         }
         let run = alarm::on_alarm(
             now,
             &row.at(&lease, closed),
-            &self.dues(&row),
+            &self.dues(&row)?,
             &self.lease_rules,
             &self.alarm_rules,
         );
         let mut jobs = Vec::new();
         let mut raise = false;
+        let mut out = Handout::default();
         for duty in &run.run {
-            // The other duties are never due here (`dues`).
-            if *duty == Duty::StampRaise {
-                raise = true;
-                jobs.push(job::message(
-                    UnitJobKind::StampRaise,
-                    &self.own,
-                    head.seqs,
-                    now,
-                ));
+            match duty {
+                Duty::StampRaise => {
+                    raise = true;
+                    jobs.push(job::message(
+                        UnitJobKind::StampRaise,
+                        &self.own,
+                        head.seqs,
+                        now,
+                    ));
+                }
+                // Tenant 0 has no job form: nothing is handed out for it.
+                Duty::HandOut if !self.own.tenant.is_zero() => {
+                    let mut plan = || {
+                        out = handout::plan(&self.cat, now)?;
+                        Ok(())
+                    };
+                    sql.atomically(&mut plan)?;
+                }
+                // The other duties are never due here (`dues`).
+                _ => {}
             }
         }
         if run.send_renew {
@@ -1771,17 +1839,20 @@ impl<S: UnitSql> Unit<S> {
             .into_iter()
             .collect::<Option<Vec<_>>>()
             .unwrap_or_default();
-        // The raise is handed out before the send (kept in `raise_from`
-        // until the send ends): a write during the send is then pending a
-        // raise of its own.
+        // The raise is handed out before the send (`raise_from` keeps the
+        // hand-out until the stamp lands): a write during the send is then
+        // pending a raise of its own.
         if raise && !jobs.is_empty() {
-            let mut take = || store::take_first_write(sql);
+            let mut take = || store::take_first_write(sql, now);
             sql.atomically(&mut take)?;
         }
         Ok(AlarmStep {
             jobs,
             raise,
             planned_lease: row.fresh_until,
+            seqs: head.seqs,
+            handout: out,
+            covered: row.first_write_at,
             run,
         })
     }
@@ -1796,19 +1867,26 @@ impl<S: UnitSql> Unit<S> {
         &self,
         now: UnixMs,
         step: &AlarmStep,
-        failed: bool,
+        sent: &AlarmSent,
     ) -> Result<Option<UnixMs>> {
         self.tables.set(None);
         if step.run.run.is_empty() && !step.run.send_renew {
             // Woken for nothing: arm what is due, if anything.
             return self.alarm_next(now, None);
         }
-        let failed =
-            failed || step.jobs.len() != step.run.run.len() + usize::from(step.run.send_renew);
+        // One unit job per raise and per renewal; tenant 0 has none.
+        let own_jobs = usize::from(step.raise) + usize::from(step.run.send_renew);
+        let handed_out =
+            sent.handed_out.len() == step.handout.jobs.len() && sent.handed_out.iter().all(|s| *s);
+        let failed = sent.failed || step.jobs.len() != own_jobs || !handed_out;
         let sql = self.sql();
         let mut run = || {
             if step.raise && !step.jobs.is_empty() {
-                store::raise_sent(sql, !failed)?;
+                store::raise_sent(sql, !sent.failed, step.covered)?;
+            }
+            if step.run.run.contains(&Duty::HandOut) {
+                let marks = &sent.handed_out[..sent.handed_out.len().min(step.handout.jobs.len())];
+                handout::done(&self.cat, now, &step.handout, marks)?;
             }
             store::alarm_ran(sql, step.run.send_renew, step.planned_lease, failed)
         };
@@ -1830,7 +1908,7 @@ impl<S: UnitSql> Unit<S> {
         Ok(alarm::next_alarm(
             now,
             &row.at(&lease, closed),
-            &self.dues(&row),
+            &self.dues(&row)?,
             retry_at,
             &self.lease_rules,
             &self.alarm_rules,
@@ -1897,6 +1975,17 @@ fn raises_stamp(op: &UnitOp) -> bool {
                 | JobCall::set_cursor { .. }
         }
     )
+}
+
+/// Whether `body` is the answer of a `stamp_advance` job call that moved
+/// the counter.
+fn raised_counter(op: &UnitOp, body: &Value) -> bool {
+    matches!(
+        op,
+        UnitOp::Job {
+            call: JobCall::stamp_advance { .. }
+        }
+    ) && body == &Value::Bool(true)
 }
 
 /// Whether `body` is the answer of a `stamp_rolled_back` job call that

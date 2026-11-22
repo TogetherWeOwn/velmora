@@ -10,8 +10,8 @@ use velmora_bridge::unit::jobcall::JobCall;
 use velmora_bridge::unit::keys::{Access, KeyEntry, KeyGrant, KeyKind, SubjectStatus};
 use velmora_bridge::unit::restore::lease_view;
 use velmora_bridge::unit::{
-    BirthKind, BirthToken, CallKind, Refused, Seqs, SyncHead, TenantId, TenantState, Unit,
-    UnitAnswer, UnitCall, UnitName, UnitOp, UnitReply,
+    AlarmSent, BirthKind, BirthToken, CallKind, Refused, Seqs, SyncHead, TenantId, TenantState,
+    Unit, UnitAnswer, UnitCall, UnitName, UnitOp, UnitReply,
 };
 use velmora_bridge::unit_lease::alarm::{AlarmRules, MIN_ALARM_GAP_MS};
 use velmora_bridge::unit_lease::job::{message, UnitJobKind};
@@ -812,17 +812,48 @@ fn the_alarm_sends_one_stamp_raise_per_period_with_writes_under_a_fresh_lease() 
     let step = u.alarm(early).unwrap();
     assert!(step.jobs.is_empty() && !step.raise);
     assert_eq!(
-        u.alarm_done(early, &step, false).unwrap(),
+        u.alarm_done(early, &step, &AlarmSent::all(&step, true))
+            .unwrap(),
         Some(UnixMs(NOW.0 + PERIOD))
     );
     let due = UnixMs(NOW.0 + PERIOD);
     let step = u.alarm(due).unwrap();
     assert!(step.raise);
     assert_eq!(step.jobs, vec![job_text(UnitJobKind::StampRaise, &u, due)]);
-    assert_eq!(u.alarm_done(due, &step, false).unwrap(), None, "idle again");
+    // Sent, the raise stays pending until its stamp lands (AM-48): the
+    // alarm looks again one period on.
+    assert_eq!(
+        u.alarm_done(due, &step, &AlarmSent::all(&step, true))
+            .unwrap(),
+        Some(UnixMs(due.0 + PERIOD)),
+        "the pending raise is looked at again"
+    );
     let row = lease_row(&u);
-    assert_eq!(row.first_write_at, None);
+    assert_eq!((row.first_write_at, row.raise_from), (None, Some(due)));
     assert_eq!((row.renew_tries, row.failed_runs), (0, 0));
+    // The raise lands: nothing is pending, and the unit is idle again.
+    let landed = UnixMs(due.0 + 500);
+    assert!(matches!(
+        job(
+            &u,
+            JobCall::stamp_advance {
+                from: None,
+                catalogue: stamp_id()
+            },
+            landed
+        ),
+        UnitAnswer::Ok { .. }
+    ));
+    assert_eq!(lease_row(&u).raise_from, None);
+    let later = UnixMs(due.0 + PERIOD);
+    let step = u.alarm(later).unwrap();
+    assert!(step.jobs.is_empty() && !step.raise);
+    assert_eq!(
+        u.alarm_done(later, &step, &AlarmSent::all(&step, true))
+            .unwrap(),
+        None,
+        "idle again"
+    );
 }
 
 #[test]
@@ -837,7 +868,10 @@ fn an_expired_lease_sends_one_renew_and_the_work_runs_after_the_renewal() {
     let step = u.alarm(due).unwrap();
     assert!(!step.raise, "no raise while expired");
     assert_eq!(step.jobs, vec![job_text(UnitJobKind::Renew, &u, due)]);
-    let next = u.alarm_done(due, &step, false).unwrap().unwrap();
+    let next = u
+        .alarm_done(due, &step, &AlarmSent::all(&step, true))
+        .unwrap()
+        .unwrap();
     assert_eq!(next.0, due.0 + AlarmRules::DEFAULT.renew_retry_ms);
     let row = lease_row(&u);
     assert_eq!(row.renew_tries, 1);
@@ -845,7 +879,10 @@ fn an_expired_lease_sends_one_renew_and_the_work_runs_after_the_renewal() {
     // The second try waits twice as long.
     let step = u.alarm(next).unwrap();
     assert_eq!(step.jobs, vec![job_text(UnitJobKind::Renew, &u, next)]);
-    let next2 = u.alarm_done(next, &step, false).unwrap().unwrap();
+    let next2 = u
+        .alarm_done(next, &step, &AlarmSent::all(&step, true))
+        .unwrap()
+        .unwrap();
     assert_eq!(next2.0, next.0 + 2 * AlarmRules::DEFAULT.renew_retry_ms);
     // The renewal comes: the tries reset, and the alarm is asked for now.
     let _ = u.take_wake();
@@ -866,7 +903,10 @@ fn a_failed_send_keeps_the_work_due_and_backs_off() {
     ));
     let due = UnixMs(NOW.0 + PERIOD);
     let step = u.alarm(due).unwrap();
-    let next = u.alarm_done(due, &step, true).unwrap().unwrap();
+    let next = u
+        .alarm_done(due, &step, &AlarmSent::all(&step, false))
+        .unwrap()
+        .unwrap();
     let row = lease_row(&u);
     assert_eq!(row.first_write_at, Some(NOW), "still due");
     assert_eq!(row.failed_runs, 1);
@@ -876,7 +916,8 @@ fn a_failed_send_keeps_the_work_due_and_backs_off() {
     assert!(matches!(renew(&u, next), UnitAnswer::Ok { .. }));
     let step = u.alarm(next).unwrap();
     assert!(step.raise);
-    u.alarm_done(next, &step, false).unwrap();
+    u.alarm_done(next, &step, &AlarmSent::all(&step, true))
+        .unwrap();
     let row = lease_row(&u);
     assert_eq!((row.failed_runs, row.first_write_at), (0, None));
 }
@@ -896,7 +937,10 @@ fn a_raise_waits_for_a_renewal_when_the_lease_runs_low() {
     let step = u.alarm(due).unwrap();
     assert!(!step.raise);
     assert_eq!(step.jobs, vec![job_text(UnitJobKind::Renew, &u, due)]);
-    let next = u.alarm_done(due, &step, false).unwrap().unwrap();
+    let next = u
+        .alarm_done(due, &step, &AlarmSent::all(&step, true))
+        .unwrap()
+        .unwrap();
     assert_eq!(next.0, due.0 + AlarmRules::DEFAULT.renew_retry_ms);
     assert_eq!(lease_row(&u).first_write_at, Some(write), "still due");
     let _ = u.take_wake();
@@ -923,11 +967,15 @@ fn what_happens_during_the_sends_is_kept() {
         request(&u, true, read_plan(), during),
         UnitAnswer::Ok { .. }
     ));
+    // The pending raise is looked at one period after its hand-out, the
+    // write during the send one period after the write: the earlier.
     assert_eq!(
-        u.alarm_done(during, &step, false).unwrap(),
-        Some(UnixMs(during.0 + PERIOD))
+        u.alarm_done(during, &step, &AlarmSent::all(&step, true))
+            .unwrap(),
+        Some(UnixMs(due.0 + PERIOD))
     );
     assert_eq!(lease_row(&u).first_write_at, Some(during));
+    assert_eq!(lease_row(&u).raise_from, Some(due));
 
     // The renew the alarm sends lands before the run is recorded.
     let late = UnixMs(during.0 + PERIOD + 1);
@@ -935,8 +983,63 @@ fn what_happens_during_the_sends_is_kept() {
     let step = u.alarm(late).unwrap();
     assert!(step.run.send_renew);
     assert!(matches!(renew(&u, late), UnitAnswer::Ok { .. }));
-    u.alarm_done(late, &step, false).unwrap();
+    u.alarm_done(late, &step, &AlarmSent::all(&step, true))
+        .unwrap();
     assert_eq!(lease_row(&u).renew_tries, 0);
+}
+
+/// The alarm hands out the unit's due work (AM-49): a due outbox row is
+/// a job of the step, marked only once its send went through; with an
+/// expired lease nothing is handed out, only `renew`.
+#[test]
+fn the_alarm_hands_out_due_rows_and_marks_only_what_was_sent() {
+    use velmora_bridge::unit_lease::alarm::Duty;
+    let u = fresh();
+    let at = UnixMs(NOW.0 + 1_000);
+    u.sql()
+        .with_conn(|c| {
+            c.execute_batch(&format!(
+                "INSERT INTO outbox(extent_id, generation_id, stage, next_at, updated_at) \
+                   VALUES ('x_000000000000000000000000e1', 'g_0019a00000000e1e1e1e1e1e1e1e1', \
+                           'post', {}, 1)",
+                at.0
+            ))
+        })
+        .unwrap();
+    let sent_at = |u: &Unit<RusqliteSql>| -> Option<i64> {
+        u.sql()
+            .with_conn(|c| c.query_row("SELECT sent_at FROM outbox", [], |r| r.get(0)))
+            .unwrap()
+    };
+    // Due at the row's time: the step carries its job.
+    let step = u.alarm(at).unwrap();
+    assert!(step.run.run.contains(&Duty::HandOut), "{:?}", step.run);
+    assert_eq!(step.handout.jobs.len(), 1);
+    assert_eq!(step.seqs, u.head().unwrap().seqs);
+    // Its send was refused: not marked, a failed run, due again.
+    let mut sent = AlarmSent::all(&step, true);
+    sent.handed_out = vec![false];
+    let next = u.alarm_done(at, &step, &sent).unwrap();
+    assert_eq!(sent_at(&u), None);
+    assert_eq!(lease_row(&u).failed_runs, 1);
+    let next = next.expect("due again");
+    assert!(next.0 > at.0);
+    // Sent: marked, and nothing else is due before its resend window.
+    let step = u.alarm(next).unwrap();
+    assert_eq!(step.handout.jobs.len(), 1);
+    let after = u
+        .alarm_done(next, &step, &AlarmSent::all(&step, true))
+        .unwrap();
+    assert_eq!(sent_at(&u), Some(next.0));
+    assert_eq!(lease_row(&u).failed_runs, 0);
+    let resend = i64::from(velmora_bridge::jobs::RESEND_SECS) * 1000;
+    assert_eq!(after, Some(UnixMs(next.0 + resend)));
+    // With the lease run out the row is due, but only `renew` is sent.
+    let late = UnixMs(next.0 + resend);
+    assert!(late.0 > NOW.0 + T);
+    let step = u.alarm(late).unwrap();
+    assert!(step.handout.jobs.is_empty());
+    assert!(step.run.send_renew);
 }
 
 /// A principal is not a key: `m/rk/` never names one, so a revoked
@@ -976,7 +1079,8 @@ fn an_idle_or_closed_alarm_wake_writes_nothing() {
     let step = u.alarm(UnixMs(NOW.0 + 1_000)).unwrap();
     assert!(step.jobs.is_empty());
     assert_eq!(
-        u.alarm_done(UnixMs(NOW.0 + 1_000), &step, false).unwrap(),
+        u.alarm_done(UnixMs(NOW.0 + 1_000), &step, &AlarmSent::all(&step, true))
+            .unwrap(),
         None
     );
     assert_eq!(u.mark(), m, "an idle wake");
@@ -992,14 +1096,19 @@ fn an_idle_or_closed_alarm_wake_writes_nothing() {
     let later = UnixMs(due.0 + 1_000);
     let step = u.alarm(later).unwrap();
     assert!(step.jobs.is_empty());
-    assert_eq!(u.alarm_done(later, &step, false).unwrap(), None);
+    assert_eq!(
+        u.alarm_done(later, &step, &AlarmSent::all(&step, true))
+            .unwrap(),
+        None
+    );
     assert_eq!(u.mark(), m, "a closed wake, even with a dead run's raise");
 }
 
-/// A run that dies during its send (the object reset) leaves its raise
-/// pending: the next run sends it again.
+/// A raise that never lands (the run died during its send, the message
+/// was lost, or it was acknowledged unrun) is pending for one period
+/// after its hand-out, then sent again (AM-48, AM-50).
 #[test]
-fn a_raise_of_a_run_that_died_is_sent_again() {
+fn a_raise_that_does_not_land_is_sent_again_one_period_on() {
     let u = fresh();
     assert!(matches!(
         request(&u, true, read_plan(), NOW),
@@ -1008,15 +1117,35 @@ fn a_raise_of_a_run_that_died_is_sent_again() {
     let due = UnixMs(NOW.0 + PERIOD);
     let step = u.alarm(due).unwrap();
     assert!(step.raise);
-    assert_eq!(lease_row(&u).raise_from, Some(NOW));
-    // No `alarm_done`: the platform runs the alarm again.
+    assert_eq!(step.covered, Some(NOW));
+    assert_eq!(lease_row(&u).raise_from, Some(due), "the hand-out time");
+    // No `alarm_done`: the platform runs the alarm again. Within the
+    // period the raise is pending, not sent again.
     let again = UnixMs(due.0 + 1_000);
     assert!(matches!(renew(&u, again), UnitAnswer::Ok { .. }));
     let step = u.alarm(again).unwrap();
-    assert!(step.raise, "the dead run's raise is due again");
-    u.alarm_done(again, &step, false).unwrap();
+    assert!(!step.raise, "still in flight");
+    assert_eq!(lease_row(&u).raise_from, Some(due));
+    // One period on it is dead: due again, and sent.
+    let dead = UnixMs(due.0 + PERIOD);
+    let step = u.alarm(dead).unwrap();
+    assert!(step.raise, "the raise is due again");
+    assert_eq!(lease_row(&u).raise_from, Some(dead));
+    u.alarm_done(dead, &step, &AlarmSent::all(&step, true))
+        .unwrap();
+    // A failed send undoes the hand-out: the writes it covered are
+    // pending again from their own time, not the hand-out's.
+    let u = fresh();
+    assert!(matches!(
+        request(&u, true, read_plan(), NOW),
+        UnitAnswer::Ok { .. }
+    ));
+    let step = u.alarm(due).unwrap();
+    assert!(step.raise);
+    u.alarm_done(due, &step, &AlarmSent::all(&step, false))
+        .unwrap();
     let row = lease_row(&u);
-    assert_eq!((row.first_write_at, row.raise_from), (None, None));
+    assert_eq!((row.first_write_at, row.raise_from), (Some(NOW), None));
 }
 
 /// A listed id that names a principal row (were one ever listed) is kept
@@ -1062,7 +1191,10 @@ fn the_alarm_sends_raw_parsed_json() {
     ))
     .unwrap();
     assert!(src.contains("js_sys::JSON::parse(text)"));
-    assert!(src.contains(".send_raw("));
+    // One raw batch per queue; never `send_batch`, which would encode
+    // the messages through `serde_wasm_bindgen`.
+    assert!(src.contains(".send_raw_batch(messages)"));
+    assert!(!src.contains(".send_batch("));
     for (n, line) in src.lines().enumerate() {
         assert!(
             !line
@@ -1085,12 +1217,21 @@ fn a_closed_or_unborn_unit_runs_nothing_and_arms_nothing() {
     let due = UnixMs(NOW.0 + PERIOD);
     let step = u.alarm(due).unwrap();
     assert!(step.jobs.is_empty() && !step.run.send_renew);
-    assert_eq!(u.alarm_done(due, &step, false).unwrap(), None);
+    assert_eq!(
+        u.alarm_done(due, &step, &AlarmSent::all(&step, true))
+            .unwrap(),
+        None
+    );
 
     let unborn = Unit::new(RusqliteSql::open_in_memory().unwrap(), own(), "");
     let step = unborn.alarm(due).unwrap();
     assert!(step.jobs.is_empty());
-    assert_eq!(unborn.alarm_done(due, &step, false).unwrap(), None);
+    assert_eq!(
+        unborn
+            .alarm_done(due, &step, &AlarmSent::all(&step, true))
+            .unwrap(),
+        None
+    );
     let tables: i64 = unborn.sql().with_conn(|c| {
         c.query_row("SELECT count(*) FROM sqlite_master", [], |r| r.get(0))
             .unwrap()

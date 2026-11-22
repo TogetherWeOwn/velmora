@@ -126,11 +126,30 @@ expired lease one `renew` and nothing else, retried with a doubling wait
 T left (its consumer reaches the unit later); with less, the alarm sends one
 `renew` instead, other duties run, and the raise follows the renewal. Work that was due stays due; after a renewal the
 alarm is set to now. The alarm is armed only when the wanted time is earlier
-than the armed one. A closed unit runs nothing. Only the stamp raise is due
-on a unit yet: the day close (W7), the sweeps, the hand-out and the report
-to the directory are not built here, and the Worker's cron runs a unit's
-jobs through `TenantCatalog`. Rules 9 and 10 (jobs that name their tenant,
-the unit's outbox to the directory) are not built yet.
+than the armed one. A closed unit runs nothing. The day close (W7), the
+sweeps and the report to the directory are not built here. Rule 10 (the
+unit's outbox to the directory) is not built yet.
+
+**The hand-out** (`unit_lease::handout`, AM-49): under a fresh lease the
+alarm also does tenant 0's cron work for the unit. It buries exhausted
+outbox rows, then sends the due rows as `extent` jobs (as many as tenant
+0's dispatcher sends in one run), one `gc` job while a GC row of a
+disposable bucket is due, and one `evict` job per eviction-check period
+while the unit holds evictable bytes. The consumer holds the
+configuration: `gc` does nothing with `GC_MODE` off, and `evict` takes the
+cap's excess itself. The hand-out is due when `Catalog::due` would take a
+row (with tenant 0's resend window, as a unit cannot ask the queues for
+their backlog), a GC row is due, or the eviction check is due, and never
+sooner than 60 s (est) after the last hand-out. An idle unit has nothing
+due. Every message goes through `velmora_bridge::routing`, as tenant 0's:
+an extent's job to its shard of the post or verify queues, everything else,
+the unit's own `renew` and `stamp_raise` included, to the queue bound as
+`AUX_Q`, or to the first verify queue where `AUX_Q` is not bound. The jobs
+are format 2, with the tenant, the unit and its numbers. After the sends
+the rows of the batches that went through are marked, and the run is
+recorded only when every send went through. The write-intent sweep is not
+handed out: tenant 0's is gated by `INTENT_SWEEP`, which only the Worker's
+configuration holds and its consumer does not check.
 
 **What makes the alarm's raise due** (ADR §8.5, AM-48). Every committed S3
 or job call that changed a row, and every reservation call that changed one
@@ -143,7 +162,12 @@ calls and `provision`. A rollback that loses one of these shows as
 `SyncNeeded` or an expired lease, or the tool runs it again, and a raise
 must not make the next one due. Read stamps (`touch_read`) count. The alarm
 sends a raise only while at least T/2 of the lease is left; with less, it
-sends `renew` and sends the raise after that renewal.
+sends `renew` and sends the raise after that renewal. The unit clears its
+pending raise only when the stamp call lands, not when the message is sent:
+the alarm keeps the hand-out time in `raise_from`, a `stamp_advance` that
+moves the counter clears it in its own transaction, and a raise that has not
+landed one period after its hand-out is due again. A failed send undoes the
+hand-out, and its writes are due from their own time.
 
 **The unit client** (`unit_lease::client`, the Worker's side of rules 5 and
 12; AM-50, AM-51). A unit does no I/O, so the Worker reads for it:

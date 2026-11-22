@@ -49,7 +49,8 @@ pub struct LeaseRow {
     pub renew_tries: u32,
     pub failed_runs: u32,
     pub first_write_at: Option<UnixMs>,
-    /// The first write of a raise being sent (`take_first_write`).
+    /// When the alarm handed out a raise that has not landed yet
+    /// (`take_first_write`, `raise_landed`).
     pub raise_from: Option<UnixMs>,
 }
 
@@ -173,43 +174,67 @@ pub fn note_write<S: Sql>(sql: &S, now: UnixMs) -> Result<bool> {
     Ok(n == 1)
 }
 
-/// A raise that a run handed out and never settled (the object reset
-/// during its send) is pending again: back into `first_write_at`, the
-/// earlier of the two. The alarm calls this first.
-pub fn settle_dead_raise<S: Sql>(sql: &S) -> Result<()> {
+/// A raise the alarm handed out at `raise_from` that has not landed one
+/// stamp period later (its message was lost, acknowledged under
+/// maintenance, or its consumer failed) is pending again: `first_write_at`
+/// becomes the earlier of the two, so the raise is due at once, and
+/// `raise_from` is cleared (AM-48, AM-50: an acknowledged raise costs at
+/// most one alarm period). A raise still in its period stays pending.
+/// `true` = one was settled. The alarm calls this first.
+pub fn settle_dead_raise<S: Sql>(sql: &S, now: UnixMs, period_ms: i64) -> Result<bool> {
+    let n = poll_once(sql.exec(
+        "UPDATE unit_lease SET \
+           first_write_at = CASE WHEN first_write_at IS NULL OR first_write_at > raise_from \
+             THEN raise_from ELSE first_write_at END, \
+           raise_from = NULL \
+         WHERE id = 1 AND raise_from IS NOT NULL AND raise_from <= ?1",
+        &[SqlValue::Int(now.0.saturating_sub(period_ms))],
+    ))??;
+    Ok(n == 1)
+}
+
+/// The alarm hands out the stamp raise at `now`: the writes it covers
+/// leave `first_write_at`, so a write during the send is pending a raise
+/// of its own, and `raise_from` keeps the hand-out time until the stamp
+/// call lands ([`raise_landed`]) or the raise is found dead
+/// ([`settle_dead_raise`]).
+pub fn take_first_write<S: Sql>(sql: &S, now: UnixMs) -> Result<()> {
+    write_one(
+        sql,
+        "UPDATE unit_lease SET raise_from = ?1, first_write_at = NULL WHERE id = 1",
+        &[SqlValue::Int(now.0)],
+    )
+}
+
+/// The send of the raise ended. Sent: the raise stays pending until its
+/// stamp call lands (AM-48). Not sent: the writes it covered, from
+/// `covered` (the `first_write_at` it took), are pending again, and the
+/// hand-out is undone.
+pub fn raise_sent<S: Sql>(sql: &S, sent: bool, covered: Option<UnixMs>) -> Result<()> {
+    if sent {
+        return Ok(());
+    }
+    let covered = covered.map_or(SqlValue::Null, |at| SqlValue::Int(at.0));
     write_one(
         sql,
         "UPDATE unit_lease SET \
-           first_write_at = CASE WHEN raise_from IS NULL THEN first_write_at \
-             WHEN first_write_at IS NULL OR first_write_at > raise_from THEN raise_from \
+           first_write_at = CASE WHEN ?1 IS NULL THEN first_write_at \
+             WHEN first_write_at IS NULL OR first_write_at > ?1 THEN ?1 \
              ELSE first_write_at END, \
            raise_from = NULL WHERE id = 1",
-        &[],
+        &[covered],
     )
 }
 
-/// The alarm hands out the stamp raise: the writes it covers move from
-/// `first_write_at` to `raise_from`, so a write during the send is
-/// pending a raise of its own.
-pub fn take_first_write<S: Sql>(sql: &S) -> Result<()> {
-    write_one(
-        sql,
-        "UPDATE unit_lease SET raise_from = first_write_at, first_write_at = NULL WHERE id = 1",
+/// A stamp call raised the unit's counter: every write before it is
+/// covered, so a raise the alarm handed out is no longer pending (AM-48).
+/// Called in the transaction of that call.
+pub fn raise_landed<S: Sql>(sql: &S) -> Result<()> {
+    poll_once(sql.exec(
+        "UPDATE unit_lease SET raise_from = NULL WHERE id = 1 AND raise_from IS NOT NULL",
         &[],
-    )
-}
-
-/// The send of the raise ended: sent (`raise_from` is done with), or not
-/// (its writes are pending again, from the earlier of the two times).
-pub fn raise_sent<S: Sql>(sql: &S, sent: bool) -> Result<()> {
-    if sent {
-        return write_one(
-            sql,
-            "UPDATE unit_lease SET raise_from = NULL WHERE id = 1",
-            &[],
-        );
-    }
-    settle_dead_raise(sql)
+    ))??;
+    Ok(())
 }
 
 /// What one alarm run did, as the row keeps it: a renew job sent counts

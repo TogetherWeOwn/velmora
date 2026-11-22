@@ -45,4 +45,4 @@ pub use birth::{may_provision, BirthKind, BirthToken, HeadView, ProvisionRefusal
 pub use call::{Reader, Refused, SyncHead, TenantState, UnitAnswer, UnitCall, UnitOp, UnitReply};
 pub use identity::{CallKind, Seqs, Verdict};
 pub use name::{TenantId, UnitName};
-pub use object::{poll_once, AlarmStep, Unit, UnitSql};
+pub use object::{poll_once, AlarmSent, AlarmStep, Unit, UnitSql};
