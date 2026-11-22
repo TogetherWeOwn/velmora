@@ -515,6 +515,17 @@ fn the_directory_is_asked_by_nothing() {
     // design round 5) is another port, with a `route` of its own: only it
     // and its one caller may say `.route(`.
     const UNIT_ROUTER: [&str; 2] = ["bridge/unit_router.rs", "bridge/service/mod.rs"];
+    // The composition root (`root`, L6-5) is the one reader of the
+    // directory's store for that router: its key routes
+    // (`SqlDirectory::route`, ADR §8.4 step 2). It runs only with `UNIT`
+    // bound (off as shipped), and it names the store, never the port.
+    const ROOT: &str = "bridge/root.rs";
+    let root = &all[ROOT];
+    assert_eq!(
+        root.matches("Directory").count(),
+        root.matches("SqlDirectory").count(),
+        "the root names the directory's store only"
+    );
     // The port's paths: the tenant chain's reader (`directory::chain`,
     // `directory::record`), which the unit client reads heads with, is not
     // the port.
@@ -532,6 +543,7 @@ fn the_directory_is_asked_by_nothing() {
             .keys()
             .filter(|f| *f != DIRECTORY && !f.starts_with("bridge/directory/"))
             .filter(|f| !(name == ".route(" && UNIT_ROUTER.contains(&f.as_str())))
+            .filter(|f| !(*f == ROOT && matches!(name, "Directory" | ".route(")))
             .collect();
         assert!(files.is_empty(), "{name}: {files:?}");
     }

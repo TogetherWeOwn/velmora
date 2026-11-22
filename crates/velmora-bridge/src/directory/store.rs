@@ -526,6 +526,34 @@ impl<S: Sql> SqlDirectory<'_, S> {
         Ok(changed > 0)
     }
 
+    /// The tenant `akid` routes to, with the tenant row's `record_seq`
+    /// and `keys_seq` (`None` when the row is gone), in one read: the
+    /// request router's miss (ADR §8.4 step 2). `None` = no route.
+    pub async fn route_tenant(&self, akid: &str) -> Result<Option<(Tenant, Option<(u64, u64)>)>> {
+        let rows = self
+            .sql
+            .query(
+                "SELECT r.tenant, t.record_seq, t.keys_seq FROM key_routes r \
+                 LEFT JOIN tenants t ON t.id = r.tenant WHERE r.akid = ?1",
+                &[SqlValue::Text(akid.to_string())],
+            )
+            .await?;
+        rows.into_iter()
+            .next()
+            .map(|row| {
+                let tenant = Tenant::parse(&text(&row, 0)?).ok_or(ERR_ROW)?;
+                let seqs = match (row.get(1), row.get(2)) {
+                    (Some(SqlValue::Null), Some(SqlValue::Null)) => None,
+                    _ => Some((
+                        u64::try_from(int_at(&row, 1)?).map_err(|_| ERR_ROW)?,
+                        u64::try_from(int_at(&row, 2)?).map_err(|_| ERR_ROW)?,
+                    )),
+                };
+                Ok((tenant, seqs))
+            })
+            .transpose()
+    }
+
     /// The route of `akid`, `None` = no tenant has such a key.
     pub async fn route(&self, akid: &str) -> Result<Option<KeyRoute>> {
         let rows = self

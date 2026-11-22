@@ -38,13 +38,14 @@
 use velmora::rng::SystemRng;
 use velmora_bridge::jobmsg::{JobTenant, Units};
 use velmora_bridge::root::Root;
+use velmora_bridge::service::KeyDispatch;
 use velmora_bridge::sql::SqlCatalog;
 use velmora_bridge::tenant_catalog::{LatestSeqs, TenantCatalog, UnitPort};
 use velmora_bridge::types::JobOutcome;
 use velmora_bridge::unit::{Seqs, TenantId, UnitAnswer, UnitCall, UnitName, UnitReply};
 use velmora_bridge::unit_consumer::{NoClient, Ran, UnitRun};
 use velmora_bridge::unit_lease::client::UnitReplies;
-use velmora_bridge::unit_router::{KeyRoutes, KeyTenant, NoClients, Router};
+use velmora_bridge::unit_router::{KeyRoutes, NoClients, Router};
 use velmora_bridge::{Bridge, BridgeError, Result};
 use worker::wasm_bindgen::JsValue;
 use worker::{Env, Method, ObjectNamespace, Request, RequestInit, Stub};
@@ -296,17 +297,17 @@ pub async fn route_request(
     };
     let cache = crate::root::cache();
     let root = Root::new(&ports, &cache, SystemRng);
-    let (tenant, floor) = match root.key_routes().tenant_of(&akid).await {
-        Ok(KeyTenant::Managed { tenant, floor }) => (tenant, floor),
-        Ok(KeyTenant::Zero) => return None,
-        // DUR-10: no route could be shown for the key.
-        Ok(KeyTenant::Unrouted) | Err(_) => {
-            let (resp, line) =
-                velmora_bridge::service::serve_unrouted(&base.catalog, &akid).await?;
-            log_request(line);
-            return Some(resp);
-        }
-    };
+    let route = root.key_routes().tenant_of(&akid).await;
+    let (tenant, floor) =
+        match velmora_bridge::service::dispatch_key_route(route, &base.catalog, &akid).await {
+            KeyDispatch::Managed { tenant, floor } => (tenant, floor),
+            KeyDispatch::TenantZero => return None,
+            // DUR-10: no route could be shown for the key.
+            KeyDispatch::Answer(resp, line) => {
+                log_request(line);
+                return Some(resp);
+            }
+        };
     let heads = root.heads();
     let router = Router {
         maintenance: base.cfg.maintenance,

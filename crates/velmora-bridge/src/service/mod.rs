@@ -423,6 +423,40 @@ pub async fn serve_managed<R: crate::unit_router::UnitRouter>(
     }
 }
 
+/// What the request router does with a request, from its key's route.
+pub enum KeyDispatch {
+    /// Tenant 0's path, unchanged.
+    TenantZero,
+    /// Through the router to the tenant's unit ([`serve_managed`]).
+    Managed {
+        tenant: crate::unit::TenantId,
+        floor: crate::unit::Seqs,
+    },
+    /// Answered here: a key no route could be shown for (DUR-10).
+    Answer(S3Response, ManagedLine),
+}
+
+/// The router's dispatch of a key route read
+/// (`unit_router::KeyRoutes::tenant_of`): a managed tenant's route goes to
+/// its unit; a directory that names no route, tenant 0's path; no route
+/// after a failed directory read, or a failed route read, goes to
+/// [`serve_unrouted`] (ADR §8.4, DUR-10).
+pub async fn dispatch_key_route<C: crate::ports::Catalog>(
+    route: crate::types::Result<crate::unit_router::KeyTenant>,
+    catalog: &C,
+    access_key_id: &str,
+) -> KeyDispatch {
+    use crate::unit_router::KeyTenant;
+    match route {
+        Ok(KeyTenant::Managed { tenant, floor }) => KeyDispatch::Managed { tenant, floor },
+        Ok(KeyTenant::Zero) => KeyDispatch::TenantZero,
+        Ok(KeyTenant::Unrouted) | Err(_) => match serve_unrouted(catalog, access_key_id).await {
+            None => KeyDispatch::TenantZero,
+            Some((resp, line)) => KeyDispatch::Answer(resp, line),
+        },
+    }
+}
+
 /// A request whose claimed key no route names while the directory could
 /// not be read (`unit_router::KeyTenant::Unrouted`, or a failed route
 /// read): ADR §8.4 (DUR-10). A key tenant 0's catalogue holds takes

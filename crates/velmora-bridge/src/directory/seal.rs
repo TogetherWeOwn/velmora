@@ -175,6 +175,11 @@ impl SealKeys {
         }
     }
 
+    /// Drops every key past its time, of every tenant (as every use does).
+    pub fn prune(&self, now: UnixMs) {
+        prune(&mut self.tenants.borrow_mut(), now);
+    }
+
     /// How many keys are held, of every tenant (tests).
     pub fn len(&self) -> usize {
         self.tenants

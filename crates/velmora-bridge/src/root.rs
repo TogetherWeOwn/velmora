@@ -9,8 +9,11 @@
 //! `root.rs`), built from its `Env` once per invocation. [`RootCache`]
 //! is what an isolate keeps between invocations: the tenant keys it
 //! loaded (each for at most `keys::tk::TK_CACHE_MS`), the tenant heads
-//! the router read (`unit_router::HEAD_MAX_AGE_MS`), and the key
-//! locations (the same 60 s).
+//! the router read (`unit_router::HEAD_MAX_AGE_MS`), the key locations
+//! (the same 60 s), and the key routes to managed tenants that were read
+//! (no time limit: a route never changes; at most [`ROUTE_CACHE_KEYS`]).
+//! Every [`Root::new`] drops the expired keys, so an isolate that loads
+//! none for a while holds none past its time.
 //!
 //! **Off as shipped.** Nothing in a production Worker builds a [`Root`]:
 //! the Worker makes one only when `UNIT` is bound, and no production
@@ -40,6 +43,7 @@
 //! record byte or name of another tenant reaches one.
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::rc::Rc;
 
 use velmora::rng::FillRandom;
@@ -51,7 +55,7 @@ use crate::directory::seal::{committed_check, ChainSeal, DoorSeal, SealKeys};
 use crate::directory::store::SqlDirectory;
 use crate::keys::locations::{read_locations, KeyLocations};
 use crate::keys::routes::read_route;
-use crate::keys::tk::{KeyBuckets, LoadedRing, TkCache};
+use crate::keys::tk::{is_foreign, KeyBuckets, LoadedRing, TkCache, ERR_TK_MISSING};
 use crate::ports::{Clock, Kek, Sql};
 use crate::records::RecordStore;
 use crate::types::{BridgeError, Result, UnixMs};
@@ -64,6 +68,10 @@ const ERR_NO_CHECK: BridgeError =
     BridgeError::Crypto("head names no committed check value for its key version");
 const ERR_ROUTE_TENANT: BridgeError = BridgeError::Crypto("key route names no tenant id");
 const ERR_NO_TENANT: BridgeError = BridgeError::Invalid("tenant has no chain");
+
+/// At most this many key routes are kept per isolate; past it the cache
+/// is emptied (a route is read again on its next use).
+pub const ROUTE_CACHE_KEYS: usize = 4096;
 
 /// No numbers known: the unit's own answer is the first call's floor.
 const NO_SEQS: Seqs = Seqs {
@@ -100,6 +108,12 @@ pub struct RootCache {
     /// The router's tenant heads.
     pub heads: HeadCache,
     locations: RefCell<Option<(KeyLocations, UnixMs)>>,
+    /// Key routes to managed tenants, with the floor the first read gave
+    /// (ADR §8.4 step 2: a route never changes, so it is kept with no time
+    /// limit; the move and its undo replace every isolate by a deploy).
+    /// Only routes that were read are kept: never "no route", whose key
+    /// may get one later, and never a failed read.
+    routes: RefCell<HashMap<String, (crate::unit::TenantId, Seqs)>>,
 }
 
 impl RootCache {
@@ -119,6 +133,11 @@ pub struct Root<'a, P: RootPorts, R> {
 impl<'a, P: RootPorts, R: FillRandom> Root<'a, P, R> {
     /// `rng` is the system CSPRNG in the Worker.
     pub fn new(ports: &'a P, cache: &'a RootCache, rng: R) -> Self {
+        // No unwrapped key outlives its time in the isolate, also when
+        // this invocation loads none.
+        let now = ports.clock().now();
+        cache.tks.prune(now);
+        cache.seal_keys.prune(now);
         Root {
             ports,
             cache,
@@ -229,7 +248,7 @@ impl<'a, P: RootPorts, R: FillRandom> Root<'a, P, R> {
         kcv: [u8; KCV_LEN],
     ) -> Result<Rc<TenantKey>> {
         let locations = self.locations().await?;
-        let key = self
+        let loaded = self
             .cache
             .tks
             .load(
@@ -241,7 +260,18 @@ impl<'a, P: RootPorts, R: FillRandom> Root<'a, P, R> {
                 version,
                 kcv,
             )
-            .await?;
+            .await;
+        let key = match loaded {
+            Ok(key) => key,
+            Err(e) => {
+                // A marker or a foreign name refuses the tenant at once,
+                // here as in the loader: the seal drops its keys too.
+                if is_foreign(&e) {
+                    self.cache.seal_keys.forget(tenant);
+                }
+                return Err(e);
+            }
+        };
         // Dated from its unwrap, which the loader's cache knows.
         let now = self.ports.clock().now();
         let loaded_at = self
@@ -254,8 +284,11 @@ impl<'a, P: RootPorts, R: FillRandom> Root<'a, P, R> {
     }
 
     /// The tenant's key ring as its head names it: the version in force
-    /// and every older committed version that still loads (a retired one
-    /// does not, and is left out). For the key chain's reader and writer.
+    /// and every older committed version whose key still exists (a
+    /// retired one has none, and is left out). Any other failure to load
+    /// a version fails the call: a ring missing a live version would fold
+    /// that version's subjects as closed. For the key chain's reader and
+    /// writer.
     pub async fn tenant_keys(&self, tenant: &TenantId) -> Result<LoadedRing> {
         let t = Tenant::Managed(tenant.clone());
         let door = self
@@ -271,8 +304,10 @@ impl<'a, P: RootPorts, R: FillRandom> Root<'a, P, R> {
             .await?;
         let mut others = Vec::new();
         for &v in door.key_checks.keys().filter(|&&v| v != door.tk_version) {
-            if let Ok(key) = self.load_key(tenant, v, check(v)?).await {
-                others.push(key);
+            match self.load_key(tenant, v, check(v)?).await {
+                Ok(key) => others.push(key),
+                Err(e) if is_missing(&e) => {}
+                Err(e) => return Err(e),
             }
         }
         LoadedRing::new(current, others)
@@ -301,6 +336,12 @@ impl<'a, P: RootPorts, R: FillRandom> Root<'a, P, R> {
     }
 }
 
+/// The loader found no copy of the version in any location: a retired
+/// version.
+fn is_missing(e: &BridgeError) -> bool {
+    matches!((e, &ERR_TK_MISSING), (BridgeError::Crypto(a), BridgeError::Crypto(b)) if a == b)
+}
+
 fn chain_error(e: ChainError) -> BridgeError {
     match e {
         ChainError::Store(e) => e,
@@ -317,47 +358,57 @@ impl<P: RootPorts, R: FillRandom> RootRoutes<'_, '_, P, R> {
     /// The route record `m/kr/<akid>`, after a failed directory read.
     async fn route_record(&self, akid: &str) -> Result<KeyTenant> {
         match read_route(self.root.records(), self.root.kek(), akid).await? {
-            Some(route) => Ok(KeyTenant::Managed {
-                tenant: crate::unit::TenantId::parse(&route.tenant).ok_or(ERR_ROUTE_TENANT)?,
+            Some(route) => {
+                let tenant = crate::unit::TenantId::parse(&route.tenant).ok_or(ERR_ROUTE_TENANT)?;
                 // A record carries no numbers: the unit's own answer is the
                 // first call's floor (rule 5).
-                floor: NO_SEQS,
-            }),
+                Ok(self.keep(akid, tenant, NO_SEQS))
+            }
             None => Ok(KeyTenant::Unrouted),
         }
+    }
+
+    /// Keeps a route that was read, and answers it.
+    fn keep(&self, akid: &str, tenant: crate::unit::TenantId, floor: Seqs) -> KeyTenant {
+        let mut routes = self.root.cache.routes.borrow_mut();
+        if routes.len() >= ROUTE_CACHE_KEYS {
+            routes.clear();
+        }
+        routes.insert(akid.to_owned(), (tenant.clone(), floor));
+        KeyTenant::Managed { tenant, floor }
     }
 }
 
 impl<P: RootPorts, R: FillRandom> KeyRoutes for RootRoutes<'_, '_, P, R> {
     async fn tenant_of(&self, akid: &str) -> Result<KeyTenant> {
+        if let Some((tenant, floor)) = self.root.cache.routes.borrow().get(akid) {
+            return Ok(KeyTenant::Managed {
+                tenant: tenant.clone(),
+                floor: *floor,
+            });
+        }
         let Some(dir) = self.root.directory() else {
             return self.route_record(akid).await;
         };
-        let route = match dir.route(akid).await {
+        // One read: the route and the tenant's numbers (ADR §8.4 step 2).
+        let route = match dir.route_tenant(akid).await {
             Ok(route) => route,
             Err(_) => return self.route_record(akid).await,
         };
-        let Some(route) = route else {
-            // The directory was read and names no route: tenant 0's key,
-            // or none at all, which tenant 0's catalogue answers.
-            return Ok(KeyTenant::Zero);
-        };
-        let tenant = match &route.tenant {
-            Tenant::Zero => return Ok(KeyTenant::Zero),
-            Tenant::Managed(t) => {
-                crate::unit::TenantId::parse(t.as_str()).ok_or(ERR_ROUTE_TENANT)?
+        match route {
+            // The directory was read and names no route: tenant 0's key, or
+            // none at all, which tenant 0's catalogue answers.
+            None | Some((Tenant::Zero, _)) => Ok(KeyTenant::Zero),
+            Some((Tenant::Managed(t), seqs)) => {
+                let tenant = crate::unit::TenantId::parse(t.as_str()).ok_or(ERR_ROUTE_TENANT)?;
+                // A floor for the first call of a cold isolate; a row that
+                // is gone gives none (the unit's own answer then is).
+                let floor = seqs.map_or(NO_SEQS, |(state_seq, keys_seq)| Seqs {
+                    state_seq,
+                    keys_seq,
+                });
+                Ok(self.keep(akid, tenant, floor))
             }
-        };
-        // The numbers the directory holds for the tenant: a floor for the
-        // first call of a cold isolate. A failed read gives none (the
-        // unit's own answer then is the floor).
-        let floor = match dir.tenant(&route.tenant).await {
-            Ok(Some(row)) => Seqs {
-                state_seq: row.record_seq,
-                keys_seq: row.keys_seq,
-            },
-            _ => NO_SEQS,
-        };
-        Ok(KeyTenant::Managed { tenant, floor })
+        }
     }
 }

@@ -18,7 +18,7 @@ use velmora_bridge::directory::transition::{Actor, Change};
 use velmora_bridge::keys::locations::{two_in_account, write_locations};
 use velmora_bridge::keys::record::SubjectKind;
 use velmora_bridge::keys::routes::put_route;
-use velmora_bridge::keys::tk::KeyBuckets;
+use velmora_bridge::keys::tk::{tk_prefix, KeyBuckets};
 use velmora_bridge::ports::Catalog;
 use velmora_bridge::records::{MemRecords, RecordStore};
 use velmora_bridge::root::{Root, RootCache, RootPorts};
@@ -337,25 +337,37 @@ fn key_routes_read_the_directory_then_the_route_record() {
     let cache = RootCache::new();
     let root = Root::new(&p, &cache, TestRng(1));
     let routes = root.key_routes();
+    let db = p.directory.as_ref().unwrap();
     block_on(async {
         // The directory names the route: the tenant, with the numbers the
-        // directory holds for it.
-        assert_eq!(
-            routes.tenant_of(AKID).await.unwrap(),
-            KeyTenant::Managed {
-                tenant: unit_id(),
-                floor: Seqs {
-                    state_seq: 4,
-                    keys_seq: 3
-                },
-            }
-        );
-        // A key the directory names no route for: tenant 0's.
+        // directory holds for it, in one read.
+        db.reset_read_stats();
+        let managed = KeyTenant::Managed {
+            tenant: unit_id(),
+            floor: Seqs {
+                state_seq: 4,
+                keys_seq: 3,
+            },
+        };
+        assert_eq!(routes.tenant_of(AKID).await.unwrap(), managed);
+        assert_eq!(db.read_stats().queries, 1);
+        // Kept: the next request reads nothing (a route never changes).
+        assert_eq!(routes.tenant_of(AKID).await.unwrap(), managed);
+        assert_eq!(db.read_stats().queries, 1);
+        // A key the directory names no route for: tenant 0's, and not
+        // kept (a route may be made for it later).
         assert_eq!(
             routes.tenant_of("AKVL00000002").await.unwrap(),
             KeyTenant::Zero
         );
+        assert_eq!(
+            routes.tenant_of("AKVL00000002").await.unwrap(),
+            KeyTenant::Zero
+        );
+        assert_eq!(db.read_stats().queries, 3);
     });
+    // The cache is the isolate's: a fresh one for the rest.
+    let cache = RootCache::new();
 
     // The directory cannot be read (no schema): the route record decides.
     let broken = RusqliteSql::open_in_memory().unwrap();
@@ -435,4 +447,169 @@ fn an_unrouted_key_is_tenant_zeros_only_if_its_catalogue_holds_it() {
             .any(|(n, v)| n.eq_ignore_ascii_case("retry-after") && v == "30"));
         assert_eq!(line.code, "key_route_unreadable");
     });
+}
+
+/// Root review (general M-2): a retired version is left out of the ring;
+/// any other failure to load a version fails the call.
+#[test]
+fn the_ring_leaves_out_only_a_retired_version() {
+    let records = active_records();
+    let key2 = TenantKey::from_bytes(&id(), 2, derived("tenant key 2")).unwrap();
+    let p = ports(records.clone(), true, None);
+    let put = |p: &Ports, key: &TenantKey, kek: &TestKek| {
+        let (kek_v, blob) = wrap_tenant_key(kek, key, &mut TestRng(11)).unwrap();
+        let name = tk_blob_name(&id(), key.version(), kek_v);
+        for store in [&p.keys_a, &p.keys_b] {
+            assert!(block_on(store.put_if_absent(&name, blob.clone())).unwrap());
+        }
+    };
+    put(&p, &key2, &p.kek);
+    let cache = RootCache::new();
+    let root = Root::new(&p, &cache, TestRng(3));
+    block_on(async {
+        root.load_key(&id(), 1, key().check_value()).await.unwrap();
+        wrote(
+            &root,
+            Change::ClaimKeyVersion { version: 2 },
+            Actor::RotationJob,
+            NOW,
+        )
+        .await;
+        root.load_key(&id(), 2, key2.check_value()).await.unwrap();
+        wrote(
+            &root,
+            Change::CommitKeyVersion {
+                version: 2,
+                kcv: key2.check_value(),
+            },
+            Actor::RotationJob,
+            NOW,
+        )
+        .await;
+    });
+    use velmora_bridge::keys::record::TkRing;
+    // Version 1 retired (no blob anywhere): left out.
+    let retired = ports(records.clone(), false, None);
+    put(&retired, &key2, &retired.kek);
+    let cache = RootCache::new();
+    let root = Root::new(&retired, &cache, TestRng(4));
+    let ring = block_on(root.tenant_keys(&id())).unwrap();
+    assert_eq!(ring.current().unwrap().version(), 2);
+    assert!(ring.key(1).is_none());
+    // Version 1 there but under a KEK this Worker does not hold: the call
+    // fails, it does not fold version 1's subjects as closed.
+    let other_kek = ports(records, false, None);
+    put(&other_kek, &key2, &other_kek.kek);
+    let foreign_kek = TestKek::with_versions(9, &[(9, [0x99; 32])]);
+    put(&other_kek, &key(), &foreign_kek);
+    let cache = RootCache::new();
+    let root = Root::new(&other_kek, &cache, TestRng(5));
+    assert!(block_on(root.tenant_keys(&id())).is_err());
+}
+
+/// Root review (security LOW-B): a refused load drops the seal's keys of
+/// the tenant.
+#[test]
+fn a_refused_load_drops_the_seals_keys() {
+    let records = active_records();
+    let p = ports(records, true, None);
+    let k = Rc::new(key());
+    // A foreign name in a key location (as a shred's marker).
+    let stray = format!("{}junk", tk_prefix(&id()));
+    assert!(block_on(p.keys_a.put_if_absent(&stray, vec![1])).unwrap());
+    let fresh = RootCache::new();
+    let cold = Root::new(&p, &fresh, TestRng(4));
+    fresh.seal_keys.hold(k.clone(), NOW, NOW).unwrap();
+    assert!(block_on(cold.load_key(&id(), 1, key().check_value())).is_err());
+    assert!(!fresh.seal_keys.holds(&id(), 1, &key().check_value(), NOW));
+}
+
+/// Root review (security LOW-C): every root drops the isolate's expired
+/// keys, also when it loads none.
+#[test]
+fn a_new_root_drops_expired_keys() {
+    let records = active_records();
+    let p = ports(records, true, None);
+    let cache = RootCache::new();
+    {
+        let root = Root::new(&p, &cache, TestRng(3));
+        block_on(root.load_key(&id(), 1, key().check_value())).unwrap();
+    }
+    assert_eq!((cache.tks.len(), cache.seal_keys.len()), (1, 1));
+    p.clock.advance_ms(velmora_bridge::keys::tk::TK_CACHE_MS);
+    let _root = Root::new(&p, &cache, TestRng(4));
+    assert_eq!((cache.tks.len(), cache.seal_keys.len()), (0, 0));
+}
+
+/// Root review (general LOW-2): the router's dispatch of every route
+/// answer.
+#[test]
+fn the_router_dispatches_every_route_answer() {
+    use velmora_bridge::service::{dispatch_key_route, KeyDispatch};
+    let catalog = SqlCatalog::new(RusqliteSql::with_schema().unwrap());
+    block_on(async {
+        catalog
+            .create_access_key(&AccessKeyRow {
+                access_key_id: "AKZERO000001".into(),
+                principal: "owner".into(),
+                secret_wrapped: vec![1; 40],
+                kek_version: 1,
+                status: KeyStatus::Active,
+                created_at: NOW,
+            })
+            .await
+            .unwrap();
+        let floor = Seqs {
+            state_seq: 2,
+            keys_seq: 1,
+        };
+        let managed = Ok(KeyTenant::Managed {
+            tenant: unit_id(),
+            floor,
+        });
+        assert!(matches!(
+            dispatch_key_route(managed, &catalog, AKID).await,
+            KeyDispatch::Managed { tenant, floor: f } if tenant == unit_id() && f == floor
+        ));
+        assert!(matches!(
+            dispatch_key_route(Ok(KeyTenant::Zero), &catalog, "AKVL00000009").await,
+            KeyDispatch::TenantZero
+        ));
+        // DUR-10: a key tenant 0 holds goes to its path ...
+        for route in [
+            Ok(KeyTenant::Unrouted),
+            Err(velmora_bridge::BridgeError::Invalid("route read failed")),
+        ] {
+            assert!(matches!(
+                dispatch_key_route(route, &catalog, "AKZERO000001").await,
+                KeyDispatch::TenantZero
+            ));
+        }
+        // ... any other answers 503.
+        for route in [
+            Ok(KeyTenant::Unrouted),
+            Err(velmora_bridge::BridgeError::Invalid("route read failed")),
+        ] {
+            match dispatch_key_route(route, &catalog, "AKVL00000009").await {
+                KeyDispatch::Answer(resp, line) => {
+                    assert_eq!(resp.status, 503);
+                    assert_eq!(line.code, "key_route_unreadable");
+                }
+                _ => panic!("a key no route names after a failed read is not tenant 0's"),
+            }
+        }
+    });
+    // A catalogue that cannot be read either: 503.
+    let broken = SqlCatalog::new(RusqliteSql::open_in_memory().unwrap());
+    match block_on(dispatch_key_route(
+        Ok(KeyTenant::Unrouted),
+        &broken,
+        "AKZERO000001",
+    )) {
+        KeyDispatch::Answer(resp, line) => {
+            assert_eq!(resp.status, 503);
+            assert_eq!(line.code, "key_route_and_catalogue_unreadable");
+        }
+        _ => panic!("a failed catalogue read is not tenant 0's path"),
+    }
 }
