@@ -1166,6 +1166,15 @@ impl Charge {
         }
     }
 
+    /// Moves up to `bytes` of this charge's request bytes into a new
+    /// charge on the same budget and request, without changing either total.
+    pub fn split_off(&mut self, bytes: u64) -> Charge {
+        let mut part = self.beside();
+        part.requests = bytes.min(self.requests);
+        self.requests -= part.requests;
+        part
+    }
+
     /// Takes over what `other` holds, so that one charge stands for both.
     /// A charge against another budget is released instead.
     pub fn absorb(&mut self, mut other: Charge) {
@@ -1195,6 +1204,33 @@ impl Drop for Charge {
         s.requests
             .set(s.requests.get().saturating_sub(self.requests));
         s.jobs.set(s.jobs.get().saturating_sub(self.jobs));
+    }
+}
+
+#[cfg(test)]
+mod charge_tests {
+    use super::*;
+
+    #[test]
+    fn splitting_a_charge_keeps_the_same_request_and_budget_totals() {
+        let budget = ByteBudget::new(100);
+        let request = budget.for_request();
+        let mut work = request.try_charge(60).unwrap();
+        let spare = work.split_off(25);
+        assert_eq!((work.bytes(), spare.bytes()), (35, 25));
+        assert_eq!(
+            (budget.in_use(), budget.peak(), request.held()),
+            (60, 60, 60)
+        );
+
+        drop(spare);
+        assert_eq!((budget.in_use(), request.held()), (35, 35));
+        let all = work.split_off(100);
+        assert_eq!((work.bytes(), all.bytes()), (0, 35));
+        drop(work);
+        assert_eq!((budget.in_use(), request.held()), (35, 35));
+        drop(all);
+        assert_eq!((budget.in_use(), request.held()), (0, 0));
     }
 }
 

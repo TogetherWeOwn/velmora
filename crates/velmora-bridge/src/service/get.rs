@@ -1389,12 +1389,11 @@ where
             if bridge.clock.now() >= deadline {
                 return Err(ReadFail::Busy);
             }
-            // Not in the cache: read it, under a charge taken as above,
-            // and with the room for its rebuild in hand if that is free
-            // still. If it is not, the rebuild asks for it itself.
-            work = self.step(need, lean).await?;
+            // Not in the cache: charge the read and any rebuild together
+            // in turn, then hand the rebuild's part to the reader.
+            work = self.step(both, lean.saturating_add(rebuild)).await?;
             if rebuild > 0 {
-                spare = room.try_charge(rebuild);
+                spare = Some(work.split_off(rebuild));
             }
         }
     }

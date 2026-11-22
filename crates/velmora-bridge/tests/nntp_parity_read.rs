@@ -7,9 +7,12 @@ mod nntp_support;
 mod service_support;
 
 use nntp_support::*;
+use std::cell::Cell;
+use std::rc::Rc;
 use velmora::rng::SystemRng;
 use velmora::yenc::decode_part_to;
-use velmora_bridge::fetch::{cold_rebuild_bytes, ColdFetch, ColdStats};
+use velmora_bridge::fetch::{cold_rebuild_bytes, cold_step_bytes, ColdFetch, ColdStats};
+use velmora_bridge::ingress::{ByteBudget, Sleeper, CHARGE_POLL_MS};
 use velmora_bridge::parity;
 use velmora_bridge::*;
 
@@ -132,11 +135,38 @@ impl Stripe {
     }
 }
 
-/// Exercise the S3 GET with one permit shared by two same-tier read
-/// providers. The second provider has either one required parity article
-/// or one required data article.
-async fn shared_pool_cold_get(with_parity: bool) {
-    let nntp = rig(&[
+const GET_KEY: &str = "extent.bin";
+
+struct ColdGet {
+    nntp: Rig,
+    svc: service_support::Rig<TcpConnector>,
+    bucket: Bucket,
+    signer: service_support::Signer,
+    extent: ExtentRow,
+}
+
+impl ColdGet {
+    async fn get(&self) -> service_support::Resp {
+        self.svc
+            .call(
+                &self.signer,
+                Method::Get,
+                &service_support::path(&self.bucket.name, GET_KEY),
+                &[],
+                &[],
+                b"",
+            )
+            .await
+    }
+}
+
+async fn posted_for_get(
+    body: &[u8],
+    with_parity: bool,
+    pooled: bool,
+    sleeper: Option<Sleeper>,
+) -> ColdGet {
+    let specs = [
         Spec {
             backbone: "bb0",
             post: true,
@@ -147,30 +177,36 @@ async fn shared_pool_cold_get(with_parity: bool) {
             post: false,
             max_conns: 2,
         },
-    ])
-    .await;
+    ];
+    let nntp = rig(&specs[..if pooled { 2 } else { 1 }]).await;
     let mut providers = nntp.bridge.cfg.providers.clone();
-    for p in &mut providers {
-        p.pool = Some("shared".into());
-        p.pool_max_conns = Some(1);
+    if pooled {
+        for p in &mut providers {
+            p.pool = Some("shared".into());
+            p.pool_max_conns = Some(1);
+        }
     }
     let mut cfg = service_support::config(providers);
     cfg.cold_sockets = 2;
     cfg.packed_plans = with_parity;
     cfg.parity = with_parity;
-    let svc = service_support::rig_with(TcpConnector::default(), cfg);
+    let mut budget = ByteBudget::new(cfg.inflight_budget_bytes);
+    if let Some(sleeper) = sleeper {
+        budget = budget.with_sleeper(sleeper);
+    }
+    let svc = service_support::rig_with_budget(TcpConnector::default(), cfg, budget);
     let bridge = &svc.bridge;
     bridge
         .catalog
         .seed_permits(&bridge.cfg.providers)
         .await
         .unwrap();
-    let (bucket, signer) = svc.standard("pool-read").await;
-    let key = "extent.bin";
-    let body = marked_plaintext(if with_parity { TEN } else { THREE });
-    svc.put(&signer, &bucket.name, key, &body).await.expect(200);
-    let (generation, extents) = svc.live(&bucket, key).await.unwrap();
-    let extent = &extents[0];
+    let (bucket, signer) = svc.standard("cold-read").await;
+    svc.put(&signer, &bucket.name, GET_KEY, body)
+        .await
+        .expect(200);
+    let (generation, extents) = svc.live(&bucket, GET_KEY).await.unwrap();
+    let extent = extents.into_iter().next().unwrap();
     let lease = bridge
         .catalog
         .claim(
@@ -190,7 +226,25 @@ async fn shared_pool_cold_get(with_parity: bool) {
         .unwrap()
         .unwrap();
     assert_eq!(bridge.post_stage(&lease, &job).await, JobOutcome::Ack);
+    bridge.cache.delete(&extent.id.cache_key()).await.unwrap();
+    bridge.safety.delete(&extent.id.safety_key()).await.unwrap();
+    bridge.nntp.slow(&bridge.clock, 0);
+    ColdGet {
+        nntp,
+        svc,
+        bucket,
+        signer,
+        extent,
+    }
+}
 
+/// Exercise the S3 GET with one permit shared by two same-tier read
+/// providers. The second provider has either one required parity article
+/// or one required data article.
+async fn shared_pool_cold_get(with_parity: bool) {
+    let body = marked_plaintext(if with_parity { TEN } else { THREE });
+    let cold = posted_for_get(&body, with_parity, true, None).await;
+    let (nntp, bridge, extent) = (&cold.nntp, &cold.svc.bridge, &cold.extent);
     let stored = bridge.catalog.stored_plan(&extent.id).await.unwrap();
     let parity = stored.parity_plan(&extent.id, extent.cipher_size).unwrap();
     let mut src = nntp.raw_client(0).await;
@@ -220,19 +274,8 @@ async fn shared_pool_cold_get(with_parity: bool) {
     }
     src.quit().await;
     dst.quit().await;
-    bridge.cache.delete(&extent.id.cache_key()).await.unwrap();
-    bridge.safety.delete(&extent.id.safety_key()).await.unwrap();
 
-    let response = svc
-        .call(
-            &signer,
-            Method::Get,
-            &service_support::path(&bucket.name, key),
-            &[],
-            &[],
-            b"",
-        )
-        .await;
+    let response = cold.get().await;
     response.expect(200);
     assert!(
         response.body == body,
@@ -250,6 +293,98 @@ async fn cold_get_rebuilds_with_parity_split_over_one_shared_pool_slot() {
 #[tokio::test]
 async fn cold_get_reads_data_from_the_waiting_provider_of_a_shared_pool() {
     shared_pool_cold_get(false).await;
+}
+
+/// A competitor takes the rebuild's room during the retry's cache
+/// check. The extent alone fits, but the retry must wait for both rather
+/// than download without enough room again.
+#[tokio::test]
+async fn cold_get_downloads_only_once_more_when_retry_rebuild_room_is_taken() {
+    let polls = Rc::new(Cell::new(0u32));
+    let released = Rc::new(Cell::new(0u32));
+    let sleeper: Sleeper = {
+        let (polls, released) = (polls.clone(), released.clone());
+        Rc::new(move |ms| {
+            if ms > CHARGE_POLL_MS {
+                return Box::pin(std::future::pending());
+            }
+            let poll = polls.get() + 1;
+            polls.set(poll);
+            let released = released.clone();
+            Box::pin(async move {
+                while released.get() < poll {
+                    tokio::task::yield_now().await;
+                }
+            })
+        })
+    };
+    let body = marked_plaintext(THREE);
+    let cold = posted_for_get(&body, true, false, Some(sleeper)).await;
+    let bridge = &cold.svc.bridge;
+    let extent = &cold.extent;
+    let stored = bridge.catalog.stored_plan(&extent.id).await.unwrap();
+    let parity = stored
+        .parity_plan(&extent.id, extent.cipher_size)
+        .unwrap()
+        .unwrap();
+    cold.nntp.server().hide(&stored.rows[1].message_id).await;
+
+    let budget = &bridge.budget;
+    let step = cold_step_bytes(extent.cipher_size, bridge.cfg.cold_sockets);
+    let rebuild = cold_rebuild_bytes(parity.articles[0].cipher_len, 1);
+    let base = budget.capacity() - step - rebuild;
+    let block_first = budget.try_charge(base + 1).unwrap();
+    let trip = &bridge.cache.trip;
+    let competitor = async {
+        while polls.get() == 0 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            budget.in_use(),
+            base + 1,
+            "the read waits without its charge"
+        );
+        drop(block_first);
+        let _base = budget.try_charge(base).unwrap();
+        trip.arm(0, service_support::Trip::Stall);
+        released.set(1);
+        while !trip.tripped() {
+            tokio::task::yield_now().await;
+        }
+        let taken = budget
+            .try_charge(rebuild)
+            .expect("retry has not reserved rebuild room across warm");
+        trip.release();
+        while polls.get() < 2 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            budget.in_use(),
+            base + rebuild,
+            "the retry waits without its charge"
+        );
+        drop(taken);
+        released.set(u32::MAX);
+    };
+    let (response, ()) = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        futures_util::future::join(cold.get(), competitor),
+    )
+    .await
+    .expect("the cold GET and competitor finish");
+
+    response.expect(200);
+    assert!(response.body == body);
+    let bodies = bridge
+        .nntp
+        .calls()
+        .iter()
+        .filter(|call| call.0 == "body")
+        .count();
+    // Each pass makes four data requests (including the second ask for
+    // the lost article); only the second pass fetches a parity article.
+    assert_eq!(bodies, 4 + 5, "a third full download was made");
+    assert_eq!(budget.in_use(), 0);
 }
 
 fn verified(stats: &ColdStats) -> u32 {
