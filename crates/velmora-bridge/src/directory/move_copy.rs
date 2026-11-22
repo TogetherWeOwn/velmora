@@ -109,8 +109,10 @@ pub trait UnitImport {
     /// `move_ordinal` the seal records (it travels in `MoveHead.flips`
     /// once the unit's call carries it). `tables` names every import table
     /// with its row count. The unit accepts it only when every count
-    /// equals its own; a repeat with the same counts answers
-    /// [`Sealed::Done`]. An `Err` says nothing about whether it landed.
+    /// equals its own. A repeat may be refused (for one, under the `since`
+    /// of a later `restoring` entry, which the seal survives): [`seal`]
+    /// then reads [`Self::seal_state`]. An `Err` says nothing about
+    /// whether it landed.
     async fn seal(
         &self,
         head: &MoveHead,
@@ -118,6 +120,16 @@ pub trait UnitImport {
         since: u64,
         tables: &[(ImportTable, u64)],
     ) -> crate::types::Result<Sealed>;
+    /// The unit's seal, if the import is sealed: its `move_ordinal` and
+    /// the row count of every import table it sealed with.
+    async fn seal_state(&self) -> crate::types::Result<Option<SealState>>;
+}
+
+/// A sealed import, as the unit holds it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SealState {
+    pub move_ordinal: u64,
+    pub tables: Vec<(ImportTable, u64)>,
 }
 
 /// The unit's answer to `ImportSeal`.
@@ -214,7 +226,9 @@ pub fn move_ordinal(zero: &TenantDoor) -> Option<u64> {
 
 /// Ends the import after the last batch (AM-29): `ImportSeal` with every
 /// table's row count as `copied` (the answer of [`copy_all`]) gives it. A
-/// lost answer sends the seal again; a repeat is answered as done.
+/// lost answer sends the seal again. A refused seal is done when the unit
+/// is already sealed for this ordinal with these counts (a repeat, also
+/// one under a later `restoring` entry).
 pub async fn seal<U: UnitImport>(
     unit: &U,
     head: &MoveHead,
@@ -237,13 +251,30 @@ pub async fn seal<U: UnitImport>(
     for _ in 0..SEND_TRIES {
         match unit.seal(head, ordinal, since, &tables).await {
             Ok(Sealed::Done) => return Ok(()),
-            Ok(Sealed::Refused(code)) => return Err(CopyError::SealRefused(code)),
+            Ok(Sealed::Refused(code)) => {
+                return match unit.seal_state().await? {
+                    Some(state)
+                        if state.move_ordinal == ordinal && same(&state.tables, &tables) =>
+                    {
+                        Ok(())
+                    }
+                    _ => Err(CopyError::SealRefused(code)),
+                }
+            }
             Err(e) => last_err = Some(e),
         }
     }
     Err(CopyError::Store(last_err.unwrap_or(BridgeError::Invalid(
         "move copy: no try was made",
     ))))
+}
+
+/// The same count for every table, in any order.
+fn same(a: &[(ImportTable, u64)], b: &[(ImportTable, u64)]) -> bool {
+    let set = |v: &[(ImportTable, u64)]| -> BTreeMap<&'static str, u64> {
+        v.iter().map(|(t, n)| (t.name(), *n)).collect()
+    };
+    a.len() == b.len() && set(a) == set(b)
 }
 
 /// Copies every table, in [`ImportTable::ALL`] order, resuming each from
@@ -491,8 +522,10 @@ impl<S: Sql, U: UnitImport, T: RowTransform> Copier<'_, S, U, T> {
                 let leased = !matches!(column(table, row, "lease_owner"), Some(ImportValue::Null))
                     || !matches!(column(table, row, "lease_until"), Some(ImportValue::Null));
                 if leased {
+                    // Live while `lease_until >= now`, as the outbox
+                    // holds it (a claim needs `lease_until < now`).
                     if let Some(ImportValue::Int(until)) = column(table, row, "lease_until") {
-                        if *until > self.now.0 {
+                        if *until >= self.now.0 {
                             return Err(CopyError::LiveLease);
                         }
                     }

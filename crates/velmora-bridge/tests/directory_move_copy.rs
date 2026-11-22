@@ -12,8 +12,8 @@ use std::collections::BTreeSet;
 use service_support::*;
 use velmora_bridge::directory::fence::freeze;
 use velmora_bridge::directory::move_copy::{
-    bound, copy_all, key_columns, move_ordinal, seal, CopyError, CopyPlan, RowTransform, Sealed,
-    TableCopy, UnitImport,
+    bound, copy_all, key_columns, move_ordinal, seal, CopyError, CopyPlan, RowTransform, SealState,
+    Sealed, TableCopy, UnitImport,
 };
 use velmora_bridge::directory::record::{Tenant, TenantRecord};
 use velmora_bridge::directory::transition::{next, Actor, Change, Outcome, KEY_CHECK_LEN};
@@ -351,6 +351,13 @@ impl UnitImport for Adapter<'_> {
             return Err(BridgeError::Blob("answer lost".into()));
         }
         Ok(Sealed::Done)
+    }
+
+    async fn seal_state(&self) -> Result<Option<SealState>> {
+        Ok(self.sealed.borrow().as_ref().map(|(o, _, t)| SealState {
+            move_ordinal: *o,
+            tables: t.clone(),
+        }))
     }
 }
 
@@ -779,6 +786,17 @@ fn the_seal_names_every_table_with_the_units_count() {
         assert!(matches!(r, Err(CopyError::Store(_))), "{r:?}");
         assert_eq!(adapter.seals.get(), 4);
         seal(&adapter, &head, 1, since, &done).await.unwrap();
+        // A repeat under a later restoring entry (AM-15's re-entry, which
+        // the seal survives) is refused by the unit and found done.
+        let before = adapter.seals.get();
+        seal(&adapter, &head, 1, since + 1, &done).await.unwrap();
+        assert_eq!(adapter.seals.get(), before + 1);
+        // Sealed under another ordinal: not this window's import.
+        let r = seal(&adapter, &head, 2, since + 1, &done).await;
+        assert!(
+            matches!(&r, Err(CopyError::SealRefused(c)) if c == "sealed"),
+            "{r:?}"
+        );
         // The ordinal is only a moving head's.
         let mut d1 = zero.clone();
         d1.door.tenant_zero.as_mut().unwrap().selector =
@@ -922,6 +940,29 @@ fn a_live_lease_stops_the_copy_before_the_outbox() {
         // The tables before the outbox were copied; a run after the
         // drain finishes goes on from there.
         assert!(!rows(u.sql(), ImportTable::Extents).is_empty());
+    });
+}
+
+#[test]
+fn a_lease_that_ends_now_is_still_live() {
+    block_on(async {
+        let rig = rig();
+        let (_, canary) = catalogue_with_lease(&rig, rig.now().0).await;
+        let (zero, owner) = heads();
+        let (head, since) = bound(&zero.door, &owner.door).unwrap();
+        let u = unit(since);
+        let adapter = Adapter::new(&u, since);
+        let r = copy_all(
+            &rig.bridge.catalog.sql,
+            &adapter,
+            &Stub { rehomed: None },
+            &plan(&canary, 500),
+            &head,
+            since,
+            rig.now(),
+        )
+        .await;
+        assert!(matches!(r, Err(CopyError::LiveLease)), "{r:?}");
     });
 }
 
