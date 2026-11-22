@@ -64,16 +64,26 @@ use super::reserve;
 use crate::ports::{Sql, SqlValue};
 use crate::types::{BridgeError, Result, UnixMs};
 
-/// The most bucket rows a unit holds (est): a bucket create's
-/// reservation is refused `cap_reached` at it, so the head's placement
-/// list for the unit, which every `sync` carries whole, never outgrows
-/// [`check_shape`]'s bound.
-pub const MAX_PLACED: usize = 10_000;
-/// The most bucket changes one `sync` may carry (est), and the most ids
-/// all its `unplaced` changes name together: a restore to an older
-/// bookmark at the create cap (50 a day for 30 days, with their drops)
-/// stays inside it.
+/// The `sync` shape bound (AM-57, AM-73): the most ids the placement
+/// list, one `unplaced` list, and all `unplaced` lists of one `sync`
+/// together may name. Twice the reservation cap
+/// ([`reserve::MAX_BUCKETS`]): a swept reservation still gets its row
+/// from its record, so the head can place more buckets than the cap
+/// counted, and a bound at the cap would refuse every later `sync`. A
+/// placement list over the cap is served and pages `buckets_over_cap`
+/// ([`over_cap`]).
+pub const MAX_PLACED: usize = 20_000;
+/// The most bucket changes one `sync` may carry (est): a restore to an
+/// older bookmark at the create cap (50 a day for 30 days, with their
+/// drops) stays inside it. It bounds the number of changes only.
 pub const MAX_CHANGES: usize = 10_000;
+
+/// Whether the placement list names more buckets than the reservation
+/// cap (AM-73): the `sync` is served, and its answer carries
+/// `buckets_over_cap` for the Worker's page.
+pub fn over_cap(placed: &[String]) -> bool {
+    placed.len() as u64 > reserve::MAX_BUCKETS
+}
 
 /// One bucket change of a tenant record, as the Worker read and verified
 /// it (`name` and `bdk_wrapped` come from the record's private part).
@@ -227,7 +237,8 @@ pub fn is_closing<S: Sql>(sql: &S, bucket_id: &str) -> Result<bool> {
 /// The shape of a `sync`'s bucket part, before anything is read: changes
 /// in seq order (strictly rising), above the unit's `state_seq`, at or
 /// below the head's; ids and names well formed; at most [`MAX_CHANGES`]
-/// changes and [`MAX_PLACED`] ids in a list.
+/// changes, and at most [`MAX_PLACED`] ids in the placement list and in
+/// all `unplaced` lists together.
 pub fn check_shape(
     changes: &[BucketChange],
     placed: &[String],
@@ -246,7 +257,7 @@ pub fn check_shape(
         }
         if let BucketChange::Unplaced { buckets, .. } = c {
             unplaced = unplaced.saturating_add(buckets.len());
-            if unplaced > MAX_CHANGES {
+            if unplaced > MAX_PLACED {
                 return Err(Malformed);
             }
         }

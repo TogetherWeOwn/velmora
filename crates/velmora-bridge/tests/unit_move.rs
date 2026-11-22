@@ -1756,6 +1756,43 @@ fn the_key_tables_are_hashed_only_and_equal_the_chains_projection() {
 }
 
 #[test]
+fn v6_hashes_the_first_non_null_owner_ref_after_a_conflicting_apply() {
+    let u = closed_for_the_move();
+    fill(&u, &[]);
+    let initial = principal(1, vec![grant(B1, Access::Rw)]);
+    let mut absent = principal(2, vec![]);
+    absent.owner_ref = None;
+    let mut disputed = principal(3, vec![grant(B1, Access::Ro)]);
+    disputed.owner_ref = Some("member-2".into());
+    let entries = [initial, absent, disputed];
+    let applied = ok(worker(
+        &u,
+        UnitOp::ApplyKeys {
+            from_seq: 0,
+            entries: entries.iter().cloned().map(Into::into).collect(),
+            answers: vec![],
+        },
+    ));
+    assert_eq!(applied["applied"], json!(3));
+    assert_eq!(applied["owner_ref_conflict"], json!([P]));
+
+    let (keys_rows, grant_rows) = chain_key_rows(&entries).unwrap();
+    let kt = ExportTable::Keys(KeyTable::UnitKeys);
+    let owner_ref = kt.columns().iter().position(|&c| c == "owner_ref").unwrap();
+    assert_eq!(keys_rows.len(), 1);
+    assert_eq!(keys_rows[0][owner_ref], t("member-1"));
+    for (table, rows) in [
+        (kt, keys_rows),
+        (ExportTable::Keys(KeyTable::UnitKeyGrants), grant_rows),
+    ] {
+        assert_eq!(rows.len(), 1);
+        let exported = ok(worker(&u, export_op(table, None, 500, ExportMode::Hash)));
+        assert_eq!(exported["count"], json!(1));
+        assert_eq!(exported["sha256"], json!(hash_rows(table, &rows).unwrap()));
+    }
+}
+
+#[test]
 fn a_malformed_export_is_refused_and_export_writes_nothing() {
     let u = closed_for_the_move();
     fill(&u, &["a"]);

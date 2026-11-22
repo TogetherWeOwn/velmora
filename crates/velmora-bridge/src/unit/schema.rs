@@ -47,6 +47,7 @@ pub const UNIT: &[&str] = &[
     include_str!("migrations/u0007_reservations.sql"),
     include_str!("migrations/u0008_move_lift_time.sql"),
     include_str!("migrations/u0009_bucket_closing.sql"),
+    include_str!("migrations/u0010_reads_release.sql"),
 ];
 
 /// The schema a token must name: every migration a unit applies.

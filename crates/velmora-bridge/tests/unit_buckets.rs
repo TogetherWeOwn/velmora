@@ -546,14 +546,43 @@ fn a_bucket_change_reads_back_from_its_json_and_shows_no_name_or_wrap() {
     assert!(!shown.contains("secret-name"), "{shown}");
 }
 
-/// The unit's bucket rows with its open creates stay below
-/// `MAX_PLACED`, the bound of the placement list every `sync` carries: a
-/// bucket create's reservation is refused `cap_reached` at it, so a
-/// tenant's `sync` is never refused for its size.
 #[test]
-fn a_bucket_create_is_refused_once_the_unit_holds_max_placed() {
+fn sync_shape_has_a_separate_bound_from_the_bucket_limit() {
+    let ids: Vec<_> = (0..=20_000).map(|i| format!("b_{i:016x}")).collect();
+    assert_eq!(buckets::check_shape(&[], &ids[..20_000], 3, 5), Ok(()));
+    assert_eq!(
+        buckets::check_shape(&[], &ids, 3, 5),
+        Err(BucketRefusal::Malformed)
+    );
+    let unplaced = |end| {
+        vec![
+            BucketChange::Unplaced {
+                seq: 4,
+                buckets: ids[..10_000].to_vec(),
+            },
+            BucketChange::Unplaced {
+                seq: 5,
+                buckets: ids[10_000..end].to_vec(),
+            },
+        ]
+    };
+    assert_eq!(buckets::check_shape(&unplaced(20_000), &[], 3, 5), Ok(()));
+    assert_eq!(
+        buckets::check_shape(&unplaced(20_001), &[], 3, 5),
+        Err(BucketRefusal::Malformed)
+    );
+    assert!(!buckets::over_cap(&ids[..10_000]));
+    assert!(buckets::over_cap(&ids[..10_001]));
+}
+
+/// Closing rows and still-open creates both use a slot in the absolute
+/// bucket limit, which is lower than the separate sync shape bound.
+#[test]
+fn a_bucket_create_is_refused_at_the_absolute_limit() {
     use velmora_bridge::unit::keys::{KeyEntry, KeyKind, SubjectStatus};
-    use velmora_bridge::unit::reserve::{Acting, Hash32, Opening, ReserveRefusal, Rid};
+    use velmora_bridge::unit::reserve::{
+        Acting, Hash32, Opening, ReserveRefusal, Rid, MAX_BUCKETS,
+    };
     let u = ready();
     let principal = KeyEntry {
         id: "p_owner".into(),
@@ -586,7 +615,7 @@ fn a_bucket_create_is_refused_once_the_unit_holds_max_placed() {
                     "INSERT INTO buckets(id, name, owner, bdk_wrapped, kek_version, created_at) \
                      VALUES (?1, ?2, 'o', x'02', 1, 1)",
                 )?;
-                for i in 0..buckets::MAX_PLACED - 1 {
+                for i in 0..MAX_BUCKETS - 1 {
                     st.execute([format!("b_{i:016x}"), format!("bulk-{i}")])?;
                 }
             }
@@ -603,13 +632,24 @@ fn a_bucket_create_is_refused_once_the_unit_holds_max_placed() {
             unit: 0,
         },
     };
+    let closed = worker(
+        &u,
+        UnitOp::BucketClose {
+            bucket_id: "b_0000000000000000".into(),
+        },
+    );
+    assert!(matches!(closed, UnitAnswer::Ok { .. }), "{closed:?}");
     let first = worker(&u, ask(1));
     assert!(matches!(first, UnitAnswer::Ok { .. }), "{first:?}");
-    assert!(matches!(
-        worker(&u, ask(2)),
-        UnitAnswer::Refused {
-            reason: Refused::Reserve(ReserveRefusal::CapReached),
-            ..
-        }
-    ));
+    let second = worker(&u, ask(2));
+    assert!(
+        matches!(
+            second,
+            UnitAnswer::Refused {
+                reason: Refused::Reserve(ReserveRefusal::LimitReached),
+                ..
+            }
+        ),
+        "{second:?}"
+    );
 }

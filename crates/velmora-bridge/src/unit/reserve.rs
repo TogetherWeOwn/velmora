@@ -69,6 +69,10 @@ pub const S3_KEYS: i64 = 20;
 pub const APP_PASSWORDS: i64 = 20;
 /// The largest answer kept (AM-38).
 pub const MAX_ANSWER: usize = 16 * 1024;
+/// Bucket rows per tenant (AM-73, est; the owner's yes pending): the
+/// root unit's rows, `closing` ones included, with its open bucket
+/// creates. A create past it is refused [`ReserveRefusal::LimitReached`].
+pub const MAX_BUCKETS: u64 = 10_000;
 
 /// 32 bytes as 64 lowercase hex digits: the key hash and the fingerprint.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -251,8 +255,14 @@ impl Opening {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReserveRefusal {
-    /// A cap of ADR §6.3 is full: `429 cap_reached`.
+    /// A rate cap of ADR §6.3 is full (creates per hour, bucket creates
+    /// per day): `429 cap_reached`.
     CapReached,
+    /// An absolute limit is full (AM-73): [`S3_KEYS`] or
+    /// [`APP_PASSWORDS`] active keys (`409 key_limit_reached`), or
+    /// [`MAX_BUCKETS`] bucket rows with the open creates
+    /// (`409 bucket_limit_reached`). Waiting does not lift it.
+    LimitReached,
     /// A grant is wider than the acting principal's: `403 grant_not_held`.
     GrantNotHeld,
     /// A grant with a prefix, an expiry or an address list (AM-18):
@@ -328,9 +338,11 @@ pub enum Admit {
     /// `subject` and `unit`: what the reservation holds (the key or
     /// principal id, the subject of a grant change; a bucket's unit). A
     /// call asked again uses them, not ids it drew again: the row turns
-    /// `applied` only by a record for its own subject.
+    /// `applied` only by a record for its own subject. `asks`: the row's
+    /// admit count after this admit (AM-72); a release passes it.
     Admitted {
         rid: Rid,
+        asks: u64,
         keys_seq: u64,
         again: bool,
         scope: Option<String>,
@@ -383,6 +395,7 @@ impl Admit {
         Some(match self {
             Admit::Admitted {
                 rid,
+                asks,
                 keys_seq,
                 again,
                 scope,
@@ -390,7 +403,7 @@ impl Admit {
                 subject,
                 unit,
             } => json!({ "admitted": {
-                "rid": rid.hex(), "keys_seq": keys_seq, "again": again,
+                "rid": rid.hex(), "asks": asks, "keys_seq": keys_seq, "again": again,
                 "scope": scope, "bound": bound, "subject": subject, "unit": unit,
             }}),
             Admit::Applied {
@@ -528,30 +541,47 @@ fn shape(ask: &Ask) -> std::result::Result<(), ReserveRefusal> {
 
 /// The principal an ask or a read names, whatever its status: a
 /// principal that is not revoked for an `owner_ref`, the principal of
-/// that id otherwise.
+/// that id otherwise. A principal whose row carries an `owner_ref`
+/// conflict mark (AM-72) answers [`ReserveRefusal::OwnerRefAmbiguous`]
+/// by its id, by its stored value and by the disputed one, so a disputed
+/// value resolves to no principal.
 fn find_principal<S: Sql>(
     sql: &S,
     acting: &Acting,
 ) -> Result<std::result::Result<PrincipalView, ReserveRefusal>> {
     let rows = match acting {
         Acting::OwnerRef(r) => poll_once(sql.query(
-            "SELECT id, status, held FROM unit_keys \
-              WHERE kind = 'principal' AND owner_ref = ?1 AND status <> 'revoked' LIMIT 2",
+            "SELECT k.id, k.status, k.held, \
+                    EXISTS (SELECT 1 FROM unit_owner_ref_conflicts m WHERE m.id = k.id) \
+               FROM unit_keys k \
+              WHERE k.kind = 'principal' AND k.owner_ref = ?1 AND k.status <> 'revoked' \
+             UNION \
+             SELECT k.id, k.status, k.held, 1 \
+               FROM unit_owner_ref_conflicts c JOIN unit_keys k ON k.id = c.id \
+              WHERE c.disputed = ?1 AND k.kind = 'principal' AND k.status <> 'revoked' \
+              LIMIT 2",
             &[SqlValue::Text(r.clone())],
         ))??,
         Acting::Principal(id) => poll_once(sql.query(
-            "SELECT id, status, held FROM unit_keys \
-              WHERE id = ?1 AND kind = 'principal' AND status <> 'revoked'",
+            "SELECT k.id, k.status, k.held, \
+                    EXISTS (SELECT 1 FROM unit_owner_ref_conflicts c WHERE c.id = k.id) \
+               FROM unit_keys k \
+              WHERE k.id = ?1 AND k.kind = 'principal' AND k.status <> 'revoked'",
             &[SqlValue::Text(id.clone())],
         ))??,
     };
-    if rows.len() > 1 {
+    if rows.len() > 1
+        || rows
+            .iter()
+            .any(|r| matches!(r.get(3), Some(SqlValue::Int(1))))
+    {
         return Ok(Err(ReserveRefusal::OwnerRefAmbiguous));
     }
     let Some(r) = rows.into_iter().next() else {
         return Ok(Err(ReserveRefusal::ActingPrincipalUnknown));
     };
-    let (SqlValue::Text(id), SqlValue::Text(status), SqlValue::Int(held)) = (&r[0], &r[1], &r[2])
+    let (SqlValue::Text(id), SqlValue::Text(status), SqlValue::Int(held), SqlValue::Int(0)) =
+        (&r[0], &r[1], &r[2], &r[3])
     else {
         return Err(decode("unit_keys principal"));
     };
@@ -821,6 +851,7 @@ pub fn admit<S: Sql>(
         if row.bound.is_some() {
             return Ok(Admit::Admitted {
                 rid: row.rid,
+                asks: count_ask(sql, &row.rid)?,
                 keys_seq,
                 again: true,
                 scope: Some(scope),
@@ -854,6 +885,7 @@ pub fn admit<S: Sql>(
         ))??;
         return Ok(Admit::Admitted {
             rid: row.rid,
+            asks: count_ask(sql, &row.rid)?,
             keys_seq,
             again: true,
             scope: acting.map(|p| p.id),
@@ -974,6 +1006,7 @@ pub fn admit<S: Sql>(
     };
     Ok(Admit::Admitted {
         rid: *ask.rid,
+        asks: 1,
         keys_seq,
         again: false,
         scope: acting.map(|p| p.id),
@@ -1083,18 +1116,21 @@ fn caps<S: Sql>(
     opening: &Opening,
     now: UnixMs,
 ) -> Result<std::result::Result<(), ReserveRefusal>> {
+    // An absolute limit answers first: it is permanent, and a rate cap's
+    // `429` would send the caller to retry for ever (AM-73).
     if let Opening::Bucket { .. } = opening {
-        // The unit's bucket rows, with the open creates, stay inside the
-        // placement list's bound (`buckets::MAX_PLACED`): a `sync` always
-        // carries the whole list.
+        // The unit's bucket rows (`closing` ones too), with the open
+        // creates. A swept reservation still gets its row from its record,
+        // so the head can place more than this counted: the `sync` shape
+        // bound is twice it (`buckets::MAX_PLACED`).
         let open = count(
             sql,
             "SELECT count(*) FROM unit_reservations WHERE class = 'bucket' AND state = 'reserved'",
             &[],
         )?;
         let open = u64::try_from(open).map_err(|_| decode("count"))?;
-        if super::buckets::count(sql)?.saturating_add(open) >= super::buckets::MAX_PLACED as u64 {
-            return Ok(Err(ReserveRefusal::CapReached));
+        if super::buckets::count(sql)?.saturating_add(open) >= MAX_BUCKETS {
+            return Ok(Err(ReserveRefusal::LimitReached));
         }
         let day = count(
             sql,
@@ -1106,14 +1142,6 @@ fn caps<S: Sql>(
         } else {
             Ok(())
         });
-    }
-    let hour = count(
-        sql,
-        "SELECT count(*) FROM unit_cap_uses WHERE at > ?1 AND class <> 'bucket'",
-        &[SqlValue::Int(now.0.saturating_sub(HOUR_MS))],
-    )?;
-    if hour >= CHANGES_PER_HOUR {
-        return Ok(Err(ReserveRefusal::CapReached));
     }
     if let Opening::Key { kind, .. } = opening {
         let cap = if *kind == KeyKind::AppPassword {
@@ -1130,28 +1158,67 @@ fn caps<S: Sql>(
             &[kind],
         )?;
         if active >= cap {
-            return Ok(Err(ReserveRefusal::CapReached));
+            return Ok(Err(ReserveRefusal::LimitReached));
         }
+    }
+    let hour = count(
+        sql,
+        "SELECT count(*) FROM unit_cap_uses WHERE at > ?1 AND class <> 'bucket'",
+        &[SqlValue::Int(now.0.saturating_sub(HOUR_MS))],
+    )?;
+    if hour >= CHANGES_PER_HOUR {
+        return Ok(Err(ReserveRefusal::CapReached));
     }
     Ok(Ok(()))
 }
 
-/// Drops the `reserved` row `rid`: a call that ends with no record
-/// (`release`), or a re-ask refused at the head. An applied or missing
-/// one changes nothing. `free_slot`: the call ended with no record, so its
-/// cap slot is given back too; a re-ask's refusal keeps it (its record may
-/// exist after a lost answer).
-pub fn release<S: Sql>(sql: &S, rid: &Rid, free_slot: bool) -> Result<bool> {
+/// Raises the admit count of the reservation `rid` (an admit asked it
+/// again) and answers the new count.
+fn count_ask<S: Sql>(sql: &S, rid: &Rid) -> Result<u64> {
+    let rid = SqlValue::Blob(rid.0.to_vec());
     let n = poll_once(sql.exec(
-        "DELETE FROM unit_reservations WHERE rid = ?1 AND state = 'reserved'",
-        &[SqlValue::Blob(rid.0.to_vec())],
+        "UPDATE unit_reservations SET asks = asks + 1 WHERE rid = ?1 AND state = 'reserved'",
+        std::slice::from_ref(&rid),
     ))??;
-    if n == 1 && free_slot {
+    if n != 1 {
+        return Err(decode("unit_reservations asks"));
+    }
+    let asks = count(
+        sql,
+        "SELECT asks FROM unit_reservations WHERE rid = ?1",
+        &[rid],
+    )?;
+    u64::try_from(asks).map_err(|_| decode("unit_reservations asks"))
+}
+
+/// A call that ends with no record gives its reservation back (AM-72):
+/// the `reserved` row `rid` is deleted only while it still holds `asks`,
+/// the count of the last answer the caller got, and its cap slot is
+/// freed only when the row was deleted. A later admit (a re-ask whose
+/// record may land) raised the count, so an overtaken caller releases
+/// nothing. An applied or missing row changes nothing.
+pub fn release<S: Sql>(sql: &S, rid: &Rid, asks: u64) -> Result<bool> {
+    let n = poll_once(sql.exec(
+        "DELETE FROM unit_reservations WHERE rid = ?1 AND state = 'reserved' AND asks = ?2",
+        &[SqlValue::Blob(rid.0.to_vec()), int(asks)?],
+    ))??;
+    if n == 1 {
         poll_once(sql.exec(
             "DELETE FROM unit_cap_uses WHERE rid = ?1",
             &[SqlValue::Blob(rid.0.to_vec())],
         ))??;
     }
+    Ok(n == 1)
+}
+
+/// The unit's own drop of a re-ask refused at the head (§2.5 (c)): the
+/// `reserved` row `rid` goes whatever its count, and its cap slot is
+/// kept, because the re-ask's record may exist after a lost answer.
+pub fn drop_refused<S: Sql>(sql: &S, rid: &Rid) -> Result<bool> {
+    let n = poll_once(sql.exec(
+        "DELETE FROM unit_reservations WHERE rid = ?1 AND state = 'reserved'",
+        &[SqlValue::Blob(rid.0.to_vec())],
+    ))??;
     Ok(n == 1)
 }
 

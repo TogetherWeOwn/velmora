@@ -21,6 +21,14 @@
 //!   second send). `revoked` is final: a row once revoked stays so.
 //! - The unit's `keys_seq` becomes the larger of its own and the last
 //!   entry's seq.
+//! - `owner_ref` is write-once per row (AM-72): an entry with none keeps
+//!   the stored value, a stored null takes the entry's, and an entry with
+//!   another non-null value keeps the stored one, applies every other
+//!   field, and marks the row (`unit_owner_ref_conflicts`): the answer
+//!   names the subject in `owner_ref_conflict` and the Worker raises that
+//!   alarm. While the mark is set every acting lookup of the principal
+//!   answers `owner_ref_ambiguous` (`reserve`). The entry is not refused,
+//!   so no verified entry can stop the unit's key chain.
 //!
 //! The catalogue's own `access_keys` and `grants` (what the S3 path
 //! reads) are then rebuilt for every subject the call touched and every
@@ -346,6 +354,10 @@ pub enum Applied {
         skipped: u64,
         reserved: u64,
         kept: u64,
+        /// The subjects an entry brought another non-null `owner_ref`
+        /// to (AM-72): kept the stored value, marked, and alarmed by the
+        /// Worker as `owner_ref_conflict`.
+        owner_ref_conflict: Vec<String>,
     },
     /// The base is above the unit's `keys_seq`: nothing was done; read
     /// again from `keys_seq + 1`.
@@ -421,6 +433,7 @@ struct Row {
     status: SubjectStatus,
     held: bool,
     last_seq: u64,
+    owner_ref: Option<String>,
 }
 
 /// Applies `entries` after `from_seq` inside the caller's transaction.
@@ -455,6 +468,7 @@ pub fn apply<S: Sql>(
     }
     let mut touched = BTreeSet::new();
     let (mut applied, mut skipped, mut reserved) = (0, 0, 0);
+    let mut conflicts = Vec::new();
     for item in entries {
         // A marker writes no row (AM-62): skipped, its seq counted.
         let Some(e) = item.key() else {
@@ -493,15 +507,22 @@ pub fn apply<S: Sql>(
         let was_revoked = row
             .as_ref()
             .is_some_and(|r| r.status == SubjectStatus::Revoked);
+        let stored_ref = row.as_ref().and_then(|r| r.owner_ref.as_deref());
         if write {
-            put(sql, e, was_revoked)?;
+            let owner_ref = owner_ref_of(sql, e, stored_ref, now, &mut conflicts)?;
+            put(sql, e, owner_ref, was_revoked)?;
             applied += 1;
             touched.insert(e.id.clone());
         } else if e.status == SubjectStatus::Revoked && !was_revoked {
-            // A revocation is applied whatever its seq.
+            // A revocation is applied whatever its seq, with the
+            // write-once rule for `owner_ref` (AM-72).
+            let owner_ref = owner_ref_of(sql, e, stored_ref, now, &mut conflicts)?;
             poll_once(sql.exec(
-                "UPDATE unit_keys SET status = 'revoked' WHERE id = ?1",
-                &[SqlValue::Text(e.id.clone())],
+                "UPDATE unit_keys SET status = 'revoked', owner_ref = ?2 WHERE id = ?1",
+                &[
+                    SqlValue::Text(e.id.clone()),
+                    owner_ref.map_or(SqlValue::Null, |o| SqlValue::Text(o.to_string())),
+                ],
             ))??;
             applied += 1;
             touched.insert(e.id.clone());
@@ -531,7 +552,74 @@ pub fn apply<S: Sql>(
         skipped,
         reserved,
         kept,
+        owner_ref_conflict: conflicts,
     })
+}
+
+/// What [`write_once`] decides for a row's `owner_ref`.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum OwnerRef<'a> {
+    /// The value the row holds after the write.
+    Keep(Option<&'a str>),
+    /// The entry brought another non-null value: the stored one is kept.
+    Conflict(&'a str),
+}
+
+/// AM-72's write-once rule for `owner_ref`, from the stored value (none
+/// for a new row) and the entry's.
+pub(crate) fn write_once<'a>(stored: Option<&'a str>, entry: Option<&'a str>) -> OwnerRef<'a> {
+    match (stored, entry) {
+        (s, None) => OwnerRef::Keep(s),
+        (None, e) => OwnerRef::Keep(e),
+        (Some(s), Some(e)) if s == e => OwnerRef::Keep(Some(s)),
+        (Some(s), Some(_)) => OwnerRef::Conflict(s),
+    }
+}
+
+/// The `owner_ref` the row of `e` holds after this entry
+/// ([`write_once`]): on a conflict the row is marked and the subject
+/// noted for the answer.
+fn owner_ref_of<'a, S: Sql>(
+    sql: &S,
+    e: &'a KeyEntry,
+    stored: Option<&'a str>,
+    now: UnixMs,
+    conflicts: &mut Vec<String>,
+) -> Result<Option<&'a str>> {
+    Ok(match write_once(stored, e.owner_ref.as_deref()) {
+        OwnerRef::Keep(v) => v,
+        OwnerRef::Conflict(kept) => {
+            mark_conflict(sql, e, now)?;
+            conflicts.push(e.id.clone());
+            Some(kept)
+        }
+    })
+}
+
+/// Marks the row of `e` as holding a disputed `owner_ref` (AM-72): one
+/// mark per disputed value, so each resolves to no principal. Only an
+/// operator clears them. The marked principal can no longer act, so its
+/// other open reservations that are not bound to a creator grant are
+/// cancelled and their cap slots given back, as for a record that closes
+/// it (§2.5); the reservation of this entry's own record is kept.
+fn mark_conflict<S: Sql>(sql: &S, e: &KeyEntry, now: UnixMs) -> Result<()> {
+    let Some(disputed) = &e.owner_ref else {
+        return Err(BridgeError::Invalid(
+            "unit: owner_ref conflict without a value",
+        ));
+    };
+    reserve::cancel_open(sql, &e.id, e.rid.as_ref())?;
+    poll_once(sql.exec(
+        "INSERT OR IGNORE INTO unit_owner_ref_conflicts(id, disputed, marked_at, seq) \
+         VALUES (?1, ?2, ?3, ?4)",
+        &[
+            SqlValue::Text(e.id.clone()),
+            SqlValue::Text(disputed.clone()),
+            SqlValue::Int(now.0),
+            int(e.last_seq)?,
+        ],
+    ))??;
+    Ok(())
 }
 
 /// Whether the unit holds a bucket row with this id.
@@ -572,7 +660,7 @@ pub fn revoked<S: Sql>(sql: &S) -> Result<u64> {
 
 fn stored<S: Sql>(sql: &S, id: &str) -> Result<Option<Row>> {
     let rows = poll_once(sql.query(
-        "SELECT status, held, last_seq FROM unit_keys WHERE id = ?1",
+        "SELECT status, held, last_seq, owner_ref FROM unit_keys WHERE id = ?1",
         &[SqlValue::Text(id.to_string())],
     ))??;
     let Some(r) = rows.into_iter().next() else {
@@ -582,10 +670,16 @@ fn stored<S: Sql>(sql: &S, id: &str) -> Result<Option<Row>> {
     else {
         return Err(decode("unit_keys row"));
     };
+    let owner_ref = match &r[3] {
+        SqlValue::Text(o) => Some(o.clone()),
+        SqlValue::Null => None,
+        _ => return Err(decode("unit_keys owner_ref")),
+    };
     Ok(Some(Row {
         status: SubjectStatus::parse(status).ok_or_else(|| decode("unit_keys status"))?,
         held: *held == 1,
         last_seq: u64::try_from(*last).map_err(|_| decode("unit_keys last_seq"))?,
+        owner_ref,
     }))
 }
 
@@ -593,6 +687,9 @@ fn stored<S: Sql>(sql: &S, id: &str) -> Result<Option<Row>> {
 /// rows, in schema order, as the entry states them with `status`: what
 /// the apply writes, and what the move's V6 hashes from the chain
 /// (`unit::export::chain_key_rows`).
+/// The place of `owner_ref` in [`entry_values`]' row.
+pub(crate) const OWNER_REF_COLUMN: usize = 8;
+
 pub(crate) fn entry_values(
     e: &KeyEntry,
     status: SubjectStatus,
@@ -633,15 +730,17 @@ pub(crate) fn entry_values(
     Ok((row, grants))
 }
 
-/// Writes the subject's row and grants as the entry states them; a row
-/// that was revoked stays revoked.
-fn put<S: Sql>(sql: &S, e: &KeyEntry, was_revoked: bool) -> Result<()> {
+/// Writes the subject's row and grants as the entry states them, with
+/// `owner_ref` as [`write_once`] decided; a row that was revoked stays
+/// revoked.
+fn put<S: Sql>(sql: &S, e: &KeyEntry, owner_ref: Option<&str>, was_revoked: bool) -> Result<()> {
     let status = if was_revoked {
         SubjectStatus::Revoked
     } else {
         e.status
     };
-    let (row, grants) = entry_values(e, status)?;
+    let (mut row, grants) = entry_values(e, status)?;
+    row[OWNER_REF_COLUMN] = owner_ref.map_or(SqlValue::Null, |o| SqlValue::Text(o.to_string()));
     poll_once(sql.exec(
         "INSERT INTO unit_keys(id, kind, status, held, made_by, created_at, secret_wrapped, \
            secret_kek_version, owner_ref, last_seq) \

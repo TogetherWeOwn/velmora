@@ -180,6 +180,16 @@
       }
     }
   ],
+  "apply_keys": {
+    "answers_kept": 0,
+    "applied": 2,
+    "owner_ref_conflict": [
+      "p_1"
+    ],
+    "reserved": 0,
+    "revoked": 0,
+    "skipped": 0
+  },
   "calls": [
     {
       "authenticated": true,
@@ -946,6 +956,7 @@
         "unit": 0
       },
       "op": {
+        "asks": 1,
         "op": "release",
         "rid": "44444444444444444444444444444444"
       },
@@ -1315,6 +1326,10 @@
       "unit_keys",
       "unit_key_grants"
     ],
+    "listed_kind": [
+      "s3",
+      "app_password"
+    ],
     "precondition": [
       "absent",
       "exists",
@@ -1329,6 +1344,7 @@
       "principal_unknown",
       "principal_inactive",
       "principal_held",
+      "owner_ref_ambiguous",
       "no_such_bucket",
       "no_grant"
     ],
@@ -1365,6 +1381,7 @@
         {
           "admitted": {
             "again": false,
+            "asks": 1,
             "bound": null,
             "keys_seq": 3,
             "rid": "44444444444444444444444444444444",
@@ -1427,6 +1444,7 @@
     },
     "reserve_refusal": [
       "cap_reached",
+      "limit_reached",
       "grant_not_held",
       "grant_limits_not_served",
       "too_many_grants",
@@ -1473,6 +1491,72 @@
       "shredding",
       "shredded"
     ]
+  },
+  "plane_bodies": {
+    "bucket_by_id": {
+      "created_at": 5,
+      "id": "b_00000000000000f1",
+      "name": "alpha",
+      "object_count": null,
+      "stored_bytes": null
+    },
+    "bucket_names": [
+      "alpha",
+      null
+    ],
+    "buckets_named": [
+      {
+        "created_at": 5,
+        "id": "b_00000000000000f1",
+        "name": "alpha",
+        "object_count": null,
+        "stored_bytes": null
+      },
+      null
+    ],
+    "buckets_page": {
+      "items": [
+        {
+          "created_at": 5,
+          "id": "b_00000000000000f1",
+          "name": "alpha",
+          "object_count": null,
+          "stored_bytes": null
+        }
+      ],
+      "more": true
+    },
+    "key_by_id": {
+      "created_at": 7,
+      "grants": [],
+      "held": false,
+      "id": "AKGOLDEN000000000001",
+      "kind": "s3",
+      "last_seq": 3,
+      "made_by": "p_1",
+      "status": "active"
+    },
+    "keys_page": {
+      "items": [
+        {
+          "created_at": 7,
+          "grants": [],
+          "held": false,
+          "id": "AKGOLDEN000000000001",
+          "kind": "s3",
+          "last_seq": 3,
+          "made_by": "p_1",
+          "status": "active"
+        }
+      ],
+      "more": false
+    },
+    "reach": {
+      "buckets": 1,
+      "keys": 1,
+      "objects": null,
+      "stored_bytes": null
+    }
   },
   "requests": [
     {
@@ -2162,6 +2246,156 @@
         "call": {
           "extent": "x_000000000000000000000000f1",
           "m": "hot_seq"
+        },
+        "op": "request"
+      },
+      "seqs": {
+        "keys_seq": 3,
+        "state_seq": 7
+      }
+    },
+    {
+      "authenticated": true,
+      "kind": "request",
+      "listed": true,
+      "name": {
+        "tenant": "t_00000000000000f1",
+        "unit": 0
+      },
+      "op": {
+        "call": {
+          "ids": [
+            "b_00000000000000f1"
+          ],
+          "m": "bucket_names"
+        },
+        "op": "request"
+      },
+      "seqs": {
+        "keys_seq": 3,
+        "state_seq": 7
+      }
+    },
+    {
+      "authenticated": true,
+      "kind": "request",
+      "listed": true,
+      "name": {
+        "tenant": "t_00000000000000f1",
+        "unit": 0
+      },
+      "op": {
+        "call": {
+          "after": "alpha",
+          "limit": 25,
+          "m": "buckets_page"
+        },
+        "op": "request"
+      },
+      "seqs": {
+        "keys_seq": 3,
+        "state_seq": 7
+      }
+    },
+    {
+      "authenticated": true,
+      "kind": "request",
+      "listed": true,
+      "name": {
+        "tenant": "t_00000000000000f1",
+        "unit": 0
+      },
+      "op": {
+        "call": {
+          "m": "buckets_named",
+          "names": [
+            "alpha",
+            "beta"
+          ]
+        },
+        "op": "request"
+      },
+      "seqs": {
+        "keys_seq": 3,
+        "state_seq": 7
+      }
+    },
+    {
+      "authenticated": true,
+      "kind": "request",
+      "listed": true,
+      "name": {
+        "tenant": "t_00000000000000f1",
+        "unit": 0
+      },
+      "op": {
+        "call": {
+          "id": "b_00000000000000f1",
+          "m": "bucket_by_id"
+        },
+        "op": "request"
+      },
+      "seqs": {
+        "keys_seq": 3,
+        "state_seq": 7
+      }
+    },
+    {
+      "authenticated": true,
+      "kind": "request",
+      "listed": true,
+      "name": {
+        "tenant": "t_00000000000000f1",
+        "unit": 0
+      },
+      "op": {
+        "call": {
+          "after": {
+            "created_at": 7,
+            "id": "AKGOLDEN000000000001"
+          },
+          "kind": "s3",
+          "limit": 25,
+          "m": "keys_page"
+        },
+        "op": "request"
+      },
+      "seqs": {
+        "keys_seq": 3,
+        "state_seq": 7
+      }
+    },
+    {
+      "authenticated": true,
+      "kind": "request",
+      "listed": true,
+      "name": {
+        "tenant": "t_00000000000000f1",
+        "unit": 0
+      },
+      "op": {
+        "call": {
+          "id": "AKGOLDEN000000000001",
+          "m": "key_by_id"
+        },
+        "op": "request"
+      },
+      "seqs": {
+        "keys_seq": 3,
+        "state_seq": 7
+      }
+    },
+    {
+      "authenticated": true,
+      "kind": "request",
+      "listed": true,
+      "name": {
+        "tenant": "t_00000000000000f1",
+        "unit": 0
+      },
+      "op": {
+        "call": {
+          "m": "reach"
         },
         "op": "request"
       },

@@ -147,6 +147,24 @@ fails closed. **Milestone 1 serves unlimited grants only:** a key or
 principal grant with a prefix, an expiry or an address list is refused
 at use, and at its reservation (`grant_limits_not_served`, below).
 
+A row's `owner_ref` is written once (AM-72). An entry with none keeps
+the stored value, a stored null takes the entry's, and an entry with
+another non-null value keeps the stored value, applies every other
+field, and marks the row (`unit_owner_ref_conflicts`, one mark per
+disputed value; a revocation applied below the row's seq follows the
+same rule): the apply's answer names the subject in
+`owner_ref_conflict`, and the Worker raises that alarm. The marked
+principal's other open reservations that are not bound to a creator
+grant are cancelled, with their cap slots, as for a record that closes
+it. While the mark is set, every acting
+lookup of that principal (a reservation, `resolve_acting`, a presigned
+URL), by its id, by the stored value or by the disputed one, answers
+`owner_ref_ambiguous` and fails closed, as two principals for one
+`owner_ref` do. The entry is not refused, so no verified entry can stop
+the unit's key chain. Only an operator clears the mark. The move's
+direct apply makes the same marks, and V6's chain-side rows
+(`export::chain_key_rows`) keep the first non-null value.
+
 ## Reservations
 
 A capped opening call (create an S3 key, an app password, a principal or
@@ -189,8 +207,12 @@ change. In one transaction the unit:
    for a key create, a principal create and a widening alike; AM-61) and
    no wider than the acting principal's effective grant (bucket and
    access; a sign-up principal without an acting principal has none);
-   then the caps: 30 capped changes an hour, 50 bucket creates a day, 20
-   active S3 keys and 20 app passwords (open reservations count). Then
+   then the limits: first the absolute ones, 20 active S3 keys, 20 app
+   passwords and 10,000 (est) bucket rows (open reservations count, and
+   `closing` rows too), refused `limit_reached` (`409 key_limit_reached`
+   or `409 bucket_limit_reached`: waiting does not lift them); then the
+   rate caps, 30 capped changes an hour and 50 bucket creates a day,
+   refused `cap_reached` (`429`). Then
    the row is kept `reserved`, and its cap slot (`unit_cap_uses`) is
    kept for the cap's window whatever becomes of the row; only an
    explicit release and a cancel (below) give it back.
@@ -227,7 +249,15 @@ finisher's `bucket_binding` read answers `open`, `created` or `none`, and
 records yet: until that apply exists and calls it in its transaction, a
 bucket reservation stays `reserved`, is swept after its hour (its slot
 still counts for the day), and a retry after that hour is checked again
-as a new ask. `release` drops a `reserved` row. Each ask sweeps first: a
+as a new ask. Every admit (the first ask and each re-ask, a bound
+bucket's included) raises the row's `asks` and answers it.
+`release(rid, asks)` deletes a `reserved` row only while it still holds
+that `asks`, the count of the last answer the caller got, and frees its
+cap slot only when it deleted the row: a caller whose answer a later
+admit overtook (a retry whose record may land) releases nothing. A
+caller that got no admit answer releases nothing. The unit's own drop
+of a re-ask refused at the head deletes the row whatever its count and
+keeps the slot. Each ask sweeps first: a
 `reserved` row goes after 1 hour, an `applied` one 24 hours after its
 apply. `resolve_acting` reads the acting principal of `objects.list` and
 `objects.presign` (refused unless active and not held) and writes
@@ -279,10 +309,17 @@ from the record's private part. In the `sync`'s transaction the unit:
    `sync` (`placements_off`, alarm); the Worker reads the chain again and
    sends it once more, and the same refusal again stops and pages.
 
-The list a `sync` carries is whole, so it is bounded: at most 10,000
-(est) ids, and as many changes, `unplaced` ids included. A bucket
-create's reservation is refused `cap_reached` once the unit's rows and
-its open creates reach that bound, so no tenant outgrows its `sync`.
+The list a `sync` carries is whole, so it is bounded (AM-57, AM-73): at
+most 20,000 ids in the placement list, and in all `unplaced` lists of
+one `sync` together (`buckets::MAX_PLACED`), and at most 10,000 changes
+(`MAX_CHANGES`). A bucket create's reservation is refused
+`limit_reached` once the unit's rows and its open creates reach 10,000
+(est; `reserve::MAX_BUCKETS`). A swept reservation still gets its row
+from its record, so the head can place more than the cap counted: the
+shape bound is twice the cap, a placement list over 10,000 is served and
+the `sync` answer pages `buckets_over_cap` (`buckets::over_cap`; the
+`sync` arm that carries the bucket part, L2's, puts it in the answer),
+and only a list over 20,000 is `malformed`.
 
 "Holds nothing" is the catalogue's rule for a bucket delete: no
 generation, object, key floor, upload or extent names the bucket. That
@@ -333,12 +370,18 @@ lowered limit.
 Above a hard ceiling of 9 GB (est) no request call that adds a row
 runs, deletes (a floor and a tombstone each) and smaller overwrites
 included, so the platform's stop is never met; the Worker answers
-`503 SlowDown` and pages, and the operator moves a bucket to another
-unit. GC, aborts and settles still run. `databaseSize` counts the pages
-of the file, freed pages included (not measured on the platform), so
-the ceiling may not lift by itself after GC: the bucket move is the way
-out. This ceiling is an L1 choice beyond ADR §2.6, for the design
-lane to confirm.
+`503 SlowDown` and pages. `abort_upload` still runs (it ends an
+upload), and so do GC and settles. The measure is `databaseSize`
+(AM-73): measured 2026-11-22 in local workerd and on a throwaway
+workers.dev object, it falls after a delete (about 33.8 MB of rows
+inserted, then deleted: back to 12,288 bytes), while `PRAGMA
+page_count` and `freelist_count` are refused (`SQLITE_AUTH`). It does
+not lift after GC today, because GC deletes no `extents`,
+`generations`, `generation_extents` or `gc` rows and a delete adds
+rows: **the ceiling is a stop the unit does not leave by itself**. The
+way out is the operator's whole-bucket move (W14, not in milestone 1);
+until then a unit at the ceiling stays stopped (the owner's yes
+pending).
 
 ## Import
 
@@ -574,6 +617,35 @@ as that principal, with `access` on `bucket_id`. The internal key has no
 `access_keys` or `grants` row, so the Worker answers the request's own
 key and grant reads from this answer. A create-only PUT runs as
 `If-None-Match: *`.
+
+## Management reads
+
+The management plane reads a managed tenant's root unit as request
+calls (`unit::plane`; L1-Q16), all reads (served while `suspended` with
+`read_only` too), each bounded and answered from indexed rows or
+counters. A `closing` bucket row answers as absent.
+
+| Call | Answer |
+|---|---|
+| `bucket_names{ids}` (at most 64) | each id's open bucket name, in the order asked, or null |
+| `buckets_page{after?, limit}` (1 to 1,000; `after` a name) | `{items, more}` in name order (UTF-8 bytes) |
+| `buckets_named{names}` (at most 64) | each name's item, in the order asked, or null |
+| `bucket_by_id{id}` | the item or null |
+| `keys_page{kind, after?, limit}` (`s3` or `app_password`; 1 to 1,000) | `{items, more}` in creation order, then id; `after` is the last item's `{created_at, id}`, so a cursor needs no row of its own |
+| `key_by_id{id}` | the item or null: an S3 key or an app password that is not revoked |
+| `reach{}` | `{buckets, objects, stored_bytes, keys}` |
+
+A bucket item is `{id, name, created_at, stored_bytes, object_count}`:
+the two figures are the live usage counters of the bucket (one
+primary-key read), null until a recount has switched the counters on.
+A key item is `{id, kind, status, held, made_by, grants, created_at,
+last_seq}`, never a secret; the internal key, principals and revoked
+rows are never listed. The unit holds no label (a private part of the
+key record, which the plane reads from the verified chain) and no
+last-used time. `reach` counts the open bucket rows (at most 20,000),
+their live objects and bytes (null until the counters are on), and the
+S3 keys and app passwords that are not revoked. A list or a name above
+its bound is `out_of_bounds` (a Worker bug, with an alarm).
 
 ## Bookmarks
 

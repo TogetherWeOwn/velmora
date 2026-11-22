@@ -8,7 +8,9 @@
 //! `403 QuotaExceeded` when one bucket fills the unit (ADR §2.6; owner
 //! item Q9).
 //!
-//! The database size is the object's own (`databaseSize`). The extent
+//! The database size is the object's own (`databaseSize`, AM-73: it
+//! falls after a delete, measured in local workerd and on the platform;
+//! `PRAGMA page_count` and `freelist_count` are refused there). The extent
 //! count is the live usage counters' (`x_unreleased + x_released +
 //! x_deleted`, every safety state) while they are on, so the guard reads
 //! one row and never counts the table. While they are off (a closed unit
@@ -32,7 +34,9 @@ pub const GUARD_EXTENTS: u64 = 3_400_000;
 /// The hard ceiling (est), between the guard and the platform's 10 GB:
 /// above it no request call that adds a row runs, not even a delete's
 /// floor or a smaller overwrite, so `SQLITE_FULL` is never reached and
-/// the calls that free space (GC, aborts, settles) still run.
+/// `abort_upload`, GC and settles still run. Nothing frees rows today, so
+/// a unit at the ceiling stays stopped until the operator's bucket move
+/// (W14; AM-73).
 pub const HARD_BYTES: u64 = 9_000_000_000;
 
 /// Where the guard stands. Tests lower it (ADR §8.2: "tested in W2
