@@ -56,6 +56,42 @@ pub trait OwnerKeys {
     async fn flat_revocations(&self, after: Option<&str>) -> Result<(Vec<String>, Option<String>)>;
 }
 
+/// The owner's key-chain head as the undo's key freeze reads it (AM-28,
+/// AM-54 LOW 1): its seq, and the `frozen_at` door field it carries
+/// (`KeysFrozen` and every later record until `KeysThawed`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KeyHead {
+    pub seq: u64,
+    pub frozen_at: Option<u64>,
+}
+
+/// How the key-chain writer answered a freeze or a thaw record.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KeyPut {
+    /// Put at the seq it was built on + 1.
+    Done,
+    /// Another record took that seq: read the head and decide again.
+    Lost,
+    /// Refused with this code: `KeysThawed` while the tenant head still
+    /// carries `keys_frozen`, or naming another freeze than the head's.
+    Refused(&'static str),
+}
+
+/// The undo's freeze of the owner's key chain (the key lane's writer in
+/// the Worker, AM-28 with AM-54 LOW 1).
+#[allow(async_fn_in_trait)]
+pub trait KeyFreeze {
+    /// The verified head of the owner's key chain.
+    async fn key_head(&self) -> Result<KeyHead>;
+    /// Puts `KeysFrozen` at `at + 1` with `frozen_at = at` (operator plane,
+    /// `put_if_absent`), built on the head of seq `at`.
+    async fn put_keys_frozen(&self, at: u64) -> Result<KeyPut>;
+    /// Puts `KeysThawed{ends}` at the head + 1, with no `frozen_at`. The
+    /// writer accepts it only while the head's `frozen_at` is `ends` and
+    /// the owner's tenant head carries no `keys_frozen`.
+    async fn put_keys_thawed(&self, ends: u64) -> Result<KeyPut>;
+}
+
 /// The owner's root unit, for the key steps.
 #[allow(async_fn_in_trait)]
 pub trait KeyUnit {

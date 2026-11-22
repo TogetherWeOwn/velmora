@@ -144,6 +144,11 @@ pub struct ImportState {
     pub t0_seq: Option<u64>,
     /// The `move_ordinal` of the seal, if the import is sealed.
     pub sealed: Option<u64>,
+    /// `unit_import_move.move_lifted` (AM-47): `Some(true)` once the move's
+    /// lift landed (an undone move's 30-day copy), `Some(false)` before it
+    /// (a give-up that did not reach its `deleteAll()`); `None`: the unit
+    /// did not say (L1 package 4c).
+    pub move_lifted: Option<bool>,
     pub tables: Vec<ImportCount>,
 }
 

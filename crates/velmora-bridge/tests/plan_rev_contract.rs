@@ -10,10 +10,11 @@
 //!
 //! - the two that write the literal 1 (`sql/outbox.rs`, the article
 //!   plan and the packed plan);
-//! - the four inserts of an extent row, which copy a value
-//!   (`sql/objects.rs`, `sql/uploads.rs`, `sql/replay.rs`, and the owner
-//!   move's import into a unit, `unit/import.rs`, whose value is bound
-//!   through `plan_rev::bound` and refused above 1);
+//! - the five inserts of an extent row, which copy a value
+//!   (`sql/objects.rs`, `sql/uploads.rs`, `sql/replay.rs`, the owner
+//!   move's import into a unit, `unit/import.rs`, and the undo's copy back
+//!   into a fresh D1, `directory/move_undo.rs`, both of whose value is
+//!   bound through `plan_rev::bound` and refused above 1);
 //! - the three updates of the replay (`sql/replay.rs`), each with the
 //!   guard that keeps it from changing a plan that is already there.
 //!
@@ -57,6 +58,10 @@ const ALLOWED: &[(&str, &str)] = &[
     ),
     (
         "crates/velmora-bridge/src/unit/import.rs",
+        "INSERT INTO extents(id, bucket_id, generation_id, state, seq, plain_offset, plain_size, cipher_size, media_header, key_mode, wrapped_file_key, plain_md5, plain_sha256, cipher_sha256, safety_state, article_count, plan_rev, last_verified_at, release_evidence, released_at, created_at, hot_safety_bytes, hot_cache_bytes, last_read_at, evict_seq, plan, posted_at, reposted_at, parity, parity_count) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30)",
+    ),
+    (
+        "crates/velmora-bridge/src/directory/move_undo.rs",
         "INSERT INTO extents(id, bucket_id, generation_id, state, seq, plain_offset, plain_size, cipher_size, media_header, key_mode, wrapped_file_key, plain_md5, plain_sha256, cipher_sha256, safety_state, article_count, plan_rev, last_verified_at, release_evidence, released_at, created_at, hot_safety_bytes, hot_cache_bytes, last_read_at, evict_seq, plan, posted_at, reposted_at, parity, parity_count) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30)",
     ),
     (

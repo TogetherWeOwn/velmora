@@ -27,6 +27,11 @@
 //!   revocations on the thawed D1;
 //! - [`move_preflight`]: the read-only counts of precondition P2 that
 //!   stop the move before its window;
+//! - [`move_window`]: the window's step 2 (the owner's root-unit entry
+//!   set anew per window, AM-53) and the thaw of an undo's key freeze;
+//! - [`move_undo`]: the undo of a flipped move (DS1 §3.7): the reverse
+//!   move onto a fresh D1, and the key and record steps of the fallback
+//!   onto the frozen one, under the key freeze of AM-28;
 //! - [`tenant_zero`]: whether tenant 0 may be served from the D1
 //!   catalogue, from its record and the database's own marker, and the
 //!   route of a request when the directory cannot be read.
@@ -41,6 +46,8 @@ pub mod move_copy;
 pub mod move_flip;
 pub mod move_keys;
 pub mod move_preflight;
+pub mod move_undo;
+pub mod move_window;
 pub mod record;
 pub mod store;
 pub mod tenant_zero;

@@ -376,6 +376,7 @@ impl UnitImport for Adapter<'_> {
             return Ok(None);
         }
         Ok(Some(ImportState {
+            move_lifted: None,
             t0_seq,
             sealed: body["sealed"].as_u64(),
             tables,
@@ -1336,6 +1337,10 @@ impl velmora_bridge::directory::move_flip::OwnerUnit for LiftCalls<'_> {
         unimplemented!("not a lift call")
     }
     async fn v9(&self) -> Result<bool> {
+        unimplemented!("not a lift call")
+    }
+
+    async fn recount(&self) -> Result<()> {
         unimplemented!("not a lift call")
     }
     fn nonce(&self) -> String {

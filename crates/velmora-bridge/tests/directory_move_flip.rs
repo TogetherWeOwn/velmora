@@ -13,11 +13,11 @@ use service_support::*;
 use velmora_bridge::directory::chain::{TenantChain, Written};
 use velmora_bridge::directory::fence::{freeze, legacy_stamp_key, stamp_row, thaw};
 use velmora_bridge::directory::move_copy::ImportState;
-use velmora_bridge::directory::move_flip::MAX_WINDOW_RECORDS;
 use velmora_bridge::directory::move_flip::{
-    flip, give_up, FlipError, Flipped, GateView, GaveUp, OwnerUnit, Reported, RouteRecords, Synced,
-    Window,
+    flip, give_up, FlipError, Flipped, GateView, GaveUp, MoveReceipt, OwnerUnit, Reported,
+    RouteRecords, Synced, Window,
 };
+use velmora_bridge::directory::move_flip::{MAX_WINDOW_RECORDS, SYNC_TRIES};
 use velmora_bridge::directory::move_keys::{KeyUnit, OwnerKeys};
 use velmora_bridge::directory::record::{HoldMode, OperatorReason};
 use velmora_bridge::directory::record::{Selector, Tenant, TenantDoor};
@@ -89,6 +89,7 @@ struct FakeUnit {
     /// Key status by id, as applied.
     key_rows: RefCell<BTreeMap<String, SubjectStatus>>,
     applies: Cell<u32>,
+    recounts: Cell<u32>,
 }
 
 impl Default for FakeUnit {
@@ -108,6 +109,7 @@ impl Default for FakeUnit {
             keys_seq: Cell::new(0),
             bend: RefCell::new(None),
             import: RefCell::new(Some(ImportState {
+                move_lifted: None,
                 t0_seq: Some(1 << 40),
                 sealed: Some(1),
                 tables: vec![],
@@ -120,6 +122,7 @@ impl Default for FakeUnit {
             armed: Cell::new(false),
             key_rows: RefCell::default(),
             applies: Cell::new(0),
+            recounts: Cell::new(0),
         }
     }
 }
@@ -198,7 +201,9 @@ impl OwnerUnit for FakeUnit {
                 }
                 if self.closed.get().is_some() && take(&self.refuse_lift) {
                     self.armed.set(self.fail_after_refusal.get());
-                    return Ok(Synced::Refused(UnitRefused::Gate(GateRefusal::Closed)));
+                    return Ok(Synced::Refused(UnitRefused::Gate(
+                        GateRefusal::NotRestoring,
+                    )));
                 }
                 self.closed.set(None);
             }
@@ -265,6 +270,11 @@ impl OwnerUnit for FakeUnit {
         assert!(self.closed.get().is_none(), "V9 reads an open unit");
         self.v9_runs.set(self.v9_runs.get() + 1);
         Ok(self.v9_ok.get())
+    }
+
+    async fn recount(&self) -> Result<()> {
+        self.recounts.set(self.recounts.get() + 1);
+        Ok(())
     }
 
     fn nonce(&self) -> String {
@@ -452,6 +462,28 @@ impl RouteRecords for FakeRoutes {
     }
 }
 
+/// The move's receipt: the window's V9 result (AM-52).
+#[derive(Default)]
+struct FakeReceipt {
+    v9_failed: Cell<bool>,
+    /// The next N writes are not reached.
+    fail: Cell<u32>,
+}
+
+impl MoveReceipt for FakeReceipt {
+    async fn v9_failed(&self) -> Result<bool> {
+        Ok(self.v9_failed.get())
+    }
+
+    async fn put_v9_failed(&self) -> Result<()> {
+        if take(&self.fail) {
+            return Err(BridgeError::Blob("receipt unreachable".into()));
+        }
+        self.v9_failed.set(true);
+        Ok(())
+    }
+}
+
 struct Move {
     rig: Rig,
     store: HookedRecords,
@@ -460,6 +492,7 @@ struct Move {
     unit: FakeUnit,
     routes: FakeRoutes,
     keys: FakeKeys,
+    receipt: FakeReceipt,
     excluded: BTreeSet<String>,
     since: u64,
     zero_seq: u64,
@@ -512,6 +545,7 @@ impl Move {
             &self.unit,
             &self.routes,
             &self.keys,
+            &self.receipt,
             &window,
             self.rig.now(),
         )
@@ -618,6 +652,7 @@ async fn window_with(placed: bool) -> Move {
         unit: FakeUnit::default(),
         routes: FakeRoutes::default(),
         keys: FakeKeys::with_moved_keys(),
+        receipt: FakeReceipt::default(),
         excluded: BTreeSet::from([canary]),
         since: 0,
         zero_seq: 0,
@@ -770,7 +805,7 @@ fn a_crash_at_any_step_is_finished_by_running_the_flip_again() {
         let m = window().await;
         let before = m.records();
         // After (a) and the lift record: the unit is not reached.
-        m.unit.fail_lift.set(1);
+        m.unit.fail_lift.set(SYNC_TRIES);
         assert!(matches!(m.flip().await, Err(FlipError::Store(_))));
         assert!(m.head(&owner()).await.restoring.is_empty());
         assert_eq!(
@@ -1428,7 +1463,7 @@ fn a_lift_the_unit_keeps_refusing_stops_before_the_routes() {
 fn a_crash_after_the_lift_record_syncs_with_its_proof() {
     block_on(async {
         let m = window().await;
-        m.unit.fail_lift.set(1);
+        m.unit.fail_lift.set(SYNC_TRIES);
         assert!(matches!(m.flip().await, Err(FlipError::Store(_))));
         let lifted = m.head(&owner()).await.lifted.unwrap();
         // A tenant-0-free owner record lands on top (a later record of
@@ -1479,9 +1514,12 @@ fn v9_failing_in_the_open_unit_gives_the_move_up_for_good() {
             o.restoring_entry(0).map(|e| e.since_seq)
         );
         assert_eq!(m.selector().await, Selector::D1);
-        // V9 passing now changes nothing: the window is given up.
+        assert!(m.receipt.v9_failed.get());
+        // V9 passing now changes nothing: the receipt holds the failure,
+        // so a re-run finishes the give-up and never samples again
+        // (AM-52).
         m.unit.v9_ok.set(true);
-        assert!(matches!(m.flip().await, Err(FlipError::NotThisMove)));
+        assert!(matches!(m.flip().await, Err(FlipError::V9Failed)));
         assert!(m.routes.records.borrow().is_empty());
         assert_eq!(m.unit.v9_runs.get(), 1);
     });
@@ -1701,7 +1739,7 @@ fn a_crash_after_the_lift_record_then_a_refusal_re_enters() {
     block_on(async {
         let m = window().await;
         let before = m.records();
-        m.unit.fail_lift.set(1);
+        m.unit.fail_lift.set(SYNC_TRIES);
         assert!(matches!(m.flip().await, Err(FlipError::Store(_))));
         // The stored lift's sync is refused once: a re-entry from the
         // lifted head.
@@ -1853,21 +1891,25 @@ fn the_lift_needs_this_windows_sealed_import() {
     for import in [
         None,
         Some(ImportState {
+            move_lifted: None,
             t0_seq: Some(1 << 40),
             sealed: None,
             tables: vec![],
         }),
         Some(ImportState {
+            move_lifted: None,
             t0_seq: Some(1 << 40),
             sealed: Some(2),
             tables: vec![],
         }),
         Some(ImportState {
+            move_lifted: None,
             t0_seq: Some(1),
             sealed: Some(1),
             tables: vec![],
         }),
         Some(ImportState {
+            move_lifted: None,
             t0_seq: None,
             sealed: Some(1),
             tables: vec![],
@@ -1887,4 +1929,130 @@ fn the_lift_needs_this_windows_sealed_import() {
             assert!(m.head(&owner()).await.restoring_entry(0).is_some());
         });
     }
+}
+
+/// AM-52: the V9 result goes to the receipt first. A crash between it
+/// and tenant 0's `d1` record leaves the window open, and the re-run gives
+/// up without a lift or a second sample.
+#[test]
+fn a_failed_v9_in_the_receipt_gives_up_without_a_second_sample() {
+    block_on(async {
+        let m = window().await;
+        m.unit.v9_ok.set(false);
+        // The receipt write is not reached: nothing of the give-up runs.
+        m.receipt.fail.set(1);
+        assert!(matches!(m.flip().await, Err(FlipError::Store(_))));
+        assert_eq!(m.selector().await, Selector::Moving);
+        assert_eq!(m.unit.v9_runs.get(), 1);
+        // The receipt holds the failure, the d1 record is not written yet
+        // (a crash right after the receipt): the re-run gives up.
+        m.receipt.v9_failed.set(true);
+        m.unit.v9_ok.set(true);
+        let r = m.flip().await;
+        assert!(matches!(r, Err(FlipError::V9Failed)), "{r:?}");
+        assert_eq!(m.unit.v9_runs.get(), 1);
+        assert_eq!(m.selector().await, Selector::D1);
+        assert!(m.routes.records.borrow().is_empty());
+        let o = m.head(&owner()).await;
+        assert!(o.placements.is_empty());
+        assert!(o.restoring_entry(0).is_some());
+    });
+}
+
+/// AM-45: `counters_off` runs `Recount` once per entry, then `sync` again;
+/// the same refusal after its fix stops; a gate refusal outside the
+/// re-entry list stops at once; a re-entry happens once per window.
+#[test]
+fn the_lift_acts_on_each_refusal_once() {
+    block_on(async {
+        let m = window().await;
+        m.unit
+            .lift_answers
+            .borrow_mut()
+            .push_back(UnitRefused::Gate(GateRefusal::CountersOff));
+        let f = m.flip().await.map_err(|e| format!("{e:?}")).unwrap();
+        assert!(f.wrote);
+        assert_eq!(m.unit.recounts.get(), 1);
+
+        let m = window().await;
+        m.unit.lift_answers.borrow_mut().extend([
+            UnitRefused::Gate(GateRefusal::CountersOff),
+            UnitRefused::Gate(GateRefusal::CountersOff),
+        ]);
+        let r = m.flip().await;
+        assert!(
+            matches!(
+                r,
+                Err(FlipError::SyncRefused(UnitRefused::Gate(
+                    GateRefusal::CountersOff
+                )))
+            ),
+            "{r:?}"
+        );
+        assert_eq!(m.unit.recounts.get(), 1);
+        assert!(m.routes.records.borrow().is_empty());
+
+        for stop in [
+            GateRefusal::MoveNotBound,
+            GateRefusal::ImportNotSealed,
+            GateRefusal::Closed,
+        ] {
+            let m = window().await;
+            let before = m.records();
+            m.unit
+                .lift_answers
+                .borrow_mut()
+                .push_back(UnitRefused::Gate(stop));
+            let r = m.flip().await;
+            assert!(
+                matches!(r, Err(FlipError::SyncRefused(UnitRefused::Gate(g))) if g == stop),
+                "{r:?}"
+            );
+            // The lift record only: no re-entry.
+            assert_eq!(m.records(), before + 1);
+        }
+
+        let m = window().await;
+        m.unit
+            .lift_answers
+            .borrow_mut()
+            .extend([UnitRefused::StaleSync, UnitRefused::StaleSync]);
+        let r = m.flip().await;
+        assert!(
+            matches!(r, Err(FlipError::SyncRefused(UnitRefused::StaleSync))),
+            "{r:?}"
+        );
+    });
+}
+
+/// AM-45: a re-entry made by an earlier run counts: a gate refusal after
+/// it stops the window.
+#[test]
+fn a_re_entry_is_made_once_per_window_across_runs() {
+    block_on(async {
+        let m = window().await;
+        m.unit.refuse_lift.set(1);
+        m.unit.fail_after_refusal.set(true);
+        assert!(m.flip().await.is_err());
+        assert!(m.head(&owner()).await.restoring_entry(0).unwrap().since_seq > m.since);
+        m.unit.refuse_lift.set(1);
+        let r = m.flip().await;
+        assert!(
+            matches!(r, Err(FlipError::SyncRefused(UnitRefused::Gate(_)))),
+            "{r:?}"
+        );
+    });
+}
+
+/// A lost answer to the lifting `sync` is read from the unit: an open
+/// unit means the lift landed.
+#[test]
+fn a_lost_lift_answer_is_read_from_the_unit() {
+    block_on(async {
+        let m = window().await;
+        m.unit.fail_lift.set(1);
+        let f = m.flip().await.map_err(|e| format!("{e:?}")).unwrap();
+        assert!(f.wrote);
+        assert_flipped(&m, f.stamp).await;
+    });
 }

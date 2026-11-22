@@ -326,7 +326,10 @@ impl<S: RecordStore, C: ControlSeal> TenantChain<'_, S, C> {
         // Both name tenant 0's head, which only the calls below read.
         if matches!(
             change,
-            Change::PlaceMovedBuckets { .. } | Change::UnplaceMovedBuckets { .. }
+            Change::PlaceMovedBuckets { .. }
+                | Change::UnplaceMovedBuckets { .. }
+                | Change::FreezeForUndo { .. }
+                | Change::OpenWindowEntry { .. }
         ) {
             return Err(ChainError::Refused(Refusal {
                 status: 400,
@@ -356,28 +359,14 @@ impl<S: RecordStore, C: ControlSeal> TenantChain<'_, S, C> {
         now: UnixMs,
         known: u64,
     ) -> Result<Written, ChainError> {
-        let mut known = known;
-        for _ in 0..MAX_PUT_TRIES {
-            let Some(zero) = self.head(&Tenant::Zero, 0).await? else {
-                return Err(ChainError::Refused(Refusal {
-                    status: 409,
-                    code: "no_move_to_tenant",
-                }));
-            };
-            let change = Change::PlaceMovedBuckets {
+        self.write_with_zero(tenant, now, known, "no_move_to_tenant", |zero| {
+            Change::PlaceMovedBuckets {
                 buckets: buckets.to_vec(),
                 unit,
-                zero: Box::new(zero.door),
-            };
-            match self
-                .try_write(tenant, &change, Actor::MoveTool, now, known)
-                .await?
-            {
-                Try::Done(written) => return Ok(written),
-                Try::Lost(seq) => known = seq,
+                zero,
             }
-        }
-        Err(ChainError::Busy)
+        })
+        .await
     }
 
     /// Removes the placements a move put on `unit` of `tenant`: the last
@@ -392,19 +381,71 @@ impl<S: RecordStore, C: ControlSeal> TenantChain<'_, S, C> {
         now: UnixMs,
         known: u64,
     ) -> Result<Written, ChainError> {
+        self.write_with_zero(tenant, now, known, "no_move_exit", |zero| {
+            Change::UnplaceMovedBuckets {
+                buckets: buckets.to_vec(),
+                unit,
+                zero,
+            }
+        })
+        .await
+    }
+
+    /// Undo step 1 (AM-28): `unit` of `tenant` `restoring` with the key
+    /// freeze at `at` (`K_u`), by the move tool, bound to tenant 0's head
+    /// read here before every try (`moved` into `tenant`).
+    pub async fn freeze_for_undo(
+        &self,
+        tenant: &Tenant,
+        unit: u32,
+        at: u64,
+        now: UnixMs,
+        known: u64,
+    ) -> Result<Written, ChainError> {
+        self.write_with_zero(tenant, now, known, "no_flipped_move_to_tenant", |zero| {
+            Change::FreezeForUndo { unit, at, zero }
+        })
+        .await
+    }
+
+    /// The move's window step 2 (AM-53): the root-unit entry of `tenant`
+    /// set anew for the window that tenant 0's record `window` opened, by
+    /// the move tool, bound to tenant 0's head read here before every try
+    /// (`moving` into `tenant`).
+    pub async fn open_window_entry(
+        &self,
+        tenant: &Tenant,
+        unit: u32,
+        window: u64,
+        now: UnixMs,
+        known: u64,
+    ) -> Result<Written, ChainError> {
+        self.write_with_zero(tenant, now, known, "no_move_to_tenant", |zero| {
+            Change::OpenWindowEntry { unit, window, zero }
+        })
+        .await
+    }
+
+    /// Writes a move-tool change that names tenant 0's head, read from its
+    /// own chain before every try (`missing`: the refusal when tenant 0
+    /// has no record).
+    async fn write_with_zero(
+        &self,
+        tenant: &Tenant,
+        now: UnixMs,
+        known: u64,
+        missing: &'static str,
+        change: impl Fn(Box<super::record::TenantDoor>) -> Change,
+    ) -> Result<Written, ChainError> {
         let mut known = known;
         for _ in 0..MAX_PUT_TRIES {
             let Some(zero) = self.head(&Tenant::Zero, 0).await? else {
                 return Err(ChainError::Refused(Refusal {
                     status: 409,
-                    code: "no_move_exit",
+                    code: missing,
                 }));
             };
-            let change = Change::UnplaceMovedBuckets {
-                buckets: buckets.to_vec(),
-                unit,
-                zero: Box::new(zero.door),
-            };
+            let change = change(Box::new(zero.door));
             match self
                 .try_write(tenant, &change, Actor::MoveTool, now, known)
                 .await?

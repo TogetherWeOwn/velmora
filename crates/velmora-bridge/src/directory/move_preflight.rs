@@ -14,6 +14,22 @@
 //!   such an INTEGER cell, stops the move: the adapters refuse to bind or
 //!   read it, so the copy would stop mid-window.
 //!
+//! - **Stale owner revocations** (P8 as AM-28 amends it,
+//!   [`p8_stale_revocations`]): a key the `keymap` maps to the owner that
+//!   has an `m/rk/<t>/<akid>` but is not revoked in D1 (its row is still
+//!   there). Such a key would be revoked in the owner's tenant and served
+//!   by D1, so a non-empty list stops the move before step 0.
+//!
+//! - **The unit's stamp prefix** (P2 as AM-44 amends it,
+//!   [`p2_stamp_prefix_clear`]): a unit the move fills whose
+//!   `rs/<t>.<u>/` already holds stamps (a second attempt after a give-up,
+//!   or a second move after an undo) needs the gate's stamp levelling
+//!   before its `move` report; without it the move stops before step 0.
+//! - **Import state in the target unit** (P12, AM-47, [`p12`]): a unit
+//!   that still holds an import (a give-up that did not reach its
+//!   `deleteAll()`, or an undone move's 30-day copy) is emptied first, or
+//!   the move stops.
+//!
 //! Every query is one page of at most [`MAX_PAGE`] rows in primary-key
 //! order; a cell's class is computed by SQLite, so no value outside the
 //! safe range is ever read through an adapter. Nothing is written.
@@ -280,4 +296,81 @@ fn key_text(key: &[SqlValue]) -> String {
         })
         .collect();
     serde_json::Value::Array(parts).to_string()
+}
+
+/// P8 (AM-28): the keys among `mapped` (every key the `keymap` maps to
+/// the owner, `drop` keys left out) that have the owner's revocation
+/// `m/rk/<t>/<akid>` and still a row in `d1`'s `access_keys` (tenant 0's
+/// revoke removes the row). A non-empty answer stops the move before
+/// step 0. One point lookup per key with a revocation.
+pub async fn p8_stale_revocations<S: Sql, K: super::move_keys::OwnerKeys>(
+    d1: &S,
+    keys: &K,
+    mapped: &[String],
+) -> Result<Vec<String>> {
+    let mut stale = Vec::new();
+    for akid in mapped {
+        if !keys.tenant_revoked(akid).await? {
+            continue;
+        }
+        let rows = d1
+            .query(
+                "SELECT 1 FROM access_keys WHERE access_key_id = ?1",
+                &[SqlValue::Text(akid.clone())],
+            )
+            .await?;
+        if !rows.is_empty() {
+            stale.push(akid.clone());
+        }
+    }
+    Ok(stale)
+}
+
+/// P2 (AM-44): whether the stamp prefix `rs/<t>.<u>/` of a unit the move
+/// fills lets the move start: empty, or the unit's stamp levelling
+/// (W4-gate) is live (`levelling_live`). One list call of one key.
+pub async fn p2_stamp_prefix_clear<B: crate::ports::BlobStore>(
+    safety: &B,
+    unit: &crate::unit::name::UnitName,
+    levelling_live: bool,
+) -> Result<bool> {
+    if levelling_live {
+        return Ok(true);
+    }
+    let prefix = format!(
+        "{}{}/",
+        crate::stamp::STAMP_PREFIX,
+        crate::unit::jobcall::stamp_id(unit)
+    );
+    Ok(safety.list(&prefix, "", 1).await?.is_empty())
+}
+
+/// What P12 (AM-47) reads in a target unit's `ImportProgress`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum P12 {
+    /// No import state: go on.
+    Empty,
+    /// `move_lifted = 0`: a give-up that did not reach its `deleteAll()`.
+    /// Finish that give-up (`deleteAll()`, the unit re-created with a
+    /// `restore` token under the entry the give-up left), then read again.
+    GiveUpLeft,
+    /// `move_lifted = 1`: an undone move's 30-day copy. Stop before step 0,
+    /// unless the owner's go (G6) names the early end of the undo copy;
+    /// then empty it as above and read again.
+    UndoCopy,
+    /// Import state, and the unit does not say `move_lifted` (L1 package
+    /// 4c): stop before step 0.
+    Unknown,
+}
+
+/// P12 from a target unit's import state ([`super::move_copy::ImportState`]).
+pub fn p12(state: Option<&super::move_copy::ImportState>) -> P12 {
+    match state {
+        None => P12::Empty,
+        Some(s) => match s.move_lifted {
+            Some(false) => P12::GiveUpLeft,
+            Some(true) => P12::UndoCopy,
+            None => P12::Unknown,
+        },
+    }
 }

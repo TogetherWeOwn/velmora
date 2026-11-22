@@ -46,7 +46,8 @@
 //! directory's copy of it), then the grant revocations on the moved-in
 //! buckets and `UnplaceMovedBuckets` ([`exit_placements`]). A V9 failure
 //! at (b2) writes tenant 0's `d1` record first and then runs the same
-//! give-up, so no later run of the flip samples V9 again.
+//! give-up (`restoring` on the owner's unit again, then the rest), so no
+//! later run of the flip samples V9 again (AM-52, DS1 §3.8 row 8(b2)).
 //! The rest of the give-up (empty the unit, thaw and level the frozen D1,
 //! the revocations of [`super::move_keys::revocations_to_d1`], migrations
 //! on, the lift) are tool steps outside this module.
@@ -107,6 +108,8 @@ pub enum FlipError {
     /// The unit refused `sync`: a closing record, a refusal that is not
     /// the gate's, or the gate's after [`MAX_REENTRIES`] re-entries.
     SyncRefused(UnitRefused),
+    /// The unit answered `sync` ok but still holds its `restoring` entry.
+    NotLifted,
     /// V9 failed in the open unit; the move was given up (AM-30).
     V9Failed,
     /// V9 failed, and the give-up it started stopped with this error: run
@@ -212,6 +215,9 @@ pub trait OwnerUnit: KeyUnit {
     /// V9 (AM-30): the sampled reads through the open unit's read plan,
     /// signed by a moved key; `true` when every one passed.
     async fn v9(&self) -> crate::types::Result<bool>;
+    /// `Recount` (AM-27), every step until it is done: the move's, under
+    /// the unit's entry and this window's seal.
+    async fn recount(&self) -> crate::types::Result<()>;
     /// A new nonce for a replay id: random, at most
     /// [`crate::unit::lift::MAX_NONCE`] bytes.
     fn nonce(&self) -> String;
@@ -238,6 +244,17 @@ pub trait RouteRecords {
         to: &Tenant,
         kind: RouteKind,
     ) -> crate::types::Result<bool>;
+}
+
+/// The move's receipt in R2, as step 8 reads and writes it (AM-52): the
+/// window's V9 result.
+#[allow(async_fn_in_trait)]
+pub trait MoveReceipt {
+    /// Whether the receipt holds a failed V9 for this window.
+    async fn v9_failed(&self) -> crate::types::Result<bool>;
+    /// Writes this window's failed V9, before anything else of its
+    /// give-up.
+    async fn put_v9_failed(&self) -> crate::types::Result<()>;
 }
 
 /// The move a flip or a give-up acts on.
@@ -276,9 +293,12 @@ pub struct Flipped {
 /// walked under the same bound.
 pub const MAX_WINDOW_RECORDS: u64 = 256;
 
-/// How often (b) re-enters through a new `restoring` entry after a
-/// refused `sync`.
-pub const MAX_REENTRIES: u32 = 3;
+/// How often (b) re-enters through a new `restoring` entry after a gate
+/// refusal of `sync`: once per window (AM-45).
+pub const MAX_REENTRIES: u32 = 1;
+
+/// How often (b) sends the same `sync` again after a lost answer.
+pub const SYNC_TRIES: u32 = 3;
 
 /// How often a failed V9 tries tenant 0's `d1` record.
 pub const V9_GIVE_UP_TRIES: u32 = 3;
@@ -390,7 +410,7 @@ fn door_of(written: Written) -> TenantDoor {
 /// `safety` hold the frozen catalogue and its stamp; `dir` the directory;
 /// `keys` the owner's key chain.
 #[allow(clippy::too_many_arguments)]
-pub async fn flip<S, C, F, B, Q, U, R, K>(
+pub async fn flip<S, C, F, B, Q, U, R, K, M>(
     chain: &TenantChain<'_, S, C>,
     frozen: &F,
     safety: &B,
@@ -398,6 +418,7 @@ pub async fn flip<S, C, F, B, Q, U, R, K>(
     unit: &U,
     routes: &R,
     keys: &K,
+    receipt: &M,
     window: &Window<'_>,
     now: UnixMs,
 ) -> Result<Flipped, FlipError>
@@ -410,6 +431,7 @@ where
     U: OwnerUnit,
     R: RouteRecords,
     K: OwnerKeys,
+    M: MoveReceipt,
 {
     let zero = match window_state(chain, window).await? {
         WindowState::Open(zero) => zero,
@@ -423,8 +445,27 @@ where
                 wrote: false,
             });
         }
-        WindowState::GivenUp(_) => return Err(FlipError::NotThisMove),
+        // A V9 failure's give-up that a crash cut short: finish it
+        // (AM-52); any other give-up is not the flip's.
+        WindowState::GivenUp(_) => {
+            if !receipt.v9_failed().await? {
+                return Err(FlipError::NotThisMove);
+            }
+            return match give_up(chain, frozen, safety, dir, unit, routes, keys, window, now).await
+            {
+                Ok(_) => Err(FlipError::V9Failed),
+                Err(e) => Err(FlipError::V9GiveUp(Box::new(e))),
+            };
+        }
     };
+    // A failed V9 in the receipt: the give-up, never a lift or a second
+    // sample (AM-52).
+    if receipt.v9_failed().await? {
+        return give_up_after_v9(
+            chain, frozen, safety, dir, unit, routes, keys, window, &zero, now,
+        )
+        .await;
+    }
     let z = zero.tenant_zero.as_ref().expect("checked by window_state");
     let m = z.moved.as_ref().expect("checked by window_state");
     // The whole window is checked before the first write.
@@ -451,57 +492,13 @@ where
     // route names the owner yet, so nothing reaches the open unit before
     // the give-up closes it.
     if !routes_started && !unit.v9().await? {
-        // Every error from here keeps the V9 answer: a re-run finds the
-        // window given up and cannot report the failing check again.
-        // The `d1` record is tried a few times: until it lands, a re-run
-        // would sample V9 again.
-        let gave_up = async {
-            let mut last = None;
-            for _ in 0..V9_GIVE_UP_TRIES {
-                // Each try checks that the window is still this one: a
-                // give-up by another run ends the loop, a later window
-                // stops it.
-                match window_state(chain, window).await {
-                    Ok(WindowState::GivenUp(_)) => {
-                        last = None;
-                        dir.apply_tenant(&head_of(chain, &Tenant::Zero).await?, now)
-                            .await?;
-                        break;
-                    }
-                    Ok(WindowState::Open(z)) if z.seq == zero.seq => {}
-                    Ok(_) => return Err(FlipError::NotThisMove),
-                    Err(e) => {
-                        last = Some(e);
-                        continue;
-                    }
-                }
-                match chain
-                    .write(
-                        &Tenant::Zero,
-                        &Change::GiveUpMove,
-                        Actor::MoveTool,
-                        now,
-                        zero.seq,
-                    )
-                    .await
-                {
-                    Ok(written) => {
-                        last = None;
-                        dir.apply_tenant(&door_of(written), now).await?;
-                        break;
-                    }
-                    Err(e) => last = Some(FlipError::Chain(e)),
-                }
-            }
-            if let Some(e) = last {
-                return Err(e);
-            }
-            give_up(chain, frozen, safety, dir, unit, routes, keys, window, now).await
-        };
-        return match gave_up.await {
-            Ok(_) => Err(FlipError::V9Failed),
-            Err(e) => Err(FlipError::V9GiveUp(Box::new(e))),
-        };
+        // The result first, so a re-run after a crash anywhere below
+        // gives up too (AM-52).
+        receipt.put_v9_failed().await?;
+        return give_up_after_v9(
+            chain, frozen, safety, dir, unit, routes, keys, window, &zero, now,
+        )
+        .await;
     }
 
     // (c) The keys once more, the directory's keys_seq, then the routes:
@@ -551,8 +548,96 @@ where
     Ok(Flipped { stamp, wrote })
 }
 
+/// The give-up after a failed V9 (AM-52, DS1 §3.8 row 8(b2)): tenant 0's
+/// `d1` record first (tried a few times: until it lands, nothing else of
+/// the give-up runs), then [`give_up`], which puts `restoring` on the
+/// owner's unit again and runs the rest. Answers [`FlipError::V9Failed`]
+/// once the give-up is done.
+#[allow(clippy::too_many_arguments)]
+async fn give_up_after_v9<S, C, F, B, Q, U, R, K>(
+    chain: &TenantChain<'_, S, C>,
+    frozen: &F,
+    safety: &B,
+    dir: &SqlDirectory<'_, Q>,
+    unit: &U,
+    routes: &R,
+    keys: &K,
+    window: &Window<'_>,
+    zero: &TenantDoor,
+    now: UnixMs,
+) -> Result<Flipped, FlipError>
+where
+    S: RecordStore,
+    C: ControlSeal,
+    F: Sql,
+    B: BlobStore,
+    Q: Sql,
+    U: OwnerUnit,
+    R: RouteRecords,
+    K: OwnerKeys,
+{
+    let gave_up = async {
+        let mut last = None;
+        for _ in 0..V9_GIVE_UP_TRIES {
+            // Each try checks that the window is still this one: a give-up
+            // by another run ends the loop, a later window stops it.
+            match window_state(chain, window).await {
+                Ok(WindowState::GivenUp(_)) => {
+                    last = None;
+                    dir.apply_tenant(&head_of(chain, &Tenant::Zero).await?, now)
+                        .await?;
+                    break;
+                }
+                Ok(WindowState::Open(z)) if z.seq == zero.seq => {}
+                Ok(_) => return Err(FlipError::NotThisMove),
+                Err(e) => {
+                    last = Some(e);
+                    continue;
+                }
+            }
+            match chain
+                .write(
+                    &Tenant::Zero,
+                    &Change::GiveUpMove,
+                    Actor::MoveTool,
+                    now,
+                    zero.seq,
+                )
+                .await
+            {
+                Ok(written) => {
+                    last = None;
+                    dir.apply_tenant(&door_of(written), now).await?;
+                    break;
+                }
+                Err(e) => last = Some(FlipError::Chain(e)),
+            }
+        }
+        if let Some(e) = last {
+            return Err(e);
+        }
+        give_up(chain, frozen, safety, dir, unit, routes, keys, window, now).await
+    };
+    match gave_up.await {
+        Ok(_) => Err(FlipError::V9Failed),
+        Err(e) => Err(FlipError::V9GiveUp(Box::new(e))),
+    }
+}
+
 /// Step 8(b): the owner's unit 0 lifted by the move's report and synced
-/// open (AM-15). Answers the owner's head the unit opened under.
+/// open (AM-15, AM-45). Answers the owner's head the unit opened under.
+///
+/// Before it acts on a refused `sync`, or on a lost answer, it reads the
+/// unit: an empty `restoring_since` means the lift landed. A lost answer
+/// sends the same `sync` again ([`SYNC_TRIES`]). `keys_not_applied`
+/// (the key records applied), `stale_sync` (the head read again) and
+/// `counters_off` (`Recount`) are each acted on once per entry; the same
+/// refusal after its fix stops. A gate refusal `not_restoring`,
+/// `no_report`, `stamp_not_levelled` or `proof_mismatch` re-enters once
+/// per window: a new entry, the unit closed under it, (b) again. Any
+/// other refusal stops; the tool then takes the give-up of DS1 §3.8 row 8
+/// with the refusal in its receipt. (c) starts only after a read of the
+/// unit shows `restoring_since` empty.
 async fn open_unit<S, C, Q, U, K>(
     chain: &TenantChain<'_, S, C>,
     dir: &SqlDirectory<'_, Q>,
@@ -569,7 +654,19 @@ where
     U: OwnerUnit,
     K: OwnerKeys,
 {
-    for reentry in 0..=MAX_REENTRIES {
+    #[derive(Default)]
+    struct Fixed {
+        keys: bool,
+        stale: bool,
+        counters: bool,
+    }
+    let mut reentries = 0u32;
+    // The entry the fixes so far were for.
+    let mut fixed_for: Option<u64> = None;
+    let mut fixed = Fixed::default();
+    // Each round is a fix, a re-entry or the end; the fixes are once per
+    // entry and the re-entries once per window, so the bound is not met.
+    for _ in 0..8 {
         let owner = head_of(chain, window.owner).await?;
         let (owner, proof) = match owner.restoring_entry(0) {
             Some(e) if e.since_seq >= window.since => {
@@ -613,27 +710,44 @@ where
                 (owner, proof)
             }
         };
+        // An entry above the window's first is a re-entry already made
+        // (by this run or an earlier one): once per window.
+        let since = proof.replay_id.since;
+        if since > window.since {
+            reentries = reentries.max(MAX_REENTRIES);
+        }
+        if fixed_for != Some(since) {
+            fixed_for = Some(since);
+            fixed = Fixed::default();
+        }
         // An opening record: the directory before the unit.
         dir.apply_tenant(&owner, now).await?;
-        let mut answer = unit.sync(&owner, Some(&proof)).await?;
-        if answer == Synced::Refused(UnitRefused::KeysNotApplied) {
-            apply_owner_keys(keys, unit).await?;
-            answer = unit.sync(&owner, Some(&proof)).await?;
-        }
-        match answer {
-            Synced::Ok => {
+        let refusal = match send_sync(unit, &owner, &proof).await? {
+            None => {
                 unit.renew().await?;
                 return Ok(owner);
             }
-            // A newer record of the owner: read the head again.
-            Synced::Refused(UnitRefused::StaleSync) if reentry < MAX_REENTRIES => {}
-            // The lift landed already (a lost answer): the unit is open.
-            Synced::Refused(UnitRefused::Gate(_)) if unit.restoring_since().await?.is_none() => {
-                unit.renew().await?;
-                return Ok(owner);
+            Some(r) => r,
+        };
+        match refusal {
+            UnitRefused::KeysNotApplied if !fixed.keys => {
+                fixed.keys = true;
+                apply_owner_keys(keys, unit).await?;
+            }
+            // A newer record of the owner: the head is read again.
+            UnitRefused::StaleSync if !fixed.stale => fixed.stale = true,
+            UnitRefused::Gate(GateRefusal::CountersOff) if !fixed.counters => {
+                fixed.counters = true;
+                unit.recount().await?;
             }
             // Re-entry: a new entry, the unit closed under it, (b) again.
-            Synced::Refused(UnitRefused::Gate(_)) if reentry < MAX_REENTRIES => {
+            UnitRefused::Gate(
+                GateRefusal::NotRestoring
+                | GateRefusal::NoReport
+                | GateRefusal::StampNotLevelled
+                | GateRefusal::ProofMismatch,
+            ) if reentries < MAX_REENTRIES => {
+                reentries += 1;
                 let closed = door_of(
                     chain
                         .write(
@@ -649,10 +763,33 @@ where
                 // A closing record: the unit before the directory.
                 dir.apply_tenant(&closed, now).await?;
             }
-            Synced::Refused(r) => return Err(FlipError::SyncRefused(r)),
+            r => return Err(FlipError::SyncRefused(r)),
         }
     }
-    unreachable!("the last re-entry returns")
+    Err(FlipError::LiftNotOk)
+}
+
+/// One `sync` that lifts, sent again after a lost answer. `None`: the lift
+/// landed (a read of the unit shows `restoring_since` empty); else the
+/// refusal, read after the unit was found still closed.
+async fn send_sync<U: OwnerUnit>(
+    unit: &U,
+    owner: &TenantDoor,
+    proof: &LiftProof,
+) -> Result<Option<UnitRefused>, FlipError> {
+    let mut lost = None;
+    for _ in 0..SYNC_TRIES {
+        let answer = unit.sync(owner, Some(proof)).await;
+        let open = unit.restoring_since().await?.is_none();
+        match answer {
+            Ok(Synced::Ok) if open => return Ok(None),
+            Ok(Synced::Ok) => return Err(FlipError::NotLifted),
+            _ if open => return Ok(None),
+            Ok(Synced::Refused(r)) => return Ok(Some(r)),
+            Err(e) => lost = Some(e),
+        }
+    }
+    Err(lost.map_or(FlipError::LiftNotOk, FlipError::Store))
 }
 
 /// The owner's unit 0 closed: this window's entry (or a later one) kept,
