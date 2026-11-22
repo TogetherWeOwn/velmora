@@ -728,8 +728,8 @@ fn a_move_import_that_is_not_sealed_never_lifts() {
         gate_refused(GateRefusal::ImportNotSealed)
     );
     assert_eq!(u.head().unwrap().restoring_since, Some(S));
-    // The rule binds the move's own entry: under a later entry (a
-    // restore), the gate's report decides.
+    // Under a later entry too (a rollback to a point inside the window,
+    // then a restore): the partial import is never lifted.
     let later = S + 3;
     ok(sync_to(&u, later, Some(later), None));
     let r = rid(later, 3, "r2");
@@ -746,7 +746,11 @@ fn a_move_import_that_is_not_sealed_never_lifts() {
             summary: empty_summary(),
         },
     ));
-    assert_eq!(proof(&u).replay_id, r);
+    assert_eq!(status(&u)["lift"]["refused"], json!("import_not_sealed"));
+    assert_eq!(
+        refusal(&sync_to(&u, later + 1, None, None)),
+        gate_refused(GateRefusal::ImportNotSealed)
+    );
 }
 
 #[test]
@@ -837,7 +841,7 @@ fn a_restore_born_unit_lifts_a_move_only_with_its_counters_on() {
 }
 
 // ---------------------------------------------------------------------------
-// The import cursor (L3's patch, and the longest key the S3 path takes)
+// The import cursor: the longest key the S3 path takes
 // ---------------------------------------------------------------------------
 
 /// The cursor the move's copy sends: the typed JSON of the row's key.

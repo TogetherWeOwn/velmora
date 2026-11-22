@@ -170,15 +170,15 @@ unit's refuses it, so a lost batch is found. It records
 from then on no batch is taken, not even the last one sent again, under
 any entry: the refusal is its own code, `sealed`, so a resumed copy knows
 the import is done. The seal survives a new `restoring` entry;
-`deleteAll()` clears it. While a move's import is not sealed, the move's
-entry is not lifted, whatever the report. Every imported key value must
+`deleteAll()` clears it. While a move's import is not sealed, no lift
+passes under any entry, whatever the report. Every imported key value must
 be of its column's class (text, or integer where declared), so the unit
 never holds a key that `export` cannot page after.
 
 In a unit, every `tenant_id` column (such as
 `upload_part_extents.tenant_id`) is a legacy default and is not
 authoritative: the unit's tenant is its certificate (`unit_birth`), and
-no unit code reads that column (L3-15).
+no unit code reads that column.
 
 ## Export
 
@@ -334,11 +334,17 @@ A `move` report takes no blocker page and no acknowledgement, and no
 summary but a complete, empty one. The lift check reads the binding the
 unit holds again (root unit, seal, stamp counter, empty summary). If a
 stamp raise lands between the report and the lift record, the `sync` is
-refused; the tool writes a new `restoring` entry, syncs the unit to it,
-and opens a new report under it. The lift a `move` report passes uses the
-seal up: no other `move` report is taken after it, so a later entry (a
-restore of the owner's unit) is lifted only by the restore gate. No other
-kind of lift exists.
+refused by the gate (`refused: gate`); the tool writes a new `restoring`
+entry, syncs the unit to it, and opens a new report under it. The lift a
+`move` report passes uses the seal up: no other `move` report is taken
+after it, so a later entry (a restore of the owner's unit) is lifted only
+by the restore gate. So a tool that re-runs 8(b) first reads the unit:
+if its `restoring_since` is already empty, the lift landed and 8(c)
+follows; a `keys_not_applied` answer means apply the keys and send the
+`sync` again, and `stale_sync` means read the head again. Only a gate
+refusal re-enters. Not covered: a rollback of the unit to a point between
+the seal and the lift brings back an unused seal (a design question). No
+other kind of lift exists.
 
 A unit born from a `restore` token cannot lift until `recount` (AM-27)
 turns its counters on; that call is not built yet.

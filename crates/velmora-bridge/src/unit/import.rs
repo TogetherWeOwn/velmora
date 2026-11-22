@@ -464,7 +464,8 @@ pub enum ImportRefusal {
     NotBound,
     /// The column list is not the unit's, or a row has another length,
     /// a value the table refuses here (a leased outbox row, a `plan_rev`
-    /// above 1), or the batch is empty or too large.
+    /// above 1, a key value that is null, a blob, or not of its column's
+    /// class), or the batch is empty or too large.
     Shape,
     /// `after` is not the table's stored cursor, and the batch is not
     /// the last one sent again.

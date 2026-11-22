@@ -663,10 +663,11 @@ pub fn check<S: Sql>(
     if id.since != since {
         return Ok(Err(GateRefusal::NoReport));
     }
-    // A move's import that is not sealed keeps the move's entry closed,
-    // whatever the report: a partial import is never lifted. (A later
-    // entry, a restore's, is the gate's to judge.)
-    if super::import::import_since(sql)? == Some(since) && super::import::sealed(sql)?.is_none() {
+    // A move's import that is not sealed keeps the unit closed under every
+    // entry, whatever the report: a partial import is never lifted, not
+    // even after a rollback to a point inside the window (both give-ups
+    // empty the unit first, and AM-15's re-entry follows the seal).
+    if super::import::import_since(sql)?.is_some() && super::import::sealed(sql)?.is_none() {
         return Ok(Err(GateRefusal::ImportNotSealed));
     }
     match kind {
