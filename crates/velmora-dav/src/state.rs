@@ -270,11 +270,11 @@ fn within(outer: &str, inner: &str) -> bool {
 
 /// For one affected resource, every exclusive lock and at least one
 /// shared lock (if any) must have an owned, submitted token.
-fn blocking_lock(
-    locks: &[Lock],
+fn blocking_lock<'a>(
+    locks: impl IntoIterator<Item = &'a Lock>,
     holds: impl Fn(&Lock) -> bool,
     inherited_shared: impl FnOnce() -> bool,
-) -> Option<&str> {
+) -> Option<&'a str> {
     let mut missing_shared = None;
     let mut held_shared = false;
     for lock in locks {
@@ -367,8 +367,17 @@ impl<S: Sql> Engine<'_, S> {
             if let Some(root) = blocking_lock(&covering, holds, || false) {
                 return Ok(Some(root.to_owned()));
             }
-            if check.scope != Scope::Tree {
+            if check.scope != Scope::Tree || (!check.path.is_empty() && !check.path.ends_with('/'))
+            {
                 continue;
+            }
+            // Scope::Tree includes descendants even if no lock is rooted
+            // at their exact path. A depth-zero token can satisfy the
+            // check above but cannot authorize the inherited lock scope.
+            if let Some(root) =
+                blocking_lock(covering.iter().filter(|l| l.depth_inf), holds, || false)
+            {
+                return Ok(Some(root.to_owned()));
             }
             let mut under = self.under(&check.path)?;
             under.sort_unstable_by(|a, b| a.root.cmp(&b.root));
@@ -382,9 +391,11 @@ impl<S: Sql> Engine<'_, S> {
             // already cover the checked path). Only authorized depth-infinity
             // shared locks can satisfy the requirement at a descendant root.
             for rooted in under.chunk_by(|a, b| a.root == b.root) {
-                if let Some(root) = blocking_lock(rooted, holds, || {
-                    ancestors(&rooted[0].root).any(|p| inherited.contains(p))
-                }) {
+                let holds_ancestor = || ancestors(&rooted[0].root).any(|p| inherited.contains(p));
+                let blocked = blocking_lock(rooted, holds, holds_ancestor).or_else(|| {
+                    blocking_lock(rooted.iter().filter(|l| l.depth_inf), holds, holds_ancestor)
+                });
+                if let Some(root) = blocked {
                     return Ok(Some(root.to_owned()));
                 }
             }

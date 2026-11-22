@@ -957,6 +957,37 @@ async fn a_tree_write_still_checks_independent_shared_locks() {
 }
 
 #[tokio::test]
+async fn a_depth_zero_token_does_not_cover_unrooted_descendants() {
+    let w = World::new().await;
+    assert_eq!(w.s3_put("docs/report", b"keep").await, 200);
+    w.req("LOCK", "/dav/docs/", &[], &lockinfo("shared", "alice"))
+        .await
+        .expect(200);
+    let bob = w
+        .req_as(
+            APP2,
+            APP2_SECRET,
+            "LOCK",
+            "/dav/docs/",
+            &[("depth", "0")],
+            &lockinfo("shared", "bob"),
+        )
+        .await;
+    let bob_if = format!("({})", bob.expect(200).header("lock-token").unwrap());
+    w.req_as(
+        APP2,
+        APP2_SECRET,
+        "DELETE",
+        "/dav/docs/",
+        &[("if", &bob_if)],
+        b"",
+    )
+    .await
+    .expect(423);
+    assert_eq!(w.s3_get("docs/report").await.1, b"keep");
+}
+
+#[tokio::test]
 async fn inherited_shared_token_can_authorize_a_membership_change() {
     let w = World::new().await;
     assert_eq!(w.s3_put("docs/team/report", b"old").await, 200);
