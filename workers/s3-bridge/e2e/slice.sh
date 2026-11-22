@@ -1140,13 +1140,15 @@ if [[ $MODE == local ]]; then
   }
   # 300 s, not 90 or 180: the restart above is a new Worker version. With
   # PERMITS=d1 the slots held by sessions of the stopped isolate stay
-  # claimed until their 120 s lease expires. With PERMITS=do the gate
-  # refuses job permits for about 125 s after a new version starts; the
-  # re-driven post job's 120 s slot wait ends just before that, so it is
-  # put off for 15 to 60 s, then posts and verifies. On CI that took 150
-  # to 192 s after the restart, past the old 180 s window more than once.
-  # The check is unchanged: the cron, not a queue message, must bring the
-  # object to release or done with a counted backbone.
+  # claimed until their 120 s lease expires. With PERMITS=do the gate's
+  # handoff to a new version can hold job permits back for up to about
+  # 125 s; when that outlasts the re-driven post job's 120 s slot wait,
+  # the job is put off for 15 to 60 s, then posts and verifies. On CI that
+  # took 150 to 192 s after the restart, past the old 180 s window more
+  # than once. The check is unchanged: the PUT's own wake-up was refused,
+  # so the cron must send a replacement job, which the queue consumers
+  # then post and verify, bringing the object to release or done with a
+  # counted backbone.
   if ! poll 300 2 cron_then_check; then
     json=$(adm "GET /_admin/objects/$SB/a/lost.bin" "$BASE/_admin/objects/$SB/a/lost.bin")
     fail "a/lost.bin recovered by the scheduled handler within 300 s" "jq: ($REACHED) and ($COUNTED)" "$json"
