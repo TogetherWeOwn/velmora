@@ -822,6 +822,101 @@ async fn shared_locks_and_lock_on_an_unmapped_url() {
 }
 
 #[tokio::test]
+async fn a_shared_lock_token_covers_a_file_with_overlapping_locks() {
+    let w = World::new().await;
+    assert_eq!(w.s3_put("docs/report", b"old").await, 200);
+    w.req("LOCK", "/dav/docs/", &[], &lockinfo("shared", "alice"))
+        .await
+        .expect(200);
+    let bob = w
+        .req_as(
+            APP2,
+            APP2_SECRET,
+            "LOCK",
+            "/dav/docs/report",
+            &[],
+            &lockinfo("shared", "bob"),
+        )
+        .await;
+    let bob_if = format!("({})", bob.expect(200).header("lock-token").unwrap());
+    w.req_as(
+        APP2,
+        APP2_SECRET,
+        "PUT",
+        "/dav/docs/report",
+        &[("if", &bob_if)],
+        b"new",
+    )
+    .await
+    .expect(204);
+    // Carol has no lock token of her own. Borrowing Bob's token doesn't help.
+    for headers in [&[][..], &[("if", bob_if.as_str())][..]] {
+        w.req_as(RO, RO_SECRET, "PUT", "/dav/docs/report", headers, b"carol")
+            .await
+            .expect(423);
+    }
+    assert_eq!(w.s3_get("docs/report").await.1, b"new");
+}
+
+#[tokio::test]
+async fn a_tree_write_still_checks_independent_shared_locks() {
+    for (depth, status) in [("0", 423), ("infinity", 204)] {
+        let w = World::new().await;
+        assert_eq!(w.s3_put("docs/report", b"old").await, 200);
+        let alice = w
+            .req(
+                "LOCK",
+                "/dav/docs/",
+                &[("depth", depth)],
+                &lockinfo("shared", "alice"),
+            )
+            .await;
+        let alice_if = format!("({})", alice.expect(200).header("lock-token").unwrap());
+        w.req_as(
+            APP2,
+            APP2_SECRET,
+            "LOCK",
+            "/dav/docs/report",
+            &[],
+            &lockinfo("shared", "bob"),
+        )
+        .await
+        .expect(200);
+        // The token covers the report only if Alice's depth is infinity.
+        w.req("DELETE", "/dav/docs/", &[("if", &alice_if)], b"")
+            .await
+            .expect(status);
+        assert_eq!(
+            w.s3_get("docs/report").await.0,
+            if depth == "0" { 200 } else { 404 }
+        );
+    }
+}
+
+#[tokio::test]
+async fn inherited_shared_token_can_authorize_a_membership_change() {
+    let w = World::new().await;
+    assert_eq!(w.s3_put("docs/team/report", b"old").await, 200);
+    let alice = w
+        .req("LOCK", "/dav/docs/", &[], &lockinfo("shared", "alice"))
+        .await;
+    let alice_if = format!("({})", alice.expect(200).header("lock-token").unwrap());
+    w.req_as(
+        APP2,
+        APP2_SECRET,
+        "LOCK",
+        "/dav/docs/team/",
+        &[("depth", "0")],
+        &lockinfo("shared", "bob"),
+    )
+    .await
+    .expect(200);
+    w.req("PUT", "/dav/docs/team/new", &[("if", &alice_if)], b"new")
+        .await
+        .expect(201);
+}
+
+#[tokio::test]
 async fn dead_properties_follow_copy_and_move_and_go_with_delete() {
     let w = World::new().await;
     w.req("PUT", "/dav/p", &[], b"x").await.expect(201);

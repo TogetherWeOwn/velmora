@@ -16,6 +16,7 @@
 //! small.
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 
 /// A value of the SQL port.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -105,7 +106,7 @@ pub enum Scope {
     Exact,
     /// The path and everything under it (a collection operation).
     Tree,
-    /// A collection whose members change: locks rooted at it.
+    /// A collection whose members change: locks covering the collection.
     Member,
 }
 
@@ -248,15 +249,9 @@ pub struct Engine<'a, S: Sql> {
 }
 
 /// Every collection above `path`, the bucket itself (`""`) included.
-fn ancestors(path: &str) -> Vec<String> {
+fn ancestors(path: &str) -> impl Iterator<Item = &str> {
     let body = path.strip_suffix('/').unwrap_or(path);
-    let mut out = vec![String::new()];
-    for (i, c) in body.char_indices() {
-        if c == '/' {
-            out.push(body[..=i].to_owned());
-        }
-    }
-    out
+    std::iter::once("").chain(body.match_indices('/').map(move |(i, _)| &body[..=i]))
 }
 
 /// The end of the key range under a collection (`a/` -> `a0`).
@@ -269,6 +264,30 @@ fn range_end(prefix: &str) -> Option<String> {
 
 fn within(outer: &str, inner: &str) -> bool {
     crate::path::within(outer, inner)
+}
+
+/// For one affected resource, every exclusive lock and at least one
+/// shared lock (if any) must have an owned, submitted token.
+fn blocking_lock(
+    locks: &[Lock],
+    holds: impl Fn(&Lock) -> bool,
+    inherited_shared: impl FnOnce() -> bool,
+) -> Option<&str> {
+    let mut missing_shared = None;
+    let mut held_shared = false;
+    for lock in locks {
+        let held = holds(lock);
+        if lock.exclusive {
+            if !held {
+                return Some(&lock.root);
+            }
+        } else if held {
+            held_shared = true;
+        } else {
+            missing_shared.get_or_insert(lock.root.as_str());
+        }
+    }
+    missing_shared.filter(|_| !held_shared && !inherited_shared())
 }
 
 const LOCK_COLS: &str =
@@ -318,7 +337,7 @@ impl<S: Sql> Engine<'_, S> {
     pub fn covering(&self, path: &str) -> Result<Vec<Lock>, String> {
         // The ancestors go as one JSON parameter: a deep path must not
         // run into the limit on bound parameters of a statement.
-        let above: Vec<String> = ancestors(path).into_iter().filter(|a| a != path).collect();
+        let above: Vec<&str> = ancestors(path).filter(|&a| a != path).collect();
         let above = serde_json::to_string(&above).map_err(|e| e.to_string())?;
         let rows = self.sql.exec(
             &format!(
@@ -330,33 +349,40 @@ impl<S: Sql> Engine<'_, S> {
         Ok(rows.iter().map(|r| lock_of(r)).collect())
     }
 
-    /// The first lock root a request does not hold: for every root that
-    /// a check meets, one lock there must be named in `tokens` and belong
-    /// to `principal`.
+    /// Check each affected resource independently, including each lock
+    /// root under a recursive operation.
     fn blocked(
         &self,
         checks: &[Check],
         tokens: &[String],
         principal: &str,
     ) -> Result<Option<String>, String> {
+        let tokens: HashSet<&str> = tokens.iter().map(String::as_str).collect();
+        let holds =
+            |lock: &Lock| lock.principal == principal && tokens.contains(lock.token.as_str());
         for check in checks {
-            let locks = match check.scope {
-                Scope::Exact => self.covering(&check.path)?,
-                Scope::Tree => {
-                    let mut l = self.covering(&check.path)?;
-                    l.extend(self.under(&check.path)?);
-                    l
-                }
-                Scope::Member => self.rooted_at(&check.path)?,
-            };
-            let mut roots: Vec<&str> = locks.iter().map(|l| l.root.as_str()).collect();
-            roots.sort_unstable();
-            roots.dedup();
-            for root in roots {
-                let held = locks.iter().any(|l| {
-                    l.root == root && tokens.contains(&l.token) && l.principal == principal
-                });
-                if !held {
+            let covering = self.covering(&check.path)?;
+            if let Some(root) = blocking_lock(&covering, holds, || false) {
+                return Ok(Some(root.to_owned()));
+            }
+            if check.scope != Scope::Tree {
+                continue;
+            }
+            let mut under = self.under(&check.path)?;
+            under.sort_unstable_by(|a, b| a.root.cmp(&b.root));
+            let inherited: HashSet<&str> = covering
+                .iter()
+                .chain(&under)
+                .filter(|lock| lock.depth_inf && !lock.exclusive && holds(lock))
+                .map(|lock| lock.root.as_str())
+                .collect();
+            // Ancestor exclusive locks are checked at their own root (or
+            // already cover the checked path). Only authorized depth-infinity
+            // shared locks can satisfy the requirement at a descendant root.
+            for rooted in under.chunk_by(|a, b| a.root == b.root) {
+                if let Some(root) = blocking_lock(rooted, holds, || {
+                    ancestors(&rooted[0].root).any(|p| inherited.contains(p))
+                }) {
                     return Ok(Some(root.to_owned()));
                 }
             }
@@ -377,14 +403,6 @@ impl<S: Sql> Engine<'_, S> {
             )?,
             None => Vec::new(),
         };
-        Ok(rows.iter().map(|r| lock_of(r)).collect())
-    }
-
-    fn rooted_at(&self, path: &str) -> Result<Vec<Lock>, String> {
-        let rows = self.sql.exec(
-            &format!("SELECT {LOCK_COLS} FROM locks WHERE root = ?1"),
-            &[t(path)],
-        )?;
         Ok(rows.iter().map(|r| lock_of(r)).collect())
     }
 
