@@ -157,46 +157,53 @@ enum BodyError {
     Read,
 }
 
-/// Plain reads of a body: `Ok(0)` is its end. A read never returns more
-/// than `dst.len()` bytes, and is never asked for 0.
+/// Plain reads of a body: `Ok(0)` is its end. A read returning `n`
+/// writes `dst[..n]`, with `n <= dst.len()`, and is never asked for 0.
 trait BodyReads {
     async fn read(&mut self, dst: &mut [u8]) -> std::result::Result<usize, BodyError>;
 }
 
-/// Reads a body of exactly `expected` bytes into one buffer of that size.
+/// Reads exactly `expected` bytes into `out`, reusing its allocation if it
+/// fits. Grow by at most [`MAX_PRESIZE`] at a time and probe for a long body
+/// on the stack, so an exactly sized buffer needs no extra capacity.
 ///
-/// The buffer is reserved up to [`MAX_PRESIZE`] ahead of what has arrived,
-/// so a larger body grows as it arrives. Each read lands in place: no chunk
-/// is held twice. The buffer has room for one byte past `expected`, so a
-/// longer body shows itself without being read further.
-async fn fill_body<R: BodyReads>(
+/// Clearing removes the old length and resizing zeroes newly exposed bytes.
+/// Each read overwrites its prefix in order, and success requires all
+/// `expected == out.len()` bytes to have been written. Old bytes beyond `len`
+/// stay in spare capacity and cannot be exposed by safe `Vec` code. The
+/// poster also checks the sealed ciphertext length and SHA-256 before posting.
+async fn fill_into<R: BodyReads>(
     reads: &mut R,
     expected: u64,
-) -> std::result::Result<Vec<u8>, BodyError> {
-    // Only a 32-bit target refuses here, and no extent comes near 4 GiB.
-    let room = usize::try_from(expected)
-        .ok()
-        .and_then(|e| e.checked_add(1))
-        .ok_or(BodyError::Read)?;
-    let mut bytes = Vec::new();
-    let mut filled = 0;
-    loop {
-        if filled == bytes.len() {
-            bytes.resize(room.min(filled + MAX_PRESIZE as usize), 0);
+    out: &mut Vec<u8>,
+) -> std::result::Result<(), BodyError> {
+    out.clear();
+    let expected = usize::try_from(expected).map_err(|_| BodyError::Read)?;
+    let result = async {
+        let mut filled = 0usize;
+        while filled < expected {
+            if filled == out.len() {
+                let target = expected.min(filled.saturating_add(MAX_PRESIZE as usize));
+                if out.capacity() < target {
+                    out.reserve_exact(target - out.len());
+                }
+                out.resize(target, 0);
+            }
+            match reads.read(&mut out[filled..]).await? {
+                0 => return Err(BodyError::Short),
+                n => filled += n,
+            }
         }
-        match reads.read(&mut bytes[filled..]).await? {
-            0 => break,
-            n => filled += n,
-        }
-        if filled == room {
-            return Err(BodyError::Long);
+        match reads.read(&mut [0u8; 1]).await? {
+            0 => Ok(()),
+            _ => Err(BodyError::Long),
         }
     }
-    if filled + 1 < room {
-        return Err(BodyError::Short);
+    .await;
+    if result.is_err() {
+        out.clear();
     }
-    bytes.truncate(filled);
-    Ok(bytes)
+    result
 }
 
 /// Largest single read asked of R2, and so the most the runtime buffer
@@ -281,6 +288,56 @@ impl BodyReads for ByobReads {
     }
 }
 
+impl R2Blobs {
+    async fn read_into(
+        &self,
+        key: &str,
+        span: Option<ByteSpan>,
+        out: &mut Vec<u8>,
+    ) -> Result<bool> {
+        // Missing objects and failures before the first read leave no old bytes.
+        out.clear();
+        let mut req = self.bucket.get(key);
+        match span {
+            // R2 has no empty range: answer from a head.
+            Some(s) if s.len == 0 => {
+                return match self.head(key).await? {
+                    None => Ok(false),
+                    Some(size) => empty_span(s, size).map(|_| true),
+                };
+            }
+            Some(s) => req = req.range(r2_range(s)?),
+            None => {}
+        }
+        let Some(object) = req.execute().await.map_err(blob_err("get"))? else {
+            return Ok(false);
+        };
+        let body = object
+            .body()
+            .ok_or_else(|| BridgeError::Blob("r2: get returned no body".into()))?;
+        let expected = span.map_or_else(|| object.size(), |s| s.len);
+        let stream = match body.response_body().map_err(blob_err("get body"))? {
+            worker::ResponseBody::Stream(stream) => stream,
+            _ => return Err(BridgeError::Blob("r2: get returned no body".into())),
+        };
+        let Some(mut reads) = ByobReads::new(&stream, expected) else {
+            return Err(BridgeError::Blob("r2: get body failed".into()));
+        };
+        fill_into(&mut reads, expected, out).await.map_err(|e| {
+            BridgeError::Blob(
+                match (e, span) {
+                    (BodyError::Short, Some(_)) => "r2: short range",
+                    (BodyError::Short, None) => "r2: short body",
+                    (BodyError::Long, _) => "r2: long body",
+                    (BodyError::Read, _) => "r2: get body failed",
+                }
+                .into(),
+            )
+        })?;
+        Ok(true)
+    }
+}
+
 impl BlobStore for R2Blobs {
     async fn put(&self, key: &str, bytes: Vec<u8>, meta: &BlobMeta<'_>) -> Result<()> {
         if self.tombstone_delay_ms > 0
@@ -327,44 +384,12 @@ impl BlobStore for R2Blobs {
     }
 
     async fn get(&self, key: &str, span: Option<ByteSpan>) -> Result<Option<Vec<u8>>> {
-        let mut req = self.bucket.get(key);
-        match span {
-            // R2 has no empty range: answer from a head.
-            Some(s) if s.len == 0 => {
-                return match self.head(key).await? {
-                    None => Ok(None),
-                    Some(size) => empty_span(s, size).map(Some),
-                };
-            }
-            Some(s) => req = req.range(r2_range(s)?),
-            None => {}
-        }
-        let Some(object) = req.execute().await.map_err(blob_err("get"))? else {
-            return Ok(None);
-        };
-        let body = object
-            .body()
-            .ok_or_else(|| BridgeError::Blob("r2: get returned no body".into()))?;
-        let expected = span.map_or_else(|| object.size(), |s| s.len);
-        let stream = match body.response_body().map_err(blob_err("get body"))? {
-            worker::ResponseBody::Stream(stream) => stream,
-            _ => return Err(BridgeError::Blob("r2: get returned no body".into())),
-        };
-        let Some(mut reads) = ByobReads::new(&stream, expected) else {
-            return Err(BridgeError::Blob("r2: get body failed".into()));
-        };
-        let bytes = fill_body(&mut reads, expected).await;
-        bytes.map(Some).map_err(|e| {
-            BridgeError::Blob(
-                match (e, span) {
-                    (BodyError::Short, Some(_)) => "r2: short range",
-                    (BodyError::Short, None) => "r2: short body",
-                    (BodyError::Long, _) => "r2: long body",
-                    (BodyError::Read, _) => "r2: get body failed",
-                }
-                .into(),
-            )
-        })
+        let mut out = Vec::new();
+        Ok(self.read_into(key, span, &mut out).await?.then_some(out))
+    }
+
+    async fn get_into(&self, key: &str, out: &mut Vec<u8>) -> Result<bool> {
+        self.read_into(key, None, out).await
     }
 
     async fn head(&self, key: &str) -> Result<Option<u64>> {
@@ -562,6 +587,75 @@ mod tests {
     }
 
     #[test]
+    fn fills_a_reused_extent_buffer_in_place() {
+        let len = 16 * 1024 * 1024 + 4144;
+        let mut out = vec![0xaa; len];
+        let (ptr, cap) = (out.as_ptr(), out.capacity());
+        let mut r = scripted(len, vec![Some(4096); 9]);
+        run(fill_into(&mut r, len as u64, &mut out)).unwrap();
+        assert_eq!(out.as_ptr(), ptr);
+        assert_eq!(out.capacity(), cap);
+        assert_eq!(out.len(), len);
+        assert_eq!(out, r.body);
+    }
+
+    #[test]
+    fn a_shorter_second_body_exposes_no_bytes_from_the_first() {
+        let mut out = vec![0xaa; 256];
+        let cap = out.capacity();
+        let mut first = scripted(200, vec![]);
+        first.body.fill(0xbb);
+        run(fill_into(&mut first, 200, &mut out)).unwrap();
+        assert_eq!(out, first.body);
+
+        let mut second = scripted(53, vec![Some(3), Some(7)]);
+        second.body.fill(0x33);
+        run(fill_into(&mut second, 53, &mut out)).unwrap();
+        assert_eq!(out, second.body);
+        assert_eq!(out.capacity(), cap);
+    }
+
+    #[test]
+    fn errors_clear_the_destination_without_growing_past_the_body_size() {
+        for previous_capacity in [16, 100, 128] {
+            for (mut r, error) in [
+                (scripted(101, vec![]), BodyError::Long),
+                (scripted(99, vec![]), BodyError::Short),
+                (scripted(100, vec![Some(10), None]), BodyError::Read),
+                (scripted(100, vec![Some(100), None]), BodyError::Read),
+            ] {
+                let mut out = vec![0xaa; previous_capacity];
+                let bound = out.capacity().max(100);
+                assert_eq!(run(fill_into(&mut r, 100, &mut out)), Err(error));
+                assert_eq!(out.len(), 0);
+                assert!(out.capacity() <= bound);
+            }
+        }
+    }
+
+    #[test]
+    fn a_fresh_buffer_has_exactly_the_body_capacity() {
+        let len = 1000;
+        let mut out = Vec::new();
+        let mut r = scripted(len, vec![Some(5)]);
+        run(fill_into(&mut r, len as u64, &mut out)).unwrap();
+        assert_eq!(out, r.body);
+        assert_eq!(out.capacity(), len);
+    }
+
+    #[test]
+    fn a_buffer_with_no_room_for_a_spare_byte_is_not_reallocated() {
+        let mut out = Vec::with_capacity(1000);
+        assert_eq!(out.capacity(), 1000);
+        let ptr = out.as_ptr();
+        let mut r = scripted(1000, vec![]);
+        run(fill_into(&mut r, 1000, &mut out)).unwrap();
+        assert_eq!(out.as_ptr(), ptr);
+        assert_eq!(out.capacity(), 1000);
+        assert_eq!(out, r.body);
+    }
+
+    #[test]
     fn body_lands_in_order_whatever_the_read_sizes() {
         for steps in [
             vec![],
@@ -570,41 +664,45 @@ mod tests {
             vec![Some(3), Some(65536), Some(5)],
         ] {
             let mut r = scripted(70_001, steps);
-            let got = run(fill_body(&mut r, 70_001)).unwrap();
-            assert_eq!(got, r.body);
+            let mut out = Vec::new();
+            run(fill_into(&mut r, 70_001, &mut out)).unwrap();
+            assert_eq!(out, r.body);
         }
     }
 
     #[test]
-    fn exact_body_ends_with_one_spare_byte() {
+    fn exact_body_ends_with_a_one_byte_probe() {
         let mut r = scripted(1000, vec![]);
-        assert_eq!(run(fill_body(&mut r, 1000)).unwrap().len(), 1000);
+        let mut out = Vec::new();
+        run(fill_into(&mut r, 1000, &mut out)).unwrap();
+        assert_eq!(out.len(), 1000);
         assert_eq!(
             r.asked,
-            vec![1001, 1],
+            vec![1000, 1],
             "one read for the body, one for its end"
         );
     }
 
     #[test]
     fn short_long_and_failed_bodies_are_refused() {
+        let mut out = Vec::new();
         assert_eq!(
-            run(fill_body(&mut scripted(99, vec![]), 100)),
+            run(fill_into(&mut scripted(99, vec![]), 100, &mut out)),
             Err(BodyError::Short)
         );
         assert_eq!(
-            run(fill_body(&mut scripted(101, vec![]), 100)),
+            run(fill_into(&mut scripted(101, vec![]), 100, &mut out)),
             Err(BodyError::Long)
         );
         let failing = vec![Some(10), None];
         assert_eq!(
-            run(fill_body(&mut scripted(100, failing), 100)),
+            run(fill_into(&mut scripted(100, failing), 100, &mut out)),
             Err(BodyError::Read)
         );
         // A body that fails at its end is not taken as complete.
         let failing_end = vec![Some(100), None];
         assert_eq!(
-            run(fill_body(&mut scripted(100, failing_end), 100)),
+            run(fill_into(&mut scripted(100, failing_end), 100, &mut out)),
             Err(BodyError::Read)
         );
     }
@@ -612,10 +710,13 @@ mod tests {
     #[test]
     fn empty_body_reads_only_its_end() {
         let mut r = scripted(0, vec![]);
-        assert_eq!(run(fill_body(&mut r, 0)).unwrap(), Vec::<u8>::new());
+        let mut out = Vec::new();
+        run(fill_into(&mut r, 0, &mut out)).unwrap();
+        assert!(out.is_empty());
+        assert_eq!(out.capacity(), 0);
         assert_eq!(r.asked, vec![1]);
         assert_eq!(
-            run(fill_body(&mut scripted(1, vec![]), 0)),
+            run(fill_into(&mut scripted(1, vec![]), 0, &mut out)),
             Err(BodyError::Long)
         );
     }
@@ -624,7 +725,9 @@ mod tests {
     fn buffer_grows_by_the_presize_step() {
         let len = MAX_PRESIZE as usize + 5;
         let mut r = scripted(len, vec![]);
-        assert_eq!(run(fill_body(&mut r, len as u64)).unwrap(), r.body);
-        assert_eq!(r.asked, vec![MAX_PRESIZE as usize, 6, 1]);
+        let mut out = Vec::new();
+        run(fill_into(&mut r, len as u64, &mut out)).unwrap();
+        assert_eq!(out, r.body);
+        assert_eq!(r.asked, vec![MAX_PRESIZE as usize, 5, 1]);
     }
 }
