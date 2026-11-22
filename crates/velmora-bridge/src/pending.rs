@@ -1,7 +1,7 @@
 //! The pending sweep (tenancy ADR §2.5, "Three things finish a crashed
-//! change"): a cron job that takes the `pending_ops` rows older than
-//! [`SWEEP_AGE_MS`], runs the finisher of each named chain, and drops a
-//! row that names a change above the chain's head.
+//! change"): a cron job that runs the finisher of every chain with a
+//! `pending_ops` row older than [`SWEEP_AGE_MS`], and drops the rows of
+//! that chain above the head the finisher read.
 //!
 //! A `pending_ops` row is the visible copy of a control intent; the
 //! queue message `apply_control(tenant, chain, seq)` is its durable part
@@ -15,21 +15,33 @@
 //!   next pass runs the finisher again (the attention list reads the age
 //!   of what stays from the directory; ADR: alarm at 10 minutes, page at
 //!   30);
-//! - a row above the head names a change that was never recorded: its
-//!   intent was refused before its record, or the Worker stopped between
-//!   the two. Nothing will ever clear it, so the sweep drops it.
+//! - a row above a **complete** head names a change that was never
+//!   recorded: its intent was refused before its record, or its request
+//!   stopped between the two. Nothing would ever clear it, so the sweep
+//!   drops it.
 //!
-//! Dropping a row is safe whatever happens next: a row is only a copy.
-//! Should the record of a dropped row be written after all (a request
-//! still running), its queue message and the freshness lease still
-//! finish it, and the finisher reads the head, not the row. The finisher
-//! runs before the head is compared, so a revocation whose `m/rk/` record
-//! was written and whose chain record was not is appended by the
-//! finisher first, and its row is then at or below the head.
+//! A head is complete ([`ChainHead::complete`]) when the finisher read
+//! the chain to its end and recorded every revocation it found in
+//! `m/rk/` without a chain record. A revocation whose chain record could
+//! not be appended (a lost put, a store error, a key that would not
+//! load) leaves the head below a change that is in force: the head is
+//! then not complete, and no row of the chain is dropped.
 //!
-//! The sweep runs each chain at most once per pass, and a chain whose
-//! finisher fails keeps its rows (nothing is dropped on a head that was
-//! not read) and does not stop the others.
+//! Only rows noted at or before the pass's cutoff are dropped
+//! ([`PendingRows::drop_above`]). A retry of a change notes its row again
+//! (noting refreshes the row's time), so a retry that records the seq
+//! after the head was read keeps its row.
+//!
+//! A dropped row is only a copy. Should its record be written after all,
+//! the freshness lease and the finisher of the chain's next change, both
+//! of which read the head, finish it.
+//!
+//! The sweep goes chain by chain, in the order of the chains' keys, at
+//! most [`SWEEP_CHAINS`] a pass, and the next pass starts after the last
+//! one ([`SweepReport::next_after`]). A chain whose rows stay (a store
+//! that is down, a subject that is closed) therefore holds no other
+//! chain back. A chain whose finisher fails keeps its rows and stops no
+//! other.
 
 use crate::crypto::scheme2::TenantId;
 use crate::keys::ports::ControlChain;
@@ -40,105 +52,131 @@ use crate::types::{Result, UnixMs};
 /// minutes").
 pub const SWEEP_AGE_MS: i64 = 2 * 60 * 1000;
 
-/// Rows one pass takes at most.
-pub const SWEEP_ROWS: u32 = 500;
+/// Chains one pass finishes at most.
+pub const SWEEP_CHAINS: u32 = 100;
 
-/// One `pending_ops` row.
+/// A chain of a tenant: the key the sweep goes in order of (the tenant,
+/// then its tenant chain before its key chain).
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PendingRow {
+pub struct ChainKey {
     pub tenant: TenantId,
     pub chain: ControlChain,
-    pub seq: u64,
-    /// When the intent was noted.
-    pub noted_at: UnixMs,
 }
 
-/// The directory's `pending_ops` rows.
+impl ChainKey {
+    fn order(&self) -> (&TenantId, u8) {
+        let chain = match self.chain {
+            ControlChain::Tenant => 0,
+            ControlChain::Keys => 1,
+        };
+        (&self.tenant, chain)
+    }
+}
+
+impl Ord for ChainKey {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.order().cmp(&other.order())
+    }
+}
+
+impl PartialOrd for ChainKey {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// The directory's `pending_ops` rows, by chain.
 #[allow(async_fn_in_trait)]
 pub trait PendingRows {
-    /// Up to `limit` rows noted at or before `cutoff`, oldest first.
-    async fn noted_by(&self, cutoff: UnixMs, limit: u32) -> Result<Vec<PendingRow>>;
-    /// Removes this one row (tenant, chain and seq). A row that is gone
-    /// already is no error.
-    async fn drop_row(&self, row: &PendingRow) -> Result<()>;
+    /// Up to `limit` distinct chains, in key order and after `after`,
+    /// that have at least one row noted at or before `cutoff`.
+    async fn chains_noted_by(
+        &self,
+        cutoff: UnixMs,
+        after: Option<&ChainKey>,
+        limit: u32,
+    ) -> Result<Vec<ChainKey>>;
+    /// Deletes the rows of `chain` whose seq is above `head` and that
+    /// were noted at or before `cutoff`, in one statement; answers how
+    /// many. A row noted again after `cutoff` stays.
+    async fn drop_above(&self, chain: &ChainKey, head: u64, cutoff: UnixMs) -> Result<u32>;
+}
+
+/// The head a finisher read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ChainHead {
+    /// The seq of the newest record (0 for a chain with no record).
+    pub seq: u64,
+    /// The chain was read to its end and every revocation of `m/rk/` has
+    /// its chain record: no change in force is above `seq`.
+    pub complete: bool,
 }
 
 /// The finisher of a chain.
 #[allow(async_fn_in_trait)]
 pub trait ChainFinisher {
-    /// Runs the finisher of `chain` of `tenant`, and answers the head
-    /// seq it read (0 for a chain with no record). An `Err`: the head
-    /// could not be read.
-    async fn finish(&self, tenant: &TenantId, chain: ControlChain) -> Result<u64>;
+    /// Runs the finisher of the chain, and answers the head it read. An
+    /// `Err`: the head could not be read.
+    async fn finish(&self, chain: &ChainKey) -> Result<ChainHead>;
 }
 
 /// What one pass did.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SweepReport {
-    /// Rows taken.
-    pub rows: u32,
-    /// Chains whose finisher ran and answered a head.
+    /// Chains whose finisher ran and answered a complete head.
     pub finished: u32,
+    /// Chains whose finisher answered a head that was not complete:
+    /// their rows were kept.
+    pub incomplete: u32,
     /// Chains whose finisher failed: their rows were kept.
     pub failed: u32,
-    /// Rows of those chains.
-    pub unread: u32,
-    /// Rows at or below the head: recorded changes, which the finisher
-    /// cleared if every store holds them, and left otherwise.
-    pub recorded: u32,
-    /// Rows dropped: above the head after the finisher.
-    pub dropped: u32,
-    /// Rows above the head whose drop failed: kept for the next pass.
+    /// Chains whose drop failed: their rows were kept for the next pass.
     pub drop_failed: u32,
+    /// Rows dropped: above a complete head.
+    pub dropped: u32,
+    /// Where the next pass starts: the last chain of this pass, or
+    /// `None` when this pass reached the last chain (the next one starts
+    /// from the first).
+    pub next_after: Option<ChainKey>,
 }
 
-/// One pass of the sweep at `now`. An `Err` only when the rows could not
-/// be read.
+/// One pass of the sweep at `now`, after the chain `after` (the
+/// `next_after` of the pass before). An `Err` only when the chains could
+/// not be read.
 pub async fn sweep<P: PendingRows, F: ChainFinisher>(
     rows: &P,
     finisher: &F,
     now: UnixMs,
+    after: Option<&ChainKey>,
 ) -> Result<SweepReport> {
-    let taken = rows
-        .noted_by(UnixMs(now.0 - SWEEP_AGE_MS), SWEEP_ROWS)
-        .await?;
+    let cutoff = UnixMs(now.0 - SWEEP_AGE_MS);
+    let chains = rows.chains_noted_by(cutoff, after, SWEEP_CHAINS).await?;
     let mut report = SweepReport {
-        rows: taken.len() as u32,
+        next_after: if chains.len() as u32 == SWEEP_CHAINS {
+            chains.last().cloned()
+        } else {
+            None
+        },
         ..SweepReport::default()
     };
-    // Each chain once, in the order of its oldest row.
-    let mut chains: Vec<(&TenantId, ControlChain)> = Vec::new();
-    for row in &taken {
-        if !chains
-            .iter()
-            .any(|(t, c)| *t == &row.tenant && *c == row.chain)
-        {
-            chains.push((&row.tenant, row.chain));
-        }
-    }
-    for (tenant, chain) in chains {
-        let of_chain = taken
-            .iter()
-            .filter(|r| &r.tenant == tenant && r.chain == chain);
-        let head = match finisher.finish(tenant, chain).await {
-            Ok(head) => {
+    for chain in &chains {
+        let head = match finisher.finish(chain).await {
+            Ok(head) if head.complete => {
                 report.finished += 1;
                 head
             }
+            Ok(_) => {
+                report.incomplete += 1;
+                continue;
+            }
             Err(_) => {
                 report.failed += 1;
-                report.unread += of_chain.count() as u32;
                 continue;
             }
         };
-        for row in of_chain {
-            if row.seq <= head {
-                report.recorded += 1;
-            } else if rows.drop_row(row).await.is_ok() {
-                report.dropped += 1;
-            } else {
-                report.drop_failed += 1;
-            }
+        match rows.drop_above(chain, head.seq, cutoff).await {
+            Ok(n) => report.dropped += n,
+            Err(_) => report.drop_failed += 1,
         }
     }
     Ok(report)

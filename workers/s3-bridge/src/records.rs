@@ -9,10 +9,13 @@
 //!   `Ok(false)`, and the stored object is left as it was. Any other
 //!   failure is an error, which says nothing about whether the bytes were
 //!   stored; the caller reads the name back (the port's rule).
-//! - `get` reads the whole object; a record is small, and one above
-//!   [`MAX_RECORD_BYTES`] is an error, never read.
-//! - `list` pages on R2's `truncated` and `cursor` until it has `limit`
-//!   names or R2 has no more. A page that says "more" and gives no
+//! - A record above [`MAX_RECORD_BYTES`] is refused before its put, and
+//!   one found above it is an error, never read: no record is stored
+//!   that a get could not read back. The largest records are the key
+//!   checkpoints (every subject a tenant has had, about 0.5 KiB each).
+//! - `list` pages on R2's `truncated` and `cursor`, at most
+//!   [`R2_LIST_MAX`] names a page, until it has `limit` names or R2 has
+//!   no more. A page that says "more" and gives no
 //!   cursor is an error, never the end: a short listing would read as
 //!   the whole one.
 //! - `exists` is a head.
@@ -31,8 +34,13 @@ use worker::wasm_bindgen_futures::JsFuture;
 use worker::worker_sys::R2Bucket as EdgeBucket;
 use worker::{Bucket, Headers};
 
-/// The largest record a get reads. Control records are a few KiB.
-pub const MAX_RECORD_BYTES: u64 = 1 << 20;
+/// The largest record that is stored or read: 32 MiB, far above a key
+/// checkpoint of 10,000 subjects (about 5 MiB) and far below the memory
+/// of an isolate (128 MB).
+pub const MAX_RECORD_BYTES: u64 = 32 << 20;
+
+/// The most names R2 answers in one page (it refuses a larger limit).
+pub const R2_LIST_MAX: u32 = 1000;
 
 /// A bucket as a store of put-once records.
 pub struct R2Records {
@@ -68,6 +76,9 @@ fn only_if_absent() -> Result<JsValue> {
 
 impl RecordStore for R2Records {
     async fn put_if_absent(&self, name: &str, bytes: Vec<u8>) -> Result<bool> {
+        if bytes.len() as u64 > MAX_RECORD_BYTES {
+            return Err(BridgeError::Blob("records: record too large".into()));
+        }
         let edge: &EdgeBucket = self.bucket.as_ref().unchecked_ref();
         let body: JsValue = Uint8Array::from(bytes.as_slice()).into();
         let put = edge
@@ -95,7 +106,7 @@ impl RecordStore for R2Records {
         let mut names = Vec::new();
         let mut cursor: Option<String> = None;
         while (names.len() as u64) < u64::from(limit) {
-            let want = limit - names.len() as u32;
+            let want = (limit - names.len() as u32).min(R2_LIST_MAX);
             let mut req = self.bucket.list().prefix(prefix).limit(want);
             req = match &cursor {
                 Some(c) => req.cursor(c.clone()),
