@@ -3053,6 +3053,7 @@ fn no_transition_lowers_the_key_version_and_the_stub_takes_nothing() {
     assert_eq!(stub.door.tk_version, 2, "the stub keeps the last version");
     let zero = tenant_zero();
     let moving = moving();
+    let flipped = apply(&moving, Change::FlipMove { stamp: 3 }, Actor::MoveTool);
 
     let floor = |ms| Change::SetMoveFloor {
         unit: 0,
@@ -3177,12 +3178,15 @@ fn no_transition_lowers_the_key_version_and_the_stub_takes_nothing() {
         &stub,
         &zero,
         &moving,
+        &flipped,
     ];
     let mut written = 0;
+    // The writes of the flipped head's own changes, by name.
+    let mut after_flip: Vec<&'static str> = Vec::new();
     for head in heads {
         for change in &changes {
             for actor in actors {
-                for now in [NOW, UnixMs(NOW.0 + 8 * DAY)] {
+                for now in [NOW, UnixMs(NOW.0 + 8 * DAY), UnixMs(NOW.0 + 31 * DAY)] {
                     let mut change = change.clone();
                     if let Change::SetLimits { base_seq, .. }
                     | Change::SetFeatures { base_seq, .. }
@@ -3199,6 +3203,14 @@ fn no_transition_lowers_the_key_version_and_the_stub_takes_nothing() {
                         continue;
                     };
                     written += 1;
+                    if std::ptr::eq(head, &flipped) {
+                        after_flip.push(match change {
+                            Change::UndoMove { .. } => "undo",
+                            Change::UndoMoveOntoFrozen { .. } => "undo_onto_frozen",
+                            Change::RetireTenantZero => "retire",
+                            _ => "other",
+                        });
+                    }
                     assert_ne!(
                         head.door.lifecycle,
                         Lifecycle::Shredded,
@@ -3214,8 +3226,12 @@ fn no_transition_lowers_the_key_version_and_the_stub_takes_nothing() {
             }
         }
     }
-    // The sweep reached real transitions, not only refusals.
+    // The sweep reached real transitions, not only refusals, the flipped
+    // tenant 0's undo, fallback undo and retirement among them.
     assert!(written > 50, "{written}");
+    for w in ["undo", "undo_onto_frozen", "retire"] {
+        assert!(after_flip.contains(&w), "{w}: {after_flip:?}");
+    }
 }
 
 /// AM-74 (Q30): `SetMoveFloor` asks for the unit to be listed on the
