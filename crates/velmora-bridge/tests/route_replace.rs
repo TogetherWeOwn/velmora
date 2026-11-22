@@ -245,7 +245,115 @@ async fn bad_input_is_refused_before_any_read() {
                 .is_err()
         );
     }
+    // Only the move and its undo replace a route: tenant 0 on exactly one
+    // side, and no tenant id that a route cannot name.
+    put(&store, &kek, &owner, "AKVL0002", SubjectKind::S3).await;
+    let before = store.raw(&route_name("AKVL0002"));
+    for (from, to) in [
+        (owner.as_str(), tenant(2).as_str()),
+        (ZERO, ZERO),
+        (owner.as_str(), owner.as_str()),
+        ("t_zz", ZERO),
+        (ZERO, "t_0000000000000001x"),
+    ] {
+        assert!(replace_route(
+            &store,
+            &kek,
+            "AKVL0002",
+            from,
+            to,
+            SubjectKind::S3,
+            &mut rng
+        )
+        .await
+        .is_err());
+    }
+    assert_eq!(store.raw(&route_name("AKVL0002")), before);
     assert_eq!(store.replaces(), 0);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_key_create_never_takes_a_tenant_zero_route() {
+    let (store, kek, owner) = (MemRecords::new(), kek(), tenant(1));
+    put(&store, &kek, ZERO, KEY, SubjectKind::S3).await;
+    let before = store.raw(&route_name(KEY));
+    let mut rng = TestRng::new("create");
+    assert_eq!(
+        put_route(
+            &store,
+            &kek,
+            &TenantId::parse(&owner).unwrap(),
+            KEY,
+            SubjectKind::S3,
+            500,
+            &mut rng
+        )
+        .await
+        .unwrap(),
+        RoutePut::Taken
+    );
+    assert_eq!(store.raw(&route_name(KEY)), before);
+    assert!(
+        TenantId::parse(ZERO).is_err(),
+        "no key is created on tenant 0's route"
+    );
+}
+
+/// A store where every replace but the last loses to a fresh tenant-0
+/// record written just before it, and the last one stores and loses its
+/// answer.
+struct LoseLast<'a> {
+    inner: &'a MemRecords,
+    flips: RefCell<Vec<Vec<u8>>>,
+    calls: Cell<u32>,
+}
+
+impl RecordStore for LoseLast<'_> {
+    async fn put_if_absent(&self, name: &str, bytes: Vec<u8>) -> Result<bool> {
+        self.inner.put_if_absent(name, bytes).await
+    }
+    async fn get(&self, name: &str) -> Result<Option<Vec<u8>>> {
+        self.inner.get(name).await
+    }
+    async fn list(&self, prefix: &str, start_after: &str, limit: u32) -> Result<Vec<String>> {
+        self.inner.list(prefix, start_after, limit).await
+    }
+    async fn get_tagged(&self, name: &str) -> Result<Option<Tagged>> {
+        self.inner.get_tagged(name).await
+    }
+    async fn replace_if_match(&self, name: &str, etag: &str, bytes: Vec<u8>) -> Result<bool> {
+        self.calls.set(self.calls.get() + 1);
+        let next = self.flips.borrow_mut().pop();
+        if let Some(flip) = next {
+            self.inner.plant(name, flip);
+            return self.inner.replace_if_match(name, etag, bytes).await;
+        }
+        assert!(self.inner.replace_if_match(name, etag, bytes).await?);
+        Err(velmora_bridge::BridgeError::Blob("answer lost".into()))
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_lost_answer_on_the_last_try_is_read_back() {
+    let (store, kek, owner) = (MemRecords::new(), kek(), tenant(1));
+    put(&store, &kek, ZERO, KEY, SubjectKind::S3).await;
+    let mut flips = Vec::new();
+    for i in 1..REPLACE_TRIES {
+        flips.push(sealed_route(&kek, ZERO, SubjectKind::S3, &format!("last {i}")).await);
+    }
+    let lose = LoseLast {
+        inner: &store,
+        flips: RefCell::new(flips),
+        calls: Cell::new(0),
+    };
+    assert!(replace(&lose, &kek, ZERO, &owner, SubjectKind::S3)
+        .await
+        .unwrap());
+    assert_eq!(lose.calls.get(), REPLACE_TRIES);
+    assert_eq!(
+        read_route(&store, &kek, KEY).await.unwrap(),
+        route(&owner, SubjectKind::S3, 100)
+    );
 }
 
 /// A store whose replace lets another writer in first: before the first

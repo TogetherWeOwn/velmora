@@ -131,8 +131,9 @@ pub const REPLACE_TRIES: u32 = 4;
 /// third tenant; nothing is written. A record that does not open, or
 /// that names another key id, is an `Err`, and nothing is written. A
 /// replace whose answer was lost is read back: the stored record decides.
-/// A record that changes under every one of [`REPLACE_TRIES`] tries is an
-/// `Err`.
+/// A record that still needs the replace after [`REPLACE_TRIES`] tries is an
+/// `Err`. Tenant 0 must be on exactly one side (the move or its undo);
+/// anything else is an `Err` before any read.
 pub async fn replace_route<S: RecordStore, K: Kek, R: FillRandom>(
     store: &S,
     kek: &K,
@@ -142,12 +143,22 @@ pub async fn replace_route<S: RecordStore, K: Kek, R: FillRandom>(
     kind: SubjectKind,
     rng: &mut R,
 ) -> Result<bool> {
-    if !valid_key_id(akid) || !kind.has_secret() || !route_tenant(from) || !route_tenant(to) {
+    // Only the move and its undo replace a route: tenant 0 on exactly one
+    // side (ADR addendum §2.2, "the only overwrite").
+    let one_side_zero = (from == DEFAULT_TENANT) != (to == DEFAULT_TENANT);
+    if !valid_key_id(akid)
+        || !kind.has_secret()
+        || !route_tenant(from)
+        || !route_tenant(to)
+        || !one_side_zero
+    {
         return Err(ERR_ROUTE);
     }
     let name = route_name(akid);
     let mut last_err = None;
-    for _ in 0..REPLACE_TRIES {
+    // Every try reads first; one more read after the last try settles a
+    // lost answer there.
+    for tried in 0..=REPLACE_TRIES {
         let Some(Tagged { bytes, etag }) = store.get_tagged(&name).await? else {
             return Ok(false);
         };
@@ -157,6 +168,9 @@ pub async fn replace_route<S: RecordStore, K: Kek, R: FillRandom>(
         }
         if route.tenant != to && route.tenant != from {
             return Ok(false);
+        }
+        if tried == REPLACE_TRIES {
+            break;
         }
         let sealed = seal_route(
             kek,
@@ -171,7 +185,7 @@ pub async fn replace_route<S: RecordStore, K: Kek, R: FillRandom>(
         match store.replace_if_match(&name, &etag, sealed).await {
             Ok(true) => return Ok(true),
             // Lost to another write, or the answer was lost: read again.
-            Ok(false) => {}
+            Ok(false) => last_err = None,
             Err(e) => last_err = Some(e),
         }
     }
