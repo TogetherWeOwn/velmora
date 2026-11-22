@@ -289,7 +289,7 @@ pub fn keys_page<S: Sql>(
         Some(a) => poll_once(sql.query(
             &format!(
                 "SELECT {KEY_COLUMNS} FROM unit_keys \
-                  WHERE kind = ?1 AND status <> 'revoked' AND (created_at, id) > (?2, ?3) \
+                  WHERE kind IN ('s3', 'app_password') AND kind = ?1 AND status <> 'revoked' AND (created_at, id) > (?2, ?3) \
                   ORDER BY created_at, id LIMIT ?4"
             ),
             &[kind, int(a.created_at)?, SqlValue::Text(a.id.clone()), take],
@@ -297,7 +297,7 @@ pub fn keys_page<S: Sql>(
         None => poll_once(sql.query(
             &format!(
                 "SELECT {KEY_COLUMNS} FROM unit_keys \
-                  WHERE kind = ?1 AND status <> 'revoked' ORDER BY created_at, id LIMIT ?2"
+                  WHERE kind IN ('s3', 'app_password') AND kind = ?1 AND status <> 'revoked' ORDER BY created_at, id LIMIT ?2"
             ),
             &[kind, take],
         ))??,

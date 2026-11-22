@@ -25,5 +25,8 @@ CREATE TABLE unit_owner_ref_conflicts (
 CREATE INDEX unit_owner_ref_conflicts_by_value ON unit_owner_ref_conflicts(disputed);
 
 -- `keys_page` (the management plane's key list): S3 keys or app
--- passwords in creation order, then id.
-CREATE INDEX unit_keys_by_kind_created ON unit_keys(kind, created_at, id);
+-- passwords in creation order, then id. Partial, so a principal lookup
+-- by `owner_ref` keeps its own index (`unit_keys_by_owner_ref`); the
+-- query names the same `kind IN (...)` term.
+CREATE INDEX unit_keys_by_kind_created ON unit_keys(kind, created_at, id)
+  WHERE kind IN ('s3', 'app_password');

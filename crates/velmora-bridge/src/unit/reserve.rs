@@ -552,11 +552,13 @@ fn find_principal<S: Sql>(
     let rows = match acting {
         Acting::OwnerRef(r) => poll_once(sql.query(
             "SELECT k.id, k.status, k.held, \
-                    EXISTS (SELECT 1 FROM unit_owner_ref_conflicts c WHERE c.id = k.id) \
+                    EXISTS (SELECT 1 FROM unit_owner_ref_conflicts m WHERE m.id = k.id) \
                FROM unit_keys k \
-              WHERE k.kind = 'principal' AND k.status <> 'revoked' \
-                AND (k.owner_ref = ?1 \
-                     OR k.id IN (SELECT id FROM unit_owner_ref_conflicts WHERE disputed = ?1)) \
+              WHERE k.kind = 'principal' AND k.owner_ref = ?1 AND k.status <> 'revoked' \
+             UNION \
+             SELECT k.id, k.status, k.held, 1 \
+               FROM unit_owner_ref_conflicts c JOIN unit_keys k ON k.id = c.id \
+              WHERE c.disputed = ?1 AND k.kind = 'principal' AND k.status <> 'revoked' \
               LIMIT 2",
             &[SqlValue::Text(r.clone())],
         ))??,

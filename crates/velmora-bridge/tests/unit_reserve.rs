@@ -557,26 +557,41 @@ fn two_principals_of_one_owner_ref_are_never_resolved() {
 }
 
 #[test]
-#[ignore = "L1-5b defect: owner-ref lookup searches by kind instead of owner_ref"]
 fn the_owner_ref_index_serves_the_resolve() {
     let u = ready();
-    let plan: Vec<String> = u
-        .sql()
-        .with_conn(|c| {
-            let mut st = c.prepare(
-                "EXPLAIN QUERY PLAN SELECT id, status, held FROM unit_keys \
-                  WHERE kind = 'principal' AND owner_ref = ?1 AND status <> 'revoked' LIMIT 2",
-            )?;
-            let v = st
-                .query_map([OWNER], |r| r.get::<_, String>(3))?
-                .collect::<rusqlite::Result<Vec<_>>>();
-            v
-        })
-        .unwrap();
-    assert!(
-        plan.iter().any(|p| p.contains("unit_keys_by_owner_ref")),
-        "{plan:?}"
-    );
+    let plan_of = |text: &str| -> Vec<String> {
+        u.sql()
+            .with_conn(|c| {
+                let mut st = c.prepare(&format!("EXPLAIN QUERY PLAN {text}"))?;
+                let v = st
+                    .query_map([OWNER], |r| r.get::<_, String>(3))?
+                    .collect::<rusqlite::Result<Vec<_>>>();
+                v
+            })
+            .unwrap()
+    };
+    // The index check of the principal create, and the resolve as
+    // `reserve::find_principal` asks it (with the conflict marks).
+    for text in [
+        "SELECT id, status, held FROM unit_keys \
+          WHERE kind = 'principal' AND owner_ref = ?1 AND status <> 'revoked' LIMIT 2",
+        "SELECT k.id, k.status, k.held, \
+                EXISTS (SELECT 1 FROM unit_owner_ref_conflicts m WHERE m.id = k.id) \
+           FROM unit_keys k \
+          WHERE k.kind = 'principal' AND k.owner_ref = ?1 AND k.status <> 'revoked' \
+         UNION \
+         SELECT k.id, k.status, k.held, 1 \
+           FROM unit_owner_ref_conflicts c JOIN unit_keys k ON k.id = c.id \
+          WHERE c.disputed = ?1 AND k.kind = 'principal' AND k.status <> 'revoked' \
+          LIMIT 2",
+    ] {
+        let plan = plan_of(text);
+        assert!(
+            plan.iter().any(|p| p.contains("unit_keys_by_owner_ref")),
+            "{plan:?}"
+        );
+        assert!(!plan.iter().any(|p| p.starts_with("SCAN")), "{plan:?}");
+    }
 }
 
 #[test]

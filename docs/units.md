@@ -365,12 +365,18 @@ lowered limit.
 Above a hard ceiling of 9 GB (est) no request call that adds a row
 runs, deletes (a floor and a tombstone each) and smaller overwrites
 included, so the platform's stop is never met; the Worker answers
-`503 SlowDown` and pages, and the operator moves a bucket to another
-unit. GC, aborts and settles still run. `databaseSize` counts the pages
-of the file, freed pages included (not measured on the platform), so
-the ceiling may not lift by itself after GC: the bucket move is the way
-out. This ceiling is an L1 choice beyond ADR §2.6, for the design
-lane to confirm.
+`503 SlowDown` and pages. `abort_upload` still runs (it ends an
+upload), and so do GC and settles. The measure is `databaseSize`
+(AM-73): measured 2026-11-22 in local workerd and on a throwaway
+workers.dev object, it falls after a delete (about 33.8 MB of rows
+inserted, then deleted: back to 12,288 bytes), while `PRAGMA
+page_count` and `freelist_count` are refused (`SQLITE_AUTH`). It does
+not lift after GC today, because GC deletes no `extents`,
+`generations`, `generation_extents` or `gc` rows and a delete adds
+rows: **the ceiling is a stop the unit does not leave by itself**. The
+way out is the operator's whole-bucket move (W14, not in milestone 1);
+until then a unit at the ceiling stays stopped (the owner's yes
+pending).
 
 ## Import
 
