@@ -324,7 +324,7 @@ where
         let record = write_generation(
             &bridge.catalog,
             &bridge.safety,
-            &bridge.kek,
+            &bridge.sealer(),
             &bridge.cfg.records,
             bucket,
             &generation,

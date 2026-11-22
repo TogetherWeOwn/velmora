@@ -35,13 +35,20 @@
 //! the root's door reader (`crate::root`). Never acknowledged on a read
 //! that was not made.
 
+use std::cell::Cell;
+use std::rc::Rc;
+
 use velmora::rng::SystemRng;
 use velmora_bridge::jobmsg::{JobTenant, Units};
+use velmora_bridge::request_catalog::RequestCatalog;
+use velmora_bridge::root::request::RequestPort;
 use velmora_bridge::root::Root;
+use velmora_bridge::service::managed;
 use velmora_bridge::service::KeyDispatch;
 use velmora_bridge::sql::SqlCatalog;
 use velmora_bridge::tenant_catalog::{LatestSeqs, TenantCatalog, UnitPort};
 use velmora_bridge::types::JobOutcome;
+use velmora_bridge::unit::request_client::RequestClient;
 use velmora_bridge::unit::{Seqs, TenantId, UnitAnswer, UnitCall, UnitName, UnitReply};
 use velmora_bridge::unit_consumer::{Ran, UnitRun};
 use velmora_bridge::unit_lease::client::UnitReplies;
@@ -246,16 +253,40 @@ impl UnitRun for OnUnit<'_> {
 }
 
 // ---------------------------------------------------------------------------
-// The request router (design round 5, AM-51)
+// The request router (design round 5, AM-51) and the request path on a
+// unit (L6-6, AM-64)
 // ---------------------------------------------------------------------------
 
-/// A request whose claimed access key routes to a managed tenant, served
-/// through the router (`velmora_bridge::service::serve_managed`). `None`:
-/// tenant 0's path, unchanged, which is every request of a Worker without
-/// `UNIT` bound (no route read at all), every request that claims no key
-/// or a key of tenant 0 (the directory names no route for it), and, after
-/// a failed directory read, a key tenant 0's catalogue holds. Any other
-/// key after a failed directory read answers `503` (ADR §8.4, DUR-10:
+/// The bridge of one managed tenant's S3 request: tenant 0's handlers
+/// over the request catalogue, whose request calls go to the tenant's
+/// unit through the root's router and unit client.
+pub type RequestBridge = Bridge<
+    RequestCatalog<RequestPort<WorkerPorts, SystemRng>, SqlCatalog<D1Sql>>,
+    R2Blobs,
+    WorkerConnector,
+    QueueSink,
+    KekRing,
+    WorkerClock,
+>;
+
+/// What became of a request at the router.
+pub enum Routed {
+    /// Tenant 0's path, unchanged: the request back.
+    TenantZero(velmora_bridge::S3Request),
+    /// Answered at once (DUR-10, the host, a refused route or `key_row`).
+    Answered(velmora_bridge::S3Response),
+    /// A managed tenant's request on its unit: serve it detached
+    /// ([`serve_on_unit`]).
+    OnUnit(Rc<RequestBridge>, velmora_bridge::S3Request),
+}
+
+/// A request whose claimed access key routes to a managed tenant goes to
+/// the tenant's unit (`velmora_bridge::service::managed`). Tenant 0's
+/// path is unchanged for every request of a Worker without `UNIT` bound
+/// (no route read at all), every request that claims no key or a key of
+/// tenant 0 (the directory names no route for it), and, after a failed
+/// directory read, a key tenant 0's catalogue holds. Any other key after a
+/// failed directory read answers `503` (ADR §8.4, DUR-10:
 /// `service::serve_unrouted`). `skip`: an admin route or a verified
 /// fan-out piece, which never take a key route.
 ///
@@ -265,48 +296,167 @@ impl UnitRun for OnUnit<'_> {
 /// retry layer).
 pub async fn route_request(
     env: &Env,
-    base: &WorkerBridge,
+    base: &Rc<WorkerBridge>,
     units: Units,
     skip: bool,
-    req: &velmora_bridge::S3Request,
-) -> Option<velmora_bridge::S3Response> {
+    req: velmora_bridge::S3Request,
+) -> Routed {
     if units != Units::Bound || skip {
-        return None;
+        return Routed::TenantZero(req);
     }
     // The host first (ADR §8.4 step 1), before any key route is read:
     // tenant 0's path gives the same refusal.
-    if velmora_bridge::service::request_host_refused(&base.cfg, req).is_some() {
-        return None;
+    if velmora_bridge::service::request_host_refused(&base.cfg, &req).is_some() {
+        return Routed::TenantZero(req);
     }
-    let akid = velmora_bridge::service::claimed_access_key(&base.cfg, req)?;
+    let Some(akid) = velmora_bridge::service::claimed_access_key(&base.cfg, &req) else {
+        return Routed::TenantZero(req);
+    };
     let ports = match WorkerPorts::from_env(env, base) {
-        Ok(ports) => ports,
+        Ok(ports) => Rc::new(ports),
         Err(class) => {
             // The bridge was built from the same `SAFETY`: not reached.
             worker::console_error!("alert: unit request ({class})");
-            return None;
+            return Routed::TenantZero(req);
         }
     };
     let cache = crate::root::cache();
-    let root = Root::new(&ports, &cache, SystemRng);
+    let root = Root::new(&*ports, &cache, SystemRng);
     let route = root.key_routes().tenant_of(&akid).await;
     let (tenant, floor) =
         match velmora_bridge::service::dispatch_key_route(route, &base.catalog, &akid).await {
             KeyDispatch::Managed { tenant, floor } => (tenant, floor),
-            KeyDispatch::TenantZero => return None,
+            KeyDispatch::TenantZero => return Routed::TenantZero(req),
             // DUR-10: no route could be shown for the key.
             KeyDispatch::Answer(resp, line) => {
                 log_request(line);
-                return Some(resp);
+                return Routed::Answered(resp);
             }
         };
-    let heads = root.heads();
-    let clients = root.clients();
-    let router = root.router(base.cfg.maintenance, &clients, &heads);
-    let (resp, line) =
-        velmora_bridge::service::serve_managed(&router, &base.cfg, &tenant, floor, req).await;
-    log_request(line);
-    Some(resp)
+    let prepared = {
+        let clients = root.clients();
+        let heads = root.heads();
+        let router = root.router(base.cfg.maintenance, &clients, &heads);
+        managed::prepare(&router, &base.cfg, &tenant, floor, &akid, &req).await
+    };
+    let request = match prepared {
+        managed::Prepared::Answer(resp, lines) => {
+            lines.into_iter().for_each(log_request);
+            return Routed::Answered(resp);
+        }
+        managed::Prepared::Serve(request) => request,
+    };
+    request.lines.iter().copied().for_each(log_request);
+    match request_bridge(env, base, ports, cache, &akid, request) {
+        Ok(bridge) => Routed::OnUnit(Rc::new(bridge), req),
+        Err(class) => {
+            worker::console_error!("alert: unit request not served ({class})");
+            Routed::Answered(velmora_bridge::service::unit_unavailable())
+        }
+    }
+}
+
+/// The request bridge of a managed tenant's request: the unit's config
+/// (`BridgeConfig::for_unit`, no fan-out: a fan-out piece is served on
+/// tenant 0's path), its blob stores and a sink whose jobs name the unit,
+/// and the request catalogue over the request port. Class-only reasons.
+fn request_bridge(
+    env: &Env,
+    base: &Rc<WorkerBridge>,
+    ports: Rc<WorkerPorts>,
+    cache: Rc<velmora_bridge::root::RootCache>,
+    akid: &str,
+    request: managed::ManagedRequest,
+) -> std::result::Result<RequestBridge, String> {
+    // The unit the jobs and the config name: the bucket's, or the root
+    // unit when the bucket's route was refused (every call then answers
+    // that refusal).
+    let unit = request.routed.as_ref().unwrap_or(&request.root).clone();
+    let mut cfg = base
+        .cfg
+        .for_unit(&unit.unit)
+        .map_err(|e| format!("unit config refused: {e}"))?;
+    cfg.get_fanout_bytes = None;
+    let sends = JobTenant::of_unit(
+        unit.unit.tenant.as_str(),
+        unit.unit.unit,
+        unit.seqs.state_seq,
+        unit.seqs.keys_seq,
+    )
+    .ok_or("not a unit's tenant")?;
+    let (shared, safety, blobs, jobs) = crate::env::unit_parts(env, base, sends)?;
+    let verified = Rc::new(Cell::new(false));
+    let port = RequestPort::new(
+        ports,
+        cache,
+        || SystemRng,
+        base.cfg.maintenance,
+        request.root.clone(),
+        request.root_renew,
+        request.routed,
+        Rc::clone(&verified),
+    );
+    let client = RequestClient::new(port, unit.unit.clone(), unit.seqs);
+    let catalog = RequestCatalog::new(
+        client,
+        shared,
+        request.scope,
+        akid,
+        request.key_row,
+        verified,
+    );
+    Ok(Bridge {
+        catalog,
+        safety,
+        cache: blobs,
+        nntp: WorkerConnector::new(),
+        jobs,
+        kek: base.kek.clone(),
+        clock: WorkerClock,
+        budget: base.budget.shared(),
+        cfg,
+    })
+}
+
+/// Serves a managed tenant's request on its bridge, then finishes it
+/// (`service::managed::finish`: the refused publications' records
+/// discarded, a unit's refusal as the answer). A background renewal the
+/// unit asked for (rule 12) is the work left for after the response,
+/// which the caller runs under `waitUntil` after a deferred body's work.
+pub async fn serve_on_unit(
+    bridge: Rc<RequestBridge>,
+    req: velmora_bridge::S3Request,
+) -> (velmora_bridge::S3Response, Option<crate::After>) {
+    let resp = Rc::clone(&bridge).handle(req).await;
+    let finished = managed::finish(bridge.catalog.client(), &bridge.safety, resp).await;
+    finished.lines.into_iter().for_each(log_request);
+    // Run after the response (and a deferred body's work): the renewal
+    // a call asked for, also one asked for by the calls of the body's
+    // work, which run after `finish` (their pages the port logs itself).
+    let first = finished.renew;
+    let after: crate::After = Box::pin(async move {
+        let port = bridge.catalog.client().port();
+        let mut due = managed::PortState::renew_due(port);
+        for (unit, seqs) in first {
+            if !due.iter().any(|(u, _)| u == &unit) {
+                due.push((unit, seqs));
+            }
+        }
+        let (ports, cache) = (Rc::clone(port.ports()), Rc::clone(port.cache()));
+        for (unit, seqs) in due {
+            let pages = velmora_bridge::root::request::renew_in_background(
+                &*ports, &cache, SystemRng, &unit, seqs,
+            )
+            .await;
+            for page in pages.iter().flatten() {
+                worker::console_error!(
+                    "alert: unit request ({})",
+                    velmora_bridge::unit_consumer::page_code(page)
+                );
+            }
+        }
+    });
+    (finished.resp, Some(after))
 }
 
 fn log_request(line: velmora_bridge::service::ManagedLine) {

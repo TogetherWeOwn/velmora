@@ -202,6 +202,7 @@ fn an_unborn_unit_answers_unborn_and_writes_nothing() {
             read_plan(None),
             UnitOp::KeyRow {
                 access_key_id: AKID.into(),
+                presigned: None,
             },
         ] {
             let mut c = call(CallKind::Request, seqs(3, 0), true, op);
@@ -785,6 +786,7 @@ fn an_unauthenticated_key_row_fetch_is_served_and_nothing_else_is() {
         false,
         UnitOp::KeyRow {
             access_key_id: AKID.into(),
+            presigned: None,
         },
     );
     let UnitAnswer::Ok { body, .. } = u.handle(&c, NOW) else {

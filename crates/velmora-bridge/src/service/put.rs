@@ -26,7 +26,7 @@ use super::common::{
     writes_refused,
 };
 use super::slices::{store_slices, SliceError, SliceSink};
-use crate::crypto::{seal_extent, unwrap_bdk};
+use crate::crypto::seal_extent;
 use crate::ingress::{read_upload, upload_lengths, UploadLengths, UploadReadError};
 use crate::intents::WRITER_MAX_AGE_MS;
 use crate::ports::{
@@ -132,13 +132,7 @@ async fn put<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: 
     let extent_id = ExtentId::mint(extent_rand);
     let generation_id = GenerationId::mint(now, generation_rand);
 
-    let bdk = unwrap_bdk(
-        &bridge.kek,
-        bucket.kek_version,
-        &bucket.id,
-        &bucket.bdk_wrapped,
-    )
-    .map_err(|_| internal())?;
+    let bdk = bridge.bucket_key(bucket).await.map_err(|_| internal())?;
     let sealed =
         seal_extent(&bdk, &bucket.id, &extent_id, &body, &mut rng).map_err(|_| internal())?;
     drop(body);
@@ -190,7 +184,7 @@ async fn put<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: 
     bridge
         .safety
         .put(
-            &extent_id.safety_key(),
+            &bridge.scope().safety_key(&extent_id),
             sealed.ciphertext,
             &BlobMeta {
                 bucket: &bucket.id,
@@ -226,7 +220,7 @@ async fn put<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: 
         let record = write_generation(
             &bridge.catalog,
             &bridge.safety,
-            &bridge.kek,
+            &bridge.sealer(),
             &bridge.cfg.records,
             bucket,
             &commit.generation,
@@ -349,13 +343,7 @@ async fn put_sliced<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: K
         rng.fill_bytes(&mut extent_rand).map_err(|_| internal())?;
         ids.push(ExtentId::mint(extent_rand));
     }
-    let bdk = unwrap_bdk(
-        &bridge.kek,
-        bucket.kek_version,
-        &bucket.id,
-        &bucket.bdk_wrapped,
-    )
-    .map_err(|_| internal())?;
+    let bdk = bridge.bucket_key(bucket).await.map_err(|_| internal())?;
 
     // Every slice has its row before its blob exists: whatever happens
     // to this request from here on, the catalogue names what it stored.
@@ -371,6 +359,7 @@ async fn put_sliced<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: K
 
     let sink = SliceSink {
         safety: &bridge.safety,
+        scope: bridge.scope().into_owned(),
         bdk: &bdk,
         bucket: &bucket.id,
         ids: &ids,
@@ -529,7 +518,7 @@ async fn put_sliced<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: K
         let record = write_generation(
             &bridge.catalog,
             &bridge.safety,
-            &bridge.kek,
+            &bridge.sealer(),
             &bridge.cfg.records,
             bucket,
             &commit.generation,

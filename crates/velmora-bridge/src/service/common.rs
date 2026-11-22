@@ -124,9 +124,9 @@ pub fn writes_refused() -> S3Response {
 }
 
 /// `503 ServiceUnavailable` with `Retry-After` for a managed tenant's
-/// request the router could not take to its unit (`service::serve_managed`).
+/// request the router could not take to its unit (`service::managed`).
 /// The body names no cause: the log line does.
-pub(super) fn unit_refused() -> S3Response {
+pub fn unit_refused() -> S3Response {
     let mut resp = S3Response::error(
         503,
         "ServiceUnavailable",
@@ -437,6 +437,58 @@ pub(super) fn edge_header(name: &str) -> bool {
         || matches!(name, "cdn-loop" | "x-real-ip" | "true-client-ip")
 }
 
+/// The request's policy, target and headers, with the refusals that name
+/// their cause. None reads anything but the request itself and the
+/// configuration. The host comes before the path is judged: on a
+/// virtual-hosted request the first segment is a key, and "not a bucket
+/// name" would name the wrong mistake.
+fn parsed(cfg: &BridgeConfig, req: &S3Request) -> Result<(Policy, Target, Headers), S3Response> {
+    let policy = policy(cfg, signed_host(cfg, req))?;
+    let target = Target::parse(&req.raw_target, &policy).map_err(s3_error);
+    let fields: Vec<(&str, &str)> = req
+        .headers
+        .iter()
+        .filter(|(n, _)| !edge_header(n))
+        .map(|(n, v)| (n.as_str(), v.as_str()))
+        .collect();
+    let headers = Headers::new(&fields, &policy).map_err(s3_error);
+    if let Ok(headers) = &headers {
+        if let Some(resp) = host_refused(headers, cfg) {
+            return Err(resp);
+        }
+    }
+    let target = target?;
+    let headers = headers?;
+    headers
+        .check_features()
+        .map_err(|refusal| header_refused(&refusal))?;
+    Ok((policy, target, headers))
+}
+
+/// A managed tenant's request checked as far as its signature and the
+/// tenant's state ([`verify_on_unit`]), with no bucket or grant read: for
+/// a call that is refused whatever the bucket (DeleteBucket over S3,
+/// AM-64). `Err` for tenant 0's catalogue, which never comes here.
+pub(super) async fn signature_on_unit<C, B, N, J, K, T>(
+    bridge: &Bridge<C, B, N, J, K, T>,
+    req: &S3Request,
+) -> Result<(), S3Response>
+where
+    C: Catalog,
+    B: BlobStore,
+    N: NntpConnector,
+    J: JobSink,
+    K: Kek,
+    T: Clock,
+{
+    let (policy, target, headers) = parsed(&bridge.cfg, req)?;
+    let akid = claimed_key(&headers, &target).unwrap_or_default();
+    match verify_on_unit(bridge, req, &policy, &target, &headers, &akid).await {
+        Some(signed) => signed.map(|_| ()),
+        None => Err(internal()),
+    }
+}
+
 /// Authenticates and authorizes from the request line and headers only.
 /// The body is never touched. A key with no usable row is
 /// `InvalidAccessKeyId` for every bucket.
@@ -461,30 +513,7 @@ where
     K: Kek,
     T: Clock,
 {
-    let policy = policy(&bridge.cfg, signed_host(&bridge.cfg, req))?;
-    let target = Target::parse(&req.raw_target, &policy).map_err(s3_error);
-    let fields: Vec<(&str, &str)> = req
-        .headers
-        .iter()
-        .filter(|(n, _)| !edge_header(n))
-        .map(|(n, v)| (n.as_str(), v.as_str()))
-        .collect();
-    let headers = Headers::new(&fields, &policy).map_err(s3_error);
-    // Refusals that name their cause. Neither reads anything but the
-    // request itself and the configuration. The host comes before the
-    // path is judged: on a virtual-hosted request the first segment is a
-    // key, and "not a bucket name" would name the wrong mistake.
-    if let Ok(headers) = &headers {
-        if let Some(resp) = host_refused(headers, &bridge.cfg) {
-            return Err(resp);
-        }
-    }
-    let target = target?;
-    let headers = headers?;
-    headers
-        .check_features()
-        .map_err(|refusal| header_refused(&refusal))?;
-
+    let (policy, target, headers) = parsed(&bridge.cfg, req)?;
     let mut authority = OneKey {
         akid: claimed_key(&headers, &target).unwrap_or_default(),
         principal: String::new(),
@@ -492,6 +521,9 @@ where
         perm: None,
         no_bucket: Cell::new(false),
     };
+    if bridge.catalog.request_scope().is_some() {
+        return authenticate_on_unit(bridge, req, policy, target, headers, authority).await;
+    }
     let mut bucket = None;
     if !authority.akid.is_empty() {
         let row = bridge
@@ -571,6 +603,193 @@ where
         verified,
         bucket,
     })
+}
+
+/// The first half of a managed tenant's authentication on its unit
+/// (tenancy ADR §2.7, AM-64): the signature, before any read but the
+/// key's row.
+///
+/// 1. The key's row ([`Catalog::access_key`]: the unit's `key_row`, read
+///    before the signature and unauthenticated), and its secret, a
+///    scheme-2 wrap bound to the request scope's tenant.
+/// 2. The signature alone ([`SignatureOnly`]): a request that fails it
+///    reads nothing more.
+/// 3. [`Catalog::signature_verified`]: every call after it is
+///    authenticated, and the tenant's state may refuse the request
+///    (`403 AccountProblem`; any other failure is `503`).
+///
+/// The caller then reads the bucket and the grant and authorizes as for
+/// tenant 0 ([`VerifiedRequest::recheck`] with its own [`Authority`]).
+/// `None`: tenant 0's catalogue, which authenticates as always.
+pub(super) async fn verify_on_unit<C, B, N, J, K, T>(
+    bridge: &Bridge<C, B, N, J, K, T>,
+    req: &S3Request,
+    policy: &Policy,
+    target: &Target,
+    headers: &Headers,
+    akid: &str,
+) -> Option<Result<(VerifiedRequest, SignedKey), S3Response>>
+where
+    C: Catalog,
+    B: BlobStore,
+    N: NntpConnector,
+    J: JobSink,
+    K: Kek,
+    T: Clock,
+{
+    let scope = bridge.catalog.request_scope()?;
+    Some(
+        async {
+            let tenant = crate::crypto::scheme2::TenantId::parse(scope.tenant_id())
+                .map_err(|_| internal())?;
+            let mut key = SignedKey {
+                akid: akid.to_owned(),
+                principal: String::new(),
+                secret: None,
+            };
+            if !akid.is_empty() {
+                let row = bridge
+                    .catalog
+                    .access_key(akid)
+                    .await
+                    .map_err(|_| internal())?
+                    .filter(|row| row.status == KeyStatus::Active);
+                if let Some(row) = row {
+                    let secret = crate::crypto::scheme2::unwrap_secret_v2(
+                        &bridge.kek,
+                        row.kek_version,
+                        &tenant,
+                        &row.access_key_id,
+                        &row.secret_wrapped,
+                    )
+                    .map_err(|_| internal())?;
+                    key.principal = row.principal;
+                    key.secret = Some(secret);
+                }
+            }
+            let verified = verify(
+                req.method.as_str(),
+                target,
+                headers,
+                true,
+                bridge.clock.now().secs().0,
+                policy,
+                &key,
+            )
+            .map_err(|code| auth_refused(code, policy, headers, target))?;
+            let read = matches!(req.method, crate::Method::Get | crate::Method::Head);
+            match bridge.catalog.signature_verified(read).await {
+                Ok(()) => {}
+                Err(e) if crate::request_catalog::is_account_problem(&e) => {
+                    return Err(account_problem())
+                }
+                Err(e) if crate::request_catalog::is_key_changed(&e) => {
+                    return Err(s3_error(ErrorCode::InvalidAccessKeyId))
+                }
+                Err(_) => return Err(unit_refused()),
+            }
+            Ok((verified, key))
+        }
+        .await,
+    )
+}
+
+/// The key a managed tenant's request was signed with, as
+/// [`verify_on_unit`] checked it: its credential, and every request
+/// authorized (the caller authorizes after the reads that only a verified
+/// caller may make).
+pub(super) struct SignedKey {
+    pub akid: String,
+    pub principal: String,
+    pub secret: Option<Zeroizing<Vec<u8>>>,
+}
+
+impl Authority for SignedKey {
+    fn credential(&self, access_key: &str) -> Option<Credential<'_>> {
+        let secret = self.secret.as_ref()?;
+        (access_key == self.akid).then_some(Credential {
+            secret,
+            principal: &self.principal,
+        })
+    }
+
+    fn authorize(&self, _: &str, _: &str, _: &Target) -> bool {
+        true
+    }
+}
+
+/// [`authenticate`] for a managed tenant's request on its unit:
+/// [`verify_on_unit`], then the bucket and the grant, then the same
+/// authorization as tenant 0's, with the same answers (`NoSuchBucket` for
+/// a bucket the key holds no grant on, whether or not it exists).
+async fn authenticate_on_unit<C, B, N, J, K, T>(
+    bridge: &Bridge<C, B, N, J, K, T>,
+    req: &S3Request,
+    policy: Policy,
+    target: Target,
+    headers: Headers,
+    mut authority: OneKey,
+) -> Result<Authed, S3Response>
+where
+    C: Catalog,
+    B: BlobStore,
+    N: NntpConnector,
+    J: JobSink,
+    K: Kek,
+    T: Clock,
+{
+    let Some(signed) =
+        verify_on_unit(bridge, req, &policy, &target, &headers, &authority.akid).await
+    else {
+        return Err(internal());
+    };
+    let (verified, key) = signed?;
+    authority.principal = key.principal;
+    authority.secret = key.secret;
+    let mut bucket = None;
+    if !target.bucket.is_empty() {
+        bucket = bridge
+            .catalog
+            .bucket_by_name(&target.bucket)
+            .await
+            .map_err(|_| internal())?;
+    }
+    if let Some(b) = &bucket {
+        authority.perm = bridge
+            .catalog
+            .grant(&authority.akid, &b.id)
+            .await
+            .map_err(|_| internal())?;
+    }
+    verified
+        .recheck(&authority, req.method.as_str(), &target)
+        .map_err(|code| {
+            if code == ErrorCode::AccessDenied && authority.no_bucket.get() {
+                s3_error(ErrorCode::NoSuchBucket)
+            } else {
+                auth_refused(code, &policy, &headers, &target)
+            }
+        })?;
+    if !target.bucket.is_empty() && bucket.is_none() {
+        return Err(s3_error(ErrorCode::NoSuchBucket));
+    }
+    Ok(Authed {
+        policy,
+        target,
+        headers,
+        verified,
+        bucket,
+    })
+}
+
+/// `403 AccountProblem`: the tenant's state refuses the request (tenancy
+/// ADR §2.8).
+pub fn account_problem() -> S3Response {
+    S3Response::error(
+        403,
+        "AccountProblem",
+        "There is a problem with your account that prevents the operation from completing.",
+    )
 }
 
 /// The condition a write request names, if any. Understood are

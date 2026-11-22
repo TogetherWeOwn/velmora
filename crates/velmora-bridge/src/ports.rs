@@ -544,7 +544,7 @@ pub enum PublishOutcome {
 // matches: the caller stops and acks.
 
 /// The ids the catalogue holds on one key ([`Catalog::key_heads`]).
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct KeyHead {
     /// The id of the live generation.
     pub live: Option<GenerationId>,
@@ -598,6 +598,41 @@ pub trait Catalog {
     async fn delete_bucket(&self, bucket: &Bucket) -> Result<Guard<()>>;
     async fn buckets_for(&self, akid: &str) -> Result<Vec<Bucket>>;
     async fn access_key(&self, akid: &str) -> Result<Option<AccessKeyRow>>;
+    /// `Some(scope)`: this catalogue serves the S3 requests of the managed
+    /// tenant of `scope` on its unit (tenancy ADR §2.7, AM-64).
+    /// `authenticate` then checks the signature before any read but
+    /// [`Self::access_key`] (whose secret is a scheme-2 wrap bound to the
+    /// tenant), calls [`Self::signature_verified`], and only then reads
+    /// the bucket and the grant; the handlers name the tenant's blobs
+    /// through the scope; a bucket delete over S3 is refused. Tenant 0's
+    /// catalogue: `None`, and nothing changes.
+    fn request_scope(&self) -> Option<&crate::tenant::TenantScope> {
+        None
+    }
+    /// The data key of `bucket` when this catalogue's buckets are wrapped
+    /// under another key than the KEK: a managed tenant's under its
+    /// tenant key (scheme 2; the row's `kek_version` is the tenant key
+    /// version). `None`: the KEK's wrap, tenant 0's
+    /// ([`crate::crypto::unwrap_bdk`]).
+    async fn bucket_key(&self, bucket: &Bucket) -> Option<Result<crate::crypto::DataKey>> {
+        let _ = bucket;
+        None
+    }
+    /// The key ring that seals this catalogue's recovery records when they
+    /// are a managed tenant's (VMR2 under the current tenant key, ADR
+    /// §3.2). `None`: the KEK seals them (tenant 0).
+    async fn record_ring(&self) -> Option<Result<std::rc::Rc<crate::keys::tk::LoadedRing>>> {
+        None
+    }
+    /// Called once by `authenticate`, after the signature verified and
+    /// before any other read (AM-64): every call after it is
+    /// authenticated. `read`: the request is a GET or a HEAD. An `Err` is
+    /// the request's answer, `403 AccountProblem`: the tenant's state
+    /// refuses it. Tenant 0's catalogue: nothing to do.
+    async fn signature_verified(&self, read: bool) -> Result<()> {
+        let _ = read;
+        Ok(())
+    }
     async fn grant(&self, akid: &str, bucket: &BucketId) -> Result<Option<Perm>>;
     /// `true` while the key has a row, whatever its status.
     async fn access_key_exists(&self, akid: &str) -> Result<bool>;

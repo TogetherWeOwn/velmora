@@ -424,10 +424,19 @@ refused before it writes (`size`: `database_full` or
 `too_many_extents`, with an alarm): the Worker answers `503 SlowDown` and
 pages. Reads, deletes and smaller overwrites go on. The extent count is
 the usage counters' while they are on (one row read), and the rows the
-move's import took while they are off. Today the move's import batches
-are the calls that add extents to a unit; the request path's write
-admission takes the same check when it moves into the unit. Tests run it
-against a lowered limit.
+move's import took while they are off. The move's import batches and the
+request calls ("Requests") take the check. Tests run it against a
+lowered limit.
+
+Above a hard ceiling of 9 GB (est) no request call that adds a row
+runs, deletes (a floor and a tombstone each) and smaller overwrites
+included, so the platform's stop is never met; the Worker answers
+`503 SlowDown` and pages, and the operator moves a bucket to another
+unit. GC, aborts and settles still run. `databaseSize` counts the pages
+of the file, freed pages included (not measured on the platform), so
+the ceiling may not lift by itself after GC: the bucket move is the way
+out. This ceiling is an L1 choice beyond ADR §2.6, for the design
+lane to confirm.
 
 ## Import
 
@@ -531,8 +540,8 @@ They are refused in `shredding` and `shredded`, and while this unit is
 closed (its own `restoring` entry is set, or its lease has expired: rule
 12). Provider permits and
 provider health are not a unit's: they stay in the shared database, which
-every tenant's jobs use. The request path does not use `TenantCatalog`.
-A refusal (`sync_needed`, stale, a job with no numbers, closed, unborn)
+every tenant's jobs use. The request path uses request calls instead
+("Requests"). A refusal (`sync_needed`, stale, a job with no numbers, closed, unborn)
 comes back as a typed error, and the first one is kept
 (`TenantCatalog::refusal`, a `UnitRefusal`); `UnitRefusal::Stale(seqs)`
 carries the unit's numbers. `TenantCatalog::latest` (`LatestSeqs`) holds
@@ -607,34 +616,151 @@ alert. The unit jobs `renew` and
 `stamp_raise` run through the unit client. A unit's job config keeps
 tenant 0's `MAINTENANCE`: under `restore` no unit job makes a unit call,
 and each is acknowledged with no page. The consumer calls L2's `UnitClient`
-through `unit_consumer::ConsumerClient`; until its bodies and a Worker
-head reader are wired, the Worker uses `NoClient` and `NoHeads`, so the
-arms that need them hand the message back, and `UNIT` stays unbound until
-the build that has both and the unit's alarm dispatcher.
+through `unit_consumer::ConsumerClient`, built by the composition root
+(`Root::unit_client(name, false)`) over the isolate's renewal state, with
+the root's key feed and finisher. `UNIT` stays unbound in production
+until the unit's alarm dispatcher exists.
 
 A managed tenant's S3 requests reach its units through the request
 router (`unit_router`, ADR §2.7), which the management plane uses too.
 Only a Worker with `UNIT` bound takes a key route; unbound, every
 request takes tenant 0's path with no added read. The claimed access key
 id picks the tenant (`KeyRoutes`; tenant 0's keys and unknown keys keep
-tenant 0's path, §8.4; so does a failed route read for now, where a key
-tenant 0 does not hold then answers `403`, not the `503` of DUR-10). The
-route's numbers are a floor. The `Host` is judged first, as on tenant 0's
-path. The tenant's verified head (cached per isolate for under 60 s, read
-again from the seq it knew, and again when below the floor) names the
-unit: the root unit for a call with no bucket, the unit of the
-bucket's placement, or the root unit for a bucket with none. The unit
-must be listed. A routed call goes through the unit's client (L2's
-`UnitClient::call`, which runs rule 5) with the head's `state_seq`, the
-highest `keys_seq` a unit of the tenant answered, and `listed`. Under
-`MAINTENANCE=restore` every request that writes answers `503` before any
-head read or unit call, and the router refuses the reservation writes the
-management plane sends (`Reserve`, `BindBucket`, `Release`,
-`ReleaseBound`) before any call. This build has no S3 request operations on a
-unit, and no key routes, head reader or unit client in the Worker, so a
-routed request answers `503` and in practice every request takes tenant
-0's path. A routed request's `503` comes before its signature is checked:
-it tells the caller only that the key id routes to a managed tenant.
+tenant 0's path, §8.4; after a failed route read, a key tenant 0 does not
+hold answers `503`, DUR-10). The route's numbers are a floor. The `Host`
+is judged first, as on tenant 0's path. The tenant's verified head
+(cached per isolate for under 60 s, read again from the seq it knew, and
+again when below the floor) names the unit: the root unit for a call with
+no bucket, the unit of the bucket's placement, or the root unit for a
+bucket with none. The unit must be listed. A routed call goes through the
+unit's client (L2's `UnitClient::call`, which runs rule 5, the only
+retry layer, AM-71) with the head's `state_seq`, the highest `keys_seq` a
+unit of the tenant answered, and `listed`.
+
+**The request path (AM-64).** The root unit's `key_row` for the claimed
+key is read first, unauthenticated (a read: allowed under
+`MAINTENANCE=restore`); when it cannot be read the request answers `503`
+before its signature is checked. `Bridge::handle` then serves the request
+with tenant 0's handlers over the request catalogue
+(`request_catalog::RequestCatalog`): it checks the signature against the
+row's secret (a scheme-2 wrap bound to the tenant), applies the tenant's
+state (`active` serves everything, `suspended` with `read_only` serves GET
+and HEAD, anything else `403 AccountProblem`), and only then reads the
+bucket and the grant, authenticated. No request call is sent before the
+signature verified. A row answered under an expired lease (AM-63) is read
+again, authenticated, before anything is served. The handlers' gates
+answer the maintenance `503` for a write before any write call, and the
+router refuses a write call under `restore` as well. The request names
+the tenant's blobs (`x/<t>/`, `c/<t>/`) and opens its buckets' data keys
+with the tenant key (scheme 2, the row's `kek_version` being the tenant
+key version). A bucket delete over S3 answers `403`. After the handler,
+the records of publications the unit refused before running them are
+discarded, and a unit's refusal answers the request when the handler
+failed on it (the table below). A fan-out GET is not split for a managed
+tenant. `upload_state` and `unmark_sent` are not request calls yet: a
+managed tenant's UploadPart and CompleteMultipartUpload fail until they
+are.
+
+## Requests
+
+The S3 handlers (`service/*`) run in the Worker, as today. What they ask
+of the catalogue, the tenant's unit answers (AM-64). Each catalogue method
+of the S3 request path, and each of the operator reads of the per-tenant
+status, is one `request` call (`unit::request::RequestCall`), run by the
+unit's own catalogue in one transaction. The Worker's request catalogue
+forwards the handlers' calls as these, so `Bridge::handle` serves a
+managed tenant with tenant 0's code: conditional PUT, the publication
+batches and their guards, the upload id bound to its bucket and key, and
+the delete batches are the catalogue's own.
+
+**The call.** `{"op": "request", "call": {"m": "<method>", ...}}`, with
+the method's arguments under the names of `ports.rs`. An upload target is
+spelt out as `bucket`, `key` and `upload`. A publication
+(`commit_generation`, `commit_sliced`, `copy_generation`,
+`complete_upload`) carries the proof of its recovery record as
+`record: {generation, key}`. The call has `kind = request`, the Worker's
+numbers from the tenant's verified head (rule 5; none is refused
+`no_numbers`), `authenticated = true` (rule 11; without it the call is
+refused `unauthenticated`: only `key_row` and `read_plan` come before the
+signature), and `listed = true`.
+
+**The answer.** `ok` carries the method's return value as JSON. A
+publication answers `"applied"`, `"refused"` or `"fenced"`, and the
+Worker rebuilds the outcome from the proof it kept
+(`Published::outcome`): a refused publication discards the Worker's own
+record, never one the unit named. A publication the unit refused for
+good before it ran it (`refused`, `closed`, `unborn`) wrote nothing under
+its id: the client hands its proof back
+(`RequestClient::take_unpublished`), and the Worker discards that record
+before it answers. A `failed` answer, or none, keeps the record, as on
+tenant 0, and so do `stale` and `sync_needed`: the Worker answers those
+below the client, in the way it reaches the unit, by syncing (or reading
+the head again) and sending the same call once more with the new
+numbers. A request body cannot be sent twice, so the retry is the
+call's, not the request's.
+
+| The unit answers | The Worker |
+|---|---|
+| `ok` | the method's value |
+| `sync_needed` | syncs, then sends the same call once more |
+| `stale{seqs}` (the head the Worker read is older than the unit's) | reads the head again, then sends the same call once more |
+| `closed` | `503` |
+| `unborn` | `503`; it pages "catalogue lost" when the route lists the unit (rule 7) |
+| `refused{account_problem}` | `403 AccountProblem` |
+| `refused{not_found}` (a write into a closing bucket, or one whose row is gone) | `404 NoSuchBucket` |
+| `refused{size}` | `503 SlowDown` and a page, or `403 QuotaExceeded` (ADR §2.6) |
+| `refused{request: out_of_bounds}` (alarm) | `500` and a page: only a Worker bug sends one |
+| `failed{class}` | as on the job path: `guard` is `GuardFailed`; any other class is a catalogue error (`500`) |
+
+**The unit's rules.** The tenant's state decides each call: every call
+while `active`; while `suspended` with `read_only`, only the reads, with
+a read's own two writes (its read stamp, `touch_read`, and its cache
+fill, `record_cache_fill`); none otherwise. While a bucket is closing
+(AM-57), `bucket_by_name` answers none for it, `buckets_for` leaves it
+out, and a write that adds a row naming it (a generation, extents, a
+floor, a tombstone, an upload or a part) is refused `not_found`; so is
+such a write into a bucket the unit no longer holds (a `sync` dropped
+the row after the request looked it up). A call
+that adds extents, or a new object, upload or intent, takes the size
+guard first, in its own transaction, and a refusal pages. Reads,
+deletes and smaller overwrites go on (ADR §2.6): a publication that
+replaces a live generation of at least as many extents passes the
+guard. Above a hard ceiling (9 GB, est) no call that adds a row runs,
+deletes and overwrites included, so the platform's 10 GB stop is never
+met; reads and the calls that only take rows away still run. Each list,
+limit and key of a call has a bound: at most 1,000
+keys, ids or rows (S3's page and DeleteObjects bound; a listing asks for
+one more), 10,001 extents (one object's bound and one more), 1,024 bytes
+an object key (the protocol's own bound), and 8 KiB a listing prefix,
+delimiter or marker (the request target's bound, as on tenant 0).
+
+**Not request calls.** Bucket create and delete, and the key and grant
+writes: a managed tenant's buckets come from its tenant chain and its
+keys from its key chain (AM-57, AM-12). The Worker answers S3
+CreateBucket and DeleteBucket itself (AM-64). Provider permits and
+provider health stay on the shared database. The job methods are job
+calls, and the record replay of a restore is tenant 0's.
+
+**`key_row`.** Its answer body is `{key, state, lease_expired}`. With an
+expired lease (rule 12), the unit still answers an unauthenticated
+`request` call's `key_row`, read-only, with `lease_expired: true`
+(`Unit::key_row_expired`, AM-63). The Worker uses that row only to check
+the signature, renews as a signed call, and reads `key_row` again before
+it serves. On entry point `presigned`, `key_row` also names what the URL
+names (`presigned: {principal, bucket, create_only}`, AM-64). `key` is
+then the unit's internal key (none for any other key: only the internal
+key signs on that entry point), and the answer carries
+`presigned: {ok, refusal, bucket_id, access}`, checked in the same
+transaction. `ok` needs the internal key `active` and not held, the principal
+`active` and not held, an open bucket of that name, and the principal's effective grant on it (`rw` for
+a create-only URL). The row is never withheld: the Worker checks SigV4
+first, and answers `403 SignatureDoesNotMatch` if it fails, whatever the
+check found. A verified request with `ok = false` answers
+`403 AccessDenied` and makes no further call. Otherwise the request runs
+as that principal, with `access` on `bucket_id`. The internal key has no
+`access_keys` or `grants` row, so the Worker answers the request's own
+key and grant reads from this answer. A create-only PUT runs as
+`If-None-Match: *`.
 
 ## Bookmarks
 

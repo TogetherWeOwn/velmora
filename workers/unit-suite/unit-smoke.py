@@ -139,7 +139,17 @@ check("schema_tables leaves the platform's out", [n for n in names if n.startswi
 check("an unauthenticated ping", unit_post(0, call(0, "request", PING, (3, 0), authenticated=False)),
       {"answer": "refused", "reason": "unauthenticated", "alarm": False})
 check("an unauthenticated key-row fetch", unit_post(0, call(0, "request", {"op": "key_row", "access_key_id": "AKNOSUCHKEY000000000"}, (3, 0), authenticated=False)),
-      {"answer": "ok", "seqs": S, "body": {"key": None, "state": {"tenant_state": "active", "tenant_mode": None}}})
+      {"answer": "ok", "seqs": S, "body": {"key": None, "lease_expired": False,
+                                            "state": {"tenant_state": "active", "tenant_mode": None}}})
+# The request calls (L1-5): one catalogue method each, after SigV4 only.
+LIVE = {"op": "request", "call": {"m": "live_generation", "bucket": "b_00000000000000f1", "key": "k"}}
+check("a request call", unit_post(0, call(0, "request", LIVE, (3, 0))),
+      {"answer": "ok", "seqs": S, "body": None})
+check("an unauthenticated request call", unit_post(0, call(0, "request", LIVE, (3, 0), authenticated=False)),
+      {"answer": "refused", "reason": "unauthenticated", "alarm": False})
+check("a request call above its bounds", unit_post(0, call(0, "request", {"op": "request", "call": {
+          "m": "key_heads", "bucket": "b_00000000000000f1", "keys": ["k"] * 1001}}, (3, 0))),
+      {"answer": "refused", "reason": {"request": "out_of_bounds"}, "alarm": True})
 check("a read plan of a missing bucket", unit_post(0, call(0, "request", {"op": "read_plan", "bucket": "nope", "key": "k", "start": 0, "end": 1}, (3, 0))),
       {"answer": "ok", "seqs": S, "body": {"bucket": None, "generation": None, "key_row": None,
                                             "state": {"tenant_state": "active", "tenant_mode": None}}})

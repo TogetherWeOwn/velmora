@@ -127,6 +127,20 @@ pub(super) async fn delete_bucket_signed<
 ) -> S3Response {
     // `authenticate` verifies the signature and, for DELETE, requires a
     // read-write grant on an existing bucket.
+    // A managed tenant: every DeleteBucket over S3 is `403` once the
+    // signature verified and the tenant's state allows the request, with
+    // no bucket or grant read (AM-64; buckets go through the management
+    // plane).
+    if bridge.catalog.request_scope().is_some() {
+        return match super::common::signature_on_unit(bridge, &req).await {
+            Ok(()) => S3Response::error(
+                403,
+                "AccessDenied",
+                "Buckets are deleted through the management plane.",
+            ),
+            Err(resp) => resp,
+        };
+    }
     let authed = match authenticate(bridge, &req).await {
         Ok(authed) => authed,
         Err(resp) => return resp,

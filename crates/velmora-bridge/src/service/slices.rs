@@ -56,6 +56,8 @@ pub(super) struct StoredSlice {
 /// Where the slices go and how they are sealed.
 pub(super) struct SliceSink<'a, B: BlobStore, R: FillRandom> {
     pub(super) safety: &'a B,
+    /// The tenant whose names the slices' safety copies take.
+    pub(super) scope: crate::tenant::TenantScope,
     pub(super) bdk: &'a DataKey,
     pub(super) bucket: &'a BucketId,
     /// One id per slice, in body order; each has its intent row.
@@ -148,7 +150,7 @@ impl<B: BlobStore, R: FillRandom> SliceSink<'_, B, R> {
             let put = self
                 .safety
                 .put(
-                    &id.safety_key(),
+                    &self.scope.safety_key(id),
                     ciphertext,
                     &BlobMeta {
                         bucket: self.bucket,

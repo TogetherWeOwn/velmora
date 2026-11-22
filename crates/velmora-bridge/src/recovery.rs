@@ -496,6 +496,26 @@ impl Recorded {
         }
     }
 
+    /// The proof as a unit's request call carries it (L1-5): the Worker
+    /// sends the generation and record name of the [`Recorded`] it holds,
+    /// and the unit's catalogue publishes against them. The unit is the
+    /// Worker's own object, reached only through it, so the proof crosses
+    /// `fetch` as the Worker made it.
+    pub(crate) fn across_unit(generation: GenerationId, key: String) -> Recorded {
+        Recorded { generation, key }
+    }
+
+    /// The unit's catalogue refused the publication of a request call
+    /// and wrote nothing under the id (`unit::request::Published`): the
+    /// Worker turns the proof it kept into the one that deletes. The
+    /// record is the Worker's own, never a name the unit answered.
+    pub(crate) fn refused_on_unit(self) -> Unpublished {
+        Unpublished {
+            generation: self.generation,
+            key: self.key,
+        }
+    }
+
     /// A proof without a record, for catalogue tests that publish rows
     /// directly. Never compiled into the Worker.
     #[cfg(feature = "testkit")]
@@ -1130,9 +1150,45 @@ impl ArticleManifest {
 // Store
 // ---------------------------------------------------------------------------
 
-/// Seals `record` under the active KEK and stores it at `name`. `bucket`
+/// What seals a recovery record for its store: the KEK for tenant 0 (a
+/// v1 manifest), or a managed tenant's key (a VMR2 envelope, ADR §3.2,
+/// through the request bridge's [`crate::ports::Bridge::sealer`]).
+#[allow(async_fn_in_trait)]
+pub trait RecordSeal {
+    async fn seal_record(&self, name: &str, plaintext: &[u8]) -> Result<Vec<u8>>;
+}
+
+/// Tenant 0's records: sealed under the active KEK.
+impl<K: Kek> RecordSeal for K {
+    async fn seal_record(&self, name: &str, plaintext: &[u8]) -> Result<Vec<u8>> {
+        seal_manifest(self, name, plaintext, &mut SystemRng)
+    }
+}
+
+/// The request path's [`RecordSeal`]: the catalogue's tenant key when it
+/// serves a managed tenant ([`Catalog::record_ring`], a VMR2 envelope under
+/// the current version), else the KEK (tenant 0).
+pub struct Sealer<'a, C, K> {
+    pub catalog: &'a C,
+    pub kek: &'a K,
+}
+
+impl<C: Catalog, K: Kek> RecordSeal for Sealer<'_, C, K> {
+    async fn seal_record(&self, name: &str, plaintext: &[u8]) -> Result<Vec<u8>> {
+        match self.catalog.record_ring().await {
+            None => seal_manifest(self.kek, name, plaintext, &mut SystemRng),
+            Some(ring) => {
+                let ring = ring?;
+                let tk = crate::keys::record::TkRing::current(&*ring).ok_or(ERR_RECORD)?;
+                crate::crypto::scheme2::seal_record_v2(tk, name, plaintext, &mut SystemRng)
+            }
+        }
+    }
+}
+
+/// Seals `record` (see [`RecordSeal`]) and stores it at `name`. `bucket`
 /// and `subject` are only the blob's descriptive metadata.
-async fn write<B: BlobStore, K: Kek, R: Serialize>(
+async fn write<B: BlobStore, K: RecordSeal, R: Serialize>(
     safety: &B,
     kek: &K,
     name: &str,
@@ -1141,7 +1197,7 @@ async fn write<B: BlobStore, K: Kek, R: Serialize>(
     record: &R,
 ) -> Result<()> {
     let plain = serde_json::to_vec(record).map_err(|_| ERR_RECORD)?;
-    let sealed = seal_manifest(kek, name, &plain, &mut SystemRng)?;
+    let sealed = kek.seal_record(name, &plain).await?;
     let sha: [u8; 32] = Sha256::digest(&sealed).into();
     let meta = BlobMeta {
         bucket,
@@ -1174,7 +1230,7 @@ async fn read<B: BlobStore, K: Kek, R: for<'de> Deserialize<'de>>(
 /// Writes the generation record (`m/<generation_id>` in the flat
 /// layout), after it raised the floor of the key to the id, and returns
 /// the proof of it, without which the catalogue publishes nothing.
-pub async fn write_generation<C: Catalog, B: BlobStore, K: Kek>(
+pub async fn write_generation<C: Catalog, B: BlobStore, K: RecordSeal>(
     catalog: &C,
     safety: &B,
     kek: &K,
@@ -1207,7 +1263,7 @@ pub async fn write_generation<C: Catalog, B: BlobStore, K: Kek>(
 /// raised the floor of the key to the id. The caller deletes only after
 /// this returned `Ok`.
 #[allow(clippy::too_many_arguments)]
-pub async fn write_tombstone<C: Catalog, B: BlobStore, K: Kek>(
+pub async fn write_tombstone<C: Catalog, B: BlobStore, K: RecordSeal>(
     catalog: &C,
     safety: &B,
     kek: &K,
@@ -1261,7 +1317,7 @@ const RECORD_WRITES: usize = 6;
 /// tombstone: either no record was stored at all, or the records stand
 /// with their floors raised and not settled, as after a
 /// `write_tombstone` that failed at the same step.
-pub async fn write_tombstones<C: Catalog, B: BlobStore, K: Kek>(
+pub async fn write_tombstones<C: Catalog, B: BlobStore, K: RecordSeal>(
     catalog: &C,
     safety: &B,
     kek: &K,

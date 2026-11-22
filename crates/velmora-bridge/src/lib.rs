@@ -36,6 +36,7 @@ pub mod records;
 pub mod recovery;
 pub mod remote;
 pub mod replay;
+pub mod request_catalog;
 pub mod root;
 pub mod service;
 pub mod sql;

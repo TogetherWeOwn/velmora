@@ -65,13 +65,16 @@ fn uses(all: &BTreeMap<String, String>, what: &str) -> BTreeMap<String, usize> {
         .collect()
 }
 
-/// How often each file says `name` other than as `scope.<name>`.
+/// How often each file says `name` other than through `scope` or `scope()`.
 fn unscoped(all: &BTreeMap<String, String>, name: &str) -> BTreeMap<String, usize> {
     all.iter()
         .map(|(file, text)| {
             let n = text
                 .match_indices(name)
-                .filter(|(at, _)| !text[..*at].ends_with("scope."))
+                .filter(|(at, _)| {
+                    let before = &text[..*at];
+                    !before.ends_with("scope.") && !before.ends_with("scope().")
+                })
                 .count();
             (file.clone(), n)
         })
@@ -155,6 +158,10 @@ fn a_scope_is_made_only_at_the_listed_places() {
             // the admin listing (the import and the call).
             ("bridge/keys/revocations.rs", 1),
             ("bridge/service/admin.rs", 2),
+            // The request path's scope (`Bridge::scope`): tenant 0's, for
+            // a bridge whose catalogue is not a managed tenant's request
+            // catalogue (which carries the scope it was made with).
+            ("bridge/service/mod.rs", 1),
         ],
     );
     // The reader of a message makes the scope of the job path, and the
@@ -165,10 +172,12 @@ fn a_scope_is_made_only_at_the_listed_places() {
 
 /// A managed tenant's scope is made in one place on the job path: the
 /// reader of a queue message, for a message that names the tenant's unit
-/// while the unit class is bound (`jobmsg::admit_for`). Off the job path,
-/// the move of tenant 0's data names the managed tenant's copies through
-/// its scope too (`keys::moving`, once), so that no name of the two
-/// families is written out by hand.
+/// while the unit class is bound (`jobmsg::admit_for`). On the request
+/// path it is made once too, for a request whose key routed to the tenant
+/// (`service::managed::prepare`), and the bridge takes it from the request
+/// catalogue. Off both paths, the move of tenant 0's data names the
+/// managed tenant's copies through its scope too (`keys::moving`, once),
+/// so that no name of the two families is written out by hand.
 #[test]
 fn a_managed_scope_is_made_only_by_the_reader() {
     let all = all();
@@ -179,7 +188,8 @@ fn a_managed_scope_is_made_only_by_the_reader() {
         found.into_iter().collect::<Vec<_>>(),
         [
             ("bridge/jobmsg.rs".to_string(), 1),
-            ("bridge/keys/moving.rs".to_string(), 1)
+            ("bridge/keys/moving.rs".to_string(), 1),
+            ("bridge/service/managed.rs".to_string(), 1)
         ]
     );
 }
@@ -284,8 +294,8 @@ fn the_id_of_tenant_zero_is_written_in_one_place() {
     );
 }
 
-/// The job path names no blob past its scope, and the places that still
-/// do are the listed ones.
+/// The job path and scoped request handlers name blobs through their
+/// scope. The remaining uses of the flat names are listed here.
 #[test]
 fn a_blob_is_named_without_a_scope_only_at_the_listed_places() {
     let all = all();
@@ -303,14 +313,10 @@ fn a_blob_is_named_without_a_scope_only_at_the_listed_places() {
         &[
             // The two definitions.
             ("bridge/types.rs", 2),
-            // The request path: a request is not scoped yet.
-            ("bridge/fetch.rs", 1),
+            // The legacy admin path.
             ("bridge/service/admin.rs", 3),
-            ("bridge/service/get.rs", 2),
-            // One call, and a variable of the name said twice.
-            ("bridge/service/multipart.rs", 3),
-            ("bridge/service/put.rs", 1),
-            ("bridge/service/slices.rs", 1),
+            // A scoped call whose result is kept in a same-named local.
+            ("bridge/service/multipart.rs", 2),
             // The replay, which goes through the whole store.
             ("bridge/replay.rs", 2),
             // The delete list the catalogue makes for garbage
@@ -525,7 +531,7 @@ fn the_directory_is_asked_by_nothing() {
     // The request router of a managed tenant's units (`unit_router`,
     // design round 5) is another port, with a `route` of its own: only it
     // and its one caller may say `.route(`.
-    const UNIT_ROUTER: [&str; 2] = ["bridge/unit_router.rs", "bridge/service/mod.rs"];
+    const UNIT_ROUTER: [&str; 2] = ["bridge/unit_router.rs", "bridge/service/managed.rs"];
     // The composition root (`root`, L6-5) is the one reader of the
     // directory's store for that router: its key routes
     // (`SqlDirectory::route_tenant`, ADR §8.4 step 2). It runs only with `UNIT`

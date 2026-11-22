@@ -21,7 +21,7 @@ use velmora_s3_proto::{plan_read, Conditions, ErrorCode, ObjectMetadata};
 use super::common::{
     authenticate, internal, s3_error, stored_checksum, stored_headers, unavailable,
 };
-use crate::crypto::{cipher_span, open_range, unwrap_bdk};
+use crate::crypto::{cipher_span, open_range, DataKey};
 use crate::fanout::{admit, Fanout, Grant, TOKEN_TTL_MS};
 use crate::fetch::{
     cold_fetch_bytes, cold_poll_ms, cold_read_bytes, cold_step_bytes, ColdFetch, ColdReader,
@@ -851,11 +851,10 @@ where
 
 /// Decrypts one piece from ciphertext `src` that starts at stream offset
 /// `base`. `None` if any chunk fails to authenticate.
-fn open<K: Kek>(kek: &K, bucket: &Bucket, piece: &Piece, base: u64, src: &[u8]) -> Option<Vec<u8>> {
-    let bdk = unwrap_bdk(kek, bucket.kek_version, &bucket.id, &bucket.bdk_wrapped).ok()?;
+fn open(bdk: &DataKey, bucket: &Bucket, piece: &Piece, base: u64, src: &[u8]) -> Option<Vec<u8>> {
     let mut plain = vec![0u8; usize::try_from(piece.len).ok()?];
     let n = open_range(
-        &bdk,
+        bdk,
         &bucket.id,
         &piece.extent,
         base,
@@ -1140,6 +1139,7 @@ where
     /// wait for each other.
     async fn warm(&mut self, bucket: &Bucket, piece: &Piece, span: ByteSpan) -> Item {
         let bridge = self.bridge;
+        let scope = bridge.scope();
         let extent = &piece.extent;
         let spent = Rc::clone(&self.spent);
         let all = span.len + piece.len;
@@ -1161,8 +1161,8 @@ where
             loop {
                 let asked = async {
                     match from_cache {
-                        true => warm(&bridge.cache, &extent.id.cache_key(), span).await,
-                        false => warm(&bridge.safety, &extent.id.safety_key(), span).await,
+                        true => warm(&bridge.cache, &scope.cache_key(&extent.id), span).await,
+                        false => warm(&bridge.safety, &scope.safety_key(&extent.id), span).await,
                     }
                 };
                 let asked = Spent::time(&bridge.clock, &spent.warm, asked);
@@ -1181,7 +1181,10 @@ where
                         }
                     }
                 }
-                let Some(plain) = open(&bridge.kek, bucket, piece, span.start, &src) else {
+                let Ok(bdk) = bridge.bucket_key(bucket).await else {
+                    break;
+                };
+                let Some(plain) = open(&bdk, bucket, piece, span.start, &src) else {
                     break;
                 };
                 drop(src);
@@ -1269,8 +1272,12 @@ where
                             }
                         }
                     }
-                    let plain = open(&bridge.kek, bucket, piece, 0, &cipher)
-                        .ok_or(ReadFail::Unavailable)?;
+                    let bdk = bridge
+                        .bucket_key(bucket)
+                        .await
+                        .map_err(|_| ReadFail::Unavailable)?;
+                    let plain =
+                        open(&bdk, bucket, piece, 0, &cipher).ok_or(ReadFail::Unavailable)?;
                     // The charge is split between the plaintext, which
                     // leaves with the piece, and the ciphertext, which
                     // stays until it is written. Nothing runs between the

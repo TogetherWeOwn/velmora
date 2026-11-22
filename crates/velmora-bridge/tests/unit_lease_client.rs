@@ -952,6 +952,7 @@ fn unsigned_calls_space_failed_renewals_with_a_backoff() {
                 rig.unit_seqs(),
                 UnitOp::KeyRow {
                     access_key_id: K.into(),
+                    presigned: None,
                 },
             );
             c.authenticated = false;
@@ -998,6 +999,7 @@ fn a_transient_failure_delays_unsigned_renewals_by_the_first_backoff_only() {
                 rig.unit_seqs(),
                 UnitOp::KeyRow {
                     access_key_id: K.into(),
+                    presigned: None,
                 },
             );
             c.authenticated = false;

@@ -94,10 +94,24 @@ async fn handle_detached(
     bridge: Rc<env::WorkerBridge>,
     req: velmora_bridge::S3Request,
 ) -> S3Response {
+    detached(ctx, async move { (bridge.handle(req).await, None) }).await
+}
+
+/// Work that runs after the response is handed over, still under
+/// `waitUntil` (a managed tenant's background renewal, rule 12).
+pub(crate) type After = std::pin::Pin<Box<dyn std::future::Future<Output = ()>>>;
+
+/// [`handle_detached`] for any handler's future, with the work it leaves
+/// for after the response: a managed tenant's request on its unit runs
+/// the same way (`units::serve_on_unit`).
+async fn detached(
+    ctx: &Context,
+    handled: impl std::future::Future<Output = (S3Response, Option<After>)> + 'static,
+) -> S3Response {
     let slot = Rc::new(RefCell::new(Slot::default()));
     let tx = Rc::clone(&slot);
     ctx.wait_until(async move {
-        let mut resp = bridge.handle(req).await;
+        let (mut resp, after) = handled.await;
         let work = match &mut resp.body {
             RespBody::Deferred(d) => d.take_work(),
             _ => None,
@@ -111,6 +125,9 @@ async fn handle_detached(
         }
         if let Some(work) = work {
             work.await;
+        }
+        if let Some(after) = after {
+            after.await;
         }
     });
     poll_fn(|cx| {
@@ -134,6 +151,9 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
         // A cache miss, counted as it happens: see `velmora_bridge::metrics`.
         metrics::write(&velmora_bridge::metrics::cold_read_point());
     });
+    // Alerts the library raises during a request (a managed tenant's
+    // unit pages after its request was finished, among them).
+    velmora_bridge::trace::log_alerts(|line| console_error!("alert: {line}"));
     metrics::bind(&env);
     if let Ok(bridge) = env::bridge(&env) {
         log_budget(&bridge);
@@ -245,11 +265,15 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
     // route, and tenant 0's path is unchanged.
     let units = units::units(&env);
     let resp = ingress::front(incoming.req, &bridge.cfg, incoming.https, |req| async {
-        if let Some(resp) =
-            units::route_request(&env, &bridge, units, admin || internal.get(), &req).await
-        {
-            return resp;
-        }
+        let req =
+            match units::route_request(&env, &bridge, units, admin || internal.get(), req).await {
+                units::Routed::TenantZero(req) => req,
+                units::Routed::Answered(resp) => return resp,
+                units::Routed::OnUnit(on_unit, req) => {
+                    let resp = detached(&ctx, units::serve_on_unit(on_unit, req)).await;
+                    return keepalive::settle_response(resp, env::sleeper()).await;
+                }
+            };
         let resp = handle_detached(&ctx, Rc::clone(&bridge), req).await;
         // A deferred document: buffered when it is done soon, else
         // streamed with keepalive whitespace.
@@ -506,7 +530,7 @@ async fn run_on_unit(
 /// unit client, never through `run_job`.
 async fn run_unit_job(
     env: &Env,
-    bridge: &env::WorkerBridge,
+    bridge: &Rc<env::WorkerBridge>,
     job: velmora_bridge::jobmsg::UnitJob,
     tenant: &JobTenant,
 ) -> Delivery {
