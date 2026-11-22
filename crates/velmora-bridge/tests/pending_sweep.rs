@@ -31,7 +31,7 @@ fn key(t: u32, chain: ControlChain) -> ChainKey {
 #[derive(Default)]
 struct Rows {
     rows: RefCell<Vec<(ChainKey, u64, UnixMs)>>,
-    asked: RefCell<Vec<(UnixMs, Option<ChainKey>, u32)>>,
+    asked: RefCell<Vec<(Option<ChainKey>, u32)>>,
     refuse_reads: bool,
     refuse_drops: bool,
 }
@@ -61,27 +61,27 @@ impl Rows {
 }
 
 impl PendingRows for Rows {
-    async fn chains_noted_by(
+    async fn chains_after(
         &self,
-        cutoff: UnixMs,
         after: Option<&ChainKey>,
         limit: u32,
-    ) -> Result<Vec<ChainKey>> {
-        self.asked
-            .borrow_mut()
-            .push((cutoff, after.cloned(), limit));
+    ) -> Result<Vec<(ChainKey, UnixMs)>> {
+        self.asked.borrow_mut().push((after.cloned(), limit));
         if self.refuse_reads {
             return Err(BridgeError::Sql("directory down".into()));
         }
-        let mut chains: Vec<ChainKey> = self
-            .rows
-            .borrow()
-            .iter()
-            .filter(|(k, _, at)| at.0 <= cutoff.0 && after.is_none_or(|a| k > a))
-            .map(|(k, _, _)| k.clone())
-            .collect();
-        chains.sort();
-        chains.dedup();
+        let mut chains: Vec<(ChainKey, UnixMs)> = Vec::new();
+        for (k, _, at) in self.rows.borrow().iter() {
+            if after.is_some_and(|a| k <= a) {
+                continue;
+            }
+            match chains.iter_mut().find(|(c, _)| c == k) {
+                Some((_, oldest)) if at.0 < oldest.0 => *oldest = *at,
+                Some(_) => {}
+                None => chains.push((k.clone(), *at)),
+            }
+        }
+        chains.sort_by(|a, b| a.0.cmp(&b.0));
         chains.truncate(limit as usize);
         Ok(chains)
     }
@@ -169,10 +169,7 @@ async fn rows_above_a_complete_head_are_dropped_and_the_others_left() {
     // Each chain once, in key order (`k` before `t`, as the directory's
     // key sorts them).
     assert_eq!(*f.calls.borrow(), [keys, state]);
-    assert_eq!(
-        *rows.asked.borrow(),
-        [(UnixMs(NOW.0 - SWEEP_AGE_MS), None, SWEEP_CHAINS)]
-    );
+    assert_eq!(*rows.asked.borrow(), [(None, SWEEP_CHAINS)]);
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -350,4 +347,30 @@ fn a_finisher_run_is_complete_only_without_a_failed_append_or_chain_read() {
             complete: false
         }
     );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_pass_examines_at_most_its_chains_whatever_their_age() {
+    // More young chains than a pass examines, ahead of one old chain: the
+    // first pass finishes none and moves on; the second reaches the old
+    // one.
+    let young = SWEEP_CHAINS + 10;
+    let mut fixture: Vec<(u32, ControlChain, u64, i64)> = (0..young)
+        .map(|t| (t, ControlChain::Keys, 1, SWEEP_AGE_MS - 1_000))
+        .collect();
+    fixture.push((young, ControlChain::Keys, 9, OLD));
+    let rows = Rows::with(&fixture);
+    let f = Finisher::with(&[(young, ControlChain::Keys, 8)]);
+    let first = sweep(&rows, &f, NOW, None).await.unwrap();
+    assert_eq!((first.finished, first.dropped), (0, 0));
+    assert!(f.calls.borrow().is_empty());
+    assert_eq!(
+        first.next_after,
+        Some(key(SWEEP_CHAINS - 1, ControlChain::Keys))
+    );
+    let second = sweep(&rows, &f, NOW, first.next_after.as_ref())
+        .await
+        .unwrap();
+    assert_eq!((second.finished, second.dropped), (1, 1));
+    assert_eq!(*f.calls.borrow(), [key(young, ControlChain::Keys)]);
 }

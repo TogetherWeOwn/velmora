@@ -37,8 +37,8 @@
 //! of which read the head, finish it.
 //!
 //! The sweep goes chain by chain, in the order of the chains' keys, at
-//! most [`SWEEP_CHAINS`] a pass, and the next pass starts after the last
-//! one ([`SweepReport::next_after`]). A chain whose rows stay (a store
+//! most [`SWEEP_CHAINS`] chains examined a pass, and the next pass starts
+//! after the last one ([`SweepReport::next_after`]). A chain whose rows stay (a store
 //! that is down, a subject that is closed) therefore holds no other
 //! chain back. A chain whose finisher fails keeps its rows and stops no
 //! other.
@@ -89,19 +89,18 @@ impl PartialOrd for ChainKey {
 /// The directory's `pending_ops` rows, by chain.
 #[allow(async_fn_in_trait)]
 pub trait PendingRows {
-    /// Up to `limit` distinct chains, in key order and after `after`,
-    /// that have at least one row noted at or before `cutoff`. It reads
-    /// O(`limit`) index entries, not the rows of a chain: a chain can hold
-    /// many rows while a subject is closed or a store is down. In SQL: step
-    /// from chain to chain on the key `(tenant, chain, seq)`, one probe of
-    /// an index on `(tenant, chain, created_at)` per chain for a row at or
-    /// before `cutoff`.
-    async fn chains_noted_by(
+    /// The next `limit` chains that have rows, in key order and after
+    /// `after`, each with the time of its oldest row. It examines exactly
+    /// the chains it answers, so a pass costs O(`limit`) index reads
+    /// whatever the rows' ages or how many rows a chain holds: in SQL,
+    /// step from chain to chain on the key `(tenant, chain, seq)`, and
+    /// take each chain's oldest row from an index on `(tenant, chain,
+    /// created_at)`.
+    async fn chains_after(
         &self,
-        cutoff: UnixMs,
         after: Option<&ChainKey>,
         limit: u32,
-    ) -> Result<Vec<ChainKey>>;
+    ) -> Result<Vec<(ChainKey, UnixMs)>>;
     /// Deletes the rows of `chain` whose seq is above `head` and that
     /// were noted at or before `cutoff`, in one statement; answers how
     /// many. A row noted again after `cutoff` stays.
@@ -168,16 +167,18 @@ pub async fn sweep<P: PendingRows, F: ChainFinisher>(
     after: Option<&ChainKey>,
 ) -> Result<SweepReport> {
     let cutoff = UnixMs(now.0 - SWEEP_AGE_MS);
-    let chains = rows.chains_noted_by(cutoff, after, SWEEP_CHAINS).await?;
+    let chains = rows.chains_after(after, SWEEP_CHAINS).await?;
     let mut report = SweepReport {
         next_after: if chains.len() as u32 == SWEEP_CHAINS {
-            chains.last().cloned()
+            chains.last().map(|(chain, _)| chain.clone())
         } else {
             None
         },
         ..SweepReport::default()
     };
-    for chain in &chains {
+    // A chain whose rows are all younger than the cutoff is left to its
+    // messages.
+    for (chain, _) in chains.iter().filter(|(_, oldest)| oldest.0 <= cutoff.0) {
         let head = match finisher.finish(chain).await {
             Ok(head) if head.complete => {
                 report.finished += 1;
