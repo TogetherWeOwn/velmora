@@ -1309,3 +1309,21 @@ async fn the_budget_counts_waits_and_refusals_of_requests_and_jobs_apart() {
     drop((first, served));
     assert_eq!(budget.in_use(), 0);
 }
+
+/// A second bridge of the isolate (a managed tenant's unit jobs) takes
+/// its bytes out of the same budget: a charge through a shared handle is
+/// a charge of the first, both ways.
+#[test]
+fn a_shared_budget_handle_counts_against_the_same_budget() {
+    const MIB: u64 = 1024 * 1024;
+    let budget = ByteBudget::new(8 * MIB);
+    let unit = budget.shared();
+    let a = unit.try_charge_job(5 * MIB).unwrap();
+    assert_eq!(budget.in_use(), 5 * MIB);
+    assert!(budget.try_charge_job(4 * MIB).is_none());
+    let b = budget.try_charge_job(3 * MIB).unwrap();
+    assert_eq!(unit.in_use(), 8 * MIB);
+    assert!(unit.try_charge_job(1).is_none());
+    drop((a, b));
+    assert_eq!(budget.in_use(), 0);
+}

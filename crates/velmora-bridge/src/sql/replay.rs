@@ -125,7 +125,7 @@ fn extent_stmts(x: &ReplayExtent, now: UnixMs, out: &mut Vec<Stmt>) -> Result<()
             SqlValue::Blob(e.plain_sha256.to_vec()),
             SqlValue::Blob(e.cipher_sha256.to_vec()),
             text(safety.as_str()),
-            SqlValue::Int(i64::from(e.plan_rev)),
+            crate::plan_rev::bound(e.plan_rev)?,
             ms(e.created_at),
         ],
     ));
@@ -145,7 +145,7 @@ fn extent_stmts(x: &ReplayExtent, now: UnixMs, out: &mut Vec<Stmt>) -> Result<()
                 vec![
                     id(),
                     SqlValue::Int(i64::try_from(plan.len()).unwrap_or(i64::MAX)),
-                    SqlValue::Int(i64::from(e.plan_rev)),
+                    crate::plan_rev::bound(e.plan_rev)?,
                     SqlValue::Blob(packed.clone()),
                     parity,
                     parity_count,
@@ -162,7 +162,7 @@ fn extent_stmts(x: &ReplayExtent, now: UnixMs, out: &mut Vec<Stmt>) -> Result<()
                 vec![
                     id(),
                     SqlValue::Int(i64::try_from(plan.len()).unwrap_or(i64::MAX)),
-                    SqlValue::Int(i64::from(e.plan_rev)),
+                    crate::plan_rev::bound(e.plan_rev)?,
                 ],
             ));
         }
@@ -330,7 +330,7 @@ pub(super) async fn replay_extents<S: Sql>(
                 vec![
                     text(x.row.id.as_str()),
                     SqlValue::Int(i64::try_from(x.plan.as_ref().map_or(0, Vec::len)).unwrap_or(0)),
-                    SqlValue::Int(i64::from(x.row.plan_rev)),
+                    crate::plan_rev::bound(x.row.plan_rev)?,
                     SqlValue::Blob(plan.clone()),
                     SqlValue::Blob(u.stored.clone()),
                     parity,

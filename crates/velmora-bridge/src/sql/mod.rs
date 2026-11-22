@@ -138,7 +138,8 @@ pub struct SqlCatalog<S: Sql> {
     gate: Option<Rc<dyn PermitGate>>,
     /// When this catalogue last ran the rollout step after an acquire
     /// that found nothing.
-    nudged: Cell<i64>,
+    /// Shared with the catalogues made by [`SqlCatalog::sharing`].
+    nudged: Rc<Cell<i64>>,
 }
 
 impl<S: Sql> SqlCatalog<S> {
@@ -146,7 +147,7 @@ impl<S: Sql> SqlCatalog<S> {
         SqlCatalog {
             sql,
             gate: None,
-            nudged: Cell::new(0),
+            nudged: Rc::new(Cell::new(0)),
         }
     }
 
@@ -156,7 +157,19 @@ impl<S: Sql> SqlCatalog<S> {
         SqlCatalog {
             sql,
             gate: Some(gate),
-            nudged: Cell::new(0),
+            nudged: Rc::new(Cell::new(0)),
+        }
+    }
+
+    /// A catalogue over `sql` that takes its permits through this one's
+    /// gate, with the same throttle of the gate rollout step: for a second
+    /// bridge of the isolate (a managed tenant's unit jobs), whose permits
+    /// and provider health are the shared database's.
+    pub fn sharing<S2: Sql>(&self, sql: S2) -> SqlCatalog<S2> {
+        SqlCatalog {
+            sql,
+            gate: self.gate.clone(),
+            nudged: Rc::clone(&self.nudged),
         }
     }
 

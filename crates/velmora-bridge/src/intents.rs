@@ -24,6 +24,7 @@
 
 use crate::ports::{BlobStore, Bridge, Catalog, Clock, JobSink, Kek, NntpConnector};
 use crate::recovery::{delete_blob, generation_recorded};
+use crate::tenant::TenantScope;
 use crate::types::{
     DispatchReport, IntentFence, Job, JobOutcome, Result, UnixMs, WriteId, JOB_VERSION,
 };
@@ -70,17 +71,17 @@ where
     }
 
     /// The sweep of one write. Every step is safe to run again.
-    pub(crate) async fn sweep_write(&self, write: &WriteId) -> JobOutcome {
+    pub(crate) async fn sweep_write(&self, scope: &TenantScope, write: &WriteId) -> JobOutcome {
         if !self.cfg.intent_sweep {
             return JobOutcome::Ack;
         }
-        match self.sweep(write).await {
+        match self.sweep(scope, write).await {
             Ok(outcome) => outcome,
             Err(_) => crate::jobs::RETRY,
         }
     }
 
-    async fn sweep(&self, write: &WriteId) -> Result<JobOutcome> {
+    async fn sweep(&self, scope: &TenantScope, write: &WriteId) -> Result<JobOutcome> {
         let stamp = match self.sweep_allowed().await {
             Ok(stamp) => stamp,
             Err(outcome) => return Ok(outcome),
@@ -101,7 +102,7 @@ where
         if let Some(generation) = &generation {
             // Under the name of either layout: the record may be of a
             // Worker that was set to the other one.
-            if generation_recorded(&self.safety, generation).await? {
+            if generation_recorded(&self.safety, scope, generation).await? {
                 self.catalog.keep_intents(write).await?;
                 return Ok(JobOutcome::Ack);
             }
@@ -121,7 +122,7 @@ where
         }
         for extent in &extents {
             // Absent is success: an earlier run of this job got here.
-            delete_blob(&self.safety, &extent.safety_key()).await?;
+            delete_blob(&self.safety, &scope.safety_key(extent)).await?;
         }
         self.catalog.drop_intents(write).await?;
         Ok(JobOutcome::Ack)

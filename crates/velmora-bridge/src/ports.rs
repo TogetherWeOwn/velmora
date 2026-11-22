@@ -406,7 +406,7 @@ const _: () = assert!(READ_CALL_SECS <= NNTP_CALL_SECS && READ_PERMIT_SECS <= PE
 
 /// A claimed outbox row. Every later mutation carries it and writes only
 /// while `token` still matches.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Lease {
     pub extent: ExtentId,
     pub generation: GenerationId,
@@ -500,7 +500,7 @@ impl PermitClass {
 }
 
 /// Outcome of a guarded batch.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Guard<T> {
     Applied(T),
     /// The guard failed; the batch wrote nothing.

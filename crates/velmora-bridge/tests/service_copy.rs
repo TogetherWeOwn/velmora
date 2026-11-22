@@ -44,7 +44,9 @@ async fn delete<N: NntpConnector + 'static>(rig: &Rig<N>, signer: &Signer, key: 
 async fn collect_garbage<N: NntpConnector + 'static>(rig: &Rig<N>) {
     rig.bridge.clock.advance_secs(7 * DAY_SECS);
     assert_eq!(
-        rig.bridge.run_job(&Job::Gc { v: JOB_VERSION }).await,
+        rig.bridge
+            .run_job(&TENANT_ZERO, &Job::Gc { v: JOB_VERSION })
+            .await,
         JobOutcome::Ack
     );
 }
@@ -823,3 +825,6 @@ async fn copy_retries_the_delete_of_a_lost_record() {
     assert!(!keys.contains(&lost.borrow()));
     assert_eq!(get(&rig, &signer, "dst").await.expect(200).body, b"payload");
 }
+
+/// The one tenant there is.
+static TENANT_ZERO: velmora_bridge::TenantScope = velmora_bridge::TenantScope::tenant_zero();

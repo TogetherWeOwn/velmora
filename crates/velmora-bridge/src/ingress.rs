@@ -752,6 +752,19 @@ impl ByteBudget {
         }
     }
 
+    /// The same budget, as a second handle that counts exactly as this
+    /// one does (no request's own share): for a second bridge of the
+    /// same isolate, the one that runs a managed tenant's jobs against
+    /// its unit, whose bytes must come out of the isolate's one budget.
+    pub fn shared(&self) -> ByteBudget {
+        ByteBudget {
+            state: Rc::clone(&self.state),
+            sleeper: self.sleeper.clone(),
+            spawner: self.spawner.clone(),
+            held: self.held.clone(),
+        }
+    }
+
     /// The same budget for one request: what is charged through the
     /// handle returned is counted as held by that request, until each
     /// charge is dropped. A charge taken in turn through it

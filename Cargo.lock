@@ -1601,6 +1601,7 @@ dependencies = [
  "serde_json",
  "velmora",
  "velmora-bridge",
+ "velmora-unit-do",
  "worker",
 ]
 
@@ -1632,6 +1633,26 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "velmora",
+]
+
+[[package]]
+name = "velmora-unit-do"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "velmora-bridge",
+ "worker",
+]
+
+[[package]]
+name = "velmora-unit-suite"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "serde_json",
+ "velmora-bridge",
+ "velmora-unit-do",
+ "worker",
 ]
 
 [[package]]

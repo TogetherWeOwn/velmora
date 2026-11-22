@@ -611,6 +611,40 @@ fn parse_kek(get: &impl Fn(&str) -> Option<String>, v: u32) -> Result<KekBytes, 
 }
 
 impl BridgeConfig {
+    /// The configuration of the jobs of one managed tenant's unit, made
+    /// from this isolate's (tenant 0's) configuration. It takes the
+    /// unit's name, never a string: `CATALOGUE_ID` stays tenant 0's and
+    /// keeps its validator ([`valid_catalogue_id`] refuses a dot, so no
+    /// deploy variable can name a unit's stamp prefix, round 3 L1-Q7).
+    /// Two settings differ from tenant 0's:
+    ///
+    /// - `catalogue_id` is the unit's stamp id `<tenant>.<unit>`, made by
+    ///   [`crate::unit::jobcall::stamp_id`], the one producer of that
+    ///   form, which the unit's job calls check against (`rs/<t>.<u>/`).
+    /// - `records` is the tenant's own layout (`m/x/<tenant>/`), whatever
+    ///   tenant 0's is: a managed tenant's records never go into the flat
+    ///   layout, which the recovery copy and the replay read as tenant
+    ///   0's.
+    ///
+    /// Refused for tenant 0, which has no unit.
+    pub fn for_unit(&self, unit: &crate::unit::UnitName) -> Result<BridgeConfig, ConfigError> {
+        if unit.tenant.is_zero() {
+            return Err(ConfigError::Refused("tenant 0 has no unit"));
+        }
+        let records = crate::recovery::Layout::tenant(unit.tenant.as_str())
+            .ok_or(ConfigError::Refused("not a tenant id"))?;
+        let catalogue_id = crate::unit::jobcall::stamp_id(unit);
+        debug_assert!(
+            !valid_catalogue_id(&catalogue_id),
+            "a unit id is never a catalogue id"
+        );
+        Ok(BridgeConfig {
+            catalogue_id,
+            records,
+            ..self.clone()
+        })
+    }
+
     /// Builds and validates the configuration from vars and secrets.
     /// `get` returns a var or secret by name (`None` = absent).
     pub fn from_vars(get: impl Fn(&str) -> Option<String>) -> Result<BridgeConfig, ConfigError> {
@@ -683,7 +717,9 @@ impl BridgeConfig {
         }
         let records = match get("RECORD_LAYOUT").as_deref().map(str::trim) {
             None | Some("") | Some("flat") => crate::recovery::Layout::flat(),
-            Some("tenant") => crate::recovery::Layout::default_tenant(),
+            Some("tenant") => {
+                crate::recovery::Layout::of(&crate::tenant::TenantScope::tenant_zero())
+            }
             Some(_) => return Err(ConfigError::Invalid("RECORD_LAYOUT".into())),
         };
 

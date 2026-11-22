@@ -19,6 +19,8 @@ use rusqlite::{params_from_iter, Connection, StatementStatus};
 use sha2::{Digest, Sha256};
 
 use crate::meter::Meter;
+#[path = "testkit_shadow.rs"]
+mod shadow;
 pub use crate::meter::{Tally, WriteOp, WriteReport};
 use crate::ports::{
     BlobMeta, BlobStore, Catalog, Clock, Guard, JobSink, Kek, PublishOutcome, Row, Sql, SqlValue,
@@ -29,6 +31,7 @@ use crate::types::{
     BridgeError, BucketId, ByteSpan, CommitGeneration, CompleteUpload, CopyGeneration, ExtentId,
     Job, KekBytes, Precondition, Result, UnixMs,
 };
+use shadow::Shadow;
 
 /// The D1 schema, applied by [`RusqliteSql::with_schema`].
 pub const MIGRATION_0001: &str =
@@ -127,6 +130,9 @@ pub struct RusqliteSql {
     meter: RefCell<Option<Meter>>,
     /// What [`Sql::query`] has cost since the last reset.
     reads: Cell<ReadStats>,
+    /// The twin in workerd, when `VELMORA_SQL_SHADOW` is set
+    /// (`testkit_shadow.rs`).
+    shadow: Option<Shadow>,
 }
 
 /// The cost of the statements run through [`Sql::query`]: how many (one
@@ -219,6 +225,7 @@ impl RusqliteSql {
             conn: RefCell::new(conn),
             meter: RefCell::new(None),
             reads: Cell::new(ReadStats::default()),
+            shadow: Shadow::from_env(),
         })
     }
 
@@ -304,17 +311,49 @@ impl RusqliteSql {
 
     /// Runs a multi-statement script (a migration).
     pub fn apply(&self, script: &str) -> Result<()> {
-        self.conn.borrow().execute_batch(script).map_err(map_err)
+        let twin = self.twin_ready();
+        let local = self.conn.borrow().execute_batch(script).map_err(map_err);
+        if let (true, Some(shadow)) = (twin, &self.shadow) {
+            shadow.apply(script, &local);
+        }
+        local
     }
 
-    /// Direct access for assertions.
+    /// Whether the workerd twin, if any, is to be asked this call; a
+    /// dirty twin is rebuilt first, from the state before the call.
+    fn twin_ready(&self) -> bool {
+        match &self.shadow {
+            Some(shadow) => shadow.ready(&self.conn.borrow()),
+            None => false,
+        }
+    }
+
+    /// Direct access for assertions. A change made here bypasses the
+    /// port, so a workerd twin is rebuilt from this database before the
+    /// next call.
     pub fn with_conn<R>(&self, f: impl FnOnce(&Connection) -> R) -> R {
-        f(&self.conn.borrow())
+        let conn = self.conn.borrow();
+        let Some(shadow) = &self.shadow else {
+            return f(&conn);
+        };
+        let mark = |c: &Connection| {
+            let version: i64 = c
+                .query_row("PRAGMA schema_version", [], |r| r.get(0))
+                .unwrap_or(-1);
+            (c.total_changes(), version)
+        };
+        let before = mark(&conn);
+        // Inside an open transaction or savepoint, direct access can roll
+        // back writes the twin already has, which no counter shows.
+        let open = !conn.is_autocommit();
+        let out = f(&conn);
+        if open || !conn.is_autocommit() || mark(&conn) != before {
+            shadow.mark_dirty();
+        }
+        out
     }
-}
 
-impl Sql for RusqliteSql {
-    async fn query(&self, sql: &str, params: &[SqlValue]) -> Result<Vec<Row>> {
+    fn query_local(&self, sql: &str, params: &[SqlValue]) -> Result<Vec<Row>> {
         check_params(params)?;
         let conn = self.conn.borrow();
         // Whatever a failed statement left behind was rolled back.
@@ -349,7 +388,7 @@ impl Sql for RusqliteSql {
         Ok(out)
     }
 
-    async fn exec(&self, sql: &str, params: &[SqlValue]) -> Result<u64> {
+    fn exec_local(&self, sql: &str, params: &[SqlValue]) -> Result<u64> {
         let conn = self.conn.borrow();
         let mut meter = self.meter.borrow_mut();
         // What a failed query left behind was rolled back.
@@ -374,17 +413,19 @@ impl Sql for RusqliteSql {
 
     /// One transaction: the first failing statement (a guard CHECK or any
     /// other error) rolls back every statement of the batch.
-    async fn batch(&self, stmts: Vec<(&'static str, Vec<SqlValue>)>) -> Result<Vec<u64>> {
+    fn batch_local(&self, stmts: &[(&'static str, Vec<SqlValue>)]) -> Result<Vec<u64>> {
         let mut conn = self.conn.borrow_mut();
         let mut meter = self.meter.borrow_mut();
         // What a failed query left behind was rolled back.
         if let Some(m) = meter.as_mut() {
             m.discard();
         }
-        let tx = conn.transaction().map_err(map_err)?;
+        // A savepoint: a transaction of its own at the top level, and a
+        // nested one inside a unit call (`UnitSql::atomically`).
+        let tx = conn.savepoint().map_err(map_err)?;
         let mut changed = Vec::with_capacity(stmts.len());
         let mut priced = Vec::new();
-        for (sql, params) in &stmts {
+        for (sql, params) in stmts {
             // On error `tx` drops here, which rolls back; nothing of the
             // batch was written, so nothing of it is metered.
             match run_to_completion(&tx, sql, params) {
@@ -407,6 +448,87 @@ impl Sql for RusqliteSql {
             }
         }
         Ok(changed)
+    }
+}
+
+impl Sql for RusqliteSql {
+    async fn query(&self, sql: &str, params: &[SqlValue]) -> Result<Vec<Row>> {
+        let twin = self.twin_ready();
+        let local = self.query_local(sql, params);
+        match (twin, &self.shadow) {
+            (true, Some(shadow)) => shadow.query(sql, params, local),
+            _ => local,
+        }
+    }
+
+    async fn exec(&self, sql: &str, params: &[SqlValue]) -> Result<u64> {
+        let twin = self.twin_ready();
+        let local = self.exec_local(sql, params);
+        match (twin, &self.shadow) {
+            (true, Some(shadow)) => shadow.exec(sql, params, local),
+            _ => local,
+        }
+    }
+
+    async fn batch(&self, stmts: Vec<(&'static str, Vec<SqlValue>)>) -> Result<Vec<u64>> {
+        let twin = self.twin_ready();
+        let local = self.batch_local(&stmts);
+        match (twin, &self.shadow) {
+            (true, Some(shadow)) => shadow.batch(&stmts, local),
+            _ => local,
+        }
+    }
+}
+
+/// A unit call is one transaction: a savepoint around it. When it rolls
+/// back, a workerd twin is rebuilt from what is left before the next call.
+impl crate::unit::UnitSql for RusqliteSql {
+    fn atomically(&self, f: &mut dyn FnMut() -> Result<()>) -> Result<()> {
+        self.conn
+            .borrow()
+            .execute_batch("SAVEPOINT unit_call")
+            .map_err(map_err)?;
+        // A failed RELEASE (a deferred foreign key) leaves the savepoint
+        // open: it is rolled back like a failed call.
+        let done = f().and_then(|()| {
+            self.conn
+                .borrow()
+                .execute_batch("RELEASE unit_call")
+                .map_err(map_err)
+        });
+        match done {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                let undone = self
+                    .conn
+                    .borrow()
+                    .execute_batch("ROLLBACK TO unit_call; RELEASE unit_call");
+                if let Some(shadow) = &self.shadow {
+                    shadow.mark_dirty();
+                }
+                match undone {
+                    Ok(()) => Err(e),
+                    Err(r) => Err(BridgeError::Sql(format!("{e}; and the rollback: {r}"))),
+                }
+            }
+        }
+    }
+
+    fn apply_script(&self, script: &str) -> Result<()> {
+        self.apply(script)
+    }
+
+    /// The local database's pages times their size (a twin is not
+    /// asked: its file is the object's own).
+    fn database_size(&self) -> Result<u64> {
+        let conn = self.conn.borrow();
+        let pragma = |name: &str| -> Result<u64> {
+            let n: i64 = conn
+                .query_row(&format!("PRAGMA {name}"), [], |r| r.get(0))
+                .map_err(map_err)?;
+            u64::try_from(n).map_err(|_| BridgeError::Sql(format!("{name} negative")))
+        };
+        Ok(pragma("page_count")? * pragma("page_size")?)
     }
 }
 

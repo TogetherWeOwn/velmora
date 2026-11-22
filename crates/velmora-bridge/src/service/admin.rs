@@ -65,12 +65,11 @@ use crate::crypto::{open_range, unwrap_bdk, wrap_bdk, wrap_secret, DataKey};
 use crate::fetch::{cold_poll_ms, cold_step_bytes, ColdFetch, ColdReader, COLD_WAIT_MS};
 use crate::hashstate::Running;
 use crate::ingress::{self, check_admin_bearer, IngressError};
+use crate::keys::revocations::list_tenant_zero_revocations;
 use crate::ports::{
     BlobStore, Bridge, Catalog, Clock, GrantPut, Guard, JobSink, Kek, NntpConnector,
 };
-use crate::recovery::{
-    delete_blob, revoked_key_id, valid_key_id, write_key_revocation, REVOKED_KEY_PREFIX,
-};
+use crate::recovery::{delete_blob, valid_key_id, write_key_revocation, REVOKED_KEY_PREFIX};
 use crate::replay::ReplayCursor;
 use crate::service::INTERRUPTED_RETRIES;
 use crate::types::{
@@ -770,13 +769,7 @@ async fn restore<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek,
             // is brought level with the newest stamp object.
             if !bridge
                 .catalog
-                .restore_finish(
-                    run,
-                    bridge.clock.now(),
-                    stamp,
-                    seen,
-                    &bridge.cfg.catalogue_id,
-                )
+                .restore_finish(run, bridge.clock.now(), stamp, seen, bridge.catalogue_id())
                 .await
                 .or_internal()?
             {
@@ -1172,6 +1165,9 @@ async fn revoke_key<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: K
 
 /// Deletes every key that has a revocation record, a page of records
 /// per catalogue batch. Idempotent: a key that is not there is skipped.
+/// Only tenant 0's revocations are read: the names directly under
+/// `m/rk/`, never those below a managed tenant's `m/rk/<tenant>/`, which
+/// the listing skips a directory at a time.
 async fn forget_revoked_keys<
     C: Catalog,
     B: BlobStore,
@@ -1185,20 +1181,12 @@ async fn forget_revoked_keys<
     let mut after = REVOKED_KEY_PREFIX.to_string();
     let mut forgotten = 0;
     loop {
-        let names = bridge
-            .safety
-            .list(REVOKED_KEY_PREFIX, &after, REVOCATION_PAGE)
-            .await?;
-        // A name that is no key id cannot name a catalogue row.
-        let ids: Vec<String> = names
-            .iter()
-            .filter_map(|n| revoked_key_id(n))
-            .map(str::to_string)
-            .collect();
+        let (ids, next) =
+            list_tenant_zero_revocations(&bridge.safety, &after, REVOCATION_PAGE).await?;
         forgotten += bridge.catalog.delete_access_keys(&ids).await?;
-        match names.last() {
-            Some(last) if names.len() >= REVOCATION_PAGE as usize => last.clone_into(&mut after),
-            _ => return Ok(forgotten),
+        match next {
+            Some(n) => after = n,
+            None => return Ok(forgotten),
         }
     }
 }
