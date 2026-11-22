@@ -69,8 +69,8 @@ use crate::ports::PermitClass;
 use crate::ports::{BlobMeta, BlobStore, Bridge, Catalog, Clock, JobSink, Kek, NntpConnector};
 use crate::post::Stop;
 use crate::types::{
-    ArticleRow, ArticleState, ExtentRow, JobOutcome, ProviderConfig, Result, SafetyState,
-    ScrubCandidate, ScrubEnd, ScrubResult, ScrubRun, UnixMs,
+    ArticleRow, ArticleState, ExtentRow, GenerationState, JobOutcome, ProviderConfig, Result,
+    SafetyState, ScrubCandidate, ScrubEnd, ScrubResult, ScrubRun, UnixMs,
 };
 use crate::verify::{release_backbones, MISSING_BACKOFF_SECS, REVERIFY_SECS};
 
@@ -1181,9 +1181,9 @@ where
         // is to sit open through them.
         Self::hang_up_all(reader, walk.stats).await;
         let read = found.cipher.is_some();
-        let (source, cipher) = match found.cipher {
-            Some(cipher) if found.rebuilt > 0 => (RepairSource::Parity, Some(cipher)),
-            Some(cipher) => (RepairSource::Usenet, Some(cipher)),
+        let (source, cipher, cleanup_cache_write) = match found.cipher {
+            Some(cipher) if found.rebuilt > 0 => (RepairSource::Parity, Some(cipher), false),
+            Some(cipher) => (RepairSource::Usenet, Some(cipher), false),
             None => match self.stored_copy(extent).await {
                 Ok(stored) => stored,
                 // A blob store did not answer: not "no copy". Looked at
@@ -1265,12 +1265,10 @@ where
             true => found.lacking.clone(),
             false => counting,
         };
-        // The cache copy is the last copy when it is the source (Usenet
-        // lacks it everywhere and the safety copy is gone): it is written
-        // to the safety store before the re-pin, while the eviction may
-        // still take the cache fill, and taken back if the guard refuses
-        // (it did not exist before). From Usenet the copy is written
-        // after the re-pin: Usenet still holds the bytes meanwhile.
+        // The cache may hold the last good copy. Write it to the safety
+        // store before re-pinning, while eviction may still take the
+        // cache fill. From Usenet the copy is written after the re-pin:
+        // Usenet still holds the bytes meanwhile.
         let key = extent.id.safety_key();
         if source == RepairSource::Cache && !self.put_safety(extent, cipher.clone()).await {
             walk.run.suspect += 1;
@@ -1278,17 +1276,11 @@ where
                 .scrub_record_one(reader, walk, extent, (ScrubResult::Suspect, None))
                 .await;
         }
-        let repinned = self
+        if self
             .catalog
             .scrub_repin(token, &extent.id, (now, next), &unread)
-            .await;
-        if source == RepairSource::Cache && matches!(repinned, Ok(false)) {
-            // Written for this re-pin alone, and the guard refused it (an
-            // answer, not an error: after an error the re-pin may have
-            // gone through, and the copy stays).
-            let _ = crate::recovery::delete_blob(&self.safety, &key).await;
-        }
-        if repinned? {
+            .await?
+        {
             // Read from Usenet: the copy is written (one in R2 may be
             // there with other bytes). Already in R2 (the safety copy just
             // read, or the cache copy written before the re-pin): it is
@@ -1329,35 +1321,50 @@ where
             }
             return Ok(());
         }
-        // Refused: the extent is no longer released and done, or no live
-        // object holds it, or the lease is gone. Looked at again later.
+        // Refusal alone does not make the write safe to undo: another run
+        // may now own it. Clean up only if the old copy was known missing
+        // or corrupt and GC already retired the extent while we wrote it.
+        if let (true, Some(generation)) = (cleanup_cache_write, &extent.generation_id) {
+            let retired = self
+                .catalog
+                .job_extent(&extent.id, generation)
+                .await
+                .is_ok_and(|row| {
+                    row.is_some_and(|row| {
+                        row.generation_state != GenerationState::Live
+                            && row.extent.safety_state == SafetyState::Deleted
+                    })
+                });
+            if retired {
+                let _ = crate::recovery::delete_blob(&self.safety, &key).await;
+            }
+        }
         walk.run.suspect += 1;
         self.scrub_record_one(reader, walk, extent, (ScrubResult::Suspect, None))
             .await
     }
 
-    /// The cache copy if it is intact, else the safety copy if it is.
-    /// `Err(())`: a store could not be read, so whether it holds a copy
-    /// is not known.
+    /// Read the intact safety copy, or fall back to an intact cache copy.
+    /// The last field is true only for a cache copy when the safety store
+    /// answered with no object or bad bytes. `Err(())` means no intact copy
+    /// was found and at least one read failed.
     async fn stored_copy(
         &self,
         extent: &ExtentRow,
-    ) -> core::result::Result<(RepairSource, Option<Vec<u8>>), ()> {
-        let mut unknown = false;
-        // The safety copy first: when it is intact nothing is written.
-        for (source, store, key) in [
-            (RepairSource::Safety, &self.safety, extent.id.safety_key()),
-            (RepairSource::Cache, &self.cache, extent.id.cache_key()),
-        ] {
-            match store.get(&key, None).await {
-                Ok(Some(bytes)) if digest_ok(extent, &bytes) => return Ok((source, Some(bytes))),
-                Ok(_) => {}
-                Err(_) => unknown = true,
+    ) -> core::result::Result<(RepairSource, Option<Vec<u8>>, bool), ()> {
+        let safety_unusable = match self.safety.get(&extent.id.safety_key(), None).await {
+            Ok(Some(bytes)) if digest_ok(extent, &bytes) => {
+                return Ok((RepairSource::Safety, Some(bytes), false));
             }
-        }
-        match unknown {
-            true => Err(()),
-            false => Ok((RepairSource::Usenet, None)),
+            Ok(_) => true,
+            Err(_) => false,
+        };
+        match self.cache.get(&extent.id.cache_key(), None).await {
+            Ok(Some(bytes)) if digest_ok(extent, &bytes) => {
+                Ok((RepairSource::Cache, Some(bytes), safety_unusable))
+            }
+            Ok(_) if safety_unusable => Ok((RepairSource::Usenet, None, false)),
+            _ => Err(()),
         }
     }
 

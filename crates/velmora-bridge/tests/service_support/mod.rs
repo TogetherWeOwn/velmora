@@ -222,12 +222,13 @@ fn sql_down() -> BridgeError {
     BridgeError::Sql("no answer".into())
 }
 
-/// A blob store whose writes can be made to fail.
+/// A blob store whose operations can be made to fail.
 #[derive(Default)]
 pub struct Blobs {
     pub inner: MemBlobStore,
-    /// Every call crosses it first.
     pub trip: Tripwire,
+    /// The next GET on this store fails without removing the blob.
+    pub fail_next_get: Cell<bool>,
     pub fail_put: Cell<bool>,
     pub frozen: Cell<bool>,
     pub frozen_write_attempts: Cell<u32>,
@@ -475,6 +476,9 @@ impl BlobStore for Blobs {
         })
     }
     async fn get(&self, key: &str, span: Option<ByteSpan>) -> Result<Option<Vec<u8>>> {
+        if self.fail_next_get.replace(false) {
+            return Err(blob_down());
+        }
         self.read_turn().await;
         if let Some((failing, left)) = self.fail_gets.borrow_mut().as_mut() {
             if failing == key && *left > 0 {

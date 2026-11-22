@@ -2220,9 +2220,9 @@ async fn a_trip_is_stored_when_it_happens() {
 }
 
 /// From the cache copy (the last copy), the safety copy is written before
-/// the re-pin; a re-pin the guard refuses takes that copy back.
+/// the re-pin and kept even if the guard refuses the re-pin.
 #[tokio::test(flavor = "current_thread")]
-async fn a_cache_sourced_copy_is_written_first_and_taken_back_when_refused() {
+async fn a_cache_sourced_copy_is_written_first_and_kept_when_refused() {
     let w = world().await;
     let o = w.released("a", 230).await;
     let cipher = w
@@ -2266,8 +2266,120 @@ async fn a_cache_sourced_copy_is_written_first_and_taken_back_when_refused() {
         puts + 1,
         "written first"
     );
-    assert!(!w.has_safety(&o), "taken back: the re-pin was refused");
+    assert!(w.has_safety(&o), "kept even though the re-pin was refused");
     assert_eq!(w.result(&o).await, "suspect");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_transient_safety_read_then_lease_loss_does_not_delete_the_copy() {
+    let w = world().await;
+    let o = w.released("a", 231).await;
+    let bridge = w.bridge();
+    let safety = &bridge.safety;
+    let safety_key = o.extent.safety_key();
+    let cipher = safety.stored(&safety_key).unwrap().bytes;
+    let extent = w.rig.live(&w.bucket, "a").await.unwrap().1.remove(0);
+    let meta = BlobMeta {
+        bucket: &extent.bucket_id,
+        extent: &extent.id,
+        cipher_sha256: &extent.cipher_sha256,
+    };
+    bridge
+        .cache
+        .put(&o.extent.cache_key(), cipher.clone(), &meta)
+        .await
+        .unwrap();
+    w.advance_secs(31 * DAY_SECS);
+    w.hide(0, &o, 0).await;
+    w.hide(1, &o, 0).await;
+    assert_eq!(w.scrub().await.repaired, 0);
+    w.advance_secs(bridge.cfg.scrub.confirm_secs);
+
+    // Fail the next safety GET, then pause the cache-sourced PUT so
+    // another run can take the scrub lease.
+    safety.fail_next_get.set(true);
+    safety.hold_put_prefix.replace(Some(safety_key.clone()));
+    let run = w.scrub();
+    tokio::pin!(run);
+    let take_lease = async {
+        while !safety.held.get() {
+            tokio::task::yield_now().await;
+        }
+        assert!(!safety.fail_next_get.get(), "the safety GET failed");
+        bridge
+            .clock
+            .advance_ms(velmora_bridge::jobtable::JOB_MAX_AGE_MS + 1);
+        let now = bridge.clock.now();
+        bridge
+            .catalog
+            .scrub_take(now, now.plus_secs(60))
+            .await
+            .unwrap()
+            .expect("another run took over the expired lease");
+        safety.hold_put_prefix.replace(None);
+    };
+    tokio::select! {
+        () = take_lease => {}
+        _ = &mut run => panic!("scrub finished without writing the cached copy"),
+    }
+    assert_eq!(run.await.repaired, 0);
+    assert_eq!(w.safety_state(&o).await, "released");
+    let stored = safety
+        .stored(&safety_key)
+        .expect("the safety copy must survive a refused re-pin after a transient GET error");
+    assert!(stored.bytes == cipher, "the safety copy must stay intact");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn cache_repair_does_not_leave_a_copy_after_gc_collects_the_extent() {
+    let w = world_with(|cfg| cfg.gc_mode = velmora_bridge::config::GcMode::Disposable).await;
+    let o = w.released("a", 232).await;
+    let bridge = w.bridge();
+    let safety = &bridge.safety;
+    let safety_key = o.extent.safety_key();
+    let cipher = safety.stored(&safety_key).unwrap().bytes;
+    assert!(safety.lose(&safety_key));
+    let extent = w.rig.live(&w.bucket, "a").await.unwrap().1.remove(0);
+    let meta = BlobMeta {
+        bucket: &extent.bucket_id,
+        extent: &extent.id,
+        cipher_sha256: &extent.cipher_sha256,
+    };
+    bridge
+        .cache
+        .put(&o.extent.cache_key(), cipher, &meta)
+        .await
+        .unwrap();
+    w.advance_secs(31 * DAY_SECS);
+    w.hide(0, &o, 0).await;
+    w.hide(1, &o, 0).await;
+    assert_eq!(w.scrub().await.repaired, 0);
+    w.advance_secs(bridge.cfg.scrub.confirm_secs);
+
+    safety.hold_put_prefix.replace(Some(safety_key));
+    let run = w.scrub();
+    tokio::pin!(run);
+    let collect = async {
+        while !safety.held.get() {
+            tokio::task::yield_now().await;
+        }
+        w.rig
+            .call(&w.signer, Method::Delete, &path(BUCKET, "a"), &[], &[], b"")
+            .await
+            .expect(204);
+        assert_eq!(
+            bridge.run_job(&Job::Gc { v: JOB_VERSION }).await,
+            JobOutcome::Ack
+        );
+        assert_eq!(w.safety_state(&o).await, "deleted");
+        safety.hold_put_prefix.replace(None);
+    };
+    tokio::select! {
+        () = collect => {}
+        _ = &mut run => panic!("scrub finished without writing the cached copy"),
+    }
+    assert_eq!(run.await.repaired, 0);
+    assert!(!w.has_safety(&o), "GC already collected the extent");
 }
 
 /// A clean check carries the count of clean checks across runs: at 8 in a
