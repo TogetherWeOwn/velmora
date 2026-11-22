@@ -2227,6 +2227,23 @@ async fn a_subject_closed_in_a_checkpoint_opens_from_an_older_one() {
     let e = read.table.get("AKVL0001").unwrap();
     assert!(e.private.is_some(), "opened from the older checkpoint");
     assert_eq!(e.effective_status(), SubjectStatus::Active);
+    // A writer with the same ring and a cached table that holds the
+    // subject closed opens it the same way, so a narrowing goes through.
+    let mut cached = read3.table.clone();
+    assert!(cached.get("AKVL0001").unwrap().private.is_none());
+    let writer = env_with!(w, &v23, &adm, &units);
+    let narrow = KeyRequest::SetGrants {
+        id: "AKVL0001".into(),
+        grants: vec![grant("b_01", RO, Some("x/"))],
+        acting: None,
+    };
+    assert_eq!(
+        writer
+            .change(&mut cached, "n", &narrow, &mut rng)
+            .await
+            .unwrap(),
+        KeyAnswer::Done { seq: 4 }
+    );
 }
 
 /// A closing record that follows an opening one the directory has not

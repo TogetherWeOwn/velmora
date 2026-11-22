@@ -364,6 +364,27 @@ pub async fn read_key_chain<S: RecordStore, K: Kek, T: TkRing>(
     Err(ERR_CHECKPOINT)
 }
 
+/// Opens, from any checkpoint that carries it whole, a subject of a
+/// cached `table` that is still closed after its own record was tried:
+/// what [`read_key_chain`] would give. Lists the checkpoints only when a
+/// subject is closed.
+pub(super) async fn reopen_from_checkpoints<S: RecordStore, K: Kek, T: TkRing>(
+    store: &S,
+    kek: &K,
+    ring: &T,
+    table: &mut KeyTable,
+) -> Result<()> {
+    let any_closed = table
+        .entries()
+        .any(|e| e.private.is_none() && e.door.status != SubjectStatus::Revoked);
+    if !any_closed {
+        return Ok(());
+    }
+    let tenant = table.tenant().clone();
+    let checkpoints = list_checkpoints(store, &tenant).await?;
+    reopen_from_older(store, kek, ring, &tenant, &checkpoints, u64::MAX, table).await
+}
+
 /// Opens a subject that is still closed from an older checkpoint that
 /// carries its private part: the same `private_seq` is the same private
 /// part, whichever checkpoint holds it. A checkpoint written by a
