@@ -51,7 +51,6 @@ use serde_json::{json, Value};
 use velmora::rng::FillRandom;
 
 use crate::directory::first_open::{first_open, FirstOpenAnswer};
-use crate::directory::gate::is_open;
 use crate::ingress::{self, check_admin};
 use crate::keys::locations::{
     init_locations, is_kek_not_held, read_locations, two_in_account, InitLocations,
@@ -235,15 +234,9 @@ where
             "No directory is bound; the gate counts as closed.",
         );
     };
-    // The route's own guard (AM-78, §R7-13 N1): an open gate answers
-    // `200` and runs nothing, so a repeat never closes it or empties
-    // `pending_ops`; a read that fails runs nothing either. `first_open`
-    // checks the gate and the managed tenant chains again before its run.
-    match is_open(root.records(), &dir).await {
-        Ok(true) => return json_response(200, &json!({ "gate": "open", "ran": false })),
-        Ok(false) => {}
-        Err(_) => return unavailable(),
-    }
+    // No guard of its own: `first_open`'s first step answers `200` only for
+    // a gate open at epoch 1 with anchor 1 alone, before any write, and
+    // every other open state is `409 gate_epoch_unexpected` (AM-83b).
     let now = root.clock().now();
     let chain = root.chain();
     match first_open(&chain, &dir, root.kek(), now).await {
