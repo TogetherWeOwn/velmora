@@ -836,7 +836,7 @@ pub struct Bucket {
 }
 
 /// `access_keys` row. `Debug` hides the wrapped secret.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AccessKeyRow {
     pub access_key_id: String,
     pub principal: String,
@@ -870,7 +870,7 @@ pub struct AccessKeySummary {
 }
 
 /// `generations` row.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct GenerationRow {
     pub id: GenerationId,
     pub bucket_id: BucketId,
@@ -1031,7 +1031,7 @@ pub struct BackboneStatus {
 }
 
 /// `uploads` row (state, revision and completion receipt).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct UploadRow {
     pub id: UploadId,
     pub bucket_id: BucketId,
@@ -1048,7 +1048,7 @@ pub struct UploadRow {
 }
 
 /// `upload_parts` row.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct UploadPartRow {
     pub upload_id: UploadId,
     /// 1..=10000.
@@ -1061,7 +1061,7 @@ pub struct UploadPartRow {
 
 /// One extent of a part of an open upload. A part body above one extent
 /// is stored as several, numbered in body order from 0.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PartExtent {
     pub part_number: u16,
     pub piece: u32,
@@ -1116,7 +1116,7 @@ pub struct JobExtent {
 }
 
 /// Admin view of one extent.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ExtentStatus {
     pub extent_id: ExtentId,
     pub seq: Option<u32>,
@@ -1131,7 +1131,7 @@ pub struct ExtentStatus {
 
 /// Admin view of a live object (`GET /_admin/objects/<b>/<k>`). Cache
 /// presence is not catalogue state; the admin handler adds it.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ObjectStatus {
     pub generation: GenerationRow,
     pub extents: Vec<ExtentStatus>,
@@ -1142,7 +1142,8 @@ pub struct ObjectStatus {
 /// delete batch that carries one holds it in a guard statement of the
 /// batch itself, so it is judged against the object the batch replaces
 /// and not against one read earlier.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Precondition {
     /// `If-None-Match: *`: the key has no live object.
     Absent,
@@ -1181,7 +1182,7 @@ impl Precondition {
 
 /// Input of a single-PUT publication batch: the new generation and its
 /// freshly sealed extents (inserted as `committed`).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CommitGeneration {
     pub generation: GenerationRow,
     pub extents: Vec<ExtentRow>,
@@ -1192,7 +1193,7 @@ pub struct CommitGeneration {
 /// generation whose extents it references. The source must still be the
 /// live object of `(generation.bucket_id, source_key)` when the batch
 /// runs; `generation` repeats its size, ETag and extent count.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CopyGeneration {
     pub generation: GenerationRow,
     pub source: GenerationId,
@@ -1201,7 +1202,7 @@ pub struct CopyGeneration {
 }
 
 /// Where one staged part extent lands in the completed object.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ExtentPlacement {
     pub extent_id: ExtentId,
     pub seq: u32,
@@ -1212,7 +1213,7 @@ pub struct ExtentPlacement {
 /// sets `generation_id`, `seq`, `plain_offset` and `state = 'committed'` on
 /// the existing staged extents; it never rewrites their hashes, keys or
 /// headers.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CompleteUpload {
     pub generation: GenerationRow,
     /// In part order.
@@ -1221,7 +1222,7 @@ pub struct CompleteUpload {
 }
 
 /// `GET /_admin/status` catalogue figures.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, serde::Deserialize)]
 pub struct OutboxStats {
     /// Row count per stage; stages with no rows are omitted.
     pub by_stage: Vec<(OutboxStage, u64)>,
@@ -1232,7 +1233,7 @@ pub struct OutboxStats {
 
 /// Hot-tier totals. Pinned bytes are safety copies that are not yet
 /// released; evictable bytes are released safety copies and cache fills.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, serde::Deserialize)]
 pub struct HotStats {
     pub pinned_bytes: u64,
     pub pinned_extents: u64,
@@ -1284,7 +1285,7 @@ db_enum!(
 
 /// ListObjectsV2 catalogue query. The service turns a prefix into the
 /// `[prefix, successor(prefix))` range and folds delimiters in Rust.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ListQuery {
     pub prefix: String,
     pub delimiter: Option<String>,
@@ -1297,7 +1298,7 @@ pub struct ListQuery {
 
 /// ListMultipartUploads catalogue query: the open uploads of a bucket in
 /// `(key, upload id)` order.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct UploadListQuery {
     pub prefix: String,
     /// Exclusive lower bound: every key after this one and, with an
@@ -1309,7 +1310,7 @@ pub struct UploadListQuery {
 }
 
 /// One open multipart upload, as a listing shows it.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct OpenUpload {
     pub key: String,
     pub id: UploadId,
@@ -1317,7 +1318,7 @@ pub struct OpenUpload {
 }
 
 /// One listed object.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ListEntry {
     pub key: String,
     pub size: u64,
@@ -1326,14 +1327,14 @@ pub struct ListEntry {
 }
 
 /// Where the next page starts (the service tags it into a token).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ListCursor {
     pub after: String,
     pub skip_prefix: Option<String>,
 }
 
 /// One page of a listing; `next` is `Some` iff truncated.
-#[derive(Clone, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub struct ListPage {
     pub entries: Vec<ListEntry>,
     pub common_prefixes: Vec<String>,
@@ -1537,7 +1538,7 @@ pub enum IntentFence {
 }
 
 /// `write_intents` as `GET /_admin/status` reports it.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, serde::Deserialize)]
 pub struct IntentStats {
     /// Writes whose blobs the sweep left in place because a recovery
     /// record of the write exists. Nothing reclaims them yet.
@@ -1810,7 +1811,7 @@ impl fmt::Debug for S3Response {
 /// The catalogue-wide usage counters (`usage_global`, row 1). Signed: a
 /// counter that has drifted below zero is reported as it is, for the
 /// recount to explain.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, serde::Deserialize)]
 pub struct UsageCounters {
     /// `false` until a recount has switched the counters on. The figures
     /// mean nothing before that.
@@ -1853,7 +1854,7 @@ impl UsageCounters {
 }
 
 /// Events of one hour (`hour` = `UnixMs / 3_600_000`).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, serde::Deserialize)]
 pub struct UsageHour {
     pub hour: i64,
     pub posts: i64,
@@ -1932,7 +1933,7 @@ pub struct RecountStep {
 }
 
 /// Everything the operations page reads, without a table scan.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, serde::Deserialize)]
 pub struct UsageSnapshot {
     pub counters: UsageCounters,
     /// Live objects and their plaintext bytes, over all buckets.
@@ -1953,7 +1954,7 @@ pub struct UsageSnapshot {
 }
 
 /// Live objects of one bucket.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, serde::Deserialize)]
 pub struct BucketUsage {
     pub bucket_id: String,
     pub name: String,

@@ -519,6 +519,21 @@ impl<S: UnitSql> Unit<S> {
             }
             return self.run(call, &head, false, now);
         }
+        // A request call (L1-5, AM-64): only after SigV4, with the
+        // caller's numbers (checked above as a request's); the tenant's
+        // state decides it as it does an S3 call.
+        if let UnitOp::Request { call: rc } = &call.op {
+            if call.kind != CallKind::Request || !call.authenticated {
+                return Ok(refused(Refused::Unauthenticated, false));
+            }
+            if !allows(&head, rc.is_read()) {
+                return Ok(refused(Refused::AccountProblem, false));
+            }
+            if let Err(r) = rc.check() {
+                return Ok(refused(Refused::Request(r), true));
+            }
+            return self.request(&head, rc);
+        }
         // A fan-out read names a grant: it is never a cold read, so it
         // is refused without `authenticated` (rule 11).
         if !call.authenticated && (!call.op.read_only() || call.kind == CallKind::Fanout) {
@@ -587,12 +602,15 @@ impl<S: UnitSql> Unit<S> {
         });
         match &call.op {
             UnitOp::Ping {} => Ok(Ok(state)),
-            UnitOp::KeyRow { access_key_id } => {
-                let row = self.cat.access_key(access_key_id).await?;
-                Ok(Ok(
-                    json!({ "key": row.as_ref().map(key_json), "state": state }),
-                ))
-            }
+            UnitOp::KeyRow {
+                access_key_id,
+                presigned,
+            } => Ok(Ok(self.key_row(
+                access_key_id,
+                presigned.as_ref(),
+                state,
+                false,
+            )?)),
             UnitOp::ReadPlan {
                 bucket,
                 key,
@@ -722,10 +740,118 @@ impl<S: UnitSql> Unit<S> {
             | UnitOp::BindBucket { .. }
             | UnitOp::ReleaseBound { .. }
             | UnitOp::BucketBinding { .. }
-            | UnitOp::BucketClose { .. } => {
+            | UnitOp::BucketClose { .. }
+            | UnitOp::Request { .. } => {
                 Err(BridgeError::Invalid("worker call routed as an operation"))
             }
         }
+    }
+
+    /// The body of a `key_row` answer: the key's row (the internal key's
+    /// with `presigned`, and the presigned check), the tenant's state, and
+    /// `lease_expired` (AM-63): set only when the unit answers it under an
+    /// expired lease ([`Unit::key_row_expired`]), for the signature check
+    /// alone. Read-only.
+    fn key_row(
+        &self,
+        access_key_id: &str,
+        presigned: Option<&super::request::Presigned>,
+        state: Value,
+        lease_expired: bool,
+    ) -> Result<Value> {
+        Ok(match presigned {
+            None => {
+                let row = poll_once(self.cat.access_key(access_key_id))??;
+                json!({
+                    "key": row.as_ref().map(key_json),
+                    "state": state,
+                    "lease_expired": lease_expired,
+                })
+            }
+            Some(p) => {
+                let (key, check) =
+                    super::request::presigned_check(self.sql(), &self.cat, access_key_id, p)?;
+                json!({
+                    "key": key,
+                    "state": state,
+                    "lease_expired": lease_expired,
+                    "presigned": check,
+                })
+            }
+        })
+    }
+
+    /// AM-63's `key_row` under an expired lease: the same read, in a
+    /// read-only transaction, marked `lease_expired`. The Worker uses the
+    /// row only to check the signature, renews as a signed call, and
+    /// reads `key_row` again before it serves. Only an unauthenticated
+    /// `request` call's `key_row` is answered so; the lease check
+    /// (rule 12, `unit_lease`) calls this in place of `renew_needed`.
+    pub fn key_row_expired(&self, call: &UnitCall, head: &Head) -> Result<UnitAnswer> {
+        let UnitOp::KeyRow {
+            access_key_id,
+            presigned,
+        } = &call.op
+        else {
+            return Ok(refused(Refused::Unauthenticated, false));
+        };
+        if call.authenticated || call.kind != CallKind::Request {
+            return Ok(refused(Refused::Unauthenticated, false));
+        }
+        let state = json!({
+            "tenant_state": head.tenant_state.as_str(),
+            "tenant_mode": head.tenant_mode.map(HoldMode::as_str),
+        });
+        let mut op = || {
+            Ok(Ok(self.key_row(
+                access_key_id,
+                presigned.as_ref(),
+                state.clone(),
+                true,
+            )?))
+        };
+        Ok(match transact(self.sql(), false, &mut op)? {
+            Ok(body) => UnitAnswer::Ok {
+                seqs: head.seqs,
+                body,
+            },
+            Err(reason) => refused(reason, true),
+        })
+    }
+
+    /// A request call (L1-5): one transaction. A write that adds rows to
+    /// a closing bucket is refused `not_found` (AM-57); a call that grows
+    /// the database takes the size guard first (ADR §2.6).
+    fn request(&self, head: &Head, rc: &super::request::RequestCall) -> Result<UnitAnswer> {
+        let sql = self.sql();
+        let grows = rc.grows();
+        let database_size = match grows {
+            Some(_) => sql.database_size()?,
+            None => 0,
+        };
+        let mut op = || -> Result<std::result::Result<Value, Refused>> {
+            if let Some(b) = rc.bucket_written() {
+                if buckets::is_closing(sql, b.as_str())? {
+                    return Ok(Err(Refused::NotFound));
+                }
+            }
+            if let Some(adding) = grows {
+                if let Err(r) = size::admit(sql, self.size, database_size, adding)? {
+                    return Ok(Err(Refused::Size(r)));
+                }
+            }
+            Ok(Ok(poll_once(rc.clone().run(&self.cat))??))
+        };
+        Ok(match transact(sql, true, &mut op)? {
+            Ok(body) => UnitAnswer::Ok {
+                seqs: head.seqs,
+                body,
+            },
+            Err(reason) => {
+                let alarm = matches!(reason, Refused::AwaitedInside);
+                refused(reason, alarm)
+            }
+        })
     }
 
     /// The third case of rule 5: a sub-request under an earlier grant is

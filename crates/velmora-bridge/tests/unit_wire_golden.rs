@@ -29,6 +29,9 @@ use velmora_bridge::unit::lift::{
     AckClass, ClassProof, FindingList, GateRefusal, GateSummary, LiftProof, ReplayId, ReportKind,
 };
 use velmora_bridge::unit::recount::{RecountCall, RecountRefusal};
+use velmora_bridge::unit::request::{
+    PresignRefusal, Presigned, Published, RecordWire, RequestCall, RequestRefusal,
+};
 use velmora_bridge::unit::reserve::{
     Acting, Admit, Binding, Hash32, Opening, PrincipalView, ReserveRefusal, Rid,
 };
@@ -38,7 +41,12 @@ use velmora_bridge::unit::{
     BirthKind, BirthToken, CallKind, ProvisionRefusal, Reader, Refused, Seqs, SyncHead, TenantId,
     TenantState, UnitAnswer, UnitCall, UnitName, UnitOp,
 };
-use velmora_bridge::{ExtentId, GenerationId, Lease, OutboxStage, UnixMs};
+use velmora_bridge::{
+    BucketId, CommitGeneration, CompleteUpload, CopyGeneration, ExtentId, ExtentPlacement,
+    ExtentRow, ExtentState, GenerationId, GenerationRow, GenerationState, Lease, ListQuery,
+    OutboxStage, Precondition, SafetyState, UnixMs, UploadId, UploadListQuery, UploadPartRow,
+    UploadRow, UploadState, WriteId,
+};
 
 const GOLDEN: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/golden/unit-wire.json");
 
@@ -102,7 +110,64 @@ fn op_kind(op: &UnitOp) -> &'static str {
         UnitOp::BucketBinding { .. } => "bucket_binding",
         UnitOp::BucketClose { .. } => "bucket_close",
         UnitOp::Job { .. } => "job",
+        UnitOp::Request { .. } => "request",
         UnitOp::ReadPlan { .. } => "read_plan",
+    }
+}
+
+/// Exhaustive: a new request call does not compile without a sample.
+fn request_kind(c: &RequestCall) -> &'static str {
+    match c {
+        RequestCall::access_key { .. }
+        | RequestCall::grant { .. }
+        | RequestCall::bucket_by_name { .. }
+        | RequestCall::buckets_for { .. }
+        | RequestCall::bucket_in_use { .. }
+        | RequestCall::live_object { .. }
+        | RequestCall::live_generation { .. }
+        | RequestCall::generation_by_id { .. }
+        | RequestCall::extents_in { .. }
+        | RequestCall::newest_id { .. }
+        | RequestCall::unpublished_floor { .. }
+        | RequestCall::key_heads { .. }
+        | RequestCall::list { .. }
+        | RequestCall::list_heads { .. }
+        | RequestCall::object_status { .. }
+        | RequestCall::replay_probe { .. }
+        | RequestCall::restore_pending {}
+        | RequestCall::articles { .. }
+        | RequestCall::touch_read { .. }
+        | RequestCall::record_cache_fill { .. }
+        | RequestCall::upload { .. }
+        | RequestCall::list_uploads { .. }
+        | RequestCall::upload_extents { .. }
+        | RequestCall::upload_extents_held { .. }
+        | RequestCall::outbox_stats {}
+        | RequestCall::intent_stats { .. }
+        | RequestCall::usage_counters {}
+        | RequestCall::usage_snapshot { .. }
+        | RequestCall::usage_buckets { .. }
+        | RequestCall::usage_recounts {}
+        | RequestCall::hot_stats {}
+        | RequestCall::hot_seq { .. }
+        | RequestCall::commit_generation { .. }
+        | RequestCall::commit_sliced { .. }
+        | RequestCall::copy_generation { .. }
+        | RequestCall::open_intents { .. }
+        | RequestCall::intents_generation { .. }
+        | RequestCall::abandon_intents { .. }
+        | RequestCall::raise_floor { .. }
+        | RequestCall::settle_floor { .. }
+        | RequestCall::raise_floors { .. }
+        | RequestCall::settle_floors { .. }
+        | RequestCall::delete_object_before { .. }
+        | RequestCall::delete_object_if { .. }
+        | RequestCall::delete_objects_before { .. }
+        | RequestCall::create_upload { .. }
+        | RequestCall::put_upload_part { .. }
+        | RequestCall::put_upload_part_sliced { .. }
+        | RequestCall::complete_upload { .. }
+        | RequestCall::abort_upload { .. } => c.name(),
     }
 }
 
@@ -143,6 +208,7 @@ fn refused_kind(r: &Refused) -> &'static str {
         Refused::Reserve(_) => "reserve",
         Refused::Size(_) => "size",
         Refused::Buckets(_) => "buckets",
+        Refused::Request(_) => "request",
     }
 }
 
@@ -174,6 +240,15 @@ fn ops() -> Vec<UnitOp> {
         UnitOp::Ping {},
         UnitOp::KeyRow {
             access_key_id: "AKGOLDEN000000000001".into(),
+            presigned: None,
+        },
+        UnitOp::KeyRow {
+            access_key_id: "AKGOLDENINTERNAL0001".into(),
+            presigned: Some(Presigned {
+                principal: "p_1".into(),
+                bucket: "alpha".into(),
+                create_only: true,
+            }),
         },
         UnitOp::ApplyKeys {
             from_seq: 2,
@@ -429,6 +504,12 @@ fn ops() -> Vec<UnitOp> {
                 now: UnixMs(1_000),
             },
         },
+        UnitOp::Request {
+            call: Box::new(RequestCall::live_generation {
+                bucket: bucket_id(),
+                key: "k".into(),
+            }),
+        },
         UnitOp::ReadPlan {
             bucket: "alpha".into(),
             key: "k".into(),
@@ -585,7 +666,352 @@ fn nested() -> Value {
         ])
         .unwrap(),
         "reservation_bodies": reservation_bodies(),
+        "request_refusal": every!(RequestRefusal: OutOfBounds),
+        "presign_refusal": every!(PresignRefusal: NotInternal, Malformed, PrincipalUnknown,
+            PrincipalInactive, PrincipalHeld, NoSuchBucket, NoGrant),
+        "published": every!(Published: Applied, Refused, Fenced),
+        "precondition": serde_json::to_value(vec![
+            Precondition::Absent,
+            Precondition::Exists,
+            Precondition::Etag("\"e1\"".into()),
+        ])
+        .unwrap(),
     })
+}
+
+fn bucket_id() -> BucketId {
+    BucketId::new("b_00000000000000f1")
+}
+
+fn gen_id() -> GenerationId {
+    GenerationId::new("g_0019a00000000f1f1f1f1f1f1f1f1")
+}
+
+fn upload_id() -> UploadId {
+    UploadId::new("u_00000000000000f1")
+}
+
+fn write_id() -> WriteId {
+    WriteId::new("w_00000000000000f1")
+}
+
+fn record() -> RecordWire {
+    RecordWire {
+        generation: gen_id(),
+        key: "r/g_0019a00000000f1f1f1f1f1f1f1f1".into(),
+    }
+}
+
+fn generation_row() -> GenerationRow {
+    GenerationRow {
+        id: gen_id(),
+        bucket_id: bucket_id(),
+        key: "k".into(),
+        state: GenerationState::Live,
+        size: 3,
+        etag: "\"e1\"".into(),
+        checksum_json: None,
+        content_json: "{}".into(),
+        user_meta_json: "{}".into(),
+        extent_count: 1,
+        created_at: UnixMs(1_000),
+        retired_at: None,
+    }
+}
+
+fn extent_row() -> ExtentRow {
+    ExtentRow {
+        id: ExtentId::new("x_000000000000000000000000f1"),
+        bucket_id: bucket_id(),
+        generation_id: Some(gen_id()),
+        state: ExtentState::Committed,
+        seq: Some(0),
+        plain_offset: Some(0),
+        plain_size: 3,
+        cipher_size: 19,
+        media_header: vec![1, 2],
+        key_mode: 1,
+        wrapped_file_key: Some(vec![3, 4]),
+        plain_md5: [5; 16],
+        plain_sha256: [6; 32],
+        cipher_sha256: [7; 32],
+        safety_state: SafetyState::Held,
+        article_count: None,
+        plan_rev: 0,
+        last_verified_at: None,
+        release_evidence: None,
+        released_at: None,
+        created_at: UnixMs(1_000),
+    }
+}
+
+fn part_row() -> UploadPartRow {
+    UploadPartRow {
+        upload_id: upload_id(),
+        part_number: 1,
+        extent_id: ExtentId::new("x_000000000000000000000000f1"),
+        size: 3,
+        etag: "\"e1\"".into(),
+        uploaded_at: UnixMs(1_000),
+    }
+}
+
+fn list_query() -> ListQuery {
+    ListQuery {
+        prefix: "p/".into(),
+        delimiter: Some("/".into()),
+        after: Some("p/a".into()),
+        skip_prefix: None,
+        max_keys: 1_000,
+    }
+}
+
+/// One sample of every request call (L1-5).
+fn requests() -> Vec<RequestCall> {
+    let b = bucket_id;
+    let k = || "k".to_string();
+    let x = || ExtentId::new("x_000000000000000000000000f1");
+    vec![
+        RequestCall::access_key {
+            akid: "AKGOLDEN000000000001".into(),
+        },
+        RequestCall::grant {
+            akid: "AKGOLDEN000000000001".into(),
+            bucket: b(),
+        },
+        RequestCall::bucket_by_name {
+            name: "alpha".into(),
+        },
+        RequestCall::buckets_for {
+            akid: "AKGOLDEN000000000001".into(),
+        },
+        RequestCall::bucket_in_use { bucket: b() },
+        RequestCall::live_object {
+            bucket: b(),
+            key: k(),
+        },
+        RequestCall::live_generation {
+            bucket: b(),
+            key: k(),
+        },
+        RequestCall::generation_by_id {
+            bucket: b(),
+            generation: gen_id(),
+        },
+        RequestCall::extents_in {
+            generation: gen_id(),
+            start: 0,
+            end: 10,
+        },
+        RequestCall::newest_id {
+            bucket: b(),
+            key: k(),
+        },
+        RequestCall::unpublished_floor {
+            bucket: b(),
+            key: k(),
+        },
+        RequestCall::key_heads {
+            bucket: b(),
+            keys: vec![k(), "l".into()],
+        },
+        RequestCall::list {
+            bucket: b(),
+            q: list_query(),
+        },
+        RequestCall::list_heads {
+            bucket: b(),
+            q: list_query(),
+        },
+        RequestCall::object_status {
+            bucket: b(),
+            key: k(),
+        },
+        RequestCall::replay_probe {
+            g: generation_row(),
+        },
+        RequestCall::restore_pending {},
+        RequestCall::articles { extent: x() },
+        RequestCall::touch_read {
+            extent: x(),
+            now: UnixMs(1_000),
+            min_gap_ms: 60_000,
+            from_cache: true,
+        },
+        RequestCall::record_cache_fill {
+            extent: x(),
+            now: UnixMs(1_000),
+        },
+        RequestCall::upload {
+            bucket: b(),
+            key: k(),
+            upload: upload_id(),
+        },
+        RequestCall::list_uploads {
+            bucket: b(),
+            q: UploadListQuery {
+                prefix: "".into(),
+                after: Some((k(), Some("u_1".into()))),
+                skip_prefix: None,
+                limit: 1_000,
+            },
+        },
+        RequestCall::upload_extents {
+            bucket: b(),
+            key: k(),
+            upload: upload_id(),
+            limit: 10_001,
+        },
+        RequestCall::upload_extents_held {
+            upload: upload_id(),
+            except: 2,
+        },
+        RequestCall::outbox_stats {},
+        RequestCall::intent_stats {
+            open_before: UnixMs(1_000),
+        },
+        RequestCall::usage_counters {},
+        RequestCall::usage_snapshot { hours: 24 },
+        RequestCall::usage_buckets {
+            after: "".into(),
+            limit: 200,
+        },
+        RequestCall::usage_recounts {},
+        RequestCall::hot_stats {},
+        RequestCall::hot_seq { extent: x() },
+        RequestCall::commit_generation {
+            c: CommitGeneration {
+                generation: generation_row(),
+                extents: vec![extent_row()],
+                now: UnixMs(1_000),
+            },
+            condition: Some(Precondition::Absent),
+            record: record(),
+        },
+        RequestCall::commit_sliced {
+            c: CommitGeneration {
+                generation: generation_row(),
+                extents: vec![extent_row()],
+                now: UnixMs(1_000),
+            },
+            write: write_id(),
+            condition: None,
+            record: record(),
+        },
+        RequestCall::copy_generation {
+            c: CopyGeneration {
+                generation: generation_row(),
+                source: GenerationId::new("g_0019a00000000e1e1e1e1e1e1e1e1"),
+                source_key: "src".into(),
+                now: UnixMs(1_000),
+            },
+            condition: Some(Precondition::Etag("\"e1\"".into())),
+            record: record(),
+        },
+        RequestCall::open_intents {
+            write: write_id(),
+            extents: vec![x()],
+            now: UnixMs(1_000),
+        },
+        RequestCall::intents_generation {
+            write: write_id(),
+            generation: gen_id(),
+            slices: 2,
+        },
+        RequestCall::abandon_intents { write: write_id() },
+        RequestCall::raise_floor {
+            bucket: b(),
+            key: k(),
+            id: gen_id(),
+            generation: true,
+        },
+        RequestCall::settle_floor {
+            bucket: b(),
+            key: k(),
+            id: gen_id(),
+        },
+        RequestCall::raise_floors {
+            bucket: b(),
+            ids: vec![(k(), gen_id())],
+        },
+        RequestCall::settle_floors {
+            bucket: b(),
+            ids: vec![(k(), gen_id())],
+        },
+        RequestCall::delete_object_before {
+            bucket: b(),
+            key: k(),
+            before: gen_id(),
+            now: UnixMs(1_000),
+        },
+        RequestCall::delete_object_if {
+            bucket: b(),
+            key: k(),
+            before: gen_id(),
+            condition: Precondition::Exists,
+            now: UnixMs(1_000),
+        },
+        RequestCall::delete_objects_before {
+            bucket: b(),
+            deletes: vec![(k(), gen_id(), UnixMs(1_000))],
+        },
+        RequestCall::create_upload {
+            u: UploadRow {
+                id: upload_id(),
+                bucket_id: b(),
+                key: k(),
+                content_json: "{}".into(),
+                user_meta_json: "{}".into(),
+                state: UploadState::Open,
+                revision: 0,
+                completed_generation_id: None,
+                complete_digest: None,
+                result_etag: None,
+                initiated_at: UnixMs(1_000),
+            },
+        },
+        RequestCall::put_upload_part {
+            bucket: b(),
+            key: k(),
+            upload: upload_id(),
+            part: part_row(),
+            extent: extent_row(),
+            now: UnixMs(1_000),
+        },
+        RequestCall::put_upload_part_sliced {
+            bucket: b(),
+            key: k(),
+            upload: upload_id(),
+            part: part_row(),
+            extents: vec![extent_row()],
+            write: write_id(),
+            now: UnixMs(1_000),
+        },
+        RequestCall::complete_upload {
+            bucket: b(),
+            key: k(),
+            upload: upload_id(),
+            revision: 1,
+            digest: [9; 32],
+            c: CompleteUpload {
+                generation: generation_row(),
+                placements: vec![ExtentPlacement {
+                    extent_id: x(),
+                    seq: 0,
+                    plain_offset: 0,
+                }],
+                now: UnixMs(1_000),
+            },
+            condition: None,
+            record: record(),
+        },
+        RequestCall::abort_upload {
+            bucket: b(),
+            key: k(),
+            upload: upload_id(),
+            now: UnixMs(1_000),
+        },
+    ]
 }
 
 fn refusals() -> Vec<Refused> {
@@ -609,6 +1035,7 @@ fn refusals() -> Vec<Refused> {
         Refused::Reserve(ReserveRefusal::GrantLimitsNotServed),
         Refused::Size(SizeRefusal::TooManyExtents),
         Refused::Buckets(BucketRefusal::NotEmpty),
+        Refused::Request(RequestRefusal::OutOfBounds),
     ]
 }
 
@@ -720,6 +1147,7 @@ fn document() -> Value {
         .map(|op| {
             let kind = match op {
                 UnitOp::Job { .. } => CallKind::Job,
+                UnitOp::Request { .. } => CallKind::Request,
                 _ => CallKind::Worker,
             };
             let c = UnitCall {
@@ -744,18 +1172,39 @@ fn document() -> Value {
             v
         })
         .collect();
+    let requests: Vec<Value> = requests()
+        .into_iter()
+        .map(|call| {
+            let c = UnitCall {
+                name: name(),
+                kind: CallKind::Request,
+                seqs: Some(seqs()),
+                authenticated: true,
+                listed: true,
+                op: UnitOp::Request {
+                    call: Box::new(call),
+                },
+            };
+            let v = serde_json::to_value(&c).unwrap();
+            assert_eq!(serde_json::from_value::<UnitCall>(v.clone()).unwrap(), c);
+            v
+        })
+        .collect();
     json!({
         "calls": calls,
         "answers": answers,
         "nested": nested(),
         "import_progress": import_progress_bodies(),
+        "requests": requests,
     })
 }
 
 #[test]
 fn every_variant_has_a_sample() {
     let ops: std::collections::BTreeSet<_> = ops().iter().map(op_kind).collect();
-    assert_eq!(ops.len(), 28, "{ops:?}");
+    assert_eq!(ops.len(), 29, "{ops:?}");
+    let requests: std::collections::BTreeSet<_> = requests().iter().map(request_kind).collect();
+    assert_eq!(requests.len(), 50, "{requests:?}");
     let readers: std::collections::BTreeSet<_> = ops_readers().into_iter().collect();
     assert_eq!(readers.len(), 2, "both readers have a sample");
     // The variants that carry data, each with a sample (exhaustive).
@@ -787,7 +1236,7 @@ fn every_variant_has_a_sample() {
     let answers: std::collections::BTreeSet<_> = answers().iter().map(answer_kind).collect();
     assert_eq!(answers.len(), 9, "{answers:?}");
     let reasons: std::collections::BTreeSet<_> = refusals().iter().map(refused_kind).collect();
-    assert_eq!(reasons.len(), 19, "{reasons:?}");
+    assert_eq!(reasons.len(), 20, "{reasons:?}");
 }
 
 #[test]

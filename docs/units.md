@@ -433,8 +433,8 @@ They are refused in `shredding` and `shredded`, and while this unit is
 closed (its own `restoring` entry is set, or its lease has expired: rule
 12). Provider permits and
 provider health are not a unit's: they stay in the shared database, which
-every tenant's jobs use. The request path does not use `TenantCatalog`.
-A refusal (`sync_needed`, stale, a job with no numbers, closed, unborn)
+every tenant's jobs use. The request path uses request calls instead
+("Requests"). A refusal (`sync_needed`, stale, a job with no numbers, closed, unborn)
 comes back as a typed error, and the first one is kept
 (`TenantCatalog::refusal`). With `stale`, `TenantCatalog::stale_seqs`
 holds the unit's numbers, and `latest_seqs` holds the numbers of the
@@ -464,6 +464,89 @@ calls must name the unit's own stamp id, `<tenant>.<unit>`. Eviction runs
 per unit against the configured cap until the directory's global
 threshold exists (ADR §5.5): with N managed tenants the cache can hold up
 to N times the cap.
+
+## Requests
+
+The S3 handlers (`service/*`) run in the Worker, as today. What they ask
+of the catalogue, the tenant's unit answers (AM-64). Each catalogue method
+of the S3 request path, and each of the operator reads of the per-tenant
+status, is one `request` call (`unit::request::RequestCall`), run by the
+unit's own catalogue in one transaction. The Worker's request catalogue
+forwards the handlers' calls as these, so `Bridge::handle` serves a
+managed tenant with tenant 0's code: conditional PUT, the publication
+batches and their guards, the upload id bound to its bucket and key, and
+the delete batches are the catalogue's own.
+
+**The call.** `{"op": "request", "call": {"m": "<method>", ...}}`, with
+the method's arguments under the names of `ports.rs`. An upload target is
+spelt out as `bucket`, `key` and `upload`. A publication
+(`commit_generation`, `commit_sliced`, `copy_generation`,
+`complete_upload`) carries the proof of its recovery record as
+`record: {generation, key}`. The call has `kind = request`, the Worker's
+numbers from the tenant's verified head (rule 5; none is refused
+`no_numbers`), `authenticated = true` (rule 11; without it the call is
+refused `unauthenticated`: only `key_row` and `read_plan` come before the
+signature), and `listed = true`.
+
+**The answer.** `ok` carries the method's return value as JSON. A
+publication answers `"applied"`, `"refused"` or `"fenced"`, and the
+Worker rebuilds the outcome from the proof it kept
+(`Published::outcome`): a refused publication discards the Worker's own
+record, never one the unit named.
+
+| The unit answers | The Worker |
+|---|---|
+| `ok` | the method's value |
+| `sync_needed` | syncs, then calls once more |
+| `stale{seqs}` (the head the Worker read is older than the unit's) | reads the head again, then calls once more |
+| `closed` | `503` |
+| `unborn` | `503`; it pages "catalogue lost" when the route lists the unit (rule 7) |
+| `refused{account_problem}` | `403 AccountProblem` |
+| `refused{not_found}` (a write into a closing bucket) | `404 NoSuchBucket` |
+| `refused{size}` | `503 SlowDown` and a page, or `403 QuotaExceeded` (ADR §2.6) |
+| `refused{request: out_of_bounds}` (alarm) | `500` and a page: only a Worker bug sends one |
+| `failed{class}` | as on the job path: `guard` is `GuardFailed`; any other class is a catalogue error (`500`) |
+
+**The unit's rules.** The tenant's state decides each call: every call
+while `active`; while `suspended` with `read_only`, only the reads, with
+a read's own two writes (its read stamp, `touch_read`, and its cache
+fill, `record_cache_fill`); none otherwise. While a bucket is closing
+(AM-57), `bucket_by_name` answers none for it, `buckets_for` leaves it
+out, and a write that adds a row naming it (a generation, extents, a
+floor, a tombstone, an upload or a part) is refused `not_found`. A call
+that adds extents or rows takes the size guard first, in its own
+transaction. Each list, limit and key of a call has a bound: at most
+1,000 keys, ids or rows (S3's page and DeleteObjects bound), 10,001
+extents (one object's bound and one more), and 1,024 bytes a key, prefix
+or marker.
+
+**Not request calls.** Bucket create and delete, and the key and grant
+writes: a managed tenant's buckets come from its tenant chain and its
+keys from its key chain (AM-57, AM-12). The Worker answers S3
+CreateBucket and DeleteBucket itself (AM-64). Provider permits and
+provider health stay on the shared database. The job methods are job
+calls, and the record replay of a restore is tenant 0's.
+
+**`key_row`.** Its answer body is `{key, state, lease_expired}`. With an
+expired lease (rule 12), the unit still answers an unauthenticated
+`request` call's `key_row`, read-only, with `lease_expired: true`
+(`Unit::key_row_expired`, AM-63). The Worker uses that row only to check
+the signature, renews as a signed call, and reads `key_row` again before
+it serves. On entry point `presigned`, `key_row` also names what the URL
+names (`presigned: {principal, bucket, create_only}`, AM-64). `key` is
+then the unit's internal key (none for any other key: only the internal
+key signs on that entry point), and the answer carries
+`presigned: {ok, refusal, bucket_id, access}`, checked in the same
+transaction. `ok` needs the principal `active` and not held, an open
+bucket of that name, and the principal's effective grant on it (`rw` for
+a create-only URL). The row is never withheld: the Worker checks SigV4
+first, and answers `403 SignatureDoesNotMatch` if it fails, whatever the
+check found. A verified request with `ok = false` answers
+`403 AccessDenied` and makes no further call. Otherwise the request runs
+as that principal, with `access` on `bucket_id`. The internal key has no
+`access_keys` or `grants` row, so the Worker answers the request's own
+key and grant reads from this answer. A create-only PUT runs as
+`If-None-Match: *`.
 
 ## Bookmarks
 
