@@ -233,13 +233,17 @@ pub const MAX_JOB_BUDGET_DEN: u64 = 2;
 /// It is what three post jobs of a full extent with parity (29.13 MiB
 /// each at 6 sockets) and a verify job charge at once, so that one post
 /// queue's three invocations run together in their isolate with parity
-/// as they do without it; a fourth post job, with parity or without,
-/// waits. It is set from a measurement of the peak memory of such an
-/// isolate, not from the charges alone: raise it only after measuring
-/// again. A job holds about what it charges and a request is weighed at
-/// more than the 1.5 bytes it holds, so in any mix the charges stand for
-/// at most `JOB_BUDGET_BYTES` (or 3/2 of `INFLIGHT_BUDGET_BYTES` where
-/// that is more) of memory.
+/// as they do without it; at 6 sockets a fourth post job, with parity or
+/// without, waits.
+///
+/// The charges bound what the jobs and requests of an isolate hold at
+/// once, not the wasm memory the allocator keeps: that only grows, a
+/// whole extent at a time once its free space is split. Measured on a
+/// deployed Worker (2026-11-22, one isolate, about 60 jobs per run): with
+/// three post jobs at once the wasm memory reached 78 to 92 MiB without
+/// parity and 85 to 103 MiB with it; with four jobs with parity at once
+/// (4 sockets each, 104.5 MiB charged), 119 MiB, and no invocation ran out
+/// of memory. Raise this limit only after measuring again.
 pub const MAX_JOB_BUDGET_BYTES: u64 = 90 * 1024 * 1024;
 
 /// Propagation grace when `PROPAGATION_GRACE_SECS` is unset: six hours.

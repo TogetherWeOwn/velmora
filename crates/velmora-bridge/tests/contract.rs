@@ -2903,8 +2903,8 @@ fn provider_pool_settings_fail_closed() {
 /// either kind. The queue's invocations share isolates (and so do the
 /// post queues), so with a larger socket count or a smaller job budget a
 /// post job waits for another: with parity at 72 MiB only two fitted, and
-/// posting was 20% slower than without. Three at once is what the peak
-/// memory of an isolate was measured with; four never was.
+/// posting was 20% slower than without. Three post jobs with parity at
+/// once is what the shipped limit was measured with.
 #[test]
 fn three_post_jobs_and_a_verify_job_fit_the_shipped_budget() {
     use velmora::media::{FileKey, Profile, Sealer};
@@ -2965,7 +2965,7 @@ fn three_post_jobs_and_a_verify_job_fit_the_shipped_budget() {
     }
     // The shipped budget is the most a deployment may set, and no more
     // than the three jobs with parity and the verify job need, rounded
-    // up to a MiB: it was measured at that value.
+    // up to a MiB.
     assert_eq!(budget, MAX_JOB_BUDGET_BYTES);
     assert_eq!(budget, (3 * with_parity + verify).div_ceil(1 << 20) << 20);
 }

@@ -104,8 +104,10 @@ INFLIGHT_BUDGET_BYTES = "50331648"   # 48 MiB per isolate: what requests may cha
 # stored while it arrives and charges a window of 512 KiB whatever its
 # length; a slice, a copied part and a download charge what they hold.
 # 90 MiB holds three post jobs with parity (29.13 MiB each) and a verify
-# job; the peak memory of an isolate running them was measured before
-# the limit was raised to it.
+# job. Measured with three post jobs at once in one isolate: wasm memory
+# up to 92 MiB without parity and 103 MiB with it, of the isolate's
+# 128 MiB; four with parity reached 119 MiB and none ran out of memory
+# (MAX_JOB_BUDGET_BYTES in config.rs).
 JOB_BUDGET_BYTES = "94371840"        # 90 MiB per isolate
 GC_MODE = "off"                      # off | disposable
 HOT_CAP_BYTES = "107374182400"       # 100 GiB of evictable R2 bytes; pinned (unverified) bytes are never counted or evicted

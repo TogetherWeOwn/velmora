@@ -776,8 +776,8 @@ async fn byte_budget_weighs_requests_and_jobs() {
         (48 * MIB, 72 * MIB)
     );
 
-    // Jobs alone: three 22 MiB post jobs and a 2 MiB job fit, a fourth
-    // post job does not; the limit is 72 MiB exactly.
+    // Jobs alone: three 22 MiB jobs and a 2 MiB job fit, a fourth 22 MiB
+    // job does not; the limit is 72 MiB exactly.
     let jobs: Vec<_> = (0..3)
         .map(|_| budget.try_charge_job(22 * MIB).unwrap())
         .collect();
