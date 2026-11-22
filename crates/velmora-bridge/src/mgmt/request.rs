@@ -62,6 +62,9 @@ pub enum CallQuery {
     UsageDays(UsageDaysQuery),
     /// Any other list: `?after=&limit=`.
     List(List),
+    /// A call outside the contract whose query its handler parses (usage
+    /// downloads, `?period=`; the parts of an upload): the raw query.
+    Raw(String),
 }
 
 impl Call {
@@ -169,8 +172,11 @@ fn call_query(call: &Call, query: &str) -> Result<CallQuery, Code> {
             list.after_as(EventPosition::parse)?;
             CallQuery::List(list)
         }
-        // Not calls of the contract: their handlers parse their position.
-        Events | UsageDownloads { .. } | UploadParts { .. } => CallQuery::List(List::parse(query)?),
+        // The global feed: a list; its handler parses the position.
+        Events => CallQuery::List(List::parse(query)?),
+        // Not calls of the contract, with queries of their own (usage
+        // downloads takes `?period=`): their handlers parse them.
+        UsageDownloads { .. } | UploadParts { .. } => CallQuery::Raw(query.to_string()),
         _ if query.is_empty() => CallQuery::None,
         _ => return Err(Code::BadRequest),
     })

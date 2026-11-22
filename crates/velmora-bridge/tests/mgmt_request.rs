@@ -131,7 +131,15 @@ fn every_call_says_what_it_needs() {
                 "{method} {path}: key {bad:?}"
             );
         }
-        // A call refuses a parameter it does not take.
+        // A call refuses a parameter it does not take; the two calls whose
+        // handlers parse their own query get it raw.
+        if matches!(c, Call::UsageDownloads { .. } | Call::UploadParts { .. }) {
+            assert_eq!(
+                check(&c, "period=2026-11", Some(ACTING), None).map(|c| c.query),
+                Ok(CallQuery::Raw("period=2026-11".into()))
+            );
+            continue;
+        }
         let extra = if q.is_empty() {
             "x=1".to_string()
         } else {
@@ -234,4 +242,22 @@ fn queries_of_the_lists() {
     );
     assert_eq!(list("external_ref=a&x=1"), Err(Code::BadRequest));
     assert_eq!(list("external_ref="), Err(Code::BadRequest));
+}
+
+#[test]
+fn debug_never_shows_a_header_value() {
+    use velmora_bridge::mgmt::serve::MgmtRequest;
+    let req = MgmtRequest {
+        method: "POST",
+        path: "/v1/tenants",
+        query: "",
+        authorization: Some("Bearer secret-token-value"),
+        acting: Some("usr_secret_ref"),
+        idempotency_key: Some("key-secret-value"),
+    };
+    let shown = format!("{req:?}");
+    for value in ["secret-token-value", "usr_secret_ref", "key-secret-value"] {
+        assert!(!shown.contains(value), "{shown}");
+    }
+    assert!(shown.contains("<present>"));
 }

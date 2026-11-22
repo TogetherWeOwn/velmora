@@ -66,8 +66,10 @@ impl Answer {
     }
 }
 
-/// One management request, as [`serve`] takes it.
-#[derive(Clone, Copy, Debug)]
+/// One management request, as [`serve`] takes it. Its `Debug` shows
+/// whether each header came, never its value: `authorization` holds the
+/// service token.
+#[derive(Clone, Copy)]
 pub struct MgmtRequest<'a> {
     pub method: &'a str,
     /// The decoded path, without its query.
@@ -79,6 +81,20 @@ pub struct MgmtRequest<'a> {
     pub acting: Option<&'a str>,
     /// `Idempotency-Key`.
     pub idempotency_key: Option<&'a str>,
+}
+
+impl std::fmt::Debug for MgmtRequest<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let present = |v: Option<&str>| if v.is_some() { "<present>" } else { "<absent>" };
+        f.debug_struct("MgmtRequest")
+            .field("method", &self.method)
+            .field("path", &self.path)
+            .field("query", &self.query)
+            .field("authorization", &present(self.authorization))
+            .field("acting", &present(self.acting))
+            .field("idempotency_key", &present(self.idempotency_key))
+            .finish()
+    }
 }
 
 /// What a call's handler answers today: every call waits for its store.
