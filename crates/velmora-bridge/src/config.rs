@@ -898,14 +898,10 @@ impl BridgeConfig {
         // read that could never be charged would fail every time.
         let cipher = velmora::media::ciphertext_size(max_extent_bytes)
             .ok_or_else(|| ConfigError::Invalid("MAX_EXTENT_BYTES".into()))?;
-        // With parity, a read that lost articles holds the rebuild
-        // beside the extent, at most as many articles as the largest
-        // extent has parity. Without room for both, such a read would
-        // be refused every time.
-        let rebuild = match parity {
-            true => crate::fetch::cold_rebuild_most(cipher),
-            false => 0,
-        };
+        // A read that lost articles holds the rebuild beside the
+        // extent. Count it even with PARITY=off: that rolls back parity
+        // for new plans, but reads still rebuild from stored parity.
+        let rebuild = crate::fetch::cold_rebuild_most(cipher);
         let fits = |sockets: &u32| {
             let step = crate::fetch::cold_step_bytes(cipher, *sockets);
             crate::fetch::cold_read_bytes(cipher, *sockets) <= inflight_budget_bytes

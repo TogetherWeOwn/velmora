@@ -386,17 +386,11 @@ fn config_loads_from_documented_vars() {
             ),
         }
     }
-    // A budget with room for the ciphertext of one extent, its copy and
-    // two more sockets lowers the count instead of refusing every cold
-    // read. The room is counted from the ciphertext: two plaintext
-    // extents and two sockets are 8288 bytes short of it.
+    // A budget that fits the rebuild but not all eight sockets lowers
+    // the count. The eighth socket's limit is counted from the
+    // ciphertext: two plaintext extents and seven buffers fall short.
     sized.insert("COLD_SOCKETS".to_string(), "8".to_string());
-    for (budget, want) in [
-        ("36708448", 3),
-        ("36708447", 2),
-        ("36700160", 2),
-        ("33562720", 1),
-    ] {
+    for (budget, want) in [("44572768", 8), ("44572767", 7), ("44564480", 7)] {
         sized.insert("INFLIGHT_BUDGET_BYTES".to_string(), budget.to_string());
         let cfg = load(&sized).unwrap();
         assert_eq!(cfg.cold_sockets, want, "{budget}");
@@ -417,6 +411,40 @@ fn config_loads_from_documented_vars() {
     }
     assert!(cfg.dev_trust_http);
     assert!(!cfg.providers[0].tls);
+}
+
+/// Turning parity off for new plans does not remove the room needed to
+/// rebuild extents whose parity is already stored.
+#[test]
+fn stored_parity_needs_rebuild_room_even_with_parity_off() {
+    use velmora_bridge::fetch::{cold_read_bytes, cold_rebuild_bytes, cold_step_bytes};
+
+    let (prod, _) = wrangler_vars();
+    let mut vars = with_secrets(prod, &prod_providers());
+    let cfg = load(&vars).unwrap();
+    let cipher = velmora::media::ciphertext_size(cfg.max_extent_bytes).unwrap();
+    let (k, shard) = velmora_bridge::parity::stripe_of(cipher).unwrap();
+    let most = velmora_bridge::parity::parity_count(usize::from(k)) as u64;
+    assert_eq!((k, most), (24, 4));
+    let read = cold_read_bytes(cipher, 1);
+    let both = cold_step_bytes(cipher, 1) + cold_rebuild_bytes(u64::from(shard), most);
+    assert!(read < both && both <= cfg.inflight_budget_bytes);
+
+    // The job budget follows the request budget.
+    vars.remove("JOB_BUDGET_BYTES");
+    vars.insert("PACKED_PLANS".into(), "on".into());
+    vars.insert("COLD_SOCKETS".into(), "1".into());
+    for parity in ["on", "off"] {
+        vars.insert("PARITY".into(), parity.into());
+        vars.insert("INFLIGHT_BUDGET_BYTES".into(), (both - 1).to_string());
+        assert_eq!(
+            load(&vars).map(|cfg| cfg.cold_sockets),
+            Err(ConfigError::Invalid("INFLIGHT_BUDGET_BYTES".into())),
+            "PARITY={parity}"
+        );
+        vars.insert("INFLIGHT_BUDGET_BYTES".into(), both.to_string());
+        assert_eq!(load(&vars).unwrap().cold_sockets, 1, "PARITY={parity}");
+    }
 }
 
 /// The recovery copy is no part of the service's configuration: off
@@ -835,37 +863,6 @@ fn config_rejects_invalid_and_unsafe_values() {
                     e,
                     ConfigError::Refused("PARITY with more than 255 NEWSGROUPS")
                 );
-            }
-        }
-    }
-    // With parity, a cold read that lost articles holds the rebuild
-    // beside the extent: a budget without room for the read of the
-    // largest extent and the rebuild of as many articles as it has
-    // parity is refused. Without parity the same budget is taken.
-    {
-        let cfg = load(&prod).unwrap();
-        let cipher = velmora::media::ciphertext_size(cfg.max_extent_bytes).unwrap();
-        let (k, shard) = velmora_bridge::parity::stripe_of(cipher).unwrap();
-        let most = velmora_bridge::parity::parity_count(usize::from(k)) as u64;
-        assert_eq!((k, most), (24, 4));
-        let rebuild = velmora_bridge::fetch::cold_rebuild_bytes(u64::from(shard), most);
-        let both = velmora_bridge::fetch::cold_step_bytes(cipher, 1) + rebuild;
-        assert!(both <= cfg.inflight_budget_bytes);
-        let mut tuned = prod.clone();
-        tuned.insert("COLD_SOCKETS".into(), "1".into());
-        // The job budget follows the request budget.
-        tuned.remove("JOB_BUDGET_BYTES");
-        for (parity, budget, fits) in [
-            ("on", both, true),
-            ("on", both - 1, false),
-            ("off", both - 1, true),
-        ] {
-            tuned.insert("PARITY".into(), parity.into());
-            tuned.insert("INFLIGHT_BUDGET_BYTES".into(), budget.to_string());
-            let got = load(&tuned).map(|c| c.inflight_budget_bytes);
-            match fits {
-                true => assert_eq!(got, Ok(budget), "PARITY={parity}"),
-                false => assert_eq!(got, Err(invalid("INFLIGHT_BUDGET_BYTES"))),
             }
         }
     }
