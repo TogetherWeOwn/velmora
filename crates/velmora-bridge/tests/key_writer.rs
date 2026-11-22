@@ -3229,3 +3229,90 @@ async fn drop_grant_removes_one_bucket_at_the_head() {
     );
     assert_eq!(w.head(), 4);
 }
+
+// ---------------------------------------------------------------------------
+// KeyVersionGone in the finisher (AM-11)
+// ---------------------------------------------------------------------------
+
+/// A ring with version 2 only; version 1 gone or merely not loaded.
+struct OnlyTwo {
+    key: TenantKey,
+    one_gone: bool,
+}
+
+impl velmora_bridge::keys::record::TkRing for OnlyTwo {
+    fn current(&self) -> Option<&TenantKey> {
+        Some(&self.key)
+    }
+    fn key(&self, v: u32) -> Option<&TenantKey> {
+        (v == 2).then_some(&self.key)
+    }
+    fn gone(&self, v: u32) -> bool {
+        self.one_gone && v == 1
+    }
+}
+
+/// Subjects whose private part is sealed under a gone version are applied
+/// disabled, reported as gone, not retried, and their pending rows clear.
+/// The same subjects under a version that merely did not load are closed
+/// and retried.
+#[tokio::test(flavor = "current_thread")]
+async fn subjects_under_a_gone_version_are_disabled_reported_and_not_retried() {
+    for one_gone in [true, false] {
+        let w = World::new();
+        let adm = FakeAdmission::new(&w.root);
+        let mut table = seed(&w, &adm).await;
+        let units = w.units();
+        let env = env!(w, &adm, &units);
+        // A third subject, revoked: it stays revoked and is not reported.
+        let k3 = s3_key(&w.t, "AKVL0003", "PR0001", &[grant("b_01", RO, None)]);
+        let mut rng = TestRng(220);
+        assert!(matches!(
+            env.change(&mut table, "k3", &KeyRequest::Create(k3), &mut rng)
+                .await
+                .unwrap(),
+            KeyAnswer::Done { .. }
+        ));
+        assert!(matches!(
+            env.change(&mut table, "r3", &revoke("AKVL0003"), &mut rng)
+                .await
+                .unwrap(),
+            KeyAnswer::Done { .. }
+        ));
+        let ring = OnlyTwo {
+            key: TenantKey::from_bytes(&w.t, 2, derived("tk 2")).unwrap(),
+            one_gone,
+        };
+        let env2 = env_with!(w, &ring, &adm, &units);
+        let report = finish_keys(&env2, &mut rng).await.unwrap();
+        let both = vec!["AKVL0001".to_owned(), "PR0001".to_owned()];
+        if one_gone {
+            assert_eq!(report.gone, both);
+            assert!(report.closed.is_empty());
+            assert!(!report.retry());
+            assert_eq!(w.intents.cleared.borrow().last(), Some(&report.head));
+        } else {
+            assert!(report.gone.is_empty());
+            assert_eq!(report.closed, both);
+            assert!(report.retry());
+        }
+        // Gone: disabled by a record, whatever row a store held. Not
+        // loaded: a store keeps the open row it holds at the same seq.
+        let expected = match one_gone {
+            true => SubjectStatus::Disabled,
+            false => SubjectStatus::Active,
+        };
+        assert_eq!(report.gone_disabled.len(), if one_gone { 2 } else { 0 });
+        for store in [&w.root, &w.unit2, &w.directory] {
+            assert_eq!(store.status("AKVL0001"), Some(expected));
+            assert_eq!(store.status("PR0001"), Some(expected));
+            assert_eq!(store.status("AKVL0003"), Some(SubjectStatus::Revoked));
+        }
+        // A second run writes nothing more.
+        let head = report.head;
+        let again = finish_keys(&env2, &mut rng).await.unwrap();
+        assert_eq!(again.head, head);
+        assert!(again.gone_disabled.is_empty());
+        assert_eq!(again.gone, report.gone);
+    }
+}

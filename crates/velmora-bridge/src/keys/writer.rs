@@ -508,11 +508,14 @@ pub(super) struct Acks {
 }
 
 /// The subjects of `table` whose private part did not open, revoked ones
-/// aside: held `disabled` wherever applied.
-fn closed_subjects(table: &KeyTable) -> Vec<String> {
+/// aside: held `disabled` wherever applied. `gone`: those whose private
+/// part is sealed under a key version the ring marks gone (AM-11), which
+/// never open again; otherwise the others, which a later run opens.
+fn closed_subjects<T: TkRing>(table: &KeyTable, ring: &T, gone: bool) -> Vec<String> {
     table
         .entries()
         .filter(|e| e.private.is_none() && e.door.status != SubjectStatus::Revoked)
+        .filter(|e| ring.gone(e.tk_version) == gone)
         .map(|e| e.door.id.clone())
         .collect()
 }
@@ -569,7 +572,7 @@ where
             Class::Closing => acks.closed,
             Class::Opening => acks.units && acks.directory,
         };
-        if acks.units && acks.directory && closed_subjects(table).is_empty() {
+        if acks.units && acks.directory && closed_subjects(table, self.ring, false).is_empty() {
             let _ = self
                 .intents
                 .clear(self.tenant, ControlChain::Keys, seq)
@@ -762,9 +765,12 @@ pub struct FinishReport {
     pub head: u64,
     /// Revoke records appended for `m/rk/` revocations.
     pub appended: Vec<u64>,
-    /// Revocations whose revoke record could not be appended (the tenant
-    /// key could not be loaded, a store error): they are in force in the
-    /// stores all the same, by their `m/rk/` record.
+    /// Disable records appended for subjects under a gone key version.
+    pub gone_disabled: Vec<u64>,
+    /// Subjects whose revoke record (for an `m/rk/` revocation) or
+    /// disable record (for a gone key version) could not be appended (the
+    /// tenant key could not be loaded, a store error). A revocation is in
+    /// force in the stores all the same, by its `m/rk/` record.
     pub append_failed: Vec<String>,
     /// Stores that did not acknowledge, by label; `chain` when the chain
     /// could not be read to its head.
@@ -777,6 +783,11 @@ pub struct FinishReport {
     /// Subjects whose private part did not open: disabled wherever
     /// applied; an attention condition.
     pub closed: Vec<String>,
+    /// Subjects whose private part is sealed under a key version that is
+    /// gone (`KeyVersionGone`, AM-11): applied `disabled` from the door
+    /// part (a revoked one stays revoked), not retried, so their pending
+    /// rows clear; one page each.
+    pub gone: Vec<String>,
 }
 
 impl FinishReport {
@@ -786,6 +797,71 @@ impl FinishReport {
     pub fn retry(&self) -> bool {
         !self.failed.is_empty() || !self.append_failed.is_empty() || !self.closed.is_empty()
     }
+}
+
+/// Appends a closing status record for `id` (`revoked` or `disabled`)
+/// at the head, with its private part as the head holds it (none when it
+/// does not open: the record keeps the one before). `Some(Some(seq))`:
+/// written at `seq`; `Some(None)`: the head already carries it (or a
+/// revoke, or no such subject); `None`: it could not be written.
+async fn append_status<S, K, T, A, I, U, D, C, R>(
+    env: &KeyEnv<'_, S, K, T, A, I, U, D, C>,
+    table: &mut KeyTable,
+    id: &str,
+    status: SubjectStatus,
+    rng: &mut R,
+) -> Option<Option<u64>>
+where
+    S: RecordStore,
+    K: Kek,
+    T: TkRing,
+    A: KeyAdmission,
+    I: ControlIntents,
+    U: KeyTarget,
+    D: KeyTarget,
+    C: Clock,
+    R: FillRandom,
+{
+    let chain = key_chain(env.tenant);
+    for _ in 0..MAX_PUTS {
+        advance(env.store, env.kek, env.ring, &chain, table)
+            .await
+            .ok()?;
+        let entry = match table.get(id) {
+            None => return Some(None),
+            Some(e) if e.door.status == SubjectStatus::Revoked || e.door.status == status => {
+                return Some(None)
+            }
+            Some(e) => e,
+        };
+        let mut door = entry.door.clone();
+        door.status = status;
+        let private = entry.private.clone();
+        let seq = table.seq() + 1;
+        let bytes = seal_key_record(
+            env.kek,
+            env.ring,
+            env.tenant,
+            seq,
+            KeyOp::Status,
+            env.now(),
+            &door,
+            private.as_ref(),
+            true,
+            rng,
+        )
+        .ok()?;
+        match chain.put(env.store, seq, bytes.clone()).await {
+            Ok(Put::Written) => {
+                let record = open_key_record(env.kek, env.ring, env.tenant, seq, &bytes).ok()?;
+                table.apply(&record).ok()?;
+                return Some(Some(seq));
+            }
+            Ok(Put::Lost) => {}
+            Err(_) => return None,
+        }
+    }
+    None
 }
 
 /// Finishes every key change of `tenant` whose record is written: the
@@ -817,57 +893,36 @@ where
     // here stops nothing below: the stores get the revocation from its
     // `m/rk/` record.
     for id in read.unrecorded_revocations() {
-        let mut appended = false;
-        for _ in 0..MAX_PUTS {
-            if advance(env.store, env.kek, env.ring, &chain, &mut table)
-                .await
-                .is_err()
-            {
-                break;
-            }
-            let Some(entry) = table.get(&id) else {
-                appended = true;
-                break;
-            };
-            if entry.door.status == SubjectStatus::Revoked {
-                appended = true;
-                break;
-            }
-            let mut door = entry.door.clone();
-            door.status = SubjectStatus::Revoked;
-            let private = entry.private.clone();
-            let seq = table.seq() + 1;
-            let Ok(bytes) = seal_key_record(
-                env.kek,
-                env.ring,
-                env.tenant,
-                seq,
-                KeyOp::Status,
-                env.now(),
-                &door,
-                private.as_ref(),
-                true,
-                rng,
-            ) else {
-                break;
-            };
-            match chain.put(env.store, seq, bytes.clone()).await {
-                Ok(Put::Written) => {
-                    if let Ok(record) = open_key_record(env.kek, env.ring, env.tenant, seq, &bytes)
-                    {
-                        if table.apply(&record).is_ok() {
-                            report.appended.push(seq);
-                            appended = true;
-                        }
-                    }
-                    break;
-                }
-                Ok(Put::Lost) => {}
-                Err(_) => break,
-            }
+        match append_status(env, &mut table, &id, SubjectStatus::Revoked, rng).await {
+            Some(Some(seq)) => report.appended.push(seq),
+            Some(None) => {}
+            None => report.append_failed.push(id),
         }
-        if !appended {
-            report.append_failed.push(id);
+    }
+    // A subject whose private part is sealed under a gone key version
+    // (AM-11) never opens again: it is disabled by a record that keeps
+    // its private part as it was, so every store closes it whatever row
+    // it holds. A revoked one stays revoked.
+    if advance(env.store, env.kek, env.ring, &chain, &mut table)
+        .await
+        .is_ok()
+    {
+        let gone: Vec<String> = table
+            .entries()
+            .filter(|e| {
+                e.private.is_none()
+                    && e.door.status == SubjectStatus::Active
+                    && !read.revoked.contains(&e.door.id)
+                    && env.ring.gone(e.tk_version)
+            })
+            .map(|e| e.door.id.clone())
+            .collect();
+        for id in gone {
+            match append_status(env, &mut table, &id, SubjectStatus::Disabled, rng).await {
+                Some(Some(seq)) => report.gone_disabled.push(seq),
+                Some(None) => {}
+                None => report.append_failed.push(id),
+            }
         }
     }
     // A chain that cannot be read to its head is a failed run: the stores
@@ -930,7 +985,8 @@ where
     }
 
     report.head = table.seq();
-    report.closed = closed_subjects(&table);
+    report.closed = closed_subjects(&table, env.ring, false);
+    report.gone = closed_subjects(&table, env.ring, true);
     if !report.retry() {
         let _ = env
             .intents
