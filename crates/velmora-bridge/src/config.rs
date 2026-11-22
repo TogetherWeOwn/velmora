@@ -216,7 +216,7 @@ pub const DEFAULT_COLD_SOCKETS: u32 = 4;
 /// reads over as many as fit ([`crate::fetch::cold_read_bytes`]).
 pub const MAX_COLD_SOCKETS: u32 = 8;
 /// `JOB_BUDGET_BYTES` may be at most `INFLIGHT_BUDGET_BYTES` times this
-/// ratio (3/2).
+/// ratio (3/2), or [`MAX_JOB_BUDGET_BYTES`] where that is more.
 ///
 /// A request holds up to 1.5 bytes for each byte it charges: an upload
 /// charges plaintext plus ciphertext and the ciphertext is copied once
@@ -227,18 +227,20 @@ pub const MAX_COLD_SOCKETS: u32 = 8;
 /// could reach, which only [`MAX_JOB_BUDGET_BYTES`] allows.
 pub const MAX_JOB_BUDGET_NUM: u64 = 3;
 pub const MAX_JOB_BUDGET_DEN: u64 = 2;
-/// `JOB_BUDGET_BYTES` may be up to this much (89 MiB) whatever
+/// `JOB_BUDGET_BYTES` may be up to this much (90 MiB) whatever
 /// `INFLIGHT_BUDGET_BYTES` is, when 3/2 of that is less.
 ///
-/// It is what three post jobs of a full extent with parity (28.88 MiB
+/// It is what three post jobs of a full extent with parity (29.13 MiB
 /// each at 6 sockets) and a verify job charge at once, so that one post
 /// queue's three invocations run together in their isolate with parity
-/// as they do without it. It is set from a measurement of the peak
-/// memory of such an isolate, not from the charges alone: raise it only
-/// after measuring again. A job holds about what it charges, and a
-/// request is weighed at more than the 1.5 bytes it holds, so in any
-/// mix the charges stand for at most this much memory.
-pub const MAX_JOB_BUDGET_BYTES: u64 = 89 * 1024 * 1024;
+/// as they do without it; a fourth post job, with parity or without,
+/// waits. It is set from a measurement of the peak memory of such an
+/// isolate, not from the charges alone: raise it only after measuring
+/// again. A job holds about what it charges and a request is weighed at
+/// more than the 1.5 bytes it holds, so in any mix the charges stand for
+/// at most `JOB_BUDGET_BYTES` (or 3/2 of `INFLIGHT_BUDGET_BYTES` where
+/// that is more) of memory.
+pub const MAX_JOB_BUDGET_BYTES: u64 = 90 * 1024 * 1024;
 
 /// Propagation grace when `PROPAGATION_GRACE_SECS` is unset: six hours.
 pub const DEFAULT_PROPAGATION_GRACE_SECS: u32 = 21_600;

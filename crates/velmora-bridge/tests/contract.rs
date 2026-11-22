@@ -271,7 +271,7 @@ fn config_loads_from_documented_vars() {
     assert_eq!(cfg.required_backbones, 2);
     assert_eq!(cfg.max_extent_bytes, 16 * 1024 * 1024);
     assert_eq!(cfg.inflight_budget_bytes, 48 * 1024 * 1024);
-    assert_eq!(cfg.job_budget_bytes, 89 * 1024 * 1024);
+    assert_eq!(cfg.job_budget_bytes, 90 * 1024 * 1024);
     // No wait after the two-backbone verify: the release job's own STAT
     // of every backbone that counts is the last check.
     assert_eq!(cfg.safety_min_age_secs, 0);
@@ -974,10 +974,10 @@ fn config_rejects_invalid_and_unsafe_values() {
         );
     }
     // The job budget: from the request budget to 1.5 times it or
-    // MAX_JOB_BUDGET_BYTES (89 MiB), whichever is more. At the shipped
-    // 48 MiB request budget that is 89 MiB, not 72.
-    assert_eq!(MAX_JOB_BUDGET_BYTES, 93_323_264);
-    for bad in ["50331647", "93323265", "72MiB", "-1"] {
+    // MAX_JOB_BUDGET_BYTES (90 MiB), whichever is more. At the shipped
+    // 48 MiB request budget that is 90 MiB, not 72.
+    assert_eq!(MAX_JOB_BUDGET_BYTES, 94_371_840);
+    for bad in ["50331647", "94371841", "72MiB", "-1"] {
         assert_eq!(
             set(&prod, "JOB_BUDGET_BYTES", bad),
             invalid("JOB_BUDGET_BYTES"),
@@ -988,14 +988,14 @@ fn config_rejects_invalid_and_unsafe_values() {
         ("50331648", 50_331_648),
         ("75497472", 75_497_472),
         ("75497473", 75_497_473),
-        ("93323264", 93_323_264),
+        ("94371840", 94_371_840),
         ("", 50_331_648),
     ] {
         let mut vars = with_secrets(prod.clone(), PROVIDER_TLS);
         vars.insert("JOB_BUDGET_BYTES".into(), good.into());
         assert_eq!(load(&vars).unwrap().job_budget_bytes, want, "{good:?}");
     }
-    // A request budget whose 1.5 times is above 89 MiB keeps that bound:
+    // A request budget whose 1.5 times is above 90 MiB keeps that bound:
     // 64 MiB allows 96 MiB and not a byte more.
     for (job, ok) in [("100663296", true), ("100663297", false)] {
         let mut vars = with_secrets(prod.clone(), PROVIDER_TLS);
@@ -2899,10 +2899,12 @@ fn provider_pool_settings_fail_closed() {
 
 /// The shipped `POST_SOCKETS` and `JOB_BUDGET_BYTES` let three post jobs
 /// of full-size extents and a verify job share one isolate's byte budget,
-/// with parity (`PARITY`) and without. The queue's invocations share
-/// isolates, so with a larger socket count or a smaller job budget a post
-/// job waits for another: with parity at 72 MiB only two fitted, and
-/// posting was 20% slower than without.
+/// with parity (`PARITY`) and without, and never a fourth post job of
+/// either kind. The queue's invocations share isolates (and so do the
+/// post queues), so with a larger socket count or a smaller job budget a
+/// post job waits for another: with parity at 72 MiB only two fitted, and
+/// posting was 20% slower than without. Three at once is what the peak
+/// memory of an isolate was measured with; four never was.
 #[test]
 fn three_post_jobs_and_a_verify_job_fit_the_shipped_budget() {
     use velmora::media::{FileKey, Profile, Sealer};
@@ -2927,25 +2929,38 @@ fn three_post_jobs_and_a_verify_job_fit_the_shipped_budget() {
     let verify = job_bytes(OutboxStage::Verify, cipher_size, sockets);
     assert_eq!(
         (parity, plain),
-        (4, 23_072_816),
-        "a 16 MiB extent at 6 sockets"
+        (4, 26_218_544),
+        "a 16 MiB extent at 6 sockets: 25.00 MiB"
     );
     assert_eq!(
-        with_parity, 30_284_016,
-        "28.88 MiB with its 4 parity shards"
+        with_parity, 30_545_264,
+        "29.13 MiB with its 4 parity shards and the codec's 2"
     );
+    let budget_of = || {
+        ByteBudget::new(prod["INFLIGHT_BUDGET_BYTES"].parse().unwrap()).with_job_capacity(budget)
+    };
     for post in [plain, with_parity] {
         assert!(
             3 * post + verify <= budget,
             "three post jobs ({post} B each) and a verify job ({verify} B) exceed {budget} B"
         );
-        let jobs = ByteBudget::new(prod["INFLIGHT_BUDGET_BYTES"].parse().unwrap())
-            .with_job_capacity(budget);
+        let jobs = budget_of();
         let held: Vec<_> = [post, post, post, verify]
             .into_iter()
             .map(|bytes| jobs.try_charge_job(bytes).expect("fits"))
             .collect();
         assert!(jobs.try_charge_job(post).is_none());
+        drop(held);
+    }
+    // No fourth post job, of any kind and in any mix, even with nothing
+    // else charged.
+    for fourth in [plain, with_parity] {
+        let jobs = budget_of();
+        let held: Vec<_> = [plain, plain, plain]
+            .into_iter()
+            .map(|bytes| jobs.try_charge_job(bytes).expect("fits"))
+            .collect();
+        assert!(jobs.try_charge_job(fourth).is_none(), "{fourth}");
         drop(held);
     }
     // The shipped budget is the most a deployment may set, and no more
