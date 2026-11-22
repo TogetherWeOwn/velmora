@@ -326,10 +326,19 @@ refused before it writes (`size`: `database_full` or
 `too_many_extents`, with an alarm): the Worker answers `503 SlowDown` and
 pages. Reads, deletes and smaller overwrites go on. The extent count is
 the usage counters' while they are on (one row read), and the rows the
-move's import took while they are off. Today the move's import batches
-are the calls that add extents to a unit; the request path's write
-admission takes the same check when it moves into the unit. Tests run it
-against a lowered limit.
+move's import took while they are off. The move's import batches and the
+request calls ("Requests") take the check. Tests run it against a
+lowered limit.
+
+Above a hard ceiling of 9 GB (est) no request call that adds a row
+runs, deletes (a floor and a tombstone each) and smaller overwrites
+included, so the platform's stop is never met; the Worker answers
+`503 SlowDown` and pages, and the operator moves a bucket to another
+unit. GC, aborts and settles still run. `databaseSize` counts the pages
+of the file, freed pages included (not measured on the platform), so
+the ceiling may not lift by itself after GC: the bucket move is the way
+out. This ceiling is an L1 choice beyond ADR §2.6, for the design
+lane to confirm.
 
 ## Import
 
