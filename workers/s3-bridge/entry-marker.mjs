@@ -2,9 +2,10 @@
 // takes every export of the main module for an entrypoint, so the main
 // module exports handlers and classes only.
 
-// Must equal velmora_bridge::entry::ENTRY_HEADER and WEBDAV.
+// Must equal velmora_bridge::entry::ENTRY_HEADER, WEBDAV and MGMT.
 export const ENTRY_HEADER = "x-velmora-entry";
 export const WEBDAV = "webdav";
+export const MGMT = "mgmt";
 
 /** The request with the marker removed, or set to `value`. */
 export function marked(request, value) {

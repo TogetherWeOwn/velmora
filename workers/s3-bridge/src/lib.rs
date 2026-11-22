@@ -1,5 +1,6 @@
 //! Worker entry: `fetch` -> headers-only precheck -> `Bridge::handle` (S3
-//! and `/_admin`), `queue` -> `Bridge::run_job`, `scheduled` ->
+//! and `/_admin`), or the management plane for a request by `MgmtEntry`
+//! (`mgmt.rs`), `queue` -> `Bridge::run_job`, `scheduled` ->
 //! the start of a pass of the recovery copy when one is due, then
 //! `Bridge::dispatch` (the bounded dispatcher), then, once every 15
 //! minutes, `Bridge::probe_providers` (a provider whose strikes no session
@@ -19,6 +20,7 @@ mod gate;
 mod http;
 mod jobs;
 mod metrics;
+mod mgmt;
 mod nntp;
 mod queues;
 mod r2;
@@ -213,6 +215,17 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
         }
     };
     let target = incoming.req.raw_target.clone();
+    // The management entry point: its own plane, never the S3 handler.
+    if velmora_bridge::entry::Entry::of(&incoming.req.headers) == velmora_bridge::entry::Entry::Mgmt
+    {
+        let answer = mgmt::answer(&env, &bridge, &method, &incoming.req).await;
+        console_log!(
+            "{}",
+            ingress::log_line(&method, &target, answer.status, &request_id)
+        );
+        count(answer.status, bridge.cfg.metrics_sample, 0);
+        return mgmt::response(answer, &request_id);
+    }
     internal.set(
         velmora_bridge::fanout::admit(
             &bridge.kek,

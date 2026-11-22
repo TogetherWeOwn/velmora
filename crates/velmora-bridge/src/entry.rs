@@ -33,6 +33,12 @@ pub const ENTRY_HEADER: &str = "x-velmora-entry";
 /// The value of [`ENTRY_HEADER`] that names the WebDAV entry point.
 pub const WEBDAV: &str = "webdav";
 
+/// The value of [`ENTRY_HEADER`] that names the management entry point
+/// (`MgmtEntry` in `entry.mjs`), which only `kofra-api` is bound to. A
+/// request by it is served by [`crate::mgmt`] and never reaches the S3
+/// handler.
+pub const MGMT: &str = "mgmt";
+
 /// Id prefix of an S3 key minted by the admin API.
 pub const S3_KEY_PREFIX: &str = "AKVL";
 
@@ -87,6 +93,8 @@ pub enum Entry {
     S3,
     /// The named entrypoint the WebDAV gateway is bound to.
     WebDav,
+    /// The named entrypoint of the management plane (`/v1`).
+    Mgmt,
 }
 
 /// A header the edge adds to every request from the Internet. The same
@@ -113,23 +121,26 @@ pub fn dropped_header(name: &str) -> bool {
 }
 
 impl Entry {
-    /// The entry point of a request with these headers: WebDAV only when
-    /// exactly one [`ENTRY_HEADER`] says so and nothing says the request
-    /// came from the edge.
+    /// The entry point of a request with these headers: WebDAV or the
+    /// management plane only when exactly one [`ENTRY_HEADER`] says so and
+    /// nothing says the request came from the edge.
     pub fn of(headers: &[(String, String)]) -> Entry {
         let mut marks = headers.iter().filter(|(name, _)| name == ENTRY_HEADER);
-        let webdav = matches!(
-            (marks.next(), marks.next()),
-            (Some((_, value)), None) if value == WEBDAV
-        );
-        if webdav && !from_edge(headers) {
-            Entry::WebDav
-        } else {
+        let named = match (marks.next(), marks.next()) {
+            (Some((_, value)), None) if value == WEBDAV => Entry::WebDav,
+            (Some((_, value)), None) if value == MGMT => Entry::Mgmt,
+            _ => Entry::S3,
+        };
+        if from_edge(headers) {
             Entry::S3
+        } else {
+            named
         }
     }
 
-    /// Whether this entry point accepts the key with this id.
+    /// Whether this entry point accepts the key with this id. The
+    /// management entry point accepts none: its callers hold service
+    /// tokens, never an access key.
     pub fn admits(self, access_key_id: &str) -> bool {
         matches!(
             (self, KeyKind::of(access_key_id)),
@@ -162,6 +173,33 @@ mod tests {
             assert_eq!(KeyKind::of(&format!("{}X", kind.prefix())), kind);
         }
         assert_eq!(KeyKind::parse("internal"), None);
+    }
+
+    #[test]
+    fn mgmt_only_by_the_marker_never_from_the_edge_and_with_no_key() {
+        assert_eq!(Entry::of(&h(&[(ENTRY_HEADER, MGMT)])), Entry::Mgmt);
+        for edge in ["cf-connecting-ip", "cf-ray", "x-forwarded-for", "cdn-loop"] {
+            assert_eq!(
+                Entry::of(&h(&[(ENTRY_HEADER, MGMT), (edge, "1")])),
+                Entry::S3,
+                "{edge}"
+            );
+        }
+        for value in ["MGMT", " mgmt", "mgmt ", "mgmt,webdav", "management"] {
+            assert_eq!(Entry::of(&h(&[(ENTRY_HEADER, value)])), Entry::S3);
+        }
+        assert_eq!(
+            Entry::of(&h(&[(ENTRY_HEADER, MGMT), (ENTRY_HEADER, MGMT)])),
+            Entry::S3
+        );
+        assert_eq!(
+            Entry::of(&h(&[(ENTRY_HEADER, MGMT), (ENTRY_HEADER, WEBDAV)])),
+            Entry::S3
+        );
+        assert_eq!(Entry::of(&h(&[("X-Velmora-Entry", MGMT)])), Entry::S3);
+        for akid in ["AKVLABCDEFGH12345678", "APVLABCDEFGH12345678", ""] {
+            assert!(!Entry::Mgmt.admits(akid), "{akid}");
+        }
     }
 
     #[test]

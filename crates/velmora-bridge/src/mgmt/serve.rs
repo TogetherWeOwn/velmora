@@ -19,7 +19,7 @@ use std::cell::RefCell;
 use crate::mgmt::gate::{admit, Admitted, Shut};
 use crate::mgmt::token::{DisabledTokens, TokenHashes};
 use crate::ports::BlobStore;
-use crate::types::UnixMs;
+use crate::types::{S3Request, UnixMs};
 
 /// Seconds a call whose handler is not built asks the caller to wait.
 pub const NOT_BUILT_RETRY_AFTER_SECS: u32 = 3600;
@@ -75,3 +75,40 @@ pub async fn serve<B: BlobStore>(
         Err(shut) => Answer::shut(shut),
     }
 }
+
+/// Serves a request that came in by the management entry point
+/// ([`crate::entry::Entry::Mgmt`]). The path is the request target up to
+/// its query, as received: the paths of this plane hold no character that
+/// needs decoding, so an encoded one is no path and answers `404`. The
+/// body is not read: no call reads one yet.
+pub async fn serve_request<B: BlobStore>(
+    disabled: &RefCell<DisabledTokens>,
+    hashes: &TokenHashes,
+    records: &B,
+    method: &str,
+    req: &S3Request,
+    now: UnixMs,
+) -> Answer {
+    let path = req
+        .raw_target
+        .split_once('?')
+        .map_or(req.raw_target.as_str(), |(path, _)| path);
+    serve(
+        disabled,
+        hashes,
+        records,
+        method,
+        path,
+        req.header("authorization"),
+        now,
+    )
+    .await
+}
+
+/// The answer when the token hashes cannot be read from the Worker's
+/// configuration: no token can be checked, so nothing is served.
+pub const MISCONFIGURED: Answer = Answer {
+    status: 503,
+    code: "service_unavailable",
+    retry_after: Some(crate::mgmt::gate::RETRY_AFTER_SECS),
+};

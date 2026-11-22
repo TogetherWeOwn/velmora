@@ -51,6 +51,34 @@ test("the WebDAV entrypoint sets the marker, replacing any sent", async () => {
   assert.equal(seen.headers.get("authorization"), "AWS4-HMAC-SHA256 x");
 });
 
+test("the management entrypoint sets its marker, replacing any sent", async () => {
+  for (const value of ["webdav", "s3", "mgmt", null]) {
+    const headers = { authorization: "Bearer x" };
+    if (value !== null) {
+      headers["x-velmora-entry"] = value;
+    }
+    const req = new Request("https://mgmt.internal/v1/tenants", {
+      method: "POST",
+      body: "{}",
+      headers,
+    });
+    new entry.MgmtEntry(ctx, env).fetch(req);
+    const seen = last().request;
+    assert.equal(seen.headers.get("x-velmora-entry"), "mgmt", String(value));
+    assert.equal(seen.headers.get("authorization"), "Bearer x");
+    assert.equal(seen.method, "POST");
+    assert.equal(await seen.text(), "{}");
+  }
+});
+
+test("the default entrypoint deletes a management marker a client sent", () => {
+  const req = new Request("https://s3.test/v1/tenants", {
+    headers: { "x-velmora-entry": "mgmt" },
+  });
+  new entry.default(ctx, env).fetch(req);
+  assert.equal(last().request.headers.has("x-velmora-entry"), false);
+});
+
 test("queue and scheduled reach the Rust Worker unchanged", () => {
   const worker = new entry.default(ctx, env);
   const batch = { messages: [] };
@@ -70,7 +98,10 @@ test("the main module exports entrypoints and classes only", () => {
   }
   assert.equal(marker.ENTRY_HEADER, "x-velmora-entry");
   assert.equal(marker.WEBDAV, "webdav");
-  // The WebDAV entrypoint has no queue or cron handler.
-  assert.equal(entry.DavEntry.prototype.queue, undefined);
-  assert.equal(entry.DavEntry.prototype.scheduled, undefined);
+  assert.equal(marker.MGMT, "mgmt");
+  // The named entrypoints have no queue or cron handler.
+  for (const named of [entry.DavEntry, entry.MgmtEntry]) {
+    assert.equal(named.prototype.queue, undefined);
+    assert.equal(named.prototype.scheduled, undefined);
+  }
 });
