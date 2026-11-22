@@ -410,7 +410,6 @@ async fn an_unbound_directory_does_not_write_records() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-#[ignore = "waits for L3-E first_open bodies"]
 async fn an_open_gate_stays_open_and_keeps_pending_ops() {
     let ports = Ports::with_closed_directory();
     let dir = ports.dir();

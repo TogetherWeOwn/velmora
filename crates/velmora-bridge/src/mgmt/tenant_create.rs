@@ -617,6 +617,8 @@ async fn ready_to_write<P: RootPorts, R: FillRandom>(
         // A record of a newer deploy's KEK: a failure that may pass, no
         // alert (§R7-2 L5-LOW).
         Err(e) if is_kek_not_held(&e) => Err(unavailable()),
+        // A store that did not answer: nothing is known to be wrong.
+        Err(BridgeError::Blob(_)) => Err(unavailable()),
         Err(_) => {
             crate::trace::alert(|| "mgmt: tenant create: key locations unreadable".to_string());
             Err(unavailable())

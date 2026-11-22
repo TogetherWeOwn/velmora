@@ -91,6 +91,8 @@ struct Faults {
     /// Once a put under this prefix lands, these records land too (another
     /// writer between this put and the call's next read).
     plant_after: RefCell<Option<(String, Planted)>>,
+    /// Reads of names under this prefix fail as a store outage.
+    fail_gets_under: RefCell<Option<String>>,
 }
 
 /// An in-memory store that fails the world's k-th put.
@@ -135,6 +137,11 @@ impl RecordStore for Faulty {
         }
     }
     async fn get(&self, name: &str) -> Result<Option<Vec<u8>>> {
+        if let Some(prefix) = self.faults.fail_gets_under.borrow().as_deref() {
+            if name.starts_with(prefix) {
+                return Err(BridgeError::Blob("fault: read failed".into()));
+            }
+        }
         if name.starts_with("m/tref/") {
             self.faults.tref_reads.set(self.faults.tref_reads.get() + 1);
         }
@@ -1328,6 +1335,24 @@ fn key_locations_under_a_newer_kek_stop_create_without_alerting() {
         expect(&w.create(&signup()).await, 503, "service_unavailable");
         assert_create_did_not_start(&w);
         ALERTS.with(|a| assert!(a.borrow().is_empty(), "{:?}", a.borrow()));
+    });
+}
+
+/// A store outage on the `m/kl/` read is no damage: 503, nothing
+/// written, and no alert.
+#[test]
+fn an_unreadable_key_location_store_stops_create_without_alerting() {
+    velmora_bridge::trace::log_alerts(capture);
+    let w = World::new();
+    futures_executor_block_on(async {
+        *w.faults.fail_gets_under.borrow_mut() = Some("m/kl/".to_string());
+        ALERTS.with(|a| a.borrow_mut().clear());
+        expect(&w.create(&signup()).await, 503, "service_unavailable");
+        assert_create_did_not_start(&w);
+        ALERTS.with(|a| assert!(a.borrow().is_empty(), "{:?}", a.borrow()));
+        // Once the store answers, the retry creates the tenant.
+        *w.faults.fail_gets_under.borrow_mut() = None;
+        expect(&w.create(&signup()).await, 201, "ok");
     });
 }
 
