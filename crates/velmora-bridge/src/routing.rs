@@ -414,7 +414,7 @@ mod tests {
     /// tenant and unit, is read back to the job tenant 0's dispatcher
     /// would send, and that job's lane is the lane of the message.
     #[test]
-    fn a_units_job_goes_to_the_queue_of_tenant_zeros_job_of_its_extent() {
+    fn a_units_job_goes_to_the_queue_of_the_flat_job_of_its_extent() {
         use crate::jobmsg::{admit_for, Admission, JobFormat, JobTenant, Units};
         let unit = JobTenant::of_unit("t_00000000000000a7", 3, 9, 4).unwrap();
         for shards in [
