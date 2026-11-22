@@ -43,6 +43,7 @@ use velmora::yenc::{encode_segment_vec, SegmentParams};
 
 use crate::articles::article_spans;
 use crate::fetch::{forgiven, job_holder, report_health, Health, ProviderSession};
+use crate::ingress::{Charge, Lent};
 use crate::jobs::{parity_job_bytes, JOB_OVERHEAD_BYTES};
 use crate::parity::{self, ParityPlan};
 use crate::plan::{draw, pack_seeded, StoredPlan};
@@ -499,9 +500,9 @@ struct DrawnParity {
 }
 
 /// What a post job holds once its extent is loaded.
-struct Loaded {
-    /// The verified ciphertext.
-    cipher: Vec<u8>,
+struct Loaded<'c> {
+    /// The verified ciphertext, in the buffer of the job's charge.
+    cipher: Lent<'c>,
     /// The stored plan: the data articles, then the parity articles.
     plan: Vec<ArticleRow>,
     /// The parity shards, in the order of the parity articles.
@@ -584,7 +585,18 @@ where
     /// Runs the post stage for a claimed extent: plan, POST every planned
     /// article, then hand over to the verify stage.
     pub async fn post_stage(&self, lease: &Lease, job: &JobExtent) -> JobOutcome {
-        let done = self.post_extent(lease, job).await;
+        self.post_stage_in(lease, job, None).await
+    }
+
+    /// [`Self::post_stage`] under the job's budget charge, whose extent
+    /// buffer ([`Charge::lend`]) the extent is read into.
+    pub(crate) async fn post_stage_in(
+        &self,
+        lease: &Lease,
+        job: &JobExtent,
+        charge: Option<&Charge>,
+    ) -> JobOutcome {
+        let done = self.post_extent(lease, job, charge).await;
         // A slot that came to the job while it waited and that it did
         // not take: it stopped first.
         self.catalog.leave_line(&job_holder(lease));
@@ -594,14 +606,19 @@ where
         }
     }
 
-    async fn post_extent(&self, lease: &Lease, job: &JobExtent) -> core::result::Result<(), Stop> {
+    async fn post_extent(
+        &self,
+        lease: &Lease,
+        job: &JobExtent,
+        charge: Option<&Charge>,
+    ) -> core::result::Result<(), Stop> {
         let extent = &job.extent;
         // A job that comes back to an extent it has posted already (a
         // crash before the stage moved on, a revived obligation) needs no
         // provider: it only writes the recovery record again.
         let stored = self.catalog.stored_plan(&extent.id).await?;
         if !stored.rows.is_empty() && stored.rows.iter().all(|a| a.state == ArticleState::Posted) {
-            self.load_planned(lease, extent, stored).await?;
+            self.load_planned(lease, extent, stored, charge).await?;
             return self.to_verify(lease).await;
         }
         let holder = job_holder(lease);
@@ -715,7 +732,7 @@ where
         // the renewal interval, as after any renewal.
         let (turned_away, loaded) = join(
             self.connect_all(lease, &mut held, kept_at),
-            self.load_planned(lease, extent, stored),
+            self.load_planned(lease, extent, stored, charge),
         )
         .await;
         let mut loaded = match loaded {
@@ -859,18 +876,27 @@ where
     /// was stored before this job (a retry, a lost race), and each must
     /// be the shard the stored addendum describes: one that is not fails
     /// the job before anything is posted.
-    async fn load_planned(
+    async fn load_planned<'c>(
         &self,
         lease: &Lease,
         extent: &ExtentRow,
         stored: StoredPlan,
-    ) -> core::result::Result<Loaded, Stop> {
+        charge: Option<&'c Charge>,
+    ) -> core::result::Result<Loaded<'c>, Stop> {
         let started = self.clock.now();
-        let cipher = self
+        let len =
+            usize::try_from(extent.cipher_size).map_err(|_| Stop::fail(FailClass::Corrupt))?;
+        let mut cipher = match charge {
+            Some(charge) => charge.lend(len),
+            None => Lent::own(len),
+        };
+        if !self
             .safety
-            .get(&extent.id.safety_key(), None)
+            .get_into(&extent.id.safety_key(), &mut cipher)
             .await?
-            .ok_or(Stop::fail(FailClass::BlobError))?;
+        {
+            return Err(Stop::fail(FailClass::BlobError));
+        }
         // Only the exact sealed ciphertext is ever posted.
         if cipher.len() as u64 != extent.cipher_size || sha256(&cipher) != extent.cipher_sha256 {
             return Err(Stop::fail(FailClass::Corrupt));
@@ -1066,7 +1092,7 @@ where
         &'a self,
         lease: &Lease,
         extent: &ExtentRow,
-        loaded: &mut Loaded,
+        loaded: &mut Loaded<'_>,
         order: &[&'a ProviderConfig],
         cooling: Option<UnixMs>,
         first: Opened<'a, C, N, T>,
@@ -1417,13 +1443,25 @@ where
             .saturating_add(u64::from(self.cfg.post_sockets) * POST_SOCKET_BYTES)
             .saturating_add(shard_bytes)
             .min(room);
-        let Ok(_charge) = self.budget.charge_job(bytes).await else {
+        let Ok(charge) = self
+            .budget
+            .charge_job_extent(bytes, extent.cipher_size)
+            .await
+        else {
             return Err(Stop::NoPermit);
         };
-        let cipher = match self.safety.get(&extent.id.safety_key(), None).await {
-            Ok(Some(cipher)) => cipher,
-            _ => return Ok(false),
+        let Ok(len) = usize::try_from(extent.cipher_size) else {
+            return Ok(false);
         };
+        let mut cipher = charge.lend(len);
+        match self
+            .safety
+            .get_into(&extent.id.safety_key(), &mut cipher)
+            .await
+        {
+            Ok(true) => {}
+            _ => return Ok(false),
+        }
         if cipher.len() as u64 != extent.cipher_size || sha256(&cipher) != extent.cipher_sha256 {
             return Ok(false);
         }

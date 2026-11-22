@@ -257,6 +257,21 @@ pub trait BlobStore {
     }
     /// `None` = absent. With a span, exactly that range.
     async fn get(&self, key: &str, span: Option<ByteSpan>) -> Result<Option<Vec<u8>>>;
+    /// The whole object into `out`, which is emptied first: `false` =
+    /// absent. For a caller that reuses one buffer for object after
+    /// object (a post job's extent): an adapter that overrides it reads
+    /// into `out` and never allocates a second copy when `out` already
+    /// has room. This default copies what [`BlobStore::get`] returns.
+    async fn get_into(&self, key: &str, out: &mut Vec<u8>) -> Result<bool> {
+        out.clear();
+        match self.get(key, None).await? {
+            Some(bytes) => {
+                out.extend_from_slice(&bytes);
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
     /// Object size, `None` = absent.
     async fn head(&self, key: &str) -> Result<Option<u64>>;
     /// Idempotent. Refuses a recovery record (any key under `m/`, which

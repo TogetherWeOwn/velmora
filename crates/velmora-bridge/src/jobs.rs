@@ -197,6 +197,20 @@ pub fn parity_job_bytes(cipher_size: u64, parity: usize) -> u64 {
     (parity as u64).saturating_add(2).saturating_mul(shard)
 }
 
+/// The extent buffers an isolate keeps between post jobs
+/// ([`crate::ingress::ByteBudget::with_extent_pool`]): as many as post
+/// jobs of the largest extent fit its job budget at once, at least one.
+pub fn extent_pool_buffers(
+    job_budget_bytes: u64,
+    max_extent_bytes: u64,
+    post_sockets: u32,
+) -> usize {
+    let job = job_bytes(OutboxStage::Post, max_extent_bytes, post_sockets).max(1);
+    usize::try_from(job_budget_bytes / job)
+        .unwrap_or(usize::MAX)
+        .max(1)
+}
+
 /// Where a drain stops: 90 % of the cap, so that a tier sitting at the
 /// cap is not evicted a little on every run.
 pub fn low_watermark(cap: u64) -> u64 {
@@ -408,16 +422,25 @@ where
         // A job larger than the whole budget still has to run: alone.
         let bytes = bytes.min(self.budget.job_capacity());
         let waited_from = self.clock.now();
-        let charged = self.budget.charge_job(bytes).await;
+        // A post job reads its extent into the buffer of its charge: a
+        // spare one of the isolate when one fits.
+        let charged = match stage {
+            OutboxStage::Post => {
+                self.budget
+                    .charge_job_extent(bytes, row.extent.cipher_size)
+                    .await
+            }
+            _ => self.budget.charge_job(bytes).await,
+        };
         let wait_ms = self.clock.now().0 - waited_from.0;
         crate::trace::note(extent, |t| t.wait_ms = wait_ms);
-        let Ok(_charge) = charged else {
+        let Ok(charge) = charged else {
             // No memory right now is not a failure of the extent: give the
             // lease back without spending an attempt.
             return settle(&self.catalog, &self.clock, lease, Stop::NoPermit).await;
         };
         match stage {
-            OutboxStage::Post => self.post_stage(lease, &row).await,
+            OutboxStage::Post => self.post_stage_in(lease, &row, Some(&charge)).await,
             OutboxStage::Verify => self.verify_stage(lease, &row).await,
             _ => self.release_stage(lease, &row).await,
         }
