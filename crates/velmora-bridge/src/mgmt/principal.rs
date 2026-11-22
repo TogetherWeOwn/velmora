@@ -34,8 +34,8 @@
 //!    What the unit answers:
 //!    - `admitted`: go on with the `rid`, the subject and the `keys_seq`
 //!      of the answer (a re-ask keeps the first ones). Asked again
-//!      (`again`), the call first reads the chain above `keys_seq`: a
-//!      record that carries the `rid` is being applied, so
+//!      (`again`), the call first reads the record at `keys_seq + 1`: a
+//!      record there that carries the `rid` is being applied, so
 //!      `409 idempotency_key_in_use` with `Retry-After: 30`.
 //!    - `applied`: the unit holds the record, perhaps closed (AM-9: the
 //!      directory has not acknowledged it). The stores are brought to the
@@ -238,8 +238,9 @@ pub enum ChainWrite {
 /// reservation's `rid` in the record's door part (AM-38).
 #[allow(async_fn_in_trait)]
 pub trait PrincipalChain {
-    /// The record above `above` that carries `rid`, if one does, read
-    /// from the chain's head now.
+    /// The record at `above + 1`, if it carries `rid`, read from the
+    /// chain's head now (one read, AM-55: a record of a reservation can
+    /// only sit at its `keys_seq + 1`).
     async fn carrying(
         &self,
         tenant: &TenantId,

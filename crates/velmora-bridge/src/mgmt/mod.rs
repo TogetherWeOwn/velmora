@@ -5,6 +5,8 @@
 //! public handler has no `/v1` router at all. This module holds what the
 //! plane checks before any handler runs.
 //!
+//! - [`adapters`]: the ports of the handlers over the tenancy plane's
+//!   stores (the tenant head, the root unit, the key chain).
 //! - [`gate`]: what every call passes before its handler runs.
 //! - [`idem`]: `Idempotency-Key` for the capped opening calls, through
 //!   the root unit's reservation.
@@ -17,6 +19,7 @@
 //! - [`token`]: the service tokens, their classes and scopes, and the
 //!   records that disable one.
 
+pub mod adapters;
 pub mod gate;
 pub mod idem;
 pub mod principal;
