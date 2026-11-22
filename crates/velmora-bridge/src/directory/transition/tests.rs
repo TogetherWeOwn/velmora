@@ -2945,3 +2945,268 @@ fn a_floor_ahead_of_the_clock_and_an_undo_of_another_deletion_are_refused() {
         FORBIDDEN
     );
 }
+
+/// AM-69: a managed tenant's record is keyless only before its first key
+/// version or as the stub, so no record of a live tenant may follow its
+/// first commit with a lower `tk_version`. Every change, by every actor,
+/// at every head below: whatever is written keeps or raises the version,
+/// and the stub takes no record at all.
+#[test]
+fn no_transition_lowers_the_key_version_and_the_stub_takes_nothing() {
+    let provisioning = match step(None, create(), Actor::TenantCreation) {
+        Ok(Outcome::Next(r)) => r,
+        _ => panic!("create"),
+    };
+    let claimed = apply(
+        &provisioning,
+        Change::ClaimKeyVersion { version: 1 },
+        Actor::TenantCreation,
+    );
+    let a = active();
+    let rotating = apply(
+        &a,
+        Change::ClaimKeyVersion { version: 2 },
+        Actor::RotationJob,
+    );
+    let rotated = apply(&rotating, commit(2), Actor::RotationJob);
+    let suspended = apply(
+        &rotated,
+        billing_hold(Some(HoldMode::ReadOnly)),
+        Actor::Billing,
+    );
+    let restoring = apply(&a, Change::SetRestoring { unit: 0 }, Actor::Operator);
+    let with_bucket = apply(&a, create_bucket(1, 0), Actor::Customer);
+    let deleting = apply(
+        &rotated,
+        delete_by(Actor::Customer, DeletionReason::CustomerRequest, 7 * DAY, 1),
+        Actor::Customer,
+    );
+    let shredding = match next(
+        &deleting.door.tenant,
+        Some(&deleting),
+        &Change::StartShred,
+        Actor::ShredJob,
+        UnixMs(NOW.0 + 7 * DAY),
+    ) {
+        Ok(Outcome::Next(r)) => r,
+        _ => panic!("shred"),
+    };
+    let stub = apply(&shredding, Change::FinishShred, Actor::ShredJob);
+    assert_eq!(stub.door.tk_version, 2, "the stub keeps the last version");
+    let zero = tenant_zero();
+    let moving = moving();
+
+    let floor = |ms| Change::SetMoveFloor {
+        unit: 0,
+        floor: UnixMs(ms),
+        zero: Box::new(moving.door.clone()),
+    };
+    let changes = vec![
+        create(),
+        Change::CreateTenantZero {
+            jurisdiction: "us".into(),
+        },
+        Change::ClaimKeyVersion { version: 1 },
+        Change::ClaimKeyVersion { version: 2 },
+        Change::ClaimKeyVersion { version: 3 },
+        Change::VoidKeyClaim { version: 1 },
+        Change::VoidKeyClaim { version: 2 },
+        commit(1),
+        commit(2),
+        commit(3),
+        Change::Activate {
+            external_ref: Some("ws_2".into()),
+        },
+        billing_hold(Some(HoldMode::Locked)),
+        billing_hold(None),
+        operator_hold(HoldMode::ReadOnly, OperatorReason::Legal, None),
+        Change::SetOperatorHold { hold: None },
+        delete_by(Actor::Customer, DeletionReason::CustomerRequest, 7 * DAY, 2),
+        Change::UndoDeletion { deletion_seq: ANY },
+        Change::SetLimits {
+            base_seq: ANY,
+            limits: BTreeMap::new(),
+            rate_json: None,
+        },
+        Change::SetFeatures {
+            base_seq: ANY,
+            features_json: Default::default(),
+        },
+        Change::SetUnits {
+            base_seq: ANY,
+            units: vec![0, 1],
+            placements: vec![],
+        },
+        Change::SetRestoring { unit: 0 },
+        Change::LiftRestoring {
+            unit: 0,
+            since_seq: restoring.door.seq,
+        },
+        create_bucket(2, 0),
+        Change::DropBucket { bucket: bid(1) },
+        Change::PlaceMovedBuckets {
+            buckets: vec![bid(9)],
+            unit: 0,
+            zero: Box::new(moving.door.clone()),
+        },
+        floor(NOW.0),
+        Change::SetEscrowOffline,
+        Change::ClearEscrowOffline {
+            destroyed: vec![hash(7)],
+        },
+        Change::StartMove {
+            to: t1(),
+            catalogue_id_frozen: "main".into(),
+        },
+        Change::FlipMove { stamp: 3 },
+        Change::GiveUpMove,
+        Change::UndoMove {
+            undo_stamp: 4,
+            catalogue_id: "main2".into(),
+        },
+        Change::UndoMoveOntoFrozen {
+            undo_stamp: 4,
+            levelled_to: 3,
+        },
+        Change::RetireTenantZero,
+        Change::StartShred,
+        Change::FinishShred,
+    ];
+    let actors = [
+        Actor::Customer,
+        Actor::Billing,
+        Actor::Operator,
+        Actor::TenantCreation,
+        Actor::RotationJob,
+        Actor::ShredJob,
+        Actor::RestoreTool,
+        Actor::MoveTool,
+    ];
+    let heads = [
+        &provisioning,
+        &claimed,
+        &a,
+        &rotating,
+        &rotated,
+        &suspended,
+        &restoring,
+        &with_bucket,
+        &deleting,
+        &shredding,
+        &stub,
+        &zero,
+        &moving,
+    ];
+    let mut written = 0;
+    for head in heads {
+        for change in &changes {
+            for actor in actors {
+                for now in [NOW, UnixMs(NOW.0 + 8 * DAY)] {
+                    let mut change = change.clone();
+                    if let Change::SetLimits { base_seq, .. }
+                    | Change::SetFeatures { base_seq, .. }
+                    | Change::SetUnits { base_seq, .. } = &mut change
+                    {
+                        *base_seq = head.door.seq;
+                    }
+                    if let Change::UndoDeletion { deletion_seq } = &mut change {
+                        *deletion_seq = head.door.deletion.as_ref().map_or(0, |d| d.seq);
+                    }
+                    let Ok(Outcome::Next(r)) =
+                        next(&head.door.tenant, Some(head), &change, actor, now)
+                    else {
+                        continue;
+                    };
+                    written += 1;
+                    assert_ne!(
+                        head.door.lifecycle,
+                        Lifecycle::Shredded,
+                        "{change:?} by {actor:?} followed the stub"
+                    );
+                    assert!(
+                        r.door.tk_version >= head.door.tk_version,
+                        "{change:?} by {actor:?} lowered tk_version {} to {}",
+                        head.door.tk_version,
+                        r.door.tk_version
+                    );
+                }
+            }
+        }
+    }
+    // The sweep reached real transitions, not only refusals.
+    assert!(written > 50, "{written}");
+}
+
+/// AM-74 (Q30): `SetMoveFloor` asks for the unit to be listed on the
+/// tenant, and for a floor at most `MAX_FLOOR_AHEAD_MS` (5 minutes) ahead
+/// of the record's `written_at`; nothing else binds it.
+#[test]
+fn a_move_floor_needs_a_listed_unit_and_at_most_five_minutes_ahead() {
+    assert_eq!(MAX_FLOOR_AHEAD_MS, 5 * 60_000);
+    let owner = active();
+    let moving = moving();
+    let floor = |unit, ms| Change::SetMoveFloor {
+        unit,
+        floor: UnixMs(ms),
+        zero: Box::new(moving.door.clone()),
+    };
+    assert_eq!(
+        refused(&owner, floor(1, NOW.0), Actor::MoveTool),
+        UNIT_NOT_LISTED
+    );
+    assert_eq!(UNIT_NOT_LISTED.code, "unit_not_listed");
+    assert_eq!(
+        refused(
+            &owner,
+            floor(0, NOW.0 + MAX_FLOOR_AHEAD_MS + 1),
+            Actor::RestoreTool
+        ),
+        INVALID
+    );
+    let f = apply(
+        &owner,
+        floor(0, NOW.0 + MAX_FLOOR_AHEAD_MS),
+        Actor::RestoreTool,
+    );
+    assert_eq!(f.door.written_at, NOW);
+    assert_eq!(
+        f.door.move_floors.get(&0),
+        Some(&UnixMs(NOW.0 + MAX_FLOOR_AHEAD_MS))
+    );
+    // The bound is the record's own time, not a fixed date.
+    let later = UnixMs(NOW.0 + DAY);
+    let Ok(Outcome::Next(g)) = next(
+        &owner.door.tenant,
+        Some(&f),
+        &floor(0, later.0 + MAX_FLOOR_AHEAD_MS),
+        Actor::MoveTool,
+        later,
+    ) else {
+        panic!("a floor within 5 minutes of a later clock");
+    };
+    assert_eq!(g.door.written_at, later);
+    // A listed unit other than the root takes a floor too.
+    let two = apply(
+        &owner,
+        Change::SetUnits {
+            base_seq: ANY,
+            units: vec![0, 2],
+            placements: vec![],
+        },
+        Actor::Operator,
+    );
+    let h = apply(&two, floor(2, NOW.0), Actor::MoveTool);
+    assert_eq!(h.door.move_floors.get(&2), Some(&NOW));
+}
+
+/// AM-79: the call key hash is the record's own; the next record does not
+/// carry it.
+#[test]
+fn the_call_key_hash_is_not_carried() {
+    let mut a = active();
+    a.door.call_key_hash = Some(hash(5));
+    let b = apply(&a, billing_hold(Some(HoldMode::ReadOnly)), Actor::Billing);
+    assert_eq!(b.door.call_key_hash, None);
+    let json = serde_json::to_value(&b.door).unwrap();
+    assert!(json.get("call_key_hash").is_none());
+}
