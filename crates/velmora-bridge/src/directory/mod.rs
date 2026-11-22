@@ -17,6 +17,8 @@
 //!   the chains, and the read-only comparison of the two;
 //! - [`fence`]: the move's freeze of tenant 0's D1 catalogue: the cutover
 //!   marker, the freeze triggers, the legacy stamp, and the thaw;
+//! - [`move_copy`]: the move's copy of the frozen D1's rows into the
+//!   owner's root unit, by bounded pages and resumable import batches;
 //! - [`tenant_zero`]: whether tenant 0 may be served from the D1
 //!   catalogue, from its record and the database's own marker, and the
 //!   route of a request when the directory cannot be read.
@@ -27,6 +29,7 @@
 pub mod chain;
 pub mod fence;
 pub mod gate;
+pub mod move_copy;
 pub mod record;
 pub mod store;
 pub mod tenant_zero;
