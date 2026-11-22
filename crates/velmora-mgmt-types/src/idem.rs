@@ -22,10 +22,13 @@
 //!    after the apply; an unapplied reservation is released after 1 h.
 //!    - same scope and fingerprint, `applied`: the stored answer, with
 //!      `secret_access_key: null` for a key;
-//!    - same scope and fingerprint, `reserved`: `409
-//!      idempotency_key_in_use` with `Retry-After: 30` if a record names
-//!      the reservation (the finisher applies it); otherwise the call is
-//!      admitted again under the same reservation. A put that loses to a
+//!    - same scope and fingerprint, `reserved`: each reservation gets a
+//!      random 128-bit `rid` at its first admit, kept by every re-ask,
+//!      and every record of a reserved call carries it in its door part.
+//!      If a record above the reservation's `keys_seq` carries its `rid`:
+//!      `409 idempotency_key_in_use` with `Retry-After: 30` (the finisher
+//!      applies it); otherwise the call is admitted again under the same
+//!      reservation. A put that loses to a
 //!      record of its own reservation answers from that record and never
 //!      applies its own bytes;
 //!    - same scope, another fingerprint: `422 idempotency_key_reused`,

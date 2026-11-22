@@ -128,8 +128,8 @@ pub enum KofraMapping {
 pub enum TenancyMapping {
     /// `Retry`.
     Retry,
-    /// `Retry`, and a page: the same `Idempotency-Key` came with another
-    /// request, which is a `kofra-api` fault.
+    /// `Retry`, and a page: a `kofra-api` or deploy fault (the same
+    /// `Idempotency-Key` with another request, or an `Upstream` code).
     RetryAndPage,
     /// `Gone`: the workspace is closed.
     Gone,
@@ -324,12 +324,17 @@ impl Code {
     }
 
     /// What the `Tenancy` port does with this code: `Gone` for
-    /// `external_ref_retired`, a `Retry` with a page for a reused key,
-    /// and `Retry` for every other code.
+    /// `external_ref_retired`; a `Retry` with a page for a reused key and
+    /// for every `Upstream` code (each one a `kofra-api` or deploy fault,
+    /// such as a wrong token at sign-up, which must not retry in
+    /// silence); and `Retry` for every other code. A code this crate does
+    /// not know is `Upstream`: `Retry` with a page.
     pub fn tenancy(self) -> TenancyMapping {
         match self.kofra() {
             KofraMapping::TenancyGone => TenancyMapping::Gone,
-            KofraMapping::IdempotencyKeyReused => TenancyMapping::RetryAndPage,
+            KofraMapping::IdempotencyKeyReused | KofraMapping::Upstream => {
+                TenancyMapping::RetryAndPage
+            }
             _ => TenancyMapping::Retry,
         }
     }

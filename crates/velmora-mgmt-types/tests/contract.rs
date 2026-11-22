@@ -112,51 +112,53 @@ fn built_path(ex: &Example) -> String {
     let list = |limit| List { after: None, limit };
     match ex.call {
         "Tenancy::create_tenant" => paths::tenants(),
-        "Tenancy::create_principal" => paths::principals(TENANT),
-        "tenant" => paths::tenant(TENANT),
-        "tenant_reach" => paths::tenant_reach(TENANT),
-        "delete_tenant" => paths::tenant_delete(TENANT, 30),
-        "restore_tenant" => paths::tenant_restore(TENANT),
+        "Tenancy::create_principal" => paths::principals(TENANT).unwrap(),
+        "tenant" => paths::tenant(TENANT).unwrap(),
+        "tenant_reach" => paths::tenant_reach(TENANT).unwrap(),
+        "delete_tenant" => paths::tenant_delete(TENANT, 30).unwrap(),
+        "restore_tenant" => paths::tenant_restore(TENANT).unwrap(),
         "buckets" => paths::with_query(
-            paths::buckets(TENANT),
+            paths::buckets(TENANT).unwrap(),
             &BucketQuery::Page(list(100)).to_query(),
         ),
         "(name lookup)" => paths::with_query(
-            paths::buckets(TENANT),
+            paths::buckets(TENANT).unwrap(),
             &BucketQuery::Names(vec!["photos".into(), "gone".into()]).to_query(),
         ),
-        "bucket" | "delete_bucket" => paths::bucket(TENANT, BUCKET),
-        "create_bucket" => paths::buckets(TENANT),
+        "bucket" | "delete_bucket" => paths::bucket(TENANT, BUCKET).unwrap(),
+        "create_bucket" => paths::buckets(TENANT).unwrap(),
         "keys" => paths::with_query(
-            paths::keys(TENANT),
+            paths::keys(TENANT).unwrap(),
             &KeyQuery {
                 kind: Some(KeyKind::S3),
                 list: list(100),
             }
             .to_query(),
         ),
-        "key" | "update_key" | "revoke_key" => paths::key(TENANT, KEY),
-        "create_key" => paths::keys(TENANT),
-        "usage" => paths::usage(TENANT),
+        "key" | "update_key" | "revoke_key" => paths::key(TENANT, KEY).unwrap(),
+        "create_key" => paths::keys(TENANT).unwrap(),
+        "usage" => paths::usage(TENANT).unwrap(),
         "usage_days" => paths::with_query(
-            paths::usage_days(TENANT),
+            paths::usage_days(TENANT).unwrap(),
             &UsageDaysQuery {
                 after_day: velmora_mgmt_types::position::Day::new(2026, 11, 1),
                 list: list(1),
             }
             .to_query(),
         ),
-        "usage_buckets" => paths::with_query(paths::usage_buckets(TENANT), &list(100).to_query()),
+        "usage_buckets" => {
+            paths::with_query(paths::usage_buckets(TENANT).unwrap(), &list(100).to_query())
+        }
         "events" => paths::with_query(
-            paths::events(TENANT),
+            paths::events(TENANT).unwrap(),
             &List {
                 after: Some(EventPosition { epoch: 1, seq: 40 }.encode()),
                 limit: 100,
             }
             .to_query(),
         ),
-        "objects" => paths::objects_list(TENANT),
-        "presign" => paths::objects_presign(TENANT),
+        "objects" => paths::objects_list(TENANT).unwrap(),
+        "presign" => paths::objects_presign(TENANT).unwrap(),
         other => panic!("no path for {other}"),
     }
 }
@@ -281,6 +283,14 @@ fn an_answer_takes_a_field_it_does_not_know() {
 #[test]
 fn request_checks() {
     let tc = |j: &str| parse_request::<TenantCreate>(j.as_bytes()).map(|_| ());
+    // The principal-create key `<external_ref>/<owner_ref>` fits 255.
+    let longest = "w".repeat(ids::MAX_EXTERNAL_REF_BYTES);
+    assert!(ids::valid_external_ref(&longest));
+    assert!(!ids::valid_external_ref(&format!("{longest}w")));
+    assert!(ids::valid_idempotency_key(&format!(
+        "{longest}/{}",
+        "u".repeat(128)
+    )));
     assert_eq!(
         tc(r#"{"external_ref":"ws 1","jurisdiction":"us"}"#),
         Err(Code::BadRequest)
@@ -484,7 +494,8 @@ fn the_largest_key_fits_the_stored_answer() {
     let key = Key {
         id: "A".repeat(ids::MAX_KEY_ID_BYTES),
         kind: KeyKind::S3,
-        name: Some("\u{FFFF}".repeat(ids::MAX_KEY_NAME_CHARS)),
+        // The widest characters: 4 bytes each.
+        name: Some("\u{10FFFF}".repeat(ids::MAX_KEY_NAME_CHARS)),
         status: KeyStatus::Active,
         grants,
         created_at_ms: MAX_SAFE_INTEGER,
@@ -532,7 +543,7 @@ fn the_key_update_fingerprint_leaves_out_if_seq() {
         a.fingerprint_body(),
         br#"{"grants":[{"bucket_id":"b_00aa11bb22cc33dd","access":"rw"}]}"#
     );
-    let path = paths::key(TENANT, KEY);
+    let path = paths::key(TENANT, KEY).unwrap();
     let f = |u: &KeyUpdate| {
         fingerprint(
             TokenClass::Confirmed,
@@ -553,6 +564,24 @@ fn the_key_update_fingerprint_leaves_out_if_seq() {
         ..a.clone()
     };
     assert_ne!(f(&narrowed), f(&a));
+    // The same list in another order is the same request.
+    let two = |first: &str, second: &str| -> KeyUpdate {
+        serde_json::from_str(&format!(
+            r#"{{"grants":[{{"bucket_id":"{first}","access":"rw"}},{{"bucket_id":"{second}","access":"ro"}}],"if_seq":1}}"#
+        ))
+        .unwrap()
+    };
+    let (x, y) = ("b_0000000000000001", "b_0000000000000002");
+    let swapped: KeyUpdate = serde_json::from_str(&format!(
+        r#"{{"grants":[{{"bucket_id":"{y}","access":"ro"}},{{"bucket_id":"{x}","access":"rw"}}],"if_seq":1}}"#
+    ))
+    .unwrap();
+    assert_eq!(f(&two(x, y)), f(&swapped));
+    assert_ne!(
+        f(&two(x, y)),
+        f(&two(y, x)),
+        "access moved to the other bucket"
+    );
 }
 
 #[test]
@@ -710,10 +739,13 @@ fn the_kofra_api_mapping() {
         Code::CapReached,
         Code::ServiceUnavailable,
         Code::IdempotencyKeyInUse,
-        Code::InternalError,
-        Code::Unauthenticated,
+        Code::TenantRestoring,
     ] {
         assert_eq!(c.tenancy(), TenancyMapping::Retry, "{}", c.as_str());
+    }
+    // A kofra-api or deploy fault at sign-up pages: it must not retry in silence.
+    for c in Code::ALL.into_iter().filter(|c| c.kofra() == K::Upstream) {
+        assert_eq!(c.tenancy(), TenancyMapping::RetryAndPage, "{}", c.as_str());
     }
 }
 
@@ -797,4 +829,97 @@ fn positions_of_the_lists() {
     }
     assert_eq!(query::DEFAULT_LIMIT, 100);
     assert_eq!(query::LIMITS, 1..=1000);
+}
+
+/// Every code, exactly as the contract's table gives it.
+#[test]
+fn the_code_table_literally() {
+    use KofraMapping as K;
+    let table: [(&str, u16, bool, KofraMapping); 38] = [
+        ("bad_request", 400, false, K::Upstream),
+        ("grant_limits_not_served", 400, false, K::Upstream),
+        ("idempotency_key_required", 400, false, K::Upstream),
+        ("invalid_position", 400, false, K::InvalidCursor),
+        ("unauthenticated", 401, false, K::Upstream),
+        ("insufficient_scope", 403, false, K::Upstream),
+        ("internal_key_refused", 403, false, K::Upstream),
+        ("acting_principal_unknown", 403, false, K::Upstream),
+        ("acting_principal_inactive", 403, false, K::Upstream),
+        ("grant_not_held", 403, false, K::GrantNotHeld),
+        ("not_found", 404, false, K::Upstream),
+        ("method_not_allowed", 405, false, K::Upstream),
+        ("tenant_not_found", 404, false, K::Upstream),
+        ("principal_not_found", 404, false, K::Upstream),
+        ("bucket_not_found", 404, false, K::BucketNotFound),
+        ("key_not_found", 404, false, K::KeyNotFound),
+        ("bucket_already_exists", 409, false, K::BucketAlreadyExists),
+        ("bucket_not_empty", 409, false, K::BucketNotEmpty),
+        ("key_limit_reached", 409, false, K::KeyLimitReached),
+        ("grant_limit_reached", 409, false, K::GrantLimitReached),
+        ("feed_reset", 409, false, K::FeedReset),
+        (
+            "deletion_already_requested",
+            409,
+            false,
+            K::DeletionAlreadyRequested,
+        ),
+        (
+            "deletion_not_requested",
+            409,
+            false,
+            K::DeletionNotRequested,
+        ),
+        ("deletion_final", 409, false, K::DeletionFinal),
+        ("deletion_replayed", 409, false, K::IdempotencyKeyReused),
+        ("tenant_read_only", 409, false, K::AccountReadOnly),
+        ("tenant_unavailable", 409, false, K::AccountUnavailable),
+        ("tenant_restoring", 409, true, K::Unavailable),
+        ("key_changed", 409, false, K::RereadKey),
+        ("principal_exists", 409, false, K::Upstream),
+        ("actor_not_permitted", 403, false, K::DeletionNotCancellable),
+        ("key_moved", 409, true, K::Unavailable),
+        ("external_ref_retired", 409, false, K::TenancyGone),
+        ("idempotency_key_in_use", 409, true, K::IdempotencyKeyInUse),
+        (
+            "idempotency_key_reused",
+            422,
+            false,
+            K::IdempotencyKeyReused,
+        ),
+        ("cap_reached", 429, true, K::Busy),
+        ("service_unavailable", 503, true, K::Unavailable),
+        ("internal_error", 500, false, K::Upstream),
+    ];
+    for (i, (name, status, retry_after, kofra)) in table.into_iter().enumerate() {
+        let c = Code::ALL[i];
+        assert_eq!(c.as_str(), name);
+        assert_eq!(c.status(), status, "{name}");
+        assert_eq!(c.retry_after(), retry_after, "{name}");
+        assert_eq!(c.kofra(), kofra, "{name}");
+    }
+}
+
+#[test]
+fn the_event_types_are_the_contracts() {
+    assert_eq!(
+        EVENT_TYPES,
+        [
+            "bucket.created",
+            "bucket.deleted",
+            "key.created",
+            "key.updated",
+            "key.disabled",
+            "key.revoked",
+            "principal.created",
+            "principal.updated",
+            "principal.revoked",
+            "tenant.suspended",
+            "tenant.resumed",
+            "tenant.deletion_scheduled",
+            "tenant.deletion_cancelled",
+            "presign.write",
+            "presign.read_hour",
+            "presign.refused",
+        ]
+    );
 }
