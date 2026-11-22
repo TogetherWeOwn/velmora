@@ -83,6 +83,8 @@ struct Obj<'a> {
     lose_answer_of: Cell<Option<&'static str>>,
     /// Another writer raises the stamp after every stamp read.
     raise_after_each_read: Cell<bool>,
+    /// Calls of this op are answered with this, not by the unit.
+    answer_of: RefCell<Option<(&'static str, UnitAnswer)>>,
     safety: &'a MemBlobStore,
 }
 
@@ -107,6 +109,15 @@ impl UnitReplies for Obj<'_> {
         self.log
             .borrow_mut()
             .push((call.kind, call.listed, op_name(&call.op)));
+        if let Some((op, answer)) = self.answer_of.borrow().as_ref() {
+            if *op == op_name(&call.op) {
+                return Ok(UnitReply {
+                    answer: answer.clone(),
+                    lease_left_ms: 0,
+                    revoked: None,
+                });
+            }
+        }
         let reply = self.unit.reply(call, self.clock.now());
         if let UnitOp::Job {
             call: JobCall::stamp { catalogue },
@@ -457,6 +468,7 @@ fn with_rig<R>(f: impl FnOnce(&Rig<'_>) -> R) -> R {
             after_stamp_read: RefCell::new(None),
             lose_answer_of: Cell::new(None),
             raise_after_each_read: Cell::new(false),
+            answer_of: RefCell::new(None),
             safety: &safety,
         },
     };
@@ -844,6 +856,7 @@ fn an_unborn_unit_is_reported() {
             after_stamp_read: RefCell::new(None),
             lose_answer_of: Cell::new(None),
             raise_after_each_read: Cell::new(false),
+            answer_of: RefCell::new(None),
             safety: &safety,
         },
     };
@@ -1114,6 +1127,60 @@ fn a_renew_job_whose_call_fails_is_handed_back() {
             (job.delivery, job.code),
             (Delivery::HandBack, "renew_failed")
         );
+    });
+}
+
+/// A unit answer no rule expects (a failed unit, a refusal outside
+/// AM-50's table) sends a unit job to the dead-letter queue with a page;
+/// a store or call failure is handed back (review MEDIUM 4).
+#[test]
+fn an_unexpected_answer_dead_letters_the_job_and_pages() {
+    use velmora_bridge::unit::Refused;
+    with_fresh(|rig| {
+        *rig.obj.answer_of.borrow_mut() = Some((
+            "job:stamp",
+            UnitAnswer::Failed {
+                class: "boom".into(),
+            },
+        ));
+        for job in [UnitJob::Renew { at: NOW }, UnitJob::StampRaise { at: NOW }] {
+            let r = block_on(rig.client().run_job(job, rig.unit_seqs()));
+            assert_eq!(
+                (r.delivery, r.code),
+                (Delivery::DeadLetter, "unit_refused"),
+                "{job:?}"
+            );
+            assert!(
+                matches!(r.pages.as_slice(), [Page::UnitRefused(_)]),
+                "{r:?}"
+            );
+        }
+        // A tenant that is shredding refuses jobs: acknowledged, no page.
+        *rig.obj.answer_of.borrow_mut() = Some((
+            "job:stamp",
+            UnitAnswer::Refused {
+                reason: Refused::AccountProblem,
+                alarm: false,
+            },
+        ));
+        let r = block_on(
+            rig.client()
+                .run_job(UnitJob::Renew { at: NOW }, rig.unit_seqs()),
+        );
+        assert_eq!((r.delivery, r.pages.len()), (Delivery::Ack, 0), "{r:?}");
+        let r = block_on(
+            rig.client()
+                .run_job(UnitJob::StampRaise { at: NOW }, rig.unit_seqs()),
+        );
+        assert_eq!((r.delivery, r.code), (Delivery::Ack, "shredding"), "{r:?}");
+        // A call that fails is handed back, never dead-lettered.
+        *rig.obj.answer_of.borrow_mut() = None;
+        rig.obj.fail.set(true);
+        let r = block_on(
+            rig.client()
+                .run_job(UnitJob::Renew { at: NOW }, rig.unit_seqs()),
+        );
+        assert_eq!(r.delivery, Delivery::HandBack);
     });
 }
 

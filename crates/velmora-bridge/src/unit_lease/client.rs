@@ -161,6 +161,9 @@ pub enum Page {
     /// The finisher could not be told of unrecorded revocations; the
     /// unit holds them all the same.
     FinisherNotTold,
+    /// The unit refused a call of the client in a way no rule expects
+    /// (the fixed text of the error).
+    UnitRefused(&'static str),
 }
 
 /// The most names one page carries.
@@ -234,6 +237,10 @@ pub enum Delivery {
     /// The unit has no certificate: the consumer reads the tenant's
     /// verified head and applies AM-50's `Unborn` row.
     Unborn,
+    /// The unit refused in a way no row of AM-50's table names (a wrong
+    /// name, an unauthenticated call, a failed unit, a refused key apply):
+    /// to the dead-letter queue, with a page (AM-50: "any other refusal").
+    DeadLetter,
 }
 
 /// The delivery of one unit job, and its log line.
@@ -688,7 +695,7 @@ where
         match job {
             UnitJob::Renew { .. } => match self.renew(seqs).await {
                 (Ok(renewal), pages) => renewal_result(renewal, pages),
-                (Err(_), pages) => job_result(Delivery::HandBack, "renew_failed", pages),
+                (Err(e), pages) => failed(&e, "renew_failed", pages),
             },
             UnitJob::StampRaise { .. } => self.raise(seqs).await,
         }
@@ -727,7 +734,7 @@ where
                     match renewal {
                         Ok(Renewal::Renewed { seqs: now, .. }) => seqs = now,
                         Ok(renewal) => return renewal_result(renewal, pages),
-                        Err(_) => return job_result(Delivery::HandBack, "renew_failed", pages),
+                        Err(e) => return failed(&e, "renew_failed", pages),
                     }
                 }
                 (Err(_), Some(Stop::Closed)) => return job_result(Delivery::Ack, "closed", pages),
@@ -747,10 +754,10 @@ where
                         Ok(Synced::NotListed) => {
                             return job_result(Delivery::Ack, "not_listed", pages)
                         }
-                        Err(_) => return job_result(Delivery::HandBack, "sync_failed", pages),
+                        Err(e) => return failed(&e, "sync_failed", pages),
                     }
                 }
-                (Err(_), _) => return job_result(Delivery::HandBack, "raise_failed", pages),
+                (Err(e), _) => return failed(&e, "raise_failed", pages),
             }
         }
         job_result(Delivery::HandBack, "raise_failed", pages)
@@ -858,6 +865,35 @@ fn unit_state(door: &TenantDoor) -> (TenantState, Option<HoldMode>) {
         DirState::Deleting => (TenantState::Deleting, None),
         DirState::Shredding => (TenantState::Shredding, None),
         DirState::Shredded => (TenantState::Shredded, None),
+    }
+}
+
+/// The delivery of a job whose renewal, sync or raise failed with `e`: an
+/// answer of the unit that no rule expects goes to the dead-letter queue
+/// with a page (AM-50); anything else (a store or a call that failed) is
+/// handed back to be retried.
+fn failed(e: &BridgeError, code: &'static str, mut pages: Vec<Page>) -> JobResult {
+    let unexpected = [
+        ERR_RENEW_ANSWER,
+        ERR_SYNC_ANSWER,
+        ERR_KEYS_ANSWER,
+        ERR_KEYS_STUCK,
+        ERR_KEYS_GAP,
+        ERR_KEYS_BELOW,
+        ERR_PING_ANSWER,
+        ERR_STAMP_ANSWER,
+        ERR_LEASE_EXPIRED,
+    ];
+    let hit = unexpected.iter().find_map(|u| match (u, e) {
+        (BridgeError::Invalid(a), BridgeError::Invalid(b)) if a == b => Some(*a),
+        _ => None,
+    });
+    match hit {
+        Some(text) => {
+            pages.push(Page::UnitRefused(text));
+            job_result(Delivery::DeadLetter, "unit_refused", pages)
+        }
+        None => job_result(Delivery::HandBack, code, pages),
     }
 }
 
