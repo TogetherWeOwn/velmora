@@ -977,9 +977,11 @@ fn a_restore_born_unit_lifts_a_move_only_with_its_counters_on() {
             "{at_ms}"
         );
     }
+    // Past the margin it is the lease checks' turn: the unit has its
+    // lease table (u0002) and closed just now, so it is too soon.
     assert_eq!(
         restore(NOW.0 + LIFT_SLACK_MS),
-        Some((Refused::Restore(RestoreRefusal::LeaseUnknown), false))
+        Some((Refused::Restore(RestoreRefusal::TooSoon), false))
     );
 }
 
