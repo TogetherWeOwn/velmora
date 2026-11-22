@@ -65,13 +65,16 @@ fn uses(all: &BTreeMap<String, String>, what: &str) -> BTreeMap<String, usize> {
         .collect()
 }
 
-/// How often each file says `name` other than as `scope.<name>`.
+/// How often each file says `name` other than through `scope` or `scope()`.
 fn unscoped(all: &BTreeMap<String, String>, name: &str) -> BTreeMap<String, usize> {
     all.iter()
         .map(|(file, text)| {
             let n = text
                 .match_indices(name)
-                .filter(|(at, _)| !text[..*at].ends_with("scope."))
+                .filter(|(at, _)| {
+                    let before = &text[..*at];
+                    !before.ends_with("scope.") && !before.ends_with("scope().")
+                })
                 .count();
             (file.clone(), n)
         })
@@ -291,8 +294,8 @@ fn the_id_of_tenant_zero_is_written_in_one_place() {
     );
 }
 
-/// The job path names no blob past its scope, and the places that still
-/// do are the listed ones.
+/// The job path and scoped request handlers name blobs through their
+/// scope. The remaining uses of the flat names are listed here.
 #[test]
 fn a_blob_is_named_without_a_scope_only_at_the_listed_places() {
     let all = all();
@@ -310,14 +313,10 @@ fn a_blob_is_named_without_a_scope_only_at_the_listed_places() {
         &[
             // The two definitions.
             ("bridge/types.rs", 2),
-            // The request path: a request is not scoped yet.
-            ("bridge/fetch.rs", 1),
+            // The legacy admin path.
             ("bridge/service/admin.rs", 3),
-            ("bridge/service/get.rs", 2),
-            // One call, and a variable of the name said twice.
-            ("bridge/service/multipart.rs", 3),
-            ("bridge/service/put.rs", 1),
-            ("bridge/service/slices.rs", 1),
+            // A scoped call whose result is kept in a same-named local.
+            ("bridge/service/multipart.rs", 2),
             // The replay, which goes through the whole store.
             ("bridge/replay.rs", 2),
             // The delete list the catalogue makes for garbage

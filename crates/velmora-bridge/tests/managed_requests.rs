@@ -18,9 +18,10 @@ use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::rc::Rc;
 
-use service_support::{config, pattern, Jobs, NoNntp, Resp, Signer, AKID, T0};
+use service_support::{config, pattern, Jobs, Resp, Signer, AKID, T0};
 use sha2::{Digest, Sha256};
 use velmora::rng::FillRandom;
+use velmora::yenc::{encode_segment, SegmentParams};
 use velmora_bridge::config::Maintenance;
 use velmora_bridge::crypto::scheme2::{
     tk_blob_name, wrap_bdk_v2, wrap_secret_v2, wrap_tenant_key, TenantId, TenantKey,
@@ -42,10 +43,12 @@ use velmora_bridge::recovery::Unpublished;
 use velmora_bridge::request_catalog::RequestCatalog;
 use velmora_bridge::root::request::RequestPort;
 use velmora_bridge::root::{ControlSend, Root, RootCache, RootPorts, UnitPorts};
+use velmora_bridge::service::claimed_access_key;
 use velmora_bridge::service::managed::{finish, prepare, Prepared};
 use velmora_bridge::sql::SqlCatalog;
 use velmora_bridge::testkit::{FixedClock, MemBlobStore, RusqliteSql, TestKek};
-use velmora_bridge::unit::call::HoldMode;
+use velmora_bridge::unit::call::{Closed, HoldMode};
+use velmora_bridge::unit::request::RequestCall;
 use velmora_bridge::unit::request_client::RequestClient;
 use velmora_bridge::unit::{
     BirthKind, BirthToken, CallKind, Seqs, SyncHead, TenantState, Unit, UnitAnswer, UnitCall,
@@ -54,11 +57,13 @@ use velmora_bridge::unit::{
 use velmora_bridge::unit_lease::client::{Synced, UnitReplies};
 use velmora_bridge::unit_lease::lease::Proven;
 use velmora_bridge::{
-    BlobMeta, BlobStore, Bridge, BucketId, ByteSpan, Method, Result, Sql, TenantScope,
+    BlobMeta, BlobStore, BodyOutcome, Bridge, BucketId, ByteSpan, Catalog, Method, NntpConnector,
+    NntpSession, Permit, ProviderConfig, Result, Sql, SqlValue, TenantScope,
 };
 
 const T1: &str = "t_00000000000000c1";
 const SECRET: &str = "managed-request-secret-0123456789";
+const NO_GRANT_AKID: &str = "AKIDNOGRANT000000001";
 const BUCKET: &str = "alpha";
 const PRINCIPAL: &str = "PR0001";
 
@@ -111,11 +116,26 @@ fn bucket_id() -> BucketId {
 struct Object {
     unit: Rc<Unit<RusqliteSql>>,
     calls: Rc<RefCell<Vec<UnitCall>>>,
+    close_on_publication: Rc<Cell<bool>>,
+    request_safety: Blobs,
 }
 
 impl UnitReplies for Object {
     async fn reply(&self, call: &UnitCall) -> Result<UnitReply> {
         self.calls.borrow_mut().push(call.clone());
+        if let (true, UnitOp::Request { call: op }) = (self.close_on_publication.get(), &call.op) {
+            if let RequestCall::commit_generation { record, .. } = op.as_ref() {
+                assert!(self.request_safety.0.contains(&record.key));
+                return Ok(UnitReply {
+                    answer: UnitAnswer::Closed {
+                        seqs: call.seqs.unwrap(),
+                        why: Closed::Restoring,
+                    },
+                    lease_left_ms: 0,
+                    revoked: None,
+                });
+            }
+        }
         Ok(self.unit.reply(call, T0))
     }
 }
@@ -146,6 +166,36 @@ impl BlobStore for Blobs {
     }
 }
 
+const MESSAGE_ID: &str = "test-extent@example.invalid";
+
+/// A single article available to a cold GET. No sockets are opened.
+#[derive(Clone, Default)]
+struct Article(Option<Rc<Vec<u8>>>);
+
+impl NntpConnector for Article {
+    type Session = Self;
+
+    async fn connect(&self, _: &ProviderConfig, _: &Permit) -> Result<Self> {
+        assert!(self.0.is_some(), "unexpected cold read");
+        Ok(self.clone())
+    }
+}
+
+impl NntpSession for Article {
+    async fn post(&mut self, _: &str, _: &[u8]) -> Result<velmora::nntp::PostOutcome> {
+        panic!("the article is read-only")
+    }
+    async fn stat(&mut self, _: &str) -> Result<bool> {
+        panic!("a cold read needs only BODY")
+    }
+    async fn body(&mut self, id: &str, out: &mut Vec<u8>) -> Result<BodyOutcome> {
+        assert_eq!(id, MESSAGE_ID);
+        out.extend_from_slice(self.0.as_ref().unwrap());
+        Ok(BodyOutcome::Found)
+    }
+    async fn quit(self) {}
+}
+
 #[derive(Default)]
 struct Control(RefCell<Vec<String>>);
 
@@ -164,6 +214,8 @@ struct Ports {
     clock: FixedClock,
     unit: Rc<Unit<RusqliteSql>>,
     calls: Rc<RefCell<Vec<UnitCall>>>,
+    close_on_publication: Rc<Cell<bool>>,
+    request_safety: Blobs,
     safety: MemBlobStore,
     control: Control,
 }
@@ -202,6 +254,8 @@ impl UnitPorts for Ports {
         Ok(Object {
             unit: Rc::clone(&self.unit),
             calls: Rc::clone(&self.calls),
+            close_on_publication: Rc::clone(&self.close_on_publication),
+            request_safety: self.request_safety.clone(),
         })
     }
     fn safety(&self) -> &MemBlobStore {
@@ -271,12 +325,14 @@ fn subject(id: &str, kind: SubjectKind) -> Subject {
 /// A managed tenant, active under key 1, with the key locations; its
 /// root unit born, renewed and synced to the head (no directory: every
 /// subject open), holding bucket `alpha` (its key wrapped under tenant
-/// key 1) and an S3 key `AKID` of `PR0001` with `rw` on it.
+/// key 1) and two S3 keys of `PR0001`: `AKID` with `rw` on it, and
+/// `NO_GRANT_AKID` with no grants.
 struct World {
     ports: Rc<Ports>,
     cache: Rc<RootCache>,
     safety: Blobs,
     blobs: Blobs,
+    article: Article,
 }
 
 impl World {
@@ -294,6 +350,8 @@ impl World {
                 "",
             )),
             calls: Rc::default(),
+            close_on_publication: Rc::default(),
+            request_safety: Blobs::default(),
             safety: MemBlobStore::default(),
             control: Control::default(),
         };
@@ -352,7 +410,7 @@ impl World {
                 .door
                 .seq
         });
-        // The key chain: the principal, then its S3 key.
+        // The key chain: the principal, then its two S3 keys.
         let seal = |seq: u64, s: &Subject| {
             seal_key_record(
                 &ports.kek,
@@ -373,13 +431,26 @@ impl World {
         ports
             .records
             .plant(&key_chain(&id()).name(1), seal(1, &principal));
-        let mut s3 = subject(AKID, SubjectKind::S3);
-        let (v, wrapped) =
-            wrap_secret_v2(&ports.kek, &id(), AKID, SECRET.as_bytes(), &mut TestRng(9)).unwrap();
-        s3.door.made_by = Some(PRINCIPAL.into());
-        s3.door.secret_kek_version = Some(v);
-        s3.private.secret_wrapped = Some(wrapped);
-        ports.records.plant(&key_chain(&id()).name(2), seal(2, &s3));
+        for (seq, akid) in [(2, AKID), (3, NO_GRANT_AKID)] {
+            let mut s3 = subject(akid, SubjectKind::S3);
+            if akid == NO_GRANT_AKID {
+                s3.set_grants(&[]);
+            }
+            let (v, wrapped) = wrap_secret_v2(
+                &ports.kek,
+                &id(),
+                akid,
+                SECRET.as_bytes(),
+                &mut TestRng(7 + seq),
+            )
+            .unwrap();
+            s3.door.made_by = Some(PRINCIPAL.into());
+            s3.door.secret_kek_version = Some(v);
+            s3.private.secret_wrapped = Some(wrapped);
+            ports
+                .records
+                .plant(&key_chain(&id()).name(seq), seal(seq, &s3));
+        }
         // The unit: born at the head, its bucket row, renewed, synced.
         let born = ports.unit.handle(
             &UnitCall {
@@ -421,10 +492,11 @@ impl World {
         ))
         .unwrap();
         let world = World {
+            safety: ports.request_safety.clone(),
             ports: Rc::new(ports),
             cache,
-            safety: Blobs::default(),
             blobs: Blobs::default(),
+            article: Article::default(),
         };
         world.renew();
         let root = Root::new(&*world.ports, &world.cache, TestRng(3));
@@ -435,7 +507,7 @@ impl World {
         }))
         .unwrap();
         assert!(
-            matches!(synced, Synced::Synced { seqs } if seqs.keys_seq == 2),
+            matches!(synced, Synced::Synced { seqs } if seqs.keys_seq == 3),
             "{synced:?}"
         );
         world.ports.calls.borrow_mut().clear();
@@ -483,21 +555,72 @@ impl World {
         self.renew();
     }
 
+    /// Put the existing ciphertext only in the fake provider, so a GET
+    /// must verify it and fill the cache rather than read a warm copy.
+    fn make_cold(&mut self, safety_key: &str, extent_id: &str) {
+        let cipher = self.safety.0.stored(safety_key).unwrap().bytes;
+        let size = cipher.len() as u64;
+        let mut body = Vec::new();
+        encode_segment(
+            &mut body,
+            &SegmentParams {
+                name: "test".into(),
+                part: 1,
+                total: 1,
+                begin: 1,
+                end: size,
+                file_size: size,
+            },
+            &cipher,
+        )
+        .unwrap();
+        block_on(self.ports.unit.sql().exec(
+            "INSERT INTO articles(extent_id, idx, message_id, newsgroup, headers, \
+             cipher_offset, cipher_len, payload_sha256, state, provider_id) \
+             VALUES (?1, 0, ?2, 'test', x'', 0, ?3, ?4, 'posted', 'test')",
+            &[
+                SqlValue::Text(extent_id.into()),
+                SqlValue::Text(MESSAGE_ID.into()),
+                SqlValue::Int(i64::try_from(size).unwrap()),
+                SqlValue::Blob(Sha256::digest(&cipher).to_vec()),
+            ],
+        ))
+        .unwrap();
+        self.article = Article(Some(Rc::new(body)));
+        assert!(self.safety.0.lose(safety_key));
+    }
+
     /// One request through the whole managed path, as the Worker serves
     /// it (`units::route_request` and `serve_on_unit`).
-    fn serve(&self, req: service_support::Req) -> (Resp, Vec<&'static str>) {
+    fn serve(
+        &self,
+        req: service_support::Req,
+        maintenance: Maintenance,
+    ) -> (Resp, Vec<&'static str>) {
         let req = req.into_request();
         let floor = Seqs {
             state_seq: 0,
             keys_seq: 0,
         };
-        let cfg = config(Vec::new());
+        let mut cfg = config(Vec::new());
+        cfg.maintenance = maintenance;
+        if self.article.0.is_some() {
+            cfg.providers.push(
+                serde_json::from_value(serde_json::json!({
+                    "id": "test", "host": "example.invalid", "port": 563, "tls": true,
+                    "user": "fixture", "pass": "fixture", "backbone": "test",
+                    "post": false, "read": true, "max_conns": 1, "enabled": true
+                }))
+                .unwrap(),
+            );
+        }
+        let akid = claimed_access_key(&cfg, &req).unwrap();
         let prepared = block_on(async {
             let root = Root::new(&*self.ports, &self.cache, TestRng(4));
             let clients = root.clients();
             let heads = root.heads();
-            let router = root.router(Maintenance::Off, &clients, &heads);
-            prepare(&router, &cfg, &unit_id(), floor, AKID, &req).await
+            let router = root.router(maintenance, &clients, &heads);
+            prepare(&router, &cfg, &unit_id(), floor, &akid, &req).await
         });
         let request = match prepared {
             Prepared::Answer(resp, lines) => {
@@ -512,7 +635,7 @@ impl World {
             Rc::clone(&self.ports),
             Rc::clone(&self.cache),
             || TestRng(5),
-            Maintenance::Off,
+            maintenance,
             request.root.clone(),
             request.root_renew,
             request.routed,
@@ -520,11 +643,12 @@ impl World {
         );
         let client = RequestClient::new(port, unit.unit.clone(), unit.seqs);
         let shared = SqlCatalog::new(RusqliteSql::with_schema().unwrap());
+        block_on(shared.seed_permits(&cfg.providers)).unwrap();
         let catalog = RequestCatalog::new(
             client,
             shared,
             request.scope,
-            AKID,
+            &akid,
             request.key_row,
             verified,
         );
@@ -533,7 +657,7 @@ impl World {
             catalog,
             safety: self.safety.clone(),
             cache: self.blobs.clone(),
-            nntp: NoNntp,
+            nntp: self.article.clone(),
             jobs: Jobs::default(),
             kek: TestKek::new(),
             clock: FixedClock::new(T0),
@@ -564,23 +688,73 @@ fn object_path() -> String {
     format!("/{BUCKET}/photo.jpg")
 }
 
-/// Every request call carries `authenticated`, and no call but the
-/// `key_row` is ever unauthenticated.
+fn put(signer: &Signer) -> service_support::Req {
+    signer.sign(T0, Method::Put, &object_path(), &[], &[], b"x".to_vec())
+}
+
+fn create_multipart(signer: &Signer) -> service_support::Req {
+    signer.sign(
+        T0,
+        Method::Post,
+        &object_path(),
+        &[("uploads", "")],
+        &[],
+        Vec::new(),
+    )
+}
+
+fn assert_s3_error(resp: &Resp, status: u16, code: &str) {
+    let body = String::from_utf8_lossy(&resp.body);
+    assert_eq!(resp.status, status, "{body}");
+    assert!(body.contains(&format!("<Code>{code}</Code>")), "{body}");
+}
+
+/// The initial key-row lookup (and any retry) is unauthenticated. Every
+/// later call carries `authenticated`.
 fn only_the_key_row_before_the_signature(calls: &[UnitCall]) {
-    for call in calls {
-        match &call.op {
-            UnitOp::KeyRow { .. } => assert!(!call.authenticated, "{call:?}"),
-            _ => assert!(call.authenticated, "{call:?}"),
-        }
+    let initial = calls
+        .iter()
+        .take_while(|call| !call.authenticated && matches!(call.op, UnitOp::KeyRow { .. }))
+        .count();
+    key_row_only(&calls[..initial]);
+    for call in &calls[initial..] {
+        assert!(call.authenticated, "{call:?}");
+    }
+}
+
+fn sent_create_upload(calls: &[UnitCall]) -> bool {
+    calls.iter().any(|c| {
+        matches!(&c.op, UnitOp::Request { call } if matches!(call.as_ref(), RequestCall::create_upload { .. }))
+    })
+}
+
+fn assert_scoped_blobs(world: &World) {
+    // List both entire stores, not just the expected prefixes. Safety
+    // also holds the separately scoped recovery record, not extent data.
+    let safety = block_on(world.safety.list("", "", u32::MAX)).unwrap();
+    let extent_prefix = format!("x/{T1}/");
+    let record_prefix = format!("m/{extent_prefix}");
+    for name in safety {
+        assert!(
+            name.starts_with(&extent_prefix) || name.starts_with(&record_prefix),
+            "unscoped safety blob: {name}"
+        );
+    }
+    let cache_prefix = format!("c/{T1}/");
+    for name in block_on(world.blobs.list("", "", u32::MAX)).unwrap() {
+        assert!(
+            name.starts_with(&cache_prefix),
+            "unscoped cache blob: {name}"
+        );
     }
 }
 
 #[test]
 fn a_put_and_a_get_round_trip_through_the_unit() {
-    let w = World::new();
+    let mut w = World::new();
     let body = pattern(7, 4096);
     let put = signer().sign(T0, Method::Put, &object_path(), &[], &[], body.clone());
-    let (resp, lines) = w.serve(put);
+    let (resp, lines) = w.serve(put, Maintenance::Off);
     assert_eq!(
         resp.status,
         200,
@@ -588,6 +762,7 @@ fn a_put_and_a_get_round_trip_through_the_unit() {
         String::from_utf8_lossy(&resp.body)
     );
     assert_eq!(lines[0], "served");
+    assert_scoped_blobs(&w);
     let calls = w.calls();
     assert!(matches!(calls[0].op, UnitOp::KeyRow { .. }));
     assert!(calls.len() > 2, "{}", calls.len());
@@ -617,29 +792,33 @@ fn a_put_and_a_get_round_trip_through_the_unit() {
     // bytes with the bucket key the tenant key unwraps.
     w.ports.calls.borrow_mut().clear();
     let get = signer().sign(T0, Method::Get, &object_path(), &[], &[], Vec::new());
-    let (resp, lines) = w.serve(get);
+    let (resp, lines) = w.serve(get, Maintenance::Off);
     assert_eq!(resp.status, 200, "{lines:?}");
     assert_eq!(resp.body, body);
+    assert_scoped_blobs(&w);
+    only_the_key_row_before_the_signature(&w.calls());
+    // Force a cold GET so the cache listing also checks a real write.
+    let extent_id = names[0].strip_prefix(&format!("x/{T1}/")).unwrap();
+    w.make_cold(&names[0], extent_id);
+    w.ports.calls.borrow_mut().clear();
+    let get = signer().sign(T0, Method::Get, &object_path(), &[], &[], Vec::new());
+    let (resp, lines) = w.serve(get, Maintenance::Off);
+    assert_eq!(resp.status, 200, "{lines:?}: {:?}", resp.stream_error);
+    assert_eq!(resp.body, body);
+    assert_scoped_blobs(&w);
+    assert!(w.blobs.0.contains(&format!("c/{T1}/{extent_id}")));
     only_the_key_row_before_the_signature(&w.calls());
     // A HEAD as well.
     let head = signer().sign(T0, Method::Head, &object_path(), &[], &[], Vec::new());
-    assert_eq!(w.serve(head).0.status, 200);
+    assert_eq!(w.serve(head, Maintenance::Off).0.status, 200);
 }
 
 #[test]
 fn a_bad_signature_reads_nothing_but_the_key_row() {
     let w = World::new();
-    let put = Signer::new(AKID, "not-the-secret").sign(
-        T0,
-        Method::Put,
-        &object_path(),
-        &[],
-        &[],
-        b"x".to_vec(),
-    );
-    let (resp, _) = w.serve(put);
-    assert_eq!(resp.status, 403);
-    assert!(String::from_utf8_lossy(&resp.body).contains("SignatureDoesNotMatch"));
+    let req = put(&Signer::new(AKID, "not-the-secret"));
+    let (resp, _) = w.serve(req, Maintenance::Off);
+    assert_s3_error(&resp, 403, "SignatureDoesNotMatch");
     // The key row only (sent once more with the unit's numbers when the
     // isolate knew none: rule 5's one retry), unauthenticated.
     key_row_only(&w.calls());
@@ -658,8 +837,7 @@ fn key_row_only(calls: &[UnitCall]) {
 fn a_suspended_read_only_tenant_serves_reads_and_refuses_writes() {
     let w = World::new();
     w.suspend();
-    let put = signer().sign(T0, Method::Put, &object_path(), &[], &[], b"x".to_vec());
-    let (resp, _) = w.serve(put);
+    let (resp, _) = w.serve(put(&signer()), Maintenance::Off);
     assert_eq!(resp.status, 403, "{}", String::from_utf8_lossy(&resp.body));
     assert!(String::from_utf8_lossy(&resp.body).contains("AccountProblem"));
     // Nothing but the key row: the state refused the request before any
@@ -667,7 +845,7 @@ fn a_suspended_read_only_tenant_serves_reads_and_refuses_writes() {
     key_row_only(&w.calls());
     w.ports.calls.borrow_mut().clear();
     let list = signer().sign(T0, Method::Get, &format!("/{BUCKET}"), &[], &[], Vec::new());
-    let (resp, lines) = w.serve(list);
+    let (resp, lines) = w.serve(list, Maintenance::Off);
     assert_eq!(resp.status, 200, "{lines:?}");
 }
 
@@ -682,14 +860,14 @@ fn delete_bucket_over_s3_is_refused_and_writes_nothing() {
         &[],
         Vec::new(),
     );
-    let (resp, _) = w.serve(del);
-    assert_eq!(resp.status, 403);
+    let (resp, _) = w.serve(del, Maintenance::Off);
+    assert_s3_error(&resp, 403, "AccessDenied");
     for call in w.calls() {
         assert!(call.op.is_read(), "{call:?}");
     }
-    // A key that is not the tenant's: no key row, InvalidAccessKeyId
-    // after the signature check.
-    let other = Signer::new("AKIDOTHERKEY00000001", SECRET).sign(
+    // A key that is not the tenant's: no key row, InvalidAccessKeyId.
+    let other_akid = "AKIDOTHERKEY00000001";
+    let other = Signer::new(other_akid, SECRET).sign(
         T0,
         Method::Get,
         &format!("/{BUCKET}"),
@@ -697,6 +875,98 @@ fn delete_bucket_over_s3_is_refused_and_writes_nothing() {
         &[],
         Vec::new(),
     );
-    let (resp, _) = w.serve(other);
-    assert_eq!(resp.status, 403);
+    let (resp, _) = w.serve(other, Maintenance::Off);
+    assert_s3_error(&resp, 403, "InvalidAccessKeyId");
+}
+
+#[test]
+fn create_multipart_checks_the_signature_before_request_calls() {
+    let w = World::new();
+    let bad = create_multipart(&Signer::new(AKID, "not-the-secret"));
+    let (resp, _) = w.serve(bad, Maintenance::Off);
+    assert_s3_error(&resp, 403, "SignatureDoesNotMatch");
+    key_row_only(&w.calls());
+
+    w.ports.calls.borrow_mut().clear();
+    let (resp, _) = w.serve(create_multipart(&signer()), Maintenance::Off);
+    assert_eq!(resp.status, 200, "{}", String::from_utf8_lossy(&resp.body));
+    assert!(String::from_utf8_lossy(&resp.body).contains("<UploadId>"));
+    let calls = w.calls();
+    only_the_key_row_before_the_signature(&calls);
+    assert!(sent_create_upload(&calls), "{calls:?}");
+}
+
+#[test]
+fn create_multipart_without_a_grant_returns_no_such_bucket() {
+    let w = World::new();
+    let req = create_multipart(&Signer::new(NO_GRANT_AKID, SECRET));
+    let (resp, _) = w.serve(req, Maintenance::Off);
+    assert_s3_error(&resp, 404, "NoSuchBucket");
+    let calls = w.calls();
+    only_the_key_row_before_the_signature(&calls);
+    assert!(!sent_create_upload(&calls), "{calls:?}");
+}
+
+#[track_caller]
+fn assert_restore_checks_signature_then_refuses_write(
+    request: fn(&Signer) -> service_support::Req,
+) {
+    let w = World::new();
+    let bad = request(&Signer::new(AKID, "not-the-secret"));
+    let (resp, _) = w.serve(bad, Maintenance::Restore);
+    assert_s3_error(&resp, 403, "SignatureDoesNotMatch");
+    key_row_only(&w.calls());
+
+    w.ports.calls.borrow_mut().clear();
+    let (resp, lines) = w.serve(request(&signer()), Maintenance::Restore);
+    assert_eq!(resp.status, 503, "{}", String::from_utf8_lossy(&resp.body));
+    // The handler gates the write; the router did not have to stop one.
+    assert_eq!(lines, ["served"]);
+    let calls = w.calls();
+    only_the_key_row_before_the_signature(&calls);
+    assert!(calls.iter().all(|c| c.op.is_read()), "{calls:?}");
+    assert!(w.safety.0.keys().is_empty());
+    assert!(w.blobs.0.keys().is_empty());
+}
+
+#[test]
+fn restore_checks_a_put_signature_before_refusing_the_write() {
+    assert_restore_checks_signature_then_refuses_write(put);
+}
+
+#[test]
+fn restore_checks_a_create_multipart_signature_before_refusing_the_write() {
+    assert_restore_checks_signature_then_refuses_write(create_multipart);
+}
+
+#[test]
+fn delete_bucket_without_a_grant_returns_access_denied() {
+    let w = World::new();
+    let req = Signer::new(NO_GRANT_AKID, SECRET).sign(
+        T0,
+        Method::Delete,
+        &format!("/{BUCKET}"),
+        &[],
+        &[],
+        Vec::new(),
+    );
+    let (resp, _) = w.serve(req, Maintenance::Off);
+    assert_s3_error(&resp, 403, "AccessDenied");
+    let calls = w.calls();
+    only_the_key_row_before_the_signature(&calls);
+    assert!(calls.iter().all(|c| c.op.is_read()), "{calls:?}");
+}
+
+#[test]
+fn a_publication_closed_on_the_unit_leaves_no_recovery_record() {
+    let w = World::new();
+    w.ports.close_on_publication.set(true);
+    let (resp, lines) = w.serve(put(&signer()), Maintenance::Off);
+    assert_eq!(resp.status, 503, "{}", String::from_utf8_lossy(&resp.body));
+    assert_eq!(lines, ["closed"]);
+    let records = block_on(w.safety.list("m/", "", u32::MAX)).unwrap();
+    assert!(
+        records.is_empty(),
+        "unpublished recovery records: {records:?}"
+    );
 }

@@ -10,8 +10,10 @@ use std::rc::Rc;
 
 use base64::Engine as _;
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use velmora_bridge::keys::tk::LoadedRing;
 use velmora_bridge::ports::Catalog;
+use velmora_bridge::recovery::Recorded;
 use velmora_bridge::request_catalog::{
     is_account_problem, is_key_changed, KeyRow, RequestCatalog, TenantRing, ERR_BEFORE_SIGNATURE,
     ERR_NOT_ON_REQUEST_PATH,
@@ -20,7 +22,7 @@ use velmora_bridge::service::managed::{finish, PortState};
 use velmora_bridge::sql::SqlCatalog;
 use velmora_bridge::tenant_catalog::UnitPort;
 use velmora_bridge::testkit::{MemBlobStore, RusqliteSql};
-use velmora_bridge::unit::call::HoldMode;
+use velmora_bridge::unit::call::{Closed, HoldMode};
 use velmora_bridge::unit::request_client::RequestClient;
 use velmora_bridge::unit::size::SizeRefusal;
 use velmora_bridge::unit::{
@@ -29,7 +31,8 @@ use velmora_bridge::unit::{
 use velmora_bridge::unit_lease::client::Page;
 use velmora_bridge::unit_router::RouteRefusal;
 use velmora_bridge::{
-    BridgeError, Bucket, BucketId, KeyStatus, Result, S3Response, TenantScope, UnixMs,
+    BlobMeta, BlobStore, BridgeError, Bucket, BucketId, CommitGeneration, ExtentId, GenerationId,
+    GenerationRow, GenerationState, KeyStatus, RespBody, Result, S3Response, TenantScope, UnixMs,
 };
 
 const T: &str = "t_00000000000000d1";
@@ -382,4 +385,96 @@ fn finish_answers_with_the_units_refusal_when_the_handler_failed() {
     let f = block_on(finish(&client, &safety, resp(204)));
     assert_eq!((f.resp.status, f.lines[0].code), (204, "served"));
     assert!(f.renew.is_none());
+}
+
+#[test]
+fn finish_keeps_the_handlers_4xx_with_a_recorded_refusal() {
+    let safety = MemBlobStore::default();
+    for route_refusal in [None, Some(RouteRefusal::Closed)] {
+        let client = client_refusing(refused(Refused::AccountProblem));
+        client.port().refusal.set(route_refusal);
+        let f = block_on(finish(&client, &safety, resp(404)));
+        assert_eq!(f.resp.status, 404);
+        let RespBody::Bytes(body) = f.resp.body else {
+            panic!("expected the handler's XML error document");
+        };
+        assert!(String::from_utf8_lossy(&body).contains("<Code>Test</Code>"));
+        assert_eq!(
+            f.lines[0].code,
+            route_refusal.map_or("account_problem", |r| r.code())
+        );
+    }
+}
+
+#[test]
+fn a_closed_or_unborn_publication_returns_its_record_for_cleanup() {
+    block_on(async {
+        let safety = MemBlobStore::default();
+        let now = UnixMs(1);
+        let generation = GenerationId::mint(now, [1; 8]);
+        let bucket = BucketId::mint([2; 8]);
+        let commit = CommitGeneration {
+            generation: GenerationRow {
+                id: generation.clone(),
+                bucket_id: bucket.clone(),
+                key: "photo.jpg".into(),
+                state: GenerationState::Live,
+                size: 0,
+                etag: "\"empty\"".into(),
+                checksum_json: None,
+                content_json: "{}".into(),
+                user_meta_json: "{}".into(),
+                extent_count: 0,
+                created_at: now,
+                retired_at: None,
+            },
+            extents: Vec::new(),
+            now,
+        };
+        let bytes = b"stored recovery record";
+        let record_key = Recorded::for_test(&generation).key();
+        for answer in [
+            UnitAnswer::Closed {
+                seqs: seqs(),
+                why: Closed::Restoring,
+            },
+            UnitAnswer::Unborn { listed: true },
+        ] {
+            safety
+                .put(
+                    &record_key,
+                    bytes.to_vec(),
+                    &BlobMeta {
+                        bucket: &bucket,
+                        extent: &ExtentId::new(generation.as_str()),
+                        cipher_sha256: &Sha256::digest(bytes).into(),
+                    },
+                )
+                .await
+                .unwrap();
+            let port = Port::default();
+            *port.answers.borrow_mut() = vec![Ok(answer.clone()), Ok(answer.clone())];
+            let client = RequestClient::new(port, unit(), seqs());
+            let result = client
+                .commit_generation(&commit, None, Recorded::for_test(&generation))
+                .await;
+            assert!(result.is_err(), "{answer:?}");
+            assert_eq!(client.refusal(), Some(answer.clone()));
+            let unpublished = client.take_unpublished();
+            assert_eq!(unpublished.len(), 1, "{answer:?}");
+            assert_eq!(unpublished[0].generation(), &generation);
+            assert_eq!(unpublished[0].key(), record_key);
+
+            // Inspecting the first proof drained it. Publish again with
+            // the same scripted refusal, this time letting finish drain it.
+            let result = client
+                .commit_generation(&commit, None, Recorded::for_test(&generation))
+                .await;
+            assert!(result.is_err(), "{answer:?}");
+            assert!(safety.contains(&record_key));
+            let _ = finish(&client, &safety, resp(500)).await;
+            assert!(!safety.contains(&record_key), "{answer:?}");
+            assert!(client.take_unpublished().is_empty());
+        }
+    });
 }
