@@ -58,9 +58,11 @@
 //!   A call that binds and then dies before `bucket_created` is finished
 //!   by the finisher of its intent (the reservation is open and bound).
 //!   Two calls under one key that overlap a refusal: one releases and
-//!   revokes; a sibling whose `bucket_created` lands just after places a
-//!   bucket its creator no longer holds, with no reservation row (no name
-//!   hold, no cap slot), and answers `200` for it. The owner repairs it
+//!   revokes; a sibling whose `bucket_created` lands between that call's
+//!   placement check and its release places a bucket its creator no
+//!   longer holds, with no reservation row (no name hold, no cap slot),
+//!   and answers `200` for it, or answers `503` and a later retry makes a
+//!   second bucket. The owner repairs it
 //!   with a grant; nothing is lost and nobody gains access. Exclusive
 //!   same-key calls at the root unit (a reservation lease) would close it.
 //!   A retry within the delay after a failed bind counts the unbound grant
@@ -313,6 +315,15 @@ where
                 // or finisher works under it, and only then is the grant
                 // revoked. A release that fails keeps both, and the call
                 // answers 503: a retry or the finisher decides it again.
+                // A sibling may have placed this very bucket since (its
+                // reservation not yet turned into the row): then nothing is
+                // given up, and the call answers 503 for the retry.
+                match records.is_placed(self.tenant, &bucket).await {
+                    Ok(false) => {}
+                    Ok(true) | Err(_) => {
+                        return Placing::Done(BucketAnswer::Unfinished { grant_seq: k })
+                    }
+                }
                 let released = self
                     .admission
                     .release_bound(self.tenant, idempotency_key, Some(k))

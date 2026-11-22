@@ -4639,10 +4639,9 @@ impl BucketRecords for RefusedLate<'_, '_> {
     }
 }
 
-/// (Review round 6.) A's put of 3 is refused; before A releases, a same-key retry
-/// places 3 and the unit turns the reservation into bucket 3. A's
-/// release_bound answers Ok(false) ("became the bucket"), A drops grant 3
-/// as an orphan, then answers Created{3} from the reservation.
+/// (Review round 6.) A's put of 3 is refused; before A releases, a
+/// same-key retry places 3 and the unit turns the reservation into bucket
+/// 3. A keeps grant 3 and answers from the reservation.
 #[tokio::test(flavor = "current_thread")]
 async fn a_refused_put_whose_bucket_a_sibling_placed_keeps_its_grant() {
     let w = World::new();
@@ -4679,6 +4678,13 @@ async fn a_refused_put_whose_bucket_a_sibling_placed_keeps_its_grant() {
     adm.bucket_open.borrow_mut().remove("ib");
     gate_a.set(true);
     let a = fut_a.await.unwrap();
+    assert!(
+        matches!(
+            a,
+            BucketAnswer::Created { grant_seq: 3, .. } | BucketAnswer::Unfinished { grant_seq: 3 }
+        ),
+        "{a:?}"
+    );
     let grants = head_grants(&w, "PR0001").await;
     eprintln!(
         "R6a: A answered {a:?}; PR0001 grants at head {grants:?}; placed {:?}",
@@ -4736,10 +4742,69 @@ async fn a_refused_finisher_put_whose_bucket_a_retry_placed_keeps_its_grant() {
     adm.bucket_open.borrow_mut().remove("ib");
     gate_f.set(true);
     let f = fut_f.await.unwrap();
+    assert!(
+        matches!(f, CreatorGrant::Placed | CreatorGrant::Busy),
+        "{f:?}"
+    );
     let grants = head_grants(&w, "PR0001").await;
     eprintln!("R6b: finisher answered {f:?}; PR0001 grants at head {grants:?}");
     assert!(
         grants.iter().any(|g| g == three.as_str()),
         "R6b: bucket 3 is placed (client told Created), but the finisher dropped its creator's grant"
+    );
+}
+
+/// (Review round 7.) A sibling records bucket 3 but the unit lags (not in
+/// force, the reservation still bound to 3); A's refused put of 3 then
+/// gives nothing up, and the sibling's retry answers bucket 3: one bucket,
+/// never a 409 for a bucket that exists.
+#[tokio::test(flavor = "current_thread")]
+async fn a_refusal_while_a_sibling_placed_the_same_bucket_gives_nothing_up() {
+    let w = World::new();
+    let adm = FakeAdmission::new(&w.root);
+    let mut table_a = seed(&w, &adm).await;
+    let units = w.units();
+    let buckets = FakeBuckets::default();
+    let gate_a = Cell::new(false);
+    let late = RefusedLate {
+        inner: &buckets,
+        gate: RefCell::new(Some(&gate_a)),
+    };
+    let env = env!(w, &adm, &units);
+    let req = photos("PR0001");
+    let mut rng_a = TestRng(7101);
+    let mut fut_a: BoxFut<'_, _> =
+        Box::pin(env.create_bucket(&late, &mut table_a, "ib", &req, &mut rng_a));
+    assert!(
+        poll_once(&mut fut_a).is_none(),
+        "A parked in bucket_created(3)"
+    );
+    buckets.not_in_force.set(true);
+    let mut table_b = table(&w);
+    let b = env
+        .create_bucket(&buckets, &mut table_b, "ib", &req, &mut TestRng(7102))
+        .await
+        .unwrap();
+    assert_eq!(b, BucketAnswer::Unfinished { grant_seq: 3 });
+    gate_a.set(true);
+    let a = fut_a.await.unwrap();
+    assert_eq!(a, BucketAnswer::Unfinished { grant_seq: 3 });
+    buckets.not_in_force.set(false);
+    let retry = env
+        .create_bucket(&buckets, &mut table_b, "ib", &req, &mut TestRng(7103))
+        .await
+        .unwrap();
+    let three = bucket_id(&w.t, 3);
+    assert_eq!(
+        retry,
+        BucketAnswer::Created {
+            bucket: three.clone(),
+            grant_seq: 3,
+        }
+    );
+    assert_eq!(buckets.placed.borrow().len(), 1);
+    assert_eq!(
+        head_grants(&w, "PR0001").await,
+        vec!["b_01".to_owned(), three.as_str().to_owned()]
     );
 }
