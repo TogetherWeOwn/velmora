@@ -398,6 +398,50 @@ fn stored<S: Sql>(sql: &S, id: &str) -> Result<Option<Row>> {
     }))
 }
 
+/// The values of a subject's `unit_keys` row and of its `unit_key_grants`
+/// rows, in schema order, as the entry states them with `status`: what
+/// the apply writes, and what the move's V6 hashes from the chain
+/// (`unit::export::chain_key_rows`).
+pub(crate) fn entry_values(
+    e: &KeyEntry,
+    status: SubjectStatus,
+) -> Result<(Vec<SqlValue>, Vec<Vec<SqlValue>>)> {
+    let opt_text = |s: &Option<String>| s.clone().map_or(SqlValue::Null, SqlValue::Text);
+    let row = vec![
+        SqlValue::Text(e.id.clone()),
+        SqlValue::Text(e.kind.as_str().into()),
+        SqlValue::Text(status.as_str().into()),
+        SqlValue::Int(i64::from(e.held)),
+        opt_text(&e.made_by),
+        int(e.created_at)?,
+        e.secret_wrapped
+            .clone()
+            .map_or(SqlValue::Null, SqlValue::Blob),
+        e.secret_kek_version
+            .map_or(SqlValue::Null, |v| SqlValue::Int(i64::from(v))),
+        opt_text(&e.owner_ref),
+        int(e.last_seq)?,
+    ];
+    let mut grants = Vec::with_capacity(e.grants.len());
+    for (i, g) in e.grants.iter().enumerate() {
+        let ips =
+            serde_json::to_string(&g.ip_list).map_err(|_| BridgeError::Invalid("unit: ip list"))?;
+        grants.push(vec![
+            SqlValue::Text(e.id.clone()),
+            SqlValue::Int(i as i64),
+            SqlValue::Text(g.bucket_id.clone()),
+            SqlValue::Text(g.access.as_str().into()),
+            match g.expires_at {
+                Some(t) => int(t)?,
+                None => SqlValue::Null,
+            },
+            opt_text(&g.prefix),
+            SqlValue::Text(ips),
+        ]);
+    }
+    Ok((row, grants))
+}
+
 /// Writes the subject's row and grants as the entry states them; a row
 /// that was revoked stays revoked.
 fn put<S: Sql>(sql: &S, e: &KeyEntry, was_revoked: bool) -> Result<()> {
@@ -406,10 +450,9 @@ fn put<S: Sql>(sql: &S, e: &KeyEntry, was_revoked: bool) -> Result<()> {
     } else {
         e.status
     };
-    let opt_text = |s: &Option<String>| s.clone().map_or(SqlValue::Null, SqlValue::Text);
-    poll_once(
-        sql.exec(
-            "INSERT INTO unit_keys(id, kind, status, held, made_by, created_at, secret_wrapped, \
+    let (row, grants) = entry_values(e, status)?;
+    poll_once(sql.exec(
+        "INSERT INTO unit_keys(id, kind, status, held, made_by, created_at, secret_wrapped, \
            secret_kek_version, owner_ref, last_seq) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) \
          ON CONFLICT(id) DO UPDATE SET kind = excluded.kind, status = excluded.status, \
@@ -417,45 +460,17 @@ fn put<S: Sql>(sql: &S, e: &KeyEntry, was_revoked: bool) -> Result<()> {
            secret_wrapped = excluded.secret_wrapped, \
            secret_kek_version = excluded.secret_kek_version, owner_ref = excluded.owner_ref, \
            last_seq = excluded.last_seq",
-            &[
-                SqlValue::Text(e.id.clone()),
-                SqlValue::Text(e.kind.as_str().into()),
-                SqlValue::Text(status.as_str().into()),
-                SqlValue::Int(i64::from(e.held)),
-                opt_text(&e.made_by),
-                int(e.created_at)?,
-                e.secret_wrapped
-                    .clone()
-                    .map_or(SqlValue::Null, SqlValue::Blob),
-                e.secret_kek_version
-                    .map_or(SqlValue::Null, |v| SqlValue::Int(i64::from(v))),
-                opt_text(&e.owner_ref),
-                int(e.last_seq)?,
-            ],
-        ),
-    )??;
+        &row,
+    ))??;
     poll_once(sql.exec(
         "DELETE FROM unit_key_grants WHERE subject_id = ?1",
         &[SqlValue::Text(e.id.clone())],
     ))??;
-    for (i, g) in e.grants.iter().enumerate() {
-        let ips =
-            serde_json::to_string(&g.ip_list).map_err(|_| BridgeError::Invalid("unit: ip list"))?;
+    for g in &grants {
         poll_once(sql.exec(
             "INSERT INTO unit_key_grants(subject_id, idx, bucket_id, access, expires_at, prefix, \
                ip_list) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            &[
-                SqlValue::Text(e.id.clone()),
-                SqlValue::Int(i as i64),
-                SqlValue::Text(g.bucket_id.clone()),
-                SqlValue::Text(g.access.as_str().into()),
-                match g.expires_at {
-                    Some(t) => int(t)?,
-                    None => SqlValue::Null,
-                },
-                opt_text(&g.prefix),
-                SqlValue::Text(ips),
-            ],
+            g,
         ))??;
     }
     Ok(())

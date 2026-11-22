@@ -132,7 +132,9 @@ principal up the chain holds such a grant on that bucket; its access is
 the lowest along the chain. The internal key is not served from these
 rows: it signs presigned URLs only, which they cannot say. A key or an
 app password outside tenant 0 must name its principal. Everything else
-fails closed.
+fails closed. **Milestone 1 serves unlimited grants only:** a key or
+principal grant with a prefix, an expiry or an address list is refused
+at use (AM-18).
 
 ## Import
 
@@ -155,7 +157,49 @@ cursor. It fills the data tables only. The keys come by the key apply
 `usage_buckets` are the unit's own: its triggers count each imported row
 while the counters are on, and the recount fills them when they are off.
 An `outbox` row must come with its lease cleared, and an extent's
-`plan_rev` is bound through `plan_rev::bound`.
+`plan_rev` is bound through `plan_rev::bound`. A cursor may be up to
+64 KiB: the copy names the key of the last row it read as typed JSON, and
+an object key is bounded only by the S3 request target (8 KiB), which
+JSON's escapes can grow sixfold.
+
+**The seal** (`import_seal`, AM-29) ends the import. It is bound and
+numbered as a batch, and names every import table once with the rows the
+unit took (0 for a table without a batch); a count that is not the
+unit's refuses it, so a lost batch is found. It records
+`move_ordinal` = tenant 0's `flips + 1` (the head carries `flips`), and
+from then on no batch is taken, not even the last one sent again, under
+any entry: the refusal is its own code, `sealed`, so a resumed copy knows
+the import is done. The seal survives a new `restoring` entry;
+`deleteAll()` clears it. While a move's import is not sealed, no lift
+passes under any entry, whatever the report. Every imported key value must
+be of its column's class (text, or integer where declared), so the unit
+never holds a key that `export` cannot page after.
+
+In a unit, every `tenant_id` column (such as
+`upload_part_extents.tenant_id`) is a legacy default and is not
+authoritative: the unit's tenant is its certificate (`unit_birth`), and
+no unit code reads that column.
+
+## Export
+
+`export(table, after, limit, mode)` (`unit::export`, AM-26) reads one
+table back out, read-only, in primary-key order: the rows after the key
+`after`, at most `limit` (1 to 500), in the import's value encoding (the
+type class of every value is kept). `mode = hash` answers the page's
+count, its last key, whether rows follow, and SHA-256 over the rows
+without the table's V1-excluded columns (`buckets.owner`, `bdk_wrapped`
+and `kek_version`; the two `hot_*` columns of `extents`; the lease owner
+and expiry of `outbox`), as `export::hash_rows` writes it: the move tool
+hashes the frozen D1's rows of the same key range with that function.
+`mode = rows` answers the rows, also cut at 1 MiB of encoded rows (a
+larger row comes alone): the reverse move only. It is refused unless the
+unit's `restoring` entry is set. It reads the tables the import writes
+and the key tables, and on the key tables only `hash`, over every
+column, the wrap included (V6 compares it with `export::chain_key_rows`
+of the chain). It never reads the unit's own tables. Wrapped keys
+(`bdk_wrapped`, `wrapped_file_key`) leave as stored, still wrapped, to
+the move or undo tool in the Worker only, never to a log, a receipt or a
+queue message.
 
 ## Jobs
 
@@ -167,8 +211,11 @@ by the unit's own catalogue in one transaction; on the Worker's side,
 `TenantCatalog` is a catalogue whose job methods are these calls, so the
 job code runs unchanged against a unit. A job call carries the job's
 numbers and must match the unit's (rule 5: missing or lower is refused,
-higher is `sync_needed`), is `authenticated`, is refused while the unit is
-closed, and is refused for a tenant being shredded. Provider permits and
+higher is `sync_needed`), and is `authenticated`. Post, verify, release,
+GC and scrub run in `active`, `suspended` (either mode) and `deleting`.
+They are refused in `shredding` and `shredded`, and while this unit is
+closed (its own `restoring` entry is set, or its lease has expired: rule
+12). Provider permits and
 provider health are not a unit's: they stay in the shared database, which
 every tenant's jobs use. The request path does not use `TenantCatalog`.
 A refusal (`sync_needed`, a stale job, closed, unborn) comes back as a
@@ -270,6 +317,37 @@ proof (its replay id and those counts and hashes), equal to the unit's.
 replay id from its own replay and nonce, and stops if `gate_status` names
 another one. Until the replay
 runs inside the unit, the Worker sends the replay's findings.
+
+**The move's lift report** (DS1 §3.4 step 8(b), AM-15). The owner move
+has no restore: its checks V1 to V8 are its replay. After they pass, the
+move tool opens a report of kind `move` (`gate_open_move`) with replay
+id (S_move, the unit's current stamp ordinal, a nonce) and closes it
+with a complete, empty summary. The unit takes a `move` report only
+under this binding: it is the root unit of a managed tenant; the import
+is sealed, and the passed tenant-0 head's `flips + 1` is the seal's
+`move_ordinal`; S is the unit's current `restoring_since` (not the
+import's first S, so a re-entry under a new entry works); tenant 0's
+head says `moving` with `move.to` = this tenant at a seq not below the
+newest the unit has seen; the call carries the unit's numbers; and the
+ordinal is the unit's stamp counter (0 while no stamp was ever raised).
+A `move` report takes no blocker page and no acknowledgement, and no
+summary but a complete, empty one. The lift check reads the binding the
+unit holds again (root unit, seal, stamp counter, empty summary). If a
+stamp raise lands between the report and the lift record, the `sync` is
+refused by the gate (`refused: gate`); the tool writes a new `restoring`
+entry, syncs the unit to it, and opens a new report under it. The lift a
+`move` report passes uses the seal up: no other `move` report is taken
+after it, so a later entry (a restore of the owner's unit) is lifted only
+by the restore gate. So a tool that re-runs 8(b) first reads the unit:
+if its `restoring_since` is already empty, the lift landed and 8(c)
+follows; a `keys_not_applied` answer means apply the keys and send the
+`sync` again, and `stale_sync` means read the head again. Only a gate
+refusal re-enters. Not covered: a rollback of the unit to a point between
+the seal and the lift brings back an unused seal (a design question). No
+other kind of lift exists.
+
+A unit born from a `restore` token cannot lift until `recount` (AM-27)
+turns its counters on; that call is not built yet.
 
 A restored unit stays closed until the gate lifts it, and the gate lifts only
 on a whole, clean replay (`unit::gate`): no damaged generation, no held row

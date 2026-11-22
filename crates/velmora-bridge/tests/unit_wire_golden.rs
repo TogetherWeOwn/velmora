@@ -13,15 +13,16 @@
 
 use serde_json::{json, Value};
 use velmora_bridge::unit::call::{Closed, HoldMode};
+use velmora_bridge::unit::export::{ExportMode, ExportRefusal, ExportTable, KeyTable};
 use velmora_bridge::unit::identity::Refusal as IdentityRefusal;
 use velmora_bridge::unit::identity::Refusal;
 use velmora_bridge::unit::import::{
-    ImportBatch, ImportRefusal, ImportTable, ImportValue, MoveHead,
+    ImportBatch, ImportCount, ImportRefusal, ImportTable, ImportValue, MoveHead,
 };
 use velmora_bridge::unit::jobcall::JobCall;
 use velmora_bridge::unit::keys::{Access, KeyEntry, KeyGrant, KeyKind, KeyRefusal, SubjectStatus};
 use velmora_bridge::unit::lift::{
-    AckClass, ClassProof, FindingList, GateRefusal, GateSummary, LiftProof, ReplayId,
+    AckClass, ClassProof, FindingList, GateRefusal, GateSummary, LiftProof, ReplayId, ReportKind,
 };
 use velmora_bridge::unit::restore::{Bookmark, RestoreRefusal, RestoreTarget};
 use velmora_bridge::unit::{
@@ -73,9 +74,12 @@ fn op_kind(op: &UnitOp) -> &'static str {
         UnitOp::HeldKeys {} => "held_keys",
         UnitOp::Import { .. } => "import",
         UnitOp::ImportProgress {} => "import_progress",
+        UnitOp::ImportSeal { .. } => "import_seal",
+        UnitOp::Export { .. } => "export",
         UnitOp::RestorePrepare { .. } => "restore_prepare",
         UnitOp::Restore { .. } => "restore",
         UnitOp::GateOpen { .. } => "gate_open",
+        UnitOp::GateOpenMove { .. } => "gate_open_move",
         UnitOp::GateReport { .. } => "gate_report",
         UnitOp::GateBlockers { .. } => "gate_blockers",
         UnitOp::GateAck { .. } => "gate_ack",
@@ -117,6 +121,7 @@ fn refused_kind(r: &Refused) -> &'static str {
         Refused::Import(_) => "import",
         Refused::Restore(_) => "restore",
         Refused::Gate(_) => "gate",
+        Refused::Export(_) => "export",
     }
 }
 
@@ -177,6 +182,7 @@ fn ops() -> Vec<UnitOp> {
                 seq: 11,
                 selector: "moving".into(),
                 to: Some(name().tenant),
+                flips: 0,
             },
             since: 7,
             batch: ImportBatch {
@@ -199,6 +205,34 @@ fn ops() -> Vec<UnitOp> {
             },
         },
         UnitOp::ImportProgress {},
+        UnitOp::ImportSeal {
+            head: MoveHead {
+                seq: 12,
+                selector: "moving".into(),
+                to: Some(name().tenant),
+                flips: 1,
+            },
+            since: 7,
+            tables: vec![ImportCount {
+                table: ImportTable::Objects,
+                rows: 2,
+            }],
+        },
+        UnitOp::Export {
+            table: ExportTable::Data(ImportTable::Objects),
+            after: Some(vec![
+                ImportValue::Text("b_00000000000000f1".into()),
+                ImportValue::Text("a/b".into()),
+            ]),
+            limit: 500,
+            mode: ExportMode::Rows,
+        },
+        UnitOp::Export {
+            table: ExportTable::Keys(KeyTable::UnitKeyGrants),
+            after: None,
+            limit: 100,
+            mode: ExportMode::Hash,
+        },
         UnitOp::RestorePrepare { since: 7 },
         UnitOp::Restore {
             token: token(),
@@ -213,6 +247,15 @@ fn ops() -> Vec<UnitOp> {
             expect_undo: Bookmark("bm-1".into()),
         },
         UnitOp::GateOpen { replay_id: rid() },
+        UnitOp::GateOpenMove {
+            replay_id: rid(),
+            head: MoveHead {
+                seq: 12,
+                selector: "moving".into(),
+                to: Some(name().tenant),
+                flips: 1,
+            },
+        },
         UnitOp::GateReport {
             replay_id: rid(),
             summary: GateSummary {
@@ -317,7 +360,12 @@ fn nested() -> Value {
         "subject_status": every!(SubjectStatus: Active, Disabled, Revoked),
         "access": every!(Access: Ro, Rw),
         "key_refusal": every!(KeyRefusal: Gap, Malformed),
-        "import_refusal": every!(ImportRefusal: NotBound, Shape, OutOfOrder),
+        "import_refusal": every!(ImportRefusal: NotBound, Shape, OutOfOrder, Sealed,
+            CountMismatch),
+        "export_refusal": every!(ExportRefusal: NotRestoring, HashOnly, Malformed),
+        "export_mode": every!(ExportMode: Hash, Rows),
+        "key_table": every!(KeyTable: UnitKeys, UnitKeyGrants),
+        "report_kind": every!(ReportKind: Restore, Move),
         "import_table": every!(ImportTable: Buckets, Generations, Objects, Extents,
             GenerationExtents, Articles, Verifications, VerifyRaises, VerifyEscalations, Outbox,
             Uploads, UploadParts, UploadPartExtents, Gc, UsageHours, UsageRecounts),
@@ -326,7 +374,8 @@ fn nested() -> Value {
         "finding_list": every!(FindingList: Damaged, Unreadable, Unpublishable,
             DamagedUnpublished, Twins, OtherBucket, HeldMissing, HeldMissingLive),
         "gate_refusal": every!(GateRefusal: NotRestoring, NoReport, StampNotLevelled, Closed,
-            AckMismatch, CountersOff, ProofMismatch, ListMismatch, Malformed),
+            AckMismatch, CountersOff, ProofMismatch, ListMismatch, Malformed, MoveNotBound,
+            ImportNotSealed, MoveNotEmpty),
         "restore_refusal": every!(RestoreRefusal: NotRestoring, WrongToken, LeaseLive,
             LeaseUnknown, TooSoon, Moved, Malformed, NoPointInTime),
     })
@@ -348,6 +397,7 @@ fn refusals() -> Vec<Refused> {
         Refused::Import(ImportRefusal::OutOfOrder),
         Refused::Restore(RestoreRefusal::Moved),
         Refused::Gate(GateRefusal::AckMismatch),
+        Refused::Export(ExportRefusal::HashOnly),
     ]
 }
 
@@ -416,7 +466,7 @@ fn document() -> Value {
 #[test]
 fn every_variant_has_a_sample() {
     let ops: std::collections::BTreeSet<_> = ops().iter().map(op_kind).collect();
-    assert_eq!(ops.len(), 17, "{ops:?}");
+    assert_eq!(ops.len(), 20, "{ops:?}");
     let readers: std::collections::BTreeSet<_> = ops_readers().into_iter().collect();
     assert_eq!(readers.len(), 2, "both readers have a sample");
     // The variants that carry data, each with a sample (exhaustive).
@@ -448,7 +498,7 @@ fn every_variant_has_a_sample() {
     let answers: std::collections::BTreeSet<_> = answers().iter().map(answer_kind).collect();
     assert_eq!(answers.len(), 9, "{answers:?}");
     let reasons: std::collections::BTreeSet<_> = refusals().iter().map(refused_kind).collect();
-    assert_eq!(reasons.len(), 14, "{reasons:?}");
+    assert_eq!(reasons.len(), 15, "{reasons:?}");
 }
 
 #[test]

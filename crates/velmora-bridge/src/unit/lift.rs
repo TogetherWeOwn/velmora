@@ -38,6 +38,24 @@
 //!
 //! Totals count distinct ids: a list holds each id once, and a total
 //! above its list keeps the unit closed (`Unlisted`).
+//!
+//! **The move's lift report** (DS1 §3.4 step 8(b), AM-15). The owner
+//! move has no restore: V1 to V9 are its replay, and any failure stops
+//! the move before 8(b). After they pass, the move tool opens a report
+//! of kind `move` ([`open_move`]) with replay id (S_move, the unit's
+//! current stamp ordinal, a nonce) and closes it complete with no
+//! blocker. The unit accepts it only under the import's binding: it is
+//! the root unit of a managed tenant; the import is sealed
+//! ([`super::import::seal`], AM-29) for this window: the passed tenant-0
+//! head's `flips + 1` is the sealed `move_ordinal`; S is the unit's
+//! current `restoring_since` (not the import's first S, so a re-entry
+//! under a new entry works); tenant 0's head says `moving` with
+//! `move.to` = this tenant at a seq not below the newest the unit has
+//! seen; and the ordinal is the unit's current stamp counter (0 while no
+//! stamp was ever raised). A `move` report takes no blocker page and no acknowledgement,
+//! and its summary must be complete and empty. The lift check re-reads
+//! everything of that binding the unit holds. No other kind of lift
+//! exists.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -56,6 +74,33 @@ pub const MAX_PAGE: usize = 100;
 pub const MAX_NONCE: usize = 64;
 /// The longest id (est).
 pub const MAX_ID: usize = 512;
+
+/// What a gate report is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReportKind {
+    /// The final replay of a restore.
+    Restore,
+    /// The owner move's lift report (AM-15).
+    Move,
+}
+
+impl ReportKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ReportKind::Restore => "restore",
+            ReportKind::Move => "move",
+        }
+    }
+
+    fn parse(s: &str) -> Option<ReportKind> {
+        match s {
+            "restore" => Some(ReportKind::Restore),
+            "move" => Some(ReportKind::Move),
+            _ => None,
+        }
+    }
+}
 
 /// The replay a gate report belongs to.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -240,6 +285,17 @@ pub enum GateRefusal {
     ListMismatch,
     /// A page above [`MAX_PAGE`] ids, an empty or long id, or a bad nonce.
     Malformed,
+    /// A `move` report outside the import's binding: not the root unit
+    /// of a managed tenant, or tenant 0's head is not `moving` to this
+    /// tenant, or is older than one the unit has seen.
+    MoveNotBound,
+    /// A `move` report before the import is sealed (AM-29), or for
+    /// another window than the seal's; or any lift while a move's import
+    /// is not sealed.
+    ImportNotSealed,
+    /// A `move` report takes no blocker, no acknowledgement and no
+    /// summary but a complete, empty one.
+    MoveNotEmpty,
 }
 
 /// SHA-256 over the sorted ids with duplicates removed, each followed
@@ -262,30 +318,56 @@ fn page_ok(ids: &[String]) -> bool {
     ids.len() <= MAX_PAGE && ids.iter().all(|i| !i.is_empty() && i.len() <= MAX_ID)
 }
 
-/// The stored report: its replay id and summary.
-fn stored<S: Sql>(sql: &S) -> Result<Option<(ReplayId, GateSummary)>> {
+/// The stored report: its replay id, summary and kind.
+struct Stored {
+    id: ReplayId,
+    summary: GateSummary,
+    kind: ReportKind,
+}
+
+fn stored<S: Sql>(sql: &S) -> Result<Option<Stored>> {
     let rows = poll_once(sql.query(
-        "SELECT since_seq, ordinal, nonce, summary FROM unit_gate_report WHERE id = 1",
+        "SELECT since_seq, ordinal, nonce, summary, kind FROM unit_gate_report WHERE id = 1",
         &[],
     ))??;
     let Some(r) = rows.first() else {
         return Ok(None);
     };
-    let (SqlValue::Int(since), SqlValue::Int(ordinal), SqlValue::Text(nonce), SqlValue::Text(f)) =
-        (&r[0], &r[1], &r[2], &r[3])
+    let (
+        SqlValue::Int(since),
+        SqlValue::Int(ordinal),
+        SqlValue::Text(nonce),
+        SqlValue::Text(f),
+        SqlValue::Text(kind),
+    ) = (&r[0], &r[1], &r[2], &r[3], &r[4])
     else {
         return Err(decode("unit_gate_report"));
     };
     let summary: GateSummary =
         serde_json::from_str(f).map_err(|_| decode("unit_gate_report summary"))?;
-    Ok(Some((
-        ReplayId {
+    Ok(Some(Stored {
+        id: ReplayId {
             since: u64::try_from(*since).map_err(|_| decode("since"))?,
             ordinal: u64::try_from(*ordinal).map_err(|_| decode("ordinal"))?,
             nonce: nonce.clone(),
         },
         summary,
-    )))
+        kind: ReportKind::parse(kind).ok_or_else(|| decode("unit_gate_report kind"))?,
+    }))
+}
+
+/// A summary that is complete and names no blocker: every total 0 and
+/// every list it names empty (count 0, the hash of no id).
+pub fn empty_and_complete(summary: &GateSummary) -> bool {
+    let none = ids_hash(std::iter::empty::<&String>());
+    summary.complete
+        && summary.damaged_total == 0
+        && summary.other_bucket_total == 0
+        && summary.held_missing_total == 0
+        && summary
+            .lists
+            .values()
+            .all(|p| p.count == 0 && p.sha256 == none)
 }
 
 /// The stored id lists, by list.
@@ -350,19 +432,20 @@ fn acks<S: Sql>(sql: &S) -> Result<Acknowledged> {
     Ok(a)
 }
 
-/// The report is of `id`, and the unit is closed under its entry.
+/// The report is of `id`, and the unit is closed under its entry. `Ok`:
+/// the report's kind.
 fn bound<S: Sql>(
     sql: &S,
     restoring_since: Option<u64>,
     id: &ReplayId,
-) -> Result<std::result::Result<(), GateRefusal>> {
+) -> Result<std::result::Result<ReportKind, GateRefusal>> {
     if restoring_since != Some(id.since) {
         return Ok(Err(GateRefusal::NotRestoring));
     }
-    if !stored(sql)?.is_some_and(|(have, _)| have == *id) {
-        return Ok(Err(GateRefusal::NoReport));
+    match stored(sql)? {
+        Some(have) if have.id == *id => Ok(Ok(have.kind)),
+        _ => Ok(Err(GateRefusal::NoReport)),
     }
-    Ok(Ok(()))
 }
 
 /// Starts the report of `id`, discarding any other. Inside the caller's
@@ -378,20 +461,87 @@ pub fn open<S: Sql>(
     if restoring_since != Some(id.since) {
         return Ok(Err(GateRefusal::NotRestoring));
     }
-    if stored(sql)?.is_some_and(|(have, _)| have == *id) {
+    if stored(sql)?.is_some_and(|have| have.id == *id && have.kind == ReportKind::Restore) {
         return Ok(Ok(false));
     }
+    put_report(sql, id, ReportKind::Restore)?;
+    Ok(Ok(true))
+}
+
+/// Discards any stored report and starts the one of `id` and `kind`.
+fn put_report<S: Sql>(sql: &S, id: &ReplayId, kind: ReportKind) -> Result<()> {
     clear(sql)?;
     poll_once(sql.exec(
-        "INSERT INTO unit_gate_report(id, since_seq, ordinal, nonce, summary) \
-         VALUES (1, ?1, ?2, ?3, ?4)",
+        "INSERT INTO unit_gate_report(id, since_seq, ordinal, nonce, summary, kind) \
+         VALUES (1, ?1, ?2, ?3, ?4, ?5)",
         &[
             int(id.since)?,
             int(id.ordinal)?,
             SqlValue::Text(id.nonce.clone()),
             SqlValue::Text(json_text(&GateSummary::default())?),
+            SqlValue::Text(kind.as_str().into()),
         ],
     ))??;
+    Ok(())
+}
+
+/// The binding of a `move` report that the unit holds (module doc),
+/// without tenant 0's head: `managed_root`, the import is sealed, and the
+/// ordinal is the unit's stamp counter now (0 while no stamp row exists:
+/// the counter was never raised). `Ok`: the seal's `move_ordinal`.
+fn move_bound<S: Sql>(
+    sql: &S,
+    managed_root: bool,
+    id: &ReplayId,
+) -> Result<std::result::Result<u64, GateRefusal>> {
+    if !managed_root || super::import::move_lifted(sql)? {
+        return Ok(Err(GateRefusal::MoveNotBound));
+    }
+    let Some(move_ordinal) = super::import::sealed(sql)? else {
+        return Ok(Err(GateRefusal::ImportNotSealed));
+    };
+    if stamp_counter(sql)?.unwrap_or(0) != id.ordinal {
+        return Ok(Err(GateRefusal::StampNotLevelled));
+    }
+    Ok(Ok(move_ordinal))
+}
+
+/// Starts the `move` report of `id`, discarding any other (AM-15).
+/// Inside the caller's transaction. `managed_root`: the unit is the root
+/// unit of a tenant other than tenant 0; `restoring_since` is the unit's;
+/// `head` is tenant 0's verified head, as the import takes it. Raises the
+/// tenant-0 seq the unit has seen.
+pub fn open_move<S: Sql>(
+    sql: &S,
+    managed_root: bool,
+    own_tenant: &super::name::TenantId,
+    restoring_since: Option<u64>,
+    id: &ReplayId,
+    head: &super::import::MoveHead,
+) -> Result<std::result::Result<bool, GateRefusal>> {
+    if !valid(id) {
+        return Ok(Err(GateRefusal::Malformed));
+    }
+    if restoring_since != Some(id.since) {
+        return Ok(Err(GateRefusal::NotRestoring));
+    }
+    let move_ordinal = match move_bound(sql, managed_root, id)? {
+        Ok(o) => o,
+        Err(r) => return Ok(Err(r)),
+    };
+    if head.flips.checked_add(1) != Some(move_ordinal) {
+        return Ok(Err(GateRefusal::ImportNotSealed));
+    }
+    let moving_here = head.selector == "moving" && head.to.as_ref() == Some(own_tenant);
+    let not_older = super::import::seen_t0_seq(sql)?.is_some_and(|seen| head.seq >= seen);
+    if !moving_here || !not_older {
+        return Ok(Err(GateRefusal::MoveNotBound));
+    }
+    super::import::see_t0_seq(sql, head.seq)?;
+    if stored(sql)?.is_some_and(|have| have.id == *id && have.kind == ReportKind::Move) {
+        return Ok(Ok(false));
+    }
+    put_report(sql, id, ReportKind::Move)?;
     Ok(Ok(true))
 }
 
@@ -402,8 +552,12 @@ pub fn report<S: Sql>(
     id: &ReplayId,
     summary: &GateSummary,
 ) -> Result<std::result::Result<(), GateRefusal>> {
-    if let Err(r) = bound(sql, restoring_since, id)? {
-        return Ok(Err(r));
+    match bound(sql, restoring_since, id)? {
+        Err(r) => return Ok(Err(r)),
+        Ok(ReportKind::Move) if !empty_and_complete(summary) => {
+            return Ok(Err(GateRefusal::MoveNotEmpty))
+        }
+        Ok(_) => {}
     }
     poll_once(sql.exec(
         "UPDATE unit_gate_report SET summary = ?1 WHERE id = 1",
@@ -423,8 +577,10 @@ pub fn blockers<S: Sql>(
     if !page_ok(ids) {
         return Ok(Err(GateRefusal::Malformed));
     }
-    if let Err(r) = bound(sql, restoring_since, id)? {
-        return Ok(Err(r));
+    match bound(sql, restoring_since, id)? {
+        Err(r) => return Ok(Err(r)),
+        Ok(ReportKind::Move) => return Ok(Err(GateRefusal::MoveNotEmpty)),
+        Ok(ReportKind::Restore) => {}
     }
     for i in ids {
         poll_once(sql.exec(
@@ -454,8 +610,10 @@ pub fn ack<S: Sql>(
     if !page_ok(ids) {
         return Ok(Err(GateRefusal::Malformed));
     }
-    if let Err(r) = bound(sql, restoring_since, id)? {
-        return Ok(Err(r));
+    match bound(sql, restoring_since, id)? {
+        Err(r) => return Ok(Err(r)),
+        Ok(ReportKind::Move) => return Ok(Err(GateRefusal::MoveNotEmpty)),
+        Ok(ReportKind::Restore) => {}
     }
     for i in ids {
         poll_once(sql.exec(
@@ -469,6 +627,16 @@ pub fn ack<S: Sql>(
     Ok(Ok(()))
 }
 
+/// After the lift check passed, in the `sync` that clears the entry: a
+/// `move` report uses the seal up (no other `move` report is taken), and
+/// the report is forgotten.
+pub fn lifted<S: Sql>(sql: &S) -> Result<()> {
+    if stored(sql)?.is_some_and(|r| r.kind == ReportKind::Move) {
+        super::import::mark_move_lifted(sql)?;
+    }
+    clear(sql)
+}
+
 /// Forgets the report, its blocker ids and its acknowledgements.
 pub fn clear<S: Sql>(sql: &S) -> Result<()> {
     poll_once(sql.exec("DELETE FROM unit_gate_acks", &[]))??;
@@ -478,22 +646,44 @@ pub fn clear<S: Sql>(sql: &S) -> Result<()> {
 }
 
 /// The lift check (module doc), but for the proof the `sync` names.
-/// `Ok(proof)`: what the lift record must carry.
+/// `Ok(proof)`: what the lift record must carry. `managed_root`: the
+/// unit is the root unit of a tenant other than tenant 0 (a `move`
+/// report lifts nothing else).
 pub fn check<S: Sql>(
     sql: &S,
+    managed_root: bool,
     restoring_since: Option<u64>,
 ) -> Result<std::result::Result<LiftProof, GateRefusal>> {
     let Some(since) = restoring_since else {
         return Ok(Err(GateRefusal::NotRestoring));
     };
-    let Some((id, summary)) = stored(sql)? else {
+    let Some(Stored { id, summary, kind }) = stored(sql)? else {
         return Ok(Err(GateRefusal::NoReport));
     };
     if id.since != since {
         return Ok(Err(GateRefusal::NoReport));
     }
-    if stamp_counter(sql)? != Some(id.ordinal) {
-        return Ok(Err(GateRefusal::StampNotLevelled));
+    // A move's import that is not sealed keeps the unit closed under every
+    // entry, whatever the report: a partial import is never lifted, not
+    // even after a rollback to a point inside the window (both give-ups
+    // empty the unit first, and AM-15's re-entry follows the seal).
+    if super::import::import_since(sql)?.is_some() && super::import::sealed(sql)?.is_none() {
+        return Ok(Err(GateRefusal::ImportNotSealed));
+    }
+    match kind {
+        ReportKind::Restore => {
+            if stamp_counter(sql)? != Some(id.ordinal) {
+                return Ok(Err(GateRefusal::StampNotLevelled));
+            }
+        }
+        ReportKind::Move => {
+            if let Err(r) = move_bound(sql, managed_root, &id)? {
+                return Ok(Err(r));
+            }
+            if !empty_and_complete(&summary) {
+                return Ok(Err(GateRefusal::Closed));
+            }
+        }
     }
     let stored_lists = lists(sql)?;
     if !lists_match(&summary, &stored_lists) {
@@ -535,10 +725,11 @@ pub fn check<S: Sql>(
 /// proof.
 pub fn check_named<S: Sql>(
     sql: &S,
+    managed_root: bool,
     restoring_since: Option<u64>,
     named: Option<&LiftProof>,
 ) -> Result<std::result::Result<(), GateRefusal>> {
-    let proof = match check(sql, restoring_since)? {
+    let proof = match check(sql, managed_root, restoring_since)? {
         Ok(p) => p,
         Err(r) => return Ok(Err(r)),
     };
@@ -549,21 +740,22 @@ pub fn check_named<S: Sql>(
 }
 
 /// The stored report and what a lift needs, for `gate_status`.
-pub fn status<S: Sql>(sql: &S, restoring_since: Option<u64>) -> Result<Value> {
+pub fn status<S: Sql>(sql: &S, managed_root: bool, restoring_since: Option<u64>) -> Result<Value> {
     let report = stored(sql)?;
     let decision = match &report {
-        Some((_, summary)) => {
-            serde_json::to_value(gate::lift(&findings(summary, lists(sql)?), &acks(sql)?))
+        Some(r) => {
+            serde_json::to_value(gate::lift(&findings(&r.summary, lists(sql)?), &acks(sql)?))
                 .map_err(|_| BridgeError::Invalid("unit: lift decision"))?
         }
         None => Value::Null,
     };
-    let lift = match check(sql, restoring_since)? {
+    let lift = match check(sql, managed_root, restoring_since)? {
         Ok(proof) => json!({ "ok": proof }),
         Err(why) => json!({ "refused": why }),
     };
     Ok(json!({
-        "replay_id": report.as_ref().map(|(id, _)| id),
+        "replay_id": report.as_ref().map(|r| &r.id),
+        "kind": report.as_ref().map(|r| r.kind),
         "decision": decision,
         "stamp_counter": stamp_counter(sql)?,
         "counters_on": counters_on(sql)?,
