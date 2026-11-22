@@ -57,6 +57,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use subtle::ConstantTimeEq;
 use velmora::rng::FillRandom;
 
+use super::apply::{Feed, Mode};
 use super::chain::Put;
 use super::checkpoint::{
     advance, checkpoint_holds, checkpoint_name, read_key_chain, reopen_closed,
@@ -434,84 +435,6 @@ fn plan<K: Kek>(
     }
 }
 
-/// The status in force of an entry, `m/rk/` included.
-fn in_force(e: &Entry, revoked: &BTreeSet<String>) -> Entry {
-    let mut e = e.clone();
-    if revoked.contains(&e.door.id) {
-        e.door.status = SubjectStatus::Revoked;
-    }
-    e
-}
-
-/// The entries a store at `held`, holding `closed` closed, needs to reach
-/// `table.seq()`, with the revocations in force.
-fn entries_for(
-    table: &KeyTable,
-    held: u64,
-    revoked: &BTreeSet<String>,
-    closed: &BTreeSet<String>,
-) -> Vec<Entry> {
-    table
-        .entries()
-        .filter(|e| {
-            e.last_seq > held || revoked.contains(&e.door.id) || closed.contains(&e.door.id)
-        })
-        .map(|e| in_force(e, revoked))
-        .collect()
-}
-
-/// Brings one unit to the table's seq before the directory acknowledged
-/// the head. `acked` is the seq the directory holds (0 when it cannot be
-/// read). A subject whose newest opening record (`opened_seq`) is above
-/// it is sent closed (held `disabled` until a run after the directory
-/// opens it); any other is sent as it is. So nothing opens at a unit
-/// before the directory has it, a closing record that follows an
-/// unacknowledged opening one does not open it either, and the unit
-/// still reaches the head.
-async fn bring_up_closing<U: KeyTarget>(
-    target: &U,
-    table: &KeyTable,
-    revoked: &BTreeSet<String>,
-    acked: u64,
-) -> Result<()> {
-    let held = target.keys_seq().await?;
-    if held >= table.seq() && revoked.is_empty() {
-        return Ok(());
-    }
-    // What the unit holds closed: an opening it holds open at or below
-    // its own seq was opened there after a directory acknowledged it.
-    let closed: BTreeSet<String> = target.closed().await?.into_iter().collect();
-    let none = BTreeSet::new();
-    let entries: Vec<Entry> = entries_for(table, held, revoked, &none)
-        .into_iter()
-        .map(|mut e| {
-            let acknowledged =
-                e.opened_seq <= acked || (e.opened_seq <= held && !closed.contains(&e.door.id));
-            if !acknowledged && e.door.status != SubjectStatus::Revoked {
-                e.private = None;
-            }
-            e
-        })
-        .collect();
-    target.apply(table.seq(), &entries).await
-}
-
-/// Brings one store to the table's seq.
-async fn bring_up<U: KeyTarget>(
-    target: &U,
-    table: &KeyTable,
-    revoked: &BTreeSet<String>,
-) -> Result<()> {
-    let held = target.keys_seq().await?;
-    let closed: BTreeSet<String> = target.closed().await?.into_iter().collect();
-    if held >= table.seq() && revoked.is_empty() && closed.is_empty() {
-        return Ok(());
-    }
-    target
-        .apply(table.seq(), &entries_for(table, held, revoked, &closed))
-        .await
-}
-
 /// What the stores acknowledged.
 #[derive(Clone, Copy)]
 pub(super) struct Acks {
@@ -588,16 +511,17 @@ where
     /// with everything. So a closing change needs no directory, and no
     /// unit opens anything the directory does not have.
     pub(super) async fn apply_all(&self, table: &KeyTable, revoked: &BTreeSet<String>) -> Acks {
+        let feed = Feed::new(self.store, self.kek, self.ring, table, revoked);
         let acked = self.directory.keys_seq().await.unwrap_or(0);
         let mut closed = true;
         for unit in self.units {
-            closed &= bring_up_closing(unit, table, revoked, acked).await.is_ok();
+            closed &= feed.bring_up(unit, Mode::Closing { acked }).await.is_ok();
         }
-        let directory = bring_up(self.directory, table, revoked).await.is_ok();
+        let directory = feed.bring_up(self.directory, Mode::Full).await.is_ok();
         let mut units = directory;
         if directory {
             for unit in self.units {
-                units &= bring_up(unit, table, revoked).await.is_ok();
+                units &= feed.bring_up(unit, Mode::Full).await.is_ok();
             }
         }
         Acks {
@@ -1191,23 +1115,18 @@ where
     // The units with what closes, the directory, then the units in full
     // once the directory has the head: nothing opens at a unit before the
     // directory has it.
+    let feed = Feed::new(env.store, env.kek, env.ring, &table, &read.revoked);
     let acked = env.directory.keys_seq().await.unwrap_or(0);
     for unit in env.units {
-        if bring_up_closing(unit, &table, &read.revoked, acked)
-            .await
-            .is_err()
-        {
+        if feed.bring_up(unit, Mode::Closing { acked }).await.is_err() {
             report.failed.push(unit.label().to_owned());
         }
     }
-    if bring_up(env.directory, &table, &read.revoked)
-        .await
-        .is_err()
-    {
+    if feed.bring_up(env.directory, Mode::Full).await.is_err() {
         report.failed.push(env.directory.label().to_owned());
     } else {
         for unit in env.units {
-            if bring_up(unit, &table, &read.revoked).await.is_err()
+            if feed.bring_up(unit, Mode::Full).await.is_err()
                 && !report.failed.iter().any(|l| l == unit.label())
             {
                 report.failed.push(unit.label().to_owned());

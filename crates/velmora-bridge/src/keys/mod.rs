@@ -28,6 +28,7 @@
 //! [`writer`] does, and if a change whose record is written always
 //! reaches every copy, which is what [`writer::finish_keys`] does.
 
+pub mod apply;
 pub mod audit;
 pub mod buckets;
 pub mod chain;

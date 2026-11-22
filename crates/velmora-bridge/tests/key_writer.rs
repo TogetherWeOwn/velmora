@@ -25,8 +25,9 @@ use velmora_bridge::keys::chain::Put;
 use velmora_bridge::keys::checkpoint::{list_checkpoints, read_key_chain};
 use velmora_bridge::keys::gate::testkit::FakeGate;
 use velmora_bridge::keys::ports::{
-    Admission, Binding, BucketAdmission, BucketPut, BucketRecords, BucketReservation, ControlChain,
-    ControlIntents, KeyAdmission, KeyTarget, OpeningChange, Refusal,
+    Admission, Applied, ApplyEntry, Binding, BucketAdmission, BucketPut, BucketRecords,
+    BucketReservation, ControlChain, ControlIntents, KeyAdmission, KeyTarget, OpeningChange,
+    Refusal, MAX_APPLY,
 };
 use velmora_bridge::keys::record::{
     grant_within, key_chain, open_key_record, seal_key_record, Access, Entry, Grant, KeyOp, OneKey,
@@ -69,6 +70,10 @@ struct FakeTarget {
     rows: RefCell<BTreeMap<String, Entry>>,
     down: Cell<bool>,
     applies: Cell<u32>,
+    /// The seqs of the markers it was sent.
+    markers: RefCell<Vec<u64>>,
+    /// Goes down after this many more applies.
+    down_after: Cell<Option<u32>>,
 }
 
 impl FakeTarget {
@@ -79,6 +84,8 @@ impl FakeTarget {
             rows: RefCell::new(BTreeMap::new()),
             down: Cell::new(false),
             applies: Cell::new(0),
+            markers: RefCell::new(Vec::new()),
+            down_after: Cell::new(None),
         }
     }
 
@@ -122,14 +129,41 @@ impl KeyTarget for FakeTarget {
             .collect())
     }
 
-    /// As the port says: per subject, in chain order.
-    async fn apply(&self, to_seq: u64, entries: &[Entry]) -> Result<()> {
+    /// As the port says (AM-12): an exclusive base, no gap, at most a
+    /// page, `Behind` above the store's seq; then per subject, in chain
+    /// order. A call that breaks the run fails the test.
+    async fn apply(&self, from_seq: u64, entries: &[ApplyEntry]) -> Result<Applied> {
+        match self.down_after.get() {
+            Some(0) => self.down.set(true),
+            Some(n) => self.down_after.set(Some(n - 1)),
+            None => {}
+        }
         if self.down.get() {
             return Err(BridgeError::Sql("fake: down".into()));
+        }
+        if from_seq > self.seq.get() {
+            return Ok(Applied::Behind {
+                keys_seq: self.seq.get(),
+            });
+        }
+        assert!(
+            entries.len() <= MAX_APPLY,
+            "{}: more than a page",
+            self.label
+        );
+        for (i, e) in entries.iter().enumerate() {
+            assert_eq!(e.seq(), from_seq + 1 + i as u64, "{}: a gap", self.label);
         }
         self.applies.set(self.applies.get() + 1);
         let mut rows = self.rows.borrow_mut();
         for e in entries {
+            let e = match e {
+                ApplyEntry::Subject(e) => e,
+                ApplyEntry::Marker { seq } => {
+                    self.markers.borrow_mut().push(*seq);
+                    continue;
+                }
+            };
             let was_revoked = rows
                 .get(&e.door.id)
                 .is_some_and(|r| r.door.status == SubjectStatus::Revoked);
@@ -152,8 +186,11 @@ impl KeyTarget for FakeTarget {
                 }
             }
         }
-        self.seq.set(self.seq.get().max(to_seq));
-        Ok(())
+        let last = from_seq + entries.len() as u64;
+        self.seq.set(self.seq.get().max(last));
+        Ok(Applied::Done {
+            keys_seq: self.seq.get(),
+        })
     }
 }
 
@@ -685,8 +722,8 @@ impl KeyTarget for &FakeTarget {
     async fn closed(&self) -> Result<Vec<String>> {
         KeyTarget::closed(*self).await
     }
-    async fn apply(&self, to_seq: u64, entries: &[Entry]) -> Result<()> {
-        KeyTarget::apply(*self, to_seq, entries).await
+    async fn apply(&self, from_seq: u64, entries: &[ApplyEntry]) -> Result<Applied> {
+        KeyTarget::apply(*self, from_seq, entries).await
     }
 }
 
@@ -1883,8 +1920,8 @@ impl KeyTarget for Hooked<'_> {
     async fn closed(&self) -> Result<Vec<String>> {
         KeyTarget::closed(self.inner).await
     }
-    async fn apply(&self, to_seq: u64, entries: &[Entry]) -> Result<()> {
-        KeyTarget::apply(self.inner, to_seq, entries).await
+    async fn apply(&self, from_seq: u64, entries: &[ApplyEntry]) -> Result<Applied> {
+        KeyTarget::apply(self.inner, from_seq, entries).await
     }
 }
 
@@ -1961,8 +1998,13 @@ async fn a_stale_open_entry_never_replaces_a_newer_closed_one() {
         t
     };
     for unit in [&w.root, &w.unit2] {
-        let entries: Vec<Entry> = stale_table.entries().cloned().collect();
-        KeyTarget::apply(unit, 2, &entries).await.unwrap();
+        // Each stale entry alone at its own seq, as a resend is sent.
+        for e in stale_table.entries().cloned() {
+            let base = e.last_seq - 1;
+            KeyTarget::apply(unit, base, &[ApplyEntry::Subject(e)])
+                .await
+                .unwrap();
+        }
         assert_eq!(
             unit.status("AKVL0001"),
             Some(SubjectStatus::Disabled),
@@ -2157,20 +2199,23 @@ async fn a_revoked_row_stays_revoked() {
     let mut closed = w.unit2.row("AKVL0001").unwrap();
     closed.private = None;
     let unit = FakeTarget::new("unit 3");
-    KeyTarget::apply(&unit, 3, std::slice::from_ref(&closed))
-        .await
-        .unwrap();
+    // Stores far enough ahead that each entry is sent alone at its seq.
+    unit.seq.set(10);
+    w.root.seq.set(10);
+    let at = |e: &Entry| (e.last_seq - 1, [ApplyEntry::Subject(e.clone())]);
+    let (base, one) = at(&closed);
+    KeyTarget::apply(&unit, base, &one).await.unwrap();
     let mut same = open.clone();
     same.last_seq = closed.last_seq;
-    KeyTarget::apply(&unit, 3, &[same]).await.unwrap();
+    let (base, one) = at(&same);
+    KeyTarget::apply(&unit, base, &one).await.unwrap();
     assert_eq!(unit.status("AKVL0001"), Some(SubjectStatus::Revoked));
     // A newer entry that is not revoked.
     let mut newer = open;
     newer.last_seq = 9;
     for store in [&w.root, &unit] {
-        KeyTarget::apply(store, 9, std::slice::from_ref(&newer))
-            .await
-            .unwrap();
+        let (base, one) = at(&newer);
+        KeyTarget::apply(store, base, &one).await.unwrap();
         assert_eq!(store.status("AKVL0001"), Some(SubjectStatus::Revoked));
     }
 }
@@ -5710,6 +5755,304 @@ async fn a_freeze_the_receipt_does_not_name_is_thawed_before_a_new_one() {
         })
     );
     assert_eq!(head_table(&w).await.frozen_at(), Some(4));
+}
+
+// ---------------------------------------------------------------------------
+// apply(from_seq): one entry per record, pages, Behind
+// ---------------------------------------------------------------------------
+
+use velmora_bridge::keys::apply::{apply_direct, ERR_APPLY_BEHIND};
+
+/// Plants `subject` at `seq` with `op` (no reservation: a fixture).
+fn plant(w: &World, seq: u64, op: KeyOp, subject: &Subject, frozen_at: Option<u64>) {
+    let closes = op == KeyOp::Status && subject.door.status != SubjectStatus::Active;
+    let bytes = seal_key_record(
+        &w.kek,
+        &w.ring,
+        &w.t,
+        seq,
+        op,
+        seq,
+        &subject.door,
+        Some(&subject.private),
+        closes,
+        frozen_at,
+        &mut TestRng(10_000 + seq),
+    )
+    .unwrap();
+    w.store.plant(&key_chain(&w.t).name(seq), bytes);
+}
+
+fn plant_marker(w: &World, seq: u64, marker: Marker) {
+    let bytes = seal_marker_record(
+        &w.kek,
+        &w.ring,
+        &w.t,
+        seq,
+        seq,
+        marker,
+        &mut TestRng(20_000 + seq),
+    )
+    .unwrap();
+    w.store.plant(&key_chain(&w.t).name(seq), bytes);
+}
+
+/// `n` principals, `PA0001` …, at seqs 1 to n.
+fn plant_principals(w: &World, n: u64) {
+    for seq in 1..=n {
+        plant(
+            w,
+            seq,
+            KeyOp::Create,
+            &principal(&format!("PA{seq:04}"), &[]),
+            None,
+        );
+    }
+}
+
+/// A store far behind gets every record after its seq, one entry per
+/// record, in pages of at most 100 with no gap (the fake asserts both).
+#[tokio::test(flavor = "current_thread")]
+async fn a_store_behind_gets_every_record_in_pages_without_a_gap() {
+    let w = World::new();
+    plant_principals(&w, 250);
+    let table = head_table(&w).await;
+    let none = Default::default();
+    let fresh = FakeTarget::new("fresh");
+    apply_direct(&w.store, &w.kek, &w.ring, &table, &none, &fresh)
+        .await
+        .unwrap();
+    assert_eq!(fresh.seq.get(), 250);
+    assert_eq!(fresh.applies.get(), 3, "100 + 100 + 50");
+    assert_eq!(fresh.rows.borrow().len(), 250);
+    // From its own seq: only what it lacks.
+    let mid = FakeTarget::new("mid");
+    mid.seq.set(120);
+    apply_direct(&w.store, &w.kek, &w.ring, &table, &none, &mid)
+        .await
+        .unwrap();
+    assert_eq!(mid.applies.get(), 2, "121..=220, 221..=250");
+    assert_eq!(mid.rows.borrow().len(), 130);
+    // At the head: nothing to send.
+    apply_direct(&w.store, &w.kek, &w.ring, &table, &none, &mid)
+        .await
+        .unwrap();
+    assert_eq!(mid.applies.get(), 2);
+}
+
+/// A store that stops between two pages holds the chain exactly as of
+/// the last page it took: a subject disabled in page 1 and re-enabled in
+/// page 2 is disabled there, never its older open state.
+#[tokio::test(flavor = "current_thread")]
+async fn a_store_that_stops_between_pages_holds_the_chain_as_of_its_last_page() {
+    let w = World::new();
+    let x = principal("PX0001", &[]);
+    plant(&w, 1, KeyOp::Create, &x, None);
+    for seq in 2..=149 {
+        plant(
+            &w,
+            seq,
+            KeyOp::Create,
+            &principal(&format!("PA{seq:04}"), &[]),
+            None,
+        );
+    }
+    let mut off = x.clone();
+    off.door.status = SubjectStatus::Disabled;
+    plant(&w, 50, KeyOp::Status, &off, None);
+    plant(&w, 150, KeyOp::Status, &x, None);
+    let table = head_table(&w).await;
+    assert_eq!(
+        table.get("PX0001").unwrap().door.status,
+        SubjectStatus::Active
+    );
+    let unit = FakeTarget::new("unit");
+    unit.down_after.set(Some(1));
+    let none = Default::default();
+    assert!(
+        apply_direct(&w.store, &w.kek, &w.ring, &table, &none, &unit)
+            .await
+            .is_err()
+    );
+    assert_eq!(unit.seq.get(), 100);
+    let row = unit.row("PX0001").unwrap();
+    assert_eq!(row.last_seq, 50);
+    assert_eq!(row.door.status, SubjectStatus::Disabled);
+    // Once back, the rest: the head's state.
+    unit.down.set(false);
+    unit.down_after.set(None);
+    apply_direct(&w.store, &w.kek, &w.ring, &table, &none, &unit)
+        .await
+        .unwrap();
+    assert_eq!(unit.seq.get(), 150);
+    assert_eq!(
+        unit.row("PX0001").unwrap(),
+        table.get("PX0001").unwrap().clone()
+    );
+}
+
+/// The markers of a freeze and a thaw hold their seqs' places; the store
+/// skips them and reaches the head.
+#[tokio::test(flavor = "current_thread")]
+async fn markers_hold_their_place_in_the_run() {
+    let w = World::new();
+    plant_principals(&w, 3);
+    plant_marker(&w, 4, Marker::KeysFrozen);
+    plant(
+        &w,
+        5,
+        KeyOp::Grants,
+        &principal("PA0001", &[grant("b_09", RW, None)]),
+        Some(3),
+    );
+    plant_marker(&w, 6, Marker::KeysThawed { ends: 3 });
+    plant(&w, 7, KeyOp::Create, &principal("PA0007", &[]), None);
+    let table = head_table(&w).await;
+    assert_eq!(table.seq(), 7);
+    let unit = FakeTarget::new("unit");
+    apply_direct(
+        &w.store,
+        &w.kek,
+        &w.ring,
+        &table,
+        &Default::default(),
+        &unit,
+    )
+    .await
+    .unwrap();
+    assert_eq!(unit.seq.get(), 7);
+    assert_eq!(*unit.markers.borrow(), vec![4, 6]);
+    assert_eq!(unit.rows.borrow().len(), 4);
+}
+
+/// A store restored between its `keys_seq` and the apply answers
+/// `Behind`; the bring-up reads it again and sends from its own seq. One
+/// that keeps falling behind fails after a bound.
+#[tokio::test(flavor = "current_thread")]
+async fn a_store_that_answers_behind_is_read_again() {
+    struct Restored<'a> {
+        inner: &'a FakeTarget,
+        restores: Cell<u32>,
+        /// Reports this seq whatever it holds (restored after each read).
+        reports: Option<u64>,
+    }
+    impl KeyTarget for Restored<'_> {
+        fn label(&self) -> &str {
+            "restored"
+        }
+        async fn keys_seq(&self) -> Result<u64> {
+            match self.reports {
+                Some(n) => Ok(n),
+                None => KeyTarget::keys_seq(self.inner).await,
+            }
+        }
+        async fn closed(&self) -> Result<Vec<String>> {
+            KeyTarget::closed(self.inner).await
+        }
+        async fn apply(&self, from_seq: u64, entries: &[ApplyEntry]) -> Result<Applied> {
+            if self.restores.get() > 0 {
+                self.restores.set(self.restores.get() - 1);
+                self.inner.reset();
+            }
+            KeyTarget::apply(self.inner, from_seq, entries).await
+        }
+    }
+    let w = World::new();
+    plant_principals(&w, 30);
+    let table = head_table(&w).await;
+    let none = Default::default();
+    let inner = FakeTarget::new("inner");
+    inner.seq.set(20);
+    let once = Restored {
+        inner: &inner,
+        restores: Cell::new(1),
+        reports: None,
+    };
+    apply_direct(&w.store, &w.kek, &w.ring, &table, &none, &once)
+        .await
+        .unwrap();
+    assert_eq!(inner.seq.get(), 30);
+    assert_eq!(inner.rows.borrow().len(), 30, "everything again from seq 1");
+    let inner = FakeTarget::new("inner");
+    inner.seq.set(20);
+    let always = Restored {
+        inner: &inner,
+        restores: Cell::new(u32::MAX),
+        reports: Some(20),
+    };
+    let err = apply_direct(&w.store, &w.kek, &w.ring, &table, &none, &always)
+        .await
+        .unwrap_err();
+    assert_eq!(err.to_string(), ERR_APPLY_BEHIND.to_string());
+    assert_eq!(inner.applies.get(), 0, "nothing was kept");
+}
+
+/// The writer's own bring-up after a change sends one entry per new
+/// record, and a subject held closed at the unit is sent again alone at
+/// its own seq once the directory has it.
+#[tokio::test(flavor = "current_thread")]
+async fn a_change_sends_its_record_and_the_second_send_is_one_entry() {
+    let w = World::new();
+    let adm = FakeAdmission::new(&w.root);
+    let mut table = seed(&w, &adm).await;
+    let units = w.units();
+    let env = env!(w, &adm, &units);
+    let mut rng = TestRng(400);
+    w.directory.down.set(true);
+    let k = s3_key(&w.t, "AKVL0002", "PR0001", &[grant("b_01", RO, None)]);
+    assert_eq!(
+        env.change(&mut table, "i-k2", &KeyRequest::Create(k), &mut rng)
+            .await
+            .unwrap(),
+        KeyAnswer::Unfinished { seq: 3 }
+    );
+    assert_eq!(w.root.seq.get(), 3);
+    assert!(w.root.row("AKVL0002").unwrap().private.is_none(), "held");
+    w.directory.down.set(false);
+    let before = w.root.applies.get();
+    let report = finish_keys(&env, &mut rng).await.unwrap();
+    assert!(!report.retry(), "{report:?}");
+    assert!(w.root.row("AKVL0002").unwrap().private.is_some());
+    assert_eq!(
+        w.root.applies.get() - before,
+        1,
+        "only the second send, alone"
+    );
+}
+
+/// An `m/rk/` revocation the chain does not record yet is in force in
+/// every entry sent: in the pages, and alone at its seq for a store that
+/// already holds the record.
+#[tokio::test(flavor = "current_thread")]
+async fn an_unrecorded_revocation_is_in_force_in_every_entry_sent() {
+    let w = World::new();
+    plant_principals(&w, 3);
+    let table = head_table(&w).await;
+    let revoked: std::collections::BTreeSet<String> = ["PA0002".to_owned()].into();
+    let fresh = FakeTarget::new("fresh");
+    apply_direct(&w.store, &w.kek, &w.ring, &table, &revoked, &fresh)
+        .await
+        .unwrap();
+    assert_eq!(fresh.status("PA0002"), Some(SubjectStatus::Revoked));
+    assert_eq!(fresh.status("PA0001"), Some(SubjectStatus::Active));
+    // A store at the head: one call, the revoke alone.
+    let at_head = FakeTarget::new("at head");
+    apply_direct(
+        &w.store,
+        &w.kek,
+        &w.ring,
+        &table,
+        &Default::default(),
+        &at_head,
+    )
+    .await
+    .unwrap();
+    let before = at_head.applies.get();
+    apply_direct(&w.store, &w.kek, &w.ring, &table, &revoked, &at_head)
+        .await
+        .unwrap();
+    assert_eq!(at_head.applies.get() - before, 1);
+    assert_eq!(at_head.status("PA0002"), Some(SubjectStatus::Revoked));
 }
 
 /// Review r1 (M1): on a frozen chain a principal's revoke has no `m/rk/`
