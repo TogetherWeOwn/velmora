@@ -19,9 +19,11 @@ opt-level = 3
 [profile.test.package.velmora-s3-proto]
 opt-level = 3
 
-# Release build of the Worker. The wasm has a size budget (CI: under
-# 3,000,000 bytes) and carries a TLS stack for the proxied NNTP route, so
-# it is built for size with whole-program LTO. The code that touches every
+# Release build of the Worker. It carries a TLS stack for the proxied NNTP
+# route, and every MB of wasm costs about 10.5 ms on a request served by a
+# new isolate (CI reports the size against main and warns on growth; its
+# only hard limit is Cloudflare's 64 MiB), so it is built for size with
+# whole-program LTO. The code that touches every
 # byte of an object is kept at opt-level 3: the engine, bridge and S3
 # library crates, the cipher, MAC, hash and checksum crates, and the
 # crates that move bytes between the runtime and the Worker. Measured on
@@ -30,9 +32,12 @@ opt-level = 3
 # measurement.
 #
 # Built for size all the same: the Worker crate itself (where the
-# bridge's generic code is instantiated; at 3 the wasm is over the
-# budget) and the TLS crates of the proxied route (`ring`, `rustls`; at
-# 3 they fit, and the CPU of a proxied read was not clearly lower).
+# bridge's generic code is instantiated; at 3 the wasm is about 727 KB
+# larger and its CPU is not measured; at "z" it is about 154 KB smaller,
+# but wasm CPU per MiB rose 3 to 11% in every stage of the local
+# end-to-end profile, 7 runs a side, so it stays at "s") and the TLS
+# crates of the proxied route (`ring`, `rustls`; at 3 they add about 208
+# KB, and the CPU of a proxied read was not clearly lower).
 [profile.release]
 opt-level = "s"
 lto = "fat"

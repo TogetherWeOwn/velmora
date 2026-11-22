@@ -1653,3 +1653,126 @@ async fn only_fk_guarded(fx: &Fx, sql: &str, params: &[SqlValue], table: &str) -
             .iter()
             .all(|&i| i > 0 && op(&code[i - 1]) == "FkIfZero")
 }
+
+// ---------------------------------------------------------------------------
+// UploadPart reads its own part only
+// ---------------------------------------------------------------------------
+
+/// Every `gc` row as `extent:action:due_at`, sorted.
+async fn gc_rows(fx: &Fx) -> Vec<String> {
+    fx.texts(
+        "SELECT extent_id || ':' || action || ':' || due_at FROM gc \
+         ORDER BY extent_id, action",
+        &[],
+    )
+    .await
+}
+
+fn gc_want(extents: &[&ExtentId], now: UnixMs) -> Vec<String> {
+    let mut want: Vec<String> = extents
+        .iter()
+        .flat_map(|x| {
+            [
+                format!("{x}:delete_safety:{}", now.0),
+                format!("{x}:shred_key:{}", now.0 + DAY_MS),
+            ]
+        })
+        .collect();
+    want.sort();
+    want
+}
+
+/// Every step of the query plan of `sql`.
+async fn plan_steps(fx: &Fx, sql: &str, params: &[SqlValue]) -> Vec<String> {
+    let plan = fx
+        .cat
+        .sql
+        .db
+        .query(&format!("EXPLAIN QUERY PLAN {sql}"), params)
+        .await
+        .unwrap();
+    plan.into_iter()
+        .map(|row| match &row[3] {
+            SqlValue::Text(step) => step.clone(),
+            other => panic!("unexpected {other:?}"),
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn upload_part_seeks_its_own_part_and_gc_rows_are_unchanged() {
+    let fx = Fx::new().await;
+    let id = fx.create(&fx.bucket, KEY).await;
+    let t = target(&fx.bucket, KEY, &id);
+    // Other parts, one of them sliced: none of them may be read or sent
+    // to GC by a replacement of part 2.
+    let (one, _) = fx.part(&t, 1, 100).await;
+    let (sliced3, _) = fx.sliced(&t, 3, &[100, 100, 40]).await;
+    for n in 4..=40 {
+        fx.part(&t, n, 10).await;
+    }
+    let (two, _) = fx.sliced(&t, 2, &[100, 60]).await;
+    assert!(fx.gc_extents().await.is_empty());
+
+    // The state alone, from the upload row.
+    assert_eq!(
+        fx.cat.upload_state(&t).await.unwrap(),
+        Some(UploadState::Open)
+    );
+    let other = fx.create(&fx.other_bucket, KEY).await;
+    assert_eq!(
+        fx.cat
+            .upload_state(&target(&fx.bucket, KEY, &other))
+            .await
+            .unwrap(),
+        None,
+        "an upload id of another bucket is unknown here"
+    );
+
+    // Replace part 2 (two extents) by one extent: exactly its two
+    // extents go to GC, each with both actions, as before.
+    fx.cat.sql.batched.borrow_mut().clear();
+    let (two_new, g) = fx.part(&t, 2, 70).await;
+    assert_eq!(g, Guard::Applied(()));
+    assert_eq!(gc_rows(&fx).await, gc_want(&[&two[0], &two[1]], T0));
+
+    // No statement of that batch walks the parts of the upload, whatever
+    // the alias: only the part tables have an `upload_id` column, so
+    // `(upload_id=?)` alone is such a walk; and nothing is scanned but
+    // constant rows and the one-row `restore_state`.
+    let ran = std::mem::take(&mut *fx.cat.sql.batched.borrow_mut());
+    let mut by_part = 0;
+    for (sql, params) in &ran {
+        for step in plan_steps(&fx, sql, params).await {
+            by_part += usize::from(step.contains("(upload_id=? AND part_number=?)"));
+            let scan_ok =
+                ["SCAN CONSTANT ROW", "SCAN a", "SCAN restore_state"].contains(&step.as_str());
+            assert!(
+                !step.contains("(upload_id=?)") && (!step.starts_with("SCAN ") || scan_ok),
+                "{sql}\n{step}"
+            );
+        }
+    }
+    assert!(
+        by_part >= 3,
+        "the GC select (both tables) and the piece delete"
+    );
+
+    // Abort sends every remaining part extent to GC, as before.
+    assert_eq!(
+        fx.cat.abort_upload(&t, T0).await.unwrap(),
+        Guard::Applied(())
+    );
+    let parts = fx.read(&t).await.1;
+    assert_eq!(parts.len(), 40);
+    let mut all: Vec<ExtentId> = vec![two[0].clone(), two[1].clone()];
+    all.extend(parts.iter().map(|p| p.extent_id.clone()));
+    all.extend(sliced3[1..].iter().cloned());
+    assert!(all.contains(&one) && all.contains(&two_new));
+    let refs: Vec<&ExtentId> = all.iter().collect();
+    assert_eq!(gc_rows(&fx).await, gc_want(&refs, T0));
+    assert_eq!(
+        fx.cat.upload_state(&t).await.unwrap(),
+        Some(UploadState::Aborted)
+    );
+}
