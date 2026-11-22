@@ -959,9 +959,10 @@ where
     /// A loss seen before (`suspect` or `unrecoverable`) whose look broke
     /// off: looked at again after the confirm interval with its result
     /// kept, so the next look that finds the loss confirms it. The time
-    /// of the last look that ended stays as it is: once it is more than
-    /// two confirm intervals old, the looks keep breaking off and that is
-    /// said (`scrub-deferred`) on each of them.
+    /// of the last look that ended stays as it is: a look that breaks off
+    /// once that is more than two confirm intervals old is said
+    /// (`scrub-deferred`): the looks since broke off, or the scrub did not
+    /// reach the extent (paused, or runs that ended early).
     async fn defer_seen(
         &self,
         token: u64,
