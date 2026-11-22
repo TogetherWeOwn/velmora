@@ -24,15 +24,18 @@
 //! 5. The record that sets lifecycle `live` (`Activate`), with the
 //!    `external_ref` in its private part, sealed under the tenant key.
 //!
-//! **Answers.** `201` with the tenant when this call wrote `m/tref/` or
-//! took the tenant on from `provisioning`; `200` with it when the
-//! reference names a tenant that is already `live` (or being deleted);
+//! **Answers.** `201` with the tenant for the call that wrote `m/tref/`;
+//! `200` with it for a call that adopts through `m/tref/` (it may finish
+//! a create still in flight), a `live` or deleting tenant included;
 //! `409 external_ref_retired` when it names a shredding or shredded
 //! tenant; `400 jurisdiction_not_served` for any jurisdiction but `none`
 //! (absent means `none`, AM-58); `503` for every store that cannot be
 //! reached, for missing key locations, and while another create holds a
-//! step this one cannot take over. While the head is `provisioning`, an
-//! unborn root unit is expected: nothing pages (AM-58).
+//! step this one cannot take over; `500` with an alert for a record that
+//! does not verify (`m/tref/`, the born marker, the tenant head), a drawn
+//! id that already has a chain, and a birth token the unit refuses (no
+//! retry changes these). While the head is `provisioning`, an unborn root
+//! unit is expected: nothing pages (AM-58).
 //!
 //! Every error answer carries nothing of a store's own text.
 
@@ -388,6 +391,30 @@ fn internal() -> Stop {
     Stop::Answer(Answer::code(Code::InternalError, None))
 }
 
+/// A record that does not verify, or a step no retry can finish: `500`
+/// (kofra-api pages on it), with an alert line of fixed words.
+fn damaged(what: &'static str) -> Stop {
+    crate::trace::alert(|| format!("mgmt: tenant create stopped: {what}"));
+    internal()
+}
+
+/// A store answer: `500` for a record that does not verify (a control
+/// record's seal or form: `BridgeError::Crypto`), `503` for the rest.
+fn store_stop(e: &BridgeError, what: &'static str) -> Stop {
+    match e {
+        BridgeError::Crypto(_) => damaged(what),
+        _ => unavailable(),
+    }
+}
+
+/// A chain answer: `500` for a head that does not verify, `503` else.
+fn chain_stop(e: &ChainError) -> Stop {
+    match e {
+        ChainError::Damaged(_) | ChainError::PrivateUnreadable => damaged("tenant head damaged"),
+        _ => unavailable(),
+    }
+}
+
 /// Runs a tenant create. `rng` draws the tenant id and seals the
 /// control records; it is taken for the call.
 pub async fn create_tenant<P, R, U, G>(
@@ -435,8 +462,8 @@ where
     let now = root.clock().now();
 
     // 1. m/tref/: create-or-adopt.
-    let tenant = match read_tref(records, kek, &body.external_ref).await {
-        Ok(Some(t)) => t,
+    let (tenant, ours) = match read_tref(records, kek, &body.external_ref).await {
+        Ok(Some(t)) => (t, false),
         Ok(None) => {
             let mut id = [0u8; ID_BYTES];
             rng.fill_bytes(&mut id).map_err(|_| unavailable())?;
@@ -445,16 +472,24 @@ where
             // tenant 0 and is never named (the retry draws again).
             crate::TenantId::parse(&text).map_err(|_| unavailable())?;
             let drawn = crate::unit::TenantId::parse(&text).ok_or_else(internal)?;
+            // An id that already has a chain is never named for another
+            // workspace (a weak or broken random source): draw again on
+            // the retry.
+            let drawn_chain = crate::TenantId::parse(&text).map_err(|_| internal())?;
+            if head(root, &Tenant::Managed(drawn_chain)).await?.is_some() {
+                return Err(damaged("drawn tenant id has a chain"));
+            }
             match put_tref(records, kek, &body.external_ref, &drawn, rng).await {
-                Ok(true) => drawn,
+                Ok(true) => (drawn, true),
                 Ok(false) => match read_tref(records, kek, &body.external_ref).await {
-                    Ok(Some(t)) => t,
-                    _ => return Err(unavailable()),
+                    Ok(Some(t)) => (t, false),
+                    Ok(None) => return Err(unavailable()),
+                    Err(e) => return Err(store_stop(&e, "tref record does not verify")),
                 },
-                Err(_) => return Err(unavailable()),
+                Err(e) => return Err(store_stop(&e, "tref record")),
             }
         }
-        Err(_) => return Err(unavailable()),
+        Err(e) => return Err(store_stop(&e, "tref record does not verify")),
     };
     let chain_tenant = crate::TenantId::parse(tenant.as_str()).map_err(|_| unavailable())?;
     let t = Tenant::Managed(chain_tenant.clone());
@@ -462,6 +497,13 @@ where
     // An adopted tenant that is already past provisioning is answered as
     // it is.
     let first = head(root, &t).await?;
+    if ours && first.is_some() {
+        // This call named the id a moment ago, after reading no chain.
+        return Err(damaged("a new tenant id has a chain"));
+    }
+    // `201` for the call that named the tenant, `200` for one that adopts
+    // it through `m/tref/` (it may finish a create still in flight).
+    let status = if ours { 201 } else { 200 };
     if let Some(door) = &first {
         match door.lifecycle {
             Lifecycle::Shredding | Lifecycle::Shredded => {
@@ -527,7 +569,7 @@ where
     // 4. Tenant key version 1.
     let door = head(root, &t).await?.ok_or_else(unavailable)?;
     if door.lifecycle != Lifecycle::Provisioning {
-        return finish(root, &tenant, &t).await;
+        return finish(root, &tenant, &t, status).await;
     }
     if door.tk_version == 0 || door.rotating_to.is_some() {
         let locations = match read_locations(records, kek, 0).await {
@@ -574,7 +616,7 @@ where
             Err(_) => return Err(unavailable()),
         }
     }
-    finish(root, &tenant, &t).await
+    finish(root, &tenant, &t, status).await
 }
 
 /// The tenant's head, door part only.
@@ -586,7 +628,7 @@ async fn head<P: RootPorts, R: FillRandom>(
         .head(t, 0)
         .await
         .map(|r| r.map(|r| r.door))
-        .map_err(|_| unavailable())
+        .map_err(|e| chain_stop(&e))
 }
 
 /// The head after the last step: `201` with the tenant once it is
@@ -595,16 +637,11 @@ async fn finish<P: RootPorts, R: FillRandom>(
     root: &Root<'_, P, R>,
     tenant: &crate::unit::TenantId,
     t: &Tenant,
+    status: u16,
 ) -> std::result::Result<Answer, Stop> {
-    let door = root
-        .heads()
-        .head(t, 0)
-        .await
-        .map_err(|_| unavailable())?
-        .ok_or_else(unavailable)?
-        .door;
+    let door = head(root, t).await?.ok_or_else(unavailable)?;
     match door.lifecycle {
-        Lifecycle::Live => answer(tenant.as_str(), &door, 201),
+        Lifecycle::Live => answer(tenant.as_str(), &door, status),
         Lifecycle::Shredding | Lifecycle::Shredded => {
             Ok(Answer::code(Code::ExternalRefRetired, None))
         }
@@ -627,8 +664,9 @@ fn answer(id: &str, door: &Door, status: u16) -> std::result::Result<Answer, Sto
 /// Step 3: `provision` while the head is record 1 and no marker exists,
 /// then the marker. A unit that is born with no marker gets it; a unit
 /// that is not born once the head moved past record 1 cannot be born
-/// with a birth token any more: `503` (an operator's case; it pages
-/// through the log line).
+/// with a birth token any more: `500` with an alert when the unit says
+/// so, `503` with an alert when the router cannot tell it from an
+/// unreachable unit (an operator's case either way).
 async fn birth<P, R, U, G>(
     ports: &CreatePorts<'_, '_, P, R, U>,
     tenant: &crate::unit::TenantId,
@@ -648,15 +686,9 @@ where
     match read_born(records, kek, tenant, ROOT).await {
         Ok(Some(_)) => return Ok(()),
         Ok(None) => {}
-        Err(_) => return Err(unavailable()),
+        Err(e) => return Err(store_stop(&e, "born marker does not verify")),
     }
-    let door = root
-        .heads()
-        .head(t, 0)
-        .await
-        .map_err(|_| unavailable())?
-        .ok_or_else(unavailable)?
-        .door;
+    let door = head(root, t).await?.ok_or_else(unavailable)?;
     let token = birth_token(tenant);
     let sealed = seal_born(kek, &token, rng).map_err(|_| unavailable())?;
     let first_record = door.seq == token.record_seq
@@ -674,6 +706,13 @@ where
                     reason: Refused::Provision(ProvisionRefusal::AlreadyBorn),
                     ..
                 } => true,
+                // The unit refuses the token itself (a name, scheme,
+                // schema or jurisdiction that does not match): no retry
+                // changes that.
+                UnitAnswer::Refused {
+                    reason: Refused::Provision(_),
+                    ..
+                } => return Err(damaged("the root unit refused its birth token")),
                 _ => return Err(unavailable()),
             },
             Err(_) => return Err(unavailable()),
@@ -684,9 +723,23 @@ where
         // between `provision` and the marker).
         match ports.unit.call(tenant, UnitOp::HeldKeys {}).await {
             Ok(a) => matches!(a.reply.answer, UnitAnswer::Ok { .. }),
-            Err(_) => false,
+            // The router answers an unborn listed unit of a `provisioning`
+            // tenant as it answers an unreachable one: `503`, and an alert,
+            // since only an operator can finish a tenant whose unit is
+            // unborn once the head moved past record 1.
+            Err(_) => {
+                crate::trace::alert(|| {
+                    "mgmt: tenant create: root unit unborn or unreachable after record 1"
+                        .to_string()
+                });
+                return Err(unavailable());
+            }
         }
     };
+    if !born && !first_record {
+        // Rule 6 forbids a birth token now, and nothing else makes it.
+        return Err(damaged("root unit unborn after record 1"));
+    }
     if !born {
         return Err(unavailable());
     }

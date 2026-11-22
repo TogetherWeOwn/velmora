@@ -72,24 +72,83 @@ impl FillRandom for TestRng {
 // The root's ports
 // ---------------------------------------------------------------------------
 
+/// Puts counted across every store of a world, for a fault at the k-th.
+#[derive(Default)]
+struct Faults {
+    puts: Cell<u64>,
+    /// The put that fails: refused (nothing stored) or answer lost
+    /// (stored, then an error).
+    at: Cell<Option<(u64, bool)>>,
+}
+
+/// An in-memory store that fails the world's k-th put.
+struct Faulty {
+    inner: MemRecords,
+    faults: Rc<Faults>,
+}
+
+impl std::ops::Deref for Faulty {
+    type Target = MemRecords;
+    fn deref(&self) -> &MemRecords {
+        &self.inner
+    }
+}
+
+impl RecordStore for Faulty {
+    async fn put_if_absent(&self, name: &str, bytes: Vec<u8>) -> Result<bool> {
+        let n = self.faults.puts.get() + 1;
+        self.faults.puts.set(n);
+        match self.faults.at.get() {
+            Some((k, false)) if k == n => Err(BridgeError::Blob("fault: put refused".into())),
+            Some((k, true)) if k == n => {
+                let _ = self.inner.put_if_absent(name, bytes).await?;
+                Err(BridgeError::Blob("fault: answer lost".into()))
+            }
+            _ => self.inner.put_if_absent(name, bytes).await,
+        }
+    }
+    async fn get(&self, name: &str) -> Result<Option<Vec<u8>>> {
+        self.inner.get(name).await
+    }
+    async fn list(&self, prefix: &str, start_after: &str, limit: u32) -> Result<Vec<String>> {
+        self.inner.list(prefix, start_after, limit).await
+    }
+}
+
 struct Ports {
-    records: MemRecords,
-    keys_a: MemRecords,
-    keys_b: MemRecords,
+    records: Faulty,
+    keys_a: Faulty,
+    keys_b: Faulty,
     kek: TestKek,
     clock: FixedClock,
 }
 
+impl Ports {
+    fn new(faults: &Rc<Faults>) -> Ports {
+        let store = || Faulty {
+            inner: MemRecords::new(),
+            faults: faults.clone(),
+        };
+        Ports {
+            records: store(),
+            keys_a: store(),
+            keys_b: store(),
+            kek: TestKek::new(),
+            clock: FixedClock::new(NOW),
+        }
+    }
+}
+
 impl RootPorts for Ports {
-    type Records = MemRecords;
-    type KeyStore = MemRecords;
+    type Records = Faulty;
+    type KeyStore = Faulty;
     type Kek = TestKek;
     type Sql = RusqliteSql;
     type Clock = FixedClock;
-    fn records(&self) -> &MemRecords {
+    fn records(&self) -> &Faulty {
         &self.records
     }
-    fn key_buckets(&self) -> KeyBuckets<'_, MemRecords> {
+    fn key_buckets(&self) -> KeyBuckets<'_, Faulty> {
         KeyBuckets {
             by_name: vec![("KEYS_A", &self.keys_a), ("KEYS_B", &self.keys_b)],
         }
@@ -114,6 +173,8 @@ struct Units {
     units: RefCell<HashMap<String, Rc<Unit<RusqliteSql>>>>,
     calls: RefCell<Vec<UnitCall>>,
     down: Cell<bool>,
+    /// The jurisdiction of the units' namespace ("" for none).
+    namespace: RefCell<String>,
 }
 
 impl Units {
@@ -126,7 +187,7 @@ impl Units {
                 Rc::new(Unit::new(
                     RusqliteSql::open_in_memory().unwrap(),
                     name.clone(),
-                    "",
+                    &self.namespace.borrow(),
                 ))
             })
             .clone()
@@ -199,6 +260,7 @@ impl<'a> RequestClients for Direct<'a> {
 // ---------------------------------------------------------------------------
 
 struct World {
+    faults: Rc<Faults>,
     ports: Ports,
     cache: RootCache,
     units: Units,
@@ -207,32 +269,17 @@ struct World {
 
 impl World {
     fn new() -> World {
-        let w = World {
-            ports: Ports {
-                records: MemRecords::new(),
-                keys_a: MemRecords::new(),
-                keys_b: MemRecords::new(),
-                kek: TestKek::new(),
-                clock: FixedClock::new(NOW),
-            },
-            cache: RootCache::new(),
-            units: Units::default(),
-            rng_seed: Cell::new(100),
-        };
+        let w = World::without_locations();
         futures_executor_block_on(w.locations());
         w
     }
 
     /// A world whose key locations were never recorded.
     fn without_locations() -> World {
+        let faults = Rc::new(Faults::default());
         World {
-            ports: Ports {
-                records: MemRecords::new(),
-                keys_a: MemRecords::new(),
-                keys_b: MemRecords::new(),
-                kek: TestKek::new(),
-                clock: FixedClock::new(NOW),
-            },
+            ports: Ports::new(&faults),
+            faults,
             cache: RootCache::new(),
             units: Units::default(),
             rng_seed: Cell::new(100),
@@ -496,7 +543,8 @@ fn without_key_locations_the_create_stops_before_the_key_and_resumes() {
         // The locations are recorded: the retry finishes the same tenant.
         w.locations().await;
         let again = w.create(&signup()).await;
-        expect(&again, 201, "ok");
+        // A retry adopts through `m/tref/` and finishes the create: `200`.
+        expect(&again, 200, "ok");
         assert_eq!(json_of(&again)["id"], tenant.as_str());
         assert_eq!(w.units.provisions(), 1, "born once");
     });
@@ -517,7 +565,8 @@ fn a_lost_marker_put_is_finished_by_the_retry() {
         // The unit answers `already_born`; the marker is written, and the
         // create goes on.
         let again = w.create(&signup()).await;
-        expect(&again, 201, "ok");
+        // A retry adopts through `m/tref/` and finishes the create: `200`.
+        expect(&again, 200, "ok");
         assert_eq!(w.units.provisions(), 2);
         assert!(w.ports.records.raw(&born_name(&tenant, 0)).is_some());
     });
@@ -535,7 +584,8 @@ fn an_unreachable_root_unit_stops_after_record_1() {
         assert!(w.ports.records.raw(&born_name(&tenant, 0)).is_none());
         w.units.down.set(false);
         let again = w.create(&signup()).await;
-        expect(&again, 201, "ok");
+        // A retry adopts through `m/tref/` and finishes the create: `200`.
+        expect(&again, 200, "ok");
         assert_eq!(json_of(&again)["id"], tenant.as_str());
     });
 }
@@ -579,8 +629,9 @@ fn a_tref_record_that_does_not_verify_is_never_adopted() {
         expect(&a, 201, "ok");
         let theirs = w.ports.records.raw(&tref_name("ws_other")).unwrap();
         w.ports.records.plant(&tref_name(WS), theirs);
+        // A record that does not verify: 500 (pages), never adopted.
         let b = w.create(&signup()).await;
-        expect(&b, 503, "service_unavailable");
+        expect(&b, 500, "internal_error");
         // A flipped byte.
         let _ = w2.create(&signup()).await;
         let mut bytes = w2.ports.records.raw(&tref_name(WS)).unwrap();
@@ -588,7 +639,7 @@ fn a_tref_record_that_does_not_verify_is_never_adopted() {
         bytes[last] ^= 1;
         w2.ports.records.lose(&tref_name(WS));
         w2.ports.records.plant(&tref_name(WS), bytes);
-        expect(&w2.create(&signup()).await, 503, "service_unavailable");
+        expect(&w2.create(&signup()).await, 500, "internal_error");
     });
 }
 
@@ -620,5 +671,163 @@ fn the_records_carry_no_secret_and_the_marker_is_control_sealed() {
         assert!(read_born(&w.ports.records, &w.ports.kek, &other, 0)
             .await
             .is_err());
+    });
+}
+
+/// The end state every create must reach for `WS`: one tenant, four
+/// records, the unit born once (from the marker's token), one key blob in
+/// each key bucket, the head live with the reference.
+async fn assert_one_live_tenant(w: &World) -> velmora_bridge::unit::TenantId {
+    let tenant = w.tenant_of(WS).await.unwrap();
+    assert_eq!(w.ports.records.names_under("m/tref/").len(), 1);
+    assert_eq!(w.chain_len(&tenant), 4, "record 1, claim, commit, live");
+    assert!(w.units.born(&UnitName::new(tenant.clone(), 0)));
+    assert!(w.ports.records.raw(&born_name(&tenant, 0)).is_some());
+    let chain_t = velmora_bridge::TenantId::parse(tenant.as_str()).unwrap();
+    for bucket in [&w.ports.keys_a, &w.ports.keys_b] {
+        assert_eq!(bucket.names_under(&tk_prefix(&chain_t)).len(), 1);
+    }
+    let root = Root::new(&w.ports, &w.cache, TestRng(5));
+    let head = root.tenant_head(&chain_t).await.unwrap().unwrap();
+    assert_eq!(head.door.lifecycle, Lifecycle::Live);
+    assert_eq!(head.private.unwrap().external_ref.as_deref(), Some(WS));
+    tenant
+}
+
+/// A crash at any put (refused, or stored with its answer lost) is
+/// finished by retries, with one tenant, one key version and one birth.
+#[test]
+fn a_fault_at_any_put_is_finished_by_a_retry() {
+    // The puts of a clean create.
+    let clean = World::new();
+    let base = clean.faults.puts.get();
+    futures_executor_block_on(async {
+        expect(&clean.create(&signup()).await, 201, "ok");
+    });
+    let total = clean.faults.puts.get() - base;
+    assert!(total >= 7, "{total}");
+    for k in 1..=total {
+        for lose in [false, true] {
+            let w = World::new();
+            let at = w.faults.puts.get() + k;
+            w.faults.at.set(Some((at, lose)));
+            futures_executor_block_on(async {
+                let first = w.create(&signup()).await;
+                w.faults.at.set(None);
+                let mut last = first.clone();
+                for _ in 0..3 {
+                    if (200..300).contains(&last.status) {
+                        break;
+                    }
+                    assert_eq!(last.status, 503, "put {k} lose {lose}: {last:?}");
+                    last = w.create(&signup()).await;
+                }
+                assert!(
+                    (200..300).contains(&last.status),
+                    "put {k} lose {lose}: {last:?}"
+                );
+                assert_one_live_tenant(&w).await;
+                assert!(w.units.provisions() <= 2, "put {k} lose {lose}");
+            });
+        }
+    }
+}
+
+/// Two creates of one workspace, the second after the first's `m/tref/`:
+/// the second adopts and finishes; the first's retry answers it.
+#[test]
+fn a_second_create_adopts_and_finishes_the_first() {
+    let w = World::new();
+    futures_executor_block_on(async {
+        // The first stops right after naming the tenant.
+        w.ports.records.refuse("m/t/");
+        expect(&w.create(&signup()).await, 503, "service_unavailable");
+        w.ports.records.allow("m/t/");
+        let second = w.create(&signup()).await;
+        expect(&second, 200, "ok");
+        let first_retry = w.create(&signup()).await;
+        expect(&first_retry, 200, "ok");
+        assert_eq!(json_of(&first_retry), json_of(&second));
+        assert_one_live_tenant(&w).await;
+        assert_eq!(w.units.provisions(), 1);
+    });
+}
+
+#[test]
+fn a_deleting_tenant_is_adopted_and_a_shredding_one_is_retired() {
+    use velmora_bridge::directory::record::DeletionReason;
+    use velmora_bridge::directory::transition::{Actor, Change};
+    let w = World::new();
+    futures_executor_block_on(async {
+        expect(&w.create(&signup()).await, 201, "ok");
+        let tenant = w.tenant_of(WS).await.unwrap();
+        let t = Tenant::parse(tenant.as_str()).unwrap();
+        let chain_t = velmora_bridge::TenantId::parse(tenant.as_str()).unwrap();
+        let root = Root::new(&w.ports, &w.cache, TestRng(6));
+        root.tenant_head(&chain_t).await.unwrap();
+        let due = UnixMs(NOW.0 + 60 * 24 * 3_600_000);
+        root.chain()
+            .write(
+                &t,
+                &Change::SetDeletion {
+                    shred_due_at: due,
+                    reason: DeletionReason::CustomerRequest,
+                    key_hash: "ab".repeat(32),
+                },
+                Actor::Customer,
+                NOW,
+                0,
+            )
+            .await
+            .unwrap();
+        let a = w.create(&signup()).await;
+        expect(&a, 200, "ok");
+        assert_eq!(json_of(&a)["state"], "deleting");
+        root.chain()
+            .write(
+                &t,
+                &Change::StartShred,
+                Actor::ShredJob,
+                UnixMs(due.0 + 1),
+                0,
+            )
+            .await
+            .unwrap();
+        expect(&w.create(&signup()).await, 409, "external_ref_retired");
+    });
+}
+
+/// A drawn id that already has a chain is never named for another
+/// workspace.
+#[test]
+fn a_drawn_id_with_a_chain_is_refused() {
+    let w = World::new();
+    futures_executor_block_on(async {
+        expect(
+            &w.create(&json!({"external_ref": "ws_first"})).await,
+            201,
+            "ok",
+        );
+    });
+    // The same random seed again: the same id is drawn.
+    w.rng_seed.set(100);
+    futures_executor_block_on(async {
+        let a = w.create(&signup()).await;
+        expect(&a, 500, "internal_error");
+        assert!(w.tenant_of(WS).await.is_none(), "nothing named");
+    });
+}
+
+/// A birth token the unit refuses (here: another jurisdiction in its
+/// namespace) stops with 500; no retry changes it.
+#[test]
+fn a_refused_birth_token_is_a_500() {
+    let w = World::new();
+    *w.units.namespace.borrow_mut() = "eu".to_string();
+    futures_executor_block_on(async {
+        expect(&w.create(&signup()).await, 500, "internal_error");
+        let tenant = w.tenant_of(WS).await.unwrap();
+        assert!(w.ports.records.raw(&born_name(&tenant, 0)).is_none());
+        assert_eq!(w.chain_len(&tenant), 1);
     });
 }
