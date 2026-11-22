@@ -669,7 +669,8 @@ fn valid_newsgroup(g: &str) -> bool {
 /// `S3_HOSTS`: absent or empty is no extra host. Otherwise a comma
 /// separated list of `<host>=<class>`, class `legacy` or `customer`,
 /// at most [`MAX_EXTRA_S3_HOSTS`] entries. Each host is a valid
-/// `S3_HOST` value in lowercase, and no host is listed twice or equals
+/// `S3_HOST` value in lowercase, without a trailing dot or an empty
+/// label, and no host is listed twice or equals
 /// `S3_HOST` (compared without case), and no host is a subdomain of
 /// another (ports aside). Anything else refuses the whole
 /// configuration: a host typed wrong must not leave a second endpoint
@@ -689,7 +690,13 @@ fn parse_s3_hosts(raw: Option<&str>, primary: &str) -> Result<Vec<S3Host>, Confi
             "customer" => HostClass::Customer,
             _ => return Err(invalid()),
         };
+        // Requests are put on a host by its normalised name
+        // (`ingress::host_name`); a name it would change (a trailing
+        // dot, an empty label) would never be matched, and the class it
+        // names would not apply.
+        let bare = name.split(':').next().unwrap_or(name);
         if !valid_s3_host(name)
+            || crate::ingress::host_name(bare).as_deref() != Some(bare)
             || name.bytes().any(|b| b.is_ascii_uppercase())
             || name.eq_ignore_ascii_case(primary)
             || out.iter().any(|h| h.name == name)
@@ -1005,11 +1012,13 @@ impl BridgeConfig {
         };
         let admin_host = match get("ADMIN_HOST").as_deref().map(str::trim) {
             None | Some("") => None,
+            // As `ingress::host_name` leaves it, or no request could name it.
             Some(h)
                 if h.len() <= 253
                     && h.bytes().all(|b| {
                         b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'.' || b == b'-'
-                    }) =>
+                    })
+                    && crate::ingress::host_name(h).as_deref() == Some(h) =>
             {
                 Some(h.to_string())
             }

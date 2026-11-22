@@ -1063,7 +1063,15 @@ fn admin_read_token_host_and_metrics_sample() {
             invalid("ADMIN_READ_TOKEN")
         );
     }
-    for bad in ["Admin.Internal", "admin internal", "admin/x", "admin:443"] {
+    for bad in [
+        "Admin.Internal",
+        "admin internal",
+        "admin/x",
+        "admin:443",
+        "admin.internal.",
+        "admin..internal",
+        ".admin.internal",
+    ] {
         assert_eq!(
             with(&[("ADMIN_HOST", bad)]).unwrap_err(),
             invalid("ADMIN_HOST")
@@ -2118,6 +2126,10 @@ fn s3_hosts_lists_more_hosts_with_a_class() {
         "a.example:8443=legacy,x.a.example=customer",
         "a b.example=customer",
         "a.example:0=customer",
+        "a.example.=customer",
+        "a.example.:8443=customer",
+        "a..example=customer",
+        ".a.example=legacy",
         "a.example=customer=legacy",
         &format!("{eight},s3-9.example=legacy"),
     ] {
