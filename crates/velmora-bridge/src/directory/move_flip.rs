@@ -106,8 +106,15 @@ pub enum FlipError {
     /// The unit refused `sync`, with its code: after a closing record, or
     /// after [`MAX_REENTRIES`] re-entries of the lift.
     SyncRefused(String),
-    /// V9 failed in the open unit: give up (AM-30).
+    /// V9 failed in the open unit; the move was given up (AM-30).
     V9Failed,
+    /// V9 failed, and the give-up it started stopped with this error: run
+    /// [`give_up`] again.
+    V9GiveUp(Box<FlipError>),
+    /// The frozen D1 has no bucket to move (less the excluded ones): there
+    /// is nothing a flip could serve, and a give-up would have no
+    /// placement to keep its exit open.
+    NothingMoved,
 }
 
 impl From<BridgeError> for FlipError {
@@ -428,8 +435,10 @@ where
             )
             .await?;
         dir.apply_tenant(&door_of(gave_up), now).await?;
-        give_up(chain, frozen, safety, dir, unit, routes, keys, window, now).await?;
-        return Err(FlipError::V9Failed);
+        return match give_up(chain, frozen, safety, dir, unit, routes, keys, window, now).await {
+            Ok(_) => Err(FlipError::V9Failed),
+            Err(e) => Err(FlipError::V9GiveUp(Box::new(e))),
+        };
     }
 
     // (c) The keys once more, the directory's keys_seq, then the routes:
@@ -438,7 +447,12 @@ where
     dir.raise_keys_seq(&owner.tenant, keys_seq).await?;
     let zero_tenant = Tenant::Zero;
     for (akid, kind) in window.keys.iter().zip(kinds) {
-        if !routes.put(akid, window.owner, kind).await? {
+        let named = match routes.get(akid).await?.as_deref() == Some(Tenant::Zero.as_str()) {
+            // An earlier window's give-up put it back on tenant 0.
+            true => routes.replace(akid, &zero_tenant, window.owner).await?,
+            false => routes.put(akid, window.owner, kind).await?,
+        };
+        if !named {
             return Err(FlipError::RouteTaken(akid.clone()));
         }
         if !dir.move_route(akid, &zero_tenant, window.owner).await? {
@@ -760,6 +774,9 @@ pub async fn placement_check<F: Sql>(
             break;
         }
     }
+    if moved.is_empty() {
+        return Err(FlipError::NothingMoved);
+    }
     let placed: BTreeSet<String> = owner
         .placements
         .iter()
@@ -797,8 +814,10 @@ async fn routes_movable<Q: Sql, R: RouteRecords>(
     }
     let mut kinds = Vec::with_capacity(window.keys.len());
     for akid in window.keys {
+        // No record, the owner's, or tenant 0's (put back by an earlier
+        // window's give-up; (c) replaces it).
         if let Some(t) = routes.get(akid).await? {
-            if t != window.owner.as_str() {
+            if t != window.owner.as_str() && t != Tenant::Zero.as_str() {
                 return Err(FlipError::RouteTaken(akid.clone()));
             }
         }

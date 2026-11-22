@@ -1689,3 +1689,71 @@ fn a_lift_refused_every_time_stops_after_the_bound() {
         assert_eq!(m.unit.reports.get() as usize, tries);
     });
 }
+
+#[test]
+fn a_later_window_replaces_a_route_record_an_earlier_give_up_put_back() {
+    block_on(async {
+        let mut m = window().await;
+        // The first window put one route record, then gave up: the record
+        // names tenant 0 again.
+        m.routes.fail_after.set(Some(1));
+        assert!(m.flip().await.is_err());
+        m.routes.fail_after.set(None);
+        m.give_up().await.map_err(|e| format!("{e:?}")).unwrap();
+        assert_eq!(m.routes.records.borrow()[KEYS[0]], Tenant::zero().as_str());
+        // A second window into the same owner.
+        let w2 = m
+            .write(
+                &Tenant::zero(),
+                Change::StartMove {
+                    to: owner(),
+                    catalogue_id_frozen: "main".into(),
+                },
+                Actor::MoveTool,
+            )
+            .await;
+        m.zero_seq = w2.seq;
+        m.since = m.head(&owner()).await.restoring_entry(0).unwrap().since_seq;
+        m.place().await;
+        let f = m.flip().await.map_err(|e| format!("{e:?}")).unwrap();
+        assert!(f.wrote);
+        for akid in KEYS {
+            assert_eq!(m.routes.records.borrow()[akid], OWNER);
+        }
+        // Give-up's replace, then the second window's.
+        assert_eq!(m.routes.replaced.get(), 2);
+    });
+}
+
+#[test]
+fn a_window_with_nothing_to_move_stops_before_any_write() {
+    block_on(async {
+        let mut m = window_with(false).await;
+        m.excluded.extend(m.buckets.clone());
+        let before = m.records();
+        let r = m.flip().await;
+        assert!(matches!(r, Err(FlipError::NothingMoved)), "{r:?}");
+        assert_eq!(m.records(), before);
+        assert!(!m.stamp_put().await);
+        assert_eq!(m.unit.closed.get(), Some(m.since));
+    });
+}
+
+#[test]
+fn a_v9_give_up_that_stopped_keeps_the_v9_answer() {
+    block_on(async {
+        let m = window().await;
+        m.unit.v9_ok.set(false);
+        m.keys.fail_grants.set(1);
+        let r = m.flip().await;
+        assert!(
+            matches!(&r, Err(FlipError::V9GiveUp(inner)) if matches!(**inner, FlipError::Store(_))),
+            "{r:?}"
+        );
+        // Tenant 0 is at d1; the give-up finishes the exit.
+        assert_eq!(m.selector().await, Selector::D1);
+        m.give_up().await.map_err(|e| format!("{e:?}")).unwrap();
+        assert!(m.head(&owner()).await.placements.is_empty());
+        assert!(m.unit.closed.get().is_some());
+    });
+}
