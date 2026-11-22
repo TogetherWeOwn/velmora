@@ -1038,8 +1038,9 @@ pub struct BackboneStatus {
     pub result: VerifyResult,
     /// How the articles were checked. Only a `Body` pass is a full check.
     pub kind: VerifyKind,
-    /// `result = ok` and `articles_ok = articles_total = article_count`:
-    /// a complete pass of its `kind`. Whether that is enough for a
+    /// `result = ok` and `articles_ok = articles_total` = every article
+    /// of the plan (`article_count`, and `parity_count` when the plan has
+    /// parity articles): a complete pass of its `kind`. Whether that is enough for a
     /// release is `verify::releasable`'s decision, never this flag's.
     pub counts: bool,
 }

@@ -111,6 +111,18 @@
 //! mode counts under both. An extent verified under `light` and released
 //! under `body` has no full check on record, so it goes back to verify
 //! and is read in full.
+//!
+//! # Parity
+//!
+//! The parity articles of a plan with a parity addendum
+//! ([`crate::parity`]) are articles of the extent like the others: every
+//! check walks them after the data articles, the totals count them, and a
+//! backbone that lacks one does not hold the extent. That holds under
+//! both modes: the size or `STAT` pass of the light check asks every
+//! backbone for them, a full read of the sample reads them, and a release
+//! outside the sample still needs every one of them on `REQUIRED_BACKBONES`
+//! backbones. An addendum that cannot be read fails the job, and nothing
+//! is released.
 
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
@@ -122,6 +134,7 @@ use crate::config::VerifyMode;
 use crate::fetch::{
     ask_articles_together, job_holder, read_articles, stat_articles, ProviderSession, ReadTally,
 };
+use crate::parity::ParityPlan;
 use crate::pool::Pool;
 use crate::ports::{
     BlobStore, Bridge, Catalog, Clock, Guard, JobSink, Kek, Lease, NntpConnector, PermitClass,
@@ -164,6 +177,39 @@ struct Evidence<'a> {
     /// one. Nothing decides on it.
     #[serde(skip_serializing_if = "Option::is_none")]
     size_command: Option<SizeCommand>,
+    /// How many of `total` are parity articles. Left out for a plan
+    /// without parity.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parity: Option<u32>,
+}
+
+/// The posted plan of an extent as verify and release walk it.
+struct Posted {
+    /// Every article: the data articles, then the parity articles.
+    rows: Vec<ArticleRow>,
+    /// The parity plan, when the plan has an addendum: the last
+    /// `articles.len()` of `rows`.
+    parity: Option<ParityPlan>,
+}
+
+impl Posted {
+    /// How many articles a complete pass covers
+    /// (`VerificationRow::articles_total`).
+    fn total(&self) -> u32 {
+        u32::try_from(self.rows.len()).unwrap_or(u32::MAX)
+    }
+
+    /// How many of them are parity articles. `None` = no parity.
+    fn parity_count(&self) -> Option<u32> {
+        let parity = self.parity.as_ref()?;
+        u32::try_from(parity.articles.len()).ok()
+    }
+
+    /// The data articles.
+    fn data(&self) -> &[ArticleRow] {
+        let parity = self.parity.as_ref().map_or(0, |p| p.articles.len());
+        &self.rows[..self.rows.len() - parity]
+    }
 }
 
 const SAMPLE_KEY_INFO: &[u8] = b"velmora/verify-sample/v1";
@@ -313,6 +359,15 @@ pub fn release_rule<'a>(
     required > 0 && (full || !need_full) && holding.len() >= required as usize
 }
 
+/// Whether the `BODY` row `b` is a full read that failed: it found an
+/// article missing or wrong, or it did not read all `total` articles of
+/// the plan. The second is a read from before parity, of the data
+/// articles alone: it says nothing of the parity articles, so it does
+/// not clear an earlier failure on one of them.
+fn read_failed(b: &BackboneStatus, total: u32) -> bool {
+    b.result != VerifyResult::Ok || b.articles_ok != b.articles_total || b.articles_total != total
+}
+
 fn result_of(tally: &ReadTally) -> VerifyResult {
     if !tally.corrupt.is_empty() {
         VerifyResult::Corrupt
@@ -342,7 +397,7 @@ where
     /// the resume point goes with the write that gives the lease back.
     pub async fn verify_stage(&self, lease: &Lease, job: &JobExtent) -> JobOutcome {
         let mut reached = None;
-        match self.verify_extent(lease, &job.extent, &mut reached).await {
+        match self.verify_extent(lease, job, &mut reached).await {
             Ok(()) => JobOutcome::Ack,
             Err(stop) => settle_at(&self.catalog, &self.clock, lease, stop, reached).await,
         }
@@ -359,13 +414,33 @@ where
     }
 
     /// The posted plan, or a failure if the extent is not fully posted.
-    async fn posted_plan(&self, extent: &ExtentRow) -> Staged<Vec<ArticleRow>> {
-        let plan = self.catalog.articles(&extent.id).await?;
-        let posted = !plan.is_empty()
-            && u32::try_from(plan.len()).ok() == extent.article_count
-            && plan.iter().all(|a| a.state == ArticleState::Posted);
+    ///
+    /// The parity articles of its addendum follow the data articles. An
+    /// addendum that cannot be read, or that is not the one the job's
+    /// row counts (`JobExtent::parity_count`), is a failure: the extent
+    /// is neither verified nor released without its parity.
+    async fn posted_plan(&self, job: &JobExtent) -> Staged<Posted> {
+        let extent = &job.extent;
+        let stored = self.catalog.stored_plan(&extent.id).await?;
+        let posted = !stored.rows.is_empty()
+            && u32::try_from(stored.rows.len()).ok() == extent.article_count
+            && stored.rows.iter().all(|a| a.state == ArticleState::Posted);
         if !posted {
             return Err(Stop::fail(FailClass::Internal));
+        }
+        let parity = stored
+            .parity_plan(&extent.id, extent.cipher_size)
+            .map_err(|_| Stop::fail(FailClass::Corrupt))?;
+        let mut plan = Posted {
+            rows: stored.rows,
+            parity: None,
+        };
+        if let Some(parity) = parity {
+            plan.rows.extend(parity.articles.iter().cloned());
+            plan.parity = Some(parity);
+        }
+        if plan.parity_count() != job.parity_count {
+            return Err(Stop::fail(FailClass::Corrupt));
         }
         Ok(plan)
     }
@@ -535,8 +610,8 @@ where
         provider: &ProviderConfig,
         tally: &ReadTally,
         kind: VerifyKind,
+        total: u32,
     ) -> Staged<VerificationRow> {
-        let total = extent.article_count.unwrap_or(0);
         let row = VerificationRow {
             extent_id: extent.id.clone(),
             backbone: label(&provider.backbone),
@@ -647,12 +722,14 @@ where
     /// Until the propagation grace is over the articles may still arrive
     /// on their own, so the backbone is only read again. Once it is over
     /// they are posted straight to a provider of this backbone, once per
-    /// round, and read again; what that read finds is recorded.
+    /// round, and read again; what that read finds is recorded. A parity
+    /// article is posted from its shard, computed again from the safety
+    /// copy and checked against the addendum.
     async fn missing_wait(
         &self,
         lease: &Lease,
         extent: &ExtentRow,
-        plan: &[ArticleRow],
+        plan: &Posted,
         backbone: &str,
         missing: &[u32],
         cursor: u32,
@@ -663,6 +740,7 @@ where
         }
         let now = self.clock.now();
         let grace_ends = plan
+            .rows
             .iter()
             .filter_map(|a| a.posted_at)
             .max()
@@ -676,7 +754,14 @@ where
                 .filter(|p| p.post && p.enabled && label(&p.backbone) == backbone)
                 .collect();
             if self
-                .repost(lease, extent, plan, missing, &posters, None)
+                .repost(
+                    lease,
+                    extent,
+                    plan.data(),
+                    missing,
+                    &posters,
+                    plan.parity.as_ref(),
+                )
                 .await?
             {
                 self.cursor(lease, cursor - retries + REPOSTED).await?;
@@ -787,13 +872,18 @@ where
 
     /// Whether the last check of the bytes of `backbone` for the current
     /// plan is on record as a failure: a full read, or a size that did
-    /// not fit ([`Catalog::body_checks`]).
-    async fn full_read_failed(&self, extent: &ExtentRow, backbone: &str) -> Staged<bool> {
+    /// not fit ([`Catalog::body_checks`]). A full read that was not one
+    /// of all `total` articles of the plan is a failure too (one from
+    /// before parity read the data alone).
+    async fn full_read_failed(
+        &self,
+        extent: &ExtentRow,
+        backbone: &str,
+        total: u32,
+    ) -> Staged<bool> {
         let checks = self.catalog.body_checks(&extent.id).await?;
         Ok(checks.iter().any(|b| {
-            b.plan_rev == extent.plan_rev
-                && label(&b.backbone) == backbone
-                && (b.result != VerifyResult::Ok || b.articles_ok != b.articles_total)
+            b.plan_rev == extent.plan_rev && label(&b.backbone) == backbone && read_failed(b, total)
         }))
     }
 
@@ -829,10 +919,11 @@ where
     async fn verify_extent(
         &self,
         lease: &Lease,
-        extent: &ExtentRow,
+        job: &JobExtent,
         reached: &mut Option<u32>,
     ) -> Staged<()> {
-        let plan = self.posted_plan(extent).await?;
+        let extent = &job.extent;
+        let plan = self.posted_plan(job).await?;
         let groups = release_backbones(&self.cfg.providers);
         let labels: Vec<String> = groups.iter().map(|(name, _)| name.clone()).collect();
         let first = (lease.cursor / CURSOR_STEPS) as usize;
@@ -855,7 +946,7 @@ where
                 // The light check: a full read only where the last check
                 // of the bytes failed, where the backbone is under full
                 // reads, and for the sample; the size or `STAT` else.
-                kind = if self.full_read_failed(extent, name).await? {
+                kind = if self.full_read_failed(extent, name, plan.total()).await? {
                     VerifyKind::Body
                 } else if light.names(index, name)
                     || (need_full && self.full_read_owed(extent, &labels, light).await?)
@@ -871,7 +962,9 @@ where
                 let full = |s: &BackboneStatus| {
                     s.counts && s.kind.is_full() && labels[..index].contains(&label(&s.backbone))
                 };
-                if status.iter().any(full) && !self.full_read_failed(extent, name).await? {
+                if status.iter().any(full)
+                    && !self.full_read_failed(extent, name, plan.total()).await?
+                {
                     kind = VerifyKind::Stat;
                 }
             }
@@ -880,13 +973,15 @@ where
             // ([`Self::sample_failed`]).
             let watched = light.is_some() && kind.is_full();
             let mut asked = false;
-            let (provider, mut tally) = self.read_backbone(lease, &plan, providers, kind).await?;
+            let (provider, mut tally) = self
+                .read_backbone(lease, &plan.rows, providers, kind)
+                .await?;
             if watched && result_of(&tally) == VerifyResult::Missing {
                 // Before the waits for a missing article, which may take
                 // hours: a provider that says with `STAT` it has what it
                 // does not serve is answering for other extents all that
                 // time. An article this reads after all is not missing.
-                self.sample_failed(lease, extent, &plan, &[provider], name, &mut tally)
+                self.sample_failed(lease, extent, &plan.rows, &[provider], name, &mut tally)
                     .await?;
                 asked = true;
             }
@@ -912,7 +1007,9 @@ where
                 *reached = stored;
             }
             let kind = Self::recorded_kind(kind, &tally);
-            let row = self.record(lease, extent, provider, &tally, kind).await?;
+            let row = self
+                .record(lease, extent, provider, &tally, kind, plan.total())
+                .await?;
             if watched && !asked && row.result != VerifyResult::Ok {
                 // Recorded first: the failure stands whatever comes of
                 // this. A raise that is not stored is made by the next
@@ -923,7 +1020,7 @@ where
                 // any other: the rows do not say which articles failed,
                 // so bytes that were bad when posted cannot be told from
                 // damage of its own.
-                self.sample_failed(lease, extent, &plan, &[provider], name, &mut tally)
+                self.sample_failed(lease, extent, &plan.rows, &[provider], name, &mut tally)
                     .await?;
             }
             // The next backbone is read by this job, under the same
@@ -972,8 +1069,8 @@ where
             // Read again: a repost by this job stamped its articles after
             // the plan was loaded. The release job reads the plan itself
             // and is the gate; this only keeps the due time right.
-            let plan = self.posted_plan(extent).await?;
-            let ready = self.min_age_over(extent, &plan).max(now);
+            let plan = self.posted_plan(job).await?;
+            let ready = self.min_age_over(extent, &plan.rows).max(now);
             return self
                 .advance_notify(lease, OutboxStage::Release, ready)
                 .await;
@@ -1010,7 +1107,17 @@ where
         match extent.safety_state {
             SafetyState::Held => {}
             // A job died between the release decision and its last step.
-            SafetyState::Releasing => return self.finish_release(lease, extent).await,
+            // That decision is not this job's, and the row does not say
+            // what it was taken on: a version from before parity decided
+            // on the data articles alone, and the passes it counted may
+            // be gone since. It is withdrawn, and the release is decided
+            // again from the start, on every article of the plan as it
+            // is now. The safety copy is pinned throughout.
+            SafetyState::Releasing => {
+                if !self.catalog.reopen_release(lease, now).await? {
+                    return Err(Stop::Fenced);
+                }
+            }
             SafetyState::Released | SafetyState::Deleted => {
                 return self.advance(lease, OutboxStage::Done, now).await;
             }
@@ -1036,8 +1143,8 @@ where
             return Ok(());
         }
         // The plan first: the minimum age counts from its newest post.
-        let plan = self.posted_plan(extent).await?;
-        let ready = self.min_age_over(extent, &plan);
+        let plan = self.posted_plan(job).await?;
+        let ready = self.min_age_over(extent, &plan.rows);
         if now < ready {
             if !self.catalog.defer(lease, ready, now).await? {
                 return Err(Stop::Fenced);
@@ -1059,7 +1166,7 @@ where
         let (full, failed): (Vec<_>, Vec<_>) = checks.into_iter().partition(|b| b.counts);
         let mut failed: Vec<String> = failed
             .iter()
-            .filter(|b| b.result != VerifyResult::Ok || b.articles_ok != b.articles_total)
+            .filter(|b| read_failed(b, plan.total()))
             .map(|b| label(&b.backbone))
             .collect();
         // The light check asks for the full check only for the sample
@@ -1105,7 +1212,7 @@ where
         let mut read = Vec::new();
         for (_, providers) in &groups {
             read.push(
-                self.read_backbone(lease, &plan, providers, VerifyKind::Stat)
+                self.read_backbone(lease, &plan.rows, providers, VerifyKind::Stat)
                     .await?,
             );
         }
@@ -1151,7 +1258,14 @@ where
                 continue;
             }
             let row = self
-                .record(lease, extent, provider, tally, VerifyKind::Stat)
+                .record(
+                    lease,
+                    extent,
+                    provider,
+                    tally,
+                    VerifyKind::Stat,
+                    plan.total(),
+                )
                 .await?;
             if row.result == VerifyResult::Ok && !failed.contains(&label(&row.backbone)) {
                 rows.push(row);
@@ -1181,6 +1295,7 @@ where
                 VerifyKind::Size => self.cfg.verify.size_command(&b.provider_id),
                 _ => None,
             },
+            parity: plan.parity_count(),
         });
         let evidence: Vec<Evidence<'_>> = rows
             .iter()
@@ -1193,6 +1308,7 @@ where
                 total: r.articles_total,
                 plan_rev: r.plan_rev,
                 size_command: None,
+                parity: plan.parity_count(),
             })
             .chain(on_record)
             .collect();
@@ -1227,8 +1343,9 @@ where
         self.advance_notify(lease, OutboxStage::Verify, due).await
     }
 
-    /// Completes the release of an extent already marked `releasing`: the
-    /// safety copy becomes evictable. Nothing is deleted here.
+    /// Completes the release this job has just decided
+    /// ([`Catalog::begin_release`] applied under `lease`): the safety
+    /// copy becomes evictable. Nothing is deleted here.
     async fn finish_release(&self, lease: &Lease, _extent: &ExtentRow) -> Staged<()> {
         match self.catalog.finish_release(lease, self.clock.now()).await? {
             true => Ok(()),

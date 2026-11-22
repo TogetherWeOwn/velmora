@@ -153,9 +153,17 @@ fn to_value(v: &SqlValue) -> Value {
     }
 }
 
+/// The largest whole number a JS number carries exactly: 2^53 - 1.
+const MAX_SAFE_INT: u64 = (1 << 53) - 1;
+
 fn from_ref(v: ValueRef<'_>) -> Result<SqlValue> {
     Ok(match v {
         ValueRef::Null => SqlValue::Null,
+        // As the D1 adapter: a row comes back as JS numbers, and one
+        // beyond what a JS number carries exactly is an error.
+        ValueRef::Integer(i) if i.unsigned_abs() > MAX_SAFE_INT => {
+            return Err(BridgeError::Sql("integer outside JS safe range".into()))
+        }
         ValueRef::Integer(i) => SqlValue::Int(i),
         ValueRef::Text(t) => SqlValue::Text(
             String::from_utf8(t.to_vec()).map_err(|_| BridgeError::Sql("non-utf8 text".into()))?,

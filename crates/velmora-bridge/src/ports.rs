@@ -1157,7 +1157,21 @@ pub trait Catalog {
     /// backbones of those that had not ended when it was stored (`at` =
     /// its `created_at`), whenever its job runs.
     async fn verify_escalations(&self, at: UnixMs) -> Result<Vec<VerifyEscalation>>;
+    /// The last step of a release, by the job whose
+    /// [`Catalog::begin_release`] was applied, under the same lease:
+    /// `releasing` becomes `released` and the row is done.
     async fn finish_release(&self, l: &Lease, now: UnixMs) -> Result<bool>;
+    /// Withdraws a release decision that was not finished: a
+    /// `releasing` extent is `held` again and its evidence is dropped.
+    /// The lease is kept. `false`: the lease no longer holds the row,
+    /// or has run out.
+    ///
+    /// A job that finds an extent `releasing` did not take that
+    /// decision and cannot tell what it was taken on (a version from
+    /// before parity decides on the data articles alone). It withdraws
+    /// it and decides again: `releasing` on a row is never a reason to
+    /// release.
+    async fn reopen_release(&self, l: &Lease, now: UnixMs) -> Result<bool>;
     /// Up to `limit` rows in `post`, `verify` or `release` that are due
     /// and held by no job, oldest due time first. Each stage has a third
     /// of `limit` to itself, so these are not always the oldest `limit`

@@ -640,6 +640,9 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
     async fn finish_release(&self, l: &Lease, now: UnixMs) -> Result<bool> {
         outbox::finish_release(self, l, now).await
     }
+    async fn reopen_release(&self, l: &Lease, now: UnixMs) -> Result<bool> {
+        outbox::reopen_release(self, l, now).await
+    }
     async fn due(&self, now: UnixMs, resend: Resend, limit: u32) -> Result<Vec<DueRow>> {
         outbox::due(self, now, resend, limit).await
     }

@@ -32,6 +32,20 @@ use crate::types::{
 
 type Stmt = (&'static str, Vec<SqlValue>);
 
+/// Ends every claim on extent `?1` while its row still holds the plan
+/// `?2`, the addendum `?3` and the count whose literal is `?4`: the
+/// lease token moves on, as when a lease is given up, so every write of
+/// a job that holds the row is refused (`held!` in `sql/outbox.rs`).
+/// A verify that had got past a backbone starts at the first again: the
+/// passes it would skip are the ones deleted here.
+/// Run before the statement that changes those values, in its batch.
+const FENCE_CLAIMS: &str =
+    "UPDATE outbox SET lease_token = lease_token + 1, lease_owner = NULL, lease_until = NULL, \
+       cursor = CASE stage WHEN 'verify' THEN 0 ELSE cursor END \
+     WHERE extent_id = ?1 \
+       AND EXISTS (SELECT 1 FROM extents WHERE id = ?1 AND plan = ?2 \
+         AND parity IS ?3 AND quote(parity_count) = ?4)";
+
 /// Statements per batch before it is sent.
 const BATCH_STATEMENTS: usize = 300;
 
@@ -233,8 +247,31 @@ struct Unreadable {
     plan: Option<Vec<u8>>,
 }
 
+/// A parity addendum in the catalogue that cannot be read beside its
+/// packed plan, which can, and the addendum of the extent's record to
+/// put in its place.
+struct LostAddendum {
+    extent: ExtentId,
+    /// The stored plan and `extents.parity` as they were read, and the
+    /// SQL literal (`quote`) of `extents.parity_count`.
+    plan: Vec<u8>,
+    stored: SqlValue,
+    stored_count: String,
+    /// The record's addendum and the number of its articles.
+    parity: SqlValue,
+    parity_count: SqlValue,
+}
+
 /// The extents of `extents` whose packed plan in the catalogue cannot be
-/// read (a damaged value, the plan of another extent).
+/// read (a damaged value, the plan of another extent), and those whose
+/// plan can be read but whose parity addendum cannot, or is not the one
+/// the row counts, where the record has the addendum of that plan.
+///
+/// An addendum that cannot be read fails every job that verifies or
+/// releases the extent, so the record is the only way back for it too.
+/// Where the record has none that is an addendum of the stored plan,
+/// the row is left as it is: its jobs keep failing, and the extent is
+/// never taken for one without parity.
 ///
 /// A plan the catalogue has is kept, in whatever form, as long as it
 /// can be read. One that cannot is no plan: every reader of the extent
@@ -243,16 +280,22 @@ struct Unreadable {
 async fn unreadable_plans<S: Sql>(
     c: &SqlCatalog<S>,
     extents: &[ReplayExtent],
-) -> Result<Vec<Unreadable>> {
+) -> Result<(Vec<Unreadable>, Vec<LostAddendum>)> {
     let mut out = Vec::new();
+    let mut addenda = Vec::new();
     for chunk in extents.chunks(LOST_CHUNK) {
         let marks = vec!["?"; chunk.len()].join(",");
         let rows = c
             .sql
             .query(
                 &format!(
-                    "SELECT id, cipher_size, plan, parity FROM extents \
-                     WHERE id IN ({marks}) AND plan IS NOT NULL"
+                    "SELECT id, cipher_size, plan, parity, \
+                       CASE WHEN typeof(parity_count) = 'real' \
+                           OR (typeof(parity_count) = 'integer' \
+                             AND parity_count NOT BETWEEN 0 AND 4294967295) \
+                         THEN quote(parity_count) ELSE parity_count END, \
+                       quote(parity_count) \
+                     FROM extents WHERE id IN ({marks}) AND plan IS NOT NULL"
                 ),
                 &chunk
                     .iter()
@@ -266,12 +309,46 @@ async fn unreadable_plans<S: Sql>(
             let cipher_size: u64 = r.num()?;
             let stored = r.blob()?;
             let parity = r.opt_blob()?;
-            if crate::plan::expand(&id, cipher_size, &stored, None, None).is_ok() {
-                continue;
-            }
+            // As it is stored: a count that is no number is damage of
+            // this row, and must not stop the replay of the others. A
+            // fraction, or a number no count can be, is read as its
+            // text (a row cannot carry every number).
+            // The statements are keyed on the literal of the value, the
+            // same text for the same stored value whatever its type: a
+            // number that went through a text is not always itself.
+            let count = r.value()?;
+            let count_literal = r.text()?;
             let Some(x) = chunk.iter().find(|x| x.row.id == id) else {
                 continue;
             };
+            if crate::plan::expand(&id, cipher_size, &stored, None, None).is_ok() {
+                // The plan reads. Its addendum has to read beside it,
+                // and be the one the row counts.
+                let on_row = match &parity {
+                    Some(parity) => SqlValue::Blob(parity.clone()),
+                    None => SqlValue::Null,
+                };
+                let reads = addendum_of(x, &stored, parity.as_deref());
+                let sound = match (&on_row, &count) {
+                    (SqlValue::Null, SqlValue::Null) => true,
+                    _ => reads == (on_row.clone(), count.clone()),
+                };
+                if sound {
+                    continue;
+                }
+                let (from_record, record_count) = addendum_of(x, &stored, x.parity.as_deref());
+                if from_record != SqlValue::Null {
+                    addenda.push(LostAddendum {
+                        extent: id,
+                        plan: stored,
+                        stored: on_row,
+                        stored_count: count_literal,
+                        parity: from_record,
+                        parity_count: record_count,
+                    });
+                }
+                continue;
+            }
             // The record's plan in the form the replay stores it in,
             // and the explicit form when it stores rows: beside a plan
             // value, rows are not read.
@@ -292,7 +369,7 @@ async fn unreadable_plans<S: Sql>(
             });
         }
     }
-    Ok(out)
+    Ok((out, addenda))
 }
 
 /// Step 1. Returns the extents whose packed plan cannot be read and
@@ -303,7 +380,7 @@ pub(super) async fn replay_extents<S: Sql>(
     extents: &[ReplayExtent],
     now: UnixMs,
 ) -> Result<Vec<ExtentId>> {
-    let unreadable = unreadable_plans(c, extents).await?;
+    let (unreadable, addenda) = unreadable_plans(c, extents).await?;
     let mut stmts: Vec<Stmt> = Vec::new();
     for x in extents {
         if stmts.is_empty() {
@@ -323,6 +400,31 @@ pub(super) async fn replay_extents<S: Sql>(
                 (SqlValue::Null, _) => addendum_of(x, plan, u.parity.as_deref()),
                 found => found,
             };
+            // Where that writes another addendum than the row has, the
+            // passes on record and the claims in flight are of the old
+            // one: both go first, in this batch, as below.
+            let swapped = || {
+                vec![
+                    text(x.row.id.as_str()),
+                    SqlValue::Blob(u.stored.clone()),
+                    parity.clone(),
+                ]
+            };
+            stmts.push((
+                "DELETE FROM verifications WHERE extent_id = ?1 \
+                   AND EXISTS (SELECT 1 FROM extents WHERE id = ?1 AND plan = ?2 \
+                     AND parity IS NOT ?3)",
+                swapped(),
+            ));
+            stmts.push((
+                "UPDATE outbox SET lease_token = lease_token + 1, lease_owner = NULL, \
+                   lease_until = NULL, \
+                   cursor = CASE stage WHEN 'verify' THEN 0 ELSE cursor END \
+                 WHERE extent_id = ?1 \
+                   AND EXISTS (SELECT 1 FROM extents WHERE id = ?1 AND plan = ?2 \
+                     AND parity IS NOT ?3)",
+                swapped(),
+            ));
             stmts.push((
                 "UPDATE extents SET article_count = ?2, plan_rev = ?3, plan = ?4, \
                    parity = ?6, parity_count = ?7 \
@@ -336,6 +438,41 @@ pub(super) async fn replay_extents<S: Sql>(
                     parity,
                     parity_count,
                 ],
+            ));
+        }
+        for a in addenda.iter().filter(|a| a.extent == x.row.id) {
+            // Keyed on the very values that were read. A pass on record
+            // is bound to the plan revision and the number of articles,
+            // not to the addendum: whoever writes another addendum on
+            // an extent drops its passes in the same batch, so that
+            // none of them speaks for parity articles it never saw.
+            let read = || {
+                vec![
+                    text(a.extent.as_str()),
+                    SqlValue::Blob(a.plan.clone()),
+                    a.stored.clone(),
+                    text(&a.stored_count),
+                ]
+            };
+            stmts.push((
+                "DELETE FROM verifications WHERE extent_id = ?1 \
+                   AND EXISTS (SELECT 1 FROM extents WHERE id = ?1 AND plan = ?2 \
+                     AND parity IS ?3 AND quote(parity_count) = ?4)",
+                read(),
+            ));
+            // And ends every claim on the extent: a job in flight read
+            // the plan before this batch and asks the backbones for the
+            // articles of the old addendum. Its lease is dead from here
+            // on, so what it finds is not recorded and it releases
+            // nothing; the row is free for a job that reads the plan as
+            // it is now.
+            stmts.push((FENCE_CLAIMS, read()));
+            let mut params = read();
+            params.extend([a.parity.clone(), a.parity_count.clone()]);
+            stmts.push((
+                "UPDATE extents SET parity = ?5, parity_count = ?6 \
+                 WHERE id = ?1 AND plan = ?2 AND parity IS ?3 AND quote(parity_count) = ?4",
+                params,
             ));
         }
         if stmts.len() >= BATCH_STATEMENTS {
