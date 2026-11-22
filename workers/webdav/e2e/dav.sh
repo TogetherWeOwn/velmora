@@ -61,6 +61,25 @@ check() {
   fi
 }
 
+# Source this function in the harness regression tests without starting Workers.
+check_litmus() {
+  local rc=$1 lines=$2 group prefix summary clean
+  ((rc == 0)) || fail "litmus" "exit 0" "exit $rc"
+  # Count and validate separately by name; two reports for one group
+  # must not stand in for a missing group or hide a failing summary.
+  for group in basic copymove props locks http; do
+    prefix="^<- summary for \`$group':"
+    summary=$(grep -E "$prefix" <<<"$lines" || true)
+    clean="$prefix of [0-9]+ tests run: [0-9]+ passed, 0 failed\."
+    if [[ $summary == *$'\n'* || ! $summary =~ $clean ]]; then
+      fail "litmus $group" "one summary with 0 failures" "${summary:-no summary}"
+    fi
+  done
+}
+if [[ ${BASH_SOURCE[0]} != "$0" ]]; then
+  return 0
+fi
+
 for tool in curl jq openssl rclone python3 npx; do
   command -v "$tool" >/dev/null || fail "prerequisite" "$tool on PATH" "not found"
 done
@@ -219,18 +238,7 @@ if [[ -n ${LITMUS_ROOT:-} ]]; then
   for s in "${SECRETS[@]}"; do sed -i "s|$s|<redacted>|g" "$T/litmus.log"; done
   cat "$T/litmus.log"
   sed -n 's/^<- summary/litmus <- summary/p' "$T/litmus.log"
-  ((litmus_rc == 0)) || fail "litmus" "exit 0" "exit $litmus_rc"
-
-  # Count and validate separately by name; two reports for one group
-  # must not stand in for a missing group or hide a failing summary.
-  for group in basic copymove props locks http; do
-    prefix="^<- summary for \`$group':"
-    summary=$(grep -E "$prefix" "$T/litmus.log" || true)
-    clean="$prefix of [0-9]+ tests run: [0-9]+ passed, 0 failed\."
-    if [[ $summary == *$'\n'* || ! $summary =~ $clean ]]; then
-      fail "litmus $group" "one summary with 0 failures" "${summary:-no summary}"
-    fi
-  done
+  check_litmus "$litmus_rc" "$(<"$T/litmus.log")"
 else
   echo "skip litmus (LITMUS_ROOT unset)"
 fi

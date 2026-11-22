@@ -7,6 +7,71 @@ mod support;
 use support::*;
 use velmora_dav::handler::Config;
 
+#[cfg(unix)]
+#[test]
+fn litmus_gate_requires_success_and_exactly_one_clean_summary_per_group() {
+    use std::process::Command;
+
+    let run = |status: &str, log: &str| {
+        let script = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../workers/webdav/e2e/dav.sh"
+        );
+        Command::new("bash")
+            .args([
+                "-c",
+                "source \"$1\"; STEP=2-litmus; check_litmus \"$2\" \"$3\"",
+                "--",
+                script,
+                status,
+                log,
+            ])
+            .output()
+            .unwrap()
+    };
+    let summary = |group: &str, passed: u8, failed: u8| {
+        format!("<- summary for `{group}': of 2 tests run: {passed} passed, {failed} failed.")
+    };
+    let clean = ["basic", "copymove", "props", "locks", "http"]
+        .map(|group| summary(group, 2, 0))
+        .join("\n");
+    assert!(run("0", &clean).status.success());
+    let duplicate = clean.replace("`locks'", "`props'");
+    let failed = clean.replace(&summary("locks", 2, 0), &summary("locks", 1, 1));
+    let contradictory = format!("{clean}\n{}", summary("locks", 1, 1));
+    for (status, log, diagnostic) in [
+        ("7", clean.as_str(), "exit 7"),
+        ("0", duplicate.as_str(), "litmus props"),
+        ("0", failed.as_str(), "litmus locks"),
+        ("0", contradictory.as_str(), "litmus locks"),
+    ] {
+        let out = run(status, log);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !out.status.success() && stderr.contains(diagnostic),
+            "{stderr}"
+        );
+    }
+}
+
+#[test]
+fn ci_checks_dav_at_its_declared_msrv() {
+    let ci = include_str!("../../../.github/workflows/ci.yml");
+    let (_, job) = ci.split_once("\n  rust-msrv:\n").expect("rust-msrv job");
+    let before_worker_sdk = job.lines().take_while(|line| {
+        (line.starts_with("    ") || line.trim().is_empty()) && !line.contains("Worker SDK minimum")
+    });
+    assert!(
+        before_worker_sdk
+            .filter(|line| line.contains("cargo check --locked"))
+            .any(|line| {
+                let fields: Vec<_> = line.split_whitespace().collect();
+                fields.windows(2).any(|pair| pair == ["-p", "velmora-dav"])
+            }),
+        "rust-msrv does not select velmora-dav"
+    );
+}
+
 #[tokio::test]
 async fn state_batch_rolls_back_on_second_op_sql_error() {
     use velmora_dav::state::{DeadProp, Op, Patch, Reply};
