@@ -7,6 +7,51 @@ use super::record::{Entry, KeyOp, Subject};
 use crate::crypto::scheme2::TenantId;
 use crate::types::{BucketId, Result};
 
+/// The most entries one apply carries (AM-12; an estimate, a page of
+/// the chain).
+pub const MAX_APPLY: usize = 100;
+
+/// One entry of a key-chain apply: the record at one seq.
+// Nearly every entry is a subject's; a marker is rare, so boxing the
+// common case would cost an allocation per record for nothing.
+#[allow(clippy::large_enum_variant)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ApplyEntry {
+    /// A subject's record: the subject as the head holds it, at
+    /// `last_seq` = the record's seq (for the subject's newest record,
+    /// exactly that record's state), with the `m/rk/` revocations in force.
+    /// `private` is `None` when the store must hold it closed (its private
+    /// part does not open, or the directory may not have its opening).
+    ///
+    /// For the unit's wire (`KeyEntry`): `held = private.is_none()`; a held
+    /// entry is sent without its secret, and then also without
+    /// `secret_kek_version` (the unit refuses one without the other).
+    Subject(Entry),
+    /// A marker record (`KeysFrozen`, `KeysThawed`; AM-28): it changes no
+    /// subject. The store skips it; it holds its seq's place in the run.
+    Marker { seq: u64 },
+}
+
+impl ApplyEntry {
+    /// The seq of the record.
+    pub fn seq(&self) -> u64 {
+        match self {
+            ApplyEntry::Subject(e) => e.last_seq,
+            ApplyEntry::Marker { seq } => *seq,
+        }
+    }
+}
+
+/// What a store answered an apply.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Applied {
+    /// Applied; the store's `keys_seq` is now this.
+    Done { keys_seq: u64 },
+    /// `from_seq` is above the store's `keys_seq`: nothing was done; the
+    /// caller sends again from `keys_seq`.
+    Behind { keys_seq: u64 },
+}
+
 /// A store that holds a copy of a tenant's key table: a unit (root or
 /// other), or the directory's routes. It is a copy: everything it gets
 /// was read and verified from the chain by the Worker.
@@ -21,20 +66,24 @@ pub trait KeyTarget {
     /// ([`Entry::effective_status`]). They are sent again once the ring
     /// opens them.
     async fn closed(&self) -> Result<Vec<String>>;
-    /// In one transaction, per subject, in the order of the chain:
-    /// - a subject the store does not hold is inserted;
-    /// - an entry replaces the subject's row only when its `last_seq` is
-    ///   above the row's; or when it is equal, the row is closed and the
-    ///   entry is not (the same record, now opened); so a stale entry
-    ///   never replaces a newer one, whichever way it closes or opens;
-    /// - a `revoked` entry sets the row `revoked` whatever its seq, and a
-    ///   row that is `revoked` stays `revoked` whatever replaces it:
-    ///   revoked is final;
-    /// - then the store's `keys_seq` becomes the larger of its own and
-    ///   `to_seq`.
+    /// The key-chain apply (ADR §2.4 rule 5, AM-12), in one transaction:
+    /// - `from_seq` is the exclusive base: `entries` are the records
+    ///   `from_seq + 1`, `from_seq + 2`, … with no gap, at most
+    ///   [`MAX_APPLY`]; anything else is refused (an `Err`), and nothing
+    ///   is kept;
+    /// - a `from_seq` above the store's `keys_seq` answers
+    ///   [`Applied::Behind`] with it, and nothing is kept;
+    /// - per entry, in order: a subject the store does not hold is
+    ///   inserted; an entry replaces the subject's row only when its
+    ///   `last_seq` is above the row's, or equal while the row is held
+    ///   closed and the entry is not; a `revoked` entry sets the row
+    ///   `revoked` whatever its seq, and a `revoked` row stays `revoked`;
+    ///   a marker changes nothing;
+    /// - then the store's `keys_seq` becomes the larger of its own and the
+    ///   last entry's seq.
     ///
     /// The directory follows the same rule for what it holds of a key.
-    async fn apply(&self, to_seq: u64, entries: &[Entry]) -> Result<()>;
+    async fn apply(&self, from_seq: u64, entries: &[ApplyEntry]) -> Result<Applied>;
 }
 
 /// Why an opening change was refused before any record.

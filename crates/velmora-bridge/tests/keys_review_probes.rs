@@ -16,8 +16,8 @@ use velmora_bridge::keys::escrow::{restore_escrow, EscrowCopy, RestoreStep};
 use velmora_bridge::keys::gate::testkit::FakeGate;
 use velmora_bridge::keys::locations::{two_in_account, KeyLocation, KeyLocations, LocationStatus};
 use velmora_bridge::keys::ports::{
-    Admission, Binding, BucketAdmission, BucketReservation, ControlChain, ControlIntents,
-    KeyAdmission, KeyTarget, OpeningChange,
+    Admission, Applied, ApplyEntry, Binding, BucketAdmission, BucketReservation, ControlChain,
+    ControlIntents, KeyAdmission, KeyTarget, OpeningChange,
 };
 use velmora_bridge::keys::record::{
     key_chain, open_key_record, seal_key_record, Access, Entry, Grant, KeyOp, KeyRecord, KeyTable,
@@ -234,15 +234,35 @@ impl KeyTarget for &FakeTarget {
             .collect())
     }
 
-    async fn apply(&self, to_seq: u64, entries: &[Entry]) -> Result<()> {
+    async fn apply(&self, from_seq: u64, entries: &[ApplyEntry]) -> Result<Applied> {
         if self.reject_apply {
             return Err(BridgeError::Sql("fake: cannot apply".into()));
         }
-        self.rows
-            .borrow_mut()
-            .extend(entries.iter().map(|e| (e.door.id.clone(), e.clone())));
-        self.seq.set(to_seq);
-        Ok(())
+        if from_seq > self.seq.get() {
+            return Ok(Applied::Behind {
+                keys_seq: self.seq.get(),
+            });
+        }
+        for (i, e) in entries.iter().enumerate() {
+            assert_eq!(e.seq(), from_seq + 1 + i as u64, "a gap");
+        }
+        let mut rows = self.rows.borrow_mut();
+        for e in entries {
+            if let ApplyEntry::Subject(e) = e {
+                let newer = rows.get(&e.door.id).is_none_or(|r| {
+                    e.last_seq > r.last_seq
+                        || (e.last_seq == r.last_seq && r.private.is_none() && e.private.is_some())
+                });
+                if newer {
+                    rows.insert(e.door.id.clone(), e.clone());
+                }
+            }
+        }
+        let last = from_seq + entries.len() as u64;
+        self.seq.set(self.seq.get().max(last));
+        Ok(Applied::Done {
+            keys_seq: self.seq.get(),
+        })
     }
 }
 
