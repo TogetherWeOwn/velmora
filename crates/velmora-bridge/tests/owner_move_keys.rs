@@ -413,7 +413,7 @@ async fn putting_a_sealed_record_distinguishes_retries_from_conflicts() {
         put_sealed(&store, &RefRing(&records.tk), records.tk.tenant(), &first)
             .await
             .unwrap(),
-        Placed::Written
+        Placed::Same
     );
 
     let same = records.reseal();
@@ -1259,4 +1259,14 @@ async fn a_key_revoked_since_the_freeze_stops_the_resumed_move_before_any_write(
         "the target holds something else under this name",
     );
     assert_eq!(fixture.store.puts(), puts);
+}
+
+/// A bucket named twice counts once against the principal's grant cap.
+#[tokio::test(flavor = "current_thread")]
+async fn a_repeated_bucket_counts_once_against_the_cap() {
+    let mut fixture = FrozenKeys::new().await;
+    let mut buckets: Vec<String> = (0..64).map(|n| format!("b_{n:02}")).collect();
+    buckets.push("b_01".into());
+    fixture.buckets = buckets;
+    fixture.write(PRINCIPAL).await.unwrap();
 }

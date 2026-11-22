@@ -298,7 +298,12 @@ pub async fn put_sealed<S: RecordStore, T: TkRing>(
         };
     };
     if there == sealed.sealed {
-        return Ok(Placed::Written);
+        // These exact bytes: stored by this call only when its answer
+        // was lost.
+        return Ok(match put {
+            Err(_) => Placed::Written,
+            Ok(_) => Placed::Same,
+        });
     }
     let (_, version) = record_v2_header(&there).map_err(|_| ERR_MOVE_DIFFERS)?;
     let tk = ring.key(version).ok_or(ERR_MOVE_DIFFERS)?;
@@ -561,7 +566,7 @@ where
         .iter()
         .filter(|g| !moved.contains(g.bucket_id.as_str()))
         .count();
-    if kept + buckets.len() > MAX_SUBJECT_GRANTS {
+    if kept + moved.len() > MAX_SUBJECT_GRANTS {
         return Err(ERR_MOVE_INPUT);
     }
 
