@@ -272,7 +272,10 @@ pub fn reseal_tombstone<R: FillRandom>(
 /// Where a sealed record went.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Placed {
-    /// Stored by this call.
+    /// Stored by this call. Also the answer when the put failed and these
+    /// exact bytes are under the name: the store cannot tell a lost answer
+    /// from an earlier put of the same bytes, and either way the record
+    /// holds this plaintext.
     Written,
     /// A record with the same plaintext was there already (a run that is
     /// resumed).

@@ -443,6 +443,46 @@ async fn putting_a_sealed_record_distinguishes_retries_from_conflicts() {
     assert_eq!(store.raw(&first.name), Some(first.sealed));
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn putting_a_sealed_record_reads_back_after_a_store_error() {
+    let mut records = Records::new();
+    let store = MemRecords::new();
+    let first = records.reseal();
+    let ring = RefRing(&records.tk);
+    let tenant = records.tk.tenant().clone();
+
+    // A put that fails before it stores anything is the store's error.
+    store.refuse("m/");
+    assert!(put_sealed(&store, &ring, &tenant, &first).await.is_err());
+    assert_eq!(store.raw(&first.name), None);
+    store.allow("m/");
+
+    // A put whose answer was lost finds its own bytes.
+    store.lose_answers(1);
+    assert_eq!(
+        put_sealed(&store, &ring, &tenant, &first).await.unwrap(),
+        Placed::Written
+    );
+    assert_eq!(store.raw(&first.name), Some(first.sealed.clone()));
+
+    // A failed retry of the same bytes cannot be told from a lost answer;
+    // the record holds the same plaintext either way.
+    store.refuse("m/");
+    assert_eq!(
+        put_sealed(&store, &ring, &tenant, &first).await.unwrap(),
+        Placed::Written
+    );
+    // The same plaintext under other bytes is still found as it is.
+    let same = records.reseal();
+    assert_eq!(
+        put_sealed(&store, &RefRing(&records.tk), &tenant, &same)
+            .await
+            .unwrap(),
+        Placed::Same
+    );
+    assert_eq!(store.raw(&first.name), Some(first.sealed));
+}
+
 #[test]
 fn tombstones_and_article_plans_open_under_their_tenant_names() {
     let mut records = Records::new();
