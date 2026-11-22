@@ -11,8 +11,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::birth::{BirthToken, ProvisionRefusal};
+use super::export::{ExportMode, ExportRefusal, ExportTable};
 use super::identity::{CallKind, Refusal, Seqs};
-use super::import::{ImportBatch, ImportRefusal, MoveHead};
+use super::import::{ImportBatch, ImportCount, ImportRefusal, ImportValue, MoveHead};
 use super::jobcall::JobCall;
 use super::keys::{KeyEntry, KeyRefusal};
 use super::lift::{AckClass, FindingList, GateRefusal, GateSummary, LiftProof, ReplayId};
@@ -167,8 +168,29 @@ pub enum UnitOp {
         since: u64,
         batch: ImportBatch,
     },
-    /// Every table's import cursor and row count. A Worker call.
+    /// Every table's import cursor and row count, and whether the import
+    /// is final. A Worker call.
     ImportProgress {},
+    /// Seals the import (AM-29): `tables` names every import table once
+    /// with the rows the unit took. Bound and numbered as an import
+    /// batch; records `move_ordinal` = the head's `flips + 1`; after it no
+    /// batch is taken. A Worker call.
+    ImportSeal {
+        head: MoveHead,
+        since: u64,
+        tables: Vec<ImportCount>,
+    },
+    /// Pages one table's rows, read-only, while the unit is closed
+    /// (AM-26): `hash` answers a digest, `rows` the rows (not on the key
+    /// tables). `after`: the key of the last row of the page before. A
+    /// Worker call.
+    Export {
+        table: ExportTable,
+        #[serde(default)]
+        after: Option<Vec<ImportValue>>,
+        limit: u32,
+        mode: ExportMode,
+    },
     /// The first of the two restore calls (AM-2): refused unless the unit
     /// is closed under the entry at `since` long enough; answers the undo
     /// bookmark. A Worker call, run by the object class (it needs the
@@ -185,6 +207,10 @@ pub enum UnitOp {
     },
     /// Starts the gate report of one replay, discarding any other.
     GateOpen { replay_id: ReplayId },
+    /// Starts the owner move's lift report (AM-15), discarding any other:
+    /// only under the import's binding, with tenant 0's verified head;
+    /// numbered as an import batch.
+    GateOpenMove { replay_id: ReplayId, head: MoveHead },
     /// What that replay found besides its id lists.
     GateReport {
         replay_id: ReplayId,
@@ -248,9 +274,12 @@ impl UnitOp {
                 | UnitOp::HeldKeys {}
                 | UnitOp::Import { .. }
                 | UnitOp::ImportProgress {}
+                | UnitOp::ImportSeal { .. }
+                | UnitOp::Export { .. }
                 | UnitOp::RestorePrepare { .. }
                 | UnitOp::Restore { .. }
                 | UnitOp::GateOpen { .. }
+                | UnitOp::GateOpenMove { .. }
                 | UnitOp::GateReport { .. }
                 | UnitOp::GateBlockers { .. }
                 | UnitOp::GateAck { .. }
@@ -319,6 +348,8 @@ pub enum Refused {
     Restore(RestoreRefusal),
     /// A gate call, or the `sync` that would lift, was refused (AM-2).
     Gate(GateRefusal),
+    /// An export was refused (AM-26).
+    Export(ExportRefusal),
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

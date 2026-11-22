@@ -66,7 +66,8 @@ use super::transition::{Actor, Change, MAX_MOVED_BUCKETS};
 use crate::ports::{BlobStore, Sql, SqlValue};
 use crate::records::RecordStore;
 use crate::types::{BridgeError, UnixMs};
-use crate::unit::lift::{LiftProof, ReplayId};
+use crate::unit::call::Refused as UnitRefused;
+use crate::unit::lift::{GateRefusal, LiftProof, ReplayId};
 
 /// Why the flip or the give-up stopped. Every sub-step it finished stays
 /// finished and is found again by the next run.
@@ -99,13 +100,13 @@ pub enum FlipError {
         missing: Vec<String>,
         extra: Vec<String>,
     },
-    /// The unit refused the `move` report, with its code.
-    Report(String),
+    /// The unit refused the `move` report.
+    Report(GateRefusal),
     /// `GateStatus` did not pass for a fresh `move` report.
     LiftNotOk,
-    /// The unit refused `sync`, with its code: after a closing record, or
-    /// after [`MAX_REENTRIES`] re-entries of the lift.
-    SyncRefused(String),
+    /// The unit refused `sync`: a closing record, a refusal that is not
+    /// the gate's, or the gate's after [`MAX_REENTRIES`] re-entries.
+    SyncRefused(UnitRefused),
     /// V9 failed in the open unit; the move was given up (AM-30).
     V9Failed,
     /// V9 failed, and the give-up it started stopped with this error: run
@@ -139,18 +140,21 @@ impl From<KeyStepError> for FlipError {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Synced {
     Ok,
-    /// Refused, with the unit's fixed code (the in-unit lift check failed,
-    /// or the head is stale).
-    Refused(String),
+    /// Refused: `gate` (the in-unit lift check: re-enter), `stale_sync`
+    /// (read the head again), `keys_not_applied` (apply the keys, send
+    /// again), or another reason (stop).
+    Refused(UnitRefused),
 }
 
 /// The unit's answer to the `move` report.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Reported {
-    /// Opened and closed complete with no blocker.
+    /// Opened (`GateOpenMove`) and closed complete with no blocker
+    /// (`GateReport`).
     Done,
-    /// Refused, with the unit's fixed code (not sealed, not this window).
-    Refused(String),
+    /// Refused (`move_not_bound`, `import_not_sealed`,
+    /// `stamp_not_levelled`, `not_restoring`).
+    Refused(GateRefusal),
 }
 
 /// What `GateStatus` says of the stored report.
@@ -182,7 +186,11 @@ pub trait OwnerUnit: KeyUnit {
     ) -> crate::types::Result<Synced>;
     /// `renew`.
     async fn renew(&self) -> crate::types::Result<()>;
-    /// The unit's stamp counter: the ordinal a `move` report names.
+    /// The unit's own `restoring_since` (`Ping` or `GateStatus`): `None`
+    /// once the lift landed.
+    async fn restoring_since(&self) -> crate::types::Result<Option<u64>>;
+    /// The unit's stamp counter (`GateStatus.stamp_counter`, `null` = 0):
+    /// the ordinal a `move` report names.
     async fn stamp_ordinal(&self) -> crate::types::Result<u64>;
     /// Opens a gate report of kind `move` with `replay_id` and closes it
     /// complete with no blocker (AM-15), passing tenant 0's verified head
@@ -213,9 +221,16 @@ pub trait RouteRecords {
     /// The tenant the route record of `akid` names; `None` = no record.
     async fn get(&self, akid: &str) -> crate::types::Result<Option<String>>;
     /// The ETag-conditional replace of DS1 §2.2: the record of `akid` that
-    /// names `from` now names `to`, or already names `to`. `false` = it
-    /// names a third tenant (or no record exists).
-    async fn replace(&self, akid: &str, from: &Tenant, to: &Tenant) -> crate::types::Result<bool>;
+    /// names `from` now names `to` with `kind` (from the key's directory
+    /// row; a later window's keymap may change it), or already names `to`.
+    /// `false` = it names a third tenant (or no record exists).
+    async fn replace(
+        &self,
+        akid: &str,
+        from: &Tenant,
+        to: &Tenant,
+        kind: RouteKind,
+    ) -> crate::types::Result<bool>;
 }
 
 /// The move a flip or a give-up acts on.
@@ -425,17 +440,22 @@ where
     // route names the owner yet, so nothing reaches the open unit before
     // the give-up closes it.
     if !routes_started && !unit.v9().await? {
-        let gave_up = chain
-            .write(
-                &Tenant::Zero,
-                &Change::GiveUpMove,
-                Actor::MoveTool,
-                now,
-                zero.seq,
-            )
-            .await?;
-        dir.apply_tenant(&door_of(gave_up), now).await?;
-        return match give_up(chain, frozen, safety, dir, unit, routes, keys, window, now).await {
+        // Every error from here keeps the V9 answer: a re-run finds the
+        // window given up and cannot report the failing check again.
+        let gave_up = async {
+            let written = chain
+                .write(
+                    &Tenant::Zero,
+                    &Change::GiveUpMove,
+                    Actor::MoveTool,
+                    now,
+                    zero.seq,
+                )
+                .await?;
+            dir.apply_tenant(&door_of(written), now).await?;
+            give_up(chain, frozen, safety, dir, unit, routes, keys, window, now).await
+        };
+        return match gave_up.await {
             Ok(_) => Err(FlipError::V9Failed),
             Err(e) => Err(FlipError::V9GiveUp(Box::new(e))),
         };
@@ -449,7 +469,11 @@ where
     for (akid, kind) in window.keys.iter().zip(kinds) {
         let named = match routes.get(akid).await?.as_deref() == Some(Tenant::Zero.as_str()) {
             // An earlier window's give-up put it back on tenant 0.
-            true => routes.replace(akid, &zero_tenant, window.owner).await?,
+            true => {
+                routes
+                    .replace(akid, &zero_tenant, window.owner, kind)
+                    .await?
+            }
             false => routes.put(akid, window.owner, kind).await?,
         };
         if !named {
@@ -537,16 +561,25 @@ where
         };
         // An opening record: the directory before the unit.
         dir.apply_tenant(&owner, now).await?;
-        match unit.sync(&owner, Some(&proof)).await? {
+        let mut answer = unit.sync(&owner, Some(&proof)).await?;
+        if answer == Synced::Refused(UnitRefused::KeysNotApplied) {
+            apply_owner_keys(keys, unit).await?;
+            answer = unit.sync(&owner, Some(&proof)).await?;
+        }
+        match answer {
             Synced::Ok => {
                 unit.renew().await?;
                 return Ok(owner);
             }
-            Synced::Refused(code) if reentry == MAX_REENTRIES => {
-                return Err(FlipError::SyncRefused(code))
+            // A newer record of the owner: read the head again.
+            Synced::Refused(UnitRefused::StaleSync) if reentry < MAX_REENTRIES => {}
+            // The lift landed already (a lost answer): the unit is open.
+            Synced::Refused(UnitRefused::Gate(_)) if unit.restoring_since().await?.is_none() => {
+                unit.renew().await?;
+                return Ok(owner);
             }
             // Re-entry: a new entry, the unit closed under it, (b) again.
-            Synced::Refused(_) => {
+            Synced::Refused(UnitRefused::Gate(_)) if reentry < MAX_REENTRIES => {
                 let closed = door_of(
                     chain
                         .write(
@@ -562,6 +595,7 @@ where
                 // A closing record: the unit before the directory.
                 dir.apply_tenant(&closed, now).await?;
             }
+            Synced::Refused(r) => return Err(FlipError::SyncRefused(r)),
         }
     }
     unreachable!("the last re-entry returns")
@@ -622,7 +656,7 @@ async fn close_unit<U: OwnerUnit>(unit: &U, owner: &TenantDoor) -> Result<(), Fl
 /// The `LiftProof` of a `move` report for the entry at `since` that the
 /// unit's gate passes: the stored report's if it is one, else a new
 /// report's (AM-15).
-async fn move_lift_proof<U: OwnerUnit>(
+pub async fn move_lift_proof<U: OwnerUnit>(
     unit: &U,
     zero: &TenantDoor,
     since: u64,
@@ -894,8 +928,15 @@ where
             close_owner(chain, dir, unit, window, now).await?;
             let zero_tenant = Tenant::Zero;
             for akid in window.keys {
-                if routes.get(akid).await?.as_deref() == Some(window.owner.as_str())
-                    && !routes.replace(akid, window.owner, &zero_tenant).await?
+                if routes.get(akid).await?.as_deref() != Some(window.owner.as_str()) {
+                    continue;
+                }
+                let Some(row) = dir.route(akid).await? else {
+                    return Err(FlipError::RouteRow(akid.clone()));
+                };
+                if !routes
+                    .replace(akid, window.owner, &zero_tenant, row.kind)
+                    .await?
                 {
                     return Err(FlipError::RouteTaken(akid.clone()));
                 }

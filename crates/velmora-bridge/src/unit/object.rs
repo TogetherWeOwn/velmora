@@ -37,8 +37,12 @@ use super::birth::{check_token, BirthKind, BirthToken, ProvisionRefusal};
 use super::call::{
     Closed, HoldMode, Reader, Refused, SyncHead, TenantState, UnitAnswer, UnitCall, UnitOp,
 };
+use super::export::{self, ExportMode, ExportTable};
 use super::identity::{self, CallKind, Seqs, Verdict};
-use super::import::{self, ImportBatch, ImportRefusal, ImportTable, Imported, MoveHead};
+use super::import::{
+    self, ImportBatch, ImportCount, ImportRefusal, ImportTable, ImportValue, Imported, MoveHead,
+    Seal,
+};
 use super::keys::{self, Applied, KeyEntry};
 use super::lift::{self, GateRefusal};
 use super::name::UnitName;
@@ -376,11 +380,41 @@ impl<S: UnitSql> Unit<S> {
                     )
                 })
             }
+            UnitOp::GateOpenMove {
+                replay_id,
+                head: mover,
+            } => {
+                if let Some(answer) = self.move_numbers(call, &head) {
+                    return Ok(answer);
+                }
+                return self.gate_write(&head, &mut || {
+                    Ok(lift::open_move(
+                        self.sql(),
+                        self.managed_root(),
+                        &self.own.tenant,
+                        head.restoring_since,
+                        replay_id,
+                        mover,
+                    )?
+                    .map(|opened| json!({ "opened": opened })))
+                });
+            }
             UnitOp::GateStatus {} => {
                 return self.read_only(&head, &mut || {
-                    lift::status(self.sql(), head.restoring_since)
+                    lift::status(self.sql(), self.managed_root(), head.restoring_since)
                 })
             }
+            UnitOp::Export {
+                table,
+                after,
+                limit,
+                mode,
+            } => return self.export(&head, *table, after.as_deref(), *limit, *mode),
+            UnitOp::ImportSeal {
+                head: mover,
+                since,
+                tables,
+            } => return self.import_seal(call, &head, mover, *since, tables),
             UnitOp::ApplyKeys { from_seq, entries } => {
                 return self.apply_keys(&head, *from_seq, entries)
             }
@@ -400,7 +434,10 @@ impl<S: UnitSql> Unit<S> {
                         .into_iter()
                         .map(|(t, c, n)| json!({ "table": t, "cursor": c, "rows": n }))
                         .collect();
-                    Ok(json!({ "tables": tables }))
+                    Ok(json!({
+                        "tables": tables,
+                        "sealed": import::sealed(self.sql())?,
+                    }))
                 })
             }
             _ => {}
@@ -618,9 +655,12 @@ impl<S: UnitSql> Unit<S> {
             | UnitOp::HeldKeys {}
             | UnitOp::Import { .. }
             | UnitOp::ImportProgress {}
+            | UnitOp::ImportSeal { .. }
+            | UnitOp::Export { .. }
             | UnitOp::RestorePrepare { .. }
             | UnitOp::Restore { .. }
             | UnitOp::GateOpen { .. }
+            | UnitOp::GateOpenMove { .. }
             | UnitOp::GateReport { .. }
             | UnitOp::GateBlockers { .. }
             | UnitOp::GateAck { .. }
@@ -834,19 +874,13 @@ impl<S: UnitSql> Unit<S> {
         since: u64,
         batch: &ImportBatch,
     ) -> Result<UnitAnswer> {
-        // The caller's numbers, as a job's: equal, or refused.
-        match identity::check(&self.own, head.seqs, &call.name, CallKind::Job, call.seqs) {
-            Verdict::Proceed => {}
-            Verdict::SyncNeeded => return Ok(UnitAnswer::SyncNeeded { seqs: head.seqs }),
-            Verdict::Refused { reason, alarm } => {
-                return Ok(refused(Refused::Identity(reason), alarm))
-            }
-            Verdict::Stale | Verdict::FanoutCheck => {
-                return Ok(refused(
-                    Refused::Identity(identity::Refusal::StaleJob),
-                    false,
-                ))
-            }
+        if let Some(answer) = self.move_numbers(call, head) {
+            return Ok(answer);
+        }
+        // A sealed import takes no batch, under any entry: its own code,
+        // so a resumed copy knows the import is done (AM-29).
+        if import::sealed(self.sql())?.is_some() {
+            return Ok(refused(Refused::Import(ImportRefusal::Sealed), false));
         }
         if !import::bound_to_move(
             &self.own.tenant,
@@ -898,6 +932,101 @@ impl<S: UnitSql> Unit<S> {
         })
     }
 
+    /// The caller's numbers of a move call (an import batch, the seal, the
+    /// `move` report), judged as a job's: equal, or the answer to give.
+    fn move_numbers(&self, call: &UnitCall, head: &Head) -> Option<UnitAnswer> {
+        match identity::check(&self.own, head.seqs, &call.name, CallKind::Job, call.seqs) {
+            Verdict::Proceed => None,
+            Verdict::SyncNeeded => Some(UnitAnswer::SyncNeeded { seqs: head.seqs }),
+            Verdict::Refused { reason, alarm } => Some(refused(Refused::Identity(reason), alarm)),
+            Verdict::Stale | Verdict::FanoutCheck => Some(refused(
+                Refused::Identity(identity::Refusal::StaleJob),
+                false,
+            )),
+        }
+    }
+
+    /// The unit is the root unit of a tenant other than tenant 0: the only
+    /// unit a move fills and a `move` report lifts.
+    fn managed_root(&self) -> bool {
+        !self.own.tenant.is_zero() && self.own.unit == 0
+    }
+
+    /// The import's seal (AM-29): bound and numbered as a batch, then
+    /// [`import::seal`] in one transaction.
+    fn import_seal(
+        &self,
+        call: &UnitCall,
+        head: &Head,
+        mover: &MoveHead,
+        since: u64,
+        tables: &[ImportCount],
+    ) -> Result<UnitAnswer> {
+        if let Some(answer) = self.move_numbers(call, head) {
+            return Ok(answer);
+        }
+        if !import::bound_to_move(
+            &self.own.tenant,
+            self.own.unit,
+            head.restoring_since,
+            since,
+            mover,
+        ) {
+            return Ok(refused(Refused::Import(ImportRefusal::NotBound), true));
+        }
+        let sql = self.sql();
+        let mut op = || -> Result<std::result::Result<Value, Refused>> {
+            Ok(match import::seal(sql, since, mover, tables)? {
+                Seal::Done {
+                    move_ordinal,
+                    newly,
+                } => Ok(json!({ "sealed": move_ordinal, "newly": newly })),
+                Seal::Refused(r) => Err(Refused::Import(r)),
+            })
+        };
+        Ok(match transact(sql, true, &mut op)? {
+            Ok(body) => UnitAnswer::Ok {
+                seqs: head.seqs,
+                body,
+            },
+            Err(reason) => {
+                let alarm = reason == Refused::Import(ImportRefusal::NotBound);
+                refused(reason, alarm)
+            }
+        })
+    }
+
+    /// `export` (AM-26): read-only, refused unless the unit is closed.
+    fn export(
+        &self,
+        head: &Head,
+        table: ExportTable,
+        after: Option<&[ImportValue]>,
+        limit: u32,
+        mode: ExportMode,
+    ) -> Result<UnitAnswer> {
+        let sql = self.sql();
+        let mut op = || {
+            Ok(
+                export::export(sql, head.restoring_since, table, after, limit, mode)?
+                    .map_err(Refused::Export),
+            )
+        };
+        Ok(match transact(sql, false, &mut op)? {
+            Ok(body) => UnitAnswer::Ok {
+                seqs: head.seqs,
+                body,
+            },
+            Err(reason) => {
+                let alarm = matches!(
+                    reason,
+                    Refused::WroteWithoutAuthentication | Refused::AwaitedInside
+                );
+                refused(reason, alarm)
+            }
+        })
+    }
+
     /// `sync` (rule 5): copies a verified record. Numbers never go back.
     /// The key records themselves are applied by the key-chain apply; until
     /// it exists here, a `keys_seq` above the unit's is refused, so the
@@ -929,11 +1058,16 @@ impl<S: UnitSql> Unit<S> {
             if lifting {
                 // AM-2: the entry is cleared only on the unit's own lift
                 // check, against the report of this restore's replay.
-                if let Err(r) = lift::check_named(sql, head.restoring_since, next.lift.as_ref())? {
+                if let Err(r) = lift::check_named(
+                    sql,
+                    self.managed_root(),
+                    head.restoring_since,
+                    next.lift.as_ref(),
+                )? {
                     why = Some(r);
                     return Err(BridgeError::Invalid(ROLLBACK));
                 }
-                lift::clear(sql)?;
+                lift::lifted(sql)?;
             }
             let n = poll_once(sql.exec(
                 "UPDATE unit_head SET state_seq = ?1, tenant_state = ?2, tenant_mode = ?3, \

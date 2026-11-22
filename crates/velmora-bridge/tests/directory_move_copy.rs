@@ -18,7 +18,9 @@ use velmora_bridge::directory::move_copy::{
 use velmora_bridge::directory::record::{Tenant, TenantRecord};
 use velmora_bridge::directory::transition::{next, Actor, Change, Outcome, KEY_CHECK_LEN};
 use velmora_bridge::testkit::RusqliteSql;
-use velmora_bridge::unit::import::{ImportBatch, ImportTable, ImportValue, Imported, MoveHead};
+use velmora_bridge::unit::import::{
+    ImportBatch, ImportCount, ImportRefusal, ImportTable, ImportValue, Imported, MoveHead,
+};
 use velmora_bridge::unit::{
     BirthKind, BirthToken, CallKind, Refused, Seqs, SyncHead, TenantState, Unit, UnitAnswer,
     UnitCall, UnitName, UnitOp,
@@ -187,9 +189,6 @@ fn unit(since: u64) -> Unit<RusqliteSql> {
 }
 
 /// The Worker's side of the import: one call per batch, with faults.
-/// `(ordinal, since, tables)` of a seal.
-type SealCall = (u64, u64, Vec<(ImportTable, u64)>);
-
 struct Adapter<'a> {
     unit: &'a Unit<RusqliteSql>,
     state_seq: u64,
@@ -205,9 +204,6 @@ struct Adapter<'a> {
     /// The Nth import of this table fails unapplied (`false`) or is
     /// applied with its answer lost (`true`).
     fault: RefCell<Option<(String, u32, bool)>>,
-    /// The seal the unit took: `(ordinal, since, tables)`. The unit call
-    /// is L1's (AM-29); this stands in for it with the rule it states.
-    sealed: RefCell<Option<SealCall>>,
     /// Seal answers to lose (the seal lands, the answer does not).
     lose_seal: Cell<u32>,
     seals: Cell<u32>,
@@ -224,7 +220,6 @@ impl<'a> Adapter<'a> {
             resent: Cell::new(0),
             by_table: RefCell::new(BTreeMap::new()),
             fault: RefCell::new(None),
-            sealed: RefCell::new(None),
             lose_seal: Cell::new(0),
             seals: Cell::new(0),
         }
@@ -315,48 +310,59 @@ impl UnitImport for Adapter<'_> {
             .collect())
     }
 
-    async fn seal(
-        &self,
-        _head: &MoveHead,
-        ordinal: u64,
-        since: u64,
-        tables: &[(ImportTable, u64)],
-    ) -> Result<Sealed> {
+    /// The unit's own `ImportSeal` (L1, AM-29).
+    async fn seal(&self, head: &MoveHead, since: u64, tables: &[ImportCount]) -> Result<Sealed> {
         self.seals.set(self.seals.get() + 1);
-        // AM-29: every count equals the unit's own (a table with no
-        // import row counts 0), and every import table is named once.
-        let progress = self.progress().await?;
-        let named: BTreeSet<&str> = tables.iter().map(|(t, _)| t.name()).collect();
-        if named.len() != ImportTable::ALL.len() || tables.len() != named.len() {
-            return Ok(Sealed::Refused("tables".into()));
-        }
-        for (table, rows) in tables {
-            let unit = progress
-                .iter()
-                .find(|(t, _, _)| t == table.name())
-                .map_or(0, |(_, _, n)| *n);
-            if unit != *rows {
-                return Ok(Sealed::Refused("count_mismatch".into()));
-            }
-        }
-        let mut sealed = self.sealed.borrow_mut();
-        match &*sealed {
-            Some((o, s, t)) if (*o, *s, t.as_slice()) != (ordinal, since, tables) => {
-                return Ok(Sealed::Refused("sealed".into()))
-            }
-            _ => *sealed = Some((ordinal, since, tables.to_vec())),
-        }
+        let a = worker(
+            self.unit,
+            seqs(self.state_seq),
+            UnitOp::ImportSeal {
+                head: head.clone(),
+                since,
+                tables: tables.to_vec(),
+            },
+        );
+        let answer = match a {
+            UnitAnswer::Ok { body, .. } => Sealed::Done {
+                ordinal: body["sealed"].as_u64().unwrap(),
+            },
+            UnitAnswer::Refused {
+                reason: Refused::Import(r),
+                ..
+            } => Sealed::Refused(r),
+            other => panic!("{other:?}"),
+        };
         if self.lose_seal.get() > 0 {
             self.lose_seal.set(self.lose_seal.get() - 1);
             return Err(BridgeError::Blob("answer lost".into()));
         }
-        Ok(Sealed::Done)
+        Ok(answer)
     }
 
+    /// From the unit's own `ImportProgress`.
     async fn seal_state(&self) -> Result<Option<SealState>> {
-        Ok(self.sealed.borrow().as_ref().map(|(o, _, t)| SealState {
-            move_ordinal: *o,
-            tables: t.clone(),
+        let a = worker(self.unit, seqs(self.state_seq), UnitOp::ImportProgress {});
+        let UnitAnswer::Ok { body, .. } = a else {
+            panic!("{a:?}")
+        };
+        let Some(ordinal) = body["sealed"].as_u64() else {
+            return Ok(None);
+        };
+        let tables = body["tables"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| ImportCount {
+                table: ImportTable::ALL
+                    .into_iter()
+                    .find(|x| x.name() == t["table"].as_str().unwrap())
+                    .unwrap(),
+                rows: t["rows"].as_u64().unwrap(),
+            })
+            .collect();
+        Ok(Some(SealState {
+            move_ordinal: ordinal,
+            tables,
         }))
     }
 }
@@ -716,21 +722,56 @@ fn every_table_arrives_row_for_row_without_the_canary() {
         // The seal after the last batch, with the counts of every table;
         // the second run's answer (no batch sent) gives the same counts.
         let ordinal = move_ordinal(&zero.door).expect("moving");
-        assert_eq!(ordinal, 1);
-        seal(&adapter, &head, ordinal, since, &done)
-            .await
-            .map_err(|e| format!("{e:?}"))
-            .unwrap();
+        assert_eq!(ordinal, head.flips + 1);
         adapter.lose_seal.set(1);
-        seal(&adapter, &head, ordinal, since, &again)
+        seal(&adapter, &head, since, &again)
             .await
             .map_err(|e| format!("{e:?}"))
             .unwrap();
-        let sealed = adapter.sealed.borrow().clone().unwrap();
-        assert_eq!(sealed.2.len(), ImportTable::ALL.len());
-        for (table, rows) in &sealed.2 {
-            assert_eq!(*rows, rows_of(&done, *table), "{}", table.name());
+        let sealed = adapter.seal_state().await.unwrap().unwrap();
+        assert_eq!(sealed.move_ordinal, ordinal);
+        for table in ImportTable::ALL {
+            let rows = sealed
+                .tables
+                .iter()
+                .find(|c| c.table == table)
+                .map_or(0, |c| c.rows);
+            assert_eq!(rows, rows_of(&done, table), "{}", table.name());
         }
+        // Sealed: a resumed copy sends nothing and answers the seal's
+        // counts; a seal again is found without a call.
+        let n = adapter.imports.get();
+        let resumed = copy_all(
+            &rig.bridge.catalog.sql,
+            &adapter,
+            &stub,
+            &plan(&canary, 2),
+            &head,
+            since,
+            rig.now(),
+        )
+        .await
+        .map_err(|e| format!("{e:?}"))
+        .unwrap();
+        assert_eq!(adapter.imports.get(), n);
+        let seals = adapter.seals.get();
+        seal(&adapter, &head, since, &resumed).await.unwrap();
+        assert_eq!(adapter.seals.get(), seals);
+        // And a batch sent anyway is refused as sealed.
+        let mut b = velmora_bridge::unit::import::ImportBatch {
+            table: ImportTable::Gc,
+            columns: ImportTable::Gc
+                .columns()
+                .iter()
+                .map(|c| c.to_string())
+                .collect(),
+            after: None,
+            cursor: "[\"z\"]".into(),
+            rows: vec![],
+        };
+        b.rows.clear();
+        let r = adapter.import(&head, since, &b).await.unwrap();
+        assert_eq!(r, Imported::Refused(ImportRefusal::Sealed));
     });
 }
 
@@ -764,39 +805,42 @@ fn the_seal_names_every_table_with_the_units_count() {
         .unwrap();
         // A run that did not reach every table cannot seal.
         let short: Vec<TableCopy> = done[..done.len() - 1].to_vec();
-        let r = seal(&adapter, &head, 1, since, &short).await;
+        let r = seal(&adapter, &head, since, &short).await;
         assert!(matches!(r, Err(CopyError::Incomplete)), "{r:?}");
         let mut twice = done.clone();
         twice.push(done[0].clone());
-        let r = seal(&adapter, &head, 1, since, &twice).await;
+        let r = seal(&adapter, &head, since, &twice).await;
         assert!(matches!(r, Err(CopyError::Incomplete)), "{r:?}");
         assert_eq!(adapter.seals.get(), 0);
         // A count the unit does not hold: refused, the import stays open.
         let mut off = done.clone();
         off[2].unit_rows += 1;
-        let r = seal(&adapter, &head, 1, since, &off).await;
+        let r = seal(&adapter, &head, since, &off).await;
         assert!(
-            matches!(&r, Err(CopyError::SealRefused(c)) if c == "count_mismatch"),
+            matches!(r, Err(CopyError::SealRefused(ImportRefusal::CountMismatch))),
             "{r:?}"
         );
-        assert!(adapter.sealed.borrow().is_none());
-        // Lost answers are sent again, up to the tries.
+        assert!(adapter.seal_state().await.unwrap().is_none());
+        // Lost answers are sent again, up to the tries: the first try
+        // landed, and the next ones are repeats under the same entry.
         adapter.lose_seal.set(3);
-        let r = seal(&adapter, &head, 1, since, &done).await;
+        let r = seal(&adapter, &head, since, &done).await;
         assert!(matches!(r, Err(CopyError::Store(_))), "{r:?}");
         assert_eq!(adapter.seals.get(), 4);
-        seal(&adapter, &head, 1, since, &done).await.unwrap();
+        seal(&adapter, &head, since, &done).await.unwrap();
         // A repeat under a later restoring entry (AM-15's re-entry, which
-        // the seal survives) is refused by the unit and found done.
+        // the seal survives) is found done without a call (the unit would
+        // page on it).
         let before = adapter.seals.get();
-        seal(&adapter, &head, 1, since + 1, &done).await.unwrap();
-        assert_eq!(adapter.seals.get(), before + 1);
-        // Sealed under another ordinal: not this window's import.
-        let r = seal(&adapter, &head, 2, since + 1, &done).await;
-        assert!(
-            matches!(&r, Err(CopyError::SealRefused(c)) if c == "sealed"),
-            "{r:?}"
-        );
+        seal(&adapter, &head, since + 1, &done).await.unwrap();
+        assert_eq!(adapter.seals.get(), before);
+        // Sealed under another ordinal, or other counts: not this one.
+        let mut later = head.clone();
+        later.flips += 1;
+        let r = seal(&adapter, &later, since, &done).await;
+        assert!(matches!(r, Err(CopyError::SealedOther)), "{r:?}");
+        let r = seal(&adapter, &head, since, &off).await;
+        assert!(matches!(r, Err(CopyError::SealedOther)), "{r:?}");
         // The ordinal is only a moving head's.
         let mut d1 = zero.clone();
         d1.door.tenant_zero.as_mut().unwrap().selector =
@@ -1125,4 +1169,189 @@ fn the_hour_filing_survives_full_pages_and_every_crash() {
             });
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// The move's lift report on the real unit (L1 package 4a, AM-15)
+// ---------------------------------------------------------------------------
+
+/// The step-8 port over the real unit, for the calls of the lift report:
+/// `GateOpenMove` + `GateReport`, `GateStatus`, `sync`.
+struct LiftCalls<'a> {
+    unit: &'a Unit<RusqliteSql>,
+    state_seq: u64,
+    nonces: Cell<u32>,
+}
+
+impl velmora_bridge::directory::move_keys::KeyUnit for LiftCalls<'_> {
+    async fn apply_keys(
+        &self,
+        _from: u64,
+        _entries: &[velmora_bridge::unit::keys::KeyEntry],
+    ) -> Result<velmora_bridge::unit::keys::Applied> {
+        unimplemented!("not a lift call")
+    }
+    async fn key_active(&self, _akid: &str) -> Result<bool> {
+        unimplemented!("not a lift call")
+    }
+}
+
+impl velmora_bridge::directory::move_flip::OwnerUnit for LiftCalls<'_> {
+    async fn sync(
+        &self,
+        _owner: &velmora_bridge::directory::record::TenantDoor,
+        _lift: Option<&velmora_bridge::unit::lift::LiftProof>,
+    ) -> Result<velmora_bridge::directory::move_flip::Synced> {
+        unimplemented!("the test syncs itself")
+    }
+    async fn renew(&self) -> Result<()> {
+        unimplemented!("not a lift call")
+    }
+    async fn restoring_since(&self) -> Result<Option<u64>> {
+        unimplemented!("not a lift call")
+    }
+    async fn stamp_ordinal(&self) -> Result<u64> {
+        let s = self.status();
+        Ok(s["stamp_counter"].as_u64().unwrap_or(0))
+    }
+    async fn report_move(
+        &self,
+        zero: &velmora_bridge::directory::record::TenantDoor,
+        replay_id: &velmora_bridge::unit::lift::ReplayId,
+    ) -> Result<velmora_bridge::directory::move_flip::Reported> {
+        use velmora_bridge::directory::move_flip::Reported;
+        use velmora_bridge::unit::lift::{ids_hash, ClassProof, FindingList, GateSummary};
+        let head = velmora_bridge::directory::move_copy::move_head(zero).unwrap();
+        let none = ids_hash(std::iter::empty::<&String>());
+        let summary = GateSummary {
+            complete: true,
+            classified: true,
+            lists: FindingList::ALL
+                .into_iter()
+                .map(|l| {
+                    (
+                        l,
+                        ClassProof {
+                            count: 0,
+                            sha256: none.clone(),
+                        },
+                    )
+                })
+                .collect(),
+            ..GateSummary::default()
+        };
+        for op in [
+            UnitOp::GateOpenMove {
+                replay_id: replay_id.clone(),
+                head,
+            },
+            UnitOp::GateReport {
+                replay_id: replay_id.clone(),
+                summary,
+            },
+        ] {
+            match worker(self.unit, seqs(self.state_seq), op) {
+                UnitAnswer::Ok { .. } => {}
+                UnitAnswer::Refused {
+                    reason: Refused::Gate(r),
+                    ..
+                } => return Ok(Reported::Refused(r)),
+                other => panic!("{other:?}"),
+            }
+        }
+        Ok(Reported::Done)
+    }
+    async fn gate_status(&self) -> Result<velmora_bridge::directory::move_flip::GateView> {
+        let s = self.status();
+        Ok(velmora_bridge::directory::move_flip::GateView {
+            replay_id: serde_json::from_value(s["replay_id"].clone()).ok(),
+            kind_move: s["kind"] == "move",
+            lift_ok: s["lift"]["ok"].is_object(),
+            proof: serde_json::from_value(s["lift"]["ok"].clone()).ok(),
+        })
+    }
+    async fn v9(&self) -> Result<bool> {
+        unimplemented!("not a lift call")
+    }
+    fn nonce(&self) -> String {
+        self.nonces.set(self.nonces.get() + 1);
+        format!("nonce-{}", self.nonces.get())
+    }
+}
+
+impl LiftCalls<'_> {
+    fn status(&self) -> serde_json::Value {
+        match worker(self.unit, seqs(self.state_seq), UnitOp::GateStatus {}) {
+            UnitAnswer::Ok { body, .. } => body,
+            other => panic!("{other:?}"),
+        }
+    }
+}
+
+#[test]
+fn the_move_report_lifts_the_real_unit_only_after_the_seal() {
+    use velmora_bridge::directory::move_flip::{move_lift_proof, FlipError};
+    use velmora_bridge::unit::lift::GateRefusal;
+    block_on(async {
+        let rig = rig();
+        let (_, canary) = catalogue(&rig).await;
+        let (zero, owner) = heads();
+        let (head, since) = bound(&zero.door, &owner.door).unwrap();
+        let u = unit(since);
+        let adapter = Adapter::new(&u, since);
+        let done = copy_all(
+            &rig.bridge.catalog.sql,
+            &adapter,
+            &Stub { rehomed: None },
+            &plan(&canary, 500),
+            &head,
+            since,
+            rig.now(),
+        )
+        .await
+        .map_err(|e| format!("{e:?}"))
+        .unwrap();
+        let calls = LiftCalls {
+            unit: &u,
+            state_seq: since,
+            nonces: Cell::new(0),
+        };
+        // Before the seal the unit refuses the move report.
+        let r = move_lift_proof(&calls, &zero.door, since).await;
+        assert!(
+            matches!(r, Err(FlipError::Report(GateRefusal::ImportNotSealed))),
+            "{r:?}"
+        );
+        seal(&adapter, &head, since, &done).await.unwrap();
+        // After it: the report for (S, the stamp counter, a nonce), and a
+        // proof the unit's own lift check gives.
+        let proof = move_lift_proof(&calls, &zero.door, since)
+            .await
+            .map_err(|e| format!("{e:?}"))
+            .unwrap();
+        assert_eq!(proof.replay_id.since, since);
+        assert!(proof.acknowledged.is_empty());
+        // Read again, the stored report is used: no new nonce.
+        let again = move_lift_proof(&calls, &zero.door, since).await.unwrap();
+        assert_eq!(again, proof);
+        assert_eq!(calls.nonces.get(), 2);
+        // The sync of the lifting head with that proof opens the unit.
+        let lifted = worker(
+            &u,
+            None,
+            UnitOp::Sync {
+                head: SyncHead {
+                    seqs: Seqs {
+                        state_seq: since + 1,
+                        keys_seq: 0,
+                    },
+                    tenant_state: TenantState::Active,
+                    tenant_mode: None,
+                    restoring_since: None,
+                    lift: Some(proof),
+                },
+            },
+        );
+        assert!(matches!(lifted, UnitAnswer::Ok { .. }), "{lifted:?}");
+    });
 }

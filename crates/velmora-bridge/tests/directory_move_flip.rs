@@ -25,7 +25,8 @@ use velmora_bridge::directory::testing::{HookedRecords, PlainSeal};
 use velmora_bridge::directory::transition::{Actor, Change, OperatorHoldRequest, KEY_CHECK_LEN};
 use velmora_bridge::testkit::RusqliteSql;
 use velmora_bridge::unit::keys::{Applied, KeyEntry, KeyKind, SubjectStatus};
-use velmora_bridge::unit::lift::{LiftProof, ReplayId};
+use velmora_bridge::unit::lift::{GateRefusal, LiftProof, ReplayId};
+use velmora_bridge::unit::Refused as UnitRefused;
 use velmora_bridge::*;
 
 const OWNER: &str = "t_00000000000000a1";
@@ -71,6 +72,10 @@ struct FakeUnit {
     keys_seq: Cell<u64>,
     /// The next N syncs that lift are not reached.
     fail_lift: Cell<u32>,
+    /// Answers for the next syncs that lift, in order (then as usual).
+    lift_answers: RefCell<std::collections::VecDeque<UnitRefused>>,
+    /// A refused lift opens the unit anyway (its answer was the stale one).
+    open_on_refusal: Cell<bool>,
     /// The unit refuses every `move` report.
     refuse_report: Cell<bool>,
     /// The sync after a refused lift is not reached.
@@ -100,6 +105,8 @@ impl Default for FakeUnit {
             keys_seq: Cell::new(0),
             bend: RefCell::new(None),
             fail_lift: Cell::new(0),
+            lift_answers: RefCell::default(),
+            open_on_refusal: Cell::new(false),
             refuse_report: Cell::new(false),
             fail_after_refusal: Cell::new(false),
             armed: Cell::new(false),
@@ -157,6 +164,14 @@ impl OwnerUnit for FakeUnit {
         if owner.restoring_entry(0).is_none() && take(&self.fail_lift) {
             return Err(BridgeError::Blob("unit unreachable".into()));
         }
+        if owner.restoring_entry(0).is_none() {
+            if let Some(r) = self.lift_answers.borrow_mut().pop_front() {
+                if self.open_on_refusal.get() {
+                    self.closed.set(None);
+                }
+                return Ok(Synced::Refused(r));
+            }
+        }
         match owner.restoring_entry(0) {
             Some(e) => self.closed.set(Some(e.since_seq)),
             None => {
@@ -169,11 +184,13 @@ impl OwnerUnit for FakeUnit {
                     _ => false,
                 };
                 if !ok {
-                    return Ok(Synced::Refused("proof_mismatch".into()));
+                    return Ok(Synced::Refused(UnitRefused::Gate(
+                        GateRefusal::ProofMismatch,
+                    )));
                 }
                 if self.closed.get().is_some() && take(&self.refuse_lift) {
                     self.armed.set(self.fail_after_refusal.get());
-                    return Ok(Synced::Refused("closed".into()));
+                    return Ok(Synced::Refused(UnitRefused::Gate(GateRefusal::Closed)));
                 }
                 self.closed.set(None);
             }
@@ -182,6 +199,10 @@ impl OwnerUnit for FakeUnit {
             .borrow_mut()
             .push((owner.clone(), lift.cloned()));
         Ok(Synced::Ok)
+    }
+
+    async fn restoring_since(&self) -> Result<Option<u64>> {
+        Ok(self.closed.get())
     }
 
     async fn renew(&self) -> Result<()> {
@@ -200,7 +221,7 @@ impl OwnerUnit for FakeUnit {
             .as_ref()
             .is_some_and(|z| z.selector == Selector::Moving);
         if self.refuse_report.get() || !moving || self.closed.get() != Some(replay_id.since) {
-            return Ok(Reported::Refused("not_this_window".into()));
+            return Ok(Reported::Refused(GateRefusal::MoveNotBound));
         }
         self.reports.set(self.reports.get() + 1);
         *self.report.borrow_mut() = Some(replay_id.clone());
@@ -395,7 +416,14 @@ impl RouteRecords for FakeRoutes {
         Ok(self.records.borrow().get(akid).cloned())
     }
 
-    async fn replace(&self, akid: &str, from: &Tenant, to: &Tenant) -> Result<bool> {
+    async fn replace(
+        &self,
+        akid: &str,
+        from: &Tenant,
+        to: &Tenant,
+        kind: RouteKind,
+    ) -> Result<bool> {
+        assert_eq!(kind, RouteKind::S3);
         let mut records = self.records.borrow_mut();
         if self.third.get() {
             records.insert(akid.into(), "t_00000000000000b2".into());
@@ -1336,7 +1364,7 @@ fn a_refused_report_stops_the_lift() {
         let before = m.records();
         let r = m.flip().await;
         assert!(
-            matches!(&r, Err(FlipError::Report(c)) if c == "not_this_window"),
+            matches!(r, Err(FlipError::Report(GateRefusal::MoveNotBound))),
             "{r:?}"
         );
         assert_eq!(m.records(), before);
@@ -1755,5 +1783,55 @@ fn a_v9_give_up_that_stopped_keeps_the_v9_answer() {
         m.give_up().await.map_err(|e| format!("{e:?}")).unwrap();
         assert!(m.head(&owner()).await.placements.is_empty());
         assert!(m.unit.closed.get().is_some());
+    });
+}
+
+#[test]
+fn the_lift_sync_applies_the_keys_and_re_reads_a_stale_head() {
+    block_on(async {
+        let m = window().await;
+        let before = m.records();
+        m.unit
+            .lift_answers
+            .borrow_mut()
+            .extend([UnitRefused::KeysNotApplied, UnitRefused::StaleSync]);
+        let applies = m.unit.applies.get();
+        let f = m.flip().await.map_err(|e| format!("{e:?}")).unwrap();
+        assert!(f.wrote);
+        assert_flipped(&m, f.stamp).await;
+        // Neither re-entered: one lift record and the flip.
+        assert_eq!(m.records(), before + 2);
+        assert_eq!(m.unit.reports.get(), 1);
+        assert!(m.unit.applies.get() > applies + 1);
+        // A refusal that is neither stops the flip, before the routes.
+        let m = window().await;
+        m.unit
+            .lift_answers
+            .borrow_mut()
+            .push_back(UnitRefused::AccountProblem);
+        let r = m.flip().await;
+        assert!(
+            matches!(r, Err(FlipError::SyncRefused(UnitRefused::AccountProblem))),
+            "{r:?}"
+        );
+        assert!(m.routes.records.borrow().is_empty());
+    });
+}
+
+#[test]
+fn a_gate_refusal_on_an_open_unit_is_the_lift_that_landed() {
+    block_on(async {
+        let m = window().await;
+        let before = m.records();
+        m.unit.open_on_refusal.set(true);
+        m.unit
+            .lift_answers
+            .borrow_mut()
+            .push_back(UnitRefused::Gate(GateRefusal::NotRestoring));
+        let f = m.flip().await.map_err(|e| format!("{e:?}")).unwrap();
+        assert!(f.wrote);
+        // No re-entry: the lift record and the flip only.
+        assert_eq!(m.records(), before + 2);
+        assert!(m.unit.closed.get().is_none());
     });
 }

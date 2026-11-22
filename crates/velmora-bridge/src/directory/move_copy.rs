@@ -46,7 +46,8 @@ use super::record::{Selector, TenantDoor};
 use crate::ports::{Sql, SqlValue};
 use crate::types::{BridgeError, UnixMs};
 use crate::unit::import::{
-    ImportBatch, ImportRefusal, ImportTable, ImportValue, Imported, MoveHead, MAX_CURSOR, MAX_ROWS,
+    ImportBatch, ImportCount, ImportRefusal, ImportTable, ImportValue, Imported, MoveHead,
+    MAX_CURSOR, MAX_ROWS,
 };
 
 /// Rows read per page, and so at most per batch.
@@ -78,7 +79,12 @@ pub enum CopyError {
     /// An outbox row still holds a live lease: the drain did not finish.
     LiveLease,
     /// The unit refused `ImportSeal`; the import stays open.
-    SealRefused(String),
+    SealRefused(ImportRefusal),
+    /// The unit is sealed for another window's ordinal or other counts.
+    SealedOther,
+    /// A batch was refused because the import is sealed: step 3 is done
+    /// (the next run reads the seal and sends nothing).
+    Sealed,
     /// [`seal`] was given counts for another set of tables than the
     /// import's: a run that did not reach every table.
     Incomplete,
@@ -104,24 +110,21 @@ pub trait UnitImport {
     ) -> crate::types::Result<Imported>;
     /// Every table's stored cursor and row count: `(table, cursor, rows)`.
     async fn progress(&self) -> crate::types::Result<Vec<(String, String, u64)>>;
-    /// `ImportSeal{since, head, tables}` (AM-29): ends the import. `head`
-    /// is tenant 0's verified head; `ordinal` its `flips + 1`, the
-    /// `move_ordinal` the seal records (it travels in `MoveHead.flips`
-    /// once the unit's call carries it). `tables` names every import table
-    /// with its row count. The unit accepts it only when every count
-    /// equals its own. A repeat may be refused (for one, under the `since`
-    /// of a later `restoring` entry, which the seal survives): [`seal`]
-    /// then reads [`Self::seal_state`]. An `Err` says nothing about
-    /// whether it landed.
+    /// `UnitOp::ImportSeal{head, since, tables}` (AM-29): ends the import.
+    /// `head` is tenant 0's verified head (its `flips + 1` is the ordinal
+    /// the seal records); `tables` names every import table once with the
+    /// rows the unit took. A repeat under the same entry with the same
+    /// counts answers done (`newly: false`); under a later entry the unit
+    /// refuses it with an alarm, so [`seal`] reads [`Self::seal_state`]
+    /// first. An `Err` says nothing about whether it landed.
     async fn seal(
         &self,
         head: &MoveHead,
-        ordinal: u64,
         since: u64,
-        tables: &[(ImportTable, u64)],
+        tables: &[ImportCount],
     ) -> crate::types::Result<Sealed>;
-    /// The unit's seal, if the import is sealed: its `move_ordinal` and
-    /// the row count of every import table it sealed with.
+    /// The unit's seal, from `ImportProgress` (`sealed` and the tables'
+    /// rows; a table not listed counts 0): `None` while the import is open.
     async fn seal_state(&self) -> crate::types::Result<Option<SealState>>;
 }
 
@@ -129,17 +132,16 @@ pub trait UnitImport {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SealState {
     pub move_ordinal: u64,
-    pub tables: Vec<(ImportTable, u64)>,
+    pub tables: Vec<ImportCount>,
 }
 
 /// The unit's answer to `ImportSeal`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Sealed {
-    /// The import is final for this window's ordinal.
-    Done,
-    /// Refused, with the unit's fixed code (a count differs, the window is
-    /// not this one).
-    Refused(String),
+    /// The import is final under this ordinal (`sealed`).
+    Done { ordinal: u64 },
+    /// Refused (`count_mismatch`, `not_bound`).
+    Refused(ImportRefusal),
 }
 
 /// What §3.2 changes on the way, computed outside this module.
@@ -206,12 +208,23 @@ pub fn bound(zero: &TenantDoor, owner: &TenantDoor) -> Option<(MoveHead, u64)> {
         return None;
     }
     let since = owner.restoring_entry(0)?.since_seq;
-    let head = MoveHead {
+    Some((move_head(zero)?, since))
+}
+
+/// Tenant 0's verified head as a unit call names it: `moving` into
+/// `move.to`, with its `flips`. `None` for any other head.
+pub fn move_head(zero: &TenantDoor) -> Option<MoveHead> {
+    let z = zero.tenant_zero.as_ref()?;
+    let to = z.moved.as_ref()?.to.clone();
+    if !zero.tenant.is_zero() || z.selector != Selector::Moving || to.is_zero() {
+        return None;
+    }
+    Some(MoveHead {
         seq: zero.seq,
         selector: "moving".into(),
-        to: crate::unit::name::TenantId::parse(owner.tenant.as_str()),
-    };
-    Some((head, since))
+        to: crate::unit::name::TenantId::parse(to.as_str()),
+        flips: z.flips,
+    })
 }
 
 /// The ordinal a window's import is sealed under: `flips + 1` of tenant
@@ -225,40 +238,51 @@ pub fn move_ordinal(zero: &TenantDoor) -> Option<u64> {
 }
 
 /// Ends the import after the last batch (AM-29): `ImportSeal` with every
-/// table's row count as `copied` (the answer of [`copy_all`]) gives it. A
-/// lost answer sends the seal again. A refused seal is done when the unit
-/// is already sealed for this ordinal with these counts (a repeat, also
-/// one under a later `restoring` entry).
+/// table's row count as `copied` (the answer of [`copy_all`]) gives it.
+/// The unit's seal is read first: sealed with this ordinal and these
+/// counts is done without a call (a repeat after AM-15's re-entry would
+/// page); sealed otherwise is refused. A lost answer sends the seal again,
+/// and a refusal is done only if the seal is then found as above.
 pub async fn seal<U: UnitImport>(
     unit: &U,
     head: &MoveHead,
-    ordinal: u64,
     since: u64,
     copied: &[TableCopy],
 ) -> Result<(), CopyError> {
+    let ordinal = head.flips.checked_add(1).ok_or(CopyError::Incomplete)?;
     let mut tables = Vec::with_capacity(ImportTable::ALL.len());
     for table in ImportTable::ALL {
         let mut rows = copied.iter().filter(|c| c.table == table.name());
         match (rows.next(), rows.next()) {
-            (Some(c), None) => tables.push((table, c.unit_rows)),
+            (Some(c), None) => tables.push(ImportCount {
+                table,
+                rows: c.unit_rows,
+            }),
             _ => return Err(CopyError::Incomplete),
         }
     }
     if copied.len() != tables.len() {
         return Err(CopyError::Incomplete);
     }
+    let found = |state: Option<SealState>| match state {
+        None => None,
+        Some(s) => Some(s.move_ordinal == ordinal && same(&s.tables, &tables)),
+    };
+    match found(unit.seal_state().await?) {
+        Some(true) => return Ok(()),
+        Some(false) => return Err(CopyError::SealedOther),
+        None => {}
+    }
     let mut last_err = None;
     for _ in 0..SEND_TRIES {
-        match unit.seal(head, ordinal, since, &tables).await {
-            Ok(Sealed::Done) => return Ok(()),
-            Ok(Sealed::Refused(code)) => {
-                return match unit.seal_state().await? {
-                    Some(state)
-                        if state.move_ordinal == ordinal && same(&state.tables, &tables) =>
-                    {
-                        Ok(())
-                    }
-                    _ => Err(CopyError::SealRefused(code)),
+        match unit.seal(head, since, &tables).await {
+            Ok(Sealed::Done { ordinal: o }) if o == ordinal => return Ok(()),
+            Ok(Sealed::Done { .. }) => return Err(CopyError::SealedOther),
+            Ok(Sealed::Refused(r)) => {
+                return match found(unit.seal_state().await?) {
+                    Some(true) => Ok(()),
+                    Some(false) => Err(CopyError::SealedOther),
+                    None => Err(CopyError::SealRefused(r)),
                 }
             }
             Err(e) => last_err = Some(e),
@@ -270,18 +294,18 @@ pub async fn seal<U: UnitImport>(
 }
 
 /// The same count for every import table, in any order; a table that is
-/// not named counts 0 (AM-29), and a table named twice or unknown makes
-/// the two differ.
-fn same(a: &[(ImportTable, u64)], b: &[(ImportTable, u64)]) -> bool {
-    let counts = |v: &[(ImportTable, u64)]| -> Option<BTreeMap<&'static str, u64>> {
+/// not named counts 0 (AM-29), and a table named twice makes the two
+/// differ.
+fn same(a: &[ImportCount], b: &[ImportCount]) -> bool {
+    let counts = |v: &[ImportCount]| -> Option<BTreeMap<&'static str, u64>> {
         let mut m: BTreeMap<&'static str, u64> =
             ImportTable::ALL.iter().map(|t| (t.name(), 0)).collect();
         let mut seen = BTreeSet::new();
-        for (t, n) in v {
-            if !seen.insert(t.name()) {
+        for c in v {
+            if !seen.insert(c.table.name()) {
                 return None;
             }
-            m.insert(t.name(), *n);
+            m.insert(c.table.name(), c.rows);
         }
         Some(m)
     };
@@ -300,6 +324,22 @@ pub async fn copy_all<S: Sql, U: UnitImport, T: RowTransform>(
     since: u64,
     now: UnixMs,
 ) -> Result<Vec<TableCopy>, CopyError> {
+    // A sealed import takes no batch (`import: sealed`): step 3 is done,
+    // and each table's count is the seal's.
+    if let Some(state) = unit.seal_state().await? {
+        return Ok(ImportTable::ALL
+            .iter()
+            .map(|t| TableCopy {
+                table: t.name(),
+                unit_rows: state
+                    .tables
+                    .iter()
+                    .find(|c| c.table == *t)
+                    .map_or(0, |c| c.rows),
+                ..TableCopy::default()
+            })
+            .collect());
+    }
     let progress = unit.progress().await?;
     let mut out = Vec::with_capacity(ImportTable::ALL.len());
     for table in ImportTable::ALL {
@@ -562,6 +602,7 @@ impl<S: Sql, U: UnitImport, T: RowTransform> Copier<'_, S, U, T> {
                     }
                     return Ok(rows);
                 }
+                Ok(Imported::Refused(ImportRefusal::Sealed)) => return Err(CopyError::Sealed),
                 Ok(Imported::Refused(refusal)) => {
                     return Err(CopyError::Refused {
                         table: batch.table,
@@ -860,21 +901,22 @@ mod tests {
 
     #[test]
     fn a_seal_state_without_its_empty_tables_is_the_same_seal() {
-        let all: Vec<(ImportTable, u64)> = ImportTable::ALL
+        let c = |table, rows| ImportCount { table, rows };
+        let all: Vec<ImportCount> = ImportTable::ALL
             .iter()
-            .map(|t| (*t, u64::from(*t == ImportTable::Buckets) * 22))
+            .map(|t| c(*t, u64::from(*t == ImportTable::Buckets) * 22))
             .collect();
-        let short = vec![(ImportTable::Buckets, 22)];
+        let short = vec![c(ImportTable::Buckets, 22)];
         assert!(same(&all, &short));
         assert!(same(&short, &all));
-        assert!(!same(&all, &[(ImportTable::Buckets, 21)]));
+        assert!(!same(&all, &[c(ImportTable::Buckets, 21)]));
         assert!(!same(
             &all,
-            &[(ImportTable::Buckets, 22), (ImportTable::Buckets, 22)]
+            &[c(ImportTable::Buckets, 22), c(ImportTable::Buckets, 22)]
         ));
         assert!(!same(
             &all,
-            &[(ImportTable::Buckets, 22), (ImportTable::Gc, 1)]
+            &[c(ImportTable::Buckets, 22), c(ImportTable::Gc, 1)]
         ));
     }
 
