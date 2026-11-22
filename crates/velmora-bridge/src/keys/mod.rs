@@ -34,6 +34,5 @@ pub mod ports;
 pub mod record;
 pub mod revocations;
 pub mod routes;
-pub mod store;
 pub mod tk;
 pub mod writer;

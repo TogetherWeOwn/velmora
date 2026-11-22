@@ -42,13 +42,13 @@ use sha2::{Digest, Sha256};
 
 use super::locations::KeyLocations;
 use super::record::{open_key_record, OneKey};
-use super::store::RecordStore;
 use super::tk::{list_tenant_blobs, KeyBuckets};
 use crate::crypto::scheme2::{
     open_record_v2, tk_blob_check_value, tk_blob_name, unwrap_tenant_key, TenantId, TenantKey,
     KCV_LEN,
 };
 use crate::ports::Kek;
+use crate::records::RecordStore;
 use crate::types::{BridgeError, Result};
 
 const MAGIC: &str = "velmora tenant key escrow v1";

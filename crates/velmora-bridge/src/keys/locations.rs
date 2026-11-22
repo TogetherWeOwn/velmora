@@ -21,9 +21,9 @@ use serde::{Deserialize, Serialize};
 use velmora::rng::FillRandom;
 
 use super::chain::{Chain, Put};
-use super::store::RecordStore;
 use crate::crypto::scheme2::{parse_control, seal_control, ControlOwner, ControlSealer};
 use crate::ports::Kek;
+use crate::records::RecordStore;
 use crate::types::{BridgeError, Result};
 
 /// The chain of key-location sets.

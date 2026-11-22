@@ -17,8 +17,8 @@ use velmora_bridge::keys::revocations::{
     read_tenant_revocation, tenant_revocation_name, tenant_revocation_prefix,
 };
 use velmora_bridge::keys::routes::{put_route, read_route, route_name, Route, RoutePut};
-use velmora_bridge::keys::store::{MemRecords, RecordStore};
 use velmora_bridge::ports::{BlobMeta, BlobStore};
+use velmora_bridge::records::{MemRecords, RecordStore};
 use velmora_bridge::recovery::Unpublished;
 use velmora_bridge::testkit::{MemBlobStore, TestKek};
 use velmora_bridge::{BridgeError, BucketId, ByteSpan, ExtentId, Result};

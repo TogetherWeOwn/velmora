@@ -28,8 +28,8 @@ use velmora_bridge::keys::record::{
 };
 use velmora_bridge::keys::revocations::{put_tenant_revocation, tenant_revocation_name};
 use velmora_bridge::keys::routes::{put_route, read_route, RoutePut};
-use velmora_bridge::keys::store::{MemRecords, RecordStore};
 use velmora_bridge::keys::writer::{finish_keys, KeyAnswer, KeyEnv, KeyRequest};
+use velmora_bridge::records::{MemRecords, RecordStore};
 use velmora_bridge::testkit::{FixedClock, TestKek};
 use velmora_bridge::{BridgeError, Result, UnixMs};
 

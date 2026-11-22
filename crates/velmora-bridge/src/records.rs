@@ -1,4 +1,4 @@
-//! The store that records are written to, with the one write a chain
+//! The store that control records are written to, with the one write a chain
 //! needs: put if absent.
 //!
 //! [`crate::ports::BlobStore`] has no conditional put, and its `put`

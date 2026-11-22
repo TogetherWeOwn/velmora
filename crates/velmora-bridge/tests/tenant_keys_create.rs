@@ -15,10 +15,10 @@ use velmora_bridge::keys::locations::two_in_account;
 use velmora_bridge::keys::record::{
     seal_key_record, KeyOp, OneKey, SubjectDoor, SubjectKind, SubjectPrivate, SubjectStatus,
 };
-use velmora_bridge::keys::store::{MemRecords, RecordStore};
 use velmora_bridge::keys::tk::{
     create_key_version, is_foreign, tk_prefix, Claim, Commit, KeyBuckets, KeyVersionClaims, TkCache,
 };
+use velmora_bridge::records::{MemRecords, RecordStore};
 use velmora_bridge::testkit::{FixedClock, TestKek};
 use velmora_bridge::{BridgeError, BucketId, Result, UnixMs};
 

@@ -18,9 +18,9 @@
 use serde::{Deserialize, Serialize};
 use velmora::rng::FillRandom;
 
-use super::store::RecordStore;
 use crate::crypto::scheme2::{parse_control, seal_control, ControlOwner, ControlSealer, TenantId};
 use crate::ports::{BlobStore, Kek};
+use crate::records::RecordStore;
 use crate::recovery::{revoked_key_id, valid_key_id, REVOKED_KEY_PREFIX};
 use crate::types::{BridgeError, Result};
 

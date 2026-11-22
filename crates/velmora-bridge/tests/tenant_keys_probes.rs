@@ -8,10 +8,10 @@ use velmora_bridge::crypto::scheme2::{
 use velmora_bridge::keys::audit::{audit, audit_page, repair_missing, Finding};
 use velmora_bridge::keys::escrow::{restore_check, EscrowCopy};
 use velmora_bridge::keys::locations::two_in_account;
-use velmora_bridge::keys::store::{MemRecords, RecordStore};
 use velmora_bridge::keys::tk::{
     create_key_version, is_foreign, tk_prefix, Claim, Commit, KeyBuckets, KeyVersionClaims, TkCache,
 };
+use velmora_bridge::records::{MemRecords, RecordStore};
 use velmora_bridge::testkit::{FixedClock, TestKek};
 use velmora_bridge::{BridgeError, Result, UnixMs};
 

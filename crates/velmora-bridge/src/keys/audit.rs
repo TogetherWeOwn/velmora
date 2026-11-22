@@ -19,12 +19,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::locations::{KeyLocations, LocationStatus};
-use super::store::RecordStore;
 use super::tk::{list_tenant_blobs, parse_tk_name, KeyBuckets};
 use crate::crypto::scheme2::{
     tk_blob_check_value, unwrap_tenant_key, TenantId, KCV_LEN, TK_PREFIX,
 };
 use crate::ports::Kek;
+use crate::records::RecordStore;
 use crate::types::Result;
 
 const PAGE: u32 = 1000;

@@ -56,12 +56,12 @@ use velmora::rng::FillRandom;
 
 use super::locations::{KeyLocation, KeyLocations};
 use super::record::TkRing;
-use super::store::RecordStore;
 use crate::crypto::scheme2::{
     tk_blob_check_value, tk_blob_name, unwrap_tenant_key, wrap_tenant_key, TenantId, TenantKey,
     KCV_LEN, TK_PREFIX,
 };
 use crate::ports::{Clock, Kek};
+use crate::records::RecordStore;
 use crate::types::{BridgeError, Result, UnixMs};
 
 /// How long an isolate keeps an unwrapped tenant key.

@@ -15,9 +15,9 @@ use serde::{Deserialize, Serialize};
 use velmora::rng::FillRandom;
 
 use super::record::SubjectKind;
-use super::store::RecordStore;
 use crate::crypto::scheme2::{parse_control, seal_control, ControlOwner, ControlSealer, TenantId};
 use crate::ports::Kek;
+use crate::records::RecordStore;
 use crate::recovery::valid_key_id;
 use crate::types::{BridgeError, Result};
 

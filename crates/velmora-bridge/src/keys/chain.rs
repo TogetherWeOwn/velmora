@@ -13,7 +13,7 @@
 //! and the key-location chain `m/kl/` have the same shape and can use it
 //! too.
 
-use super::store::RecordStore;
+use crate::records::RecordStore;
 use crate::types::{BridgeError, Result};
 
 /// Digits of a seq in a record name.

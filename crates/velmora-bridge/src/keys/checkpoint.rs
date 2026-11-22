@@ -35,11 +35,11 @@ use super::record::{
     SubjectStatus, TkRing,
 };
 use super::revocations::list_tenant_revocations;
-use super::store::RecordStore;
 use crate::crypto::scheme2::{
     parse_control, seal_control, ControlOwner, ControlSealer, PrivateKeyRef, TenantId,
 };
 use crate::ports::Kek;
+use crate::records::RecordStore;
 use crate::types::{BridgeError, Result};
 
 /// Records between two checkpoints (an estimate; a dial).

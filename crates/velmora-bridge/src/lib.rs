@@ -28,6 +28,7 @@ mod pool;
 pub mod ports;
 pub mod post;
 pub mod probe;
+pub mod records;
 pub mod recovery;
 pub mod remote;
 pub mod replay;
@@ -45,5 +46,6 @@ pub mod metrics;
 pub mod testkit;
 
 pub use config::{BridgeConfig, KekRing, REAL_DATA_READY};
+pub use crypto::scheme2::TenantId;
 pub use ports::*;
 pub use types::*;

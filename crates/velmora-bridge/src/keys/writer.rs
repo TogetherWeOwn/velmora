@@ -70,9 +70,9 @@ use super::record::{
 };
 use super::revocations::{list_tenant_revocations, put_tenant_revocation};
 use super::routes::{put_route, RoutePut};
-use super::store::RecordStore;
 use crate::crypto::scheme2::{unwrap_secret_v2, TenantId};
 use crate::ports::{Clock, Kek};
+use crate::records::RecordStore;
 use crate::types::Result;
 
 /// Puts of the next seq one call tries before it answers busy (an

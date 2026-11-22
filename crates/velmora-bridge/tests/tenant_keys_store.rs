@@ -12,8 +12,8 @@ use velmora_bridge::keys::locations::{
     read_locations, two_in_account, write_locations, KeyLocation, KeyLocations, LocationStatus,
 };
 use velmora_bridge::keys::record::TkRing;
-use velmora_bridge::keys::store::MemRecords;
 use velmora_bridge::keys::tk::{is_foreign, KeyBuckets, LoadedRing, TkCache};
+use velmora_bridge::records::MemRecords;
 use velmora_bridge::testkit::{FixedClock, TestKek};
 use velmora_bridge::{BridgeError, UnixMs};
 
