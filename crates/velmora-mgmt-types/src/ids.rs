@@ -80,11 +80,16 @@ pub fn valid_owner_ref(s: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b':' | b'-'))
 }
 
-/// An `external_ref` (the workspace id at tenant create): the form of an
-/// `owner_ref`. It must be a random id, never personal data: its hash
-/// outlives the tenant's shred.
+/// The most bytes in an `external_ref`: with `/` and the longest
+/// `owner_ref`, the `Idempotency-Key` of a principal create at sign-up
+/// (`<workspace id>/<owner_ref>`) stays within 255.
+pub const MAX_EXTERNAL_REF_BYTES: usize = 126;
+
+/// An `external_ref` (the workspace id at tenant create): 1 to 126 of
+/// `[A-Za-z0-9_:-]`. It must be a random id, never personal data: its
+/// hash outlives the tenant's shred.
 pub fn valid_external_ref(s: &str) -> bool {
-    valid_owner_ref(s)
+    s.len() <= MAX_EXTERNAL_REF_BYTES && valid_owner_ref(s)
 }
 
 /// A jurisdiction or a rate class: 1 to 32 of `a-z`, `0-9` and `_`. Which

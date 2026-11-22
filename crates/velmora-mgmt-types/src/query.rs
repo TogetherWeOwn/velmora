@@ -127,7 +127,10 @@ impl List {
         let limit = match get(pairs, "limit") {
             None => DEFAULT_LIMIT,
             Some(v) => {
-                let canonical = !v.is_empty() && v.len() <= 4 && !v.starts_with('0');
+                let canonical = !v.is_empty()
+                    && v.len() <= 4
+                    && v.bytes().all(|b| b.is_ascii_digit())
+                    && !v.starts_with('0');
                 let n: u32 = canonical
                     .then(|| v.parse().ok())
                     .flatten()
@@ -298,7 +301,11 @@ impl UsageDaysQuery {
 pub fn parse_hold_days(query: &str) -> Result<u32, Code> {
     let pairs = pairs(query, &["hold_days"])?;
     let v = get(&pairs, "hold_days").ok_or(Code::BadRequest)?;
-    let n: u32 = (!v.starts_with('0') && v.len() <= 4)
+    let canonical = !v.is_empty()
+        && v.len() <= 4
+        && v.bytes().all(|b| b.is_ascii_digit())
+        && !v.starts_with('0');
+    let n: u32 = canonical
         .then(|| v.parse().ok())
         .flatten()
         .ok_or(Code::BadRequest)?;
@@ -332,6 +339,9 @@ mod tests {
             "limit=1001",
             "limit=01",
             "limit=-1",
+            "limit=+100",
+            "limit=%2B100",
+            "limit=%201",
             "limit=1&limit=2",
             "x=1",
             "after",
@@ -400,6 +410,9 @@ mod tests {
             "hold_days=6",
             "hold_days=3651",
             "hold_days=030",
+            "hold_days=+30",
+            "hold_days=%2B30",
+            "hold_days=",
             "hold_days=30&hold_days=30",
             "days=30",
         ] {

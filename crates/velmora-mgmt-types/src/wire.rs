@@ -431,6 +431,14 @@ pub enum KeyStatus {
 /// A key, never with its secret. `seq` is the key's newest key-chain seq,
 /// which a grant change names as `if_seq`. `last_used_at_ms` is `null`
 /// until velmora records use.
+///
+/// `GET`, `PATCH` and `DELETE` on `…/keys/{k}` with a principal's id
+/// answer `404 key_not_found` and write nothing; on the tenant's internal
+/// key they answer `403 internal_key_refused`. A list never shows a
+/// `revoked` key; a read can. `kofra-api` answers `KeyNotFound` for a
+/// `revoked` key on its `key` and `update_key`. Its `revoke_key` always
+/// sends the `DELETE`, and a `204`, first or repeat, is `Ok`: a repeat
+/// runs the stores again, so a revoke that died half-way is finished.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Key {
     pub id: String,
@@ -487,8 +495,10 @@ impl fmt::Debug for KeyCreated {
 /// **whole new list**, never a delta; `if_seq` is the `seq` the caller
 /// read.
 ///
-/// The unit checks in this order: (1) the same scope and fingerprint as
-/// an applied widening: its stored answer; (2) the key already has
+/// The unit checks in this order: (1) the same scope and the same
+/// fingerprint: the answer of [`crate::idem`], case 1 (the stored answer
+/// once applied; `409 idempotency_key_in_use` or a re-admission while
+/// reserved); (2) the key already has
 /// exactly this list and name: `200`, and nothing is written; (3) the
 /// same scope with another fingerprint: `422 idempotency_key_reused`;
 /// (4) `if_seq` is not the key's `seq`: `409 key_changed`; (5) otherwise
@@ -519,7 +529,9 @@ impl Validate for KeyUpdate {
 impl KeyUpdate {
     /// The body the fingerprint is taken over: this request without
     /// `if_seq`, as compact JSON with `name` then `grants`, an absent one
-    /// left out. A re-read that brings a new `if_seq` is the same request.
+    /// left out, and the grants in `bucket_id` order (a list holds a
+    /// bucket once, so the order is total). A re-read that brings a new
+    /// `if_seq`, or the same list in another order, is the same request.
     pub fn fingerprint_body(&self) -> Vec<u8> {
         #[derive(Serialize)]
         struct Body<'a> {
@@ -528,9 +540,14 @@ impl KeyUpdate {
             #[serde(skip_serializing_if = "Option::is_none")]
             grants: Option<&'a [GrantIn]>,
         }
+        let grants = self.grants.as_ref().map(|g| {
+            let mut g = g.clone();
+            g.sort_by(|a, b| a.bucket_id.cmp(&b.bucket_id));
+            g
+        });
         let body = Body {
             name: self.name.as_deref(),
-            grants: self.grants.as_deref(),
+            grants: grants.as_deref(),
         };
         // A struct of strings and enums: serializing it cannot fail.
         serde_json::to_vec(&body).unwrap_or_default()
