@@ -301,7 +301,9 @@ taken, until a delete retry completes it. The `sync` arm that carries
 the changes, and the stamp raise after `bucket_close` (AM-48), are the
 Worker's (L2). Until the request path asks `is_closing` before a write
 (`RequestCall`, L1 package 5), a write into a closing bucket is not
-refused; a drop still keeps every row that holds data.
+refused; a drop still keeps every row that holds data. Package 5 also
+leaves closing rows out of ListBuckets and HeadBucket: a kept row keeps
+its grant rows, and its `~dropped/<id>` name is no S3 name.
 
 ## Key scheme
 

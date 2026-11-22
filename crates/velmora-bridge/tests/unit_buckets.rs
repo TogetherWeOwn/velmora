@@ -182,8 +182,13 @@ fn a_created_record_makes_the_row_once_and_a_conflict_is_refused() {
     // The same record again changes nothing.
     let done = apply(&u, &[created(4, B1, "alpha", 2)], false).unwrap();
     assert_eq!(done.created, 0);
-    // Another name for the id, or the name for another id: a broken chain.
-    for c in [created(5, B1, "other", 3), created(5, B2, "alpha", 3)] {
+    // Another name for the id, the name for another id, or the creator
+    // grant of another row: a broken chain.
+    for c in [
+        created(5, B1, "other", 3),
+        created(5, B2, "alpha", 3),
+        created(5, B2, "beta", 2),
+    ] {
         assert_eq!(apply(&u, &[c], false), Err(BucketRefusal::CreatedConflict));
     }
     assert!(BucketRefusal::CreatedConflict.alarm());

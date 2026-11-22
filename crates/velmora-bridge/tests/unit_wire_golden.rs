@@ -466,6 +466,59 @@ macro_rules! every {
     }};
 }
 
+/// `ImportProgress`'s answer body as a real unit gives it (AM-47,
+/// AM-67): before any import, and after a lift (`lifted_at` set). The
+/// L3 move tool and the restore tool read `lifted_at` from it.
+/// `schema_tables` is left out: it lists the unit's tables, so every
+/// migration changes it.
+fn import_progress_bodies() -> Value {
+    use velmora_bridge::testkit::RusqliteSql;
+    use velmora_bridge::unit::Unit;
+    let now = UnixMs(1_795_000_000_000);
+    let u = Unit::new(RusqliteSql::open_in_memory().unwrap(), name(), "");
+    let mut token = token();
+    token.jurisdiction = String::new();
+    token.schema_version = velmora_bridge::unit::schema::SCHEMA_VERSION;
+    token.kind = BirthKind::Birth;
+    let call = |op, s: Option<Seqs>| UnitCall {
+        name: name(),
+        kind: CallKind::Worker,
+        seqs: s,
+        authenticated: true,
+        listed: true,
+        op,
+    };
+    let born = u.handle(
+        &call(
+            UnitOp::Provision {
+                token,
+                sealed: b"sealed".to_vec(),
+            },
+            Some(seqs()),
+        ),
+        now,
+    );
+    assert!(matches!(born, UnitAnswer::Ok { .. }), "{born:?}");
+    let body = || match u.handle(&call(UnitOp::ImportProgress {}, None), now) {
+        UnitAnswer::Ok { mut body, .. } => {
+            body.as_object_mut().unwrap().remove("schema_tables");
+            body
+        }
+        other => panic!("{other:?}"),
+    };
+    let before = body();
+    u.sql()
+        .with_conn(|c| {
+            c.execute(
+                "INSERT INTO unit_import_move(id, t0_seq, since_seq, final, move_ordinal, \
+                   move_lifted, lifted_at) VALUES (1, 11, 7, 1, 1, 1, ?1)",
+                [now.0],
+            )
+        })
+        .unwrap();
+    json!({ "never_bound": before, "lifted": body() })
+}
+
 fn nested() -> Value {
     json!({
         "call_kind": every!(CallKind: Request, Job, Fanout, Worker),
@@ -691,7 +744,12 @@ fn document() -> Value {
             v
         })
         .collect();
-    json!({ "calls": calls, "answers": answers, "nested": nested() })
+    json!({
+        "calls": calls,
+        "answers": answers,
+        "nested": nested(),
+        "import_progress": import_progress_bodies(),
+    })
 }
 
 #[test]

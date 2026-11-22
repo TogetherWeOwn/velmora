@@ -1106,6 +1106,24 @@
       }
     }
   ],
+  "import_progress": {
+    "lifted": {
+      "lifted_at": 1795000000000,
+      "move_lifted": true,
+      "sealed": 1,
+      "since_seq": 7,
+      "t0_seq": 11,
+      "tables": []
+    },
+    "never_bound": {
+      "lifted_at": null,
+      "move_lifted": null,
+      "sealed": null,
+      "since_seq": null,
+      "t0_seq": null,
+      "tables": []
+    }
+  },
   "nested": {
     "access": [
       "ro",

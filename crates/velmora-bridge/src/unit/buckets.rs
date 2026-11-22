@@ -317,7 +317,7 @@ pub fn apply<S: Sql>(
                 written_at,
                 ..
             } => {
-                match existing(sql, bucket_id, name)? {
+                match existing(sql, bucket_id, name, *grant_seq)? {
                     Existing::Same => {}
                     Existing::Conflict => return Ok(Err(BucketRefusal::CreatedConflict)),
                     Existing::None => {
@@ -444,7 +444,13 @@ enum Existing {
     Conflict,
 }
 
-fn existing<S: Sql>(sql: &S, bucket_id: &str, name: &str) -> Result<Existing> {
+/// Whether a `created`'s row exists: the same (id and name, and its
+/// `grant_seq` if kept), none, or a conflict (another name for the id,
+/// the name for another id, or the `grant_seq` another row holds).
+fn existing<S: Sql>(sql: &S, bucket_id: &str, name: &str, grant_seq: u64) -> Result<Existing> {
+    if by_grant_seq(sql, grant_seq)?.is_some_and(|other| other != bucket_id) {
+        return Ok(Existing::Conflict);
+    }
     let rows = poll_once(sql.query(
         "SELECT id, name FROM buckets WHERE id = ?1 OR name = ?2",
         &[
