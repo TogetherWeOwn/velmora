@@ -369,6 +369,30 @@ async fn upload_part_refuses_a_mismatched_extent() {
     assert_eq!(fx.read(&t).await.0.revision, 0);
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn upload_part_refuses_a_plan_rev_above_one() {
+    let fx = Fx::new().await;
+    let id = fx.create(&fx.bucket, KEY).await;
+    let t = target(&fx.bucket, KEY, &id);
+    let mut e = fx.extent(&fx.bucket, 10);
+    e.plan_rev = 2;
+    let part = UploadPartRow {
+        upload_id: id.clone(),
+        part_number: 1,
+        extent_id: e.id.clone(),
+        size: 10,
+        etag: "\"e\"".into(),
+        uploaded_at: T0,
+    };
+    let err = fx.cat.put_upload_part(&t, &part, &e, T0).await.unwrap_err();
+    assert!(
+        matches!(err, BridgeError::Invalid(plan_rev::ERR_PLAN_REV)),
+        "{err:?}"
+    );
+    assert_eq!(fx.count("SELECT COUNT(*) FROM extents").await, 0);
+    assert_eq!(fx.read(&t).await.0.revision, 0);
+}
+
 // ---------------------------------------------------------------------------
 // Target binding
 // ---------------------------------------------------------------------------

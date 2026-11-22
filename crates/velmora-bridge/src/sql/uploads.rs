@@ -368,7 +368,7 @@ fn staged_extent(e: &ExtentRow) -> Result<Stmt> {
             SqlValue::Blob(e.plain_sha256.to_vec()),
             SqlValue::Blob(e.cipher_sha256.to_vec()),
             text(e.safety_state.as_str()),
-            SqlValue::Int(i64::from(e.plan_rev)),
+            crate::plan_rev::bound(e.plan_rev)?,
             ms(e.created_at),
         ],
     ))

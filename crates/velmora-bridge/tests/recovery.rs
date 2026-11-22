@@ -3606,6 +3606,86 @@ async fn a_replayed_plan_keeps_each_rows_yenc_form() {
     assert_eq!(ids, want);
 }
 
+/// No plan changes, so `plan_rev` is 0 or 1 (the plan_rev contract,
+/// parts 2 and 3): a plan record of a later revision is never written,
+/// and one that is found is reported unreadable and nothing is written
+/// from it.
+#[tokio::test(flavor = "current_thread")]
+async fn a_plan_record_above_revision_one_is_never_written_nor_replayed() {
+    use velmora::rng::SystemRng;
+    use velmora_bridge::crypto::{open_manifest, seal_manifest};
+
+    let rig = rig();
+    let (bucket, signer) = rig.standard(BUCKET).await;
+    let body = vec![7u8; 1_000_000];
+    rig.put(&signer, BUCKET, "two-articles", &body)
+        .await
+        .expect(200);
+    let (extent, plan) = plan_record(&rig, &bucket, "two-articles", &[None, None]).await;
+    let name = format!("m/art/{}", extent.id.as_str());
+    let sealed = rig.bridge.safety.stored(&name).unwrap().bytes;
+
+    let mut later = extent.clone();
+    later.plan_rev = 2;
+    let err = velmora_bridge::recovery::write_article_plan(
+        &rig.bridge.safety,
+        &rig.bridge.kek,
+        &Layout::flat(),
+        &later,
+        &plan,
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(err, BridgeError::Invalid(plan_rev::ERR_PLAN_REV)),
+        "{err:?}"
+    );
+    assert_eq!(rig.bridge.safety.stored(&name).unwrap().bytes, sealed);
+
+    // The same record, opened and sealed again at revision 2.
+    let mut record: Value =
+        serde_json::from_slice(&open_manifest(&rig.bridge.kek, &name, &sealed).unwrap()).unwrap();
+    assert_eq!(record["plan_rev"], json!(1));
+    record["plan_rev"] = json!(2);
+    let plain = serde_json::to_vec(&record).unwrap();
+    let resealed = seal_manifest(&rig.bridge.kek, &name, &plain, &mut SystemRng).unwrap();
+    let digest = sha256(&resealed);
+    let meta = BlobMeta {
+        bucket: &bucket.id,
+        extent: &extent.id,
+        cipher_sha256: &digest,
+    };
+    rig.bridge
+        .safety
+        .inner
+        .put(&name, resealed, &meta)
+        .await
+        .unwrap();
+
+    wipe(&rig);
+    let (report, _) = replay(&rig, UnixMs(0), ReplayLimits::default()).await;
+    assert_eq!(report.published, 1, "{report:?}");
+    assert_eq!(report.article_plans, 0, "{report:?}");
+    assert_eq!(report.unreadable, [name.as_str()], "{report:?}");
+    assert!(rig
+        .bridge
+        .catalog
+        .articles(&extent.id)
+        .await
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        count(
+            &rig,
+            &format!(
+                "SELECT plan_rev FROM extents WHERE id = '{}'",
+                extent.id.as_str()
+            )
+        ),
+        0
+    );
+}
+
 /// A plan record whose yEnc name the catalogue would refuse is reported
 /// unreadable, not skipped without a word by the replay's insert.
 #[tokio::test(flavor = "current_thread")]

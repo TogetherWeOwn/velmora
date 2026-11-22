@@ -2,11 +2,21 @@
 //!
 //! Value mapping:
 //! - `Null` <-> JS `null` (`undefined` reads as `Null` too).
-//! - `Int` <-> JS number. D1 has no BigInt binding, so only integers in
-//!   `±(2^53 - 1)` round-trip exactly. A bound `Int` outside that range is
-//!   refused, and a returned number that is fractional or outside it is a
-//!   decode error: values are never rounded. Every catalogue integer
-//!   (millisecond times, sizes, counters, fencing tokens) is far inside it.
+//! - `Int` -> its decimal text, **bound through `+CAST(?N AS INTEGER)`**
+//!   (`velmora_bridge::sql_bind::cast_bound`, the statement text the
+//!   Durable Object adapter uses too). D1 binds a JS number as a SQLite
+//!   REAL, so an integer bound as a number would divide as a fraction and
+//!   be stored as a REAL wherever no INTEGER affinity converts it; the
+//!   text is cast to the exact `i64`, so every integer is stored as the
+//!   INTEGER a native binding gives ([`d1_bound`]).
+//! - Only integers in `±(2^53 - 1)` are bound; another is refused before
+//!   the call, as the Durable Object adapter refuses it. D1 has no BigInt
+//!   result, so a larger one could be stored but never read back: a row
+//!   holding one would fail every read of it.
+//! - `Int` <- JS number. A returned number that is fractional or outside
+//!   `±(2^53 - 1)` is a decode error, never rounded. Every catalogue
+//!   integer (millisecond times, sizes, counters, fencing tokens) is far
+//!   inside it.
 //! - `Text` <-> JS string.
 //! - `Blob` -> `ArrayBuffer` (D1's BLOB binding). A returned BLOB may be an
 //!   array of byte numbers, an `ArrayBuffer` or a `Uint8Array`.
@@ -26,6 +36,7 @@
 use std::future::Future;
 use std::time::Duration;
 
+use velmora_bridge::sql_bind::cast_bound;
 use velmora_bridge::{
     is_tx_guard_violation, BridgeError, Result, Row, Sql, SqlValue, MAX_SQL_PARAMS,
 };
@@ -66,11 +77,11 @@ impl D1Sql {
     }
 
     fn statement(&self, sql: &str, params: &[SqlValue]) -> Result<D1PreparedStatement> {
-        check_params(params.len())?;
+        let (sql, params) = d1_bound(sql, params)?;
         let values = params.iter().map(to_js).collect::<Result<Array>>()?;
         let bind_err = |_| BridgeError::Sql("d1: bind failed".into());
         self.db
-            .prepare(sql)
+            .prepare(&sql)
             .map_err(bind_err)?
             .bind(values)
             .map_err(bind_err)
@@ -188,13 +199,6 @@ fn check_params(n: usize) -> Result<()> {
     Ok(())
 }
 
-fn int_to_number(i: i64) -> Result<f64> {
-    if !(-MAX_SAFE_INT..=MAX_SAFE_INT).contains(&i) {
-        return Err(BridgeError::Sql("d1: integer outside JS safe range".into()));
-    }
-    Ok(i as f64)
-}
-
 fn number_to_int(f: f64) -> Result<i64> {
     let safe = MAX_SAFE_INT as f64;
     if !f.is_finite() || f.fract() != 0.0 || f.abs() > safe {
@@ -210,10 +214,30 @@ fn number_to_byte(f: f64) -> Result<u8> {
     }
 }
 
+/// The statement and values D1 is given: at most [`MAX_SQL_PARAMS`]
+/// values, every integer inside `±(2^53 - 1)`, and then
+/// [`cast_bound`]: each integer placeholder `+CAST(?N AS INTEGER)`, each
+/// integer bound as its decimal text. The values hold no `Int`.
+fn d1_bound<'a>(
+    sql: &'a str,
+    params: &[SqlValue],
+) -> Result<(std::borrow::Cow<'a, str>, Vec<SqlValue>)> {
+    check_params(params.len())?;
+    for p in params {
+        if let SqlValue::Int(i) = p {
+            if !(-MAX_SAFE_INT..=MAX_SAFE_INT).contains(i) {
+                return Err(BridgeError::Sql("d1: integer outside JS safe range".into()));
+            }
+        }
+    }
+    cast_bound(sql, params)
+}
+
 fn to_js(v: &SqlValue) -> Result<JsValue> {
     Ok(match v {
         SqlValue::Null => JsValue::NULL,
-        SqlValue::Int(i) => JsValue::from_f64(int_to_number(*i)?),
+        // `cast_bound` made every integer its text.
+        SqlValue::Int(_) => return Err(BridgeError::Sql("d1: integer not cast".into())),
         SqlValue::Text(s) => JsValue::from_str(s),
         SqlValue::Blob(b) => Uint8Array::from(b.as_slice()).buffer().into(),
     })
@@ -230,9 +254,13 @@ fn from_js(v: JsValue) -> Result<SqlValue> {
         return Ok(SqlValue::Text(s));
     }
     if v.is_bigint() {
+        // D1 returns no BigInt today; if it ever does, the same range
+        // holds as for a number (AM-22 rule 3).
         return i64::try_from(v)
+            .ok()
+            .filter(|i| (-MAX_SAFE_INT..=MAX_SAFE_INT).contains(i))
             .map(SqlValue::Int)
-            .map_err(|_| decode_err());
+            .ok_or_else(decode_err);
     }
     if let Some(buf) = v.dyn_ref::<ArrayBuffer>() {
         return Ok(SqlValue::Blob(Uint8Array::new(buf).to_vec()));
@@ -291,14 +319,92 @@ mod tests {
     use super::*;
 
     #[test]
+    fn integers_are_bound_as_cast_text_inside_the_safe_range() {
+        let (sql, values) = d1_bound(
+            "SELECT a FROM t WHERE n = ?1 AND s = ?2 LIMIT ?3",
+            &[
+                SqlValue::Int(MAX_SAFE_INT),
+                SqlValue::Text("x".into()),
+                SqlValue::Int(-7),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            sql,
+            "SELECT a FROM t WHERE n = +CAST(?1 AS INTEGER) AND s = ?2 LIMIT +CAST(?3 AS INTEGER)"
+        );
+        assert_eq!(
+            values,
+            [
+                SqlValue::Text("9007199254740991".into()),
+                SqlValue::Text("x".into()),
+                SqlValue::Text("-7".into()),
+            ]
+        );
+        // Both edges bind; 2^53 and 2^53 + 1, either sign, are refused
+        // at bind, before any call (AM-22): 2^53 is exact in a double but
+        // not safe, because 2^53 + 1 rounds to it.
+        let (_, edges) = d1_bound(
+            "SELECT ?1, ?2",
+            &[SqlValue::Int(MAX_SAFE_INT), SqlValue::Int(-MAX_SAFE_INT)],
+        )
+        .unwrap();
+        assert_eq!(
+            edges,
+            [
+                SqlValue::Text("9007199254740991".into()),
+                SqlValue::Text("-9007199254740991".into()),
+            ]
+        );
+        for unsafe_int in [
+            MAX_SAFE_INT + 1,
+            -MAX_SAFE_INT - 1,
+            MAX_SAFE_INT + 2,
+            -MAX_SAFE_INT - 2,
+            i64::MAX,
+            i64::MIN,
+        ] {
+            assert!(
+                d1_bound("SELECT ?1", &[SqlValue::Int(unsafe_int)]).is_err(),
+                "{unsafe_int}"
+            );
+            // One unsafe value refuses the whole statement.
+            assert!(
+                d1_bound(
+                    "SELECT ?1, ?2",
+                    &[SqlValue::Int(1), SqlValue::Int(unsafe_int)]
+                )
+                .is_err(),
+                "{unsafe_int}"
+            );
+        }
+        // No placeholder takes an integer: the statement is as it was.
+        let (sql, _) = d1_bound("SELECT ?1", &[SqlValue::Null]).unwrap();
+        assert_eq!(sql, "SELECT ?1");
+        assert!(d1_bound("SELECT 1", &vec![SqlValue::Null; MAX_SQL_PARAMS + 1]).is_err());
+    }
+
+    #[test]
     fn param_guard_and_safe_integers() {
         assert!(check_params(MAX_SQL_PARAMS).is_ok());
         assert!(check_params(MAX_SQL_PARAMS + 1).is_err());
         let now = 1_794_000_000_000_i64; // a millisecond timestamp
-        assert_eq!(number_to_int(int_to_number(now).unwrap()).unwrap(), now);
-        assert!(int_to_number(MAX_SAFE_INT).is_ok() && int_to_number(-MAX_SAFE_INT).is_ok());
-        assert!(int_to_number(MAX_SAFE_INT + 1).is_err() && int_to_number(i64::MIN).is_err());
-        for bad in [1.5, f64::NAN, f64::INFINITY, 9_007_199_254_740_992.0] {
+        assert_eq!(number_to_int(now as f64).unwrap(), now);
+        assert_eq!(number_to_int(MAX_SAFE_INT as f64).unwrap(), MAX_SAFE_INT);
+        assert_eq!(
+            number_to_int(-(MAX_SAFE_INT as f64)).unwrap(),
+            -MAX_SAFE_INT
+        );
+        // A stored value outside the range is refused on read, never
+        // rounded (AM-22 rule 3); 2^53 + 1 arrives as 2^53.
+        for bad in [
+            1.5,
+            f64::NAN,
+            f64::INFINITY,
+            9_007_199_254_740_992.0,
+            -9_007_199_254_740_992.0,
+            i64::MAX as f64,
+        ] {
             assert!(number_to_int(bad).is_err(), "{bad}");
         }
         assert_eq!(number_to_byte(255.0).unwrap(), 255);

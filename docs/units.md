@@ -125,11 +125,21 @@ lifts that test on purpose.
 `DoSql` (`workers/unit/src/do_sql.rs`) is the catalogue's `Sql` port over a
 Durable Object's SQLite storage. What it does about the runtime, as measured:
 
-- A JS number binds as a SQLite REAL (in a Durable Object and in D1). `DoSql`
-  writes every integer placeholder as `+CAST(?N AS INTEGER)`: the integer a
-  native binding gives, without the affinity a bare `CAST` adds.
-- An integer above 2^53 reads back rounded, silently: `DoSql` refuses
-  integers outside ±(2^53 - 1) both ways, as the D1 adapter does.
+- A JS number binds as a SQLite REAL (in a Durable Object and in D1). Both
+  adapters write every integer placeholder as `+CAST(?N AS INTEGER)`
+  (`velmora_bridge::sql_bind`): the integer a native binding gives, without
+  the affinity a bare `CAST` adds. `DoSql` binds the integer as a JS number;
+  the D1 adapter binds its decimal text.
+- An integer above 2^53 - 1 reads back rounded, silently (Durable Object:
+  measured; D1: by its documentation). So the adapters keep three rules:
+  (1) every integer is bound and stored as SQLite INTEGER; (2) an integer
+  outside ±(2^53 - 1) is refused at bind, before the call, by `DoSql` and
+  the D1 adapter alike; (3) a stored value outside that range is never
+  read back rounded through them: both refuse it on read. ±(2^53 - 1)
+  round-trip exactly with `typeof` integer; ±2^53 and ±(2^53 + 1) are
+  refused at bind (2^53 is exact in a double but not safe, because
+  2^53 + 1 rounds to it). Readers outside the adapters (the REST API,
+  `wrangler --json`, scripts) get rounded values.
 - `BEGIN` and `SAVEPOINT` are refused; `transactionSync` nests as a
   savepoint. Rows changed are the difference of `total_changes()` around a
   statement, which counts trigger rows as D1's `meta.changes` does.

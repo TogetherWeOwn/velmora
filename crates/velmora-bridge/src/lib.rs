@@ -33,6 +33,7 @@ pub mod remote;
 pub mod replay;
 pub mod service;
 pub mod sql;
+pub mod sql_bind;
 pub mod stamp;
 pub mod trace;
 pub mod types;
