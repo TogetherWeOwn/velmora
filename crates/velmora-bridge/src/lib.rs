@@ -23,6 +23,7 @@ pub mod jobtable;
 pub mod keepalive;
 pub mod parity;
 pub mod plan;
+pub mod plan_rev;
 mod pool;
 pub mod ports;
 pub mod post;
@@ -35,6 +36,7 @@ pub mod sql;
 pub mod stamp;
 pub mod trace;
 pub mod types;
+pub mod unit;
 pub mod verify;
 
 #[cfg(feature = "testkit")]

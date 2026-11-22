@@ -1,0 +1,18 @@
+[package]
+name = "velmora-unit-do"
+version = "0.1.0"
+edition = "2021"
+# The locked Worker SDK (worker 0.8.7) requires Rust 1.91.
+rust-version = "1.91"
+description = "Durable Object side of a velmora unit: the DoSql adapter over SQLite storage, its JavaScript transaction shim, and the point-in-time bridge"
+license = "MIT"
+repository = "https://github.com/TogetherWeOwn/velmora"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+velmora-bridge = { version = "0.1.0", path = "../../crates/velmora-bridge" }
+worker = { version = "0.8" }
+serde_json = "1"
