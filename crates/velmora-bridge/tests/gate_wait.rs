@@ -123,9 +123,14 @@ struct World {
     msgs: Cell<u32>,
     /// Replies the gate sent to sessions that waited.
     pushed: Cell<u32>,
+    /// Each invocation's last grant from the line, in delivery order.
+    grants: RefCell<BTreeMap<String, u64>>,
+    grant_sequence: Cell<u64>,
     /// The gate runs code from before the line: it cannot read a
     /// request to wait.
     old_code: Cell<bool>,
+    /// Release failed without ending the session or returning its slot.
+    fail_release: Cell<bool>,
 }
 
 impl World {
@@ -158,7 +163,10 @@ impl World {
             opens: Cell::new(0),
             msgs: Cell::new(0),
             pushed: Cell::new(0),
+            grants: RefCell::default(),
+            grant_sequence: Cell::new(0),
             old_code: Cell::new(false),
+            fail_release: Cell::new(false),
         })
     }
 
@@ -239,6 +247,14 @@ impl World {
         self.ended.borrow_mut().clear();
     }
 
+    fn record_grant(&self, owner: &str, reply: &GateReply) {
+        if matches!(reply.answers.as_slice(), [GateAnswer::Acquired(Some(_))]) {
+            let sequence = self.grant_sequence.get() + 1;
+            self.grant_sequence.set(sequence);
+            self.grants.borrow_mut().insert(owner.to_string(), sequence);
+        }
+    }
+
     /// What the host does after every event at the gate: the sessions
     /// that were handed a slot are sent it, each kept with its
     /// connection first. One that cannot be sent to has ended.
@@ -253,6 +269,7 @@ impl World {
                 match self.sockets.borrow_mut().get_mut(&id) {
                     Some(socket) => {
                         socket.state = state;
+                        self.record_grant(&socket.owner, &reply);
                         socket.inbox.push_back(on_the_wire(&reply));
                         self.pushed.set(self.pushed.get() + 1);
                     }
@@ -426,19 +443,34 @@ impl GateSession for Line {
             return Err(BridgeError::Sql("gate: session ended".into()));
         }
         self.world.msgs.set(self.world.msgs.get() + 1);
+        if self.world.fail_release.get()
+            && request
+                .ops
+                .iter()
+                .any(|op| matches!(op, GateOp::Release { .. }))
+        {
+            return Ok(GateReply::failed(request.id));
+        }
         let gate = self.world.gate().await;
         let id = request.id;
+        let wake = request.ops.is_empty();
         let reply = gate
             .handle(Some(self.id), request, self.world.now())
             .await
             .unwrap_or(GateReply::failed(id));
         self.attach(&gate);
+        // As on the object, send the direct reply, then drain pushes.
+        if let Some(socket) = self.world.sockets.borrow_mut().get_mut(&self.id) {
+            if wake {
+                self.world.record_grant(&socket.owner, &reply);
+            }
+            socket.inbox.push_back(on_the_wire(&reply));
+        }
         self.world.deliver(&gate).await;
         // Read in the order sent: a slot that was on its way when the
         // question left comes first, under the same id.
         match self.world.sockets.borrow_mut().get_mut(&self.id) {
             Some(socket) => {
-                socket.inbox.push_back(on_the_wire(&reply));
                 let at = socket.inbox.iter().position(|r| r.id == id);
                 Ok(socket.inbox.remove(at.unwrap()).unwrap())
             }
@@ -706,6 +738,28 @@ async fn a_slot_given_back_goes_to_the_job_that_waited_longest() {
     let got = take(&b, &w, &p, JOB, "job-b").await.unwrap();
     assert_eq!(got.slot, first.slot);
     assert_eq!(w.pushed.get(), 2);
+}
+
+#[tokio::test]
+async fn two_grants_pushed_in_one_pass_arrive_in_line_order() {
+    let Full { w, p, .. } = full().await;
+    let (sleep, on) = (w.sleeper(), [&p]);
+    let older = w.pushing("older", core::slice::from_ref(&p));
+    let later = w.pushing("later", core::slice::from_ref(&p));
+    w.pass(JOB_MS - 10_000);
+    let mut a = wait(&older, &on, "job-a", 60_000, &sleep);
+    let mut b = wait(&later, &on, "job-b", 60_000, &sleep);
+    assert_eq!(turn(&mut a), None);
+    assert_eq!(turn(&mut b), None);
+
+    w.pass(10_001);
+    assert_eq!(w.held("p").await, 2, "both grants from one serving pass");
+    assert_eq!(w.pushed.get(), 2);
+    // Read the futures in the opposite order to delivery.
+    assert_eq!(turn(&mut b), Some(SlotWait::Granted));
+    assert_eq!(turn(&mut a), Some(SlotWait::Granted));
+    let grants = w.grants.borrow();
+    assert_eq!([grants["older"], grants["later"]], [1, 2]);
 }
 
 /// A slot whose holder stopped renewing runs out with no word to the
@@ -1056,14 +1110,20 @@ async fn a_restart_ends_the_line_and_the_jobs_ask_again() {
     assert_eq!(turn(&mut again), None);
     let asked = (w.opens.get(), w.msgs.get());
     let mut waited = 0;
-    while turn(&mut again).is_none() {
+    let outcome = loop {
+        if let Some(outcome) = turn(&mut again) {
+            break outcome;
+        }
         w.pass(1_000);
         waited += 1_000;
         assert!(waited <= JOB_MS + SKEW_MS + 1_000, "{waited}");
-    }
+    };
+    assert_eq!(outcome, SlotWait::Granted);
     assert!(waited >= JOB_MS - 1_000, "{waited}");
     assert_eq!((w.opens.get(), w.msgs.get()), (asked.0, asked.1 + 1));
+    let (sessions, opened) = (w.sessions(), w.opens.get());
     assert!(take(&a, &w, &p, JOB, "job-a").await.is_some());
+    assert_eq!((w.sessions(), w.opens.get()), (sessions, opened));
 }
 
 /// After a restart no job gets a slot while a read of the old object
@@ -1093,14 +1153,20 @@ async fn a_job_waits_out_the_reads_of_the_old_object_with_one_question() {
     assert_eq!(turn(&mut wait_a), None);
     let asked = (w.opens.get(), w.msgs.get());
     let mut waited = 0;
-    while turn(&mut wait_a).is_none() {
+    let outcome = loop {
+        if let Some(outcome) = turn(&mut wait_a) {
+            break outcome;
+        }
         w.pass(1_000);
         waited += 1_000;
         assert!(waited <= read_ms + SKEW_MS + 1_000, "{waited}");
-    }
+    };
+    assert_eq!(outcome, SlotWait::Granted);
     assert!(waited >= read_ms - 1_000, "{waited}");
     assert_eq!((w.opens.get(), w.msgs.get()), (asked.0, asked.1 + 1));
+    let (sessions, opened) = (w.sessions(), w.opens.get());
     assert!(take(&a, &w, &p, JOB, "job-a").await.is_some());
+    assert_eq!((w.sessions(), w.opens.get()), (sessions, opened));
 }
 
 // ---------------------------------------------------------------------------
@@ -1170,6 +1236,36 @@ async fn a_job_in_the_lines_of_two_gates_takes_the_first_slot_and_leaves_the_oth
     assert_eq!((wp.held("p").await, wq.held("q").await), (0, 1));
     assert!(take(&a, wq, &both[1], JOB, "job-a").await.is_some());
     assert_eq!((wp.pushed.get(), wq.pushed.get()), (0, 1));
+}
+
+#[tokio::test]
+async fn leaving_the_line_closes_a_session_after_its_extra_release_fails() {
+    let two = Two::new().await;
+    let (wp, wq) = (&two.p.1, &two.q.1);
+    let [p, q] = two.both();
+    let both = [p.clone(), q.clone()];
+    let a = Two::client(wp, wq, "a", &both);
+    let holder = "job-a";
+    two.c.release_permit(&two.held[0]).await.unwrap();
+    let own = take(&a, wp, &p, JOB, holder).await.unwrap();
+    let (on, sleep) = ([&q], wq.sleeper());
+    let mut waiting = wait(&a, &on, holder, 60_000, &sleep);
+    assert_eq!(turn(&mut waiting), None);
+    assert_eq!(wq.sessions(), 2, "the holder and its waiter");
+    two.c.release_permit(&two.held[1]).await.unwrap();
+    assert_eq!(turn(&mut waiting), Some(SlotWait::Granted));
+    drop(waiting);
+    assert_eq!(wq.sessions(), 1, "only the recipient of the grant");
+    assert_eq!(wq.held("q").await, 1);
+    wq.fail_release.set(true);
+
+    a.release_permit(&own).await.unwrap();
+    assert_eq!(wq.held("q").await, 1, "the extra release failed");
+    a.leave_line(holder);
+
+    assert_eq!(wq.sessions(), 0, "the pocket still owns cleanup");
+    assert_eq!(wq.held("q").await, 0);
+    assert!(take(&two.c, wq, &q, JOB, "next-job").await.is_some());
 }
 
 /// Q handles the upgrade before its caller can see the resulting session.
@@ -1913,9 +2009,9 @@ async fn where_no_line_is_kept_the_job_is_told_at_once() {
 /// held, and the job asks again as it did before the line.
 #[tokio::test]
 async fn a_wait_too_large_to_keep_is_not_begun() {
-    for (accounts, kept) in [(8, true), (12, false)] {
+    for (count, kept) in [(8, true), (12, false)] {
         let w = World::new();
-        let pool: Vec<ProviderConfig> = (0..accounts)
+        let pool: Vec<ProviderConfig> = (0..count)
             .map(|i| {
                 let mut p = provider(&format!("account-{i}"), 2);
                 p.pool = Some("shared".to_string());
@@ -1937,14 +2033,14 @@ async fn a_wait_too_large_to_keep_is_not_begun() {
         let mut waiting = wait(&a, &on, "job-a", 60_000, &sleep);
         match kept {
             true => {
-                assert_eq!(turn(&mut waiting), None, "{accounts} accounts");
+                assert_eq!(turn(&mut waiting), None, "{count} providers");
                 assert_eq!(w.sessions(), open + 1);
                 c.release_permit(&held[0]).await.unwrap();
                 assert_eq!(turn(&mut waiting), Some(SlotWait::Granted));
             }
             false => {
                 assert_eq!(turn(&mut waiting), Some(SlotWait::Unsupported));
-                assert_eq!(w.sessions(), open, "{accounts} accounts");
+                assert_eq!(w.sessions(), open, "{count} providers");
             }
         }
     }
@@ -2096,8 +2192,9 @@ async fn a_long_schedule_serves_in_order_and_loses_no_slot() {
                     Some(SlotWait::Unsupported) => panic!("job {i}: no line"),
                 }
             }
-            // A slot went only to the jobs at the head of the line.
-            granted.sort_by_key(|i| line.iter().position(|j| j == i));
+            // Compare with the gate's recorded delivery order (push or
+            // wake reply), not the order in which the clients were polled.
+            granted.sort_unstable_by_key(|i| w.grants.borrow()[&format!("w{i}")]);
             for i in granted {
                 assert_eq!(line.first(), Some(&i), "seed {seed}: {i} before {line:?}");
                 line.remove(0);

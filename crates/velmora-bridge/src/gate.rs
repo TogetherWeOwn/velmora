@@ -2779,27 +2779,36 @@ impl<T: GateTransport> PermitGate for GateClient<T> {
             // A slot that came to this holder from a line and that it
             // never asked for (it found one elsewhere first) goes back
             // with the first slot it gives back: sent together, so one
-            // request for each gate. One that cannot be given back
-            // runs out.
-            let mut left: Vec<Permit> = Vec::new();
-            self.pocket.borrow_mut().retain(|(by, slot, _)| {
+            // request for each gate. If an extra release fails, leave
+            // the grant in the pocket so the job can still give it up.
+            let mut left = Vec::new();
+            self.pocket.borrow_mut().retain(|(by, slot, at)| {
                 let mine = *by == holder;
                 if mine {
-                    left.push(slot.clone());
+                    left.push((slot.clone(), *at));
                 }
                 !mine
             });
             let back = |slot: &Permit| GateOp::Release {
                 permits: vec![GatePermit::from(slot)],
             };
-            let extras = left.iter().filter_map(|slot| {
-                let (gate, holder) = self.link_of(slot)?;
+            let extras = left.into_iter().filter_map(|(slot, at)| {
+                let (gate, holder) = self.link_of(&slot)?;
                 let channel = (gate, Some(holder));
-                Some(async move { self.ask(&channel, back(slot)).await })
+                Some(async move {
+                    let answer = self.ask(&channel, back(&slot)).await;
+                    (slot, at, answer)
+                })
             });
             let own = (gate, Some(holder.clone()));
-            let (own, _) =
+            let (own, extras) =
                 futures_util::future::join(self.ask(&own, back(permit)), join_all(extras)).await;
+            self.pocket
+                .borrow_mut()
+                .extend(extras.into_iter().filter_map(|(slot, at, answer)| {
+                    (!matches!(answer, Ok(GateAnswer::Released)))
+                        .then(|| (holder.clone(), slot, at))
+                }));
             match own? {
                 GateAnswer::Released => Ok(()),
                 _ => Err(unexpected()),
