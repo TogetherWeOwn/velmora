@@ -55,6 +55,9 @@ fn keys() -> Vec<String> {
 /// is taken only for the entry the unit is closed under; the `sync` that
 /// lifts needs the stored report's proof; key rows from the chain apply.
 struct FakeUnit {
+    /// When set, the lift that opens the unit moves this clock on by the
+    /// milliseconds given and lands at the moved time (`lifted_at`).
+    lift_clock: RefCell<Option<(velmora_bridge::testkit::FixedClock, i64)>>,
     /// Every head the unit was synced with, and the lift it carried.
     synced: RefCell<Vec<(TenantDoor, Option<LiftProof>)>>,
     /// The `since_seq` the unit is closed under (`None`: open).
@@ -132,6 +135,7 @@ impl Default for FakeUnit {
             recounts: Cell::new(0),
             grow_keys: RefCell::default(),
             log: RefCell::default(),
+            lift_clock: RefCell::default(),
         }
     }
 }
@@ -218,6 +222,14 @@ impl OwnerUnit for FakeUnit {
                     return Ok(Synced::Refused(UnitRefused::Gate(
                         GateRefusal::NotRestoring,
                     )));
+                }
+                if self.closed.get().is_some() {
+                    if let Some((clock, ms)) = self.lift_clock.borrow().as_ref() {
+                        clock.advance_ms(*ms);
+                        if let Some(i) = self.import.borrow_mut().as_mut() {
+                            i.lifted_at = Some(clock.now());
+                        }
+                    }
                 }
                 self.closed.set(None);
             }
@@ -2333,5 +2345,27 @@ fn an_exit_after_a_later_move_elsewhere_still_raises_the_floor() {
             .await
             .unwrap();
         assert_eq!(m.head(&owner()).await.move_floors.get(&0), Some(&raised));
+    });
+}
+
+/// Review c3 LOW: the lift lands minutes after the run began; (b1) checks
+/// its floor against the clock read then, not at the start of the run.
+#[test]
+fn the_move_floor_is_checked_against_the_clock_after_the_lift() {
+    block_on(async {
+        let m = window().await;
+        let start = m.rig.now();
+        *m.unit.lift_clock.borrow_mut() = Some((
+            m.rig.bridge.clock.clone(),
+            velmora_bridge::directory::transition::MAX_FLOOR_AHEAD_MS + 60_000,
+        ));
+        let f = m.flip().await.map_err(|e| format!("{e:?}")).unwrap();
+        assert!(f.wrote);
+        let floor = *m.head(&owner()).await.move_floors.get(&0).unwrap();
+        assert!(floor.0 > start.0 + velmora_bridge::directory::transition::MAX_FLOOR_AHEAD_MS);
+        assert_eq!(
+            Some(floor),
+            m.unit.import.borrow().as_ref().unwrap().lifted_at
+        );
     });
 }
