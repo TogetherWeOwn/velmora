@@ -27,15 +27,18 @@ set +x
 umask 077
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source-path=SCRIPTDIR
+source "$HERE/catalog-common.sh"
 cd "$HERE/.."
 DB=${VELMORA_D1:-velmora-catalog}
 BUCKET=${VELMORA_EXPORT_BUCKET:-velmora-catalog-export}
 remote=${VELMORA_EXPORT_RCLONE_REMOTE-}
 part_bytes=${VELMORA_EXPORT_PART_BYTES-268435456}
 
-for tool in zstd jq split sha256sum; do
+for tool in zstd jq split sha256sum python3; do
   command -v "$tool" >/dev/null || { echo "catalog-export: missing tool: $tool" >&2; exit 1; }
 done
+catalog_init_sql_limits
 if [[ ${VELMORA_EXPORT_RCLONE_REMOTE+x} && ! $remote =~ ^[A-Za-z0-9_-]+$ ]]; then
   echo "catalog-export: invalid VELMORA_EXPORT_RCLONE_REMOTE" >&2
   exit 1
@@ -83,8 +86,10 @@ if [[ -n $remote ]]; then
     manifest_check_failed
 elif get "$manifest" "$WORK/existing.json" "$@"; then
   listing=$manifest
-# Match the missing-key test in catalog-import.sh's get_restore_object.
-elif grep -qiE 'The specified key does not exist|NoSuchKey|not found' "$WORK/get.log"; then
+# Any 404 means there is no readable manifest at this key with these
+# credentials. If the bucket itself is missing, the first put fails and
+# the manifest is never written.
+elif catalog_wrangler_get_is_404 "$WORK/get.log"; then
   listing=
 else
   manifest_check_failed
@@ -101,7 +106,10 @@ npx wrangler d1 export "$DB" --remote --output "$file" "$@" </dev/null >"$WORK/e
   exit 1
 }
 [ -s "$file" ] || { echo "catalog-export: the export is empty" >&2; exit 1; }
+sql_bytes=$(( $(wc -c <"$file") ))
+catalog_check_sql_size "$sql_bytes"
 grep -q 'CREATE TABLE' "$file" || { echo "catalog-export: the export has no schema" >&2; exit 1; }
+catalog_check_sql_statements "$file"
 
 put() {
   local key=$1 path=$2 type=$3
@@ -128,7 +136,6 @@ if (( ($(wc -c <"$file.zst") + part_bytes - 1) / part_bytes > 1000 )); then
 fi
 split -b "$part_bytes" -d -a 3 "$file.zst" "$file.zst.part-"
 
-sql_bytes=$(( $(wc -c <"$file") ))
 sql_sha256=$(sha256sum <"$file")
 sql_sha256=${sql_sha256%% *}
 zst_bytes=$(( $(wc -c <"$file.zst") ))

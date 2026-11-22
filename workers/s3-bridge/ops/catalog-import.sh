@@ -30,15 +30,18 @@ fi
 [[ $since_ms =~ ^[0-9]+$ ]] || die 'restore point must contain only digits'
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source-path=SCRIPTDIR
+source "$HERE/catalog-common.sh"
 cd "$HERE/.."
 BUCKET=${VELMORA_EXPORT_BUCKET:-velmora-catalog-export}
 remote=${VELMORA_EXPORT_RCLONE_REMOTE-}
 if [[ ${VELMORA_EXPORT_RCLONE_REMOTE+x} && ! $remote =~ ^[A-Za-z0-9_-]+$ ]]; then
   die 'invalid VELMORA_EXPORT_RCLONE_REMOTE'
 fi
-for tool in zstd jq sha256sum; do
+for tool in zstd jq sha256sum python3; do
   command -v "$tool" >/dev/null || die "missing tool: $tool"
 done
+catalog_init_sql_limits
 
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/velmora-import.XXXXXX")
 trap 'rm -r -- "$WORK"' EXIT
@@ -57,7 +60,7 @@ get() {
   [[ -s $out ]] || die "empty download for $key"
 }
 
-# Return 2 only when the object is missing.
+# Return 2 only when the exact listing is empty or Wrangler reports R2 HTTP 404.
 get_restore_object() {
   local key=$1 out=$2 listing
   shift 2
@@ -68,7 +71,7 @@ get_restore_object() {
   if get "$key" "$out" "$@"; then
     return 0
   fi
-  if [[ -z $remote ]] && grep -qiE 'The specified key does not exist|NoSuchKey|not found' "$out.log"; then
+  if [[ -z $remote ]] && catalog_wrangler_get_is_404 "$out.log"; then
     return 2
   fi
   return 1
@@ -98,6 +101,8 @@ if get_restore_object "$manifest" "$WORK/manifest.json" "$@"; then
         (.key | startswith($prefix) and (ltrimstr($prefix) | test("^[0-9]{3}$"))) and
         (.bytes | bytes) and (.sha256 | sha256))))
   ' "$WORK/manifest.json" >/dev/null || die "invalid manifest $manifest"
+  manifest_sql_bytes=$(jq -er '.sql_bytes + 0' "$WORK/manifest.json")
+  catalog_check_sql_size "$manifest_sql_bytes"
 
   jq -r '.parts[] | [.key, .bytes, .sha256] | @tsv' "$WORK/manifest.json" >"$WORK/parts.tsv"
   while IFS=$'\t' read -r key bytes sha256; do
@@ -129,6 +134,10 @@ else
   echo 'catalog-import: legacy export without a manifest; no checksum to check'
 fi
 
+loaded_bytes=$(( $(wc -c <"$sql") ))
+catalog_check_sql_size "$loaded_bytes"
+catalog_check_sql_statements "$sql"
+
 npx wrangler d1 execute "$target" --remote --json \
   --command "SELECT count(*) AS n FROM sqlite_master WHERE type='table' AND substr(name, 1, 4) <> '_cf_' AND substr(name, 1, 7) <> 'sqlite_'" \
   "$@" </dev/null >"$WORK/count.json" 2>"$WORK/count.log" || {
@@ -143,5 +152,5 @@ npx wrangler d1 execute "$target" --remote --yes --file "$sql" "$@" </dev/null >
   tail -n 20 "$WORK/load.log" >&2
   die "load into $target failed"
 }
-printf 'catalog-import: loaded %s bytes into %s from restore point %s\n' "$(wc -c <"$sql")" "$target" "$since_ms"
+printf 'catalog-import: loaded %s bytes into %s from restore point %s\n' "$loaded_bytes" "$target" "$since_ms"
 echo 'catalog-import: next: migrations apply, then ops/restore-arm.sql (README, Restore step 2)'
