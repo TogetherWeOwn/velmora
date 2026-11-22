@@ -148,7 +148,11 @@ fn open_global<'b, K: crate::ports::Kek>(
     let v = envelope.kek_version();
     match envelope.open_door(kek, name, ControlOwner::Global) {
         Ok(opened) => Ok(opened.door().to_vec()),
-        Err(_) if v > kek.active().0 && v <= crate::config::MAX_KEK_VERSION => {
+        Err(_)
+            if kek.version(v).is_none()
+                && v > kek.active().0
+                && v <= crate::config::MAX_KEK_VERSION =>
+        {
             Err(ERR_KEK_NOT_HELD)
         }
         Err(e) => Err(e),
@@ -600,7 +604,13 @@ where
             // (`m/kl/`, written by the deploy step that makes the key
             // buckets).
             Ok(None) => return Err(unavailable()),
-            Err(e) => return Err(store_stop(&e, "key locations do not verify")),
+            // Not 500: the locations' reader cannot tell a record of a
+            // newer deploy's KEK from damage (`keys::locations`), so this
+            // is a 503 with an alert.
+            Err(_) => {
+                crate::trace::alert(|| "mgmt: tenant create: key locations unreadable".to_string());
+                return Err(unavailable());
+            }
         };
         let claims = ChainClaims { root, now };
         let created = create_key_version(

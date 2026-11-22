@@ -19,7 +19,8 @@ use velmora_bridge::keys::tk::{tk_prefix, KeyBuckets};
 use velmora_bridge::mgmt::adapters::RoutedUnit;
 use velmora_bridge::mgmt::serve::{serve_with, Answer, Either, MgmtRequest, NotBuilt};
 use velmora_bridge::mgmt::tenant_create::{
-    born_name, read_born, read_tref, tref_name, CreatePorts, TenantCreateHandler, LOCATION_HINT,
+    born_name, put_tref, read_born, read_tref, tref_name, CreatePorts, TenantCreateHandler,
+    LOCATION_HINT,
 };
 use velmora_bridge::mgmt::token::{DisabledTokens, TokenHashes};
 use velmora_bridge::records::{MemRecords, RecordStore};
@@ -923,5 +924,31 @@ fn a_damaged_born_marker_is_a_500_with_an_alert() {
         assert!(alerts
             .iter()
             .all(|l| !l.contains(tenant.as_str()) && !l.contains(WS)));
+    });
+}
+
+/// An `m/tref/` record under a KEK version this Worker does not hold yet
+/// (a newer deploy's record) is a failure that may pass: 503, never 500.
+#[test]
+fn a_tref_record_under_a_newer_kek_is_a_503() {
+    use sha2::Digest as _;
+    let newer = TestKek::with_versions(
+        2,
+        &[
+            (1, Sha256::digest(b"kek one").into()),
+            (2, Sha256::digest(b"kek two").into()),
+        ],
+    );
+    let w = World::new();
+    futures_executor_block_on(async {
+        let other = velmora_bridge::unit::TenantId::parse("t_00000000000000ee").unwrap();
+        let mem = MemRecords::new();
+        assert!(put_tref(&mem, &newer, WS, &other, &mut TestRng(8))
+            .await
+            .unwrap());
+        w.ports
+            .records
+            .plant(&tref_name(WS), mem.raw(&tref_name(WS)).unwrap());
+        expect(&w.create(&signup()).await, 503, "service_unavailable");
     });
 }
