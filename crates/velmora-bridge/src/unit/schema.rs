@@ -7,6 +7,10 @@
 //! A unit applies both at birth, in one transaction, and records
 //! [`SCHEMA_VERSION`] in its certificate.
 
+use super::object::poll_once;
+use crate::ports::{Sql, SqlValue};
+use crate::types::{BridgeError, Result};
+
 /// Every catalogue migration, in order.
 pub const CATALOGUE: &[&str] = &[
     include_str!("../../../../workers/s3-bridge/migrations/0001_init.sql"),
@@ -50,6 +54,34 @@ pub const SCHEMA_VERSION: u32 = (CATALOGUE.len() + UNIT.len()) as u32;
 /// The migrations in the order a birth applies them.
 pub fn all() -> impl Iterator<Item = &'static str> {
     CATALOGUE.iter().chain(UNIT.iter()).copied()
+}
+
+/// Whether the unit may run a schema migration now (AM-46). Not while an
+/// import exists that no `move` report has lifted: a migration takes the
+/// pre-migration bookmark (ADR §8.7), and no bookmark from before the
+/// move's lift may exist. Code reads schema N − 1 and N, so such a unit
+/// serves (once lifted) without migrating. A born unit runs no migration
+/// today (it is born at [`SCHEMA_VERSION`]); every future upgrade path
+/// must ask this first, in the transaction that migrates.
+pub fn migration_allowed<S: Sql>(sql: &S) -> Result<bool> {
+    Ok(!super::import::unlifted_import(sql)?)
+}
+
+/// Every table the unit holds, by name, for the reverse move's preflight
+/// (AM-26): SQLite's own tables and the platform's (`_cf_…`) are left out.
+pub fn tables<S: Sql>(sql: &S) -> Result<Vec<String>> {
+    let rows = poll_once(sql.query(
+        "SELECT name FROM sqlite_master WHERE type = 'table' \
+           AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\' \
+           AND name NOT LIKE '\\_cf\\_%' ESCAPE '\\' ORDER BY name",
+        &[],
+    ))??;
+    rows.into_iter()
+        .map(|r| match r.first() {
+            Some(SqlValue::Text(n)) => Ok(n.clone()),
+            _ => Err(BridgeError::Sql("unit: row decode: sqlite_master".into())),
+        })
+        .collect()
 }
 
 #[cfg(test)]

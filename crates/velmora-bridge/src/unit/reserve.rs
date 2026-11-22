@@ -274,8 +274,11 @@ pub enum ReserveRefusal {
     /// The name is a bucket's, or another call holds it:
     /// `409 bucket_already_exists`.
     BucketAlreadyExists,
-    /// Another call holds the `owner_ref` for a principal create:
-    /// `409 principal_exists`.
+    /// Another open reservation holds the `owner_ref` for a principal
+    /// create and no principal exists yet (a new ask that finds one is
+    /// answered `exists`), or, on a re-ask, a principal holds it now: the
+    /// Worker answers `503` with `Retry-After`, and the retry lands in
+    /// `exists` (L5, #236).
     PrincipalExists,
     /// The id the call would make exists: `409 conflict`.
     Conflict,
@@ -887,9 +890,13 @@ pub fn admit<S: Sql>(
         }
     }
     // A principal create that finds its principal answers it (AM-36).
+    // Two principals for one `owner_ref` are never resolved: the refusal
+    // stands (and alarms), it does not fall through to `principal_exists`.
     if let Opening::Principal { owner_ref, .. } = ask.opening {
-        if let Ok(p) = find_principal(sql, &Acting::OwnerRef(owner_ref.clone()))? {
-            return Ok(Admit::Exists(p));
+        match find_principal(sql, &Acting::OwnerRef(owner_ref.clone()))? {
+            Ok(p) => return Ok(Admit::Exists(p)),
+            Err(ReserveRefusal::ActingPrincipalUnknown) => {}
+            Err(r) => return Ok(Admit::Refused(r)),
         }
     }
     if let Err(r) = check(sql, ask, acting.as_ref(), None)? {
@@ -1025,6 +1032,11 @@ fn check<S: Sql>(
         }
     }
     if let Opening::Principal { owner_ref, .. } = ask.opening {
+        // Two held for one `owner_ref` is a broken invariant: refused with
+        // the alarm on every path, a re-ask's included.
+        if let Err(OwnerRefAmbiguous) = find_principal(sql, &Acting::OwnerRef(owner_ref.clone()))? {
+            return Ok(Err(OwnerRefAmbiguous));
+        }
         // At most one principal per `owner_ref` that is not revoked
         // (AM-35): none held, and no other open create for it.
         if exists(

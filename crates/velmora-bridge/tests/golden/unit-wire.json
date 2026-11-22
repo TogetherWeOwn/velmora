@@ -1292,7 +1292,9 @@
       "moved",
       "malformed",
       "no_point_in_time",
-      "before_move_lift"
+      "before_move_lift",
+      "move_not_lifted",
+      "before_birth"
     ],
     "size_refusal": [
       "database_full",

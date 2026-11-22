@@ -27,6 +27,11 @@
 //! 4. (`restore` only) its current bookmark is still `expect_undo`: the
 //!    unit wrote nothing since `restore_prepare`. A refusal here means the
 //!    tool runs `restore_prepare` again.
+//! 5. (AM-46) both calls are refused while an import exists that no
+//!    `move` report has lifted (`move_not_lifted`), so no undo bookmark
+//!    from before the move's lift exists; `restore` refuses a time target
+//!    before the move's lift (`before_move_lift`) or before the unit's
+//!    birth (`before_birth`), each with [`LIFT_SLACK_MS`].
 //!
 //! Checks 1 to 3 run in the unit's own code over its tables
 //! ([`Unit::pitr_step`](super::object::Unit::pitr_step)); check 4 and the
@@ -52,9 +57,10 @@ use crate::types::{BridgeError, Result, UnixMs};
 pub const LEASE_TERM_MS: i64 = 600_000;
 /// The margin after T and after the latest lease, before a restore.
 pub const RESTORE_MARGIN_MS: i64 = 60_000;
-/// The margin after the owner move's lift within which a restore to a
-/// time is still refused: the lift's recorded time is its call's clock,
-/// a little before the commit (est).
+/// The margin after the owner move's lift, and after the unit's birth,
+/// within which a restore to a time is still refused: each recorded time
+/// is its call's clock, a little before the commit (est; the S3 drill
+/// measures `getBookmarkForTime`'s offset, AM-46).
 pub const LIFT_SLACK_MS: i64 = 60_000;
 /// The longest bookmark the unit takes back (est).
 pub const MAX_BOOKMARK: usize = 1024;
@@ -108,6 +114,15 @@ pub enum RestoreRefusal {
     NoPointInTime,
     /// A time target before the owner move's lift (the move's window).
     BeforeMoveLift,
+    /// An import exists that no `move` report has lifted yet (AM-46): no
+    /// undo bookmark is taken, so none from before the lift can exist.
+    /// The unit is closed mid-move and has never served a request; the
+    /// move's own give-up or lift ends this.
+    MoveNotLifted,
+    /// A time target before this incarnation's birth (AM-46): it would
+    /// bring back the unit that was replaced (a dump restore into a gone
+    /// or unborn unit, or a re-creation after `deleteAll()`).
+    BeforeBirth,
 }
 
 /// The lease as the restore checks read it: `fresh_until` and the latest

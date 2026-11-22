@@ -158,10 +158,11 @@ impl<S: UnitSql> Unit<S> {
         let born = self.born()?;
         let UnitOp::Provision { token, sealed } = &call.op else {
             let Some(cert) = born else {
-                // Rule 7: nothing is made, nothing is written.
-                return Ok(UnitAnswer::Unborn {
-                    listed: call.listed,
-                });
+                // Rule 7: nothing is made, nothing is written. The move
+                // tool's read of import state (P12) decides an unborn unit
+                // from the heads it read first, so that read never pages.
+                let listed = call.listed && !matches!(call.op, UnitOp::ImportProgress {});
+                return Ok(UnitAnswer::Unborn { listed });
             };
             if cert != self.own {
                 // The certificate names another unit than the object: a
@@ -207,6 +208,18 @@ impl<S: UnitSql> Unit<S> {
         UnitName::parse(&name)
             .map(Some)
             .ok_or_else(|| decode("unit_birth name"))
+    }
+
+    /// The unit's clock at its birth (`unit_birth.born_at`).
+    fn born_at(&self) -> Result<i64> {
+        let rows = poll_once(
+            self.sql()
+                .query("SELECT born_at FROM unit_birth WHERE id = 1", &[]),
+        )??;
+        match rows.first().and_then(|r| r.first()) {
+            Some(SqlValue::Int(t)) => Ok(*t),
+            _ => Err(decode("unit_birth born_at")),
+        }
     }
 
     pub fn head(&self) -> Result<Head> {
@@ -456,11 +469,18 @@ impl<S: UnitSql> Unit<S> {
                         .into_iter()
                         .map(|(t, c, n)| json!({ "table": t, "cursor": c, "rows": n }))
                         .collect();
+                    // AM-47: the move's record; all null when no import
+                    // was ever bound to this unit.
+                    let record = import::move_record(self.sql())?;
                     Ok(json!({
                         "tables": tables,
                         "sealed": import::sealed(self.sql())?,
+                        "t0_seq": record.map(|m| m.t0_seq),
+                        "since_seq": record.map(|m| m.since_seq),
+                        "move_lifted": record.map(|m| m.move_lifted),
+                        "schema_tables": schema::tables(self.sql())?,
                     }))
-                })
+                });
             }
             _ => {}
         }
@@ -815,14 +835,26 @@ impl<S: UnitSql> Unit<S> {
                 return no(RestoreRefusal::Malformed);
             }
         }
-        // Never back into the owner move's window: a time before the
-        // move's lift would bring back its unused seal. The lift's time is
-        // the call's clock, a little before its commit: a margin covers it.
+        // AM-46: no undo bookmark while an import is not lifted, so no
+        // bookmark from before the move's lift can exist. `restore` needs
+        // the bookmark `restore_prepare` answered, so it is refused too.
+        if import::unlifted_import(self.sql())? {
+            return no(RestoreRefusal::MoveNotLifted);
+        }
         if let Some((_, restore::RestoreTarget::Time { at_ms }, _)) = &restore {
+            // Never back into the owner move's window: a time before the
+            // move's lift would bring back its unused seal. The lift's
+            // time is the call's clock, a little before its commit: a
+            // margin covers it.
             if import::move_lifted_at(self.sql())?
                 .is_some_and(|lifted| *at_ms < lifted.saturating_add(restore::LIFT_SLACK_MS))
             {
                 return no(RestoreRefusal::BeforeMoveLift);
+            }
+            // Never back before this incarnation's birth (AM-46), with the
+            // same margin: the birth's time is its call's clock too.
+            if *at_ms < self.born_at()?.saturating_add(restore::LIFT_SLACK_MS) {
+                return no(RestoreRefusal::BeforeBirth);
             }
         }
         let lease = restore::lease_view(self.sql())?;

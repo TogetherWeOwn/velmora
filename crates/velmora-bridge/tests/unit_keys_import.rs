@@ -954,10 +954,18 @@ fn batches_apply_once_and_in_order_and_the_import_resumes_by_cursor() {
         Some((Refused::Import(ImportRefusal::OutOfOrder), false))
     );
     assert_eq!(imported(&u, "buckets"), 4);
-    let progress = ok_body(worker(&u, UnitOp::ImportProgress {}));
+    let mut progress = ok_body(worker(&u, UnitOp::ImportProgress {}));
+    assert!(progress["schema_tables"].is_array());
+    progress.as_object_mut().unwrap().remove("schema_tables");
     assert_eq!(
         progress,
-        json!({ "tables": [{ "table": "buckets", "cursor": "b2", "rows": 3 }], "sealed": null })
+        json!({
+            "tables": [{ "table": "buckets", "cursor": "b2", "rows": 3 }],
+            "sealed": null,
+            "t0_seq": 10,
+            "since_seq": SINCE,
+            "move_lifted": false,
+        })
     );
 }
 

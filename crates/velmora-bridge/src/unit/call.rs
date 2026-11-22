@@ -442,7 +442,8 @@ pub enum UnitAnswer {
     SyncNeeded {
         seqs: Seqs,
     },
-    /// The caller is behind; nothing was done (rule 5).
+    /// The caller is behind; nothing was done (rule 5). A job runs once
+    /// more with these numbers (AM-50).
     Stale {
         seqs: Seqs,
     },
