@@ -96,6 +96,11 @@ pub enum KeyRequest {
         grants: Vec<Grant>,
         acting: Option<String>,
     },
+    /// Remove the grant on one bucket id, whatever else the subject holds
+    /// at the head: a closing change. The revoke of an orphan creator
+    /// grant (ADR §6.2, AM-8, AM-24), so that a concurrent change to the
+    /// subject's other grants is never undone.
+    DropGrant { id: String, bucket_id: String },
 }
 
 /// What a key change answered.
@@ -165,7 +170,7 @@ pub struct KeyEnv<'a, S, K, T, A, I, U, D, C> {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Class {
+pub(super) enum Class {
     Closing,
     Opening,
 }
@@ -378,6 +383,38 @@ fn plan<K: Kek>(
                 Err(_) => Planned::Refused(Refusal::Conflict),
             }
         }
+        KeyRequest::DropGrant { id, bucket_id } => {
+            let Some(entry) = table.get(id) else {
+                return Planned::Refused(Refusal::NotFound);
+            };
+            // A revoked subject holds nothing in force; one without the
+            // grant is where the change leads.
+            let held = entry.door.grants.iter().any(|g| g.bucket_id == *bucket_id);
+            if revoked.contains(id) || entry.door.status == SubjectStatus::Revoked || !held {
+                return Planned::InHead(Class::Closing);
+            }
+            let Some(subject) = entry.subject() else {
+                return Planned::Busy;
+            };
+            let grants: Vec<Grant> = subject
+                .grants()
+                .into_iter()
+                .filter(|g| g.bucket_id != *bucket_id)
+                .collect();
+            let mut next = subject.clone();
+            next.set_grants(&grants);
+            match table.admits(KeyOp::Grants, &next.door, Some(&next.private)) {
+                Ok(()) => Planned::Change(Box::new(Plan {
+                    op: KeyOp::Grants,
+                    door: next.door,
+                    private: Some(next.private),
+                    class: Class::Closing,
+                    acting: entry.door.made_by.clone(),
+                    revoke: false,
+                })),
+                Err(_) => Planned::Refused(Refusal::Conflict),
+            }
+        }
     }
 }
 
@@ -461,13 +498,13 @@ async fn bring_up<U: KeyTarget>(
 
 /// What the stores acknowledged.
 #[derive(Clone, Copy)]
-struct Acks {
+pub(super) struct Acks {
     /// Every unit holds the head, with what does not close held closed.
     closed: bool,
     /// The directory holds the head.
     directory: bool,
     /// Every unit holds the head in full (only after the directory).
-    units: bool,
+    pub(super) units: bool,
 }
 
 /// The subjects of `table` whose private part did not open, revoked ones
@@ -491,7 +528,7 @@ where
     D: KeyTarget,
     C: Clock,
 {
-    fn now(&self) -> u64 {
+    pub(super) fn now(&self) -> u64 {
         u64::try_from(self.clock.now().0).unwrap_or(0)
     }
 
@@ -499,7 +536,7 @@ where
     /// the directory, then, once the directory acknowledged, the units
     /// with everything. So a closing change needs no directory, and no
     /// unit opens anything the directory does not have.
-    async fn apply_all(&self, table: &KeyTable, revoked: &BTreeSet<String>) -> Acks {
+    pub(super) async fn apply_all(&self, table: &KeyTable, revoked: &BTreeSet<String>) -> Acks {
         let acked = self.directory.keys_seq().await.unwrap_or(0);
         let mut closed = true;
         for unit in self.units {
@@ -521,7 +558,13 @@ where
 
     /// The answer once the stores were brought up. Clears the pending
     /// rows up to `seq` when every store holds it with every subject open.
-    async fn answer(&self, class: Class, table: &KeyTable, seq: u64, acks: Acks) -> KeyAnswer {
+    pub(super) async fn answer(
+        &self,
+        class: Class,
+        table: &KeyTable,
+        seq: u64,
+        acks: Acks,
+    ) -> KeyAnswer {
         let done = match class {
             Class::Closing => acks.closed,
             Class::Opening => acks.units && acks.directory,

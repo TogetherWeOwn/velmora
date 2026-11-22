@@ -16,6 +16,9 @@
 //! | `m/tk/<t>/<n>.<v>` | tenant key version `n` under KEK version `v`, in the key buckets only | created in the arbiter, then copied ([`tk`]) |
 //! | `m/kl/<seq>` | the closed set of key locations | put once, exactly the next seq ([`locations`]) |
 //!
+//! A bucket create writes its creator grant to the key chain first, and
+//! the bucket's id is derived from that record's seq ([`buckets`]).
+//!
 //! # Why the chain decides
 //!
 //! The databases are copies. A unit or a directory restored to an older
@@ -26,6 +29,7 @@
 //! reaches every copy, which is what [`writer::finish_keys`] does.
 
 pub mod audit;
+pub mod buckets;
 pub mod chain;
 pub mod checkpoint;
 pub mod escrow;

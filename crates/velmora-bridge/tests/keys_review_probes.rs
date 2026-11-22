@@ -15,7 +15,8 @@ use velmora_bridge::keys::checkpoint::{
 use velmora_bridge::keys::escrow::{restore_escrow, EscrowCopy, RestoreStep};
 use velmora_bridge::keys::locations::{two_in_account, KeyLocation, KeyLocations, LocationStatus};
 use velmora_bridge::keys::ports::{
-    Admission, ControlChain, ControlIntents, KeyAdmission, KeyTarget, OpeningChange,
+    Admission, BucketAdmission, BucketReservation, ControlChain, ControlIntents, KeyAdmission,
+    KeyTarget, OpeningChange,
 };
 use velmora_bridge::keys::record::{
     key_chain, open_key_record, seal_key_record, Access, Entry, Grant, KeyOp, KeyRecord, KeyTable,
@@ -252,6 +253,15 @@ impl KeyAdmission for FakeAdmission {
 
     async fn release(&self, _: &TenantId, _: &str) -> Result<()> {
         panic!("the finisher does not release reservations");
+    }
+
+    async fn admit_bucket(
+        &self,
+        _: &TenantId,
+        _: &str,
+        _: &BucketReservation<'_>,
+    ) -> Result<BucketAdmission> {
+        panic!("the finisher does not request admission");
     }
 }
 
