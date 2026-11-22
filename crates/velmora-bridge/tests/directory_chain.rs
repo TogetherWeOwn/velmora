@@ -998,7 +998,7 @@ fn a_move_floor_is_bound_to_tenant_zeros_own_head() {
             .await
             .unwrap();
         assert!(matches!(w, Written::Unchanged(_)), "{w:?}");
-        // A move into another tenant: refused.
+        // A move into another tenant: this tenant's exit still raises it.
         chain
             .write(
                 &Tenant::zero(),
@@ -1014,10 +1014,11 @@ fn a_move_floor_is_bound_to_tenant_zeros_own_head() {
             .unwrap();
         let w = chain
             .set_move_floor(&t1(), 0, UnixMs(11), Actor::MoveTool, UnixMs(20), 0)
-            .await;
-        assert!(
-            matches!(&w, Err(ChainError::Refused(r)) if r.code == "no_move_to_tenant"),
-            "{w:?}"
-        );
+            .await
+            .unwrap();
+        let Written::Wrote(r) = w else {
+            panic!("{w:?}")
+        };
+        assert_eq!(r.door.move_floors.get(&0), Some(&UnixMs(11)));
     });
 }

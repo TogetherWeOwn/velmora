@@ -894,18 +894,17 @@ pub fn next(
             if !h.units.contains(unit) {
                 return Err(UNIT_NOT_LISTED);
             }
-            // Tenant 0's head: a move into this tenant is under way, flipped
-            // or undone (`move.to` names it), or was given up (`move` gone,
-            // `d1`). Never once tenant 0 is retired.
-            let owner = zero.tenant.is_zero()
-                && zero.tenant_zero.as_ref().is_some_and(|z| match z.selector {
-                    Selector::Moving | Selector::Moved => {
-                        z.moved.as_ref().is_some_and(|m| m.to == *tenant)
-                    }
-                    Selector::D1 => z.moved.as_ref().is_none_or(|m| m.to == *tenant),
-                    Selector::Retired => false,
-                });
-            if !owner {
+            // Tenant 0's head `moving`, `moved` or `d1` (the §2.8 row),
+            // never `retired`. Whom `move.to` names is not asked: an exit of
+            // this tenant's move may run after a later move into another
+            // tenant began (an undo's day 30, a give-up finished late), and
+            // a raised floor only narrows what a restore may do.
+            let open = zero.tenant.is_zero()
+                && zero
+                    .tenant_zero
+                    .as_ref()
+                    .is_some_and(|z| z.selector != Selector::Retired);
+            if !open {
                 return Err(NOT_MOVING_HERE);
             }
             door.move_floors.insert(*unit, *floor);

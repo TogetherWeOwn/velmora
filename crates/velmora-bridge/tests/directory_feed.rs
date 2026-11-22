@@ -380,3 +380,78 @@ fn the_shred_purges_one_tenants_events_and_marks_them() {
         assert_eq!(seqs(&b), [2]);
     });
 }
+
+/// A database that runs one prune step right after the read's index range
+/// and before its second state read: the race of AM-37's reset rule.
+struct PruneDuringRead<'a> {
+    db: &'a Db,
+    cutoff: UnixMs,
+    armed: std::cell::Cell<bool>,
+}
+
+impl Sql for PruneDuringRead<'_> {
+    async fn query(
+        &self,
+        sql: &str,
+        params: &[SqlValue],
+    ) -> velmora_bridge::Result<Vec<Vec<SqlValue>>> {
+        let rows = self.db.query(sql, params).await?;
+        if sql == TENANT_RANGE && self.armed.replace(false) {
+            SqlDirectory { sql: self.db }
+                .prune_events(self.cutoff, 1)
+                .await?;
+        }
+        Ok(rows)
+    }
+
+    async fn exec(&self, sql: &str, params: &[SqlValue]) -> velmora_bridge::Result<u64> {
+        self.db.exec(sql, params).await
+    }
+
+    async fn batch(
+        &self,
+        stmts: Vec<(&'static str, Vec<SqlValue>)>,
+    ) -> velmora_bridge::Result<Vec<u64>> {
+        self.db.batch(stmts).await
+    }
+}
+
+/// Review r2 LOW: a prune during a read resets a position below its new
+/// mark, and never a read without one (it starts at the oldest kept event).
+#[test]
+fn a_prune_during_a_read_resets_a_position_and_never_a_read_without_one() {
+    block_on(async {
+        let db = database();
+        let dir = SqlDirectory { sql: &db };
+        let old = NOW.0 - EVENT_KEEP_MS - 1;
+        // a1: 1 (old), 2, 3 (young).
+        append(&dir, A1, "t/1", old).await;
+        append(&dir, A1, "t/2", NOW.0).await;
+        append(&dir, A1, "t/3", NOW.0).await;
+        let cutoff = UnixMs(NOW.0 - EVENT_KEEP_MS);
+        let racing = PruneDuringRead {
+            db: &db,
+            cutoff,
+            armed: std::cell::Cell::new(true),
+        };
+        let r = SqlDirectory { sql: &racing };
+        // Without `after`: the page as read, no reset.
+        let p = r.tenant_events(&t(A1), None, 10).await.unwrap().unwrap();
+        assert_eq!(seqs(&p), [1, 2, 3]);
+        // The prune ran: seq 1 is gone, the mark is 1.
+        let after = dir.tenant_events(&t(A1), None, 10).await.unwrap().unwrap();
+        assert_eq!(seqs(&after), [2, 3]);
+        // A position at the mark, and a prune during the read that takes
+        // seq 2 (a later cutoff) and raises the mark above it: reset.
+        let racing = PruneDuringRead {
+            db: &db,
+            cutoff: UnixMs(NOW.0 + 1),
+            armed: std::cell::Cell::new(true),
+        };
+        let r = SqlDirectory { sql: &racing };
+        assert_eq!(
+            r.tenant_events(&t(A1), Some(pos(0, 1)), 10).await.unwrap(),
+            Err(FeedReset)
+        );
+    });
+}
