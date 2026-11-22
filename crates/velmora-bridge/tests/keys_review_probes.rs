@@ -248,7 +248,7 @@ impl KeyTarget for &FakeTarget {
         }
         let mut rows = self.rows.borrow_mut();
         for e in entries {
-            if let ApplyEntry::Subject(e) = e {
+            if let Some(e) = e.entry() {
                 let newer = rows.get(&e.door.id).is_none_or(|r| {
                     e.last_seq > r.last_seq
                         || (e.last_seq == r.last_seq && r.private.is_none() && e.private.is_some())

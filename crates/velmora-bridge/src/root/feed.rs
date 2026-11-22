@@ -9,28 +9,34 @@
 //!   (`keys::apply::Feed::entries`);
 //! - a marker record (`KeysFrozen`, `KeysThawed`) as the unit's marker
 //!   item, in its place, so the run has no gap;
-//! - an opening that the directory may not have yet, **held**
-//!   (`keys::apply::hold_unacknowledged`): the closing step's rule, as
-//!   L4's writer sends it to a unit before the directory acknowledged.
-//!   With no directory bound there is no store to wait for (AM-75: the
-//!   directory step is skipped and keys are routed by `m/kr/`), so every
-//!   entry is sent as the chain has it.
+//! - an opening that the directory may not have yet, **held** with its
+//!   `owner_ref` (`ApplyEntry::Held`, AM-72), through L4's
+//!   `Feed::entries_for` in the closing step's mode, as L4's writer sends
+//!   it to a unit before the directory acknowledged. The feed does not
+//!   know which subjects the unit holds closed, so it counts every
+//!   subject as closed: an opening is sent open only once the directory
+//!   acknowledged it, never because the unit's `keys_seq` is past it (a
+//!   unit can hold a subject closed below its own seq). A subject the
+//!   unit holds open is open there only after a full send that followed
+//!   the directory's acknowledgement, so it is not held again. With no
+//!   directory bound there is no store to wait for (AM-75: the directory
+//!   step is skipped and keys are routed by `m/kr/`), so every entry is
+//!   sent as the chain has it. (A Worker that binds `DIRECTORY` later
+//!   holds every opening its rows do not acknowledge yet.)
 //!
 //! The tenant's key ring comes from [`Root::tenant_keys`], so the feed
 //! fails closed when the key locations or a live key version are missing
 //! (AM-71). A chain with no record after `after` reads no key at all: a
 //! tenant before its first key record (key version 0) syncs.
 //!
-//! **Not yet (AM-72, L4-W2):** a held principal entry keeps its
-//! `owner_ref`. L4's entry drops the whole private part when it is held,
-//! so a held entry goes with `owner_ref: None` until L4's hold keeps it.
-//!
 //! [`unit_item`] is the one mapping of a key-chain item onto the unit's
 //! wire; the management adapters can use it too.
 
 use crate::crypto::scheme2::TenantId as KeyTenant;
 use crate::directory::record::Tenant;
-use crate::keys::apply::{hold_unacknowledged, Feed, Mode};
+use std::collections::BTreeSet;
+
+use crate::keys::apply::{Feed, Mode};
 use crate::keys::checkpoint::read_key_chain;
 use crate::keys::ports::{ApplyEntry as ChainItem, MAX_APPLY};
 use crate::keys::record::{
@@ -63,17 +69,20 @@ pub struct RootKeyFeed<'r, 'a, P: RootPorts, R> {
 
 impl<P: RootPorts, R: FillRandom> RootKeyFeed<'_, '_, P, R> {
     /// How openings are held for `tenant`'s units: until the directory
-    /// acknowledged them when it is bound (a failed read acknowledges
-    /// nothing), not at all when it is not.
-    async fn mode(&self, tenant: &KeyTenant) -> Mode {
+    /// acknowledged them when it is bound (a tenant with no row has
+    /// acknowledged nothing), not at all when it is not. A failed read is
+    /// the feed's error: guessing "nothing acknowledged" would hold, at a
+    /// unit far behind, keys it holds open, and no later send of this
+    /// path reopens them.
+    async fn mode(&self, tenant: &KeyTenant) -> Result<Mode> {
         let Some(dir) = self.root.directory() else {
-            return Mode::Full;
+            return Ok(Mode::Full);
         };
-        let acked = match dir.tenant(&Tenant::Managed(tenant.clone())).await {
-            Ok(Some(row)) => row.keys_seq,
-            Ok(None) | Err(_) => 0,
-        };
-        Mode::Closing { acked }
+        let acked = dir
+            .tenant(&Tenant::Managed(tenant.clone()))
+            .await?
+            .map_or(0, |row| row.keys_seq);
+        Ok(Mode::Closing { acked })
     }
 }
 
@@ -100,18 +109,20 @@ impl<P: RootPorts, R: FillRandom> KeyFeed for RootKeyFeed<'_, '_, P, R> {
         if top < head {
             return Err(ERR_FEED_SHORT);
         }
-        let mode = self.mode(&t).await;
+        let mode = self.mode(&t).await?;
+        // Every subject counted as held closed by the unit (see the
+        // module): only the directory's acknowledgement opens.
+        let closed: BTreeSet<String> = read.table.entries().map(|e| e.door.id.clone()).collect();
         let feed = Feed::new(records, self.root.kek(), &ring, &read.table, &read.revoked);
         let mut entries = Vec::new();
         let mut from = after;
         while from < top {
-            let page = feed.entries(from, MAX_APPLY).await?;
+            let page = feed.entries_for(from, MAX_APPLY, mode, &closed).await?;
             let Some(last) = page.last().map(ChainItem::seq) else {
                 return Err(ERR_FEED_SHORT);
             };
-            for mut item in page {
-                hold_unacknowledged(mode, &mut item);
-                entries.push(unit_item(&item)?);
+            for item in &page {
+                entries.push(unit_item(item)?);
             }
             from = last;
         }
@@ -126,12 +137,16 @@ impl<P: RootPorts, R: FillRandom> KeyFeed for RootKeyFeed<'_, '_, P, R> {
 }
 
 /// One key-chain item in the unit's wire form (`ApplyKeys`), as L4's
-/// `ApplyEntry` states it: `held` when the private part is not there; a
-/// held entry carries no secret, no `secret_kek_version`, no `owner_ref`
-/// and no grant limit. A marker is the unit's marker item of its kind (a
-/// thaw's `ends` is not on the wire).
+/// `ApplyEntry` states it:
+/// - a subject's entry: `held` when its private part did not open, and
+///   then with no secret, no `secret_kek_version`, no `owner_ref` and no
+///   grant limit;
+/// - a held entry (`Held`, the closing step's hold): `held`, with its
+///   `owner_ref` (AM-72) and nothing else of its private part;
+/// - a marker: the unit's marker item of its kind (a thaw's `ends` is not
+///   on the wire).
 pub fn unit_item(item: &ChainItem) -> Result<UnitItem> {
-    let e = match item {
+    let (e, kept_owner) = match item {
         ChainItem::Marker { seq, marker } => {
             let marker = match marker {
                 Marker::KeysFrozen => MarkerKind::KeysFrozen,
@@ -139,10 +154,14 @@ pub fn unit_item(item: &ChainItem) -> Result<UnitItem> {
             };
             return Ok(UnitItem::Marker(KeyMarker { marker, seq: *seq }));
         }
-        ChainItem::Subject(e) => e,
+        ChainItem::Subject(e) => (e, None),
+        ChainItem::Held { entry, owner_ref } => (entry, Some(owner_ref)),
     };
-    let held = e.private.is_none();
-    if let Some(p) = &e.private {
+    // A held entry never carries its private part (L4's form); one that
+    // did would be sent held with no part of it.
+    let held = e.private.is_none() || kept_owner.is_some();
+    let private = e.private.as_ref().filter(|_| !held);
+    if let Some(p) = private {
         // The door and the private part name the same buckets in the same
         // order (the record's own rule); anything else is damage.
         let same = p.grants.len() == e.door.grants.len()
@@ -160,7 +179,7 @@ pub fn unit_item(item: &ChainItem) -> Result<UnitItem> {
         .iter()
         .enumerate()
         .map(|(i, d)| {
-            let p = e.private.as_ref().and_then(|p| p.grants.get(i));
+            let p = private.and_then(|p| p.grants.get(i));
             KeyGrant {
                 bucket_id: d.bucket_id.clone(),
                 access: match d.access {
@@ -190,12 +209,15 @@ pub fn unit_item(item: &ChainItem) -> Result<UnitItem> {
         made_by: e.door.made_by.clone(),
         grants,
         created_at: e.door.created_at,
-        secret_wrapped: e.private.as_ref().and_then(|p| p.secret_wrapped.clone()),
+        secret_wrapped: private.and_then(|p| p.secret_wrapped.clone()),
         secret_kek_version: match held {
             true => None,
             false => e.door.secret_kek_version,
         },
-        owner_ref: e.private.as_ref().and_then(|p| p.owner_ref.clone()),
+        owner_ref: match kept_owner {
+            Some(owner_ref) => owner_ref.clone(),
+            None => private.and_then(|p| p.owner_ref.clone()),
+        },
         last_seq: e.last_seq,
         rid: e.rid.map(|r| UnitRid(r.0)),
     }))

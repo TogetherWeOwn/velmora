@@ -12,7 +12,9 @@ use std::rc::Rc;
 use sha2::{Digest, Sha256};
 use velmora::rng::FillRandom;
 use velmora_bridge::config::Maintenance;
-use velmora_bridge::crypto::scheme2::{tk_blob_name, wrap_tenant_key, TenantId, TenantKey};
+use velmora_bridge::crypto::scheme2::{
+    tk_blob_name, wrap_secret_v2, wrap_tenant_key, TenantId, TenantKey,
+};
 use velmora_bridge::directory::chain::Written;
 use velmora_bridge::directory::record::{Tenant, TenantDoor};
 use velmora_bridge::directory::store::SqlDirectory;
@@ -31,10 +33,14 @@ use velmora_bridge::root::{unit_item, ControlSend, Root, RootCache, RootPorts, U
 use velmora_bridge::testkit::{FixedClock, MemBlobStore, RusqliteSql, TestKek};
 use velmora_bridge::types::{BridgeError, Result};
 use velmora_bridge::unit::keys::{ApplyEntry as UnitItem, KeyMarker, MarkerKind};
-use velmora_bridge::unit::{CallKind, Seqs, UnitAnswer, UnitCall, UnitName, UnitOp, UnitReply};
+use velmora_bridge::unit::{
+    BirthKind, BirthToken, CallKind, Seqs, Unit, UnitAnswer, UnitCall, UnitName, UnitOp, UnitReply,
+};
+use velmora_bridge::unit_lease::client::Synced;
 use velmora_bridge::unit_lease::client::{KeyFeed, KeyFinisher, UnitReplies};
 use velmora_bridge::unit_router::{RequestClients, Routed, UnitRouter};
 use velmora_bridge::UnixMs;
+use velmora_bridge::{Sql, SqlValue};
 
 const NOW: UnixMs = UnixMs(1_800_000_000_000);
 const T1: &str = "t_00000000000000a1";
@@ -85,11 +91,17 @@ struct Objects {
 struct Object {
     seen: Rc<Objects>,
     name: UnitName,
+    /// The real unit, when the ports have one: it answers instead.
+    real: Option<Rc<Unit<RusqliteSql>>>,
 }
 
 impl UnitReplies for Object {
     async fn reply(&self, call: &UnitCall) -> Result<UnitReply> {
         assert_eq!(call.name, self.name, "a client calls its own unit");
+        if let Some(unit) = &self.real {
+            self.seen.calls.borrow_mut().push(call.clone());
+            return Ok(unit.reply(call, NOW));
+        }
         self.seen.calls.borrow_mut().push(call.clone());
         Ok(UnitReply {
             answer: UnitAnswer::Ok {
@@ -132,6 +144,7 @@ struct Ports {
     objects: Rc<Objects>,
     safety: MemBlobStore,
     control: Control,
+    unit: Option<Rc<Unit<RusqliteSql>>>,
 }
 
 impl RootPorts for Ports {
@@ -169,6 +182,7 @@ impl UnitPorts for Ports {
         Ok(Object {
             seen: self.objects.clone(),
             name: name.clone(),
+            real: self.unit.clone(),
         })
     }
     fn safety(&self) -> &MemBlobStore {
@@ -200,6 +214,7 @@ fn ports(records: Rc<MemRecords>, directory: Option<RusqliteSql>) -> Ports {
         objects: Rc::default(),
         safety: MemBlobStore::default(),
         control: Control::default(),
+        unit: None,
     };
     let (kek_v, blob) = wrap_tenant_key(&ports.kek, &key(), &mut TestRng(7)).unwrap();
     let name = tk_blob_name(&id(), 1, kek_v);
@@ -480,11 +495,12 @@ fn with_a_directory_an_opening_it_has_not_acknowledged_is_held() {
             (5, Some(("PR0001", true))),
         ]
     );
-    // A held entry carries no secret, no KEK version, no owner and no
-    // grant limit; its grants' buckets and access stay.
+    // A held entry keeps its identity (AM-72) and carries no secret, no
+    // KEK version, no label and no grant limit; its grants' buckets and
+    // access stay.
     let held = entry_of(&batch.entries, 2);
     assert!(held.held);
-    assert_eq!(held.owner_ref, None);
+    assert_eq!(held.owner_ref.as_deref(), Some("member-of-PR0002"));
     assert_eq!(held.secret_wrapped, None);
     assert_eq!(held.secret_kek_version, None);
     assert_eq!(held.grants[0].prefix, None);
@@ -552,6 +568,99 @@ fn the_feed_fails_closed_without_key_locations_but_an_empty_chain_reads_no_key()
     )
     .unwrap();
     assert!(block_on(root.key_feed().after(&zero, 0)).is_err());
+}
+
+/// The unit learns an opening only from the directory's acknowledgement,
+/// never from its own seq: a subject opened at or below the unit's
+/// `keys_seq` but not acknowledged is sent held in a later record.
+#[test]
+fn an_opening_below_the_units_seq_is_held_until_the_directory_has_it() {
+    let records = active_records(true);
+    key_chain_records(&records);
+    // PR0002 narrowed at 6 (a closing change): its opening stays seq 2.
+    let mut narrowed = principal("PR0002");
+    narrowed.set_grants(&[Grant {
+        bucket_id: "b_00000000000000b1".into(),
+        access: Access::Ro,
+        expires_at: Some(9_000),
+        prefix: Some("photos/".into()),
+        ip_list: vec!["10.0.0.0/8".into()],
+    }]);
+    plant(&records, 6, KeyOp::Grants, &narrowed, true);
+    let p = ports(records, Some(directory_db()));
+    let cache = RootCache::new();
+    let root = Root::new(&p, &cache, TestRng(3));
+    // The unit holds up to 5 (PR0002 held there); nothing acknowledged.
+    let batch = block_on(root.key_feed().after(&unit_id(), 5)).unwrap();
+    assert_eq!(keys(&batch.entries), vec![(6, Some(("PR0002", true)))]);
+}
+
+/// A directory that cannot be read acknowledges nothing and opens
+/// nothing: the feed fails, and the unit's `sync` is retried, rather than
+/// holding keys the unit may hold open.
+#[test]
+fn a_failed_directory_read_fails_the_feed() {
+    let records = active_records(true);
+    key_chain_records(&records);
+    // A database with no directory schema: every read of it fails.
+    let p = ports(records, Some(RusqliteSql::open_in_memory().unwrap()));
+    let cache = RootCache::new();
+    let root = Root::new(&p, &cache, TestRng(3));
+    assert!(block_on(root.key_feed().after(&unit_id(), 0)).is_err());
+    // Nothing after the unit: no read at all, so no failure.
+    let none = block_on(root.key_feed().after(&unit_id(), 5)).unwrap();
+    assert_eq!((none.head, none.entries.len()), (5, 0));
+}
+
+#[test]
+fn held_items_keep_their_owner_and_lose_their_private_part() {
+    let s = principal("PR0003");
+    let open = Entry {
+        door: s.door.clone(),
+        private: Some(s.private.clone()),
+        last_seq: 4,
+        private_seq: 4,
+        tk_version: 1,
+        closes: false,
+        opened_seq: 4,
+        rid: None,
+    };
+    let UnitItem::Key(sent) = unit_item(&ChainItem::Subject(open.clone())).unwrap() else {
+        panic!()
+    };
+    assert!(!sent.held);
+    assert_eq!(sent.owner_ref.as_deref(), Some("member-of-PR0003"));
+    let mut closed = open.clone();
+    closed.private = None;
+    let UnitItem::Key(unopened) = unit_item(&ChainItem::Subject(closed.clone())).unwrap() else {
+        panic!()
+    };
+    assert!(unopened.held);
+    assert_eq!(unopened.owner_ref, None);
+    let UnitItem::Key(held) = unit_item(&ChainItem::Held {
+        entry: closed,
+        owner_ref: Some("member-of-PR0003".into()),
+    })
+    .unwrap() else {
+        panic!()
+    };
+    assert!(held.held);
+    assert_eq!(held.owner_ref.as_deref(), Some("member-of-PR0003"));
+    assert_eq!(held.secret_wrapped, None);
+    assert_eq!(held.secret_kek_version, None);
+    assert_eq!(held.grants[0].prefix, None);
+    assert!(held.grants[0].ip_list.is_empty());
+    // A held item that still carried its private part sends none of it.
+    let UnitItem::Key(stripped) = unit_item(&ChainItem::Held {
+        entry: open,
+        owner_ref: None,
+    })
+    .unwrap() else {
+        panic!()
+    };
+    assert!(stripped.held);
+    assert_eq!(stripped.owner_ref, None);
+    assert_eq!(stripped.grants[0].prefix, None);
 }
 
 #[test]
@@ -662,4 +771,133 @@ fn the_router_calls_the_routed_unit_with_the_heads_numbers() {
     assert!(calls[0].authenticated && calls[0].listed);
     // The clients are the root's: one per routed unit.
     assert!(clients.client(&routed).is_ok());
+}
+
+/// An S3 key of PR0002's (active), its secret wrapped for the tenant (scheme 2).
+fn s3_key(akid: &str) -> Subject {
+    let (version, wrapped) = wrap_secret_v2(
+        &TestKek::new(),
+        &id(),
+        akid,
+        format!("secret-of-{akid}").as_bytes(),
+        &mut TestRng(900),
+    )
+    .unwrap();
+    let mut s = principal(akid);
+    s.door.kind = SubjectKind::S3;
+    s.door.made_by = Some("PR0002".into());
+    s.door.secret_kek_version = Some(version);
+    s.private.owner_ref = None;
+    s.private.secret_wrapped = Some(wrapped);
+    s
+}
+
+/// A born root unit of the tenant, at the head's `state_seq`.
+fn born_unit(state_seq: u64) -> Rc<Unit<RusqliteSql>> {
+    let name = UnitName::new(unit_id(), 0);
+    let unit = Unit::new(RusqliteSql::open_in_memory().unwrap(), name.clone(), "");
+    let born = unit.handle(
+        &UnitCall {
+            name: name.clone(),
+            kind: CallKind::Worker,
+            seqs: Some(Seqs {
+                state_seq,
+                keys_seq: 0,
+            }),
+            authenticated: true,
+            listed: true,
+            op: UnitOp::Provision {
+                token: BirthToken {
+                    name,
+                    jurisdiction: String::new(),
+                    record_seq: state_seq,
+                    schema_version: velmora_bridge::unit::schema::SCHEMA_VERSION,
+                    key_scheme: 2,
+                    kind: BirthKind::Birth,
+                },
+                sealed: vec![1],
+            },
+        },
+        NOW,
+    );
+    assert!(matches!(born, UnitAnswer::Ok { .. }), "{born:?}");
+    Rc::new(unit)
+}
+
+/// The unit's key rows: (id, held, status, has an owner, has a secret).
+fn unit_rows(unit: &Unit<RusqliteSql>) -> Vec<(String, i64, String, bool, bool)> {
+    let rows = block_on(unit.sql().query(
+        "SELECT id, held, status, owner_ref IS NOT NULL, secret_wrapped IS NOT NULL \
+         FROM unit_keys ORDER BY id",
+        &[],
+    ))
+    .unwrap();
+    rows.iter()
+        .map(|r| {
+            let text = |i: usize| match &r[i] {
+                SqlValue::Text(t) => t.clone(),
+                other => panic!("{other:?}"),
+            };
+            let int = |i: usize| match &r[i] {
+                SqlValue::Int(n) => *n,
+                other => panic!("{other:?}"),
+            };
+            (text(0), int(1), text(2), int(3) == 1, int(4) == 1)
+        })
+        .collect()
+}
+
+/// The feed's items, applied by a real unit through the unit client's
+/// `sync`: every record to the head, markers and an S3 key included; with
+/// no directory every subject opens, and with a directory that has
+/// acknowledged nothing every opening is held, owners kept, secrets not
+/// sent.
+#[test]
+fn a_real_unit_syncs_to_the_head_from_the_feed() {
+    for with_directory in [false, true] {
+        let records = active_records(true);
+        key_chain_records(&records);
+        plant(&records, 6, KeyOp::Create, &s3_key("AKVL00000001"), false);
+        let mut p = ports(records, with_directory.then(directory_db));
+        let cache = RootCache::new();
+        let state_seq = {
+            let root = Root::new(&p, &cache, TestRng(3));
+            block_on(root.heads().head(&Tenant::Managed(id()), 0))
+                .unwrap()
+                .unwrap()
+                .door
+                .seq
+        };
+        let unit = born_unit(state_seq);
+        p.unit = Some(unit.clone());
+        let root = Root::new(&p, &cache, TestRng(4));
+        let client = root
+            .unit_client(&UnitName::new(unit_id(), 0), false)
+            .unwrap();
+        let synced = block_on(client.sync(Seqs {
+            state_seq,
+            keys_seq: 0,
+        }))
+        .unwrap();
+        let Synced::Synced { seqs } = synced else {
+            panic!("{synced:?}")
+        };
+        assert_eq!(seqs.keys_seq, 6, "{with_directory}");
+        let held = i64::from(with_directory);
+        assert_eq!(
+            unit_rows(&unit),
+            vec![
+                (
+                    "AKVL00000001".into(),
+                    held,
+                    "active".into(),
+                    false,
+                    !with_directory
+                ),
+                ("PR0001".into(), held, "disabled".into(), true, false),
+                ("PR0002".into(), held, "active".into(), true, false),
+            ],
+            "{with_directory}"
+        );
+    }
 }
