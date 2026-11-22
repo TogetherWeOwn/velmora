@@ -29,11 +29,12 @@
 //!    tool runs `restore_prepare` again.
 //! 5. (AM-46) both calls are refused while an import exists that no
 //!    `move` report has lifted (`move_not_lifted`), so no undo bookmark
-//!    is taken once a move's first batch landed (the span between the
-//!    move's close and its first batch is an open design question);
-//!    `restore` refuses a time target
-//!    before the move's lift (`before_move_lift`) or before the unit's
-//!    birth (`before_birth`), each with [`LIFT_SLACK_MS`].
+//!    is taken once a move's first batch landed (in the span between the
+//!    move's close and its first batch the unit cannot tell the move's
+//!    entry from a restore's); `restore` refuses a time target before the
+//!    move floor, the later of the unit's own lift and the `floor_ms` the
+//!    tenant chain keeps for it (AM-67; `before_move_lift`), or before
+//!    the unit's birth (`before_birth`), each with [`LIFT_SLACK_MS`].
 //!
 //! Checks 1 to 3 run in the unit's own code over its tables
 //! ([`Unit::pitr_step`](super::object::Unit::pitr_step)); check 4 and the
