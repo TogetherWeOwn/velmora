@@ -151,6 +151,9 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
         // A cache miss, counted as it happens: see `velmora_bridge::metrics`.
         metrics::write(&velmora_bridge::metrics::cold_read_point());
     });
+    // Alerts the library raises during a request (a managed tenant's
+    // unit pages after its request was finished, among them).
+    velmora_bridge::trace::log_alerts(|line| console_error!("alert: {line}"));
     metrics::bind(&env);
     if let Ok(bridge) = env::bridge(&env) {
         log_budget(&bridge);

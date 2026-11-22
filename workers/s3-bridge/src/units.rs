@@ -436,19 +436,24 @@ pub async fn serve_on_unit(
     let first = finished.renew;
     let after: crate::After = Box::pin(async move {
         let port = bridge.catalog.client().port();
-        let Some((unit, seqs)) = managed::PortState::renew_due(port).or(first) else {
-            return;
-        };
+        let mut due = managed::PortState::renew_due(port);
+        for (unit, seqs) in first {
+            if !due.iter().any(|(u, _)| u == &unit) {
+                due.push((unit, seqs));
+            }
+        }
         let (ports, cache) = (Rc::clone(port.ports()), Rc::clone(port.cache()));
-        let pages = velmora_bridge::root::request::renew_in_background(
-            &*ports, &cache, SystemRng, &unit, seqs,
-        )
-        .await;
-        for page in pages.iter().flatten() {
-            worker::console_error!(
-                "alert: unit request ({})",
-                velmora_bridge::unit_consumer::page_code(page)
-            );
+        for (unit, seqs) in due {
+            let pages = velmora_bridge::root::request::renew_in_background(
+                &*ports, &cache, SystemRng, &unit, seqs,
+            )
+            .await;
+            for page in pages.iter().flatten() {
+                worker::console_error!(
+                    "alert: unit request ({})",
+                    velmora_bridge::unit_consumer::page_code(page)
+                );
+            }
         }
     });
     (finished.resp, Some(after))

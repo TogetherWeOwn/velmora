@@ -183,9 +183,9 @@ pub trait PortState: UnitPort {
     /// calls after this (a streamed body's reads, a deferred delete's
     /// work) are logged by the port itself as alerts.
     fn take_pages(&self) -> Vec<Page>;
-    /// A call's answer asked for a background renewal (rule 12): the unit
-    /// and the numbers it answered.
-    fn renew_due(&self) -> Option<(UnitName, Seqs)>;
+    /// The calls' answers that asked for a background renewal (rule 12):
+    /// each unit once, with the numbers it answered last.
+    fn renew_due(&self) -> Vec<(UnitName, Seqs)>;
 }
 
 /// What became of a managed tenant's request.
@@ -193,8 +193,8 @@ pub struct Finished {
     pub resp: S3Response,
     /// The first is the request's; the others are pages and alerts.
     pub lines: Vec<ManagedLine>,
-    /// Renew this unit in the background, from these numbers (rule 12).
-    pub renew: Option<(UnitName, Seqs)>,
+    /// Renew these units in the background, from these numbers (rule 12).
+    pub renew: Vec<(UnitName, Seqs)>,
 }
 
 /// The steps after `Bridge::handle` (see the [module](self)). `unit`'s

@@ -62,8 +62,8 @@ pub struct RequestPort<P: UnitPorts, R> {
     pages: RefCell<Vec<Page>>,
     /// The pages were taken (`finish`): later ones are logged at once.
     drained: Cell<bool>,
-    /// A renewal an answer asked for: the unit and its numbers.
-    renew: RefCell<Option<(UnitName, Seqs)>>,
+    /// The renewals answers asked for: per unit, its latest numbers.
+    renew: RefCell<Vec<(UnitName, Seqs)>>,
 }
 
 impl<P: UnitPorts, R: FillRandom> RequestPort<P, R> {
@@ -82,7 +82,10 @@ impl<P: UnitPorts, R: FillRandom> RequestPort<P, R> {
         routed: std::result::Result<Routed, RouteRefusal>,
         verified: Rc<Cell<bool>>,
     ) -> Self {
-        let renew = root_renew.map(|seqs| (root.unit.clone(), seqs));
+        let renew = root_renew
+            .map(|seqs| (root.unit.clone(), seqs))
+            .into_iter()
+            .collect();
         RequestPort {
             ports,
             cache,
@@ -188,7 +191,9 @@ impl<P: UnitPorts, R: FillRandom> UnitPort for RequestPort<P, R> {
                 }
             }
             if answered.renew_due {
-                *self.renew.borrow_mut() = Some((routed.unit.clone(), *seqs));
+                let mut renew = self.renew.borrow_mut();
+                renew.retain(|(unit, _)| unit != &routed.unit);
+                renew.push((routed.unit.clone(), *seqs));
             }
         }
         Ok(answered.reply.answer)
@@ -213,7 +218,7 @@ impl<P: UnitPorts, R: FillRandom> PortState for RequestPort<P, R> {
         std::mem::take(&mut *self.pages.borrow_mut())
     }
 
-    fn renew_due(&self) -> Option<(UnitName, Seqs)> {
+    fn renew_due(&self) -> Vec<(UnitName, Seqs)> {
         self.renew.borrow().clone()
     }
 }

@@ -119,8 +119,8 @@ impl PortState for Port {
     fn take_pages(&self) -> Vec<Page> {
         std::mem::take(&mut *self.pages.borrow_mut())
     }
-    fn renew_due(&self) -> Option<(UnitName, Seqs)> {
-        None
+    fn renew_due(&self) -> Vec<(UnitName, Seqs)> {
+        Vec::new()
     }
 }
 
@@ -384,7 +384,7 @@ fn finish_answers_with_the_units_refusal_when_the_handler_failed() {
     let client = RequestClient::new(Port::default(), unit(), seqs());
     let f = block_on(finish(&client, &safety, resp(204)));
     assert_eq!((f.resp.status, f.lines[0].code), (204, "served"));
-    assert!(f.renew.is_none());
+    assert!(f.renew.is_empty());
 }
 
 #[test]

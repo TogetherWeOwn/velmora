@@ -449,6 +449,58 @@ pub(super) fn edge_header(name: &str) -> bool {
 /// has no grant on does not exist, so no key can probe for the names of
 /// buckets that are not its own. A key that holds a grant too weak for
 /// the operation (read-only, on a write) is `AccessDenied`.
+/// The request's policy, target and headers, with the refusals that name
+/// their cause. None reads anything but the request itself and the
+/// configuration. The host comes before the path is judged: on a
+/// virtual-hosted request the first segment is a key, and "not a bucket
+/// name" would name the wrong mistake.
+fn parsed(cfg: &BridgeConfig, req: &S3Request) -> Result<(Policy, Target, Headers), S3Response> {
+    let policy = policy(cfg, signed_host(cfg, req))?;
+    let target = Target::parse(&req.raw_target, &policy).map_err(s3_error);
+    let fields: Vec<(&str, &str)> = req
+        .headers
+        .iter()
+        .filter(|(n, _)| !edge_header(n))
+        .map(|(n, v)| (n.as_str(), v.as_str()))
+        .collect();
+    let headers = Headers::new(&fields, &policy).map_err(s3_error);
+    if let Ok(headers) = &headers {
+        if let Some(resp) = host_refused(headers, cfg) {
+            return Err(resp);
+        }
+    }
+    let target = target?;
+    let headers = headers?;
+    headers
+        .check_features()
+        .map_err(|refusal| header_refused(&refusal))?;
+    Ok((policy, target, headers))
+}
+
+/// A managed tenant's request checked as far as its signature and the
+/// tenant's state ([`verify_on_unit`]), with no bucket or grant read: for
+/// a call that is refused whatever the bucket (DeleteBucket over S3,
+/// AM-64). `Err` for tenant 0's catalogue, which never comes here.
+pub(super) async fn signature_on_unit<C, B, N, J, K, T>(
+    bridge: &Bridge<C, B, N, J, K, T>,
+    req: &S3Request,
+) -> Result<(), S3Response>
+where
+    C: Catalog,
+    B: BlobStore,
+    N: NntpConnector,
+    J: JobSink,
+    K: Kek,
+    T: Clock,
+{
+    let (policy, target, headers) = parsed(&bridge.cfg, req)?;
+    let akid = claimed_key(&headers, &target).unwrap_or_default();
+    match verify_on_unit(bridge, req, &policy, &target, &headers, &akid).await {
+        Some(signed) => signed.map(|_| ()),
+        None => Err(internal()),
+    }
+}
+
 pub(super) async fn authenticate<C, B, N, J, K, T>(
     bridge: &Bridge<C, B, N, J, K, T>,
     req: &S3Request,
@@ -461,30 +513,7 @@ where
     K: Kek,
     T: Clock,
 {
-    let policy = policy(&bridge.cfg, signed_host(&bridge.cfg, req))?;
-    let target = Target::parse(&req.raw_target, &policy).map_err(s3_error);
-    let fields: Vec<(&str, &str)> = req
-        .headers
-        .iter()
-        .filter(|(n, _)| !edge_header(n))
-        .map(|(n, v)| (n.as_str(), v.as_str()))
-        .collect();
-    let headers = Headers::new(&fields, &policy).map_err(s3_error);
-    // Refusals that name their cause. Neither reads anything but the
-    // request itself and the configuration. The host comes before the
-    // path is judged: on a virtual-hosted request the first segment is a
-    // key, and "not a bucket name" would name the wrong mistake.
-    if let Ok(headers) = &headers {
-        if let Some(resp) = host_refused(headers, &bridge.cfg) {
-            return Err(resp);
-        }
-    }
-    let target = target?;
-    let headers = headers?;
-    headers
-        .check_features()
-        .map_err(|refusal| header_refused(&refusal))?;
-
+    let (policy, target, headers) = parsed(&bridge.cfg, req)?;
     let mut authority = OneKey {
         akid: claimed_key(&headers, &target).unwrap_or_default(),
         principal: String::new(),

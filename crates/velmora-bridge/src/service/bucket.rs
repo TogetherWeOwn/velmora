@@ -127,32 +127,27 @@ pub(super) async fn delete_bucket_signed<
 ) -> S3Response {
     // `authenticate` verifies the signature and, for DELETE, requires a
     // read-write grant on an existing bucket.
-    let authed = match authenticate(bridge, &req).await {
-        Ok(authed) => authed,
-        // A managed tenant: every DeleteBucket over S3 is `403` once the
-        // signature verified, a bucket it holds no grant on too (AM-64).
-        Err(resp) if resp.status == 404 && bridge.catalog.request_scope().is_some() => {
-            return S3Response::error(
+    // A managed tenant: every DeleteBucket over S3 is `403` once the
+    // signature verified and the tenant's state allows the request, with
+    // no bucket or grant read (AM-64; buckets go through the management
+    // plane).
+    if bridge.catalog.request_scope().is_some() {
+        return match super::common::signature_on_unit(bridge, &req).await {
+            Ok(()) => S3Response::error(
                 403,
                 "AccessDenied",
                 "Buckets are deleted through the management plane.",
-            )
-        }
+            ),
+            Err(resp) => resp,
+        };
+    }
+    let authed = match authenticate(bridge, &req).await {
+        Ok(authed) => authed,
         Err(resp) => return resp,
     };
     let Some(bucket) = &authed.bucket else {
         return s3_error(ErrorCode::InvalidRequest);
     };
-    // A managed tenant's buckets are deleted through the management
-    // plane only (AM-57, AM-64): `403 AccessDenied`, nothing read or
-    // written past the authentication.
-    if bridge.catalog.request_scope().is_some() {
-        return S3Response::error(
-            403,
-            "AccessDenied",
-            "Buckets are deleted through the management plane.",
-        );
-    }
     match bridge.catalog.bucket_in_use(&bucket.id).await {
         Ok(true) => bucket_not_empty(),
         Ok(false) => S3Response::error(
