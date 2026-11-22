@@ -215,19 +215,23 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
     let incoming = match http::to_s3_request(req) {
         Ok(incoming) => incoming,
         Err(e) => {
-            console_log!(
-                "{}",
-                ingress::log_line(&method, "-", e.status(), &request_id)
-            );
             if by_mgmt {
                 let answer = if e.status() < 500 {
                     BAD_REQUEST
                 } else {
                     MISCONFIGURED
                 };
+                console_log!(
+                    "{}",
+                    ingress::log_line(&method, "-", answer.status, &request_id)
+                );
                 count(answer.status, bridge.cfg.metrics_sample, 0);
                 return mgmt::response(answer, &request_id);
             }
+            console_log!(
+                "{}",
+                ingress::log_line(&method, "-", e.status(), &request_id)
+            );
             count(e.status(), bridge.cfg.metrics_sample, 0);
             return Ok(early(e.response()));
         }
