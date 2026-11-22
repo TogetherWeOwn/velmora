@@ -2,7 +2,10 @@
 //! bytes of each, what the reader runs, and what it refuses.
 
 use serde_json::{json, Value};
-use velmora_bridge::jobmsg::{admit, Admission, JobFormat, JobTenant, Refusal, TENANT_FIELDS};
+use velmora_bridge::jobmsg::{
+    admit, read_unit_job, Admission, JobFormat, JobTenant, Refusal, UnitJob, JOB_KINDS,
+    TENANT_FIELDS, UNIT_JOB_KINDS,
+};
 use velmora_bridge::{
     ExtentId, GenerationId, Job, OutboxStage, TenantScope, UnixMs, WriteId, JOB_VERSION,
 };
@@ -286,7 +289,17 @@ fn invalid_tenant_messages_are_refused() {
     );
     assert_refused(&with(&gc, "unit", json!("a")), BadBody, "string unit");
     assert_refused(&with(&gc, "x", json!(1)), BadBody, "unknown field");
-    assert_refused(&with(&gc, "t", json!("nope")), BadBody, "unknown job type");
+    assert_refused(
+        &with(&gc, "t", json!("nope")),
+        Refusal::UnknownKind,
+        "unknown job type",
+    );
+    assert_refused(&without(&gc, "t"), Refusal::UnknownKind, "no job type");
+    assert_refused(
+        &with(&gc, "t", json!(7)),
+        Refusal::UnknownKind,
+        "numeric job type",
+    );
     assert_refused(&without(&extent, "extent"), BadBody, "missing extent");
     assert_refused(
         &with(&extent, "stage", json!("nope")),
@@ -390,4 +403,156 @@ fn the_format_switch_reports_errors_without_raw_values() {
         assert!(error.contains("JOB_FORMAT"), "{error}");
         assert!(!error.contains(raw), "{error}");
     }
+}
+
+const OTHER_TENANT: &str = "t_0123456789abcdef";
+const AT: UnixMs = UnixMs(1_800_000_000_000);
+
+fn unit_tenant() -> JobTenant {
+    JobTenant::of_unit(OTHER_TENANT, 3, u64::MAX, 9_007_199_254_740_993).unwrap()
+}
+
+/// Both unit jobs, next to the bytes they are sent as.
+fn unit_jobs() -> Vec<(UnitJob, &'static str)> {
+    vec![
+        (
+            UnitJob::Renew { at: AT },
+            r#"{"t":"renew","v":2,"at":1800000000000,"tenant":"t_0123456789abcdef","unit":3,"state_seq":18446744073709551615,"keys_seq":9007199254740993}"#,
+        ),
+        (
+            UnitJob::StampRaise { at: AT },
+            r#"{"t":"stamp_raise","v":2,"at":1800000000000,"tenant":"t_0123456789abcdef","unit":3,"state_seq":18446744073709551615,"keys_seq":9007199254740993}"#,
+        ),
+    ]
+}
+
+/// Every job kind is listed, and no unit job kind is a job kind.
+#[test]
+fn the_kind_lists_are_complete_and_apart() {
+    let tags: std::collections::BTreeSet<String> = jobs()
+        .iter()
+        .map(|(job, _, _)| parse(&job.to_json())["t"].as_str().unwrap().to_string())
+        .collect();
+    let listed: std::collections::BTreeSet<String> =
+        JOB_KINDS.iter().map(|kind| kind.to_string()).collect();
+    assert_eq!(tags, listed);
+    let unit_tags: std::collections::BTreeSet<String> = unit_jobs()
+        .iter()
+        .map(|(_, bytes)| parse(bytes)["t"].as_str().unwrap().to_string())
+        .collect();
+    let unit_listed: std::collections::BTreeSet<String> =
+        UNIT_JOB_KINDS.iter().map(|kind| kind.to_string()).collect();
+    assert_eq!(unit_tags, unit_listed);
+    assert!(listed.is_disjoint(&unit_listed));
+}
+
+/// A unit job is sent in format 2 with its tenant and unit, and reads back as itself.
+#[test]
+fn unit_jobs_match_the_expected_bytes_and_read_back() {
+    let tenant = unit_tenant();
+    for (job, expected) in unit_jobs() {
+        let text = job.message(&tenant).unwrap();
+        assert_eq!(text, expected, "{job:?}");
+        assert_eq!(read_unit_job(&parse(&text)), Ok((job, tenant.clone())));
+    }
+}
+
+/// Only a unit of a tenant other than tenant 0 can name a unit job.
+#[test]
+fn unit_job_tenants_name_a_unit_of_another_tenant() {
+    let zero = TenantScope::tenant_zero();
+    assert_eq!(JobTenant::of_unit(zero.tenant_id(), 0, 0, 0), None);
+    for bad in ["", "x", "t_", "t_ABC", "t_0123/../x"] {
+        assert_eq!(JobTenant::of_unit(bad, 0, 0, 0), None, "{bad}");
+    }
+    let tenant = unit_tenant();
+    assert_eq!(tenant.tenant(), OTHER_TENANT);
+    assert_eq!(tenant.unit(), Some(3));
+    // Tenant 0's fields name no unit, so no unit job can be written for them.
+    let zero = JobTenant::of(&zero);
+    for (job, _) in unit_jobs() {
+        assert_eq!(job.message(&zero), None, "{job:?}");
+    }
+}
+
+/// This Worker serves no unit: every unit job is refused, with the reason the reader gives.
+#[test]
+fn unit_jobs_are_refused_by_a_worker_that_serves_no_unit() {
+    let zero = TenantScope::tenant_zero();
+    for (job, bytes) in unit_jobs() {
+        let body = parse(bytes);
+        assert_refused(&body, Refusal::OtherTenant, "a unit of another tenant");
+        let mut zero_unit = body.clone();
+        zero_unit["tenant"] = json!(zero.tenant_id());
+        assert_refused(&zero_unit, Refusal::UnitOfTenantZero, "a unit of tenant 0");
+        let mut zero_none = zero_unit.clone();
+        zero_none.as_object_mut().unwrap().remove("unit");
+        assert_refused(&zero_none, Refusal::NoUnit, "tenant 0 names no unit");
+        let mut zero_extra = zero_none.clone();
+        zero_extra["extent"] = json!(extent().as_str());
+        assert_refused(&zero_extra, Refusal::BadBody, "a field of no unit job");
+        let mut zero_no_at = zero_none.clone();
+        zero_no_at.as_object_mut().unwrap().remove("at");
+        assert_refused(&zero_no_at, Refusal::BadBody, "no time");
+        // A unit job has no format 1: it is malformed there, as before.
+        let mut plain = body.clone();
+        plain["v"] = json!(1);
+        assert_eq!(admit(&plain), Admission::Malformed, "{job:?}");
+        for name in TENANT_FIELDS {
+            plain.as_object_mut().unwrap().remove(name);
+        }
+        assert_eq!(admit(&plain), Admission::Malformed, "{job:?}");
+    }
+}
+
+/// The unit job reader refuses each field it cannot take, with its reason.
+#[test]
+fn the_unit_job_reader_refuses_what_is_not_a_unit_job() {
+    let (_, bytes) = unit_jobs().remove(0);
+    let body = parse(bytes);
+    let with = |name: &str, value: Value| {
+        let mut body = body.clone();
+        body[name] = value;
+        body
+    };
+    let without = |name: &str| {
+        let mut body = body.clone();
+        body.as_object_mut().unwrap().remove(name);
+        body
+    };
+    assert_eq!(read_unit_job(&without("unit")), Err(Refusal::NoUnit));
+    assert_eq!(read_unit_job(&without("tenant")), Err(Refusal::NoTenant));
+    assert_eq!(
+        read_unit_job(&with("tenant", json!("x"))),
+        Err(Refusal::BadTenant)
+    );
+    assert_eq!(
+        read_unit_job(&with("tenant", json!(1))),
+        Err(Refusal::BadTenant)
+    );
+    assert_eq!(
+        read_unit_job(&with("unit", json!(-1))),
+        Err(Refusal::BadBody)
+    );
+    assert_eq!(read_unit_job(&without("keys_seq")), Err(Refusal::BadBody));
+    assert_eq!(
+        read_unit_job(&with("at", json!("1"))),
+        Err(Refusal::BadBody)
+    );
+    assert_eq!(
+        read_unit_job(&with("cursor", json!("x"))),
+        Err(Refusal::BadBody)
+    );
+    assert_eq!(read_unit_job(&with("v", json!(1))), Err(Refusal::BadBody));
+    assert_eq!(
+        read_unit_job(&with("t", json!("gc"))),
+        Err(Refusal::UnknownKind)
+    );
+    assert_eq!(read_unit_job(&without("t")), Err(Refusal::UnknownKind));
+    assert_eq!(read_unit_job(&json!([2])), Err(Refusal::BadBody));
+    // A job of a tenant's own kind is not a unit job.
+    assert_eq!(
+        read_unit_job(&tenant_body(&gc())),
+        Err(Refusal::UnknownKind)
+    );
 }
