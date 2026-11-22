@@ -378,6 +378,7 @@ impl UnitImport for Adapter<'_> {
         Ok(Some(ImportState {
             t0_seq,
             sealed: body["sealed"].as_u64(),
+            lifted_at: body["lifted_at"].as_i64().map(velmora_bridge::UnixMs),
             tables,
         }))
     }

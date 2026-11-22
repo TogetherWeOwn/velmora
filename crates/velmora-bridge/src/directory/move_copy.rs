@@ -144,6 +144,10 @@ pub struct ImportState {
     pub t0_seq: Option<u64>,
     /// The `move_ordinal` of the seal, if the import is sealed.
     pub sealed: Option<u64>,
+    /// When the move's lift landed in the unit (`ImportProgress.lifted_at`,
+    /// the unit's clock), once `move_lifted`. `None`: not lifted, or the
+    /// unit did not say.
+    pub lifted_at: Option<UnixMs>,
     pub tables: Vec<ImportCount>,
 }
 
