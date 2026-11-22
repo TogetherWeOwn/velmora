@@ -1216,3 +1216,47 @@ fn a_stored_wrap_that_does_not_open_is_refused() {
         );
     }
 }
+
+/// A resumed move whose key was revoked since the frozen row was taken
+/// stops in the plan, before any write.
+#[tokio::test(flavor = "current_thread")]
+async fn a_key_revoked_since_the_freeze_stops_the_resumed_move_before_any_write() {
+    let mut fixture = FrozenKeys::new().await;
+    let tenant = fixture.ring.0.tenant().clone();
+    let all = std::mem::take(&mut fixture.keys);
+    fixture.keys = vec![all[0].clone()];
+    fixture.write(PRINCIPAL).await.unwrap();
+    // AKVL0001 is revoked in the chain; the frozen row says active.
+    let read = read_key_chain(&fixture.store, &fixture.kek, &fixture.ring, &tenant)
+        .await
+        .unwrap();
+    let entry = read.table.get("AKVL0001").unwrap();
+    let mut door = entry.door.clone();
+    door.status = SubjectStatus::Revoked;
+    let seq = read.table.seq() + 1;
+    let revoked = seal_key_record(
+        &fixture.kek,
+        &fixture.ring,
+        &tenant,
+        seq,
+        KeyOp::Status,
+        AT,
+        &door,
+        entry.private.as_ref(),
+        true,
+        &mut fixture.rng,
+    )
+    .unwrap();
+    key_chain(&tenant)
+        .put(&fixture.store, seq, revoked)
+        .await
+        .unwrap();
+    // B is listed before A: nothing of B may be written.
+    fixture.keys = vec![all[1].clone(), all[0].clone()];
+    let puts = fixture.store.puts();
+    assert_invalid(
+        fixture.write(PRINCIPAL).await.unwrap_err(),
+        "the target holds something else under this name",
+    );
+    assert_eq!(fixture.store.puts(), puts);
+}

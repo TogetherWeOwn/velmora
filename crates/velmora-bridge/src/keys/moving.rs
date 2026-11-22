@@ -497,7 +497,12 @@ where
         if let Some(entry) = table.get(&key.access_key_id) {
             // A resumed run: the key must be the one this run would write.
             let private = entry.private.as_ref().ok_or(ERR_MOVE_DIFFERS)?;
-            let same = entry.door.kind == key.kind
+            // A key revoked since the frozen row was taken is not the
+            // frozen key; a revoked frozen key may already be revoked.
+            let revoked_since =
+                entry.door.status == SubjectStatus::Revoked && key.status != SubjectStatus::Revoked;
+            let same = !revoked_since
+                && entry.door.kind == key.kind
                 && entry.door.made_by.as_deref() == Some(principal)
                 && entry.door.created_at == key.created_at
                 && private.owner_ref.as_deref() == Some(owner_ref)
