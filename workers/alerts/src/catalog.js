@@ -48,6 +48,9 @@ export async function newestExport(bucket, now, prefix = EXPORT_PREFIX) {
       const m = /^(\d{13})\.(?:manifest\.json|sql)$/.exec(o.key.slice(prefix.length));
       if (m) newest = Math.max(newest ?? 0, Number(m[1]));
     }
+    // "More to come" with no cursor is an error, never the end: a
+    // listing that stopped there could miss the newest export.
+    if (page.truncated && !page.cursor) throw new Error("list: more to come and no cursor");
     cursor = page.truncated ? page.cursor : undefined;
   } while (cursor);
   return newest;

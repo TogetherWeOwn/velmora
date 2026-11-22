@@ -135,6 +135,11 @@ test("newest export reads only manifests of the last three days", async () => {
   assert.equal(await newestExport(new FakeBucket([]), T0), null);
 });
 
+test("an export listing that says more with no cursor is an error", async () => {
+  const torn = { list: async () => ({ objects: [], truncated: true }) };
+  await assert.rejects(newestExport(torn, T0), /more to come and no cursor/);
+});
+
 // ---- store.js ----
 
 test("one email per key per hour, then backing off while it holds", async () => {
