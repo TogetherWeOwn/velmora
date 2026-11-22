@@ -1233,6 +1233,12 @@
         },
         null,
         {
+          "not_open": {
+            "keys_seq": 3,
+            "rid": "44444444444444444444444444444444"
+          }
+        },
+        {
           "exists": {
             "grants": [],
             "held": false,

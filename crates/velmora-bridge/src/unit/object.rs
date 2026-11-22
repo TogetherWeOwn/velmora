@@ -1120,7 +1120,7 @@ impl<S: UnitSql> Unit<S> {
                     (Admit::Refused(r) | Admit::RefusedDrop(r, _), None) => {
                         Err(Refused::Reserve(r))
                     }
-                    (Admit::NotOpen, None) => Err(Refused::AccountProblem),
+                    (Admit::NotOpen { .. }, None) => Err(Refused::AccountProblem),
                     (_, None) => Err(Refused::Reserve(reserve::ReserveRefusal::Malformed)),
                 })
             };

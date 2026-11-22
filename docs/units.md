@@ -182,7 +182,7 @@ change. In one transaction the unit:
    active S3 keys and 20 app passwords (open reservations count). Then
    the row is kept `reserved`, and its cap slot (`unit_cap_uses`) is
    kept for the cap's window whatever becomes of the row; only an
-   explicit release gives it back.
+   explicit release and a cancel (below) give it back.
 
 The answer carries the unit's `keys_seq`: the call's record is exactly
 `keys_seq + 1` and carries the `rid` in its door part. On an answer with
@@ -195,7 +195,9 @@ JSON object of at most 16 KiB with no `secret_access_key`, or none is
 kept and the Worker builds the answer from the chain). A record that
 closes or narrows a principal (any status but `active`, or a grant it
 held that no grant of the record covers) cancels that principal's
-other open reservations that are not bound to a creator grant. Each
+other open reservations that are not bound to a creator grant, and
+gives their cap slots back (a held principal record counts as a
+narrowing: it may come without its private grant parts). Each
 entry's reservation turns `applied` before a later entry of the same
 call is applied. A bucket reservation is bound to its creator
 grant's seq (`bind_bucket`, a compare-and-set; `release_bound`); the
@@ -211,9 +213,14 @@ as a new ask. `release` drops a `reserved` row. Each ask sweeps first: a
 apply. `resolve_acting` reads the acting principal of `objects.list` and
 `objects.presign` (refused unless active and not held) and writes
 nothing. The reservation calls run on an open unit, `authenticated`; an
-ask runs in every tenant state but a shred, and in a hold or a deletion
+ask runs in every tenant state but a shred. In a hold or a deletion it
 answers only what keeps no reservation (a narrowing, a reused key, a
-kept answer; else `403`); the others run in any state.
+kept answer, a bound bucket reservation); a re-ask of its own open row
+answers `not_open` with the `rid` and `keys_seq` (the Worker reads the
+chain for a record of it first, then refuses), and a new ask is refused
+as `account_problem`. The Worker answers the contract's code for the
+tenant's state (`409 tenant_read_only` or `409 tenant_unavailable`),
+never `403`. The other reservation calls run in any state.
 
 ## Key scheme
 

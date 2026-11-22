@@ -61,7 +61,9 @@ CREATE INDEX unit_reservations_by_scope ON unit_reservations(scope, state);
 -- The cap slots taken (ADR §6.3): one per new reservation, kept for the
 -- cap's window (an hour, a day for a bucket create) whatever becomes of
 -- the reservation, so a reservation swept unapplied still counts. Only an
--- explicit release (the call ended with no record) gives the slot back.
+-- explicit release (the call ended with no record) and a cancel (a record
+-- that narrows or closes the acting principal: the call can never apply)
+-- give the slot back.
 CREATE TABLE unit_cap_uses (
   rid    BLOB PRIMARY KEY CHECK (typeof(rid) = 'blob' AND length(rid) = 16),
   class  TEXT NOT NULL CHECK (class IN ('s3', 'app_password', 'principal', 'grants', 'bucket')),

@@ -1116,19 +1116,19 @@ fn a_narrowing_and_a_kept_answer_are_answered_in_a_held_tenant_and_a_new_ask_is_
         );
         assert!(ok(worker(&u, narrow))["narrowing"].is_object());
         assert!(ok(worker(&u, create.clone()))["applied"].is_object());
-        // A new ask, and the re-ask of an open one, keep a reservation.
-        for op in [
-            reserve_op(4, 4, 4, by_owner(), new_key("AK4", vec![])),
-            open_ask.clone(),
-        ] {
-            assert_eq!(
-                worker(&u, op),
-                UnitAnswer::Refused {
-                    reason: Refused::AccountProblem,
-                    alarm: false,
-                }
-            );
-        }
+        // A new ask is refused; the re-ask of an open one is refused with
+        // its rid, so the Worker can look for its record first.
+        assert_eq!(
+            worker(&u, reserve_op(4, 4, 4, by_owner(), new_key("AK4", vec![]))),
+            UnitAnswer::Refused {
+                reason: Refused::AccountProblem,
+                alarm: false,
+            }
+        );
+        assert_eq!(
+            ok(worker(&u, open_ask.clone())),
+            json!({ "not_open": { "rid": rid(2).hex(), "keys_seq": 3 } })
+        );
         assert_eq!(state_of(&u, 2).as_deref(), Some("reserved"));
     }
     assert!(matches!(
@@ -1391,6 +1391,89 @@ fn a_bound_bucket_reservation_outlives_a_narrowing_of_its_creator() {
             json!("open")
         );
     }
+}
+
+#[test]
+fn a_bound_bucket_reservation_is_answered_in_a_held_tenant() {
+    let u = ready();
+    ok(worker(&u, bucket(1, 1, "beta")));
+    ok(worker(
+        &u,
+        UnitOp::BindBucket {
+            rid: rid(1),
+            expected: None,
+            grant_seq: 4,
+        },
+    ));
+    assert!(matches!(
+        sync(&u, TenantState::Suspended, None),
+        UnitAnswer::Ok { .. }
+    ));
+    assert_eq!(
+        ok(worker(&u, bucket(1, 1, "beta")))["admitted"]["bound"],
+        json!(4)
+    );
+}
+
+#[test]
+fn a_cancelled_reservation_gives_its_cap_slot_back() {
+    let u = ready();
+    let n = 15u8;
+    for i in 0..n {
+        ok(worker(
+            &u,
+            reserve_op(i, i, i, by_owner(), new_key(&format!("AK{i}"), vec![])),
+        ));
+    }
+    apply(
+        &u,
+        vec![principal_entry(
+            P,
+            OWNER,
+            2,
+            SubjectStatus::Active,
+            false,
+            vec![grant(B1, Access::Ro)],
+        )],
+        vec![],
+    );
+    // The 15 calls ask again as new asks: they fit the hourly cap with a
+    // 16th, as no slot of a cancelled call is left.
+    for i in 0..=n {
+        let a = worker(
+            &u,
+            reserve_op(
+                100 + i,
+                100 + i,
+                100 + i,
+                by_owner(),
+                new_key(&format!("AKN{i}"), vec![]),
+            ),
+        );
+        assert!(matches!(a, UnitAnswer::Ok { .. }), "{i}: {a:?}");
+    }
+}
+
+#[test]
+fn a_held_principal_record_cancels_its_open_reservations() {
+    let u = ready();
+    ok(worker(
+        &u,
+        reserve_op(1, 1, 1, by_owner(), new_key("AK1", vec![])),
+    ));
+    apply(
+        &u,
+        vec![principal_entry(
+            P,
+            OWNER,
+            2,
+            SubjectStatus::Active,
+            true,
+            vec![grant(B1, Access::Rw), grant(B2, Access::Ro)],
+        )],
+        vec![],
+    );
+    assert_eq!(state_of(&u, 1), None);
 }
 
 #[test]

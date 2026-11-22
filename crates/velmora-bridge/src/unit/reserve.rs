@@ -350,9 +350,15 @@ pub enum Admit {
     Narrowing {
         keys_seq: u64,
     },
-    /// The tenant's state refuses an opening ask (`403`): a hold or a
-    /// deletion refuses opening writes only. Nothing is kept.
-    NotOpen,
+    /// The tenant's state refuses an opening ask: a hold or a deletion
+    /// refuses opening writes only, and nothing is kept. `open`: the ask
+    /// found its own `reserved` row (its `rid`, the unit's `keys_seq`), so
+    /// a record of it may exist; answered as a body (`not_open`), else as
+    /// the refusal `account_problem`. The Worker picks the contract code
+    /// (`tenant_read_only`, `tenant_unavailable`) from the tenant's state.
+    NotOpen {
+        open: Option<(Rid, u64)>,
+    },
     /// A principal that is not revoked already holds the `owner_ref`
     /// (AM-36): `200` with it when the grant sets are equal, else
     /// `409 principal_exists`, decided by the Worker.
@@ -393,7 +399,12 @@ impl Admit {
             Admit::Reused => json!({ "reused": true }),
             Admit::Narrowing { keys_seq } => json!({ "narrowing": { "keys_seq": keys_seq } }),
             Admit::Exists(p) => json!({ "exists": p }),
-            Admit::Refused(_) | Admit::RefusedDrop(..) | Admit::NotOpen => return None,
+            Admit::NotOpen {
+                open: Some((rid, keys_seq)),
+            } => json!({ "not_open": { "rid": rid.hex(), "keys_seq": keys_seq } }),
+            Admit::Refused(_) | Admit::RefusedDrop(..) | Admit::NotOpen { open: None } => {
+                return None
+            }
         })
     }
 }
@@ -796,11 +807,9 @@ pub fn admit<S: Sql>(
                 grant_seq: row.bound,
             });
         }
-        if !may_open {
-            return Ok(Admit::NotOpen);
-        }
         // A bound bucket reservation is answered so whatever its creator
-        // is now: its creator grant was recorded first (`bind_bucket`).
+        // is now, and in a held tenant too: its creator grant was
+        // recorded first (`bind_bucket`), and it takes nothing new.
         if row.bound.is_some() {
             return Ok(Admit::Admitted {
                 rid: row.rid,
@@ -810,6 +819,14 @@ pub fn admit<S: Sql>(
                 bound: row.bound,
                 subject: None,
                 unit: row.unit,
+            });
+        }
+        // Held open in a held tenant: refused, but with its `rid`, so the
+        // Worker can read the chain above `keys_seq` for a record of it
+        // (`409 idempotency_key_in_use`) before it answers the refusal.
+        if !may_open {
+            return Ok(Admit::NotOpen {
+                open: Some((row.rid, keys_seq)),
             });
         }
         // Asked again: checked again at the head (§2.5 step 0, SEC-2),
@@ -861,7 +878,7 @@ pub fn admit<S: Sql>(
         }
     }
     if !may_open {
-        return Ok(Admit::NotOpen);
+        return Ok(Admit::NotOpen { open: None });
     }
     if let Some(p) = &acting {
         if let Err(r) = open(p) {
@@ -1326,6 +1343,14 @@ pub fn keep_answer<S: Sql>(sql: &S, rid: &Rid, status: u16, body: &str) -> Resul
 /// (§2.5: a record that revokes, disables or narrows a principal), but
 /// the one whose record this is.
 pub fn cancel_open<S: Sql>(sql: &S, principal: &str, except: Option<&Rid>) -> Result<u64> {
+    poll_once(sql.exec(
+        "DELETE FROM unit_cap_uses WHERE rid IN (SELECT rid FROM unit_reservations \
+          WHERE scope = ?1 AND state = 'reserved' AND bound IS NULL AND rid IS NOT ?2)",
+        &[
+            SqlValue::Text(principal.into()),
+            except.map_or(SqlValue::Null, |r| SqlValue::Blob(r.0.to_vec())),
+        ],
+    ))??;
     poll_once(sql.exec(
         "DELETE FROM unit_reservations \
           WHERE scope = ?1 AND state = 'reserved' AND bound IS NULL AND rid IS NOT ?2",

@@ -378,7 +378,10 @@ pub fn apply<S: Sql>(
         if e.kind == KeyKind::Principal {
             if let Some(r) = &row {
                 let before = grants_of(sql, &e.id)?;
-                let kept = e.status == SubjectStatus::Active
+                // A held record may come without its private grant parts:
+                // it never counts as keeping a limited grant.
+                let kept = !e.held
+                    && e.status == SubjectStatus::Active
                     && r.status == SubjectStatus::Active
                     && before
                         .iter()
