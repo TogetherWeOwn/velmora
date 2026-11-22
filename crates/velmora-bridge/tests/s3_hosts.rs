@@ -302,3 +302,146 @@ async fn customer_host_is_refused_when_no_extras_are_configured() {
         .await;
     assert_host_refused(&resp, "does not name this endpoint");
 }
+
+/// Other spellings of the customer host that name the same host: with a
+/// port, in another case, with the root's trailing dot.
+const CUSTOMER_SPELLINGS: [&str; 6] = [
+    "s3.customer.test:443",
+    "s3.customer.test:80",
+    "S3.Customer.TEST",
+    "S3.CUSTOMER.TEST:443",
+    "s3.customer.test.",
+    "s3.customer.test.:443",
+];
+
+/// `Host` values that are not a host name with an optional port. While
+/// a customer host is configured, each is taken as that host.
+const MALFORMED_HOSTS: [&str; 14] = [
+    "s3.customer.test:abc",
+    "s3.customer.test:",
+    "s3.customer.test:0",
+    "s3.customer.test:65536",
+    "s3.customer.test:+443",
+    "s3.customer.test:44 3",
+    "s3.customer.test:443:443",
+    "",
+    ":443",
+    "[::1]",
+    "[::1]:443",
+    "s3.customer.test..",
+    ".s3.customer.test",
+    "s3.customer.test, s3.test",
+];
+
+/// A bearer request with `host` (none when `None`).
+async fn bearer_call_opt(rig: &Rig, method: Method, target: &str, host: Option<&str>) -> Resp {
+    let mut headers = vec![("authorization".to_string(), format!("Bearer {TOKEN}"))];
+    if let Some(host) = host {
+        headers.push(("host".to_string(), host.to_string()));
+    }
+    rig.send(Req {
+        method,
+        target: target.to_string(),
+        headers,
+        body: Vec::new(),
+    })
+    .await
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn admin_routes_are_hidden_on_every_spelling_of_the_customer_host() {
+    let rig = two_hosts();
+    for host in CUSTOMER_SPELLINGS.iter().chain(MALFORMED_HOSTS.iter()) {
+        let resp = bearer_call(&rig, Method::Get, "/_admin/status", host).await;
+        assert_eq!(
+            (resp.status, resp.code().as_str()),
+            (404, "NotFound"),
+            "Host {host:?}: {}",
+            resp.text()
+        );
+    }
+    bearer_call_opt(&rig, Method::Get, "/_admin/status", None)
+        .await
+        .expect_error(404, "NotFound");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn admin_routes_still_answer_on_every_spelling_of_the_legacy_host() {
+    let rig = two_hosts();
+    for host in [
+        "s3.test",
+        "s3.test:443",
+        "s3.test:80",
+        "S3.TEST",
+        "s3.test.",
+    ] {
+        let resp = bearer_call(&rig, Method::Get, "/_admin/status", host).await;
+        assert_eq!(resp.status, 200, "Host {host:?}: {}", resp.text());
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn bearer_bucket_calls_are_refused_on_every_spelling_of_the_customer_host() {
+    let rig = two_hosts();
+    rig.bucket(BUCKET, true).await;
+    for host in CUSTOMER_SPELLINGS.iter().chain(MALFORMED_HOSTS.iter()) {
+        let created = bearer_call(&rig, Method::Put, "/newbucket", host).await;
+        assert_eq!(
+            (created.status, created.code().as_str()),
+            (403, "AccessDenied"),
+            "CreateBucket, Host {host:?}: {}",
+            created.text()
+        );
+        let deleted = bearer_call(&rig, Method::Delete, "/bkt-hosts", host).await;
+        assert_eq!(
+            (deleted.status, deleted.code().as_str()),
+            (403, "AccessDenied"),
+            "DeleteBucket, Host {host:?}: {}",
+            deleted.text()
+        );
+    }
+    for method in [Method::Put, Method::Delete] {
+        let target = if method == Method::Put {
+            "/newbucket"
+        } else {
+            "/bkt-hosts"
+        };
+        bearer_call_opt(&rig, method, target, None)
+            .await
+            .expect_error(403, "AccessDenied");
+    }
+    let catalog = &rig.bridge.catalog;
+    assert!(catalog.bucket_by_name("newbucket").await.unwrap().is_none());
+    assert!(catalog.bucket_by_name(BUCKET).await.unwrap().is_some());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn without_a_customer_host_an_odd_host_changes_no_admin_answer() {
+    let mut cfg = config(Vec::new());
+    cfg.admin_token = Secret::new(TOKEN.to_string());
+    let rig = rig_with(NoNntp, cfg);
+    for host in ["s3.test:abc", "", "[::1]:443"] {
+        let resp = bearer_call(&rig, Method::Get, "/_admin/status", host).await;
+        assert_eq!(resp.status, 200, "Host {host:?}: {}", resp.text());
+    }
+}
+
+#[test]
+fn host_name_strips_a_port_and_case_and_refuses_the_malformed() {
+    use velmora_bridge::ingress::host_name;
+    for (host, name) in [
+        ("s3.customer.test", "s3.customer.test"),
+        ("s3.customer.test:443", "s3.customer.test"),
+        ("S3.Customer.TEST:80", "s3.customer.test"),
+        ("s3.customer.test.", "s3.customer.test"),
+        ("s3.customer.test.:8443", "s3.customer.test"),
+        ("127.0.0.1:8787", "127.0.0.1"),
+        ("s3.test:65535", "s3.test"),
+        ("s3.test:00443", "s3.test"),
+    ] {
+        assert_eq!(host_name(host).as_deref(), Some(name), "{host:?}");
+    }
+    for host in MALFORMED_HOSTS {
+        assert_eq!(host_name(host), None, "{host:?}");
+    }
+}

@@ -3177,7 +3177,21 @@ async fn admin_answers_only_on_its_host_when_one_is_set() {
     );
     // Its own host: the token decides.
     assert_eq!(send(Some("admin.internal"), Some(auth.clone())).await, 200);
-    assert_eq!(send(Some("ADMIN.internal:443"), Some(auth)).await, 200);
+    assert_eq!(
+        send(Some("ADMIN.internal:443"), Some(auth.clone())).await,
+        200
+    );
+    assert_eq!(send(Some("admin.internal."), Some(auth.clone())).await, 200);
+    // A malformed port or name is not its host.
+    for host in [
+        "admin.internal:",
+        "admin.internal:abc",
+        "admin.internal:0",
+        "[::1]:443",
+        "",
+    ] {
+        assert_eq!(send(Some(host), Some(auth.clone())).await, 404, "{host:?}");
+    }
     assert_eq!(send(Some("admin.internal"), None).await, 401);
     assert_eq!(
         send(Some("admin.internal"), Some("Bearer wrong".to_string())).await,

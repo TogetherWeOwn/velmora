@@ -368,14 +368,63 @@ fn header<'a>(req: &'a S3Request, name: &str) -> Option<&'a str> {
         .map(|(_, v)| v.as_str())
 }
 
-/// Whether the request's `Host` is an S3 host of class
+/// The host name a `Host` value names, for a check of which host a
+/// request is on: lowercase, without a port and without the root's
+/// trailing dot (`S3.Example.:443` is `s3.example`). `None` when the value
+/// is not a host name with an optional port: empty, an empty label, a
+/// bracketed IPv6 literal (no configured host can be one), a port that is
+/// not a number from 1 to 65535, or any byte but ASCII letters, digits,
+/// `.` and `-`. A check that classifies a request by its host takes
+/// `None` as the most restricted host.
+pub fn host_name(host: &str) -> Option<String> {
+    let name = match host.rsplit_once(':') {
+        None => host,
+        Some((name, port)) => {
+            let numeric = !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit());
+            if !numeric || port.parse::<u16>().map_or(true, |p| p == 0) {
+                return None;
+            }
+            name
+        }
+    };
+    let name = name.strip_suffix('.').unwrap_or(name);
+    let fits = (1..=253).contains(&name.len())
+        && name.split('.').all(|label| !label.is_empty())
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-');
+    fits.then(|| name.to_ascii_lowercase())
+}
+
+/// Whether the request is on an S3 host of class
 /// [`HostClass::Customer`](crate::config::HostClass::Customer). No admin
 /// route (`/_admin`, and the bearer-token CreateBucket and DeleteBucket)
 /// answers there: a customer host serves the S3 API and nothing else.
+///
+/// The host is compared by name ([`host_name`]): a port, the case and a
+/// trailing dot do not make it another host, since the edge routes by
+/// name. While a customer host is configured, a request whose `Host` is
+/// missing or is not a host name with an optional port counts as on it,
+/// and so does one on another host of the same name (a legacy host that
+/// differs from a customer host by its port alone). With no customer
+/// host configured, this is never true.
 pub fn on_customer_host(req: &S3Request, cfg: &BridgeConfig) -> bool {
-    header(req, "host")
-        .and_then(|host| cfg.s3_host_for(host))
-        .is_some_and(|(_, class)| class == crate::config::HostClass::Customer)
+    let mut customers = cfg
+        .s3_hosts
+        .iter()
+        .filter(|h| h.class == crate::config::HostClass::Customer)
+        .peekable();
+    if customers.peek().is_none() {
+        return false;
+    }
+    let Some(name) = header(req, "host").and_then(host_name) else {
+        return true;
+    };
+    customers.any(|h| {
+        // As configured: lowercase, a name and an optional `:port`.
+        let configured = h.name.split(':').next().unwrap_or(&h.name);
+        configured.eq_ignore_ascii_case(&name)
+    })
 }
 
 /// Constant-time check of `Authorization: Bearer <token>` against the
@@ -405,8 +454,9 @@ pub const ADMIN_READ_ROUTES: [&str; 4] = [
 
 /// The whole check of an admin request, in this order:
 ///
-/// 1. With `ADMIN_HOST` set, the request must name that host; any other
-///    is answered as if the route did not exist, token or not.
+/// 1. On a customer host ([`on_customer_host`]), and with `ADMIN_HOST`
+///    set on any host but that one ([`host_name`]), the route is answered
+///    as if it did not exist, token or not.
 /// 2. `ADMIN_TOKEN` opens every route.
 /// 3. `ADMIN_READ_TOKEN`, when one is configured, opens a `GET` of
 ///    [`ADMIN_READ_ROUTES`] and nothing else.
@@ -418,16 +468,12 @@ pub fn check_admin(req: &S3Request, cfg: &BridgeConfig) -> Result<(), IngressErr
         return Err(IngressError::AdminHidden);
     }
     if let Some(only) = &cfg.admin_host {
-        let host = header(req, "host").unwrap_or("");
-        // Without a port: the name is what is configured.
-        let host = host.rsplit_once(':').map_or(host, |(name, port)| {
-            if port.bytes().all(|b| b.is_ascii_digit()) {
-                name
-            } else {
-                host
-            }
-        });
-        if !host.eq_ignore_ascii_case(only) {
+        // By name, as the edge routes: the name is what is configured.
+        // A missing or malformed `Host` is not that host.
+        let named = header(req, "host")
+            .and_then(host_name)
+            .is_some_and(|name| name.eq_ignore_ascii_case(only));
+        if !named {
             return Err(IngressError::AdminHidden);
         }
     }
