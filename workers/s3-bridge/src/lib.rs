@@ -448,6 +448,7 @@ async fn run_on_unit(
     let seqs = unit.catalog.seqs();
     let run = units::OnUnit {
         bridge: Rc::clone(&unit),
+        started: velmora_bridge::ports::Clock::now(&bridge.clock),
         scope,
         job,
     };

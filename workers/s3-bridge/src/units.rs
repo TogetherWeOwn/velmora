@@ -203,6 +203,10 @@ pub fn heads() -> NoHeads {
 /// every job (`crate::jobs::run`).
 pub struct OnUnit<'a> {
     pub bridge: std::rc::Rc<UnitBridge>,
+    /// When the delivery's first run began: every run of the delivery is
+    /// timed from it, so that all of them share one `JOB_WAIT_MS` and the
+    /// table gives a late run up inside the invocation.
+    pub started: velmora_bridge::UnixMs,
     pub scope: &'a velmora_bridge::TenantScope,
     pub job: &'a velmora_bridge::Job,
 }
@@ -210,7 +214,7 @@ pub struct OnUnit<'a> {
 impl UnitRun for OnUnit<'_> {
     async fn run(&self, seqs: Seqs) -> Ran {
         self.bridge.catalog.run_again_with(seqs);
-        let now = velmora_bridge::ports::Clock::now(&self.bridge.clock);
+        let now = self.started;
         // Set when the job itself ended: the table can also answer a
         // retry of its own for a job it gave up.
         let ended = std::rc::Rc::new(std::cell::Cell::new(false));
