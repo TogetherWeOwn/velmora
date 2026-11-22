@@ -23,6 +23,7 @@ pub struct HookedRecords {
     before_put: RefCell<Option<PutHook>>,
     fail_lists: Cell<bool>,
     lists: Cell<u64>,
+    lost_answers: Cell<u32>,
 }
 
 impl HookedRecords {
@@ -53,6 +54,12 @@ impl HookedRecords {
         *self.before_put.borrow_mut() = Some(Box::new(hook));
     }
 
+    /// The next `n` puts do what they do, then answer an error, as a put
+    /// whose answer was lost.
+    pub fn lose_answers(&self, n: u32) {
+        self.lost_answers.set(n);
+    }
+
     /// While set, every list fails.
     pub fn fail_lists(&self, fail: bool) {
         self.fail_lists.set(fail);
@@ -69,12 +76,21 @@ impl RecordStore for HookedRecords {
         if let Some(hook) = self.before_put.borrow_mut().as_mut() {
             hook(key, &mut self.objects.borrow_mut());
         }
-        let mut objects = self.objects.borrow_mut();
-        if objects.contains_key(key) {
-            return Ok(false);
+        let stored = {
+            let mut objects = self.objects.borrow_mut();
+            match objects.contains_key(key) {
+                true => false,
+                false => {
+                    objects.insert(key.to_string(), bytes);
+                    true
+                }
+            }
+        };
+        if self.lost_answers.get() > 0 {
+            self.lost_answers.set(self.lost_answers.get() - 1);
+            return Err(BridgeError::Blob("mem: answer lost".into()));
         }
-        objects.insert(key.to_string(), bytes);
-        Ok(true)
+        Ok(stored)
     }
 
     async fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {

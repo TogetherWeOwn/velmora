@@ -879,3 +879,37 @@ fn the_plain_write_refuses_a_place_of_moved_buckets() {
         assert_eq!(store.keys().len(), 4);
     });
 }
+
+/// A put that answers an error over another writer's record at its seq
+/// lost the race: the writer reads on from that seq and validates again.
+#[test]
+fn a_lost_answer_over_another_writers_record_is_a_lost_race() {
+    let store = HookedRecords::new();
+    let seal = PlainSeal::new();
+    let chain = TenantChain {
+        store: &store,
+        seal: &seal,
+    };
+    block_on(active(&chain));
+    let (name, sealed) = competitor(&store, &seal, hold(HoldMode::ReadOnly), Actor::Operator);
+    let mut planted = Some((name, sealed));
+    store.before_put(move |_key, objects| {
+        if let Some((name, sealed)) = planted.take() {
+            objects.insert(name, sealed);
+        }
+    });
+    store.lose_answers(1);
+    block_on(async {
+        let w = chain
+            .write(&t1(), &delete(1), Actor::Customer, NOW, 0)
+            .await;
+        let Ok(Written::Wrote(r)) = w else {
+            panic!("{w:?}")
+        };
+        // Written at the seq after the competitor's, on top of its hold.
+        assert_eq!(r.door.seq, 6);
+        assert!(r.door.holds.operator.is_some());
+        assert!(r.door.deletion.is_some());
+        assert_eq!(store.keys().len(), 6);
+    });
+}
