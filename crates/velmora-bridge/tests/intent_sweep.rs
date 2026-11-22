@@ -1374,6 +1374,97 @@ async fn a_sweep_job_that_stops_at_any_call_is_finished_by_the_next_tick() {
     }
 }
 
+thread_local! {
+    /// What the bridge handed to the operator's log in this test.
+    static ALERTS: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn take_alerts() -> Vec<String> {
+    ALERTS.with(|a| a.take())
+}
+
+/// A sweep job that fails is tried again, and says so in the operator's
+/// log: one line with the class of the error, and nothing that names
+/// the write. A job that ends does not log.
+#[tokio::test(flavor = "current_thread")]
+async fn a_sweep_job_that_fails_says_so_once_with_the_class_of_the_error() {
+    const LINE: &str = "intent sweep: a job failed and is tried again: class=";
+    trace::log_alerts(|line| ALERTS.with(|a| a.borrow_mut().push(line.to_string())));
+    let mut classes = BTreeSet::new();
+    for trip in [Trip::Fail, Trip::Lost] {
+        let mut n = 0;
+        loop {
+            let s = setup().await;
+            drop(s.put_stopped(|p| p.blobs == SLICES).await);
+            s.rig.trip().disarm();
+            s.rig.bridge.clock.advance_ms(DAY_MS);
+            let write = s.write();
+            let jobs = sweep_jobs(&s.rig).await;
+            assert_eq!(jobs.len(), 1);
+            take_alerts();
+
+            let job = start_job(&s.rig, jobs[0].clone());
+            let ran = run_until(&s.rig, job, n, trip).await;
+            let reached = s.rig.trip().tripped();
+            s.rig.trip().disarm();
+            let what = format!("{trip:?} at call {n}");
+            let lines = take_alerts();
+            match ran.done().expect("a failed call answers") {
+                JobOutcome::Ack => assert_eq!(lines, [""; 0], "{what}"),
+                JobOutcome::Retry { delay_secs } => {
+                    assert!(reached, "{what}");
+                    assert_eq!(delay_secs, jobs::INFRA_RETRY_SECS, "{what}");
+                    assert_eq!(lines.len(), 1, "{what}: {lines:?}");
+                    let class = lines[0].strip_prefix(LINE).expect(&what).to_string();
+                    assert!(
+                        ["catalog", "blob"].contains(&class.as_str()),
+                        "{what}: {class}"
+                    );
+                    assert!(!lines[0].contains(write.as_str()), "{what}");
+                    classes.insert(class);
+                }
+            }
+            // The next job ends the work without a line.
+            sweep_out(&s.rig).await;
+            assert!(
+                intents(&s.rig).is_empty() && orphans(&s.rig).is_empty(),
+                "{what}"
+            );
+            assert_eq!(take_alerts(), [""; 0], "{what}");
+            if !reached {
+                assert!(n >= 4, "the job made {n} calls");
+                break;
+            }
+            n += 1;
+        }
+    }
+    // A failure of the catalogue and one of the store were both seen.
+    assert_eq!(classes.into_iter().collect::<Vec<_>>(), ["blob", "catalog"]);
+
+    // With the switch off a job does nothing and says nothing.
+    let mut cfg = small_config();
+    cfg.intent_sweep = false;
+    let s = setup_with(cfg).await;
+    drop(s.put_stopped(|p| p.blobs == SLICES).await);
+    s.rig.trip().disarm();
+    s.rig.bridge.clock.advance_ms(DAY_MS);
+    take_alerts();
+    assert_eq!(s.sweep(&s.write()).await, JobOutcome::Ack);
+    assert_eq!(take_alerts(), [""; 0]);
+    // Also when the check every job makes first fails: the job is
+    // tried again like any other, and it is not a failed sweep.
+    s.rig.trip().arm(0, Trip::Fail);
+    assert_eq!(
+        s.sweep(&s.write()).await,
+        JobOutcome::Retry {
+            delay_secs: jobs::INFRA_RETRY_SECS
+        }
+    );
+    assert!(s.rig.trip().tripped());
+    s.rig.trip().disarm();
+    assert_eq!(take_alerts(), [""; 0]);
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn a_tick_hands_over_twenty_writes_oldest_first_and_the_switch_stops_it() {
     let mut cfg = small_config();

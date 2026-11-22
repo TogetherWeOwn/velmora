@@ -25,7 +25,7 @@
 use crate::ports::{BlobStore, Bridge, Catalog, Clock, JobSink, Kek, NntpConnector};
 use crate::recovery::{delete_blob, generation_recorded};
 use crate::types::{
-    DispatchReport, IntentFence, Job, JobOutcome, Result, UnixMs, WriteId, JOB_VERSION,
+    BridgeError, DispatchReport, IntentFence, Job, JobOutcome, Result, UnixMs, WriteId, JOB_VERSION,
 };
 
 /// How long the `open` rows of a write wait before the sweep takes them.
@@ -39,6 +39,21 @@ pub const WRITER_MAX_AGE_MS: i64 = 12 * 60 * 60 * 1000;
 
 /// Writes one dispatcher run hands to the sweep.
 pub const SWEEP_BATCH: u32 = 20;
+
+/// The line of a sweep job that failed, for the operator's log
+/// ([`crate::trace::log_alerts`]). The job is tried again, so without
+/// the line a sweep that fails every time shows only as
+/// `waiting_writes` that do not go down. The class of the error only:
+/// the text of a database or store error can carry data.
+pub(crate) fn job_failed(e: &BridgeError) {
+    let class = match e {
+        BridgeError::Sql(_) | BridgeError::GuardFailed => "catalog",
+        BridgeError::Blob(_) => "blob",
+        BridgeError::Crypto(_) => "crypto",
+        _ => "internal",
+    };
+    crate::trace::alert(|| format!("intent sweep: a job failed and is tried again: class={class}"));
+}
 
 /// The start of the grace period that ends at `now`.
 pub fn open_before(now: UnixMs) -> UnixMs {
@@ -65,7 +80,10 @@ where
             Ok(None) => Err(JobOutcome::Ack),
             // The check could not be made: the same as a rollback for
             // this run.
-            Err(_) => Err(crate::jobs::RETRY),
+            Err(e) => {
+                job_failed(&e);
+                Err(crate::jobs::RETRY)
+            }
         }
     }
 
@@ -76,7 +94,10 @@ where
         }
         match self.sweep(write).await {
             Ok(outcome) => outcome,
-            Err(_) => crate::jobs::RETRY,
+            Err(e) => {
+                job_failed(&e);
+                crate::jobs::RETRY
+            }
         }
     }
 
