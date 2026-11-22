@@ -13,9 +13,13 @@
 //!
 //! # Where a scope is made
 //!
-//! [`TenantScope::tenant_zero`] is the only constructor, and the type
-//! has no `Default`: a scope cannot appear by accident. It is called
-//! where work enters with no tenant on it:
+//! [`TenantScope::tenant_zero`] and [`TenantScope::managed`] are the
+//! only constructors, and the type has no `Default`: a scope cannot
+//! appear by accident. `managed` is called in one place: the reader of a
+//! queue message ([`crate::jobmsg::admit_for`]), for a job message that
+//! names a managed tenant and its unit, when this Worker has the unit
+//! class bound. `tenant_zero` is called where work enters with no tenant
+//! on it:
 //!
 //! - the queue consumer, once for each message;
 //! - the configuration, for the record layout `tenant`;
@@ -39,8 +43,11 @@
 //! [`BUCKET_CONFIG_DIR`] under a tenant's record directory, and
 //! [`CATALOGUE_DUMP_PREFIX`].
 
+use std::borrow::Cow;
+
 use crate::recovery::DEFAULT_TENANT;
 use crate::types::ExtentId;
+use crate::unit::TenantId;
 
 /// Reserved: the directory of a tenant's bucket configuration records,
 /// under the tenant's record directory
@@ -56,23 +63,32 @@ pub const CATALOGUE_DUMP_PREFIX: &str = "cb/";
 /// The tenant a piece of work is done for. See the [module](self).
 ///
 /// On purpose not `Default`, not `Deserialize` and with a private
-/// field: [`TenantScope::tenant_zero`] is the one way to get one.
+/// field: [`TenantScope::tenant_zero`] and [`TenantScope::managed`] are
+/// the ways to get one.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TenantScope {
-    tenant: &'static str,
+    tenant: Cow<'static, str>,
 }
 
 impl TenantScope {
     /// The scope of tenant 0, the owner of every bucket there is.
     pub const fn tenant_zero() -> TenantScope {
         TenantScope {
-            tenant: DEFAULT_TENANT,
+            tenant: Cow::Borrowed(DEFAULT_TENANT),
         }
+    }
+
+    /// The scope of a managed tenant, whose catalogue is its unit.
+    /// `None` for tenant 0, which has no unit and keeps its own names.
+    pub fn managed(tenant: &TenantId) -> Option<TenantScope> {
+        (!tenant.is_zero()).then(|| TenantScope {
+            tenant: Cow::Owned(tenant.as_str().to_string()),
+        })
     }
 
     /// The tenant id, as a record name takes it.
     pub fn tenant_id(&self) -> &str {
-        self.tenant
+        &self.tenant
     }
 
     pub fn is_tenant_zero(&self) -> bool {
@@ -83,7 +99,7 @@ impl TenantScope {
     pub fn safety_key(&self, extent: &ExtentId) -> String {
         match self.is_tenant_zero() {
             true => extent.safety_key(),
-            false => blob_key("x/", self.tenant, extent),
+            false => blob_key("x/", &self.tenant, extent),
         }
     }
 
@@ -91,14 +107,14 @@ impl TenantScope {
     pub fn cache_key(&self, extent: &ExtentId) -> String {
         match self.is_tenant_zero() {
             true => extent.cache_key(),
-            false => blob_key("c/", self.tenant, extent),
+            false => blob_key("c/", &self.tenant, extent),
         }
     }
 }
 
 /// The name of a blob of a tenant other than tenant 0: the tenant comes
-/// before the extent. No scope of such a tenant can be made yet, so
-/// nothing is stored under such a name.
+/// before the extent. Only the job path of a managed tenant's unit names
+/// blobs so (the request path of such a tenant is not built yet).
 fn blob_key(family: &str, tenant: &str, extent: &ExtentId) -> String {
     format!("{family}{tenant}/{}", extent.as_str())
 }
@@ -160,6 +176,27 @@ mod tests {
             "c/t_1/x_000102030405060708090a0b0c"
         );
         assert!(!extent().as_str().contains('/'));
+    }
+
+    /// A managed tenant's scope names its blobs and records under its
+    /// own id; tenant 0 has no managed scope.
+    #[test]
+    fn a_managed_scope_names_its_own_blobs_and_records() {
+        let t = TenantId::parse("t_00000000000000a7").unwrap();
+        let scope = TenantScope::managed(&t).unwrap();
+        assert!(!scope.is_tenant_zero());
+        assert_eq!(scope.tenant_id(), "t_00000000000000a7");
+        assert_eq!(
+            scope.safety_key(&extent()),
+            "x/t_00000000000000a7/x_000102030405060708090a0b0c"
+        );
+        assert_eq!(
+            scope.cache_key(&extent()),
+            "c/t_00000000000000a7/x_000102030405060708090a0b0c"
+        );
+        assert_eq!(Layout::of(&scope).root(), "m/x/t_00000000000000a7/");
+        assert_ne!(scope, TenantScope::tenant_zero());
+        assert_eq!(TenantScope::managed(&TenantId::zero()), None);
     }
 
     /// The reserved names are no record of any kind, and the bucket

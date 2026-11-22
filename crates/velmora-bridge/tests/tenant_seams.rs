@@ -114,19 +114,41 @@ fn a_scope_is_made_only_at_the_listed_places() {
             ("bridge/directory.rs", 1),
             // The replay: the listing, and the plans of an extent.
             ("bridge/replay.rs", 3),
-            // The reader of a queue message: the tenant a message names
-            // (one scope), whether a scope is tenant 0 (`is_tenant_zero`,
-            // twice), and whether a unit job names tenant 0, which has no
-            // unit (one, compared by id; no scope is made from it).
-            ("bridge/jobmsg.rs", 4),
+            // The reader of a queue message: the scope of tenant 0 (one,
+            // given to the reader of a `v` 2 message), whether a scope is
+            // tenant 0 (`is_tenant_zero`: the sink's check, the unit of
+            // tenant 0, a unit job of tenant 0, a managed tenant with no
+            // unit), whether a unit job names tenant 0, which has no unit
+            // (one, compared by id; no scope is made from it), and its
+            // tests (four).
+            ("bridge/jobmsg.rs", 10),
             // The queue sink: the tenant its messages name.
             ("worker/env.rs", 1),
+            // Not scopes: the unit's name for "this unit is tenant 0's"
+            // in the key-chain check (a `bool`), and a test's name.
+            ("bridge/unit/keys.rs", 4),
+            ("bridge/unit/birth.rs", 1),
         ],
     );
     // The reader of a message makes the scope of the job path, and the
     // consumer takes it from there: it makes none of its own.
-    assert_eq!(found.get("bridge/jobmsg.rs"), Some(&4));
+    assert_eq!(found.get("bridge/jobmsg.rs"), Some(&10));
     assert_eq!(found.get("worker/lib.rs"), None);
+}
+
+/// A managed tenant's scope is made in one place: the reader of a queue
+/// message, for a message that names the tenant's unit while the unit
+/// class is bound (`jobmsg::admit_for`).
+#[test]
+fn a_managed_scope_is_made_only_by_the_reader() {
+    let all = all();
+    let mut found = uses(&all, "TenantScope::managed");
+    // Its own tests.
+    found.remove(TENANT);
+    assert_eq!(
+        found.into_iter().collect::<Vec<_>>(),
+        [("bridge/jobmsg.rs".to_string(), 1)]
+    );
 }
 
 /// One constructor, no `Default`, nothing that reads one from bytes.
@@ -135,10 +157,11 @@ fn the_scope_has_one_constructor() {
     let all = all();
     let tenant = &all[TENANT];
     assert_eq!(tenant.matches("-> TenantScope").count(), 1);
+    assert_eq!(tenant.matches("-> Option<TenantScope>").count(), 1);
     assert_eq!(
         tenant.matches("TenantScope {").count(),
-        4,
-        "the struct, its impl, the constructor and its one literal"
+        5,
+        "the struct, its impl, the two constructors and their literals"
     );
     let derive = tenant
         .lines()
@@ -160,15 +183,17 @@ fn the_scope_has_one_constructor() {
     }
     // No constructor under another spelling, and no conversion: in the
     // code of the module (its tests left out) the type is never made
-    // through `Self`, and the field is named three times: the struct,
-    // the one literal, and the parameter of `blob_key`.
+    // through `Self`, and the field is named five times: the struct,
+    // the two literals, the parameter of `managed` and the parameter of
+    // `blob_key`.
     let module = tenant
         .split("#[cfg(test)]")
         .next()
         .expect("the module before its tests");
     assert!(!module.contains("Self"), "a second way to make a scope");
-    assert_eq!(module.matches("tenant: ").count(), 3);
+    assert_eq!(module.matches("tenant: ").count(), 5);
     assert_eq!(module.matches("fn tenant_zero").count(), 1);
+    assert_eq!(module.matches("fn managed").count(), 1);
     for (file, text) in &all {
         assert!(
             !text.contains(" for TenantScope"),
@@ -176,7 +201,7 @@ fn the_scope_has_one_constructor() {
         );
     }
     // The field is private: no other file can write the literal.
-    assert!(tenant.contains("pub struct TenantScope {\n    tenant: &'static str,\n}"));
+    assert!(tenant.contains("pub struct TenantScope {\n    tenant: Cow<'static, str>,\n}"));
     let literals = uses(&all, "TenantScope {");
     assert_eq!(literals.keys().collect::<Vec<_>>(), [TENANT]);
 }
@@ -187,13 +212,15 @@ fn the_scope_has_one_constructor() {
 fn the_id_of_tenant_zero_is_written_in_one_place() {
     let all = all();
     let mut literal = uses(&all, "t_0000000000000000");
-    // The tests of the scope say the names in full.
+    // The tests of the scope and of a unit's name say the names in full.
     literal.remove(TENANT);
+    literal.remove("bridge/unit/name.rs");
     assert_eq!(literal.keys().collect::<Vec<_>>(), ["bridge/recovery.rs"]);
     let named = uses(&all, "DEFAULT_TENANT");
+    // A unit's tenant id (`unit::TenantId::zero`) takes it by name too.
     assert_eq!(
         named.keys().collect::<Vec<_>>(),
-        ["bridge/recovery.rs", TENANT]
+        ["bridge/recovery.rs", TENANT, "bridge/unit/name.rs"]
     );
 }
 

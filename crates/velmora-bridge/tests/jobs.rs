@@ -2819,4 +2819,4 @@ async fn an_abandoned_job_does_not_hold_the_budget_for_ever() {
 }
 
 /// The one tenant there is.
-const TENANT_ZERO: velmora_bridge::TenantScope = velmora_bridge::TenantScope::tenant_zero();
+static TENANT_ZERO: velmora_bridge::TenantScope = velmora_bridge::TenantScope::tenant_zero();

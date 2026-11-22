@@ -1053,4 +1053,4 @@ async fn no_delete_removes_a_stamp_or_a_tenant_key() {
 }
 
 /// The one tenant there is.
-const TENANT_ZERO: velmora_bridge::TenantScope = velmora_bridge::TenantScope::tenant_zero();
+static TENANT_ZERO: velmora_bridge::TenantScope = velmora_bridge::TenantScope::tenant_zero();

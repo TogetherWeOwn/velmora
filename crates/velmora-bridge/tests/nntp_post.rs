@@ -624,7 +624,7 @@ async fn mismatched_safety_bytes_are_not_posted() {
 }
 
 /// The one tenant there is.
-const TENANT_ZERO: velmora_bridge::TenantScope = velmora_bridge::TenantScope::tenant_zero();
+static TENANT_ZERO: velmora_bridge::TenantScope = velmora_bridge::TenantScope::tenant_zero();
 
 /// The post stage writes the article-plan record in the record layout
 /// of its scope: flat when the layout is unset, tenant 0's directory

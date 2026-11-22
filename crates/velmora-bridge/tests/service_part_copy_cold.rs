@@ -194,4 +194,4 @@ async fn a_range_that_ends_in_a_cold_full_size_extent_fits_the_budget() {
 }
 
 /// The one tenant there is.
-const TENANT_ZERO: velmora_bridge::TenantScope = velmora_bridge::TenantScope::tenant_zero();
+static TENANT_ZERO: velmora_bridge::TenantScope = velmora_bridge::TenantScope::tenant_zero();

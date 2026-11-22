@@ -3188,4 +3188,4 @@ async fn admin_answers_only_on_its_host_when_one_is_set() {
 }
 
 /// The one tenant there is.
-const TENANT_ZERO: velmora_bridge::TenantScope = velmora_bridge::TenantScope::tenant_zero();
+static TENANT_ZERO: velmora_bridge::TenantScope = velmora_bridge::TenantScope::tenant_zero();

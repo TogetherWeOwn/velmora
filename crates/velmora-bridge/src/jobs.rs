@@ -244,7 +244,7 @@ where
                 stage,
                 ..
             } if *v == JOB_VERSION => self.run_extent(scope, extent, generation, *stage).await,
-            Job::Gc { v } if *v == JOB_VERSION => self.run_gc().await,
+            Job::Gc { v } if *v == JOB_VERSION => self.run_gc(scope).await,
             Job::Evict { v, remaining } if *v == JOB_VERSION => {
                 match self.evict_batch(scope, *remaining).await {
                     Ok(_) => JobOutcome::Ack,
@@ -370,20 +370,20 @@ where
         }
     }
 
-    /// Handles up to [`GC_BATCH`] due `gc` rows.
-    async fn run_gc(&self) -> JobOutcome {
+    /// Handles up to [`GC_BATCH`] due `gc` rows of the tenant of `scope`.
+    async fn run_gc(&self, scope: &TenantScope) -> JobOutcome {
         let disposable_only = match self.cfg.gc_mode {
             GcMode::Off => return JobOutcome::Ack,
             GcMode::Disposable => true,
         };
-        match self.gc_batch(disposable_only).await {
+        match self.gc_batch(scope, disposable_only).await {
             Ok(()) => JobOutcome::Ack,
             // Every step is idempotent, so the batch simply runs again.
             Err(_) => RETRY,
         }
     }
 
-    async fn gc_batch(&self, disposable_only: bool) -> Result<()> {
+    async fn gc_batch(&self, scope: &TenantScope, disposable_only: bool) -> Result<()> {
         // Nothing is deleted on a catalogue that is behind its stamp:
         // its rows may name as garbage what a later commit used. A check
         // that could not be made retries the job.
@@ -396,7 +396,7 @@ where
         // stays due, and the first error makes the job retry.
         let mut failed = None;
         for row in &rows {
-            if let Err(e) = self.gc_row(row).await {
+            if let Err(e) = self.gc_row(scope, row).await {
                 failed.get_or_insert(e);
             }
         }
@@ -409,13 +409,22 @@ where
     }
 
     /// One `gc` row: the catalogue re-checks that no live generation uses
-    /// the extent and names the one blob that may go.
-    async fn gc_row(&self, row: &GcRow) -> Result<()> {
+    /// the extent and says which of its two blobs may go. The blob's name
+    /// comes from the row's extent and the job's scope, not from the
+    /// catalogue: its delete list names tenant 0's blobs (its rows carry
+    /// no tenant), so for tenant 0 the name is the same, and a managed
+    /// tenant's unit can never name a blob outside that tenant's own
+    /// names.
+    async fn gc_row(&self, scope: &TenantScope, row: &GcRow) -> Result<()> {
         match self.catalog.gc_begin(row, self.clock.now()).await? {
-            GcStep::DeleteBlob { store, key } => {
+            GcStep::DeleteBlob { store, .. } => {
                 match store {
-                    BlobStoreKind::Safety => delete_blob(&self.safety, &key).await?,
-                    BlobStoreKind::Cache => delete_blob(&self.cache, &key).await?,
+                    BlobStoreKind::Safety => {
+                        delete_blob(&self.safety, &scope.safety_key(&row.extent_id)).await?
+                    }
+                    BlobStoreKind::Cache => {
+                        delete_blob(&self.cache, &scope.cache_key(&row.extent_id)).await?
+                    }
                 }
                 self.catalog.gc_done(row.id, self.clock.now()).await
             }

@@ -1428,4 +1428,4 @@ async fn a_refusal_inside_the_round_is_no_strike_when_no_socket_ends_well() {
 }
 
 /// The one tenant there is.
-const TENANT_ZERO: velmora_bridge::TenantScope = velmora_bridge::TenantScope::tenant_zero();
+static TENANT_ZERO: velmora_bridge::TenantScope = velmora_bridge::TenantScope::tenant_zero();

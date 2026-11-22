@@ -30,11 +30,16 @@
 //!
 //! # What is never run
 //!
-//! A `v` 2 message runs only for a tenant this Worker can serve. Today
-//! that is tenant 0, whose catalogue is the D1 database: it has no unit,
-//! so its message names none. A `v` 2 message with no tenant, with a
-//! tenant that is not tenant 0, with a unit for tenant 0, or with fields
-//! this build does not know is **refused** ([`Refusal`]): the consumer
+//! A `v` 2 message runs only for a tenant this Worker can serve. That is
+//! tenant 0, whose catalogue is the D1 database: it has no unit, so its
+//! message names none. When the Worker has the unit class bound
+//! ([`Units::Bound`], [`admit_for`]; not in the production config), it
+//! is also a managed tenant (a [`crate::unit::TenantId`] other than
+//! tenant 0) whose message names its unit: the job runs in that tenant's
+//! scope against its unit. A `v` 2 message with no tenant, with a
+//! tenant this Worker cannot serve, with a unit for tenant 0, with no
+//! unit for a managed tenant, or with fields this build does not know is
+//! **refused** ([`Refusal`]): the consumer
 //! hands it back to the queue until its deliveries are used up, so it
 //! lands in the dead-letter queue, which pages (in production; the
 //! dead-letter queues of `wrangler dev` and of drills have no consumer
@@ -76,11 +81,13 @@
 //! this one on knows them ([`read_unit_job`]), long before a unit can
 //! write one.
 //!
-//! This Worker serves no unit: tenant 0 has none. A unit job is
-//! therefore refused here, as [`Refusal::OtherTenant`] for a unit of
-//! another tenant, [`Refusal::UnitOfTenantZero`] or [`Refusal::NoUnit`]
-//! for tenant 0, and [`Refusal::BadBody`] when its fields are not those
-//! of its kind. The build that binds the unit class runs them. A lost
+//! No build runs them yet: the Worker side of the renewal (prove, then
+//! `renew`) and of the raise is not built. A unit job is therefore
+//! refused here, as [`Refusal::OtherTenant`] for a unit of another
+//! tenant when the unit class is not bound, [`Refusal::UnitJobNotRun`]
+//! for a well-formed one of a managed tenant when it is,
+//! [`Refusal::UnitOfTenantZero`] or [`Refusal::NoUnit`] for tenant 0, and
+//! [`Refusal::BadBody`] when its fields are not those of its kind. A lost
 //! `renew` closes the unit when its lease runs out (an outage, never a
 //! wrong answer); the alarm's backoff sends it again.
 //!
@@ -658,8 +665,12 @@ pub enum Refusal {
     BadBody,
     /// Its kind (`t`) is none this build knows.
     UnknownKind,
-    /// A unit job ([`UnitJob`]) that names no unit.
+    /// A unit job ([`UnitJob`]), or a job of a managed tenant, that
+    /// names no unit.
     NoUnit,
+    /// A well-formed unit job ([`UnitJob`]) of a managed tenant: this
+    /// build does not run unit jobs.
+    UnitJobNotRun,
 }
 
 impl Refusal {
@@ -672,15 +683,35 @@ impl Refusal {
             Refusal::BadBody => "bad_body",
             Refusal::UnknownKind => "unknown_kind",
             Refusal::NoUnit => "no_unit",
+            Refusal::UnitJobNotRun => "unit_job_not_run",
         }
     }
 }
 
-/// Reads a queue message. See the [module](self).
+/// Whether this Worker has the unit class bound, so that it can run the
+/// jobs of a managed tenant against its unit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Units {
+    /// No unit binding (the production config): tenant 0 only.
+    Unbound,
+    /// The unit class is bound: a managed tenant's job that names its
+    /// unit runs too.
+    Bound,
+}
+
+/// Reads a queue message, for a Worker without the unit class bound.
+/// See the [module](self).
 pub fn admit(body: &Value) -> Admission {
-    // The one tenant this Worker serves. A message of `v` 1 names no
-    // tenant: it is tenant 0's, the only tenant there was when it could
-    // be written.
+    admit_for(body, Units::Unbound)
+}
+
+/// Reads a queue message. With [`Units::Bound`], a `v` 2 message of a
+/// managed tenant that names its unit is admitted in that tenant's scope
+/// ([`TenantScope::managed`]), its tenant fields in `tenant`. See the
+/// [module](self).
+pub fn admit_for(body: &Value, units: Units) -> Admission {
+    // A message of `v` 1 names no tenant: it is tenant 0's, the only
+    // tenant there was when it could be written.
     let scope = TenantScope::tenant_zero();
     if body.get("v").and_then(Value::as_u64) != Some(u64::from(TENANT_FORMAT_VERSION)) {
         return match serde_json::from_value::<Job>(body.clone()) {
@@ -692,8 +723,8 @@ pub fn admit(body: &Value) -> Admission {
             Err(_) => Admission::Malformed,
         };
     }
-    match tenant_message(body, &scope) {
-        Ok((job, tenant)) => Admission::Run {
+    match tenant_message(body, units, scope) {
+        Ok((scope, job, tenant)) => Admission::Run {
             scope,
             job,
             tenant: Some(tenant),
@@ -702,32 +733,52 @@ pub fn admit(body: &Value) -> Admission {
     }
 }
 
-/// A `v` 2 message of the tenant of `served` as its job and its tenant
-/// fields.
+/// A `v` 2 message of a tenant this Worker serves as the job's scope, its
+/// job and its tenant fields. `zero` is tenant 0's scope.
 fn tenant_message(
     body: &Value,
-    served: &TenantScope,
-) -> std::result::Result<(Job, JobTenant), Refusal> {
+    units: Units,
+    zero: TenantScope,
+) -> std::result::Result<(TenantScope, Job, JobTenant), Refusal> {
     let Some(fields) = body.as_object() else {
         return Err(Refusal::BadBody);
     };
     let (tenant, numbers) = tenant_fields(fields)?;
-    if tenant != served.tenant_id() {
-        return Err(match crate::recovery::Layout::tenant(&tenant) {
-            Some(_) => Refusal::OtherTenant,
-            None => Refusal::BadTenant,
-        });
-    }
-    // Tenant 0's catalogue is the D1 database, not a unit.
-    if served.is_tenant_zero() && numbers.unit.is_some() {
+    let scope = if tenant == zero.tenant_id() {
+        zero
+    } else {
+        // A managed tenant: served only with the unit class bound, and
+        // only for an id a unit can be named by.
+        let managed = crate::unit::TenantId::parse(&tenant)
+            .as_ref()
+            .and_then(TenantScope::managed);
+        match (units, managed) {
+            (Units::Bound, Some(scope)) => scope,
+            _ => {
+                return Err(match crate::recovery::Layout::tenant(&tenant) {
+                    Some(_) => Refusal::OtherTenant,
+                    None => Refusal::BadTenant,
+                })
+            }
+        }
+    };
+    // Tenant 0's catalogue is the D1 database, not a unit; a managed
+    // tenant's catalogue is its unit, so its job must name one.
+    if scope.is_tenant_zero() && numbers.unit.is_some() {
         return Err(Refusal::UnitOfTenantZero);
     }
     let kind = fields.get("t").and_then(Value::as_str);
-    // A unit job of the served tenant. The served tenant is tenant 0,
-    // which has no unit, so a well-formed one is refused here too: the
-    // reader says whether it was well formed.
+    // A unit job: no build runs one yet. The reader says whether it was
+    // well formed.
     if kind.is_some_and(|kind| UNIT_JOB_KINDS.contains(&kind)) {
-        return Err(read_unit_job(body).err().unwrap_or(Refusal::NoUnit));
+        return Err(match read_unit_job(body) {
+            Err(refusal) => refusal,
+            Ok(_) if scope.is_tenant_zero() => Refusal::NoUnit,
+            Ok(_) => Refusal::UnitJobNotRun,
+        });
+    }
+    if !scope.is_tenant_zero() && numbers.unit.is_none() {
+        return Err(Refusal::NoUnit);
     }
     // The body without the tenant fields is a body of the current
     // version; `Job` refuses any field it does not know.
@@ -745,6 +796,7 @@ fn tenant_message(
         }
     })?;
     Ok((
+        scope,
         job,
         JobTenant {
             tenant,
@@ -886,6 +938,7 @@ mod tests {
             Refusal::BadBody,
             Refusal::UnknownKind,
             Refusal::NoUnit,
+            Refusal::UnitJobNotRun,
         ];
         let codes: std::collections::BTreeSet<_> = all.iter().map(|r| r.code()).collect();
         assert_eq!(codes.len(), all.len());
@@ -897,9 +950,146 @@ mod tests {
             admit(&json!({"v": 2})),
             Admission::Refused(Refusal::NoTenant)
         );
-        let Admission::Run { scope, .. } = admit(&json!({"t": "gc", "v": 1})) else {
+        let Admission::Run { .. } = admit(&json!({"t": "gc", "v": 1})) else {
             panic!("a gc job of v 1 runs");
         };
-        assert_eq!(tenant_message(&json!([2]), &scope), Err(Refusal::BadBody));
+        for units in [Units::Unbound, Units::Bound] {
+            assert_eq!(
+                tenant_message(&json!([2]), units, TenantScope::tenant_zero()),
+                Err(Refusal::BadBody)
+            );
+        }
+    }
+
+    const MANAGED: &str = "t_00000000000000a7";
+
+    fn managed_gc(unit: Option<u32>) -> Value {
+        let mut body = json!({"t": "gc", "v": 2, "tenant": MANAGED, "state_seq": 7, "keys_seq": 3});
+        if let Some(unit) = unit {
+            body["unit"] = json!(unit);
+        }
+        body
+    }
+
+    /// With the unit class bound, a managed tenant's job that names its
+    /// unit runs in that tenant's scope, with its numbers; without the
+    /// binding it is refused as before.
+    #[test]
+    fn a_managed_tenants_job_runs_only_with_units_bound() {
+        let Admission::Run { scope, job, tenant } = admit_for(&managed_gc(Some(0)), Units::Bound)
+        else {
+            panic!("a managed tenant's gc job runs with units bound");
+        };
+        assert_eq!(scope.tenant_id(), MANAGED);
+        assert!(!scope.is_tenant_zero());
+        assert_eq!(job, Job::Gc { v: JOB_VERSION });
+        let tenant = tenant.unwrap();
+        assert_eq!(
+            (
+                tenant.tenant(),
+                tenant.unit(),
+                tenant.state_seq(),
+                tenant.keys_seq()
+            ),
+            (MANAGED, Some(0), 7, 3)
+        );
+        assert_eq!(
+            admit_for(&managed_gc(Some(0)), Units::Unbound),
+            Admission::Refused(Refusal::OtherTenant)
+        );
+        assert_eq!(
+            admit(&managed_gc(Some(0))),
+            Admission::Refused(Refusal::OtherTenant)
+        );
+        // A managed tenant's catalogue is its unit: no unit, no job.
+        assert_eq!(
+            admit_for(&managed_gc(None), Units::Bound),
+            Admission::Refused(Refusal::NoUnit)
+        );
+    }
+
+    /// The binding changes nothing for tenant 0, and admits no tenant id
+    /// a unit cannot be named by.
+    #[test]
+    fn units_bound_leave_tenant_zero_and_bad_ids_as_they_were() {
+        let zero = TenantScope::tenant_zero().tenant_id().to_string();
+        let v2 = json!({"t": "gc", "v": 2, "tenant": zero, "state_seq": 0, "keys_seq": 0});
+        let v1 = json!({"t": "gc", "v": 1});
+        for body in [&v1, &v2] {
+            assert_eq!(admit_for(body, Units::Bound), admit(body), "{body}");
+        }
+        let mut with_unit = v2.clone();
+        with_unit["unit"] = json!(0);
+        assert_eq!(
+            admit_for(&with_unit, Units::Bound),
+            Admission::Refused(Refusal::UnitOfTenantZero)
+        );
+        // A record-name tenant id that is not a unit's tenant id (`t_` and
+        // 16 lowercase hex digits) is another tenant; what is no tenant id
+        // at all is a bad one.
+        for (tenant, want) in [
+            ("t_1", Refusal::OtherTenant),
+            ("t_00000000000000a7x", Refusal::OtherTenant),
+            ("t_00000000000000A7", Refusal::BadTenant),
+            ("not a tenant", Refusal::BadTenant),
+        ] {
+            let mut body = managed_gc(Some(0));
+            body["tenant"] = json!(tenant);
+            assert_eq!(
+                admit_for(&body, Units::Bound),
+                Admission::Refused(want),
+                "{tenant}"
+            );
+        }
+    }
+
+    /// A unit job (renew, stamp_raise) is never run by this build: with
+    /// units bound a well-formed one says so, a malformed one says why.
+    #[test]
+    fn unit_jobs_are_refused_with_units_bound_too() {
+        let renew = json!({"t": "renew", "v": 2, "at": 1_800_000_000_000_i64, "tenant": MANAGED,
+                           "unit": 0, "state_seq": 1, "keys_seq": 1});
+        assert_eq!(
+            admit_for(&renew, Units::Bound),
+            Admission::Refused(Refusal::UnitJobNotRun)
+        );
+        assert_eq!(
+            admit_for(&renew, Units::Unbound),
+            Admission::Refused(Refusal::OtherTenant)
+        );
+        let mut no_unit = renew.clone();
+        no_unit.as_object_mut().unwrap().remove("unit");
+        assert_eq!(
+            admit_for(&no_unit, Units::Bound),
+            Admission::Refused(Refusal::NoUnit)
+        );
+        let mut extra = renew.clone();
+        extra["extra"] = json!(1);
+        assert_eq!(
+            admit_for(&extra, Units::Bound),
+            Admission::Refused(Refusal::BadBody)
+        );
+    }
+
+    /// What a managed tenant's unit sends (its own tenant fields, always
+    /// `v` 2) is admitted as that unit's job again, field for field.
+    #[test]
+    fn a_units_message_reads_back_as_the_same_units_job() {
+        let tenant = JobTenant::of_unit(MANAGED, 4, 11, 12).unwrap();
+        let job = Job::Gc { v: JOB_VERSION };
+        let text = JobFormat::Tenant.message(&job, &tenant).to_json();
+        let body: Value = serde_json::from_str(&text).unwrap();
+        let Admission::Run {
+            scope,
+            job: read,
+            tenant: Some(read_tenant),
+        } = admit_for(&body, Units::Bound)
+        else {
+            panic!("{text}");
+        };
+        assert_eq!(
+            (scope.tenant_id(), read, read_tenant),
+            (MANAGED, job, tenant)
+        );
     }
 }

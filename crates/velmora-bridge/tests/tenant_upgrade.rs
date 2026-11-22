@@ -188,4 +188,4 @@ async fn a_catalogue_id_made_from_the_tenant_would_be_refused_by_the_old_stamp()
 }
 
 /// The one tenant there is.
-const TENANT_ZERO: velmora_bridge::TenantScope = velmora_bridge::TenantScope::tenant_zero();
+static TENANT_ZERO: velmora_bridge::TenantScope = velmora_bridge::TenantScope::tenant_zero();

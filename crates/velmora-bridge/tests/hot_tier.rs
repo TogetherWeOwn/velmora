@@ -1799,4 +1799,4 @@ async fn an_eviction_under_another_catalogue_id_is_refused_by_the_old_stamp() {
 }
 
 /// The one tenant there is.
-const TENANT_ZERO: velmora_bridge::TenantScope = velmora_bridge::TenantScope::tenant_zero();
+static TENANT_ZERO: velmora_bridge::TenantScope = velmora_bridge::TenantScope::tenant_zero();

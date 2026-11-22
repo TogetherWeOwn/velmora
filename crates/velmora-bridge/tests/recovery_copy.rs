@@ -5443,4 +5443,4 @@ async fn a_pass_over_six_segmented_records_holds_a_few_segments_at_once() {
 }
 
 /// The one tenant there is.
-const TENANT_ZERO: velmora_bridge::TenantScope = velmora_bridge::TenantScope::tenant_zero();
+static TENANT_ZERO: velmora_bridge::TenantScope = velmora_bridge::TenantScope::tenant_zero();
