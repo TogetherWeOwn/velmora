@@ -8,15 +8,17 @@
 //!
 //! | Refusal | Delivery | Why |
 //! |---|---|---|
-//! | stale job (the job's numbers are below the unit's, or missing) | acknowledged | rule 5: "runs the job again or drops it". The message only names an outbox row in the unit; the unit's dispatcher sends the row again with its current numbers |
-//! | closed (restoring, or the lease ran out) | acknowledged | jobs are refused while the unit is closed; its outbox rows stay and are sent again once it opens |
+//! | stale job (the job's numbers are below the unit's, or missing) | acknowledged | rule 5: "runs the job again or drops it". The message only names an outbox row in the unit, which stays; the unit's alarm dispatcher (W2, not in this build) sends the row again with its current numbers |
+//! | closed (restoring or provisioning) | acknowledged | jobs are refused while the unit is closed; its outbox rows stay, and the unit's alarm dispatcher (W2, not in this build) sends them again once it opens |
 //! | sync needed (the unit is behind the chain) | handed back until the dead-letter queue, which pages | the Worker must read the chain and call `sync` first (rule 5); this build has no consumer-side sync, so an operator must look |
 //! | unborn | dead-letter queue, alert | rule 7: a listed unit with no certificate is "catalogue lost" and pages |
 //! | any other refusal | dead-letter queue, alert | the unit alarms; the Worker says so too |
 //!
 //! No delivery is dropped in silence: each refusal is one log line with a
 //! fixed code, and an alert for the ones that page. Nothing here reads
-//! or writes a catalogue.
+//! or writes a catalogue. Until the unit's alarm dispatcher exists,
+//! nothing sends an acknowledged row again, so the unit class must stay
+//! unbound in every deployed config (it is: no config binds `UNIT`).
 
 use crate::jobmsg::REFUSED_RETRY_DELAY_SECS;
 use crate::tenant_catalog::{UNIT_CLOSED, UNIT_STALE_JOB, UNIT_SYNC_NEEDED, UNIT_UNBORN};

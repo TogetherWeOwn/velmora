@@ -124,6 +124,9 @@ fn a_scope_is_made_only_at_the_listed_places() {
             ("bridge/jobmsg.rs", 10),
             // The queue sink: the tenant its messages name.
             ("worker/env.rs", 1),
+            // Whether a scope is tenant 0, whose layouts alone include
+            // the flat one (`Layout::all`, `Layout::in_scope`).
+            ("bridge/recovery.rs", 2),
             // Not scopes: the unit's name for "this unit is tenant 0's"
             // in the key-chain check (a `bool`), and a test's name.
             ("bridge/unit/keys.rs", 4),
@@ -212,8 +215,14 @@ fn the_scope_has_one_constructor() {
 fn the_id_of_tenant_zero_is_written_in_one_place() {
     let all = all();
     let mut literal = uses(&all, "t_0000000000000000");
-    // The tests of the scope and of a unit's name say the names in full.
+    // The tests of the scope and of a unit's name say the names in full;
+    // the code of a unit's name does not.
     literal.remove(TENANT);
+    let name = all["bridge/unit/name.rs"]
+        .split("#[cfg(test)]")
+        .next()
+        .expect("the module before its tests");
+    assert!(!name.contains("t_0000000000000000"));
     literal.remove("bridge/unit/name.rs");
     assert_eq!(literal.keys().collect::<Vec<_>>(), ["bridge/recovery.rs"]);
     let named = uses(&all, "DEFAULT_TENANT");

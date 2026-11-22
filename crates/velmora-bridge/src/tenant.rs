@@ -148,7 +148,7 @@ mod tests {
         let scope = TenantScope::tenant_zero();
         assert_eq!(Layout::of(&scope).root(), "m/x/t_0000000000000000/");
         assert_eq!(Some(Layout::of(&scope)), Layout::tenant(scope.tenant_id()));
-        let [flat, tenant] = Layout::all(&scope);
+        let [flat, tenant]: [Layout; 2] = Layout::all(&scope).try_into().unwrap();
         assert_eq!(flat, Layout::flat());
         assert_eq!(tenant, Layout::of(&scope));
     }
@@ -195,6 +195,17 @@ mod tests {
             "c/t_00000000000000a7/x_000102030405060708090a0b0c"
         );
         assert_eq!(Layout::of(&scope).root(), "m/x/t_00000000000000a7/");
+        // Its records are never in the flat layout, which is tenant 0's.
+        assert_eq!(Layout::all(&scope), vec![Layout::of(&scope)]);
+        assert_eq!(Layout::flat().in_scope(&scope), Layout::of(&scope));
+        assert_eq!(
+            Layout::flat().in_scope(&TenantScope::tenant_zero()),
+            Layout::flat()
+        );
+        assert_eq!(
+            crate::recovery::other_plan_key(&scope, &Layout::of(&scope).article_key(&extent())),
+            None
+        );
         assert_ne!(scope, TenantScope::tenant_zero());
         assert_eq!(TenantScope::managed(&TenantId::zero()), None);
     }

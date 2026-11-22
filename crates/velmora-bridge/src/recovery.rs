@@ -189,13 +189,17 @@ impl Layout {
     }
 
     /// Every layout a record of the tenant of `scope` can be in, in the
-    /// order readers look: the flat one first.
+    /// order readers look: for tenant 0 the flat one first, then its
+    /// tenant layout.
     ///
     /// The flat layout is of tenant 0 only: it has no tenant in its
-    /// names. So is this function, while tenant 0 is the only tenant a
-    /// scope can be made for.
-    pub fn all(scope: &TenantScope) -> [Layout; 2] {
-        [Layout::flat(), Layout::of(scope)]
+    /// names. A managed tenant's records are only ever in its own layout,
+    /// so for its scope that is the one layout.
+    pub fn all(scope: &TenantScope) -> Vec<Layout> {
+        match scope.is_tenant_zero() {
+            true => vec![Layout::flat(), Layout::of(scope)],
+            false => vec![Layout::of(scope)],
+        }
     }
 
     /// The configured layout of new records (`RECORD_LAYOUT`), for the
@@ -204,9 +208,10 @@ impl Layout {
     /// records it writes through this, so the name comes from the scope
     /// and not from the tenant the configuration was read for.
     ///
-    /// The flat layout is of tenant 0 only (see [`Layout::all`]).
+    /// The flat layout is of tenant 0 only (see [`Layout::all`]): a
+    /// managed tenant's scope gets its own layout whatever is configured.
     pub fn in_scope(&self, scope: &TenantScope) -> Layout {
-        if self.root == RECORD_PREFIX {
+        if self.root == RECORD_PREFIX && scope.is_tenant_zero() {
             Layout::flat()
         } else {
             Layout::of(scope)
@@ -320,11 +325,12 @@ pub fn record_name(key: &str) -> Option<RecordName<'_>> {
 }
 
 /// The name of the article plan of the same extent in the other layout
-/// of the two that [`Layout::all`] names for `scope`; `None` when `key`
-/// is no article plan of one of them.
+/// of the two that [`Layout::all`] names for tenant 0; `None` when `key`
+/// is no article plan of one of them, and for a managed tenant, whose
+/// records have one layout.
 pub fn other_plan_key(scope: &TenantScope, key: &str) -> Option<String> {
     let name = record_name(key).filter(|n| n.kind == RecordKind::ArticlePlan)?;
-    let [flat, tenant] = Layout::all(scope);
+    let [flat, tenant]: [Layout; 2] = Layout::all(scope).try_into().ok()?;
     let other = if name.layout == flat {
         tenant
     } else if name.layout == tenant {

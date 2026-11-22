@@ -427,7 +427,7 @@ async fn run_on_unit(
             after.code
         ),
         Some(after) => console_log!(
-            "the unit refused the job ({}): acknowledged; its outbox sends it again",
+            "the unit refused the job ({}): acknowledged; its outbox row stays for the unit's dispatcher",
             after.code
         ),
         None => {}

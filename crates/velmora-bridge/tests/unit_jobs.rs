@@ -794,3 +794,34 @@ async fn a_job_call_without_authentication_is_refused() {
         }
     ));
 }
+
+/// A unit's sweep asks only its tenant's layout whether a generation is
+/// recorded: a record under tenant 0's flat name never counts for it.
+#[tokio::test]
+async fn a_units_generation_record_is_looked_for_in_its_own_layout_only() {
+    use velmora_bridge::recovery::{generation_recorded, Layout};
+    let store = MemBlobStore::new();
+    let id = GenerationId::new("g_00000000000000000000000001");
+    let (bucket, extent) = (BucketId::new("b_0000000000000001"), ExtentId::new("x_0"));
+    let digest: [u8; 32] = <sha2::Sha256 as sha2::Digest>::digest([1u8]).into();
+    let meta = BlobMeta {
+        bucket: &bucket,
+        extent: &extent,
+        cipher_sha256: &digest,
+    };
+    store
+        .put(&Layout::flat().generation_key(&id), vec![1], &meta)
+        .await
+        .unwrap();
+    assert!(!generation_recorded(&store, &scope(), &id).await.unwrap());
+    assert!(
+        generation_recorded(&store, &TenantScope::tenant_zero(), &id)
+            .await
+            .unwrap()
+    );
+    store
+        .put(&Layout::of(&scope()).generation_key(&id), vec![1], &meta)
+        .await
+        .unwrap();
+    assert!(generation_recorded(&store, &scope(), &id).await.unwrap());
+}

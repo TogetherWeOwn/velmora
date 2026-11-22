@@ -14,7 +14,7 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use velmora_bridge::config::{BridgeConfig, KekRing};
-use velmora_bridge::gate::{shards_from_var, GateClient, GateSharding, PermitGate, PermitMode};
+use velmora_bridge::gate::{shards_from_var, GateClient, GateSharding, PermitMode};
 use velmora_bridge::ingress::{ByteBudget, Sleeper};
 use velmora_bridge::sql::SqlCatalog;
 use velmora_bridge::{Bridge, Clock, UnixMs};
@@ -58,10 +58,6 @@ thread_local! {
     static MEMORY_LOG: Cell<Option<i64>> = const { Cell::new(None) };
     /// The time this isolate built its bridge.
     static ISOLATE: Cell<i64> = const { Cell::new(0) };
-    /// The permit gate of the isolate's bridge, when one is bound: the
-    /// bridge of a unit's jobs takes its permits through the same one
-    /// (`crate::units`).
-    static GATE: RefCell<Option<Rc<dyn PermitGate>>> = const { RefCell::new(None) };
 }
 
 /// Names the isolate in a log line: the time it built its bridge.
@@ -162,8 +158,9 @@ fn build(env: &Env) -> Result<WorkerBridge, String> {
     let permits = PermitMode::from_var(get(PERMITS).as_deref())?;
     let sharding = GateSharding::from_var(get(PERMIT_GATES).as_deref())?;
     let shards = shards_from_var(get(PERMIT_SHARDS).as_deref())?;
-    let gate = match env.durable_object(GATE_BINDING) {
-        Ok(namespace) => Some(
+    let catalog = match env.durable_object(GATE_BINDING) {
+        Ok(namespace) => SqlCatalog::with_gate(
+            catalog,
             GateClient::new(
                 DoTransport::new(namespace),
                 || WorkerClock.now(),
@@ -177,12 +174,7 @@ fn build(env: &Env) -> Result<WorkerBridge, String> {
         Err(_) if permits == PermitMode::Gate => {
             return Err(format!("missing binding {GATE_BINDING}"))
         }
-        Err(_) => None,
-    };
-    GATE.with(|g| *g.borrow_mut() = gate.clone());
-    let catalog = match gate {
-        Some(gate) => SqlCatalog::with_gate(catalog, gate),
-        None => SqlCatalog::new(catalog),
+        Err(_) => SqlCatalog::new(catalog),
     };
     let (safety, cache) = blob_stores(env, tombstone_delay)?;
     Ok(Bridge {
@@ -238,8 +230,9 @@ fn queue_sink(
 
 /// What the bridge of a managed tenant's unit shares with the isolate's
 /// bridge, made from the same bindings and settings: the shared database
-/// (permits and provider health of every tenant) with the isolate's
-/// permit gate, the two buckets and the job queues, whose messages name
+/// (permits and provider health of every tenant) through the isolate's
+/// catalogue's permit gate and its throttle (`SqlCatalog::sharing`), the
+/// two buckets and the job queues, whose messages name
 /// `tenant` (always `v` 2; the dev fault of `DEV_DROP_NOTIFY_N` is tenant
 /// 0's sink only). Class-only reasons.
 pub fn unit_parts(
@@ -249,14 +242,10 @@ pub fn unit_parts(
 ) -> Result<(SqlCatalog<D1Sql>, R2Blobs, R2Blobs, QueueSink), String> {
     let get = |name: &str| lookup(env, name);
     let dev = base.cfg.is_dev();
-    let shared = D1Sql::new(
+    let shared = base.catalog.sharing(D1Sql::new(
         env.d1("CATALOG")
             .map_err(|_| "missing binding CATALOG".to_string())?,
-    );
-    let shared = match GATE.with(|g| g.borrow().clone()) {
-        Some(gate) => SqlCatalog::with_gate(shared, gate),
-        None => SqlCatalog::new(shared),
-    };
+    ));
     let tombstone_delay =
         tombstone_delay_from_var(dev, get(DEV_TOMBSTONE_PUT_DELAY_MS).as_deref())?;
     let (safety, cache) = blob_stores(env, tombstone_delay)?;

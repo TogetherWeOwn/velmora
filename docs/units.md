@@ -195,7 +195,9 @@ which would be read as tenant 0's); and the isolate's one byte budget and
 permit gate. Garbage collection names the blob it deletes from the row's
 extent through the job's scope, not from the catalogue's delete list. The
 first refusal decides the delivery (`unit_consumer`): a stale job or a
-closed unit is acknowledged (the unit's outbox sends it again); sync
+closed unit is acknowledged (its outbox row stays, for the unit's alarm
+dispatcher of W2 to send again; that dispatcher is not built yet, so the
+class stays unbound until it is); sync
 needed, unborn and any other refusal go to the dead-letter queue with an
 alert. Unit jobs (`renew`, `stamp_raise`) are not run yet
 (`unit_job_not_run`).
