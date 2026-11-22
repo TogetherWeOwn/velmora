@@ -15,7 +15,9 @@ use velmora_bridge::directory::chain::{record_key, TenantChain, Written};
 use velmora_bridge::directory::first_open::{
     first_open, managed_tenant_exists, FirstOpenAnswer, FIRST_OPEN_REASON, REGISTRY_PREFIX,
 };
-use velmora_bridge::directory::gate::{anchored_epoch, is_open};
+use velmora_bridge::directory::gate::{
+    anchored_epoch, close, is_open, run_gate_closed_at, NotBuilt,
+};
 use velmora_bridge::directory::record::Tenant;
 use velmora_bridge::directory::store::{ChainKind, PendingOp, SqlDirectory};
 use velmora_bridge::directory::sweep::{DROP_ABOVE, NEXT_CHAIN};
@@ -339,6 +341,104 @@ fn key_locations_that_do_not_open_keep_the_gate_closed() {
     });
 }
 
+/// A stale first-open guard gets the `None` that maps to `Moved`, without writing an anchor.
+#[test]
+fn a_stale_first_open_guard_writes_no_anchor() {
+    let db = database();
+    let store = HookedRecords::new();
+    let seal = PlainSeal::new();
+    let chain = TenantChain {
+        store: &store,
+        seal: &seal,
+    };
+    let dir = SqlDirectory { sql: &db };
+    block_on(async {
+        let seen = dir.gate().await.unwrap().epoch;
+        assert_eq!(seen, 0);
+        let epoch = close(&store, &dir, "another_close", NOW).await.unwrap();
+        assert_eq!(epoch, 1);
+        let anchors = store.keys();
+        assert_eq!(anchors.len(), 1);
+
+        let run = run_gate_closed_at(&chain, &dir, &NotBuilt, FIRST_OPEN_REASON, NOW, seen)
+            .await
+            .unwrap();
+        assert!(run.is_none(), "{run:?}");
+        assert_eq!(store.keys(), anchors);
+        assert_eq!(dir.gate().await.unwrap().epoch, epoch);
+    });
+}
+
+/// A feed epoch ahead of the gate leaves the counters step undone and the gate closed.
+#[test]
+fn a_newer_feed_epoch_keeps_first_open_closed() {
+    let db = database();
+    let store = HookedRecords::new();
+    let seal = PlainSeal::new();
+    let chain = TenantChain {
+        store: &store,
+        seal: &seal,
+    };
+    let dir = SqlDirectory { sql: &db };
+    let kek = kek();
+    block_on(async {
+        locations(&store, &kek).await;
+        assert!(dir.start_feed_epoch(50).await.unwrap());
+        let FirstOpenAnswer::Ran(run) = first_open(&chain, &dir, &kek, NOW).await.unwrap() else {
+            panic!("no run");
+        };
+        assert_eq!(run.epoch, 1);
+        assert!(!run.opened);
+        let (_, step) = run.steps.iter().find(|(n, _)| *n == "counters").unwrap();
+        assert!(!step.done);
+        assert_eq!(step.problems, ["feed_epoch_newer"]);
+        assert_eq!(dir.feed_epoch().await.unwrap(), 50);
+        assert!(!is_open(&store, &dir).await.unwrap());
+    });
+}
+
+/// A newer, divergent key location survives first open and leaves the location step undone.
+#[test]
+fn a_divergent_key_location_keeps_first_open_closed() {
+    let db = database();
+    let store = HookedRecords::new();
+    let seal = PlainSeal::new();
+    let chain = TenantChain {
+        store: &store,
+        seal: &seal,
+    };
+    let dir = SqlDirectory { sql: &db };
+    let kek = kek();
+    block_on(async {
+        locations(&store, &kek).await;
+        db.exec(
+            "INSERT INTO key_locations (location, status, kl_seq) VALUES ('KEYS_A', 'proposed', 2)",
+            &[],
+        )
+        .await
+        .unwrap();
+        let FirstOpenAnswer::Ran(run) = first_open(&chain, &dir, &kek, NOW).await.unwrap() else {
+            panic!("no run");
+        };
+        assert!(!run.opened);
+        let (_, step) = run
+            .steps
+            .iter()
+            .find(|(n, _)| *n == "key_locations_and_registry")
+            .unwrap();
+        assert!(!step.done);
+        assert_eq!(step.problems, ["key_locations_differ"]);
+        assert_eq!(
+            dir.key_locations().await.unwrap(),
+            vec![
+                ("KEYS_A".into(), "proposed".into(), 2),
+                ("KEYS_B".into(), "active".into(), 1)
+            ]
+        );
+        assert!(!is_open(&store, &dir).await.unwrap());
+    });
+}
+
 // ---------------------------------------------------------------------------
 // The pending sweep's rows
 // ---------------------------------------------------------------------------
@@ -406,7 +506,15 @@ fn chains_come_in_key_order_with_their_oldest_row() {
             .is_empty());
 
         // DO UPDATE: the note again sets the row's time and kind.
-        note(&dir, B2, ChainKind::Tenant, 4, 90).await;
+        dir.add_pending(&PendingOp {
+            tenant: t(B2),
+            chain: ChainKind::Tenant,
+            seq: 4,
+            kind: "re-noted".into(),
+            created_at: UnixMs(90),
+        })
+        .await
+        .unwrap();
         let rows = db
             .query(
                 "SELECT kind, created_at FROM pending_ops WHERE tenant = ?1 AND seq = 4",
@@ -416,7 +524,7 @@ fn chains_come_in_key_order_with_their_oldest_row() {
             .unwrap();
         assert_eq!(
             rows,
-            vec![vec![SqlValue::Text("k4".into()), SqlValue::Int(90)]]
+            vec![vec![SqlValue::Text("re-noted".into()), SqlValue::Int(90)]]
         );
         assert_eq!(
             dir.chains_after(Some(&all[1].0), 1).await.unwrap(),
@@ -504,7 +612,7 @@ fn the_sweep_runs_over_the_directory_rows() {
     });
 }
 
-/// Every statement of the sweep and the backstop uses an index.
+/// Pending-chain seek and clear use bounded primary-key ranges; sweep and cap queries do not scan.
 #[test]
 fn the_sweep_and_the_backstop_read_through_an_index() {
     let db = database();
@@ -514,6 +622,25 @@ fn the_sweep_and_the_backstop_read_through_an_index() {
         assert!(
             next.iter().any(|l| l.contains("pending_ops_chain_created")),
             "{next:?}"
+        );
+        assert!(
+            next.iter()
+                .any(|l| l.contains("sqlite_autoindex_pending_ops_1 ((tenant,chain,seq)>(?,?,?))")),
+            "{next:?}"
+        );
+        let clear = plan(
+            &db,
+            "clear_pending",
+            "DELETE FROM pending_ops WHERE tenant = ?1 AND chain = ?2 AND seq <= ?3",
+            &[text(A1), text("k"), SqlValue::Int(1)],
+        )
+        .await;
+        assert!(
+            clear
+                .iter()
+                .any(|l| l
+                    .contains("sqlite_autoindex_pending_ops_1 (tenant=? AND chain=? AND seq<?)")),
+            "{clear:?}"
         );
         plan(
             &db,
@@ -626,6 +753,55 @@ fn the_backstop_counts_to_its_cap() {
                 .unwrap(),
             CapTake::Taken { count: 2 }
         );
+    });
+}
+
+/// A zero cap refuses a fresh window without creating its counter row.
+#[test]
+fn a_zero_cap_writes_no_counter_row() {
+    let db = database();
+    let dir = SqlDirectory { sql: &db };
+    block_on(async {
+        let day = day_window(NOW);
+        assert_eq!(
+            dir.take_token_cap("kofra_std", TENANT_CREATE, day, 0)
+                .await
+                .unwrap(),
+            CapTake::Full
+        );
+        let rows = db
+            .query(
+                CAP_COUNT,
+                &[
+                    SqlValue::Int(day),
+                    SqlValue::Text("kofra_std".into()),
+                    SqlValue::Text(TENANT_CREATE.into()),
+                ],
+            )
+            .await
+            .unwrap();
+        assert!(rows.is_empty(), "{rows:?}");
+    });
+}
+
+/// Prune rejects a limit over 1000 and deletes at most the requested rows per call.
+#[test]
+fn cap_pruning_rejects_oversize_limits_and_bounds_each_delete() {
+    let db = database();
+    let dir = SqlDirectory { sql: &db };
+    block_on(async {
+        let day = day_window(NOW);
+        for days_ago in 1..=3 {
+            assert_eq!(
+                dir.take_token_cap("kofra_std", TENANT_CREATE, day - days_ago * 86_400_000, 1)
+                    .await
+                    .unwrap(),
+                CapTake::Taken { count: 1 }
+            );
+        }
+        assert!(dir.prune_token_caps(day, 1001).await.is_err());
+        assert_eq!(dir.prune_token_caps(day, 2).await.unwrap(), 2);
+        assert_eq!(dir.prune_token_caps(day, 2).await.unwrap(), 1);
     });
 }
 

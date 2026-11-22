@@ -17,8 +17,8 @@ use velmora_bridge::directory::finish::{
     MAX_FINISH_RECORDS,
 };
 use velmora_bridge::directory::keys::{
-    is, pages, DirectoryKeys, UnboundDirectory, ERR_APPLY_SHAPE, ERR_NO_TENANT_ROW,
-    ERR_ROUTE_CONFLICT, ERR_ROUTE_WRONG_KIND,
+    is, pages, DirectoryKeys, UnboundDirectory, ERR_APPLY_SHAPE, ERR_KEYS_SEQ_NOT_RAISED,
+    ERR_NO_TENANT_ROW, ERR_ROUTE_CONFLICT, ERR_ROUTE_WRONG_KIND,
 };
 use velmora_bridge::directory::record::{
     DeletionReason, HoldMode, OperatorReason, Tenant, TenantState,
@@ -202,6 +202,8 @@ impl TenantUnits for Units<'_> {
 struct Flaky<'a> {
     db: &'a Db,
     fail: RefCell<Option<&'static str>>,
+    // Some(None) loses the write; Some(Some(seq)) simulates a concurrent raise.
+    zero_raise: Cell<Option<Option<u64>>>,
 }
 
 impl<'a> Flaky<'a> {
@@ -209,6 +211,7 @@ impl<'a> Flaky<'a> {
         Flaky {
             db,
             fail: RefCell::new(None),
+            zero_raise: Cell::new(None),
         }
     }
 
@@ -232,6 +235,20 @@ impl Sql for Flaky<'_> {
     async fn exec(&self, sql: &str, params: &[SqlValue]) -> Result<u64> {
         if self.hit(sql) {
             return Err(BridgeError::Sql("down".into()));
+        }
+        if let Some(raise_to) = self
+            .zero_raise
+            .get()
+            .filter(|_| sql.contains("UPDATE tenants SET keys_seq"))
+        {
+            if let Some(seq) = raise_to {
+                assert!(
+                    SqlDirectory { sql: self.db }
+                        .raise_keys_seq(&t(A1), seq)
+                        .await?
+                );
+            }
+            return Ok(0);
         }
         self.db.exec(sql, params).await
     }
@@ -421,6 +438,119 @@ fn a_closing_reaches_the_units_before_the_directory() {
     });
 }
 
+/// A failed closing stays above the directory row, so a later opening still runs units first.
+#[test]
+fn a_failed_closing_keeps_closing_order_under_an_opening_head() {
+    let db = database();
+    let store = HookedRecords::new();
+    let seal = PlainSeal::new();
+    let chain = TenantChain {
+        store: &store,
+        seal: &seal,
+    };
+    let dir = SqlDirectory { sql: &db };
+    let units = Units::new(&db);
+    block_on(async {
+        tenant_row(&db, &store, &seal, A1).await;
+        let old = row_seq(&db, A1).await.unwrap();
+        let closed = write(&chain, A1, hold(HoldMode::Locked), Actor::Operator).await;
+        units.answer(0, Answer::Fail);
+        let run = finish_tenant(&chain, Some(&dir), &units, &tid(A1), NOW)
+            .await
+            .unwrap();
+        assert_eq!(run.order, Some(WriteOrder::Closing));
+        assert_eq!(run.units, [(0, StoreStep::Failed)]);
+        assert_eq!(units.take_log(), [(0, Some(old))]);
+        assert_eq!(run.directory, StoreStep::Waiting);
+        assert_eq!(row_seq(&db, A1).await, Some(old));
+        assert_eq!(run.events, 0);
+        assert!(events(&db, A1).await.is_empty());
+
+        let opened = write(
+            &chain,
+            A1,
+            Change::SetOperatorHold { hold: None },
+            Actor::Operator,
+        )
+        .await;
+        units.answer(0, Answer::Head);
+        units.head.set(opened);
+        let run = finish_tenant(&chain, Some(&dir), &units, &tid(A1), NOW)
+            .await
+            .unwrap();
+        assert_eq!(run.order, Some(WriteOrder::Closing));
+        assert_eq!(run.units, [(0, StoreStep::Holds(opened))]);
+        assert_eq!(units.take_log(), [(0, Some(old))]);
+        assert_eq!(run.directory, StoreStep::Holds(opened));
+        assert_eq!(row_seq(&db, A1).await, Some(opened));
+        assert_eq!(run.events, 2);
+        assert_eq!(
+            events(&db, A1).await,
+            [
+                (
+                    "tenant.suspended".into(),
+                    format!("t/{closed}"),
+                    json!({"mode": "locked"})
+                ),
+                ("tenant.resumed".into(), format!("t/{opened}"), json!({})),
+            ]
+        );
+    });
+}
+
+/// With an unreadable row, the head's own order decides whether units may run.
+#[test]
+fn an_unreadable_row_blocks_opening_heads_but_not_closing_heads() {
+    let db = database();
+    let flaky = Flaky::new(&db);
+    let store = HookedRecords::new();
+    let seal = PlainSeal::new();
+    let chain = TenantChain {
+        store: &store,
+        seal: &seal,
+    };
+    let dir = SqlDirectory { sql: &flaky };
+    let units = Units::new(&db);
+    block_on(async {
+        tenant_row(&db, &store, &seal, A1).await;
+        let held = write(&chain, A1, hold(HoldMode::Locked), Actor::Operator).await;
+        units.head.set(held);
+        finish_tenant(&chain, Some(&dir), &units, &tid(A1), NOW)
+            .await
+            .unwrap();
+        units.take_log();
+        assert_eq!(row_seq(&db, A1).await, Some(held));
+        flaky.fail(Some("FROM tenants WHERE id"));
+
+        let opened = write(
+            &chain,
+            A1,
+            Change::SetOperatorHold { hold: None },
+            Actor::Operator,
+        )
+        .await;
+        units.head.set(opened);
+        let run = finish_tenant(&chain, Some(&dir), &units, &tid(A1), NOW)
+            .await
+            .unwrap();
+        assert_eq!(run.order, Some(WriteOrder::Opening));
+        assert_eq!(run.directory, StoreStep::Failed);
+        assert_eq!(run.units, [(0, StoreStep::Waiting)]);
+        assert!(units.take_log().is_empty());
+
+        let closed = write(&chain, A1, hold(HoldMode::Locked), Actor::Operator).await;
+        units.head.set(closed);
+        let run = finish_tenant(&chain, Some(&dir), &units, &tid(A1), NOW)
+            .await
+            .unwrap();
+        assert_eq!(run.order, Some(WriteOrder::Closing));
+        assert_eq!(run.directory, StoreStep::Failed);
+        assert_eq!(run.units, [(0, StoreStep::Holds(closed))]);
+        assert_eq!(units.take_log(), [(0, Some(held))]);
+        assert_eq!(row_seq(&db, A1).await, Some(held));
+    });
+}
+
 /// An opening whose directory step fails reaches no unit; a closing
 /// whose directory step fails still reaches every unit. Nothing is
 /// cleared while the directory is behind.
@@ -544,7 +674,8 @@ fn rows_are_cleared_at_what_every_store_holds() {
 
 /// Under a `provisioning` head an unborn root unit is expected: it counts
 /// as holding the head, and no marker is written. Once the tenant is past
-/// provisioning, an unborn unit holds nothing.
+/// provisioning, an unborn unit pages and holds nothing; a failed born
+/// marker also keeps the pending row.
 #[test]
 fn an_unborn_unit_counts_only_while_provisioning() {
     let db = database();
@@ -565,6 +696,7 @@ fn an_unborn_unit_counts_only_while_provisioning() {
             .unwrap();
         assert_eq!(run.units, vec![(0, StoreStep::Unborn)]);
         assert_eq!(run.cleared_to, Some(1));
+        assert!(run.pages.is_empty());
         assert!(units.born.borrow().is_empty());
         for change in [
             Change::ClaimKeyVersion { version: 1 },
@@ -581,6 +713,7 @@ fn an_unborn_unit_counts_only_while_provisioning() {
             .await
             .unwrap();
         assert_eq!(run.units, vec![(0, StoreStep::Unborn)]);
+        assert_eq!(run.pages, ["unit_unborn"]);
         assert_eq!(run.cleared_to, None);
         assert_eq!(pending_seqs(&db, A1, "t").await, vec![4]);
         // A marker that cannot be written is reported; the unit holds.
@@ -592,6 +725,8 @@ fn an_unborn_unit_counts_only_while_provisioning() {
             .unwrap();
         assert_eq!(run.units, vec![(0, StoreStep::Holds(4))]);
         assert_eq!(run.born_failed, vec![0]);
+        assert_eq!(run.cleared_to, None);
+        assert_eq!(pending_seqs(&db, A1, "t").await, vec![4]);
     });
 }
 
@@ -714,6 +849,115 @@ fn events_come_from_the_records_once_each() {
             assert_eq!((k.as_str(), s, d), (*wk, ws, wd));
             assert!(EVENT_TYPES.contains(&k.as_str()), "{k}");
         }
+    });
+}
+
+/// Tightening an effective hold emits suspension; loosening it without resuming does not.
+#[test]
+fn suspension_events_only_follow_stricter_effective_holds() {
+    let db = database();
+    let store = HookedRecords::new();
+    let seal = PlainSeal::new();
+    let chain = TenantChain {
+        store: &store,
+        seal: &seal,
+    };
+    let dir = SqlDirectory { sql: &db };
+    let units = Units::new(&db);
+    block_on(async {
+        tenant_row(&db, &store, &seal, A1).await;
+        let read_only = write(
+            &chain,
+            A1,
+            Change::SetBillingHold {
+                mode: Some(HoldMode::ReadOnly),
+            },
+            Actor::Billing,
+        )
+        .await;
+        let locked = write(&chain, A1, hold(HoldMode::Locked), Actor::Operator).await;
+        let loosened = write(
+            &chain,
+            A1,
+            Change::SetOperatorHold { hold: None },
+            Actor::Operator,
+        )
+        .await;
+        units.head.set(loosened);
+        let run = finish_tenant(&chain, Some(&dir), &units, &tid(A1), NOW)
+            .await
+            .unwrap();
+        assert_eq!(run.directory, StoreStep::Holds(loosened));
+        assert_eq!(
+            events(&db, A1).await,
+            [
+                (
+                    "tenant.suspended".into(),
+                    format!("t/{read_only}"),
+                    json!({"mode": "read_only"})
+                ),
+                (
+                    "tenant.suspended".into(),
+                    format!("t/{locked}"),
+                    json!({"mode": "locked"})
+                ),
+            ]
+        );
+    });
+}
+
+/// A missing row is rebuilt from the shredded stub alone, in closing order with no events.
+#[test]
+fn a_shredded_stub_rebuilds_a_missing_row_without_events() {
+    let db = database();
+    let store = HookedRecords::new();
+    let seal = PlainSeal::new();
+    let chain = TenantChain {
+        store: &store,
+        seal: &seal,
+    };
+    let dir = SqlDirectory { sql: &db };
+    let units = Units::new(&db);
+    block_on(async {
+        active(&chain, A1).await;
+        let due = UnixMs(NOW.0 + 7 * DAY);
+        write(
+            &chain,
+            A1,
+            Change::SetDeletion {
+                shred_due_at: due,
+                reason: DeletionReason::CustomerRequest,
+                key_hash: hash(1),
+            },
+            Actor::Customer,
+        )
+        .await;
+        let now = UnixMs(due.0 + 1);
+        assert!(matches!(
+            chain
+                .write(&t(A1), &Change::StartShred, Actor::ShredJob, now, 0)
+                .await
+                .unwrap(),
+            Written::Wrote(_)
+        ));
+        let Written::Wrote(stub) = chain
+            .write(&t(A1), &Change::FinishShred, Actor::ShredJob, now, 0)
+            .await
+            .unwrap()
+        else {
+            panic!("no shredded stub");
+        };
+        assert!(dir.raw_tenant(&t(A1)).await.unwrap().is_none());
+        let run = finish_tenant(&chain, Some(&dir), &units, &tid(A1), now)
+            .await
+            .unwrap();
+        assert_eq!(run.directory, StoreStep::Holds(stub.door.seq));
+        let row = dir.tenant(&t(A1)).await.unwrap().unwrap();
+        assert_eq!(row.door, stub.door);
+        assert_eq!(row.door.state(), TenantState::Shredded);
+        assert_eq!(run.events, 0);
+        assert!(events(&db, A1).await.is_empty());
+        assert_eq!(run.order, Some(WriteOrder::Closing));
     });
 }
 
@@ -979,6 +1223,10 @@ async fn put_key(
 /// A1's key chain: 1 principal, 2 an S3 key, 3 an app password, 4 the key
 /// disabled, 5 the principal's grants widened, 6 a freeze marker.
 async fn key_chain_of_a1(store: &HookedRecords, kek: &TestKek) {
+    key_chain_of_a1_with_s3_disable(store, kek, true).await;
+}
+
+async fn key_chain_of_a1_with_s3_disable(store: &HookedRecords, kek: &TestKek, disable: bool) {
     let p = principal("p_00000000000000aa");
     put_key(store, kek, A1, 1, KeyOp::Create, &p).await;
     let k = key("AKVL0001", SubjectKind::S3, "p_00000000000000aa", A1, kek);
@@ -991,10 +1239,16 @@ async fn key_chain_of_a1(store: &HookedRecords, kek: &TestKek) {
         kek,
     );
     put_key(store, kek, A1, 3, KeyOp::Create, &a).await;
-    let mut off = k.clone();
-    off.door.status = SubjectStatus::Disabled;
-    put_key(store, kek, A1, 4, KeyOp::Status, &off).await;
-    let mut wider = p.clone();
+    if disable {
+        let mut off = k;
+        off.door.status = SubjectStatus::Disabled;
+        put_key(store, kek, A1, 4, KeyOp::Status, &off).await;
+    } else {
+        // Keep a new route and an event at 4 without replaying AKVL0001 there.
+        let other = key("AKVL0002", SubjectKind::S3, "p_00000000000000aa", A1, kek);
+        put_key(store, kek, A1, 4, KeyOp::Create, &other).await;
+    }
+    let mut wider = p;
     wider.set_grants(&[grant("b_01"), grant("b_02")]);
     put_key(store, kek, A1, 5, KeyOp::Grants, &wider).await;
     let bytes = seal_marker_record(
@@ -1114,6 +1368,84 @@ fn the_directory_routes_each_key_once_and_writes_its_events() {
     });
 }
 
+/// A replay writes routes and events only for entries above the held `keys_seq`.
+#[test]
+fn a_replay_skips_routes_and_events_at_or_below_keys_seq() {
+    let db = database();
+    let store = HookedRecords::new();
+    let seal = PlainSeal::new();
+    let kek = kek();
+    let ring = ring(A1);
+    let a1 = tid(A1);
+    block_on(async {
+        tenant_row(&db, &store, &seal, A1).await;
+        tenant_row(&db, &store, &seal, B2).await;
+        let dir = SqlDirectory { sql: &db };
+        assert!(dir.raise_keys_seq(&t(A1), 3).await.unwrap());
+        dir.put_route(&KeyRoute {
+            akid: "AKVL0001".into(),
+            tenant: t(B2),
+            kind: RouteKind::S3,
+            owner_ref: None,
+            created_at: UnixMs(1),
+        })
+        .await
+        .unwrap();
+        key_chain_of_a1_with_s3_disable(&store, &kek, false).await;
+        let read = read_key_chain(&store, &kek, &ring, &a1).await.unwrap();
+        let feed = Feed::new(&store, &kek, &ring, &read.table, &read.revoked);
+        let entries = feed.entries(0, MAX_APPLY).await.unwrap();
+        let dk = target(&db, &a1, &store, &kek, &ring);
+        let result = dk.apply(0, &entries).await;
+        assert!(
+            matches!(result, Ok(Applied::Done { keys_seq: 6 })),
+            "expected Done {{ keys_seq: 6 }}, got {result:?}"
+        );
+        assert_eq!(dir.route("AKVL0001").await.unwrap().unwrap().tenant, t(B2));
+        assert!(dir.route("APVL0001").await.unwrap().is_none());
+        assert_eq!(dir.route("AKVL0002").await.unwrap().unwrap().tenant, t(A1));
+        let sources: Vec<_> = events(&db, A1)
+            .await
+            .into_iter()
+            .map(|(_, s, _)| s)
+            .collect();
+        assert_eq!(sources, ["k/4", "k/5"]);
+    });
+}
+
+/// A zero-row raise trusts the re-read: below the target fails, ahead reports the actual seq.
+#[test]
+fn a_zero_row_keys_seq_raise_is_checked_against_the_row() {
+    let db = database();
+    let sql = Flaky::new(&db);
+    let store = HookedRecords::new();
+    let seal = PlainSeal::new();
+    let kek = kek();
+    let ring = ring(A1);
+    let a1 = tid(A1);
+    block_on(async {
+        tenant_row(&db, &store, &seal, A1).await;
+        key_chain_of_a1(&store, &kek).await;
+        let read = read_key_chain(&store, &kek, &ring, &a1).await.unwrap();
+        let feed = Feed::new(&store, &kek, &ring, &read.table, &read.revoked);
+        let entries = feed.entries(0, MAX_APPLY).await.unwrap();
+        let dk = DirectoryKeys::new(SqlDirectory { sql: &sql }, &a1, &store, &kek, &ring);
+
+        sql.zero_raise.set(Some(None));
+        let error = dk.apply(0, &entries).await.unwrap_err();
+        assert!(is(&error, &ERR_KEYS_SEQ_NOT_RAISED), "{error:?}");
+        assert_eq!(dk.keys_seq().await.unwrap(), 0);
+
+        sql.zero_raise.set(Some(Some(9)));
+        let result = dk.apply(0, &entries).await;
+        assert!(
+            matches!(result, Ok(Applied::Done { keys_seq: 9 })),
+            "expected Done {{ keys_seq: 9 }}, got {result:?}"
+        );
+        assert_eq!(dk.keys_seq().await.unwrap(), 9);
+    });
+}
+
 /// The apply's base and shape rules, as a unit's: a base above the row
 /// answers `Behind`; a gap, a wrong first seq or more than `MAX_APPLY`
 /// entries is refused and keeps nothing.
@@ -1192,7 +1524,7 @@ fn a_tenant_with_no_row_takes_no_key() {
 }
 
 /// A route of the key to another tenant is damage: the apply fails and
-/// pages, `keys_seq` stays, and a later run finds the same.
+/// pages once across retries until drained; `keys_seq` stays.
 #[test]
 fn a_conflicting_route_pages_and_keeps_keys_seq() {
     let db = database();
@@ -1224,14 +1556,16 @@ fn a_conflicting_route_pages_and_keeps_keys_seq() {
             assert!(is(&e, &ERR_ROUTE_CONFLICT) && pages(&e));
             assert_eq!(dk.keys_seq().await.unwrap(), 0);
         }
+        assert_eq!(dk.take_pages(), ["directory_route_conflict"]);
+        assert!(dk.take_pages().is_empty());
         // The events were written first, once.
         assert_eq!(events(&db, A1).await.len(), 5);
         assert_eq!(dir.route("AKVL0001").await.unwrap().unwrap().tenant, t(B2));
     });
 }
 
-/// A key id that does not fit its kind pages; a held entry's route keeps
-/// its `owner_ref`.
+/// A key id that does not fit its kind leaves a wrong-kind page to drain;
+/// a held entry's route keeps its `owner_ref`.
 #[test]
 fn a_wrong_kind_pages_and_a_held_entry_keeps_its_owner() {
     let db = database();
@@ -1275,7 +1609,93 @@ fn a_wrong_kind_pages_and_a_held_entry_keeps_its_owner() {
         e.door.kind = SubjectKind::S3;
         let err = dk.apply(2, &next).await.unwrap_err();
         assert!(is(&err, &ERR_ROUTE_WRONG_KIND) && pages(&err));
+        assert_eq!(dk.take_pages(), ["directory_route_wrong_kind"]);
+        assert!(dk.take_pages().is_empty());
         assert_eq!(dk.keys_seq().await.unwrap(), 2);
+    });
+}
+
+/// A held route's NULL owner can be filled, but a later put cannot replace it.
+#[test]
+fn a_route_fills_a_missing_owner_once() {
+    let db = database();
+    let store = HookedRecords::new();
+    let seal = PlainSeal::new();
+    let kek = kek();
+    let ring = ring(A1);
+    let a1 = tid(A1);
+    block_on(async {
+        tenant_row(&db, &store, &seal, A1).await;
+        let p = principal("p_00000000000000aa");
+        put_key(&store, &kek, A1, 1, KeyOp::Create, &p).await;
+        let mut k = key("AKVL0001", SubjectKind::S3, &p.door.id, A1, &kek);
+        put_key(&store, &kek, A1, 2, KeyOp::Create, &k).await;
+        for (seq, bucket) in [(3, "b_02"), (4, "b_03")] {
+            k.set_grants(&[grant(bucket)]);
+            put_key(&store, &kek, A1, seq, KeyOp::Grants, &k).await;
+        }
+        let read = read_key_chain(&store, &kek, &ring, &a1).await.unwrap();
+        let feed = Feed::new(&store, &kek, &ring, &read.table, &read.revoked);
+        let mut entries = feed.entries(0, MAX_APPLY).await.unwrap();
+        let ApplyEntry::Subject(mut held) = entries[1].clone() else {
+            panic!("not a subject");
+        };
+        held.private = None;
+        entries[1] = ApplyEntry::Held {
+            entry: held,
+            owner_ref: None,
+        };
+        let ApplyEntry::Subject(later) = &mut entries[3] else {
+            panic!("not a subject");
+        };
+        later.private.as_mut().unwrap().owner_ref = Some("later-owner".into());
+
+        let dk = target(&db, &a1, &store, &kek, &ring);
+        assert_eq!(
+            dk.apply(0, &entries[..2]).await.unwrap(),
+            Applied::Done { keys_seq: 2 }
+        );
+        let dir = SqlDirectory { sql: &db };
+        let route = || async { dir.route("AKVL0001").await.unwrap().unwrap().owner_ref };
+        assert_eq!(route().await, None);
+        assert_eq!(
+            dk.apply(2, &entries[2..3]).await.unwrap(),
+            Applied::Done { keys_seq: 3 }
+        );
+        assert_eq!(route().await.as_deref(), Some("owner-of-AKVL0001"));
+        assert_eq!(
+            dk.apply(3, &entries[3..]).await.unwrap(),
+            Applied::Done { keys_seq: 4 }
+        );
+        assert_eq!(route().await.as_deref(), Some("owner-of-AKVL0001"));
+    });
+}
+
+/// An internal key gets a directory route but no tenant event.
+#[test]
+fn an_internal_key_has_a_route_but_no_event() {
+    let db = database();
+    let store = HookedRecords::new();
+    let seal = PlainSeal::new();
+    let kek = kek();
+    let ring = ring(A1);
+    let a1 = tid(A1);
+    block_on(async {
+        tenant_row(&db, &store, &seal, A1).await;
+        let mut k = key("AKVL0001", SubjectKind::Internal, "", A1, &kek);
+        k.door.made_by = None;
+        put_key(&store, &kek, A1, 1, KeyOp::Create, &k).await;
+        let read = read_key_chain(&store, &kek, &ring, &a1).await.unwrap();
+        let feed = Feed::new(&store, &kek, &ring, &read.table, &read.revoked);
+        let entries = feed.entries(0, MAX_APPLY).await.unwrap();
+        let dk = target(&db, &a1, &store, &kek, &ring);
+        assert_eq!(
+            dk.apply(0, &entries).await.unwrap(),
+            Applied::Done { keys_seq: 1 }
+        );
+        let route = dk.dir.route(&k.door.id).await.unwrap().unwrap();
+        assert_eq!((route.tenant, route.kind), (t(A1), RouteKind::Internal));
+        assert!(events(&db, A1).await.is_empty());
     });
 }
 
