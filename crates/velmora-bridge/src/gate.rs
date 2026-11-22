@@ -2388,7 +2388,10 @@ impl<T: GateTransport> GateClient<T> {
         let now = (self.clock)().0;
         let turn = {
             let mut links = self.links.borrow_mut();
-            links.retain(|k, link| *k == key || (0..LINK_IDLE_MS).contains(&(now - link.used)));
+            // A session another invocation used a moment "after" this
+            // one's clock is in use: see `UnixMs::within`.
+            links
+                .retain(|k, link| *k == key || UnixMs(now).within(UnixMs(link.used), LINK_IDLE_MS));
             let link = links.entry(key.clone()).or_insert_with(|| Link {
                 session: None,
                 tokens: BTreeSet::new(),
