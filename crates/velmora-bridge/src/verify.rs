@@ -597,7 +597,10 @@ where
             // No slot on this backbone. It is waited for under the claim
             // for a bounded time ([`crate::jobs::SLOT_WAIT_MS`]): the
             // row is not given back and delivered again for a slot
-            // that comes free in seconds.
+            // that comes free in seconds. All still-usable providers
+            // were tried; give back any unclaimed grant before joining,
+            // including ones left over from an earlier backbone.
+            self.catalog.leave_line(&holder);
             if !self
                 .slot_wait(lease, &asked, pool.cooling_until(&fresh))
                 .await
