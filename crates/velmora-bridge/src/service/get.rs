@@ -47,6 +47,14 @@ thread_local! {
     static STAMPED: RefCell<HashMap<String, i64>> = RefCell::new(HashMap::new());
 }
 
+/// Whether a stamp `at` this isolate remembers is recent enough at `now`
+/// to skip the catalogue. The stamp is the catalogue's, written by any
+/// invocation or isolate, so it can be a moment ahead of this clock: that
+/// is recent, not a reason to stamp again (see [`UnixMs::within`]).
+fn stamped_recently(now: UnixMs, at: i64) -> bool {
+    now.within(UnixMs(at), READ_STAMP_MS)
+}
+
 /// Records that `extent` served a read, for the eviction order. Best
 /// effort: a failed stamp never fails the read. `from_cache`: the bytes
 /// came from the cache fill; the same write counts a fill that the
@@ -67,7 +75,7 @@ async fn stamp_read<C, B, N, J, K, T>(
     let recent = STAMPED.with(|memo| {
         memo.borrow()
             .get(extent.as_str())
-            .is_some_and(|&at| (0..READ_STAMP_MS).contains(&(now.0 - at)))
+            .is_some_and(|&at| stamped_recently(now, at))
     });
     if recent {
         return;
@@ -1362,6 +1370,21 @@ mod tests {
     use std::sync::Arc;
 
     use futures_util::task::{noop_waker, waker, ArcWake};
+
+    /// The stamp the catalogue holds may come from a clock a moment
+    /// ahead of this one: it is recent, and the read is not stamped
+    /// again. One a whole gap ahead is old, so a clock that jumped cannot
+    /// keep an extent from being stamped.
+    #[test]
+    fn a_stamp_a_moment_ahead_is_recent_and_one_far_ahead_is_not() {
+        let now = UnixMs(10_000_000);
+        for ahead in [1, 24, 5_000] {
+            assert!(stamped_recently(now, now.0 + ahead), "{ahead} ms ahead");
+        }
+        assert!(stamped_recently(now, now.0 - (READ_STAMP_MS - 1)));
+        assert!(!stamped_recently(now, now.0 - READ_STAMP_MS));
+        assert!(!stamped_recently(now, now.0 + READ_STAMP_MS));
+    }
 
     /// Polls `stream` once for its next item.
     fn pull<S: Stream + Unpin>(stream: &mut S) -> Poll<Option<S::Item>> {

@@ -2249,6 +2249,126 @@ async fn a_call_that_crosses_a_forgotten_session_asks_again() {
     assert_eq!((w.sessions(name), w.held(name, "p").await), (0, 0));
 }
 
+/// The invocations of one isolate share its sessions and read the
+/// time each on a clock of its own, which stands still between two
+/// events of that invocation: one can read less than another wrote a
+/// moment before. A call whose clock is behind leaves the session of
+/// another holder alone: the holder renews on it and gives its slot
+/// back on it, and the gate hands the slot on at once. Were the session
+/// dropped there, the holder would find none to give its slot back on,
+/// the socket would stay open with the invocation that opened it, and
+/// the slot would be held until it ran out.
+#[tokio::test]
+async fn a_call_whose_clock_is_behind_leaves_the_sessions_of_others() {
+    let w = World::new();
+    let p = provider("p", 3);
+    let providers = [p.clone()];
+    let behind = Rc::new(Cell::new(0_i64));
+    let clock = {
+        let (w, behind) = (w.clone(), behind.clone());
+        move || UnixMs(w.now().0 - behind.get())
+    };
+    let (mode, one) = (PermitMode::Gate, GateSharding::One);
+    let client = GateClient::new(Wire(w.clone()), clock, mode, one, 1, &providers);
+    let c = SqlCatalog::with_gate(w.db.clone(), client.into_gate());
+    c.seed_permits(&providers).await.unwrap();
+    let name = "permits:all:0";
+    for ms in [1, 24, 5_000] {
+        let a = take(&c, &w, &p, JOB, "job-1").await.unwrap();
+        behind.set(ms);
+        let b = take(&c, &w, &p, JOB, "job-2").await.unwrap();
+        behind.set(0);
+        assert_eq!((w.sessions(name), w.held(name, "p").await), (2, 2));
+        assert!(c.renew_permit(&a, w.now()).await.unwrap(), "{ms} ms: held");
+        c.release_permit(&a).await.unwrap();
+        let open = (w.sessions(name), w.held(name, "p").await);
+        assert_eq!(open, (1, 1), "{ms} ms: given back at once");
+        c.release_permit(&b).await.unwrap();
+        assert_eq!((w.sessions(name), w.held(name, "p").await), (0, 0));
+    }
+}
+
+/// A session nobody has used for the lifetime of a slot and the time a
+/// gate keeps an idle session holds nothing any more: it is forgotten
+/// when another holder next asks, and its holder is answered with no
+/// request. A millisecond earlier it is still known, and asked on.
+#[tokio::test]
+async fn a_session_unused_for_the_lifetime_of_a_slot_is_still_forgotten() {
+    let w = World::new();
+    let p = provider("p", 3);
+    let providers = [p.clone()];
+    let c = w.catalog(PermitMode::Gate, GateSharding::One, &providers);
+    c.seed_permits(&providers).await.unwrap();
+    let name = "permits:all:0";
+    for (idle, asked) in [(LINK_IDLE_MS - 1, 1), (LINK_IDLE_MS, 0)] {
+        let a = take(&c, &w, &p, JOB, "job-1").await.unwrap();
+        w.pass(idle);
+        let b = take(&c, &w, &p, JOB, "job-2").await.unwrap();
+        let msgs = w.msgs.get();
+        assert!(!c.renew_permit(&a, w.now()).await.unwrap(), "ran out");
+        assert_eq!(w.msgs.get(), msgs + asked, "after {idle} ms");
+        c.release_permit(&a).await.unwrap();
+        assert_eq!(w.msgs.get(), msgs + asked, "nothing is held on it");
+        c.release_permit(&b).await.unwrap();
+        assert_eq!(w.held(name, "p").await, 0);
+        w.pass(LINK_IDLE_MS);
+    }
+}
+
+/// A session stamped by a clock a whole lifetime ahead is not a reading
+/// order but a clock that jumped: it is forgotten like an idle one, so
+/// a stamp from the future cannot keep a session known forever. A
+/// millisecond less ahead, it is still known, and asked on.
+#[tokio::test]
+async fn a_session_stamped_far_ahead_is_still_forgotten() {
+    let w = World::new();
+    let p = provider("p", 3);
+    let providers = [p.clone()];
+    let ahead = Rc::new(Cell::new(0_i64));
+    let clock = {
+        let (w, ahead) = (w.clone(), ahead.clone());
+        move || UnixMs(w.now().0 + ahead.get())
+    };
+    let (mode, one) = (PermitMode::Gate, GateSharding::One);
+    let client = GateClient::new(Wire(w.clone()), clock, mode, one, 1, &providers);
+    let c = SqlCatalog::with_gate(w.db.clone(), client.into_gate());
+    c.seed_permits(&providers).await.unwrap();
+    let name = "permits:all:0";
+    for (skew, asked) in [(LINK_IDLE_MS - 1, 1), (LINK_IDLE_MS, 0)] {
+        ahead.set(skew);
+        let a = take(&c, &w, &p, JOB, "job-1").await.unwrap();
+        ahead.set(0);
+        let b = take(&c, &w, &p, JOB, "job-2").await.unwrap();
+        let msgs = w.msgs.get();
+        c.release_permit(&a).await.unwrap();
+        assert_eq!(w.msgs.get(), msgs + asked, "{skew} ms ahead");
+        c.release_permit(&b).await.unwrap();
+        w.pass(LINK_IDLE_MS);
+        assert_eq!(w.held(name, "p").await, 0);
+    }
+}
+
+/// What a gate said of its load is heard by one invocation and read by
+/// another, whose clock can be behind: it is used all the same, unless
+/// it is a whole hint's life ahead, which is a clock that jumped.
+#[tokio::test]
+async fn the_load_a_gate_told_is_used_by_a_call_whose_clock_is_behind() {
+    let w = World::new();
+    let p = provider("p", 3);
+    let providers = [p.clone()];
+    let c = w.catalog(PermitMode::Gate, GateSharding::One, &providers);
+    c.seed_permits(&providers).await.unwrap();
+    take(&c, &w, &p, JOB, "job-1").await.unwrap();
+    for behind in [0, 1, 24, HINT_MS - 1] {
+        let load = c.provider_load(UnixMs(w.now().0 - behind)).await.unwrap();
+        assert_eq!(load[0].held, 1, "{behind} ms behind");
+    }
+    let load = c.provider_load(UnixMs(w.now().0 - HINT_MS)).await.unwrap();
+    assert_eq!(load[0].held, 0, "too far ahead to go by");
+    let load = c.provider_load(UnixMs(w.now().0 + HINT_MS)).await.unwrap();
+    assert_eq!(load[0].held, 0, "too old to go by");
+}
+
 /// Names that are not ASCII are counted at their stored size, and
 /// their providers are served like any other.
 #[tokio::test]

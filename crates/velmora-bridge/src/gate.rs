@@ -1827,7 +1827,10 @@ impl<T: GateTransport> GateClient<T> {
             let mut links = self.links.borrow_mut();
             // Not closed: a session of an invocation that has ended is
             // not this one's to touch, and ended with it.
-            links.retain(|k, link| *k == key || (0..LINK_IDLE_MS).contains(&(now - link.used)));
+            // A session another invocation used a moment "after" this
+            // one's clock is in use: see `UnixMs::within`.
+            links
+                .retain(|k, link| *k == key || UnixMs(now).within(UnixMs(link.used), LINK_IDLE_MS));
             let link = links.entry(key.clone()).or_insert_with(fresh);
             link.used = now;
             Rc::clone(&link.turn)
@@ -2133,7 +2136,7 @@ impl<T: GateTransport> PermitGate for GateClient<T> {
         let hints = self.hints.borrow();
         let fresh = hints
             .values()
-            .filter(|(at, _)| (0..HINT_MS).contains(&(now.0 - at)));
+            .filter(|(at, _)| now.within(UnixMs(*at), HINT_MS));
         sum_load(fresh.flat_map(|(_, load)| load.iter().cloned()).collect())
     }
 
