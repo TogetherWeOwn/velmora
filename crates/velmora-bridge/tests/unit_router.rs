@@ -455,6 +455,22 @@ async fn a_key_row_that_cannot_be_read_answers_503_first() {
     let m = served(prepared(&r, Maintenance::Off, &req).await);
     assert_eq!(m.routed, Err(RouteRefusal::NotPlaced));
     assert_eq!(m.root.unit, unit(0));
+    // A shredding tenant's key row answers 503 before the signature,
+    // never 403 AccountProblem (ADR §2.8: that comes after it).
+    let mut shredding = answered(
+        UnitAnswer::RenewNeeded {
+            seqs: seqs(3, 1),
+            why: None,
+        },
+        None,
+    );
+    shredding.renewal = Some(velmora_bridge::unit_lease::client::Renewal::Shredding);
+    let clients = Clients::answering(vec![shredding]);
+    let heads = Heads::one(3, &[0]);
+    let cache = HeadCache::default();
+    let r = router(Maintenance::Off, &clients, &heads, &cache, &clock);
+    let (status, line) = answered_with(prepared(&r, Maintenance::Off, &req).await);
+    assert_eq!((status, line.code), (503, "account_problem"));
     // Tenant 0 is never prepared.
     let zero = TenantId::parse(velmora_bridge::TenantScope::tenant_zero().tenant_id()).unwrap();
     let p = prepare(&r, &cfg(Maintenance::Off), &zero, NONE, AKID, &req).await;

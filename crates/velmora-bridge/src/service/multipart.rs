@@ -406,7 +406,11 @@ where
     K: Kek,
     T: Clock,
 {
-    if bridge.cfg.maintenance == Maintenance::Restore {
+    // Tenant 0: every multipart call is refused under `restore` first. A
+    // managed tenant's request checks its signature first (AM-64), and
+    // the refusal follows it (below).
+    let on_unit = bridge.catalog.request_scope().is_some();
+    if bridge.cfg.maintenance == Maintenance::Restore && !on_unit {
         return Err(ErrorCode::SlowDown.into());
     }
     let policy = policy(&bridge.cfg, signed_host(&bridge.cfg, req))?;
@@ -438,6 +442,9 @@ where
         match verify_on_unit(bridge, req, &policy, &target, &headers, &presented).await {
             Some(signed) => {
                 let (verified, key) = signed.map_err(Fail::Response)?;
+                if bridge.cfg.maintenance == Maintenance::Restore {
+                    return Err(ErrorCode::SlowDown.into());
+                }
                 let mut authority = OneKey::default();
                 let bucket = bridge.catalog.bucket_by_name(&target.bucket).await?;
                 let perm = match &bucket {
@@ -1465,7 +1472,7 @@ where
         let record = write_generation(
             &bridge.catalog,
             &bridge.safety,
-            &bridge.kek,
+            &bridge.sealer(),
             &bridge.cfg.records,
             &a.bucket,
             &commit.generation,

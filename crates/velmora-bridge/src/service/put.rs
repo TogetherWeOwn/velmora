@@ -220,7 +220,7 @@ async fn put<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: 
         let record = write_generation(
             &bridge.catalog,
             &bridge.safety,
-            &bridge.kek,
+            &bridge.sealer(),
             &bridge.cfg.records,
             bucket,
             &commit.generation,
@@ -518,7 +518,7 @@ async fn put_sliced<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: K
         let record = write_generation(
             &bridge.catalog,
             &bridge.safety,
-            &bridge.kek,
+            &bridge.sealer(),
             &bridge.cfg.records,
             bucket,
             &commit.generation,

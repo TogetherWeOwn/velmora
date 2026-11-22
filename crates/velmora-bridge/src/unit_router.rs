@@ -42,7 +42,7 @@ use crate::directory::chain::ChainError;
 use crate::directory::record::{Lifecycle, TenantDoor};
 use crate::ports::{BlobStore, Clock};
 use crate::types::{BridgeError, Result, UnixMs};
-use crate::unit::{CallKind, Seqs, TenantId, UnitAnswer, UnitCall, UnitName, UnitOp};
+use crate::unit::{CallKind, Seqs, TenantId, UnitAnswer, UnitCall, UnitName, UnitOp, UnitReply};
 use crate::unit_lease::client::{
     Answered, KeyFeed, KeyFinisher, Page, Renewal, Synced, TenantHeads, UnitClient, UnitReplies,
 };
@@ -495,11 +495,32 @@ impl<C: RequestClients, H: TenantHeads, T: Clock> UnitRouter for Router<'_, C, H
         authenticated: bool,
         op: UnitOp,
     ) -> (std::result::Result<Answered, RouteRefusal>, Vec<Page>) {
+        let (result, pages) = self.call_with_reply(routed, kind, authenticated, op).await;
+        (result.map_err(|(refusal, _)| refusal), pages)
+    }
+}
+
+impl<C: RequestClients, H: TenantHeads, T: Clock> Router<'_, C, H, T> {
+    /// [`UnitRouter::call`], with the unit's own answer beside a refusal
+    /// when one came (`None`: no call was made, or no answer came). The
+    /// request path uses it: an answer the unit gave before it ran the
+    /// call (`closed`, `unborn`, a lease or numbers still refused) tells
+    /// the request client that a publication wrote nothing.
+    pub async fn call_with_reply(
+        &self,
+        routed: &Routed,
+        kind: CallKind,
+        authenticated: bool,
+        op: UnitOp,
+    ) -> (
+        std::result::Result<Answered, (RouteRefusal, Option<UnitReply>)>,
+        Vec<Page>,
+    ) {
         if self.maintenance == Maintenance::Restore && writes(kind, &op) {
-            return (Err(RouteRefusal::Maintenance), Vec::new());
+            return (Err((RouteRefusal::Maintenance, None)), Vec::new());
         }
         let Ok(client) = self.clients.client(routed) else {
-            return (Err(RouteRefusal::Unavailable), Vec::new());
+            return (Err((RouteRefusal::Unavailable, None)), Vec::new());
         };
         let (answered, pages) = client
             .call(UnitCall {
@@ -512,7 +533,7 @@ impl<C: RequestClients, H: TenantHeads, T: Clock> UnitRouter for Router<'_, C, H
             })
             .await;
         let Ok(answered) = answered else {
-            return (Err(RouteRefusal::Unavailable), pages);
+            return (Err((RouteRefusal::Unavailable, None)), pages);
         };
         let tenant = &routed.unit.tenant;
         // Rule 7 pages only for a live tenant (AM-58): while the head is
@@ -538,22 +559,26 @@ impl<C: RequestClients, H: TenantHeads, T: Clock> UnitRouter for Router<'_, C, H
             (Some(Renewal::Shredding), _) => Some(RouteRefusal::AccountProblem),
             _ => None,
         };
-        let result = match &answered.reply.answer {
-            UnitAnswer::Closed { .. } => Err(RouteRefusal::Closed),
-            UnitAnswer::Unborn { listed: true } => Err(lost),
-            UnitAnswer::Unborn { listed: false } => Err(RouteRefusal::NotPlaced),
+        let refused = match &answered.reply.answer {
+            UnitAnswer::Closed { .. } => Some(RouteRefusal::Closed),
+            UnitAnswer::Unborn { listed: true } => Some(lost),
+            UnitAnswer::Unborn { listed: false } => Some(RouteRefusal::NotPlaced),
             UnitAnswer::Stale { .. }
             | UnitAnswer::SyncNeeded { .. }
             | UnitAnswer::RenewNeeded { .. }
                 if kind == CallKind::Request =>
             {
-                Err(fixed.unwrap_or(RouteRefusal::NotFresh))
+                Some(fixed.unwrap_or(RouteRefusal::NotFresh))
             }
             UnitAnswer::Ok { seqs, .. } => {
                 self.cache.answered(tenant, *seqs);
-                Ok(answered)
+                None
             }
-            _ => Ok(answered),
+            _ => None,
+        };
+        let result = match refused {
+            Some(refusal) => Err((refusal, Some(answered.reply))),
+            None => Ok(answered),
         };
         (result, pages)
     }

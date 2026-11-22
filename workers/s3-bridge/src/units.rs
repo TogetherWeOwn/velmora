@@ -391,6 +391,8 @@ fn request_bridge(
         cache,
         || SystemRng,
         base.cfg.maintenance,
+        request.root.clone(),
+        request.root_renew,
         request.routed,
         Rc::clone(&verified),
     );
@@ -420,7 +422,7 @@ fn request_bridge(
 /// (`service::managed::finish`: the refused publications' records
 /// discarded, a unit's refusal as the answer). A background renewal the
 /// unit asked for (rule 12) is the work left for after the response,
-/// which the caller runs under `waitUntil`.
+/// which the caller runs under `waitUntil` after a deferred body's work.
 pub async fn serve_on_unit(
     bridge: Rc<RequestBridge>,
     req: velmora_bridge::S3Request,
@@ -428,24 +430,28 @@ pub async fn serve_on_unit(
     let resp = Rc::clone(&bridge).handle(req).await;
     let finished = managed::finish(bridge.catalog.client(), &bridge.safety, resp).await;
     finished.lines.into_iter().for_each(log_request);
-    let after = finished.renew.map(|(unit, seqs)| {
+    // Run after the response (and a deferred body's work): the renewal
+    // a call asked for, also one asked for by the calls of the body's
+    // work, which run after `finish` (their pages the port logs itself).
+    let first = finished.renew;
+    let after: crate::After = Box::pin(async move {
         let port = bridge.catalog.client().port();
+        let Some((unit, seqs)) = managed::PortState::renew_due(port).or(first) else {
+            return;
+        };
         let (ports, cache) = (Rc::clone(port.ports()), Rc::clone(port.cache()));
-        let renew: crate::After = Box::pin(async move {
-            let pages = velmora_bridge::root::request::renew_in_background(
-                &*ports, &cache, SystemRng, &unit, seqs,
-            )
-            .await;
-            for page in pages.iter().flatten() {
-                worker::console_error!(
-                    "alert: unit request ({})",
-                    velmora_bridge::unit_consumer::page_code(page)
-                );
-            }
-        });
-        renew
+        let pages = velmora_bridge::root::request::renew_in_background(
+            &*ports, &cache, SystemRng, &unit, seqs,
+        )
+        .await;
+        for page in pages.iter().flatten() {
+            worker::console_error!(
+                "alert: unit request ({})",
+                velmora_bridge::unit_consumer::page_code(page)
+            );
+        }
     });
-    (finished.resp, after)
+    (finished.resp, Some(after))
 }
 
 fn log_request(line: velmora_bridge::service::ManagedLine) {

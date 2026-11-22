@@ -251,6 +251,15 @@ where
         }
     }
 
+    /// What seals the request's recovery records: the managed tenant's
+    /// current key (VMR2) when the catalogue holds one, else the KEK.
+    pub fn sealer(&self) -> crate::recovery::Sealer<'_, C, K> {
+        crate::recovery::Sealer {
+            catalog: &self.catalog,
+            kek: &self.kek,
+        }
+    }
+
     /// The data key of `bucket`: the catalogue's when it holds its
     /// buckets under a tenant key ([`Catalog::bucket_key`]), else the
     /// KEK's unwrap.

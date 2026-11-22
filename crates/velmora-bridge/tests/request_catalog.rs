@@ -339,9 +339,9 @@ fn finish_answers_with_the_units_refusal_when_the_handler_failed() {
         ),
         (
             refused(Refused::Size(SizeRefusal::TooManyExtents)),
-            403,
+            503,
             "unit_extents_full",
-            false,
+            true,
         ),
         (refused(Refused::Unauthenticated), 500, "unit_refused", true),
     ] {

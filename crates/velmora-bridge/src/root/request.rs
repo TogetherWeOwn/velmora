@@ -15,9 +15,13 @@
 //! - Every call after it is authenticated and carries the routed unit's
 //!   numbers, raised to what the unit answered (rule 5's numbers, kept
 //!   for the request's later calls).
+//! - Every `key_row` goes to the root unit, which answered the first one.
 //! - A router refusal (`503`, or `403 AccountProblem`) is kept, the first
-//!   one, for `service::managed::finish`; so are the unit client's pages
-//!   and an answer that asked for a background renewal (rule 12).
+//!   one, for `service::managed::finish`, and the unit's own answer, when
+//!   one came, is handed to the request client (a publication the unit
+//!   refused before running it hands its record back). So are the unit
+//!   client's pages kept, and an answer that asked for a background
+//!   renewal (rule 12); pages of calls after `finish` are logged at once.
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -32,7 +36,7 @@ use crate::tenant_catalog::UnitPort;
 use crate::types::{BridgeError, Result};
 use crate::unit::{Seqs, UnitAnswer, UnitCall, UnitName, UnitOp};
 use crate::unit_lease::client::Page;
-use crate::unit_router::{RouteRefusal, Routed, UnitRouter};
+use crate::unit_router::{RouteRefusal, Routed};
 
 use super::client::UnitPorts;
 use super::{Root, RootCache};
@@ -50,33 +54,47 @@ pub struct RequestPort<P: UnitPorts, R> {
     rng: fn() -> R,
     maintenance: Maintenance,
     routed: RefCell<std::result::Result<Routed, RouteRefusal>>,
+    /// The root unit, which every `key_row` goes to (the first, before
+    /// the signature, and the AM-63 re-read).
+    root: RefCell<Routed>,
     verified: Rc<Cell<bool>>,
     refusal: Cell<Option<RouteRefusal>>,
     pages: RefCell<Vec<Page>>,
-    renew: Cell<Option<Seqs>>,
+    /// The pages were taken (`finish`): later ones are logged at once.
+    drained: Cell<bool>,
+    /// A renewal an answer asked for: the unit and its numbers.
+    renew: RefCell<Option<(UnitName, Seqs)>>,
 }
 
 impl<P: UnitPorts, R: FillRandom> RequestPort<P, R> {
-    /// The port of a request routed to `routed` (or refused there).
-    /// `verified` is the request catalogue's flag.
+    /// The port of a request routed to `routed` (or refused there), whose
+    /// `key_row` the root unit `root` answered (`root_renew`: that answer
+    /// asked for a background renewal). `verified` is the request
+    /// catalogue's flag.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         ports: Rc<P>,
         cache: Rc<RootCache>,
         rng: fn() -> R,
         maintenance: Maintenance,
+        root: Routed,
+        root_renew: Option<Seqs>,
         routed: std::result::Result<Routed, RouteRefusal>,
         verified: Rc<Cell<bool>>,
     ) -> Self {
+        let renew = root_renew.map(|seqs| (root.unit.clone(), seqs));
         RequestPort {
             ports,
             cache,
             rng,
             maintenance,
             routed: RefCell::new(routed),
+            root: RefCell::new(root),
             verified,
             refusal: Cell::new(None),
             pages: RefCell::new(Vec::new()),
-            renew: Cell::new(None),
+            drained: Cell::new(false),
+            renew: RefCell::new(renew),
         }
     }
 
@@ -109,39 +127,68 @@ impl<P: UnitPorts, R: FillRandom> UnitPort for RequestPort<P, R> {
         if !authenticated && !matches!(call.op, UnitOp::KeyRow { .. }) {
             return Err(ERR_UNSIGNED_CALL);
         }
-        let routed = match &*self.routed.borrow() {
-            Ok(routed) => routed.clone(),
-            Err(refusal) => {
-                self.keep(*refusal);
-                return Err(ERR_ROUTE_REFUSED);
-            }
+        let key_row = matches!(call.op, UnitOp::KeyRow { .. });
+        let routed = match key_row {
+            true => self.root.borrow().clone(),
+            false => match &*self.routed.borrow() {
+                Ok(routed) => routed.clone(),
+                Err(refusal) => {
+                    self.keep(*refusal);
+                    return Err(ERR_ROUTE_REFUSED);
+                }
+            },
         };
         let root = Root::new(&*self.ports, &self.cache, (self.rng)());
         let clients = root.clients();
         let heads = root.heads();
         let router = root.router(self.maintenance, &clients, &heads);
         let (answered, pages) = router
-            .call(&routed, call.kind, authenticated, call.op.clone())
+            .call_with_reply(&routed, call.kind, authenticated, call.op.clone())
             .await;
-        self.pages.borrow_mut().extend(pages);
+        match self.drained.get() {
+            false => self.pages.borrow_mut().extend(pages),
+            true => {
+                for page in &pages {
+                    crate::trace::alert(|| {
+                        format!("unit request ({})", crate::unit_consumer::page_code(page))
+                    });
+                }
+            }
+        }
         let answered = match answered {
             Ok(answered) => answered,
-            Err(refusal) => {
+            // The unit answered without running the call (closed, unborn,
+            // a lease or numbers it still refused): the refusal is kept,
+            // and the request client gets the unit's own answer, so a
+            // publication it refused that way hands its record back.
+            Err((refusal, Some(reply))) => {
+                self.keep(refusal);
+                return Ok(reply.answer);
+            }
+            Err((refusal, None)) => {
                 self.keep(refusal);
                 return Err(ERR_ROUTE_REFUSED);
             }
         };
-        // The unit's numbers carry to this request's later calls (rule 5):
-        // never lower than the head's.
+        // The unit's numbers carry to this request's later calls to it
+        // (rule 5): never lower than the head's.
         if let UnitAnswer::Ok { seqs, .. } = &answered.reply.answer {
-            if let Ok(r) = &mut *self.routed.borrow_mut() {
+            let raise = |r: &mut Routed| {
                 r.seqs = Seqs {
                     state_seq: r.seqs.state_seq.max(seqs.state_seq),
                     keys_seq: r.seqs.keys_seq.max(seqs.keys_seq),
                 };
+            };
+            match key_row {
+                true => raise(&mut self.root.borrow_mut()),
+                false => {
+                    if let Ok(r) = &mut *self.routed.borrow_mut() {
+                        raise(r);
+                    }
+                }
             }
             if answered.renew_due {
-                self.renew.set(Some(*seqs));
+                *self.renew.borrow_mut() = Some((routed.unit.clone(), *seqs));
             }
         }
         Ok(answered.reply.answer)
@@ -162,13 +209,12 @@ impl<P: UnitPorts, R: FillRandom> PortState for RequestPort<P, R> {
     }
 
     fn take_pages(&self) -> Vec<Page> {
+        self.drained.set(true);
         std::mem::take(&mut *self.pages.borrow_mut())
     }
 
     fn renew_due(&self) -> Option<(UnitName, Seqs)> {
-        let seqs = self.renew.get()?;
-        let unit = self.routed.borrow().as_ref().ok()?.unit.clone();
-        Some((unit, seqs))
+        self.renew.borrow().clone()
     }
 }
 

@@ -618,6 +618,12 @@ pub trait Catalog {
         let _ = bucket;
         None
     }
+    /// The key ring that seals this catalogue's recovery records when they
+    /// are a managed tenant's (VMR2 under the current tenant key, ADR
+    /// §3.2). `None`: the KEK seals them (tenant 0).
+    async fn record_ring(&self) -> Option<Result<std::rc::Rc<crate::keys::tk::LoadedRing>>> {
+        None
+    }
     /// Called once by `authenticate`, after the signature verified and
     /// before any other read (AM-64): every call after it is
     /// authenticated. `read`: the request is a GET or a HEAD. An `Err` is

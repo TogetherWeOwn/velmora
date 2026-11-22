@@ -513,6 +513,8 @@ impl World {
             Rc::clone(&self.cache),
             || TestRng(5),
             Maintenance::Off,
+            request.root.clone(),
+            request.root_renew,
             request.routed,
             Rc::clone(&verified),
         );
@@ -599,6 +601,18 @@ fn a_put_and_a_get_round_trip_through_the_unit() {
         names[0].starts_with(&format!("x/{}/", scope.tenant_id())),
         "{names:?}"
     );
+    // Its recovery record is the tenant's: a VMR2 envelope under the
+    // tenant key in `m/x/<t>/` (ADR §3.2), which the KEK does not open.
+    let records = block_on(w.safety.list("m/", "", 100)).unwrap();
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert!(records[0].starts_with(&format!("m/x/{T1}/")), "{records:?}");
+    let sealed = block_on(w.safety.get(&records[0], None)).unwrap().unwrap();
+    assert!(velmora_bridge::crypto::scheme2::is_record_v2(&sealed));
+    assert!(velmora_bridge::crypto::open_manifest(&TestKek::new(), &records[0], &sealed).is_err());
+    let plain =
+        velmora_bridge::crypto::scheme2::open_record_v2(&key(), &id(), &records[0], &sealed)
+            .unwrap();
+    assert!(String::from_utf8_lossy(&plain).contains("photo.jpg"));
     // The GET reads the unit's rows and the tenant's blobs, and opens the
     // bytes with the bucket key the tenant key unwraps.
     w.ports.calls.borrow_mut().clear();

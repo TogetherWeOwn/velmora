@@ -238,7 +238,7 @@ async fn delete_key_once<
     write_tombstone(
         &bridge.catalog,
         &bridge.safety,
-        &bridge.kek,
+        &bridge.sealer(),
         &bridge.cfg.records,
         &bucket.id,
         key,
@@ -365,7 +365,7 @@ async fn delete_chunk<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K:
     let stored = match write_tombstones(
         &bridge.catalog,
         &bridge.safety,
-        &bridge.kek,
+        &bridge.sealer(),
         &bridge.cfg.records,
         &bucket.id,
         &tombstones,
@@ -548,7 +548,7 @@ async fn delete_key_if<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K
         write_tombstone(
             &bridge.catalog,
             &bridge.safety,
-            &bridge.kek,
+            &bridge.sealer(),
             &bridge.cfg.records,
             &bucket.id,
             key,

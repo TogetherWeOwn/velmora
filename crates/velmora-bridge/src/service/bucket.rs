@@ -129,6 +129,15 @@ pub(super) async fn delete_bucket_signed<
     // read-write grant on an existing bucket.
     let authed = match authenticate(bridge, &req).await {
         Ok(authed) => authed,
+        // A managed tenant: every DeleteBucket over S3 is `403` once the
+        // signature verified, a bucket it holds no grant on too (AM-64).
+        Err(resp) if resp.status == 404 && bridge.catalog.request_scope().is_some() => {
+            return S3Response::error(
+                403,
+                "AccessDenied",
+                "Buckets are deleted through the management plane.",
+            )
+        }
         Err(resp) => return resp,
     };
     let Some(bucket) = &authed.bucket else {

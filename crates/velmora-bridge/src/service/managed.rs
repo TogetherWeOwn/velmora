@@ -65,6 +65,9 @@ pub struct ManagedRequest {
     pub scope: TenantScope,
     /// The root unit, which answered the `key_row`.
     pub root: Routed,
+    /// The `key_row`'s answer asked for a background renewal of the root
+    /// unit (rule 12): its numbers.
+    pub root_renew: Option<Seqs>,
     /// The unit of the request's bucket (the root unit with none), or the
     /// router's refusal, which the first call after the signature answers.
     pub routed: std::result::Result<Routed, RouteRefusal>,
@@ -121,11 +124,14 @@ pub async fn prepare<R: UnitRouter>(
             Vec::new(),
         );
     };
+    // Before the signature every refusal is `503`: a `403 AccountProblem`
+    // here would tell a caller who knows only a key id that its tenant is
+    // being shredded (ADR §2.8: after the signature verifies).
     let root = match router.route(tenant, None, floor).await {
         Ok(root) => root,
         Err(refusal) => {
             return answer(
-                refused(refusal),
+                unit_refused(),
                 line(refusal.code(), refusal.alert()),
                 Vec::new(),
             )
@@ -140,12 +146,12 @@ pub async fn prepare<R: UnitRouter>(
     let answered = match answered {
         Ok(answered) => answered,
         Err(refusal) => {
-            return answer(
-                refused(refusal),
-                line(refusal.code(), refusal.alert()),
-                lines,
-            )
+            return answer(unit_refused(), line(refusal.code(), refusal.alert()), lines)
         }
+    };
+    let root_renew = match (&answered.reply.answer, answered.renew_due) {
+        (UnitAnswer::Ok { seqs, .. }, true) => Some(*seqs),
+        _ => None,
     };
     let key_row = match &answered.reply.answer {
         UnitAnswer::Ok { body, .. } => KeyRow::from_body(body, access_key_id),
@@ -161,6 +167,7 @@ pub async fn prepare<R: UnitRouter>(
     Prepared::Serve(ManagedRequest {
         scope,
         root,
+        root_renew,
         routed,
         key_row,
         lines,
@@ -172,7 +179,9 @@ pub async fn prepare<R: UnitRouter>(
 pub trait PortState: UnitPort {
     /// The first router refusal of a call of this request.
     fn route_refusal(&self) -> Option<RouteRefusal>;
-    /// The unit client's pages of this request's calls.
+    /// The unit client's pages of this request's calls so far. Pages of
+    /// calls after this (a streamed body's reads, a deferred delete's
+    /// work) are logged by the port itself as alerts.
     fn take_pages(&self) -> Vec<Page>;
     /// A call's answer asked for a background renewal (rule 12): the unit
     /// and the numbers it answered.
@@ -231,8 +240,8 @@ pub async fn finish<P: PortState, B: BlobStore>(
     Finished { resp, lines, renew }
 }
 
-/// A router refusal as the request's answer: `503` with `Retry-After`,
-/// but `403 AccountProblem` for a shredding tenant.
+/// A router refusal after the signature, as the request's answer: `503`
+/// with `Retry-After`, but `403 AccountProblem` for a shredding tenant.
 fn refused(refusal: RouteRefusal) -> S3Response {
     match refusal {
         RouteRefusal::AccountProblem => common::account_problem(),
@@ -252,13 +261,13 @@ fn unit_answer(answer: &UnitAnswer) -> (S3Response, ManagedLine) {
             Refused::Size(SizeRefusal::DatabaseFull) => {
                 (s3_error(ErrorCode::SlowDown), line("unit_full", true))
             }
+            // ADR §2.6: at the unit's guard the answer is `503 SlowDown`
+            // and the operator is paged (a bucket can be moved out);
+            // `403 QuotaExceeded` for one bucket alone filling a unit
+            // waits on the owner's decision.
             Refused::Size(SizeRefusal::TooManyExtents) => (
-                S3Response::error(
-                    403,
-                    "QuotaExceeded",
-                    "The storage this account may hold is used up.",
-                ),
-                line("unit_extents_full", false),
+                s3_error(ErrorCode::SlowDown),
+                line("unit_extents_full", true),
             ),
             Refused::Request(RequestRefusal::OutOfBounds) => {
                 (common::internal(), line("request_out_of_bounds", true))

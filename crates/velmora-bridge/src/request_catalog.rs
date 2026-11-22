@@ -232,21 +232,28 @@ impl<P: UnitPort + TenantRing, S: Catalog> RequestCatalog<P, S> {
         }
     }
 
+    /// The tenant's key ring, loaded once per request through the port.
+    /// Only after the signature verified.
+    async fn ring(&self) -> Result<Rc<LoadedRing>> {
+        self.verified()?;
+        let held = self.ring.borrow().clone();
+        match held {
+            Some(ring) => Ok(ring),
+            None => {
+                let tenant = KeyTenant::parse(self.scope.tenant_id())?;
+                let ring = Rc::new(self.client.port().tenant_ring(&tenant).await?);
+                *self.ring.borrow_mut() = Some(Rc::clone(&ring));
+                Ok(ring)
+            }
+        }
+    }
+
     /// The data key of a bucket of this tenant: its wrap under the tenant
     /// key whose version the row names (scheme 2). Only after the
     /// signature verified.
     async fn tenant_bucket_key(&self, bucket: &Bucket) -> Result<DataKey> {
-        self.verified()?;
         let tenant = KeyTenant::parse(self.scope.tenant_id())?;
-        let held = self.ring.borrow().clone();
-        let ring = match held {
-            Some(ring) => ring,
-            None => {
-                let ring = Rc::new(self.client.port().tenant_ring(&tenant).await?);
-                *self.ring.borrow_mut() = Some(Rc::clone(&ring));
-                ring
-            }
-        };
+        let ring = self.ring().await?;
         let tk = ring.key(bucket.kek_version).ok_or(ERR_NO_BUCKET_KEY)?;
         unwrap_bdk_v2(
             tk,
@@ -272,6 +279,12 @@ impl<P: UnitPort + TenantRing, S: Catalog> RequestCatalog<P, S> {
         };
         match self.client.port().call(&call).await? {
             UnitAnswer::Ok { body, .. } => KeyRow::from_body(&body, &self.access_key_id),
+            // The unit refuses an authenticated read of a tenant whose
+            // state serves nothing: 403 after the signature (ADR §2.8).
+            UnitAnswer::Refused {
+                reason: crate::unit::Refused::AccountProblem,
+                ..
+            } => Err(ERR_ACCOUNT_PROBLEM),
             _ => Err(ERR_KEY_ROW),
         }
     }
@@ -287,6 +300,10 @@ impl<P: UnitPort + TenantRing, S: Catalog> RequestCatalog<P, S> {
 impl<P: UnitPort + TenantRing, S: Catalog> Catalog for RequestCatalog<P, S> {
     fn request_scope(&self) -> Option<&TenantScope> {
         Some(&self.scope)
+    }
+
+    async fn record_ring(&self) -> Option<Result<Rc<LoadedRing>>> {
+        Some(self.ring().await)
     }
 
     async fn bucket_key(&self, bucket: &Bucket) -> Option<Result<DataKey>> {
