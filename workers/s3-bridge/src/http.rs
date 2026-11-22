@@ -11,9 +11,15 @@
 //! only `ingress::read_capped` or `ingress::read_upload` reads it, after auth
 //! and the budget charge.
 
-use futures_util::StreamExt;
+use std::cell::RefCell;
+use std::future::poll_fn;
+use std::pin::Pin;
+use std::rc::Rc;
+use std::task::{Context, Poll, Waker};
+
+use futures_util::{Stream, StreamExt};
 use velmora_bridge::ingress::{self, IngressError};
-use velmora_bridge::{Body, BridgeError, Method, RespBody, S3Request, S3Response};
+use velmora_bridge::{Body, BridgeError, ByteStream, Method, RespBody, S3Request, S3Response};
 use worker::{EncodeBody, FixedLengthStream, Headers, Request, Response, ResponseBody};
 
 /// One request as the bridge sees it, plus what the edge knows about it.
@@ -84,37 +90,119 @@ fn content_length(headers: &[(String, String)]) -> Option<u64> {
         .and_then(|(_, v)| v.trim().parse::<u64>().ok())
 }
 
+/// A one-shot signal from a Rust response stream to its invocation's
+/// detached-open cleanup. There is only one waiter per stream.
+#[derive(Clone, Default)]
+pub struct BodyDone(Rc<RefCell<BodyState>>);
+
+#[derive(Default)]
+struct BodyState {
+    done: bool,
+    waker: Option<Waker>,
+}
+
+impl BodyDone {
+    pub fn track(&self, stream: ByteStream) -> impl Stream<Item = velmora_bridge::Result<Vec<u8>>> {
+        TrackedBody {
+            stream: Some(stream),
+            done: self.clone(),
+        }
+    }
+
+    pub async fn wait(self) {
+        poll_fn(|cx| {
+            let mut state = self.0.borrow_mut();
+            if state.done {
+                Poll::Ready(())
+            } else {
+                state.waker = Some(cx.waker().clone());
+                Poll::Pending
+            }
+        })
+        .await;
+    }
+}
+
+struct TrackedBody {
+    stream: Option<ByteStream>,
+    done: BodyDone,
+}
+
+impl TrackedBody {
+    fn finish(&mut self) {
+        if let Some(stream) = self.stream.take() {
+            // Drop any in-flight read before the waiter checks for opens
+            // whose callers have gone away.
+            drop(stream);
+            let waker = {
+                let mut state = self.done.0.borrow_mut();
+                state.done = true;
+                state.waker.take()
+            };
+            if let Some(waker) = waker {
+                waker.wake();
+            }
+        }
+    }
+}
+
+impl Stream for TrackedBody {
+    type Item = Result<Vec<u8>, BridgeError>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let Some(stream) = &mut self.stream else {
+            return Poll::Ready(None);
+        };
+        let next = stream.as_mut().poll_next(cx);
+        if matches!(next, Poll::Ready(None | Some(Err(_)))) {
+            self.finish();
+        }
+        next
+    }
+}
+
+impl Drop for TrackedBody {
+    fn drop(&mut self) {
+        self.finish();
+    }
+}
+
 /// `S3Response` -> `worker::Response`. A streamed body with a declared
 /// `content-length` goes through a `FixedLengthStream`, so the client sees
 /// the length and a short stream fails the response instead of truncating
 /// it silently. Stream errors never carry their text to the client.
-pub fn to_response(resp: S3Response) -> Response {
-    try_response(resp).unwrap_or_else(|_| internal_error())
+pub fn to_response(resp: S3Response) -> (Response, Option<BodyDone>) {
+    try_response(resp).unwrap_or_else(|_| (internal_error(), None))
 }
 
-fn try_response(resp: S3Response) -> worker::Result<Response> {
+fn try_response(resp: S3Response) -> worker::Result<(Response, Option<BodyDone>)> {
     let headers = Headers::new();
     for (name, value) in &resp.headers {
         headers.append(name, value)?;
     }
+    let mut body_done = None;
+    let mut track = |stream| {
+        let done = BodyDone::default();
+        let stream = done
+            .track(stream)
+            .map(|chunk| chunk.map_err(|_| worker::Error::RustError("body stream".into())));
+        body_done = Some(done);
+        stream
+    };
     let out = match resp.body {
         RespBody::Empty => Response::empty()?,
         RespBody::Bytes(bytes) => Response::from_bytes(bytes)?,
         // `fetch` settles a deferred body first; one that is left is
         // streamed with its keepalive.
-        RespBody::Deferred(d) => Response::from_stream(
-            d.into_stream(
-                crate::env::sleeper(),
-                velmora_bridge::keepalive::KEEPALIVE_INTERVAL_MS,
-            )
-            .map(|chunk| chunk.map_err(|_| worker::Error::RustError("body stream".into()))),
-        )?,
+        RespBody::Deferred(d) => Response::from_stream(track(d.into_stream(
+            crate::env::sleeper(),
+            velmora_bridge::keepalive::KEEPALIVE_INTERVAL_MS,
+        )))?,
         // `fetch` serves a body in sub-ranges itself (`crate::fanout`);
         // one that reaches this point has no stream to go to.
         RespBody::Fanout(_) => return Err(worker::Error::RustError("fanout body".into())),
         RespBody::Stream(stream) => {
-            let stream = stream
-                .map(|chunk| chunk.map_err(|_| worker::Error::RustError("body stream".into())));
+            let stream = track(stream);
             match content_length(&resp.headers) {
                 Some(len) => {
                     let fixed: worker::worker_sys::FixedLengthStream =
@@ -129,15 +217,90 @@ fn try_response(resp: S3Response) -> worker::Result<Response> {
     // `content-encoding` header can only be an object's stored metadata,
     // which describes the stored bytes. The default (`automatic`) would
     // compress such an object again and drop its length.
-    Ok(out
-        .with_status(resp.status)
-        .with_headers(headers)
-        .with_encode_body(EncodeBody::Manual))
+    Ok((
+        out.with_status(resp.status)
+            .with_headers(headers)
+            .with_encode_body(EncodeBody::Manual),
+        body_done,
+    ))
 }
 
 /// A class-only `500` (fail closed). Never names a variable or value.
 pub fn internal_error() -> Response {
     try_response(IngressError::Internal.response())
+        .map(|(resp, _)| resp)
         .or_else(|_| Response::error("Internal Error", 500))
         .unwrap_or_else(|_| Response::empty().expect("empty response").with_status(500))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures_util::{stream, Stream};
+    use std::future::Future;
+    use std::task::{Context, Poll, Wake, Waker};
+
+    #[derive(Default)]
+    struct Wakes(std::sync::atomic::AtomicUsize);
+
+    impl Wake for Wakes {
+        fn wake(self: std::sync::Arc<Self>) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    #[test]
+    fn body_done_wakes_the_waiter_at_eof_not_at_a_chunk() {
+        let done = BodyDone::default();
+        let mut body = std::pin::pin!(done.track(Box::pin(stream::iter([Ok(vec![1])]))));
+        let mut wait = std::pin::pin!(done.wait());
+        let wakes = std::sync::Arc::new(Wakes::default());
+        let waker = Waker::from(wakes.clone());
+        let mut cx = Context::from_waker(&waker);
+
+        assert!(wait.as_mut().poll(&mut cx).is_pending());
+        assert!(matches!(
+            body.as_mut().poll_next(&mut cx),
+            Poll::Ready(Some(Ok(_)))
+        ));
+        assert_eq!(wakes.0.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert!(matches!(
+            body.as_mut().poll_next(&mut cx),
+            Poll::Ready(None)
+        ));
+        assert_eq!(wakes.0.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert!(wait.as_mut().poll(&mut cx).is_ready());
+    }
+
+    #[test]
+    fn body_done_is_set_on_stream_error_before_drop() {
+        let done = BodyDone::default();
+        let failing = stream::iter([Err(BridgeError::Invalid("test body")), Ok(vec![1])]);
+        let mut body = std::pin::pin!(done.track(Box::pin(failing)));
+        let mut wait = std::pin::pin!(done.wait());
+        let mut cx = Context::from_waker(futures_util::task::noop_waker_ref());
+
+        assert!(matches!(
+            body.as_mut().poll_next(&mut cx),
+            Poll::Ready(Some(Err(_)))
+        ));
+        assert!(wait.as_mut().poll(&mut cx).is_ready());
+        assert!(matches!(
+            body.as_mut().poll_next(&mut cx),
+            Poll::Ready(None)
+        ));
+    }
+
+    #[test]
+    fn body_done_is_set_on_drop_during_a_pending_pull() {
+        let done = BodyDone::default();
+        let mut body = Box::pin(done.track(Box::pin(stream::pending())));
+        let mut wait = std::pin::pin!(done.wait());
+        let mut cx = Context::from_waker(futures_util::task::noop_waker_ref());
+
+        assert!(body.as_mut().poll_next(&mut cx).is_pending());
+        assert!(wait.as_mut().poll(&mut cx).is_pending());
+        drop(body);
+        assert!(wait.as_mut().poll(&mut cx).is_ready());
+    }
 }

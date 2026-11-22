@@ -187,25 +187,24 @@ pub async fn respond(
     ctx: &Context,
     resp: S3Response,
     request_id: &str,
-) -> (u16, Response) {
+) -> (u16, Response, Option<crate::http::BodyDone>) {
     let (status, headers) = (resp.status, resp.headers);
     let fan = match resp.body {
         RespBody::Fanout(fan) => fan,
         body => {
-            let resp = S3Response {
+            let (out, done) = crate::http::to_response(S3Response {
                 status,
                 headers,
                 body,
-            };
-            return (status, crate::http::to_response(resp));
+            });
+            return (status, out, done);
         }
     };
     // `resp` came with its request ID; a refusal made here gets it too.
     let refuse = |resp: S3Response| {
-        (
-            resp.status,
-            crate::http::to_response(resp.with_request_id(request_id)),
-        )
+        let status = resp.status;
+        let (out, done) = crate::http::to_response(resp.with_request_id(request_id));
+        (status, out, done)
     };
     let Some((pipe, readable)) = SelfPipe::new(env, fan.len()) else {
         console_error!("fanout: no service binding or stream");
@@ -249,5 +248,7 @@ pub async fn respond(
             }
         }
     });
-    (status, resp)
+    // The pump is already under waitUntil; the separate invocations
+    // producing the sub-responses track their own Rust body streams.
+    (status, resp, None)
 }

@@ -108,14 +108,20 @@ async fn handle_detached(
 
 #[event(fetch)]
 async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
-    let result = handle_fetch(req, env, &ctx).await;
-    if let Some(drain) = gate::drain_detached_opens() {
+    let (response, body_done) = handle_fetch(req, env, &ctx).await;
+    if let Some(done) = body_done {
+        // A later body pull can start an open even if none are pending now.
+        ctx.wait_until(gate::drain_detached_opens_after(done.wait()));
+    } else if let Some(drain) = gate::drain_detached_opens() {
+        // With no Rust response stream, no work of this invocation can
+        // start an open after return. Fanout sub-requests are separate
+        // invocations and keep their own opens alive.
         ctx.wait_until(drain);
     }
-    result
+    Ok(response)
 }
 
-async fn handle_fetch(req: Request, env: Env, ctx: &Context) -> Result<Response> {
+async fn handle_fetch(req: Request, env: Env, ctx: &Context) -> (Response, Option<http::BodyDone>) {
     // What a GET read from Usenet, one line per run of cold extents.
     velmora_bridge::trace::log_cold_reads(|line| {
         console_log!("cold read: {line}");
@@ -206,7 +212,7 @@ async fn handle_fetch(req: Request, env: Env, ctx: &Context) -> Result<Response>
             console_error!("config refused: {class}");
             let resp = ingress::IngressError::Internal.response();
             count(resp.status, 1, 0);
-            return Ok(early(resp));
+            return early(resp);
         }
     };
     let incoming = match http::to_s3_request(req) {
@@ -217,7 +223,7 @@ async fn handle_fetch(req: Request, env: Env, ctx: &Context) -> Result<Response>
                 ingress::log_line(&method, "-", e.status(), &request_id)
             );
             count(e.status(), bridge.cfg.metrics_sample, 0);
-            return Ok(early(e.response()));
+            return early(e.response());
         }
     };
     let target = incoming.req.raw_target.clone();
@@ -239,7 +245,7 @@ async fn handle_fetch(req: Request, env: Env, ctx: &Context) -> Result<Response>
     .with_request_id(&request_id);
     // A body in sub-ranges: the first one is opened before the status is
     // known to the client.
-    let (status, out) = fanout::respond(&env, ctx, resp, &request_id).await;
+    let (status, out, body_done) = fanout::respond(&env, ctx, resp, &request_id).await;
     console_log!(
         "{}",
         ingress::log_line(&method, &target, status, &request_id)
@@ -248,7 +254,7 @@ async fn handle_fetch(req: Request, env: Env, ctx: &Context) -> Result<Response>
         console_log!("{line}");
     }
     count(status, bridge.cfg.metrics_sample, length(out.headers()));
-    Ok(out)
+    (out, body_done)
 }
 
 #[event(queue)]

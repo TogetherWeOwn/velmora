@@ -434,18 +434,32 @@ fn tracked_open_spawner(spawn: Spawner) -> Spawner {
     })
 }
 
-/// Used with the current invocation's `wait_until`. The cached transport
-/// does not own a Context, and `spawn_local` alone does not keep it alive.
+/// Used with the current invocation's `wait_until` once no more work can
+/// start an open. The cached transport does not own a Context, and
+/// `spawn_local` alone does not keep it alive.
 pub fn drain_detached_opens() -> Option<impl Future<Output = ()>> {
-    (DETACHED_OPENS.get() != 0).then_some(async {
-        let drain = async {
-            while DETACHED_OPENS.get() != 0 {
-                worker::Delay::from(Duration::from_millis(50)).await;
-            }
-        };
-        let timeout = worker::Delay::from(Duration::from_secs(30));
-        let _ = futures_util::future::select(std::pin::pin!(drain), std::pin::pin!(timeout)).await;
-    })
+    (DETACHED_OPENS.get() != 0).then(|| drain_detached_opens_after(std::future::ready(())))
+}
+
+/// A streamed body can start an open after the response is returned, so
+/// wait for the body to finish before checking the count or starting the
+/// cleanup timeout.
+pub async fn drain_detached_opens_after(body_done: impl Future<Output = ()>) {
+    wait_for_detached_opens(body_done, worker::Delay::from).await;
+}
+
+async fn wait_for_detached_opens<F: Future<Output = ()>>(
+    body_done: impl Future<Output = ()>,
+    delay: impl Fn(Duration) -> F,
+) {
+    body_done.await;
+    let drain = async {
+        while DETACHED_OPENS.get() != 0 {
+            delay(Duration::from_millis(50)).await;
+        }
+    };
+    let timeout = delay(Duration::from_secs(30));
+    let _ = futures_util::future::select(std::pin::pin!(drain), std::pin::pin!(timeout)).await;
 }
 
 /// Asks the gate objects of one namespace.
@@ -675,6 +689,68 @@ impl GateTransport for DoTransport {
 mod tests {
     use super::*;
     use std::future::Future;
+
+    use crate::http::BodyDone;
+
+    #[derive(Default)]
+    struct TestClock(Cell<Duration>);
+
+    impl TestClock {
+        fn advance(&self, ms: u64) {
+            self.0.set(self.0.get() + Duration::from_millis(ms));
+        }
+
+        fn delay(&self, duration: Duration) -> impl Future<Output = ()> + '_ {
+            let deadline = self.0.get() + duration;
+            std::future::poll_fn(move |_| {
+                if self.0.get() >= deadline {
+                    Poll::Ready(())
+                } else {
+                    Poll::Pending
+                }
+            })
+        }
+    }
+
+    #[test]
+    fn stream_drain_waits_for_body_and_an_open_started_after_headers() {
+        let clock = TestClock::default();
+        let done = BodyDone::default();
+        let body = done.track(Box::pin(futures_util::stream::pending()));
+        let mut wait = std::pin::pin!(wait_for_detached_opens(done.wait(), |d| clock.delay(d)));
+        let mut cx = std::task::Context::from_waker(futures_util::task::noop_waker_ref());
+
+        assert_eq!(DETACHED_OPENS.get(), 0);
+        assert!(wait.as_mut().poll(&mut cx).is_pending());
+        let opening = DetachedOpen::start();
+        assert!(wait.as_mut().poll(&mut cx).is_pending());
+        drop(body);
+        assert!(wait.as_mut().poll(&mut cx).is_pending());
+        drop(opening);
+        clock.advance(50);
+        assert!(wait.as_mut().poll(&mut cx).is_ready());
+    }
+
+    #[test]
+    fn stream_drain_times_out_thirty_seconds_after_the_body_ends() {
+        let clock = TestClock::default();
+        let done = BodyDone::default();
+        let body = done.track(Box::pin(futures_util::stream::pending()));
+        let mut wait = std::pin::pin!(wait_for_detached_opens(done.wait(), |d| clock.delay(d)));
+        let mut cx = std::task::Context::from_waker(futures_util::task::noop_waker_ref());
+        let _opening = DetachedOpen::start();
+
+        assert!(wait.as_mut().poll(&mut cx).is_pending());
+        clock.advance(60_000);
+        assert!(wait.as_mut().poll(&mut cx).is_pending());
+        drop(body);
+        assert!(wait.as_mut().poll(&mut cx).is_pending());
+        clock.advance(29_999);
+        assert!(wait.as_mut().poll(&mut cx).is_pending());
+        clock.advance(1);
+        assert!(wait.as_mut().poll(&mut cx).is_ready());
+        assert_eq!(DETACHED_OPENS.get(), 1);
+    }
 
     struct Session(Rc<Cell<u32>>);
 
