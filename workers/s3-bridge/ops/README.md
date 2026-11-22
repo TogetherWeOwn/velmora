@@ -689,6 +689,30 @@ here):
    version takes the answer of the version before it. Treat any other
    version without a CI message (an upload by hand) as below the floor.
 
+## More than one S3 host
+
+`S3_HOST` is always in the `legacy` class. Extra hosts can be `legacy` or
+`customer`. Both classes admit every key for now, because there is one
+tenant; a later change binds tenants to classes. A request is checked
+against the host it was sent to: a signature made for one host is refused
+on another, and `CompleteMultipartUpload` names the host it was sent to
+in `Location`.
+A configured host may not be a subdomain of another configured host so
+virtual-hosted requests remain refused.
+Customer-class hosts return HTTP 404 for `/_admin` routes and HTTP 403
+for bearer-token CreateBucket and DeleteBucket requests.
+
+1. Attach the new host to the Worker as a Custom Domain.
+2. Set the GitHub Actions variable `VELMORA_S3_HOSTS` to the full list of
+   extra hosts, for example `s3.example.io=customer,archive.example.io=legacy`.
+   Use up to eight lowercase hostnames without ports or spaces.
+3. Let CI deploy. Check the smoke lines for an HTTP 403 with
+   `AccessDenied` for each host. Index 1 is the primary host, followed
+   by the extra hosts in list order.
+
+To remove a host, remove its entry from `VELMORA_S3_HOSTS`, let CI deploy
+successfully, then detach the Custom Domain.
+
 ## Client settings
 
 Write with parts of 16 MiB, start multipart at 16 MiB, keep about 16

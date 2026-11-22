@@ -169,6 +169,11 @@ RECOVERY_COPY = "off"
 # set "d1" again (the gates hand their slot rows back).
 PERMITS = "do"
 # Optional vars and their defaults (production sets POST_SOCKETS and COLD_SOCKETS explicitly):
+#   S3_HOSTS (empty): up to eight comma-separated entries. Join each hostname and class with an equals sign.
+#     Classes are legacy and customer.
+#     S3_HOST is always legacy. Production takes its extra hosts from VELMORA_S3_HOSTS.
+#     Attach each host to the Worker as a Custom Domain before naming it in the variable,
+#     or the smoke test fails and the deploy rolls back.
 #   SLICE_BYTES (8388608, 8 MiB): the slice of a PutObject or UploadPart body above MAX_EXTENT_BYTES; at most MAX_EXTENT_BYTES.
 #   MAX_OBJECT_EXTENTS (10000): most extents one object is made of, 1 to 10000. CompleteMultipartUpload, and an UploadPart
 #     above MAX_EXTENT_BYTES, answer 400 EntityTooLarge for an upload that would hold more. With slices of 8 MiB that is 78 GiB in parts above

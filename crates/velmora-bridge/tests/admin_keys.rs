@@ -8,10 +8,8 @@
 
 mod service_support;
 
-use hmac::{Hmac, KeyInit, Mac};
 use serde_json::{json, Value};
 use service_support::*;
-use sha2::Sha256;
 use velmora_bridge::config::Maintenance;
 use velmora_bridge::recovery::{read_key_revocation, REVOKED_KEY_PREFIX};
 use velmora_bridge::*;
@@ -71,46 +69,6 @@ async fn revoke<N: NntpConnector + 'static>(rig: &Rig<N>, akid: &str) -> Resp {
 
 async fn list<N: NntpConnector + 'static>(rig: &Rig<N>, query: &str) -> Resp {
     admin(rig, Method::Get, &format!("/_admin/keys{query}"), None).await
-}
-
-fn hmac(key: &[u8], data: &[u8]) -> Vec<u8> {
-    let mut mac = Hmac::<Sha256>::new_from_slice(key).unwrap();
-    mac.update(data);
-    mac.finalize().into_bytes().to_vec()
-}
-
-/// A presigned GET of `raw_path`, signed at `now` and valid for an hour.
-fn presign(signer: &Signer, now: UnixMs, raw_path: &str) -> Req {
-    let (stamp, scope, key) = signer.scope(now);
-    let credential = format!("{}/{scope}", signer.akid);
-    let mut q: Vec<(String, String)> = [
-        ("X-Amz-Algorithm", "AWS4-HMAC-SHA256"),
-        ("X-Amz-Credential", credential.as_str()),
-        ("X-Amz-Date", stamp.as_str()),
-        ("X-Amz-Expires", "3600"),
-        ("X-Amz-SignedHeaders", "host"),
-    ]
-    .iter()
-    .map(|(k, v)| (uri_encode(k, false), uri_encode(v, false)))
-    .collect();
-    q.sort();
-    let query = q
-        .iter()
-        .map(|(k, v)| format!("{k}={v}"))
-        .collect::<Vec<_>>()
-        .join("&");
-    let canonical = format!("GET\n{raw_path}\n{query}\nhost:{HOST}\n\nhost\nUNSIGNED-PAYLOAD");
-    let to_sign = format!(
-        "AWS4-HMAC-SHA256\n{stamp}\n{scope}\n{}",
-        hex(&sha256(canonical.as_bytes()))
-    );
-    let signature = hex(&hmac(&key, to_sign.as_bytes()));
-    Req {
-        method: Method::Get,
-        target: format!("{raw_path}?{query}&X-Amz-Signature={signature}"),
-        headers: vec![("host".to_string(), HOST.to_string())],
-        body: Vec::new(),
-    }
 }
 
 /// No response may carry a secret or the name of a secret column.

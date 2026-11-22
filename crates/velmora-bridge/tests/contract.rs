@@ -1049,6 +1049,9 @@ fn admin_read_token_host_and_metrics_sample() {
         Some(read)
     );
     assert_eq!(set.admin_host.as_deref(), Some("admin.internal"));
+    // The root's dot is the same name: kept as a request is compared.
+    let dotted = with(&[("ADMIN_HOST", "admin.internal.")]).unwrap();
+    assert_eq!(dotted.admin_host.as_deref(), Some("admin.internal"));
     assert_eq!(set.metrics_sample, 1);
     assert!(
         !format!("{set:?}").contains(read),
@@ -1063,7 +1066,15 @@ fn admin_read_token_host_and_metrics_sample() {
             invalid("ADMIN_READ_TOKEN")
         );
     }
-    for bad in ["Admin.Internal", "admin internal", "admin/x", "admin:443"] {
+    for bad in [
+        "Admin.Internal",
+        "admin internal",
+        "admin/x",
+        "admin:443",
+        "admin.internal..",
+        "admin..internal",
+        ".admin.internal",
+    ] {
         assert_eq!(
             with(&[("ADMIN_HOST", bad)]).unwrap_err(),
             invalid("ADMIN_HOST")
@@ -2028,6 +2039,106 @@ fn s3_host_allows_only_hostname_and_port() {
         assert_eq!(
             host(bad).unwrap_err(),
             ConfigError::Invalid("S3_HOST".into()),
+            "{bad}"
+        );
+    }
+}
+
+#[test]
+fn s3_hosts_lists_more_hosts_with_a_class() {
+    use velmora_bridge::config::{HostClass, S3Host};
+
+    let (_, dev) = wrangler_vars();
+    let base = with_secrets(dev, PROVIDER_PLAIN);
+    let primary = base["S3_HOST"].as_str();
+    let hosts = |value: Option<&str>| {
+        let mut m = base.clone();
+        if let Some(value) = value {
+            m.insert("S3_HOSTS".into(), value.into());
+        }
+        load(&m)
+    };
+
+    for value in [None, Some(""), Some(" \t ")] {
+        let cfg = hosts(value).unwrap();
+        assert!(cfg.s3_hosts.is_empty(), "{value:?}");
+        assert_eq!(cfg.s3_host_for(primary), Some((primary, HostClass::Legacy)));
+    }
+
+    let cfg = hosts(Some("s3.customer.example=customer")).unwrap();
+    assert_eq!(
+        cfg.s3_hosts,
+        [S3Host {
+            name: "s3.customer.example".into(),
+            class: HostClass::Customer,
+        }]
+    );
+    assert_eq!(
+        cfg.s3_host_for("S3.Customer.Example"),
+        Some(("s3.customer.example", HostClass::Customer))
+    );
+    assert_eq!(cfg.s3_host_for("other.example"), None);
+    assert_eq!(cfg.s3_host_for("s3.customer.example:443"), None);
+
+    let cfg = hosts(Some(" a.example=legacy , b.example:8443=customer ")).unwrap();
+    assert_eq!(
+        cfg.s3_hosts,
+        [
+            S3Host {
+                name: "a.example".into(),
+                class: HostClass::Legacy,
+            },
+            S3Host {
+                name: "b.example:8443".into(),
+                class: HostClass::Customer,
+            },
+        ]
+    );
+    assert_eq!(
+        cfg.all_s3_hosts().collect::<Vec<_>>(),
+        [primary, "a.example", "b.example:8443"]
+    );
+
+    let cfg = hosts(Some("a.example=legacy,b-a.example=customer")).unwrap();
+    assert_eq!(
+        cfg.all_s3_hosts().collect::<Vec<_>>(),
+        [primary, "a.example", "b-a.example"]
+    );
+
+    let eight = (1..=8)
+        .map(|i| format!("s3-{i}.example=legacy"))
+        .collect::<Vec<_>>()
+        .join(",");
+    assert_eq!(hosts(Some(&eight)).unwrap().s3_hosts.len(), 8);
+
+    for bad in [
+        "a.example",
+        "a.example=",
+        "=customer",
+        "a.example=Customer",
+        "a.example=public",
+        "A.example=customer",
+        "a.example=customer,",
+        ",a.example=customer",
+        "a.example=customer,a.example=legacy",
+        &format!("{}=customer", primary.to_ascii_uppercase()),
+        &format!("{primary}=customer"),
+        &format!("eu.{primary}=customer"),
+        "a.example=legacy,x.a.example=customer",
+        "x.a.example=customer,a.example=legacy",
+        "a.example:8443=legacy,x.a.example=customer",
+        "a b.example=customer",
+        "a.example:0=customer",
+        "a.example.=customer",
+        "a.example.:8443=customer",
+        "a..example=customer",
+        ".a.example=legacy",
+        "a.example=customer=legacy",
+        &format!("{eight},s3-9.example=legacy"),
+    ] {
+        assert_eq!(
+            hosts(Some(bad)).unwrap_err(),
+            ConfigError::Invalid("S3_HOSTS".into()),
             "{bad}"
         );
     }

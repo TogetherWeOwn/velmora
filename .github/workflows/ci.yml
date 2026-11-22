@@ -869,11 +869,16 @@ jobs:
       # workers/s3-bridge/tools/test_deploy_config.py: it runs the
       # script below as it stands in this file, and it holds that the
       # step is that script and nothing else.
+      #
+      # VELMORA_S3_HOSTS adds S3 endpoint hosts as comma separated
+      # hostname=class entries. Attach each host as a Custom Domain
+      # before setting the variable. The smoke test checks every host.
       - name: Generate the production wrangler config
         if: steps.fresh.outputs.fresh == 'true'
         working-directory: workers/s3-bridge
         env:
           VELMORA_S3_HOST: ${{ vars.VELMORA_S3_HOST }}
+          VELMORA_S3_HOSTS: ${{ vars.VELMORA_S3_HOSTS }}
           VELMORA_D1_DATABASE_ID: ${{ vars.VELMORA_D1_DATABASE_ID }}
           VELMORA_RECOVERY_COPY: ${{ vars.VELMORA_RECOVERY_COPY }}
           VELMORA_RECOVERY_PREFIX: ${{ vars.VELMORA_RECOVERY_PREFIX }}
@@ -886,9 +891,11 @@ jobs:
 
           src, dst = sys.argv[1], sys.argv[2]
           host = os.environ.get("VELMORA_S3_HOST", "")
+          hosts = os.environ.get("VELMORA_S3_HOSTS", "")
           dbid = os.environ.get("VELMORA_D1_DATABASE_ID", "")
           label = r"[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?"
-          if len(host) > 253 or not re.fullmatch(rf"{label}(\.{label})+", host):
+          hostname = re.compile(rf"{label}(\.{label})+")
+          if len(host) > 253 or not hostname.fullmatch(host):
               sys.exit("VELMORA_S3_HOST is missing or not a plain lowercase hostname")
           if not re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", dbid):
               sys.exit("VELMORA_D1_DATABASE_ID is missing or not a lowercase UUID")
@@ -915,6 +922,32 @@ jobs:
           # The prod section ends at the first [env.*] table header.
           end = next((i for i, l in enumerate(lines)
                       if re.match(r"\s*\[\[?env\.", l)), len(lines))
+          host_key = re.compile(r"""\s*(?:S3_HOSTS|"S3_HOSTS"|'S3_HOSTS')\s*[.=]""")
+          if any(host_key.match(line) for line in lines[:end]):
+              sys.exit("the prod section of the shipped file sets S3_HOSTS")
+          def sets_s3_hosts(value):
+              if isinstance(value, dict):
+                  return "S3_HOSTS" in value or any(map(sets_s3_hosts, value.values()))
+              return isinstance(value, list) and any(map(sets_s3_hosts, value))
+
+          try:
+              shipped_prod = tomllib.loads("\n".join(lines[:end]))
+          except tomllib.TOMLDecodeError:
+              shipped_prod = {}  # The generated config is checked below.
+          if sets_s3_hosts(shipped_prod):
+              sys.exit("the prod section of the shipped file sets S3_HOSTS")
+          entries = hosts.split(",") if hosts else []
+          seen = {host}
+          classes = []
+          for entry in entries:
+              name, _, host_class = entry.partition("=")
+              if (len(entries) > 8 or len(name) > 253 or not hostname.fullmatch(name)
+                      or host_class not in ("legacy", "customer") or name in seen
+                      or any(name.endswith("." + other) or other.endswith("." + name)
+                             for other in seen)):
+                  sys.exit("VELMORA_S3_HOSTS must be a comma separated list of <lowercase host>=legacy|customer, at most 8, without S3_HOST, a repeat or a subdomain of another host")
+              seen.add(name)
+              classes.append(host_class)
           subs = [
               ('S3_HOST = "velmora-s3.<account>.workers.dev"', f'S3_HOST = "{host}"'),
               ('database_id = "<from wrangler d1 create>"', f'database_id = "{dbid}"'),
@@ -954,7 +987,10 @@ jobs:
               if len(hits) != 1:
                   sys.exit(f"expected exactly one prod line {placeholder!r}, found {len(hits)}")
               i = hits[0]
-              lines[i] = lines[i][: len(lines[i]) - len(lines[i].lstrip())] + value
+              indent = lines[i][: len(lines[i]) - len(lines[i].lstrip())]
+              lines[i] = indent + value
+              if hosts and placeholder.startswith("S3_HOST "):
+                  lines[i] += f'\n{indent}S3_HOSTS = "{hosts}"'
           builds = [i for i in range(end) if lines[i].strip() == "[build]"]
           if len(builds) != 1:
               sys.exit(f"expected exactly one prod [build] table, found {len(builds)}")
@@ -985,10 +1021,14 @@ jobs:
               and int(word) <= single)
           if layout != "tenant" and not writer_off:
               sys.exit(f"the generated config sets MAX_OBJECT_EXTENTS above {single} (segmented records) while the record layout is flat")
+          if prod_vars.get("S3_HOSTS") != (hosts or None):
+              sys.exit("the generated config does not carry the S3 hosts that were asked for")
           with open(dst, "w", encoding="utf-8") as f:
               f.write(text)
           print(f"wrangler.deploy.toml: prod placeholders substituted, prod [build] removed, recovery copy {copy}, verify mode {mode}")
           print(f"record layout in the generated config: {layout}")
+          class_list = f" ({','.join(classes)})" if classes else ""
+          print(f"extra S3 hosts in the generated config: {len(classes)}{class_list}")
           PY
       # The version serving 100% of traffic now, the rollback target. A
       # Worker that does not exist yet (first deploy) has none; any other
@@ -1044,21 +1084,40 @@ jobs:
         if: steps.fresh.outputs.fresh == 'true'
         env:
           VELMORA_S3_HOST: ${{ vars.VELMORA_S3_HOST }}
+          VELMORA_S3_HOSTS: ${{ vars.VELMORA_S3_HOSTS }}
         run: |
           set -euo pipefail
           body="${RUNNER_TEMP}/smoke-body"
-          code=none
-          for attempt in 1 2 3 4 5 6; do
-            code=$(curl -sS -o "$body" -w '%{http_code}' --connect-timeout 10 --max-time 30 \
-              "https://${VELMORA_S3_HOST}/" || true)
-            echo "attempt ${attempt}: HTTP ${code}"
-            if [ "$code" = "403" ] && grep -q '<Code>AccessDenied</Code>' "$body"; then
-              exit 0
+          hosts=("$VELMORA_S3_HOST")
+          if [ -n "$VELMORA_S3_HOSTS" ]; then
+            IFS=, read -r -a entries <<< "$VELMORA_S3_HOSTS"
+            for entry in "${entries[@]}"; do
+              hosts+=("${entry%%=*}")
+            done
+          fi
+          for i in "${!hosts[@]}"; do
+            host="${hosts[i]}"
+            index=$((i + 1))
+            if ! [[ "$host" =~ ^[a-z0-9]([a-z0-9.-]{0,251}[a-z0-9])?$ ]]; then
+              echo "smoke: invalid host at index ${index}"
+              exit 1
             fi
-            sleep 10
+            if [ "${#hosts[@]}" -gt 1 ]; then
+              echo "smoke: checking host ${index}"
+            fi
+            code=none
+            for attempt in 1 2 3 4 5 6; do
+              code=$(curl -sS -o "$body" -w '%{http_code}' --connect-timeout 10 --max-time 30 \
+                "https://${host}/" || true)
+              echo "attempt ${attempt}: HTTP ${code}"
+              if [ "$code" = "403" ] && grep -q '<Code>AccessDenied</Code>' "$body"; then
+                continue 2
+              fi
+              sleep 10
+            done
+            echo "smoke: expected HTTP 403 AccessDenied for an unsigned GET, last got ${code} (host index ${index})"
+            exit 1
           done
-          echo "smoke: expected HTTP 403 AccessDenied for an unsigned GET, last got ${code}"
-          exit 1
       # On any failure or cancellation after the rollback target was
       # recorded: roll back to that exact version, but only when the active
       # version is the one this run deployed (from the wrangler output), so
