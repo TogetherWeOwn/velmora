@@ -133,6 +133,28 @@ struct BornRecord {
     token: BirthToken,
 }
 
+/// A KEK version this Worker does not hold yet (a record of a newer
+/// deploy): a failure that may pass, never damage (as the chain's seal
+/// rules it, `directory::seal`).
+const ERR_KEK_NOT_HELD: BridgeError = BridgeError::Invalid("control record under a newer KEK");
+
+/// The door part of a global control record `name`.
+fn open_global<'b, K: crate::ports::Kek>(
+    kek: &K,
+    name: &'b str,
+    bytes: &'b [u8],
+) -> Result<Vec<u8>> {
+    let envelope = parse_control(bytes)?;
+    let v = envelope.kek_version();
+    match envelope.open_door(kek, name, ControlOwner::Global) {
+        Ok(opened) => Ok(opened.door().to_vec()),
+        Err(_) if v > kek.active().0 && v <= crate::config::MAX_KEK_VERSION => {
+            Err(ERR_KEK_NOT_HELD)
+        }
+        Err(e) => Err(e),
+    }
+}
+
 /// The tenant `m/tref/` names for `external_ref`; `None` when there is no
 /// record. A record that does not open under the control key, or names
 /// another hash, is damage (an `Err`).
@@ -145,8 +167,8 @@ pub async fn read_tref<S: RecordStore, K: crate::ports::Kek>(
     let Some(bytes) = records.get(&name).await? else {
         return Ok(None);
     };
-    let opened = parse_control(&bytes)?.open_door(kek, &name, ControlOwner::Global)?;
-    let body: TrefRecord = serde_json::from_slice(opened.door()).map_err(|_| ERR_TREF)?;
+    let door = open_global(kek, &name, &bytes)?;
+    let body: TrefRecord = serde_json::from_slice(&door).map_err(|_| ERR_TREF)?;
     if body.label != TREF_LABEL || body.v != 1 || body.ref_hash != ref_hash(external_ref) {
         return Err(ERR_TREF);
     }
@@ -219,8 +241,8 @@ pub async fn read_born<S: RecordStore, K: crate::ports::Kek>(
     let Some(bytes) = records.get(&name).await? else {
         return Ok(None);
     };
-    let opened = parse_control(&bytes)?.open_door(kek, &name, ControlOwner::Global)?;
-    let body: BornRecord = serde_json::from_slice(opened.door()).map_err(|_| ERR_BORN)?;
+    let door = open_global(kek, &name, &bytes)?;
+    let body: BornRecord = serde_json::from_slice(&door).map_err(|_| ERR_BORN)?;
     if body.label != BORN_LABEL
         || body.v != 1
         || body.token.name != UnitName::new(tenant.clone(), unit)
@@ -486,7 +508,8 @@ where
                     Ok(None) => return Err(unavailable()),
                     Err(e) => return Err(store_stop(&e, "tref record does not verify")),
                 },
-                Err(e) => return Err(store_stop(&e, "tref record")),
+                // Sealing or the put: nothing was verified, so never damage.
+                Err(_) => return Err(unavailable()),
             }
         }
         Err(e) => return Err(store_stop(&e, "tref record does not verify")),
@@ -497,10 +520,9 @@ where
     // An adopted tenant that is already past provisioning is answered as
     // it is.
     let first = head(root, &t).await?;
-    if ours && first.is_some() {
-        // This call named the id a moment ago, after reading no chain.
-        return Err(damaged("a new tenant id has a chain"));
-    }
+    // A chain under the id this call named a moment ago (it read none
+    // before the put) is a concurrent create of the same workspace that
+    // adopted the record and went on: this call goes on with it too.
     // `201` for the call that named the tenant, `200` for one that adopts
     // it through `m/tref/` (it may finish a create still in flight).
     let status = if ours { 201 } else { 200 };
@@ -578,7 +600,7 @@ where
             // (`m/kl/`, written by the deploy step that makes the key
             // buckets).
             Ok(None) => return Err(unavailable()),
-            Err(_) => return Err(unavailable()),
+            Err(e) => return Err(store_stop(&e, "key locations do not verify")),
         };
         let claims = ChainClaims { root, now };
         let created = create_key_version(
@@ -592,6 +614,9 @@ where
         )
         .await;
         if created.is_err() {
+            // Contention between two creates is among these: a retry
+            // finishes it; the alert shows one that never does.
+            crate::trace::alert(|| "mgmt: tenant create: key version not created".to_string());
             return Err(unavailable());
         }
     }
@@ -602,7 +627,10 @@ where
         let kcv = committed_check(&door, door.tk_version).ok_or_else(unavailable)?;
         root.load_key(&chain_tenant, door.tk_version, kcv)
             .await
-            .map_err(|_| unavailable())?;
+            .map_err(|_| {
+                crate::trace::alert(|| "mgmt: tenant create: committed key not loaded".to_string());
+                unavailable()
+            })?;
         let activate = Change::Activate {
             external_ref: Some(body.external_ref.clone()),
         };

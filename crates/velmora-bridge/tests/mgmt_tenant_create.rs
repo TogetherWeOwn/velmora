@@ -79,6 +79,9 @@ struct Faults {
     /// The put that fails: refused (nothing stored) or answer lost
     /// (stored, then an error).
     at: Cell<Option<(u64, bool)>>,
+    /// Once a put under this prefix lands, these records land too (another
+    /// writer between this put and the call's next read).
+    plant_after: RefCell<Option<(String, Vec<(String, Vec<u8>)>)>>,
 }
 
 /// An in-memory store that fails the world's k-th put.
@@ -104,7 +107,22 @@ impl RecordStore for Faulty {
                 let _ = self.inner.put_if_absent(name, bytes).await?;
                 Err(BridgeError::Blob("fault: answer lost".into()))
             }
-            _ => self.inner.put_if_absent(name, bytes).await,
+            _ => {
+                let put = self.inner.put_if_absent(name, bytes).await?;
+                let hook = {
+                    let mut plant = self.faults.plant_after.borrow_mut();
+                    match plant.as_ref() {
+                        Some((prefix, _)) if name.starts_with(prefix.as_str()) => plant.take(),
+                        _ => None,
+                    }
+                };
+                if let Some((_, records)) = hook {
+                    for (n, b) in records {
+                        self.inner.plant(&n, b);
+                    }
+                }
+                Ok(put)
+            }
         }
     }
     async fn get(&self, name: &str) -> Result<Option<Vec<u8>>> {
@@ -713,6 +731,7 @@ fn a_fault_at_any_put_is_finished_by_a_retry() {
             w.faults.at.set(Some((at, lose)));
             futures_executor_block_on(async {
                 let first = w.create(&signup()).await;
+                assert!(w.faults.puts.get() >= at, "the fault at put {k} fired");
                 w.faults.at.set(None);
                 let mut last = first.clone();
                 for _ in 0..3 {
@@ -829,5 +848,77 @@ fn a_refused_birth_token_is_a_500() {
         let tenant = w.tenant_of(WS).await.unwrap();
         assert!(w.ports.records.raw(&born_name(&tenant, 0)).is_none());
         assert_eq!(w.chain_len(&tenant), 1);
+    });
+}
+
+/// Another create of the same workspace writes record 1 between this
+/// call's `m/tref/` put and its head read: this call goes on with it
+/// (never a 500), and both end on one tenant.
+#[test]
+fn a_create_racing_between_the_tref_put_and_the_head_read_goes_on() {
+    // Record 1 of the tenant the seed draws, from a world that stops
+    // right after it.
+    let other = World::new();
+    futures_executor_block_on(async {
+        other.ports.records.refuse("m/ub/");
+        expect(&other.create(&signup()).await, 503, "service_unavailable");
+    });
+    let tenant = futures_executor_block_on(other.tenant_of(WS)).unwrap();
+    let record_1: Vec<(String, Vec<u8>)> = other
+        .ports
+        .records
+        .names_under(&format!("m/t/{}/", tenant.as_str()))
+        .into_iter()
+        .map(|n| {
+            let b = other.ports.records.raw(&n).unwrap();
+            (n, b)
+        })
+        .collect();
+    assert_eq!(record_1.len(), 1);
+    let w = World::new();
+    *w.faults.plant_after.borrow_mut() = Some(("m/tref/".to_string(), record_1));
+    futures_executor_block_on(async {
+        let a = w.create(&signup()).await;
+        expect(&a, 201, "ok");
+        assert_eq!(json_of(&a)["id"], tenant.as_str());
+        assert!(w.faults.plant_after.borrow().is_none(), "the race ran");
+        assert_one_live_tenant(&w).await;
+    });
+}
+
+thread_local! {
+    static ALERTS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+}
+
+fn capture(line: &str) {
+    ALERTS.with(|a| a.borrow_mut().push(line.to_string()));
+}
+
+/// A born marker that does not verify stops a resumed create with 500
+/// and an alert of fixed words.
+#[test]
+fn a_damaged_born_marker_is_a_500_with_an_alert() {
+    velmora_bridge::trace::log_alerts(capture);
+    let w = World::without_locations();
+    futures_executor_block_on(async {
+        expect(&w.create(&signup()).await, 503, "service_unavailable");
+        let tenant = w.tenant_of(WS).await.unwrap();
+        let name = born_name(&tenant, 0);
+        let mut bytes = w.ports.records.raw(&name).unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 1;
+        w.ports.records.lose(&name);
+        w.ports.records.plant(&name, bytes);
+        w.locations().await;
+        ALERTS.with(|a| a.borrow_mut().clear());
+        expect(&w.create(&signup()).await, 500, "internal_error");
+        let alerts = ALERTS.with(|a| a.borrow().clone());
+        assert_eq!(
+            alerts,
+            vec!["mgmt: tenant create stopped: born marker does not verify".to_string()]
+        );
+        assert!(alerts
+            .iter()
+            .all(|l| !l.contains(tenant.as_str()) && !l.contains(WS)));
     });
 }
