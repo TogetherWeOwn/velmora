@@ -36,7 +36,7 @@ use crate::ports::{
     BlobStore, Bridge, Catalog, Clock, JobSink, Kek, Lease, NntpConnector, SlotWait,
     SlotWaitWindow, LEASE_SECS, MAX_QUEUE_DELAY_SECS, PERMIT_SECS,
 };
-use crate::post::{settle, Stop, POST_SOCKET_BYTES};
+use crate::post::{check_extent_size, settle, Stop, POST_SOCKET_BYTES};
 use crate::recovery::delete_blob;
 use crate::stamp::Advance;
 use crate::types::{
@@ -190,11 +190,24 @@ pub fn job_bytes(stage: OutboxStage, cipher_size: u64, post_sockets: u32) -> u64
 /// parity. Measured on a deployed Worker, a post job with parity held
 /// 2.8 MiB more than one without: its 4 shards.
 pub fn parity_job_bytes(cipher_size: u64, parity: usize) -> u64 {
-    let shard = match (parity, crate::parity::stripe_of(cipher_size)) {
-        (0, _) | (_, None) => return 0,
-        (_, Some((_, shard))) => u64::from(shard),
+    if parity == 0 {
+        return 0;
+    }
+    let Some((_, shard)) = crate::parity::stripe_of(cipher_size) else {
+        return 0;
     };
-    (parity as u64).saturating_add(2).saturating_mul(shard)
+    (parity as u64)
+        .saturating_add(2)
+        .saturating_mul(u64::from(shard))
+}
+
+fn post_job_bytes(cipher_size: u64, post_sockets: u32, parity: usize) -> u64 {
+    job_bytes(OutboxStage::Post, cipher_size, post_sockets)
+        .saturating_add(parity_job_bytes(cipher_size, parity))
+}
+
+fn new_plan_parity_count(cipher_size: u64) -> usize {
+    crate::parity::parity_count(crate::articles::article_spans(cipher_size).len())
 }
 
 /// The extent buffers an isolate keeps between post jobs
@@ -204,8 +217,17 @@ pub fn extent_pool_buffers(
     job_budget_bytes: u64,
     max_extent_bytes: u64,
     post_sockets: u32,
+    parity: bool,
 ) -> usize {
-    let job = job_bytes(OutboxStage::Post, max_extent_bytes, post_sockets).max(1);
+    let Some(cipher_size) = velmora::media::ciphertext_size(max_extent_bytes) else {
+        return 1;
+    };
+    let parity = if parity {
+        new_plan_parity_count(cipher_size)
+    } else {
+        0
+    };
+    let job = post_job_bytes(cipher_size, post_sockets, parity).max(1);
     usize::try_from(job_budget_bytes / job)
         .unwrap_or(usize::MAX)
         .max(1)
@@ -405,20 +427,28 @@ where
             }
             Err(e) => return settle(&self.catalog, &self.clock, lease, e.into()).await,
         };
-        let bytes = job_bytes(stage, row.extent.cipher_size, self.cfg.post_sockets);
-        // A post job computes the parity shards of its extent and holds
-        // them next to it: those of the stored plan, or of the plan it
-        // is about to draw.
-        let parity = match (stage, row.parity_count, row.extent.article_count) {
-            (OutboxStage::Post, Some(parity), _) => parity as usize,
-            (OutboxStage::Post, None, None) if self.cfg.packed_plans && self.cfg.parity => {
-                crate::parity::parity_count(
-                    crate::articles::article_spans(row.extent.cipher_size).len(),
-                )
+        let cipher_size = row.extent.cipher_size;
+        let bytes = if stage == OutboxStage::Post {
+            if let Err(stop) = check_extent_size(cipher_size) {
+                return settle(&self.catalog, &self.clock, lease, stop).await;
             }
-            _ => 0,
+            if cipher_size > self.budget.job_capacity() {
+                // Even a job running alone must have room for the extent itself.
+                let stop = Stop::fail(FailClass::Corrupt);
+                return settle(&self.catalog, &self.clock, lease, stop).await;
+            }
+            // Charge the stored parity or the shards of the plan about to be drawn.
+            let parity = match (row.parity_count, row.extent.article_count) {
+                (Some(parity), _) => parity as usize,
+                (None, None) if self.cfg.packed_plans && self.cfg.parity => {
+                    new_plan_parity_count(cipher_size)
+                }
+                _ => 0,
+            };
+            post_job_bytes(cipher_size, self.cfg.post_sockets, parity)
+        } else {
+            job_bytes(stage, cipher_size, self.cfg.post_sockets)
         };
-        let bytes = bytes.saturating_add(parity_job_bytes(row.extent.cipher_size, parity));
         // A job larger than the whole budget still has to run: alone.
         let bytes = bytes.min(self.budget.job_capacity());
         let waited_from = self.clock.now();

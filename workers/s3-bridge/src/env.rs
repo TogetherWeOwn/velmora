@@ -208,6 +208,7 @@ fn build(env: &Env) -> Result<WorkerBridge, String> {
                 cfg.job_budget_bytes,
                 cfg.max_extent_bytes,
                 cfg.post_sockets,
+                cfg.parity,
             ))
             .with_sleeper(sleeper())
             .with_spawner(Rc::new(worker::wasm_bindgen_futures::spawn_local)),

@@ -13,6 +13,108 @@ use velmora_bridge::*;
 
 const MIB: u64 = 1024 * 1024;
 
+#[test]
+fn spare_count_uses_the_post_job_charge_including_parity() {
+    use velmora_bridge::jobs::extent_pool_buffers;
+
+    // With parity and 8 sockets, two ~32.13 MiB jobs fit in 90 MiB.
+    assert_eq!(extent_pool_buffers(90 * MIB, 16 * MIB, 8, true), 2);
+    assert_eq!(extent_pool_buffers(90 * MIB, 16 * MIB, 8, false), 3);
+    // 84 MiB would fit three plaintext-sized charges but not three ciphertext ones.
+    assert_eq!(extent_pool_buffers(84 * MIB, 16 * MIB, 8, false), 2);
+    // Shipped config: 90 MiB budget, 16 MiB extents, 6 sockets, parity off.
+    assert_eq!(extent_pool_buffers(90 * MIB, 16 * MIB, 6, false), 3);
+}
+
+#[tokio::test]
+async fn an_oversized_catalogue_extent_settles_as_corrupt_before_taking_a_buffer() {
+    let mut rig = rig(&[Spec {
+        backbone: "bb0",
+        post: true,
+        max_conns: 1,
+    }])
+    .await;
+    rig.bridge.budget = budget(1);
+    let s = rig.seed(1, b"sealed extent").await;
+    rig.bridge
+        .catalog
+        .entries
+        .borrow_mut()
+        .get_mut(&s.extent)
+        .unwrap()
+        .job
+        .extent
+        .cipher_size = 2 << 30;
+    let job = Job::Extent {
+        v: JOB_VERSION,
+        extent: s.extent.clone(),
+        generation: s.generation,
+        stage: OutboxStage::Post,
+    };
+    assert!(matches!(
+        rig.bridge.run_job(&job).await,
+        JobOutcome::Retry { .. }
+    ));
+    assert_eq!(
+        rig.bridge.catalog.outbox(&s.extent).last_error,
+        Some(FailClass::Corrupt)
+    );
+    assert_eq!(rig.bridge.safety.gets(), 0, "no safety body read");
+    assert_eq!(rig.bridge.budget.peak(), 0, "no extent buffer charge");
+    assert_eq!(
+        rig.bridge.budget.spare_bytes(),
+        0,
+        "no spare capacity retained"
+    );
+}
+
+#[tokio::test]
+async fn lowering_the_upload_limit_does_not_strand_an_existing_extent() {
+    let mut rig = rig(&[Spec {
+        backbone: "bb0",
+        post: true,
+        max_conns: 1,
+    }])
+    .await;
+    rig.bridge.budget = budget(1);
+    let s = rig.seed(1, &marked_plaintext(5 * MIB as usize)).await;
+    rig.bridge.cfg.max_extent_bytes = 4 * MIB;
+    let job = Job::Extent {
+        v: JOB_VERSION,
+        extent: s.extent.clone(),
+        generation: s.generation,
+        stage: OutboxStage::Post,
+    };
+    assert_eq!(rig.bridge.run_job(&job).await, JobOutcome::Ack);
+    assert_eq!(
+        rig.bridge.catalog.outbox(&s.extent).stage,
+        OutboxStage::Verify
+    );
+    assert!(rig.server().posted_count().await > 0);
+}
+
+#[tokio::test]
+async fn a_wrong_safety_object_size_settles_as_corrupt_before_reading() {
+    let rig = rig(&[Spec {
+        backbone: "bb0",
+        post: true,
+        max_conns: 1,
+    }])
+    .await;
+    let s = rig.seed(1, b"sealed extent").await;
+    assert!(rig
+        .bridge
+        .safety
+        .corrupt(&s.extent.safety_key(), |bytes| bytes.push(0)));
+    assert!(matches!(rig.run_post(&s).await, JobOutcome::Retry { .. }));
+    assert_eq!(
+        rig.bridge.catalog.outbox(&s.extent).last_error,
+        Some(FailClass::Corrupt)
+    );
+    assert_eq!(rig.bridge.safety.gets(), 0, "no safety body read");
+    assert_eq!(rig.server().posted_count().await, 0);
+}
+
 /// A job budget as production has it: 48 MiB for requests, 90 for jobs.
 fn budget(spares: usize) -> ByteBudget {
     ByteBudget::new(48 * MIB)

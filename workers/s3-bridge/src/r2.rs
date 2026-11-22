@@ -288,11 +288,26 @@ impl BodyReads for ByobReads {
     }
 }
 
+/// Check the returned object's size before opening its stream or growing `out`.
+async fn read_object_body(
+    required: Option<u64>,
+    actual: u64,
+    out: &mut Vec<u8>,
+    fill: impl AsyncFnOnce(u64, &mut Vec<u8>) -> Result<()>,
+) -> Result<()> {
+    if required.is_some_and(|size| size != actual) {
+        out.clear();
+        return Err(BridgeError::BlobSizeMismatch);
+    }
+    fill(actual, out).await
+}
+
 impl R2Blobs {
     async fn read_into(
         &self,
         key: &str,
         span: Option<ByteSpan>,
+        required: Option<u64>,
         out: &mut Vec<u8>,
     ) -> Result<bool> {
         // Missing objects and failures before the first read leave no old bytes.
@@ -312,28 +327,31 @@ impl R2Blobs {
         let Some(object) = req.execute().await.map_err(blob_err("get"))? else {
             return Ok(false);
         };
-        let body = object
-            .body()
-            .ok_or_else(|| BridgeError::Blob("r2: get returned no body".into()))?;
-        let expected = span.map_or_else(|| object.size(), |s| s.len);
-        let stream = match body.response_body().map_err(blob_err("get body"))? {
-            worker::ResponseBody::Stream(stream) => stream,
-            _ => return Err(BridgeError::Blob("r2: get returned no body".into())),
-        };
-        let Some(mut reads) = ByobReads::new(&stream, expected) else {
-            return Err(BridgeError::Blob("r2: get body failed".into()));
-        };
-        fill_into(&mut reads, expected, out).await.map_err(|e| {
-            BridgeError::Blob(
-                match (e, span) {
-                    (BodyError::Short, Some(_)) => "r2: short range",
-                    (BodyError::Short, None) => "r2: short body",
-                    (BodyError::Long, _) => "r2: long body",
-                    (BodyError::Read, _) => "r2: get body failed",
-                }
-                .into(),
-            )
-        })?;
+        let actual = span.map_or_else(|| object.size(), |s| s.len);
+        read_object_body(required, actual, out, async |expected, out| {
+            let body = object
+                .body()
+                .ok_or_else(|| BridgeError::Blob("r2: get returned no body".into()))?;
+            let stream = match body.response_body().map_err(blob_err("get body"))? {
+                worker::ResponseBody::Stream(stream) => stream,
+                _ => return Err(BridgeError::Blob("r2: get returned no body".into())),
+            };
+            let Some(mut reads) = ByobReads::new(&stream, expected) else {
+                return Err(BridgeError::Blob("r2: get body failed".into()));
+            };
+            fill_into(&mut reads, expected, out).await.map_err(|e| {
+                BridgeError::Blob(
+                    match (e, span) {
+                        (BodyError::Short, Some(_)) => "r2: short range",
+                        (BodyError::Short, None) => "r2: short body",
+                        (BodyError::Long, _) => "r2: long body",
+                        (BodyError::Read, _) => "r2: get body failed",
+                    }
+                    .into(),
+                )
+            })
+        })
+        .await?;
         Ok(true)
     }
 }
@@ -385,11 +403,14 @@ impl BlobStore for R2Blobs {
 
     async fn get(&self, key: &str, span: Option<ByteSpan>) -> Result<Option<Vec<u8>>> {
         let mut out = Vec::new();
-        Ok(self.read_into(key, span, &mut out).await?.then_some(out))
+        Ok(self
+            .read_into(key, span, None, &mut out)
+            .await?
+            .then_some(out))
     }
 
-    async fn get_into(&self, key: &str, out: &mut Vec<u8>) -> Result<bool> {
-        self.read_into(key, None, out).await
+    async fn get_into(&self, key: &str, expected: u64, out: &mut Vec<u8>) -> Result<bool> {
+        self.read_into(key, None, Some(expected), out).await
     }
 
     async fn head(&self, key: &str) -> Result<Option<u64>> {
@@ -583,6 +604,31 @@ mod tests {
         match std::pin::pin!(f).poll(&mut Context::from_waker(Waker::noop())) {
             Poll::Ready(v) => v,
             Poll::Pending => panic!("scripted reads never wait"),
+        }
+    }
+
+    #[test]
+    fn a_reported_size_mismatch_never_opens_or_fills_the_body() {
+        for (expected, reported) in [(64, 65), (65, 64)] {
+            let mut out = vec![0xaa; 16];
+            let capacity = out.capacity();
+            let mut opens = 0;
+            let mut reader = scripted(reported as usize, vec![]);
+            let result = run(read_object_body(
+                Some(expected),
+                reported,
+                &mut out,
+                async |size, out| {
+                    opens += 1;
+                    fill_into(&mut reader, size, out).await.unwrap();
+                    Ok(())
+                },
+            ));
+            assert_eq!(opens, 0, "no body reader opened");
+            assert!(reader.asked.is_empty(), "no body bytes read");
+            assert!(matches!(result, Err(BridgeError::BlobSizeMismatch)));
+            assert!(out.is_empty());
+            assert_eq!(out.capacity(), capacity);
         }
     }
 

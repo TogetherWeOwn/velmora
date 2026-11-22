@@ -37,6 +37,8 @@ pub enum BridgeError {
     Sql(String),
     /// Blob store failure (R2 or another S3-compatible store).
     Blob(String),
+    /// The blob does not match the expected size of a bounded read.
+    BlobSizeMismatch,
     /// NNTP failure from the engine. Its `Debug` redacts auth reply text.
     Nntp(velmora::Error),
     /// Queue send failure.
@@ -56,6 +58,7 @@ impl fmt::Display for BridgeError {
             BridgeError::NotImplemented(what) => write!(f, "not implemented: {what}"),
             BridgeError::Sql(m) => write!(f, "sql: {m}"),
             BridgeError::Blob(m) => write!(f, "blob: {m}"),
+            BridgeError::BlobSizeMismatch => f.write_str("blob: size mismatch"),
             BridgeError::Nntp(e) => write!(f, "nntp: {e}"),
             BridgeError::Queue(m) => write!(f, "queue: {m}"),
             BridgeError::Crypto(c) => write!(f, "crypto: {c}"),

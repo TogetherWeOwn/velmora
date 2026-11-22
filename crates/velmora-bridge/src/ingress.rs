@@ -1024,7 +1024,8 @@ impl ByteBudget {
     fn try_charge_as(&self, bytes: u64, job: bool, extent: Option<u64>) -> Option<Charge> {
         let s = &self.state;
         let limit = if job { s.job_capacity } else { s.capacity };
-        let extent = extent.filter(|len| job && *len >= EXTENT_POOL_MIN_BYTES && *len <= bytes);
+        let extent_len = extent.filter(|len| job && *len <= bytes);
+        let extent = extent_len.filter(|len| *len >= EXTENT_POOL_MIN_BYTES);
         let given = bytes;
         // With `lend` (the spare taken over: its place, its capacity):
         // the bytes charged, and how many of the other spares, oldest
@@ -1091,6 +1092,7 @@ impl ByteBudget {
             jobs,
             held: self.held.clone(),
             buffer: Cell::new(lent),
+            extent_len,
             pooled,
         })
     }
@@ -1267,6 +1269,8 @@ pub struct Charge {
     held: Option<Rc<Cell<u64>>>,
     /// The extent buffer of the job, while no [`Lent`] has it out.
     buffer: Cell<Option<Vec<u8>>>,
+    /// The ciphertext length this job was charged for, not the spare's capacity.
+    extent_len: Option<u64>,
     /// The capacity of the extent buffer that `jobs` count: the most a
     /// buffer kept as a spare may hold.
     pooled: u64,
@@ -1297,6 +1301,7 @@ impl Charge {
             jobs: 0,
             held: self.held.clone(),
             buffer: Cell::new(None),
+            extent_len: None,
             pooled: 0,
         }
     }
@@ -1348,11 +1353,22 @@ impl Charge {
     /// comes back to this charge when the [`Lent`] is dropped, and goes
     /// to the spares with the charge.
     pub fn lend(&self, len: usize) -> Lent<'_> {
+        let mut buffer = self.lend_buffer();
+        if buffer.capacity() < len {
+            buffer.bytes = Vec::with_capacity(len);
+        }
+        buffer
+    }
+
+    /// Take the spare (or an empty vector) only for the extent this job
+    /// was charged for. The store grows it only after confirming the size.
+    pub(crate) fn lend_charged(&self, len: u64) -> Option<Lent<'_>> {
+        (self.extent_len == Some(len) && len <= self.jobs).then(|| self.lend_buffer())
+    }
+
+    fn lend_buffer(&self) -> Lent<'_> {
         let mut bytes = self.buffer.take().unwrap_or_default();
         bytes.clear();
-        if bytes.capacity() < len {
-            bytes = Vec::with_capacity(len);
-        }
         Lent {
             bytes,
             home: Some(self),
@@ -1463,6 +1479,18 @@ mod charge_tests {
     }
 
     #[tokio::test]
+    async fn a_loan_requires_the_charged_length_and_does_not_allocate() {
+        let len = EXTENT_POOL_MIN_BYTES;
+        let budget = ByteBudget::new(3 * len).with_extent_pool(1);
+        let job = budget.charge_job_extent(2 * len, len).await.unwrap();
+        assert!(job.lend_charged(2 << 30).is_none());
+        assert!(job.lend_charged(len - 1).is_none());
+        assert_eq!(job.lend_charged(len).unwrap().capacity(), 0);
+        drop(job);
+        assert_eq!(budget.spare_bytes(), 0);
+    }
+
+    #[tokio::test]
     async fn held_request_bytes_and_idle_spares_both_count_toward_peak() {
         let len = EXTENT_POOL_MIN_BYTES;
         let budget = ByteBudget::new(2 * len).with_extent_pool(1);
@@ -1487,20 +1515,11 @@ mod charge_tests {
 pub const EXTENT_POOL_MIN_BYTES: u64 = 4 * 1024 * 1024;
 
 /// A job's extent buffer ([`Charge::lend`]), back with its charge when
-/// dropped. One made by [`Lent::own`] has no charge and is freed.
+/// dropped. An uncharged default buffer is freed instead.
+#[derive(Default)]
 pub struct Lent<'c> {
     bytes: Vec<u8>,
     home: Option<&'c Charge>,
-}
-
-impl Lent<'_> {
-    /// An empty buffer for `len` bytes that belongs to no charge.
-    pub fn own(len: usize) -> Lent<'static> {
-        Lent {
-            bytes: Vec::with_capacity(len),
-            home: None,
-        }
-    }
 }
 
 impl std::ops::Deref for Lent<'_> {

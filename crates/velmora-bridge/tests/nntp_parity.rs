@@ -748,6 +748,29 @@ async fn a_lost_parity_article_is_posted_again() {
     assert_eq!(addendum(&rig, &s), entry.parity.clone());
 }
 
+#[tokio::test]
+async fn a_wrong_size_safety_copy_is_unavailable_for_repost_without_being_read() {
+    let rig = parity_rig(&[spec("bb0", 5)]).await;
+    let s = rig.seed(1, &marked_plaintext(TEN)).await;
+    let plan = rig.post(&s).await;
+    let lost = &plan[3];
+    rig.server().hide(&lost.message_id).await;
+    assert!(rig
+        .bridge
+        .safety
+        .corrupt(&s.extent.safety_key(), |bytes| bytes.push(0)));
+    let reads = rig.bridge.safety.gets();
+
+    let lease = rig.claim(&s, OutboxStage::Verify).await;
+    let job = rig.job(&s).await;
+    assert_eq!(
+        rig.bridge.repost_run(&lease, &job, &[lost.idx]).await,
+        Ok(false)
+    );
+    assert_eq!(rig.bridge.safety.gets(), reads);
+    assert!(rig.server().is_hidden(&lost.message_id).await);
+}
+
 /// A packed plan has one repost stamp for all its articles: a repost of
 /// a parity article alone moves the time its safety copy waits from,
 /// for the data articles too.

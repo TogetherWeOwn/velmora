@@ -343,12 +343,24 @@ impl From<BridgeError> for Stop {
             ) => Stop::fail(FailClass::PostRefused),
             BridgeError::Nntp(_) => Stop::fail(FailClass::NntpError),
             BridgeError::Blob(_) => Stop::fail(FailClass::BlobError),
+            BridgeError::BlobSizeMismatch => Stop::fail(FailClass::Corrupt),
             BridgeError::Crypto(_) => Stop::fail(FailClass::CryptoError),
             BridgeError::Queue(_) => Stop::fail(FailClass::QueueError),
             BridgeError::Sql(_) | BridgeError::GuardFailed => Stop::Catalog,
             _ => Stop::fail(FailClass::Internal),
         }
     }
+}
+
+/// Reject lengths above the supported ciphertext ceiling. A lower
+/// upload limit must not strand extents sealed under an earlier value.
+pub(crate) fn check_extent_size(cipher_size: u64) -> core::result::Result<(), Stop> {
+    if velmora::media::ciphertext_size(crate::config::MAX_EXTENT_BYTES_LIMIT)
+        .is_none_or(|max| cipher_size > max)
+    {
+        return Err(Stop::fail(FailClass::Corrupt));
+    }
+    Ok(())
 }
 
 /// `60 s · 2^(attempts-1)`, capped at one hour.
@@ -613,6 +625,7 @@ where
         charge: Option<&Charge>,
     ) -> core::result::Result<(), Stop> {
         let extent = &job.extent;
+        check_extent_size(extent.cipher_size)?;
         // A job that comes back to an extent it has posted already (a
         // crash before the stage moved on, a revived obligation) needs no
         // provider: it only writes the recovery record again.
@@ -884,15 +897,15 @@ where
         charge: Option<&'c Charge>,
     ) -> core::result::Result<Loaded<'c>, Stop> {
         let started = self.clock.now();
-        let len =
-            usize::try_from(extent.cipher_size).map_err(|_| Stop::fail(FailClass::Corrupt))?;
         let mut cipher = match charge {
-            Some(charge) => charge.lend(len),
-            None => Lent::own(len),
+            Some(charge) => charge
+                .lend_charged(extent.cipher_size)
+                .ok_or_else(|| Stop::fail(FailClass::Corrupt))?,
+            None => Lent::default(),
         };
         if !self
             .safety
-            .get_into(&extent.id.safety_key(), &mut cipher)
+            .get_into(&extent.id.safety_key(), extent.cipher_size, &mut cipher)
             .await?
         {
             return Err(Stop::fail(FailClass::BlobError));
@@ -1413,7 +1426,10 @@ where
         parity: Option<&ParityPlan>,
         other_shards: &mut bool,
     ) -> core::result::Result<bool, Stop> {
-        if providers.is_empty() || extent.safety_state != SafetyState::Held {
+        if providers.is_empty()
+            || extent.safety_state != SafetyState::Held
+            || check_extent_size(extent.cipher_size).is_err()
+        {
             return Ok(false);
         }
         let data = plan.len();
@@ -1438,6 +1454,9 @@ where
             .budget
             .job_capacity()
             .saturating_sub(JOB_OVERHEAD_BYTES);
+        if extent.cipher_size > room {
+            return Ok(false);
+        }
         let bytes = extent
             .cipher_size
             .saturating_add(u64::from(self.cfg.post_sockets) * POST_SOCKET_BYTES)
@@ -1450,17 +1469,17 @@ where
         else {
             return Err(Stop::NoPermit);
         };
-        let Ok(len) = usize::try_from(extent.cipher_size) else {
+        let Some(mut cipher) = charge.lend_charged(extent.cipher_size) else {
             return Ok(false);
         };
-        let mut cipher = charge.lend(len);
-        match self
-            .safety
-            .get_into(&extent.id.safety_key(), &mut cipher)
-            .await
-        {
-            Ok(true) => {}
-            _ => return Ok(false),
+        if !matches!(
+            self.safety
+                .get_into(&extent.id.safety_key(), extent.cipher_size, &mut cipher)
+                .await,
+            Ok(true)
+        ) {
+            // No intact copy to repost; verification still handles what Usenet has.
+            return Ok(false);
         }
         if cipher.len() as u64 != extent.cipher_size || sha256(&cipher) != extent.cipher_sha256 {
             return Ok(false);
