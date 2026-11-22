@@ -22,8 +22,10 @@
 //!   on the binding the call was admitted with, so of two overlapping
 //!   calls under one key only one binds; the other revokes its own grant
 //!   and places the bound one's bucket. A call that dies between its put
-//!   and its bind leaves an unbound grant, which is never placed. A bound
-//!   grant its creator no longer holds is never placed either.
+//!   and its bind leaves an unbound grant, which is never placed: the
+//!   finisher's `Binding::None` fences its seq before it revokes it, so a
+//!   late bind fails. A bound grant its creator no longer holds is never
+//!   placed either, unless its bucket already is: then that is the answer.
 //! - **A grant on the id that K derives, held by any other subject before
 //!   the create, is dropped first** (closing records), so the new bucket
 //!   is reachable by its creator alone (A7).
@@ -45,12 +47,15 @@
 //!   every creator grant by its reservation: for an open bound one it runs
 //!   the create again under that reservation, and it revokes one that no
 //!   open reservation is bound to.
-//! - **Residuals:** a call stalled for more than the intent's delay (30 s)
-//!   between its put and its bind loses its grant to the finisher (its
-//!   bucket is then never placed; the retry makes a new one); and the
-//!   `pending_ops` row of a creator grant is cleared with the head by any
-//!   later finished change, so the queue message, the durable part, is
-//!   what finishes it.
+//! - **Residuals:** the `pending_ops` row of a creator grant is cleared
+//!   with the head by any later finished change, so the queue message,
+//!   the durable part, is what finishes it. An intent that runs before its
+//!   grant's put has landed (a put stalled past the 30 s delay) answers
+//!   `NotOne`; if that call then dies before its bind, the unbound grant
+//!   opens nothing and is left until a later finisher run names its seq.
+//!   A retry within the delay after a failed bind counts the unbound grant
+//!   against the 64-grant cap, so a creator at 63 grants may be refused
+//!   `too_many_grants` until the finisher revokes it.
 
 use std::collections::BTreeSet;
 
@@ -298,11 +303,16 @@ where
                 let _ = self
                     .drop_grant(table, request.creator, bucket.as_str(), rng)
                     .await;
-                let _ = self
+                // Answered only once the reservation is released, so no
+                // finisher can make the refused create a bucket later.
+                match self
                     .admission
                     .release_bound(self.tenant, idempotency_key, Some(k))
-                    .await;
-                Placing::Done(BucketAnswer::StateRefused { status, code })
+                    .await
+                {
+                    Ok(()) => Placing::Done(BucketAnswer::StateRefused { status, code }),
+                    Err(_) => Placing::Done(BucketAnswer::Unfinished { grant_seq: k }),
+                }
             }
             None => {
                 let _ = self.apply_all(table, revoked).await;
@@ -323,6 +333,25 @@ where
         request: &BucketRequest<'_>,
         rng: &mut R,
     ) -> Result<BucketAnswer> {
+        Ok(self
+            .create(records, table, idempotency_key, request, None, rng)
+            .await?
+            .unwrap_or(BucketAnswer::Busy))
+    }
+
+    /// The create. With `only = Some(seq)` (the finisher), it goes on only
+    /// while the reservation is bound to `seq` with its grant held, or to
+    /// a grant this run bound after `seq` lost its order (AM-8); `None`
+    /// once it is not, after undoing any reservation it made itself.
+    async fn create<B: BucketRecords, R: FillRandom>(
+        &self,
+        records: &B,
+        table: &mut KeyTable,
+        idempotency_key: &str,
+        request: &BucketRequest<'_>,
+        only: Option<u64>,
+        rng: &mut R,
+    ) -> Result<Option<BucketAnswer>> {
         let chain = key_chain(self.tenant);
         let reservation = BucketReservation {
             name: request.name,
@@ -334,6 +363,8 @@ where
         // newest bound seq until a new one is bound, and such a seq is
         // never placed again.
         let mut spent = BTreeSet::new();
+        // The finisher's own bindings: `only`, and what it bound since.
+        let mut ours: BTreeSet<u64> = only.into_iter().collect();
         let mut puts = 0;
         let mut caught_up = false;
         let mut caught_up_in_full = false;
@@ -359,19 +390,20 @@ where
                     if bucket != bucket_id(self.tenant, grant_seq) {
                         return Err(ERR_BINDING);
                     }
-                    // In force only when both chains' stores have it.
+                    // In force only when both chains' stores have it. A
+                    // bucket deleted since is a conflict for an old retry.
                     let in_force = match self.put_bucket(records, request, grant_seq).await {
                         Some(BucketPut::Placed { in_force }) => in_force,
                         Some(BucketPut::OrderLost | BucketPut::Refused { .. }) => {
-                            return Err(ERR_BINDING)
+                            return Ok(Some(BucketAnswer::Refused(Refusal::Conflict)))
                         }
                         None => false,
                     };
                     let keys = self.keys_in_force(table, &revoked).await;
-                    return Ok(match keys && in_force {
+                    return Ok(Some(match keys && in_force {
                         true => BucketAnswer::Created { bucket, grant_seq },
                         false => BucketAnswer::Unfinished { grant_seq },
-                    });
+                    }));
                 }
                 // A refusal by a unit behind the head may be stale: bring
                 // the units up once and ask again. (The bucket cap does not
@@ -387,11 +419,22 @@ where
                 BucketAdmission::Refused(Refusal::NotFound | Refusal::CreatorNotActive)
                     if !caught_up_in_full =>
                 {
-                    return Ok(BucketAnswer::Busy)
+                    return Ok(Some(BucketAnswer::Busy))
                 }
-                BucketAdmission::Refused(r) => return Ok(BucketAnswer::Refused(r)),
+                BucketAdmission::Refused(r) => return Ok(Some(BucketAnswer::Refused(r))),
                 BucketAdmission::Admitted { keys_seq, bound } => (keys_seq, bound),
             };
+            if only.is_some() && !seen.is_some_and(|k| ours.contains(&k)) {
+                // Not the finisher's reservation any more: a fresh one it
+                // just made is undone.
+                if seen.is_none() {
+                    let _ = self
+                        .admission
+                        .release_bound(self.tenant, idempotency_key, None)
+                        .await;
+                }
+                return Ok(None);
+            }
 
             if let Some(k) = seen.filter(|k| !spent.contains(k)) {
                 // An earlier call under this key wrote and bound k: place
@@ -402,13 +445,19 @@ where
                 if !is_creator_grant(self.tenant, &record) || record.door.id != request.creator {
                     return Err(ERR_BINDING);
                 }
-                // A bound grant its creator no longer holds (revoked after
-                // a refusal) is never placed: take a new K.
                 let bucket = bucket_id(self.tenant, k);
+                // Placed already: that is the bucket, whatever became of
+                // its grant since.
+                let placed = records.is_placed(self.tenant, &bucket).await?;
                 let held = table
                     .get(request.creator)
                     .is_some_and(|e| e.door.grants.iter().any(|g| g.bucket_id == bucket.as_str()));
-                if !held {
+                if !placed && !held {
+                    // A bound grant its creator no longer holds (revoked
+                    // after a refusal) is never placed.
+                    if only.is_some() {
+                        return Ok(None);
+                    }
                     spent.insert(k);
                     continue;
                 }
@@ -416,12 +465,12 @@ where
                     .place(records, table, &revoked, idempotency_key, request, k, rng)
                     .await
                 {
-                    Placing::Done(answer) => return Ok(answer),
+                    Placing::Done(answer) => return Ok(Some(answer)),
                     Placing::Again => {
                         spent.insert(k);
                         lost_orders += 1;
                         if lost_orders >= MAX_ORDER_TRIES {
-                            return Ok(BucketAnswer::Busy);
+                            return Ok(Some(BucketAnswer::Busy));
                         }
                         puts = 0;
                         caught_up = false;
@@ -446,9 +495,9 @@ where
                         .admission
                         .release_bound(self.tenant, idempotency_key, seen)
                         .await;
-                    return Ok(BucketAnswer::Refused(r));
+                    return Ok(Some(BucketAnswer::Refused(r)));
                 }
-                Creator::Busy => return Ok(BucketAnswer::Busy),
+                Creator::Busy => return Ok(Some(BucketAnswer::Busy)),
             };
             let k = keys_seq + 1;
             let bucket = bucket_id(self.tenant, k);
@@ -472,7 +521,7 @@ where
                         .await
                         .is_none()
                     {
-                        return Ok(BucketAnswer::Busy);
+                        return Ok(Some(BucketAnswer::Busy));
                     }
                 }
                 puts += 1;
@@ -516,45 +565,48 @@ where
             let applied = open_key_record(self.kek, self.ring, self.tenant, k, &bytes)
                 .and_then(|record| table.apply(&record));
             if applied.is_err() {
-                return Ok(BucketAnswer::Unfinished { grant_seq: k });
+                return Ok(Some(BucketAnswer::Unfinished { grant_seq: k }));
             }
             // Bind K to the reservation before the bucket is placed, so a
             // retry places this grant's bucket and no second one, and only
             // while no other call under the key bound one since: of two
-            // calls, one binds and the other places that one's bucket. An
-            // unbound grant is never placed: it is revoked.
+            // calls, one binds and the other places that one's bucket. A
+            // seq the finisher found unbound is fenced, so a call that
+            // stalled here never binds a grant the finisher revoked.
             match self
                 .admission
                 .bind_bucket(self.tenant, idempotency_key, seen, k)
                 .await
             {
-                Ok(true) => {}
+                Ok(true) => {
+                    ours.insert(k);
+                }
                 Ok(false) => {
                     if self
                         .drop_grant(table, request.creator, bucket.as_str(), rng)
                         .await
                         .is_none()
                     {
-                        return Ok(BucketAnswer::Unfinished { grant_seq: k });
+                        return Ok(Some(BucketAnswer::Unfinished { grant_seq: k }));
                     }
                     puts += 1;
                     continue;
                 }
                 Err(_) => {
                     let _ = self.apply_all(table, &revoked).await;
-                    return Ok(BucketAnswer::Unfinished { grant_seq: k });
+                    return Ok(Some(BucketAnswer::Unfinished { grant_seq: k }));
                 }
             }
             match self
                 .place(records, table, &revoked, idempotency_key, request, k, rng)
                 .await
             {
-                Placing::Done(answer) => return Ok(answer),
+                Placing::Done(answer) => return Ok(Some(answer)),
                 Placing::Again => {
                     spent.insert(k);
                     lost_orders += 1;
                     if lost_orders >= MAX_ORDER_TRIES {
-                        return Ok(BucketAnswer::Busy);
+                        return Ok(Some(BucketAnswer::Busy));
                     }
                     // A new K under the same reservation.
                     puts = 0;
@@ -563,7 +615,7 @@ where
                 }
             }
         }
-        Ok(BucketAnswer::Busy)
+        Ok(Some(BucketAnswer::Busy))
     }
 }
 
@@ -573,12 +625,14 @@ where
 ///
 /// - The record at `seq` is no creator grant: nothing.
 /// - Its bucket is placed, or its reservation became the bucket: nothing.
-/// - An open reservation is bound to it: the create is run again under
-///   that reservation, as the Worker would have ([`KeyEnv::create_bucket`]:
-///   it places this grant's bucket, or after a lost order a new one);
-///   when that does not place this grant's bucket, the grant is revoked.
-/// - No open reservation is bound to it: the grant is an orphan for good
-///   and is revoked.
+/// - An open reservation is bound to it and its creator holds it: the
+///   create goes on under that reservation, as the Worker's would have,
+///   only while the reservation stays bound to it (or, after a lost order,
+///   to the grant this run wrote instead, AM-8). When that does not place
+///   this grant's bucket, the grant is revoked and the reservation
+///   released.
+/// - No open reservation is bound to it: the answer fences the seq, and
+///   the grant, an orphan for good, is revoked.
 pub async fn finish_creator_grant<S, K, T, A, I, U, D, C, B, R>(
     env: &KeyEnv<'_, S, K, T, A, I, U, D, C>,
     records: &B,
@@ -613,6 +667,7 @@ where
     if records.is_placed(env.tenant, &bucket).await? {
         return Ok(CreatorGrant::Placed);
     }
+    let mut release = None;
     match env.admission.bucket_binding(env.tenant, seq).await? {
         Binding::Created => return Ok(CreatorGrant::Placed),
         Binding::None => {}
@@ -631,28 +686,41 @@ where
                 unit,
             };
             match env
-                .create_bucket(records, table, &idempotency_key, &request, rng)
+                .create(records, table, &idempotency_key, &request, Some(seq), rng)
                 .await?
             {
-                BucketAnswer::Created { grant_seq, .. } if grant_seq == seq => {
+                Some(BucketAnswer::Created { grant_seq, .. }) if grant_seq == seq => {
                     return Ok(CreatorGrant::Placed)
                 }
-                BucketAnswer::Busy | BucketAnswer::Unfinished { .. } => {
+                Some(BucketAnswer::Busy | BucketAnswer::Unfinished { .. }) => {
                     return Ok(CreatorGrant::Busy)
                 }
-                // Placed under another K, or refused: this grant is an
-                // orphan.
-                BucketAnswer::Created { .. }
-                | BucketAnswer::Refused(_)
-                | BucketAnswer::StateRefused { .. } => {}
+                // Placed under another K, or refused (released there).
+                Some(
+                    BucketAnswer::Created { .. }
+                    | BucketAnswer::Refused(_)
+                    | BucketAnswer::StateRefused { .. },
+                ) => {}
+                // No longer bound to this grant: release it if it still is.
+                None => release = Some(idempotency_key),
             }
             if records.is_placed(env.tenant, &bucket).await? {
                 return Ok(CreatorGrant::Placed);
             }
         }
     }
-    match env.drop_grant(table, creator, bucket.as_str(), rng).await {
-        Some(revoke) => Ok(CreatorGrant::Revoked { seq: revoke }),
-        None => Ok(CreatorGrant::Busy),
+    let Some(revoke) = env.drop_grant(table, creator, bucket.as_str(), rng).await else {
+        return Ok(CreatorGrant::Busy);
+    };
+    if let Some(key) = release {
+        if env
+            .admission
+            .release_bound(env.tenant, &key, Some(seq))
+            .await
+            .is_err()
+        {
+            return Ok(CreatorGrant::Busy);
+        }
     }
+    Ok(CreatorGrant::Revoked { seq: revoke })
 }

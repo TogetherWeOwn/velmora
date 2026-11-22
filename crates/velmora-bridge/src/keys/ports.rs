@@ -165,7 +165,8 @@ pub enum Binding {
     Created,
     /// No reservation is bound to it: none ever was (a call that died
     /// between its put and its bind), or it was released, swept, or bound
-    /// again to a later seq. The grant is an orphan for good.
+    /// again to a later seq. The seq is fenced by this answer: the grant
+    /// is an orphan for good.
     None,
 }
 
@@ -220,7 +221,11 @@ pub trait KeyAdmission {
         idempotency_key: &str,
         bound: Option<u64>,
     ) -> Result<()>;
-    /// What the reservations say of the creator grant at `grant_seq`.
+    /// What the reservations say of the creator grant at `grant_seq`. An
+    /// answer of [`Binding::None`] also fences the seq, in the same unit
+    /// transaction: from then on [`KeyAdmission::bind_bucket`] of it
+    /// answers `Ok(false)`. So the finisher's revoke of an unbound grant
+    /// and a late bind of it by a stalled call never both happen.
     async fn bucket_binding(&self, tenant: &TenantId, grant_seq: u64) -> Result<Binding>;
 }
 

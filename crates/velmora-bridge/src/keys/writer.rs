@@ -52,7 +52,7 @@
 //! the head once every store holds it with every subject open. A step
 //! that fails is reported and does not stop the others.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use subtle::ConstantTimeEq;
 use velmora::rng::FillRandom;
@@ -521,15 +521,16 @@ fn closed_subjects(table: &KeyTable) -> Vec<String> {
 /// (AM-11): sealed under a key version the ring marks gone, with a ring
 /// that loaded every other committed version, and no checkpoint that may
 /// still carry it. Anything less is a closed subject to retry. One pass
-/// over the checkpoints, only when some subject is a candidate.
+/// over the checkpoints, only when some subject is a candidate. Each
+/// lost subject with the `private_seq` it was decided at.
 async fn lost_subjects<S: RecordStore, K: Kek, T: TkRing>(
     store: &S,
     kek: &K,
     ring: &T,
     table: &KeyTable,
-) -> BTreeSet<String> {
+) -> BTreeMap<String, u64> {
     if ring.partial() {
-        return BTreeSet::new();
+        return BTreeMap::new();
     }
     let candidates: Vec<&Entry> = table
         .entries()
@@ -540,13 +541,13 @@ async fn lost_subjects<S: RecordStore, K: Kek, T: TkRing>(
         })
         .collect();
     let Some(from) = candidates.iter().map(|e| e.private_seq).min() else {
-        return BTreeSet::new();
+        return BTreeMap::new();
     };
     let holds = checkpoint_holds(store, kek, ring, table.tenant(), from).await;
     candidates
         .into_iter()
         .filter(|e| !holds.may_hold(&e.door.id, e.private_seq))
-        .map(|e| e.door.id.clone())
+        .map(|e| (e.door.id.clone(), e.private_seq))
         .collect()
 }
 
@@ -946,7 +947,7 @@ where
     // (AM-11) never opens again: it is disabled by a record that keeps
     // its private part as it was, so every store closes it whatever row
     // it holds. A revoked one stays revoked.
-    let mut lost = BTreeSet::new();
+    let mut lost = BTreeMap::new();
     if advance(env.store, env.kek, env.ring, &chain, &mut table)
         .await
         .is_ok()
@@ -955,7 +956,7 @@ where
         let gone: Vec<(String, u64)> = table
             .entries()
             .filter(|e| {
-                lost.contains(&e.door.id)
+                lost.contains_key(&e.door.id)
                     && e.door.status == SubjectStatus::Active
                     && !read.revoked.contains(&e.door.id)
             })
@@ -1038,11 +1039,17 @@ where
     }
 
     report.head = table.seq();
-    // The set decided above: a disable record keeps the private part and
-    // its seq, so a subject in it is still lost.
-    let (gone, closed): (Vec<String>, Vec<String>) = closed_subjects(&table)
-        .into_iter()
-        .partition(|id| lost.contains(id));
+    // Gone: decided above, and still closed with the same private part
+    // under a gone version (a disable record keeps both). A record that
+    // landed since makes it an ordinary closed subject, retried.
+    let (gone, closed): (Vec<String>, Vec<String>) =
+        closed_subjects(&table).into_iter().partition(|id| {
+            table.get(id).is_some_and(|e| {
+                lost.get(id) == Some(&e.private_seq)
+                    && e.private.is_none()
+                    && env.ring.gone(e.tk_version)
+            })
+        });
     report.closed = closed;
     report.gone = gone;
     if !report.retry() {
