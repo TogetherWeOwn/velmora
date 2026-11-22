@@ -1327,6 +1327,10 @@ impl velmora_bridge::directory::move_flip::OwnerUnit for LiftCalls<'_> {
     async fn v9(&self) -> Result<bool> {
         unimplemented!("not a lift call")
     }
+
+    async fn recount(&self) -> Result<()> {
+        unimplemented!("not a lift call")
+    }
     fn nonce(&self) -> String {
         self.nonces.set(self.nonces.get() + 1);
         format!("nonce-{}", self.nonces.get())

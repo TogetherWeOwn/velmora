@@ -2678,6 +2678,194 @@ fn lift(unit: u32, since_seq: u64) -> Change {
     }
 }
 
+/// Tenant 0 flipped into `t1` at stamp 7.
+fn flipped() -> TenantRecord {
+    apply(&moving(), Change::FlipMove { stamp: 7 }, Actor::MoveTool)
+}
+
+fn freeze_for_undo(zero: &TenantRecord, at: u64) -> Change {
+    Change::FreezeForUndo {
+        unit: 0,
+        at,
+        zero: Box::new(zero.door.clone()),
+    }
+}
+
+fn open_entry(zero: &TenantRecord, window: u64) -> Change {
+    Change::OpenWindowEntry {
+        unit: 0,
+        window,
+        zero: Box::new(zero.door.clone()),
+    }
+}
+
+/// Undo step 1 (AM-28): the root unit `restoring` with the key freeze,
+/// only for a flipped move into this tenant, only for a tenant with its
+/// root unit alone, and never over an entry without this freeze.
+#[test]
+fn the_undo_freezes_keys_with_the_root_units_entry() {
+    let owner = active();
+    let z = flipped();
+    for actor in [Actor::Customer, Actor::Operator, Actor::RestoreTool] {
+        assert_eq!(refused(&owner, freeze_for_undo(&z, 9), actor), FORBIDDEN);
+    }
+    // Not without a flip into this tenant.
+    for zero in [tenant_zero(), moving()] {
+        assert_eq!(
+            refused(&owner, freeze_for_undo(&zero, 9), Actor::MoveTool),
+            NOT_MOVED_HERE
+        );
+    }
+    let mut planted = z.clone();
+    planted.door.tenant = t1();
+    assert_eq!(
+        refused(&owner, freeze_for_undo(&planted, 9), Actor::MoveTool),
+        NOT_MOVED_HERE
+    );
+    // Tenant 0 itself is never frozen this way.
+    assert_eq!(
+        next(
+            &Tenant::zero(),
+            Some(&z),
+            &freeze_for_undo(&z, 9),
+            Actor::MoveTool,
+            NOW
+        ),
+        Err(TENANT_ZERO)
+    );
+    // The root unit alone.
+    let two = placed(owner.clone(), "b_00000000000000aa", 1);
+    assert_eq!(
+        refused(&two, freeze_for_undo(&z, 9), Actor::MoveTool),
+        NOT_ONLY_ROOT
+    );
+    let wrong_unit = Change::FreezeForUndo {
+        unit: 1,
+        at: 9,
+        zero: Box::new(z.door.clone()),
+    };
+    assert_eq!(refused(&owner, wrong_unit, Actor::MoveTool), NOT_ONLY_ROOT);
+    // An entry without the freeze: a restore under way.
+    let restoring = apply(&owner, Change::SetRestoring { unit: 0 }, Actor::Operator);
+    assert_eq!(
+        refused(&restoring, freeze_for_undo(&z, 9), Actor::MoveTool),
+        FREEZE_DIFFERS
+    );
+    // The record: the entry at its own seq, and the freeze.
+    let frozen = apply(&owner, freeze_for_undo(&z, 9), Actor::MoveTool);
+    assert_eq!(
+        frozen.door.restoring_entry(0).map(|e| e.since_seq),
+        Some(frozen.door.seq)
+    );
+    assert_eq!(frozen.door.keys_frozen, Some(KeysFrozen { at: 9 }));
+    // A repeat writes nothing, whatever tenant 0 says by now (the
+    // fallback after the reverse move's step 1); another freeze is
+    // refused.
+    unchanged(&frozen, freeze_for_undo(&z, 9), Actor::MoveTool);
+    unchanged(&frozen, freeze_for_undo(&tenant_zero(), 9), Actor::MoveTool);
+    assert_eq!(
+        refused(&frozen, freeze_for_undo(&z, 10), Actor::MoveTool),
+        FREEZE_DIFFERS
+    );
+    // The freeze is carried by later records, and the entry refuses a
+    // create.
+    let held = apply(
+        &frozen,
+        Change::SetOperatorHold {
+            hold: Some(OperatorHoldRequest {
+                mode: HoldMode::ReadOnly,
+                reason: OperatorReason::Abuse,
+                preserve: None,
+            }),
+        },
+        Actor::Operator,
+    );
+    assert_eq!(held.door.keys_frozen, Some(KeysFrozen { at: 9 }));
+    assert_eq!(
+        refused(&frozen, create_bucket(20, 0), Actor::Customer),
+        RESTORING
+    );
+}
+
+/// The lift of the root unit's entry ends the freeze (an undo given up
+/// while tenant 0 is still `moved`, AM-28).
+#[test]
+fn the_lift_of_the_root_units_entry_ends_the_key_freeze() {
+    let frozen = apply(&active(), freeze_for_undo(&flipped(), 9), Actor::MoveTool);
+    let since = frozen.door.restoring_entry(0).unwrap().since_seq;
+    let lifted = apply(&frozen, lift(0, since), Actor::RestoreTool);
+    assert!(lifted.door.restoring.is_empty());
+    assert_eq!(lifted.door.keys_frozen, None);
+}
+
+/// Window step 2 (AM-53): the entry set anew with this record's seq, also
+/// over an entry a give-up or an undo left; the freeze cleared; a repeat
+/// for the same window writes nothing; an older window is refused.
+#[test]
+fn window_step_two_sets_the_entry_anew_and_thaws() {
+    let owner = active();
+    let z = moving();
+    for actor in [Actor::Customer, Actor::Operator, Actor::RestoreTool] {
+        assert_eq!(
+            refused(&owner, open_entry(&z, z.door.seq), actor),
+            FORBIDDEN
+        );
+    }
+    // Only while tenant 0 is `moving` into this tenant, and the window
+    // is at or below its head.
+    for zero in [tenant_zero(), flipped()] {
+        assert_eq!(
+            refused(&owner, open_entry(&zero, zero.door.seq), Actor::MoveTool),
+            NOT_MOVING_HERE
+        );
+    }
+    assert_eq!(
+        refused(&owner, open_entry(&z, z.door.seq + 1), Actor::MoveTool),
+        NOT_MOVING_HERE
+    );
+    assert_eq!(
+        refused(&owner, open_entry(&z, 0), Actor::MoveTool),
+        NOT_MOVING_HERE
+    );
+    let bad_unit = Change::OpenWindowEntry {
+        unit: 4,
+        window: z.door.seq,
+        zero: Box::new(z.door.clone()),
+    };
+    assert_eq!(refused(&owner, bad_unit, Actor::MoveTool), UNIT_NOT_LISTED);
+    // First window: a fresh entry.
+    let first = apply(&owner, open_entry(&z, z.door.seq), Actor::MoveTool);
+    let since = first.door.restoring_entry(0).unwrap().since_seq;
+    assert_eq!(since, first.door.seq);
+    assert_eq!(
+        first.door.window_entry,
+        Some(WindowEntry {
+            zero_seq: z.door.seq,
+            unit: 0,
+            since_seq: since
+        })
+    );
+    unchanged(&first, open_entry(&z, z.door.seq), Actor::MoveTool);
+    // An undo's freeze left on an entry: a later window re-sets the entry
+    // with a new since_seq and clears the freeze.
+    let mut left = apply(&owner, freeze_for_undo(&flipped(), 9), Actor::MoveTool);
+    left.door.window_entry = first.door.window_entry;
+    let old = left.door.restoring_entry(0).unwrap().since_seq;
+    let later = z.door.seq + 5;
+    let mut z_later = z.clone();
+    z_later.door.seq = later;
+    let second = apply(&left, open_entry(&z_later, later), Actor::MoveTool);
+    let new = second.door.restoring_entry(0).unwrap().since_seq;
+    assert!(new > old);
+    assert_eq!(second.door.restoring.len(), 1);
+    assert_eq!(second.door.keys_frozen, None);
+    // The earlier window is refused once a later one took step 2.
+    assert_eq!(
+        refused(&second, open_entry(&z_later, z.door.seq), Actor::MoveTool),
+        OLDER_WINDOW
+    );
+}
+
 /// `next` at a time of its own.
 fn at(head: &TenantRecord, change: Change, actor: Actor, now: UnixMs) -> TenantRecord {
     match next(&head.door.tenant, Some(head), &change, actor, now) {

@@ -28,8 +28,9 @@ use std::collections::BTreeMap;
 
 use super::record::{
     ActorClass, BillingHold, BucketCreated, BucketSecrets, Deletion, DeletionReason, HoldMode,
-    Holds, Lifecycle, Lifted, Move, MovedIn, OperatorHold, OperatorReason, Placement, Restoring,
-    Selector, Tenant, TenantDoor, TenantPrivate, TenantRecord, TenantZero, RECORD_FORMAT,
+    Holds, KeysFrozen, Lifecycle, Lifted, Move, MovedIn, OperatorHold, OperatorReason, Placement,
+    Restoring, Selector, Tenant, TenantDoor, TenantPrivate, TenantRecord, TenantZero, WindowEntry,
+    RECORD_FORMAT,
 };
 use crate::types::UnixMs;
 use crate::unit::lift::LiftProof;
@@ -252,6 +253,30 @@ pub enum Change {
         floor: UnixMs,
         zero: Box<TenantDoor>,
     },
+    /// Undo step 1 of a flipped move (DS1 §3.7, AM-28), or the first step
+    /// of the fallback route: the owner's root unit `restoring` again,
+    /// with the key freeze `keys_frozen = {at}` copied from the owner's
+    /// `KeysFrozen` key-chain record (`at` = `K_u`). `zero` is tenant 0's
+    /// head read from its chain by the caller: `moved` into this tenant.
+    /// The tenant must have only its root unit, and an entry already set
+    /// must carry this freeze (a repeat writes nothing).
+    FreezeForUndo {
+        unit: u32,
+        at: u64,
+        zero: Box<TenantDoor>,
+    },
+    /// The move's window step 2 (DS1 §3.4, AM-53): the owner's root-unit
+    /// `restoring` entry set anew with this record's seq, also when one
+    /// is set (a give-up or an undo leaves it), and the undo's key freeze
+    /// cleared (AM-28). `window` is the seq of tenant 0's record that
+    /// opened the window; `zero` is tenant 0's head read from its chain
+    /// by the caller: `moving` into this tenant, at or above `window`. A
+    /// repeat for the same window writes nothing.
+    OpenWindowEntry {
+        unit: u32,
+        window: u64,
+        zero: Box<TenantDoor>,
+    },
     /// Mark the tenant's key as escrowed offline.
     SetEscrowOffline,
     /// Clear the offline escrow mark. The operator names the SHA-256 of
@@ -355,6 +380,15 @@ const NOT_RESTORING: Refusal = refuse(409, "unit_not_restoring");
 const NOT_MOVED_IN: Refusal = refuse(409, "not_moved_in");
 const NO_MOVE_EXIT: Refusal = refuse(409, "no_move_exit");
 const UNPLACE_INCOMPLETE: Refusal = refuse(409, "unplace_list_incomplete");
+/// Tenant 0 is not `moved` into this tenant: there is no flip to undo.
+const NOT_MOVED_HERE: Refusal = refuse(409, "no_flipped_move_to_tenant");
+/// The undo needs a tenant with only its root unit (AM-28): a second
+/// unit would keep serving while its key changes are refused.
+const NOT_ONLY_ROOT: Refusal = refuse(409, "not_only_root_unit");
+/// The root unit is already `restoring` without this key freeze.
+const FREEZE_DIFFERS: Refusal = refuse(409, "restoring_without_this_key_freeze");
+/// A window older than the one whose step 2 this tenant last took.
+const OLDER_WINDOW: Refusal = refuse(409, "older_window");
 
 /// Validates `change` against `head` and builds the record that follows.
 /// See the [module](self).
@@ -745,6 +779,13 @@ pub fn next(
                 return Err(ENTRY_GONE);
             }
             door.restoring.retain(|r| *r != ours);
+            // The lift of the root unit's entry ends an undo's key freeze
+            // too: an undo given up while tenant 0 is still `moved` is
+            // lifted by the restore gate (AM-28); the move's own lift
+            // comes after window step 2, which cleared it already.
+            if *unit == 0 {
+                door.keys_frozen = None;
+            }
             door.lifted = Some(Lifted {
                 unit: *unit,
                 since_seq: *since_seq,
@@ -1029,6 +1070,88 @@ pub fn next(
             door.move_floors.insert(*unit, *floor);
         }
 
+        Change::FreezeForUndo { unit, at, zero } => {
+            live(h)?;
+            if actor != Actor::MoveTool {
+                return Err(FORBIDDEN);
+            }
+            if tenant.is_zero() {
+                return Err(TENANT_ZERO);
+            }
+            // A repeat (a re-run of step 1, or the fallback after the
+            // reverse move's step 1) writes nothing, whatever tenant 0's
+            // head says by now.
+            if h.restoring_entry(*unit).is_some() && h.keys_frozen == Some(KeysFrozen { at: *at }) {
+                return Ok(Outcome::Unchanged);
+            }
+            let moved_here = zero.tenant.is_zero()
+                && zero.tenant_zero.as_ref().is_some_and(|z| {
+                    z.selector == Selector::Moved
+                        && z.moved.as_ref().is_some_and(|m| m.to == *tenant)
+                });
+            if !moved_here {
+                return Err(NOT_MOVED_HERE);
+            }
+            // Milestone 1 has one unit per tenant; the root unit is 0.
+            if *unit != 0 || h.units != [0] {
+                return Err(NOT_ONLY_ROOT);
+            }
+            // An entry without this freeze (a restore under way, or another
+            // freeze): the undo does not start.
+            if h.restoring_entry(*unit).is_some() || h.keys_frozen.is_some() {
+                return Err(FREEZE_DIFFERS);
+            }
+            door.restoring.push(Restoring {
+                unit: *unit,
+                since_seq: h.seq + 1,
+            });
+            door.keys_frozen = Some(KeysFrozen { at: *at });
+        }
+
+        Change::OpenWindowEntry { unit, window, zero } => {
+            live(h)?;
+            if actor != Actor::MoveTool {
+                return Err(FORBIDDEN);
+            }
+            if tenant.is_zero() {
+                return Err(TENANT_ZERO);
+            }
+            match h.window_entry {
+                Some(w) if w.zero_seq == *window && w.unit == *unit => {
+                    return Ok(Outcome::Unchanged)
+                }
+                Some(w) if w.zero_seq >= *window => return Err(OLDER_WINDOW),
+                _ => {}
+            }
+            let moving_here = zero.tenant.is_zero()
+                && *window > 0
+                && *window <= zero.seq
+                && zero.tenant_zero.as_ref().is_some_and(|z| {
+                    z.selector == Selector::Moving
+                        && z.moved.as_ref().is_some_and(|m| m.to == *tenant)
+                });
+            if !moving_here {
+                return Err(NOT_MOVING_HERE);
+            }
+            if !h.units.contains(unit) {
+                return Err(UNIT_NOT_LISTED);
+            }
+            // Always a new entry: a given-up window's import, seal or
+            // report can never match this one's `since_seq` (AM-53).
+            let since_seq = h.seq + 1;
+            door.restoring.retain(|r| r.unit != *unit);
+            door.restoring.push(Restoring {
+                unit: *unit,
+                since_seq,
+            });
+            door.keys_frozen = None;
+            door.window_entry = Some(WindowEntry {
+                zero_seq: *window,
+                unit: *unit,
+                since_seq,
+            });
+        }
+
         Change::SetEscrowOffline => {
             live(h)?;
             if actor != Actor::Operator {
@@ -1295,6 +1418,8 @@ fn first(tenant: &Tenant, change: &Change, actor: Actor, now: UnixMs) -> Result<
         moved_in: None,
         buckets_unplaced: None,
         lifted: None,
+        keys_frozen: None,
+        window_entry: None,
         bucket_created: None,
         tk_version: 0,
         key_checks: BTreeMap::new(),
@@ -1479,7 +1604,7 @@ fn valid_bdk_wrap(w: &[u8]) -> bool {
 
 /// A bucket id, a principal id or a catalogue id: 1 to 128 bytes of
 /// ASCII letters, digits, `_` and `-`.
-fn valid_name(s: &str) -> bool {
+pub(crate) fn valid_name(s: &str) -> bool {
     (1..=128).contains(&s.len())
         && s.bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
@@ -1515,6 +1640,8 @@ fn shredded_stub(h: &TenantDoor) -> TenantDoor {
         moved_in: None,
         buckets_unplaced: None,
         lifted: None,
+        keys_frozen: None,
+        window_entry: None,
         bucket_created: None,
         tk_version: h.tk_version,
         key_checks: BTreeMap::new(),

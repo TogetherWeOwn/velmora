@@ -472,6 +472,33 @@ pub struct MovedIn {
     pub zero_seq: u64,
 }
 
+/// The undo's key freeze, copied from the key chain (AM-28): `at` is
+/// `K_u`, the key-chain seq below the owner's `KeysFrozen` record. While
+/// it is set, the key-chain writer refuses every record of this tenant
+/// above `K_u` except the exit's own grant revocations, and every D1
+/// build of the undo reads the key chain up to `K_u`. Set by the record
+/// that sets the root unit's `restoring` entry in undo step 1 (or the
+/// fallback's first step); cleared by the next move's window step 2, or
+/// by the lift of that entry (an undo given up while tenant 0 is still
+/// `moved`). Carried in between.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KeysFrozen {
+    pub at: u64,
+}
+
+/// The move window whose step 2 set this tenant's root-unit `restoring`
+/// entry (AM-53): the seq of tenant 0's record that opened that window.
+/// Carried until the next window's step 2, so a repeat of step 2 for the
+/// same window writes nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WindowEntry {
+    pub zero_seq: u64,
+    pub unit: u32,
+    pub since_seq: u64,
+}
+
 /// The `restoring` entry a record lifts, with the lift the unit checks
 /// (ADR §8.6 step 8, AM-2, AM-15): the restore gate's, or the move's
 /// `move` report. Only the record that lifts carries it.
@@ -568,6 +595,13 @@ pub struct TenantDoor {
     /// The `restoring` entry this record lifts (this record only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lifted: Option<Lifted>,
+    /// The undo's key freeze (AM-28); carried while set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keys_frozen: Option<KeysFrozen>,
+    /// The move window whose step 2 last set the root unit's entry
+    /// (AM-53); carried.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window_entry: Option<WindowEntry>,
     /// The tenant key version in force; 0 for tenant 0, which has none.
     pub tk_version: u32,
     /// The key check value of every committed tenant key version, in
@@ -730,6 +764,8 @@ mod tests {
             moved_in: None,
             buckets_unplaced: None,
             lifted: None,
+            keys_frozen: None,
+            window_entry: None,
             bucket_created: None,
             tk_version: 1,
             key_checks: BTreeMap::from([(1, "00".repeat(16))]),

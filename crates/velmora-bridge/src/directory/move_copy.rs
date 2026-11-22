@@ -144,6 +144,11 @@ pub struct ImportState {
     pub t0_seq: Option<u64>,
     /// The `move_ordinal` of the seal, if the import is sealed.
     pub sealed: Option<u64>,
+    /// `unit_import_move.move_lifted` (AM-47): `Some(true)` once the move's
+    /// lift landed (an undone move's 30-day copy), `Some(false)` before it
+    /// (a give-up that did not reach its `deleteAll()`); `None`: no move
+    /// record (`ImportProgress.move_lifted` null).
+    pub move_lifted: Option<bool>,
     /// When the move's lift landed in the unit (`ImportProgress.lifted_at`,
     /// the unit's clock), once `move_lifted`. `None`: not lifted, or the
     /// unit did not say.
@@ -208,12 +213,18 @@ impl ImportState {
             let rows = t.get("rows").and_then(Value::as_u64).ok_or(BAD)?;
             tables.push(ImportCount { table, rows });
         }
-        if t0_seq.is_none() && sealed.is_none() && lifted_at.is_none() && tables.is_empty() {
+        if t0_seq.is_none()
+            && sealed.is_none()
+            && move_lifted.is_none()
+            && lifted_at.is_none()
+            && tables.is_empty()
+        {
             return Ok(None);
         }
         Ok(Some(ImportState {
             t0_seq,
             sealed,
+            move_lifted,
             lifted_at,
             tables,
         }))
@@ -1083,6 +1094,7 @@ mod tests {
             Some(ImportState {
                 t0_seq: Some(11),
                 sealed: Some(3),
+                move_lifted: Some(true),
                 lifted_at: Some(UnixMs(1_795_000_000_000)),
                 tables: vec![ImportCount {
                     table: ImportTable::Buckets,
@@ -1093,7 +1105,10 @@ mod tests {
         // Bound but not lifted (a resumed copy): t0_seq still read.
         let body = progress(json!(11), json!(null), json!(false), json!(null), json!([]));
         let s = ImportState::from_progress(&body).unwrap().unwrap();
-        assert_eq!((s.t0_seq, s.sealed, s.lifted_at), (Some(11), None, None));
+        assert_eq!(
+            (s.t0_seq, s.sealed, s.move_lifted, s.lifted_at),
+            (Some(11), None, Some(false), None)
+        );
         // Nothing ever bound.
         let body = progress(
             json!(null),

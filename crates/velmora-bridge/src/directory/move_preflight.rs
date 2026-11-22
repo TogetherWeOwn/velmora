@@ -14,6 +14,23 @@
 //!   such an INTEGER cell, stops the move: the adapters refuse to bind or
 //!   read it, so the copy would stop mid-window.
 //!
+//! - **Stale owner revocations** (P8 as AM-28 amends it,
+//!   [`p8_stale_revocations`]): a key the `keymap` maps to the owner that
+//!   has an `m/rk/<t>/<akid>` but is not revoked in D1 (its row is still
+//!   there). Such a key would be revoked in the owner's tenant and served
+//!   by D1, so a non-empty list stops the move before step 0.
+//!
+//! - **The unit's stamp prefix** (P2 as AM-44 amends it,
+//!   [`p2_stamp_prefix_clear`]): a unit the move fills whose
+//!   `rs/<t>.<u>/` already holds stamps (a second attempt after a give-up,
+//!   or a second move after an undo) needs the gate's stamp levelling
+//!   before its `move` report; without it the move stops before step 0.
+//! - **Import state in the target unit** (P12, AM-47, [`p12`]), read with
+//!   tenant 0's head and the owner's: only a closed unit, and only while
+//!   tenant 0 is `d1`, is emptied first (a give-up left unfinished, or an
+//!   undone move's 30-day copy with the owner's G6); anything else stops
+//!   the move with nothing written.
+//!
 //! Every query is one page of at most [`MAX_PAGE`] rows in primary-key
 //! order; a cell's class is computed by SQLite, so no value outside the
 //! safe range is ever read through an adapter. Nothing is written.
@@ -26,6 +43,8 @@ use super::move_copy::key_columns;
 use crate::ports::{Sql, SqlValue};
 use crate::types::{BridgeError, Result};
 use crate::unit::import::ImportTable;
+
+use super::record::{Selector, TenantDoor};
 
 /// The largest page a P2 query reads.
 pub const MAX_PAGE: usize = 1000;
@@ -280,4 +299,139 @@ fn key_text(key: &[SqlValue]) -> String {
         })
         .collect();
     serde_json::Value::Array(parts).to_string()
+}
+
+/// P8 (AM-28): the keys among `mapped` (every key the `keymap` maps to
+/// the owner, `drop` keys left out) that have the owner's revocation
+/// `m/rk/<t>/<akid>` and are still served by `d1`: an `active` row, or a
+/// row with a grant. Tenant 0's revoke removes the row; a give-up's
+/// revocation leaves it `disabled` with no grant, which counts as
+/// revoked. A non-empty answer stops the move before step 0. Two point
+/// lookups per key with a revocation.
+pub async fn p8_stale_revocations<S: Sql, K: super::move_keys::OwnerKeys>(
+    d1: &S,
+    keys: &K,
+    mapped: &[String],
+) -> Result<Vec<String>> {
+    let mut stale = Vec::new();
+    for akid in mapped {
+        if !keys.tenant_revoked(akid).await? {
+            continue;
+        }
+        let id = [SqlValue::Text(akid.clone())];
+        let active = d1
+            .query(
+                "SELECT 1 FROM access_keys WHERE access_key_id = ?1 AND status = 'active'",
+                &id,
+            )
+            .await?;
+        let granted = d1
+            .query("SELECT 1 FROM grants WHERE access_key_id = ?1 LIMIT 1", &id)
+            .await?;
+        if !active.is_empty() || !granted.is_empty() {
+            stale.push(akid.clone());
+        }
+    }
+    Ok(stale)
+}
+
+/// P2 (AM-44): whether the stamp prefix `rs/<t>.<u>/` of a unit the move
+/// fills is empty, so the move may start. One list call of one key. A
+/// prefix that holds stamps stops the move until step 8(b) levels the
+/// unit's counter before its `move` report (W4-gate's stamp levelling),
+/// which this code does not do yet.
+pub async fn p2_stamp_prefix_clear<B: crate::ports::BlobStore>(
+    safety: &B,
+    unit: &crate::unit::name::UnitName,
+) -> Result<bool> {
+    let prefix = format!(
+        "{}{}/",
+        crate::stamp::STAMP_PREFIX,
+        crate::unit::jobcall::stamp_id(unit)
+    );
+    Ok(safety.list(&prefix, "", 1).await?.is_empty())
+}
+
+/// A target unit as P12 reads it (`ImportProgress`, and whether the unit
+/// exists and is closed).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum UnitView {
+    /// The unit holds no import.
+    Empty,
+    /// The unit is unborn (emptied by a `deleteAll()`); `marker`: the
+    /// emptied marker `m/ub/<t>/<u>` exists.
+    Unborn { marker: bool },
+    /// The unit holds an import; `closed`: it answers `Closed{restoring}`.
+    Import {
+        state: super::move_copy::ImportState,
+        closed: bool,
+    },
+}
+
+/// What P12 (AM-47) decides for a target unit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum P12 {
+    /// No import state (or an unborn unit the day-30 `deleteAll()` left):
+    /// go on.
+    Empty,
+    /// A give-up left unfinished: finish it with no G6 (`deleteAll()`,
+    /// the unit re-created with a `restore` token under the entry it
+    /// left), then read again.
+    FinishGiveUp,
+    /// An undone move's 30-day copy: stop before step 0, unless the
+    /// owner's go (G6) names the early end of the undo copy; then empty it
+    /// as above and read again.
+    UndoCopy,
+    /// Anything else (tenant 0 `moving` or `moved`, a unit that is not
+    /// closed, a `move_lifted` the unit does not say, an unborn unit
+    /// without its entry and marker): stop before step 0 and write
+    /// nothing. A live unit is never emptied.
+    Stop,
+}
+
+/// P12 for unit `unit` of the owner `owner_head`, from tenant 0's verified
+/// head `zero` and the unit's view.
+pub fn p12(zero: &TenantDoor, owner_head: &TenantDoor, unit: u32, view: &UnitView) -> P12 {
+    let z = match zero.tenant_zero.as_ref() {
+        Some(z) if zero.tenant.is_zero() => z,
+        _ => return P12::Stop,
+    };
+    match view {
+        UnitView::Empty => P12::Empty,
+        UnitView::Unborn { marker } => {
+            let listed =
+                owner_head.units.contains(&unit) && owner_head.restoring_entry(unit).is_some();
+            match listed && *marker {
+                true => P12::Empty,
+                false => P12::Stop,
+            }
+        }
+        UnitView::Import { state, closed } => {
+            if !closed || z.selector != Selector::D1 {
+                return P12::Stop;
+            }
+            let undone_here =
+                z.undone() && z.moved.as_ref().is_some_and(|m| m.to == owner_head.tenant);
+            // The seal tells the two lifted states apart: a move that was
+            // lifted and given up (V9) never raised `flips`, so its seal is
+            // `flips + 1`; a move that flipped (and was undone) sealed at
+            // or below `flips`. A later move into another tenant that gave
+            // up clears `move` and leaves the undo copy here. After a later
+            // flip into another tenant a lifted give-up's seal falls at or
+            // below `flips` too and is answered as the undo copy: the
+            // cautious answer (the owner is asked for G6; nothing is
+            // emptied without it).
+            let given_up_seal = z.flips.checked_add(1);
+            let flipped_seal = state.sealed.is_some_and(|s| s <= z.flips);
+            match (state.move_lifted, &z.moved) {
+                (Some(false), _) => P12::FinishGiveUp,
+                (Some(true), None) if state.sealed.is_some() && state.sealed == given_up_seal => {
+                    P12::FinishGiveUp
+                }
+                (Some(true), None) if flipped_seal => P12::UndoCopy,
+                (Some(true), Some(_)) if undone_here && flipped_seal => P12::UndoCopy,
+                _ => P12::Stop,
+            }
+        }
+    }
 }
