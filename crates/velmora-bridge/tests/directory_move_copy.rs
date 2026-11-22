@@ -152,6 +152,7 @@ fn sync(u: &Unit<RusqliteSql>, state_seq: u64, restoring: Option<u64>) {
                 tenant_state: TenantState::Active,
                 tenant_mode: None,
                 restoring_since: restoring,
+                lift: None,
             },
         },
     );
