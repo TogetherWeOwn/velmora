@@ -157,8 +157,15 @@ impl Sql for DoSql {
 
 /// Refuses what D1 refuses, with the same messages: more than
 /// [`MAX_SQL_PARAMS`] bound values, or one above [`MAX_SQL_VALUE_BYTES`].
-/// The SQLite storage of a Durable Object has the same two limits.
+/// The SQLite storage of a Durable Object has the same two limits. Also
+/// refuses, before anything is bound, an integer outside `±(2^53 - 1)`
+/// (AM-22; `to_js` would refuse it too).
 fn check_params(params: &[SqlValue]) -> Result<()> {
+    for p in params {
+        if let SqlValue::Int(i) = p {
+            int_to_number(*i)?;
+        }
+    }
     if params.len() > MAX_SQL_PARAMS {
         return Err(BridgeError::Sql(format!(
             "too many bound parameters: {} > {MAX_SQL_PARAMS}",
@@ -300,5 +307,18 @@ mod tests {
         assert!(check_params(&many[..MAX_SQL_PARAMS]).is_ok());
         let big = vec![SqlValue::Blob(vec![0; MAX_SQL_VALUE_BYTES + 1])];
         assert!(check_params(&big).is_err());
+        // `prepared` calls this first: an unsafe integer anywhere in the
+        // parameters refuses the statement before it is bound (AM-22).
+        let edges = [SqlValue::Int(MAX_SAFE_INT), SqlValue::Int(-MAX_SAFE_INT)];
+        assert!(check_params(&edges).is_ok());
+        for unsafe_int in [
+            MAX_SAFE_INT + 1,
+            -MAX_SAFE_INT - 1,
+            MAX_SAFE_INT + 2,
+            -MAX_SAFE_INT - 2,
+        ] {
+            let params = [SqlValue::Text("x".into()), SqlValue::Int(unsafe_int)];
+            assert!(check_params(&params).is_err(), "{unsafe_int}");
+        }
     }
 }

@@ -254,9 +254,13 @@ fn from_js(v: JsValue) -> Result<SqlValue> {
         return Ok(SqlValue::Text(s));
     }
     if v.is_bigint() {
+        // D1 returns no BigInt today; if it ever does, the same range
+        // holds as for a number (AM-22 rule 3).
         return i64::try_from(v)
+            .ok()
+            .filter(|i| (-MAX_SAFE_INT..=MAX_SAFE_INT).contains(i))
             .map(SqlValue::Int)
-            .map_err(|_| decode_err());
+            .ok_or_else(decode_err);
     }
     if let Some(buf) = v.dyn_ref::<ArrayBuffer>() {
         return Ok(SqlValue::Blob(Uint8Array::new(buf).to_vec()));
