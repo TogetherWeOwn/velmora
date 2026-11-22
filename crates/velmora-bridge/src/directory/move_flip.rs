@@ -39,12 +39,14 @@
 //!   then the directory's copy of tenant 0's selector (AM-20).
 //!
 //! [`give_up`] is the way back while tenant 0 is still `moving`, in the
-//! exit order of AM-23: the owner's unit closed again, the directory rows
-//! back on tenant 0, tenant 0's record back to `d1` (and the directory's
-//! copy of it), then the grant revocations on the moved-in buckets and
-//! `UnplaceMovedBuckets` ([`exit_placements`]). It refuses once a route
-//! record names the owner: a route record is put once, and putting it
-//! back needs the conditional replace of DS1 §2.2, which no code has yet.
+//! order of DS1 §3.8 row 8 and AM-23: the owner's unit closed again, the
+//! route records that name the owner put back on tenant 0 by the
+//! conditional replace of DS1 §2.2 ([`RouteRecords::replace`]), the
+//! directory rows back, tenant 0's record back to `d1` (and the
+//! directory's copy of it), then the grant revocations on the moved-in
+//! buckets and `UnplaceMovedBuckets` ([`exit_placements`]). A V9 failure
+//! at (b2) writes tenant 0's `d1` record first and then runs the same
+//! give-up, so no later run of the flip samples V9 again.
 //! The rest of the give-up (empty the unit, thaw and level the frozen D1,
 //! the revocations of [`super::move_keys::revocations_to_d1`], migrations
 //! on, the lift) are tool steps outside this module.
@@ -86,9 +88,6 @@ pub enum FlipError {
     /// A directory route row names neither tenant 0 nor the owner, or is
     /// missing.
     RouteRow(String),
-    /// Route records already name the owner; the give-up cannot put them
-    /// back.
-    RoutesPut(Vec<String>),
     /// The frozen catalogue does not carry this window's cutover marker.
     Marker,
     /// The owner has no live directory row to move routes to.
@@ -164,8 +163,11 @@ pub struct GateView {
 /// package 4 through the Worker's stub fetch).
 #[allow(async_fn_in_trait)]
 pub trait OwnerUnit: KeyUnit {
-    /// `sync` with the owner's verified head `owner`. `lift`: the proof of
-    /// the record that removed unit 0's entry; `None` for any other head.
+    /// `sync` with the owner's verified head `owner`. `lift`: for a head
+    /// without unit 0's entry, the proof of the newest record of this
+    /// window that lifted it (that record, or one below `owner`); `None`
+    /// for a head that has the entry. The unit lifts when its own check
+    /// gives that proof; a refusal comes back as [`Synced::Refused`].
     async fn sync(
         &self,
         owner: &TenantDoor,
@@ -203,6 +205,10 @@ pub trait RouteRecords {
         -> crate::types::Result<bool>;
     /// The tenant the route record of `akid` names; `None` = no record.
     async fn get(&self, akid: &str) -> crate::types::Result<Option<String>>;
+    /// The ETag-conditional replace of DS1 §2.2: the record of `akid` that
+    /// names `from` now names `to`, or already names `to`. `false` = it
+    /// names a third tenant (or no record exists).
+    async fn replace(&self, akid: &str, from: &Tenant, to: &Tenant) -> crate::types::Result<bool>;
 }
 
 /// The move a flip or a give-up acts on.
@@ -403,11 +409,26 @@ where
     let stamp = put_legacy_stamp(frozen, safety, &m.catalogue_id_frozen, now).await?;
 
     // (b) The owner's root unit opens through the move's lift.
-    let owner = open_unit(chain, unit, keys, &zero, window, now).await?;
+    let owner = open_unit(chain, dir, unit, keys, &zero, window, now).await?;
 
     // (b2) V9, once the unit is open; a run that already put a route
     // passed it.
+    // A failure gives the move up at once, tenant 0's record first, so no
+    // later run samples V9 again and flips (AM-30, DS1 §3.8 row 7). No
+    // route names the owner yet, so nothing reaches the open unit before
+    // the give-up closes it.
     if !routes_started && !unit.v9().await? {
+        let gave_up = chain
+            .write(
+                &Tenant::Zero,
+                &Change::GiveUpMove,
+                Actor::MoveTool,
+                now,
+                zero.seq,
+            )
+            .await?;
+        dir.apply_tenant(&door_of(gave_up), now).await?;
+        give_up(chain, frozen, safety, dir, unit, routes, keys, window, now).await?;
         return Err(FlipError::V9Failed);
     }
 
@@ -451,8 +472,9 @@ where
 
 /// Step 8(b): the owner's unit 0 lifted by the move's report and synced
 /// open (AM-15). Answers the owner's head the unit opened under.
-async fn open_unit<S, C, U, K>(
+async fn open_unit<S, C, Q, U, K>(
     chain: &TenantChain<'_, S, C>,
+    dir: &SqlDirectory<'_, Q>,
     unit: &U,
     keys: &K,
     zero: &TenantDoor,
@@ -462,6 +484,7 @@ async fn open_unit<S, C, U, K>(
 where
     S: RecordStore,
     C: ControlSeal,
+    Q: Sql,
     U: OwnerUnit,
     K: OwnerKeys,
 {
@@ -470,6 +493,10 @@ where
         let (owner, proof) = match owner.restoring_entry(0) {
             Some(e) if e.since_seq >= window.since => {
                 let since = e.since_seq;
+                // The unit closed under this entry first: a re-entry that
+                // stopped after its record left the unit on the old one,
+                // and the report binds the unit's own entry.
+                close_unit(unit, &owner).await?;
                 // AM-31: the sweep before the lift record.
                 revocation_sweep(keys, unit, window.keys).await?;
                 let proof = move_lift_proof(unit, zero, since).await?;
@@ -494,6 +521,8 @@ where
                 (owner, proof)
             }
         };
+        // An opening record: the directory before the unit.
+        dir.apply_tenant(&owner, now).await?;
         match unit.sync(&owner, Some(&proof)).await? {
             Synced::Ok => {
                 unit.renew().await?;
@@ -516,10 +545,55 @@ where
                         .await?,
                 );
                 close_unit(unit, &closed).await?;
+                // A closing record: the unit before the directory.
+                dir.apply_tenant(&closed, now).await?;
             }
         }
     }
     unreachable!("the last re-entry returns")
+}
+
+/// The owner's unit 0 closed: this window's entry (or a later one) kept,
+/// or a new one set if an earlier step lifted it; the unit synced to it,
+/// then the directory (a closing record: the unit first).
+async fn close_owner<S, C, Q, U>(
+    chain: &TenantChain<'_, S, C>,
+    dir: &SqlDirectory<'_, Q>,
+    unit: &U,
+    window: &Window<'_>,
+    now: UnixMs,
+) -> Result<TenantDoor, FlipError>
+where
+    S: RecordStore,
+    C: ControlSeal,
+    Q: Sql,
+    U: OwnerUnit,
+{
+    let owner = head_of(chain, window.owner).await?;
+    let owner = match owner.restoring_entry(0) {
+        // This window's entry, a re-entry's, or the one an earlier run of
+        // this give-up set; an older entry is another window's.
+        Some(r) if r.since_seq >= window.since => owner,
+        Some(r) => {
+            return Err(FlipError::OtherWindow {
+                since_seq: r.since_seq,
+            })
+        }
+        None => door_of(
+            chain
+                .write(
+                    window.owner,
+                    &Change::SetRestoring { unit: 0 },
+                    Actor::Operator,
+                    now,
+                    owner.seq,
+                )
+                .await?,
+        ),
+    };
+    close_unit(unit, &owner).await?;
+    dir.apply_tenant(&owner, now).await?;
+    Ok(owner)
 }
 
 /// Syncs the unit to a head that closes it. No `renew`: a `restoring`
@@ -760,11 +834,11 @@ pub struct GaveUp {
 }
 
 /// Gives the move up before the flip, in the exit order of AM-23: the
-/// owner's unit closed again, the directory rows back on tenant 0, tenant
+/// owner's unit closed again, the route records and the directory rows
+/// back on tenant 0, tenant
 /// 0's record back to `d1` and the directory's copy of it, then
 /// [`exit_placements`]. Runs again from wherever it stopped. Refused once
-/// tenant 0 is `moved` (the way back is then the reverse move) and once a
-/// route record names the owner.
+/// tenant 0 is `moved` (the way back is then the reverse move).
 #[allow(clippy::too_many_arguments)]
 pub async fn give_up<S, C, F, B, Q, U, R, K>(
     chain: &TenantChain<'_, S, C>,
@@ -795,42 +869,19 @@ where
                 .and_then(|z| z.moved.as_ref())
                 .map(|m| m.catalogue_id_frozen.clone())
                 .expect("checked by window_state");
-            let mut put = Vec::new();
-            for akid in window.keys {
-                if routes.get(akid).await?.as_deref() == Some(window.owner.as_str()) {
-                    put.push(akid.clone());
-                }
-            }
-            if !put.is_empty() {
-                return Err(FlipError::RoutesPut(put));
-            }
-            // The owner's unit closed again, if an earlier step opened it.
-            let owner = head_of(chain, window.owner).await?;
-            let owner = match owner.restoring_entry(0) {
-                // This window's entry, a re-entry's, or the one an earlier
-                // run of this give-up set; an older entry is another
-                // window's.
-                Some(r) if r.since_seq >= window.since => owner,
-                Some(r) => {
-                    return Err(FlipError::OtherWindow {
-                        since_seq: r.since_seq,
-                    })
-                }
-                None => door_of(
-                    chain
-                        .write(
-                            window.owner,
-                            &Change::SetRestoring { unit: 0 },
-                            Actor::Operator,
-                            now,
-                            owner.seq,
-                        )
-                        .await?,
-                ),
-            };
-            close_unit(unit, &owner).await?;
-            // The directory rows back on tenant 0.
+            // The owner's unit closed again, if an earlier step opened it;
+            // then the route records back on tenant 0 by the conditional
+            // replace (DS1 §3.8 row 8).
+            close_owner(chain, dir, unit, window, now).await?;
             let zero_tenant = Tenant::Zero;
+            for akid in window.keys {
+                if routes.get(akid).await?.as_deref() == Some(window.owner.as_str())
+                    && !routes.replace(akid, window.owner, &zero_tenant).await?
+                {
+                    return Err(FlipError::RouteTaken(akid.clone()));
+                }
+            }
+            // The directory rows back on tenant 0.
             for akid in window.keys {
                 if !dir.move_route(akid, window.owner, &zero_tenant).await? {
                     let row = dir.route(akid).await?;
@@ -853,8 +904,15 @@ where
             );
             (frozen_id, zero)
         }
-        // Given up by an earlier run: finish the exit, answer again.
-        WindowState::GivenUp(frozen_id) => (frozen_id, head_of(chain, &Tenant::Zero).await?),
+        // Given up by an earlier run (or by the flip after V9): finish the
+        // exit, answer again. While the exit is open the unit is closed
+        // first, as the exit needs.
+        WindowState::GivenUp(frozen_id) => {
+            if head_of(chain, window.owner).await?.moved_in.is_some() {
+                close_owner(chain, dir, unit, window, now).await?;
+            }
+            (frozen_id, head_of(chain, &Tenant::Zero).await?)
+        }
         // The way back after the flip is the reverse move.
         WindowState::Flipped(_) => return Err(FlipError::NotThisMove),
     };
@@ -891,6 +949,9 @@ where
 {
     let head = head_of(chain, owner).await?;
     if head.moved_in.is_none() {
+        // Done, or never filled: the directory's copy as it stands (a
+        // crash after the unplace may have missed it).
+        dir.apply_tenant(&head, now).await?;
         return Ok(false);
     }
     let buckets: Vec<String> = head

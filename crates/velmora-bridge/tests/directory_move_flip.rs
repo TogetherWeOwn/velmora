@@ -69,6 +69,15 @@ struct FakeUnit {
     v9_runs: Cell<u32>,
     nonces: Cell<u32>,
     keys_seq: Cell<u64>,
+    /// The next N syncs that lift are not reached.
+    fail_lift: Cell<u32>,
+    /// The unit refuses every `move` report.
+    refuse_report: Cell<bool>,
+    /// The sync after a refused lift is not reached.
+    fail_after_refusal: Cell<bool>,
+    armed: Cell<bool>,
+    /// Changes every `GateStatus` answer (a unit that answers wrongly).
+    bend: RefCell<Option<fn(&mut GateView)>>,
     /// Key status by id, as applied.
     key_rows: RefCell<BTreeMap<String, SubjectStatus>>,
     applies: Cell<u32>,
@@ -89,6 +98,11 @@ impl Default for FakeUnit {
             v9_runs: Cell::new(0),
             nonces: Cell::new(0),
             keys_seq: Cell::new(0),
+            bend: RefCell::new(None),
+            fail_lift: Cell::new(0),
+            refuse_report: Cell::new(false),
+            fail_after_refusal: Cell::new(false),
+            armed: Cell::new(false),
             key_rows: RefCell::default(),
             applies: Cell::new(0),
         }
@@ -137,7 +151,10 @@ impl KeyUnit for FakeUnit {
 
 impl OwnerUnit for FakeUnit {
     async fn sync(&self, owner: &TenantDoor, lift: Option<&LiftProof>) -> Result<Synced> {
-        if take(&self.fail) {
+        if take(&self.fail) || self.armed.replace(false) {
+            return Err(BridgeError::Blob("unit unreachable".into()));
+        }
+        if owner.restoring_entry(0).is_none() && take(&self.fail_lift) {
             return Err(BridgeError::Blob("unit unreachable".into()));
         }
         match owner.restoring_entry(0) {
@@ -155,6 +172,7 @@ impl OwnerUnit for FakeUnit {
                     return Ok(Synced::Refused("proof_mismatch".into()));
                 }
                 if self.closed.get().is_some() && take(&self.refuse_lift) {
+                    self.armed.set(self.fail_after_refusal.get());
                     return Ok(Synced::Refused("closed".into()));
                 }
                 self.closed.set(None);
@@ -181,7 +199,7 @@ impl OwnerUnit for FakeUnit {
             .tenant_zero
             .as_ref()
             .is_some_and(|z| z.selector == Selector::Moving);
-        if !moving || self.closed.get() != Some(replay_id.since) {
+        if self.refuse_report.get() || !moving || self.closed.get() != Some(replay_id.since) {
             return Ok(Reported::Refused("not_this_window".into()));
         }
         self.reports.set(self.reports.get() + 1);
@@ -195,7 +213,7 @@ impl OwnerUnit for FakeUnit {
             .as_ref()
             .is_some_and(|r| Some(r.since) == self.closed.get())
             && !take(&self.not_ok);
-        Ok(GateView {
+        let mut view = GateView {
             kind_move: report.is_some(),
             lift_ok,
             proof: report.clone().map(|replay_id| LiftProof {
@@ -203,7 +221,11 @@ impl OwnerUnit for FakeUnit {
                 acknowledged: Default::default(),
             }),
             replay_id: report,
-        })
+        };
+        if let Some(bend) = *self.bend.borrow() {
+            bend(&mut view);
+        }
+        Ok(view)
     }
 
     async fn v9(&self) -> Result<bool> {
@@ -340,6 +362,10 @@ struct FakeRoutes {
     fail_after: Cell<Option<u32>>,
     /// The next N puts store, then answer an error.
     lose: Cell<u32>,
+    /// Replaces that changed a record.
+    replaced: Cell<u32>,
+    /// A third tenant took every record before a replace.
+    third: Cell<bool>,
 }
 
 impl RouteRecords for FakeRoutes {
@@ -367,6 +393,22 @@ impl RouteRecords for FakeRoutes {
 
     async fn get(&self, akid: &str) -> Result<Option<String>> {
         Ok(self.records.borrow().get(akid).cloned())
+    }
+
+    async fn replace(&self, akid: &str, from: &Tenant, to: &Tenant) -> Result<bool> {
+        let mut records = self.records.borrow_mut();
+        if self.third.get() {
+            records.insert(akid.into(), "t_00000000000000b2".into());
+        }
+        match records.get(akid).map(String::as_str) {
+            Some(t) if t == to.as_str() => Ok(true),
+            Some(t) if t == from.as_str() => {
+                records.insert(akid.into(), to.as_str().into());
+                self.replaced.set(self.replaced.get() + 1);
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
     }
 }
 
@@ -637,6 +679,8 @@ async fn assert_flipped(m: &Move, stamp: u64) {
     let proof = proof.expect("the opening sync names the lift");
     if let Some(l) = lifted {
         assert_eq!(l.proof, proof);
+        // The directory took the lift before the unit did.
+        assert_eq!(m.dir_row(&owner()).await.0, o.seq);
     }
     assert_eq!(Some(proof.replay_id), *m.unit.report.borrow());
     assert!(m.unit.closed.get().is_none());
@@ -686,7 +730,7 @@ fn a_crash_at_any_step_is_finished_by_running_the_flip_again() {
         let m = window().await;
         let before = m.records();
         // After (a) and the lift record: the unit is not reached.
-        m.unit.fail.set(1);
+        m.unit.fail_lift.set(1);
         assert!(matches!(m.flip().await, Err(FlipError::Store(_))));
         assert!(m.head(&owner()).await.restoring.is_empty());
         assert_eq!(
@@ -798,20 +842,36 @@ fn the_move_is_given_up_before_its_routes() {
 }
 
 #[test]
-fn the_give_up_stops_once_a_route_record_names_the_owner() {
+fn the_give_up_puts_a_route_record_back_by_the_conditional_replace() {
     block_on(async {
+        let m = window().await;
+        // (c) put the first key's record, then stopped.
+        m.routes.fail_after.set(Some(1));
+        assert!(m.flip().await.is_err());
+        assert_eq!(m.routes.records.borrow()[KEYS[0]], OWNER);
+        m.routes.fail_after.set(None);
+        let g = m.give_up().await.map_err(|e| format!("{e:?}")).unwrap();
+        assert!(g.stamp_put);
+        // Closed first, then the record back on tenant 0, then d1.
+        assert_eq!(m.routes.records.borrow()[KEYS[0]], Tenant::zero().as_str());
+        assert_eq!(m.routes.replaced.get(), 1);
+        assert!(m.unit.closed.get().is_some());
+        assert_eq!(m.selector().await, Selector::D1);
+        for akid in KEYS {
+            assert!(m.route_row(akid).await.is_zero());
+        }
+        // A record that names a third tenant stops the give-up before d1.
         let m = window().await;
         m.routes.fail_after.set(Some(1));
         assert!(m.flip().await.is_err());
+        m.routes.fail_after.set(None);
+        m.routes.third.set(true);
         let r = m.give_up().await;
         assert!(
-            matches!(&r, Err(FlipError::RoutesPut(k)) if k == &[KEYS[0].to_string()]),
+            matches!(&r, Err(FlipError::RouteTaken(k)) if k == KEYS[0]),
             "{r:?}"
         );
-        assert_eq!(
-            m.head(&Tenant::zero()).await.tenant_zero.unwrap().selector,
-            Selector::Moving
-        );
+        assert_eq!(m.selector().await, Selector::Moving);
     });
 }
 
@@ -1271,8 +1331,8 @@ fn a_stored_report_that_passes_is_used_and_a_failing_one_replaced() {
 fn a_refused_report_stops_the_lift() {
     block_on(async {
         let m = window().await;
-        // The unit is closed under another entry than the owner's head.
-        m.unit.closed.set(Some(m.since + 7));
+        // The unit refuses the binding (for one, an import not sealed).
+        m.unit.refuse_report.set(true);
         let before = m.records();
         let r = m.flip().await;
         assert!(
@@ -1328,7 +1388,7 @@ fn a_lift_the_unit_keeps_refusing_stops_before_the_routes() {
 fn a_crash_after_the_lift_record_syncs_with_its_proof() {
     block_on(async {
         let m = window().await;
-        m.unit.fail.set(1);
+        m.unit.fail_lift.set(1);
         assert!(matches!(m.flip().await, Err(FlipError::Store(_))));
         let lifted = m.head(&owner()).await.lifted.unwrap();
         // A tenant-0-free owner record lands on top (a later record of
@@ -1342,39 +1402,64 @@ fn a_crash_after_the_lift_record_syncs_with_its_proof() {
     });
 }
 
+/// Logs every put of a tenant record, by chain, into the keys' log.
+fn log_puts(m: &Move) {
+    let log = Rc::clone(&m.keys.log);
+    let zero_prefix = "m/t/t_0000000000000000/".to_string();
+    let owner_prefix = format!("m/t/{OWNER}/");
+    m.store.before_put(move |key, _| {
+        if key.starts_with(&zero_prefix) {
+            log.borrow_mut().push("zero".into());
+        } else if key.starts_with(&owner_prefix) {
+            log.borrow_mut().push("owner".into());
+        }
+    });
+}
+
 #[test]
-fn v9_failing_in_the_open_unit_takes_the_give_up_in_the_exit_order() {
+fn v9_failing_in_the_open_unit_gives_the_move_up_for_good() {
     block_on(async {
         let m = window().await;
+        log_puts(&m);
         m.unit.v9_ok.set(false);
         let r = m.flip().await;
         assert!(matches!(r, Err(FlipError::V9Failed)), "{r:?}");
-        // The unit is open, no route moved.
-        assert!(m.unit.closed.get().is_none());
-        assert!(m.routes.records.borrow().is_empty());
-        // The order of the exit: the owner closed, tenant 0 at d1, the
-        // grant revocations, then the unplace.
-        let log = Rc::clone(&m.keys.log);
-        let zero_prefix = "m/t/t_0000000000000000/".to_string();
-        let owner_prefix = format!("m/t/{OWNER}/");
-        m.store.before_put(move |key, _| {
-            if key.starts_with(&zero_prefix) {
-                log.borrow_mut().push("zero".into());
-            } else if key.starts_with(&owner_prefix) {
-                log.borrow_mut().push("owner".into());
-            }
-        });
-        m.give_up().await.map_err(|e| format!("{e:?}")).unwrap();
+        // The lift, tenant 0 at d1 first (durable), the unit closed again,
+        // the grant revocations, the unplace.
         assert_eq!(
             *m.keys.log.borrow(),
-            ["owner", "zero", "revoke_grants", "owner"]
+            ["owner", "zero", "owner", "revoke_grants", "owner"]
         );
+        assert!(m.routes.records.borrow().is_empty());
         let o = m.head(&owner()).await;
         assert!(o.placements.is_empty());
         assert_eq!(o.buckets_unplaced.clone().unwrap().buckets, m.buckets);
         assert_eq!(
             m.unit.closed.get(),
             o.restoring_entry(0).map(|e| e.since_seq)
+        );
+        assert_eq!(m.selector().await, Selector::D1);
+        // V9 passing now changes nothing: the window is given up.
+        m.unit.v9_ok.set(true);
+        assert!(matches!(m.flip().await, Err(FlipError::NotThisMove)));
+        assert!(m.routes.records.borrow().is_empty());
+        assert_eq!(m.unit.v9_runs.get(), 1);
+    });
+}
+
+#[test]
+fn the_give_up_after_the_unit_opened_exits_in_order() {
+    block_on(async {
+        let m = window().await;
+        log_puts(&m);
+        m.routes.fail_after.set(Some(0));
+        assert!(m.flip().await.is_err());
+        m.give_up().await.map_err(|e| format!("{e:?}")).unwrap();
+        // The lift; then the unit closed, tenant 0 at d1, the grant
+        // revocations, the unplace.
+        assert_eq!(
+            *m.keys.log.borrow(),
+            ["owner", "owner", "zero", "revoke_grants", "owner"]
         );
     });
 }
@@ -1506,5 +1591,101 @@ fn a_crash_after_the_flip_record_still_copies_the_selector() {
             .unwrap();
         m.flip().await.unwrap();
         assert_eq!(m.dir_row(&Tenant::zero()).await.1, Some(Selector::Moved));
+    });
+}
+
+#[test]
+fn a_gate_answer_that_is_not_this_lift_is_never_used() {
+    let bends: [fn(&mut GateView); 5] = [
+        |v| v.kind_move = false,
+        |v| {
+            if let Some(p) = v.proof.as_mut() {
+                p.acknowledged.insert(
+                    velmora_bridge::unit::lift::AckClass::Damaged,
+                    velmora_bridge::unit::lift::ClassProof {
+                        count: 1,
+                        sha256: "0".repeat(64),
+                    },
+                );
+            }
+        },
+        |v| {
+            if let Some(p) = v.proof.as_mut() {
+                p.replay_id.since += 1;
+            }
+        },
+        |v| {
+            if let Some(p) = v.proof.as_mut() {
+                p.replay_id.nonce = "other".into();
+            }
+        },
+        |v| v.replay_id = None,
+    ];
+    for bend in bends {
+        block_on(async {
+            let m = window().await;
+            *m.unit.bend.borrow_mut() = Some(bend);
+            let before = m.records();
+            let r = m.flip().await;
+            assert!(matches!(r, Err(FlipError::LiftNotOk)), "{r:?}");
+            assert_eq!(m.records(), before);
+            assert!(m.head(&owner()).await.restoring_entry(0).is_some());
+        });
+    }
+}
+
+#[test]
+fn a_re_entry_that_stopped_after_its_record_closes_the_unit_first() {
+    block_on(async {
+        let m = window().await;
+        // The lift is refused once; the re-entry's closing sync is not
+        // reached.
+        m.unit.refuse_lift.set(1);
+        m.unit.fail_after_refusal.set(true);
+        let r = m.flip().await;
+        assert!(matches!(r, Err(FlipError::Store(_))), "{r:?}");
+        let o = m.head(&owner()).await;
+        let s2 = o.restoring_entry(0).unwrap().since_seq;
+        assert!(s2 > m.since);
+        // The unit is still on the first entry.
+        assert_eq!(m.unit.closed.get(), Some(m.since));
+        let f = m.flip().await.map_err(|e| format!("{e:?}")).unwrap();
+        assert!(f.wrote);
+        assert_eq!(m.unit.report.borrow().clone().unwrap().since, s2);
+        assert_eq!(m.head(&owner()).await.lifted.unwrap().since_seq, s2);
+    });
+}
+
+#[test]
+fn a_crash_after_the_lift_record_then_a_refusal_re_enters() {
+    block_on(async {
+        let m = window().await;
+        let before = m.records();
+        m.unit.fail_lift.set(1);
+        assert!(matches!(m.flip().await, Err(FlipError::Store(_))));
+        // The stored lift's sync is refused once: a re-entry from the
+        // lifted head.
+        m.unit.refuse_lift.set(1);
+        let f = m.flip().await.map_err(|e| format!("{e:?}")).unwrap();
+        assert!(f.wrote);
+        // Lift, re-entry, lift, flip.
+        assert_eq!(m.records(), before + 4);
+        assert_eq!(m.unit.reports.get(), 2);
+    });
+}
+
+#[test]
+fn a_lift_refused_every_time_stops_after_the_bound() {
+    use velmora_bridge::directory::move_flip::MAX_REENTRIES;
+    block_on(async {
+        let m = window().await;
+        let before = m.records();
+        m.unit.refuse_lift.set(99);
+        let r = m.flip().await;
+        assert!(matches!(r, Err(FlipError::SyncRefused(_))), "{r:?}");
+        let tries = MAX_REENTRIES as usize + 1;
+        // A lift per try, an entry between tries.
+        assert_eq!(m.records(), before + tries + MAX_REENTRIES as usize);
+        assert_eq!(m.unit.reports.get() as usize, tries);
     });
 }

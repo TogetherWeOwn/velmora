@@ -100,10 +100,10 @@ pub async fn apply_owner_keys<K: OwnerKeys, U: KeyUnit>(
     let head = keys.head().await?;
     let mut from = 0u64;
     let mut unit_seq = 0u64;
-    // Each round moves `from` on by at least one record, or is a
-    // `behind` answer, which moves it to the unit's seq; a few more for
-    // those.
-    let rounds = head / MAX_ENTRIES as u64 + head.min(8) + 4;
+    // Each round moves `from` on by at least one record (a page may be
+    // short), or is a `behind` answer, which moves it down to the unit's
+    // seq once; a few more for those.
+    let rounds = head.saturating_add(8);
     for _ in 0..rounds {
         if from >= head {
             return Ok(unit_seq.max(from));

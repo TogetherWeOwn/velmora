@@ -329,3 +329,78 @@ fn p2_counts_bucket_ids_and_integer_cells_that_stop_the_move() {
         assert!(json.contains("vault-old"));
     });
 }
+
+#[test]
+fn p2_records_an_unreadable_key_or_bucket_id_as_a_stop_line() {
+    block_on(async {
+        let rig = rig();
+        let (_, signer) = rig.standard("vault").await;
+        rig.put(&signer, "vault", "k", &pattern(1, 100))
+            .await
+            .expect(200);
+        let sql = &rig.bridge.catalog.sql;
+        sql.inner
+            .apply(
+                "INSERT INTO usage_hours (hour, posts, verifies, releases, dead, failures) \
+                 VALUES (5, 0, 0, 0, 0, 0), (1152921504606846976, 0, 0, 0, 0, 0);\n\
+                 INSERT INTO buckets (id, name, owner, bdk_wrapped, kek_version, disposable, created_at) \
+                 SELECT NULL, 'nullid', owner, bdk_wrapped, kek_version, disposable, created_at FROM buckets LIMIT 1;",
+            )
+            .unwrap();
+        let lines = p2_lines(sql, &BTreeSet::new(), 1).await.unwrap();
+        assert!(lines.stops());
+        assert_eq!(lines.nonconforming_count, 1);
+        assert!(lines.nonconforming_ids[0].starts_with("<null at rowid"));
+        let hour = lines
+            .cells
+            .iter()
+            .find(|l| l.table == "usage_hours" && l.column == "hour")
+            .unwrap();
+        assert_eq!(hour.int_unsafe, 1);
+        assert_eq!(hour.samples.len(), 1);
+        // Both scans stopped there and say so; every later table was read.
+        assert_eq!(lines.unreadable_keys, ["buckets", "usage_hours"]);
+        assert!(lines.cells.iter().any(|l| l.table == "usage_recounts"));
+    });
+}
+
+/// A key lane that answers one record per page still finishes.
+#[test]
+fn the_key_apply_finishes_with_short_pages() {
+    struct Short(Keys);
+    impl OwnerKeys for Short {
+        async fn head(&self) -> Result<u64> {
+            self.0.head().await
+        }
+        async fn entries(&self, after: u64, _limit: usize) -> Result<Vec<KeyEntry>> {
+            self.0.entries(after, 1).await
+        }
+        async fn flat_revoked(&self, a: &str) -> Result<bool> {
+            self.0.flat_revoked(a).await
+        }
+        async fn tenant_revoked(&self, a: &str) -> Result<bool> {
+            self.0.tenant_revoked(a).await
+        }
+        async fn put_tenant_revocation(&self, a: &str) -> Result<()> {
+            self.0.put_tenant_revocation(a).await
+        }
+        async fn revoke(&self, a: &str) -> Result<()> {
+            self.0.revoke(a).await
+        }
+        async fn revoke_grants(&self, b: &[String]) -> Result<()> {
+            self.0.revoke_grants(b).await
+        }
+        async fn flat_revocations(
+            &self,
+            after: Option<&str>,
+        ) -> Result<(Vec<String>, Option<String>)> {
+            self.0.flat_revocations(after).await
+        }
+    }
+    block_on(async {
+        let keys = Short(chain_of(150));
+        let unit = Unit::default();
+        assert_eq!(apply_owner_keys(&keys, &unit).await.unwrap(), 150);
+        assert_eq!(unit.calls.borrow().len(), 150);
+    });
+}

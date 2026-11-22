@@ -62,12 +62,17 @@ pub struct P2Lines {
     pub excluded: BTreeSet<String>,
     /// Every INTEGER-declared column of every imported table.
     pub cells: Vec<CellLine>,
+    /// Tables whose scan stopped at a primary key that cannot be read or
+    /// paged past (NULL, REAL or an unsafe integer): the rest of the table
+    /// was not scanned.
+    pub unreadable_keys: Vec<&'static str>,
 }
 
 impl P2Lines {
     /// Whether a line stops the move before step 0.
     pub fn stops(&self) -> bool {
         self.nonconforming_count > 0
+            || !self.unreadable_keys.is_empty()
             || self
                 .cells
                 .iter()
@@ -83,43 +88,48 @@ pub async fn p2_lines<S: Sql>(d1: &S, excluded: &BTreeSet<String>, page: usize) 
         excluded: excluded.clone(),
         ..P2Lines::default()
     };
-    // Bucket ids.
-    let mut after: Option<SqlValue> = None;
+    // Bucket ids, paged by rowid (`buckets` is a rowid table whose `id`
+    // has no NOT NULL), so an id that is not text is counted, not fatal.
+    let mut after: i64 = 0;
     loop {
-        let rows = match &after {
-            None => {
-                d1.query(
-                    &format!("SELECT id FROM buckets ORDER BY id LIMIT {page}"),
-                    &[],
-                )
-                .await?
-            }
-            Some(a) => {
-                d1.query(
-                    &format!("SELECT id FROM buckets WHERE id > ?1 ORDER BY id LIMIT {page}"),
-                    std::slice::from_ref(a),
-                )
-                .await?
-            }
-        };
+        let rows = d1
+            .query(
+                &format!(
+                    "SELECT rowid, CASE WHEN typeof(id) = 'text' THEN id END, typeof(id) \
+                     FROM buckets WHERE rowid > ?1 ORDER BY rowid LIMIT {page}"
+                ),
+                &[SqlValue::Int(after)],
+            )
+            .await?;
         for row in &rows {
-            let Some(SqlValue::Text(id)) = row.first() else {
+            let (Some(SqlValue::Int(rowid)), Some(id), Some(SqlValue::Text(ty))) =
+                (row.first(), row.get(1), row.get(2))
+            else {
                 return Err(BridgeError::Invalid("p2: bucket id"));
             };
-            if !super::transition::valid_bucket_id(id) {
+            let shown = match id {
+                SqlValue::Text(id) if super::transition::valid_bucket_id(id) => None,
+                SqlValue::Text(id) => Some(id.clone()),
+                _ => Some(format!("<{ty} at rowid {rowid}>")),
+            };
+            if let Some(shown) = shown {
                 lines.nonconforming_count += 1;
                 if lines.nonconforming_ids.len() < MAX_SAMPLES {
-                    lines.nonconforming_ids.push(id.clone());
+                    lines.nonconforming_ids.push(shown);
                 }
             }
-            after = Some(SqlValue::Text(id.clone()));
+            after = *rowid;
         }
         if rows.len() < page {
             break;
         }
     }
     for table in ImportTable::ALL {
-        lines.cells.extend(integer_cells(d1, table, page).await?);
+        let (cells, complete) = integer_cells(d1, table, page).await?;
+        lines.cells.extend(cells);
+        if !complete {
+            lines.unreadable_keys.push(table.name());
+        }
     }
     Ok(lines)
 }
@@ -152,14 +162,33 @@ async fn integer_columns<S: Sql>(d1: &S, table: ImportTable) -> Result<Vec<Strin
     Ok(out)
 }
 
-/// The class of each INTEGER-declared cell of `table`, a page at a time.
-async fn integer_cells<S: Sql>(d1: &S, table: ImportTable, page: usize) -> Result<Vec<CellLine>> {
+/// The class of each INTEGER-declared cell of `table`, a page at a time,
+/// and whether the scan reached the end of the table.
+async fn integer_cells<S: Sql>(
+    d1: &S,
+    table: ImportTable,
+    page: usize,
+) -> Result<(Vec<CellLine>, bool)> {
     let columns = integer_columns(d1, table).await?;
     if columns.is_empty() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), true));
     }
     let keys = key_columns(table);
     let key_list: Vec<String> = keys.iter().map(|k| format!("\"{k}\"")).collect();
+    // A key cell is read through the adapter only when it is text, a blob
+    // or a safe integer; any other comes back NULL (its class is counted
+    // by its own flag, as every INTEGER key column is also a flag column),
+    // and the scan of the table stops there: it cannot be paged past.
+    let key_reads: Vec<String> = keys
+        .iter()
+        .map(|k| {
+            format!(
+                "CASE WHEN typeof(\"{k}\") IN ('text', 'blob') \
+                 OR (typeof(\"{k}\") = 'integer' AND \"{k}\" >= -{SAFE} AND \"{k}\" <= {SAFE}) \
+                 THEN \"{k}\" END"
+            )
+        })
+        .collect();
     let flags: Vec<String> = columns
         .iter()
         .map(|c| {
@@ -182,7 +211,7 @@ async fn integer_cells<S: Sql>(d1: &S, table: ImportTable, page: usize) -> Resul
         .collect();
     let base = format!(
         "SELECT {}, {} FROM \"{}\"",
-        key_list.join(", "),
+        key_reads.join(", "),
         flags.join(", "),
         table.name()
     );
@@ -225,13 +254,19 @@ async fn integer_cells<S: Sql>(d1: &S, table: ImportTable, page: usize) -> Resul
                     line.samples.push(key_text(key));
                 }
             }
+            if key.contains(&SqlValue::Null) {
+                // An unreadable key (NULL, or an unsafe or REAL cell counted
+                // above): the stop line is recorded; the rest of the table
+                // is not scanned.
+                return Ok((lines, false));
+            }
             position = Some(key.to_vec());
         }
         if rows.len() < page {
             break;
         }
     }
-    Ok(lines)
+    Ok((lines, true))
 }
 
 fn key_text(key: &[SqlValue]) -> String {
