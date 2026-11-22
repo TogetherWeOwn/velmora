@@ -200,8 +200,18 @@ pub async fn respond(
             return (status, crate::http::to_response(resp));
         }
     };
-    // `resp` came with its request ID; a refusal made here gets it too.
-    let refuse = |resp: S3Response| {
+    // A failure opening the first piece is still the client's S3 response.
+    let refuse = |mut resp: S3Response| {
+        velmora_bridge::cors::carry_fanout_cors(&headers, &mut resp);
+        // A configured response also varies by Origin when no ACAO was sent.
+        if headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("vary")
+                && value
+                    .split(',')
+                    .any(|field| field.trim().eq_ignore_ascii_case("origin"))
+        }) {
+            velmora_bridge::cors::merge_vary_origin(&mut resp);
+        }
         (
             resp.status,
             crate::http::to_response(resp.with_request_id(request_id)),

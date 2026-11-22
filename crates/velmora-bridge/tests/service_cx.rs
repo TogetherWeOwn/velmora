@@ -285,47 +285,6 @@ async fn the_region_aliases_sign_as_well_as_the_configured_region() {
         .expect_error(403, "SignatureDoesNotMatch");
 }
 
-/// A presigned GET of `raw_path`, signed at `now` and valid for an hour.
-fn presign(signer: &Signer, now: UnixMs, raw_path: &str) -> Req {
-    let (stamp, scope, key) = signer.scope(now);
-    let credential = format!("{}/{scope}", signer.akid);
-    let mut q: Vec<(String, String)> = [
-        ("X-Amz-Algorithm", "AWS4-HMAC-SHA256"),
-        ("X-Amz-Credential", credential.as_str()),
-        ("X-Amz-Date", stamp.as_str()),
-        ("X-Amz-Expires", "3600"),
-        ("X-Amz-SignedHeaders", "host"),
-    ]
-    .iter()
-    .map(|(k, v)| (uri_encode(k, false), uri_encode(v, false)))
-    .collect();
-    q.sort();
-    let query = q
-        .iter()
-        .map(|(k, v)| format!("{k}={v}"))
-        .collect::<Vec<_>>()
-        .join("&");
-    let canonical = format!("GET\n{raw_path}\n{query}\nhost:{HOST}\n\nhost\nUNSIGNED-PAYLOAD");
-    let to_sign = format!(
-        "AWS4-HMAC-SHA256\n{stamp}\n{scope}\n{}",
-        hex(&sha256(canonical.as_bytes()))
-    );
-    let signature = hex(&hmac_sha256(&key, to_sign.as_bytes()));
-    Req {
-        method: Method::Get,
-        target: format!("{raw_path}?{query}&X-Amz-Signature={signature}"),
-        headers: vec![("host".to_string(), HOST.to_string())],
-        body: Vec::new(),
-    }
-}
-
-fn hmac_sha256(key: &[u8], data: &[u8]) -> Vec<u8> {
-    use hmac::{Hmac, KeyInit, Mac};
-    let mut mac = Hmac::<sha2::Sha256>::new_from_slice(key).unwrap();
-    mac.update(data);
-    mac.finalize().into_bytes().to_vec()
-}
-
 #[tokio::test(flavor = "current_thread")]
 async fn a_wrong_region_is_told_the_region_to_use() {
     let rig = rig();
@@ -361,22 +320,20 @@ async fn a_wrong_region_is_told_the_region_to_use() {
     assert_eq!(answers.len(), 1);
 
     // A presigned URL names its scope in the query.
-    let good = presign(&signer, rig.now(), &path(BUCKET, "k"));
+    let good = signer.presign(rig.now(), &path(BUCKET, "k"));
     rig.send(good).await.expect(200);
     let east = Signer {
         region: "us-east-1".to_string(),
         ..signer.clone()
     };
-    rig.send(presign(&east, rig.now(), &path(BUCKET, "k")))
+    rig.send(east.presign(rig.now(), &path(BUCKET, "k")))
         .await
         .expect(200);
     let west = Signer {
         region: "us-west-2".to_string(),
         ..signer.clone()
     };
-    let resp = rig
-        .send(presign(&west, rig.now(), &path(BUCKET, "k")))
-        .await;
+    let resp = rig.send(west.presign(rig.now(), &path(BUCKET, "k"))).await;
     resp.expect_error(400, "AuthorizationQueryParametersError");
     assert_eq!(field(&resp, "Region").as_deref(), Some(REGION));
     assert_eq!(

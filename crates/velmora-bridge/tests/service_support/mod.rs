@@ -634,6 +634,7 @@ pub fn config(providers: Vec<ProviderConfig>) -> BridgeConfig {
     BridgeConfig {
         environment: Environment::Dev,
         s3_host: HOST.to_string(),
+        cors_origins: Vec::new(),
         region: REGION.to_string(),
         max_extent_bytes: 16 * 1024 * 1024,
         max_put_bytes: 16 * 1024 * 1024,
@@ -980,6 +981,40 @@ impl Signer {
             akid: akid.to_string(),
             secret: secret.to_string(),
             region: REGION.to_string(),
+        }
+    }
+
+    /// A presigned GET of `raw_path`, signed at `now` and valid for an hour.
+    pub fn presign(&self, now: UnixMs, raw_path: &str) -> Req {
+        let (stamp, scope, key) = self.scope(now);
+        let credential = format!("{}/{scope}", self.akid);
+        let mut q: Vec<(String, String)> = [
+            ("X-Amz-Algorithm", "AWS4-HMAC-SHA256"),
+            ("X-Amz-Credential", credential.as_str()),
+            ("X-Amz-Date", stamp.as_str()),
+            ("X-Amz-Expires", "3600"),
+            ("X-Amz-SignedHeaders", "host"),
+        ]
+        .iter()
+        .map(|(k, v)| (uri_encode(k, false), uri_encode(v, false)))
+        .collect();
+        q.sort();
+        let query = q
+            .iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect::<Vec<_>>()
+            .join("&");
+        let canonical = format!("GET\n{raw_path}\n{query}\nhost:{HOST}\n\nhost\nUNSIGNED-PAYLOAD");
+        let to_sign = format!(
+            "AWS4-HMAC-SHA256\n{stamp}\n{scope}\n{}",
+            hex(&sha256(canonical.as_bytes()))
+        );
+        let signature = hex(&hmac(&key, to_sign.as_bytes()));
+        Req {
+            method: Method::Get,
+            target: format!("{raw_path}?{query}&X-Amz-Signature={signature}"),
+            headers: vec![("host".to_string(), HOST.to_string())],
+            body: Vec::new(),
         }
     }
 

@@ -2033,6 +2033,80 @@ fn s3_host_allows_only_hostname_and_port() {
     }
 }
 
+#[test]
+fn cors_origins_accept_only_exact_origins_for_the_environment() {
+    let (prod, dev) = wrangler_vars();
+    let mut prod = with_secrets(prod, &prod_providers());
+    let mut dev = with_secrets(dev, PROVIDER_PLAIN);
+    assert!(load(&prod).unwrap().cors_origins.is_empty());
+    prod.insert("CORS_ORIGINS".into(), "  ".into());
+    assert!(load(&prod).unwrap().cors_origins.is_empty());
+
+    prod.insert(
+        "CORS_ORIGINS".into(),
+        " https://console.example.app:1 , https://media.example.app:65535 ".into(),
+    );
+    assert_eq!(
+        load(&prod).unwrap().cors_origins,
+        [
+            "https://console.example.app:1",
+            "https://media.example.app:65535"
+        ]
+    );
+    dev.insert("CORS_ORIGINS".into(), "http://localhost:8787".into());
+    assert_eq!(load(&dev).unwrap().cors_origins, ["http://localhost:8787"]);
+
+    let many: Vec<_> = (0..9)
+        .map(|i| format!("https://site{i}.example.app"))
+        .collect();
+    prod.insert("CORS_ORIGINS".into(), many[..8].join(","));
+    assert_eq!(load(&prod).unwrap().cors_origins, many[..8]);
+    let too_many = many.join(",");
+    for bad in [
+        "*",
+        "http://localhost:8787",
+        "HTTPS://console.example.app",
+        "https://Console.example.app",
+        "https://*.example.app",
+        "https://console.example.app.",
+        "https://console..example.app",
+        "https://-console.example.app",
+        "https://console_example.app",
+        "https://",
+        "https://console.example.app/",
+        "https://console.example.app/path",
+        "https://console.example.app?q",
+        "https://console.example.app#fragment",
+        "https://user@console.example.app",
+        "https://console.example.app:",
+        "https://console.example.app:0",
+        "https://console.example.app:65536",
+        "https://console.example.app:443",
+        "https://console.example.app:08443",
+        "http://localhost:80",
+        "http://localhost:08787",
+        "https://console.example.app:+80",
+        "https://console.example.app,",
+        "https://console.example.app, https://console.example.app",
+        &too_many,
+    ] {
+        prod.insert("CORS_ORIGINS".into(), bad.into());
+        assert_eq!(
+            load(&prod).unwrap_err(),
+            ConfigError::Invalid("CORS_ORIGINS".into()),
+            "{bad}"
+        );
+        if bad != "http://localhost:8787" {
+            dev.insert("CORS_ORIGINS".into(), bad.into());
+            assert_eq!(
+                load(&dev).unwrap_err(),
+                ConfigError::Invalid("CORS_ORIGINS".into()),
+                "{bad}"
+            );
+        }
+    }
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn fake_jobs_reject_delays_over_12_hours() {
     let jobs = FakeJobs::new();

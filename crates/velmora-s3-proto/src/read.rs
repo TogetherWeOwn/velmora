@@ -135,6 +135,11 @@ impl ObjectMetadata {
     pub fn etag(&self) -> &str {
         &self.etag
     }
+
+    /// Whether a supplied If-Range validator matches this representation.
+    pub fn matches_if_range(&self, validator: &str) -> bool {
+        validator == self.etag || http_date(validator) == Some(self.modified)
+    }
 }
 
 #[derive(Clone, Debug, Default)]

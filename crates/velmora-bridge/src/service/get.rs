@@ -304,16 +304,18 @@ async fn read<
         stored_checksum(&generation),
     )
     .map_err(|_| internal())?;
+    let range = authed.headers.get("range").filter(|_| {
+        !head
+            && authed
+                .headers
+                .get("if-range")
+                .is_none_or(|validator| metadata.matches_if_range(validator))
+    });
     let plan = plan_read(
         &metadata,
         head,
         &Conditions::from_headers(&authed.headers),
-        // HEAD has no ranges: a `Range` header is ignored.
-        if head {
-            None
-        } else {
-            authed.headers.get("range")
-        },
+        range,
         authed.headers.get("x-amz-checksum-mode").is_some(),
     )
     .map_err(s3_error)?;
