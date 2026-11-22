@@ -25,6 +25,11 @@ use crate::unit::identity::{self, CallKind, Seqs};
 use crate::unit::jobcall::JobCall;
 use crate::unit::{Refused, UnitAnswer, UnitCall, UnitName, UnitOp};
 
+/// The unit's lease has expired (ADR §2.4 rule 12): it runs no job until
+/// a renewal; the consumer retries later (the unit's alarm sends the
+/// `renew` job).
+pub const UNIT_RENEW_NEEDED: &str = "unit: renew needed";
+
 /// A method the job path does not use: not served through a unit.
 pub const NOT_ON_UNIT: &str = "not on the unit job path";
 /// The unit holds a newer record than the job: `sync` first.
@@ -105,6 +110,7 @@ impl<P: UnitPort, S: Catalog> TenantCatalog<P, S> {
             }
             | UnitAnswer::Stale { .. } => Err(self.refused(UNIT_STALE_JOB)),
             UnitAnswer::Closed { .. } => Err(self.refused(UNIT_CLOSED)),
+            UnitAnswer::RenewNeeded { .. } => Err(self.refused(UNIT_RENEW_NEEDED)),
             UnitAnswer::Unborn { .. } => Err(self.refused(UNIT_UNBORN)),
             UnitAnswer::Failed { class } => Err(match class.as_str() {
                 "guard" => BridgeError::GuardFailed,

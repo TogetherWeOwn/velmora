@@ -81,23 +81,59 @@ database, so they run natively in tests); the Durable Object class, the
     key-row fetch and the cold read plan (both read-only; a cold read
     returns the key row with the plan, so a cold isolate verifies the
     signature from one call). Their transaction is rolled back and refused
-    if it changed a row. The Worker's own calls (`provision`, `sync`) are
+    if it changed a row. The Worker's own calls (`provision`, `sync`, `renew`) are
     not judged by this flag: they carry records the Worker has verified,
     never a caller's input, and a cold isolate needs `sync` before it can
     verify a signature.
+12. **Freshness lease** (`unit_lease`). The unit stores `fresh_until`. With
+    an expired lease (never issued, closed, or run out) it answers
+    `renew_needed` to every call but the Worker's own (`sync`, `renew`, the
+    key apply, the import, the gate's and the restore's) and the stamp
+    check of a job (`stamp`, `stamp_rolled_back`), and does nothing else.
+    - **`renew(proof_start, proven, revocations)`.** The Worker proves the
+      unit from the safety bucket (`unit_lease::renewal`: the next record of
+      each chain is absent, no stamp object after the unit's counter, and
+      the listing of `m/rk/<t>/`) and passes what it proved. In one
+      transaction the unit applies the listed revocations (a key row is
+      revoked; an id it holds no row for is kept in `unit_revoked_ids` and
+      revokes a row that arrives for it later), then sets
+      `fresh_until = proof_start + T` (T = 10 minutes, est) only if its own
+      seqs, stamp counter and revoked count are at least the proven ones,
+      every listed id is held as revoked, and `proof_start` is at most 30 s
+      behind or 5 s ahead of its clock. A renewal never moves the lease
+      back. Refused (with the reason): a `restoring` entry, a recorded
+      rollback, a unit without the lease table. The listed revocations are
+      kept also when the lease is refused.
+    - **The close.** The `sync` that sets a `restoring` entry ends the
+      lease; `lease_hi`, the latest `fresh_until` ever held, is kept for the
+      restore's wait. A `stamp_rolled_back` that records a rollback ends it
+      too.
+    - **Every answer** leaves the unit as `UnitReply`: the answer's object
+      with `lease_left_ms` (0 for no lease) and, once the unit holds keys or
+      listed ids, `revoked` (each id once) beside its fields.
 13. **Key scheme.** Tenant 0 holds key scheme 1, every other tenant scheme 2;
     a token with the other scheme is refused.
 14. **Jurisdiction.** A token names the jurisdiction of the namespace its
     object is in; a token for another one makes no object.
 
-Rules 8 to 10 and 12 (one alarm, jobs that name their tenant, the unit's
-outbox to the directory, the freshness lease) are not built yet. Until the
-lease exists, a unit is not bound anywhere: the lease is what closes a unit
-that a point-in-time restore took back to an older state.
+**Rule 8, one alarm** (`workers/unit/src/alarm.rs`, `unit_lease::alarm`):
+the alarm is the only code of a unit that sends to a queue. It sends the
+unit's two jobs, format 2 with the tenant and the unit: `stamp_raise`, once
+per period (5 minutes, est) after the first write since the last raise
+(the stamp's own calls and the cron's bookkeeping do not count), and with an
+expired lease one `renew` and nothing else, retried with a doubling wait
+(60 s to 30 minutes, est). A raise is handed out only with at least half of
+T left (its consumer reaches the unit later); with less, the alarm sends one
+`renew` instead, other duties run, and the raise follows the renewal. Work that was due stays due; after a renewal the
+alarm is set to now. The alarm is armed only when the wanted time is earlier
+than the armed one. A closed unit runs nothing. Only the stamp raise is due
+on a unit yet: the day close (W7), the sweeps, the hand-out and the report
+to the directory are not built here, and the Worker's cron runs a unit's
+jobs through `TenantCatalog`. Rules 9 and 10 (jobs that name their tenant,
+the unit's outbox to the directory) are not built yet.
 
-**The calls are JSON** (`UnitCall` and `UnitAnswer`, `unit::call`). Every
-answer is to carry `lease_left_ms`, and an answer of a unit that holds
-keys `revoked` (rule 12; with the lease). Until the class is bound
+**The calls are JSON** (`UnitCall` and `UnitAnswer`, `unit::call`; an
+answer leaves the unit as `UnitReply`, rule 12). Until the class is bound
 (stage C(b)) the format may change. After it, these types only gain
 fields, in two deploys, reader first, and a golden-JSON test pins each
 variant.
@@ -110,8 +146,15 @@ mode, `restoring_since` and `closed_at`; moved by
 calls and the fenced creator-grant seqs (`unit_reservations`,
 `unit_bucket_fences`); the gate report and its
 acknowledgements; the lease and the alarm's counters in
-`unit_lease`, and revocations listed for a key the unit does not hold as
-tombstones (with the lease); and the stamp counter.
+`unit_lease` (`fresh_until`, `lease_hi`, `renew_tries`, `failed_runs`,
+`first_write_at`, `raise_from`; migration `u0002`), and revocations listed
+for a key the unit does not hold, or for an id that names a principal row,
+in `unit_revoked_ids`; and the stamp counter.
+
+**The write mark** (`unit_lease::mark`): the unit's catalogue and every
+table of the unit are reached only through `MarkedSql`, which counts every
+write of the wake (`wake_id` is random at each wake and kept in memory).
+A dump whose pages carry one mark is exact.
 
 ## Keys
 

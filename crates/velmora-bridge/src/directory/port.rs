@@ -1,4 +1,4 @@
-//! The directory: which tenant an access key belongs to.
+//! The directory port: which tenant an access key belongs to.
 //!
 //! A store with more than one tenant has to find the tenant of a
 //! request before it can ask that tenant's catalogue anything.

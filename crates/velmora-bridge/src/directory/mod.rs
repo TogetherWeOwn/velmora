@@ -19,7 +19,9 @@
 //!   marker, the freeze triggers, the legacy stamp, and the thaw;
 //! - [`tenant_zero`]: whether tenant 0 may be served from the D1
 //!   catalogue, from its record and the database's own marker, and the
-//!   route of a request when the directory cannot be read.
+//!   route of a request when the directory cannot be read;
+//! - [`port`]: [`Directory`], the port that finds the tenant of an access
+//!   key, and its one adapter [`SingleTenant`] (every key is tenant 0's).
 //!
 //! Nothing in the Worker calls this module yet. No request is routed by
 //! it and no record is written by it in production.
@@ -27,10 +29,13 @@
 pub mod chain;
 pub mod fence;
 pub mod gate;
+pub mod port;
 pub mod record;
 pub mod store;
 pub mod tenant_zero;
 pub mod transition;
+
+pub use port::{Directory, SingleTenant};
 
 #[cfg(any(test, feature = "testkit"))]
 pub mod testing;

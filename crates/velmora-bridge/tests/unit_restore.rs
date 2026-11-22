@@ -99,14 +99,10 @@ fn provision(kind: BirthKind, seq: u64) -> Unit<RusqliteSql> {
         UnixMs(BORN),
     );
     assert!(matches!(a, UnitAnswer::Ok { .. }), "{a:?}");
-    // The lease's own table (L2's migration), here by hand: no row, so
-    // the unit never issued a lease.
-    u.sql().apply(LEASE_TABLE).unwrap();
+    // The lease's own table comes with the birth (`u0002`), with no
+    // lease: the unit never issued one.
     u
 }
-
-const LEASE_TABLE: &str =
-    "CREATE TABLE unit_lease (id INTEGER PRIMARY KEY, fresh_until INTEGER, lease_hi INTEGER)";
 
 /// A born, active unit, closed for a restore at `S` at time `BORN + 1000`.
 fn closed() -> Unit<RusqliteSql> {
@@ -268,7 +264,7 @@ fn a_live_lease_or_a_later_lease_holds_the_restore_back() {
     let t = ready_at(BORN + 1000);
     u.sql()
         .apply(&format!(
-            "INSERT INTO unit_lease(id, fresh_until, lease_hi) VALUES (1, {}, {})",
+            "UPDATE unit_lease SET fresh_until = {}, lease_hi = {} WHERE id = 1",
             t + 5,
             t + 5
         ))

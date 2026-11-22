@@ -721,7 +721,7 @@ pub fn project_buckets<S: Sql>(sql: &S, buckets: &[String]) -> Result<()> {
 
 /// Rebuilds the catalogue's `access_keys` and `grants` for `touched` and
 /// every key made under one of them, down the `made_by` chains.
-fn project<S: Sql>(sql: &S, touched: &BTreeSet<String>) -> Result<()> {
+pub(crate) fn project<S: Sql>(sql: &S, touched: &BTreeSet<String>) -> Result<()> {
     let mut all: BTreeSet<String> = touched.clone();
     let mut frontier: Vec<String> = touched.iter().cloned().collect();
     for _ in 0..MAX_DEPTH {

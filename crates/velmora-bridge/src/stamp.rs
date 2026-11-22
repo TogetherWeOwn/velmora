@@ -44,6 +44,20 @@
 //! What the stamp does not see: a commit that no raise followed before
 //! the rollback (the handler was killed before its raise, or the raise
 //! failed). The operations runbook lists both cases.
+//!
+//! # One algorithm for every catalogue
+//!
+//! [`Stamp`] is the algorithm. It takes the id its objects are keyed by
+//! and the store of its counter ([`StampLedger`]) as arguments, so that
+//! tenant 0's D1 (id `main`, the counter in the `rollback_stamp` table,
+//! through [`Catalog`]) and a unit (id `<tenant>.<unit>`,
+//! [`crate::unit_lease::UnitStampId`], the counter in the unit) run the
+//! same rules (ADR-TENANCY §8.5). The methods on [`Bridge`] are tenant
+//! 0's: they build a [`Stamp`] over the catalogue and the configured
+//! `CATALOGUE_ID`.
+
+// No `Send` bound is intended (see `ports`).
+#![allow(async_fn_in_trait)]
 
 use sha2::{Digest, Sha256};
 
@@ -92,7 +106,7 @@ pub struct StampRow {
 
 /// What one raise came to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Advance {
+pub enum Advance {
     /// The check passed and the counter was moved to this value.
     Raised(u64),
     /// The check passed; another raise moved the counter up first.
@@ -123,6 +137,264 @@ fn counter_of(dir: &str, key: &str) -> Result<u64> {
         .ok_or(ERR_STAMP_KEY)
 }
 
+/// Where a catalogue keeps its stamp counter: tenant 0's D1 through
+/// [`Catalog`] ([`CatalogLedger`]), or a unit. `id` is the id the caller
+/// keys the stamp objects by; the store keeps the id its row was created
+/// with and fails every call with [`ERR_CATALOGUE_ID`] when the two
+/// differ.
+pub trait StampLedger {
+    /// The stamp row.
+    async fn stamp(&self, id: &str) -> Result<StampRow>;
+    /// Moves the counter from `from` to the next value (`None` = creates
+    /// the row at 1). `false` = the counter is not at `from`, or a
+    /// rollback is recorded: nothing changed.
+    async fn stamp_advance(&self, from: Option<u64>, id: &str) -> Result<bool>;
+    /// Records that the catalogue was found behind its stamp, if its
+    /// counter is still `seen` and no rollback is on record. `false` =
+    /// nothing was recorded; the caller reads again.
+    async fn stamp_rolled_back(&self, seen: Option<u64>, now: UnixMs, id: &str) -> Result<bool>;
+}
+
+/// Tenant 0's counter: the `rollback_stamp` table of the catalogue.
+pub struct CatalogLedger<'a, C: Catalog>(pub &'a C);
+
+impl<C: Catalog> StampLedger for CatalogLedger<'_, C> {
+    async fn stamp(&self, id: &str) -> Result<StampRow> {
+        self.0.stamp(id).await
+    }
+    async fn stamp_advance(&self, from: Option<u64>, id: &str) -> Result<bool> {
+        self.0.stamp_advance(from, id).await
+    }
+    async fn stamp_rolled_back(&self, seen: Option<u64>, now: UnixMs, id: &str) -> Result<bool> {
+        self.0.stamp_rolled_back(seen, now, id).await
+    }
+}
+
+/// The stamp of one catalogue: its counter store, the safety bucket its
+/// objects are in, a clock, and the id they are keyed by. See the
+/// [module](self).
+pub struct Stamp<'a, L: StampLedger, B: BlobStore, T: Clock> {
+    pub ledger: L,
+    pub safety: &'a B,
+    pub clock: &'a T,
+    pub id: &'a str,
+}
+
+impl<L: StampLedger, B: BlobStore, T: Clock> Stamp<'_, L, B, T> {
+    /// The stamp row. Fails if it was created under another id: see the
+    /// module text.
+    pub async fn row(&self) -> Result<StampRow> {
+        self.ledger.stamp(self.id).await
+    }
+
+    /// Whether a stamp object exists after the one of `counter`.
+    pub async fn ahead(&self, counter: Option<u64>) -> Result<bool> {
+        let dir = stamp_dir(self.id);
+        let after = match counter {
+            Some(c) => stamp_key(self.id, c),
+            None => dir.clone(),
+        };
+        Ok(!self.safety.list(&dir, &after, 1).await?.is_empty())
+    }
+
+    /// Whether the catalogue was restored to an earlier point and no
+    /// replay of the recovery records has ended since. One counter read
+    /// and one list call of the safety bucket. A rollback that is found
+    /// is recorded in the counter store.
+    ///
+    /// `Err` = the check could not be made. A caller that would delete
+    /// something treats that like `true`.
+    pub async fn rolled_back(&self) -> Result<bool> {
+        Ok(self.checked().await?.is_none())
+    }
+
+    /// [`Self::rolled_back`], with what it compared: `Some` = not rolled
+    /// back, and no stamp object exists after the one of the counter in
+    /// it (`Some(None)` = no stamp row and no stamp object). A batch that
+    /// acts on this answer holds the catalogue to that counter: a
+    /// database restored after the check is below it.
+    pub async fn checked(&self) -> Result<Option<Option<u64>>> {
+        for _ in 0..ADVANCE_ATTEMPTS {
+            let row = self.row().await?;
+            if row.rolled_back {
+                return Ok(None);
+            }
+            if !self.ahead(row.counter).await? {
+                return Ok(Some(row.counter));
+            }
+            if self.behind(row.counter).await? {
+                return Ok(None);
+            }
+        }
+        Err(BridgeError::Invalid(MOVING))
+    }
+
+    /// An object was seen after the one of `seen`. Records the rollback
+    /// if the counter still is `seen`. `false` = it is not: a raise ran
+    /// between the read of the counter and the list call, and the
+    /// object may be its own. Nothing is known then; the caller reads
+    /// again.
+    ///
+    /// With the counter unchanged the object proves a rollback: an
+    /// object is put only after the counter reached its value, and the
+    /// counter of a catalogue that was not restored never moves down.
+    async fn behind(&self, seen: Option<u64>) -> Result<bool> {
+        self.ledger
+            .stamp_rolled_back(seen, self.clock.now(), self.id)
+            .await
+    }
+
+    /// Checks, then moves the counter by one.
+    ///
+    /// `must_raise`: the caller needs the object of a new value, so a
+    /// round that another raise won is run again. Without it that round
+    /// ends the call with [`Advance::Checked`]: the check was made, and
+    /// the other raise moved the counter.
+    pub async fn advance(&self, must_raise: bool) -> Result<Advance> {
+        let mut last = BridgeError::Invalid(MOVING);
+        for _ in 0..ADVANCE_ATTEMPTS {
+            let row = match self.row().await {
+                Ok(row) => row,
+                // No other round would read anything else.
+                Err(e) if is_catalogue_id_error(&e) => return Err(e),
+                Err(e) => {
+                    last = e;
+                    continue;
+                }
+            };
+            if row.rolled_back {
+                return Ok(Advance::RolledBack);
+            }
+            // Never without the check: see the module text.
+            if self.ahead(row.counter).await? {
+                if self.behind(row.counter).await? {
+                    return Ok(Advance::RolledBack);
+                }
+                continue;
+            }
+            // An answer that was lost may have moved the counter. The
+            // next round starts from what the catalogue holds then; a
+            // value without an object is harmless.
+            match self.ledger.stamp_advance(row.counter, self.id).await {
+                Ok(true) => return Ok(Advance::Raised(row.counter.map_or(1, |c| c + 1))),
+                Ok(false) if must_raise => {}
+                // The row says what the round was lost to. A recorded
+                // rollback; another raise, which moved the counter up;
+                // or a restore of the database between the check and
+                // here, which did not: the next round's check finds it.
+                Ok(false) => {
+                    let now = self.row().await?;
+                    if now.rolled_back {
+                        return Ok(Advance::RolledBack);
+                    }
+                    if now.counter > row.counter {
+                        return Ok(Advance::Checked);
+                    }
+                }
+                Err(e) => last = e,
+            }
+        }
+        Err(last)
+    }
+
+    /// Puts the object of a value the catalogue holds.
+    pub async fn store(&self, counter: u64) -> Result<()> {
+        let key = stamp_key(self.id, counter);
+        // The body is the time of the raise: read by the last step of
+        // a replay, and by the operator who looks for the restore point.
+        let body = self.clock.now().0.to_string().into_bytes();
+        let sha: [u8; 32] = Sha256::digest(&body).into();
+        let bucket = BucketId::new("-");
+        let meta = BlobMeta {
+            bucket: &bucket,
+            extent: &ExtentId::new("rollback-stamp"),
+            cipher_sha256: &sha,
+        };
+        let mut last = Ok(());
+        for _ in 0..PUT_ATTEMPTS {
+            last = self.safety.put(&key, body.clone(), &meta).await;
+            if last.is_ok() {
+                break;
+            }
+        }
+        last
+    }
+
+    /// Raises the stamp: checks, moves the counter by compare-and-set,
+    /// then puts the object of the new value. See
+    /// [`Bridge::raise_stamp`] for where a raise is placed.
+    ///
+    /// `Err` undoes nothing. [`ERR_ROLLED_BACK`] = the catalogue is
+    /// behind its stamp (now recorded). Any other error = the stamp was
+    /// not raised after several tries.
+    pub async fn raise(&self) -> Result<()> {
+        match self.advance(true).await? {
+            Advance::Raised(counter) => self.store(counter).await,
+            // Not reached with `must_raise`.
+            Advance::Checked => Err(BridgeError::Invalid(MOVING)),
+            Advance::RolledBack => Err(ERR_ROLLED_BACK),
+        }
+    }
+
+    /// When the stamp object of `counter` was raised.
+    async fn time(&self, counter: u64) -> Result<UnixMs> {
+        let key = stamp_key(self.id, counter);
+        let body = self.safety.get(&key, None).await?.ok_or(ERR_STAMP_BODY)?;
+        std::str::from_utf8(&body)
+            .ok()
+            .and_then(|text| text.parse().ok())
+            .map(UnixMs)
+            .ok_or(ERR_STAMP_BODY)
+    }
+
+    /// For the last step of the replay that was started at `run`: the
+    /// value its end brings the counter level with, and the counter it
+    /// was chosen from. `None` = that replay must not be ended: see
+    /// [`Bridge::stamp_level`].
+    pub async fn level(&self, run: UnixMs) -> Result<Option<(u64, Option<u64>)>> {
+        for _ in 0..ADVANCE_ATTEMPTS {
+            let row = self.row().await?;
+            let top = self.top(row.counter).await?;
+            // Not behind: nothing to tell from the times. A replay that
+            // has ended and whose last step is sent again is here.
+            if top <= row.counter.unwrap_or(0) || self.time(top).await? <= run {
+                return Ok(Some((top, row.counter)));
+            }
+            // `false` = a raise ran since the row was read, and the
+            // newest object may be its own: read again.
+            if row.rolled_back || self.behind(row.counter).await? {
+                return Ok(None);
+            }
+        }
+        Err(BridgeError::Invalid(MOVING))
+    }
+
+    /// The counter of the newest stamp object, `0` when there is none.
+    /// Reads on from `counter` (the catalogue's), so that the number of
+    /// list calls follows the raises since the restore point, not the
+    /// age of the bucket.
+    async fn top(&self, counter: Option<u64>) -> Result<u64> {
+        let dir = stamp_dir(self.id);
+        let mut top = 0;
+        let mut after = match counter {
+            // The object of the counter itself may be the newest one.
+            Some(c) if c > 0 => stamp_key(self.id, c - 1),
+            _ => dir.clone(),
+        };
+        loop {
+            let page = self.safety.list(&dir, &after, TOP_PAGE).await?;
+            let Some(last) = page.last() else {
+                return Ok(top);
+            };
+            top = counter_of(&dir, last)?;
+            if (page.len() as u64) < u64::from(TOP_PAGE) {
+                return Ok(top);
+            }
+            after = last.clone();
+        }
+    }
+}
+
 impl<C, B, N, J, K, T> Bridge<C, B, N, J, K, T>
 where
     C: Catalog,
@@ -143,20 +415,21 @@ where
         &self.cfg.catalogue_id
     }
 
+    /// Tenant 0's stamp: the catalogue's counter and the configured
+    /// `CATALOGUE_ID`, asked through [`Self::catalogue_id`].
+    fn stamp(&self) -> Stamp<'_, CatalogLedger<'_, C>, B, T> {
+        Stamp {
+            ledger: CatalogLedger(&self.catalog),
+            safety: &self.safety,
+            clock: &self.clock,
+            id: self.catalogue_id(),
+        }
+    }
+
     /// The stamp row. Fails if it was created under another catalogue
     /// id: see the module text.
     pub(crate) async fn stamp_row(&self) -> Result<StampRow> {
-        self.catalog.stamp(self.catalogue_id()).await
-    }
-
-    /// Whether a stamp object exists after the one of `counter`.
-    async fn stamp_ahead(&self, counter: Option<u64>) -> Result<bool> {
-        let dir = stamp_dir(self.catalogue_id());
-        let after = match counter {
-            Some(c) => stamp_key(self.catalogue_id(), c),
-            None => dir.clone(),
-        };
-        Ok(!self.safety.list(&dir, &after, 1).await?.is_empty())
+        self.stamp().row().await
     }
 
     /// Whether the catalogue was restored to an earlier point and no
@@ -168,123 +441,23 @@ where
     /// `Err` = the check could not be made. A caller that would delete
     /// something treats that like `true`.
     pub async fn catalogue_rolled_back(&self) -> Result<bool> {
-        Ok(self.stamp_checked().await?.is_none())
+        self.stamp().rolled_back().await
     }
 
-    /// [`Self::catalogue_rolled_back`], with what it compared: `Some` =
-    /// not rolled back, and no stamp object exists after the one of the
-    /// counter in it (`Some(None)` = no stamp row and no stamp object).
-    /// A batch that acts on this answer holds the catalogue to that
-    /// counter: a database restored after the check is below it.
+    /// [`Self::catalogue_rolled_back`], with what it compared: see
+    /// [`Stamp::checked`].
     pub(crate) async fn stamp_checked(&self) -> Result<Option<Option<u64>>> {
-        for _ in 0..ADVANCE_ATTEMPTS {
-            let row = self.stamp_row().await?;
-            if row.rolled_back {
-                return Ok(None);
-            }
-            if !self.stamp_ahead(row.counter).await? {
-                return Ok(Some(row.counter));
-            }
-            if self.stamp_behind(row.counter).await? {
-                return Ok(None);
-            }
-        }
-        Err(BridgeError::Invalid(MOVING))
+        self.stamp().checked().await
     }
 
-    /// An object was seen after the one of `seen`. Records the rollback
-    /// if the counter still is `seen`. `false` = it is not: a raise ran
-    /// between the read of the counter and the list call, and the
-    /// object may be its own. Nothing is known then; the caller reads
-    /// again.
-    ///
-    /// With the counter unchanged the object proves a rollback: an
-    /// object is put only after the counter reached its value, and the
-    /// counter of a catalogue that was not restored never moves down.
-    async fn stamp_behind(&self, seen: Option<u64>) -> Result<bool> {
-        self.catalog
-            .stamp_rolled_back(seen, self.clock.now(), self.catalogue_id())
-            .await
-    }
-
-    /// Checks, then moves the counter by one.
-    ///
-    /// `must_raise`: the caller needs the object of a new value, so a
-    /// round that another raise won is run again. Without it that round
-    /// ends the call with [`Advance::Checked`]: the check was made, and
-    /// the other raise moved the counter.
+    /// Checks, then moves the counter by one: see [`Stamp::advance`].
     pub(crate) async fn stamp_advance(&self, must_raise: bool) -> Result<Advance> {
-        let mut last = BridgeError::Invalid(MOVING);
-        for _ in 0..ADVANCE_ATTEMPTS {
-            let row = match self.stamp_row().await {
-                Ok(row) => row,
-                // No other round would read anything else.
-                Err(e) if is_catalogue_id_error(&e) => return Err(e),
-                Err(e) => {
-                    last = e;
-                    continue;
-                }
-            };
-            if row.rolled_back {
-                return Ok(Advance::RolledBack);
-            }
-            // Never without the check: see the module text.
-            if self.stamp_ahead(row.counter).await? {
-                if self.stamp_behind(row.counter).await? {
-                    return Ok(Advance::RolledBack);
-                }
-                continue;
-            }
-            // An answer that was lost may have moved the counter. The
-            // next round starts from what the catalogue holds then; a
-            // value without an object is harmless.
-            match self
-                .catalog
-                .stamp_advance(row.counter, self.catalogue_id())
-                .await
-            {
-                Ok(true) => return Ok(Advance::Raised(row.counter.map_or(1, |c| c + 1))),
-                Ok(false) if must_raise => {}
-                // The row says what the round was lost to. A recorded
-                // rollback; another raise, which moved the counter up;
-                // or a restore of the database between the check and
-                // here, which did not: the next round's check finds it.
-                Ok(false) => {
-                    let now = self.stamp_row().await?;
-                    if now.rolled_back {
-                        return Ok(Advance::RolledBack);
-                    }
-                    if now.counter > row.counter {
-                        return Ok(Advance::Checked);
-                    }
-                }
-                Err(e) => last = e,
-            }
-        }
-        Err(last)
+        self.stamp().advance(must_raise).await
     }
 
     /// Puts the object of a value the catalogue holds.
     pub(crate) async fn stamp_store(&self, counter: u64) -> Result<()> {
-        let key = stamp_key(self.catalogue_id(), counter);
-        // The body is the time of the raise: read by the last step of
-        // a replay, and by the operator who looks for the restore point.
-        let body = self.clock.now().0.to_string().into_bytes();
-        let sha: [u8; 32] = Sha256::digest(&body).into();
-        let bucket = BucketId::new("-");
-        let meta = BlobMeta {
-            bucket: &bucket,
-            extent: &ExtentId::new("rollback-stamp"),
-            cipher_sha256: &sha,
-        };
-        let mut last = Ok(());
-        for _ in 0..PUT_ATTEMPTS {
-            last = self.safety.put(&key, body.clone(), &meta).await;
-            if last.is_ok() {
-                break;
-            }
-        }
-        last
+        self.stamp().store(counter).await
     }
 
     /// Raises the stamp: checks, moves the counter by compare-and-set,
@@ -307,23 +480,7 @@ where
     /// it goes on fails its request; a caller whose write is committed
     /// still answers `200`.
     pub async fn raise_stamp(&self) -> Result<()> {
-        match self.stamp_advance(true).await? {
-            Advance::Raised(counter) => self.stamp_store(counter).await,
-            // Not reached with `must_raise`.
-            Advance::Checked => Err(BridgeError::Invalid(MOVING)),
-            Advance::RolledBack => Err(ERR_ROLLED_BACK),
-        }
-    }
-
-    /// When the stamp object of `counter` was raised.
-    async fn stamp_time(&self, counter: u64) -> Result<UnixMs> {
-        let key = stamp_key(self.catalogue_id(), counter);
-        let body = self.safety.get(&key, None).await?.ok_or(ERR_STAMP_BODY)?;
-        std::str::from_utf8(&body)
-            .ok()
-            .and_then(|text| text.parse().ok())
-            .map(UnixMs)
-            .ok_or(ERR_STAMP_BODY)
+        self.stamp().raise().await
     }
 
     /// For the last step of the replay that was started at `run`: the
@@ -343,45 +500,6 @@ where
     /// With the value comes the counter it was chosen from, for
     /// [`Catalog::restore_finish`] to hold the catalogue to.
     pub(crate) async fn stamp_level(&self, run: UnixMs) -> Result<Option<(u64, Option<u64>)>> {
-        for _ in 0..ADVANCE_ATTEMPTS {
-            let row = self.stamp_row().await?;
-            let top = self.stamp_top(row.counter).await?;
-            // Not behind: nothing to tell from the times. A replay that
-            // has ended and whose last step is sent again is here.
-            if top <= row.counter.unwrap_or(0) || self.stamp_time(top).await? <= run {
-                return Ok(Some((top, row.counter)));
-            }
-            // `false` = a raise ran since the row was read, and the
-            // newest object may be its own: read again.
-            if row.rolled_back || self.stamp_behind(row.counter).await? {
-                return Ok(None);
-            }
-        }
-        Err(BridgeError::Invalid(MOVING))
-    }
-
-    /// The counter of the newest stamp object, `0` when there is none.
-    /// Reads on from `counter` (the catalogue's), so that the number of
-    /// list calls follows the raises since the restore point, not the
-    /// age of the bucket.
-    async fn stamp_top(&self, counter: Option<u64>) -> Result<u64> {
-        let dir = stamp_dir(self.catalogue_id());
-        let mut top = 0;
-        let mut after = match counter {
-            // The object of the counter itself may be the newest one.
-            Some(c) if c > 0 => stamp_key(self.catalogue_id(), c - 1),
-            _ => dir.clone(),
-        };
-        loop {
-            let page = self.safety.list(&dir, &after, TOP_PAGE).await?;
-            let Some(last) = page.last() else {
-                return Ok(top);
-            };
-            top = counter_of(&dir, last)?;
-            if (page.len() as u64) < u64::from(TOP_PAGE) {
-                return Ok(top);
-            }
-            after = last.clone();
-        }
+        self.stamp().level(run).await
     }
 }

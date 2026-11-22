@@ -11,6 +11,7 @@ use velmora_bridge::unit::{
     BirthKind, BirthToken, CallKind, ProvisionRefusal, Reader, Refused, Seqs, SyncHead, TenantId,
     TenantState, Unit, UnitAnswer, UnitCall, UnitName, UnitOp,
 };
+use velmora_bridge::unit_lease::lease::Proven;
 use velmora_bridge::{Sql, SqlValue, UnixMs};
 
 const NOW: UnixMs = UnixMs(1_795_000_000_000);
@@ -90,8 +91,26 @@ fn sync(
     u.handle(&call(CallKind::Worker, None, true, op), NOW)
 }
 
+/// The Worker's renewal at `now` (rule 12; `unit_lease_wiring.rs` holds
+/// its rules): the unit's lease then holds for T.
+fn renew(u: &Unit<RusqliteSql>, now: UnixMs) {
+    let seqs = u.head().unwrap().seqs;
+    let op = UnitOp::Renew {
+        proof_start: now,
+        proven: Proven {
+            state_seq: seqs.state_seq,
+            keys_seq: seqs.keys_seq,
+            stamp_counter: None,
+            revoked: 0,
+        },
+        revocations: Vec::new(),
+    };
+    let a = u.handle(&call(CallKind::Worker, None, true, op), now);
+    assert!(matches!(a, UnitAnswer::Ok { .. }), "renew: {a:?}");
+}
+
 /// A born, active unit at seq 3 with one bucket, one object of two
-/// extents and one key granted on the bucket.
+/// extents and one key granted on the bucket, with a fresh lease.
 fn ready() -> Unit<RusqliteSql> {
     let u = unit();
     assert!(matches!(
@@ -102,6 +121,7 @@ fn ready() -> Unit<RusqliteSql> {
         sync(&u, 3, TenantState::Active, None),
         UnitAnswer::Ok { .. }
     ));
+    renew(&u, NOW);
     u.sql()
         .apply(
             "INSERT INTO buckets(id, name, owner, bdk_wrapped, kek_version, created_at) \
@@ -1041,6 +1061,10 @@ fn the_unit_code_holds_no_key_and_reaches_for_no_io() {
     // The object class answers its own `fetch` handler; that is the way
     // in, not a request out.
     let allowed_lines = ["async fn fetch(&self", "One `POST` per call"];
+    // The alarm (rules 4 and 8) is the one place that sends to a queue
+    // and arms the alarm; it holds no key and opens no socket either.
+    let alarm_file = "alarm.rs";
+    let alarm_words = ["set_alarm", "setAlarm", "Queue"];
     let mut seen = 0;
     for dir in &dirs {
         for entry in std::fs::read_dir(dir).unwrap() {
@@ -1056,6 +1080,13 @@ fn the_unit_code_holds_no_key_and_reaches_for_no_io() {
                     continue;
                 }
                 for word in forbidden {
+                    let in_alarm = path.file_name().and_then(|f| f.to_str()) == Some(alarm_file)
+                        && path
+                            .parent()
+                            .is_some_and(|d| d.ends_with("workers/unit/src"));
+                    if in_alarm && alarm_words.contains(&word) {
+                        continue;
+                    }
                     assert!(
                         !line.contains(word),
                         "{}:{}: `{word}` in the unit's code: {line}",

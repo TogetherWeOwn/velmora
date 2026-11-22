@@ -111,7 +111,7 @@ fn a_scope_is_made_only_at_the_listed_places() {
             // of a plan.
             ("bridge/copy.rs", 2),
             // The directory of a store with one tenant.
-            ("bridge/directory.rs", 1),
+            ("bridge/directory/port.rs", 1),
             // The replay: the listing, and the plans of an extent.
             ("bridge/replay.rs", 3),
             // The reader of a queue message: the scope of tenant 0 (one,
@@ -419,9 +419,16 @@ fn the_catalogue_id_is_read_in_one_place() {
             .count(),
         1
     );
-    // The stamp is the one user of the id in the library, and it asks
-    // the accessor every time.
-    assert_eq!(all["bridge/stamp.rs"].matches(".catalogue_id()").count(), 9);
+    // The stamp is the one user of the id in the library. The bridge
+    // asks the accessor once, where it builds tenant 0's `Stamp`, and
+    // the stamp algorithm keys every row and object by that id.
+    assert_eq!(all["bridge/stamp.rs"].matches(".catalogue_id()").count(), 1);
+    assert_eq!(
+        all["bridge/stamp.rs"]
+            .matches("id: self.catalogue_id(),")
+            .count(),
+        1
+    );
     // The end of a restore makes or levels the stamp row: it asks the
     // accessor, as the stamp does that is read under that row after.
     assert_eq!(
@@ -431,7 +438,7 @@ fn the_catalogue_id_is_read_in_one_place() {
         1
     );
     assert!(!all[TENANT].contains("catalogue_id"));
-    assert!(!all["bridge/directory.rs"].contains("catalogue_id"));
+    assert!(!all["bridge/directory/port.rs"].contains("catalogue_id"));
 }
 
 /// The directory is a port and one adapter, and nothing asks it yet: no
@@ -439,7 +446,7 @@ fn the_catalogue_id_is_read_in_one_place() {
 #[test]
 fn the_directory_is_asked_by_nothing() {
     let all = all();
-    const DIRECTORY: &str = "bridge/directory.rs";
+    const DIRECTORY: &str = "bridge/directory/port.rs";
     for name in ["Directory", "SingleTenant", "directory::", ".route("] {
         let found = uses(&all, name);
         let files: Vec<&String> = found.keys().filter(|f| *f != DIRECTORY).collect();

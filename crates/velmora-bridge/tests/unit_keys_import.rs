@@ -14,6 +14,7 @@ use velmora_bridge::unit::{
     BirthKind, BirthToken, CallKind, Refused, Seqs, SyncHead, TenantId, TenantState, Unit,
     UnitAnswer, UnitCall, UnitName, UnitOp,
 };
+use velmora_bridge::unit_lease::lease::Proven;
 use velmora_bridge::{SqlValue, UnixMs};
 
 const NOW: UnixMs = UnixMs(1_795_000_000_000);
@@ -99,6 +100,21 @@ fn born() -> Unit<RusqliteSql> {
     );
     assert!(matches!(a, UnitAnswer::Ok { .. }), "{a:?}");
     assert!(matches!(sync(&u, 3, 0, None), UnitAnswer::Ok { .. }));
+    // A fresh lease (rule 12; `unit_lease_wiring.rs` holds its rules).
+    let a = worker(
+        &u,
+        UnitOp::Renew {
+            proof_start: NOW,
+            proven: Proven {
+                state_seq: 3,
+                keys_seq: 0,
+                stamp_counter: None,
+                revoked: 0,
+            },
+            revocations: Vec::new(),
+        },
+    );
+    assert!(matches!(a, UnitAnswer::Ok { .. }), "renew: {a:?}");
     u.sql()
         .apply(&format!(
             "INSERT INTO buckets(id, name, owner, bdk_wrapped, kek_version, created_at) \
