@@ -11,6 +11,14 @@
 //! takes `(rid, keys_seq)` as given; it does not call
 //! [`super::ports::KeyAdmission`].
 //!
+//! - **The reservation is the authorization.** The writer takes
+//!   `(rid, keys_seq)` as admitted: the unit's reservation must have
+//!   checked the change's bounds (the cap, and for a key the grants of the
+//!   principal it was made under, its `made_by`, whatever the request's
+//!   acting header). The writer keeps only its own rules: an explicit
+//!   acting principal other than the key's `made_by` is refused, and the
+//!   record is written only on a head equal to `keys_seq`, so the unit's
+//!   check was made on the head the record follows.
 //! - **The record is exactly `keys_seq + 1`** and carries the `rid` in its
 //!   door part ([`super::record::Rid`]). A head that moved past
 //!   `keys_seq` with no record of this `rid` answers
@@ -97,15 +105,17 @@ pub enum ReservedAnswer {
     Frozen,
     /// A change ([`KeyEnv::change_reserved`]) the head already states,
     /// from a record that does not carry the `rid`: nothing is recorded
-    /// under the reservation, and the caller releases it. The stores were
+    /// under the reservation, and the caller releases it. `seq` is the
+    /// subject's own newest record (AM-41's `if_seq`). The stores were
     /// brought to the head; `done` is whether every door store holds it
     /// (as [`KeyAnswer::Done`]).
     InHead { seq: u64, done: bool },
     /// A change ([`KeyEnv::change_reserved`]) that closes at this head (a
-    /// narrowing, a disable, a revoke, a dropped grant): not a reserved
-    /// call. Nothing is recorded; the caller releases the reservation and
-    /// sends the change through [`KeyEnv::change`], which takes none for a
-    /// closing change.
+    /// narrowing, a disable, a revoke, a dropped grant), whatever
+    /// `keys_seq` is: not a reserved call. Nothing is recorded; the caller
+    /// releases the reservation and sends the change through
+    /// [`KeyEnv::change_closing`], which records it only while it still
+    /// closes (a newer head that makes it a widening answers `Busy`).
     Closes,
 }
 
@@ -433,17 +443,6 @@ where
         if let KeyRequest::Create(subject) = request {
             return self.create_reserved(table, subject, reserved, rng).await;
         }
-        // AM-72: a re-enable answers `503` until the unit's reservation has
-        // an `Opening` for it (the unit cannot check it yet).
-        if matches!(
-            request,
-            KeyRequest::SetStatus {
-                status: SubjectStatus::Active,
-                ..
-            }
-        ) {
-            return Ok(ReservedAnswer::Busy);
-        }
         let Reserved {
             rid,
             keys_seq,
@@ -465,11 +464,36 @@ where
             return Ok(self.settle(table, &revoked, &carried, answer).await);
         }
         if table.seq() < keys_seq {
+            // The unit holds more of the chain than it can be read now.
             return Ok(ReservedAnswer::Busy);
         }
-        if table.seq() > keys_seq {
-            let _ = self.apply_all(table, &revoked).await;
-            return Ok(ReservedAnswer::Lost);
+        // The class comes from the head, whatever `keys_seq` is: a change
+        // that closes there is not a reserved call (served now, AM-72).
+        let planned = plan(self.kek, table, &revoked, request, self.limits);
+        let closes = match &planned {
+            Planned::InHead(class) => *class == Class::Closing,
+            Planned::Change(p) => p.closes(),
+            Planned::Refused(_) | Planned::Busy => false,
+        };
+        if closes {
+            return Ok(ReservedAnswer::Closes);
+        }
+        // AM-72: a re-enable answers `503` until the unit's reservation has
+        // an `Opening` for it (the unit cannot check it yet). A subject
+        // already active is the head's state (in head, below).
+        let re_enable = matches!(
+            request,
+            KeyRequest::SetStatus {
+                status: SubjectStatus::Active,
+                ..
+            }
+        );
+        if re_enable
+            && table
+                .get(id)
+                .is_some_and(|e| e.door.status != SubjectStatus::Active)
+        {
+            return Ok(ReservedAnswer::Busy);
         }
         let Ok(zero) = self.gate.zero_head().await else {
             return Ok(ReservedAnswer::Busy);
@@ -493,21 +517,27 @@ where
             // Revokes only: they close.
             Gate::ZeroRevoke | Gate::FrozenRevoke => return Ok(ReservedAnswer::Closes),
         }
-        let plan = match plan(self.kek, table, &revoked, request, self.limits) {
+        let plan = match planned {
             Planned::Refused(r) => return Ok(ReservedAnswer::Refused(r)),
             Planned::Busy => return Ok(ReservedAnswer::Busy),
             Planned::InHead(class) => {
                 let acks = self.apply_all(table, &revoked).await;
-                let seq = table.seq();
                 let done = matches!(
-                    self.answer(class, table, seq, acks).await,
+                    self.answer(class, table, table.seq(), acks).await,
                     KeyAnswer::Done { .. }
                 );
+                // The subject's own newest record (AM-41's `if_seq`).
+                let seq = table.get(id).map_or(table.seq(), |e| e.last_seq);
                 return Ok(ReservedAnswer::InHead { seq, done });
             }
-            Planned::Change(p) if p.closes() => return Ok(ReservedAnswer::Closes),
             Planned::Change(p) => p,
         };
+        if table.seq() > keys_seq {
+            // An opening change whose reservation is behind the head: the
+            // handler asks the unit again.
+            let _ = self.apply_all(table, &revoked).await;
+            return Ok(ReservedAnswer::Lost);
+        }
         let seq = keys_seq + 1;
 
         // Intent: the message is the durable part.

@@ -193,6 +193,18 @@ pub const ERR_LOCATIONS_KEK_NOT_HELD: BridgeError = BridgeError::Invalid(KEK_NOT
 
 const KEK_NOT_HELD: &str = "key location record is under a KEK version not held yet";
 
+/// Whether `e`, from [`read_locations`] or [`init_locations`], is damage
+/// (a page): a record that does not open, or does not hold a valid set.
+/// Not the not-held error, and not a store error (`Blob`, `Sql`: a
+/// failure that may pass, `503` with no page).
+pub fn is_locations_damage(e: &BridgeError) -> bool {
+    match e {
+        BridgeError::Crypto(_) => true,
+        BridgeError::Invalid(m) => *m != KEK_NOT_HELD,
+        _ => false,
+    }
+}
+
 /// Whether `e` is [`ERR_LOCATIONS_KEK_NOT_HELD`].
 pub fn is_kek_not_held(e: &BridgeError) -> bool {
     matches!(e, BridgeError::Invalid(m) if *m == KEK_NOT_HELD)
@@ -333,9 +345,10 @@ fn answer_for(head: &KeyLocations) -> InitLocations {
 ///   and answers by the rules below.
 /// - A head that opens: nothing is written; [`InitLocations::Same`] or
 ///   [`InitLocations::Differ`].
-/// - A head that does not open: an `Err`, nothing written (`503`).
-///   [`is_kek_not_held`] tells a KEK version this Worker does not hold
-///   yet (no page) from damage (a page).
+/// - A head that does not open, or a store error: an `Err`, nothing
+///   written (`503`). [`is_locations_damage`] is the one that pages;
+///   [`is_kek_not_held`] (a KEK version this Worker does not hold yet) and
+///   store errors do not.
 pub async fn init_locations<S, K, R>(store: &S, kek: &K, rng: &mut R) -> Result<InitLocations>
 where
     S: RecordStore,

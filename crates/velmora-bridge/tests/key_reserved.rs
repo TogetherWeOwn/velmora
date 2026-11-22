@@ -1428,7 +1428,11 @@ async fn a_closing_or_already_held_change_records_nothing_under_the_reservation(
             },
             ReservedAnswer::Closes,
         ),
-        (set_status(SubjectStatus::Active), ReservedAnswer::Busy),
+        // Already active: the head's state, not a re-enable.
+        (
+            set_status(SubjectStatus::Active),
+            ReservedAnswer::InHead { seq: 1, done: true },
+        ),
         (
             KeyRequest::SetGrants {
                 id: SEED.into(),
@@ -1652,4 +1656,144 @@ async fn a_create_through_change_reserved_is_the_reserved_create() {
     )
     .unwrap();
     assert_eq!((record.op, record.rid), (KeyOp::Create, Some(RID)));
+}
+
+/// Review r1 of L4-W2: the class comes from the head whatever `keys_seq`
+/// is. A closing change with a reservation behind the head answers
+/// `Closes` (never `Lost`); an in-head answer names the subject's own
+/// newest record, not the chain head.
+#[tokio::test(flavor = "current_thread")]
+async fn the_class_and_the_in_head_seq_come_from_the_head_whatever_keys_seq() {
+    let w = World::new();
+    let mut table = seed(&w).await;
+    let units = [&w.root, &w.unit2];
+    let plain = env!(w, &w.store, &AtRoot(&w.root), &units);
+    plain
+        .change(
+            &mut table,
+            "idem-other",
+            &KeyRequest::Create(principal(NEW, Some(SEED))),
+            &mut TestRng(5),
+        )
+        .await
+        .unwrap();
+    assert_eq!(w.head(), 2);
+    let env = env!(w, &w.store, &NoAdmission, &units);
+    let answer = kept(RID);
+    let puts = w.store.puts();
+    let narrow = KeyRequest::SetGrants {
+        id: SEED.into(),
+        grants: Vec::new(),
+        acting: None,
+    };
+    assert_eq!(
+        env.change_reserved(
+            &mut table,
+            &narrow,
+            reserved_at(&answer, 1),
+            &mut TestRng(6)
+        )
+        .await
+        .unwrap(),
+        ReservedAnswer::Closes
+    );
+    let same = KeyRequest::SetGrants {
+        id: SEED.into(),
+        grants: vec![rw("b_01")],
+        acting: None,
+    };
+    for keys_seq in [1, 2] {
+        assert_eq!(
+            env.change_reserved(
+                &mut table,
+                &same,
+                reserved_at(&answer, keys_seq),
+                &mut TestRng(7)
+            )
+            .await
+            .unwrap(),
+            ReservedAnswer::InHead { seq: 1, done: true }
+        );
+    }
+    assert_eq!(w.store.puts(), puts);
+    // An opening change behind the head is still `Lost`.
+    assert_eq!(
+        env.change_reserved(
+            &mut table,
+            &widen(),
+            reserved_at(&answer, 1),
+            &mut TestRng(8)
+        )
+        .await
+        .unwrap(),
+        ReservedAnswer::Lost
+    );
+    assert_eq!(w.store.puts(), puts);
+}
+
+/// Review r1 of L4-W2 (MEDIUM): `change_closing` records a closing change
+/// and never an opening one. A change classed `Closes` at an older head
+/// that a newer head makes a widening answers `Busy`, with nothing put and
+/// nothing admitted; the caller's retry reserves again.
+#[tokio::test(flavor = "current_thread")]
+async fn change_closing_never_records_an_opening_change() {
+    let w = World::new();
+    let mut table = seed(&w).await;
+    let units = [&w.root, &w.unit2];
+    // The seed principal holds b_01 and b_02.
+    let plain = env!(w, &w.store, &AtRoot(&w.root), &units);
+    assert_eq!(
+        plain
+            .change(&mut table, "idem-w", &widen(), &mut TestRng(2))
+            .await
+            .unwrap(),
+        KeyAnswer::Done { seq: 2 }
+    );
+    let env = env!(w, &w.store, &NoAdmission, &units);
+    let answer = kept(RID);
+    let to_a = KeyRequest::SetGrants {
+        id: SEED.into(),
+        grants: vec![rw("b_01")],
+        acting: None,
+    };
+    assert_eq!(
+        env.change_reserved(&mut table, &to_a, reserved_at(&answer, 2), &mut TestRng(3))
+            .await
+            .unwrap(),
+        ReservedAnswer::Closes
+    );
+    // A concurrent narrowing to b_02 only lands first.
+    let to_b = KeyRequest::SetGrants {
+        id: SEED.into(),
+        grants: vec![rw("b_02")],
+        acting: None,
+    };
+    let mut other = table.clone();
+    assert_eq!(
+        env.change_closing(&mut other, &to_b, &mut TestRng(4))
+            .await
+            .unwrap(),
+        KeyAnswer::Done { seq: 3 }
+    );
+    // Against that head, b_01 alone is a widening: nothing is recorded.
+    let puts = w.store.puts();
+    assert_eq!(
+        env.change_closing(&mut table, &to_a, &mut TestRng(5))
+            .await
+            .unwrap(),
+        KeyAnswer::Busy
+    );
+    assert_eq!(w.store.puts(), puts);
+    assert_eq!(w.head(), 3);
+    // A disable through it is recorded at the head + 1.
+    assert_eq!(
+        env.change_closing(
+            &mut table,
+            &set_status(SubjectStatus::Disabled),
+            &mut TestRng(6)
+        )
+        .await
+        .unwrap(),
+        KeyAnswer::Done { seq: 4 }
+    );
 }

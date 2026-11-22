@@ -9,8 +9,8 @@ use std::cell::Cell;
 use sha2::{Digest, Sha256};
 use velmora::rng::FillRandom;
 use velmora_bridge::keys::locations::{
-    init_locations, is_kek_not_held, locations_chain, read_locations, two_in_account,
-    write_locations, InitLocations, KeyLocation, LocationStatus,
+    init_locations, is_kek_not_held, is_locations_damage, locations_chain, read_locations,
+    two_in_account, write_locations, InitLocations, KeyLocation, LocationStatus,
 };
 use velmora_bridge::records::{MemRecords, RecordStore};
 use velmora_bridge::testkit::TestKek;
@@ -186,6 +186,7 @@ async fn a_head_that_does_not_open_fails_and_tells_not_held_from_damage() {
         .await
         .unwrap_err();
     assert!(is_kek_not_held(&err), "{err:?}");
+    assert!(!is_locations_damage(&err));
     let err = read_locations(&store, &kek, 0).await.unwrap_err();
     assert!(is_kek_not_held(&err));
     assert_eq!(store.puts(), puts);
@@ -197,6 +198,7 @@ async fn a_head_that_does_not_open_fails_and_tells_not_held_from_damage() {
     let ahead = TestKek::with_versions(3, &[(3, kek_bytes(3))]);
     let err = read_locations(&store, &ahead, 0).await.unwrap_err();
     assert!(!is_kek_not_held(&err), "{err:?}");
+    assert!(is_locations_damage(&err), "{err:?}");
 
     // Damage: a flipped byte in the record.
     let name = locations_chain().name(1);
@@ -211,5 +213,18 @@ async fn a_head_that_does_not_open_fails_and_tells_not_held_from_damage() {
         .await
         .unwrap_err();
     assert!(!is_kek_not_held(&err), "{err:?}");
+    assert!(is_locations_damage(&err), "{err:?}");
     assert_eq!(store.puts(), puts);
+
+    // A store outage is neither: `503` with no page.
+    let store = MemRecords::new();
+    store.refuse_lists(true);
+    let err = init_locations(&store, &kek, &mut TestRng(5))
+        .await
+        .unwrap_err();
+    assert!(
+        !is_kek_not_held(&err) && !is_locations_damage(&err),
+        "{err:?}"
+    );
+    assert!(store.names().is_empty());
 }
