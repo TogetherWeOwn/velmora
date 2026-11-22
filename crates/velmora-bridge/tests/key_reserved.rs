@@ -59,6 +59,9 @@ struct Target {
     /// far at that moment.
     kept: RefCell<Vec<(Rid, u16)>>,
     applied_rids: RefCell<Vec<Rid>>,
+    /// The `owner_ref` of each row, write-once (AM-72): from an open
+    /// entry's private part or a held entry's identity.
+    owners: RefCell<BTreeMap<String, String>>,
 }
 
 impl Target {
@@ -72,6 +75,7 @@ impl Target {
             rids: RefCell::new(Vec::new()),
             kept: RefCell::new(Vec::new()),
             applied_rids: RefCell::new(Vec::new()),
+            owners: RefCell::new(BTreeMap::new()),
         }
     }
 
@@ -83,6 +87,7 @@ impl Target {
         self.seq.set(0);
         self.rows.borrow_mut().clear();
         self.rids.borrow_mut().clear();
+        self.owners.borrow_mut().clear();
     }
 
     fn down_err() -> BridgeError {
@@ -129,7 +134,28 @@ impl KeyTarget for Target {
         }
         let mut rows = self.rows.borrow_mut();
         for e in entries {
-            let ApplyEntry::Subject(e) = e else { continue };
+            let (e, held_owner) = match e {
+                ApplyEntry::Subject(e) => (e, None),
+                ApplyEntry::Held { entry, owner_ref } => {
+                    assert!(
+                        entry.private.is_none(),
+                        "{}: a held entry opens",
+                        self.label
+                    );
+                    (entry, owner_ref.clone())
+                }
+                ApplyEntry::Marker { .. } => continue,
+            };
+            let owner = e
+                .private
+                .as_ref()
+                .and_then(|p| p.owner_ref.clone())
+                .or(held_owner);
+            if let Some(owner) = owner {
+                let mut owners = self.owners.borrow_mut();
+                let kept = owners.entry(e.door.id.clone()).or_insert(owner.clone());
+                assert_eq!(*kept, owner, "{}: owner_ref changed", self.label);
+            }
             if let Some(rid) = e.rid {
                 self.rids
                     .borrow_mut()
@@ -1106,4 +1132,116 @@ async fn a_subject_revoked_by_m_rk_alone_is_not_answered_as_open() {
     );
     assert_eq!(*w.root.kept.borrow(), vec![(RID, 201)]);
     assert_eq!(w.head(), 3);
+}
+
+/// The root unit's principal reservation check (D21, AM-36), as the unit
+/// makes it before a create: a live principal row (open or held) with the
+/// same `owner_ref` refuses `principal_exists` (`409`), unless it is the
+/// same principal with the same grants (`Exists`, `200`). Otherwise the
+/// reservation is admitted at the unit's `keys_seq`.
+#[derive(Debug, PartialEq, Eq)]
+enum UnitReserve {
+    Admitted { keys_seq: u64 },
+    Exists,
+    PrincipalExists,
+}
+
+fn unit_reserve(root: &Target, subject: &Subject) -> UnitReserve {
+    let Some(owner) = subject.private.owner_ref.as_deref() else {
+        return UnitReserve::Admitted {
+            keys_seq: root.seq.get(),
+        };
+    };
+    let owners = root.owners.borrow();
+    for (id, row) in root.rows.borrow().iter() {
+        let live = row.door.kind == SubjectKind::Principal
+            && row.door.status != SubjectStatus::Revoked
+            && owners.get(id).map(String::as_str) == Some(owner);
+        if !live {
+            continue;
+        }
+        return match row.door.grants == subject.door.grants && *id == subject.door.id {
+            true => UnitReserve::Exists,
+            false => UnitReserve::PrincipalExists,
+        };
+    }
+    UnitReserve::Admitted {
+        keys_seq: root.seq.get(),
+    }
+}
+
+/// AM-72 (the plane's #246 review, M2): while the directory is down a
+/// principal create lands held at the units, and the held entry keeps its
+/// `owner_ref`. So the unit's one-principal-per-member check (D21) still
+/// finds the member: a second create for it, with other grants, is
+/// refused `principal_exists` at the reservation, and nothing is recorded.
+/// Without the `owner_ref` on the held row the same check admits it (the
+/// defect).
+#[tokio::test(flavor = "current_thread")]
+async fn a_second_create_for_the_member_of_a_held_principal_is_refused() {
+    let w = World::new();
+    let mut table = seed(&w).await;
+    let units = [&w.root, &w.unit2];
+    let env = env!(w, &w.store, &NoAdmission, &units);
+    let first = principal(NEW, Some("p_0000000000000001"));
+    let member = first.private.owner_ref.clone().unwrap();
+    w.directory.down.set(true);
+    let UnitReserve::Admitted { keys_seq } = unit_reserve(&w.root, &first) else {
+        panic!("the first create is admitted");
+    };
+    let answer = kept(RID);
+    assert_eq!(
+        env.create_reserved(
+            &mut table,
+            &first,
+            Reserved {
+                rid: RID,
+                keys_seq,
+                answer: &answer,
+            },
+            &mut TestRng(2)
+        )
+        .await
+        .unwrap(),
+        ReservedAnswer::Unfinished { seq: 2 }
+    );
+    for unit in [&w.root, &w.unit2] {
+        assert!(unit.row(NEW).unwrap().private.is_none(), "{}", unit.label);
+        assert_eq!(
+            unit.owners.borrow().get(NEW),
+            Some(&member),
+            "{}: held without its owner_ref",
+            unit.label
+        );
+    }
+
+    // The second create for the same member, another principal with other
+    // grants, under another key: refused at the reservation.
+    let mut second = principal("p_0000000000000003", Some("p_0000000000000001"));
+    second.private.owner_ref = Some(member.clone());
+    second.set_grants(&[]);
+    assert_eq!(unit_reserve(&w.root, &second), UnitReserve::PrincipalExists);
+    // A retry of the first is `Exists`, not a refusal.
+    assert_eq!(unit_reserve(&w.root, &first), UnitReserve::Exists);
+    assert_eq!(w.head(), 2);
+    assert!(w.root.row("p_0000000000000003").is_none());
+    // The defect, for contrast: a held row without its owner_ref admits it.
+    w.root.owners.borrow_mut().remove(NEW);
+    assert!(matches!(
+        unit_reserve(&w.root, &second),
+        UnitReserve::Admitted { .. }
+    ));
+    w.root
+        .owners
+        .borrow_mut()
+        .insert(NEW.into(), member.clone());
+
+    // Once the directory is back the principal opens with the same owner.
+    w.directory.down.set(false);
+    assert_eq!(
+        env.finish_subject(&mut table, NEW).await.unwrap(),
+        Finished::Done { seq: 2 }
+    );
+    let row = w.root.row(NEW).unwrap();
+    assert_eq!(row.private.unwrap().owner_ref, Some(member));
 }
