@@ -164,6 +164,7 @@ fn create_pending_row() -> Row {
 enum StopAt {
     Never,
     OpenGate,
+    AfterOpenGate,
     FirstWrite,
     TenantCheck,
     TenantZeroRowSeq,
@@ -208,7 +209,7 @@ impl Pause {
             self.writes.set(self.writes.get() + 1);
         }
         let stop = match self.stop_at.get() {
-            StopAt::Never => false,
+            StopAt::Never | StopAt::AfterOpenGate => false,
             StopAt::OpenGate => io == Io::OpenGate,
             StopAt::FirstWrite => matches!(io, Io::Write | Io::OpenGate),
             StopAt::TenantCheck => io == Io::TenantCheck,
@@ -217,10 +218,14 @@ impl Pause {
             StopAt::Io(k) => call == k,
         };
         if stop {
-            self.stop_at.set(StopAt::Never);
-            self.reached.notify_one();
-            self.release.notified().await;
+            self.stop().await;
         }
+    }
+
+    async fn stop(&self) {
+        self.stop_at.set(StopAt::Never);
+        self.reached.notify_one();
+        self.release.notified().await;
     }
 
     /// Drive the pinned attempt to its stop or completion, without dropping it.
@@ -296,7 +301,14 @@ impl Sql for PausedSql<'_> {
             Io::Write
         };
         self.pause.before(io).await;
-        self.db.exec(sql, params).await
+        let changed = self.db.exec(sql, params).await?;
+        if io == Io::OpenGate
+            && changed == 1
+            && matches!(self.pause.stop_at.get(), StopAt::AfterOpenGate)
+        {
+            self.pause.stop().await;
+        }
+        Ok(changed)
     }
 
     async fn batch(&self, stmts: Vec<(&'static str, Vec<SqlValue>)>) -> Result<Vec<u64>> {
@@ -708,6 +720,47 @@ fn a_lost_open_cas_reports_moved_if_a_second_anchor_appears() {
         let mut expected = before;
         expected.anchors.push(SECOND_ANCHOR.into());
         assert_eq!(Snapshot::read(&db, &store).await, expected);
+    });
+}
+
+#[test]
+fn a_first_open_does_not_report_an_epoch_two_open_as_its_own() {
+    block_on(async {
+        let db = database();
+        let store = HookedRecords::new();
+        let dir = SqlDirectory { sql: &db };
+        seed(&store, &dir).await;
+
+        let pause = Pause::new(StopAt::AfterOpenGate);
+        let mut a = std::pin::pin!(attempt(&store, &db, &pause, A_NOW));
+        if let Some(answer) = pause.wait_or_finish(a.as_mut()).await {
+            panic!("A completed before the pause: {answer:?}");
+        }
+        assert!(gate_open_at_one(&store, &dir).await);
+
+        // A opened epoch 1. A repair advances and reopens the gate before
+        // A can confirm that its own open still holds.
+        store.plant(SECOND_ANCHOR, vec![1]);
+        assert_eq!(
+            db.exec(
+                "UPDATE directory_gate SET closed = 0, epoch = 2, opened_at = ?1 \
+                 WHERE id = 1 AND closed = 0 AND epoch = 1",
+                &[SqlValue::Int(B_NOW.0)],
+            )
+            .await
+            .unwrap(),
+            1
+        );
+        assert!(is_open(&store, &dir).await.unwrap());
+
+        pause.release.notify_one();
+        let answer = a.await.unwrap();
+        println!("first-open answer: {answer:?}");
+        assert!(
+            matches!(&answer, FirstOpenAnswer::Ran(run) if !run.opened)
+                || matches!(&answer, FirstOpenAnswer::Moved),
+            "first open claimed epoch two as its own: {answer:?}"
+        );
     });
 }
 
