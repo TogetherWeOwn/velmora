@@ -23,6 +23,11 @@ mod nntp;
 mod queues;
 mod r2;
 
+/// The unit's Durable Object class (`docs/units.md`). Exported so that
+/// a later configuration can bind it; no `wrangler.toml` declares or
+/// binds it yet, so no request reaches it.
+pub use velmora_unit_do::UnitObject;
+
 use std::cell::RefCell;
 use std::future::poll_fn;
 use std::rc::Rc;
