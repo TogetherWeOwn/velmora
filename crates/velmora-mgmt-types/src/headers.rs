@@ -1,7 +1,7 @@
 //! The header names of the contract.
 //!
 //! - [`AUTHORIZATION`]: `Bearer <service token>`. `kofra-api` picks the
-//!   token class (standard or confirmed); velmora checks the scope.
+//!   token class (standard or confirmed); the plane checks the scope.
 //! - [`ACTING_OWNER_REF`]: the member who acts, by `owner_ref`
 //!   ([`crate::ids::valid_owner_ref`]). Required on every write except
 //!   tenant create and a principal create with an empty grant list, and
