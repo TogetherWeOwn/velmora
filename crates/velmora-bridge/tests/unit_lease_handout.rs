@@ -490,3 +490,44 @@ fn the_due_time_is_bounded_and_never_late() {
     assert!(due_rows(&cat, first_free) > 0);
     assert!(rows <= u64::from(DUE_WINDOW) + 20, "{rows} rows read");
 }
+
+/// A GC window full of rows of buckets that are not disposable (they stay
+/// open for good) does not hide a later disposable row: its last `due_at`
+/// stands for the rest, held to one look per period (confirmation LOW).
+#[test]
+fn a_full_gc_window_of_other_rows_does_not_hide_a_disposable_one() {
+    let cat = catalogue(1, false);
+    // A second, disposable bucket with one extent.
+    exec(
+        &cat,
+        &format!(
+            "INSERT INTO buckets(id, name, owner, bdk_wrapped, kek_version, created_at, disposable) \
+               VALUES ('b_00000000000000e2', 'beta', 'o', x'00', 1, 1, 1); \
+             INSERT INTO extents(id, bucket_id, generation_id, state, seq, plain_offset, \
+               plain_size, cipher_size, media_header, plain_md5, plain_sha256, cipher_sha256, \
+               safety_state, created_at) \
+               VALUES ('x_d', 'b_00000000000000e2', '{G1}', 'committed', 9, 9, 1, 1, zeroblob(48), \
+                 zeroblob(16), zeroblob(32), zeroblob(32), 'held', 1);"
+        ),
+    );
+    let mut script = String::new();
+    for n in 0..510 {
+        script.push_str(&format!(
+            "INSERT INTO gc(extent_id, action, due_at) VALUES ('{}', 'delete_cache', {});",
+            ext(0),
+            1_000 + n
+        ));
+    }
+    script.push_str(
+        "INSERT INTO gc(extent_id, action, due_at) VALUES ('x_d', 'delete_cache', 5000);",
+    );
+    exec(&cat, &script);
+    let at = due_at(&cat, &ALL).unwrap().expect("not hidden");
+    assert!(at.0 <= 5_000, "{at:?}");
+    // After a look, held to one per period.
+    let h = plan(&cat, UnixMs(10_000), &ALL).unwrap();
+    assert!(h.gc_looked);
+    done(&cat, UnixMs(10_000), &h, &vec![true; h.jobs.len()]).unwrap();
+    let next = due_at(&cat, &ALL).unwrap().unwrap();
+    assert!(next.0 >= 10_000 + EVICT_MS, "{next:?}");
+}

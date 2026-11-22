@@ -171,17 +171,42 @@ pub fn due_at<S: Sql>(cat: &SqlCatalog<S>, rules: &HandoutRules) -> Result<Optio
         }
     }
     // As `gc_due(.., disposable_only = true)`, the only mode that runs,
-    // and only while it runs.
+    // and only while it runs: the earliest disposable row of a bounded
+    // window. A window full of rows that are not disposable (they stay
+    // open for good: `gc_due` skips them) stands for the rest by its last
+    // `due_at`, held to one look per eviction-check period so that it does
+    // not wake the unit every minute.
     let gc = if rules.gc {
-        one_time(
-            sql,
-            "SELECT min(g.due_at) FROM \
-               (SELECT due_at, extent_id FROM gc WHERE done_at IS NULL \
-                 ORDER BY due_at LIMIT ?1) g \
-              WHERE EXISTS (SELECT 1 FROM extents e JOIN buckets b ON b.id = e.bucket_id \
-                            WHERE e.id = g.extent_id AND b.disposable = 1)",
+        let window = poll_once(sql.query(
+            "SELECT g.due_at, EXISTS (SELECT 1 FROM extents e JOIN buckets b ON b.id = e.bucket_id \
+                                      WHERE e.id = g.extent_id AND b.disposable = 1) \
+               FROM (SELECT due_at, extent_id FROM gc WHERE done_at IS NULL \
+                      ORDER BY due_at LIMIT ?1) g",
             &[SqlValue::Int(i64::from(GC_WINDOW))],
-        )?
+        ))??;
+        let mut first = None;
+        let mut last = None;
+        for r in &window {
+            let (Some(SqlValue::Int(at)), Some(SqlValue::Int(disposable))) = (r.first(), r.get(1))
+            else {
+                return Err(decode("gc"));
+            };
+            if *disposable != 0 && first.is_none() {
+                first = Some(UnixMs(*at));
+            }
+            last = Some(UnixMs(*at));
+        }
+        match (first, last) {
+            (Some(at), _) => Some(at),
+            (None, Some(last)) if window.len() >= GC_WINDOW as usize => {
+                let looked = one_time(sql, "SELECT v FROM meta WHERE k = 'gc_looked_at'", &[])?;
+                Some(match looked {
+                    Some(at) => last.max(UnixMs(at.0.saturating_add(EVICT_EVERY_MS))),
+                    None => last,
+                })
+            }
+            _ => None,
+        }
     } else {
         None
     };
@@ -222,6 +247,8 @@ pub struct Handout {
     pub jobs: Vec<Job>,
     /// The eviction check was due: it is recorded after the sends.
     pub evict_check: bool,
+    /// GC was looked at (`GC_MODE` runs): recorded after the sends.
+    pub gc_looked: bool,
 }
 
 /// The work of a hand-out at `now` (it buries exhausted rows first, one
@@ -256,7 +283,11 @@ pub fn plan<S: Sql>(cat: &SqlCatalog<S>, now: UnixMs, rules: &HandoutRules) -> R
             });
         }
     }
-    Ok(Handout { jobs, evict_check })
+    Ok(Handout {
+        jobs,
+        evict_check,
+        gc_looked: rules.gc,
+    })
 }
 
 /// After the sends of `handout`: `sent[i]` = job `i` went to its queue.
@@ -266,6 +297,14 @@ pub fn done<S: Sql>(
     handout: &Handout,
     sent: &[bool],
 ) -> Result<()> {
+    // The GC look of this run (`due_at`'s floor for a window of rows that
+    // never close).
+    if handout.gc_looked {
+        poll_once(cat.sql.exec(
+            "INSERT OR REPLACE INTO meta(k, v) VALUES ('gc_looked_at', ?1)",
+            &[SqlValue::Int(now.0)],
+        ))??;
+    }
     let extents: Vec<ExtentId> = handout
         .jobs
         .iter()
