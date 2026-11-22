@@ -618,7 +618,7 @@ fn answer(id: &str, door: &Door, status: u16) -> std::result::Result<Answer, Sto
             let json = serde_json::to_vec(&*t).map_err(|_| internal())?;
             Ok(Answer::json(status, json))
         }
-        Read::NotFound => Ok(Answer::code(Code::ExternalRefRetired, None)),
+        Read::Unavailable => Ok(Answer::code(Code::ExternalRefRetired, None)),
         Read::NotYet => Err(unavailable()),
         Read::Damaged => Err(internal()),
     }
