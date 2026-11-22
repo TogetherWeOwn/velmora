@@ -141,16 +141,25 @@ pub struct Grant {
 // Tenants
 // ---------------------------------------------------------------------------
 
+/// The one jurisdiction milestone 1 serves (AM-58): no Durable Object
+/// jurisdiction. Also what an absent `jurisdiction` means.
+pub const JURISDICTION_NONE: &str = "none";
+
 /// `POST /v1/tenants`. Without `limits` and `rate_class`: the registry's
 /// free allowance and default class. `Idempotency-Key` = the workspace id.
 /// A create with an `external_ref` that has a tenant answers `200` with
 /// it (adopted); one whose tenant was shredded answers
 /// `409 external_ref_retired`.
+///
+/// `jurisdiction`: absent means [`JURISDICTION_NONE`] (AM-58). Milestone 1
+/// serves `none` only; any other value answers
+/// `400 jurisdiction_not_served`. `kofra-api` sends none.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TenantCreate {
     pub external_ref: String,
-    pub jurisdiction: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jurisdiction: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limits: Option<LimitsIn>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -160,7 +169,7 @@ pub struct TenantCreate {
 impl Validate for TenantCreate {
     fn validate(&self) -> Result<(), Code> {
         check(valid_external_ref(&self.external_ref))?;
-        check(valid_label(&self.jurisdiction))?;
+        check(self.jurisdiction.as_deref().is_none_or(valid_label))?;
         if let Some(l) = &self.limits {
             l.validate()?;
         }

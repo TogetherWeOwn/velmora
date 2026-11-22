@@ -299,6 +299,22 @@ fn request_checks() {
         tc(r#"{"external_ref":"ws_1","jurisdiction":"US"}"#),
         Err(Code::BadRequest)
     );
+    // AM-58: an absent jurisdiction is `none`; the shape takes any label,
+    // and velmora's handler refuses a value it does not serve.
+    assert_eq!(tc(r#"{"external_ref":"ws_1"}"#), Ok(()));
+    let absent: TenantCreate = parse_request(br#"{"external_ref":"ws_1"}"#).unwrap();
+    assert_eq!(absent.jurisdiction, None);
+    let none: TenantCreate =
+        parse_request(br#"{"external_ref":"ws_1","jurisdiction":"none"}"#).unwrap();
+    assert_eq!(
+        none.jurisdiction.as_deref(),
+        Some(velmora_mgmt_types::wire::JURISDICTION_NONE)
+    );
+    assert_eq!(
+        serde_json::to_string(&absent).unwrap(),
+        r#"{"external_ref":"ws_1"}"#,
+        "kofra-api's create body carries no jurisdiction"
+    );
     assert_eq!(
         tc(r#"{"external_ref":"ws_1","jurisdiction":"us","rate_class":"a b"}"#),
         Err(Code::BadRequest)
@@ -614,6 +630,7 @@ fn the_code_table() {
             &[
                 "bad_request",
                 "grant_limits_not_served",
+                "jurisdiction_not_served",
                 "idempotency_key_required",
                 "invalid_position",
             ][..],
@@ -698,6 +715,7 @@ fn the_kofra_api_mapping() {
     for c in [
         "bad_request",
         "grant_limits_not_served",
+        "jurisdiction_not_served",
         "idempotency_key_required",
         "unauthenticated",
         "insufficient_scope",
@@ -844,10 +862,17 @@ fn positions_of_the_lists() {
 fn the_code_table_literally() {
     use KofraMapping as K;
     use TenancyMapping as TM;
-    let table: [(&str, u16, bool, KofraMapping, TenancyMapping); 38] = [
+    let table: [(&str, u16, bool, KofraMapping, TenancyMapping); 39] = [
         ("bad_request", 400, false, K::Upstream, TM::RetryAndPage),
         (
             "grant_limits_not_served",
+            400,
+            false,
+            K::Upstream,
+            TM::RetryAndPage,
+        ),
+        (
+            "jurisdiction_not_served",
             400,
             false,
             K::Upstream,
