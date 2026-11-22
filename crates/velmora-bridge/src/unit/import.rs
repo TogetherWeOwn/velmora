@@ -90,8 +90,9 @@ impl ImportValue {
     }
 }
 
-/// One batch of one table.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// One batch of one table. `Debug` shows its shape only: rows hold
+/// object names and wrapped keys.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ImportBatch {
     pub table: ImportTable,
@@ -102,6 +103,17 @@ pub struct ImportBatch {
     /// This batch's own cursor (the tool's position in the frozen D1).
     pub cursor: String,
     pub rows: Vec<Vec<ImportValue>>,
+}
+
+impl std::fmt::Debug for ImportBatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ImportBatch")
+            .field("table", &self.table)
+            .field("after", &self.after)
+            .field("cursor", &self.cursor)
+            .field("rows", &self.rows.len())
+            .finish_non_exhaustive()
+    }
 }
 
 /// The tables an import fills.

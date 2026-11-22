@@ -24,10 +24,11 @@
 //! every principal up its `made_by` chain is `active` and not held; a
 //! grant is served only on a bucket this unit holds, only when it has no
 //! prefix, address list or expiry (the catalogue's `grants` cannot say
-//! them, so such a grant waits for the check that can), and only when
-//! every principal up the chain holds such a grant on the bucket with at
-//! least that access. Anything else is not served: the build fails
-//! toward closed.
+//! them, so such a grant waits for the check that can), and only while
+//! every principal up the chain holds such a grant on the bucket; its
+//! access is the lowest along the chain. The internal key is not served
+//! here (it signs presigned URLs only, which the catalogue's rows cannot
+//! say). Anything else is not served: the build fails toward closed.
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -235,7 +236,13 @@ pub enum Applied {
 }
 
 /// The checks that need no database.
-pub fn check_entries(from_seq: u64, entries: &[KeyEntry]) -> std::result::Result<(), KeyRefusal> {
+/// `tenant_zero`: the unit is tenant 0's, whose keys older than the key
+/// chain have no principal.
+pub fn check_entries(
+    from_seq: u64,
+    entries: &[KeyEntry],
+    tenant_zero: bool,
+) -> std::result::Result<(), KeyRefusal> {
     if entries.len() > MAX_ENTRIES {
         return Err(KeyRefusal::Malformed);
     }
@@ -248,6 +255,16 @@ pub fn check_entries(from_seq: u64, entries: &[KeyEntry]) -> std::result::Result
             return Err(KeyRefusal::Malformed);
         }
         if e.made_by.as_deref() == Some(e.id.as_str()) {
+            return Err(KeyRefusal::Malformed);
+        }
+        // A key or an app password is made under a principal (outside
+        // tenant 0's old keys); the internal key under none.
+        let principal_shape = match e.kind {
+            KeyKind::S3 | KeyKind::AppPassword => e.made_by.is_some() || tenant_zero,
+            KeyKind::Internal => e.made_by.is_none(),
+            KeyKind::Principal => true,
+        };
+        if !principal_shape {
             return Err(KeyRefusal::Malformed);
         }
         if e.secret_wrapped.is_some() != e.secret_kek_version.is_some() {
@@ -291,11 +308,12 @@ pub fn apply<S: Sql>(
     keys_seq: u64,
     from_seq: u64,
     entries: &[KeyEntry],
+    tenant_zero: bool,
 ) -> Result<Applied> {
     if from_seq > keys_seq {
         return Ok(Applied::Behind { keys_seq });
     }
-    if let Err(r) = check_entries(from_seq, entries) {
+    if let Err(r) = check_entries(from_seq, entries, tenant_zero) {
         return Ok(Applied::Refused(r));
     }
     let mut touched = BTreeSet::new();
@@ -588,7 +606,10 @@ fn build<S: Sql>(sql: &S, id: &str) -> Result<()> {
     let Some(key) = subject(sql, id)? else {
         return Ok(());
     };
-    if key.kind == KeyKind::Principal || !key.open {
+    // A principal has no secret. The internal key signs presigned URLs
+    // only, and the catalogue's `access_keys` cannot say so: it is not
+    // served from here until the request path checks the kind.
+    if matches!(key.kind, KeyKind::Principal | KeyKind::Internal) || !key.open {
         return Ok(());
     }
     let Some((secret, kek_version)) = key.secret.clone() else {
@@ -613,8 +634,18 @@ fn build<S: Sql>(sql: &S, id: &str) -> Result<()> {
     }
     let mut grants = whole_grants(sql, id)?;
     for p in &chain {
+        // The lower of the two (ADR §6.2): a key under a narrowed
+        // principal keeps what the principal still holds.
         let theirs = whole_grants(sql, p)?;
-        grants.retain(|(b, a)| theirs.iter().any(|(pb, pa)| pb == b && pa >= a));
+        grants = grants
+            .into_iter()
+            .filter_map(|(b, a)| {
+                theirs
+                    .iter()
+                    .find(|(pb, _)| *pb == b)
+                    .map(|(_, pa)| (b, a.min(*pa)))
+            })
+            .collect();
     }
     poll_once(sql.exec(
         "INSERT INTO access_keys(access_key_id, principal, secret_wrapped, kek_version, status, \

@@ -428,8 +428,9 @@ fn the_served_grant_is_the_keys_own_inside_its_principals() {
                 SubjectStatus::Active,
                 vec![grant(B1, Access::Ro), grant(b3, Access::Rw)],
             ),
-            // rw on B1 is wider than the principal's ro; B2 is not this
-            // unit's; the prefix grant on b3 cannot be stated here.
+            // rw on B1 is wider than the principal's ro: lowered to ro;
+            // B2 is not this unit's; the prefix grant on b3 cannot be
+            // stated here.
             key(
                 2,
                 SubjectStatus::Active,
@@ -437,7 +438,7 @@ fn the_served_grant_is_the_keys_own_inside_its_principals() {
             ),
         ],
     ));
-    assert_eq!(served(&u, K), (true, vec![]));
+    assert_eq!(served(&u, K), (true, vec![(B1.into(), "ro".into())]));
     ok_body(apply(
         &u,
         2,
@@ -483,6 +484,32 @@ fn the_served_grant_is_the_keys_own_inside_its_principals() {
     orphan.made_by = Some("p_missing".into());
     ok_body(apply(&u, 5, vec![orphan]));
     assert_eq!(served(&u, "AKKEYS00000000000002"), (false, vec![]));
+}
+
+#[test]
+fn a_key_needs_its_principal_and_the_internal_key_is_not_served_here() {
+    let u = born();
+    let mut lone = key(1, SubjectStatus::Active, vec![grant(B1, Access::Rw)]);
+    lone.made_by = None;
+    assert!(matches!(
+        apply(&u, 0, vec![lone]),
+        UnitAnswer::Refused {
+            reason: Refused::Keys(KeyRefusal::Malformed),
+            ..
+        }
+    ));
+    let mut internal = key(1, SubjectStatus::Active, vec![grant(B1, Access::Rw)]);
+    internal.kind = KeyKind::Internal;
+    assert!(matches!(
+        apply(&u, 0, vec![internal.clone()]),
+        UnitAnswer::Refused {
+            reason: Refused::Keys(KeyRefusal::Malformed),
+            ..
+        }
+    ));
+    internal.made_by = None;
+    ok_body(apply(&u, 0, vec![internal]));
+    assert_eq!(served(&u, K), (false, vec![]));
 }
 
 #[test]
@@ -1183,5 +1210,11 @@ fn an_import_call_reads_back_from_its_json() {
     let mut v3 = v;
     v3["op"]["head"]["extra"] = json!(1);
     assert!(serde_json::from_value::<UnitCall>(v3).is_err());
+    // Rows hold names and wrapped keys: `Debug` shows the shape only.
+    let shown = format!("{c:?}");
+    assert!(
+        !shown.contains("beta") && shown.contains("rows: 1"),
+        "{shown}"
+    );
     let _ = SqlValue::Null;
 }

@@ -126,9 +126,12 @@ key is served only while it is `active`, not held, has its secret, and
 every principal up its `made_by` chain is `active` and not held. A grant
 is served only on a bucket this unit holds, only without a prefix,
 address list or expiry (the catalogue's `grants` cannot state them; such a
-grant is not served until the check that can), and only when every
-principal up the chain holds such a grant on that bucket with at least
-that access. Everything else fails closed.
+grant is not served until the check that can), and only while every
+principal up the chain holds such a grant on that bucket; its access is
+the lowest along the chain. The internal key is not served from these
+rows: it signs presigned URLs only, which they cannot say. A key or an
+app password outside tenant 0 must name its principal. Everything else
+fails closed.
 
 ## Import
 

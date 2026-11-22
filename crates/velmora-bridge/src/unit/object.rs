@@ -577,7 +577,13 @@ impl<S: UnitSql> Unit<S> {
         let mut behind = false;
         let mut now_seqs = head.seqs;
         let mut op = || -> Result<std::result::Result<Value, Refused>> {
-            match keys::apply(sql, head.seqs.keys_seq, from_seq, entries)? {
+            match keys::apply(
+                sql,
+                head.seqs.keys_seq,
+                from_seq,
+                entries,
+                self.own.tenant.is_zero(),
+            )? {
                 Applied::Behind { .. } => {
                     behind = true;
                     Ok(Ok(Value::Null))
