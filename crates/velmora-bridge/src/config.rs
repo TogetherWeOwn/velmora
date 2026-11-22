@@ -109,6 +109,38 @@ pub enum GcMode {
     Disposable,
 }
 
+/// How long an upload part stays after it stopped being part of its
+/// upload (replaced, aborted, or left out of the part list at
+/// completion) before `GC_ORPHANS` deletes its safety copy: 31 days.
+///
+/// Requests and jobs never bring such a part back: its extent id is
+/// never issued again and only an open upload that lists an extent can
+/// publish it. A catalogue from before the drop does list it, and its
+/// upload is open there. The database can be taken back at most 30 days
+/// (D1 Time Travel), so once a part has been dropped for longer, no
+/// state the database can return to lists it. The 31st day is the
+/// margin between the clocks compared: the Worker's, which dated the
+/// drop and runs the collector, and the database's.
+///
+/// The same wait makes a deletion safe to lose: a catalogue taken back
+/// to before a part was collected still has the part dropped, with its
+/// row open, and the collector deletes the absent copy once more.
+/// And it ends every request that could still name the part: a
+/// completion that read the part list before the drop has stored its
+/// recovery record, or never will, long before the wait is over.
+///
+/// What it assumes: the database stayed on one history for that long.
+/// A restore that is undone leaves a second history that Time Travel
+/// can still return to for 30 days, with states of before the restore
+/// point in it. So the collector waits the same time once more after
+/// every replay: no claim is granted until this long after the last
+/// one ended (`sql/gc.rs`, "After a replay"). A restore that was undone
+/// before a replay ended on it, or within the minutes before the
+/// rollback stamp was next raised, leaves nothing in the catalogue to
+/// tell by: for that one the ops notes keep the rule that the switch
+/// stays off for this long ("After a restore").
+pub const ORPHAN_GRACE_MS: i64 = 31 * 24 * 60 * 60 * 1000;
+
 /// `MAINTENANCE`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Maintenance {
@@ -192,6 +224,11 @@ pub struct BridgeConfig {
     /// published. Off: their `write_intents` rows stay and can be swept
     /// later.
     pub intent_sweep: bool,
+    /// Delete the safety copies of upload parts that no upload and no
+    /// object refers to, [`ORPHAN_GRACE_MS`] after they were dropped
+    /// (`GC_ORPHANS`). Independent of `gc_mode`. Off: they stay, and a
+    /// later run with the switch on takes them.
+    pub gc_orphans: bool,
     /// Store the article plan of a new extent packed on its row
     /// (`PACKED_PLANS`, [`crate::plan`]) instead of as one row per
     /// article. Every Worker from the one that knows this switch reads
@@ -666,6 +703,11 @@ impl BridgeConfig {
             Some("on") => true,
             Some(_) => return Err(ConfigError::Invalid("INTENT_SWEEP".into())),
         };
+        let gc_orphans = match get("GC_ORPHANS").as_deref().map(str::trim) {
+            None | Some("") | Some("off") => false,
+            Some("on") => true,
+            Some(_) => return Err(ConfigError::Invalid("GC_ORPHANS".into())),
+        };
         let packed_plans = match get("PACKED_PLANS").as_deref().map(str::trim) {
             None | Some("") | Some("off") => false,
             Some("on") => true,
@@ -885,6 +927,7 @@ impl BridgeConfig {
             slice_bytes,
             max_object_extents,
             intent_sweep,
+            gc_orphans,
             packed_plans,
             parity,
             records,

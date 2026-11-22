@@ -562,6 +562,24 @@ where
         }
     }
 
+    /// Moves the row to `to`, due at `at`, and sends the job of that
+    /// stage itself. The move marks the row as sent, so the dispatcher
+    /// does not send a second job for a row that is due before the
+    /// first was delivered; a send that fails takes the mark back, and
+    /// the next dispatcher run sends the job. If the mark cannot be
+    /// taken back, or the job is lost after its send was answered, the
+    /// dispatcher sends it again when the mark has aged.
+    pub(crate) async fn advance_notify(
+        &self,
+        lease: &Lease,
+        to: OutboxStage,
+        at: UnixMs,
+    ) -> Staged<()> {
+        self.advance(lease, to, at).await?;
+        self.notify_at(lease, to, at).await;
+        Ok(())
+    }
+
     /// Queue notification for this extent, due at `at`. The outbox row
     /// is the obligation: the dispatcher sends again for one that is
     /// lost. Within the
@@ -591,10 +609,10 @@ where
                 at,
             },
         };
-        let _ = self
-            .jobs
-            .send(&job, delay_secs.min(MAX_QUEUE_DELAY_SECS))
-            .await;
+        let delay = delay_secs.min(MAX_QUEUE_DELAY_SECS);
+        if self.jobs.send(&job, delay).await.is_err() {
+            let _ = self.catalog.unmark_sent(&[job], at).await;
+        }
     }
 
     /// A backbone lacks articles. `Some` = the wait before it is read
@@ -933,9 +951,9 @@ where
             // and is the gate; this only keeps the due time right.
             let plan = self.posted_plan(extent).await?;
             let ready = self.min_age_over(extent, &plan).max(now);
-            self.advance(lease, OutboxStage::Release, ready).await?;
-            self.notify_at(lease, OutboxStage::Release, ready).await;
-            return Ok(());
+            return self
+                .advance_notify(lease, OutboxStage::Release, ready)
+                .await;
         }
         if groups.is_empty() {
             // No backbone counts toward a release: nothing was checked
@@ -1183,9 +1201,7 @@ where
     async fn back_to_verify(&self, lease: &Lease, now: UnixMs, wait_secs: u32) -> Staged<()> {
         // The move resets the resume point itself ([`Catalog::advance`]).
         let due = now.plus_secs(wait_secs);
-        self.advance(lease, OutboxStage::Verify, due).await?;
-        self.notify_at(lease, OutboxStage::Verify, due).await;
-        Ok(())
+        self.advance_notify(lease, OutboxStage::Verify, due).await
     }
 
     /// Completes the release of an extent already marked `releasing`: the

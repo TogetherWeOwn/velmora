@@ -6,7 +6,7 @@ after.
 ## Layer 1: local and deterministic
 
 ```sh
-bench/run-local.sh [--ref <git ref>] [--name <name>] [--out <dir>] [--tiny <n>] [--cpu <cpu.json>]
+bench/run-local.sh [--ref <git ref>] [--name <name>] [--out <dir>] [--tiny <n>] [--late-queue] [--cpu <cpu.json>]
 ```
 
 - Runs `crates/velmora-bridge/tests/bench_counts.rs`: the real `Bridge` over
@@ -44,6 +44,17 @@ bench/run-local.sh [--ref <git ref>] [--name <name>] [--out <dir>] [--tiny <n>] 
   objects, to see which figures grow with the size of the catalogue; without
   `--name` or `--out` such a run is named `<sha>-tiny<n>`, apart from the
   full run. `--out` and `--cpu` may be relative to the caller's directory.
+- `--late-queue` delivers every queue message of the ingest loop 360 s
+  after it is due (one dispatcher period and a minute), with the
+  dispatcher on its 5-minute clock whatever is queued: a queue with a
+  backlog, where the dispatcher sees a row a handler left due before the
+  handler's own job arrives. In the release and delete phases a queued
+  message is delivered right after the next dispatcher run, which gives
+  the same order (dispatcher first) without the fixed 360 s. The
+  counts to read are the dispatcher's messages and rows written
+  (`stage:cron`) and `outbox_empty_claims` (claims that found nothing to
+  do). Such a run is named `<sha>-late`; compare it only with another
+  late-queue run.
 - The D1 storage line of the cost model uses the fixture's average
   catalogue bytes per extent over every class, so it moves with `--tiny`
   (more small objects, more rows per byte stored); it is not the footprint
