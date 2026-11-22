@@ -208,20 +208,29 @@ check "S3 key on the S3 entry point" "$BUCKET" "$(awk '{print $NF}' <<<"$out" | 
 STEP=2-litmus
 if [[ -n ${LITMUS_ROOT:-} ]]; then
   log "running litmus"
-  set +e
+  litmus_rc=0
   # litmus writes debug.log and child.log where it runs: in the temp dir.
-  cd "$T"
-  LD_LIBRARY_PATH="$LITMUS_ROOT/usr/lib/x86_64-linux-gnu" \
-    HTDOCS="$LITMUS_ROOT/usr/share/litmus/htdocs" TESTROOT="$LITMUS_ROOT/usr/libexec/litmus" \
-    sh "$LITMUS_ROOT/usr/bin/litmus" -k "$DAV/$BUCKET/" "$APP_ID" "$APP_SECRET" >"$T/litmus.log" 2>&1
-  set -e
-  cd "$REPO_DIR"
+  (
+    cd "$T" &&
+      LD_LIBRARY_PATH="$LITMUS_ROOT/usr/lib/x86_64-linux-gnu" \
+      HTDOCS="$LITMUS_ROOT/usr/share/litmus/htdocs" TESTROOT="$LITMUS_ROOT/usr/libexec/litmus" \
+      sh "$LITMUS_ROOT/usr/bin/litmus" -k "$DAV/$BUCKET/" "$APP_ID" "$APP_SECRET"
+  ) >"$T/litmus.log" 2>&1 || litmus_rc=$?
   for s in "${SECRETS[@]}"; do sed -i "s|$s|<redacted>|g" "$T/litmus.log"; done
   cat "$T/litmus.log"
-  grep -E '^<- summary' "$T/litmus.log" | sed 's/^/litmus /'
-  # Every group ran and none failed.
-  clean=$(grep -cE "^<- summary for \`(basic|copymove|props|locks|http)': of [0-9]+ tests run: [0-9]+ passed, 0 failed" "$T/litmus.log" || true)
-  check "litmus groups with 0 failures" 5 "$clean"
+  sed -n 's/^<- summary/litmus <- summary/p' "$T/litmus.log"
+  ((litmus_rc == 0)) || fail "litmus" "exit 0" "exit $litmus_rc"
+
+  # Count and validate separately by name; two reports for one group
+  # must not stand in for a missing group or hide a failing summary.
+  for group in basic copymove props locks http; do
+    prefix="^<- summary for \`$group':"
+    summary=$(grep -E "$prefix" "$T/litmus.log" || true)
+    clean="$prefix of [0-9]+ tests run: [0-9]+ passed, 0 failed\."
+    if [[ $summary == *$'\n'* || ! $summary =~ $clean ]]; then
+      fail "litmus $group" "one summary with 0 failures" "${summary:-no summary}"
+    fi
+  done
 else
   echo "skip litmus (LITMUS_ROOT unset)"
 fi
