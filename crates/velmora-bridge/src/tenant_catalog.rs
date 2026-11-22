@@ -465,6 +465,34 @@ impl<P: UnitPort, S: Catalog> Catalog for TenantCatalog<P, S> {
     async fn gc_done(&self, id: i64, now: UnixMs) -> Result<()> {
         self.unit(JobCall::gc_done { id, now }).await
     }
+    // The orphaned-part scan (`GC_ORPHANS`, main's #166) is not a unit job
+    // call: `run_gc` runs it for tenant 0 only, so a unit has none due.
+    async fn gc_orphans_due(&self, _now: UnixMs) -> Result<bool> {
+        Ok(false)
+    }
+    async fn gc_orphans(
+        &self,
+        _now: UnixMs,
+        _cutoff: UnixMs,
+        _scan: u32,
+        _limit: u32,
+    ) -> Result<Vec<GcRow>> {
+        Err(BridgeError::NotImplemented(NOT_ON_UNIT))
+    }
+    async fn gc_orphan_claim(
+        &self,
+        rows: &[GcRow],
+        _now: UnixMs,
+        _cutoff: UnixMs,
+    ) -> (Vec<bool>, Result<()>) {
+        (
+            vec![false; rows.len()],
+            Err(BridgeError::NotImplemented(NOT_ON_UNIT)),
+        )
+    }
+    async fn gc_orphan_done(&self, _id: i64, _now: UnixMs) -> Result<()> {
+        Err(BridgeError::NotImplemented(NOT_ON_UNIT))
+    }
     async fn gc_due(&self, now: UnixMs, limit: u32, disposable_only: bool) -> Result<Vec<GcRow>> {
         self.unit(JobCall::gc_due {
             now,

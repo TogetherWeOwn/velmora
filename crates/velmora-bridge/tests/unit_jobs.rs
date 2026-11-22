@@ -268,6 +268,7 @@ impl Fx {
             inflight_budget_bytes: BUDGET,
             job_budget_bytes: BUDGET,
             gc_mode,
+            gc_orphans: false,
             hot_cap_bytes: velmora_bridge::config::DEFAULT_HOT_CAP_BYTES,
             maintenance: Maintenance::Off,
             server_side_copy: false,

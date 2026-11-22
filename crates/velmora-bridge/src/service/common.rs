@@ -404,7 +404,7 @@ pub fn claimed_access_key(cfg: &BridgeConfig, req: &S3Request) -> Option<String>
     let fields: Vec<(&str, &str)> = req
         .headers
         .iter()
-        .filter(|(n, _)| !edge_header(n))
+        .filter(|(n, _)| !crate::entry::dropped_header(n))
         .map(|(n, v)| (n.as_str(), v.as_str()))
         .collect();
     let headers = Headers::new(&fields, &policy).ok()?;
