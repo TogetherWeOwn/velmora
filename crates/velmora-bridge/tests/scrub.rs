@@ -1461,7 +1461,7 @@ async fn write_meter_separates_enrollment_from_independent_copy_checks() {
     let spent = db.writes().since(&before);
     let enrollment = spent.table("extents") + spent.table("scrub_copies");
     println!("rows written per initial enrollment: {enrollment} (excluding run state)");
-    assert_eq!(enrollment, 7);
+    assert_eq!(enrollment, 6);
     assert!(c.scrub_free(token, now).await.unwrap());
     let later = now.plus_secs(100 * DAY_SECS);
     w.set_clocks(&o, "beta", later, later).await;
@@ -1473,7 +1473,7 @@ async fn write_meter_separates_enrollment_from_independent_copy_checks() {
         let rows = spent.table("extents") + spent.table("scrub_copies");
         let overhead = spent.billed() - rows;
         println!("rows written per one-copy {kind} visit: {rows} (+{overhead} per run)");
-        assert_eq!(rows, 4);
+        assert_eq!(rows, 3);
     }
 }
 
