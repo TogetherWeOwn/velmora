@@ -1346,8 +1346,7 @@ fn the_lift_opens_one_move_report_for_the_units_entry() {
         let r = m.unit.report.borrow().clone().unwrap();
         assert_eq!((r.since, r.ordinal, r.nonce.as_str()), (m.since, 2, "n1"));
         // The lift record names the entry and the report, by the move
-        // tool; it is the record below tenant 0's flip on the owner.
-        let o = m.head(&owner()).await;
+        // tool; the move floor (b1) and tenant 0's flip follow it.
         let l = m.lift_record().await.unwrap();
         assert_eq!((l.unit, l.since_seq), (0, m.since));
         assert_eq!(l.proof.replay_id, r);
@@ -1414,7 +1413,6 @@ fn a_refused_sync_re_enters_under_a_new_entry() {
         // The first lift, the re-entry's entry, the second lift, the
         // floor, the flip.
         assert_eq!(m.records(), before + 5);
-        let o = m.head(&owner()).await;
         let l = m.lift_record().await.unwrap();
         assert!(l.since_seq > m.since);
         // The second report names the new entry.
