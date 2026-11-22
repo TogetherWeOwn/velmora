@@ -433,7 +433,11 @@ pub trait ControlIntents {
     /// stops the change before its record.
     async fn send(&self, tenant: &TenantId, chain: ControlChain, seq: u64) -> Result<()>;
     /// Writes the `pending_ops` row. Best effort: the directory may be
-    /// down, and the message does not need it.
+    /// down, and the message does not need it. On a row that exists for
+    /// `(tenant, chain, seq)` (a retry of the change), it sets the row's
+    /// time to now and its kind to `kind` (`INSERT … ON CONFLICT DO
+    /// UPDATE`, never `INSERT OR IGNORE`): the pending sweep drops only
+    /// rows noted before its cutoff (`crate::pending`).
     async fn note(
         &self,
         tenant: &TenantId,

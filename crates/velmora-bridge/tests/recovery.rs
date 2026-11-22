@@ -365,7 +365,9 @@ async fn recovery_records_survive_gc_and_eviction() {
     rig.bridge.clock.advance_secs(3 * 24 * 60 * 60);
     for _ in 0..4 {
         assert_eq!(
-            rig.bridge.run_job(&Job::Gc { v: JOB_VERSION }).await,
+            rig.bridge
+                .run_job(&TENANT_ZERO, &Job::Gc { v: JOB_VERSION })
+                .await,
             JobOutcome::Ack
         );
     }
@@ -2402,7 +2404,10 @@ async fn an_unfinished_replay_refuses_writes_without_maintenance() {
         generation: GenerationId::new(row.1.clone()),
         stage: OutboxStage::Post,
     };
-    assert_eq!(rig.bridge.run_job(&job).await, JobOutcome::Ack);
+    assert_eq!(
+        rig.bridge.run_job(&TENANT_ZERO, &job).await,
+        JobOutcome::Ack
+    );
     assert_eq!(outbox(), row);
     assert_eq!(
         rig.bridge.dispatch().await.unwrap(),
@@ -3606,6 +3611,86 @@ async fn a_replayed_plan_keeps_each_rows_yenc_form() {
     assert_eq!(ids, want);
 }
 
+/// No plan changes, so `plan_rev` is 0 or 1 (the plan_rev contract,
+/// parts 2 and 3): a plan record of a later revision is never written,
+/// and one that is found is reported unreadable and nothing is written
+/// from it.
+#[tokio::test(flavor = "current_thread")]
+async fn a_plan_record_above_revision_one_is_never_written_nor_replayed() {
+    use velmora::rng::SystemRng;
+    use velmora_bridge::crypto::{open_manifest, seal_manifest};
+
+    let rig = rig();
+    let (bucket, signer) = rig.standard(BUCKET).await;
+    let body = vec![7u8; 1_000_000];
+    rig.put(&signer, BUCKET, "two-articles", &body)
+        .await
+        .expect(200);
+    let (extent, plan) = plan_record(&rig, &bucket, "two-articles", &[None, None]).await;
+    let name = format!("m/art/{}", extent.id.as_str());
+    let sealed = rig.bridge.safety.stored(&name).unwrap().bytes;
+
+    let mut later = extent.clone();
+    later.plan_rev = 2;
+    let err = velmora_bridge::recovery::write_article_plan(
+        &rig.bridge.safety,
+        &rig.bridge.kek,
+        &Layout::flat(),
+        &later,
+        &plan,
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(err, BridgeError::Invalid(plan_rev::ERR_PLAN_REV)),
+        "{err:?}"
+    );
+    assert_eq!(rig.bridge.safety.stored(&name).unwrap().bytes, sealed);
+
+    // The same record, opened and sealed again at revision 2.
+    let mut record: Value =
+        serde_json::from_slice(&open_manifest(&rig.bridge.kek, &name, &sealed).unwrap()).unwrap();
+    assert_eq!(record["plan_rev"], json!(1));
+    record["plan_rev"] = json!(2);
+    let plain = serde_json::to_vec(&record).unwrap();
+    let resealed = seal_manifest(&rig.bridge.kek, &name, &plain, &mut SystemRng).unwrap();
+    let digest = sha256(&resealed);
+    let meta = BlobMeta {
+        bucket: &bucket.id,
+        extent: &extent.id,
+        cipher_sha256: &digest,
+    };
+    rig.bridge
+        .safety
+        .inner
+        .put(&name, resealed, &meta)
+        .await
+        .unwrap();
+
+    wipe(&rig);
+    let (report, _) = replay(&rig, UnixMs(0), ReplayLimits::default()).await;
+    assert_eq!(report.published, 1, "{report:?}");
+    assert_eq!(report.article_plans, 0, "{report:?}");
+    assert_eq!(report.unreadable, [name.as_str()], "{report:?}");
+    assert!(rig
+        .bridge
+        .catalog
+        .articles(&extent.id)
+        .await
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        count(
+            &rig,
+            &format!(
+                "SELECT plan_rev FROM extents WHERE id = '{}'",
+                extent.id.as_str()
+            )
+        ),
+        0
+    );
+}
+
 /// A plan record whose yEnc name the catalogue would refuse is reported
 /// unreadable, not skipped without a word by the replay's insert.
 #[tokio::test(flavor = "current_thread")]
@@ -3722,13 +3807,13 @@ async fn the_tenant_layout_puts_every_new_record_under_the_tenant() {
     let (flat, tenant) = by_layout(&rig);
     assert_eq!((flat.len(), tenant.len()), (2, 0), "{flat:?} {tenant:?}");
 
-    write_in(&mut rig, Layout::default_tenant());
+    write_in(&mut rig, Layout::of(&TENANT_ZERO));
     tick(&rig);
     rig.put(&signer, BUCKET, "put", b"put").await.expect(200);
     multipart(&rig, &signer, "parts", 3).await;
     copy(&rig, &signer, "put", "copy").await.expect(200);
     delete(&rig, &signer, "put").await.expect(204);
-    let (plan_of, _) = plan_record_in(&rig, &bucket, "copy", &Layout::default_tenant()).await;
+    let (plan_of, _) = plan_record_in(&rig, &bucket, "copy", &Layout::of(&TENANT_ZERO)).await;
 
     let (still, tenant) = by_layout(&rig);
     assert_eq!(still, flat, "the flat layout got nothing new");
@@ -3743,7 +3828,7 @@ async fn the_tenant_layout_puts_every_new_record_under_the_tenant() {
             Err(BridgeError::Invalid(_))
         ));
         let name = record_name(key).expect("a record name");
-        assert_eq!(name.layout, Layout::default_tenant());
+        assert_eq!(name.layout, Layout::of(&TENANT_ZERO));
         // The same name as the flat layout has, after the directory.
         assert_eq!(key[TENANT.len()..], name.flat()["m/".len()..]);
         kinds.push(name.kind);
@@ -3874,7 +3959,7 @@ async fn random_histories_in_both_layouts_replay_to_the_same_objects() {
                 if mixed && turn.roll(6) == 0 {
                     tenant = !tenant;
                     let layout = if tenant {
-                        Layout::default_tenant()
+                        Layout::of(&TENANT_ZERO)
                     } else {
                         Layout::flat()
                     };
@@ -3912,7 +3997,7 @@ async fn random_histories_in_both_layouts_replay_to_the_same_objects() {
 #[tokio::test(flavor = "current_thread")]
 async fn a_deleted_key_stays_deleted_across_the_layouts() {
     let flat = Layout::flat;
-    let tenant = Layout::default_tenant;
+    let tenant = || Layout::of(&TENANT_ZERO);
     // (key, the layout of the write, of the delete, and of a write
     // after the delete)
     let cases: [(&str, Layout, Layout, Option<Layout>); 4] = [
@@ -3973,8 +4058,8 @@ async fn a_deleted_key_stays_deleted_across_the_layouts() {
 #[tokio::test(flavor = "current_thread")]
 async fn an_article_plan_is_found_in_the_other_layout_than_its_record() {
     for (record, plan) in [
-        (Layout::flat(), Layout::default_tenant()),
-        (Layout::default_tenant(), Layout::flat()),
+        (Layout::flat(), Layout::of(&TENANT_ZERO)),
+        (Layout::of(&TENANT_ZERO), Layout::flat()),
     ] {
         let mut rig = rig();
         write_in(&mut rig, record.clone());
@@ -4033,8 +4118,8 @@ async fn an_article_plan_is_found_in_the_other_layout_than_its_record() {
 #[tokio::test(flavor = "current_thread")]
 async fn a_record_moved_to_the_other_layout_does_not_open() {
     for (from, to) in [
-        (Layout::flat(), Layout::default_tenant()),
-        (Layout::default_tenant(), Layout::flat()),
+        (Layout::flat(), Layout::of(&TENANT_ZERO)),
+        (Layout::of(&TENANT_ZERO), Layout::flat()),
     ] {
         let mut rig = rig();
         write_in(&mut rig, from.clone());
@@ -4079,7 +4164,7 @@ async fn one_id_in_both_layouts_is_replayed_once_and_reported() {
         .await
         .expect(200);
     let (live, extents) = rig.live(&bucket, "k").await.unwrap();
-    let tenant = Layout::default_tenant();
+    let tenant = Layout::of(&TENANT_ZERO);
     velmora_bridge::recovery::write_generation(
         &rig.bridge.catalog,
         &rig.bridge.safety,
@@ -4118,7 +4203,7 @@ async fn one_id_in_both_layouts_is_replayed_once_and_reported() {
 #[tokio::test(flavor = "current_thread")]
 async fn a_flat_name_that_does_not_open_does_not_hide_the_tenant_record() {
     let mut rig = rig();
-    write_in(&mut rig, Layout::default_tenant());
+    write_in(&mut rig, Layout::of(&TENANT_ZERO));
     let (bucket, signer) = rig.standard(BUCKET).await;
     rig.put(&signer, BUCKET, "kept", b"body").await.expect(200);
     tick(&rig);
@@ -4127,7 +4212,7 @@ async fn a_flat_name_that_does_not_open_does_not_hide_the_tenant_record() {
     delete(&rig, &signer, "gone").await.expect(204);
     let (flat, tenant) = by_layout(&rig);
     assert!(flat.is_empty(), "{flat:?}");
-    let root = Layout::default_tenant().root().to_owned();
+    let root = Layout::of(&TENANT_ZERO).root().to_owned();
     let mut real: Vec<String> = tenant
         .into_iter()
         .filter(|k| !k.contains("/art/"))
@@ -4183,7 +4268,7 @@ async fn a_flat_name_that_does_not_open_does_not_hide_the_tenant_record() {
 #[tokio::test(flavor = "current_thread")]
 async fn a_refused_record_of_the_tenant_layout_is_removed_under_its_name() {
     let mut rig = rig();
-    write_in(&mut rig, Layout::default_tenant());
+    write_in(&mut rig, Layout::of(&TENANT_ZERO));
     let (_, signer) = rig.standard(BUCKET).await;
     let id = create_upload(&rig, &signer, "big").await;
     let etag = upload_part(&rig, &signer, "big", &id, 1, b"part one").await;
@@ -4219,7 +4304,7 @@ async fn plan_keys_are_named_in_the_layout_asked_for() {
     use velmora_bridge::recovery::{other_plan_key, plan_keys};
 
     let plain = br#"{"extents":[{"id":"x_1"},{"id":"x_2"}]}"#;
-    let tenant = Layout::default_tenant();
+    let tenant = Layout::of(&TENANT_ZERO);
     assert_eq!(
         plan_keys(plain, &Layout::flat()).unwrap(),
         ["m/art/x_1", "m/art/x_2"]
@@ -4230,8 +4315,14 @@ async fn plan_keys_are_named_in_the_layout_asked_for() {
         [format!("{TENANT}art/x_1"), format!("{TENANT}art/x_2")]
     );
     // Each names the plan of the same extent in the other layout.
-    assert_eq!(other_plan_key("m/art/x_1"), Some(keys[0].clone()));
-    assert_eq!(other_plan_key(&keys[1]).as_deref(), Some("m/art/x_2"));
+    assert_eq!(
+        other_plan_key(&TENANT_ZERO, "m/art/x_1"),
+        Some(keys[0].clone())
+    );
+    assert_eq!(
+        other_plan_key(&TENANT_ZERO, &keys[1]).as_deref(),
+        Some("m/art/x_2")
+    );
     for none in [
         "m/g_1",
         "m/del/g_1",
@@ -4240,6 +4331,9 @@ async fn plan_keys_are_named_in_the_layout_asked_for() {
         "m/tk/t_1",
         "m/x/art/x_1",
     ] {
-        assert_eq!(other_plan_key(none), None, "{none}");
+        assert_eq!(other_plan_key(&TENANT_ZERO, none), None, "{none}");
     }
 }
+
+/// The one tenant there is.
+static TENANT_ZERO: velmora_bridge::TenantScope = velmora_bridge::TenantScope::tenant_zero();

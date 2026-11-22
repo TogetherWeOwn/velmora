@@ -310,6 +310,184 @@ where
     }
 }
 
+// ---------------------------------------------------------------------------
+// A managed tenant's request (design round 5, AM-51)
+// ---------------------------------------------------------------------------
+
+pub use common::{claimed_access_key, request_host_refused, writes_refused};
+
+impl Route<'_> {
+    /// The operation changes stored state: the maintenance gate refuses
+    /// it (`open_gate`, and for a unit `serve_managed`).
+    pub fn writes(&self) -> bool {
+        matches!(
+            self,
+            Route::CreateBucket { .. }
+                | Route::DeleteBucket { .. }
+                | Route::DeleteObjects { .. }
+                | Route::PutObject { .. }
+                | Route::DeleteObject { .. }
+                | Route::CreateMultipartUpload { .. }
+                | Route::UploadPart { .. }
+                | Route::CompleteMultipartUpload { .. }
+                | Route::AbortMultipartUpload { .. }
+        )
+    }
+
+    /// The bucket the operation names, raw.
+    pub fn bucket(&self) -> Option<&str> {
+        match *self {
+            Route::Admin { .. } | Route::ListBuckets | Route::NotImplemented => None,
+            Route::CreateBucket { bucket }
+            | Route::DeleteBucket { bucket }
+            | Route::HeadBucket { bucket }
+            | Route::GetBucketLocation { bucket }
+            | Route::ListObjects { bucket }
+            | Route::DeleteObjects { bucket }
+            | Route::ListMultipartUploads { bucket }
+            | Route::PutObject { bucket, .. }
+            | Route::GetObject { bucket, .. }
+            | Route::HeadObject { bucket, .. }
+            | Route::DeleteObject { bucket, .. }
+            | Route::CreateMultipartUpload { bucket, .. }
+            | Route::UploadPart { bucket, .. }
+            | Route::CompleteMultipartUpload { bucket, .. }
+            | Route::AbortMultipartUpload { bucket, .. }
+            | Route::ListParts { bucket, .. } => Some(bucket),
+        }
+    }
+}
+
+/// The fixed code of a managed tenant's request that the unit cannot take
+/// yet: the unit has no S3 request operations in this build.
+pub const UNIT_REQUESTS_NOT_BUILT: &str = "unit_requests_not_built";
+
+/// What became of a managed tenant's request, for the log line: a fixed
+/// code, and whether it pages.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ManagedLine {
+    pub code: &'static str,
+    pub alert: bool,
+}
+
+/// A request whose access key routes to the managed tenant `tenant`
+/// (`unit_router::KeyRoutes`), through `router` to its unit.
+///
+/// Under `MAINTENANCE=restore` a request that writes ([`Route::writes`])
+/// answers `503` with `Retry-After` before anything is read: no unit
+/// call, no head read (AM-50; DS1 §3.4 from 8(b) to step 9). Any other
+/// request is routed to its unit ([`crate::unit_router::UnitRouter::route`]);
+/// a refusal answers `503`. This build has no S3 request operations on a
+/// unit, so a routed request answers `503` ([`UNIT_REQUESTS_NOT_BUILT`])
+/// as well, and the signature is never checked: nothing is read or
+/// written for it.
+pub async fn serve_managed<R: crate::unit_router::UnitRouter>(
+    router: &R,
+    cfg: &crate::config::BridgeConfig,
+    tenant: &crate::unit::TenantId,
+    floor: crate::unit::Seqs,
+    req: &S3Request,
+) -> (S3Response, ManagedLine) {
+    let route = classify(&req.method, &req.raw_target);
+    let line = |code, alert| ManagedLine { code, alert };
+    // The host first, as on tenant 0's path: on a virtual-hosted request
+    // the path's first segment is a key, never a bucket to route by.
+    if let Some(resp) = common::request_host_refused(cfg, req) {
+        return (resp, line("host_refused", false));
+    }
+    match route {
+        Route::NotImplemented => {
+            return (
+                S3Response::not_implemented(),
+                line("not_implemented", false),
+            )
+        }
+        // The admin plane takes its bearer, never an access key.
+        Route::Admin { .. } => {
+            return (
+                common::s3_error(velmora_s3_proto::ErrorCode::AccessDenied),
+                line("admin_with_key", false),
+            )
+        }
+        _ => {}
+    }
+    if cfg.maintenance == crate::config::Maintenance::Restore && route.writes() {
+        return (writes_refused(), line("maintenance", false));
+    }
+    match router.route(tenant, route.bucket(), floor).await {
+        Err(refusal) => (
+            common::unit_refused(),
+            line(refusal.code(), refusal.alert()),
+        ),
+        Ok(_) => (common::unit_refused(), line(UNIT_REQUESTS_NOT_BUILT, false)),
+    }
+}
+
+/// What the request router does with a request, from its key's route.
+pub enum KeyDispatch {
+    /// Tenant 0's path, unchanged.
+    TenantZero,
+    /// Through the router to the tenant's unit ([`serve_managed`]).
+    Managed {
+        tenant: crate::unit::TenantId,
+        floor: crate::unit::Seqs,
+    },
+    /// Answered here: a key no route could be shown for (DUR-10).
+    Answer(S3Response, ManagedLine),
+}
+
+/// The router's dispatch of a key route read
+/// (`unit_router::KeyRoutes::tenant_of`): a managed tenant's route goes to
+/// its unit; a directory that names no route, tenant 0's path; no route
+/// after a failed directory read, or a failed route read, goes to
+/// [`serve_unrouted`] (ADR §8.4, DUR-10).
+pub async fn dispatch_key_route<C: crate::ports::Catalog>(
+    route: crate::types::Result<crate::unit_router::KeyTenant>,
+    catalog: &C,
+    access_key_id: &str,
+) -> KeyDispatch {
+    use crate::unit_router::KeyTenant;
+    match route {
+        Ok(KeyTenant::Managed { tenant, floor }) => KeyDispatch::Managed { tenant, floor },
+        Ok(KeyTenant::Zero) => KeyDispatch::TenantZero,
+        Ok(KeyTenant::Unrouted) | Err(_) => match serve_unrouted(catalog, access_key_id).await {
+            None => KeyDispatch::TenantZero,
+            Some((resp, line)) => KeyDispatch::Answer(resp, line),
+        },
+    }
+}
+
+/// A request whose claimed key no route names while the directory could
+/// not be read (`unit_router::KeyTenant::Unrouted`, or a failed route
+/// read): ADR §8.4 (DUR-10). A key tenant 0's catalogue holds takes
+/// tenant 0's path (`None`), where its signature is checked as always.
+/// Any other key, and a catalogue that cannot be read, answers `503`
+/// with `Retry-After` before the signature is checked, as tenant 0 does
+/// in a D1 outage: a route may exist that the directory could not show,
+/// so `403 InvalidAccessKeyId` would be a wrong answer.
+pub async fn serve_unrouted<C: crate::ports::Catalog>(
+    catalog: &C,
+    access_key_id: &str,
+) -> Option<(S3Response, ManagedLine)> {
+    match catalog.access_key_exists(access_key_id).await {
+        Ok(true) => None,
+        Ok(false) => Some((
+            common::unit_refused(),
+            ManagedLine {
+                code: "key_route_unreadable",
+                alert: false,
+            },
+        )),
+        Err(_) => Some((
+            common::unit_refused(),
+            ManagedLine {
+                code: "key_route_and_catalogue_unreadable",
+                alert: false,
+            },
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{classify, Route};

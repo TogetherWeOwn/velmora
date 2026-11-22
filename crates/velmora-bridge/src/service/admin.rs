@@ -769,13 +769,7 @@ async fn restore<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek,
             // is brought level with the newest stamp object.
             if !bridge
                 .catalog
-                .restore_finish(
-                    run,
-                    bridge.clock.now(),
-                    stamp,
-                    seen,
-                    &bridge.cfg.catalogue_id,
-                )
+                .restore_finish(run, bridge.clock.now(), stamp, seen, bridge.catalogue_id())
                 .await
                 .or_internal()?
             {
