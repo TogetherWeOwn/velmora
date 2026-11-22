@@ -120,6 +120,41 @@ pub fn dropped_header(name: &str) -> bool {
     edge_header(name) || name == ENTRY_HEADER
 }
 
+/// What a request's entry marker says of the management entry point.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MgmtMark {
+    /// No marker names it: the request is not the management plane's.
+    None,
+    /// Served by the management plane: exactly one marker, `mgmt`, and
+    /// no header the edge adds ([`Entry::Mgmt`]).
+    Serve,
+    /// A marker names it but the request is not [`Entry::Mgmt`] (two
+    /// markers, an edge header). Only `MgmtEntry` sets the value, since
+    /// the default entrypoint deletes every marker, so this request came
+    /// by the management entry point too: it is refused there, and never
+    /// handed to the S3 handler.
+    Refuse,
+}
+
+/// Whether a value of [`ENTRY_HEADER`] names the management entry point:
+/// the value, or any comma-separated part of it (a header sent twice
+/// arrives joined), is [`MGMT`].
+pub fn names_mgmt(value: &str) -> bool {
+    value.split(',').any(|part| part.trim() == MGMT)
+}
+
+/// What the markers of a request say of the management entry point.
+pub fn mgmt_mark(headers: &[(String, String)]) -> MgmtMark {
+    let named = headers
+        .iter()
+        .any(|(name, value)| name == ENTRY_HEADER && names_mgmt(value));
+    match (named, Entry::of(headers)) {
+        (false, _) => MgmtMark::None,
+        (true, Entry::Mgmt) => MgmtMark::Serve,
+        (true, _) => MgmtMark::Refuse,
+    }
+}
+
 impl Entry {
     /// The entry point of a request with these headers: WebDAV or the
     /// management plane only when exactly one [`ENTRY_HEADER`] says so and
@@ -197,6 +232,28 @@ mod tests {
             Entry::S3
         );
         assert_eq!(Entry::of(&h(&[("X-Velmora-Entry", MGMT)])), Entry::S3);
+        // Whatever Entry::of says, a marker that names mgmt is never S3's.
+        assert_eq!(mgmt_mark(&h(&[(ENTRY_HEADER, MGMT)])), MgmtMark::Serve);
+        for refused in [
+            h(&[(ENTRY_HEADER, MGMT), ("x-forwarded-for", "1")]),
+            h(&[(ENTRY_HEADER, MGMT), ("cf-ray", "1")]),
+            h(&[(ENTRY_HEADER, MGMT), (ENTRY_HEADER, MGMT)]),
+            h(&[(ENTRY_HEADER, MGMT), (ENTRY_HEADER, WEBDAV)]),
+            h(&[(ENTRY_HEADER, "mgmt, mgmt")]),
+            h(&[(ENTRY_HEADER, "webdav,mgmt")]),
+            h(&[(ENTRY_HEADER, " mgmt ")]),
+        ] {
+            assert_eq!(mgmt_mark(&refused), MgmtMark::Refuse, "{refused:?}");
+        }
+        for none in [
+            h(&[("host", "s3.test")]),
+            h(&[(ENTRY_HEADER, WEBDAV)]),
+            h(&[(ENTRY_HEADER, "MGMT")]),
+            h(&[(ENTRY_HEADER, "management")]),
+            h(&[("X-Velmora-Entry", MGMT)]),
+        ] {
+            assert_eq!(mgmt_mark(&none), MgmtMark::None, "{none:?}");
+        }
         for akid in ["AKVLABCDEFGH12345678", "APVLABCDEFGH12345678", ""] {
             assert!(!Entry::Mgmt.admits(akid), "{akid}");
         }

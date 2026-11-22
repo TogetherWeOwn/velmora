@@ -31,8 +31,10 @@ use std::rc::Rc;
 use std::task::{Poll, Waker};
 
 use velmora_bridge::copy::Copier;
+use velmora_bridge::entry::MgmtMark;
 use velmora_bridge::ingress;
 use velmora_bridge::keepalive;
+use velmora_bridge::mgmt::serve::{BAD_REQUEST, MISCONFIGURED};
 use velmora_bridge::{
     BridgeError, Job, JobOutcome, OutboxStage, RespBody, S3Response, UnixMs, JOB_VERSION,
 };
@@ -140,6 +142,9 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
     // Every answer for an admin route carries `no-store`, the early
     // refusals below too.
     let admin = ingress::is_admin_url(&req.inner().url());
+    // A request by the management entry point is answered by the
+    // management plane alone, its early failures too (`mgmt.rs`).
+    let by_mgmt = mgmt::marked(req.headers());
     // The ray ID: what the request is logged under, and what every
     // answer carries as `x-amz-request-id` (`S3Response::with_request_id`).
     // A request that did not come through the edge (a service binding)
@@ -198,6 +203,10 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
         Ok(bridge) => bridge,
         Err(class) => {
             console_error!("config refused: {class}");
+            if by_mgmt {
+                count(MISCONFIGURED.status, 1, 0);
+                return mgmt::response(MISCONFIGURED, &request_id);
+            }
             let resp = ingress::IngressError::Internal.response();
             count(resp.status, 1, 0);
             return Ok(early(resp));
@@ -210,15 +219,28 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
                 "{}",
                 ingress::log_line(&method, "-", e.status(), &request_id)
             );
+            if by_mgmt {
+                let answer = if e.status() < 500 {
+                    BAD_REQUEST
+                } else {
+                    MISCONFIGURED
+                };
+                count(answer.status, bridge.cfg.metrics_sample, 0);
+                return mgmt::response(answer, &request_id);
+            }
             count(e.status(), bridge.cfg.metrics_sample, 0);
             return Ok(early(e.response()));
         }
     };
     let target = incoming.req.raw_target.clone();
     // The management entry point: its own plane, never the S3 handler.
-    if velmora_bridge::entry::Entry::of(&incoming.req.headers) == velmora_bridge::entry::Entry::Mgmt
-    {
-        let answer = mgmt::answer(&env, &bridge, &method, &incoming.req).await;
+    // A marker that names it on a request it cannot serve is refused.
+    let mark = velmora_bridge::entry::mgmt_mark(&incoming.req.headers);
+    if by_mgmt || mark != MgmtMark::None {
+        let answer = match mark {
+            MgmtMark::Serve => mgmt::answer(&env, &bridge, &method, &incoming.req).await,
+            MgmtMark::Refuse | MgmtMark::None => BAD_REQUEST,
+        };
         console_log!(
             "{}",
             ingress::log_line(&method, &target, answer.status, &request_id)

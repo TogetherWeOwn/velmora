@@ -112,3 +112,13 @@ pub const MISCONFIGURED: Answer = Answer {
     code: "service_unavailable",
     retry_after: Some(crate::mgmt::gate::RETRY_AFTER_SECS),
 };
+
+/// The answer to a request that came by the management entry point but
+/// is not one this plane serves: a request target that is not origin
+/// form, or headers that say the edge (only the caller can have added
+/// them). Never handed to the S3 handler.
+pub const BAD_REQUEST: Answer = Answer {
+    status: 400,
+    code: "bad_request",
+    retry_after: None,
+};

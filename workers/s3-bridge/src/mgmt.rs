@@ -5,6 +5,7 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
+use velmora_bridge::entry::{names_mgmt, ENTRY_HEADER};
 use velmora_bridge::mgmt::serve::{serve_request, Answer, MISCONFIGURED};
 use velmora_bridge::mgmt::token::{DisabledTokens, TokenHashes};
 use velmora_bridge::S3Request;
@@ -15,6 +16,16 @@ use crate::env::WorkerBridge;
 thread_local! {
     /// The disabled tokens this isolate knows of (`m/rst/`).
     static DISABLED: Rc<RefCell<DisabledTokens>> = Rc::new(RefCell::new(DisabledTokens::default()));
+}
+
+/// Whether the request's entry marker names the management entry point,
+/// read before anything else of the request.
+pub fn marked(headers: &Headers) -> bool {
+    headers
+        .get(ENTRY_HEADER)
+        .ok()
+        .flatten()
+        .is_some_and(|value| names_mgmt(&value))
 }
 
 /// The answer to a management request.
@@ -41,6 +52,9 @@ pub fn response(answer: Answer, request_id: &str) -> Result<Response> {
     headers.set("x-request-id", request_id)?;
     if let Some(secs) = answer.retry_after {
         headers.set("retry-after", &secs.to_string())?;
+    }
+    if answer.status == 401 {
+        headers.set("www-authenticate", "Bearer")?;
     }
     Ok(Response::ok(answer.body())?
         .with_status(answer.status)
