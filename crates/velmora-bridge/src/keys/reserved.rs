@@ -41,7 +41,7 @@ use super::ports::{
 };
 use super::record::{
     key_chain, open_chain_record, open_key_record, seal_key_record_carrying, ChainRecord, KeyOp,
-    KeyTable, Rid, Subject, SubjectStatus, TkRing,
+    KeyTable, Rid, Subject, TkRing,
 };
 use super::revocations::list_tenant_revocations;
 use super::routes::{put_route, RoutePut};
@@ -86,8 +86,9 @@ pub enum ReservedAnswer {
     /// kept the answer.
     Done { seq: u64 },
     /// The record that carries the `rid` is at `seq`; a store did not
-    /// acknowledge, the subject is held closed, or the answer was not
-    /// kept. `503`; the finishers apply it.
+    /// acknowledge, the subject is held closed or revoked by an `m/rk/`
+    /// not yet recorded, or the answer was not kept. `503`; the finishers
+    /// apply it.
     Unfinished { seq: u64 },
     /// Another record took `keys_seq + 1` and none above `keys_seq`
     /// carries the `rid`: nothing of this call is recorded, and the stores
@@ -115,10 +116,12 @@ pub struct Carried {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Finished {
     /// Every door store holds the head and the subject open; `seq` is its
-    /// newest record.
+    /// newest record, and the table states the subject as the stores hold
+    /// it.
     Done { seq: u64 },
-    /// A store did not acknowledge, or the subject is held closed (its
-    /// private part does not open now).
+    /// A store did not acknowledge, the subject is held closed (its
+    /// private part does not open now), or an `m/rk/` revocation holds it
+    /// revoked before its revoke record (the finisher writes that first).
     Unfinished,
     /// The head holds no such subject.
     NotHeld,
@@ -198,7 +201,10 @@ where
         let acks = self.apply_all(table, &revoked).await;
         let seq = table.seq();
         let _ = self.answer(Class::Opening, table, seq, acks).await;
-        let open = table.get(id).is_some_and(|e| e.private.is_some());
+        // A subject an `m/rk/` revocation holds revoked, with no revoke
+        // record yet, is not answered as the table states it (`active`):
+        // the finisher records the revoke first.
+        let open = table.get(id).is_some_and(|e| e.private.is_some()) && !revoked.contains(id);
         Ok(match acks.units && acks.directory && open {
             true => Finished::Done {
                 seq: table.get(id).map_or(seq, |e| e.last_seq),
@@ -229,14 +235,14 @@ where
         let Some(mut entry) = table.get(&carried.id).cloned() else {
             return unfinished;
         };
-        if entry.private.is_none() {
+        // Held closed, or revoked by an `m/rk/` the chain does not record
+        // yet: no answer is kept for a subject the head does not state as
+        // the stores hold it.
+        if entry.private.is_none() || revoked.contains(&entry.door.id) {
             return unfinished;
         }
         entry.last_seq = seq;
         entry.rid = Some(answer.rid);
-        if revoked.contains(&entry.door.id) {
-            entry.door.status = SubjectStatus::Revoked;
-        }
         let Some(root) = self.units.first() else {
             return unfinished;
         };

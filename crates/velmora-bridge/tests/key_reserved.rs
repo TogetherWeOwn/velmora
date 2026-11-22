@@ -983,3 +983,94 @@ fn principal_ids_are_p_and_16_hex_and_no_key_takes_one() {
     assert!(seal_key("AKVL0001").is_ok());
     assert!(seal_key("p_0123456789abcdef").is_err());
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_plane_principal_is_revoked_with_its_m_rk_first() {
+    use velmora_bridge::keys::revocations::{list_tenant_revocations, tenant_revocation_name};
+    let w = World::new();
+    let mut table = seed(&w).await;
+    let units = [&w.root, &w.unit2];
+    let env = env!(w, &w.store, &NoAdmission, &units);
+    let answer = kept(RID);
+    let reserved = Reserved {
+        rid: RID,
+        keys_seq: 1,
+        answer: &answer,
+    };
+    env.create_reserved(
+        &mut table,
+        &principal(NEW, Some("p_0000000000000001")),
+        reserved,
+        &mut TestRng(2),
+    )
+    .await
+    .unwrap();
+    let env = env!(w, &w.store, &AtRoot(&w.root), &units);
+    assert_eq!(
+        env.change(
+            &mut table,
+            "idem-revoke",
+            &KeyRequest::SetStatus {
+                id: NEW.into(),
+                status: SubjectStatus::Revoked,
+            },
+            &mut TestRng(3),
+        )
+        .await
+        .unwrap(),
+        KeyAnswer::Done { seq: 3 }
+    );
+    assert!(w.store.raw(&tenant_revocation_name(&w.t, NEW)).is_some());
+    assert_eq!(
+        list_tenant_revocations(&w.store, &w.t).await.unwrap(),
+        vec![NEW.to_owned()]
+    );
+    for store in [&w.root, &w.unit2, &w.directory] {
+        assert_eq!(
+            store.row(NEW).unwrap().door.status,
+            SubjectStatus::Revoked,
+            "{}",
+            store.label
+        );
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_subject_revoked_by_m_rk_alone_is_not_answered_as_open() {
+    use velmora_bridge::keys::revocations::put_tenant_revocation;
+    let w = World::new();
+    let mut table = seed(&w).await;
+    let units = [&w.root, &w.unit2];
+    let env = env!(w, &w.store, &NoAdmission, &units);
+    let answer = kept(RID);
+    let subject = principal(NEW, Some("p_0000000000000001"));
+    let reserved = Reserved {
+        rid: RID,
+        keys_seq: 1,
+        answer: &answer,
+    };
+    w.directory.down.set(true);
+    assert_eq!(
+        env.create_reserved(&mut table, &subject, reserved, &mut TestRng(2))
+            .await
+            .unwrap(),
+        ReservedAnswer::Unfinished { seq: 2 }
+    );
+    w.directory.down.set(false);
+    // A revoke that stopped after its `m/rk/`, before its record.
+    put_tenant_revocation(&w.store, &w.kek, &w.t, NEW, 5, &mut TestRng(4))
+        .await
+        .unwrap();
+    assert_eq!(
+        env.finish_subject(&mut table, NEW).await.unwrap(),
+        Finished::Unfinished
+    );
+    assert_eq!(
+        env.create_reserved(&mut table, &subject, reserved, &mut TestRng(3))
+            .await
+            .unwrap(),
+        ReservedAnswer::Unfinished { seq: 2 }
+    );
+    assert!(w.root.kept.borrow().is_empty());
+    assert_eq!(w.root.row(NEW).unwrap().door.status, SubjectStatus::Revoked);
+}
