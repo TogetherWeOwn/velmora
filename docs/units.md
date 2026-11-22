@@ -157,13 +157,19 @@ change. In one transaction the unit:
 3. reads the row of the scope (the principal's id, or `''` for none; the
    key hash). Another fingerprint is `reused`. An `applied` row answers
    its kept answer. A `reserved` row is asked again: checked again at the
-   unit's head, answered with its own `rid` and `again`; if the check now
-   fails, the refusal leaves no row. A bound bucket reservation is
-   answered whatever its creator is now;
+   unit's head for the subject (and a bucket's unit) it holds, not for
+   ids the retry drew again, and answered with its own `rid`, `subject`
+   and `again`; if the check now fails, the refusal leaves no row (its
+   cap slot stays). A bound bucket reservation is answered whatever its
+   creator is now;
 4. otherwise: a grant change that is a narrowing of the subject's
    current grants (each new grant inside an unlimited current grant on
-   the same bucket, access no higher) is answered `narrowing` and takes
-   nothing; the acting principal must be `active`
+   the same bucket, access no higher) is answered `narrowing` with the
+   unit's `keys_seq`, and takes nothing; its record must be exactly
+   `keys_seq + 1` too, so a narrowing judged on a stale key table is
+   never recorded on a newer head. A held acting principal may narrow, a
+   disabled one may not; the internal key is refused
+   (`internal_key_refused`). Then the acting principal must be `active`
    (`acting_principal_inactive`) and not held (`503`); a principal create
    that finds a principal of that `owner_ref` that is not revoked answers
    it (`exists`: the Worker answers `200` when the grant sets are equal,
@@ -174,7 +180,9 @@ change. In one transaction the unit:
    and access; a sign-up principal without an acting principal has none);
    then the caps: 30 capped changes an hour, 50 bucket creates a day, 20
    active S3 keys and 20 app passwords (open reservations count). Then
-   the row is kept `reserved`.
+   the row is kept `reserved`, and its cap slot (`unit_cap_uses`) is
+   kept for the cap's window whatever becomes of the row; only an
+   explicit release gives it back.
 
 The answer carries the unit's `keys_seq`: the call's record is exactly
 `keys_seq + 1` and carries the `rid` in its door part. On an answer with
@@ -186,19 +194,26 @@ and keeps the answer the Worker passes with it (once; a 2xx status and a
 JSON object of at most 16 KiB with no `secret_access_key`, or none is
 kept and the Worker builds the answer from the chain). A record that
 closes or narrows a principal (any status but `active`, or a grant it
-held that the record does not hold the same) cancels that principal's
-other open reservations. A bucket reservation is bound to its creator
+held that no grant of the record covers) cancels that principal's
+other open reservations that are not bound to a creator grant. Each
+entry's reservation turns `applied` before a later entry of the same
+call is applied. A bucket reservation is bound to its creator
 grant's seq (`bind_bucket`, a compare-and-set; `release_bound`); the
 finisher's `bucket_binding` read answers `open`, `created` or `none`, and
 `none` fences the seq for good. The apply of the tenant record
 `bucket_created` turns the reservation bound to its seq into the bucket
-(`reserve::bucket_created`; the tenant-record apply calls it in its
-transaction). `release` drops a `reserved` row. Each ask sweeps first: a
+(`reserve::bucket_created`). The unit does not apply tenant-chain bucket
+records yet: until that apply exists and calls it in its transaction, a
+bucket reservation stays `reserved`, is swept after its hour (its slot
+still counts for the day), and a retry after that hour is checked again
+as a new ask. `release` drops a `reserved` row. Each ask sweeps first: a
 `reserved` row goes after 1 hour, an `applied` one 24 hours after its
 apply. `resolve_acting` reads the acting principal of `objects.list` and
 `objects.presign` (refused unless active and not held) and writes
 nothing. The reservation calls run on an open unit, `authenticated`; an
-ask needs an `active` tenant, the others run in any state.
+ask runs in every tenant state but a shred, and in a hold or a deletion
+answers only what keeps no reservation (a narrowing, a reused key, a
+kept answer; else `403`); the others run in any state.
 
 ## Key scheme
 
@@ -433,7 +448,8 @@ if its `restoring_since` is already empty, the lift landed and 8(c)
 follows; a `keys_not_applied` answer means apply the keys and send the
 `sync` again, and `stale_sync` means read the head again. Only a gate
 refusal re-enters. The unit keeps the time of that lift, and refuses a
-restore to a time before it (`before_move_lift`): a rollback into the
+restore to a time before it, or less than 60 s (est) after it, as the
+time is the lift call's clock (`before_move_lift`): a rollback into the
 move's window would bring back an unused seal. A restore to an undo
 bookmark is not compared (a bookmark names no time); a platform rollback
 of the object is outside the unit. The move's import record (the seal,
@@ -451,7 +467,8 @@ unit's `restoring` entry is set. It is the move's when the import filled
 the entry the unit is closed under: then it also needs the seal, tenant
 0's verified head moving here, not older than the import's, with `flips
 + 1` equal to the sealed ordinal, and the unit's numbers, as a `move`
-report does. Any other `recount` is the restore gate's.
+report does. Any other `recount` is the restore gate's. It writes, so it
+is an `authenticated` Worker call.
 
 A restored unit stays closed until the gate lifts it, and the gate lifts only
 on a whole, clean replay (`unit::gate`): no damaged generation, no held row

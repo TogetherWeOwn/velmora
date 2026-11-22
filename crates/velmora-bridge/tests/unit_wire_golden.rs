@@ -482,7 +482,8 @@ fn nested() -> Value {
         "reserve_refusal": every!(ReserveRefusal: CapReached, GrantNotHeld,
             GrantLimitsNotServed, TooManyGrants, ActingPrincipalUnknown,
             ActingPrincipalInactive, ActingPrincipalHeld, OwnerRefAmbiguous,
-            BucketAlreadyExists, PrincipalExists, Conflict, NotFound, RidTaken, Malformed),
+            BucketAlreadyExists, PrincipalExists, Conflict, InternalKeyRefused, NotFound, RidTaken,
+            Malformed),
         "size_refusal": every!(SizeRefusal: DatabaseFull, TooManyExtents),
         "reservation_bodies": reservation_bodies(),
     })
@@ -527,6 +528,8 @@ fn reservation_bodies() -> Value {
             again: false,
             scope: Some("p_1".into()),
             bound: None,
+            subject: Some("AKGOLDEN000000000002".into()),
+            unit: None,
         },
         Admit::Applied {
             status: Some(201),
@@ -536,7 +539,8 @@ fn reservation_bodies() -> Value {
             grant_seq: None,
         },
         Admit::Reused,
-        Admit::Narrowing,
+        Admit::Narrowing { keys_seq: 3 },
+        Admit::NotOpen,
         Admit::Exists(principal),
         Admit::Refused(ReserveRefusal::CapReached),
         Admit::RefusedDrop(ReserveRefusal::GrantNotHeld, Rid([0x44; 16])),
@@ -547,13 +551,14 @@ fn reservation_bodies() -> Value {
             Admit::Admitted { .. } => "admitted",
             Admit::Applied { .. } => "applied",
             Admit::Reused => "reused",
-            Admit::Narrowing => "narrowing",
+            Admit::Narrowing { .. } => "narrowing",
+            Admit::NotOpen => "not_open",
             Admit::Exists(_) => "exists",
             Admit::Refused(_) => "refused",
             Admit::RefusedDrop(..) => "refused_drop",
         });
     }
-    assert_eq!(kinds.len(), 7);
+    assert_eq!(kinds.len(), 8);
     let bindings = [
         Binding::Open {
             rid: Rid([0x47; 16]),

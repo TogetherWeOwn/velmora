@@ -24,7 +24,10 @@
 //!    alone, and the caps, then keeps a `reserved` row.
 //!
 //! The answer carries the unit's `keys_seq`: the call's record must be
-//! exactly `keys_seq + 1` (SEC-2). The key-chain apply turns the row
+//! exactly `keys_seq + 1` (SEC-2). So does a `narrowing` answer, which
+//! keeps nothing. A re-ask is checked, and answered, for the subject the
+//! reservation holds. In a held or deleting tenant only what keeps no
+//! reservation is answered; a shred refuses every ask. The key-chain apply turns the row
 //! `applied` when it applies a record that carries the row's `rid`, and
 //! keeps the answer the Worker passes with it (2xx, a JSON object of at
 //! most 16 KiB, no `secret_access_key`). A record that closes or narrows
@@ -274,9 +277,11 @@ pub enum ReserveRefusal {
     /// Another call holds the `owner_ref` for a principal create:
     /// `409 principal_exists`.
     PrincipalExists,
-    /// The id the call would make exists, or the subject cannot be
-    /// changed here (the internal key): `409 conflict`.
+    /// The id the call would make exists: `409 conflict`.
     Conflict,
+    /// A grant change of the internal key, which no token of this plane
+    /// may change (SEC-8): `403 internal_key_refused`.
+    InternalKeyRefused,
     /// The subject of a grant change is not held, or is revoked:
     /// `404 key_not_found`.
     NotFound,
@@ -313,12 +318,18 @@ pub enum Admit {
     /// Reserved (or asked again with `again`): the record must be
     /// `keys_seq + 1` and carry `rid`. `scope`: the acting principal's
     /// id. `bound`: the creator-grant seq a bucket create bound.
+    /// `subject` and `unit`: what the reservation holds (the key or
+    /// principal id, the subject of a grant change; a bucket's unit). A
+    /// call asked again uses them, not ids it drew again: the row turns
+    /// `applied` only by a record for its own subject.
     Admitted {
         rid: Rid,
         keys_seq: u64,
         again: bool,
         scope: Option<String>,
         bound: Option<u64>,
+        subject: Option<String>,
+        unit: Option<u32>,
     },
     /// The row was applied: the answer kept (none yet, if the record was
     /// applied without one), and what the call made.
@@ -331,9 +342,17 @@ pub enum Admit {
     },
     /// The same key with another request: no row, no record.
     Reused,
-    /// The grant change is a narrowing: it takes no reservation and no
-    /// cap (a closing change, §2.5).
-    Narrowing,
+    /// The grant change is a narrowing of the subject's grants at the
+    /// unit's `keys_seq`: it takes no reservation and no cap (a closing
+    /// change, §2.5). Its record must be exactly `keys_seq + 1`, so a
+    /// narrowing judged on a stale key table is never recorded on a newer
+    /// head (a lost put asks again).
+    Narrowing {
+        keys_seq: u64,
+    },
+    /// The tenant's state refuses an opening ask (`403`): a hold or a
+    /// deletion refuses opening writes only. Nothing is kept.
+    NotOpen,
     /// A principal that is not revoked already holds the `owner_ref`
     /// (AM-36): `200` with it when the grant sets are equal, else
     /// `409 principal_exists`, decided by the Worker.
@@ -355,9 +374,11 @@ impl Admit {
                 again,
                 scope,
                 bound,
+                subject,
+                unit,
             } => json!({ "admitted": {
                 "rid": rid.hex(), "keys_seq": keys_seq, "again": again,
-                "scope": scope, "bound": bound,
+                "scope": scope, "bound": bound, "subject": subject, "unit": unit,
             }}),
             Admit::Applied {
                 status,
@@ -370,9 +391,9 @@ impl Admit {
                 "bucket": bucket, "grant_seq": grant_seq,
             }}),
             Admit::Reused => json!({ "reused": true }),
-            Admit::Narrowing => json!({ "narrowing": true }),
+            Admit::Narrowing { keys_seq } => json!({ "narrowing": { "keys_seq": keys_seq } }),
             Admit::Exists(p) => json!({ "exists": p }),
-            Admit::Refused(_) | Admit::RefusedDrop(..) => return None,
+            Admit::Refused(_) | Admit::RefusedDrop(..) | Admit::NotOpen => return None,
         })
     }
 }
@@ -617,6 +638,10 @@ fn count<S: Sql>(sql: &S, text: &'static str, params: &[SqlValue]) -> Result<i64
 /// `applied` 24 hours after the apply. Inside the caller's transaction.
 pub fn sweep<S: Sql>(sql: &S, now: UnixMs) -> Result<u64> {
     poll_once(sql.exec(
+        "DELETE FROM unit_cap_uses WHERE at <= ?1",
+        &[SqlValue::Int(now.0.saturating_sub(DAY_MS))],
+    ))??;
+    poll_once(sql.exec(
         "DELETE FROM unit_reservations \
           WHERE (state = 'reserved' AND reserved_at <= ?1) \
              OR (state = 'applied' AND applied_at <= ?2)",
@@ -637,12 +662,16 @@ struct Stored {
     bound: Option<u64>,
     bucket_id: Option<String>,
     answer: Option<(u16, String)>,
+    owner_ref: Option<String>,
+    name: Option<String>,
+    unit: Option<u32>,
 }
 
 fn stored<S: Sql>(sql: &S, scope: &str, key_hash: &Hash32) -> Result<Option<Stored>> {
     let rows = poll_once(sql.query(
         "SELECT fingerprint, rid, class, state, subject, bound, bucket_id, answer_status, \
-           answer_body FROM unit_reservations WHERE scope = ?1 AND key_hash = ?2",
+           answer_body, owner_ref, name, unit FROM unit_reservations \
+          WHERE scope = ?1 AND key_hash = ?2",
         &[
             SqlValue::Text(scope.to_string()),
             SqlValue::Blob(key_hash.0.to_vec()),
@@ -691,12 +720,56 @@ fn row_stored(r: Row) -> Result<Stored> {
         bound,
         bucket_id: text(&r[6])?,
         answer,
+        owner_ref: text(&r[9])?,
+        name: text(&r[10])?,
+        unit: match &r[11] {
+            SqlValue::Null => None,
+            SqlValue::Int(n) => Some(u32::try_from(*n).map_err(|_| decode("unit"))?),
+            _ => return Err(decode("unit_reservations unit")),
+        },
     })
 }
 
+impl Stored {
+    /// The ask's change with what this reservation holds in place of the
+    /// ids the call drew: a re-ask is checked for its own subject.
+    fn opening(&self, asked: &Opening) -> Result<Opening> {
+        let missing = || decode("unit_reservations held values");
+        Ok(match asked {
+            Opening::Key { kind, grants, .. } => Opening::Key {
+                kind: *kind,
+                id: self.subject.clone().ok_or_else(missing)?,
+                grants: grants.clone(),
+            },
+            Opening::Principal { grants, .. } => Opening::Principal {
+                id: self.subject.clone().ok_or_else(missing)?,
+                owner_ref: self.owner_ref.clone().ok_or_else(missing)?,
+                grants: grants.clone(),
+            },
+            Opening::Grants { grants, .. } => Opening::Grants {
+                subject: self.subject.clone().ok_or_else(missing)?,
+                grants: grants.clone(),
+            },
+            Opening::Bucket { .. } => Opening::Bucket {
+                name: self.name.clone().ok_or_else(missing)?,
+                unit: self.unit.ok_or_else(missing)?,
+            },
+        })
+    }
+}
+
 /// One ask (module doc), inside the caller's transaction. `keys_seq` is
-/// the unit's own. A refusal writes nothing; the caller rolls back.
-pub fn admit<S: Sql>(sql: &S, keys_seq: u64, ask: &Ask, now: UnixMs) -> Result<Admit> {
+/// the unit's own; `may_open`: the tenant's state allows opening writes
+/// (`active`). Otherwise only what keeps no reservation is answered (a
+/// narrowing, a reused key, a kept answer). A refusal writes nothing; the
+/// caller rolls back.
+pub fn admit<S: Sql>(
+    sql: &S,
+    keys_seq: u64,
+    may_open: bool,
+    ask: &Ask,
+    now: UnixMs,
+) -> Result<Admit> {
     if let Err(r) = shape(ask) {
         return Ok(Admit::Refused(r));
     }
@@ -723,6 +796,9 @@ pub fn admit<S: Sql>(sql: &S, keys_seq: u64, ask: &Ask, now: UnixMs) -> Result<A
                 grant_seq: row.bound,
             });
         }
+        if !may_open {
+            return Ok(Admit::NotOpen);
+        }
         // A bound bucket reservation is answered so whatever its creator
         // is now: its creator grant was recorded first (`bind_bucket`).
         if row.bound.is_some() {
@@ -732,10 +808,18 @@ pub fn admit<S: Sql>(sql: &S, keys_seq: u64, ask: &Ask, now: UnixMs) -> Result<A
                 again: true,
                 scope: Some(scope),
                 bound: row.bound,
+                subject: None,
+                unit: row.unit,
             });
         }
-        // Asked again: checked again at the head (§2.5 step 0, SEC-2).
-        let checked = check(sql, ask, acting.as_ref(), Some(&row.rid))?;
+        // Asked again: checked again at the head (§2.5 step 0, SEC-2),
+        // for what the reservation holds.
+        let held = row.opening(ask.opening)?;
+        let again = Ask {
+            opening: &held,
+            ..*ask
+        };
+        let checked = check(sql, &again, acting.as_ref(), Some(&row.rid))?;
         if let Err(r) = checked {
             return Ok(Admit::RefusedDrop(r, row.rid));
         }
@@ -749,21 +833,35 @@ pub fn admit<S: Sql>(sql: &S, keys_seq: u64, ask: &Ask, now: UnixMs) -> Result<A
             again: true,
             scope: acting.map(|p| p.id),
             bound: None,
+            subject: row.subject,
+            unit: row.unit,
         });
     }
     // A grant change that narrows takes no reservation (SEC-8): it is a
-    // closing change, which a held principal may make too.
+    // closing change, which a held principal may make too, and in any
+    // tenant state but a shred; a disabled one may not.
     if let Opening::Grants { subject, grants } = ask.opening {
         match subject_of(sql, subject)? {
             None | Some((_, SubjectStatus::Revoked)) => {
                 return Ok(Admit::Refused(ReserveRefusal::NotFound))
             }
-            Some((KeyKind::Internal, _)) => return Ok(Admit::Refused(ReserveRefusal::Conflict)),
+            Some((KeyKind::Internal, _)) => {
+                return Ok(Admit::Refused(ReserveRefusal::InternalKeyRefused))
+            }
             Some(_) => {}
         }
         if narrowing(sql, subject, grants)? {
-            return Ok(Admit::Narrowing);
+            if acting
+                .as_ref()
+                .is_some_and(|p| p.status != SubjectStatus::Active)
+            {
+                return Ok(Admit::Refused(ReserveRefusal::ActingPrincipalInactive));
+            }
+            return Ok(Admit::Narrowing { keys_seq });
         }
+    }
+    if !may_open {
+        return Ok(Admit::NotOpen);
     }
     if let Some(p) = &acting {
         if let Err(r) = open(p) {
@@ -784,7 +882,8 @@ pub fn admit<S: Sql>(sql: &S, keys_seq: u64, ask: &Ask, now: UnixMs) -> Result<A
     }
     if exists(
         sql,
-        "SELECT 1 FROM unit_reservations WHERE rid = ?1",
+        "SELECT 1 FROM unit_reservations WHERE rid = ?1 \
+         UNION ALL SELECT 1 FROM unit_cap_uses WHERE rid = ?1",
         &[SqlValue::Blob(ask.rid.0.to_vec())],
     )? {
         return Ok(Admit::Refused(ReserveRefusal::RidTaken));
@@ -830,12 +929,28 @@ pub fn admit<S: Sql>(sql: &S, keys_seq: u64, ask: &Ask, now: UnixMs) -> Result<A
             SqlValue::Int(now.0),
         ],
     ))??;
+    // The cap slot, kept for its window (`unit_cap_uses`).
+    poll_once(sql.exec(
+        "INSERT INTO unit_cap_uses(rid, class, at) VALUES (?1, ?2, ?3)",
+        &[
+            SqlValue::Blob(ask.rid.0.to_vec()),
+            SqlValue::Text(ask.opening.class().into()),
+            SqlValue::Int(now.0),
+        ],
+    ))??;
+    let (subject, unit) = match ask.opening {
+        Opening::Key { id, .. } | Opening::Principal { id, .. } => (Some(id.clone()), None),
+        Opening::Grants { subject, .. } => (Some(subject.clone()), None),
+        Opening::Bucket { unit, .. } => (None, Some(*unit)),
+    };
     Ok(Admit::Admitted {
         rid: *ask.rid,
         keys_seq,
         again: false,
         scope: acting.map(|p| p.id),
         bound: None,
+        subject,
+        unit,
     })
 }
 
@@ -873,7 +988,7 @@ fn check<S: Sql>(
         }
         Opening::Grants { subject, .. } => match subject_of(sql, subject)? {
             None | Some((_, SubjectStatus::Revoked)) => return Ok(Err(NotFound)),
-            Some((KeyKind::Internal, _)) => return Ok(Err(Conflict)),
+            Some((KeyKind::Internal, _)) => return Ok(Err(InternalKeyRefused)),
             Some(_) => {}
         },
         Opening::Bucket { name, .. } => {
@@ -929,8 +1044,7 @@ fn caps<S: Sql>(
     if let Opening::Bucket { .. } = opening {
         let day = count(
             sql,
-            "SELECT count(*) FROM unit_reservations \
-              WHERE state IN ('reserved', 'applied') AND reserved_at > ?1 AND class = 'bucket'",
+            "SELECT count(*) FROM unit_cap_uses WHERE at > ?1 AND class = 'bucket'",
             &[SqlValue::Int(now.0.saturating_sub(DAY_MS))],
         )?;
         return Ok(if day >= BUCKETS_PER_DAY {
@@ -941,8 +1055,7 @@ fn caps<S: Sql>(
     }
     let hour = count(
         sql,
-        "SELECT count(*) FROM unit_reservations \
-          WHERE state IN ('reserved', 'applied') AND reserved_at > ?1 AND class <> 'bucket'",
+        "SELECT count(*) FROM unit_cap_uses WHERE at > ?1 AND class <> 'bucket'",
         &[SqlValue::Int(now.0.saturating_sub(HOUR_MS))],
     )?;
     if hour >= CHANGES_PER_HOUR {
@@ -971,12 +1084,20 @@ fn caps<S: Sql>(
 
 /// Drops the `reserved` row `rid`: a call that ends with no record
 /// (`release`), or a re-ask refused at the head. An applied or missing
-/// one changes nothing.
-pub fn release<S: Sql>(sql: &S, rid: &Rid) -> Result<bool> {
+/// one changes nothing. `free_slot`: the call ended with no record, so its
+/// cap slot is given back too; a re-ask's refusal keeps it (its record may
+/// exist after a lost answer).
+pub fn release<S: Sql>(sql: &S, rid: &Rid, free_slot: bool) -> Result<bool> {
     let n = poll_once(sql.exec(
         "DELETE FROM unit_reservations WHERE rid = ?1 AND state = 'reserved'",
         &[SqlValue::Blob(rid.0.to_vec())],
     ))??;
+    if n == 1 && free_slot {
+        poll_once(sql.exec(
+            "DELETE FROM unit_cap_uses WHERE rid = ?1",
+            &[SqlValue::Blob(rid.0.to_vec())],
+        ))??;
+    }
     Ok(n == 1)
 }
 
@@ -1050,6 +1171,13 @@ pub fn release_bound<S: Sql>(sql: &S, rid: &Rid, bound: Option<u64>) -> Result<b
             bound.map_or(Ok(SqlValue::Null), int)?,
         ],
     ))??;
+    // The create ended with no bucket: its slot is given back.
+    if n == 1 {
+        poll_once(sql.exec(
+            "DELETE FROM unit_cap_uses WHERE rid = ?1",
+            &[SqlValue::Blob(rid.0.to_vec())],
+        ))??;
+    }
     Ok(n == 1)
 }
 
@@ -1199,7 +1327,8 @@ pub fn keep_answer<S: Sql>(sql: &S, rid: &Rid, status: u16, body: &str) -> Resul
 /// the one whose record this is.
 pub fn cancel_open<S: Sql>(sql: &S, principal: &str, except: Option<&Rid>) -> Result<u64> {
     poll_once(sql.exec(
-        "DELETE FROM unit_reservations WHERE scope = ?1 AND state = 'reserved' AND rid IS NOT ?2",
+        "DELETE FROM unit_reservations \
+          WHERE scope = ?1 AND state = 'reserved' AND bound IS NULL AND rid IS NOT ?2",
         &[
             SqlValue::Text(principal.into()),
             except.map_or(SqlValue::Null, |r| SqlValue::Blob(r.0.to_vec())),
@@ -1244,6 +1373,33 @@ mod tests {
         assert!(!keepable(200, "not json"));
         let big = format!("{{\"a\":\"{}\"}}", "x".repeat(MAX_ANSWER));
         assert!(!keepable(200, &big));
+    }
+
+    #[test]
+    fn an_unknown_field_is_refused_in_every_new_shape() {
+        for text in [
+            r#"{"class":"bucket","name":"abc","unit":0,"x":1}"#,
+            r#"{"class":"key","kind":"s3","id":"AK","grants":[],"x":1}"#,
+            r#"{"class":"grants","subject":"AK","grants":[{"bucket_id":"b","access":"ro","x":1}]}"#,
+        ] {
+            assert!(serde_json::from_str::<Opening>(text).is_err(), "{text}");
+        }
+        assert!(serde_json::from_str::<Acting>(r#"{"owner_ref":"m","x":1}"#).is_err());
+        assert!(
+            serde_json::from_str::<Opening>(r#"{"class":"bucket","name":"abc","unit":0}"#).is_ok()
+        );
+    }
+
+    #[test]
+    fn debug_shows_no_owner_ref() {
+        let a = Acting::OwnerRef("member-secretive".into());
+        assert!(!format!("{a:?}").contains("secretive"));
+        let o = Opening::Principal {
+            id: "p".into(),
+            owner_ref: "member-secretive".into(),
+            grants: vec![],
+        };
+        assert!(!format!("{o:?}").contains("secretive"));
     }
 
     #[test]

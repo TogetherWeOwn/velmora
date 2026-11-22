@@ -17,7 +17,9 @@ use velmora_bridge::unit::lift::{
     ids_hash, ClassProof, FindingList, GateRefusal, GateSummary, LiftProof, ReplayId,
 };
 use velmora_bridge::unit::recount::{RecountCall, RecountRefusal};
-use velmora_bridge::unit::restore::{Bookmark, PitrStep, RestoreRefusal, RestoreTarget};
+use velmora_bridge::unit::restore::{
+    Bookmark, PitrStep, RestoreRefusal, RestoreTarget, LIFT_SLACK_MS,
+};
 use velmora_bridge::unit::{
     BirthKind, BirthToken, CallKind, Refused, Seqs, SyncHead, TenantId, TenantState, Unit,
     UnitAnswer, UnitCall, UnitName, UnitOp,
@@ -889,6 +891,18 @@ fn a_restore_born_unit_lifts_a_move_only_with_its_counters_on() {
         refusal(&worker(&u, start(Some(moving(10))))),
         Some((Refused::Identity(Refusal::StaleJob), false))
     );
+    // It writes: an unauthenticated call is refused (rule 11).
+    let mut unauthenticated = call_on(
+        &own(),
+        CallKind::Worker,
+        Some(u.head().unwrap().seqs),
+        start(Some(moving(10))),
+    );
+    unauthenticated.authenticated = false;
+    assert_eq!(
+        refusal(&u.handle(&unauthenticated, NOW)),
+        Some((Refused::Unauthenticated, false))
+    );
     let started = ok(numbered(&u, start(Some(moving(10)))));
     assert_eq!(started["started"], json!(true));
     let mut on = false;
@@ -955,12 +969,16 @@ fn a_restore_born_unit_lifts_a_move_only_with_its_counters_on() {
             other => panic!("armed: {other:?}"),
         }
     };
+    // The lift's time is its call's clock: a margin after it is refused too.
+    for at_ms in [NOW.0 - 1, NOW.0, NOW.0 + LIFT_SLACK_MS - 1] {
+        assert_eq!(
+            restore(at_ms),
+            Some((Refused::Restore(RestoreRefusal::BeforeMoveLift), false)),
+            "{at_ms}"
+        );
+    }
     assert_eq!(
-        restore(NOW.0 - 1),
-        Some((Refused::Restore(RestoreRefusal::BeforeMoveLift), false))
-    );
-    assert_eq!(
-        restore(NOW.0),
+        restore(NOW.0 + LIFT_SLACK_MS),
         Some((Refused::Restore(RestoreRefusal::LeaseUnknown), false))
     );
 }

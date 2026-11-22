@@ -162,6 +162,21 @@ impl KeyGrant {
     pub(crate) fn whole(&self) -> bool {
         self.prefix.is_none() && self.ip_list.is_empty() && self.expires_at.is_none()
     }
+
+    /// Whether this grant allows everything `other` allows: the same
+    /// bucket, access no lower, and each limit absent or no narrower
+    /// (the same prefix, an expiry no earlier, the same address list).
+    pub(crate) fn covers(&self, other: &KeyGrant) -> bool {
+        self.bucket_id == other.bucket_id
+            && self.access >= other.access
+            && (self.prefix.is_none() || self.prefix == other.prefix)
+            && match (self.expires_at, other.expires_at) {
+                (None, _) => true,
+                (Some(mine), Some(theirs)) => mine >= theirs,
+                (Some(_), None) => false,
+            }
+            && (self.ip_list.is_empty() || self.ip_list == other.ip_list)
+    }
 }
 
 /// One subject as of one record of the key chain: the Worker's
@@ -355,7 +370,7 @@ pub fn apply<S: Sql>(
         return Ok(Applied::Refused(r));
     }
     let mut touched = BTreeSet::new();
-    let (mut applied, mut skipped) = (0, 0);
+    let (mut applied, mut skipped, mut reserved) = (0, 0, 0);
     for e in entries {
         let row = stored(sql, &e.id)?;
         // What a principal held before this record: a record that closes
@@ -365,7 +380,9 @@ pub fn apply<S: Sql>(
                 let before = grants_of(sql, &e.id)?;
                 let kept = e.status == SubjectStatus::Active
                     && r.status == SubjectStatus::Active
-                    && before.iter().all(|g| e.grants.contains(g));
+                    && before
+                        .iter()
+                        .all(|old| e.grants.iter().any(|new| new.covers(old)));
                 if !kept && (e.last_seq > r.last_seq || e.status == SubjectStatus::Revoked) {
                     reserve::cancel_open(sql, &e.id, e.rid.as_ref())?;
                 }
@@ -393,16 +410,16 @@ pub fn apply<S: Sql>(
         } else {
             skipped += 1;
         }
-    }
-    project(sql, &touched)?;
-    let mut reserved = 0;
-    for e in entries {
+        // The unit holds this record now (written here or before): its
+        // reservation is applied before a later entry of the same call
+        // can cancel it.
         if let Some(rid) = &e.rid {
             if reserve::applied(sql, rid, &e.id, now)? {
                 reserved += 1;
             }
         }
     }
+    project(sql, &touched)?;
     let mut kept = 0;
     for a in answers {
         if reserve::keep_answer(sql, &a.rid, a.status, &a.body)? {

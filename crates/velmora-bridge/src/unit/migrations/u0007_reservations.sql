@@ -58,6 +58,17 @@ CREATE INDEX unit_reservations_by_owner_ref ON unit_reservations(owner_ref)
   WHERE owner_ref IS NOT NULL;
 CREATE INDEX unit_reservations_by_scope ON unit_reservations(scope, state);
 
+-- The cap slots taken (ADR §6.3): one per new reservation, kept for the
+-- cap's window (an hour, a day for a bucket create) whatever becomes of
+-- the reservation, so a reservation swept unapplied still counts. Only an
+-- explicit release (the call ended with no record) gives the slot back.
+CREATE TABLE unit_cap_uses (
+  rid    BLOB PRIMARY KEY CHECK (typeof(rid) = 'blob' AND length(rid) = 16),
+  class  TEXT NOT NULL CHECK (class IN ('s3', 'app_password', 'principal', 'grants', 'bucket')),
+  at     INTEGER NOT NULL
+) WITHOUT ROWID;
+CREATE INDEX unit_cap_uses_by_time ON unit_cap_uses(at);
+
 -- Creator-grant seqs that no reservation was bound to when the finisher
 -- asked (`bucket_binding` answered none): such a grant is an orphan for
 -- good, and no late bind may take it.

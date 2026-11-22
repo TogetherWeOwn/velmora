@@ -269,6 +269,7 @@ fn a_key_is_reserved_at_the_units_head_and_asked_again_under_its_rid() {
         first,
         json!({ "admitted": {
             "rid": rid(3).hex(), "keys_seq": 1, "again": false, "scope": P, "bound": null,
+            "subject": "AK1", "unit": null,
         }})
     );
     // Asked again (a lost put, or a retry): the same rid, checked again
@@ -1015,7 +1016,7 @@ fn a_grant_change_is_classified_by_the_unit() {
     ] {
         assert_eq!(
             ok(worker(&u, change(1, "AK1", grants))),
-            json!({ "narrowing": true })
+            json!({ "narrowing": { "keys_seq": 2 } })
         );
     }
     assert_eq!(rows(&u), 0);
@@ -1047,8 +1048,186 @@ fn a_grant_change_is_classified_by_the_unit() {
     );
     assert_eq!(
         refused(&worker(&u, change(5, "AKINT", vec![grant(B1, Access::Ro)]))),
+        Some(ReserveRefusal::InternalKeyRefused)
+    );
+    assert_eq!(
+        refused(&worker(&u, change(5, "AKINT", vec![]))),
+        Some(ReserveRefusal::InternalKeyRefused)
+    );
+    // A disabled acting principal narrows nothing (a held one may).
+    apply(
+        &u,
+        vec![principal_entry(
+            P,
+            OWNER,
+            4,
+            SubjectStatus::Disabled,
+            false,
+            vec![grant(B1, Access::Rw), grant(B2, Access::Ro)],
+        )],
+        vec![],
+    );
+    assert_eq!(
+        refused(&worker(&u, change(6, "AK1", vec![]))),
+        Some(ReserveRefusal::ActingPrincipalInactive)
+    );
+    apply(
+        &u,
+        vec![principal_entry(
+            P,
+            OWNER,
+            5,
+            SubjectStatus::Active,
+            true,
+            vec![grant(B1, Access::Rw), grant(B2, Access::Ro)],
+        )],
+        vec![],
+    );
+    assert_eq!(
+        ok(worker(&u, change(6, "AK1", vec![])))["narrowing"]["keys_seq"],
+        json!(5)
+    );
+}
+
+#[test]
+fn a_narrowing_and_a_kept_answer_are_answered_in_a_held_tenant_and_a_new_ask_is_not() {
+    let u = ready();
+    apply(
+        &u,
+        vec![key_entry("AK1", 2, vec![grant(B1, Access::Rw)], None)],
+        vec![],
+    );
+    let create = reserve_op(1, 1, 1, by_owner(), new_key("AK2", vec![]));
+    ok(worker(&u, create.clone()));
+    apply(&u, vec![key_entry("AK2", 3, vec![], Some(rid(1)))], vec![]);
+    let open_ask = reserve_op(2, 2, 2, by_owner(), new_key("AK3", vec![]));
+    ok(worker(&u, open_ask.clone()));
+    for state in [TenantState::Suspended, TenantState::Deleting] {
+        assert!(matches!(sync(&u, state, None), UnitAnswer::Ok { .. }));
+        let narrow = reserve_op(
+            3,
+            3,
+            3,
+            by_owner(),
+            Opening::Grants {
+                subject: "AK1".into(),
+                grants: vec![grant(B1, Access::Ro)],
+            },
+        );
+        assert!(ok(worker(&u, narrow))["narrowing"].is_object());
+        assert!(ok(worker(&u, create.clone()))["applied"].is_object());
+        // A new ask, and the re-ask of an open one, keep a reservation.
+        for op in [
+            reserve_op(4, 4, 4, by_owner(), new_key("AK4", vec![])),
+            open_ask.clone(),
+        ] {
+            assert_eq!(
+                worker(&u, op),
+                UnitAnswer::Refused {
+                    reason: Refused::AccountProblem,
+                    alarm: false,
+                }
+            );
+        }
+        assert_eq!(state_of(&u, 2).as_deref(), Some("reserved"));
+    }
+    assert!(matches!(
+        sync(&u, TenantState::Shredding, None),
+        UnitAnswer::Ok { .. }
+    ));
+    assert_eq!(
+        worker(&u, create),
+        UnitAnswer::Refused {
+            reason: Refused::AccountProblem,
+            alarm: false,
+        }
+    );
+}
+
+#[test]
+fn a_re_ask_is_checked_and_answered_for_the_subject_it_reserved() {
+    let u = ready();
+    ok(worker(
+        &u,
+        reserve_op(1, 1, 1, by_owner(), new_key("AK1", vec![])),
+    ));
+    // The retry drew another key id: the reservation keeps its own.
+    let again = ok(worker(
+        &u,
+        reserve_op(1, 1, 2, by_owner(), new_key("AKNEW", vec![])),
+    ));
+    assert_eq!(again["admitted"]["subject"], json!("AK1"));
+    assert_eq!(again["admitted"]["again"], json!(true));
+    // The id it reserved exists now under another record (no rid): the
+    // re-ask fails its check for that id, and leaves no row.
+    apply(&u, vec![key_entry("AK1", 2, vec![], None)], vec![]);
+    assert_eq!(
+        refused(&worker(
+            &u,
+            reserve_op(1, 1, 2, by_owner(), new_key("AKNEW", vec![]))
+        )),
         Some(ReserveRefusal::Conflict)
     );
+    assert_eq!(state_of(&u, 1), None);
+}
+
+#[test]
+fn a_batch_applies_a_reservation_before_a_later_narrowing_cancels() {
+    let u = ready();
+    ok(worker(
+        &u,
+        reserve_op(1, 1, 7, by_owner(), new_key("AK1", vec![])),
+    ));
+    ok(worker(
+        &u,
+        reserve_op(2, 2, 8, by_owner(), new_key("AK2", vec![])),
+    ));
+    let out = apply(
+        &u,
+        vec![
+            key_entry("AK1", 2, vec![], Some(rid(7))),
+            principal_entry(
+                P,
+                OWNER,
+                3,
+                SubjectStatus::Active,
+                false,
+                vec![grant(B1, Access::Ro)],
+            ),
+        ],
+        vec![KeptAnswer {
+            rid: rid(7),
+            status: 201,
+            body: "{}".into(),
+        }],
+    );
+    assert_eq!(out["reserved"], json!(1));
+    assert_eq!(out["answers_kept"], json!(1));
+    assert_eq!(state_of(&u, 7).as_deref(), Some("applied"));
+    // The other open one was cancelled by the narrowing.
+    assert_eq!(state_of(&u, 8), None);
+}
+
+#[test]
+fn a_widening_or_a_lifted_limit_of_the_principal_cancels_nothing() {
+    let u = ready();
+    ok(worker(
+        &u,
+        reserve_op(1, 1, 1, by_owner(), new_key("AK1", vec![])),
+    ));
+    apply(
+        &u,
+        vec![principal_entry(
+            P,
+            OWNER,
+            2,
+            SubjectStatus::Active,
+            false,
+            vec![grant(B1, Access::Rw), grant(B2, Access::Rw)],
+        )],
+        vec![],
+    );
+    assert_eq!(state_of(&u, 1).as_deref(), Some("reserved"));
 }
 
 // ---------------------------------------------------------------------------
@@ -1186,6 +1365,87 @@ fn release_bound_releases_only_its_own_binding() {
     assert_eq!(
         ok(worker(&u, UnitOp::BucketBinding { grant_seq: 4 })),
         json!({ "binding": "none" })
+    );
+}
+
+#[test]
+fn a_bound_bucket_reservation_outlives_a_narrowing_of_its_creator() {
+    let u = ready();
+    ok(worker(&u, bucket(1, 1, "beta")));
+    ok(worker(
+        &u,
+        UnitOp::BindBucket {
+            rid: rid(1),
+            expected: None,
+            grant_seq: 4,
+        },
+    ));
+    for (seq, status) in [(2, SubjectStatus::Active), (3, SubjectStatus::Disabled)] {
+        apply(
+            &u,
+            vec![principal_entry(P, OWNER, seq, status, false, vec![])],
+            vec![],
+        );
+        assert_eq!(
+            ok(worker(&u, UnitOp::BucketBinding { grant_seq: 4 }))["binding"],
+            json!("open")
+        );
+    }
+}
+
+#[test]
+fn a_bucket_slot_swept_unapplied_still_counts_for_the_day() {
+    let u = ready();
+    for i in 0..BUCKETS_PER_DAY as u8 {
+        let a = worker(&u, bucket(i, i, &format!("bucket-{i}")));
+        assert!(matches!(a, UnitAnswer::Ok { .. }), "{i}: {a:?}");
+    }
+    let later = UnixMs(NOW.0 + RESERVED_MS + 1);
+    assert_eq!(
+        refused(&at(&u, bucket(200, 200, "one-more"), later)),
+        Some(ReserveRefusal::CapReached)
+    );
+    // The open rows are past their hour: a sweep (in the next ask that
+    // keeps its writes) drops them, but not their slots.
+    ok(at(
+        &u,
+        reserve_op(150, 150, 150, by_owner(), new_key("AKS", vec![])),
+        later,
+    ));
+    let open: i64 = u
+        .sql()
+        .with_conn(|c| {
+            c.query_row(
+                "SELECT count(*) FROM unit_reservations WHERE class = 'bucket'",
+                [],
+                |r| r.get(0),
+            )
+        })
+        .unwrap();
+    assert_eq!(open, 0);
+    assert_eq!(
+        refused(&at(&u, bucket(203, 203, "still-full"), later)),
+        Some(ReserveRefusal::CapReached)
+    );
+    // An explicit release gives a slot back; a rid of a swept row is
+    // still taken.
+    let fresh = UnixMs(NOW.0 + 1);
+    let u2 = ready();
+    for i in 0..BUCKETS_PER_DAY as u8 {
+        ok(at(&u2, bucket(i, i, &format!("bucket-{i}")), fresh));
+    }
+    ok(at(&u2, UnitOp::Release { rid: rid(0) }, fresh));
+    assert!(matches!(
+        at(&u2, bucket(201, 201, "freed"), fresh),
+        UnitAnswer::Ok { .. }
+    ));
+    assert_eq!(
+        refused(&at(
+            &u,
+            reserve_op(202, 202, 1, by_owner(), new_key("AKRID", vec![])),
+            UnixMs(NOW.0 + KEPT_MS - 1)
+        )),
+        Some(ReserveRefusal::RidTaken)
     );
 }
 

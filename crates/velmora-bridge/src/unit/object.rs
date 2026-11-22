@@ -816,9 +816,12 @@ impl<S: UnitSql> Unit<S> {
             }
         }
         // Never back into the owner move's window: a time before the
-        // move's lift would bring back its unused seal.
+        // move's lift would bring back its unused seal. The lift's time is
+        // the call's clock, a little before its commit: a margin covers it.
         if let Some((_, restore::RestoreTarget::Time { at_ms }, _)) = &restore {
-            if import::move_lifted_at(self.sql())?.is_some_and(|lifted| *at_ms < lifted) {
+            if import::move_lifted_at(self.sql())?
+                .is_some_and(|lifted| *at_ms < lifted.saturating_add(restore::LIFT_SLACK_MS))
+            {
                 return no(RestoreRefusal::BeforeMoveLift);
             }
         }
@@ -1007,6 +1010,10 @@ impl<S: UnitSql> Unit<S> {
         mover: Option<&MoveHead>,
         now: UnixMs,
     ) -> Result<UnitAnswer> {
+        // It writes: only an authenticated Worker call (rule 11).
+        if !call.authenticated {
+            return Ok(refused(Refused::Unauthenticated, false));
+        }
         if recount::is_move(self.sql(), head.restoring_since)? {
             if let Some(answer) = self.move_numbers(call, head) {
                 return Ok(answer);
@@ -1087,9 +1094,15 @@ impl<S: UnitSql> Unit<S> {
             opening,
         } = &call.op
         {
-            if head.tenant_state != TenantState::Active {
+            // A shred refuses everything; a hold or a deletion refuses
+            // only what keeps a reservation (`may_open`).
+            if matches!(
+                head.tenant_state,
+                TenantState::Shredding | TenantState::Shredded
+            ) {
                 return Ok(refused(Refused::AccountProblem, false));
             }
+            let may_open = head.tenant_state == TenantState::Active;
             let ask = Ask {
                 key_hash,
                 fingerprint,
@@ -1099,7 +1112,7 @@ impl<S: UnitSql> Unit<S> {
             };
             let mut outcome = None;
             let mut op = || -> Result<std::result::Result<Value, Refused>> {
-                let admit = reserve::admit(sql, head.seqs.keys_seq, &ask, now)?;
+                let admit = reserve::admit(sql, head.seqs.keys_seq, may_open, &ask, now)?;
                 let body = admit.body();
                 outcome = Some(admit.clone());
                 Ok(match (admit, body) {
@@ -1107,6 +1120,7 @@ impl<S: UnitSql> Unit<S> {
                     (Admit::Refused(r) | Admit::RefusedDrop(r, _), None) => {
                         Err(Refused::Reserve(r))
                     }
+                    (Admit::NotOpen, None) => Err(Refused::AccountProblem),
                     (_, None) => Err(Refused::Reserve(reserve::ReserveRefusal::Malformed)),
                 })
             };
@@ -1115,7 +1129,11 @@ impl<S: UnitSql> Unit<S> {
             // the drop is its own transaction, as the refusal rolled the
             // ask back.
             if let Some(Admit::RefusedDrop(_, rid)) = outcome {
-                let mut drop = || Ok(Ok(json!({ "released": reserve::release(sql, &rid)? })));
+                let mut drop = || {
+                    Ok(Ok(
+                        json!({ "released": reserve::release(sql, &rid, false)? }),
+                    ))
+                };
                 // Dropped, or already gone: either way no row is left.
                 let _ = transact(sql, true, &mut drop)?;
             }
@@ -1130,7 +1148,9 @@ impl<S: UnitSql> Unit<S> {
         }
         let mut op = || -> Result<std::result::Result<Value, Refused>> {
             Ok(Ok(match &call.op {
-                UnitOp::Release { rid } => json!({ "released": reserve::release(sql, rid)? }),
+                UnitOp::Release { rid } => {
+                    json!({ "released": reserve::release(sql, rid, true)? })
+                }
                 UnitOp::BindBucket {
                     rid,
                     expected,

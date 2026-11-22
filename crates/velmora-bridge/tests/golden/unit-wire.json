@@ -1209,7 +1209,9 @@
             "bound": null,
             "keys_seq": 3,
             "rid": "44444444444444444444444444444444",
-            "scope": "p_1"
+            "scope": "p_1",
+            "subject": "AKGOLDEN000000000002",
+            "unit": null
           }
         },
         {
@@ -1225,8 +1227,11 @@
           "reused": true
         },
         {
-          "narrowing": true
+          "narrowing": {
+            "keys_seq": 3
+          }
         },
+        null,
         {
           "exists": {
             "grants": [],
@@ -1267,6 +1272,7 @@
       "bucket_already_exists",
       "principal_exists",
       "conflict",
+      "internal_key_refused",
       "not_found",
       "rid_taken",
       "malformed"
