@@ -9,7 +9,9 @@
 //!   with an expired lease still serves). The proof is
 //!   [`super::renewal::prove`] over the safety bucket. Then the unit is
 //!   called with `renew(proof_start, proven, revocations)`. A newer record
-//!   means `sync` first; a stamp object after the counter is confirmed
+//!   means `sync` first. Stamp objects after the counter: the proof holds
+//!   the newest one's counter, and the unit renews only if its own counter
+//!   reached it; a `not_proven` refusal (or a full page ahead) is confirmed
 //!   through the unit's own counter ([`crate::stamp::Stamp::checked`]),
 //!   which records a rollback and closes the unit only if the counter has
 //!   not moved.
@@ -23,8 +25,12 @@
 //!   `renew_needed` renews, a `sync_needed` syncs, a lower request number
 //!   takes the unit's numbers; then the call runs once more. An answer
 //!   with less than half of T left asks for a background renewal
-//!   ([`Answered::renew_due`]; the caller runs it under `waitUntil`, at
-//!   most one per unit and isolate: [`InFlight`]).
+//!   ([`Answered::renew_due`]; the caller runs
+//!   [`UnitClient::renew_in_background`] under `waitUntil`). Unsigned
+//!   calls and background renewals go through the isolate's spacing
+//!   ([`InFlight`]): none while one runs, and after a failed attempt a
+//!   backoff from 60 s doubling up to T (rule 11). Signed calls renew for
+//!   themselves.
 //! - **The two unit jobs** ([`UnitClient::run_job`]): `renew` and
 //!   `stamp_raise`, which the queue consumer hands here (AM-51). Under
 //!   `MAINTENANCE = restore` the consumer acknowledges both without a call
@@ -64,6 +70,7 @@ use crate::unit::{
     UnitOp, UnitReply,
 };
 
+use super::alarm::{renew_retry_ms, AlarmRules};
 use super::lease::{LeaseRefusal, LeaseRules};
 use super::renewal::{prove, ChainNames, Proof, UnitView};
 use super::stamp_id::UnitStampId;
@@ -212,10 +219,9 @@ pub struct Answered {
     /// caller's: the caller's view of the tenant head is old and is read
     /// again.
     pub refreshed: Option<Seqs>,
-    /// Less than half of T is left: renew in the background (rule 12).
+    /// Less than half of T is left: renew in the background (rule 12,
+    /// [`UnitClient::renew_in_background`]).
     pub renew_due: bool,
-    /// Alerts from a renewal this call made.
-    pub pages: Vec<Page>,
 }
 
 /// What the queue does with a `renew` or `stamp_raise` message.
@@ -591,42 +597,41 @@ where
     /// Rule 5 on the request path: sends `call`; on `renew_needed` renews,
     /// on `sync_needed` syncs, on a lower number (`stale`) takes the
     /// unit's numbers; then sends it once more. Each fix runs at most once
-    /// per call.
-    pub async fn call(&self, mut call: UnitCall) -> Result<Answered> {
+    /// per call. The pages of a renewal it made come back whatever the
+    /// outcome.
+    pub async fn call(&self, call: UnitCall) -> (Result<Answered>, Vec<Page>) {
+        let mut pages = Vec::new();
+        let answered = self.call_into(call, &mut pages).await;
+        (answered, pages)
+    }
+
+    async fn call_into(&self, mut call: UnitCall, pages: &mut Vec<Page>) -> Result<Answered> {
         let (mut renewed, mut synced, mut restaled) = (false, false, false);
         let mut refreshed = None;
-        let mut pages = Vec::new();
         loop {
             let reply = self.unit.reply(&call).await?;
             match reply.answer {
                 UnitAnswer::RenewNeeded { seqs, why: None } if !renewed => {
                     renewed = true;
-                    // Rule 11: an unsigned call causes at most one renewal
-                    // attempt per unit and T in this isolate, and none while
-                    // one runs. A signed call renews for itself.
-                    let attempt = match call.authenticated {
-                        true => None,
-                        false => match self.flights.attempt(
-                            &self.name,
-                            self.clock.now(),
-                            self.lease.term_ms,
-                        ) {
-                            Some(guard) => Some(guard),
-                            None => {
-                                let renew_due = self.renew_due(&reply);
-                                return Ok(Answered {
-                                    reply,
-                                    refreshed,
-                                    renew_due,
-                                    pages,
-                                });
+                    // Rule 11: an unsigned call renews only through the
+                    // isolate's spacing (none while one runs, and after a
+                    // failure a backoff up to T). A signed call renews for
+                    // itself.
+                    let renewal = match call.authenticated {
+                        true => {
+                            let (renewal, more) = self.renew(seqs).await;
+                            pages.extend(more);
+                            Some(renewal?)
+                        }
+                        false => match self.renew_spaced(seqs).await {
+                            Some((renewal, more)) => {
+                                pages.extend(more);
+                                Some(renewal?)
                             }
+                            None => None,
                         },
                     };
-                    let (renewal, more) = self.renew(seqs).await;
-                    drop(attempt);
-                    pages.extend(more);
-                    if matches!(renewal?, Renewal::Renewed { .. }) {
+                    if matches!(renewal, Some(Renewal::Renewed { .. })) {
                         continue;
                     }
                 }
@@ -649,9 +654,25 @@ where
                 reply,
                 refreshed,
                 renew_due,
-                pages,
             });
         }
+    }
+
+    /// The background renewal of rule 12 (an answer with less than half of
+    /// T left, [`Answered::renew_due`]): the caller runs it under
+    /// `waitUntil`. Through the isolate's spacing, as an unsigned call's:
+    /// `None` = one runs, or the last one failed too recently.
+    pub async fn renew_in_background(&self, seen: Seqs) -> Option<(Result<Renewal>, Vec<Page>)> {
+        self.renew_spaced(seen).await
+    }
+
+    async fn renew_spaced(&self, seen: Seqs) -> Option<(Result<Renewal>, Vec<Page>)> {
+        let guard = self
+            .flights
+            .attempt(&self.name, self.clock.now(), self.lease.term_ms)?;
+        let (renewal, pages) = self.renew(seen).await;
+        guard.done(matches!(renewal, Ok(Renewal::Renewed { .. })));
+        Some((renewal, pages))
     }
 
     /// Whether `reply` asks for a background renewal: some lease, and
@@ -1113,77 +1134,115 @@ impl ChainNames for RecordNames {
     }
 }
 
-/// The renewals in flight in one isolate, by unit, and when each unit's
-/// last attempt began: a second one for the same unit is not started while
-/// one runs, and [`InFlight::attempt`] spaces them. Cheap to clone; one per
-/// isolate.
+/// The renewals in flight in one isolate, by unit, and the failed
+/// attempts of each: a second renewal of a unit is not started while one
+/// runs, and [`InFlight::attempt`] spaces the attempts after a failure
+/// (a backoff from [`AlarmRules::renew_retry_ms`] that doubles up to T).
+/// A success clears it. Cheap to clone; one per isolate.
 #[derive(Clone, Debug, Default)]
 pub struct InFlight(Rc<RefCell<Flights>>);
 
 #[derive(Debug, Default)]
 struct Flights {
     running: BTreeSet<String>,
-    last: BTreeMap<String, UnixMs>,
+    /// Per unit: the time of the last failed attempt, and how many failed
+    /// in a row.
+    failed: BTreeMap<String, (UnixMs, u32)>,
 }
 
-/// Held while one renewal runs; dropping it ends it.
+/// Held while one renewal runs. [`InFlightGuard::done`] says how it
+/// ended; dropped without it, it counts as failed.
 #[derive(Debug)]
 pub struct InFlightGuard {
     set: Rc<RefCell<Flights>>,
     name: String,
+    /// Spaced attempts record their outcome; `begin`'s do not.
+    spaced: Option<UnixMs>,
+    ended: bool,
 }
 
-/// Units whose last attempt is remembered, at most: an isolate serves far
-/// fewer; past it the oldest are forgotten.
+/// Units whose failed attempts are remembered, at most: an isolate serves
+/// far fewer; past it the oldest are forgotten.
 const MAX_REMEMBERED: usize = 4096;
 
 impl InFlight {
     /// Starts a renewal of `name`, or `None` when one is running.
     pub fn begin(&self, name: &UnitName) -> Option<InFlightGuard> {
-        self.start(name, None)
+        self.start(name, None, 0)
     }
 
     /// Starts a renewal attempt of `name` at `now`, or `None` when one is
-    /// running or the last one began less than `gap_ms` ago.
-    pub fn attempt(&self, name: &UnitName, now: UnixMs, gap_ms: i64) -> Option<InFlightGuard> {
-        self.start(name, Some((now, gap_ms)))
+    /// running, or when the last attempt failed less than the backoff for
+    /// its failures in a row ago (60 s doubling, at most `max_gap_ms`).
+    pub fn attempt(&self, name: &UnitName, now: UnixMs, max_gap_ms: i64) -> Option<InFlightGuard> {
+        self.start(name, Some(now), max_gap_ms)
     }
 
-    fn start(&self, name: &UnitName, spaced: Option<(UnixMs, i64)>) -> Option<InFlightGuard> {
+    fn start(
+        &self,
+        name: &UnitName,
+        spaced: Option<UnixMs>,
+        max_gap: i64,
+    ) -> Option<InFlightGuard> {
         let key = name.object_name();
         let mut f = self.0.borrow_mut();
         if f.running.contains(&key) {
             return None;
         }
-        if let Some((now, gap)) = spaced {
-            if f.last
-                .get(&key)
-                .is_some_and(|at| now.0 < at.0.saturating_add(gap))
-            {
+        if let (Some(now), Some((at, fails))) = (spaced, f.failed.get(&key)) {
+            let gap = renew_retry_ms(fails.saturating_sub(1), &AlarmRules::DEFAULT).min(max_gap);
+            if now.0 < at.0.saturating_add(gap) {
                 return None;
             }
-            if f.last.len() >= MAX_REMEMBERED && !f.last.contains_key(&key) {
-                if let Some(oldest) = f
-                    .last
-                    .iter()
-                    .min_by_key(|(_, at)| at.0)
-                    .map(|(k, _)| k.clone())
-                {
-                    f.last.remove(&oldest);
-                }
-            }
-            f.last.insert(key.clone(), now);
         }
         f.running.insert(key.clone());
         Some(InFlightGuard {
             set: self.0.clone(),
             name: key,
+            spaced,
+            ended: false,
         })
+    }
+}
+
+impl InFlightGuard {
+    /// The attempt ended: renewed (`ok`), or not.
+    pub fn done(mut self, ok: bool) {
+        self.end(ok);
+    }
+
+    fn end(&mut self, ok: bool) {
+        if self.ended {
+            return;
+        }
+        self.ended = true;
+        let mut f = self.set.borrow_mut();
+        f.running.remove(&self.name);
+        let Some(now) = self.spaced else {
+            return;
+        };
+        if ok {
+            f.failed.remove(&self.name);
+            return;
+        }
+        if f.failed.len() >= MAX_REMEMBERED && !f.failed.contains_key(&self.name) {
+            if let Some(oldest) = f
+                .failed
+                .iter()
+                .min_by_key(|(_, (at, _))| at.0)
+                .map(|(k, _)| k.clone())
+            {
+                f.failed.remove(&oldest);
+            }
+        }
+        let fails = f.failed.get(&self.name).map_or(0, |(_, n)| *n);
+        f.failed
+            .insert(self.name.clone(), (now, fails.saturating_add(1)));
     }
 }
 
 impl Drop for InFlightGuard {
     fn drop(&mut self) {
-        self.set.borrow_mut().running.remove(&self.name);
+        self.end(false);
     }
 }
