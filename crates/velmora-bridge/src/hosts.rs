@@ -349,6 +349,9 @@ impl HostPicker {
         endpoints: &[&str],
         d: &D,
     ) -> (Vec<usize>, bool) {
+        // This connect waits at most `PROBE_WAIT_MS` by its own clock,
+        // whatever the mark of the probe says.
+        let started = d.now();
         let (first, probed) = loop {
             let now = d.now();
             let pick = self.picks.borrow().get(&provider.id).cloned();
@@ -361,7 +364,10 @@ impl HostPicker {
                 // A probe another invocation started a moment "after"
                 // this one's clock is running; one a whole wait ahead
                 // (the clock stepped back) is lost.
-                Some(Pick::Probing(since)) if now.within(since, PROBE_WAIT_MS) => {
+                Some(Pick::Probing(since))
+                    if now.within(since, PROBE_WAIT_MS)
+                        && now.0.saturating_sub(started.0) < PROBE_WAIT_MS =>
+                {
                     d.pause(PROBE_POLL_MS).await;
                     continue;
                 }
@@ -1226,6 +1232,26 @@ mod tests {
             assert_eq!(n.paused.get(), PROBE_POLL_MS, "{ahead} ms ahead");
             assert_eq!(n.probes(), 0, "{ahead} ms ahead");
         }
+    }
+
+    /// A probe that never finishes, marked by a clock seconds ahead of
+    /// this one's, is still given up after one wait by this connect's
+    /// own clock: the read keeps its time to connect.
+    #[test]
+    fn a_lost_probe_marked_ahead_is_given_up_after_one_wait() {
+        let n = net(&[("a", Some(400)), ("b", Some(150))]);
+        let picker = HostPicker::new();
+        picker
+            .picks
+            .borrow_mut()
+            .insert("p6".into(), Pick::Probing(UnixMs(n.now().0 + 5_000)));
+        assert_eq!(
+            run(picker.connect_host(&provider("a", &["b"]), &n)).unwrap(),
+            "b"
+        );
+        assert!(n.paused.get() as i64 >= PROBE_WAIT_MS - i64::from(PROBE_POLL_MS));
+        assert!((n.paused.get() as i64) < PROBE_WAIT_MS + i64::from(PROBE_POLL_MS));
+        assert_eq!(n.probes(), 2);
     }
 
     /// A probe mark from the future (the clock stepped back) is lost, not
