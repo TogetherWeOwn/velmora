@@ -825,9 +825,9 @@ impl<S: UnitSql> Unit<S> {
     fn request(&self, head: &Head, rc: &super::request::RequestCall) -> Result<UnitAnswer> {
         let sql = self.sql();
         let grows = rc.grows();
-        let database_size = match grows {
-            Some(_) => sql.database_size()?,
-            None => 0,
+        let database_size = match rc.adds_rows() {
+            true => sql.database_size()?,
+            false => 0,
         };
         let mut op = || -> Result<std::result::Result<Value, Refused>> {
             // A closing bucket, or one whose row a `sync` dropped since
@@ -836,6 +836,12 @@ impl<S: UnitSql> Unit<S> {
                 if buckets::is_closing(sql, b.as_str())? || !keys::bucket_exists(sql, b.as_str())? {
                     return Ok(Err(Refused::NotFound));
                 }
+            }
+            // Above the hard ceiling nothing adds a row, so the platform's
+            // stop is never met (ADR §2.6); below it deletes and smaller
+            // overwrites pass the guard.
+            if rc.adds_rows() && database_size >= self.size.hard_bytes {
+                return Ok(Err(Refused::Size(size::SizeRefusal::DatabaseFull)));
             }
             if let Some(adding) = grows {
                 if !self.smaller_overwrite(rc)? {

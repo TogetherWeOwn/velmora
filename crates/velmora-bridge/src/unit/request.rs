@@ -527,6 +527,21 @@ impl RequestCall {
         }
     }
 
+    /// Whether the call can add a row (a growth, or a delete's floor or
+    /// tombstone): above the hard ceiling it does not run
+    /// ([`super::size::HARD_BYTES`]).
+    pub fn adds_rows(&self) -> bool {
+        self.grows().is_some()
+            || matches!(
+                self,
+                RequestCall::raise_floor { .. }
+                    | RequestCall::raise_floors { .. }
+                    | RequestCall::delete_object_before { .. }
+                    | RequestCall::delete_object_if { .. }
+                    | RequestCall::delete_objects_before { .. }
+            )
+    }
+
     /// The call's bounds (module doc): every list, limit and key within
     /// what the handlers send.
     pub fn check(&self) -> std::result::Result<(), RequestRefusal> {

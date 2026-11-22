@@ -492,17 +492,22 @@ signature), and `listed = true`.
 publication answers `"applied"`, `"refused"` or `"fenced"`, and the
 Worker rebuilds the outcome from the proof it kept
 (`Published::outcome`): a refused publication discards the Worker's own
-record, never one the unit named. A publication the unit refused before
-it ran it (any answer but `ok` and `failed`) wrote nothing under its id:
-the client hands its proof back (`RequestClient::take_unpublished`), and
-the Worker discards that record before it answers. A `failed` answer, or
-none, keeps the record, as on tenant 0.
+record, never one the unit named. A publication the unit refused for
+good before it ran it (`refused`, `closed`, `unborn`) wrote nothing under
+its id: the client hands its proof back
+(`RequestClient::take_unpublished`), and the Worker discards that record
+before it answers. A `failed` answer, or none, keeps the record, as on
+tenant 0, and so do `stale` and `sync_needed`: the Worker answers those
+below the client, in the way it reaches the unit, by syncing (or reading
+the head again) and sending the same call once more with the new
+numbers. A request body cannot be sent twice, so the retry is the
+call's, not the request's.
 
 | The unit answers | The Worker |
 |---|---|
 | `ok` | the method's value |
-| `sync_needed` | syncs, then calls once more |
-| `stale{seqs}` (the head the Worker read is older than the unit's) | reads the head again, then calls once more |
+| `sync_needed` | syncs, then sends the same call once more |
+| `stale{seqs}` (the head the Worker read is older than the unit's) | reads the head again, then sends the same call once more |
 | `closed` | `503` |
 | `unborn` | `503`; it pages "catalogue lost" when the route lists the unit (rule 7) |
 | `refused{account_problem}` | `403 AccountProblem` |
@@ -524,7 +529,10 @@ that adds extents, or a new object, upload or intent, takes the size
 guard first, in its own transaction, and a refusal pages. Reads,
 deletes and smaller overwrites go on (ADR §2.6): a publication that
 replaces a live generation of at least as many extents passes the
-guard. Each list, limit and key of a call has a bound: at most 1,000
+guard. Above a hard ceiling (9 GB, est) no call that adds a row runs,
+deletes and overwrites included, so the platform's 10 GB stop is never
+met; reads and the calls that only take rows away still run. Each list,
+limit and key of a call has a bound: at most 1,000
 keys, ids or rows (S3's page and DeleteObjects bound; a listing asks for
 one more), 10,001 extents (one object's bound and one more), 1,024 bytes
 an object key (the protocol's own bound), and 8 KiB a listing prefix,

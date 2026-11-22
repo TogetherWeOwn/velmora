@@ -51,11 +51,14 @@ impl<P: UnitPort> RequestClient<P> {
         }
     }
 
-    /// The records of publications the unit refused before it ran them
-    /// (any answer but `ok`, `failed` and none): nothing was written under
+    /// The records of publications the unit refused for good before it
+    /// ran them (`refused`, `closed`, `unborn`): nothing was written under
     /// their ids, so the Worker discards each (`discard_generation`)
     /// before it answers the request. A `failed` answer or none keeps the
-    /// record, as on tenant 0.
+    /// record, as on tenant 0, and so do `stale` and `sync_needed`: the
+    /// Worker answers those in its [`UnitPort`] by syncing (or reading the
+    /// head again) and sending the same call once more with the new
+    /// numbers, so a retried publication keeps its record.
     pub fn take_unpublished(&self) -> Vec<Unpublished> {
         std::mem::take(&mut *self.unpublished.borrow_mut())
     }
@@ -123,6 +126,11 @@ impl<P: UnitPort> RequestClient<P> {
         match answer {
             UnitAnswer::Ok { .. } => Ok(self.read::<Published>(answer)?.outcome(record)),
             UnitAnswer::Failed { .. } => self.read::<Published>(answer).map(|_| unreachable!()),
+            // The caller syncs or reads the head again and sends the call
+            // once more (in its port): the record stays with the call.
+            UnitAnswer::Stale { .. } | UnitAnswer::SyncNeeded { .. } => {
+                self.read::<Published>(answer).map(|_| unreachable!())
+            }
             refused => {
                 self.unpublished.borrow_mut().push(record.refused_on_unit());
                 self.read::<Published>(refused).map(|_| unreachable!())

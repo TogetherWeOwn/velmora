@@ -760,6 +760,7 @@ fn a_full_unit_refuses_growth_and_lets_deletes_and_smaller_overwrites_go_on() {
     let u = born_with(SizeLimits {
         bytes: u64::MAX,
         extents: 0,
+        ..SizeLimits::default()
     });
     let seqs = s(3, 0);
     assert_eq!(
@@ -775,6 +776,7 @@ fn a_full_unit_refuses_growth_and_lets_deletes_and_smaller_overwrites_go_on() {
     let u = u.with_size_limits(SizeLimits {
         bytes: 0,
         extents: u64::MAX,
+        ..SizeLimits::default()
     });
     let before = changes(&u);
     for call in [
@@ -853,6 +855,50 @@ fn a_full_unit_refuses_growth_and_lets_deletes_and_smaller_overwrites_go_on() {
         seqs,
         RequestCall::abandon_intents {
             write: WriteId::new("w_00000000000000e1"),
+        },
+    ));
+
+    // Above the hard ceiling nothing that adds a row runs: neither an
+    // overwrite nor a delete's floor or tombstone.
+    let u = u.with_size_limits(SizeLimits {
+        bytes: 0,
+        extents: u64::MAX,
+        hard_bytes: 0,
+    });
+    let before = changes(&u);
+    for call in [
+        commit_as(
+            B1,
+            "g_0019a00000000e8e8e8e8e8e8e8e8",
+            "x_0000000000000000000000e008",
+        ),
+        raise_floor(B1),
+        RequestCall::delete_objects_before {
+            bucket: BucketId::new(B1),
+            deletes: vec![(
+                "absent".into(),
+                GenerationId::new("g_0019a00000000e9e9e9e9e9e9e9e9"),
+                NOW,
+            )],
+        },
+    ] {
+        let name = call.name();
+        assert_eq!(
+            refused(&ask(&u, seqs, call)),
+            (Refused::Size(SizeRefusal::DatabaseFull), true),
+            "{name}"
+        );
+    }
+    assert_eq!(changes(&u), before);
+    ok(ask(&u, seqs, live_generation()));
+    ok(ask(
+        &u,
+        seqs,
+        RequestCall::abort_upload {
+            bucket: BucketId::new(B1),
+            key: "k".into(),
+            upload: UploadId::new("u_00000000000000e1"),
+            now: NOW,
         },
     ));
 }
@@ -1311,7 +1357,8 @@ async fn a_publication_refused_before_it_ran_hands_its_record_back() {
             ..
         })
     ));
-    // A stale client's publication never ran either.
+    // A stale client's publication did not run, and its record stays:
+    // the Worker's port syncs and sends the same call once more.
     sync(&u, s(4, 0), TenantState::Active, None);
     let stale = RequestClient::new(Port(Rc::clone(&u)), own(), s(3, 0));
     let RequestCall::commit_generation { c, .. } = commit(B1) else {
@@ -1322,7 +1369,8 @@ async fn a_publication_refused_before_it_ran_hands_its_record_back() {
         .commit_generation(&c, None, Recorded::for_test(&g))
         .await
         .is_err());
-    assert_eq!(stale.take_unpublished().len(), 1);
+    assert!(matches!(stale.refusal(), Some(UnitAnswer::Stale { .. })));
+    assert!(stale.take_unpublished().is_empty());
 }
 
 #[test]
