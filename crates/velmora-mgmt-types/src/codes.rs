@@ -128,8 +128,8 @@ pub enum KofraMapping {
 pub enum TenancyMapping {
     /// `Retry`.
     Retry,
-    /// `Retry`, and a page: a `kofra-api` or deploy fault (the same
-    /// `Idempotency-Key` with another request, or an `Upstream` code).
+    /// `Retry`, and a page: every code that is not a "not now" or `Gone`
+    /// (see [`Code::tenancy`]); none may retry in silence.
     RetryAndPage,
     /// `Gone`: the workspace is closed.
     Gone,
