@@ -12,11 +12,13 @@ use velmora_bridge::crypto::scheme2::{
 use velmora_bridge::crypto::DataKey;
 use velmora_bridge::keys::escrow::{restore_check, restore_escrow, EscrowCopy, RestoreStep};
 use velmora_bridge::keys::locations::two_in_account;
+use velmora_bridge::keys::record::TkRing;
 use velmora_bridge::keys::record::{
     seal_key_record, KeyOp, OneKey, SubjectDoor, SubjectKind, SubjectPrivate, SubjectStatus,
 };
 use velmora_bridge::keys::tk::{
-    create_key_version, is_foreign, tk_prefix, Claim, Commit, KeyBuckets, KeyVersionClaims, TkCache,
+    create_key_version, is_foreign, load_ring, tk_prefix, Claim, Commit, KeyBuckets, KeyCheck,
+    KeyVersionClaims, KeyVersionGone, Loaded, TkCache, ERR_TK_CURRENT_GONE, ERR_TK_NOT_COMMITTED,
 };
 use velmora_bridge::records::{MemRecords, RecordStore};
 use velmora_bridge::testkit::{FixedClock, TestKek};
@@ -65,6 +67,10 @@ struct ClaimState {
     voids: Vec<u32>,
     commits: Vec<u32>,
     pinned: Option<[u8; 8]>,
+    /// `key_checks`: every committed version's check value, kept.
+    checks: std::collections::BTreeMap<u32, [u8; 8]>,
+    /// Versions a record marks retired or lost.
+    gone: Vec<u32>,
 }
 
 impl KeyVersionClaims for Claims {
@@ -116,8 +122,20 @@ impl KeyVersionClaims for Claims {
         s.tk_version = version;
         s.rotating_to = None;
         s.pinned = Some(kcv);
+        s.checks.insert(version, kcv);
         s.commits.push(version);
         Ok(Commit::Committed)
+    }
+
+    async fn committed_kcv(&self, _t: &TenantId, version: u32) -> Result<KeyCheck> {
+        let s = self.state.borrow();
+        if s.gone.contains(&version) {
+            return Ok(KeyCheck::Gone);
+        }
+        Ok(match s.checks.get(&version) {
+            Some(kcv) => KeyCheck::Committed(*kcv),
+            None => KeyCheck::NotCommitted,
+        })
     }
 }
 
@@ -658,6 +676,9 @@ async fn a_run_racing_under_another_kek_version_never_replaces_the_committed_key
         }
         async fn commit(&self, t: &TenantId, version: u32, kcv: [u8; 8]) -> Result<Commit> {
             self.0.commit(t, version, kcv).await
+        }
+        async fn committed_kcv(&self, t: &TenantId, version: u32) -> Result<KeyCheck> {
+            self.0.committed_kcv(t, version).await
         }
     }
     let ha = Hooked {
@@ -1455,4 +1476,191 @@ async fn a_damaged_replica_is_not_counted_as_a_copy() {
     .await
     .unwrap();
     assert!(created.voided.contains(&1), "{:?}", created.voided);
+}
+
+// ---------------------------------------------------------------------------
+// Key-version checks: a check value per committed version (AM-10, AM-11)
+// ---------------------------------------------------------------------------
+
+/// Versions 1 and 2 of the tenant's key, both committed; KEK 1 then 2.
+async fn two_versions(w: &World) -> (TenantKey, TenantKey) {
+    let set = two_in_account();
+    let v1 = create_key_version(
+        &set,
+        &w.buckets(),
+        &w.claims,
+        &w.kek,
+        &w.t,
+        0,
+        &mut TestRng(300),
+    )
+    .await
+    .unwrap();
+    let v2 = create_key_version(
+        &set,
+        &w.buckets(),
+        &w.claims,
+        &w.kek,
+        &w.t,
+        1,
+        &mut TestRng(301),
+    )
+    .await
+    .unwrap();
+    assert_eq!((v1.key.version(), v2.key.version()), (1, 2));
+    (v1.key, v2.key)
+}
+
+/// A load of an older version is pinned to that version's own committed
+/// check value: a stray copy of it, under a newer KEK the loader would
+/// prefer, is never taken (the KEK-rotation race of the current version,
+/// for an old one).
+#[tokio::test(flavor = "current_thread")]
+async fn an_older_version_loads_pinned_to_its_own_committed_check() {
+    let mut w = World::new();
+    let (v1, v2) = two_versions(&w).await;
+    // KEK 2 becomes active; a stray v1 under it lands in both buckets.
+    w.kek = TestKek::with_versions(2, &[(1, derived("kek")), (2, derived("kek 2"))]);
+    let stray = TenantKey::from_bytes(&w.t, 1, derived("stray v1")).unwrap();
+    let (kv, blob) = wrap_tenant_key(&w.kek, &stray, &mut TestRng(302)).unwrap();
+    assert_eq!(kv, 2);
+    w.a.plant(&tk_blob_name(&w.t, 1, 2), blob.clone());
+    w.b.plant(&tk_blob_name(&w.t, 1, 2), blob);
+    let set = two_in_account();
+    let clock = FixedClock::new(UnixMs(1_700_000_000_000));
+    let cache = TkCache::new();
+    let load = load_ring(
+        &cache,
+        &set,
+        &w.buckets(),
+        &w.kek,
+        &clock,
+        &w.claims,
+        &w.t,
+        2,
+        &[1],
+    )
+    .await
+    .unwrap();
+    assert!(load.failed.is_empty());
+    assert_eq!(load.ring.current().unwrap().check_value(), v2.check_value());
+    assert_eq!(load.ring.key(1).unwrap().check_value(), v1.check_value());
+    assert_ne!(v1.check_value(), stray.check_value());
+    assert!(!load.ring.gone(1));
+}
+
+/// A version the head keeps no check value for is never loaded: refused
+/// before any location is read, and reported by the ring load.
+#[tokio::test(flavor = "current_thread")]
+async fn a_version_that_is_not_committed_is_never_loaded() {
+    let w = World::new();
+    let _ = two_versions(&w).await;
+    // A blob of version 3 exists (a claim that never committed).
+    let v3 = TenantKey::from_bytes(&w.t, 3, derived("v3")).unwrap();
+    let (_, blob) = wrap_tenant_key(&w.kek, &v3, &mut TestRng(303)).unwrap();
+    w.a.plant(&tk_blob_name(&w.t, 3, 1), blob);
+    let set = two_in_account();
+    let clock = FixedClock::new(UnixMs(1_700_000_000_000));
+    let cache = TkCache::new();
+    let lists = (w.a.lists(), w.b.lists());
+    let e = cache
+        .load_committed(&set, &w.buckets(), &w.kek, &clock, &w.claims, &w.t, 3)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!((&e, &ERR_TK_NOT_COMMITTED), (BridgeError::Crypto(a), BridgeError::Crypto(b)) if a == b)
+    );
+    assert_eq!((w.a.lists(), w.b.lists()), lists, "no location was read");
+    let load = load_ring(
+        &cache,
+        &set,
+        &w.buckets(),
+        &w.kek,
+        &clock,
+        &w.claims,
+        &w.t,
+        2,
+        &[1, 3],
+    )
+    .await
+    .unwrap();
+    assert!(load.failed.is_empty());
+    assert_eq!(load.not_committed, vec![3]);
+    assert!(
+        !load.ring.partial(),
+        "a version never committed is no load error"
+    );
+    assert!(load.ring.key(3).is_none());
+    assert!(load.ring.key(1).is_some());
+    // A current version that is not committed fails the ring.
+    assert!(load_ring(
+        &cache,
+        &set,
+        &w.buckets(),
+        &w.kek,
+        &clock,
+        &w.claims,
+        &w.t,
+        3,
+        &[]
+    )
+    .await
+    .is_err());
+}
+
+/// A version a record marks gone is an outcome: `KeyVersionGone`, marked
+/// in the ring, never loaded; a gone current version fails the ring.
+#[tokio::test(flavor = "current_thread")]
+async fn a_gone_version_is_an_outcome_not_a_load() {
+    let w = World::new();
+    let _ = two_versions(&w).await;
+    w.claims.state.borrow_mut().gone.push(1);
+    let set = two_in_account();
+    let clock = FixedClock::new(UnixMs(1_700_000_000_000));
+    let cache = TkCache::new();
+    let lists = (w.a.lists(), w.b.lists());
+    match cache
+        .load_committed(&set, &w.buckets(), &w.kek, &clock, &w.claims, &w.t, 1)
+        .await
+        .unwrap()
+    {
+        Loaded::Gone(g) => assert_eq!(g, KeyVersionGone { version: 1 }),
+        Loaded::Key(_) => panic!("a gone version was loaded"),
+    }
+    assert_eq!((w.a.lists(), w.b.lists()), lists, "no location was read");
+    let load = load_ring(
+        &cache,
+        &set,
+        &w.buckets(),
+        &w.kek,
+        &clock,
+        &w.claims,
+        &w.t,
+        2,
+        &[1],
+    )
+    .await
+    .unwrap();
+    assert!(load.failed.is_empty());
+    assert!(load.ring.gone(1));
+    assert!(load.ring.key(1).is_none());
+    assert!(!load.ring.gone(2));
+    w.claims.state.borrow_mut().gone.push(2);
+    let e = load_ring(
+        &cache,
+        &set,
+        &w.buckets(),
+        &w.kek,
+        &clock,
+        &w.claims,
+        &w.t,
+        2,
+        &[1],
+    )
+    .await
+    .err()
+    .unwrap();
+    assert!(
+        matches!((&e, &ERR_TK_CURRENT_GONE), (BridgeError::Crypto(a), BridgeError::Crypto(b)) if a == b)
+    );
 }
