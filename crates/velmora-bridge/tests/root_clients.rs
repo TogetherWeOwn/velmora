@@ -82,6 +82,18 @@ fn key() -> TenantKey {
     TenantKey::from_bytes(&id(), 1, derived("tenant key 1")).unwrap()
 }
 
+async fn after(
+    root: &Root<'_, Ports, TestRng>,
+    seq: u64,
+    closed: &[&str],
+) -> Result<velmora_bridge::unit_lease::client::KeyBatch> {
+    let feed = root.key_feed();
+    let tenant = unit_id();
+    let acked = feed.acked(&tenant).await;
+    let closed = closed.iter().map(|id| (*id).to_owned()).collect::<Vec<_>>();
+    feed.after(&tenant, seq, acked, &closed).await
+}
+
 /// What the fake unit object saw, and answers.
 #[derive(Default)]
 struct Objects {
@@ -410,7 +422,7 @@ fn the_feed_answers_every_record_after_the_unit_in_head_state_with_markers_in_pl
     let p = ports(records, None);
     let cache = RootCache::new();
     let root = Root::new(&p, &cache, TestRng(3));
-    let batch = block_on(root.key_feed().after(&unit_id(), 0)).unwrap();
+    let batch = block_on(after(&root, 0, &[])).unwrap();
     assert_eq!(batch.head, 5);
     assert!(batch.answers.is_empty());
     // No directory bound: nothing to wait for, nothing held.
@@ -451,16 +463,16 @@ fn the_feed_answers_every_record_after_the_unit_in_head_state_with_markers_in_pl
     assert_eq!(first.grants[0].ip_list, vec!["10.0.0.0/8".to_string()]);
     assert_eq!(first.grants[0].expires_at, Some(9_000));
     // From the unit's own seq: only what follows it.
-    let later = block_on(root.key_feed().after(&unit_id(), 3)).unwrap();
+    let later = block_on(after(&root, 3, &[])).unwrap();
     assert_eq!(later.head, 5);
     assert_eq!(
         keys(&later.entries),
         vec![(4, None), (5, Some(("PR0001", false)))]
     );
     // At the head: nothing, and a seq above the chain is refused.
-    let none = block_on(root.key_feed().after(&unit_id(), 5)).unwrap();
+    let none = block_on(after(&root, 5, &[])).unwrap();
     assert_eq!((none.head, none.entries.len()), (5, 0));
-    assert!(block_on(root.key_feed().after(&unit_id(), 6)).is_err());
+    assert!(block_on(after(&root, 6, &[])).is_err());
 }
 
 #[test]
@@ -478,7 +490,7 @@ fn the_feed_pages_past_one_apply() {
     let p = ports(records, None);
     let cache = RootCache::new();
     let root = Root::new(&p, &cache, TestRng(3));
-    let batch = block_on(root.key_feed().after(&unit_id(), 7)).unwrap();
+    let batch = block_on(after(&root, 7, &[])).unwrap();
     assert_eq!(batch.head, 230);
     let seqs: Vec<u64> = batch.entries.iter().map(UnitItem::seq).collect();
     assert_eq!(seqs, (8..=230).collect::<Vec<_>>());
@@ -492,7 +504,7 @@ fn with_a_directory_an_opening_it_has_not_acknowledged_is_held() {
     let cache = RootCache::new();
     let root = Root::new(&p, &cache, TestRng(3));
     // No row yet: nothing acknowledged, every opening held.
-    let batch = block_on(root.key_feed().after(&unit_id(), 0)).unwrap();
+    let batch = block_on(after(&root, 0, &[])).unwrap();
     assert_eq!(
         keys(&batch.entries),
         vec![
@@ -525,7 +537,7 @@ fn with_a_directory_an_opening_it_has_not_acknowledged_is_held() {
         .door;
     block_on(dir.apply_tenant(&door, NOW)).unwrap();
     assert!(block_on(dir.raise_keys_seq(&Tenant::Managed(id()), 1)).unwrap());
-    let batch = block_on(root.key_feed().after(&unit_id(), 0)).unwrap();
+    let batch = block_on(after(&root, 0, &[])).unwrap();
     assert_eq!(
         keys(&batch.entries),
         vec![
@@ -550,7 +562,7 @@ fn a_revocation_in_force_is_sent_as_revoked_and_never_held() {
     let p = ports(records, Some(directory_db()));
     let cache = RootCache::new();
     let root = Root::new(&p, &cache, TestRng(3));
-    let batch = block_on(root.key_feed().after(&unit_id(), 1)).unwrap();
+    let batch = block_on(after(&root, 1, &[])).unwrap();
     let two = entry_of(&batch.entries, 2);
     assert_eq!(
         two.status,
@@ -565,17 +577,17 @@ fn the_feed_fails_closed_without_key_locations_but_an_empty_chain_reads_no_key()
     let cache = RootCache::new();
     let root = Root::new(&p, &cache, TestRng(3));
     // No key record: nothing to load, the batch is empty.
-    let batch = block_on(root.key_feed().after(&unit_id(), 0)).unwrap();
+    let batch = block_on(after(&root, 0, &[])).unwrap();
     assert_eq!((batch.head, batch.entries.len()), (0, 0));
     // A record and no key locations: refused, never sent without its key.
     key_chain_records(&records);
-    assert!(block_on(root.key_feed().after(&unit_id(), 0)).is_err());
+    assert!(block_on(after(&root, 0, &[])).is_err());
     // Tenant 0 has no key feed here.
     let zero = velmora_bridge::unit::TenantId::parse(
         velmora_bridge::TenantScope::tenant_zero().tenant_id(),
     )
     .unwrap();
-    assert!(block_on(root.key_feed().after(&zero, 0)).is_err());
+    assert!(block_on(root.key_feed().after(&zero, 0, 0, &[])).is_err());
 }
 
 /// The unit learns an opening only from the directory's acknowledgement,
@@ -598,25 +610,28 @@ fn an_opening_below_the_units_seq_is_held_until_the_directory_has_it() {
     let p = ports(records, Some(directory_db()));
     let cache = RootCache::new();
     let root = Root::new(&p, &cache, TestRng(3));
-    // The unit holds up to 5 (PR0002 held there); nothing acknowledged.
-    let batch = block_on(root.key_feed().after(&unit_id(), 5)).unwrap();
+    // The unit holds up to 5; the directory has acknowledged nothing.
+    let batch = block_on(after(&root, 5, &["PR0002"])).unwrap();
     assert_eq!(keys(&batch.entries), vec![(6, Some(("PR0002", true)))]);
+    // The same seq with PR0002 already open must not close it again.
+    let batch = block_on(after(&root, 5, &[])).unwrap();
+    assert_eq!(keys(&batch.entries), vec![(6, Some(("PR0002", false)))]);
 }
 
-/// A directory that cannot be read acknowledges nothing and opens
-/// nothing: the feed fails, and the unit's `sync` is retried, rather than
-/// holding keys the unit may hold open.
+/// An unavailable directory cannot acknowledge an opening. The unit's
+/// actual set of closed subjects still distinguishes open keys.
 #[test]
-fn a_failed_directory_read_fails_the_feed() {
+fn a_failed_directory_read_acknowledges_nothing() {
     let records = active_records(true);
     key_chain_records(&records);
     // A database with no directory schema: every read of it fails.
     let p = ports(records, Some(RusqliteSql::open_in_memory().unwrap()));
     let cache = RootCache::new();
     let root = Root::new(&p, &cache, TestRng(3));
-    assert!(block_on(root.key_feed().after(&unit_id(), 0)).is_err());
-    // Nothing after the unit: no read at all, so no failure.
-    let none = block_on(root.key_feed().after(&unit_id(), 5)).unwrap();
+    assert_eq!(block_on(root.key_feed().acked(&unit_id())), 0);
+    let batch = block_on(after(&root, 0, &[])).unwrap();
+    assert!(entry_of(&batch.entries, 2).held);
+    let none = block_on(after(&root, 5, &[])).unwrap();
     assert_eq!((none.head, none.entries.len()), (5, 0));
 }
 
@@ -896,6 +911,18 @@ fn tenant_bring_up_syncs_and_a_separate_marker_call_delegates() {
                 state_seq: head.door.seq
             }
         );
+        let mut from = 1;
+        let calls = p.objects.calls.borrow().clone();
+        for call in calls {
+            if let UnitOp::Sync { head } = call.op {
+                assert_eq!(head.from_seq, from);
+                from = head.seqs.state_seq;
+                let mut wire = serde_json::to_value(head).unwrap();
+                assert!(wire.as_object_mut().unwrap().remove("from_seq").is_some());
+                assert!(serde_json::from_value::<velmora_bridge::unit::SyncHead>(wire).is_err());
+            }
+        }
+        assert_eq!(from, head.door.seq);
         assert!(marks.borrow().is_empty());
         units.mark_born(&tenant, 0).await.unwrap();
         assert_eq!(*marks.borrow(), [(tenant, 0)]);
@@ -910,6 +937,34 @@ fn capture_control_alerts() {
     CONTROL_ALERTS.with(|lines| lines.borrow_mut().clear());
     velmora_bridge::trace::log_alerts(|line| {
         CONTROL_ALERTS.with(|lines| lines.borrow_mut().push(line.into()));
+    });
+}
+
+#[test]
+fn tenant_bring_up_pages_a_sync_refusal_on_the_existing_alert_sink() {
+    use velmora_bridge::directory::finish::TenantUnits;
+    let mut p = ports(active_records(true), None);
+    let unit = born_unit(1);
+    block_on(unit.sql().exec(
+        "INSERT INTO buckets(id, name, owner, bdk_wrapped, kek_version, created_at) \
+         VALUES ('b_00000000000000b1', 'unexpected', 'fixture', x'02', 1, 1)",
+        &[],
+    ))
+    .unwrap();
+    p.unit = Some(unit);
+    let cache = RootCache::new();
+    let root = Root::new(&p, &cache, TestRng(3));
+    let tenant = id();
+    capture_control_alerts();
+    let units = root.tenant_units(async |_: &TenantId, _| Ok(()));
+    assert!(block_on(units.bring_up(&tenant, 0)).is_err());
+    CONTROL_ALERTS.with(|lines| {
+        assert_eq!(
+            *lines.borrow(),
+            [format!(
+                "tenant finisher (placements_off) tenant={tenant} unit=0"
+            )]
+        );
     });
 }
 
@@ -1159,11 +1214,12 @@ fn a_real_unit_syncs_to_the_head_from_the_feed() {
         let client = root
             .unit_client(&UnitName::new(unit_id(), 0), false)
             .unwrap();
-        let synced = block_on(client.sync(Seqs {
+        let (synced, pages) = block_on(client.sync(Seqs {
             state_seq,
             keys_seq: 0,
-        }))
-        .unwrap();
+        }));
+        assert!(pages.is_empty(), "{pages:?}");
+        let synced = synced.unwrap();
         let Synced::Synced { seqs } = synced else {
             panic!("{synced:?}")
         };

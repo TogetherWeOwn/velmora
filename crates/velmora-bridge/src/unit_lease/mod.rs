@@ -19,13 +19,17 @@
 //! - the unit's rows of all this: [`store`] (`unit_lease`,
 //!   `unit_revoked_ids`; migration `u0002`);
 //! - the Worker's side of `renew` and `sync`, rule 5 on the request
-//!   path, and the `renew` and `stamp_raise` jobs: [`client`].
+//!   path, and the `renew` and `stamp_raise` jobs: [`client`];
+//! - the alarm's hand-out of the unit's due work, routed as tenant 0's:
+//!   [`handout`].
 
 pub mod alarm;
 pub mod client;
+pub mod handout;
 pub mod job;
 pub mod lease;
 pub mod mark;
+pub mod placements;
 pub mod renewal;
 pub mod stamp_id;
 pub mod store;

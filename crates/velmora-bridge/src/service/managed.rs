@@ -41,7 +41,7 @@ use crate::unit::request::RequestRefusal;
 use crate::unit::size::SizeRefusal;
 use crate::unit::{CallKind, Refused, Seqs, TenantId, UnitAnswer, UnitName, UnitOp};
 use crate::unit_consumer::page_code;
-use crate::unit_lease::client::Page;
+use crate::unit_lease::client::{Answered, Page};
 use crate::unit_router::{RouteRefusal, Routed, UnitRouter};
 
 const fn line(code: &'static str, alert: bool) -> ManagedLine {
@@ -73,6 +73,8 @@ pub struct ManagedRequest {
     pub routed: std::result::Result<Routed, RouteRefusal>,
     /// The root unit's `key_row` for the claimed key.
     pub key_row: KeyRow,
+    /// The provisional answer, kept only when it must be re-read after SigV4.
+    pub expired_key_row: Option<Box<Answered>>,
     /// The unit client's pages so far (alerts).
     pub lines: Vec<ManagedLine>,
 }
@@ -164,12 +166,14 @@ pub async fn prepare<R: UnitRouter>(
         None => Ok(root.clone()),
         Some(bucket) => router.route(tenant, Some(bucket), floor).await,
     };
+    let expired_key_row = key_row.lease_expired.then(|| Box::new(answered));
     Prepared::Serve(ManagedRequest {
         scope,
         root,
         root_renew,
         routed,
         key_row,
+        expired_key_row,
         lines,
     })
 }

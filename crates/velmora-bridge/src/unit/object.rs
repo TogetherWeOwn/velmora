@@ -29,7 +29,9 @@
 //!   expired lease every call but the Worker's own (`sync`, `renew`, the
 //!   key apply, the import, the gate's and the restore's) and the stamp
 //!   check of a job (`stamp`, `stamp_rolled_back`) answers
-//!   [`UnitAnswer::RenewNeeded`]. `renew` sets the lease from a proof,
+//!   [`UnitAnswer::RenewNeeded`], but for an unauthenticated `key_row` of
+//!   a request, which is answered read-only and marked `lease_expired`
+//!   (AM-63: for the signature check only). `renew` sets the lease from a proof,
 //!   after it applied the revocations the proof listed; the `sync` that
 //!   sets a `restoring` entry closes it. Every answer leaves the unit as a
 //!   [`UnitReply`] with `lease_left_ms`, and `revoked` once it holds keys.
@@ -49,7 +51,7 @@ use base64::Engine as _;
 use serde_json::{json, Value};
 
 use super::birth::{check_token, BirthKind, BirthToken, ProvisionRefusal};
-use super::buckets;
+use super::buckets::{self, BucketRefusal, BucketsApplied};
 use super::call::{
     Closed, HoldMode, Reader, Refused, SyncHead, TenantState, UnitAnswer, UnitCall, UnitOp,
     UnitReply,
@@ -73,6 +75,7 @@ use crate::ports::{Catalog, Sql, SqlValue};
 use crate::sql::SqlCatalog;
 use crate::types::{BridgeError, BucketId, ExtentId, GenerationId, KeyStatus, Result, UnixMs};
 use crate::unit_lease::alarm::{self, AlarmRules, AlarmRun, Dues, Duty};
+use crate::unit_lease::handout::{self, Handout, HandoutRules};
 use crate::unit_lease::job::{self, UnitJobKind};
 use crate::unit_lease::lease::{Admit as LeaseAdmit, LeaseRefusal, LeaseRules, Proven};
 use crate::unit_lease::mark::{Mark, MarkedSql, WriteMark};
@@ -139,6 +142,34 @@ pub struct AlarmStep {
     /// The lease when the run was planned: a renewal that lands during
     /// the sends is not counted as one more failed try.
     pub planned_lease: Option<UnixMs>,
+    /// The unit's numbers: the hand-out's jobs carry them (format 2).
+    pub seqs: Seqs,
+    /// The due work handed out ([`Duty::HandOut`]): sent by the object
+    /// class through `velmora_bridge::routing`, after [`AlarmStep::jobs`].
+    pub handout: Handout,
+    /// The first write the raise covers (`first_write_at` before the
+    /// hand-out): pending again if its send fails.
+    pub covered: Option<UnixMs>,
+}
+
+/// What the object class sent of an [`AlarmStep`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AlarmSent {
+    /// A send of [`AlarmStep::jobs`] was refused (or the unit has no job
+    /// form: tenant 0).
+    pub failed: bool,
+    /// For each job of [`AlarmStep::handout`], whether it was sent.
+    pub handed_out: Vec<bool>,
+}
+
+impl AlarmSent {
+    /// Every send of `step` went through (`true`) or none did (`false`).
+    pub fn all(step: &AlarmStep, sent: bool) -> AlarmSent {
+        AlarmSent {
+            failed: !sent,
+            handed_out: vec![sent; step.handout.jobs.len()],
+        }
+    }
 }
 
 /// One unit over its database.
@@ -151,6 +182,8 @@ pub struct Unit<S: UnitSql> {
     jurisdiction: String,
     /// Where the size guard stands (ADR §2.6).
     size: SizeLimits,
+    /// What the Worker's configuration says about the alarm's hand-out.
+    handout_rules: HandoutRules,
     lease_rules: LeaseRules,
     alarm_rules: AlarmRules,
     /// The earliest time a call of this wake asked the alarm to be armed
@@ -176,7 +209,15 @@ impl<S: UnitSql> Unit<S> {
             wake: Cell::new(None),
             tables: Cell::new(None),
             size: SizeLimits::default(),
+            handout_rules: HandoutRules::ROWS_ONLY,
         }
+    }
+
+    /// The same unit with the hand-out at `rules` (the object class reads
+    /// them from the Worker's environment).
+    pub fn with_handout(mut self, rules: HandoutRules) -> Self {
+        self.handout_rules = rules;
+        self
     }
 
     /// The same unit with the size guard at `limits` (tests lower it).
@@ -687,6 +728,17 @@ impl<S: UnitSql> Unit<S> {
             }
         );
         if !stamp_check && self.lease_at(now)? == LeaseAdmit::RenewNeeded {
+            // AM-63: the S3 path's first call, an unauthenticated
+            // `key_row`, is still answered (read-only, marked
+            // `lease_expired`), so that a request whose signature verifies
+            // can renew as a signed call. Any other call, an authenticated
+            // `key_row` included, waits for the renewal.
+            if matches!(call.op, UnitOp::KeyRow { .. })
+                && call.kind == CallKind::Request
+                && !call.authenticated
+            {
+                return self.key_row_expired(call, &head);
+            }
             return Ok(UnitAnswer::RenewNeeded {
                 seqs: head.seqs,
                 why: None,
@@ -725,7 +777,7 @@ impl<S: UnitSql> Unit<S> {
             if let Err(r) = rc.check() {
                 return Ok(refused(Refused::Request(r), true));
             }
-            return self.request(&head, rc);
+            return self.request(&head, rc, now);
         }
         // A fan-out read names a grant: it is never a cold read, so it
         // is refused without `authenticated` (rule 11).
@@ -781,6 +833,12 @@ impl<S: UnitSql> Unit<S> {
                 // unit is behind its stamp and needs the gate (§8.6).
                 if recorded_rollback(&call.op, body) {
                     store::close(sql)?;
+                }
+                // A raise of the counter covers every write before it:
+                // the alarm's pending raise is cleared now, not when its
+                // message was sent (AM-48).
+                if raised_counter(&call.op, body) && self.has_tables()? {
+                    store::raise_landed(sql)?;
                 }
             }
             Ok(out)
@@ -1039,7 +1097,12 @@ impl<S: UnitSql> Unit<S> {
     /// A request call (L1-5): one transaction. A write that adds rows to
     /// a closing bucket is refused `not_found` (AM-57); a call that grows
     /// the database takes the size guard first (ADR §2.6).
-    fn request(&self, head: &Head, rc: &super::request::RequestCall) -> Result<UnitAnswer> {
+    fn request(
+        &self,
+        head: &Head,
+        rc: &super::request::RequestCall,
+        now: UnixMs,
+    ) -> Result<UnitAnswer> {
         let sql = self.sql();
         let grows = rc.grows();
         let database_size = match rc.adds_rows() {
@@ -1069,7 +1132,9 @@ impl<S: UnitSql> Unit<S> {
             }
             Ok(Ok(poll_once(rc.clone().run(&self.cat))??))
         };
-        Ok(match transact(sql, true, &mut op)? {
+        // AM-48: a request call that changed a row makes the stamp raise
+        // due, as a job's does.
+        Ok(match self.transact_noted(now, &mut op)? {
             Ok(body) => UnitAnswer::Ok {
                 seqs: head.seqs,
                 body,
@@ -1507,7 +1572,10 @@ impl<S: UnitSql> Unit<S> {
                     .map(|newly| json!({ "closing": true, "newly": newly }))
                     .map_err(Refused::Buckets))
             };
-            return Ok(match transact(sql, true, &mut op)? {
+            // AM-48: a close that marked the bucket makes the raise due
+            // (the Worker raises the stamp before the `DropBucket`
+            // record, ADR §6.2).
+            return Ok(match self.transact_noted(now, &mut op)? {
                 Ok(body) => ok(body),
                 Err(reason) => refused(reason, false),
             });
@@ -1753,9 +1821,31 @@ impl<S: UnitSql> Unit<S> {
         if next.seqs.keys_seq > head.seqs.keys_seq {
             return Ok(refused(Refused::KeysNotApplied, false));
         }
+        // The bucket part was built from `from_seq`: from any other base
+        // it would skip or repeat changes. The Worker reads again.
+        if next.from_seq != head.seqs.state_seq {
+            return Ok(refused(Refused::StaleSync, false));
+        }
+        // An entry is replaced only by a newer one (its `since_seq` is the
+        // seq of the record that set it): an older one comes from a sync
+        // that read the head before another sync landed.
+        if let (Some(have), Some(want)) = (head.restoring_since, next.restoring_since) {
+            if want < have {
+                return Ok(refused(Refused::StaleSync, false));
+            }
+        }
         let mode_ok = (next.tenant_state == TenantState::Suspended) == next.tenant_mode.is_some();
         if !mode_ok {
             return Err(BridgeError::Invalid("sync: mode without suspension"));
+        }
+        // AM-57: the bucket part's shape, before anything is read.
+        if let Err(r) = buckets::check_shape(
+            &next.buckets,
+            &next.placed,
+            head.seqs.state_seq,
+            next.seqs.state_seq,
+        ) {
+            return Ok(refused(Refused::Buckets(r), r.alarm()));
         }
         let sql = self.sql();
         // The entry's close time: kept while the same entry stays, the
@@ -1769,6 +1859,11 @@ impl<S: UnitSql> Unit<S> {
         let lifting = head.restoring_since.is_some() && next.restoring_since.is_none();
         let mut synced = None;
         let mut why = None;
+        let mut why_buckets = None;
+        let mut applied = BucketsApplied::default();
+        // An `unplaced` removes nothing while an entry is set at either
+        // end of this `sync`: the 30-day copy keeps its rows (AM-57 (3)).
+        let restoring = head.restoring_since.is_some() || next.restoring_since.is_some();
         let mut run = || -> Result<()> {
             if lifting {
                 // AM-2: the entry is cleared only on the unit's own lift
@@ -1809,21 +1904,63 @@ impl<S: UnitSql> Unit<S> {
             if n != 1 {
                 return Err(decode("unit_head"));
             }
+            // AM-57: the bucket records, in the same transaction. Then
+            // the closing rows the head no longer places are swept, and,
+            // outside a `restoring` entry (and in the `sync` that clears
+            // it), the rows must equal the head's list.
+            match buckets::apply(sql, &next.buckets, restoring, now)? {
+                Ok(done) => applied = done,
+                Err(r) => {
+                    why_buckets = Some(r);
+                    return Err(BridgeError::Invalid(ROLLBACK));
+                }
+            }
+            // Not while an entry stays or is set: the 30-day copy keeps
+            // its rows, a closing one too (AM-57 (3)). The sync that lifts
+            // the entry (its proof checked above) sweeps, as any sync with
+            // no entry after it.
+            if next.restoring_since.is_none() {
+                buckets::sweep_closing(sql, &next.placed)?;
+            }
+            if next.restoring_since.is_none() && !buckets::placement_check(sql, &next.placed)? {
+                why_buckets = Some(BucketRefusal::PlacementsOff);
+                return Err(BridgeError::Invalid(ROLLBACK));
+            }
             // Read inside the call, as in `provision`.
             synced = Some(self.head()?);
             Ok(())
         };
         match sql.atomically(&mut run) {
             Err(BridgeError::Invalid(ROLLBACK)) => {
+                if let Some(r) = why_buckets {
+                    // Nothing of the `sync` is kept (AM-57).
+                    return Ok(refused(Refused::Buckets(r), r.alarm()));
+                }
                 let r = why.ok_or(BridgeError::Invalid("rollback without a reason"))?;
                 return Ok(refused(Refused::Gate(r), false));
             }
             other => other?,
         }
         let head = synced.ok_or_else(|| decode("unit_head"))?;
+        // The lift opens the unit: what waited while it was closed (rows
+        // a job left as `Closed`, the import's outbox) is due, so the alarm
+        // runs now. Its lease was ended at the close: it sends `renew`, and
+        // the renewal arms the hand-out (RD-9; AM-50's `Closed` row).
+        if lifting {
+            self.want_wake(Some(now));
+        }
         Ok(UnitAnswer::Ok {
             seqs: head.seqs,
-            body: json!({ "synced": head.seqs.state_seq }),
+            body: json!({
+                "synced": head.seqs.state_seq,
+                "buckets": {
+                    "created": applied.created,
+                    "dropped": applied.dropped,
+                    // Kept closing because they still hold something: the
+                    // Worker pages `drop_not_closed` for the operator.
+                    "drop_not_closed": applied.drop_not_closed,
+                },
+            }),
         })
     }
 
@@ -1859,17 +1996,19 @@ impl<S: UnitSql> Unit<S> {
         let mut outcome: Option<std::result::Result<UnixMs, LeaseRefusal>> = None;
         let mut applied = 0;
         let mut run = || -> Result<()> {
-            let stamp = poll_once(self.cat.stamp(&stamp_id))??;
-            if stamp.rolled_back {
-                outcome = Some(Err(LeaseRefusal::RolledBack));
-                return Ok(());
-            }
+            // The listed revocations first: each is a fact of `m/rk/`,
+            // kept whatever the lease comes to (a rolled-back unit too).
             match store::revoke_listed(sql, listed, now)? {
                 Ok(n) => applied = n,
                 Err(_) => {
                     outcome = Some(Err(LeaseRefusal::BadList));
                     return Ok(());
                 }
+            }
+            let stamp = poll_once(self.cat.stamp(&stamp_id))??;
+            if stamp.rolled_back {
+                outcome = Some(Err(LeaseRefusal::RolledBack));
+                return Ok(());
             }
             let own = Proven {
                 state_seq: head.seqs.state_seq,
@@ -1900,7 +2039,7 @@ impl<S: UnitSql> Unit<S> {
             Ok(until) => {
                 // Work that waited for the renewal runs at once (RD-9).
                 let after = store::read(sql)?;
-                self.want_wake(alarm::after_renew(now, &self.dues(&after)));
+                self.want_wake(alarm::after_renew(now, &self.dues(&after)?));
                 Ok(UnitAnswer::Ok {
                     seqs: head.seqs,
                     body: json!({ "fresh_until": until.0, "applied": applied }),
@@ -1910,15 +2049,35 @@ impl<S: UnitSql> Unit<S> {
         }
     }
 
-    /// When each duty of the alarm is due. Only the stamp raise is built
-    /// (§8.5); the day close (W7), the sweeps, the job hand-out and the
-    /// report to the directory are not due on a unit yet: the Worker's
-    /// cron runs the jobs of a unit through `TenantCatalog`.
-    fn dues(&self, row: &store::LeaseRow) -> Dues {
-        Dues::none().with(
-            Duty::StampRaise,
+    /// When each duty of the alarm is due: the stamp raise (§8.5), one
+    /// period after the first write since the last raise, or one period
+    /// after a raise that was handed out and has not landed (AM-48); and
+    /// the hand-out of the unit's due work (`unit_lease::handout`). The
+    /// day close (W7), the sweeps and the report to the directory are not
+    /// due on a unit yet.
+    fn dues(&self, row: &store::LeaseRow) -> Result<Dues> {
+        let period = self.alarm_rules.stamp_period_ms;
+        let pending = row.raise_from.map(|at| UnixMs(at.0.saturating_add(period)));
+        let raise = [
             alarm::stamp_raise_due(row.first_write_at, &self.alarm_rules),
-        )
+            pending,
+        ]
+        .into_iter()
+        .flatten()
+        .min();
+        // A tenant that is being shredded takes no job (AM-50: they are
+        // acknowledged and their rows stay): nothing is handed out.
+        let shredding = matches!(
+            self.head()?.tenant_state,
+            TenantState::Shredding | TenantState::Shredded
+        );
+        let handout = match shredding {
+            true => None,
+            false => handout::due_at(&self.cat, &self.handout_rules)?,
+        };
+        Ok(Dues::none()
+            .with(Duty::StampRaise, raise)
+            .with(Duty::HandOut, handout))
     }
 
     /// Whether the unit takes no `renew` and no job: a `restoring` entry,
@@ -1945,6 +2104,12 @@ impl<S: UnitSql> Unit<S> {
             jobs: Vec::new(),
             raise: false,
             planned_lease: None,
+            seqs: Seqs {
+                state_seq: 0,
+                keys_seq: 0,
+            },
+            handout: Handout::default(),
+            covered: None,
         };
         self.tables.set(None);
         match self.born()? {
@@ -1958,33 +2123,50 @@ impl<S: UnitSql> Unit<S> {
         let head = self.head()?;
         let lease = row.lease();
         let closed = self.closed(&head)?;
-        // A raise a dead run handed out is pending again. Written only
-        // then, and not on a closed unit: an idle or closed wake writes
-        // nothing (a restore's check 4, a dump's mark).
-        if row.raise_from.is_some() && !closed {
-            let mut settle = || store::settle_dead_raise(sql);
+        // A raise handed out a period ago that has not landed is pending
+        // again. Written only then, and not on a closed unit: an idle or
+        // closed wake writes nothing (a restore's check 4, a dump's mark).
+        let period = self.alarm_rules.stamp_period_ms;
+        if row
+            .raise_from
+            .is_some_and(|at| at.0.saturating_add(period) <= now.0)
+            && !closed
+        {
+            let mut settle = || store::settle_dead_raise(sql, now, period).map(|_| ());
             sql.atomically(&mut settle)?;
             row = store::read(sql)?;
         }
         let run = alarm::on_alarm(
             now,
             &row.at(&lease, closed),
-            &self.dues(&row),
+            &self.dues(&row)?,
             &self.lease_rules,
             &self.alarm_rules,
         );
         let mut jobs = Vec::new();
         let mut raise = false;
+        let mut out = Handout::default();
         for duty in &run.run {
-            // The other duties are never due here (`dues`).
-            if *duty == Duty::StampRaise {
-                raise = true;
-                jobs.push(job::message(
-                    UnitJobKind::StampRaise,
-                    &self.own,
-                    head.seqs,
-                    now,
-                ));
+            match duty {
+                Duty::StampRaise => {
+                    raise = true;
+                    jobs.push(job::message(
+                        UnitJobKind::StampRaise,
+                        &self.own,
+                        head.seqs,
+                        now,
+                    ));
+                }
+                // Tenant 0 has no job form: nothing is handed out for it.
+                Duty::HandOut if !self.own.tenant.is_zero() => {
+                    let mut plan = || {
+                        out = handout::plan(&self.cat, now, &self.handout_rules)?;
+                        Ok(())
+                    };
+                    sql.atomically(&mut plan)?;
+                }
+                // The other duties are never due here (`dues`).
+                _ => {}
             }
         }
         if run.send_renew {
@@ -1994,17 +2176,20 @@ impl<S: UnitSql> Unit<S> {
             .into_iter()
             .collect::<Option<Vec<_>>>()
             .unwrap_or_default();
-        // The raise is handed out before the send (kept in `raise_from`
-        // until the send ends): a write during the send is then pending a
-        // raise of its own.
+        // The raise is handed out before the send (`raise_from` keeps the
+        // hand-out until the stamp lands): a write during the send is then
+        // pending a raise of its own.
         if raise && !jobs.is_empty() {
-            let mut take = || store::take_first_write(sql);
+            let mut take = || store::take_first_write(sql, now);
             sql.atomically(&mut take)?;
         }
         Ok(AlarmStep {
             jobs,
             raise,
             planned_lease: row.fresh_until,
+            seqs: head.seqs,
+            handout: out,
+            covered: row.first_write_at,
             run,
         })
     }
@@ -2019,19 +2204,26 @@ impl<S: UnitSql> Unit<S> {
         &self,
         now: UnixMs,
         step: &AlarmStep,
-        failed: bool,
+        sent: &AlarmSent,
     ) -> Result<Option<UnixMs>> {
         self.tables.set(None);
         if step.run.run.is_empty() && !step.run.send_renew {
             // Woken for nothing: arm what is due, if anything.
             return self.alarm_next(now, None);
         }
-        let failed =
-            failed || step.jobs.len() != step.run.run.len() + usize::from(step.run.send_renew);
+        // One unit job per raise and per renewal; tenant 0 has none.
+        let own_jobs = usize::from(step.raise) + usize::from(step.run.send_renew);
+        let handed_out =
+            sent.handed_out.len() == step.handout.jobs.len() && sent.handed_out.iter().all(|s| *s);
+        let failed = sent.failed || step.jobs.len() != own_jobs || !handed_out;
         let sql = self.sql();
         let mut run = || {
             if step.raise && !step.jobs.is_empty() {
-                store::raise_sent(sql, !failed)?;
+                store::raise_sent(sql, !sent.failed, step.covered)?;
+            }
+            if step.run.run.contains(&Duty::HandOut) {
+                let marks = &sent.handed_out[..sent.handed_out.len().min(step.handout.jobs.len())];
+                handout::done(&self.cat, now, &step.handout, marks)?;
             }
             store::alarm_ran(sql, step.run.send_renew, step.planned_lease, failed)
         };
@@ -2053,7 +2245,7 @@ impl<S: UnitSql> Unit<S> {
         Ok(alarm::next_alarm(
             now,
             &row.at(&lease, closed),
-            &self.dues(&row),
+            &self.dues(&row)?,
             retry_at,
             &self.lease_rules,
             &self.alarm_rules,
@@ -2120,6 +2312,17 @@ fn raises_stamp(op: &UnitOp) -> bool {
                 | JobCall::set_cursor { .. }
         }
     )
+}
+
+/// Whether `body` is the answer of a `stamp_advance` job call that moved
+/// the counter.
+fn raised_counter(op: &UnitOp, body: &Value) -> bool {
+    matches!(
+        op,
+        UnitOp::Job {
+            call: JobCall::stamp_advance { .. }
+        }
+    ) && body == &Value::Bool(true)
 }
 
 /// Whether `body` is the answer of a `stamp_rolled_back` job call that

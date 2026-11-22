@@ -14,21 +14,23 @@
 //!   only grows, and a close keeps it (AM-2 check 3).
 //! - [`note_write`]: the first write since the last stamp raise the alarm
 //!   asked for (the due time of [`super::alarm::Duty::StampRaise`]).
-//! - [`revoked`]: the revoked keys the unit holds, counted once per id:
-//!   revoked key rows (not principals: `m/rk/` names access keys only) and
-//!   listed ids it holds no row for. This is the
+//! - [`revoked`]: the revoked subjects the unit holds, counted once per
+//!   id: revoked key and principal rows (`m/rk/<t>/` names both, AM-72)
+//!   and listed ids it holds no row for. This is the
 //!   number every answer carries and the renewal proof compares with the
 //!   listing of `m/rk/<t>/` (SEC-6).
-//! - [`revoke_listed`]: applies the ids a renewal listed: a key row is
-//!   revoked, an id without a row is kept as listed.
+//! - [`revoke_listed`]: applies the ids a renewal listed: a key or
+//!   principal row is revoked (a principal's keys then lose their
+//!   effective grant, their rows keep their status), an id without a row
+//!   is kept as listed.
 //! - [`enforce_listed`]: after a key-chain apply, a row of a listed id is
 //!   revoked whatever its record says (a revocation overrides every
 //!   `m/k/` status, ADR §8.5).
 
 use std::collections::BTreeSet;
 
+use crate::keys::revocations::revocable_id;
 use crate::ports::{Sql, SqlValue};
-use crate::recovery::valid_key_id;
 use crate::types::{BridgeError, Result, UnixMs};
 use crate::unit::keys;
 use crate::unit::object::poll_once;
@@ -49,7 +51,8 @@ pub struct LeaseRow {
     pub renew_tries: u32,
     pub failed_runs: u32,
     pub first_write_at: Option<UnixMs>,
-    /// The first write of a raise being sent (`take_first_write`).
+    /// When the alarm handed out a raise that has not landed yet
+    /// (`take_first_write`, `raise_landed`).
     pub raise_from: Option<UnixMs>,
 }
 
@@ -173,43 +176,67 @@ pub fn note_write<S: Sql>(sql: &S, now: UnixMs) -> Result<bool> {
     Ok(n == 1)
 }
 
-/// A raise that a run handed out and never settled (the object reset
-/// during its send) is pending again: back into `first_write_at`, the
-/// earlier of the two. The alarm calls this first.
-pub fn settle_dead_raise<S: Sql>(sql: &S) -> Result<()> {
+/// A raise the alarm handed out at `raise_from` that has not landed one
+/// stamp period later (its message was lost, acknowledged under
+/// maintenance, or its consumer failed) is pending again: `first_write_at`
+/// becomes the earlier of the two, so the raise is due at once, and
+/// `raise_from` is cleared (AM-48, AM-50: an acknowledged raise costs at
+/// most one alarm period). A raise still in its period stays pending.
+/// `true` = one was settled. The alarm calls this first.
+pub fn settle_dead_raise<S: Sql>(sql: &S, now: UnixMs, period_ms: i64) -> Result<bool> {
+    let n = poll_once(sql.exec(
+        "UPDATE unit_lease SET \
+           first_write_at = CASE WHEN first_write_at IS NULL OR first_write_at > raise_from \
+             THEN raise_from ELSE first_write_at END, \
+           raise_from = NULL \
+         WHERE id = 1 AND raise_from IS NOT NULL AND raise_from <= ?1",
+        &[SqlValue::Int(now.0.saturating_sub(period_ms))],
+    ))??;
+    Ok(n == 1)
+}
+
+/// The alarm hands out the stamp raise at `now`: the writes it covers
+/// leave `first_write_at`, so a write during the send is pending a raise
+/// of its own, and `raise_from` keeps the hand-out time until the stamp
+/// call lands ([`raise_landed`]) or the raise is found dead
+/// ([`settle_dead_raise`]).
+pub fn take_first_write<S: Sql>(sql: &S, now: UnixMs) -> Result<()> {
+    write_one(
+        sql,
+        "UPDATE unit_lease SET raise_from = ?1, first_write_at = NULL WHERE id = 1",
+        &[SqlValue::Int(now.0)],
+    )
+}
+
+/// The send of the raise ended. Sent: the raise stays pending until its
+/// stamp call lands (AM-48). Not sent: the writes it covered, from
+/// `covered` (the `first_write_at` it took), are pending again, and the
+/// hand-out is undone.
+pub fn raise_sent<S: Sql>(sql: &S, sent: bool, covered: Option<UnixMs>) -> Result<()> {
+    if sent {
+        return Ok(());
+    }
+    let covered = covered.map_or(SqlValue::Null, |at| SqlValue::Int(at.0));
     write_one(
         sql,
         "UPDATE unit_lease SET \
-           first_write_at = CASE WHEN raise_from IS NULL THEN first_write_at \
-             WHEN first_write_at IS NULL OR first_write_at > raise_from THEN raise_from \
+           first_write_at = CASE WHEN ?1 IS NULL THEN first_write_at \
+             WHEN first_write_at IS NULL OR first_write_at > ?1 THEN ?1 \
              ELSE first_write_at END, \
            raise_from = NULL WHERE id = 1",
-        &[],
+        &[covered],
     )
 }
 
-/// The alarm hands out the stamp raise: the writes it covers move from
-/// `first_write_at` to `raise_from`, so a write during the send is
-/// pending a raise of its own.
-pub fn take_first_write<S: Sql>(sql: &S) -> Result<()> {
-    write_one(
-        sql,
-        "UPDATE unit_lease SET raise_from = first_write_at, first_write_at = NULL WHERE id = 1",
+/// A stamp call raised the unit's counter: every write before it is
+/// covered, so a raise the alarm handed out is no longer pending (AM-48).
+/// Called in the transaction of that call.
+pub fn raise_landed<S: Sql>(sql: &S) -> Result<()> {
+    poll_once(sql.exec(
+        "UPDATE unit_lease SET raise_from = NULL WHERE id = 1 AND raise_from IS NOT NULL",
         &[],
-    )
-}
-
-/// The send of the raise ended: sent (`raise_from` is done with), or not
-/// (its writes are pending again, from the earlier of the two times).
-pub fn raise_sent<S: Sql>(sql: &S, sent: bool) -> Result<()> {
-    if sent {
-        return write_one(
-            sql,
-            "UPDATE unit_lease SET raise_from = NULL WHERE id = 1",
-            &[],
-        );
-    }
-    settle_dead_raise(sql)
+    ))??;
+    Ok(())
 }
 
 /// What one alarm run did, as the row keeps it: a renew job sent counts
@@ -236,15 +263,14 @@ pub fn alarm_ran<S: Sql>(
     )
 }
 
-/// The revoked keys the unit holds, each id once: key rows that are
-/// `revoked` (a principal is not a key: `m/rk/` never names one, so
-/// counting it would make every renewal short), and listed ids without a
-/// row. `None` = the unit holds no key and no listed id (its answers
+/// The revoked subjects the unit holds, each id once: key and principal
+/// rows that are `revoked` (`m/rk/<t>/` names both, AM-72, so the count
+/// meets the listing), and listed ids without a row. `None` = the unit holds no key and no listed id (its answers
 /// carry no `revoked`). [`present`] first.
 pub fn revoked<S: Sql>(sql: &S) -> Result<Option<u64>> {
     let rows = poll_once(sql.query(
         "SELECT (SELECT count(*) FROM ( \
-                   SELECT id FROM unit_keys WHERE status = 'revoked' AND kind <> 'principal' \
+                   SELECT id FROM unit_keys WHERE status = 'revoked' \
                    UNION SELECT id FROM unit_revoked_ids)), \
                 EXISTS (SELECT 1 FROM unit_keys) OR EXISTS (SELECT 1 FROM unit_revoked_ids)",
         &[],
@@ -257,12 +283,11 @@ pub fn revoked<S: Sql>(sql: &S) -> Result<Option<u64>> {
     }
 }
 
-/// Whether the unit holds `id` as revoked: a `revoked` key row, or a
-/// listed id.
+/// Whether the unit holds `id` as revoked: a `revoked` key or principal
+/// row, or a listed id.
 pub fn holds_revoked<S: Sql>(sql: &S, id: &str) -> Result<bool> {
     let rows = poll_once(sql.query(
-        "SELECT EXISTS (SELECT 1 FROM unit_keys WHERE id = ?1 AND status = 'revoked' \
-                            AND kind <> 'principal') \
+        "SELECT EXISTS (SELECT 1 FROM unit_keys WHERE id = ?1 AND status = 'revoked') \
              OR EXISTS (SELECT 1 FROM unit_revoked_ids WHERE id = ?1)",
         &[SqlValue::Text(id.to_string())],
     ))??;
@@ -277,15 +302,17 @@ pub fn holds_revoked<S: Sql>(sql: &S, id: &str) -> Result<bool> {
 pub enum ListRefused {
     /// More than [`MAX_LISTED`] ids.
     TooMany,
-    /// An id that is not an access key id (the Worker skips those when
-    /// it lists, so one here is a bug in the caller).
+    /// An id that is neither an access key id nor a principal id (the
+    /// Worker skips those when it lists, so one here is a bug in the
+    /// caller).
     Malformed,
 }
 
-/// Applies the ids a renewal listed (`m/rk/<t>/<id>`): a key row is
-/// revoked (and the catalogue's served rows rebuilt, down its `made_by`
-/// chain), an id without a row, or one that names a principal row (left
-/// as it is), is kept in `unit_revoked_ids`. Setting
+/// Applies the ids a renewal listed (`m/rk/<t>/<id>`): a key or
+/// principal row is revoked (and the catalogue's served rows rebuilt,
+/// down its `made_by` chain, so a principal's keys lose their effective
+/// grant while their rows keep their status), an id without a row is kept
+/// in `unit_revoked_ids`. Setting
 /// `revoked` twice changes nothing. Answers how many ids changed.
 pub fn revoke_listed<S: Sql>(
     sql: &S,
@@ -295,28 +322,18 @@ pub fn revoke_listed<S: Sql>(
     if ids.len() > MAX_LISTED {
         return Ok(Err(ListRefused::TooMany));
     }
-    if !ids.iter().all(|id| valid_key_id(id)) {
+    if !ids.iter().all(|id| revocable_id(id)) {
         return Ok(Err(ListRefused::Malformed));
     }
     let mut touched = BTreeSet::new();
     let mut changed = 0;
     for id in ids {
         let rows = poll_once(sql.query(
-            "SELECT status, kind FROM unit_keys WHERE id = ?1",
+            "SELECT status FROM unit_keys WHERE id = ?1",
             &[SqlValue::Text(id.clone())],
         ))??;
-        let row = rows.first().map(|r| (r.first(), r.get(1)));
-        // A principal is not a key: the listed id is kept on its own,
-        // so the count and the check agree with the listing.
-        let principal = matches!(row, Some((_, Some(SqlValue::Text(k)))) if k == "principal");
-        match row.map(|(status, _)| status) {
-            _ if principal => {
-                changed += poll_once(sql.exec(
-                    "INSERT INTO unit_revoked_ids(id, listed_at) VALUES (?1, ?2) \
-                     ON CONFLICT(id) DO NOTHING",
-                    &[SqlValue::Text(id.clone()), SqlValue::Int(now.0)],
-                ))?? as usize;
-            }
+        // A key row and a principal row alike (AM-72).
+        match rows.first().map(|r| r.first()) {
             Some(Some(SqlValue::Text(status))) if status == "revoked" => {}
             Some(Some(SqlValue::Text(_))) => {
                 poll_once(sql.exec(
@@ -340,12 +357,13 @@ pub fn revoke_listed<S: Sql>(
     Ok(Ok(changed))
 }
 
-/// After a key-chain apply: every key row whose id a renewal listed is
-/// revoked, whatever the record said, and its served rows rebuilt.
+/// After a key-chain apply: every key or principal row whose id a renewal
+/// listed is revoked, whatever the record said, and its served rows
+/// rebuilt (a principal's down its keys).
 pub fn enforce_listed<S: Sql>(sql: &S) -> Result<usize> {
     let rows = poll_once(sql.query(
         "SELECT k.id FROM unit_revoked_ids r JOIN unit_keys k ON k.id = r.id \
-          WHERE k.status <> 'revoked' AND k.kind <> 'principal'",
+          WHERE k.status <> 'revoked'",
         &[],
     ))??;
     let mut touched = BTreeSet::new();

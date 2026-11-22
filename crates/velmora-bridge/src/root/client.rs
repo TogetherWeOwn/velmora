@@ -21,14 +21,15 @@
 //! [`RootCache::flights`]: super::RootCache::flights
 
 use crate::config::Maintenance;
-use crate::directory::chain::TenantChain;
+use crate::directory::chain::{ChainError, ReadRecord, TenantChain};
+use crate::directory::record::{Tenant, TenantDoor};
 use crate::directory::seal::DoorSeal;
 use crate::jobmsg::{ControlIntent, IntentChain};
 use crate::ports::{BlobEntry, BlobMeta, BlobStore, Clock};
 use crate::recovery::Unpublished;
 use crate::types::{BridgeError, ByteSpan, Result, UnixMs};
 use crate::unit::{TenantId, UnitName};
-use crate::unit_lease::client::{KeyFinisher, RecordNames, UnitClient, UnitReplies};
+use crate::unit_lease::client::{KeyFinisher, RecordNames, TenantHeads, UnitClient, UnitReplies};
 use crate::unit_lease::lease::LeaseRules;
 use crate::unit_router::{RequestClients, Routed, Router};
 use velmora::rng::FillRandom;
@@ -134,7 +135,7 @@ pub type RootUnitClient<'r, 'a, P, R> = UnitClient<
     Shared<'a, <P as UnitPorts>::Safety>,
     Shared<'a, <P as RootPorts>::Clock>,
     RecordNames,
-    RootHeads<'r, 'a, P>,
+    RootUnitHeads<'r, 'a, P, R>,
     RootKeyFeed<'r, 'a, P, R>,
     RootFinisher<'a, <P as UnitPorts>::Control>,
 >;
@@ -142,6 +143,55 @@ pub type RootUnitClient<'r, 'a, P, R> = UnitClient<
 /// The tenant heads the root reads (door parts only).
 pub type RootHeads<'r, 'a, P> =
     TenantChain<'r, <P as RootPorts>::Records, DoorSeal<'a, <P as RootPorts>::Kek>>;
+
+/// The unit client's chain reader: heads are door-only, but a sync also
+/// needs the verified private part of each bucket creation on its unit.
+pub struct RootUnitHeads<'r, 'a, P: RootPorts, R> {
+    root: &'r Root<'a, P, R>,
+    unit: u32,
+}
+
+impl<P: RootPorts, R: FillRandom> TenantHeads for RootUnitHeads<'_, '_, P, R> {
+    async fn head(
+        &self,
+        tenant: &TenantId,
+        known: u64,
+    ) -> std::result::Result<Option<TenantDoor>, ChainError> {
+        TenantHeads::head(&self.root.heads(), tenant, known).await
+    }
+
+    async fn record(
+        &self,
+        tenant: &TenantId,
+        seq: u64,
+    ) -> std::result::Result<Option<ReadRecord>, ChainError> {
+        let Some(record) = self.root.heads().record(tenant, seq).await? else {
+            return Ok(None);
+        };
+        let needs_private = record.door.bucket_created.as_ref().is_some_and(|created| {
+            record
+                .door
+                .placements
+                .iter()
+                .any(|p| p.unit == self.unit && p.bucket == created.bucket)
+        });
+        if !needs_private {
+            return Ok(Some(record));
+        }
+        let t = &record.door.tenant;
+        let Tenant::Managed(tenant) = t else {
+            return Err(ChainError::Damaged("bucket_create_not_managed"));
+        };
+        let chain = self.root.chain();
+        match chain.read(t, seq).await {
+            Err(ChainError::KeyNotHeld { version }) => {
+                self.root.load_for(tenant, &record.door, version).await?;
+                chain.read(t, seq).await
+            }
+            other => other,
+        }
+    }
+}
 
 /// The router over the root's clients and heads.
 pub type RootRouter<'r, 'a, P, R> =
@@ -162,7 +212,10 @@ impl<'a, P: UnitPorts, R: FillRandom> Root<'a, P, R> {
             safety: Shared(self.ports.safety()),
             clock: Shared(self.ports.clock()),
             names: RecordNames,
-            heads: self.heads(),
+            heads: RootUnitHeads {
+                root: self,
+                unit: name.unit,
+            },
             keys: self.key_feed(),
             finisher: RootFinisher {
                 control: self.ports.control(),

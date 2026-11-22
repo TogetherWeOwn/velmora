@@ -77,7 +77,7 @@ use crate::ports::{Clock, Kek, Sql};
 use crate::records::RecordStore;
 use crate::types::{BridgeError, Result, UnixMs};
 use crate::unit::Seqs;
-use crate::unit_lease::client::InFlight;
+use crate::unit_lease::client::{InFlight, Sleep};
 use crate::unit_router::{HeadCache, KeyRoutes, KeyTenant, HEAD_MAX_AGE_MS};
 use crate::TenantId;
 
@@ -140,6 +140,14 @@ pub struct RootCache {
 impl RootCache {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Use the isolate's request-local timer for shared renewals and syncs.
+    pub fn with_sleep(sleep: Sleep) -> Self {
+        Self {
+            flights: InFlight::with_sleep(sleep),
+            ..Self::default()
+        }
     }
 }
 

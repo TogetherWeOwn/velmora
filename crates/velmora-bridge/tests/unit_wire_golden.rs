@@ -45,9 +45,9 @@ use velmora_bridge::unit::{
 use velmora_bridge::unit_lease::lease::{LeaseRefusal, Proven};
 use velmora_bridge::{
     BucketId, CommitGeneration, CompleteUpload, CopyGeneration, ExtentId, ExtentPlacement,
-    ExtentRow, ExtentState, GenerationId, GenerationRow, GenerationState, Lease, ListQuery,
+    ExtentRow, ExtentState, GenerationId, GenerationRow, GenerationState, Job, Lease, ListQuery,
     OutboxStage, Precondition, SafetyState, UnixMs, UploadId, UploadListQuery, UploadPartRow,
-    UploadRow, UploadState, WriteId,
+    UploadRow, UploadState, WriteId, JOB_VERSION,
 };
 
 const GOLDEN: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/golden/unit-wire.json");
@@ -142,6 +142,7 @@ fn request_kind(c: &RequestCall) -> &'static str {
         | RequestCall::touch_read { .. }
         | RequestCall::record_cache_fill { .. }
         | RequestCall::upload { .. }
+        | RequestCall::upload_state { .. }
         | RequestCall::list_uploads { .. }
         | RequestCall::upload_extents { .. }
         | RequestCall::upload_extents_held { .. }
@@ -171,6 +172,7 @@ fn request_kind(c: &RequestCall) -> &'static str {
         | RequestCall::put_upload_part_sliced { .. }
         | RequestCall::complete_upload { .. }
         | RequestCall::abort_upload { .. }
+        | RequestCall::unmark_sent { .. }
         | RequestCall::fence_upload { .. } => c.name(),
     }
 }
@@ -225,6 +227,7 @@ fn ops() -> Vec<UnitOp> {
         },
         UnitOp::Sync {
             head: SyncHead {
+                from_seq: seqs().state_seq - 1,
                 seqs: seqs(),
                 tenant_state: TenantState::Suspended,
                 tenant_mode: Some(HoldMode::ReadOnly),
@@ -240,6 +243,8 @@ fn ops() -> Vec<UnitOp> {
                     )]
                     .into(),
                 }),
+                buckets: vec![],
+                placed: vec![bucket_id().to_string()],
             },
         },
         UnitOp::Renew {
@@ -678,6 +683,10 @@ fn nested() -> Value {
                 seq: 10,
                 buckets: vec!["b_00000000000000f2".into()],
             },
+            BucketChange::Removed {
+                seq: 11,
+                buckets: vec!["b_00000000000000f3".into(), "b_00000000000000f4".into()],
+            },
         ])
         .unwrap(),
         "reservation_bodies": reservation_bodies(),
@@ -864,6 +873,11 @@ fn requests() -> Vec<RequestCall> {
             key: k(),
             upload: upload_id(),
         },
+        RequestCall::upload_state {
+            bucket: b(),
+            key: k(),
+            upload: upload_id(),
+        },
         RequestCall::list_uploads {
             bucket: b(),
             q: UploadListQuery {
@@ -1028,6 +1042,15 @@ fn requests() -> Vec<RequestCall> {
             upload: upload_id(),
             now: UnixMs(1_000),
         },
+        RequestCall::unmark_sent {
+            jobs: vec![Job::Extent {
+                v: JOB_VERSION,
+                extent: x(),
+                generation: gen_id(),
+                stage: OutboxStage::Post,
+            }],
+            mark: UnixMs(1_000),
+        },
         RequestCall::fence_upload {
             bucket: b(),
             key: k(),
@@ -1139,7 +1162,10 @@ fn answers() -> Vec<UnitAnswer> {
     let mut out = vec![
         UnitAnswer::Ok {
             seqs: seqs(),
-            body: json!({ "synced": 7 }),
+            body: json!({
+                "synced": 7,
+                "buckets": { "created": 0, "dropped": 0, "drop_not_closed": [] },
+            }),
         },
         UnitAnswer::SyncNeeded { seqs: seqs() },
         UnitAnswer::Stale { seqs: seqs() },
@@ -1267,7 +1293,7 @@ fn every_variant_has_a_sample() {
     let ops: std::collections::BTreeSet<_> = ops().iter().map(op_kind).collect();
     assert_eq!(ops.len(), 30, "{ops:?}");
     let requests: std::collections::BTreeSet<_> = requests().iter().map(request_kind).collect();
-    assert_eq!(requests.len(), 51, "{requests:?}");
+    assert_eq!(requests.len(), 53, "{requests:?}");
     let readers: std::collections::BTreeSet<_> = ops_readers().into_iter().collect();
     assert_eq!(readers.len(), 2, "both readers have a sample");
     // The variants that carry data, each with a sample (exhaustive).
@@ -1313,6 +1339,38 @@ fn the_wire_format_is_the_golden_file() {
         text, golden,
         "the unit wire format changed: see the module doc"
     );
+}
+
+/// Sync accepts an omitted bucket delta, but requires the base sequence and placements.
+#[test]
+fn sync_defaults_to_no_bucket_changes_but_requires_the_base_and_placements() {
+    let from_seq = seqs().state_seq - 1;
+    let wire = json!({
+        "op": "sync",
+        "head": {
+            "from_seq": from_seq,
+            "seqs": seqs(),
+            "tenant_state": "active",
+            "placed": [],
+        },
+    });
+    let UnitOp::Sync { head } = serde_json::from_value(wire.clone()).unwrap() else {
+        panic!("expected a sync operation");
+    };
+    assert_eq!(head.from_seq, from_seq);
+    assert!(head.buckets.is_empty());
+    assert!(head.placed.is_empty());
+
+    for field in ["from_seq", "placed"] {
+        let mut wire = wire.clone();
+        wire["head"].as_object_mut().unwrap().remove(field).unwrap();
+        let err = serde_json::from_value::<UnitOp>(wire).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains(&format!("missing field `{field}`")),
+            "{err}"
+        );
+    }
 }
 
 fn ops_readers() -> Vec<&'static str> {

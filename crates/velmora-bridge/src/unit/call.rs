@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::birth::{BirthToken, ProvisionRefusal};
-use super::buckets::BucketRefusal;
+use super::buckets::{BucketChange, BucketRefusal};
 use super::export::{ExportMode, ExportRefusal, ExportTable};
 use super::identity::{CallKind, Refusal, Seqs};
 use super::import::{ImportBatch, ImportCount, ImportRefusal, ImportValue, MoveHead};
@@ -63,6 +63,21 @@ pub struct SyncHead {
     /// ids): the unit lifts only when its own check gives the same.
     #[serde(default)]
     pub lift: Option<LiftProof>,
+    /// The unit's `state_seq` that the Worker read and built `buckets`
+    /// from. Required: a unit at another seq refuses the `sync`
+    /// `stale_sync` and the Worker reads again, so a part built from
+    /// another base (a second isolate's sync landed first, or a restore
+    /// took the unit back) is never applied.
+    pub from_seq: u64,
+    /// AM-57: the bucket changes of the tenant records this `sync` moves
+    /// past (after `from_seq`, up to `seqs.state_seq`), for the buckets
+    /// placed on this unit, in seq order.
+    #[serde(default)]
+    pub buckets: Vec<BucketChange>,
+    /// AM-57: every bucket id the record at `seqs.state_seq` places on
+    /// this unit. Required: a `sync` without it does not decode, so no
+    /// sender can skip the placement check by leaving it out.
+    pub placed: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

@@ -36,7 +36,12 @@ where
         let Some(seen) = client.unit_seqs().await? else {
             return Ok(UnitHolds::Unborn);
         };
-        match client.sync(seen).await? {
+        let (synced, pages) = client.sync(seen).await;
+        for page in pages {
+            let code = crate::unit_consumer::page_code(&page);
+            crate::trace::alert(|| format!("tenant finisher ({code}) tenant={tenant} unit={unit}"));
+        }
+        match synced? {
             Synced::Synced { seqs } | Synced::LiftPending { seqs } => Ok(UnitHolds::Seq {
                 state_seq: seqs.state_seq,
             }),

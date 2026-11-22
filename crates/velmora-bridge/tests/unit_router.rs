@@ -153,6 +153,14 @@ impl TenantHeads for Heads {
         };
         next.ok_or(ChainError::Busy)
     }
+
+    async fn record(
+        &self,
+        _: &TenantId,
+        _: u64,
+    ) -> std::result::Result<Option<velmora_bridge::directory::chain::ReadRecord>, ChainError> {
+        panic!("this router test only reads heads")
+    }
 }
 
 const S3_HOST: &str = "s3.example";
@@ -350,11 +358,14 @@ async fn under_restore_writes_make_no_write_call_and_the_key_row_comes_first() {
         .is_ok());
     let sync = UnitOp::Sync {
         head: SyncHead {
+            from_seq: routed.seqs.state_seq,
             seqs: seqs(3, 1),
             tenant_state: TenantState::Active,
             tenant_mode: None,
             restoring_since: None,
             lift: None,
+            buckets: vec![],
+            placed: vec![],
         },
     };
     assert!(r

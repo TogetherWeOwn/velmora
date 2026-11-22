@@ -139,7 +139,9 @@ thread_local! {
     /// What this isolate keeps between invocations: tenant keys (each for
     /// at most the loader's time), tenant heads, key locations, key
     /// routes, and the unit clients' renewal state (AM-71).
-    static CACHE: Rc<RootCache> = Rc::default();
+    static CACHE: Rc<RootCache> = Rc::new(RootCache::with_sleep(Rc::new(|ms| {
+        Box::pin(worker::Delay::from(std::time::Duration::from_millis(ms)))
+    })));
 }
 
 /// The isolate's root cache.

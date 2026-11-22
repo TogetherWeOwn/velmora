@@ -31,7 +31,7 @@
 //! |---|---|
 //! | a newer tenant or key record | `sync` first, then proves again |
 //! | stamp objects after the unit's counter | proves on at the newest one's counter: the unit renews only if its own counter has reached it, so a raise that ran after the unit answered passes. A unit refused `not_proven` is confirmed through its stamp counter ([`crate::stamp::Stamp::checked`]): with the counter unchanged the rollback is recorded, the unit is closed and the restore gate is needed (§8.6). A full page of objects ([`STAMP_PAGE`]) is confirmed first ([`Proof::StampAhead`]) |
-//! | a name under `m/rk/<t>/` that is not an access key id | skips it and pages (`stray` in the proof): it cannot match a key, so skipping it un-revokes nothing, and `m/` is put-only, so failing on it would close the tenant for good |
+//! | a name under `m/rk/<t>/` that is neither an access key id nor a principal's plane id (`keys::revocations::revocable_id`) | skips it and pages (`stray` in the proof): it cannot match a key, so skipping it un-revokes nothing, and `m/` is put-only, so failing on it would close the tenant for good |
 //! | more revocations listed than the unit holds | applies every listed id to that unit (setting `revoked` twice changes nothing), sends an `apply_control` message for the key chain so the finisher appends a missing record, then calls `renew` with the same `proof_start`, the proven state and the listed ids |
 //! | fewer revocations listed than the unit holds | does not renew, and pages: `m/rk/` is put-only, so the unit holds a revocation the bucket does not, which no correct history gives |
 //!
@@ -41,8 +41,8 @@
 //! The names of the two chains and of the revocations belong to the
 //! lanes that write them; this module takes them through [`ChainNames`].
 
+use crate::keys::revocations::revocable_id;
 use crate::ports::{BlobStore, Clock};
-use crate::recovery::valid_key_id;
 use crate::stamp::{counter_of, stamp_key, STAMP_PREFIX};
 use crate::types::{BridgeError, Result, UnixMs};
 
@@ -67,7 +67,7 @@ pub trait ChainNames {
     /// Record `seq` of the key chain `m/k/<tenant>/`.
     fn key_record(&self, tenant: &str, seq: u64) -> String;
     /// The directory of the tenant's revocations, ending in `/`: every
-    /// key under it is `<dir><access key id>`.
+    /// key under it is `<dir><access key id or principal id>`.
     fn revocation_dir(&self, tenant: &str) -> String;
 }
 
@@ -120,9 +120,9 @@ pub enum Proof {
 /// The revocation directory of a tenant, as listed.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Listed {
-    /// The access key ids, in key order.
+    /// The revoked ids (access key ids and principal ids), in key order.
     pub ids: Vec<String>,
-    /// The names that are not one access key id below the directory
+    /// The names that are not one revocable id below the directory
     /// (nested, empty or another shape), in key order. Not counted.
     pub stray: Vec<String>,
 }
@@ -212,10 +212,11 @@ where
     }
 }
 
-/// Every access key id under the tenant's revocation directory, in key
-/// order, and apart the names that are not one (page
-/// and skip). Every name that is an access key id counts as a
-/// revocation, whatever its body (fail toward revoked).
+/// Every revocable id (an access key id or a principal's plane id,
+/// `revocable_id`, AM-72) under the tenant's revocation directory, in key
+/// order, and apart the names that are not one (page and skip). Every
+/// name that is one counts as a revocation, whatever its body (fail
+/// toward revoked).
 pub async fn revocations<B: BlobStore, N: ChainNames>(
     safety: &B,
     names: &N,
@@ -232,7 +233,9 @@ pub async fn revocations<B: BlobStore, N: ChainNames>(
     loop {
         let page = safety.list(&dir, &after, REVOCATION_PAGE).await?;
         for key in &page {
-            match key.strip_prefix(&dir).filter(|id| valid_key_id(id)) {
+            // An access key id or a principal's plane id (AM-72): a
+            // principal revoke is `m/rk/` first, as a key's is.
+            match key.strip_prefix(&dir).filter(|id| revocable_id(id)) {
                 Some(id) => listed.ids.push(id.to_string()),
                 None => listed.stray.push(key.clone()),
             }

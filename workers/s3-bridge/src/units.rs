@@ -393,6 +393,7 @@ fn request_bridge(
         base.cfg.maintenance,
         request.root.clone(),
         request.root_renew,
+        request.expired_key_row,
         request.routed,
         Rc::clone(&verified),
     );

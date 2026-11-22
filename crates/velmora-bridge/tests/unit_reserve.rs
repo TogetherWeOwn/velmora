@@ -4,7 +4,10 @@
 //! database. `workers/unit-suite` runs this file against a Durable
 //! Object too.
 
+mod unit_bucket_support;
+
 use serde_json::{json, Value};
+use unit_bucket_support::fixture_placements;
 use velmora_bridge::testkit::RusqliteSql;
 use velmora_bridge::unit::import::{ImportBatch, ImportTable, ImportValue, MoveHead};
 use velmora_bridge::unit::keys::{Access, KeptAnswer, KeyEntry, KeyGrant, KeyKind, SubjectStatus};
@@ -88,6 +91,7 @@ fn sync(u: &Unit<RusqliteSql>, state: TenantState, restoring: Option<u64>) -> Un
         u,
         UnitOp::Sync {
             head: SyncHead {
+                from_seq: h.seqs.state_seq,
                 seqs: Seqs {
                     state_seq: h.seqs.state_seq + 1,
                     keys_seq: h.seqs.keys_seq,
@@ -97,6 +101,8 @@ fn sync(u: &Unit<RusqliteSql>, state: TenantState, restoring: Option<u64>) -> Un
                 tenant_state: state,
                 restoring_since: restoring,
                 lift: None,
+                buckets: vec![],
+                placed: fixture_placements(u.sql()),
             },
         },
     )
@@ -1141,6 +1147,7 @@ fn a_re_ask_keeps_the_current_keys_seq_and_writes_nothing_in_a_locked_tenant() {
             &u,
             UnitOp::Sync {
                 head: SyncHead {
+                    from_seq: h.seqs.state_seq,
                     seqs: Seqs {
                         state_seq: h.seqs.state_seq + 1,
                         keys_seq: h.seqs.keys_seq,
@@ -1149,6 +1156,8 @@ fn a_re_ask_keeps_the_current_keys_seq_and_writes_nothing_in_a_locked_tenant() {
                     tenant_state: TenantState::Suspended,
                     restoring_since: None,
                     lift: None,
+                    buckets: vec![],
+                    placed: fixture_placements(u.sql()),
                 },
             },
         ),

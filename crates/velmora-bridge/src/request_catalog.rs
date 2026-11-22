@@ -311,30 +311,28 @@ impl<P: UnitPort + TenantRing, S: Catalog> Catalog for RequestCatalog<P, S> {
     }
 
     async fn signature_verified(&self, read: bool) -> Result<()> {
-        if !self.key_row.serves(read) {
-            return Err(ERR_ACCOUNT_PROBLEM);
-        }
-        self.verified.set(true);
-        if self.key_row.lease_expired {
-            // AM-63: a row read under an expired lease checked the
-            // signature only. Read it again, authenticated (the unit
-            // client renews first), and serve only if it still names the
-            // same active key and the tenant's state still serves.
-            let again = self.reread_key_row().await;
-            let same = match &again {
-                Ok(row) => row.key.is_some() && row.key == self.key_row.key && row.serves(read),
-                Err(_) => false,
-            };
-            if !same {
-                self.verified.set(false);
-                return match again {
-                    Ok(row) if !row.serves(read) => Err(ERR_ACCOUNT_PROBLEM),
-                    Ok(_) => Err(ERR_KEY_CHANGED),
-                    Err(e) => Err(e),
-                };
+        if !self.key_row.lease_expired {
+            if !self.key_row.serves(read) {
+                return Err(ERR_ACCOUNT_PROBLEM);
             }
+            self.verified.set(true);
+            return Ok(());
         }
-        Ok(())
+
+        // AM-63: the expired row checked the signature only. The signed
+        // re-read must be fresh, and only its tenant state can authorize.
+        self.verified.set(true);
+        let result = match self.reread_key_row().await {
+            Ok(row) if row.lease_expired => Err(ERR_KEY_ROW),
+            Ok(row) if !row.serves(read) => Err(ERR_ACCOUNT_PROBLEM),
+            Ok(row) if row.key.is_some() && row.key == self.key_row.key => Ok(()),
+            Ok(_) => Err(ERR_KEY_CHANGED),
+            Err(e) => Err(e),
+        };
+        if result.is_err() {
+            self.verified.set(false);
+        }
+        result
     }
 
     async fn upload_state(&self, t: &UploadTarget<'_>) -> Result<Option<UploadState>> {

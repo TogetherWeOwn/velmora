@@ -38,6 +38,7 @@ pub mod remote;
 pub mod replay;
 pub mod request_catalog;
 pub mod root;
+pub mod routing;
 pub mod service;
 pub mod sql;
 pub mod sql_bind;

@@ -16,8 +16,12 @@
 //!   which records a rollback and closes the unit only if the counter has
 //!   not moved.
 //! - **`sync`.** The tenant chain's verified head ([`TenantHeads`]) and the
-//!   key-chain records after the unit's `keys_seq` ([`KeyFeed`]): first
-//!   the key apply (AM-12), then `sync` with both heads. The `sync` that
+//!   key-chain records after the unit's `keys_seq` ([`KeyFeed`], with the
+//!   directory's ack and the unit's closed subjects, AM-71): first the key
+//!   apply (AM-12), then `sync` with both heads and the bucket part of the
+//!   records it moves past (AM-57, [`super::placements`]), in steps of at
+//!   most [`MAX_SYNC_RECORDS`] records, each with the head's tenant state
+//!   and `restoring` entry. The `sync` that
 //!   would lift a `restoring` entry is the restore tool's (AM-45): it
 //!   carries the lift, which no record here has, so the client reports
 //!   [`Synced::LiftPending`] and changes nothing.
@@ -30,7 +34,12 @@
 //!   calls and background renewals go through the isolate's spacing
 //!   ([`InFlight`]): none while one runs, and after a failed attempt a
 //!   backoff from 60 s doubling up to T (rule 11). Signed calls go through
-//!   the same spacing with the backoff capped at 1 s.
+//!   the same spacing with the backoff capped at 1 s. A call that finds a
+//!   renewal of its unit running waits for it ([`InFlight::wait`], at most
+//!   [`RENEW_WAIT_MS`]) and runs once more if it renewed (rule 12, AM-63).
+//!   A `key_row` marked `lease_expired` is for the signature check only:
+//!   [`UnitClient::key_row_verified`] renews as a signed call and reads it
+//!   again.
 //! - **The two unit jobs** ([`UnitClient::run_job`]): `renew` and
 //!   `stamp_raise`, which the queue consumer hands here (AM-51). Under
 //!   `MAINTENANCE = restore` the consumer acknowledges both without a call
@@ -44,13 +53,14 @@
 //! carries a key, a secret or a caller's input.
 
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::rc::Rc;
 
+use futures_util::future::LocalBoxFuture;
 use serde_json::Value;
 
 use crate::crypto::scheme2::TenantId as KeyTenant;
-use crate::directory::chain::{record_key, ChainError, ControlSeal, TenantChain};
+use crate::directory::chain::{record_key, ChainError, ControlSeal, ReadRecord, TenantChain};
 use crate::directory::record::{
     HoldMode as DirHoldMode, Tenant, TenantDoor, TenantState as DirState,
 };
@@ -61,6 +71,7 @@ use crate::ports::{BlobStore, Clock};
 use crate::records::RecordStore;
 use crate::stamp::{Stamp, StampLedger, StampRow, ERR_ROLLED_BACK};
 use crate::types::{BridgeError, Result, UnixMs};
+use crate::unit::buckets::{BucketChange, BucketRefusal};
 use crate::unit::call::HoldMode;
 use crate::unit::identity::Refusal;
 use crate::unit::jobcall::JobCall;
@@ -72,6 +83,7 @@ use crate::unit::{
 
 use super::alarm::{renew_retry_ms, AlarmRules};
 use super::lease::{LeaseRefusal, LeaseRules};
+use super::placements;
 use super::renewal::{prove, ChainNames, Proof, UnitView};
 use super::stamp_id::UnitStampId;
 
@@ -106,15 +118,38 @@ pub trait TenantHeads {
         tenant: &TenantId,
         known: u64,
     ) -> std::result::Result<Option<TenantDoor>, ChainError>;
+    /// Record `seq` of the chain, read and checked: its door, and its
+    /// private part when it opened. `None` = no such record. `sync` reads
+    /// the records it moves past for their bucket changes (AM-57).
+    async fn record(
+        &self,
+        tenant: &TenantId,
+        seq: u64,
+    ) -> std::result::Result<Option<ReadRecord>, ChainError>;
 }
 
 /// The key-chain records of a tenant after a seq, verified and in the
 /// form the unit applies them (L4's reader and apply feed, AM-12).
 #[allow(async_fn_in_trait)]
 pub trait KeyFeed {
-    /// The records of `m/k/<tenant>/` after `after`, one entry per record
-    /// in chain order, up to the chain's head.
-    async fn after(&self, tenant: &TenantId, after: u64) -> Result<KeyBatch>;
+    /// `acked` of AM-71: the directory's `keys_seq` for the tenant, read
+    /// once per sync before the entries. A failed read is 0; with
+    /// `DIRECTORY` unbound, `u64::MAX`.
+    async fn acked(&self, tenant: &TenantId) -> u64;
+    /// The records of `m/k/<tenant>/` after `after`, one item per record
+    /// in chain order, up to the chain's head, as a store takes them in
+    /// closing mode (L4's `Feed::entries_for(after, limit,
+    /// Mode::Closing { acked }, closed)`): an entry whose newest opening
+    /// is above `acked` is sent held. `closed`: the subjects the unit
+    /// holds closed (`held_keys`), which `sync` reads from the unit before
+    /// the feed.
+    async fn after(
+        &self,
+        tenant: &TenantId,
+        after: u64,
+        acked: u64,
+        closed: &[String],
+    ) -> Result<KeyBatch>;
 }
 
 /// What [`KeyFeed::after`] read.
@@ -122,8 +157,8 @@ pub trait KeyFeed {
 pub struct KeyBatch {
     /// The chain's head seq (`after` when nothing follows it).
     pub head: u64,
-    /// The items after `after`, up to `head`: a subject's entry, or a
-    /// marker for a record that changes no subject (AM-62).
+    /// The items after `after`, up to `head`: one per record, a subject's
+    /// entry in head state or a marker (AM-62).
     pub entries: Vec<ApplyEntry>,
     /// The answers kept for the reservations whose records these are
     /// (AM-38), if the feed has them.
@@ -165,6 +200,19 @@ pub enum Page {
     /// The unit refused a call of the client in a way no rule expects
     /// (the fixed text of the error).
     UnitRefused(&'static str),
+    /// AM-57: the unit's bucket rows differ from the head's placement
+    /// list, twice in a row, after the chain was read again: nothing of
+    /// the `sync` was kept, and the unit is not synced until an operator
+    /// looks.
+    PlacementsOff,
+    /// AM-57: the unit refused a `sync`'s bucket part (a broken chain:
+    /// `created_conflict`, or a malformed part).
+    BucketsRefused(BucketRefusal),
+    /// AM-57 (2): buckets whose `DropBucket` came while they still hold
+    /// something: kept closing under `~dropped/<id>`, no object deleted;
+    /// the operator's (`drop_not_closed`). The first [`MAX_PAGED_NAMES`]
+    /// ids, and how many there are.
+    DropNotClosed { first: Vec<String>, total: usize },
 }
 
 /// The most names one page carries.
@@ -332,7 +380,7 @@ where
             let ledger = UnitLedger::new(self, seqs);
             let read = match ledger.read_stamp(id.as_str()).await? {
                 Step::Done(read) => read,
-                Step::Stop(stop) => match self.on_stop(stop).await? {
+                Step::Stop(stop) => match self.on_stop(stop, pages).await? {
                     Flow::Again(now) => {
                         seqs = now;
                         continue;
@@ -429,10 +477,12 @@ where
                         _ => return Err(ERR_RENEW_ANSWER),
                     }
                 }
-                Proof::SyncNeeded { .. } => match self.on_stop(Stop::SyncNeeded(seqs)).await? {
-                    Flow::Again(now) => seqs = now,
-                    Flow::Done(renewal) => return Ok(renewal),
-                },
+                Proof::SyncNeeded { .. } => {
+                    match self.on_stop(Stop::SyncNeeded(seqs), pages).await? {
+                        Flow::Again(now) => seqs = now,
+                        Flow::Done(renewal) => return Ok(renewal),
+                    }
+                }
                 // A full page of stamp objects after the counter: confirmed
                 // before anything else.
                 Proof::StampAhead { .. } => match self.confirm_stamp(&id, seqs, pages).await? {
@@ -481,7 +531,7 @@ where
             }
             Ok(Some(_)) => Ok(Flow::Again(seqs)),
             Err(e) => match ledger.stopped() {
-                Some(stop) => self.on_stop(stop).await,
+                Some(stop) => self.on_stop(stop, pages).await,
                 None => Err(e),
             },
         }
@@ -489,14 +539,14 @@ where
 
     /// What a renewal does when the unit's answer stops a stamp call, or
     /// the proof finds a newer record.
-    async fn on_stop(&self, stop: Stop) -> Result<Flow> {
+    async fn on_stop(&self, stop: Stop, pages: &mut Vec<Page>) -> Result<Flow> {
         Ok(match stop {
             Stop::Closed => Flow::Done(Renewal::Closed { rolled_back: false }),
             Stop::Unborn => Flow::Done(Renewal::Unborn),
             Stop::Shredding => Flow::Done(Renewal::Shredding),
             // The unit is behind (a newer record, or a rolled-back unit
             // found by the numbers, rule 5): sync it, then prove again.
-            Stop::SyncNeeded(unit) => match self.sync(unit).await? {
+            Stop::SyncNeeded(unit) => match self.sync_into(unit, pages).await? {
                 Synced::Synced { seqs } => Flow::Again(seqs),
                 Synced::LiftPending { .. } => Flow::Done(Renewal::Closed { rolled_back: false }),
                 Synced::Unborn => Flow::Done(Renewal::Unborn),
@@ -509,12 +559,30 @@ where
     }
 
     /// Reads and verifies both chains up to their heads, applies the
-    /// key-chain records (AM-12), then calls `sync` (rule 5). `seen`: the
-    /// unit's numbers as its last answer gave them.
-    pub async fn sync(&self, seen: Seqs) -> Result<Synced> {
+    /// key-chain records (AM-12), then calls `sync` (rule 5) with the
+    /// bucket part of the tenant records it moves past (AM-57). `seen`:
+    /// the unit's numbers as its last answer gave them. A unit more than
+    /// [`MAX_SYNC_RECORDS`] records behind is brought up in steps, each a
+    /// `sync` to a record of the chain. The pages come back whatever the
+    /// outcome, an `Err` included.
+    pub async fn sync(&self, seen: Seqs) -> (Result<Synced>, Vec<Page>) {
+        let mut pages = Vec::new();
+        let synced = self.sync_into(seen, &mut pages).await;
+        (synced, pages)
+    }
+
+    async fn sync_into(&self, seen: Seqs, pages: &mut Vec<Page>) -> Result<Synced> {
         let tenant = &self.name.tenant;
         let mut unit = seen;
-        for _ in 0..SYNC_ROUNDS {
+        // AM-71: the directory's acknowledgement, once per sync.
+        let acked = self.keys.acked(tenant).await;
+        let (mut rounds, mut steps, mut placements_retried) = (0, 0, false);
+        loop {
+            rounds += 1;
+            if rounds > SYNC_ROUNDS {
+                return Err(ERR_SYNC_ROUNDS);
+            }
+            let read_at = unit.state_seq;
             let door = match self.heads.head(tenant, unit.state_seq).await {
                 Ok(Some(door)) => door,
                 Ok(None) => return Ok(Synced::NotListed),
@@ -525,7 +593,16 @@ where
             }
             // The key chain first: `sync` refuses a `keys_seq` the unit's
             // rows do not hold (`keys_not_applied`).
-            let batch = self.keys.after(tenant, unit.keys_seq).await?;
+            // The subjects the unit holds closed, read before the feed
+            // (AM-71), so one the ring now opens is sent again.
+            let closed = match self.held_keys(unit).await? {
+                Some(closed) => closed,
+                None => return Ok(Synced::Unborn),
+            };
+            let batch = self
+                .keys
+                .after(tenant, unit.keys_seq, acked, &closed)
+                .await?;
             if batch.head < unit.keys_seq {
                 return Err(ERR_KEYS_BELOW);
             }
@@ -577,24 +654,81 @@ where
             if behind || unit.keys_seq != batch.head {
                 continue;
             }
+            // The unit moved on while the keys were applied (another
+            // sync): its state is past the head read here, so read the
+            // head again rather than send an older admission.
+            if unit.state_seq != read_at {
+                continue;
+            }
+            // AM-57: the bucket part, from the records after the unit's
+            // `state_seq` up to the head or the step's last record.
+            // Admission is always the head's, also on a step below it:
+            // its tenant state and mode, and this unit's `restoring` entry.
+            // A record below the head may allow what the head refuses (a
+            // hold lifted and set again, an entry lifted before a new
+            // one), and an entry is cleared only by the restore tool's
+            // lift with its proof, never by a step. The bucket part is the
+            // step's: the unit judges an `unplaced` under the head's entry,
+            // and the Worker sends removals made outside an entry as
+            // `dropped`/`removed`, which apply whatever the entry.
             let (tenant_state, tenant_mode) = unit_state(&door);
             let restoring_since = door.restoring_entry(self.name.unit).map(|r| r.since_seq);
+            let part = self.bucket_part(tenant, unit.state_seq, door).await?;
+            let target = &part.door;
             let next = SyncHead {
                 seqs: Seqs {
-                    state_seq: door.seq,
+                    state_seq: target.seq,
                     keys_seq: batch.head,
                 },
                 tenant_state,
                 tenant_mode,
                 restoring_since,
                 lift: None,
+                from_seq: unit.state_seq,
+                buckets: part.changes,
+                placed: part.placed,
             };
             let reply = self
                 .unit
                 .reply(&self.worker_call(unit, UnitOp::Sync { head: next }))
                 .await?;
             match reply.answer {
-                UnitAnswer::Ok { seqs, .. } => return Ok(Synced::Synced { seqs }),
+                UnitAnswer::Ok { seqs, body } => {
+                    if let Some(page) = drop_not_closed(&body) {
+                        pages.push(page);
+                    }
+                    if !part.at_head {
+                        // One step of a unit far behind: on to the next.
+                        steps += 1;
+                        if steps >= MAX_SYNC_STEPS {
+                            return Err(ERR_SYNC_FAR_BEHIND);
+                        }
+                        rounds -= 1;
+                        unit = seqs;
+                        continue;
+                    }
+                    return Ok(Synced::Synced { seqs });
+                }
+                // AM-57: the rows differ from the head's list. Read the
+                // chain again and send once more; the same refusal again
+                // stops and pages. Nothing of the `sync` was kept.
+                UnitAnswer::Refused {
+                    reason: Refused::Buckets(BucketRefusal::PlacementsOff),
+                    ..
+                } => {
+                    if placements_retried {
+                        pages.push(Page::PlacementsOff);
+                        return Err(ERR_PLACEMENTS_OFF);
+                    }
+                    placements_retried = true;
+                }
+                UnitAnswer::Refused {
+                    reason: Refused::Buckets(r),
+                    ..
+                } => {
+                    pages.push(Page::BucketsRefused(r));
+                    return Err(ERR_BUCKETS_REFUSED);
+                }
                 UnitAnswer::Unborn { .. } => return Ok(Synced::Unborn),
                 // A head that clears this unit's entry: the lift is the
                 // restore tool's (AM-45), with the proof no record here
@@ -616,7 +750,52 @@ where
                 _ => return Err(ERR_SYNC_ANSWER),
             }
         }
-        Err(ERR_SYNC_ROUNDS)
+    }
+
+    /// The bucket part of a `sync` from the unit at `from` towards `head`
+    /// (AM-57): the records `from + 1` up to `head`, at most
+    /// [`MAX_SYNC_RECORDS`] of them, read and verified, and the record at
+    /// `from` to compare the first one with. One read per record; none
+    /// when the unit is at the head (or past it: the unit then refuses
+    /// the `sync` as stale and the head is read again).
+    async fn bucket_part(
+        &self,
+        tenant: &TenantId,
+        from: u64,
+        head: TenantDoor,
+    ) -> Result<BucketPart> {
+        let unit = self.name.unit;
+        if head.seq <= from {
+            return Ok(BucketPart {
+                changes: Vec::new(),
+                placed: placements::placed(&head, unit),
+                door: head,
+                at_head: true,
+            });
+        }
+        let read = |seq| self.heads.record(tenant, seq);
+        let base = read(from)
+            .await
+            .map_err(chain_error)?
+            .ok_or(ERR_RECORD_MISSING)?;
+        let to = head.seq.min(from.saturating_add(MAX_SYNC_RECORDS));
+        let mut records: Vec<ReadRecord> = Vec::new();
+        for seq in from + 1..=to {
+            records.push(
+                read(seq)
+                    .await
+                    .map_err(chain_error)?
+                    .ok_or(ERR_RECORD_MISSING)?,
+            );
+        }
+        let changes = placements::bucket_changes(unit, &base.door, &records)?;
+        let door = records.pop().map(|r| r.door).ok_or(ERR_RECORD_MISSING)?;
+        Ok(BucketPart {
+            changes,
+            placed: placements::placed(&door, unit),
+            at_head: door.seq == head.seq,
+            door,
+        })
     }
 
     /// Rule 5 on the request path: sends `call`; on `renew_needed` renews,
@@ -627,6 +806,35 @@ where
     pub async fn call(&self, call: UnitCall) -> (Result<Answered>, Vec<Page>) {
         let mut pages = Vec::new();
         let answered = self.call_into(call, &mut pages).await;
+        (answered, pages)
+    }
+
+    /// AM-63: the S3 path's `key_row` once the request's signature has
+    /// verified against `first`, the unsigned answer. A row the unit
+    /// marked `lease_expired` was for the signature check only: this
+    /// renews as a signed call (rule 11's 1 s cap; or waits for the
+    /// isolate's renewal) and reads `key_row` again, signed, and the
+    /// request goes on only with that answer. A first answer that is not
+    /// marked comes back as it is, with no call. `call` is the `key_row`
+    /// call `first` answered. The answer is never marked: a second marked
+    /// row is an error.
+    pub async fn key_row_verified(
+        &self,
+        first: Answered,
+        mut call: UnitCall,
+    ) -> (Result<Answered>, Vec<Page>) {
+        if !lease_expired(&first.reply) {
+            return (Ok(first), Vec::new());
+        }
+        if !matches!(call.op, UnitOp::KeyRow { .. }) {
+            return (Err(ERR_NOT_KEY_ROW), Vec::new());
+        }
+        call.authenticated = true;
+        let (answered, pages) = self.call(call).await;
+        let answered = match answered {
+            Ok(a) if lease_expired(&a.reply) => Err(ERR_KEY_ROW_MARKED),
+            other => other,
+        };
         (answered, pages)
     }
 
@@ -651,22 +859,97 @@ where
                         true => SIGNED_RETRY_MS,
                         false => self.lease.term_ms,
                     };
-                    let outcome = match self.renew_spaced_by(seqs, max_gap).await {
-                        Some((renewal, more)) => {
-                            pages.extend(more);
-                            Some(renewal?)
+                    // Rule 12's waiter (AM-63): a renewal of this unit
+                    // runs in this isolate already, so wait for it (at
+                    // most RENEW_WAIT_MS) and run once more if it renewed;
+                    // otherwise answer `renew_needed`. Its pages are its
+                    // own caller's.
+                    if self.flights.running(&self.name) {
+                        if let Some(waited) = self
+                            .flights
+                            .wait(&self.name, RENEW_WAIT_MS, &self.clock)
+                            .await
+                        {
+                            renewal = waited.renewal;
+                            if waited.renewed {
+                                continue;
+                            }
                         }
-                        None => None,
-                    };
-                    let again = matches!(outcome, Some(Renewal::Renewed { .. }));
-                    renewal = outcome;
-                    if again {
-                        continue;
+                    } else {
+                        let outcome = match self.renew_spaced_by(seqs, max_gap).await {
+                            Some((renewal, more)) => {
+                                pages.extend(more);
+                                Some(renewal?)
+                            }
+                            None => None,
+                        };
+                        let again = matches!(outcome, Some(Renewal::Renewed { .. }));
+                        renewal = outcome;
+                        if again {
+                            continue;
+                        }
                     }
                 }
                 UnitAnswer::SyncNeeded { seqs } if !synced => {
                     synced = true;
-                    let outcome = self.sync(seqs).await?;
+                    // A sync reads up to MAX_SYNC_RECORDS records and an
+                    // unsigned call can cause it (the unit answers
+                    // `sync_needed` before any check of the call), so it
+                    // takes the isolate's spacing as a renewal does: one
+                    // at a time per unit, and after a failed one a backoff
+                    // (up to T unsigned, 1 s signed). A failure that stays
+                    // (placements_off, damage) is then read and paged at
+                    // that pace, not once per request.
+                    let max_gap = match call.authenticated {
+                        true => SIGNED_RETRY_MS,
+                        false => self.lease.term_ms,
+                    };
+                    // A sync of this unit runs in this isolate: wait for it
+                    // (as for a renewal, at most RENEW_WAIT_MS on this
+                    // call's own timer) and run once more if it synced.
+                    // Either way it starts no sync of its own.
+                    let waited = match self.flights.running_sync(&self.name) {
+                        true => Some(
+                            self.flights
+                                .wait_sync(&self.name, RENEW_WAIT_MS, &self.clock)
+                                .await,
+                        ),
+                        false => None,
+                    };
+                    if let Some(w) = &waited {
+                        if w.as_ref().is_some_and(|w| w.renewed) {
+                            continue;
+                        }
+                    }
+                    let guard = match waited {
+                        Some(_) => None,
+                        None => self
+                            .flights
+                            .attempt_sync(&self.name, self.clock.now(), max_gap),
+                    };
+                    let Some(guard) = guard else {
+                        // Held back: the call answers `sync_needed` (503).
+                        let renew_due = self.renew_due(&reply);
+                        return Ok(Answered {
+                            reply,
+                            refreshed,
+                            renew_due,
+                            renewal,
+                            synced: sync_outcome,
+                        });
+                    };
+                    let outcome = self.sync_into(seqs, pages).await;
+                    // A unit far behind that was brought up part of the
+                    // way made progress: no backoff for that.
+                    let progressed = match &outcome {
+                        Ok(Synced::Synced { .. }) => true,
+                        Err(BridgeError::Invalid(t)) => {
+                            matches!(ERR_SYNC_FAR_BEHIND, BridgeError::Invalid(f) if f == *t)
+                        }
+                        _ => false,
+                    };
+                    guard.done_at(progressed, self.clock.now());
+                    let outcome = outcome?;
                     let again = matches!(outcome, Synced::Synced { .. });
                     sync_outcome = Some(outcome);
                     if again {
@@ -713,7 +996,18 @@ where
             .flights
             .attempt(&self.name, self.clock.now(), max_gap_ms)?;
         let (renewal, pages) = self.renew(seen).await;
-        guard.done(matches!(renewal, Ok(Renewal::Renewed { .. })));
+        guard.ended_at(&renewal, self.clock.now());
+        Some((renewal, pages))
+    }
+
+    /// A renewal that takes this isolate's one slot for the unit, unspaced
+    /// (a queued job's: the alarm spaces those), so the requests of the
+    /// isolate wait for it instead of starting their own. `None`: one
+    /// runs already.
+    async fn renew_single(&self, seen: Seqs) -> Option<(Result<Renewal>, Vec<Page>)> {
+        let guard = self.flights.begin(&self.name)?;
+        let (renewal, pages) = self.renew(seen).await;
+        guard.ended_at(&renewal, self.clock.now());
         Some((renewal, pages))
     }
 
@@ -728,9 +1022,13 @@ where
     /// it carries (AM-50, AM-51).
     pub async fn run_job(&self, job: UnitJob, seqs: Seqs) -> JobResult {
         match job {
-            UnitJob::Renew { .. } => match self.renew(seqs).await {
-                (Ok(renewal), pages) => renewal_result(renewal, pages),
-                (Err(e), pages) => failed(&e, "renew_failed", pages),
+            // One renewal of a unit per isolate (rule 11, AM-63): a job
+            // that finds one running leaves it to that one (the alarm
+            // sends `renew` again on its backoff if it fails).
+            UnitJob::Renew { .. } => match self.renew_single(seqs).await {
+                None => job_result(Delivery::Ack, "renewing", Vec::new()),
+                Some((Ok(renewal), pages)) => renewal_result(renewal, pages),
+                Some((Err(e), pages)) => failed(&e, "renew_failed", pages),
             },
             UnitJob::StampRaise { .. } => self.raise(seqs).await,
         }
@@ -764,7 +1062,11 @@ where
                     return job_result(Delivery::Ack, "rolled_back", pages);
                 }
                 (Err(_), Some(Stop::RenewNeeded)) if attempt == 0 => {
-                    let (renewal, more) = self.renew(seqs).await;
+                    // A renewal of this unit runs in this isolate: raise
+                    // later, after it.
+                    let Some((renewal, more)) = self.renew_single(seqs).await else {
+                        return job_result(Delivery::HandBack, "renewing", pages);
+                    };
                     pages.extend(more);
                     match renewal {
                         Ok(Renewal::Renewed { seqs: now, .. }) => seqs = now,
@@ -780,7 +1082,7 @@ where
                     return job_result(Delivery::Ack, "shredding", pages)
                 }
                 (Err(_), Some(Stop::SyncNeeded(unit))) if attempt == 0 => {
-                    match self.sync(unit).await {
+                    match self.sync_into(unit, &mut pages).await {
                         Ok(Synced::Synced { seqs: now }) => seqs = now,
                         Ok(Synced::LiftPending { .. }) => {
                             return job_result(Delivery::Ack, "closed", pages)
@@ -825,6 +1127,25 @@ where
         }
     }
 
+    /// The subjects the unit holds closed (`held_keys`, a Worker call).
+    /// `None` = unborn.
+    async fn held_keys(&self, seqs: Seqs) -> Result<Option<Vec<String>>> {
+        let call = self.worker_call(seqs, UnitOp::HeldKeys {});
+        match self.unit.reply(&call).await?.answer {
+            UnitAnswer::Ok { body, .. } => match body.get("held").and_then(Value::as_array) {
+                Some(ids) => ids
+                    .iter()
+                    .map(|v| v.as_str().map(str::to_string).ok_or(ERR_HELD_ANSWER))
+                    .collect::<Result<Vec<_>>>()
+                    .map(Some),
+                None => Err(ERR_HELD_ANSWER),
+            },
+            UnitAnswer::Unborn { .. } => Ok(None),
+            UnitAnswer::Failed { class } => Err(unit_failed(&class)),
+            _ => Err(ERR_HELD_ANSWER),
+        }
+    }
+
     fn worker_call(&self, seqs: Seqs, op: UnitOp) -> UnitCall {
         UnitCall {
             name: self.name.clone(),
@@ -856,8 +1177,52 @@ const SIGNED_RETRY_MS: i64 = 1000;
 /// Rounds of a renewal: a sync, a stamp confirmation and a proof that
 /// aged are each one; more than this is a unit that keeps moving.
 const RENEW_ROUNDS: usize = 4;
-/// Rounds of a sync: a key apply behind, and a unit that moved.
+/// Rounds of a sync: a key apply behind, a unit that moved, and one
+/// `placements_off` read again.
 const SYNC_ROUNDS: usize = 4;
+/// The most tenant records one `sync` step reads for its bucket part
+/// (est): a unit further behind is brought up in steps.
+pub const MAX_SYNC_RECORDS: u64 = 32;
+/// The most steps of one sync (est): `MAX_SYNC_RECORDS` times this many
+/// records at most per call; a unit further behind is brought up the
+/// rest of the way by the next one (each step is kept).
+pub const MAX_SYNC_STEPS: usize = 8;
+
+/// One `sync` step's bucket part (AM-57).
+struct BucketPart {
+    /// The record the step syncs to: the head, or a record below it.
+    door: TenantDoor,
+    at_head: bool,
+    changes: Vec<BucketChange>,
+    placed: Vec<String>,
+}
+
+/// Whether `reply` is a `key_row` the unit answered under an expired
+/// lease (AM-63): for the signature check only, never to serve.
+pub fn lease_expired(reply: &UnitReply) -> bool {
+    matches!(&reply.answer, UnitAnswer::Ok { body, .. }
+        if body.get("lease_expired").and_then(Value::as_bool) == Some(true))
+}
+
+/// The page of a `sync` answer that kept buckets closing because they
+/// still hold something (AM-57 (2)).
+fn drop_not_closed(body: &Value) -> Option<Page> {
+    let ids: Vec<String> = body
+        .get("buckets")?
+        .get("drop_not_closed")?
+        .as_array()?
+        .iter()
+        .filter_map(|v| v.as_str().map(str::to_string))
+        .collect();
+    if ids.is_empty() {
+        return None;
+    }
+    let total = ids.len();
+    Some(Page::DropNotClosed {
+        first: ids.into_iter().take(MAX_PAGED_NAMES).collect(),
+        total,
+    })
+}
 
 const ERR_RENEW_ROUNDS: BridgeError = BridgeError::Invalid("unit renewal: the unit kept moving");
 const ERR_RENEW_ANSWER: BridgeError = BridgeError::Invalid("unit renewal: unexpected answer");
@@ -872,6 +1237,26 @@ const ERR_KEYS_STUCK: BridgeError =
     BridgeError::Invalid("unit sync: a key apply did not move the unit's keys_seq");
 const ERR_KEYS_BELOW: BridgeError =
     BridgeError::Invalid("unit sync: the key chain ends below the unit's keys_seq");
+const ERR_HELD_ANSWER: BridgeError =
+    BridgeError::Invalid("unit sync: unexpected answer to held_keys");
+const ERR_PLACEMENTS_OFF: BridgeError =
+    BridgeError::Invalid("unit sync: the unit's buckets differ from the head's placements");
+const ERR_BUCKETS_REFUSED: BridgeError =
+    BridgeError::Invalid("unit sync: the unit refused the bucket records");
+const ERR_RECORD_MISSING: BridgeError =
+    BridgeError::Invalid("unit sync: a tenant record below the head is missing");
+/// Definitive damage of the tenant chain (it pages; a key version not
+/// held yet, a store failure or a busy chain may pass and are retried).
+const ERR_CHAIN_DAMAGED: BridgeError =
+    BridgeError::Invalid("unit sync: the tenant chain is damaged");
+const ERR_PRIVATE_UNREADABLE: BridgeError =
+    BridgeError::Invalid("unit sync: the head's private part is unreadable");
+const ERR_SYNC_FAR_BEHIND: BridgeError =
+    BridgeError::Invalid("unit sync: the unit is far behind; brought up part of the way");
+const ERR_NOT_KEY_ROW: BridgeError =
+    BridgeError::Invalid("unit: key_row_verified needs the key_row call");
+const ERR_KEY_ROW_MARKED: BridgeError =
+    BridgeError::Invalid("unit: the signed key_row is still marked lease_expired");
 const ERR_PING_ANSWER: BridgeError = BridgeError::Invalid("unit: unexpected answer to a ping");
 const ERR_STAMP_ANSWER: BridgeError = BridgeError::Invalid("unit: unexpected stamp answer");
 const ERR_STAMP_STALE: BridgeError = BridgeError::Invalid("unit: the stamp call was stale twice");
@@ -880,13 +1265,11 @@ const ERR_STOPPED: BridgeError = BridgeError::Invalid("unit: stamp call stopped"
 fn chain_error(e: ChainError) -> BridgeError {
     match e {
         ChainError::Store(e) => e,
-        ChainError::Damaged(_) => BridgeError::Invalid("unit sync: the tenant chain is damaged"),
+        ChainError::Damaged(_) => ERR_CHAIN_DAMAGED,
         ChainError::KeyNotHeld { .. } => {
             BridgeError::Invalid("unit sync: a tenant key version is not held yet")
         }
-        ChainError::PrivateUnreadable => {
-            BridgeError::Invalid("unit sync: the head's private part is unreadable")
-        }
+        ChainError::PrivateUnreadable => ERR_PRIVATE_UNREADABLE,
         ChainError::Refused(_) | ChainError::Busy => {
             BridgeError::Invalid("unit sync: the chain read failed")
         }
@@ -933,6 +1316,14 @@ fn failed(e: &BridgeError, code: &'static str, mut pages: Vec<Page>) -> JobResul
         ERR_KEYS_GAP,
         ERR_KEYS_BELOW,
         ERR_PING_ANSWER,
+        ERR_HELD_ANSWER,
+        ERR_PLACEMENTS_OFF,
+        ERR_BUCKETS_REFUSED,
+        ERR_RECORD_MISSING,
+        placements::ERR_BUCKET_SECRETS,
+        ERR_CHAIN_DAMAGED,
+        ERR_PRIVATE_UNREADABLE,
+        placements::ERR_RECORD_ORDER,
         ERR_STAMP_ANSWER,
         ERR_LEASE_EXPIRED,
     ];
@@ -1171,6 +1562,14 @@ impl<S: RecordStore, C: ControlSeal> TenantHeads for TenantChain<'_, S, C> {
         let t = Tenant::parse(tenant.as_str()).ok_or(ChainError::Damaged("not_a_tenant_id"))?;
         Ok(TenantChain::head(self, &t, known).await?.map(|r| r.door))
     }
+    async fn record(
+        &self,
+        tenant: &TenantId,
+        seq: u64,
+    ) -> std::result::Result<Option<ReadRecord>, ChainError> {
+        let t = Tenant::parse(tenant.as_str()).ok_or(ChainError::Damaged("not_a_tenant_id"))?;
+        TenantChain::read(self, &t, seq).await
+    }
 }
 
 impl<T: TenantHeads> TenantHeads for &T {
@@ -1181,11 +1580,27 @@ impl<T: TenantHeads> TenantHeads for &T {
     ) -> std::result::Result<Option<TenantDoor>, ChainError> {
         (**self).head(tenant, known).await
     }
+    async fn record(
+        &self,
+        tenant: &TenantId,
+        seq: u64,
+    ) -> std::result::Result<Option<ReadRecord>, ChainError> {
+        (**self).record(tenant, seq).await
+    }
 }
 
 impl<T: KeyFeed> KeyFeed for &T {
-    async fn after(&self, tenant: &TenantId, after: u64) -> Result<KeyBatch> {
-        (**self).after(tenant, after).await
+    async fn acked(&self, tenant: &TenantId) -> u64 {
+        (**self).acked(tenant).await
+    }
+    async fn after(
+        &self,
+        tenant: &TenantId,
+        after: u64,
+        acked: u64,
+        closed: &[String],
+    ) -> Result<KeyBatch> {
+        (**self).after(tenant, after, acked, closed).await
     }
 }
 
@@ -1233,26 +1648,80 @@ impl ChainNames for RecordNames {
 /// attempts of each: a second renewal of a unit is not started while one
 /// runs, and [`InFlight::attempt`] spaces the attempts after a failure
 /// (a backoff from [`AlarmRules::renew_retry_ms`] that doubles up to T).
-/// A success clears it. Cheap to clone; one per isolate.
-#[derive(Clone, Debug, Default)]
-pub struct InFlight(Rc<RefCell<Flights>>);
+/// A success clears it. A call that finds a renewal of its unit running
+/// waits for it ([`InFlight::wait`], rule 12's waiter, AM-63). Cheap to
+/// clone; one per isolate (AM-71: the Worker keeps it in `RootCache`,
+/// with the isolate's timer, [`InFlight::with_sleep`]).
+#[derive(Clone, Default)]
+pub struct InFlight {
+    flights: Rc<RefCell<Flights>>,
+    /// The isolate's timer: the waiter's bound. Without one a call does
+    /// not wait (it answers `renew_needed`, as before the waiter).
+    sleep: Option<Sleep>,
+}
+
+/// A timer: a future that completes after the given milliseconds (the
+/// Worker's `setTimeout`).
+pub type Sleep = Rc<dyn Fn(u64) -> LocalBoxFuture<'static, ()>>;
+
+impl std::fmt::Debug for InFlight {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InFlight")
+            .field("flights", &self.flights)
+            .field("sleep", &self.sleep.is_some())
+            .finish()
+    }
+}
 
 #[derive(Debug, Default)]
 struct Flights {
-    running: BTreeSet<String>,
+    /// Per unit running a renewal: where its end is told.
+    running: BTreeMap<String, Rc<Notice>>,
     /// Per unit: the time of the last failed attempt, and how many failed
     /// in a row.
     failed: BTreeMap<String, (UnixMs, u32)>,
 }
 
-/// Held while one renewal runs. [`InFlightGuard::done`] says how it
-/// ended; dropped without it, it counts as failed.
+/// How a running renewal ended, for the calls waiting on it. Read, not
+/// pushed: a waiter looks at it on its own timer, so it never resumes in
+/// the renewing request's turn (the Workers runtime refuses I/O on behalf
+/// of another request).
+#[derive(Debug, Default)]
+struct Notice {
+    ended: RefCell<Option<Waited>>,
+}
+
+/// What a waiter learns: whether the renewal renewed, and what it came
+/// to (`None`: it failed with an error, or ended with no outcome).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Waited {
+    pub renewed: bool,
+    pub renewal: Option<Renewal>,
+}
+
+impl Notice {
+    fn end(&self, waited: Waited) {
+        *self.ended.borrow_mut() = Some(waited);
+    }
+
+    fn ended(&self) -> Option<Waited> {
+        self.ended.borrow().clone()
+    }
+}
+
+/// Held while one renewal runs. [`InFlightGuard::done`] or
+/// [`InFlightGuard::ended`] says how it ended; dropped without either, it
+/// counts as failed (and its waiters learn so).
 #[derive(Debug)]
 pub struct InFlightGuard {
     set: Rc<RefCell<Flights>>,
+    notice: Rc<Notice>,
     name: String,
     /// Spaced attempts record their outcome; `begin`'s do not.
     spaced: Option<UnixMs>,
+    /// When the attempt ended, if the caller said: a failure's backoff is
+    /// counted from it (a slow failure does not use its backoff up).
+    finished: Option<UnixMs>,
     ended: bool,
 }
 
@@ -1260,7 +1729,28 @@ pub struct InFlightGuard {
 /// far fewer; past it the oldest are forgotten.
 const MAX_REMEMBERED: usize = 4096;
 
+/// The key of a unit's request-path sync in [`InFlight`] (beside its
+/// renewal's, the unit's object name).
+fn sync_key(name: &UnitName) -> String {
+    format!("sync:{}", name.object_name())
+}
+
+/// The longest a call waits for its isolate's renewal of its unit (rule
+/// 12, AM-63; est).
+pub const RENEW_WAIT_MS: u64 = 5_000;
+/// How often a waiting call looks whether the renewal ended (est): at
+/// most `RENEW_WAIT_MS / RENEW_POLL_MS` timers per waiting call.
+pub const RENEW_POLL_MS: u64 = 50;
+
 impl InFlight {
+    /// The isolate's state, with its timer for the waiter's bound.
+    pub fn with_sleep(sleep: Sleep) -> InFlight {
+        InFlight {
+            flights: Rc::default(),
+            sleep: Some(sleep),
+        }
+    }
+
     /// Starts a renewal of `name`, or `None` when one is running.
     pub fn begin(&self, name: &UnitName) -> Option<InFlightGuard> {
         self.start(name, None, 0)
@@ -1273,15 +1763,96 @@ impl InFlight {
         self.start(name, Some(now), max_gap_ms)
     }
 
+    /// Whether a renewal of `name` runs in this isolate now.
+    pub fn running(&self, name: &UnitName) -> bool {
+        self.flights
+            .borrow()
+            .running
+            .contains_key(&name.object_name())
+    }
+
+    /// Rule 12's waiter (AM-63): waits for the renewal of `name` that runs
+    /// in this isolate, for at most `max_ms`, looking every
+    /// [`RENEW_POLL_MS`] on the caller's own timer, until `clock` passes
+    /// the deadline (a late timer does not stretch it) or the slices are
+    /// spent. `None`: none runs, the wait ran out, or this state has no
+    /// timer (then nothing waits).
+    pub async fn wait<C: Clock>(&self, name: &UnitName, max_ms: u64, clock: &C) -> Option<Waited> {
+        self.wait_key(&name.object_name(), max_ms, clock).await
+    }
+
+    /// Whether a request-path sync of `name` runs in this isolate now.
+    pub fn running_sync(&self, name: &UnitName) -> bool {
+        self.flights.borrow().running.contains_key(&sync_key(name))
+    }
+
+    /// [`Self::wait`] for the request-path sync of `name` that runs in
+    /// this isolate (`renewed`: it synced).
+    pub async fn wait_sync<C: Clock>(
+        &self,
+        name: &UnitName,
+        max_ms: u64,
+        clock: &C,
+    ) -> Option<Waited> {
+        self.wait_key(&sync_key(name), max_ms, clock).await
+    }
+
+    async fn wait_key<C: Clock>(&self, key: &str, max_ms: u64, clock: &C) -> Option<Waited> {
+        let sleep = self.sleep.clone()?;
+        let notice = self.flights.borrow().running.get(key).cloned()?;
+        let deadline = clock
+            .now()
+            .0
+            .saturating_add(i64::try_from(max_ms).unwrap_or(i64::MAX));
+        let mut waited_ms = 0;
+        while waited_ms < max_ms {
+            // Never past the deadline, by the clock or by the slices.
+            let left = u64::try_from(deadline.saturating_sub(clock.now().0)).unwrap_or(0);
+            let slice = RENEW_POLL_MS.min(max_ms - waited_ms).min(left);
+            if slice == 0 {
+                return notice.ended();
+            }
+            sleep(slice).await;
+            waited_ms += slice;
+            if clock.now().0 > deadline {
+                return None;
+            }
+            if let Some(w) = notice.ended() {
+                return Some(w);
+            }
+        }
+        None
+    }
+
+    /// Starts a request-path sync of `name` at `now`, spaced as renewal
+    /// attempts are, under its own key: `None` when one runs, or when the
+    /// last one failed less than its backoff ago.
+    pub fn attempt_sync(
+        &self,
+        name: &UnitName,
+        now: UnixMs,
+        max_gap_ms: i64,
+    ) -> Option<InFlightGuard> {
+        self.start_key(sync_key(name), Some(now), max_gap_ms)
+    }
+
     fn start(
         &self,
         name: &UnitName,
         spaced: Option<UnixMs>,
         max_gap: i64,
     ) -> Option<InFlightGuard> {
-        let key = name.object_name();
-        let mut f = self.0.borrow_mut();
-        if f.running.contains(&key) {
+        self.start_key(name.object_name(), spaced, max_gap)
+    }
+
+    fn start_key(
+        &self,
+        key: String,
+        spaced: Option<UnixMs>,
+        max_gap: i64,
+    ) -> Option<InFlightGuard> {
+        let mut f = self.flights.borrow_mut();
+        if f.running.contains_key(&key) {
             return None;
         }
         if let (Some(now), Some((at, fails))) = (spaced, f.failed.get(&key)) {
@@ -1290,11 +1861,14 @@ impl InFlight {
                 return None;
             }
         }
-        f.running.insert(key.clone());
+        let notice = Rc::new(Notice::default());
+        f.running.insert(key.clone(), Rc::clone(&notice));
         Some(InFlightGuard {
-            set: self.0.clone(),
+            set: self.flights.clone(),
+            notice,
             name: key,
             spaced,
+            finished: None,
             ended: false,
         })
     }
@@ -1303,41 +1877,77 @@ impl InFlight {
 impl InFlightGuard {
     /// The attempt ended: renewed (`ok`), or not.
     pub fn done(mut self, ok: bool) {
-        self.end(ok);
+        self.end(Waited {
+            renewed: ok,
+            renewal: None,
+        });
     }
 
-    fn end(&mut self, ok: bool) {
+    /// [`Self::done`] at `now`, the time the attempt ended.
+    pub fn done_at(mut self, ok: bool, now: UnixMs) {
+        self.finished = Some(now);
+        self.done(ok);
+    }
+
+    /// [`Self::ended`] at `now`, the time the attempt ended.
+    pub fn ended_at(mut self, outcome: &Result<Renewal>, now: UnixMs) {
+        self.finished = Some(now);
+        self.ended(outcome);
+    }
+
+    /// The attempt ended with `outcome`: its waiters learn it.
+    pub fn ended(mut self, outcome: &Result<Renewal>) {
+        let renewal = outcome.as_ref().ok().cloned();
+        let renewed = matches!(renewal, Some(Renewal::Renewed { .. }));
+        self.end(Waited { renewed, renewal });
+    }
+
+    fn end(&mut self, waited: Waited) {
         if self.ended {
             return;
         }
         self.ended = true;
-        let mut f = self.set.borrow_mut();
-        f.running.remove(&self.name);
-        let Some(now) = self.spaced else {
-            return;
-        };
-        if ok {
-            f.failed.remove(&self.name);
-            return;
-        }
-        if f.failed.len() >= MAX_REMEMBERED && !f.failed.contains_key(&self.name) {
-            if let Some(oldest) = f
-                .failed
-                .iter()
-                .min_by_key(|(_, (at, _))| at.0)
-                .map(|(k, _)| k.clone())
-            {
-                f.failed.remove(&oldest);
+        let ok = waited.renewed;
+        {
+            let mut f = self.set.borrow_mut();
+            f.running.remove(&self.name);
+            // Any renewal that renewed clears the unit's backoff, a
+            // queued job's too.
+            if ok {
+                f.failed.remove(&self.name);
+            }
+            if let Some(start) = self.spaced {
+                let now = self
+                    .finished
+                    .map_or(start, |end| UnixMs(end.0.max(start.0)));
+                if !ok {
+                    if f.failed.len() >= MAX_REMEMBERED && !f.failed.contains_key(&self.name) {
+                        if let Some(oldest) = f
+                            .failed
+                            .iter()
+                            .min_by_key(|(_, (at, _))| at.0)
+                            .map(|(k, _)| k.clone())
+                        {
+                            f.failed.remove(&oldest);
+                        }
+                    }
+                    let fails = f.failed.get(&self.name).map_or(0, |(_, n)| *n);
+                    f.failed
+                        .insert(self.name.clone(), (now, fails.saturating_add(1)));
+                }
             }
         }
-        let fails = f.failed.get(&self.name).map_or(0, |(_, n)| *n);
-        f.failed
-            .insert(self.name.clone(), (now, fails.saturating_add(1)));
+        // Told after the state is settled: a waiter that runs at once
+        // finds this renewal gone.
+        self.notice.end(waited);
     }
 }
 
 impl Drop for InFlightGuard {
     fn drop(&mut self) {
-        self.end(false);
+        self.end(Waited {
+            renewed: false,
+            renewal: None,
+        });
     }
 }
