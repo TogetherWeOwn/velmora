@@ -101,14 +101,12 @@ fn fail(status: u16, code: &'static str, message: &'static str) -> S3Response {
     json_response(status, &json!({ "error": code, "message": message }))
 }
 
-/// How long a retryable `503` asks the caller to wait, in seconds: as
-/// the S3 path's `SlowDown` (`ingress.rs`).
-pub const RETRY_AFTER_SECS: &str = "1";
-
 fn unavailable() -> S3Response {
     let mut resp = fail(503, "SlowDown", "Not available now; retry shortly.");
-    resp.headers
-        .push(("retry-after".to_string(), RETRY_AFTER_SECS.to_string()));
+    resp.headers.push((
+        "retry-after".into(),
+        super::gate::RETRY_AFTER_SECS.to_string(),
+    ));
     resp
 }
 

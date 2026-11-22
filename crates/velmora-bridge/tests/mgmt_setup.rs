@@ -590,6 +590,20 @@ async fn a_managed_tenant_chain_refuses_first_open_and_alerts() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn a_first_open_lookup_failure_returns_retry_after() {
+    let ports = Ports::with_closed_directory();
+    ports.records.refuse_lists(true);
+
+    let resp = ports.post(GATE_PATH).await;
+    expect_error(&resp, 503, "SlowDown");
+    let retry_after = resp.headers.iter().find_map(|(name, value)| {
+        name.eq_ignore_ascii_case("retry-after")
+            .then_some(value.as_str())
+    });
+    assert_eq!(retry_after, Some("5"));
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn a_closed_gate_without_tenants_runs_first_open() {
     let ports = Ports::with_closed_directory();
     let dir = ports.dir();
@@ -696,7 +710,7 @@ async fn a_first_open_record_store_error_has_retry_after() {
     ports.records.refuse_lists(true);
     let resp = ports.post(GATE_PATH).await;
     expect_error(&resp, 503, "SlowDown");
-    assert_eq!(response_header(&resp, "retry-after"), Some("1"));
+    assert_eq!(response_header(&resp, "retry-after"), Some("5"));
     assert_eq!(ports.dir().gate_row().await.unwrap(), None);
     ports.assert_writes(0, &[]);
 }
@@ -709,7 +723,7 @@ async fn a_first_open_that_loses_the_gate_has_retry_after() {
     dir.sql.move_on_batch.set(true);
     let resp = ports.post(GATE_PATH).await;
     expect_error(&resp, 503, "SlowDown");
-    assert_eq!(response_header(&resp, "retry-after"), Some("1"));
+    assert_eq!(response_header(&resp, "retry-after"), Some("5"));
     assert!(!dir.sql.move_on_batch.get(), "the forced CAS loss must run");
     let row = dir.gate_row().await.unwrap().unwrap();
     assert!(
