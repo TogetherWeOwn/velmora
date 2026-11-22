@@ -27,8 +27,8 @@ use velmora_bridge::crypto::scheme2::{
     tk_blob_name, wrap_bdk_v2, wrap_secret_v2, wrap_tenant_key, TenantId, TenantKey,
 };
 use velmora_bridge::crypto::DataKey;
-use velmora_bridge::directory::chain::Written;
-use velmora_bridge::directory::record::Tenant;
+use velmora_bridge::directory::chain::{ChainError, Written};
+use velmora_bridge::directory::record::{Lifecycle, Placement, Tenant, TenantDoor};
 use velmora_bridge::directory::transition::{Actor, Change};
 use velmora_bridge::ingress::ByteBudget;
 use velmora_bridge::jobmsg::ControlIntent;
@@ -44,8 +44,9 @@ use velmora_bridge::request_catalog::RequestCatalog;
 use velmora_bridge::root::request::RequestPort;
 use velmora_bridge::root::{ControlSend, Root, RootCache, RootPorts, UnitPorts};
 use velmora_bridge::service::claimed_access_key;
-use velmora_bridge::service::managed::{finish, prepare, Prepared};
+use velmora_bridge::service::managed::{finish, prepare, ManagedRequest, PortState, Prepared};
 use velmora_bridge::sql::SqlCatalog;
+use velmora_bridge::tenant_catalog::UnitPort;
 use velmora_bridge::testkit::{FixedClock, MemBlobStore, RusqliteSql, TestKek};
 use velmora_bridge::unit::call::{Closed, HoldMode};
 use velmora_bridge::unit::request::RequestCall;
@@ -54,8 +55,9 @@ use velmora_bridge::unit::{
     BirthKind, BirthToken, CallKind, Seqs, SyncHead, TenantState, Unit, UnitAnswer, UnitCall,
     UnitName, UnitOp, UnitReply,
 };
-use velmora_bridge::unit_lease::client::{Synced, UnitReplies};
+use velmora_bridge::unit_lease::client::{Synced, TenantHeads, UnitReplies};
 use velmora_bridge::unit_lease::lease::Proven;
+use velmora_bridge::unit_router::{test_door, Router};
 use velmora_bridge::{
     BlobMeta, BlobStore, BodyOutcome, Bridge, BucketId, ByteSpan, Catalog, Method, NntpConnector,
     NntpSession, Permit, ProviderConfig, Result, Sql, SqlValue, TenantScope,
@@ -112,9 +114,18 @@ fn bucket_id() -> BucketId {
     BucketId::mint([0xb1; 8])
 }
 
-/// The unit object: the real unit, at `T0`, with every call kept.
+#[derive(Clone, Copy)]
+enum SecondUnit {
+    Open,
+    Closed,
+}
+
+/// The real root unit at `T0`, with an optional scripted bucket unit.
+/// Both ports record every call.
 struct Object {
+    name: UnitName,
     unit: Rc<Unit<RusqliteSql>>,
+    second_unit: Option<SecondUnit>,
     calls: Rc<RefCell<Vec<UnitCall>>>,
     close_on_publication: Rc<Cell<bool>>,
     request_safety: Blobs,
@@ -122,7 +133,34 @@ struct Object {
 
 impl UnitReplies for Object {
     async fn reply(&self, call: &UnitCall) -> Result<UnitReply> {
+        assert_eq!(call.name, self.name);
         self.calls.borrow_mut().push(call.clone());
+        // A positive lease below half of T asks for a background renewal.
+        const SHORT_LEASE_MS: u64 = 1;
+        if self.name.unit == 1 {
+            let seqs = call.seqs.unwrap();
+            let (answer, lease_left_ms) = match self.second_unit.unwrap() {
+                SecondUnit::Open => (
+                    UnitAnswer::Ok {
+                        seqs,
+                        body: serde_json::Value::Null,
+                    },
+                    SHORT_LEASE_MS,
+                ),
+                SecondUnit::Closed => (
+                    UnitAnswer::Closed {
+                        seqs,
+                        why: Closed::Restoring,
+                    },
+                    0,
+                ),
+            };
+            return Ok(UnitReply {
+                answer,
+                lease_left_ms,
+                revoked: None,
+            });
+        }
         if let (true, UnitOp::Request { call: op }) = (self.close_on_publication.get(), &call.op) {
             if let RequestCall::commit_generation { record, .. } = op.as_ref() {
                 assert!(self.request_safety.0.contains(&record.key));
@@ -136,7 +174,11 @@ impl UnitReplies for Object {
                 });
             }
         }
-        Ok(self.unit.reply(call, T0))
+        let mut reply = self.unit.reply(call, T0);
+        if matches!(self.second_unit, Some(SecondUnit::Open)) {
+            reply.lease_left_ms = SHORT_LEASE_MS;
+        }
+        Ok(reply)
     }
 }
 
@@ -213,6 +255,7 @@ struct Ports {
     kek: TestKek,
     clock: FixedClock,
     unit: Rc<Unit<RusqliteSql>>,
+    second_unit: Option<SecondUnit>,
     calls: Rc<RefCell<Vec<UnitCall>>>,
     close_on_publication: Rc<Cell<bool>>,
     request_safety: Blobs,
@@ -250,9 +293,12 @@ impl UnitPorts for Ports {
     type Safety = MemBlobStore;
     type Control = Control;
     fn object(&self, name: &UnitName) -> Result<Object> {
-        assert_eq!(name, &root_unit());
+        assert_eq!(name.tenant, unit_id());
+        assert!(name.unit == 0 || (name.unit == 1 && self.second_unit.is_some()));
         Ok(Object {
+            name: name.clone(),
             unit: Rc::clone(&self.unit),
+            second_unit: self.second_unit,
             calls: Rc::clone(&self.calls),
             close_on_publication: Rc::clone(&self.close_on_publication),
             request_safety: self.request_safety.clone(),
@@ -322,6 +368,21 @@ fn subject(id: &str, kind: SubjectKind) -> Subject {
     s
 }
 
+/// The router's test head for a bucket on a non-root unit.
+struct PlacedHead(TenantDoor);
+
+impl TenantHeads for PlacedHead {
+    async fn head(
+        &self,
+        tenant: &velmora_bridge::unit::TenantId,
+        known: u64,
+    ) -> std::result::Result<Option<TenantDoor>, ChainError> {
+        assert_eq!(tenant, &unit_id());
+        assert!(known <= self.0.seq);
+        Ok(Some(self.0.clone()))
+    }
+}
+
 /// A managed tenant, active under key 1, with the key locations; its
 /// root unit born, renewed and synced to the head (no directory: every
 /// subject open), holding bucket `alpha` (its key wrapped under tenant
@@ -337,6 +398,10 @@ struct World {
 
 impl World {
     fn new() -> World {
+        Self::with_bucket_unit(None)
+    }
+
+    fn with_bucket_unit(second_unit: Option<SecondUnit>) -> World {
         let kek = TestKek::new();
         let ports = Ports {
             records: MemRecords::default(),
@@ -349,6 +414,7 @@ impl World {
                 root_unit(),
                 "",
             )),
+            second_unit,
             calls: Rc::default(),
             close_on_publication: Rc::default(),
             request_safety: Blobs::default(),
@@ -590,6 +656,60 @@ impl World {
         assert!(self.safety.0.lose(safety_key));
     }
 
+    async fn prepare(
+        &self,
+        cfg: &velmora_bridge::BridgeConfig,
+        req: &velmora_bridge::S3Request,
+        akid: &str,
+    ) -> Prepared {
+        let floor = Seqs {
+            state_seq: 0,
+            keys_seq: 0,
+        };
+        let root = Root::new(&*self.ports, &self.cache, TestRng(4));
+        let clients = root.clients();
+        let heads = root.heads();
+        let router = root.router(cfg.maintenance, &clients, &heads);
+        if self.ports.second_unit.is_some() {
+            // Start at the synced numbers so this tests routing, not stale retries.
+            let floor = self.ports.unit.head().unwrap().seqs;
+            let mut door = test_door(&unit_id(), floor.state_seq, Lifecycle::Live, &[0, 1]);
+            door.placements.push(Placement {
+                bucket: BUCKET.into(),
+                unit: 1,
+                epoch: 1,
+            });
+            let router = Router {
+                maintenance: router.maintenance,
+                clients: router.clients,
+                heads: &PlacedHead(door),
+                cache: router.cache,
+                clock: router.clock,
+            };
+            prepare(&router, cfg, &unit_id(), floor, akid, req).await
+        } else {
+            prepare(&router, cfg, &unit_id(), floor, akid, req).await
+        }
+    }
+
+    fn request_port(
+        &self,
+        request: &ManagedRequest,
+        maintenance: Maintenance,
+        verified: Rc<Cell<bool>>,
+    ) -> RequestPort<Ports, TestRng> {
+        RequestPort::new(
+            Rc::clone(&self.ports),
+            Rc::clone(&self.cache),
+            || TestRng(5),
+            maintenance,
+            request.root.clone(),
+            request.root_renew,
+            request.routed.clone(),
+            verified,
+        )
+    }
+
     /// One request through the whole managed path, as the Worker serves
     /// it (`units::route_request` and `serve_on_unit`).
     fn serve(
@@ -598,10 +718,6 @@ impl World {
         maintenance: Maintenance,
     ) -> (Resp, Vec<&'static str>) {
         let req = req.into_request();
-        let floor = Seqs {
-            state_seq: 0,
-            keys_seq: 0,
-        };
         let mut cfg = config(Vec::new());
         cfg.maintenance = maintenance;
         if self.article.0.is_some() {
@@ -615,13 +731,7 @@ impl World {
             );
         }
         let akid = claimed_access_key(&cfg, &req).unwrap();
-        let prepared = block_on(async {
-            let root = Root::new(&*self.ports, &self.cache, TestRng(4));
-            let clients = root.clients();
-            let heads = root.heads();
-            let router = root.router(maintenance, &clients, &heads);
-            prepare(&router, &cfg, &unit_id(), floor, &akid, &req).await
-        });
+        let prepared = block_on(self.prepare(&cfg, &req, &akid));
         let request = match prepared {
             Prepared::Answer(resp, lines) => {
                 let resp = block_on(Resp::collect(resp));
@@ -631,16 +741,7 @@ impl World {
         };
         let unit = request.routed.as_ref().unwrap_or(&request.root).clone();
         let verified = Rc::new(Cell::new(false));
-        let port = RequestPort::new(
-            Rc::clone(&self.ports),
-            Rc::clone(&self.cache),
-            || TestRng(5),
-            maintenance,
-            request.root.clone(),
-            request.root_renew,
-            request.routed,
-            Rc::clone(&verified),
-        );
+        let port = self.request_port(&request, maintenance, Rc::clone(&verified));
         let client = RequestClient::new(port, unit.unit.clone(), unit.seqs);
         let shared = SqlCatalog::new(RusqliteSql::with_schema().unwrap());
         block_on(shared.seed_permits(&cfg.providers)).unwrap();
@@ -834,6 +935,79 @@ fn key_row_only(calls: &[UnitCall]) {
 }
 
 #[test]
+fn key_rows_stay_on_root_and_renewals_are_kept_once_per_unit() {
+    let w = World::with_bucket_unit(Some(SecondUnit::Open));
+    let cfg = config(Vec::new());
+    let req = put(&signer()).into_request();
+    let Prepared::Serve(request) = block_on(w.prepare(&cfg, &req, AKID)) else {
+        panic!("the root must answer the initial key_row");
+    };
+    let bucket_unit = UnitName::new(unit_id(), 1);
+    let routed = request.routed.as_ref().unwrap();
+    assert_eq!(routed.unit, bucket_unit);
+    let root_seqs = request
+        .root_renew
+        .expect("initial key_row should ask to renew");
+
+    // Exercise the port after signature verification, including the
+    // key_row re-read. The request client supplies the bucket unit name.
+    let port = w.request_port(&request, Maintenance::Off, Rc::new(Cell::new(true)));
+    let call = |op| UnitCall {
+        name: bucket_unit.clone(),
+        kind: CallKind::Request,
+        seqs: Some(routed.seqs),
+        authenticated: true,
+        listed: true,
+        op,
+    };
+    let key_row = call(UnitOp::KeyRow {
+        access_key_id: AKID.into(),
+        presigned: None,
+    });
+    let bucket_read = call(UnitOp::Request {
+        call: Box::new(RequestCall::bucket_by_name {
+            name: BUCKET.into(),
+        }),
+    });
+    block_on(async {
+        for call in [&key_row, &bucket_read, &bucket_read] {
+            assert!(matches!(
+                port.call(call).await.unwrap(),
+                UnitAnswer::Ok { .. }
+            ));
+        }
+    });
+
+    let calls = w.calls();
+    let sent: Vec<_> = calls
+        .iter()
+        .map(|call| {
+            let op = match &call.op {
+                UnitOp::KeyRow { .. } => "key_row",
+                UnitOp::Request { .. } => "request",
+                _ => panic!("unexpected unit call: {:?}", call.op),
+            };
+            (call.name.unit, op, call.authenticated)
+        })
+        .collect();
+    assert_eq!(
+        sent,
+        [
+            (0, "key_row", false),
+            (0, "key_row", true),
+            (1, "request", true),
+            (1, "request", true),
+        ]
+    );
+    let mut renewals = port.renew_due();
+    renewals.sort_by_key(|(unit, _)| unit.unit);
+    assert_eq!(
+        renewals,
+        [(root_unit(), root_seqs), (bucket_unit, routed.seqs)]
+    );
+}
+
+#[test]
 fn a_suspended_read_only_tenant_serves_reads_and_refuses_writes() {
     let w = World::new();
     w.suspend();
@@ -952,9 +1126,36 @@ fn delete_bucket_without_a_grant_returns_access_denied() {
     );
     let (resp, _) = w.serve(req, Maintenance::Off);
     assert_s3_error(&resp, 403, "AccessDenied");
-    let calls = w.calls();
-    only_the_key_row_before_the_signature(&calls);
-    assert!(calls.iter().all(|c| c.op.is_read()), "{calls:?}");
+    key_row_only(&w.calls());
+}
+
+#[test]
+fn delete_bucket_checks_signature_without_contacting_a_closed_bucket_unit() {
+    let w = World::with_bucket_unit(Some(SecondUnit::Closed));
+    let delete = |s: &Signer| {
+        s.sign(
+            T0,
+            Method::Delete,
+            &format!("/{BUCKET}"),
+            &[],
+            &[],
+            Vec::new(),
+        )
+    };
+    for (signer, error) in [
+        (signer(), "AccessDenied"),
+        (Signer::new(AKID, "not-the-secret"), "SignatureDoesNotMatch"),
+    ] {
+        let (resp, _) = w.serve(delete(&signer), Maintenance::Off);
+        assert_s3_error(&resp, 403, error);
+        let calls = w.calls();
+        key_row_only(&calls);
+        assert!(
+            calls.iter().all(|call| call.name == root_unit()),
+            "{calls:?}"
+        );
+        w.ports.calls.borrow_mut().clear();
+    }
 }
 
 #[test]
