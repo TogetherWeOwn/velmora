@@ -24,12 +24,14 @@
 //! runs nothing. Only a closed gate with no managed tenant chain gets a
 //! run, and a run that left the gate closed may be started again.
 
-use super::chain::{ControlSeal, TenantChain};
-use super::gate::{run_gate, GateRun, GateSteps, StepReport};
-use super::store::SqlDirectory;
+use super::chain::{chain_prefix, ControlSeal, TenantChain, TENANT_CHAIN_PREFIX};
+use super::gate::{is_open, run_gate, GateRun, GateSteps, StepReport};
+use super::record::Tenant;
+use super::store::{location_status, SqlDirectory};
+use crate::keys::locations::read_locations;
 use crate::ports::{Kek, Sql};
 use crate::records::RecordStore;
-use crate::types::{BridgeError, Result, UnixMs};
+use crate::types::{Result, UnixMs};
 
 /// The reason a first open names in its closing.
 pub const FIRST_OPEN_REASON: &str = "first_open";
@@ -52,8 +54,17 @@ pub enum FirstOpenAnswer {
 /// Whether any tenant chain but tenant 0's exists: at most two listings
 /// of one name each. A stray name under `m/t/` counts as one.
 pub async fn managed_tenant_exists<S: RecordStore>(store: &S) -> Result<bool> {
-    let _ = store;
-    Err(BridgeError::NotImplemented("managed_tenant_exists"))
+    let first = store.list(TENANT_CHAIN_PREFIX, "", 1).await?;
+    let Some(key) = first.first() else {
+        return Ok(false);
+    };
+    let zero = chain_prefix(&Tenant::Zero);
+    if !key.starts_with(&zero) {
+        return Ok(true);
+    }
+    // Past every name under tenant 0's chain: `0` is the byte after `/`.
+    let after = format!("{}0", zero.trim_end_matches('/'));
+    Ok(!store.list(TENANT_CHAIN_PREFIX, &after, 1).await?.is_empty())
 }
 
 /// The gate steps of the first open. See the [module](self).
@@ -63,59 +74,81 @@ pub struct FirstOpen<'a, S, K, Q> {
     pub dir: SqlDirectory<'a, Q>,
 }
 
-impl<S: RecordStore, K: Kek, Q: Sql> GateSteps for FirstOpen<'_, S, K, Q> {
-    async fn revocations(&self) -> Result<StepReport> {
-        Err(BridgeError::NotImplemented("FirstOpen"))
-    }
-    async fn key_locations_and_registry(&self) -> Result<StepReport> {
-        Err(BridgeError::NotImplemented("FirstOpen"))
-    }
-    async fn key_versions(&self) -> Result<StepReport> {
-        Err(BridgeError::NotImplemented("FirstOpen"))
-    }
-    async fn key_routes_and_labels(&self) -> Result<StepReport> {
-        Err(BridgeError::NotImplemented("FirstOpen"))
-    }
-    async fn root_units(&self) -> Result<StepReport> {
-        Err(BridgeError::NotImplemented("FirstOpen"))
-    }
-    async fn finisher(&self) -> Result<StepReport> {
-        Err(BridgeError::NotImplemented("FirstOpen"))
-    }
-    async fn counters(&self, _epoch: u64) -> Result<StepReport> {
-        Err(BridgeError::NotImplemented("FirstOpen"))
-    }
-    async fn sealed_days(&self) -> Result<StepReport> {
-        Err(BridgeError::NotImplemented("FirstOpen"))
+impl<S: RecordStore, K: Kek, Q: Sql> FirstOpen<'_, S, K, Q> {
+    /// A per-tenant step: done only while no managed tenant chain exists.
+    async fn no_tenant(&self) -> Result<StepReport> {
+        Ok(match managed_tenant_exists(self.store).await? {
+            false => StepReport::done(),
+            true => StepReport::not_done("managed_tenant_exists"),
+        })
     }
 }
 
-/// Placeholder for the signature commit.
-struct NoSteps;
-impl GateSteps for NoSteps {
+impl<S: RecordStore, K: Kek, Q: Sql> GateSteps for FirstOpen<'_, S, K, Q> {
     async fn revocations(&self) -> Result<StepReport> {
-        Ok(StepReport::not_done("x"))
+        self.no_tenant().await
     }
+
     async fn key_locations_and_registry(&self) -> Result<StepReport> {
-        Ok(StepReport::not_done("x"))
+        let mut problems = Vec::new();
+        // A head that is absent or does not open leaves the step not done.
+        match read_locations(self.store, self.kek, 0).await {
+            Ok(Some(set)) => {
+                self.dir.put_key_locations(&set).await?;
+                let want: Vec<(String, String, u64)> = set
+                    .locations
+                    .iter()
+                    .map(|l| {
+                        (
+                            l.name.clone(),
+                            location_status(l.status).to_string(),
+                            set.seq,
+                        )
+                    })
+                    .collect();
+                let mut want = want;
+                want.sort();
+                if self.dir.key_locations().await? != want {
+                    problems.push("key_locations_differ".to_string());
+                }
+            }
+            Ok(None) => problems.push("key_locations_absent".to_string()),
+            Err(_) => problems.push("key_locations_unreadable".to_string()),
+        }
+        if !self.store.list(REGISTRY_PREFIX, "", 1).await?.is_empty() {
+            problems.push("registry_present".to_string());
+        }
+        Ok(StepReport {
+            done: problems.is_empty(),
+            problems,
+        })
     }
+
     async fn key_versions(&self) -> Result<StepReport> {
-        Ok(StepReport::not_done("x"))
+        self.no_tenant().await
     }
+
     async fn key_routes_and_labels(&self) -> Result<StepReport> {
-        Ok(StepReport::not_done("x"))
+        self.no_tenant().await
     }
+
     async fn root_units(&self) -> Result<StepReport> {
-        Ok(StepReport::not_done("x"))
+        self.no_tenant().await
     }
+
     async fn finisher(&self) -> Result<StepReport> {
-        Ok(StepReport::not_done("x"))
+        self.no_tenant().await
     }
-    async fn counters(&self, _epoch: u64) -> Result<StepReport> {
-        Ok(StepReport::not_done("x"))
+
+    async fn counters(&self, epoch: u64) -> Result<StepReport> {
+        if self.dir.start_feed_epoch(epoch).await? || self.dir.feed_epoch().await? == epoch {
+            return Ok(StepReport::done());
+        }
+        Ok(StepReport::not_done("feed_epoch_newer"))
     }
+
     async fn sealed_days(&self) -> Result<StepReport> {
-        Ok(StepReport::not_done("x"))
+        self.no_tenant().await
     }
 }
 
@@ -133,6 +166,17 @@ where
     Q: Sql,
     K: Kek,
 {
-    let _ = (chain, dir, kek, now, run_gate::<S, C, Q, NoSteps>);
-    Err(BridgeError::NotImplemented("first_open"))
+    if is_open(chain.store, dir).await? {
+        return Ok(FirstOpenAnswer::AlreadyOpen);
+    }
+    if managed_tenant_exists(chain.store).await? {
+        return Ok(FirstOpenAnswer::HasTenants);
+    }
+    let steps = FirstOpen {
+        store: chain.store,
+        kek,
+        dir: SqlDirectory { sql: dir.sql },
+    };
+    let run = run_gate(chain, dir, &steps, FIRST_OPEN_REASON, now).await?;
+    Ok(FirstOpenAnswer::Ran(run))
 }

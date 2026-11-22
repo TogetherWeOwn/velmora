@@ -13,9 +13,11 @@
 //! age alarm on the oldest row (`oldest_pending`) keeps paging until an
 //! operator removes it.
 
-use super::store::SqlDirectory;
+use super::store::{int, SqlDirectory};
+use crate::crypto::scheme2::TenantId;
+use crate::keys::ports::ControlChain;
 use crate::pending::{ChainKey, PendingRows};
-use crate::ports::Sql;
+use crate::ports::{Sql, SqlValue};
 use crate::types::{BridgeError, Result, UnixMs};
 
 /// The next chain after a key, with its oldest row: two index seeks.
@@ -27,18 +29,89 @@ pub const NEXT_CHAIN: &str = "SELECT p.tenant, p.chain, \
 pub const DROP_ABOVE: &str = "DELETE FROM pending_ops WHERE tenant = ?1 AND chain = ?2 \
      AND seq > ?3 AND created_at <= ?4";
 
+/// How many rows of other tenants (tenant 0, damage) one call steps over
+/// before it answers what it has.
+pub const MAX_STEPPED_OVER: u32 = 100;
+
+const ERR_PENDING_ROW: BridgeError = BridgeError::Invalid("pending row");
+
+fn chain_code(chain: ControlChain) -> &'static str {
+    match chain {
+        ControlChain::Keys => "k",
+        ControlChain::Tenant => "t",
+    }
+}
+
 impl<S: Sql> PendingRows for SqlDirectory<'_, S> {
     async fn chains_after(
         &self,
         after: Option<&ChainKey>,
         limit: u32,
     ) -> Result<Vec<(ChainKey, UnixMs)>> {
-        let _ = (after, limit);
-        Err(BridgeError::NotImplemented("chains_after"))
+        let mut out = Vec::new();
+        // The key the next step starts after, as stored; the empty key
+        // sorts before every row.
+        let mut cursor: (String, String) = after.map_or((String::new(), String::new()), |c| {
+            (
+                c.tenant.as_str().to_string(),
+                chain_code(c.chain).to_string(),
+            )
+        });
+        let mut stepped_over = 0;
+        while (out.len() as u32) < limit {
+            let rows = self
+                .sql
+                .query(
+                    NEXT_CHAIN,
+                    &[
+                        SqlValue::Text(cursor.0.clone()),
+                        SqlValue::Text(cursor.1.clone()),
+                    ],
+                )
+                .await?;
+            let Some(row) = rows.into_iter().next() else {
+                break;
+            };
+            let (tenant, chain, oldest) = match row.as_slice() {
+                [SqlValue::Text(t), SqlValue::Text(c), SqlValue::Int(at)] => {
+                    (t.clone(), c.clone(), *at)
+                }
+                _ => return Err(ERR_PENDING_ROW),
+            };
+            cursor = (tenant.clone(), chain.clone());
+            let kind = match chain.as_str() {
+                "k" => Some(ControlChain::Keys),
+                "t" => Some(ControlChain::Tenant),
+                _ => None,
+            };
+            match (TenantId::parse(&tenant).ok(), kind) {
+                (Some(tenant), Some(chain)) => {
+                    out.push((ChainKey { tenant, chain }, UnixMs(oldest)));
+                }
+                _ => {
+                    stepped_over += 1;
+                    if stepped_over >= MAX_STEPPED_OVER {
+                        break;
+                    }
+                }
+            }
+        }
+        Ok(out)
     }
 
     async fn drop_above(&self, chain: &ChainKey, head: u64, cutoff: UnixMs) -> Result<u32> {
-        let _ = (chain, head, cutoff);
-        Err(BridgeError::NotImplemented("drop_above"))
+        let n = self
+            .sql
+            .exec(
+                DROP_ABOVE,
+                &[
+                    SqlValue::Text(chain.tenant.as_str().to_string()),
+                    SqlValue::Text(chain_code(chain.chain).to_string()),
+                    int(head)?,
+                    SqlValue::Int(cutoff.0),
+                ],
+            )
+            .await?;
+        u32::try_from(n).map_err(|_| ERR_PENDING_ROW)
     }
 }

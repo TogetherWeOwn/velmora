@@ -27,9 +27,12 @@
 //! With no directory bound (AM-75), the directory step and the clear are
 //! skipped, and an opening reaches the units at once.
 
-use super::chain::{ControlSeal, TenantChain};
-use super::store::SqlDirectory;
-use super::transition::WriteOrder;
+use super::chain::{ChainError, ControlSeal, ReadRecord, TenantChain};
+use super::events::tenant_events;
+use super::feed::Appended;
+use super::record::{Lifecycle, Tenant};
+use super::store::{ChainKind, RawTenant, SqlDirectory};
+use super::transition::{write_order, WriteOrder};
 use crate::crypto::scheme2::TenantId;
 use crate::keys::ports::ControlChain;
 use crate::pending::{ChainFinisher, ChainHead, ChainKey};
@@ -83,6 +86,8 @@ pub enum StoreStep {
     Waiting,
     /// No directory is bound.
     Unbound,
+    /// The unit is not born, and the head is not `provisioning`.
+    Unborn,
     /// The store failed; the next run tries again.
     Failed,
 }
@@ -101,6 +106,9 @@ pub struct TenantFinish {
     pub events: u32,
     /// The seq up to which the `pending_ops` rows were cleared.
     pub cleared_to: Option<u64>,
+    /// Units whose born marker could not be written (the next run tries
+    /// again).
+    pub born_failed: Vec<u32>,
     /// Fixed codes of what pages: damage, never an outage.
     pub pages: Vec<&'static str>,
 }
@@ -120,8 +128,252 @@ where
     Q: Sql,
     U: TenantUnits,
 {
-    let _ = (chain, dir, units, tenant, now);
-    Err(BridgeError::NotImplemented("finish_tenant"))
+    let managed = Tenant::Managed(tenant.clone());
+    let mut run = TenantFinish {
+        head: ChainHead {
+            seq: 0,
+            complete: true,
+        },
+        order: None,
+        directory: match dir {
+            Some(_) => StoreStep::Failed,
+            None => StoreStep::Unbound,
+        },
+        units: Vec::new(),
+        events: 0,
+        cleared_to: None,
+        born_failed: Vec::new(),
+        pages: Vec::new(),
+    };
+    // The row before the head: a head read after it is at least as new.
+    let row = match dir {
+        None => Row::Unbound,
+        Some(d) => match d.raw_tenant(&managed).await {
+            Ok(None) => Row::Seq(0),
+            Ok(Some(RawTenant {
+                record_seq: Some(seq),
+                door: Some(_),
+            })) => Row::Seq(seq),
+            Ok(Some(_)) => {
+                run.pages.push("directory_row_unreadable");
+                Row::Unknown
+            }
+            Err(_) => Row::Unknown,
+        },
+    };
+    let head = match chain.head(&managed, 0).await {
+        Ok(Some(head)) => head,
+        Ok(None) => return Ok(run),
+        Err(e) => return Err(chain_error(e)),
+    };
+    let h = head.door.seq;
+    run.head.seq = h;
+
+    // The records the directory does not hold, oldest first, each with
+    // the one before it.
+    let mut steps: Vec<(Option<ReadRecord>, ReadRecord)> = Vec::new();
+    let mut readable = false;
+    let mut far = false;
+    if let Row::Seq(s) = row {
+        if s > h {
+            run.pages.push("directory_row_ahead");
+        } else if s == h {
+            readable = true;
+        } else if head.door.lifecycle == Lifecycle::Shredded {
+            // The shred's purge removes the records below the stub, and
+            // its events with them: the stub alone, with no event.
+            readable = true;
+            steps.push((None, head.clone()));
+        } else {
+            let to = h.min(s.saturating_add(MAX_FINISH_RECORDS));
+            far = to < h;
+            match read_steps(chain, &managed, s, to, &head).await {
+                Ok(read) => {
+                    readable = true;
+                    steps = read;
+                }
+                Err(Some(what)) => run.pages.push(what),
+                Err(None) => {}
+            }
+        }
+    }
+
+    // A failed, unbound or unreadable directory, or one too far behind
+    // to read whole, takes the closing order: what closes reaches the
+    // units now.
+    let order = match (&row, readable) {
+        (Row::Seq(_), true) if !far => {
+            let closes = steps.iter().any(|(prev, r)| {
+                write_order(prev.as_ref().map(|p| &p.door), &r.door) == WriteOrder::Closing
+            });
+            match closes {
+                true => WriteOrder::Closing,
+                false => WriteOrder::Opening,
+            }
+        }
+        _ => WriteOrder::Closing,
+    };
+    run.order = Some(order);
+
+    if order == WriteOrder::Closing {
+        bring_units(units, tenant, &head, &mut run).await;
+    }
+    if let (Some(d), Row::Seq(s), true) = (dir, &row, readable) {
+        run.directory = directory_step(d, *s, h, &steps, now, &mut run.events).await;
+    }
+    if order == WriteOrder::Opening {
+        match run.directory {
+            StoreStep::Holds(seq) if seq == h => bring_units(units, tenant, &head, &mut run).await,
+            _ => {
+                run.units = head
+                    .door
+                    .units
+                    .iter()
+                    .map(|u| (*u, StoreStep::Waiting))
+                    .collect()
+            }
+        }
+    }
+
+    // Clear what every store holds.
+    if let (Some(d), StoreStep::Holds(held)) = (dir, run.directory) {
+        let provisioning = head.door.lifecycle == Lifecycle::Provisioning;
+        let mut floor = Some(held);
+        for (_, step) in &run.units {
+            floor = match (floor, step) {
+                (Some(f), StoreStep::Holds(seq)) => Some(f.min(*seq)),
+                (Some(f), StoreStep::Unborn) if provisioning => Some(f),
+                _ => None,
+            };
+        }
+        if let Some(to) = floor.filter(|&to| to > 0) {
+            if d.clear_pending(&managed, ChainKind::Tenant, to)
+                .await
+                .is_ok()
+            {
+                run.cleared_to = Some(to);
+            }
+        }
+    }
+    Ok(run)
+}
+
+/// What the finisher read of the directory's row.
+enum Row {
+    /// No directory is bound.
+    Unbound,
+    /// The row's seq; 0 for no row.
+    Seq(u64),
+    /// The row could not be read, or does not say a seq it can be trusted
+    /// with.
+    Unknown,
+}
+
+/// The tenant chain did not read: damage pages, anything else may pass.
+pub const ERR_CHAIN_DAMAGED: BridgeError =
+    BridgeError::Invalid("tenant finisher: the tenant chain is damaged");
+
+/// The tenant key version a record names is not held here yet.
+pub const ERR_KEY_NOT_HELD: BridgeError =
+    BridgeError::Invalid("tenant finisher: tenant key version not held yet");
+
+fn chain_error(e: ChainError) -> BridgeError {
+    match e {
+        ChainError::Store(e) => e,
+        ChainError::KeyNotHeld { .. } => ERR_KEY_NOT_HELD,
+        _ => ERR_CHAIN_DAMAGED,
+    }
+}
+
+/// The records `s + 1` to `to`, each with the record before it (`None`
+/// for seq 1). `Err(Some(code))`: damage, which pages; `Err(None)`: the
+/// store failed.
+async fn read_steps<S: RecordStore, C: ControlSeal>(
+    chain: &TenantChain<'_, S, C>,
+    tenant: &Tenant,
+    s: u64,
+    to: u64,
+    head: &ReadRecord,
+) -> std::result::Result<Vec<(Option<ReadRecord>, ReadRecord)>, Option<&'static str>> {
+    let read = |seq: u64| async move {
+        if seq == head.door.seq {
+            return Ok(head.clone());
+        }
+        match chain.read(tenant, seq).await {
+            Ok(Some(r)) => Ok(r),
+            Ok(None) => Err(Some("tenant_record_missing")),
+            Err(ChainError::Store(_)) | Err(ChainError::KeyNotHeld { .. }) => Err(None),
+            Err(_) => Err(Some("tenant_record_damaged")),
+        }
+    };
+    let mut prev = match s {
+        0 => None,
+        s => Some(read(s).await?),
+    };
+    let mut out = Vec::new();
+    for seq in s + 1..=to {
+        let r = read(seq).await?;
+        out.push((prev.take(), r.clone()));
+        prev = Some(r);
+    }
+    Ok(out)
+}
+
+/// The directory step: the events of `steps` in seq order, then the row
+/// raised to the last of them.
+async fn directory_step<Q: Sql>(
+    dir: &SqlDirectory<'_, Q>,
+    s: u64,
+    h: u64,
+    steps: &[(Option<ReadRecord>, ReadRecord)],
+    now: UnixMs,
+    events: &mut u32,
+) -> StoreStep {
+    let Some((_, last)) = steps.last() else {
+        return match s == h {
+            true => StoreStep::Holds(h),
+            false => StoreStep::Failed,
+        };
+    };
+    for (prev, r) in steps {
+        for event in tenant_events(prev.as_ref(), r) {
+            match dir.append_event(&event).await {
+                Ok(Appended::Appended) => *events += 1,
+                Ok(Appended::Repeated) => {}
+                Err(_) => return StoreStep::Failed,
+            }
+        }
+    }
+    match dir.apply_tenant(&last.door, now).await {
+        Ok(_) => StoreStep::Holds(last.door.seq),
+        Err(_) => StoreStep::Failed,
+    }
+}
+
+/// Every listed unit, the root unit first, brought to the head; a born
+/// unit's marker written if it is missing.
+async fn bring_units<U: TenantUnits>(
+    units: &U,
+    tenant: &TenantId,
+    head: &ReadRecord,
+    run: &mut TenantFinish,
+) {
+    let provisioning = head.door.lifecycle == Lifecycle::Provisioning;
+    // The list is ascending, so the root unit (0) comes first.
+    for &unit in &head.door.units {
+        let step = match units.bring_up(tenant, unit).await {
+            Ok(UnitHolds::Seq { state_seq }) => {
+                if units.mark_born(tenant, unit).await.is_err() {
+                    run.born_failed.push(unit);
+                }
+                StoreStep::Holds(state_seq)
+            }
+            Ok(UnitHolds::Unborn) if provisioning => StoreStep::Unborn,
+            Ok(UnitHolds::Unborn) => StoreStep::Unborn,
+            Err(_) => StoreStep::Failed,
+        };
+        run.units.push((unit, step));
+    }
 }
 
 /// [`finish_tenant`] as the pending sweep's [`ChainFinisher`]: it answers
