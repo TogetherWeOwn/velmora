@@ -51,8 +51,8 @@ use zeroize::Zeroizing;
 use crate::config::{BridgeConfig, Maintenance};
 use crate::crypto::{seal_extent, unwrap_bdk, unwrap_secret};
 use crate::ingress::{
-    body_is_empty, declared_length, read_upload, upload_lengths, Charge, IngressError,
-    UploadLengths, UploadReadError,
+    body_is_empty, declared_length, read_upload, read_upload_traced, upload_lengths, Charge,
+    IngressError, UploadLengths, UploadReadError,
 };
 use crate::intents::WRITER_MAX_AGE_MS;
 use crate::ports::{
@@ -65,6 +65,7 @@ use crate::service::common::{
     hold_precondition, host_refused, precondition, restore_gate, writes_refused, REGION_ALIASES,
 };
 use crate::service::slices::{store_slices, SliceError, SliceSink};
+use crate::trace::{Phase, WriteTrace};
 use crate::types::{
     Body, BridgeError, Bucket, CompleteUpload, ExtentId, ExtentPlacement, ExtentRow, ExtentState,
     GenerationRow, GenerationState, Job, KeyStatus, OutboxStage, PartExtent, Perm, RespBody,
@@ -664,12 +665,18 @@ pub(super) async fn upload_part<
     _bucket: &str,
     _key: &str,
 ) -> S3Response {
-    respond(upload_part_inner(bridge, req).await)
+    let mut trace = WriteTrace::begin("part", &bridge.clock);
+    let outcome = upload_part_inner(bridge, req, &mut trace).await;
+    if outcome.is_ok() {
+        trace.ok();
+    }
+    respond(outcome)
 }
 
 async fn upload_part_inner<C, B, N, J, K, T>(
     bridge: &Bridge<C, B, N, J, K, T>,
     req: S3Request,
+    trace: &mut WriteTrace<'_>,
 ) -> Outcome<S3Response>
 where
     C: Catalog,
@@ -680,6 +687,7 @@ where
     T: Clock,
 {
     let a = authenticate(bridge, &req).await?;
+    trace.lap(Phase::Auth).await;
     refuse_conditional(&a.headers)?;
     // UploadPartCopy is this request with a source header and no body.
     let copy = a.headers.get("x-amz-copy-source").is_some();
@@ -699,26 +707,33 @@ where
         Some((upload, _)) if upload.state == UploadState::Open => {}
         _ => return Err(ErrorCode::NoSuchUpload.into()),
     }
+    trace.lap(Phase::D1).await;
 
     // Plaintext and ciphertext live together while sealing: the charge
     // covers both and is held until the ciphertext has been handed over.
     // For aws-chunked bodies every length below is the decoded one.
     let (body, charge) = if copy {
-        copied_part(bridge, &a, &req.headers, req.body).await?
+        trace.kind("part_copy");
+        let copied = copied_part(bridge, &a, &req.headers, req.body).await?;
+        trace.lap(Phase::Other).await;
+        copied
     } else {
         // A part may be as long as a PutObject. Above one extent it is
         // stored as slices, never read whole.
         let lengths = upload_lengths(&req.headers, bridge.cfg.max_put_bytes)?;
         if lengths.decoded > bridge.cfg.max_extent_bytes {
-            return sliced_part(bridge, &a, &target, number, req.body, lengths).await;
+            return sliced_part(bridge, &a, &target, number, req.body, lengths, trace).await;
         }
         let mut validator = UploadValidator::new(&a.headers, &a.verified, &a.policy)?;
         let charge = bridge.budget.charge_body(lengths.decoded).await?;
-        let body = read_upload(req.body, lengths, &charge, &mut validator).await?;
+        trace.lap(Phase::Wait).await;
+        let body = read_upload_traced(req.body, lengths, &charge, &mut validator, trace).await?;
         validator.finish()?;
+        trace.lap(Phase::Hash).await;
         (body, charge)
     };
     let declared = body.len() as u64;
+    trace.body(declared, 1);
 
     let bdk = unwrap_bdk(
         &bridge.kek,
@@ -730,6 +745,7 @@ where
     let extent_id = ExtentId::mint(random()?);
     let sealed = seal_extent(&bdk, &a.bucket.id, &extent_id, &body, &mut SystemRng)?;
     drop(body);
+    trace.lap(Phase::Seal).await;
     let now = bridge.clock.now();
     let etag = format!("\"{}\"", hex(&sealed.plain_md5));
     let extent = ExtentRow {
@@ -769,6 +785,7 @@ where
         )
         .await?;
     drop(charge);
+    trace.lap(Phase::R2).await;
 
     let part = UploadPartRow {
         upload_id: id.clone(),
@@ -778,11 +795,12 @@ where
         etag: etag.clone(),
         uploaded_at: now,
     };
-    match bridge
+    let applied = bridge
         .catalog
         .put_upload_part(&target, &part, &extent, now)
-        .await?
-    {
+        .await?;
+    trace.lap(Phase::D1).await;
+    match applied {
         Guard::Applied(()) if copy => Ok(from_proto(copy_part_response(&etag, now.0)?)),
         Guard::Applied(()) => Ok(S3Response {
             status: 200,
@@ -816,6 +834,7 @@ async fn sliced_part<C, B, N, J, K, T>(
     number: u16,
     body: Body,
     lengths: UploadLengths,
+    trace: &mut WriteTrace<'_>,
 ) -> Outcome<S3Response>
 where
     C: Catalog,
@@ -840,10 +859,13 @@ where
     if held.saturating_add(count as u64) > u64::from(limit) {
         return Err(too_many_extents(limit).into());
     }
+    trace.body(lengths.decoded, u32::try_from(count).unwrap_or(u32::MAX));
+    trace.lap(Phase::D1).await;
     let mut validator = UploadValidator::new(&a.headers, &a.verified, &a.policy)?;
     // One slice of plaintext and one of ciphertext are held at a time,
     // whatever the length of the part. Nothing is read before this.
     let charge = bridge.budget.charge_body(slice_bytes).await?;
+    trace.lap(Phase::Wait).await;
 
     let started = bridge.clock.now();
     let write = WriteId::mint(random()?);
@@ -867,6 +889,7 @@ where
             return Err(writes_refused().into());
         }
     }
+    trace.lap(Phase::D1).await;
     // From here on a failure gives the rows up. No record of the write
     // exists anywhere, so the sweep need not wait for them. A row that is
     // given up no longer passes the guard of the batch below: a batch
@@ -884,7 +907,7 @@ where
         slice_bytes,
         rng: &mut rng,
     };
-    let stored = match store_slices(sink, body, lengths, &charge, &mut validator).await {
+    let stored = match store_slices(sink, body, lengths, &charge, &mut validator, trace).await {
         Ok(stored) => stored,
         Err(e) => {
             give_up().await;
@@ -906,6 +929,7 @@ where
         }
     };
     drop(charge);
+    trace.lap(Phase::Hash).await;
     if stored.len() != count {
         give_up().await;
         return Err(Fail::Internal);
@@ -960,11 +984,12 @@ where
         give_up().await;
         return Err(ErrorCode::SlowDown.into());
     }
-    match bridge
+    let applied = bridge
         .catalog
         .put_upload_part_sliced(target, &part, &extents, &write, now)
-        .await
-    {
+        .await;
+    trace.lap(Phase::D1).await;
+    match applied {
         Ok(Guard::Applied(())) => {}
         Ok(Guard::Lost) => {
             // The batch wrote nothing. The upload was completed or
@@ -989,7 +1014,9 @@ where
     // Before the answer: a catalogue restored to a point before this
     // commit is then behind its stamp, the sweep refuses there, and the
     // slices stay. Without the raise the part is not acknowledged.
-    if bridge.raise_stamp().await.is_err() {
+    let raised = bridge.raise_stamp().await;
+    trace.lap(Phase::D1).await;
+    if raised.is_err() {
         restore_gate(bridge).await?;
         return Err(ErrorCode::SlowDown.into());
     }

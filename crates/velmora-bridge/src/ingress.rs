@@ -37,6 +37,7 @@ use velmora_s3_proto::{is_aws_chunked, ErrorCode, UploadValidator};
 
 use crate::config::BridgeConfig;
 use crate::service::{classify, Route};
+use crate::trace::{Phase, WriteTrace};
 use crate::types::{Body, S3Request, S3Response};
 
 /// How long a request may wait for budget before `503 SlowDown`.
@@ -1156,6 +1157,19 @@ pub async fn read_upload(
     charge: &Charge,
     validator: &mut UploadValidator,
 ) -> Result<Vec<u8>, UploadReadError> {
+    read_upload_traced(body, lengths, charge, validator, &mut WriteTrace::off()).await
+}
+
+/// [`read_upload`], noting in `trace` the time spent waiting for each
+/// piece of the body ([`Phase::Read`]) and taking it in
+/// ([`Phase::Hash`]).
+pub(crate) async fn read_upload_traced(
+    body: Body,
+    lengths: UploadLengths,
+    charge: &Charge,
+    validator: &mut UploadValidator,
+    trace: &mut WriteTrace<'_>,
+) -> Result<Vec<u8>, UploadReadError> {
     if charge.bytes() < lengths.decoded || validator.decoded_length() != lengths.decoded {
         return Err(IngressError::Internal.into());
     }
@@ -1164,13 +1178,17 @@ pub async fn read_upload(
     let mut received: u64 = 0;
     if let Body::Stream { mut stream, .. } = body {
         while let Some(chunk) = stream.next().await {
+            trace.mark(Phase::Read);
             let chunk = chunk.map_err(|_| IngressError::IncompleteBody)?;
             received = received.saturating_add(chunk.len() as u64);
             if lengths.encoded.is_some_and(|n| received > n) {
                 return Err(IngressError::EntityTooLarge.into());
             }
             validator.push_body(&chunk, &mut |decoded| out.extend_from_slice(decoded))?;
+            drop(chunk);
+            trace.piece();
         }
+        trace.mark(Phase::Read);
     }
     if lengths.encoded.is_some_and(|n| received != n) {
         return Err(IngressError::IncompleteBody.into());

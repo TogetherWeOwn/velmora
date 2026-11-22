@@ -26,12 +26,13 @@ use super::common::{
 };
 use super::slices::{store_slices, SliceError, SliceSink};
 use crate::crypto::{seal_extent, unwrap_bdk};
-use crate::ingress::{read_upload, upload_lengths, UploadLengths, UploadReadError};
+use crate::ingress::{read_upload_traced, upload_lengths, UploadLengths, UploadReadError};
 use crate::intents::WRITER_MAX_AGE_MS;
 use crate::ports::{
     BlobMeta, BlobStore, Bridge, Catalog, Clock, Guard, JobSink, Kek, NntpConnector, PublishOutcome,
 };
 use crate::recovery::{id_after, write_generation};
+use crate::trace::{Phase, WriteTrace};
 use crate::types::{
     Body, Bucket, CommitGeneration, ExtentId, ExtentRow, ExtentState, GenerationId, GenerationRow,
     GenerationState, Job, OutboxStage, Precondition, S3Request, S3Response, SafetyState, WriteId,
@@ -72,7 +73,21 @@ async fn put<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: 
     bridge: &Bridge<C, B, N, J, K, T>,
     req: S3Request,
 ) -> Result<S3Response, S3Response> {
+    let mut trace = WriteTrace::begin("put", &bridge.clock);
+    let resp = put_traced(bridge, req, &mut trace).await;
+    if resp.is_ok() {
+        trace.ok();
+    }
+    resp
+}
+
+async fn put_traced<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>(
+    bridge: &Bridge<C, B, N, J, K, T>,
+    req: S3Request,
+    trace: &mut WriteTrace<'_>,
+) -> Result<S3Response, S3Response> {
     let authed = authenticate(bridge, &req).await?;
+    trace.lap(Phase::Auth).await;
     let (bucket, key) = authed.object()?;
     // `If-None-Match: *` or `If-Match`, held to by the batch that
     // publishes; any other conditional header is refused here.
@@ -80,6 +95,7 @@ async fn put<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: 
     restore_gate(bridge).await?;
     // CopyObject is this request shape with a source header and no body.
     if authed.headers.get("x-amz-copy-source").is_some() {
+        trace.kind("copy");
         let declared = crate::ingress::declared_length(&req.headers).map_err(|e| e.response())?;
         return super::copy::copy_object(bridge, &authed, declared, req.body, condition).await;
     }
@@ -89,6 +105,7 @@ async fn put<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: 
     if let Some(condition) = &condition {
         check_precondition(bridge, &bucket.id, key, condition).await?;
     }
+    trace.lap(Phase::D1).await;
     let metadata = UploadMetadata::from_headers(&authed.headers).map_err(s3_error)?;
     // For aws-chunked bodies every length below is the decoded one.
     let lengths =
@@ -105,8 +122,9 @@ async fn put<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: 
             validator,
             condition,
         };
-        return put_sliced(bridge, req.body, upload).await;
+        return put_sliced(bridge, req.body, upload, trace).await;
     }
+    trace.body(len, 1);
 
     // Nothing of the body is buffered before this charge is held.
     let charge = bridge
@@ -114,13 +132,15 @@ async fn put<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: 
         .charge_body(len)
         .await
         .map_err(|e| e.response())?;
-    let body = read_upload(req.body, lengths, &charge, &mut validator)
+    trace.lap(Phase::Wait).await;
+    let body = read_upload_traced(req.body, lengths, &charge, &mut validator, trace)
         .await
         .map_err(|e| match e {
             UploadReadError::Ingress(e) => e.response(),
             UploadReadError::Proto(e) => s3_error(e),
         })?;
     let decoded = validator.finish().map_err(s3_error)?;
+    trace.lap(Phase::Hash).await;
 
     let now = bridge.clock.now();
     let mut rng = SystemRng;
@@ -142,6 +162,7 @@ async fn put<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: 
     let sealed =
         seal_extent(&bdk, &bucket.id, &extent_id, &body, &mut rng).map_err(|_| internal())?;
     drop(body);
+    trace.lap(Phase::Seal).await;
 
     let etag = format!("\"{}\"", hex(&sealed.plain_md5));
     let checksum = decoded.checksum().cloned();
@@ -200,6 +221,7 @@ async fn put<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: 
         )
         .await
         .map_err(|_| internal())?;
+    trace.lap(Phase::R2).await;
     // The recovery record is durable before the catalogue batch: an
     // acknowledged PUT can be replayed into a restored catalogue. If this
     // write fails, nothing is published.
@@ -223,6 +245,7 @@ async fn put<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: 
             condition.as_ref(),
         )
         .await?;
+        trace.lap(Phase::D1).await;
         let record = write_generation(
             &bridge.catalog,
             &bridge.safety,
@@ -234,12 +257,14 @@ async fn put<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: 
         )
         .await
         .map_err(|_| internal())?;
-        let refused = match bridge
+        trace.lap(Phase::Other).await;
+        let outcome = bridge
             .catalog
             .commit_generation(&commit, condition.as_ref(), record)
             .await
-            .map_err(|_| internal())?
-        {
+            .map_err(|_| internal())?;
+        trace.lap(Phase::D1).await;
+        let refused = match outcome {
             PublishOutcome::Applied => break commit.generation.id.clone(),
             PublishOutcome::Refused(record) | PublishOutcome::Fenced(record) => record,
         };
@@ -330,6 +355,7 @@ async fn put_sliced<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: K
     bridge: &Bridge<C, B, N, J, K, T>,
     body: Body,
     upload: SlicedUpload<'_>,
+    trace: &mut WriteTrace<'_>,
 ) -> Result<S3Response, S3Response> {
     let SlicedUpload {
         bucket,
@@ -342,6 +368,7 @@ async fn put_sliced<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: K
     let len = lengths.decoded;
     let slice_bytes = bridge.cfg.slice_bytes;
     let count = usize::try_from(len.div_ceil(slice_bytes)).map_err(|_| internal())?;
+    trace.body(len, u32::try_from(count).unwrap_or(u32::MAX));
 
     // One slice of plaintext and one of ciphertext are held at a time,
     // whatever the length of the body. Nothing is read before this.
@@ -350,6 +377,7 @@ async fn put_sliced<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: K
         .charge_body(slice_bytes)
         .await
         .map_err(|e| e.response())?;
+    trace.lap(Phase::Wait).await;
 
     let started = bridge.clock.now();
     let mut rng = SystemRng;
@@ -381,6 +409,7 @@ async fn put_sliced<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: K
         }
         Err(_) => return Err(internal()),
     }
+    trace.lap(Phase::D1).await;
 
     let sink = SliceSink {
         safety: &bridge.safety,
@@ -390,7 +419,7 @@ async fn put_sliced<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: K
         slice_bytes,
         rng: &mut rng,
     };
-    let stored = match store_slices(sink, body, lengths, &charge, &mut validator).await {
+    let stored = match store_slices(sink, body, lengths, &charge, &mut validator, trace).await {
         Ok(stored) => stored,
         Err(e) => {
             give_up(bridge, &write).await;
@@ -411,6 +440,7 @@ async fn put_sliced<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: K
             return Err(s3_error(e));
         }
     };
+    trace.lap(Phase::Hash).await;
     if stored.len() != count {
         give_up(bridge, &write).await;
         return Err(internal());
@@ -534,6 +564,7 @@ async fn put_sliced<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: K
             give_up(bridge, &write).await;
             return Err(resp);
         }
+        trace.lap(Phase::D1).await;
         // From the record on, a failure without an answer leaves the
         // rows `open`: the record may exist, and only the sweep's look
         // at `SAFETY` after the grace period decides what the slices
@@ -550,12 +581,13 @@ async fn put_sliced<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: K
         )
         .await
         .map_err(|_| internal())?;
-        let refused = match bridge
+        trace.lap(Phase::Other).await;
+        let committed = bridge
             .catalog
             .commit_sliced(&commit, &write, condition.as_ref(), record)
-            .await
-            .map_err(|_| internal())?
-        {
+            .await;
+        trace.lap(Phase::D1).await;
+        let refused = match committed.map_err(|_| internal())? {
             PublishOutcome::Applied => break,
             PublishOutcome::Refused(record) | PublishOutcome::Fenced(record) => record,
         };
@@ -596,6 +628,7 @@ async fn put_sliced<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: K
     // to a point before this commit is then found as such, and closes
     // the write gate. A raise that fails does not undo the commit.
     let _ = bridge.raise_stamp().await;
+    trace.lap(Phase::D1).await;
     drop(charge);
 
     // The commit wrote the posting obligations; the queue messages are
