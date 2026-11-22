@@ -7,7 +7,7 @@ use std::collections::HashSet;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use serde_json::Value;
-use velmora_mgmt_types::codes::{Code, KofraMapping, TenancyMapping};
+use velmora_mgmt_types::codes::{Code, ErrorBody, KofraMapping, TenancyMapping};
 use velmora_mgmt_types::examples::{Example, BUCKET, EXAMPLES, KEY, TENANT};
 use velmora_mgmt_types::idem::{fingerprint, TokenClass};
 use velmora_mgmt_types::ids::{self, MAX_SAFE_INTEGER};
@@ -577,6 +577,14 @@ fn the_key_update_fingerprint_leaves_out_if_seq() {
     ))
     .unwrap();
     assert_eq!(f(&two(x, y)), f(&swapped));
+    // Ascending bucket-id order, exactly: a kept row outlives a deploy.
+    assert_eq!(
+        swapped.fingerprint_body(),
+        format!(
+            r#"{{"grants":[{{"bucket_id":"{x}","access":"rw"}},{{"bucket_id":"{y}","access":"ro"}}]}}"#
+        )
+        .into_bytes()
+    );
     assert_ne!(
         f(&two(x, y)),
         f(&two(y, x)),
@@ -835,68 +843,225 @@ fn positions_of_the_lists() {
 #[test]
 fn the_code_table_literally() {
     use KofraMapping as K;
-    let table: [(&str, u16, bool, KofraMapping); 38] = [
-        ("bad_request", 400, false, K::Upstream),
-        ("grant_limits_not_served", 400, false, K::Upstream),
-        ("idempotency_key_required", 400, false, K::Upstream),
-        ("invalid_position", 400, false, K::InvalidCursor),
-        ("unauthenticated", 401, false, K::Upstream),
-        ("insufficient_scope", 403, false, K::Upstream),
-        ("internal_key_refused", 403, false, K::Upstream),
-        ("acting_principal_unknown", 403, false, K::Upstream),
-        ("acting_principal_inactive", 403, false, K::Upstream),
-        ("grant_not_held", 403, false, K::GrantNotHeld),
-        ("not_found", 404, false, K::Upstream),
-        ("method_not_allowed", 405, false, K::Upstream),
-        ("tenant_not_found", 404, false, K::Upstream),
-        ("principal_not_found", 404, false, K::Upstream),
-        ("bucket_not_found", 404, false, K::BucketNotFound),
-        ("key_not_found", 404, false, K::KeyNotFound),
-        ("bucket_already_exists", 409, false, K::BucketAlreadyExists),
-        ("bucket_not_empty", 409, false, K::BucketNotEmpty),
-        ("key_limit_reached", 409, false, K::KeyLimitReached),
-        ("grant_limit_reached", 409, false, K::GrantLimitReached),
-        ("feed_reset", 409, false, K::FeedReset),
+    use TenancyMapping as TM;
+    let table: [(&str, u16, bool, KofraMapping, TenancyMapping); 38] = [
+        ("bad_request", 400, false, K::Upstream, TM::RetryAndPage),
+        (
+            "grant_limits_not_served",
+            400,
+            false,
+            K::Upstream,
+            TM::RetryAndPage,
+        ),
+        (
+            "idempotency_key_required",
+            400,
+            false,
+            K::Upstream,
+            TM::RetryAndPage,
+        ),
+        (
+            "invalid_position",
+            400,
+            false,
+            K::InvalidCursor,
+            TM::RetryAndPage,
+        ),
+        ("unauthenticated", 401, false, K::Upstream, TM::RetryAndPage),
+        (
+            "insufficient_scope",
+            403,
+            false,
+            K::Upstream,
+            TM::RetryAndPage,
+        ),
+        (
+            "internal_key_refused",
+            403,
+            false,
+            K::Upstream,
+            TM::RetryAndPage,
+        ),
+        (
+            "acting_principal_unknown",
+            403,
+            false,
+            K::Upstream,
+            TM::RetryAndPage,
+        ),
+        (
+            "acting_principal_inactive",
+            403,
+            false,
+            K::Upstream,
+            TM::RetryAndPage,
+        ),
+        (
+            "grant_not_held",
+            403,
+            false,
+            K::GrantNotHeld,
+            TM::RetryAndPage,
+        ),
+        ("not_found", 404, false, K::Upstream, TM::RetryAndPage),
+        (
+            "method_not_allowed",
+            405,
+            false,
+            K::Upstream,
+            TM::RetryAndPage,
+        ),
+        (
+            "tenant_not_found",
+            404,
+            false,
+            K::Upstream,
+            TM::RetryAndPage,
+        ),
+        (
+            "principal_not_found",
+            404,
+            false,
+            K::Upstream,
+            TM::RetryAndPage,
+        ),
+        (
+            "bucket_not_found",
+            404,
+            false,
+            K::BucketNotFound,
+            TM::RetryAndPage,
+        ),
+        (
+            "key_not_found",
+            404,
+            false,
+            K::KeyNotFound,
+            TM::RetryAndPage,
+        ),
+        (
+            "bucket_already_exists",
+            409,
+            false,
+            K::BucketAlreadyExists,
+            TM::RetryAndPage,
+        ),
+        (
+            "bucket_not_empty",
+            409,
+            false,
+            K::BucketNotEmpty,
+            TM::RetryAndPage,
+        ),
+        (
+            "key_limit_reached",
+            409,
+            false,
+            K::KeyLimitReached,
+            TM::RetryAndPage,
+        ),
+        (
+            "grant_limit_reached",
+            409,
+            false,
+            K::GrantLimitReached,
+            TM::RetryAndPage,
+        ),
+        ("feed_reset", 409, false, K::FeedReset, TM::RetryAndPage),
         (
             "deletion_already_requested",
             409,
             false,
             K::DeletionAlreadyRequested,
+            TM::RetryAndPage,
         ),
         (
             "deletion_not_requested",
             409,
             false,
             K::DeletionNotRequested,
+            TM::RetryAndPage,
         ),
-        ("deletion_final", 409, false, K::DeletionFinal),
-        ("deletion_replayed", 409, false, K::IdempotencyKeyReused),
-        ("tenant_read_only", 409, false, K::AccountReadOnly),
-        ("tenant_unavailable", 409, false, K::AccountUnavailable),
-        ("tenant_restoring", 409, true, K::Unavailable),
-        ("key_changed", 409, false, K::RereadKey),
-        ("principal_exists", 409, false, K::Upstream),
-        ("actor_not_permitted", 403, false, K::DeletionNotCancellable),
-        ("key_moved", 409, true, K::Unavailable),
-        ("external_ref_retired", 409, false, K::TenancyGone),
-        ("idempotency_key_in_use", 409, true, K::IdempotencyKeyInUse),
+        (
+            "deletion_final",
+            409,
+            false,
+            K::DeletionFinal,
+            TM::RetryAndPage,
+        ),
+        (
+            "deletion_replayed",
+            409,
+            false,
+            K::IdempotencyKeyReused,
+            TM::RetryAndPage,
+        ),
+        (
+            "tenant_read_only",
+            409,
+            false,
+            K::AccountReadOnly,
+            TM::RetryAndPage,
+        ),
+        (
+            "tenant_unavailable",
+            409,
+            false,
+            K::AccountUnavailable,
+            TM::RetryAndPage,
+        ),
+        ("tenant_restoring", 409, true, K::Unavailable, TM::Retry),
+        ("key_changed", 409, false, K::RereadKey, TM::RetryAndPage),
+        (
+            "principal_exists",
+            409,
+            false,
+            K::Upstream,
+            TM::RetryAndPage,
+        ),
+        (
+            "actor_not_permitted",
+            403,
+            false,
+            K::DeletionNotCancellable,
+            TM::RetryAndPage,
+        ),
+        ("key_moved", 409, true, K::Unavailable, TM::Retry),
+        ("external_ref_retired", 409, false, K::TenancyGone, TM::Gone),
+        (
+            "idempotency_key_in_use",
+            409,
+            true,
+            K::IdempotencyKeyInUse,
+            TM::Retry,
+        ),
         (
             "idempotency_key_reused",
             422,
             false,
             K::IdempotencyKeyReused,
+            TM::RetryAndPage,
         ),
-        ("cap_reached", 429, true, K::Busy),
-        ("service_unavailable", 503, true, K::Unavailable),
-        ("internal_error", 500, false, K::Upstream),
+        ("cap_reached", 429, true, K::Busy, TM::Retry),
+        ("service_unavailable", 503, true, K::Unavailable, TM::Retry),
+        ("internal_error", 500, false, K::Upstream, TM::RetryAndPage),
     ];
-    for (i, (name, status, retry_after, kofra)) in table.into_iter().enumerate() {
+    for (i, (name, status, retry_after, kofra, tenancy)) in table.into_iter().enumerate() {
         let c = Code::ALL[i];
         assert_eq!(c.as_str(), name);
         assert_eq!(c.status(), status, "{name}");
         assert_eq!(c.retry_after(), retry_after, "{name}");
         assert_eq!(c.kofra(), kofra, "{name}");
+        assert_eq!(c.tenancy(), tenancy, "{name}");
+        assert_eq!(c.body().kofra(), kofra, "{name}");
+        assert_eq!(c.body().tenancy(), tenancy, "{name}");
     }
+    // A code this crate does not know.
+    let unknown = ErrorBody {
+        code: "rate_limited".into(),
+    };
+    assert_eq!(unknown.kofra(), K::Upstream);
+    assert_eq!(unknown.tenancy(), TM::RetryAndPage);
 }
 
 #[test]
