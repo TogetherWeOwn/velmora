@@ -2,7 +2,10 @@
 //! move's import (DS1 §2.3), on the native database. `workers/unit-suite`
 //! runs this file against a Durable Object too.
 
+mod unit_bucket_support;
+
 use serde_json::json;
+use unit_bucket_support::fixture_placements;
 use velmora_bridge::testkit::RusqliteSql;
 use velmora_bridge::unit::call::HoldMode;
 use velmora_bridge::unit::identity::Refusal;
@@ -74,6 +77,8 @@ fn sync(
                 tenant_mode: None::<HoldMode>,
                 restoring_since: restoring,
                 lift: None,
+                buckets: vec![],
+                placed: fixture_placements(u.sql()),
             },
         },
     )

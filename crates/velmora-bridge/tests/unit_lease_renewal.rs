@@ -459,10 +459,9 @@ async fn revocations_are_listed_in_pages_of_a_thousand() {
     assert_eq!(bucket.count("list"), 2);
 }
 
-/// A name below the revocation directory that is not one access key id
-/// is skipped and reported for paging, and every
-/// name that is one counts; a directory that does not name the tenant is
-/// refused before any list.
+/// A name below the revocation directory that is not one revocable id
+/// is skipped and reported for paging. A directory that does not name
+/// the tenant is refused before any list.
 #[tokio::test(flavor = "current_thread")]
 async fn stray_revocation_names_are_skipped_and_reported() {
     let clock = FixedClock::new(T0);
@@ -516,6 +515,40 @@ async fn stray_revocation_names_are_skipped_and_reported() {
     let bucket = SlowBucket::new(&clock);
     assert!(revocations(&bucket, &Flat, TENANT).await.is_err());
     assert_eq!(bucket.count("list"), 0);
+}
+
+/// The renewal proof counts a valid principal id and reports a malformed
+/// principal name as stray without counting it.
+#[tokio::test(flavor = "current_thread")]
+async fn renewal_lists_valid_principal_ids_and_reports_malformed_ones() {
+    let clock = FixedClock::new(T0);
+    let bucket = SlowBucket::new(&clock);
+    chains(&bucket, TENANT, 1, 1).await;
+    let principal = "p_00000000000000a1";
+    let malformed = format!("m/rk/{TENANT}/p_xyz");
+    bucket.plant(&format!("m/rk/{TENANT}/{principal}")).await;
+    bucket.plant(&malformed).await;
+
+    let listed = revocations(&bucket, &Names, TENANT).await.unwrap();
+    assert_eq!(listed.ids, vec![principal]);
+    assert_eq!(listed.stray, vec![malformed.clone()]);
+
+    let id = unit_id(0);
+    let proof = prove(&bucket, &clock, &Names, &view(&id, 1, 1, 0))
+        .await
+        .unwrap();
+    let Proof::Fresh {
+        revocations,
+        stray,
+        proven,
+        ..
+    } = proof
+    else {
+        panic!("expected a fresh proof with the principal revocation: {proof:?}");
+    };
+    assert_eq!(revocations, vec![principal]);
+    assert_eq!(stray, vec![malformed]);
+    assert_eq!(proven.revoked, 1);
 }
 
 /// The stamp of a unit runs the same algorithm as tenant 0's, keyed by

@@ -246,6 +246,8 @@ impl TestCatalog {
                 tenant_mode: None,
                 restoring_since: None,
                 lift: None,
+                buckets: vec![],
+                placed: vec![],
             },
         });
         assert!(matches!(synced, UnitAnswer::Ok { .. }), "{synced:?}");

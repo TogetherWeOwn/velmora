@@ -29,6 +29,7 @@ pub mod handout;
 pub mod job;
 pub mod lease;
 pub mod mark;
+pub mod placements;
 pub mod renewal;
 pub mod stamp_id;
 pub mod store;

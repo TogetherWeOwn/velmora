@@ -3,7 +3,10 @@
 //! Durable Object through `DoSql` (workers/unit); `workers/unit-suite`
 //! runs this file against it as well.
 
+mod unit_bucket_support;
+
 use serde_json::json;
+use unit_bucket_support::fixture_placements;
 use velmora_bridge::testkit::RusqliteSql;
 use velmora_bridge::unit::call::{Closed, HoldMode};
 use velmora_bridge::unit::identity::Refusal;
@@ -87,6 +90,8 @@ fn sync(
             tenant_mode: mode,
             restoring_since: None,
             lift: None,
+            buckets: vec![],
+            placed: fixture_placements(u.sql()),
         },
     };
     u.handle(&call(CallKind::Worker, None, true, op), NOW)
@@ -223,6 +228,8 @@ fn an_unborn_unit_answers_unborn_and_writes_nothing() {
                     tenant_mode: None,
                     restoring_since: None,
                     lift: None,
+                    buckets: vec![],
+                    placed: vec![],
                 },
             },
         );
@@ -432,6 +439,8 @@ fn a_restored_unit_starts_closed_and_a_sync_still_reaches_it() {
             tenant_mode: None,
             restoring_since: Some(7),
             lift: None,
+            buckets: vec![],
+            placed: vec![],
         },
     };
     assert!(matches!(
@@ -888,6 +897,8 @@ fn a_sync_never_moves_back_and_never_claims_keys_it_does_not_hold() {
             tenant_mode: None,
             restoring_since: None,
             lift: None,
+            buckets: vec![],
+            placed: fixture_placements(u.sql()),
         },
     };
     assert_eq!(
@@ -908,6 +919,8 @@ fn a_sync_never_moves_back_and_never_claims_keys_it_does_not_hold() {
             tenant_mode: None,
             restoring_since: None,
             lift: None,
+            buckets: vec![],
+            placed: fixture_placements(u.sql()),
         },
     };
     assert_eq!(

@@ -26,6 +26,7 @@ const NOW: UnixMs = UnixMs(1_795_000_000_000);
 const T: i64 = LeaseRules::DEFAULT.term_ms;
 const PERIOD: i64 = AlarmRules::DEFAULT.stamp_period_ms;
 const P: &str = "p_owner";
+const LISTED_P: &str = "p_00000000000000a1";
 const K: &str = "AKWIRE00000000000001";
 const GONE: &str = "AKWIRE00000000000099";
 const B1: &str = "b_00000000000000e1";
@@ -65,7 +66,13 @@ fn worker(u: &Unit<RusqliteSql>, op: UnitOp, now: UnixMs) -> UnitAnswer {
     u.handle(&call(CallKind::Worker, None, true, op), now)
 }
 
-fn sync(u: &Unit<RusqliteSql>, state_seq: u64, restoring: Option<u64>, now: UnixMs) -> UnitAnswer {
+fn sync(
+    u: &Unit<RusqliteSql>,
+    state_seq: u64,
+    restoring: Option<u64>,
+    placed: &[&str],
+    now: UnixMs,
+) -> UnitAnswer {
     let keys_seq = u.head().unwrap().seqs.keys_seq;
     worker(
         u,
@@ -79,6 +86,8 @@ fn sync(u: &Unit<RusqliteSql>, state_seq: u64, restoring: Option<u64>, now: Unix
                 tenant_mode: None,
                 restoring_since: restoring,
                 lift: None,
+                buckets: vec![],
+                placed: placed.iter().map(|id| id.to_string()).collect(),
             },
         },
         now,
@@ -132,7 +141,7 @@ fn born() -> Unit<RusqliteSql> {
         NOW,
     );
     assert!(matches!(a, UnitAnswer::Ok { .. }), "{a:?}");
-    assert!(matches!(sync(&u, 3, None, NOW), UnitAnswer::Ok { .. }));
+    assert!(matches!(sync(&u, 3, None, &[], NOW), UnitAnswer::Ok { .. }));
     u.sql()
         .apply(&format!(
             "INSERT INTO buckets(id, name, owner, bdk_wrapped, kek_version, created_at) \
@@ -249,6 +258,20 @@ fn key(id: &str, seq: u64) -> KeyEntry {
     }
 }
 
+fn listed_principal(seq: u64) -> KeyEntry {
+    KeyEntry {
+        id: LISTED_P.into(),
+        ..principal(seq)
+    }
+}
+
+fn listed_principals_key(seq: u64) -> KeyEntry {
+    KeyEntry {
+        made_by: Some(LISTED_P.into()),
+        ..key(K, seq)
+    }
+}
+
 /// Whether the S3 path serves `id` (its catalogue key row is active).
 fn served(u: &Unit<RusqliteSql>, id: &str) -> bool {
     u.sql().with_conn(|c| {
@@ -259,6 +282,18 @@ fn served(u: &Unit<RusqliteSql>, id: &str) -> bool {
         )
         .unwrap()
             == 1
+    })
+}
+
+/// Count the catalogue's effective grants, not the grants kept in the key chain.
+fn effective_grants_for(u: &Unit<RusqliteSql>, id: &str) -> i64 {
+    u.sql().with_conn(|c| {
+        c.query_row(
+            "SELECT count(*) FROM grants WHERE access_key_id = ?1",
+            [id],
+            |r| r.get(0),
+        )
+        .unwrap()
     })
 }
 
@@ -325,7 +360,10 @@ fn an_expired_lease_refuses_every_call_but_the_workers_and_writes_nothing() {
     assert_eq!(changes(&u), before, "nothing written");
 
     // The Worker's own calls still run: they copy verified records.
-    assert!(matches!(sync(&u, 3, None, NOW), UnitAnswer::Ok { .. }));
+    assert!(matches!(
+        sync(&u, 3, None, &[B1], NOW),
+        UnitAnswer::Ok { .. }
+    ));
     assert!(matches!(
         worker(&u, UnitOp::HeldKeys {}, NOW),
         UnitAnswer::Ok { .. }
@@ -521,7 +559,10 @@ fn renew_applies_the_listed_revocations_and_counts_each_id_once() {
         ),
         UnitAnswer::Ok { .. }
     ));
-    assert!(matches!(sync(&u, 3, None, NOW), UnitAnswer::Ok { .. }));
+    assert!(matches!(
+        sync(&u, 3, None, &[B1], NOW),
+        UnitAnswer::Ok { .. }
+    ));
     assert!(served(&u, K));
     // The proof listed K and an id the unit never had a row for.
     let a = worker(&u, renew_op(NOW, proven(&u, 2), &[K, GONE]), NOW);
@@ -552,7 +593,10 @@ fn renew_applies_the_listed_revocations_and_counts_each_id_once() {
     assert!(!served(&u, GONE));
     assert_eq!(store::revoked(u.sql()).unwrap(), Some(2));
     // Listing them again changes nothing.
-    assert!(matches!(sync(&u, 3, None, NOW), UnitAnswer::Ok { .. }));
+    assert!(matches!(
+        sync(&u, 3, None, &[B1], NOW),
+        UnitAnswer::Ok { .. }
+    ));
     let a = worker(&u, renew_op(NOW, proven(&u, 2), &[K, GONE]), NOW);
     assert!(
         matches!(&a, UnitAnswer::Ok { body, .. } if body["applied"] == json!(0)),
@@ -591,7 +635,7 @@ fn the_sync_that_sets_a_restoring_entry_ends_the_lease_and_keeps_its_high_mark()
     let u = fresh();
     let hi = lease_row(&u).lease_hi;
     assert!(matches!(
-        sync(&u, 4, Some(4), UnixMs(NOW.0 + 1_000)),
+        sync(&u, 4, Some(4), &[B1], UnixMs(NOW.0 + 1_000)),
         UnitAnswer::Ok { .. }
     ));
     let row = lease_row(&u);
@@ -1247,10 +1291,11 @@ fn a_shredding_tenant_hands_out_nothing() {
     assert!(step.run.run.is_empty(), "{:?}", step.run);
 }
 
-/// A principal is not a key: `m/rk/` never names one, so a revoked
-/// principal must not raise the count the proof compares with.
+/// A revoked principal counts like a revoked key (AM-72): its revoke puts
+/// `m/rk/<t>/<p_id>` first, so the listing the proof compares with names
+/// it too.
 #[test]
-fn a_revoked_principal_is_not_counted() {
+fn a_revoked_principal_is_counted() {
     let u = born();
     let mut gone = principal(1);
     gone.status = SubjectStatus::Revoked;
@@ -1267,12 +1312,47 @@ fn a_revoked_principal_is_not_counted() {
         UnitAnswer::Ok { .. }
     ));
     assert_eq!(status_of(&u, P), "revoked");
-    assert_eq!(store::revoked(u.sql()).unwrap(), Some(0));
-    assert!(matches!(sync(&u, 3, None, NOW), UnitAnswer::Ok { .. }));
+    assert_eq!(store::revoked(u.sql()).unwrap(), Some(1));
+    assert!(matches!(
+        sync(&u, 3, None, &[B1], NOW),
+        UnitAnswer::Ok { .. }
+    ));
     assert!(matches!(
         worker(&u, renew_op(NOW, proven(&u, 0), &[]), NOW),
         UnitAnswer::Ok { .. }
     ));
+}
+
+/// A principal revoked by the key chain already satisfies its listed revocation.
+#[test]
+fn a_recorded_principal_revocation_allows_renewal() {
+    let u = born();
+    let mut gone = listed_principal(1);
+    gone.status = SubjectStatus::Revoked;
+    assert!(matches!(
+        worker(
+            &u,
+            UnitOp::ApplyKeys {
+                from_seq: 0,
+                entries: vec![gone.into()],
+                answers: vec![],
+            },
+            NOW
+        ),
+        UnitAnswer::Ok { .. }
+    ));
+    assert_eq!(status_of(&u, LISTED_P), "revoked");
+    assert_eq!(store::revoked(u.sql()).unwrap(), Some(1));
+    assert!(matches!(
+        sync(&u, 3, None, &[B1], NOW),
+        UnitAnswer::Ok { .. }
+    ));
+    let a = worker(&u, renew_op(NOW, proven(&u, 1), &[LISTED_P]), NOW);
+    assert!(
+        matches!(&a, UnitAnswer::Ok { body, .. } if body["applied"] == json!(0)),
+        "{a:?}"
+    );
+    assert_eq!(store::revoked(u.sql()).unwrap(), Some(1));
 }
 
 /// An alarm wake with nothing to send writes nothing, on an idle unit
@@ -1296,7 +1376,10 @@ fn an_idle_or_closed_alarm_wake_writes_nothing() {
     ));
     let due = UnixMs(NOW.0 + PERIOD);
     let _dead = u.alarm(due).unwrap();
-    assert!(matches!(sync(&u, 4, Some(4), due), UnitAnswer::Ok { .. }));
+    assert!(matches!(
+        sync(&u, 4, Some(4), &[B1], due),
+        UnitAnswer::Ok { .. }
+    ));
     let m = u.mark();
     let later = UnixMs(due.0 + 1_000);
     let step = u.alarm(later).unwrap();
@@ -1354,10 +1437,10 @@ fn a_raise_that_does_not_land_is_sent_again_one_period_on() {
 }
 
 /// A listed id that names a principal row (were one ever listed) is kept
-/// on its own: the principal is left as it is, and the count and the
-/// check agree with the listing.
+/// as a revocation of that row (AM-72): the principal is revoked, and the
+/// count and the check agree with the listing.
 #[test]
-fn a_listed_id_of_a_principal_row_counts_without_touching_it() {
+fn a_listed_id_of_a_principal_row_revokes_it_and_counts_once() {
     let u = born();
     let mut p = principal(1);
     p.id = "PWIRE0000000000001".into();
@@ -1373,14 +1456,86 @@ fn a_listed_id_of_a_principal_row_counts_without_touching_it() {
         ),
         UnitAnswer::Ok { .. }
     ));
-    assert!(matches!(sync(&u, 3, None, NOW), UnitAnswer::Ok { .. }));
+    assert!(matches!(
+        sync(&u, 3, None, &[B1], NOW),
+        UnitAnswer::Ok { .. }
+    ));
     let a = worker(
         &u,
         renew_op(NOW, proven(&u, 1), &["PWIRE0000000000001"]),
         NOW,
     );
     assert!(matches!(a, UnitAnswer::Ok { .. }), "{a:?}");
-    assert_eq!(status_of(&u, "PWIRE0000000000001"), "active");
+    assert_eq!(status_of(&u, "PWIRE0000000000001"), "revoked");
+    assert_eq!(store::revoked(u.sql()).unwrap(), Some(1));
+}
+
+/// Renewal applies an unrecorded principal revocation, removing its key's
+/// effective grant without revoking the key itself.
+#[test]
+fn renewal_removes_a_listed_principals_key_grants() {
+    let u = born();
+    let a = worker(
+        &u,
+        UnitOp::ApplyKeys {
+            from_seq: 0,
+            entries: vec![listed_principal(1).into(), listed_principals_key(2).into()],
+            answers: vec![],
+        },
+        NOW,
+    );
+    assert!(matches!(a, UnitAnswer::Ok { .. }), "{a:?}");
+    assert!(matches!(
+        sync(&u, 3, None, &[B1], NOW),
+        UnitAnswer::Ok { .. }
+    ));
+    assert_eq!(status_of(&u, LISTED_P), "active");
+    assert_eq!(status_of(&u, K), "active");
+    assert_eq!(effective_grants_for(&u, K), 1);
+    assert_eq!(store::revoked(u.sql()).unwrap(), Some(0));
+
+    let a = worker(&u, renew_op(NOW, proven(&u, 1), &[LISTED_P]), NOW);
+    assert!(matches!(a, UnitAnswer::Ok { .. }), "{a:?}");
+    assert_eq!(status_of(&u, LISTED_P), "revoked");
+    assert_eq!(status_of(&u, K), "active");
+    assert_eq!(effective_grants_for(&u, K), 0);
+    assert_eq!(store::revoked(u.sql()).unwrap(), Some(1));
+}
+
+/// A listed principal that the unit does not yet hold stays revoked when
+/// the key chain later supplies it as active, so its key gains no grant.
+#[test]
+fn a_listed_principal_stays_revoked_when_its_records_arrive() {
+    let u = born();
+    assert_eq!(store::revoked(u.sql()).unwrap(), None);
+    let a = worker(&u, renew_op(NOW, proven(&u, 1), &[LISTED_P]), NOW);
+    assert!(matches!(a, UnitAnswer::Ok { .. }), "{a:?}");
+    let kept: bool = u.sql().with_conn(|c| {
+        c.query_row(
+            "SELECT EXISTS (SELECT 1 FROM unit_revoked_ids WHERE id = ?1)",
+            [LISTED_P],
+            |r| r.get(0),
+        )
+        .unwrap()
+    });
+    assert!(
+        kept,
+        "the revocation is stored before the principal arrives"
+    );
+
+    let a = worker(
+        &u,
+        UnitOp::ApplyKeys {
+            from_seq: 0,
+            entries: vec![listed_principal(1).into(), listed_principals_key(2).into()],
+            answers: vec![],
+        },
+        NOW,
+    );
+    assert!(matches!(a, UnitAnswer::Ok { .. }), "{a:?}");
+    assert_eq!(status_of(&u, LISTED_P), "revoked");
+    assert_eq!(status_of(&u, K), "active");
+    assert_eq!(effective_grants_for(&u, K), 0);
     assert_eq!(store::revoked(u.sql()).unwrap(), Some(1));
 }
 
@@ -1418,7 +1573,10 @@ fn a_closed_or_unborn_unit_runs_nothing_and_arms_nothing() {
         request(&u, true, read_plan(), NOW),
         UnitAnswer::Ok { .. }
     ));
-    assert!(matches!(sync(&u, 4, Some(4), NOW), UnitAnswer::Ok { .. }));
+    assert!(matches!(
+        sync(&u, 4, Some(4), &[B1], NOW),
+        UnitAnswer::Ok { .. }
+    ));
     let due = UnixMs(NOW.0 + PERIOD);
     let step = u.alarm(due).unwrap();
     assert!(step.jobs.is_empty() && !step.run.send_renew);

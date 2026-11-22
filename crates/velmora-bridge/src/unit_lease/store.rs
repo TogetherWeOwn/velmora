@@ -14,21 +14,23 @@
 //!   only grows, and a close keeps it (AM-2 check 3).
 //! - [`note_write`]: the first write since the last stamp raise the alarm
 //!   asked for (the due time of [`super::alarm::Duty::StampRaise`]).
-//! - [`revoked`]: the revoked keys the unit holds, counted once per id:
-//!   revoked key rows (not principals: `m/rk/` names access keys only) and
-//!   listed ids it holds no row for. This is the
+//! - [`revoked`]: the revoked subjects the unit holds, counted once per
+//!   id: revoked key and principal rows (`m/rk/<t>/` names both, AM-72)
+//!   and listed ids it holds no row for. This is the
 //!   number every answer carries and the renewal proof compares with the
 //!   listing of `m/rk/<t>/` (SEC-6).
-//! - [`revoke_listed`]: applies the ids a renewal listed: a key row is
-//!   revoked, an id without a row is kept as listed.
+//! - [`revoke_listed`]: applies the ids a renewal listed: a key or
+//!   principal row is revoked (a principal's keys then lose their
+//!   effective grant, their rows keep their status), an id without a row
+//!   is kept as listed.
 //! - [`enforce_listed`]: after a key-chain apply, a row of a listed id is
 //!   revoked whatever its record says (a revocation overrides every
 //!   `m/k/` status, ADR §8.5).
 
 use std::collections::BTreeSet;
 
+use crate::keys::revocations::revocable_id;
 use crate::ports::{Sql, SqlValue};
-use crate::recovery::valid_key_id;
 use crate::types::{BridgeError, Result, UnixMs};
 use crate::unit::keys;
 use crate::unit::object::poll_once;
@@ -261,15 +263,14 @@ pub fn alarm_ran<S: Sql>(
     )
 }
 
-/// The revoked keys the unit holds, each id once: key rows that are
-/// `revoked` (a principal is not a key: `m/rk/` never names one, so
-/// counting it would make every renewal short), and listed ids without a
-/// row. `None` = the unit holds no key and no listed id (its answers
+/// The revoked subjects the unit holds, each id once: key and principal
+/// rows that are `revoked` (`m/rk/<t>/` names both, AM-72, so the count
+/// meets the listing), and listed ids without a row. `None` = the unit holds no key and no listed id (its answers
 /// carry no `revoked`). [`present`] first.
 pub fn revoked<S: Sql>(sql: &S) -> Result<Option<u64>> {
     let rows = poll_once(sql.query(
         "SELECT (SELECT count(*) FROM ( \
-                   SELECT id FROM unit_keys WHERE status = 'revoked' AND kind <> 'principal' \
+                   SELECT id FROM unit_keys WHERE status = 'revoked' \
                    UNION SELECT id FROM unit_revoked_ids)), \
                 EXISTS (SELECT 1 FROM unit_keys) OR EXISTS (SELECT 1 FROM unit_revoked_ids)",
         &[],
@@ -282,12 +283,11 @@ pub fn revoked<S: Sql>(sql: &S) -> Result<Option<u64>> {
     }
 }
 
-/// Whether the unit holds `id` as revoked: a `revoked` key row, or a
-/// listed id.
+/// Whether the unit holds `id` as revoked: a `revoked` key or principal
+/// row, or a listed id.
 pub fn holds_revoked<S: Sql>(sql: &S, id: &str) -> Result<bool> {
     let rows = poll_once(sql.query(
-        "SELECT EXISTS (SELECT 1 FROM unit_keys WHERE id = ?1 AND status = 'revoked' \
-                            AND kind <> 'principal') \
+        "SELECT EXISTS (SELECT 1 FROM unit_keys WHERE id = ?1 AND status = 'revoked') \
              OR EXISTS (SELECT 1 FROM unit_revoked_ids WHERE id = ?1)",
         &[SqlValue::Text(id.to_string())],
     ))??;
@@ -302,15 +302,17 @@ pub fn holds_revoked<S: Sql>(sql: &S, id: &str) -> Result<bool> {
 pub enum ListRefused {
     /// More than [`MAX_LISTED`] ids.
     TooMany,
-    /// An id that is not an access key id (the Worker skips those when
-    /// it lists, so one here is a bug in the caller).
+    /// An id that is neither an access key id nor a principal id (the
+    /// Worker skips those when it lists, so one here is a bug in the
+    /// caller).
     Malformed,
 }
 
-/// Applies the ids a renewal listed (`m/rk/<t>/<id>`): a key row is
-/// revoked (and the catalogue's served rows rebuilt, down its `made_by`
-/// chain), an id without a row, or one that names a principal row (left
-/// as it is), is kept in `unit_revoked_ids`. Setting
+/// Applies the ids a renewal listed (`m/rk/<t>/<id>`): a key or
+/// principal row is revoked (and the catalogue's served rows rebuilt,
+/// down its `made_by` chain, so a principal's keys lose their effective
+/// grant while their rows keep their status), an id without a row is kept
+/// in `unit_revoked_ids`. Setting
 /// `revoked` twice changes nothing. Answers how many ids changed.
 pub fn revoke_listed<S: Sql>(
     sql: &S,
@@ -320,28 +322,18 @@ pub fn revoke_listed<S: Sql>(
     if ids.len() > MAX_LISTED {
         return Ok(Err(ListRefused::TooMany));
     }
-    if !ids.iter().all(|id| valid_key_id(id)) {
+    if !ids.iter().all(|id| revocable_id(id)) {
         return Ok(Err(ListRefused::Malformed));
     }
     let mut touched = BTreeSet::new();
     let mut changed = 0;
     for id in ids {
         let rows = poll_once(sql.query(
-            "SELECT status, kind FROM unit_keys WHERE id = ?1",
+            "SELECT status FROM unit_keys WHERE id = ?1",
             &[SqlValue::Text(id.clone())],
         ))??;
-        let row = rows.first().map(|r| (r.first(), r.get(1)));
-        // A principal is not a key: the listed id is kept on its own,
-        // so the count and the check agree with the listing.
-        let principal = matches!(row, Some((_, Some(SqlValue::Text(k)))) if k == "principal");
-        match row.map(|(status, _)| status) {
-            _ if principal => {
-                changed += poll_once(sql.exec(
-                    "INSERT INTO unit_revoked_ids(id, listed_at) VALUES (?1, ?2) \
-                     ON CONFLICT(id) DO NOTHING",
-                    &[SqlValue::Text(id.clone()), SqlValue::Int(now.0)],
-                ))?? as usize;
-            }
+        // A key row and a principal row alike (AM-72).
+        match rows.first().map(|r| r.first()) {
             Some(Some(SqlValue::Text(status))) if status == "revoked" => {}
             Some(Some(SqlValue::Text(_))) => {
                 poll_once(sql.exec(
@@ -365,12 +357,13 @@ pub fn revoke_listed<S: Sql>(
     Ok(Ok(changed))
 }
 
-/// After a key-chain apply: every key row whose id a renewal listed is
-/// revoked, whatever the record said, and its served rows rebuilt.
+/// After a key-chain apply: every key or principal row whose id a renewal
+/// listed is revoked, whatever the record said, and its served rows
+/// rebuilt (a principal's down its keys).
 pub fn enforce_listed<S: Sql>(sql: &S) -> Result<usize> {
     let rows = poll_once(sql.query(
         "SELECT k.id FROM unit_revoked_ids r JOIN unit_keys k ON k.id = r.id \
-          WHERE k.status <> 'revoked' AND k.kind <> 'principal'",
+          WHERE k.status <> 'revoked'",
         &[],
     ))??;
     let mut touched = BTreeSet::new();

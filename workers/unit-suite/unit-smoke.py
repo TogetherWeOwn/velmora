@@ -102,8 +102,8 @@ check("the replayed birth token", unit_post(0, call(0, "worker", {"op": "provisi
       {"answer": "refused", "reason": {"provision": "already_born"}, "alarm": False})
 check("provisioning until the first sync", unit_post(0, call(0, "request", PING, (3, 0))),
       {"answer": "closed", "seqs": S, "why": "provisioning"})
-sync = {"op": "sync", "head": {"seqs": S, "tenant_state": "active"}}
-check("sync to active", unit_post(0, call(0, "worker", sync)), {"answer": "ok", "seqs": S, "body": {"synced": 3}})
+sync = {"op": "sync", "head": {"seqs": S, "tenant_state": "active", "placed": []}}
+check("sync to active", unit_post(0, call(0, "worker", sync)), {"answer": "ok", "seqs": S, "body": {"synced": 3, "buckets": {"created": 0, "dropped": 0, "drop_not_closed": []}}})
 
 # Rule 12: nothing is served before a renewal.
 check("no lease yet", unit_post(0, call(0, "request", PING, (3, 0))),
@@ -165,13 +165,14 @@ check("restore on an open unit", unit_post(0, call(0, "worker", {"op": "restore"
       "target": {"to": "time", "at_ms": 4102444800000}, "expect_undo": "bm", "floor_ms": 0})),
       {"answer": "refused", "reason": {"restore": "not_restoring"}, "alarm": False})
 check("a restore entry closes the unit", unit_post(0, call(0, "worker", {"op": "sync", "head": {"seqs": {"state_seq": 4, "keys_seq": 0},
-      "tenant_state": "active", "restoring_since": 4}})), {"answer": "ok", "seqs": {"state_seq": 4, "keys_seq": 0}, "body": {"synced": 4}})
+      "tenant_state": "active", "restoring_since": 4, "placed": []}})), {"answer": "ok", "seqs": {"state_seq": 4, "keys_seq": 0},
+      "body": {"synced": 4, "buckets": {"created": 0, "dropped": 0, "drop_not_closed": []}}})
 check("the close ended the lease", unit_post(0, call(0, "request", PING, (4, 0))),
       {"answer": "closed", "seqs": {"state_seq": 4, "keys_seq": 0}, "why": "restoring"}, lease="none")
 check("restore_prepare while the lease could still be held", unit_post(0, call(0, "worker", {"op": "restore_prepare", "since": 4})),
       {"answer": "refused", "reason": {"restore": "too_soon"}, "alarm": False})
 check("the entry is not cleared without the lift check", unit_post(0, call(0, "worker", {"op": "sync", "head": {"seqs": {"state_seq": 5, "keys_seq": 0},
-      "tenant_state": "active"}})), {"answer": "refused", "reason": {"gate": "no_report"}, "alarm": False})
+      "tenant_state": "active", "placed": []}})), {"answer": "refused", "reason": {"gate": "no_report"}, "alarm": False})
 
 # The whole-call transaction.
 atomic = post("/atomic/smoke", {}).get("ok", {})

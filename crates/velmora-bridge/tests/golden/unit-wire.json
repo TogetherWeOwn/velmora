@@ -3,6 +3,11 @@
     {
       "answer": "ok",
       "body": {
+        "buckets": {
+          "created": 0,
+          "drop_not_closed": [],
+          "dropped": 0
+        },
         "synced": 7
       },
       "seqs": {
@@ -234,6 +239,7 @@
       },
       "op": {
         "head": {
+          "buckets": [],
           "lift": {
             "acknowledged": {
               "damaged": {
@@ -247,6 +253,9 @@
               "since": 7
             }
           },
+          "placed": [
+            "b_00000000000000f1"
+          ],
           "restoring_since": null,
           "seqs": {
             "keys_seq": 3,

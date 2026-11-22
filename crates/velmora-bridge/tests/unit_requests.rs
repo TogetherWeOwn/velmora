@@ -439,6 +439,8 @@ const P: &str = "p_member";
 const K: &str = "AKREQS00000000000001";
 const INTERNAL: &str = "AKINTERNAL0000000001";
 
+mod unit_bucket_support;
+
 fn own() -> UnitName {
     UnitName::new(TenantId::parse("t_0000000000000e01").unwrap(), 0)
 }
@@ -474,6 +476,8 @@ fn sync(u: &Unit<RusqliteSql>, seqs: Seqs, state: TenantState, mode: Option<Hold
                 tenant_mode: mode,
                 restoring_since: None,
                 lift: None,
+                buckets: vec![],
+                placed: unit_bucket_support::fixture_placements(u.sql()),
             },
         },
     );
@@ -735,6 +739,8 @@ fn a_restoring_or_provisioning_unit_is_closed_to_request_calls() {
                 tenant_mode: None,
                 restoring_since: Some(4),
                 lift: None,
+                buckets: vec![],
+                placed: vec![B1.into(), B2.into()],
             },
         },
     );

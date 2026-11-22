@@ -206,15 +206,33 @@ hand-out, and its writes are due from their own time.
   unchanged the rollback is recorded, the unit closes and the client pages
   (again at every look while it stays closed). Revocations the unit did not
   hold are applied with the renewal, and the key chain's finisher is told
-  once, before the call (SEC-6). More revocations held than listed renews
-  nothing and pages. The pages come back with an error too.
+  once, before the call (SEC-6). A revocation is a name under
+  `m/rk/<t>/` that is an access key id or a principal's plane id
+  (`p_` and 16 hex, AM-72): a listed principal's row is set `revoked`,
+  and the keys it made lose their effective grant while their rows keep
+  their status. More revocations held than listed renews nothing and
+  pages. The pages come back with an error too.
 - **`sync`.** The tenant chain's verified head and the key-chain records
   after the unit's `keys_seq`: first the key apply (AM-12, in pages of at
-  most 100 records, each from the unit's own `keys_seq`), then `sync` at
-  both heads, with the head's state, mode and this unit's `restoring` entry.
-  A head that clears the entry is not sent as a lift: only the restore
-  tool's `sync` carries the lift proof (AM-45); the client reports it and
-  changes nothing. A unit the head does not list is not called.
+  most 100 records, each from the unit's own `keys_seq`; the feed gets the
+  directory's acknowledged `keys_seq`, read once per sync, and the
+  subjects the unit holds closed, read before each feed read, AM-71), then
+  `sync` at both heads, with the head's state, mode and this unit's
+  `restoring` entry, and the bucket part (AM-57): the bucket changes of
+  the records after the unit's `state_seq` for the buckets placed on this
+  unit (`unit_lease::placements`: a record that creates a bucket on this
+  unit is `created`, with the name and wrapped key from its private part;
+  a placement on this unit that a record removes is `unplaced` when the
+  record before held this unit's `restoring` entry, else `dropped`, or
+  `unplaced` for several at once), and the head's placement list for this
+  unit. A unit more than 32 records (est) behind is brought up in steps,
+  each a `sync` to a record of the chain, at most 8 steps per sync.
+  `placements_off` reads the chain again and sends once more; the same
+  refusal again pages. A `sync` that kept a bucket closing because it
+  still holds something pages `drop_not_closed`. A head that clears the
+  entry is not sent as a lift: only the restore tool's `sync` carries the
+  lift proof (AM-45); the client reports it and changes nothing. A unit
+  the head does not list is not called.
 - **The request path** (rule 5): `renew_needed` renews, `sync_needed`
   syncs, a lower request number takes the unit's numbers; each fix runs once
   and the call runs once more. An answer with less than half of T left asks
@@ -222,7 +240,18 @@ hand-out, and its writes are due from their own time.
   renewals go through the isolate's spacing: none while one runs, and after
   a failed attempt a backoff from 60 s doubling up to T, cleared by a
   success (rule 11). Signed calls go through the same spacing with the
-  backoff capped at 1 s.
+  backoff capped at 1 s. A call answered `renew_needed` that finds a
+  renewal of its unit running in its isolate waits for it, at most 5 s
+  (est), and runs once more if it renewed; otherwise it answers
+  `renew_needed` (rule 12, AM-63). The state (renewals in flight, the
+  backoff, the waiter and the isolate's timer) is one `InFlight` per
+  isolate (AM-71); without a timer nothing waits. Background renewals do
+  not wait.
+- **`key_row` after the signature** (AM-63): a `key_row` the unit
+  answered marked `lease_expired` is used only to check the signature.
+  `key_row_verified` then renews as a signed call and reads `key_row`
+  again, signed; the request goes on only with that row, so a revocation
+  is applied before the key serves.
 - **The `renew` and `stamp_raise` jobs**, which the queue consumer hands to
   the client: a renewal as above; a raise moves the unit's counter, then puts
   its object, renewing first when the lease ran out. A failed call, or a
@@ -431,9 +460,9 @@ row; otherwise it marks the bucket closing (once), and every write into
 it answers `NoSuchBucket` from then on (`buckets::is_closing`, for the
 request path). Then the `DropBucket` record, then `sync`. A closing
 bucket whose record never came stays closed and empty, and its name
-taken, until a delete retry completes it. The `sync` arm that carries
-the changes, and the stamp raise after `bucket_close` (AM-48), are the
-Worker's (L2). Until the request path asks `is_closing` before a write
+taken, until a delete retry completes it. The Worker's `sync` carries
+the changes (the unit client, above); `bucket_close` makes the stamp
+raise due (AM-48). Until the request path asks `is_closing` before a write
 (`RequestCall`, L1 package 5), a write into a closing bucket is not
 refused; a drop still keeps every row that holds data. Package 5 also
 leaves closing rows out of ListBuckets and HeadBucket: a kept row keeps

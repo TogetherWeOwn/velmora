@@ -242,6 +242,8 @@ fn ops() -> Vec<UnitOp> {
                     )]
                     .into(),
                 }),
+                buckets: vec![],
+                placed: vec![bucket_id().to_string()],
             },
         },
         UnitOp::Renew {
@@ -1155,7 +1157,10 @@ fn answers() -> Vec<UnitAnswer> {
     let mut out = vec![
         UnitAnswer::Ok {
             seqs: seqs(),
-            body: json!({ "synced": 7 }),
+            body: json!({
+                "synced": 7,
+                "buckets": { "created": 0, "dropped": 0, "drop_not_closed": [] },
+            }),
         },
         UnitAnswer::SyncNeeded { seqs: seqs() },
         UnitAnswer::Stale { seqs: seqs() },
@@ -1329,6 +1334,28 @@ fn the_wire_format_is_the_golden_file() {
         text, golden,
         "the unit wire format changed: see the module doc"
     );
+}
+
+/// Sync accepts an omitted bucket delta, but it requires explicit placements.
+#[test]
+fn sync_defaults_to_no_bucket_changes_but_requires_placements() {
+    let mut wire = json!({
+        "op": "sync",
+        "head": {
+            "seqs": seqs(),
+            "tenant_state": "active",
+            "placed": [],
+        },
+    });
+    let UnitOp::Sync { head } = serde_json::from_value(wire.clone()).unwrap() else {
+        panic!("expected a sync operation");
+    };
+    assert!(head.buckets.is_empty());
+    assert!(head.placed.is_empty());
+
+    wire["head"].as_object_mut().unwrap().remove("placed");
+    let err = serde_json::from_value::<UnitOp>(wire).unwrap_err();
+    assert!(err.to_string().contains("missing field `placed`"), "{err}");
 }
 
 fn ops_readers() -> Vec<&'static str> {

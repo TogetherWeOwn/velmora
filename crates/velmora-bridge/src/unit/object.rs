@@ -51,7 +51,7 @@ use base64::Engine as _;
 use serde_json::{json, Value};
 
 use super::birth::{check_token, BirthKind, BirthToken, ProvisionRefusal};
-use super::buckets;
+use super::buckets::{self, BucketRefusal, BucketsApplied};
 use super::call::{
     Closed, HoldMode, Reader, Refused, SyncHead, TenantState, UnitAnswer, UnitCall, UnitOp,
     UnitReply,
@@ -1825,6 +1825,15 @@ impl<S: UnitSql> Unit<S> {
         if !mode_ok {
             return Err(BridgeError::Invalid("sync: mode without suspension"));
         }
+        // AM-57: the bucket part's shape, before anything is read.
+        if let Err(r) = buckets::check_shape(
+            &next.buckets,
+            &next.placed,
+            head.seqs.state_seq,
+            next.seqs.state_seq,
+        ) {
+            return Ok(refused(Refused::Buckets(r), r.alarm()));
+        }
         let sql = self.sql();
         // The entry's close time: kept while the same entry stays, the
         // unit's clock when an entry is set (or changed), none once
@@ -1837,6 +1846,11 @@ impl<S: UnitSql> Unit<S> {
         let lifting = head.restoring_since.is_some() && next.restoring_since.is_none();
         let mut synced = None;
         let mut why = None;
+        let mut why_buckets = None;
+        let mut applied = BucketsApplied::default();
+        // An `unplaced` removes nothing while an entry is set at either
+        // end of this `sync`: the 30-day copy keeps its rows (AM-57 (3)).
+        let restoring = head.restoring_since.is_some() || next.restoring_since.is_some();
         let mut run = || -> Result<()> {
             if lifting {
                 // AM-2: the entry is cleared only on the unit's own lift
@@ -1877,12 +1891,32 @@ impl<S: UnitSql> Unit<S> {
             if n != 1 {
                 return Err(decode("unit_head"));
             }
+            // AM-57: the bucket records, in the same transaction. Then
+            // the closing rows the head no longer places are swept, and,
+            // outside a `restoring` entry (and in the `sync` that clears
+            // it), the rows must equal the head's list.
+            match buckets::apply(sql, &next.buckets, restoring, now)? {
+                Ok(done) => applied = done,
+                Err(r) => {
+                    why_buckets = Some(r);
+                    return Err(BridgeError::Invalid(ROLLBACK));
+                }
+            }
+            buckets::sweep_closing(sql, &next.placed)?;
+            if next.restoring_since.is_none() && !buckets::placement_check(sql, &next.placed)? {
+                why_buckets = Some(BucketRefusal::PlacementsOff);
+                return Err(BridgeError::Invalid(ROLLBACK));
+            }
             // Read inside the call, as in `provision`.
             synced = Some(self.head()?);
             Ok(())
         };
         match sql.atomically(&mut run) {
             Err(BridgeError::Invalid(ROLLBACK)) => {
+                if let Some(r) = why_buckets {
+                    // Nothing of the `sync` is kept (AM-57).
+                    return Ok(refused(Refused::Buckets(r), r.alarm()));
+                }
                 let r = why.ok_or(BridgeError::Invalid("rollback without a reason"))?;
                 return Ok(refused(Refused::Gate(r), false));
             }
@@ -1898,7 +1932,16 @@ impl<S: UnitSql> Unit<S> {
         }
         Ok(UnitAnswer::Ok {
             seqs: head.seqs,
-            body: json!({ "synced": head.seqs.state_seq }),
+            body: json!({
+                "synced": head.seqs.state_seq,
+                "buckets": {
+                    "created": applied.created,
+                    "dropped": applied.dropped,
+                    // Kept closing because they still hold something: the
+                    // Worker pages `drop_not_closed` for the operator.
+                    "drop_not_closed": applied.drop_not_closed,
+                },
+            }),
         })
     }
 

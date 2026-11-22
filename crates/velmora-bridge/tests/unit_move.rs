@@ -73,6 +73,8 @@ fn numbered(u: &Unit<RusqliteSql>, op: UnitOp) -> UnitAnswer {
     u.handle(&call_on(u.name(), CallKind::Worker, Some(s), op), NOW)
 }
 
+mod unit_bucket_support;
+
 fn sync_to(
     u: &Unit<RusqliteSql>,
     state_seq: u64,
@@ -92,6 +94,8 @@ fn sync_to(
                 tenant_mode: None,
                 restoring_since: restoring,
                 lift,
+                buckets: vec![],
+                placed: unit_bucket_support::fixture_placements(u.sql()),
             },
         },
     )
