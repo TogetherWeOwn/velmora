@@ -230,8 +230,9 @@ export function evaluate(snap, env = {}) {
         key: "scrub-stalled",
         title: "Scrub repair stalled",
         detail:
-          `A scrub repair is still pinned in R2 at its bound (the stalled total rose ${ageText(now - roseAt)} ago; ${scrub.stalled} in all): verify could not make every backbone hold the extent again. ` +
-          "The scrub-stalled line in the S3 Worker log says whether the safety copy is intact, written again or missing; the extent's outbox row is in stage verify. " +
+          `A scrub repair is still pinned in R2 at its bound (the stalled total rose ${ageText(now - roseAt)} ago; ${scrub.stalled} in all). ` +
+          "The scrub-stalled line in the S3 Worker log names the extent and says whether the safety copy is intact, written again or missing; " +
+          "its outbox row says why (normally in stage verify; dead once its attempts ran out). " +
           `This alert clears ${ageText(stalledWindowMs)} after the last rise.`,
         forMs: 0,
       });

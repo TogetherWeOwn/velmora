@@ -4,7 +4,7 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
 import { FakeD1, FakeBucket, FakeEmail } from "./d1.js";
-import { evaluate, figures, DEFAULTS } from "../src/checks.js";
+import { evaluate, figures, setting, DEFAULTS } from "../src/checks.js";
 import { SQL, newestExport, readSnapshot } from "../src/catalog.js";
 import * as store from "../src/store.js";
 import worker, { tick, ingest, digest } from "../src/index.js";
@@ -317,8 +317,9 @@ test("tick: the first stalled scrub reading is quiet and a rise stays active for
   assert.equal(next.sent, 1);
   assert.equal(e.ALERT_EMAIL.sent[0].subject, "[velmora] Scrub repair stalled");
   assert.ok(e.ALERT_EMAIL.sent[0].text.includes(
-    "A scrub repair is still pinned in R2 at its bound (the stalled total rose 0 min ago; 5 in all): verify could not make every backbone hold the extent again. " +
-    "The scrub-stalled line in the S3 Worker log says whether the safety copy is intact, written again or missing; the extent's outbox row is in stage verify. " +
+    "A scrub repair is still pinned in R2 at its bound (the stalled total rose 0 min ago; 5 in all). " +
+    "The scrub-stalled line in the S3 Worker log names the extent and says whether the safety copy is intact, written again or missing; " +
+    "its outbox row says why (normally in stage verify; dead once its attempts ran out). " +
     "This alert clears 6.0 h after the last rise.",
   ));
   assert.deepEqual(await store.getMeta(e.STATE, "scrub_stalled"), { seen: 5, roseAt: T0 + 5 * MIN });
@@ -775,4 +776,11 @@ test("a report's email states the one-hour wait", async () => {
   const a = { source: "ci", key: "deploy-failed", title: "t" };
   for (let h = 0; h < 3; h++) await ingest(req(a), e, T0 + h * HOUR);
   assert.match(e.ALERT_EMAIL.sent[2].text, new RegExp(`not before ${new Date(T0 + 3 * HOUR).toISOString().replace(".000Z", "Z")}`));
+});
+
+test("a negative setting falls back to the default, or to the floor when one is given", () => {
+  assert.equal(setting({ POST_STALL_SECS: "-5" }, "POST_STALL_SECS"), DEFAULTS.POST_STALL_SECS);
+  assert.equal(setting({ POST_STALL_SECS: "0" }, "POST_STALL_SECS"), 0);
+  assert.equal(setting({ SCRUB_STALLED_WINDOW_SECS: "-5" }, "SCRUB_STALLED_WINDOW_SECS", 3600), 3600);
+  assert.equal(setting({ SCRUB_STALLED_WINDOW_SECS: "7200" }, "SCRUB_STALLED_WINDOW_SECS", 3600), 7200);
 });
