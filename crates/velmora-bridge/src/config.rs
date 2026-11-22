@@ -239,7 +239,7 @@ pub const MAX_JOB_BUDGET_DEN: u64 = 2;
 /// The charges bound what the jobs and requests of an isolate hold at
 /// once, not the wasm memory the allocator keeps: that only grows, a
 /// whole extent at a time once its free space is split. Measured on a
-/// deployed Worker (2026-11-22, one isolate, about 60 jobs per run): with
+/// deployed Worker (2026-11-22, one post queue, about 60 jobs per run): with
 /// three post jobs at once the wasm memory reached 78 to 92 MiB without
 /// parity and 85 to 103 MiB with it; with four jobs with parity at once
 /// (4 sockets each, 104.5 MiB charged), 119 MiB, and no invocation ran out

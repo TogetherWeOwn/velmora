@@ -106,7 +106,8 @@ INFLIGHT_BUDGET_BYTES = "50331648"   # 48 MiB per isolate: what requests may cha
 # 90 MiB holds three post jobs with parity (29.13 MiB each) and a verify
 # job. Measured with three post jobs at once in one isolate: wasm memory
 # up to 92 MiB without parity and 103 MiB with it, of the isolate's
-# 128 MiB; four with parity reached 119 MiB and none ran out of memory
+# 128 MiB; four with parity (4 sockets each, 104.5 MiB charged) reached
+# 119 MiB and none ran out of memory
 # (MAX_JOB_BUDGET_BYTES in config.rs).
 JOB_BUDGET_BYTES = "94371840"        # 90 MiB per isolate
 GC_MODE = "off"                      # off | disposable
