@@ -6,7 +6,8 @@
 #   VELMORA_D1                    source database (default velmora-catalog)
 #   VELMORA_EXPORT_BUCKET         R2 bucket (default velmora-catalog-export)
 #   VELMORA_EXPORT_RCLONE_REMOTE  optional configured rclone remote
-#   VELMORA_IMPORT_PRODUCTION     set to yes to allow a catalogue target
+#   VELMORA_IMPORT_DATABASE_ID    required UUID of the resolved target database
+#   VELMORA_IMPORT_PRODUCTION     set to yes to allow a production catalogue target
 #   CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID  for wrangler
 
 set -euo pipefail
@@ -23,10 +24,6 @@ target=$1
 since_ms=$2
 shift 2
 DB=${VELMORA_D1:-velmora-catalog}
-if [[ ${VELMORA_IMPORT_PRODUCTION:-} != yes &&
-      ( $target == velmora-catalog || $target == CATALOG || $target == "$DB" ) ]]; then
-  die "refusing to load into $target without VELMORA_IMPORT_PRODUCTION=yes"
-fi
 [[ $since_ms =~ ^[0-9]+$ ]] || die 'restore point must contain only digits'
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -38,18 +35,19 @@ remote=${VELMORA_EXPORT_RCLONE_REMOTE-}
 if [[ ${VELMORA_EXPORT_RCLONE_REMOTE+x} && ! $remote =~ ^[A-Za-z0-9_-]+$ ]]; then
   die 'invalid VELMORA_EXPORT_RCLONE_REMOTE'
 fi
-for tool in zstd jq sha256sum python3; do
+for tool in zstd jq sha256sum python3 head; do
   command -v "$tool" >/dev/null || die "missing tool: $tool"
 done
 catalog_require_sqlite
 catalog_init_sql_limits
 
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/velmora-import.XXXXXX")
-trap 'rm -r -- "$WORK"' EXIT
+trap 'catalog_cleanup "$?"' EXIT
+LOG_DIR=$(mktemp -d "${TMPDIR:-/tmp}/velmora-catalog-import-logs.XXXXXX")
 
 get() {
-  local key=$1 out=$2
-  shift 2
+  local key=$1 out=$2 log=$3
+  shift 3
   if [[ -n $remote ]]; then
     # --ignore-times: parts of one size can share a modification time,
     # and rclone would skip a download onto the previous part's file.
@@ -57,22 +55,22 @@ get() {
     rclone copyto "$remote:$BUCKET/$key" "$out" --ignore-times </dev/null
   else
     npx wrangler r2 object get "$BUCKET/$key" --file "$out" --remote "$@" </dev/null
-  fi >"$out.log" 2>&1 || return 1
-  [[ -s $out ]] || die "empty download for $key"
+  fi >>"$log" 2>&1 || return 1
+  [[ -s $out ]] || die "empty download for $key, see $log"
 }
 
 # Return 2 only when the exact listing is empty or Wrangler reports R2 HTTP 404.
 get_restore_object() {
-  local key=$1 out=$2 listing
-  shift 2
+  local key=$1 out=$2 log=$3 listing
+  shift 3
   if [[ -n $remote ]]; then
-    listing=$(rclone lsf "$remote:$BUCKET/$key" </dev/null 2>"$out.log") || return 1
+    listing=$(rclone lsf "$remote:$BUCKET/$key" </dev/null 2>"$log") || return 1
     [[ -n $listing ]] || return 2
   fi
-  if get "$key" "$out" "$@"; then
+  if get "$key" "$out" "$log" "$@"; then
     return 0
   fi
-  if [[ -z $remote ]] && catalog_wrangler_get_is_404 "$out.log"; then
+  if [[ -z $remote ]] && catalog_wrangler_get_is_404 "$log"; then
     return 2
   fi
   return 1
@@ -89,48 +87,64 @@ verify() {
 prefix="d1/$DB/$since_ms"
 manifest="$prefix.manifest.json"
 sql="$WORK/catalog.sql"
-if get_restore_object "$manifest" "$WORK/manifest.json" "$@"; then
-  jq -ers --arg db "$DB" --arg ms "$since_ms" --arg prefix "$prefix.sql.zst.part-" '
+manifest_log="$LOG_DIR/manifest.get.log"
+if get_restore_object "$manifest" "$WORK/manifest.json" "$manifest_log" "$@"; then
+  jq -ers --arg db "$DB" --arg ms "$since_ms" --arg prefix "$prefix" '
     def bytes: type == "number" and . >= 0 and floor == .;
     def sha256: type == "string" and test("^[0-9a-f]{64}$");
-    length == 1 and (.[0] |
-      (.format // 1) == 1 and .database == $db and
+    def part_prefix:
+      if (.format // 1) == 1 then $prefix + ".sql.zst.part-"
+      elif .format == 2 and (.attempt | type == "string" and length == 16 and test("^[0-9a-f]{16}$"))
+      then $prefix + "." + .attempt + ".part-"
+      else null end;
+    length == 1 and (.[0] | part_prefix as $part_prefix |
+      $part_prefix != null and .database == $db and
       (.restore_point_ms | type == "number" and tostring == $ms) and
       (.sql_bytes | bytes) and (.sql_sha256 | sha256) and
       (.zst_bytes | bytes) and (.zst_sha256 | sha256) and
       (.parts | type == "array" and length > 0 and all(.[];
-        (.key | startswith($prefix) and (ltrimstr($prefix) | test("^[0-9]{3}$"))) and
+        (.key | type == "string" and startswith($part_prefix) and
+          (ltrimstr($part_prefix) | length == 3 and test("^[0-9]{3}$"))) and
         (.bytes | bytes) and (.sha256 | sha256))))
-  ' "$WORK/manifest.json" >/dev/null || die "invalid manifest $manifest"
+  ' "$WORK/manifest.json" >/dev/null 2>&1 || die "invalid manifest $manifest, see $manifest_log"
   manifest_sql_bytes=$(jq -er '.sql_bytes + 0' "$WORK/manifest.json")
   catalog_check_sql_size "$manifest_sql_bytes"
 
   jq -r '.parts[] | [.key, .bytes, .sha256] | @tsv' "$WORK/manifest.json" >"$WORK/parts.tsv"
+  part_index=0
   while IFS=$'\t' read -r key bytes sha256; do
-    get "$key" "$WORK/part" "$@" || die "download failed for $key"
+    part_log="$LOG_DIR/part-$part_index.get.log"
+    get "$key" "$WORK/part" "$part_log" "$@" || die "could not read $key, see $part_log"
     verify "$WORK/part" "$key" "$bytes" "$sha256"
     cat "$WORK/part"
+    part_index=$((part_index + 1))
   done <"$WORK/parts.tsv" >"$sql.zst"
 
-  IFS=$'\t' read -r zst_bytes zst_sha256 sql_bytes sql_sha256 < <(
-    jq -r '[.zst_bytes, .zst_sha256, .sql_bytes, .sql_sha256] | @tsv' "$WORK/manifest.json"
+  IFS=$'\t' read -r zst_bytes zst_sha256 sql_sha256 < <(
+    jq -r '[.zst_bytes, .zst_sha256, .sql_sha256] | @tsv' "$WORK/manifest.json"
   )
   verify "$sql.zst" "$prefix.sql.zst (from $manifest)" "$zst_bytes" "$zst_sha256"
-  zstd -q -d "$sql.zst" -o "$sql" || die "decompression failed for $prefix.sql.zst (from $manifest)"
-  verify "$sql" "$prefix.sql (from $manifest)" "$sql_bytes" "$sql_sha256"
-else
-  if [[ $? != 2 ]]; then
-    tail -n 20 "$WORK/manifest.json.log" >&2
-    die "could not read $manifest"
+  bound=$((manifest_sql_bytes < catalog_sql_file_limit ? manifest_sql_bytes : catalog_sql_file_limit))
+  decompress_log="$LOG_DIR/decompress.log"
+  decompress_status=0
+  zstd -q -dc "$sql.zst" 2>"$decompress_log" | head -c "$((bound + 1))" >"$sql" || decompress_status=$?
+  # If head stopped the decoder, report the exceeded bound even if zstd
+  # also failed (e.g. SIGPIPE). Nothing else reads the oversized SQL.
+  if (( $(wc -c <"$sql") > bound )); then
+    die "decompressed SQL exceeds $bound bytes (from $manifest), see $decompress_log"
   fi
+  (( decompress_status == 0 )) || die "decompression failed for $prefix.sql.zst (from $manifest), see $decompress_log"
+  verify "$sql" "$prefix.sql (from $manifest)" "$manifest_sql_bytes" "$sql_sha256"
+else
+  [[ $? == 2 ]] || die "could not read $manifest, see $manifest_log"
   legacy="$prefix.sql"
-  if get_restore_object "$legacy" "$sql" "$@"; then
-    grep -q 'CREATE TABLE' "$sql" || die "no schema in $legacy"
+  legacy_log="$LOG_DIR/legacy.get.log"
+  if get_restore_object "$legacy" "$sql" "$legacy_log" "$@"; then
+    grep -q 'CREATE TABLE' "$sql" || die "no schema in $legacy, see $legacy_log"
   elif [[ $? == 2 ]]; then
     die "no export at restore point $since_ms (neither $manifest nor $legacy)"
   else
-    tail -n 20 "$sql.log" >&2
-    die "could not read $legacy"
+    die "could not read $legacy, see $legacy_log"
   fi
   echo 'catalog-import: legacy export without a manifest; no checksum to check'
 fi
@@ -139,19 +153,38 @@ loaded_bytes=$(( $(wc -c <"$sql") ))
 catalog_check_sql_size "$loaded_bytes"
 catalog_check_sql_statements "$sql"
 
+# Wrangler resolves names and bindings in the same configuration as execute.
+# d1 info is remote-only (there is no --remote flag for this command).
+info_log="$LOG_DIR/d1-info.log"
+npx wrangler d1 info "$target" --json "$@" </dev/null >"$WORK/info.json" 2>"$info_log" ||
+  die "could not resolve $target, see $info_log"
+resolved=$(jq -ers '
+  select(length == 1) | .[0] | select(
+    (.uuid | type == "string" and length == 36 and
+      test("^[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$")) and
+    (.name | type == "string" and length > 0 and (test("[[:cntrl:]]") | not))) |
+  [.uuid, .name] | @tsv
+' "$WORK/info.json" 2>>"$info_log") || die "could not read UUID and name for $target, see $info_log"
+IFS=$'\t' read -r resolved_id resolved_name <<<"$resolved"
+expected_id=${VELMORA_IMPORT_DATABASE_ID:-<unset>}
+[[ $expected_id == "$resolved_id" ]] ||
+  die "refusing to load into $resolved_name: resolved UUID $resolved_id, VELMORA_IMPORT_DATABASE_ID=$expected_id"
+if [[ ${VELMORA_IMPORT_PRODUCTION:-} != yes &&
+      ( $resolved_name == velmora-catalog || $resolved_name == CATALOG || $resolved_name == "$DB" ) ]]; then
+  die "refusing to load into $resolved_name without VELMORA_IMPORT_PRODUCTION=yes"
+fi
+
+count_log="$LOG_DIR/d1-count.log"
 npx wrangler d1 execute "$target" --remote --json \
   --command "SELECT count(*) AS n FROM sqlite_master WHERE type='table' AND substr(name, 1, 4) <> '_cf_' AND substr(name, 1, 7) <> 'sqlite_'" \
-  "$@" </dev/null >"$WORK/count.json" 2>"$WORK/count.log" || {
-  tail -n 20 "$WORK/count.log" >&2
-  die "could not check whether $target is empty"
-}
-count=$(jq -er '.[0].results[0].n | select(type == "number" and . >= 0 and floor == .)' "$WORK/count.json") ||
-  die "could not read table count for $target"
-[[ $count == 0 ]] || die "$target is not empty"
+  "$@" </dev/null >"$WORK/count.json" 2>"$count_log" ||
+  die "could not check whether $target is empty, see $count_log"
+count=$(jq -er '.[0].results[0].n | select(type == "number" and . >= 0 and floor == .)' "$WORK/count.json" 2>>"$count_log") ||
+  die "could not read table count for $target, see $count_log"
+[[ $count == 0 ]] || die "$target is not empty, see $count_log"
 
-npx wrangler d1 execute "$target" --remote --yes --file "$sql" "$@" </dev/null >"$WORK/load.log" 2>&1 || {
-  tail -n 20 "$WORK/load.log" >&2
-  die "load into $target failed"
-}
+load_log="$LOG_DIR/d1-load.log"
+npx wrangler d1 execute "$target" --remote --yes --file "$sql" "$@" </dev/null >"$load_log" 2>&1 ||
+  die "load into $target failed, see $load_log"
 printf 'catalog-import: loaded %s bytes into %s from restore point %s\n' "$loaded_bytes" "$target" "$since_ms"
 echo 'catalog-import: next: migrations apply, then ops/restore-arm.sql (README, Restore step 2)'

@@ -11,6 +11,21 @@ catalog_wrangler_get_is_404() {
     grep -Fx '✘ [ERROR] The specified key does not exist.' >/dev/null
 }
 
+# Remove staged SQL and parts regardless of the result. On failure, leave
+# only tool output in the separate private diagnostics directory.
+catalog_cleanup() {
+  local status=$1 logs
+  rm -r -- "$WORK"
+  if [[ -n ${LOG_DIR:-} ]]; then
+    logs=("$LOG_DIR"/*.log)
+    if (( status == 0 )) || [[ ! -e ${logs[0]} ]]; then
+      rm -r -- "$LOG_DIR"
+    else
+      printf 'catalogue transfer logs kept in %s\n' "$LOG_DIR" >&2
+    fi
+  fi
+}
+
 # Use the smallest advertised one-file limit: D1's 5 GB, the import guide's
 # 5 GiB, and R2's single PUT limit of 5 GiB minus 5 MiB.
 # https://developers.cloudflare.com/d1/platform/limits/

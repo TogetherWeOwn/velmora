@@ -35,7 +35,7 @@ BUCKET=${VELMORA_EXPORT_BUCKET:-velmora-catalog-export}
 remote=${VELMORA_EXPORT_RCLONE_REMOTE-}
 part_bytes=${VELMORA_EXPORT_PART_BYTES-268435456}
 
-for tool in zstd jq split sha256sum python3; do
+for tool in zstd jq split sha256sum python3 od; do
   command -v "$tool" >/dev/null || { echo "catalog-export: missing tool: $tool" >&2; exit 1; }
 done
 catalog_require_sqlite
@@ -52,17 +52,22 @@ else
 fi
 
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/velmora-export.XXXXXX")
-trap 'rm -r -- "$WORK"' EXIT
+trap 'catalog_cleanup "$?"' EXIT
+LOG_DIR=$(mktemp -d "${TMPDIR:-/tmp}/velmora-catalog-export-logs.XXXXXX")
 
 if ! since_ms=$(date +%s%3N) || [[ ! $since_ms =~ ^[0-9]+$ ]]; then
   since_ms=$(($(date +%s) * 1000))
 fi
 prefix="d1/$DB/$since_ms"
 manifest="$prefix.manifest.json"
+attempt=$(od -An -N8 -tx1 /dev/urandom | tr -d '[:space:]')
+if [[ ! $attempt =~ ^[0-9a-f]{16}$ ]]; then
+  catalog_error 'could not generate an export attempt ID'
+fi
 
 get() {
-  local key=$1 out=$2
-  shift 2
+  local key=$1 out=$2 log=$3
+  shift 3
   if [[ -n $remote ]]; then
     # --ignore-times: parts of one size can share a modification time,
     # and rclone would skip a download onto the previous part's file.
@@ -70,30 +75,22 @@ get() {
     rclone copyto "$remote:$BUCKET/$key" "$out" --ignore-times </dev/null
   else
     npx wrangler r2 object get "$BUCKET/$key" --file "$out" --remote "$@" </dev/null
-  fi >"$WORK/get.log" 2>&1
+  fi >"$log" 2>&1
 }
 
-manifest_check_failed() {
-  local log
-  # Keep just the private lookup log after the work directory is removed.
-  log=$(mktemp "${TMPDIR:-/tmp}/velmora-catalog-get.XXXXXX")
-  mv -- "$WORK/get.log" "$log"
-  echo "catalog-export: could not check $BUCKET/$manifest, see $log" >&2
-  exit 1
-}
-
+check_log="$LOG_DIR/manifest.check.log"
 if [[ -n $remote ]]; then
-  listing=$(rclone lsf "$remote:$BUCKET/$manifest" </dev/null 2>"$WORK/get.log") ||
-    manifest_check_failed
-elif get "$manifest" "$WORK/existing.json" "$@"; then
+  listing=$(rclone lsf "$remote:$BUCKET/$manifest" </dev/null 2>"$check_log") ||
+    catalog_error "could not check $BUCKET/$manifest, see $check_log"
+elif get "$manifest" "$WORK/existing.json" "$check_log" "$@"; then
   listing=$manifest
 # Any 404 means there is no readable manifest at this key with these
 # credentials. If the bucket itself is missing, the first put fails and
 # the manifest is never written.
-elif catalog_wrangler_get_is_404 "$WORK/get.log"; then
+elif catalog_wrangler_get_is_404 "$check_log"; then
   listing=
 else
-  manifest_check_failed
+  catalog_error "could not check $BUCKET/$manifest, see $check_log"
 fi
 if [[ -n $listing ]]; then
   echo "catalog-export: an export at restore point $since_ms exists already" >&2
@@ -101,19 +98,17 @@ if [[ -n $listing ]]; then
 fi
 
 file="$WORK/catalog.sql"
-npx wrangler d1 export "$DB" --remote --output "$file" "$@" </dev/null >"$WORK/export.log" 2>&1 || {
-  echo "catalog-export: wrangler d1 export failed:" >&2
-  tail -n 20 "$WORK/export.log" >&2
-  exit 1
-}
-[ -s "$file" ] || { echo "catalog-export: the export is empty" >&2; exit 1; }
+export_log="$LOG_DIR/d1-export.log"
+npx wrangler d1 export "$DB" --remote --output "$file" "$@" </dev/null >"$export_log" 2>&1 ||
+  catalog_error "wrangler d1 export failed, see $export_log"
+[[ -s $file ]] || catalog_error "the export is empty, see $export_log"
 sql_bytes=$(( $(wc -c <"$file") ))
 catalog_check_sql_size "$sql_bytes"
 grep -q 'CREATE TABLE' "$file" || { echo "catalog-export: the export has no schema" >&2; exit 1; }
 catalog_check_sql_statements "$file"
 
 put() {
-  local key=$1 path=$2 type=$3
+  local key=$1 path=$2 type=$3 log="$LOG_DIR/${2##*/}.put.log"
   shift 3
   if [[ -n $remote ]]; then
     rclone copyto "$path" "$remote:$BUCKET/$key" --s3-upload-cutoff 64M \
@@ -121,11 +116,7 @@ put() {
   else
     npx wrangler r2 object put "$BUCKET/$key" --file "$path" --remote \
       --content-type "$type" "$@" </dev/null
-  fi >"$WORK/put.log" 2>&1 || {
-    echo "catalog-export: put of $key failed:" >&2
-    tail -n 20 "$WORK/put.log" >&2
-    exit 1
-  }
+  fi >"$log" 2>&1 || catalog_error "put of $key failed, see $log"
 }
 
 zstd -q -T0 -10 "$file" -o "$file.zst"
@@ -144,7 +135,7 @@ zst_sha256=$(sha256sum <"$file.zst")
 zst_sha256=${zst_sha256%% *}
 parts=("$file.zst.part-"*)
 for part in "${parts[@]}"; do
-  key="$prefix.sql.zst.part-${part##*-}"
+  key="$prefix.$attempt.part-${part##*-}"
   bytes=$(( $(wc -c <"$part") ))
   sha256=$(sha256sum <"$part")
   jq -n --arg key "$key" --argjson bytes "$bytes" --arg sha256 "${sha256%% *}" \
@@ -152,17 +143,24 @@ for part in "${parts[@]}"; do
   put "$key" "$part" application/zstd "$@"
 done
 
-jq -n --argjson restore_point_ms "$since_ms" --arg database "$DB" \
+jq -n --argjson restore_point_ms "$since_ms" --arg database "$DB" --arg attempt "$attempt" \
   --argjson sql_bytes "$sql_bytes" --arg sql_sha256 "$sql_sha256" \
   --argjson zst_bytes "$zst_bytes" --arg zst_sha256 "$zst_sha256" \
   --slurpfile parts "$WORK/parts.json" \
-  '{format: 1, $restore_point_ms, $database, $sql_bytes, $sql_sha256,
+  '{format: 2, $restore_point_ms, $database, $attempt, $sql_bytes, $sql_sha256,
     $zst_bytes, $zst_sha256, $parts}' >"$WORK/manifest.json"
 put "$manifest" "$WORK/manifest.json" application/json "$@"
-if ! get "$manifest" "$WORK/readback.json" "$@" ||
-   ! cmp -s "$WORK/manifest.json" "$WORK/readback.json"; then
-  echo "catalog-export: the manifest read back from $BUCKET/$manifest differs" >&2
-  exit 1
+readback_log="$LOG_DIR/manifest.readback.log"
+get "$manifest" "$WORK/readback.json" "$readback_log" "$@" ||
+  catalog_error "could not read $manifest, see $readback_log"
+if ! cmp -s "$WORK/manifest.json" "$WORK/readback.json"; then
+  if jq -es --arg attempt "$attempt" --arg database "$DB" --argjson ms "$since_ms" '
+    length == 1 and (.[0] | .format == 2 and .database == $database and .restore_point_ms == $ms and
+      (.attempt | type == "string" and length == 16 and test("^[0-9a-f]{16}$") and . != $attempt))
+  ' "$WORK/readback.json" >/dev/null 2>&1; then
+    catalog_error "another export published restore point $since_ms, see $readback_log"
+  fi
+  catalog_error "the manifest read back from $BUCKET/$manifest differs, see $readback_log"
 fi
 
 printf 'catalog-export: sql %s bytes, sha256 %s, zst %s bytes in %s part(s), manifest %s/%s\n' \

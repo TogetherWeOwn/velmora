@@ -259,9 +259,11 @@ with `npx wrangler r2 bucket create velmora-catalog-export`). Run it from
 cron, for example daily. D1 does not answer queries while an export runs.
 
 The script prints the **restore point** in milliseconds. Under `d1/<db>/`,
-the parts are named `<restore point>.sql.zst.part-000`, `-001`, and so on.
-The script uploads `<restore point>.manifest.json` last. The manifest lists
-the parts and checksums and marks a complete export.
+the parts are named `<restore point>.<attempt>.part-000`, `-001`, and so on.
+The script uploads `<restore point>.manifest.json` last. The format 2
+manifest lists the attempt, its parts and their checksums. Concurrent
+exports at the same restore point do not overwrite each other's parts.
+The importer also reads format 1 manifests with `.sql.zst.part-NNN` keys.
 
 Install the pinned Wrangler with `npm ci` in `workers/s3-bridge` before
 running either script. Both scripts also require Python 3 with SQLite support
@@ -274,7 +276,9 @@ Wrangler uploads each part by default. Splitting keeps each upload under
 Wrangler's 300 MiB limit. `VELMORA_EXPORT_PART_BYTES` defaults to 268435456
 (256 MiB) and accepts positive integers up to 300000000. To use rclone for
 uploads and restores, set `VELMORA_EXPORT_RCLONE_REMOTE` to the name of a
-configured remote for the R2 S3 endpoint.
+configured remote for the R2 S3 endpoint. On failure, the scripts report
+where they kept private transfer logs. Staged SQL and parts are removed
+locally even on failure.
 
 Take a fresh export after every deploy that applied a migration. An
 export carries the schema of its day and the list of the migrations
@@ -298,13 +302,16 @@ exists: restore it to a timestamp, then replay from that timestamp.
      (`--include '*.sql'`); it loads too, without checksums.
      The number before `.manifest.json` is the restore point. Set
      `VELMORA_D1` to the source database of the export. Create an empty
-     database and run `ops/catalog-import.sh <new db> <restore point>`.
-     A target that is the catalogue itself requires
-     `VELMORA_IMPORT_PRODUCTION=yes`. The export carries
-     the schema and the list of applied migrations, so apply migrations
-     after loading it. The script checks every checksum in the manifest and
-     refuses a non-empty database. Legacy single-file exports have no
-     checksums.
+     database and set `VELMORA_IMPORT_DATABASE_ID` to its UUID from
+     `wrangler d1 info <new db> --json` (use the same Wrangler config and
+     environment as the import). Run `ops/catalog-import.sh <new db> <restore point>`.
+     The script checks the resolved database name and UUID, even if the
+     target is a Wrangler binding. A production catalogue also requires
+     `VELMORA_IMPORT_PRODUCTION=yes`. The export carries the schema and
+     the list of applied migrations, so apply migrations after loading it.
+     The script bounds decompression by the declared SQL size and the import
+     limit, checks every manifest checksum, and refuses a non-empty database.
+     Legacy single-file exports have no checksums.
    - Nothing: create a database. The restore point is `0`.
 
    Then, in every case, bring the schema up to date and close the
