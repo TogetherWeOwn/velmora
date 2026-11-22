@@ -115,6 +115,39 @@ pub enum KeyAnswer {
     Unfinished { seq: u64 },
 }
 
+/// Which grant limits a writer records.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Limits {
+    /// Milestone 1 (ADR §6.2, AM-18): a create whose grant has a prefix,
+    /// an expiry or an IP list, and a grant change that adds or changes
+    /// one, are refused with [`Refusal::GrantLimitsNotServed`] before any
+    /// reservation or record. The units cannot serve such a grant yet.
+    NotServed,
+    /// Every grant the record rules allow. A unit still refuses a
+    /// limited grant at use (fail closed). For the record rules' own
+    /// tests, and for the milestone that serves limits.
+    Recorded,
+}
+
+/// Whether a grant has a prefix, an expiry or an IP list.
+fn limited(g: &Grant) -> bool {
+    g.prefix.is_some() || g.expires_at.is_some() || !g.ip_list.is_empty()
+}
+
+/// Whether `new` adds a limit to `current`: it holds a limited grant that
+/// is not, limit for limit, the current grant of its bucket.
+fn adds_limits(new: &[Grant], current: &[Grant]) -> bool {
+    new.iter().any(|n| {
+        limited(n)
+            && !current.iter().any(|c| {
+                c.bucket_id == n.bucket_id
+                    && c.prefix == n.prefix
+                    && c.expires_at == n.expires_at
+                    && c.ip_list == n.ip_list
+            })
+    })
+}
+
 /// Everything a key change talks to.
 pub struct KeyEnv<'a, S, K, T, A, I, U, D, C> {
     pub store: &'a S,
@@ -127,6 +160,8 @@ pub struct KeyEnv<'a, S, K, T, A, I, U, D, C> {
     pub units: &'a [U],
     pub directory: &'a D,
     pub clock: &'a C,
+    /// The Worker sets [`Limits::NotServed`] in milestone 1.
+    pub limits: Limits,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -220,9 +255,14 @@ fn plan<K: Kek>(
     table: &KeyTable,
     revoked: &BTreeSet<String>,
     request: &KeyRequest,
+    limits: Limits,
 ) -> Planned {
+    let not_served = limits == Limits::NotServed;
     match request {
         KeyRequest::Create(subject) => {
+            if not_served && subject.grants().iter().any(limited) {
+                return Planned::Refused(Refusal::GrantLimitsNotServed);
+            }
             if revoked.contains(&subject.door.id) {
                 return Planned::Refused(Refusal::Conflict);
             }
@@ -313,6 +353,11 @@ fn plan<K: Kek>(
                     false => Class::Opening,
                 };
                 return Planned::InHead(class);
+            }
+            // A narrowing that adds a limit is refused too: it would make a
+            // key that cannot work.
+            if not_served && adds_limits(grants, &current) {
+                return Planned::Refused(Refusal::GrantLimitsNotServed);
             }
             // The class comes from the head, never from the caller.
             let class = match grants_narrow(grants, &current) {
@@ -519,7 +564,7 @@ where
             reopen_closed(self.store, self.kek, self.ring, &chain, table).await?;
             // Best effort: a closing change never waits on a checkpoint.
             let _ = reopen_from_checkpoints(self.store, self.kek, self.ring, table).await;
-            let plan = match plan(self.kek, table, &revoked, request) {
+            let plan = match plan(self.kek, table, &revoked, request, self.limits) {
                 Planned::Refused(r) => return Ok(KeyAnswer::Refused(r)),
                 Planned::Busy => return Ok(KeyAnswer::Busy),
                 Planned::InHead(class) => {
@@ -616,7 +661,9 @@ where
                 )
                 .await?;
                 if routed == RoutePut::Taken {
-                    // The finisher of this intent clears its row.
+                    // No record will be written for this reservation; the
+                    // finisher of this intent clears its row.
+                    let _ = self.admission.release(self.tenant, idempotency_key).await;
                     return Ok(KeyAnswer::Refused(Refusal::IdTaken));
                 }
             }

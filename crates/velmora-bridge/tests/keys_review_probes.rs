@@ -23,7 +23,7 @@ use velmora_bridge::keys::record::{
     KEY_RECORD_VERSION,
 };
 use velmora_bridge::keys::tk::{tk_prefix, KeyBuckets};
-use velmora_bridge::keys::writer::{finish_keys, KeyEnv};
+use velmora_bridge::keys::writer::{finish_keys, KeyEnv, Limits};
 use velmora_bridge::records::{MemRecords, RecordStore};
 use velmora_bridge::testkit::{FixedClock, TestKek};
 use velmora_bridge::{BridgeError, Result, UnixMs};
@@ -249,6 +249,10 @@ impl KeyAdmission for FakeAdmission {
     async fn admit(&self, _: &TenantId, _: &str, _: &OpeningChange<'_>) -> Result<Admission> {
         panic!("the finisher does not request admission");
     }
+
+    async fn release(&self, _: &TenantId, _: &str) -> Result<()> {
+        panic!("the finisher does not release reservations");
+    }
 }
 
 struct FakeIntents;
@@ -290,6 +294,7 @@ async fn closing_pass_opens_at_the_directory_acknowledgment() {
         units: &[&unit],
         directory: &&directory,
         clock: &FixedClock::new(UnixMs(1_700_000_000_000)),
+        limits: Limits::Recorded,
     };
     finish_keys(&env, &mut w.rng).await.unwrap();
     assert_eq!(directory.seq.get(), 1);

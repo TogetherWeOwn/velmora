@@ -51,6 +51,35 @@ pub enum Refusal {
     /// The access key id is routed to another tenant already: draw a new
     /// id and ask again.
     IdTaken,
+    /// A grant with a prefix, an expiry or an IP list: milestone 1 serves
+    /// unlimited grants only, so a key is never made or narrowed into one
+    /// that cannot work (ADR §6.2, AM-18): `400`.
+    GrantLimitsNotServed,
+}
+
+impl Refusal {
+    /// The HTTP status of the answer.
+    pub fn status(self) -> u16 {
+        match self {
+            Refusal::CapFull => 429,
+            Refusal::NotSubset => 403,
+            Refusal::Conflict | Refusal::IdTaken => 409,
+            Refusal::NotFound => 404,
+            Refusal::GrantLimitsNotServed => 400,
+        }
+    }
+
+    /// The code of the answer's body.
+    pub fn code(self) -> &'static str {
+        match self {
+            Refusal::CapFull => "cap_full",
+            Refusal::NotSubset => "grant_not_subset",
+            Refusal::Conflict => "conflict",
+            Refusal::NotFound => "not_found",
+            Refusal::IdTaken => "id_taken",
+            Refusal::GrantLimitsNotServed => "grant_limits_not_served",
+        }
+    }
 }
 
 /// The answer of the root unit's reservation call.
@@ -87,6 +116,11 @@ pub trait KeyAdmission {
         idempotency_key: &str,
         change: &OpeningChange<'_>,
     ) -> Result<Admission>;
+    /// Releases the reservation held under `idempotency_key`: called once
+    /// a call ends with no record for it. Best effort: a reservation that
+    /// is not released is swept after 1 hour (est). Releasing one that
+    /// was already released, or turned into a row, changes nothing.
+    async fn release(&self, tenant: &TenantId, idempotency_key: &str) -> Result<()>;
 }
 
 /// The chain a control intent names.

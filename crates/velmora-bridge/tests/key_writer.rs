@@ -28,7 +28,7 @@ use velmora_bridge::keys::record::{
 };
 use velmora_bridge::keys::revocations::{put_tenant_revocation, tenant_revocation_name};
 use velmora_bridge::keys::routes::{put_route, read_route, RoutePut};
-use velmora_bridge::keys::writer::{finish_keys, KeyAnswer, KeyEnv, KeyRequest};
+use velmora_bridge::keys::writer::{finish_keys, KeyAnswer, KeyEnv, KeyRequest, Limits};
 use velmora_bridge::records::{MemRecords, RecordStore};
 use velmora_bridge::testkit::{FixedClock, TestKek};
 use velmora_bridge::{BridgeError, Result, UnixMs};
@@ -156,6 +156,8 @@ struct FakeAdmission<'a> {
     root: &'a FakeTarget,
     cap: usize,
     calls: Cell<u32>,
+    /// The idempotency keys released, in order.
+    released: RefCell<Vec<String>>,
     refuse: Cell<Option<Refusal>>,
     /// Answers this `keys_seq` instead of the root's.
     stale: Cell<Option<u64>>,
@@ -170,6 +172,7 @@ impl<'a> FakeAdmission<'a> {
             root,
             cap: 20,
             calls: Cell::new(0),
+            released: RefCell::new(Vec::new()),
             refuse: Cell::new(None),
             stale: Cell::new(None),
             race: RefCell::new(None),
@@ -197,6 +200,11 @@ impl KeyAdmission for FakeAdmission<'_> {
             race();
         }
         Ok(answer)
+    }
+
+    async fn release(&self, _tenant: &TenantId, idempotency_key: &str) -> Result<()> {
+        self.released.borrow_mut().push(idempotency_key.to_owned());
+        Ok(())
     }
 }
 
@@ -401,6 +409,7 @@ macro_rules! env {
             units: $units,
             directory: &&$w.directory,
             clock: &$w.clock,
+            limits: Limits::Recorded,
         }
     };
 }
@@ -977,6 +986,8 @@ async fn a_key_id_routed_to_another_tenant_is_refused() {
         KeyAnswer::Refused(Refusal::IdTaken)
     );
     assert_eq!(w.head(), 2);
+    // No record will use the reservation: it is released.
+    assert_eq!(*adm.released.borrow(), vec!["i".to_owned()]);
     assert_eq!(
         read_route(&w.store, &w.kek, "AKVL0007")
             .await
@@ -1258,6 +1269,7 @@ macro_rules! env_with {
             units: $units,
             directory: &&$w.directory,
             clock: &$w.clock,
+            limits: Limits::Recorded,
         }
     };
 }
@@ -1667,6 +1679,7 @@ async fn a_stale_open_entry_never_replaces_a_newer_closed_one() {
         units: &stale_units,
         directory: &dir,
         clock: &w.clock,
+        limits: Limits::Recorded,
     };
     let mut rng = TestRng(94);
     let report = finish_keys(&stale, &mut rng).await.unwrap();
@@ -2140,6 +2153,7 @@ async fn a_finisher_that_cannot_read_to_the_head_asks_for_a_retry() {
             units: &units,
             directory: &&w.directory,
             clock: &w.clock,
+            limits: Limits::Recorded,
         };
         // The first list call that lands the record after the read and
         // before the final one; an earlier one fails the read itself.
@@ -2412,4 +2426,143 @@ async fn a_refusal_after_a_partial_catch_up_answers_busy() {
             .unwrap(),
         KeyAnswer::Busy
     );
+}
+
+// ---------------------------------------------------------------------------
+// AM-18: milestone 1 serves unlimited grants only
+// ---------------------------------------------------------------------------
+
+fn limited_grants() -> Vec<(&'static str, Grant)> {
+    let mut expiring = grant("b_01", RO, None);
+    expiring.expires_at = Some(1_800_000_000_000);
+    let mut addressed = grant("b_01", RO, None);
+    addressed.ip_list = vec!["203.0.113.7".into()];
+    vec![
+        ("prefix", grant("b_01", RO, Some("x/"))),
+        ("expiry", expiring),
+        ("ip list", addressed),
+    ]
+}
+
+/// A create whose grant has a prefix, an expiry or an IP list is refused
+/// with `400 grant_limits_not_served`: no reservation, intent, route or
+/// record.
+#[tokio::test(flavor = "current_thread")]
+async fn a_create_with_a_limited_grant_is_refused_before_its_reservation() {
+    let w = World::new();
+    let adm = FakeAdmission::new(&w.root);
+    let mut table = seed(&w, &adm).await;
+    let units = w.units();
+    let mut env = env!(w, &adm, &units);
+    env.limits = Limits::NotServed;
+    let mut rng = TestRng(180);
+    let head = w.head();
+    let calls = adm.calls.get();
+    let sent = w.intents.sent.borrow().len();
+    for (what, g) in limited_grants() {
+        let key = s3_key(&w.t, "AKVL0180", "PR0001", &[g]);
+        let answer = env
+            .change(&mut table, "i180", &KeyRequest::Create(key), &mut rng)
+            .await
+            .unwrap();
+        assert_eq!(
+            answer,
+            KeyAnswer::Refused(Refusal::GrantLimitsNotServed),
+            "{what}"
+        );
+    }
+    assert_eq!(Refusal::GrantLimitsNotServed.status(), 400);
+    assert_eq!(
+        Refusal::GrantLimitsNotServed.code(),
+        "grant_limits_not_served"
+    );
+    assert_eq!(w.head(), head);
+    assert_eq!(adm.calls.get(), calls);
+    assert_eq!(w.intents.sent.borrow().len(), sent);
+    assert!(read_route(&w.store, &w.kek, "AKVL0180")
+        .await
+        .unwrap()
+        .is_none());
+    // The same key without the limit is made.
+    let key = s3_key(&w.t, "AKVL0180", "PR0001", &[grant("b_01", RO, None)]);
+    assert!(matches!(
+        env.change(&mut table, "i180", &KeyRequest::Create(key), &mut rng)
+            .await
+            .unwrap(),
+        KeyAnswer::Done { .. }
+    ));
+}
+
+/// A grant change that adds a limit is refused, a narrowing among them
+/// (it would leave a key that cannot work); one that adds none is made.
+#[tokio::test(flavor = "current_thread")]
+async fn a_grant_change_that_adds_a_limit_is_refused() {
+    let w = World::new();
+    let adm = FakeAdmission::new(&w.root);
+    let mut table = seed(&w, &adm).await;
+    let units = w.units();
+    let mut env = env!(w, &adm, &units);
+    env.limits = Limits::NotServed;
+    let mut rng = TestRng(181);
+    let p = principal(
+        "PR0181",
+        &[grant("b_01", RW, None), grant("b_02", RW, None)],
+    );
+    assert!(matches!(
+        env.change(&mut table, "i181p", &KeyRequest::Create(p), &mut rng)
+            .await
+            .unwrap(),
+        KeyAnswer::Done { .. }
+    ));
+    let key = s3_key(
+        &w.t,
+        "AKVL0181",
+        "PR0181",
+        &[grant("b_01", RO, None), grant("b_02", RO, None)],
+    );
+    assert!(matches!(
+        env.change(&mut table, "i181", &KeyRequest::Create(key), &mut rng)
+            .await
+            .unwrap(),
+        KeyAnswer::Done { .. }
+    ));
+    let head = w.head();
+    for (what, g) in limited_grants() {
+        let answer = env
+            .change(
+                &mut table,
+                "i181b",
+                &KeyRequest::SetGrants {
+                    id: "AKVL0181".into(),
+                    grants: vec![g],
+                    acting: None,
+                },
+                &mut rng,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            answer,
+            KeyAnswer::Refused(Refusal::GrantLimitsNotServed),
+            "{what}"
+        );
+    }
+    assert_eq!(w.head(), head);
+    // A narrowing with no limit (a bucket dropped) is recorded.
+    assert!(matches!(
+        env.change(
+            &mut table,
+            "i181c",
+            &KeyRequest::SetGrants {
+                id: "AKVL0181".into(),
+                grants: vec![grant("b_01", RO, None)],
+                acting: None,
+            },
+            &mut rng,
+        )
+        .await
+        .unwrap(),
+        KeyAnswer::Done { .. }
+    ));
+    assert_eq!(w.head(), head + 1);
 }
