@@ -69,17 +69,20 @@ pub struct RootKeyFeed<'r, 'a, P: RootPorts, R> {
 
 impl<P: RootPorts, R: FillRandom> RootKeyFeed<'_, '_, P, R> {
     /// How openings are held for `tenant`'s units: until the directory
-    /// acknowledged them when it is bound (a failed read acknowledges
-    /// nothing), not at all when it is not.
-    async fn mode(&self, tenant: &KeyTenant) -> Mode {
+    /// acknowledged them when it is bound (a tenant with no row has
+    /// acknowledged nothing), not at all when it is not. A failed read is
+    /// the feed's error: guessing "nothing acknowledged" would hold, at a
+    /// unit far behind, keys it holds open, and no later send of this
+    /// path reopens them.
+    async fn mode(&self, tenant: &KeyTenant) -> Result<Mode> {
         let Some(dir) = self.root.directory() else {
-            return Mode::Full;
+            return Ok(Mode::Full);
         };
-        let acked = match dir.tenant(&Tenant::Managed(tenant.clone())).await {
-            Ok(Some(row)) => row.keys_seq,
-            Ok(None) | Err(_) => 0,
-        };
-        Mode::Closing { acked }
+        let acked = dir
+            .tenant(&Tenant::Managed(tenant.clone()))
+            .await?
+            .map_or(0, |row| row.keys_seq);
+        Ok(Mode::Closing { acked })
     }
 }
 
@@ -106,7 +109,7 @@ impl<P: RootPorts, R: FillRandom> KeyFeed for RootKeyFeed<'_, '_, P, R> {
         if top < head {
             return Err(ERR_FEED_SHORT);
         }
-        let mode = self.mode(&t).await;
+        let mode = self.mode(&t).await?;
         // Every subject counted as held closed by the unit (see the
         // module): only the directory's acknowledgement opens.
         let closed: BTreeSet<String> = read.table.entries().map(|e| e.door.id.clone()).collect();
