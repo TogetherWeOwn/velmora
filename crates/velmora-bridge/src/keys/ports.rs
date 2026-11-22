@@ -3,7 +3,7 @@
 //! against fakes before the unit and the directory exist (tenant
 //! side) exist.
 
-use super::record::{Entry, KeyOp, Rid, Subject};
+use super::record::{Entry, KeyOp, Marker, Rid, Subject};
 use crate::crypto::scheme2::TenantId;
 use crate::types::{BridgeError, BucketId, Result};
 
@@ -15,29 +15,90 @@ pub const MAX_APPLY: usize = 100;
 // Nearly every entry is a subject's; a marker is rare, so boxing the
 // common case would cost an allocation per record for nothing.
 #[allow(clippy::large_enum_variant)]
-#[derive(Clone, Debug, PartialEq, Eq)]
+// `Debug` is written out: a held entry's `owner_ref` is not shown.
+#[derive(Clone, PartialEq, Eq)]
 pub enum ApplyEntry {
     /// A subject's record: the subject as the head holds it, at
     /// `last_seq` = the record's seq (for the subject's newest record,
     /// exactly that record's state), with the `m/rk/` revocations in force.
-    /// `private` is `None` when the store must hold it closed (its private
-    /// part does not open, or the directory may not have its opening).
+    /// `private` is `None` only when its private part does not open: the
+    /// store holds it closed, and there is no identity to send. A subject
+    /// the closing step holds (its opening not acknowledged by the
+    /// directory) is [`ApplyEntry::Held`], never this.
     ///
     /// For the unit's wire (`KeyEntry`): `held = private.is_none()`; a held
     /// entry is sent without its secret, and then also without
-    /// `secret_kek_version` (the unit refuses one without the other).
+    /// `secret_kek_version` (the unit refuses one without the other), and
+    /// with no `owner_ref`.
     Subject(Entry),
-    /// A marker record (`KeysFrozen`, `KeysThawed`; AM-28): it changes no
-    /// subject. The store skips it; it holds its seq's place in the run.
-    Marker { seq: u64 },
+    /// A subject's record the store must hold closed although its private
+    /// part opened: the directory may not have its opening yet (the
+    /// closing step's hold, ADR §2.5, AM-9). `entry` is the head's entry
+    /// with `private: None` (no secret, no grant limits, no label), as for
+    /// a subject that does not open. A held subject keeps its identity
+    /// (AM-9 with AM-72): for a principal, `owner_ref` is its private
+    /// part's; for a key it is `None`. Every sender sets the wire's `held`
+    /// from [`ApplyEntry::held`].
+    ///
+    /// For the unit's wire (`KeyEntry`): `held = true`, `owner_ref` as
+    /// here, no secret, no `secret_kek_version`, grants without their
+    /// limits.
+    Held {
+        entry: Entry,
+        owner_ref: Option<String>,
+    },
+    /// A marker record (`KeysFrozen`, `KeysThawed`; AM-28, AM-62): it
+    /// changes no subject. The store writes no row for it; it holds its
+    /// seq's place in the run, so the run has no gap. `marker` is the
+    /// record's kind as the chain states it.
+    ///
+    /// For the unit's wire (`KeyMarker`): `{"marker": "keys_frozen" |
+    /// "keys_thawed", "seq": seq}` (a thaw's `ends` is not sent).
+    Marker { seq: u64, marker: Marker },
+}
+
+impl std::fmt::Debug for ApplyEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ApplyEntry::Subject(e) => f.debug_tuple("Subject").field(e).finish(),
+            ApplyEntry::Held { entry, owner_ref } => f
+                .debug_struct("Held")
+                .field("entry", entry)
+                .field("owner_ref", &owner_ref.is_some())
+                .finish(),
+            ApplyEntry::Marker { seq, marker } => f
+                .debug_struct("Marker")
+                .field("seq", seq)
+                .field("marker", marker)
+                .finish(),
+        }
+    }
 }
 
 impl ApplyEntry {
     /// The seq of the record.
     pub fn seq(&self) -> u64 {
         match self {
-            ApplyEntry::Subject(e) => e.last_seq,
-            ApplyEntry::Marker { seq } => *seq,
+            ApplyEntry::Subject(e) | ApplyEntry::Held { entry: e, .. } => e.last_seq,
+            ApplyEntry::Marker { seq, .. } => *seq,
+        }
+    }
+
+    /// The subject's entry, held or not; `None` for a marker.
+    pub fn entry(&self) -> Option<&Entry> {
+        match self {
+            ApplyEntry::Subject(e) | ApplyEntry::Held { entry: e, .. } => Some(e),
+            ApplyEntry::Marker { .. } => None,
+        }
+    }
+
+    /// Whether the store must hold the subject closed: a held entry, or
+    /// one whose private part did not open.
+    pub fn held(&self) -> bool {
+        match self {
+            ApplyEntry::Subject(e) => e.private.is_none(),
+            ApplyEntry::Held { .. } => true,
+            ApplyEntry::Marker { .. } => false,
         }
     }
 }
