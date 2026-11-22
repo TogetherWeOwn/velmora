@@ -2642,7 +2642,7 @@ fn a_bucket_create_carries_its_name_and_wrap_in_the_private_part() {
     let back: TenantPrivate = serde_json::from_value(private).unwrap();
     assert_eq!(back, c.private);
     let shown = format!("{secrets:?}");
-    assert!(!shown.contains("bucket-1"), "{shown}");
+    assert!(!shown.contains("bucket-1"), "Debug exposed the bucket name");
     // The next record drops both.
     let n = apply(&c, create_bucket(2, 0), Actor::Customer);
     assert_eq!(n.private.bucket_created.as_ref().unwrap().name, "bucket-2");
