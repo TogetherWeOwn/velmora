@@ -60,6 +60,7 @@ const OPERATIONS: [(&str, &str); 3] = [("ins", "INSERT"), ("upd", "UPDATE"), ("d
 
 const ERR_NAME: BridgeError = BridgeError::Invalid("catalogue table name");
 const ERR_NOT_FROZEN: BridgeError = BridgeError::Invalid("catalogue not frozen");
+const ERR_NO_STAMP_ROW: BridgeError = BridgeError::Invalid("catalogue without its stamp row");
 const ERR_ID: BridgeError = BridgeError::Invalid("catalogue id of the stamp row");
 
 /// The longest table name the freeze takes: its trigger names, the
@@ -165,7 +166,15 @@ pub async fn write_marker<S: Sql>(catalog: &S, ordinal: u64) -> Result<()> {
 /// triggers on every table. A freeze trigger whose text is not exactly
 /// the expected one is dropped and made again. It can be run again; it
 /// ends by reading the fence back and fails unless it holds.
+///
+/// A catalogue without its stamp row is refused before anything is
+/// written: the row carries the catalogue id that the move's window
+/// names, and without it no read of the frozen catalogue serves. Raise
+/// the stamp first.
 pub async fn freeze<S: Sql>(catalog: &S, ordinal: u64) -> Result<Vec<String>> {
+    if stamp_row(catalog).await?.is_none() {
+        return Err(ERR_NO_STAMP_ROW);
+    }
     write_marker(catalog, ordinal).await?;
     let tables = catalogue_tables(catalog).await?;
     let existing = freeze_triggers(catalog).await?;

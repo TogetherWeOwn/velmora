@@ -161,9 +161,11 @@ const UPSERT_TENANT: &str = "INSERT INTO tenants (id, record_seq, state, hold_mo
 /// one included (a restored or damaged row is not trusted over R2), but
 /// only if the row still holds the seq the gate saw (`?13`, NULL for no
 /// row): a head that a closing call applied in between is newer than the
-/// gate's and stays.
+/// gate's and stays. A row the gate saw that is gone since is not made
+/// again either.
 const REPLACE_TENANT: &str = "INSERT INTO tenants (id, record_seq, state, hold_mode, shred_due_at, tk_version, rotating_to, selector, synthetic, jurisdiction, door_json, updated_at) \
-     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12) \
+     SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12 \
+     WHERE ?13 IS NULL OR EXISTS (SELECT 1 FROM tenants WHERE id = ?1) \
      ON CONFLICT (id) DO UPDATE SET record_seq = excluded.record_seq, state = excluded.state, hold_mode = excluded.hold_mode, shred_due_at = excluded.shred_due_at, tk_version = excluded.tk_version, rotating_to = excluded.rotating_to, selector = excluded.selector, synthetic = excluded.synthetic, jurisdiction = excluded.jurisdiction, door_json = excluded.door_json, updated_at = excluded.updated_at \
      WHERE tenants.record_seq IS ?13";
 

@@ -575,12 +575,19 @@ pub fn next(
             {
                 return Err(INVALID);
             }
-            // A bucket id that was dropped never comes back.
+            // A bucket id that was dropped never comes back, and past the
+            // cap no new id is placed, as for CreateBucket.
             if placements
                 .iter()
                 .any(|p| h.dropped_buckets.contains(&p.bucket))
             {
                 return Err(BUCKET_EXISTS);
+            }
+            let places_a_new_id = placements
+                .iter()
+                .any(|p| !h.placements.iter().any(|old| old.bucket == p.bucket));
+            if places_a_new_id && h.dropped_buckets.len() >= MAX_DROPPED_BUCKETS {
+                return Err(TOO_MANY_DROPPED);
             }
             let dropped: Vec<String> = h
                 .placements

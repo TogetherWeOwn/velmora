@@ -815,6 +815,12 @@ fn the_gate_does_not_overwrite_a_row_that_moved_on() {
         assert!(dir.tenant(&t).await.unwrap().is_some());
         assert!(dir.remove_tenant(&t, &at_old).await.unwrap());
         assert!(dir.tenant(&t).await.unwrap().is_none());
+        // A row the gate saw that is gone since is not made again; one it
+        // saw absent is.
+        assert!(!dir.replace_tenant(&old, &at_old, NOW).await.unwrap());
+        assert!(dir.tenant(&t).await.unwrap().is_none());
+        assert!(dir.replace_tenant(&old, &no_row, NOW).await.unwrap());
+        assert_eq!(dir.tenant(&t).await.unwrap().unwrap().record_seq, old.seq);
     });
 }
 

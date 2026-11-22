@@ -41,6 +41,27 @@ async fn loaded() -> (Rig, Signer, Vec<u8>) {
     (rig, signer, body)
 }
 
+/// A catalogue whose stamp was never raised has no catalogue id for the
+/// window to name: the freeze refuses it before writing anything.
+#[test]
+fn a_catalogue_without_its_stamp_row_is_not_frozen() {
+    block_on(async {
+        let rig = rig();
+        let (_, signer) = rig.standard(BUCKET).await;
+        let r = rig
+            .put(&signer, BUCKET, "kept.bin", &pattern(7, 1_000))
+            .await;
+        assert_eq!(r.status, 200, "{}", r.status);
+        let sql = &rig.bridge.catalog.sql;
+        assert_eq!(stamp_row(sql).await.unwrap(), None);
+        assert!(freeze(sql, 1).await.is_err());
+        assert_eq!(marker(sql).await.unwrap(), None);
+        assert!(!freeze_state(sql).await.unwrap().frozen());
+        rig.bridge.raise_stamp().await.unwrap();
+        freeze(sql, 1).await.unwrap();
+    });
+}
+
 #[test]
 fn every_write_to_every_catalogue_table_aborts_and_reads_go_on() {
     block_on(async {
@@ -390,6 +411,7 @@ async fn a_read_from_usenet_serves_under_the_freeze() {
             store.delete(&key).await.unwrap();
         }
     }
+    rig.bridge.raise_stamp().await.unwrap();
     freeze(&rig.bridge.catalog.sql, 1).await.unwrap();
     let get = rig
         .call(

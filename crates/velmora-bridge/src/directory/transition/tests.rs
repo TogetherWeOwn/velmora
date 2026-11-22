@@ -1848,6 +1848,27 @@ fn dropped_bucket_ids_are_capped() {
         Actor::Customer,
     );
     assert_eq!(dropped.door.dropped_buckets.len(), MAX_DROPPED_BUCKETS + 1);
+    // Nor does the operator place a new id past the cap; ones already
+    // placed may still move.
+    let set = |placements| Change::SetUnits {
+        base_seq: ANY,
+        units: vec![0],
+        placements,
+    };
+    let new_id = Placement {
+        bucket: "b_new".into(),
+        unit: 0,
+        epoch: 2,
+    };
+    assert_eq!(
+        refused(
+            &a,
+            set(vec![a.door.placements[0].clone(), new_id]),
+            Actor::Operator
+        ),
+        TOO_MANY_DROPPED
+    );
+    unchanged(&a, set(a.door.placements.clone()), Actor::Operator);
     let mut below = active();
     below.door.dropped_buckets = (1..MAX_DROPPED_BUCKETS).map(|i| format!("d_{i}")).collect();
     apply(
