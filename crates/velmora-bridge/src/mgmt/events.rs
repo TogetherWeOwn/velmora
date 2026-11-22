@@ -101,6 +101,9 @@ pub async fn read_events<H: TenantHeadRead, F: TenantFeed>(
     match heads.door(&id).await {
         Ok(Some(_)) => {}
         Ok(None) => return Answer::code(Code::TenantNotFound, None),
+        Err(e) if crate::mgmt::adapters::head_damaged(&e) => {
+            return Answer::code(Code::InternalError, None)
+        }
         Err(_) => return Answer::code(Code::ServiceUnavailable, None),
     }
     let Some(feed) = feed else {

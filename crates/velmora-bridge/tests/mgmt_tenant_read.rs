@@ -61,6 +61,7 @@ fn door() -> Door {
 struct Heads {
     door: RefCell<Option<Door>>,
     down: Cell<bool>,
+    damaged: Cell<bool>,
 }
 
 impl Heads {
@@ -68,6 +69,7 @@ impl Heads {
         Heads {
             door: RefCell::new(Some(door)),
             down: Cell::new(false),
+            damaged: Cell::new(false),
         }
     }
 }
@@ -75,7 +77,12 @@ impl Heads {
 impl TenantHeads for Heads {
     async fn head(&self, t: &TenantId, _: u64) -> Result<Option<Door>, ChainError> {
         if self.down.get() {
-            return Err(ChainError::Damaged("fake: down"));
+            return Err(ChainError::Store(velmora_bridge::BridgeError::Sql(
+                "fake: down".into(),
+            )));
+        }
+        if self.damaged.get() {
+            return Err(ChainError::Damaged("fake: a record is missing"));
         }
         Ok(self.door.borrow().clone().filter(|_| t.as_str() == TENANT))
     }
@@ -239,12 +246,9 @@ async fn a_deletion_reads_with_its_seq_and_times() {
     );
     // The key hash never leaves the head.
     assert!(!read(&Heads::of(d.clone())).await.body().contains("abab"));
+    // AM-40: any call while shredding or shredded.
     d.lifecycle = Lifecycle::Shredding;
-    let t = json_of(&read(&Heads::of(d)).await);
-    assert_eq!(
-        (t["state"].clone(), t["access"].clone()),
-        (json!("deleting"), json!("none"))
-    );
+    expect(&read(&Heads::of(d)).await, 409, "tenant_unavailable");
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -267,13 +271,17 @@ async fn not_yet_gone_unreadable_and_absent() {
     assert!(a.retry_after.is_some());
     let mut d = door();
     d.lifecycle = Lifecycle::Shredded;
-    expect(&read(&Heads::of(d)).await, 404, "tenant_not_found");
+    expect(&read(&Heads::of(d)).await, 409, "tenant_unavailable");
     let heads = Heads::of(door());
     heads.down.set(true);
     expect(&read(&heads).await, 503, "service_unavailable");
     let heads = Heads::of(door());
     *heads.door.borrow_mut() = None;
     expect(&read(&heads).await, 404, "tenant_not_found");
+    // A head that does not verify: 500, which pages; never a retry.
+    let heads = Heads::of(door());
+    heads.damaged.set(true);
+    expect(&read(&heads).await, 500, "internal_error");
     // Another tenant id: no chain.
     expect(
         &get(

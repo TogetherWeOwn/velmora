@@ -207,6 +207,10 @@ impl Fx {
 
     /// `job_seq`: the `state_seq` the jobs carry (the unit is at 3).
     async fn with(gc_mode: GcMode, job_seq: u64) -> Fx {
+        Fx::with_orphans(gc_mode, job_seq, false).await
+    }
+
+    async fn with_orphans(gc_mode: GcMode, job_seq: u64, gc_orphans: bool) -> Fx {
         let mut config = ServerConfig::for_test();
         config.articles = Vec::new();
         config.missing_ids.clear();
@@ -268,7 +272,7 @@ impl Fx {
             inflight_budget_bytes: BUDGET,
             job_budget_bytes: BUDGET,
             gc_mode,
-            gc_orphans: false,
+            gc_orphans,
             hot_cap_bytes: velmora_bridge::config::DEFAULT_HOT_CAP_BYTES,
             maintenance: Maintenance::Off,
             server_side_copy: false,
@@ -638,6 +642,25 @@ async fn gc_takes_an_overwritten_extent_on_the_unit() {
     assert!(!fx.bridge.cache.contains(&scope().cache_key(&old.extent)));
     // The live object keeps its copies.
     assert!(fx.bridge.safety.contains(&scope().safety_key(&new.extent)));
+}
+
+/// `GC_ORPHANS` on (main's #166): the orphan scan is not a unit job call,
+/// so a unit's Gc job finds none and still acknowledges; it never retries
+/// into the DLQ.
+#[tokio::test]
+async fn gc_with_the_orphan_scan_on_acknowledges_on_the_unit() {
+    let fx = Fx::with_orphans(GcMode::Disposable, 3, true).await;
+    let bucket = fx.bucket("scratch").await;
+    let old = fx.put(&bucket, "k", b"one").await;
+    let _new = fx.put(&bucket, "k", b"two").await;
+    assert_eq!(
+        fx.bridge
+            .run_job(&scope(), &Job::Gc { v: JOB_VERSION })
+            .await,
+        JobOutcome::Ack
+    );
+    assert_eq!(fx.extent(&old, "safety_state").await, "deleted");
+    assert_eq!(fx.bridge.catalog.refusal(), None);
 }
 
 // ---------------------------------------------------------------------------

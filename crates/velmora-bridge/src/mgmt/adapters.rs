@@ -32,6 +32,7 @@ use std::cell::{Cell, RefCell};
 use velmora::rng::FillRandom;
 use velmora_mgmt_types::Code;
 
+use crate::directory::chain::ChainError;
 use crate::directory::record::{TenantDoor as Door, TenantState};
 use crate::keys::gate::MoveGate;
 use crate::keys::ports::{
@@ -59,8 +60,17 @@ use crate::unit::{CallKind, Seqs, TenantId, UnitAnswer, UnitOp};
 use crate::unit_lease::client::{Answered, Page, TenantHeads};
 use crate::unit_router::{RouteRefusal, Routed, UnitRouter};
 
-/// The head could not be read or did not verify.
+/// The head could not be read now (a store fault, a key not loaded yet).
 pub const ERR_HEAD: BridgeError = BridgeError::Invalid("mgmt: tenant head unreadable");
+/// The head does not verify (a record missing, out of order, or not what
+/// its name says; a private part that does not open): the chain's reader
+/// fails closed, and the answer is `500`, which pages.
+pub const ERR_HEAD_DAMAGED: BridgeError = BridgeError::Crypto("mgmt: tenant head damaged");
+
+/// Whether `e` is [`ERR_HEAD_DAMAGED`].
+pub fn head_damaged(e: &BridgeError) -> bool {
+    matches!((e, &ERR_HEAD_DAMAGED), (BridgeError::Crypto(a), BridgeError::Crypto(b)) if a == b)
+}
 /// The root unit answered what the call never answers.
 pub const ERR_UNIT_ANSWER: BridgeError = BridgeError::Invalid("mgmt: unexpected unit answer");
 /// The router refused the call (any [`RouteRefusal`]).
@@ -132,7 +142,10 @@ pub struct HeadDoor<'a, H, N> {
 impl<H: TenantHeads, N: BucketNames> HeadDoor<'_, H, N> {
     /// The verified head; `None`: the tenant has no chain.
     pub async fn head(&self, tenant: &TenantId) -> Result<Option<Door>> {
-        self.heads.head(tenant, 0).await.map_err(|_| ERR_HEAD)
+        self.heads.head(tenant, 0).await.map_err(|e| match e {
+            ChainError::Damaged(_) | ChainError::PrivateUnreadable => ERR_HEAD_DAMAGED,
+            _ => ERR_HEAD,
+        })
     }
 }
 
@@ -182,13 +195,17 @@ impl<H: TenantHeads, N: BucketNames> TenantDoor for HeadDoor<'_, H, N> {
 // RootUnit (and the root unit's KeyTarget)
 // ---------------------------------------------------------------------------
 
-/// [`RootUnit`] over the request router. The client's pages and its
-/// "renew in the background" come back with every call; the Worker logs
-/// the pages as alerts and runs the renewal under `waitUntil`
-/// ([`RoutedUnit::take_pages`], [`RoutedUnit::renew_due`]).
+/// [`RootUnit`] over the request router. The client's pages, the
+/// router's refusals that page (rule 7's "catalogue lost": a listed unit
+/// of a `live` tenant that is unborn) and the client's "renew in the
+/// background" come back with every call; the Worker logs the pages and
+/// the alerts as alerts and runs the renewal under `waitUntil`
+/// ([`RoutedUnit::take_pages`], [`RoutedUnit::take_alerts`],
+/// [`RoutedUnit::renew_due`]).
 pub struct RoutedUnit<'a, R> {
     pub router: &'a R,
     pages: RefCell<Vec<Page>>,
+    alerts: RefCell<Vec<RouteRefusal>>,
     renew_due: Cell<bool>,
 }
 
@@ -197,6 +214,7 @@ impl<'a, R: UnitRouter> RoutedUnit<'a, R> {
         RoutedUnit {
             router,
             pages: RefCell::new(Vec::new()),
+            alerts: RefCell::new(Vec::new()),
             renew_due: Cell::new(false),
         }
     }
@@ -204,6 +222,18 @@ impl<'a, R: UnitRouter> RoutedUnit<'a, R> {
     /// The pages of every call so far (each one an alert).
     pub fn take_pages(&self) -> Vec<Page> {
         std::mem::take(&mut *self.pages.borrow_mut())
+    }
+
+    /// The router's refusals so far that page ([`RouteRefusal::alert`]).
+    pub fn take_alerts(&self) -> Vec<RouteRefusal> {
+        std::mem::take(&mut *self.alerts.borrow_mut())
+    }
+
+    fn noted(&self, r: RouteRefusal) -> RouteRefusal {
+        if r.alert() {
+            self.alerts.borrow_mut().push(r);
+        }
+        r
     }
 
     /// A unit asked for a background renewal.
@@ -222,12 +252,14 @@ impl<'a, R: UnitRouter> RoutedUnit<'a, R> {
         tenant: &TenantId,
         op: UnitOp,
     ) -> std::result::Result<Answered, RouteRefusal> {
-        let routed = self.route(tenant).await?;
+        let routed = self.route(tenant).await.map_err(|r| self.noted(r))?;
         let (answered, pages) = self.router.call(&routed, CallKind::Worker, true, op).await;
         self.pages.borrow_mut().extend(pages);
-        if let Ok(a) = &answered {
-            if a.renew_due {
-                self.renew_due.set(true);
+        match &answered {
+            Ok(a) if a.renew_due => self.renew_due.set(true),
+            Ok(_) => {}
+            Err(r) => {
+                self.noted(*r);
             }
         }
         answered

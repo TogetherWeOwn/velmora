@@ -5,14 +5,18 @@
 //! the head's door part, which L3 carries for this read (AM-59):
 //!
 //! - `state`: `active`, `suspended` (a hold), `deleting` (a deletion is
-//!   set, or the shred is running). A `provisioning` head answers `503`
-//!   (the create is in flight: its retry finishes it, AM-58); a
-//!   `shredded` one `404 tenant_not_found` (nothing of it is served; a
-//!   create with its `external_ref` answers `409 external_ref_retired`).
+//!   set). A `provisioning` head answers `503` (the create is in flight:
+//!   its retry finishes it, AM-58); a `shredding` or `shredded` one
+//!   `409 tenant_unavailable` (AM-40: any call while shredding or
+//!   shredded; a create with its `external_ref` answers
+//!   `409 external_ref_retired`).
 //! - `access`: what the tenant's keys may do now, from the state:
 //!   `full`, `read_only` (a `read_only` hold), `none` (a `locked` hold, a
-//!   deletion, the shred). A `restoring` entry changes no field: it is a
-//!   `503` of the moment, not a state of the tenant.
+//!   deletion). A `restoring` entry changes no field: it is a `503` of the
+//!   moment, not a state of the tenant.
+//!
+//! A head that does not verify answers `500` (the chain's reader fails
+//! closed and the code pages); one that cannot be read now, `503`.
 //! - `limits`: the head's named limits; a size that is absent is `null`
 //!   (no limit). `active_keys` is the head's, else the plane's cap of
 //!   [`DEFAULT_ACTIVE_KEYS`] (ADR §6.3).
@@ -60,8 +64,8 @@ pub trait TenantHeadRead {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Read {
     Tenant(Box<Tenant>),
-    /// No chain, or `shredded`.
-    NotFound,
+    /// `shredding` or `shredded`: `409 tenant_unavailable`.
+    Unavailable,
     /// `provisioning`: `503`.
     NotYet,
     /// The head holds what no correct writer writes.
@@ -76,13 +80,13 @@ fn ms(t: UnixMs) -> Option<u64> {
 pub fn tenant_of(id: &str, door: &Door) -> Read {
     let (state, access) = match door.state() {
         TenantState::Provisioning => return Read::NotYet,
-        TenantState::Shredded => return Read::NotFound,
+        TenantState::Shredding | TenantState::Shredded => return Read::Unavailable,
         TenantState::Active => (WireState::Active, TenantAccess::Full),
         TenantState::Suspended(HoldMode::ReadOnly) => {
             (WireState::Suspended, TenantAccess::ReadOnly)
         }
         TenantState::Suspended(HoldMode::Locked) => (WireState::Suspended, TenantAccess::None),
-        TenantState::Deleting | TenantState::Shredding => (WireState::Deleting, TenantAccess::None),
+        TenantState::Deleting => (WireState::Deleting, TenantAccess::None),
     };
     let limit = |name: &str| door.limits.get(name).copied();
     let limits = Limits {
@@ -162,6 +166,9 @@ pub async fn read_tenant<H: TenantHeadRead>(heads: &H, tenant: &str) -> Answer {
     let door = match heads.door(&id).await {
         Ok(Some(door)) => door,
         Ok(None) => return Answer::code(Code::TenantNotFound, None),
+        Err(e) if crate::mgmt::adapters::head_damaged(&e) => {
+            return Answer::code(Code::InternalError, None)
+        }
         Err(_) => return Answer::code(Code::ServiceUnavailable, None),
     };
     // A head of another tenant under this name is damage (the chain's
@@ -178,7 +185,7 @@ pub async fn read_tenant<H: TenantHeadRead>(heads: &H, tenant: &str) -> Answer {
             Ok(json) => Answer::json(200, json),
             Err(_) => Answer::code(Code::InternalError, None),
         },
-        Read::NotFound => Answer::code(Code::TenantNotFound, None),
+        Read::Unavailable => Answer::code(Code::TenantUnavailable, None),
         Read::NotYet => Answer::code(Code::ServiceUnavailable, None),
         Read::Damaged => Answer::code(Code::InternalError, None),
     }

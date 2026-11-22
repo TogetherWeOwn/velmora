@@ -470,6 +470,11 @@ where
             .catalog
             .gc_orphans(now, cutoff, ORPHAN_SCAN, ORPHAN_BATCH)
             .await?;
+        // Nothing to claim (a window with no orphan, and always on a unit,
+        // whose catalogue has no orphan scan yet).
+        if rows.is_empty() {
+            return Ok(());
+        }
         // The scan read the rows a moment ago; the claim proves each
         // again in the batch that records its delete, and only then
         // does a blob go. Claims that an error cut short still granted
