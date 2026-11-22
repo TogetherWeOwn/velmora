@@ -184,7 +184,10 @@ pub fn unit_bridge(
     })
 }
 
-/// The unit client of this build: none (see the [module](self)).
+/// The unit client of this build: none yet (see the [module](self)). L2's
+/// `UnitClient` implements the consumer's port
+/// (`velmora_bridge::unit_consumer::ConsumerClient`); it is wired here
+/// once its bodies are built.
 pub fn client() -> NoClient {
     NoClient
 }
@@ -224,6 +227,15 @@ impl UnitRun for OnUnit<'_> {
         };
         crate::log_post_trace(self.job, &outcome);
         (outcome, self.bridge.catalog.refusal())
+    }
+
+    async fn prepare(&self, seqs: Seqs) -> bool {
+        self.bridge.catalog.run_again_with(seqs);
+        let now = velmora_bridge::ports::Clock::now(&self.bridge.clock);
+        let given = self.bridge.catalog.give_back(now).await.is_ok();
+        // The run once more starts with no refusal of its own.
+        self.bridge.catalog.run_again_with(seqs);
+        given
     }
 }
 

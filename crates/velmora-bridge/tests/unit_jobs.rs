@@ -745,7 +745,10 @@ async fn a_job_with_higher_numbers_needs_a_sync() {
         matches!(err, BridgeError::Invalid(UNIT_SYNC_NEEDED)),
         "{err:?}"
     );
-    assert_eq!(fx.bridge.catalog.refusal(), Some(UnitRefusal::SyncNeeded));
+    assert!(matches!(
+        fx.bridge.catalog.refusal(),
+        Some(UnitRefusal::SyncNeeded(_))
+    ));
 }
 
 #[tokio::test]
@@ -930,4 +933,50 @@ async fn job_calls_are_unlisted_and_keep_the_units_latest_numbers() {
     assert!(calls.iter().all(|c| !c.listed && c.kind == CallKind::Job));
     assert_eq!(calls[0].seqs, Some(seqs(3, 1)));
     assert_eq!(calls[1].seqs, Some(seqs(5, 2)));
+}
+
+/// A run that the unit refused after its claim kept the row leased: the
+/// lease is given back with the new numbers before the run once more,
+/// which then claims the row (review of L6-1, MEDIUM).
+#[tokio::test]
+async fn the_lease_of_a_refused_run_is_given_back_before_the_run_once_more() {
+    let fx = Fx::new().await;
+    let bucket = fx.bucket("scratch").await;
+    let o = fx.put(&bucket, "a/x.bin", b"x").await;
+    let now = fx.clock.now();
+    let cat = &fx.bridge.catalog;
+    let lease = cat
+        .claim(&o.extent, &o.generation, OutboxStage::Post, "job:post", now)
+        .await
+        .unwrap()
+        .expect("the row is due");
+    // The chain moves on; the run's next call is refused.
+    sync(&fx.unit, 4, None, now);
+    assert!(cat.renew(&lease, now).await.is_err());
+    assert!(cat.refusal().is_some());
+    // Without the give-back the row stays leased.
+    let unit_seqs = Seqs {
+        state_seq: 4,
+        keys_seq: 0,
+    };
+    cat.run_again_with(unit_seqs);
+    assert_eq!(
+        cat.claim(&o.extent, &o.generation, OutboxStage::Post, "job:post", now)
+            .await
+            .unwrap(),
+        None
+    );
+    cat.give_back(now).await.unwrap();
+    assert_eq!(cat.refusal(), None);
+    let again = cat
+        .claim(&o.extent, &o.generation, OutboxStage::Post, "job:post", now)
+        .await
+        .unwrap();
+    assert!(again.is_some(), "the run once more claims the row");
+    // The give-back used no attempt of its own: two claims, one attempt
+    // (`defer` hands the claim's attempt back).
+    assert_eq!(fx.outbox(&o, "attempts").await, "1");
+    // A second give-back finds nothing of its own to free but the new
+    // claim, which it gives back too: the runs are sequential.
+    cat.give_back(now).await.unwrap();
 }

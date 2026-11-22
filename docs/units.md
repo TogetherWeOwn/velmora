@@ -411,13 +411,20 @@ tenant's verified head (listed: dead-letter queue and a "catalogue lost"
 page; not listed: acknowledged; a head that cannot be read: handed back);
 `AccountProblem` while the tenant is shredding is acknowledged with no
 page; anything else goes to the dead-letter queue and pages. A job runs
-once more at most once per delivery. The unit jobs `renew` and
+once more at most once per delivery, with numbers never below the
+message's, and only after the outbox lease its first run claimed is given
+back (`TenantCatalog::give_back`; if it cannot be, the message is handed
+back). The unit client's other outcomes take the same rows: closed or a
+lift pending is acknowledged, unborn reads the head, a unit the head no
+longer lists is acknowledged, and every page it returns is logged as an
+alert. The unit jobs `renew` and
 `stamp_raise` run through the unit client. A unit's job config keeps
 tenant 0's `MAINTENANCE`: under `restore` no unit job makes a unit call,
-and each is acknowledged with no page. This build has neither the unit
-client nor the tenant head reader (lanes L2 and L3), so the arms that
-need them hand the message back, and `UNIT` stays unbound until the build
-that has both and the unit's alarm dispatcher.
+and each is acknowledged with no page. The consumer calls L2's `UnitClient`
+through `unit_consumer::ConsumerClient`; until its bodies and a Worker
+head reader are wired, the Worker uses `NoClient` and `NoHeads`, so the
+arms that need them hand the message back, and `UNIT` stays unbound until
+the build that has both and the unit's alarm dispatcher.
 
 ## Bookmarks
 

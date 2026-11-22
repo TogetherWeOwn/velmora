@@ -443,7 +443,7 @@ async fn run_on_unit(
         scope,
         job,
     };
-    let (delivery, line) = velmora_bridge::unit_consumer::deliver(
+    let (delivery, lines) = velmora_bridge::unit_consumer::deliver(
         bridge.cfg.maintenance,
         &name,
         seqs,
@@ -452,7 +452,7 @@ async fn run_on_unit(
         &units::heads(),
     )
     .await;
-    log_unit_line(line);
+    log_unit_lines(&lines);
     delivery
 }
 
@@ -476,25 +476,30 @@ async fn run_unit_job(
             };
         }
     };
-    let (delivery, line) = velmora_bridge::unit_consumer::deliver_unit_job(
+    let seqs = velmora_bridge::unit::Seqs {
+        state_seq: tenant.state_seq(),
+        keys_seq: tenant.keys_seq(),
+    };
+    let (delivery, lines) = velmora_bridge::unit_consumer::deliver_unit_job(
         bridge.cfg.maintenance,
         job,
         &name,
+        seqs,
         &units::client(),
+        &units::heads(),
     )
     .await;
-    log_unit_line(Some(line));
+    log_unit_lines(&lines);
     delivery
 }
 
-/// The consumer's line about a managed tenant's message: a fixed code.
-fn log_unit_line(line: Option<velmora_bridge::unit_consumer::Line>) {
-    match line {
-        Some(line) if line.alert => {
-            console_error!("alert: unit job ({}): to the dead-letter queue", line.code)
+/// The consumer's lines about a managed tenant's message: fixed codes.
+fn log_unit_lines(lines: &[velmora_bridge::unit_consumer::Line]) {
+    for line in lines {
+        match line.alert {
+            true => console_error!("alert: unit job ({})", line.code),
+            false => console_log!("unit job ({})", line.code),
         }
-        Some(line) => console_log!("unit job ({})", line.code),
-        None => {}
     }
 }
 

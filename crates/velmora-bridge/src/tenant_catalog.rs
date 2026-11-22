@@ -53,10 +53,11 @@ pub enum UnitRefusal {
     /// `Refused{stale_job}`: a job call with no numbers, or (before the
     /// unit answers `Stale{seqs}` to job calls) with lower ones.
     StaleJob,
-    /// `SyncNeeded`: the job knows a newer record than the unit.
-    SyncNeeded,
-    /// `renew_needed`: the unit's lease has run out.
-    RenewNeeded,
+    /// `SyncNeeded`: the job knows a newer record than the unit, whose
+    /// numbers come with the answer.
+    SyncNeeded(Seqs),
+    /// `renew_needed`: the unit's lease has run out; its numbers.
+    RenewNeeded(Seqs),
     /// `Closed` (restoring or provisioning).
     Closed,
     /// `Unborn`: the unit has no certificate.
@@ -72,8 +73,8 @@ impl UnitRefusal {
     pub fn text(self) -> &'static str {
         match self {
             UnitRefusal::Stale(_) | UnitRefusal::StaleJob => UNIT_STALE_JOB,
-            UnitRefusal::SyncNeeded => UNIT_SYNC_NEEDED,
-            UnitRefusal::RenewNeeded => UNIT_RENEW_NEEDED,
+            UnitRefusal::SyncNeeded(_) => UNIT_SYNC_NEEDED,
+            UnitRefusal::RenewNeeded(_) => UNIT_RENEW_NEEDED,
             UnitRefusal::Closed => UNIT_CLOSED,
             UnitRefusal::Unborn => UNIT_UNBORN,
             UnitRefusal::AccountProblem => UNIT_ACCOUNT_PROBLEM,
@@ -124,6 +125,9 @@ pub struct TenantCatalog<P: UnitPort, S: Catalog> {
     /// The first refusal the unit gave in this run.
     refusal: std::cell::Cell<Option<UnitRefusal>>,
     latest: LatestSeqs,
+    /// The outbox leases this run claimed: given back before the job runs
+    /// once more ([`TenantCatalog::give_back`]).
+    claimed: std::cell::RefCell<Vec<Lease>>,
 }
 
 impl<P: UnitPort, S: Catalog> TenantCatalog<P, S> {
@@ -143,6 +147,7 @@ impl<P: UnitPort, S: Catalog> TenantCatalog<P, S> {
             seqs: std::cell::Cell::new(seqs),
             refusal: std::cell::Cell::new(None),
             latest,
+            claimed: std::cell::RefCell::default(),
         }
     }
 
@@ -167,6 +172,27 @@ impl<P: UnitPort, S: Catalog> TenantCatalog<P, S> {
         self.seqs.set(seqs);
         self.latest.raise(seqs);
         self.refusal.set(None);
+    }
+
+    /// Gives back, with the current numbers, every outbox lease the last
+    /// run claimed (`defer` to `now`, fenced by the lease's token: a lease
+    /// that run already freed or advanced is left as it is). A run that
+    /// the unit refused after its claim kept the row leased, and its
+    /// `fail` went out with the refused numbers too; without this the run
+    /// once more would find the row leased and acknowledge having done
+    /// nothing. `Err`: a lease is still held; the refusal of that call is
+    /// kept.
+    pub async fn give_back(&self, now: UnixMs) -> Result<()> {
+        let claimed = std::mem::take(&mut *self.claimed.borrow_mut());
+        for (at, lease) in claimed.iter().enumerate() {
+            if let Err(e) = Catalog::defer(self, lease, now, now).await {
+                self.claimed
+                    .borrow_mut()
+                    .extend(claimed[at..].iter().cloned());
+                return Err(e);
+            }
+        }
+        Ok(())
     }
 
     /// The first refusal the unit gave since this catalogue was made: the
@@ -208,7 +234,7 @@ impl<P: UnitPort, S: Catalog> TenantCatalog<P, S> {
         match answer {
             UnitAnswer::Ok { body, .. } => serde_json::from_value(body)
                 .map_err(|_| BridgeError::Sql("unit: job answer does not decode".into())),
-            UnitAnswer::SyncNeeded { .. } => Err(self.refused(UnitRefusal::SyncNeeded)),
+            UnitAnswer::SyncNeeded { seqs } => Err(self.refused(UnitRefusal::SyncNeeded(seqs))),
             UnitAnswer::Stale { seqs } => Err(self.refused(UnitRefusal::Stale(seqs))),
             UnitAnswer::Refused {
                 reason: Refused::Identity(identity::Refusal::StaleJob),
@@ -219,7 +245,9 @@ impl<P: UnitPort, S: Catalog> TenantCatalog<P, S> {
                 ..
             } => Err(self.refused(UnitRefusal::AccountProblem)),
             UnitAnswer::Closed { .. } => Err(self.refused(UnitRefusal::Closed)),
-            UnitAnswer::RenewNeeded { .. } => Err(self.refused(UnitRefusal::RenewNeeded)),
+            UnitAnswer::RenewNeeded { seqs, .. } => {
+                Err(self.refused(UnitRefusal::RenewNeeded(seqs)))
+            }
             UnitAnswer::Unborn { .. } => Err(self.refused(UnitRefusal::Unborn)),
             UnitAnswer::Failed { class } => Err(match class.as_str() {
                 "guard" => BridgeError::GuardFailed,
@@ -336,14 +364,19 @@ impl<P: UnitPort, S: Catalog> Catalog for TenantCatalog<P, S> {
         owner: &str,
         now: UnixMs,
     ) -> Result<Option<Lease>> {
-        self.unit(JobCall::claim {
-            extent: extent.clone(),
-            generation: generation.clone(),
-            stage,
-            owner: owner.to_string(),
-            now,
-        })
-        .await
+        let lease: Option<Lease> = self
+            .unit(JobCall::claim {
+                extent: extent.clone(),
+                generation: generation.clone(),
+                stage,
+                owner: owner.to_string(),
+                now,
+            })
+            .await?;
+        if let Some(lease) = &lease {
+            self.claimed.borrow_mut().push(lease.clone());
+        }
+        Ok(lease)
     }
     async fn defer(&self, l: &Lease, next_at: UnixMs, now: UnixMs) -> Result<bool> {
         self.unit(JobCall::defer {
