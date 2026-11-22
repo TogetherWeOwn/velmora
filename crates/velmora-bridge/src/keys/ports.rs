@@ -130,11 +130,17 @@ pub struct BucketReservation<'a> {
 pub enum BucketAdmission {
     /// The bucket-create cap slot and the name are held under the
     /// `Idempotency-Key`; the creator was an active principal at
-    /// `keys_seq`. The creator grant must be exactly `keys_seq + 1`.
-    /// Asked again under the same key, the unit checks again at its own
-    /// head and answers that head.
+    /// `keys_seq`. With `bound` unset, the creator grant must be exactly
+    /// `keys_seq + 1`; asked again under the same key, the unit checks
+    /// again at its own head and answers that head. With `bound` set, an
+    /// earlier call under this key wrote the creator grant at that seq
+    /// and bound it ([`KeyAdmission::bind_bucket`]): the call places that
+    /// grant's bucket, and writes no new grant unless that one loses. A
+    /// bound reservation is answered so whatever its creator is now: its
+    /// grant was recorded first.
     Admitted {
         keys_seq: u64,
+        bound: Option<u64>,
     },
     /// The reservation under this key already became the bucket
     /// `bucket`, whose creator grant is `grant_seq`: the call is a retry.
@@ -143,6 +149,23 @@ pub enum BucketAdmission {
         grant_seq: u64,
     },
     Refused(Refusal),
+}
+
+/// What the root unit's reservations say of one creator-grant seq.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Binding {
+    /// An open reservation is bound to it: the create may still finish.
+    Open {
+        idempotency_key: String,
+        creator: String,
+        unit: u32,
+    },
+    /// The reservation bound to it became the bucket.
+    Created,
+    /// No reservation is bound to it: none ever was (a call that died
+    /// between its put and its bind), or it was released, swept, or bound
+    /// again to a later seq. The grant is an orphan for good.
+    None,
 }
 
 /// The root unit's reservation call: the cap slot, under the request's
@@ -159,7 +182,8 @@ pub trait KeyAdmission {
     /// Releases the reservation held under `idempotency_key`: called once
     /// a call ends with no record for it. Best effort: a reservation that
     /// is not released is swept after 1 hour (est). Releasing one that
-    /// was already released, or turned into a row, changes nothing.
+    /// was already released, or turned into a row, changes nothing. A
+    /// later call under the same key reserves again.
     async fn release(&self, tenant: &TenantId, idempotency_key: &str) -> Result<()>;
     /// The reservation of a bucket create: the bucket-create cap slot and
     /// the name, under `idempotency_key`, and the check that the creator
@@ -170,30 +194,35 @@ pub trait KeyAdmission {
         idempotency_key: &str,
         bucket: &BucketReservation<'_>,
     ) -> Result<BucketAdmission>;
+    /// Binds the bucket reservation under `idempotency_key` to the creator
+    /// grant at `grant_seq`, which this call's own put wrote; a later
+    /// bind of a higher seq replaces it. From then on the unit answers it
+    /// in `Admitted::bound`, and turns the reservation into the bucket
+    /// row when it applies `bucket_created` for that seq. Idempotent.
+    async fn bind_bucket(
+        &self,
+        tenant: &TenantId,
+        idempotency_key: &str,
+        grant_seq: u64,
+    ) -> Result<()>;
+    /// What the reservations say of the creator grant at `grant_seq`.
+    async fn bucket_binding(&self, tenant: &TenantId, grant_seq: u64) -> Result<Binding>;
 }
 
 /// What the tenant chain answered a `bucket_created` record.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BucketPut {
     /// Recorded: by this call, or read back as this create after a lost
-    /// answer.
-    Placed,
+    /// answer. `in_force`: the directory and the units acknowledged it
+    /// (ADR §2.5 store order); when not, the tenant chain's finisher
+    /// brings them up.
+    Placed { in_force: bool },
     /// Another create recorded a higher creator-grant seq first
     /// (`grant_order_lost`). This grant seq can never be placed now.
     OrderLost,
     /// Refused by the tenant's state (`restoring`, the lifecycle, a unit
     /// that is not listed): the call answers `status` with `code`.
     Refused { status: u16, code: &'static str },
-}
-
-/// Where the tenant chain's head stands for one derived bucket id.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct GrantOrder {
-    /// The id is placed.
-    pub placed: bool,
-    /// The head's `last_grant_seq`: no creator grant at or below it can
-    /// be placed any more unless it already is.
-    pub last_grant_seq: u64,
 }
 
 /// The tenant chain as the creator-grant writer needs it. Its owner
@@ -211,8 +240,8 @@ pub trait BucketRecords {
         creator: &str,
         grant_seq: u64,
     ) -> Result<BucketPut>;
-    /// The head's placement of `bucket` and its `last_grant_seq`.
-    async fn grant_order(&self, tenant: &TenantId, bucket: &BucketId) -> Result<GrantOrder>;
+    /// Whether the verified head places `bucket`.
+    async fn is_placed(&self, tenant: &TenantId, bucket: &BucketId) -> Result<bool>;
 }
 
 /// The chain a control intent names.

@@ -24,8 +24,8 @@ use velmora_bridge::keys::buckets::{
 use velmora_bridge::keys::chain::Put;
 use velmora_bridge::keys::checkpoint::{list_checkpoints, read_key_chain};
 use velmora_bridge::keys::ports::{
-    Admission, BucketAdmission, BucketPut, BucketRecords, BucketReservation, ControlChain,
-    ControlIntents, GrantOrder, KeyAdmission, KeyTarget, OpeningChange, Refusal,
+    Admission, Binding, BucketAdmission, BucketPut, BucketRecords, BucketReservation, ControlChain,
+    ControlIntents, KeyAdmission, KeyTarget, OpeningChange, Refusal,
 };
 use velmora_bridge::keys::record::{
     grant_within, key_chain, open_key_record, seal_key_record, Access, Entry, Grant, KeyOp, OneKey,
@@ -156,6 +156,9 @@ impl KeyTarget for FakeTarget {
     }
 }
 
+/// An open bucket reservation: (creator, unit, bound seq).
+type OpenBucket = (String, u32, Option<u64>);
+
 /// The root unit's reservation call, checked against the root fake.
 struct FakeAdmission<'a> {
     root: &'a FakeTarget,
@@ -172,6 +175,10 @@ struct FakeAdmission<'a> {
     bucket_done: RefCell<Option<(BucketId, u64)>>,
     /// Bucket creates left under the cap.
     bucket_cap: Cell<u32>,
+    /// Open bucket reservations: key -> (creator, unit, bound seq).
+    bucket_open: RefCell<BTreeMap<String, OpenBucket>>,
+    /// `bind_bucket` fails while set.
+    bind_down: Cell<bool>,
     /// Runs once, inside the first call, before the answer is computed:
     /// another writer's record lands between the reservation and the put.
     race: RefCell<Option<Box<dyn FnOnce() -> u64 + 'a>>>,
@@ -189,6 +196,8 @@ impl<'a> FakeAdmission<'a> {
             bucket_asks: RefCell::new(Vec::new()),
             bucket_done: RefCell::new(None),
             bucket_cap: Cell::new(50),
+            bucket_open: RefCell::new(BTreeMap::new()),
+            bind_down: Cell::new(false),
             race: RefCell::new(None),
         }
     }
@@ -218,7 +227,48 @@ impl KeyAdmission for FakeAdmission<'_> {
 
     async fn release(&self, _tenant: &TenantId, idempotency_key: &str) -> Result<()> {
         self.released.borrow_mut().push(idempotency_key.to_owned());
+        self.bucket_open.borrow_mut().remove(idempotency_key);
         Ok(())
+    }
+
+    async fn bind_bucket(
+        &self,
+        _t: &TenantId,
+        idempotency_key: &str,
+        grant_seq: u64,
+    ) -> Result<()> {
+        if self.bind_down.get() {
+            return Err(BridgeError::Sql("fake: root unit down".into()));
+        }
+        let mut open = self.bucket_open.borrow_mut();
+        let r = open
+            .get_mut(idempotency_key)
+            .expect("a bind names an open reservation");
+        assert!(r.2.is_none_or(|b| b < grant_seq), "a bind only moves up");
+        r.2 = Some(grant_seq);
+        Ok(())
+    }
+
+    async fn bucket_binding(&self, _t: &TenantId, grant_seq: u64) -> Result<Binding> {
+        if self
+            .bucket_done
+            .borrow()
+            .as_ref()
+            .is_some_and(|(_, k)| *k == grant_seq)
+        {
+            return Ok(Binding::Created);
+        }
+        Ok(self
+            .bucket_open
+            .borrow()
+            .iter()
+            .find(|(_, (_, _, b))| *b == Some(grant_seq))
+            .map(|(key, (creator, unit, _))| Binding::Open {
+                idempotency_key: key.clone(),
+                creator: creator.clone(),
+                unit: *unit,
+            })
+            .unwrap_or(Binding::None))
     }
 
     async fn admit_bucket(
@@ -232,10 +282,21 @@ impl KeyAdmission for FakeAdmission<'_> {
             .borrow_mut()
             .push(idempotency_key.to_owned());
         let seq = self.root.seq.get();
+        let bound = self
+            .bucket_open
+            .borrow()
+            .get(idempotency_key)
+            .and_then(|r| r.2);
         let answer = if let Some((b, k)) = self.bucket_done.borrow().clone() {
             BucketAdmission::Created {
                 bucket: b,
                 grant_seq: k,
+            }
+        } else if let Some(k) = bound {
+            // A bound reservation is answered whatever its creator is now.
+            BucketAdmission::Admitted {
+                keys_seq: self.stale.get().unwrap_or(seq),
+                bound: Some(k),
             }
         } else if let Some(r) = self.refuse.get() {
             BucketAdmission::Refused(r)
@@ -251,9 +312,18 @@ impl KeyAdmission for FakeAdmission<'_> {
                 {
                     BucketAdmission::Refused(Refusal::CreatorNotActive)
                 }
-                Some(_) => BucketAdmission::Admitted {
-                    keys_seq: self.stale.get().unwrap_or(seq),
-                },
+                Some(_) => {
+                    let mut open = self.bucket_open.borrow_mut();
+                    let r = open.entry(idempotency_key.to_owned()).or_insert((
+                        bucket.creator.to_owned(),
+                        bucket.unit,
+                        None,
+                    ));
+                    BucketAdmission::Admitted {
+                        keys_seq: self.stale.get().unwrap_or(seq),
+                        bound: r.2,
+                    }
+                }
             }
         };
         if let Some(race) = self.race.borrow_mut().take() {
@@ -275,7 +345,19 @@ struct FakeBuckets {
     /// creator-grant seq was recorded first.
     lose_orders: Cell<u32>,
     down: Cell<bool>,
+    /// The next N creates are recorded and then answer an error.
+    lose_answers: Cell<u32>,
+    /// The directory or the unit does not acknowledge.
+    not_in_force: Cell<bool>,
     calls: Cell<u32>,
+}
+
+impl FakeBuckets {
+    fn placed_now(&self) -> BucketPut {
+        BucketPut::Placed {
+            in_force: !self.not_in_force.get(),
+        }
+    }
 }
 
 impl BucketRecords for FakeBuckets {
@@ -299,7 +381,11 @@ impl BucketRecords for FakeBuckets {
             .any(|(b, ..)| b == bucket.as_str())
         {
             assert!(grant_seq <= self.last_grant_seq.get());
-            return Ok(BucketPut::Placed);
+            if self.lose_answers.get() > 0 {
+                self.lose_answers.set(self.lose_answers.get() - 1);
+                return Err(BridgeError::Blob("fake: answer lost".into()));
+            }
+            return Ok(self.placed_now());
         }
         if let Some((status, code)) = self.refuse.get() {
             return Ok(BucketPut::Refused { status, code });
@@ -318,21 +404,22 @@ impl BucketRecords for FakeBuckets {
             creator.to_owned(),
             grant_seq,
         ));
-        Ok(BucketPut::Placed)
+        if self.lose_answers.get() > 0 {
+            self.lose_answers.set(self.lose_answers.get() - 1);
+            return Err(BridgeError::Blob("fake: answer lost".into()));
+        }
+        Ok(self.placed_now())
     }
 
-    async fn grant_order(&self, _t: &TenantId, bucket: &BucketId) -> Result<GrantOrder> {
+    async fn is_placed(&self, _t: &TenantId, bucket: &BucketId) -> Result<bool> {
         if self.down.get() {
             return Err(BridgeError::Blob("fake: tenant chain down".into()));
         }
-        Ok(GrantOrder {
-            placed: self
-                .placed
-                .borrow()
-                .iter()
-                .any(|(b, ..)| b == bucket.as_str()),
-            last_grant_seq: self.last_grant_seq.get(),
-        })
+        Ok(self
+            .placed
+            .borrow()
+            .iter()
+            .any(|(b, ..)| b == bucket.as_str()))
     }
 }
 
@@ -2722,10 +2809,35 @@ async fn head_grants(w: &World, id: &str) -> Vec<String> {
         .collect()
 }
 
+/// Every subject at the head that holds a grant on `bucket`.
+async fn holders(w: &World, bucket: &BucketId) -> Vec<String> {
+    let read = read_key_chain(&w.store, &w.kek, &w.ring, &w.t)
+        .await
+        .unwrap();
+    read.table
+        .entries()
+        .filter(|e| e.door.grants.iter().any(|g| g.bucket_id == bucket.as_str()))
+        .map(|e| e.door.id.clone())
+        .collect()
+}
+
+/// The entry of `id` at the chain's head (sync, from the planted store).
+fn read_entry(w: &World, id: &str) -> Entry {
+    let mut table = velmora_bridge::keys::record::KeyTable::empty(w.t.clone());
+    let chain = key_chain(&w.t);
+    let mut seq = 1;
+    while let Some(bytes) = w.store.raw(&chain.name(seq)) {
+        let record = open_key_record(&w.kek, &w.ring, &w.t, seq, &bytes).unwrap();
+        table.apply(&record).unwrap();
+        seq += 1;
+    }
+    table.get(id).unwrap().clone()
+}
+
 /// A create writes the creator grant at exactly the reservation's
-/// `keys_seq + 1` = K, derives the bucket id from K, and records
-/// `bucket_created` with `grant_seq = K`. Only the creator gains the
-/// grant: no key under it does.
+/// `keys_seq + 1` = K, binds K to the reservation, derives the bucket id
+/// from K, and records `bucket_created` with `grant_seq = K`. Only the
+/// creator gains the grant: no key under it does.
 #[tokio::test(flavor = "current_thread")]
 async fn a_bucket_create_writes_the_creator_grant_first_with_the_derived_id() {
     let w = World::new();
@@ -2750,7 +2862,6 @@ async fn a_bucket_create_writes_the_creator_grant_first_with_the_derived_id() {
         BucketAnswer::Created {
             bucket: id3.clone(),
             grant_seq: 3,
-            in_force: true
         }
     );
     assert_eq!(w.head(), 3);
@@ -2767,6 +2878,7 @@ async fn a_bucket_create_writes_the_creator_grant_first_with_the_derived_id() {
         *buckets.placed.borrow(),
         vec![(id3.as_str().to_owned(), 1, "PR0001".to_owned(), 3)]
     );
+    assert_eq!(adm.bucket_open.borrow()["ib1"].2, Some(3), "K is bound");
     assert!(w.intents.sent.borrow().contains(&3));
     assert!(w
         .intents
@@ -2774,10 +2886,7 @@ async fn a_bucket_create_writes_the_creator_grant_first_with_the_derived_id() {
         .borrow()
         .contains(&(3, BUCKET_CREATE_KIND.to_owned())));
     // A key gets nothing from it.
-    assert_eq!(
-        joined(&w.root.row("AKVL0001").unwrap()),
-        vec![grant("b_01", RO, None)]
-    );
+    assert_eq!(holders(&w, &id3).await, vec!["PR0001".to_owned()]);
     for store in [&w.root, &w.unit2, &w.directory] {
         assert_eq!(store.seq.get(), 3);
     }
@@ -2834,7 +2943,6 @@ async fn a_lost_grant_put_derives_the_id_from_its_own_seq() {
         BucketAnswer::Created {
             bucket: bucket_id(&w.t, 4),
             grant_seq: 4,
-            in_force: true
         }
     );
     assert_eq!(w.head(), 4);
@@ -2843,19 +2951,7 @@ async fn a_lost_grant_put_derives_the_id_from_its_own_seq() {
         vec!["b_01".to_owned(), bucket_id(&w.t, 4).as_str().to_owned()]
     );
     assert_eq!(buckets.calls.get(), 1, "only the grant it wrote is placed");
-}
-
-/// The entry of `id` at the chain's head (sync, from the planted store).
-fn read_entry(w: &World, id: &str) -> Entry {
-    let mut table = velmora_bridge::keys::record::KeyTable::empty(w.t.clone());
-    let chain = key_chain(&w.t);
-    let mut seq = 1;
-    while let Some(bytes) = w.store.raw(&chain.name(seq)) {
-        let record = open_key_record(&w.kek, &w.ring, &w.t, seq, &bytes).unwrap();
-        table.apply(&record).unwrap();
-        seq += 1;
-    }
-    table.get(id).unwrap().clone()
+    assert_eq!(adm.bucket_open.borrow()["ib2"].2, Some(4));
 }
 
 /// A put whose answer was lost is read back: the same bytes are this
@@ -2884,10 +2980,192 @@ async fn a_lost_answer_of_the_grant_put_is_read_back() {
         BucketAnswer::Created {
             bucket: bucket_id(&w.t, 3),
             grant_seq: 3,
-            in_force: true
         }
     );
     assert_eq!(w.head(), 3);
+}
+
+/// (Review H1.) `bucket_created` is recorded but every answer is lost:
+/// the call answers unfinished, and the retry under the same key places
+/// the bound grant's bucket again. One create, one bucket.
+#[tokio::test(flavor = "current_thread")]
+async fn a_retry_after_a_lost_placement_answer_places_no_second_bucket() {
+    let w = World::new();
+    let adm = FakeAdmission::new(&w.root);
+    let mut table = seed(&w, &adm).await;
+    let units = w.units();
+    let env = env!(w, &adm, &units);
+    let buckets = FakeBuckets::default();
+    let mut rng = TestRng(211);
+    buckets.lose_answers.set(MAX_ORDER_TRIES);
+    assert_eq!(
+        env.create_bucket(&buckets, &mut table, "ib11", &photos("PR0001"), &mut rng)
+            .await
+            .unwrap(),
+        BucketAnswer::Unfinished { grant_seq: 3 }
+    );
+    let id3 = bucket_id(&w.t, 3);
+    assert_eq!(
+        env.create_bucket(&buckets, &mut table, "ib11", &photos("PR0001"), &mut rng)
+            .await
+            .unwrap(),
+        BucketAnswer::Created {
+            bucket: id3.clone(),
+            grant_seq: 3,
+        }
+    );
+    assert_eq!(buckets.placed.borrow().len(), 1);
+    assert_eq!(w.head(), 3, "no second grant");
+    // A second call while the first is placed: the same bucket.
+    assert_eq!(
+        env.create_bucket(&buckets, &mut table, "ib11", &photos("PR0001"), &mut rng)
+            .await
+            .unwrap(),
+        BucketAnswer::Created {
+            bucket: id3,
+            grant_seq: 3,
+        }
+    );
+    assert_eq!(w.head(), 3);
+}
+
+/// (Review M1.) A placement that the directory or the unit has not
+/// acknowledged answers unfinished, not `200`; the retry answers it once
+/// it is in force.
+#[tokio::test(flavor = "current_thread")]
+async fn a_bucket_that_is_not_in_force_answers_unfinished() {
+    let w = World::new();
+    let adm = FakeAdmission::new(&w.root);
+    let mut table = seed(&w, &adm).await;
+    let units = w.units();
+    let env = env!(w, &adm, &units);
+    let buckets = FakeBuckets::default();
+    let mut rng = TestRng(212);
+    buckets.not_in_force.set(true);
+    assert_eq!(
+        env.create_bucket(&buckets, &mut table, "ib12", &photos("PR0001"), &mut rng)
+            .await
+            .unwrap(),
+        BucketAnswer::Unfinished { grant_seq: 3 }
+    );
+    buckets.not_in_force.set(false);
+    w.directory.down.set(true);
+    assert_eq!(
+        env.create_bucket(&buckets, &mut table, "ib12", &photos("PR0001"), &mut rng)
+            .await
+            .unwrap(),
+        BucketAnswer::Unfinished { grant_seq: 3 },
+        "the creator grant is not acknowledged by the directory"
+    );
+    w.directory.down.set(false);
+    assert_eq!(
+        env.create_bucket(&buckets, &mut table, "ib12", &photos("PR0001"), &mut rng)
+            .await
+            .unwrap(),
+        BucketAnswer::Created {
+            bucket: bucket_id(&w.t, 3),
+            grant_seq: 3,
+        }
+    );
+    assert_eq!(buckets.placed.borrow().len(), 1);
+}
+
+/// (Review M2.) The retry of a create whose grant was the creator's 64th,
+/// or whose creator was disabled since, is answered its bucket, not a
+/// refusal.
+#[tokio::test(flavor = "current_thread")]
+async fn a_retry_is_answered_its_bucket_whatever_the_creator_is_now() {
+    let w = World::new();
+    let adm = FakeAdmission::new(&w.root);
+    let mut table = seed(&w, &adm).await;
+    let units = w.units();
+    let env = env!(w, &adm, &units);
+    let buckets = FakeBuckets::default();
+    let mut rng = TestRng(213);
+    let many: Vec<Grant> = (0..63)
+        .map(|i| grant(&format!("b_{i:02}"), RW, None))
+        .collect();
+    assert!(matches!(
+        env.change(
+            &mut table,
+            "p63",
+            &KeyRequest::Create(principal("PR0063", &many)),
+            &mut rng
+        )
+        .await
+        .unwrap(),
+        KeyAnswer::Done { seq: 3 }
+    ));
+    buckets.not_in_force.set(true);
+    assert_eq!(
+        env.create_bucket(&buckets, &mut table, "ib13", &photos("PR0063"), &mut rng)
+            .await
+            .unwrap(),
+        BucketAnswer::Unfinished { grant_seq: 4 }
+    );
+    assert_eq!(head_grants(&w, "PR0063").await.len(), 64);
+    buckets.not_in_force.set(false);
+    let id4 = BucketAnswer::Created {
+        bucket: bucket_id(&w.t, 4),
+        grant_seq: 4,
+    };
+    assert_eq!(
+        env.create_bucket(&buckets, &mut table, "ib13", &photos("PR0063"), &mut rng)
+            .await
+            .unwrap(),
+        id4
+    );
+    assert!(matches!(
+        env.change(&mut table, "d", &disable("PR0063"), &mut rng)
+            .await
+            .unwrap(),
+        KeyAnswer::Done { .. }
+    ));
+    assert_eq!(
+        env.create_bucket(&buckets, &mut table, "ib13", &photos("PR0063"), &mut rng)
+            .await
+            .unwrap(),
+        id4
+    );
+    assert_eq!(buckets.placed.borrow().len(), 1);
+}
+
+/// (Review L3.) A grant on the id that K derives, held before the bucket
+/// exists by another subject, is dropped first: only the creator reaches
+/// the new bucket.
+#[tokio::test(flavor = "current_thread")]
+async fn a_grant_held_on_the_next_derived_id_is_dropped_first() {
+    let w = World::new();
+    let adm = FakeAdmission::new(&w.root);
+    let mut table = seed(&w, &adm).await;
+    let units = w.units();
+    let env = env!(w, &adm, &units);
+    let buckets = FakeBuckets::default();
+    let mut rng = TestRng(214);
+    // PR0002, made at seq 3, holds a grant on the id K = 4 would derive.
+    let id4 = bucket_id(&w.t, 4);
+    let early = principal("PR0002", &[grant(id4.as_str(), RW, None)]);
+    assert!(matches!(
+        env.change(&mut table, "p2", &KeyRequest::Create(early), &mut rng)
+            .await
+            .unwrap(),
+        KeyAnswer::Done { seq: 3 }
+    ));
+    let answer = env
+        .create_bucket(&buckets, &mut table, "ib14", &photos("PR0001"), &mut rng)
+        .await
+        .unwrap();
+    // 4 drops PR0002's grant; the creator grant is 5.
+    let id5 = bucket_id(&w.t, 5);
+    assert_eq!(
+        answer,
+        BucketAnswer::Created {
+            bucket: id5.clone(),
+            grant_seq: 5,
+        }
+    );
+    assert!(holders(&w, &id4).await.is_empty());
+    assert_eq!(holders(&w, &id5).await, vec!["PR0001".to_owned()]);
 }
 
 /// A create that loses the K order revokes its orphan grant with a
@@ -2918,7 +3196,6 @@ async fn a_create_that_loses_the_order_revokes_its_orphan_and_tries_again() {
         BucketAnswer::Created {
             bucket: id5.clone(),
             grant_seq: 5,
-            in_force: true
         }
     );
     // 3: the orphan grant; 4: its revoke (closing); 5: the new grant.
@@ -2934,11 +3211,12 @@ async fn a_create_that_loses_the_order_revokes_its_orphan_and_tries_again() {
         vec![grant("b_01", RW, None), grant(id5.as_str(), RW, None)]
     );
     assert_eq!(*adm.bucket_asks.borrow(), vec!["ib4", "ib4"]);
+    assert_eq!(adm.bucket_open.borrow()["ib4"].2, Some(5), "bound again");
     assert!(adm.released.borrow().is_empty());
 }
 
 /// After [`MAX_ORDER_TRIES`] lost orders the call answers busy, and no
-/// orphan grant is left.
+/// orphan grant is left. A retry does not place a lost one again.
 #[tokio::test(flavor = "current_thread")]
 async fn three_lost_orders_answer_busy_and_leave_no_orphan() {
     let w = World::new();
@@ -2947,19 +3225,15 @@ async fn three_lost_orders_answer_busy_and_leave_no_orphan() {
     let units = w.units();
     let env = env!(w, &adm, &units);
     let buckets = FakeBuckets::default();
+    let mut rng = TestRng(205);
     buckets.lose_orders.set(MAX_ORDER_TRIES);
     let answer = env
-        .create_bucket(
-            &buckets,
-            &mut table,
-            "ib5",
-            &photos("PR0001"),
-            &mut TestRng(205),
-        )
+        .create_bucket(&buckets, &mut table, "ib5", &photos("PR0001"), &mut rng)
         .await
         .unwrap();
     assert_eq!(answer, BucketAnswer::Busy);
-    assert_eq!(w.head(), 2 + 2 * u64::from(MAX_ORDER_TRIES));
+    let head = 2 + 2 * u64::from(MAX_ORDER_TRIES);
+    assert_eq!(w.head(), head);
     assert_eq!(head_grants(&w, "PR0001").await, vec!["b_01".to_owned()]);
     assert_eq!(
         joined(&w.root.row("PR0001").unwrap()),
@@ -2967,6 +3241,20 @@ async fn three_lost_orders_answer_busy_and_leave_no_orphan() {
     );
     assert!(buckets.placed.borrow().is_empty());
     assert_eq!(adm.bucket_asks.borrow().len(), MAX_ORDER_TRIES as usize);
+    // The retry: the bound seq lost (its revoke is in the head), so a
+    // new grant is written and placed.
+    let answer = env
+        .create_bucket(&buckets, &mut table, "ib5", &photos("PR0001"), &mut rng)
+        .await
+        .unwrap();
+    assert_eq!(
+        answer,
+        BucketAnswer::Created {
+            bucket: bucket_id(&w.t, head + 1),
+            grant_seq: head + 1,
+        }
+    );
+    assert_eq!(buckets.placed.borrow().len(), 1);
 }
 
 /// Any other refusal of `bucket_created` (here `restoring`) revokes the
@@ -3006,10 +3294,11 @@ async fn a_state_refusal_revokes_the_orphan_and_releases_the_reservation() {
     assert_eq!(*adm.released.borrow(), vec!["ib6".to_owned()]);
 }
 
-/// The creator is checked at the head before any reservation: it must
-/// exist, be an active principal and have room for one more grant.
+/// The creator is checked at the head: it must exist, be an active
+/// principal and have room for one more grant. A refusal after the
+/// reservation releases it.
 #[tokio::test(flavor = "current_thread")]
-async fn the_creator_is_checked_before_the_reservation() {
+async fn the_creator_is_checked_and_a_refusal_releases_the_reservation() {
     let w = World::new();
     let adm = FakeAdmission::new(&w.root);
     let mut table = seed(&w, &adm).await;
@@ -3041,15 +3330,15 @@ async fn the_creator_is_checked_before_the_reservation() {
         KeyAnswer::Done { .. }
     ));
     let head = w.head();
-    let asks = adm.bucket_asks.borrow().len();
     for (creator, refusal) in [
         ("PR0404", Refusal::NotFound),
         ("AKVL0001", Refusal::CreatorNotActive),
         ("PR0003", Refusal::CreatorNotActive),
         ("PR0064", Refusal::GrantCap),
     ] {
+        let key = format!("ib7-{creator}");
         assert_eq!(
-            env.create_bucket(&buckets, &mut table, "ib7", &photos(creator), &mut rng)
+            env.create_bucket(&buckets, &mut table, &key, &photos(creator), &mut rng)
                 .await
                 .unwrap(),
             BucketAnswer::Refused(refusal),
@@ -3059,8 +3348,9 @@ async fn the_creator_is_checked_before_the_reservation() {
     assert_eq!(Refusal::GrantCap.status(), 409);
     assert_eq!(Refusal::CreatorNotActive.status(), 403);
     assert_eq!(w.head(), head);
-    assert_eq!(adm.bucket_asks.borrow().len(), asks);
     assert_eq!(buckets.calls.get(), 0);
+    // Only the one the unit admitted held a reservation to release.
+    assert_eq!(*adm.released.borrow(), vec!["ib7-PR0064".to_owned()]);
 }
 
 /// A full bucket cap answers `429` before any record; a retry whose
@@ -3093,7 +3383,6 @@ async fn the_reservation_answers_the_cap_and_retries() {
         BucketAnswer::Created {
             bucket: bucket_id(&w.t, 7),
             grant_seq: 7,
-            in_force: true
         }
     );
     *adm.bucket_done.borrow_mut() = Some((bucket_id(&w.t, 8), 7));
@@ -3105,12 +3394,11 @@ async fn the_reservation_answers_the_cap_and_retries() {
     assert_eq!(buckets.calls.get(), 0);
 }
 
-/// With the tenant chain unreachable the grant is written and the call
-/// answers unfinished. The finisher leaves the grant while its bucket
-/// could still be placed, and revokes it once a later create makes it an
-/// orphan for good. It never places a bucket.
+/// The finisher decides every creator grant by its reservation: it
+/// places the bucket of an open bound one (the call that wrote it could
+/// not), and revokes one no open reservation is bound to.
 #[tokio::test(flavor = "current_thread")]
-async fn the_finisher_revokes_a_grant_whose_bucket_can_never_be_placed() {
+async fn the_finisher_places_a_bound_grant_and_revokes_an_unbound_one() {
     let w = World::new();
     let adm = FakeAdmission::new(&w.root);
     let mut table = seed(&w, &adm).await;
@@ -3118,6 +3406,8 @@ async fn the_finisher_revokes_a_grant_whose_bucket_can_never_be_placed() {
     let env = env!(w, &adm, &units);
     let buckets = FakeBuckets::default();
     let mut rng = TestRng(209);
+
+    // (a) The tenant chain is down for the call: grant 3, bound.
     buckets.down.set(true);
     assert_eq!(
         env.create_bucket(&buckets, &mut table, "ib9", &photos("PR0001"), &mut rng)
@@ -3125,61 +3415,94 @@ async fn the_finisher_revokes_a_grant_whose_bucket_can_never_be_placed() {
             .unwrap(),
         BucketAnswer::Unfinished { grant_seq: 3 }
     );
-    assert_eq!(w.head(), 3);
-    assert!(buckets.placed.borrow().is_empty());
+    let mut fin = table.clone();
+    assert!(
+        finish_creator_grant(&env, &buckets, &mut fin, 3, &mut rng)
+            .await
+            .is_err(),
+        "the tenant chain is still down: the message is retried"
+    );
     buckets.down.set(false);
-    let mut finisher_table = table.clone();
     assert_eq!(
-        finish_creator_grant(&env, &buckets, &mut finisher_table, 3, &mut rng)
+        finish_creator_grant(&env, &buckets, &mut fin, 3, &mut rng)
             .await
             .unwrap(),
-        CreatorGrant::Undecided
+        CreatorGrant::Placed
     );
-    // The caller's retry: a new grant at 4, placed.
-    let id4 = bucket_id(&w.t, 4);
+    assert_eq!(buckets.placed.borrow().len(), 1);
+    assert_eq!(buckets.placed.borrow()[0].3, 3);
+
+    // (b) The bind fails: grant 4 is never bound, so never placed.
+    adm.bind_down.set(true);
     assert_eq!(
-        env.create_bucket(&buckets, &mut table, "ib9", &photos("PR0001"), &mut rng)
+        env.create_bucket(&buckets, &mut table, "ib10", &photos("PR0001"), &mut rng)
             .await
             .unwrap(),
-        BucketAnswer::Created {
-            bucket: id4.clone(),
-            grant_seq: 4,
-            in_force: true
-        }
+        BucketAnswer::Unfinished { grant_seq: 4 }
     );
+    adm.bind_down.set(false);
     assert_eq!(
-        finish_creator_grant(&env, &buckets, &mut finisher_table, 3, &mut rng)
+        finish_creator_grant(&env, &buckets, &mut fin, 4, &mut rng)
             .await
             .unwrap(),
         CreatorGrant::Revoked { seq: 5 }
     );
-    assert_eq!(
-        head_grants(&w, "PR0001").await,
-        vec!["b_01".to_owned(), id4.as_str().to_owned()]
-    );
+    let id4 = bucket_id(&w.t, 4);
+    assert!(holders(&w, &id4).await.is_empty());
+    assert_eq!(buckets.placed.borrow().len(), 1);
     // Again: already revoked, nothing written.
     assert_eq!(
-        finish_creator_grant(&env, &buckets, &mut finisher_table, 3, &mut rng)
+        finish_creator_grant(&env, &buckets, &mut fin, 4, &mut rng)
             .await
             .unwrap(),
         CreatorGrant::Revoked { seq: 5 }
     );
     assert_eq!(w.head(), 5);
     for (seq, outcome) in [
-        (4, CreatorGrant::Placed),
+        (3, CreatorGrant::Placed),
         (2, CreatorGrant::NotOne),
         (5, CreatorGrant::NotOne),
         (9, CreatorGrant::NotOne),
     ] {
         assert_eq!(
-            finish_creator_grant(&env, &buckets, &mut finisher_table, seq, &mut rng)
+            finish_creator_grant(&env, &buckets, &mut fin, seq, &mut rng)
                 .await
                 .unwrap(),
             outcome,
             "seq {seq}"
         );
     }
-    assert_eq!(buckets.placed.borrow().len(), 1);
+}
+
+/// An open bound grant whose bucket the tenant chain refuses is revoked by
+/// the finisher, and its reservation released.
+#[tokio::test(flavor = "current_thread")]
+async fn the_finisher_revokes_a_bound_grant_the_tenant_chain_refuses() {
+    let w = World::new();
+    let adm = FakeAdmission::new(&w.root);
+    let mut table = seed(&w, &adm).await;
+    let units = w.units();
+    let env = env!(w, &adm, &units);
+    let buckets = FakeBuckets::default();
+    let mut rng = TestRng(215);
+    buckets.down.set(true);
+    assert_eq!(
+        env.create_bucket(&buckets, &mut table, "ib15", &photos("PR0001"), &mut rng)
+            .await
+            .unwrap(),
+        BucketAnswer::Unfinished { grant_seq: 3 }
+    );
+    buckets.down.set(false);
+    buckets.refuse.set(Some((409, "restoring")));
+    let mut fin = table.clone();
+    assert_eq!(
+        finish_creator_grant(&env, &buckets, &mut fin, 3, &mut rng)
+            .await
+            .unwrap(),
+        CreatorGrant::Revoked { seq: 4 }
+    );
+    assert_eq!(*adm.released.borrow(), vec!["ib15".to_owned()]);
+    assert!(holders(&w, &bucket_id(&w.t, 3)).await.is_empty());
 }
 
 /// `DropGrant` removes one bucket's grant and keeps every other one, at
