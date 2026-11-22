@@ -6,19 +6,19 @@
 use std::cell::Cell;
 
 use velmora_bridge::directory::chain::{record_key, TenantChain, Written};
-use velmora_bridge::directory::record::{TenantDoor, TenantId};
+use velmora_bridge::directory::record::{Tenant, TenantDoor};
 use velmora_bridge::directory::tenant_zero::{
     database_facts, decide, route_without_directory, DatabaseFacts, DirectoryAnswer, Lookup, Route,
     Seen, ZeroServe, ZeroWatch, CUTOVER_MARKER_KEY, RECHECK_MS,
 };
-use velmora_bridge::directory::testing::{MemRecords, PlainSeal};
+use velmora_bridge::directory::testing::{HookedRecords, PlainSeal};
 use velmora_bridge::directory::transition::{Actor, Change, RETIRE_AFTER_MS};
 use velmora_bridge::testkit::RusqliteSql;
 use velmora_bridge::{Sql, SqlValue, UnixMs};
 
 const NOW: UnixMs = UnixMs(1_800_000_000_000);
 
-type Chain<'a> = TenantChain<'a, MemRecords, PlainSeal>;
+type Chain<'a> = TenantChain<'a, HookedRecords, PlainSeal>;
 
 fn block_on<F: std::future::Future>(f: F) -> F::Output {
     tokio::runtime::Builder::new_current_thread()
@@ -27,13 +27,13 @@ fn block_on<F: std::future::Future>(f: F) -> F::Output {
         .block_on(f)
 }
 
-fn t1() -> TenantId {
-    TenantId::parse("t_00000000000000a1").unwrap()
+fn t1() -> Tenant {
+    Tenant::parse("t_00000000000000a1").unwrap()
 }
 
 /// Writes one change to tenant 0's chain and answers the new head.
 fn write(chain: &Chain<'_>, change: Change, actor: Actor, now: UnixMs) -> TenantDoor {
-    let w = block_on(chain.write(&TenantId::zero(), &change, actor, now, 0)).unwrap();
+    let w = block_on(chain.write(&Tenant::zero(), &change, actor, now, 0)).unwrap();
     let Written::Wrote(rec) = w else {
         panic!("{change:?}: {w:?}")
     };
@@ -101,7 +101,7 @@ fn fresh() -> Seen {
 
 #[test]
 fn the_selector_the_marker_and_the_catalogue_id_decide() {
-    let store = MemRecords::new();
+    let store = HookedRecords::new();
     let seal = PlainSeal::new();
     let chain = TenantChain {
         store: &store,
@@ -182,7 +182,7 @@ fn the_selector_the_marker_and_the_catalogue_id_decide() {
 /// would leave them.
 #[test]
 fn heads_that_no_transition_writes_are_refused() {
-    let store = MemRecords::new();
+    let store = HookedRecords::new();
     let seal = PlainSeal::new();
     let chain = TenantChain {
         store: &store,
@@ -226,7 +226,7 @@ fn heads_that_no_transition_writes_are_refused() {
 /// catalogue that an undo named.
 #[test]
 fn moved_stays_seen() {
-    let store = MemRecords::new();
+    let store = HookedRecords::new();
     let seal = PlainSeal::new();
     let chain = TenantChain {
         store: &store,
@@ -279,7 +279,7 @@ fn moved_stays_seen() {
 /// one listing, whatever it says, and reads it again when it moved.
 #[test]
 fn the_watch_rechecks_the_head_and_follows_the_move() {
-    let store = MemRecords::new();
+    let store = HookedRecords::new();
     let seal = PlainSeal::new();
     let chain = TenantChain {
         store: &store,
@@ -325,7 +325,7 @@ fn the_watch_rechecks_the_head_and_follows_the_move() {
 
 #[test]
 fn a_record_that_cannot_be_read_answers_503() {
-    let store = MemRecords::new();
+    let store = HookedRecords::new();
     let seal = PlainSeal::new();
     let chain = TenantChain {
         store: &store,
@@ -353,7 +353,7 @@ fn a_record_that_cannot_be_read_answers_503() {
     );
     // A record changed behind the chain's back: damage.
     store.fail_lists(false);
-    let key = record_key(&TenantId::zero(), 1);
+    let key = record_key(&Tenant::zero(), 1);
     let mut bytes = store.raw(&key).unwrap();
     bytes[0] ^= 1;
     store.plant(&key, bytes);
@@ -408,7 +408,7 @@ fn route(
     asked: &Asked,
     answer: DirectoryAnswer,
     zero: ZeroServe,
-    record: Lookup<TenantId>,
+    record: Lookup<Tenant>,
     held: Lookup<()>,
 ) -> Route {
     block_on(route_without_directory(
@@ -482,7 +482,7 @@ fn a_failed_directory_read_is_not_an_unknown_key() {
             Lookup::Absent,
             Lookup::Found(()),
         );
-        assert_eq!(r, Route::Tenant(TenantId::zero()));
+        assert_eq!(r, Route::Tenant(Tenant::zero()));
         // Not held, or the lookup failed: 503, never another tenant.
         for held in [Lookup::Absent, Lookup::Failed] {
             let r = route(&a, DirectoryAnswer::Failed, zero, Lookup::Absent, held);
@@ -515,7 +515,7 @@ fn a_failed_directory_read_is_not_an_unknown_key() {
 /// marker gone, it serves; with the marker still there it does not.
 #[test]
 fn the_fallback_undo_serves_the_thawed_frozen_catalogue() {
-    let store = MemRecords::new();
+    let store = HookedRecords::new();
     let seal = PlainSeal::new();
     let chain = TenantChain {
         store: &store,
@@ -549,7 +549,7 @@ fn the_fallback_undo_serves_the_thawed_frozen_catalogue() {
 /// the move already made is a database left behind.
 #[test]
 fn the_next_moves_marker_opens_a_window_and_an_old_one_is_left_behind() {
-    let store = MemRecords::new();
+    let store = HookedRecords::new();
     let seal = PlainSeal::new();
     let chain = TenantChain {
         store: &store,
@@ -571,7 +571,7 @@ fn the_next_moves_marker_opens_a_window_and_an_old_one_is_left_behind() {
     // The give-up of that window before its record: unchanged, and the
     // thawed catalogue serves again.
     let w = block_on(chain.write(
-        &TenantId::zero(),
+        &Tenant::zero(),
         &Change::GiveUpMove,
         Actor::MoveTool,
         NOW,
@@ -589,7 +589,7 @@ fn the_next_moves_marker_opens_a_window_and_an_old_one_is_left_behind() {
 /// once the database carries the marker, inside the interval too.
 #[test]
 fn a_cached_d1_head_meets_the_marker() {
-    let store = MemRecords::new();
+    let store = HookedRecords::new();
     let seal = PlainSeal::new();
     let chain = TenantChain {
         store: &store,
@@ -612,7 +612,7 @@ fn a_cached_d1_head_meets_the_marker() {
 /// reads only, never a page.
 #[test]
 fn a_given_up_second_window_serves_reads_until_the_thaw() {
-    let store = MemRecords::new();
+    let store = HookedRecords::new();
     let seal = PlainSeal::new();
     let chain = TenantChain {
         store: &store,
@@ -639,7 +639,7 @@ fn a_given_up_second_window_serves_reads_until_the_thaw() {
 /// d1 before the marker is cleared, and in between reads are served.
 #[test]
 fn a_first_window_given_up_serves_reads_until_the_thaw() {
-    let store = MemRecords::new();
+    let store = HookedRecords::new();
     let seal = PlainSeal::new();
     let chain = TenantChain {
         store: &store,
@@ -663,7 +663,7 @@ fn a_first_window_given_up_serves_reads_until_the_thaw() {
 /// flip it is a database left behind.
 #[test]
 fn a_stored_marker_is_read_back_and_judged_against_the_head() {
-    let store = MemRecords::new();
+    let store = HookedRecords::new();
     let seal = PlainSeal::new();
     let chain = TenantChain {
         store: &store,

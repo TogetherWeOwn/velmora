@@ -8,7 +8,7 @@
 //! for a route on a cache miss, by the management plane, and by the
 //! operator.
 
-use super::record::{TenantDoor, TenantId};
+use super::record::{Tenant, TenantDoor};
 use crate::ports::{Row, Sql, SqlValue};
 use crate::types::{BridgeError, Result, UnixMs};
 
@@ -20,7 +20,7 @@ pub struct SqlDirectory<'a, S> {
 /// A tenant row as stored.
 #[derive(Clone, Debug, PartialEq)]
 pub struct TenantRow {
-    pub id: TenantId,
+    pub id: Tenant,
     pub record_seq: u64,
     pub keys_seq: u64,
     pub door: TenantDoor,
@@ -77,7 +77,7 @@ impl RouteKind {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct KeyRoute {
     pub akid: String,
-    pub tenant: TenantId,
+    pub tenant: Tenant,
     pub kind: RouteKind,
     pub owner_ref: Option<String>,
     pub created_at: UnixMs,
@@ -136,7 +136,7 @@ impl ChainKind {
 /// A control change that is not yet applied everywhere.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PendingOp {
-    pub tenant: TenantId,
+    pub tenant: Tenant,
     pub chain: ChainKind,
     pub seq: u64,
     pub kind: String,
@@ -252,7 +252,7 @@ impl<S: Sql> SqlDirectory<'_, S> {
     }
 
     /// The seq column of `tenant`'s row as stored, `NULL` for no row.
-    pub async fn row_seq(&self, tenant: &TenantId) -> Result<RowSeq> {
+    pub async fn row_seq(&self, tenant: &Tenant) -> Result<RowSeq> {
         let rows = self
             .sql
             .query(
@@ -318,7 +318,7 @@ impl<S: Sql> SqlDirectory<'_, S> {
     /// The row of `tenant` as the gate reads it: a row that does not parse
     /// or whose columns disagree with its door is a row without a door,
     /// never an error, so that the gate can write it again.
-    pub async fn raw_tenant(&self, tenant: &TenantId) -> Result<Option<RawTenant>> {
+    pub async fn raw_tenant(&self, tenant: &Tenant) -> Result<Option<RawTenant>> {
         let rows = self
             .sql
             .query(
@@ -345,7 +345,7 @@ impl<S: Sql> SqlDirectory<'_, S> {
     }
 
     /// The row of `tenant`, `None` = no row.
-    pub async fn tenant(&self, tenant: &TenantId) -> Result<Option<TenantRow>> {
+    pub async fn tenant(&self, tenant: &Tenant) -> Result<Option<TenantRow>> {
         let rows = self
             .sql
             .query(
@@ -357,7 +357,7 @@ impl<S: Sql> SqlDirectory<'_, S> {
     }
 
     /// Up to `limit` tenant ids after `after`, in id order.
-    pub async fn tenant_ids(&self, after: &str, limit: u32) -> Result<Vec<TenantId>> {
+    pub async fn tenant_ids(&self, after: &str, limit: u32) -> Result<Vec<Tenant>> {
         let rows = self
             .sql
             .query(
@@ -369,14 +369,14 @@ impl<S: Sql> SqlDirectory<'_, S> {
             )
             .await?;
         rows.into_iter()
-            .map(|row| text(&row, 0).and_then(|s| TenantId::parse(&s).ok_or(ERR_ROW)))
+            .map(|row| text(&row, 0).and_then(|s| Tenant::parse(&s).ok_or(ERR_ROW)))
             .collect()
     }
 
     /// Removes a tenant row that no chain backs, with its units, routes
     /// and labels, if the row still holds the seq the gate saw. Only the
     /// gate calls this. `false` = the row changed, nothing was removed.
-    pub async fn remove_tenant(&self, tenant: &TenantId, observed: &RowSeq) -> Result<bool> {
+    pub async fn remove_tenant(&self, tenant: &Tenant, observed: &RowSeq) -> Result<bool> {
         if observed.0 == SqlValue::Null {
             return Ok(false);
         }
@@ -408,7 +408,7 @@ impl<S: Sql> SqlDirectory<'_, S> {
     }
 
     /// The unit rows of `tenant`, by unit number.
-    pub async fn units(&self, tenant: &TenantId) -> Result<Vec<UnitRow>> {
+    pub async fn units(&self, tenant: &Tenant) -> Result<Vec<UnitRow>> {
         let rows = self
             .sql
             .query(
@@ -430,7 +430,7 @@ impl<S: Sql> SqlDirectory<'_, S> {
     }
 
     /// Raises the tenant's key chain head; a lower seq changes nothing.
-    pub async fn raise_keys_seq(&self, tenant: &TenantId, keys_seq: u64) -> Result<bool> {
+    pub async fn raise_keys_seq(&self, tenant: &Tenant, keys_seq: u64) -> Result<bool> {
         let changed = self
             .sql
             .exec(
@@ -447,7 +447,7 @@ impl<S: Sql> SqlDirectory<'_, S> {
     /// meanwhile stays.
     pub async fn set_keys_seq(
         &self,
-        tenant: &TenantId,
+        tenant: &Tenant,
         keys_seq: u64,
         observed: u64,
     ) -> Result<bool> {
@@ -506,8 +506,8 @@ impl<S: Sql> SqlDirectory<'_, S> {
     /// fixes it for life.
     /// `false` = the route did not name `from`, the target has no live
     /// row, or neither or both of the two are tenant 0; nothing changed.
-    pub async fn move_route(&self, akid: &str, from: &TenantId, to: &TenantId) -> Result<bool> {
-        let zero = TenantId::zero();
+    pub async fn move_route(&self, akid: &str, from: &Tenant, to: &Tenant) -> Result<bool> {
+        let zero = Tenant::zero();
         if (*from == zero) == (*to == zero) {
             return Ok(false);
         }
@@ -540,7 +540,7 @@ impl<S: Sql> SqlDirectory<'_, S> {
             .map(|row| {
                 Ok(KeyRoute {
                     akid: text(&row, 0)?,
-                    tenant: TenantId::parse(&text(&row, 1)?).ok_or(ERR_ROW)?,
+                    tenant: Tenant::parse(&text(&row, 1)?).ok_or(ERR_ROW)?,
                     kind: RouteKind::parse(&text(&row, 2)?).ok_or(ERR_ROW)?,
                     owner_ref: match row.get(3) {
                         Some(SqlValue::Null) => None,
@@ -572,12 +572,7 @@ impl<S: Sql> SqlDirectory<'_, S> {
 
     /// Clears every pending operation of the chain up to `seq`: the
     /// finisher applies a chain up to its head, which covers them all.
-    pub async fn clear_pending(
-        &self,
-        tenant: &TenantId,
-        chain: ChainKind,
-        seq: u64,
-    ) -> Result<u64> {
+    pub async fn clear_pending(&self, tenant: &Tenant, chain: ChainKind, seq: u64) -> Result<u64> {
         self.sql
             .exec(
                 "DELETE FROM pending_ops WHERE tenant = ?1 AND chain = ?2 AND seq <= ?3",
@@ -604,7 +599,7 @@ impl<S: Sql> SqlDirectory<'_, S> {
         rows.into_iter()
             .map(|row| {
                 Ok(PendingOp {
-                    tenant: TenantId::parse(&text(&row, 0)?).ok_or(ERR_ROW)?,
+                    tenant: Tenant::parse(&text(&row, 0)?).ok_or(ERR_ROW)?,
                     chain: ChainKind::parse(&text(&row, 1)?).ok_or(ERR_ROW)?,
                     seq: u64::try_from(int_at(&row, 2)?).map_err(|_| ERR_ROW)?,
                     kind: text(&row, 3)?,
@@ -689,7 +684,7 @@ impl<S: Sql> SqlDirectory<'_, S> {
 }
 
 fn tenant_row(row: Row) -> Result<TenantRow> {
-    let id = TenantId::parse(&text(&row, 0)?).ok_or(ERR_ROW)?;
+    let id = Tenant::parse(&text(&row, 0)?).ok_or(ERR_ROW)?;
     let door: TenantDoor = serde_json::from_str(&text(&row, 3)?).map_err(|_| ERR_ROW)?;
     let record_seq = u64::try_from(int_at(&row, 1)?).map_err(|_| ERR_ROW)?;
     if door.tenant != id || door.seq != record_seq {

@@ -30,6 +30,7 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 use crate::types::UnixMs;
+use crate::TenantId;
 
 /// The version of the door and private part formats. A reader refuses
 /// any other: a gate that cannot apply a field must not guess it.
@@ -38,74 +39,107 @@ pub const RECORD_FORMAT: u32 = 1;
 /// The number of hex digits after `t_` in a tenant id.
 pub const TENANT_ID_HEX: usize = 16;
 
-/// A tenant id: `t_` and 16 lowercase hex digits. Tenant 0 is
-/// `t_0000000000000000`.
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+/// The owner of a tenant chain: tenant 0 (`t_0000000000000000`, scheme 1)
+/// or a managed tenant, whose id is the crate's one tenant id type,
+/// [`crate::TenantId`] (scheme 2). The directory names both, so it keeps
+/// tenant 0 apart in its own variant, as the control seal's
+/// [`crate::crypto::scheme2::ControlOwner`] does. Stored as the bare id.
+#[derive(Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
-pub struct TenantId(String);
-
-impl TenantId {
+pub enum Tenant {
     /// The tenant of every bucket that exists today.
-    pub fn zero() -> TenantId {
-        TenantId(crate::recovery::DEFAULT_TENANT.to_string())
+    Zero,
+    /// A managed tenant.
+    Managed(TenantId),
+}
+
+impl Tenant {
+    /// Tenant 0.
+    pub fn zero() -> Tenant {
+        Tenant::Zero
     }
 
     /// Parses a tenant id; `None` for anything but `t_` and 16 lowercase
     /// hex digits.
-    pub fn parse(id: &str) -> Option<TenantId> {
-        let hex = id.strip_prefix("t_")?;
-        let ok = hex.len() == TENANT_ID_HEX
-            && hex
-                .bytes()
-                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
-        ok.then(|| TenantId(id.to_string()))
+    pub fn parse(id: &str) -> Option<Tenant> {
+        if id == crate::recovery::DEFAULT_TENANT {
+            return Some(Tenant::Zero);
+        }
+        TenantId::parse(id).ok().map(Tenant::Managed)
     }
 
     /// From the 8 random bytes of a new tenant. All zero is tenant 0's id,
     /// which no new tenant may take: `None`.
-    pub fn from_random(bytes: [u8; 8]) -> Option<TenantId> {
-        if bytes == [0u8; 8] {
-            return None;
-        }
+    pub fn from_random(bytes: [u8; 8]) -> Option<Tenant> {
         let mut id = String::with_capacity(2 + TENANT_ID_HEX);
         id.push_str("t_");
         for b in bytes {
             id.push_str(&format!("{b:02x}"));
         }
-        Some(TenantId(id))
+        TenantId::parse(&id).ok().map(Tenant::Managed)
     }
 
     pub fn as_str(&self) -> &str {
-        &self.0
+        match self {
+            Tenant::Zero => crate::recovery::DEFAULT_TENANT,
+            Tenant::Managed(t) => t.as_str(),
+        }
     }
 
     pub fn is_zero(&self) -> bool {
-        self.0 == crate::recovery::DEFAULT_TENANT
+        matches!(self, Tenant::Zero)
+    }
+
+    /// The managed tenant's id; `None` for tenant 0.
+    pub fn managed(&self) -> Option<&TenantId> {
+        match self {
+            Tenant::Zero => None,
+            Tenant::Managed(t) => Some(t),
+        }
     }
 }
 
-impl fmt::Debug for TenantId {
+impl From<TenantId> for Tenant {
+    fn from(t: TenantId) -> Tenant {
+        Tenant::Managed(t)
+    }
+}
+
+// By the id, as the directory's rows and the chain's names sort.
+impl Ord for Tenant {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.as_str().cmp(other.as_str())
+    }
+}
+
+impl PartialOrd for Tenant {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl fmt::Debug for Tenant {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
+        f.write_str(self.as_str())
     }
 }
 
-impl fmt::Display for TenantId {
+impl fmt::Display for Tenant {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
+        f.write_str(self.as_str())
     }
 }
 
-impl TryFrom<String> for TenantId {
+impl TryFrom<String> for Tenant {
     type Error = &'static str;
     fn try_from(s: String) -> Result<Self, Self::Error> {
-        TenantId::parse(&s).ok_or("not a tenant id")
+        Tenant::parse(&s).ok_or("not a tenant id")
     }
 }
 
-impl From<TenantId> for String {
-    fn from(t: TenantId) -> String {
-        t.0
+impl From<Tenant> for String {
+    fn from(t: Tenant) -> String {
+        t.as_str().to_owned()
     }
 }
 
@@ -275,7 +309,7 @@ impl Selector {
 #[serde(deny_unknown_fields)]
 pub struct Move {
     /// The tenant that the data moves to.
-    pub to: TenantId,
+    pub to: Tenant,
     /// The catalogue id of the frozen D1 (`main`).
     pub catalogue_id_frozen: String,
     /// The legacy stamp's counter at the flip, once it happened.
@@ -350,7 +384,7 @@ pub struct BucketCreated {
 #[serde(deny_unknown_fields)]
 pub struct TenantDoor {
     pub v: u32,
-    pub tenant: TenantId,
+    pub tenant: Tenant,
     pub seq: u64,
     pub written_at: UnixMs,
     pub lifecycle: Lifecycle,
@@ -534,7 +568,7 @@ mod tests {
     fn door() -> TenantDoor {
         TenantDoor {
             v: RECORD_FORMAT,
-            tenant: TenantId::parse("t_00000000000000a1").unwrap(),
+            tenant: Tenant::parse("t_00000000000000a1").unwrap(),
             seq: 1,
             written_at: UnixMs(1),
             lifecycle: Lifecycle::Live,
@@ -565,9 +599,9 @@ mod tests {
 
     #[test]
     fn tenant_ids() {
-        assert!(TenantId::zero().is_zero());
-        assert_eq!(TenantId::zero().as_str(), "t_0000000000000000");
-        assert!(TenantId::parse("t_0123456789abcdef").is_some());
+        assert!(Tenant::zero().is_zero());
+        assert_eq!(Tenant::zero().as_str(), "t_0000000000000000");
+        assert!(Tenant::parse("t_0123456789abcdef").is_some());
         for bad in [
             "t_0123456789ABCDEF",
             "t_0123456789abcde",
@@ -577,15 +611,23 @@ mod tests {
             "",
             "t_",
         ] {
-            assert!(TenantId::parse(bad).is_none(), "{bad}");
+            assert!(Tenant::parse(bad).is_none(), "{bad}");
         }
-        assert_eq!(TenantId::from_random([0; 8]), None);
-        let t = TenantId::from_random([0xde, 0xad, 0, 1, 2, 3, 4, 0xff]).unwrap();
+        assert_eq!(Tenant::from_random([0; 8]), None);
+        let t = Tenant::from_random([0xde, 0xad, 0, 1, 2, 3, 4, 0xff]).unwrap();
         assert_eq!(t.as_str(), "t_dead0001020304ff");
         assert!(!t.is_zero());
         let json = serde_json::to_string(&t).unwrap();
         assert_eq!(json, "\"t_dead0001020304ff\"");
-        assert!(serde_json::from_str::<TenantId>("\"t_DEAD0001020304ff\"").is_err());
+        assert!(serde_json::from_str::<Tenant>("\"t_DEAD0001020304ff\"").is_err());
+        // Tenant 0 is its own variant; every other id is the crate's
+        // managed id, and both sort by the id.
+        assert_eq!(Tenant::parse("t_0000000000000000"), Some(Tenant::Zero));
+        assert_eq!(t.managed().map(|m| m.as_str()), Some("t_dead0001020304ff"));
+        assert_eq!(Tenant::zero().managed(), None);
+        assert!(Tenant::zero() < t);
+        let back: Tenant = serde_json::from_str("\"t_0000000000000000\"").unwrap();
+        assert!(back.is_zero());
     }
 
     #[test]
@@ -660,7 +702,7 @@ mod tests {
         let z = TenantZero {
             selector: Selector::Moved,
             moved: Some(Move {
-                to: TenantId::parse("t_00000000000000a1").unwrap(),
+                to: Tenant::parse("t_00000000000000a1").unwrap(),
                 catalogue_id_frozen: "main".into(),
                 stamp: Some(7),
                 flipped_at: Some(UnixMs(5)),

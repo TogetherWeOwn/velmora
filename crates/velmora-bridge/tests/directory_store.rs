@@ -5,13 +5,13 @@ use velmora_bridge::directory::gate::{
     StepReport, PENDING_ALARM_MS, PENDING_PAGE_MS,
 };
 use velmora_bridge::directory::record::{
-    DeletionReason, HoldMode, Lifecycle, OperatorReason, Placement, Restoring, TenantDoor,
-    TenantId, TenantState,
+    DeletionReason, HoldMode, Lifecycle, OperatorReason, Placement, Restoring, Tenant, TenantDoor,
+    TenantState,
 };
 use velmora_bridge::directory::store::{
     Applied, ChainKind, GateState, KeyRoute, PendingOp, RouteKind, RoutePut, SqlDirectory, UnitRow,
 };
-use velmora_bridge::directory::testing::{MemRecords, PlainSeal};
+use velmora_bridge::directory::testing::{HookedRecords, PlainSeal};
 use velmora_bridge::directory::transition::{Actor, Change, OperatorHoldRequest, KEY_CHECK_LEN};
 use velmora_bridge::testkit::RusqliteSql;
 use velmora_bridge::{Result, UnixMs};
@@ -27,7 +27,7 @@ const ROOT_UNIT: UnitRow = UnitRow {
     restoring_since: None,
 };
 
-type Chain<'a> = TenantChain<'a, MemRecords, PlainSeal>;
+type Chain<'a> = TenantChain<'a, HookedRecords, PlainSeal>;
 type Directory<'a> = SqlDirectory<'a, RusqliteSql>;
 
 fn block_on<F: std::future::Future>(f: F) -> F::Output {
@@ -48,7 +48,7 @@ fn database() -> RusqliteSql {
 
 async fn write(
     chain: &Chain<'_>,
-    tenant: &TenantId,
+    tenant: &Tenant,
     change: Change,
     actor: Actor,
     now: UnixMs,
@@ -64,7 +64,7 @@ async fn write(
     }
 }
 
-async fn active(chain: &Chain<'_>, tenant: &TenantId) {
+async fn active(chain: &Chain<'_>, tenant: &Tenant) {
     let mut known = 0;
     for change in [
         Change::Create {
@@ -90,7 +90,7 @@ async fn active(chain: &Chain<'_>, tenant: &TenantId) {
     }
 }
 
-async fn head(chain: &Chain<'_>, tenant: &TenantId) -> TenantDoor {
+async fn head(chain: &Chain<'_>, tenant: &Tenant) -> TenantDoor {
     chain.head(tenant, 0).await.unwrap().unwrap().door
 }
 
@@ -108,7 +108,7 @@ fn two_units(base_seq: u64) -> Change {
 
 async fn billing_hold(
     chain: &Chain<'_>,
-    tenant: &TenantId,
+    tenant: &Tenant,
     mode: Option<HoldMode>,
     known: u64,
 ) -> TenantDoor {
@@ -123,7 +123,7 @@ async fn billing_hold(
     .await
 }
 
-async fn create_zero(chain: &Chain<'_>, tenant: &TenantId) -> TenantDoor {
+async fn create_zero(chain: &Chain<'_>, tenant: &Tenant) -> TenantDoor {
     write(
         chain,
         tenant,
@@ -137,10 +137,10 @@ async fn create_zero(chain: &Chain<'_>, tenant: &TenantId) -> TenantDoor {
     .await
 }
 
-async fn populate_directory(chain: &Chain<'_>, dir: &Directory<'_>) -> [TenantId; 3] {
-    let a = TenantId::parse(A1).unwrap();
-    let b = TenantId::parse(B2).unwrap();
-    let zero = TenantId::zero();
+async fn populate_directory(chain: &Chain<'_>, dir: &Directory<'_>) -> [Tenant; 3] {
+    let a = Tenant::parse(A1).unwrap();
+    let b = Tenant::parse(B2).unwrap();
+    let zero = Tenant::zero();
     active(chain, &a).await;
     billing_hold(chain, &a, Some(HoldMode::ReadOnly), 4).await;
     active(chain, &b).await;
@@ -166,7 +166,7 @@ async fn populate_directory(chain: &Chain<'_>, dir: &Directory<'_>) -> [TenantId
     [a, b, zero]
 }
 
-fn pending(tenant: TenantId) -> PendingOp {
+fn pending(tenant: Tenant) -> PendingOp {
     PendingOp {
         tenant,
         chain: ChainKind::Tenant,
@@ -182,10 +182,10 @@ fn applying_a_tenant_copies_its_head() {
         let db = database();
         let dir = SqlDirectory { sql: &db };
         let chain = TenantChain {
-            store: &MemRecords::new(),
+            store: &HookedRecords::new(),
             seal: &PlainSeal::new(),
         };
-        let t = TenantId::parse(A1).unwrap();
+        let t = Tenant::parse(A1).unwrap();
         active(&chain, &t).await;
         let head = chain.head(&t, 0).await.unwrap().unwrap();
 
@@ -206,10 +206,10 @@ fn an_older_head_never_replaces_a_newer_one() {
         let db = database();
         let dir = SqlDirectory { sql: &db };
         let chain = TenantChain {
-            store: &MemRecords::new(),
+            store: &HookedRecords::new(),
             seal: &PlainSeal::new(),
         };
-        let t = TenantId::parse(A1).unwrap();
+        let t = Tenant::parse(A1).unwrap();
         active(&chain, &t).await;
         let current = head(&chain, &t).await;
         let older = chain.read(&t, 3).await.unwrap().unwrap().door;
@@ -236,10 +236,10 @@ fn unit_rows_follow_the_head() {
         let db = database();
         let dir = SqlDirectory { sql: &db };
         let chain = TenantChain {
-            store: &MemRecords::new(),
+            store: &HookedRecords::new(),
             seal: &PlainSeal::new(),
         };
-        let t = TenantId::parse(A1).unwrap();
+        let t = Tenant::parse(A1).unwrap();
         active(&chain, &t).await;
         assert_eq!(
             dir.apply_tenant(&head(&chain, &t).await, NOW)
@@ -326,11 +326,11 @@ fn a_shredded_tenant_keeps_its_row_and_loses_its_routes() {
         let db = database();
         let dir = SqlDirectory { sql: &db };
         let chain = TenantChain {
-            store: &MemRecords::new(),
+            store: &HookedRecords::new(),
             seal: &PlainSeal::new(),
         };
-        let t = TenantId::parse(A1).unwrap();
-        let other = TenantId::parse(B2).unwrap();
+        let t = Tenant::parse(A1).unwrap();
+        let other = Tenant::parse(B2).unwrap();
         for tenant in [&t, &other] {
             active(&chain, tenant).await;
             dir.apply_tenant(&head(&chain, tenant).await, NOW)
@@ -420,7 +420,7 @@ fn pending_operations_are_deduplicated_filtered_and_cleared() {
     block_on(async {
         let db = database();
         let dir = SqlDirectory { sql: &db };
-        let first = pending(TenantId::parse(A1).unwrap());
+        let first = pending(Tenant::parse(A1).unwrap());
         dir.add_pending(&first).await.unwrap();
         dir.add_pending(&first).await.unwrap();
         assert_eq!(dir.pending_before(FAR_FUTURE, 10).await.unwrap().len(), 1);
@@ -456,10 +456,10 @@ fn the_key_sequence_only_grows() {
         let db = database();
         let dir = SqlDirectory { sql: &db };
         let chain = TenantChain {
-            store: &MemRecords::new(),
+            store: &HookedRecords::new(),
             seal: &PlainSeal::new(),
         };
-        let t = TenantId::parse(A1).unwrap();
+        let t = Tenant::parse(A1).unwrap();
         active(&chain, &t).await;
         dir.apply_tenant(&head(&chain, &t).await, NOW)
             .await
@@ -476,7 +476,7 @@ fn the_gate_checks_epochs_and_admits_closing_calls() {
     block_on(async {
         let db = database();
         let dir = SqlDirectory { sql: &db };
-        let store = MemRecords::new();
+        let store = HookedRecords::new();
         assert_eq!(
             dir.gate().await.unwrap(),
             GateState {
@@ -526,7 +526,7 @@ fn the_gate_checks_epochs_and_admits_closing_calls() {
 #[test]
 fn a_restored_gate_row_does_not_open_the_gate() {
     block_on(async {
-        let store = MemRecords::new();
+        let store = HookedRecords::new();
         let db = database();
         let dir = SqlDirectory { sql: &db };
         let epoch = close(&store, &dir, "rebuild", NOW).await.unwrap();
@@ -562,7 +562,7 @@ fn a_wiped_directory_rebuilt_from_the_chains_equals_the_old_one() {
         let original_db = database();
         let original = SqlDirectory { sql: &original_db };
         let chain = TenantChain {
-            store: &MemRecords::new(),
+            store: &HookedRecords::new(),
             seal: &PlainSeal::new(),
         };
         let tenants = populate_directory(&chain, &original).await;
@@ -597,14 +597,14 @@ fn the_comparison_finds_behind_ahead_orphan_and_damaged_tenants() {
     block_on(async {
         let db = database();
         let dir = SqlDirectory { sql: &db };
-        let store = MemRecords::new();
+        let store = HookedRecords::new();
         let chain = TenantChain {
             store: &store,
             seal: &PlainSeal::new(),
         };
         let [a, b, _] = populate_directory(&chain, &dir).await;
-        let orphan = TenantId::parse("t_00000000000000c3").unwrap();
-        let damaged = TenantId::parse(D4).unwrap();
+        let orphan = Tenant::parse("t_00000000000000c3").unwrap();
+        let damaged = Tenant::parse(D4).unwrap();
 
         let old_a = head(&chain, &a).await;
         let new_a = billing_hold(&chain, &a, None, old_a.seq).await;
@@ -700,12 +700,12 @@ fn the_gate_opens_only_when_every_step_is_done_and_chains_are_intact() {
     block_on(async {
         let db = database();
         let dir = SqlDirectory { sql: &db };
-        let store = MemRecords::new();
+        let store = HookedRecords::new();
         let chain = TenantChain {
             store: &store,
             seal: &PlainSeal::new(),
         };
-        let t = TenantId::parse(A1).unwrap();
+        let t = Tenant::parse(A1).unwrap();
         active(&chain, &t).await;
         dir.add_pending(&pending(t)).await.unwrap();
 
@@ -738,14 +738,14 @@ fn the_gate_opens_only_when_every_step_is_done_and_chains_are_intact() {
 #[test]
 fn chain_tenants_lists_each_tenant_once_in_id_order() {
     block_on(async {
-        let store = MemRecords::new();
+        let store = HookedRecords::new();
         let chain = TenantChain {
             store: &store,
             seal: &PlainSeal::new(),
         };
-        let a = TenantId::parse(A1).unwrap();
-        let b = TenantId::parse(B2).unwrap();
-        let zero = TenantId::zero();
+        let a = Tenant::parse(A1).unwrap();
+        let b = Tenant::parse(B2).unwrap();
+        let zero = Tenant::zero();
         active(&chain, &b).await;
         active(&chain, &a).await;
         create_zero(&chain, &zero).await;
@@ -790,10 +790,10 @@ fn the_gate_does_not_overwrite_a_row_that_moved_on() {
         let db = database();
         let dir = SqlDirectory { sql: &db };
         let chain = TenantChain {
-            store: &MemRecords::new(),
+            store: &HookedRecords::new(),
             seal: &PlainSeal::new(),
         };
-        let t = TenantId::parse(A1).unwrap();
+        let t = Tenant::parse(A1).unwrap();
         active(&chain, &t).await;
         let old = head(&chain, &t).await;
         let no_row = dir.row_seq(&t).await.unwrap();
@@ -829,7 +829,7 @@ fn the_gate_does_not_overwrite_a_row_that_moved_on() {
 struct WritesDuringTheGate<'a> {
     chain: &'a Chain<'a>,
     dir: &'a Directory<'a>,
-    tenant: TenantId,
+    tenant: Tenant,
     apply: bool,
 }
 
@@ -893,13 +893,13 @@ fn a_record_written_while_the_gate_runs_is_in_the_rows_when_it_opens() {
         block_on(async {
             let db = database();
             let dir = SqlDirectory { sql: &db };
-            let store = MemRecords::new();
+            let store = HookedRecords::new();
             let seal = PlainSeal::new();
             let chain = TenantChain {
                 store: &store,
                 seal: &seal,
             };
-            let t = TenantId::parse(A1).unwrap();
+            let t = Tenant::parse(A1).unwrap();
             active(&chain, &t).await;
             let steps = WritesDuringTheGate {
                 chain: &chain,
@@ -927,11 +927,11 @@ fn a_damaged_row_is_rewritten_by_the_gate() {
         let db = database();
         let dir = SqlDirectory { sql: &db };
         let chain = TenantChain {
-            store: &MemRecords::new(),
+            store: &HookedRecords::new(),
             seal: &PlainSeal::new(),
         };
-        let a = TenantId::parse(A1).unwrap();
-        let b = TenantId::parse(B2).unwrap();
+        let a = Tenant::parse(A1).unwrap();
+        let b = Tenant::parse(B2).unwrap();
         for t in [&a, &b] {
             active(&chain, t).await;
             dir.apply_tenant(&head(&chain, t).await, NOW).await.unwrap();
@@ -966,13 +966,13 @@ fn a_damaged_row_is_rewritten_by_the_gate() {
 #[test]
 fn a_stray_name_inside_a_chain_does_not_stall_the_listing() {
     block_on(async {
-        let store = MemRecords::new();
+        let store = HookedRecords::new();
         let chain = TenantChain {
             store: &store,
             seal: &PlainSeal::new(),
         };
-        let a = TenantId::parse(A1).unwrap();
-        let b = TenantId::parse(B2).unwrap();
+        let a = Tenant::parse(A1).unwrap();
+        let b = Tenant::parse(B2).unwrap();
         active(&chain, &a).await;
         active(&chain, &b).await;
         for stray in ["~x", "\u{7f}", "\u{e9}"] {
@@ -999,7 +999,7 @@ fn a_route_needs_a_tenant_that_is_not_shredded() {
         let dir = SqlDirectory { sql: &db };
         let route = KeyRoute {
             akid: "APVL2".into(),
-            tenant: TenantId::parse(A1).unwrap(),
+            tenant: Tenant::parse(A1).unwrap(),
             kind: RouteKind::AppPassword,
             owner_ref: None,
             created_at: NOW,
@@ -1007,7 +1007,7 @@ fn a_route_needs_a_tenant_that_is_not_shredded() {
         assert_eq!(dir.put_route(&route).await.unwrap(), RoutePut::NoTenant);
         assert_eq!(dir.route("APVL2").await.unwrap(), None);
         let chain = TenantChain {
-            store: &MemRecords::new(),
+            store: &HookedRecords::new(),
             seal: &PlainSeal::new(),
         };
         active(&chain, &route.tenant).await;
@@ -1029,10 +1029,10 @@ fn the_gate_sets_the_key_seq_lower_too() {
         let db = database();
         let dir = SqlDirectory { sql: &db };
         let chain = TenantChain {
-            store: &MemRecords::new(),
+            store: &HookedRecords::new(),
             seal: &PlainSeal::new(),
         };
-        let t = TenantId::parse(A1).unwrap();
+        let t = Tenant::parse(A1).unwrap();
         active(&chain, &t).await;
         dir.apply_tenant(&head(&chain, &t).await, NOW)
             .await
@@ -1053,10 +1053,10 @@ fn another_door_at_the_same_seq_changes_no_unit_row() {
         let db = database();
         let dir = SqlDirectory { sql: &db };
         let chain = TenantChain {
-            store: &MemRecords::new(),
+            store: &HookedRecords::new(),
             seal: &PlainSeal::new(),
         };
-        let t = TenantId::parse(A1).unwrap();
+        let t = Tenant::parse(A1).unwrap();
         active(&chain, &t).await;
         let door = head(&chain, &t).await;
         dir.apply_tenant(&door, NOW).await.unwrap();
@@ -1080,7 +1080,7 @@ fn another_door_at_the_same_seq_changes_no_unit_row() {
 #[test]
 fn the_open_check_is_one_short_listing_and_strays_keep_it_closed() {
     block_on(async {
-        let store = MemRecords::new();
+        let store = HookedRecords::new();
         let db = database();
         let dir = SqlDirectory { sql: &db };
         for _ in 0..5 {
@@ -1113,11 +1113,11 @@ fn rows_that_do_not_read_are_written_again() {
         let db = database();
         let dir = SqlDirectory { sql: &db };
         let chain = TenantChain {
-            store: &MemRecords::new(),
+            store: &HookedRecords::new(),
             seal: &PlainSeal::new(),
         };
-        let a = TenantId::parse(A1).unwrap();
-        let b = TenantId::parse(B2).unwrap();
+        let a = Tenant::parse(A1).unwrap();
+        let b = Tenant::parse(B2).unwrap();
         for t in [&a, &b] {
             active(&chain, t).await;
             dir.apply_tenant(&head(&chain, t).await, NOW).await.unwrap();
@@ -1142,7 +1142,7 @@ fn rows_that_do_not_read_are_written_again() {
 /// Gate steps whose finisher sees another run close the gate over this
 /// one.
 struct ClosedOver<'a> {
-    store: &'a MemRecords,
+    store: &'a HookedRecords,
     dir: &'a Directory<'a>,
     counted: std::cell::Cell<bool>,
 }
@@ -1188,7 +1188,7 @@ fn a_run_that_another_closed_over_stops_before_the_counters() {
     block_on(async {
         let db = database();
         let dir = SqlDirectory { sql: &db };
-        let store = MemRecords::new();
+        let store = HookedRecords::new();
         let seal = PlainSeal::new();
         let chain = TenantChain {
             store: &store,
@@ -1216,7 +1216,7 @@ fn a_stray_anchor_keeps_the_run_from_saying_it_opened() {
     block_on(async {
         let db = database();
         let dir = SqlDirectory { sql: &db };
-        let store = MemRecords::new();
+        let store = HookedRecords::new();
         let chain = TenantChain {
             store: &store,
             seal: &PlainSeal::new(),
@@ -1244,8 +1244,8 @@ fn pending_operations_are_emptied_only_by_the_run_that_holds_the_gate() {
     block_on(async {
         let db = database();
         let dir = SqlDirectory { sql: &db };
-        let store = MemRecords::new();
-        let op = pending(TenantId::parse(A1).unwrap());
+        let store = HookedRecords::new();
+        let op = pending(Tenant::parse(A1).unwrap());
         dir.add_pending(&op).await.unwrap();
         let e1 = close(&store, &dir, "first", NOW).await.unwrap();
         let e2 = close(&store, &dir, "second", NOW).await.unwrap();
@@ -1266,12 +1266,12 @@ fn a_route_moves_only_from_the_tenant_it_names() {
         let db = database();
         let dir = SqlDirectory { sql: &db };
         let chain = TenantChain {
-            store: &MemRecords::new(),
+            store: &HookedRecords::new(),
             seal: &PlainSeal::new(),
         };
-        let zero = TenantId::zero();
-        let owner = TenantId::parse(A1).unwrap();
-        let other = TenantId::parse(B2).unwrap();
+        let zero = Tenant::zero();
+        let owner = Tenant::parse(A1).unwrap();
+        let other = Tenant::parse(B2).unwrap();
         create_zero(&chain, &zero).await;
         active(&chain, &owner).await;
         active(&chain, &other).await;
@@ -1313,10 +1313,10 @@ fn a_route_kind_must_fit_its_id() {
         let db = database();
         let dir = SqlDirectory { sql: &db };
         let chain = TenantChain {
-            store: &MemRecords::new(),
+            store: &HookedRecords::new(),
             seal: &PlainSeal::new(),
         };
-        let owner = TenantId::parse(A1).unwrap();
+        let owner = Tenant::parse(A1).unwrap();
         active(&chain, &owner).await;
         dir.apply_tenant(&head(&chain, &owner).await, NOW)
             .await
@@ -1344,12 +1344,12 @@ fn a_route_kind_must_fit_its_id() {
 #[test]
 fn a_bare_tenant_name_is_a_stray() {
     block_on(async {
-        let store = MemRecords::new();
+        let store = HookedRecords::new();
         let chain = TenantChain {
             store: &store,
             seal: &PlainSeal::new(),
         };
-        let a = TenantId::parse(A1).unwrap();
+        let a = Tenant::parse(A1).unwrap();
         active(&chain, &a).await;
         store.plant(&format!("m/t/{A1}"), vec![1]);
         assert!(chain_tenants(&store).await.is_err());

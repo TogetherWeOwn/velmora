@@ -7,8 +7,9 @@ use std::collections::BTreeMap;
 
 use zeroize::Zeroizing;
 
-use super::chain::{ControlSeal, OpenedParts, RecordStore, SealError};
-use super::record::TenantId;
+use super::chain::{ControlSeal, OpenedParts, SealError};
+use super::record::Tenant;
+use crate::records::RecordStore;
 use crate::types::{BridgeError, Result};
 
 /// A hook that sees the store's objects just before a put.
@@ -17,14 +18,14 @@ type PutHook = Box<dyn FnMut(&str, &mut BTreeMap<String, Vec<u8>>)>;
 /// In-memory [`RecordStore`]. A hook can run just before a put, so that a
 /// test can let another writer take the seq first.
 #[derive(Default)]
-pub struct MemRecords {
+pub struct HookedRecords {
     objects: RefCell<BTreeMap<String, Vec<u8>>>,
     before_put: RefCell<Option<PutHook>>,
     fail_lists: Cell<bool>,
     lists: Cell<u64>,
 }
 
-impl MemRecords {
+impl HookedRecords {
     pub fn new() -> Self {
         Self::default()
     }
@@ -63,7 +64,7 @@ impl MemRecords {
     }
 }
 
-impl RecordStore for MemRecords {
+impl RecordStore for HookedRecords {
     async fn put_if_absent(&self, key: &str, bytes: Vec<u8>) -> Result<bool> {
         if let Some(hook) = self.before_put.borrow_mut().as_mut() {
             hook(key, &mut self.objects.borrow_mut());
@@ -158,7 +159,7 @@ impl ControlSeal for PlainSeal {
     fn seal(
         &self,
         name: &str,
-        tenant: &TenantId,
+        tenant: &Tenant,
         key_version: u32,
         door: &[u8],
         private: &[u8],
@@ -178,7 +179,7 @@ impl ControlSeal for PlainSeal {
     fn open(
         &self,
         name: &str,
-        tenant: &TenantId,
+        tenant: &Tenant,
         sealed: &[u8],
     ) -> std::result::Result<OpenedParts, SealError> {
         let bad = |_| SealError::Damaged;

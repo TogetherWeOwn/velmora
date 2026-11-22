@@ -6,8 +6,8 @@ use crate::directory::record::{S3Access, TenantState};
 const DAY: i64 = 24 * 3_600_000;
 const NOW: UnixMs = UnixMs(1_800_000_000_000);
 
-fn t1() -> TenantId {
-    TenantId::parse("t_00000000000000a1").unwrap()
+fn t1() -> Tenant {
+    Tenant::parse("t_00000000000000a1").unwrap()
 }
 
 /// The commit of `version` with the check value of a test key.
@@ -181,7 +181,7 @@ fn creation_runs_provisioning_claim_commit_active() {
 
 #[test]
 fn tenant_zero_has_its_own_first_record() {
-    let zero = TenantId::zero();
+    let zero = Tenant::zero();
     let create_zero = Change::CreateTenantZero {
         jurisdiction: "us".into(),
     };
@@ -1000,7 +1000,7 @@ fn each_record_is_the_next_seq_of_its_head() {
     assert_eq!(b.door.seq, a.door.seq + 1);
     assert_eq!(b.door.written_at, NOW);
     // A head of another tenant is refused.
-    let other = TenantId::parse("t_00000000000000b2").unwrap();
+    let other = Tenant::parse("t_00000000000000b2").unwrap();
     assert_eq!(
         next(&other, Some(&a), &billing_hold(None), Actor::Billing, NOW),
         Err(INVALID)
@@ -1105,7 +1105,7 @@ fn closing_and_opening_order() {
 
 fn tenant_zero() -> TenantRecord {
     let Ok(Outcome::Next(z)) = next(
-        &TenantId::zero(),
+        &Tenant::zero(),
         None,
         &Change::CreateTenantZero {
             jurisdiction: "us".into(),
@@ -1548,7 +1548,7 @@ fn the_move_of_tenant_zero_runs_its_window_flip_and_retirement() {
         refused(
             &z,
             Change::StartMove {
-                to: TenantId::zero(),
+                to: Tenant::zero(),
                 catalogue_id_frozen: "main".into()
             },
             Actor::MoveTool
@@ -1565,7 +1565,7 @@ fn the_move_of_tenant_zero_runs_its_window_flip_and_retirement() {
         refused(
             &m,
             Change::StartMove {
-                to: TenantId::parse("t_00000000000000b2").unwrap(),
+                to: Tenant::parse("t_00000000000000b2").unwrap(),
                 catalogue_id_frozen: "main".into()
             },
             Actor::MoveTool
@@ -1603,7 +1603,7 @@ fn the_move_of_tenant_zero_runs_its_window_flip_and_retirement() {
     );
     let later = UnixMs(NOW.0 + RETIRE_AFTER_MS);
     let Ok(Outcome::Next(retired)) = next(
-        &TenantId::zero(),
+        &Tenant::zero(),
         Some(&flipped),
         &Change::RetireTenantZero,
         Actor::MoveTool,

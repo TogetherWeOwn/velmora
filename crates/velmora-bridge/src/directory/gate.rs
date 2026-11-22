@@ -41,10 +41,11 @@
 
 use std::collections::BTreeMap;
 
-use super::chain::{ChainError, ControlSeal, RecordStore, TenantChain, TENANT_CHAIN_PREFIX};
-use super::record::{TenantDoor, TenantId};
+use super::chain::{ChainError, ControlSeal, TenantChain, TENANT_CHAIN_PREFIX};
+use super::record::{Tenant, TenantDoor};
 use super::store::SqlDirectory;
 use crate::ports::Sql;
+use crate::records::RecordStore;
 use crate::types::{BridgeError, Result, UnixMs};
 
 /// A management call that passes a closed gate.
@@ -74,32 +75,29 @@ pub fn admitted(closed: bool, call: ManagementCall) -> bool {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Difference {
     /// A chain with no row.
-    Missing(TenantId),
+    Missing(Tenant),
     /// A row behind its head.
     Behind {
-        tenant: TenantId,
+        tenant: Tenant,
         row_seq: u64,
         head_seq: u64,
     },
     /// A row ahead of its head: the row names a record that is not in R2.
     Ahead {
-        tenant: TenantId,
+        tenant: Tenant,
         row_seq: u64,
         head_seq: u64,
     },
     /// A row at the head's seq that does not say what the head says, or
     /// whose columns disagree with its own door.
-    Changed(TenantId),
+    Changed(Tenant),
     /// A row that does not parse or names another tenant or seq.
-    Unreadable(TenantId),
+    Unreadable(Tenant),
     /// A row that no chain backs.
-    Orphan(TenantId),
+    Orphan(Tenant),
     /// A chain that does not read: missing record, stray name, a record
     /// that names another tenant or seq.
-    Damaged {
-        tenant: TenantId,
-        what: &'static str,
-    },
+    Damaged { tenant: Tenant, what: &'static str },
 }
 
 /// What the tenant step did.
@@ -327,8 +325,8 @@ pub async fn is_open<S: RecordStore, Q: Sql>(store: &S, dir: &SqlDirectory<'_, Q
 
 /// Every tenant id that has a chain, in id order: one listing call per
 /// tenant, each starting after the last tenant's whole chain.
-pub async fn chain_tenants<S: RecordStore>(store: &S) -> Result<Vec<TenantId>> {
-    let mut out: Vec<TenantId> = Vec::new();
+pub async fn chain_tenants<S: RecordStore>(store: &S) -> Result<Vec<Tenant>> {
+    let mut out: Vec<Tenant> = Vec::new();
     let mut after = String::new();
     loop {
         let keys = store.list(TENANT_CHAIN_PREFIX, &after, 1).await?;
@@ -340,7 +338,7 @@ pub async fn chain_tenants<S: RecordStore>(store: &S) -> Result<Vec<TenantId>> {
             // A record name has a `/` after the tenant id; a bare
             // `m/t/<tenant>` is a stray name.
             .and_then(|rest| rest.split_once('/').map(|(tenant, _)| tenant))
-            .and_then(TenantId::parse)
+            .and_then(Tenant::parse)
             .ok_or(BridgeError::Invalid("stray name under the tenant chains"))?;
         if out.last().is_some_and(|last| *last >= tenant) {
             return Err(BridgeError::Invalid("tenant chains out of order"));
@@ -352,7 +350,7 @@ pub async fn chain_tenants<S: RecordStore>(store: &S) -> Result<Vec<TenantId>> {
 }
 
 /// Every tenant id that has a row, in id order.
-async fn row_tenants<S: Sql>(dir: &SqlDirectory<'_, S>) -> Result<Vec<TenantId>> {
+async fn row_tenants<S: Sql>(dir: &SqlDirectory<'_, S>) -> Result<Vec<Tenant>> {
     let mut out = Vec::new();
     let mut after = String::new();
     loop {
@@ -369,7 +367,7 @@ async fn row_tenants<S: Sql>(dir: &SqlDirectory<'_, S>) -> Result<Vec<TenantId>>
     }
 }
 
-type Heads = Vec<(TenantId, std::result::Result<TenantDoor, &'static str>)>;
+type Heads = Vec<(Tenant, std::result::Result<TenantDoor, &'static str>)>;
 
 /// The head door of every chain, or the damage that kept it from reading.
 async fn heads<S: RecordStore, C: ControlSeal>(chain: &TenantChain<'_, S, C>) -> Result<Heads> {
@@ -396,7 +394,7 @@ async fn heads<S: RecordStore, C: ControlSeal>(chain: &TenantChain<'_, S, C>) ->
 struct Compared {
     differences: Vec<Difference>,
     /// The seq of each row as read, `None` for no row.
-    observed: BTreeMap<TenantId, Option<u64>>,
+    observed: BTreeMap<Tenant, Option<u64>>,
 }
 
 /// Compares every tenant row with its chain head. Read-only: the nightly

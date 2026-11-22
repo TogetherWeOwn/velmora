@@ -8,8 +8,8 @@ use velmora_bridge::directory::chain::{
     record_key, ChainError, ControlSeal, TenantChain, Written, MAX_PUT_TRIES,
 };
 use velmora_bridge::directory::record::DeletionReason;
-use velmora_bridge::directory::record::{HoldMode, OperatorReason, TenantId, TenantState};
-use velmora_bridge::directory::testing::{MemRecords, PlainSeal};
+use velmora_bridge::directory::record::{HoldMode, OperatorReason, Tenant, TenantState};
+use velmora_bridge::directory::testing::{HookedRecords, PlainSeal};
 use velmora_bridge::directory::transition::{
     next, Actor, Change, OperatorHoldRequest, Outcome, KEY_CHECK_LEN,
 };
@@ -18,8 +18,8 @@ use velmora_bridge::UnixMs;
 const NOW: UnixMs = UnixMs(1_800_000_000_000);
 const DAY: i64 = 24 * 3_600_000;
 
-fn t1() -> TenantId {
-    TenantId::parse("t_00000000000000a1").unwrap()
+fn t1() -> Tenant {
+    Tenant::parse("t_00000000000000a1").unwrap()
 }
 
 fn block_on<F: std::future::Future>(f: F) -> F::Output {
@@ -59,7 +59,7 @@ fn delete(key: u8) -> Change {
 }
 
 /// Creates t1 and takes it to `active`: 4 records.
-async fn active(chain: &TenantChain<'_, MemRecords, PlainSeal>) {
+async fn active(chain: &TenantChain<'_, HookedRecords, PlainSeal>) {
     let t = t1();
     for change in [
         create(),
@@ -85,7 +85,7 @@ async fn active(chain: &TenantChain<'_, MemRecords, PlainSeal>) {
 /// The sealed bytes of the record that `change` makes on top of the head
 /// of `store`, as a second writer would put them.
 fn competitor(
-    store: &MemRecords,
+    store: &HookedRecords,
     seal: &PlainSeal,
     change: Change,
     actor: Actor,
@@ -110,7 +110,7 @@ fn competitor(
 
 #[test]
 fn records_are_put_once_at_the_next_seq() {
-    let store = MemRecords::new();
+    let store = HookedRecords::new();
     let seal = PlainSeal::new();
     let chain = TenantChain {
         store: &store,
@@ -140,7 +140,7 @@ fn records_are_put_once_at_the_next_seq() {
 
 #[test]
 fn a_change_the_head_carries_writes_nothing() {
-    let store = MemRecords::new();
+    let store = HookedRecords::new();
     let seal = PlainSeal::new();
     let chain = TenantChain {
         store: &store,
@@ -163,7 +163,7 @@ fn a_change_the_head_carries_writes_nothing() {
 
 #[test]
 fn a_refused_change_writes_nothing() {
-    let store = MemRecords::new();
+    let store = HookedRecords::new();
     let seal = PlainSeal::new();
     let chain = TenantChain {
         store: &store,
@@ -186,7 +186,7 @@ fn a_refused_change_writes_nothing() {
 /// change lands at the seq after the winner's.
 #[test]
 fn the_loser_of_a_race_is_validated_again_on_the_new_head() {
-    let store = MemRecords::new();
+    let store = HookedRecords::new();
     let seal = PlainSeal::new();
     let chain = TenantChain {
         store: &store,
@@ -228,7 +228,7 @@ fn the_loser_of_a_race_is_validated_again_on_the_new_head() {
 /// refused and is never written at seq + 1.
 #[test]
 fn a_loser_that_is_no_longer_valid_is_refused() {
-    let store = MemRecords::new();
+    let store = HookedRecords::new();
     let seal = PlainSeal::new();
     let chain = TenantChain {
         store: &store,
@@ -261,7 +261,7 @@ fn a_loser_that_is_no_longer_valid_is_refused() {
 /// refused, instead of writing its placements over the new bucket's.
 #[test]
 fn a_whole_field_change_never_erases_a_concurrent_bucket() {
-    let store = MemRecords::new();
+    let store = HookedRecords::new();
     let seal = PlainSeal::new();
     let chain = TenantChain {
         store: &store,
@@ -322,7 +322,7 @@ fn a_whole_field_change_never_erases_a_concurrent_bucket() {
 
 #[test]
 fn a_writer_that_keeps_losing_answers_busy() {
-    let store = MemRecords::new();
+    let store = HookedRecords::new();
     let seal = PlainSeal::new();
     let chain = TenantChain {
         store: &store,
@@ -366,10 +366,10 @@ fn a_writer_that_keeps_losing_answers_busy() {
 #[test]
 fn a_damaged_chain_is_refused() {
     let seal = PlainSeal::new();
-    let t2 = TenantId::parse("t_00000000000000b2").unwrap();
+    let t2 = Tenant::parse("t_00000000000000b2").unwrap();
 
     // A gap.
-    let store = MemRecords::new();
+    let store = HookedRecords::new();
     let chain = TenantChain {
         store: &store,
         seal: &seal,
@@ -395,7 +395,7 @@ fn a_damaged_chain_is_refused() {
 
     // A record of t1 under t2's name: the seal refuses it, and a seal
     // that would open it still finds the door naming another tenant.
-    let store = MemRecords::new();
+    let store = HookedRecords::new();
     let chain = TenantChain {
         store: &store,
         seal: &seal,
@@ -435,7 +435,7 @@ fn a_damaged_chain_is_refused() {
         matches!(r, Err(ChainError::Damaged("known_above_head"))),
         "{r:?}"
     );
-    let r = block_on(chain.head_seq(&TenantId::parse("t_00000000000000e5").unwrap(), 7));
+    let r = block_on(chain.head_seq(&Tenant::parse("t_00000000000000e5").unwrap(), 7));
     assert!(
         matches!(r, Err(ChainError::Damaged("known_above_head"))),
         "{r:?}"
@@ -446,7 +446,7 @@ fn a_damaged_chain_is_refused() {
 
 #[test]
 fn a_head_whose_private_part_does_not_open_takes_no_record() {
-    let store = MemRecords::new();
+    let store = HookedRecords::new();
     let seal = PlainSeal::new();
     let chain = TenantChain {
         store: &store,
@@ -469,7 +469,7 @@ fn a_head_whose_private_part_does_not_open_takes_no_record() {
 
 #[test]
 fn the_head_is_found_across_listing_pages() {
-    let store = MemRecords::new();
+    let store = HookedRecords::new();
     let seal = PlainSeal::new();
     let chain = TenantChain {
         store: &store,
@@ -506,7 +506,7 @@ fn the_head_is_found_across_listing_pages() {
 /// is sealed with no tenant key and reads back as the head.
 #[test]
 fn the_shredded_stub_needs_no_tenant_key() {
-    let store = MemRecords::new();
+    let store = HookedRecords::new();
     let seal = PlainSeal::new();
     let chain = TenantChain {
         store: &store,
@@ -555,7 +555,7 @@ fn the_shredded_stub_needs_no_tenant_key() {
 /// the store.
 #[test]
 fn a_record_that_does_not_open_is_damage() {
-    let store = MemRecords::new();
+    let store = HookedRecords::new();
     let seal = PlainSeal::new();
     let chain = TenantChain {
         store: &store,
@@ -576,7 +576,7 @@ fn a_record_that_does_not_open_is_damage() {
 /// is the head. Any other record alone above a gap is damage.
 #[test]
 fn a_purged_chain_reads_its_stub_as_the_head() {
-    let store = MemRecords::new();
+    let store = HookedRecords::new();
     let seal = PlainSeal::new();
     let chain = TenantChain {
         store: &store,
@@ -618,7 +618,7 @@ fn a_purged_chain_reads_its_stub_as_the_head() {
     });
 
     // A live record alone above a gap is damage, not a stub.
-    let store = MemRecords::new();
+    let store = HookedRecords::new();
     let seal = PlainSeal::new();
     let chain = TenantChain {
         store: &store,
@@ -636,7 +636,7 @@ fn a_purged_chain_reads_its_stub_as_the_head() {
 /// failure that may pass, not damage.
 #[test]
 fn a_key_version_not_held_yet_is_not_damage() {
-    let store = MemRecords::new();
+    let store = HookedRecords::new();
     let seal = PlainSeal::new();
     let chain = TenantChain {
         store: &store,
@@ -657,7 +657,7 @@ fn a_key_version_not_held_yet_is_not_damage() {
 /// contiguous tail that ends in the stub: the stub is the head.
 #[test]
 fn a_purge_under_way_reads_its_stub_as_the_head() {
-    let store = MemRecords::new();
+    let store = HookedRecords::new();
     let seal = PlainSeal::new();
     let chain = TenantChain {
         store: &store,
@@ -701,7 +701,7 @@ fn a_purge_under_way_reads_its_stub_as_the_head() {
 /// inside the chain, not a purge.
 #[test]
 fn a_gap_inside_the_chain_is_not_taken_for_a_purge() {
-    let store = MemRecords::new();
+    let store = HookedRecords::new();
     let seal = PlainSeal::new();
     let chain = TenantChain {
         store: &store,

@@ -28,7 +28,7 @@ use std::collections::BTreeMap;
 
 use super::record::{
     ActorClass, BillingHold, BucketCreated, Deletion, DeletionReason, HoldMode, Holds, Lifecycle,
-    Move, OperatorHold, OperatorReason, Placement, Restoring, Selector, TenantDoor, TenantId,
+    Move, OperatorHold, OperatorReason, Placement, Restoring, Selector, Tenant, TenantDoor,
     TenantPrivate, TenantRecord, TenantZero, RECORD_FORMAT,
 };
 use crate::types::UnixMs;
@@ -191,7 +191,7 @@ pub enum Change {
     ClearEscrowOffline { destroyed: Vec<String> },
     /// Tenant 0: open the move's window into tenant `to`.
     StartMove {
-        to: TenantId,
+        to: Tenant,
         catalogue_id_frozen: String,
     },
     /// Tenant 0: the flip, at the legacy stamp's counter `stamp`.
@@ -280,7 +280,7 @@ const TOO_MANY_DROPPED: Refusal = refuse(409, "too_many_dropped_buckets");
 /// Validates `change` against `head` and builds the record that follows.
 /// See the [module](self).
 pub fn next(
-    tenant: &TenantId,
+    tenant: &Tenant,
     head: Option<&TenantRecord>,
     change: &Change,
     actor: Actor,
@@ -942,12 +942,7 @@ pub fn next(
 }
 
 /// The first record of a tenant.
-fn first(
-    tenant: &TenantId,
-    change: &Change,
-    actor: Actor,
-    now: UnixMs,
-) -> Result<Outcome, Refusal> {
+fn first(tenant: &Tenant, change: &Change, actor: Actor, now: UnixMs) -> Result<Outcome, Refusal> {
     let base = |lifecycle, jurisdiction: &str| TenantDoor {
         v: RECORD_FORMAT,
         tenant: tenant.clone(),
@@ -1081,7 +1076,7 @@ fn rotation_allowed(h: &TenantDoor, actor: Actor, _version: u32) -> Result<(), R
 
 /// The move tool on tenant 0's record.
 fn move_allowed<'a>(
-    tenant: &TenantId,
+    tenant: &Tenant,
     h: &'a TenantDoor,
     actor: Actor,
 ) -> Result<&'a TenantZero, Refusal> {

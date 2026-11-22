@@ -42,8 +42,9 @@
 
 use zeroize::Zeroizing;
 
-use super::record::{Lifecycle, TenantDoor, TenantId, TenantPrivate, TenantRecord, RECORD_FORMAT};
+use super::record::{Lifecycle, Tenant, TenantDoor, TenantPrivate, TenantRecord, RECORD_FORMAT};
 use super::transition::{next, Actor, Change, Outcome, Refusal};
+use crate::records::RecordStore;
 use crate::types::{BridgeError, UnixMs};
 
 type BResult<T> = crate::types::Result<T>;
@@ -59,24 +60,6 @@ const LIST_PAGE: u32 = 1000;
 
 /// The width of a seq in a record name.
 const SEQ_DIGITS: usize = 20;
-
-/// The R2 operations the chain needs. Put-if-absent is what makes a seq
-/// one writer's: R2's conditional put on "no object" (verify the binding
-/// form when the adapter is built).
-pub trait RecordStore {
-    /// Stores `bytes` at `key` only if no object is there. `true` = this
-    /// call stored it; `false` = an object was already there and nothing
-    /// was written.
-    async fn put_if_absent(&self, key: &str, bytes: Vec<u8>) -> BResult<bool>;
-    /// `None` = absent.
-    async fn get(&self, key: &str) -> BResult<Option<Vec<u8>>>;
-    /// Up to `limit` keys that start with `prefix` and sort after
-    /// `start_after`, in key order. Fewer than `limit` = no more keys, so
-    /// an adapter over a store that can answer a short page before the
-    /// end (R2 can) pages on by itself, as the R2 `BlobStore` adapter
-    /// does.
-    async fn list(&self, prefix: &str, start_after: &str, limit: u32) -> BResult<Vec<String>>;
-}
 
 /// The two-part seal of a control record: the door part under
 /// the control key, the private part under a key derived from the
@@ -105,7 +88,7 @@ pub trait ControlSeal {
     fn seal(
         &self,
         name: &str,
-        tenant: &TenantId,
+        tenant: &Tenant,
         key_version: u32,
         door: &[u8],
         private: &[u8],
@@ -114,7 +97,7 @@ pub trait ControlSeal {
     /// call fails. The private part is `None` only when its key version
     /// is gone for good (retired, or destroyed by a shred): a head whose
     /// private part is `None` takes no next record.
-    fn open(&self, name: &str, tenant: &TenantId, sealed: &[u8]) -> Result<OpenedParts, SealError>;
+    fn open(&self, name: &str, tenant: &Tenant, sealed: &[u8]) -> Result<OpenedParts, SealError>;
 }
 
 /// Why a control record did not open.
@@ -184,18 +167,18 @@ pub enum Written {
 }
 
 /// The directory of a tenant's chain: `m/t/<tenant>/`.
-pub fn chain_prefix(tenant: &TenantId) -> String {
+pub fn chain_prefix(tenant: &Tenant) -> String {
     format!("{TENANT_CHAIN_PREFIX}{}/", tenant.as_str())
 }
 
 /// The name of record `seq` of a tenant's chain.
-pub fn record_key(tenant: &TenantId, seq: u64) -> String {
+pub fn record_key(tenant: &Tenant, seq: u64) -> String {
     format!("{}{seq:0SEQ_DIGITS$}", chain_prefix(tenant))
 }
 
 /// The seq of a record name of `tenant`'s chain; `None` for any other
 /// name.
-pub fn record_seq(tenant: &TenantId, key: &str) -> Option<u64> {
+pub fn record_seq(tenant: &Tenant, key: &str) -> Option<u64> {
     let digits = key.strip_prefix(&chain_prefix(tenant))?;
     if digits.len() != SEQ_DIGITS || !digits.bytes().all(|b| b.is_ascii_digit()) {
         return None;
@@ -213,7 +196,7 @@ impl<S: RecordStore, C: ControlSeal> TenantChain<'_, S, C> {
     /// The seq of the newest record, listing after `known` (0 = from the
     /// start). `None` = the tenant has no chain. A `known` above the head
     /// is damage: the caller knew a record that is not there.
-    pub async fn head_seq(&self, tenant: &TenantId, known: u64) -> Result<Option<u64>, ChainError> {
+    pub async fn head_seq(&self, tenant: &Tenant, known: u64) -> Result<Option<u64>, ChainError> {
         let prefix = chain_prefix(tenant);
         // From the record before `known`, so that `known` itself must be
         // listed: a known seq above the head is damage, not the head.
@@ -269,11 +252,7 @@ impl<S: RecordStore, C: ControlSeal> TenantChain<'_, S, C> {
     }
 
     /// Reads and checks record `seq`. `None` = no such record.
-    pub async fn read(
-        &self,
-        tenant: &TenantId,
-        seq: u64,
-    ) -> Result<Option<ReadRecord>, ChainError> {
+    pub async fn read(&self, tenant: &Tenant, seq: u64) -> Result<Option<ReadRecord>, ChainError> {
         let name = record_key(tenant, seq);
         let Some(sealed) = self.store.get(&name).await? else {
             return Ok(None);
@@ -318,7 +297,7 @@ impl<S: RecordStore, C: ControlSeal> TenantChain<'_, S, C> {
     /// The newest record, listing after `known`.
     pub async fn head(
         &self,
-        tenant: &TenantId,
+        tenant: &Tenant,
         known: u64,
     ) -> Result<Option<ReadRecord>, ChainError> {
         let Some(seq) = self.head_seq(tenant, known).await? else {
@@ -335,7 +314,7 @@ impl<S: RecordStore, C: ControlSeal> TenantChain<'_, S, C> {
     /// follows it. See the [module](self).
     pub async fn write(
         &self,
-        tenant: &TenantId,
+        tenant: &Tenant,
         change: &Change,
         actor: Actor,
         now: UnixMs,
@@ -421,7 +400,7 @@ mod tests {
 
     #[test]
     fn record_names() {
-        let t = TenantId::parse("t_00000000000000a1").unwrap();
+        let t = Tenant::parse("t_00000000000000a1").unwrap();
         assert_eq!(chain_prefix(&t), "m/t/t_00000000000000a1/");
         assert_eq!(
             record_key(&t, 1),
@@ -429,7 +408,7 @@ mod tests {
         );
         assert_eq!(record_seq(&t, &record_key(&t, 42)), Some(42));
         assert_eq!(record_seq(&t, &record_key(&t, u64::MAX)), Some(u64::MAX));
-        let other = TenantId::parse("t_00000000000000b2").unwrap();
+        let other = Tenant::parse("t_00000000000000b2").unwrap();
         assert_eq!(record_seq(&other, &record_key(&t, 1)), None);
         for bad in [
             "m/t/t_00000000000000a1/1",
@@ -447,7 +426,7 @@ mod tests {
         assert!(!key.starts_with(crate::recovery::REVOKED_KEY_PREFIX));
         // Tenant 0's chain sits beside the others.
         assert_eq!(
-            record_key(&TenantId::zero(), 7),
+            record_key(&Tenant::zero(), 7),
             "m/t/t_0000000000000000/00000000000000000007"
         );
     }

@@ -55,9 +55,10 @@
 //! taken for a failure, and a failed lookup is never taken for "no such
 //! key".
 
-use super::chain::{ChainError, ControlSeal, RecordStore, TenantChain};
-use super::record::{Selector, TenantDoor, TenantId, TenantZero};
+use super::chain::{ChainError, ControlSeal, TenantChain};
+use super::record::{Selector, Tenant, TenantDoor, TenantZero};
 use crate::ports::{Sql, SqlValue};
+use crate::records::RecordStore;
 use crate::types::{Result, UnixMs};
 
 /// How often an isolate checks that tenant 0's head has not moved.
@@ -218,7 +219,7 @@ impl ZeroWatch {
         chain: &TenantChain<'_, S, C>,
         now: UnixMs,
     ) -> std::result::Result<&TenantDoor, ChainError> {
-        let zero = TenantId::zero();
+        let zero = Tenant::zero();
         let fresh = self
             .checked_at
             .is_some_and(|at| now.0 >= at.0 && now.0 - at.0 < RECHECK_MS);
@@ -267,7 +268,7 @@ impl ZeroWatch {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DirectoryAnswer {
     /// The directory was read: the key's tenant, or `None` for no such key.
-    Read(Option<TenantId>),
+    Read(Option<Tenant>),
     /// The directory could not be read.
     Failed,
 }
@@ -285,7 +286,7 @@ pub enum Lookup<T> {
 /// Where a request goes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Route {
-    Tenant(TenantId),
+    Tenant(Tenant),
     /// No tenant has the key: the request is refused as an unknown key.
     UnknownKey,
     /// `503`: the tenant cannot be known now.
@@ -299,7 +300,7 @@ pub enum Route {
 pub async fn route_without_directory(
     answer: DirectoryAnswer,
     zero: ZeroServe,
-    route_record: impl AsyncFnOnce() -> Lookup<TenantId>,
+    route_record: impl AsyncFnOnce() -> Lookup<Tenant>,
     zero_holds_key: impl AsyncFnOnce() -> Lookup<()>,
 ) -> Route {
     match answer {
@@ -309,7 +310,7 @@ pub async fn route_without_directory(
             Lookup::Found(tenant) => Route::Tenant(tenant),
             Lookup::Failed => Route::Unavailable,
             Lookup::Absent if zero.serves_from_d1() => match zero_holds_key().await {
-                Lookup::Found(()) => Route::Tenant(TenantId::zero()),
+                Lookup::Found(()) => Route::Tenant(Tenant::zero()),
                 Lookup::Absent | Lookup::Failed => Route::Unavailable,
             },
             Lookup::Absent => Route::Unavailable,
