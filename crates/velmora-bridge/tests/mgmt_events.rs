@@ -81,6 +81,9 @@ fn closed_directory() -> Dir {
 }
 
 struct Heads {
+    /// Answer every read with this tenant's head (a head of another
+    /// tenant under the name asked for).
+    swapped: Option<String>,
     tenants: Vec<String>,
     down: Cell<bool>,
     damaged: Cell<bool>,
@@ -97,16 +100,19 @@ impl TenantHeads for Heads {
                 "fake: down".into(),
             )));
         }
-        Ok(self
-            .tenants
-            .iter()
-            .any(|x| x == t.as_str())
-            .then(|| test_door(t, 3, self.lifecycle.get(), &[0])))
+        Ok(self.tenants.iter().any(|x| x == t.as_str()).then(|| {
+            let named = self
+                .swapped
+                .as_deref()
+                .map_or(t.clone(), |s| TenantId::parse(s).unwrap());
+            test_door(&named, 3, self.lifecycle.get(), &[0])
+        }))
     }
 }
 
 fn heads() -> Heads {
     Heads {
+        swapped: None,
         tenants: vec![TENANT.into(), OTHER.into()],
         down: Cell::new(false),
         damaged: Cell::new(false),
@@ -318,5 +324,13 @@ async fn shredding_damage_and_bad_rows() {
              VALUES (0, '{TENANT}', 'bucket.created', 't/9', 1, '[1]');"
         ))
         .unwrap();
+    expect(&get(&h, Some(&d), TENANT, "").await, 500, "internal_error");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_head_of_another_tenant_is_a_500() {
+    let d = directory().await;
+    let mut h = heads();
+    h.swapped = Some(OTHER.to_string());
     expect(&get(&h, Some(&d), TENANT, "").await, 500, "internal_error");
 }
