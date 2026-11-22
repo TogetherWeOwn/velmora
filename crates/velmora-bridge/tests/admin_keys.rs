@@ -469,6 +469,55 @@ async fn a_restore_forgets_keys_revoked_after_the_export() {
     assert_eq!(r.status, 200);
 }
 
+/// A revocation of another tenant, under `m/rk/<tenant>/`, never removes a
+/// key of tenant 0, even one with the same id, however many there are.
+#[tokio::test(flavor = "current_thread")]
+async fn a_restore_forgets_no_key_for_another_tenants_revocation() {
+    let mut cfg = config(Vec::new());
+    cfg.maintenance = Maintenance::Restore;
+    let rig = rig_with(NoNntp, cfg);
+    let bucket = rig.bucket(BUCKET, true).await;
+    let kept = rig
+        .key(
+            "AKVLKEPT000000000001",
+            "secret-kept-secret-kept-000000001",
+            KeyStatus::Active,
+        )
+        .await;
+    rig.grant(&kept.akid, &bucket, Perm::Ro).await;
+    let bytes = b"not a record of tenant 0".to_vec();
+    let digest: [u8; 32] = <Sha256 as sha2::Digest>::digest(&bytes).into();
+    let (b, x) = (BucketId::new("-"), ExtentId::new("-"));
+    let meta = BlobMeta {
+        bucket: &b,
+        extent: &x,
+        cipher_sha256: &digest,
+    };
+    for n in 0..3 {
+        for id in [kept.akid.clone(), format!("AKVLOTHER{n:011}")] {
+            let name = format!("{REVOKED_KEY_PREFIX}t_00000000000000a{n}/{id}");
+            rig.bridge
+                .safety
+                .put(&name, bytes.clone(), &meta)
+                .await
+                .unwrap();
+        }
+    }
+    let r = admin(
+        &rig,
+        Method::Post,
+        "/_admin/restore",
+        Some(json!({ "since_ms": 0 })),
+    )
+    .await;
+    assert_eq!(r.status, 200, "{}", r.text());
+    assert_eq!(rig.count("access_keys"), 1);
+    let r = rig
+        .call(&kept, Method::Get, &format!("/{BUCKET}"), &[], &[], b"")
+        .await;
+    assert_eq!(r.status, 200);
+}
+
 // ---------------------------------------------------------------------------
 // POST /_admin/keys/<id>/grants
 // ---------------------------------------------------------------------------
