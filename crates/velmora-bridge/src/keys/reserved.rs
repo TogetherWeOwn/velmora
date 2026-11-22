@@ -13,8 +13,8 @@
 //!   [`ReservedAnswer::Lost`] after bringing the stores to it: the handler
 //!   asks the unit again.
 //! - **A record of this `rid` wins.** Before it writes, and after a put
-//!   that lost, the writer looks for the record above `keys_seq` that
-//!   carries the `rid` ([`KeyEnv::carrying`]). One that exists is this
+//!   that lost, the writer reads the record at `keys_seq + 1` and checks
+//!   for the `rid` (one read, AM-55; [`KeyEnv::carrying`]). One that is this
 //!   reservation's create, whoever wrote it: the writer brings the stores
 //!   up to it and answers from it, and never writes its own bytes.
 //! - **The kept answer only with the full apply.** The stores are brought
@@ -40,8 +40,8 @@ use super::ports::{
     Applied, ApplyEntry, ControlChain, ControlIntents, KeptAnswer, KeyAdmission, KeyTarget, Refusal,
 };
 use super::record::{
-    key_chain, open_chain_record, open_key_record, seal_key_record_carrying, ChainRecord, KeyOp,
-    KeyTable, Rid, Subject, TkRing,
+    key_chain, open_chain_record, open_key_record, seal_key_record_carrying, ChainRecord, Entry,
+    KeyOp, KeyTable, Rid, Subject, SubjectStatus, TkRing,
 };
 use super::revocations::list_tenant_revocations;
 use super::routes::{put_route, RoutePut};
@@ -49,17 +49,6 @@ use super::writer::{op_kind, plan, Class, KeyEnv, KeyRequest, Planned};
 use crate::ports::{Clock, Kek};
 use crate::records::RecordStore;
 use crate::types::{BridgeError, Result};
-
-/// The most records above a reservation's `keys_seq` that a search for its
-/// `rid` reads (an estimate; a dial). A reservation lives about an hour
-/// and a tenant makes at most a few dozen changes in that time, so a head
-/// further on than this cannot hold a live reservation's record; the call
-/// answers `503`.
-pub const MAX_CARRYING: u64 = 1_000;
-
-/// The search for a `rid` would read more than [`MAX_CARRYING`] records.
-pub const ERR_CARRYING_FAR: BridgeError =
-    BridgeError::Invalid("the key chain is too far past the reservation");
 
 /// A record of a `rid` names another subject than the call's: the
 /// reservation is not this call's.
@@ -90,8 +79,8 @@ pub enum ReservedAnswer {
     /// not yet recorded, or the answer was not kept. `503`; the finishers
     /// apply it.
     Unfinished { seq: u64 },
-    /// Another record took `keys_seq + 1` and none above `keys_seq`
-    /// carries the `rid`: nothing of this call is recorded, and the stores
+    /// Another record, without the `rid`, took `keys_seq + 1`: nothing of
+    /// this call is recorded, and the stores
     /// are brought to the head. Ask the unit again.
     Lost,
     /// Nothing recorded, and the chain cannot record now: `503`.
@@ -127,6 +116,12 @@ pub enum Finished {
     NotHeld,
 }
 
+/// An `m/rk/` revocation of `entry` that the chain does not record yet
+/// (the finisher's rule): the table still states the subject otherwise.
+fn unrecorded_revoke(revoked: &BTreeSet<String>, entry: &Entry) -> bool {
+    revoked.contains(&entry.door.id) && entry.door.status != SubjectStatus::Revoked
+}
+
 impl<S, K, T, A, I, U, D, C, G> KeyEnv<'_, S, K, T, A, I, U, D, C, G>
 where
     S: RecordStore,
@@ -152,33 +147,35 @@ where
         Ok(revoked)
     }
 
-    /// The record above `above`, up to `table`'s seq, that carries `rid`.
+    /// The record at `above + 1`, if `table`'s head holds one and it
+    /// carries `rid`. One read is enough (AM-55): the unit applies key
+    /// records in seq order with no gap, so a record of a reservation can
+    /// only sit at its `keys_seq + 1`, and once the unit applied it the
+    /// reservation is `applied` and is not asked again.
     async fn find_carrying(
         &self,
         table: &KeyTable,
         rid: &Rid,
         above: u64,
     ) -> Result<Option<Carried>> {
-        let head = table.seq();
-        if head.saturating_sub(above) > MAX_CARRYING {
-            return Err(ERR_CARRYING_FAR);
+        let seq = above + 1;
+        if seq > table.seq() {
+            return Ok(None);
         }
-        let chain = key_chain(self.tenant);
-        for seq in above + 1..=head {
-            let bytes = chain.get(self.store, seq).await?;
-            if let ChainRecord::Key(r) =
-                open_chain_record(self.kek, self.ring, self.tenant, seq, &bytes)?
-            {
-                if r.rid.as_ref() == Some(rid) {
-                    return Ok(Some(Carried { seq, id: r.door.id }));
+        let bytes = key_chain(self.tenant).get(self.store, seq).await?;
+        Ok(
+            match open_chain_record(self.kek, self.ring, self.tenant, seq, &bytes)? {
+                ChainRecord::Key(r) if r.rid.as_ref() == Some(rid) => {
+                    Some(Carried { seq, id: r.door.id })
                 }
-            }
-        }
-        Ok(None)
+                _ => None,
+            },
+        )
     }
 
-    /// The record above `above` that carries `rid`, read from the chain's
-    /// head now (`table` is brought there). `None`: no such record.
+    /// The record at `above + 1` if it carries `rid` (AM-55), read from the
+    /// chain's head now (`table` is brought there). `None`: no record there
+    /// yet, or another record holds the seq.
     pub async fn carrying(
         &self,
         table: &mut KeyTable,
@@ -204,7 +201,9 @@ where
         // A subject an `m/rk/` revocation holds revoked, with no revoke
         // record yet, is not answered as the table states it (`active`):
         // the finisher records the revoke first.
-        let open = table.get(id).is_some_and(|e| e.private.is_some()) && !revoked.contains(id);
+        let open = table
+            .get(id)
+            .is_some_and(|e| e.private.is_some() && !unrecorded_revoke(&revoked, e));
         Ok(match acks.units && acks.directory && open {
             true => Finished::Done {
                 seq: table.get(id).map_or(seq, |e| e.last_seq),
@@ -238,7 +237,7 @@ where
         // Held closed, or revoked by an `m/rk/` the chain does not record
         // yet: no answer is kept for a subject the head does not state as
         // the stores hold it.
-        if entry.private.is_none() || revoked.contains(&entry.door.id) {
+        if entry.private.is_none() || unrecorded_revoke(revoked, &entry) {
             return unfinished;
         }
         entry.last_seq = seq;

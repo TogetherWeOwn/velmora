@@ -696,6 +696,8 @@ async fn carrying_finds_the_record_of_a_rid_above_a_seq() {
     );
     assert_eq!(cold.seq(), 2, "read from the head");
     assert_eq!(env.carrying(&mut cold, &RID, 2).await.unwrap(), None);
+    // One read, at `above + 1` (AM-55): seq 1 is another record.
+    assert_eq!(env.carrying(&mut cold, &RID, 0).await.unwrap(), None);
     assert_eq!(env.carrying(&mut cold, &OTHER, 0).await.unwrap(), None);
     assert_eq!(
         env.finish_subject(&mut cold, "p_00000000000000ff")
@@ -1073,4 +1075,35 @@ async fn a_subject_revoked_by_m_rk_alone_is_not_answered_as_open() {
     );
     assert!(w.root.kept.borrow().is_empty());
     assert_eq!(w.root.row(NEW).unwrap().door.status, SubjectStatus::Revoked);
+
+    // Once the revoke is recorded, the table states it: `finish` is done,
+    // and a retry keeps the create's answer.
+    let env = env!(w, &w.store, &AtRoot(&w.root), &units);
+    assert_eq!(
+        env.change(
+            &mut table,
+            "idem-revoke",
+            &KeyRequest::SetStatus {
+                id: NEW.into(),
+                status: SubjectStatus::Revoked,
+            },
+            &mut TestRng(5),
+        )
+        .await
+        .unwrap(),
+        KeyAnswer::Done { seq: 3 }
+    );
+    let env = env!(w, &w.store, &NoAdmission, &units);
+    assert_eq!(
+        env.finish_subject(&mut table, NEW).await.unwrap(),
+        Finished::Done { seq: 3 }
+    );
+    assert_eq!(
+        env.create_reserved(&mut table, &subject, reserved, &mut TestRng(6))
+            .await
+            .unwrap(),
+        ReservedAnswer::Done { seq: 2 }
+    );
+    assert_eq!(*w.root.kept.borrow(), vec![(RID, 201)]);
+    assert_eq!(w.head(), 3);
 }
