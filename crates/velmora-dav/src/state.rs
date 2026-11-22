@@ -11,9 +11,8 @@
 //! infinity on a collection covers every path under it, members added
 //! later included.
 //!
-//! Expired locks and leases are ignored by every lookup and deleted at
-//! the start of the next batch, so no alarm is needed to keep the table
-//! small.
+//! Expired locks, leases and reservations are deleted at the start of
+//! the next batch, so no alarm is needed.
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -71,10 +70,19 @@ pub const SCHEMA: &[&str] = &[
        holder TEXT NOT NULL, path TEXT NOT NULL, recursive INTEGER NOT NULL, \
        expires_at INTEGER NOT NULL, PRIMARY KEY (holder, path)) WITHOUT ROWID",
     "CREATE INDEX IF NOT EXISTS write_leases_path ON write_leases(path)",
+    "CREATE TABLE IF NOT EXISTS mutation_reservations (\
+       holder TEXT NOT NULL, path TEXT NOT NULL, recursive INTEGER NOT NULL, \
+       expires_at INTEGER NOT NULL, PRIMARY KEY (holder, path)) WITHOUT ROWID",
+    "CREATE TABLE IF NOT EXISTS moved_capacity (\
+       holder TEXT PRIMARY KEY, amount INTEGER NOT NULL, expires_at INTEGER NOT NULL) WITHOUT ROWID",
     "CREATE TABLE IF NOT EXISTS dav_props (\
        path TEXT NOT NULL, ns TEXT NOT NULL, name TEXT NOT NULL, value_xml TEXT NOT NULL, \
        etag TEXT, PRIMARY KEY (path, ns, name)) WITHOUT ROWID",
+    "CREATE TABLE IF NOT EXISTS moved_members (\
+       destination TEXT PRIMARY KEY, etag TEXT NOT NULL, source TEXT NOT NULL) WITHOUT ROWID",
 ];
+// Keep even JSON-escaped maximum-length keys well below the SQL value limit.
+const MOVED_MEMBER_SQL_BATCH: usize = 32;
 
 /// Caps. A dead property is stored as one row of the object's SQLite
 /// storage, read whole on every PROPFIND that asks for it: 64 KiB a value
@@ -85,6 +93,7 @@ pub const MAX_PROP_BYTES: usize = 64 * 1024;
 pub const MAX_PROPS_PER_RESOURCE: usize = 256 * 1024;
 const MAX_PROPFIND_PROP_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_LOCKS_PER_BUCKET: i64 = 5_000;
+pub const MAX_MOVED_MEMBERS_PER_BUCKET: i64 = 10_000;
 pub const MAX_LOCKS_PER_KEY: i64 = 500;
 pub const MAX_OWNER_BYTES: usize = 1024;
 
@@ -131,6 +140,13 @@ pub enum Patch {
     Remove { ns: String, name: String },
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MovedMember {
+    pub destination: String,
+    pub etag: String,
+    pub source: String,
+}
+
 /// One operation. A batch of them runs atomically.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Op {
@@ -174,6 +190,15 @@ pub enum Op {
         principal: String,
         holder: String,
         ttl_secs: u32,
+    },
+    /// Serialize overlapping DAV mutations independently of LOCK checks.
+    Reserve {
+        holder: String,
+        roots: Vec<(String, bool)>,
+        ttl_secs: u32,
+    },
+    CheckReserve {
+        holder: String,
     },
     RenewWrite {
         holder: String,
@@ -223,6 +248,38 @@ pub enum Op {
         from: String,
         to: String,
     },
+    /// Copies properties only for collections represented by these successful
+    /// destination keys (including explicit markers and implicit ancestors).
+    PropCopyFolders {
+        from: String,
+        to: String,
+        members: Vec<String>,
+    },
+    /// Hold room for a MOVE before copying, including against disjoint MOVEs.
+    ReserveMoved {
+        holder: String,
+        destinations: Vec<String>,
+        ttl_secs: u32,
+    },
+    /// Publish all copied versions atomically before deleting any source member.
+    RecordMoved {
+        holder: Option<String>,
+        members: Vec<MovedMember>,
+    },
+    /// Reconcile ledger rows against a complete destination listing and keep
+    /// only matching versions. `exact` covers a same-named file outside `root`.
+    FindMoved {
+        holder: String,
+        root: Option<String>,
+        listed: Vec<(String, String)>,
+        exact: Option<(String, String)>,
+    },
+    /// Collection candidates that still carry rooted state, including descendants.
+    FoldersWithState(Vec<String>),
+    /// Remove the matching ledger rows after all source deletes succeeded.
+    FinishMove(Vec<MovedMember>),
+    /// A successful WebDAV write or delete superseded these exact keys.
+    ClearMoved(Vec<String>),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -244,6 +301,9 @@ pub enum Reply {
     Props(Vec<Vec<DeadProp>>),
     /// One status per patch, in order (`200`, `403`, `424`, `507`).
     Patched(Vec<u16>),
+    Moved(Vec<String>),
+    StatefulFolders(Vec<String>),
+    Busy,
 }
 
 /// The bucket's state over a SQL port.
@@ -325,8 +385,16 @@ impl<S: Sql> Engine<'_, S> {
             "DELETE FROM locks WHERE expires_at <= ?1",
             std::slice::from_ref(&now),
         )?;
+        self.sql.exec(
+            "DELETE FROM write_leases WHERE expires_at <= ?1",
+            std::slice::from_ref(&now),
+        )?;
+        self.sql.exec(
+            "DELETE FROM mutation_reservations WHERE expires_at <= ?1",
+            std::slice::from_ref(&now),
+        )?;
         self.sql
-            .exec("DELETE FROM write_leases WHERE expires_at <= ?1", &[now])?;
+            .exec("DELETE FROM moved_capacity WHERE expires_at <= ?1", &[now])?;
         Ok(())
     }
 
@@ -590,16 +658,59 @@ impl<S: Sql> Engine<'_, S> {
                 }
                 Ok(Reply::Granted)
             }
+            Op::Reserve {
+                holder,
+                roots,
+                ttl_secs,
+            } => {
+                for row in self.sql.exec(
+                    "SELECT path, recursive FROM mutation_reservations WHERE holder <> ?1",
+                    &[t(&holder)],
+                )? {
+                    let path = row[0].text();
+                    if roots.iter().any(|(root, recursive)| {
+                        root == &path
+                            || (*recursive && within(root, &path))
+                            || (row[1].int() != 0 && within(&path, root))
+                    }) {
+                        return Ok(Reply::Busy);
+                    }
+                }
+                for (root, recursive) in roots {
+                    self.sql.exec(
+                        "INSERT OR REPLACE INTO mutation_reservations VALUES (?1, ?2, ?3, ?4)",
+                        &[
+                            t(&holder),
+                            t(&root),
+                            Val::Int(i64::from(recursive)),
+                            Val::Int(self.now + i64::from(ttl_secs)),
+                        ],
+                    )?;
+                }
+                Ok(Reply::Granted)
+            }
+            Op::CheckReserve { holder } => Ok(if self.live_reservation(&holder)? {
+                Reply::Granted
+            } else {
+                Reply::Busy
+            }),
             Op::RenewWrite { holder, ttl_secs } => {
-                self.sql.exec(
-                    "UPDATE write_leases SET expires_at = ?2 WHERE holder = ?1",
-                    &[t(&holder), Val::Int(self.now + i64::from(ttl_secs))],
-                )?;
+                let params = [t(&holder), Val::Int(self.now + i64::from(ttl_secs))];
+                for table in ["write_leases", "mutation_reservations", "moved_capacity"] {
+                    self.sql.exec(
+                        &format!("UPDATE {table} SET expires_at = ?2 WHERE holder = ?1"),
+                        &params,
+                    )?;
+                }
                 Ok(Reply::Done)
             }
             Op::EndWrite { holder } => {
-                self.sql
-                    .exec("DELETE FROM write_leases WHERE holder = ?1", &[t(&holder)])?;
+                for table in ["write_leases", "mutation_reservations", "moved_capacity"] {
+                    self.sql.exec(
+                        &format!("DELETE FROM {table} WHERE holder = ?1"),
+                        &[t(&holder)],
+                    )?;
+                }
                 Ok(Reply::Done)
             }
             Op::DropLocks { path, tree } => {
@@ -702,7 +813,212 @@ impl<S: Sql> Engine<'_, S> {
                 )?;
                 Ok(Reply::Done)
             }
+            Op::PropCopyFolders { from, to, members } => {
+                self.copy_folder_props(&from, &to, members)?;
+                Ok(Reply::Done)
+            }
+            Op::ReserveMoved {
+                holder,
+                destinations,
+                ttl_secs,
+            } => {
+                if !self.live_reservation(&holder)? {
+                    return Ok(Reply::Busy);
+                }
+                let used = self.sql.exec(
+                    "SELECT (SELECT count(*) FROM moved_members) + \
+                            (SELECT coalesce(sum(amount), 0) FROM moved_capacity WHERE holder <> ?1)",
+                    &[t(&holder)],
+                )?[0][0].int();
+                let missing = self.missing_moved_keys(&destinations)?;
+                if used + missing > MAX_MOVED_MEMBERS_PER_BUCKET {
+                    return Ok(Reply::Full);
+                }
+                self.sql.exec(
+                    "INSERT OR REPLACE INTO moved_capacity VALUES (?1, ?2, ?3)",
+                    &[
+                        t(&holder),
+                        Val::Int(missing),
+                        Val::Int(self.now + i64::from(ttl_secs)),
+                    ],
+                )?;
+                Ok(Reply::Granted)
+            }
+            Op::RecordMoved { holder, members } => {
+                if let Some(holder) = &holder {
+                    if !self.live_reservation(holder)?
+                        || self
+                            .sql
+                            .exec(
+                                "SELECT 1 FROM moved_capacity WHERE holder = ?1",
+                                &[t(holder)],
+                            )?
+                            .is_empty()
+                    {
+                        return Ok(Reply::Busy);
+                    }
+                }
+                let keys: Vec<_> = members.iter().map(|m| m.destination.as_str()).collect();
+                let used = self.sql.exec("SELECT count(*) FROM moved_members", &[])?[0][0].int();
+                if used + self.missing_moved_keys(&keys)? > MAX_MOVED_MEMBERS_PER_BUCKET {
+                    return Ok(Reply::Full);
+                }
+                for chunk in members.chunks(MOVED_MEMBER_SQL_BATCH) {
+                    let json = serde_json::to_string(chunk).map_err(|e| e.to_string())?;
+                    self.sql.exec(
+                        "INSERT OR REPLACE INTO moved_members (destination, etag, source) \
+                         SELECT json_extract(value, '$.destination'), json_extract(value, '$.etag'), \
+                                json_extract(value, '$.source') FROM json_each(?1)",
+                        &[Val::Text(json)],
+                    )?;
+                }
+                if let Some(holder) = holder {
+                    self.sql.exec(
+                        "DELETE FROM moved_capacity WHERE holder = ?1",
+                        &[t(&holder)],
+                    )?;
+                }
+                Ok(Reply::Done)
+            }
+            Op::FindMoved {
+                holder,
+                root,
+                listed,
+                exact,
+            } => {
+                if !self.live_reservation(&holder)? {
+                    return Ok(Reply::Busy);
+                }
+                let mut rows = Vec::new();
+                if let Some(root) = root {
+                    let end = range_end(&root).ok_or("not a collection")?;
+                    rows.extend(self.sql.exec(
+                        "SELECT destination, etag FROM moved_members WHERE destination >= ?1 AND destination < ?2",
+                        &[t(&root), t(&end)],
+                    )?);
+                }
+                if let Some((key, _)) = &exact {
+                    rows.extend(self.sql.exec(
+                        "SELECT destination, etag FROM moved_members WHERE destination = ?1",
+                        &[t(key)],
+                    )?);
+                }
+                let listed: std::collections::HashMap<_, _> =
+                    listed.into_iter().chain(exact).collect();
+                let mut kept = Vec::new();
+                let mut stale = Vec::new();
+                for row in rows {
+                    let key = row[0].text();
+                    if listed.get(&key).is_some_and(|etag| *etag == row[1].text()) {
+                        kept.push(key);
+                    } else {
+                        stale.push(key);
+                    }
+                }
+                self.one(Op::ClearMoved(stale))?;
+                Ok(Reply::Moved(kept))
+            }
+            Op::FoldersWithState(folders) => {
+                let mut stateful = Vec::new();
+                for folder in folders {
+                    let end = range_end(&folder).ok_or("not a collection")?;
+                    let rows = self.sql.exec(
+                        "SELECT 1 WHERE EXISTS (SELECT 1 FROM locks WHERE root >= ?1 AND root < ?2) \
+                           OR EXISTS (SELECT 1 FROM dav_props WHERE path >= ?1 AND path < ?2)",
+                        &[t(&folder), t(&end)],
+                    )?;
+                    if !rows.is_empty() {
+                        stateful.push(folder);
+                    }
+                }
+                Ok(Reply::StatefulFolders(stateful))
+            }
+            Op::FinishMove(members) => {
+                for chunk in members.chunks(MOVED_MEMBER_SQL_BATCH) {
+                    let json = serde_json::to_string(chunk).map_err(|e| e.to_string())?;
+                    self.sql.exec(
+                        "DELETE FROM moved_members WHERE destination IN (\
+                           SELECT m.destination FROM json_each(?1) AS candidate \
+                           JOIN moved_members AS m ON m.destination = json_extract(candidate.value, '$.destination') \
+                            AND m.etag = json_extract(candidate.value, '$.etag') \
+                            AND m.source = json_extract(candidate.value, '$.source'))",
+                        &[Val::Text(json)],
+                    )?;
+                }
+                Ok(Reply::Done)
+            }
+            Op::ClearMoved(paths) => {
+                for chunk in paths.chunks(MOVED_MEMBER_SQL_BATCH) {
+                    let json = serde_json::to_string(chunk).map_err(|e| e.to_string())?;
+                    self.sql.exec(
+                        "DELETE FROM moved_members WHERE destination IN (SELECT value FROM json_each(?1))",
+                        &[Val::Text(json)],
+                    )?;
+                }
+                Ok(Reply::Done)
+            }
         }
+    }
+
+    fn live_reservation(&self, holder: &str) -> Result<bool, String> {
+        Ok(!self
+            .sql
+            .exec(
+                "SELECT 1 FROM mutation_reservations WHERE holder = ?1 LIMIT 1",
+                &[t(holder)],
+            )?
+            .is_empty())
+    }
+
+    fn missing_moved_keys<T: Serialize>(&self, keys: &[T]) -> Result<i64, String> {
+        let mut missing = 0;
+        for chunk in keys.chunks(MOVED_MEMBER_SQL_BATCH) {
+            let json = serde_json::to_string(chunk).map_err(|e| e.to_string())?;
+            missing += self.sql.exec(
+                "SELECT count(*) FROM json_each(?1) AS k WHERE NOT EXISTS \
+                 (SELECT 1 FROM moved_members WHERE destination = k.value)",
+                &[Val::Text(json)],
+            )?[0][0]
+                .int();
+        }
+        Ok(missing)
+    }
+
+    fn copy_folder_props(
+        &self,
+        from: &str,
+        to: &str,
+        mut members: Vec<String>,
+    ) -> Result<(), String> {
+        members.sort_unstable();
+        // Look up only existing property paths, not every ancestor of every
+        // copied key. The successful keys tell us which collections exist.
+        let mut copied = HashSet::new();
+        for root in [from, to] {
+            let end = range_end(root).ok_or("not a collection")?;
+            for row in self.sql.exec(
+                "SELECT DISTINCT path FROM dav_props WHERE path >= ?1 AND path < ?2 AND etag IS NULL",
+                &[t(root), t(&end)],
+            )? {
+                let path = row[0].text();
+                let suffix = &path[root.len()..];
+                let dest = format!("{to}{suffix}");
+                if crate::path::has_prefix_member(&members, &dest) {
+                    copied.insert(suffix.to_owned());
+                }
+            }
+        }
+        for suffix in copied {
+            let src = format!("{from}{suffix}");
+            let dest = format!("{to}{suffix}");
+            self.prop_drop(&dest, false)?;
+            self.sql.exec(
+                "INSERT INTO dav_props (path, ns, name, value_xml, etag) \
+                 SELECT ?2, ns, name, value_xml, NULL FROM dav_props WHERE path = ?1 AND etag IS NULL",
+                &[t(&src), t(&dest)],
+            )?;
+        }
+        Ok(())
     }
 
     fn prop_rows(

@@ -138,11 +138,26 @@ pub fn response(href_value: &str, groups: &[(u16, Vec<String>)]) -> String {
 
 /// A `<D:response>` with a status and no properties.
 pub fn status_response(href_value: &str, status: u16) -> String {
-    format!(
-        "<D:response><D:href>{}</D:href><D:status>HTTP/1.1 {status} {}</D:status></D:response>",
+    status_response_with_description(href_value, status, None)
+}
+
+pub(crate) fn status_response_with_description(
+    href_value: &str,
+    status: u16,
+    description: Option<&str>,
+) -> String {
+    let mut response = format!(
+        "<D:response><D:href>{}</D:href><D:status>HTTP/1.1 {status} {}</D:status>",
         escape_text(href_value),
         crate::http::reason(status)
-    )
+    );
+    if let Some(description) = description {
+        response.push_str("<D:responsedescription>");
+        response.push_str(&escape_text(description));
+        response.push_str("</D:responsedescription>");
+    }
+    response.push_str("</D:response>");
+    response
 }
 
 pub fn multistatus(responses: &str) -> Vec<u8> {

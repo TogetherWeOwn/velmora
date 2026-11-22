@@ -178,6 +178,14 @@ pub fn within(outer: &str, inner: &str) -> bool {
     outer.is_empty() || inner == outer || (outer.ends_with('/') && inner.starts_with(outer))
 }
 
+/// Whether a sorted list contains the collection marker or any member below it.
+pub(crate) fn has_prefix_member<K: AsRef<str>>(sorted_keys: &[K], prefix: &str) -> bool {
+    let first = sorted_keys.partition_point(|key| key.as_ref() < prefix);
+    sorted_keys
+        .get(first)
+        .is_some_and(|key| key.as_ref().starts_with(prefix))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

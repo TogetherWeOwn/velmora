@@ -15,7 +15,7 @@ use crate::props::{self, Resource, LIVE};
 use crate::s3::{Cond, Entry, Meta, S3Error, Upstream, S3};
 use crate::sigv4::Credentials;
 use crate::slots::Slot;
-use crate::state::{Check, DeadProp, Lock, Op, Patch, Reply, Scope};
+use crate::state::{Check, DeadProp, Lock, MovedMember, Op, Patch, Reply, Scope};
 use crate::xml::{self, Element, DAV};
 
 /// The prefix of an app password's id (velmora_bridge::entry). An S3 key
@@ -107,6 +107,8 @@ pub struct Dav<U: Upstream, S: StatePort> {
 
 type Resp<B> = Response<B>;
 type Out<B> = Result<Response<B>, Response<B>>;
+
+const MAX_FOLDER_PROBES: usize = 100;
 
 const ALLOW: &str =
     "OPTIONS, GET, HEAD, PUT, DELETE, PROPFIND, PROPPATCH, MKCOL, COPY, MOVE, LOCK, UNLOCK";
@@ -213,7 +215,7 @@ struct Ctx<'a, U: Upstream, S: StatePort> {
     dav: &'a Dav<U, S>,
     s3: S3<'a, U>,
     principal: String,
-    host: String,
+    origin: String,
 }
 
 fn depth(req_headers: &[(String, String)]) -> Result<Option<u8>, ()> {
@@ -238,21 +240,60 @@ fn state_path(res: &Res, key: &str) -> String {
 }
 
 /// The path of a URL taken from a header (`Destination`, an `If` tag):
-/// an absolute URL on this host, or an absolute path.
-fn header_url_path(value: &str, host: &str) -> Option<String> {
+/// an absolute URL on this origin, or an absolute path.
+fn header_url_path(value: &str, origin: &str) -> Option<String> {
     let value = value.trim();
-    if value.starts_with('/') {
+    if value.starts_with('/') && !value.starts_with("//") {
         return Some(value.split(['?', '#']).next()?.to_owned());
     }
-    let (_, rest) = value.split_once("://")?;
-    let (authority, path) = match rest.find('/') {
-        Some(i) => (&rest[..i], &rest[i..]),
-        None => (rest, "/"),
-    };
-    if !authority.eq_ignore_ascii_case(host) {
+    let (scheme, rest) = value.split_once("://")?;
+    let (actual_scheme, actual_authority) = origin.split_once("://")?;
+    if !scheme.eq_ignore_ascii_case(actual_scheme) {
         return None;
     }
-    Some(path.split(['?', '#']).next()?.to_owned())
+    let default_port = if scheme.eq_ignore_ascii_case("https") {
+        443
+    } else if scheme.eq_ignore_ascii_case("http") {
+        80
+    } else {
+        return None;
+    };
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (authority, path) = rest.split_at(authority_end);
+    if origin_authority(authority, default_port)?
+        != origin_authority(actual_authority, default_port)?
+    {
+        return None;
+    }
+    let path = path.split(['?', '#']).next()?;
+    Some(if path.is_empty() { "/" } else { path }.to_owned())
+}
+
+fn origin_authority(authority: &str, default_port: u16) -> Option<(String, u16)> {
+    let (host, port) = if let Some(ip) = authority.strip_prefix('[') {
+        let (ip, suffix) = ip.split_once(']')?;
+        let host = ip.parse::<std::net::Ipv6Addr>().ok()?.to_string();
+        let port = if suffix.is_empty() {
+            default_port
+        } else {
+            suffix.strip_prefix(':')?.parse().ok()?
+        };
+        (host, port)
+    } else {
+        let (host, port) = match authority.split_once(':') {
+            Some((host, port)) => (host, port.parse().ok()?),
+            None => (authority, default_port),
+        };
+        if host.is_empty()
+            || !host
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'))
+        {
+            return None;
+        }
+        (host.to_ascii_lowercase(), port)
+    };
+    Some((host, port))
 }
 
 fn timeout_secs(value: Option<&str>, cfg: &Config) -> u32 {
@@ -327,7 +368,7 @@ impl<U: Upstream, S: StatePort> Dav<U, S> {
         if !creds.access_key.starts_with(APP_PASSWORD_PREFIX) {
             return Err(unauthorized());
         }
-        let host = req.header("host").unwrap_or_default().to_owned();
+        let origin = req.origin.clone();
         let ctx = Ctx {
             dav: self,
             s3: S3 {
@@ -337,7 +378,7 @@ impl<U: Upstream, S: StatePort> Dav<U, S> {
                 region: &self.cfg.region,
             },
             principal: creds.access_key.clone(),
-            host,
+            origin,
         };
         match method.as_str() {
             "GET" | "HEAD" => ctx.get(&method, &loc, req).await,
@@ -411,7 +452,7 @@ impl<U: Upstream, S: StatePort> Ctx<'_, U, S> {
             return;
         }
         if let Ok(false) = self.s3.any_under(bucket, coll).await {
-            let _ = self
+            let result = self
                 .s3
                 .put(
                     bucket,
@@ -423,6 +464,11 @@ impl<U: Upstream, S: StatePort> Ctx<'_, U, S> {
                     Some(&Cond::Absent),
                 )
                 .await;
+            if result.is_ok() {
+                let _ = self
+                    .state(bucket, vec![Op::ClearMoved(vec![coll.to_owned()])])
+                    .await;
+            }
         }
     }
 
@@ -451,7 +497,7 @@ impl<U: Upstream, S: StatePort> Ctx<'_, U, S> {
         };
         targets.push((None, req_path.to_owned(), req_etag.clone()));
         for tag in h.tags() {
-            let resolved = header_url_path(&tag, &self.host).and_then(|p| Loc::parse(&p).ok());
+            let resolved = header_url_path(&tag, &self.origin).and_then(|p| Loc::parse(&p).ok());
             match resolved {
                 Some(Loc::Item { bucket: b, key }) if b == bucket => {
                     if key == req_path && req_res.exists() {
@@ -589,6 +635,47 @@ impl<U: Upstream, S: StatePort> Ctx<'_, U, S> {
             holder: holder.to_owned(),
         });
         let _ = self.state(bucket, ops).await;
+    }
+
+    /// Fence other DAV mutations while the request plans and changes storage.
+    /// Direct S3 writers do not use this state; their races are guarded by ETags.
+    async fn reserve(
+        &self,
+        bucket: &str,
+        holder: &str,
+        roots: Vec<(String, bool)>,
+    ) -> Result<(), Resp<U::Body>> {
+        let replies = self
+            .state(
+                bucket,
+                vec![Op::Reserve {
+                    holder: holder.to_owned(),
+                    roots,
+                    ttl_secs: self.cfg().lease_secs,
+                }],
+            )
+            .await?;
+        match replies.as_slice() {
+            [Reply::Granted] => Ok(()),
+            [Reply::Busy] => Err(reservation_busy()),
+            _ => Err(status(500)),
+        }
+    }
+
+    async fn check_reservation(&self, bucket: &str, holder: &str) -> Result<(), Resp<U::Body>> {
+        let replies = self
+            .state(
+                bucket,
+                vec![Op::CheckReserve {
+                    holder: holder.to_owned(),
+                }],
+            )
+            .await?;
+        match replies.as_slice() {
+            [Reply::Granted] => Ok(()),
+            [Reply::Busy] => Err(reservation_busy()),
+            _ => Err(status(500)),
+        }
     }
 
     /// Runs `work` while renewing the lease every third of its life.
@@ -998,7 +1085,7 @@ impl<U: Upstream, S: StatePort> Ctx<'_, U, S> {
         let res = existing.clone().map_or(Res::Missing, Res::File);
         // HTTP conditions, judged against what is there now; the write
         // then carries a guard on exactly that, which closes the race.
-        let mut guard = http_conditions(&req, existing.as_ref())?;
+        let mut guard = http_conditions(&req, existing.as_ref(), existing.is_some())?;
         let ifh = self.parse_if(&req)?;
         if let Some(h) = &ifh {
             if h.lists.iter().any(|l| {
@@ -1019,9 +1106,17 @@ impl<U: Upstream, S: StatePort> Ctx<'_, U, S> {
                 scope: Scope::Member,
             });
         }
+        self.require_write(bucket, key).await?;
         let holder = self
             .begin_write(bucket, checks, ifh.as_ref(), (key, &res))
             .await?;
+        if let Err(r) = self
+            .reserve(bucket, &holder, vec![(key.to_owned(), false)])
+            .await
+        {
+            self.end_write(bucket, &holder, Vec::new()).await;
+            return Err(r);
+        }
 
         let content_type = req
             .header("content-type")
@@ -1045,7 +1140,7 @@ impl<U: Upstream, S: StatePort> Ctx<'_, U, S> {
             )
             .await;
         // An object replaced through WebDAV keeps its dead properties.
-        let keep = match (&existing, &result) {
+        let mut keep = match (&existing, &result) {
             (Some(old), Ok(new)) if !new.is_empty() => vec![Op::PropRestamp {
                 path: key.to_owned(),
                 from: old.etag.clone(),
@@ -1053,6 +1148,9 @@ impl<U: Upstream, S: StatePort> Ctx<'_, U, S> {
             }],
             _ => Vec::new(),
         };
+        if result.is_ok() {
+            keep.push(Op::ClearMoved(vec![key.to_owned()]));
+        }
         self.end_write(bucket, &holder, keep).await;
         let etag = result?;
         let mut r = status(if existing.is_some() { 204 } else { 201 });
@@ -1281,7 +1379,8 @@ impl<U: Upstream, S: StatePort> Ctx<'_, U, S> {
             Res::Missing => Err(status(404)),
             Res::Bucket => Err(status(403)),
             Res::File(meta) => {
-                let http_guard = http_conditions(&req, Some(meta))?;
+                let http_guard = http_conditions(&req, Some(meta), true)?;
+                self.require_write(bucket, &path).await?;
                 let (holder, dav_guard) = self
                     .begin_write_with_guard(
                         bucket,
@@ -1300,22 +1399,38 @@ impl<U: Upstream, S: StatePort> Ctx<'_, U, S> {
                     )
                     .await?;
                 let guard = http_guard.or(dav_guard);
-                let r = self.s3.delete(bucket, &path, guard.as_ref()).await;
+                if let Err(r) = self
+                    .reserve(bucket, &holder, vec![(path.clone(), false)])
+                    .await
+                {
+                    self.end_write(bucket, &holder, Vec::new()).await;
+                    return Err(r);
+                }
+                let r = self
+                    .under_lease(
+                        bucket,
+                        &holder,
+                        self.s3.delete(bucket, &path, guard.as_ref()),
+                    )
+                    .await;
                 // Properties and locks go with the file, and only when it
                 // went.
-                let drops = match r {
-                    Ok(()) => forget(std::slice::from_ref(&path)),
-                    Err(_) => Vec::new(),
-                };
+                let mut drops = Vec::new();
+                if r.is_ok() {
+                    drops.extend(forget(std::slice::from_ref(&path)));
+                    drops.push(Op::ClearMoved(vec![path.clone()]));
+                }
                 self.end_write(bucket, &holder, drops).await;
                 r.map_err(|e| from_s3(&e))?;
                 self.keep_folder(bucket, &parent(&path)).await;
                 Ok(status(204))
             }
             Res::Coll { key: coll } => {
+                http_conditions(&req, None, true)?;
                 if depth(&req.headers) != Ok(None) {
                     return Err(status(400));
                 }
+                self.require_write(bucket, coll).await?;
                 let holder = self
                     .begin_write(
                         bucket,
@@ -1333,24 +1448,28 @@ impl<U: Upstream, S: StatePort> Ctx<'_, U, S> {
                         (coll, &res),
                     )
                     .await?;
-                let out = self
-                    .under_lease(bucket, &holder, self.delete_tree(bucket, coll))
-                    .await;
-                // Properties and locks of what was deleted, and nothing else.
-                let drops = match &out {
-                    Ok((_, failed)) if failed.is_empty() => forget_tree(coll).to_vec(),
-                    Ok((deleted, failed)) => {
-                        self.under_lease(
+                let work = async {
+                    self.reserve(bucket, &holder, vec![(coll.clone(), true)])
+                        .await?;
+                    let (deleted, failed) = self.delete_tree(bucket, coll).await?;
+                    let mut probe_budget = MAX_FOLDER_PROBES;
+                    let drops = self
+                        .forget_removed(
                             bucket,
-                            &holder,
-                            self.forget_removed(bucket, deleted, failed),
+                            Some(coll),
+                            &deleted,
+                            failed.iter().map(|(key, _)| key.as_str()),
+                            &mut probe_budget,
                         )
-                        .await
+                        .await;
+                    if !drops.is_empty() {
+                        self.state(bucket, drops).await?;
                     }
-                    Err(_) => Vec::new(),
+                    Ok(failed)
                 };
-                self.end_write(bucket, &holder, drops).await;
-                let (_, failed) = out?;
+                let out = self.under_lease(bucket, &holder, work).await;
+                self.end_write(bucket, &holder, Vec::new()).await;
+                let failed = out?;
                 if !failed.is_empty() {
                     return Ok(failed_members(bucket, &failed));
                 }
@@ -1360,32 +1479,41 @@ impl<U: Upstream, S: StatePort> Ctx<'_, U, S> {
         }
     }
 
-    /// A deleted S3 marker alone does not mean the WebDAV collection
-    /// disappeared. Preserve state when either known failures or a fresh
-    /// prefix lookup say the folder remains (or absence is not confirmed).
-    async fn forget_removed(
+    async fn forget_removed<'a>(
         &self,
         bucket: &str,
+        tree: Option<&str>,
         deleted: &[String],
-        failed: &[(String, u16)],
+        remaining: impl Iterator<Item = &'a str>,
+        probe_budget: &mut usize,
     ) -> Vec<Op> {
-        let mut removed = stream::iter(deleted)
-            .map(|key| async move {
-                if !key.ends_with('/')
-                    || (!failed.iter().any(|(k, _)| k.starts_with(key))
-                        && matches!(self.s3.any_under(bucket, key).await, Ok(false)))
-                {
-                    Some(key.clone())
-                } else {
-                    None
-                }
+        let (mut ops, folders) = removal_plan(tree, deleted, remaining);
+        if folders.is_empty() || *probe_budget == 0 {
+            return ops;
+        }
+        let Ok(replies) = self
+            .state(bucket, vec![Op::FoldersWithState(folders)])
+            .await
+        else {
+            return ops; // Unknown state: preserve folder metadata.
+        };
+        let Some(Reply::StatefulFolders(folders)) = replies.into_iter().next() else {
+            return ops;
+        };
+        let count = folders.len().min(*probe_budget);
+        *probe_budget -= count;
+        let mut probes = stream::iter(folders.into_iter().take(count))
+            .map(|folder| async move {
+                let absent = matches!(self.s3.any_under(bucket, &folder).await, Ok(false));
+                (folder, absent)
             })
             .buffer_unordered(self.cfg().fan_out.max(1));
-        let mut files_and_gone_folders = Vec::new();
-        while let Some(key) = removed.next().await {
-            files_and_gone_folders.extend(key);
+        while let Some((folder, absent)) = probes.next().await {
+            if absent {
+                ops.extend(forget_tree(&folder));
+            }
         }
-        forget(&files_and_gone_folders)
+        ops
     }
 
     async fn list_tree(&self, bucket: &str, coll: &str) -> Result<Vec<Entry>, Resp<U::Body>> {
@@ -1473,6 +1601,7 @@ impl<U: Upstream, S: StatePort> Ctx<'_, U, S> {
         if !self.parent_exists(bucket, &coll).await? {
             return Err(status(409));
         }
+        self.require_write(bucket, &coll).await?;
         let holder = self
             .begin_write(
                 bucket,
@@ -1490,19 +1619,34 @@ impl<U: Upstream, S: StatePort> Ctx<'_, U, S> {
                 (&coll, &Res::Missing),
             )
             .await?;
+        if let Err(r) = self
+            .reserve(bucket, &holder, vec![(coll.clone(), false)])
+            .await
+        {
+            self.end_write(bucket, &holder, Vec::new()).await;
+            return Err(r);
+        }
         let r = self
-            .s3
-            .put(
+            .under_lease(
                 bucket,
-                &coll,
-                Body::Empty,
-                0,
-                "application/x-directory",
-                &[],
-                Some(&Cond::Absent),
+                &holder,
+                self.s3.put(
+                    bucket,
+                    &coll,
+                    Body::Empty,
+                    0,
+                    "application/x-directory",
+                    &[],
+                    Some(&Cond::Absent),
+                ),
             )
             .await;
-        self.end_write(bucket, &holder, Vec::new()).await;
+        let ops = if r.is_ok() {
+            vec![Op::ClearMoved(vec![coll])]
+        } else {
+            Vec::new()
+        };
+        self.end_write(bucket, &holder, ops).await;
         match r {
             Ok(_) => Ok(status(201)),
             Err(e) if e.status == 412 || e.is("PreconditionFailed") => {
@@ -1522,7 +1666,7 @@ impl<U: Upstream, S: StatePort> Ctx<'_, U, S> {
             return Err(status(403));
         }
         let dest = req.header("destination").ok_or_else(|| status(400))?;
-        let dest_path = header_url_path(dest, &self.host).ok_or_else(|| status(502))?;
+        let dest_path = header_url_path(dest, &self.origin).ok_or_else(|| status(502))?;
         let dest_loc = match Loc::parse(&dest_path) {
             Ok(l) => l,
             Err(PathError::Bad) => return Err(status(400)),
@@ -1554,6 +1698,14 @@ impl<U: Upstream, S: StatePort> Ctx<'_, U, S> {
             (Res::Coll { .. }, Some(0)) if is_move => return Err(status(400)),
             _ => {}
         }
+        let src_meta = match &src {
+            Res::File(meta) => Some(meta),
+            _ => None,
+        };
+        let source_guard = match http_conditions(&req, src_meta, true)? {
+            Some(Cond::Is(etag)) => Some(etag),
+            _ => None,
+        };
         let src_path = state_path(&src, key);
         let dst_path = if src_coll {
             as_collection(dkey)
@@ -1611,51 +1763,67 @@ impl<U: Upstream, S: StatePort> Ctx<'_, U, S> {
                 scope: Scope::Member,
             });
         }
-        // Plan and validate every mapped key before changing either tree.
-        let mut members = Vec::new();
-        let mut markers = Vec::new();
-        if src_coll && depth != Some(0) {
-            let entries = self.list_tree(bucket, &src_path).await?;
-            let hidden = hidden_tree_keys(&entries);
-            if is_move && !hidden.is_empty() {
-                return Err(hidden_folder());
-            }
-            for entry in entries {
-                if hidden.contains(&entry.key) {
-                    // The hidden object bytes are never copied, but its
-                    // addressable collection prefixes can still be visible.
-                    if let Some(suffix) =
-                        visible_collection_prefix(&entry.key).strip_prefix(&src_path)
-                    {
-                        if !suffix.is_empty() {
-                            markers.push(format!("{dst_path}{suffix}"));
-                        }
-                    }
-                    continue;
-                }
-                let suffix = entry
-                    .key
-                    .strip_prefix(&src_path)
-                    .ok_or_else(|| status(502))?;
-                let dest = format!("{dst_path}{suffix}");
-                if !storable_key(&dest) {
-                    return Err(status(409));
-                }
-                members.push((entry, dest));
-            }
-            markers = empty_copy_markers(markers, &members);
+        self.require_write(bucket, &dst_path).await?;
+        if is_move {
+            self.require_write(bucket, &src_path).await?;
         }
-        // Materialize the root of an implied or depth-zero collection.
-        if src_coll && !members.iter().any(|(_, dest)| dest == &dst_path) {
-            markers.push(dst_path.clone());
+        let mut roots = vec![(dst_path.clone(), src_coll)];
+        if src_coll {
+            roots.push((as_file(&dst_path).to_owned(), false));
         }
-        if markers.iter().any(|key| !storable_key(key)) {
-            return Err(status(409));
+        if let Res::Coll { key } = &dst {
+            roots.push((key.clone(), true));
+        }
+        if is_move {
+            roots.push((src_path.clone(), src_coll));
         }
         let holder = self
             .begin_write(bucket, checks, ifh.as_ref(), (&src_path, &src))
             .await?;
         let work = async {
+            self.reserve(bucket, &holder, roots).await?;
+            let mut probe_budget = MAX_FOLDER_PROBES;
+            // Plan and validate every mapped key before changing either tree.
+            let mut members = Vec::new();
+            let mut markers = Vec::new();
+            if src_coll && depth != Some(0) {
+                let entries = self.list_tree(bucket, &src_path).await?;
+                let hidden = hidden_tree_keys(&entries);
+                if is_move && !hidden.is_empty() {
+                    return Err(hidden_folder());
+                }
+                for entry in entries {
+                    if hidden.contains(&entry.key) {
+                        // The hidden object bytes are never copied, but its
+                        // addressable collection prefixes can still be visible.
+                        if let Some(suffix) =
+                            visible_collection_prefix(&entry.key).strip_prefix(&src_path)
+                        {
+                            if !suffix.is_empty() {
+                                markers.push(format!("{dst_path}{suffix}"));
+                            }
+                        }
+                        continue;
+                    }
+                    let suffix = entry
+                        .key
+                        .strip_prefix(&src_path)
+                        .ok_or_else(|| status(502))?;
+                    let dest = format!("{dst_path}{suffix}");
+                    if !storable_key(&dest) {
+                        return Err(status(409));
+                    }
+                    members.push((entry, dest));
+                }
+                markers = empty_copy_markers(markers, &members);
+            }
+            // Materialize the root of an implied or depth-zero collection.
+            if src_coll && !members.iter().any(|(_, dest)| dest == &dst_path) {
+                markers.push(dst_path.clone());
+            }
+            if markers.iter().any(|key| !storable_key(key)) {
+                return Err(status(409));
+            }
             let dest_collection = match &dst {
                 Res::Coll { key } => Some(key.as_str()),
                 // A same-named file can mask the collection in resolve().
@@ -1663,6 +1831,7 @@ impl<U: Upstream, S: StatePort> Ctx<'_, U, S> {
                 _ => None,
             };
             let mut obsolete = Vec::new();
+            let mut listed = Vec::new();
             let mut destination_markers = HashMap::new();
             if let Some(dcoll) = dest_collection {
                 let entries = self.list_tree(bucket, dcoll).await?;
@@ -1671,6 +1840,7 @@ impl<U: Upstream, S: StatePort> Ctx<'_, U, S> {
                 new_keys.extend(members.iter().map(|(_, dest)| dest.as_str()));
                 new_keys.extend(markers.iter().map(String::as_str));
                 for e in entries {
+                    listed.push((e.key.clone(), e.etag.clone()));
                     if !new_keys.contains(e.key.as_str()) {
                         obsolete.push((e.key, e.etag));
                     } else if e.key.ends_with('/') {
@@ -1678,8 +1848,58 @@ impl<U: Upstream, S: StatePort> Ctx<'_, U, S> {
                     }
                 }
             }
-            if let (true, Res::File(meta)) = (src_coll, &dst) {
-                obsolete.push((dst_existing, meta.etag.clone()));
+            let exact = match (src_coll, &dst) {
+                (true, Res::File(meta)) => Some((dst_existing, meta.etag.clone())),
+                _ => None,
+            };
+            obsolete.extend(exact.clone());
+            // The complete listing can also reclaim rows whose keys are no
+            // longer present. The mutation reservation covers the whole handoff.
+            let mut kept = Vec::new();
+            if dest_collection.is_some() || exact.is_some() {
+                let replies = self
+                    .state(
+                        bucket,
+                        vec![Op::FindMoved {
+                            holder: holder.clone(),
+                            root: dest_collection.map(str::to_owned),
+                            listed,
+                            exact,
+                        }],
+                    )
+                    .await?;
+                let protected = match replies.into_iter().next() {
+                    Some(Reply::Moved(protected)) => protected,
+                    Some(Reply::Busy) => return Err(reservation_busy()),
+                    _ => return Err(status(500)),
+                };
+                let protected: HashSet<_> = protected.into_iter().collect();
+                obsolete.retain(|(key, _)| {
+                    if protected.contains(key) {
+                        kept.push(key.clone());
+                        false
+                    } else {
+                        true
+                    }
+                });
+            }
+            if is_move && src_coll {
+                let replies = self
+                    .state(
+                        bucket,
+                        vec![Op::ReserveMoved {
+                            holder: holder.clone(),
+                            destinations: members.iter().map(|(_, key)| key.clone()).collect(),
+                            ttl_secs: self.cfg().lease_secs,
+                        }],
+                    )
+                    .await?;
+                match replies.as_slice() {
+                    [Reply::Granted] => {}
+                    [Reply::Busy] => return Err(reservation_busy()),
+                    [Reply::Full] => return Err(status(507)),
+                    _ => return Err(status(500)),
+                }
             }
             let etag = if src_coll {
                 None
@@ -1687,7 +1907,13 @@ impl<U: Upstream, S: StatePort> Ctx<'_, U, S> {
                 let cond = (!overwrite).then_some(Cond::Absent);
                 Some(
                     self.s3
-                        .copy(bucket, &src_path, &dst_path, cond.as_ref(), None)
+                        .copy(
+                            bucket,
+                            &src_path,
+                            &dst_path,
+                            cond.as_ref(),
+                            source_guard.as_deref(),
+                        )
                         .await
                         .map_err(|e| from_s3(&e))?,
                 )
@@ -1695,103 +1921,168 @@ impl<U: Upstream, S: StatePort> Ctx<'_, U, S> {
             let TreeCopy {
                 versions,
                 mut properties,
-                failed,
-            } = self.copy_tree(bucket, &members, &destination_markers).await;
+                mut failed,
+            } = self
+                .copy_tree(bucket, &members, &destination_markers, overwrite)
+                .await;
+            let mut written: Vec<_> = versions.iter().map(|m| m.destination.clone()).collect();
+            let copied_version_count = written.len();
             if let Some(tag) = &etag {
                 properties.push(copied_file_props(&src_path, &dst_path, tag));
+                written.push(dst_path.clone());
             }
-            if !failed.is_empty() {
-                if !properties.is_empty() {
-                    self.state(bucket, properties).await?;
-                }
-                return Ok(failed_members(bucket, &failed));
-            }
-            // Materialize empty collections before deleting anything.
-            for marker in &markers {
-                if let Err(e) = self
-                    .s3
-                    .put(
-                        bucket,
-                        marker,
-                        Body::Empty,
-                        0,
-                        "application/x-directory",
-                        &[],
-                        Some(&Cond::Absent),
-                    )
-                    .await
-                {
-                    let code = from_s3::<U::Body>(&e).status;
-                    if code != 412 {
-                        if !properties.is_empty() {
-                            self.state(bucket, properties).await?;
+            let mut copied_keys = written.clone();
+            // Materialize empty collections before deleting anything. Only
+            // folders represented by a successful copy or marker get props.
+            if failed.is_empty() {
+                for marker in &markers {
+                    let result = self
+                        .s3
+                        .put(
+                            bucket,
+                            marker,
+                            Body::Empty,
+                            0,
+                            "application/x-directory",
+                            &[],
+                            Some(&Cond::Absent),
+                        )
+                        .await;
+                    match result {
+                        Ok(_) => written.push(marker.clone()),
+                        Err(e) => {
+                            let code = from_s3::<U::Body>(&e).status;
+                            if code != 412 {
+                                failed.push((marker.clone(), code));
+                                break;
+                            }
+                            // A marker already exists; we did not replace it.
                         }
-                        return Ok(failed_members(bucket, &[(marker.clone(), code)]));
                     }
-                    // A marker already exists.
+                    copied_keys.push(marker.clone());
                 }
             }
-            // Copies may replace same-named keys, but never remove an
-            // obsolete destination member until all copies have succeeded.
-            let (removed, failed) = self.delete_matching_members(bucket, obsolete, 412).await;
-            if let Some(old) = dest_collection.filter(|_| !src_coll && failed.is_empty()) {
-                if matches!(self.s3.any_under(bucket, old).await, Ok(false)) {
-                    properties.extend(forget_tree(old));
-                } else {
-                    properties.extend(self.forget_removed(bucket, &removed, &failed).await);
-                }
-            } else {
-                properties.extend(self.forget_removed(bucket, &removed, &failed).await);
-            }
-            if !failed.is_empty() {
-                if !properties.is_empty() {
-                    self.state(bucket, properties).await?;
-                }
-                return Ok(failed_members(bucket, &failed));
-            }
-            let (removed, failed) = if !is_move {
-                (Vec::new(), Vec::new())
-            } else if let Some(etag) = &etag {
-                if let Err(e) = self
-                    .s3
-                    .delete(bucket, &src_path, Some(&Cond::Is(etag.clone())))
-                    .await
-                {
-                    // The destination copy did succeed. Leave the source
-                    // state alone but give the copy its matching properties.
-                    self.state(bucket, properties).await?;
-                    let r = from_s3(&e);
-                    return Err(if r.status == 412 { status(409) } else { r });
-                }
-                (Vec::new(), Vec::new())
-            } else {
-                self.delete_matching_members(bucket, versions, 409).await
-            };
-            let mut ops = Vec::new();
-            if src_coll {
-                ops.push(Op::PropCopy {
+            if src_coll && !copied_keys.is_empty() {
+                properties.push(Op::PropCopyFolders {
                     from: src_path.clone(),
                     to: dst_path.clone(),
-                    tree: depth != Some(0),
-                    from_etag: None,
-                    to_etag: None,
+                    members: copied_keys.clone(),
                 });
             }
-            // For a complete copy, the collection op clears the old
-            // destination tree first. File state is applied afterward.
-            ops.extend(properties);
-            if is_move && failed.is_empty() {
-                if src_coll {
-                    ops.extend(forget_tree(&src_path));
-                } else {
-                    ops.extend(forget(std::slice::from_ref(&src_path)));
-                }
-            } else if is_move {
-                ops.extend(self.forget_removed(bucket, &removed, &failed).await);
+            // A renewal outage can expire a suspended request. Do not let it
+            // reconcile state or dispatch its prune after another holder enters.
+            self.check_reservation(bucket, &holder).await?;
+            let pending_move_keys = if is_move && src_coll && failed.is_empty() {
+                // Do not give up these existing ledger slots before the
+                // reserved versions replace them in RecordMoved.
+                written.drain(..copied_version_count).collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
+            if !written.is_empty() {
+                properties.push(Op::ClearMoved(written));
             }
-            self.state(bucket, ops).await?;
+            if !properties.is_empty() {
+                self.state(bucket, properties).await?;
+            }
             if !failed.is_empty() {
                 return Ok(failed_members(bucket, &failed));
+            }
+
+            // Do not prune obsolete keys until the copies and their state
+            // have succeeded. Protected keys were excluded under the reservation.
+            if !obsolete.is_empty() {
+                self.check_reservation(bucket, &holder).await?;
+            }
+            let (removed, failed) = self.delete_matching_members(bucket, obsolete, 412).await;
+            if !removed.is_empty() {
+                let ops = self
+                    .forget_removed(
+                        bucket,
+                        dest_collection,
+                        &removed,
+                        copied_keys
+                            .iter()
+                            .chain(&kept)
+                            .map(String::as_str)
+                            .chain(failed.iter().map(|(key, _)| key.as_str())),
+                        &mut probe_budget,
+                    )
+                    .await;
+                self.state(bucket, ops).await?;
+            }
+            if !failed.is_empty() {
+                if !pending_move_keys.is_empty() {
+                    self.state(bucket, vec![Op::ClearMoved(pending_move_keys)])
+                        .await?;
+                }
+                return Ok(failed_members_with_kept(bucket, &failed, &kept));
+            }
+
+            if is_move {
+                if let Some(etag) = &etag {
+                    self.check_reservation(bucket, &holder).await?;
+                    self.s3
+                        .delete(bucket, &src_path, Some(&Cond::Is(etag.clone())))
+                        .await
+                        .map_err(|e| {
+                            let r = from_s3(&e);
+                            if r.status == 412 {
+                                status(409)
+                            } else {
+                                r
+                            }
+                        })?;
+                    let mut ops = forget(std::slice::from_ref(&src_path));
+                    ops.push(Op::ClearMoved(vec![src_path.clone()]));
+                    self.state(bucket, ops).await?;
+                } else {
+                    let source_versions = versions
+                        .iter()
+                        .map(|m| (m.source.clone(), m.etag.clone()))
+                        .collect();
+                    // A failed state batch must abort before the first source
+                    // delete. If interrupted afterward, matching records stay.
+                    let replies = self
+                        .state(
+                            bucket,
+                            vec![Op::RecordMoved {
+                                holder: Some(holder.clone()),
+                                members: versions.clone(),
+                            }],
+                        )
+                        .await?;
+                    match replies.as_slice() {
+                        [Reply::Done] => {}
+                        [Reply::Busy] => return Err(reservation_busy()),
+                        [Reply::Full] => return Err(status(507)),
+                        _ => return Err(status(500)),
+                    }
+                    let (removed, failed) = self
+                        .delete_matching_members(bucket, source_versions, 409)
+                        .await;
+                    let mut ops = self
+                        .forget_removed(
+                            bucket,
+                            Some(&src_path),
+                            &removed,
+                            failed.iter().map(|(key, _)| key.as_str()),
+                            &mut probe_budget,
+                        )
+                        .await;
+                    if failed.is_empty() {
+                        ops.push(Op::FinishMove(versions));
+                    }
+                    if !ops.is_empty() {
+                        self.state(bucket, ops).await?;
+                    }
+                    if !failed.is_empty() {
+                        return Ok(failed_members_with_kept(bucket, &failed, &kept));
+                    }
+                }
+            }
+            if !kept.is_empty() {
+                return Ok(failed_members_with_kept(bucket, &[], &kept));
             }
             Ok(status(if dst.exists() { 204 } else { 201 }))
         };
@@ -1811,6 +2102,7 @@ impl<U: Upstream, S: StatePort> Ctx<'_, U, S> {
         bucket: &str,
         members: &[(Entry, String)],
         destination_markers: &HashMap<String, String>,
+        overwrite: bool,
     ) -> TreeCopy {
         let mut copied = TreeCopy::default();
         for batch in members.chunks(self.cfg().fan_out.max(1)) {
@@ -1818,11 +2110,15 @@ impl<U: Upstream, S: StatePort> Ctx<'_, U, S> {
                 let marker_etag = src.key.ends_with('/').then_some(src.etag.as_str());
                 // A same-named destination marker can also become hidden
                 // after preflight. Replace only the listed empty object.
-                let condition = marker_etag.map(|_| {
-                    destination_markers
-                        .get(dst)
-                        .map_or(Cond::Absent, |tag| Cond::Is(tag.clone()))
-                });
+                let condition = if !overwrite {
+                    Some(Cond::Absent)
+                } else {
+                    marker_etag.map(|_| {
+                        destination_markers
+                            .get(dst)
+                            .map_or(Cond::Absent, |tag| Cond::Is(tag.clone()))
+                    })
+                };
                 self.s3
                     .copy(bucket, &src.key, dst, condition.as_ref(), marker_etag)
                     .await
@@ -1836,7 +2132,11 @@ impl<U: Upstream, S: StatePort> Ctx<'_, U, S> {
                                 .properties
                                 .push(copied_file_props(&src.key, dst, &etag));
                         }
-                        copied.versions.push((src.key.clone(), etag));
+                        copied.versions.push(MovedMember {
+                            destination: dst.clone(),
+                            etag,
+                            source: src.key.clone(),
+                        });
                     }
                     Err(e) => copied
                         .failed
@@ -2007,7 +2307,12 @@ impl<U: Upstream, S: StatePort> Ctx<'_, U, S> {
             )
             .await
         {
-            Ok(_) => Ok(lock_answer(201, &lock, bucket, now, true)),
+            Ok(_) => {
+                let _ = self
+                    .state(bucket, vec![Op::ClearMoved(vec![lock_path])])
+                    .await;
+                Ok(lock_answer(201, &lock, bucket, now, true))
+            }
             Err(e) if e.status == 412 || e.is("PreconditionFailed") => {
                 Ok(lock_answer(200, &lock, bucket, now, true))
             }
@@ -2246,6 +2551,48 @@ fn forget(paths: &[String]) -> Vec<Op> {
         .collect()
 }
 
+/// Use the preflight plan minus successful deletes, plus successful writes,
+/// to detect absent collections, including ones that had no S3 marker.
+fn removal_plan<'a>(
+    tree: Option<&str>,
+    deleted: &[String],
+    remaining: impl Iterator<Item = &'a str>,
+) -> (Vec<Op>, Vec<String>) {
+    if deleted.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+    let mut remaining: Vec<_> = remaining.collect();
+    remaining.sort_unstable();
+    let mut keys: Vec<_> = deleted.iter().map(String::as_str).collect();
+    keys.sort_unstable();
+    let mut ops = vec![Op::ClearMoved(deleted.to_vec())];
+    let mut candidates = Vec::new();
+    let mut last_removed_tree = None;
+    for key in keys {
+        if !key.ends_with('/') {
+            ops.extend(forget(&[key.to_owned()]));
+        }
+        if last_removed_tree.is_some_and(|folder| key.starts_with(folder)) {
+            continue;
+        }
+        let gone = tree.and_then(|root| {
+            let suffix = key.strip_prefix(root)?;
+            std::iter::once(root)
+                .chain(
+                    suffix
+                        .match_indices('/')
+                        .map(|(i, _)| &key[..=root.len() + i]),
+                )
+                .find(|folder| !path::has_prefix_member(&remaining, folder))
+        });
+        if let Some(folder) = gone {
+            candidates.push(folder.to_owned());
+            last_removed_tree = Some(folder);
+        }
+    }
+    (ops, candidates)
+}
+
 fn copied_file_props(from: &str, to: &str, etag: &str) -> Op {
     // The bridge preserves the copied source's ETag on the destination.
     Op::PropCopy {
@@ -2259,7 +2606,7 @@ fn copied_file_props(from: &str, to: &str, etag: &str) -> Op {
 
 #[derive(Default)]
 struct TreeCopy {
-    versions: Vec<(String, String)>,
+    versions: Vec<MovedMember>,
     properties: Vec<Op>,
     failed: Vec<(String, u16)>,
 }
@@ -2338,11 +2685,26 @@ fn too_many<B>(cap: usize) -> Resp<B> {
 }
 
 /// `207` naming the members that failed.
+fn reservation_busy<B>() -> Resp<B> {
+    status(503).with_header("retry-after", "2")
+}
+
 fn failed_members<B>(bucket: &str, failed: &[(String, u16)]) -> Resp<B> {
-    let body: String = failed
+    failed_members_with_kept(bucket, failed, &[])
+}
+
+fn failed_members_with_kept<B>(bucket: &str, failed: &[(String, u16)], kept: &[String]) -> Resp<B> {
+    let mut body: String = failed
         .iter()
         .map(|(k, code)| props::status_response(&path::href(bucket, k), *code))
         .collect();
+    for key in kept {
+        body.push_str(&props::status_response_with_description(
+            &path::href(bucket, key),
+            409,
+            Some("kept after a partial MOVE"),
+        ));
+    }
     xml_resp(207, props::multistatus(&body))
 }
 
@@ -2414,22 +2776,36 @@ mod etag_tests {
 
 /// `If-Match`, `If-None-Match` and `If-Unmodified-Since` of a write,
 /// judged against what is there. `Some(guard)` when there were any.
-fn http_conditions<B>(req: &Request<B>, existing: Option<&Meta>) -> Result<Option<Cond>, Resp<B>> {
+fn http_conditions<B>(
+    req: &Request<B>,
+    existing: Option<&Meta>,
+    exists: bool,
+) -> Result<Option<Cond>, Resp<B>> {
     let etag = existing.map(|m| m.etag.as_str());
     let mut any = false;
+    let matches = |v: &str, weak| {
+        if v.trim() == "*" {
+            Ok(exists)
+        } else {
+            matches_etag(v, etag, weak).map_err(|()| status(400))
+        }
+    };
     if let Some(v) = req.header("if-match") {
         any = true;
-        if !matches_etag(v, etag, false).map_err(|()| status(400))? {
+        if !matches(v, false)? {
             return Err(status(412));
         }
     }
     if let Some(v) = req.header("if-none-match") {
         any = true;
-        if matches_etag(v, etag, true).map_err(|()| status(400))? {
+        if matches(v, true)? {
             return Err(status(412));
         }
     }
-    if let Some(v) = req.header("if-unmodified-since") {
+    if let Some(v) = req
+        .header("if-unmodified-since")
+        .filter(|_| req.header("if-match").is_none())
+    {
         any = true;
         if let (Some(m), Some(t)) = (existing, crate::time::parse_http_date(v)) {
             if m.modified_ms / 1000 > t / 1000 {
@@ -2577,7 +2953,7 @@ mod tests {
     #[test]
     fn destination_urls() {
         assert_eq!(
-            header_url_path("https://dav.test/b/x%20y", "dav.test").as_deref(),
+            header_url_path("https://dav.test/b/x%20y", "https://dav.test").as_deref(),
             Some("/b/x%20y")
         );
         assert_eq!(header_url_path("https://other/b/x", "dav.test"), None);

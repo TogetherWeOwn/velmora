@@ -28,6 +28,8 @@ impl<B> Body<B> {
 /// One request from a WebDAV client.
 pub struct Request<B> {
     pub method: String,
+    /// The effective request origin, supplied by the trusted runtime URL.
+    pub origin: String,
     /// The URL path as sent, still percent-encoded.
     pub path: String,
     /// Header names in lower case; values as sent.

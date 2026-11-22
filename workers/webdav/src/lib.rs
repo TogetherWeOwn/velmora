@@ -309,12 +309,13 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         .unwrap_or("/");
     // A fragment stays in: the handler refuses a target that has one.
     let path = path.split('?').next().unwrap_or("/").to_owned();
-    let mut headers: Vec<(String, String)> = req.headers().entries().collect();
-    if !headers.iter().any(|(n, _)| n == "host") {
-        if let Some(host) = url.split_once("://").and_then(|(_, r)| r.split('/').next()) {
-            headers.push(("host".into(), host.to_owned()));
-        }
-    }
+    let headers: Vec<(String, String)> = req.headers().entries().collect();
+    let origin = url
+        .split_once("://")
+        .map_or_else(String::new, |(scheme, rest)| {
+            let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+            format!("{scheme}://{authority}")
+        });
     let body = match req.inner().body() {
         Some(s) => Body::Native(WBody::Js(s)),
         None => Body::Empty,
@@ -327,6 +328,7 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
     let resp = dav
         .handle(DavRequest {
             method: method.clone(),
+            origin,
             path,
             headers,
             body,

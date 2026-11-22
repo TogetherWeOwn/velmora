@@ -40,17 +40,36 @@ pub const MIB: usize = 1024 * 1024;
 pub struct TBody {
     bytes: Vec<u8>,
     pos: usize,
+    pending: bool,
 }
 
 impl TBody {
     pub fn new(bytes: Vec<u8>) -> Self {
-        TBody { bytes, pos: 0 }
+        TBody {
+            bytes,
+            pos: 0,
+            pending: false,
+        }
+    }
+
+    pub fn pending() -> Self {
+        Self {
+            pending: true,
+            ..Self::new(Vec::new())
+        }
     }
 }
 
 pub enum StorageFault {
     Fail,
-    Replace { key: String, body: Vec<u8> },
+    Replace {
+        key: String,
+        body: Vec<u8>,
+    },
+    Pause {
+        reached: tokio::sync::oneshot::Sender<()>,
+        resume: tokio::sync::oneshot::Receiver<()>,
+    },
 }
 
 /// The storage Worker in process, reached as through `DavEntry`.
@@ -132,10 +151,17 @@ impl Upstream for Up {
                 });
             }
             let resp = Resp::collect(bridge.handle(req).await).await;
-            if let Some(StorageFault::Replace { key, body }) = fault {
-                assert_eq!(resp.status, 200);
-                let signer = Signer::new(S3KEY, S3KEY_SECRET);
-                assert_eq!(self.rig.put(&signer, BUCKET, &key, &body).await.status, 200);
+            match fault {
+                Some(StorageFault::Replace { key, body }) => {
+                    assert_eq!(resp.status, 200);
+                    let signer = Signer::new(S3KEY, S3KEY_SECRET);
+                    assert_eq!(self.rig.put(&signer, BUCKET, &key, &body).await.status, 200);
+                }
+                Some(StorageFault::Pause { reached, resume }) => {
+                    reached.send(()).unwrap();
+                    resume.await.unwrap();
+                }
+                _ => {}
             }
             Ok(Response {
                 status: resp.status,
@@ -150,6 +176,9 @@ impl Upstream for Up {
         body: &'a mut TBody,
         max: usize,
     ) -> LocalBoxFuture<'a, Result<Vec<u8>, S3Error>> {
+        if body.pending {
+            return Box::pin(std::future::pending());
+        }
         // Hands out at most 1 MiB at a time, as a stream would.
         let n = max.min(MIB).min(body.bytes.len() - body.pos);
         let out = body.bytes[body.pos..body.pos + n].to_vec();
@@ -406,6 +435,7 @@ impl World {
             .dav
             .handle(Request {
                 method: method.to_owned(),
+                origin: format!("https://{DAV_HOST}"),
                 path: path.to_owned(),
                 headers: h,
                 body: if body.is_empty() {
