@@ -50,8 +50,12 @@ async fn round_trips(mode: Mode) {
         assert!(intents(&rig).is_empty(), "the publish took its intents");
         assert!(orphans(&rig).is_empty() && broken(&rig).is_empty());
         assert_eq!(records(&rig), [generation.id.as_str().to_string()]);
-        // One posting job per slice.
+        // One posting job per slice, and every row marked as sent.
         assert_eq!(rig.bridge.jobs.inner.take().len(), extents.len());
+        assert_eq!(
+            rig.count("outbox WHERE sent_at = next_at"),
+            extents.len() as i64
+        );
 
         let head = rig.head(&signer, BUCKET, "big").await;
         head.expect(200);
@@ -64,6 +68,32 @@ async fn round_trips(mode: Mode) {
         got.expect(200);
         assert!(got.body == body, "{mode:?} {len}: the body reads back");
     }
+}
+
+/// A queue that refuses the posting jobs of a sliced body: the PUT is
+/// acknowledged all the same, and no row keeps a mark, so the next
+/// dispatcher run sends every job.
+#[tokio::test(flavor = "current_thread")]
+async fn a_refused_send_leaves_every_slice_unmarked() {
+    let rig = big_rig();
+    let (bucket, signer) = rig.standard(BUCKET).await;
+    let body = pattern(1, 16 * MIB + 1);
+    rig.bridge.jobs.fail.set(true);
+    let r = rig
+        .send(mode_req(&rig, &signer, "big", &body, MODES[0]))
+        .await;
+    assert_eq!(r.status, 200, "{}", r.text());
+    let (_, extents) = rig.live(&bucket, "big").await.unwrap();
+    assert_eq!(extents.len(), 3);
+    assert_eq!(rig.count("outbox WHERE sent_at IS NULL"), 3);
+    assert_eq!(rig.count("outbox"), 3);
+    let due = rig
+        .bridge
+        .catalog
+        .due(rig.now(), Resend::after(jobs::RESEND_SECS), 10)
+        .await
+        .unwrap();
+    assert_eq!(due.len(), 3);
 }
 
 #[tokio::test(flavor = "current_thread")]
