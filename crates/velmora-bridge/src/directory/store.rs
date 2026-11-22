@@ -191,6 +191,13 @@ const DROP_SHREDDED_ROUTES: &str = "DELETE FROM key_routes WHERE tenant = ?1 \
 const DROP_SHREDDED_LABELS: &str = "DELETE FROM bucket_index WHERE tenant = ?1 \
      AND (SELECT state FROM tenants WHERE id = ?1 AND record_seq = ?2) = 'shredded'";
 
+/// A tenant's key chain head as its row holds it: a point read.
+pub const KEYS_SEQ_OF: &str = "SELECT keys_seq FROM tenants WHERE id = ?1";
+
+/// The rows of a chain at or below a seq: one range of the primary key.
+pub const CLEAR_PENDING: &str =
+    "DELETE FROM pending_ops WHERE tenant = ?1 AND chain = ?2 AND seq <= ?3";
+
 /// One location of the key-location set; a row at a newer seq stays.
 const PUT_KEY_LOCATION: &str =
     "INSERT INTO key_locations (location, status, kl_seq) VALUES (?1, ?2, ?3) \
@@ -450,10 +457,7 @@ impl<S: Sql> SqlDirectory<'_, S> {
     pub async fn keys_seq_of(&self, tenant: &Tenant) -> Result<Option<u64>> {
         let rows = self
             .sql
-            .query(
-                "SELECT keys_seq FROM tenants WHERE id = ?1",
-                &[SqlValue::Text(tenant.as_str().to_string())],
-            )
+            .query(KEYS_SEQ_OF, &[SqlValue::Text(tenant.as_str().to_string())])
             .await?;
         rows.first()
             .map(|row| u64::try_from(int_at(row, 0)?).map_err(|_| ERR_ROW))
@@ -702,7 +706,7 @@ impl<S: Sql> SqlDirectory<'_, S> {
     pub async fn clear_pending(&self, tenant: &Tenant, chain: ChainKind, seq: u64) -> Result<u64> {
         self.sql
             .exec(
-                "DELETE FROM pending_ops WHERE tenant = ?1 AND chain = ?2 AND seq <= ?3",
+                CLEAR_PENDING,
                 &[
                     SqlValue::Text(tenant.as_str().to_string()),
                     SqlValue::Text(chain.as_str().to_string()),

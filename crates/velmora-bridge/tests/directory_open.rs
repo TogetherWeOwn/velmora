@@ -678,7 +678,7 @@ fn the_sweep_and_the_backstop_read_through_an_index() {
         let clear = plan(
             &db,
             "clear_pending",
-            "DELETE FROM pending_ops WHERE tenant = ?1 AND chain = ?2 AND seq <= ?3",
+            velmora_bridge::directory::store::CLEAR_PENDING,
             &[text(A1), text("k"), SqlValue::Int(1)],
         )
         .await;
@@ -725,7 +725,7 @@ fn the_sweep_and_the_backstop_read_through_an_index() {
         plan(
             &db,
             "keys_seq_of",
-            "SELECT keys_seq FROM tenants WHERE id = ?1",
+            velmora_bridge::directory::store::KEYS_SEQ_OF,
             &[text(A1)],
         )
         .await;
@@ -849,6 +849,82 @@ fn cap_pruning_rejects_oversize_limits_and_bounds_each_delete() {
         assert!(dir.prune_token_caps(day, 1001).await.is_err());
         assert_eq!(dir.prune_token_caps(day, 2).await.unwrap(), 2);
         assert_eq!(dir.prune_token_caps(day, 2).await.unwrap(), 1);
+    });
+}
+
+/// A row whose seq the whole-key seek does not pass (damage: above
+/// `MAX_SQL_INT`, or not an integer) is stepped past on the chain's first
+/// two columns: the sweep moves on to the next chain, and a damaged tenant
+/// id is stepped over without a loop.
+#[test]
+fn a_damaged_seq_does_not_stop_the_sweep() {
+    let db = database();
+    let dir = SqlDirectory { sql: &db };
+    block_on(async {
+        for (tenant, chain, seq) in [
+            (A1, "k", "9223372036854775807"),
+            (A1, "t", "'x'"),
+            ("t_zz", "k", "9223372036854775807"),
+        ] {
+            db.exec(
+                &format!(
+                    "INSERT INTO pending_ops (tenant, chain, seq, kind, created_at) \
+                     VALUES ('{tenant}', '{chain}', {seq}, 'x', 1)"
+                ),
+                &[],
+            )
+            .await
+            .unwrap();
+        }
+        note(&dir, B2, ChainKind::Tenant, 1, 5).await;
+        let all = dir.chains_after(None, 100).await.unwrap();
+        assert_eq!(
+            all,
+            vec![
+                (key(A1, ControlChain::Keys), UnixMs(1)),
+                (key(A1, ControlChain::Tenant), UnixMs(1)),
+                (key(B2, ControlChain::Tenant), UnixMs(5)),
+            ]
+        );
+    });
+}
+
+/// A gate whose row says open under a newer anchor is closed (`is_open`),
+/// and a first-open call closes over it and opens; a stray name before the
+/// first anchor likewise.
+#[test]
+fn a_first_open_recovers_a_row_open_under_a_newer_anchor() {
+    let db = database();
+    let store = HookedRecords::new();
+    let seal = PlainSeal::new();
+    let chain = TenantChain {
+        store: &store,
+        seal: &seal,
+    };
+    let dir = SqlDirectory { sql: &db };
+    let kek = kek();
+    block_on(async {
+        locations(&store, &kek).await;
+        store.plant("m/dg/0", vec![1]);
+        let FirstOpenAnswer::Ran(run) = first_open(&chain, &dir, &kek, NOW).await.unwrap() else {
+            panic!("no run");
+        };
+        // The stray name keeps epoch 1 from opening.
+        assert!(!run.opened);
+        assert!(!is_open(&store, &dir).await.unwrap());
+        let FirstOpenAnswer::Ran(run) = first_open(&chain, &dir, &kek, NOW).await.unwrap() else {
+            panic!("a retry did not run");
+        };
+        assert!(run.opened, "{run:?}");
+        assert!(is_open(&store, &dir).await.unwrap());
+        // An anchor put whose row write was lost, over an open gate.
+        store.plant(&format!("m/dg/{:020}", run.epoch + 1), vec![1]);
+        assert!(!is_open(&store, &dir).await.unwrap());
+        let FirstOpenAnswer::Ran(again) = first_open(&chain, &dir, &kek, NOW).await.unwrap() else {
+            panic!("no run over the newer anchor");
+        };
+        assert!(again.opened);
+        assert_eq!(again.epoch, run.epoch + 2);
     });
 }
 

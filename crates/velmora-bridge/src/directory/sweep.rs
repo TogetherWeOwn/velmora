@@ -29,6 +29,14 @@ pub const NEXT_CHAIN: &str = "SELECT p.tenant, p.chain, \
      FROM pending_ops p WHERE (p.tenant, p.chain, p.seq) > (?1, ?2, 9007199254740991) \
      ORDER BY p.tenant, p.chain, p.seq LIMIT 1";
 
+/// The next chain after a key, on the first two columns only: the way past
+/// a chain whose row holds a seq the whole-key seek does not pass (above
+/// `MAX_SQL_INT`, or not an integer: damage). It reads the rows of that
+/// chain, so it runs only then.
+pub const NEXT_CHAIN_PAST: &str = "SELECT p.tenant, p.chain, \
+     (SELECT MIN(q.created_at) FROM pending_ops q WHERE q.tenant = p.tenant AND q.chain = p.chain) \
+     FROM pending_ops p WHERE (p.tenant, p.chain) > (?1, ?2) ORDER BY p.tenant, p.chain LIMIT 1";
+
 /// The rows of one chain above a head, noted at or before a cutoff.
 pub const DROP_ABOVE: &str = "DELETE FROM pending_ops WHERE tenant = ?1 AND chain = ?2 \
      AND seq > ?3 AND created_at <= ?4";
@@ -39,6 +47,35 @@ fn chain_code(chain: ControlChain) -> &'static str {
     match chain {
         ControlChain::Keys => "k",
         ControlChain::Tenant => "t",
+    }
+}
+
+impl<S: Sql> SqlDirectory<'_, S> {
+    /// The chain after `cursor` by `sql`: tenant, chain, oldest row.
+    async fn next_chain(
+        &self,
+        sql: &str,
+        cursor: &(String, String),
+    ) -> Result<Option<(String, String, i64)>> {
+        let rows = self
+            .sql
+            .query(
+                sql,
+                &[
+                    SqlValue::Text(cursor.0.clone()),
+                    SqlValue::Text(cursor.1.clone()),
+                ],
+            )
+            .await?;
+        let Some(row) = rows.into_iter().next() else {
+            return Ok(None);
+        };
+        match row.as_slice() {
+            [SqlValue::Text(t), SqlValue::Text(c), SqlValue::Int(at)] => {
+                Ok(Some((t.clone(), c.clone(), *at)))
+            }
+            _ => Err(ERR_PENDING_ROW),
+        }
     }
 }
 
@@ -58,24 +95,23 @@ impl<S: Sql> PendingRows for SqlDirectory<'_, S> {
             )
         });
         while (out.len() as u32) < limit {
-            let rows = self
-                .sql
-                .query(
-                    NEXT_CHAIN,
-                    &[
-                        SqlValue::Text(cursor.0.clone()),
-                        SqlValue::Text(cursor.1.clone()),
-                    ],
-                )
-                .await?;
-            let Some(row) = rows.into_iter().next() else {
-                break;
-            };
-            let (tenant, chain, oldest) = match row.as_slice() {
-                [SqlValue::Text(t), SqlValue::Text(c), SqlValue::Int(at)] => {
-                    (t.clone(), c.clone(), *at)
+            let mut next = self.next_chain(NEXT_CHAIN, &cursor).await?;
+            // A damaged seq in the cursor's own chain is found again by the
+            // whole-key seek: step past the chain on its first two columns.
+            if next
+                .as_ref()
+                .is_some_and(|(t, c, _)| (t, c) == (&cursor.0, &cursor.1))
+            {
+                next = self.next_chain(NEXT_CHAIN_PAST, &cursor).await?;
+                if next
+                    .as_ref()
+                    .is_some_and(|(t, c, _)| (t, c) == (&cursor.0, &cursor.1))
+                {
+                    return Err(ERR_PENDING_ROW);
                 }
-                _ => return Err(ERR_PENDING_ROW),
+            }
+            let Some((tenant, chain, oldest)) = next else {
+                break;
             };
             cursor = (tenant.clone(), chain.clone());
             let kind = match chain.as_str() {

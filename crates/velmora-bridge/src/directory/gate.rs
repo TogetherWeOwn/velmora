@@ -553,8 +553,8 @@ pub async fn run_gate<S: RecordStore, C: ControlSeal, Q: Sql, G: GateSteps>(
     run_from(chain, dir, steps, epoch, now).await
 }
 
-/// [`run_gate`] only over a gate that is closed: the gate row is read
-/// again right before the closing's anchor is put, so a run whose guard
+/// [`run_gate`] only over a gate that is closed: the gate is read again
+/// ([`is_open`]) right before the closing's anchor is put, so a run whose guard
 /// passed while another run was under way does not close the gate that
 /// run has opened since (AM-78, the first open). `None`: the gate is open
 /// now, or another closing took the epoch first; nothing was written. A
@@ -572,7 +572,10 @@ pub async fn run_gate_if_closed<S: RecordStore, C: ControlSeal, Q: Sql, G: GateS
 ) -> Result<Option<GateRun>> {
     let (anchored, _) = anchored_epoch(chain.store).await?;
     let row = dir.gate().await?;
-    if !row.closed {
+    // Only a gate that is open in full is left alone. A row that says
+    // open under a newer anchor or a stray name is closed (`is_open`), and
+    // a closing over it is what opens it again.
+    if !row.closed && is_open(chain.store, dir).await? {
         return Ok(None);
     }
     let epoch = anchored
