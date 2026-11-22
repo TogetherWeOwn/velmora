@@ -310,7 +310,7 @@ impl<S: Sql> SqlDirectory<'_, S> {
                 ],
             )
             .await?;
-        let items = rows
+        let mut items = rows
             .iter()
             .map(|row| {
                 let data = match serde_json::from_str(&text(row, 4)?) {
@@ -329,21 +329,27 @@ impl<S: Sql> SqlDirectory<'_, S> {
         // A new epoch makes the page stale. After a position, a prune that
         // ran meanwhile may have removed rows of this range before the
         // read saw them. Without one, the read starts at the oldest kept
-        // event, and a row the prune took is no longer kept.
+        // event: a row the prune took meanwhile is dropped from the page,
+        // so the position it answers is never below the new mark.
         let again = self.feed_state(tenant).await?;
         if again.epoch != state.epoch || (after.is_some() && again.pruned > from) {
             return Ok(Err(FeedReset));
         }
-        let position = match (items.last(), after) {
-            (Some(last), _) => FeedPosition {
-                epoch: state.epoch,
-                seq: last.seq,
-            },
-            (None, Some(p)) => p,
-            (None, None) => FeedPosition {
-                epoch: state.epoch,
-                seq: state.newest.max(state.base).max(state.pruned),
-            },
+        let page_end = items.last().map(|e| e.seq);
+        if after.is_none() {
+            items.retain(|e| e.seq > again.pruned);
+        }
+        let seq = match (items.last(), after, page_end) {
+            (Some(last), _, _) => last.seq,
+            (None, Some(p), _) => p.seq,
+            // Every row of the page was pruned meanwhile: the mark, so the
+            // next read starts after it and skips nothing kept.
+            (None, None, Some(end)) => end.max(again.pruned),
+            (None, None, None) => state.newest.max(state.base).max(again.pruned),
+        };
+        let position = FeedPosition {
+            epoch: state.epoch,
+            seq,
         };
         Ok(Ok(EventPage { items, position }))
     }

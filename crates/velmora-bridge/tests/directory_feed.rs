@@ -435,9 +435,11 @@ fn a_prune_during_a_read_resets_a_position_and_never_a_read_without_one() {
             armed: std::cell::Cell::new(true),
         };
         let r = SqlDirectory { sql: &racing };
-        // Without `after`: the page as read, no reset.
+        // Without `after`: no reset; the row the prune took meanwhile is
+        // dropped, so the position is never below the new mark.
         let p = r.tenant_events(&t(A1), None, 10).await.unwrap().unwrap();
-        assert_eq!(seqs(&p), [1, 2, 3]);
+        assert_eq!(seqs(&p), [2, 3]);
+        assert_eq!(p.position, pos(0, 3));
         // The prune ran: seq 1 is gone, the mark is 1.
         let after = dir.tenant_events(&t(A1), None, 10).await.unwrap().unwrap();
         assert_eq!(seqs(&after), [2, 3]);
@@ -453,5 +455,29 @@ fn a_prune_during_a_read_resets_a_position_and_never_a_read_without_one() {
             r.tenant_events(&t(A1), Some(pos(0, 1)), 10).await.unwrap(),
             Err(FeedReset)
         );
+    });
+}
+
+/// A first page whose only row the prune took during the read answers the
+/// prune mark, and the next read from it is not reset and skips nothing.
+#[test]
+fn a_first_page_pruned_during_the_read_answers_the_mark() {
+    block_on(async {
+        let db = database();
+        let dir = SqlDirectory { sql: &db };
+        let old = NOW.0 - EVENT_KEEP_MS - 1;
+        append(&dir, A1, "t/1", old).await;
+        append(&dir, A1, "t/2", NOW.0).await;
+        let racing = PruneDuringRead {
+            db: &db,
+            cutoff: UnixMs(NOW.0 - EVENT_KEEP_MS),
+            armed: std::cell::Cell::new(true),
+        };
+        let r = SqlDirectory { sql: &racing };
+        let p = r.tenant_events(&t(A1), None, 1).await.unwrap().unwrap();
+        assert!(p.items.is_empty());
+        assert_eq!(p.position, pos(0, 1));
+        let next = page(&dir, A1, Some(p.position), 10).await.unwrap();
+        assert_eq!(seqs(&next), [2]);
     });
 }
