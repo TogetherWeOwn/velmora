@@ -488,12 +488,12 @@ pub async fn rebuild_tenants<S: RecordStore, C: ControlSeal, Q: Sql>(
     dir: &SqlDirectory<'_, Q>,
     now: UnixMs,
 ) -> Result<TenantStep> {
-    rebuild_tenants_in(chain, dir, now, TenantScope::All).await
+    rebuild_tenants_in(chain, dir, now, RowsWritten::All).await
 }
 
 /// Which tenants' rows a tenant step writes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum TenantScope {
+enum RowsWritten {
     /// Every tenant.
     All,
     /// Tenant 0's only (the first open, AM-83b item 7): a managed tenant
@@ -503,9 +503,9 @@ enum TenantScope {
     ZeroOnly,
 }
 
-impl TenantScope {
+impl RowsWritten {
     fn writes(self, tenant: &Tenant) -> bool {
-        self == TenantScope::All || *tenant == Tenant::Zero
+        self == RowsWritten::All || *tenant == Tenant::Zero
     }
 }
 
@@ -513,7 +513,7 @@ async fn rebuild_tenants_in<S: RecordStore, C: ControlSeal, Q: Sql>(
     chain: &TenantChain<'_, S, C>,
     dir: &SqlDirectory<'_, Q>,
     now: UnixMs,
-    scope: TenantScope,
+    scope: RowsWritten,
 ) -> Result<TenantStep> {
     let heads = heads(chain).await?;
     let compared = compare(&heads, dir).await?;
@@ -624,10 +624,10 @@ impl Fence {
         }
     }
 
-    fn scope(self) -> TenantScope {
+    fn scope(self) -> RowsWritten {
         match self {
-            Fence::Anchor(_) => TenantScope::All,
-            Fence::FirstOpen => TenantScope::ZeroOnly,
+            Fence::Anchor(_) => RowsWritten::All,
+            Fence::FirstOpen => RowsWritten::ZeroOnly,
         }
     }
 
