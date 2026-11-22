@@ -242,6 +242,12 @@ if [[ $MODE == local ]]; then
     redacted_tail "$T/migrate.log"
     fail "d1 migrations apply" "exit 0" "non-zero exit (log above)"
   fi
+  log "applying the directory migrations to the same local state"
+  if ! npx --yes wrangler@4 d1 migrations apply velmora-directory-dev --local --env dev \
+    --persist-to "$T/state" >"$T/migrate-directory.log" 2>&1 </dev/null; then
+    redacted_tail "$T/migrate-directory.log"
+    fail "d1 migrations apply (directory)" "exit 0" "non-zero exit (log above)"
+  fi
 
   wrangler_ready() {
     kill -0 "$WRANGLER_PID" 2>/dev/null || return 2

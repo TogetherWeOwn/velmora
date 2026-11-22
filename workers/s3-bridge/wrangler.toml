@@ -528,6 +528,16 @@ database_name = "velmora-catalog-dev"
 database_id = "<from wrangler d1 create>"
 migrations_dir = "migrations"
 
+# The directory database, local only: the local slice applies its
+# migrations (migrations-directory/) as the production deploy does, so a
+# directory migration that does not apply fails before it merges. No
+# Worker code reads it yet.
+[[env.dev.d1_databases]]
+binding = "DIRECTORY"
+database_name = "velmora-directory-dev"
+database_id = "<directory: from wrangler d1 create>"
+migrations_dir = "migrations-directory"
+
 [[env.dev.r2_buckets]]
 binding = "SAFETY"
 bucket_name = "velmora-safety-dev"
