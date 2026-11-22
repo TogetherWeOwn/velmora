@@ -36,7 +36,9 @@ pub enum ApplyEntry {
     /// closing step's hold, ADR §2.5, AM-9). `entry` is the head's entry
     /// with `private: None` (no secret, no grant limits, no label), as for
     /// a subject that does not open. A held subject keeps its identity
-    /// (AM-72): `owner_ref` is its private part's.
+    /// (AM-9 with AM-72): for a principal, `owner_ref` is its private
+    /// part's; for a key it is `None`. Every sender sets the wire's `held`
+    /// from [`ApplyEntry::held`].
     ///
     /// For the unit's wire (`KeyEntry`): `held = true`, `owner_ref` as
     /// here, no secret, no `secret_kek_version`, grants without their

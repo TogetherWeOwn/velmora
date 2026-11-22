@@ -39,8 +39,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use super::chain::Chain;
 use super::ports::{Applied, ApplyEntry, KeyTarget, MAX_APPLY};
 use super::record::{
-    key_chain, open_chain_record, ChainRecord, Entry, KeyTable, Marker, Rid, SubjectStatus, TkRing,
-    ERR_KEY_RECORD,
+    key_chain, open_chain_record, ChainRecord, Entry, KeyTable, Marker, Rid, SubjectKind,
+    SubjectStatus, TkRing, ERR_KEY_RECORD,
 };
 
 use crate::ports::Kek;
@@ -88,6 +88,9 @@ pub struct Feed<'a, S, K, T> {
     table: &'a KeyTable,
     revoked: &'a BTreeSet<String>,
     memo: RefCell<BTreeMap<u64, Slot>>,
+    /// The subjects [`Feed::entries_for`] sent held: a store that took one
+    /// holds it closed from then on, whatever its `closed` read said.
+    held_sent: RefCell<BTreeSet<String>>,
 }
 
 impl<'a, S: RecordStore, K: Kek, T: TkRing> Feed<'a, S, K, T> {
@@ -106,6 +109,7 @@ impl<'a, S: RecordStore, K: Kek, T: TkRing> Feed<'a, S, K, T> {
             table,
             revoked,
             memo: RefCell::new(BTreeMap::new()),
+            held_sent: RefCell::new(BTreeSet::new()),
         }
     }
 
@@ -160,8 +164,9 @@ impl<'a, S: RecordStore, K: Kek, T: TkRing> Feed<'a, S, K, T> {
 
     /// Holds closed, in `mode`, an entry whose opening the directory may
     /// not have: the rule of the closing step. The held entry drops its
-    /// private part (the secret, the grant limits, the label) and keeps
-    /// its `owner_ref` (AM-72).
+    /// private part (the secret, the grant limits, the label); a held
+    /// principal keeps its `owner_ref`, a held key sends none (AM-9 with
+    /// AM-72).
     fn hold(mode: Mode, held: u64, closed: &BTreeSet<String>, entry: &mut ApplyEntry) {
         let (Mode::Closing { acked }, ApplyEntry::Subject(e)) = (mode, &mut *entry) else {
             return;
@@ -176,10 +181,16 @@ impl<'a, S: RecordStore, K: Kek, T: TkRing> Feed<'a, S, K, T> {
         let Some(private) = e.private.take() else {
             return;
         };
+        // The identity a held subject keeps (AM-9 with AM-72): a
+        // principal's member; a key sends none.
+        let owner_ref = match e.door.kind {
+            SubjectKind::Principal => private.owner_ref,
+            _ => None,
+        };
         let held_entry = e.clone();
         *entry = ApplyEntry::Held {
             entry: held_entry,
-            owner_ref: private.owner_ref,
+            owner_ref,
         };
     }
 
@@ -314,14 +325,32 @@ impl<'a, S: RecordStore, K: Kek, T: TkRing> Feed<'a, S, K, T> {
     }
 
     /// [`Feed::entries`] as a store at `keys_seq = after` takes them in
-    /// `mode` (AM-71's `KeyFeed`, serving a unit that asks for the records
-    /// after its `keys_seq`): in [`Mode::Closing`], an entry whose newest
-    /// opening the directory has not acknowledged (above `acked`, unless
-    /// the store already holds that opening open at or below `after`) is
-    /// [`ApplyEntry::Held`] with its `owner_ref`; `closed` is the store's
-    /// closed subjects ([`KeyTarget::closed`]). [`Mode::Full`] holds
-    /// nothing. The `m/rk/` revocations below `after` and the second send
-    /// are the bring-up's ([`Feed::bring_up`]), not this read's.
+    /// `mode` (AM-71's `KeyFeed`: a unit asking for the records after its
+    /// `keys_seq`, page by page). [`Mode::Full`] holds nothing. In
+    /// [`Mode::Closing`] the closing step's rule (as [`Feed::bring_up`]):
+    /// an entry is [`ApplyEntry::Held`], with its `owner_ref`, unless its
+    /// newest opening is at or below `acked` (the directory's `keys_seq`),
+    /// or at or below `after` while the store holds the subject open.
+    ///
+    /// - **`closed` must be the store's closed subjects
+    ///   ([`KeyTarget::closed`]) read at the same `keys_seq` as the first
+    ///   `after`**: one read that answers both (the unit's `closed` with
+    ///   its `keys_seq`), made again for every round of a sync and never
+    ///   reused across rounds. Every record at or below `after` is the
+    ///   store's (the apply has no gap), so a subject whose opening is
+    ///   there and that the store does not hold closed is held open by the
+    ///   store already: sending it open opens nothing new. So a stale or
+    ///   failed `acked` (0) never closes what the store served open at
+    ///   `after`. A `closed` older than `after` could send open what the
+    ///   directory lacks; one newer than `after` can close what a finisher
+    ///   opened in between (fails safe).
+    /// - Across the pages of one round, `after` moves on while `closed`
+    ///   was read once: every subject this feed sent held counts as closed
+    ///   on the later pages (the store took it closed). Use one `Feed` for
+    ///   the pages of one round.
+    ///
+    /// The `m/rk/` revocations below `after` and the second send are the
+    /// bring-up's ([`Feed::bring_up`]), not this read's.
     pub async fn entries_for(
         &self,
         after: u64,
@@ -330,8 +359,13 @@ impl<'a, S: RecordStore, K: Kek, T: TkRing> Feed<'a, S, K, T> {
         closed: &BTreeSet<String>,
     ) -> Result<Vec<ApplyEntry>> {
         let mut out = self.entries(after, limit).await?;
+        let mut held_sent = self.held_sent.borrow_mut();
+        let closed: BTreeSet<String> = closed.union(&held_sent).cloned().collect();
         for e in &mut out {
-            Self::hold(mode, after, closed, e);
+            Self::hold(mode, after, &closed, e);
+            if let ApplyEntry::Held { entry, .. } = e {
+                held_sent.insert(entry.door.id.clone());
+            }
         }
         Ok(out)
     }
