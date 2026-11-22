@@ -1645,6 +1645,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "velmora-unit-do"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "velmora-bridge",
+ "worker",
+]
+
+[[package]]
+name = "velmora-unit-suite"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "serde_json",
+ "velmora-bridge",
+ "velmora-unit-do",
+ "worker",
+]
+
+[[package]]
 name = "walkdir"
 version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

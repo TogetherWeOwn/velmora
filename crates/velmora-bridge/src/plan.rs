@@ -131,7 +131,7 @@ impl FillRandom for SeedRng {
 }
 
 /// What one call of [`crate::ports::Catalog::pack_plans`] did.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PackReport {
     /// Extents with article rows that the call looked at.
     pub looked: u32,
@@ -144,7 +144,7 @@ pub struct PackReport {
 }
 
 /// The plan of an extent as the catalogue holds it.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct StoredPlan {
     /// The articles, in `idx` order. Empty = the extent has no plan.
     pub rows: Vec<ArticleRow>,

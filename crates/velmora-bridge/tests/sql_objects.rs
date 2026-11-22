@@ -2356,7 +2356,10 @@ async fn extents_in_matches_the_statement_it_replaced() {
             (size + 5, size + 9),
             (0, 0),
             (size, size),
-            (0, u64::MAX >> 1),
+            // An open end: the largest integer D1 and a Durable Object
+            // bind exactly (2^53 - 1). Above it both adapters refuse
+            // the statement, as the workerd run of this suite shows.
+            (0, (1 << 53) - 1),
         ];
         let mut border = 0;
         for s in &sizes {

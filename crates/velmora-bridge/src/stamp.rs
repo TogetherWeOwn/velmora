@@ -82,7 +82,7 @@ const PUT_ATTEMPTS: usize = 3;
 const TOP_PAGE: u32 = 1000;
 
 /// The stamp row of the catalogue.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct StampRow {
     /// `None` = no row: the counter was never raised on this database.
     pub counter: Option<u64>,

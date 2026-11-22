@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/velmora", "crates/velmora-test-nntp", "crates/velmora-ssrf-guard", "crates/velmora-s3-proto", "crates/velmora-bridge", "crates/velmora-mgmt-types", "crates/velmora-parity-bench", "crates/velmora-cpu-bench", "workers/s3-bridge"]
+members = ["crates/velmora", "crates/velmora-test-nntp", "crates/velmora-ssrf-guard", "crates/velmora-s3-proto", "crates/velmora-bridge", "crates/velmora-mgmt-types", "crates/velmora-parity-bench", "crates/velmora-cpu-bench", "workers/s3-bridge", "workers/unit", "workers/unit-suite"]
 resolver = "2"
 
 # `cargo test` only. The tests seal, encode, hash and read back hundreds of

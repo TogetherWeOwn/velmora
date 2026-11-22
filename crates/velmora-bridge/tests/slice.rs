@@ -2024,7 +2024,9 @@ async fn rebuild_from_usenet(packed_plans: &str) {
     // A release keeps the copy in R2 until the hot tier evicts it. Evict
     // all that may go, so that the replay meets extents with a copy
     // (still pinned) and without one.
-    let all = u64::MAX / 2;
+    // Every byte there is: the largest integer D1 and a Durable Object
+    // bind exactly (2^53 - 1).
+    let all = (1u64 << 53) - 1;
     rig.bridge
         .catalog
         .hot_drain_set(all)
@@ -2813,7 +2815,9 @@ async fn a_backfill_packs_posted_plans_and_they_read_from_usenet() {
     // Cold: no cache, and no safety copy where the hot tier may drop it.
     let s = "backfill cold read";
     rig.pump(s).await;
-    let all = u64::MAX / 2;
+    // Every byte there is: the largest integer D1 and a Durable Object
+    // bind exactly (2^53 - 1).
+    let all = (1u64 << 53) - 1;
     rig.bridge
         .catalog
         .hot_drain_set(all)
