@@ -385,7 +385,9 @@ impl<P: UnitPort, S: Catalog> Catalog for TenantCatalog<P, S> {
     /// that is not taken back leaves the row marked, as a failed take-back
     /// does on D1. The unit's job call is the unit lanes' to add.
     async fn unmark_sent(&self, _jobs: &[crate::types::Job], _mark: UnixMs) -> Result<u64> {
-        Err(BridgeError::Sql("unit: unmark_sent is not a job call".into()))
+        Err(BridgeError::Sql(
+            "unit: unmark_sent is not a job call".into(),
+        ))
     }
     async fn pack_plans(&self, limit: u32) -> Result<PackReport> {
         self.unit(JobCall::pack_plans { limit }).await

@@ -92,6 +92,16 @@ pub enum TokenClass {
     Confirmed,
 }
 
+/// The class as the contract's fingerprint names it.
+impl From<TokenClass> for velmora_mgmt_types::idem::TokenClass {
+    fn from(class: TokenClass) -> Self {
+        match class {
+            TokenClass::Standard => velmora_mgmt_types::idem::TokenClass::Standard,
+            TokenClass::Confirmed => velmora_mgmt_types::idem::TokenClass::Confirmed,
+        }
+    }
+}
+
 impl TokenClass {
     pub const ALL: [TokenClass; 2] = [TokenClass::Standard, TokenClass::Confirmed];
 

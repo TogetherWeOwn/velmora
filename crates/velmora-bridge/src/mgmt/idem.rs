@@ -54,9 +54,9 @@ impl IdemRequest {
 }
 
 /// The id a reservation gets at its first admit, kept by every re-ask.
-/// Every record of a reserved call carries it in its door part.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Rid(pub [u8; 16]);
+/// Every record of a reserved call carries it in its door part. The
+/// Worker draws it; the unit keeps the first one (L1, #231).
+pub use crate::unit::reserve::Rid;
 
 /// What the root unit answers to a reservation ask.
 #[derive(Clone, Debug, PartialEq, Eq)]
