@@ -871,6 +871,7 @@ impl<U: Upstream, S: StatePort> Ctx<'_, U, S> {
                 match reply {
                     Reply::Locks(l) => locks = l,
                     Reply::Props(p) => dead = p,
+                    Reply::Full => return Err(status(507)),
                     _ => {}
                 }
             }

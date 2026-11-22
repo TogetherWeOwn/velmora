@@ -83,6 +83,7 @@ pub const SCHEMA: &[&str] = &[
 /// object.
 pub const MAX_PROP_BYTES: usize = 64 * 1024;
 pub const MAX_PROPS_PER_RESOURCE: usize = 256 * 1024;
+const MAX_PROPFIND_PROP_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_LOCKS_PER_BUCKET: i64 = 5_000;
 pub const MAX_LOCKS_PER_KEY: i64 = 500;
 pub const MAX_OWNER_BYTES: usize = 1024;
@@ -188,6 +189,7 @@ pub enum Op {
     },
     /// Dead properties of each `(path, etag)`; rows with a different
     /// stamp are skipped, not deleted. `names`: only these (`None`: all).
+    /// Replies `Full` rather than returning a partial result over the budget.
     PropGet {
         paths: Vec<(String, Option<String>)>,
         names: Option<Vec<(String, String)>>,
@@ -599,25 +601,34 @@ impl<S: Sql> Engine<'_, S> {
             }
             Op::PropGet { paths, names } => {
                 let mut out = Vec::with_capacity(paths.len());
+                let mut remaining = MAX_PROPFIND_PROP_BYTES;
+                // Read no more than one resource's rows at a time. Apply
+                // the request-wide limit before retaining a value for reply.
                 for (path, etag) in &paths {
                     let rows = self.sql.exec(
                         "SELECT ns, name, value_xml FROM dav_props \
                          WHERE path = ?1 AND etag IS ?2 ORDER BY ns, name",
                         &[t(path), etag.as_deref().map_or(Val::Null, t)],
                     )?;
-                    let props: Vec<DeadProp> = rows
-                        .iter()
-                        .map(|r| DeadProp {
-                            ns: r[0].text(),
-                            name: r[1].text(),
-                            xml: r[2].text(),
-                        })
-                        .filter(|p| {
-                            names.as_ref().is_none_or(|n| {
-                                n.iter().any(|(ns, name)| *ns == p.ns && *name == p.name)
-                            })
-                        })
-                        .collect();
+                    let mut props = Vec::new();
+                    for row in rows {
+                        let Ok([Val::Text(ns), Val::Text(name), Val::Text(xml)]) =
+                            <[Val; 3]>::try_from(row)
+                        else {
+                            return Err("invalid dead property row".into());
+                        };
+                        if names.as_ref().is_some_and(|n| {
+                            !n.iter()
+                                .any(|(want_ns, want_name)| want_ns == &ns && want_name == &name)
+                        }) {
+                            continue;
+                        }
+                        let Some(left) = remaining.checked_sub(xml.len()) else {
+                            return Ok(Reply::Full);
+                        };
+                        remaining = left;
+                        props.push(DeadProp { ns, name, xml });
+                    }
                     out.push(props);
                 }
                 Ok(Reply::Props(out))

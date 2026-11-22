@@ -430,6 +430,69 @@ async fn propfind_depths_and_the_two_views_agree() {
 }
 
 #[tokio::test]
+async fn propfind_refuses_more_than_16_mib_of_dead_properties() {
+    let w = World::new().await;
+    // Each resource has four legal ~62 KiB properties. Across 67
+    // resources that is over 16 MiB of UTF-8, but fewer characters.
+    let value = "é".repeat(31 * 1024);
+    let mut patch = String::from(r#"<D:propertyupdate xmlns:D="DAV:"><D:set><D:prop>"#);
+    for name in ["a", "b", "c", "d"] {
+        patch.push_str(&format!(r#"<{name} xmlns="urn:test">{value}</{name}>"#));
+    }
+    patch.push_str("</D:prop></D:set></D:propertyupdate>");
+    for i in 0..67 {
+        let key = format!("docs/report-{i}");
+        assert_eq!(w.s3_put(&key, b"report").await, 200);
+        let r = w
+            .req("PROPPATCH", &format!("/dav/{key}"), &[], patch.as_bytes())
+            .await;
+        r.expect(207);
+        assert!(r.text().contains("HTTP/1.1 200 OK"));
+        assert!(!r.text().contains("HTTP/1.1 507"));
+    }
+    let r = w
+        .req(
+            "PROPFIND",
+            "/dav/docs/",
+            &[("depth", "1")],
+            br#"<D:propfind xmlns:D="DAV:"><D:allprop/></D:propfind>"#,
+        )
+        .await;
+    assert_eq!(r.status, 507);
+    assert!(!r.text().contains("multistatus"));
+
+    // Check the state boundary, not just the HTTP status: no property
+    // bytes are returned to the gateway when the budget is exhausted.
+    use velmora_dav::state::{Engine, Op, Reply};
+    let paths = w
+        .s3_list("docs/")
+        .await
+        .into_iter()
+        .map(|(key, _, etag)| (key, Some(etag)))
+        .collect();
+    let db = w.dav.state.dbs.borrow().values().next().unwrap().clone();
+    let replies = Engine {
+        sql: db.as_ref(),
+        now: w.dav.state.now.get(),
+    }
+    .run(vec![Op::PropGet { paths, names: None }])
+    .unwrap();
+    assert!(matches!(replies.as_slice(), [Reply::Full]));
+
+    // An explicit request whose selected values fit still succeeds.
+    let r = w
+        .req(
+            "PROPFIND",
+            "/dav/docs/",
+            &[("depth", "1")],
+            br#"<D:propfind xmlns:D="DAV:"><D:prop><a xmlns="urn:test"/></D:prop></D:propfind>"#,
+        )
+        .await;
+    assert_eq!(r.status, 207);
+    assert_eq!(r.hrefs().len(), 68);
+}
+
+#[tokio::test]
 async fn a_plain_propfind_never_touches_the_state_object() {
     let w = World::new().await;
     w.req("PUT", "/dav/a", &[], b"x").await.expect(201);
