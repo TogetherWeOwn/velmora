@@ -17,10 +17,11 @@
 //!
 //! **Refusal (AM-53).** P12 (AM-47, [`super::move_preflight::p12`])
 //! empties a unit that holds an earlier move's import before step 0. Step
-//! 2 reads `ImportProgress` again, before tenant 0's `moving` record and
-//! again just before the owner's record, and stops if it is not empty:
-//! P12 was skipped or raced. A re-run after the owner's record skips the
-//! second read (the window's own import may exist by then).
+//! 2 reads `ImportProgress` again: before tenant 0's `moving` record any
+//! import stops it with nothing written; after it, an import bound below
+//! this window's `moving` record stops it for the give-up without
+//! `deleteAll()`, and one at or above it is this window's own (the copy
+//! resumes; no new entry is set).
 //!
 //! Every part reads what is there first, so a crash anywhere is finished
 //! by running [`open_window`] again: the marker and triggers are put
@@ -51,11 +52,16 @@ pub enum WindowError {
     /// Tenant 0 is not `d1` with no move open (or `moving` into the owner,
     /// for a repeat), or its window is longer than the walk's bound.
     NotThisMove,
-    /// The unit still holds an earlier window's import (AM-53): finish
-    /// that give-up (`deleteAll()`) first. `t0_seq` is the tenant-0 seq
-    /// the import is bound to, if the unit says.
+    /// The unit still holds an import from before this window (AM-53):
+    /// P12 was skipped or raced. `started: false`: found before tenant 0's
+    /// `moving` record, nothing written; run P12. `started: true`: found
+    /// after it; the tool takes the give-up of DS1 §3.8 **without** its
+    /// `deleteAll()` (the unit holds an earlier move's record) and pages.
+    /// `t0_seq` is the tenant-0 seq the import is bound to, if the unit
+    /// says.
     EarlierImport {
         t0_seq: Option<u64>,
+        started: bool,
     },
     /// The unit refused to close under the new entry.
     SyncRefused(UnitRefused),
@@ -193,7 +199,10 @@ where
         // Before the window's first record, any import is an earlier
         // window's.
         if let Some(i) = unit.import_state().await? {
-            return Err(WindowError::EarlierImport { t0_seq: i.t0_seq });
+            return Err(WindowError::EarlierImport {
+                t0_seq: i.t0_seq,
+                started: false,
+            });
         }
         let z = zero.tenant_zero.as_ref().ok_or(WindowError::NotThisMove)?;
         let ordinal = z.flips.checked_add(1).ok_or(WindowError::NotThisMove)?;
@@ -218,12 +227,21 @@ where
     let done = head
         .window_entry
         .is_some_and(|w| w.zero_seq == window && w.unit == 0);
-    if !done {
-        // AM-53: read again just before the record; any import state now
-        // means P12 was skipped or raced.
-        if let Some(i) = unit.import_state().await? {
-            return Err(WindowError::EarlierImport { t0_seq: i.t0_seq });
+    // AM-53: read again just before the record. An import bound below
+    // this window's `moving` record is an earlier move's (P12 was skipped
+    // or raced); one at or above it is this window's own, and step 2 is
+    // done: the copy resumes.
+    let own = match unit.import_state().await? {
+        None => false,
+        Some(i) if i.t0_seq.is_some_and(|t| t >= window) => true,
+        Some(i) => {
+            return Err(WindowError::EarlierImport {
+                t0_seq: i.t0_seq,
+                started: true,
+            })
         }
+    };
+    if !done && !own {
         head = door_of(
             chain
                 .open_window_entry(owner, 0, window, now, head.seq)

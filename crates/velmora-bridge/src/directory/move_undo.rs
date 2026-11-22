@@ -438,6 +438,26 @@ async fn undo_open<S: RecordStore, C: ControlSeal>(
     }
 }
 
+/// As [`undo_open`], and also once tenant 0 is `d1` after this undo of
+/// the move into `owner`: for the steps that write no D1 row (the flat
+/// revocations, the records, the routes), so a step the undo's `d1` record
+/// overtook can still be finished.
+async fn undo_open_or_done<S: RecordStore, C: ControlSeal>(
+    chain: &TenantChain<'_, S, C>,
+    owner: &Tenant,
+    k_u: u64,
+) -> Result<TenantDoor> {
+    frozen_owner(chain, owner, k_u).await?;
+    let zero = head_of(chain, &Tenant::Zero).await?;
+    let done = zero.tenant_zero.as_ref().is_some_and(|z| {
+        z.selector == Selector::D1 && z.undone() && z.moved.as_ref().is_some_and(|m| m.to == *owner)
+    });
+    match moved_into(&zero, owner) || done {
+        true => Ok(zero),
+        false => Err(UndoError::NotThisMove),
+    }
+}
+
 /// The key chain still frozen at `k_u` (AM-28): a thaw that raced the
 /// undo, or a `K_u` that is not this freeze's, stops the step.
 async fn key_chain_frozen<K: KeyFreeze>(keys: &K, k_u: u64) -> Result<()> {
@@ -1609,12 +1629,24 @@ async fn revocations<K: UndoKeys>(keys: &K) -> Result<BTreeSet<String>> {
 }
 
 /// The revocation override (AM-28): the row and the grants of every key
-/// named by an `m/rk/<t>/` or a flat `m/rk/` are removed from `d1`. Run as
+/// named by an `m/rk/<t>/` or a flat `m/rk/` are removed from `d1`, each
+/// `m/rk/<t>/` put as a flat `m/rk/` first. Run as
 /// the build's last act and again just before the lift deploy, after
 /// tenant 0's `d1` record. Answers the key ids it found in `d1` and
 /// removed.
 pub async fn override_revocations<D: Sql, K: UndoKeys>(d1: &D, keys: &K) -> Result<Vec<String>> {
-    let ids = revocations(keys).await?;
+    let owners =
+        list_all(|after| async move { keys.tenant_revocations(after.as_deref()).await }).await?;
+    // Flat first, from this same listing: a later restore of tenant 0
+    // (which reads only flat `m/rk/`) keeps every key it removes revoked
+    // (DS1 §3.7 step 5, ADR §8.5).
+    for id in owners.iter().filter(|id| crate::recovery::valid_key_id(id)) {
+        keys.put_flat_revocation(id).await?;
+    }
+    let mut ids = owners;
+    ids.extend(
+        list_all(|after| async move { keys.flat_revocations(after.as_deref()).await }).await?,
+    );
     let held = keys_held(d1, &ids).await?;
     remove(d1, &held).await?;
     Ok(held.into_iter().collect())
@@ -1651,7 +1683,7 @@ where
     K: UndoKeys,
     R: RecordsBack,
 {
-    let zero = undo_open(chain, owner, k_u).await?;
+    let zero = undo_open_or_done(chain, owner, k_u).await?;
     let flipped_at = zero
         .tenant_zero
         .as_ref()
@@ -1720,7 +1752,7 @@ where
     R: RouteRecords,
     K: OwnerKeys,
 {
-    undo_open(chain, owner, k_u).await?;
+    undo_open_or_done(chain, owner, k_u).await?;
     let zero = Tenant::Zero;
     let entries = entries_to(keys, k_u).await?;
     let ids = project(entries, &BTreeSet::new(), &BTreeSet::new()).keys;
@@ -2306,8 +2338,15 @@ where
     if marker(d1).await?.is_some() {
         return Err(UndoError::FreshCatalogue("d1_has_marker"));
     }
-    if matches!(back, Back::Frozen(_)) && !super::fence::freeze_state(d1).await?.thawed() {
-        return Err(UndoError::FreshCatalogue("frozen_d1_not_thawed"));
+    if let Back::Frozen(levelled_to) = back {
+        if !super::fence::freeze_state(d1).await?.thawed() {
+            return Err(UndoError::FreshCatalogue("frozen_d1_not_thawed"));
+        }
+        // The stamp the record names is the one the tool levelled to.
+        let counter = stamp_row(d1).await?.map(|(c, _)| c);
+        if counter != Some(levelled_to) || levelled_to < stamp {
+            return Err(UndoError::FreshCatalogue("frozen_d1_not_levelled"));
+        }
     }
     let change = match back {
         Back::Fresh(id) => Change::UndoMove {
@@ -2324,14 +2363,7 @@ where
         .await?;
     let wrote = matches!(written, Written::Wrote(_));
     dir.apply_tenant(&door_of(written), now).await?;
-    // Just before the lift deploy: every revocation put since the build,
-    // flat first, so a later restore of tenant 0 (which reads only flat
-    // `m/rk/`) keeps it revoked (DS1 §3.7 step 5, ADR §8.5).
-    let owners =
-        list_all(|after| async move { keys.tenant_revocations(after.as_deref()).await }).await?;
-    for id in owners.iter().filter(|id| crate::recovery::valid_key_id(id)) {
-        keys.put_flat_revocation(id).await?;
-    }
+    // Just before the lift deploy: every revocation put since the build.
     let overridden = override_revocations(d1, keys).await?;
     let unplaced = exit_placements(chain, dir, keys, owner, now).await?;
     Ok(FlippedBack {

@@ -1506,11 +1506,12 @@ fn v9_failing_in_the_open_unit_gives_the_move_up_for_good() {
         m.unit.v9_ok.set(false);
         let r = m.flip().await;
         assert!(matches!(r, Err(FlipError::V9Failed)), "{r:?}");
-        // The lift, tenant 0 at d1 first (durable), the unit closed again,
-        // the grant revocations, the unplace.
+        // The lift, then (AM-52) the unit closed again while tenant 0 is
+        // still `moving`, then tenant 0 at d1, the grant revocations, the
+        // unplace.
         assert_eq!(
             *m.keys.log.borrow(),
-            ["owner", "zero", "owner", "revoke_grants", "owner"]
+            ["owner", "owner", "zero", "revoke_grants", "owner"]
         );
         assert!(m.routes.records.borrow().is_empty());
         let o = m.head(&owner()).await;

@@ -1498,6 +1498,13 @@ fn the_reverse_move_gives_back_a_correct_d1() {
         assert!(matches!(u.verify(k_u).await, Err(UndoError::NotThisMove)));
         assert!(matches!(u.copy().await, Err(UndoError::NotThisMove)));
         assert!(matches!(u.build(k_u).await, Err(UndoError::NotThisMove)));
+        // The steps that write no D1 row can still be finished.
+        routes_back(&u.chain(), &u.dir(), &u.routes, &u.keys, &owner(), k_u)
+            .await
+            .unwrap();
+        revocations_back(&u.chain(), u.frozen(), &u.keys, &u.records, &owner(), k_u)
+            .await
+            .unwrap();
         // A re-run of step 8 writes nothing.
         let again = u.flip(k_u).await.unwrap();
         assert!(!again.wrote && !again.unplaced);
@@ -1870,7 +1877,12 @@ fn the_fallback_builds_keys_on_the_thawed_d1_and_flips_onto_it() {
             held(NEW_KEY).await,
             Some(vec![SqlValue::Text("active".into())])
         );
-        // The flip onto the frozen catalogue, levelled to the flip's stamp.
+        // The flip onto the frozen catalogue, levelled to the flip's stamp
+        // (the tool's `stamp_level`, here its end state).
+        frozen
+            .exec("UPDATE rollback_stamp SET counter = 2 WHERE id = 1", &[])
+            .await
+            .unwrap();
         let done = flip_back_onto_frozen(
             &u.chain(),
             &u.dir(),
@@ -1981,7 +1993,13 @@ fn the_next_window_thaws_the_undo_and_sets_a_new_entry() {
         )
         .await;
         assert!(
-            matches!(r, Err(WindowError::EarlierImport { t0_seq: Some(3) })),
+            matches!(
+                r,
+                Err(WindowError::EarlierImport {
+                    t0_seq: Some(3),
+                    started: false
+                })
+            ),
             "{r:?}"
         );
         assert_eq!(
@@ -2116,20 +2134,70 @@ fn a_hand_built_tenant_zero_head_is_refused() {
     });
 }
 
-/// P12 (AM-47): what the target unit's import state means before step 0.
+/// P12 (AM-47): what the target unit's import state means before step 0,
+/// read with tenant 0's head and the owner's: only a closed unit while
+/// tenant 0 is `d1` is ever emptied.
 #[test]
-fn p12_reads_the_units_import_state() {
-    use velmora_bridge::directory::move_preflight::{p12, P12};
-    let state = |lifted| ImportState {
-        move_lifted: lifted,
-        t0_seq: Some(1),
-        sealed: Some(1),
-        tables: vec![],
-    };
-    assert_eq!(p12(None), P12::Empty);
-    assert_eq!(p12(Some(&state(Some(false)))), P12::GiveUpLeft);
-    assert_eq!(p12(Some(&state(Some(true)))), P12::UndoCopy);
-    assert_eq!(p12(Some(&state(None))), P12::Unknown);
+fn p12_reads_both_heads_and_the_unit() {
+    use velmora_bridge::directory::move_preflight::{p12, UnitView, P12};
+    block_on(async {
+        let u = flipped().await;
+        let moved = u.head(&Tenant::zero()).await;
+        let o = u.head(&owner()).await;
+        let import = |lifted, closed| UnitView::Import {
+            state: ImportState {
+                move_lifted: lifted,
+                t0_seq: Some(1),
+                sealed: Some(1),
+                tables: vec![],
+            },
+            closed,
+        };
+        let with = |f: &dyn Fn(&mut velmora_bridge::directory::record::TenantZero)| {
+            let mut z = moved.clone();
+            f(z.tenant_zero.as_mut().unwrap());
+            z
+        };
+        let moving = with(&|z| z.selector = Selector::Moving);
+        let given_up = with(&|z| {
+            z.selector = Selector::D1;
+            z.moved = None;
+        });
+        let undone = with(&|z| {
+            z.selector = Selector::D1;
+            z.undo_stamp = Some(3);
+            z.catalogue_id = Some(FRESH_ID.into());
+        });
+        assert_eq!(p12(&moved, &o, 0, &UnitView::Empty), P12::Empty);
+        // A live unit is never emptied: tenant 0 moving or moved.
+        for z in [&moved, &moving] {
+            for v in [import(Some(false), true), import(Some(true), true)] {
+                assert_eq!(p12(z, &o, 0, &v), P12::Stop);
+            }
+        }
+        assert_eq!(
+            p12(&given_up, &o, 0, &import(Some(false), true)),
+            P12::FinishGiveUp
+        );
+        assert_eq!(
+            p12(&given_up, &o, 0, &import(Some(true), true)),
+            P12::FinishGiveUp
+        );
+        assert_eq!(
+            p12(&undone, &o, 0, &import(Some(true), true)),
+            P12::UndoCopy
+        );
+        // Not closed, or not said: stop.
+        assert_eq!(p12(&undone, &o, 0, &import(Some(true), false)), P12::Stop);
+        assert_eq!(p12(&given_up, &o, 0, &import(None, true)), P12::Stop);
+        // An unborn unit: empty only with its entry and the marker.
+        let unborn = |marker| UnitView::Unborn { marker };
+        assert_eq!(p12(&undone, &o, 0, &unborn(true)), P12::Stop);
+        u.freeze().await.unwrap();
+        let closed = u.head(&owner()).await;
+        assert_eq!(p12(&undone, &closed, 0, &unborn(true)), P12::Empty);
+        assert_eq!(p12(&undone, &closed, 0, &unborn(false)), P12::Stop);
+    });
 }
 
 /// P2 (AM-44): a unit whose stamp prefix holds stamps stops the move
@@ -2292,25 +2360,76 @@ fn the_key_build_refuses_a_held_entry_and_a_thawed_chain() {
 /// The fallback's flip needs the frozen catalogue thawed.
 #[test]
 fn the_fallback_flip_needs_the_thawed_frozen_d1() {
+    use velmora_bridge::directory::tenant_zero::CUTOVER_MARKER_KEY;
     block_on(async {
         let u = flipped().await;
         let k_u = u.freeze().await.unwrap();
-        let r = flip_back_onto_frozen(
-            &u.chain(),
-            &u.dir(),
-            u.frozen(),
-            &u.keys,
-            &owner(),
-            k_u,
-            2,
-            u.rig.now(),
-        )
-        .await;
-        assert!(matches!(r, Err(UndoError::FreshCatalogue(_))), "{r:?}");
+        let frozen = &u.rig.bridge.catalog.sql;
+        let chain = u.chain();
+        let dir = u.dir();
+        let o = owner();
+        let flip = || flip_back_onto_frozen(&chain, &dir, frozen, &u.keys, &o, k_u, 2, u.rig.now());
+        let code = |r: std::result::Result<FlippedBack, UndoError>| match r {
+            Err(UndoError::FreshCatalogue(c)) => c,
+            other => panic!("{other:?}"),
+        };
+        // Frozen, marker and triggers in place.
+        assert_eq!(code(flip().await), "d1_has_marker");
+        // The marker cleared, the triggers still there.
+        frozen
+            .exec(
+                "DELETE FROM meta WHERE k = ?1",
+                &[SqlValue::Text(CUTOVER_MARKER_KEY.into())],
+            )
+            .await
+            .unwrap_err();
+        thaw(frozen).await.unwrap();
+        freeze(frozen, 1).await.unwrap();
+        frozen
+            .exec("DROP TRIGGER IF EXISTS move_freeze_meta_del", &[])
+            .await
+            .unwrap();
+        frozen
+            .exec(
+                "DELETE FROM meta WHERE k = ?1",
+                &[SqlValue::Text(CUTOVER_MARKER_KEY.into())],
+            )
+            .await
+            .unwrap();
+        assert_eq!(code(flip().await), "frozen_d1_not_thawed");
+        // Thawed, not levelled to the stamp the record names.
+        thaw(frozen).await.unwrap();
+        assert_eq!(code(flip().await), "frozen_d1_not_levelled");
         assert_eq!(
             u.head(&Tenant::zero()).await.tenant_zero.unwrap().selector,
             Selector::Moved
         );
+    });
+}
+
+/// The copy refuses a fresh D1 that a Worker already raised (it serves),
+/// and step 1 refuses a receipt naming another freeze.
+#[test]
+fn the_copy_and_step_one_refuse_another_undos_state() {
+    block_on(async {
+        let u = flipped().await;
+        u.freeze().await.unwrap();
+        u.prepare(FRESH_ID).await.unwrap();
+        u.fresh
+            .exec("UPDATE rollback_stamp SET counter = 1 WHERE id = 1", &[])
+            .await
+            .unwrap();
+        assert!(matches!(
+            u.copy().await,
+            Err(UndoError::FreshCatalogue("fresh_not_prepared_or_serving"))
+        ));
+        let u = flipped().await;
+        let k_u = u.freeze().await.unwrap();
+        u.receipt.0.set(Some(k_u + 7));
+        assert!(matches!(
+            u.freeze().await,
+            Err(UndoError::ReceiptDiffers { .. })
+        ));
     });
 }
 

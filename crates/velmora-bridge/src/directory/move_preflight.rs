@@ -25,10 +25,11 @@
 //!   `rs/<t>.<u>/` already holds stamps (a second attempt after a give-up,
 //!   or a second move after an undo) needs the gate's stamp levelling
 //!   before its `move` report; without it the move stops before step 0.
-//! - **Import state in the target unit** (P12, AM-47, [`p12`]): a unit
-//!   that still holds an import (a give-up that did not reach its
-//!   `deleteAll()`, or an undone move's 30-day copy) is emptied first, or
-//!   the move stops.
+//! - **Import state in the target unit** (P12, AM-47, [`p12`]), read with
+//!   tenant 0's head and the owner's: only a closed unit, and only while
+//!   tenant 0 is `d1`, is emptied first (a give-up left unfinished, or an
+//!   undone move's 30-day copy with the owner's G6); anything else stops
+//!   the move with nothing written.
 //!
 //! Every query is one page of at most [`MAX_PAGE`] rows in primary-key
 //! order; a cell's class is computed by SQLite, so no value outside the
@@ -42,6 +43,8 @@ use super::move_copy::key_columns;
 use crate::ports::{Sql, SqlValue};
 use crate::types::{BridgeError, Result};
 use crate::unit::import::ImportTable;
+
+use super::record::{Selector, TenantDoor};
 
 /// The largest page a P2 query reads.
 pub const MAX_PAGE: usize = 1000;
@@ -349,32 +352,72 @@ pub async fn p2_stamp_prefix_clear<B: crate::ports::BlobStore>(
     Ok(safety.list(&prefix, "", 1).await?.is_empty())
 }
 
-/// What P12 (AM-47) reads in a target unit's `ImportProgress`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum P12 {
-    /// No import state: go on.
+/// A target unit as P12 reads it (`ImportProgress`, and whether the unit
+/// exists and is closed).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum UnitView {
+    /// The unit holds no import.
     Empty,
-    /// `move_lifted = 0`: a give-up that did not reach its `deleteAll()`.
-    /// Finish that give-up (`deleteAll()`, the unit re-created with a
-    /// `restore` token under the entry the give-up left), then read again.
-    GiveUpLeft,
-    /// `move_lifted = 1`: an undone move's 30-day copy. Stop before step 0,
-    /// unless the owner's go (G6) names the early end of the undo copy;
-    /// then empty it as above and read again.
-    UndoCopy,
-    /// Import state, and the unit does not say `move_lifted` (L1 package
-    /// 4c): stop before step 0.
-    Unknown,
+    /// The unit is unborn (emptied by a `deleteAll()`); `marker`: the
+    /// emptied marker `m/ub/<t>/<u>` exists.
+    Unborn { marker: bool },
+    /// The unit holds an import; `closed`: it answers `Closed{restoring}`.
+    Import {
+        state: super::move_copy::ImportState,
+        closed: bool,
+    },
 }
 
-/// P12 from a target unit's import state ([`super::move_copy::ImportState`]).
-pub fn p12(state: Option<&super::move_copy::ImportState>) -> P12 {
-    match state {
-        None => P12::Empty,
-        Some(s) => match s.move_lifted {
-            Some(false) => P12::GiveUpLeft,
-            Some(true) => P12::UndoCopy,
-            None => P12::Unknown,
-        },
+/// What P12 (AM-47) decides for a target unit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum P12 {
+    /// No import state (or an unborn unit the day-30 `deleteAll()` left):
+    /// go on.
+    Empty,
+    /// A give-up left unfinished: finish it with no G6 (`deleteAll()`,
+    /// the unit re-created with a `restore` token under the entry it
+    /// left), then read again.
+    FinishGiveUp,
+    /// An undone move's 30-day copy: stop before step 0, unless the
+    /// owner's go (G6) names the early end of the undo copy; then empty it
+    /// as above and read again.
+    UndoCopy,
+    /// Anything else (tenant 0 `moving` or `moved`, a unit that is not
+    /// closed, a `move_lifted` the unit does not say, an unborn unit
+    /// without its entry and marker): stop before step 0 and write
+    /// nothing. A live unit is never emptied.
+    Stop,
+}
+
+/// P12 for unit `unit` of the owner `owner_head`, from tenant 0's verified
+/// head `zero` and the unit's view.
+pub fn p12(zero: &TenantDoor, owner_head: &TenantDoor, unit: u32, view: &UnitView) -> P12 {
+    let z = match zero.tenant_zero.as_ref() {
+        Some(z) if zero.tenant.is_zero() => z,
+        _ => return P12::Stop,
+    };
+    match view {
+        UnitView::Empty => P12::Empty,
+        UnitView::Unborn { marker } => {
+            let listed =
+                owner_head.units.contains(&unit) && owner_head.restoring_entry(unit).is_some();
+            match listed && *marker {
+                true => P12::Empty,
+                false => P12::Stop,
+            }
+        }
+        UnitView::Import { state, closed } => {
+            if !closed || z.selector != Selector::D1 {
+                return P12::Stop;
+            }
+            let undone_here =
+                z.undone() && z.moved.as_ref().is_some_and(|m| m.to == owner_head.tenant);
+            match (state.move_lifted, &z.moved) {
+                (Some(false), _) => P12::FinishGiveUp,
+                (Some(true), None) => P12::FinishGiveUp,
+                (Some(true), Some(_)) if undone_here => P12::UndoCopy,
+                _ => P12::Stop,
+            }
+        }
     }
 }
