@@ -260,6 +260,7 @@ fn an_apply_writes_the_keys_moves_keys_seq_and_lets_sync_pass() {
             seqs(3, 2),
             UnitOp::KeyRow {
                 access_key_id: K.into(),
+                presigned: None,
             },
         ),
         NOW,

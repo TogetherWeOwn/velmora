@@ -291,6 +291,7 @@ async fn under_restore_writes_answer_503_with_no_unit_call() {
     ];
     let read = UnitOp::KeyRow {
         access_key_id: "AKIA".into(),
+        presigned: None,
     };
     assert!(r
         .call(&routed, CallKind::Request, false, read)

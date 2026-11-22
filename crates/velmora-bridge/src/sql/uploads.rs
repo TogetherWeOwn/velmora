@@ -780,6 +780,26 @@ pub(super) async fn complete_upload<S: Sql>(
     // applied, and its own guard on `revision` fails from here on. Then
     // nothing is published under this id, and its record may go, so
     // that a replay cannot publish an upload the client aborts later.
+    match fence(c, t, revision).await {
+        Ok(true) => Ok(PublishOutcome::Fenced(
+            record.refused(super::GuardRefused(())),
+        )),
+        // Still unknown, or it had applied: the record stays.
+        Ok(false) | Err(_) => Err(failed),
+    }
+}
+
+/// Moves the upload to its next revision while it is still open at
+/// `revision`: `true` when that applied, so a Complete at `revision`
+/// had not applied and its guard fails from here on; `false` when the
+/// upload is no longer open at `revision`. Complete's own settling of an
+/// unknown outcome, and a unit's request call for it when the unit's
+/// answer to a Complete was lost (`unit::request`).
+pub(super) async fn fence<S: Sql>(
+    c: &SqlCatalog<S>,
+    t: &UploadTarget<'_>,
+    revision: u64,
+) -> Result<bool> {
     let mut open_at = target(t);
     open_at.push(int(revision)?);
     let fence = vec![
@@ -795,10 +815,8 @@ pub(super) async fn complete_upload<S: Sql>(
         ),
     ];
     match c.sql.batch(fence).await {
-        Ok(_) => Ok(PublishOutcome::Fenced(
-            record.refused(super::GuardRefused(())),
-        )),
-        // Still unknown, or it had applied: the record stays.
-        Err(_) => Err(failed),
+        Ok(_) => Ok(true),
+        Err(BridgeError::GuardFailed) => Ok(false),
+        Err(e) => Err(e),
     }
 }

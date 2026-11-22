@@ -304,6 +304,7 @@ fn an_expired_lease_refuses_every_call_but_the_workers_and_writes_nothing() {
             false,
             UnitOp::KeyRow {
                 access_key_id: K.into(),
+                presigned: None,
             },
         ),
     ] {

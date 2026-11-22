@@ -544,7 +544,7 @@ pub enum PublishOutcome {
 // matches: the caller stops and acks.
 
 /// The ids the catalogue holds on one key ([`Catalog::key_heads`]).
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct KeyHead {
     /// The id of the live generation.
     pub live: Option<GenerationId>,
