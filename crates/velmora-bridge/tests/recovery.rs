@@ -3666,7 +3666,7 @@ async fn a_plan_record_above_revision_one_is_never_written_nor_replayed() {
     let (report, _) = replay(&rig, UnixMs(0), ReplayLimits::default()).await;
     assert_eq!(report.published, 1, "{report:?}");
     assert_eq!(report.article_plans, 0, "{report:?}");
-    assert_eq!(report.unreadable, [name.clone()], "{report:?}");
+    assert_eq!(report.unreadable, [name.as_str()], "{report:?}");
     assert!(rig
         .bridge
         .catalog
