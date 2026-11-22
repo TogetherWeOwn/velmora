@@ -17,9 +17,12 @@
 //! - the alarm: [`alarm::on_alarm`], [`alarm::after_renew`],
 //!   [`alarm::rearm`], and the two jobs it sends ([`job`]);
 //! - the unit's rows of all this: [`store`] (`unit_lease`,
-//!   `unit_revoked_ids`; migration `u0002`).
+//!   `unit_revoked_ids`; migration `u0002`);
+//! - the Worker's side of `renew` and `sync`, rule 5 on the request
+//!   path, and the `renew` and `stamp_raise` jobs: [`client`].
 
 pub mod alarm;
+pub mod client;
 pub mod job;
 pub mod lease;
 pub mod mark;
