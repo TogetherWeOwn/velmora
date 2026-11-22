@@ -13,7 +13,11 @@
 -- newer one). `keys_seq` is the head of the tenant's key chain, written by
 -- the key chain's own steps.
 CREATE TABLE tenants (
-  id            TEXT PRIMARY KEY CHECK (id GLOB 't_[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]'),
+  -- `t_` and 16 lowercase hex digits. Written without one long GLOB:
+  -- D1 and Durable Object SQLite refuse a LIKE or GLOB pattern over 50
+  -- bytes ("LIKE or GLOB pattern too complex"), at every insert.
+  id            TEXT PRIMARY KEY CHECK (length(id) = 18 AND substr(id, 1, 2) = 't_'
+                  AND substr(id, 3) NOT GLOB '*[^0-9a-f]*'),
   record_seq    INTEGER NOT NULL CHECK (record_seq > 0),
   keys_seq      INTEGER NOT NULL DEFAULT 0 CHECK (keys_seq >= 0),
   state         TEXT NOT NULL,
