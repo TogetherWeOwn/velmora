@@ -1066,6 +1066,76 @@ fn a_grant_on_a_bucket_the_unit_does_not_hold_is_refused_as_not_found() {
     assert_eq!(state_of(&u, 4), None);
 }
 
+fn row_keys_seq(u: &Unit<RusqliteSql>, r: u8) -> i64 {
+    u.sql()
+        .with_conn(|c| {
+            c.query_row(
+                "SELECT keys_seq FROM unit_reservations WHERE rid = ?1",
+                [rid(r).0.to_vec()],
+                |row| row.get(0),
+            )
+        })
+        .unwrap()
+}
+
+/// AM-55: a re-ask answers the first `rid` and the unit's current
+/// `keys_seq`, and the row keeps that seq (the Worker then reads exactly
+/// `keys_seq + 1`). In a locked tenant the re-ask is answered `not_open`
+/// with the row's `rid` and writes nothing.
+#[test]
+fn a_re_ask_keeps_the_current_keys_seq_and_writes_nothing_in_a_locked_tenant() {
+    let u = ready();
+    let ask = |r| {
+        reserve_op(
+            1,
+            1,
+            r,
+            by_owner(),
+            new_key("AK1", vec![grant(B1, Access::Ro)]),
+        )
+    };
+    assert_eq!(ok(worker(&u, ask(1)))["admitted"]["keys_seq"], json!(1));
+    assert_eq!(row_keys_seq(&u, 1), 1);
+    // Another record lands first (seq 2): the re-ask answers 2, the row
+    // keeps 2, and the re-ask's own rid is ignored.
+    apply(&u, vec![key_entry("AKX", 2, vec![], None)], vec![]);
+    let again = ok(worker(&u, ask(7)));
+    assert_eq!(again["admitted"]["rid"], json!(rid(1).hex()));
+    assert_eq!(again["admitted"]["keys_seq"], json!(2));
+    assert_eq!(row_keys_seq(&u, 1), 2);
+    assert_eq!(state_of(&u, 7), None);
+    // Locked: `not_open`, with the rid and the current seq; nothing kept.
+    let h = u.head().unwrap();
+    assert!(matches!(
+        worker(
+            &u,
+            UnitOp::Sync {
+                head: SyncHead {
+                    seqs: Seqs {
+                        state_seq: h.seqs.state_seq + 1,
+                        keys_seq: h.seqs.keys_seq,
+                    },
+                    tenant_mode: Some(velmora_bridge::unit::call::HoldMode::Locked),
+                    tenant_state: TenantState::Suspended,
+                    restoring_since: None,
+                    lift: None,
+                },
+            },
+        ),
+        UnitAnswer::Ok { .. }
+    ));
+    apply(&u, vec![key_entry("AKY", 3, vec![], None)], vec![]);
+    let before = u.sql().with_conn(|c| c.total_changes());
+    assert_eq!(
+        ok(worker(&u, ask(8))),
+        json!({ "not_open": { "rid": rid(1).hex(), "keys_seq": 3 } })
+    );
+    assert_eq!(u.sql().with_conn(|c| c.total_changes()), before);
+    assert_eq!(row_keys_seq(&u, 1), 2);
+    assert_eq!(state_of(&u, 1).as_deref(), Some("reserved"));
+    assert_eq!(rows(&u), 1);
+}
+
 #[test]
 fn a_re_ask_that_fails_at_the_new_head_is_refused_and_leaves_no_row() {
     let u = ready();

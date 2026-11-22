@@ -196,10 +196,16 @@ change. In one transaction the unit:
    explicit release and a cancel (below) give it back.
 
 The answer carries the unit's `keys_seq`: the call's record is exactly
-`keys_seq + 1` and carries the `rid` in its door part. On an answer with
-`again`, the Worker reads the chain above `keys_seq` for that `rid`: a
-record that carries it is the finisher's to apply
-(`409 idempotency_key_in_use`). The key-chain apply turns the row
+`keys_seq + 1` and carries the `rid` in its door part. The Worker draws
+the `rid` (16 bytes from its CSPRNG) and sends it with every ask; the
+unit keeps the first one and answers it on every re-ask, ignoring the
+re-ask's, and draws no random value itself. A re-ask is checked again at
+the head, answers the unit's current `keys_seq`, and the row keeps that
+seq. On an `again` or `not_open` answer the Worker reads and verifies
+exactly one record, `m/k/<t>/<keys_seq + 1>` (AM-55): one that carries
+the `rid` is the finisher's to apply (`409 idempotency_key_in_use`).
+Key records are applied in seq order with no gap, so a record of the
+call can only sit there. The key-chain apply turns the row
 `applied` when it holds a record that carries its `rid` for its subject,
 and keeps the answer the Worker passes with it (once; a 2xx status and a
 JSON object of at most 16 KiB with no `secret_access_key`, or none is
