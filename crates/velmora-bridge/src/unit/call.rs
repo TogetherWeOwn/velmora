@@ -11,11 +11,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::birth::{BirthToken, ProvisionRefusal};
-use super::gate::GateFindings;
 use super::identity::{CallKind, Refusal, Seqs};
 use super::import::{ImportBatch, ImportRefusal, MoveHead};
 use super::keys::{KeyEntry, KeyRefusal};
-use super::lift::{AckClass, GateRefusal, ReplayId};
+use super::lift::{AckClass, FindingList, GateRefusal, GateSummary, LiftProof, ReplayId};
 use super::name::UnitName;
 use super::restore::{Bookmark, RestoreRefusal, RestoreTarget};
 
@@ -50,6 +49,11 @@ pub struct SyncHead {
     /// The since_seq of this unit's `restoring` entry, if the record has one.
     #[serde(default)]
     pub restoring_since: Option<u64>,
+    /// The lift a record that removes this unit's entry carries (its
+    /// replay id, and per class the count and hash of the acknowledged
+    /// ids): the unit lifts only when its own check gives the same.
+    #[serde(default)]
+    pub lift: Option<LiftProof>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -180,10 +184,16 @@ pub enum UnitOp {
     },
     /// Starts the gate report of one replay, discarding any other.
     GateOpen { replay_id: ReplayId },
-    /// What that replay found.
+    /// What that replay found besides its id lists.
     GateReport {
         replay_id: ReplayId,
-        findings: GateFindings,
+        summary: GateSummary,
+    },
+    /// One page of ids of one list of that replay's findings.
+    GateBlockers {
+        replay_id: ReplayId,
+        list: FindingList,
+        ids: Vec<String>,
     },
     /// One page of acknowledged blocker ids of one class.
     GateAck {
@@ -237,6 +247,7 @@ impl UnitOp {
                 | UnitOp::Restore { .. }
                 | UnitOp::GateOpen { .. }
                 | UnitOp::GateReport { .. }
+                | UnitOp::GateBlockers { .. }
                 | UnitOp::GateAck { .. }
                 | UnitOp::GateStatus {}
         )

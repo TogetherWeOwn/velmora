@@ -344,14 +344,23 @@ impl<S: UnitSql> Unit<S> {
                         .map(|opened| json!({ "opened": opened })))
                 })
             }
-            UnitOp::GateReport {
+            UnitOp::GateReport { replay_id, summary } => {
+                return self.gate_write(&head, &mut || {
+                    Ok(
+                        lift::report(self.sql(), head.restoring_since, replay_id, summary)?
+                            .map(|()| json!({ "reported": true })),
+                    )
+                })
+            }
+            UnitOp::GateBlockers {
                 replay_id,
-                findings,
+                list,
+                ids,
             } => {
                 return self.gate_write(&head, &mut || {
                     Ok(
-                        lift::report(self.sql(), head.restoring_since, replay_id, findings)?
-                            .map(|()| json!({ "reported": true })),
+                        lift::blockers(self.sql(), head.restoring_since, replay_id, *list, ids)?
+                            .map(|()| json!({ "listed": ids.len() })),
                     )
                 })
             }
@@ -587,6 +596,7 @@ impl<S: UnitSql> Unit<S> {
             | UnitOp::Restore { .. }
             | UnitOp::GateOpen { .. }
             | UnitOp::GateReport { .. }
+            | UnitOp::GateBlockers { .. }
             | UnitOp::GateAck { .. }
             | UnitOp::GateStatus {} => {
                 Err(BridgeError::Invalid("worker call routed as an operation"))
@@ -893,7 +903,7 @@ impl<S: UnitSql> Unit<S> {
             if lifting {
                 // AM-2: the entry is cleared only on the unit's own lift
                 // check, against the report of this restore's replay.
-                if let Err(r) = lift::check(sql, head.restoring_since)? {
+                if let Err(r) = lift::check_named(sql, head.restoring_since, next.lift.as_ref())? {
                     why = Some(r);
                     return Err(BridgeError::Invalid(ROLLBACK));
                 }

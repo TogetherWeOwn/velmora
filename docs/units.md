@@ -206,11 +206,15 @@ clock is at least max(`closed_at` + T, `lease_hi`) + 60 s, where
 `lease_hi` the latest `fresh_until` it ever held; and, for `restore`, that
 its current bookmark is still `expect_undo` (it wrote nothing since
 `restore_prepare`; on a refusal the tool prepares again). Any failure
-refuses and arms nothing. A unit born from a `restore` token has
-`closed_at` = its birth and no lease, so a gone or unborn unit passes at
-birth. The bookmark calls need the object's storage, so the object class
+refuses and arms nothing. The lease is the latest of `lease_hi` and
+`fresh_until`; a unit without a lease table is refused (its lease is not
+known), and one with the table but no row never issued a lease. A unit
+born from a `restore` token has `closed_at` = its birth and no lease row,
+so a gone or unborn unit passes T + 60 s after its birth. The bookmark calls need the object's storage, so the object class
 runs them after the unit's own checks; a restore never answers `ok` (the
-object restarts), and the tool reads the result from the unit's state.
+object restarts), and the tool reads the result from the unit's state. An
+answer `failed` of class `pitr_armed` means the restore was armed without
+the restart: the tool treats the unit as restored.
 
 A unit born from a `restore` token starts with its usage counters off. The
 gate's recount turns them on, and the lift is refused while any is off. A
@@ -222,18 +226,22 @@ unit born from a `birth` token starts with them on.
 restore** (`unit::lift`). The gate's final replay has a replay id: the
 entry's `since_seq` S, the stamp ordinal raised before the restore, and a
 nonce from the tool. The unit keeps one report: `gate_open` starts it and
-discards a report of any other replay id with its acknowledgements (such
-as an old one that a point-in-time restore brought back), `gate_report`
-stores what the replay found, and `gate_ack` acknowledges blocker ids by
-name, in pages of at most 100. **The `sync` that clears `restoring_since`
-is refused unless the check passes:** the report names this entry; its
+discards a report of any other replay id with its ids and
+acknowledgements (such as an old one that a point-in-time restore brought
+back); `gate_blockers` adds the ids of each list of the findings in pages
+of at most 100, so any number can be reported; `gate_report` stores the
+rest (complete, the totals, whether held rows were classified); and
+`gate_ack` acknowledges blocker ids by name, in pages of at most 100.
+Totals count distinct ids. **The `sync` that clears `restoring_since` is
+refused unless the check passes:** the report names this entry; its
 ordinal equals the unit's stamp counter as the gate levelled it; the lift
 decision below opens on its findings, and per class the acknowledged ids
 are exactly the ones the decision needs (the same count, and the same
 SHA-256 over the sorted ids with duplicates removed, UTF-8, each followed
-by `\n`); and every usage counter is on. `gate_status` answers the counts
-and hashes for the lift record. Until the replay runs inside the unit, the
-Worker sends the replay's findings with `gate_report`.
+by `\n`); every usage counter is on; and the `sync` names the lift record's
+proof (its replay id and those counts and hashes), equal to the unit's.
+`gate_status` answers that proof for the lift record. Until the replay
+runs inside the unit, the Worker sends the replay's findings.
 
 A restored unit stays closed until the gate lifts it, and the gate lifts only
 on a whole, clean replay (`unit::gate`): no damaged generation, no held row

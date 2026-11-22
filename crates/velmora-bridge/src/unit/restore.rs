@@ -32,8 +32,9 @@
 //! ([`Unit::pitr_step`](super::object::Unit::pitr_step)); check 4 and the
 //! bookmark calls need the object's storage, which only the object class
 //! reaches ([`drive`], with [`PointInTimePort`]). A unit born from a
-//! `restore` token has `closed_at = born_at` and no lease, so a unit that
-//! is gone or unborn passes checks 2 and 3 at birth.
+//! `restore` token has `closed_at = born_at` and no lease row, so a unit
+//! that was gone or unborn passes checks 2 and 3 at T + 60 s after its
+//! birth. A unit without a lease table is refused: its lease is unknown.
 
 use std::fmt;
 
@@ -88,6 +89,9 @@ pub enum RestoreRefusal {
     WrongToken,
     /// The unit's lease has not expired.
     LeaseLive,
+    /// The unit keeps no lease table: whether a lease is live is not
+    /// known.
+    LeaseUnknown,
     /// Less than max(`closed_at` + T, `lease_hi`) + 60 s since the close.
     TooSoon,
     /// The unit's bookmark is no longer `expect_undo`: it wrote since
@@ -109,32 +113,33 @@ pub struct LeaseView {
     pub lease_hi: Option<i64>,
 }
 
-/// Reads the lease view. A unit without a `unit_lease` table, or without
-/// its row, has never issued a lease.
-pub fn lease_view<S: Sql>(sql: &S) -> Result<LeaseView> {
+/// Reads the lease view: `None` when the unit has no `unit_lease` table
+/// (its lease is not known, so no restore is armed); a table without its
+/// row is a unit that never issued a lease.
+pub fn lease_view<S: Sql>(sql: &S) -> Result<Option<LeaseView>> {
     let has = poll_once(sql.query(
         "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'unit_lease'",
         &[],
     ))??;
     if !matches!(has.first().and_then(|r| r.first()), Some(SqlValue::Int(1))) {
-        return Ok(LeaseView::default());
+        return Ok(None);
     }
     let rows = poll_once(sql.query(
         "SELECT fresh_until, lease_hi FROM unit_lease WHERE id = 1",
         &[],
     ))??;
     let Some(r) = rows.first() else {
-        return Ok(LeaseView::default());
+        return Ok(Some(LeaseView::default()));
     };
     let opt = |v: &SqlValue| match v {
         SqlValue::Null => Ok(None),
         SqlValue::Int(n) => Ok(Some(*n)),
         _ => Err(BridgeError::Sql("unit: row decode: unit_lease".into())),
     };
-    Ok(LeaseView {
+    Ok(Some(LeaseView {
         fresh_until: opt(&r[0])?,
         lease_hi: opt(&r[1])?,
-    })
+    }))
 }
 
 /// Checks 1 to 3. `restoring_since` and `closed_at` are the unit's own;
@@ -142,13 +147,16 @@ pub fn lease_view<S: Sql>(sql: &S) -> Result<LeaseView> {
 pub fn closed_long_enough(
     restoring_since: Option<u64>,
     closed_at: Option<i64>,
-    lease: LeaseView,
+    lease: Option<LeaseView>,
     since: u64,
     now: UnixMs,
 ) -> std::result::Result<(), RestoreRefusal> {
     if restoring_since != Some(since) {
         return Err(RestoreRefusal::NotRestoring);
     }
+    let Some(lease) = lease else {
+        return Err(RestoreRefusal::LeaseUnknown);
+    };
     if lease.fresh_until.is_some_and(|until| now.0 < until) {
         return Err(RestoreRefusal::LeaseLive);
     }
@@ -157,9 +165,10 @@ pub fn closed_long_enough(
     let Some(closed_at) = closed_at else {
         return Err(RestoreRefusal::TooSoon);
     };
-    let from = closed_at
-        .saturating_add(LEASE_TERM_MS)
-        .max(lease.lease_hi.unwrap_or(i64::MIN));
+    // The latest lease the unit held: `lease_hi`, and `fresh_until` in
+    // case the high mark lags it.
+    let latest = lease.lease_hi.max(lease.fresh_until).unwrap_or(i64::MIN);
+    let from = closed_at.saturating_add(LEASE_TERM_MS).max(latest);
     if now.0 < from.saturating_add(RESTORE_MARGIN_MS) {
         return Err(RestoreRefusal::TooSoon);
     }
@@ -225,9 +234,15 @@ pub async fn drive<P: PointInTimePort>(step: PitrStep, pitr: &P) -> UnitAnswer {
                 RestoreTarget::Bookmark { bookmark } => bookmark.0,
             };
             // On success the object restarts and this request never
-            // answers; any return is the runtime refusing the bookmark.
-            let _ = pitr.restore_now(&to).await;
-            pitr_failed()
+            // answers. An error is the runtime refusing the bookmark:
+            // nothing is armed. A plain return means armed without the
+            // restart: the tool must treat the unit as restored.
+            match pitr.restore_now(&to).await {
+                Ok(()) => UnitAnswer::Failed {
+                    class: "pitr_armed".into(),
+                },
+                Err(_) => pitr_failed(),
+            }
         }
     }
 }

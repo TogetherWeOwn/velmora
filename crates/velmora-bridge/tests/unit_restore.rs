@@ -7,8 +7,9 @@ use std::cell::RefCell;
 
 use serde_json::json;
 use velmora_bridge::testkit::{RusqliteSql, ARM_USAGE};
-use velmora_bridge::unit::gate::GateFindings;
-use velmora_bridge::unit::lift::{ids_hash, AckClass, GateRefusal, ReplayId, MAX_ACK_PAGE};
+use velmora_bridge::unit::lift::{
+    ids_hash, AckClass, FindingList, GateRefusal, GateSummary, LiftProof, ReplayId, MAX_PAGE,
+};
 use velmora_bridge::unit::restore::{
     drive, Bookmark, PitrStep, PointInTimePort, RestoreRefusal, RestoreTarget, LEASE_TERM_MS,
     RESTORE_MARGIN_MS,
@@ -72,6 +73,7 @@ fn sync(u: &Unit<RusqliteSql>, state_seq: u64, restoring: Option<u64>, at: i64) 
                 tenant_state: TenantState::Active,
                 tenant_mode: None,
                 restoring_since: restoring,
+                lift: None,
             },
         },
         at,
@@ -95,8 +97,14 @@ fn provision(kind: BirthKind, seq: u64) -> Unit<RusqliteSql> {
         UnixMs(BORN),
     );
     assert!(matches!(a, UnitAnswer::Ok { .. }), "{a:?}");
+    // The lease's own table (L2's migration), here by hand: no row, so
+    // the unit never issued a lease.
+    u.sql().apply(LEASE_TABLE).unwrap();
     u
 }
+
+const LEASE_TABLE: &str =
+    "CREATE TABLE unit_lease (id INTEGER PRIMARY KEY, fresh_until INTEGER, lease_hi INTEGER)";
 
 /// A born, active unit, closed for a restore at `S` at time `BORN + 1000`.
 fn closed() -> Unit<RusqliteSql> {
@@ -256,13 +264,6 @@ fn a_live_lease_or_a_later_lease_holds_the_restore_back() {
     let pitr = FakePitr::new("bm-now");
     let u = closed();
     let t = ready_at(BORN + 1000);
-    // The lease's own table (written by the lease); here by hand.
-    u.sql()
-        .apply(
-            "CREATE TABLE unit_lease (id INTEGER PRIMARY KEY, fresh_until INTEGER, \
-               lease_hi INTEGER)",
-        )
-        .unwrap();
     u.sql()
         .apply(&format!(
             "INSERT INTO unit_lease(id, fresh_until, lease_hi) VALUES (1, {}, {})",
@@ -287,6 +288,22 @@ fn a_live_lease_or_a_later_lease_holds_the_restore_back() {
         ),
         refused_restore(RestoreRefusal::TooSoon)
     );
+    // A high mark that lags its own fresh_until: the later of the two.
+    u.sql()
+        .apply(&format!(
+            "UPDATE unit_lease SET fresh_until = {}, lease_hi = NULL",
+            t + 5
+        ))
+        .unwrap();
+    assert_eq!(
+        run(
+            &u,
+            UnitOp::RestorePrepare { since: S },
+            t + 5 + RESTORE_MARGIN_MS - 1,
+            &pitr
+        ),
+        refused_restore(RestoreRefusal::TooSoon)
+    );
     assert!(matches!(
         run(
             &u,
@@ -296,6 +313,53 @@ fn a_live_lease_or_a_later_lease_holds_the_restore_back() {
         ),
         UnitAnswer::UndoBookmark { .. }
     ));
+}
+
+#[test]
+fn a_unit_without_a_lease_table_is_not_restored() {
+    let pitr = FakePitr::new("bm-now");
+    let u = closed();
+    u.sql().apply("DROP TABLE unit_lease").unwrap();
+    assert_eq!(
+        run(
+            &u,
+            UnitOp::RestorePrepare { since: S },
+            ready_at(BORN + 1000),
+            &pitr
+        ),
+        refused_restore(RestoreRefusal::LeaseUnknown)
+    );
+}
+
+#[test]
+fn a_restore_armed_without_the_restart_says_so() {
+    struct Armed(FakePitr);
+    impl PointInTimePort for Armed {
+        async fn current(&self) -> Result<String> {
+            self.0.current().await
+        }
+        async fn at(&self, unix_ms: i64) -> Result<String> {
+            self.0.at(unix_ms).await
+        }
+        async fn restore_now(&self, _: &str) -> Result<()> {
+            Ok(())
+        }
+    }
+    let u = closed();
+    let pitr = Armed(FakePitr::new("bm-undo"));
+    let op = restore_op(
+        BirthKind::Restore,
+        S,
+        RestoreTarget::Time { at_ms: 1 },
+        "bm-undo",
+    );
+    let a = poll_once(drive(step(&u, op, ready_at(BORN + 1000)), &pitr)).unwrap();
+    assert_eq!(
+        a,
+        UnitAnswer::Failed {
+            class: "pitr_armed".into()
+        }
+    );
 }
 
 #[test]
@@ -474,12 +538,11 @@ fn rid(nonce: &str) -> ReplayId {
     }
 }
 
-fn whole(damaged: &[&str]) -> GateFindings {
-    GateFindings {
+fn whole(damaged_total: u64) -> GateSummary {
+    GateSummary {
         complete: true,
-        damaged_total: damaged.len() as u64,
-        damaged: damaged.iter().map(|s| s.to_string()).collect(),
-        ..GateFindings::default()
+        damaged_total,
+        ..GateSummary::default()
     }
 }
 
@@ -499,11 +562,57 @@ fn ok(a: UnitAnswer) -> serde_json::Value {
     }
 }
 
+/// The lift the unit would accept now, as `gate_status` gives it.
+fn proof(u: &Unit<RusqliteSql>, t: i64) -> LiftProof {
+    let status = ok(worker(u, UnitOp::GateStatus {}, t));
+    serde_json::from_value(status["lift"]["ok"].clone()).expect("the lift passes")
+}
+
+/// The `sync` of the record that removes the entry, naming `lift`.
+fn lift(u: &Unit<RusqliteSql>, state_seq: u64, lift: Option<LiftProof>, at: i64) -> UnitAnswer {
+    worker(
+        u,
+        UnitOp::Sync {
+            head: SyncHead {
+                seqs: Seqs {
+                    state_seq,
+                    keys_seq: 0,
+                },
+                tenant_state: TenantState::Active,
+                tenant_mode: None,
+                restoring_since: None,
+                lift,
+            },
+        },
+        at,
+    )
+}
+
+fn page(list: FindingList, nonce: &str, ids: &[String]) -> UnitOp {
+    UnitOp::GateBlockers {
+        replay_id: rid(nonce),
+        list,
+        ids: ids.to_vec(),
+    }
+}
+
+fn ack(nonce: &str, ids: &[String]) -> UnitOp {
+    UnitOp::GateAck {
+        replay_id: rid(nonce),
+        class: AckClass::Damaged,
+        ids: ids.to_vec(),
+    }
+}
+
+fn ids(names: &[&str]) -> Vec<String> {
+    names.iter().map(|s| s.to_string()).collect()
+}
+
 #[test]
 fn the_entry_is_not_cleared_without_a_report_of_this_replay() {
     let u = closed();
     assert_eq!(
-        sync(&u, S + 1, None, BORN + 2000),
+        lift(&u, S + 1, None, BORN + 2000),
         refused_gate(GateRefusal::NoReport)
     );
     assert_eq!(u.head().unwrap().restoring_since, Some(S));
@@ -519,7 +628,7 @@ fn the_entry_is_not_cleared_without_a_report_of_this_replay() {
 }
 
 #[test]
-fn a_clean_whole_replay_lifts_once_the_stamp_is_level_and_the_counters_are_on() {
+fn a_clean_whole_replay_lifts_with_its_proof_once_the_stamp_is_level() {
     let u = closed();
     let t = BORN + 2000;
     assert_eq!(
@@ -543,26 +652,31 @@ fn a_clean_whole_replay_lifts_once_the_stamp_is_level_and_the_counters_are_on() 
         )),
         json!({ "opened": false })
     );
-    // Not complete yet.
     assert_eq!(
-        sync(&u, S + 1, None, t),
+        lift(&u, S + 1, None, t),
         refused_gate(GateRefusal::StampNotLevelled)
     );
     level_stamp(&u, 4);
-    assert_eq!(sync(&u, S + 1, None, t), refused_gate(GateRefusal::Closed));
+    // Not complete yet.
+    assert_eq!(lift(&u, S + 1, None, t), refused_gate(GateRefusal::Closed));
     ok(worker(
         &u,
         UnitOp::GateReport {
             replay_id: rid("n1"),
-            findings: whole(&[]),
+            summary: whole(0),
         },
         t,
     ));
-    // The born unit's counters are on: the lift passes.
     let status = ok(worker(&u, UnitOp::GateStatus {}, t));
     assert_eq!(status["counters_on"], json!(true));
-    assert_eq!(status["lift"]["ok"]["replay_id"]["nonce"], json!("n1"));
-    assert!(matches!(sync(&u, S + 1, None, t), UnitAnswer::Ok { .. }));
+    // The record's lift must be named, and be this one.
+    assert_eq!(
+        lift(&u, S + 1, None, t),
+        refused_gate(GateRefusal::ProofMismatch)
+    );
+    let p = proof(&u, t);
+    assert_eq!(p.replay_id, rid("n1"));
+    assert!(matches!(lift(&u, S + 1, Some(p), t), UnitAnswer::Ok { .. }));
     let h = u.head().unwrap();
     assert_eq!((h.restoring_since, h.closed_at), (None, None));
     // The report is gone with the entry.
@@ -570,6 +684,58 @@ fn a_clean_whole_replay_lifts_once_the_stamp_is_level_and_the_counters_are_on() 
         ok(worker(&u, UnitOp::GateStatus {}, t))["replay_id"],
         json!(null)
     );
+}
+
+#[test]
+fn a_lift_naming_another_replay_or_other_ids_is_refused() {
+    let u = closed();
+    let t = BORN + 2000;
+    level_stamp(&u, 4);
+    ok(worker(
+        &u,
+        UnitOp::GateOpen {
+            replay_id: rid("n1"),
+        },
+        t,
+    ));
+    ok(worker(
+        &u,
+        UnitOp::GateReport {
+            replay_id: rid("n1"),
+            summary: whole(1),
+        },
+        t,
+    ));
+    ok(worker(
+        &u,
+        page(FindingList::Damaged, "n1", &ids(&["g_a"])),
+        t,
+    ));
+    ok(worker(&u, ack("n1", &ids(&["g_a"])), t));
+    let good = proof(&u, t);
+    // The record of an earlier attempt of the same restore (another
+    // nonce), brought back with its counter by an undo: refused.
+    let mut older = good.clone();
+    older.replay_id.nonce = "n0".into();
+    assert_eq!(
+        lift(&u, S + 1, Some(older), t),
+        refused_gate(GateRefusal::ProofMismatch)
+    );
+    // A record that acknowledged other ids: refused.
+    let mut other = good.clone();
+    other
+        .acknowledged
+        .get_mut(&AckClass::Damaged)
+        .unwrap()
+        .sha256 = ids_hash(&ids(&["g_b"]));
+    assert_eq!(
+        lift(&u, S + 1, Some(other), t),
+        refused_gate(GateRefusal::ProofMismatch)
+    );
+    assert!(matches!(
+        lift(&u, S + 1, Some(good), t),
+        UnitAnswer::Ok { .. }
+    ));
 }
 
 #[test]
@@ -588,17 +754,18 @@ fn a_restored_unit_lifts_only_with_its_counters_on() {
         &u,
         UnitOp::GateReport {
             replay_id: rid("n1"),
-            findings: whole(&[]),
+            summary: whole(0),
         },
         t,
     ));
     assert_eq!(
-        sync(&u, S + 1, None, t),
+        lift(&u, S + 1, None, t),
         refused_gate(GateRefusal::CountersOff)
     );
     // The gate's recount turns them on (AM-3).
     u.sql().apply(ARM_USAGE).unwrap();
-    assert!(matches!(sync(&u, S + 1, None, t), UnitAnswer::Ok { .. }));
+    let p = proof(&u, t);
+    assert!(matches!(lift(&u, S + 1, Some(p), t), UnitAnswer::Ok { .. }));
 }
 
 #[test]
@@ -617,35 +784,38 @@ fn blockers_lift_only_when_acknowledged_exactly_by_name() {
         &u,
         UnitOp::GateReport {
             replay_id: rid("n1"),
-            findings: whole(&["g_a", "g_b"]),
+            summary: whole(2),
         },
         t,
     ));
-    let ack = |ids: &[&str], nonce: &str| UnitOp::GateAck {
-        replay_id: rid(nonce),
-        class: AckClass::Damaged,
-        ids: ids.iter().map(|s| s.to_string()).collect(),
-    };
-    ok(worker(&u, ack(&["g_a"], "n1"), t));
-    assert_eq!(sync(&u, S + 1, None, t), refused_gate(GateRefusal::Closed));
+    ok(worker(
+        &u,
+        page(FindingList::Damaged, "n1", &ids(&["g_a", "g_b"])),
+        t,
+    ));
+    ok(worker(&u, ack("n1", &ids(&["g_a"])), t));
+    assert_eq!(lift(&u, S + 1, None, t), refused_gate(GateRefusal::Closed));
     // A page of more than 100 ids, or an ack for another replay: refused.
-    let big: Vec<String> = (0..=MAX_ACK_PAGE).map(|i| format!("g_{i}")).collect();
-    let big: Vec<&str> = big.iter().map(String::as_str).collect();
+    let big: Vec<String> = (0..=MAX_PAGE).map(|i| format!("g_{i}")).collect();
     assert_eq!(
-        worker(&u, ack(&big, "n1"), t),
+        worker(&u, ack("n1", &big), t),
         refused_gate(GateRefusal::Malformed)
     );
     assert_eq!(
-        worker(&u, ack(&["g_b"], "n2"), t),
+        worker(&u, page(FindingList::Damaged, "n1", &big), t),
+        refused_gate(GateRefusal::Malformed)
+    );
+    assert_eq!(
+        worker(&u, ack("n2", &ids(&["g_b"])), t),
         refused_gate(GateRefusal::NoReport)
     );
     // An extra id the lift does not need: not exactly the named set.
-    ok(worker(&u, ack(&["g_b", "g_extra"], "n1"), t));
+    ok(worker(&u, ack("n1", &ids(&["g_b", "g_extra"])), t));
     assert_eq!(
-        sync(&u, S + 1, None, t),
+        lift(&u, S + 1, None, t),
         refused_gate(GateRefusal::AckMismatch)
     );
-    // Opening the replay again under a new nonce discards the acks.
+    // Opening the replay again under a new nonce discards the ids and acks.
     ok(worker(
         &u,
         UnitOp::GateOpen {
@@ -653,22 +823,66 @@ fn blockers_lift_only_when_acknowledged_exactly_by_name() {
         },
         t,
     ));
+    assert_eq!(lift(&u, S + 1, None, t), refused_gate(GateRefusal::Closed));
     ok(worker(
         &u,
         UnitOp::GateReport {
             replay_id: rid("n2"),
-            findings: whole(&["g_a", "g_b"]),
+            summary: whole(2),
         },
         t,
     ));
-    ok(worker(&u, ack(&["g_b", "g_a", "g_a"], "n2"), t));
-    let status = ok(worker(&u, UnitOp::GateStatus {}, t));
-    let want = ids_hash(&["g_a".to_string(), "g_b".to_string()]);
-    assert_eq!(
-        status["lift"]["ok"]["acknowledged"]["damaged"],
-        json!({ "count": 2, "sha256": want })
-    );
-    assert!(matches!(sync(&u, S + 1, None, t), UnitAnswer::Ok { .. }));
+    ok(worker(
+        &u,
+        page(FindingList::Damaged, "n2", &ids(&["g_a", "g_b"])),
+        t,
+    ));
+    ok(worker(&u, ack("n2", &ids(&["g_b", "g_a", "g_a"])), t));
+    let p = proof(&u, t);
+    let want = ids_hash(&ids(&["g_a", "g_b"]));
+    assert_eq!(p.acknowledged[&AckClass::Damaged].count, 2);
+    assert_eq!(p.acknowledged[&AckClass::Damaged].sha256, want);
+    assert!(matches!(lift(&u, S + 1, Some(p), t), UnitAnswer::Ok { .. }));
+}
+
+#[test]
+fn any_number_of_blockers_is_reported_and_acknowledged_in_pages() {
+    let u = closed();
+    let t = BORN + 2000;
+    level_stamp(&u, 4);
+    ok(worker(
+        &u,
+        UnitOp::GateOpen {
+            replay_id: rid("n1"),
+        },
+        t,
+    ));
+    let all: Vec<String> = (0..350).map(|i| format!("g_{i:04}")).collect();
+    ok(worker(
+        &u,
+        UnitOp::GateReport {
+            replay_id: rid("n1"),
+            summary: whole(350),
+        },
+        t,
+    ));
+    let mut pages = all.chunks(MAX_PAGE);
+    ok(worker(
+        &u,
+        page(FindingList::Damaged, "n1", pages.next().unwrap()),
+        t,
+    ));
+    // Fewer listed than counted: closed (`Unlisted`) until every page is in.
+    assert_eq!(lift(&u, S + 1, None, t), refused_gate(GateRefusal::Closed));
+    for chunk in pages {
+        ok(worker(&u, page(FindingList::Damaged, "n1", chunk), t));
+    }
+    for chunk in all.chunks(MAX_PAGE) {
+        ok(worker(&u, ack("n1", chunk), t));
+    }
+    let p = proof(&u, t);
+    assert_eq!(p.acknowledged[&AckClass::Damaged].count, 350);
+    assert!(matches!(lift(&u, S + 1, Some(p), t), UnitAnswer::Ok { .. }));
 }
 
 #[test]
@@ -689,12 +903,12 @@ fn a_report_of_an_older_replay_never_lifts() {
         &u,
         UnitOp::GateReport {
             replay_id: rid("n1"),
-            findings: whole(&[]),
+            summary: whole(0),
         },
         t,
     ));
     assert_eq!(
-        sync(&u, S + 1, None, t),
+        lift(&u, S + 1, None, t),
         refused_gate(GateRefusal::StampNotLevelled)
     );
     // A report for the replay of this ordinal lifts.
@@ -713,11 +927,12 @@ fn a_report_of_an_older_replay_never_lifts() {
         &u,
         UnitOp::GateReport {
             replay_id: now,
-            findings: whole(&[]),
+            summary: whole(0),
         },
         t,
     ));
-    assert!(matches!(sync(&u, S + 1, None, t), UnitAnswer::Ok { .. }));
+    let p = proof(&u, t);
+    assert!(matches!(lift(&u, S + 1, Some(p), t), UnitAnswer::Ok { .. }));
 }
 
 #[test]

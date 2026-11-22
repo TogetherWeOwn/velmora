@@ -111,8 +111,8 @@ check("restore on an open unit", unit_post(0, call(0, "worker", {"op": "restore"
       {"answer": "refused", "reason": {"restore": "not_restoring"}, "alarm": False})
 check("a restore entry closes the unit", unit_post(0, call(0, "worker", {"op": "sync", "head": {"seqs": {"state_seq": 4, "keys_seq": 0},
       "tenant_state": "active", "restoring_since": 4}})), {"answer": "ok", "seqs": {"state_seq": 4, "keys_seq": 0}, "body": {"synced": 4}})
-check("restore_prepare too soon after the close", unit_post(0, call(0, "worker", {"op": "restore_prepare", "since": 4})),
-      {"answer": "refused", "reason": {"restore": "too_soon"}, "alarm": False})
+check("restore_prepare without a lease table", unit_post(0, call(0, "worker", {"op": "restore_prepare", "since": 4})),
+      {"answer": "refused", "reason": {"restore": "lease_unknown"}, "alarm": False})
 check("the entry is not cleared without the lift check", unit_post(0, call(0, "worker", {"op": "sync", "head": {"seqs": {"state_seq": 5, "keys_seq": 0},
       "tenant_state": "active"}})), {"answer": "refused", "reason": {"gate": "no_report"}, "alarm": False})
 

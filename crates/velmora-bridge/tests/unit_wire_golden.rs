@@ -13,13 +13,15 @@
 
 use serde_json::{json, Value};
 use velmora_bridge::unit::call::{Closed, HoldMode};
-use velmora_bridge::unit::gate::GateFindings;
+use velmora_bridge::unit::identity::Refusal as IdentityRefusal;
 use velmora_bridge::unit::identity::Refusal;
 use velmora_bridge::unit::import::{
     ImportBatch, ImportRefusal, ImportTable, ImportValue, MoveHead,
 };
 use velmora_bridge::unit::keys::{Access, KeyEntry, KeyGrant, KeyKind, KeyRefusal, SubjectStatus};
-use velmora_bridge::unit::lift::{AckClass, GateRefusal, ReplayId};
+use velmora_bridge::unit::lift::{
+    AckClass, ClassProof, FindingList, GateRefusal, GateSummary, LiftProof, ReplayId,
+};
 use velmora_bridge::unit::restore::{Bookmark, RestoreRefusal, RestoreTarget};
 use velmora_bridge::unit::{
     BirthKind, BirthToken, CallKind, ProvisionRefusal, Reader, Refused, Seqs, SyncHead, TenantId,
@@ -73,6 +75,7 @@ fn op_kind(op: &UnitOp) -> &'static str {
         UnitOp::Restore { .. } => "restore",
         UnitOp::GateOpen { .. } => "gate_open",
         UnitOp::GateReport { .. } => "gate_report",
+        UnitOp::GateBlockers { .. } => "gate_blockers",
         UnitOp::GateAck { .. } => "gate_ack",
         UnitOp::GateStatus {} => "gate_status",
         UnitOp::ReadPlan { .. } => "read_plan",
@@ -125,7 +128,18 @@ fn ops() -> Vec<UnitOp> {
                 seqs: seqs(),
                 tenant_state: TenantState::Suspended,
                 tenant_mode: Some(HoldMode::ReadOnly),
-                restoring_since: Some(7),
+                restoring_since: None,
+                lift: Some(LiftProof {
+                    replay_id: rid(),
+                    acknowledged: [(
+                        AckClass::Damaged,
+                        ClassProof {
+                            count: 1,
+                            sha256: "ab".into(),
+                        },
+                    )]
+                    .into(),
+                }),
             },
         },
         UnitOp::Ping {},
@@ -198,13 +212,18 @@ fn ops() -> Vec<UnitOp> {
         UnitOp::GateOpen { replay_id: rid() },
         UnitOp::GateReport {
             replay_id: rid(),
-            findings: GateFindings {
+            summary: GateSummary {
                 complete: true,
                 damaged_total: 1,
-                damaged: vec!["g_1".into()],
-                held_missing_live: Some(vec![]),
-                ..GateFindings::default()
+                other_bucket_total: 0,
+                held_missing_total: 2,
+                classified: true,
             },
+        },
+        UnitOp::GateBlockers {
+            replay_id: rid(),
+            list: FindingList::HeldMissingLive,
+            ids: vec!["x_1".into()],
         },
         UnitOp::GateAck {
             replay_id: rid(),
@@ -223,7 +242,59 @@ fn ops() -> Vec<UnitOp> {
             }),
             generation: Some("g_1".into()),
         },
+        UnitOp::ReadPlan {
+            bucket: "alpha".into(),
+            key: "k".into(),
+            start: 0,
+            end: 0,
+            access_key_id: None,
+            reader: Some(Reader::Public),
+            generation: Some("g_1".into()),
+        },
     ]
+}
+
+/// Every variant of a field-less enum, as a list and as an exhaustive
+/// match: a new variant does not compile until it is listed here.
+macro_rules! every {
+    ($e:ident: $($v:ident),* $(,)?) => {{
+        let all = vec![$($e::$v),*];
+        for v in &all {
+            match v {
+                $($e::$v)|* => {}
+            }
+        }
+        serde_json::to_value(&all).unwrap()
+    }};
+}
+
+fn nested() -> Value {
+    json!({
+        "call_kind": every!(CallKind: Request, Job, Fanout, Worker),
+        "identity_refusal": every!(IdentityRefusal: WrongName, StaleJob, NoNumbers),
+        "tenant_state": every!(TenantState: Provisioning, Active, Suspended, Deleting, Shredding, Shredded),
+        "hold_mode": every!(HoldMode: ReadOnly, Locked),
+        "closed": every!(Closed: Restoring, Provisioning),
+        "birth_kind": every!(BirthKind: Birth, Restore),
+        "provision_refusal": every!(ProvisionRefusal: BornBefore, NotTheListingRecord, NotRestoring,
+            WrongName, WrongScheme, WrongSchema, StaleBirth, AlreadyBorn, NoNumbers),
+        "key_kind": every!(KeyKind: S3, AppPassword, Principal, Internal),
+        "subject_status": every!(SubjectStatus: Active, Disabled, Revoked),
+        "access": every!(Access: Ro, Rw),
+        "key_refusal": every!(KeyRefusal: Gap, Malformed),
+        "import_refusal": every!(ImportRefusal: NotBound, Shape, OutOfOrder),
+        "import_table": every!(ImportTable: Buckets, Generations, Objects, Extents,
+            GenerationExtents, Articles, Verifications, VerifyRaises, VerifyEscalations, Outbox,
+            Uploads, UploadParts, UploadPartExtents, Gc, UsageHours, UsageRecounts),
+        "ack_class": every!(AckClass: Damaged, HeldMissing, Unreadable, Unpublishable,
+            DamagedUnpublished, Twins, OtherBucket),
+        "finding_list": every!(FindingList: Damaged, Unreadable, Unpublishable,
+            DamagedUnpublished, Twins, OtherBucket, HeldMissing, HeldMissingLive),
+        "gate_refusal": every!(GateRefusal: NotRestoring, NoReport, StampNotLevelled, Closed,
+            AckMismatch, CountersOff, ProofMismatch, Malformed),
+        "restore_refusal": every!(RestoreRefusal: NotRestoring, WrongToken, LeaseLive,
+            LeaseUnknown, TooSoon, Moved, Malformed, NoPointInTime),
+    })
 }
 
 fn refusals() -> Vec<Refused> {
@@ -300,13 +371,15 @@ fn document() -> Value {
             v
         })
         .collect();
-    json!({ "calls": calls, "answers": answers })
+    json!({ "calls": calls, "answers": answers, "nested": nested() })
 }
 
 #[test]
 fn every_variant_has_a_sample() {
     let ops: std::collections::BTreeSet<_> = ops().iter().map(op_kind).collect();
-    assert_eq!(ops.len(), 15, "{ops:?}");
+    assert_eq!(ops.len(), 16, "{ops:?}");
+    let readers: std::collections::BTreeSet<_> = ops_readers().into_iter().collect();
+    assert_eq!(readers.len(), 2, "both readers have a sample");
     let answers: std::collections::BTreeSet<_> = answers().iter().map(answer_kind).collect();
     assert_eq!(answers.len(), 9, "{answers:?}");
     let reasons: std::collections::BTreeSet<_> = refusals().iter().map(refused_kind).collect();
@@ -324,4 +397,19 @@ fn the_wire_format_is_the_golden_file() {
         text, golden,
         "the unit wire format changed: see the module doc"
     );
+}
+
+fn ops_readers() -> Vec<&'static str> {
+    ops()
+        .iter()
+        .filter_map(|op| match op {
+            UnitOp::ReadPlan {
+                reader: Some(r), ..
+            } => Some(match r {
+                Reader::Key { .. } => "key",
+                Reader::Public => "public",
+            }),
+            _ => None,
+        })
+        .collect()
 }
