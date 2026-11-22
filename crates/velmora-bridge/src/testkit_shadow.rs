@@ -553,6 +553,12 @@ fn error_class(message: &str) -> String {
     if let Some(o) = own.iter().find(|o| message.starts_with(*o)) {
         return (*o).to_string();
     }
+    // The native adapter refuses the same value itself (#166's check in
+    // `testkit`, D1's rule), with no store prefix: one class with the
+    // object's.
+    if message == "integer outside JS safe range" {
+        return "do: integer outside JS safe range".to_string();
+    }
     if message.contains("constraint failed") || message.ends_with("constraint violation") {
         "constraint".into()
     } else {
