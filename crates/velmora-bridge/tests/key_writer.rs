@@ -6514,3 +6514,106 @@ async fn the_exit_finds_new_holders_and_reports_blocked_ones() {
     assert_eq!(drops.blocked, vec!["PR0004".to_owned()]);
     assert!(!drops.done);
 }
+
+/// Review r1 of the apply (M1): a store that stops between pages never
+/// serves a subject more open than the head or than it did before. The
+/// unit holds PX0001 disabled; the chain re-enables it at 60 and disables
+/// it again at the head; after page 1 alone it must not be active.
+#[tokio::test(flavor = "current_thread")]
+async fn an_older_record_never_opens_a_subject_between_pages() {
+    let w = World::new();
+    let x = principal("PX0001", &[]);
+    let mut off = x.clone();
+    off.door.status = SubjectStatus::Disabled;
+    plant(&w, 1, KeyOp::Create, &x, None);
+    plant(&w, 2, KeyOp::Status, &off, None);
+    for seq in 3..=149 {
+        plant(
+            &w,
+            seq,
+            KeyOp::Create,
+            &principal(&format!("PA{seq:04}"), &[]),
+            None,
+        );
+    }
+    plant(&w, 60, KeyOp::Status, &x, None);
+    plant(&w, 150, KeyOp::Status, &off, None);
+    let table = head_table(&w).await;
+    let none = Default::default();
+    let unit = FakeTarget::new("unit");
+    // The unit at seq 2, PX0001 disabled.
+    {
+        let early = {
+            let mut t = KeyTable::empty(w.t.clone());
+            let chain = key_chain(&w.t);
+            for seq in 1..=2 {
+                let b = chain.get(&w.store, seq).await.unwrap();
+                t.apply(&open_key_record(&w.kek, &w.ring, &w.t, seq, &b).unwrap())
+                    .unwrap();
+            }
+            t
+        };
+        let e = early.get("PX0001").unwrap().clone();
+        KeyTarget::apply(
+            &unit,
+            0,
+            &[ApplyEntry::Marker { seq: 1 }, ApplyEntry::Subject(e)],
+        )
+        .await
+        .unwrap();
+    }
+    assert_eq!(unit.status("PX0001"), Some(SubjectStatus::Disabled));
+    unit.down_after.set(Some(1));
+    assert!(
+        apply_direct(&w.store, &w.kek, &w.ring, &table, &none, &unit)
+            .await
+            .is_err()
+    );
+    assert_eq!(unit.seq.get(), 102);
+    assert_ne!(unit.status("PX0001"), Some(SubjectStatus::Active));
+}
+
+/// Review r1 of the apply (M2): an `m/rk/` revocation without its record
+/// reaches a store before any page, so a page that fails cannot keep it
+/// out.
+#[tokio::test(flavor = "current_thread")]
+async fn an_unrecorded_revocation_goes_before_the_pages() {
+    let w = World::new();
+    plant_principals(&w, 200);
+    let table = head_table(&w).await;
+    let revoked: std::collections::BTreeSet<String> = ["PA0010".to_owned()].into();
+    let unit = FakeTarget::new("unit");
+    unit.seq.set(50);
+    unit.down_after.set(Some(1));
+    assert!(
+        apply_direct(&w.store, &w.kek, &w.ring, &table, &revoked, &unit)
+            .await
+            .is_err()
+    );
+    assert_eq!(unit.status("PA0010"), Some(SubjectStatus::Revoked));
+    assert_eq!(unit.seq.get(), 50, "no page was taken");
+}
+
+/// Review r1 of the apply (LOW 3): many held subjects that now open are
+/// sent again as one run of the records, not one call each.
+#[tokio::test(flavor = "current_thread")]
+async fn many_reopened_subjects_take_one_run() {
+    let w = World::new();
+    plant_principals(&w, 250);
+    let table = head_table(&w).await;
+    let none = Default::default();
+    let unit = FakeTarget::new("unit");
+    apply_direct(&w.store, &w.kek, &w.ring, &table, &none, &unit)
+        .await
+        .unwrap();
+    // Every row held closed (applied by a Worker that could not open them).
+    for row in unit.rows.borrow_mut().values_mut() {
+        row.private = None;
+    }
+    let before = unit.applies.get();
+    apply_direct(&w.store, &w.kek, &w.ring, &table, &none, &unit)
+        .await
+        .unwrap();
+    assert_eq!(unit.applies.get() - before, 3, "100 + 100 + 50, not 250");
+    assert!(unit.rows.borrow().values().all(|r| r.private.is_some()));
+}

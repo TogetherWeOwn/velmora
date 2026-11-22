@@ -14,22 +14,19 @@
 //!   entry that opens, at the same seq, a row it holds closed.
 //!
 //! So a bring-up sends the records after the store's `keys_seq` up to the
-//! head, page by page, each record as the subject's state right after it.
-//! A store that stops between two pages holds the chain exactly as of the
-//! last page it took. Two kinds of entry are then sent again, alone, at
-//! their own seq: a subject the store holds closed whose private part now
-//! opens (the bring-up's second send), and a subject whose `m/rk/`
-//! revocation the chain does not record yet.
+//! head, page by page. For a subject's newest record the entry is the head
+//! table's entry, exactly. **Every older record is sent closed** (held),
+//! with its door as the record states it: the subject's newest record
+//! lies later in the same run, so a store that stops between two pages
+//! never serves a subject more open than the head does, nor more open
+//! than it did before (a disable answered `Done` is never undone there).
 //!
-//! The entry of a record is the subject's state after that record. For a
-//! subject's newest record it is the head table's entry, exactly. For an
-//! older one it is built from the record: its private part is the
-//! record's own, and when the record carries none (a close whose writer
-//! could not open it) or it does not open now, the entry is sent closed,
-//! which is what that record did anyway. Its newest opening at or below
-//! the record is known when it lies in the range sent; otherwise it is at
-//! or below the store's `keys_seq`, and that bound is used, which only
-//! ever holds more closed.
+//! Before the pages, every `m/rk/` revocation the chain does not record
+//! yet is sent alone at its subject's newest seq, so a store that a page
+//! cannot reach still gets it. After the pages, every subject the store
+//! holds closed whose private part now opens is sent again (the
+//! bring-up's second send): alone at its own seq, or, when that takes
+//! fewer calls, as one run of the records from the lowest such seq.
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
@@ -37,7 +34,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use super::chain::Chain;
 use super::ports::{Applied, ApplyEntry, KeyTarget, MAX_APPLY};
 use super::record::{
-    key_chain, open_chain_record, ChainRecord, Entry, KeyOp, KeyTable, SubjectStatus, TkRing,
+    key_chain, open_chain_record, ChainRecord, Entry, KeyTable, SubjectStatus, TkRing,
     ERR_KEY_RECORD,
 };
 use crate::ports::Kek;
@@ -49,8 +46,9 @@ use crate::types::{BridgeError, Result};
 pub const MAX_BEHIND: u32 = 3;
 
 /// Records kept in memory by one feed: the stores of one change are
-/// brought up three times from the same few records.
-const MEMO_RECORDS: usize = 256;
+/// brought up three times from the same records (an estimate; a few MiB
+/// at most).
+const MEMO_RECORDS: usize = 2048;
 
 /// The store kept answering `Behind`.
 pub const ERR_APPLY_BEHIND: BridgeError =
@@ -120,16 +118,9 @@ impl<'a, S: RecordStore, K: Kek, T: TkRing> Feed<'a, S, K, T> {
         e
     }
 
-    /// The entries of the records `(from, to]`, for a pass whose range
-    /// starts at `base`. `opened` carries, per subject seen in the pass,
-    /// its newest opening so far (or `base`, a bound).
-    async fn page(
-        &self,
-        base: u64,
-        from: u64,
-        to: u64,
-        opened: &mut BTreeMap<String, u64>,
-    ) -> Result<Vec<ApplyEntry>> {
+    /// The entries of the records `(from, to]`: the head's entry for a
+    /// subject's newest record, every older one held closed.
+    async fn page(&self, from: u64, to: u64) -> Result<Vec<ApplyEntry>> {
         let mut out = Vec::with_capacity((to - from) as usize);
         for seq in from + 1..=to {
             let r = match self.record(seq).await? {
@@ -140,28 +131,16 @@ impl<'a, S: RecordStore, K: Kek, T: TkRing> Feed<'a, S, K, T> {
                 ChainRecord::Key(r) => r,
             };
             let head = self.table.get(&r.door.id).ok_or(ERR_KEY_RECORD)?;
-            // Before its first record in the range, a subject's newest
-            // opening is exact when the head's is at or below the base,
-            // and at or below the base otherwise.
-            let bound = opened
-                .entry(r.door.id.clone())
-                .or_insert(match head.opened_seq <= base {
-                    true => head.opened_seq,
-                    false => base,
-                });
-            if !r.closes && r.op != KeyOp::Restate {
-                *bound = r.seq;
-            }
             let entry = match head.last_seq == r.seq {
                 true => head.clone(),
                 false => Entry {
                     door: r.door,
-                    private: r.private,
+                    private: None,
                     last_seq: r.seq,
                     private_seq: r.seq,
                     tk_version: r.tk_version,
                     closes: r.closes,
-                    opened_seq: *bound,
+                    opened_seq: head.opened_seq,
                 },
             };
             out.push(ApplyEntry::Subject(self.in_force(entry)));
@@ -182,53 +161,102 @@ impl<'a, S: RecordStore, K: Kek, T: TkRing> Feed<'a, S, K, T> {
         }
     }
 
-    /// The entries sent again, alone, at their own seq: a revocation the
-    /// chain does not record yet, and (in [`Mode::Full`]) a subject the
-    /// store holds closed that now opens. Only those at or below `held`;
-    /// the others are in the pages.
-    fn resends(&self, mode: Mode, held: u64, closed: &BTreeSet<String>) -> Vec<Entry> {
+    /// The `m/rk/` revocations the chain does not record yet, at or below
+    /// `held` (the others are in the pages).
+    fn unrecorded(&self, held: u64) -> Vec<Entry> {
         self.table
             .entries()
             .filter(|e| e.last_seq <= held)
             .filter(|e| {
-                let unrecorded =
-                    self.revoked.contains(&e.door.id) && e.door.status != SubjectStatus::Revoked;
-                let reopens = mode == Mode::Full
-                    && closed.contains(&e.door.id)
-                    && e.private.is_some()
-                    && e.door.status != SubjectStatus::Revoked;
-                unrecorded || reopens
+                self.revoked.contains(&e.door.id) && e.door.status != SubjectStatus::Revoked
             })
             .map(|e| self.in_force(e.clone()))
             .collect()
     }
 
-    /// One pass: the pages after the store's `keys_seq`, then the
-    /// resends. `false`: the store answered `Behind`.
-    async fn pass<U: KeyTarget>(&self, target: &U, mode: Mode) -> Result<bool> {
-        let held = target.keys_seq().await?;
-        let closed: BTreeSet<String> = target.closed().await?.into_iter().collect();
-        let to = self.table.seq();
-        let mut opened = BTreeMap::new();
-        let mut from = held;
-        while from < to {
-            let end = to.min(from + MAX_APPLY as u64);
-            let mut entries = self.page(held, from, end, &mut opened).await?;
-            for e in &mut entries {
-                Self::hold(mode, held, &closed, e);
-            }
-            if let Applied::Behind { .. } = target.apply(from, &entries).await? {
-                return Ok(false);
-            }
-            from = end;
-        }
-        for e in self.resends(mode, held, &closed) {
+    /// The subjects the store holds closed that now open, at or below
+    /// `held` (the second send).
+    fn reopened(&self, held: u64, closed: &BTreeSet<String>) -> Vec<Entry> {
+        self.table
+            .entries()
+            .filter(|e| {
+                e.last_seq <= held
+                    && closed.contains(&e.door.id)
+                    && e.private.is_some()
+                    && e.door.status != SubjectStatus::Revoked
+            })
+            .map(|e| self.in_force(e.clone()))
+            .collect()
+    }
+
+    /// Sends `entries` alone, each at its own seq. `false`: `Behind`.
+    async fn singly<U: KeyTarget>(&self, target: &U, entries: Vec<Entry>) -> Result<bool> {
+        for e in entries {
             let base = e.last_seq - 1;
             if let Applied::Behind { .. } = target.apply(base, &[ApplyEntry::Subject(e)]).await? {
                 return Ok(false);
             }
         }
         Ok(true)
+    }
+
+    /// Sends the records `(from, to]` page by page, held closed in `mode`.
+    /// `false`: `Behind`.
+    async fn run<U: KeyTarget>(
+        &self,
+        target: &U,
+        mode: Mode,
+        held: u64,
+        closed: &BTreeSet<String>,
+        mut from: u64,
+        to: u64,
+    ) -> Result<bool> {
+        while from < to {
+            let end = to.min(from + MAX_APPLY as u64);
+            let mut entries = self.page(from, end).await?;
+            for e in &mut entries {
+                Self::hold(mode, held, closed, e);
+            }
+            if let Applied::Behind { .. } = target.apply(from, &entries).await? {
+                return Ok(false);
+            }
+            from = end;
+        }
+        Ok(true)
+    }
+
+    /// One pass: the unrecorded revocations, the pages after the store's
+    /// `keys_seq`, then (in [`Mode::Full`]) the second send. `false`: the
+    /// store answered `Behind`.
+    async fn pass<U: KeyTarget>(&self, target: &U, mode: Mode) -> Result<bool> {
+        let held = target.keys_seq().await?;
+        let closed: BTreeSet<String> = target.closed().await?.into_iter().collect();
+        if !self.singly(target, self.unrecorded(held)).await? {
+            return Ok(false);
+        }
+        if !self
+            .run(target, mode, held, &closed, held, self.table.seq())
+            .await?
+        {
+            return Ok(false);
+        }
+        if mode != Mode::Full {
+            return Ok(true);
+        }
+        let reopened = self.reopened(held, &closed);
+        let Some(lowest) = reopened.iter().map(|e| e.last_seq).min() else {
+            return Ok(true);
+        };
+        // One run from the lowest such seq takes ceil(span / 100) calls;
+        // the store skips every other entry at or below its rows.
+        let span = held - (lowest - 1);
+        let run_calls = span.div_ceil(MAX_APPLY as u64);
+        if run_calls < reopened.len() as u64 {
+            self.run(target, Mode::Full, held, &closed, lowest - 1, held)
+                .await
+        } else {
+            self.singly(target, reopened).await
+        }
     }
 
     /// Brings `target` to the head in `mode`. A store that answers
