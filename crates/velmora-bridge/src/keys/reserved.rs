@@ -420,9 +420,10 @@ where
 
     /// Makes the opening change `request` under the reservation `reserved`
     /// the caller holds (AM-38 case 1, AM-72): a widening, a grant change
-    /// that adds or widens, of a key or a principal. A re-enable answers
-    /// [`ReservedAnswer::Busy`] (`503`) until the unit's reservation has an
-    /// `Opening` for it (AM-72), and nothing is read or written. On the
+    /// that adds or widens, of a key or a principal. A re-enable of a
+    /// disabled subject answers [`ReservedAnswer::Busy`] (`503`) until the
+    /// unit's reservation has an `Opening` for it (AM-72), and nothing is
+    /// written; a revoked subject is refused, an active one is in head. On the
     /// rules of [`KeyEnv::create_reserved`]: a record of this `rid` at
     /// `keys_seq + 1` wins; a head past `keys_seq` without one answers
     /// `Lost`; otherwise the record at exactly `keys_seq + 1` carries the
@@ -479,8 +480,7 @@ where
             return Ok(ReservedAnswer::Closes);
         }
         // AM-72: a re-enable answers `503` until the unit's reservation has
-        // an `Opening` for it (the unit cannot check it yet). A subject
-        // already active is the head's state (in head, below).
+        // an `Opening` for it (the unit cannot check it yet).
         let re_enable = matches!(
             request,
             KeyRequest::SetStatus {
@@ -488,11 +488,9 @@ where
                 ..
             }
         );
-        if re_enable
-            && table
-                .get(id)
-                .is_some_and(|e| e.door.status != SubjectStatus::Active)
-        {
+        // Only a real re-enable (of a disabled subject) is a change here; a
+        // revoked one is refused and an active one is in head, below.
+        if re_enable && matches!(planned, Planned::Change(_)) {
             return Ok(ReservedAnswer::Busy);
         }
         let Ok(zero) = self.gate.zero_head().await else {

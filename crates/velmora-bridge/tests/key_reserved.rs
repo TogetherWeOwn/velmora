@@ -13,7 +13,7 @@ use velmora_bridge::keys::checkpoint::{open_checkpoint, seal_checkpoint};
 use velmora_bridge::keys::gate::testkit::FakeGate;
 use velmora_bridge::keys::ports::{
     Admission, Applied, ApplyEntry, Binding, BucketAdmission, BucketReservation, ControlChain,
-    ControlIntents, KeptAnswer, KeyAdmission, KeyTarget, OpeningChange,
+    ControlIntents, KeptAnswer, KeyAdmission, KeyTarget, OpeningChange, Refusal,
 };
 use velmora_bridge::keys::record::{
     key_chain, open_key_record, seal_key_record_carrying, Access, Entry, Grant, KeyOp, KeyTable,
@@ -1796,4 +1796,42 @@ async fn change_closing_never_records_an_opening_change() {
         .unwrap(),
         KeyAnswer::Done { seq: 4 }
     );
+}
+
+/// A reservation cannot revive a revoked subject.
+#[tokio::test(flavor = "current_thread")]
+async fn a_reserved_re_enable_of_a_revoked_subject_is_refused_not_busy() {
+    let w = World::new();
+    let mut table = seed(&w).await;
+    let units = [&w.root, &w.unit2];
+    let plain = env!(w, &w.store, &AtRoot(&w.root), &units);
+    assert_eq!(
+        plain
+            .change(
+                &mut table,
+                "idem-rv",
+                &set_status(SubjectStatus::Revoked),
+                &mut TestRng(2)
+            )
+            .await
+            .unwrap(),
+        KeyAnswer::Done { seq: 2 }
+    );
+    let env = env!(w, &w.store, &NoAdmission, &units);
+    let answer = kept(RID);
+    let puts = w.store.puts();
+    assert_eq!(
+        env.change_reserved(
+            &mut table,
+            &set_status(SubjectStatus::Active),
+            reserved_at(&answer, 2),
+            &mut TestRng(3)
+        )
+        .await
+        .unwrap(),
+        ReservedAnswer::Refused(Refusal::Conflict)
+    );
+    assert_eq!(w.store.puts(), puts);
+    assert_eq!(w.head(), 2);
+    assert!(w.root.kept.borrow().is_empty());
 }
