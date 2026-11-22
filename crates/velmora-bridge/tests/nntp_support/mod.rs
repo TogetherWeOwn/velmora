@@ -373,6 +373,8 @@ pub struct MemCatalog {
     pub entries: RefCell<BTreeMap<ExtentId, Entry>>,
     slots: RefCell<BTreeMap<String, Vec<Slot>>>,
     health: RefCell<BTreeMap<String, Health>>,
+    /// A cooldown that begins by itself: `(provider, from, until)`.
+    later_cooldown: RefCell<Option<(String, i64, i64)>>,
     /// The next `n` `mark_posted` calls fail before writing (a job that
     /// dies between the POST and the catalogue write).
     pub fail_mark_posted: Cell<u32>,
@@ -413,6 +415,9 @@ pub struct MemCatalog {
     pub slow_next_renewal: RefCell<Option<(FixedClock, i64)>>,
     /// `provider_failed` calls so far (strikes reported).
     pub failures_reported: Cell<u32>,
+    loads: Cell<u32>,
+    acquires: Cell<u32>,
+    fail_asks: Cell<Option<(u32, bool)>>,
     /// The backbones read in full for a while, as `verify_escalations`.
     pub escalations: RefCell<Vec<VerifyEscalation>>,
     /// Extent, backbone and plan of each raise, as `verify_raises`.
@@ -459,6 +464,24 @@ impl MemCatalog {
 
     pub fn verifications(&self, extent: &ExtentId) -> Vec<VerificationRow> {
         self.entries.borrow()[extent].verifications.clone()
+    }
+
+    /// How often the load of the providers was read, and how often a
+    /// slot was asked for.
+    pub fn slot_asks(&self) -> (u32, u32) {
+        (self.loads.get(), self.acquires.get())
+    }
+
+    /// From the `n`th read of the providers' load on, that read fails
+    /// (`acquire` false) or every ask for a slot after it does.
+    pub fn fail_slot_asks(&self, n: u32, acquire: bool) {
+        self.fail_asks.set(Some((n, acquire)));
+    }
+
+    /// Provider `id` reads as cooling until `until` from `from` on, as
+    /// when another job's failures begin a cooldown at `from`.
+    pub fn cool_from(&self, id: &str, from: UnixMs, until: UnixMs) {
+        *self.later_cooldown.borrow_mut() = Some((id.to_string(), from.0, until.0));
     }
 
     /// Every held slot passes to someone else: its holder's permit is dead.
@@ -1024,6 +1047,10 @@ impl Catalog for MemCatalog {
         now: UnixMs,
     ) -> Result<Option<Permit>> {
         note_event("acquire");
+        self.acquires.set(self.acquires.get() + 1);
+        if matches!(self.fail_asks.get(), Some((n, true)) if self.loads.get() >= n) {
+            return Err(BridgeError::Sql("injected acquire_permit failure".into()));
+        }
         if self.acquire_takes_a_turn.get() {
             let in_flight = self.acquire_in_flight.get() + 1;
             self.acquire_in_flight.set(in_flight);
@@ -1599,14 +1626,29 @@ impl Catalog for MemCatalog {
         unused()
     }
     async fn provider_load(&self, now: UnixMs) -> Result<Vec<ProviderLoad>> {
+        self.loads.set(self.loads.get() + 1);
+        if matches!(self.fail_asks.get(), Some((n, false)) if self.loads.get() >= n) {
+            return Err(BridgeError::Sql("injected provider_load failure".into()));
+        }
         let slots = self.slots.borrow();
         let health = self.health.borrow();
-        let ids: std::collections::BTreeSet<&String> = slots.keys().chain(health.keys()).collect();
+        let later = self.later_cooldown.borrow();
+        let ids: std::collections::BTreeSet<&String> = slots
+            .keys()
+            .chain(health.keys())
+            .chain(later.as_ref().map(|l| &l.0))
+            .collect();
         Ok(ids
             .into_iter()
             .map(|id| {
                 let s = slots.get(id).map(Vec::as_slice).unwrap_or_default();
-                let h = health.get(id).copied().unwrap_or_default();
+                let mut h = health.get(id).copied().unwrap_or_default();
+                if let Some((_, _, until)) = later
+                    .as_ref()
+                    .filter(|(p, from, _)| p == id.as_str() && *from <= now.0)
+                {
+                    h.until = *until;
+                }
                 ProviderLoad {
                     provider_id: id.clone(),
                     held: s.iter().filter(|s| s.until >= now.0).count() as u32,
@@ -1895,6 +1937,37 @@ pub async fn rig(specs: &[Spec]) -> Rig {
         servers,
         bridge,
         dead_ports: Vec::new(),
+    }
+}
+
+impl Rig {
+    /// The host has a timer from here on, as the Worker has: a job may
+    /// wait, and each wait moves the rig's clock by its length.
+    pub fn with_timer(&mut self) {
+        let clock = self.bridge.clock.clone();
+        self.bridge.budget = ByteBudget::new(48 * 1024 * 1024).with_sleeper(Rc::new(move |ms| {
+            clock.advance_ms(i64::from(ms));
+            Box::pin(async {})
+        }));
+    }
+
+    /// Takes every background slot of provider `index` for another
+    /// holder, as of `at`: they expire one permit lifetime after it.
+    pub async fn take_slots(&self, index: usize, at: UnixMs) -> Vec<Permit> {
+        let provider = &self.bridge.cfg.providers[index];
+        let class = PermitClass::Background;
+        let mut held = Vec::new();
+        while let Some(permit) = self
+            .bridge
+            .catalog
+            .acquire_permit(provider, class, "other", at)
+            .await
+            .unwrap()
+        {
+            held.push(permit);
+        }
+        assert!(!held.is_empty());
+        held
     }
 }
 
