@@ -186,6 +186,23 @@ pub trait Handlers {
     async fn handle(&self, ctx: CallContext<'_>, body: &[u8]) -> Answer;
 }
 
+/// Two sets of handlers as one: a call goes to the first that serves it.
+#[derive(Clone, Copy, Debug)]
+pub struct Either<A, B>(pub A, pub B);
+
+impl<A: Handlers, B: Handlers> Handlers for Either<A, B> {
+    fn serves(&self, call: &Call) -> bool {
+        self.0.serves(call) || self.1.serves(call)
+    }
+
+    async fn handle(&self, ctx: CallContext<'_>, body: &[u8]) -> Answer {
+        match self.0.serves(&ctx.admitted.call) {
+            true => self.0.handle(ctx, body).await,
+            false => self.1.handle(ctx, body).await,
+        }
+    }
+}
+
 /// No handler: every call that passed the gate waits for its store.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct NotBuilt;

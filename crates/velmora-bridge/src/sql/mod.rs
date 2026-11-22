@@ -95,7 +95,6 @@ use crate::ports::{
 };
 use crate::recovery::Recorded;
 use crate::replay::{ReplayExtent, ReplayMark, ReplayProbe, ReplayPublish, RestoreProgress};
-use crate::types::Resend;
 use crate::types::{
     AccessKeyRow, AccessKeySummary, ArticleRow, BackboneStatus, BridgeError, Bucket, BucketId,
     CommitGeneration, CompleteUpload, CopyGeneration, DueRow, EvictCandidate, ExtentId,
@@ -108,6 +107,7 @@ use crate::types::{
 use crate::types::{
     BucketUsage, RecountState, RecountStep, UsageCounters, UsageRecount, UsageSnapshot,
 };
+use crate::types::{Resend, UploadState};
 
 /// `meta` key the guard self-test writes inside its failing batch.
 const GUARD_SELFTEST_KEY: &str = "guard_selftest_marker";
@@ -138,7 +138,8 @@ pub struct SqlCatalog<S: Sql> {
     gate: Option<Rc<dyn PermitGate>>,
     /// When this catalogue last ran the rollout step after an acquire
     /// that found nothing.
-    nudged: Cell<i64>,
+    /// Shared with the catalogues made by [`SqlCatalog::sharing`].
+    nudged: Rc<Cell<i64>>,
 }
 
 impl<S: Sql> SqlCatalog<S> {
@@ -146,7 +147,7 @@ impl<S: Sql> SqlCatalog<S> {
         SqlCatalog {
             sql,
             gate: None,
-            nudged: Cell::new(0),
+            nudged: Rc::new(Cell::new(0)),
         }
     }
 
@@ -156,7 +157,19 @@ impl<S: Sql> SqlCatalog<S> {
         SqlCatalog {
             sql,
             gate: Some(gate),
-            nudged: Cell::new(0),
+            nudged: Rc::new(Cell::new(0)),
+        }
+    }
+
+    /// A catalogue over `sql` that takes its permits through this one's
+    /// gate, with the same throttle of the gate rollout step: for a second
+    /// bridge of the isolate (a managed tenant's unit jobs), whose permits
+    /// and provider health are the shared database's.
+    pub fn sharing<S2: Sql>(&self, sql: S2) -> SqlCatalog<S2> {
+        SqlCatalog {
+            sql,
+            gate: self.gate.clone(),
+            nudged: Rc::clone(&self.nudged),
         }
     }
 
@@ -424,6 +437,9 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
         t: &UploadTarget<'_>,
     ) -> Result<Option<(UploadRow, Vec<UploadPartRow>)>> {
         uploads::upload(self, t).await
+    }
+    async fn upload_state(&self, t: &UploadTarget<'_>) -> Result<Option<UploadState>> {
+        uploads::upload_state(self, t).await
     }
     async fn list_uploads(
         &self,
@@ -694,6 +710,29 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
     }
     async fn gc_done(&self, id: i64, now: UnixMs) -> Result<()> {
         gc::gc_done(self, id, now).await
+    }
+    async fn gc_orphans_due(&self, now: UnixMs) -> Result<bool> {
+        gc::gc_orphans_due(self, now).await
+    }
+    async fn gc_orphans(
+        &self,
+        now: UnixMs,
+        cutoff: UnixMs,
+        scan: u32,
+        limit: u32,
+    ) -> Result<Vec<GcRow>> {
+        gc::gc_orphans(self, now, cutoff, scan, limit).await
+    }
+    async fn gc_orphan_claim(
+        &self,
+        rows: &[GcRow],
+        now: UnixMs,
+        cutoff: UnixMs,
+    ) -> (Vec<bool>, Result<()>) {
+        gc::gc_orphan_claim(self, rows, now, cutoff).await
+    }
+    async fn gc_orphan_done(&self, id: i64, now: UnixMs) -> Result<()> {
+        gc::gc_orphan_done(self, id, now).await
     }
 
     // recovery replay

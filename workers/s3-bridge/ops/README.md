@@ -276,8 +276,9 @@ exists: restore it to a timestamp, then replay from that timestamp.
 
 ## Restore
 
-1. Set `MAINTENANCE = "restore"` and deploy. Every write now answers 503,
-   and the jobs and the cron do nothing.
+1. Set the production variable `VELMORA_MAINTENANCE=restore` and re-run
+   the deploy job as described in [Deploy switches](#deploy-switches).
+   Every write now answers 503, and the jobs and the cron do nothing.
 2. Bring the database back, one of:
    - Time Travel: `npx wrangler d1 time-travel restore <db> --timestamp <T>`.
      The restore point is `T` in milliseconds.
@@ -313,7 +314,8 @@ exists: restore it to a timestamp, then replay from that timestamp.
      its post.
 5. Check: `GET /_admin/status` (`replay_unfinished` must be `false`), a
    listing, and a GET of a recent object.
-6. Set `MAINTENANCE = "off"` and deploy. Issue access keys again if the
+6. Unset the production variable `VELMORA_MAINTENANCE` or set it to
+   `off`, then re-run the deploy job. Issue access keys again if the
    database was rebuilt from the records alone. Keys revoked after the
    restore point stay revoked (`GET /_admin/keys` to check).
 
@@ -586,9 +588,10 @@ Above the floor a rollback is still not free:
 - (Versions from before the recovery records, #64, write no record at
   all; they are below the #71 floor anyway.)
 
-The CI auto-rollback only ever goes back to the version that served
-before that run's deploy, which is above the floor once the floor has
-been deployed. The floor matters for a rollback by hand.
+The CI auto-rollback targets the version that served before that run's
+deploy. If a rollback floor version is configured, CI refuses a target
+created before that version or an age comparison it cannot complete.
+Apply the same floor when rolling back by hand.
 
 To find the floor (version IDs are per account, so they are not listed
 here):
@@ -607,6 +610,86 @@ here):
    <commit>`. The first version for which it succeeds is the floor. A secret-change
    version takes the answer of the version before it. Treat any other
    version without a CI message (an upload by hand) as below the floor.
+
+## Deploy switches
+
+Set these GitHub configuration variables for production. Set
+`VELMORA_DEPLOY_FREEZE` and `VELMORA_CATALOGUE_MIGRATIONS` as **repository**
+variables under Settings → Secrets and variables → Actions → Variables →
+Repository. The build job and pull request checks run without the production
+environment, and the deploy job reads the same repository values.
+
+| Variable | Effect and default |
+|---|---|
+| `VELMORA_MAINTENANCE` | `restore` enables restore mode. Defaults to `off`. |
+| `VELMORA_CATALOGUE_ID` | Sets the catalogue name used in rollback stamps. Defaults to `main`. Use 1 to 32 lowercase letters, digits, underscores or hyphens. Keep the id stable for a catalogue in use. |
+| `VELMORA_JOB_FORMAT` | Selects job format `1` or `2` once the Worker supports the switch. Defaults to `1`. |
+| `VELMORA_DEPLOY_FREEZE` | Allows only the specified full lowercase commit SHA to deploy. Unset allows any commit that passes the tip check. |
+| `VELMORA_FLOOR_MIN` | Sets the minimum bundle floor level. Defaults to `0`. |
+| `VELMORA_FLOOR_VERSION` | Sets the earliest automatic rollback target by Worker version UUID and creation time. Unset disables this comparison. |
+| `VELMORA_CATALOGUE_MIGRATIONS` | `on` (default) applies catalogue migrations. `off` checks that none are pending and refuses the deploy if any are. |
+| `VELMORA_DIRECTORY_D1_ID` | Binds the directory D1 database by lowercase UUID and applies its migrations. Unset leaves it unbound. |
+| `VELMORA_KEYS_A_BUCKET`, `VELMORA_KEYS_B_BUCKET` | Bind the two key buckets of the tenant keys as `KEYS_A` (the bucket that creates a key version) and `KEYS_B` (its synchronous copy), by R2 bucket name. Set both or neither; they must differ from each other and from every bucket the file binds (production and dev). Unset leaves both unbound. |
+
+For a switch deploy, set the variable and re-run the deploy job of the
+tip commit's push run. During a freeze, use branch protection to hold
+merges and re-run the deploy job of the frozen commit's push run.
+
+The bundle artifact is kept for 30 days. Re-runs are possible only
+within GitHub's re-run window (about 30 days, check GitHub's current
+limit). Once that window closes, a switch deploy requires a new commit
+to main that changes the bridge. `workflow_dispatch` does not deploy.
+Check the switch values printed in the log and confirm that the deployed
+commit id matches the commit serving before the switch deploy.
+
+`FLOOR_LEVEL` travels with the bundle. Raise it by one in the PR that
+ships a fence a rollback must never cross. Once that deploy is live
+and before the next merge, raise `VELMORA_FLOOR_MIN` by hand to the new
+level. Set `VELMORA_FLOOR_VERSION` to the Worker version that establishes
+the floor so automatic rollback also respects it. The floor rule compares
+Worker version creation times. After a hand rollback or a secret change
+that re-stamps an old version, check by hand that the rollback target
+respects the floor.
+
+Create the directory database once by hand with
+`wrangler d1 create velmora-directory --location enam`. Set its id as
+`VELMORA_DIRECTORY_D1_ID`. The binding is unused until Worker code
+reads it.
+
+Create the two key buckets once by hand before you set their variables
+(Cloudflare refuses the upload of a version that binds a bucket that
+does not exist, so the deploy fails and the version before stays live),
+for example `wrangler r2 bucket create velmora-keys-a --location enam`
+and `wrangler r2 bucket create velmora-keys-b --location enam`. They hold
+wrapped tenant keys only. The bindings are unused until Worker code
+reads them.
+
+Migration files are append-only. Give each new SQL file a name
+`NNNN_<snake>.sql` with a number higher than all existing numbers in
+its folder. Use additive SQL. A deliberate, reviewed destructive
+contract step requires a first line of `-- contract: <reason>`. With
+catalogue migrations `off`, CI also refuses new files in the catalogue
+migration folder. Directory migrations run independently.
+
+## More than one S3 host
+
+`S3_HOST` is always in the `legacy` class. Extra hosts can be `legacy` or
+`customer`. Both classes admit every key for now, because there is one
+tenant; a later change binds tenants to classes. A request is checked
+against the host it was sent to: a signature made for one host is refused
+on another, and `CompleteMultipartUpload` names the host it was sent to
+in `Location`.
+
+1. Attach the new host to the Worker as a Custom Domain.
+2. Set the GitHub Actions variable `VELMORA_S3_HOSTS` to the full list of
+   extra hosts, for example `s3.example.io=customer,archive.example.io=legacy`.
+   Use up to eight lowercase hostnames without ports or spaces.
+3. Let CI deploy. Check the smoke lines for an HTTP 403 with
+   `AccessDenied` for each host. Index 1 is the primary host, followed
+   by the extra hosts in list order.
+
+To remove a host, remove its entry from `VELMORA_S3_HOSTS`, let CI deploy
+successfully, then detach the Custom Domain.
 
 ## Client settings
 
@@ -831,6 +914,179 @@ Going back to a Worker version from before this table needs nothing
 else: the objects are ordinary generations, which it reads, posts,
 verifies and replays. It answers `EntityTooLarge` to a new PutObject
 above one extent.
+
+## Upload parts that left their upload
+
+Three things take a part out of a multipart upload for good: the part
+is uploaded again under its number, the upload is aborted, or
+CompleteMultipartUpload leaves the part out of its list. Such a part
+was never posted. Its ciphertext stays in `SAFETY` (`x/<extent id>`),
+and `GC_MODE` takes it only in a disposable bucket.
+
+`GC_ORPHANS = "on"` (its own switch, in every bucket, whatever
+`GC_MODE` says) deletes these copies and nothing else. The copy of an
+extent goes when all of this holds in one batch of the catalogue:
+
+1. the extent has an open `delete_safety` row in `gc`. For an extent
+   that is still `staged`, only the three writes above queue one, in
+   the batch that takes the part out of the upload, dated with that
+   moment;
+2. that moment is 31 days ago or more;
+3. the extent is `staged` and has no generation: no object was ever
+   made of it;
+4. no `generation_extents` row names it: no object and no server-side
+   copy reads it;
+5. no part of an open upload names it. An upload in progress keeps
+   every part it lists, however old it is;
+6. no replay is under way, the catalogue is not behind its rollback
+   stamp, and the last replay ended 31 days ago or more ("After a
+   restore" below);
+7. no key that could still get an object made of the part has a write
+   whose outcome is not known (below).
+
+**Why 31 days.** Nothing a request or a job does brings a dropped part
+back: its extent id is never issued again, and only an open upload
+that lists an extent can publish it. A database taken back to before
+the drop does list it. Time Travel reaches 30 days, so a part that was
+dropped longer ago is dropped in every state the database can return
+to, as long as it was not restored in that time ("After a restore"
+below); the 31st day is the margin between the clocks. A database taken
+back to before a part was collected still has the part dropped with
+its row open, and the collector deletes the absent copy once more.
+
+**A write whose outcome is not known.** CompleteMultipartUpload stores
+its recovery record, which names the parts it was given, before its
+batch runs. If the batch does not run and the record cannot be removed
+either, the request answers 5xx, the upload stays open, and the record
+stays: a replay would publish it. The catalogue marks the key before
+any such record is stored (`key_floors.unpublished`), and only a write
+or a delete of the key that was acknowledged takes the mark away. While
+the key of an upload is marked, the collector leaves the parts of that
+upload. For a part that was uploaded again, and for the slices after
+the first of a part above one extent, the catalogue no longer knows
+the upload: those wait until no key of their bucket that an upload was
+ever begun on is marked. The catalogue asks that of a bucket once a
+day at most and keeps the answer for that day (`scan_cursors`, key
+`orphans:bucket:<bucket id>`, value `clean:<time>` or `marked:<time>`
+in milliseconds). A key that is marked after a bucket was found clean
+holds nothing back that day, and need not: its record was stored then,
+from a part list that a part dropped 31 days earlier is not in. The
+marked keys:
+
+```
+npx wrangler d1 execute <db> --remote --command \
+  "SELECT b.name, f.key, f.floor_id FROM key_floors f JOIN buckets b ON b.id = f.bucket_id WHERE f.unpublished <> 0"
+```
+
+To let the parts go, settle the key: PUT the object again, or DELETE
+the key (a delete of a marked key stores a tombstone also when the key
+has no object). The parts of that key's upload go with the pass after
+that. The others go with the first pass after the answer about their
+bucket is a day old. What holds a bucket's parts back now:
+
+```
+npx wrangler d1 execute <db> --remote --command \
+  "SELECT k, v FROM scan_cursors WHERE k LIKE 'orphans%'"
+```
+
+`orphans:bucket:<bucket id>` = `marked:<time>` means the parts of
+unknown uploads in that bucket wait for a marked key, as found at that
+time. `orphans` is the position of the scan (`rest:<time>`: the next
+pass starts then).
+
+**Before turning it on.**
+
+1. A record stored before the catalogue had `key_floors` (migration
+   0007) set no mark. Such a record names only parts that were stored
+   before it. This must print 0:
+
+   ```
+   npx wrangler d1 execute <db> --remote --command \
+     "SELECT COUNT(*) FROM extents WHERE state = 'staged' AND created_at < COALESCE((SELECT CAST(strftime('%s', applied_at) AS INTEGER) * 1000 FROM d1_migrations WHERE name = '0007_key_floors.sql'), 9007199254740991)"
+   ```
+
+   A database with no row for that migration in `d1_migrations` (it
+   was applied by hand, or the database was imported) counts every
+   staged extent: put the time the migration was applied in place of
+   the subquery.
+
+   The Worker version that came with that migration is the first one
+   that sets the mark. A version from before it may have served for a
+   while after the migration was applied, and serves again after a
+   Worker rollback: put the time from which only versions with the
+   mark have served in place of `applied_at` when it is the later one.
+
+   If it does not, leave the switch off until every key that had an
+   upload before that time has been written again: PUT an object
+   to it, and DELETE that object after if the key should hold none. A
+   DELETE alone is not enough there: such a key carries no mark, and
+   on a key with no object and no mark a delete stores nothing, so the
+   old record would stay the newest one of the key.
+2. Run it on a deployed test environment, with `GC_ORPHANS = "on"`
+   and `GC_MODE` off there: with `GC_MODE=disposable` the older
+   collector deletes a dropped part in a bucket flagged disposable as
+   soon as it is dropped, and the run would show nothing about this
+   one. Abort an upload, upload a part twice and keep one upload open.
+   Then delete the row `orphans` of `scan_cursors` on that environment
+   (the scan rests a day after a pass, and a database used before may
+   hold a row from then) and wait until the row is back and reads
+   `rest:<ms>`: the collector has then made a pass since the parts
+   were dropped (the first cron run of a new deployment can be a
+   quarter of an hour away). The copies of the dropped parts are still
+   in `SAFETY` (`x/<extent id>`): the grace period holds them. Then
+   date the `gc` rows of the dropped parts 31 days back, delete the
+   row `orphans` again, and wait for a cron run. Then see both: the
+   copies of the dropped parts are gone from `SAFETY` and their
+   extents say `deleted` with the `gc` row closed, so the collector
+   did run; and the open upload completes and reads back.
+
+**What it costs.** While nothing is due, one row read per cron run. A
+pass reads the open `gc` rows in windows of 500, oldest first, and a
+job takes at most 100 parts; each part is one delete in `SAFETY` and
+three rows written (the extent, the usage counter, the `gc` row), plus
+one row per job for the position of the scan. After a pass over every
+due row the next one starts a day later. With `GC_MODE` off the rows
+of deleted and replaced objects stay open, and every pass reads them
+again: one row read for each, plus one for its extent, once a day. The
+parts whose upload is no longer known (point 7) need one statement per
+bucket that reads every row of `uploads`, about two rows read per
+upload ever begun. It runs once a day per bucket, whatever the number
+of parts and jobs, and also while a marked key holds such parts back:
+those are then refused for the rest of the day without another read of
+the uploads. Two jobs that run at the same moment on an answer that is
+a day old both ask: the read is then done once for each of them.
+
+**After a restore.** Time Travel cannot reach back past the 31 days on
+the history the database is on. It can return to a state of a history
+that an earlier restore left, for 30 days after that restore, and such
+a state may list in an open upload a part that was dropped, and since
+collected, on the history that was kept. So the collector deletes
+nothing until 31 days after the last replay ended
+(`SELECT state, finished_at FROM restore_state`): a catalogue that was
+taken back takes no write before a replay has run to its end, and by
+then every state of a history left before it is out of reach.
+
+It cannot see a restore that was undone before the replay after it
+ended, or in the minutes after it ended and before the next cron run
+raised the rollback stamp: the catalogue that is brought back holds no
+trace of the time it was away. So two rules stay as well, for every
+Time Travel restore, also one that undoes another, and also one that
+the rollback check did not report:
+
+1. set `GC_ORPHANS` to off and leave it off for 31 days;
+2. run the replay to its end before the switch goes back on. A restore
+   can take away the mark of a write whose outcome is not known while
+   its record stays; the replay publishes such a record and takes its
+   parts into the object, so they are not collected.
+
+A database loaded from an export file that is older than 31 days can
+list, in an open upload, a part whose copy was collected since. The
+replay counts such rows in `held_missing_total`; abort the uploads they
+belong to. A catalogue rebuilt from the records alone does not know the
+parts that were not collected yet: their copies stay in `SAFETY`.
+
+With the switch off nothing is deleted, and the rows stay for a later
+run with the switch on.
 
 ## Packed article plans
 

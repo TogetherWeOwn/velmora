@@ -17,6 +17,7 @@ use velmora_bridge::unit::{
     BirthKind, BirthToken, CallKind, Refused, Seqs, SyncHead, TenantId, TenantState, Unit,
     UnitAnswer, UnitCall, UnitName, UnitOp,
 };
+use velmora_bridge::unit_lease::lease::Proven;
 use velmora_bridge::UnixMs;
 
 const NOW: UnixMs = UnixMs(1_795_000_000_000);
@@ -45,8 +46,36 @@ fn call(op: UnitOp) -> UnitCall {
     }
 }
 
+/// One call at `now`, as the Worker makes it under rule 12: an answer
+/// `renew_needed` (the lease ran out: these tests move the clock by hours)
+/// is followed by a renewal at `now` and the same call once more.
 fn at(u: &Unit<RusqliteSql>, op: UnitOp, now: UnixMs) -> UnitAnswer {
-    u.handle(&call(op), now)
+    let c = call(op);
+    match u.handle(&c, now) {
+        UnitAnswer::RenewNeeded { why: None, .. } => {
+            renew(u, now);
+            u.handle(&c, now)
+        }
+        a => a,
+    }
+}
+
+/// The Worker's renewal at `now` (rule 12; `unit_lease_wiring.rs` holds
+/// its rules): the unit's lease then holds for T.
+fn renew(u: &Unit<RusqliteSql>, now: UnixMs) {
+    let seqs = u.head().unwrap().seqs;
+    let op = UnitOp::Renew {
+        proof_start: now,
+        proven: Proven {
+            state_seq: seqs.state_seq,
+            keys_seq: seqs.keys_seq,
+            stamp_counter: None,
+            revoked: 0,
+        },
+        revocations: Vec::new(),
+    };
+    let a = u.handle(&call(op), now);
+    assert!(matches!(a, UnitAnswer::Ok { .. }), "renew: {a:?}");
 }
 
 fn worker(u: &Unit<RusqliteSql>, op: UnitOp) -> UnitAnswer {
@@ -182,6 +211,7 @@ fn ready() -> Unit<RusqliteSql> {
         )],
         vec![],
     );
+    renew(&u, NOW);
     u
 }
 
@@ -986,6 +1016,75 @@ fn one_principal_per_owner_ref_that_is_not_revoked() {
     );
     let fresh = ok(worker(&u, create(4, 4, OWNER)));
     assert_eq!(fresh["admitted"]["rid"], json!(rid(4).hex()));
+}
+
+#[test]
+fn a_principal_create_for_an_ambiguous_owner_ref_alarms_on_every_path() {
+    // L5's review note: the create must not fall through to
+    // `principal_exists` when two principals hold one `owner_ref`.
+    let u = ready();
+    let create = |key: u8, r: u8, owner_ref: &str| {
+        reserve_op(
+            key,
+            key,
+            r,
+            None,
+            Opening::Principal {
+                id: format!("p_{r}"),
+                owner_ref: owner_ref.into(),
+                grants: vec![],
+            },
+        )
+    };
+    let ambiguous = UnitAnswer::Refused {
+        reason: Refused::Reserve(ReserveRefusal::OwnerRefAmbiguous),
+        alarm: true,
+    };
+    // A new ask.
+    let next = keys_seq(&u) + 1;
+    apply(
+        &u,
+        vec![principal_entry(
+            "p_twin",
+            OWNER,
+            next,
+            SubjectStatus::Active,
+            false,
+            vec![],
+        )],
+        vec![],
+    );
+    assert_eq!(worker(&u, create(1, 1, OWNER)), ambiguous);
+    assert_eq!(rows(&u), 0);
+    // A re-ask of a create reserved before the second principal came:
+    // refused with the alarm, and its row is dropped.
+    ok(worker(&u, create(2, 2, "member-3")));
+    assert_eq!(rows(&u), 1);
+    let next = keys_seq(&u) + 1;
+    apply(
+        &u,
+        vec![
+            principal_entry(
+                "p_m3a",
+                "member-3",
+                next,
+                SubjectStatus::Active,
+                false,
+                vec![],
+            ),
+            principal_entry(
+                "p_m3b",
+                "member-3",
+                next + 1,
+                SubjectStatus::Active,
+                false,
+                vec![],
+            ),
+        ],
+        vec![],
+    );
+    assert_eq!(worker(&u, create(2, 2, "member-3")), ambiguous);
+    assert_eq!(rows(&u), 0);
 }
 
 #[test]

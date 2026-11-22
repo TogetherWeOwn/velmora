@@ -17,8 +17,8 @@ use velmora_bridge::crypto::{seal_extent, unwrap_bdk, wrap_bdk, DataKey};
 use velmora_bridge::ingress::ByteBudget;
 use velmora_bridge::sql::SqlCatalog;
 use velmora_bridge::tenant_catalog::{
-    TenantCatalog, UnitPort, NOT_ON_UNIT, UNIT_CLOSED, UNIT_REFUSED, UNIT_STALE_JOB,
-    UNIT_SYNC_NEEDED,
+    TenantCatalog, UnitPort, UnitRefusal, NOT_ON_UNIT, UNIT_ACCOUNT_PROBLEM, UNIT_CLOSED,
+    UNIT_STALE_JOB, UNIT_SYNC_NEEDED,
 };
 use velmora_bridge::testkit::{
     FakeJobs, FixedClock, MemBlobStore, PublishUnrecorded, RusqliteSql, TestKek,
@@ -27,6 +27,8 @@ use velmora_bridge::unit::{
     BirthKind, BirthToken, CallKind, Seqs, SyncHead, TenantId, TenantState, Unit, UnitAnswer,
     UnitCall, UnitName, UnitOp, UnitSql,
 };
+use velmora_bridge::unit_lease::alarm::AlarmRules;
+use velmora_bridge::unit_lease::lease::{LeaseRules, Proven};
 use velmora_bridge::*;
 use velmora_test_nntp::{ServerConfig, TestNntpServer, UserConfig};
 
@@ -39,6 +41,11 @@ fn tenant() -> TenantId {
 
 fn own() -> UnitName {
     UnitName::new(tenant(), 0)
+}
+
+/// The scope the consumer gives a job of this tenant (`jobmsg::admit_for`).
+fn scope() -> velmora_bridge::TenantScope {
+    velmora_bridge::TenantScope::managed(&tenant()).unwrap()
 }
 
 // ---------------------------------------------------------------------------
@@ -174,6 +181,25 @@ fn sync(unit: &Unit<Db>, state_seq: u64, restoring: Option<u64>, now: UnixMs) {
     assert!(matches!(a, UnitAnswer::Ok { .. }), "{a:?}");
 }
 
+/// The Worker's renewal at `now` (rule 12).
+fn renew(unit: &Unit<Db>, now: UnixMs) {
+    let a = worker(
+        unit,
+        UnitOp::Renew {
+            proof_start: now,
+            proven: Proven {
+                state_seq: 3,
+                keys_seq: 0,
+                stamp_counter: None,
+                revoked: 0,
+            },
+            revocations: Vec::new(),
+        },
+        now,
+    );
+    assert!(matches!(a, UnitAnswer::Ok { .. }), "renew: {a:?}");
+}
+
 impl Fx {
     async fn new() -> Fx {
         Fx::with(GcMode::Disposable, 3).await
@@ -181,6 +207,10 @@ impl Fx {
 
     /// `job_seq`: the `state_seq` the jobs carry (the unit is at 3).
     async fn with(gc_mode: GcMode, job_seq: u64) -> Fx {
+        Fx::with_orphans(gc_mode, job_seq, false).await
+    }
+
+    async fn with_orphans(gc_mode: GcMode, job_seq: u64, gc_orphans: bool) -> Fx {
         let mut config = ServerConfig::for_test();
         config.articles = Vec::new();
         config.missing_ids.clear();
@@ -221,6 +251,7 @@ impl Fx {
             metrics_sample: 10,
             environment: Environment::Dev,
             s3_host: "s3.test".to_string(),
+            s3_hosts: Vec::new(),
             region: "auto".to_string(),
             max_extent_bytes: 16 * 1024 * 1024,
             max_put_bytes: 16 * 1024 * 1024,
@@ -241,19 +272,33 @@ impl Fx {
             inflight_budget_bytes: BUDGET,
             job_budget_bytes: BUDGET,
             gc_mode,
+            gc_orphans,
             hot_cap_bytes: velmora_bridge::config::DEFAULT_HOT_CAP_BYTES,
             maintenance: Maintenance::Off,
             server_side_copy: false,
             get_fanout_bytes: None,
-            catalogue_id: format!("{}.0", tenant()),
+            // Tenant 0's id: `for_unit` below makes the unit's.
+            catalogue_id: "main".to_string(),
             dev_trust_http: false,
             verify: Default::default(),
             providers,
             admin_token: Secret::new("admin-token-fixture-admin-token-fixture".to_string()),
-        };
+        }
+        // The unit's job configuration, as the consumer makes it.
+        .for_unit(&own())
+        .unwrap();
+        assert_eq!(cfg.catalogue_id, format!("{}.0", tenant()));
         let clock = Rc::new(FixedClock::new(T0));
         let db = Db(Rc::new(RusqliteSql::open_in_memory().unwrap()));
-        let unit = Rc::new(Unit::new(db.clone(), own(), ""));
+        // A lease that outlasts the test's clock: these tests are about
+        // the job path; `unit_lease_wiring.rs` holds the lease's rules.
+        let unit = Rc::new(Unit::new(db.clone(), own(), "").with_rules(
+            LeaseRules {
+                term_ms: 30 * 24 * 3_600_000,
+                ..LeaseRules::DEFAULT
+            },
+            AlarmRules::DEFAULT,
+        ));
         let token = BirthToken {
             name: own(),
             jurisdiction: String::new(),
@@ -272,6 +317,7 @@ impl Fx {
         );
         assert!(matches!(born, UnitAnswer::Ok { .. }), "{born:?}");
         sync(&unit, 3, None, T0);
+        renew(&unit, T0);
         let calls = Rc::new(Cell::new(0));
         let port = Local {
             unit: Rc::clone(&unit),
@@ -405,12 +451,20 @@ impl Fx {
         };
         self.bridge
             .safety
-            .put(&extent_id.safety_key(), sealed.ciphertext.clone(), &meta)
+            .put(
+                &scope().safety_key(&extent_id),
+                sealed.ciphertext.clone(),
+                &meta,
+            )
             .await
             .unwrap();
         self.bridge
             .cache
-            .put(&extent_id.cache_key(), sealed.ciphertext.clone(), &meta)
+            .put(
+                &scope().cache_key(&extent_id),
+                sealed.ciphertext.clone(),
+                &meta,
+            )
             .await
             .unwrap();
         self.cat
@@ -468,7 +522,7 @@ impl Fx {
             }
             runs += 1;
             assert!(runs < 200, "the queue does not drain");
-            if let JobOutcome::Retry { delay_secs } = self.bridge.run_job(&job).await {
+            if let JobOutcome::Retry { delay_secs } = self.bridge.run_job(&scope(), &job).await {
                 queue.push((self.clock.now().plus_secs(delay_secs), job));
             }
         }
@@ -537,9 +591,9 @@ async fn eviction_drops_a_released_extents_copies_through_the_unit() {
     fx.pump().await;
     assert_eq!(fx.extent(&o, "safety_state").await, "released");
     let cipher: u64 = fx.extent(&o, "cipher_size").await.parse().unwrap();
-    assert_eq!(fx.bridge.evict_batch(0).await.unwrap(), cipher);
-    assert!(!fx.bridge.safety.contains(&o.extent.safety_key()));
-    assert!(!fx.bridge.cache.contains(&o.extent.cache_key()));
+    assert_eq!(fx.bridge.evict_batch(&scope(), 0).await.unwrap(), cipher);
+    assert!(!fx.bridge.safety.contains(&scope().safety_key(&o.extent)));
+    assert!(!fx.bridge.cache.contains(&scope().cache_key(&o.extent)));
     assert_eq!(fx.extent(&o, "hot_safety_bytes").await, "0");
     assert_eq!(fx.extent(&o, "hot_cache_bytes").await, "0");
 }
@@ -575,17 +629,38 @@ async fn gc_takes_an_overwritten_extent_on_the_unit() {
     assert!(fx.bridge.dispatch().await.unwrap().gc_enqueued);
     fx.bridge.jobs.take();
     assert_eq!(
-        fx.bridge.run_job(&Job::Gc { v: JOB_VERSION }).await,
+        fx.bridge
+            .run_job(&scope(), &Job::Gc { v: JOB_VERSION })
+            .await,
         JobOutcome::Ack
     );
     let done = "SELECT COUNT(*) FROM gc WHERE extent_id = ?1 AND done_at IS NOT NULL";
     let id = [SqlValue::Text(old.extent.as_str().into())];
     assert_eq!(fx.scalar(done, &id).await, "2");
     assert_eq!(fx.extent(&old, "safety_state").await, "deleted");
-    assert!(!fx.bridge.safety.contains(&old.extent.safety_key()));
-    assert!(!fx.bridge.cache.contains(&old.extent.cache_key()));
+    assert!(!fx.bridge.safety.contains(&scope().safety_key(&old.extent)));
+    assert!(!fx.bridge.cache.contains(&scope().cache_key(&old.extent)));
     // The live object keeps its copies.
-    assert!(fx.bridge.safety.contains(&new.extent.safety_key()));
+    assert!(fx.bridge.safety.contains(&scope().safety_key(&new.extent)));
+}
+
+/// `GC_ORPHANS` on (main's #166): the orphan scan is not a unit job call,
+/// so a unit's Gc job finds none and still acknowledges; it never retries
+/// into the DLQ.
+#[tokio::test]
+async fn gc_with_the_orphan_scan_on_acknowledges_on_the_unit() {
+    let fx = Fx::with_orphans(GcMode::Disposable, 3, true).await;
+    let bucket = fx.bucket("scratch").await;
+    let old = fx.put(&bucket, "k", b"one").await;
+    let _new = fx.put(&bucket, "k", b"two").await;
+    assert_eq!(
+        fx.bridge
+            .run_job(&scope(), &Job::Gc { v: JOB_VERSION })
+            .await,
+        JobOutcome::Ack
+    );
+    assert_eq!(fx.extent(&old, "safety_state").await, "deleted");
+    assert_eq!(fx.bridge.catalog.refusal(), None);
 }
 
 // ---------------------------------------------------------------------------
@@ -593,13 +668,12 @@ async fn gc_takes_an_overwritten_extent_on_the_unit() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn a_job_with_lower_numbers_changes_nothing_in_the_unit() {
+async fn a_job_with_lower_numbers_changes_nothing_and_gets_the_units_numbers() {
     // The unit holds seq 3; the job carries 2.
     let fx = Fx::with(GcMode::Disposable, 2).await;
     let bucket = fx.bucket("scratch").await;
     let o = fx.put(&bucket, "a/x.bin", &plaintext()).await;
-    // The unit refuses the job's first call; the consumer reads the
-    // heads and runs it again or drops it (rule 5).
+    // The unit answers its own numbers and does nothing (AM-50).
     let err = fx
         .bridge
         .catalog
@@ -610,12 +684,91 @@ async fn a_job_with_lower_numbers_changes_nothing_in_the_unit() {
         matches!(err, BridgeError::Invalid(UNIT_STALE_JOB)),
         "{err:?}"
     );
-    fx.bridge.run_job(&o.job(OutboxStage::Post)).await;
+    let unit_seqs = Seqs {
+        state_seq: 3,
+        keys_seq: 0,
+    };
+    assert_eq!(
+        fx.bridge.catalog.refusal(),
+        Some(UnitRefusal::Stale(unit_seqs))
+    );
+    assert_eq!(fx.bridge.catalog.latest().get(), unit_seqs);
+    fx.bridge.run_job(&scope(), &o.job(OutboxStage::Post)).await;
     // The consumer can tell why: the unit's refusal is kept.
-    assert_eq!(fx.bridge.catalog.refusal(), Some(UNIT_STALE_JOB));
+    assert_eq!(
+        fx.bridge.catalog.refusal(),
+        Some(UnitRefusal::Stale(unit_seqs))
+    );
     assert_eq!(fx.outbox(&o, "stage").await, "post");
     assert_eq!(fx.outbox(&o, "attempts").await, "0");
     assert_eq!(fx.server.posted_count().await, 0);
+    // Run once more with the unit's numbers: it goes through.
+    let again = TenantCatalog::new(
+        Local {
+            unit: Rc::clone(&fx.unit),
+            clock: Rc::clone(&fx.clock),
+            calls: Rc::default(),
+        },
+        SqlCatalog::new(RusqliteSql::with_schema().unwrap()),
+        own(),
+        unit_seqs,
+    );
+    again.job_extent(&o.extent, &o.generation).await.unwrap();
+    assert_eq!(again.refusal(), None);
+    assert_eq!(again.latest().get(), unit_seqs);
+}
+
+#[tokio::test]
+async fn a_job_with_no_numbers_is_refused_and_is_not_stale() {
+    let fx = Fx::new().await;
+    let call = UnitCall {
+        name: own(),
+        kind: CallKind::Job,
+        seqs: None,
+        authenticated: true,
+        listed: false,
+        op: UnitOp::Job {
+            call: velmora_bridge::unit::jobcall::JobCall::evictable_bytes {},
+        },
+    };
+    assert_eq!(
+        fx.unit.handle(&call, fx.clock.now()),
+        UnitAnswer::Refused {
+            reason: velmora_bridge::unit::Refused::Identity(
+                velmora_bridge::unit::identity::Refusal::StaleJob
+            ),
+            alarm: false,
+        }
+    );
+    // Through the job catalogue it is `UnitRefusal::StaleJob`, never `Stale`:
+    // the consumer pages for it instead of running it again (AM-50).
+    struct NoNumbers(Local);
+    impl UnitPort for NoNumbers {
+        async fn call(&self, call: &UnitCall) -> Result<UnitAnswer> {
+            let mut c = call.clone();
+            c.seqs = None;
+            self.0.call(&c).await
+        }
+    }
+    let cat = TenantCatalog::new(
+        NoNumbers(Local {
+            unit: Rc::clone(&fx.unit),
+            clock: Rc::clone(&fx.clock),
+            calls: Rc::default(),
+        }),
+        SqlCatalog::new(RusqliteSql::with_schema().unwrap()),
+        own(),
+        Seqs {
+            state_seq: 3,
+            keys_seq: 0,
+        },
+    );
+    let err = cat.evictable_bytes().await.unwrap_err();
+    assert!(
+        matches!(err, BridgeError::Invalid(UNIT_STALE_JOB)),
+        "{err:?}"
+    );
+    assert_eq!(cat.refusal(), Some(UnitRefusal::StaleJob));
 }
 
 #[tokio::test]
@@ -695,7 +848,10 @@ async fn a_job_with_higher_numbers_needs_a_sync() {
         matches!(err, BridgeError::Invalid(UNIT_SYNC_NEEDED)),
         "{err:?}"
     );
-    assert_eq!(fx.bridge.catalog.refusal(), Some(UNIT_SYNC_NEEDED));
+    assert!(matches!(
+        fx.bridge.catalog.refusal(),
+        Some(UnitRefusal::SyncNeeded(_))
+    ));
 }
 
 #[tokio::test]
@@ -757,7 +913,14 @@ async fn jobs_run_for_a_suspended_tenant_and_not_for_a_shred() {
         .job_extent(&o.extent, &o.generation)
         .await
         .unwrap_err();
-    assert!(matches!(err, BridgeError::Invalid(UNIT_REFUSED)), "{err:?}");
+    assert!(
+        matches!(err, BridgeError::Invalid(UNIT_ACCOUNT_PROBLEM)),
+        "{err:?}"
+    );
+    assert_eq!(
+        fx.bridge.catalog.refusal(),
+        Some(UnitRefusal::AccountProblem)
+    );
 }
 
 #[tokio::test]
@@ -783,4 +946,140 @@ async fn a_job_call_without_authentication_is_refused() {
             ..
         }
     ));
+}
+
+/// A unit's sweep asks only its tenant's layout whether a generation is
+/// recorded: a record under tenant 0's flat name never counts for it.
+#[tokio::test]
+async fn a_units_generation_record_is_looked_for_in_its_own_layout_only() {
+    use velmora_bridge::recovery::{generation_recorded, Layout};
+    let store = MemBlobStore::new();
+    let id = GenerationId::new("g_00000000000000000000000001");
+    let (bucket, extent) = (BucketId::new("b_0000000000000001"), ExtentId::new("x_0"));
+    let digest: [u8; 32] = <sha2::Sha256 as sha2::Digest>::digest([1u8]).into();
+    let meta = BlobMeta {
+        bucket: &bucket,
+        extent: &extent,
+        cipher_sha256: &digest,
+    };
+    store
+        .put(&Layout::flat().generation_key(&id), vec![1], &meta)
+        .await
+        .unwrap();
+    assert!(!generation_recorded(&store, &scope(), &id).await.unwrap());
+    assert!(
+        generation_recorded(&store, &TenantScope::tenant_zero(), &id)
+            .await
+            .unwrap()
+    );
+    store
+        .put(&Layout::of(&scope()).generation_key(&id), vec![1], &meta)
+        .await
+        .unwrap();
+    assert!(generation_recorded(&store, &scope(), &id).await.unwrap());
+}
+
+/// A port that answers what it is told and keeps the calls it got.
+struct Scripted {
+    answers: std::cell::RefCell<Vec<UnitAnswer>>,
+    calls: std::cell::RefCell<Vec<UnitCall>>,
+}
+
+impl UnitPort for &Scripted {
+    async fn call(&self, call: &UnitCall) -> Result<UnitAnswer> {
+        self.calls.borrow_mut().push(call.clone());
+        Ok(self.answers.borrow_mut().remove(0))
+    }
+}
+
+/// Job calls say `listed = false` (AM-50, L6-7c); a `Stale` keeps the
+/// unit's numbers for the run once more and for follow-ups (L6-7d); a run
+/// once more carries them and forgets the last refusal.
+#[tokio::test]
+async fn job_calls_are_unlisted_and_keep_the_units_latest_numbers() {
+    let seqs = |state_seq, keys_seq| Seqs {
+        state_seq,
+        keys_seq,
+    };
+    let port = Scripted {
+        answers: std::cell::RefCell::new(vec![
+            UnitAnswer::Stale { seqs: seqs(5, 2) },
+            UnitAnswer::Ok {
+                seqs: seqs(5, 2),
+                body: serde_json::json!(7),
+            },
+            UnitAnswer::Unborn { listed: false },
+        ]),
+        calls: std::cell::RefCell::default(),
+    };
+    let cat = TenantCatalog::new(
+        &port,
+        SqlCatalog::new(RusqliteSql::with_schema().unwrap()),
+        own(),
+        seqs(3, 1),
+    );
+    let err = cat.evictable_bytes().await.unwrap_err();
+    assert!(
+        matches!(err, BridgeError::Invalid(UNIT_STALE_JOB)),
+        "{err:?}"
+    );
+    assert_eq!(cat.refusal(), Some(UnitRefusal::Stale(seqs(5, 2))));
+    assert_eq!(cat.latest().get(), seqs(5, 2));
+    cat.run_again_with(seqs(5, 2));
+    assert_eq!(cat.refusal(), None);
+    assert_eq!(cat.evictable_bytes().await.unwrap(), 7);
+    let err = cat.evictable_bytes().await.unwrap_err();
+    assert!(matches!(err, BridgeError::Invalid(_)), "{err:?}");
+    assert_eq!(cat.refusal(), Some(UnitRefusal::Unborn));
+    let calls = port.calls.borrow();
+    assert_eq!(calls.len(), 3);
+    assert!(calls.iter().all(|c| !c.listed && c.kind == CallKind::Job));
+    assert_eq!(calls[0].seqs, Some(seqs(3, 1)));
+    assert_eq!(calls[1].seqs, Some(seqs(5, 2)));
+}
+
+/// A run that the unit refused after its claim kept the row leased: the
+/// lease is given back with the new numbers before the run once more,
+/// which then claims the row (review of L6-1, MEDIUM).
+#[tokio::test]
+async fn the_lease_of_a_refused_run_is_given_back_before_the_run_once_more() {
+    let fx = Fx::new().await;
+    let bucket = fx.bucket("scratch").await;
+    let o = fx.put(&bucket, "a/x.bin", b"x").await;
+    let now = fx.clock.now();
+    let cat = &fx.bridge.catalog;
+    let lease = cat
+        .claim(&o.extent, &o.generation, OutboxStage::Post, "job:post", now)
+        .await
+        .unwrap()
+        .expect("the row is due");
+    // The chain moves on; the run's next call is refused.
+    sync(&fx.unit, 4, None, now);
+    assert!(cat.renew(&lease, now).await.is_err());
+    assert!(cat.refusal().is_some());
+    // Without the give-back the row stays leased.
+    let unit_seqs = Seqs {
+        state_seq: 4,
+        keys_seq: 0,
+    };
+    cat.run_again_with(unit_seqs);
+    assert_eq!(
+        cat.claim(&o.extent, &o.generation, OutboxStage::Post, "job:post", now)
+            .await
+            .unwrap(),
+        None
+    );
+    cat.give_back(now).await.unwrap();
+    assert_eq!(cat.refusal(), None);
+    let again = cat
+        .claim(&o.extent, &o.generation, OutboxStage::Post, "job:post", now)
+        .await
+        .unwrap();
+    assert!(again.is_some(), "the run once more claims the row");
+    // The give-back used no attempt of its own: two claims, one attempt
+    // (`defer` hands the claim's attempt back).
+    assert_eq!(fx.outbox(&o, "attempts").await, "1");
+    // A second give-back finds nothing of its own to free but the new
+    // claim, which it gives back too: the runs are sequential.
+    cat.give_back(now).await.unwrap();
 }

@@ -36,7 +36,10 @@ database, so they run natively in tests); the Durable Object class, the
      records up to the head and calls `sync` first;
    - a request with a lower number: the unit answers its own numbers and
      does nothing; the Worker refreshes and retries once;
-   - a job with no number, or a lower one: refused;
+   - a job with a lower number: the unit answers `stale` with its own
+     numbers and does nothing; the consumer runs the job once more with
+     them (AM-50, "Jobs");
+   - a job with no number: refused (`stale_job`); no writer sends one;
    - a fan-out sub-request (a part of a large GET, under a grant made
      earlier) with lower numbers: served only if, in the same transaction,
      the unit's own tables say the tenant may read, the bucket exists, and
@@ -81,23 +84,114 @@ database, so they run natively in tests); the Durable Object class, the
     key-row fetch and the cold read plan (both read-only; a cold read
     returns the key row with the plan, so a cold isolate verifies the
     signature from one call). Their transaction is rolled back and refused
-    if it changed a row. The Worker's own calls (`provision`, `sync`) are
+    if it changed a row. The Worker's own calls (`provision`, `sync`, `renew`) are
     not judged by this flag: they carry records the Worker has verified,
     never a caller's input, and a cold isolate needs `sync` before it can
     verify a signature.
+12. **Freshness lease** (`unit_lease`). The unit stores `fresh_until`. With
+    an expired lease (never issued, closed, or run out) it answers
+    `renew_needed` to every call but the Worker's own (`sync`, `renew`, the
+    key apply, the import, the gate's and the restore's) and the stamp
+    check of a job (`stamp`, `stamp_rolled_back`), and does nothing else.
+    - **`renew(proof_start, proven, revocations)`.** The Worker proves the
+      unit from the safety bucket (`unit_lease::renewal`: the next record of
+      each chain is absent, no stamp object after the unit's counter, and
+      the listing of `m/rk/<t>/`) and passes what it proved. In one
+      transaction the unit applies the listed revocations (a key row is
+      revoked; an id it holds no row for is kept in `unit_revoked_ids` and
+      revokes a row that arrives for it later), then sets
+      `fresh_until = proof_start + T` (T = 10 minutes, est) only if its own
+      seqs, stamp counter and revoked count are at least the proven ones,
+      every listed id is held as revoked, and `proof_start` is at most 30 s
+      behind or 5 s ahead of its clock. A renewal never moves the lease
+      back. Refused (with the reason): a `restoring` entry, a recorded
+      rollback, a unit without the lease table. The listed revocations are
+      kept also when the lease is refused.
+    - **The close.** The `sync` that sets a `restoring` entry ends the
+      lease; `lease_hi`, the latest `fresh_until` ever held, is kept for the
+      restore's wait. A `stamp_rolled_back` that records a rollback ends it
+      too.
+    - **Every answer** leaves the unit as `UnitReply`: the answer's object
+      with `lease_left_ms` (0 for no lease) and, once the unit holds keys or
+      listed ids, `revoked` (each id once) beside its fields.
 13. **Key scheme.** Tenant 0 holds key scheme 1, every other tenant scheme 2;
     a token with the other scheme is refused.
 14. **Jurisdiction.** A token names the jurisdiction of the namespace its
     object is in; a token for another one makes no object.
 
-Rules 8 to 10 and 12 (one alarm, jobs that name their tenant, the unit's
-outbox to the directory, the freshness lease) are not built yet. Until the
-lease exists, a unit is not bound anywhere: the lease is what closes a unit
-that a point-in-time restore took back to an older state.
+**Rule 8, one alarm** (`workers/unit/src/alarm.rs`, `unit_lease::alarm`):
+the alarm is the only code of a unit that sends to a queue. It sends the
+unit's two jobs, format 2 with the tenant and the unit: `stamp_raise`, once
+per period (5 minutes, est) after the first write since the last raise
+(the stamp's own calls and the cron's bookkeeping do not count), and with an
+expired lease one `renew` and nothing else, retried with a doubling wait
+(60 s to 30 minutes, est). A raise is handed out only with at least half of
+T left (its consumer reaches the unit later); with less, the alarm sends one
+`renew` instead, other duties run, and the raise follows the renewal. Work that was due stays due; after a renewal the
+alarm is set to now. The alarm is armed only when the wanted time is earlier
+than the armed one. A closed unit runs nothing. Only the stamp raise is due
+on a unit yet: the day close (W7), the sweeps, the hand-out and the report
+to the directory are not built here, and the Worker's cron runs a unit's
+jobs through `TenantCatalog`. Rules 9 and 10 (jobs that name their tenant,
+the unit's outbox to the directory) are not built yet.
 
-**The calls are JSON** (`UnitCall` and `UnitAnswer`, `unit::call`). Every
-answer is to carry `lease_left_ms`, and an answer of a unit that holds
-keys `revoked` (rule 12; with the lease). Until the class is bound
+**What makes the alarm's raise due** (ADR §8.5, AM-48). Every committed S3
+or job call that changed a row, and every reservation call that changed one
+(a reservation, its drop, a release, a binding, a grant's fence), makes the
+raise due: a call that wrote nothing leaves nothing for a rollback to lose.
+(AM-48 says "every reservation call"; this narrowing, as built, is with the
+design lane.) These do not: the stamp's own calls (`stamp`, `stamp_advance`,
+`stamp_rolled_back`), the dispatcher's run time (`record_dispatch`) and the
+scan cursors (`set_cursor`). Nor do the Worker's own calls: `renew`, `sync`,
+the key-chain apply, `import`, `ImportSeal`, `Recount`, `Export`, the gate
+calls and `provision`. A rollback that loses one of these shows as
+`SyncNeeded` or an expired lease, or the tool runs it again, and a raise
+must not make the next one due. Read stamps (`touch_read`) count. The alarm
+sends a raise only while at least T/2 of the lease is left; with less, it
+sends `renew` and sends the raise after that renewal.
+
+**The unit client** (`unit_lease::client`, the Worker's side of rules 5 and
+12; AM-50, AM-51). A unit does no I/O, so the Worker reads for it:
+
+- **`renew`.** The unit's numbers, stamp counter and revoked count come
+  from one stamp read through the job path (allowed with an expired lease),
+  then the proof (`unit_lease::renewal`) and `renew(proof_start, proven,
+  revocations)`. A newer record means `sync` first. Stamp objects after
+  the counter: the proof holds the newest one's counter, and the unit
+  renews only if its own counter has reached it, so a raise in between
+  passes; a unit refused `not_proven` (or with a full page of objects
+  ahead) is confirmed through its own counter, and with the counter
+  unchanged the rollback is recorded, the unit closes and the client pages
+  (again at every look while it stays closed). Revocations the unit did not
+  hold are applied with the renewal, and the key chain's finisher is told
+  once, before the call (SEC-6). More revocations held than listed renews
+  nothing and pages. The pages come back with an error too.
+- **`sync`.** The tenant chain's verified head and the key-chain records
+  after the unit's `keys_seq`: first the key apply (AM-12, in pages of at
+  most 100 records, each from the unit's own `keys_seq`), then `sync` at
+  both heads, with the head's state, mode and this unit's `restoring` entry.
+  A head that clears the entry is not sent as a lift: only the restore
+  tool's `sync` carries the lift proof (AM-45); the client reports it and
+  changes nothing. A unit the head does not list is not called.
+- **The request path** (rule 5): `renew_needed` renews, `sync_needed`
+  syncs, a lower request number takes the unit's numbers; each fix runs once
+  and the call runs once more. An answer with less than half of T left asks
+  for a background renewal (`waitUntil`). Unsigned calls and background
+  renewals go through the isolate's spacing: none while one runs, and after
+  a failed attempt a backoff from 60 s doubling up to T, cleared by a
+  success (rule 11). Signed calls go through the same spacing with the
+  backoff capped at 1 s.
+- **The `renew` and `stamp_raise` jobs**, which the queue consumer hands to
+  the client: a renewal as above; a raise moves the unit's counter, then puts
+  its object, renewing first when the lease ran out. A failed call, or a
+  unit's `Failed` answer, is handed back with the queue's retry delay; a
+  call that is stale twice is acknowledged; `unborn` goes to the consumer's
+  `Unborn` rule; a refusal no AM-50 row names goes to the dead-letter queue
+  with a page (AM-50). Under `MAINTENANCE = restore` the consumer acknowledges both
+  without a call.
+
+**The calls are JSON** (`UnitCall` and `UnitAnswer`, `unit::call`; an
+answer leaves the unit as `UnitReply`, rule 12). Until the class is bound
 (stage C(b)) the format may change. After it, these types only gain
 fields, in two deploys, reader first, and a golden-JSON test pins each
 variant.
@@ -110,8 +204,15 @@ mode, `restoring_since` and `closed_at`; moved by
 calls and the fenced creator-grant seqs (`unit_reservations`,
 `unit_bucket_fences`); the gate report and its
 acknowledgements; the lease and the alarm's counters in
-`unit_lease`, and revocations listed for a key the unit does not hold as
-tombstones (with the lease); and the stamp counter.
+`unit_lease` (`fresh_until`, `lease_hi`, `renew_tries`, `failed_runs`,
+`first_write_at`, `raise_from`; migration `u0002`), and revocations listed
+for a key the unit does not hold, or for an id that names a principal row,
+in `unit_revoked_ids`; and the stamp counter.
+
+**The write mark** (`unit_lease::mark`): the unit's catalogue and every
+table of the unit are reached only through `MarkedSql`, which counts every
+write of the wake (`wake_id` is random at each wake and kept in memory).
+A dump whose pages carry one mark is exact.
 
 ## Keys
 
@@ -283,7 +384,23 @@ from then on no batch is taken, not even the last one sent again, under
 any entry: the refusal is its own code, `sealed`, so a resumed copy knows
 the import is done. The seal survives a new `restoring` entry;
 `deleteAll()` clears it. While a move's import is not sealed, no lift
-passes under any entry, whatever the report. Every imported key value must
+passes under any entry, whatever the report.
+
+**The move's record stays** (AM-47): `unit_import` and
+`unit_import_move` (the seal, `t0_seq`, `move_ordinal`, `move_lifted`,
+`lifted_at`) stay after the move as its record until `deleteAll()`.
+`import_progress` answers, read-only, every table's cursor and rows, and
+`sealed` (the seal's `move_ordinal`), `t0_seq` (the newest tenant-0 seq a
+batch, the seal or a `move` report was bound to), `since_seq` and
+`move_lifted`; the last three are null when no import was ever bound to
+the unit. It also answers `schema_tables`, every table the unit holds
+(SQLite's and the platform's own left out), for the reverse move's
+preflight. A window's copy resumes only an import whose `t0_seq` is at or
+above its own first record (AM-53); a second move reads it before step 0
+(P12). On an unborn unit, `import_progress` answers `unborn` and makes
+nothing; `listed` is as the call says (rule 7). P12 reads both heads
+first and sends `listed = false` where they say an unborn unit is
+expected (the day-30 `deleteAll()`); every other read keeps the page. Every imported key value must
 be of its column's class (text, or integer where declared), so the unit
 never holds a key that `export` cannot page after.
 
@@ -322,21 +439,121 @@ catalogue method of the job path is one `job` call (`unit::jobcall`), run
 by the unit's own catalogue in one transaction; on the Worker's side,
 `TenantCatalog` is a catalogue whose job methods are these calls, so the
 job code runs unchanged against a unit. A job call carries the job's
-numbers and must match the unit's (rule 5: missing or lower is refused,
-higher is `sync_needed`), and is `authenticated`. Post, verify, release,
+numbers and must match the unit's (rule 5: lower is answered `stale`
+with the unit's numbers, missing is refused `stale_job`, higher is
+`sync_needed`), and is `authenticated`. A job call carries
+`listed = false`: it reaches the unit through its message, not through a
+record, so an unborn unit is decided by the consumer from the tenant's
+verified head (rule 7). Post, verify, release,
 GC and scrub run in `active`, `suspended` (either mode) and `deleting`.
 They are refused in `shredding` and `shredded`, and while this unit is
 closed (its own `restoring` entry is set, or its lease has expired: rule
 12). Provider permits and
 provider health are not a unit's: they stay in the shared database, which
 every tenant's jobs use. The request path does not use `TenantCatalog`.
-A refusal (`sync_needed`, a stale job, closed, unborn) comes back as a
-typed error, and the first one is kept (`TenantCatalog::refusal`) so the
-consumer can re-read the heads and run the job again or drop it. Stamp
+A refusal (`sync_needed`, stale, a job with no numbers, closed, unborn)
+comes back as a typed error, and the first one is kept
+(`TenantCatalog::refusal`). With `stale`, the refusal is
+`UnitRefusal::Stale(seqs)` with the unit's numbers, and
+`TenantCatalog::latest` holds the highest numbers the unit answered in
+the run, for a follow-up job (never below the job's own).
+
+**What the consumer does with a unit's answer to a job call (AM-50):**
+
+| The unit answers | The consumer |
+|---|---|
+| `stale{seqs}` | runs the job once more with the unit's `seqs`. They stand for the chain heads, because the unit refuses every job once its lease has expired, so they are at most T old (rule 12). A second `stale` is acknowledged; the outbox row stays. |
+| `refused{stale_job}` (no numbers) | DLQ and page: no writer sends a format-2 job without numbers. |
+| `closed` (restoring, provisioning) | acknowledges. The row stays in the unit's outbox, and the unit's dispatcher sends it again once the unit opens. |
+| `renew_needed` | renews through the unit client (rule 12), then runs the job once more. A failed renewal hands the message back with the queue's `retry_delay`. |
+| `sync_needed` | reads and verifies both chains up to their heads, applies the keys and calls `sync`, then runs the job once more. A failure hands the message back, and the DLQ pages once `max_retries` is reached. |
+| `unborn` | reads the tenant's verified head. If it lists the unit: DLQ and a "catalogue lost" page (rule 7). If not: acknowledged with a log line and no page. A head read that fails or does not verify hands the message back. |
+| `account_problem` while the tenant is `shredding` or `shredded` | acknowledges with a log line and no page. |
+| any other refusal | DLQ and page. |
+
+`renew` and `stamp_raise` have no outbox row; the unit keeps a raise
+pending until its stamp call lands. A managed tenant's job and request
+configs keep `MAINTENANCE` as tenant 0's: under `restore`, a unit job
+makes no unit call (an outbox job, `renew` and `stamp_raise` are
+acknowledged, with a log line and no page), and the request path refuses
+unit writes with `503`. Stamp
 calls must name the unit's own stamp id, `<tenant>.<unit>`. Eviction runs
 per unit against the configured cap until the directory's global
 threshold exists (ADR §5.5): with N managed tenants the cache can hold up
 to N times the cap.
+
+The queue consumer runs such a job only when the Worker has the unit
+class bound as `UNIT` (no production config binds it; without it the
+message is refused as `other_tenant`, as before). The reader
+(`jobmsg::admit_for`) admits a format-2 message of a managed tenant that
+names its unit, in that tenant's scope (`TenantScope::managed`: blobs
+`x/<t>/` and `c/<t>/`). The consumer gives the job a bridge of its own
+(`workers/s3-bridge/src/units.rs`): a `TenantCatalog` over the unit
+object's `fetch` with the message's numbers; the configuration from
+`BridgeConfig::for_unit`, which takes the unit's name and sets the stamp
+id `<tenant>.<unit>` (`jobcall::stamp_id`) and the tenant's record layout
+`m/x/<t>/` (never the flat layout); a sink whose messages name the same
+unit, always in format 2 (it refuses to send a `v` 1 message, which
+would be read as tenant 0's), with the numbers of the unit's latest
+answer in the run, never lower than the message's; and the isolate's one
+byte budget and permit gate. Garbage collection names the blob it deletes
+from the row's extent through the job's scope, not from the catalogue's
+delete list. Job calls carry `listed = false`.
+
+The unit's refusals decide the delivery (`unit_consumer`, ADR §2.4 rule 5
+as amended by AM-50): `Stale{seqs}` runs the job once more with the
+unit's numbers, and a second `Stale` is acknowledged; `Refused{stale_job}`
+(no numbers) goes to the dead-letter queue and pages; `Closed` is
+acknowledged (the row stays in the unit's outbox); `renew_needed` and
+`SyncNeeded` go through the unit client (renew, or read both chains,
+apply the keys and `sync`), then the job runs once more, and a failure
+hands the message back with the queue's `retry_delay`; `Unborn` reads the
+tenant's verified head (listed: dead-letter queue and a "catalogue lost"
+page; not listed: acknowledged; a head that cannot be read: handed back);
+`AccountProblem` while the tenant is shredding is acknowledged with no
+page; anything else goes to the dead-letter queue and pages. Each fix
+(the unit's numbers, a renewal, a `sync`) runs at most once per delivery,
+with numbers never below the message's, and only after the outbox lease
+the last run claimed is given back (`TenantCatalog::give_back`; if it
+cannot be, the message is handed back). A run the job table gave up is
+not run once more. A hand-back whose lease could not be given back
+leaves the row leased: a redelivery within the lease (600 s) is
+acknowledged, and the unit's dispatcher sends the row again after it, so
+the work waits at most the lease and one dispatcher period. The unit client's other outcomes take the same rows: closed or a
+lift pending is acknowledged, unborn reads the head, a unit the head no
+longer lists is acknowledged, and every page it returns is logged as an
+alert. The unit jobs `renew` and
+`stamp_raise` run through the unit client. A unit's job config keeps
+tenant 0's `MAINTENANCE`: under `restore` no unit job makes a unit call,
+and each is acknowledged with no page. The consumer calls L2's `UnitClient`
+through `unit_consumer::ConsumerClient`; until its bodies and a Worker
+head reader are wired, the Worker uses `NoClient` and `NoHeads`, so the
+arms that need them hand the message back, and `UNIT` stays unbound until
+the build that has both and the unit's alarm dispatcher.
+
+A managed tenant's S3 requests reach its units through the request
+router (`unit_router`, ADR §2.7), which the management plane uses too.
+Only a Worker with `UNIT` bound takes a key route; unbound, every
+request takes tenant 0's path with no added read. The claimed access key
+id picks the tenant (`KeyRoutes`; tenant 0's keys and unknown keys keep
+tenant 0's path, §8.4; so does a failed route read for now, where a key
+tenant 0 does not hold then answers `403`, not the `503` of DUR-10). The
+route's numbers are a floor. The `Host` is judged first, as on tenant 0's
+path. The tenant's verified head (cached per isolate for under 60 s, read
+again from the seq it knew, and again when below the floor) names the
+unit: the root unit for a call with no bucket, the unit of the
+bucket's placement, or the root unit for a bucket with none. The unit
+must be listed. A routed call goes through the unit's client (L2's
+`UnitClient::call`, which runs rule 5) with the head's `state_seq`, the
+highest `keys_seq` a unit of the tenant answered, and `listed`. Under
+`MAINTENANCE=restore` every request that writes answers `503` before any
+head read or unit call, and the router refuses the reservation writes the
+management plane sends (`Reserve`, `BindBucket`, `Release`,
+`ReleaseBound`) before any call. This build has no S3 request operations on a
+unit, and no key routes, head reader or unit client in the Worker, so a
+routed request answers `503` and in practice every request takes tenant
+0's path. A routed request's `503` comes before its signature is checked:
+it tells the caller only that the key id routes to a managed tenant.
 
 ## Bookmarks
 
@@ -398,6 +615,37 @@ answer `failed` of class `pitr_armed` means the restore was armed without
 the restart, which applies it: the tool sends the same restore again until
 it gets no answer, and runs the gate only once the restart is seen.
 
+**Not before a move's lift, not before the birth** (AM-46, check 5).
+While an import exists that no `move` report has lifted
+(`unit_import_move` with `move_lifted = 0`), `restore_prepare` is refused
+with `move_not_lifted`, so no undo bookmark from before the lift exists;
+`restore`, which needs that bookmark, is refused the same way. Once
+lifted, `restore` refuses a time target before `lifted_at` + 60 s (est)
+with `before_move_lift`. It also refuses a time target before the unit's
+own `born_at` + 60 s (est) with `before_birth`: a rebirth (a dump restore
+into a gone or unborn unit, or a re-creation after `deleteAll()`)
+replaced the unit, and the history before it would bring back the old
+incarnation. Both margins cover a recorded time that is its call's clock,
+a little before the commit; the S3 drill measures
+`getBookmarkForTime`'s offset, and above 30 s the margin becomes twice
+it. A bookmark target is not compared: the only bookmarks are the undo
+bookmark and the pre-migration bookmark, and neither can be taken before
+the lift, with one span open (a design question for the move): from
+the time the owner's unit is closed with no move record (the move's
+step-2 sync, or a re-creation with a `restore` token under the move's
+entry, AM-53, or under a left entry, P12) until the first import batch,
+the unit cannot tell that entry from a restore's, whatever its birth, so
+`restore_prepare` there goes on to checks 1 to 3. A unit runs no schema
+migration while an import is not lifted
+(`schema::migration_allowed`; code reads N - 1 and N, so it serves
+without migrating), and the move window runs under the merge freeze.
+Every state before the lift is a closed unit in mid-move that never
+served a request, so no recovery point is lost. A rollback of the object
+by the platform, outside `restore`, is an accepted residual. W4 dumps
+leave out `unit_import` and `unit_import_move`, as `export` does, so a
+unit born from a dump cannot take a `move` report (`import_not_sealed`);
+a dump restore empties the unit first.
+
 A unit born from a `restore` token starts with its usage counters off. The
 gate's recount turns them on, and the lift is refused while any is off. A
 unit born from a `birth` token starts with them on.
@@ -444,17 +692,30 @@ newest the unit has seen; the call carries the unit's numbers; and the
 ordinal is the unit's stamp counter (0 while no stamp was ever raised).
 A `move` report takes no blocker page and no acknowledgement, and no
 summary but a complete, empty one. The lift check reads the binding the
-unit holds again (root unit, seal, stamp counter, empty summary). If a
+unit holds again (root unit, seal, stamp counter, empty summary).
+The stamp counter is the unit's `rollback_stamp` row, or 0 when no row
+exists; only a `move` report takes the 0, and a restore report needs the
+row, which the gate's stamp levelling writes. Jobs, the stamp's own
+included, are refused while the unit is closed, so the window raises
+none. A move into a unit whose stamp prefix `rs/<t>.<u>/` already holds
+stamps (a second attempt, or a second move after an undo) must first
+level the counter to the newest of them; until W4-gate's levelling
+exists, the move's preflight stops before step 0 (AM-44). If a
 stamp raise lands between the report and the lift record, the `sync` is
 refused by the gate (`refused: gate`); the tool writes a new `restoring`
 entry, syncs the unit to it, and opens a new report under it. The lift a
 `move` report passes uses the seal up: no other `move` report is taken
 after it, so a later entry (a restore of the owner's unit) is lifted only
-by the restore gate. So a tool that re-runs 8(b) first reads the unit:
-if its `restoring_since` is already empty, the lift landed and 8(c)
-follows; a `keys_not_applied` answer means apply the keys and send the
-`sync` again, and `stale_sync` means read the head again. Only a gate
-refusal re-enters. The unit keeps the time of that lift, and refuses a
+by the restore gate. So a tool that re-runs 8(b) first reads the unit
+(AM-45): if its `restoring_since` is already empty, the lift landed, and
+V9 (8(b2)) runs before 8(c). Otherwise: a lost or `failed` answer sends
+the same `sync` again; `keys_not_applied` means apply the keys and send
+it again, `stale_sync` read the head again, `counters_off` run
+`recount`, each once per entry. If the same refusal comes back after
+its fix while the owner tenant's chain heads have not moved since the
+fix, the window stops; a higher head allows one more fix. Only `not_restoring`, `no_report`,
+`stamp_not_levelled` and `proof_mismatch` re-enter, once per window; any
+other refusal stops the window. The unit keeps the time of that lift, and refuses a
 restore to a time before it, or less than 60 s (est) after it, as the
 time is the lift call's clock (`before_move_lift`): a rollback into the
 move's window would bring back an unused seal. A restore to an undo
@@ -500,11 +761,21 @@ lifts that test on purpose.
 `DoSql` (`workers/unit/src/do_sql.rs`) is the catalogue's `Sql` port over a
 Durable Object's SQLite storage. What it does about the runtime, as measured:
 
-- A JS number binds as a SQLite REAL (in a Durable Object and in D1). `DoSql`
-  writes every integer placeholder as `+CAST(?N AS INTEGER)`: the integer a
-  native binding gives, without the affinity a bare `CAST` adds.
-- An integer above 2^53 reads back rounded, silently: `DoSql` refuses
-  integers outside ±(2^53 - 1) both ways, as the D1 adapter does.
+- A JS number binds as a SQLite REAL (in a Durable Object and in D1). Both
+  adapters write every integer placeholder as `+CAST(?N AS INTEGER)`
+  (`velmora_bridge::sql_bind`): the integer a native binding gives, without
+  the affinity a bare `CAST` adds. `DoSql` binds the integer as a JS number;
+  the D1 adapter binds its decimal text.
+- An integer above 2^53 - 1 reads back rounded, silently (Durable Object:
+  measured; D1: by its documentation). So the adapters keep three rules:
+  (1) every integer is bound and stored as SQLite INTEGER; (2) an integer
+  outside ±(2^53 - 1) is refused at bind, before the call, by `DoSql` and
+  the D1 adapter alike; (3) a stored value outside that range is never
+  read back rounded through them: both refuse it on read. ±(2^53 - 1)
+  round-trip exactly with `typeof` integer; ±2^53 and ±(2^53 + 1) are
+  refused at bind (2^53 is exact in a double but not safe, because
+  2^53 + 1 rounds to it). Readers outside the adapters (the REST API,
+  `wrangler --json`, scripts) get rounded values.
 - `BEGIN` and `SAVEPOINT` are refused; `transactionSync` nests as a
   savepoint. Rows changed are the difference of `total_changes()` around a
   statement, which counts trigger rows as D1's `meta.changes` does.

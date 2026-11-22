@@ -5,6 +5,9 @@
 //! public handler has no `/v1` router at all. This module holds what the
 //! plane checks before any handler runs.
 //!
+//! - [`adapters`]: the ports of the handlers over the tenancy plane's
+//!   stores (the tenant head, the root unit, the key chain).
+//! - [`events`]: one tenant's events, from the directory's feed.
 //! - [`gate`]: what every call passes before its handler runs.
 //! - [`idem`]: `Idempotency-Key` for the capped opening calls, through
 //!   the root unit's reservation.
@@ -14,13 +17,17 @@
 //!   of the stores it reads and writes.
 //! - [`route`]: the calls, their paths and the least scope of each.
 //! - [`serve`]: one request, from the gate to its answer.
+//! - [`tenant`]: tenant read, from the verified head.
 //! - [`token`]: the service tokens, their classes and scopes, and the
 //!   records that disable one.
 
+pub mod adapters;
+pub mod events;
 pub mod gate;
 pub mod idem;
 pub mod principal;
 pub mod request;
 pub mod route;
 pub mod serve;
+pub mod tenant;
 pub mod token;

@@ -253,6 +253,9 @@ fn load(vars: &BTreeMap<String, String>) -> std::result::Result<BridgeConfig, Co
 #[test]
 fn config_loads_from_documented_vars() {
     let (prod, dev) = wrangler_vars();
+    // The file sets no GC_ORPHANS, in either environment: the collector
+    // of orphaned upload parts is turned on by the operator alone.
+    assert!(!prod.contains_key("GC_ORPHANS") && !dev.contains_key("GC_ORPHANS"));
 
     // Until deploy fills in the account subdomain, prod refuses to start.
     let mut shipped = with_secrets(prod.clone(), &prod_providers());
@@ -305,6 +308,8 @@ fn config_loads_from_documented_vars() {
     assert_eq!(cfg.max_put_bytes, MAX_PUT_BYTES_LIMIT);
     assert_eq!(cfg.slice_bytes, DEFAULT_SLICE_BYTES);
     assert!(!cfg.intent_sweep);
+    // Upload parts that left their upload are not collected.
+    assert!(!cfg.gc_orphans);
     // One object holds at most 10 000 extents unless the variable says
     // fewer.
     assert_eq!(cfg.max_object_extents, 10_000);
@@ -322,6 +327,7 @@ fn config_loads_from_documented_vars() {
         (cfg.max_put_bytes, cfg.slice_bytes, cfg.intent_sweep),
         (MAX_PUT_BYTES_LIMIT, DEFAULT_SLICE_BYTES, true)
     );
+    assert!(!cfg.gc_orphans);
     // Dev sets no job budget: jobs and requests share the one limit.
     assert_eq!(cfg.job_budget_bytes, cfg.inflight_budget_bytes);
     // Absent or empty is the default; any other size is taken as given.
@@ -413,6 +419,47 @@ fn config_loads_from_documented_vars() {
     assert!(!cfg.providers[0].tls);
 }
 
+/// A unit's job configuration (round 3 L1-Q7): made from tenant 0's,
+/// with the unit's stamp id from its name and the tenant's own record
+/// layout, and nothing else changed. `CATALOGUE_ID` still refuses the
+/// unit form, so no deploy variable can name a unit's stamp prefix.
+#[test]
+fn a_units_job_config_takes_its_stamp_id_from_the_units_name() {
+    use velmora_bridge::recovery::Layout;
+    use velmora_bridge::unit::{jobcall, TenantId, UnitName};
+    let (prod, _) = wrangler_vars();
+    let vars = with_secrets(prod, PROVIDER_TLS);
+    let base = load(&vars).unwrap();
+    let name = UnitName::new(TenantId::parse("t_00000000000000a7").unwrap(), 3);
+    let unit = base.for_unit(&name).unwrap();
+    assert_eq!(unit.catalogue_id, "t_00000000000000a7.3");
+    assert_eq!(unit.catalogue_id, jobcall::stamp_id(&name));
+    assert_eq!(unit.records, Layout::tenant("t_00000000000000a7").unwrap());
+    assert_ne!(unit.records, Layout::flat());
+    assert_eq!(base.catalogue_id, "main");
+    let same = BridgeConfig {
+        catalogue_id: base.catalogue_id.clone(),
+        records: base.records.clone(),
+        ..unit.clone()
+    };
+    assert_eq!(format!("{same:?}"), format!("{base:?}"));
+    assert!(base.for_unit(&UnitName::new(TenantId::zero(), 0)).is_err());
+    // Tenant 0's maintenance holds for its units too (AM-50).
+    let restoring = BridgeConfig {
+        maintenance: velmora_bridge::config::Maintenance::Restore,
+        ..base.clone()
+    };
+    assert_eq!(
+        restoring.for_unit(&name).unwrap().maintenance,
+        velmora_bridge::config::Maintenance::Restore
+    );
+    for id in ["t_00000000000000a7.3", "main.0"] {
+        let mut v = vars.clone();
+        v.insert("CATALOGUE_ID".to_string(), id.to_string());
+        assert!(load(&v).is_err(), "{id}");
+    }
+}
+
 /// The recovery copy is no part of the service's configuration: off
 /// when unset or blank, and a copy that is refused does not stop the
 /// service.
@@ -476,7 +523,7 @@ fn record_layout_is_flat_unless_tenant_is_asked_for() {
     for tenant in ["tenant", " tenant "] {
         vars.insert("RECORD_LAYOUT".into(), tenant.into());
         let records = load(&vars).unwrap().records;
-        assert_eq!(records, Layout::default_tenant(), "{tenant:?}");
+        assert_eq!(records, Layout::of(&TENANT_ZERO), "{tenant:?}");
         assert_eq!(records.root(), "m/x/t_0000000000000000/");
     }
     for bad in ["on", "off", "TENANT", "Flat", "t_1", "m/x/", "tenant,flat"] {
@@ -771,6 +818,10 @@ fn config_rejects_invalid_and_unsafe_values() {
         ("INTENT_SWEEP", "1"),
         ("INTENT_SWEEP", "ON"),
         ("INTENT_SWEEP", "disposable"),
+        ("GC_ORPHANS", "1"),
+        ("GC_ORPHANS", "ON"),
+        ("GC_ORPHANS", "true"),
+        ("GC_ORPHANS", "disposable"),
         ("PARITY", "1"),
         ("PARITY", "ON"),
         ("PARITY", "true"),
@@ -843,6 +894,24 @@ fn config_rejects_invalid_and_unsafe_values() {
         assert_eq!(cfg.max_put_bytes.to_string(), put);
         assert_eq!(cfg.slice_bytes.to_string(), slice);
         assert_eq!(cfg.intent_sweep, sweep.trim() == "on");
+    }
+    // The collector of orphaned upload parts: its own switch, whatever
+    // GC_MODE says.
+    for (orphans, on) in [
+        ("off", false),
+        ("", false),
+        ("  ", false),
+        ("on", true),
+        (" on ", true),
+    ] {
+        for mode in ["off", "disposable"] {
+            let mut tuned = prod.clone();
+            tuned.insert("GC_ORPHANS".into(), orphans.into());
+            tuned.insert("GC_MODE".into(), mode.into());
+            let cfg = load(&tuned).unwrap();
+            assert_eq!(cfg.gc_orphans, on, "{orphans:?}");
+            assert_eq!(cfg.gc_mode == GcMode::Disposable, mode == "disposable");
+        }
     }
     for n in ["1", "10000"] {
         let mut capped = prod.clone();
@@ -1735,7 +1804,7 @@ async fn contract_compiles_against_fakes() {
         budget: ByteBudget::new(cfg.inflight_budget_bytes),
         cfg,
     });
-    let _ = bridge.run_job(&job).await;
+    let _ = bridge.run_job(&TENANT_ZERO, &job).await;
     let _ = bridge.dispatch().await;
     let resp = Rc::clone(&bridge)
         .handle(S3Request {
@@ -1864,6 +1933,38 @@ async fn sql_rejects_more_than_100_params_like_d1() {
         0,
         "an over-limit statement rolls back its batch"
     );
+
+    // An integer crosses to D1 as a JS number: one that a number does
+    // not hold exactly is refused, by the fixture as by the adapter.
+    for ok in [MAX_SQL_INT, -MAX_SQL_INT, 0] {
+        db.query("SELECT ?1", &[SqlValue::Int(ok)]).await.unwrap();
+    }
+    for bad in [MAX_SQL_INT + 1, -MAX_SQL_INT - 1, i64::MAX, i64::MIN] {
+        for err in [
+            db.query("SELECT ?1", &[SqlValue::Int(bad)])
+                .await
+                .unwrap_err(),
+            db.exec(INSERT_GC_MARKER, &[text("x_a"), SqlValue::Int(bad)])
+                .await
+                .unwrap_err(),
+            db.batch(vec![
+                (INSERT_GC_MARKER, vec![text("x_a"), SqlValue::Int(T0.0)]),
+                (INSERT_GC_MARKER, vec![text("x_b"), SqlValue::Int(bad)]),
+            ])
+            .await
+            .unwrap_err(),
+        ] {
+            assert!(
+                matches!(&err, BridgeError::Sql(m) if m.contains("outside JS safe range")),
+                "{bad}: {err:?}"
+            );
+        }
+    }
+    assert_eq!(
+        count(&db, "gc"),
+        0,
+        "an out-of-range integer rolls back its batch"
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -1968,6 +2069,92 @@ fn s3_host_allows_only_hostname_and_port() {
         assert_eq!(
             host(bad).unwrap_err(),
             ConfigError::Invalid("S3_HOST".into()),
+            "{bad}"
+        );
+    }
+}
+
+#[test]
+fn s3_hosts_lists_more_hosts_with_a_class() {
+    use velmora_bridge::config::{HostClass, S3Host};
+
+    let (_, dev) = wrangler_vars();
+    let base = with_secrets(dev, PROVIDER_PLAIN);
+    let primary = base["S3_HOST"].as_str();
+    let hosts = |value: Option<&str>| {
+        let mut m = base.clone();
+        if let Some(value) = value {
+            m.insert("S3_HOSTS".into(), value.into());
+        }
+        load(&m)
+    };
+
+    for value in [None, Some(""), Some(" \t ")] {
+        let cfg = hosts(value).unwrap();
+        assert!(cfg.s3_hosts.is_empty(), "{value:?}");
+        assert_eq!(cfg.s3_host_for(primary), Some((primary, HostClass::Legacy)));
+    }
+
+    let cfg = hosts(Some("s3.customer.example=customer")).unwrap();
+    assert_eq!(
+        cfg.s3_hosts,
+        [S3Host {
+            name: "s3.customer.example".into(),
+            class: HostClass::Customer,
+        }]
+    );
+    assert_eq!(
+        cfg.s3_host_for("S3.Customer.Example"),
+        Some(("s3.customer.example", HostClass::Customer))
+    );
+    assert_eq!(cfg.s3_host_for("other.example"), None);
+    assert_eq!(cfg.s3_host_for("s3.customer.example:443"), None);
+
+    let cfg = hosts(Some(" a.example=legacy , b.example:8443=customer ")).unwrap();
+    assert_eq!(
+        cfg.s3_hosts,
+        [
+            S3Host {
+                name: "a.example".into(),
+                class: HostClass::Legacy,
+            },
+            S3Host {
+                name: "b.example:8443".into(),
+                class: HostClass::Customer,
+            },
+        ]
+    );
+    assert_eq!(
+        cfg.all_s3_hosts().collect::<Vec<_>>(),
+        [primary, "a.example", "b.example:8443"]
+    );
+
+    let eight = (1..=8)
+        .map(|i| format!("s3-{i}.example=legacy"))
+        .collect::<Vec<_>>()
+        .join(",");
+    assert_eq!(hosts(Some(&eight)).unwrap().s3_hosts.len(), 8);
+
+    for bad in [
+        "a.example",
+        "a.example=",
+        "=customer",
+        "a.example=Customer",
+        "a.example=public",
+        "A.example=customer",
+        "a.example=customer,",
+        ",a.example=customer",
+        "a.example=customer,a.example=legacy",
+        &format!("{}=customer", primary.to_ascii_uppercase()),
+        &format!("{primary}=customer"),
+        "a b.example=customer",
+        "a.example:0=customer",
+        "a.example=customer=legacy",
+        &format!("{eight},s3-9.example=legacy"),
+    ] {
+        assert_eq!(
+            hosts(Some(bad)).unwrap_err(),
+            ConfigError::Invalid("S3_HOSTS".into()),
             "{bad}"
         );
     }
@@ -2973,3 +3160,6 @@ fn production_places_the_fetch_handler_in_us_east_1_and_dev_does_not() {
     assert_eq!(dev, ["env.dev.placement"], "dev states its own placement");
     assert_eq!(table_body("[env.dev.placement]"), ["mode=off"]);
 }
+
+/// The one tenant there is.
+static TENANT_ZERO: velmora_bridge::TenantScope = velmora_bridge::TenantScope::tenant_zero();

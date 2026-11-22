@@ -167,25 +167,38 @@ fn guard_open(t: &UploadTarget<'_>) -> Stmt {
 /// them, or only those currently stored under `part_number`. A part of
 /// several extents has its first in `upload_parts` and the others in
 /// `upload_part_extents`.
+///
+/// Two statement texts, not one with `?4 IS NULL OR part_number = ?4`:
+/// SQLite cannot seek on that `OR`, so the one-part form would walk every
+/// part of the upload (rows read growing with the part count on each
+/// UploadPart). Each text seeks the primary key on what it binds.
 fn gc_staged_parts(id: &UploadId, part_number: Option<u16>, now: UnixMs) -> Stmt {
-    (
-        "INSERT INTO gc(extent_id, action, due_at) \
-         SELECT p.extent_id, a.action, a.due_at FROM \
-           (SELECT extent_id FROM upload_parts \
-             WHERE upload_id = ?1 AND (?4 IS NULL OR part_number = ?4) \
-            UNION ALL SELECT extent_id FROM upload_part_extents \
-             WHERE upload_id = ?1 AND (?4 IS NULL OR part_number = ?4)) p \
-         JOIN extents e ON e.id = p.extent_id \
-         JOIN (SELECT 'delete_safety' AS action, ?2 AS due_at \
-               UNION ALL SELECT 'shred_key', ?3) a \
-         WHERE e.state = 'staged'",
-        vec![
-            text(id.as_str()),
-            ms(now),
-            ms(now.plus_ms(SHRED_GRACE_MS)),
-            opt(part_number, |n| SqlValue::Int(i64::from(n))),
-        ],
-    )
+    macro_rules! gc_staged {
+        ($filter:literal) => {
+            concat!(
+                "INSERT INTO gc(extent_id, action, due_at) \
+                 SELECT p.extent_id, a.action, a.due_at FROM \
+                   (SELECT extent_id FROM upload_parts WHERE upload_id = ?1",
+                $filter,
+                " UNION ALL SELECT extent_id FROM upload_part_extents WHERE upload_id = ?1",
+                $filter,
+                ") p \
+                 JOIN extents e ON e.id = p.extent_id \
+                 JOIN (SELECT 'delete_safety' AS action, ?2 AS due_at \
+                       UNION ALL SELECT 'shred_key', ?3) a \
+                 WHERE e.state = 'staged'"
+            )
+        };
+    }
+    let mut params = vec![text(id.as_str()), ms(now), ms(now.plus_ms(SHRED_GRACE_MS))];
+    let sql = match part_number {
+        Some(n) => {
+            params.push(SqlValue::Int(i64::from(n)));
+            gc_staged!(" AND part_number = ?4")
+        }
+        None => gc_staged!(""),
+    };
+    (sql, params)
 }
 
 /// Removes the rows naming the extents after the first of every part.
@@ -286,6 +299,25 @@ pub(super) async fn list_uploads<S: Sql>(
         .collect()
 }
 
+/// The state of the upload, from its row alone (one primary-key seek):
+/// the parts are not read.
+pub(super) async fn upload_state<S: Sql>(
+    c: &SqlCatalog<S>,
+    t: &UploadTarget<'_>,
+) -> Result<Option<UploadState>> {
+    let rows = c
+        .sql
+        .query(
+            "SELECT state FROM uploads WHERE id = ?1 AND bucket_id = ?2 AND key = ?3",
+            &target(t),
+        )
+        .await?;
+    match rows.into_iter().next() {
+        Some(row) => Ok(Some(Cols::new(row).parsed(UploadState::parse)?)),
+        None => Ok(None),
+    }
+}
+
 /// The upload row is read before its parts: a part written in between
 /// makes the parts newer than `revision`, never older, and the revision
 /// guard of Complete then refuses that view.
@@ -368,7 +400,7 @@ fn staged_extent(e: &ExtentRow) -> Result<Stmt> {
             SqlValue::Blob(e.plain_sha256.to_vec()),
             SqlValue::Blob(e.cipher_sha256.to_vec()),
             text(e.safety_state.as_str()),
-            SqlValue::Int(i64::from(e.plan_rev)),
+            crate::plan_rev::bound(e.plan_rev)?,
             ms(e.created_at),
         ],
     ))

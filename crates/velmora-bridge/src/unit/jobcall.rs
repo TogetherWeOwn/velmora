@@ -172,6 +172,11 @@ pub enum JobCall {
         extents: Vec<ExtentId>,
         now: UnixMs,
     },
+    /// The mark of a send that failed, taken back (#172).
+    unmark_sent {
+        jobs: Vec<Job>,
+        mark: UnixMs,
+    },
     pack_plans {
         limit: u32,
     },
@@ -307,6 +312,7 @@ impl JobCall {
             JobCall::mark_posted_many { .. } => "mark_posted_many",
             JobCall::mark_reposted_many { .. } => "mark_reposted_many",
             JobCall::mark_sent { .. } => "mark_sent",
+            JobCall::unmark_sent { .. } => "unmark_sent",
             JobCall::pack_plans { .. } => "pack_plans",
             JobCall::plan_articles { .. } => "plan_articles",
             JobCall::plan_packed { .. } => "plan_packed",
@@ -462,6 +468,9 @@ impl JobCall {
             }
             JobCall::mark_sent { extents, now } => {
                 answer(Catalog::mark_sent(cat, &extents, now).await?)
+            }
+            JobCall::unmark_sent { jobs, mark } => {
+                answer(Catalog::unmark_sent(cat, &jobs, mark).await?)
             }
             JobCall::pack_plans { limit } => answer(Catalog::pack_plans(cat, limit).await?),
             JobCall::plan_articles { l, rows } => {

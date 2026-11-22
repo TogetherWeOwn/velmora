@@ -1553,6 +1553,9 @@ impl Catalog for MemCatalog {
     ) -> Result<Option<(UploadRow, Vec<UploadPartRow>)>> {
         unused()
     }
+    async fn upload_state(&self, _: &UploadTarget<'_>) -> Result<Option<UploadState>> {
+        unused()
+    }
     async fn list_uploads(&self, _: &BucketId, _: &UploadListQuery) -> Result<Vec<OpenUpload>> {
         unused()
     }
@@ -1726,6 +1729,18 @@ impl Catalog for MemCatalog {
     async fn gc_done(&self, _: i64, _: UnixMs) -> Result<()> {
         unused()
     }
+    async fn gc_orphans_due(&self, _: UnixMs) -> Result<bool> {
+        unused()
+    }
+    async fn gc_orphans(&self, _: UnixMs, _: UnixMs, _: u32, _: u32) -> Result<Vec<GcRow>> {
+        unused()
+    }
+    async fn gc_orphan_claim(&self, _: &[GcRow], _: UnixMs, _: UnixMs) -> (Vec<bool>, Result<()>) {
+        (Vec::new(), unused())
+    }
+    async fn gc_orphan_done(&self, _: i64, _: UnixMs) -> Result<()> {
+        unused()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1829,12 +1844,14 @@ pub async fn rig(specs: &[Spec]) -> Rig {
     let cfg = BridgeConfig {
         environment: Environment::Dev,
         s3_host: "s3.test".to_string(),
+        s3_hosts: Vec::new(),
         region: "auto".to_string(),
         max_extent_bytes: 16 * 1024 * 1024,
         max_put_bytes: 16 * 1024 * 1024,
         slice_bytes: 8 * 1024 * 1024,
         max_object_extents: 10_000,
         intent_sweep: false,
+        gc_orphans: false,
         records: velmora_bridge::recovery::Layout::flat(),
         packed_plans: false,
         parity: false,
@@ -2057,7 +2074,7 @@ impl Rig {
     pub async fn run_post(&self, s: &Seeded) -> JobOutcome {
         let lease = self.claim(s, OutboxStage::Post).await;
         let job = self.job(s).await;
-        self.bridge.post_stage(&lease, &job).await
+        self.bridge.post_stage(&TENANT_ZERO, &lease, &job).await
     }
 
     /// Claims the post stage and runs it; as soon as server `server`
@@ -2075,7 +2092,7 @@ impl Rig {
         // as it is: `then` does not run and nothing waits for ever.
         let done = Cell::new(false);
         let post = async {
-            let outcome = self.bridge.post_stage(&lease, &job).await;
+            let outcome = self.bridge.post_stage(&TENANT_ZERO, &lease, &job).await;
             done.set(true);
             outcome
         };
@@ -2103,8 +2120,8 @@ impl Rig {
         let lease = self.claim(s, stage).await;
         let job = self.job(s).await;
         match stage {
-            OutboxStage::Post => self.bridge.post_stage(&lease, &job).await,
-            OutboxStage::Verify => self.bridge.verify_stage(&lease, &job).await,
+            OutboxStage::Post => self.bridge.post_stage(&TENANT_ZERO, &lease, &job).await,
+            OutboxStage::Verify => self.bridge.verify_stage(&TENANT_ZERO, &lease, &job).await,
             OutboxStage::Release => self.bridge.release_stage(&lease, &job).await,
             other => panic!("no stage function for {other:?}"),
         }
@@ -2181,3 +2198,6 @@ fn slot_key(p: &Permit) -> String {
         _ => p.provider.clone(),
     }
 }
+
+/// The one tenant there is.
+static TENANT_ZERO: velmora_bridge::TenantScope = velmora_bridge::TenantScope::tenant_zero();

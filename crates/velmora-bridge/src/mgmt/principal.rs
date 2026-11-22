@@ -34,8 +34,8 @@
 //!    What the unit answers:
 //!    - `admitted`: go on with the `rid`, the subject and the `keys_seq`
 //!      of the answer (a re-ask keeps the first ones). Asked again
-//!      (`again`), the call first reads the chain above `keys_seq`: a
-//!      record that carries the `rid` is being applied, so
+//!      (`again`), the call first reads the record at `keys_seq + 1`: a
+//!      record there that carries the `rid` is being applied, so
 //!      `409 idempotency_key_in_use` with `Retry-After: 30`.
 //!    - `applied`: the unit holds the record, perhaps closed (AM-9: the
 //!      directory has not acknowledged it). The stores are brought to the
@@ -238,8 +238,9 @@ pub enum ChainWrite {
 /// reservation's `rid` in the record's door part (AM-38).
 #[allow(async_fn_in_trait)]
 pub trait PrincipalChain {
-    /// The record above `above` that carries `rid`, if one does, read
-    /// from the chain's head now.
+    /// The record at `above + 1`, if it carries `rid`, read from the
+    /// chain's head now (one read, AM-55: a record of a reservation can
+    /// only sit at its `keys_seq + 1`).
     async fn carrying(
         &self,
         tenant: &TenantId,
@@ -405,6 +406,15 @@ fn internal() -> Answer {
     code(Code::InternalError, None)
 }
 
+/// A read of the tenant's head that failed: `500` (pages) for a head that
+/// does not verify, `503` for one that cannot be read now.
+fn door_error(e: &crate::types::BridgeError) -> Answer {
+    match crate::mgmt::adapters::head_damaged(e) {
+        true => internal(),
+        false => unavailable(),
+    }
+}
+
 fn draw<const N: usize, R: FillRandom>(rng: &RefCell<R>) -> Option<[u8; N]> {
     let mut out = [0u8; N];
     rng.borrow_mut().fill_bytes(&mut out).ok()?;
@@ -509,6 +519,7 @@ async fn state_answer<D: TenantDoor>(door: &D, tenant: &TenantId) -> Answer {
         Ok(Some(DoorState::Unavailable)) => code(Code::TenantUnavailable, None),
         Ok(Some(DoorState::Restoring)) => code(Code::TenantRestoring, Some(RETRY_AFTER_SECS)),
         Ok(None) => code(Code::TenantNotFound, None),
+        Err(e) if crate::mgmt::adapters::head_damaged(&e) => internal(),
         Ok(Some(DoorState::Open | DoorState::Provisioning)) | Err(_) => unavailable(),
     }
 }
@@ -554,7 +565,7 @@ async fn finished<D: TenantDoor, K: PrincipalChain>(
     let owner_ref = owner_ref.unwrap_or(&p.owner_ref);
     match principal_json(door, tenant, &p.id, owner_ref, p.status, &p.grants).await {
         Ok(json) => stored(status, json),
-        Err(_) => unavailable(),
+        Err(e) => door_error(&e),
     }
 }
 
@@ -615,6 +626,7 @@ where
         Ok(Some(DoorState::Restoring)) => {
             return code(Code::TenantRestoring, Some(RETRY_AFTER_SECS))
         }
+        Err(e) if crate::mgmt::adapters::head_damaged(&e) => return internal(),
         Ok(Some(DoorState::Provisioning)) | Err(_) => return unavailable(),
         Ok(None) => return code(Code::TenantNotFound, None),
         Ok(Some(DoorState::Open | DoorState::ReadOnly | DoorState::Unavailable)) => {}
@@ -725,7 +737,7 @@ where
                 .await
                 {
                     Ok(json) => stored(200, json),
-                    Err(_) => unavailable(),
+                    Err(e) => door_error(&e),
                 };
             }
             ReserveAnswer::NotOpen { rid, keys_seq } => {
@@ -754,11 +766,12 @@ where
                 give_back(ports.unit, ports.chain, &tenant, &rid, ours, keys_seq).await;
                 return code(Code::BucketNotFound, None);
             }
+            Err(e) if crate::mgmt::adapters::head_damaged(&e) => return internal(),
             Err(_) => return unavailable(),
         }
 
         // 4. The record and the stores, with the answer the unit keeps.
-        let Ok(json) = principal_json(
+        let json = match principal_json(
             ports.door,
             &tenant,
             &subject,
@@ -767,8 +780,9 @@ where
             &grants,
         )
         .await
-        else {
-            return unavailable();
+        {
+            Ok(json) => json,
+            Err(e) => return door_error(&e),
         };
         let Ok(kept) = idem::stored_answer(201, &json) else {
             return internal();
@@ -808,7 +822,7 @@ where
                 .await
                 {
                     Ok(json) => stored(201, json),
-                    Err(_) => unavailable(),
+                    Err(e) => door_error(&e),
                 };
             }
             Ok(ChainWrite::Unfinished) | Ok(ChainWrite::Busy) | Err(_) => return unavailable(),

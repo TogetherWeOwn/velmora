@@ -25,6 +25,21 @@
       }
     },
     {
+      "answer": "renew_needed",
+      "seqs": {
+        "keys_seq": 3,
+        "state_seq": 7
+      }
+    },
+    {
+      "answer": "renew_needed",
+      "seqs": {
+        "keys_seq": 3,
+        "state_seq": 7
+      },
+      "why": "proof_too_old"
+    },
+    {
       "answer": "keys_behind",
       "seqs": {
         "keys_seq": 3,
@@ -227,6 +242,33 @@
           "tenant_state": "suspended"
         },
         "op": "sync"
+      },
+      "seqs": {
+        "keys_seq": 3,
+        "state_seq": 7
+      }
+    },
+    {
+      "authenticated": true,
+      "kind": "worker",
+      "listed": true,
+      "name": {
+        "tenant": "t_00000000000000f1",
+        "unit": 0
+      },
+      "op": {
+        "op": "renew",
+        "proof_start": 1795000000000,
+        "proven": {
+          "keys_seq": 3,
+          "revoked": 2,
+          "stamp_counter": 12,
+          "state_seq": 7
+        },
+        "revocations": [
+          "AKGOLDEN000000000001",
+          "AKGOLDEN000000000002"
+        ]
       },
       "seqs": {
         "keys_seq": 3,
@@ -1181,6 +1223,16 @@
       "unit_keys",
       "unit_key_grants"
     ],
+    "lease_refusal": [
+      "restoring",
+      "rolled_back",
+      "no_lease_table",
+      "proof_too_old",
+      "proof_ahead",
+      "not_proven",
+      "revocations_unapplied",
+      "bad_list"
+    ],
     "provision_refusal": [
       "born_before",
       "not_the_listing_record",
@@ -1292,7 +1344,9 @@
       "moved",
       "malformed",
       "no_point_in_time",
-      "before_move_lift"
+      "before_move_lift",
+      "move_not_lifted",
+      "before_birth"
     ],
     "size_refusal": [
       "database_full",
@@ -1311,5 +1365,28 @@
       "shredding",
       "shredded"
     ]
-  }
+  },
+  "replies": [
+    {
+      "answer": "ok",
+      "body": {
+        "applied": 1,
+        "fresh_until": 1795000600000
+      },
+      "lease_left_ms": 600000,
+      "revoked": 2,
+      "seqs": {
+        "keys_seq": 3,
+        "state_seq": 7
+      }
+    },
+    {
+      "answer": "renew_needed",
+      "lease_left_ms": 0,
+      "seqs": {
+        "keys_seq": 3,
+        "state_seq": 7
+      }
+    }
+  ]
 }

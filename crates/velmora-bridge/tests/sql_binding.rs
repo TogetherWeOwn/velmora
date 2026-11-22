@@ -138,6 +138,37 @@ async fn values_read_back_as_they_were_bound() {
     }
 }
 
+/// AM-22: ±(2^53 - 1) are the largest integers either adapter binds.
+/// They are stored as SQLite INTEGER, in a column with no affinity too,
+/// and read back exactly. (±2^53 and beyond are refused at bind by each
+/// adapter: `d1.rs` and `do_sql.rs` unit tests. They are not bound here,
+/// because the native database takes them and the twin would differ.)
+#[tokio::test(flavor = "current_thread")]
+async fn the_safe_integer_edges_are_stored_as_integer() {
+    let db = db();
+    for v in [MAX_SAFE, -MAX_SAFE] {
+        db.exec("DELETE FROM t", &[]).await.unwrap();
+        assert_eq!(
+            db.exec("INSERT INTO t (u) VALUES (?1)", &[int(v)])
+                .await
+                .unwrap(),
+            1
+        );
+        let rows = db
+            .query(
+                "SELECT typeof(u), u, CAST(u AS TEXT), u = ?1 FROM t",
+                &[int(v)],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![vec![text("integer"), int(v), text(&v.to_string()), int(1)]],
+            "{v}"
+        );
+    }
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn rows_changed_count_trigger_free_and_returning_statements() {
     let db = db();

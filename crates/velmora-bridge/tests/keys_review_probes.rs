@@ -13,9 +13,11 @@ use velmora_bridge::keys::checkpoint::{
     checkpoint_name, open_checkpoint, read_key_chain, seal_checkpoint,
 };
 use velmora_bridge::keys::escrow::{restore_escrow, EscrowCopy, RestoreStep};
+use velmora_bridge::keys::gate::testkit::FakeGate;
 use velmora_bridge::keys::locations::{two_in_account, KeyLocation, KeyLocations, LocationStatus};
 use velmora_bridge::keys::ports::{
-    Admission, ControlChain, ControlIntents, KeyAdmission, KeyTarget, OpeningChange,
+    Admission, Applied, ApplyEntry, Binding, BucketAdmission, BucketReservation, ControlChain,
+    ControlIntents, KeyAdmission, KeyTarget, OpeningChange,
 };
 use velmora_bridge::keys::record::{
     key_chain, open_key_record, seal_key_record, Access, Entry, Grant, KeyOp, KeyRecord, KeyTable,
@@ -23,7 +25,7 @@ use velmora_bridge::keys::record::{
     KEY_RECORD_VERSION,
 };
 use velmora_bridge::keys::tk::{tk_prefix, KeyBuckets};
-use velmora_bridge::keys::writer::{finish_keys, KeyEnv};
+use velmora_bridge::keys::writer::{finish_keys, KeyEnv, Limits};
 use velmora_bridge::records::{MemRecords, RecordStore};
 use velmora_bridge::testkit::{FixedClock, TestKek};
 use velmora_bridge::{BridgeError, Result, UnixMs};
@@ -143,6 +145,7 @@ impl World {
             &subject.door,
             Some(&subject.private),
             closes,
+            None,
             &mut self.rng,
         )
         .unwrap()
@@ -231,15 +234,35 @@ impl KeyTarget for &FakeTarget {
             .collect())
     }
 
-    async fn apply(&self, to_seq: u64, entries: &[Entry]) -> Result<()> {
+    async fn apply(&self, from_seq: u64, entries: &[ApplyEntry]) -> Result<Applied> {
         if self.reject_apply {
             return Err(BridgeError::Sql("fake: cannot apply".into()));
         }
-        self.rows
-            .borrow_mut()
-            .extend(entries.iter().map(|e| (e.door.id.clone(), e.clone())));
-        self.seq.set(to_seq);
-        Ok(())
+        if from_seq > self.seq.get() {
+            return Ok(Applied::Behind {
+                keys_seq: self.seq.get(),
+            });
+        }
+        for (i, e) in entries.iter().enumerate() {
+            assert_eq!(e.seq(), from_seq + 1 + i as u64, "a gap");
+        }
+        let mut rows = self.rows.borrow_mut();
+        for e in entries {
+            if let ApplyEntry::Subject(e) = e {
+                let newer = rows.get(&e.door.id).is_none_or(|r| {
+                    e.last_seq > r.last_seq
+                        || (e.last_seq == r.last_seq && r.private.is_none() && e.private.is_some())
+                });
+                if newer {
+                    rows.insert(e.door.id.clone(), e.clone());
+                }
+            }
+        }
+        let last = from_seq + entries.len() as u64;
+        self.seq.set(self.seq.get().max(last));
+        Ok(Applied::Done {
+            keys_seq: self.seq.get(),
+        })
     }
 }
 
@@ -248,6 +271,31 @@ struct FakeAdmission;
 impl KeyAdmission for FakeAdmission {
     async fn admit(&self, _: &TenantId, _: &str, _: &OpeningChange<'_>) -> Result<Admission> {
         panic!("the finisher does not request admission");
+    }
+
+    async fn release(&self, _: &TenantId, _: &str) -> Result<()> {
+        panic!("the finisher does not release reservations");
+    }
+
+    async fn admit_bucket(
+        &self,
+        _: &TenantId,
+        _: &str,
+        _: &BucketReservation<'_>,
+    ) -> Result<BucketAdmission> {
+        panic!("the finisher does not request admission");
+    }
+
+    async fn bind_bucket(&self, _: &TenantId, _: &str, _: Option<u64>, _: u64) -> Result<bool> {
+        panic!("the finisher does not bind reservations");
+    }
+
+    async fn release_bound(&self, _: &TenantId, _: &str, _: Option<u64>) -> Result<bool> {
+        panic!("the finisher does not release reservations");
+    }
+
+    async fn bucket_binding(&self, _: &TenantId, _: u64) -> Result<Binding> {
+        panic!("this finisher does not read bindings");
     }
 }
 
@@ -290,6 +338,8 @@ async fn closing_pass_opens_at_the_directory_acknowledgment() {
         units: &[&unit],
         directory: &&directory,
         clock: &FixedClock::new(UnixMs(1_700_000_000_000)),
+        limits: Limits::Recorded,
+        gate: &FakeGate::before_move(),
     };
     finish_keys(&env, &mut w.rng).await.unwrap();
     assert_eq!(directory.seq.get(), 1);
@@ -387,6 +437,8 @@ fn private_unchanged_requires_a_prior_entry() {
         tk_version: 1,
         closes: false,
         private_unchanged: true,
+        frozen_at: None,
+        rid: None,
     };
     let mut table = KeyTable::empty(w.tenant.clone());
     assert!(table.apply(&record).is_err());
@@ -668,6 +720,7 @@ fn closes_must_fit_the_change_and_restates_move_forward() {
         &subject.door,
         Some(&subject.private),
         true,
+        None,
         &mut w.rng,
     )
     .is_err());

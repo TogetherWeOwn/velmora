@@ -16,11 +16,14 @@
 //! A restarted isolate re-arms the counter. Outside `ENVIRONMENT=dev` the
 //! variable is ignored.
 
+use std::borrow::Cow;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use std::time::Duration;
 
 use futures_util::future::{join_all, select, Either};
+use velmora_bridge::jobmsg::{JobFormat, JobMessage, JobTenant};
+use velmora_bridge::tenant_catalog::LatestSeqs;
 use velmora_bridge::{
     Backlog, BridgeError, Job, JobSink, Oldest, OutboxStage, Result, UnixMs, MAX_QUEUE_DELAY_SECS,
 };
@@ -127,6 +130,45 @@ pub struct QueueSink {
     /// bound.
     aux: Option<Queue>,
     drop_notify: DropNotify,
+    /// The format of the messages (`JOB_FORMAT`) and the tenant a
+    /// message of `v` 2 names.
+    format: (JobFormat, JobTenant),
+    /// A unit's sink: the highest numbers its unit answered in the job's
+    /// run, which a follow-up job carries (AM-50, L6-7d).
+    latest: Option<LatestSeqs>,
+}
+
+/// The tenant fields a message names: `tenant`'s, with each number raised
+/// to the unit's latest answer when the sink has one. Never lower.
+fn tenant_now<'a>(tenant: &'a JobTenant, latest: Option<&LatestSeqs>) -> Cow<'a, JobTenant> {
+    let (Some(latest), Some(unit)) = (latest, tenant.unit()) else {
+        return Cow::Borrowed(tenant);
+    };
+    let seqs = latest.get();
+    match JobTenant::of_unit(
+        tenant.tenant(),
+        unit,
+        seqs.state_seq.max(tenant.state_seq()),
+        seqs.keys_seq.max(tenant.keys_seq()),
+    ) {
+        Some(raised) => Cow::Owned(raised),
+        None => Cow::Borrowed(tenant),
+    }
+}
+
+/// The message of `job` in `format` for `tenant`; see
+/// [`QueueSink::message`].
+fn message_for<'a>(
+    format: JobFormat,
+    tenant: &'a JobTenant,
+    job: &'a Job,
+) -> Result<JobMessage<'a>> {
+    match format.message(job, tenant) {
+        JobMessage::Plain(_) if tenant.unit().is_some() => Err(BridgeError::Queue(
+            "a unit's job must be sent in the tenant format".into(),
+        )),
+        message => Ok(message),
+    }
 }
 
 /// The binding of the queue for jobs that name no extent: gc, sweep,
@@ -145,6 +187,7 @@ impl QueueSink {
         verify: Vec<Queue>,
         aux: Option<Queue>,
         drop_notify: DropNotify,
+        format: (JobFormat, JobTenant),
     ) -> std::result::Result<Self, &'static str> {
         if post.is_empty() {
             return Err("POST_Q");
@@ -157,7 +200,27 @@ impl QueueSink {
             verify,
             aux,
             drop_notify,
+            format,
+            latest: None,
         })
+    }
+
+    /// A unit's sink: its messages carry the unit's latest numbers.
+    pub fn with_latest(mut self, latest: LatestSeqs) -> Self {
+        self.latest = Some(latest);
+        self
+    }
+
+    /// The message that carries `job`. A sink of a managed tenant's unit
+    /// (its tenant fields name a unit) sends `v` 2 only: a `v` 1 message
+    /// names no tenant and is read as tenant 0's, so a job of another
+    /// body version is refused here, never sent as tenant 0's.
+    fn message<'a>(&self, tenant: &'a JobTenant, job: &'a Job) -> Result<JobMessage<'a>> {
+        message_for(self.format.0, tenant, job)
+    }
+
+    fn tenant(&self) -> Cow<'_, JobTenant> {
+        tenant_now(&self.format.1, self.latest.as_ref())
     }
 
     fn shards(&self) -> Shards {
@@ -390,7 +453,8 @@ impl JobSink for QueueSink {
         if self.drop_notify.take() {
             return Err(BridgeError::Queue("dev: send refused".to_string()));
         }
-        let msg = MessageBuilder::new(job)
+        let tenant = self.tenant();
+        let msg = MessageBuilder::new(self.message(&tenant, job)?)
             .content_type(QueueContentType::Json)
             .delay_seconds(delay_secs)
             .build();
@@ -409,8 +473,13 @@ impl JobSink for QueueSink {
             return Err(BridgeError::Queue(format!("batch above {MAX_BATCH} jobs")));
         }
         let shards = self.shards();
+        let tenant = self.tenant();
         let mut sends = Vec::new();
         for (target, batch) in batches(jobs, shards) {
+            let batch: Vec<JobMessage<'_>> = batch
+                .into_iter()
+                .map(|job| self.message(&tenant, job))
+                .collect::<Result<_>>()?;
             sends.push(self.queue(target).send_batch(batch).await);
         }
         first_error(sends)
@@ -421,6 +490,45 @@ impl JobSink for QueueSink {
 mod tests {
     use super::*;
     use velmora_bridge::{ExtentId, GenerationId, WriteId, JOB_VERSION};
+
+    /// A unit's sink never sends a `v` 1 message, which would be read as
+    /// tenant 0's (tenant 0's sink, which names no unit, is unchanged).
+    #[test]
+    fn a_units_sink_sends_the_tenant_format_only() {
+        let unit = JobTenant::of_unit("t_00000000000000a7", 0, 5, 6).unwrap();
+        let current = Job::Gc { v: JOB_VERSION };
+        let other = Job::Gc { v: JOB_VERSION + 7 };
+        assert!(matches!(
+            message_for(JobFormat::Tenant, &unit, &current),
+            Ok(JobMessage::Tenant(_))
+        ));
+        for (format, job) in [
+            (JobFormat::Tenant, &other),
+            (JobFormat::Plain, &current),
+            (JobFormat::Plain, &other),
+        ] {
+            assert!(
+                message_for(format, &unit, job).is_err(),
+                "{format:?} {job:?}"
+            );
+        }
+    }
+
+    /// A follow-up job carries the unit's latest numbers, never lower
+    /// than its own. Tenant 0's sink names no unit and has no latest
+    /// numbers (`tenant_now` returns its fields as they are).
+    #[test]
+    fn a_units_follow_up_carries_the_latest_numbers() {
+        let unit = JobTenant::of_unit("t_00000000000000a7", 0, 5, 6).unwrap();
+        let latest = LatestSeqs::new(velmora_bridge::unit::Seqs {
+            state_seq: 7,
+            keys_seq: 2,
+        });
+        let now = tenant_now(&unit, Some(&latest));
+        assert_eq!((now.state_seq(), now.keys_seq()), (7, 6));
+        assert_eq!((now.tenant(), now.unit()), ("t_00000000000000a7", Some(0)));
+        assert_eq!(*tenant_now(&unit, None), unit);
+    }
 
     fn extent_job(stage: OutboxStage) -> Job {
         Job::Extent {

@@ -53,6 +53,7 @@ use crate::ports::{
     NNTP_CALL_SECS, PERMIT_SECS,
 };
 use crate::recovery::write_stored_plan;
+use crate::tenant::TenantScope;
 use crate::types::{
     valid_yenc_name, ArticleRow, ArticleState, BridgeError, ExtentRow, FailClass, JobExtent,
     JobOutcome, OutboxStage, ProviderConfig, Result, SafetyState, SizeCommand, UnixMs,
@@ -583,21 +584,31 @@ where
 {
     /// Runs the post stage for a claimed extent: plan, POST every planned
     /// article, then hand over to the verify stage.
-    pub async fn post_stage(&self, lease: &Lease, job: &JobExtent) -> JobOutcome {
-        match self.post_extent(lease, job).await {
+    pub async fn post_stage(
+        &self,
+        scope: &TenantScope,
+        lease: &Lease,
+        job: &JobExtent,
+    ) -> JobOutcome {
+        match self.post_extent(scope, lease, job).await {
             Ok(()) => JobOutcome::Ack,
             Err(stop) => settle(&self.catalog, &self.clock, lease, stop).await,
         }
     }
 
-    async fn post_extent(&self, lease: &Lease, job: &JobExtent) -> core::result::Result<(), Stop> {
+    async fn post_extent(
+        &self,
+        scope: &TenantScope,
+        lease: &Lease,
+        job: &JobExtent,
+    ) -> core::result::Result<(), Stop> {
         let extent = &job.extent;
         // A job that comes back to an extent it has posted already (a
         // crash before the stage moved on, a revived obligation) needs no
         // provider: it only writes the recovery record again.
         let stored = self.catalog.stored_plan(&extent.id).await?;
         if !stored.rows.is_empty() && stored.rows.iter().all(|a| a.state == ArticleState::Posted) {
-            self.load_planned(lease, extent, stored).await?;
+            self.load_planned(scope, lease, extent, stored).await?;
             return self.to_verify(lease).await;
         }
         let holder = job_holder(lease);
@@ -673,7 +684,7 @@ where
         // the renewal interval, as after any renewal.
         let (turned_away, loaded) = join(
             self.connect_all(lease, &mut held, kept_at),
-            self.load_planned(lease, extent, stored),
+            self.load_planned(scope, lease, extent, stored),
         )
         .await;
         let mut loaded = match loaded {
@@ -819,6 +830,7 @@ where
     /// the job before anything is posted.
     async fn load_planned(
         &self,
+        scope: &TenantScope,
         lease: &Lease,
         extent: &ExtentRow,
         stored: StoredPlan,
@@ -826,7 +838,7 @@ where
         let started = self.clock.now();
         let cipher = self
             .safety
-            .get(&extent.id.safety_key(), None)
+            .get(&scope.safety_key(&extent.id), None)
             .await?
             .ok_or(Stop::fail(FailClass::BlobError))?;
         // Only the exact sealed ciphertext is ever posted.
@@ -856,9 +868,15 @@ where
         // The message-ids exist nowhere but the catalogue until this
         // record is stored: without it, a lost catalogue could not find
         // the extent on Usenet. Nothing is posted before it is durable.
-        write_stored_plan(&self.safety, &self.kek, &self.cfg.records, extent, &plan)
-            .await
-            .map_err(|_| Stop::fail(FailClass::BlobError))?;
+        write_stored_plan(
+            &self.safety,
+            &self.kek,
+            &self.cfg.records.in_scope(scope),
+            extent,
+            &plan,
+        )
+        .await
+        .map_err(|_| Stop::fail(FailClass::BlobError))?;
         let load_ms = self.clock.now().0 - started.0;
         crate::trace::note(&lease.extent, |t| t.load_ms = load_ms);
         let mut rows = plan.rows;
@@ -1300,8 +1318,10 @@ where
     /// `Ok(false)` = it cannot be done now (no provider that posts, no
     /// intact safety copy, or the providers refused): the caller carries
     /// on as if there were no repost.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn repost(
         &self,
+        scope: &TenantScope,
         lease: &Lease,
         extent: &ExtentRow,
         plan: &[ArticleRow],
@@ -1341,7 +1361,7 @@ where
         let Ok(_charge) = self.budget.charge_job(bytes).await else {
             return Err(Stop::NoPermit);
         };
-        let cipher = match self.safety.get(&extent.id.safety_key(), None).await {
+        let cipher = match self.safety.get(&scope.safety_key(&extent.id), None).await {
             Ok(Some(cipher)) => cipher,
             _ => return Ok(false),
         };
@@ -1405,6 +1425,7 @@ where
     #[cfg(feature = "testkit")]
     pub async fn repost_run(
         &self,
+        scope: &TenantScope,
         lease: &Lease,
         job: &JobExtent,
         missing: &[u32],
@@ -1422,6 +1443,7 @@ where
                 .filter(|p| p.post && p.enabled)
                 .collect();
             self.repost(
+                scope,
                 lease,
                 extent,
                 &stored.rows,

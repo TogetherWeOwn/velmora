@@ -367,7 +367,7 @@ fn the_bytes_of_both_formats_are_the_ones_checked_in() {
         "m/seg/s_0000018bcfe568050123456789abcdef/00001"
     );
     assert_eq!(
-        Layout::default_tenant().segment_key(set, 12),
+        Layout::of(&TENANT_ZERO).segment_key(set, 12),
         "m/x/t_0000000000000000/seg/s_0000018bcfe568050123456789abcdef/00012"
     );
 }
@@ -384,7 +384,7 @@ fn the_bytes_of_both_formats_are_the_ones_checked_in() {
 /// place a call can stop at, each border of a segment among them.
 #[tokio::test(flavor = "current_thread")]
 async fn a_segmented_record_replays_to_what_the_single_record_replays_to() {
-    for layout in Layout::all() {
+    for layout in Layout::all(&TENANT_ZERO) {
         let (rig, bucket, _, body) = world(&layout).await;
         let live_before = rig.live(&bucket, "big").await.unwrap();
         let (name, m) = record_of(&rig, &bucket, "big", &layout).await;
@@ -489,7 +489,7 @@ async fn parts(rig: &Rig, bucket: &Bucket, layout: &Layout) -> (String, Generati
 /// A segment that is not stored: unreadable, nothing published.
 #[tokio::test(flavor = "current_thread")]
 async fn a_missing_segment_makes_the_record_unreadable() {
-    for layout in Layout::all() {
+    for layout in Layout::all(&TENANT_ZERO) {
         for lost in [0, 1, 2] {
             let (rig, bucket, _, _) = world(&layout).await;
             let sealed = segment(&rig, &bucket, &layout, 64).await;
@@ -642,7 +642,7 @@ async fn a_segment_that_is_not_what_its_head_says_makes_the_record_unreadable() 
             |_| {},
         ),
     ];
-    for layout in Layout::all() {
+    for layout in Layout::all(&TENANT_ZERO) {
         for (what, in_segments, in_head) in &cases {
             let (rig, bucket, _, _) = world(&layout).await;
             let (name, m) = parts(&rig, &bucket, &layout).await;
@@ -663,7 +663,7 @@ async fn a_segment_that_is_not_what_its_head_says_makes_the_record_unreadable() 
 /// sealed under this name that says it is of another set.
 #[tokio::test(flavor = "current_thread")]
 async fn a_segment_of_another_set_makes_the_record_unreadable() {
-    for layout in Layout::all() {
+    for layout in Layout::all(&TENANT_ZERO) {
         // The bytes of another set's segment, with the digest the head
         // names: only the name they were sealed under is wrong.
         let (rig, bucket, _, _) = world(&layout).await;
@@ -707,7 +707,7 @@ async fn a_segment_of_another_set_makes_the_record_unreadable() {
 /// A head that names one segment more than was stored.
 #[tokio::test(flavor = "current_thread")]
 async fn a_head_that_names_more_segments_than_exist_is_unreadable() {
-    for layout in Layout::all() {
+    for layout in Layout::all(&TENANT_ZERO) {
         let (rig, bucket, _, _) = world(&layout).await;
         let (name, m) = parts(&rig, &bucket, &layout).await;
         // Four segments, 64, 64, 32 and 1, of which three are stored.
@@ -944,7 +944,7 @@ async fn a_record_under_two_names_is_replayed_from_the_one_that_reads() {
             extents,
         };
         let flat = Layout::flat();
-        let tenant = Layout::default_tenant();
+        let tenant = Layout::of(&TENANT_ZERO);
         let (rig, bucket, _, body) = world(&flat).await;
         let (name, m) = record_of(&rig, &bucket, "big", &flat).await;
         let first = segment_from(&rig, &bucket, &flat, &name, &m, 64).await;
@@ -1000,7 +1000,7 @@ async fn a_single_record_behind_a_segmented_one_that_does_not_read_is_replayed()
             let (rig, bucket, _, body) = world(&flat).await;
             let (name, m) = record_of(&rig, &bucket, "big", &flat).await;
             let first = segment_from(&rig, &bucket, &flat, &name, &m, 64).await;
-            let twin = Layout::default_tenant().of_flat(&name);
+            let twin = Layout::of(&TENANT_ZERO).of_flat(&name);
             let plain = serde_json::to_vec(&m).unwrap();
             let sealed = seal_manifest(&rig.bridge.kek, &twin, &plain, &mut SystemRng).unwrap();
             store(&rig, &bucket, &twin, sealed).await;
@@ -1035,7 +1035,7 @@ async fn a_count_is_not_carried_to_the_other_name_of_a_record() {
         for removed in [true, false] {
             let case = format!("segmented {segmented}, older {older}, removed {removed}");
             let flat = Layout::flat();
-            let tenant = Layout::default_tenant();
+            let tenant = Layout::of(&TENANT_ZERO);
             let (rig, bucket, _, body) = world(&flat).await;
             let (name, m) = record_of(&rig, &bucket, "big", &flat).await;
             if segmented {
@@ -1081,7 +1081,7 @@ async fn a_cursor_without_a_name_goes_on_in_a_record_in_one_part() {
         records: 1,
         extents: 10,
     };
-    for layout in [Layout::flat(), Layout::default_tenant()] {
+    for layout in [Layout::flat(), Layout::of(&TENANT_ZERO)] {
         let (rig, bucket, _, body) = world(&layout).await;
         let (name, _) = record_of(&rig, &bucket, "big", &layout).await;
         wipe(&rig);
@@ -1261,7 +1261,7 @@ fn a_head_of_another_name_or_with_a_set_id_that_is_none_is_refused() {
         GenerationHead::parse(name, &serde_json::to_vec(head).unwrap())
     };
     parse(&name, &head).unwrap();
-    let tenant = Layout::default_tenant().of_flat(&name);
+    let tenant = Layout::of(&TENANT_ZERO).of_flat(&name);
     parse(&tenant, &head).unwrap();
 
     // The name of another generation, of a tombstone, of a plan.
@@ -1340,3 +1340,6 @@ async fn a_record_of_an_unknown_version_is_refused() {
     put_segmented(&rig, &bucket, &sealed).await;
     assert_refused(&rig, &sealed.head_key, None, "segment v 3").await;
 }
+
+/// The one tenant there is.
+static TENANT_ZERO: velmora_bridge::TenantScope = velmora_bridge::TenantScope::tenant_zero();

@@ -108,6 +108,7 @@ INFLIGHT_BUDGET_BYTES = "50331648"   # 48 MiB per isolate: what requests may cha
 JOB_BUDGET_BYTES = "75497472"        # 72 MiB per isolate
 GC_MODE = "off"                      # off | disposable
 HOT_CAP_BYTES = "107374182400"       # 100 GiB of evictable R2 bytes; pinned (unverified) bytes are never counted or evicted
+# The production deploy writes this line from VELMORA_MAINTENANCE (unset: off); see "Deploy switches" in ops/README.md.
 MAINTENANCE = "off"                  # off | restore
 # Sockets per post job, spread over the posting tier. A post job charges
 # its extent (16 MiB) plus 1 MiB per socket to the isolate's byte budget,
@@ -169,12 +170,24 @@ RECOVERY_COPY = "off"
 # pools unchanged in that deploy. See "Permit gate" in ops/README.md.
 PERMITS = "d1"
 # Optional vars and their defaults (production sets POST_SOCKETS and COLD_SOCKETS explicitly):
+#   S3_HOSTS (empty): up to eight comma-separated entries. Join each hostname and class with an equals sign.
+#     Classes are legacy and customer.
+#     S3_HOST is always legacy. Production takes its extra hosts from VELMORA_S3_HOSTS.
+#     Attach each host to the Worker as a Custom Domain before naming it in the variable,
+#     or the smoke test fails and the deploy rolls back.
 #   SLICE_BYTES (8388608, 8 MiB): the slice of a PutObject or UploadPart body above MAX_EXTENT_BYTES; at most MAX_EXTENT_BYTES.
 #   MAX_OBJECT_EXTENTS (10000): most extents one object is made of, 1 to 10000. CompleteMultipartUpload, and an UploadPart
 #     above MAX_EXTENT_BYTES, answer 400 EntityTooLarge for an upload that would hold more. With slices of 8 MiB that is 78 GiB in parts above
 #     MAX_EXTENT_BYTES, and 156 GiB in parts of exactly MAX_EXTENT_BYTES.
 #   MAX_PUT_BYTES (MAX_EXTENT_BYTES): see above. INTENT_SWEEP (off): see above.
-#   CATALOGUE_ID (main): names this catalogue in its rollback stamp keys in SAFETY (rs/<id>/<counter>). Never change it for a catalogue in use.
+#   GC_ORPHANS (off): off | on. On: the cron deletes the pinned copy of an upload part that left its upload (uploaded again under
+#     its number, aborted, or left out of the part list of a completion) 31 days after it left, in every bucket and whatever
+#     GC_MODE says. It takes nothing an object, a server-side copy or an open upload refers to, nothing of a key that has a
+#     write whose outcome is not known, and nothing while a replay is under way, for 31 days after one ended, or while the
+#     catalogue is behind its rollback stamp.
+#     Not set here: read "Upload parts that left their upload" in ops/README.md before turning it on.
+#   CATALOGUE_ID (main), from VELMORA_CATALOGUE_ID in production: names this catalogue in its rollback stamp keys in SAFETY (rs/<id>/<counter>). Never change it for a catalogue in use.
+#   JOB_FORMAT (1), from VELMORA_JOB_FORMAT in production: the Worker reads it from the job-message change onward and ignores it before that change.
 #   POST_SOCKETS (4): connections one post job opens, 1 to 8, each on its own provider permit.
 #     A job is one source address to a provider, however many connections it holds there.
 #   COLD_SOCKETS (4; production sets 8 above): connections one GET reads from Usenet over, 1 to 8, each on its own
@@ -535,6 +548,16 @@ binding = "CATALOG"
 database_name = "velmora-catalog-dev"
 database_id = "<from wrangler d1 create>"
 migrations_dir = "migrations"
+
+# The directory database, local only: the local slice applies its
+# migrations (migrations-directory/) as the production deploy does, so a
+# directory migration that does not apply fails before it merges. No
+# Worker code reads it yet.
+[[env.dev.d1_databases]]
+binding = "DIRECTORY"
+database_name = "velmora-directory-dev"
+database_id = "<directory: from wrangler d1 create>"
+migrations_dir = "migrations-directory"
 
 [[env.dev.r2_buckets]]
 binding = "SAFETY"

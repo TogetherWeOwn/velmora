@@ -62,8 +62,8 @@ use crate::ports::{
 use crate::recovery::{id_after, write_generation};
 use crate::service::common::{
     auth_refused, check_precondition, discard_refused, discard_unless_present, header_refused,
-    hold_precondition, host_refused, precondition, restore_gate, send_post_jobs, writes_refused,
-    REGION_ALIASES,
+    hold_precondition, host_refused, precondition, restore_gate, send_post_jobs, signed_host,
+    writes_refused, REGION_ALIASES,
 };
 use crate::service::slices::{store_slices, SliceError, SliceSink};
 use crate::types::{
@@ -273,9 +273,10 @@ fn from_proto(resp: velmora_s3_proto::Response) -> S3Response {
     }
 }
 
-fn policy(cfg: &BridgeConfig) -> Outcome<Policy> {
+/// The policy for requests signed for `host` (see `common::signed_host`).
+fn policy(cfg: &BridgeConfig, host: &str) -> Outcome<Policy> {
     Policy::new(
-        cfg.s3_host.clone(),
+        host.to_owned(),
         cfg.region.clone(),
         Limits {
             target_bytes: 8 * 1024,
@@ -399,7 +400,7 @@ where
     if bridge.cfg.maintenance == Maintenance::Restore {
         return Err(ErrorCode::SlowDown.into());
     }
-    let policy = policy(&bridge.cfg)?;
+    let policy = policy(&bridge.cfg, signed_host(&bridge.cfg, req))?;
     let target = Target::parse(&req.raw_target, &policy);
     let fields: Vec<(&str, &str)> = req
         .headers
@@ -687,9 +688,10 @@ where
     };
     // Refuse an unknown or closed upload before the body is read or
     // anything is stored. The guarded batch below decides for real.
-    match bridge.catalog.upload(&target).await? {
-        Some((upload, _)) if upload.state == UploadState::Open => {}
-        _ => return Err(ErrorCode::NoSuchUpload.into()),
+    // The state alone: reading the parts here would cost a row per part
+    // already uploaded, on every part.
+    if bridge.catalog.upload_state(&target).await? != Some(UploadState::Open) {
+        return Err(ErrorCode::NoSuchUpload.into());
     }
 
     // Plaintext and ciphertext live together while sealing: the charge
@@ -964,8 +966,8 @@ where
             // longer this request's. The slices are left to the sweep.
             give_up().await;
             restore_gate(bridge).await?;
-            return Err(match bridge.catalog.upload(target).await? {
-                Some((upload, _)) if upload.state == UploadState::Open => ErrorCode::SlowDown,
+            return Err(match bridge.catalog.upload_state(target).await? {
+                Some(UploadState::Open) => ErrorCode::SlowDown,
                 _ => ErrorCode::NoSuchUpload,
             }
             .into());

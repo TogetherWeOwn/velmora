@@ -699,6 +699,34 @@ async fn commit_rejects_input_that_is_not_one_live_generation() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn a_commit_with_a_plan_rev_above_one_is_refused_before_any_statement() {
+    let fx = Fx::new();
+    let b = fx.bucket("alpha").await;
+    let _ = fx.writes();
+    let mut c = fx.commit(&b.id, "k", 2, T0);
+    c.extents[1].plan_rev = 2;
+    let err = fx.cat.publish(&c).await.unwrap_err();
+    assert!(
+        matches!(err, BridgeError::Invalid(plan_rev::ERR_PLAN_REV)),
+        "{err:?}"
+    );
+    assert_eq!(fx.writes(), (0, 0));
+    assert_eq!(fx.footprint(), [0, 0, 0, 0, 0]);
+
+    // 1, the plan its articles were posted under, is written as it is.
+    let mut c = fx.commit(&b.id, "k", 1, T0);
+    c.extents[0].plan_rev = 1;
+    fx.cat.publish(&c).await.unwrap();
+    assert_eq!(
+        fx.int(&format!(
+            "SELECT plan_rev FROM extents WHERE id = '{}'",
+            c.extents[0].id
+        )),
+        1
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn commit_binds_fresh_extents_to_the_generation_as_committed() {
     let fx = Fx::new();
     let b = fx.bucket("alpha").await;
@@ -2356,10 +2384,8 @@ async fn extents_in_matches_the_statement_it_replaced() {
             (size + 5, size + 9),
             (0, 0),
             (size, size),
-            // An open end: the largest integer D1 and a Durable Object
-            // bind exactly (2^53 - 1). Above it both adapters refuse
-            // the statement, as the workerd run of this suite shows.
-            (0, (1 << 53) - 1),
+            // The largest end the database takes as a bound value.
+            (0, MAX_SQL_INT as u64),
         ];
         let mut border = 0;
         for s in &sizes {
