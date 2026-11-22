@@ -207,11 +207,15 @@ pub enum UnitOp {
     /// The second restore call (AM-2): refused unless the unit is closed
     /// under the token's entry long enough and still at `expect_undo`;
     /// then restores to `target` and restarts. A Worker call, run by the
-    /// object class. It never answers `ok`.
+    /// object class. It never answers `ok`. `floor_ms`: the move floor
+    /// the verified tenant head holds for this unit (`move_floors`, 0
+    /// when none; AM-67): a time target before it + 60 s is refused, as
+    /// before the unit's own `lifted_at`.
     Restore {
         token: BirthToken,
         target: RestoreTarget,
         expect_undo: Bookmark,
+        floor_ms: u64,
     },
     /// Starts the gate report of one replay, discarding any other.
     GateOpen { replay_id: ReplayId },

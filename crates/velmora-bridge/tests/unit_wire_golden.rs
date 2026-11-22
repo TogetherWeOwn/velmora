@@ -273,6 +273,7 @@ fn ops() -> Vec<UnitOp> {
             token: token(),
             target: RestoreTarget::Time { at_ms: 1_000 },
             expect_undo: Bookmark("bm-1".into()),
+            floor_ms: 900,
         },
         UnitOp::Restore {
             token: token(),
@@ -280,6 +281,7 @@ fn ops() -> Vec<UnitOp> {
                 bookmark: Bookmark("bm-0".into()),
             },
             expect_undo: Bookmark("bm-1".into()),
+            floor_ms: 0,
         },
         UnitOp::GateOpen { replay_id: rid() },
         UnitOp::GateOpenMove {

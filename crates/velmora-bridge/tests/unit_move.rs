@@ -962,6 +962,7 @@ fn a_restore_born_unit_lifts_a_move_only_with_its_counters_on() {
                 },
                 target: RestoreTarget::Time { at_ms },
                 expect_undo: Bookmark("undo".into()),
+                floor_ms: 0,
             },
         );
         match u.pitr_step(&c, NOW) {
@@ -1124,6 +1125,15 @@ fn prepare(u: &Unit<RusqliteSql>, since: u64) -> Option<(Refused, bool)> {
 }
 
 fn restore_at(u: &Unit<RusqliteSql>, since: u64, at_ms: i64) -> Option<(Refused, bool)> {
+    restore_floor(u, since, at_ms, 0)
+}
+
+fn restore_floor(
+    u: &Unit<RusqliteSql>,
+    since: u64,
+    at_ms: i64,
+    floor_ms: u64,
+) -> Option<(Refused, bool)> {
     let c = call_on(
         &own(),
         CallKind::Worker,
@@ -1139,12 +1149,67 @@ fn restore_at(u: &Unit<RusqliteSql>, since: u64, at_ms: i64) -> Option<(Refused,
             },
             target: RestoreTarget::Time { at_ms },
             expect_undo: Bookmark("undo".into()),
+            floor_ms,
         },
     );
     match u.pitr_step(&c, NOW) {
         PitrStep::Answer(a) => refusal(&a),
         other => panic!("armed: {other:?}"),
     }
+}
+
+/// AM-67: the move floor the tenant chain keeps (`move_floors`), named
+/// by every `restore` call. It holds when the unit's own record is gone
+/// (a first restore took `unit_import_move` away): a time target before
+/// the later of the two floors + 60 s is refused with `before_move_lift`.
+#[test]
+fn a_time_restore_before_the_chains_move_floor_is_refused() {
+    let before_lift = Some((Refused::Restore(RestoreRefusal::BeforeMoveLift), false));
+    let lease_unknown = Some((Refused::Restore(RestoreRefusal::LeaseUnknown), false));
+    // No move record in the unit (as after a restore to a bookmark taken
+    // before the move's first batch): only the named floor holds.
+    let u = closed_for_the_move();
+    let floor = NOW.0 + 3_600_000;
+    for at_ms in [NOW.0 + LIFT_SLACK_MS, floor, floor + LIFT_SLACK_MS - 1] {
+        assert_eq!(
+            restore_floor(&u, S, at_ms, floor as u64),
+            before_lift,
+            "{at_ms}"
+        );
+    }
+    assert_eq!(
+        restore_floor(&u, S, floor + LIFT_SLACK_MS, floor as u64),
+        lease_unknown
+    );
+    // No floor named (0) and no record: the birth floor only.
+    assert_eq!(
+        restore_floor(&u, S, NOW.0 + LIFT_SLACK_MS, 0),
+        lease_unknown
+    );
+    // A floor that is no time: malformed, before anything else.
+    assert_eq!(
+        restore_floor(&u, S, NOW.0 + LIFT_SLACK_MS, u64::MAX),
+        Some((Refused::Restore(RestoreRefusal::Malformed), false))
+    );
+    // With the unit's own lift, the later of the two holds: a named floor
+    // below the lift does not lower it.
+    let u = closed_for_the_move();
+    fill(&u, &["a"]);
+    lift_the_move(&u);
+    let s2 = S + 2;
+    ok(sync_to(&u, s2, Some(s2), None));
+    assert_eq!(
+        restore_floor(&u, s2, NOW.0 + LIFT_SLACK_MS - 1, 1),
+        before_lift
+    );
+    assert_eq!(
+        restore_floor(&u, s2, NOW.0 + LIFT_SLACK_MS, 1),
+        lease_unknown
+    );
+    assert_eq!(
+        restore_floor(&u, s2, NOW.0 + LIFT_SLACK_MS, floor as u64),
+        before_lift
+    );
 }
 
 #[test]
@@ -1195,8 +1260,9 @@ fn a_restore_to_a_time_before_the_units_birth_is_refused() {
 fn the_first_batch_closes_the_undo_bookmark_and_the_span_before_it_is_open() {
     // The move's step 2 re-creates an unborn owner unit with a `restore`
     // token under its entry (AM-53). Before the first batch there is no
-    // move record: the restore checks go on (an open design question,
-    // 4c review). From the first batch on, no undo bookmark (AM-46).
+    // move record: the restore checks go on (the chain's move floor,
+    // AM-67, covers a later time restore). From the first batch on, no
+    // undo bookmark (AM-46).
     let u = Unit::new(RusqliteSql::open_in_memory().unwrap(), own(), "");
     let token = BirthToken {
         name: own(),

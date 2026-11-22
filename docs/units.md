@@ -456,7 +456,13 @@ While an import exists that no `move` report has lifted
 with `move_not_lifted`, so no undo bookmark from before the lift exists;
 `restore`, which needs that bookmark, is refused the same way. Once
 lifted, `restore` refuses a time target before `lifted_at` + 60 s (est)
-with `before_move_lift`. It also refuses a time target before the unit's
+with `before_move_lift`. **The floor is also kept in the tenant chain**
+(AM-67), where a unit restore cannot take it back: the first owner-tenant
+record after the lift sets the carried door field `move_floors: {<unit>:
+<lifted_at>}`, and every `restore` call carries `floor_ms`, read by the
+Worker from the verified head for that unit (0 when there is none). The
+unit refuses a time target before max(its own `lifted_at`, `floor_ms`) +
+60 s with `before_move_lift`, also when its own record is gone. It also refuses a time target before the unit's
 own `born_at` + 60 s (est) with `before_birth`: a rebirth (a dump restore
 into a gone or unborn unit, or a re-creation after `deleteAll()`)
 replaced the unit, and the history before it would bring back the old
@@ -465,12 +471,14 @@ a little before the commit; the S3 drill measures
 `getBookmarkForTime`'s offset, and above 30 s the margin becomes twice
 it. A bookmark target is not compared: the only bookmarks are the undo
 bookmark and the pre-migration bookmark, and neither can be taken before
-the lift, with one span open (a design question for the move): from
-the time the owner's unit is closed with no move record (the move's
-step-2 sync, or a re-creation with a `restore` token under the move's
-entry, AM-53, or under a left entry, P12) until the first import batch,
-the unit cannot tell that entry from a restore's, whatever its birth, so
-`restore_prepare` there goes on to checks 1 to 3. A unit runs no schema
+the lift, with one span open: from the time the owner's unit is closed
+with no move record (the move's step-2 sync, or a re-creation with a
+`restore` token under the move's entry, AM-53, or under a left entry,
+P12) until the first import batch, the unit cannot tell that entry from
+a restore's, whatever its birth, so `restore_prepare` there goes on to
+checks 1 to 3. Restoring such a bookmark after the lift takes the unit's
+own record away; the chain's floor then still refuses a later time
+restore into the seal-to-lift span (AM-67; the move's P14 drills it). A unit runs no schema
 migration while an import is not lifted
 (`schema::migration_allowed`; code reads N - 1 and N, so it serves
 without migrating), and the move window runs under the merge freeze.
