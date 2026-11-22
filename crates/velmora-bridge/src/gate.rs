@@ -1822,12 +1822,169 @@ pub trait GateSession {
     fn close(&self);
 }
 
+struct Opening<S> {
+    result: Option<Result<S>>,
+    waker: Option<core::task::Waker>,
+    gone: bool,
+}
+
+struct OpenReceiver<S: GateSession>(Rc<RefCell<Opening<S>>>);
+
+impl<S: GateSession> core::future::Future for OpenReceiver<S> {
+    type Output = Result<S>;
+
+    fn poll(
+        self: core::pin::Pin<&mut Self>,
+        cx: &mut core::task::Context<'_>,
+    ) -> core::task::Poll<Self::Output> {
+        let mut opening = self.0.borrow_mut();
+        match opening.result.take() {
+            Some(result) => core::task::Poll::Ready(result),
+            None => {
+                opening.waker = Some(cx.waker().clone());
+                core::task::Poll::Pending
+            }
+        }
+    }
+}
+
+impl<S: GateSession> Drop for OpenReceiver<S> {
+    fn drop(&mut self) {
+        let result = {
+            let mut opening = self.0.borrow_mut();
+            opening.gone = true;
+            opening.waker = None;
+            opening.result.take()
+        };
+        if let Some(Ok(session)) = result {
+            session.close();
+        }
+    }
+}
+
+/// Runs an opening that cannot be cancelled midway to completion. If the
+/// caller drops the receiver before taking the session, the session closes.
+pub fn open_detached<S: GateSession + 'static>(
+    spawn: &crate::ingress::Spawner,
+    opening: LocalBoxFuture<'static, Result<S>>,
+) -> impl core::future::Future<Output = Result<S>> {
+    let state = Rc::new(RefCell::new(Opening {
+        result: None,
+        waker: None,
+        gone: false,
+    }));
+    let receive = OpenReceiver(state.clone());
+    spawn(Box::pin(async move {
+        let result = opening.await;
+        let waker = {
+            let mut state = state.borrow_mut();
+            if state.gone {
+                drop(state);
+                if let Ok(session) = result {
+                    session.close();
+                }
+                return;
+            }
+            state.result = Some(result);
+            state.waker.take()
+        };
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+    }));
+    receive
+}
+
+#[cfg(test)]
+mod detached_open_tests {
+    use super::*;
+    use std::cell::Cell;
+    use tokio::sync::oneshot;
+    use tokio::task::{spawn_local, LocalSet};
+
+    fn spawner() -> crate::ingress::Spawner {
+        Rc::new(|task| {
+            spawn_local(task);
+        })
+    }
+
+    struct Session(Rc<Cell<u32>>);
+
+    impl GateSession for Session {
+        async fn call(&self, _: GateRequest) -> Result<GateReply> {
+            unreachable!("the opening does not call the session");
+        }
+
+        fn close(&self) {
+            self.0.set(self.0.get() + 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_pending_open_closes_the_late_session_once() {
+        let closes = Rc::new(Cell::new(0));
+        let session = Session(closes.clone());
+        let (started, pending) = oneshot::channel();
+        let (finish, opening) = oneshot::channel();
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let receive = open_detached(
+                    &spawner(),
+                    Box::pin(async move {
+                        started.send(()).unwrap();
+                        opening.await.unwrap();
+                        Ok(session)
+                    }),
+                );
+                pending.await.unwrap();
+                drop(receive);
+                finish.send(()).unwrap();
+            })
+            .await;
+        local.await;
+        assert_eq!(closes.get(), 1);
+    }
+
+    #[tokio::test]
+    async fn dropping_an_open_result_closes_it_but_receiving_it_does_not() {
+        LocalSet::new()
+            .run_until(async {
+                let closes = Rc::new(Cell::new(0));
+                let session = Session(closes.clone());
+                let (done, finished) = oneshot::channel();
+                let receive = open_detached(
+                    &spawner(),
+                    Box::pin(async move {
+                        done.send(()).unwrap();
+                        Ok(session)
+                    }),
+                );
+                finished.await.unwrap();
+                drop(receive);
+                assert_eq!(closes.get(), 1);
+
+                let session = Session(closes.clone());
+                let taken = open_detached(&spawner(), Box::pin(async { Ok(session) }))
+                    .await
+                    .unwrap();
+                assert_eq!(closes.get(), 1);
+                taken.close();
+                assert_eq!(closes.get(), 2);
+            })
+            .await;
+    }
+}
+
 /// The way to the gates.
 #[allow(async_fn_in_trait)]
 pub trait GateTransport {
     type Session: GateSession;
     /// Opens a session with the gate named in `request`. The request
-    /// travels with the opening: one round trip for both.
+    /// travels with the opening: one round trip for both. Dropping the
+    /// future must not leave a session open at the gate. If the opening
+    /// cannot be cancelled midway, run it to completion and close the
+    /// resulting session if the caller dropped it.
     async fn open(&self, request: GateRequest) -> Result<(Self::Session, GateReply)>;
     /// One request outside any session. It can take no slot.
     async fn call(&self, request: GateRequest) -> Result<GateReply>;

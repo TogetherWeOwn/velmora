@@ -29,16 +29,17 @@ use std::rc::Rc;
 use std::task::{Poll, Waker};
 
 use velmora_bridge::gate::{
-    Gate, GateAnswer, GateRecord, GateReply, GateRequest, GateSession, GateStore, GateTransport,
-    SessionState,
+    open_detached, Gate, GateAnswer, GateRecord, GateReply, GateRequest, GateSession, GateStore,
+    GateTransport, SessionState,
 };
+use velmora_bridge::ingress::Spawner;
 use velmora_bridge::{BridgeError, Clock, Result};
 use worker::wasm_bindgen::closure::Closure;
 use worker::wasm_bindgen::{self, JsCast, JsValue};
 use worker::web_sys;
 use worker::{
     console_log, durable_object, DurableObject, Env, Method, ObjectNamespace, Request, RequestInit,
-    Response, State, Storage, WebSocket, WebSocketIncomingMessage, WebSocketPair,
+    Response, State, Storage, Stub, WebSocket, WebSocketIncomingMessage, WebSocketPair,
     WorkerVersionMetadata,
 };
 
@@ -405,19 +406,22 @@ impl DurableObject for PermitGate {
 /// Asks the gate objects of one namespace.
 pub struct DoTransport {
     namespace: ObjectNamespace,
+    spawn: Spawner,
 }
 
 impl DoTransport {
-    pub fn new(namespace: ObjectNamespace) -> Self {
-        DoTransport { namespace }
+    pub fn new(namespace: ObjectNamespace, spawn: Spawner) -> Self {
+        DoTransport { namespace, spawn }
     }
 
-    async fn fetch(&self, gate: &str, req: Request) -> Result<Response> {
-        let stub = self
-            .namespace
+    fn stub(&self, gate: &str) -> Result<Stub> {
+        self.namespace
             .id_from_name(gate)
             .and_then(|id| id.get_stub())
-            .map_err(|_| failed("no object"))?;
+            .map_err(|_| failed("no object"))
+    }
+
+    async fn fetch(stub: Stub, req: Request) -> Result<Response> {
         stub.fetch_with_request(req)
             .await
             .map_err(|_| failed("call failed"))
@@ -584,9 +588,16 @@ impl GateTransport for DoTransport {
             headers.set(REQUEST_HEADER, &header)
         });
         set.map_err(|_| failed("request refused"))?;
-        let resp = self.fetch(&request.gate, req).await?;
-        let ws = resp.websocket().ok_or_else(|| failed("call refused"))?;
-        let session = DoSession::new(ws)?;
+        let stub = self.stub(&request.gate)?;
+        let session = open_detached(
+            &self.spawn,
+            Box::pin(async move {
+                let resp = Self::fetch(stub, req).await?;
+                let ws = resp.websocket().ok_or_else(|| failed("call refused"))?;
+                DoSession::new(ws)
+            }),
+        )
+        .await?;
         match session.reply(request.id).await {
             Ok(reply) => Ok((session, reply)),
             Err(e) => {
@@ -603,7 +614,7 @@ impl GateTransport for DoTransport {
             .with_body(Some(JsValue::from_str(&body)));
         let req = Request::new_with_init("https://permit-gate/", &init)
             .map_err(|_| failed("request refused"))?;
-        let mut resp = self.fetch(&request.gate, req).await?;
+        let mut resp = Self::fetch(self.stub(&request.gate)?, req).await?;
         if resp.status_code() != 200 {
             return Err(failed("call refused"));
         }

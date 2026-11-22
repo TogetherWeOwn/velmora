@@ -10,8 +10,10 @@ use std::pin::Pin;
 use std::rc::Rc;
 use std::task::Poll;
 
+use tokio::sync::oneshot;
+use tokio::task::{spawn_local, LocalSet};
 use velmora_bridge::gate::*;
-use velmora_bridge::ingress::Sleeper;
+use velmora_bridge::ingress::{Sleeper, Spawner};
 use velmora_bridge::sql::SqlCatalog;
 use velmora_bridge::testkit::RusqliteSql;
 use velmora_bridge::*;
@@ -1168,6 +1170,107 @@ async fn a_job_in_the_lines_of_two_gates_takes_the_first_slot_and_leaves_the_oth
     assert_eq!((wp.held("p").await, wq.held("q").await), (0, 1));
     assert!(take(&a, wq, &both[1], JOB, "job-a").await.is_some());
     assert_eq!((wp.pushed.get(), wq.pushed.get()), (0, 1));
+}
+
+/// Q handles the upgrade before its caller can see the resulting session.
+struct SlowOpen {
+    wires: Wires,
+    gate: String,
+    started: Cell<Option<oneshot::Sender<u64>>>,
+    finish: Cell<Option<oneshot::Receiver<oneshot::Sender<()>>>>,
+    spawn: Spawner,
+}
+
+impl GateTransport for SlowOpen {
+    type Session = Line;
+
+    async fn open(&self, request: GateRequest) -> Result<(Line, GateReply)> {
+        let wire = self.wires.to(&request.gate);
+        if request.gate != self.gate {
+            return wire.open(request).await;
+        }
+        let wire = Wire(wire.0.clone(), wire.1.clone());
+        let started = self.started.take().unwrap();
+        let finish = self.finish.take().unwrap();
+        let reply = Rc::new(Cell::new(None));
+        let answer = reply.clone();
+        let line = open_detached(
+            &self.spawn,
+            Box::pin(async move {
+                let (line, reply) = wire.open(request).await?;
+                answer.set(Some(reply));
+                started.send(line.id).unwrap();
+                finish.await.unwrap().send(()).unwrap();
+                Ok(line)
+            }),
+        )
+        .await?;
+        Ok((line, reply.take().unwrap()))
+    }
+
+    async fn call(&self, request: GateRequest) -> Result<GateReply> {
+        self.wires.call(request).await
+    }
+}
+
+#[tokio::test]
+async fn a_losing_pending_open_does_not_hold_a_slot() {
+    let local = LocalSet::new();
+    local
+        .run_until(async {
+            let two = Two::new().await;
+            let (wp, wq) = (&two.p.1, &two.q.1);
+            let (sleep, both) = (wp.sleeper(), two.both());
+            let on = [&both[0], &both[1]];
+            let wire = |w: &Rc<World>| (w.name.clone(), Wire(w.clone(), "waiting".into()));
+            let (started, pending) = oneshot::channel();
+            let (finish, open) = oneshot::channel();
+            let transport = SlowOpen {
+                wires: Wires(vec![wire(wp), wire(wq)]),
+                gate: wq.name.clone(),
+                started: Cell::new(Some(started)),
+                finish: Cell::new(Some(open)),
+                spawn: Rc::new(|task| {
+                    spawn_local(task);
+                }),
+            };
+            let origin = wp.clone();
+            let clock = move || origin.now();
+            let a = GateClient::new(
+                transport,
+                clock,
+                PermitMode::Gate,
+                GateSharding::Account,
+                1,
+                &both,
+            )
+            .with_push(true);
+            let mut waiting = a.wait(&on, "job-a", 60_000, &sleep);
+            assert_eq!(turn(&mut waiting), None);
+            let id = pending.await.unwrap();
+            let gate = wq.gate().await;
+            assert!(gate.session(id, wq.now()).wait.is_some());
+
+            two.c.release_permit(&two.held[0]).await.unwrap();
+            assert_eq!(turn(&mut waiting), Some(SlotWait::Granted));
+            drop(waiting);
+            two.c.release_permit(&two.held[1]).await.unwrap();
+            assert_eq!(
+                wq.held("q").await,
+                1,
+                "Q granted while its upgrade was pending"
+            );
+            let baseline = wq.sessions() - 1;
+            let (done, finished) = oneshot::channel();
+            finish.send(done).unwrap();
+            finished.await.unwrap();
+
+            assert_eq!(wq.sessions(), baseline, "Q's losing session was closed");
+            assert_eq!(wq.held("q").await, 0);
+            assert!(gate.session(id, wq.now()).wait.is_none());
+            assert!(take(&two.c, wq, &both[1], JOB, "next-job").await.is_some());
+        })
+        .await;
 }
 
 /// One of the two gates keeps no line (it runs code from before it):
