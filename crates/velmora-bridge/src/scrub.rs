@@ -214,6 +214,7 @@ struct Walk<'w, 's, C: Catalog, N: NntpConnector, T: Clock> {
     blocked: Vec<String>,
     body_blocked: Vec<String>,
     deferred_checks: bool,
+    completed_checks: bool,
     /// The copy-check sessions, kept from one extent to the next.
     stats: &'w mut Vec<ProviderSession<'s, C, N, T>>,
     /// Providers that refused this run's login: not asked again in it.
@@ -340,6 +341,7 @@ where
             blocked,
             body_blocked,
             deferred_checks: false,
+            completed_checks: false,
             stats: &mut stats,
             refused: Vec::new(),
             blocked_repins: 0,
@@ -349,11 +351,11 @@ where
         let mut blocked = core::mem::take(&mut walk.blocked);
         let mut body_blocked = core::mem::take(&mut walk.body_blocked);
         let mut clean = core::mem::take(&mut walk.clean);
-        let deferred_checks = walk.deferred_checks;
+        let no_copy_progress = !walk.completed_checks && walk.deferred_checks;
         ProviderSession::close_all(stats).await;
         reader.close().await;
         run.ended = ended;
-        if run.checked == 0 && (ended == ScrubEnd::Busy || deferred_checks) {
+        if no_copy_progress || (run.checked == 0 && ended == ScrubEnd::Busy) {
             crate::trace::alert(|| format!("scrub-no-progress ended={} checked=0", ended.as_str()));
         }
         if run.incident.is_some() {
@@ -651,16 +653,12 @@ where
             confirmed,
         } = self.check_copies(reader, walk, candidate, &plan).await?;
         walk.deferred_checks |= busy || deferred;
+        walk.completed_checks |= !observed.is_empty();
         walk.breaker.note(&observed);
         for backbone in &walk.blocked {
             let checks = || observed.iter().filter(|check| &check.backbone == backbone);
             if lacking.contains(backbone) {
                 walk.clean.retain(|(name, _)| name != backbone);
-                if checks().any(|check| check.full && !check.intact)
-                    && !walk.body_blocked.contains(backbone)
-                {
-                    walk.body_blocked.push(backbone.clone());
-                }
             } else if checks().any(|check| check.full || !walk.body_blocked.contains(backbone)) {
                 if let Some((_, n)) = walk.clean.iter_mut().find(|(name, _)| name == backbone) {
                     *n += 1;
@@ -823,7 +821,11 @@ where
                     if intact {
                         let interval = intervals[usize::from(check.full)];
                         let next = next_cadence(check.phase_at, now, interval);
-                        updates.push((check.clone(), next, None));
+                        let mut check = check.clone();
+                        // The nominal deadline moves only after a pass.
+                        // A retry changes due_at, not the cadence anchor.
+                        check.phase_at = next;
+                        updates.push((check, next, None));
                     } else {
                         if !out.lacking.contains(&check.backbone) {
                             out.lacking.push(check.backbone.clone());

@@ -1644,6 +1644,7 @@ pub struct ScrubCheck {
     pub backbone: String,
     pub full: bool,
     pub due_at: UnixMs,
+    /// The nominal deadline, unchanged by a retry or repair.
     pub phase_at: UnixMs,
     pub loss_at: Option<UnixMs>,
 }

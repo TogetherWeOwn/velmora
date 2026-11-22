@@ -684,6 +684,48 @@ async fn a_successful_retry_resumes_the_original_phase() {
     assert_eq!(w.clocks(&o, "beta").await.0, now.plus_secs(30 * DAY_SECS));
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn a_changed_interval_starts_at_the_latest_regular_deadline() {
+    let mut w = world().await;
+    let o = w.released("new-interval", 14).await;
+    let now = w.bridge().clock.now();
+    let later = now.plus_secs(300 * DAY_SECS);
+    w.set_clocks(&o, "alpha", later, later).await;
+    w.set_clocks(&o, "beta", later, now).await;
+    assert_eq!(w.scrub().await.ok, 1);
+    assert_eq!(w.clocks(&o, "beta").await.1, now.plus_secs(90 * DAY_SECS));
+    std::rc::Rc::get_mut(&mut w.rig.bridge)
+        .unwrap()
+        .cfg
+        .scrub
+        .full_interval_days = 91;
+    w.advance_secs(90 * DAY_SECS);
+    assert_eq!(w.scrub().await.ok, 1);
+    assert_eq!(w.clocks(&o, "beta").await.1, now.plus_secs(181 * DAY_SECS));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_single_body_failure_does_not_upgrade_a_stat_incident() {
+    let w = world().await;
+    let o = w.released("stat-incident", 15).await;
+    w.full_checks_now(&o).await;
+    w.bridge()
+        .catalog
+        .sql
+        .exec(
+            r#"UPDATE scrub_state SET last_incident = '["beta"]', incident_clean = 7"#,
+            &[],
+        )
+        .await
+        .unwrap();
+    w.servers[1].set_body_gone(true).await;
+    assert_eq!(w.scrub().await.suspect, 1);
+    let state = w.state().await;
+    assert_eq!(state.blocked(), ["beta"]);
+    assert!(state.incident_body_by.is_empty());
+    assert_eq!(state.incident_clean, 0);
+}
+
 /// An article lost on one backbone: seen once it is only `suspect`;
 /// seen again after the confirm interval the extent is re-pinned, the
 /// verify stage posts the article to that backbone again under its
@@ -926,6 +968,14 @@ async fn a_provider_without_a_free_slot_defers_only_its_own_check() {
         w.clocks(&o, "beta").await.0,
         now.plus_secs(w.bridge().cfg.scrub.confirm_secs)
     );
+    // A run with only this partial result still completes alpha's check.
+    w.set_clocks(&o, "alpha", now, later).await;
+    w.set_clocks(&o, "beta", now, later).await;
+    assert_eq!(w.scrub().await.checked, 0);
+    assert!(w.clocks(&o, "alpha").await.0 > now);
+    assert!(!alerts()
+        .iter()
+        .any(|alert| alert.starts_with("scrub-no-progress")));
 }
 
 /// The breaker: 8 extents of 8 lacking articles on one backbone is a

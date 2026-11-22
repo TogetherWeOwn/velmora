@@ -355,10 +355,10 @@ pub(super) async fn advance<S: Sql>(
     ));
     for (check, next, loss) in updates {
         let sql = if check.full {
-            "UPDATE scrub_copies SET full_at = ?4, full_loss_at = ?5 \
+            "UPDATE scrub_copies SET full_at = ?4, full_loss_at = ?5, full_phase_at = ?6 \
              WHERE extent_id = ?1 AND backbone = ?2 AND full_at = ?3"
         } else {
-            "UPDATE scrub_copies SET stat_at = ?4, stat_loss_at = ?5 \
+            "UPDATE scrub_copies SET stat_at = ?4, stat_loss_at = ?5, stat_phase_at = ?6 \
              WHERE extent_id = ?1 AND backbone = ?2 AND stat_at = ?3"
         };
         stmts.push((
@@ -369,6 +369,7 @@ pub(super) async fn advance<S: Sql>(
                 ms(check.due_at),
                 ms(*next),
                 loss.map_or(SqlValue::Null, ms),
+                ms(check.phase_at),
             ],
         ));
     }
