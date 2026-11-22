@@ -132,6 +132,48 @@ to the directory are not built here, and the Worker's cron runs a unit's
 jobs through `TenantCatalog`. Rules 9 and 10 (jobs that name their tenant,
 the unit's outbox to the directory) are not built yet.
 
+**What makes the alarm's raise due** (ADR §8.5, AM-48). Every committed S3
+or job call that changed a row, and every reservation call, makes the raise
+due. These do not: the stamp's own calls (`stamp`, `stamp_advance`,
+`stamp_rolled_back`), the dispatcher's run time (`record_dispatch`) and the
+scan cursors (`set_cursor`). Nor do the Worker's own calls: `renew`, `sync`,
+the key-chain apply, `import`, `ImportSeal`, `Recount`, `Export`, the gate
+calls and `provision`. A rollback that loses one of these shows as
+`SyncNeeded` or an expired lease, or the tool runs it again, and a raise
+must not make the next one due. Read stamps (`touch_read`) count. The alarm
+sends a raise only while at least T/2 of the lease is left; with less, it
+sends `renew` and sends the raise after that renewal.
+
+**The unit client** (`unit_lease::client`, the Worker's side of rules 5 and
+12; AM-50, AM-51). A unit does no I/O, so the Worker reads for it:
+
+- **`renew`.** The unit's numbers, stamp counter and revoked count come
+  from one stamp read through the job path (allowed with an expired lease),
+  then the proof (`unit_lease::renewal`) and `renew(proof_start, proven,
+  revocations)`. A newer record means `sync` first. A stamp object after
+  the counter is confirmed through the unit's own counter: a raise that ran
+  in between moves it and is not a rollback; with the counter unchanged the
+  rollback is recorded, the unit closes and the client pages. Revocations
+  the unit did not hold are applied with the renewal, and the key chain's
+  finisher is told once (SEC-6). More revocations held than listed renews
+  nothing and pages.
+- **`sync`.** The tenant chain's verified head and the key-chain records
+  after the unit's `keys_seq`: first the key apply (AM-12), then `sync` at
+  both heads, with the head's state, mode and this unit's `restoring` entry.
+  A head that clears the entry is not sent as a lift: only the restore
+  tool's `sync` carries the lift proof (AM-45); the client reports it and
+  changes nothing. A unit the head does not list is not called.
+- **The request path** (rule 5): `renew_needed` renews, `sync_needed`
+  syncs, a lower request number takes the unit's numbers; each fix runs once
+  and the call runs once more. An answer with less than half of T left asks
+  for a background renewal (`waitUntil`), one per unit and isolate.
+- **The `renew` and `stamp_raise` jobs**, which the queue consumer hands to
+  the client: a renewal as above; a raise moves the unit's counter, then puts
+  its object, renewing first when the lease ran out. A failed call is handed
+  back with the queue's retry delay; `unborn` goes to the consumer's `Unborn`
+  rule (AM-50). Under `MAINTENANCE = restore` the consumer acknowledges both
+  without a call.
+
 **The calls are JSON** (`UnitCall` and `UnitAnswer`, `unit::call`; an
 answer leaves the unit as `UnitReply`, rule 12). Until the class is bound
 (stage C(b)) the format may change. After it, these types only gain
