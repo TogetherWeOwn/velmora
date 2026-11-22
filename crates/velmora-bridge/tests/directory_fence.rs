@@ -461,6 +461,33 @@ fn the_unfenced_operational_tables_keep_their_columns() {
                 .collect::<Vec<_>>()
         };
         assert_eq!(OPERATIONAL_TABLES, ["provider_health", "provider_permits"]);
+        // The rig's schema is the testkit's list of migrations. A new file
+        // that names either table fails here even before that list has
+        // it: only these four touch them today.
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../workers/s3-bridge");
+        let mut touching = Vec::new();
+        for dir in ["migrations", "migrations-next"] {
+            for entry in std::fs::read_dir(root.join(dir)).unwrap() {
+                let path = entry.unwrap().path();
+                let text = std::fs::read_to_string(&path).unwrap();
+                if OPERATIONAL_TABLES.iter().any(|t| text.contains(t)) {
+                    touching.push(format!(
+                        "{dir}/{}",
+                        path.file_name().unwrap().to_string_lossy()
+                    ));
+                }
+            }
+        }
+        touching.sort();
+        assert_eq!(
+            touching,
+            [
+                "migrations/0001_init.sql",
+                "migrations/0002_provider_health.sql",
+                "migrations/0006_permit_class.sql",
+                "migrations/0012_provider_health_reason.sql",
+            ]
+        );
         assert_eq!(
             columns("provider_health").await,
             [

@@ -312,6 +312,9 @@ impl<S: RecordStore, C: ControlSeal> TenantChain<'_, S, C> {
 
     /// Validates `change` against the head and writes the record that
     /// follows it. See the [module](self).
+    ///
+    /// Not for [`Change::PlaceMovedBuckets`]: that change is bound to
+    /// tenant 0's head, which only [`Self::place_moved_buckets`] reads.
     pub async fn write(
         &self,
         tenant: &Tenant,
@@ -320,49 +323,27 @@ impl<S: RecordStore, C: ControlSeal> TenantChain<'_, S, C> {
         now: UnixMs,
         known: u64,
     ) -> Result<Written, ChainError> {
+        if matches!(change, Change::PlaceMovedBuckets { .. }) {
+            return Err(ChainError::Refused(Refusal {
+                status: 400,
+                code: "invalid_change",
+            }));
+        }
         let mut known = known;
         for _ in 0..MAX_PUT_TRIES {
-            let head = self.head(tenant, known).await?;
-            let current = match &head {
-                None => None,
-                Some(read) => Some(writable(read)?),
-            };
-            let record = match next(tenant, current.as_ref(), change, actor, now) {
-                Err(refusal) => return Err(ChainError::Refused(refusal)),
-                Ok(Outcome::Unchanged) => {
-                    let head = head.expect("a change is unchanged only against a head");
-                    return Ok(Written::Unchanged(head));
-                }
-                Ok(Outcome::Next(record)) => record,
-            };
-            let name = record_key(tenant, record.door.seq);
-            let door =
-                serde_json::to_vec(&record.door).map_err(|_| ChainError::Damaged("encode"))?;
-            let private = Zeroizing::new(
-                serde_json::to_vec(&record.private).map_err(|_| ChainError::Damaged("encode"))?,
-            );
-            if keyless(&record.door) && record.private != empty_private() {
-                return Err(ChainError::Damaged("private_part_without_key"));
+            match self.try_write(tenant, change, actor, now, known).await? {
+                Try::Done(written) => return Ok(written),
+                Try::Lost(seq) => known = seq,
             }
-            let sealed =
-                self.seal
-                    .seal(&name, tenant, seal_version(&record.door), &door, &private)?;
-            if self.store.put_if_absent(&name, sealed).await? {
-                return Ok(Written::Wrote(record));
-            }
-            // Another writer took this seq: read on from it.
-            known = record.door.seq;
         }
         Err(ChainError::Busy)
     }
-}
 
-impl<S: RecordStore, C: ControlSeal> TenantChain<'_, S, C> {
     /// Places the owner's buckets, moved from tenant 0 with their ids
     /// unchanged, on `unit` of `tenant` (the move's import, by the move
-    /// tool). Tenant 0's head is read from its own chain here, so the
-    /// change is bound to a verified head that is `moving` into `tenant`;
-    /// the record names that head's seq.
+    /// tool). Tenant 0's head is read from its own chain here, before
+    /// every try, so the change is bound to a verified head that is
+    /// `moving` into `tenant`; the record names that head's seq.
     pub async fn place_moved_buckets(
         &self,
         tenant: &Tenant,
@@ -371,20 +352,87 @@ impl<S: RecordStore, C: ControlSeal> TenantChain<'_, S, C> {
         now: UnixMs,
         known: u64,
     ) -> Result<Written, ChainError> {
-        let Some(zero) = self.head(&Tenant::Zero, 0).await? else {
-            return Err(ChainError::Refused(Refusal {
-                status: 409,
-                code: "no_move_to_tenant",
-            }));
-        };
-        let change = Change::PlaceMovedBuckets {
-            buckets: buckets.to_vec(),
-            unit,
-            zero: Box::new(zero.door),
-        };
-        self.write(tenant, &change, Actor::MoveTool, now, known)
-            .await
+        let mut known = known;
+        for _ in 0..MAX_PUT_TRIES {
+            let Some(zero) = self.head(&Tenant::Zero, 0).await? else {
+                return Err(ChainError::Refused(Refusal {
+                    status: 409,
+                    code: "no_move_to_tenant",
+                }));
+            };
+            let change = Change::PlaceMovedBuckets {
+                buckets: buckets.to_vec(),
+                unit,
+                zero: Box::new(zero.door),
+            };
+            match self
+                .try_write(tenant, &change, Actor::MoveTool, now, known)
+                .await?
+            {
+                Try::Done(written) => return Ok(written),
+                Try::Lost(seq) => known = seq,
+            }
+        }
+        Err(ChainError::Busy)
     }
+
+    /// One try: the record that follows the head, put at its seq.
+    async fn try_write(
+        &self,
+        tenant: &Tenant,
+        change: &Change,
+        actor: Actor,
+        now: UnixMs,
+        known: u64,
+    ) -> Result<Try, ChainError> {
+        let head = self.head(tenant, known).await?;
+        let current = match &head {
+            None => None,
+            Some(read) => Some(writable(read)?),
+        };
+        let record = match next(tenant, current.as_ref(), change, actor, now) {
+            Err(refusal) => return Err(ChainError::Refused(refusal)),
+            Ok(Outcome::Unchanged) => {
+                let head = head.expect("a change is unchanged only against a head");
+                return Ok(Try::Done(Written::Unchanged(head)));
+            }
+            Ok(Outcome::Next(record)) => record,
+        };
+        let name = record_key(tenant, record.door.seq);
+        let door = serde_json::to_vec(&record.door).map_err(|_| ChainError::Damaged("encode"))?;
+        let private = Zeroizing::new(
+            serde_json::to_vec(&record.private).map_err(|_| ChainError::Damaged("encode"))?,
+        );
+        if keyless(&record.door) && record.private != empty_private() {
+            return Err(ChainError::Damaged("private_part_without_key"));
+        }
+        let sealed = self
+            .seal
+            .seal(&name, tenant, seal_version(&record.door), &door, &private)?;
+        let seq = record.door.seq;
+        match self.store.put_if_absent(&name, sealed.clone()).await {
+            Ok(true) => Ok(Try::Done(Written::Wrote(record))),
+            // Another writer took this seq: read on from it.
+            Ok(false) => Ok(Try::Lost(seq)),
+            // An error says nothing about whether the bytes were stored:
+            // read the name back. These exact bytes (the seal is never the
+            // same twice) are this put's; other bytes are another writer's.
+            Err(e) => match self.store.get(&name).await {
+                Ok(Some(stored)) if stored == sealed => Ok(Try::Done(Written::Wrote(record))),
+                Ok(Some(_)) => Ok(Try::Lost(seq)),
+                Ok(None) | Err(_) => Err(e.into()),
+            },
+        }
+    }
+}
+
+/// What one try of a write did.
+// Short-lived: made and matched in one call, never stored.
+#[allow(clippy::large_enum_variant)]
+enum Try {
+    Done(Written),
+    /// The seq was taken by another writer.
+    Lost(u64),
 }
 
 /// A record of a tenant other than tenant 0 from before its first key

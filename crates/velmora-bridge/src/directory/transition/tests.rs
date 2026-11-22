@@ -1891,6 +1891,22 @@ fn bucket_ids_are_derived_from_the_creator_grant() {
     unchanged(&at5, create_bucket(5, 0), Actor::Customer);
     let at9 = apply(&at5, create_bucket(9, 0), Actor::Customer);
     assert_eq!(at9.door.placements.len(), 2);
+    // Read back under a later head (another create, a hold, the bucket
+    // moved to another unit, the tenant suspended or restoring): still
+    // the same create, never a lost order that would revoke its grant.
+    unchanged(&at9, create_bucket(5, 0), Actor::Customer);
+    unchanged(&at9, create_bucket(5, 1), Actor::Operator);
+    let held = apply(&at9, billing_hold(Some(HoldMode::ReadOnly)), Actor::Billing);
+    unchanged(&held, create_bucket(5, 0), Actor::Customer);
+    let restoring = apply(&at9, Change::SetRestoring { unit: 0 }, Actor::Operator);
+    unchanged(&restoring, create_bucket(9, 0), Actor::Customer);
+    // A placed id under a seq never recorded is not a read-back.
+    let mut planted = at9.clone();
+    planted.door.last_grant_seq = 3;
+    assert_eq!(
+        refused(&planted, create_bucket(5, 0), Actor::Customer),
+        BUCKET_EXISTS
+    );
     // Create and drop without end: every create passes, no record grows.
     let mut r = at9;
     for k in 10..2_100u64 {
@@ -1967,10 +1983,17 @@ fn moved_buckets_are_placed_only_by_the_move() {
         UNIT_NOT_LISTED
     );
     // Malformed lists.
+    let too_many: Vec<String> = (0..=MAX_MOVED_BUCKETS as u64)
+        .map(|i| format!("b_{i:016x}"))
+        .collect();
     for bad in [
         vec![],
         vec![String::new()],
         vec![ids[0].clone(), ids[0].clone()],
+        vec!["vault".to_string()],
+        vec!["b_00000000000000AA".to_string()],
+        vec!["b_00000000000000a".to_string()],
+        too_many,
     ] {
         assert_eq!(
             refused(&owner, place(&moving, bad, 0), Actor::MoveTool),

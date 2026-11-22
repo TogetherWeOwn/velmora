@@ -50,6 +50,11 @@ pub const OPERATOR_DELETE_MIN_MS: i64 = 3_600_000 - 60_000;
 /// The length of a tenant key's check value, in bytes.
 pub const KEY_CHECK_LEN: usize = 8;
 
+/// The most bucket ids one `PlaceMovedBuckets` record names. The owner
+/// moves 22; the bound keeps one record, and the directory row that copies
+/// it, small.
+pub const MAX_MOVED_BUCKETS: usize = 1024;
+
 /// How long tenant 0 stays `moved` before it can be retired: 30 days.
 pub const RETIRE_AFTER_MS: i64 = 30 * 24 * 3_600_000;
 
@@ -653,45 +658,44 @@ pub fn next(
             if !matches!(actor, Actor::Customer | Actor::Operator) {
                 return Err(FORBIDDEN);
             }
-            if h.state() != super::record::TenantState::Active {
-                return Err(WRONG_STATE);
-            }
-            if !h.restoring.is_empty() {
-                return Err(RESTORING);
-            }
             let Some(managed) = tenant.managed() else {
                 return Err(TENANT_ZERO);
             };
             if !valid_name(creator) {
                 return Err(INVALID);
             }
+            if *bucket != crate::records::bucket_id(managed, *grant_seq).as_str() {
+                return Err(NOT_DERIVED);
+            }
+            // The id belongs to this grant seq alone, so a placement of it
+            // under a seq already recorded is this create, read back after
+            // a lost answer: on any unit, under any later head.
+            if h.placements.iter().any(|p| p.bucket == *bucket) {
+                return match *grant_seq <= h.last_grant_seq {
+                    true => Ok(Outcome::Unchanged),
+                    false => Err(BUCKET_EXISTS),
+                };
+            }
+            if h.state() != super::record::TenantState::Active {
+                return Err(WRONG_STATE);
+            }
+            if !h.restoring.is_empty() {
+                return Err(RESTORING);
+            }
             if !h.units.contains(unit) {
                 return Err(UNIT_NOT_LISTED);
+            }
+            // The seq only grows, so a derived id is never placed twice,
+            // also after its bucket was dropped. A create that is not placed
+            // and whose seq is not above the last lost the order.
+            if *grant_seq <= h.last_grant_seq {
+                return Err(GRANT_ORDER);
             }
             let created = BucketCreated {
                 bucket: bucket.clone(),
                 creator: creator.clone(),
                 grant_seq: *grant_seq,
             };
-            // The record this create wrote, read back after a lost answer.
-            if h.bucket_created.as_ref() == Some(&created)
-                && h.placements
-                    .iter()
-                    .any(|p| p.bucket == *bucket && p.unit == *unit)
-            {
-                return Ok(Outcome::Unchanged);
-            }
-            if *bucket != crate::records::bucket_id(managed, *grant_seq).as_str() {
-                return Err(NOT_DERIVED);
-            }
-            // The seq only grows, so a derived id is never placed twice,
-            // also after its bucket was dropped.
-            if *grant_seq <= h.last_grant_seq {
-                return Err(GRANT_ORDER);
-            }
-            if h.placements.iter().any(|p| p.bucket == *bucket) {
-                return Err(BUCKET_EXISTS);
-            }
             let epoch = h.max_move_epoch.checked_add(1).ok_or(INVALID)?;
             door.placements.push(Placement {
                 bucket: bucket.clone(),
@@ -740,12 +744,11 @@ pub fn next(
             if h.state() != super::record::TenantState::Active {
                 return Err(WRONG_STATE);
             }
+            let distinct: std::collections::BTreeSet<&String> = buckets.iter().collect();
             if buckets.is_empty()
-                || !buckets.iter().all(|b| valid_name(b))
-                || buckets
-                    .iter()
-                    .enumerate()
-                    .any(|(i, b)| buckets[..i].contains(b))
+                || buckets.len() > MAX_MOVED_BUCKETS
+                || distinct.len() != buckets.len()
+                || !buckets.iter().all(|b| valid_bucket_id(b))
             {
                 return Err(INVALID);
             }
@@ -1202,6 +1205,16 @@ fn valid_sha256(s: &str) -> bool {
 
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// A minted bucket id: `b_` and 16 lowercase hex digits.
+fn valid_bucket_id(s: &str) -> bool {
+    s.strip_prefix("b_").is_some_and(|hex| {
+        hex.len() == 16
+            && hex
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    })
 }
 
 /// A bucket id, a principal id or a catalogue id: 1 to 128 bytes of

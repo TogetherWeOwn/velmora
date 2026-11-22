@@ -804,3 +804,78 @@ fn moved_buckets_are_placed_against_tenant_zeros_own_head() {
         assert_eq!(refused(w), "no_move_to_tenant");
     });
 }
+
+/// A put whose answer was lost stored its record: the writer reads the
+/// name back and reports the write, instead of failing a change that
+/// landed (a retry of a create would then look like a lost order).
+#[test]
+fn a_put_whose_answer_was_lost_is_read_back() {
+    use velmora_bridge::records::MemRecords;
+    let store = MemRecords::new();
+    let seal = PlainSeal::new();
+    let chain = TenantChain {
+        store: &store,
+        seal: &seal,
+    };
+    block_on(async {
+        let w = chain
+            .write(&t1(), &create(), Actor::TenantCreation, NOW, 0)
+            .await;
+        assert!(matches!(w, Ok(Written::Wrote(_))), "{w:?}");
+        store.lose_answers(1);
+        let w = chain
+            .write(
+                &t1(),
+                &Change::ClaimKeyVersion { version: 1 },
+                Actor::TenantCreation,
+                NOW,
+                0,
+            )
+            .await;
+        let Ok(Written::Wrote(r)) = w else {
+            panic!("{w:?}")
+        };
+        assert_eq!(r.door.seq, 2);
+        assert_eq!(store.names().len(), 2);
+        // A put that stored nothing still fails.
+        store.refuse("m/t/");
+        let w = chain
+            .write(
+                &t1(),
+                &Change::VoidKeyClaim { version: 1 },
+                Actor::TenantCreation,
+                NOW,
+                0,
+            )
+            .await;
+        assert!(matches!(w, Err(ChainError::Store(_))), "{w:?}");
+        assert_eq!(store.names().len(), 2);
+    });
+}
+
+/// The move's place is bound to tenant 0's head as read from its chain:
+/// the plain write refuses it, whatever door it carries.
+#[test]
+fn the_plain_write_refuses_a_place_of_moved_buckets() {
+    let store = HookedRecords::new();
+    let seal = PlainSeal::new();
+    let chain = TenantChain {
+        store: &store,
+        seal: &seal,
+    };
+    block_on(async {
+        active(&chain).await;
+        let head = chain.head(&t1(), 0).await.unwrap().unwrap();
+        let change = Change::PlaceMovedBuckets {
+            buckets: vec!["b_00000000000000aa".into()],
+            unit: 0,
+            zero: Box::new(head.door),
+        };
+        let w = chain.write(&t1(), &change, Actor::MoveTool, NOW, 0).await;
+        let Err(ChainError::Refused(r)) = w else {
+            panic!("{w:?}")
+        };
+        assert_eq!((r.status, r.code), (400, "invalid_change"));
+        assert_eq!(store.keys().len(), 4);
+    });
+}
