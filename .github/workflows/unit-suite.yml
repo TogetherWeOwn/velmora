@@ -1,0 +1,91 @@
+name: unit suite
+
+# The whole velmora-bridge suite on the workerd twin
+# (workers/unit-suite/run-suite.sh): every catalogue call of every test is
+# also asked of a SQLite Durable Object and compared. About 70 minutes, so
+# it is not a pull request check; `ci.yml` runs the unit core part of it
+# (`unit-core`) on the pull requests that touch the unit. Nightly on main,
+# and by hand. A failed night is reported to the alerts Worker as an
+# attention item (severity info: no email).
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: unit-suite
+  cancel-in-progress: false
+
+jobs:
+  suite:
+    name: unit suite (workerd twin)
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust stable
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update --target wasm32-unknown-unknown
+          rustup default stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: false
+      - name: Install pinned worker-build 0.8.7
+        run: cargo install --locked worker-build --version 0.8.7
+      - name: Install the pinned deploy tooling
+        working-directory: workers/s3-bridge
+        run: npm ci --silent
+      - name: Whole suite on the twin
+        env:
+          SUITE_INSTANCES: "4"
+          SUITE_REPORT: ${{ runner.temp }}/unit-suite-summary.txt
+        run: bash workers/unit-suite/run-suite.sh
+      - name: Keep the summary
+        if: ${{ always() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: unit-suite-summary
+          path: ${{ runner.temp }}/unit-suite-summary.txt
+          if-no-files-found: ignore
+          retention-days: 30
+
+  alert:
+    name: unit suite alert
+    needs: [suite]
+    if: ${{ always() && github.ref == 'refs/heads/main' && (needs.suite.result == 'failure' || needs.suite.result == 'cancelled') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    environment: production
+    permissions:
+      contents: read
+    steps:
+      - name: Report the failed night
+        env:
+          ALERTS_INGEST_URL: ${{ vars.ALERTS_INGEST_URL }}
+          ALERTS_INGEST_TOKEN: ${{ secrets.ALERTS_INGEST_TOKEN }}
+          RESULT: ${{ needs.suite.result }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -uo pipefail
+          if [ -z "${ALERTS_INGEST_URL}" ] || [ -z "${ALERTS_INGEST_TOKEN}" ]; then
+            echo "::warning::unit suite alert not sent: ALERTS_INGEST_URL or ALERTS_INGEST_TOKEN is not set in the production environment"
+            exit 0
+          fi
+          body=$(jq -n --arg sha "$GITHUB_SHA" --arg r "$RESULT" --arg run "$RUN_URL" '{
+            source: "ci", key: "unit-suite-failed", severity: "info",
+            title: "Nightly unit suite failed",
+            detail: ("Commit \($sha): the whole suite on the workerd twin ended \($r). The summary is the run'"'"'s unit-suite-summary artifact. Production is unchanged. Run: \($run)")}')
+          if printf 'Authorization: Bearer %s\n' "$ALERTS_INGEST_TOKEN" \
+            | curl -fs --max-time 30 -H @- -H 'Content-Type: application/json' \
+                --data "$body" "${ALERTS_INGEST_URL%/}/v1/alert" >/dev/null 2>&1; then
+            echo "unit suite alert sent"
+          else
+            echo "::warning::unit suite alert could not be delivered"
+          fi
