@@ -13,6 +13,8 @@ CREATE TABLE scrub_copies (
   backbone TEXT NOT NULL,
   stat_at INTEGER NOT NULL,
   full_at INTEGER NOT NULL,
+  stat_phase_at INTEGER NOT NULL,
+  full_phase_at INTEGER NOT NULL,
   stat_loss_at INTEGER,
   full_loss_at INTEGER,
   PRIMARY KEY (extent_id, backbone)
@@ -26,3 +28,6 @@ ALTER TABLE scrub_state ADD COLUMN cadence_backbones TEXT;
 ALTER TABLE scrub_state ADD COLUMN cadence_after TEXT;
 ALTER TABLE scrub_state ADD COLUMN cadence_epoch INTEGER;
 ALTER TABLE scrub_state ADD COLUMN incident_clean_by TEXT;
+ALTER TABLE scrub_state ADD COLUMN incident_body_by TEXT;
+-- Legacy incidents did not distinguish STAT from BODY. Require BODY evidence.
+UPDATE scrub_state SET incident_body_by = last_incident WHERE id = 1;

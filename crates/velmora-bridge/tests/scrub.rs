@@ -215,7 +215,7 @@ impl World {
         c.scrub_free(token, now).await.unwrap();
         c.sql
             .exec(
-                "UPDATE scrub_copies SET stat_at = ?2, full_at = ?3 WHERE extent_id = ?1",
+                "UPDATE scrub_copies SET stat_at = ?2, full_at = ?3, stat_phase_at = ?2, full_phase_at = ?3 WHERE extent_id = ?1",
                 &[
                     SqlValue::Text(o.extent.as_str().to_owned()),
                     SqlValue::Int(now.plus_secs(30 * DAY_SECS).0),
@@ -228,7 +228,7 @@ impl World {
 
     async fn set_clocks(&self, o: &Obj, backbone: &str, stat_at: UnixMs, full_at: UnixMs) {
         self.bridge().catalog.sql.exec(
-            "UPDATE scrub_copies SET stat_at = ?3, full_at = ?4 WHERE extent_id = ?1 AND backbone = ?2",
+            "UPDATE scrub_copies SET stat_at = ?3, full_at = ?4, stat_phase_at = ?3, full_phase_at = ?4 WHERE extent_id = ?1 AND backbone = ?2",
             &[SqlValue::Text(o.extent.as_str().to_owned()), SqlValue::Text(backbone.to_owned()), SqlValue::Int(stat_at.0), SqlValue::Int(full_at.0)],
         ).await.unwrap();
     }
@@ -620,6 +620,70 @@ async fn clean_checks_clear_only_the_observed_backbones_incident() {
     assert_eq!(state.incident_clean_by, [("beta".into(), 7)]);
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn enrollment_preserves_a_legacy_pending_loss_as_full_work() {
+    let w = world().await;
+    let o = w.released_unenrolled("legacy-loss", 12).await;
+    let now = w.bridge().clock.now();
+    w.bridge().catalog.sql.exec(
+        "UPDATE extents SET scrub_result='suspect', last_scrubbed_at=?2, scrub_next_at=?2 WHERE id=?1",
+        &[SqlValue::Text(o.extent.as_str().into()), SqlValue::Int(now.0)],
+    ).await.unwrap();
+    w.servers[1].set_body_gone(true).await;
+    let run = w.scrub().await;
+    assert_eq!(
+        (run.suspect, run.repaired),
+        (1, 0),
+        "retry the legacy loss without assuming its backbone"
+    );
+    assert_eq!(w.clocks(&o, "beta").await.1, now.plus_secs(3600));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_stat_pass_cannot_clear_a_body_incident() {
+    let w = world().await;
+    let mut objects = Vec::new();
+    for i in 0..8 {
+        objects.push(w.released(&format!("body-incident-{i}"), i).await);
+    }
+    for o in &objects {
+        w.full_checks_now(o).await;
+    }
+    w.servers[1].set_body_gone(true).await;
+    assert_eq!(w.scrub().await.incident.as_deref(), Some("beta"));
+
+    let now = w.bridge().clock.now();
+    for o in &objects {
+        let full = w.clocks(o, "beta").await.1;
+        w.set_clocks(o, "beta", now, full).await;
+    }
+    w.scrub().await;
+    assert_eq!(
+        w.state().await.blocked(),
+        ["beta"],
+        "STAT is not BODY recovery evidence"
+    );
+    w.servers[1].set_body_gone(false).await;
+    w.advance_secs(3600);
+    assert_eq!(w.scrub().await.ok, 8);
+    assert!(w.state().await.blocked().is_empty());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_successful_retry_resumes_the_original_phase() {
+    let w = world().await;
+    let o = w.released("phase-retry", 13).await;
+    let now = w.bridge().clock.now();
+    w.set_clocks(&o, "beta", now, now.plus_secs(90 * DAY_SECS))
+        .await;
+    w.hide(1, &o, 0).await;
+    assert_eq!(w.scrub().await.suspect, 1);
+    w.servers[1].unhide(&w.plan(&o).await[0].message_id).await;
+    w.advance_secs(3600);
+    assert_eq!(w.scrub().await.ok, 1);
+    assert_eq!(w.clocks(&o, "beta").await.0, now.plus_secs(30 * DAY_SECS));
+}
+
 /// An article lost on one backbone: seen once it is only `suspect`;
 /// seen again after the confirm interval the extent is re-pinned, the
 /// verify stage posts the article to that backbone again under its
@@ -839,9 +903,17 @@ async fn a_provider_without_a_free_slot_defers_only_its_own_check() {
         .await
         .unwrap();
     assert!(held.is_some());
+    let db = &w.bridge().catalog.sql.inner;
+    db.meter_writes().unwrap();
+    let before = db.writes();
 
     let run = w.scrub().await;
     assert_eq!((run.checked, run.ended), (1, ScrubEnd::Idle));
+    assert_eq!(
+        db.writes().since(&before).table("provider_permits"),
+        2,
+        "one alpha session, no shared pool with beta"
+    );
     assert_eq!(w.result(&healthy).await, "ok");
     assert_eq!(w.result(&o).await, "NULL");
     assert_eq!(w.next_at(&o).await, None);
@@ -1102,8 +1174,8 @@ async fn due_work_is_bounded_even_when_twenty_thousand_copies_are_due() {
     ).await.unwrap();
     c.sql
         .exec(
-            "INSERT INTO scrub_copies(extent_id,backbone,stat_at,full_at) \
-         SELECT id, 'alpha', 0, 100 FROM extents",
+            "INSERT INTO scrub_copies(extent_id,backbone,stat_at,full_at,stat_phase_at,full_phase_at) \
+         SELECT id, 'alpha', 0, 100, 0, 100 FROM extents",
             &[],
         )
         .await

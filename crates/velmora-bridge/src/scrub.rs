@@ -8,8 +8,9 @@
 //! (one run at a time; every write it makes names the lease's token),
 //! checks the extents that are due, the one due longest first, a page at
 //! a time, and ends after `SCRUB_EXTENTS_PER_RUN` extents, after
-//! `SCRUB_RUN_SECS`, at the first provider without a free slot, or when
-//! the breaker trips. The lease lasts as long as a queue invocation can
+//! `SCRUB_RUN_SECS`, when repair reconstruction has no slot, or when
+//! the breaker trips. An unavailable copy check defers only that copy.
+//! The lease lasts as long as a queue invocation can
 //! ([`JOB_MAX_AGE_MS`]), so a run that died frees it by itself.
 //!
 //! # A check
@@ -44,14 +45,15 @@
 //!
 //! # Valves
 //!
-//! - The breaker: a run that finds 8 or more of the extents it checked,
-//!   and more than 12 % of them, lacking articles on one backbone stops
+//! - The breaker: if 8 or more extents and more than 12% of the checks
+//!   of one kind on a backbone find loss, the run stops
 //!   and repairs nothing more there. That is a backbone event (an outage,
 //!   a purge, a provider answering `430` while throttled), not lost
 //!   articles: re-pinning would copy the store back into R2. From then on
 //!   at most one loss a run on that backbone is re-pinned
 //!   ([`BLOCKED_REPINS_PER_RUN`]); the others stay `suspect`, until 8
-//!   checks in a row, across runs, find nothing lacking there.
+//!   checks in a row, across runs, find nothing lacking there. A BODY
+//!   incident requires clean BODY checks.
 //! - At most `SCRUB_REPAIRS_PER_RUN` re-pins per run.
 
 use futures_util::future::{select, Either};
@@ -178,7 +180,7 @@ struct Found {
 #[derive(Default)]
 struct CopyChecks {
     lacking: Vec<String>,
-    observed: Vec<String>,
+    observed: Vec<Observation>,
     busy: bool,
     deferred: bool,
     prior_loss: Option<UnixMs>,
@@ -210,7 +212,9 @@ struct Walk<'w, 's, C: Catalog, N: NntpConnector, T: Clock> {
     breaker: &'w mut Breaker,
     /// The backbones of the breaker trips that stand.
     blocked: Vec<String>,
-    /// The `STAT` sessions, kept from one extent to the next.
+    body_blocked: Vec<String>,
+    deferred_checks: bool,
+    /// The copy-check sessions, kept from one extent to the next.
     stats: &'w mut Vec<ProviderSession<'s, C, N, T>>,
     /// Providers that refused this run's login: not asked again in it.
     refused: Vec<String>,
@@ -220,31 +224,42 @@ struct Walk<'w, 's, C: Catalog, N: NntpConnector, T: Clock> {
     clean: Vec<(String, u64)>,
 }
 
-/// The breaker's tally for one run.
+struct Observation {
+    backbone: String,
+    full: bool,
+    intact: bool,
+}
+
+/// The breaker's counts for one run, by backbone and kind of check.
 #[derive(Default)]
 struct Breaker {
-    /// Per backbone: its observed and lacking extents, respectively.
-    samples: Vec<(String, u32, u32)>,
+    samples: Vec<(String, bool, u32, u32)>,
 }
 
 impl Breaker {
-    fn note(&mut self, observed: &[String], lacking: &[String]) {
-        for name in observed {
-            let bad = u32::from(lacking.contains(name));
-            match self.samples.iter_mut().find(|(b, _, _)| b == name) {
-                Some((_, checked, lost)) => {
+    fn note(&mut self, observed: &[Observation]) {
+        for check in observed {
+            let bad = u32::from(!check.intact);
+            match self
+                .samples
+                .iter_mut()
+                .find(|(b, full, _, _)| *b == check.backbone && *full == check.full)
+            {
+                Some((_, _, checked, lost)) => {
                     *checked += 1;
                     *lost += bad;
                 }
-                None => self.samples.push((name.clone(), 1, bad)),
+                None => self
+                    .samples
+                    .push((check.backbone.clone(), check.full, 1, bad)),
             }
         }
     }
 
-    fn tripped(&self) -> Vec<(String, u32, u32)> {
+    fn tripped(&self) -> Vec<(String, bool, u32, u32)> {
         self.samples
             .iter()
-            .filter(|(_, checked, lost)| breaker_trips(*lost, *checked))
+            .filter(|(_, _, checked, lost)| breaker_trips(*lost, *checked))
             .cloned()
             .collect()
     }
@@ -307,7 +322,12 @@ where
         // An incident clears only on fresh observations of that backbone.
         let blocked = state.blocked();
         let mut clean = state.incident_clean_by;
-        if clean.is_empty() && blocked.len() == 1 && state.incident_clean != 0 {
+        let body_blocked = state.incident_body_by;
+        if clean.is_empty()
+            && blocked.len() == 1
+            && body_blocked.is_empty()
+            && state.incident_clean != 0
+        {
             clean.push((blocked[0].clone(), state.incident_clean));
         }
         let mut run = ScrubRun::default();
@@ -318,6 +338,8 @@ where
             run: &mut run,
             breaker: &mut breaker,
             blocked,
+            body_blocked,
+            deferred_checks: false,
             stats: &mut stats,
             refused: Vec::new(),
             blocked_repins: 0,
@@ -325,15 +347,14 @@ where
         };
         let ended = self.scrub_pages(started, &mut reader, &mut walk).await;
         let mut blocked = core::mem::take(&mut walk.blocked);
+        let mut body_blocked = core::mem::take(&mut walk.body_blocked);
         let mut clean = core::mem::take(&mut walk.clean);
+        let deferred_checks = walk.deferred_checks;
         ProviderSession::close_all(stats).await;
         reader.close().await;
         run.ended = ended;
-        if ended == ScrubEnd::Busy && run.checked == 0 {
-            // A provider had no slot, or a backbone that counts could not
-            // be asked at all (all its providers cooling or refused): the
-            // run could check nothing.
-            crate::trace::alert(|| "scrub-no-progress ended=busy checked=0".to_owned());
+        if run.checked == 0 && (ended == ScrubEnd::Busy || deferred_checks) {
+            crate::trace::alert(|| format!("scrub-no-progress ended={} checked=0", ended.as_str()));
         }
         if run.incident.is_some() {
             // Keep the original conservative rule: a run that tripped
@@ -352,8 +373,10 @@ where
         } else {
             0
         };
+        body_blocked.retain(|name| blocked.contains(name));
         run.blocked = blocked;
         run.incident_clean_by = clean;
+        run.incident_body_by = body_blocked;
         let now = self.clock.now();
         // A run that lost its lease adds nothing: the totals are another
         // run's to add.
@@ -627,14 +650,23 @@ where
             prior_loss,
             confirmed,
         } = self.check_copies(reader, walk, candidate, &plan).await?;
-        walk.breaker.note(&observed, &lacking);
-        for backbone in observed.iter().filter(|name| walk.blocked.contains(name)) {
+        walk.deferred_checks |= busy || deferred;
+        walk.breaker.note(&observed);
+        for backbone in &walk.blocked {
+            let checks = || observed.iter().filter(|check| &check.backbone == backbone);
             if lacking.contains(backbone) {
                 walk.clean.retain(|(name, _)| name != backbone);
-            } else if let Some((_, n)) = walk.clean.iter_mut().find(|(name, _)| name == backbone) {
-                *n += 1;
-            } else {
-                walk.clean.push((backbone.clone(), 1));
+                if checks().any(|check| check.full && !check.intact)
+                    && !walk.body_blocked.contains(backbone)
+                {
+                    walk.body_blocked.push(backbone.clone());
+                }
+            } else if checks().any(|check| check.full || !walk.body_blocked.contains(backbone)) {
+                if let Some((_, n)) = walk.clean.iter_mut().find(|(name, _)| name == backbone) {
+                    *n += 1;
+                } else {
+                    walk.clean.push((backbone.clone(), 1));
+                }
             }
         }
         if lacking.is_empty() && (observed.is_empty() || busy || deferred) {
@@ -673,18 +705,22 @@ where
         let data = &plan[..data_count];
         let tripped = walk.breaker.tripped();
         if !tripped.is_empty() {
-            for (backbone, checked, lacking) in &tripped {
+            for (backbone, full, checked, lacking) in &tripped {
                 crate::trace::alert(|| format!("scrub-incident {backbone} {lacking}/{checked}"));
                 if !walk.blocked.contains(backbone) {
                     walk.blocked.push(backbone.clone());
                 }
+                if *full && !walk.body_blocked.contains(backbone) {
+                    walk.body_blocked.push(backbone.clone());
+                }
             }
-            walk.run.incident = tripped.first().map(|(b, _, _)| b.clone());
-            walk.clean
-                .retain(|(name, _)| !tripped.iter().any(|(b, _, _)| b == name));
+            walk.run.incident = tripped.first().map(|(b, _, _, _)| b.clone());
             // Stored now, under the lease: a run that dies before its end
             // still leaves the next one blocked.
-            let _ = self.catalog.scrub_block(token, &walk.blocked).await;
+            let _ = self
+                .catalog
+                .scrub_block(token, &walk.blocked, &walk.body_blocked)
+                .await;
         }
 
         if confirmed.is_empty() {
@@ -779,12 +815,14 @@ where
             match answer {
                 Ok(Presence::Complete { intact, bytes }) => {
                     walk.run.bytes_read += bytes;
-                    if !out.observed.contains(&check.backbone) {
-                        out.observed.push(check.backbone.clone());
-                    }
+                    out.observed.push(Observation {
+                        backbone: check.backbone.clone(),
+                        full: check.full,
+                        intact,
+                    });
                     if intact {
                         let interval = intervals[usize::from(check.full)];
-                        let next = next_cadence(check.due_at, now, interval);
+                        let next = next_cadence(check.phase_at, now, interval);
                         updates.push((check.clone(), next, None));
                     } else {
                         if !out.lacking.contains(&check.backbone) {
@@ -939,12 +977,32 @@ where
                             None => self.check_session(provider, holder, full.is_some()).await?,
                         };
                         if session.is_none() && held {
-                            // The slot may be one this run keeps for another
-                            // backbone (providers that share a pool): those are
-                            // ended, and the slot asked for once more.
-                            ProviderSession::close_all(core::mem::take(stats)).await;
-                            end_parked().await;
-                            session = self.check_session(provider, holder, full.is_some()).await?;
+                            let blocks = |s: &ProviderSession<'s, C, N, T>| {
+                                s.provider.id == provider.id
+                                    || provider
+                                        .pool
+                                        .as_ref()
+                                        .is_some_and(|pool| s.provider.pool.as_ref() == Some(pool))
+                            };
+                            // Free only slots that could block this provider.
+                            // An unrelated busy backbone must not evict healthy sessions.
+                            let (mut released, keep): (Vec<_>, Vec<_>) =
+                                core::mem::take(stats).into_iter().partition(blocks);
+                            *stats = keep;
+                            {
+                                let mut sessions = parked.borrow_mut();
+                                let (mine, keep): (Vec<_>, Vec<_>) =
+                                    core::mem::take(&mut *sessions)
+                                        .into_iter()
+                                        .partition(blocks);
+                                *sessions = keep;
+                                released.extend(mine);
+                            }
+                            if !released.is_empty() {
+                                ProviderSession::close_all(released).await;
+                                session =
+                                    self.check_session(provider, holder, full.is_some()).await?;
+                            }
                         }
                         let Some(mut session) = session else {
                             break;
@@ -1463,18 +1521,21 @@ mod tests {
     }
 
     #[test]
-    fn the_breaker_counts_each_backbone_apart() {
+    fn the_breaker_counts_each_backbone_and_kind_apart() {
         let mut b = Breaker::default();
-        let a = ["a".to_owned()];
-        let other = ["b".to_owned()];
+        let observation = |name: &str, full, intact| Observation {
+            backbone: name.into(),
+            full,
+            intact,
+        };
         for _ in 0..60 {
-            b.note(&other, &[]);
+            b.note(&[observation("b", true, true), observation("a", false, true)]);
         }
         for _ in 0..7 {
-            b.note(&a, &a);
+            b.note(&[observation("a", true, false)]);
         }
         assert!(b.tripped().is_empty());
-        b.note(&a, &a);
-        assert_eq!(b.tripped(), [("a".into(), 8, 8)]);
+        b.note(&[observation("a", true, false)]);
+        assert_eq!(b.tripped(), [("a".into(), true, 8, 8)]);
     }
 }

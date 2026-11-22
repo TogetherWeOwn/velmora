@@ -1644,6 +1644,7 @@ pub struct ScrubCheck {
     pub backbone: String,
     pub full: bool,
     pub due_at: UnixMs,
+    pub phase_at: UnixMs,
     pub loss_at: Option<UnixMs>,
 }
 
@@ -1667,6 +1668,8 @@ pub struct ScrubRun {
     pub incident_clean: u64,
     /// Independent clean streaks for the blocked backbones.
     pub incident_clean_by: Vec<(String, u64)>,
+    /// Blocked backbones that require successful BODY checks to clear.
+    pub incident_body_by: Vec<String>,
     /// Ciphertext bytes read from Usenet.
     pub bytes_read: u64,
     /// Articles a provider did not serve intact that another one did,
@@ -1736,6 +1739,8 @@ pub struct ScrubState {
     pub incident_clean: u64,
     /// Independent clean streaks for the blocked backbones.
     pub incident_clean_by: Vec<(String, u64)>,
+    /// Blocked backbones that require successful BODY checks to clear.
+    pub incident_body_by: Vec<String>,
 }
 
 impl ScrubState {

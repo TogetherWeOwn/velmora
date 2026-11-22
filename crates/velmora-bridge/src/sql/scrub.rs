@@ -18,11 +18,13 @@ use crate::types::{
 };
 
 const ENROLL_PAGE: i64 = 128;
-const PENDING_SQL: &str =
-    "SELECT id, COALESCE(released_at, created_at) FROM extents INDEXED BY extents_scrub_pending \
+const PENDING_SQL: &str = "SELECT id, COALESCE(released_at, created_at), \
+       CASE WHEN scrub_result IN ('suspect', 'unrecoverable', 'deferred') \
+            THEN COALESCE(scrub_next_at, last_scrubbed_at, created_at) END \
+     FROM extents INDEXED BY extents_scrub_pending \
     WHERE safety_state = 'released' AND scrub_enrolled = 0 AND id > ?1 ORDER BY id LIMIT ?2";
 const BACKFILL_SQL: &str =
-    "SELECT id, COALESCE(released_at, created_at) FROM extents INDEXED BY extents_scrub_enrolled \
+    "SELECT id, COALESCE(released_at, created_at), NULL FROM extents INDEXED BY extents_scrub_enrolled \
     WHERE scrub_enrolled = 1 AND safety_state <> 'deleted' AND id > ?1 ORDER BY id LIMIT ?2";
 
 /// The run that holds the lease is the one with token `?2`.
@@ -58,7 +60,7 @@ pub(super) async fn state<S: Sql>(c: &SqlCatalog<S>) -> Result<ScrubState> {
         .query(
             "SELECT lease_token, lease_until, runs, checked, ok, suspect, repaired, unrecoverable, stalled, \
                incidents, bytes_read, last_run_at, last_unrecoverable_at, last_incident_at, \
-               last_incident, incident_clean, incident_clean_by FROM scrub_state WHERE id = 1",
+               last_incident, incident_clean, incident_clean_by, incident_body_by FROM scrub_state WHERE id = 1",
             &[],
         )
         .await?;
@@ -87,6 +89,9 @@ pub(super) async fn state<S: Sql>(c: &SqlCatalog<S>) -> Result<ScrubState> {
             .opt_text()?
             .and_then(|raw| serde_json::from_str(&raw).ok())
             .unwrap_or_default(),
+        incident_body_by: r.opt_text()?.map_or_else(Vec::new, |raw| {
+            serde_json::from_str(&raw).unwrap_or_else(|_| vec![raw])
+        }),
     })
 }
 
@@ -145,11 +150,11 @@ pub(super) async fn enroll<S: Sql>(
         epoch = now;
         after = previous.map(|_| String::new());
     }
-    let ids = |rows: Vec<crate::ports::Row>| -> Result<Vec<(String, UnixMs)>> {
+    let ids = |rows: Vec<crate::ports::Row>| -> Result<Vec<_>> {
         rows.into_iter()
             .map(|r| {
                 let mut row = Cols::new(r);
-                Ok((row.text()?, row.ms()?))
+                Ok((row.text()?, (row.ms()?, row.opt_ms()?)))
             })
             .collect()
     };
@@ -158,7 +163,7 @@ pub(super) async fn enroll<S: Sql>(
         .query(PENDING_SQL, &[text(""), SqlValue::Int(ENROLL_PAGE)])
         .await?)?;
     let mut advance = changed;
-    let mut work: BTreeMap<String, UnixMs> = pending.iter().cloned().collect();
+    let mut work: BTreeMap<_, _> = pending.iter().cloned().collect();
     if let Some(cursor) = &after {
         let page = ids(c
             .sql
@@ -178,18 +183,23 @@ pub(super) async fn enroll<S: Sql>(
         // Conflict means a prior enrollment already established the clocks.
         let entries: Vec<_> = work
             .iter()
-            .map(|(id, released)| {
+            .map(|(id, (released, legacy_retry))| {
                 let start = epoch.max(*released);
                 let [stat, full] = phase(id, intervals);
-                (id, start.plus_ms(stat).0, start.plus_ms(full).0)
+                let full = start.plus_ms(full);
+                // A legacy result does not identify a backbone. Recheck
+                // every copy in full without marking any loss confirmed.
+                let first_full = legacy_retry.map_or(full, |retry| retry.min(full));
+                (id, start.plus_ms(stat).0, first_full.0, full.0)
             })
             .collect();
         let entries = json(&entries)?;
         for label in &labels {
             stmts.push((
                 concat!(
-                    "INSERT INTO scrub_copies(extent_id, backbone, stat_at, full_at) \
-                 SELECT e.id, ?1, json_extract(j.value, '$[1]'), json_extract(j.value, '$[2]') \
+                    "INSERT INTO scrub_copies(extent_id, backbone, stat_at, full_at, stat_phase_at, full_phase_at) \
+                 SELECT e.id, ?1, json_extract(j.value, '$[1]'), json_extract(j.value, '$[2]'), \
+                    json_extract(j.value, '$[1]'), json_extract(j.value, '$[3]') \
                  FROM json_each(?3) j CROSS JOIN extents e ON e.id = json_extract(j.value, '$[0]') \
                  WHERE e.safety_state <> 'deleted' AND (e.safety_state = 'released' OR e.scrub_enrolled = 1) AND ",
                     run_holds!(),
@@ -224,7 +234,8 @@ pub(super) async fn enroll<S: Sql>(
 
 pub(crate) fn due_sql() -> String {
     format!(
-        "SELECT {EXTENT_COLS}, scrub_result, last_scrubbed_at, stat_at, full_at, stat_loss_at, full_loss_at \
+        "SELECT {EXTENT_COLS}, scrub_result, last_scrubbed_at, stat_at, full_at, \
+           stat_loss_at, full_loss_at, stat_phase_at, full_phase_at \
          FROM scrub_copies s INDEXED BY scrub_copies_due CROSS JOIN extents e ON e.id = s.extent_id \
          WHERE s.backbone = ?1 AND MIN(stat_at, full_at) <= ?2 \
          ORDER BY MIN(stat_at, full_at), s.extent_id LIMIT ?3"
@@ -297,16 +308,22 @@ pub(super) async fn due<S: Sql>(
             let full = UnixMs(extra.num()?);
             let stat_loss = extra.opt_ms()?;
             let full_loss = extra.opt_ms()?;
+            let stat_phase = extra.ms()?;
+            let full_phase = extra.ms()?;
             let (oldest, candidate) = grouped
                 .entry(candidate.extent.id.clone())
                 .or_insert((stat.min(full), candidate));
             *oldest = (*oldest).min(stat.min(full));
-            for (due_at, loss_at, full) in [(stat, stat_loss, false), (full, full_loss, true)] {
+            for (due_at, phase_at, loss_at, full) in [
+                (stat, stat_phase, stat_loss, false),
+                (full, full_phase, full_loss, true),
+            ] {
                 if due_at <= now {
                     candidate.checks.push(ScrubCheck {
                         backbone: backbone.clone(),
                         full,
                         due_at,
+                        phase_at,
                         loss_at,
                     });
                 }
@@ -474,15 +491,14 @@ pub(super) async fn block<S: Sql>(
     c: &SqlCatalog<S>,
     token: u64,
     blocked: &[String],
+    body: &[String],
 ) -> Result<bool> {
-    let labels =
-        serde_json::to_string(blocked).map_err(|_| BridgeError::Invalid("backbone labels"))?;
     let changed = c
         .sql
         .exec(
-            "UPDATE scrub_state SET last_incident = ?2, incident_clean = 0, incident_clean_by = NULL \
-             WHERE id = 1 AND lease_token = ?1",
-            &[uint(token)?, text(&labels)],
+            "UPDATE scrub_state SET last_incident = ?2, incident_clean = 0, incident_clean_by = NULL, \
+               incident_body_by = ?3 WHERE id = 1 AND lease_token = ?1",
+            &[uint(token)?, json(&blocked)?, json(&body)?],
         )
         .await?;
     Ok(changed == 1)
@@ -595,7 +611,7 @@ pub(super) async fn end<S: Sql>(
                bytes_read = bytes_read + ?10, last_run_at = ?1, \
                last_unrecoverable_at = CASE WHEN ?7 > 0 THEN ?1 ELSE last_unrecoverable_at END, \
                last_incident_at = CASE WHEN ?11 IS NOT NULL THEN ?1 ELSE last_incident_at END, \
-               last_incident = ?12, incident_clean = ?13, incident_clean_by = ?14 \
+               last_incident = ?12, incident_clean = ?13, incident_clean_by = ?14, incident_body_by = ?15 \
              WHERE id = 1 AND lease_token = ?2",
             &[
                 ms(now),
@@ -622,6 +638,7 @@ pub(super) async fn end<S: Sql>(
                 } else {
                     json(&run.incident_clean_by)?
                 },
+                if run.incident_body_by.is_empty() { SqlValue::Null } else { json(&run.incident_body_by)? },
             ],
         )
         .await?;

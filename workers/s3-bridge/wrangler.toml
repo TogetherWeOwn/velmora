@@ -245,7 +245,7 @@ PERMITS = "do"
 #     without its parity articles. Not set here: production posts no parity yet.
 #   SCRUB (off): off | on. On: every cron run sends one scrub run to the aux queue while no run holds the scrub's lease.
 #     Released extents have independent STAT and full read-back deadlines on each counting backbone. The first passes
-#     are staggered across each interval after enrollment. New intervals apply to new deadlines, not ones already set.
+#     are staggered across each interval from activation or release, whichever is later. New intervals apply to new deadlines.
 #     A loss confirmed by the same check after SCRUB_CONFIRM_SECS re-pins the extent from verified bytes and sends
 #     it back to verify. Repair-source reads do not complete any scheduled check. See src/scrub.rs.
 #     Not set here.

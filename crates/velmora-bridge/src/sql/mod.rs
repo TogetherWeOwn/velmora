@@ -1049,8 +1049,8 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
     async fn scrub_free(&self, token: u64, now: UnixMs) -> Result<bool> {
         scrub::free(self, token, now).await
     }
-    async fn scrub_block(&self, token: u64, blocked: &[String]) -> Result<bool> {
-        scrub::block(self, token, blocked).await
+    async fn scrub_block(&self, token: u64, blocked: &[String], body: &[String]) -> Result<bool> {
+        scrub::block(self, token, blocked, body).await
     }
     async fn scrub_defer(&self, token: u64, extent: &ExtentId, next_at: UnixMs) -> Result<bool> {
         scrub::defer(self, token, extent, next_at).await

@@ -1655,7 +1655,12 @@ pub trait Catalog {
     }
     /// Stores the backbones under an incident (`scrub_state.last_incident`)
     /// at once, under the lease of `token`.
-    async fn scrub_block(&self, _token: u64, _blocked: &[String]) -> Result<bool> {
+    async fn scrub_block(
+        &self,
+        _token: u64,
+        _blocked: &[String],
+        _body: &[String],
+    ) -> Result<bool> {
         Err(BridgeError::Invalid("this catalogue has no scrub"))
     }
     /// Moves an extent's due time only: a check that could not finish.

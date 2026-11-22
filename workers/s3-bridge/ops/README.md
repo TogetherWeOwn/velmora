@@ -1790,34 +1790,34 @@ connection lost now is opened again.
 
 ## Scrub
 
-The scrub reads released extents back from Usenet alone and repairs what it finds lost (`src/scrub.rs` in the bridge crate, migration 0023). Off by default (`SCRUB`; the settings are listed in `wrangler.toml`).
+The scrub checks released extents on every counting backbone and queues repairs through verify (`src/scrub.rs` in the bridge crate). `SCRUB` is off by default.
 
-**Turning it on.** Set `SCRUB = "on"` in a deploy of its own, after the deploy that applied migration 0023. Nothing else changes: the first check of an extent is due 30 days after its last verification, so a catalogue of recently verified extents starts slowly. A rollback to a Worker from before the switch is safe: that Worker drops the scrub's queue messages as unknown, never reads the new columns, and a re-pinned extent is to it an extent held in verify, which it verifies and releases as any other.
+**Schema rollout.** The production deploy applies additive migration 0024 even when `SCRUB` is off. Its three extent indexes each read the existing extent table once at creation; coordinate the merge and deploy window accordingly. Leaving the switch off prevents scheduled work, not migration work. The additional pending-index entry costs one row write at release (measured with local workerd D1).
 
-**Always, even with `SCRUB=off`:** migration 0023 adds the index `extents_scrub_due`, so every release writes one more row (the extent's entry there): 49 rows per packed extent instead of 48.
+**Turning it on.** After 0024 is applied, enable `SCRUB` separately. Each counting copy has an existence check (`SCRUB_INTERVAL_DAYS`, 30) and a full read-back (`SCRUB_FULL_INTERVAL_DAYS`, 90). The first checks are spread across their intervals from activation or release, whichever is later. Healthy checks return to their phases after retries, and repair-source reads do not complete a copy's checks. Roll back by turning `SCRUB` off; the additive schema can remain, and the normal verify pipeline continues handling extents already re-pinned.
 
-**What it costs.** About 38 ms of CPU per MiB read (cold read, measured) and 2 rows written per extent checked (the result and its index entry). Nothing else for a healthy extent: no R2 operation, no `verifications` row. A repair adds one R2 write of the extent and the verify and release rows of the stage it goes through.
+**What it costs.** STAT does not download bodies. Full checks read the actual bytes on the selected backbone. Healthy checks update copy deadlines and the extent summary; they write no blobs or `verifications` rows. A repair can write a verified safety copy and pays for the existing verify and release stages.
 
 **Watching it.** One row:
 
 ```sql
 SELECT runs, checked, ok, suspect, repaired, unrecoverable, stalled, incidents, bytes_read,
-       last_run_at, last_unrecoverable_at, last_incident_at, last_incident, lease_until
+       last_run_at, last_unrecoverable_at, last_incident_at, last_incident, incident_body_by, lease_until
   FROM scrub_state;
 ```
 
-Each run logs one `scrub: checked=... ended=...` line (`refetched=` counts articles a provider did not serve and another did; a backbone that counts and answers `STAT` for an article it does not serve is a loss there, read in full by verify after the re-pin). An extent no live object holds (deleted or overwritten, waiting for garbage collection) is recorded `skipped` and not read. `ended=busy` means a provider had no free slot (an operator drill holds the drill connections, or verify holds the background slots), or a backbone that counts could not be asked at all (every provider of it cooling or refused): the run stops and the next one goes on; one that checked nothing logs `alert: scrub-no-progress`. A read that broke off is recorded `deferred` and looked at again after `SCRUB_CONFIRM_SECS` (`scrub-deferred` the second time in a row).
+Each run logs one `scrub: checked=... ended=...` line. `refetched=` counts articles recovered from a different provider during repair-source reads. Unreferenced extents are never read. A busy or interrupted copy check defers that copy alone by `SCRUB_CONFIRM_SECS`; other backbones can still make progress. A run that deferred due checks but could complete none logs `alert: scrub-no-progress`, even when it ends idle.
 
 **Alert lines** (`alert:` in the Worker logs; no key, bucket, message-id or host):
 
 | Line | Meaning | What to do |
 |---|---|---|
 | `scrub-repair <extent> source=<usenet\|parity\|cache\|safety> lacking=[<backbones>]` | A loss seen twice; the extent is held again and its outbox row is in verify. | Nothing: verify posts what a backbone lacks and the release follows. |
-| `scrub-incident <backbone> <lost>/<checked>` | At least 8 of a run's extents, and more than 12 % of those it checked, lack articles on one backbone. From then on at most one re-pin a run for losses there, until 8 checks in a row (across runs) find nothing lacking on it. | Look at the provider: an outage, a purge, throttling that answers 430. `last_incident` (a JSON array) names every backbone under an incident until it clears. |
+| `scrub-incident <backbone> <lost>/<checked>` | At least 8 extents and more than 12% of checks of the same kind on this backbone failed. At most one re-pin per run for blocked backbones until 8 clean checks on the affected backbone. A BODY incident requires clean BODY checks. | Inspect provider outages, purges and throttling. `last_incident` names blocked backbones; `incident_body_by` identifies those that need BODY recovery evidence. |
 | `scrub-stalled <extent> ... safety copy <intact\|written again\|missing, not written>` | A re-pinned extent is still held when its repair should have ended (minimum age + every verify wait + one confirm interval). "intact" / "written again": the copy is pinned in R2. "missing, not written": the copy is gone and could not be written back; it is tried again after `SCRUB_CONFIRM_SECS`. | Look at the extent's outbox row: no provider that posts to the backbone that lacks the article, or a backbone that refuses the stored message-id. For "missing, not written", check the SAFETY bucket now: until the copy is back, the extent has one copy fewer. |
 | `scrub-unpostable <extent> lacking=[...]` | A confirmed loss on a backbone no enabled provider posts to. The extent is still re-pinned (unless the run is past its re-pins or under an incident there): verify cannot post it to that backbone, so with two backbones that count it stays pinned (then `scrub-stalled`). | Give that backbone a provider with `post: true`, or wait for a fresh article plan (follow-up). |
 | `scrub-repair-copy-missing <extent>` | Re-pinned, but the safety copy could not be written back (twice). | Nothing at once: the watch at the repair bound writes it from Usenet or the cache. Check the SAFETY bucket if it repeats. |
-| `scrub-no-progress ended=busy checked=0` | A run checked nothing: no free slot, or a backbone that counts cannot be asked. | Look at provider health and drill usage if it lasts more than a few runs. |
+| `scrub-no-progress ended=... checked=0` | Due checks were deferred or repair reconstruction had no slot, and no scheduled check finished. | Inspect provider health, permit usage and pending due work. |
 | `scrub-deferred <extent>` | The read of that extent broke off twice in a row while every backbone answers `STAT`; or, for a loss seen before (`suspect` or `unrecoverable`, kept on record through the break), a look broke off and the last look of it that ended is more than two `SCRUB_CONFIRM_SECS` old (its looks since broke off, or the scrub did not reach it: paused, or runs that ended early). | Look at the providers' health; it is looked at again every `SCRUB_CONFIRM_SECS`. |
 | `scrub-unrecoverable <extent> ...` | Lost on every backbone, and neither cache nor safety copy is intact. Checked again every `SCRUB_CONFIRM_SECS`. | The object's bytes in this extent cannot be read. Restore from another copy if one exists outside velmora. |
 
