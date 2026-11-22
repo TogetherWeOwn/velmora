@@ -447,12 +447,34 @@ fn files(dir: &Path, out: &mut Vec<PathBuf>) {
         .collect();
     entries.sort();
     for p in entries {
-        if p.is_dir() {
+        // Not followed: the caller's checker reads a link as a file and
+        // fails on it, so the port refuses one too.
+        let meta = fs::symlink_metadata(&p).unwrap_or_else(|e| panic!("{}: {e}", p.display()));
+        assert!(
+            !meta.file_type().is_symlink(),
+            "{}: a link under src/ is not covered by this port",
+            p.display()
+        );
+        if meta.is_dir() {
             files(&p, out);
         } else {
             out.push(p);
         }
     }
+}
+
+/// The name the caller's checker sees: `src/` and the path below it as
+/// it is (a name that is not UTF-8 cannot be read there either), and
+/// whether it is Rust source as the checker's `extname` tells it (a file
+/// named `.rs` has no extension).
+fn checked_name(src: &Path, p: &Path) -> (String, bool) {
+    let below = p
+        .strip_prefix(src)
+        .unwrap()
+        .to_str()
+        .unwrap_or_else(|| panic!("{}: a name that is not UTF-8", p.display()));
+    let rust = p.extension().is_some_and(|e| e == "rs");
+    (format!("src/{below}"), rust)
 }
 
 #[test]
@@ -464,15 +486,9 @@ fn the_source_names_no_deny_listed_term() {
     assert!(all.len() >= 10, "src/ looks empty: {all:?}");
     let mut hits = Vec::new();
     for p in &all {
-        let rel = format!(
-            "src/{}",
-            p.strip_prefix(&src)
-                .unwrap()
-                .to_string_lossy()
-                .replace('\\', "/")
-        );
+        let (rel, rust) = checked_name(&src, p);
         assert!(
-            rel.ends_with(".rs"),
+            rust,
             "{rel}: only Rust source is covered by this port; extend it first"
         );
         let text = fs::read_to_string(p).unwrap_or_else(|e| panic!("{rel}: {e}"));
@@ -488,6 +504,20 @@ fn the_source_names_no_deny_listed_term() {
         report.len(),
         report.join("\n")
     );
+}
+
+#[test]
+fn a_name_is_checked_as_the_checker_sees_it() {
+    let src = Path::new("/x/src");
+    assert_eq!(
+        checked_name(src, &src.join("a/b.rs")),
+        ("src/a/b.rs".to_string(), true)
+    );
+    // `.rs` alone has no extension for the checker: prose, not Rust.
+    assert!(!checked_name(src, &src.join(".rs")).1);
+    // A backslash stays, so a Windows user folder is still found.
+    let (name, _) = checked_name(src, &src.join("C:\\Users\\1.rs"));
+    assert!(home_path(&name), "{name}");
 }
 
 /// Positive controls: each class finds a term this repository may name
