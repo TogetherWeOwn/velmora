@@ -869,7 +869,7 @@ where
 }
 
 /// The subject a request names.
-fn subject_of(request: &KeyRequest) -> &str {
+pub(super) fn subject_of(request: &KeyRequest) -> &str {
     match request {
         KeyRequest::Create(s) => &s.door.id,
         KeyRequest::SetStatus { id, .. }

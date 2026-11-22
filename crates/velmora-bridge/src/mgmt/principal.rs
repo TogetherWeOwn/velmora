@@ -381,6 +381,8 @@ pub fn refusal(r: ReserveRefusal) -> Option<(Code, Option<u32>)> {
         // its own once that one is released.
         PrincipalExists => (Code::ServiceUnavailable, Some(RETRY_AFTER_SECS)),
         InternalKeyRefused => (Code::InternalKeyRefused, None),
+        // A grant on a bucket id the unit holds no row for (AM-61).
+        BucketNotFound => (Code::BucketNotFound, None),
         // Two principals for one `owner_ref` (the unit alarms), an id
         // that exists, a bucket's or a grant change's refusal, an ask
         // this Worker built wrong: never the request's.

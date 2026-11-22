@@ -3,14 +3,16 @@
 //!
 //! An error answer is `{"code": "<code>"}` ([`ErrorBody`]) and, where the
 //! table says so, a `Retry-After` header. It carries nothing of the
-//! request. A code that a caller does not know (a newer velmora) is
+//! request. A code that a caller does not know (a newer plane) is
 //! [`KofraMapping::Upstream`]. A new code is a change of this crate, and
 //! the caller maps it in the change that takes that crate version.
 //!
 //! | Code | Status | Retry-After | When | `kofra-api` |
 //! |---|---|---|---|---|
-//! | `bad_request`, `grant_limits_not_served`, `idempotency_key_required` | 400 | — | malformed or not served | `Upstream` |
+//! | `bad_request`, `grant_limits_not_served` | 400 | — | malformed or not served | `Upstream` |
 //! | `jurisdiction_not_served` | 400 | — | a tenant create names a jurisdiction other than `none` (milestone 1 serves `none` only) | `Upstream` |
+//! | `limits_not_served`, `rate_class_not_served` | 400 | — | a tenant create carries `limits` or `rate_class` (milestone 1 serves neither) | `Upstream` |
+//! | `idempotency_key_required` | 400 | — | missing required idempotency key | `Upstream` |
 //! | `invalid_position` | 400 | — | a position that does not parse | `InvalidCursor` |
 //! | `unauthenticated` | 401 | — | token | `Upstream` |
 //! | `insufficient_scope`, `internal_key_refused`, `acting_principal_unknown`, `acting_principal_inactive` | 403 | — | wrong token class; the tenant's internal key; the acting header | `Upstream` |
@@ -18,7 +20,7 @@
 //! | `not_found`, `method_not_allowed` | 404, 405 | — | no such call | `Upstream` |
 //! | `tenant_not_found`, `principal_not_found` | 404 | — | an id the tenant does not have | `Upstream` |
 //! | `bucket_not_found`, `key_not_found` | 404 | — | | same-named variant |
-//! | `bucket_already_exists`, `bucket_not_empty`, `key_limit_reached`, `grant_limit_reached`, `feed_reset`, `deletion_already_requested`, `deletion_not_requested`, `deletion_final` | 409 | — | | same-named variant |
+//! | `bucket_already_exists`, `bucket_not_empty`, `key_limit_reached`, `bucket_limit_reached`, `upload_limit_reached`, `grant_limit_reached`, `feed_reset`, `deletion_already_requested`, `deletion_not_requested`, `deletion_final` | 409 | — | | same-named variant |
 //! | `deletion_replayed` | 409 | — | the key of a deletion that was undone | `IdempotencyKeyReused` |
 //! | `tenant_read_only` | 409 | — | an opening write while suspended `read_only`; never the undo of a deletion | `AccountReadOnly` |
 //! | `tenant_unavailable` | 409 | — | while `blocked`, any write but the hold and deletion changes; any call while `shredding` or `shredded`; an opening write while `deleting`. Never a revoke, a disable, a narrowing or the undo of a deletion | `AccountUnavailable` |
@@ -30,9 +32,15 @@
 //! | `external_ref_retired` | 409 | — | the `external_ref` names a shredded tenant | `TenancyError::Gone` |
 //! | `idempotency_key_in_use` | 409 | yes | the same request is still being applied | `IdempotencyKeyInUse { retry_after }` |
 //! | `idempotency_key_reused` | 422 | — | the key with another request | `IdempotencyKeyReused` |
-//! | `cap_reached` | 429 | yes | a per-tenant or per-token cap | `Busy` |
+//! | `cap_reached` | 429 | yes | a per-tenant or per-token rate cap; never an absolute limit | `Busy` |
 //! | `service_unavailable` | 503 | yes | the `m/rst/` bound, the directory gate, a unit that cannot be reached | `Unavailable` |
 //! | `internal_error` | 500 | — | | `Upstream` |
+//!
+//! **Absolute limits answer `409`**, never `429`: the tenant's buckets
+//! (`bucket_limit_reached`), its keys and app passwords
+//! (`key_limit_reached`) and its open uploads (`upload_limit_reached`).
+//! A retry cannot pass one, so the sign-up port pages on each
+//! ([`TenancyMapping::RetryAndPage`]).
 //!
 //! **Never stored as a final answer.** Every code with a `Retry-After`
 //! ([`Code::retry_after`]) is a "not now": `kofra-api` releases its own
@@ -52,6 +60,8 @@ pub enum Code {
     BadRequest,
     GrantLimitsNotServed,
     JurisdictionNotServed,
+    LimitsNotServed,
+    RateClassNotServed,
     IdempotencyKeyRequired,
     InvalidPosition,
     Unauthenticated,
@@ -69,6 +79,8 @@ pub enum Code {
     BucketAlreadyExists,
     BucketNotEmpty,
     KeyLimitReached,
+    BucketLimitReached,
+    UploadLimitReached,
     GrantLimitReached,
     FeedReset,
     DeletionAlreadyRequested,
@@ -103,6 +115,8 @@ pub enum KofraMapping {
     BucketAlreadyExists,
     BucketNotEmpty,
     KeyLimitReached,
+    BucketLimitReached,
+    UploadLimitReached,
     GrantLimitReached,
     FeedReset,
     DeletionAlreadyRequested,
@@ -139,10 +153,12 @@ pub enum TenancyMapping {
 
 impl Code {
     /// Every code, in the order of the table.
-    pub const ALL: [Code; 39] = [
+    pub const ALL: [Code; 43] = [
         Code::BadRequest,
         Code::GrantLimitsNotServed,
         Code::JurisdictionNotServed,
+        Code::LimitsNotServed,
+        Code::RateClassNotServed,
         Code::IdempotencyKeyRequired,
         Code::InvalidPosition,
         Code::Unauthenticated,
@@ -160,6 +176,8 @@ impl Code {
         Code::BucketAlreadyExists,
         Code::BucketNotEmpty,
         Code::KeyLimitReached,
+        Code::BucketLimitReached,
+        Code::UploadLimitReached,
         Code::GrantLimitReached,
         Code::FeedReset,
         Code::DeletionAlreadyRequested,
@@ -188,6 +206,8 @@ impl Code {
             BadRequest => "bad_request",
             GrantLimitsNotServed => "grant_limits_not_served",
             JurisdictionNotServed => "jurisdiction_not_served",
+            LimitsNotServed => "limits_not_served",
+            RateClassNotServed => "rate_class_not_served",
             IdempotencyKeyRequired => "idempotency_key_required",
             InvalidPosition => "invalid_position",
             Unauthenticated => "unauthenticated",
@@ -205,6 +225,8 @@ impl Code {
             BucketAlreadyExists => "bucket_already_exists",
             BucketNotEmpty => "bucket_not_empty",
             KeyLimitReached => "key_limit_reached",
+            BucketLimitReached => "bucket_limit_reached",
+            UploadLimitReached => "upload_limit_reached",
             GrantLimitReached => "grant_limit_reached",
             FeedReset => "feed_reset",
             DeletionAlreadyRequested => "deletion_already_requested",
@@ -240,6 +262,8 @@ impl Code {
             BadRequest
             | GrantLimitsNotServed
             | JurisdictionNotServed
+            | LimitsNotServed
+            | RateClassNotServed
             | IdempotencyKeyRequired
             | InvalidPosition => 400,
             Unauthenticated => 401,
@@ -254,6 +278,8 @@ impl Code {
             BucketAlreadyExists
             | BucketNotEmpty
             | KeyLimitReached
+            | BucketLimitReached
+            | UploadLimitReached
             | GrantLimitReached
             | FeedReset
             | DeletionAlreadyRequested
@@ -296,6 +322,8 @@ impl Code {
             BadRequest
             | GrantLimitsNotServed
             | JurisdictionNotServed
+            | LimitsNotServed
+            | RateClassNotServed
             | IdempotencyKeyRequired
             | Unauthenticated
             | InsufficientScope
@@ -315,6 +343,8 @@ impl Code {
             BucketAlreadyExists => K::BucketAlreadyExists,
             BucketNotEmpty => K::BucketNotEmpty,
             KeyLimitReached => K::KeyLimitReached,
+            BucketLimitReached => K::BucketLimitReached,
+            UploadLimitReached => K::UploadLimitReached,
             GrantLimitReached => K::GrantLimitReached,
             FeedReset => K::FeedReset,
             DeletionAlreadyRequested => K::DeletionAlreadyRequested,
@@ -355,6 +385,8 @@ impl Code {
             | K::BucketAlreadyExists
             | K::BucketNotEmpty
             | K::KeyLimitReached
+            | K::BucketLimitReached
+            | K::UploadLimitReached
             | K::GrantLimitReached
             | K::FeedReset
             | K::DeletionAlreadyRequested

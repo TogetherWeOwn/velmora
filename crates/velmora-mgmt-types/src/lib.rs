@@ -1,15 +1,20 @@
-//! The wire contract of the velmora management plane, as `kofra-api`
+//! The wire contract of the management plane, as `kofra-api`
 //! calls it.
 //!
 //! This crate is the contract: paths ([`paths`]), request and answer
 //! types ([`wire`]), codes ([`codes`]), positions ([`position`]), query
 //! strings ([`query`]), header names ([`headers`]), id forms ([`ids`]) and
 //! the request fingerprint ([`idem`]), with one example per call
-//! ([`examples`]). A caller depends on it at a pinned velmora commit. A
-//! path and its types change together, in one change of this crate, and
-//! a change that breaks a caller bumps its major version.
+//! ([`examples`]). A caller depends on it at a pinned commit, or keeps a
+//! checked copy of `src/` at one. A path and its types change together,
+//! in one change of this crate, and a change that breaks a caller bumps
+//! its major version.
 //!
-//! **Transport.** A service binding to velmora's management entry point,
+//! **Neutral text.** The source under `src/` names no backend, place or
+//! project, because a caller may copy it into a repository with its own
+//! deny-list; `tests/neutral_text.rs` guards it.
+//!
+//! **Transport.** A service binding to the plane's management entry point,
 //! `Authorization: Bearer <service token>`, JSON bodies (UTF-8,
 //! `Content-Type: application/json`). Unknown body fields are refused
 //! with `400 bad_request`. Times are Unix ms integers, and every integer
@@ -27,7 +32,7 @@
 //! (`data.bucket_id`, `data.bucket`).
 //!
 //! **Who acts.** [`headers::ACTING_OWNER_REF`] names the member; the root
-//! unit resolves it to a principal. Velmora takes grants, never a role:
+//! unit resolves it to a principal. The plane takes grants, never a role:
 //! the caller maps a role to a grant list. A grant asked for with the
 //! header must be held by the acting principal (`403 grant_not_held`).
 //!
@@ -38,7 +43,7 @@
 //! **Lists.** `?after=&limit=` (`limit` 1 to 1,000, default 100) and
 //! `{items, next}`; see [`query`] and [`position`].
 //!
-//! **Rollout.** The caller keeps its stub for every call until velmora
+//! **Rollout.** The caller keeps its stub for every call until the plane
 //! serves all of them on the deployment it binds to, and then switches
 //! reads and writes together. There is no per-call mix.
 

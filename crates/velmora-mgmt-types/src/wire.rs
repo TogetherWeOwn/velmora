@@ -3,7 +3,7 @@
 //! **Requests** refuse unknown fields (`400 bad_request`), and each has a
 //! [`Validate`] check for what serde cannot say: forms, bounds and the
 //! largest integer. [`parse_request`] does both. **Answers** accept
-//! unknown fields, so that velmora can add one without breaking a caller;
+//! unknown fields, so that the plane can add one without breaking a caller;
 //! removing or changing a field is a breaking change of this crate.
 //!
 //! A field written `x | null` in the contract is always present in an
@@ -141,12 +141,16 @@ pub struct Grant {
 // Tenants
 // ---------------------------------------------------------------------------
 
-/// The one jurisdiction milestone 1 serves (AM-58): no Durable Object
+/// The one jurisdiction milestone 1 serves (AM-58): no data-location
 /// jurisdiction. Also what an absent `jurisdiction` means.
 pub const JURISDICTION_NONE: &str = "none";
 
-/// `POST /v1/tenants`. Without `limits` and `rate_class`: the registry's
-/// free allowance and default class. `Idempotency-Key` = the workspace id.
+/// `POST /v1/tenants`. `Idempotency-Key` = the workspace id.
+///
+/// `limits` and `rate_class`: milestone 1 serves neither (AM-76). Absent,
+/// the tenant gets no stored limit and no class; present (and well
+/// formed), the create answers `400 limits_not_served` or
+/// `400 rate_class_not_served`. `kofra-api` sends neither.
 /// A create with an `external_ref` that has a tenant answers `200` with
 /// it (adopted); one whose tenant was shredded answers
 /// `409 external_ref_retired`.
@@ -232,7 +236,7 @@ pub enum TenantState {
     Deleting,
 }
 
-/// What the tenant's keys may do now. Velmora computes it from the
+/// What the tenant's keys may do now. The plane computes it from the
 /// holds; a caller does not derive it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -439,7 +443,7 @@ pub enum KeyStatus {
 
 /// A key, never with its secret. `seq` is the key's newest key-chain seq,
 /// which a grant change names as `if_seq`. `last_used_at_ms` is `null`
-/// until velmora records use.
+/// until the plane records use.
 ///
 /// `GET`, `PATCH` and `DELETE` on `…/keys/{k}` with a principal's id
 /// answer `404 key_not_found` and write nothing; on the tenant's internal
@@ -704,7 +708,7 @@ pub enum DayStatus {
     UnderReview,
 }
 
-/// One day of usage. The list is empty until velmora builds the days.
+/// One day of usage. The list is empty until the plane builds the days.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UsageDay {
     pub day: Day,
@@ -729,7 +733,7 @@ pub struct BucketUsage {
 // Events and pages
 // ---------------------------------------------------------------------------
 
-/// The event types velmora writes today. A caller passes a type it does
+/// The event types the plane writes today. A caller passes a type it does
 /// not know on: the list grows without a breaking change.
 pub const EVENT_TYPES: [&str; 16] = [
     "bucket.created",

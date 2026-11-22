@@ -25,20 +25,37 @@
 //! - [`tenant_zero`]: whether tenant 0 may be served from the D1
 //!   catalogue, from its record and the database's own marker, and the
 //!   route of a request when the directory cannot be read;
+//! - [`keys`]: the directory as a store of the key chain
+//!   ([`keys::DirectoryKeys`], `KeyEnv.directory`), and the target of an
+//!   environment with no directory ([`keys::UnboundDirectory`]);
+//! - [`finish`]: the finisher of a tenant chain (`finish_tenant`), the
+//!   directory as a store of the tenant chain;
+//! - [`events`]: the feed events built from chain records;
+//! - [`sweep`]: the pending sweep's rows over `pending_ops`;
+//! - [`first_open`]: the gate's first open (`FirstOpen`, AM-78);
+//! - [`caps`]: the global backstops per service token (ADR §6.3);
 //! - [`port`]: [`Directory`], the port that finds the tenant of an access
 //!   key, and its one adapter [`SingleTenant`] (every key is tenant 0's).
 //!
 //! Nothing in the Worker calls this module yet. No request is routed by
-//! it and no record is written by it in production.
+//! it and no record is written by it in production. The composition
+//! root wires [`keys::DirectoryKeys`] and [`finish::finish_tenant`] in
+//! (AM-75).
 
+pub mod caps;
 pub mod chain;
+pub mod events;
 pub mod feed;
 pub mod fence;
+pub mod finish;
+pub mod first_open;
 pub mod gate;
+pub mod keys;
 pub mod port;
 pub mod record;
 pub mod seal;
 pub mod store;
+pub mod sweep;
 pub mod tenant_zero;
 pub mod transition;
 

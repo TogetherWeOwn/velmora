@@ -1,7 +1,7 @@
 //! List positions: where a page ends and the next one starts.
 //!
 //! A position is an opaque string to a caller, at most
-//! [`MAX_POSITION_BYTES`] bytes. Velmora builds it from the last row of a
+//! [`MAX_POSITION_BYTES`] bytes. The plane builds it from the last row of a
 //! page, never from a backend's own cursor, so a list keeps no state
 //! between pages. A position whose row is gone continues after it in the
 //! same order: nothing is skipped or repeated. A position that does not

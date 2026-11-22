@@ -366,6 +366,29 @@ impl RusqliteSql {
         }
     }
 
+    /// Rebuilds the workerd twin's object from this database now, if
+    /// there is a twin: the object is emptied (`deleteAll`) and the copy
+    /// written, so its connection's counters restart, as after workerd
+    /// evicts an idle object. Answers the object's `total_changes()`
+    /// after it; `None` without a twin, with one that stopped, or when
+    /// this database's state breaks a foreign key (the twin is then
+    /// rebuilt at the next whole state).
+    pub fn restart_twin(&self) -> Option<i64> {
+        let shadow = self.shadow.as_ref()?;
+        shadow.mark_dirty();
+        shadow
+            .ready(&self.conn.borrow())
+            .then(|| shadow.object_total_changes())
+    }
+
+    /// The workerd twin's own `total_changes()`, if there is a twin.
+    pub fn twin_total_changes(&self) -> Option<i64> {
+        let shadow = self.shadow.as_ref()?;
+        shadow
+            .ready(&self.conn.borrow())
+            .then(|| shadow.object_total_changes())
+    }
+
     /// Direct access for assertions. A change made here bypasses the
     /// port, so a workerd twin is rebuilt from this database before the
     /// next call.
@@ -492,9 +515,11 @@ impl RusqliteSql {
 impl Sql for RusqliteSql {
     async fn query(&self, sql: &str, params: &[SqlValue]) -> Result<Vec<Row>> {
         let twin = self.twin_ready();
+        let before = self.conn.borrow().total_changes();
         let local = self.query_local(sql, params);
+        let changed = self.conn.borrow().total_changes().saturating_sub(before);
         match (twin, &self.shadow) {
-            (true, Some(shadow)) => shadow.query(sql, params, local),
+            (true, Some(shadow)) => shadow.query(sql, params, local, changed),
             _ => local,
         }
     }

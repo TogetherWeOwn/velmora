@@ -41,8 +41,23 @@
 //! - [`Root::records`], [`Root::kek`], [`Root::directory`]: the parts, for
 //!   the adapters that need them directly.
 //!
+//! - [`Root::unit_client`] (with [`UnitPorts`]): L2's unit client of one
+//!   unit over the isolate's renewal state, with the root's key feed
+//!   ([`feed::RootKeyFeed`]) and finisher ([`client::RootFinisher`]);
+//!   [`Root::clients`] and [`Root::router`] for the request router and the
+//!   management plane (AM-71, package L6-5b).
+//!
 //! Every error is a fixed string or the chain's own class: no key byte,
 //! record byte or name of another tenant reaches one.
+
+pub mod client;
+pub mod feed;
+
+pub use client::{
+    ControlSend, RootClients, RootFinisher, RootHeads, RootRouter, RootUnitClient, Shared,
+    UnitPorts,
+};
+pub use feed::{unit_item, RootKeyFeed};
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -62,6 +77,7 @@ use crate::ports::{Clock, Kek, Sql};
 use crate::records::RecordStore;
 use crate::types::{BridgeError, Result, UnixMs};
 use crate::unit::Seqs;
+use crate::unit_lease::client::InFlight;
 use crate::unit_router::{HeadCache, KeyRoutes, KeyTenant, HEAD_MAX_AGE_MS};
 use crate::TenantId;
 
@@ -116,6 +132,9 @@ pub struct RootCache {
     /// Only routes that were read are kept: never "no route", whose key
     /// may get one later, and never a failed read.
     routes: RefCell<HashMap<String, (crate::unit::TenantId, Seqs)>>,
+    /// The unit clients' renewal state (rule 11's spacing and backoff, the
+    /// renewals in flight), by unit, bounded at 4,096 units (AM-71).
+    pub flights: InFlight,
 }
 
 impl RootCache {

@@ -30,8 +30,9 @@
 //! | `presign` | `POST /v1/tenants/{t}/objects/presign` | `objects:presign_read` |
 //!
 //! "Confirmed" is the confirmed service token; every other call takes the
-//! standard one. Velmora checks the scope only: `kofra-api` picks the
-//! class, so a velmora `insufficient_scope` is always a `kofra-api` fault.
+//! standard one. The plane checks the scope only: `kofra-api` picks the
+//! class, so the plane's `insufficient_scope` is always a `kofra-api`
+//! fault.
 
 use crate::ids::{valid_bucket_id, valid_key_id, valid_tenant_id};
 

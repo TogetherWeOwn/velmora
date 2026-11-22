@@ -53,8 +53,7 @@ use crate::ports::{Clock, Kek};
 use crate::records::RecordStore;
 use crate::types::{BridgeError, Result};
 use crate::unit::keys::{
-    Access as UnitAccess, KeptAnswer as UnitKept, KeyEntry, KeyGrant, KeyKind,
-    SubjectStatus as UnitStatus,
+    Access as UnitAccess, KeptAnswer as UnitKept, KeyGrant, SubjectStatus as UnitStatus,
 };
 use crate::unit::reserve::Rid as UnitRid;
 use crate::unit::{CallKind, Seqs, TenantId, UnitAnswer, UnitOp};
@@ -339,72 +338,14 @@ fn unit_status(s: ChainStatus) -> UnitStatus {
     }
 }
 
-fn unit_kind(k: SubjectKind) -> KeyKind {
-    match k {
-        SubjectKind::S3 => KeyKind::S3,
-        SubjectKind::AppPassword => KeyKind::AppPassword,
-        SubjectKind::Principal => KeyKind::Principal,
-        SubjectKind::Internal => KeyKind::Internal,
-    }
-}
-
-/// An entry of the key table in the unit's wire form (`KeyEntry`), as
-/// `ApplyEntry`'s doc states it: `held` when the private part is not
-/// there, and a held entry carries no secret, no `secret_kek_version`, no
-/// `owner_ref` and no grant limit (it has none to give: the limits are in
-/// the private part, and the unit holds it closed). A marker has no wire
-/// form yet (AM-62, L1-4e): [`ERR_MARKER`].
-pub fn unit_entry(entry: &ApplyEntry) -> Result<KeyEntry> {
-    let ApplyEntry::Subject(e) = entry else {
-        return Err(ERR_MARKER);
-    };
-    let held = e.private.is_none();
-    let grants = e
-        .door
-        .grants
-        .iter()
-        .enumerate()
-        .map(|(i, d)| {
-            let p = e.private.as_ref().and_then(|p| p.grants.get(i));
-            KeyGrant {
-                bucket_id: d.bucket_id.clone(),
-                access: unit_access(d.access),
-                expires_at: d.expires_at,
-                prefix: p.and_then(|p| p.prefix.clone()),
-                ip_list: p.map(|p| p.ip_list.clone()).unwrap_or_default(),
-            }
-        })
-        .collect();
-    if let Some(p) = &e.private {
-        // The door and the private part name the same buckets in the
-        // same order (the record's own rule); anything else is damage.
-        let same = p.grants.len() == e.door.grants.len()
-            && p.grants
-                .iter()
-                .zip(&e.door.grants)
-                .all(|(p, d)| p.bucket_id == d.bucket_id);
-        if !same {
-            return Err(BridgeError::Crypto("key entry: grants do not match"));
-        }
-    }
-    Ok(KeyEntry {
-        id: e.door.id.clone(),
-        kind: unit_kind(e.door.kind),
-        status: unit_status(e.door.status),
-        held,
-        made_by: e.door.made_by.clone(),
-        grants,
-        created_at: e.door.created_at,
-        secret_wrapped: e.private.as_ref().and_then(|p| p.secret_wrapped.clone()),
-        secret_kek_version: if held {
-            None
-        } else {
-            e.door.secret_kek_version
-        },
-        owner_ref: e.private.as_ref().and_then(|p| p.owner_ref.clone()),
-        last_seq: e.last_seq,
-        rid: e.rid.map(|r| UnitRid(r.0)),
-    })
+/// An item of the key table in the unit's wire form: the composition
+/// root's mapping (`root::feed::unit_item`, L6-5b), so the request path's
+/// feed and this adapter send the same bytes. A held subject, of either
+/// held form, goes `held` with no secret and no grant limit; an
+/// [`ApplyEntry::Held`] keeps its `owner_ref` (AM-72); a marker is a
+/// marker item.
+pub fn unit_entry(entry: &ApplyEntry) -> Result<crate::unit::keys::ApplyEntry> {
+    crate::root::feed::unit_item(entry)
 }
 
 fn unit_kept(a: &ChainKept) -> UnitKept {
@@ -764,10 +705,123 @@ where
             Ok(ReservedAnswer::Busy | ReservedAnswer::Frozen) => Ok(ChainWrite::Busy),
             Ok(ReservedAnswer::KeyMoved) => Ok(ChainWrite::Refused(Code::KeyMoved)),
             Ok(ReservedAnswer::Refused(r)) => Ok(ChainWrite::Refused(refusal_code(r))),
+            // Answers of `change_reserved` only; a create never gets one.
+            Ok(ReservedAnswer::InHead { .. } | ReservedAnswer::Closes) => {
+                Err(BridgeError::Invalid("mgmt: a create got a change's answer"))
+            }
             Err(e) => Err(e),
         };
         self.put_back(table);
         out
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ControlIntents over the queue and the directory
+// ---------------------------------------------------------------------------
+
+/// [`ControlIntents`] of the Worker: the queue message
+/// `apply_control(tenant, chain, seq)` is the durable part, sent through
+/// the root's [`ControlSend`](crate::root::ControlSend) with its delay; the
+/// directory's `pending_ops` row is its visible copy, noted and cleared
+/// only while `DIRECTORY` is bound (AM-75: with it unbound there is no row
+/// to keep, and the message alone finishes the change).
+pub struct QueueIntents<'a, C, Q, T> {
+    pub control: &'a C,
+    pub directory: Option<crate::directory::store::SqlDirectory<'a, Q>>,
+    pub clock: &'a T,
+}
+
+/// A tenant id that is no managed tenant (tenant 0 has no intents here).
+pub const ERR_INTENT_TENANT: BridgeError =
+    BridgeError::Invalid("mgmt: an intent for a tenant that is not managed");
+
+fn intent_chain(chain: crate::keys::ports::ControlChain) -> crate::jobmsg::IntentChain {
+    match chain {
+        crate::keys::ports::ControlChain::Tenant => crate::jobmsg::IntentChain::Tenant,
+        crate::keys::ports::ControlChain::Keys => crate::jobmsg::IntentChain::Keys,
+    }
+}
+
+fn row_chain(chain: crate::keys::ports::ControlChain) -> crate::directory::store::ChainKind {
+    match chain {
+        crate::keys::ports::ControlChain::Tenant => crate::directory::store::ChainKind::Tenant,
+        crate::keys::ports::ControlChain::Keys => crate::directory::store::ChainKind::Keys,
+    }
+}
+
+impl<C, Q, T> ControlIntents for QueueIntents<'_, C, Q, T>
+where
+    C: crate::root::ControlSend,
+    Q: crate::ports::Sql,
+    T: Clock,
+{
+    async fn send(
+        &self,
+        tenant: &crate::TenantId,
+        chain: crate::keys::ports::ControlChain,
+        seq: u64,
+    ) -> Result<()> {
+        let intent = crate::jobmsg::ControlIntent::new(tenant.as_str(), intent_chain(chain), seq)
+            .ok_or(ERR_INTENT_TENANT)?;
+        self.control.send_control(&intent).await
+    }
+
+    async fn note(
+        &self,
+        tenant: &crate::TenantId,
+        chain: crate::keys::ports::ControlChain,
+        seq: u64,
+        kind: &str,
+    ) -> Result<()> {
+        let Some(dir) = &self.directory else {
+            return Ok(());
+        };
+        dir.add_pending(&crate::directory::store::PendingOp {
+            tenant: crate::directory::record::Tenant::Managed(tenant.clone()),
+            chain: row_chain(chain),
+            seq,
+            kind: kind.to_string(),
+            created_at: self.clock.now(),
+        })
+        .await
+    }
+
+    async fn clear(
+        &self,
+        tenant: &crate::TenantId,
+        chain: crate::keys::ports::ControlChain,
+        seq: u64,
+    ) -> Result<()> {
+        let Some(dir) = &self.directory else {
+            return Ok(());
+        };
+        dir.clear_pending(
+            &crate::directory::record::Tenant::Managed(tenant.clone()),
+            row_chain(chain),
+            seq,
+        )
+        .await
+        .map(|_| ())
+    }
+}
+
+/// The units' side of the tenant finisher before the Worker has one: every
+/// bring-up fails, so a handler's step 3 answers `503` and the intent's
+/// message finishes the change once the adapter exists (L3's
+/// `TenantUnits`, the request path's unit client; not built yet).
+pub struct NoTenantUnits;
+
+impl crate::directory::finish::TenantUnits for NoTenantUnits {
+    async fn bring_up(
+        &self,
+        _tenant: &crate::TenantId,
+        _unit: u32,
+    ) -> Result<crate::directory::finish::UnitHolds> {
+        Err(BridgeError::NotImplemented("TenantUnits"))
+    }
+    async fn mark_born(&self, _tenant: &crate::TenantId, _unit: u32) -> Result<()> {
+        Err(BridgeError::NotImplemented("TenantUnits"))
     }
 }
 
@@ -783,10 +837,13 @@ mod tests {
     }
 
     #[test]
-    fn a_marker_has_no_unit_form_yet() {
+    fn a_marker_is_a_marker_item() {
         assert!(matches!(
-            unit_entry(&ApplyEntry::Marker { seq: 3 }),
-            Err(BridgeError::NotImplemented(_))
+            unit_entry(&ApplyEntry::Marker {
+                seq: 3,
+                marker: crate::keys::record::Marker::KeysFrozen,
+            }),
+            Ok(crate::unit::keys::ApplyEntry::Marker(m)) if m.seq == 3
         ));
     }
 }

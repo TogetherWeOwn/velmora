@@ -429,6 +429,29 @@ impl<S: Sql> SqlDirectory<'_, S> {
             .collect()
     }
 
+    /// The tenant's key chain head as the row holds it; `None`: no row.
+    pub async fn keys_seq_of(&self, tenant: &Tenant) -> Result<Option<u64>> {
+        let _ = tenant;
+        Err(BridgeError::NotImplemented("keys_seq_of"))
+    }
+
+    /// Copies the head of `m/kl/` into `key_locations` (ADR §8.6 step 3),
+    /// one row per location, in one batch: a row takes the set's status
+    /// only from a set at or above the seq it holds. A name never leaves
+    /// the set, so no row is removed.
+    pub async fn put_key_locations(
+        &self,
+        set: &crate::keys::locations::KeyLocations,
+    ) -> Result<()> {
+        let _ = set;
+        Err(BridgeError::NotImplemented("put_key_locations"))
+    }
+
+    /// The `key_locations` rows, by name: name, status, seq.
+    pub async fn key_locations(&self) -> Result<Vec<(String, String, u64)>> {
+        Err(BridgeError::NotImplemented("key_locations"))
+    }
+
     /// Raises the tenant's key chain head; a lower seq changes nothing.
     pub async fn raise_keys_seq(&self, tenant: &Tenant, keys_seq: u64) -> Result<bool> {
         let changed = self
@@ -580,12 +603,17 @@ impl<S: Sql> SqlDirectory<'_, S> {
             .transpose()
     }
 
-    /// Records a pending operation; the same one twice is one row.
+    /// Records a pending operation (an intent's visible copy,
+    /// `ControlIntents::note`). The same one twice is one row, whose time
+    /// and kind the later note sets (AM-75: `DO UPDATE`, never `DO
+    /// NOTHING`): the pending sweep drops only rows noted before its
+    /// cutoff, so a retry that records its seq after the sweep read the
+    /// head keeps its row.
     pub async fn add_pending(&self, op: &PendingOp) -> Result<()> {
         self.sql
             .exec(
                 "INSERT INTO pending_ops (tenant, chain, seq, kind, created_at) VALUES (?1, ?2, ?3, ?4, ?5) \
-                 ON CONFLICT (tenant, chain, seq) DO NOTHING",
+                 ON CONFLICT (tenant, chain, seq) DO UPDATE SET kind = excluded.kind, created_at = excluded.created_at",
                 &[
                     SqlValue::Text(op.tenant.as_str().to_string()),
                     SqlValue::Text(op.chain.as_str().to_string()),

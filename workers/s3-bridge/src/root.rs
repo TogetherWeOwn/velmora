@@ -9,24 +9,34 @@
 //! - `DIRECTORY`: the directory database; unbound, the key routes read
 //!   the route records only.
 //! - the KEK ring of the isolate's bridge, and the Worker's clock.
+//! - for the unit clients (`velmora_bridge::root::UnitPorts`, L6-5b):
+//!   `UNIT`, the unit objects; the bridge's `SAFETY` blob store (the
+//!   lease proof's reads and the stamp objects); the bridge's queue sink,
+//!   which sends the key chain's `apply_control` intents.
 //!
 //! **Off as shipped:** the request path builds a root only with `UNIT`
-//! bound (`units::route_request`), which no production configuration
-//! does. The management entry (`mgmt.rs`) builds one for every request
-//! (no store read: `Root::new` only prunes the isolate's caches); its
-//! handlers, which run only after the token gate, are the readers of
-//! `SAFETY` and the directory's feed. It has no binding in production.
+//! bound (`units::route_request`, the unit consumer), which no production
+//! configuration does. The management entry (`mgmt.rs`) builds one for
+//! every request (no store read: `Root::new` only prunes the isolate's
+//! caches); its handlers, which run only after the token gate, are the
+//! readers of `SAFETY` and the directory's feed. It has no binding in
+//! production.
 
 use std::rc::Rc;
 
 use velmora_bridge::config::KekRing;
 use velmora_bridge::keys::tk::KeyBuckets;
-use velmora_bridge::root::{RootCache, RootPorts};
-use worker::Env;
+use velmora_bridge::root::{RootCache, RootPorts, UnitPorts};
+use velmora_bridge::unit::UnitName;
+use velmora_bridge::{BridgeError, Result};
+use worker::{Env, ObjectNamespace};
 
 use crate::d1::D1Sql;
-use crate::env::WorkerClock;
+use crate::env::{WorkerBridge, WorkerClock};
+use crate::queues::QueueSink;
+use crate::r2::R2Blobs;
 use crate::records::R2Records;
+use crate::units::{UnitStub, UNIT_BINDING};
 
 /// The key buckets, by binding name (`keys::locations::two_in_account`).
 const KEY_BUCKETS: [&str; 2] = ["KEYS_A", "KEYS_B"];
@@ -38,12 +48,19 @@ pub struct WorkerPorts<'a> {
     kek: &'a KekRing,
     directory: Option<D1Sql>,
     clock: WorkerClock,
+    units: Option<ObjectNamespace>,
+    safety: &'a R2Blobs,
+    control: &'a QueueSink,
 }
 
 impl<'a> WorkerPorts<'a> {
-    /// The ports from `env`, with the bridge's KEK ring. Only `SAFETY` is
-    /// required; the reason names the binding, nothing else.
-    pub fn from_env(env: &Env, kek: &'a KekRing) -> Result<WorkerPorts<'a>, String> {
+    /// The ports from `env`, with the bridge's KEK ring, `SAFETY` blob
+    /// store and queue sink. Only `SAFETY` is required; the reason names
+    /// the binding, nothing else.
+    pub fn from_env(
+        env: &Env,
+        bridge: &'a WorkerBridge,
+    ) -> std::result::Result<WorkerPorts<'a>, String> {
         let records = R2Records::new(
             env.bucket("SAFETY")
                 .map_err(|_| "missing binding SAFETY".to_string())?,
@@ -56,9 +73,12 @@ impl<'a> WorkerPorts<'a> {
         Ok(WorkerPorts {
             records,
             keys,
-            kek,
+            kek: &bridge.kek,
             directory,
             clock: WorkerClock,
+            units: env.durable_object(UNIT_BINDING).ok(),
+            safety: &bridge.safety,
+            control: &bridge.jobs,
         })
     }
 }
@@ -97,9 +117,32 @@ impl RootPorts for WorkerPorts<'_> {
     }
 }
 
+impl UnitPorts for WorkerPorts<'_> {
+    type Object = UnitStub;
+    type Safety = R2Blobs;
+    type Control = QueueSink;
+
+    fn object(&self, name: &UnitName) -> Result<UnitStub> {
+        let namespace = self
+            .units
+            .as_ref()
+            .ok_or(BridgeError::NotImplemented("no unit binding"))?;
+        UnitStub::new(namespace, name)
+    }
+
+    fn safety(&self) -> &R2Blobs {
+        self.safety
+    }
+
+    fn control(&self) -> &QueueSink {
+        self.control
+    }
+}
+
 thread_local! {
     /// What this isolate keeps between invocations: tenant keys (each for
-    /// at most the loader's time), tenant heads, key locations.
+    /// at most the loader's time), tenant heads, key locations, key
+    /// routes, and the unit clients' renewal state (AM-71).
     static CACHE: Rc<RootCache> = Rc::default();
 }
 

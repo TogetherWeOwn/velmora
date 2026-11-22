@@ -15,8 +15,10 @@
 #   SUITE_PORT       first loopback port (default 18922)
 #   SUITE_INSTANCES  workerd processes on consecutive ports (default 4);
 #                    each test database lives in one of them
-#   SUITE_PRIMARY    do (default): the tests get the object's answers;
-#                    sqlite: they get SQLite's, the object is compared only
+#   SUITE_PRIMARY    do (default): the tests get the object's answers
+#                    (except `total_changes()` and `last_insert_rowid()`,
+#                    which are SQLite's: testkit_shadow.rs); sqlite: they
+#                    get SQLite's, the object is compared only
 #   SUITE_REPORT     file for the summary (default: stdout only)
 #   SUITE_KEEP       directory to keep the logs in (cargo, twin, workerd)
 #   CARGO_TARGET_DIR and the other cargo variables are passed through.

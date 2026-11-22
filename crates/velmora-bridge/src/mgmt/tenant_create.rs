@@ -24,12 +24,42 @@
 //! 5. The record that sets lifecycle `live` (`Activate`), with the
 //!    `external_ref` in its private part, sealed under the tenant key.
 //!
+//! **Before the first write (AM-78, AM-70).** The body is checked
+//! first: a `jurisdiction` other than `none`, any `limits` and any
+//! `rate_class` answer `400` (AM-58, AM-76). Then the directory gate must
+//! be open (`directory::gate::is_open`; with `DIRECTORY` unbound it counts
+//! as closed) and the head of `m/kl/` must open. Either missing answers
+//! `503` with nothing written, so no managed tenant chain is written
+//! before its environment's first open. A head of `m/kl/` under a KEK
+//! version this Worker does not hold yet is a failure that may pass: no
+//! alert. Damage there alerts.
+//!
+//! **Intents (AM-75).** Every tenant-chain record this call writes (record
+//! 1, the key claim, void and commit, `Activate`) has its intent first:
+//! `apply_control(tenant, tenant chain, seq)` is sent (a failure stops the
+//! call before the record, `503`) and its `pending_ops` row noted (best
+//! effort), for the seq after the head read just before. If another writer
+//! takes that seq, the record lands higher; the intent still finishes it,
+//! because the finisher applies the head, never a row's seq (`pending`).
+//! Each record names the call's `call_key_hash` (AM-79).
+//!
+//! **Step 3: the stores (AM-75).** Before it answers a `live` tenant (the
+//! call that activated it, and every call that adopts one), the call runs
+//! the tenant chain's finisher ([`TenantStores`]): the directory and the
+//! listed units brought to the head, the directory first for an opening.
+//! Until every store holds the head the answer is `503`, and the intent's
+//! message or the next call finishes it.
+//!
+//! **Maintenance.** Under `MAINTENANCE=restore` every mutation answers
+//! `503`, so the call stops after its body checks, before any read.
+//!
 //! **Answers.** `201` with the tenant for the call that wrote `m/tref/`;
 //! `200` with it for a call that adopts through `m/tref/` (it may finish
 //! a create still in flight), a `live` or deleting tenant included;
 //! `409 external_ref_retired` when it names a shredding or shredded
 //! tenant; `400 jurisdiction_not_served` for any jurisdiction but `none`
-//! (absent means `none`, AM-58); `503` for every store that cannot be
+//! (absent means `none`, AM-58), `400 limits_not_served` and
+//! `400 rate_class_not_served` (AM-76); `503` for every store that cannot be
 //! reached, for missing key locations, and while another create holds a
 //! step this one cannot take over; `500` with an alert for a record that
 //! does not verify (`m/tref/`, the born marker, the tenant head), a drawn
@@ -49,10 +79,12 @@ use velmora_mgmt_types::{parse_request, Code};
 
 use crate::crypto::scheme2::{parse_control, seal_control, ControlOwner, ControlSealer, KCV_LEN};
 use crate::directory::chain::{ChainError, Written};
+use crate::directory::gate::is_open;
 use crate::directory::record::{Lifecycle, Tenant, TenantDoor as Door};
 use crate::directory::seal::committed_check;
 use crate::directory::transition::{Actor, Change};
-use crate::keys::locations::read_locations;
+use crate::keys::locations::{is_kek_not_held, read_locations};
+use crate::keys::ports::{ControlChain, ControlIntents};
 use crate::keys::tk::{create_key_version, Claim, Commit, KeyCheck, KeyVersionClaims};
 use crate::mgmt::adapters::RoutedUnit;
 use crate::mgmt::serve::Answer;
@@ -74,10 +106,47 @@ pub const BORN_LABEL: &str = "velmora/ub/v1";
 /// Where the registry places a tenant with no jurisdiction (AM-58: where
 /// today's D1 is placed; est).
 pub const LOCATION_HINT: &str = "enam";
-/// The jurisdiction a tenant record names for `none` (a record's
-/// jurisdiction is a non-empty label); the unit's namespace, and so the
-/// birth token, says `""`.
-pub const RECORD_JURISDICTION_NONE: &str = "none";
+/// The kind of a tenant create's intent rows (`pending_ops.kind`).
+pub const TENANT_CREATE_KIND: &str = "tenant.create";
+
+/// A jurisdiction the plane serves (AM-58, AM-76): milestone 1 serves one,
+/// [`Jurisdiction::None`] (no data-location jurisdiction).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Jurisdiction {
+    None,
+}
+
+/// The two spellings of a [`Jurisdiction`]: a tenant record names a
+/// non-empty label, the unit's namespace (and so the birth token) its own
+/// form.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct JurisdictionForms {
+    pub record: &'static str,
+    pub token: &'static str,
+}
+
+impl Jurisdiction {
+    /// The jurisdiction a create asks for: absent or `none` is
+    /// [`Jurisdiction::None`]; any other value is not served (`None`).
+    pub fn of_request(asked: Option<&str>) -> Option<Jurisdiction> {
+        match asked {
+            None => Some(Jurisdiction::None),
+            Some(j) if j == JURISDICTION_NONE => Some(Jurisdiction::None),
+            Some(_) => None,
+        }
+    }
+
+    /// Both spellings, from this one function: `none` in the record, `""`
+    /// in the birth token. No code compares the two strings.
+    pub fn forms(self) -> JurisdictionForms {
+        match self {
+            Jurisdiction::None => JurisdictionForms {
+                record: "none",
+                token: "",
+            },
+        }
+    }
+}
 /// The root unit.
 const ROOT: u32 = 0;
 /// The bytes of a tenant id after its `t_` prefix, as hex.
@@ -204,12 +273,10 @@ pub async fn put_tref<S: RecordStore, K: crate::ports::Kek, R: FillRandom>(
 }
 
 /// The birth token of `tenant`'s root unit for record 1.
-pub fn birth_token(tenant: &crate::unit::TenantId) -> BirthToken {
+pub fn birth_token(tenant: &crate::unit::TenantId, jurisdiction: Jurisdiction) -> BirthToken {
     BirthToken {
         name: UnitName::new(tenant.clone(), ROOT),
-        // `none`: no Durable Object jurisdiction; the unit's namespace
-        // reports "" (AM-58).
-        jurisdiction: String::new(),
+        jurisdiction: jurisdiction.forms().token.to_string(),
         record_seq: 1,
         schema_version: SCHEMA_VERSION,
         key_scheme: 2,
@@ -262,11 +329,57 @@ pub async fn read_born<S: RecordStore, K: crate::ports::Kek>(
 
 /// [`KeyVersionClaims`] over the tenant chain of the composition root:
 /// `ClaimKeyVersion`, `VoidKeyClaim` and `CommitKeyVersion` records,
-/// written by tenant creation. A commit loads the key it commits first
-/// (the record after it is sealed under it).
-pub struct ChainClaims<'r, 'a, P: RootPorts, R> {
+/// written by tenant creation, each after its intent ([`write_record`]).
+/// A commit loads the key it commits first (the record after it is
+/// sealed under it).
+pub struct ChainClaims<'r, 'a, P: RootPorts, R, I> {
     pub root: &'r Root<'a, P, R>,
+    pub intents: &'r I,
     pub now: UnixMs,
+    /// The management call's `call_key_hash` (AM-79); `None` for a writer
+    /// that is no management call.
+    pub key_hash: Option<&'r str>,
+}
+
+/// Writes one tenant-chain record, its intent first (AM-75): the intent
+/// names the seq after the head read here, its message is sent (a failure
+/// stops the write: nothing is recorded), and its `pending_ops` row is
+/// noted, best effort. A record that lands above that seq (another writer
+/// took it) is still finished by the intent, since the finisher applies
+/// the head. The record names `key_hash` (AM-79).
+pub async fn write_record<P, R, I>(
+    root: &Root<'_, P, R>,
+    intents: &I,
+    tenant: &crate::TenantId,
+    change: &Change,
+    now: UnixMs,
+    key_hash: Option<&str>,
+) -> std::result::Result<Written, ChainError>
+where
+    P: RootPorts,
+    R: FillRandom,
+    I: ControlIntents,
+{
+    let t = managed(tenant);
+    let head = root.heads().head_seq(&t, 0).await?;
+    let next = head.map_or(1, |h| h.saturating_add(1));
+    intents
+        .send(tenant, ControlChain::Tenant, next)
+        .await
+        .map_err(ChainError::Store)?;
+    let _ = intents
+        .note(tenant, ControlChain::Tenant, next, TENANT_CREATE_KIND)
+        .await;
+    root.chain()
+        .write_keyed(
+            &t,
+            change,
+            Actor::TenantCreation,
+            now,
+            head.unwrap_or(0),
+            key_hash,
+        )
+        .await
 }
 
 fn managed(t: &crate::TenantId) -> Tenant {
@@ -280,7 +393,7 @@ fn chain_err(e: ChainError) -> BridgeError {
     }
 }
 
-impl<P: RootPorts, R: FillRandom> ChainClaims<'_, '_, P, R> {
+impl<P: RootPorts, R: FillRandom, I: ControlIntents> ChainClaims<'_, '_, P, R, I> {
     async fn door(&self, t: &crate::TenantId) -> Result<Door> {
         self.root
             .heads()
@@ -306,15 +419,15 @@ impl<P: RootPorts, R: FillRandom> ChainClaims<'_, '_, P, R> {
         t: &crate::TenantId,
         change: Change,
     ) -> std::result::Result<(), ChainError> {
-        self.root
-            .chain()
-            .write(&managed(t), &change, Actor::TenantCreation, self.now, 0)
+        write_record(self.root, self.intents, t, &change, self.now, self.key_hash)
             .await
             .map(|_| ())
     }
 }
 
-impl<P: RootPorts, R: FillRandom> KeyVersionClaims for ChainClaims<'_, '_, P, R> {
+impl<P: RootPorts, R: FillRandom, I: ControlIntents> KeyVersionClaims
+    for ChainClaims<'_, '_, P, R, I>
+{
     async fn claim(&self, t: &crate::TenantId, from: u32) -> Result<Claim> {
         for _ in 0..MAX_STEP_TRIES {
             let door = self.door(t).await?;
@@ -392,16 +505,83 @@ impl<P: RootPorts, R: FillRandom> KeyVersionClaims for ChainClaims<'_, '_, P, R>
 }
 
 // ---------------------------------------------------------------------------
+// Step 3: the stores
+// ---------------------------------------------------------------------------
+
+/// Step 3 of a tenant-chain change (ADR §2.5, AM-75): the tenant chain's
+/// finisher, run by the handler before it answers.
+#[allow(async_fn_in_trait)]
+pub trait TenantStores {
+    /// Brings the directory and every listed unit of `tenant` to its
+    /// chain's head. `Ok(Some(seq))`: every store holds the chain up to
+    /// `seq` (an unbound directory counts as holding it). `Ok(None)` or
+    /// `Err`: not yet; the call answers `503` and the intent's message
+    /// finishes it.
+    async fn finish(&self, tenant: &crate::TenantId) -> Result<Option<u64>>;
+}
+
+/// The seq every store holds after a finisher run: the head it read, when
+/// the chain was read to its end, the directory holds it (or is unbound),
+/// and every listed unit holds it; `None` otherwise (a store waiting or
+/// failed, a unit below the head, no unit, an empty or incomplete head).
+pub fn holds_head(run: &crate::directory::finish::TenantFinish) -> Option<u64> {
+    use crate::directory::finish::StoreStep;
+    let head = run.head.seq;
+    let holds = |s: &StoreStep| match s {
+        StoreStep::Holds(seq) => *seq >= head,
+        StoreStep::Unbound => true,
+        StoreStep::Waiting | StoreStep::Failed => false,
+    };
+    (head > 0
+        && run.head.complete
+        && holds(&run.directory)
+        && !run.units.is_empty()
+        && run.units.iter().all(|(_, s)| holds(s)))
+    .then_some(head)
+}
+
+/// [`TenantStores`] over `directory::finish::finish_tenant`, with the
+/// root's chain and directory and the units' adapter.
+pub struct ChainStores<'r, 'a, P: RootPorts, R, U> {
+    pub root: &'r Root<'a, P, R>,
+    pub units: &'r U,
+}
+
+impl<P, R, U> TenantStores for ChainStores<'_, '_, P, R, U>
+where
+    P: RootPorts,
+    R: FillRandom,
+    U: crate::directory::finish::TenantUnits,
+{
+    async fn finish(&self, tenant: &crate::TenantId) -> Result<Option<u64>> {
+        use crate::directory::finish::finish_tenant;
+        let dir = self.root.directory();
+        let now = self.root.clock().now();
+        let run = finish_tenant(&self.root.chain(), dir.as_ref(), self.units, tenant, now).await?;
+        for page in &run.pages {
+            crate::trace::alert(|| format!("mgmt: tenant create: finisher: {page}"));
+        }
+        Ok(holds_head(&run))
+    }
+}
+
+// ---------------------------------------------------------------------------
 // The call
 // ---------------------------------------------------------------------------
 
 /// The stores of a tenant create.
-pub struct CreatePorts<'r, 'a, P: RootPorts, R, U> {
+pub struct CreatePorts<'r, 'a, P: RootPorts, R, U, I, F> {
     pub ports: &'a P,
     pub root: &'r Root<'a, P, R>,
     /// The router's root-unit calls (`provision`, and a probe of an
     /// unborn unit).
     pub unit: &'r RoutedUnit<'r, U>,
+    /// The tenant chain's intents (AM-75).
+    pub intents: &'r I,
+    /// Step 3: the stores brought to the head before a `live` answer.
+    pub stores: &'r F,
+    /// `MAINTENANCE`: under `restore` the call writes nothing.
+    pub maintenance: crate::config::Maintenance,
 }
 
 /// Why a step stopped the call: its answer.
@@ -441,51 +621,112 @@ fn chain_stop(e: &ChainError) -> Stop {
     }
 }
 
+/// The `call_key_hash` of a call's `Idempotency-Key` (AM-79): SHA-256,
+/// lowercase hex.
+pub fn call_key_hash(idempotency_key: &str) -> String {
+    velmora_mgmt_types::idem::hex(&velmora_mgmt_types::idem::key_hash(idempotency_key))
+}
+
 /// Runs a tenant create. `rng` draws the tenant id and seals the
-/// control records; it is taken for the call.
-pub async fn create_tenant<P, R, U, G>(
-    ports: &CreatePorts<'_, '_, P, R, U>,
+/// control records; it is taken for the call. `idempotency_key` is the
+/// call's (the gate requires one on every write); its hash goes into
+/// every record the call writes (AM-79).
+pub async fn create_tenant<P, R, U, I, F, G>(
+    ports: &CreatePorts<'_, '_, P, R, U, I, F>,
     body: &[u8],
+    idempotency_key: Option<&str>,
     rng: &mut G,
 ) -> Answer
 where
     P: RootPorts,
     R: FillRandom,
     U: UnitRouter,
+    I: ControlIntents,
+    F: TenantStores,
     G: FillRandom,
 {
-    match run(ports, body, rng).await {
+    let key_hash = idempotency_key.map(call_key_hash);
+    match run(ports, body, key_hash.as_deref(), rng).await {
         Ok(answer) | Err(Stop::Answer(answer)) => answer,
     }
 }
 
-async fn run<P, R, U, G>(
-    ports: &CreatePorts<'_, '_, P, R, U>,
+/// The body's checks, before any read (AM-58, AM-76).
+fn checked_body(body: &[u8]) -> std::result::Result<(TenantCreate, Jurisdiction), Stop> {
+    let body: TenantCreate =
+        parse_request(body).map_err(|c| Stop::Answer(Answer::code(c, None)))?;
+    let Some(jurisdiction) = Jurisdiction::of_request(body.jurisdiction.as_deref()) else {
+        return Err(Stop::Answer(Answer::code(
+            Code::JurisdictionNotServed,
+            None,
+        )));
+    };
+    if body.limits.is_some() {
+        return Err(Stop::Answer(Answer::code(Code::LimitsNotServed, None)));
+    }
+    if body.rate_class.is_some() {
+        return Err(Stop::Answer(Answer::code(Code::RateClassNotServed, None)));
+    }
+    Ok((body, jurisdiction))
+}
+
+/// The checks before the first write (AM-78, AM-70): the directory gate
+/// is open, and the head of `m/kl/` opens. Answers the key locations.
+async fn ready_to_write<P: RootPorts, R: FillRandom>(
+    root: &Root<'_, P, R>,
+) -> std::result::Result<crate::keys::locations::KeyLocations, Stop> {
+    let records = root.records();
+    // With `DIRECTORY` unbound the gate counts as closed (AM-78).
+    let Some(dir) = root.directory() else {
+        return Err(unavailable());
+    };
+    match is_open(records, &dir).await {
+        Ok(true) => {}
+        // Closed, or a read that failed: closed (`is_open`).
+        Ok(false) | Err(_) => return Err(unavailable()),
+    }
+    match read_locations(records, root.kek(), 0).await {
+        Ok(Some(l)) => Ok(l),
+        // Fail closed: no tenant before its environment's first `m/kl/`
+        // record (the operator call, AM-70).
+        Ok(None) => Err(unavailable()),
+        // A record of a newer deploy's KEK: a failure that may pass, no
+        // alert (§R7-2 L5-LOW).
+        Err(e) if is_kek_not_held(&e) => Err(unavailable()),
+        // A store that did not answer: nothing is known to be wrong.
+        Err(BridgeError::Blob(_)) => Err(unavailable()),
+        Err(_) => {
+            crate::trace::alert(|| "mgmt: tenant create: key locations unreadable".to_string());
+            Err(unavailable())
+        }
+    }
+}
+
+async fn run<P, R, U, I, F, G>(
+    ports: &CreatePorts<'_, '_, P, R, U, I, F>,
     body: &[u8],
+    key_hash: Option<&str>,
     rng: &mut G,
 ) -> std::result::Result<Answer, Stop>
 where
     P: RootPorts,
     R: FillRandom,
     U: UnitRouter,
+    I: ControlIntents,
+    F: TenantStores,
     G: FillRandom,
 {
-    let body: TenantCreate =
-        parse_request(body).map_err(|c| Stop::Answer(Answer::code(c, None)))?;
-    if body
-        .jurisdiction
-        .as_deref()
-        .is_some_and(|j| j != JURISDICTION_NONE)
-    {
-        return Err(Stop::Answer(Answer::code(
-            Code::JurisdictionNotServed,
-            None,
-        )));
+    let (body, jurisdiction) = checked_body(body)?;
+    // Every mutation answers 503 under restore, before any read.
+    if ports.maintenance == crate::config::Maintenance::Restore {
+        return Err(unavailable());
     }
     let root = ports.root;
     let records = root.records();
     let kek = root.kek();
     let now = root.clock().now();
+    // Nothing is written before both checks pass (AM-78).
+    let locations = ready_to_write(root).await?;
 
     // 1. m/tref/: create-or-adopt.
     let (tenant, ours) = match read_tref(records, kek, &body.external_ref).await {
@@ -535,53 +776,25 @@ where
             Lifecycle::Shredding | Lifecycle::Shredded => {
                 return Ok(Answer::code(Code::ExternalRefRetired, None))
             }
-            Lifecycle::Live => return answer(tenant.as_str(), door, 200),
+            Lifecycle::Live => {
+                return finish(root, ports.stores, &chain_tenant, &tenant, &t, 200).await;
+            }
             Lifecycle::Provisioning => {}
         }
     }
 
-    // 2. Record 1.
+    // 2. Record 1. No limit and no rate class (AM-76: a create that
+    // carries either was refused above).
     if first.is_none() {
-        let limits = body
-            .limits
-            .as_ref()
-            .map(|l| {
-                let mut m = std::collections::BTreeMap::new();
-                let mut put = |k: &str, v: Option<u64>| {
-                    if let Some(v) = v {
-                        m.insert(k.to_string(), v);
-                    }
-                };
-                put(crate::mgmt::tenant::LIMIT_STORAGE, l.storage_bytes);
-                put(crate::mgmt::tenant::LIMIT_UPLOAD_24H, l.upload_24h_bytes);
-                put(
-                    crate::mgmt::tenant::LIMIT_DOWNLOAD,
-                    l.download_allowance_bytes,
-                );
-                put(
-                    crate::mgmt::tenant::LIMIT_ACTIVE_KEYS,
-                    Some(u64::from(l.active_keys)),
-                );
-                m
-            })
-            .unwrap_or_default();
-        let mut rate_json = serde_json::Map::new();
-        if let Some(class) = &body.rate_class {
-            rate_json.insert("class".into(), serde_json::Value::String(class.clone()));
-        }
         let create = Change::Create {
-            jurisdiction: RECORD_JURISDICTION_NONE.to_string(),
+            jurisdiction: jurisdiction.forms().record.to_string(),
             location_hint: Some(LOCATION_HINT.to_string()),
             synthetic: false,
-            limits,
-            rate_json,
+            limits: std::collections::BTreeMap::new(),
+            rate_json: serde_json::Map::new(),
             features_json: serde_json::Map::new(),
         };
-        match root
-            .chain()
-            .write(&t, &create, Actor::TenantCreation, now, 0)
-            .await
-        {
+        match write_record(root, ports.intents, &chain_tenant, &create, now, key_hash).await {
             Ok(_) => {}
             // Another create wrote record 1 first: go on from its head.
             Err(ChainError::Refused(_) | ChainError::Busy) => {}
@@ -590,29 +803,20 @@ where
     }
 
     // 3. The root unit's birth, then its marker.
-    birth(ports, &tenant, &t, rng).await?;
+    birth(ports, &tenant, &t, jurisdiction, rng).await?;
 
     // 4. Tenant key version 1.
     let door = head(root, &t).await?.ok_or_else(unavailable)?;
     if door.lifecycle != Lifecycle::Provisioning {
-        return finish(root, &tenant, &t, status).await;
+        return finish(root, ports.stores, &chain_tenant, &tenant, &t, status).await;
     }
     if door.tk_version == 0 || door.rotating_to.is_some() {
-        let locations = match read_locations(records, kek, 0).await {
-            Ok(Some(l)) => l,
-            // Fail closed: no key is made without its recorded locations
-            // (`m/kl/`, written by the deploy step that makes the key
-            // buckets).
-            Ok(None) => return Err(unavailable()),
-            // Not 500: the locations' reader cannot tell a record of a
-            // newer deploy's KEK from damage (`keys::locations`), so this
-            // is a 503 with an alert.
-            Err(_) => {
-                crate::trace::alert(|| "mgmt: tenant create: key locations unreadable".to_string());
-                return Err(unavailable());
-            }
+        let claims = ChainClaims {
+            root,
+            intents: ports.intents,
+            now,
+            key_hash,
         };
-        let claims = ChainClaims { root, now };
         let created = create_key_version(
             &locations,
             &ports.ports.key_buckets(),
@@ -644,17 +848,13 @@ where
         let activate = Change::Activate {
             external_ref: Some(body.external_ref.clone()),
         };
-        match root
-            .chain()
-            .write(&t, &activate, Actor::TenantCreation, now, 0)
-            .await
-        {
+        match write_record(root, ports.intents, &chain_tenant, &activate, now, key_hash).await {
             Ok(Written::Wrote(_) | Written::Unchanged(_)) => {}
             Err(ChainError::Refused(_) | ChainError::Busy) => {}
             Err(_) => return Err(unavailable()),
         }
     }
-    finish(root, &tenant, &t, status).await
+    finish(root, ports.stores, &chain_tenant, &tenant, &t, status).await
 }
 
 /// The tenant's head, door part only.
@@ -671,13 +871,36 @@ async fn head<P: RootPorts, R: FillRandom>(
 
 /// The head after the last step: `201` with the tenant once it is
 /// `live`; `503` while another create still holds a step.
-async fn finish<P: RootPorts, R: FillRandom>(
+/// The answer after the last step. A `live` head is answered only after
+/// step 3, and only from a head that every store holds: the head is read
+/// after the finisher ran, and a head above the seq the stores hold
+/// (another call wrote a record in between) answers `503`, as does a
+/// finisher that did not finish. `503` while another create still holds a
+/// step.
+async fn finish<P: RootPorts, R: FillRandom, F: TenantStores>(
     root: &Root<'_, P, R>,
+    stores: &F,
+    chain_tenant: &crate::TenantId,
     tenant: &crate::unit::TenantId,
     t: &Tenant,
     status: u16,
 ) -> std::result::Result<Answer, Stop> {
     let door = head(root, t).await?.ok_or_else(unavailable)?;
+    match door.lifecycle {
+        Lifecycle::Live => {}
+        Lifecycle::Shredding | Lifecycle::Shredded => {
+            return Ok(Answer::code(Code::ExternalRefRetired, None))
+        }
+        Lifecycle::Provisioning => return Err(unavailable()),
+    }
+    let held = match stores.finish(chain_tenant).await {
+        Ok(Some(seq)) => seq,
+        Ok(None) | Err(_) => return Err(unavailable()),
+    };
+    let door = head(root, t).await?.ok_or_else(unavailable)?;
+    if door.seq > held {
+        return Err(unavailable());
+    }
     match door.lifecycle {
         Lifecycle::Live => answer(tenant.as_str(), &door, status),
         Lifecycle::Shredding | Lifecycle::Shredded => {
@@ -705,10 +928,11 @@ fn answer(id: &str, door: &Door, status: u16) -> std::result::Result<Answer, Sto
 /// with a birth token any more: `500` with an alert when the unit says
 /// so, `503` with an alert when the router cannot tell it from an
 /// unreachable unit (an operator's case either way).
-async fn birth<P, R, U, G>(
-    ports: &CreatePorts<'_, '_, P, R, U>,
+async fn birth<P, R, U, I, F, G>(
+    ports: &CreatePorts<'_, '_, P, R, U, I, F>,
     tenant: &crate::unit::TenantId,
     t: &Tenant,
+    jurisdiction: Jurisdiction,
     rng: &mut G,
 ) -> std::result::Result<(), Stop>
 where
@@ -727,7 +951,7 @@ where
         Err(e) => return Err(store_stop(&e, "born marker does not verify")),
     }
     let door = head(root, t).await?.ok_or_else(unavailable)?;
-    let token = birth_token(tenant);
+    let token = birth_token(tenant, jurisdiction);
     let sealed = seal_born(kek, &token, rng).map_err(|_| unavailable())?;
     let first_record = door.seq == token.record_seq
         && door.lifecycle == Lifecycle::Provisioning
@@ -793,16 +1017,19 @@ where
 // ---------------------------------------------------------------------------
 
 /// The plane's tenant create over `ports`, with its random source.
-pub struct TenantCreateHandler<'r, 'a, P: RootPorts, R, U, G> {
-    pub ports: CreatePorts<'r, 'a, P, R, U>,
+pub struct TenantCreateHandler<'r, 'a, P: RootPorts, R, U, I, F, G> {
+    pub ports: CreatePorts<'r, 'a, P, R, U, I, F>,
     pub rng: RefCell<Option<G>>,
 }
 
-impl<P, R, U, G> crate::mgmt::serve::Handlers for TenantCreateHandler<'_, '_, P, R, U, G>
+impl<P, R, U, I, F, G> crate::mgmt::serve::Handlers
+    for TenantCreateHandler<'_, '_, P, R, U, I, F, G>
 where
     P: RootPorts,
     R: FillRandom,
     U: UnitRouter,
+    I: ControlIntents,
+    F: TenantStores,
     G: FillRandom,
 {
     fn serves(&self, call: &crate::mgmt::route::Call) -> bool {
@@ -816,8 +1043,70 @@ where
         let Some(mut rng) = self.rng.borrow_mut().take() else {
             return Answer::code(Code::ServiceUnavailable, None);
         };
-        let answer = create_tenant(&self.ports, body, &mut rng).await;
+        let key = ctx.checked.idempotency_key.as_deref();
+        let answer = create_tenant(&self.ports, body, key, &mut rng).await;
         *self.rng.borrow_mut() = Some(rng);
         answer
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::directory::finish::{StoreStep, TenantFinish};
+    use crate::pending::ChainHead;
+
+    fn run(seq: u64, complete: bool, directory: StoreStep, units: Vec<StoreStep>) -> TenantFinish {
+        TenantFinish {
+            head: ChainHead { seq, complete },
+            order: None,
+            directory,
+            units: units
+                .into_iter()
+                .enumerate()
+                .map(|(i, s)| (i as u32, s))
+                .collect(),
+            events: 0,
+            cleared_to: None,
+            pages: vec![],
+        }
+    }
+
+    #[test]
+    fn every_store_must_hold_the_head() {
+        use StoreStep::*;
+        // Held: the directory at the head or unbound, every unit at it.
+        assert_eq!(holds_head(&run(5, true, Holds(5), vec![Holds(5)])), Some(5));
+        assert_eq!(
+            holds_head(&run(5, true, Unbound, vec![Holds(5), Holds(6)])),
+            Some(5)
+        );
+        // Not held.
+        for r in [
+            run(5, true, Waiting, vec![Holds(5)]),
+            run(5, true, Failed, vec![Holds(5)]),
+            run(5, true, Holds(4), vec![Holds(5)]),
+            run(5, true, Holds(5), vec![Holds(4)]),
+            run(5, true, Holds(5), vec![Holds(5), Waiting]),
+            run(5, true, Holds(5), vec![Failed]),
+            run(5, true, Holds(5), vec![]),
+            run(5, false, Holds(5), vec![Holds(5)]),
+            run(0, true, Unbound, vec![Holds(0)]),
+        ] {
+            assert_eq!(holds_head(&r), None, "{r:?}");
+        }
+    }
+
+    #[test]
+    fn one_function_spells_the_jurisdiction() {
+        let f = Jurisdiction::None.forms();
+        assert_eq!((f.record, f.token), ("none", ""));
+        assert_eq!(Jurisdiction::of_request(None), Some(Jurisdiction::None));
+        assert_eq!(
+            Jurisdiction::of_request(Some("none")),
+            Some(Jurisdiction::None)
+        );
+        assert_eq!(Jurisdiction::of_request(Some("eu")), None);
+        assert_eq!(Jurisdiction::of_request(Some("")), None);
     }
 }
