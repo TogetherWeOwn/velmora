@@ -214,13 +214,16 @@ pub trait KeyAdmission {
     ) -> Result<bool>;
     /// Releases the bucket reservation under `idempotency_key` only while
     /// it is bound to `bound`: a call never releases a reservation that
-    /// another call under the same key has bound since.
+    /// another call under the same key has bound since. `Ok(true)`: no
+    /// reservation under the key lives on (released now, or none open).
+    /// `Ok(false)`: it lives on, bound to another seq or turned into the
+    /// bucket; nothing changed.
     async fn release_bound(
         &self,
         tenant: &TenantId,
         idempotency_key: &str,
         bound: Option<u64>,
-    ) -> Result<()>;
+    ) -> Result<bool>;
     /// What the reservations say of the creator grant at `grant_seq`. An
     /// answer of [`Binding::None`] also fences the seq, in the same unit
     /// transaction: from then on [`KeyAdmission::bind_bucket`] of it

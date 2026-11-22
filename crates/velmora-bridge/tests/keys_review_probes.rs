@@ -268,7 +268,7 @@ impl KeyAdmission for FakeAdmission {
         panic!("the finisher does not bind reservations");
     }
 
-    async fn release_bound(&self, _: &TenantId, _: &str, _: Option<u64>) -> Result<()> {
+    async fn release_bound(&self, _: &TenantId, _: &str, _: Option<u64>) -> Result<bool> {
         panic!("the finisher does not release reservations");
     }
 

@@ -273,16 +273,16 @@ impl KeyAdmission for FakeAdmission<'_> {
         t: &TenantId,
         idempotency_key: &str,
         bound: Option<u64>,
-    ) -> Result<()> {
-        let matches = self
-            .bucket_open
-            .borrow()
-            .get(idempotency_key)
-            .is_some_and(|r| r.2 == bound);
-        if matches {
-            self.release(t, idempotency_key).await?;
+    ) -> Result<bool> {
+        let current = self.bucket_open.borrow().get(idempotency_key).map(|r| r.2);
+        match current {
+            Some(b) if b == bound => {
+                self.release(t, idempotency_key).await?;
+                Ok(true)
+            }
+            Some(_) => Ok(false),
+            None => Ok(self.bucket_done.borrow().is_none()),
         }
-        Ok(())
     }
 
     async fn bucket_binding(&self, _t: &TenantId, grant_seq: u64) -> Result<Binding> {
@@ -3855,7 +3855,7 @@ impl KeyAdmission for HookAdm<'_, '_, '_> {
         }
         self.inner.bind_bucket(t, k, expected, seq).await
     }
-    async fn release_bound(&self, t: &TenantId, k: &str, bound: Option<u64>) -> Result<()> {
+    async fn release_bound(&self, t: &TenantId, k: &str, bound: Option<u64>) -> Result<bool> {
         self.inner.release_bound(t, k, bound).await
     }
     async fn bucket_binding(&self, t: &TenantId, seq: u64) -> Result<Binding> {
@@ -4369,7 +4369,7 @@ impl KeyAdmission for ReleasingAdm<'_, '_> {
     async fn bind_bucket(&self, t: &TenantId, k: &str, e: Option<u64>, s: u64) -> Result<bool> {
         self.inner.bind_bucket(t, k, e, s).await
     }
-    async fn release_bound(&self, t: &TenantId, k: &str, b: Option<u64>) -> Result<()> {
+    async fn release_bound(&self, t: &TenantId, k: &str, b: Option<u64>) -> Result<bool> {
         self.inner.release_bound(t, k, b).await
     }
     async fn bucket_binding(&self, t: &TenantId, seq: u64) -> Result<Binding> {
@@ -4510,4 +4510,85 @@ async fn an_inflight_place_and_a_retry_after_a_drop_place_one_bucket() {
         grant_seq: 3,
     };
     assert_eq!((a, b), (three.clone(), three));
+}
+
+/// (Review round 5.) The parked call is refused after the reservation
+/// moved on to a new K that was placed: it answers that bucket, never 409.
+#[tokio::test(flavor = "current_thread")]
+async fn a_refusal_after_a_sibling_took_a_new_k_answers_its_bucket() {
+    let w = World::new();
+    let adm = FakeAdmission::new(&w.root);
+    let mut table_a = seed(&w, &adm).await;
+    let units = w.units();
+    let buckets = FakeBuckets::default();
+    let gate_a = Cell::new(false);
+    let gb_a = GatedBuckets {
+        inner: &buckets,
+        gate: RefCell::new(Some(&gate_a)),
+    };
+    let env = env!(w, &adm, &units);
+    let req = photos("PR0001");
+    let mut rng_a = TestRng(5201);
+    let mut fut_a: BoxFut<'_, _> =
+        Box::pin(env.create_bucket(&gb_a, &mut table_a, "ib", &req, &mut rng_a));
+    assert!(
+        poll_once(&mut fut_a).is_none(),
+        "A parked in bucket_created(3)"
+    );
+    buckets.lose_orders.set(1);
+    let mut table_b = table(&w);
+    let _b = env
+        .create_bucket(&buckets, &mut table_b, "ib", &req, &mut TestRng(5202))
+        .await
+        .unwrap();
+    buckets.refuse.set(Some((409, "restoring")));
+    gate_a.set(true);
+    let a = fut_a.await.unwrap();
+    assert!(matches!(a, BucketAnswer::Created { .. }), "{a:?}");
+    assert_eq!(buckets.placed.borrow().len(), 1);
+    let a_refused = matches!(a, BucketAnswer::StateRefused { .. });
+    assert!(
+        !(a_refused && !buckets.placed.borrow().is_empty()),
+        "R5b: A answered 409 while the create's bucket exists"
+    );
+}
+
+/// (Review round 5.) The parked call is refused after the reservation
+/// moved on to a new K that was placed: it answers that bucket, never 409.
+#[tokio::test(flavor = "current_thread")]
+async fn a_refusal_after_the_finisher_took_a_new_k_answers_its_bucket() {
+    let w = World::new();
+    let adm = FakeAdmission::new(&w.root);
+    let mut table_a = seed(&w, &adm).await;
+    let units = w.units();
+    let buckets = FakeBuckets::default();
+    let gate_a = Cell::new(false);
+    let gb_a = GatedBuckets {
+        inner: &buckets,
+        gate: RefCell::new(Some(&gate_a)),
+    };
+    let env = env!(w, &adm, &units);
+    let req = photos("PR0001");
+    let mut rng_a = TestRng(5301);
+    let mut fut_a: BoxFut<'_, _> =
+        Box::pin(env.create_bucket(&gb_a, &mut table_a, "ib", &req, &mut rng_a));
+    assert!(
+        poll_once(&mut fut_a).is_none(),
+        "A parked in bucket_created(3)"
+    );
+    buckets.lose_orders.set(1);
+    let mut fin = table(&w);
+    let _f = finish_creator_grant(&env, &buckets, &mut fin, 3, &mut TestRng(5302))
+        .await
+        .unwrap();
+    buckets.refuse.set(Some((409, "restoring")));
+    gate_a.set(true);
+    let a = fut_a.await.unwrap();
+    assert!(matches!(a, BucketAnswer::Created { .. }), "{a:?}");
+    assert_eq!(buckets.placed.borrow().len(), 1);
+    let a_refused = matches!(a, BucketAnswer::StateRefused { .. });
+    assert!(
+        !(a_refused && !buckets.placed.borrow().is_empty()),
+        "R5c: the client got 409 while its create's bucket exists"
+    );
 }

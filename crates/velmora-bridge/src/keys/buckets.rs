@@ -35,8 +35,10 @@
 //!   reservation, at most [`MAX_ORDER_TRIES`] times, then answers busy
 //!   (`503` with `Retry-After`).
 //! - **Every other refusal of `bucket_created`** (the tenant state,
-//!   `restoring`, an unlisted unit) revokes the orphan grant, releases the
-//!   reservation, and answers the refusal's `409` with its code.
+//!   `restoring`, an unlisted unit) releases the reservation, then revokes
+//!   the orphan grant, and answers the refusal's `409` with its code. When
+//!   the reservation lives on under a later grant, the answer comes from
+//!   it instead; when the release fails, the call answers `503`.
 //! - **The answer is `Created` only when the bucket is in force**: both
 //!   records are acknowledged by every door store, on a retry answered
 //!   from the reservation too. Anything less is `Unfinished` (`503`), and
@@ -57,8 +59,10 @@
 //!   by the finisher of its intent (the reservation is open and bound).
 //!   Two calls under one key that overlap a refusal: one releases and
 //!   revokes; a sibling whose `bucket_created` lands just after places a
-//!   bucket its creator no longer holds (exclusive same-key calls at the
-//!   root unit would close this; it needs the unit's reservation lease).
+//!   bucket its creator no longer holds, with no reservation row (no name
+//!   hold, no cap slot), and answers `200` for it. The owner repairs it
+//!   with a grant; nothing is lost and nobody gains access. Exclusive
+//!   same-key calls at the root unit (a reservation lease) would close it.
 //!   A retry within the delay after a failed bind counts the unbound grant
 //!   against the 64-grant cap, so a creator at 63 grants may be refused
 //!   `too_many_grants` until the finisher revokes it.
@@ -204,6 +208,8 @@ enum Placing {
     Done(BucketAnswer),
     /// The K order was lost and the orphan revoked: take a new K.
     Again,
+    /// The reservation moved on to another grant: ask it again.
+    Spent,
 }
 
 impl<S, K, T, A, I, U, D, C> KeyEnv<'_, S, K, T, A, I, U, D, C>
@@ -307,20 +313,31 @@ where
                 // or finisher works under it, and only then is the grant
                 // revoked. A release that fails keeps both, and the call
                 // answers 503: a retry or the finisher decides it again.
-                if self
+                let released = self
                     .admission
                     .release_bound(self.tenant, idempotency_key, Some(k))
-                    .await
-                    .is_err()
-                {
-                    return Placing::Done(BucketAnswer::Unfinished { grant_seq: k });
-                }
+                    .await;
                 // When the revoke cannot be written now, the finisher
                 // revokes it: no open reservation is bound to it.
-                let _ = self
-                    .drop_grant(table, request.creator, bucket.as_str(), rng)
-                    .await;
-                Placing::Done(BucketAnswer::StateRefused { status, code })
+                match released {
+                    Err(_) => Placing::Done(BucketAnswer::Unfinished { grant_seq: k }),
+                    Ok(true) => {
+                        let _ = self
+                            .drop_grant(table, request.creator, bucket.as_str(), rng)
+                            .await;
+                        Placing::Done(BucketAnswer::StateRefused { status, code })
+                    }
+                    // The reservation lives on under a later grant (a
+                    // sibling or the finisher took a new K after this one
+                    // lost its order) or became the bucket: this grant is
+                    // an orphan, and the answer comes from the reservation.
+                    Ok(false) => {
+                        let _ = self
+                            .drop_grant(table, request.creator, bucket.as_str(), rng)
+                            .await;
+                        Placing::Spent
+                    }
+                }
             }
             None => {
                 let _ = self.apply_all(table, revoked).await;
@@ -348,7 +365,7 @@ where
     }
 
     /// The create. With `only = Some(seq)` (the finisher), it goes on only
-    /// while the reservation is bound to `seq` with its grant held, or to
+    /// while the reservation is bound to `seq`, or to
     /// a grant this run bound after `seq` lost its order (AM-8); `None`
     /// once it is not, after undoing any reservation it made itself.
     async fn create<B: BucketRecords, R: FillRandom>(
@@ -463,6 +480,11 @@ where
                     .await
                 {
                     Placing::Done(answer) => return Ok(Some(answer)),
+                    Placing::Spent => {
+                        spent.insert(k);
+                        puts += 1;
+                        continue;
+                    }
                     Placing::Again => {
                         spent.insert(k);
                         lost_orders += 1;
@@ -599,6 +621,10 @@ where
                 .await
             {
                 Placing::Done(answer) => return Ok(Some(answer)),
+                Placing::Spent => {
+                    spent.insert(k);
+                    puts += 1;
+                }
                 Placing::Again => {
                     spent.insert(k);
                     lost_orders += 1;
@@ -622,7 +648,7 @@ where
 ///
 /// - The record at `seq` is no creator grant: nothing.
 /// - Its bucket is placed, or its reservation became the bucket: nothing.
-/// - An open reservation is bound to it and its creator holds it: the
+/// - An open reservation is bound to it: the
 ///   create goes on under that reservation, as the Worker's would have,
 ///   only while the reservation stays bound to it (or, after a lost order,
 ///   to the grant this run wrote instead, AM-8). When that does not place
