@@ -891,16 +891,82 @@ fn a_full_unit_refuses_growth_and_lets_deletes_and_smaller_overwrites_go_on() {
     }
     assert_eq!(changes(&u), before);
     ok(ask(&u, seqs, live_generation()));
+}
+
+#[test]
+fn above_the_hard_ceiling_an_open_upload_can_be_aborted_but_an_object_cannot_be_deleted() {
+    let u = born();
+    let seqs = s(3, 0);
+    let bucket = BucketId::new(B1);
+    let upload = UploadId::new("u_00000000000000e1");
+    assert_eq!(ok(ask(&u, seqs, commit(B1))), "applied");
+    ok(ask(
+        &u,
+        seqs,
+        RequestCall::create_upload {
+            u: UploadRow {
+                id: upload.clone(),
+                bucket_id: bucket.clone(),
+                key: "k".into(),
+                content_json: "{}".into(),
+                user_meta_json: "{}".into(),
+                state: UploadState::Open,
+                revision: 0,
+                completed_generation_id: None,
+                complete_digest: None,
+                result_etag: None,
+                initiated_at: NOW,
+            },
+        },
+    ));
+    let u = u.with_size_limits(SizeLimits {
+        bytes: 0,
+        extents: u64::MAX,
+        hard_bytes: 0,
+    });
+    let live = ok(ask(&u, seqs, live_generation()));
+    assert!(!live.is_null());
+    assert_eq!(
+        refused(&ask(
+            &u,
+            seqs,
+            RequestCall::delete_object_before {
+                bucket: bucket.clone(),
+                key: "k".into(),
+                before: GenerationId::new("g_0019a00000000e9e9e9e9e9e9e9"),
+                now: NOW,
+            },
+        )),
+        (Refused::Size(SizeRefusal::DatabaseFull), true)
+    );
+    assert_eq!(ok(ask(&u, seqs, live_generation())), live);
+
+    let read_upload = || -> UploadRow {
+        let body = ok(ask(
+            &u,
+            seqs,
+            RequestCall::upload {
+                bucket: bucket.clone(),
+                key: "k".into(),
+                upload: upload.clone(),
+            },
+        ));
+        serde_json::from_value(body[0].clone()).unwrap()
+    };
+    assert_eq!(read_upload().state, UploadState::Open);
     ok(ask(
         &u,
         seqs,
         RequestCall::abort_upload {
-            bucket: BucketId::new(B1),
+            bucket: bucket.clone(),
             key: "k".into(),
-            upload: UploadId::new("u_00000000000000e1"),
+            upload: upload.clone(),
             now: NOW,
         },
     ));
+    let aborted = read_upload();
+    assert_eq!(aborted.state, UploadState::Aborted);
+    assert_eq!(aborted.revision, 1);
 }
 
 #[test]

@@ -12,6 +12,7 @@
 //! To write the file after a deliberate change: `UNIT_WIRE_GOLDEN=write`.
 
 use serde_json::{json, Value};
+use velmora_bridge::testkit::RusqliteSql;
 use velmora_bridge::unit::buckets::{BucketChange, BucketRefusal};
 use velmora_bridge::unit::call::{Closed, HoldMode};
 use velmora_bridge::unit::export::{ExportMode, ExportRefusal, ExportTable, KeyTable};
@@ -28,6 +29,7 @@ use velmora_bridge::unit::keys::{
 use velmora_bridge::unit::lift::{
     AckClass, ClassProof, FindingList, GateRefusal, GateSummary, LiftProof, ReplayId, ReportKind,
 };
+use velmora_bridge::unit::plane::{BucketItem, KeyItem, KeysAfter, ListedKind, Page, Reach};
 use velmora_bridge::unit::recount::{RecountCall, RecountRefusal};
 use velmora_bridge::unit::request::{
     PresignRefusal, Presigned, Published, RecordWire, RequestCall, RequestRefusal,
@@ -39,7 +41,7 @@ use velmora_bridge::unit::restore::{Bookmark, RestoreRefusal, RestoreTarget};
 use velmora_bridge::unit::size::SizeRefusal;
 use velmora_bridge::unit::{
     BirthKind, BirthToken, CallKind, ProvisionRefusal, Reader, Refused, Seqs, SyncHead, TenantId,
-    TenantState, UnitAnswer, UnitCall, UnitName, UnitOp,
+    TenantState, Unit, UnitAnswer, UnitCall, UnitName, UnitOp,
 };
 use velmora_bridge::{
     BucketId, CommitGeneration, CompleteUpload, CopyGeneration, ExtentId, ExtentPlacement,
@@ -150,6 +152,13 @@ fn request_kind(c: &RequestCall) -> &'static str {
         | RequestCall::usage_recounts {}
         | RequestCall::hot_stats {}
         | RequestCall::hot_seq { .. }
+        | RequestCall::bucket_names { .. }
+        | RequestCall::buckets_page { .. }
+        | RequestCall::buckets_named { .. }
+        | RequestCall::bucket_by_id { .. }
+        | RequestCall::keys_page { .. }
+        | RequestCall::key_by_id { .. }
+        | RequestCall::reach {}
         | RequestCall::commit_generation { .. }
         | RequestCall::commit_sliced { .. }
         | RequestCall::copy_generation { .. }
@@ -467,6 +476,7 @@ fn ops() -> Vec<UnitOp> {
         },
         UnitOp::Release {
             rid: Rid([0x44; 16]),
+            asks: 1,
         },
         UnitOp::BindBucket {
             rid: Rid([0x47; 16]),
@@ -548,40 +558,47 @@ macro_rules! every {
     }};
 }
 
-/// `ImportProgress`'s answer body as a real unit gives it (AM-47,
-/// AM-67): before any import, and after a lift (`lifted_at` set). The
-/// L3 move tool and the restore tool read `lifted_at` from it.
-/// `schema_tables` is left out: it lists the unit's tables, so every
-/// migration changes it.
-fn import_progress_bodies() -> Value {
-    use velmora_bridge::testkit::RusqliteSql;
-    use velmora_bridge::unit::Unit;
-    let now = UnixMs(1_795_000_000_000);
+const NOW: UnixMs = UnixMs(1_795_000_000_000);
+
+fn worker_call(op: UnitOp, seqs: Option<Seqs>) -> UnitCall {
+    UnitCall {
+        name: name(),
+        kind: CallKind::Worker,
+        seqs,
+        authenticated: true,
+        listed: true,
+        op,
+    }
+}
+
+fn born_unit() -> Unit<RusqliteSql> {
     let u = Unit::new(RusqliteSql::open_in_memory().unwrap(), name(), "");
     let mut token = token();
     token.jurisdiction = String::new();
     token.schema_version = velmora_bridge::unit::schema::SCHEMA_VERSION;
     token.kind = BirthKind::Birth;
-    let call = |op, s: Option<Seqs>| UnitCall {
-        name: name(),
-        kind: CallKind::Worker,
-        seqs: s,
-        authenticated: true,
-        listed: true,
-        op,
-    };
     let born = u.handle(
-        &call(
+        &worker_call(
             UnitOp::Provision {
                 token,
                 sealed: b"sealed".to_vec(),
             },
             Some(seqs()),
         ),
-        now,
+        NOW,
     );
     assert!(matches!(born, UnitAnswer::Ok { .. }), "{born:?}");
-    let body = || match u.handle(&call(UnitOp::ImportProgress {}, None), now) {
+    u
+}
+
+/// `ImportProgress`'s answer body as a real unit gives it (AM-47,
+/// AM-67): before any import, and after a lift (`lifted_at` set). The
+/// L3 move tool and the restore tool read `lifted_at` from it.
+/// `schema_tables` is left out: it lists the unit's tables, so every
+/// migration changes it.
+fn import_progress_bodies() -> Value {
+    let u = born_unit();
+    let body = || match u.handle(&worker_call(UnitOp::ImportProgress {}, None), NOW) {
         UnitAnswer::Ok { mut body, .. } => {
             body.as_object_mut().unwrap().remove("schema_tables");
             body
@@ -594,11 +611,76 @@ fn import_progress_bodies() -> Value {
             c.execute(
                 "INSERT INTO unit_import_move(id, t0_seq, since_seq, final, move_ordinal, \
                    move_lifted, lifted_at) VALUES (1, 11, 7, 1, 1, 1, ?1)",
-                [now.0],
+                [NOW.0],
             )
         })
         .unwrap();
     json!({ "never_bound": before, "lifted": body() })
+}
+
+/// Pin the real apply answer rather than building its JSON in the test.
+fn apply_keys_body() -> Value {
+    let u = born_unit();
+    let principal = |last_seq, owner: &str| {
+        KeyEntry {
+            id: "p_1".into(),
+            kind: KeyKind::Principal,
+            status: SubjectStatus::Active,
+            held: false,
+            made_by: None,
+            grants: vec![],
+            created_at: 5,
+            secret_wrapped: None,
+            secret_kek_version: None,
+            owner_ref: Some(owner.into()),
+            last_seq,
+            rid: None,
+        }
+        .into()
+    };
+    match u.handle(
+        &worker_call(
+            UnitOp::ApplyKeys {
+                from_seq: 0,
+                entries: vec![principal(1, "m_1"), principal(2, "m_2")],
+                answers: vec![],
+            },
+            None,
+        ),
+        NOW,
+    ) {
+        UnitAnswer::Ok { body, .. } => body,
+        other => panic!("{other:?}"),
+    }
+}
+
+fn plane_bodies() -> Value {
+    let bucket = BucketItem {
+        id: bucket_id().as_str().into(),
+        name: "alpha".into(),
+        created_at: 5,
+        stored_bytes: None,
+        object_count: None,
+    };
+    let key = KeyItem {
+        id: "AKGOLDEN000000000001".into(),
+        kind: KeyKind::S3,
+        status: SubjectStatus::Active,
+        held: false,
+        made_by: Some("p_1".into()),
+        grants: vec![],
+        created_at: 7,
+        last_seq: 3,
+    };
+    json!({
+        "bucket_names": vec![Some("alpha"), None],
+        "buckets_page": Page { items: vec![bucket.clone()], more: true },
+        "buckets_named": vec![Some(bucket.clone()), None],
+        "bucket_by_id": bucket,
+        "keys_page": Page { items: vec![key.clone()], more: false },
+        "key_by_id": key,
+        "reach": Reach { buckets: 1, objects: None, stored_bytes: None, keys: 1 },
+    })
 }
 
 fn nested() -> Value {
@@ -635,7 +717,7 @@ fn nested() -> Value {
             LeaseUnknown, TooSoon, Moved, Malformed, NoPointInTime, BeforeMoveLift, MoveNotLifted,
             BeforeBirth),
         "recount_refusal": every!(RecountRefusal: NotRestoring, ImportNotSealed, MoveNotBound),
-        "reserve_refusal": every!(ReserveRefusal: CapReached, GrantNotHeld,
+        "reserve_refusal": every!(ReserveRefusal: CapReached, LimitReached, GrantNotHeld,
             GrantLimitsNotServed, TooManyGrants, ActingPrincipalUnknown,
             ActingPrincipalInactive, ActingPrincipalHeld, OwnerRefAmbiguous,
             BucketAlreadyExists, PrincipalExists, Conflict, InternalKeyRefused, NotFound, BucketNotFound, RidTaken,
@@ -669,7 +751,8 @@ fn nested() -> Value {
         "reservation_bodies": reservation_bodies(),
         "request_refusal": every!(RequestRefusal: OutOfBounds),
         "presign_refusal": every!(PresignRefusal: NotInternal, KeyInactive, Malformed, PrincipalUnknown,
-            PrincipalInactive, PrincipalHeld, NoSuchBucket, NoGrant),
+            PrincipalInactive, PrincipalHeld, OwnerRefAmbiguous, NoSuchBucket, NoGrant),
+        "listed_kind": every!(ListedKind: S3, AppPassword),
         "published": every!(Published: Applied, Refused, Fenced),
         "precondition": serde_json::to_value(vec![
             Precondition::Absent,
@@ -880,6 +963,31 @@ fn requests() -> Vec<RequestCall> {
         RequestCall::usage_recounts {},
         RequestCall::hot_stats {},
         RequestCall::hot_seq { extent: x() },
+        RequestCall::bucket_names {
+            ids: vec![b().as_str().into()],
+        },
+        RequestCall::buckets_page {
+            after: Some("alpha".into()),
+            limit: 25,
+        },
+        RequestCall::buckets_named {
+            names: vec!["alpha".into(), "beta".into()],
+        },
+        RequestCall::bucket_by_id {
+            id: b().as_str().into(),
+        },
+        RequestCall::keys_page {
+            kind: ListedKind::S3,
+            after: Some(KeysAfter {
+                created_at: 7,
+                id: "AKGOLDEN000000000001".into(),
+            }),
+            limit: 25,
+        },
+        RequestCall::key_by_id {
+            id: "AKGOLDEN000000000001".into(),
+        },
+        RequestCall::reach {},
         RequestCall::commit_generation {
             c: CommitGeneration {
                 generation: generation_row(),
@@ -1058,6 +1166,7 @@ fn reservation_bodies() -> Value {
     let admits = vec![
         Admit::Admitted {
             rid: Rid([0x44; 16]),
+            asks: 1,
             keys_seq: 3,
             again: false,
             scope: Some("p_1".into()),
@@ -1202,6 +1311,8 @@ fn document() -> Value {
         "answers": answers,
         "nested": nested(),
         "import_progress": import_progress_bodies(),
+        "apply_keys": apply_keys_body(),
+        "plane_bodies": plane_bodies(),
         "requests": requests,
     })
 }
@@ -1211,7 +1322,7 @@ fn every_variant_has_a_sample() {
     let ops: std::collections::BTreeSet<_> = ops().iter().map(op_kind).collect();
     assert_eq!(ops.len(), 29, "{ops:?}");
     let requests: std::collections::BTreeSet<_> = requests().iter().map(request_kind).collect();
-    assert_eq!(requests.len(), 51, "{requests:?}");
+    assert_eq!(requests.len(), 58, "{requests:?}");
     let readers: std::collections::BTreeSet<_> = ops_readers().into_iter().collect();
     assert_eq!(readers.len(), 2, "both readers have a sample");
     // The variants that carry data, each with a sample (exhaustive).
@@ -1244,6 +1355,22 @@ fn every_variant_has_a_sample() {
     assert_eq!(answers.len(), 9, "{answers:?}");
     let reasons: std::collections::BTreeSet<_> = refusals().iter().map(refused_kind).collect();
     assert_eq!(reasons.len(), 20, "{reasons:?}");
+}
+
+#[test]
+fn release_without_the_admitted_ask_count_does_not_decode() {
+    let call = worker_call(
+        UnitOp::Release {
+            rid: Rid([0x44; 16]),
+            asks: 1,
+        },
+        Some(seqs()),
+    );
+    let mut wire = serde_json::to_value(call).unwrap();
+    let release = wire["op"].as_object_mut().unwrap();
+    assert_eq!(release.remove("asks"), Some(json!(1)));
+    let err = serde_json::from_value::<UnitCall>(wire).unwrap_err();
+    assert!(err.to_string().contains("missing field `asks`"), "{err}");
 }
 
 #[test]

@@ -13,6 +13,8 @@ use velmora_bridge::unit::keys::{
     Access, ApplyEntry, KeyEntry, KeyGrant, KeyKind, KeyMarker, KeyRefusal, MarkerKind,
     SubjectStatus,
 };
+use velmora_bridge::unit::request::Presigned;
+use velmora_bridge::unit::reserve::{Acting, Hash32, Opening, ReserveRefusal, Rid};
 use velmora_bridge::unit::{
     BirthKind, BirthToken, CallKind, Refused, Seqs, SyncHead, TenantId, TenantState, Unit,
     UnitAnswer, UnitCall, UnitName, UnitOp,
@@ -24,6 +26,9 @@ const B1: &str = "b_00000000000000d1";
 const B2: &str = "b_00000000000000d2";
 const P: &str = "p_owner";
 const K: &str = "AKKEYS00000000000001";
+const OWNER_A: &str = "member-1";
+const OWNER_B: &str = "member-2";
+const NEW_P: &str = "p_00000000000000d3";
 
 fn tenant() -> TenantId {
     TenantId::parse("t_0000000000000d01").unwrap()
@@ -132,7 +137,7 @@ fn principal(seq: u64, status: SubjectStatus, grants: Vec<KeyGrant>) -> KeyEntry
         created_at: 1,
         secret_wrapped: None,
         secret_kek_version: None,
-        owner_ref: Some("member-1".into()),
+        owner_ref: Some(OWNER_A.into()),
         last_seq: seq,
         rid: None,
     }
@@ -575,6 +580,255 @@ fn a_held_subject_is_not_served_until_the_same_seq_opens_it() {
     let body = ok_body(apply(&u, 1, vec![closed]));
     assert_eq!(body["skipped"], json!(1));
     assert_eq!(served(&u, K), (true, vec![(B1.into(), "rw".into())]));
+}
+
+fn stored_owner_ref(u: &Unit<RusqliteSql>, id: &str) -> Option<String> {
+    u.sql()
+        .with_conn(|c| {
+            c.query_row("SELECT owner_ref FROM unit_keys WHERE id = ?1", [id], |r| {
+                r.get(0)
+            })
+        })
+        .unwrap()
+}
+
+#[test]
+fn an_apply_without_an_owner_ref_keeps_the_stored_value() {
+    let u = born();
+    ok_body(apply(
+        &u,
+        0,
+        vec![principal(1, SubjectStatus::Active, vec![])],
+    ));
+    let mut absent = principal(2, SubjectStatus::Active, vec![]);
+    absent.owner_ref = None;
+    let body = ok_body(apply(&u, 1, vec![absent]));
+    assert_eq!(body["applied"], json!(1));
+    assert_eq!(body["owner_ref_conflict"], json!([]));
+    assert_eq!(stored_owner_ref(&u, P).as_deref(), Some(OWNER_A));
+    assert_eq!(keys_seq(&u), 2);
+}
+
+#[test]
+fn an_opened_principal_fills_in_the_held_rows_missing_owner_ref() {
+    let u = born();
+    let opened = principal(1, SubjectStatus::Active, vec![]);
+    let mut held = opened.clone();
+    held.held = true;
+    held.owner_ref = None;
+    ok_body(apply(&u, 0, vec![held]));
+    assert_eq!(stored_owner_ref(&u, P), None);
+    assert_eq!(ok_body(worker(&u, UnitOp::HeldKeys {}))["held"], json!([P]));
+
+    let body = ok_body(apply(&u, 0, vec![opened]));
+    assert_eq!(body["applied"], json!(1));
+    assert_eq!(body["owner_ref_conflict"], json!([]));
+    assert_eq!(stored_owner_ref(&u, P).as_deref(), Some(OWNER_A));
+    assert_eq!(ok_body(worker(&u, UnitOp::HeldKeys {}))["held"], json!([]));
+    assert_eq!(keys_seq(&u), 1);
+}
+
+fn apply_conflicting_owner_ref(u: &Unit<RusqliteSql>, from_seq: u64) -> serde_json::Value {
+    let mut disputed = principal(
+        from_seq + 1,
+        SubjectStatus::Active,
+        vec![grant(B1, Access::Ro)],
+    );
+    disputed.owner_ref = Some(OWNER_B.into());
+    disputed.created_at = 22;
+    ok_body(apply(u, from_seq, vec![disputed]))
+}
+
+fn principal_with_disputed_owner_ref() -> Unit<RusqliteSql> {
+    let u = born();
+    ok_body(apply(
+        &u,
+        0,
+        vec![principal(
+            1,
+            SubjectStatus::Active,
+            vec![grant(B1, Access::Rw)],
+        )],
+    ));
+    apply_conflicting_owner_ref(&u, 1);
+    u
+}
+
+#[test]
+fn a_conflicting_owner_ref_is_reported_without_stalling_apply() {
+    let u = born();
+    ok_body(apply(
+        &u,
+        0,
+        vec![principal(
+            1,
+            SubjectStatus::Active,
+            vec![grant(B1, Access::Rw)],
+        )],
+    ));
+    let body = apply_conflicting_owner_ref(&u, 1);
+    assert_eq!(body["owner_ref_conflict"], json!([P]));
+    assert_eq!(body["applied"], json!(1));
+    assert_eq!(stored_owner_ref(&u, P).as_deref(), Some(OWNER_A));
+    assert_eq!(keys_seq(&u), 2);
+    let fields: (i64, String) = u
+        .sql()
+        .with_conn(|c| {
+            c.query_row(
+                "SELECT k.created_at, g.access FROM unit_keys k JOIN unit_key_grants g \
+             ON k.id = g.subject_id WHERE k.id = ?1 AND g.bucket_id = ?2",
+                [P, B1],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+        })
+        .unwrap();
+    assert_eq!(fields, (22, "ro".into()));
+
+    let mut later = principal(3, SubjectStatus::Active, vec![]);
+    later.id = NEW_P.into();
+    later.owner_ref = Some("member-3".into());
+    let body = ok_body(apply(&u, 2, vec![later]));
+    assert_eq!(body["applied"], json!(1));
+    assert_eq!(body["owner_ref_conflict"], json!([]));
+    assert_eq!(stored_owner_ref(&u, NEW_P).as_deref(), Some("member-3"));
+    assert_eq!(keys_seq(&u), 3);
+}
+
+const AMBIGUOUS_OWNER: UnitAnswer = UnitAnswer::Refused {
+    reason: Refused::Reserve(ReserveRefusal::OwnerRefAmbiguous),
+    alarm: true,
+};
+
+#[test]
+fn resolve_acting_alarms_on_both_owner_refs_and_the_conflicted_principal_id() {
+    let u = principal_with_disputed_owner_ref();
+    for acting in [
+        Acting::OwnerRef(OWNER_A.into()),
+        Acting::OwnerRef(OWNER_B.into()),
+        Acting::Principal(P.into()),
+    ] {
+        let answer = worker(
+            &u,
+            UnitOp::ResolveActing {
+                acting: acting.clone(),
+            },
+        );
+        assert_eq!(answer, AMBIGUOUS_OWNER, "resolve {acting:?}");
+    }
+}
+
+fn reserve_for_owner_b() -> UnitOp {
+    UnitOp::Reserve {
+        key_hash: Hash32([2; 32]),
+        fingerprint: Hash32([3; 32]),
+        rid: Rid([4; 16]),
+        acting: None,
+        opening: Opening::Principal {
+            id: NEW_P.into(),
+            owner_ref: OWNER_B.into(),
+            grants: vec![],
+        },
+    }
+}
+
+#[test]
+fn a_reservation_refuses_and_alarms_when_its_acting_principal_has_a_conflict() {
+    let u = principal_with_disputed_owner_ref();
+    let answer = worker(
+        &u,
+        UnitOp::Reserve {
+            key_hash: Hash32([1; 32]),
+            fingerprint: Hash32([2; 32]),
+            rid: Rid([3; 16]),
+            acting: Some(Acting::Principal(P.into())),
+            opening: Opening::Key {
+                kind: KeyKind::S3,
+                id: K.into(),
+                grants: vec![],
+            },
+        },
+    );
+    assert_eq!(answer, AMBIGUOUS_OWNER);
+}
+
+#[test]
+fn a_principal_create_refuses_and_alarms_on_the_disputed_owner_ref() {
+    let u = principal_with_disputed_owner_ref();
+    assert_eq!(worker(&u, reserve_for_owner_b()), AMBIGUOUS_OWNER);
+}
+
+#[test]
+fn a_revoked_conflicted_principal_no_longer_blocks_the_disputed_owner_ref() {
+    let u = principal_with_disputed_owner_ref();
+    assert_eq!(worker(&u, reserve_for_owner_b()), AMBIGUOUS_OWNER);
+    let mut revoked = principal(3, SubjectStatus::Revoked, vec![]);
+    revoked.owner_ref = None;
+    ok_body(apply(&u, 2, vec![revoked]));
+    assert_eq!(status_of(&u, P), "revoked");
+    for acting in [
+        Acting::OwnerRef(OWNER_A.into()),
+        Acting::OwnerRef(OWNER_B.into()),
+        Acting::Principal(P.into()),
+    ] {
+        let answer = worker(
+            &u,
+            UnitOp::ResolveActing {
+                acting: acting.clone(),
+            },
+        );
+        assert_eq!(
+            answer,
+            UnitAnswer::Refused {
+                reason: Refused::Reserve(ReserveRefusal::ActingPrincipalUnknown),
+                alarm: false,
+            },
+            "resolve {acting:?} after revocation"
+        );
+    }
+    let body = ok_body(worker(&u, reserve_for_owner_b()));
+    assert_eq!(body["admitted"]["subject"], json!(NEW_P));
+}
+
+#[test]
+fn a_presigned_key_row_refuses_a_conflicted_principal() {
+    let u = born();
+    let mut internal = key(2, SubjectStatus::Active, vec![]);
+    internal.kind = KeyKind::Internal;
+    internal.made_by = None;
+    internal.owner_ref = None;
+    ok_body(apply(
+        &u,
+        0,
+        vec![
+            principal(1, SubjectStatus::Active, vec![grant(B1, Access::Rw)]),
+            internal,
+        ],
+    ));
+    let presigned = |keys_seq| {
+        let mut c = call(
+            CallKind::Request,
+            seqs(3, keys_seq),
+            UnitOp::KeyRow {
+                access_key_id: K.into(),
+                presigned: Some(Presigned {
+                    principal: P.into(),
+                    bucket: "alpha".into(),
+                    create_only: false,
+                }),
+            },
+        );
+        c.authenticated = false;
+        ok_body(u.handle(&c, NOW))["presigned"].clone()
+    };
+    assert_eq!(presigned(2)["ok"], json!(true));
+
+    apply_conflicting_owner_ref(&u, 2);
+    assert_eq!(
+        presigned(3),
+        json!({
+            "ok": false, "refusal": "owner_ref_ambiguous", "bucket_id": null, "access": null,
+        })
+    );
 }
 
 #[test]
