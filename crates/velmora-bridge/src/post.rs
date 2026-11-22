@@ -55,8 +55,8 @@ use crate::ports::{
 use crate::recovery::write_stored_plan;
 use crate::tenant::TenantScope;
 use crate::types::{
-    valid_yenc_name, ArticleRow, ArticleState, BridgeError, ExtentRow, FailClass, Job, JobExtent,
-    JobOutcome, OutboxStage, ProviderConfig, Result, SafetyState, SizeCommand, UnixMs, JOB_VERSION,
+    valid_yenc_name, ArticleRow, ArticleState, BridgeError, ExtentRow, FailClass, JobExtent,
+    JobOutcome, OutboxStage, ProviderConfig, Result, SafetyState, SizeCommand, UnixMs,
 };
 
 /// Asks a provider whether it has an article and for the size it reports
@@ -816,25 +816,8 @@ where
 
     /// Every article is recorded as posted: the extent goes on to verify.
     async fn to_verify(&self, lease: &Lease) -> core::result::Result<(), Stop> {
-        let now = self.clock.now();
-        let delay = self.cfg.verify_delay_secs;
-        if !self
-            .catalog
-            .advance(lease, OutboxStage::Verify, now.plus_secs(delay), now)
-            .await?
-        {
-            return Err(Stop::Fenced);
-        }
-        let next = Job::Extent {
-            v: JOB_VERSION,
-            extent: lease.extent.clone(),
-            generation: lease.generation.clone(),
-            stage: OutboxStage::Verify,
-        };
-        // The outbox row is the obligation: the dispatcher re-sends a
-        // notification that is lost here.
-        let _ = self.jobs.send(&next, delay.min(MAX_QUEUE_DELAY_SECS)).await;
-        Ok(())
+        let due = self.clock.now().plus_secs(self.cfg.verify_delay_secs);
+        self.advance_notify(lease, OutboxStage::Verify, due).await
     }
 
     /// The verified ciphertext of the extent and its stored article plan,

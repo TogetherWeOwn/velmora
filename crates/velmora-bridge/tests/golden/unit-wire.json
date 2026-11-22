@@ -1223,6 +1223,16 @@
       "unit_keys",
       "unit_key_grants"
     ],
+    "lease_refusal": [
+      "restoring",
+      "rolled_back",
+      "no_lease_table",
+      "proof_too_old",
+      "proof_ahead",
+      "not_proven",
+      "revocations_unapplied",
+      "bad_list"
+    ],
     "provision_refusal": [
       "born_before",
       "not_the_listing_record",

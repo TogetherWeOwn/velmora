@@ -85,10 +85,12 @@ pub const RESEND_MAX_SECS: u32 = 86_400;
 /// How much older than the oldest message in its queues a mark must be
 /// before its message counts as gone.
 ///
-/// A mark carries the time its dispatcher run began, and the message
-/// the time the queue took it, later in that run: a run lasts well
-/// under this, so a message still in a queue is never newer than its
-/// row's mark by this much. It also covers a clock of the queues that
+/// A mark carries the time its dispatcher run began, the time of the
+/// commit that made the row, or the due time a handler gave the row
+/// before it sent the job itself. The message carries the time the
+/// queue took it, later in that run or request: that takes well under
+/// this, so a message still in a queue is never newer than its row's
+/// mark by this much. It also covers a clock of the queues that
 /// is not this one, and a message that was delivered and whose job has
 /// not claimed its row yet.
 pub const RESEND_SLACK_SECS: u32 = 600;
@@ -208,7 +210,7 @@ where
     pub async fn run_job(&self, scope: &TenantScope, job: &Job) -> JobOutcome {
         if self.cfg.maintenance == Maintenance::Restore {
             // The outbox keeps the obligation; the dispatcher re-sends it
-            // once maintenance ends.
+            // once maintenance has ended and the row's mark has aged.
             return JobOutcome::Ack;
         }
         // A wake-up that came before its time is sent on for the rest

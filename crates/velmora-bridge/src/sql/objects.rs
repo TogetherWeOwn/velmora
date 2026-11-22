@@ -426,7 +426,7 @@ pub(super) fn retire_live(
         ),
         (
             concat!(
-                "UPDATE outbox SET stage = 'cancelled', updated_at = ?3 \
+                "UPDATE outbox SET stage = 'cancelled', sent_at = NULL, updated_at = ?3 \
                  WHERE stage NOT IN ('done', 'cancelled') AND extent_id IN (",
                 retiring!(),
                 ")"
@@ -815,8 +815,10 @@ pub(super) async fn commit_generation<S: Sql>(
             vec![text(e.id.as_str())],
         ));
         stmts.push((
-            "INSERT INTO outbox(extent_id, generation_id, stage, next_at, updated_at) \
-             VALUES (?1, ?2, 'post', ?3, ?3)",
+            // Marked as sent from the start (`sent_at`): the caller
+            // sends the post job itself (`Catalog::commit_generation`).
+            "INSERT INTO outbox(extent_id, generation_id, stage, next_at, updated_at, sent_at) \
+             VALUES (?1, ?2, 'post', ?3, ?3, ?3)",
             vec![text(e.id.as_str()), text(g.id.as_str()), ms(commit.now)],
         ));
     }

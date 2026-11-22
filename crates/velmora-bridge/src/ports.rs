@@ -21,8 +21,8 @@ use crate::types::{
     IntentFence, IntentStats, Job, JobExtent, KekBytes, ListEntry, ListPage, ListQuery,
     ObjectStatus, OpenUpload, OutboxStage, OutboxStats, PartExtent, Perm, Precondition,
     ProviderConfig, ProviderFault, ProviderLoad, Resend, SafetyState, SizeCommand, UnixMs,
-    UploadId, UploadListQuery, UploadPartRow, UploadRow, VerificationRow, VerifyEscalation,
-    WriteId,
+    UploadId, UploadListQuery, UploadPartRow, UploadRow, UploadState, VerificationRow,
+    VerifyEscalation, WriteId,
 };
 use crate::types::{
     BucketUsage, RecountState, RecountStep, UsageCounters, UsageRecount, UsageSnapshot,
@@ -640,6 +640,12 @@ pub trait Catalog {
     /// batch retires. A batch refused for it wrote nothing and is
     /// `Refused` like one refused for its id; the caller tells the two
     /// apart by looking at the key again.
+    ///
+    /// The posting obligations (outbox rows) of every publication, this
+    /// one, [`Self::commit_sliced`] and [`Self::complete_upload`], are
+    /// inserted marked as sent at the commit's `now`: the caller sends
+    /// the post job of each extent right after an `Applied`, and takes
+    /// the mark back with [`Self::unmark_sent`] where that send failed.
     async fn commit_generation(
         &self,
         c: &CommitGeneration,
@@ -828,6 +834,8 @@ pub trait Catalog {
     /// The row carries state, revision and the completion receipt.
     async fn upload(&self, t: &UploadTarget<'_>)
         -> Result<Option<(UploadRow, Vec<UploadPartRow>)>>;
+    /// The upload's state alone, without its parts: one key lookup.
+    async fn upload_state(&self, t: &UploadTarget<'_>) -> Result<Option<UploadState>>;
     /// The open uploads of the bucket in `(key, upload id)` order, at
     /// most `q.limit`.
     async fn list_uploads(&self, bucket: &BucketId, q: &UploadListQuery)
@@ -883,6 +891,16 @@ pub trait Catalog {
     /// Moves the row to stage `to`, due at `next_at`, and frees the
     /// lease. The new stage starts at its first step: attempts and
     /// cursor are 0 again.
+    ///
+    /// The caller sends the job of a stage that has work (`post`,
+    /// `verify`, `release`) itself, right after this call: the same
+    /// write marks the row as sent for `next_at`, so the dispatcher does
+    /// not send a second job while that one is on its way
+    /// ([`Self::due`]). If the send fails, the caller takes the mark
+    /// back with [`Self::unmark_sent`] and `next_at`. A job that never
+    /// arrives although its send was answered is sent again by the
+    /// dispatcher once the mark has aged (`Resend`), counted from
+    /// `next_at`. A row moved to an end stage keeps no mark.
     async fn advance(
         &self,
         l: &Lease,
@@ -1057,6 +1075,13 @@ pub trait Catalog {
     /// ones that are still due and held by no job, and returns how many.
     /// The mark is a hint for [`Self::due`] alone; it gates no claim.
     async fn mark_sent(&self, extents: &[ExtentId], now: UnixMs) -> Result<u64>;
+    /// `jobs`, each for an outbox row, were not sent: takes
+    /// back the mark `mark` their rows were given by
+    /// [`Self::advance`] (its `next_at`) or by the publication that
+    /// inserted them (its `now`), and returns how many rows had it. A
+    /// row that a job claimed since, or that was marked again, is left
+    /// as it is. The next dispatcher run sends a row without a mark.
+    async fn unmark_sent(&self, jobs: &[Job], mark: UnixMs) -> Result<u64>;
     async fn bury_exhausted(&self, max_attempts: u32, now: UnixMs) -> Result<u64>;
     /// Stamps `meta.last_dispatch_at` (the dispatcher, once per run).
     async fn record_dispatch(&self, now: UnixMs) -> Result<()>;

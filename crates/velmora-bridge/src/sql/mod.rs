@@ -95,7 +95,6 @@ use crate::ports::{
 };
 use crate::recovery::Recorded;
 use crate::replay::{ReplayExtent, ReplayMark, ReplayProbe, ReplayPublish, RestoreProgress};
-use crate::types::Resend;
 use crate::types::{
     AccessKeyRow, AccessKeySummary, ArticleRow, BackboneStatus, BridgeError, Bucket, BucketId,
     CommitGeneration, CompleteUpload, CopyGeneration, DueRow, EvictCandidate, ExtentId,
@@ -108,6 +107,7 @@ use crate::types::{
 use crate::types::{
     BucketUsage, RecountState, RecountStep, UsageCounters, UsageRecount, UsageSnapshot,
 };
+use crate::types::{Resend, UploadState};
 
 /// `meta` key the guard self-test writes inside its failing batch.
 const GUARD_SELFTEST_KEY: &str = "guard_selftest_marker";
@@ -438,6 +438,9 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
     ) -> Result<Option<(UploadRow, Vec<UploadPartRow>)>> {
         uploads::upload(self, t).await
     }
+    async fn upload_state(&self, t: &UploadTarget<'_>) -> Result<Option<UploadState>> {
+        uploads::upload_state(self, t).await
+    }
     async fn list_uploads(
         &self,
         bucket: &BucketId,
@@ -655,6 +658,9 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
     }
     async fn mark_sent(&self, extents: &[ExtentId], now: UnixMs) -> Result<u64> {
         outbox::mark_sent(self, extents, now).await
+    }
+    async fn unmark_sent(&self, jobs: &[crate::types::Job], mark: UnixMs) -> Result<u64> {
+        outbox::unmark_sent(self, jobs, mark).await
     }
     async fn bury_exhausted(&self, max_attempts: u32, now: UnixMs) -> Result<u64> {
         outbox::bury_exhausted(self, max_attempts, now).await

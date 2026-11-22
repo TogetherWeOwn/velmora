@@ -1399,6 +1399,16 @@ pub enum Job {
 }
 
 impl Job {
+    /// The extent whose outbox row this job is for, if it is for one.
+    pub fn extent(&self) -> Option<&ExtentId> {
+        match self {
+            Job::Extent { extent, .. } | Job::Wake { extent, .. } => Some(extent),
+            _ => None,
+        }
+    }
+}
+
+impl Job {
     pub fn to_json(&self) -> String {
         // Serializing plain strings and integers cannot fail.
         serde_json::to_string(self).unwrap_or_default()

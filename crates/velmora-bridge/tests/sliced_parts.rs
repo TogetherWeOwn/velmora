@@ -265,8 +265,12 @@ async fn parts_of_64_and_95_mib_among_small_ones_read_back() {
     assert_eq!(records(&rig), [generation.id.as_str().to_string()]);
     assert!(orphans(&rig).is_empty() && broken(&rig).is_empty());
     assert!(in_gc(&rig).is_empty());
-    // One posting job per extent.
+    // One posting job per extent, and every row marked as sent.
     assert_eq!(rig.bridge.jobs.inner.take().len(), extents.len());
+    assert_eq!(
+        rig.count("outbox WHERE sent_at = next_at"),
+        extents.len() as i64
+    );
 
     let head = rig.head(&signer, BUCKET, KEY).await;
     head.expect(200);
@@ -299,6 +303,32 @@ async fn parts_of_64_and_95_mib_among_small_ones_read_back() {
         got.expect(206);
         assert!(got.body == whole[first..=last], "bytes {first}-{last}");
     }
+}
+
+/// A queue that refuses the posting jobs of a Complete: the upload is
+/// completed all the same, and no row keeps a mark, so the next
+/// dispatcher run sends every job.
+#[tokio::test(flavor = "current_thread")]
+async fn a_complete_whose_send_is_refused_leaves_its_rows_unmarked() {
+    let rig = big_rig();
+    let (_, signer) = rig.standard(BUCKET).await;
+    let id = create(&rig, &signer, KEY).await;
+    let mut etags = Vec::new();
+    for n in 1..=2u8 {
+        let bytes = body(n, if n == 1 { 5 * MIB } else { MIB });
+        etags.push(part(&rig, &signer, &id, u16::from(n), &bytes).await);
+    }
+    rig.bridge.jobs.fail.set(true);
+    complete(&rig, &signer, &id, &etags).await.expect(200);
+    assert_eq!(rig.count("outbox"), 2);
+    assert_eq!(rig.count("outbox WHERE sent_at IS NULL"), 2);
+    let due = rig
+        .bridge
+        .catalog
+        .due(rig.now(), Resend::after(jobs::RESEND_SECS), 10)
+        .await
+        .unwrap();
+    assert_eq!(due.len(), 2);
 }
 
 #[tokio::test(flavor = "current_thread")]

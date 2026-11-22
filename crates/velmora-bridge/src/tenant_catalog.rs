@@ -386,6 +386,13 @@ impl<P: UnitPort, S: Catalog> Catalog for TenantCatalog<P, S> {
         })
         .await
     }
+    async fn unmark_sent(&self, jobs: &[Job], mark: UnixMs) -> Result<u64> {
+        self.unit(JobCall::unmark_sent {
+            jobs: jobs.to_vec(),
+            mark,
+        })
+        .await
+    }
     async fn pack_plans(&self, limit: u32) -> Result<PackReport> {
         self.unit(JobCall::pack_plans { limit }).await
     }
@@ -768,6 +775,9 @@ impl<P: UnitPort, S: Catalog> Catalog for TenantCatalog<P, S> {
         &self,
         t: &UploadTarget<'_>,
     ) -> Result<Option<(UploadRow, Vec<UploadPartRow>)>> {
+        Err(BridgeError::NotImplemented(NOT_ON_UNIT))
+    }
+    async fn upload_state(&self, t: &UploadTarget<'_>) -> Result<Option<UploadState>> {
         Err(BridgeError::NotImplemented(NOT_ON_UNIT))
     }
     async fn list_uploads(

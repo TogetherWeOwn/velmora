@@ -5,10 +5,14 @@
 //! the same queue of its kind ([`shard`]).
 //!
 //! Dev only: `DEV_DROP_NOTIFY_N` makes the first `n` `send` calls of the
-//! isolate vanish while reporting success (a lost queue notification), so
-//! the local acceptance run can prove that the cron dispatcher re-drives
-//! the outbox. `send_many` is never dropped; the dispatcher must keep
-//! re-enqueueing extents through it so the re-drive itself is never lost.
+//! isolate fail without sending (a queue that refuses the notification),
+//! so the local acceptance run can prove that the handler leaves the
+//! outbox row unmarked and the next run of the cron dispatcher sends its
+//! job. (A notification lost after the queue took it is made up for only
+//! when its mark has aged, an hour or more: the native tests cover that
+//! with their own clock.) `send_many` is never dropped; the dispatcher
+//! must keep re-enqueueing extents through it so the re-drive itself is
+//! never lost.
 //! A restarted isolate re-arms the counter. Outside `ENVIRONMENT=dev` the
 //! variable is ignored.
 
@@ -414,7 +418,7 @@ impl JobSink for QueueSink {
     async fn send(&self, job: &Job, delay_secs: u32) -> Result<()> {
         check_delay(delay_secs)?;
         if self.drop_notify.take() {
-            return Ok(());
+            return Err(BridgeError::Queue("dev: send refused".to_string()));
         }
         let msg = MessageBuilder::new(self.message(job)?)
             .content_type(QueueContentType::Json)

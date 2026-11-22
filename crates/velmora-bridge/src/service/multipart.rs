@@ -62,14 +62,14 @@ use crate::ports::{
 use crate::recovery::{id_after, write_generation};
 use crate::service::common::{
     auth_refused, check_precondition, discard_refused, discard_unless_present, header_refused,
-    hold_precondition, host_refused, precondition, restore_gate, writes_refused, REGION_ALIASES,
+    hold_precondition, host_refused, precondition, restore_gate, send_post_jobs, writes_refused,
+    REGION_ALIASES,
 };
 use crate::service::slices::{store_slices, SliceError, SliceSink};
 use crate::types::{
     Body, BridgeError, Bucket, CompleteUpload, ExtentId, ExtentPlacement, ExtentRow, ExtentState,
-    GenerationRow, GenerationState, Job, KeyStatus, OutboxStage, PartExtent, Perm, RespBody,
-    S3Request, S3Response, SafetyState, UploadId, UploadPartRow, UploadRow, UploadState, WriteId,
-    JOB_VERSION,
+    GenerationRow, GenerationState, KeyStatus, PartExtent, Perm, RespBody, S3Request, S3Response,
+    SafetyState, UploadId, UploadPartRow, UploadRow, UploadState, WriteId,
 };
 
 /// Smallest non-final part.
@@ -83,8 +83,6 @@ pub const MAX_COMPLETE_BODY_BYTES: u64 = 2 * 1024 * 1024;
 const COMPLETE_ATTEMPTS: u32 = 3;
 /// `KeyMode::Random`.
 const KEY_MODE_RANDOM: u8 = 1;
-/// Queue messages of one `send_many`.
-const JOB_BATCH: usize = 100;
 
 /// Headers the edge adds. They are never signed and their values are not
 /// always printable ASCII, so they are dropped before header validation.
@@ -695,9 +693,10 @@ where
     };
     // Refuse an unknown or closed upload before the body is read or
     // anything is stored. The guarded batch below decides for real.
-    match bridge.catalog.upload(&target).await? {
-        Some((upload, _)) if upload.state == UploadState::Open => {}
-        _ => return Err(ErrorCode::NoSuchUpload.into()),
+    // The state alone: reading the parts here would cost a row per part
+    // already uploaded, on every part.
+    if bridge.catalog.upload_state(&target).await? != Some(UploadState::Open) {
+        return Err(ErrorCode::NoSuchUpload.into());
     }
 
     // Plaintext and ciphertext live together while sealing: the charge
@@ -972,8 +971,8 @@ where
             // longer this request's. The slices are left to the sweep.
             give_up().await;
             restore_gate(bridge).await?;
-            return Err(match bridge.catalog.upload(target).await? {
-                Some((upload, _)) if upload.state == UploadState::Open => ErrorCode::SlowDown,
+            return Err(match bridge.catalog.upload_state(target).await? {
+                Some(UploadState::Open) => ErrorCode::SlowDown,
                 _ => ErrorCode::NoSuchUpload,
             }
             .into());
@@ -1459,21 +1458,12 @@ where
             .await?
         {
             PublishOutcome::Applied => {
-                // The outbox rows are the durable obligation; a lost
-                // notification is picked up by the dispatcher.
-                let jobs: Vec<Job> = commit
+                let rows = commit
                     .placements
                     .iter()
-                    .map(|p| Job::Extent {
-                        v: JOB_VERSION,
-                        extent: p.extent_id.clone(),
-                        generation: commit.generation.id.clone(),
-                        stage: OutboxStage::Post,
-                    })
+                    .map(|p| p.extent_id.clone())
                     .collect();
-                for batch in jobs.chunks(JOB_BATCH) {
-                    let _ = bridge.jobs.send_many(batch).await;
-                }
+                send_post_jobs(bridge, &commit.generation.id, rows, commit.now).await;
                 return complete_response(&a, publication.etag, now.0);
             }
             PublishOutcome::Refused(record) => {
