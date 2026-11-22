@@ -11,9 +11,14 @@
 //!   in [`velmora_bridge::unit`]. Exported by a Worker that depends on
 //!   this crate; bound by none yet.
 //!
-//! Nothing here holds a key, reaches the network or sets a timer
-//! (rules 3 and 4).
+//! - the alarm ([`alarm`]): the one place that sends to a queue (the
+//!   unit's `renew` and `stamp_raise` jobs) and arms the alarm (rules 4,
+//!   8 and 12).
+//!
+//! Nothing here holds a key or reaches the network, and nothing but the
+//! alarm sends or sets a timer (rules 3 and 4).
 
+pub mod alarm;
 mod do_sql;
 mod object;
 mod pitr;

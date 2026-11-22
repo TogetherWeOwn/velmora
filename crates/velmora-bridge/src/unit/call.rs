@@ -18,6 +18,8 @@ use super::keys::{KeyEntry, KeyRefusal};
 use super::lift::{AckClass, FindingList, GateRefusal, GateSummary, LiftProof, ReplayId};
 use super::name::UnitName;
 use super::restore::{Bookmark, RestoreRefusal, RestoreTarget};
+use crate::types::UnixMs;
+use crate::unit_lease::lease::{LeaseRefusal, Proven};
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -141,6 +143,18 @@ pub enum UnitOp {
     /// Copies a verified tenant record into the unit (rule 5). A Worker
     /// call.
     Sync { head: SyncHead },
+    /// Renews the freshness lease (rule 12) after the Worker proved the
+    /// unit fresh from the stores: `fresh_until = proof_start + T`.
+    /// `proven`: the state the proof was made for; `revocations`: the ids
+    /// the proof listed under `m/rk/<t>/` when the counts differed, which
+    /// the unit applies first, in the same transaction. A Worker call; it
+    /// runs with an expired lease.
+    Renew {
+        proof_start: UnixMs,
+        proven: Proven,
+        #[serde(default)]
+        revocations: Vec<String>,
+    },
     /// The unit's numbers and state, and nothing else. A struct variant,
     /// so that an unknown field next to it is refused.
     Ping {},
@@ -244,6 +258,7 @@ impl UnitOp {
             self,
             UnitOp::Provision { .. }
                 | UnitOp::Sync { .. }
+                | UnitOp::Renew { .. }
                 | UnitOp::ApplyKeys { .. }
                 | UnitOp::HeldKeys {}
                 | UnitOp::Import { .. }
@@ -336,6 +351,15 @@ pub enum UnitAnswer {
     Stale {
         seqs: Seqs,
     },
+    /// The lease has expired, was never issued or was closed (rule 12):
+    /// every call but the Worker's own and the stamp check is refused
+    /// with this, and nothing was done. The Worker proves and renews,
+    /// then retries. `why`: set on a refused `renew`.
+    RenewNeeded {
+        seqs: Seqs,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        why: Option<LeaseRefusal>,
+    },
     /// A key-chain apply whose base is above the unit's `keys_seq`:
     /// nothing was done; the caller reads again from `keys_seq + 1`
     /// (AM-12).
@@ -365,6 +389,20 @@ pub enum UnitAnswer {
     Failed {
         class: String,
     },
+}
+
+/// An answer as it leaves the unit (rule 12, SEC-6): the answer, the
+/// time its lease has left (0 = none: expired, never issued, closed or
+/// not known), and, for a unit that holds keys, the revoked keys it holds
+/// (each id once). The JSON is the answer's object with the two fields
+/// beside its own.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct UnitReply {
+    #[serde(flatten)]
+    pub answer: UnitAnswer,
+    pub lease_left_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revoked: Option<u64>,
 }
 
 mod b64 {

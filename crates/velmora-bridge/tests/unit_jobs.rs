@@ -27,6 +27,8 @@ use velmora_bridge::unit::{
     BirthKind, BirthToken, CallKind, Seqs, SyncHead, TenantId, TenantState, Unit, UnitAnswer,
     UnitCall, UnitName, UnitOp, UnitSql,
 };
+use velmora_bridge::unit_lease::alarm::AlarmRules;
+use velmora_bridge::unit_lease::lease::{LeaseRules, Proven};
 use velmora_bridge::*;
 use velmora_test_nntp::{ServerConfig, TestNntpServer, UserConfig};
 
@@ -171,6 +173,25 @@ fn sync(unit: &Unit<Db>, state_seq: u64, restoring: Option<u64>, now: UnixMs) {
     assert!(matches!(a, UnitAnswer::Ok { .. }), "{a:?}");
 }
 
+/// The Worker's renewal at `now` (rule 12).
+fn renew(unit: &Unit<Db>, now: UnixMs) {
+    let a = worker(
+        unit,
+        UnitOp::Renew {
+            proof_start: now,
+            proven: Proven {
+                state_seq: 3,
+                keys_seq: 0,
+                stamp_counter: None,
+                revoked: 0,
+            },
+            revocations: Vec::new(),
+        },
+        now,
+    );
+    assert!(matches!(a, UnitAnswer::Ok { .. }), "renew: {a:?}");
+}
+
 impl Fx {
     async fn new() -> Fx {
         Fx::with(GcMode::Disposable, 3).await
@@ -250,7 +271,15 @@ impl Fx {
         };
         let clock = Rc::new(FixedClock::new(T0));
         let db = Db(Rc::new(RusqliteSql::open_in_memory().unwrap()));
-        let unit = Rc::new(Unit::new(db.clone(), own(), ""));
+        // A lease that outlasts the test's clock: these tests are about
+        // the job path; `unit_lease_wiring.rs` holds the lease's rules.
+        let unit = Rc::new(Unit::new(db.clone(), own(), "").with_rules(
+            LeaseRules {
+                term_ms: 30 * 24 * 3_600_000,
+                ..LeaseRules::DEFAULT
+            },
+            AlarmRules::DEFAULT,
+        ));
         let token = BirthToken {
             name: own(),
             jurisdiction: String::new(),
@@ -269,6 +298,7 @@ impl Fx {
         );
         assert!(matches!(born, UnitAnswer::Ok { .. }), "{born:?}");
         sync(&unit, 3, None, T0);
+        renew(&unit, T0);
         let calls = Rc::new(Cell::new(0));
         let port = Local {
             unit: Rc::clone(&unit),
