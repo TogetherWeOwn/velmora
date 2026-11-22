@@ -54,6 +54,13 @@ pub fn on_d1() -> bool {
     std::env::var("VELMORA_D1_PROBE").is_ok_and(|v| !v.is_empty())
 }
 
+/// Whether this run has the unit suite's workerd twin (every native
+/// database is also a Durable Object SQLite database, compared call by
+/// call; `crates/velmora-bridge/src/testkit_shadow.rs` where it exists).
+pub fn under_twin() -> bool {
+    std::env::var("VELMORA_SQL_SHADOW").is_ok_and(|v| !v.is_empty())
+}
+
 /// A fresh directory database with the whole schema.
 pub fn database() -> Db {
     match std::env::var("VELMORA_D1_PROBE") {
