@@ -6917,10 +6917,14 @@ async fn a_held_entry_keeps_its_owner_ref_and_nothing_else_private() {
                 .map(|(_, o)| o)
                 .collect();
             assert!(!sent.is_empty(), "{}: {id} was not held", u.label);
+            // A principal keeps its member; a key sends none (AM-9).
+            let want = match id {
+                "PR0009" => Some(format!("member-of-{id}")),
+                _ => None,
+            };
             assert!(
-                sent.iter()
-                    .all(|o| o.as_deref() == Some(&format!("member-of-{id}")[..])),
-                "{}: {id} held without its owner_ref",
+                sent.iter().all(|o| **o == want),
+                "{}: {id} held with the wrong owner_ref",
                 u.label
             );
             let row = u.row(id).unwrap();
@@ -6994,10 +6998,9 @@ async fn entries_for_holds_what_the_directory_lacks_with_its_owner() {
     let table = head_table(&w).await;
     let none = Default::default();
     let feed = Feed::new(&w.store, &w.kek, &w.ring, &table, &none);
-    let closed = Default::default();
     // The directory acknowledged seq 1 only.
     let items = feed
-        .entries_for(0, 100, Mode::Closing { acked: 1 }, &closed)
+        .entries_for(0, 100, Mode::Closing { acked: 1 })
         .await
         .unwrap();
     assert_eq!(items.len(), 3);
@@ -7022,14 +7025,61 @@ async fn entries_for_holds_what_the_directory_lacks_with_its_owner() {
     assert!(!shown.contains("member-of"), "{shown}");
     // A page after the store's seq: the same hold, the same items.
     let from_one = feed
-        .entries_for(1, 100, Mode::Closing { acked: 1 }, &closed)
+        .entries_for(1, 100, Mode::Closing { acked: 1 })
         .await
         .unwrap();
     assert_eq!(from_one, items[1..].to_vec());
     // Full mode holds nothing.
-    let full = feed.entries_for(0, 100, Mode::Full, &closed).await.unwrap();
+    let full = feed.entries_for(0, 100, Mode::Full).await.unwrap();
     assert_eq!(full, feed.entries(0, 100).await.unwrap());
     assert!(full.iter().all(|e| !e.held()));
+}
+
+/// Confirmation r1 of the held owner_ref (MEDIUM): `after` is a page
+/// cursor, not what the store holds open. A subject opened at 1 (not
+/// acknowledged) with a later record at 2 is held on every page that
+/// carries it, whatever the cursor: read from 1, or page by page.
+#[tokio::test(flavor = "current_thread")]
+async fn entries_for_holds_by_the_directory_alone_whatever_the_cursor() {
+    let w = World::new();
+    let x = principal("PA0001", &[grant("b_01", RO, None)]);
+    plant(&w, 1, KeyOp::Create, &x, None);
+    // A narrowing at 2 (a closing record): it opens nothing, so the
+    // newest opening stays 1.
+    let narrowed = principal("PA0001", &[]);
+    let bytes = seal_key_record(
+        &w.kek,
+        &w.ring,
+        &w.t,
+        2,
+        KeyOp::Grants,
+        2,
+        &narrowed.door,
+        Some(&narrowed.private),
+        true,
+        None,
+        &mut TestRng(30_002),
+    )
+    .unwrap();
+    w.store.plant(&key_chain(&w.t).name(2), bytes);
+    let table = head_table(&w).await;
+    assert_eq!(table.get("PA0001").unwrap().opened_seq, 1);
+    let none = Default::default();
+    let feed = Feed::new(&w.store, &w.kek, &w.ring, &table, &none);
+    let closing = Mode::Closing { acked: 0 };
+    let from_one = feed.entries_for(1, 1, closing).await.unwrap();
+    assert!(matches!(from_one[..], [ApplyEntry::Held { .. }]));
+    let first = feed.entries_for(0, 1, closing).await.unwrap();
+    let second = feed.entries_for(1, 1, closing).await.unwrap();
+    assert!(first.iter().chain(&second).all(ApplyEntry::held));
+    // Acknowledged at 2: open on every page.
+    let acked = Mode::Closing { acked: 2 };
+    assert!(feed
+        .entries_for(0, 100, acked)
+        .await
+        .unwrap()
+        .iter()
+        .all(|e| !e.held()));
 }
 
 /// Confirmation of the apply (N6): the closing step sends open what the

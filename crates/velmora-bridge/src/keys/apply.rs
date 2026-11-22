@@ -39,8 +39,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use super::chain::Chain;
 use super::ports::{Applied, ApplyEntry, KeyTarget, MAX_APPLY};
 use super::record::{
-    key_chain, open_chain_record, ChainRecord, Entry, KeyTable, Marker, Rid, SubjectStatus, TkRing,
-    ERR_KEY_RECORD,
+    key_chain, open_chain_record, ChainRecord, Entry, KeyTable, Marker, Rid, SubjectKind,
+    SubjectStatus, TkRing, ERR_KEY_RECORD,
 };
 
 use crate::ports::Kek;
@@ -160,8 +160,9 @@ impl<'a, S: RecordStore, K: Kek, T: TkRing> Feed<'a, S, K, T> {
 
     /// Holds closed, in `mode`, an entry whose opening the directory may
     /// not have: the rule of the closing step. The held entry drops its
-    /// private part (the secret, the grant limits, the label) and keeps
-    /// its `owner_ref` (AM-72).
+    /// private part (the secret, the grant limits, the label); a held
+    /// principal keeps its `owner_ref`, a held key sends none (AM-9 with
+    /// AM-72).
     fn hold(mode: Mode, held: u64, closed: &BTreeSet<String>, entry: &mut ApplyEntry) {
         let (Mode::Closing { acked }, ApplyEntry::Subject(e)) = (mode, &mut *entry) else {
             return;
@@ -176,10 +177,16 @@ impl<'a, S: RecordStore, K: Kek, T: TkRing> Feed<'a, S, K, T> {
         let Some(private) = e.private.take() else {
             return;
         };
+        // The identity a held subject keeps (AM-9 with AM-72): a
+        // principal's member; a key sends none.
+        let owner_ref = match e.door.kind {
+            SubjectKind::Principal => private.owner_ref,
+            _ => None,
+        };
         let held_entry = e.clone();
         *entry = ApplyEntry::Held {
             entry: held_entry,
-            owner_ref: private.owner_ref,
+            owner_ref,
         };
     }
 
@@ -313,25 +320,27 @@ impl<'a, S: RecordStore, K: Kek, T: TkRing> Feed<'a, S, K, T> {
         self.page(after, head.min(after.saturating_add(take))).await
     }
 
-    /// [`Feed::entries`] as a store at `keys_seq = after` takes them in
-    /// `mode` (AM-71's `KeyFeed`, serving a unit that asks for the records
-    /// after its `keys_seq`): in [`Mode::Closing`], an entry whose newest
-    /// opening the directory has not acknowledged (above `acked`, unless
-    /// the store already holds that opening open at or below `after`) is
-    /// [`ApplyEntry::Held`] with its `owner_ref`; `closed` is the store's
-    /// closed subjects ([`KeyTarget::closed`]). [`Mode::Full`] holds
-    /// nothing. The `m/rk/` revocations below `after` and the second send
-    /// are the bring-up's ([`Feed::bring_up`]), not this read's.
+    /// [`Feed::entries`] as a store takes them in `mode` (AM-71's
+    /// `KeyFeed`, serving a unit that asks for the records after its
+    /// `keys_seq`, page by page): in [`Mode::Closing`], every entry whose
+    /// newest opening is above `acked` (the directory's `keys_seq`) is
+    /// [`ApplyEntry::Held`] with its `owner_ref`. The hold is by the
+    /// directory's acknowledgement alone: `after` is a page cursor, not
+    /// what the store holds open, so nothing the directory may lack is sent
+    /// open (a store that already held it open gets it closed, which fails
+    /// safe; the full step opens it). [`Mode::Full`] holds nothing. The
+    /// `m/rk/` revocations below the store's seq and the second send are
+    /// the bring-up's ([`Feed::bring_up`]), not this read's.
     pub async fn entries_for(
         &self,
         after: u64,
         limit: usize,
         mode: Mode,
-        closed: &BTreeSet<String>,
     ) -> Result<Vec<ApplyEntry>> {
         let mut out = self.entries(after, limit).await?;
+        let none = BTreeSet::new();
         for e in &mut out {
-            Self::hold(mode, after, closed, e);
+            Self::hold(mode, 0, &none, e);
         }
         Ok(out)
     }
