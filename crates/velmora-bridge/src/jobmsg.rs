@@ -82,9 +82,11 @@
 //! refused: a control intent has no outbox row that would send it again,
 //! so it is never dropped as a malformed job. A build without the finisher
 //! (this one) hands every control message back until it reaches the
-//! dead-letter queue, which pages: no intent is dropped in silence, and
-//! the freshness lease and the pending sweep finish its change (ADR
-//! §2.5, "Three things finish a crashed change").
+//! dead-letter queue, which pages: no intent is dropped in silence. No
+//! writer sends one before the finisher exists; once the chains are
+//! wired, the freshness lease and the pending sweep are the other two
+//! ways a crashed change is finished (ADR §2.5, "Three things finish a
+//! crashed change").
 //!
 //! # Inside the Worker
 //!
