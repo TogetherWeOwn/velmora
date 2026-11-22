@@ -10,8 +10,9 @@
 //! leaves it set: the emptied unit is re-created only with a `restore`
 //! token, which needs the entry). That record also clears an undo's key
 //! freeze (`keys_frozen`), and the tool then writes `KeysThawed` in the
-//! owner's key chain ([`thaw_keys`]). Then the unit is synced closed
-//! under the new entry. A new `since_seq` per window means that a
+//! owner's key chain ([`thaw_keys`]). Then an unborn unit is created
+//! again with a `restore` token, and the unit is synced closed under the
+//! new entry. A new `since_seq` per window means that a
 //! given-up window's import, seal or report never matches this one's.
 //!
 //! **Refusal (AM-53).** P12 (AM-47, [`super::move_preflight::p12`])
@@ -83,8 +84,13 @@ pub trait WindowUnit {
     /// root unit's `restoring` entry: the unit closes under it.
     async fn sync(&self, owner: &TenantDoor) -> crate::types::Result<Synced>;
     /// The import the unit holds (`ImportProgress`, with its tenant-0
-    /// seq): `None` when it holds none.
+    /// seq): `None` when it holds none, an unborn unit included.
     async fn import_state(&self) -> crate::types::Result<Option<ImportState>>;
+    /// After the owner's record of step 2: an unborn unit (emptied by a
+    /// give-up's or an undo's `deleteAll()`) is created again with a
+    /// `restore` token for the entry that record set (ADR §2.4 rule 6,
+    /// AM-53); a unit that exists is left alone.
+    async fn ensure_born(&self, owner: &TenantDoor) -> crate::types::Result<()>;
 }
 
 /// What step 2 did.
@@ -234,6 +240,7 @@ where
     // window (a placement) keeps it, a re-entry of 8(b) sets a later one.
     let head = head_of(chain, owner).await?;
     if head.restoring_entry(0).is_some() {
+        unit.ensure_born(&head).await?;
         match unit.sync(&head).await? {
             Synced::Ok => {}
             Synced::Refused(r) => return Err(WindowError::SyncRefused(r)),

@@ -281,10 +281,17 @@ pub trait UndoKeys: OwnerKeys + KeyFreeze {
     async fn put_flat_revocation(&self, akid: &str) -> crate::types::Result<()>;
 }
 
-/// The undo's receipt in R2 (AM-28): the `K_u` its step 1 froze at.
+/// The undo's receipt in R2 (AM-28): the `K_u` its step 1 froze at. One
+/// receipt per undo of one flip: the wiring names it by the owner and
+/// tenant 0's flip stamp, so an undo of a later move never reads an
+/// earlier one's.
 #[allow(async_fn_in_trait)]
 pub trait UndoReceipt {
+    /// The `K_u` the receipt names, `None` before step 1 wrote it.
     async fn k_u(&self) -> crate::types::Result<Option<u64>>;
+    /// Writes `k_u`, **replacing** what the receipt named (a freeze the
+    /// tool ended with `KeysThawed` is replaced by the new one). The tool
+    /// reads it back before the tenant record.
     async fn put_k_u(&self, k_u: u64) -> crate::types::Result<()>;
 }
 
@@ -409,6 +416,33 @@ async fn frozen_owner<S: RecordStore, C: ControlSeal>(
     let frozen = head.keys_frozen.is_some_and(|f| f.at == k_u) && head.restoring_entry(0).is_some();
     match frozen {
         true => Ok(head),
+        false => Err(UndoError::NotFrozen),
+    }
+}
+
+/// Steps 2 to 7 run only inside the undo: the owner frozen at `k_u` with
+/// its entry, and tenant 0 still `moved` into the owner, read from its
+/// chain. Once tenant 0's undo `d1` record exists, D1 is the catalogue
+/// again and no step may write to it (a re-run of the copy would bring
+/// back rows deleted since). Answers tenant 0's head.
+async fn undo_open<S: RecordStore, C: ControlSeal>(
+    chain: &TenantChain<'_, S, C>,
+    owner: &Tenant,
+    k_u: u64,
+) -> Result<TenantDoor> {
+    frozen_owner(chain, owner, k_u).await?;
+    let zero = head_of(chain, &Tenant::Zero).await?;
+    match moved_into(&zero, owner) {
+        true => Ok(zero),
+        false => Err(UndoError::NotThisMove),
+    }
+}
+
+/// The key chain still frozen at `k_u` (AM-28): a thaw that raced the
+/// undo, or a `K_u` that is not this freeze's, stops the step.
+async fn key_chain_frozen<K: KeyFreeze>(keys: &K, k_u: u64) -> Result<()> {
+    match keys.key_head().await?.frozen_at == Some(k_u) {
+        true => Ok(()),
         false => Err(UndoError::NotFrozen),
     }
 }
@@ -552,11 +586,23 @@ where
     // only through it.
     if receipt_k_u != Some(k_u) {
         receipt.put_k_u(k_u).await?;
+        match receipt.k_u().await? {
+            Some(r) if r == k_u => {}
+            Some(r) => {
+                return Err(UndoError::ReceiptDiffers {
+                    receipt: r,
+                    head: k_u,
+                })
+            }
+            None => return Err(UndoError::NotFrozen),
+        }
     }
     let head = door_of(chain.freeze_for_undo(owner, 0, k_u, now, head.seq).await?);
     if head.keys_frozen.map(|f| f.at) != Some(k_u) {
         return Err(UndoError::NotFrozen);
     }
+    // No thaw raced the tenant record.
+    key_chain_frozen(keys, k_u).await?;
     close(unit, &head).await?;
     dir.apply_tenant(&head, now).await?;
     Ok(k_u)
@@ -664,14 +710,23 @@ async fn migration_names<S: Sql>(db: &S) -> Result<BTreeSet<String>> {
 }
 
 /// Step 2 on the fresh D1 `fresh`, whose catalogue id is `catalogue_id`,
-/// against the frozen one and tenant 0's head `zero` (`moved` into the
-/// owner). See the [module](self).
-pub async fn prepare_fresh<F: Sql, D: Sql>(
+/// against the frozen one, inside the undo of the move into `owner`
+/// frozen at `k_u`. See the [module](self).
+pub async fn prepare_fresh<S, C, F, D>(
+    chain: &TenantChain<'_, S, C>,
     frozen: &F,
     fresh: &D,
-    zero: &TenantDoor,
+    owner: &Tenant,
+    k_u: u64,
     catalogue_id: &str,
-) -> Result<()> {
+) -> Result<()>
+where
+    S: RecordStore,
+    C: ControlSeal,
+    F: Sql,
+    D: Sql,
+{
+    let zero = undo_open(chain, owner, k_u).await?;
     let z = zero.tenant_zero.as_ref().ok_or(UndoError::NotThisMove)?;
     let m = z.moved.as_ref().ok_or(UndoError::NotThisMove)?;
     if !super::transition::valid_name(catalogue_id)
@@ -865,24 +920,46 @@ fn key_cmp(a: &[ImportValue], b: &[ImportValue]) -> std::cmp::Ordering {
     a.len().cmp(&b.len())
 }
 
+/// The undo a step acts on: the owner, the freeze, the fresh catalogue.
+#[derive(Clone, Copy, Debug)]
+pub struct Undo<'a> {
+    pub owner: &'a Tenant,
+    /// `K_u`, from step 1 ([`freeze_keys`]).
+    pub k_u: u64,
+    /// The fresh D1's catalogue id (step 2).
+    pub catalogue_id: &'a str,
+}
+
 /// Step 3 with step 4: every table the unit imports, from the unit into
 /// the fresh D1. See the [module](self). `now` decides whether an outbox
 /// lease is live.
-pub async fn copy_back<U, F, D, T, B>(
+#[allow(clippy::too_many_arguments)]
+pub async fn copy_back<S, C, U, F, D, T, B>(
+    chain: &TenantChain<'_, S, C>,
     unit: &U,
     frozen: &F,
     fresh: &D,
     transform: &T,
     blobs: &B,
+    undo: &Undo<'_>,
     now: UnixMs,
 ) -> Result<Vec<TableBack>>
 where
+    S: RecordStore,
+    C: ControlSeal,
     U: UndoUnit,
     F: Sql,
     D: Sql,
     T: ReverseTransform,
     B: BlobsBack,
 {
+    undo_open(chain, undo.owner, undo.k_u).await?;
+    // The fresh D1 of this undo, never raised yet: no Worker has served
+    // from it, so nothing it holds is newer than the unit.
+    match stamp_row(fresh).await? {
+        Some((0, id)) if id == undo.catalogue_id => {}
+        _ => return Err(UndoError::FreshCatalogue("fresh_not_prepared_or_serving")),
+    }
     preflight(unit).await?;
     let mut out = Vec::new();
     for table in ImportTable::ALL {
@@ -1291,6 +1368,11 @@ pub async fn entries_to<K: OwnerKeys>(keys: &K, k_u: u64) -> Result<Vec<KeyEntry
         if last <= from {
             return Err(UndoError::Keys(KeyStepError::Diverged));
         }
+        // A held entry may lack its private grant limits: the move sends
+        // records as they state, never held.
+        if let Some(e) = page.iter().find(|e| e.held && e.last_seq <= k_u) {
+            return Err(UndoError::Keys(KeyStepError::HeldEntry(e.id.clone())));
+        }
         out.extend(page.into_iter().filter(|e| e.last_seq <= k_u));
         from = last;
     }
@@ -1382,7 +1464,8 @@ where
     K: UndoKeys,
     T: ReverseTransform,
 {
-    frozen_owner(chain, owner, k_u).await?;
+    undo_open(chain, owner, k_u).await?;
+    key_chain_frozen(keys, k_u).await?;
     let entries = entries_to(keys, k_u).await?;
     let ids: BTreeSet<String> = entries.iter().map(|e| e.id.clone()).collect();
     let before = keys_held(frozen, &ids).await?;
@@ -1568,8 +1651,7 @@ where
     K: UndoKeys,
     R: RecordsBack,
 {
-    frozen_owner(chain, owner, k_u).await?;
-    let zero = head_of(chain, &Tenant::Zero).await?;
+    let zero = undo_open(chain, owner, k_u).await?;
     let flipped_at = zero
         .tenant_zero
         .as_ref()
@@ -1638,7 +1720,7 @@ where
     R: RouteRecords,
     K: OwnerKeys,
 {
-    frozen_owner(chain, owner, k_u).await?;
+    undo_open(chain, owner, k_u).await?;
     let zero = Tenant::Zero;
     let entries = entries_to(keys, k_u).await?;
     let ids = project(entries, &BTreeSet::new(), &BTreeSet::new()).keys;
@@ -1719,7 +1801,7 @@ where
     T: ReverseTransform,
     B: BlobsBack,
 {
-    frozen_owner(chain, owner, k_u).await?;
+    undo_open(chain, owner, k_u).await?;
     let mut done = VerifiedBack::default();
     for table in ImportTable::ALL {
         let n = v1_table(unit, fresh, table).await?;
@@ -1827,8 +1909,9 @@ async fn v1_table<U: UndoUnit, D: Sql>(unit: &U, fresh: &D, table: ImportTable) 
     Ok(total)
 }
 
-/// V3: every held extent of the fresh D1 has its flat safety copy with
-/// its digest (a full read; held extents are few). Pages the held index.
+/// V3: every held or releasing extent of the fresh D1 has its flat safety
+/// copy with its digest (a full read; such extents are few). Pages the
+/// `extents_safety` index.
 async fn v3<D: Sql, B: BlobsBack>(fresh: &D, blobs: &B) -> Result<u64> {
     let mut after = String::new();
     let mut failed = Vec::new();
@@ -1836,8 +1919,10 @@ async fn v3<D: Sql, B: BlobsBack>(fresh: &D, blobs: &B) -> Result<u64> {
     loop {
         let rows = fresh
             .query(
-                "SELECT id, cipher_sha256 FROM extents WHERE safety_state = 'held' AND id > ?1 \
-                 ORDER BY id LIMIT 500",
+                // The index's own condition, word for word: the planner
+                // takes a partial index only then.
+                "SELECT id, cipher_sha256 FROM extents INDEXED BY extents_safety \
+                 WHERE safety_state IN ('held', 'releasing') AND id > ?1 ORDER BY id LIMIT 500",
                 &[SqlValue::Text(after.clone())],
             )
             .await?;
@@ -2209,6 +2294,21 @@ where
     if z.selector != Selector::Moved && !done {
         return Err(UndoError::NotThisMove);
     }
+    // The D1 the record names is the one in hand: its stamp row's id, no
+    // cutover marker, and for the fallback the frozen catalogue thawed.
+    let named = match &back {
+        Back::Fresh(id) => *id,
+        Back::Frozen(_) => m.catalogue_id_frozen.as_str(),
+    };
+    if !matches!(stamp_row(d1).await?, Some((_, id)) if id == named) {
+        return Err(UndoError::FreshCatalogue("d1_is_not_the_named_catalogue"));
+    }
+    if marker(d1).await?.is_some() {
+        return Err(UndoError::FreshCatalogue("d1_has_marker"));
+    }
+    if matches!(back, Back::Frozen(_)) && !super::fence::freeze_state(d1).await?.thawed() {
+        return Err(UndoError::FreshCatalogue("frozen_d1_not_thawed"));
+    }
     let change = match back {
         Back::Fresh(id) => Change::UndoMove {
             undo_stamp,
@@ -2224,7 +2324,14 @@ where
         .await?;
     let wrote = matches!(written, Written::Wrote(_));
     dir.apply_tenant(&door_of(written), now).await?;
-    // Just before the lift deploy: every revocation put since the build.
+    // Just before the lift deploy: every revocation put since the build,
+    // flat first, so a later restore of tenant 0 (which reads only flat
+    // `m/rk/`) keeps it revoked (DS1 §3.7 step 5, ADR §8.5).
+    let owners =
+        list_all(|after| async move { keys.tenant_revocations(after.as_deref()).await }).await?;
+    for id in owners.iter().filter(|id| crate::recovery::valid_key_id(id)) {
+        keys.put_flat_revocation(id).await?;
+    }
     let overridden = override_revocations(d1, keys).await?;
     let unplaced = exit_placements(chain, dir, keys, owner, now).await?;
     Ok(FlippedBack {

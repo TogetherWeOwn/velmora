@@ -300,9 +300,11 @@ fn key_text(key: &[SqlValue]) -> String {
 
 /// P8 (AM-28): the keys among `mapped` (every key the `keymap` maps to
 /// the owner, `drop` keys left out) that have the owner's revocation
-/// `m/rk/<t>/<akid>` and still a row in `d1`'s `access_keys` (tenant 0's
-/// revoke removes the row). A non-empty answer stops the move before
-/// step 0. One point lookup per key with a revocation.
+/// `m/rk/<t>/<akid>` and are still served by `d1`: an `active` row, or a
+/// row with a grant. Tenant 0's revoke removes the row; a give-up's
+/// revocation leaves it `disabled` with no grant, which counts as
+/// revoked. A non-empty answer stops the move before step 0. Two point
+/// lookups per key with a revocation.
 pub async fn p8_stale_revocations<S: Sql, K: super::move_keys::OwnerKeys>(
     d1: &S,
     keys: &K,
@@ -313,13 +315,17 @@ pub async fn p8_stale_revocations<S: Sql, K: super::move_keys::OwnerKeys>(
         if !keys.tenant_revoked(akid).await? {
             continue;
         }
-        let rows = d1
+        let id = [SqlValue::Text(akid.clone())];
+        let active = d1
             .query(
-                "SELECT 1 FROM access_keys WHERE access_key_id = ?1",
-                &[SqlValue::Text(akid.clone())],
+                "SELECT 1 FROM access_keys WHERE access_key_id = ?1 AND status = 'active'",
+                &id,
             )
             .await?;
-        if !rows.is_empty() {
+        let granted = d1
+            .query("SELECT 1 FROM grants WHERE access_key_id = ?1 LIMIT 1", &id)
+            .await?;
+        if !active.is_empty() || !granted.is_empty() {
             stale.push(akid.clone());
         }
     }
@@ -327,16 +333,14 @@ pub async fn p8_stale_revocations<S: Sql, K: super::move_keys::OwnerKeys>(
 }
 
 /// P2 (AM-44): whether the stamp prefix `rs/<t>.<u>/` of a unit the move
-/// fills lets the move start: empty, or the unit's stamp levelling
-/// (W4-gate) is live (`levelling_live`). One list call of one key.
+/// fills is empty, so the move may start. One list call of one key. A
+/// prefix that holds stamps stops the move until step 8(b) levels the
+/// unit's counter before its `move` report (W4-gate's stamp levelling),
+/// which this code does not do yet.
 pub async fn p2_stamp_prefix_clear<B: crate::ports::BlobStore>(
     safety: &B,
     unit: &crate::unit::name::UnitName,
-    levelling_live: bool,
 ) -> Result<bool> {
-    if levelling_live {
-        return Ok(true);
-    }
     let prefix = format!(
         "{}{}/",
         crate::stamp::STAMP_PREFIX,

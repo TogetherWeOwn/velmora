@@ -61,6 +61,7 @@ use std::collections::BTreeSet;
 use super::chain::{ChainError, ControlSeal, TenantChain, Written};
 use super::fence::{legacy_stamp_key, marker, put_legacy_stamp, stamp_row};
 use super::move_keys::{apply_owner_keys, revocation_sweep, KeyStepError, KeyUnit, OwnerKeys};
+use super::move_window::window_start;
 use super::record::{Lifecycle, Selector, Tenant, TenantDoor};
 use super::store::{RouteKind, SqlDirectory};
 use super::transition::{Actor, Change, MAX_MOVED_BUCKETS};
@@ -185,7 +186,11 @@ pub trait OwnerUnit: KeyUnit {
     /// without unit 0's entry, the proof of the newest record of this
     /// window that lifted it (that record, or one below `owner`); `None`
     /// for a head that has the entry. The unit lifts when its own check
-    /// gives that proof; a refusal comes back as [`Synced::Refused`].
+    /// gives that proof. Every refusal the unit answers comes back as
+    /// [`Synced::Refused`] with its code (the gate's as `Gate(code)`,
+    /// `closed` among them); an answer that was lost, a `Failed` answer
+    /// and an unborn unit come back as `Err`, and (b) reads the unit
+    /// before it acts on them (AM-45).
     async fn sync(
         &self,
         owner: &TenantDoor,
@@ -493,8 +498,14 @@ where
     // the give-up closes it.
     if !routes_started && !unit.v9().await? {
         // The result first, so a re-run after a crash anywhere below
-        // gives up too (AM-52).
-        receipt.put_v9_failed().await?;
+        // gives up too (AM-52). A receipt that cannot be written does not
+        // stop the give-up: tenant 0's `d1` record ends the window too, and
+        // no later run can sample V9 again or flip.
+        for _ in 0..V9_GIVE_UP_TRIES {
+            if receipt.put_v9_failed().await.is_ok() {
+                break;
+            }
+        }
         return give_up_after_v9(
             chain, frozen, safety, dir, unit, routes, keys, window, &zero, now,
         )
@@ -711,9 +722,18 @@ where
             }
         };
         // An entry above the window's first is a re-entry already made
-        // (by this run or an earlier one): once per window.
+        // (by this run or an earlier one): once per window. The window's
+        // first entry is the one its step 2 set (`window_entry`), when the
+        // owner's head names this window; else the caller's.
         let since = proof.replay_id.since;
-        if since > window.since {
+        let first = match window_start(chain, zero, window.owner).await {
+            Ok(start) => owner
+                .window_entry
+                .filter(|w| w.zero_seq == start && w.unit == 0)
+                .map_or(window.since, |w| w.since_seq.min(window.since)),
+            Err(_) => window.since,
+        };
+        if since > first {
             reentries = reentries.max(MAX_REENTRIES);
         }
         if fixed_for != Some(since) {

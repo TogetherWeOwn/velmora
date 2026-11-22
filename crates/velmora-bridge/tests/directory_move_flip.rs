@@ -709,9 +709,16 @@ async fn window_with(placed: bool) -> Move {
         )
         .await
         .seq;
-    let closed = m
-        .write(&o, Change::SetRestoring { unit: 0 }, Actor::Operator)
-        .await;
+    // Step 2's owner record (AM-53).
+    let closed = match m
+        .chain()
+        .open_window_entry(&o, 0, m.zero_seq, m.rig.now(), 0)
+        .await
+        .unwrap()
+    {
+        Written::Wrote(r) => r.door,
+        Written::Unchanged(r) => r.door,
+    };
     m.since = closed.restoring_entry(0).unwrap().since_seq;
     if placed {
         m.place().await;
@@ -1938,19 +1945,15 @@ fn the_lift_needs_this_windows_sealed_import() {
 fn a_failed_v9_in_the_receipt_gives_up_without_a_second_sample() {
     block_on(async {
         let m = window().await;
-        m.unit.v9_ok.set(false);
-        // The receipt write is not reached: nothing of the give-up runs.
-        m.receipt.fail.set(1);
-        assert!(matches!(m.flip().await, Err(FlipError::Store(_))));
-        assert_eq!(m.selector().await, Selector::Moving);
-        assert_eq!(m.unit.v9_runs.get(), 1);
-        // The receipt holds the failure, the d1 record is not written yet
-        // (a crash right after the receipt): the re-run gives up.
+        // A run sampled V9, wrote the failure to the receipt and crashed
+        // before tenant 0's `d1` record: the window is still open.
         m.receipt.v9_failed.set(true);
         m.unit.v9_ok.set(true);
         let r = m.flip().await;
         assert!(matches!(r, Err(FlipError::V9Failed)), "{r:?}");
-        assert_eq!(m.unit.v9_runs.get(), 1);
+        // Never lifted again, never sampled again.
+        assert_eq!(m.unit.v9_runs.get(), 0);
+        assert_eq!(m.unit.reports.get(), 0);
         assert_eq!(m.selector().await, Selector::D1);
         assert!(m.routes.records.borrow().is_empty());
         let o = m.head(&owner()).await;
@@ -2054,5 +2057,46 @@ fn a_lost_lift_answer_is_read_from_the_unit() {
         let f = m.flip().await.map_err(|e| format!("{e:?}")).unwrap();
         assert!(f.wrote);
         assert_flipped(&m, f.stamp).await;
+    });
+}
+
+/// AM-45's once-per-window re-entry holds across a crash even when the
+/// caller names the re-entry's entry as the window's: the first entry is
+/// the one window step 2 recorded (`window_entry`).
+#[test]
+fn the_re_entry_count_starts_at_the_windows_step_two_entry() {
+    block_on(async {
+        let mut m = window().await;
+        m.unit.refuse_lift.set(1);
+        m.unit.fail_after_refusal.set(true);
+        assert!(m.flip().await.is_err());
+        let s2 = m.head(&owner()).await.restoring_entry(0).unwrap().since_seq;
+        assert!(s2 > m.since);
+        // A resumed tool binds the window to the current entry.
+        m.since = s2;
+        m.unit.refuse_lift.set(1);
+        let r = m.flip().await;
+        assert!(
+            matches!(r, Err(FlipError::SyncRefused(UnitRefused::Gate(_)))),
+            "{r:?}"
+        );
+    });
+}
+
+/// AM-52: a receipt that cannot be written does not keep the window
+/// open: the give-up runs, and no later run samples V9 again.
+#[test]
+fn a_receipt_that_cannot_be_written_still_gives_up() {
+    block_on(async {
+        let m = window().await;
+        m.unit.v9_ok.set(false);
+        m.receipt.fail.set(99);
+        let r = m.flip().await;
+        assert!(matches!(r, Err(FlipError::V9Failed)), "{r:?}");
+        assert_eq!(m.selector().await, Selector::D1);
+        m.unit.v9_ok.set(true);
+        assert!(m.flip().await.is_err());
+        assert_eq!(m.unit.v9_runs.get(), 1);
+        assert!(m.routes.records.borrow().is_empty());
     });
 }

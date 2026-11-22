@@ -69,6 +69,7 @@ struct FakeUnit {
     syncs: Cell<u32>,
     extra_tables: RefCell<Vec<String>>,
     import: RefCell<Option<ImportState>>,
+    born: Cell<u32>,
 }
 
 impl FakeUnit {
@@ -79,6 +80,7 @@ impl FakeUnit {
             syncs: Cell::new(0),
             extra_tables: RefCell::default(),
             import: RefCell::default(),
+            born: Cell::new(0),
         }
     }
 }
@@ -147,6 +149,12 @@ impl WindowUnit for FakeUnit {
 
     async fn import_state(&self) -> Result<Option<ImportState>> {
         Ok(self.import.borrow().clone())
+    }
+
+    async fn ensure_born(&self, owner: &TenantDoor) -> Result<()> {
+        assert!(owner.restoring_entry(0).is_some(), "born closed");
+        self.born.set(self.born.get() + 1);
+        Ok(())
     }
 }
 
@@ -524,6 +532,8 @@ struct Undo {
     records: FakeRecords,
     routes: FakeRoutes,
     fresh: RusqliteSql,
+    /// `K_u` of the last step 1.
+    k_u: Cell<u64>,
     vault: String,
     canary: String,
     /// The bucket made after the move.
@@ -593,7 +603,7 @@ impl Undo {
     }
 
     async fn freeze(&self) -> std::result::Result<u64, UndoError> {
-        freeze_keys(
+        let k_u = freeze_keys(
             &self.chain(),
             &self.dir(),
             &self.unit,
@@ -602,19 +612,45 @@ impl Undo {
             &owner(),
             self.rig.now(),
         )
+        .await?;
+        self.k_u.set(k_u);
+        Ok(k_u)
+    }
+
+    async fn prepare(&self, id: &str) -> std::result::Result<(), UndoError> {
+        prepare_fresh(
+            &self.chain(),
+            self.frozen(),
+            &self.fresh,
+            &owner(),
+            self.k_u.get(),
+            id,
+        )
+        .await
+    }
+
+    async fn copy_into<D: Sql>(&self, fresh: &D) -> std::result::Result<Vec<TableBack>, UndoError> {
+        let o = owner();
+        let undo = velmora_bridge::directory::move_undo::Undo {
+            owner: &o,
+            k_u: self.k_u.get(),
+            catalogue_id: FRESH_ID,
+        };
+        copy_back(
+            &self.chain(),
+            &self.unit,
+            self.frozen(),
+            fresh,
+            &self.transform,
+            &self.blobs,
+            &undo,
+            self.rig.now(),
+        )
         .await
     }
 
     async fn copy(&self) -> std::result::Result<Vec<TableBack>, UndoError> {
-        copy_back(
-            &self.unit,
-            self.frozen(),
-            &self.fresh,
-            &self.transform,
-            &self.blobs,
-            self.rig.now(),
-        )
-        .await
+        self.copy_into(&self.fresh).await
     }
 
     async fn build(&self, k_u: u64) -> std::result::Result<KeysBack, UndoError> {
@@ -662,14 +698,7 @@ impl Undo {
     /// Steps 1 to 7 of the reverse move. Answers `K_u`.
     async fn up_to_verify(&self) -> u64 {
         let k_u = self.freeze().await.unwrap();
-        prepare_fresh(
-            self.frozen(),
-            &self.fresh,
-            &self.head(&Tenant::zero()).await,
-            FRESH_ID,
-        )
-        .await
-        .unwrap();
+        self.prepare(FRESH_ID).await.unwrap();
         self.copy().await.unwrap();
         self.build(k_u).await.unwrap();
         revocations_back(
@@ -831,6 +860,7 @@ async fn flipped() -> Undo {
         records: FakeRecords::default(),
         routes: FakeRoutes::default(),
         fresh: RusqliteSql::with_schema_unarmed().unwrap(),
+        k_u: Cell::new(0),
         vault,
         canary,
         photos: String::new(),
@@ -1281,6 +1311,38 @@ fn step_one_refuses_what_the_undo_cannot_hold() {
 
         let u = flipped().await;
         let o2 = Tenant::parse("t_00000000000000b2").unwrap();
+        // A live tenant that no move filled: tenant 0 is `moved` into the
+        // owner, not into it.
+        for (change, actor) in [
+            (
+                Change::Create {
+                    jurisdiction: "us".into(),
+                    location_hint: None,
+                    synthetic: false,
+                    limits: Default::default(),
+                    rate_json: Default::default(),
+                    features_json: Default::default(),
+                },
+                Actor::TenantCreation,
+            ),
+            (
+                Change::ClaimKeyVersion { version: 1 },
+                Actor::TenantCreation,
+            ),
+            (
+                Change::CommitKeyVersion {
+                    version: 1,
+                    kcv: [2; KEY_CHECK_LEN],
+                },
+                Actor::TenantCreation,
+            ),
+            (
+                Change::Activate { external_ref: None },
+                Actor::TenantCreation,
+            ),
+        ] {
+            u.write(&o2, change, actor).await;
+        }
         let r = freeze_keys(
             &u.chain(),
             &u.dir(),
@@ -1291,7 +1353,7 @@ fn step_one_refuses_what_the_undo_cannot_hold() {
             u.rig.now(),
         )
         .await;
-        assert!(r.is_err());
+        assert!(matches!(r, Err(UndoError::NotThisMove)), "{r:?}");
         assert_eq!(u.keys.frozen_at(), None);
     });
 }
@@ -1430,9 +1492,12 @@ fn the_reverse_move_gives_back_a_correct_d1() {
         assert_eq!(o.keys_frozen, Some(KeysFrozen { at: k_u }));
         let revoked: BTreeSet<String> = u.keys.grants_revoked.borrow()[0].iter().cloned().collect();
         assert_eq!(revoked, BTreeSet::from([u.vault.clone(), u.photos.clone()]));
-        // The exit's records are above K_u and change nothing in D1.
+        // The exit's records are above K_u. Once tenant 0 is `d1` again,
+        // D1 is the catalogue: no step of the undo runs on it again.
         assert!(u.keys.seq() > k_u);
-        u.verify(k_u).await.unwrap();
+        assert!(matches!(u.verify(k_u).await, Err(UndoError::NotThisMove)));
+        assert!(matches!(u.copy().await, Err(UndoError::NotThisMove)));
+        assert!(matches!(u.build(k_u).await, Err(UndoError::NotThisMove)));
         // A re-run of step 8 writes nothing.
         let again = u.flip(k_u).await.unwrap();
         assert!(!again.wrote && !again.unplaced);
@@ -1460,8 +1525,9 @@ fn a_revoke_during_the_freeze_reaches_the_fresh_d1() {
         );
         assert!(u.fresh_key(NEW_KEY).await.is_none());
         assert!(u.fresh_key(UNDER_NARROW).await.is_none());
-        // V6 holds with the same override.
-        u.verify(k_u).await.unwrap();
+        // The owner's revocation is flat now too: a later restore of
+        // tenant 0, which reads only flat ones, keeps it revoked.
+        assert!(u.keys.flat.borrow().contains(NEW_KEY));
     });
 }
 
@@ -1473,14 +1539,7 @@ fn the_key_build_stops_at_k_u() {
     block_on(async {
         let u = flipped().await;
         let k_u = u.freeze().await.unwrap();
-        prepare_fresh(
-            u.frozen(),
-            &u.fresh,
-            &u.head(&Tenant::zero()).await,
-            FRESH_ID,
-        )
-        .await
-        .unwrap();
+        u.prepare(FRESH_ID).await.unwrap();
         u.copy().await.unwrap();
         u.keys.push(
             NEW_KEY,
@@ -1507,28 +1566,13 @@ fn a_copy_that_stopped_resumes_from_the_fresh_d1() {
     block_on(async {
         let u = flipped().await;
         let k_u = u.freeze().await.unwrap();
-        prepare_fresh(
-            u.frozen(),
-            &u.fresh,
-            &u.head(&Tenant::zero()).await,
-            FRESH_ID,
-        )
-        .await
-        .unwrap();
+        u.prepare(FRESH_ID).await.unwrap();
         for budget in [0u32, 1, 3, 5, 8] {
             let flaky = Flaky {
                 inner: &u.fresh,
                 budget: Cell::new(Some(budget)),
             };
-            let r = copy_back(
-                &u.unit,
-                u.frozen(),
-                &flaky,
-                &u.transform,
-                &u.blobs,
-                u.rig.now(),
-            )
-            .await;
+            let r = u.copy_into(&flaky).await;
             if r.is_ok() {
                 break;
             }
@@ -1633,6 +1677,7 @@ fn outbox_leases_are_judged_as_the_forward_copy_judges_them() {
     block_on(async {
         let u = flipped().await;
         u.freeze().await.unwrap();
+        u.prepare(FRESH_ID).await.unwrap();
         let now = u.rig.now().0;
         let expired = u
             .unit
@@ -1660,6 +1705,7 @@ fn outbox_leases_are_judged_as_the_forward_copy_judges_them() {
         }
         let u = flipped().await;
         u.freeze().await.unwrap();
+        u.prepare(FRESH_ID).await.unwrap();
         u.unit
             .db
             .exec(
@@ -1679,13 +1725,19 @@ fn the_preflight_stops_on_a_table_left_behind() {
     block_on(async {
         let u = flipped().await;
         u.freeze().await.unwrap();
+        u.prepare(FRESH_ID).await.unwrap();
         u.unit.extra_tables.borrow_mut().push("photo_tags".into());
         match u.copy().await {
             Err(UndoError::UnknownTables(t)) => assert_eq!(t, vec!["photo_tags".to_string()]),
             other => panic!("{other:?}"),
         }
         assert!(last_rows(&u.fresh).await == 0);
+        // Not before step 1; and an open unit refuses every page.
         let u = flipped().await;
+        assert!(matches!(u.copy().await, Err(UndoError::NotFrozen)));
+        u.freeze().await.unwrap();
+        u.prepare(FRESH_ID).await.unwrap();
+        u.unit.closed.set(None);
         assert!(matches!(
             u.copy().await,
             Err(UndoError::ExportRefused { .. })
@@ -1708,10 +1760,15 @@ async fn last_rows(db: &RusqliteSql) -> usize {
 fn the_fresh_d1_is_checked_before_any_row() {
     block_on(async {
         let u = flipped().await;
-        let zero = u.head(&Tenant::zero()).await;
+        // Not before step 1.
+        assert!(matches!(
+            u.prepare(FRESH_ID).await,
+            Err(UndoError::NotFrozen)
+        ));
+        u.freeze().await.unwrap();
         for id in ["main", "", "no/slash"] {
             assert!(matches!(
-                prepare_fresh(u.frozen(), &u.fresh, &zero, id).await,
+                u.prepare(id).await,
                 Err(UndoError::FreshCatalogue("catalogue_id_not_fresh"))
             ));
         }
@@ -1729,7 +1786,7 @@ fn the_fresh_d1_is_checked_before_any_row() {
             )
             .await
             .unwrap();
-        match prepare_fresh(u.frozen(), &u.fresh, &zero, FRESH_ID).await {
+        match u.prepare(FRESH_ID).await {
             Err(UndoError::Migrations { missing, extra }) => {
                 assert_eq!(missing, vec!["0022_parity.sql".to_string()]);
                 assert_eq!(extra, vec!["0099_new.sql".to_string()]);
@@ -1737,27 +1794,25 @@ fn the_fresh_d1_is_checked_before_any_row() {
             other => panic!("{other:?}"),
         }
         let u = flipped().await;
-        prepare_fresh(u.frozen(), &u.fresh, &zero, FRESH_ID)
-            .await
-            .unwrap();
+        u.freeze().await.unwrap();
+        u.prepare(FRESH_ID).await.unwrap();
         assert_eq!(
             stamp_row(&u.fresh).await.unwrap(),
             Some((0, FRESH_ID.to_string()))
         );
         // Run again: unchanged.
-        prepare_fresh(u.frozen(), &u.fresh, &zero, FRESH_ID)
-            .await
-            .unwrap();
+        u.prepare(FRESH_ID).await.unwrap();
         assert!(matches!(
-            prepare_fresh(u.frozen(), &u.fresh, &zero, "undo2").await,
+            u.prepare("undo2").await,
             Err(UndoError::FreshCatalogue("stamp_row_names_another_id"))
         ));
         let u = flipped().await;
+        u.freeze().await.unwrap();
         u.fresh
             .exec("INSERT INTO meta (k, v) VALUES ('cutover_marker', 1)", &[])
             .await
             .unwrap();
-        let r = prepare_fresh(u.frozen(), &u.fresh, &zero, FRESH_ID).await;
+        let r = u.prepare(FRESH_ID).await;
         assert!(matches!(r, Err(UndoError::FreshCatalogue(_))), "{r:?}");
     });
 }
@@ -1855,6 +1910,26 @@ fn step_eight_needs_this_undos_freeze() {
             u.rig.now(),
         )
         .await;
+        assert!(matches!(r, Err(UndoError::FreshCatalogue(_))), "{r:?}");
+        // A fresh D1 whose stamp row names "main" is refused by the record.
+        u.fresh
+            .exec(
+                "INSERT INTO rollback_stamp VALUES (1, 0, 'main', NULL)",
+                &[],
+            )
+            .await
+            .unwrap();
+        let r = flip_back(
+            &u.chain(),
+            &u.dir(),
+            &u.fresh,
+            &u.keys,
+            &owner(),
+            k_u,
+            "main",
+            u.rig.now(),
+        )
+        .await;
         assert!(matches!(r, Err(UndoError::Chain(_))), "{r:?}");
         assert_eq!(
             u.head(&Tenant::zero()).await.tenant_zero.unwrap().selector,
@@ -1935,6 +2010,8 @@ fn the_next_window_thaws_the_undo_and_sets_a_new_entry() {
         assert_eq!(o.restoring.len(), 1);
         assert_eq!(o.restoring_entry(0).unwrap().since_seq, opened.since);
         assert_eq!(u.unit.closed.get(), Some(opened.since));
+        // An emptied unit is created again (restore token) before it closes.
+        assert_eq!(u.unit.born.get(), 1);
         let z = u.head(&Tenant::zero()).await;
         assert_eq!(z.seq, opened.zero_seq);
         assert_eq!(z.tenant_zero.unwrap().selector, Selector::Moving);
@@ -2068,7 +2145,7 @@ fn p2_and_p8_lines_of_a_second_move() {
         let tid = velmora_bridge::unit::TenantId::parse(OWNER).unwrap();
         let unit = UnitName::new(tid.clone(), 0);
         let safety = &u.rig.bridge.safety;
-        assert!(p2_stamp_prefix_clear(safety, &unit, false).await.unwrap());
+        assert!(p2_stamp_prefix_clear(safety, &unit).await.unwrap());
         let bucket = BucketId::mint([1; 8]);
         let extent = ExtentId::mint([2; 13]);
         let meta = BlobMeta {
@@ -2080,11 +2157,10 @@ fn p2_and_p8_lines_of_a_second_move() {
             .put(&format!("rs/{OWNER}.0/{:020}", 1), b"{}".to_vec(), &meta)
             .await
             .unwrap();
-        assert!(!p2_stamp_prefix_clear(safety, &unit, false).await.unwrap());
-        assert!(p2_stamp_prefix_clear(safety, &unit, true).await.unwrap());
+        assert!(!p2_stamp_prefix_clear(safety, &unit).await.unwrap());
         // Another unit's prefix is not this one's.
         let other = UnitName::new(tid, 1);
-        assert!(p2_stamp_prefix_clear(safety, &other, false).await.unwrap());
+        assert!(p2_stamp_prefix_clear(safety, &other).await.unwrap());
 
         let mapped = vec![AKID.to_string(), REVOKED.to_string()];
         assert!(p8_stale_revocations(u.frozen(), &u.keys, &mapped)
@@ -2118,6 +2194,7 @@ fn a_plan_revision_above_one_stops_the_copy() {
     block_on(async {
         let u = flipped().await;
         u.freeze().await.unwrap();
+        u.prepare(FRESH_ID).await.unwrap();
         u.unit
             .db
             .exec(
@@ -2133,5 +2210,137 @@ fn a_plan_revision_above_one_stops_the_copy() {
             .await
             .unwrap();
         assert!(n.is_empty());
+    });
+}
+
+/// The first revocation override, the build's last act: a revocation put
+/// before the build (its chain record refused by the freeze) removes the
+/// key from the fresh D1 before V6.
+#[test]
+fn the_builds_own_override_removes_a_revoked_key() {
+    block_on(async {
+        let u = flipped().await;
+        let k_u = u.freeze().await.unwrap();
+        u.prepare(FRESH_ID).await.unwrap();
+        u.copy().await.unwrap();
+        u.keys.tenant.borrow_mut().insert(AKID.into());
+        let built = u.build(k_u).await.unwrap();
+        assert_eq!(built.overridden, vec![AKID.to_string()]);
+        assert!(!built.carried.contains_key(AKID));
+        assert!(u.fresh_key(AKID).await.is_none());
+    });
+}
+
+/// A table of several pages and write chunks copies back whole, resumes
+/// after a stop between chunks, and V1 compares it page by page.
+#[test]
+fn a_table_of_many_pages_copies_back_and_verifies() {
+    block_on(async {
+        let u = flipped().await;
+        for hour in 1..=1_234i64 {
+            u.unit
+                .db
+                .exec(
+                    "INSERT INTO usage_hours (hour, posts, verifies, releases, dead, failures) \
+                     VALUES (?1, 1, 2, 3, 0, 0)",
+                    &[SqlValue::Int(hour)],
+                )
+                .await
+                .unwrap();
+        }
+        let k_u = u.freeze().await.unwrap();
+        u.prepare(FRESH_ID).await.unwrap();
+        let flaky = Flaky {
+            inner: &u.fresh,
+            budget: Cell::new(Some(7)),
+        };
+        assert!(u.copy_into(&flaky).await.is_err());
+        let done = u.copy().await.unwrap();
+        let n = rows_of(&u.fresh, ImportTable::UsageHours).await.len();
+        assert_eq!(n, rows_of(&u.unit.db, ImportTable::UsageHours).await.len());
+        assert!(n > 1_000);
+        assert!(done.iter().any(|t| t.table == "usage_hours"));
+        u.build(k_u).await.unwrap();
+        let v = u.verify(k_u).await.unwrap();
+        assert_eq!(v.rows["usage_hours"], n as u64);
+    });
+}
+
+/// The key build stops on a held entry and on a key chain that is no
+/// longer frozen at `K_u` (a thaw that raced the undo).
+#[test]
+fn the_key_build_refuses_a_held_entry_and_a_thawed_chain() {
+    block_on(async {
+        let u = flipped().await;
+        if let Some(KeyRecord::Entry(e)) = u.keys.records.borrow_mut().get_mut(2) {
+            e.held = true;
+        }
+        let k_u = u.freeze().await.unwrap();
+        u.prepare(FRESH_ID).await.unwrap();
+        u.copy().await.unwrap();
+        assert!(matches!(u.build(k_u).await, Err(UndoError::Keys(_))));
+
+        let u = flipped().await;
+        let k_u = u.freeze().await.unwrap();
+        u.prepare(FRESH_ID).await.unwrap();
+        u.copy().await.unwrap();
+        u.keys.records.borrow_mut().push(KeyRecord::Thawed(k_u));
+        assert!(matches!(u.build(k_u).await, Err(UndoError::NotFrozen)));
+    });
+}
+
+/// The fallback's flip needs the frozen catalogue thawed.
+#[test]
+fn the_fallback_flip_needs_the_thawed_frozen_d1() {
+    block_on(async {
+        let u = flipped().await;
+        let k_u = u.freeze().await.unwrap();
+        let r = flip_back_onto_frozen(
+            &u.chain(),
+            &u.dir(),
+            u.frozen(),
+            &u.keys,
+            &owner(),
+            k_u,
+            2,
+            u.rig.now(),
+        )
+        .await;
+        assert!(matches!(r, Err(UndoError::FreshCatalogue(_))), "{r:?}");
+        assert_eq!(
+            u.head(&Tenant::zero()).await.tenant_zero.unwrap().selector,
+            Selector::Moved
+        );
+    });
+}
+
+/// P8 counts a give-up's revocation (a `disabled` row with no grant) as
+/// revoked.
+#[test]
+fn p8_takes_a_disabled_row_without_grants_as_revoked() {
+    use velmora_bridge::directory::move_preflight::p8_stale_revocations;
+    block_on(async {
+        let u = flipped().await;
+        let frozen = &u.rig.bridge.catalog.sql;
+        thaw(frozen).await.unwrap();
+        frozen
+            .exec(
+                "DELETE FROM grants WHERE access_key_id = ?1",
+                &[SqlValue::Text(REVOKED.into())],
+            )
+            .await
+            .unwrap();
+        frozen
+            .exec(
+                "UPDATE access_keys SET status = 'disabled' WHERE access_key_id = ?1",
+                &[SqlValue::Text(REVOKED.into())],
+            )
+            .await
+            .unwrap();
+        let mapped = vec![AKID.to_string(), REVOKED.to_string()];
+        assert!(p8_stale_revocations(frozen, &u.keys, &mapped)
+            .await
+            .unwrap()
+            .is_empty());
     });
 }

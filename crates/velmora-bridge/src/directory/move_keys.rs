@@ -35,7 +35,10 @@ pub trait OwnerKeys {
     /// The seq of the owner's key-chain head (0: no record).
     async fn head(&self) -> Result<u64>;
     /// The verified entries of the records after `after`, in chain order,
-    /// at most `limit`: one entry per record, as the record states it.
+    /// at most `limit`: one entry per record, as the record states it. A
+    /// record that names no subject (`KeysFrozen`, `KeysThawed`, AM-28)
+    /// has no entry and is left out, so the seqs may have gaps; a record
+    /// that does not verify is an error, never left out.
     async fn entries(&self, after: u64, limit: usize) -> Result<Vec<KeyEntry>>;
     /// Whether tenant 0's flat revocation `m/rk/<akid>` exists.
     async fn flat_revoked(&self, akid: &str) -> Result<bool>;
