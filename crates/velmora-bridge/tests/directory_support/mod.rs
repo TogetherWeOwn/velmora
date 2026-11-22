@@ -54,6 +54,7 @@ const TABLES: [&str; 12] = [
 ];
 
 /// A directory database for one test.
+#[allow(clippy::large_enum_variant)]
 pub enum Db {
     Native(RusqliteSql),
     D1(D1Probe),
