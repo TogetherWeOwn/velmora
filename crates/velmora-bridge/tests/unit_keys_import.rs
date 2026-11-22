@@ -69,6 +69,7 @@ fn sync(
                 tenant_state: TenantState::Active,
                 tenant_mode: None::<HoldMode>,
                 restoring_since: restoring,
+                lift: None,
             },
         },
     )

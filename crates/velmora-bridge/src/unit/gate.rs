@@ -33,6 +33,7 @@ use crate::replay::ReplayReport;
 
 /// What the gate's last replay found, as the lift decision reads it.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GateFindings {
     /// The replay reached its end (`next` was `None`).
     pub complete: bool,

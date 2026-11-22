@@ -14,7 +14,9 @@ use super::birth::{BirthToken, ProvisionRefusal};
 use super::identity::{CallKind, Refusal, Seqs};
 use super::import::{ImportBatch, ImportRefusal, MoveHead};
 use super::keys::{KeyEntry, KeyRefusal};
+use super::lift::{AckClass, FindingList, GateRefusal, GateSummary, LiftProof, ReplayId};
 use super::name::UnitName;
+use super::restore::{Bookmark, RestoreRefusal, RestoreTarget};
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -47,6 +49,11 @@ pub struct SyncHead {
     /// The since_seq of this unit's `restoring` entry, if the record has one.
     #[serde(default)]
     pub restoring_since: Option<u64>,
+    /// The lift a record that removes this unit's entry carries (its
+    /// replay id, and per class the count and hash of the acknowledged
+    /// ids): the unit lifts only when its own check gives the same.
+    #[serde(default)]
+    pub lift: Option<LiftProof>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -161,6 +168,42 @@ pub enum UnitOp {
     },
     /// Every table's import cursor and row count. A Worker call.
     ImportProgress {},
+    /// The first of the two restore calls (AM-2): refused unless the unit
+    /// is closed under the entry at `since` long enough; answers the undo
+    /// bookmark. A Worker call, run by the object class (it needs the
+    /// object's storage).
+    RestorePrepare { since: u64 },
+    /// The second restore call (AM-2): refused unless the unit is closed
+    /// under the token's entry long enough and still at `expect_undo`;
+    /// then restores to `target` and restarts. A Worker call, run by the
+    /// object class. It never answers `ok`.
+    Restore {
+        token: BirthToken,
+        target: RestoreTarget,
+        expect_undo: Bookmark,
+    },
+    /// Starts the gate report of one replay, discarding any other.
+    GateOpen { replay_id: ReplayId },
+    /// What that replay found besides its id lists.
+    GateReport {
+        replay_id: ReplayId,
+        summary: GateSummary,
+    },
+    /// One page of ids of one list of that replay's findings.
+    GateBlockers {
+        replay_id: ReplayId,
+        list: FindingList,
+        ids: Vec<String>,
+    },
+    /// One page of acknowledged blocker ids of one class.
+    GateAck {
+        replay_id: ReplayId,
+        class: AckClass,
+        ids: Vec<String>,
+    },
+    /// The stored report and whether a lift would pass now, with the
+    /// counts and hashes for the lift record. A Worker call.
+    GateStatus {},
     /// The read plan of a range of an object: the live generation (or
     /// the one named) and its extents in `[start, end)`. Allowed without
     /// `authenticated`, and then it writes nothing (no read stamp).
@@ -200,7 +243,20 @@ impl UnitOp {
                 | UnitOp::HeldKeys {}
                 | UnitOp::Import { .. }
                 | UnitOp::ImportProgress {}
+                | UnitOp::RestorePrepare { .. }
+                | UnitOp::Restore { .. }
+                | UnitOp::GateOpen { .. }
+                | UnitOp::GateReport { .. }
+                | UnitOp::GateBlockers { .. }
+                | UnitOp::GateAck { .. }
+                | UnitOp::GateStatus {}
         )
+    }
+
+    /// The two restore calls, which the object class runs with its
+    /// storage.
+    pub fn restore_call(&self) -> bool {
+        matches!(self, UnitOp::RestorePrepare { .. } | UnitOp::Restore { .. })
     }
 
     /// A read, for the tenant-state rule (`read_only` serves
@@ -254,6 +310,10 @@ pub enum Refused {
     Keys(KeyRefusal),
     /// An import batch was refused (DS1 §2.3).
     Import(ImportRefusal),
+    /// A restore call was refused; nothing was armed (AM-2).
+    Restore(RestoreRefusal),
+    /// A gate call, or the `sync` that would lift, was refused (AM-2).
+    Gate(GateRefusal),
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -280,6 +340,12 @@ pub enum UnitAnswer {
     Refused {
         reason: Refused,
         alarm: bool,
+    },
+    /// `restore_prepare`: the undo bookmark. The tool seals it before it
+    /// stores it anywhere (AM-1).
+    UndoBookmark {
+        seqs: Seqs,
+        bookmark: Bookmark,
     },
     /// No certificate (rule 7). `listed`: as the call said; the Worker
     /// answers `503` and pages when it is set, `404` when not.

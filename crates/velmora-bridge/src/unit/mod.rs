@@ -11,6 +11,8 @@
 //! - [`object`]: the unit itself (rules 1 to 7 and 11).
 //! - [`keys`]: the key-chain apply and the effective grant.
 //! - [`import`]: the owner move's import.
+//! - [`restore`]: the restore calls.
+//! - [`lift`]: the lift, checked in the unit.
 //! - [`schema`]: what a unit is born with.
 //! - [`gate`]: the restore gate's lift decision.
 //!
@@ -22,8 +24,10 @@ pub mod gate;
 pub mod identity;
 pub mod import;
 pub mod keys;
+pub mod lift;
 pub mod name;
 pub mod object;
+pub mod restore;
 pub mod schema;
 
 pub use birth::{may_provision, BirthKind, BirthToken, HeadView, ProvisionRefusal};

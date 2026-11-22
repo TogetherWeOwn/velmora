@@ -75,9 +75,17 @@ export function pitrAt(storage, unixMs) {
 // is the caller's: a `getCurrentBookmark()` taken before, kept outside
 // the object, undoes the restore exactly only if no write commits in
 // between, so the restore call must close the unit first.
+//
+// Once `onNextSessionRestoreBookmark` resolved, the restore is armed: a
+// throw from `abort()` does not undo that, so it is not passed on as a
+// refusal. Returning at all means armed without the restart.
 export async function pitrRestoreNow(state, storage, bookmark) {
   await storage.onNextSessionRestoreBookmark(bookmark);
-  state.abort("point-in-time restore");
+  try {
+    state.abort("point-in-time restore");
+  } catch (_) {
+    // Armed either way.
+  }
 }
 
 // One unit call as one transaction: `run` is the Rust side of the call.

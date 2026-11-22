@@ -37,6 +37,7 @@ pub const CATALOGUE: &[&str] = &[
 pub const UNIT: &[&str] = &[
     include_str!("migrations/u0001_identity.sql"),
     include_str!("migrations/u0003_keys_import.sql"),
+    include_str!("migrations/u0004_restore.sql"),
 ];
 
 /// The schema a token must name: every migration a unit applies.
