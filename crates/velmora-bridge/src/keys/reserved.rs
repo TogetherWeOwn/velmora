@@ -1,5 +1,9 @@
-//! The key writer under a reservation the caller holds (AM-38): the
-//! management plane's create calls.
+//! The key writer under a reservation the caller holds (AM-38, AM-72):
+//! the management plane's opening calls. Every opening key-chain change
+//! is a reserved call: a key or principal create
+//! ([`KeyEnv::create_reserved`]), a widening and a grant change that adds
+//! or widens ([`KeyEnv::change_reserved`]). A re-enable answers `503`
+//! until the unit's reservation can name it (AM-72).
 //!
 //! The handler asks the root unit for the reservation itself
 //! (`UnitOp::Reserve`, keyed by the key hash and the request's
@@ -7,6 +11,14 @@
 //! takes `(rid, keys_seq)` as given; it does not call
 //! [`super::ports::KeyAdmission`].
 //!
+//! - **The reservation is the authorization.** The writer takes
+//!   `(rid, keys_seq)` as admitted: the unit's reservation must have
+//!   checked the change's bounds (the cap, and for a key the grants of the
+//!   principal it was made under, its `made_by`, whatever the request's
+//!   acting header). The writer keeps only its own rules: an explicit
+//!   acting principal other than the key's `made_by` is refused, and the
+//!   record is written only on a head equal to `keys_seq`, so the unit's
+//!   check was made on the head the record follows.
 //! - **The record is exactly `keys_seq + 1`** and carries the `rid` in its
 //!   door part ([`super::record::Rid`]). A head that moved past
 //!   `keys_seq` with no record of this `rid` answers
@@ -45,7 +57,7 @@ use super::record::{
 };
 use super::revocations::list_tenant_revocations;
 use super::routes::{put_route, RoutePut};
-use super::writer::{op_kind, plan, Class, KeyEnv, KeyRequest, Planned};
+use super::writer::{op_kind, plan, subject_of, Class, KeyAnswer, KeyEnv, KeyRequest, Planned};
 use crate::ports::{Clock, Kek};
 use crate::records::RecordStore;
 use crate::types::{BridgeError, Result};
@@ -91,6 +103,20 @@ pub enum ReservedAnswer {
     KeyMoved,
     /// `503`: the chain is frozen (AM-28), nothing put.
     Frozen,
+    /// A change ([`KeyEnv::change_reserved`]) the head already states,
+    /// from a record that does not carry the `rid`: nothing is recorded
+    /// under the reservation, and the caller releases it. `seq` is the
+    /// subject's own newest record (AM-41's `if_seq`). The stores were
+    /// brought to the head; `done` is whether every door store holds it
+    /// (as [`KeyAnswer::Done`]).
+    InHead { seq: u64, done: bool },
+    /// A change ([`KeyEnv::change_reserved`]) that closes at this head (a
+    /// narrowing, a disable, a revoke, a dropped grant), whatever
+    /// `keys_seq` is: not a reserved call. Nothing is recorded; the caller
+    /// releases the reservation and sends the change through
+    /// [`KeyEnv::change_closing`], which records it only while it still
+    /// closes (a newer head that makes it a widening answers `Busy`).
+    Closes,
 }
 
 /// A record above some seq that carries a `rid`.
@@ -372,6 +398,175 @@ where
             Put::Lost => {
                 // Whoever took the seq: a record of this reservation wins,
                 // any other one ends this call.
+                revoked = self.read_head(table).await?;
+                match self.find_carrying(table, &rid, keys_seq).await? {
+                    Some(carried) if carried.id == id => {
+                        return Ok(self.settle(table, &revoked, &carried, answer).await)
+                    }
+                    Some(_) => return Err(ERR_RID_SUBJECT),
+                    None => {
+                        let _ = self.apply_all(table, &revoked).await;
+                        return Ok(ReservedAnswer::Lost);
+                    }
+                }
+            }
+        }
+        let carried = Carried {
+            seq,
+            id: id.to_owned(),
+        };
+        Ok(self.settle(table, &revoked, &carried, answer).await)
+    }
+
+    /// Makes the opening change `request` under the reservation `reserved`
+    /// the caller holds (AM-38 case 1, AM-72): a widening, a grant change
+    /// that adds or widens, of a key or a principal. A re-enable of a
+    /// disabled subject answers [`ReservedAnswer::Busy`] (`503`) until the
+    /// unit's reservation has an `Opening` for it (AM-72), and nothing is
+    /// written; a revoked subject is refused, an active one is in head. On the
+    /// rules of [`KeyEnv::create_reserved`]: a record of this `rid` at
+    /// `keys_seq + 1` wins; a head past `keys_seq` without one answers
+    /// `Lost`; otherwise the record at exactly `keys_seq + 1` carries the
+    /// `rid`, and the answer is kept only after the full apply. A create is
+    /// [`KeyEnv::create_reserved`].
+    ///
+    /// The class comes from the head, never from the caller: a change that
+    /// closes at this head answers [`ReservedAnswer::Closes`], and one the
+    /// head already states [`ReservedAnswer::InHead`]; neither records
+    /// anything under the reservation.
+    pub async fn change_reserved<R: FillRandom>(
+        &self,
+        table: &mut KeyTable,
+        request: &KeyRequest,
+        reserved: Reserved<'_>,
+        rng: &mut R,
+    ) -> Result<ReservedAnswer> {
+        if let KeyRequest::Create(subject) = request {
+            return self.create_reserved(table, subject, reserved, rng).await;
+        }
+        let Reserved {
+            rid,
+            keys_seq,
+            answer,
+        } = reserved;
+        if answer.rid != rid {
+            return Err(BridgeError::Invalid(
+                "the kept answer is another reservation's",
+            ));
+        }
+        let id = subject_of(request);
+        let mut revoked = self.read_head(table).await?;
+        // A retry, or a call under the same reservation that got there
+        // first: its record is the change.
+        if let Some(carried) = self.find_carrying(table, &rid, keys_seq).await? {
+            if carried.id != id {
+                return Err(ERR_RID_SUBJECT);
+            }
+            return Ok(self.settle(table, &revoked, &carried, answer).await);
+        }
+        if table.seq() < keys_seq {
+            // The unit holds more of the chain than it can be read now.
+            return Ok(ReservedAnswer::Busy);
+        }
+        // The class comes from the head, whatever `keys_seq` is: a change
+        // that closes there is not a reserved call (served now, AM-72).
+        let planned = plan(self.kek, table, &revoked, request, self.limits);
+        let closes = match &planned {
+            Planned::InHead(class) => *class == Class::Closing,
+            Planned::Change(p) => p.closes(),
+            Planned::Refused(_) | Planned::Busy => false,
+        };
+        if closes {
+            return Ok(ReservedAnswer::Closes);
+        }
+        // AM-72: a re-enable answers `503` until the unit's reservation has
+        // an `Opening` for it (the unit cannot check it yet).
+        let re_enable = matches!(
+            request,
+            KeyRequest::SetStatus {
+                status: SubjectStatus::Active,
+                ..
+            }
+        );
+        // Only a real re-enable (of a disabled subject) is a change here; a
+        // revoked one is refused and an active one is in head, below.
+        if re_enable && matches!(planned, Planned::Change(_)) {
+            return Ok(ReservedAnswer::Busy);
+        }
+        let Ok(zero) = self.gate.zero_head().await else {
+            return Ok(ReservedAnswer::Busy);
+        };
+        match self.move_rules(&zero, table, request).await {
+            Gate::Go => {}
+            Gate::KeyMoved { pre_apply } => {
+                // As the plain writer (AM-31): an existing `m/rk/<t>/` of
+                // the key is applied to D1 first.
+                if pre_apply && revoked.contains(id) && self.gate.refuse_in_d1(id).await.is_err() {
+                    return Ok(ReservedAnswer::Busy);
+                }
+                return Ok(ReservedAnswer::KeyMoved);
+            }
+            Gate::Unavailable => {
+                return Ok(match table.frozen_at() {
+                    Some(_) => ReservedAnswer::Frozen,
+                    None => ReservedAnswer::Busy,
+                })
+            }
+            // Revokes only: they close.
+            Gate::ZeroRevoke | Gate::FrozenRevoke => return Ok(ReservedAnswer::Closes),
+        }
+        let plan = match planned {
+            Planned::Refused(r) => return Ok(ReservedAnswer::Refused(r)),
+            Planned::Busy => return Ok(ReservedAnswer::Busy),
+            Planned::InHead(class) => {
+                let acks = self.apply_all(table, &revoked).await;
+                let done = matches!(
+                    self.answer(class, table, table.seq(), acks).await,
+                    KeyAnswer::Done { .. }
+                );
+                // The subject's own newest record (AM-41's `if_seq`).
+                let seq = table.get(id).map_or(table.seq(), |e| e.last_seq);
+                return Ok(ReservedAnswer::InHead { seq, done });
+            }
+            Planned::Change(p) => p,
+        };
+        if table.seq() > keys_seq {
+            // An opening change whose reservation is behind the head: the
+            // handler asks the unit again.
+            let _ = self.apply_all(table, &revoked).await;
+            return Ok(ReservedAnswer::Lost);
+        }
+        let seq = keys_seq + 1;
+
+        // Intent: the message is the durable part.
+        self.intents
+            .send(self.tenant, ControlChain::Keys, seq)
+            .await?;
+        let _ = self
+            .intents
+            .note(self.tenant, ControlChain::Keys, seq, op_kind(&plan))
+            .await;
+        let bytes = seal_key_record_carrying(
+            self.kek,
+            self.ring,
+            self.tenant,
+            seq,
+            plan.op,
+            self.now(),
+            &plan.door,
+            plan.private.as_ref(),
+            false,
+            table.frozen_at(),
+            Some(rid),
+            rng,
+        )?;
+        let chain = key_chain(self.tenant);
+        match chain.put(self.store, seq, bytes.clone()).await? {
+            Put::Written => {
+                let record = open_key_record(self.kek, self.ring, self.tenant, seq, &bytes)?;
+                table.apply(&record)?;
+            }
+            Put::Lost => {
                 revoked = self.read_head(table).await?;
                 match self.find_carrying(table, &rid, keys_seq).await? {
                     Some(carried) if carried.id == id => {

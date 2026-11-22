@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 use velmora::rng::FillRandom;
 
 use super::chain::{Chain, Put};
+use crate::config::MAX_KEK_VERSION;
 use crate::crypto::scheme2::{parse_control, seal_control, ControlOwner, ControlSealer};
 use crate::ports::Kek;
 use crate::records::RecordStore;
@@ -183,9 +184,42 @@ fn seal<K: Kek, R: FillRandom>(kek: &K, set: &KeyLocations, rng: &mut R) -> Resu
     )
 }
 
+/// A key-location record sealed under a KEK version this Worker does not
+/// hold yet: newer than its active one, and one a deploy can have
+/// (`config::MAX_KEK_VERSION`). A record of a newer deploy during a KEK
+/// rollout: a failure that may pass (`503`, no damage page). Not a
+/// `Crypto` error, so callers tell it from damage ([`is_kek_not_held`]).
+pub const ERR_LOCATIONS_KEK_NOT_HELD: BridgeError = BridgeError::Invalid(KEK_NOT_HELD);
+
+const KEK_NOT_HELD: &str = "key location record is under a KEK version not held yet";
+
+/// Whether `e`, from [`read_locations`] or [`init_locations`], is damage
+/// (a page): a record that does not open, or does not hold a valid set.
+/// Not the not-held error, and not a store error (`Blob`, `Sql`: a
+/// failure that may pass, `503` with no page).
+pub fn is_locations_damage(e: &BridgeError) -> bool {
+    match e {
+        BridgeError::Crypto(_) => true,
+        BridgeError::Invalid(m) => *m != KEK_NOT_HELD,
+        _ => false,
+    }
+}
+
+/// Whether `e` is [`ERR_LOCATIONS_KEK_NOT_HELD`].
+pub fn is_kek_not_held(e: &BridgeError) -> bool {
+    matches!(e, BridgeError::Invalid(m) if *m == KEK_NOT_HELD)
+}
+
 fn open<K: Kek>(kek: &K, seq: u64, bytes: &[u8]) -> Result<KeyLocations> {
     let name = locations_chain().name(seq);
-    let opened = parse_control(bytes)?.open_door(kek, &name, ControlOwner::Global)?;
+    let env = parse_control(bytes)?;
+    let v = env.kek_version();
+    // The rule of the directory's seal (`kek_not_held`): any other version
+    // this Worker does not hold is damage.
+    if kek.version(v).is_none() && v > kek.active().0 && v <= MAX_KEK_VERSION {
+        return Err(ERR_LOCATIONS_KEK_NOT_HELD);
+    }
+    let opened = env.open_door(kek, &name, ControlOwner::Global)?;
     let set: KeyLocations = serde_json::from_slice(opened.door()).map_err(|_| ERR_LOCATIONS)?;
     if set.seq != seq {
         return Err(ERR_LOCATIONS);
@@ -260,5 +294,78 @@ pub fn two_in_account() -> KeyLocations {
                 synchronous: true,
             },
         ],
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The first record (AM-70, AM-70b)
+// ---------------------------------------------------------------------------
+
+/// What [`init_locations`] answered.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InitLocations {
+    /// Seq 1 is written: [`two_in_account`]. `200`.
+    Written,
+    /// The head lists `KEYS_A` as the active synchronous arbiter and
+    /// `KEYS_B` as active and synchronous (whatever its seq and its other
+    /// locations); nothing written. `200`.
+    Same,
+    /// The head names another set; nothing written. `409
+    /// locations_differ`, and a page.
+    Differ,
+}
+
+/// Whether `head` lists the milestone's two locations as AM-70 needs
+/// them, whatever its seq and its other locations.
+fn names_the_two(head: &KeyLocations) -> bool {
+    let find = |name: &str| head.locations.iter().find(|l| l.name == name);
+    let a_ok = find("KEYS_A")
+        .is_some_and(|l| l.arbiter && l.synchronous && l.status == LocationStatus::Active);
+    let b_ok = find("KEYS_B")
+        .is_some_and(|l| !l.arbiter && l.synchronous && l.status == LocationStatus::Active);
+    a_ok && b_ok
+}
+
+fn answer_for(head: &KeyLocations) -> InitLocations {
+    match names_the_two(head) {
+        true => InitLocations::Same,
+        false => InitLocations::Differ,
+    }
+}
+
+/// The first key-location record (AM-70): the operator call (`POST`, no
+/// body, `ADMIN_TOKEN` only, AM-70b) that the coordinator makes once per
+/// environment after the deploy that binds `KEYS_A` and `KEYS_B`, and the
+/// drill runner once per drill environment. No request path calls it. It
+/// writes only into an empty chain, and only [`two_in_account`]; it
+/// writes no object to either key bucket.
+///
+/// - No head: seq 1, put once ([`write_locations`]). A lost put, or a
+///   refusal because a head appeared since the read, reads the head again
+///   and answers by the rules below.
+/// - A head that opens: nothing is written; [`InitLocations::Same`] or
+///   [`InitLocations::Differ`].
+/// - A head that does not open, or a store error: an `Err`, nothing
+///   written (`503`). [`is_locations_damage`] is the one that pages;
+///   [`is_kek_not_held`] (a KEK version this Worker does not hold yet) and
+///   store errors do not.
+pub async fn init_locations<S, K, R>(store: &S, kek: &K, rng: &mut R) -> Result<InitLocations>
+where
+    S: RecordStore,
+    K: Kek,
+    R: FillRandom,
+{
+    if let Some(head) = read_locations(store, kek, 0).await? {
+        return Ok(answer_for(&head));
+    }
+    let written = write_locations(store, kek, &two_in_account(), rng).await;
+    if let Ok(true) = written {
+        return Ok(InitLocations::Written);
+    }
+    // Lost, or refused: a head may have appeared. Without one, the
+    // write's own error stands.
+    match read_locations(store, kek, 0).await? {
+        Some(head) => Ok(answer_for(&head)),
+        None => written.and(Err(ERR_LOCATIONS_MOVE)),
     }
 }

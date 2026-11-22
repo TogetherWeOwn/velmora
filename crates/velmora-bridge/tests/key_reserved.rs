@@ -13,7 +13,7 @@ use velmora_bridge::keys::checkpoint::{open_checkpoint, seal_checkpoint};
 use velmora_bridge::keys::gate::testkit::FakeGate;
 use velmora_bridge::keys::ports::{
     Admission, Applied, ApplyEntry, Binding, BucketAdmission, BucketReservation, ControlChain,
-    ControlIntents, KeptAnswer, KeyAdmission, KeyTarget, OpeningChange,
+    ControlIntents, KeptAnswer, KeyAdmission, KeyTarget, OpeningChange, Refusal,
 };
 use velmora_bridge::keys::record::{
     key_chain, open_key_record, seal_key_record_carrying, Access, Entry, Grant, KeyOp, KeyTable,
@@ -1244,4 +1244,594 @@ async fn a_second_create_for_the_member_of_a_held_principal_is_refused() {
     );
     let row = w.root.row(NEW).unwrap();
     assert_eq!(row.private.unwrap().owner_ref, Some(member));
+}
+
+// ---------------------------------------------------------------------------
+// change_reserved (L4-W2, AM-72): widenings, re-enables, grant changes
+// ---------------------------------------------------------------------------
+
+const SEED: &str = "p_0000000000000001";
+
+fn rw(bucket: &str) -> Grant {
+    Grant {
+        bucket_id: bucket.into(),
+        access: Access::Rw,
+        expires_at: None,
+        prefix: None,
+        ip_list: Vec::new(),
+    }
+}
+
+fn widen() -> KeyRequest {
+    KeyRequest::SetGrants {
+        id: SEED.into(),
+        grants: vec![rw("b_01"), rw("b_02")],
+        acting: None,
+    }
+}
+
+fn set_status(status: SubjectStatus) -> KeyRequest {
+    KeyRequest::SetStatus {
+        id: SEED.into(),
+        status,
+    }
+}
+
+/// Another call's widening of the seed principal under `rid` at `seq`.
+fn their_widening(w: &World, table: &KeyTable, rid: Option<Rid>, seq: u64) -> Vec<u8> {
+    let mut next = table.get(SEED).unwrap().subject().unwrap();
+    next.set_grants(&[rw("b_01"), rw("b_03")]);
+    seal_key_record_carrying(
+        &w.kek,
+        &w.ring,
+        &w.t,
+        seq,
+        KeyOp::Grants,
+        9,
+        &next.door,
+        Some(&next.private),
+        false,
+        None,
+        rid,
+        &mut TestRng(98),
+    )
+    .unwrap()
+}
+
+fn reserved_at(answer: &KeptAnswer, keys_seq: u64) -> Reserved<'_> {
+    Reserved {
+        rid: answer.rid,
+        keys_seq,
+        answer,
+    }
+}
+
+/// A widening under a reservation: the record is exactly `keys_seq + 1`,
+/// carries the `rid`, reaches every store, and the root unit keeps the
+/// answer once, after the full apply. A retry writes nothing more.
+#[tokio::test(flavor = "current_thread")]
+async fn a_reserved_widening_records_exactly_keys_seq_plus_one_with_its_rid() {
+    let w = World::new();
+    let mut table = seed(&w).await;
+    let units = [&w.root, &w.unit2];
+    let env = env!(w, &w.store, &NoAdmission, &units);
+    let answer = kept(RID);
+    assert_eq!(
+        env.change_reserved(
+            &mut table,
+            &widen(),
+            reserved_at(&answer, 1),
+            &mut TestRng(2)
+        )
+        .await
+        .unwrap(),
+        ReservedAnswer::Done { seq: 2 }
+    );
+    assert_eq!(w.head(), 2);
+    let bytes = w.store.raw(&key_chain(&w.t).name(2)).unwrap();
+    let record = open_key_record(&w.kek, &w.ring, &w.t, 2, &bytes).unwrap();
+    assert_eq!(record.rid, Some(RID));
+    assert_eq!(record.op, KeyOp::Grants);
+    assert_eq!(record.door.grants.len(), 2);
+    for store in [&w.root, &w.unit2, &w.directory] {
+        assert_eq!(store.seq.get(), 2, "{}", store.label);
+        let row = store.row(SEED).unwrap();
+        assert_eq!(row.door.grants.len(), 2, "{}", store.label);
+        assert!(row.private.is_some(), "{}", store.label);
+    }
+    assert_eq!(*w.root.kept.borrow(), vec![(RID, 201)]);
+    assert!(w.unit2.kept.borrow().is_empty());
+    assert_eq!(*w.intents.sent.borrow(), vec![1, 2]);
+    // The retry: its record wins, nothing is put, the answer is kept once.
+    let puts = w.store.puts();
+    assert_eq!(
+        env.change_reserved(
+            &mut table,
+            &widen(),
+            reserved_at(&answer, 1),
+            &mut TestRng(3)
+        )
+        .await
+        .unwrap(),
+        ReservedAnswer::Done { seq: 2 }
+    );
+    assert_eq!(w.store.puts(), puts);
+    assert_eq!(*w.root.kept.borrow(), vec![(RID, 201)]);
+}
+
+/// A re-enable under a reservation answers `503` until the unit's
+/// reservation has an `Opening` for it (AM-72): nothing is put, no intent
+/// is sent, no answer is kept.
+#[tokio::test(flavor = "current_thread")]
+async fn a_reserved_re_enable_answers_busy_until_the_unit_can_name_it() {
+    let w = World::new();
+    let mut table = seed(&w).await;
+    let units = [&w.root, &w.unit2];
+    let plain = env!(w, &w.store, &AtRoot(&w.root), &units);
+    assert_eq!(
+        plain
+            .change(
+                &mut table,
+                "idem-off",
+                &set_status(SubjectStatus::Disabled),
+                &mut TestRng(2)
+            )
+            .await
+            .unwrap(),
+        KeyAnswer::Done { seq: 2 }
+    );
+    let env = env!(w, &w.store, &NoAdmission, &units);
+    let answer = kept(RID);
+    let puts = w.store.puts();
+    assert_eq!(
+        env.change_reserved(
+            &mut table,
+            &set_status(SubjectStatus::Active),
+            reserved_at(&answer, 2),
+            &mut TestRng(3)
+        )
+        .await
+        .unwrap(),
+        ReservedAnswer::Busy
+    );
+    assert_eq!(w.store.puts(), puts);
+    assert_eq!(w.head(), 2);
+    assert_eq!(*w.intents.sent.borrow(), vec![1, 2]);
+    assert!(w.root.kept.borrow().is_empty());
+    assert_eq!(
+        w.root.row(SEED).unwrap().door.status,
+        SubjectStatus::Disabled
+    );
+}
+
+/// The class comes from the head: a change that closes there (a
+/// narrowing, a disable, a revoke, a dropped grant) is not a reserved
+/// call, and one the head already states records nothing. Neither puts
+/// anything or keeps an answer.
+#[tokio::test(flavor = "current_thread")]
+async fn a_closing_or_already_held_change_records_nothing_under_the_reservation() {
+    for (request, expected) in [
+        (
+            KeyRequest::SetGrants {
+                id: SEED.into(),
+                grants: Vec::new(),
+                acting: None,
+            },
+            ReservedAnswer::Closes,
+        ),
+        (set_status(SubjectStatus::Disabled), ReservedAnswer::Closes),
+        (set_status(SubjectStatus::Revoked), ReservedAnswer::Closes),
+        (
+            KeyRequest::DropGrant {
+                id: SEED.into(),
+                bucket_id: "b_01".into(),
+            },
+            ReservedAnswer::Closes,
+        ),
+        // Already active: the head's state, not a re-enable.
+        (
+            set_status(SubjectStatus::Active),
+            ReservedAnswer::InHead { seq: 1, done: true },
+        ),
+        (
+            KeyRequest::SetGrants {
+                id: SEED.into(),
+                grants: vec![rw("b_01")],
+                acting: None,
+            },
+            ReservedAnswer::InHead { seq: 1, done: true },
+        ),
+    ] {
+        let w = World::new();
+        let mut table = seed(&w).await;
+        let units = [&w.root, &w.unit2];
+        let env = env!(w, &w.store, &NoAdmission, &units);
+        let answer = kept(RID);
+        let puts = w.store.puts();
+        assert_eq!(
+            env.change_reserved(
+                &mut table,
+                &request,
+                reserved_at(&answer, 1),
+                &mut TestRng(2)
+            )
+            .await
+            .unwrap(),
+            expected,
+            "{request:?}"
+        );
+        assert_eq!(w.store.puts(), puts, "{request:?}");
+        assert_eq!(w.head(), 1);
+        assert!(w.root.kept.borrow().is_empty());
+        assert_eq!(*w.intents.sent.borrow(), vec![1], "{request:?}");
+    }
+}
+
+/// A put lost to a record of the same `rid` takes that record; one lost
+/// to any other record, or a head already past `keys_seq`, answers `Lost`
+/// with the stores at the head.
+#[tokio::test(flavor = "current_thread")]
+async fn a_reserved_change_lost_to_its_own_rid_takes_it_and_to_another_answers_lost() {
+    for (rid, expected) in [
+        (Some(RID), ReservedAnswer::Done { seq: 2 }),
+        (Some(OTHER), ReservedAnswer::Lost),
+        (None, ReservedAnswer::Lost),
+    ] {
+        let w = World::new();
+        let mut table = seed(&w).await;
+        let theirs = their_widening(&w, &table, rid, 2);
+        let store = PlantOnPut {
+            inner: &w.store,
+            name: key_chain(&w.t).name(2),
+            theirs: RefCell::new(Some(theirs.clone())),
+        };
+        let units = [&w.root, &w.unit2];
+        let env = env!(w, &store, &NoAdmission, &units);
+        let answer = kept(RID);
+        assert_eq!(
+            env.change_reserved(
+                &mut table,
+                &widen(),
+                reserved_at(&answer, 1),
+                &mut TestRng(2)
+            )
+            .await
+            .unwrap(),
+            expected,
+            "{rid:?}"
+        );
+        // Their bytes, never ours.
+        assert_eq!(w.store.raw(&key_chain(&w.t).name(2)), Some(theirs));
+        let bucket_ids: Vec<String> = table
+            .get(SEED)
+            .unwrap()
+            .door
+            .grants
+            .iter()
+            .map(|g| g.bucket_id.clone())
+            .collect();
+        assert_eq!(bucket_ids, ["b_01", "b_03"]);
+        for store in [&w.root, &w.unit2, &w.directory] {
+            assert_eq!(store.seq.get(), 2, "{}", store.label);
+        }
+        let kept_now = w.root.kept.borrow().clone();
+        match expected {
+            ReservedAnswer::Done { .. } => assert_eq!(kept_now, vec![(RID, 201)]),
+            _ => assert!(kept_now.is_empty()),
+        }
+    }
+    // A head already past keys_seq: nothing is put.
+    let w = World::new();
+    let mut table = seed(&w).await;
+    let units = [&w.root, &w.unit2];
+    let plain = env!(w, &w.store, &AtRoot(&w.root), &units);
+    plain
+        .change(
+            &mut table,
+            "idem-other",
+            &KeyRequest::Create(principal(NEW, Some(SEED))),
+            &mut TestRng(5),
+        )
+        .await
+        .unwrap();
+    let env = env!(w, &w.store, &NoAdmission, &units);
+    let answer = kept(RID);
+    let puts = w.store.puts();
+    assert_eq!(
+        env.change_reserved(
+            &mut table,
+            &widen(),
+            reserved_at(&answer, 1),
+            &mut TestRng(6)
+        )
+        .await
+        .unwrap(),
+        ReservedAnswer::Lost
+    );
+    assert_eq!(w.store.puts(), puts);
+}
+
+/// A record of the `rid` that names another subject, and a kept answer of
+/// another reservation, are errors before anything is put.
+#[tokio::test(flavor = "current_thread")]
+async fn a_reserved_change_refuses_another_subjects_rid_and_another_answer() {
+    let w = World::new();
+    let mut table = seed(&w).await;
+    let units = [&w.root, &w.unit2];
+    let env = env!(w, &w.store, &NoAdmission, &units);
+    // The rid's record is a create of NEW at 2.
+    let answer = kept(RID);
+    assert_eq!(
+        env.create_reserved(
+            &mut table,
+            &principal(NEW, Some(SEED)),
+            reserved_at(&answer, 1),
+            &mut TestRng(2)
+        )
+        .await
+        .unwrap(),
+        ReservedAnswer::Done { seq: 2 }
+    );
+    let puts = w.store.puts();
+    assert!(env
+        .change_reserved(
+            &mut table,
+            &widen(),
+            reserved_at(&answer, 1),
+            &mut TestRng(3)
+        )
+        .await
+        .is_err());
+    let other = kept(OTHER);
+    let mismatched = Reserved {
+        rid: RID,
+        keys_seq: 2,
+        answer: &other,
+    };
+    assert!(env
+        .change_reserved(&mut table, &widen(), mismatched, &mut TestRng(4))
+        .await
+        .is_err());
+    assert_eq!(w.store.puts(), puts);
+}
+
+/// The move rules stop a reserved change before any put (AM-28, AM-31):
+/// `moving` answers `Busy`, and the undo's `d1` answers `key_moved`.
+#[tokio::test(flavor = "current_thread")]
+async fn the_move_rules_stop_a_reserved_change_before_any_put() {
+    use velmora_bridge::keys::gate::ZeroHead;
+    let t = TenantId::parse("t_0000000000000001").unwrap();
+    for (zero, expected) in [
+        (ZeroHead::Moving { to: t.clone() }, ReservedAnswer::Busy),
+        (ZeroHead::Undone { to: t.clone() }, ReservedAnswer::KeyMoved),
+    ] {
+        let w = World::new();
+        let mut table = seed(&w).await;
+        w.gate.set_zero(zero);
+        let units = [&w.root, &w.unit2];
+        let env = env!(w, &w.store, &NoAdmission, &units);
+        let answer = kept(RID);
+        let puts = w.store.puts();
+        assert_eq!(
+            env.change_reserved(
+                &mut table,
+                &widen(),
+                reserved_at(&answer, 1),
+                &mut TestRng(2)
+            )
+            .await
+            .unwrap(),
+            expected
+        );
+        assert_eq!(w.store.puts(), puts);
+        assert_eq!(*w.intents.sent.borrow(), vec![1]);
+    }
+}
+
+/// A create sent through `change_reserved` is `create_reserved`.
+#[tokio::test(flavor = "current_thread")]
+async fn a_create_through_change_reserved_is_the_reserved_create() {
+    let w = World::new();
+    let mut table = seed(&w).await;
+    let units = [&w.root, &w.unit2];
+    let env = env!(w, &w.store, &NoAdmission, &units);
+    let answer = kept(RID);
+    assert_eq!(
+        env.change_reserved(
+            &mut table,
+            &KeyRequest::Create(principal(NEW, Some(SEED))),
+            reserved_at(&answer, 1),
+            &mut TestRng(2)
+        )
+        .await
+        .unwrap(),
+        ReservedAnswer::Done { seq: 2 }
+    );
+    let record = open_key_record(
+        &w.kek,
+        &w.ring,
+        &w.t,
+        2,
+        &w.store.raw(&key_chain(&w.t).name(2)).unwrap(),
+    )
+    .unwrap();
+    assert_eq!((record.op, record.rid), (KeyOp::Create, Some(RID)));
+}
+
+/// Review r1 of L4-W2: the class comes from the head whatever `keys_seq`
+/// is. A closing change with a reservation behind the head answers
+/// `Closes` (never `Lost`); an in-head answer names the subject's own
+/// newest record, not the chain head.
+#[tokio::test(flavor = "current_thread")]
+async fn the_class_and_the_in_head_seq_come_from_the_head_whatever_keys_seq() {
+    let w = World::new();
+    let mut table = seed(&w).await;
+    let units = [&w.root, &w.unit2];
+    let plain = env!(w, &w.store, &AtRoot(&w.root), &units);
+    plain
+        .change(
+            &mut table,
+            "idem-other",
+            &KeyRequest::Create(principal(NEW, Some(SEED))),
+            &mut TestRng(5),
+        )
+        .await
+        .unwrap();
+    assert_eq!(w.head(), 2);
+    let env = env!(w, &w.store, &NoAdmission, &units);
+    let answer = kept(RID);
+    let puts = w.store.puts();
+    let narrow = KeyRequest::SetGrants {
+        id: SEED.into(),
+        grants: Vec::new(),
+        acting: None,
+    };
+    assert_eq!(
+        env.change_reserved(
+            &mut table,
+            &narrow,
+            reserved_at(&answer, 1),
+            &mut TestRng(6)
+        )
+        .await
+        .unwrap(),
+        ReservedAnswer::Closes
+    );
+    let same = KeyRequest::SetGrants {
+        id: SEED.into(),
+        grants: vec![rw("b_01")],
+        acting: None,
+    };
+    for keys_seq in [1, 2] {
+        assert_eq!(
+            env.change_reserved(
+                &mut table,
+                &same,
+                reserved_at(&answer, keys_seq),
+                &mut TestRng(7)
+            )
+            .await
+            .unwrap(),
+            ReservedAnswer::InHead { seq: 1, done: true }
+        );
+    }
+    assert_eq!(w.store.puts(), puts);
+    // An opening change behind the head is still `Lost`.
+    assert_eq!(
+        env.change_reserved(
+            &mut table,
+            &widen(),
+            reserved_at(&answer, 1),
+            &mut TestRng(8)
+        )
+        .await
+        .unwrap(),
+        ReservedAnswer::Lost
+    );
+    assert_eq!(w.store.puts(), puts);
+}
+
+/// Review r1 of L4-W2 (MEDIUM): `change_closing` records a closing change
+/// and never an opening one. A change classed `Closes` at an older head
+/// that a newer head makes a widening answers `Busy`, with nothing put and
+/// nothing admitted; the caller's retry reserves again.
+#[tokio::test(flavor = "current_thread")]
+async fn change_closing_never_records_an_opening_change() {
+    let w = World::new();
+    let mut table = seed(&w).await;
+    let units = [&w.root, &w.unit2];
+    // The seed principal holds b_01 and b_02.
+    let plain = env!(w, &w.store, &AtRoot(&w.root), &units);
+    assert_eq!(
+        plain
+            .change(&mut table, "idem-w", &widen(), &mut TestRng(2))
+            .await
+            .unwrap(),
+        KeyAnswer::Done { seq: 2 }
+    );
+    let env = env!(w, &w.store, &NoAdmission, &units);
+    let answer = kept(RID);
+    let to_a = KeyRequest::SetGrants {
+        id: SEED.into(),
+        grants: vec![rw("b_01")],
+        acting: None,
+    };
+    assert_eq!(
+        env.change_reserved(&mut table, &to_a, reserved_at(&answer, 2), &mut TestRng(3))
+            .await
+            .unwrap(),
+        ReservedAnswer::Closes
+    );
+    // A concurrent narrowing to b_02 only lands first.
+    let to_b = KeyRequest::SetGrants {
+        id: SEED.into(),
+        grants: vec![rw("b_02")],
+        acting: None,
+    };
+    let mut other = table.clone();
+    assert_eq!(
+        env.change_closing(&mut other, &to_b, &mut TestRng(4))
+            .await
+            .unwrap(),
+        KeyAnswer::Done { seq: 3 }
+    );
+    // Against that head, b_01 alone is a widening: nothing is recorded.
+    let puts = w.store.puts();
+    assert_eq!(
+        env.change_closing(&mut table, &to_a, &mut TestRng(5))
+            .await
+            .unwrap(),
+        KeyAnswer::Busy
+    );
+    assert_eq!(w.store.puts(), puts);
+    assert_eq!(w.head(), 3);
+    // A disable through it is recorded at the head + 1.
+    assert_eq!(
+        env.change_closing(
+            &mut table,
+            &set_status(SubjectStatus::Disabled),
+            &mut TestRng(6)
+        )
+        .await
+        .unwrap(),
+        KeyAnswer::Done { seq: 4 }
+    );
+}
+
+/// A reservation cannot revive a revoked subject.
+#[tokio::test(flavor = "current_thread")]
+async fn a_reserved_re_enable_of_a_revoked_subject_is_refused_not_busy() {
+    let w = World::new();
+    let mut table = seed(&w).await;
+    let units = [&w.root, &w.unit2];
+    let plain = env!(w, &w.store, &AtRoot(&w.root), &units);
+    assert_eq!(
+        plain
+            .change(
+                &mut table,
+                "idem-rv",
+                &set_status(SubjectStatus::Revoked),
+                &mut TestRng(2)
+            )
+            .await
+            .unwrap(),
+        KeyAnswer::Done { seq: 2 }
+    );
+    let env = env!(w, &w.store, &NoAdmission, &units);
+    let answer = kept(RID);
+    let puts = w.store.puts();
+    assert_eq!(
+        env.change_reserved(
+            &mut table,
+            &set_status(SubjectStatus::Active),
+            reserved_at(&answer, 2),
+            &mut TestRng(3)
+        )
+        .await
+        .unwrap(),
+        ReservedAnswer::Refused(Refusal::Conflict)
+    );
+    assert_eq!(w.store.puts(), puts);
+    assert_eq!(w.head(), 2);
+    assert!(w.root.kept.borrow().is_empty());
 }

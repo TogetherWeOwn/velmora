@@ -559,11 +559,46 @@ where
     /// Runs one key change. `table` is the caller's copy of the key
     /// table (cached per isolate, any age); it is brought to the head
     /// here and left there.
+    ///
+    /// An opening change goes through [`KeyAdmission`] under the raw
+    /// `Idempotency-Key`, and its record carries no `rid`: the path before
+    /// AM-38's reservations. The management plane makes opening changes
+    /// through [`KeyEnv::create_reserved`] / [`KeyEnv::change_reserved`]
+    /// and closing ones through [`KeyEnv::change_closing`] (AM-72).
     pub async fn change<R: FillRandom>(
         &self,
         table: &mut KeyTable,
         idempotency_key: &str,
         request: &KeyRequest,
+        rng: &mut R,
+    ) -> Result<KeyAnswer> {
+        self.change_inner(table, idempotency_key, request, false, rng)
+            .await
+    }
+
+    /// A closing key change (a narrowing, a disable, a revoke, a dropped
+    /// grant), which needs no reservation (AM-72): as [`KeyEnv::change`],
+    /// except that a change that opens at the head it reads answers
+    /// [`KeyAnswer::Busy`] with nothing recorded, and admits nothing. So a
+    /// change classed closing by an older head (see
+    /// [`super::reserved::ReservedAnswer::Closes`]) that a newer head makes
+    /// a widening is never recorded without its reservation; the caller's
+    /// retry reserves again.
+    pub async fn change_closing<R: FillRandom>(
+        &self,
+        table: &mut KeyTable,
+        request: &KeyRequest,
+        rng: &mut R,
+    ) -> Result<KeyAnswer> {
+        self.change_inner(table, "", request, true, rng).await
+    }
+
+    async fn change_inner<R: FillRandom>(
+        &self,
+        table: &mut KeyTable,
+        idempotency_key: &str,
+        request: &KeyRequest,
+        closing_only: bool,
         rng: &mut R,
     ) -> Result<KeyAnswer> {
         let chain = key_chain(self.tenant);
@@ -634,6 +669,8 @@ where
             // exactly its keys_seq + 1.
             let seq = match plan.class {
                 Class::Closing => table.seq() + 1,
+                // Not a reserved call: an opening change is never made here.
+                Class::Opening if closing_only => return Ok(KeyAnswer::Busy),
                 Class::Opening => {
                     // Opening plans always carry an open private part.
                     let Some(private) = plan.private.clone() else {
@@ -869,7 +906,7 @@ where
 }
 
 /// The subject a request names.
-fn subject_of(request: &KeyRequest) -> &str {
+pub(super) fn subject_of(request: &KeyRequest) -> &str {
     match request {
         KeyRequest::Create(s) => &s.door.id,
         KeyRequest::SetStatus { id, .. }
