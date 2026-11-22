@@ -1947,6 +1947,40 @@ async fn a_job_in_the_line_goes_on_when_a_slot_is_its_own() {
     assert_eq!(rig.bridge.nntp.live(), 0);
 }
 
+#[tokio::test]
+async fn a_provider_whose_retention_ends_during_the_wait_is_not_asked_again() {
+    let mut rig = shared_backbone_rig().await;
+    rig.bridge.cfg.required_backbones = 1;
+    rig.bridge.cfg.providers[0].retention_days = Some(1);
+    rig.bridge.cfg.providers[1].retention_days = Some(2);
+    rig.bridge.cfg.providers[1].priority = 1;
+    rig.with_timer();
+    let (s, plan) = rig.posted(52).await;
+    rig.propagate(&s, 0, 1).await;
+    let oldest = plan.iter().filter_map(|row| row.posted_at).min().unwrap();
+    let clock = &rig.bridge.clock;
+    let until = oldest.plus_secs(86_400);
+    clock.advance_secs(u32::try_from((until.0 - clock.now().0) / 1_000 - 4).unwrap());
+    let now = clock.now();
+    let catalog = &rig.bridge.catalog;
+    catalog.line.set(Some(SlotWait::Granted));
+    for index in 0..2 {
+        let held = rig.take_slots(index, now.plus_secs(30)).await;
+        catalog.line_frees.borrow_mut().extend(held);
+    }
+    let p0_connects = rig.bridge.nntp.connects_to("p0");
+
+    assert_eq!(rig.run(&s, OutboxStage::Verify).await, JobOutcome::Ack);
+
+    let waits = catalog.line_waits.borrow();
+    assert_eq!(waits.len(), 1);
+    assert_eq!(waits[0].1, ["p0", "p1"], "both retained before the wait");
+    assert_eq!(rig.bridge.nntp.connects_to("p0"), p0_connects);
+    let rows = rig.rows(&s);
+    assert_eq!(rows[0].provider_id, "p1");
+    assert_eq!(rows[0].result, VerifyResult::Ok);
+}
+
 /// The line did not come to the job in the time it had: it is put off
 /// without having asked again and without an attempt.
 #[tokio::test]

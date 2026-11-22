@@ -527,20 +527,16 @@ where
         let holder = job_holder(lease);
         let rows: Vec<&ArticleRow> = plan.iter().collect();
         let together = self.cfg.verify.mode == VerifyMode::Light;
-        let now = self.clock.now();
         let oldest = plan.iter().filter_map(|a| a.posted_at).min();
-        let (mut fresh, expired): (Vec<_>, Vec<_>) = providers
-            .iter()
-            .copied()
-            .partition(|p| p.retains(oldest, now));
-        if fresh.is_empty() {
-            fresh = expired;
-        }
         let mut waited = false;
         loop {
-            // The pool as it is now: a wait may have outlasted a cooldown,
-            // or seen one begin.
+            // A wait can outlast a cooldown or a provider's retention.
             let at = self.clock.now();
+            let (fresh, expired): (Vec<_>, Vec<_>) = providers
+                .iter()
+                .copied()
+                .partition(|p| p.retains(oldest, at));
+            let fresh = if fresh.is_empty() { expired } else { fresh };
             let pool = match Pool::load(&self.catalog, &self.cfg.providers, at).await {
                 // A later ask that cannot read the pool ends the wait as
                 // a put-off: the attempt of the claim is handed back.
