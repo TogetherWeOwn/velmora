@@ -34,7 +34,7 @@ use velmora_bridge::unit_lease::client::{
     Renewal, Sleep, Synced, TenantHeads, UnitClient, UnitReplies, MAX_SYNC_RECORDS, RENEW_POLL_MS,
     RENEW_WAIT_MS,
 };
-use velmora_bridge::unit_lease::lease::LeaseRules;
+use velmora_bridge::unit_lease::lease::{LeaseRefusal, LeaseRules};
 use velmora_bridge::unit_lease::renewal::ChainNames;
 use velmora_bridge::{
     BlobMeta, BlobStore, BridgeError, BucketId, ByteSpan, Clock, ExtentId, Result, UnixMs,
@@ -477,6 +477,26 @@ fn create() -> Change {
         rate_json: Default::default(),
         features_json: Default::default(),
     }
+}
+
+/// An unsigned key lookup with the directory's current tenant sequence.
+fn unsigned_key_row_at_head(rig: &Rig<'_>) -> UnitCall {
+    unsigned_key_row(Seqs {
+        state_seq: rig.head_seq(),
+        ..rig.unit_seqs()
+    })
+}
+
+/// Add a bucket row that no tenant record places in this unit.
+fn plant_orphan_bucket(rig: &Rig<'_>) {
+    rig.obj.unit.sql().with_conn(|conn| {
+        conn.execute(
+            "INSERT INTO buckets(id, name, owner, bdk_wrapped, kek_version, created_at) \
+             VALUES (?1, 'orphan', ?2, x'02', 1, 1)",
+            [B1, P],
+        )
+        .unwrap();
+    });
 }
 
 /// A record that changes nothing a unit holds but its seq.
@@ -1302,14 +1322,7 @@ fn sync_retries_a_placement_mismatch_once_then_pages() {
 
     with_fresh(|rig| {
         let before = rig.unit_seqs();
-        rig.obj.unit.sql().with_conn(|conn| {
-            conn.execute(
-                "INSERT INTO buckets(id, name, owner, bdk_wrapped, kek_version, created_at) \
-                 VALUES (?1, 'orphan', ?2, x'02', 1, 1)",
-                [B1, P],
-            )
-            .unwrap();
-        });
+        plant_orphan_bucket(rig);
         rig.write(limits(rig), Actor::Operator);
         rig.obj.log.borrow_mut().clear();
         rig.obj.sync_attempts.borrow_mut().clear();
@@ -2294,6 +2307,112 @@ fn a_request_with_newer_numbers_syncs_and_runs_once_more() {
     });
 }
 
+/// A persistent placement mismatch permits one unsigned sync per backoff,
+/// with one page for its two wire attempts. Signed requests retry after 1 s.
+#[test]
+fn request_syncs_are_spaced_after_placement_mismatches() {
+    with_fresh(|rig| {
+        plant_orphan_bucket(rig);
+        rig.write(limits(rig), Actor::Operator);
+        rig.obj.log.borrow_mut().clear();
+        let client = rig.client();
+        let before = rig.unit_seqs();
+        let unsigned = unsigned_key_row_at_head(rig);
+        let sync_calls = || rig.calls().into_iter().filter(|op| op == "sync").count();
+        let assert_held_back = |call| {
+            let (answer, pages) = called(&client, call);
+            assert_eq!(answer.reply.answer, UnitAnswer::SyncNeeded { seqs: before });
+            assert_eq!(answer.synced, None);
+            assert!(pages.is_empty(), "{pages:?}");
+        };
+
+        assert_placement_sync_failed(&client, unsigned.clone());
+        for _ in 0..4 {
+            assert_held_back(unsigned.clone());
+        }
+        assert_eq!(sync_calls(), 2);
+
+        rig.clock.advance_ms(59_999);
+        assert_held_back(unsigned.clone());
+        assert_eq!(sync_calls(), 2);
+        rig.clock.advance_ms(1);
+        assert_placement_sync_failed(&client, unsigned.clone());
+        assert_eq!(sync_calls(), 4);
+
+        let signed = UnitCall {
+            authenticated: true,
+            ..unsigned
+        };
+        rig.clock.advance_ms(999);
+        assert_held_back(signed.clone());
+        assert_eq!(sync_calls(), 4);
+        rig.clock.advance_ms(1);
+        assert_placement_sync_failed(&client, signed);
+        assert_eq!(sync_calls(), 6);
+        assert_eq!(rig.unit_seqs(), before);
+    });
+}
+
+fn assert_placement_sync_failed(client: &Client<'_, '_>, call: UnitCall) {
+    let (result, pages) = block_on(client.call(call));
+    assert!(result.is_err(), "{result:?}");
+    assert_eq!(pages, [Page::PlacementsOff]);
+}
+
+/// Repair lets the next eligible sync serve the request and clears the
+/// backoff: a new head syncs immediately, and the next failure starts at 60 s.
+#[test]
+fn a_successful_request_sync_clears_the_backoff() {
+    with_fresh(|rig| {
+        plant_orphan_bucket(rig);
+        rig.write(limits(rig), Actor::Operator);
+        rig.obj.log.borrow_mut().clear();
+        let client = rig.client();
+        let sync_calls = || rig.calls().into_iter().filter(|op| op == "sync").count();
+        let assert_served = || {
+            let call = unsigned_key_row_at_head(rig);
+            let seqs = call.seqs.unwrap();
+            let (answer, pages) = called(&client, call);
+            assert!(
+                matches!(answer.reply.answer, UnitAnswer::Ok { seqs: got, .. } if got == seqs),
+                "key lookup not served at {} with calls {:?}",
+                rig.clock.now().0,
+                rig.calls()
+            );
+            assert_eq!(answer.synced, Some(Synced::Synced { seqs }));
+            assert_eq!(rig.unit_seqs(), seqs);
+            assert!(pages.is_empty(), "{pages:?}");
+        };
+
+        assert_placement_sync_failed(&client, unsigned_key_row_at_head(rig));
+        assert_eq!(sync_calls(), 2);
+        rig.obj.unit.sql().with_conn(|conn| {
+            assert_eq!(
+                conn.execute("DELETE FROM buckets WHERE id = ?1", [B1])
+                    .unwrap(),
+                1
+            );
+        });
+        rig.clock.advance_secs(60);
+        assert_served();
+        assert_eq!(sync_calls(), 3);
+        rig.write(limits(rig), Actor::Operator);
+        assert_served();
+        assert_eq!(sync_calls(), 4);
+
+        // The immediate sync alone cannot distinguish clearing from an elapsed
+        // backoff. A new failure must wait 60 s, not the doubled 120 s.
+        plant_orphan_bucket(rig);
+        rig.write(limits(rig), Actor::Operator);
+        let unsigned = unsigned_key_row_at_head(rig);
+        assert_placement_sync_failed(&client, unsigned.clone());
+        assert_eq!(sync_calls(), 6);
+        rig.clock.advance_secs(60);
+        assert_placement_sync_failed(&client, unsigned);
+        assert_eq!(sync_calls(), 8);
+    });
+}
+
 /// A lower number (the caller's head is old): the unit's numbers, once
 /// more, and the caller is told to read its head again.
 #[test]
@@ -2704,6 +2823,50 @@ fn a_request_waits_for_a_queued_renewal_and_is_served_after_it() {
         assert!(pages.is_empty(), "{pages:?}");
         assert_eq!(*slept.borrow(), [50]);
         assert_eq!(rig.calls(), ["job:stamp", "ping", "renew", "ping"]);
+    });
+}
+
+/// A request waits for the shared renewal, then returns RenewNeeded if
+/// it was refused, without attempting another renewal or repeating the page.
+#[test]
+fn a_waiter_returns_renew_needed_when_the_shared_renewal_is_refused() {
+    with_expired(|rig| {
+        let (flights, slept) = fake_sleep();
+        // The queued leader doesn't impose spacing that could mask a retry.
+        let leader = UnitClient {
+            flights: flights.clone(),
+            ..rig.client()
+        };
+        let waiter = UnitClient {
+            flights: flights.clone(),
+            ..rig.client()
+        };
+        let seqs = rig.unit_seqs();
+        *rig.obj.answer_once.borrow_mut() = Some((
+            "renew",
+            UnitAnswer::RenewNeeded {
+                seqs,
+                why: Some(LeaseRefusal::BadList),
+            },
+        ));
+        let (job, (answer, pages)) = during_a_gated_renewal(
+            rig,
+            &flights,
+            leader.run_job(UnitJob::Renew { at: NOW }, seqs),
+            waiter.call(request(seqs, UnitOp::Ping {})),
+            Follower::WaitsForRenewal,
+        );
+        assert_eq!((job.delivery, job.code), (Delivery::Ack, "renew_refused"));
+        assert_eq!(job.pages, [Page::RenewRefused(LeaseRefusal::BadList)]);
+        let answer = answer.unwrap();
+        assert_eq!(
+            answer.reply.answer,
+            UnitAnswer::RenewNeeded { seqs, why: None }
+        );
+        assert_eq!(answer.renewal, Some(Renewal::Refused));
+        assert!(pages.is_empty(), "{pages:?}");
+        assert_eq!(*slept.borrow(), [RENEW_POLL_MS]);
+        assert_eq!(rig.calls(), ["job:stamp", "ping", "renew"]);
     });
 }
 

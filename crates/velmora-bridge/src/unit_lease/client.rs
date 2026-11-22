@@ -885,7 +885,35 @@ where
                 }
                 UnitAnswer::SyncNeeded { seqs } if !synced => {
                     synced = true;
-                    let outcome = self.sync_into(seqs, pages).await?;
+                    // A sync reads up to MAX_SYNC_RECORDS records and an
+                    // unsigned call can cause it (the unit answers
+                    // `sync_needed` before any check of the call), so it
+                    // takes the isolate's spacing as a renewal does: one
+                    // at a time per unit, and after a failed one a backoff
+                    // (up to T unsigned, 1 s signed). A failure that stays
+                    // (placements_off, damage) is then read and paged at
+                    // that pace, not once per request.
+                    let max_gap = match call.authenticated {
+                        true => SIGNED_RETRY_MS,
+                        false => self.lease.term_ms,
+                    };
+                    let Some(guard) =
+                        self.flights
+                            .attempt_sync(&self.name, self.clock.now(), max_gap)
+                    else {
+                        // Held back: the call answers `sync_needed` (503).
+                        let renew_due = self.renew_due(&reply);
+                        return Ok(Answered {
+                            reply,
+                            refreshed,
+                            renew_due,
+                            renewal,
+                            synced: sync_outcome,
+                        });
+                    };
+                    let outcome = self.sync_into(seqs, pages).await;
+                    guard.done(matches!(outcome, Ok(Synced::Synced { .. })));
+                    let outcome = outcome?;
                     let again = matches!(outcome, Synced::Synced { .. });
                     sync_outcome = Some(outcome);
                     if again {
@@ -1736,13 +1764,37 @@ impl InFlight {
         None
     }
 
+    /// Starts a request-path sync of `name` at `now`, spaced as renewal
+    /// attempts are, under its own key: `None` when one runs, or when the
+    /// last one failed less than its backoff ago.
+    pub fn attempt_sync(
+        &self,
+        name: &UnitName,
+        now: UnixMs,
+        max_gap_ms: i64,
+    ) -> Option<InFlightGuard> {
+        self.start_key(
+            format!("sync:{}", name.object_name()),
+            Some(now),
+            max_gap_ms,
+        )
+    }
+
     fn start(
         &self,
         name: &UnitName,
         spaced: Option<UnixMs>,
         max_gap: i64,
     ) -> Option<InFlightGuard> {
-        let key = name.object_name();
+        self.start_key(name.object_name(), spaced, max_gap)
+    }
+
+    fn start_key(
+        &self,
+        key: String,
+        spaced: Option<UnixMs>,
+        max_gap: i64,
+    ) -> Option<InFlightGuard> {
         let mut f = self.flights.borrow_mut();
         if f.running.contains_key(&key) {
             return None;

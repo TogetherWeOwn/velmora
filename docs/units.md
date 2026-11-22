@@ -248,7 +248,10 @@ hand-out, and its writes are due from their own time.
   renewals go through the isolate's spacing: none while one runs, and after
   a failed attempt a backoff from 60 s doubling up to T, cleared by a
   success (rule 11). Signed calls go through the same spacing with the
-  backoff capped at 1 s. A call answered `renew_needed` that finds a
+  backoff capped at 1 s. A `sync_needed` sync takes the same spacing under
+  its own key (it reads up to 32 records, and an unsigned call can cause
+  it), so a sync that keeps failing (`placements_off`, damage) is read
+  and paged at that pace. A call answered `renew_needed` that finds a
   renewal of its unit running in its isolate waits for it, at most 5 s
   (est), and runs once more if it renewed; otherwise it answers
   `renew_needed` (rule 12, AM-63). The waiting call looks every 50 ms
