@@ -426,10 +426,6 @@ where
         let mut caught_up = false;
         let mut caught_up_in_full = false;
         while puts < MAX_PUTS {
-            // For every attempt, as in `change`.
-            let Ok(zero) = self.gate.zero_head().await else {
-                return Ok(Some(BucketAnswer::Busy));
-            };
             let revoked: BTreeSet<String> = list_tenant_revocations(self.store, self.tenant)
                 .await?
                 .into_iter()
@@ -437,6 +433,10 @@ where
             advance(self.store, self.kek, self.ring, &chain, table).await?;
             reopen_closed(self.store, self.kek, self.ring, &chain, table).await?;
             let _ = reopen_from_checkpoints(self.store, self.kek, self.ring, table).await;
+            // For every attempt and after the key chain, as in `change`.
+            let Ok(zero) = self.gate.zero_head().await else {
+                return Ok(Some(BucketAnswer::Busy));
+            };
             // The move rules (AM-28, AM-31), against this head: a frozen
             // chain, or a tenant whose keys are tenant 0's or being moved,
             // takes no creator grant.
@@ -446,6 +446,7 @@ where
                 frozen: table.frozen_at().is_some(),
                 kind: ChangeKind::Create,
                 key_held: false,
+                internal: false,
                 routed_here: None,
             });
             match rules {

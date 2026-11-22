@@ -306,7 +306,7 @@ where
     let listed: BTreeSet<&str> = buckets.iter().map(String::as_str).collect();
     let chain = key_chain(env.tenant);
     let read = read_key_chain(env.store, env.kek, env.ring, env.tenant).await?;
-    let mut table = read.table;
+    let mut table = read.table.clone();
     let mut out = ExitDrops::default();
     let mut lost = 0;
     // The holders are found again at every head: on an exit that is not
@@ -316,7 +316,13 @@ where
         let next = table
             .entries()
             .filter(|e| {
-                e.door.status != SubjectStatus::Revoked
+                // A revoked holder (on the chain or by `m/rk/`) and one
+                // sealed under a gone key version hold nothing in force,
+                // and no record can be written for them on a frozen chain.
+                let dead = e.door.status == SubjectStatus::Revoked
+                    || read.revoked.contains(&e.door.id)
+                    || (e.private.is_none() && env.ring.gone(e.tk_version));
+                !dead
                     && e.door
                         .grants
                         .iter()
@@ -362,7 +368,7 @@ where
                 out.written.push(seq);
                 // Bounded: a run that keeps meeting new holders stops, and
                 // the tool runs it again.
-                if out.written.len() > MAX_EXIT_RECORDS {
+                if out.written.len() >= MAX_EXIT_RECORDS {
                     return Ok(out);
                 }
             }

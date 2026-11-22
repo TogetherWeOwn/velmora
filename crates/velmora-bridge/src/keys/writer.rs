@@ -68,7 +68,7 @@ use super::ports::{
 };
 use super::record::{
     grants_narrow, key_chain, open_key_record, seal_key_record, Entry, Grant, KeyOp, KeyTable,
-    Subject, SubjectDoor, SubjectPrivate, SubjectStatus, TkRing,
+    Subject, SubjectDoor, SubjectKind, SubjectPrivate, SubjectStatus, TkRing,
 };
 use super::revocations::{list_tenant_revocations, put_tenant_revocation};
 use super::routes::{put_route, read_route, RoutePut};
@@ -647,12 +647,6 @@ where
         let mut caught_up = false;
         let mut caught_up_in_full = false;
         while puts < MAX_PUTS {
-            // Tenant 0's head first (AM-28), for every attempt: a put lost
-            // to a give-up's or the move's record must see the head that
-            // record goes with.
-            let Ok(zero) = self.gate.zero_head().await else {
-                return Ok(KeyAnswer::Busy);
-            };
             // Read for every attempt: a retry validates against the
             // revocations as they are now.
             let mut revoked: BTreeSet<String> = list_tenant_revocations(self.store, self.tenant)
@@ -664,6 +658,12 @@ where
             reopen_closed(self.store, self.kek, self.ring, &chain, table).await?;
             // Best effort: a closing change never waits on a checkpoint.
             let _ = reopen_from_checkpoints(self.store, self.kek, self.ring, table).await;
+            // Tenant 0's head, for every attempt and after the key chain: a
+            // give-up writes tenant 0's `d1` record before its key-chain
+            // records, so a writer that has folded one sees `d1` here.
+            let Ok(zero) = self.gate.zero_head().await else {
+                return Ok(KeyAnswer::Busy);
+            };
             // The move rules, against this head: a writer that lost its
             // put reads the head again and checks again, so no record from
             // before a freeze lands above it.
@@ -781,6 +781,35 @@ where
                 )
                 .await?;
                 revoked.insert(plan.door.id.clone());
+                // A revoke that read the move's window: the window may have
+                // ended since (a give-up, whose sweep this `m/rk/` may have
+                // missed). Decide by the head now (AM-31, AM-54 LOW 3).
+                if matches!(&zero, ZeroHead::Moving { to } if to == self.tenant) {
+                    let Ok(now) = self.gate.zero_head().await else {
+                        return Ok(KeyAnswer::Busy);
+                    };
+                    match self.move_rules(&now, table, request).await {
+                        Gate::KeyMoved { .. } => {
+                            return Ok(match self.gate.refuse_in_d1(&plan.door.id).await {
+                                Ok(()) => KeyAnswer::KeyMoved,
+                                Err(_) => KeyAnswer::Busy,
+                            })
+                        }
+                        Gate::ZeroRevoke => {
+                            return Ok(match self.gate.zero_revoke(&plan.door.id).await {
+                                Ok(()) => KeyAnswer::RevokedOffChain,
+                                Err(_) => KeyAnswer::Busy,
+                            })
+                        }
+                        Gate::FrozenRevoke => {
+                            return self
+                                .frozen_revoke(table, &mut revoked, &plan.door.id, rng)
+                                .await
+                        }
+                        Gate::Unavailable => return Ok(KeyAnswer::Busy),
+                        Gate::Go => {}
+                    }
+                }
             }
             if plan.op == KeyOp::Create && plan.door.kind.has_secret() {
                 let routed = put_route(
@@ -857,12 +886,16 @@ where
                 Ok(Some(r)) if r.tenant == self.tenant.as_str()
             )),
         };
+        let internal = table
+            .get(id)
+            .is_some_and(|e| e.door.kind == SubjectKind::Internal);
         decide(&Facts {
             tenant: self.tenant,
             zero,
             frozen: table.frozen_at().is_some(),
             kind,
             key_held,
+            internal,
             routed_here,
         })
     }
@@ -892,6 +925,8 @@ where
         // Best effort: a unit that still holds the key closes it by the
         // override.
         let _ = self.apply_all(table, revoked).await;
+        // `<t>`'s internal key: D1 never holds it; its `m/rk/<t>/` is the
+        // revocation, and D1 refuses it already.
         let to_d1 = match self.gate.zero_head().await {
             Ok(ZeroHead::Undone { to }) => to == *self.tenant,
             Ok(ZeroHead::D1) => true,

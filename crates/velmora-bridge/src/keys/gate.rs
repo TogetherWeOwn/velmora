@@ -121,6 +121,9 @@ pub struct Facts<'a> {
     /// The subject is a key with a secret (an S3 key, an app password or
     /// the internal key) that `<t>`'s chain holds.
     pub key_held: bool,
+    /// The subject is `<t>`'s internal key: D1 never holds it (AM-28), so
+    /// after the undo its revoke is `<t>`'s own.
+    pub internal: bool,
     /// The key's `m/kr/` names `<t>`. `None` when not read (not a key);
     /// an unreadable or missing route is `Some(false)`.
     pub routed_here: Option<bool>,
@@ -131,10 +134,13 @@ pub fn decide(f: &Facts<'_>) -> Gate {
     let to_us = |to: &TenantId| to == f.tenant;
     match f.zero {
         ZeroHead::Undone { to } if to_us(to) => {
-            return match (f.kind, f.key_held) {
-                (ChangeKind::Revoke, true) => Gate::ZeroRevoke,
+            return match (f.kind, f.key_held, f.internal) {
+                // `<t>`'s own internal key: its `m/rk/<t>/` is what `<t>`
+                // reads when it serves again.
+                (ChangeKind::Revoke, true, true) => Gate::FrozenRevoke,
+                (ChangeKind::Revoke, true, false) => Gate::ZeroRevoke,
                 _ => Gate::KeyMoved { pre_apply: false },
-            }
+            };
         }
         ZeroHead::D1 => {
             let changes_key = matches!(f.kind, ChangeKind::Revoke | ChangeKind::Other);
@@ -264,6 +270,7 @@ mod tests {
             frozen,
             kind,
             key_held: true,
+            internal: false,
             routed_here,
         }
     }
@@ -290,6 +297,10 @@ mod tests {
                 Gate::KeyMoved { pre_apply: false }
             );
         }
+        // The internal key's revoke after the undo is `<t>`'s own.
+        let mut f = facts(&us, &undone, true, Revoke, None);
+        f.internal = true;
+        assert_eq!(decide(&f), Gate::FrozenRevoke);
         // A revoke of a subject the chain does not hold as a key.
         let mut f = facts(&us, &undone, true, Revoke, None);
         f.key_held = false;
