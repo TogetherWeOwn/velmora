@@ -2656,6 +2656,108 @@ async fn a_marked_row_is_not_due_again_until_the_resend_timeout() {
     assert!(fx.claim(&a, OutboxStage::Post, T0).await.is_some());
 }
 
+/// A hand-over that sends its own job marks the row in the write that
+/// moves it, with the time the row is due: the row is not due to the
+/// dispatcher until the resend timeout after that time. A refused send
+/// takes exactly that mark back.
+#[tokio::test]
+async fn a_hand_over_marks_the_row_and_a_refused_send_unmarks_it() {
+    let fx = Fx::new().await;
+    let o = fx.publish(&fx.bucket, "k").await;
+    let lease = fx.claim(&o, OutboxStage::Post, T0).await.unwrap();
+    let due = T0.plus_secs(30);
+    fx.cat.sql.1.borrow_mut().clear();
+    assert!(fx
+        .cat
+        .advance(&lease, OutboxStage::Verify, due, T0)
+        .await
+        .unwrap());
+    // One statement, as for a hand-over without the mark.
+    assert_eq!(fx.cat.sql.1.borrow().len(), 1);
+    assert_eq!(fx.outbox(&o, "stage").await, "verify");
+    assert_eq!(fx.outbox(&o, "sent_at").await, due.0.to_string());
+    // A spent lease marks nothing.
+    assert!(!fx
+        .cat
+        .advance(&lease, OutboxStage::Release, due.plus_secs(9), T0)
+        .await
+        .unwrap());
+    assert_eq!(fx.outbox(&o, "sent_at").await, due.0.to_string());
+
+    assert_eq!(fx.due_ids(due).await, []);
+    assert_eq!(fx.due_ids(due.plus_ms(RESEND_MS - 1)).await, []);
+    assert_eq!(
+        fx.due_ids(due.plus_ms(RESEND_MS)).await,
+        std::slice::from_ref(&o.extent)
+    );
+
+    // Another mark (a dispatcher run sent the row since) is not taken
+    // back, nor is the mark of a row that is not named.
+    let ids = std::slice::from_ref(&o.extent);
+    let jobs = &velmora_bridge::testkit::post_jobs([o.extent.clone()], &o.generation)[..];
+    let other = [Job::Gc { v: 1 }];
+    assert_eq!(fx.cat.unmark_sent(jobs, due.plus_ms(1)).await.unwrap(), 0);
+    assert_eq!(fx.cat.unmark_sent(&[], due).await.unwrap(), 0);
+    assert_eq!(fx.cat.unmark_sent(&other, due).await.unwrap(), 0);
+    assert_eq!(fx.outbox(&o, "sent_at").await, due.0.to_string());
+    let before = fx.outbox(&o, "lease_token").await;
+    assert_eq!(fx.cat.unmark_sent(jobs, due).await.unwrap(), 1);
+    assert_eq!(fx.outbox(&o, "sent_at").await, "NULL");
+    assert_eq!(fx.outbox(&o, "lease_token").await, before);
+    assert_eq!(fx.due_ids(due).await, ids);
+
+    // A row that moves to an end stage keeps no mark.
+    let lease = fx.claim(&o, OutboxStage::Verify, due).await.unwrap();
+    let later = due.plus_secs(60);
+    assert!(fx
+        .cat
+        .advance(&lease, OutboxStage::Release, later, due)
+        .await
+        .unwrap());
+    assert_eq!(fx.outbox(&o, "sent_at").await, later.0.to_string());
+    let lease = fx.claim(&o, OutboxStage::Release, later).await.unwrap();
+    assert!(fx
+        .cat
+        .advance(&lease, OutboxStage::Done, later, later)
+        .await
+        .unwrap());
+    assert_eq!(fx.outbox(&o, "sent_at").await, "NULL");
+}
+
+/// A mark never outlives the stage it was written for: a claim clears
+/// it, and so does every write that brings a row back to work, so a row
+/// that is revived or sent round again is due at once.
+#[tokio::test]
+async fn a_mark_does_not_outlive_its_stage() {
+    let fx = Fx::new().await;
+    let o = fx.publish(&fx.bucket, "k").await;
+    let lease = fx.claim(&o, OutboxStage::Post, T0).await.unwrap();
+    let due = T0.plus_secs(30);
+    assert!(fx
+        .cat
+        .advance(&lease, OutboxStage::Verify, due, T0)
+        .await
+        .unwrap());
+    assert_eq!(fx.outbox(&o, "sent_at").await, due.0.to_string());
+    // The job arrives: its claim clears the mark, so a job that dies is
+    // made up for when its lease is over.
+    assert!(fx.claim(&o, OutboxStage::Verify, due).await.is_some());
+    assert_eq!(fx.outbox(&o, "sent_at").await, "NULL");
+
+    // An overwrite cancels the row of the object it replaces: the mark
+    // goes with it.
+    let p = fx.publish(&fx.bucket, "gone").await;
+    let lease = fx.claim(&p, OutboxStage::Post, T0).await.unwrap();
+    assert!(fx
+        .cat
+        .advance(&lease, OutboxStage::Verify, due, T0)
+        .await
+        .unwrap());
+    fx.publish(&fx.bucket, "gone").await;
+    assert_eq!(fx.outbox(&p, "stage").await, "cancelled");
+    assert_eq!(fx.outbox(&p, "sent_at").await, "NULL");
+}
+
 /// Each stage is left alone for the wait of its kind of queue: `post`
 /// for one, `verify` and `release` for the other.
 #[tokio::test]

@@ -369,8 +369,14 @@ async fn failure_on_the_last_statement_rolls_back_the_whole_batch() {
     // One batch and nothing else per successful write.
     fx.writes();
     let v1 = fx.commit(&b.id, "k", 2, T0);
-    fx.cat.publish(&v1).await.unwrap();
+    fx.cat.publish_sent(&v1).await.unwrap();
     assert_eq!(fx.writes(), (1, 0), "first commit");
+    // The rows are marked as sent in that batch: the caller sends the
+    // jobs, and the dispatcher leaves the rows alone meanwhile.
+    assert_eq!(
+        fx.int("SELECT COUNT(*) FROM outbox WHERE sent_at = next_at AND sent_at = updated_at"),
+        2
+    );
     assert!(fx
         .cat
         .sql
@@ -379,7 +385,7 @@ async fn failure_on_the_last_statement_rolls_back_the_whole_batch() {
         .last()
         .is_some_and(|s| s.starts_with("INSERT INTO objects")));
     fx.cat
-        .publish(&fx.commit(&b.id, "k", 1, T0.plus_ms(1)))
+        .publish_sent(&fx.commit(&b.id, "k", 1, T0.plus_ms(1)))
         .await
         .unwrap();
     assert_eq!(fx.writes(), (1, 0), "overwrite");
@@ -468,7 +474,7 @@ async fn revival_reads_only_its_window_of_the_outbox() {
     let ran = fx.cat.sql.ran.borrow().clone();
     let revive: Vec<_> = ran
         .iter()
-        .filter(|s| s.starts_with("UPDATE outbox"))
+        .filter(|s| s.starts_with("UPDATE outbox SET stage"))
         .collect();
     assert_eq!(revive.len(), 1, "{ran:?}");
     let plan = fx.cat.sql.db.with_conn(|c| {
@@ -2350,7 +2356,8 @@ async fn extents_in_matches_the_statement_it_replaced() {
             (size + 5, size + 9),
             (0, 0),
             (size, size),
-            (0, u64::MAX >> 1),
+            // The largest end the database takes as a bound value.
+            (0, MAX_SQL_INT as u64),
         ];
         let mut border = 0;
         for s in &sizes {
