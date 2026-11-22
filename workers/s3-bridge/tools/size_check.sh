@@ -8,7 +8,7 @@ set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 out_json=$1
 work=$(mktemp -d)
-trap 'rm -rf "$work" wrangler.size.toml' EXIT
+trap 'rm -r -- "$work"; [ ! -e wrangler.size.toml ] || rm -- wrangler.size.toml' EXIT
 # The config sits next to wrangler.toml: its paths are relative to it.
 python3 -I tools/bundle_size.py config wrangler.toml wrangler.size.toml
 WRANGLER_SEND_METRICS=false ./node_modules/.bin/wrangler deploy --dry-run --env="" \

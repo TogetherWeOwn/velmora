@@ -422,7 +422,7 @@ jobs:
              && unzip -p "$RUNNER_TEMP/base.zip" size.json > "$base"; then
             :
           else
-            rm -f "$base"
+            [ ! -e "$base" ] || rm -- "$base"
             echo "No size measurement from main could be read; reporting without a delta."
           fi
       # Without a token. A failed fetch above still leaves a report.
