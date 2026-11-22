@@ -62,6 +62,28 @@
 //! before this module: `run_job` drops it and the outbox sends its row
 //! again in the current format.
 //!
+//! A `v` 2 message whose kind (`t`) is none this build knows is refused
+//! as [`Refusal::UnknownKind`], so the dead-letter queue says why.
+//!
+//! # Unit jobs
+//!
+//! Two kinds exist in format 2 only: [`UnitJob::Renew`] (a unit's alarm
+//! asks the Worker to prove the unit's lease and renew it) and
+//! [`UnitJob::StampRaise`] (the alarm's one raise of the unit's stamp per
+//! period with writes). Only a unit writes them, so each names its
+//! tenant **and** its unit; they have no `v` 1 form, and a `v` 1 message
+//! of either kind is malformed, as before this module. Every reader from
+//! this one on knows them ([`read_unit_job`]), long before a unit can
+//! write one.
+//!
+//! This Worker serves no unit: tenant 0 has none. A unit job is
+//! therefore refused here, as [`Refusal::OtherTenant`] for a unit of
+//! another tenant, [`Refusal::UnitOfTenantZero`] or [`Refusal::NoUnit`]
+//! for tenant 0, and [`Refusal::BadBody`] when its fields are not those
+//! of its kind. The build that binds the unit class runs them. A lost
+//! `renew` closes the unit when its lease runs out (an outage, never a
+//! wrong answer); the alarm's backoff sends it again.
+//!
 //! # Inside the Worker
 //!
 //! The body of a `v` 2 message is the body of a `v` 1 message plus the
@@ -90,6 +112,14 @@ pub const REFUSED_RETRY_DELAY_SECS: u32 = 0;
 
 /// Name of the configuration switch of the writers' format.
 pub const JOB_FORMAT_VAR: &str = "JOB_FORMAT";
+
+/// The kinds (`t`) of a [`Job`], in either format. A test holds that
+/// every variant's tag is listed.
+pub const JOB_KINDS: [&str; 6] = ["extent", "wake", "gc", "evict", "sweep", "recovery_copy"];
+
+/// The kinds (`t`) of a [`UnitJob`]: format 2 only. No [`Job`] kind has
+/// one of these names (a test holds it).
+pub const UNIT_JOB_KINDS: [&str; 2] = ["renew", "stamp_raise"];
 
 /// The four fields a `v` 2 message adds. A body field of a [`Job`] never
 /// has one of these names (a test holds it).
@@ -152,6 +182,20 @@ impl JobTenant {
             state_seq: 0,
             keys_seq: 0,
         }
+    }
+
+    /// The fields for a job of `unit` of `tenant`, at the unit's
+    /// `state_seq` and `keys_seq`. `None` for tenant 0, which has no
+    /// unit, and for a name that is not a tenant id.
+    pub fn of_unit(tenant: &str, unit: u32, state_seq: u64, keys_seq: u64) -> Option<JobTenant> {
+        (crate::recovery::valid_tenant_id(tenant) && !is_unitless_tenant(tenant)).then(|| {
+            JobTenant {
+                tenant: tenant.to_string(),
+                unit: Some(unit),
+                state_seq,
+                keys_seq,
+            }
+        })
     }
 
     pub fn tenant(&self) -> &str {
@@ -343,6 +387,139 @@ impl<'a> TenantMessage<'a> {
     }
 }
 
+/// A job that only a unit sends, for itself: format 2 only. See the
+/// [module](self#unit-jobs).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UnitJob {
+    /// Prove the unit's lease from the stores and renew it (ADR rule
+    /// 12). `at` is the unit's clock when its alarm sent the job: a
+    /// hint for the lag line only, never part of the proof, which starts
+    /// at the Worker's own clock.
+    Renew { at: UnixMs },
+    /// Raise the unit's stamp once (§8.5). `at` as for `Renew`.
+    StampRaise { at: UnixMs },
+}
+
+impl UnitJob {
+    /// The message for this job of the unit of `tenant`, whatever
+    /// `JOB_FORMAT` says: a unit job has no `v` 1 form. `None` when
+    /// `tenant` names no unit ([`JobTenant::of_unit`] always names one).
+    pub fn message(&self, tenant: &JobTenant) -> Option<String> {
+        let unit = tenant.unit?;
+        let (v, t) = (TENANT_FORMAT_VERSION, tenant.tenant.as_str());
+        let (state_seq, keys_seq) = (tenant.state_seq, tenant.keys_seq);
+        let message = match *self {
+            UnitJob::Renew { at } => UnitMessage::Renew {
+                v,
+                at,
+                tenant: t,
+                unit,
+                state_seq,
+                keys_seq,
+            },
+            UnitJob::StampRaise { at } => UnitMessage::StampRaise {
+                v,
+                at,
+                tenant: t,
+                unit,
+                state_seq,
+                keys_seq,
+            },
+        };
+        // Plain strings and integers only: it cannot fail.
+        Some(serde_json::to_string(&message).unwrap_or_default())
+    }
+}
+
+/// The bytes of a unit job: a struct per kind, never `flatten` (see
+/// [`TenantMessage`]).
+#[derive(Serialize)]
+#[serde(tag = "t", rename_all = "snake_case")]
+enum UnitMessage<'a> {
+    Renew {
+        v: u8,
+        at: UnixMs,
+        tenant: &'a str,
+        unit: u32,
+        state_seq: u64,
+        keys_seq: u64,
+    },
+    StampRaise {
+        v: u8,
+        at: UnixMs,
+        tenant: &'a str,
+        unit: u32,
+        state_seq: u64,
+        keys_seq: u64,
+    },
+}
+
+/// The body of a unit job without its tenant fields.
+#[derive(Deserialize)]
+#[serde(tag = "t", rename_all = "snake_case", deny_unknown_fields)]
+enum UnitBody {
+    Renew {
+        #[allow(dead_code)]
+        v: u8,
+        at: UnixMs,
+    },
+    StampRaise {
+        #[allow(dead_code)]
+        v: u8,
+        at: UnixMs,
+    },
+}
+
+/// Reads a unit job: a `v` 2 message of a kind in [`UNIT_JOB_KINDS`],
+/// of a tenant other than tenant 0, naming its unit, with the fields of
+/// its kind and nothing else. It says nothing of whether this Worker
+/// serves that unit: [`admit`] decides that.
+pub fn read_unit_job(body: &Value) -> std::result::Result<(UnitJob, JobTenant), Refusal> {
+    let Some(fields) = body.as_object() else {
+        return Err(Refusal::BadBody);
+    };
+    if fields.get("v").and_then(Value::as_u64) != Some(u64::from(TENANT_FORMAT_VERSION)) {
+        return Err(Refusal::BadBody);
+    }
+    let (tenant, numbers) = tenant_fields(fields)?;
+    if !crate::recovery::valid_tenant_id(&tenant) {
+        return Err(Refusal::BadTenant);
+    }
+    if is_unitless_tenant(&tenant) && numbers.unit.is_some() {
+        return Err(Refusal::UnitOfTenantZero);
+    }
+    match fields.get("t").and_then(Value::as_str) {
+        Some(kind) if UNIT_JOB_KINDS.contains(&kind) => {}
+        _ => return Err(Refusal::UnknownKind),
+    }
+    let mut rest = fields.clone();
+    for name in TENANT_FIELDS {
+        rest.remove(name);
+    }
+    let job = match serde_json::from_value::<UnitBody>(Value::Object(rest)) {
+        Ok(UnitBody::Renew { at, .. }) => UnitJob::Renew { at },
+        Ok(UnitBody::StampRaise { at, .. }) => UnitJob::StampRaise { at },
+        Err(_) => return Err(Refusal::BadBody),
+    };
+    let Some(unit) = numbers.unit else {
+        return Err(Refusal::NoUnit);
+    };
+    Ok((
+        job,
+        JobTenant {
+            tenant,
+            unit: Some(unit),
+            state_seq: numbers.state_seq,
+            keys_seq: numbers.keys_seq,
+        },
+    ))
+}
+
+/// Whether `tenant` is tenant 0's id. Tenant 0 has no unit.
+fn is_unitless_tenant(tenant: &str) -> bool {
+    tenant == TenantScope::tenant_zero().tenant_id()
+}
+
 /// `v` of a job's body.
 fn body_version(job: &Job) -> u8 {
     match job {
@@ -475,6 +652,10 @@ pub enum Refusal {
     UnitOfTenantZero,
     /// Its fields are not a job of this build.
     BadBody,
+    /// Its kind (`t`) is none this build knows.
+    UnknownKind,
+    /// A unit job ([`UnitJob`]) that names no unit.
+    NoUnit,
 }
 
 impl Refusal {
@@ -485,6 +666,8 @@ impl Refusal {
             Refusal::OtherTenant => "other_tenant",
             Refusal::UnitOfTenantZero => "unit_of_tenant_0",
             Refusal::BadBody => "bad_body",
+            Refusal::UnknownKind => "unknown_kind",
+            Refusal::NoUnit => "no_unit",
         }
     }
 }
@@ -524,18 +707,7 @@ fn tenant_message(
     let Some(fields) = body.as_object() else {
         return Err(Refusal::BadBody);
     };
-    let tenant = match fields.get("tenant") {
-        None | Some(Value::Null) => return Err(Refusal::NoTenant),
-        Some(Value::String(tenant)) => tenant.clone(),
-        Some(_) => return Err(Refusal::BadTenant),
-    };
-    let numbers: Numbers = serde_json::from_value(Value::Object(
-        TENANT_FIELDS
-            .iter()
-            .filter_map(|name| Some(((*name).to_string(), fields.get(*name)?.clone())))
-            .collect(),
-    ))
-    .map_err(|_| Refusal::BadBody)?;
+    let (tenant, numbers) = tenant_fields(fields)?;
     if tenant != served.tenant_id() {
         return Err(match crate::recovery::Layout::tenant(&tenant) {
             Some(_) => Refusal::OtherTenant,
@@ -545,6 +717,16 @@ fn tenant_message(
     // Tenant 0's catalogue is the D1 database, not a unit.
     if served.is_tenant_zero() && numbers.unit.is_some() {
         return Err(Refusal::UnitOfTenantZero);
+    }
+    match fields.get("t").and_then(Value::as_str) {
+        Some(kind) if JOB_KINDS.contains(&kind) => {}
+        // A unit job of the served tenant. The served tenant is tenant
+        // 0, which has no unit, so a well-formed one is refused here
+        // too: the reader says whether it was well formed.
+        Some(kind) if UNIT_JOB_KINDS.contains(&kind) => {
+            return Err(read_unit_job(body).err().unwrap_or(Refusal::NoUnit));
+        }
+        _ => return Err(Refusal::UnknownKind),
     }
     // The body without the tenant fields is a body of the current
     // version; `Job` refuses any field it does not know.
@@ -563,6 +745,25 @@ fn tenant_message(
             keys_seq: numbers.keys_seq,
         },
     ))
+}
+
+/// The tenant and the tenant fields of a `v` 2 message.
+fn tenant_fields(
+    fields: &serde_json::Map<String, Value>,
+) -> std::result::Result<(String, Numbers), Refusal> {
+    let tenant = match fields.get("tenant") {
+        None | Some(Value::Null) => return Err(Refusal::NoTenant),
+        Some(Value::String(tenant)) => tenant.clone(),
+        Some(_) => return Err(Refusal::BadTenant),
+    };
+    let numbers: Numbers = serde_json::from_value(Value::Object(
+        TENANT_FIELDS
+            .iter()
+            .filter_map(|name| Some(((*name).to_string(), fields.get(*name)?.clone())))
+            .collect(),
+    ))
+    .map_err(|_| Refusal::BadBody)?;
+    Ok((tenant, numbers))
 }
 
 /// The tenant fields as a `v` 2 message must carry them: both numbers
@@ -647,6 +848,8 @@ mod tests {
             Refusal::OtherTenant,
             Refusal::UnitOfTenantZero,
             Refusal::BadBody,
+            Refusal::UnknownKind,
+            Refusal::NoUnit,
         ] {
             assert_eq!(
                 Admission::Refused(refusal).disposition(),
@@ -673,6 +876,8 @@ mod tests {
             Refusal::OtherTenant,
             Refusal::UnitOfTenantZero,
             Refusal::BadBody,
+            Refusal::UnknownKind,
+            Refusal::NoUnit,
         ];
         let codes: std::collections::BTreeSet<_> = all.iter().map(|r| r.code()).collect();
         assert_eq!(codes.len(), all.len());
