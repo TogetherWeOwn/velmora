@@ -18,7 +18,7 @@ const INVALID_TENANTS: [&str; 5] = [
     "",
 ];
 
-fn cases() -> [(&'static str, String, Call, Scope); 29] {
+fn cases() -> [(&'static str, String, Call, Scope); 33] {
     let tenant_path = format!("/v1/tenants/{TENANT}");
     [
         (
@@ -253,6 +253,40 @@ fn cases() -> [(&'static str, String, Call, Scope); 29] {
             Scope::TenantsRead,
         ),
         ("GET", "/v1/events".into(), Call::Events, Scope::EventsRead),
+        (
+            "GET",
+            format!("{tenant_path}/reach"),
+            Call::TenantReach {
+                tenant: TENANT.into(),
+            },
+            Scope::TenantsRead,
+        ),
+        (
+            "GET",
+            format!("{tenant_path}/buckets/{BUCKET}"),
+            Call::BucketRead {
+                tenant: TENANT.into(),
+                bucket: BUCKET.into(),
+            },
+            Scope::TenantsRead,
+        ),
+        (
+            "GET",
+            format!("{tenant_path}/keys/{KEY}"),
+            Call::KeyRead {
+                tenant: TENANT.into(),
+                key: KEY.into(),
+            },
+            Scope::TenantsRead,
+        ),
+        (
+            "GET",
+            format!("{tenant_path}/usage/buckets"),
+            Call::UsageBuckets {
+                tenant: TENANT.into(),
+            },
+            Scope::UsageRead,
+        ),
     ]
 }
 

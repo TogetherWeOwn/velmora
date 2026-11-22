@@ -18,12 +18,13 @@
 //! | GET | `/v1/tenants` | tenant list (`?external_ref=`; never tenant 0) | `tenants:read` |
 //! | POST | `/v1/tenants` | tenant create | `tenants:create` |
 //! | GET | `/v1/tenants/{t}` | tenant read | `tenants:read` |
+//! | GET | `/v1/tenants/{t}/reach` | what a delete of the tenant would reach (a dry run) | `tenants:read` |
 //! | DELETE | `/v1/tenants/{t}` | delete request (hold of 7 days or more) | `tenants:delete` |
 //! | POST | `/v1/tenants/{t}/restore` | undo of the customer's own delete request | `tenants:delete` |
 //! | GET, POST | `/v1/tenants/{t}/buckets` | list, create | `tenants:read`, `buckets:write` |
-//! | PATCH, DELETE | `/v1/tenants/{t}/buckets/{b}` | settings, delete an empty bucket | `buckets:write`, `buckets:delete` |
+//! | GET, PATCH, DELETE | `/v1/tenants/{t}/buckets/{b}` | read, settings, delete an empty bucket | `tenants:read`, `buckets:write`, `buckets:delete` |
 //! | GET, POST | `/v1/tenants/{t}/keys` | list, create a key or an app password | `tenants:read`, `keys:write` |
-//! | PATCH, DELETE | `/v1/tenants/{t}/keys/{k}` | grant change, revoke | `keys:write` |
+//! | GET, PATCH, DELETE | `/v1/tenants/{t}/keys/{k}` | read (never a secret), grant change, revoke | `tenants:read`, `keys:write` |
 //! | POST | `/v1/tenants/{t}/keys/{k}/disable` | disable | `keys:write` |
 //! | POST | `/v1/tenants/{t}/principals` | create | `principals:write` |
 //! | PATCH, DELETE | `/v1/tenants/{t}/principals/{p}` | grant change, revoke | `keys:write` |
@@ -36,11 +37,14 @@
 //! | DELETE | `/v1/tenants/{t}/uploads/{u}` | `objects.multipart_abort` | `objects:create` |
 //! | GET | `/v1/tenants/{t}/uploads/{u}/parts` | `objects.multipart_parts` | `objects:list` |
 //! | GET | `/v1/tenants/{t}/usage` | usage totals | `usage:read` |
-//! | GET | `/v1/tenants/{t}/usage/days`, `/v1/tenants/{t}/usage/downloads` | usage by day, downloads | `usage:read` |
+//! | GET | `/v1/tenants/{t}/usage/days`, `/v1/tenants/{t}/usage/downloads`, `/v1/tenants/{t}/usage/buckets` | usage by day, downloads, per bucket | `usage:read` |
 //! | GET | `/v1/events` | the event feed (`?after=`) | `events:read` |
 //!
-//! The paths are a proposal of this package for the contract with
-//! `kofra-api`; the call list and the scopes are the tenancy design's.
+//! The paths are the contract with `kofra-api` (design answer L5-1); the
+//! call list and the scopes are the tenancy design's. Four reads were
+//! added for the calls `kofra-api`'s storage port makes: the tenant's
+//! reach, one bucket, one key, and usage per bucket. Each is read-only
+//! and on `tenants:read` or `usage:read`, as the list it reads from.
 
 use crate::mgmt::token::Scope;
 use crate::recovery::{valid_key_id, DEFAULT_TENANT};
@@ -56,12 +60,15 @@ pub enum Call {
     TenantRead { tenant: String },
     TenantDelete { tenant: String },
     TenantRestore { tenant: String },
+    TenantReach { tenant: String },
     BucketList { tenant: String },
     BucketCreate { tenant: String },
+    BucketRead { tenant: String, bucket: String },
     BucketUpdate { tenant: String, bucket: String },
     BucketDelete { tenant: String, bucket: String },
     KeyList { tenant: String },
     KeyCreate { tenant: String },
+    KeyRead { tenant: String, key: String },
     KeyUpdate { tenant: String, key: String },
     KeyRevoke { tenant: String, key: String },
     KeyDisable { tenant: String, key: String },
@@ -79,6 +86,7 @@ pub enum Call {
     Usage { tenant: String },
     UsageDays { tenant: String },
     UsageDownloads { tenant: String },
+    UsageBuckets { tenant: String },
     Events,
 }
 
@@ -88,9 +96,13 @@ impl Call {
         use Call::*;
         match self {
             TenantCreate => Scope::TenantsCreate,
-            TenantList | TenantRead { .. } | BucketList { .. } | KeyList { .. } => {
-                Scope::TenantsRead
-            }
+            TenantList
+            | TenantRead { .. }
+            | TenantReach { .. }
+            | BucketList { .. }
+            | BucketRead { .. }
+            | KeyList { .. }
+            | KeyRead { .. } => Scope::TenantsRead,
             TenantDelete { .. } | TenantRestore { .. } => Scope::TenantsDelete,
             BucketCreate { .. } | BucketUpdate { .. } => Scope::BucketsWrite,
             BucketDelete { .. } => Scope::BucketsDelete,
@@ -108,7 +120,9 @@ impl Call {
             UploadCreate { .. } | UploadComplete { .. } | UploadAbort { .. } => {
                 Scope::ObjectsCreate
             }
-            Usage { .. } | UsageDays { .. } | UsageDownloads { .. } => Scope::UsageRead,
+            Usage { .. } | UsageDays { .. } | UsageDownloads { .. } | UsageBuckets { .. } => {
+                Scope::UsageRead
+            }
             Events => Scope::EventsRead,
         }
     }
@@ -137,12 +151,15 @@ impl Call {
             TenantRead { tenant }
             | TenantDelete { tenant }
             | TenantRestore { tenant }
+            | TenantReach { tenant }
             | BucketList { tenant }
             | BucketCreate { tenant }
+            | BucketRead { tenant, .. }
             | BucketUpdate { tenant, .. }
             | BucketDelete { tenant, .. }
             | KeyList { tenant }
             | KeyCreate { tenant }
+            | KeyRead { tenant, .. }
             | KeyUpdate { tenant, .. }
             | KeyRevoke { tenant, .. }
             | KeyDisable { tenant, .. }
@@ -159,7 +176,8 @@ impl Call {
             | UploadParts { tenant, .. }
             | Usage { tenant }
             | UsageDays { tenant }
-            | UsageDownloads { tenant } => Some(tenant),
+            | UsageDownloads { tenant }
+            | UsageBuckets { tenant } => Some(tenant),
         }
     }
 }
@@ -226,6 +244,10 @@ pub fn route(method: &str, path: &str) -> Result<Call, NoCall> {
                 _ => None,
             }
         }
+        ["tenants", tn, "reach"] => {
+            let tenant = t(tn)?;
+            (method == "GET").then_some(Call::TenantReach { tenant })
+        }
         ["tenants", tn, "restore"] => {
             let tenant = t(tn)?;
             (method == "POST").then_some(Call::TenantRestore { tenant })
@@ -241,6 +263,7 @@ pub fn route(method: &str, path: &str) -> Result<Call, NoCall> {
         ["tenants", tn, "buckets", b] => {
             let (tenant, bucket) = (t(tn)?, id(b, bucket_id)?);
             match method {
+                "GET" => Some(Call::BucketRead { tenant, bucket }),
                 "PATCH" => Some(Call::BucketUpdate { tenant, bucket }),
                 "DELETE" => Some(Call::BucketDelete { tenant, bucket }),
                 _ => None,
@@ -257,6 +280,7 @@ pub fn route(method: &str, path: &str) -> Result<Call, NoCall> {
         ["tenants", tn, "keys", k] => {
             let (tenant, key) = (t(tn)?, id(k, valid_key_id)?);
             match method {
+                "GET" => Some(Call::KeyRead { tenant, key }),
                 "PATCH" => Some(Call::KeyUpdate { tenant, key }),
                 "DELETE" => Some(Call::KeyRevoke { tenant, key }),
                 _ => None,
@@ -319,6 +343,10 @@ pub fn route(method: &str, path: &str) -> Result<Call, NoCall> {
         ["tenants", tn, "usage", "downloads"] => {
             let tenant = t(tn)?;
             (method == "GET").then_some(Call::UsageDownloads { tenant })
+        }
+        ["tenants", tn, "usage", "buckets"] => {
+            let tenant = t(tn)?;
+            (method == "GET").then_some(Call::UsageBuckets { tenant })
         }
         _ => return Err(NoCall::NotFound),
     };

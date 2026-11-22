@@ -7,9 +7,11 @@
 //!
 //! - [`gate`]: what every call passes before its handler runs.
 //! - [`route`]: the calls, their paths and the least scope of each.
+//! - [`serve`]: one request, from the gate to its answer.
 //! - [`token`]: the service tokens, their classes and scopes, and the
 //!   records that disable one.
 
 pub mod gate;
 pub mod route;
+pub mod serve;
 pub mod token;
