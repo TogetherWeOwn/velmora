@@ -1192,11 +1192,11 @@ fn a_restore_to_a_time_before_the_units_birth_is_refused() {
 }
 
 #[test]
-fn a_unit_born_closed_takes_no_undo_bookmark_before_the_moves_first_batch() {
+fn the_first_batch_closes_the_undo_bookmark_and_the_span_before_it_is_open() {
     // The move's step 2 re-creates an unborn owner unit with a `restore`
     // token under its entry (AM-53). Before the first batch there is no
-    // move record, so only the birth tells the unit that it never served:
-    // no undo bookmark is taken (AM-46; review r1 MEDIUM).
+    // move record: the restore checks go on (an open design question,
+    // 4c review). From the first batch on, no undo bookmark (AM-46).
     let u = Unit::new(RusqliteSql::open_in_memory().unwrap(), own(), "");
     let token = BirthToken {
         name: own(),
@@ -1224,7 +1224,6 @@ fn a_unit_born_closed_takes_no_undo_bookmark_before_the_moves_first_batch() {
     u.sql()
         .apply("CREATE TABLE unit_lease (id INTEGER PRIMARY KEY, fresh_until INTEGER, lease_hi INTEGER)")
         .unwrap();
-    let never = Some((Refused::Restore(RestoreRefusal::NeverOpened), false));
     let late = UnixMs(NOW.0 + 86_400_000);
     let c = call_on(
         &own(),
@@ -1232,10 +1231,7 @@ fn a_unit_born_closed_takes_no_undo_bookmark_before_the_moves_first_batch() {
         None,
         UnitOp::RestorePrepare { since: S },
     );
-    match u.pitr_step(&c, late) {
-        PitrStep::Answer(a) => assert_eq!(refusal(&a), never),
-        other => panic!("prepared: {other:?}"),
-    }
+    assert!(matches!(u.pitr_step(&c, late), PitrStep::Prepare { .. }));
     // The first batch binds the move: then `move_not_lifted`.
     ok(import(
         &u,

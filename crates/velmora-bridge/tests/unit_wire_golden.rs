@@ -478,7 +478,7 @@ fn nested() -> Value {
             ImportNotSealed, MoveNotEmpty),
         "restore_refusal": every!(RestoreRefusal: NotRestoring, WrongToken, LeaseLive,
             LeaseUnknown, TooSoon, Moved, Malformed, NoPointInTime, BeforeMoveLift, MoveNotLifted,
-            NeverOpened, BeforeBirth),
+            BeforeBirth),
         "recount_refusal": every!(RecountRefusal: NotRestoring, ImportNotSealed, MoveNotBound),
         "reserve_refusal": every!(ReserveRefusal: CapReached, GrantNotHeld,
             GrantLimitsNotServed, TooManyGrants, ActingPrincipalUnknown,
