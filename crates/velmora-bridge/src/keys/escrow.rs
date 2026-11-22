@@ -262,7 +262,7 @@ pub async fn restore_escrow<S: RecordStore, K: Kek>(
     // Every active location is read (an asynchronous one may hold the
     // newest name, or a copy in conflict); only synchronous ones are
     // written.
-    let mut conflict_elsewhere = false;
+    let mut conflict_elsewhere = Vec::new();
     for location in set.active() {
         let store = buckets.get(location)?;
         let mut conflict = false;
@@ -304,15 +304,15 @@ pub async fn restore_escrow<S: RecordStore, K: Kek>(
         };
         if location.synchronous {
             decided.push((location, step));
-        } else {
-            conflict_elsewhere |= step == RestoreStep::Conflict;
+        } else if step == RestoreStep::Conflict {
+            conflict_elsewhere.push(location.name.clone());
         }
     }
     let (newest_v, name, blob) =
         newest.unwrap_or((copy.kek_version, copy.name(), copy.blob.clone()));
     // A conflict anywhere, or a copy under a newer KEK than the one we
     // would write, stops every write: no older name beside a newer one.
-    let mut stop = conflict_elsewhere
+    let mut stop = !conflict_elsewhere.is_empty()
         || decided.iter().any(|(_, s)| *s == RestoreStep::Conflict)
         || unopened > newest_v;
     let mut out = Vec::new();
@@ -352,6 +352,13 @@ pub async fn restore_escrow<S: RecordStore, K: Kek>(
         };
         out.push((location.name.clone(), step));
     }
+    // An asynchronous location in conflict is named too: it is never
+    // written, but it is what withheld the writes.
+    out.extend(
+        conflict_elsewhere
+            .into_iter()
+            .map(|name| (name, RestoreStep::Conflict)),
+    );
     Ok(out)
 }
 

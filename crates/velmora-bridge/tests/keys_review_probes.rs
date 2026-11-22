@@ -597,6 +597,11 @@ async fn escrow_restore_uses_newest_verified_copy_and_stops_on_conflict() {
         let actual = restore_escrow(&old_copy, &ring, kcv, &set, &stores.buckets())
             .await
             .unwrap();
+        let mut expected = expected.to_vec();
+        if expected[0].1 == Withheld {
+            // The asynchronous location that withheld the writes is named.
+            expected.push(("KEYS_OFFSITE".into(), RestoreStep::Conflict));
+        }
         assert_eq!(actual, expected);
         for store in [&stores.a, &stores.b] {
             let restored = expected[0].1 == Restored;

@@ -515,7 +515,8 @@ where
             advance(self.store, self.kek, self.ring, &chain, table).await?;
             // A cached table opens what this ring can open now.
             reopen_closed(self.store, self.kek, self.ring, &chain, table).await?;
-            reopen_from_checkpoints(self.store, self.kek, self.ring, table).await?;
+            // Best effort: a closing change never waits on a checkpoint.
+            let _ = reopen_from_checkpoints(self.store, self.kek, self.ring, table).await;
             let plan = match plan(self.kek, table, &revoked, request) {
                 Planned::Refused(r) => return Ok(KeyAnswer::Refused(r)),
                 Planned::Busy => return Ok(KeyAnswer::Busy),
