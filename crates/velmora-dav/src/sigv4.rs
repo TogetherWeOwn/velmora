@@ -107,7 +107,15 @@ pub fn sign(req: &Unsigned<'_>, creds: &Credentials, region: &str, now_ms: i64) 
     }
     signed.sort();
     signed.dedup_by(|a, b| a.0 == b.0);
-    let canonical_headers: String = signed.iter().map(|(k, v)| format!("{k}:{v}\n")).collect();
+    // Match velmora-s3-proto's canonical_request without rewriting the
+    // wire header values (whitespace may be significant inside a value).
+    let canonical_headers: String = signed
+        .iter()
+        .map(|(k, v)| {
+            let canonical_value = v.split_ascii_whitespace().collect::<Vec<_>>().join(" ");
+            format!("{k}:{canonical_value}\n")
+        })
+        .collect();
     let names = signed
         .iter()
         .map(|(k, _)| k.as_str())
@@ -153,6 +161,50 @@ mod tests {
             amz_date(951_782_400_000 + 86_399_000),
             ("20000229T235959Z".into(), "20000229".into())
         );
+    }
+
+    #[test]
+    fn signed_header_whitespace_matches_bridge_canonical_request() {
+        let host = "s3.test";
+        let path = "/bucket/file.txt";
+        let value = " \ttext/plain;  name=\"a\tb\" \t";
+        let creds = Credentials {
+            access_key: "APVLEXAMPLE".into(),
+            secret: "fixture".into(),
+        };
+        let signed = sign(
+            &Unsigned {
+                method: "PUT",
+                host,
+                path,
+                query: &[],
+                headers: &[("Content-Type".into(), value.into())],
+            },
+            &creds,
+            "auto",
+            0,
+        );
+
+        // Fixed signature generated from velmora-s3-proto's canonical_request
+        // for these headers, using the public test fixture key above.
+        let expected_signature = "e0132ab51ea6a43ab2c8be21aebaf16369fcc686e478ff97c0607c6f797849b4";
+        let names = "content-type;host;x-amz-content-sha256;x-amz-date";
+        let auth = &signed
+            .headers
+            .iter()
+            .find(|(k, _)| k == "authorization")
+            .unwrap()
+            .1;
+        assert!(
+            auth.ends_with(&format!(
+                "SignedHeaders={names}, Signature={expected_signature}"
+            )),
+            "gateway signature does not match the bridge's canonical request"
+        );
+        // Canonicalization is for signing, not a rewrite of the signed header.
+        assert!(signed
+            .headers
+            .contains(&("content-type".into(), value.trim().into())));
     }
 
     /// The example of the AWS SigV4 documentation for a GET with a
