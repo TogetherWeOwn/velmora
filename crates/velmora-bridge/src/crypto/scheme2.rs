@@ -61,7 +61,11 @@
 //!   needs to close a door without the tenant key;
 //! - the **private part**, under a key the header names: the TK-derived
 //!   key of a managed tenant, a KEK-derived key for tenant 0, or nothing
-//!   for a global record.
+//!   for a global record and for a managed tenant's tenant-chain record
+//!   that has no tenant key (before its version 1, and the `shredded`
+//!   stub; under `m/t/<t>/` only). The
+//!   owner label in the AAD keeps a keyless tenant record apart from a
+//!   global one, and the header's kind is authenticated by the door.
 //!
 //! The 21-byte header names the KEK version of the door part, the kind
 //! and version of the private key and both lengths. The private part is
@@ -144,6 +148,10 @@ const BUCKET_CONFIG_DIR: &str = "b/";
 /// The owner of a global control record in an AAD. No tenant id can be
 /// it.
 const GLOBAL_OWNER: &str = "-";
+
+/// The one directory whose records a managed tenant may seal with no
+/// tenant key: its tenant chain.
+const KEYLESS_DIR: &str = "m/t/";
 
 const PRIVATE_NONE: u8 = 0;
 const PRIVATE_KEK: u8 = 1;
@@ -676,6 +684,13 @@ pub enum ControlSealer<'a> {
     /// A managed tenant: the private part under its tenant key, whose
     /// tenant and version the record names.
     Managed(&'a TenantKey),
+    /// A managed tenant's record that has no tenant key to seal under: a
+    /// tenant-chain record from before the tenant's key version 1, or the
+    /// `shredded` stub written after every version was destroyed. A door
+    /// part only, under the tenant's chain `m/t/<t>/` and nowhere else,
+    /// bound to the tenant like any of its records. Nothing private may be
+    /// in it.
+    ManagedKeyless(&'a TenantId),
 }
 
 /// Who a control record belongs to, as a reader names it. The reader
@@ -696,11 +711,18 @@ impl ControlOwner<'_> {
         }
     }
 
-    fn private_kind(&self) -> u8 {
+    /// Whether a record of this owner stored under `name` may name
+    /// private-key kind `kind`. A managed tenant's record has its tenant
+    /// key; only a record of its tenant chain (`m/t/<t>/`) may have none
+    /// at all (see [`ControlSealer::ManagedKeyless`]).
+    fn takes_kind(&self, kind: u8, name: &str) -> bool {
         match self {
-            ControlOwner::Global => PRIVATE_NONE,
-            ControlOwner::TenantZero => PRIVATE_KEK,
-            ControlOwner::Managed(_) => PRIVATE_TENANT,
+            ControlOwner::Global => kind == PRIVATE_NONE,
+            ControlOwner::TenantZero => kind == PRIVATE_KEK,
+            ControlOwner::Managed(_) => {
+                kind == PRIVATE_TENANT
+                    || (kind == PRIVATE_NONE && below(name, KEYLESS_DIR, self.label()).is_some())
+            }
         }
     }
 
@@ -733,6 +755,7 @@ impl ControlSealer<'_> {
             ControlSealer::Global => ControlOwner::Global,
             ControlSealer::TenantZero => ControlOwner::TenantZero,
             ControlSealer::Managed(tk) => ControlOwner::Managed(&tk.tenant),
+            ControlSealer::ManagedKeyless(t) => ControlOwner::Managed(t),
         }
     }
 }
@@ -777,8 +800,9 @@ fn len_u32(n: usize) -> Result<u32> {
 /// Seals a control record stored under `name`, which must lie in the
 /// owner's directories: the door part under the control key of the
 /// active KEK, the private part under the key of `sealer`. A global
-/// record takes no private part; tenant 0 and a managed tenant always
-/// have one (it may be empty).
+/// record and a managed tenant's keyless record take no private part;
+/// tenant 0 and a managed tenant under its key always have one (it may be
+/// empty).
 pub fn seal_control<K: Kek, R: FillRandom>(
     kek: &K,
     name: &str,
@@ -791,9 +815,12 @@ pub fn seal_control<K: Kek, R: FillRandom>(
     if !owner.owns(name) {
         return Err(ERR_CONTROL_NAME);
     }
+    if matches!(sealer, ControlSealer::ManagedKeyless(_)) && !owner.takes_kind(PRIVATE_NONE, name) {
+        return Err(ERR_CONTROL_KIND);
+    }
     let (kek_v, kek_bytes) = kek.active();
     let (kind, priv_v) = match sealer {
-        ControlSealer::Global => (PRIVATE_NONE, 0),
+        ControlSealer::Global | ControlSealer::ManagedKeyless(_) => (PRIVATE_NONE, 0),
         ControlSealer::TenantZero => (PRIVATE_KEK, kek_v),
         ControlSealer::Managed(tk) => (PRIVATE_TENANT, tk.version),
     };
@@ -934,7 +961,7 @@ impl<'a> ControlEnvelope<'a> {
         name: &'a str,
         owner: ControlOwner<'a>,
     ) -> Result<OpenedControl<'a>> {
-        if self.kind != owner.private_kind() {
+        if !owner.takes_kind(self.kind, name) {
             return Err(ERR_CONTROL_KIND);
         }
         if !owner.owns(name) {

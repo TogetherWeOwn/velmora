@@ -26,6 +26,7 @@ pub mod jobtable;
 pub mod keepalive;
 pub mod keys;
 pub mod parity;
+pub mod pending;
 pub mod plan;
 pub mod plan_rev;
 mod pool;
@@ -36,6 +37,7 @@ pub mod records;
 pub mod recovery;
 pub mod remote;
 pub mod replay;
+pub mod root;
 pub mod service;
 pub mod sql;
 pub mod sql_bind;
@@ -47,6 +49,7 @@ pub mod types;
 pub mod unit;
 pub mod unit_consumer;
 pub mod unit_lease;
+pub mod unit_router;
 pub mod verify;
 
 #[cfg(feature = "testkit")]

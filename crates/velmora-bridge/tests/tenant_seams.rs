@@ -135,8 +135,9 @@ fn a_scope_is_made_only_at_the_listed_places() {
             // tenant 0, a unit job of tenant 0, a managed tenant with no
             // unit), whether a unit job names tenant 0, which has no unit
             // (one, compared by id; no scope is made from it), and its
-            // tests (four).
-            ("bridge/jobmsg.rs", 10),
+            // tests (four), and the tenant a control intent must not name
+            // (one).
+            ("bridge/jobmsg.rs", 11),
             // The queue sink: the tenant its messages name.
             ("worker/env.rs", 1),
             // Whether a scope is tenant 0, whose layouts alone include
@@ -158,7 +159,7 @@ fn a_scope_is_made_only_at_the_listed_places() {
     );
     // The reader of a message makes the scope of the job path, and the
     // consumer takes it from there: it makes none of its own.
-    assert_eq!(found.get("bridge/jobmsg.rs"), Some(&10));
+    assert_eq!(found.get("bridge/jobmsg.rs"), Some(&11));
     assert_eq!(found.get("worker/lib.rs"), None);
 }
 
@@ -503,11 +504,28 @@ fn the_catalogue_id_is_read_in_one_place() {
 }
 
 /// The directory is a port and one adapter, and nothing asks it yet: no
-/// request and no job is routed by it.
+/// request and no job is routed by it. The rest of the `directory` module
+/// (the tenant chain, its records) is read by the unit client and the
+/// consumer; only the port's own path is probed here.
 #[test]
 fn the_directory_is_asked_by_nothing() {
     let all = all();
     const DIRECTORY: &str = "bridge/directory/port.rs";
+    // The request router of a managed tenant's units (`unit_router`,
+    // design round 5) is another port, with a `route` of its own: only it
+    // and its one caller may say `.route(`.
+    const UNIT_ROUTER: [&str; 2] = ["bridge/unit_router.rs", "bridge/service/mod.rs"];
+    // The composition root (`root`, L6-5) is the one reader of the
+    // directory's store for that router: its key routes
+    // (`SqlDirectory::route`, ADR §8.4 step 2). It runs only with `UNIT`
+    // bound (off as shipped), and it names the store, never the port.
+    const ROOT: &str = "bridge/root.rs";
+    let root = &all[ROOT];
+    assert_eq!(
+        root.matches("Directory").count(),
+        root.matches("SqlDirectory").count(),
+        "the root names the directory's store only"
+    );
     // The port's paths: the tenant chain's reader (`directory::chain`,
     // `directory::record`), which the unit client reads heads with, is not
     // the port.
@@ -524,6 +542,8 @@ fn the_directory_is_asked_by_nothing() {
         let files: Vec<&String> = found
             .keys()
             .filter(|f| *f != DIRECTORY && !f.starts_with("bridge/directory/"))
+            .filter(|f| !(name == ".route(" && UNIT_ROUTER.contains(&f.as_str())))
+            .filter(|f| !(*f == ROOT && matches!(name, "Directory" | ".route(")))
             .collect();
         assert!(files.is_empty(), "{name}: {files:?}");
     }

@@ -493,17 +493,67 @@ object's `fetch` with the message's numbers; the configuration from
 `BridgeConfig::for_unit`, which takes the unit's name and sets the stamp
 id `<tenant>.<unit>` (`jobcall::stamp_id`) and the tenant's record layout
 `m/x/<t>/` (never the flat layout); a sink whose messages name the same
-unit and numbers, always in format 2 (it refuses to send a `v` 1 message,
-which would be read as tenant 0's); and the isolate's one byte budget and
-permit gate. Garbage collection names the blob it deletes from the row's
-extent through the job's scope, not from the catalogue's delete list. The
-first refusal decides the delivery (`unit_consumer`): a stale job or a
-closed unit is acknowledged (its outbox row stays, for the unit's alarm
-dispatcher of W2 to send again; that dispatcher is not built yet, so the
-class stays unbound until it is); sync
-needed, unborn and any other refusal go to the dead-letter queue with an
-alert. Unit jobs (`renew`, `stamp_raise`) are not run yet
-(`unit_job_not_run`).
+unit, always in format 2 (it refuses to send a `v` 1 message, which
+would be read as tenant 0's), with the numbers of the unit's latest
+answer in the run, never lower than the message's; and the isolate's one
+byte budget and permit gate. Garbage collection names the blob it deletes
+from the row's extent through the job's scope, not from the catalogue's
+delete list. Job calls carry `listed = false`.
+
+The unit's refusals decide the delivery (`unit_consumer`, ADR §2.4 rule 5
+as amended by AM-50): `Stale{seqs}` runs the job once more with the
+unit's numbers, and a second `Stale` is acknowledged; `Refused{stale_job}`
+(no numbers) goes to the dead-letter queue and pages; `Closed` is
+acknowledged (the row stays in the unit's outbox); `renew_needed` and
+`SyncNeeded` go through the unit client (renew, or read both chains,
+apply the keys and `sync`), then the job runs once more, and a failure
+hands the message back with the queue's `retry_delay`; `Unborn` reads the
+tenant's verified head (listed: dead-letter queue and a "catalogue lost"
+page; not listed: acknowledged; a head that cannot be read: handed back);
+`AccountProblem` while the tenant is shredding is acknowledged with no
+page; anything else goes to the dead-letter queue and pages. Each fix
+(the unit's numbers, a renewal, a `sync`) runs at most once per delivery,
+with numbers never below the message's, and only after the outbox lease
+the last run claimed is given back (`TenantCatalog::give_back`; if it
+cannot be, the message is handed back). A run the job table gave up is
+not run once more. A hand-back whose lease could not be given back
+leaves the row leased: a redelivery within the lease (600 s) is
+acknowledged, and the unit's dispatcher sends the row again after it, so
+the work waits at most the lease and one dispatcher period. The unit client's other outcomes take the same rows: closed or a
+lift pending is acknowledged, unborn reads the head, a unit the head no
+longer lists is acknowledged, and every page it returns is logged as an
+alert. The unit jobs `renew` and
+`stamp_raise` run through the unit client. A unit's job config keeps
+tenant 0's `MAINTENANCE`: under `restore` no unit job makes a unit call,
+and each is acknowledged with no page. The consumer calls L2's `UnitClient`
+through `unit_consumer::ConsumerClient`; until its bodies and a Worker
+head reader are wired, the Worker uses `NoClient` and `NoHeads`, so the
+arms that need them hand the message back, and `UNIT` stays unbound until
+the build that has both and the unit's alarm dispatcher.
+
+A managed tenant's S3 requests reach its units through the request
+router (`unit_router`, ADR §2.7), which the management plane uses too.
+Only a Worker with `UNIT` bound takes a key route; unbound, every
+request takes tenant 0's path with no added read. The claimed access key
+id picks the tenant (`KeyRoutes`; tenant 0's keys and unknown keys keep
+tenant 0's path, §8.4; so does a failed route read for now, where a key
+tenant 0 does not hold then answers `403`, not the `503` of DUR-10). The
+route's numbers are a floor. The `Host` is judged first, as on tenant 0's
+path. The tenant's verified head (cached per isolate for under 60 s, read
+again from the seq it knew, and again when below the floor) names the
+unit: the root unit for a call with no bucket, the unit of the
+bucket's placement, or the root unit for a bucket with none. The unit
+must be listed. A routed call goes through the unit's client (L2's
+`UnitClient::call`, which runs rule 5) with the head's `state_seq`, the
+highest `keys_seq` a unit of the tenant answered, and `listed`. Under
+`MAINTENANCE=restore` every request that writes answers `503` before any
+head read or unit call, and the router refuses the reservation writes the
+management plane sends (`Reserve`, `BindBucket`, `Release`,
+`ReleaseBound`) before any call. This build has no S3 request operations on a
+unit, and no key routes, head reader or unit client in the Worker, so a
+routed request answers `503` and in practice every request takes tenant
+0's path. A routed request's `503` comes before its signature is checked:
+it tells the caller only that the key id routes to a managed tenant.
 
 ## Bookmarks
 
