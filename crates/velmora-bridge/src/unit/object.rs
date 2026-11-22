@@ -29,7 +29,9 @@
 //!   expired lease every call but the Worker's own (`sync`, `renew`, the
 //!   key apply, the import, the gate's and the restore's) and the stamp
 //!   check of a job (`stamp`, `stamp_rolled_back`) answers
-//!   [`UnitAnswer::RenewNeeded`]. `renew` sets the lease from a proof,
+//!   [`UnitAnswer::RenewNeeded`], but for an unauthenticated `key_row` of
+//!   a request, which is answered read-only and marked `lease_expired`
+//!   (AM-63: for the signature check only). `renew` sets the lease from a proof,
 //!   after it applied the revocations the proof listed; the `sync` that
 //!   sets a `restoring` entry closes it. Every answer leaves the unit as a
 //!   [`UnitReply`] with `lease_left_ms`, and `revoked` once it holds keys.
@@ -736,7 +738,7 @@ impl<S: UnitSql> Unit<S> {
             if let Err(r) = rc.check() {
                 return Ok(refused(Refused::Request(r), true));
             }
-            return self.request(&head, rc);
+            return self.request(&head, rc, now);
         }
         // A fan-out read names a grant: it is never a cold read, so it
         // is refused without `authenticated` (rule 11).
@@ -1050,7 +1052,12 @@ impl<S: UnitSql> Unit<S> {
     /// A request call (L1-5): one transaction. A write that adds rows to
     /// a closing bucket is refused `not_found` (AM-57); a call that grows
     /// the database takes the size guard first (ADR §2.6).
-    fn request(&self, head: &Head, rc: &super::request::RequestCall) -> Result<UnitAnswer> {
+    fn request(
+        &self,
+        head: &Head,
+        rc: &super::request::RequestCall,
+        now: UnixMs,
+    ) -> Result<UnitAnswer> {
         let sql = self.sql();
         let grows = rc.grows();
         let database_size = match rc.adds_rows() {
@@ -1080,7 +1087,9 @@ impl<S: UnitSql> Unit<S> {
             }
             Ok(Ok(poll_once(rc.clone().run(&self.cat))??))
         };
-        Ok(match transact(sql, true, &mut op)? {
+        // AM-48: a request call that changed a row makes the stamp raise
+        // due, as a job's does.
+        Ok(match self.transact_noted(now, &mut op)? {
             Ok(body) => UnitAnswer::Ok {
                 seqs: head.seqs,
                 body,
@@ -1518,7 +1527,10 @@ impl<S: UnitSql> Unit<S> {
                     .map(|newly| json!({ "closing": true, "newly": newly }))
                     .map_err(Refused::Buckets))
             };
-            return Ok(match transact(sql, true, &mut op)? {
+            // AM-48: a close that marked the bucket makes the raise due
+            // (the Worker raises the stamp before the `DropBucket`
+            // record, ADR §6.2).
+            return Ok(match self.transact_noted(now, &mut op)? {
                 Ok(body) => ok(body),
                 Err(reason) => refused(reason, false),
             });
@@ -1870,17 +1882,19 @@ impl<S: UnitSql> Unit<S> {
         let mut outcome: Option<std::result::Result<UnixMs, LeaseRefusal>> = None;
         let mut applied = 0;
         let mut run = || -> Result<()> {
-            let stamp = poll_once(self.cat.stamp(&stamp_id))??;
-            if stamp.rolled_back {
-                outcome = Some(Err(LeaseRefusal::RolledBack));
-                return Ok(());
-            }
+            // The listed revocations first: each is a fact of `m/rk/`,
+            // kept whatever the lease comes to (a rolled-back unit too).
             match store::revoke_listed(sql, listed, now)? {
                 Ok(n) => applied = n,
                 Err(_) => {
                     outcome = Some(Err(LeaseRefusal::BadList));
                     return Ok(());
                 }
+            }
+            let stamp = poll_once(self.cat.stamp(&stamp_id))??;
+            if stamp.rolled_back {
+                outcome = Some(Err(LeaseRefusal::RolledBack));
+                return Ok(());
             }
             let own = Proven {
                 state_seq: head.seqs.state_seq,

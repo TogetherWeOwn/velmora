@@ -29,6 +29,7 @@ const P: &str = "p_owner";
 const K: &str = "AKWIRE00000000000001";
 const GONE: &str = "AKWIRE00000000000099";
 const B1: &str = "b_00000000000000e1";
+const B2: &str = "b_00000000000000e2";
 
 fn tenant() -> TenantId {
     TenantId::parse("t_0000000000000e01").unwrap()
@@ -635,6 +636,12 @@ fn a_recorded_rollback_closes_the_lease_at_once_and_refuses_renewal() {
     p.stamp_counter = Some(1);
     let a = worker(&u, renew_op(NOW, p, &[]), NOW);
     assert!(renew_needed(Some(LeaseRefusal::RolledBack))(&a), "{a:?}");
+    // The revocations a refused renewal listed are kept all the same.
+    let mut p = proven(&u, 1);
+    p.stamp_counter = Some(1);
+    let a = worker(&u, renew_op(NOW, p, &[GONE]), NOW);
+    assert!(renew_needed(Some(LeaseRefusal::RolledBack))(&a), "{a:?}");
+    assert!(store::holds_revoked(u.sql(), GONE).unwrap());
 }
 
 #[test]
@@ -765,6 +772,90 @@ fn the_first_write_since_the_raise_asks_for_the_alarm_once() {
     ));
     assert_eq!(lease_row(&u).first_write_at, None);
     assert_eq!(u.take_wake(), None);
+}
+
+fn request_call(call: RequestCall) -> UnitOp {
+    UnitOp::Request {
+        call: Box::new(call),
+    }
+}
+
+/// AM-48: an S3 request call that changed a row (L1-5, `Unit::request`)
+/// makes the raise due like a job's; a read and a refused write do not.
+#[test]
+fn a_request_write_makes_the_raise_due_and_a_read_or_a_refusal_does_not() {
+    let u = fresh();
+    let _ = u.take_wake();
+    let read = request_call(RequestCall::live_generation {
+        bucket: BucketId::new(B1),
+        key: "k".into(),
+    });
+    assert!(matches!(
+        request(&u, true, read, NOW),
+        UnitAnswer::Ok { .. }
+    ));
+    assert_eq!(lease_row(&u).first_write_at, None);
+    assert_eq!(u.take_wake(), None);
+    // Out of bounds: refused before it runs.
+    let refused = request_call(RequestCall::raise_floor {
+        bucket: BucketId::new(B1),
+        key: "k".repeat(2_000),
+        id: velmora_bridge::GenerationId::new("g_0019a00000000e1e1e1e1e1e1e1e2"),
+        generation: true,
+    });
+    assert!(matches!(
+        request(&u, true, refused, NOW),
+        UnitAnswer::Refused { .. }
+    ));
+    assert_eq!(lease_row(&u).first_write_at, None);
+    assert_eq!(u.take_wake(), None);
+    // A floor: a write.
+    let write = request_call(RequestCall::raise_floor {
+        bucket: BucketId::new(B1),
+        key: "k".into(),
+        id: velmora_bridge::GenerationId::new("g_0019a00000000e1e1e1e1e1e1e1e2"),
+        generation: true,
+    });
+    let a = request(&u, true, write, NOW);
+    assert!(matches!(a, UnitAnswer::Ok { .. }), "{a:?}");
+    assert_eq!(lease_row(&u).first_write_at, Some(NOW));
+    assert_eq!(u.take_wake(), Some(UnixMs(NOW.0 + PERIOD)));
+}
+
+/// AM-48: a `bucket_close` that marked the bucket makes the raise due; a
+/// refused one (the bucket holds data) does not.
+#[test]
+fn a_bucket_close_makes_the_raise_due_and_a_refused_one_does_not() {
+    let u = fresh();
+    let _ = u.take_wake();
+    let close = || {
+        worker(
+            &u,
+            UnitOp::BucketClose {
+                bucket_id: B1.into(),
+            },
+            NOW,
+        )
+    };
+    assert!(matches!(close(), UnitAnswer::Refused { .. }), "B1 holds k");
+    assert_eq!(lease_row(&u).first_write_at, None);
+    assert_eq!(u.take_wake(), None);
+    u.sql()
+        .apply(&format!(
+            "INSERT INTO buckets(id, name, owner, bdk_wrapped, kek_version, created_at) \
+               VALUES ('{B2}', 'beta', 'o', x'02', 1, 1);"
+        ))
+        .unwrap();
+    let a = worker(
+        &u,
+        UnitOp::BucketClose {
+            bucket_id: B2.into(),
+        },
+        NOW,
+    );
+    assert!(matches!(a, UnitAnswer::Ok { .. }), "{a:?}");
+    assert_eq!(lease_row(&u).first_write_at, Some(NOW));
+    assert_eq!(u.take_wake(), Some(UnixMs(NOW.0 + PERIOD)));
 }
 
 /// A fresh unit holding the principal `P` (its owner ref `member-1`).

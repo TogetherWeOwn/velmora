@@ -99,6 +99,11 @@ database, so they run natively in tests); the Durable Object class, the
     `renew_needed` to every call but the Worker's own (`sync`, `renew`, the
     key apply, the import, the gate's and the restore's) and the stamp
     check of a job (`stamp`, `stamp_rolled_back`), and does nothing else.
+    The one exception (AM-63): an unauthenticated `key_row` of a request is
+    still answered, read-only and marked `lease_expired`. The Worker uses
+    that row only to check the signature; a request whose signature
+    verifies renews as a signed call and reads `key_row` again, and goes on
+    only with the row read after the renewal.
     - **`renew(proof_start, proven, revocations)`.** The Worker proves the
       unit from the safety bucket (`unit_lease::renewal`: the next record of
       each chain is absent, no stamp object after the unit's counter, and
@@ -568,21 +573,23 @@ publication answers `"applied"`, `"refused"` or `"fenced"`, and the
 Worker rebuilds the outcome from the proof it kept
 (`Published::outcome`): a refused publication discards the Worker's own
 record, never one the unit named. A publication the unit refused for
-good before it ran it (`refused`, `closed`, `unborn`) wrote nothing under
-its id: the client hands its proof back
-(`RequestClient::take_unpublished`), and the Worker discards that record
-before it answers. A `failed` answer, or none, keeps the record, as on
-tenant 0, and so do `stale` and `sync_needed`: the Worker answers those
-below the client, in the way it reaches the unit, by syncing (or reading
-the head again) and sending the same call once more with the new
-numbers. A request body cannot be sent twice, so the retry is the
-call's, not the request's.
+good before it ran it (`refused`, `closed`, `unborn`, and a `stale`,
+`sync_needed` or `renew_needed` that is still the answer after the unit
+client's one retry) wrote nothing under its id: the client hands its
+proof back (`RequestClient::take_unpublished`), and the Worker discards
+that record before it answers. A `failed` answer, or none, keeps the
+record, as on tenant 0. The retry is the unit client's
+(`UnitClient::call`, AM-71), below this client: it syncs, reads the head
+again or renews, and sends the same call once more with the new numbers.
+A request body cannot be sent twice, so the retry is the call's, not the
+request's.
 
 | The unit answers | The Worker |
 |---|---|
 | `ok` | the method's value |
-| `sync_needed` | syncs, then sends the same call once more |
-| `stale{seqs}` (the head the Worker read is older than the unit's) | reads the head again, then sends the same call once more |
+| `sync_needed` | syncs, then sends the same call once more; the same answer again is `503` |
+| `stale{seqs}` (the head the Worker read is older than the unit's) | reads the head again, then sends the same call once more; the same answer again is `503` |
+| `renew_needed` (rule 12) | renews (or waits for its isolate's renewal of the unit, at most 5 s (est)), then sends the same call once more; otherwise `503` (AM-63, AM-71) |
 | `closed` | `503` |
 | `unborn` | `503`; it pages "catalogue lost" when the route lists the unit (rule 7) |
 | `refused{account_problem}` | `403 AccountProblem` |

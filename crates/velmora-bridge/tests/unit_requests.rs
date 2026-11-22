@@ -1442,8 +1442,8 @@ async fn a_publication_refused_before_it_ran_hands_its_record_back() {
             ..
         })
     ));
-    // A stale client's publication did not run, and its record stays:
-    // the Worker's port syncs and sends the same call once more.
+    // A stale client's publication did not run: the port has made its
+    // one retry already (AM-71), so its record is handed back.
     sync(&u, s(4, 0), TenantState::Active, None);
     let stale = RequestClient::new(Port(Rc::clone(&u)), own(), s(3, 0));
     let RequestCall::commit_generation { c, .. } = commit(B1) else {
@@ -1455,7 +1455,9 @@ async fn a_publication_refused_before_it_ran_hands_its_record_back() {
         .await
         .is_err());
     assert!(matches!(stale.refusal(), Some(UnitAnswer::Stale { .. })));
-    assert!(stale.take_unpublished().is_empty());
+    let back = stale.take_unpublished();
+    assert_eq!(back.len(), 1);
+    assert_eq!(back[0].generation(), &g);
 }
 
 #[test]
