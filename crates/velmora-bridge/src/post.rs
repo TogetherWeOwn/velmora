@@ -659,7 +659,19 @@ where
                 Err(_) if waited => return Err(Stop::NoPermit),
                 opened => opened?.0,
             };
-            if !held.is_empty() || !self.slot_wait(lease, first_tier, cooling).await {
+            if !held.is_empty() {
+                break (cooling, probing, order, held);
+            }
+            // Only a poster in this tier or a preferred one can change
+            // the next ask. Keep the full cooldown for stage settlement.
+            let relevant: Vec<_> = self
+                .cfg
+                .providers
+                .iter()
+                .filter(|p| p.post && p.priority <= first_tier[0].priority)
+                .collect();
+            let back = pool.cooling_until(&relevant);
+            if !self.slot_wait(lease, first_tier, back).await {
                 break (cooling, probing, order, held);
             }
             waited = true;

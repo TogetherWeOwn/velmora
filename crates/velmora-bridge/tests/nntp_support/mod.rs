@@ -1374,6 +1374,10 @@ impl Catalog for MemCatalog {
             .borrow_mut()
             .push((holder.to_string(), ids, ms));
         match end {
+            SlotWait::Granted if ms < i64::from(LINE_MS) => {
+                sleep(u32::try_from(ms).expect("a wait in ms")).await;
+                return Ok(SlotWait::Elapsed);
+            }
             SlotWait::Granted => {
                 sleep(LINE_MS).await;
                 let freed: Vec<Permit> = self.line_frees.borrow_mut().drain(..).collect();
