@@ -285,8 +285,9 @@ jobs:
           else
             echo "bridge=false" >> "$GITHUB_OUTPUT"
           fi
-          # The unit's code and the twin that compares it with SQLite.
-          if grep -qE '^(Cargo\.toml|Cargo\.lock|\.github/workflows/ci\.yml|workers/unit/|workers/unit-suite/|crates/velmora-bridge/src/(unit|unit_lease)/|crates/velmora-bridge/src/(sql_bind|testkit|testkit_shadow)\.rs$|crates/velmora-bridge/tests/(unit_core|sql_binding|d1_binding)\.rs$)' <<< "$changed"; then
+          # The unit's code, the twin that compares it with SQLite, the
+          # pinned workerd and the catalogue migrations a unit applies.
+          if grep -qE '^(Cargo\.toml|Cargo\.lock|\.github/workflows/ci\.yml|workers/unit/|workers/unit-suite/|workers/s3-bridge/package-lock\.json|workers/s3-bridge/migrations/|crates/velmora-bridge/src/(unit|unit_lease)/|crates/velmora-bridge/src/(sql_bind|testkit|testkit_shadow)\.rs$|crates/velmora-bridge/tests/(unit_core|sql_binding|d1_binding)\.rs$)' <<< "$changed"; then
             echo "unit=true" >> "$GITHUB_OUTPUT"
           else
             echo "unit=false" >> "$GITHUB_OUTPUT"

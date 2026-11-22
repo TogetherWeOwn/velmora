@@ -19,7 +19,11 @@ on:
     paths:
       - "Cargo.toml"
       - "Cargo.lock"
+      - ".github/workflows/ci.yml"
       - ".github/workflows/unit-suite.yml"
+      # The pinned workerd, and the catalogue migrations a unit applies.
+      - "workers/s3-bridge/package-lock.json"
+      - "workers/s3-bridge/migrations/**"
       - "workers/unit/**"
       - "workers/unit-suite/**"
       - "crates/velmora-bridge/src/unit/**"
