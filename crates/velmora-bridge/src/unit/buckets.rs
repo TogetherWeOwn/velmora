@@ -100,6 +100,15 @@ pub enum BucketChange {
         seq: u64,
         buckets: Vec<String>,
     },
+    /// Several placements on this unit that one record removed outside a
+    /// `restoring` entry (an operator's `SetUnits`): each is dropped as a
+    /// `dropped` is, whatever entry the unit holds when it applies them
+    /// (an `unplaced` keeps its rows under an entry). Built by the
+    /// Worker (L2, `unit_lease::placements`).
+    Removed {
+        seq: u64,
+        buckets: Vec<String>,
+    },
 }
 
 impl BucketChange {
@@ -107,7 +116,8 @@ impl BucketChange {
         match self {
             BucketChange::Created { seq, .. }
             | BucketChange::Dropped { seq, .. }
-            | BucketChange::Unplaced { seq, .. } => *seq,
+            | BucketChange::Unplaced { seq, .. }
+            | BucketChange::Removed { seq, .. } => *seq,
         }
     }
 }
@@ -134,6 +144,11 @@ impl std::fmt::Debug for BucketChange {
                 .finish(),
             BucketChange::Unplaced { seq, buckets } => f
                 .debug_struct("Unplaced")
+                .field("seq", seq)
+                .field("buckets", &buckets.len())
+                .finish(),
+            BucketChange::Removed { seq, buckets } => f
+                .debug_struct("Removed")
                 .field("seq", seq)
                 .field("buckets", &buckets.len())
                 .finish(),
@@ -244,7 +259,7 @@ pub fn check_shape(
         if c.seq() <= last || c.seq() > to_seq || i64::try_from(c.seq()).is_err() {
             return Err(Malformed);
         }
-        if let BucketChange::Unplaced { buckets, .. } = c {
+        if let BucketChange::Unplaced { buckets, .. } | BucketChange::Removed { buckets, .. } = c {
             unplaced = unplaced.saturating_add(buckets.len());
             if unplaced > MAX_CHANGES {
                 return Err(Malformed);
@@ -277,7 +292,7 @@ pub fn check_shape(
                     return Err(Malformed);
                 }
             }
-            BucketChange::Unplaced { buckets, .. } => {
+            BucketChange::Unplaced { buckets, .. } | BucketChange::Removed { buckets, .. } => {
                 if buckets.is_empty()
                     || buckets.len() > MAX_PLACED
                     || !buckets.iter().all(|b| reserve::valid_id(b))
@@ -360,6 +375,11 @@ pub fn apply<S: Sql>(
                 if restoring {
                     continue;
                 }
+                for b in buckets {
+                    drop_row(sql, b, now, &mut done)?;
+                }
+            }
+            BucketChange::Removed { buckets, .. } => {
                 for b in buckets {
                     drop_row(sql, b, now, &mut done)?;
                 }

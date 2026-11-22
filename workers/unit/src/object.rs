@@ -25,6 +25,7 @@ use std::cell::Cell;
 use velmora_bridge::unit::identity::Refusal;
 use velmora_bridge::unit::restore::{self, PointInTimePort};
 use velmora_bridge::unit::{Refused, Unit, UnitAnswer, UnitCall, UnitName, UnitReply};
+use velmora_bridge::unit_lease::handout::HandoutRules;
 use velmora_bridge::UnixMs;
 use worker::js_sys::{self, Reflect};
 use worker::wasm_bindgen::{self, JsCast, JsValue};
@@ -49,7 +50,14 @@ impl DurableObject for UnitObject {
         let name = state.id().name().and_then(|n| UnitName::parse(&n));
         let jurisdiction = jurisdiction(&state);
         let unit = name
-            .map(|own| Unit::woken(DoSql::new(&state.storage()), own, &jurisdiction, wake_id()));
+            .map(|own| Unit::woken(DoSql::new(&state.storage()), own, &jurisdiction, wake_id()))
+            // The hand-out's rules are the Worker's own variables: the
+            // class runs in the Worker (`unit_lease::handout`).
+            .map(|unit| {
+                unit.with_handout(HandoutRules::from_vars(|name| {
+                    env.var(name).ok().map(|v| v.to_string())
+                }))
+            });
         let pitr = PointInTime::new(&state);
         UnitObject {
             unit,

@@ -133,6 +133,16 @@ impl TenantHeads for NoHeads {
             NO_HEAD_READER,
         )))
     }
+
+    async fn record(
+        &self,
+        _: &TenantId,
+        _: u64,
+    ) -> std::result::Result<Option<crate::directory::chain::ReadRecord>, ChainError> {
+        Err(ChainError::Store(BridgeError::NotImplemented(
+            NO_HEAD_READER,
+        )))
+    }
 }
 
 /// A tenant head for tests: `tenant` at `seq`, in `lifecycle`, listing
@@ -533,9 +543,17 @@ impl<C: RequestClients, H: TenantHeads, T: Clock> Router<'_, C, H, T> {
                 op,
             })
             .await;
-        let Ok(answered) = answered else {
-            return (Err((RouteRefusal::Unavailable, None)), pages);
-        };
+        (self.interpret_reply(routed, kind, answered), pages)
+    }
+
+    /// Apply the same routing and freshness checks to the signed key re-read.
+    pub(crate) fn interpret_reply(
+        &self,
+        routed: &Routed,
+        kind: CallKind,
+        answered: Result<Answered>,
+    ) -> std::result::Result<Answered, (RouteRefusal, Option<UnitReply>)> {
+        let answered = answered.map_err(|_| (RouteRefusal::Unavailable, None))?;
         let tenant = &routed.unit.tenant;
         // Rule 7 pages only for a live tenant (AM-58): while the head is
         // `provisioning` an unborn root unit is expected, and any other
@@ -577,11 +595,10 @@ impl<C: RequestClients, H: TenantHeads, T: Clock> Router<'_, C, H, T> {
             }
             _ => None,
         };
-        let result = match refused {
+        match refused {
             Some(refusal) => Err((refusal, Some(answered.reply))),
             None => Ok(answered),
-        };
-        (result, pages)
+        }
     }
 }
 

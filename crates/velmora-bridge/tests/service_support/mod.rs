@@ -241,16 +241,19 @@ impl TestCatalog {
         assert!(matches!(born, UnitAnswer::Ok { .. }), "{born:?}");
         let synced = worker(UnitOp::Sync {
             head: SyncHead {
+                from_seq: UNIT_SEQS.state_seq,
                 seqs: UNIT_SEQS,
                 tenant_state: TenantState::Active,
                 tenant_mode: None,
                 restoring_since: None,
                 lift: None,
+                buckets: vec![],
+                placed: vec![],
             },
         });
         assert!(matches!(synced, UnitAnswer::Ok { .. }), "{synced:?}");
-        // On this line a born unit has a lease table: the Worker's
-        // renewal (rule 12) at the rig's time, which every call uses.
+        // Rule 12 (the unit lease, u0002): the Worker's renewal at T0, so
+        // the unit serves for T; every unit call of the rig runs at T0.
         let renewed = worker(UnitOp::Renew {
             proof_start: T0,
             proven: velmora_bridge::unit_lease::lease::Proven {
@@ -290,38 +293,6 @@ impl std::ops::Deref for TestCatalog {
 }
 
 impl Catalog for TestCatalog {
-    // Main's newer methods (#172, GC_ORPHANS): not request calls on this
-    // line yet (`upload_state` and `unmark_sent` are L2-4's), so they go
-    // to the rig's database directly in both modes.
-    async fn upload_state(&self, t: &UploadTarget<'_>) -> Result<Option<UploadState>> {
-        self.cat.upload_state(t).await
-    }
-    async fn unmark_sent(&self, jobs: &[Job], mark: UnixMs) -> Result<u64> {
-        self.cat.unmark_sent(jobs, mark).await
-    }
-    async fn gc_orphans_due(&self, now: UnixMs) -> Result<bool> {
-        self.cat.gc_orphans_due(now).await
-    }
-    async fn gc_orphans(
-        &self,
-        now: UnixMs,
-        cutoff: UnixMs,
-        scan: u32,
-        limit: u32,
-    ) -> Result<Vec<GcRow>> {
-        self.cat.gc_orphans(now, cutoff, scan, limit).await
-    }
-    async fn gc_orphan_claim(
-        &self,
-        rows: &[GcRow],
-        now: UnixMs,
-        cutoff: UnixMs,
-    ) -> (Vec<bool>, Result<()>) {
-        self.cat.gc_orphan_claim(rows, now, cutoff).await
-    }
-    async fn gc_orphan_done(&self, id: i64, now: UnixMs) -> Result<()> {
-        self.cat.gc_orphan_done(id, now).await
-    }
     async fn create_bucket(&self, b: &Bucket) -> Result<Guard<()>> {
         self.cat.create_bucket(b).await
     }
@@ -667,6 +638,12 @@ impl Catalog for TestCatalog {
             None => self.cat.upload(t).await,
         }
     }
+    async fn upload_state(&self, t: &UploadTarget<'_>) -> Result<Option<UploadState>> {
+        match &self.unit {
+            Some(route) => route.client.upload_state(t).await,
+            None => self.cat.upload_state(t).await,
+        }
+    }
     async fn list_uploads(
         &self,
         bucket: &BucketId,
@@ -903,6 +880,12 @@ impl Catalog for TestCatalog {
     async fn mark_sent(&self, extents: &[ExtentId], now: UnixMs) -> Result<u64> {
         self.cat.mark_sent(extents, now).await
     }
+    async fn unmark_sent(&self, jobs: &[Job], mark: UnixMs) -> Result<u64> {
+        match &self.unit {
+            Some(route) => route.client.unmark_sent(jobs, mark).await,
+            None => self.cat.unmark_sent(jobs, mark).await,
+        }
+    }
     async fn bury_exhausted(&self, max_attempts: u32, now: UnixMs) -> Result<u64> {
         self.cat.bury_exhausted(max_attempts, now).await
     }
@@ -920,6 +903,29 @@ impl Catalog for TestCatalog {
     }
     async fn gc_due(&self, now: UnixMs, limit: u32, disposable_only: bool) -> Result<Vec<GcRow>> {
         self.cat.gc_due(now, limit, disposable_only).await
+    }
+    async fn gc_orphans_due(&self, now: UnixMs) -> Result<bool> {
+        self.cat.gc_orphans_due(now).await
+    }
+    async fn gc_orphans(
+        &self,
+        now: UnixMs,
+        cutoff: UnixMs,
+        scan: u32,
+        limit: u32,
+    ) -> Result<Vec<GcRow>> {
+        self.cat.gc_orphans(now, cutoff, scan, limit).await
+    }
+    async fn gc_orphan_claim(
+        &self,
+        rows: &[GcRow],
+        now: UnixMs,
+        cutoff: UnixMs,
+    ) -> (Vec<bool>, Result<()>) {
+        self.cat.gc_orphan_claim(rows, now, cutoff).await
+    }
+    async fn gc_orphan_done(&self, id: i64, now: UnixMs) -> Result<()> {
+        self.cat.gc_orphan_done(id, now).await
     }
     async fn gc_begin(&self, row: &GcRow, now: UnixMs) -> Result<GcStep> {
         self.cat.gc_begin(row, now).await

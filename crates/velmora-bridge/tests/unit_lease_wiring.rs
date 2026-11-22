@@ -8,10 +8,11 @@ use serde_json::{json, Value};
 use velmora_bridge::testkit::{FixedClock, MemBlobStore, RusqliteSql};
 use velmora_bridge::unit::jobcall::JobCall;
 use velmora_bridge::unit::keys::{Access, KeyEntry, KeyGrant, KeyKind, SubjectStatus};
+use velmora_bridge::unit::request::RequestCall;
 use velmora_bridge::unit::restore::lease_view;
 use velmora_bridge::unit::{
-    BirthKind, BirthToken, CallKind, Refused, Seqs, SyncHead, TenantId, TenantState, Unit,
-    UnitAnswer, UnitCall, UnitName, UnitOp, UnitReply,
+    AlarmSent, BirthKind, BirthToken, CallKind, Refused, Seqs, SyncHead, TenantId, TenantState,
+    Unit, UnitAnswer, UnitCall, UnitName, UnitOp, UnitReply,
 };
 use velmora_bridge::unit_lease::alarm::{AlarmRules, MIN_ALARM_GAP_MS};
 use velmora_bridge::unit_lease::job::{message, UnitJobKind};
@@ -19,15 +20,17 @@ use velmora_bridge::unit_lease::lease::{LeaseRefusal, LeaseRules, Proven};
 use velmora_bridge::unit_lease::renewal::{prove, ChainNames, Proof, UnitView};
 use velmora_bridge::unit_lease::store;
 use velmora_bridge::unit_lease::UnitStampId;
-use velmora_bridge::{BlobMeta, BlobStore, BucketId, Clock, ExtentId, UnixMs};
+use velmora_bridge::{BlobMeta, BlobStore, BucketId, Clock, ExtentId, UnixMs, UploadId};
 
 const NOW: UnixMs = UnixMs(1_795_000_000_000);
 const T: i64 = LeaseRules::DEFAULT.term_ms;
 const PERIOD: i64 = AlarmRules::DEFAULT.stamp_period_ms;
 const P: &str = "p_owner";
+const LISTED_P: &str = "p_00000000000000a1";
 const K: &str = "AKWIRE00000000000001";
 const GONE: &str = "AKWIRE00000000000099";
 const B1: &str = "b_00000000000000e1";
+const B2: &str = "b_00000000000000e2";
 
 fn tenant() -> TenantId {
     TenantId::parse("t_0000000000000e01").unwrap()
@@ -63,20 +66,29 @@ fn worker(u: &Unit<RusqliteSql>, op: UnitOp, now: UnixMs) -> UnitAnswer {
     u.handle(&call(CallKind::Worker, None, true, op), now)
 }
 
-fn sync(u: &Unit<RusqliteSql>, state_seq: u64, restoring: Option<u64>, now: UnixMs) -> UnitAnswer {
-    let keys_seq = u.head().unwrap().seqs.keys_seq;
+fn sync(
+    u: &Unit<RusqliteSql>,
+    state_seq: u64,
+    restoring: Option<u64>,
+    placed: &[&str],
+    now: UnixMs,
+) -> UnitAnswer {
+    let current = u.head().unwrap().seqs;
     worker(
         u,
         UnitOp::Sync {
             head: SyncHead {
+                from_seq: current.state_seq,
                 seqs: Seqs {
                     state_seq,
-                    keys_seq,
+                    keys_seq: current.keys_seq,
                 },
                 tenant_state: TenantState::Active,
                 tenant_mode: None,
                 restoring_since: restoring,
                 lift: None,
+                buckets: vec![],
+                placed: placed.iter().map(|id| id.to_string()).collect(),
             },
         },
         now,
@@ -130,7 +142,7 @@ fn born() -> Unit<RusqliteSql> {
         NOW,
     );
     assert!(matches!(a, UnitAnswer::Ok { .. }), "{a:?}");
-    assert!(matches!(sync(&u, 3, None, NOW), UnitAnswer::Ok { .. }));
+    assert!(matches!(sync(&u, 3, None, &[], NOW), UnitAnswer::Ok { .. }));
     u.sql()
         .apply(&format!(
             "INSERT INTO buckets(id, name, owner, bdk_wrapped, kek_version, created_at) \
@@ -247,6 +259,20 @@ fn key(id: &str, seq: u64) -> KeyEntry {
     }
 }
 
+fn listed_principal(seq: u64) -> KeyEntry {
+    KeyEntry {
+        id: LISTED_P.into(),
+        ..principal(seq)
+    }
+}
+
+fn listed_principals_key(seq: u64) -> KeyEntry {
+    KeyEntry {
+        made_by: Some(LISTED_P.into()),
+        ..key(K, seq)
+    }
+}
+
 /// Whether the S3 path serves `id` (its catalogue key row is active).
 fn served(u: &Unit<RusqliteSql>, id: &str) -> bool {
     u.sql().with_conn(|c| {
@@ -257,6 +283,18 @@ fn served(u: &Unit<RusqliteSql>, id: &str) -> bool {
         )
         .unwrap()
             == 1
+    })
+}
+
+/// Count the catalogue's effective grants, not the grants kept in the key chain.
+fn effective_grants_for(u: &Unit<RusqliteSql>, id: &str) -> i64 {
+    u.sql().with_conn(|c| {
+        c.query_row(
+            "SELECT count(*) FROM grants WHERE access_key_id = ?1",
+            [id],
+            |r| r.get(0),
+        )
+        .unwrap()
     })
 }
 
@@ -299,9 +337,10 @@ fn an_expired_lease_refuses_every_call_but_the_workers_and_writes_nothing() {
         (CallKind::Request, true, UnitOp::Ping {}),
         (CallKind::Request, true, read_plan()),
         (CallKind::Request, false, read_plan()),
+        // AM-63: only the unauthenticated `key_row` is answered (below).
         (
             CallKind::Request,
-            false,
+            true,
             UnitOp::KeyRow {
                 access_key_id: K.into(),
                 presigned: None,
@@ -322,7 +361,10 @@ fn an_expired_lease_refuses_every_call_but_the_workers_and_writes_nothing() {
     assert_eq!(changes(&u), before, "nothing written");
 
     // The Worker's own calls still run: they copy verified records.
-    assert!(matches!(sync(&u, 3, None, NOW), UnitAnswer::Ok { .. }));
+    assert!(matches!(
+        sync(&u, 3, None, &[B1], NOW),
+        UnitAnswer::Ok { .. }
+    ));
     assert!(matches!(
         worker(&u, UnitOp::HeldKeys {}, NOW),
         UnitAnswer::Ok { .. }
@@ -360,6 +402,83 @@ fn an_expired_lease_refuses_every_call_but_the_workers_and_writes_nothing() {
         NOW,
     );
     assert!(renew_needed(None)(&a), "{a:?}");
+}
+
+fn key_row(u: &Unit<RusqliteSql>, kind: CallKind, authenticated: bool, now: UnixMs) -> UnitAnswer {
+    let seqs = u.head().unwrap().seqs;
+    u.handle(
+        &call(
+            kind,
+            Some(seqs),
+            authenticated,
+            UnitOp::KeyRow {
+                access_key_id: K.into(),
+                presigned: None,
+            },
+        ),
+        now,
+    )
+}
+
+/// AM-63: with an expired lease the unit still answers the S3 path's
+/// first call, an unauthenticated `key_row`, read-only and marked
+/// `lease_expired`, so a request whose signature verifies can renew as a
+/// signed call. Nothing else is served: an authenticated `key_row` and
+/// every write wait for the renewal.
+#[test]
+fn an_expired_lease_answers_the_unauthenticated_key_row_marked_and_serves_nothing_else() {
+    let u = born();
+    assert!(matches!(
+        worker(
+            &u,
+            UnitOp::ApplyKeys {
+                from_seq: 0,
+                entries: vec![principal(1).into(), key(K, 2).into()],
+                answers: vec![],
+            },
+            NOW
+        ),
+        UnitAnswer::Ok { .. }
+    ));
+    let before = changes(&u);
+    let a = key_row(&u, CallKind::Request, false, NOW);
+    let UnitAnswer::Ok { body, .. } = &a else {
+        panic!("{a:?}")
+    };
+    assert_eq!(body["lease_expired"], json!(true), "{body}");
+    assert_eq!(body["key"]["access_key_id"], json!(K), "{body}");
+    assert_eq!(body["state"]["tenant_state"], json!("active"), "{body}");
+    assert_eq!(changes(&u), before, "read-only");
+
+    // Signed, or not a request: the renewal first.
+    assert!(renew_needed(None)(&key_row(
+        &u,
+        CallKind::Request,
+        true,
+        NOW
+    )));
+    assert!(renew_needed(None)(&key_row(&u, CallKind::Job, false, NOW)));
+    // A write in the same state is refused and writes nothing.
+    let seqs = u.head().unwrap().seqs;
+    let write = UnitOp::Request {
+        call: Box::new(RequestCall::abort_upload {
+            bucket: BucketId::new(B1),
+            key: "k".into(),
+            upload: UploadId::new("u_00000000000000e1"),
+            now: NOW,
+        }),
+    };
+    let a = u.handle(&call(CallKind::Request, Some(seqs), true, write), NOW);
+    assert!(renew_needed(None)(&a), "{a:?}");
+    assert_eq!(changes(&u), before, "nothing written");
+
+    // After a renewal the same read is served as usual, not marked.
+    assert!(matches!(renew(&u, NOW), UnitAnswer::Ok { .. }));
+    let a = key_row(&u, CallKind::Request, false, NOW);
+    let UnitAnswer::Ok { body, .. } = &a else {
+        panic!("{a:?}")
+    };
+    assert_eq!(body["lease_expired"], json!(false), "{body}");
 }
 
 #[test]
@@ -441,7 +560,10 @@ fn renew_applies_the_listed_revocations_and_counts_each_id_once() {
         ),
         UnitAnswer::Ok { .. }
     ));
-    assert!(matches!(sync(&u, 3, None, NOW), UnitAnswer::Ok { .. }));
+    assert!(matches!(
+        sync(&u, 3, None, &[B1], NOW),
+        UnitAnswer::Ok { .. }
+    ));
     assert!(served(&u, K));
     // The proof listed K and an id the unit never had a row for.
     let a = worker(&u, renew_op(NOW, proven(&u, 2), &[K, GONE]), NOW);
@@ -472,7 +594,10 @@ fn renew_applies_the_listed_revocations_and_counts_each_id_once() {
     assert!(!served(&u, GONE));
     assert_eq!(store::revoked(u.sql()).unwrap(), Some(2));
     // Listing them again changes nothing.
-    assert!(matches!(sync(&u, 3, None, NOW), UnitAnswer::Ok { .. }));
+    assert!(matches!(
+        sync(&u, 3, None, &[B1], NOW),
+        UnitAnswer::Ok { .. }
+    ));
     let a = worker(&u, renew_op(NOW, proven(&u, 2), &[K, GONE]), NOW);
     assert!(
         matches!(&a, UnitAnswer::Ok { body, .. } if body["applied"] == json!(0)),
@@ -511,7 +636,7 @@ fn the_sync_that_sets_a_restoring_entry_ends_the_lease_and_keeps_its_high_mark()
     let u = fresh();
     let hi = lease_row(&u).lease_hi;
     assert!(matches!(
-        sync(&u, 4, Some(4), UnixMs(NOW.0 + 1_000)),
+        sync(&u, 4, Some(4), &[B1], UnixMs(NOW.0 + 1_000)),
         UnitAnswer::Ok { .. }
     ));
     let row = lease_row(&u);
@@ -556,6 +681,12 @@ fn a_recorded_rollback_closes_the_lease_at_once_and_refuses_renewal() {
     p.stamp_counter = Some(1);
     let a = worker(&u, renew_op(NOW, p, &[]), NOW);
     assert!(renew_needed(Some(LeaseRefusal::RolledBack))(&a), "{a:?}");
+    // The revocations a refused renewal listed are kept all the same.
+    let mut p = proven(&u, 1);
+    p.stamp_counter = Some(1);
+    let a = worker(&u, renew_op(NOW, p, &[GONE]), NOW);
+    assert!(renew_needed(Some(LeaseRefusal::RolledBack))(&a), "{a:?}");
+    assert!(store::holds_revoked(u.sql(), GONE).unwrap());
 }
 
 #[test]
@@ -688,6 +819,90 @@ fn the_first_write_since_the_raise_asks_for_the_alarm_once() {
     assert_eq!(u.take_wake(), None);
 }
 
+fn request_call(call: RequestCall) -> UnitOp {
+    UnitOp::Request {
+        call: Box::new(call),
+    }
+}
+
+/// AM-48: an S3 request call that changed a row (L1-5, `Unit::request`)
+/// makes the raise due like a job's; a read and a refused write do not.
+#[test]
+fn a_request_write_makes_the_raise_due_and_a_read_or_a_refusal_does_not() {
+    let u = fresh();
+    let _ = u.take_wake();
+    let read = request_call(RequestCall::live_generation {
+        bucket: BucketId::new(B1),
+        key: "k".into(),
+    });
+    assert!(matches!(
+        request(&u, true, read, NOW),
+        UnitAnswer::Ok { .. }
+    ));
+    assert_eq!(lease_row(&u).first_write_at, None);
+    assert_eq!(u.take_wake(), None);
+    // Out of bounds: refused before it runs.
+    let refused = request_call(RequestCall::raise_floor {
+        bucket: BucketId::new(B1),
+        key: "k".repeat(2_000),
+        id: velmora_bridge::GenerationId::new("g_0019a00000000e1e1e1e1e1e1e1e2"),
+        generation: true,
+    });
+    assert!(matches!(
+        request(&u, true, refused, NOW),
+        UnitAnswer::Refused { .. }
+    ));
+    assert_eq!(lease_row(&u).first_write_at, None);
+    assert_eq!(u.take_wake(), None);
+    // A floor: a write.
+    let write = request_call(RequestCall::raise_floor {
+        bucket: BucketId::new(B1),
+        key: "k".into(),
+        id: velmora_bridge::GenerationId::new("g_0019a00000000e1e1e1e1e1e1e1e2"),
+        generation: true,
+    });
+    let a = request(&u, true, write, NOW);
+    assert!(matches!(a, UnitAnswer::Ok { .. }), "{a:?}");
+    assert_eq!(lease_row(&u).first_write_at, Some(NOW));
+    assert_eq!(u.take_wake(), Some(UnixMs(NOW.0 + PERIOD)));
+}
+
+/// AM-48: a `bucket_close` that marked the bucket makes the raise due; a
+/// refused one (the bucket holds data) does not.
+#[test]
+fn a_bucket_close_makes_the_raise_due_and_a_refused_one_does_not() {
+    let u = fresh();
+    let _ = u.take_wake();
+    let close = || {
+        worker(
+            &u,
+            UnitOp::BucketClose {
+                bucket_id: B1.into(),
+            },
+            NOW,
+        )
+    };
+    assert!(matches!(close(), UnitAnswer::Refused { .. }), "B1 holds k");
+    assert_eq!(lease_row(&u).first_write_at, None);
+    assert_eq!(u.take_wake(), None);
+    u.sql()
+        .apply(&format!(
+            "INSERT INTO buckets(id, name, owner, bdk_wrapped, kek_version, created_at) \
+               VALUES ('{B2}', 'beta', 'o', x'02', 1, 1);"
+        ))
+        .unwrap();
+    let a = worker(
+        &u,
+        UnitOp::BucketClose {
+            bucket_id: B2.into(),
+        },
+        NOW,
+    );
+    assert!(matches!(a, UnitAnswer::Ok { .. }), "{a:?}");
+    assert_eq!(lease_row(&u).first_write_at, Some(NOW));
+    assert_eq!(u.take_wake(), Some(UnixMs(NOW.0 + PERIOD)));
+}
+
 /// A fresh unit holding the principal `P` (its owner ref `member-1`).
 fn fresh_with_principal() -> Unit<RusqliteSql> {
     let u = fresh();
@@ -813,17 +1028,48 @@ fn the_alarm_sends_one_stamp_raise_per_period_with_writes_under_a_fresh_lease() 
     let step = u.alarm(early).unwrap();
     assert!(step.jobs.is_empty() && !step.raise);
     assert_eq!(
-        u.alarm_done(early, &step, false).unwrap(),
+        u.alarm_done(early, &step, &AlarmSent::all(&step, true))
+            .unwrap(),
         Some(UnixMs(NOW.0 + PERIOD))
     );
     let due = UnixMs(NOW.0 + PERIOD);
     let step = u.alarm(due).unwrap();
     assert!(step.raise);
     assert_eq!(step.jobs, vec![job_text(UnitJobKind::StampRaise, &u, due)]);
-    assert_eq!(u.alarm_done(due, &step, false).unwrap(), None, "idle again");
+    // Sent, the raise stays pending until its stamp lands (AM-48): the
+    // alarm looks again one period on.
+    assert_eq!(
+        u.alarm_done(due, &step, &AlarmSent::all(&step, true))
+            .unwrap(),
+        Some(UnixMs(due.0 + PERIOD)),
+        "the pending raise is looked at again"
+    );
     let row = lease_row(&u);
-    assert_eq!(row.first_write_at, None);
+    assert_eq!((row.first_write_at, row.raise_from), (None, Some(due)));
     assert_eq!((row.renew_tries, row.failed_runs), (0, 0));
+    // The raise lands: nothing is pending, and the unit is idle again.
+    let landed = UnixMs(due.0 + 500);
+    assert!(matches!(
+        job(
+            &u,
+            JobCall::stamp_advance {
+                from: None,
+                catalogue: stamp_id()
+            },
+            landed
+        ),
+        UnitAnswer::Ok { .. }
+    ));
+    assert_eq!(lease_row(&u).raise_from, None);
+    let later = UnixMs(due.0 + PERIOD);
+    let step = u.alarm(later).unwrap();
+    assert!(step.jobs.is_empty() && !step.raise);
+    assert_eq!(
+        u.alarm_done(later, &step, &AlarmSent::all(&step, true))
+            .unwrap(),
+        None,
+        "idle again"
+    );
 }
 
 #[test]
@@ -838,7 +1084,10 @@ fn an_expired_lease_sends_one_renew_and_the_work_runs_after_the_renewal() {
     let step = u.alarm(due).unwrap();
     assert!(!step.raise, "no raise while expired");
     assert_eq!(step.jobs, vec![job_text(UnitJobKind::Renew, &u, due)]);
-    let next = u.alarm_done(due, &step, false).unwrap().unwrap();
+    let next = u
+        .alarm_done(due, &step, &AlarmSent::all(&step, true))
+        .unwrap()
+        .unwrap();
     assert_eq!(next.0, due.0 + AlarmRules::DEFAULT.renew_retry_ms);
     let row = lease_row(&u);
     assert_eq!(row.renew_tries, 1);
@@ -846,7 +1095,10 @@ fn an_expired_lease_sends_one_renew_and_the_work_runs_after_the_renewal() {
     // The second try waits twice as long.
     let step = u.alarm(next).unwrap();
     assert_eq!(step.jobs, vec![job_text(UnitJobKind::Renew, &u, next)]);
-    let next2 = u.alarm_done(next, &step, false).unwrap().unwrap();
+    let next2 = u
+        .alarm_done(next, &step, &AlarmSent::all(&step, true))
+        .unwrap()
+        .unwrap();
     assert_eq!(next2.0, next.0 + 2 * AlarmRules::DEFAULT.renew_retry_ms);
     // The renewal comes: the tries reset, and the alarm is asked for now.
     let _ = u.take_wake();
@@ -867,7 +1119,10 @@ fn a_failed_send_keeps_the_work_due_and_backs_off() {
     ));
     let due = UnixMs(NOW.0 + PERIOD);
     let step = u.alarm(due).unwrap();
-    let next = u.alarm_done(due, &step, true).unwrap().unwrap();
+    let next = u
+        .alarm_done(due, &step, &AlarmSent::all(&step, false))
+        .unwrap()
+        .unwrap();
     let row = lease_row(&u);
     assert_eq!(row.first_write_at, Some(NOW), "still due");
     assert_eq!(row.failed_runs, 1);
@@ -877,7 +1132,8 @@ fn a_failed_send_keeps_the_work_due_and_backs_off() {
     assert!(matches!(renew(&u, next), UnitAnswer::Ok { .. }));
     let step = u.alarm(next).unwrap();
     assert!(step.raise);
-    u.alarm_done(next, &step, false).unwrap();
+    u.alarm_done(next, &step, &AlarmSent::all(&step, true))
+        .unwrap();
     let row = lease_row(&u);
     assert_eq!((row.failed_runs, row.first_write_at), (0, None));
 }
@@ -897,7 +1153,10 @@ fn a_raise_waits_for_a_renewal_when_the_lease_runs_low() {
     let step = u.alarm(due).unwrap();
     assert!(!step.raise);
     assert_eq!(step.jobs, vec![job_text(UnitJobKind::Renew, &u, due)]);
-    let next = u.alarm_done(due, &step, false).unwrap().unwrap();
+    let next = u
+        .alarm_done(due, &step, &AlarmSent::all(&step, true))
+        .unwrap()
+        .unwrap();
     assert_eq!(next.0, due.0 + AlarmRules::DEFAULT.renew_retry_ms);
     assert_eq!(lease_row(&u).first_write_at, Some(write), "still due");
     let _ = u.take_wake();
@@ -924,11 +1183,15 @@ fn what_happens_during_the_sends_is_kept() {
         request(&u, true, read_plan(), during),
         UnitAnswer::Ok { .. }
     ));
+    // The pending raise is looked at one period after its hand-out, the
+    // write during the send one period after the write: the earlier.
     assert_eq!(
-        u.alarm_done(during, &step, false).unwrap(),
-        Some(UnixMs(during.0 + PERIOD))
+        u.alarm_done(during, &step, &AlarmSent::all(&step, true))
+            .unwrap(),
+        Some(UnixMs(due.0 + PERIOD))
     );
     assert_eq!(lease_row(&u).first_write_at, Some(during));
+    assert_eq!(lease_row(&u).raise_from, Some(due));
 
     // The renew the alarm sends lands before the run is recorded.
     let late = UnixMs(during.0 + PERIOD + 1);
@@ -936,14 +1199,104 @@ fn what_happens_during_the_sends_is_kept() {
     let step = u.alarm(late).unwrap();
     assert!(step.run.send_renew);
     assert!(matches!(renew(&u, late), UnitAnswer::Ok { .. }));
-    u.alarm_done(late, &step, false).unwrap();
+    u.alarm_done(late, &step, &AlarmSent::all(&step, true))
+        .unwrap();
     assert_eq!(lease_row(&u).renew_tries, 0);
 }
 
-/// A principal is not a key: `m/rk/` never names one, so a revoked
-/// principal must not raise the count the proof compares with.
+/// The alarm hands out the unit's due work (AM-49): a due outbox row is
+/// a job of the step, marked only once its send went through; with an
+/// expired lease nothing is handed out, only `renew`.
 #[test]
-fn a_revoked_principal_is_not_counted() {
+fn the_alarm_hands_out_due_rows_and_marks_only_what_was_sent() {
+    use velmora_bridge::unit_lease::alarm::Duty;
+    let u = fresh();
+    let at = UnixMs(NOW.0 + 1_000);
+    u.sql()
+        .with_conn(|c| {
+            c.execute_batch(&format!(
+                "INSERT INTO outbox(extent_id, generation_id, stage, next_at, updated_at) \
+                   VALUES ('x_000000000000000000000000e1', 'g_0019a00000000e1e1e1e1e1e1e1e1', \
+                           'post', {}, 1)",
+                at.0
+            ))
+        })
+        .unwrap();
+    let sent_at = |u: &Unit<RusqliteSql>| -> Option<i64> {
+        u.sql()
+            .with_conn(|c| c.query_row("SELECT sent_at FROM outbox", [], |r| r.get(0)))
+            .unwrap()
+    };
+    // Due at the row's time: the step carries its job.
+    let step = u.alarm(at).unwrap();
+    assert!(step.run.run.contains(&Duty::HandOut), "{:?}", step.run);
+    assert_eq!(step.handout.jobs.len(), 1);
+    assert_eq!(step.seqs, u.head().unwrap().seqs);
+    // Its send was refused: not marked, a failed run, due again.
+    let mut sent = AlarmSent::all(&step, true);
+    sent.handed_out = vec![false];
+    let next = u.alarm_done(at, &step, &sent).unwrap();
+    assert_eq!(sent_at(&u), None);
+    assert_eq!(lease_row(&u).failed_runs, 1);
+    let next = next.expect("due again");
+    assert!(next.0 > at.0);
+    // Sent: marked, and nothing else is due before its resend window.
+    let step = u.alarm(next).unwrap();
+    assert_eq!(step.handout.jobs.len(), 1);
+    let after = u
+        .alarm_done(next, &step, &AlarmSent::all(&step, true))
+        .unwrap();
+    assert_eq!(sent_at(&u), Some(next.0));
+    assert_eq!(lease_row(&u).failed_runs, 0);
+    let resend = i64::from(velmora_bridge::jobs::RESEND_SECS) * 1000;
+    assert_eq!(after, Some(UnixMs(next.0 + resend)));
+    // With the lease run out the row is due, but only `renew` is sent.
+    let late = UnixMs(next.0 + resend);
+    assert!(late.0 > NOW.0 + T);
+    let step = u.alarm(late).unwrap();
+    assert!(step.handout.jobs.is_empty());
+    assert!(step.run.send_renew);
+}
+
+/// A tenant that is being shredded takes no job: nothing is handed out,
+/// whatever its outbox holds (review LOW 2).
+#[test]
+fn a_shredding_tenant_hands_out_nothing() {
+    let u = fresh();
+    u.sql()
+        .with_conn(|c| {
+            c.execute_batch(&format!(
+                "INSERT INTO outbox(extent_id, generation_id, stage, next_at, updated_at) \
+                   VALUES ('x_000000000000000000000000e1', 'g_0019a00000000e1e1e1e1e1e1e1e1', \
+                           'post', {}, 1)",
+                NOW.0
+            ))
+        })
+        .unwrap();
+    let at = UnixMs(NOW.0 + 1_000);
+    assert!(!u.alarm(at).unwrap().handout.jobs.is_empty());
+    let u = fresh();
+    u.sql()
+        .with_conn(|c| {
+            c.execute_batch(&format!(
+                "INSERT INTO outbox(extent_id, generation_id, stage, next_at, updated_at) \
+                   VALUES ('x_000000000000000000000000e1', 'g_0019a00000000e1e1e1e1e1e1e1e1', \
+                           'post', {}, 1); \
+                 UPDATE unit_head SET tenant_state = 'shredding'",
+                NOW.0
+            ))
+        })
+        .unwrap();
+    let step = u.alarm(at).unwrap();
+    assert!(step.handout.jobs.is_empty());
+    assert!(step.run.run.is_empty(), "{:?}", step.run);
+}
+
+/// A revoked principal counts like a revoked key (AM-72): its revoke puts
+/// `m/rk/<t>/<p_id>` first, so the listing the proof compares with names
+/// it too.
+#[test]
+fn a_revoked_principal_is_counted() {
     let u = born();
     let mut gone = principal(1);
     gone.status = SubjectStatus::Revoked;
@@ -960,12 +1313,47 @@ fn a_revoked_principal_is_not_counted() {
         UnitAnswer::Ok { .. }
     ));
     assert_eq!(status_of(&u, P), "revoked");
-    assert_eq!(store::revoked(u.sql()).unwrap(), Some(0));
-    assert!(matches!(sync(&u, 3, None, NOW), UnitAnswer::Ok { .. }));
+    assert_eq!(store::revoked(u.sql()).unwrap(), Some(1));
+    assert!(matches!(
+        sync(&u, 3, None, &[B1], NOW),
+        UnitAnswer::Ok { .. }
+    ));
     assert!(matches!(
         worker(&u, renew_op(NOW, proven(&u, 0), &[]), NOW),
         UnitAnswer::Ok { .. }
     ));
+}
+
+/// A principal revoked by the key chain already satisfies its listed revocation.
+#[test]
+fn a_recorded_principal_revocation_allows_renewal() {
+    let u = born();
+    let mut gone = listed_principal(1);
+    gone.status = SubjectStatus::Revoked;
+    assert!(matches!(
+        worker(
+            &u,
+            UnitOp::ApplyKeys {
+                from_seq: 0,
+                entries: vec![gone.into()],
+                answers: vec![],
+            },
+            NOW
+        ),
+        UnitAnswer::Ok { .. }
+    ));
+    assert_eq!(status_of(&u, LISTED_P), "revoked");
+    assert_eq!(store::revoked(u.sql()).unwrap(), Some(1));
+    assert!(matches!(
+        sync(&u, 3, None, &[B1], NOW),
+        UnitAnswer::Ok { .. }
+    ));
+    let a = worker(&u, renew_op(NOW, proven(&u, 1), &[LISTED_P]), NOW);
+    assert!(
+        matches!(&a, UnitAnswer::Ok { body, .. } if body["applied"] == json!(0)),
+        "{a:?}"
+    );
+    assert_eq!(store::revoked(u.sql()).unwrap(), Some(1));
 }
 
 /// An alarm wake with nothing to send writes nothing, on an idle unit
@@ -977,7 +1365,8 @@ fn an_idle_or_closed_alarm_wake_writes_nothing() {
     let step = u.alarm(UnixMs(NOW.0 + 1_000)).unwrap();
     assert!(step.jobs.is_empty());
     assert_eq!(
-        u.alarm_done(UnixMs(NOW.0 + 1_000), &step, false).unwrap(),
+        u.alarm_done(UnixMs(NOW.0 + 1_000), &step, &AlarmSent::all(&step, true))
+            .unwrap(),
         None
     );
     assert_eq!(u.mark(), m, "an idle wake");
@@ -988,19 +1377,27 @@ fn an_idle_or_closed_alarm_wake_writes_nothing() {
     ));
     let due = UnixMs(NOW.0 + PERIOD);
     let _dead = u.alarm(due).unwrap();
-    assert!(matches!(sync(&u, 4, Some(4), due), UnitAnswer::Ok { .. }));
+    assert!(matches!(
+        sync(&u, 4, Some(4), &[B1], due),
+        UnitAnswer::Ok { .. }
+    ));
     let m = u.mark();
     let later = UnixMs(due.0 + 1_000);
     let step = u.alarm(later).unwrap();
     assert!(step.jobs.is_empty());
-    assert_eq!(u.alarm_done(later, &step, false).unwrap(), None);
+    assert_eq!(
+        u.alarm_done(later, &step, &AlarmSent::all(&step, true))
+            .unwrap(),
+        None
+    );
     assert_eq!(u.mark(), m, "a closed wake, even with a dead run's raise");
 }
 
-/// A run that dies during its send (the object reset) leaves its raise
-/// pending: the next run sends it again.
+/// A raise that never lands (the run died during its send, the message
+/// was lost, or it was acknowledged unrun) is pending for one period
+/// after its hand-out, then sent again (AM-48, AM-50).
 #[test]
-fn a_raise_of_a_run_that_died_is_sent_again() {
+fn a_raise_that_does_not_land_is_sent_again_one_period_on() {
     let u = fresh();
     assert!(matches!(
         request(&u, true, read_plan(), NOW),
@@ -1009,22 +1406,42 @@ fn a_raise_of_a_run_that_died_is_sent_again() {
     let due = UnixMs(NOW.0 + PERIOD);
     let step = u.alarm(due).unwrap();
     assert!(step.raise);
-    assert_eq!(lease_row(&u).raise_from, Some(NOW));
-    // No `alarm_done`: the platform runs the alarm again.
+    assert_eq!(step.covered, Some(NOW));
+    assert_eq!(lease_row(&u).raise_from, Some(due), "the hand-out time");
+    // No `alarm_done`: the platform runs the alarm again. Within the
+    // period the raise is pending, not sent again.
     let again = UnixMs(due.0 + 1_000);
     assert!(matches!(renew(&u, again), UnitAnswer::Ok { .. }));
     let step = u.alarm(again).unwrap();
-    assert!(step.raise, "the dead run's raise is due again");
-    u.alarm_done(again, &step, false).unwrap();
+    assert!(!step.raise, "still in flight");
+    assert_eq!(lease_row(&u).raise_from, Some(due));
+    // One period on it is dead: due again, and sent.
+    let dead = UnixMs(due.0 + PERIOD);
+    let step = u.alarm(dead).unwrap();
+    assert!(step.raise, "the raise is due again");
+    assert_eq!(lease_row(&u).raise_from, Some(dead));
+    u.alarm_done(dead, &step, &AlarmSent::all(&step, true))
+        .unwrap();
+    // A failed send undoes the hand-out: the writes it covered are
+    // pending again from their own time, not the hand-out's.
+    let u = fresh();
+    assert!(matches!(
+        request(&u, true, read_plan(), NOW),
+        UnitAnswer::Ok { .. }
+    ));
+    let step = u.alarm(due).unwrap();
+    assert!(step.raise);
+    u.alarm_done(due, &step, &AlarmSent::all(&step, false))
+        .unwrap();
     let row = lease_row(&u);
-    assert_eq!((row.first_write_at, row.raise_from), (None, None));
+    assert_eq!((row.first_write_at, row.raise_from), (Some(NOW), None));
 }
 
 /// A listed id that names a principal row (were one ever listed) is kept
-/// on its own: the principal is left as it is, and the count and the
-/// check agree with the listing.
+/// as a revocation of that row (AM-72): the principal is revoked, and the
+/// count and the check agree with the listing.
 #[test]
-fn a_listed_id_of_a_principal_row_counts_without_touching_it() {
+fn a_listed_id_of_a_principal_row_revokes_it_and_counts_once() {
     let u = born();
     let mut p = principal(1);
     p.id = "PWIRE0000000000001".into();
@@ -1040,15 +1457,138 @@ fn a_listed_id_of_a_principal_row_counts_without_touching_it() {
         ),
         UnitAnswer::Ok { .. }
     ));
-    assert!(matches!(sync(&u, 3, None, NOW), UnitAnswer::Ok { .. }));
+    assert!(matches!(
+        sync(&u, 3, None, &[B1], NOW),
+        UnitAnswer::Ok { .. }
+    ));
     let a = worker(
         &u,
         renew_op(NOW, proven(&u, 1), &["PWIRE0000000000001"]),
         NOW,
     );
     assert!(matches!(a, UnitAnswer::Ok { .. }), "{a:?}");
-    assert_eq!(status_of(&u, "PWIRE0000000000001"), "active");
+    assert_eq!(status_of(&u, "PWIRE0000000000001"), "revoked");
     assert_eq!(store::revoked(u.sql()).unwrap(), Some(1));
+}
+
+/// Renewal applies an unrecorded principal revocation, removing its key's
+/// effective grant without revoking the key itself.
+#[test]
+fn renewal_removes_a_listed_principals_key_grants() {
+    let u = born();
+    let a = worker(
+        &u,
+        UnitOp::ApplyKeys {
+            from_seq: 0,
+            entries: vec![listed_principal(1).into(), listed_principals_key(2).into()],
+            answers: vec![],
+        },
+        NOW,
+    );
+    assert!(matches!(a, UnitAnswer::Ok { .. }), "{a:?}");
+    assert!(matches!(
+        sync(&u, 3, None, &[B1], NOW),
+        UnitAnswer::Ok { .. }
+    ));
+    assert_eq!(status_of(&u, LISTED_P), "active");
+    assert_eq!(status_of(&u, K), "active");
+    assert_eq!(effective_grants_for(&u, K), 1);
+    assert_eq!(store::revoked(u.sql()).unwrap(), Some(0));
+
+    let grant = || {
+        u.handle(
+            &call(
+                CallKind::Request,
+                Some(u.head().unwrap().seqs),
+                true,
+                request_call(RequestCall::grant {
+                    akid: K.into(),
+                    bucket: BucketId::new(B1),
+                }),
+            ),
+            NOW,
+        )
+    };
+    assert!(matches!(renew(&u, NOW), UnitAnswer::Ok { .. }));
+    assert_eq!(
+        grant(),
+        UnitAnswer::Ok {
+            seqs: u.head().unwrap().seqs,
+            body: json!(velmora_bridge::Perm::Ro),
+        }
+    );
+
+    let a = worker(&u, renew_op(NOW, proven(&u, 1), &[LISTED_P]), NOW);
+    assert!(matches!(a, UnitAnswer::Ok { .. }), "{a:?}");
+    assert_eq!(status_of(&u, LISTED_P), "revoked");
+    assert_eq!(status_of(&u, K), "active");
+    assert_eq!(effective_grants_for(&u, K), 0);
+    assert_eq!(store::revoked(u.sql()).unwrap(), Some(1));
+    assert_eq!(
+        grant(),
+        UnitAnswer::Ok {
+            seqs: u.head().unwrap().seqs,
+            body: json!(null),
+        }
+    );
+}
+
+/// A principal listed before its row exists stays revoked when the key chain
+/// later supplies it as active. Its key gains no effective grants, and the
+/// request for its grant on the bucket returns null.
+#[test]
+fn a_listed_principal_stays_revoked_when_its_records_arrive() {
+    let u = born();
+    assert_eq!(store::revoked(u.sql()).unwrap(), None);
+    let a = worker(&u, renew_op(NOW, proven(&u, 1), &[LISTED_P]), NOW);
+    assert!(matches!(a, UnitAnswer::Ok { .. }), "{a:?}");
+    let kept: bool = u.sql().with_conn(|c| {
+        c.query_row(
+            "SELECT EXISTS (SELECT 1 FROM unit_revoked_ids WHERE id = ?1)",
+            [LISTED_P],
+            |r| r.get(0),
+        )
+        .unwrap()
+    });
+    assert!(
+        kept,
+        "the revocation is stored before the principal arrives"
+    );
+
+    let a = worker(
+        &u,
+        UnitOp::ApplyKeys {
+            from_seq: 0,
+            entries: vec![listed_principal(1).into(), listed_principals_key(2).into()],
+            answers: vec![],
+        },
+        NOW,
+    );
+    assert!(matches!(a, UnitAnswer::Ok { .. }), "{a:?}");
+    assert_eq!(status_of(&u, LISTED_P), "revoked");
+    assert_eq!(status_of(&u, K), "active");
+    assert_eq!(effective_grants_for(&u, K), 0);
+    assert_eq!(store::revoked(u.sql()).unwrap(), Some(1));
+
+    let seqs = u.head().unwrap().seqs;
+    assert_eq!(
+        u.handle(
+            &call(
+                CallKind::Request,
+                Some(seqs),
+                true,
+                request_call(RequestCall::grant {
+                    akid: K.into(),
+                    bucket: BucketId::new(B1),
+                }),
+            ),
+            NOW,
+        ),
+        UnitAnswer::Ok {
+            seqs,
+            body: json!(null),
+        }
+    );
 }
 
 /// The alarm sends each job as a JavaScript object parsed from its JSON
@@ -1063,7 +1603,10 @@ fn the_alarm_sends_raw_parsed_json() {
     ))
     .unwrap();
     assert!(src.contains("js_sys::JSON::parse(text)"));
-    assert!(src.contains(".send_raw("));
+    // One raw batch per queue; never `send_batch`, which would encode
+    // the messages through `serde_wasm_bindgen`.
+    assert!(src.contains(".send_raw_batch(messages)"));
+    assert!(!src.contains(".send_batch("));
     for (n, line) in src.lines().enumerate() {
         assert!(
             !line
@@ -1082,16 +1625,28 @@ fn a_closed_or_unborn_unit_runs_nothing_and_arms_nothing() {
         request(&u, true, read_plan(), NOW),
         UnitAnswer::Ok { .. }
     ));
-    assert!(matches!(sync(&u, 4, Some(4), NOW), UnitAnswer::Ok { .. }));
+    assert!(matches!(
+        sync(&u, 4, Some(4), &[B1], NOW),
+        UnitAnswer::Ok { .. }
+    ));
     let due = UnixMs(NOW.0 + PERIOD);
     let step = u.alarm(due).unwrap();
     assert!(step.jobs.is_empty() && !step.run.send_renew);
-    assert_eq!(u.alarm_done(due, &step, false).unwrap(), None);
+    assert_eq!(
+        u.alarm_done(due, &step, &AlarmSent::all(&step, true))
+            .unwrap(),
+        None
+    );
 
     let unborn = Unit::new(RusqliteSql::open_in_memory().unwrap(), own(), "");
     let step = unborn.alarm(due).unwrap();
     assert!(step.jobs.is_empty());
-    assert_eq!(unborn.alarm_done(due, &step, false).unwrap(), None);
+    assert_eq!(
+        unborn
+            .alarm_done(due, &step, &AlarmSent::all(&step, true))
+            .unwrap(),
+        None
+    );
     let tables: i64 = unborn.sql().with_conn(|c| {
         c.query_row("SELECT count(*) FROM sqlite_master", [], |r| r.get(0))
             .unwrap()

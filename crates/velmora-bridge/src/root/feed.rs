@@ -12,17 +12,11 @@
 //! - an opening that the directory may not have yet, **held** with its
 //!   `owner_ref` (`ApplyEntry::Held`, AM-72), through L4's
 //!   `Feed::entries_for` in the closing step's mode, as L4's writer sends
-//!   it to a unit before the directory acknowledged. The feed does not
-//!   know which subjects the unit holds closed, so it counts every
-//!   subject as closed: an opening is sent open only once the directory
-//!   acknowledged it, never because the unit's `keys_seq` is past it (a
-//!   unit can hold a subject closed below its own seq). A subject the
-//!   unit holds open is open there only after a full send that followed
-//!   the directory's acknowledgement, so it is not held again. With no
-//!   directory bound there is no store to wait for (AM-75: the directory
-//!   step is skipped and keys are routed by `m/kr/`), so every entry is
-//!   sent as the chain has it. (A Worker that binds `DIRECTORY` later
-//!   holds every opening its rows do not acknowledge yet.)
+//!   it to a unit before the directory acknowledged. The client supplies
+//!   the unit's actual closed subjects so a subject held below `keys_seq`
+//!   stays held until acknowledged without re-closing an already open one.
+//!   With no directory bound there is no store to wait for (AM-75), so
+//!   every entry is sent as the chain has it.
 //!
 //! The tenant's key ring comes from [`Root::tenant_keys`], so the feed
 //! fails closed when the key locations or a live key version are missing
@@ -67,27 +61,28 @@ pub struct RootKeyFeed<'r, 'a, P: RootPorts, R> {
     pub(super) root: &'r Root<'a, P, R>,
 }
 
-impl<P: RootPorts, R: FillRandom> RootKeyFeed<'_, '_, P, R> {
-    /// How openings are held for `tenant`'s units: until the directory
-    /// acknowledged them when it is bound (a tenant with no row has
-    /// acknowledged nothing), not at all when it is not. A failed read is
-    /// the feed's error: guessing "nothing acknowledged" would hold, at a
-    /// unit far behind, keys it holds open, and no later send of this
-    /// path reopens them.
-    async fn mode(&self, tenant: &KeyTenant) -> Result<Mode> {
-        let Some(dir) = self.root.directory() else {
-            return Ok(Mode::Full);
-        };
-        let acked = dir
-            .tenant(&Tenant::Managed(tenant.clone()))
-            .await?
-            .map_or(0, |row| row.keys_seq);
-        Ok(Mode::Closing { acked })
-    }
-}
-
 impl<P: RootPorts, R: FillRandom> KeyFeed for RootKeyFeed<'_, '_, P, R> {
-    async fn after(&self, tenant: &TenantId, after: u64) -> Result<KeyBatch> {
+    async fn acked(&self, tenant: &TenantId) -> u64 {
+        let Ok(tenant) = KeyTenant::parse(tenant.as_str()) else {
+            return 0;
+        };
+        let Some(dir) = self.root.directory() else {
+            return u64::MAX;
+        };
+        dir.tenant(&Tenant::Managed(tenant))
+            .await
+            .ok()
+            .flatten()
+            .map_or(0, |row| row.keys_seq)
+    }
+
+    async fn after(
+        &self,
+        tenant: &TenantId,
+        after: u64,
+        acked: u64,
+        closed: &[String],
+    ) -> Result<KeyBatch> {
         if tenant.is_zero() {
             return Err(ERR_FEED_TENANT);
         }
@@ -109,10 +104,8 @@ impl<P: RootPorts, R: FillRandom> KeyFeed for RootKeyFeed<'_, '_, P, R> {
         if top < head {
             return Err(ERR_FEED_SHORT);
         }
-        let mode = self.mode(&t).await?;
-        // Every subject counted as held closed by the unit (see the
-        // module): only the directory's acknowledgement opens.
-        let closed: BTreeSet<String> = read.table.entries().map(|e| e.door.id.clone()).collect();
+        let mode = Mode::Closing { acked };
+        let closed: BTreeSet<String> = closed.iter().cloned().collect();
         let feed = Feed::new(records, self.root.kek(), &ring, &read.table, &read.revoked);
         let mut entries = Vec::new();
         let mut from = after;

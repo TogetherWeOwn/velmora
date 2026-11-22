@@ -56,11 +56,11 @@ use velmora_bridge::unit::{
     UnitName, UnitOp, UnitReply,
 };
 use velmora_bridge::unit_lease::client::{Synced, TenantHeads, UnitReplies};
-use velmora_bridge::unit_lease::lease::Proven;
+use velmora_bridge::unit_lease::lease::{LeaseRules, Proven};
 use velmora_bridge::unit_router::{test_door, Router};
 use velmora_bridge::{
-    BlobMeta, BlobStore, BodyOutcome, Bridge, BucketId, ByteSpan, Catalog, Method, NntpConnector,
-    NntpSession, Permit, ProviderConfig, Result, Sql, SqlValue, TenantScope,
+    BlobMeta, BlobStore, BodyOutcome, Bridge, BucketId, ByteSpan, Catalog, Clock, Method,
+    NntpConnector, NntpSession, Permit, ProviderConfig, Result, Sql, SqlValue, TenantScope, UnixMs,
 };
 
 const T1: &str = "t_00000000000000c1";
@@ -110,8 +110,10 @@ fn key() -> TenantKey {
     TenantKey::from_bytes(&id(), 1, derived("tenant key 1")).unwrap()
 }
 
+const BUCKET_GRANT_SEQ: u64 = 1;
+
 fn bucket_id() -> BucketId {
-    BucketId::mint([0xb1; 8])
+    velmora_bridge::records::bucket_id(&id(), BUCKET_GRANT_SEQ)
 }
 
 #[derive(Clone, Copy)]
@@ -120,14 +122,17 @@ enum SecondUnit {
     Closed,
 }
 
-/// The real root unit at `T0`, with an optional scripted bucket unit.
-/// Both ports record every call.
+/// The real root unit at the rig's clock, with an optional scripted
+/// bucket unit. Both ports record every call.
 struct Object {
     name: UnitName,
     unit: Rc<Unit<RusqliteSql>>,
+    clock: FixedClock,
     second_unit: Option<SecondUnit>,
     calls: Rc<RefCell<Vec<UnitCall>>>,
     close_on_publication: Rc<Cell<bool>>,
+    pause_renewal: Rc<Cell<bool>>,
+    mark_signed_reread: Rc<Cell<bool>>,
     request_safety: Blobs,
 }
 
@@ -174,7 +179,18 @@ impl UnitReplies for Object {
                 });
             }
         }
-        let mut reply = self.unit.reply(call, T0);
+        if self.pause_renewal.get() && matches!(call.op, UnitOp::Renew { .. }) {
+            std::future::pending::<()>().await;
+        }
+        let mut reply = self.unit.reply(call, self.clock.now());
+        if self.mark_signed_reread.get()
+            && call.authenticated
+            && matches!(call.op, UnitOp::KeyRow { .. })
+        {
+            if let UnitAnswer::Ok { body, .. } = &mut reply.answer {
+                body["lease_expired"] = true.into();
+            }
+        }
         if matches!(self.second_unit, Some(SecondUnit::Open)) {
             reply.lease_left_ms = SHORT_LEASE_MS;
         }
@@ -258,6 +274,8 @@ struct Ports {
     second_unit: Option<SecondUnit>,
     calls: Rc<RefCell<Vec<UnitCall>>>,
     close_on_publication: Rc<Cell<bool>>,
+    pause_renewal: Rc<Cell<bool>>,
+    mark_signed_reread: Rc<Cell<bool>>,
     request_safety: Blobs,
     safety: MemBlobStore,
     control: Control,
@@ -298,9 +316,12 @@ impl UnitPorts for Ports {
         Ok(Object {
             name: name.clone(),
             unit: Rc::clone(&self.unit),
+            clock: self.clock.clone(),
             second_unit: self.second_unit,
             calls: Rc::clone(&self.calls),
             close_on_publication: Rc::clone(&self.close_on_publication),
+            pause_renewal: Rc::clone(&self.pause_renewal),
+            mark_signed_reread: Rc::clone(&self.mark_signed_reread),
             request_safety: self.request_safety.clone(),
         })
     }
@@ -381,6 +402,14 @@ impl TenantHeads for PlacedHead {
         assert!(known <= self.0.seq);
         Ok(Some(self.0.clone()))
     }
+
+    async fn record(
+        &self,
+        _: &velmora_bridge::unit::TenantId,
+        _: u64,
+    ) -> std::result::Result<Option<velmora_bridge::directory::chain::ReadRecord>, ChainError> {
+        panic!("the placed-head router fixture only reads heads")
+    }
 }
 
 /// A managed tenant, active under key 1, with the key locations; its
@@ -394,6 +423,7 @@ struct World {
     safety: Blobs,
     blobs: Blobs,
     article: Article,
+    fail_jobs: Cell<bool>,
 }
 
 impl World {
@@ -417,6 +447,8 @@ impl World {
             second_unit,
             calls: Rc::default(),
             close_on_publication: Rc::default(),
+            pause_renewal: Rc::default(),
+            mark_signed_reread: Rc::default(),
             request_safety: Blobs::default(),
             safety: MemBlobStore::default(),
             control: Control::default(),
@@ -517,7 +549,8 @@ impl World {
                 .records
                 .plant(&key_chain(&id()).name(seq), seal(seq, &s3));
         }
-        // The unit: born at the head, its bucket row, renewed, synced.
+        // The unit is born at the pre-bucket head. Sync picks up the
+        // subsequent bucket record, including its private part.
         let born = ports.unit.handle(
             &UnitCall {
                 name: root_unit(),
@@ -546,38 +579,53 @@ impl World {
         let bdk = DataKey::generate(&mut TestRng(11)).unwrap();
         // (The test reads the bytes back through the tenant key alone.)
         let bdk_wrapped = wrap_bdk_v2(&key(), &bucket_id(), &bdk, &mut TestRng(12)).unwrap();
-        block_on(ports.unit.sql().exec(
-            "INSERT INTO buckets(id, name, owner, bdk_wrapped, kek_version, created_at) \
-             VALUES (?1, ?2, ?3, ?4, 1, 1)",
-            &[
-                velmora_bridge::SqlValue::Text(bucket_id().as_str().to_owned()),
-                velmora_bridge::SqlValue::Text(BUCKET.into()),
-                velmora_bridge::SqlValue::Text(PRINCIPAL.into()),
-                velmora_bridge::SqlValue::Blob(bdk_wrapped),
-            ],
-        ))
-        .unwrap();
+        let root = Root::new(&ports, &cache, TestRng(8));
+        let bucket_record = block_on(root.chain().write(
+            &Tenant::Managed(id()),
+            &Change::CreateBucket {
+                bucket: bucket_id().as_str().to_owned(),
+                unit: 0,
+                creator: PRINCIPAL.into(),
+                grant_seq: BUCKET_GRANT_SEQ,
+                name: BUCKET.into(),
+                bdk_wrapped,
+                tk_version: 1,
+            },
+            Actor::Customer,
+            T0,
+            0,
+        ));
+        assert!(matches!(bucket_record, Ok(Written::Wrote(_))));
         let world = World {
             safety: ports.request_safety.clone(),
             ports: Rc::new(ports),
-            cache,
+            cache: Rc::new(RootCache::new()),
             blobs: Blobs::default(),
             article: Article::default(),
+            fail_jobs: Cell::new(false),
         };
         world.renew();
         let root = Root::new(&*world.ports, &world.cache, TestRng(3));
         let client = root.unit_client(&root_unit(), false).unwrap();
-        let synced = block_on(client.sync(Seqs {
+        let (synced, pages) = block_on(client.sync(Seqs {
             state_seq,
             keys_seq: 0,
-        }))
-        .unwrap();
+        }));
+        assert!(pages.is_empty(), "{pages:?}");
+        let synced = synced.unwrap();
         assert!(
-            matches!(synced, Synced::Synced { seqs } if seqs.keys_seq == 3),
+            matches!(synced, Synced::Synced { seqs } if seqs.keys_seq == 3 && seqs.state_seq == state_seq + 1),
             "{synced:?}"
         );
+        world.renew();
         world.ports.calls.borrow_mut().clear();
         world
+    }
+
+    fn expire_lease(&self) -> UnixMs {
+        let now = UnixMs(T0.0 + LeaseRules::DEFAULT.term_ms + 1);
+        self.ports.clock.set(now);
+        now
     }
 
     fn renew(&self) {
@@ -606,6 +654,7 @@ impl World {
             &self.ports.unit,
             UnitOp::Sync {
                 head: SyncHead {
+                    from_seq: seqs.state_seq,
                     seqs: Seqs {
                         state_seq: seqs.state_seq + 1,
                         keys_seq: seqs.keys_seq,
@@ -614,6 +663,8 @@ impl World {
                     tenant_mode: Some(HoldMode::ReadOnly),
                     restoring_since: None,
                     lift: None,
+                    buckets: vec![],
+                    placed: vec![bucket_id().as_str().to_owned()],
                 },
             },
         );
@@ -705,6 +756,7 @@ impl World {
             maintenance,
             request.root.clone(),
             request.root_renew,
+            request.expired_key_row.clone(),
             request.routed.clone(),
             verified,
         )
@@ -759,9 +811,12 @@ impl World {
             safety: self.safety.clone(),
             cache: self.blobs.clone(),
             nntp: self.article.clone(),
-            jobs: Jobs::default(),
+            jobs: Jobs {
+                fail: Cell::new(self.fail_jobs.get()),
+                ..Jobs::default()
+            },
             kek: TestKek::new(),
-            clock: FixedClock::new(T0),
+            clock: self.ports.clock.clone(),
             budget: ByteBudget::new(ucfg.inflight_budget_bytes),
             cfg: ucfg,
         });
@@ -925,6 +980,132 @@ fn a_bad_signature_reads_nothing_but_the_key_row() {
     key_row_only(&w.calls());
 }
 
+#[test]
+fn an_expired_key_serves_only_after_its_signed_fresh_reread() {
+    for still_marked in [false, true] {
+        let w = World::new();
+        let now = w.expire_lease();
+        w.ports.mark_signed_reread.set(still_marked);
+        let req = signer().sign(
+            now,
+            Method::Get,
+            &format!("/{BUCKET}"),
+            &[],
+            &[],
+            Vec::new(),
+        );
+        let (resp, _) = w.serve(req, Maintenance::Off);
+        assert_eq!(resp.status, if still_marked { 503 } else { 200 });
+        let calls = w.calls();
+        let renewals: Vec<_> = calls
+            .iter()
+            .enumerate()
+            .filter(|(_, call)| matches!(call.op, UnitOp::Renew { .. }))
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(renewals.len(), 1);
+        let renewal = renewals[0];
+        assert!(matches!(calls[0].op, UnitOp::KeyRow { .. }));
+        assert!(!calls[0].authenticated);
+        assert!(calls[..renewal]
+            .iter()
+            .any(|call| { call.authenticated && matches!(call.op, UnitOp::KeyRow { .. }) }));
+        let reread = calls
+            .iter()
+            .rposition(|call| matches!(call.op, UnitOp::KeyRow { .. }))
+            .unwrap();
+        assert!(reread > renewal && calls[reread].authenticated);
+        assert!(calls[..reread]
+            .iter()
+            .all(|call| !matches!(call.op, UnitOp::Request { .. })));
+        assert_eq!(
+            calls[reread + 1..]
+                .iter()
+                .any(|call| matches!(call.op, UnitOp::Request { .. })),
+            !still_marked
+        );
+    }
+}
+
+#[test]
+fn an_expired_key_with_a_bad_signature_never_renews() {
+    let w = World::new();
+    let now = w.expire_lease();
+    let req = Signer::new(AKID, "invalid-signature-fixture").sign(
+        now,
+        Method::Get,
+        &format!("/{BUCKET}"),
+        &[],
+        &[],
+        Vec::new(),
+    );
+    let (resp, _) = w.serve(req, Maintenance::Off);
+    assert_s3_error(&resp, 403, "SignatureDoesNotMatch");
+    key_row_only(&w.calls());
+}
+
+#[test]
+fn a_shared_root_renewal_waits_five_seconds_then_fails_closed() {
+    use std::future::{poll_fn, Future};
+    use std::task::{Context, Poll, Waker};
+
+    let mut w = World::new();
+    w.expire_lease();
+    w.ports.pause_renewal.set(true);
+    let clock = w.ports.clock.clone();
+    let waited = Rc::new(Cell::new(0));
+    let elapsed = waited.clone();
+    w.cache = Rc::new(RootCache::with_sleep(Rc::new(move |ms| {
+        let clock = clock.clone();
+        let elapsed = elapsed.clone();
+        let mut first_poll = true;
+        Box::pin(poll_fn(move |_| {
+            if std::mem::take(&mut first_poll) {
+                return Poll::Pending;
+            }
+            elapsed.set(elapsed.get() + ms);
+            clock.set(UnixMs(clock.now().0 + i64::try_from(ms).unwrap()));
+            Poll::Ready(())
+        }))
+    })));
+    let name = root_unit();
+    let seen = w.ports.unit.head().unwrap().seqs;
+    let root = Root::new(&*w.ports, &w.cache, TestRng(6));
+    let first = root.unit_client(&name, true).unwrap();
+    let second = root.unit_client(&name, true).unwrap();
+    let mut leader = std::pin::pin!(first.renew_in_background(seen));
+    let mut waiter = std::pin::pin!(second.call(UnitCall {
+        name: name.clone(),
+        kind: CallKind::Request,
+        seqs: Some(seen),
+        authenticated: true,
+        listed: true,
+        op: UnitOp::Ping {},
+    }));
+    let mut cx = Context::from_waker(Waker::noop());
+    assert!(leader.as_mut().poll(&mut cx).is_pending());
+    assert!(w.cache.flights.running(&name));
+    for expected in (0..5_000).step_by(50) {
+        assert!(waiter.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(waited.get(), expected);
+    }
+    let Poll::Ready((answer, _)) = waiter.as_mut().poll(&mut cx) else {
+        panic!("a waiter must stop at the five-second deadline")
+    };
+    assert_eq!(waited.get(), 5_000);
+    assert!(matches!(
+        answer.unwrap().reply.answer,
+        UnitAnswer::RenewNeeded { .. }
+    ));
+    assert_eq!(
+        w.calls()
+            .iter()
+            .filter(|call| matches!(call.op, UnitOp::Renew { .. }))
+            .count(),
+        1
+    );
+}
+
 /// Every call was the `key_row`, unauthenticated: nothing else was read.
 fn key_row_only(calls: &[UnitCall]) {
     assert!(!calls.is_empty() && calls.len() <= 2, "{calls:?}");
@@ -1051,6 +1232,118 @@ fn delete_bucket_over_s3_is_refused_and_writes_nothing() {
     );
     let (resp, _) = w.serve(other, Maintenance::Off);
     assert_s3_error(&resp, 403, "InvalidAccessKeyId");
+}
+
+#[test]
+fn a_managed_multipart_upload_completes_and_takes_back_failed_job_marks() {
+    let w = World::new();
+    let signer = signer();
+    let (created, _) = w.serve(create_multipart(&signer), Maintenance::Off);
+    assert_eq!(created.status, 200);
+    let xml = std::str::from_utf8(&created.body).unwrap();
+    let (_, xml) = xml.split_once("<UploadId>").unwrap();
+    let (upload_id, _) = xml.split_once("</UploadId>").unwrap();
+    let path = object_path();
+    let mut manifest = String::from("<CompleteMultipartUpload>");
+    let mut bytes = Vec::new();
+    for (number, part) in [
+        ("1", vec![b'a'; 5 * 1024 * 1024]),
+        ("2", b"last part".to_vec()),
+    ] {
+        bytes.extend_from_slice(&part);
+        let req = signer.sign(
+            T0,
+            Method::Put,
+            &path,
+            &[("partNumber", number), ("uploadId", upload_id)],
+            &[],
+            part,
+        );
+        let (resp, _) = w.serve(req, Maintenance::Off);
+        assert_eq!(resp.status, 200, "UploadPart {number}");
+        let etag = resp.header("etag").unwrap().replace('"', "&quot;");
+        manifest.push_str(&format!(
+            "<Part><PartNumber>{number}</PartNumber><ETag>{etag}</ETag></Part>"
+        ));
+    }
+    manifest.push_str("</CompleteMultipartUpload>");
+    w.fail_jobs.set(true);
+    let req = signer.sign(
+        T0,
+        Method::Post,
+        &path,
+        &[("uploadId", upload_id)],
+        &[],
+        manifest.into_bytes(),
+    );
+    let (completed, _) = w.serve(req, Maintenance::Off);
+    assert_eq!(completed.status, 200);
+    let completed_xml = std::str::from_utf8(&completed.body).unwrap();
+    assert!(completed_xml.contains("<CompleteMultipartUploadResult"));
+    assert!(w.calls().iter().any(|call| {
+        call.authenticated
+            && matches!(&call.op, UnitOp::Request { call }
+            if matches!(call.as_ref(), RequestCall::unmark_sent { jobs, mark }
+                if jobs.len() == 2 && *mark == T0))
+    }));
+    let outbox = w
+        .ports
+        .unit
+        .sql()
+        .with_conn(|c| {
+            c.query_row(
+                "SELECT COUNT(*), COUNT(sent_at) FROM outbox WHERE stage='post'",
+                [],
+                |row| Ok((row.get::<_, u32>(0)?, row.get::<_, u32>(1)?)),
+            )
+        })
+        .unwrap();
+    assert_eq!(
+        outbox,
+        (2, 0),
+        "the durable post jobs remain and both sent marks are cleared"
+    );
+    let req = signer.sign(T0, Method::Get, &path, &[], &[], Vec::new());
+    let (get, _) = w.serve(req, Maintenance::Off);
+    assert_eq!(get.status, 200);
+    assert!(
+        get.body == bytes,
+        "the multipart object's bytes must match both parts"
+    );
+}
+
+#[test]
+fn a_later_door_only_sync_does_not_need_the_applied_bucket_records_key() {
+    let w = World::new();
+    let seen = w.ports.unit.head().unwrap().seqs;
+    let tenant = Tenant::Managed(id());
+    let root = Root::new(&*w.ports, &w.cache, TestRng(18));
+    let wrote = block_on(root.chain().write(
+        &tenant,
+        &Change::SetLimits {
+            base_seq: seen.state_seq,
+            limits: BTreeMap::from([("fixture-cap".into(), 1)]),
+            rate_json: None,
+        },
+        Actor::Operator,
+        T0,
+        0,
+    ));
+    assert!(matches!(wrote, Ok(Written::Wrote(_))));
+    for store in [&w.ports.keys_a, &w.ports.keys_b] {
+        let names = store.names();
+        assert_eq!(names.len(), 1);
+        assert!(store.lose(&names[0]));
+    }
+    let cold = RootCache::new();
+    let root = Root::new(&*w.ports, &cold, TestRng(19));
+    let client = root.unit_client(&root_unit(), true).unwrap();
+    let (synced, pages) = block_on(client.sync(seen));
+    assert!(pages.is_empty(), "{pages:?}");
+    assert!(
+        matches!(synced, Ok(Synced::Synced { seqs }) if seqs.state_seq == seen.state_seq + 1),
+        "{synced:?}"
+    );
 }
 
 #[test]

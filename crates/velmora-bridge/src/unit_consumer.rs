@@ -122,6 +122,9 @@ pub fn page_code(page: &Page) -> &'static str {
         Page::RenewRefused(_) => "renew_refused",
         Page::FinisherNotTold => "finisher_not_told",
         Page::UnitRefused(_) => "unit_refused",
+        Page::PlacementsOff => "placements_off",
+        Page::BucketsRefused(_) => "buckets_refused",
+        Page::DropNotClosed { .. } => "drop_not_closed",
     }
 }
 
@@ -140,7 +143,7 @@ pub trait ConsumerClient {
     async fn renew(&self, seen: Seqs) -> (Result<Renewal>, Vec<Page>);
     /// `UnitClient::sync`: read and verify both chains, apply the keys
     /// (AM-12), then `sync`.
-    async fn sync(&self, seen: Seqs) -> Result<Synced>;
+    async fn sync(&self, seen: Seqs) -> (Result<Synced>, Vec<Page>);
     /// `UnitClient::run_job`: a `renew` or `stamp_raise` message at the
     /// numbers it carries.
     async fn run_job(&self, job: UnitJob, seqs: Seqs) -> JobResult;
@@ -159,7 +162,7 @@ where
     async fn renew(&self, seen: Seqs) -> (Result<Renewal>, Vec<Page>) {
         UnitClient::renew(self, seen).await
     }
-    async fn sync(&self, seen: Seqs) -> Result<Synced> {
+    async fn sync(&self, seen: Seqs) -> (Result<Synced>, Vec<Page>) {
         UnitClient::sync(self, seen).await
     }
     async fn run_job(&self, job: UnitJob, seqs: Seqs) -> JobResult {
@@ -179,8 +182,8 @@ impl ConsumerClient for NoClient {
     async fn renew(&self, _: Seqs) -> (Result<Renewal>, Vec<Page>) {
         (Err(BridgeError::NotImplemented(NO_UNIT_CLIENT)), Vec::new())
     }
-    async fn sync(&self, _: Seqs) -> Result<Synced> {
-        Err(BridgeError::NotImplemented(NO_UNIT_CLIENT))
+    async fn sync(&self, _: Seqs) -> (Result<Synced>, Vec<Page>) {
+        (Err(BridgeError::NotImplemented(NO_UNIT_CLIENT)), Vec::new())
     }
     async fn run_job(&self, _: UnitJob, _: Seqs) -> JobResult {
         JobResult {
@@ -323,7 +326,9 @@ pub async fn deliver<R: UnitRun, C: ConsumerClient, H: TenantHeads>(
             }
             UnitRefusal::SyncNeeded(seen) if !synced => {
                 synced = true;
-                match client.sync(seen).await {
+                let (sync, alerts) = client.sync(seen).await;
+                lines.extend(pages(&alerts));
+                match sync {
                     Err(_) => Next::Done(Delivery::HandBack, line("sync_failed", false)),
                     Ok(Synced::Synced { seqs: synced }) => Next::Again(higher(seqs, synced)),
                     // Only the restore tool's `sync` lifts: the unit stays
@@ -473,6 +478,7 @@ mod tests {
     struct Client {
         renewal: (Option<Renewal>, Vec<Page>),
         synced: Option<Synced>,
+        sync_pages: Vec<Page>,
         job: JobResult,
         renews: Cell<u32>,
         syncs: Cell<u32>,
@@ -491,6 +497,7 @@ mod tests {
                     vec![],
                 ),
                 synced: Some(Synced::Synced { seqs: seqs(9, 9) }),
+                sync_pages: vec![],
                 job: JobResult {
                     delivery: client::Delivery::Ack,
                     code: "renewed",
@@ -536,10 +543,13 @@ mod tests {
             let (renewal, pages) = self.renewal.clone();
             (renewal.ok_or(BridgeError::Sql("down".into())), pages)
         }
-        async fn sync(&self, seen: Seqs) -> Result<Synced> {
+        async fn sync(&self, seen: Seqs) -> (Result<Synced>, Vec<Page>) {
             self.syncs.set(self.syncs.get() + 1);
             self.seen.borrow_mut().push(seen);
-            self.synced.clone().ok_or(BridgeError::Sql("down".into()))
+            (
+                self.synced.clone().ok_or(BridgeError::Sql("down".into())),
+                self.sync_pages.clone(),
+            )
         }
         async fn run_job(&self, _: UnitJob, seqs: Seqs) -> JobResult {
             self.jobs.set(self.jobs.get() + 1);
@@ -577,6 +587,17 @@ mod tests {
             self.0
                 .clone()
                 .ok_or(crate::directory::chain::ChainError::Busy)
+        }
+
+        async fn record(
+            &self,
+            _: &TenantId,
+            _: u64,
+        ) -> std::result::Result<
+            Option<crate::directory::chain::ReadRecord>,
+            crate::directory::chain::ChainError,
+        > {
+            panic!("the queue consumer reads only the head")
         }
     }
 
@@ -765,6 +786,31 @@ mod tests {
         let (d, l) = go(&s, &Client::failing(), &Heads::failing()).await;
         assert_eq!(d, Delivery::HandBack);
         assert_eq!(codes(&l), [("sync_failed", false)]);
+    }
+
+    #[tokio::test]
+    async fn sync_failure_keeps_fixed_code_alerts() {
+        let s = Script::new(&[Some(UnitRefusal::SyncNeeded(seqs(2, 1)))]);
+        let c = Client {
+            sync_pages: vec![
+                Page::PlacementsOff,
+                Page::DropNotClosed {
+                    first: vec!["synthetic-bucket-id".into()],
+                    total: 1,
+                },
+            ],
+            ..Client::failing()
+        };
+        let (delivery, lines) = go(&s, &c, &Heads::failing()).await;
+        assert_eq!(delivery, Delivery::HandBack);
+        assert_eq!(
+            codes(&lines),
+            [
+                ("placements_off", true),
+                ("drop_not_closed", true),
+                ("sync_failed", false)
+            ]
+        );
     }
 
     #[tokio::test]

@@ -161,11 +161,14 @@ fn worker(unit: &Unit<Db>, op: UnitOp, now: UnixMs) -> UnitAnswer {
     )
 }
 
+mod unit_bucket_support;
+
 fn sync(unit: &Unit<Db>, state_seq: u64, restoring: Option<u64>, now: UnixMs) {
     let a = worker(
         unit,
         UnitOp::Sync {
             head: SyncHead {
+                from_seq: unit.head().unwrap().seqs.state_seq,
                 seqs: Seqs {
                     state_seq,
                     keys_seq: 0,
@@ -174,6 +177,8 @@ fn sync(unit: &Unit<Db>, state_seq: u64, restoring: Option<u64>, now: UnixMs) {
                 tenant_mode: None,
                 restoring_since: restoring,
                 lift: None,
+                buckets: vec![],
+                placed: unit_bucket_support::fixture_placements(unit.sql()),
             },
         },
         now,
@@ -850,6 +855,7 @@ async fn jobs_run_for_a_suspended_tenant_and_not_for_a_shred() {
             &fx.unit,
             UnitOp::Sync {
                 head: SyncHead {
+                    from_seq: fx.unit.head().unwrap().seqs.state_seq,
                     seqs: Seqs {
                         state_seq: 3,
                         keys_seq: 0,
@@ -858,6 +864,8 @@ async fn jobs_run_for_a_suspended_tenant_and_not_for_a_shred() {
                     tenant_mode: mode,
                     restoring_since: None,
                     lift: None,
+                    buckets: vec![],
+                    placed: vec![bucket.id.to_string()],
                 },
             },
             fx.clock.now(),

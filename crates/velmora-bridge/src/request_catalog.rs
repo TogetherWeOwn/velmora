@@ -21,11 +21,6 @@
 //!   the job path. Every other method (bucket and key administration,
 //!   jobs, replay, restore) is not on a unit's request path and is
 //!   refused ([`ERR_NOT_ON_REQUEST_PATH`]).
-//!
-//! **Not request calls yet:** `upload_state` and `unmark_sent`, main's
-//! two newer methods (L2-4 adds them to `RequestCall`). Until then a
-//! managed tenant's UploadPart and CompleteMultipartUpload fail, and the
-//! PUT path's mark take-back is skipped (it is best effort).
 
 #![allow(clippy::too_many_arguments)]
 
@@ -311,39 +306,37 @@ impl<P: UnitPort + TenantRing, S: Catalog> Catalog for RequestCatalog<P, S> {
     }
 
     async fn signature_verified(&self, read: bool) -> Result<()> {
-        if !self.key_row.serves(read) {
-            return Err(ERR_ACCOUNT_PROBLEM);
-        }
-        self.verified.set(true);
-        if self.key_row.lease_expired {
-            // AM-63: a row read under an expired lease checked the
-            // signature only. Read it again, authenticated (the unit
-            // client renews first), and serve only if it still names the
-            // same active key and the tenant's state still serves.
-            let again = self.reread_key_row().await;
-            let same = match &again {
-                Ok(row) => row.key.is_some() && row.key == self.key_row.key && row.serves(read),
-                Err(_) => false,
-            };
-            if !same {
-                self.verified.set(false);
-                return match again {
-                    Ok(row) if !row.serves(read) => Err(ERR_ACCOUNT_PROBLEM),
-                    Ok(_) => Err(ERR_KEY_CHANGED),
-                    Err(e) => Err(e),
-                };
+        if !self.key_row.lease_expired {
+            if !self.key_row.serves(read) {
+                return Err(ERR_ACCOUNT_PROBLEM);
             }
+            self.verified.set(true);
+            return Ok(());
         }
-        Ok(())
+
+        // AM-63: the expired row checked the signature only. The signed
+        // re-read must be fresh, and only its tenant state can authorize.
+        self.verified.set(true);
+        let result = match self.reread_key_row().await {
+            Ok(row) if row.lease_expired => Err(ERR_KEY_ROW),
+            Ok(row) if !row.serves(read) => Err(ERR_ACCOUNT_PROBLEM),
+            Ok(row) if row.key.is_some() && row.key == self.key_row.key => Ok(()),
+            Ok(_) => Err(ERR_KEY_CHANGED),
+            Err(e) => Err(e),
+        };
+        if result.is_err() {
+            self.verified.set(false);
+        }
+        result
     }
 
     async fn upload_state(&self, t: &UploadTarget<'_>) -> Result<Option<UploadState>> {
-        let _ = (t,);
-        Err(not_here("upload_state"))
+        self.verified()?;
+        self.client.upload_state(t).await
     }
     async fn unmark_sent(&self, jobs: &[Job], mark: UnixMs) -> Result<u64> {
-        let _ = (jobs, mark);
-        Err(not_here("unmark_sent"))
+        self.verified()?;
+        self.client.unmark_sent(jobs, mark).await
     }
     async fn gc_orphans_due(&self, now: UnixMs) -> Result<bool> {
         let _ = (now,);

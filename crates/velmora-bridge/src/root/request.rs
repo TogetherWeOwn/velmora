@@ -35,7 +35,7 @@ use crate::service::managed::PortState;
 use crate::tenant_catalog::UnitPort;
 use crate::types::{BridgeError, Result};
 use crate::unit::{Seqs, UnitAnswer, UnitCall, UnitName, UnitOp};
-use crate::unit_lease::client::Page;
+use crate::unit_lease::client::{Answered, Page};
 use crate::unit_router::{RouteRefusal, Routed};
 
 use super::client::UnitPorts;
@@ -57,6 +57,7 @@ pub struct RequestPort<P: UnitPorts, R> {
     /// The root unit, which every `key_row` goes to (the first, before
     /// the signature, and the AM-63 re-read).
     root: RefCell<Routed>,
+    expired_key_row: Option<Box<Answered>>,
     verified: Rc<Cell<bool>>,
     refusal: Cell<Option<RouteRefusal>>,
     pages: RefCell<Vec<Page>>,
@@ -79,6 +80,7 @@ impl<P: UnitPorts, R: FillRandom> RequestPort<P, R> {
         maintenance: Maintenance,
         root: Routed,
         root_renew: Option<Seqs>,
+        expired_key_row: Option<Box<Answered>>,
         routed: std::result::Result<Routed, RouteRefusal>,
         verified: Rc<Cell<bool>>,
     ) -> Self {
@@ -93,6 +95,7 @@ impl<P: UnitPorts, R: FillRandom> RequestPort<P, R> {
             maintenance,
             routed: RefCell::new(routed),
             root: RefCell::new(root),
+            expired_key_row,
             verified,
             refusal: Cell::new(None),
             pages: RefCell::new(Vec::new()),
@@ -151,9 +154,34 @@ impl<P: UnitPorts, R: FillRandom> UnitPort for RequestPort<P, R> {
         let clients = root.clients();
         let heads = root.heads();
         let router = root.router(self.maintenance, &clients, &heads);
-        let (answered, pages) = router
-            .call_with_reply(&routed, call.kind, authenticated, call.op.clone())
-            .await;
+        let (answered, pages) = if let Some(first) = self
+            .expired_key_row
+            .as_deref()
+            .filter(|_| key_row && authenticated)
+        {
+            let Ok(client) = root.unit_client(&routed.unit, routed.listed) else {
+                self.keep(RouteRefusal::Unavailable);
+                return Err(ERR_ROUTE_REFUSED);
+            };
+            let (answered, pages) = client
+                .key_row_verified(
+                    first.clone(),
+                    UnitCall {
+                        name: routed.unit.clone(),
+                        kind: call.kind,
+                        seqs: Some(routed.seqs),
+                        authenticated,
+                        listed: routed.listed,
+                        op: call.op.clone(),
+                    },
+                )
+                .await;
+            (router.interpret_reply(&routed, call.kind, answered), pages)
+        } else {
+            router
+                .call_with_reply(&routed, call.kind, authenticated, call.op.clone())
+                .await
+        };
         match self.drained.get() {
             false => self.pages.borrow_mut().extend(pages),
             true => {

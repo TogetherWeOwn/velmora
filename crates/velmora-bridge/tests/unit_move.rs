@@ -73,25 +73,30 @@ fn numbered(u: &Unit<RusqliteSql>, op: UnitOp) -> UnitAnswer {
     u.handle(&call_on(u.name(), CallKind::Worker, Some(s), op), NOW)
 }
 
+mod unit_bucket_support;
+
 fn sync_to(
     u: &Unit<RusqliteSql>,
     state_seq: u64,
     restoring: Option<u64>,
     lift: Option<LiftProof>,
 ) -> UnitAnswer {
-    let keys_seq = u.head().unwrap().seqs.keys_seq;
+    let current = u.head().unwrap().seqs;
     worker(
         u,
         UnitOp::Sync {
             head: SyncHead {
+                from_seq: current.state_seq,
                 seqs: Seqs {
                     state_seq,
-                    keys_seq,
+                    keys_seq: current.keys_seq,
                 },
                 tenant_state: TenantState::Active,
                 tenant_mode: None,
                 restoring_since: restoring,
                 lift,
+                buckets: vec![],
+                placed: unit_bucket_support::fixture_placements(u.sql()),
             },
         },
     )
@@ -1170,8 +1175,8 @@ fn restore_floor(
 #[test]
 fn a_time_restore_before_the_chains_move_floor_is_refused() {
     let before_lift = Some((Refused::Restore(RestoreRefusal::BeforeMoveLift), false));
-    // Past the floors the restore checks go on to the lease checks: the
-    // unit has its lease table (u0002) and closed just now, so too soon.
+    // Past the floors it is the lease checks' turn: the unit has its lease
+    // table (u0002) and closed just now, so too soon.
     let too_soon = Some((Refused::Restore(RestoreRefusal::TooSoon), false));
     // No move record in the unit (as after a restore to a bookmark taken
     // before the move's first batch): only the named floor holds.

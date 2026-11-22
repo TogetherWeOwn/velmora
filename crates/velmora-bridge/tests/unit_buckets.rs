@@ -9,6 +9,8 @@ use velmora_bridge::unit::buckets::{
     self, BucketChange, BucketRefusal, BucketsApplied, MAX_CHANGES,
 };
 use velmora_bridge::unit::call::HoldMode;
+use velmora_bridge::unit::keys::{KeyEntry, KeyKind, SubjectStatus};
+use velmora_bridge::unit::reserve::{Acting, Hash32, Opening, Rid};
 use velmora_bridge::unit::{
     BirthKind, BirthToken, CallKind, Refused, Seqs, SyncHead, TenantId, TenantState, Unit,
     UnitAnswer, UnitCall, UnitName, UnitOp,
@@ -72,12 +74,18 @@ fn renew(u: &Unit<RusqliteSql>) {
     assert!(matches!(a, UnitAnswer::Ok { .. }), "renew: {a:?}");
 }
 
-fn sync(u: &Unit<RusqliteSql>, state: TenantState, mode: Option<HoldMode>) -> UnitAnswer {
+fn sync(
+    u: &Unit<RusqliteSql>,
+    state: TenantState,
+    mode: Option<HoldMode>,
+    placed_ids: &[&str],
+) -> UnitAnswer {
     let h = u.head().unwrap();
     worker(
         u,
         UnitOp::Sync {
             head: SyncHead {
+                from_seq: h.seqs.state_seq,
                 seqs: Seqs {
                     state_seq: h.seqs.state_seq + 1,
                     keys_seq: h.seqs.keys_seq,
@@ -86,6 +94,8 @@ fn sync(u: &Unit<RusqliteSql>, state: TenantState, mode: Option<HoldMode>) -> Un
                 tenant_state: state,
                 restoring_since: None,
                 lift: None,
+                buckets: vec![],
+                placed: placed(placed_ids),
             },
         },
     )
@@ -115,9 +125,26 @@ fn ready() -> Unit<RusqliteSql> {
     });
     assert!(matches!(u.handle(&c, NOW), UnitAnswer::Ok { .. }));
     assert!(matches!(
-        sync(&u, TenantState::Active, None),
+        sync(&u, TenantState::Active, None, &[]),
         UnitAnswer::Ok { .. }
     ));
+    // Rule 12 (the unit lease, u0002): the Worker's renewal at NOW, so the
+    // unit serves for T; every call of these tests runs at NOW.
+    let h = u.head().unwrap();
+    let renewed = worker(
+        &u,
+        UnitOp::Renew {
+            proof_start: NOW,
+            proven: Proven {
+                state_seq: h.seqs.state_seq,
+                keys_seq: h.seqs.keys_seq,
+                stamp_counter: None,
+                revoked: 0,
+            },
+            revocations: Vec::new(),
+        },
+    );
+    assert!(matches!(renewed, UnitAnswer::Ok { .. }), "{renewed:?}");
     u
 }
 
@@ -295,7 +322,12 @@ fn bucket_close_marks_an_empty_bucket_closing_and_refuses_one_that_holds_data() 
         }
     ));
     assert!(matches!(
-        sync(&u, TenantState::Suspended, Some(HoldMode::ReadOnly)),
+        sync(
+            &u,
+            TenantState::Suspended,
+            Some(HoldMode::ReadOnly),
+            &[B1, B2],
+        ),
         UnitAnswer::Ok { .. }
     ));
     assert!(matches!(
@@ -563,6 +595,26 @@ fn the_bucket_part_of_a_sync_is_shape_checked_first() {
     assert_eq!(ok(&[], &placed(&[""])), Err(Malformed));
 }
 
+/// `Removed` rejects an empty list or a list containing an invalid bucket ID.
+#[test]
+fn a_removed_change_rejects_empty_and_malformed_bucket_lists() {
+    let check = |list: &[&str]| {
+        buckets::check_shape(
+            &[BucketChange::Removed {
+                seq: 4,
+                buckets: placed(list),
+            }],
+            &[],
+            3,
+            4,
+        )
+    };
+    assert_eq!(check(&[B1, B2]), Ok(()));
+    for list in [&[][..], &[B1, "bad id"]] {
+        assert_eq!(check(list), Err(BucketRefusal::Malformed), "{list:?}");
+    }
+}
+
 #[test]
 fn a_bucket_change_reads_back_from_its_json_and_shows_no_name_or_wrap() {
     let c = created(4, B1, "secret-name", 2);
@@ -575,16 +627,8 @@ fn a_bucket_change_reads_back_from_its_json_and_shows_no_name_or_wrap() {
     assert!(!shown.contains("secret-name"), "{shown}");
 }
 
-/// The unit's bucket rows with its open creates stay below
-/// `MAX_PLACED`, the bound of the placement list every `sync` carries: a
-/// bucket create's reservation is refused `cap_reached` at it, so a
-/// tenant's `sync` is never refused for its size.
-#[test]
-fn a_bucket_create_is_refused_once_the_unit_holds_max_placed() {
-    use velmora_bridge::unit::keys::{KeyEntry, KeyKind, SubjectStatus};
-    use velmora_bridge::unit::reserve::{Acting, Hash32, Opening, ReserveRefusal, Rid};
-    let u = ready();
-    let principal = KeyEntry {
+fn owner_principal() -> KeyEntry {
+    KeyEntry {
         id: "p_owner".into(),
         kind: KeyKind::Principal,
         status: SubjectStatus::Active,
@@ -597,12 +641,22 @@ fn a_bucket_create_is_refused_once_the_unit_holds_max_placed() {
         owner_ref: Some("owner-1".into()),
         last_seq: 1,
         rid: None,
-    };
+    }
+}
+
+/// The unit's bucket rows with its open creates stay below
+/// `MAX_PLACED`, the bound of the placement list every `sync` carries: a
+/// bucket create's reservation is refused `cap_reached` at it, so a
+/// tenant's `sync` is never refused for its size.
+#[test]
+fn a_bucket_create_is_refused_once_the_unit_holds_max_placed() {
+    use velmora_bridge::unit::reserve::ReserveRefusal;
+    let u = ready();
     let a = worker(
         &u,
         UnitOp::ApplyKeys {
             from_seq: 0,
-            entries: vec![principal.into()],
+            entries: vec![owner_principal().into()],
             answers: vec![],
         },
     );
@@ -641,4 +695,359 @@ fn a_bucket_create_is_refused_once_the_unit_holds_max_placed() {
             ..
         }
     ));
+}
+
+fn sync_buckets(
+    u: &Unit<RusqliteSql>,
+    state_seq: u64,
+    restoring_since: Option<u64>,
+    buckets: Vec<BucketChange>,
+    placed_ids: &[&str],
+) -> UnitAnswer {
+    let current = u.head().unwrap().seqs;
+    worker(
+        u,
+        UnitOp::Sync {
+            head: SyncHead {
+                from_seq: current.state_seq,
+                seqs: Seqs {
+                    state_seq,
+                    keys_seq: current.keys_seq,
+                },
+                tenant_mode: None,
+                tenant_state: TenantState::Active,
+                restoring_since,
+                lift: None,
+                buckets,
+                placed: placed(placed_ids),
+            },
+        },
+    )
+}
+
+fn ok_body(answer: UnitAnswer) -> serde_json::Value {
+    match answer {
+        UnitAnswer::Ok { body, .. } => body,
+        other => panic!("expected an OK unit answer, got {other:?}"),
+    }
+}
+
+fn sync_alpha(u: &Unit<RusqliteSql>) {
+    ok_body(sync_buckets(
+        u,
+        5,
+        None,
+        vec![created(5, B1, "alpha", 2)],
+        &[B1],
+    ));
+}
+
+/// The unit creates the placed row and makes the same reservation replay as applied.
+#[test]
+fn a_sync_creation_writes_the_bucket_and_applies_its_bound_reservation() {
+    use velmora_bridge::unit::keys::{Access, KeyGrant};
+    let u = ready();
+    let owner = owner_principal();
+    ok_body(worker(
+        &u,
+        UnitOp::ApplyKeys {
+            from_seq: 0,
+            entries: vec![owner.clone().into()],
+            answers: vec![],
+        },
+    ));
+    let ask = || UnitOp::Reserve {
+        key_hash: Hash32([1; 32]),
+        fingerprint: Hash32([2; 32]),
+        rid: Rid([3; 16]),
+        acting: Some(Acting::OwnerRef("owner-1".into())),
+        opening: Opening::Bucket {
+            name: "alpha".into(),
+            unit: 0,
+        },
+    };
+    let admitted = ok_body(worker(&u, ask()));
+    assert_eq!(admitted["admitted"]["keys_seq"], json!(1));
+    let bound = ok_body(worker(
+        &u,
+        UnitOp::BindBucket {
+            rid: Rid([3; 16]),
+            expected: None,
+            grant_seq: 2,
+        },
+    ));
+    assert_eq!(bound, json!({ "bound": true }));
+    ok_body(worker(
+        &u,
+        UnitOp::ApplyKeys {
+            from_seq: 1,
+            entries: vec![KeyEntry {
+                grants: vec![KeyGrant {
+                    bucket_id: B1.into(),
+                    access: Access::Rw,
+                    expires_at: None,
+                    prefix: None,
+                    ip_list: vec![],
+                }],
+                last_seq: 2,
+                ..owner
+            }
+            .into()],
+            answers: vec![],
+        },
+    ));
+
+    let body = ok_body(sync_buckets(
+        &u,
+        5,
+        None,
+        vec![created(5, B1, "alpha", 2)],
+        &[B1],
+    ));
+    assert_eq!(body["buckets"]["created"], json!(1));
+    assert_eq!(ids(&u), placed(&[B1]));
+    assert_eq!(name_of(&u, B1), "alpha");
+    assert_eq!(u.head().unwrap().seqs.state_seq, 5);
+    let replay = ok_body(worker(&u, ask()));
+    assert_eq!(replay["applied"]["bucket"], json!(B1));
+    assert_eq!(replay["applied"]["grant_seq"], json!(2));
+}
+
+/// A dropped record removes the row of a bucket already closed while empty.
+#[test]
+fn a_sync_drop_deletes_an_empty_closing_bucket() {
+    let u = ready();
+    sync_alpha(&u);
+    let close = ok_body(worker(
+        &u,
+        UnitOp::BucketClose {
+            bucket_id: B1.into(),
+        },
+    ));
+    assert_eq!(close, json!({ "closing": true, "newly": true }));
+
+    let body = ok_body(sync_buckets(&u, 6, None, vec![dropped(6, B1)], &[]));
+    assert_eq!(body["buckets"]["dropped"], json!(1));
+    assert!(ids(&u).is_empty());
+    assert!(!closing(&u, B1));
+}
+
+/// A late drop keeps the live object, frees the bucket name, and reports the retained row.
+#[test]
+fn a_sync_drop_keeps_an_occupied_bucket_under_its_dropped_name() {
+    const GENERATION: &str = "g_0019a00000000c1c1c1c1c1c1c1c1";
+    let u = ready();
+    sync_alpha(&u);
+    u.sql()
+        .apply(&format!(
+            "INSERT INTO generations(id, bucket_id, key, state, size, etag, content_json, \
+             user_meta_json, extent_count, created_at) \
+             VALUES ('{GENERATION}', '{B1}', 'k', 'live', 0, '\"e\"', '{{}}', '{{}}', 0, 1); \
+             INSERT INTO objects(bucket_id, key, generation_id) VALUES ('{B1}', 'k', '{GENERATION}');"
+        ))
+        .unwrap();
+
+    let body = ok_body(sync_buckets(&u, 6, None, vec![dropped(6, B1)], &[]));
+    assert_eq!(body["buckets"]["dropped"], json!(0));
+    assert_eq!(body["buckets"]["drop_not_closed"], json!([B1]));
+    assert_eq!(ids(&u), placed(&[B1]));
+    assert_eq!(name_of(&u, B1), format!("~dropped/{B1}"));
+    assert!(closing(&u, B1));
+    let live_generation: String = u
+        .sql()
+        .with_conn(|c| {
+            c.query_row(
+                "SELECT generation_id FROM objects WHERE bucket_id = ?1 AND key = 'k'",
+                [B1],
+                |r| r.get(0),
+            )
+        })
+        .unwrap();
+    assert_eq!(live_generation, GENERATION);
+}
+
+fn sync_omitting_alpha(u: &Unit<RusqliteSql>, restoring_since: Option<u64>) -> UnitAnswer {
+    sync_buckets(
+        u,
+        6,
+        restoring_since,
+        vec![created(6, B2, "beta", 3)],
+        &[B2],
+    )
+}
+
+/// Omitting a live bucket from placements alarms and rolls back the new row and head.
+#[test]
+fn a_sync_that_omits_a_bucket_alarms_without_advancing_the_head() {
+    let u = ready();
+    sync_alpha(&u);
+    let before = u.head().unwrap();
+
+    let answer = sync_omitting_alpha(&u, None);
+    assert!(
+        matches!(
+            answer,
+            UnitAnswer::Refused {
+                reason: Refused::Buckets(BucketRefusal::PlacementsOff),
+                alarm: true,
+            }
+        ),
+        "{answer:?}"
+    );
+    assert_eq!(u.head().unwrap(), before);
+    assert_eq!(ids(&u), placed(&[B1]));
+    assert_eq!(name_of(&u, B1), "alpha");
+    assert!(!closing(&u, B1));
+}
+
+/// The placement guard uses the next head's restoring entry, even on entry into restore.
+#[test]
+fn a_sync_entering_restore_accepts_an_omitted_bucket() {
+    let u = ready();
+    sync_alpha(&u);
+    assert_eq!(u.head().unwrap().restoring_since, None);
+
+    let body = ok_body(sync_omitting_alpha(&u, Some(6)));
+    assert_eq!(body["buckets"]["created"], json!(1));
+    let head = u.head().unwrap();
+    assert_eq!(head.seqs.state_seq, 6);
+    assert_eq!(head.restoring_since, Some(6));
+    assert_eq!(ids(&u), placed(&[B1, B2]));
+}
+
+/// Unplacing a bucket while restoring leaves the rollback copy intact.
+#[test]
+fn a_sync_unplace_preserves_bucket_rows_while_restoring() {
+    let u = ready();
+    sync_alpha(&u);
+    ok_body(sync_buckets(&u, 6, Some(6), vec![], &[B1]));
+
+    let body = ok_body(sync_buckets(
+        &u,
+        7,
+        Some(6),
+        vec![BucketChange::Unplaced {
+            seq: 7,
+            buckets: placed(&[B1]),
+        }],
+        &[],
+    ));
+    assert_eq!(body["buckets"]["dropped"], json!(0));
+    let head = u.head().unwrap();
+    assert_eq!(head.seqs.state_seq, 7);
+    assert_eq!(head.restoring_since, Some(6));
+    assert_eq!(ids(&u), placed(&[B1]));
+    assert_eq!(name_of(&u, B1), "alpha");
+    assert!(!closing(&u, B1));
+}
+
+/// `Removed` drops empty rows and keeps occupied rows closing, with or without a retained restore entry.
+#[test]
+fn a_sync_removal_drops_empty_rows_and_keeps_occupied_rows_closing() {
+    for restoring in [None, Some(8)] {
+        let u = ready();
+        ok_body(sync_buckets(
+            &u,
+            7,
+            None,
+            vec![
+                created(5, B1, "alpha", 2),
+                created(6, B2, "beta", 3),
+                created(7, B3, "gamma", 4),
+            ],
+            &[B1, B2, B3],
+        ));
+        ok_body(sync_buckets(&u, 8, restoring, vec![], &[B1, B2, B3]));
+        assert_eq!(u.head().unwrap().restoring_since, restoring);
+        hold_something(&u, B3);
+
+        let body = ok_body(sync_buckets(
+            &u,
+            9,
+            restoring,
+            vec![BucketChange::Removed {
+                seq: 9,
+                buckets: placed(&[B1, B2, B3]),
+            }],
+            &[],
+        ));
+        assert_eq!(body["buckets"]["dropped"], json!(2));
+        assert_eq!(body["buckets"]["drop_not_closed"], json!([B3]));
+        assert_eq!(ids(&u), placed(&[B3]));
+        assert!(closing(&u, B3));
+        assert_eq!(name_of(&u, B3), format!("~dropped/{B3}"));
+        let head = u.head().unwrap();
+        assert_eq!(head.seqs.state_seq, 9);
+        assert_eq!(head.restoring_since, restoring);
+    }
+}
+
+/// A sync based on an old sequence is refused without changing the head or rows, even with a valid bucket part.
+#[test]
+fn a_sync_based_on_an_old_sequence_leaves_the_head_and_rows_unchanged() {
+    let u = ready();
+    sync_alpha(&u);
+    let before = u.head().unwrap();
+    let mut head = SyncHead {
+        from_seq: before.seqs.state_seq - 1,
+        seqs: Seqs {
+            state_seq: before.seqs.state_seq + 1,
+            keys_seq: before.seqs.keys_seq,
+        },
+        tenant_state: TenantState::Active,
+        tenant_mode: None,
+        restoring_since: None,
+        lift: None,
+        buckets: vec![created(before.seqs.state_seq + 1, B2, "beta", 3)],
+        placed: placed(&[B1, B2]),
+    };
+    let writes_before = u.sql().with_conn(|c| c.total_changes());
+
+    assert_eq!(
+        worker(&u, UnitOp::Sync { head: head.clone() }),
+        UnitAnswer::Refused {
+            reason: Refused::StaleSync,
+            alarm: false,
+        }
+    );
+    assert_eq!(u.sql().with_conn(|c| c.total_changes()), writes_before);
+    assert_eq!(u.head().unwrap(), before);
+    assert_eq!(ids(&u), placed(&[B1]));
+
+    head.from_seq = before.seqs.state_seq;
+    let next = head.seqs;
+    let body = ok_body(worker(&u, UnitOp::Sync { head }));
+    assert_eq!(body["buckets"]["created"], json!(1));
+    assert_eq!(u.head().unwrap().seqs, next);
+    assert_eq!(ids(&u), placed(&[B1, B2]));
+}
+
+/// Descending change sequences are malformed even if applying them would match placements.
+#[test]
+fn a_sync_with_out_of_order_bucket_changes_is_refused_before_changes() {
+    let u = ready();
+    let before = u.head().unwrap();
+    let changes = || u.sql().with_conn(|c| c.total_changes());
+    let writes_before = changes();
+
+    let answer = sync_buckets(
+        &u,
+        6,
+        None,
+        vec![created(6, B1, "alpha", 2), created(5, B2, "beta", 3)],
+        &[B1, B2],
+    );
+    assert!(
+        matches!(
+            answer,
+            UnitAnswer::Refused {
+                reason: Refused::Buckets(BucketRefusal::Malformed),
+                alarm: false,
+            }
+        ),
+        "{answer:?}"
+    );
+    assert_eq!(changes(), writes_before, "the malformed delta never ran");
+    assert_eq!(u.head().unwrap(), before);
+    assert!(ids(&u).is_empty());
 }
