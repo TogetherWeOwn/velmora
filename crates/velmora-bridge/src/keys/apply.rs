@@ -51,10 +51,15 @@ use crate::types::{BridgeError, Result};
 /// restored between its `keys_seq` and the apply) before the call fails.
 pub const MAX_BEHIND: u32 = 3;
 
-/// Records kept in memory by one feed: the stores of one change are
-/// brought up three times from the same records (an estimate; a few MiB
-/// at most).
-const MEMO_RECORDS: usize = 2048;
+/// What a feed keeps of each record it read: the subject it names, or a
+/// marker. A few bytes per seq, so one run reads each record at most once
+/// whatever the stores' lag (a store far behind costs one GET per record
+/// it lacks, once).
+#[derive(Clone, Debug)]
+enum Slot {
+    Subject(String),
+    Marker,
+}
 
 /// The store kept answering `Behind`.
 pub const ERR_APPLY_BEHIND: BridgeError =
@@ -81,7 +86,7 @@ pub struct Feed<'a, S, K, T> {
     chain: Chain,
     table: &'a KeyTable,
     revoked: &'a BTreeSet<String>,
-    memo: RefCell<BTreeMap<u64, ChainRecord>>,
+    memo: RefCell<BTreeMap<u64, Slot>>,
 }
 
 impl<'a, S: RecordStore, K: Kek, T: TkRing> Feed<'a, S, K, T> {
@@ -103,17 +108,23 @@ impl<'a, S: RecordStore, K: Kek, T: TkRing> Feed<'a, S, K, T> {
         }
     }
 
-    async fn record(&self, seq: u64) -> Result<ChainRecord> {
+    async fn slot(&self, seq: u64) -> Result<Slot> {
         if let Some(r) = self.memo.borrow().get(&seq) {
             return Ok(r.clone());
         }
         let bytes = self.chain.get(self.store, seq).await?;
-        let record = open_chain_record(self.kek, self.ring, self.table.tenant(), seq, &bytes)?;
-        let mut memo = self.memo.borrow_mut();
-        if memo.len() < MEMO_RECORDS {
-            memo.insert(seq, record.clone());
-        }
-        Ok(record)
+        let slot = match open_chain_record(self.kek, self.ring, self.table.tenant(), seq, &bytes)? {
+            ChainRecord::Key(r) => Slot::Subject(r.door.id),
+            ChainRecord::Marker(_) => Slot::Marker,
+        };
+        self.memo.borrow_mut().insert(seq, slot.clone());
+        Ok(slot)
+    }
+
+    /// How many of the records `(from, to]` this feed has not read yet.
+    fn unread(&self, from: u64, to: u64) -> u64 {
+        let memo = self.memo.borrow();
+        (to - from) - memo.range(from + 1..=to).count() as u64
     }
 
     /// An entry with the `m/rk/` revocations in force.
@@ -129,16 +140,16 @@ impl<'a, S: RecordStore, K: Kek, T: TkRing> Feed<'a, S, K, T> {
     async fn page(&self, from: u64, to: u64) -> Result<Vec<ApplyEntry>> {
         let mut out = Vec::with_capacity((to - from) as usize);
         for seq in from + 1..=to {
-            let r = match self.record(seq).await? {
-                ChainRecord::Marker(m) => {
-                    out.push(ApplyEntry::Marker { seq: m.seq });
+            let id = match self.slot(seq).await? {
+                Slot::Marker => {
+                    out.push(ApplyEntry::Marker { seq });
                     continue;
                 }
-                ChainRecord::Key(r) => r,
+                Slot::Subject(id) => id,
             };
-            let head = self.table.get(&r.door.id).ok_or(ERR_KEY_RECORD)?;
+            let head = self.table.get(&id).ok_or(ERR_KEY_RECORD)?;
             let mut entry = head.clone();
-            entry.last_seq = r.seq;
+            entry.last_seq = seq;
             out.push(ApplyEntry::Subject(self.in_force(entry)));
         }
         Ok(out)
@@ -246,12 +257,15 @@ impl<'a, S: RecordStore, K: Kek, T: TkRing> Feed<'a, S, K, T> {
         // One run from the lowest such seq to the table's head (never
         // past it: a store may be ahead) takes ceil(span / 100) calls; the
         // store skips every other entry at or below its rows. It also
-        // reads span records (the memo holds most), so it is taken only
-        // when it saves calls.
+        // reads the span's records this feed has not read yet, so it is
+        // taken only when calls plus those reads cost less than one call
+        // per subject.
         let top = held.min(self.table.seq());
-        let span = top - (lowest - 1);
-        let run_calls = span.div_ceil(MAX_APPLY as u64);
-        if run_calls < reopened.len() as u64 {
+        let Some(span) = top.checked_sub(lowest - 1) else {
+            return self.singly(target, reopened).await;
+        };
+        let cost = span.div_ceil(MAX_APPLY as u64) + self.unread(lowest - 1, top);
+        if cost < reopened.len() as u64 {
             self.run(target, Mode::Full, held, &closed, lowest - 1, top)
                 .await
         } else {

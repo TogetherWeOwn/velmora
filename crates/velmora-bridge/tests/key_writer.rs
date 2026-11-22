@@ -164,6 +164,21 @@ impl KeyTarget for FakeTarget {
                     continue;
                 }
             };
+            // The unit's shape rules (`unit::keys::check_entries`): an
+            // open key carries its secret, a principal none.
+            if let Some(p) = &e.private {
+                let open_key = e.door.kind.has_secret() && e.door.status != SubjectStatus::Revoked;
+                assert!(
+                    !open_key || p.secret_wrapped.is_some(),
+                    "{}: an open key without its secret",
+                    self.label
+                );
+                assert!(
+                    e.door.kind.has_secret() || p.secret_wrapped.is_none(),
+                    "{}: a principal with a secret",
+                    self.label
+                );
+            }
             let was_revoked = rows
                 .get(&e.door.id)
                 .is_some_and(|r| r.door.status == SubjectStatus::Revoked);
@@ -6597,10 +6612,13 @@ async fn an_unrecorded_revocation_goes_before_the_pages() {
     assert_eq!(unit.seq.get(), 50, "no page was taken");
 }
 
-/// Review r1 of the apply (LOW 3): many held subjects that now open are
-/// sent again as one run of the records, not one call each.
+/// Review r1 of the apply (LOW 3) and its second confirmation: many held
+/// subjects that now open are sent again as one run of the records when
+/// the calls plus the records the run has not read yet cost less than
+/// one call each; with nothing read yet, alone.
 #[tokio::test(flavor = "current_thread")]
 async fn many_reopened_subjects_take_one_run() {
+    use velmora_bridge::keys::apply::{Feed, Mode};
     let w = World::new();
     plant_principals(&w, 250);
     let table = head_table(&w).await;
@@ -6609,14 +6627,27 @@ async fn many_reopened_subjects_take_one_run() {
     apply_direct(&w.store, &w.kek, &w.ring, &table, &none, &unit)
         .await
         .unwrap();
-    // Every row held closed (applied by a Worker that could not open them).
-    for row in unit.rows.borrow_mut().values_mut() {
-        row.private = None;
-    }
+    let hold_all = |u: &FakeTarget| {
+        for row in u.rows.borrow_mut().values_mut() {
+            row.private = None;
+        }
+    };
+    // A fresh feed has read nothing: 250 calls cost less than 3 calls
+    // and 250 reads.
+    hold_all(&unit);
     let before = unit.applies.get();
     apply_direct(&w.store, &w.kek, &w.ring, &table, &none, &unit)
         .await
         .unwrap();
+    assert_eq!(unit.applies.get() - before, 250);
+    // A feed that already read the records (another store of the run).
+    hold_all(&unit);
+    let feed = Feed::new(&w.store, &w.kek, &w.ring, &table, &none);
+    feed.bring_up(&FakeTarget::new("other"), Mode::Full)
+        .await
+        .unwrap();
+    let before = unit.applies.get();
+    feed.bring_up(&unit, Mode::Full).await.unwrap();
     assert_eq!(unit.applies.get() - before, 3, "100 + 100 + 50, not 250");
     assert!(unit.rows.borrow().values().all(|r| r.private.is_some()));
 }
@@ -6741,4 +6772,53 @@ async fn the_second_send_picks_the_cheaper_form_and_stays_within_the_table() {
     for id in ["PA0001", "PA0002", "PA0003", "PA0004", "PA0005"] {
         assert!(unit.row(id).unwrap().private.is_some(), "{id}");
     }
+}
+
+/// Second confirmation of the apply (LOW 3): a held subject whose newest
+/// record is above the store's seq comes in the pages, not again alone.
+#[tokio::test(flavor = "current_thread")]
+async fn a_held_subject_above_the_stores_seq_is_sent_once() {
+    let w = World::new();
+    let x = principal("PX0001", &[]);
+    let mut off = x.clone();
+    off.door.status = SubjectStatus::Disabled;
+    plant(&w, 1, KeyOp::Create, &x, None);
+    plant(&w, 2, KeyOp::Create, &principal("PA0002", &[]), None);
+    plant(&w, 3, KeyOp::Status, &off, None);
+    plant(&w, 4, KeyOp::Status, &x, None);
+    let table = head_table(&w).await;
+    let unit = FakeTarget::new("unit");
+    let early = {
+        let mut t = KeyTable::empty(w.t.clone());
+        let chain = key_chain(&w.t);
+        for seq in 1..=2 {
+            let b = chain.get(&w.store, seq).await.unwrap();
+            t.apply(&open_key_record(&w.kek, &w.ring, &w.t, seq, &b).unwrap())
+                .unwrap();
+        }
+        t
+    };
+    let mut held = early.get("PX0001").unwrap().clone();
+    held.private = None;
+    let other = early.get("PA0002").unwrap().clone();
+    KeyTarget::apply(
+        &unit,
+        0,
+        &[ApplyEntry::Subject(held), ApplyEntry::Subject(other)],
+    )
+    .await
+    .unwrap();
+    let before = unit.applies.get();
+    apply_direct(
+        &w.store,
+        &w.kek,
+        &w.ring,
+        &table,
+        &Default::default(),
+        &unit,
+    )
+    .await
+    .unwrap();
+    assert_eq!(unit.applies.get() - before, 1, "one page, no second send");
+    assert!(unit.row("PX0001").unwrap().private.is_some());
 }
