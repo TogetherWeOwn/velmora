@@ -363,8 +363,10 @@ it. No build writes them yet. Any other value of the variable refuses to start.
 
 - A record is never renamed, moved or rewritten: it is sealed under its
   whole name and would not open under another. Changing the setting
-  changes where the next record goes, nothing else, and it can be
-  changed in either direction at any time.
+  changes where the next record goes, nothing else. It can be changed
+  in either direction until a build has written segments (below); from
+  then on `flat` is set only under the conditions of "Turning it off
+  again" at the end of this section.
 - Every reader reads both layouts whatever the setting says: the
   replay, the recovery copy, the intent sweep, and the lookup of an
   article plan (in the layout of
@@ -397,11 +399,83 @@ Turning it on, in two deploys:
 1. Deploy a version that knows `RECORD_LAYOUT`, with the variable unset
    or `flat`. Let it serve until a rollback to an earlier version is no
    longer wanted.
-2. Set `RECORD_LAYOUT = "tenant"` and deploy. From this deploy on the
-   rollback floor below applies.
+2. Set `RECORD_LAYOUT = "tenant"` and deploy, alone in its deploy.
+   From this deploy on the rollback floor below applies.
 
-Turning it off again (`flat`) is safe at any time and does not lower
-the floor: the tenant records that were written stay.
+In production the variable is not set in `wrangler.toml`, and a value
+set by hand in the dashboard or with `wrangler deploy --var` is gone
+at the next CI deploy. The deploy job writes it from the variable
+`VELMORA_RECORD_LAYOUT` of the `production` environment of the
+repository (unset, empty or `flat`: flat; `tenant`; any other value
+fails the job before the deploy). Step 2 in production:
+
+1. Let nothing else merge to `main` until step 6 has passed.
+2. Check that the version that serves production was deployed by the
+   push run of the tip of `main`: its message is `ci <run>.<attempt>
+   <commit>`, and the commit is the tip. If the tip was not deployed
+   (its deploy failed or was rolled back), stop: the switch would then
+   deploy other code together with the variable.
+3. Check that this push run is younger than 1 day: the job `deploy
+   (production)` takes the bundle the run built, and it is kept for 1
+   day. If it is older, wait for the day of the next deploy.
+4. Check the other variables of the `production` environment that the
+   deploy job writes into the config (every `VELMORA_*` one the step
+   "Generate the production wrangler config" reads, among them
+   `VELMORA_S3_HOST`, `VELMORA_D1_DATABASE_ID`, `VELMORA_RECOVERY_COPY`,
+   `VELMORA_RECOVERY_PREFIX` and `VELMORA_VERIFY_MODE`): the run in
+   step 5 deploys their values of now, not those of the serving deploy.
+   Compare them with what the serving version carries:
+   `wrangler versions view <id> --json` lists its variables and
+   bindings in full (without `--json` long values are cut). Put
+   any difference right, or confirm it is meant, before going on. Then
+   set `VELMORA_RECORD_LAYOUT` to `tenant` in the `production`
+   environment.
+5. Run the job `deploy (production)` of that push run again, and that
+   job only. Running `deploy-build` again builds a new bundle from the
+   same commit with the toolchain of that day, which is not the bundle
+   that serves. (`workflow_dispatch` does not deploy.)
+6. Read the deploy log: the step "Generate the production wrangler
+   config" names the layout the generated config carries, `tenant`,
+   and the deploy message carries the same commit as the version that
+   served before. Then check that the job ended green and that the
+   version that serves production carries this run's message. A job
+   that fails after the deploy rolls back to the version before it,
+   but not always: with no version recorded before the deploy, the
+   rollback is skipped; when this run's version is not known and the
+   serving one is not the one before, or when a third version serves,
+   the step stops with an error and rolls nothing back; and the
+   rollback command itself can fail. When this run's version is known
+   but the serving one could not be read, it rolls back without that
+   check. A failed job sends the deploy alert only where its settings
+   are present, and a failed send is only a warning in the log. So
+   after a failed job, read which version serves before taking
+   production as restored.
+   Nothing else changed.
+
+`wrangler secret list` must show no secret named `RECORD_LAYOUT`,
+before and after: the Worker reads a secret where the variable is
+absent, a deploy keeps secrets, and the deploy job cannot see them.
+
+What to watch after the switch, in the Worker log:
+
+| Line | Meaning |
+|---|---|
+| `recovery copy: pass=… retry=… records=… copied=… failed=… refused=… source_unreadable=… pending=… extra=… foreign=…` | a copy pass that did not copy everything: `failed`, `refused` and `source_unreadable` count records. A pass without an error logs the line without those three fields |
+| `recovery copy: pass=… retry=… stopped: …` | a copy pass that stopped before its end |
+| `dispatch: the sweep of unpublished writes was not sent` | the cron could not send the sweep jobs |
+
+and in `GET /_admin/status`: `write_intents.anomalies`, which must not
+go up.
+
+Turning it off again (`flat`) is done the same way, with
+`VELMORA_RECORD_LAYOUT` set to `flat` or removed. It does not lower the
+floor: the tenant records that were written stay. It is safe until a
+build has written segments. A segmented upload of a large object writes
+segment records for as long as it runs, which can be days, and no
+segment may be written under a flat name. So once a build that writes
+segments has been deployed with its writer on, the layout is not set
+back to `flat`: the writer is turned off first, and `flat` is set only
+when no segmented upload is open.
 
 With the recovery copy on, a pass that finds nothing to send costs 6
 list calls here and 6 at the other provider (4 and 4 before), in either
@@ -545,7 +619,9 @@ the code real data relies on. Never roll back past the floor:
   rolls back like any other. See "Permit gate".
 
 - **Once `RECORD_LAYOUT=tenant` has been deployed:** never to a version
-  older than the first one that knows `RECORD_LAYOUT`. From then on a
+  older than the first one that knows `RECORD_LAYOUT`: the first one
+  built from a commit that contains #133 (`tenant-prefixed names for
+  new recovery records, behind RECORD_LAYOUT`). From then on a
   recovery record can be stored under `m/x/<tenant id>/`. An older
   Worker reads the flat names only:
   - its replay lists `m/g_` and `m/del/g_` and so passes over every
@@ -603,9 +679,11 @@ here):
 2. A CI deploy carries the message `ci <run>.<attempt> <commit>`. A
    version made by a secret change (`workers/triggered_by` = `secret`)
    runs the code of the version before it.
-3. Take the latest floor that applies: the merge commit of #121 (the
-   one that brought `PACKED_PLANS`) once the switch has been deployed
-   on, else the merge commit of #71. For each version, oldest first,
+3. Take the latest floor that applies: the merge commit of #133 (the
+   one that brought `RECORD_LAYOUT`) once `tenant` has been deployed,
+   else the merge commit of #121 (the one that brought `PACKED_PLANS`)
+   once that switch has been deployed on, else the merge commit of
+   #71. For each version, oldest first,
    check the commit: `git merge-base --is-ancestor <that merge commit>
    <commit>`. The first version for which it succeeds is the floor. A secret-change
    version takes the answer of the version before it. Treat any other
