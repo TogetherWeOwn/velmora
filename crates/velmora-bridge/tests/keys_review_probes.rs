@@ -13,6 +13,7 @@ use velmora_bridge::keys::checkpoint::{
     checkpoint_name, open_checkpoint, read_key_chain, seal_checkpoint,
 };
 use velmora_bridge::keys::escrow::{restore_escrow, EscrowCopy, RestoreStep};
+use velmora_bridge::keys::gate::testkit::FakeGate;
 use velmora_bridge::keys::locations::{two_in_account, KeyLocation, KeyLocations, LocationStatus};
 use velmora_bridge::keys::ports::{
     Admission, Binding, BucketAdmission, BucketReservation, ControlChain, ControlIntents,
@@ -144,6 +145,7 @@ impl World {
             &subject.door,
             Some(&subject.private),
             closes,
+            None,
             &mut self.rng,
         )
         .unwrap()
@@ -317,6 +319,7 @@ async fn closing_pass_opens_at_the_directory_acknowledgment() {
         directory: &&directory,
         clock: &FixedClock::new(UnixMs(1_700_000_000_000)),
         limits: Limits::Recorded,
+        gate: &FakeGate::before_move(),
     };
     finish_keys(&env, &mut w.rng).await.unwrap();
     assert_eq!(directory.seq.get(), 1);
@@ -414,6 +417,7 @@ fn private_unchanged_requires_a_prior_entry() {
         tk_version: 1,
         closes: false,
         private_unchanged: true,
+        frozen_at: None,
     };
     let mut table = KeyTable::empty(w.tenant.clone());
     assert!(table.apply(&record).is_err());
@@ -695,6 +699,7 @@ fn closes_must_fit_the_change_and_restates_move_forward() {
         &subject.door,
         Some(&subject.private),
         true,
+        None,
         &mut w.rng,
     )
     .is_err());

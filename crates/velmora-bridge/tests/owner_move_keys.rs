@@ -621,6 +621,7 @@ impl FrozenKeys {
                 secret_wrapped: None,
             }),
             false,
+            None,
             &mut self.rng,
         )
         .unwrap()
@@ -1172,6 +1173,7 @@ async fn every_bad_input_stops_the_move_before_any_write() {
         &door,
         entry.private.as_ref(),
         true,
+        None,
         &mut fixture.rng,
     )
     .unwrap();
@@ -1284,6 +1286,7 @@ async fn a_key_revoked_since_the_freeze_stops_the_resumed_move_before_any_write(
         &door,
         entry.private.as_ref(),
         true,
+        None,
         &mut fixture.rng,
     )
     .unwrap();
@@ -1309,4 +1312,32 @@ async fn a_repeated_bucket_counts_once_against_the_cap() {
     buckets.push("b_01".into());
     fixture.buckets = buckets;
     fixture.write(PRINCIPAL).await.unwrap();
+}
+
+/// A chain that carries an undo's freeze takes no moved key (AM-28): the
+/// next move's window thaws it first.
+#[tokio::test(flavor = "current_thread")]
+async fn a_frozen_key_chain_takes_no_moved_key() {
+    let mut fixture = FrozenKeys::new().await;
+    let tenant = fixture.ring.0.tenant().clone();
+    let marker = velmora_bridge::keys::record::seal_marker_record(
+        &fixture.kek,
+        &fixture.ring,
+        &tenant,
+        2,
+        1,
+        velmora_bridge::keys::record::Marker::KeysFrozen,
+        &mut fixture.rng,
+    )
+    .unwrap();
+    fixture.store.plant(&key_chain(&tenant).name(2), marker);
+    let err = fixture.write(PRINCIPAL).await.unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        velmora_bridge::keys::moving::ERR_MOVE_FROZEN.to_string()
+    );
+    assert_eq!(
+        fixture.store.names_under(key_chain(&tenant).prefix()).len(),
+        2
+    );
 }

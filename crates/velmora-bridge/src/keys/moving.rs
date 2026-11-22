@@ -53,6 +53,10 @@ use crate::types::{
 /// Another writer took a seq of the new tenant's key chain during the
 /// move. Nothing else writes it in the window, so the move gives up.
 pub const ERR_MOVE_RACE: BridgeError = BridgeError::Invalid("the key chain moved under the move");
+/// The new tenant's key chain carries an undo's freeze (AM-28): the
+/// move's window step 2 must thaw it before any key is applied.
+pub const ERR_MOVE_FROZEN: BridgeError =
+    BridgeError::Invalid("the key chain is frozen: thaw it first");
 /// What the target already holds differs from what the move would write.
 pub const ERR_MOVE_DIFFERS: BridgeError =
     BridgeError::Invalid("the target holds something else under this name");
@@ -454,6 +458,9 @@ where
     R: FillRandom,
 {
     let mut table = read_key_chain(store, kek, ring, tenant).await?.table;
+    if table.frozen_at().is_some() {
+        return Err(ERR_MOVE_FROZEN);
+    }
     let mut out = MovedKeys::default();
     let moved: BTreeSet<&str> = buckets.iter().map(String::as_str).collect();
 
@@ -709,9 +716,16 @@ async fn append<S: RecordStore, K: Kek, T: TkRing, R: FillRandom>(
     closes: bool,
     rng: &mut R,
 ) -> Result<u64> {
+    // The move writes on a thawed chain only (AM-28: the next move's
+    // window step 2 thaws an undone tenant before any key is applied).
+    if table.frozen_at().is_some() {
+        return Err(ERR_MOVE_FROZEN);
+    }
     table.admits(op, door, private)?;
     let seq = table.seq() + 1;
-    let bytes = seal_key_record(kek, ring, tenant, seq, op, at, door, private, closes, rng)?;
+    let bytes = seal_key_record(
+        kek, ring, tenant, seq, op, at, door, private, closes, None, rng,
+    )?;
     if key_chain(tenant).put(store, seq, bytes.clone()).await? != Put::Written {
         return Err(ERR_MOVE_RACE);
     }
