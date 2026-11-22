@@ -40,6 +40,7 @@ use velmora_bridge::copy::Copier;
 use velmora_bridge::ingress;
 use velmora_bridge::jobmsg::{Admission, FormatCount, JobTenant, REFUSED_RETRY_DELAY_SECS};
 use velmora_bridge::keepalive;
+use velmora_bridge::unit_consumer::Delivery;
 use velmora_bridge::{
     BridgeError, Job, JobOutcome, OutboxStage, RespBody, S3Response, UnixMs, JOB_VERSION,
 };
@@ -284,6 +285,18 @@ async fn queue(batch: MessageBatch<serde_json::Value>, env: Env, _ctx: Context) 
         // for each arm: run, drop, or hand back.
         let (scope, job, tenant) = match admission {
             Admission::Run { scope, job, tenant } => (scope, job, tenant),
+            Admission::Unit { job, tenant } => {
+                match run_unit_job(&bridge, job, &tenant).await {
+                    Delivery::Ack => msg.ack(),
+                    Delivery::Retry { delay_secs } => msg.retry_with_options(
+                        &QueueRetryOptionsBuilder::new()
+                            .with_delay_seconds(delay_secs)
+                            .build(),
+                    ),
+                    Delivery::HandBack => msg.retry(),
+                }
+                continue;
+            }
             Admission::Malformed => {
                 // A job only names an outbox row; the dispatcher re-drives it.
                 console_error!("malformed job message dropped");
@@ -317,7 +330,20 @@ async fn queue(batch: MessageBatch<serde_json::Value>, env: Env, _ctx: Context) 
                     delay_secs: REFUSED_RETRY_DELAY_SECS,
                 }
             }
-            (_, Some(tenant)) => run_on_unit(&env, &bridge, &scope, tenant, &job).await,
+            (_, Some(tenant)) => {
+                // No plan hint: it names tenant 0's layouts
+                // (`copy::plan_hint`). Each run logs its post trace.
+                match run_on_unit(&env, &bridge, &scope, tenant, &job).await {
+                    Delivery::Ack => msg.ack(),
+                    Delivery::Retry { delay_secs } => msg.retry_with_options(
+                        &QueueRetryOptionsBuilder::new()
+                            .with_delay_seconds(delay_secs)
+                            .build(),
+                    ),
+                    Delivery::HandBack => msg.retry(),
+                }
+                continue;
+            }
             // Never through `run_job`, which reads the catalogue. A job
             // of another version is dropped: the next pass does the work.
             (Job::RecoveryCopy { v, pass, cursor }, None) => {
@@ -377,7 +403,7 @@ async fn run_in_table(
 }
 
 /// A post job, or a wake that is due and runs its post stage too.
-fn is_post(job: &Job) -> bool {
+pub(crate) fn is_post(job: &Job) -> bool {
     matches!(
         job,
         Job::Extent {
@@ -391,53 +417,91 @@ fn is_post(job: &Job) -> bool {
 }
 
 /// A managed tenant's job, on the bridge of its unit (`units`), in the
-/// isolate's job table as every job. The first refusal the unit gave
-/// decides the delivery (`velmora_bridge::unit_consumer`); the log line
-/// carries a fixed code only.
+/// isolate's job table as every job. The unit's refusals decide the
+/// delivery (`velmora_bridge::unit_consumer::deliver`, the AM-50 table);
+/// the log line carries a fixed code only.
 async fn run_on_unit(
     env: &Env,
     bridge: &Rc<env::WorkerBridge>,
     scope: &velmora_bridge::TenantScope,
     tenant: &JobTenant,
     job: &Job,
-) -> JobOutcome {
+) -> Delivery {
     let unit = match units::unit_bridge(env, bridge, tenant) {
         Ok(unit) => Rc::new(unit),
         Err(class) => {
             console_error!("alert: unit job not run ({class}): to the dead-letter queue");
-            return JobOutcome::Retry {
+            return Delivery::Retry {
                 delay_secs: REFUSED_RETRY_DELAY_SECS,
             };
         }
     };
-    let now = velmora_bridge::ports::Clock::now(&bridge.clock);
-    let (u, j, scope) = (Rc::clone(&unit), job.clone(), scope.clone());
-    let outcome = match jobs::run(
-        now,
-        is_post(job),
-        async move { u.run_job(&scope, &j).await },
-    )
-    .await
-    {
-        Some(outcome) => outcome,
-        // `jobs::run` has logged it.
-        None => JobOutcome::Retry {
-            delay_secs: velmora_bridge::jobs::INFRA_RETRY_SECS,
-        },
+    let name = unit.catalog.name().clone();
+    let seqs = unit.catalog.seqs();
+    let run = units::OnUnit {
+        bridge: Rc::clone(&unit),
+        started: velmora_bridge::ports::Clock::now(&bridge.clock),
+        scope,
+        job,
     };
-    let (outcome, after) = velmora_bridge::unit_consumer::delivery(outcome, unit.catalog.refusal());
-    match after {
-        Some(after) if after.alert => console_error!(
-            "alert: the unit refused the job ({}): to the dead-letter queue",
-            after.code
-        ),
-        Some(after) => console_log!(
-            "the unit refused the job ({}): acknowledged; its outbox row stays for the unit's dispatcher",
-            after.code
-        ),
-        None => {}
+    let (delivery, lines) = velmora_bridge::unit_consumer::deliver(
+        bridge.cfg.maintenance,
+        &name,
+        seqs,
+        &run,
+        &units::client(),
+        &units::heads(),
+    )
+    .await;
+    log_unit_lines(&lines);
+    delivery
+}
+
+/// A unit job (`renew`, `stamp_raise`) of a managed tenant: through the
+/// unit client, never through `run_job`.
+async fn run_unit_job(
+    bridge: &env::WorkerBridge,
+    job: velmora_bridge::jobmsg::UnitJob,
+    tenant: &JobTenant,
+) -> Delivery {
+    let name = match (
+        velmora_bridge::unit::TenantId::parse(tenant.tenant()),
+        tenant.unit(),
+    ) {
+        (Some(id), Some(unit)) => velmora_bridge::unit::UnitName::new(id, unit),
+        // The reader admits a unit job only with both.
+        _ => {
+            console_error!("alert: unit job names no unit: to the dead-letter queue");
+            return Delivery::Retry {
+                delay_secs: REFUSED_RETRY_DELAY_SECS,
+            };
+        }
+    };
+    let seqs = velmora_bridge::unit::Seqs {
+        state_seq: tenant.state_seq(),
+        keys_seq: tenant.keys_seq(),
+    };
+    let (delivery, lines) = velmora_bridge::unit_consumer::deliver_unit_job(
+        bridge.cfg.maintenance,
+        job,
+        &name,
+        seqs,
+        &units::client(),
+        &units::heads(),
+    )
+    .await;
+    log_unit_lines(&lines);
+    delivery
+}
+
+/// The consumer's lines about a managed tenant's message: fixed codes.
+fn log_unit_lines(lines: &[velmora_bridge::unit_consumer::Line]) {
+    for line in lines {
+        match line.alert {
+            true => console_error!("alert: unit job ({})", line.code),
+            false => console_log!("unit job ({})", line.code),
+        }
     }
-    outcome
 }
 
 /// Drops the jobs of invocations that are gone, and says when the byte
@@ -559,7 +623,7 @@ async fn recovery_copy(
 
 /// One line per post job: its outcome and phase timings, milliseconds
 /// and counts only (see `velmora_bridge::trace`).
-fn log_post_trace(job: &Job, outcome: &JobOutcome) {
+pub(crate) fn log_post_trace(job: &Job, outcome: &JobOutcome) {
     let Job::Extent {
         extent,
         stage: OutboxStage::Post,

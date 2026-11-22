@@ -503,7 +503,9 @@ fn the_catalogue_id_is_read_in_one_place() {
 }
 
 /// The directory is a port and one adapter, and nothing asks it yet: no
-/// request and no job is routed by it.
+/// request and no job is routed by it. The rest of the `directory` module
+/// (the tenant chain, its records) is read by the unit client and the
+/// consumer; only the port's own path is probed here.
 #[test]
 fn the_directory_is_asked_by_nothing() {
     let all = all();

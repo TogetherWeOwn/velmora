@@ -453,10 +453,10 @@ provider health are not a unit's: they stay in the shared database, which
 every tenant's jobs use. The request path does not use `TenantCatalog`.
 A refusal (`sync_needed`, stale, a job with no numbers, closed, unborn)
 comes back as a typed error, and the first one is kept
-(`TenantCatalog::refusal`). With `stale`, `TenantCatalog::stale_seqs`
-holds the unit's numbers, and `latest_seqs` holds the numbers of the
-unit's latest `ok` or `stale` answer in the run, for a follow-up job
-(never below the job's own).
+(`TenantCatalog::refusal`, a `UnitRefusal`); `UnitRefusal::Stale(seqs)`
+carries the unit's numbers. `TenantCatalog::latest` (`LatestSeqs`) holds
+the numbers of the unit's latest `ok` or `stale` answer in the run, for a
+follow-up job (never below the job's own).
 
 **What the consumer does with a unit's answer to a job call (AM-50):**
 
@@ -493,17 +493,43 @@ object's `fetch` with the message's numbers; the configuration from
 `BridgeConfig::for_unit`, which takes the unit's name and sets the stamp
 id `<tenant>.<unit>` (`jobcall::stamp_id`) and the tenant's record layout
 `m/x/<t>/` (never the flat layout); a sink whose messages name the same
-unit and numbers, always in format 2 (it refuses to send a `v` 1 message,
-which would be read as tenant 0's); and the isolate's one byte budget and
-permit gate. Garbage collection names the blob it deletes from the row's
-extent through the job's scope, not from the catalogue's delete list. The
-first refusal decides the delivery (`unit_consumer`): a stale job or a
-closed unit is acknowledged (its outbox row stays, for the unit's alarm
-dispatcher of W2 to send again; that dispatcher is not built yet, so the
-class stays unbound until it is); sync
-needed, unborn and any other refusal go to the dead-letter queue with an
-alert. Unit jobs (`renew`, `stamp_raise`) are not run yet
-(`unit_job_not_run`).
+unit, always in format 2 (it refuses to send a `v` 1 message, which
+would be read as tenant 0's), with the numbers of the unit's latest
+answer in the run, never lower than the message's; and the isolate's one
+byte budget and permit gate. Garbage collection names the blob it deletes
+from the row's extent through the job's scope, not from the catalogue's
+delete list. Job calls carry `listed = false`.
+
+The unit's refusals decide the delivery (`unit_consumer`, ADR §2.4 rule 5
+as amended by AM-50): `Stale{seqs}` runs the job once more with the
+unit's numbers, and a second `Stale` is acknowledged; `Refused{stale_job}`
+(no numbers) goes to the dead-letter queue and pages; `Closed` is
+acknowledged (the row stays in the unit's outbox); `renew_needed` and
+`SyncNeeded` go through the unit client (renew, or read both chains,
+apply the keys and `sync`), then the job runs once more, and a failure
+hands the message back with the queue's `retry_delay`; `Unborn` reads the
+tenant's verified head (listed: dead-letter queue and a "catalogue lost"
+page; not listed: acknowledged; a head that cannot be read: handed back);
+`AccountProblem` while the tenant is shredding is acknowledged with no
+page; anything else goes to the dead-letter queue and pages. Each fix
+(the unit's numbers, a renewal, a `sync`) runs at most once per delivery,
+with numbers never below the message's, and only after the outbox lease
+the last run claimed is given back (`TenantCatalog::give_back`; if it
+cannot be, the message is handed back). A run the job table gave up is
+not run once more. A hand-back whose lease could not be given back
+leaves the row leased: a redelivery within the lease (600 s) is
+acknowledged, and the unit's dispatcher sends the row again after it, so
+the work waits at most the lease and one dispatcher period. The unit client's other outcomes take the same rows: closed or a
+lift pending is acknowledged, unborn reads the head, a unit the head no
+longer lists is acknowledged, and every page it returns is logged as an
+alert. The unit jobs `renew` and
+`stamp_raise` run through the unit client. A unit's job config keeps
+tenant 0's `MAINTENANCE`: under `restore` no unit job makes a unit call,
+and each is acknowledged with no page. The consumer calls L2's `UnitClient`
+through `unit_consumer::ConsumerClient`; until its bodies and a Worker
+head reader are wired, the Worker uses `NoClient` and `NoHeads`, so the
+arms that need them hand the message back, and `UNIT` stays unbound until
+the build that has both and the unit's alarm dispatcher.
 
 ## Bookmarks
 

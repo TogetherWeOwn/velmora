@@ -438,6 +438,15 @@ fn a_units_job_config_takes_its_stamp_id_from_the_units_name() {
     };
     assert_eq!(format!("{same:?}"), format!("{base:?}"));
     assert!(base.for_unit(&UnitName::new(TenantId::zero(), 0)).is_err());
+    // Tenant 0's maintenance holds for its units too (AM-50).
+    let restoring = BridgeConfig {
+        maintenance: velmora_bridge::config::Maintenance::Restore,
+        ..base.clone()
+    };
+    assert_eq!(
+        restoring.for_unit(&name).unwrap().maintenance,
+        velmora_bridge::config::Maintenance::Restore
+    );
     for id in ["t_00000000000000a7.3", "main.0"] {
         let mut v = vars.clone();
         v.insert("CATALOGUE_ID".to_string(), id.to_string());
