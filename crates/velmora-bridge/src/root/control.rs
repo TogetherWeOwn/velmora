@@ -80,41 +80,41 @@ impl<'a, P: UnitPorts, R: FillRandom> Root<'a, P, R> {
 
 // Keep the unbound target explicit: a missing row in a bound directory is
 // still a refusal. Only the lack of a binding acknowledges everything.
-enum RootDirectoryKeys<D> {
-    Bound(D),
+enum RootDirectoryKeys<'a, D> {
+    Bound { dir: D, tenant: &'a TenantId },
     Unbound(UnboundDirectory),
 }
 
 impl<Q: Sql, S: RecordStore, K: Kek, T: TkRing> KeyTarget
-    for RootDirectoryKeys<DirectoryKeys<'_, Q, S, K, T>>
+    for RootDirectoryKeys<'_, DirectoryKeys<'_, Q, S, K, T>>
 {
     fn label(&self) -> &str {
         match self {
-            Self::Bound(dir) => dir.label(),
+            Self::Bound { dir, .. } => dir.label(),
             Self::Unbound(dir) => dir.label(),
         }
     }
 
     async fn keys_seq(&self) -> Result<u64> {
         match self {
-            Self::Bound(dir) => dir.keys_seq().await,
+            Self::Bound { dir, .. } => dir.keys_seq().await,
             Self::Unbound(dir) => dir.keys_seq().await,
         }
     }
 
     async fn closed(&self) -> Result<Vec<String>> {
         match self {
-            Self::Bound(dir) => dir.closed().await,
+            Self::Bound { dir, .. } => dir.closed().await,
             Self::Unbound(dir) => dir.closed().await,
         }
     }
 
     async fn apply(&self, from_seq: u64, entries: &[ApplyEntry]) -> Result<Applied> {
         match self {
-            Self::Bound(dir) => {
+            Self::Bound { dir, tenant } => {
                 let result = dir.apply(from_seq, entries).await;
                 for code in dir.take_pages() {
-                    crate::trace::alert(|| format!("key finisher ({code})"));
+                    crate::trace::alert(|| format!("key finisher ({code}) tenant={tenant}"));
                 }
                 result
             }
@@ -132,13 +132,10 @@ impl<P: RootPorts, R: FillRandom> Root<'_, P, R> {
         ring: &'r T,
     ) -> impl KeyTarget + 'r {
         match self.directory() {
-            Some(dir) => RootDirectoryKeys::Bound(DirectoryKeys::new(
-                dir,
+            Some(dir) => RootDirectoryKeys::Bound {
+                dir: DirectoryKeys::new(dir, tenant, self.records(), self.kek(), ring),
                 tenant,
-                self.records(),
-                self.kek(),
-                ring,
-            )),
+            },
             None => RootDirectoryKeys::Unbound(UnboundDirectory),
         }
     }

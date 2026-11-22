@@ -154,9 +154,9 @@ pub struct TenantFinish {
 }
 
 impl TenantFinish {
-    fn report_pages(&self) {
+    fn report_pages(&self, tenant: &TenantId) {
         for code in &self.pages {
-            crate::trace::alert(|| format!("tenant finisher ({code})"));
+            crate::trace::alert(|| format!("tenant finisher ({code}) tenant={tenant}"));
         }
     }
 }
@@ -215,7 +215,7 @@ where
         Err(e) => {
             // The caller gets no report on an error; preserve any page
             // already collected while reading the directory.
-            run.report_pages();
+            run.report_pages(tenant);
             return Err(chain_error(e));
         }
     };
@@ -580,7 +580,7 @@ where
             self.now,
         )
         .await?;
-        run.report_pages();
+        run.report_pages(&chain.tenant);
         Ok(run.head)
     }
 }

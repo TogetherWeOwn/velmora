@@ -731,8 +731,28 @@ pub(crate) fn log_post_trace(job: &Job, outcome: &JobOutcome) {
     }
 }
 
+#[cfg(test)]
+mod scheduled_tests {
+    #[test]
+    fn scheduled_installs_alert_sink_before_dispatch() {
+        // The event adapter needs a Workers runtime. Check its entry-point
+        // wiring here; the bridge tests exercise delivery to an installed sink.
+        let (_, handler) = include_str!("lib.rs")
+            .split_once(concat!("#[event(", "scheduled)]"))
+            .expect("scheduled event handler");
+        let (_, body) = handler.split_once('{').expect("scheduled handler body");
+        assert!(
+            body.trim_start().starts_with(
+                r#"velmora_bridge::trace::log_alerts(|line| console_error!("alert: {line}"));"#
+            ),
+            "a fresh scheduled isolate must install the alert sink before doing any work"
+        );
+    }
+}
+
 #[event(scheduled)]
 async fn scheduled(event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
+    velmora_bridge::trace::log_alerts(|line| console_error!("alert: {line}"));
     let bridge = match env::bridge(&env) {
         Ok(bridge) => bridge,
         Err(class) => {

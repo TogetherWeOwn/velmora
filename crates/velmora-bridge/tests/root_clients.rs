@@ -972,8 +972,14 @@ fn bound_directory_key_target_writes_routes_and_drains_refusal_pages() {
         // No additional page from a later successful no-op.
         target.apply(1, &[]).await.unwrap();
     });
-    CONTROL_ALERTS
-        .with(|lines| assert_eq!(*lines.borrow(), ["key finisher (directory_route_conflict)"]));
+    CONTROL_ALERTS.with(|lines| {
+        assert_eq!(
+            *lines.borrow(),
+            [format!(
+                "key finisher (directory_route_conflict) tenant={tenant}"
+            )]
+        );
+    });
 }
 
 #[test]
@@ -1051,7 +1057,12 @@ fn tenant_finish_pages_reach_the_alert_sink() {
     let reads = p.objects.calls.borrow().len();
     assert!(block_on(units.held(&tenant, 0)).is_err());
     assert_eq!(p.objects.calls.borrow().len(), reads + 1);
-    CONTROL_ALERTS.with(|lines| assert_eq!(*lines.borrow(), ["tenant finisher (unit_unborn)"]));
+    CONTROL_ALERTS.with(|lines| {
+        assert_eq!(
+            *lines.borrow(),
+            [format!("tenant finisher (unit_unborn) tenant={tenant}")]
+        );
+    });
 }
 
 #[test]
@@ -1091,8 +1102,10 @@ fn tenant_finish_pages_a_damaged_row_even_when_the_head_read_fails() {
     CONTROL_ALERTS.with(|lines| {
         assert_eq!(
             *lines.borrow(),
-            ["tenant finisher (directory_row_unreadable)"]
-        )
+            [format!(
+                "tenant finisher (directory_row_unreadable) tenant={tenant}"
+            )]
+        );
     });
 }
 
