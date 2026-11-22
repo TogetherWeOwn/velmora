@@ -1164,6 +1164,25 @@ enum Phase {
     Any,
 }
 
+/// Whether this phase counts the provider for the article, regardless
+/// of cooldown or slots. Retention is an estimate: when no enabled
+/// reader retains the article, every enabled reader may still hold it.
+fn can_answer(
+    provider: &ProviderConfig,
+    article: &ArticleRow,
+    now: UnixMs,
+    readers: &[&ProviderConfig],
+    phase: Phase,
+) -> bool {
+    let retains = |p: &ProviderConfig| p.enabled && p.retains(article.posted_at, now);
+    provider.enabled
+        && match phase {
+            Phase::Retained => retains(provider),
+            Phase::Orphan => !readers.iter().copied().any(retains),
+            Phase::Any => true,
+        }
+}
+
 /// Why a provider gets no (more) work in one cold read of an extent.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Out {
@@ -1192,8 +1211,6 @@ struct Desk<'a> {
     out: Vec<Option<Out>>,
     /// Per provider: it gave no further slot.
     full: Vec<bool>,
-    /// Per provider: it answered for every article it was asked for.
-    asked: Vec<bool>,
     /// Per provider: sessions that broke off in this read.
     breaks: Vec<u32>,
     /// Whether the reader is a drill's ([`ColdReader::drill`]).
@@ -1201,52 +1218,45 @@ struct Desk<'a> {
 }
 
 impl Desk<'_> {
-    /// How a read ends that could not get every article of `rows`
-    /// (`have`): whether a provider that may hold what is lacking could
-    /// not be asked, and why.
+    /// How a read ends that could not get every article of `rows`.
+    /// For each missing article, a counted provider must have answered
+    /// missing for that article, not just answered some other request.
     fn short(
         &self,
-        pool: &Pool<'_>,
         readers: &[&ProviderConfig],
         rows: &[ArticleRow],
-        have: &[bool],
+        board: &Board,
         now: UnixMs,
-        shunned: &[String],
     ) -> ColdFetch {
-        let drill = self.drill;
-        // A cooling provider that retains a missing article and was
-        // not asked may hold what the others lack: retry later.
-        // (A drill asks a reader whatever its retention.)
-        let lacks = |p: &ProviderConfig| {
-            rows.iter()
-                .zip(have)
-                .any(|(a, have)| !have && (drill || p.retains(a.posted_at, now)))
-        };
-        let was_asked = |p: &ProviderConfig| {
-            self.order
-                .iter()
-                .position(|o| o.id == p.id)
-                .is_some_and(|i| self.asked[i] && self.out[i].is_none())
-        };
-        let waiting: Vec<&ProviderConfig> = readers
-            .iter()
-            .copied()
-            .filter(|p| !was_asked(p) && lacks(p))
-            .collect();
-        let broken = self.out.contains(&Some(Out::Broken));
-        let busy = self.out.contains(&Some(Out::Busy));
-        // A provider that was not asked because it cools, or because
-        // it refused this drill's login, may hold what the others
-        // lack.
-        let unasked = pool.cooling_until(&waiting).is_some()
-            || waiting.iter().any(|p| shunned.contains(&p.id));
-        // A drill waits for a slot of a provider that is full
-        // (`Busy`, as long as a cold read may wait) before it counts
-        // a try against a provider it does not ask: the tries would
-        // be spent on that one while the provider that has the
-        // articles frees a slot.
-        let interrupted = broken || (unasked && !(drill && busy));
-        if interrupted {
+        let mut busy = false;
+        let mut unasked = false;
+        for &provider in readers {
+            let index = self.order.iter().position(|p| p.id == provider.id);
+            for (a, row) in rows.iter().enumerate() {
+                if board.have[a] || index.is_some_and(|i| !board.open(a, i)) {
+                    continue;
+                }
+                let can = |phase| can_answer(provider, row, now, readers, phase);
+                let retained = can(Phase::Retained);
+                let orphan = !retained && can(Phase::Orphan);
+                if !(retained || orphan || self.drill && can(Phase::Any)) {
+                    continue;
+                }
+                if orphan {
+                    // A counted provider has not answered for the orphan.
+                    return ColdFetch::Interrupted;
+                }
+                match index.and_then(|i| self.out[i]) {
+                    Some(Out::Busy) => busy = true,
+                    Some(Out::Broken) => return ColdFetch::Interrupted,
+                    // A cooling or shunned provider is not in the order.
+                    None => unasked = true,
+                }
+            }
+        }
+        // A drill waits for a slot before spending a try on a provider
+        // it could not ask, so a slot that frees up can still be used.
+        if unasked && !(self.drill && busy) {
             ColdFetch::Interrupted
         } else if busy {
             ColdFetch::Busy
@@ -1688,18 +1698,10 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ColdReader<'a, C, N, T> {
         board: &core::cell::RefCell<Board>,
     ) -> Result<()> {
         let drill = self.drill;
-        // An article past every reader's stated retention may still be
-        // there: a second phase asks for those before giving up.
-        let orphan = |a: &ArticleRow| {
-            !readers
-                .iter()
-                .any(|p| p.enabled && p.retains(a.posted_at, now))
-        };
         let Desk {
             order,
             out,
             full,
-            asked,
             breaks,
             ..
         } = desk;
@@ -1718,12 +1720,7 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ColdReader<'a, C, N, T> {
         };
         'phases: for &phase in phases {
             let wanted = |provider: usize, article: usize| {
-                chosen[article]
-                    && match phase {
-                        Phase::Retained => order[provider].retains(plan[article].posted_at, now),
-                        Phase::Orphan => orphan(&plan[article]),
-                        Phase::Any => true,
-                    }
+                chosen[article] && can_answer(order[provider], &plan[article], now, readers, phase)
             };
             loop {
                 let work: Vec<usize> = (0..order.len())
@@ -1882,11 +1879,6 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ColdReader<'a, C, N, T> {
                     failure = Some(BridgeError::Sql(CATALOGUE_FAILED.into()));
                     break 'phases;
                 }
-                for i in 0..order.len() {
-                    asked[i] |= out[i].is_none()
-                        && (self.held(order[i]) > 0
-                            || slow.iter().any(|s| s.provider.id == order[i].id));
-                }
                 // A connection far slower than the others holds up every
                 // extent for the one article it reads. It is ended, and
                 // the next pass opens another in its place while the
@@ -1940,7 +1932,6 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ColdReader<'a, C, N, T> {
         lost: Lost<'_>,
         cipher: &mut [u8],
         desk: &mut Desk<'a>,
-        pool: &Pool<'_>,
         readers: &[&'a ProviderConfig],
     ) -> Result<Option<ColdFetch>> {
         let Lost { stored, have, end } = lost;
@@ -2014,22 +2005,19 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ColdReader<'a, C, N, T> {
             self.read_rows(desk, readers, now, &parity.articles, &chosen, &board)
                 .await?;
         }
-        let Board {
-            cipher: shards,
-            have: got,
-            ..
-        } = board.into_inner();
-        let usable: Vec<usize> = (0..m).filter(|&slot| got[slot]).collect();
+        let board = board.into_inner();
+        let usable: Vec<usize> = (0..m).filter(|&slot| board.have[slot]).collect();
         if usable.len() < t {
             if !sure {
                 return Ok(Some(end.clone()));
             }
             // A provider that could not be asked may have the rest.
-            return match desk.short(pool, readers, &parity.articles, &got, now, &self.shunned) {
+            return match desk.short(readers, &parity.articles, &board, now) {
                 ColdFetch::Unavailable => unrecoverable(&self.stats),
                 end => Ok(Some(end)),
             };
         }
+        let shards = board.cipher;
         let rebuilt = {
             // Every shard passed in was compared with its SHA-256 when it
             // was read: the present data articles with their plan rows,
@@ -2087,13 +2075,13 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ColdReader<'a, C, N, T> {
     /// to the other sockets, and the broken session reconnects (through
     /// the next proxy, if the provider has several) while its reconnects
     /// last ([`MAX_READ_RECONNECTS`]). A provider is not asked for an
-    /// article older than its retention, and a provider in a cooldown is
-    /// not asked at all. An article past every reader's stated retention
-    /// is asked of every reader before the read gives up.
+    /// article older than its retention unless it is past every reader's
+    /// retention. Then every reader counts, including those that cannot
+    /// be asked because they are cooling.
     ///
-    /// Articles that every provider was asked for and none had intact
-    /// are rebuilt from the extent's parity articles, when it has any
-    /// ([`Self::rebuild`]); an extent that lost none reads no parity.
+    /// Articles that were asked for but not found intact can be rebuilt
+    /// from the extent's parity articles, when it has any ([`Self::rebuild`]);
+    /// an extent that lost none reads no parity.
     pub(crate) async fn fetch(&mut self, extent: &ExtentRow) -> Result<ColdFetch> {
         // The plan and the parity addendum beside it come with one
         // read of the catalogue. The addendum is looked at only when an
@@ -2152,7 +2140,6 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ColdReader<'a, C, N, T> {
             drill,
             out: vec![None; order.len()],
             full: vec![false; order.len()],
-            asked: vec![false; order.len()],
             breaks: vec![0; order.len()],
             order,
         };
@@ -2161,41 +2148,34 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ColdReader<'a, C, N, T> {
         let all = vec![true; plan.len()];
         // On the heap too: a body nests many futures above this one.
         Box::pin(self.read_rows(&mut desk, &readers, now, plan, &all, &board)).await?;
-        let Board {
-            mut cipher,
-            have,
-            asks,
-            providers,
-            ..
-        } = board.into_inner();
-        let lost = have.iter().filter(|have| !**have).count();
+        let mut board = board.into_inner();
+        let lost = board.have.iter().filter(|have| !**have).count();
         if lost > 0 {
-            let end = desk.short(&pool, &readers, plan, &have, now, &self.shunned);
+            let end = desk.short(&readers, plan, &board, now);
             // The extent's parity, if it has any, is read only for
             // articles that are lost where they were asked for: each by
             // a provider that said it has it not, or sent other bytes.
             // An article nobody answered for (no reader, or none that
             // could be asked) is not known to be lost.
-            let answered = |article: usize| {
-                let from = article * providers;
-                asks[from..from + providers].iter().any(|asks| *asks > 0)
-            };
-            if !(0..plan.len()).all(|a| have[a] || answered(a)) {
+            let answered =
+                |article: usize| (0..board.providers).any(|i| board.asks(article, i) > 0);
+            if !(0..plan.len()).all(|a| board.have[a] || answered(a)) {
                 return Ok(end);
             }
             let lost = Lost {
                 stored: &stored,
-                have: &have,
+                have: &board.have,
                 end: &end,
             };
             // On the heap: the rebuild is rare, and what it holds across
             // its awaits is not carried by every read that never needs it.
-            let rebuild = self.rebuild(extent, lost, &mut cipher, &mut desk, &pool, &readers);
+            let rebuild = self.rebuild(extent, lost, &mut board.cipher, &mut desk, &readers);
             let rebuilt = Box::pin(rebuild).await?;
             if let Some(end) = rebuilt {
                 return Ok(end);
             }
         }
+        let cipher = board.cipher;
         if sha256(&cipher) != extent.cipher_sha256 {
             return Ok(ColdFetch::Unavailable);
         }

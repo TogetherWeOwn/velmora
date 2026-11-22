@@ -445,6 +445,75 @@ async fn a_loss_beyond_parity_is_not_final_while_a_provider_is_cooling() {
     assert_eq!((stats.rebuilt, stats.unrecoverable), (0, 0));
 }
 
+#[tokio::test]
+async fn review_orphan_losses_are_not_final_while_a_provider_is_cooling() {
+    let mut st = posted(14, THREE, 2).await;
+    for provider in &mut st.rig.bridge.cfg.providers {
+        provider.retention_days = Some(1);
+    }
+    st.rig.bridge.clock.advance_secs(2 * 86_400);
+    for idx in [0, 2] {
+        st.rig.servers[0].hide(&st.data[idx].message_id).await;
+    }
+    st.cool(1).await;
+
+    let (read, stats) = st.read().await;
+    assert_eq!(read, ColdFetch::Interrupted);
+    assert_eq!(stats.unrecoverable, 0);
+
+    st.rig.bridge.clock.advance_secs(86_400);
+    for idx in [0, 2] {
+        st.rig.servers[1].hide(&st.data[idx].message_id).await;
+    }
+    let (read, stats) = st.read().await;
+    assert_eq!(read, ColdFetch::Unrecoverable);
+    assert_eq!(stats.unrecoverable, 1);
+}
+
+#[tokio::test]
+async fn review_orphan_losses_are_interrupted_while_a_provider_is_busy() {
+    let mut st = posted(16, THREE, 2).await;
+    for provider in &mut st.rig.bridge.cfg.providers {
+        provider.retention_days = Some(1);
+    }
+    st.rig.bridge.clock.advance_secs(2 * 86_400);
+    for idx in [0, 2] {
+        st.rig.servers[0].hide(&st.data[idx].message_id).await;
+    }
+    st.occupy(1).await;
+
+    let (read, stats) = st.read().await;
+    assert_eq!(read, ColdFetch::Interrupted);
+    assert_eq!(stats.unrecoverable, 0);
+}
+
+#[tokio::test]
+async fn review_orphan_parity_loss_is_not_final_while_a_provider_is_cooling() {
+    let mut st = posted(15, THREE, 2).await;
+    st.rig.bridge.cfg.providers[0].retention_days = Some(3);
+    st.rig.bridge.cfg.providers[1].retention_days = Some(1);
+    st.rig.bridge.clock.advance_secs(2 * 86_400);
+    // The parity rows inherit the first data row's stamp. Age only that
+    // row (which both readers still have), so the missing data row is
+    // within p0's retention and only the missing parity needs the orphan pass.
+    st.rig.bridge.catalog.edit(&st.s.extent, |e| {
+        e.articles[0].posted_at = Some(UnixMs(T0.0 - 2 * 86_400_000));
+    });
+    st.rig.servers[0].hide(&st.data[1].message_id).await;
+    st.rig.servers[0].hide(&st.parity[0].message_id).await;
+    st.cool(1).await;
+
+    let (read, stats) = st.read().await;
+    assert_eq!(read, ColdFetch::Interrupted);
+    assert_eq!(stats.unrecoverable, 0);
+
+    st.rig.bridge.clock.advance_secs(3_600);
+    st.rig.servers[1].hide(&st.parity[0].message_id).await;
+    let (read, stats) = st.read().await;
+    assert_eq!(read, ColdFetch::Unrecoverable);
+    assert_eq!(stats.unrecoverable, 1);
+}
+
 /// With both providers answering, the same loss on both is final.
 #[tokio::test]
 async fn a_loss_beyond_parity_on_every_provider_is_unrecoverable() {
