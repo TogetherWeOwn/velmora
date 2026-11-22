@@ -69,6 +69,7 @@ fn sync(
         u,
         UnitOp::Sync {
             head: SyncHead {
+                from_seq: u.head().unwrap().seqs.state_seq,
                 seqs: Seqs {
                     state_seq,
                     keys_seq,

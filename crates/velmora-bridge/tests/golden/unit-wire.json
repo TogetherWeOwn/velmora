@@ -240,6 +240,7 @@
       "op": {
         "head": {
           "buckets": [],
+          "from_seq": 6,
           "lift": {
             "acknowledged": {
               "damaged": {

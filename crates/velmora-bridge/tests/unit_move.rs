@@ -81,14 +81,15 @@ fn sync_to(
     restoring: Option<u64>,
     lift: Option<LiftProof>,
 ) -> UnitAnswer {
-    let keys_seq = u.head().unwrap().seqs.keys_seq;
+    let current = u.head().unwrap().seqs;
     worker(
         u,
         UnitOp::Sync {
             head: SyncHead {
+                from_seq: current.state_seq,
                 seqs: Seqs {
                     state_seq,
-                    keys_seq,
+                    keys_seq: current.keys_seq,
                 },
                 tenant_state: TenantState::Active,
                 tenant_mode: None,

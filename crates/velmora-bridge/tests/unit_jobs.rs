@@ -168,6 +168,7 @@ fn sync(unit: &Unit<Db>, state_seq: u64, restoring: Option<u64>, now: UnixMs) {
         unit,
         UnitOp::Sync {
             head: SyncHead {
+                from_seq: unit.head().unwrap().seqs.state_seq,
                 seqs: Seqs {
                     state_seq,
                     keys_seq: 0,
@@ -878,6 +879,7 @@ async fn jobs_run_for_a_suspended_tenant_and_not_for_a_shred() {
             &fx.unit,
             UnitOp::Sync {
                 head: SyncHead {
+                    from_seq: fx.unit.head().unwrap().seqs.state_seq,
                     seqs: Seqs {
                         state_seq: 3,
                         keys_seq: 0,

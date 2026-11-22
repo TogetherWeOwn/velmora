@@ -73,14 +73,15 @@ fn sync(
     placed: &[&str],
     now: UnixMs,
 ) -> UnitAnswer {
-    let keys_seq = u.head().unwrap().seqs.keys_seq;
+    let current = u.head().unwrap().seqs;
     worker(
         u,
         UnitOp::Sync {
             head: SyncHead {
+                from_seq: current.state_seq,
                 seqs: Seqs {
                     state_seq,
-                    keys_seq,
+                    keys_seq: current.keys_seq,
                 },
                 tenant_state: TenantState::Active,
                 tenant_mode: None,
@@ -1494,12 +1495,42 @@ fn renewal_removes_a_listed_principals_key_grants() {
     assert_eq!(effective_grants_for(&u, K), 1);
     assert_eq!(store::revoked(u.sql()).unwrap(), Some(0));
 
+    let grant = || {
+        u.handle(
+            &call(
+                CallKind::Request,
+                Some(u.head().unwrap().seqs),
+                true,
+                request_call(RequestCall::grant {
+                    akid: K.into(),
+                    bucket: BucketId::new(B1),
+                }),
+            ),
+            NOW,
+        )
+    };
+    assert!(matches!(renew(&u, NOW), UnitAnswer::Ok { .. }));
+    assert_eq!(
+        grant(),
+        UnitAnswer::Ok {
+            seqs: u.head().unwrap().seqs,
+            body: json!(velmora_bridge::Perm::Ro),
+        }
+    );
+
     let a = worker(&u, renew_op(NOW, proven(&u, 1), &[LISTED_P]), NOW);
     assert!(matches!(a, UnitAnswer::Ok { .. }), "{a:?}");
     assert_eq!(status_of(&u, LISTED_P), "revoked");
     assert_eq!(status_of(&u, K), "active");
     assert_eq!(effective_grants_for(&u, K), 0);
     assert_eq!(store::revoked(u.sql()).unwrap(), Some(1));
+    assert_eq!(
+        grant(),
+        UnitAnswer::Ok {
+            seqs: u.head().unwrap().seqs,
+            body: json!(null),
+        }
+    );
 }
 
 /// A listed principal that the unit does not yet hold stays revoked when

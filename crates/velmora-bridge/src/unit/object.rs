@@ -1821,6 +1821,11 @@ impl<S: UnitSql> Unit<S> {
         if next.seqs.keys_seq > head.seqs.keys_seq {
             return Ok(refused(Refused::KeysNotApplied, false));
         }
+        // The bucket part was built from `from_seq`: from any other base
+        // it would skip or repeat changes. The Worker reads again.
+        if next.from_seq != head.seqs.state_seq {
+            return Ok(refused(Refused::StaleSync, false));
+        }
         let mode_ok = (next.tenant_state == TenantState::Suspended) == next.tenant_mode.is_some();
         if !mode_ok {
             return Err(BridgeError::Invalid("sync: mode without suspension"));
@@ -1902,7 +1907,12 @@ impl<S: UnitSql> Unit<S> {
                     return Err(BridgeError::Invalid(ROLLBACK));
                 }
             }
-            buckets::sweep_closing(sql, &next.placed)?;
+            // Not while an entry is set at either end: the 30-day copy
+            // keeps its rows, a closing one too (AM-57 (3)); the gate's
+            // last call sweeps after the lift.
+            if !restoring {
+                buckets::sweep_closing(sql, &next.placed)?;
+            }
             if next.restoring_since.is_none() && !buckets::placement_check(sql, &next.placed)? {
                 why_buckets = Some(BucketRefusal::PlacementsOff);
                 return Err(BridgeError::Invalid(ROLLBACK));

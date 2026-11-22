@@ -53,12 +53,9 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
-use std::future::Future;
-use std::pin::Pin;
 use std::rc::Rc;
-use std::task::{Context, Poll, Waker};
 
-use futures_util::future::{select, Either, LocalBoxFuture};
+use futures_util::future::LocalBoxFuture;
 use serde_json::Value;
 
 use crate::crypto::scheme2::TenantId as KeyTenant;
@@ -670,6 +667,7 @@ where
                 tenant_mode,
                 restoring_since,
                 lift: None,
+                from_seq: unit.state_seq,
                 buckets: part.changes,
                 placed: part.placed,
             };
@@ -764,14 +762,26 @@ where
             .await
             .map_err(chain_error)?
             .ok_or(ERR_RECORD_MISSING)?;
-        let mut records = Vec::new();
+        // A step ends at every record that changes this unit's
+        // `restoring` entry, and that record is a step of its own: the
+        // unit judges "restoring" from a step's two ends, so a removal
+        // before the change (an operator's `SetUnits`) must not be judged
+        // under it, nor one after a lift.
+        let entry = |d: &TenantDoor| d.restoring_entry(unit).map(|r| r.since_seq);
+        let mut records: Vec<ReadRecord> = Vec::new();
         for seq in from + 1..=to {
-            records.push(
-                read(seq)
-                    .await
-                    .map_err(chain_error)?
-                    .ok_or(ERR_RECORD_MISSING)?,
-            );
+            let r = read(seq)
+                .await
+                .map_err(chain_error)?
+                .ok_or(ERR_RECORD_MISSING)?;
+            let before = records.last().map_or(&base.door, |p| &p.door);
+            if entry(&r.door) != entry(before) {
+                if records.is_empty() {
+                    records.push(r);
+                }
+                break;
+            }
+            records.push(r);
         }
         let changes = placements::bucket_changes(unit, &base.door, &records)?;
         let door = records.pop().map(|r| r.door).ok_or(ERR_RECORD_MISSING)?;
@@ -924,6 +934,17 @@ where
         Some((renewal, pages))
     }
 
+    /// A renewal that takes this isolate's one slot for the unit, unspaced
+    /// (a queued job's: the alarm spaces those), so the requests of the
+    /// isolate wait for it instead of starting their own. `None`: one
+    /// runs already.
+    async fn renew_single(&self, seen: Seqs) -> Option<(Result<Renewal>, Vec<Page>)> {
+        let guard = self.flights.begin(&self.name)?;
+        let (renewal, pages) = self.renew(seen).await;
+        guard.ended(&renewal);
+        Some((renewal, pages))
+    }
+
     /// Whether `reply` asks for a background renewal: some lease, and
     /// less than half of T left (rule 12).
     pub fn renew_due(&self, reply: &UnitReply) -> bool {
@@ -935,9 +956,13 @@ where
     /// it carries (AM-50, AM-51).
     pub async fn run_job(&self, job: UnitJob, seqs: Seqs) -> JobResult {
         match job {
-            UnitJob::Renew { .. } => match self.renew(seqs).await {
-                (Ok(renewal), pages) => renewal_result(renewal, pages),
-                (Err(e), pages) => failed(&e, "renew_failed", pages),
+            // One renewal of a unit per isolate (rule 11, AM-63): a job
+            // that finds one running leaves it to that one (the alarm
+            // sends `renew` again on its backoff if it fails).
+            UnitJob::Renew { .. } => match self.renew_single(seqs).await {
+                None => job_result(Delivery::Ack, "renewing", Vec::new()),
+                Some((Ok(renewal), pages)) => renewal_result(renewal, pages),
+                Some((Err(e), pages)) => failed(&e, "renew_failed", pages),
             },
             UnitJob::StampRaise { .. } => self.raise(seqs).await,
         }
@@ -971,7 +996,11 @@ where
                     return job_result(Delivery::Ack, "rolled_back", pages);
                 }
                 (Err(_), Some(Stop::RenewNeeded)) if attempt == 0 => {
-                    let (renewal, more) = self.renew(seqs).await;
+                    // A renewal of this unit runs in this isolate: raise
+                    // later, after it.
+                    let Some((renewal, more)) = self.renew_single(seqs).await else {
+                        return job_result(Delivery::HandBack, "renewing", pages);
+                    };
                     pages.extend(more);
                     match renewal {
                         Ok(Renewal::Renewed { seqs: now, .. }) => seqs = now,
@@ -1221,6 +1250,8 @@ fn failed(e: &BridgeError, code: &'static str, mut pages: Vec<Page>) -> JobResul
         ERR_PLACEMENTS_OFF,
         ERR_BUCKETS_REFUSED,
         ERR_RECORD_MISSING,
+        placements::ERR_BUCKET_SECRETS,
+        placements::ERR_RECORD_ORDER,
         ERR_STAMP_ANSWER,
         ERR_LEASE_EXPIRED,
     ];
@@ -1579,11 +1610,13 @@ struct Flights {
     failed: BTreeMap<String, (UnixMs, u32)>,
 }
 
-/// How a running renewal ended, for the calls waiting on it.
+/// How a running renewal ended, for the calls waiting on it. Read, not
+/// pushed: a waiter looks at it on its own timer, so it never resumes in
+/// the renewing request's turn (the Workers runtime refuses I/O on behalf
+/// of another request).
 #[derive(Debug, Default)]
 struct Notice {
     ended: RefCell<Option<Waited>>,
-    wakers: RefCell<Vec<Waker>>,
 }
 
 /// What a waiter learns: whether the renewal renewed, and what it came
@@ -1597,23 +1630,10 @@ pub struct Waited {
 impl Notice {
     fn end(&self, waited: Waited) {
         *self.ended.borrow_mut() = Some(waited);
-        for w in self.wakers.borrow_mut().drain(..) {
-            w.wake();
-        }
     }
-}
 
-/// The end of one running renewal.
-struct Waiting(Rc<Notice>);
-
-impl Future for Waiting {
-    type Output = Waited;
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Waited> {
-        if let Some(w) = self.0.ended.borrow().clone() {
-            return Poll::Ready(w);
-        }
-        self.0.wakers.borrow_mut().push(cx.waker().clone());
-        Poll::Pending
+    fn ended(&self) -> Option<Waited> {
+        self.ended.borrow().clone()
     }
 }
 
@@ -1637,6 +1657,9 @@ const MAX_REMEMBERED: usize = 4096;
 /// The longest a call waits for its isolate's renewal of its unit (rule
 /// 12, AM-63; est).
 pub const RENEW_WAIT_MS: u64 = 5_000;
+/// How often a waiting call looks whether the renewal ended (est): at
+/// most `RENEW_WAIT_MS / RENEW_POLL_MS` timers per waiting call.
+pub const RENEW_POLL_MS: u64 = 50;
 
 impl InFlight {
     /// The isolate's state, with its timer for the waiter's bound.
@@ -1668,8 +1691,9 @@ impl InFlight {
     }
 
     /// Rule 12's waiter (AM-63): waits for the renewal of `name` that runs
-    /// in this isolate, for at most `max_ms`. `None`: none runs, the wait
-    /// ran out, or this state has no timer (then nothing waits).
+    /// in this isolate, for at most `max_ms`, looking every
+    /// [`RENEW_POLL_MS`] on the caller's own timer. `None`: none runs, the
+    /// wait ran out, or this state has no timer (then nothing waits).
     pub async fn wait(&self, name: &UnitName, max_ms: u64) -> Option<Waited> {
         let sleep = self.sleep.clone()?;
         let notice = self
@@ -1678,10 +1702,16 @@ impl InFlight {
             .running
             .get(&name.object_name())
             .cloned()?;
-        match select(Waiting(notice), sleep(max_ms)).await {
-            Either::Left((waited, _)) => Some(waited),
-            Either::Right(_) => None,
+        let mut waited_ms = 0;
+        while waited_ms < max_ms {
+            let slice = RENEW_POLL_MS.min(max_ms - waited_ms);
+            sleep(slice).await;
+            waited_ms += slice;
+            if let Some(w) = notice.ended() {
+                return Some(w);
+            }
         }
+        None
     }
 
     fn start(
@@ -1738,10 +1768,13 @@ impl InFlightGuard {
         {
             let mut f = self.set.borrow_mut();
             f.running.remove(&self.name);
+            // Any renewal that renewed clears the unit's backoff, a
+            // queued job's too.
+            if ok {
+                f.failed.remove(&self.name);
+            }
             if let Some(now) = self.spaced {
-                if ok {
-                    f.failed.remove(&self.name);
-                } else {
+                if !ok {
                     if f.failed.len() >= MAX_REMEMBERED && !f.failed.contains_key(&self.name) {
                         if let Some(oldest) = f
                             .failed

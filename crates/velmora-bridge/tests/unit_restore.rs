@@ -68,6 +68,7 @@ fn sync(u: &Unit<RusqliteSql>, state_seq: u64, restoring: Option<u64>, at: i64) 
         u,
         UnitOp::Sync {
             head: SyncHead {
+                from_seq: u.head().unwrap().seqs.state_seq,
                 seqs: Seqs {
                     state_seq,
                     keys_seq: 0,
@@ -591,6 +592,7 @@ fn lift(u: &Unit<RusqliteSql>, state_seq: u64, lift: Option<LiftProof>, at: i64)
         u,
         UnitOp::Sync {
             head: SyncHead {
+                from_seq: u.head().unwrap().seqs.state_seq,
                 seqs: Seqs {
                     state_seq,
                     keys_seq: 0,
@@ -707,6 +709,128 @@ fn a_clean_whole_replay_lifts_with_its_proof_once_the_stamp_is_level() {
         ok(worker(&u, UnitOp::GateStatus {}, t))["replay_id"],
         json!(null)
     );
+}
+
+/// An empty closing bucket unplaced on entry to restore or during it is swept only after the lift.
+#[test]
+fn an_unplaced_closing_bucket_survives_restore_until_a_later_sync() {
+    use velmora_bridge::unit::buckets::{self, BucketChange};
+    use velmora_bridge::unit_lease::lease::Proven;
+
+    const BUCKET: &str = "b_00000000000000e1";
+    let t = BORN + 2000;
+    for unplace_on_entry in [true, false] {
+        let u = provision(BirthKind::Birth, 3);
+        let sync_buckets = |state_seq, restoring_since, buckets, placed| {
+            ok(worker(
+                &u,
+                UnitOp::Sync {
+                    head: SyncHead {
+                        from_seq: u.head().unwrap().seqs.state_seq,
+                        seqs: Seqs {
+                            state_seq,
+                            keys_seq: 0,
+                        },
+                        tenant_state: TenantState::Active,
+                        tenant_mode: None,
+                        restoring_since,
+                        lift: None,
+                        buckets,
+                        placed,
+                    },
+                },
+                t,
+            ))
+        };
+        sync_buckets(
+            4,
+            None,
+            vec![BucketChange::Created {
+                seq: 4,
+                bucket_id: BUCKET.into(),
+                grant_seq: 1,
+                creator: "p_owner".into(),
+                name: "alpha".into(),
+                bdk_wrapped: vec![2, 9, 9],
+                tk_version: 1,
+                written_at: u64::try_from(t).unwrap(),
+            }],
+            vec![BUCKET.into()],
+        );
+        ok(worker(
+            &u,
+            UnitOp::Renew {
+                proof_start: UnixMs(t),
+                proven: Proven {
+                    state_seq: 4,
+                    keys_seq: 0,
+                    stamp_counter: None,
+                    revoked: 0,
+                },
+                revocations: vec![],
+            },
+            t,
+        ));
+        assert_eq!(
+            ok(worker(
+                &u,
+                UnitOp::BucketClose {
+                    bucket_id: BUCKET.into()
+                },
+                t
+            )),
+            json!({ "closing": true, "newly": true })
+        );
+        let assert_retained = || {
+            assert_eq!(buckets::count(u.sql()).unwrap(), 1);
+            assert!(buckets::is_closing(u.sql(), BUCKET).unwrap());
+        };
+        for state_seq in [S, S + 1] {
+            let unplace = if unplace_on_entry { S } else { S + 1 };
+            let changes = if state_seq == unplace {
+                vec![BucketChange::Unplaced {
+                    seq: state_seq,
+                    buckets: vec![BUCKET.into()],
+                }]
+            } else {
+                vec![]
+            };
+            let placed = if state_seq < unplace {
+                vec![BUCKET.into()]
+            } else {
+                vec![]
+            };
+            let body = sync_buckets(state_seq, Some(S), changes, placed);
+            assert_eq!(body["buckets"]["dropped"], json!(0));
+            assert_retained();
+        }
+
+        let replay_id = rid("n1");
+        ok(worker(
+            &u,
+            UnitOp::GateOpen {
+                replay_id: replay_id.clone(),
+            },
+            t,
+        ));
+        level_stamp(&u, replay_id.ordinal);
+        ok(worker(
+            &u,
+            UnitOp::GateReport {
+                replay_id,
+                summary: whole(&[]),
+            },
+            t,
+        ));
+        ok(lift(&u, S + 2, Some(proof(&u, t)), t));
+        assert_eq!(u.head().unwrap().restoring_since, None);
+        assert_retained();
+
+        sync_buckets(S + 3, None, vec![], vec![]);
+        assert_eq!(u.head().unwrap().seqs.state_seq, S + 3);
+        assert_eq!(buckets::count(u.sql()).unwrap(), 0);
+        assert!(!buckets::is_closing(u.sql(), BUCKET).unwrap());
+    }
 }
 
 #[test]

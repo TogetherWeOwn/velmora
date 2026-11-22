@@ -82,6 +82,7 @@ fn sync(
 ) -> UnitAnswer {
     let op = UnitOp::Sync {
         head: SyncHead {
+            from_seq: u.head().unwrap().seqs.state_seq,
             seqs: Seqs {
                 state_seq,
                 keys_seq: 0,
@@ -220,6 +221,7 @@ fn an_unborn_unit_answers_unborn_and_writes_nothing() {
             true,
             UnitOp::Sync {
                 head: SyncHead {
+                    from_seq: 0,
                     seqs: Seqs {
                         state_seq: 3,
                         keys_seq: 0,
@@ -431,6 +433,7 @@ fn a_restored_unit_starts_closed_and_a_sync_still_reaches_it() {
     // The record that still carries the entry keeps it closed.
     let keep = UnitOp::Sync {
         head: SyncHead {
+            from_seq: u.head().unwrap().seqs.state_seq,
             seqs: Seqs {
                 state_seq: 9,
                 keys_seq: 0,
@@ -889,6 +892,7 @@ fn a_sync_never_moves_back_and_never_claims_keys_it_does_not_hold() {
     );
     let keys = UnitOp::Sync {
         head: SyncHead {
+            from_seq: u.head().unwrap().seqs.state_seq,
             seqs: Seqs {
                 state_seq: 5,
                 keys_seq: 1,
@@ -911,6 +915,7 @@ fn a_sync_never_moves_back_and_never_claims_keys_it_does_not_hold() {
     // Only the Worker syncs, and the Worker only runs its own calls.
     let s = UnitOp::Sync {
         head: SyncHead {
+            from_seq: u.head().unwrap().seqs.state_seq,
             seqs: Seqs {
                 state_seq: 6,
                 keys_seq: 0,

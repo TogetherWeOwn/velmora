@@ -6,14 +6,14 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
-use std::future::{self, Future};
+use std::future::{poll_fn, Future};
 use std::rc::Rc;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
-use std::task::{Context, Poll, Wake, Waker};
+use std::task::{Context, Poll, Waker};
 
 use tokio::sync::oneshot;
-use velmora_bridge::directory::chain::{record_key, ChainError, ReadRecord, TenantChain, Written};
+use velmora_bridge::directory::chain::{
+    record_key, ChainError, ControlSeal, ReadRecord, TenantChain, Written,
+};
 use velmora_bridge::directory::record::{HoldMode, OperatorReason, Tenant, TenantDoor};
 use velmora_bridge::directory::testing::{HookedRecords, PlainSeal};
 use velmora_bridge::directory::transition::{Actor, Change, OperatorHoldRequest, KEY_CHECK_LEN};
@@ -31,7 +31,7 @@ use velmora_bridge::unit::{
 };
 use velmora_bridge::unit_lease::client::{
     lease_expired, Answered, Delivery, InFlight, KeyBatch, KeyFeed, KeyFinisher, Page, RecordNames,
-    Renewal, Sleep, Synced, TenantHeads, UnitClient, UnitReplies,
+    Renewal, Sleep, Synced, TenantHeads, UnitClient, UnitReplies, RENEW_POLL_MS, RENEW_WAIT_MS,
 };
 use velmora_bridge::unit_lease::lease::LeaseRules;
 use velmora_bridge::unit_lease::renewal::ChainNames;
@@ -75,13 +75,21 @@ fn block_on<F: std::future::Future>(f: F) -> F::Output {
 
 type Hook<'a> = Box<dyn FnOnce(&Unit<RusqliteSql>) + 'a>;
 
+struct SyncAttempt {
+    from_seq: u64,
+    to_seq: u64,
+    answer: UnitAnswer,
+}
+
 /// The unit object as the stub reaches it: the real unit at the rig's
 /// clock, with a log of the calls and a way to fail them.
 struct Obj<'a> {
     unit: Unit<RusqliteSql>,
     clock: &'a FixedClock,
     log: RefCell<Vec<(CallKind, bool, String, bool)>>,
-    sync_attempts: RefCell<Vec<(u64, UnitAnswer)>>,
+    sync_attempts: RefCell<Vec<SyncAttempt>>,
+    /// Holds the next sync just before it reaches the unit.
+    sync_gate: RefCell<Option<oneshot::Receiver<()>>>,
     fail: Cell<bool>,
     /// Run once, right after the first `stamp` read answered.
     after_stamp_read: RefCell<Option<Hook<'a>>>,
@@ -145,11 +153,19 @@ impl UnitReplies for Obj<'_> {
                 });
             }
         }
+        if matches!(call.op, UnitOp::Sync { .. }) {
+            let gate = self.sync_gate.borrow_mut().take();
+            if let Some(gate) = gate {
+                gate.await.expect("the test must release the sync");
+            }
+        }
         let reply = self.unit.reply(call, self.clock.now());
         if let UnitOp::Sync { head } = &call.op {
-            self.sync_attempts
-                .borrow_mut()
-                .push((head.seqs.state_seq, reply.answer.clone()));
+            self.sync_attempts.borrow_mut().push(SyncAttempt {
+                from_seq: head.from_seq,
+                to_seq: head.seqs.state_seq,
+                answer: reply.answer.clone(),
+            });
         }
         if let UnitOp::Job {
             call: JobCall::stamp { catalogue },
@@ -548,6 +564,7 @@ fn with_rig<R>(f: impl FnOnce(&Rig<'_>) -> R) -> R {
             clock: &clock,
             log: RefCell::new(vec![]),
             sync_attempts: RefCell::default(),
+            sync_gate: RefCell::default(),
             fail: Cell::new(false),
             after_stamp_read: RefCell::new(None),
             stamp_read_gate: RefCell::default(),
@@ -753,28 +770,33 @@ fn a_key_chain_below_the_unit_is_an_error() {
     });
 }
 
+fn write_bucket_creation(rig: &Rig<'_>, grant_seq: u64, name: &str) -> (BucketId, Vec<u8>) {
+    let bucket = velmora_bridge::records::bucket_id(dir_tenant().managed().unwrap(), grant_seq);
+    let mut wrap = vec![0xa5; velmora_bridge::crypto::WRAPPED_KEY_LEN];
+    wrap[0] = velmora_bridge::crypto::scheme2::WRAP_VERSION_2;
+    rig.write(
+        Change::CreateBucket {
+            bucket: bucket.as_str().into(),
+            unit: 0,
+            creator: P.into(),
+            grant_seq,
+            name: name.into(),
+            bdk_wrapped: wrap.clone(),
+            tk_version: 1,
+        },
+        Actor::Customer,
+    );
+    (bucket, wrap)
+}
+
 /// Syncing a bucket creation reads the tenant record and makes the placed row.
 #[test]
 fn sync_creates_the_bucket_from_the_tenant_record() {
     with_fresh(|rig| {
         let before = rig.unit_seqs();
-        let bucket = velmora_bridge::records::bucket_id(dir_tenant().managed().unwrap(), 1);
-        let mut wrap = vec![0xa5; velmora_bridge::crypto::WRAPPED_KEY_LEN];
-        wrap[0] = velmora_bridge::crypto::scheme2::WRAP_VERSION_2;
         rig.clock.advance_ms(123);
         let written_at = rig.clock.now();
-        rig.write(
-            Change::CreateBucket {
-                bucket: bucket.as_str().into(),
-                unit: 0,
-                creator: P.into(),
-                grant_seq: 1,
-                name: "client-bucket".into(),
-                bdk_wrapped: wrap.clone(),
-                tk_version: 1,
-            },
-            Actor::Customer,
-        );
+        let (bucket, wrap) = write_bucket_creation(rig, 1, "client-bucket");
         rig.clock.advance_ms(456);
         let want = Seqs {
             state_seq: before.state_seq + 1,
@@ -812,6 +834,161 @@ fn sync_creates_the_bucket_from_the_tenant_record() {
     });
 }
 
+/// A restore entry gets its own sync step, so the preceding `SetUnits`
+/// drops both empty buckets before the unit starts preserving rows.
+#[test]
+fn sync_drops_unplaced_buckets_before_entering_restore() {
+    with_fresh(|rig| {
+        let (x, _) = write_bucket_creation(rig, 1, "client-bucket-x");
+        let (y, _) = write_bucket_creation(rig, 2, "client-bucket-y");
+        let client = rig.client();
+        synced(&client, rig.unit_seqs());
+        let before = rig.unit_seqs();
+        let bucket_rows = || {
+            rig.obj.unit.sql().with_conn(|conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM buckets WHERE id IN (?1, ?2)",
+                    [x.as_str(), y.as_str()],
+                    |r| r.get::<_, i64>(0),
+                )
+                .unwrap()
+            })
+        };
+        assert_eq!(bucket_rows(), 2);
+        rig.obj.sync_attempts.borrow_mut().clear();
+
+        rig.write(
+            Change::SetUnits {
+                base_seq: before.state_seq,
+                units: vec![0],
+                placements: vec![],
+            },
+            Actor::Operator,
+        );
+        rig.write(Change::SetRestoring { unit: 0 }, Actor::Operator);
+        let want = Seqs {
+            state_seq: before.state_seq + 2,
+            ..before
+        };
+        assert_eq!(synced(&client, before), Synced::Synced { seqs: want });
+        let attempts = rig.obj.sync_attempts.borrow();
+        let [removal, restore] = attempts.as_slice() else {
+            panic!("expected two sync dispatches, got {}", attempts.len());
+        };
+        assert_eq!(
+            (removal.from_seq, removal.to_seq),
+            (before.state_seq, before.state_seq + 1)
+        );
+        assert_eq!(
+            (restore.from_seq, restore.to_seq),
+            (before.state_seq + 1, want.state_seq)
+        );
+        assert!(
+            matches!(&removal.answer, UnitAnswer::Ok { body, .. } if body["buckets"]["dropped"] == 2),
+            "{:?}",
+            removal.answer
+        );
+        assert!(
+            matches!(restore.answer, UnitAnswer::Ok { .. }),
+            "{:?}",
+            restore.answer
+        );
+        let head = rig.obj.unit.head().unwrap();
+        assert_eq!(head.seqs, want);
+        assert_eq!(head.restoring_since, Some(want.state_seq));
+        assert_eq!(bucket_rows(), 0);
+    });
+}
+
+/// A racing sync from the old base reads the unit's numbers again and leaves exactly one bucket row.
+#[test]
+fn a_racing_sync_reloads_the_base_and_does_not_reapply_the_bucket() {
+    with_fresh(|rig| {
+        let before = rig.unit_seqs();
+        let (bucket, _) = write_bucket_creation(rig, 1, "client-bucket");
+        let want = Seqs {
+            state_seq: before.state_seq + 1,
+            ..before
+        };
+        let first = rig.client();
+        let second = UnitClient {
+            flights: InFlight::default(),
+            ..rig.client()
+        };
+        rig.obj.sync_attempts.borrow_mut().clear();
+        rig.obj.log.borrow_mut().clear();
+
+        let (release, held) = oneshot::channel();
+        *rig.obj.sync_gate.borrow_mut() = Some(held);
+        let mut late = std::pin::pin!(second.sync(before));
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(late.as_mut().poll(&mut cx).is_pending());
+        assert!(rig.obj.sync_gate.borrow().is_none());
+        assert!(rig.obj.sync_attempts.borrow().is_empty());
+
+        let (result, pages) = block_on(first.sync(before));
+        assert_eq!(result.unwrap(), Synced::Synced { seqs: want });
+        assert!(pages.is_empty(), "{pages:?}");
+        assert_eq!(rig.unit_seqs(), want);
+        release.send(()).unwrap();
+        let (result, pages) = block_on(late);
+        assert_eq!(result.unwrap(), Synced::Synced { seqs: want });
+        assert!(pages.is_empty(), "{pages:?}");
+        assert_eq!(rig.unit_seqs(), want);
+        rig.assert_call_auth(&[
+            ("held_keys", true),
+            ("sync", true), // second stops at the gate
+            ("held_keys", true),
+            ("sync", true),  // first reaches the unit
+            ("ping", false), // second reads the unit's new base
+            ("held_keys", true),
+            ("sync", true),
+        ]);
+
+        let attempts = rig.obj.sync_attempts.borrow();
+        let [winner, stale, retry] = attempts.as_slice() else {
+            panic!("expected three sync dispatches, got {}", attempts.len());
+        };
+        for attempt in [winner, stale] {
+            assert_eq!(
+                (attempt.from_seq, attempt.to_seq),
+                (before.state_seq, want.state_seq)
+            );
+        }
+        assert!(
+            matches!(&winner.answer, UnitAnswer::Ok { body, .. } if body["buckets"]["created"] == 1)
+        );
+        assert_eq!(
+            stale.answer,
+            UnitAnswer::Refused {
+                reason: Refused::StaleSync,
+                alarm: false
+            }
+        );
+        assert_eq!(
+            (retry.from_seq, retry.to_seq),
+            (want.state_seq, want.state_seq)
+        );
+        assert!(
+            matches!(&retry.answer, UnitAnswer::Ok { body, .. } if body["buckets"]["created"] == 0)
+        );
+        rig.obj.unit.sql().with_conn(|conn| {
+            for sql in [
+                "SELECT id FROM buckets",
+                "SELECT bucket_id FROM unit_bucket_grant",
+            ] {
+                let mut stmt = conn.prepare(sql).unwrap();
+                let ids: Vec<String> = stmt
+                    .query_map([], |row| row.get(0))
+                    .unwrap()
+                    .collect::<rusqlite::Result<_>>()
+                    .unwrap();
+                assert_eq!(ids, [bucket.as_str()]);
+            }
+        });
+    });
+}
+
 /// A backlog beyond 32 records is applied in multiple, bounded sync steps.
 #[test]
 fn sync_splits_a_long_tenant_backlog_into_steps() {
@@ -830,7 +1007,13 @@ fn sync_splits_a_long_tenant_backlog_into_steps() {
         assert_eq!(synced(&rig.client(), before), Synced::Synced { seqs: want });
         assert_eq!(rig.unit_seqs(), want);
         assert_eq!(rig.calls().iter().filter(|op| *op == "sync").count(), 2);
-        let targets: Vec<_> = rig.obj.sync_attempts.borrow().iter().map(|a| a.0).collect();
+        let targets: Vec<_> = rig
+            .obj
+            .sync_attempts
+            .borrow()
+            .iter()
+            .map(|a| a.to_seq)
+            .collect();
         assert_eq!(targets, [middle, want.state_seq]);
         let expected_reads: Vec<_> = (before.state_seq..=middle)
             .chain(middle..=want.state_seq)
@@ -865,8 +1048,9 @@ fn sync_retries_a_placement_mismatch_once_then_pages() {
         let next = before.state_seq + 1;
         let attempts = rig.obj.sync_attempts.borrow();
         assert_eq!(attempts.len(), 2);
-        for (target, answer) in attempts.iter() {
-            assert_eq!(*target, next);
+        for attempt in attempts.iter() {
+            assert_eq!(attempt.to_seq, next);
+            let answer = &attempt.answer;
             assert!(
                 matches!(
                     answer,
@@ -1088,6 +1272,7 @@ fn an_unborn_unit_is_reported() {
             clock: &clock,
             log: RefCell::new(vec![]),
             sync_attempts: RefCell::default(),
+            sync_gate: RefCell::default(),
             fail: Cell::new(false),
             after_stamp_read: RefCell::new(None),
             stamp_read_gate: RefCell::default(),
@@ -1392,6 +1577,100 @@ fn a_renew_job_whose_call_fails_is_handed_back() {
             (job.delivery, job.code),
             (Delivery::HandBack, "renew_failed")
         );
+    });
+}
+
+/// Missing bucket secrets in a placed creation are damage, so a queued
+/// renewal that encounters them dead-letters and pages instead of retrying.
+#[test]
+fn a_renew_job_dead_letters_a_bucket_creation_missing_its_secrets() {
+    use velmora_bridge::unit_lease::placements::ERR_BUCKET_SECRETS;
+
+    with_expired(|rig| {
+        let before = rig.unit_seqs();
+        let client = rig.client();
+        write_bucket_creation(rig, 1, "client-bucket");
+        let seq = rig.head_seq();
+        let ReadRecord { door, private } = block_on(client.heads.record(&tenant(), seq))
+            .unwrap()
+            .unwrap();
+        let mut private = private.unwrap();
+        private.bucket_created.take().unwrap();
+        // Preserve the valid public record and seal just this private part
+        // without its synthetic bucket material.
+        let name = record_key(&dir_tenant(), seq);
+        let sealed = rig
+            .seal
+            .seal(
+                &name,
+                &dir_tenant(),
+                door.tk_version,
+                &serde_json::to_vec(&door).unwrap(),
+                &serde_json::to_vec(&private).unwrap(),
+            )
+            .unwrap();
+        rig.records.plant(&name, sealed);
+
+        let job = block_on(client.run_job(
+            UnitJob::Renew {
+                at: rig.clock.now(),
+            },
+            before,
+        ));
+        assert_eq!(
+            (job.delivery, job.code),
+            (Delivery::DeadLetter, "unit_refused")
+        );
+        let BridgeError::Invalid(reason) = ERR_BUCKET_SECRETS else {
+            panic!("expected a placement damage reason");
+        };
+        assert_eq!(job.pages, [Page::UnitRefused(reason)]);
+        assert_eq!(rig.unit_seqs(), before);
+        assert!(!rig.calls().iter().any(|call| call == "sync"));
+    });
+}
+
+/// A queued success clears the unsigned request's failure backoff, even
+/// when a new renewal is needed before that backoff would have elapsed.
+#[test]
+fn a_successful_queued_renewal_clears_unsigned_backoff() {
+    with_expired(|rig| {
+        let client = rig.client();
+        let unsigned = || {
+            let mut call = request(rig.unit_seqs(), UnitOp::Ping {});
+            call.authenticated = false;
+            block_on(client.call(call))
+        };
+        rig.obj.lose_answer_of.set(Some("job:stamp"));
+        let (failed, pages) = unsigned();
+        assert!(matches!(failed, Err(BridgeError::Sql(ref text)) if text == "unit: answer lost"));
+        assert!(pages.is_empty(), "{pages:?}");
+        let (spaced, pages) = unsigned();
+        let spaced = spaced.unwrap();
+        assert!(spaced.renewal.is_none(), "{spaced:?}");
+        assert!(matches!(
+            spaced.reply.answer,
+            UnitAnswer::RenewNeeded { .. }
+        ));
+        assert!(pages.is_empty(), "{pages:?}");
+
+        let at = rig.clock.now();
+        let job = block_on(client.run_job(UnitJob::Renew { at }, rig.unit_seqs()));
+        assert_eq!((job.delivery, job.code), (Delivery::Ack, "renewed"));
+        assert!(job.pages.is_empty(), "{job:?}");
+        assert!(matches!(rig.ping(), UnitAnswer::Ok { .. }));
+
+        // End the lease without advancing the clock past the old backoff.
+        velmora_bridge::unit_lease::store::close(rig.obj.unit.sql()).unwrap();
+        let (retried, pages) = unsigned();
+        let retried = retried.unwrap();
+        assert!(
+            matches!(retried.renewal, Some(Renewal::Renewed { .. })),
+            "{retried:?}"
+        );
+        assert!(pages.is_empty(), "{pages:?}");
+        assert_eq!(rig.clock.now(), at);
+        assert!(matches!(rig.ping(), UnitAnswer::Ok { .. }));
     });
 }
 
@@ -1748,88 +2027,106 @@ fn in_flight_holds_one_renewal_per_unit() {
     assert!(flights.begin(&own()).is_some());
 }
 
-#[derive(Default)]
-struct WakeCount(AtomicUsize);
-
-impl Wake for WakeCount {
-    fn wake(self: Arc<Self>) {
-        self.wake_by_ref();
-    }
-
-    fn wake_by_ref(self: &Arc<Self>) {
-        self.0.fetch_add(1, Ordering::Relaxed);
-    }
+enum Follower {
+    /// Its first timer is pending; release the leader before that timer completes.
+    WaitsForRenewal,
+    /// Keep the leader gated until the follower completes after exactly this many yields.
+    FinishesWhileGated(usize),
 }
 
-/// Drives two callers plus a release branch in a fixed order. A stalled or
-/// unexpectedly eager waiter fails on a poll or assertion, not a wall timer.
-fn during_a_gated_renewal<F: Future>(
+/// Polls the two callers separately so the stamp gate remains closed for the exact wait under test.
+fn during_a_gated_renewal<L: Future, F: Future>(
+    rig: &Rig<'_>,
+    flights: &InFlight,
+    renewal: L,
+    other: F,
+    follower: Follower,
+) -> (L::Output, F::Output) {
+    let (release, held) = oneshot::channel();
+    *rig.obj.stamp_read_gate.borrow_mut() = Some(held);
+    let mut renewal = std::pin::pin!(renewal);
+    let mut other = std::pin::pin!(other);
+    let mut cx = Context::from_waker(Waker::noop());
+    assert!(renewal.as_mut().poll(&mut cx).is_pending());
+    assert!(rig.obj.stamp_read_gate.borrow().is_none());
+    assert!(flights.running(&own()));
+
+    let early = match follower {
+        Follower::WaitsForRenewal => {
+            assert!(other.as_mut().poll(&mut cx).is_pending());
+            None
+        }
+        Follower::FinishesWhileGated(polls) => {
+            for tick in 0..polls {
+                assert!(
+                    other.as_mut().poll(&mut cx).is_pending(),
+                    "finished before timer {} completed",
+                    tick + 1
+                );
+            }
+            let Poll::Ready(result) = other.as_mut().poll(&mut cx) else {
+                panic!("the follower did not finish while renewal was gated");
+            };
+            Some(result)
+        }
+    };
+    assert!(flights.running(&own()));
+    assert!(
+        rig.calls().iter().all(|op| op != "renew"),
+        "no renewal has reached the unit"
+    );
+    release.send(()).expect("the stamp read is still held");
+    let Poll::Ready(renewal) = renewal.poll(&mut cx) else {
+        panic!("the renewal did not finish after releasing the stamp reply");
+    };
+    assert!(!flights.running(&own()));
+    let result = early.unwrap_or_else(|| {
+        let Poll::Ready(result) = other.poll(&mut cx) else {
+            panic!("the follower did not finish after its timer and the renewal");
+        };
+        result
+    });
+    assert_eq!(rig.calls().iter().filter(|op| **op == "renew").count(), 1);
+    (renewal, result)
+}
+
+fn during_a_gated_request_renewal<F: Future>(
     rig: &Rig<'_>,
     leader: &Client<'_, '_>,
     other: F,
-    should_wait: bool,
+    follower: Follower,
 ) -> F::Output {
-    let (release, held) = oneshot::channel();
-    *rig.obj.stamp_read_gate.borrow_mut() = Some(held);
-    let seqs = rig.unit_seqs();
-    let other_done = Cell::new(false);
-    let mut joined = std::pin::pin!(futures_util::future::join(
-        leader.call(request(seqs, UnitOp::Ping {})),
-        futures_util::future::join(
-            async {
-                let result = other.await;
-                other_done.set(true);
-                result
-            },
-            async {
-                assert!(rig.obj.stamp_read_gate.borrow().is_none());
-                assert!(leader.flights.running(&own()));
-                assert_eq!(
-                    other_done.get(),
-                    !should_wait,
-                    "before releasing the stamp reply"
-                );
-                release.send(()).expect("the stamp read is still held");
-            },
-        ),
-    ));
-    let wakes = Arc::new(WakeCount::default());
-    let waker = Waker::from(Arc::clone(&wakes));
-    let mut cx = Context::from_waker(&waker);
-    assert!(joined.as_mut().poll(&mut cx).is_pending());
-    // The stamp gate wakes the joined task during the first poll. A waiter
-    // must cause another wake when the renewal ends, even though join would
-    // poll it again without one.
-    let gate_wakes = wakes.0.load(Ordering::Relaxed);
-    let Poll::Ready(((leader, pages), (other, ()))) = joined.poll(&mut cx) else {
-        panic!("the callers did not finish after releasing the stamp reply");
-    };
-    if should_wait {
-        assert!(
-            wakes.0.load(Ordering::Relaxed) > gate_wakes,
-            "the renewal did not wake its waiter"
-        );
-    }
+    let ((answer, pages), result) = during_a_gated_renewal(
+        rig,
+        &leader.flights,
+        leader.call(request(rig.unit_seqs(), UnitOp::Ping {})),
+        other,
+        follower,
+    );
     assert!(pages.is_empty(), "{pages:?}");
     assert!(matches!(
-        leader.unwrap().reply.answer,
+        answer.unwrap().reply.answer,
         UnitAnswer::Ok { .. }
     ));
-    other
+    result
 }
 
-/// Makes the renewal waiter's deadline pending forever or ready immediately.
-fn fake_sleep(ready: bool) -> (InFlight, Rc<Cell<Option<u64>>>) {
-    let seen = Rc::new(Cell::new(None));
+/// Records every sleep in milliseconds and yields once before each one completes.
+fn fake_sleep() -> (InFlight, Rc<RefCell<Vec<u64>>>) {
+    let seen = Rc::new(RefCell::new(Vec::new()));
     let sleep: Sleep = Rc::new({
         let seen = Rc::clone(&seen);
-        move |ms| -> futures_util::future::LocalBoxFuture<'static, ()> {
-            assert_eq!(seen.replace(Some(ms)), None, "a single timer per waiter");
-            if ready {
-                Box::pin(future::ready(()))
-            } else {
-                Box::pin(future::pending())
-            }
+        move |ms| {
+            seen.borrow_mut().push(ms);
+            let mut pending = true;
+            Box::pin(poll_fn(move |cx| {
+                if std::mem::take(&mut pending) {
+                    cx.waker().wake_by_ref();
+                    Poll::Pending
+                } else {
+                    Poll::Ready(())
+                }
+            }))
         }
     });
     (InFlight::with_sleep(sleep), seen)
@@ -1839,7 +2136,7 @@ fn fake_sleep(ready: bool) -> (InFlight, Rc<Cell<Option<u64>>>) {
 #[test]
 fn an_expired_request_waits_for_the_shared_renewal() {
     with_expired(|rig| {
-        let (flights, slept) = fake_sleep(false);
+        let (flights, slept) = fake_sleep();
         let leader = UnitClient {
             flights: flights.clone(),
             ..rig.client()
@@ -1848,17 +2145,17 @@ fn an_expired_request_waits_for_the_shared_renewal() {
             flights,
             ..rig.client()
         };
-        let (answer, pages) = during_a_gated_renewal(
+        let (answer, pages) = during_a_gated_request_renewal(
             rig,
             &leader,
             waiter.call(request(rig.unit_seqs(), UnitOp::Ping {})),
-            true,
+            Follower::WaitsForRenewal,
         );
         let answer = answer.unwrap();
         assert!(matches!(answer.reply.answer, UnitAnswer::Ok { .. }));
         assert!(matches!(answer.renewal, Some(Renewal::Renewed { .. })));
         assert!(pages.is_empty());
-        assert_eq!(slept.get(), Some(5_000));
+        assert_eq!(*slept.borrow(), [50]);
         assert_eq!(
             rig.calls(),
             ["ping", "job:stamp", "ping", "renew", "ping", "ping"]
@@ -1870,7 +2167,9 @@ fn an_expired_request_waits_for_the_shared_renewal() {
 #[test]
 fn a_waiter_that_times_out_returns_renew_needed() {
     with_expired(|rig| {
-        let (flights, slept) = fake_sleep(true);
+        let (flights, slept) = fake_sleep();
+        assert_eq!((RENEW_WAIT_MS, RENEW_POLL_MS), (5_000, 50));
+        let polls = usize::try_from(RENEW_WAIT_MS / RENEW_POLL_MS).unwrap();
         let leader = UnitClient {
             flights: flights.clone(),
             ..rig.client()
@@ -1879,11 +2178,11 @@ fn a_waiter_that_times_out_returns_renew_needed() {
             flights,
             ..rig.client()
         };
-        let (answer, pages) = during_a_gated_renewal(
+        let (answer, pages) = during_a_gated_request_renewal(
             rig,
             &leader,
             waiter.call(request(rig.unit_seqs(), UnitOp::Ping {})),
-            false,
+            Follower::FinishesWhileGated(polls),
         );
         let answer = answer.unwrap();
         assert!(matches!(
@@ -1892,7 +2191,8 @@ fn a_waiter_that_times_out_returns_renew_needed() {
         ));
         assert_eq!(answer.renewal, None);
         assert!(pages.is_empty());
-        assert_eq!(slept.get(), Some(5_000));
+        assert_eq!(*slept.borrow(), vec![RENEW_POLL_MS; polls]);
+        assert_eq!(slept.borrow().iter().sum::<u64>(), RENEW_WAIT_MS);
         assert_eq!(rig.calls(), ["ping", "job:stamp", "ping", "renew", "ping"]);
     });
 }
@@ -1903,11 +2203,11 @@ fn an_expired_request_without_a_timer_returns_renew_needed() {
     with_expired(|rig| {
         let leader = rig.client();
         let other = rig.client();
-        let (answer, pages) = during_a_gated_renewal(
+        let (answer, pages) = during_a_gated_request_renewal(
             rig,
             &leader,
             other.call(request(rig.unit_seqs(), UnitOp::Ping {})),
-            false,
+            Follower::FinishesWhileGated(0),
         );
         let answer = answer.unwrap();
         assert!(matches!(
@@ -1924,7 +2224,7 @@ fn an_expired_request_without_a_timer_returns_renew_needed() {
 #[test]
 fn a_background_renewal_does_not_wait_for_an_in_flight_renewal() {
     with_expired(|rig| {
-        let (flights, slept) = fake_sleep(false);
+        let (flights, slept) = fake_sleep();
         let leader = UnitClient {
             flights: flights.clone(),
             ..rig.client()
@@ -1933,15 +2233,106 @@ fn a_background_renewal_does_not_wait_for_an_in_flight_renewal() {
             flights,
             ..rig.client()
         };
-        let result = during_a_gated_renewal(
+        let result = during_a_gated_request_renewal(
             rig,
             &leader,
             background.renew_in_background(rig.unit_seqs()),
-            false,
+            Follower::FinishesWhileGated(0),
         );
         assert!(result.is_none());
-        assert_eq!(slept.get(), None);
+        assert!(slept.borrow().is_empty());
         assert_eq!(rig.calls(), ["ping", "job:stamp", "renew", "ping"]);
+    });
+}
+
+/// A queued renew acknowledges a renewal already in this isolate without proving a second lease.
+#[test]
+fn a_renew_job_acknowledges_a_renewal_already_in_flight() {
+    with_expired(|rig| {
+        let leader = rig.client();
+        let queue = rig.client();
+        let job = during_a_gated_request_renewal(
+            rig,
+            &leader,
+            queue.run_job(UnitJob::Renew { at: NOW }, rig.unit_seqs()),
+            Follower::FinishesWhileGated(0),
+        );
+        assert_eq!((job.delivery, job.code), (Delivery::Ack, "renewing"));
+        assert!(job.pages.is_empty(), "{:?}", job.pages);
+        assert_eq!(rig.calls(), ["ping", "job:stamp", "renew", "ping"]);
+    });
+}
+
+/// A request waits for a queued renew registered by another caller in the same isolate.
+#[test]
+fn a_request_waits_for_a_queued_renewal_and_is_served_after_it() {
+    with_expired(|rig| {
+        let (flights, slept) = fake_sleep();
+        let queue = UnitClient {
+            flights: flights.clone(),
+            ..rig.client()
+        };
+        let waiter = UnitClient {
+            flights: flights.clone(),
+            ..rig.client()
+        };
+        let seqs = rig.unit_seqs();
+        let (job, (answer, pages)) = during_a_gated_renewal(
+            rig,
+            &flights,
+            queue.run_job(UnitJob::Renew { at: NOW }, seqs),
+            waiter.call(request(seqs, UnitOp::Ping {})),
+            Follower::WaitsForRenewal,
+        );
+        assert_eq!((job.delivery, job.code), (Delivery::Ack, "renewed"));
+        assert!(job.pages.is_empty(), "{:?}", job.pages);
+        let answer = answer.unwrap();
+        assert!(matches!(answer.reply.answer, UnitAnswer::Ok { .. }));
+        assert!(matches!(answer.renewal, Some(Renewal::Renewed { .. })));
+        assert!(pages.is_empty(), "{pages:?}");
+        assert_eq!(*slept.borrow(), [50]);
+        assert_eq!(rig.calls(), ["job:stamp", "ping", "renew", "ping"]);
+    });
+}
+
+/// A stamp raise that needs a lease hands back while a renewal already holds the slot.
+#[test]
+fn a_stamp_raise_that_needs_renewal_is_handed_back_while_one_runs() {
+    with_expired(|rig| {
+        let leader = rig.client();
+        let queue = rig.client();
+        let id = queue.stamp_id().unwrap();
+        let before = stamp_row(rig, id.as_str()).counter;
+        let next = before.unwrap_or(0) + 1;
+        let stamp = stamp_key(id.as_str(), next);
+        let job = during_a_gated_request_renewal(
+            rig,
+            &leader,
+            queue.run_job(UnitJob::StampRaise { at: NOW }, rig.unit_seqs()),
+            Follower::FinishesWhileGated(0),
+        );
+        assert_eq!((job.delivery, job.code), (Delivery::HandBack, "renewing"));
+        assert!(job.pages.is_empty(), "{:?}", job.pages);
+        assert_eq!(stamp_row(rig, id.as_str()).counter, before);
+        assert!(!rig.safety.contains(&stamp));
+        assert_eq!(
+            rig.calls(),
+            [
+                "ping",
+                "job:stamp",
+                "job:stamp",
+                "job:stamp_advance",
+                "renew",
+                "ping"
+            ]
+        );
+
+        let retry = block_on(queue.run_job(UnitJob::StampRaise { at: NOW }, rig.unit_seqs()));
+        assert_eq!((retry.delivery, retry.code), (Delivery::Ack, "raised"));
+        assert!(retry.pages.is_empty(), "{:?}", retry.pages);
+        assert_eq!(stamp_row(rig, id.as_str()).counter, Some(next));
+        assert!(rig.safety.contains(&stamp));
+        assert_eq!(rig.calls().iter().filter(|op| **op == "renew").count(), 1);
     });
 }
 
@@ -2012,6 +2403,52 @@ fn a_verified_expired_key_row_is_reread_signed_after_renewal() {
             ("renew", true),
             ("key_row", true),
         ]);
+    });
+}
+
+/// A signed reread reports a revocation that landed after the marked unsigned key read.
+#[test]
+fn a_verified_expired_key_row_reports_an_intervening_revocation() {
+    with_expired(|rig| {
+        let c = rig.client();
+        let call = unsigned_key_row(rig.unit_seqs());
+        let (first, pages) = called(&c, call.clone());
+        assert!(pages.is_empty(), "{pages:?}");
+        assert!(lease_expired(&first.reply));
+        assert!(
+            matches!(&first.reply.answer, UnitAnswer::Ok { body, .. } if body["key"]["status"] == "active")
+        );
+        rig.assert_call_auth(&[("key_row", false)]);
+
+        put(
+            rig.safety,
+            &format!("{}{K}", RecordNames.revocation_dir(tid())),
+        );
+        let (answer, pages) = block_on(c.key_row_verified(first, call));
+        let answer = answer.unwrap();
+        assert!(pages.is_empty(), "{pages:?}");
+        assert!(matches!(answer.renewal, Some(Renewal::Renewed { .. })));
+        assert!(!lease_expired(&answer.reply));
+        assert_eq!(revoked_count(rig), 1);
+        rig.assert_call_auth(&[
+            ("key_row", false),
+            ("key_row", true),
+            ("job:stamp", true),
+            ("renew", true),
+            ("key_row", true),
+        ]);
+        let UnitAnswer::Ok { body, .. } = answer.reply.answer else {
+            panic!("expected a successful signed key lookup");
+        };
+        let key = body
+            .get("key")
+            .expect("the signed reread includes a key field");
+        // The catalogue serves active keys only: a revoked key reads as
+        // none, which the Worker answers 403. Never the old active row.
+        assert!(
+            key.is_null() || key["status"].as_str() != Some("active"),
+            "{key}"
+        );
     });
 }
 

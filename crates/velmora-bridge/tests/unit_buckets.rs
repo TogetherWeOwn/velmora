@@ -57,6 +57,7 @@ fn sync(
         u,
         UnitOp::Sync {
             head: SyncHead {
+                from_seq: h.seqs.state_seq,
                 seqs: Seqs {
                     state_seq: h.seqs.state_seq + 1,
                     keys_seq: h.seqs.keys_seq,
@@ -655,13 +656,15 @@ fn sync_buckets(
     buckets: Vec<BucketChange>,
     placed_ids: &[&str],
 ) -> UnitAnswer {
+    let current = u.head().unwrap().seqs;
     worker(
         u,
         UnitOp::Sync {
             head: SyncHead {
+                from_seq: current.state_seq,
                 seqs: Seqs {
                     state_seq,
-                    keys_seq: u.head().unwrap().seqs.keys_seq,
+                    keys_seq: current.keys_seq,
                 },
                 tenant_mode: None,
                 tenant_state: TenantState::Active,
@@ -888,6 +891,46 @@ fn a_sync_unplace_preserves_bucket_rows_while_restoring() {
     assert_eq!(ids(&u), placed(&[B1]));
     assert_eq!(name_of(&u, B1), "alpha");
     assert!(!closing(&u, B1));
+}
+
+/// A sync based on an old sequence is refused without changing the head or rows, even with a valid bucket part.
+#[test]
+fn a_sync_based_on_an_old_sequence_leaves_the_head_and_rows_unchanged() {
+    let u = ready();
+    sync_alpha(&u);
+    let before = u.head().unwrap();
+    let mut head = SyncHead {
+        from_seq: before.seqs.state_seq - 1,
+        seqs: Seqs {
+            state_seq: before.seqs.state_seq + 1,
+            keys_seq: before.seqs.keys_seq,
+        },
+        tenant_state: TenantState::Active,
+        tenant_mode: None,
+        restoring_since: None,
+        lift: None,
+        buckets: vec![created(before.seqs.state_seq + 1, B2, "beta", 3)],
+        placed: placed(&[B1, B2]),
+    };
+    let writes_before = u.sql().with_conn(|c| c.total_changes());
+
+    assert_eq!(
+        worker(&u, UnitOp::Sync { head: head.clone() }),
+        UnitAnswer::Refused {
+            reason: Refused::StaleSync,
+            alarm: false,
+        }
+    );
+    assert_eq!(u.sql().with_conn(|c| c.total_changes()), writes_before);
+    assert_eq!(u.head().unwrap(), before);
+    assert_eq!(ids(&u), placed(&[B1]));
+
+    head.from_seq = before.seqs.state_seq;
+    let next = head.seqs;
+    let body = ok_body(worker(&u, UnitOp::Sync { head }));
+    assert_eq!(body["buckets"]["created"], json!(1));
+    assert_eq!(u.head().unwrap().seqs, next);
+    assert_eq!(ids(&u), placed(&[B1, B2]));
 }
 
 /// Descending change sequences are malformed even if applying them would match placements.

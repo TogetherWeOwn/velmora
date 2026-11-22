@@ -471,6 +471,7 @@ fn sync(u: &Unit<RusqliteSql>, seqs: Seqs, state: TenantState, mode: Option<Hold
         u,
         UnitOp::Sync {
             head: SyncHead {
+                from_seq: u.head().unwrap().seqs.state_seq,
                 seqs,
                 tenant_state: state,
                 tenant_mode: mode,
@@ -734,6 +735,7 @@ fn a_restoring_or_provisioning_unit_is_closed_to_request_calls() {
         &u,
         UnitOp::Sync {
             head: SyncHead {
+                from_seq: u.head().unwrap().seqs.state_seq,
                 seqs: s(4, 0),
                 tenant_state: TenantState::Active,
                 tenant_mode: None,

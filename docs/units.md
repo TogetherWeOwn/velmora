@@ -226,7 +226,11 @@ hand-out, and its writes are due from their own time.
   record before held this unit's `restoring` entry, else `dropped`, or
   `unplaced` for several at once), and the head's placement list for this
   unit. A unit more than 32 records (est) behind is brought up in steps,
-  each a `sync` to a record of the chain, at most 8 steps per sync.
+  each a `sync` to a record of the chain, at most 8 steps per sync. Each
+  `sync` names the unit's `state_seq` its part was built from
+  (`from_seq`); a unit at another seq refuses it `stale_sync` and the
+  Worker reads again, so a part from another base (a second isolate's
+  `sync` first, or a restore in between) is never applied.
   `placements_off` reads the chain again and sends once more; the same
   refusal again pages. A `sync` that kept a bucket closing because it
   still holds something pages `drop_not_closed`. A head that clears the
@@ -243,10 +247,14 @@ hand-out, and its writes are due from their own time.
   backoff capped at 1 s. A call answered `renew_needed` that finds a
   renewal of its unit running in its isolate waits for it, at most 5 s
   (est), and runs once more if it renewed; otherwise it answers
-  `renew_needed` (rule 12, AM-63). The state (renewals in flight, the
-  backoff, the waiter and the isolate's timer) is one `InFlight` per
-  isolate (AM-71); without a timer nothing waits. Background renewals do
-  not wait.
+  `renew_needed` (rule 12, AM-63). The waiting call looks every 50 ms
+  (est) on its own timer, so it never resumes in the renewing request's
+  turn. The state (renewals in flight, the backoff, the waiter and the
+  isolate's timer) is one `InFlight` per isolate (AM-71); without a timer
+  nothing waits. Background renewals do not wait. A queued `renew` job
+  takes the same slot: with a renewal of the unit running it is
+  acknowledged (`renewing`), and a stamp raise that needs one is handed
+  back.
 - **`key_row` after the signature** (AM-63): a `key_row` the unit
   answered marked `lease_expired` is used only to check the signature.
   `key_row_verified` then renews as a signed call and reads `key_row`
@@ -431,9 +439,11 @@ from the record's private part. In the `sync`'s transaction the unit:
    `~dropped/<bucket_id>`, so that a later `created` can take the name;
    the rest of the `sync` applies, and the answer names it for the
    operator's page (`drop_not_closed`). No object is deleted for it;
-2a. on every `sync` (after the changes, before the check) and on the
-   gate's last call after §8.6 step 7.4, drops each closing row the head
-   does not place once it holds nothing (`buckets::sweep_closing`);
+2a. on every `sync` with no `restoring` entry at either end (after the
+   changes, before the check) and on the gate's last call after §8.6
+   step 7.4, drops each closing row the head does not place once it holds
+   nothing (`buckets::sweep_closing`); a unit under an entry keeps its
+   closing rows too, as the 30-day copy keeps its rows;
 3. for `unplaced`, removes nothing while the unit's `restoring` entry is
    set, and otherwise drops those rows as in 2;
 4. checks that its bucket rows, less every closing row the head does not
