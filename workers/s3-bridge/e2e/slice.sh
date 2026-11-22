@@ -1138,12 +1138,20 @@ if [[ $MODE == local ]]; then
     curl -sf "${CURL_TLS[@]}" --max-time 60 "$BASE/__scheduled?cron=*/5+*+*+*+*" >/dev/null || return 1
     stage_reached lost.bin
   }
-  # 180 s, not 90: provider slots held by sessions of the stopped isolate
-  # stay claimed until their 120 s lease expires, and only then can the
-  # re-driven post job get a connection.
-  if ! poll 180 2 cron_then_check; then
+  # 300 s, not 90 or 180: the restart above is a new Worker version. With
+  # PERMITS=d1 the slots held by sessions of the stopped isolate stay
+  # claimed until their 120 s lease expires. With PERMITS=do the gate's
+  # handoff to a new version can hold job permits back for up to about
+  # 125 s; when that outlasts the re-driven post job's 120 s slot wait,
+  # the job is put off for 15 to 60 s, then posts and verifies. On CI that
+  # took 150 to 192 s after the restart, past the old 180 s window more
+  # than once. The check is unchanged: the PUT's own wake-up was refused,
+  # so the cron must send a replacement job, which the queue consumers
+  # then post and verify, bringing the object to release or done with a
+  # counted backbone.
+  if ! poll 300 2 cron_then_check; then
     json=$(adm "GET /_admin/objects/$SB/a/lost.bin" "$BASE/_admin/objects/$SB/a/lost.bin")
-    fail "a/lost.bin recovered by the scheduled handler within 180 s" "jq: ($REACHED) and ($COUNTED)" "$json"
+    fail "a/lost.bin recovered by the scheduled handler within 300 s" "jq: ($REACHED) and ($COUNTED)" "$json"
   fi
 else
   # The drop counter is dev-only: prove the real cron runs after deploy,
