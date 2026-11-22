@@ -218,8 +218,9 @@ Its secret is wrapped under its own domain (`velmora/app-password/v1`,
 not the S3 keys' `velmora/ak/v1`). A Worker built before key kinds
 cannot open it, so after a rollback below that build every request
 signed with an app password fails (`500 InternalError`) instead of
-being accepted as an S3 key on the public endpoint. Roll forward again
-(or revoke the app passwords) to give WebDAV users access back.
+being accepted as an S3 key on the public endpoint. Rolling forward again
+gives WebDAV users their access back. Revoking an app password instead
+deletes it for good: its holder needs a new one.
 
 ## Granting a key on another bucket
 
