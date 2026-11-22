@@ -8,7 +8,26 @@
 //! under the name (R2 `onlyIf`, verify on the deployed binding); the
 //! in-memory one is [`MemRecords`].
 
-use crate::types::Result;
+use sha2::{Digest, Sha256};
+
+use crate::types::{BucketId, Result};
+use crate::TenantId;
+
+/// The domain of a derived bucket id (ADR §6.2, "Grants").
+pub const BUCKET_ID_DOMAIN: &str = "velmora/bucket-id/v1";
+
+/// The id of the bucket whose creator grant is record `grant_seq` of
+/// `tenant`'s key chain: `b_` and the first 16 hex digits of
+/// SHA-256(`velmora/bucket-id/v1|<tenant>|<grant_seq>`), the seq in
+/// decimal. Bucket ids of managed tenants are derived, never drawn: the
+/// tenant chain admits a new bucket only under this id and only with a
+/// `grant_seq` above every earlier one, so an id never comes back.
+pub fn bucket_id(tenant: &TenantId, grant_seq: u64) -> BucketId {
+    let digest = Sha256::digest(format!("{BUCKET_ID_DOMAIN}|{tenant}|{grant_seq}").as_bytes());
+    let mut first = [0u8; 8];
+    first.copy_from_slice(&digest[..8]);
+    BucketId::mint(first)
+}
 
 /// A store of put-once records.
 #[allow(async_fn_in_trait)]
@@ -182,5 +201,22 @@ mod mem {
                 .cloned()
                 .collect())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::bucket_id;
+    use crate::TenantId;
+
+    #[test]
+    fn bucket_ids_are_derived_from_the_tenant_and_the_grant_seq() {
+        let a1 = TenantId::parse("t_00000000000000a1").unwrap();
+        let other = TenantId::parse("t_dead0001020304ff").unwrap();
+        // Fixed vectors: SHA-256 of `velmora/bucket-id/v1|<tenant>|<K>`.
+        assert_eq!(bucket_id(&a1, 1).as_str(), "b_9bad172a55286d31");
+        assert_eq!(bucket_id(&a1, 2).as_str(), "b_d7c5722c907594a0");
+        assert_eq!(bucket_id(&other, u64::MAX).as_str(), "b_b6d250124b1a4db9");
+        assert_ne!(bucket_id(&a1, 1), bucket_id(&other, 1));
     }
 }
