@@ -277,6 +277,8 @@ struct Chain<'a> {
     refuse: Cell<Option<velmora_mgmt_types::Code>>,
     /// The next create cannot record now (nothing written).
     busy: Cell<bool>,
+    /// The create after the next one is refused before any record.
+    refuse_second: Cell<Option<velmora_mgmt_types::Code>>,
     /// The chain cannot be read.
     unreadable: Cell<bool>,
     creates: Cell<u32>,
@@ -293,6 +295,7 @@ impl<'a> Chain<'a> {
             races: RefCell::new(Vec::new()),
             refuse: Cell::new(None),
             busy: Cell::new(false),
+            refuse_second: Cell::new(None),
             unreadable: Cell::new(false),
             creates: Cell::new(0),
         };
@@ -444,6 +447,11 @@ impl PrincipalChain for Chain<'_> {
         }
         if self.busy.take() {
             return Ok(ChainWrite::Busy);
+        }
+        if self.creates.get() == 2 {
+            if let Some(code) = self.refuse_second.take() {
+                return Ok(ChainWrite::Refused(code));
+            }
         }
         if let Some(other) = self.races.borrow_mut().pop() {
             self.push(other, None, None);
@@ -1213,7 +1221,7 @@ fn every_refusal_maps_to_its_contract_code() {
             Some((C::ActingPrincipalInactive, None)),
         ),
         (ActingPrincipalHeld, Some((C::ServiceUnavailable, Some(5)))),
-        (PrincipalExists, Some((C::PrincipalExists, None))),
+        (PrincipalExists, Some((C::ServiceUnavailable, Some(5)))),
         (InternalKeyRefused, Some((C::InternalKeyRefused, None))),
         (OwnerRefAmbiguous, None),
         (BucketAlreadyExists, None),
@@ -1396,4 +1404,51 @@ async fn more_than_64_grants_are_refused() {
         .await;
     expect_code(&a, 409, "grant_limit_reached", None);
     assert!(w.root.asks.borrow().is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// Review round 2
+// ---------------------------------------------------------------------------
+
+/// A put lost, then a refusal: the re-ask answers `again` for the
+/// reservation this call made, and the call still gives it back.
+#[tokio::test(flavor = "current_thread")]
+async fn a_call_gives_back_its_own_reservation_after_a_lost_put() {
+    let u = ready();
+    let w = World::new(&u);
+    w.chain.races.borrow_mut().push(RecordedPrincipal {
+        id: "p_other".into(),
+        owner_ref: "other-1".into(),
+        status: SubjectStatus::Active,
+        grants: vec![],
+    });
+    // The first put is lost; the second create (after the re-ask) is
+    // refused.
+    w.chain
+        .refuse_second
+        .set(Some(velmora_mgmt_types::Code::TenantUnavailable));
+    let a = w.send(CONFIRMED, None, Some(KEY), &signup()).await;
+    expect_code(&a, 409, "tenant_unavailable", None);
+    assert_eq!(w.root.asks.borrow().len(), 2);
+    assert_eq!(w.root.releases.get(), 1);
+    assert!(reservations(&u).is_empty());
+}
+
+/// A create for an `owner_ref` another create holds, before that one has
+/// a principal: `503`, and once the first is recorded the second answers
+/// `200` with it.
+#[tokio::test(flavor = "current_thread")]
+async fn a_create_racing_another_for_the_owner_ref_waits() {
+    let u = ready();
+    let w = World::new(&u);
+    w.chain.busy.set(true);
+    let a = w.send(CONFIRMED, None, Some(KEY), &signup()).await;
+    expect_code(&a, 503, "service_unavailable", Some(5));
+    let b = w.send(CONFIRMED, None, Some("other-key"), &signup()).await;
+    expect_code(&b, 503, "service_unavailable", Some(5));
+    let a = w.send(CONFIRMED, None, Some(KEY), &signup()).await;
+    assert_eq!(a.status, 201, "{a:?}");
+    let b = w.send(CONFIRMED, None, Some("other-key"), &signup()).await;
+    assert_eq!(b.status, 200, "{b:?}");
+    assert_eq!(json_of(&a), json_of(&b));
 }

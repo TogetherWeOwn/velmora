@@ -374,7 +374,11 @@ pub fn refusal(r: ReserveRefusal) -> Option<(Code, Option<u32>)> {
         ActingPrincipalUnknown => (Code::ActingPrincipalUnknown, None),
         ActingPrincipalInactive => (Code::ActingPrincipalInactive, None),
         ActingPrincipalHeld => (Code::ServiceUnavailable, Some(RETRY_AFTER_SECS)),
-        PrincipalExists => (Code::PrincipalExists, None),
+        // Another create holds the `owner_ref` and has no principal yet
+        // (a principal that exists answers `exists`): not final, a retry
+        // lands in `exists` once it is recorded, or in a reservation of
+        // its own once that one is released.
+        PrincipalExists => (Code::ServiceUnavailable, Some(RETRY_AFTER_SECS)),
         InternalKeyRefused => (Code::InternalKeyRefused, None),
         // Two principals for one `owner_ref` (the unit alarms), an id
         // that exists, a bucket's or a grant change's refusal, an ask
@@ -555,18 +559,19 @@ async fn finished<D: TenantDoor, K: PrincipalChain>(
 }
 
 /// Gives the reservation back after a refusal that left no record, but
-/// only when this call made it (`again` unset) and no record carries its
-/// `rid`: another call under the same reservation may be writing one.
-/// Best effort: the unit's sweep releases it after 1 hour anyway.
+/// only when this call made it (`ours`: its first admit was not a re-ask)
+/// and no record carries its `rid`: a reservation another call made may
+/// be writing its record. Best effort: the unit's sweep releases it after
+/// 1 hour anyway.
 async fn give_back<U: RootUnit, K: PrincipalChain>(
     unit: &U,
     chain: &K,
     tenant: &TenantId,
     rid: &Rid,
-    again: bool,
+    ours: bool,
     keys_seq: u64,
 ) {
-    if again {
+    if !ours {
         return;
     }
     if let Ok(None) = chain.carrying(tenant, rid, keys_seq).await {
@@ -630,6 +635,10 @@ where
     };
     let drawn_id = format!("p_{}", hex(&id_bytes));
     let mut asks = 0;
+    // The reservation this call made (an admit that was no re-ask): a
+    // re-ask after a lost put answers `again` for it, and it is still
+    // this call's to give back.
+    let mut made: Option<Rid> = None;
     while asks < MAX_ASKS {
         asks += 1;
         let Some(rid) = draw::<16, R>(ports.rng).map(Rid) else {
@@ -650,7 +659,7 @@ where
             Ok(answer) => answer,
             Err(_) => return unavailable(),
         };
-        let (rid, keys_seq, again, scope, subject) = match answer {
+        let (rid, keys_seq, ours, scope, subject) = match answer {
             ReserveAnswer::Admitted {
                 rid,
                 keys_seq,
@@ -666,7 +675,10 @@ where
                     }
                 }
                 let subject = subject.unwrap_or_else(|| drawn_id.clone());
-                (rid, keys_seq, again, scope, subject)
+                if !again {
+                    made = Some(rid);
+                }
+                (rid, keys_seq, made == Some(rid), scope, subject)
             }
             // The unit holds the record, perhaps closed (the directory
             // not yet acknowledged it): the stores are brought up first.
@@ -739,7 +751,7 @@ where
         match placed(ports.door, &tenant, &grants).await {
             Ok(true) => {}
             Ok(false) => {
-                give_back(ports.unit, ports.chain, &tenant, &rid, again, keys_seq).await;
+                give_back(ports.unit, ports.chain, &tenant, &rid, ours, keys_seq).await;
                 return code(Code::BucketNotFound, None);
             }
             Err(_) => return unavailable(),
@@ -802,7 +814,7 @@ where
             Ok(ChainWrite::Unfinished) | Ok(ChainWrite::Busy) | Err(_) => return unavailable(),
             Ok(ChainWrite::Lost) => continue,
             Ok(ChainWrite::Refused(c)) => {
-                give_back(ports.unit, ports.chain, &tenant, &rid, again, keys_seq).await;
+                give_back(ports.unit, ports.chain, &tenant, &rid, ours, keys_seq).await;
                 return code(c, c.retry_after().then_some(RETRY_AFTER_SECS));
             }
         }
