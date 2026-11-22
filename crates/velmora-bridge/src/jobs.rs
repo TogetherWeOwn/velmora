@@ -37,6 +37,7 @@ use crate::ports::{
 use crate::post::{settle, Stop, POST_SOCKET_BYTES};
 use crate::recovery::delete_blob;
 use crate::stamp::Advance;
+use crate::tenant::TenantScope;
 use crate::types::{
     BlobStoreKind, DispatchReport, EvictCandidate, ExtentId, FailClass, GcRow, GcStep,
     GenerationId, Job, JobOutcome, Oldest, OutboxStage, Resend, Result, UnixMs, JOB_VERSION,
@@ -213,7 +214,11 @@ where
     T: Clock,
 {
     /// Runs one queue job to an outcome. Never panics on a stale job.
-    pub async fn run_job(&self, job: &Job) -> JobOutcome {
+    ///
+    /// `scope` is the tenant the job runs for. The message does not name
+    /// one: the consumer makes the scope, and every stage that names a
+    /// stored blob takes its name from it.
+    pub async fn run_job(&self, scope: &TenantScope, job: &Job) -> JobOutcome {
         if self.cfg.maintenance == Maintenance::Restore {
             // The outbox keeps the obligation; the dispatcher re-sends it
             // once maintenance has ended and the row's mark has aged.
@@ -244,23 +249,23 @@ where
                 extent,
                 generation,
                 stage,
-            } if *v == JOB_VERSION => self.run_extent(extent, generation, *stage).await,
+            } if *v == JOB_VERSION => self.run_extent(scope, extent, generation, *stage).await,
             Job::Wake {
                 v,
                 extent,
                 generation,
                 stage,
                 ..
-            } if *v == JOB_VERSION => self.run_extent(extent, generation, *stage).await,
-            Job::Gc { v } if *v == JOB_VERSION => self.run_gc().await,
+            } if *v == JOB_VERSION => self.run_extent(scope, extent, generation, *stage).await,
+            Job::Gc { v } if *v == JOB_VERSION => self.run_gc(scope).await,
             Job::Evict { v, remaining } if *v == JOB_VERSION => {
-                match self.evict_batch(*remaining).await {
+                match self.evict_batch(scope, *remaining).await {
                     Ok(_) => JobOutcome::Ack,
                     // Every step is idempotent, so the batch simply runs again.
                     Err(_) => RETRY,
                 }
             }
-            Job::Sweep { v, write } if *v == JOB_VERSION => self.sweep_write(write).await,
+            Job::Sweep { v, write } if *v == JOB_VERSION => self.sweep_write(scope, write).await,
             // Run by the adapter that holds the recovery store
             // (`crate::copy`), never here: one that arrives all the same
             // is dropped, and the next pass does its work.
@@ -292,6 +297,7 @@ where
 
     async fn run_extent(
         &self,
+        scope: &TenantScope,
         extent: &ExtentId,
         generation: &GenerationId,
         stage: OutboxStage,
@@ -316,10 +322,14 @@ where
             Err(_) => return RETRY,
         };
         if stage != OutboxStage::Post {
-            return self.run_leased(&lease, extent, generation, stage).await;
+            return self
+                .run_leased(scope, &lease, extent, generation, stage)
+                .await;
         }
         crate::trace::begin(extent, started);
-        let outcome = self.run_leased(&lease, extent, generation, stage).await;
+        let outcome = self
+            .run_leased(scope, &lease, extent, generation, stage)
+            .await;
         crate::trace::finish(extent, self.clock.now());
         outcome
     }
@@ -327,6 +337,7 @@ where
     /// The part of [`Self::run_extent`] after a successful claim.
     async fn run_leased(
         &self,
+        scope: &TenantScope,
         lease: &Lease,
         extent: &ExtentId,
         generation: &GenerationId,
@@ -366,32 +377,33 @@ where
             return settle(&self.catalog, &self.clock, lease, Stop::NoPermit).await;
         };
         match stage {
-            OutboxStage::Post => self.post_stage(lease, &row).await,
-            OutboxStage::Verify => self.verify_stage(lease, &row).await,
+            OutboxStage::Post => self.post_stage(scope, lease, &row).await,
+            OutboxStage::Verify => self.verify_stage(scope, lease, &row).await,
             _ => self.release_stage(lease, &row).await,
         }
     }
 
-    /// Handles up to [`GC_BATCH`] due `gc` rows in the mode `GC_MODE`
-    /// allows, and one window of orphaned upload parts with `GC_ORPHANS`.
-    async fn run_gc(&self) -> JobOutcome {
+    /// Handles up to [`GC_BATCH`] due `gc` rows of the tenant of `scope`
+    /// in the mode `GC_MODE` allows, and one window of its orphaned upload
+    /// parts with `GC_ORPHANS` (a unit's catalogue has none yet).
+    async fn run_gc(&self, scope: &TenantScope) -> JobOutcome {
         // Every step of both is idempotent, so a failed job simply runs
         // again.
         let mut outcome = JobOutcome::Ack;
         let rows = match self.cfg.gc_mode {
             GcMode::Off => Ok(()),
-            GcMode::Disposable => self.gc_batch(true).await,
+            GcMode::Disposable => self.gc_batch(scope, true).await,
         };
         if rows.is_err() {
             outcome = RETRY;
         }
-        if self.cfg.gc_orphans && self.orphan_batch().await.is_err() {
+        if self.cfg.gc_orphans && self.orphan_batch(scope).await.is_err() {
             outcome = RETRY;
         }
         outcome
     }
 
-    async fn gc_batch(&self, disposable_only: bool) -> Result<()> {
+    async fn gc_batch(&self, scope: &TenantScope, disposable_only: bool) -> Result<()> {
         // Nothing is deleted on a catalogue that is behind its stamp:
         // its rows may name as garbage what a later commit used. A check
         // that could not be made retries the job.
@@ -404,7 +416,7 @@ where
         // stays due, and the first error makes the job retry.
         let mut failed = None;
         for row in &rows {
-            if let Err(e) = self.gc_row(row).await {
+            if let Err(e) = self.gc_row(scope, row).await {
                 failed.get_or_insert(e);
             }
         }
@@ -417,13 +429,22 @@ where
     }
 
     /// One `gc` row: the catalogue re-checks that no live generation uses
-    /// the extent and names the one blob that may go.
-    async fn gc_row(&self, row: &GcRow) -> Result<()> {
+    /// the extent and says which of its two blobs may go. The blob's name
+    /// comes from the row's extent and the job's scope, not from the
+    /// catalogue: its delete list names tenant 0's blobs (its rows carry
+    /// no tenant), so for tenant 0 the name is the same, and a managed
+    /// tenant's unit can never name a blob outside that tenant's own
+    /// names.
+    async fn gc_row(&self, scope: &TenantScope, row: &GcRow) -> Result<()> {
         match self.catalog.gc_begin(row, self.clock.now()).await? {
-            GcStep::DeleteBlob { store, key } => {
+            GcStep::DeleteBlob { store, .. } => {
                 match store {
-                    BlobStoreKind::Safety => delete_blob(&self.safety, &key).await?,
-                    BlobStoreKind::Cache => delete_blob(&self.cache, &key).await?,
+                    BlobStoreKind::Safety => {
+                        delete_blob(&self.safety, &scope.safety_key(&row.extent_id)).await?
+                    }
+                    BlobStoreKind::Cache => {
+                        delete_blob(&self.cache, &scope.cache_key(&row.extent_id)).await?
+                    }
                 }
                 self.catalog.gc_done(row.id, self.clock.now()).await
             }
@@ -436,7 +457,7 @@ where
     /// The scan has already moved past the window, so a job that runs
     /// again after an error reads the next one, and the rows that failed
     /// wait for the next pass.
-    async fn orphan_batch(&self) -> Result<()> {
+    async fn orphan_batch(&self, scope: &TenantScope) -> Result<()> {
         // As in `gc_batch`: nothing is deleted on a catalogue that is
         // behind its stamp.
         if self.catalogue_rolled_back().await? {
@@ -456,7 +477,7 @@ where
         let (granted, claimed) = self.catalog.gc_orphan_claim(&rows, now, cutoff).await;
         let mut failed = claimed.err();
         for (row, _) in rows.iter().zip(granted).filter(|(_, granted)| *granted) {
-            if let Err(e) = self.orphan_row(row).await {
+            if let Err(e) = self.orphan_row(scope, row).await {
                 failed.get_or_insert(e);
             }
         }
@@ -464,8 +485,8 @@ where
     }
 
     /// One orphaned part whose claim was granted.
-    async fn orphan_row(&self, row: &GcRow) -> Result<()> {
-        delete_blob(&self.safety, &row.extent_id.safety_key()).await?;
+    async fn orphan_row(&self, scope: &TenantScope, row: &GcRow) -> Result<()> {
+        delete_blob(&self.safety, &scope.safety_key(&row.extent_id)).await?;
         self.catalog.gc_orphan_done(row.id, self.clock.now()).await
     }
 
@@ -488,7 +509,7 @@ where
     /// the dispatcher starts a new drain if the tier is still over the
     /// cap. Only a first step that is retried after an error totals the
     /// tier again and goes on from there.
-    pub async fn evict_batch(&self, remaining: u64) -> Result<u64> {
+    pub async fn evict_batch(&self, scope: &TenantScope, remaining: u64) -> Result<u64> {
         // As in garbage collection: no delete on a catalogue that is
         // behind its stamp.
         if self.catalogue_rolled_back().await? {
@@ -517,7 +538,7 @@ where
             if excess == 0 {
                 break;
             }
-            match self.evict_one(row).await {
+            match self.evict_one(scope, row).await {
                 Ok(Some(bytes)) => {
                     freed = freed.saturating_add(bytes);
                     excess = excess.saturating_sub(bytes);
@@ -556,7 +577,7 @@ where
     /// freed. `None` when something else changed the extent meanwhile:
     /// either the catalogue refused the eviction (nothing was deleted), or
     /// it could not be finished as begun.
-    async fn evict_one(&self, row: &EvictCandidate) -> Result<Option<u64>> {
+    async fn evict_one(&self, scope: &TenantScope, row: &EvictCandidate) -> Result<Option<u64>> {
         if !self.catalog.begin_evict(row).await? {
             return Ok(None);
         }
@@ -564,9 +585,9 @@ where
         // did not count goes too. The one exception is the safety copy of
         // a pinned extent, which is not part of the claim.
         if !row.pinned {
-            delete_blob(&self.safety, &row.extent.safety_key()).await?;
+            delete_blob(&self.safety, &scope.safety_key(&row.extent)).await?;
         }
-        delete_blob(&self.cache, &row.extent.cache_key()).await?;
+        delete_blob(&self.cache, &scope.cache_key(&row.extent)).await?;
         // `false`: a cold read refilled the cache, or another eviction
         // took the extent, since `begin_evict`. The counts stand, and
         // what this drain still has to evict is no longer known.

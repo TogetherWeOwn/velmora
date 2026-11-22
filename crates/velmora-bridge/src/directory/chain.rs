@@ -481,8 +481,9 @@ fn keyless(door: &TenantDoor) -> bool {
 }
 
 /// The key version a record's private part is sealed under: its
-/// `tk_version`, and 0 for a record with no tenant key.
-fn seal_version(door: &TenantDoor) -> u32 {
+/// `tk_version`, and 0 for a record with no tenant key. The seal checks a
+/// door against it before it seals ([`super::seal::ChainSeal`]).
+pub fn seal_version(door: &TenantDoor) -> u32 {
     match keyless(door) {
         true => 0,
         false => door.tk_version,

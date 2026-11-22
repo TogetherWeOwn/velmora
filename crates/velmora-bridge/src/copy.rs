@@ -140,6 +140,7 @@ use crate::recovery::{
     RECORD_PREFIX, SEGMENTED_VERSION, TENANT_DIR, TENANT_KEY_PREFIX,
 };
 use crate::remote::{md5_hex, HttpSend, RemoteError, S3Remote, MAX_KEY_BYTES};
+use crate::tenant::TenantScope;
 use crate::types::{
     BridgeError, BucketId, ExtentId, Job, JobOutcome, OutboxStage, Result, UnixMs, JOB_VERSION,
 };
@@ -388,8 +389,10 @@ impl Phase {
     fn layout(self) -> Layout {
         use Phase::*;
         match self {
+            // The copy goes through the records of the whole store, and
+            // tenant 0 is the one tenant that has any.
             TenantTombstones | TenantGenerations | TenantLow | TenantHigh | Tail => {
-                Layout::default_tenant()
+                Layout::of(&TenantScope::tenant_zero())
             }
             Tombstones | Generations | Low | High | Plan => Layout::flat(),
         }
@@ -1911,7 +1914,7 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
         if !matches!(plan, Plan::Absent | Plan::Unreadable) {
             return plan;
         }
-        match other_plan_key(key) {
+        match other_plan_key(&TenantScope::tenant_zero(), key) {
             Some(other) => match self.plan_at(&other).await {
                 Plan::Absent => plan,
                 found => found,

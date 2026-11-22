@@ -143,6 +143,18 @@ impl KeyVersionClaims for CommittedClaim<'_> {
     async fn commit(&self, _: &TenantId, _: u32, _: [u8; 8]) -> Result<Commit> {
         panic!("a committed claim must not be committed again");
     }
+
+    async fn committed_kcv(
+        &self,
+        _: &TenantId,
+        version: u32,
+    ) -> Result<velmora_bridge::keys::tk::KeyCheck> {
+        use velmora_bridge::keys::tk::KeyCheck;
+        Ok(match version == self.0.version() {
+            true => KeyCheck::Committed(self.0.check_value()),
+            false => KeyCheck::NotCommitted,
+        })
+    }
 }
 
 /// Committed adoption refuses the arbiter's shred marker even with a valid replica.

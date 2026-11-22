@@ -295,7 +295,13 @@ impl T {
         assert_eq!(report.gc_enqueued, !jobs.is_empty());
         assert!(jobs.len() <= 1);
         for job in &jobs {
-            assert_eq!(self.rig.bridge.run_job(job).await, JobOutcome::Ack);
+            assert_eq!(
+                self.rig
+                    .bridge
+                    .run_job(&TenantScope::tenant_zero(), job)
+                    .await,
+                JobOutcome::Ack
+            );
         }
         !jobs.is_empty()
     }
@@ -571,7 +577,13 @@ async fn off_by_default_and_nothing_is_deleted_while_off() {
     // (sent before the switch went off) does nothing.
     assert!(!t.tick().await);
     let job = Job::Gc { v: 1 };
-    assert_eq!(t.rig.bridge.run_job(&job).await, JobOutcome::Ack);
+    assert_eq!(
+        t.rig
+            .bridge
+            .run_job(&TenantScope::tenant_zero(), &job)
+            .await,
+        JobOutcome::Ack
+    );
     assert_eq!(t.blobs(), blobs);
     assert_eq!(
         t.count("SELECT COUNT(*) FROM gc WHERE done_at IS NOT NULL"),
@@ -849,7 +861,9 @@ async fn a_completion_racing_the_collector_loses_nothing() {
                 assert_eq!(claimed, [false], "a listed part was claimed");
             }
             let job = Job::Gc { v: 1 };
-            let outcome = bridge.run_job(&job).now_or_never();
+            let outcome = bridge
+                .run_job(&TenantScope::tenant_zero(), &job)
+                .now_or_never();
             assert_eq!(outcome, Some(JobOutcome::Ack));
             seen.set(true);
         }),
@@ -1771,7 +1785,10 @@ async fn a_job_whose_claim_an_error_cuts_short_deletes_what_was_granted() {
     assert!(t.rig.bridge.dispatch().await.unwrap().gc_enqueued);
     let job = t.rig.bridge.jobs.inner.take().remove(0).job;
     assert!(matches!(
-        t.rig.bridge.run_job(&job).await,
+        t.rig
+            .bridge
+            .run_job(&TenantScope::tenant_zero(), &job)
+            .await,
         JobOutcome::Retry { .. }
     ));
     // The part of the aborted upload went, and its row is closed.
@@ -1856,7 +1873,10 @@ async fn a_blob_delete_that_fails_is_repeated_by_the_next_pass() {
     assert!(t.rig.bridge.dispatch().await.unwrap().gc_enqueued);
     let job = t.rig.bridge.jobs.inner.take().remove(0).job;
     assert!(matches!(
-        t.rig.bridge.run_job(&job).await,
+        t.rig
+            .bridge
+            .run_job(&TenantScope::tenant_zero(), &job)
+            .await,
         JobOutcome::Retry { .. }
     ));
     assert_eq!(t.blobs(), BTreeSet::from([stuck.clone()]));
@@ -1870,7 +1890,13 @@ async fn a_blob_delete_that_fails_is_repeated_by_the_next_pass() {
         1
     );
     // The job that runs again reads the rest of the pass: nothing.
-    assert_eq!(t.rig.bridge.run_job(&job).await, JobOutcome::Ack);
+    assert_eq!(
+        t.rig
+            .bridge
+            .run_job(&TenantScope::tenant_zero(), &job)
+            .await,
+        JobOutcome::Ack
+    );
     assert_eq!(t.blobs().len(), 1);
 
     *t.rig.bridge.safety.fail_delete.borrow_mut() = None;
@@ -1899,7 +1925,13 @@ async fn nothing_is_deleted_on_a_catalogue_behind_its_stamp() {
 
     // The job on its own: it compares the stamp before it reads a row.
     let job = Job::Gc { v: 1 };
-    assert_eq!(t.rig.bridge.run_job(&job).await, JobOutcome::Ack);
+    assert_eq!(
+        t.rig
+            .bridge
+            .run_job(&TenantScope::tenant_zero(), &job)
+            .await,
+        JobOutcome::Ack
+    );
     assert_eq!(t.blobs(), blobs);
     assert_eq!(
         t.count("SELECT COUNT(*) FROM scan_cursors WHERE k = 'orphans'"),
@@ -2247,7 +2279,13 @@ async fn rows_written_per_collected_part() {
         let sql = &t.catalog().sql;
         sql.meter_writes().unwrap();
         let job = Job::Gc { v: 1 };
-        assert_eq!(t.rig.bridge.run_job(&job).await, JobOutcome::Ack);
+        assert_eq!(
+            t.rig
+                .bridge
+                .run_job(&TenantScope::tenant_zero(), &job)
+                .await,
+            JobOutcome::Ack
+        );
         assert!(t.blobs().is_empty());
         let writes = sql.writes();
         let by = |needle: &str| -> u64 {

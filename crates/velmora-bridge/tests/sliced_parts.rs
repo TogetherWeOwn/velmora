@@ -152,7 +152,9 @@ fn in_gc(rig: &Rig) -> Vec<String> {
 async fn collect(rig: &Rig) {
     rig.bridge.clock.advance_secs(7 * 86_400);
     assert_eq!(
-        rig.bridge.run_job(&Job::Gc { v: JOB_VERSION }).await,
+        rig.bridge
+            .run_job(&TENANT_ZERO, &Job::Gc { v: JOB_VERSION })
+            .await,
         JobOutcome::Ack
     );
 }
@@ -1118,7 +1120,7 @@ async fn a_catalogue_restored_into_a_part_keeps_its_slices() {
     let write = intents(&s.rig)[0].write.clone();
 
     assert_eq!(
-        s.rig.bridge.run_job(&sweep_job(&write)).await,
+        s.rig.bridge.run_job(&TENANT_ZERO, &sweep_job(&write)).await,
         JobOutcome::Ack
     );
     assert_eq!(blobs(&s.rig), all);
@@ -1131,3 +1133,6 @@ async fn a_catalogue_restored_into_a_part_keeps_its_slices() {
     assert_eq!(blobs(&s.rig), all);
     assert_eq!(part.len(), SLICES);
 }
+
+/// The one tenant there is.
+static TENANT_ZERO: velmora_bridge::TenantScope = velmora_bridge::TenantScope::tenant_zero();

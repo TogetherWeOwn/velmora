@@ -403,7 +403,12 @@ async fn a_read_from_usenet_serves_under_the_freeze() {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(rig.bridge.post_stage(&lease, &job).await, JobOutcome::Ack);
+        assert_eq!(
+            rig.bridge
+                .post_stage(&TenantScope::tenant_zero(), &lease, &job)
+                .await,
+            JobOutcome::Ack
+        );
         for (store, key) in [
             (&rig.bridge.cache, extent.id.cache_key()),
             (&rig.bridge.safety, extent.id.safety_key()),
