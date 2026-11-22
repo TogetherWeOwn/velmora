@@ -86,8 +86,10 @@ cleanup() {
   local rc=$?
   set +e
   for pid in "${PIDS[@]}"; do stop_group "$pid"; done
-  rm -f "$S3_DIR/.dev.vars"
-  rm -rf "$T"
+  if [[ -e $S3_DIR/.dev.vars ]]; then
+    rm -- "$S3_DIR/.dev.vars"
+  fi
+  rm -r -- "$T"
   exit "$rc"
 }
 trap cleanup EXIT
@@ -149,7 +151,7 @@ PIDS+=($!)
 wait_port "$S3_PORT" "${PIDS[-1]}" "$T/s3.log"
 log "starting the gateway on $DAV_PORT"
 (cd "$DAV_DIR" && exec setsid npx --yes wrangler@4 dev --env dev --local --ip 127.0.0.1 --port "$DAV_PORT" \
-  --var "S3_HOST:127.0.0.1:$S3_PORT" --persist-to "$T/state" --show-interactive-dev-session=false \
+  --var DAV_ENABLED:true --var "S3_HOST:127.0.0.1:$S3_PORT" --persist-to "$T/state" --show-interactive-dev-session=false \
   >"$T/dav.log" 2>&1 </dev/null) &
 PIDS+=($!)
 wait_port "$DAV_PORT" "${PIDS[-1]}" "$T/dav.log"
@@ -165,7 +167,7 @@ S3_ID=$(jq -r .access_key_id "$T/s3.json")
 S3_SECRET=$(jq -r .secret "$T/s3.json")
 SECRETS+=("$APP_SECRET" "$S3_SECRET")
 [[ $APP_ID == APVL* && $S3_ID == AKVL* ]] || fail "admin keys" "an APVL and an AKVL key" "$APP_ID $S3_ID"
-rm -f "$T/app.json" "$T/s3.json"
+rm -- "$T/app.json" "$T/s3.json"
 
 # rclone remotes, configured from the environment only.
 export RCLONE_CONFIG="$T/rclone.conf"
