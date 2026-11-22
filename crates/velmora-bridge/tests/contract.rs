@@ -2947,12 +2947,13 @@ fn wrangler_tables() -> (Vec<String>, Vec<String>, Vec<String>) {
 /// declares and binds the permit gate in deploys of their own, after the
 /// code that knows `PERMITS` has run ("Shipping the gate" in
 /// ops/README.md). Deploy 2 declared the class `PermitGate`; deploy 3
-/// adds the `PERMIT_GATE` binding and `[version_metadata]`, and
-/// `PERMITS` stays `"d1"` until a deploy of its own. The legacy
+/// added the `PERMIT_GATE` binding and `[version_metadata]`; deploy 4,
+/// a deploy of its own, set production's `PERMITS` to `"do"` (dev keeps
+/// `"d1"`; its end-to-end run sets `do` itself). The legacy
 /// `[[migrations]]` array is never used: once a class is declared by
 /// `exports`, a deploy that declares one by `[[migrations]]` is refused.
 #[test]
-fn production_declares_and_binds_the_gate_with_permits_d1() {
+fn production_declares_and_binds_the_gate_and_takes_permits_from_it() {
     let (prod, env, root) = wrangler_tables();
     let gate = |key: &str| {
         let first = key.split('.').next().unwrap_or_default();
@@ -2993,7 +2994,7 @@ fn production_declares_and_binds_the_gate_with_permits_d1() {
         );
     }
     let (vars, dev) = wrangler_vars();
-    assert_eq!(vars.get("PERMITS").map(String::as_str), Some("d1"));
+    assert_eq!(vars.get("PERMITS").map(String::as_str), Some("do"));
     assert_eq!(dev.get("PERMITS").map(String::as_str), Some("d1"));
     assert!(
         !env.iter().any(|t| t.ends_with(".migrations")),
