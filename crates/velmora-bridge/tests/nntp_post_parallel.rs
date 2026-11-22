@@ -842,6 +842,32 @@ async fn a_cooldown_that_begins_during_the_wait_puts_the_job_off() {
     assert_eq!((row.attempts, row.next_at), (0, until));
 }
 
+#[tokio::test]
+async fn a_grant_for_a_cooling_poster_is_returned_before_waiting_again() {
+    let mut rig = rig(&[spec("bb0", 2), spec("bb1", 2)]).await;
+    rig.bridge.cfg.providers[1].priority = 1;
+    let s = rig.seed(1, b"a job waiting to post").await;
+    let now = rig.bridge.clock.now();
+    let released = rig.take_slots(0, now.plus_secs(30)).await;
+    rig.take_slots(1, now.plus_secs(30)).await;
+    rig.with_pocketed_grant(released);
+    let catalog = &rig.bridge.catalog;
+    catalog.cool_from("p0", now.plus_ms(1), now.plus_secs(600));
+
+    let mut posting = Box::pin(rig.run_post(&s));
+    let mut cx = core::task::Context::from_waker(futures_util::task::noop_waker_ref());
+    assert!(std::future::Future::poll(posting.as_mut(), &mut cx).is_pending());
+    {
+        let waits = catalog.line_waits.borrow();
+        assert_eq!(waits.len(), 2);
+        assert_eq!(waits[0].1, ["p0"]);
+        assert_eq!(waits[1].1, ["p1"]);
+    }
+    let load = catalog.provider_load(rig.bridge.clock.now()).await.unwrap();
+    assert_eq!(load[0].held, 0, "cooling poster still holds a slot");
+    assert_eq!(load[1].held, 1);
+}
+
 /// Where the slots have a line the job stands in it and does not ask
 /// while it waits: it is refused once, waits for the first tier only
 /// and for what is left of the slot-wait window from its claim. It

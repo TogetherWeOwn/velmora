@@ -1981,6 +1981,41 @@ async fn a_provider_whose_retention_ends_during_the_wait_is_not_asked_again() {
     assert_eq!(rows[0].result, VerifyResult::Ok);
 }
 
+#[tokio::test]
+async fn a_grant_for_a_provider_past_retention_is_returned_before_waiting_again() {
+    let mut rig = shared_backbone_rig().await;
+    rig.bridge.cfg.required_backbones = 1;
+    rig.bridge.cfg.providers[0].retention_days = Some(1);
+    rig.bridge.cfg.providers[1].retention_days = Some(2);
+    rig.bridge.cfg.providers[1].priority = 1;
+    let (s, plan) = rig.posted(53).await;
+    let oldest = plan.iter().filter_map(|row| row.posted_at).min().unwrap();
+    let clock = &rig.bridge.clock;
+    let until = oldest.plus_secs(86_400);
+    clock.advance_secs(u32::try_from((until.0 - clock.now().0) / 1_000 - 4).unwrap());
+    let now = clock.now();
+    let released = rig.take_slots(0, now.plus_secs(30)).await;
+    let busy = rig.take_slots(1, now.plus_secs(30)).await.len();
+    rig.with_pocketed_grant(released);
+    let catalog = &rig.bridge.catalog;
+
+    let mut verifying = Box::pin(rig.run(&s, OutboxStage::Verify));
+    let mut cx = core::task::Context::from_waker(futures_util::task::noop_waker_ref());
+    assert!(std::future::Future::poll(verifying.as_mut(), &mut cx).is_pending());
+    {
+        let waits = catalog.line_waits.borrow();
+        assert_eq!(waits.len(), 2);
+        assert_eq!(waits[0].1, ["p0", "p1"]);
+        assert_eq!(waits[1].1, ["p1"]);
+    }
+    let load = catalog.provider_load(rig.bridge.clock.now()).await.unwrap();
+    assert_eq!(
+        load[0].held, 0,
+        "expired-retention provider still holds a slot"
+    );
+    assert_eq!(load[1].held as usize, busy);
+}
+
 /// The line did not come to the job in the time it had: it is put off
 /// without having asked again and without an attempt.
 #[tokio::test]

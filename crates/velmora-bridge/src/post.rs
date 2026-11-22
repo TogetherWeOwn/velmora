@@ -671,6 +671,11 @@ where
                 .filter(|p| p.post && p.priority <= first_tier[0].priority)
                 .collect();
             let back = pool.cooling_until(&relevant);
+            // The first tier can change while a grant is on its way.
+            // None of the refreshed tier's providers yielded a session.
+            if waited {
+                self.catalog.leave_line(&holder);
+            }
             if !self.slot_wait(lease, first_tier, back).await {
                 break (cooling, probing, order, held);
             }

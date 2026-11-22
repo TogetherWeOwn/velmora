@@ -415,6 +415,9 @@ pub struct MemCatalog {
     /// Permits another holder gives back to the job that waits in the
     /// line.
     pub line_frees: RefCell<Vec<Permit>>,
+    /// When set, the next grant takes and pockets a real fake-catalogue slot.
+    line_grant_clock: RefCell<Option<FixedClock>>,
+    line_pocket: RefCell<Option<(String, Permit)>>,
     /// Each wait in the line: the holder, its providers and the time
     /// it had.
     pub line_waits: RefCell<Vec<(String, Vec<String>, i64)>>,
@@ -468,6 +471,14 @@ impl MemCatalog {
                 verifications: Vec::new(),
             },
         );
+    }
+
+    fn free_slot(&self, p: &Permit) {
+        let mut slots = self.slots.borrow_mut();
+        let slot = &mut slots.get_mut(&slot_key(p)).expect("seeded")[p.slot as usize];
+        if slot.token == p.token {
+            slot.until = 0;
+        }
     }
 
     pub fn outbox(&self, extent: &ExtentId) -> OutboxRow {
@@ -1351,11 +1362,7 @@ impl Catalog for MemCatalog {
     }
 
     async fn release_permit(&self, p: &Permit) -> Result<()> {
-        let mut slots = self.slots.borrow_mut();
-        let slot = &mut slots.get_mut(&slot_key(p)).expect("seeded")[p.slot as usize];
-        if slot.token == p.token {
-            slot.until = 0;
-        }
+        self.free_slot(p);
         Ok(())
     }
 
@@ -1379,10 +1386,23 @@ impl Catalog for MemCatalog {
                 return Ok(SlotWait::Elapsed);
             }
             SlotWait::Granted => {
-                sleep(LINE_MS).await;
+                let clock = self.line_grant_clock.borrow_mut().take();
+                if clock.is_none() {
+                    sleep(LINE_MS).await;
+                }
                 let freed: Vec<Permit> = self.line_frees.borrow_mut().drain(..).collect();
                 for permit in freed {
                     self.release_permit(&permit).await?;
+                }
+                if let Some(clock) = clock {
+                    let permit = self
+                        .acquire_permit(providers[0], PermitClass::Background, holder, clock.now())
+                        .await?
+                        .expect("the first provider has just freed a slot");
+                    self.line_pocket.replace(Some((holder.to_string(), permit)));
+                    self.line.set(Some(SlotWait::Elapsed));
+                    // The slot is held while the grant travels to the job.
+                    sleep(LINE_MS).await;
                 }
             }
             SlotWait::Elapsed => sleep(u32::try_from(ms).expect("a wait in ms")).await,
@@ -1393,6 +1413,11 @@ impl Catalog for MemCatalog {
 
     fn leave_line(&self, holder: &str) {
         self.line_left.borrow_mut().push(holder.to_string());
+        let mut pocket = self.line_pocket.borrow_mut();
+        if pocket.as_ref().is_some_and(|(owner, _)| owner == holder) {
+            let (_, permit) = pocket.take().unwrap();
+            self.free_slot(&permit);
+        }
     }
 
     // Not used by the post, verify, release or cold-read paths.
@@ -2035,6 +2060,25 @@ impl Rig {
         self.bridge.budget = ByteBudget::new(48 * 1024 * 1024).with_sleeper(Rc::new(move |ms| {
             clock.advance_ms(i64::from(ms));
             Box::pin(async {})
+        }));
+    }
+
+    /// The first wait pockets a slot; the second stays pending so the
+    /// test can inspect the slots before the job's stage cleanup.
+    pub fn with_pocketed_grant(&mut self, released: Vec<Permit>) {
+        let clock = self.bridge.clock.clone();
+        let catalog = &self.bridge.catalog;
+        catalog.line.set(Some(SlotWait::Granted));
+        catalog.line_frees.borrow_mut().extend(released);
+        catalog.line_grant_clock.replace(Some(clock.clone()));
+        let first = Cell::new(true);
+        self.bridge.budget = ByteBudget::new(48 * 1024 * 1024).with_sleeper(Rc::new(move |ms| {
+            if first.replace(false) {
+                clock.advance_ms(i64::from(ms));
+                Box::pin(core::future::ready(()))
+            } else {
+                Box::pin(core::future::pending())
+            }
         }));
     }
 
