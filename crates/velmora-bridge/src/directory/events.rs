@@ -172,7 +172,7 @@ pub fn key_events(tenant: &TenantId, record: &ChainRecord) -> Vec<NewEvent> {
         'k',
         r.seq,
         at,
-        None,
+        r.call_key_hash.as_deref(),
         vec![(kind, data)],
     )
 }
@@ -226,7 +226,7 @@ mod tests {
     }
 
     fn record(op: KeyOp, kind: SubjectKind, status: SubjectStatus) -> ChainRecord {
-        ChainRecord::Key(KeyRecord {
+        ChainRecord::Key(Box::new(KeyRecord {
             seq: 7,
             op,
             at: 99,
@@ -245,7 +245,24 @@ mod tests {
             private_unchanged: false,
             frozen_at: None,
             rid: None,
-        })
+            call_key_hash: None,
+        }))
+    }
+
+    #[test]
+    fn key_create_event_carries_key_hash() {
+        let mut created = record(KeyOp::Create, SubjectKind::S3, SubjectStatus::Active);
+        let ChainRecord::Key(key) = &mut created else {
+            unreachable!();
+        };
+        let hash = "0123456789abcdef".repeat(4);
+        key.call_key_hash = Some(hash.clone());
+
+        let events = key_events(&tenant(), &created);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, "key.created");
+        assert_eq!(events[0].source, "k/7");
+        assert_eq!(events[0].data.get("key_hash"), Some(&Value::from(hash)));
     }
 
     #[test]
