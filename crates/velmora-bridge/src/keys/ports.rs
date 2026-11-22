@@ -27,6 +27,20 @@ pub enum ApplyEntry {
     /// entry is sent without its secret, and then also without
     /// `secret_kek_version` (the unit refuses one without the other).
     Subject(Entry),
+    /// A subject's record the store must hold closed although its private
+    /// part opened: the directory may not have its opening yet (the
+    /// closing step's hold, ADR §2.5, AM-9). `entry` is the head's entry
+    /// with `private: None` (no secret, no grant limits, no label), as for
+    /// a subject that does not open. A held subject keeps its identity
+    /// (AM-72): `owner_ref` is its private part's.
+    ///
+    /// For the unit's wire (`KeyEntry`): `held = true`, `owner_ref` as
+    /// here, no secret, no `secret_kek_version`, grants without their
+    /// limits.
+    Held {
+        entry: Entry,
+        owner_ref: Option<String>,
+    },
     /// A marker record (`KeysFrozen`, `KeysThawed`; AM-28, AM-62): it
     /// changes no subject. The store writes no row for it; it holds its
     /// seq's place in the run, so the run has no gap. `marker` is the
@@ -41,8 +55,26 @@ impl ApplyEntry {
     /// The seq of the record.
     pub fn seq(&self) -> u64 {
         match self {
-            ApplyEntry::Subject(e) => e.last_seq,
+            ApplyEntry::Subject(e) | ApplyEntry::Held { entry: e, .. } => e.last_seq,
             ApplyEntry::Marker { seq, .. } => *seq,
+        }
+    }
+
+    /// The subject's entry, held or not; `None` for a marker.
+    pub fn entry(&self) -> Option<&Entry> {
+        match self {
+            ApplyEntry::Subject(e) | ApplyEntry::Held { entry: e, .. } => Some(e),
+            ApplyEntry::Marker { .. } => None,
+        }
+    }
+
+    /// Whether the store must hold the subject closed: a held entry, or
+    /// one whose private part did not open.
+    pub fn held(&self) -> bool {
+        match self {
+            ApplyEntry::Subject(e) => e.private.is_none(),
+            ApplyEntry::Held { .. } => true,
+            ApplyEntry::Marker { .. } => false,
         }
     }
 }

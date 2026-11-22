@@ -159,16 +159,28 @@ impl<'a, S: RecordStore, K: Kek, T: TkRing> Feed<'a, S, K, T> {
     }
 
     /// Holds closed, in `mode`, an entry whose opening the directory may
-    /// not have: the rule of the closing step.
+    /// not have: the rule of the closing step. The held entry drops its
+    /// private part (the secret, the grant limits, the label) and keeps
+    /// its `owner_ref` (AM-72).
     fn hold(mode: Mode, held: u64, closed: &BTreeSet<String>, entry: &mut ApplyEntry) {
-        let (Mode::Closing { acked }, ApplyEntry::Subject(e)) = (mode, entry) else {
+        let (Mode::Closing { acked }, ApplyEntry::Subject(e)) = (mode, &mut *entry) else {
             return;
         };
         let acknowledged =
             e.opened_seq <= acked || (e.opened_seq <= held && !closed.contains(&e.door.id));
-        if !acknowledged && e.door.status != SubjectStatus::Revoked {
-            e.private = None;
+        if acknowledged || e.door.status == SubjectStatus::Revoked {
+            return;
         }
+        // A private part that did not open is held already, with no
+        // identity to keep.
+        let Some(private) = e.private.take() else {
+            return;
+        };
+        let held_entry = e.clone();
+        *entry = ApplyEntry::Held {
+            entry: held_entry,
+            owner_ref: private.owner_ref,
+        };
     }
 
     /// The `m/rk/` revocations the chain does not record yet, at or below

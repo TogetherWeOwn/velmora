@@ -72,6 +72,8 @@ struct FakeTarget {
     applies: Cell<u32>,
     /// The markers it was sent: seq and kind.
     markers: RefCell<Vec<(u64, Marker)>>,
+    /// The `owner_ref` of every held entry it was sent, by subject.
+    held_owners: RefCell<Vec<(String, Option<String>)>>,
     /// Goes down after this many more applies.
     down_after: Cell<Option<u32>>,
 }
@@ -85,6 +87,7 @@ impl FakeTarget {
             down: Cell::new(false),
             applies: Cell::new(0),
             markers: RefCell::new(Vec::new()),
+            held_owners: RefCell::new(Vec::new()),
             down_after: Cell::new(None),
         }
     }
@@ -159,6 +162,19 @@ impl KeyTarget for FakeTarget {
         for e in entries {
             let e = match e {
                 ApplyEntry::Subject(e) => e,
+                ApplyEntry::Held { entry, owner_ref } => {
+                    // A held entry is the head's with no private part, and
+                    // keeps the identity it had (AM-72).
+                    assert!(
+                        entry.private.is_none(),
+                        "{}: a held entry opens",
+                        self.label
+                    );
+                    self.held_owners
+                        .borrow_mut()
+                        .push((entry.door.id.clone(), owner_ref.clone()));
+                    entry
+                }
                 ApplyEntry::Marker { seq, marker } => {
                     self.markers.borrow_mut().push((*seq, *marker));
                     continue;
@@ -5777,7 +5793,7 @@ async fn a_freeze_the_receipt_does_not_name_is_thawed_before_a_new_one() {
 // apply(from_seq): one entry per record, pages, Behind
 // ---------------------------------------------------------------------------
 
-use velmora_bridge::keys::apply::{apply_direct, Feed, ERR_APPLY_BEHIND};
+use velmora_bridge::keys::apply::{apply_direct, Feed, Mode, ERR_APPLY_BEHIND};
 
 /// Plants `subject` at `seq` with `op` (no reservation: a fixture).
 fn plant(w: &World, seq: u64, op: KeyOp, subject: &Subject, frozen_at: Option<u64>) {
@@ -6792,7 +6808,6 @@ async fn an_unrecorded_revocation_goes_before_the_pages() {
 /// one call each; with nothing read yet, alone.
 #[tokio::test(flavor = "current_thread")]
 async fn many_reopened_subjects_take_one_run() {
-    use velmora_bridge::keys::apply::{Feed, Mode};
     let w = World::new();
     plant_principals(&w, 250);
     let table = head_table(&w).await;
@@ -6857,6 +6872,114 @@ async fn the_closing_step_never_opens_what_a_partial_directory_holds_closed() {
     let at_dir = directory.row("PX0001").unwrap();
     assert!(at_dir.private.is_some(), "the directory holds it open");
     assert!(at_dir.door.grants.is_empty(), "as the head narrows it");
+}
+
+/// AM-72 (the plane's #246 review, M2): a subject the units hold closed
+/// while the directory is down keeps its identity. The held entry carries
+/// its `owner_ref` and no private part: no secret, no grant limit, no
+/// label. Once the directory is back the full step opens it, and nothing
+/// is held any more.
+#[tokio::test(flavor = "current_thread")]
+async fn a_held_entry_keeps_its_owner_ref_and_nothing_else_private() {
+    let w = World::new();
+    let adm = FakeAdmission::new(&w.root);
+    let mut table = seed(&w, &adm).await;
+    let units = w.units();
+    let env = env!(w, &adm, &units);
+    let mut rng = TestRng(450);
+    // Every create is held at the closing step until the directory has
+    // it, the seed's too: count from here.
+    for u in [&w.root, &w.unit2] {
+        u.held_owners.borrow_mut().clear();
+    }
+    w.directory.down.set(true);
+    let mut p = principal("PR0009", &[grant("b_01", RW, Some("photos/"))]);
+    p.private.label = Some("a label".into());
+    assert_eq!(
+        env.change(&mut table, "i-p9", &KeyRequest::Create(p), &mut rng)
+            .await
+            .unwrap(),
+        KeyAnswer::Unfinished { seq: 3 }
+    );
+    let k = s3_key(&w.t, "AKVL0009", "PR0001", &[grant("b_01", RO, None)]);
+    assert_eq!(
+        env.change(&mut table, "i-k9", &KeyRequest::Create(k), &mut rng)
+            .await
+            .unwrap(),
+        KeyAnswer::Unfinished { seq: 4 }
+    );
+    for u in [&w.root, &w.unit2] {
+        let owners = u.held_owners.borrow();
+        for id in ["PR0009", "AKVL0009"] {
+            let sent: Vec<&Option<String>> = owners
+                .iter()
+                .filter(|(i, _)| i == id)
+                .map(|(_, o)| o)
+                .collect();
+            assert!(!sent.is_empty(), "{}: {id} was not held", u.label);
+            assert!(
+                sent.iter()
+                    .all(|o| o.as_deref() == Some(&format!("member-of-{id}")[..])),
+                "{}: {id} held without its owner_ref",
+                u.label
+            );
+            let row = u.row(id).unwrap();
+            assert!(row.private.is_none(), "{}: {id} opens", u.label);
+            // The door's grant is kept (bucket and access); its limit was
+            // in the private part.
+            assert_eq!(row.door.grants.len(), 1, "{}: {id}", u.label);
+        }
+        // What the directory acknowledged before is not held again.
+        assert!(!owners.iter().any(|(i, _)| i == "PR0001" || i == "AKVL0001"));
+    }
+    w.directory.down.set(false);
+    let held_before = w.root.held_owners.borrow().len();
+    finish_keys(&env, &mut rng).await.unwrap();
+    for u in [&w.root, &w.unit2] {
+        for id in ["PR0009", "AKVL0009"] {
+            let row = u.row(id).unwrap();
+            let private = row.private.as_ref().expect("opened by the full step");
+            assert_eq!(
+                private.owner_ref.as_deref(),
+                Some(&format!("member-of-{id}")[..])
+            );
+        }
+    }
+    assert_eq!(w.root.held_owners.borrow().len(), held_before);
+}
+
+/// The closing step's hold, on its own: with nothing acknowledged every
+/// opening is held, each with its `owner_ref`; with everything
+/// acknowledged nothing is.
+#[tokio::test(flavor = "current_thread")]
+async fn the_closing_step_holds_each_unacknowledged_opening_with_its_owner() {
+    let w = World::new();
+    plant_principals(&w, 3);
+    let table = head_table(&w).await;
+    let none = Default::default();
+    let feed = Feed::new(&w.store, &w.kek, &w.ring, &table, &none);
+    let unit = FakeTarget::new("unit");
+    feed.bring_up(&unit, Mode::Closing { acked: 0 })
+        .await
+        .unwrap();
+    assert_eq!(unit.seq.get(), 3);
+    assert_eq!(
+        *unit.held_owners.borrow(),
+        (1..=3)
+            .map(|n| {
+                let id = format!("PA{n:04}");
+                let owner = format!("member-of-{id}");
+                (id, Some(owner))
+            })
+            .collect::<Vec<_>>()
+    );
+    assert!(unit.rows.borrow().values().all(|r| r.private.is_none()));
+    let unit = FakeTarget::new("unit 2");
+    feed.bring_up(&unit, Mode::Closing { acked: 3 })
+        .await
+        .unwrap();
+    assert!(unit.held_owners.borrow().is_empty());
+    assert!(unit.rows.borrow().values().all(|r| r.private.is_some()));
 }
 
 /// Confirmation of the apply (N6): the closing step sends open what the
