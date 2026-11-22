@@ -79,12 +79,6 @@ impl Target {
         }
     }
 
-    /// The unit's one-principal-per-member rule (D21), as its reservation
-    /// checks it: whether a row it holds, open or held, has `owner_ref`.
-    fn owner_taken(&self, owner_ref: &str) -> bool {
-        self.owners.borrow().values().any(|o| o == owner_ref)
-    }
-
     fn row(&self, id: &str) -> Option<Entry> {
         self.rows.borrow().get(id).cloned()
     }
@@ -1140,28 +1134,69 @@ async fn a_subject_revoked_by_m_rk_alone_is_not_answered_as_open() {
     assert_eq!(w.head(), 3);
 }
 
+/// The root unit's principal reservation check (D21, AM-36), as the unit
+/// makes it before a create: a live principal row (open or held) with the
+/// same `owner_ref` refuses `principal_exists` (`409`), unless it is the
+/// same principal with the same grants (`Exists`, `200`). Otherwise the
+/// reservation is admitted at the unit's `keys_seq`.
+#[derive(Debug, PartialEq, Eq)]
+enum UnitReserve {
+    Admitted { keys_seq: u64 },
+    Exists,
+    PrincipalExists,
+}
+
+fn unit_reserve(root: &Target, subject: &Subject) -> UnitReserve {
+    let Some(owner) = subject.private.owner_ref.as_deref() else {
+        return UnitReserve::Admitted {
+            keys_seq: root.seq.get(),
+        };
+    };
+    let owners = root.owners.borrow();
+    for (id, row) in root.rows.borrow().iter() {
+        let live = row.door.kind == SubjectKind::Principal
+            && row.door.status != SubjectStatus::Revoked
+            && owners.get(id).map(String::as_str) == Some(owner);
+        if !live {
+            continue;
+        }
+        return match row.door.grants == subject.door.grants && *id == subject.door.id {
+            true => UnitReserve::Exists,
+            false => UnitReserve::PrincipalExists,
+        };
+    }
+    UnitReserve::Admitted {
+        keys_seq: root.seq.get(),
+    }
+}
+
 /// AM-72 (the plane's #246 review, M2): while the directory is down a
 /// principal create lands held at the units, and the held entry keeps its
 /// `owner_ref`. So the unit's one-principal-per-member check (D21) still
-/// finds the member, and a second create for it under another reservation
-/// is refused `principal_exists` before anything is recorded.
+/// finds the member: a second create for it, with other grants, is
+/// refused `principal_exists` at the reservation, and nothing is recorded.
+/// Without the `owner_ref` on the held row the same check admits it (the
+/// defect).
 #[tokio::test(flavor = "current_thread")]
 async fn a_second_create_for_the_member_of_a_held_principal_is_refused() {
     let w = World::new();
     let mut table = seed(&w).await;
     let units = [&w.root, &w.unit2];
     let env = env!(w, &w.store, &NoAdmission, &units);
-    let answer = kept(RID);
     let first = principal(NEW, Some("p_0000000000000001"));
     let member = first.private.owner_ref.clone().unwrap();
     w.directory.down.set(true);
+    let UnitReserve::Admitted { keys_seq } = unit_reserve(&w.root, &first) else {
+        panic!("the first create is admitted");
+    };
+    let answer = kept(RID);
     assert_eq!(
         env.create_reserved(
             &mut table,
             &first,
             Reserved {
                 rid: RID,
-                keys_seq: 1,
+                keys_seq,
                 answer: &answer,
             },
             &mut TestRng(2)
@@ -1179,16 +1214,28 @@ async fn a_second_create_for_the_member_of_a_held_principal_is_refused() {
             unit.label
         );
     }
-    // The handler's second create for the same member: the root unit's
-    // reservation check refuses it, so no reservation and no record.
+
+    // The second create for the same member, another principal with other
+    // grants, under another key: refused at the reservation.
     let mut second = principal("p_0000000000000003", Some("p_0000000000000001"));
     second.private.owner_ref = Some(member.clone());
-    assert!(
-        w.root.owner_taken(&member),
-        "principal_exists: the unit must see the held member"
-    );
-    assert!(!w.root.owner_taken("member-of-nobody"));
+    second.set_grants(&[]);
+    assert_eq!(unit_reserve(&w.root, &second), UnitReserve::PrincipalExists);
+    // A retry of the first is `Exists`, not a refusal.
+    assert_eq!(unit_reserve(&w.root, &first), UnitReserve::Exists);
     assert_eq!(w.head(), 2);
+    assert!(w.root.row("p_0000000000000003").is_none());
+    // The defect, for contrast: a held row without its owner_ref admits it.
+    w.root.owners.borrow_mut().remove(NEW);
+    assert!(matches!(
+        unit_reserve(&w.root, &second),
+        UnitReserve::Admitted { .. }
+    ));
+    w.root
+        .owners
+        .borrow_mut()
+        .insert(NEW.into(), member.clone());
+
     // Once the directory is back the principal opens with the same owner.
     w.directory.down.set(false);
     assert_eq!(
