@@ -1138,13 +1138,15 @@ if [[ $MODE == local ]]; then
     curl -sf "${CURL_TLS[@]}" --max-time 60 "$BASE/__scheduled?cron=*/5+*+*+*+*" >/dev/null || return 1
     stage_reached lost.bin
   }
-  # 300 s, not 90: provider slots held by sessions of the stopped isolate
-  # stay claimed until their 120 s lease expires, and only then can the
-  # re-driven post job get a connection; its verify follows. With
-  # PERMITS=do the step took 165 to 176 s on green CI runs and 192 s on
-  # two red ones (verified 26 ms after a 180 s window), so 180 s left no
-  # margin. The check is unchanged: the cron, not a queue message, must
-  # bring the object to release or done with a counted backbone.
+  # 300 s, not 90 or 180: the restart above is a new Worker version. With
+  # PERMITS=d1 the slots held by sessions of the stopped isolate stay
+  # claimed until their 120 s lease expires. With PERMITS=do the gate
+  # refuses job permits for about 125 s after a new version starts; the
+  # re-driven post job's 120 s slot wait ends just before that, so it is
+  # put off for 15 to 60 s, then posts and verifies. On CI that took 150
+  # to 192 s after the restart, past the old 180 s window more than once.
+  # The check is unchanged: the cron, not a queue message, must bring the
+  # object to release or done with a counted backbone.
   if ! poll 300 2 cron_then_check; then
     json=$(adm "GET /_admin/objects/$SB/a/lost.bin" "$BASE/_admin/objects/$SB/a/lost.bin")
     fail "a/lost.bin recovered by the scheduled handler within 300 s" "jq: ($REACHED) and ($COUNTED)" "$json"
