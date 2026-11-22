@@ -12,7 +12,8 @@ use std::collections::BTreeSet;
 use service_support::*;
 use velmora_bridge::directory::fence::freeze;
 use velmora_bridge::directory::move_copy::{
-    bound, copy_all, key_columns, CopyError, CopyPlan, RowTransform, UnitImport,
+    bound, copy_all, key_columns, move_ordinal, seal, CopyError, CopyPlan, RowTransform, Sealed,
+    TableCopy, UnitImport,
 };
 use velmora_bridge::directory::record::{Tenant, TenantRecord};
 use velmora_bridge::directory::transition::{next, Actor, Change, Outcome, KEY_CHECK_LEN};
@@ -186,6 +187,9 @@ fn unit(since: u64) -> Unit<RusqliteSql> {
 }
 
 /// The Worker's side of the import: one call per batch, with faults.
+/// `(ordinal, since, tables)` of a seal.
+type SealCall = (u64, u64, Vec<(ImportTable, u64)>);
+
 struct Adapter<'a> {
     unit: &'a Unit<RusqliteSql>,
     state_seq: u64,
@@ -201,6 +205,12 @@ struct Adapter<'a> {
     /// The Nth import of this table fails unapplied (`false`) or is
     /// applied with its answer lost (`true`).
     fault: RefCell<Option<(String, u32, bool)>>,
+    /// The seal the unit took: `(ordinal, since, tables)`. The unit call
+    /// is L1's (AM-29); this stands in for it with the rule it states.
+    sealed: RefCell<Option<SealCall>>,
+    /// Seal answers to lose (the seal lands, the answer does not).
+    lose_seal: Cell<u32>,
+    seals: Cell<u32>,
 }
 
 impl<'a> Adapter<'a> {
@@ -214,6 +224,9 @@ impl<'a> Adapter<'a> {
             resent: Cell::new(0),
             by_table: RefCell::new(BTreeMap::new()),
             fault: RefCell::new(None),
+            sealed: RefCell::new(None),
+            lose_seal: Cell::new(0),
+            seals: Cell::new(0),
         }
     }
 }
@@ -300,6 +313,44 @@ impl UnitImport for Adapter<'_> {
                 )
             })
             .collect())
+    }
+
+    async fn seal(
+        &self,
+        _head: &MoveHead,
+        ordinal: u64,
+        since: u64,
+        tables: &[(ImportTable, u64)],
+    ) -> Result<Sealed> {
+        self.seals.set(self.seals.get() + 1);
+        // AM-29: every count equals the unit's own (a table with no
+        // import row counts 0), and every import table is named once.
+        let progress = self.progress().await?;
+        let named: BTreeSet<&str> = tables.iter().map(|(t, _)| t.name()).collect();
+        if named.len() != ImportTable::ALL.len() || tables.len() != named.len() {
+            return Ok(Sealed::Refused("tables".into()));
+        }
+        for (table, rows) in tables {
+            let unit = progress
+                .iter()
+                .find(|(t, _, _)| t == table.name())
+                .map_or(0, |(_, _, n)| *n);
+            if unit != *rows {
+                return Ok(Sealed::Refused("count_mismatch".into()));
+            }
+        }
+        let mut sealed = self.sealed.borrow_mut();
+        match &*sealed {
+            Some((o, s, t)) if (*o, *s, t.as_slice()) != (ordinal, since, tables) => {
+                return Ok(Sealed::Refused("sealed".into()))
+            }
+            _ => *sealed = Some((ordinal, since, tables.to_vec())),
+        }
+        if self.lose_seal.get() > 0 {
+            self.lose_seal.set(self.lose_seal.get() - 1);
+            return Err(BridgeError::Blob("answer lost".into()));
+        }
+        Ok(Sealed::Done)
     }
 }
 
@@ -399,7 +450,7 @@ async fn catalogue_with(
            ('u_v', 1, '{xv}', 5, 'e1', 4), ('u_v', 2, '{xv}', 5, 'e2', 4), ('u_c', 1, '{xc}', 5, 'e1', 4);\n\
          INSERT INTO upload_part_extents(upload_id, part_number, piece, extent_id) VALUES \
            ('u_v', 1, 1, '{xv}'), ('u_c', 1, 1, '{xc}');\n\
-         UPDATE outbox SET lease_owner = 'gone-worker', lease_until = {lease_until} WHERE extent_id = '{xv}';\n"
+         UPDATE outbox SET lease_token = 7, lease_owner = 'gone-worker', lease_until = {lease_until} WHERE extent_id = '{xv}';\n"
     ));
     // The longest key, of the characters JSON escapes: its cursor is
     // more than twice its length.
@@ -622,6 +673,13 @@ fn every_table_arrives_row_for_row_without_the_canary() {
         assert_eq!(by("upload_parts").excluded, 1);
         assert_eq!(by("verify_escalations").excluded, 0);
         assert_eq!(by("outbox").leases_cleared, 1);
+        // The cleared lease kept its fencing token.
+        let token = ready(u.sql().query(
+            "SELECT lease_token, lease_owner FROM outbox WHERE lease_token = 7",
+            &[],
+        ))
+        .unwrap();
+        assert_eq!(token, vec![vec![SqlValue::Int(7), SqlValue::Null]]);
         assert_eq!(by("usage_hours").sent, 23);
         // Uploads sort u_a (vault), u_c, u_c1, u_c2 (canary), u_v (vault):
         // by 2, the middle page holds canary rows only and sends nothing,
@@ -648,6 +706,85 @@ fn every_table_arrives_row_for_row_without_the_canary() {
         .map_err(|e| format!("{e:?}"))
         .unwrap();
         assert!(again.iter().all(|d| d.sent == 0), "{again:?}");
+        // The seal after the last batch, with the counts of every table;
+        // the second run's answer (no batch sent) gives the same counts.
+        let ordinal = move_ordinal(&zero.door).expect("moving");
+        assert_eq!(ordinal, 1);
+        seal(&adapter, &head, ordinal, since, &done)
+            .await
+            .map_err(|e| format!("{e:?}"))
+            .unwrap();
+        adapter.lose_seal.set(1);
+        seal(&adapter, &head, ordinal, since, &again)
+            .await
+            .map_err(|e| format!("{e:?}"))
+            .unwrap();
+        let sealed = adapter.sealed.borrow().clone().unwrap();
+        assert_eq!(sealed.2.len(), ImportTable::ALL.len());
+        for (table, rows) in &sealed.2 {
+            assert_eq!(*rows, rows_of(&done, *table), "{}", table.name());
+        }
+    });
+}
+
+fn rows_of(done: &[TableCopy], table: ImportTable) -> u64 {
+    done.iter()
+        .find(|d| d.table == table.name())
+        .unwrap()
+        .unit_rows
+}
+
+#[test]
+fn the_seal_names_every_table_with_the_units_count() {
+    block_on(async {
+        let rig = rig();
+        let (_, canary) = catalogue(&rig).await;
+        let (zero, owner) = heads();
+        let (head, since) = bound(&zero.door, &owner.door).unwrap();
+        let u = unit(since);
+        let adapter = Adapter::new(&u, since);
+        let done = copy_all(
+            &rig.bridge.catalog.sql,
+            &adapter,
+            &Stub { rehomed: None },
+            &plan(&canary, 7),
+            &head,
+            since,
+            rig.now(),
+        )
+        .await
+        .map_err(|e| format!("{e:?}"))
+        .unwrap();
+        // A run that did not reach every table cannot seal.
+        let short: Vec<TableCopy> = done[..done.len() - 1].to_vec();
+        let r = seal(&adapter, &head, 1, since, &short).await;
+        assert!(matches!(r, Err(CopyError::Incomplete)), "{r:?}");
+        let mut twice = done.clone();
+        twice.push(done[0].clone());
+        let r = seal(&adapter, &head, 1, since, &twice).await;
+        assert!(matches!(r, Err(CopyError::Incomplete)), "{r:?}");
+        assert_eq!(adapter.seals.get(), 0);
+        // A count the unit does not hold: refused, the import stays open.
+        let mut off = done.clone();
+        off[2].unit_rows += 1;
+        let r = seal(&adapter, &head, 1, since, &off).await;
+        assert!(
+            matches!(&r, Err(CopyError::SealRefused(c)) if c == "count_mismatch"),
+            "{r:?}"
+        );
+        assert!(adapter.sealed.borrow().is_none());
+        // Lost answers are sent again, up to the tries.
+        adapter.lose_seal.set(3);
+        let r = seal(&adapter, &head, 1, since, &done).await;
+        assert!(matches!(r, Err(CopyError::Store(_))), "{r:?}");
+        assert_eq!(adapter.seals.get(), 4);
+        seal(&adapter, &head, 1, since, &done).await.unwrap();
+        // The ordinal is only a moving head's.
+        let mut d1 = zero.clone();
+        d1.door.tenant_zero.as_mut().unwrap().selector =
+            velmora_bridge::directory::record::Selector::D1;
+        assert_eq!(move_ordinal(&d1.door), None);
+        assert_eq!(move_ordinal(&owner.door), None);
     });
 }
 

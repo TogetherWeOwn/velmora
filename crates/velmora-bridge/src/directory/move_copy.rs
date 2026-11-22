@@ -24,9 +24,16 @@
 //!   [`RowTransform::rehomed`] says that copy was re-homed under the
 //!   tenant's name (§3.3 P6), so the unit never counts a warm copy it does
 //!   not have;
-//! - `outbox`: an expired lease is cleared (`lease_owner`, `lease_until`);
-//!   a lease that is still live means the drain did not finish, and the
-//!   copy stops.
+//! - `outbox`: a live lease stops the copy (the drain did not finish); an
+//!   expired lease is cleared (`lease_owner`, `lease_until`), its fencing
+//!   token (`lease_token`) kept, so the unit's next lease is above it;
+//! - `usage_hours`: the frozen D1's hour under way (row 1 of
+//!   `usage_global`) is filed at its place in hour order, added to that
+//!   hour's row if one exists (AM-17).
+//!
+//! After the last batch, [`seal`] ends the import (`ImportSeal`, AM-29)
+//! with every table's row count, so the `move` report and the move's
+//! `Recount` can tell that the import is done.
 //!
 //! Nothing here writes to the frozen D1 or deletes anything. The unit
 //! takes a batch only while tenant 0's verified head is `moving` into the
@@ -70,6 +77,11 @@ pub enum CopyError {
     CursorTooLong { table: ImportTable },
     /// An outbox row still holds a live lease: the drain did not finish.
     LiveLease,
+    /// The unit refused `ImportSeal`; the import stays open.
+    SealRefused(String),
+    /// [`seal`] was given counts for another set of tables than the
+    /// import's: a run that did not reach every table.
+    Incomplete,
 }
 
 impl From<BridgeError> for CopyError {
@@ -92,6 +104,30 @@ pub trait UnitImport {
     ) -> crate::types::Result<Imported>;
     /// Every table's stored cursor and row count: `(table, cursor, rows)`.
     async fn progress(&self) -> crate::types::Result<Vec<(String, String, u64)>>;
+    /// `ImportSeal{since, head, tables}` (AM-29): ends the import. `head`
+    /// is tenant 0's verified head; `ordinal` its `flips + 1`, the
+    /// `move_ordinal` the seal records (it travels in `MoveHead.flips`
+    /// once the unit's call carries it). `tables` names every import table
+    /// with its row count. The unit accepts it only when every count
+    /// equals its own; a repeat with the same counts answers
+    /// [`Sealed::Done`]. An `Err` says nothing about whether it landed.
+    async fn seal(
+        &self,
+        head: &MoveHead,
+        ordinal: u64,
+        since: u64,
+        tables: &[(ImportTable, u64)],
+    ) -> crate::types::Result<Sealed>;
+}
+
+/// The unit's answer to `ImportSeal`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Sealed {
+    /// The import is final for this window's ordinal.
+    Done,
+    /// Refused, with the unit's fixed code (a count differs, the window is
+    /// not this one).
+    Refused(String),
 }
 
 /// What §3.2 changes on the way, computed outside this module.
@@ -164,6 +200,50 @@ pub fn bound(zero: &TenantDoor, owner: &TenantDoor) -> Option<(MoveHead, u64)> {
         to: crate::unit::name::TenantId::parse(owner.tenant.as_str()),
     };
     Some((head, since))
+}
+
+/// The ordinal a window's import is sealed under: `flips + 1` of tenant
+/// 0's head while it is `moving` (AM-7, AM-29). `None` for any other head.
+pub fn move_ordinal(zero: &TenantDoor) -> Option<u64> {
+    let z = zero.tenant_zero.as_ref()?;
+    match (zero.tenant.is_zero(), z.selector, &z.moved) {
+        (true, Selector::Moving, Some(_)) => z.flips.checked_add(1),
+        _ => None,
+    }
+}
+
+/// Ends the import after the last batch (AM-29): `ImportSeal` with every
+/// table's row count as `copied` (the answer of [`copy_all`]) gives it. A
+/// lost answer sends the seal again; a repeat is answered as done.
+pub async fn seal<U: UnitImport>(
+    unit: &U,
+    head: &MoveHead,
+    ordinal: u64,
+    since: u64,
+    copied: &[TableCopy],
+) -> Result<(), CopyError> {
+    let mut tables = Vec::with_capacity(ImportTable::ALL.len());
+    for table in ImportTable::ALL {
+        let mut rows = copied.iter().filter(|c| c.table == table.name());
+        match (rows.next(), rows.next()) {
+            (Some(c), None) => tables.push((table, c.unit_rows)),
+            _ => return Err(CopyError::Incomplete),
+        }
+    }
+    if copied.len() != tables.len() {
+        return Err(CopyError::Incomplete);
+    }
+    let mut last_err = None;
+    for _ in 0..SEND_TRIES {
+        match unit.seal(head, ordinal, since, &tables).await {
+            Ok(Sealed::Done) => return Ok(()),
+            Ok(Sealed::Refused(code)) => return Err(CopyError::SealRefused(code)),
+            Err(e) => last_err = Some(e),
+        }
+    }
+    Err(CopyError::Store(last_err.unwrap_or(BridgeError::Invalid(
+        "move copy: no try was made",
+    ))))
 }
 
 /// Copies every table, in [`ImportTable::ALL`] order, resuming each from
@@ -474,7 +554,13 @@ pub struct ExcludedSums {
 
 /// Sums the excluded rows of `extents` and `outbox` with the copy's own
 /// bounded pages and exclusion rule. It reads the frozen D1 only and can
-/// be run at any time, so a resumed copy does not change the answer.
+/// be run at any time, so a resumed copy does not change the answer: the
+/// move tool runs it at step 7 for V2, never using [`TableCopy`]'s counts,
+/// which cover one run (AM-17, AM-25). Each query is one page of at most
+/// [`PAGE`] rows by primary key (plus a primary-key lookup of the parent
+/// extent for `outbox`), filtered to the excluded buckets in code:
+/// `extents` has no index by bucket, so `WHERE bucket_id = ?` would scan
+/// the whole table in one query.
 pub async fn excluded_sums<S: Sql>(frozen: &S, plan: &CopyPlan) -> Result<ExcludedSums, CopyError> {
     let mut sums = ExcludedSums::default();
     let coverage = frozen
