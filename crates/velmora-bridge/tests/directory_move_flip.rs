@@ -12,6 +12,7 @@ use std::rc::Rc;
 use service_support::*;
 use velmora_bridge::directory::chain::{TenantChain, Written};
 use velmora_bridge::directory::fence::{freeze, legacy_stamp_key, stamp_row, thaw};
+use velmora_bridge::directory::move_copy::ImportState;
 use velmora_bridge::directory::move_flip::MAX_WINDOW_RECORDS;
 use velmora_bridge::directory::move_flip::{
     flip, give_up, FlipError, Flipped, GateView, GaveUp, OwnerUnit, Reported, RouteRecords, Synced,
@@ -81,6 +82,8 @@ struct FakeUnit {
     /// The sync after a refused lift is not reached.
     fail_after_refusal: Cell<bool>,
     armed: Cell<bool>,
+    /// The import the unit holds (default: this window's, sealed).
+    import: RefCell<Option<ImportState>>,
     /// Changes every `GateStatus` answer (a unit that answers wrongly).
     bend: RefCell<Option<fn(&mut GateView)>>,
     /// Key status by id, as applied.
@@ -104,6 +107,11 @@ impl Default for FakeUnit {
             nonces: Cell::new(0),
             keys_seq: Cell::new(0),
             bend: RefCell::new(None),
+            import: RefCell::new(Some(ImportState {
+                t0_seq: Some(1 << 40),
+                sealed: Some(1),
+                tables: vec![],
+            })),
             fail_lift: Cell::new(0),
             lift_answers: RefCell::default(),
             open_on_refusal: Cell::new(false),
@@ -247,6 +255,10 @@ impl OwnerUnit for FakeUnit {
             bend(&mut view);
         }
         Ok(view)
+    }
+
+    async fn move_import(&self) -> Result<Option<ImportState>> {
+        Ok(self.import.borrow().clone())
     }
 
     async fn v9(&self) -> Result<bool> {
@@ -1834,4 +1846,45 @@ fn a_gate_refusal_on_an_open_unit_is_the_lift_that_landed() {
         assert_eq!(m.records(), before + 2);
         assert!(m.unit.closed.get().is_none());
     });
+}
+
+#[test]
+fn the_lift_needs_this_windows_sealed_import() {
+    for import in [
+        None,
+        Some(ImportState {
+            t0_seq: Some(1 << 40),
+            sealed: None,
+            tables: vec![],
+        }),
+        Some(ImportState {
+            t0_seq: Some(1 << 40),
+            sealed: Some(2),
+            tables: vec![],
+        }),
+        Some(ImportState {
+            t0_seq: Some(1),
+            sealed: Some(1),
+            tables: vec![],
+        }),
+        Some(ImportState {
+            t0_seq: None,
+            sealed: Some(1),
+            tables: vec![],
+        }),
+    ] {
+        block_on(async {
+            let m = window().await;
+            *m.unit.import.borrow_mut() = import.clone();
+            let before = m.records();
+            let r = m.flip().await;
+            assert!(
+                matches!(r, Err(FlipError::NotThisImport)),
+                "{import:?}: {r:?}"
+            );
+            assert_eq!(m.records(), before);
+            assert_eq!(m.unit.reports.get(), 0);
+            assert!(m.head(&owner()).await.restoring_entry(0).is_some());
+        });
+    }
 }

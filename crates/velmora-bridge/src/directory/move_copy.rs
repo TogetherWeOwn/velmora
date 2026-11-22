@@ -136,8 +136,8 @@ pub trait UnitImport {
 /// The import a unit holds.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ImportState {
-    /// The newest tenant-0 seq a batch or the seal was bound to
-    /// (`unit_import_move.t0_seq`). Every record of a window is at or above
+    /// The newest tenant-0 seq a batch, the seal or a `move` report was
+    /// bound to (`unit_import_move.t0_seq`). Every record of a window is at or above
     /// the window's first `moving` record, and every record of an earlier
     /// window is below it, so this tells a given-up window's import (whose
     /// unit was not emptied) from this one's. `None`: the unit did not say.
@@ -290,7 +290,15 @@ pub async fn seal<U: UnitImport>(
             o == ordinal && s.t0_seq.is_some_and(|t| t >= window_start) && same(&s.tables, &tables),
         )
     };
-    match found(unit.import_state().await?) {
+    let state = unit.import_state().await?;
+    // An open import of an earlier window is not sealed as this one's
+    // (the seal would raise its tenant-0 seq into this window).
+    if let Some(s) = &state {
+        if !s.t0_seq.is_some_and(|t| t >= window_start) {
+            return Err(CopyError::OtherWindowImport);
+        }
+    }
+    match found(state) {
         Some(true) => return Ok(()),
         Some(false) => return Err(CopyError::SealedOther),
         None => {}

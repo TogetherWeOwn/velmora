@@ -880,7 +880,7 @@ fn the_seal_names_every_table_with_the_units_count() {
         assert!(matches!(r, Err(CopyError::OtherWindowImport)), "{r:?}");
         assert_eq!(adapter.imports.get(), n);
         let r = seal(&adapter, &head, since, WINDOW_START + 5, &done).await;
-        assert!(matches!(r, Err(CopyError::SealedOther)), "{r:?}");
+        assert!(matches!(r, Err(CopyError::OtherWindowImport)), "{r:?}");
         // After a re-entry of the same window (a new entry S') the import
         // is still this window's: found done.
         copy_all(
@@ -1330,6 +1330,11 @@ impl velmora_bridge::directory::move_flip::OwnerUnit for LiftCalls<'_> {
             proof: serde_json::from_value(s["lift"]["ok"].clone()).ok(),
         })
     }
+    async fn move_import(
+        &self,
+    ) -> Result<Option<velmora_bridge::directory::move_copy::ImportState>> {
+        unimplemented!("not a lift call")
+    }
     async fn v9(&self) -> Result<bool> {
         unimplemented!("not a lift call")
     }
@@ -1548,6 +1553,18 @@ fn an_open_import_of_an_earlier_window_is_not_continued() {
         .await;
         assert!(matches!(r, Err(CopyError::OtherWindowImport)), "{r:?}");
         assert_eq!(adapter.imports.get(), n);
+        // Nor is it sealed as window 2's.
+        let counts: Vec<TableCopy> = ImportTable::ALL
+            .iter()
+            .map(|t| TableCopy {
+                table: t.name(),
+                ..TableCopy::default()
+            })
+            .collect();
+        let seals = adapter.seals.get();
+        let r = seal(&adapter, &head2, since, WINDOW_START + 2, &counts).await;
+        assert!(matches!(r, Err(CopyError::OtherWindowImport)), "{r:?}");
+        assert_eq!(adapter.seals.get(), seals);
         // The default plan continues no import at all.
         let r = copy_all(
             &rig.bridge.catalog.sql,

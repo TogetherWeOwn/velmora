@@ -112,6 +112,10 @@ pub enum FlipError {
     /// V9 failed, and the give-up it started stopped with this error: run
     /// [`give_up`] again.
     V9GiveUp(Box<FlipError>),
+    /// The unit's import is not this window's sealed import: not sealed
+    /// under `flips + 1`, or bound below the window's record `zero_seq`
+    /// (a given-up window's, whose unit was not emptied).
+    NotThisImport,
     /// The frozen D1 has no bucket to move (less the excluded ones): there
     /// is nothing a flip could serve, and a give-up would have no
     /// placement to keep its exit open.
@@ -202,6 +206,9 @@ pub trait OwnerUnit: KeyUnit {
     ) -> crate::types::Result<Reported>;
     /// `GateStatus`.
     async fn gate_status(&self) -> crate::types::Result<GateView>;
+    /// The import the unit holds (`ImportProgress` and its tenant-0 seq),
+    /// as [`super::move_copy::UnitImport::import_state`] reads it.
+    async fn move_import(&self) -> crate::types::Result<Option<super::move_copy::ImportState>>;
     /// V9 (AM-30): the sampled reads through the open unit's read plan,
     /// signed by a moved key; `true` when every one passed.
     async fn v9(&self) -> crate::types::Result<bool>;
@@ -238,8 +245,9 @@ pub struct Window<'a> {
     /// The owner's tenant.
     pub owner: &'a Tenant,
     /// The seq of a tenant-0 record of this window: `moving` into the
-    /// owner (the copy's [`super::move_copy::bound`] answers it as
-    /// `MoveHead.seq`). The window is the run of `moving` records from it;
+    /// owner, at or below the copy's `MoveHead.seq` (the window's first
+    /// record is best; [`super::move_copy::bound`] answers the head the
+    /// copy ran under). The unit's import must be bound at or above it. The window is the run of `moving` records from it;
     /// a record that ends the run (`d1`, `moved`) ends the window, so a run
     /// of an older window never acts on a later one.
     pub zero_seq: u64,
@@ -570,6 +578,17 @@ where
                 // stopped after its record left the unit on the old one,
                 // and the report binds the unit's own entry.
                 close_unit(unit, &owner).await?;
+                // The import is this window's and sealed: a `move` report
+                // would otherwise lift (and claim) another window's.
+                let flips = zero.tenant_zero.as_ref().map(|z| z.flips);
+                let ours = unit.move_import().await?.is_some_and(|i| {
+                    i.sealed.is_some()
+                        && i.sealed == flips.and_then(|f| f.checked_add(1))
+                        && i.t0_seq.is_some_and(|t| t >= window.zero_seq)
+                });
+                if !ours {
+                    return Err(FlipError::NotThisImport);
+                }
                 // AM-31: the sweep before the lift record.
                 revocation_sweep(keys, unit, window.keys).await?;
                 let proof = move_lift_proof(unit, zero, since).await?;
