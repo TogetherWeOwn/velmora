@@ -1,8 +1,9 @@
 //! The key writer under a reservation the caller holds (AM-38, AM-72):
 //! the management plane's opening calls. Every opening key-chain change
 //! is a reserved call: a key or principal create
-//! ([`KeyEnv::create_reserved`]), a widening, a re-enable and a grant
-//! change that adds or widens ([`KeyEnv::change_reserved`]).
+//! ([`KeyEnv::create_reserved`]), a widening and a grant change that adds
+//! or widens ([`KeyEnv::change_reserved`]). A re-enable answers `503`
+//! until the unit's reservation can name it (AM-72).
 //!
 //! The handler asks the root unit for the reservation itself
 //! (`UnitOp::Reserve`, keyed by the key hash and the request's
@@ -408,8 +409,10 @@ where
     }
 
     /// Makes the opening change `request` under the reservation `reserved`
-    /// the caller holds (AM-38 case 1, AM-72): a widening, a re-enable, a
-    /// grant change that adds or widens, of a key or a principal. On the
+    /// the caller holds (AM-38 case 1, AM-72): a widening, a grant change
+    /// that adds or widens, of a key or a principal. A re-enable answers
+    /// [`ReservedAnswer::Busy`] (`503`) until the unit's reservation has an
+    /// `Opening` for it (AM-72), and nothing is read or written. On the
     /// rules of [`KeyEnv::create_reserved`]: a record of this `rid` at
     /// `keys_seq + 1` wins; a head past `keys_seq` without one answers
     /// `Lost`; otherwise the record at exactly `keys_seq + 1` carries the
@@ -429,6 +432,17 @@ where
     ) -> Result<ReservedAnswer> {
         if let KeyRequest::Create(subject) = request {
             return self.create_reserved(table, subject, reserved, rng).await;
+        }
+        // AM-72: a re-enable answers `503` until the unit's reservation has
+        // an `Opening` for it (the unit cannot check it yet).
+        if matches!(
+            request,
+            KeyRequest::SetStatus {
+                status: SubjectStatus::Active,
+                ..
+            }
+        ) {
+            return Ok(ReservedAnswer::Busy);
         }
         let Reserved {
             rid,

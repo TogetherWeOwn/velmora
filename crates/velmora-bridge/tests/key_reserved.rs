@@ -1359,11 +1359,11 @@ async fn a_reserved_widening_records_exactly_keys_seq_plus_one_with_its_rid() {
     assert_eq!(*w.root.kept.borrow(), vec![(RID, 201)]);
 }
 
-/// A re-enable under a reservation: the record carries the `rid`; while
-/// the directory is down it is held at the units with no answer kept,
-/// and `finish` then a retry keep it.
+/// A re-enable under a reservation answers `503` until the unit's
+/// reservation has an `Opening` for it (AM-72): nothing is put, no intent
+/// is sent, no answer is kept.
 #[tokio::test(flavor = "current_thread")]
-async fn a_reserved_re_enable_carries_its_rid_and_keeps_the_answer_only_when_open() {
+async fn a_reserved_re_enable_answers_busy_until_the_unit_can_name_it() {
     let w = World::new();
     let mut table = seed(&w).await;
     let units = [&w.root, &w.unit2];
@@ -1382,7 +1382,7 @@ async fn a_reserved_re_enable_carries_its_rid_and_keeps_the_answer_only_when_ope
     );
     let env = env!(w, &w.store, &NoAdmission, &units);
     let answer = kept(RID);
-    w.directory.down.set(true);
+    let puts = w.store.puts();
     assert_eq!(
         env.change_reserved(
             &mut table,
@@ -1392,43 +1392,16 @@ async fn a_reserved_re_enable_carries_its_rid_and_keeps_the_answer_only_when_ope
         )
         .await
         .unwrap(),
-        ReservedAnswer::Unfinished { seq: 3 }
+        ReservedAnswer::Busy
     );
-    let record = open_key_record(
-        &w.kek,
-        &w.ring,
-        &w.t,
-        3,
-        &w.store.raw(&key_chain(&w.t).name(3)).unwrap(),
-    )
-    .unwrap();
-    assert_eq!(record.rid, Some(RID));
-    assert_eq!(record.op, KeyOp::Status);
-    assert_eq!(record.door.status, SubjectStatus::Active);
-    for unit in [&w.root, &w.unit2] {
-        assert!(unit.row(SEED).unwrap().private.is_none(), "{}", unit.label);
-        assert!(
-            unit.rids.borrow().contains(&(RID, 3, true)),
-            "{}",
-            unit.label
-        );
-    }
+    assert_eq!(w.store.puts(), puts);
+    assert_eq!(w.head(), 2);
+    assert_eq!(*w.intents.sent.borrow(), vec![1, 2]);
     assert!(w.root.kept.borrow().is_empty());
-    w.directory.down.set(false);
     assert_eq!(
-        env.change_reserved(
-            &mut table,
-            &set_status(SubjectStatus::Active),
-            reserved_at(&answer, 2),
-            &mut TestRng(4)
-        )
-        .await
-        .unwrap(),
-        ReservedAnswer::Done { seq: 3 }
+        w.root.row(SEED).unwrap().door.status,
+        SubjectStatus::Disabled
     );
-    assert_eq!(w.head(), 3);
-    assert_eq!(*w.root.kept.borrow(), vec![(RID, 201)]);
-    assert_eq!(w.root.row(SEED).unwrap().door.status, SubjectStatus::Active);
 }
 
 /// The class comes from the head: a change that closes there (a
@@ -1455,10 +1428,7 @@ async fn a_closing_or_already_held_change_records_nothing_under_the_reservation(
             },
             ReservedAnswer::Closes,
         ),
-        (
-            set_status(SubjectStatus::Active),
-            ReservedAnswer::InHead { seq: 1, done: true },
-        ),
+        (set_status(SubjectStatus::Active), ReservedAnswer::Busy),
         (
             KeyRequest::SetGrants {
                 id: SEED.into(),
