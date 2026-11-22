@@ -169,8 +169,11 @@ pub enum KeyTenant {
     /// Tenant 0's key, or one no route names: tenant 0's catalogue decides
     /// (D1 `access_keys`), as today.
     Zero,
-    /// A managed tenant's key.
-    Managed(TenantId),
+    /// A managed tenant's key, with the numbers the directory handed out
+    /// with its route: a floor for the first call of a cold isolate (rule
+    /// 5, §8.4 step 2). Zeros when the route came from the `m/kr/` record
+    /// (a failed directory read), which carries none.
+    Managed { tenant: TenantId, floor: Seqs },
 }
 
 /// An access key id to its tenant: the directory's `key_routes` row, or
@@ -181,8 +184,10 @@ pub trait KeyRoutes {
     async fn tenant_of(&self, access_key_id: &str) -> Result<KeyTenant>;
 }
 
-/// No key routes in this build: every read fails, so every request takes
-/// tenant 0's path (ADR §8.4, a failed route read, DUR-10).
+/// No key routes in this build: every read fails. The Worker then takes
+/// tenant 0's path, where a key tenant 0 does not hold answers `403`; ADR
+/// §8.4 (DUR-10) asks for `503` after a failed route read, which comes
+/// with the real adapter (design question 11 in the lane log).
 #[derive(Clone, Copy, Debug, Default)]
 pub struct NoRoutes;
 
@@ -253,10 +258,14 @@ impl RouteRefusal {
 pub trait UnitRouter {
     /// The unit of `tenant` that holds `bucket`; `None`: the root unit,
     /// for calls that name no bucket (keys, principals, bucket create).
+    /// `floor`: numbers the caller knows (the key route's, rule 5; zeros
+    /// for none). A head below `floor.state_seq` is read again, and if it
+    /// stays below, refused; `keys_seq` is at least `floor.keys_seq`.
     async fn route(
         &self,
         tenant: &TenantId,
         bucket: Option<&str>,
+        floor: Seqs,
     ) -> std::result::Result<Routed, RouteRefusal>;
 
     /// One call to `routed`, carrying its numbers and `listed`, through
@@ -274,10 +283,23 @@ pub trait UnitRouter {
     ) -> std::result::Result<Answered, RouteRefusal>;
 }
 
-/// A call to a unit that writes, for the maintenance gate: a `Request`
-/// call of any op but the three reads (`UnitOp::is_read`).
+/// A call to a unit that writes on a caller's behalf, for the maintenance
+/// gate: a `Request` call of any op but the three reads
+/// (`UnitOp::is_read`), and the reservation calls that change rows
+/// (`Reserve`, `BindBucket`, `Release`, `ReleaseBound`), which the
+/// management plane sends as Worker calls. The tools' own calls (`sync`,
+/// the key apply, the import and the gate) and the reservation reads
+/// (`ResolveActing`, `BucketBinding`) pass: the owner move's window runs
+/// on them (DS1 §3.4).
 pub fn writes(kind: CallKind, op: &UnitOp) -> bool {
-    kind == CallKind::Request && !op.is_read()
+    let reserves = matches!(
+        op,
+        UnitOp::Reserve { .. }
+            | UnitOp::BindBucket { .. }
+            | UnitOp::Release { .. }
+            | UnitOp::ReleaseBound { .. }
+    );
+    reserves || (kind == CallKind::Request && !op.is_read())
 }
 
 /// The unit client of one unit as the router calls it: L2's
@@ -353,6 +375,16 @@ impl HeadCache {
         if heads.len() >= HEAD_CACHE_TENANTS && !heads.contains_key(tenant) {
             heads.clear();
         }
+        // Two requests that overlap: the newer head and the higher
+        // numbers stay.
+        if let Some(c) = heads.get(tenant) {
+            if c.view.seq > view.seq {
+                return;
+            }
+        }
+        let keys_seq = heads
+            .get(tenant)
+            .map_or(keys_seq, |c| c.keys_seq.max(keys_seq));
         heads.insert(
             tenant.clone(),
             Cached {
@@ -380,34 +412,43 @@ impl HeadCache {
 }
 
 /// The router of one request (or one management call): the isolate's
-/// head cache, the clients and heads, and the request's clock reading.
-pub struct Router<'a, C, H> {
+/// head cache, the clients and heads, and a clock read at every route.
+pub struct Router<'a, C, H, T> {
     pub maintenance: Maintenance,
     pub clients: &'a C,
     pub heads: &'a H,
     pub cache: &'a HeadCache,
-    pub now: UnixMs,
+    pub clock: &'a T,
 }
 
-impl<C: RequestClients, H: TenantHeads> UnitRouter for Router<'_, C, H> {
+impl<C: RequestClients, H: TenantHeads, T: Clock> UnitRouter for Router<'_, C, H, T> {
     async fn route(
         &self,
         tenant: &TenantId,
         bucket: Option<&str>,
+        floor: Seqs,
     ) -> std::result::Result<Routed, RouteRefusal> {
         if tenant.is_zero() {
             // Tenant 0's catalogue is D1, never through this router.
             return Err(RouteRefusal::NotPlaced);
         }
-        let (cached, known, keys_seq) = self.cache.get(tenant, self.now);
-        let view = match cached {
+        let now = self.clock.now();
+        let (cached, known, keys_seq) = self.cache.get(tenant, now);
+        let keys_seq = keys_seq.max(floor.keys_seq);
+        // A cached head below the floor is old: read it again.
+        let view = match cached.filter(|c| c.view.seq >= floor.state_seq) {
             Some(c) => c.view,
             None => {
                 let view = read_head_after(self.heads, tenant, known)
                     .await
                     .map_err(|_| RouteRefusal::Unavailable)?
                     .ok_or(RouteRefusal::NotPlaced)?;
-                self.cache.put(tenant, view.clone(), keys_seq, self.now);
+                // A verified head below what the directory handed out: the
+                // chain is behind its own record, never routed by.
+                if view.seq < floor.state_seq {
+                    return Err(RouteRefusal::Unavailable);
+                }
+                self.cache.put(tenant, view.clone(), keys_seq, now);
                 view
             }
         };

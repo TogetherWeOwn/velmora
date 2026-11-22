@@ -5,10 +5,14 @@
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
-use velmora_bridge::config::Maintenance;
+use std::collections::BTreeMap;
+
+use base64::Engine as _;
+use velmora_bridge::config::{BridgeConfig, Maintenance};
 use velmora_bridge::directory::chain::ChainError;
 use velmora_bridge::directory::record::{Lifecycle, Placement, TenantDoor};
 use velmora_bridge::service::{serve_managed, ManagedLine, UNIT_REQUESTS_NOT_BUILT};
+use velmora_bridge::testkit::FixedClock;
 use velmora_bridge::unit::{
     CallKind, Seqs, SyncHead, TenantId, TenantState, UnitAnswer, UnitCall, UnitName, UnitOp,
     UnitReply,
@@ -145,27 +149,81 @@ impl TenantHeads for Heads {
     }
 }
 
+const S3_HOST: &str = "s3.example";
+
+/// The configuration a managed request is judged under.
+fn cfg(maintenance: Maintenance) -> BridgeConfig {
+    let providers = serde_json::json!([{
+        "id": "unused", "host": "127.0.0.1", "port": 1, "tls": false,
+        "user": "nobody", "pass": "unused", "backbone": "none",
+        "post": true, "read": true, "max_conns": 1,
+    }])
+    .to_string();
+    let maintenance = match maintenance {
+        Maintenance::Off => "off",
+        Maintenance::Restore => "restore",
+    };
+    let vars: BTreeMap<&str, String> = [
+        ("ENVIRONMENT", "dev".to_string()),
+        ("S3_HOST", S3_HOST.to_string()),
+        ("S3_REGION", "us-east-1".to_string()),
+        ("MAX_EXTENT_BYTES", "16777216".to_string()),
+        ("REQUIRED_BACKBONES", "1".to_string()),
+        ("SAFETY_MIN_AGE_SECS", "0".to_string()),
+        ("VERIFY_DELAY_SECS", "1".to_string()),
+        ("DEV_TRUST_HTTP", "1".to_string()),
+        ("NEWSGROUPS", "alt.binaries.test".to_string()),
+        ("VELMORA_KEK_ACTIVE", "1".to_string()),
+        ("INFLIGHT_BUDGET_BYTES", "50331648".to_string()),
+        ("GC_MODE", "disposable".to_string()),
+        ("MAINTENANCE", maintenance.to_string()),
+        ("SERVER_SIDE_COPY", "on".to_string()),
+        (
+            "ADMIN_TOKEN",
+            "router-test-admin-token-0123456789abcdef".to_string(),
+        ),
+        ("NNTP_PROVIDERS", providers),
+        (
+            "VELMORA_KEK_1",
+            base64::engine::general_purpose::STANDARD.encode([0x11u8; 32]),
+        ),
+    ]
+    .into_iter()
+    .collect();
+    BridgeConfig::from_vars(|k| vars.get(k).cloned()).expect("test configuration is valid")
+}
+
+/// No floor: a call that knows no numbers.
+const NONE: Seqs = Seqs {
+    state_seq: 0,
+    keys_seq: 0,
+};
+
 fn router<'a>(
     maintenance: Maintenance,
     clients: &'a Clients,
     heads: &'a Heads,
     cache: &'a HeadCache,
-    now: i64,
-) -> Router<'a, Clients, Heads> {
+    clock: &'a FixedClock,
+) -> Router<'a, Clients, Heads, FixedClock> {
     Router {
         maintenance,
         clients,
         heads,
         cache,
-        now: UnixMs(now),
+        clock,
     }
+}
+
+fn at(now: i64) -> FixedClock {
+    FixedClock::new(UnixMs(now))
 }
 
 fn request(method: Method, target: &str) -> S3Request {
     S3Request {
         method,
         raw_target: target.to_string(),
-        headers: vec![("host".into(), "s3.example".into())],
+        headers: vec![("host".into(), S3_HOST.into())],
         body: Body::Empty,
     }
 }
@@ -175,10 +233,11 @@ fn request(method: Method, target: &str) -> S3Request {
 /// does any other write; no head is read for one either.
 #[tokio::test]
 async fn under_restore_writes_answer_503_with_no_unit_call() {
+    let clock = at(1);
     let clients = Clients::default();
     let heads = Heads::one(3, &[0]);
     let cache = HeadCache::default();
-    let r = router(Maintenance::Restore, &clients, &heads, &cache, 1);
+    let r = router(Maintenance::Restore, &clients, &heads, &cache, &clock);
     for (method, target) in [
         (Method::Put, "/b/k"),
         (Method::Delete, "/b/k"),
@@ -191,7 +250,8 @@ async fn under_restore_writes_answer_503_with_no_unit_call() {
         (Method::Delete, "/b"),
     ] {
         let req = request(method.clone(), target);
-        let (resp, line) = serve_managed(&r, Maintenance::Restore, &tenant(), &req).await;
+        let (resp, line) =
+            serve_managed(&r, &cfg(Maintenance::Restore), &tenant(), NONE, &req).await;
         assert_eq!(resp.status, 503, "{method:?} {target}");
         assert!(
             resp.headers
@@ -212,7 +272,7 @@ async fn under_restore_writes_answer_503_with_no_unit_call() {
     assert_eq!(heads.reads(), 0);
     // Through the port too: a request call that writes is refused before
     // any client is made; a read and the Worker's own calls go on.
-    let routed = r.route(&tenant(), Some("b")).await.unwrap();
+    let routed = r.route(&tenant(), Some("b"), NONE).await.unwrap();
     assert_eq!(
         r.call(&routed, CallKind::Request, true, UnitOp::HeldKeys {})
             .await,
@@ -245,17 +305,19 @@ async fn under_restore_writes_answer_503_with_no_unit_call() {
 
 #[tokio::test]
 async fn reads_go_on_under_restore_and_nothing_is_served_by_this_build() {
+    let clock = at(1);
     let clients = Clients::default();
     let heads = Heads::one(3, &[0]);
     let cache = HeadCache::default();
-    let r = router(Maintenance::Restore, &clients, &heads, &cache, 1);
+    let r = router(Maintenance::Restore, &clients, &heads, &cache, &clock);
     for (method, target) in [
         (Method::Get, "/b/k"),
         (Method::Head, "/b/k"),
         (Method::Get, "/b"),
     ] {
         let req = request(method, target);
-        let (resp, line) = serve_managed(&r, Maintenance::Restore, &tenant(), &req).await;
+        let (resp, line) =
+            serve_managed(&r, &cfg(Maintenance::Restore), &tenant(), NONE, &req).await;
         assert_eq!(resp.status, 503);
         assert_eq!(line.code, UNIT_REQUESTS_NOT_BUILT);
     }
@@ -263,7 +325,7 @@ async fn reads_go_on_under_restore_and_nothing_is_served_by_this_build() {
     assert_eq!(heads.reads(), 1);
     assert!(clients.calls().is_empty());
     let req = request(Method::Get, "/_admin/status");
-    let (resp, line) = serve_managed(&r, Maintenance::Off, &tenant(), &req).await;
+    let (resp, line) = serve_managed(&r, &cfg(Maintenance::Off), &tenant(), NONE, &req).await;
     assert_eq!((resp.status, line.code), (403, "admin_with_key"));
 }
 
@@ -272,6 +334,7 @@ async fn reads_go_on_under_restore_and_nothing_is_served_by_this_build() {
 /// chain and tenant 0 are refusals.
 #[tokio::test]
 async fn placements_name_the_unit() {
+    let clock = at(1);
     let clients = Clients::default();
     let mut placed = door(3, &[0, 1]);
     placed.placements = vec![Placement {
@@ -281,15 +344,15 @@ async fn placements_name_the_unit() {
     }];
     let heads = Heads::of(vec![Some(Some(placed))]);
     let cache = HeadCache::default();
-    let r = router(Maintenance::Off, &clients, &heads, &cache, 1);
-    let at = |n| Routed {
+    let r = router(Maintenance::Off, &clients, &heads, &cache, &clock);
+    let on = |n| Routed {
         unit: unit(n),
         seqs: seqs(3, 0),
         listed: true,
     };
-    assert_eq!(r.route(&tenant(), Some("far")).await, Ok(at(1)));
-    assert_eq!(r.route(&tenant(), Some("near")).await, Ok(at(0)));
-    assert_eq!(r.route(&tenant(), None).await, Ok(at(0)));
+    assert_eq!(r.route(&tenant(), Some("far"), NONE).await, Ok(on(1)));
+    assert_eq!(r.route(&tenant(), Some("near"), NONE).await, Ok(on(0)));
+    assert_eq!(r.route(&tenant(), None, NONE).await, Ok(on(0)));
     // A placement on a unit the head does not list.
     let mut stray = door(3, &[0]);
     stray.placements = vec![Placement {
@@ -298,9 +361,9 @@ async fn placements_name_the_unit() {
         epoch: 1,
     }];
     let (heads, cache) = (Heads::of(vec![Some(Some(stray))]), HeadCache::default());
-    let r = router(Maintenance::Off, &clients, &heads, &cache, 1);
+    let r = router(Maintenance::Off, &clients, &heads, &cache, &clock);
     assert_eq!(
-        r.route(&tenant(), Some("far")).await,
+        r.route(&tenant(), Some("far"), NONE).await,
         Err(RouteRefusal::NotPlaced)
     );
     for (heads, want) in [
@@ -309,13 +372,13 @@ async fn placements_name_the_unit() {
         (Heads::of(vec![None]), RouteRefusal::Unavailable),
     ] {
         let cache = HeadCache::default();
-        let r = router(Maintenance::Off, &clients, &heads, &cache, 1);
-        assert_eq!(r.route(&tenant(), None).await, Err(want));
+        let r = router(Maintenance::Off, &clients, &heads, &cache, &clock);
+        assert_eq!(r.route(&tenant(), None, NONE).await, Err(want));
     }
     let (heads, cache) = (Heads::one(3, &[0]), HeadCache::default());
-    let r = router(Maintenance::Off, &clients, &heads, &cache, 1);
+    let r = router(Maintenance::Off, &clients, &heads, &cache, &clock);
     assert_eq!(
-        r.route(&TenantId::zero(), None).await,
+        r.route(&TenantId::zero(), None, NONE).await,
         Err(RouteRefusal::NotPlaced)
     );
     assert_eq!(heads.reads(), 0);
@@ -326,6 +389,7 @@ async fn placements_name_the_unit() {
 /// knew; a clock that went back reads it again too.
 #[tokio::test]
 async fn a_head_is_cached_for_less_than_sixty_seconds() {
+    let clock = at(1_000_000);
     let clients = Clients::default();
     let cache = HeadCache::default();
     let heads = Heads::of(vec![
@@ -333,26 +397,115 @@ async fn a_head_is_cached_for_less_than_sixty_seconds() {
         Some(Some(door(4, &[0]))),
         Some(Some(door(5, &[0]))),
     ]);
-    let at = |now| router(Maintenance::Off, &clients, &heads, &cache, now);
-    let t0 = 1_000_000;
+    // One router for every route: it reads the clock at each.
+    let r = router(Maintenance::Off, &clients, &heads, &cache, &clock);
     let seq = |r: Routed| r.seqs.state_seq;
-    assert_eq!(seq(at(t0).route(&tenant(), None).await.unwrap()), 3);
-    let last = t0 + HEAD_MAX_AGE_MS - 1;
-    assert_eq!(seq(at(last).route(&tenant(), None).await.unwrap()), 3);
+    let t0 = 1_000_000;
+    assert_eq!(seq(r.route(&tenant(), None, NONE).await.unwrap()), 3);
+    clock.set(UnixMs(t0 + HEAD_MAX_AGE_MS - 1));
+    assert_eq!(seq(r.route(&tenant(), None, NONE).await.unwrap()), 3);
     assert_eq!(heads.reads(), 1);
-    let past = t0 + HEAD_MAX_AGE_MS;
-    assert_eq!(seq(at(past).route(&tenant(), None).await.unwrap()), 4);
-    assert_eq!(seq(at(past - 5).route(&tenant(), None).await.unwrap()), 5);
+    clock.set(UnixMs(t0 + HEAD_MAX_AGE_MS));
+    assert_eq!(seq(r.route(&tenant(), None, NONE).await.unwrap()), 4);
+    clock.set(UnixMs(t0 + HEAD_MAX_AGE_MS - 5));
+    assert_eq!(seq(r.route(&tenant(), None, NONE).await.unwrap()), 5);
     assert_eq!(*heads.known.borrow(), [0, 3, 4]);
+}
+
+/// The key route's numbers are a floor (rule 5, §8.4 step 2; review of
+/// L6-2): the call carries at least its `keys_seq`, a cached head below
+/// its `state_seq` is read again, and a head that stays below is refused.
+#[tokio::test]
+async fn the_key_routes_numbers_are_a_floor() {
+    let clock = at(1);
+    let clients = Clients::default();
+    let cache = HeadCache::default();
+    let heads = Heads::of(vec![
+        Some(Some(door(3, &[0]))),
+        Some(Some(door(6, &[0]))),
+        Some(Some(door(6, &[0]))),
+    ]);
+    let r = router(Maintenance::Off, &clients, &heads, &cache, &clock);
+    assert_eq!(
+        r.route(&tenant(), None, seqs(3, 5)).await.unwrap().seqs,
+        seqs(3, 5)
+    );
+    // A floor above the cached head: read again.
+    assert_eq!(
+        r.route(&tenant(), None, seqs(6, 1)).await.unwrap().seqs,
+        seqs(6, 5)
+    );
+    assert_eq!(heads.reads(), 2);
+    // A verified head that stays below the floor is never routed by.
+    assert_eq!(
+        r.route(&tenant(), None, seqs(7, 0)).await,
+        Err(RouteRefusal::Unavailable)
+    );
+    // An older head read late does not replace a newer one.
+    assert_eq!(
+        r.route(&tenant(), None, NONE).await.unwrap().seqs,
+        seqs(6, 5)
+    );
+}
+
+/// The management plane's reservation writes are Worker calls: the
+/// maintenance gate refuses them too (review of L6-2, MEDIUM); the
+/// reservation reads pass.
+#[tokio::test]
+async fn under_restore_the_reservation_writes_are_refused() {
+    use velmora_bridge::unit::call::UnitOp as Op;
+    let clock = at(1);
+    let clients = Clients::default();
+    let heads = Heads::one(3, &[0]);
+    let cache = HeadCache::default();
+    let r = router(Maintenance::Restore, &clients, &heads, &cache, &clock);
+    let routed = r.route(&tenant(), None, NONE).await.unwrap();
+    let writes = [Op::Release {
+        rid: velmora_bridge::unit::reserve::Rid([7; 16]),
+    }];
+    for op in writes {
+        assert!(
+            velmora_bridge::unit_router::writes(CallKind::Worker, &op),
+            "{op:?}"
+        );
+        assert_eq!(
+            r.call(&routed, CallKind::Worker, true, op).await,
+            Err(RouteRefusal::Maintenance)
+        );
+    }
+    assert_eq!(clients.made.get(), 0);
+    let read = Op::BucketBinding { grant_seq: 1 };
+    assert!(!velmora_bridge::unit_router::writes(
+        CallKind::Worker,
+        &read
+    ));
+}
+
+/// The host is judged first, as on tenant 0's path: a virtual-hosted
+/// request is refused before any route (review of L6-2, LOW).
+#[tokio::test]
+async fn a_virtual_hosted_request_is_refused_before_routing() {
+    let clock = at(1);
+    let clients = Clients::default();
+    let heads = Heads::one(3, &[0]);
+    let cache = HeadCache::default();
+    let r = router(Maintenance::Off, &clients, &heads, &cache, &clock);
+    let mut req = request(Method::Get, "/k");
+    req.headers = vec![("host".into(), format!("b.{S3_HOST}"))];
+    let (resp, line) = serve_managed(&r, &cfg(Maintenance::Off), &tenant(), NONE, &req).await;
+    assert_eq!(line.code, "host_refused");
+    assert_ne!(resp.status, 200);
+    assert_eq!(heads.reads(), 0);
 }
 
 #[tokio::test]
 async fn a_call_carries_the_numbers_and_listed_through_the_client() {
+    let clock = at(1);
     let clients = Clients::answering(vec![answered(ok(seqs(3, 2)), None)]);
     let heads = Heads::one(3, &[0]);
     let cache = HeadCache::default();
-    let r = router(Maintenance::Off, &clients, &heads, &cache, 1);
-    let routed = r.route(&tenant(), Some("b")).await.unwrap();
+    let r = router(Maintenance::Off, &clients, &heads, &cache, &clock);
+    let routed = r.route(&tenant(), Some("b"), NONE).await.unwrap();
     let op = UnitOp::Ping {};
     let got = r
         .call(&routed, CallKind::Request, true, op.clone())
@@ -374,35 +527,46 @@ async fn a_call_carries_the_numbers_and_listed_through_the_client() {
     );
     assert_eq!(*clients.routed.borrow(), [routed]);
     // The unit's keys_seq is kept: the next route carries it.
-    assert_eq!(r.route(&tenant(), None).await.unwrap().seqs, seqs(3, 2));
+    assert_eq!(
+        r.route(&tenant(), None, NONE).await.unwrap().seqs,
+        seqs(3, 2)
+    );
 }
 
 /// The client ran rule 5 with newer numbers: kept for the next call; a
 /// `state_seq` above the head's makes the head be read again.
 #[tokio::test]
 async fn refreshed_numbers_are_kept_and_a_newer_state_reads_the_head_again() {
+    let clock = at(1);
     let clients = Clients::answering(vec![
         answered(ok(seqs(3, 5)), Some(seqs(3, 5))),
         answered(ok(seqs(4, 5)), Some(seqs(4, 5))),
     ]);
     let heads = Heads::of(vec![Some(Some(door(3, &[0]))), Some(Some(door(4, &[0])))]);
     let cache = HeadCache::default();
-    let r = router(Maintenance::Off, &clients, &heads, &cache, 1);
-    let routed = r.route(&tenant(), None).await.unwrap();
+    let r = router(Maintenance::Off, &clients, &heads, &cache, &clock);
+    let routed = r.route(&tenant(), None, NONE).await.unwrap();
     r.call(&routed, CallKind::Request, true, UnitOp::Ping {})
         .await
         .unwrap();
-    assert_eq!(r.route(&tenant(), None).await.unwrap().seqs, seqs(3, 5));
+    assert_eq!(
+        r.route(&tenant(), None, NONE).await.unwrap().seqs,
+        seqs(3, 5)
+    );
     assert_eq!(heads.reads(), 1);
     r.call(&routed, CallKind::Request, true, UnitOp::Ping {})
         .await
         .unwrap();
-    assert_eq!(r.route(&tenant(), None).await.unwrap().seqs, seqs(4, 5));
+    assert_eq!(
+        r.route(&tenant(), None, NONE).await.unwrap().seqs,
+        seqs(4, 5)
+    );
     assert_eq!(heads.reads(), 2);
 }
 
 #[tokio::test]
 async fn closed_unborn_stale_and_an_unreachable_unit_are_refusals() {
+    let clock = at(1);
     let heads = Heads::one(3, &[0]);
     for (answer, want) in [
         (
@@ -438,8 +602,8 @@ async fn closed_unborn_stale_and_an_unreachable_unit_are_refusals() {
     ] {
         let clients = Clients::answering(vec![answered(answer.clone(), None)]);
         let cache = HeadCache::default();
-        let r = router(Maintenance::Off, &clients, &heads, &cache, 1);
-        let routed = r.route(&tenant(), None).await.unwrap();
+        let r = router(Maintenance::Off, &clients, &heads, &cache, &clock);
+        let routed = r.route(&tenant(), None, NONE).await.unwrap();
         assert_eq!(
             r.call(&routed, CallKind::Request, true, UnitOp::Ping {})
                 .await,
@@ -451,8 +615,8 @@ async fn closed_unborn_stale_and_an_unreachable_unit_are_refusals() {
     assert!(!RouteRefusal::Closed.alert());
     let clients = Clients::default();
     let cache = HeadCache::default();
-    let r = router(Maintenance::Off, &clients, &heads, &cache, 1);
-    let routed = r.route(&tenant(), None).await.unwrap();
+    let r = router(Maintenance::Off, &clients, &heads, &cache, &clock);
+    let routed = r.route(&tenant(), None, NONE).await.unwrap();
     assert_eq!(
         r.call(&routed, CallKind::Request, true, UnitOp::Ping {})
             .await,

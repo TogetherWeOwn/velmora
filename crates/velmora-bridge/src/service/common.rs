@@ -368,6 +368,16 @@ impl Authority for OneKey {
 /// The access key id the request claims, from the `Authorization` header
 /// or a presigned query. Only used to look the key up; the verifier
 /// parses the credential strictly.
+/// [`host_refused`] for a raw request, before anything else is parsed
+/// (the router of a managed tenant's requests, `service::serve_managed`).
+/// A request with no `Host` is not refused here.
+pub(super) fn request_host_refused(cfg: &BridgeConfig, req: &S3Request) -> Option<S3Response> {
+    req.headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("host"))
+        .and_then(|(_, host)| host_value_refused(host, cfg))
+}
+
 /// The access key id a request claims (its `Authorization` header or its
 /// presigned query), for the request router only (`unit_router`): it
 /// picks the tenant whose catalogue then verifies the signature. `None`

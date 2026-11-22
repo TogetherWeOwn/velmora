@@ -307,8 +307,8 @@ thread_local! {
 /// tenant 0's path, unchanged, which is every request of a Worker without
 /// `UNIT` bound (no route read at all), every request that claims no key
 /// or a key of tenant 0, and every request whose route read failed (ADR
-/// §8.4, DUR-10). `skip`: an admin route or a verified fan-out piece,
-/// which never take a key route.
+/// §8.4; see `NoRoutes` for the `503` that DUR-10 asks for). `skip`: an
+/// admin route or a verified fan-out piece, which never take a key route.
 ///
 /// This build has no key routes, no head reader and no unit client for
 /// requests (`NoRoutes`, `NoHeads`, `NoClients`), so it always answers
@@ -325,9 +325,14 @@ pub async fn route_request(
     }
     let akid = velmora_bridge::service::claimed_access_key(&base.cfg, req)?;
     let tenant = match routes().tenant_of(&akid).await {
-        Ok(KeyTenant::Managed(tenant)) => tenant,
+        Ok(KeyTenant::Managed { tenant, floor }) => (tenant, floor),
+        // Tenant 0's key, or none a route names: tenant 0's path. A failed
+        // route read takes it too; there a key tenant 0 does not hold
+        // answers `403`, where ADR §8.4 (DUR-10) asks for `503` (design
+        // question 11: with the real key routes).
         Ok(KeyTenant::Zero) | Err(_) => return None,
     };
+    let (tenant, floor) = tenant;
     let cache = HEADS.with(std::rc::Rc::clone);
     let heads = heads();
     let router = Router {
@@ -335,10 +340,10 @@ pub async fn route_request(
         clients: &NoClients,
         heads: &heads,
         cache: &cache,
-        now: velmora_bridge::ports::Clock::now(&base.clock),
+        clock: &base.clock,
     };
     let (resp, line) =
-        velmora_bridge::service::serve_managed(&router, base.cfg.maintenance, &tenant, req).await;
+        velmora_bridge::service::serve_managed(&router, &base.cfg, &tenant, floor, req).await;
     match line.alert {
         true => worker::console_error!("alert: unit request ({})", line.code),
         false => worker::console_log!("unit request ({})", line.code),

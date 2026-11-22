@@ -434,16 +434,21 @@ A managed tenant's S3 requests reach its units through the request
 router (`unit_router`, ADR §2.7), which the management plane uses too.
 Only a Worker with `UNIT` bound takes a key route; unbound, every
 request takes tenant 0's path with no added read. The claimed access key
-id picks the tenant (`KeyRoutes`; tenant 0's keys, unknown keys and a
-failed route read keep tenant 0's path, §8.4). The tenant's verified head
-(cached per isolate for under 60 s, read again from the seq it knew)
-names the unit: the root unit for a call with no bucket, the unit of the
+id picks the tenant (`KeyRoutes`; tenant 0's keys and unknown keys keep
+tenant 0's path, §8.4; so does a failed route read for now, where a key
+tenant 0 does not hold then answers `403`, not the `503` of DUR-10). The
+route's numbers are a floor. The `Host` is judged first, as on tenant 0's
+path. The tenant's verified head (cached per isolate for under 60 s, read
+again from the seq it knew, and again when below the floor) names the
+unit: the root unit for a call with no bucket, the unit of the
 bucket's placement, or the root unit for a bucket with none. The unit
 must be listed. A routed call goes through the unit's client (L2's
 `UnitClient::call`, which runs rule 5) with the head's `state_seq`, the
 highest `keys_seq` a unit of the tenant answered, and `listed`. Under
 `MAINTENANCE=restore` every request that writes answers `503` before any
-head read or unit call. This build has no S3 request operations on a
+head read or unit call, and the router refuses the reservation writes the
+management plane sends (`Reserve`, `BindBucket`, `Release`,
+`ReleaseBound`) before any call. This build has no S3 request operations on a
 unit, and no key routes, head reader or unit client in the Worker, so a
 routed request answers `503` and in practice every request takes tenant
 0's path. A routed request's `503` comes before its signature is checked:

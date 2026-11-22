@@ -383,12 +383,18 @@ pub struct ManagedLine {
 /// written for it.
 pub async fn serve_managed<R: crate::unit_router::UnitRouter>(
     router: &R,
-    maintenance: crate::config::Maintenance,
+    cfg: &crate::config::BridgeConfig,
     tenant: &crate::unit::TenantId,
+    floor: crate::unit::Seqs,
     req: &S3Request,
 ) -> (S3Response, ManagedLine) {
     let route = classify(&req.method, &req.raw_target);
     let line = |code, alert| ManagedLine { code, alert };
+    // The host first, as on tenant 0's path: on a virtual-hosted request
+    // the path's first segment is a key, never a bucket to route by.
+    if let Some(resp) = common::request_host_refused(cfg, req) {
+        return (resp, line("host_refused", false));
+    }
     match route {
         Route::NotImplemented => {
             return (
@@ -405,10 +411,10 @@ pub async fn serve_managed<R: crate::unit_router::UnitRouter>(
         }
         _ => {}
     }
-    if maintenance == crate::config::Maintenance::Restore && route.writes() {
+    if cfg.maintenance == crate::config::Maintenance::Restore && route.writes() {
         return (writes_refused(), line("maintenance", false));
     }
-    match router.route(tenant, route.bucket()).await {
+    match router.route(tenant, route.bucket(), floor).await {
         Err(refusal) => (
             common::unit_refused(),
             line(refusal.code(), refusal.alert()),
