@@ -412,10 +412,20 @@ pub fn p12(zero: &TenantDoor, owner_head: &TenantDoor, unit: u32, view: &UnitVie
             }
             let undone_here =
                 z.undone() && z.moved.as_ref().is_some_and(|m| m.to == owner_head.tenant);
+            // The seal tells the two lifted states apart: a move that was
+            // lifted and given up (V9) never raised `flips`, so its seal is
+            // `flips + 1`; a move that flipped (and was undone) sealed at
+            // or below `flips`. A later move into another tenant that gave
+            // up clears `move` and leaves the undo copy here.
+            let given_up_seal = z.flips.checked_add(1);
+            let flipped_seal = state.sealed.is_some_and(|s| s <= z.flips);
             match (state.move_lifted, &z.moved) {
                 (Some(false), _) => P12::FinishGiveUp,
-                (Some(true), None) => P12::FinishGiveUp,
-                (Some(true), Some(_)) if undone_here => P12::UndoCopy,
+                (Some(true), None) if state.sealed.is_some() && state.sealed == given_up_seal => {
+                    P12::FinishGiveUp
+                }
+                (Some(true), None) if flipped_seal => P12::UndoCopy,
+                (Some(true), Some(_)) if undone_here && flipped_seal => P12::UndoCopy,
                 _ => P12::Stop,
             }
         }

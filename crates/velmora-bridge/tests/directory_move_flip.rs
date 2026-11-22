@@ -90,6 +90,10 @@ struct FakeUnit {
     key_rows: RefCell<BTreeMap<String, SubjectStatus>>,
     applies: Cell<u32>,
     recounts: Cell<u32>,
+    /// A key chain to grow by one record on each recount.
+    grow_keys: RefCell<Option<Rc<RefCell<Vec<KeyEntry>>>>>,
+    /// Logs each closing sync.
+    log: RefCell<Option<Rc<RefCell<Vec<String>>>>>,
 }
 
 impl Default for FakeUnit {
@@ -123,6 +127,8 @@ impl Default for FakeUnit {
             key_rows: RefCell::default(),
             applies: Cell::new(0),
             recounts: Cell::new(0),
+            grow_keys: RefCell::default(),
+            log: RefCell::default(),
         }
     }
 }
@@ -169,6 +175,11 @@ impl KeyUnit for FakeUnit {
 
 impl OwnerUnit for FakeUnit {
     async fn sync(&self, owner: &TenantDoor, lift: Option<&LiftProof>) -> Result<Synced> {
+        if let Some(log) = self.log.borrow().as_ref() {
+            if owner.restoring_entry(0).is_some() {
+                log.borrow_mut().push("close".into());
+            }
+        }
         if take(&self.fail) || self.armed.replace(false) {
             return Err(BridgeError::Blob("unit unreachable".into()));
         }
@@ -274,6 +285,13 @@ impl OwnerUnit for FakeUnit {
 
     async fn recount(&self) -> Result<()> {
         self.recounts.set(self.recounts.get() + 1);
+        // A key record lands while the recount runs.
+        if let Some(chain) = self.grow_keys.borrow().as_ref() {
+            let seq = chain.borrow().len() as u64 + 1;
+            chain
+                .borrow_mut()
+                .push(entry("AKLATE00000000000001", SubjectStatus::Active, seq));
+        }
         Ok(())
     }
 
@@ -286,7 +304,7 @@ impl OwnerUnit for FakeUnit {
 /// The owner's key chain (one entry per record) and the revocations.
 #[derive(Default)]
 struct FakeKeys {
-    chain: RefCell<Vec<KeyEntry>>,
+    chain: Rc<RefCell<Vec<KeyEntry>>>,
     flat: RefCell<BTreeSet<String>>,
     tenant: RefCell<BTreeSet<String>>,
     /// The bucket lists of every grant revocation, in order.
@@ -468,6 +486,7 @@ struct FakeReceipt {
     v9_failed: Cell<bool>,
     /// The next N writes are not reached.
     fail: Cell<u32>,
+    log: RefCell<Option<Rc<RefCell<Vec<String>>>>>,
 }
 
 impl MoveReceipt for FakeReceipt {
@@ -480,6 +499,9 @@ impl MoveReceipt for FakeReceipt {
             return Err(BridgeError::Blob("receipt unreachable".into()));
         }
         self.v9_failed.set(true);
+        if let Some(log) = self.log.borrow().as_ref() {
+            log.borrow_mut().push("receipt".into());
+        }
         Ok(())
     }
 }
@@ -918,8 +940,9 @@ fn the_move_is_given_up_before_its_routes() {
         );
         assert_eq!(m.keys.grants_revoked.borrow().len(), 1);
         assert_eq!(m.records(), n);
-        // And the flip no longer runs.
-        assert!(matches!(m.flip().await, Err(FlipError::NotThisMove)));
+        // And the flip no longer runs: it finishes the give-up (here
+        // done) and says so.
+        assert!(matches!(m.flip().await, Err(FlipError::GivenUp(_))));
     });
 }
 
@@ -1334,7 +1357,8 @@ fn records_of_no_window_after_the_give_up_keep_its_answer() {
             first
         );
         assert_eq!(m.records(), n);
-        assert!(matches!(m.flip().await, Err(FlipError::NotThisMove)));
+        assert!(matches!(m.flip().await, Err(FlipError::GivenUp(_))));
+        assert_eq!(m.records(), n);
     });
 }
 
@@ -1503,15 +1527,27 @@ fn v9_failing_in_the_open_unit_gives_the_move_up_for_good() {
     block_on(async {
         let m = window().await;
         log_puts(&m);
+        *m.receipt.log.borrow_mut() = Some(Rc::clone(&m.keys.log));
+        *m.unit.log.borrow_mut() = Some(Rc::clone(&m.keys.log));
         m.unit.v9_ok.set(false);
         let r = m.flip().await;
         assert!(matches!(r, Err(FlipError::V9Failed)), "{r:?}");
-        // The lift, then (AM-52) the unit closed again while tenant 0 is
-        // still `moving`, then tenant 0 at d1, the grant revocations, the
-        // unplace.
+        // The unit closed under the entry, the lift; then (AM-52) the V9
+        // result to the receipt, the owner's entry again and the unit
+        // closed under it while tenant 0 is still `moving`, then tenant 0
+        // at d1, the grant revocations, the unplace.
         assert_eq!(
             *m.keys.log.borrow(),
-            ["owner", "owner", "zero", "revoke_grants", "owner"]
+            [
+                "close",
+                "owner",
+                "receipt",
+                "owner",
+                "close",
+                "zero",
+                "revoke_grants",
+                "owner"
+            ]
         );
         assert!(m.routes.records.borrow().is_empty());
         let o = m.head(&owner()).await;
@@ -2099,5 +2135,36 @@ fn a_receipt_that_cannot_be_written_still_gives_up() {
         assert!(m.flip().await.is_err());
         assert_eq!(m.unit.v9_runs.get(), 1);
         assert!(m.routes.records.borrow().is_empty());
+    });
+}
+
+/// AM-45: the same refusal after its fix stops, unless a chain head moved
+/// since the fix: then one more fix.
+#[test]
+fn a_moved_head_allows_one_more_fix() {
+    block_on(async {
+        let m = window().await;
+        *m.unit.grow_keys.borrow_mut() = Some(Rc::clone(&m.keys.chain));
+        m.unit.lift_answers.borrow_mut().extend([
+            UnitRefused::Gate(GateRefusal::CountersOff),
+            UnitRefused::Gate(GateRefusal::CountersOff),
+        ]);
+        let f = m.flip().await.map_err(|e| format!("{e:?}")).unwrap();
+        assert!(f.wrote);
+        assert_eq!(m.unit.recounts.get(), 2);
+    });
+}
+
+/// AM-52: V9 failed, the receipt could not be written and the give-up
+/// stopped: the error says the failure is not recorded.
+#[test]
+fn an_unrecorded_v9_failure_says_so() {
+    block_on(async {
+        let m = window().await;
+        m.unit.v9_ok.set(false);
+        m.receipt.fail.set(99);
+        m.keys.fail_grants.set(1);
+        let r = m.flip().await;
+        assert!(matches!(r, Err(FlipError::V9Unrecorded(_))), "{r:?}");
     });
 }

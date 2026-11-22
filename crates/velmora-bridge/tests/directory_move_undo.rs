@@ -2144,15 +2144,18 @@ fn p12_reads_both_heads_and_the_unit() {
         let u = flipped().await;
         let moved = u.head(&Tenant::zero()).await;
         let o = u.head(&owner()).await;
-        let import = |lifted, closed| UnitView::Import {
+        // Tenant 0 flipped once (`flips` = 1): the flipped import sealed at
+        // 1; a later window that was lifted and given up seals at 2.
+        let sealed_at = |lifted, sealed, closed| UnitView::Import {
             state: ImportState {
                 move_lifted: lifted,
                 t0_seq: Some(1),
-                sealed: Some(1),
+                sealed,
                 tables: vec![],
             },
             closed,
         };
+        let import = |lifted, closed| sealed_at(lifted, Some(1), closed);
         let with = |f: &dyn Fn(&mut velmora_bridge::directory::record::TenantZero)| {
             let mut z = moved.clone();
             f(z.tenant_zero.as_mut().unwrap());
@@ -2179,9 +2182,21 @@ fn p12_reads_both_heads_and_the_unit() {
             p12(&given_up, &o, 0, &import(Some(false), true)),
             P12::FinishGiveUp
         );
+        // Lifted and given up (V9): its seal is one above `flips`.
+        assert_eq!(
+            p12(&given_up, &o, 0, &sealed_at(Some(true), Some(2), true)),
+            P12::FinishGiveUp
+        );
+        // An undone move's copy, after a later move into another tenant
+        // gave up and cleared `move`: still the undo copy, never emptied
+        // without the owner's G6.
         assert_eq!(
             p12(&given_up, &o, 0, &import(Some(true), true)),
-            P12::FinishGiveUp
+            P12::UndoCopy
+        );
+        assert_eq!(
+            p12(&given_up, &o, 0, &sealed_at(Some(true), None, true)),
+            P12::Stop
         );
         assert_eq!(
             p12(&undone, &o, 0, &import(Some(true), true)),
@@ -2461,5 +2476,56 @@ fn p8_takes_a_disabled_row_without_grants_as_revoked() {
             .await
             .unwrap()
             .is_empty());
+    });
+}
+
+/// AM-53: an import found after tenant 0's `moving` record and bound
+/// below it stops step 2 for the give-up without `deleteAll()`.
+#[test]
+fn an_earlier_import_found_after_the_moving_record_stops_step_two() {
+    block_on(async {
+        let u = flipped().await;
+        let k_u = u.up_to_verify().await;
+        u.flip(k_u).await.unwrap();
+        // The next window's tenant-0 record landed; step 2 then finds the
+        // undone move's import (P12 skipped).
+        u.write(
+            &Tenant::zero(),
+            Change::StartMove {
+                to: owner(),
+                catalogue_id_frozen: FRESH_ID.into(),
+            },
+            Actor::MoveTool,
+        )
+        .await;
+        *u.unit.import.borrow_mut() = Some(ImportState {
+            move_lifted: Some(true),
+            t0_seq: Some(3),
+            sealed: Some(1),
+            tables: vec![],
+        });
+        let before = u.head(&owner()).await.seq;
+        let r = open_window(
+            &u.chain(),
+            &u.fresh,
+            &u.dir(),
+            &u.unit,
+            &u.keys,
+            &owner(),
+            FRESH_ID,
+            u.rig.now(),
+        )
+        .await;
+        assert!(
+            matches!(
+                r,
+                Err(WindowError::EarlierImport {
+                    t0_seq: Some(3),
+                    started: true
+                })
+            ),
+            "{r:?}"
+        );
+        assert_eq!(u.head(&owner()).await.seq, before);
     });
 }

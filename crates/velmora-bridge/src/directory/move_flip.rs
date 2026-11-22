@@ -115,6 +115,9 @@ pub enum FlipError {
     NotLifted,
     /// V9 failed in the open unit; the move was given up (AM-30).
     V9Failed,
+    /// The window was given up (not for V9): this run finished the
+    /// give-up, as [`give_up`] answers it.
+    GivenUp(GaveUp),
     /// V9 failed, and the give-up it started stopped with this error: run
     /// [`give_up`] again.
     V9GiveUp(Box<FlipError>),
@@ -311,7 +314,7 @@ pub const MAX_REENTRIES: u32 = 1;
 /// How often (b) sends the same `sync` again after a lost answer.
 pub const SYNC_TRIES: u32 = 3;
 
-/// How often a failed V9 tries tenant 0's `d1` record.
+/// How often a failed V9 tries to write its result to the move receipt.
 pub const V9_GIVE_UP_TRIES: u32 = 3;
 
 /// How many `move` reports (b) opens before it stops.
@@ -463,7 +466,7 @@ where
             return match give_up(chain, frozen, safety, dir, unit, routes, keys, window, now).await
             {
                 Ok(_) if v9 => Err(FlipError::V9Failed),
-                Ok(_) => Err(FlipError::NotThisMove),
+                Ok(g) => Err(FlipError::GivenUp(g)),
                 Err(e) if v9 => Err(FlipError::V9GiveUp(Box::new(e))),
                 Err(e) => Err(e),
             };
@@ -494,18 +497,20 @@ where
     let owner = open_unit(chain, dir, unit, keys, &zero, window, now).await?;
 
     // (b2) V9, once the unit is open; a run that already put a route
-    // passed it.
-    // A failure gives the move up at once, tenant 0's record first, so no
-    // later run samples V9 again and flips (AM-30, DS1 §3.8 row 7). No
-    // route names the owner yet, so nothing reaches the open unit before
-    // the give-up closes it.
+    // passed it. A failure gives the move up at once, in the order of DS1
+    // §3.8 row 8(b2) (AM-52): the receipt, the unit closed again while
+    // tenant 0 is `moving`, tenant 0's `d1` record, the rest; no later run
+    // samples V9 again (AM-30). No route names the owner yet, so nothing
+    // reaches the open unit before the give-up closes it.
     if !routes_started && !unit.v9().await? {
         // The result first, so every later run of step 8 reads it and
         // gives up too (AM-52, AM-45). A receipt that cannot be written does
         // not stop the give-up: the owner's unit closed again and tenant
-        // 0's `d1` record end the window as well. (The receipt and both
-        // chains are in R2: a run that can write neither leaves the window
-        // as it was, and its error says so.)
+        // 0's `d1` record end the window as well. A run that could write
+        // neither the receipt nor the give-up's `d1` record answers
+        // `V9Unrecorded`: the window may still be open (the unit may be
+        // closed again already), and the tool must record the failure
+        // before it runs step 8 again.
         let mut recorded = false;
         for _ in 0..V9_GIVE_UP_TRIES {
             if receipt.put_v9_failed().await.is_ok() {
@@ -648,8 +653,13 @@ where
     // when the owner's head names this window; else the caller's.
     let start = window_start(chain, zero, window.owner)
         .await
-        .map_err(|_| FlipError::NotThisMove)?;
+        .map_err(|e| match e {
+            super::move_window::WindowError::Store(e) => FlipError::Store(e),
+            super::move_window::WindowError::Chain(e) => FlipError::Chain(e),
+            _ => FlipError::NotThisMove,
+        })?;
     let mut reentries = 0u32;
+    let mut last: Option<UnitRefused> = None;
     // The entry the fixes so far were for.
     let mut fixed_for: Option<u64> = None;
     let mut fixed = Fixed::default();
@@ -726,6 +736,7 @@ where
             Some(r) => r,
         };
         let heads = (head_of(chain, window.owner).await?.seq, keys.head().await?);
+        last = Some(refusal.clone());
         match refusal {
             UnitRefused::KeysNotApplied if may(fixed.keys, heads) => {
                 fixed.keys = Some(heads);
@@ -763,7 +774,8 @@ where
             r => return Err(FlipError::SyncRefused(r)),
         }
     }
-    Err(FlipError::LiftNotOk)
+    // A head that kept moving: the last refusal, for the receipt.
+    Err(last.map_or(FlipError::LiftNotOk, FlipError::SyncRefused))
 }
 
 /// One `sync` that lifts, sent again after a lost answer. `None`: the lift
