@@ -788,6 +788,8 @@ impl<S: Sql> SqlDirectory<'_, S> {
 
     /// Marks the gate closed at `epoch`, which the caller has anchored in
     /// R2. An older epoch changes nothing; the caller reads the row back.
+    /// The same epoch closes an open row, so the first open never calls
+    /// this (AM-83b): it moves the row by [`Self::first_close`].
     pub async fn mark_closed(&self, epoch: u64, reason: &str, now: UnixMs) -> Result<()> {
         self.sql
             .exec(
@@ -812,7 +814,85 @@ impl<S: Sql> SqlDirectory<'_, S> {
             .await?;
         Ok(changed > 0)
     }
+
+    /// The gate row as the first open reads it (AM-83b item 1); `None`:
+    /// no row (the migration's state). Never [`Self::gate`]'s "no row =
+    /// closed at 0": the first open tells the two apart in its answer.
+    pub async fn gate_row(&self) -> Result<Option<GateRow>> {
+        let rows = self
+            .sql
+            .query(
+                "SELECT closed, epoch, pending_cleared FROM directory_gate WHERE id = 1",
+                &[],
+            )
+            .await?;
+        rows.first()
+            .map(|row| {
+                Ok(GateRow {
+                    closed: int_at(row, 0)? != 0,
+                    epoch: u64::try_from(int_at(row, 1)?).map_err(|_| ERR_ROW)?,
+                    pending_cleared: int_at(row, 2)? != 0,
+                })
+            })
+            .transpose()
+    }
+
+    /// The first open's move to closed at epoch 1 (AM-83b item 6): one
+    /// batch, every statement conditioned in itself. The row moves from
+    /// no row or closed at epoch 0 to closed at epoch 1, and `pending_ops`
+    /// is emptied once, only while the row is closed at epoch 1 and not
+    /// yet emptied, so never after an open. A row in any other state is
+    /// left as it is; the caller reads it back. Never [`Self::mark_closed`].
+    pub async fn first_close(&self, reason: &str, now: UnixMs) -> Result<()> {
+        self.sql
+            .batch(vec![
+                (
+                    FIRST_CLOSE,
+                    vec![SqlValue::Text(reason.to_string()), SqlValue::Int(now.0)],
+                ),
+                (FIRST_CLEAR_PENDING, vec![]),
+                (FIRST_MARK_CLEARED, vec![]),
+            ])
+            .await
+            .map(|_| ())
+    }
+
+    /// The first open's open (AM-83b item 8): only a row closed at epoch
+    /// 1 whose pending table was emptied. `false`: no row changed.
+    pub async fn first_open_gate(&self, now: UnixMs) -> Result<bool> {
+        let changed = self.sql.exec(FIRST_OPEN, &[SqlValue::Int(now.0)]).await?;
+        Ok(changed > 0)
+    }
 }
+
+/// The gate row with the first open's column (AM-83b).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GateRow {
+    pub closed: bool,
+    pub epoch: u64,
+    /// The first open's batch emptied `pending_ops` at epoch 1.
+    pub pending_cleared: bool,
+}
+
+/// The compare-and-set of the first open: no row, or closed at epoch 0,
+/// becomes closed at epoch 1; any other row is left as it is.
+pub const FIRST_CLOSE: &str = "INSERT INTO directory_gate (id, closed, epoch, reason, closed_at, pending_cleared) \
+     VALUES (1, 1, 1, ?1, ?2, 0) \
+     ON CONFLICT (id) DO UPDATE SET epoch = 1, pending_cleared = 0, reason = excluded.reason, closed_at = excluded.closed_at \
+     WHERE directory_gate.closed = 1 AND directory_gate.epoch = 0";
+
+/// Empties `pending_ops` once: only while the row is closed at epoch 1
+/// and its first-open batch has not emptied it yet.
+pub const FIRST_CLEAR_PENDING: &str = "DELETE FROM pending_ops WHERE EXISTS \
+     (SELECT 1 FROM directory_gate WHERE id = 1 AND closed = 1 AND epoch = 1 AND pending_cleared = 0)";
+
+/// Marks the emptying done, under the same condition.
+pub const FIRST_MARK_CLEARED: &str = "UPDATE directory_gate SET pending_cleared = 1 \
+     WHERE id = 1 AND closed = 1 AND epoch = 1 AND pending_cleared = 0";
+
+/// The first open's open: only from closed at epoch 1, emptied.
+pub const FIRST_OPEN: &str = "UPDATE directory_gate SET closed = 0, opened_at = ?1 \
+     WHERE id = 1 AND closed = 1 AND epoch = 1 AND pending_cleared = 1";
 
 fn tenant_row(row: Row) -> Result<TenantRow> {
     let id = Tenant::parse(&text(&row, 0)?).ok_or(ERR_ROW)?;

@@ -29,17 +29,20 @@
 //!   written only by a deploy that has them. A head that is there is
 //!   answered as above whatever the deployment binds.
 //! - Under `MAINTENANCE=restore` both answer `503` and do nothing.
-//! - [`GATE_FIRST_OPEN_PATH`]: `directory::first_open::first_open`, whose
-//!   guard runs before any gate step: an open gate answers `200` with
+//! - [`GATE_FIRST_OPEN_PATH`]: `directory::first_open::first_open`, at
+//!   epoch 1 only (AM-83b): an open gate answers `200` with
 //!   `{"gate": "open", "ran": false}` and runs nothing (a repeat never
-//!   closes an open gate, and never empties `pending_ops`); a tenant chain
+//!   closes an open gate, and never empties `pending_ops`), before any
+//!   tenant check; anchors or a gate row that no first open makes answer
+//!   `409 gate_epoch_unexpected` (a page) and run nothing; a tenant chain
 //!   of a managed tenant answers `409 gate_has_tenants` (a page) and runs
-//!   nothing. Otherwise one gate run with `FirstOpen` steps: `200` with
-//!   `{"gate": "open", "ran": true, "epoch": E}` when it opened, and
+//!   nothing. Otherwise one run with `FirstOpen` steps at epoch 1: `200`
+//!   with `{"gate": "open", "ran": true, "epoch": 1}` when it opened, and
 //!   `503 gate_not_opened` with the steps that are not done when it did
-//!   not (a run that left the gate closed may be started again). With
-//!   `DIRECTORY` unbound the gate counts as closed: `503
-//!   directory_unbound`, nothing run.
+//!   not (a run that left the gate closed may be started again). A
+//!   compare-and-set that lost to another call, and a store that did not
+//!   answer, answer `503` with `Retry-After`. With `DIRECTORY` unbound the
+//!   gate counts as closed: `503 directory_unbound`, nothing run.
 //!
 //! Every answer carries fixed words and numbers only, never a store's
 //! text.
@@ -97,8 +100,15 @@ fn fail(status: u16, code: &'static str, message: &'static str) -> S3Response {
     json_response(status, &json!({ "error": code, "message": message }))
 }
 
+/// How long a retryable `503` asks the caller to wait, in seconds: as
+/// the S3 path's `SlowDown` (`ingress.rs`).
+pub const RETRY_AFTER_SECS: &str = "1";
+
 fn unavailable() -> S3Response {
-    fail(503, "SlowDown", "Not available now; retry shortly.")
+    let mut resp = fail(503, "SlowDown", "Not available now; retry shortly.");
+    resp.headers
+        .push(("retry-after".to_string(), RETRY_AFTER_SECS.to_string()));
+    resp
 }
 
 /// Whether the request carries a body: a declared length above 0, or a
@@ -239,6 +249,17 @@ where
     match first_open(&chain, &dir, root.kek(), now).await {
         Ok(FirstOpenAnswer::AlreadyOpen) => {
             json_response(200, &json!({ "gate": "open", "ran": false }))
+        }
+        Ok(FirstOpenAnswer::EpochUnexpected) => {
+            crate::trace::alert(|| {
+                "setup: first open refused: the gate anchors or row are not at epoch 0 or 1"
+                    .to_string()
+            });
+            fail(
+                409,
+                "gate_epoch_unexpected",
+                "The gate is in a state no first open makes; nothing was run.",
+            )
         }
         Ok(FirstOpenAnswer::HasTenants) => {
             crate::trace::alert(|| {

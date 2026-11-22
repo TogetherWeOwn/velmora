@@ -61,6 +61,9 @@ impl Ports {
             include_str!(
                 "../../../workers/s3-bridge/migrations-directory/0003_pending_chains_and_caps.sql"
             ),
+            include_str!(
+                "../../../workers/s3-bridge/migrations-directory/0004_gate_pending_cleared.sql"
+            ),
         ] {
             sql.apply(migration).unwrap();
         }
