@@ -134,6 +134,16 @@ pub(super) async fn delete_bucket_signed<
     let Some(bucket) = &authed.bucket else {
         return s3_error(ErrorCode::InvalidRequest);
     };
+    // A managed tenant's buckets are deleted through the management
+    // plane only (AM-57, AM-64): `403 AccessDenied`, nothing read or
+    // written past the authentication.
+    if bridge.catalog.request_scope().is_some() {
+        return S3Response::error(
+            403,
+            "AccessDenied",
+            "Buckets are deleted through the management plane.",
+        );
+    }
     match bridge.catalog.bucket_in_use(&bucket.id).await {
         Ok(true) => bucket_not_empty(),
         Ok(false) => S3Response::error(

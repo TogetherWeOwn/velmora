@@ -11,7 +11,8 @@ use base64::Engine as _;
 use velmora_bridge::config::{BridgeConfig, Maintenance};
 use velmora_bridge::directory::chain::ChainError;
 use velmora_bridge::directory::record::{Lifecycle, Placement, TenantDoor};
-use velmora_bridge::service::{serve_managed, ManagedLine, UNIT_REQUESTS_NOT_BUILT};
+use velmora_bridge::service::managed::{prepare, ManagedRequest, Prepared};
+use velmora_bridge::service::ManagedLine;
 use velmora_bridge::testkit::FixedClock;
 use velmora_bridge::unit::{
     CallKind, Seqs, SyncHead, TenantId, TenantState, UnitAnswer, UnitCall, UnitName, UnitOp,
@@ -233,17 +234,60 @@ fn request(method: Method, target: &str) -> S3Request {
     }
 }
 
-/// The acceptance of L6-2: under `restore`, a PUT, a DELETE and a
-/// multipart create to a unit answer `503` and make no unit call. Nor
-/// does any other write; no head is read for one either.
+const AKID: &str = "AKIA0000000000000001";
+
+/// The root unit's `key_row` answer for `AKID`: an active key of an
+/// active tenant.
+fn key_row_ok(s: Seqs) -> UnitAnswer {
+    UnitAnswer::Ok {
+        seqs: s,
+        body: serde_json::json!({
+            "key": {
+                "access_key_id": AKID,
+                "principal": "p_1",
+                "secret_wrapped": base64::engine::general_purpose::STANDARD.encode([2u8, 9, 9]),
+                "kek_version": 1,
+                "status": "active",
+                "created_at": 5,
+            },
+            "state": { "tenant_state": "active", "tenant_mode": null },
+            "lease_expired": false,
+        }),
+    }
+}
+
+async fn prepared<R: UnitRouter>(r: &R, maintenance: Maintenance, req: &S3Request) -> Prepared {
+    prepare(r, &cfg(maintenance), &tenant(), NONE, AKID, req).await
+}
+
+fn served(p: Prepared) -> ManagedRequest {
+    match p {
+        Prepared::Serve(m) => m,
+        Prepared::Answer(resp, lines) => panic!("answered {}: {lines:?}", resp.status),
+    }
+}
+
+fn answered_with(p: Prepared) -> (u16, ManagedLine) {
+    match p {
+        Prepared::Answer(resp, lines) => (resp.status, lines[0]),
+        Prepared::Serve(_) => panic!("served"),
+    }
+}
+
+/// The L6-2 acceptance, with AM-64's order: under `restore`, a PUT, a
+/// DELETE and a multipart create to a unit make no write call to the
+/// unit. The one call before the signature is the root unit's `key_row`,
+/// an unauthenticated read (allowed under `restore`); the maintenance
+/// `503` comes after the signature, from the handler's own gate, and the
+/// router refuses a write call before any client is made.
 #[tokio::test]
-async fn under_restore_writes_answer_503_with_no_unit_call() {
+async fn under_restore_writes_make_no_write_call_and_the_key_row_comes_first() {
     let clock = at(1);
     let clients = Clients::default();
     let heads = Heads::one(3, &[0]);
     let cache = HeadCache::default();
     let r = router(Maintenance::Restore, &clients, &heads, &cache, &clock);
-    for (method, target) in [
+    let writes = [
         (Method::Put, "/b/k"),
         (Method::Delete, "/b/k"),
         (Method::Post, "/b/k?uploads"),
@@ -253,30 +297,36 @@ async fn under_restore_writes_answer_503_with_no_unit_call() {
         (Method::Post, "/b?delete"),
         (Method::Put, "/b"),
         (Method::Delete, "/b"),
-    ] {
+    ];
+    *clients.answers.borrow_mut() = writes
+        .iter()
+        .map(|_| answered(key_row_ok(seqs(3, 1)), None))
+        .collect();
+    for (method, target) in writes.iter().cloned() {
         let req = request(method.clone(), target);
-        let (resp, line) =
-            serve_managed(&r, &cfg(Maintenance::Restore), &tenant(), NONE, &req).await;
-        assert_eq!(resp.status, 503, "{method:?} {target}");
-        assert!(
-            resp.headers
-                .iter()
-                .any(|(n, v)| n == "retry-after" && v == "30"),
+        let m = served(prepared(&r, Maintenance::Restore, &req).await);
+        assert_eq!(m.key_row.key.as_ref().unwrap().access_key_id, AKID);
+        assert_eq!(
+            m.routed.as_ref().unwrap().unit,
+            unit(0),
             "{method:?} {target}"
         );
-        assert_eq!(
-            line,
-            ManagedLine {
-                code: "maintenance",
-                alert: false
-            }
-        );
+        assert_eq!(m.scope.tenant_id(), tenant().as_str());
     }
-    assert_eq!(clients.made.get(), 0);
-    assert!(clients.calls().is_empty());
-    assert_eq!(heads.reads(), 0);
-    // Through the port too: a request call that writes is refused before
+    let calls = clients.calls();
+    assert_eq!(calls.len(), writes.len());
+    for call in &calls {
+        assert!(
+            matches!(&call.op, UnitOp::KeyRow { access_key_id, presigned: None } if access_key_id == AKID),
+            "{call:?}"
+        );
+        assert_eq!(call.kind, CallKind::Request);
+        assert!(!call.authenticated);
+        assert_eq!(call.name, unit(0));
+    }
+    // Through the port: a request call that writes is refused before
     // any client is made; a read and the Worker's own calls go on.
+    let made = clients.made.get();
     let routed = r.route(&tenant(), Some("b"), NONE).await.unwrap();
     assert_eq!(
         r.call(&routed, CallKind::Request, true, UnitOp::HeldKeys {})
@@ -284,7 +334,7 @@ async fn under_restore_writes_answer_503_with_no_unit_call() {
             .0,
         Err(RouteRefusal::Maintenance)
     );
-    assert_eq!(clients.made.get(), 0);
+    assert_eq!(clients.made.get(), made);
     *clients.answers.borrow_mut() = vec![
         answered(ok(seqs(3, 1)), None),
         answered(ok(seqs(3, 1)), None),
@@ -312,33 +362,103 @@ async fn under_restore_writes_answer_503_with_no_unit_call() {
         .await
         .0
         .is_ok());
-    assert_eq!(clients.calls().len(), 2);
+    assert_eq!(clients.calls().len(), writes.len() + 2);
 }
 
 #[tokio::test]
-async fn reads_go_on_under_restore_and_nothing_is_served_by_this_build() {
+async fn reads_are_prepared_under_restore_and_the_admin_plane_is_refused() {
     let clock = at(1);
     let clients = Clients::default();
     let heads = Heads::one(3, &[0]);
     let cache = HeadCache::default();
     let r = router(Maintenance::Restore, &clients, &heads, &cache, &clock);
-    for (method, target) in [
+    let reads = [
         (Method::Get, "/b/k"),
         (Method::Head, "/b/k"),
         (Method::Get, "/b"),
-    ] {
+        (Method::Get, "/"),
+    ];
+    *clients.answers.borrow_mut() = reads
+        .iter()
+        .map(|_| answered(key_row_ok(seqs(3, 1)), None))
+        .collect();
+    for (method, target) in reads {
         let req = request(method, target);
-        let (resp, line) =
-            serve_managed(&r, &cfg(Maintenance::Restore), &tenant(), NONE, &req).await;
-        assert_eq!(resp.status, 503);
-        assert_eq!(line.code, UNIT_REQUESTS_NOT_BUILT);
+        let m = served(prepared(&r, Maintenance::Restore, &req).await);
+        assert!(m.key_row.serves(true));
     }
-    // One head read, cached; no unit call.
+    // One head read, cached.
     assert_eq!(heads.reads(), 1);
-    assert!(clients.calls().is_empty());
     let req = request(Method::Get, "/_admin/status");
-    let (resp, line) = serve_managed(&r, &cfg(Maintenance::Off), &tenant(), NONE, &req).await;
-    assert_eq!((resp.status, line.code), (403, "admin_with_key"));
+    let calls = clients.calls().len();
+    let (status, line) = answered_with(prepared(&r, Maintenance::Off, &req).await);
+    assert_eq!((status, line.code), (403, "admin_with_key"));
+    assert_eq!(clients.calls().len(), calls);
+}
+
+/// When the root unit's `key_row` cannot be read, the request answers
+/// `503` before its signature is checked (AM-64): a head that does not
+/// read, a closed unit, an answer that does not decode. A refused route
+/// of the bucket is kept for the first call after the signature.
+#[tokio::test]
+async fn a_key_row_that_cannot_be_read_answers_503_first() {
+    let clock = at(1);
+    let req = request(Method::Get, "/b/k");
+    // No head.
+    let clients = Clients::default();
+    let heads = Heads::of(vec![None]);
+    let cache = HeadCache::default();
+    let r = router(Maintenance::Off, &clients, &heads, &cache, &clock);
+    let (status, line) = answered_with(prepared(&r, Maintenance::Off, &req).await);
+    assert_eq!((status, line.code), (503, "unavailable"));
+    assert!(clients.calls().is_empty());
+    // A closed unit.
+    let clients = Clients::answering(vec![answered(
+        UnitAnswer::Closed {
+            seqs: seqs(3, 1),
+            why: velmora_bridge::unit::call::Closed::Restoring,
+        },
+        None,
+    )]);
+    let heads = Heads::one(3, &[0]);
+    let cache = HeadCache::default();
+    let r = router(Maintenance::Off, &clients, &heads, &cache, &clock);
+    let (status, line) = answered_with(prepared(&r, Maintenance::Off, &req).await);
+    assert_eq!((status, line.code), (503, "closed"));
+    // An answer that does not decode pages.
+    let clients = Clients::answering(vec![answered(ok(seqs(3, 1)), None)]);
+    let cache = HeadCache::default();
+    let r = router(Maintenance::Off, &clients, &heads, &cache, &clock);
+    let (status, line) = answered_with(prepared(&r, Maintenance::Off, &req).await);
+    assert_eq!(
+        (status, line),
+        (
+            503,
+            ManagedLine {
+                code: "key_row_refused",
+                alert: true
+            }
+        )
+    );
+    // A bucket placed on a unit the head does not list: prepared, the
+    // refusal kept for after the signature.
+    let mut placed = door(3, &[0]);
+    placed.placements = vec![Placement {
+        bucket: "b".into(),
+        unit: 4,
+        epoch: 1,
+    }];
+    let heads = Heads::of(vec![Some(Some(placed))]);
+    let clients = Clients::answering(vec![answered(key_row_ok(seqs(3, 1)), None)]);
+    let cache = HeadCache::default();
+    let r = router(Maintenance::Off, &clients, &heads, &cache, &clock);
+    let m = served(prepared(&r, Maintenance::Off, &req).await);
+    assert_eq!(m.routed, Err(RouteRefusal::NotPlaced));
+    assert_eq!(m.root.unit, unit(0));
+    // Tenant 0 is never prepared.
+    let zero = TenantId::parse(velmora_bridge::TenantScope::tenant_zero().tenant_id()).unwrap();
+    let p = prepare(&r, &cfg(Maintenance::Off), &zero, NONE, AKID, &req).await;
+    assert_eq!(answered_with(p).0, 503);
 }
 
 /// A bucket goes to the unit its placement names, or to the root unit;
@@ -508,9 +628,9 @@ async fn a_virtual_hosted_request_is_refused_before_routing() {
     let r = router(Maintenance::Off, &clients, &heads, &cache, &clock);
     let mut req = request(Method::Get, "/k");
     req.headers = vec![("host".into(), format!("b.{S3_HOST}"))];
-    let (resp, line) = serve_managed(&r, &cfg(Maintenance::Off), &tenant(), NONE, &req).await;
+    let (status, line) = answered_with(prepared(&r, Maintenance::Off, &req).await);
     assert_eq!(line.code, "host_refused");
-    assert_ne!(resp.status, 200);
+    assert_ne!(status, 200);
     assert_eq!(heads.reads(), 0);
 }
 

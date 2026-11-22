@@ -616,34 +616,50 @@ alert. The unit jobs `renew` and
 `stamp_raise` run through the unit client. A unit's job config keeps
 tenant 0's `MAINTENANCE`: under `restore` no unit job makes a unit call,
 and each is acknowledged with no page. The consumer calls L2's `UnitClient`
-through `unit_consumer::ConsumerClient`; until its bodies and a Worker
-head reader are wired, the Worker uses `NoClient` and `NoHeads`, so the
-arms that need them hand the message back, and `UNIT` stays unbound until
-the build that has both and the unit's alarm dispatcher.
+through `unit_consumer::ConsumerClient`, built by the composition root
+(`Root::unit_client(name, false)`) over the isolate's renewal state, with
+the root's key feed and finisher. `UNIT` stays unbound in production
+until the unit's alarm dispatcher exists.
 
 A managed tenant's S3 requests reach its units through the request
 router (`unit_router`, ADR §2.7), which the management plane uses too.
 Only a Worker with `UNIT` bound takes a key route; unbound, every
 request takes tenant 0's path with no added read. The claimed access key
 id picks the tenant (`KeyRoutes`; tenant 0's keys and unknown keys keep
-tenant 0's path, §8.4; so does a failed route read for now, where a key
-tenant 0 does not hold then answers `403`, not the `503` of DUR-10). The
-route's numbers are a floor. The `Host` is judged first, as on tenant 0's
-path. The tenant's verified head (cached per isolate for under 60 s, read
-again from the seq it knew, and again when below the floor) names the
-unit: the root unit for a call with no bucket, the unit of the
-bucket's placement, or the root unit for a bucket with none. The unit
-must be listed. A routed call goes through the unit's client (L2's
-`UnitClient::call`, which runs rule 5) with the head's `state_seq`, the
-highest `keys_seq` a unit of the tenant answered, and `listed`. Under
-`MAINTENANCE=restore` every request that writes answers `503` before any
-head read or unit call, and the router refuses the reservation writes the
-management plane sends (`Reserve`, `BindBucket`, `Release`,
-`ReleaseBound`) before any call. This build has no S3 request operations on a
-unit, and no key routes, head reader or unit client in the Worker, so a
-routed request answers `503` and in practice every request takes tenant
-0's path. A routed request's `503` comes before its signature is checked:
-it tells the caller only that the key id routes to a managed tenant.
+tenant 0's path, §8.4; after a failed route read, a key tenant 0 does not
+hold answers `503`, DUR-10). The route's numbers are a floor. The `Host`
+is judged first, as on tenant 0's path. The tenant's verified head
+(cached per isolate for under 60 s, read again from the seq it knew, and
+again when below the floor) names the unit: the root unit for a call with
+no bucket, the unit of the bucket's placement, or the root unit for a
+bucket with none. The unit must be listed. A routed call goes through the
+unit's client (L2's `UnitClient::call`, which runs rule 5, the only
+retry layer, AM-71) with the head's `state_seq`, the highest `keys_seq` a
+unit of the tenant answered, and `listed`.
+
+**The request path (AM-64).** The root unit's `key_row` for the claimed
+key is read first, unauthenticated (a read: allowed under
+`MAINTENANCE=restore`); when it cannot be read the request answers `503`
+before its signature is checked. `Bridge::handle` then serves the request
+with tenant 0's handlers over the request catalogue
+(`request_catalog::RequestCatalog`): it checks the signature against the
+row's secret (a scheme-2 wrap bound to the tenant), applies the tenant's
+state (`active` serves everything, `suspended` with `read_only` serves GET
+and HEAD, anything else `403 AccountProblem`), and only then reads the
+bucket and the grant, authenticated. No request call is sent before the
+signature verified. A row answered under an expired lease (AM-63) is read
+again, authenticated, before anything is served. The handlers' gates
+answer the maintenance `503` for a write before any write call, and the
+router refuses a write call under `restore` as well. The request names
+the tenant's blobs (`x/<t>/`, `c/<t>/`) and opens its buckets' data keys
+with the tenant key (scheme 2, the row's `kek_version` being the tenant
+key version). A bucket delete over S3 answers `403`. After the handler,
+the records of publications the unit refused before running them are
+discarded, and a unit's refusal answers the request when the handler
+failed on it (the table below). A fan-out GET is not split for a managed
+tenant. `upload_state` and `unmark_sent` are not request calls yet: a
+managed tenant's UploadPart and CompleteMultipartUpload fail until they
+are.
 
 ## Requests
 

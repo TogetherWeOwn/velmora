@@ -2011,7 +2011,7 @@ where
             return Ok(false);
         }
         self.cache
-            .put(&extent.id.cache_key(), cipher, &meta)
+            .put(&self.scope().cache_key(&extent.id), cipher, &meta)
             .await?;
         let _ = count().await;
         Ok(true)

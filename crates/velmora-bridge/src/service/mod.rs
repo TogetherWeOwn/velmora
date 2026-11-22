@@ -13,6 +13,7 @@ mod delete;
 mod get;
 pub use get::{INTERRUPTED_RETRIES, PIECE_WAIT_MS, READ_STAMP_MS};
 mod list;
+pub mod managed;
 mod multipart;
 mod multipart_list;
 mod put;
@@ -240,6 +241,34 @@ where
     K: Kek,
     T: Clock,
 {
+    /// The tenant whose blobs a request names: the managed tenant whose
+    /// request catalogue this bridge serves over (AM-64), else tenant 0,
+    /// whose names are the flat ones.
+    pub fn scope(&self) -> std::borrow::Cow<'_, crate::tenant::TenantScope> {
+        match self.catalog.request_scope() {
+            Some(scope) => std::borrow::Cow::Borrowed(scope),
+            None => std::borrow::Cow::Owned(crate::tenant::TenantScope::tenant_zero()),
+        }
+    }
+
+    /// The data key of `bucket`: the catalogue's when it holds its
+    /// buckets under a tenant key ([`Catalog::bucket_key`]), else the
+    /// KEK's unwrap.
+    pub async fn bucket_key(
+        &self,
+        bucket: &crate::Bucket,
+    ) -> crate::Result<crate::crypto::DataKey> {
+        match self.catalog.bucket_key(bucket).await {
+            Some(key) => key,
+            None => crate::crypto::unwrap_bdk(
+                &self.kek,
+                bucket.kek_version,
+                &bucket.id,
+                &bucket.bdk_wrapped,
+            ),
+        }
+    }
+
     /// Entry point for every fetch: S3 and `/_admin`.
     pub async fn handle(self: Rc<Self>, req: S3Request) -> S3Response
     where
@@ -314,7 +343,10 @@ where
 // A managed tenant's request (design round 5, AM-51)
 // ---------------------------------------------------------------------------
 
-pub use common::{claimed_access_key, request_host_refused, writes_refused};
+pub use common::{
+    account_problem, claimed_access_key, request_host_refused, unit_refused as unit_unavailable,
+    writes_refused,
+};
 
 impl Route<'_> {
     /// The operation changes stored state: the maintenance gate refuses
@@ -358,69 +390,12 @@ impl Route<'_> {
     }
 }
 
-/// The fixed code of a managed tenant's request that the unit cannot take
-/// yet: the unit has no S3 request operations in this build.
-pub const UNIT_REQUESTS_NOT_BUILT: &str = "unit_requests_not_built";
-
 /// What became of a managed tenant's request, for the log line: a fixed
 /// code, and whether it pages.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ManagedLine {
     pub code: &'static str,
     pub alert: bool,
-}
-
-/// A request whose access key routes to the managed tenant `tenant`
-/// (`unit_router::KeyRoutes`), through `router` to its unit.
-///
-/// Under `MAINTENANCE=restore` a request that writes ([`Route::writes`])
-/// answers `503` with `Retry-After` before anything is read: no unit
-/// call, no head read (AM-50; DS1 §3.4 from 8(b) to step 9). Any other
-/// request is routed to its unit ([`crate::unit_router::UnitRouter::route`]);
-/// a refusal answers `503`. This build has no S3 request operations on a
-/// unit, so a routed request answers `503` ([`UNIT_REQUESTS_NOT_BUILT`])
-/// as well, and the signature is never checked: nothing is read or
-/// written for it.
-pub async fn serve_managed<R: crate::unit_router::UnitRouter>(
-    router: &R,
-    cfg: &crate::config::BridgeConfig,
-    tenant: &crate::unit::TenantId,
-    floor: crate::unit::Seqs,
-    req: &S3Request,
-) -> (S3Response, ManagedLine) {
-    let route = classify(&req.method, &req.raw_target);
-    let line = |code, alert| ManagedLine { code, alert };
-    // The host first, as on tenant 0's path: on a virtual-hosted request
-    // the path's first segment is a key, never a bucket to route by.
-    if let Some(resp) = common::request_host_refused(cfg, req) {
-        return (resp, line("host_refused", false));
-    }
-    match route {
-        Route::NotImplemented => {
-            return (
-                S3Response::not_implemented(),
-                line("not_implemented", false),
-            )
-        }
-        // The admin plane takes its bearer, never an access key.
-        Route::Admin { .. } => {
-            return (
-                common::s3_error(velmora_s3_proto::ErrorCode::AccessDenied),
-                line("admin_with_key", false),
-            )
-        }
-        _ => {}
-    }
-    if cfg.maintenance == crate::config::Maintenance::Restore && route.writes() {
-        return (writes_refused(), line("maintenance", false));
-    }
-    match router.route(tenant, route.bucket(), floor).await {
-        Err(refusal) => (
-            common::unit_refused(),
-            line(refusal.code(), refusal.alert()),
-        ),
-        Ok(_) => (common::unit_refused(), line(UNIT_REQUESTS_NOT_BUILT, false)),
-    }
 }
 
 /// What the request router does with a request, from its key's route.

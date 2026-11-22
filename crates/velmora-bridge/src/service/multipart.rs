@@ -49,7 +49,7 @@ use velmora_s3_proto::{
 use zeroize::Zeroizing;
 
 use crate::config::{BridgeConfig, Maintenance};
-use crate::crypto::{seal_extent, unwrap_bdk, unwrap_secret};
+use crate::crypto::{seal_extent, unwrap_secret};
 use crate::ingress::{
     body_is_empty, declared_length, read_upload, upload_lengths, Charge, IngressError,
     UploadLengths, UploadReadError,
@@ -63,7 +63,7 @@ use crate::recovery::{id_after, write_generation};
 use crate::service::common::{
     auth_refused, check_precondition, discard_refused, discard_unless_present, header_refused,
     hold_precondition, host_refused, precondition, restore_gate, send_post_jobs, signed_host,
-    writes_refused, REGION_ALIASES,
+    verify_on_unit, writes_refused, REGION_ALIASES,
 };
 use crate::service::slices::{store_slices, SliceError, SliceSink};
 use crate::types::{
@@ -431,51 +431,87 @@ where
         .check_features()
         .map_err(|refusal| header_refused(&refusal))?;
 
-    let mut authority = OneKey::default();
-    let mut bucket = None;
-    if let Some(akid) = presented_access_key(&target, &headers) {
-        // Unknown and disabled keys look the same: no credential.
-        let row = bridge.catalog.access_key(&akid).await?;
-        if let Some(row) = row.filter(|r| r.status == KeyStatus::Active) {
-            let secret = unwrap_secret(
-                &bridge.kek,
-                row.kek_version,
-                &row.access_key_id,
-                &row.secret_wrapped,
-            )?;
-            bucket = bridge.catalog.bucket_by_name(&target.bucket).await?;
-            let perm = match &bucket {
-                Some(b) => bridge.catalog.grant(&akid, &b.id).await?,
-                None => None,
-            };
-            authority.granted = perm.is_some();
-            authority.writable_bucket = (perm == Some(Perm::Rw)).then(|| target.bucket.clone());
-            authority.key = Some(KeyMaterial {
-                access_key_id: row.access_key_id,
-                principal: row.principal,
-                secret,
-            });
-        }
-    }
-    // Ingress refuses untrusted transport before any handler runs.
-    let verified = verify(
-        req.method.as_str(),
-        &target,
-        &headers,
-        true,
-        bridge.clock.now().secs().0,
-        &policy,
-        &authority,
-    )
-    .map_err(|code| {
-        if code == ErrorCode::AccessDenied && authority.no_bucket.get() {
-            // As `common::authenticate`: the signature verified, and to
-            // this key no bucket of this name exists.
-            Fail::S3(ErrorCode::NoSuchBucket)
-        } else {
-            Fail::Response(auth_refused(code, &policy, &headers, &target))
-        }
-    })?;
+    // A managed tenant's request on its unit: the signature first, then
+    // the reads (AM-64, `common::verify_on_unit`).
+    let presented = presented_access_key(&target, &headers).unwrap_or_default();
+    let (verified, bucket) =
+        match verify_on_unit(bridge, req, &policy, &target, &headers, &presented).await {
+            Some(signed) => {
+                let (verified, key) = signed.map_err(Fail::Response)?;
+                let mut authority = OneKey::default();
+                let bucket = bridge.catalog.bucket_by_name(&target.bucket).await?;
+                let perm = match &bucket {
+                    Some(b) => bridge.catalog.grant(&presented, &b.id).await?,
+                    None => None,
+                };
+                authority.granted = perm.is_some();
+                authority.writable_bucket = (perm == Some(Perm::Rw)).then(|| target.bucket.clone());
+                authority.key = key.secret.map(|secret| KeyMaterial {
+                    access_key_id: presented.clone(),
+                    principal: key.principal,
+                    secret,
+                });
+                verified
+                    .recheck(&authority, req.method.as_str(), &target)
+                    .map_err(|code| {
+                        if code == ErrorCode::AccessDenied && authority.no_bucket.get() {
+                            Fail::S3(ErrorCode::NoSuchBucket)
+                        } else {
+                            Fail::Response(auth_refused(code, &policy, &headers, &target))
+                        }
+                    })?;
+                (verified, bucket)
+            }
+            None => {
+                let mut authority = OneKey::default();
+                let mut bucket = None;
+                if let Some(akid) = presented_access_key(&target, &headers) {
+                    // Unknown and disabled keys look the same: no credential.
+                    let row = bridge.catalog.access_key(&akid).await?;
+                    if let Some(row) = row.filter(|r| r.status == KeyStatus::Active) {
+                        let secret = unwrap_secret(
+                            &bridge.kek,
+                            row.kek_version,
+                            &row.access_key_id,
+                            &row.secret_wrapped,
+                        )?;
+                        bucket = bridge.catalog.bucket_by_name(&target.bucket).await?;
+                        let perm = match &bucket {
+                            Some(b) => bridge.catalog.grant(&akid, &b.id).await?,
+                            None => None,
+                        };
+                        authority.granted = perm.is_some();
+                        authority.writable_bucket =
+                            (perm == Some(Perm::Rw)).then(|| target.bucket.clone());
+                        authority.key = Some(KeyMaterial {
+                            access_key_id: row.access_key_id,
+                            principal: row.principal,
+                            secret,
+                        });
+                    }
+                }
+                // Ingress refuses untrusted transport before any handler runs.
+                let verified = verify(
+                    req.method.as_str(),
+                    &target,
+                    &headers,
+                    true,
+                    bridge.clock.now().secs().0,
+                    &policy,
+                    &authority,
+                )
+                .map_err(|code| {
+                    if code == ErrorCode::AccessDenied && authority.no_bucket.get() {
+                        // As `common::authenticate`: the signature verified, and to
+                        // this key no bucket of this name exists.
+                        Fail::S3(ErrorCode::NoSuchBucket)
+                    } else {
+                        Fail::Response(auth_refused(code, &policy, &headers, &target))
+                    }
+                })?;
+                (verified, bucket)
+            }
+        };
     // `authorize` passed, so the bucket exists and the grant is `rw`.
     let bucket = bucket.ok_or(ErrorCode::NoSuchBucket)?;
     // A replay that was started and did not end: see `restore_gate`.
@@ -720,12 +756,7 @@ where
     };
     let declared = body.len() as u64;
 
-    let bdk = unwrap_bdk(
-        &bridge.kek,
-        a.bucket.kek_version,
-        &a.bucket.id,
-        &a.bucket.bdk_wrapped,
-    )?;
+    let bdk = bridge.bucket_key(&a.bucket).await?;
     // A fresh id per seal: the key wrap binds the id, never a version.
     let extent_id = ExtentId::mint(random()?);
     let sealed = seal_extent(&bdk, &a.bucket.id, &extent_id, &body, &mut SystemRng)?;
@@ -755,7 +786,7 @@ where
         released_at: None,
         created_at: now,
     };
-    let safety_key = extent_id.safety_key();
+    let safety_key = bridge.scope().safety_key(&extent_id);
     bridge
         .safety
         .put(
@@ -851,12 +882,7 @@ where
     for _ in 0..count {
         ids.push(ExtentId::mint(random()?));
     }
-    let bdk = unwrap_bdk(
-        &bridge.kek,
-        a.bucket.kek_version,
-        &a.bucket.id,
-        &a.bucket.bdk_wrapped,
-    )?;
+    let bdk = bridge.bucket_key(&a.bucket).await?;
     // Every slice has its row before its blob exists: whatever happens
     // to this request from here on, the catalogue names what it stored.
     match bridge.catalog.open_intents(&write, &ids, started).await? {
@@ -878,6 +904,7 @@ where
     let mut rng = SystemRng;
     let sink = SliceSink {
         safety: &bridge.safety,
+        scope: bridge.scope().into_owned(),
         bdk: &bdk,
         bucket: &a.bucket.id,
         ids: &ids,

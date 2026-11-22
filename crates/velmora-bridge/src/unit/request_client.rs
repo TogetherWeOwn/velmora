@@ -73,6 +73,16 @@ impl<P: UnitPort> RequestClient<P> {
         &self.port
     }
 
+    /// The unit the calls go to.
+    pub fn name(&self) -> &UnitName {
+        &self.name
+    }
+
+    /// The numbers the calls carry.
+    pub fn seqs(&self) -> Seqs {
+        self.seqs
+    }
+
     /// One request call; its `ok` body read back as `T`.
     pub async fn call<T: DeserializeOwned>(&self, call: RequestCall) -> Result<T> {
         let answer = self.send(call).await?;

@@ -155,6 +155,10 @@ fn a_scope_is_made_only_at_the_listed_places() {
             // the admin listing (the import and the call).
             ("bridge/keys/revocations.rs", 1),
             ("bridge/service/admin.rs", 2),
+            // The request path's scope (`Bridge::scope`): tenant 0's, for
+            // a bridge whose catalogue is not a managed tenant's request
+            // catalogue (which carries the scope it was made with).
+            ("bridge/service/mod.rs", 1),
         ],
     );
     // The reader of a message makes the scope of the job path, and the
@@ -165,10 +169,12 @@ fn a_scope_is_made_only_at_the_listed_places() {
 
 /// A managed tenant's scope is made in one place on the job path: the
 /// reader of a queue message, for a message that names the tenant's unit
-/// while the unit class is bound (`jobmsg::admit_for`). Off the job path,
-/// the move of tenant 0's data names the managed tenant's copies through
-/// its scope too (`keys::moving`, once), so that no name of the two
-/// families is written out by hand.
+/// while the unit class is bound (`jobmsg::admit_for`). On the request
+/// path it is made once too, for a request whose key routed to the tenant
+/// (`service::managed::prepare`), and the bridge takes it from the request
+/// catalogue. Off both paths, the move of tenant 0's data names the
+/// managed tenant's copies through its scope too (`keys::moving`, once),
+/// so that no name of the two families is written out by hand.
 #[test]
 fn a_managed_scope_is_made_only_by_the_reader() {
     let all = all();
@@ -179,7 +185,8 @@ fn a_managed_scope_is_made_only_by_the_reader() {
         found.into_iter().collect::<Vec<_>>(),
         [
             ("bridge/jobmsg.rs".to_string(), 1),
-            ("bridge/keys/moving.rs".to_string(), 1)
+            ("bridge/keys/moving.rs".to_string(), 1),
+            ("bridge/service/managed.rs".to_string(), 1)
         ]
     );
 }
@@ -525,7 +532,7 @@ fn the_directory_is_asked_by_nothing() {
     // The request router of a managed tenant's units (`unit_router`,
     // design round 5) is another port, with a `route` of its own: only it
     // and its one caller may say `.route(`.
-    const UNIT_ROUTER: [&str; 2] = ["bridge/unit_router.rs", "bridge/service/mod.rs"];
+    const UNIT_ROUTER: [&str; 2] = ["bridge/unit_router.rs", "bridge/service/managed.rs"];
     // The composition root (`root`, L6-5) is the one reader of the
     // directory's store for that router: its key routes
     // (`SqlDirectory::route_tenant`, ADR §8.4 step 2). It runs only with `UNIT`

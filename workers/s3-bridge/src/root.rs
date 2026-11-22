@@ -38,25 +38,27 @@ use crate::units::{UnitStub, UNIT_BINDING};
 const KEY_BUCKETS: [&str; 2] = ["KEYS_A", "KEYS_B"];
 
 /// The root's ports in a Worker.
-pub struct WorkerPorts<'a> {
+///
+/// It owns what it holds (the isolate's bridge by `Rc`), so a managed
+/// tenant's request port can keep it for the request (`'static`).
+pub struct WorkerPorts {
     records: R2Records,
     keys: Vec<(&'static str, R2Records)>,
-    kek: &'a KekRing,
     directory: Option<D1Sql>,
     clock: WorkerClock,
     units: Option<ObjectNamespace>,
-    safety: &'a R2Blobs,
-    control: &'a QueueSink,
+    /// The KEK ring, the `SAFETY` blob store and the queue sink.
+    bridge: Rc<WorkerBridge>,
 }
 
-impl<'a> WorkerPorts<'a> {
+impl WorkerPorts {
     /// The ports from `env`, with the bridge's KEK ring, `SAFETY` blob
     /// store and queue sink. Only `SAFETY` is required; the reason names
     /// the binding, nothing else.
     pub fn from_env(
         env: &Env,
-        bridge: &'a WorkerBridge,
-    ) -> std::result::Result<WorkerPorts<'a>, String> {
+        bridge: &Rc<WorkerBridge>,
+    ) -> std::result::Result<WorkerPorts, String> {
         let records = R2Records::new(
             env.bucket("SAFETY")
                 .map_err(|_| "missing binding SAFETY".to_string())?,
@@ -69,17 +71,15 @@ impl<'a> WorkerPorts<'a> {
         Ok(WorkerPorts {
             records,
             keys,
-            kek: &bridge.kek,
             directory,
             clock: WorkerClock,
             units: env.durable_object(UNIT_BINDING).ok(),
-            safety: &bridge.safety,
-            control: &bridge.jobs,
+            bridge: Rc::clone(bridge),
         })
     }
 }
 
-impl RootPorts for WorkerPorts<'_> {
+impl RootPorts for WorkerPorts {
     type Records = R2Records;
     type KeyStore = R2Records;
     type Kek = KekRing;
@@ -101,7 +101,7 @@ impl RootPorts for WorkerPorts<'_> {
     }
 
     fn kek(&self) -> &KekRing {
-        self.kek
+        &self.bridge.kek
     }
 
     fn directory(&self) -> Option<&D1Sql> {
@@ -113,7 +113,7 @@ impl RootPorts for WorkerPorts<'_> {
     }
 }
 
-impl UnitPorts for WorkerPorts<'_> {
+impl UnitPorts for WorkerPorts {
     type Object = UnitStub;
     type Safety = R2Blobs;
     type Control = QueueSink;
@@ -127,11 +127,11 @@ impl UnitPorts for WorkerPorts<'_> {
     }
 
     fn safety(&self) -> &R2Blobs {
-        self.safety
+        &self.bridge.safety
     }
 
     fn control(&self) -> &QueueSink {
-        self.control
+        &self.bridge.jobs
     }
 }
 

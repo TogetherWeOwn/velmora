@@ -50,6 +50,7 @@
 
 pub mod client;
 pub mod feed;
+pub mod request;
 
 pub use client::{
     ControlSend, RootClients, RootFinisher, RootHeads, RootRouter, RootUnitClient, Shared,
