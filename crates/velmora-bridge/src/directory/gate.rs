@@ -553,27 +553,30 @@ pub async fn run_gate<S: RecordStore, C: ControlSeal, Q: Sql, G: GateSteps>(
     run_from(chain, dir, steps, epoch, now).await
 }
 
-/// [`run_gate`] only over a gate that is still closed at `seen`, the
-/// epoch the caller's guard read (`0`: never closed): checked again right
-/// before the closing's anchor is put, so a run whose guard passed while
-/// another run was under way does not close the gate that run opened
-/// (AM-78, the first open). `None`: the gate moved on since; nothing was
-/// written. The check and the put are two calls, so two guards may still
-/// both pass within one round trip: the caller runs one call at a time.
-pub async fn run_gate_closed_at<S: RecordStore, C: ControlSeal, Q: Sql, G: GateSteps>(
+/// [`run_gate`] only over a gate that is closed: the gate row is read
+/// again right before the closing's anchor is put, so a run whose guard
+/// passed while another run was under way does not close the gate that
+/// run has opened since (AM-78, the first open). `None`: the gate is open
+/// now, or another closing took the epoch first; nothing was written. A
+/// closing whose anchor landed but whose row write did not (a lost answer)
+/// leaves the row closed below the newest anchor: a later call closes
+/// over it at the next epoch. The read and the put are two calls, so a
+/// gate opened between them is closed again: the caller runs one call at
+/// a time.
+pub async fn run_gate_if_closed<S: RecordStore, C: ControlSeal, Q: Sql, G: GateSteps>(
     chain: &TenantChain<'_, S, C>,
     dir: &SqlDirectory<'_, Q>,
     steps: &G,
     reason: &str,
     now: UnixMs,
-    seen: u64,
 ) -> Result<Option<GateRun>> {
     let (anchored, _) = anchored_epoch(chain.store).await?;
     let row = dir.gate().await?;
-    if anchored != seen || row.epoch != seen || !row.closed {
+    if !row.closed {
         return Ok(None);
     }
-    let epoch = seen
+    let epoch = anchored
+        .max(row.epoch)
         .checked_add(1)
         .filter(|&e| e <= MAX_EPOCH)
         .ok_or(BridgeError::Invalid("gate epoch out of range"))?;
@@ -582,7 +585,7 @@ pub async fn run_gate_closed_at<S: RecordStore, C: ControlSeal, Q: Sql, G: GateS
         "closed_at": now.0,
     }))
     .map_err(|_| BridgeError::Invalid("gate anchor"))?;
-    // Put once: of two runs that saw the same epoch, one closes.
+    // Put once: of two runs that read the same anchors, one closes.
     if !chain.store.put_if_absent(&anchor_key(epoch), body).await? {
         return Ok(None);
     }

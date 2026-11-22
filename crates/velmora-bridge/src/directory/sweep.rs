@@ -83,13 +83,10 @@ impl<S: Sql> PendingRows for SqlDirectory<'_, S> {
                 "t" => Some(ControlChain::Tenant),
                 _ => None,
             };
-            match (TenantId::parse(&tenant).ok(), kind) {
-                (Some(tenant), Some(chain)) => {
-                    out.push((ChainKey { tenant, chain }, UnixMs(oldest)));
-                }
-                // Stepped over: one index seek each, and the age alarm
-                // keeps paging on it.
-                _ => {}
+            // Any other row is stepped over: one index seek each, and the
+            // age alarm keeps paging on it.
+            if let (Ok(tenant), Some(chain)) = (TenantId::parse(&tenant), kind) {
+                out.push((ChainKey { tenant, chain }, UnixMs(oldest)));
             }
         }
         Ok(out)

@@ -15,9 +15,7 @@ use velmora_bridge::directory::chain::{record_key, TenantChain, Written};
 use velmora_bridge::directory::first_open::{
     first_open, managed_tenant_exists, FirstOpenAnswer, FIRST_OPEN_REASON, REGISTRY_PREFIX,
 };
-use velmora_bridge::directory::gate::{
-    anchored_epoch, close, is_open, run_gate_closed_at, NotBuilt,
-};
+use velmora_bridge::directory::gate::{anchored_epoch, is_open, run_gate_if_closed, NotBuilt};
 use velmora_bridge::directory::record::Tenant;
 use velmora_bridge::directory::store::{ChainKind, PendingOp, SqlDirectory};
 use velmora_bridge::directory::sweep::{DROP_ABOVE, NEXT_CHAIN};
@@ -341,7 +339,9 @@ fn key_locations_that_do_not_open_keep_the_gate_closed() {
     });
 }
 
-/// A stale first-open guard gets the `None` that maps to `Moved`, without writing an anchor.
+/// A call whose guard passed before another run opened the gate finds it
+/// open at its closing: `None` (the call answers `Moved`), no anchor, and
+/// the gate stays open.
 #[test]
 fn a_stale_first_open_guard_writes_no_anchor() {
     let db = database();
@@ -352,20 +352,67 @@ fn a_stale_first_open_guard_writes_no_anchor() {
         seal: &seal,
     };
     let dir = SqlDirectory { sql: &db };
+    let kek = kek();
     block_on(async {
-        let seen = dir.gate().await.unwrap().epoch;
-        assert_eq!(seen, 0);
-        let epoch = close(&store, &dir, "another_close", NOW).await.unwrap();
-        assert_eq!(epoch, 1);
+        locations(&store, &kek).await;
+        let FirstOpenAnswer::Ran(run) = first_open(&chain, &dir, &kek, NOW).await.unwrap() else {
+            panic!("no run");
+        };
+        assert!(run.opened);
         let anchors = store.keys();
-        assert_eq!(anchors.len(), 1);
-
-        let run = run_gate_closed_at(&chain, &dir, &NotBuilt, FIRST_OPEN_REASON, NOW, seen)
+        let run = run_gate_if_closed(&chain, &dir, &NotBuilt, FIRST_OPEN_REASON, NOW)
             .await
             .unwrap();
         assert!(run.is_none(), "{run:?}");
         assert_eq!(store.keys(), anchors);
-        assert_eq!(dir.gate().await.unwrap().epoch, epoch);
+        assert!(is_open(&store, &dir).await.unwrap());
+        // A closing taken by another call first: `None` too.
+        let other = HookedRecords::new();
+        let other_chain = TenantChain {
+            store: &other,
+            seal: &seal,
+        };
+        let fresh = database();
+        let fresh_dir = SqlDirectory { sql: &fresh };
+        other.before_put(|key, map| {
+            if key.starts_with("m/dg/") {
+                map.insert(key.to_string(), vec![1]);
+            }
+        });
+        let run = run_gate_if_closed(&other_chain, &fresh_dir, &NotBuilt, FIRST_OPEN_REASON, NOW)
+            .await
+            .unwrap();
+        assert!(run.is_none());
+        assert!(fresh_dir.gate().await.unwrap().epoch == 0);
+    });
+}
+
+/// The answer of the closing's anchor put is lost after it landed: the row
+/// is still closed below the newest anchor, and a call again closes over it
+/// and opens.
+#[test]
+fn first_open_runs_again_after_a_lost_anchor_answer() {
+    let db = database();
+    let store = HookedRecords::new();
+    let seal = PlainSeal::new();
+    let chain = TenantChain {
+        store: &store,
+        seal: &seal,
+    };
+    let dir = SqlDirectory { sql: &db };
+    let kek = kek();
+    block_on(async {
+        locations(&store, &kek).await;
+        store.lose_answers(1);
+        assert!(first_open(&chain, &dir, &kek, NOW).await.is_err());
+        assert_eq!(anchored_epoch(&store).await.unwrap().0, 1);
+        let gate = dir.gate().await.unwrap();
+        assert!(gate.closed && gate.epoch == 0);
+        let FirstOpenAnswer::Ran(run) = first_open(&chain, &dir, &kek, NOW).await.unwrap() else {
+            panic!("no run");
+        };
+        assert!(run.opened, "{run:?}");
+        assert_eq!(run.epoch, 2);
     });
 }
 

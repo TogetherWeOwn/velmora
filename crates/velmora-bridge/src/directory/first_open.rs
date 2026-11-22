@@ -23,14 +23,14 @@
 //! [`FirstOpenAnswer::HasTenants`] (`409 gate_has_tenants`, it pages) and
 //! runs nothing. Only a closed gate with no managed tenant chain gets a
 //! run, and a run that left the gate closed may be started again. The run
-//! closes only over the epoch its guard saw closed
-//! ([`super::gate::run_gate_closed_at`]): a call whose guard passed while
+//! reads the gate row again right before its closing
+//! ([`super::gate::run_gate_if_closed`]): a call whose guard passed while
 //! another run was under way answers [`FirstOpenAnswer::Moved`] instead
-//! of closing the gate that run opened. The guard and the closing are
+//! of closing the gate that run opened. The read and the closing are
 //! still two calls apart, so the operator route runs one call at a time.
 
 use super::chain::{chain_prefix, ControlSeal, TenantChain, TENANT_CHAIN_PREFIX};
-use super::gate::{is_open, run_gate_closed_at, GateRun, GateSteps, StepReport};
+use super::gate::{is_open, run_gate_if_closed, GateRun, GateSteps, StepReport};
 use super::record::Tenant;
 use super::store::{location_status, SqlDirectory};
 use crate::keys::locations::read_locations;
@@ -54,8 +54,9 @@ pub enum FirstOpenAnswer {
     HasTenants,
     /// A gate run ran; [`GateRun::opened`] says whether it opened.
     Ran(GateRun),
-    /// The gate moved on between the guard and the closing (another run
-    /// closed or opened it): nothing ran (`503`, call again).
+    /// The gate opened between the guard and the closing, or another
+    /// closing took the epoch: nothing ran (`503`; a call again answers
+    /// `AlreadyOpen` or runs).
     Moved,
 }
 
@@ -174,8 +175,6 @@ where
     Q: Sql,
     K: Kek,
 {
-    // The epoch the guard sees closed; the run closes only over it.
-    let seen = dir.gate().await?.epoch;
     if is_open(chain.store, dir).await? {
         return Ok(FirstOpenAnswer::AlreadyOpen);
     }
@@ -187,7 +186,7 @@ where
         kek,
         dir: SqlDirectory { sql: dir.sql },
     };
-    match run_gate_closed_at(chain, dir, &steps, FIRST_OPEN_REASON, now, seen).await? {
+    match run_gate_if_closed(chain, dir, &steps, FIRST_OPEN_REASON, now).await? {
         Some(run) => Ok(FirstOpenAnswer::Ran(run)),
         None => Ok(FirstOpenAnswer::Moved),
     }
