@@ -19,6 +19,8 @@
 //!   marker, the freeze triggers, the legacy stamp, and the thaw;
 //! - [`move_copy`]: the move's copy of the frozen D1's rows into the
 //!   owner's root unit, by bounded pages and resumable import batches;
+//! - [`move_flip`]: the move's flip (legacy stamp, the unit opened, the
+//!   routes, tenant 0 `moved`) and its give-up before the flip;
 //! - [`tenant_zero`]: whether tenant 0 may be served from the D1
 //!   catalogue, from its record and the database's own marker, and the
 //!   route of a request when the directory cannot be read.
@@ -30,6 +32,7 @@ pub mod chain;
 pub mod fence;
 pub mod gate;
 pub mod move_copy;
+pub mod move_flip;
 pub mod record;
 pub mod store;
 pub mod tenant_zero;
