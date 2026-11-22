@@ -25,6 +25,7 @@ pub mod jobtable;
 pub mod keepalive;
 pub mod keys;
 pub mod parity;
+pub mod pending;
 pub mod plan;
 pub mod plan_rev;
 mod pool;

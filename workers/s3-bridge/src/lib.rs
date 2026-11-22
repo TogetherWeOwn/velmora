@@ -24,6 +24,9 @@ mod metrics;
 mod nntp;
 mod queues;
 mod r2;
+/// The put-once store of control records over R2; bound by no
+/// configuration yet.
+pub mod records;
 mod units;
 
 /// The unit's Durable Object class (`docs/units.md`). Exported so that
