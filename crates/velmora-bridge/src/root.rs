@@ -16,8 +16,9 @@
 //! none for a while holds none past its time.
 //!
 //! **Off as shipped.** Nothing in a production Worker builds a [`Root`]:
-//! the Worker makes one only when `UNIT` is bound, and no production
-//! configuration binds it.
+//! the request path makes one only when `UNIT` is bound, which no
+//! production configuration does, and the management entry, which makes
+//! one after its token gate, has no production binding.
 //!
 //! # What it gives
 //!

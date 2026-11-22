@@ -10,8 +10,11 @@
 //!   the route records only.
 //! - the KEK ring of the isolate's bridge, and the Worker's clock.
 //!
-//! **Off as shipped:** the Worker builds a root only with `UNIT` bound
-//! (`units::route_request`), which no production configuration does.
+//! **Off as shipped:** the request path builds a root only with `UNIT`
+//! bound (`units::route_request`), which no production configuration
+//! does. The management entry (`mgmt.rs`) builds one for every request
+//! that passed its token gate (door reads of `SAFETY` and the directory's
+//! feed); it has no binding in production.
 
 use std::rc::Rc;
 
