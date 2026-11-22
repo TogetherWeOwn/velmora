@@ -468,7 +468,7 @@ async fn run_on_unit(
         job,
     };
     // The tenant heads: door parts through the composition root.
-    let ports = match root::WorkerPorts::from_env(env, &bridge.kek) {
+    let ports = match root::WorkerPorts::from_env(env, bridge) {
         Ok(ports) => ports,
         Err(class) => {
             console_error!("alert: unit job not run ({class}): to the dead-letter queue");
@@ -479,12 +479,22 @@ async fn run_on_unit(
     };
     let cache = root::cache();
     let root = velmora_bridge::root::Root::new(&ports, &cache, velmora::rng::SystemRng);
+    // Job calls send `listed = false` (AM-50).
+    let client = match root.unit_client(&name, false) {
+        Ok(client) => client,
+        Err(_) => {
+            console_error!("alert: unit job not run (no unit object): to the dead-letter queue");
+            return Delivery::Retry {
+                delay_secs: REFUSED_RETRY_DELAY_SECS,
+            };
+        }
+    };
     let (delivery, lines) = velmora_bridge::unit_consumer::deliver(
         bridge.cfg.maintenance,
         &name,
         seqs,
         &run,
-        &units::client(),
+        &client,
         &root.heads(),
     )
     .await;
@@ -517,7 +527,7 @@ async fn run_unit_job(
         state_seq: tenant.state_seq(),
         keys_seq: tenant.keys_seq(),
     };
-    let ports = match root::WorkerPorts::from_env(env, &bridge.kek) {
+    let ports = match root::WorkerPorts::from_env(env, bridge) {
         Ok(ports) => ports,
         Err(class) => {
             console_error!("alert: unit job not run ({class}): to the dead-letter queue");
@@ -528,12 +538,21 @@ async fn run_unit_job(
     };
     let cache = root::cache();
     let root = velmora_bridge::root::Root::new(&ports, &cache, velmora::rng::SystemRng);
+    let client = match root.unit_client(&name, false) {
+        Ok(client) => client,
+        Err(_) => {
+            console_error!("alert: unit job not run (no unit object): to the dead-letter queue");
+            return Delivery::Retry {
+                delay_secs: REFUSED_RETRY_DELAY_SECS,
+            };
+        }
+    };
     let (delivery, lines) = velmora_bridge::unit_consumer::deliver_unit_job(
         bridge.cfg.maintenance,
         job,
         &name,
         seqs,
-        &units::client(),
+        &client,
         &root.heads(),
     )
     .await;

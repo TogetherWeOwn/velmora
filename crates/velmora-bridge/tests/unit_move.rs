@@ -1189,10 +1189,7 @@ fn a_time_restore_before_the_chains_move_floor_is_refused() {
         too_soon
     );
     // No floor named (0) and no record: the birth floor only.
-    assert_eq!(
-        restore_floor(&u, S, NOW.0 + LIFT_SLACK_MS, 0),
-        too_soon
-    );
+    assert_eq!(restore_floor(&u, S, NOW.0 + LIFT_SLACK_MS, 0), too_soon);
     // A floor that is no time: malformed, before anything else.
     assert_eq!(
         restore_floor(&u, S, NOW.0 + LIFT_SLACK_MS, u64::MAX),
@@ -1209,10 +1206,7 @@ fn a_time_restore_before_the_chains_move_floor_is_refused() {
         restore_floor(&u, s2, NOW.0 + LIFT_SLACK_MS - 1, 1),
         before_lift
     );
-    assert_eq!(
-        restore_floor(&u, s2, NOW.0 + LIFT_SLACK_MS, 1),
-        too_soon
-    );
+    assert_eq!(restore_floor(&u, s2, NOW.0 + LIFT_SLACK_MS, 1), too_soon);
     assert_eq!(
         restore_floor(&u, s2, NOW.0 + LIFT_SLACK_MS, floor as u64),
         before_lift

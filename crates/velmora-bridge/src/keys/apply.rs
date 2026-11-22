@@ -161,14 +161,7 @@ impl<'a, S: RecordStore, K: Kek, T: TkRing> Feed<'a, S, K, T> {
     /// Holds closed, in `mode`, an entry whose opening the directory may
     /// not have: the rule of the closing step.
     fn hold(mode: Mode, held: u64, closed: &BTreeSet<String>, entry: &mut ApplyEntry) {
-        let (Mode::Closing { acked }, ApplyEntry::Subject(e)) = (mode, entry) else {
-            return;
-        };
-        let acknowledged =
-            e.opened_seq <= acked || (e.opened_seq <= held && !closed.contains(&e.door.id));
-        if !acknowledged && e.door.status != SubjectStatus::Revoked {
-            e.private = None;
-        }
+        hold_rule(mode, held, closed, entry);
     }
 
     /// The `m/rk/` revocations the chain does not record yet, at or below
@@ -310,6 +303,33 @@ impl<'a, S: RecordStore, K: Kek, T: TkRing> Feed<'a, S, K, T> {
         }
         Err(ERR_APPLY_BEHIND)
     }
+}
+
+/// The rule of the closing step ([`Feed::bring_up`]): in
+/// [`Mode::Closing`], an entry whose opening the directory has not
+/// acknowledged (above `acked`) is held, unless the store holds that
+/// opening open already (at or below `held`, and not in `closed`).
+fn hold_rule(mode: Mode, held: u64, closed: &BTreeSet<String>, entry: &mut ApplyEntry) {
+    let (Mode::Closing { acked }, ApplyEntry::Subject(e)) = (mode, entry) else {
+        return;
+    };
+    let acknowledged =
+        e.opened_seq <= acked || (e.opened_seq <= held && !closed.contains(&e.door.id));
+    if !acknowledged && e.door.status != SubjectStatus::Revoked {
+        e.private = None;
+    }
+}
+
+/// The closing step's hold for a reader that sends [`Feed::entries`]
+/// without the store's closed set (the unit client's `sync`, through the
+/// composition root's key feed): as [`Feed::bring_up`]'s rule with no
+/// subject counted as held open by the store, so an opening the directory
+/// has not acknowledged is never sent open. A subject the store already
+/// holds open is then sent held until the directory acknowledges it; it
+/// cannot be one the directory has not, since the store got it open only
+/// from a full send after the directory's acknowledgement.
+pub fn hold_unacknowledged(mode: Mode, entry: &mut ApplyEntry) {
+    hold_rule(mode, 0, &BTreeSet::new(), entry);
 }
 
 /// The move's direct apply (AM-16): `target` gets `table`'s chain in full
