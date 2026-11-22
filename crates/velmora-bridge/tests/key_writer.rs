@@ -789,6 +789,7 @@ async fn a_key_is_never_recorded_wider_than_its_principal_at_its_seq() {
                     private_seq: 3,
                     tk_version: 1,
                     closes: true,
+                    opened_seq: 1,
                 },
             );
             w.root.seq.set(3);
@@ -2226,4 +2227,83 @@ async fn a_subject_closed_in_a_checkpoint_opens_from_an_older_one() {
     let e = read.table.get("AKVL0001").unwrap();
     assert!(e.private.is_some(), "opened from the older checkpoint");
     assert_eq!(e.effective_status(), SubjectStatus::Active);
+}
+
+/// A closing record that follows an opening one the directory has not
+/// acknowledged does not open the subject at a unit.
+#[tokio::test(flavor = "current_thread")]
+async fn a_close_after_an_unacknowledged_open_keeps_the_subject_closed() {
+    // Re-enable with the directory down, then narrow.
+    let w = World::new();
+    let adm = FakeAdmission::new(&w.root);
+    let mut table = seed(&w, &adm).await;
+    let units = w.units();
+    let env = env!(w, &adm, &units);
+    let mut rng = TestRng(140);
+    assert_eq!(
+        env.change(&mut table, "d", &disable("AKVL0001"), &mut rng)
+            .await
+            .unwrap(),
+        KeyAnswer::Done { seq: 3 }
+    );
+    w.directory.down.set(true);
+    assert_eq!(
+        env.change(&mut table, "e", &enable("AKVL0001"), &mut rng)
+            .await
+            .unwrap(),
+        KeyAnswer::Unfinished { seq: 4 }
+    );
+    let narrow = KeyRequest::SetGrants {
+        id: "AKVL0001".into(),
+        grants: vec![grant("b_01", RO, Some("x/"))],
+        acting: None,
+    };
+    assert_eq!(
+        env.change(&mut table, "n", &narrow, &mut rng)
+            .await
+            .unwrap(),
+        KeyAnswer::Done { seq: 5 }
+    );
+    for unit in [&w.root, &w.unit2] {
+        assert_eq!(unit.status("AKVL0001"), Some(SubjectStatus::Disabled));
+    }
+
+    // Widen with the directory down, then narrow within the widening.
+    let w = World::new();
+    let adm = FakeAdmission::new(&w.root);
+    let mut table = seed(&w, &adm).await;
+    let units = w.units();
+    let env = env!(w, &adm, &units);
+    w.directory.down.set(true);
+    let widen = KeyRequest::SetGrants {
+        id: "AKVL0001".into(),
+        grants: vec![grant("b_01", RW, None)],
+        acting: None,
+    };
+    assert_eq!(
+        env.change(&mut table, "w", &widen, &mut rng).await.unwrap(),
+        KeyAnswer::Unfinished { seq: 3 }
+    );
+    let narrow = KeyRequest::SetGrants {
+        id: "AKVL0001".into(),
+        grants: vec![grant("b_01", RW, Some("x/"))],
+        acting: None,
+    };
+    assert_eq!(
+        env.change(&mut table, "n", &narrow, &mut rng)
+            .await
+            .unwrap(),
+        KeyAnswer::Done { seq: 4 }
+    );
+    for unit in [&w.root, &w.unit2] {
+        let row = unit.row("AKVL0001").unwrap();
+        assert_eq!(row.effective_status(), SubjectStatus::Disabled);
+    }
+    // Once the directory is back, the key opens as recorded.
+    w.directory.down.set(false);
+    let report = finish_keys(&env, &mut rng).await.unwrap();
+    assert!(!report.retry(), "{report:?}");
+    let row = w.root.row("AKVL0001").unwrap();
+    assert_eq!(row.effective_status(), SubjectStatus::Active);
+    assert_eq!(joined(&row), vec![grant("b_01", RW, Some("x/"))]);
 }

@@ -362,14 +362,18 @@ fn entries_for(
 }
 
 /// Brings one unit to the table's seq before the directory acknowledged
-/// the head: an entry whose record closes is sent as it is; any other is
-/// sent closed (held `disabled` until a later run opens it), so nothing
-/// opens at a unit before the directory has it, and the unit still
-/// reaches the head.
+/// the head. `acked` is the seq the directory holds (0 when it cannot be
+/// read). A subject whose newest opening record (`opened_seq`) is above
+/// it is sent closed (held `disabled` until a run after the directory
+/// opens it); any other is sent as it is. So nothing opens at a unit
+/// before the directory has it, a closing record that follows an
+/// unacknowledged opening one does not open it either, and the unit
+/// still reaches the head.
 async fn bring_up_closing<U: KeyTarget>(
     target: &U,
     table: &KeyTable,
     revoked: &BTreeSet<String>,
+    acked: u64,
 ) -> Result<()> {
     let held = target.keys_seq().await?;
     if held >= table.seq() && revoked.is_empty() {
@@ -379,7 +383,7 @@ async fn bring_up_closing<U: KeyTarget>(
     let entries: Vec<Entry> = entries_for(table, held, revoked, &none)
         .into_iter()
         .map(|mut e| {
-            if !e.closes && e.door.status != SubjectStatus::Revoked {
+            if e.opened_seq > acked && e.door.status != SubjectStatus::Revoked {
                 e.private = None;
             }
             e
@@ -445,9 +449,10 @@ where
     /// with everything. So a closing change needs no directory, and no
     /// unit opens anything the directory does not have.
     async fn apply_all(&self, table: &KeyTable, revoked: &BTreeSet<String>) -> Acks {
+        let acked = self.directory.keys_seq().await.unwrap_or(0);
         let mut closed = true;
         for unit in self.units {
-            closed &= bring_up_closing(unit, table, revoked).await.is_ok();
+            closed &= bring_up_closing(unit, table, revoked, acked).await.is_ok();
         }
         let directory = bring_up(self.directory, table, revoked).await.is_ok();
         let mut units = directory;
@@ -769,8 +774,12 @@ where
     // The units with what closes, the directory, then the units in full
     // once the directory has the head: nothing opens at a unit before the
     // directory has it.
+    let acked = env.directory.keys_seq().await.unwrap_or(0);
     for unit in env.units {
-        if bring_up_closing(unit, &table, &read.revoked).await.is_err() {
+        if bring_up_closing(unit, &table, &read.revoked, acked)
+            .await
+            .is_err()
+        {
             report.failed.push(unit.label().to_owned());
         }
     }

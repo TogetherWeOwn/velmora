@@ -402,6 +402,7 @@ fn effective_status_closes_unreadable_subjects_and_preserves_revocation() {
         private_seq: 1,
         tk_version: 1,
         closes: false,
+        opened_seq: 1,
     };
     assert_eq!(entry.effective_status(), SubjectStatus::Disabled);
     entry.door.status = SubjectStatus::Revoked;
@@ -713,7 +714,7 @@ async fn a_checkpoint_with_duplicate_or_misaligned_subjects_is_skipped() {
         "record_sha256": sha,
         "subjects": entries.iter().map(|e| serde_json::json!({
             "door": e.door, "last_seq": e.last_seq, "private_seq": e.private_seq,
-            "tk_version": e.tk_version, "closes": e.closes, "open": true
+            "tk_version": e.tk_version, "closes": e.closes, "opened_seq": e.opened_seq, "open": true
         })).collect::<Vec<_>>(),
     });
     let privates = |dup: bool, misalign: bool| {
@@ -747,7 +748,7 @@ async fn a_checkpoint_with_duplicate_or_misaligned_subjects_is_skipped() {
         "record_sha256": door["record_sha256"].clone(),
         "subjects": entries.iter().filter(|e| e.door.id != PRINCIPAL).map(|e| serde_json::json!({
             "door": e.door, "last_seq": e.last_seq, "private_seq": e.private_seq,
-            "tk_version": e.tk_version, "closes": e.closes, "open": true
+            "tk_version": e.tk_version, "closes": e.closes, "opened_seq": e.opened_seq, "open": true
         })).collect::<Vec<_>>(),
     });
     let without_private = serde_json::json!({

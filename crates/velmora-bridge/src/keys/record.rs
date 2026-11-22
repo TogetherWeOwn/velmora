@@ -521,6 +521,10 @@ pub struct Entry {
     pub tk_version: u32,
     /// The newest record closes a door.
     pub closes: bool,
+    /// The seq of the subject's newest record that opens a door (a
+    /// create, a re-enable, a widening). A store whose directory has not
+    /// acknowledged this seq must not hold the subject open.
+    pub opened_seq: u64,
 }
 
 impl Entry {
@@ -674,6 +678,13 @@ impl KeyTable {
                 (true, None) => return Err(ERR_KEY_RECORD),
                 (false, _) => (record.private.clone(), record.seq, record.tk_version),
             };
+        // A restate re-seals the private part and changes no policy.
+        let opens = !record.closes && record.op != KeyOp::Restate;
+        let opened_seq = match (opens, self.subjects.get(&record.door.id)) {
+            (true, _) => record.seq,
+            (false, Some(before)) => before.opened_seq,
+            (false, None) => 0,
+        };
         self.subjects.insert(
             record.door.id.clone(),
             Entry {
@@ -683,6 +694,7 @@ impl KeyTable {
                 private_seq,
                 tk_version,
                 closes: record.closes,
+                opened_seq,
             },
         );
         self.seq = record.seq;

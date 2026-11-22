@@ -77,6 +77,7 @@ struct DoorEntry {
     private_seq: u64,
     tk_version: u32,
     closes: bool,
+    opened_seq: u64,
     /// Whether the private part below holds this subject.
     open: bool,
 }
@@ -125,6 +126,7 @@ pub fn seal_checkpoint<K: Kek, T: TkRing, R: FillRandom>(
                 private_seq: e.private_seq,
                 tk_version: e.tk_version,
                 closes: e.closes,
+                opened_seq: e.opened_seq,
                 open: e.private.is_some(),
             })
             .collect(),
@@ -202,7 +204,8 @@ pub fn open_checkpoint<K: Kek, T: TkRing>(
         let seqs_fit = d.last_seq != 0
             && d.last_seq <= seq
             && d.private_seq != 0
-            && d.private_seq <= d.last_seq;
+            && d.private_seq <= d.last_seq
+            && d.opened_seq <= d.last_seq;
         if !seqs_fit || subjects.contains_key(&d.door.id) {
             return None;
         }
@@ -217,6 +220,7 @@ pub fn open_checkpoint<K: Kek, T: TkRing>(
                 private_seq: d.private_seq,
                 tk_version: d.tk_version,
                 closes: d.closes,
+                opened_seq: d.opened_seq,
             },
         );
     }
