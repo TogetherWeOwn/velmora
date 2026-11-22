@@ -419,6 +419,47 @@ fn config_loads_from_documented_vars() {
     assert!(!cfg.providers[0].tls);
 }
 
+/// A unit's job configuration (round 3 L1-Q7): made from tenant 0's,
+/// with the unit's stamp id from its name and the tenant's own record
+/// layout, and nothing else changed. `CATALOGUE_ID` still refuses the
+/// unit form, so no deploy variable can name a unit's stamp prefix.
+#[test]
+fn a_units_job_config_takes_its_stamp_id_from_the_units_name() {
+    use velmora_bridge::recovery::Layout;
+    use velmora_bridge::unit::{jobcall, TenantId, UnitName};
+    let (prod, _) = wrangler_vars();
+    let vars = with_secrets(prod, PROVIDER_TLS);
+    let base = load(&vars).unwrap();
+    let name = UnitName::new(TenantId::parse("t_00000000000000a7").unwrap(), 3);
+    let unit = base.for_unit(&name).unwrap();
+    assert_eq!(unit.catalogue_id, "t_00000000000000a7.3");
+    assert_eq!(unit.catalogue_id, jobcall::stamp_id(&name));
+    assert_eq!(unit.records, Layout::tenant("t_00000000000000a7").unwrap());
+    assert_ne!(unit.records, Layout::flat());
+    assert_eq!(base.catalogue_id, "main");
+    let same = BridgeConfig {
+        catalogue_id: base.catalogue_id.clone(),
+        records: base.records.clone(),
+        ..unit.clone()
+    };
+    assert_eq!(format!("{same:?}"), format!("{base:?}"));
+    assert!(base.for_unit(&UnitName::new(TenantId::zero(), 0)).is_err());
+    // Tenant 0's maintenance holds for its units too (AM-50).
+    let restoring = BridgeConfig {
+        maintenance: velmora_bridge::config::Maintenance::Restore,
+        ..base.clone()
+    };
+    assert_eq!(
+        restoring.for_unit(&name).unwrap().maintenance,
+        velmora_bridge::config::Maintenance::Restore
+    );
+    for id in ["t_00000000000000a7.3", "main.0"] {
+        let mut v = vars.clone();
+        v.insert("CATALOGUE_ID".to_string(), id.to_string());
+        assert!(load(&v).is_err(), "{id}");
+    }
+}
+
 /// The recovery copy is no part of the service's configuration: off
 /// when unset or blank, and a copy that is refused does not stop the
 /// service.
@@ -482,7 +523,7 @@ fn record_layout_is_flat_unless_tenant_is_asked_for() {
     for tenant in ["tenant", " tenant "] {
         vars.insert("RECORD_LAYOUT".into(), tenant.into());
         let records = load(&vars).unwrap().records;
-        assert_eq!(records, Layout::default_tenant(), "{tenant:?}");
+        assert_eq!(records, Layout::of(&TENANT_ZERO), "{tenant:?}");
         assert_eq!(records.root(), "m/x/t_0000000000000000/");
     }
     for bad in ["on", "off", "TENANT", "Flat", "t_1", "m/x/", "tenant,flat"] {
@@ -1763,7 +1804,7 @@ async fn contract_compiles_against_fakes() {
         budget: ByteBudget::new(cfg.inflight_budget_bytes),
         cfg,
     });
-    let _ = bridge.run_job(&job).await;
+    let _ = bridge.run_job(&TENANT_ZERO, &job).await;
     let _ = bridge.dispatch().await;
     let resp = Rc::clone(&bridge)
         .handle(S3Request {
@@ -2028,6 +2069,92 @@ fn s3_host_allows_only_hostname_and_port() {
         assert_eq!(
             host(bad).unwrap_err(),
             ConfigError::Invalid("S3_HOST".into()),
+            "{bad}"
+        );
+    }
+}
+
+#[test]
+fn s3_hosts_lists_more_hosts_with_a_class() {
+    use velmora_bridge::config::{HostClass, S3Host};
+
+    let (_, dev) = wrangler_vars();
+    let base = with_secrets(dev, PROVIDER_PLAIN);
+    let primary = base["S3_HOST"].as_str();
+    let hosts = |value: Option<&str>| {
+        let mut m = base.clone();
+        if let Some(value) = value {
+            m.insert("S3_HOSTS".into(), value.into());
+        }
+        load(&m)
+    };
+
+    for value in [None, Some(""), Some(" \t ")] {
+        let cfg = hosts(value).unwrap();
+        assert!(cfg.s3_hosts.is_empty(), "{value:?}");
+        assert_eq!(cfg.s3_host_for(primary), Some((primary, HostClass::Legacy)));
+    }
+
+    let cfg = hosts(Some("s3.customer.example=customer")).unwrap();
+    assert_eq!(
+        cfg.s3_hosts,
+        [S3Host {
+            name: "s3.customer.example".into(),
+            class: HostClass::Customer,
+        }]
+    );
+    assert_eq!(
+        cfg.s3_host_for("S3.Customer.Example"),
+        Some(("s3.customer.example", HostClass::Customer))
+    );
+    assert_eq!(cfg.s3_host_for("other.example"), None);
+    assert_eq!(cfg.s3_host_for("s3.customer.example:443"), None);
+
+    let cfg = hosts(Some(" a.example=legacy , b.example:8443=customer ")).unwrap();
+    assert_eq!(
+        cfg.s3_hosts,
+        [
+            S3Host {
+                name: "a.example".into(),
+                class: HostClass::Legacy,
+            },
+            S3Host {
+                name: "b.example:8443".into(),
+                class: HostClass::Customer,
+            },
+        ]
+    );
+    assert_eq!(
+        cfg.all_s3_hosts().collect::<Vec<_>>(),
+        [primary, "a.example", "b.example:8443"]
+    );
+
+    let eight = (1..=8)
+        .map(|i| format!("s3-{i}.example=legacy"))
+        .collect::<Vec<_>>()
+        .join(",");
+    assert_eq!(hosts(Some(&eight)).unwrap().s3_hosts.len(), 8);
+
+    for bad in [
+        "a.example",
+        "a.example=",
+        "=customer",
+        "a.example=Customer",
+        "a.example=public",
+        "A.example=customer",
+        "a.example=customer,",
+        ",a.example=customer",
+        "a.example=customer,a.example=legacy",
+        &format!("{}=customer", primary.to_ascii_uppercase()),
+        &format!("{primary}=customer"),
+        "a b.example=customer",
+        "a.example:0=customer",
+        "a.example=customer=legacy",
+        &format!("{eight},s3-9.example=legacy"),
+    ] {
+        assert_eq!(
+            hosts(Some(bad)).unwrap_err(),
+            ConfigError::Invalid("S3_HOSTS".into()),
             "{bad}"
         );
     }
@@ -3033,3 +3160,6 @@ fn production_places_the_fetch_handler_in_us_east_1_and_dev_does_not() {
     assert_eq!(dev, ["env.dev.placement"], "dev states its own placement");
     assert_eq!(table_body("[env.dev.placement]"), ["mode=off"]);
 }
+
+/// The one tenant there is.
+static TENANT_ZERO: velmora_bridge::TenantScope = velmora_bridge::TenantScope::tenant_zero();

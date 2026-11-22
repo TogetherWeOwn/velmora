@@ -1676,7 +1676,10 @@ async fn verify_renews_first_on_a_claim_that_is_old() {
     let lease = rig.claim(&s, OutboxStage::Verify).await;
     clock.advance_secs(20);
     let start = clock.now();
-    assert_eq!(rig.bridge.verify_stage(&lease, &job).await, JobOutcome::Ack);
+    assert_eq!(
+        rig.bridge.verify_stage(&TENANT_ZERO, &lease, &job).await,
+        JobOutcome::Ack
+    );
     assert_eq!(rig.bridge.nntp.calls().len(), 1 + plan.len());
     assert_eq!(*rig.bridge.catalog.lease_renewed_at.borrow(), [start]);
     assert_eq!(*rig.bridge.catalog.permit_renewed_at.borrow(), [start]);
@@ -1690,7 +1693,7 @@ async fn verify_renews_first_on_a_claim_that_is_old() {
     clock.advance_secs(20);
     rig.bridge.catalog.take_over(&s.extent);
     let at = clock.now();
-    rig.bridge.verify_stage(&lease, &job).await;
+    rig.bridge.verify_stage(&TENANT_ZERO, &lease, &job).await;
     assert!(rig.bridge.nntp.calls().is_empty());
     assert_eq!(*rig.bridge.catalog.lease_renewed_at.borrow(), [at]);
     assert!(rig.rows(&s).is_empty());
@@ -1712,7 +1715,7 @@ impl Rig {
         let lease = self.claim(s, OutboxStage::Verify).await;
         let done = std::cell::Cell::new(false);
         let stage = async {
-            let outcome = self.bridge.verify_stage(&lease, &job).await;
+            let outcome = self.bridge.verify_stage(&TENANT_ZERO, &lease, &job).await;
             done.set(true);
             outcome
         };
@@ -2402,7 +2405,10 @@ async fn stale_lease_reposts_nothing() {
     rig.bridge.clock.advance_secs(LEASE_SECS + 1);
     let holder = rig.claim(&s, OutboxStage::Verify).await;
     let job = rig.job(&s).await;
-    assert_eq!(rig.bridge.verify_stage(&stale, &job).await, JobOutcome::Ack);
+    assert_eq!(
+        rig.bridge.verify_stage(&TENANT_ZERO, &stale, &job).await,
+        JobOutcome::Ack
+    );
 
     assert_eq!(rig.servers[1].posted_count().await, 0);
     let outbox = rig.outbox(&s);
@@ -2432,3 +2438,6 @@ async fn repost_waits_for_memory() {
     );
     drop(held);
 }
+
+/// The one tenant there is.
+static TENANT_ZERO: velmora_bridge::TenantScope = velmora_bridge::TenantScope::tenant_zero();

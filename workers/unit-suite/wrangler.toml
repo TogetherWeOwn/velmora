@@ -1,0 +1,25 @@
+# Test Worker for the unit's database adapter and its object class.
+# Local only: run-suite.sh serves it with workerd. It is never deployed.
+name = "velmora-unit-suite"
+main = "build/worker/shim.mjs"
+compatibility_date = "2026-11-01"
+workers_dev = false
+
+[build]
+command = "cargo install -q --locked worker-build@0.8.7 && worker-build --release"
+
+[exports.SuiteDb]
+type = "durable-object"
+storage = "sqlite"
+
+[[durable_objects.bindings]]
+name = "SUITE_DB"
+class_name = "SuiteDb"
+
+[exports.UnitObject]
+type = "durable-object"
+storage = "sqlite"
+
+[[durable_objects.bindings]]
+name = "UNIT"
+class_name = "UnitObject"

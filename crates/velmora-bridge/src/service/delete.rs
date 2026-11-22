@@ -635,6 +635,7 @@ async fn delete_many<
     // The limits of this document, not those of an object body.
     let xml_policy = policy_with(
         &bridge.cfg,
+        &bridge.cfg.s3_host,
         MAX_DELETE_BODY_BYTES as usize,
         MAX_DELETE_BODY_BYTES,
     )?;

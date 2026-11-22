@@ -483,6 +483,30 @@ impl TkCache {
         self.forgotten.borrow().get(tenant).copied().unwrap_or(0)
     }
 
+    /// Drops every key past [`TK_CACHE_MS`], of every tenant, as each
+    /// load does first: an isolate that loads no key for a while holds
+    /// none past its time.
+    pub fn prune(&self, now: UnixMs) {
+        let fresh = |at: &UnixMs| now.0 >= at.0 && now.0 - at.0 < TK_CACHE_MS;
+        self.keys.borrow_mut().retain(|_, (_, at)| fresh(at));
+    }
+
+    /// When the cached key of `version` of `tenant` with check value
+    /// `pinned` was unwrapped; `None` when none is cached. A holder that
+    /// keeps the key beyond the call dates it from here, not from its own
+    /// clock, so the key is used for at most [`TK_CACHE_MS`] after its
+    /// unwrap (`directory::seal::SealKeys`).
+    pub fn loaded_at(
+        &self,
+        tenant: &TenantId,
+        version: u32,
+        pinned: &[u8; KCV_LEN],
+    ) -> Option<UnixMs> {
+        let keys = self.keys.borrow();
+        let (key, at) = keys.get(&(tenant.clone(), version))?;
+        (key.check_value() == *pinned).then_some(*at)
+    }
+
     /// How many keys are held (tests).
     pub fn len(&self) -> usize {
         self.keys.borrow().len()

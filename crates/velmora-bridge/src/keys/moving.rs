@@ -71,14 +71,25 @@ pub const ERR_MOVE_INPUT: BridgeError = BridgeError::Invalid("move input is not 
 // Names
 // ---------------------------------------------------------------------------
 
-/// The safety copy of `extent` of a managed tenant: `x/<t>/<id>`.
-pub fn tenant_safety_key(tenant: &TenantId, extent: &ExtentId) -> String {
-    format!("x/{tenant}/{}", extent.as_str())
+/// The scope of a managed tenant, whose names every blob takes
+/// (`crate::tenant`).
+fn scope_of(tenant: &TenantId) -> Option<crate::TenantScope> {
+    crate::unit::TenantId::parse(tenant.as_str()).and_then(|t| crate::TenantScope::managed(&t))
 }
 
-/// The cache copy of `extent` of a managed tenant: `c/<t>/<id>`.
+/// The safety copy of `extent` of a managed tenant: `x/<t>/<id>`, named
+/// by its scope.
+pub fn tenant_safety_key(tenant: &TenantId, extent: &ExtentId) -> String {
+    // A scheme-2 tenant id is a managed tenant's, never tenant 0's.
+    let scope = scope_of(tenant).expect("a managed tenant id");
+    scope.safety_key(extent)
+}
+
+/// The cache copy of `extent` of a managed tenant: `c/<t>/<id>`, named by
+/// its scope.
 pub fn tenant_cache_key(tenant: &TenantId, extent: &ExtentId) -> String {
-    format!("c/{tenant}/{}", extent.as_str())
+    let scope = scope_of(tenant).expect("a managed tenant id");
+    scope.cache_key(extent)
 }
 
 fn layout(tenant: &TenantId) -> Result<Layout> {

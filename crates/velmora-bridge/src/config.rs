@@ -141,6 +141,32 @@ pub enum GcMode {
 /// stays off for this long ("After a restore").
 pub const ORPHAN_GRACE_MS: i64 = 31 * 24 * 60 * 60 * 1000;
 
+/// What a host name the service answers on is for. `S3_HOST` is always
+/// [`HostClass::Legacy`]; the hosts of `S3_HOSTS` name their class.
+///
+/// For now both classes admit every key: there is one tenant, so the
+/// class changes no answer yet. It is parsed, validated and resolved
+/// per request now, so that binding tenants to classes later is a
+/// change to one rule and not to the configuration.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HostClass {
+    /// The endpoint the existing keys were given.
+    Legacy,
+    /// The endpoint for customer tenants.
+    Customer,
+}
+
+/// One more host the S3 surface answers on, besides `S3_HOST`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct S3Host {
+    /// As configured: lowercase, with an optional `:port`.
+    pub name: String,
+    pub class: HostClass,
+}
+
+/// Most hosts `S3_HOSTS` may list.
+pub const MAX_EXTRA_S3_HOSTS: usize = 8;
+
 /// `MAINTENANCE`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Maintenance {
@@ -208,8 +234,13 @@ pub const DEFAULT_PROPAGATION_GRACE_SECS: u32 = 21_600;
 #[derive(Clone, Debug)]
 pub struct BridgeConfig {
     pub environment: Environment,
-    /// The host clients sign (`policy.host`).
+    /// The host clients sign (`policy.host`), class
+    /// [`HostClass::Legacy`].
     pub s3_host: String,
+    /// More hosts clients may sign for (`S3_HOSTS`), each with its
+    /// class. Empty when the variable is unset: the service answers on
+    /// `s3_host` alone, as before the variable existed.
+    pub s3_hosts: Vec<S3Host>,
     pub region: String,
     pub max_extent_bytes: u64,
     /// Largest PutObject body. A body above `max_extent_bytes` is cut
@@ -635,6 +666,46 @@ fn valid_newsgroup(g: &str) -> bool {
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"._+-".contains(&b))
 }
 
+/// `S3_HOSTS`: absent or empty is no extra host. Otherwise a comma
+/// separated list of `<host>=<class>`, class `legacy` or `customer`,
+/// at most [`MAX_EXTRA_S3_HOSTS`] entries. Each host is a valid
+/// `S3_HOST` value in lowercase, and no host is listed twice or equals
+/// `S3_HOST` (compared without case). Anything else refuses the whole
+/// configuration: a host typed wrong must not leave a second endpoint
+/// half-configured.
+fn parse_s3_hosts(raw: Option<&str>, primary: &str) -> Result<Vec<S3Host>, ConfigError> {
+    let invalid = || ConfigError::Invalid("S3_HOSTS".into());
+    let raw = match raw.map(str::trim) {
+        None | Some("") => return Ok(Vec::new()),
+        Some(raw) => raw,
+    };
+    let mut out: Vec<S3Host> = Vec::new();
+    for entry in raw.split(',') {
+        let (name, class) = entry.trim().split_once('=').ok_or_else(invalid)?;
+        let (name, class) = (name.trim(), class.trim());
+        let class = match class {
+            "legacy" => HostClass::Legacy,
+            "customer" => HostClass::Customer,
+            _ => return Err(invalid()),
+        };
+        if !valid_s3_host(name)
+            || name.bytes().any(|b| b.is_ascii_uppercase())
+            || name.eq_ignore_ascii_case(primary)
+            || out.iter().any(|h| h.name == name)
+        {
+            return Err(invalid());
+        }
+        out.push(S3Host {
+            name: name.to_owned(),
+            class,
+        });
+    }
+    if out.len() > MAX_EXTRA_S3_HOSTS {
+        return Err(invalid());
+    }
+    Ok(out)
+}
+
 /// `VELMORA_KEK_<v>`: base64 (standard, padded) of exactly 32 bytes.
 fn parse_kek(get: &impl Fn(&str) -> Option<String>, v: u32) -> Result<KekBytes, ConfigError> {
     let name = format!("VELMORA_KEK_{v}");
@@ -648,6 +719,63 @@ fn parse_kek(get: &impl Fn(&str) -> Option<String>, v: u32) -> Result<KekBytes, 
 }
 
 impl BridgeConfig {
+    /// The configuration of the jobs of one managed tenant's unit, made
+    /// from this isolate's (tenant 0's) configuration. It takes the
+    /// unit's name, never a string: `CATALOGUE_ID` stays tenant 0's and
+    /// keeps its validator ([`valid_catalogue_id`] refuses a dot, so no
+    /// deploy variable can name a unit's stamp prefix, round 3 L1-Q7).
+    /// Two settings differ from tenant 0's:
+    ///
+    /// - `catalogue_id` is the unit's stamp id `<tenant>.<unit>`, made by
+    ///   [`crate::unit::jobcall::stamp_id`], the one producer of that
+    ///   form, which the unit's job calls check against (`rs/<t>.<u>/`).
+    /// - `records` is the tenant's own layout (`m/x/<tenant>/`), whatever
+    ///   tenant 0's is: a managed tenant's records never go into the flat
+    ///   layout, which the recovery copy and the replay read as tenant
+    ///   0's.
+    ///
+    /// Every other setting is tenant 0's, `maintenance` included (AM-50):
+    /// under `restore` a unit's jobs make no unit call and its writes
+    /// answer `503`, which the owner move's window depends on (DS1 §3.4
+    /// from 8(b) to step 9).
+    ///
+    /// Refused for tenant 0, which has no unit.
+    pub fn for_unit(&self, unit: &crate::unit::UnitName) -> Result<BridgeConfig, ConfigError> {
+        if unit.tenant.is_zero() {
+            return Err(ConfigError::Refused("tenant 0 has no unit"));
+        }
+        let records = crate::recovery::Layout::tenant(unit.tenant.as_str())
+            .ok_or(ConfigError::Refused("not a tenant id"))?;
+        let catalogue_id = crate::unit::jobcall::stamp_id(unit);
+        debug_assert!(
+            !valid_catalogue_id(&catalogue_id),
+            "a unit id is never a catalogue id"
+        );
+        Ok(BridgeConfig {
+            catalogue_id,
+            records,
+            ..self.clone()
+        })
+    }
+
+    /// The configured host a request's `Host` names, as configured, and
+    /// its class; `None` when it names none of them. Compared without
+    /// case, port included: `s3.example` does not match `s3.example:443`.
+    pub fn s3_host_for(&self, host: &str) -> Option<(&str, HostClass)> {
+        if host.eq_ignore_ascii_case(&self.s3_host) {
+            return Some((self.s3_host.as_str(), HostClass::Legacy));
+        }
+        self.s3_hosts
+            .iter()
+            .find(|h| host.eq_ignore_ascii_case(&h.name))
+            .map(|h| (h.name.as_str(), h.class))
+    }
+
+    /// Every host the S3 surface answers on: `S3_HOST` first.
+    pub fn all_s3_hosts(&self) -> impl Iterator<Item = &str> {
+        core::iter::once(self.s3_host.as_str()).chain(self.s3_hosts.iter().map(|h| h.name.as_str()))
+    }
+
     /// Builds and validates the configuration from vars and secrets.
     /// `get` returns a var or secret by name (`None` = absent).
     pub fn from_vars(get: impl Fn(&str) -> Option<String>) -> Result<BridgeConfig, ConfigError> {
@@ -662,6 +790,7 @@ impl BridgeConfig {
         if !valid_s3_host(&s3_host) {
             return Err(ConfigError::Invalid("S3_HOST".into()));
         }
+        let s3_hosts = parse_s3_hosts(get("S3_HOSTS").as_deref(), &s3_host)?;
         let region = required(&get, "S3_REGION")?;
 
         let max_extent_bytes: u64 = number(&get, "MAX_EXTENT_BYTES")?;
@@ -725,7 +854,9 @@ impl BridgeConfig {
         }
         let records = match get("RECORD_LAYOUT").as_deref().map(str::trim) {
             None | Some("") | Some("flat") => crate::recovery::Layout::flat(),
-            Some("tenant") => crate::recovery::Layout::default_tenant(),
+            Some("tenant") => {
+                crate::recovery::Layout::of(&crate::tenant::TenantScope::tenant_zero())
+            }
             Some(_) => return Err(ConfigError::Invalid("RECORD_LAYOUT".into())),
         };
 
@@ -921,6 +1052,7 @@ impl BridgeConfig {
         Ok(BridgeConfig {
             environment,
             s3_host,
+            s3_hosts,
             region,
             max_extent_bytes,
             max_put_bytes,
