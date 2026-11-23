@@ -466,9 +466,11 @@ impl<H: HttpSend> S3Remote<H> {
                     }
                     None
                 }
+                Ok(r) if (500..600).contains(&r.status) || r.status == 429 => Some(r),
                 Ok(r)
-                    if (500..600).contains(&r.status)
-                        || (op != Operation::Get && r.status == 429) =>
+                    if op == Operation::Get
+                        && (400..500).contains(&r.status)
+                        && error_code(&r) == Some("SlowDown") =>
                 {
                     Some(r)
                 }

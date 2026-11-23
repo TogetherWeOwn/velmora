@@ -7,8 +7,7 @@ use velmora_bridge::{JobOutcome, Result, Sql, SqlValue, UnixMs};
 const INSERT: &str =
     "INSERT INTO recovery_copy_log (at, kind, pass, swept, problems, checked, detail)
     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)";
-const PRUNE: &str =
-    "DELETE FROM recovery_copy_log WHERE kind IN ('job', 'walk', 'audit') AND at < ?1";
+const PRUNE: &str = include_str!("recovery_log_prune.sql");
 const RETENTION_MS: i64 = 7 * 24 * 3_600_000;
 
 pub struct Log {
@@ -110,7 +109,11 @@ pub fn source_problem(report: &JobReport) -> Option<Problem> {
     })
 }
 
-pub async fn prune(db: &impl Sql, now: UnixMs) -> Result<()> {
+/// One cleanup attempt per pass interval even while copying is off or paused.
+pub async fn prune_tick(db: &impl Sql, scheduled: UnixMs, now: UnixMs) -> Result<()> {
+    if !velmora_bridge::copy::pass_due(scheduled) {
+        return Ok(());
+    }
     db.exec(PRUNE, &[SqlValue::Int(now.0 - RETENTION_MS)])
         .await
         .map(|_| ())

@@ -111,7 +111,7 @@ export function reminderGap(sentInRun) {
  * cron conditions; one hour for reports (host, ci), each a new event.
  */
 export function gapFor(row, sentInRun) {
-  if (row.source === "cron" && row.key.startsWith("recovery-copy-")) return DAY;
+  if (row.source === "cron" && row.key.startsWith("recovery-copy-")) return sentInRun <= 0 ? HOUR : DAY;
   return row.source === "cron" ? reminderGap(sentInRun) : HOUR;
 }
 

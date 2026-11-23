@@ -38,47 +38,31 @@ pub async fn run(env: Env, pass: UnixMs, remote: S3Remote<FetchHttp>) {
         return;
     };
     let now = WorkerClock.now();
-    let sample = async {
-        let counts = match env.bucket("SAFETY") {
-            Ok(bucket) => {
-                audit(
-                    &R2Blobs::new(bucket),
-                    &remote,
-                    &WorkerClock,
-                    now,
-                    &random_start(now, (Math::random() * 8.0) as usize, Math::random()),
-                    |remaining| (Math::random() * remaining as f64) as usize,
-                )
-                .await
-            }
-            Err(_) => AuditCounts {
-                source_errors: 1,
-                ..Default::default()
-            },
-        };
-        let log = recovery_log::Log {
-            at: WorkerClock.now(),
-            pass,
-            destination: Some(remote.place()),
-            first: remote.transport().first_problem.get(),
-        };
-        if log.audit(&db, &counts).await.is_err() {
-            console_error!("recovery copy: audit telemetry write failed");
+    let counts = match env.bucket("SAFETY") {
+        Ok(bucket) => {
+            audit(
+                &R2Blobs::new(bucket),
+                &remote,
+                &WorkerClock,
+                now,
+                &random_start(now, (Math::random() * 8.0) as usize, Math::random()),
+                |remaining| (Math::random() * remaining as f64) as usize,
+            )
+            .await
         }
+        Err(_) => AuditCounts {
+            source_errors: 1,
+            ..Default::default()
+        },
     };
-    futures_util::join!(sample, prune_log(&db, now));
-}
-
-async fn prune_log(db: &D1Sql, now: UnixMs) {
-    if recovery_log::prune(db, now).await.is_err() {
-        console_error!("recovery copy: telemetry prune failed");
-    }
-}
-
-pub async fn prune_after_refused_pass(env: Env) {
-    match env.d1("CATALOG").map(D1Sql::new) {
-        Ok(db) => prune_log(&db, WorkerClock.now()).await,
-        Err(_) => console_error!("recovery copy: telemetry prune failed"),
+    let log = recovery_log::Log {
+        at: WorkerClock.now(),
+        pass,
+        destination: Some(remote.place()),
+        first: remote.transport().first_problem.get(),
+    };
+    if log.audit(&db, &counts).await.is_err() {
+        console_error!("recovery copy: audit telemetry write failed");
     }
 }
 

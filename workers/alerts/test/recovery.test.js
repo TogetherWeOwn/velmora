@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
+import { readFileSync } from "node:fs";
 
 import { tick } from "../src/index.js";
 import { SQL } from "../src/recovery.js";
@@ -105,7 +106,9 @@ test("a persistent GET-only 503 pages within 60 min while copier jobs are health
   for (const minutes of [15, 30, 45, 60]) {
     const at = T0 + minutes * MIN;
     f.row("job", at, { swept: 1 });
-    f.row("audit", at, unavailable);
+    // The sampler's fallback can turn a missed tenant probe into one
+    // checked-but-unavailable flat record (the Rust sampler test).
+    f.row("audit", at, minutes > 30 ? { checked: 1, detail: '{"counts":{"unavailable":1}}' } : unavailable);
     const checked = await f.check(at);
     assert.equal(has(checked, FAILING), false);
     assert.equal(has(checked, AUDIT), minutes === 60);
@@ -138,6 +141,33 @@ test("a mismatch during startup can page before the missing-history thresholds",
   const f = fixture();
   f.row("audit", T0, { checked: 1, problems: 1 });
   assert.deepEqual((await f.check(T0)).conditions, [AUDIT]);
+});
+
+test("a new failure seven hours after the last page sends its own first email", async () => {
+  const f = fixture();
+  for (const at of [T0, T0 + 7 * HOUR]) {
+    if (at !== T0) {
+      f.healthy(T0 + 6 * HOUR);
+      assert.equal(has(await f.check(T0 + 6 * HOUR), FAILING), false);
+    }
+    f.healthy(at);
+    f.row("job", at - 15 * MIN, { problems: 1 });
+    f.row("job", at, { problems: 1 });
+    assert.equal(has(await f.check(at), FAILING), true);
+    assert.equal(f.env.ALERT_EMAIL.sent.length, at === T0 ? 1 : 2);
+  }
+});
+
+test("a usable comparison clears and suppresses the GET-only condition after startup", async () => {
+  const f = fixture();
+  f.healthy(T0 - 49 * HOUR);
+  f.healthy(T0);
+  for (const minutes of [15, 30, 45, 60]) f.row("audit", T0 + minutes * MIN, unavailable);
+  assert.equal(has(await f.check(T0 + HOUR), AUDIT), true);
+  f.row("audit", T0 + 65 * MIN, { checked: 1, detail: '{"counts":{"equal":1,"unavailable":0}}' });
+  assert.equal(has(await f.check(T0 + 65 * MIN), AUDIT), false);
+  f.row("audit", T0 + 75 * MIN, unavailable);
+  assert.equal(has(await f.check(T0 + 75 * MIN), AUDIT), false);
 });
 
 test("62 h of 403 for writes and reads pages within 35 min and reminds at most once per day", async () => {
@@ -184,32 +214,64 @@ for (const op of ["put", "verify", "plan", "list"]) {
   }
 }
 
-test("indexed SQLite dry run over 7 days of rows at 45 jobs/pass", async (t) => {
+test("pruning catches up after a seven-day gap in batches of at most 1000", (t) => {
+  const f = fixture();
+  const db = f.env.CATALOG.db;
+  const prune = readFileSync(new URL("../../s3-bridge/src/recovery_log_prune.sql", import.meta.url), "utf8");
+  const cutoff = T0 - 7 * 24 * HOUR;
+  f.env.CATALOG.exec("BEGIN");
+  for (let n = 1; n <= 30_240; n++) f.row("job", cutoff - n * 20_000);
+  f.row("walk", cutoff - 1);
+  f.row("audit", cutoff - 1);
+  f.healthy(cutoff);
+  f.env.CATALOG.exec("COMMIT");
+  const plan = db.prepare(`EXPLAIN QUERY PLAN ${prune}`).all(cutoff).map((r) => r.detail);
+  assert.ok(plan.some((s) => s.includes("USING COVERING INDEX recovery_copy_log_kind_at (kind=? AND at<?)")), plan.join("; "));
+  assert.ok(!plan.some((s) => s.includes("TEMP B-TREE")), plan.join("; "));
+  const counts = Array.from({length: 32}, () => db.prepare(prune).run(cutoff).changes);
+  assert.deepEqual(counts, [...Array(30).fill(1000), 242, 0]);
+  assert.equal(db.prepare("SELECT count(*) AS n FROM recovery_copy_log WHERE at >= ?").get(cutoff).n, 3);
+  assert.equal(db.prepare("SELECT count(*) AS n FROM recovery_copy_log WHERE at < ?").get(cutoff).n, 0);
+  t.diagnostic(`prune: ${plan.join("; ")}; removed 30,242 expired rows in 31 capped batches`);
+});
+
+test("indexed SQLite dry run at one job per two seconds, healthy and saturated", async (t) => {
   const f = fixture();
   f.env.CATALOG.exec("BEGIN");
   for (let n = 1; n <= 7 * 96; n++) {
     const pass = T0 - n * 15 * MIN;
-    for (let j = 1; j <= 45; j++) f.row("job", pass + j * 20_000, { pass });
-    f.row("audit", pass + 5 * MIN);
+    if (n <= 24) for (let j = 1; j <= 450; j++) f.row("job", pass + j * 2000, { pass });
+    f.row("audit", pass + 5 * MIN, { pass, checked: n === 1 ? 1 : 0 });
     if (n % 96 === 0) f.row("walk", pass + MIN, { pass });
   }
   f.env.CATALOG.exec("COMMIT");
   const db = f.env.CATALOG.db;
-  const plans = [["failing", [T0, T0 - 6 * HOUR]], ["stale", [T0, T0 - 2 * HOUR, T0 - 48 * HOUR]], ["audit", [T0, T0 - 2 * HOUR, T0 - 24 * HOUR, T0 - HOUR]]];
-  for (const [name, params] of plans) {
+  const failing = [T0, T0 - 6 * HOUR];
+  const stale = [T0, T0 - 2 * HOUR, T0 - 48 * HOUR];
+  for (const [name, params, index] of [
+    ["failing", failing, "recovery_copy_log_problem_at"],
+    ["stale", stale, "recovery_copy_log_swept_at"],
+    ["audit", [T0, T0 - 2 * HOUR, T0 - 24 * HOUR, T0 - HOUR], "recovery_copy_log_kind_at"],
+  ]) {
     const steps = db.prepare(`EXPLAIN QUERY PLAN ${SQL[name]}`).all(...params).map((r) => r.detail);
-    const indexReads = steps.filter((s) => s.includes("USING INDEX recovery_copy_log_kind_at"));
-    assert.equal(indexReads.length, name === "stale" ? 2 : 1, `${name}: ${steps.join("; ")}`);
-    assert.ok(indexReads.every((s) => s.includes("kind=? AND at>? AND at<?")));
-    const first = steps.filter((s) => s.includes("USING COVERING INDEX recovery_copy_log_kind_at (kind=?)"));
-    assert.equal(first.length, name === "stale" ? 3 : 0, "one first-row lookup per kind");
-    t.diagnostic(`${name}: ${[...indexReads, ...first].join("; ")}`);
+    assert.ok(steps.some((s) => s.includes(`INDEX ${index}`) && s.includes("at>? AND at<?")), steps.join("; "));
+    assert.ok(!steps.some((s) => s.includes("SCAN recovery_copy_log") || s.includes("TEMP B-TREE FOR ORDER BY")), steps.join("; "));
+    t.diagnostic(`${name}: ${steps.join("; ")}`);
   }
   const count = db.prepare("SELECT COUNT(*) AS n FROM recovery_copy_log WHERE kind = ? AND at > ? AND at <= ?");
-  const windows = [["job", 6, 1080], ["job", 2, 360], ["walk", 48, 2], ["audit", 24, 96]];
-  for (const [kind, hours, n] of windows) {
+  for (const [kind, hours, n] of [["job", 6, 10_800], ["job", 2, 3600], ["walk", 48, 2], ["audit", 24, 96]]) {
     assert.equal(count.get(kind, T0 - hours * HOUR, T0).n, n);
-    t.diagnostic(`${kind} ${hours} h: ${n} rows in the indexed range`);
   }
-  for (const key of [STALE, AUDIT]) assert.equal(has(await f.check(T0), key), true);
+  const readProblems = db.prepare(SQL.failing);
+  assert.equal(readProblems.all(...failing).length, 0, "healthy 10,800-job window reads no problem-index rows");
+  assert.equal(db.prepare(SQL.stale).get(...stale).sweep_at, null, "no completed sweep to read");
+  db.prepare("UPDATE recovery_copy_log SET swept = 1 WHERE kind = 'job' AND at = ?").run(T0);
+  assert.equal(db.prepare(SQL.stale).get(...stale).sweep_at, T0, "one indexed swept row");
+  assert.equal(has(await f.check(T0), FAILING), false);
+  db.prepare("UPDATE recovery_copy_log SET problems = 1 WHERE kind = 'job' AND pass = ?").run(T0 - 15 * MIN);
+  const atLimit = readProblems.all(...failing);
+  assert.equal(atLimit.length, 200);
+  assert.equal(new Set(atLimit.map((r) => r.pass)).size, 1, "the 200 row cap fails safe even for one pass");
+  assert.equal(has(await f.check(T0), FAILING), true);
+  t.diagnostic("10,800 jobs in 6 h and 3,600 in 2 h: 0 healthy / 200 saturated problem-index entries; 0 absent / 1 present sweep-index entry; at most 2 walk and 96 audit candidates");
 });

@@ -576,6 +576,25 @@ fn log_post_trace(job: &Job, outcome: &JobOutcome) {
 
 #[event(scheduled)]
 async fn scheduled(event: ScheduledEvent, env: Env, ctx: ScheduleContext) {
+    let scheduled = UnixMs(event.schedule() as i64);
+    if velmora_bridge::copy::pass_due(scheduled) {
+        let env = env.clone();
+        ctx.wait_until(async move {
+            let ok = match env.d1("CATALOG").map(d1::D1Sql::new) {
+                Ok(db) => recovery_log::prune_tick(
+                    &db,
+                    scheduled,
+                    velmora_bridge::ports::Clock::now(&env::WorkerClock),
+                )
+                .await
+                .is_ok(),
+                Err(_) => false,
+            };
+            if !ok {
+                console_error!("recovery copy: telemetry prune failed");
+            }
+        });
+    }
     let bridge = match env::bridge(&env) {
         Ok(bridge) => bridge,
         Err(class) => {
@@ -586,7 +605,6 @@ async fn scheduled(event: ScheduledEvent, env: Env, ctx: ScheduleContext) {
     // Before the dispatcher and apart from it: the copy reads no
     // catalogue, so a dispatcher that fails or does not return cannot
     // keep a pass from starting.
-    let scheduled = UnixMs(event.schedule() as i64);
     let copy_allowed = bridge.cfg.maintenance != velmora_bridge::config::Maintenance::Restore;
     match env::recovery_store(&env) {
         Ok(None) => {}
@@ -613,8 +631,6 @@ async fn scheduled(event: ScheduledEvent, env: Env, ctx: ScheduleContext) {
                     velmora_bridge::ports::Clock::now(&bridge.clock),
                 );
                 ctx.wait_until(persist_copy_job(env.clone(), log, Default::default(), 1));
-            } else if copy_allowed && recovery_audit::pass_at(scheduled).is_some() {
-                ctx.wait_until(recovery_audit::prune_after_refused_pass(env.clone()));
             }
         }
     }

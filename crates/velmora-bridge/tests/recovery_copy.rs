@@ -281,7 +281,7 @@ async fn independent_audit_classifies_equal_missing_different_refused_and_unavai
         (None, Some(b"no".as_slice()), 1, 0),
         (None, Some(oversized.as_slice()), 1, 0),
         (Some(403), None, 1, 0),
-        (Some(429), None, 1, 0),
+        (Some(429), None, 0, 1),
         (Some(503), None, 0, 1),
         (Some(0), None, 0, 1),
     ] {
@@ -309,6 +309,28 @@ async fn independent_audit_classifies_equal_missing_different_refused_and_unavai
             "one bounded GET per source record"
         );
     }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn audit_slowdown_header_is_unavailable_even_with_another_4xx_status() {
+    use velmora_bridge::audit::audit;
+    let w = World::new();
+    let at = NOW - 2 * 3_600_000;
+    let mut source = AuditShelf::default();
+    source.rows.insert(
+        format!("m/g_{at:013x}_sample"),
+        (2, at, Some(b"ok".to_vec())),
+    );
+    *w.e2.get_answer.borrow_mut() = Some(HttpResponse {
+        status: 400,
+        headers: vec![("x-amz-error-code".into(), "SlowDown".into())],
+        body: vec![],
+    });
+    let counts = audit(&source, &w.remote, &w.clock, UnixMs(NOW), "m/", |_| 0).await;
+    assert_eq!(
+        (counts.checked, counts.problems(), counts.unavailable),
+        (1, 0, 1)
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -356,6 +378,57 @@ async fn random_old_sample_can_compare_a_segment_beyond_the_first_five() {
     )
     .await;
     assert_eq!((result.checked, result.missing), (5, 1));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn old_audit_tries_one_fallback_page_after_an_empty_tenant_probe() {
+    use velmora_bridge::audit::audit;
+    let w = World::new();
+    let mut source = AuditShelf::default();
+    source.rows.insert(
+        "m/art/x_1".into(),
+        (2, NOW - 49 * 3_600_000, Some(b"ok".to_vec())),
+    );
+    w.e2.status.set(Some(503));
+    let counts = audit(
+        &source,
+        &w.remote,
+        &w.clock,
+        UnixMs(NOW),
+        "m/x/t_0000000000000000/",
+        |_| 0,
+    )
+    .await;
+    assert_eq!((counts.checked, counts.unavailable), (1, 1));
+    assert_eq!(
+        source.lists.get(),
+        6,
+        "four recent pages, the empty anchor, one fallback"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn oversized_recent_record_does_not_displace_an_eligible_sample() {
+    use velmora_bridge::audit::audit;
+    let w = World::new();
+    let mut source = AuditShelf::default();
+    let at = NOW - 2 * 3_600_000;
+    for i in 0..10 {
+        let key = format!("m/g_{:013x}_sample", at + i);
+        source
+            .rows
+            .insert(key.clone(), (2, at + i, Some(b"ok".to_vec())));
+        if i != 0 {
+            w.e2.set(&key, b"ok");
+        }
+    }
+    let large = velmora_bridge::remote::MAX_AUDIT_BYTES + 1;
+    source.rows.insert(
+        format!("m/g_{:013x}_large", at + 10),
+        (large, at + 10, None),
+    );
+    let counts = audit(&source, &w.remote, &w.clock, UnixMs(NOW), "m/", |_| 0).await;
+    assert_eq!((counts.checked, counts.missing), (10, 1));
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -455,6 +528,7 @@ struct FakeE2 {
     /// `start-after` of every list request, without the store's prefix.
     asked: RefCell<Vec<String>>,
     put_answer: RefCell<Option<HttpResponse>>,
+    get_answer: RefCell<Option<HttpResponse>>,
     problems: RefCell<Vec<velmora_bridge::remote::Problem>>,
 }
 
@@ -683,6 +757,9 @@ impl HttpSend for &FakeE2 {
             return self.list(query);
         }
         if method == "GET" {
+            if let Some(forced) = self.get_answer.borrow().as_ref() {
+                return Ok(forced.clone());
+            }
             return match self.get(key) {
                 None => answer(404),
                 Some(body) if body.len() > request.max_answer => Err(TransportError::BodyTooLong),

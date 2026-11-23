@@ -9,3 +9,7 @@ CREATE TABLE recovery_copy_log (
     detail   TEXT
 );
 CREATE INDEX recovery_copy_log_kind_at ON recovery_copy_log (kind, at);
+CREATE INDEX recovery_copy_log_problem_at ON recovery_copy_log (at DESC, pass)
+    WHERE kind = 'job' AND problems > 0;
+CREATE INDEX recovery_copy_log_swept_at ON recovery_copy_log (at DESC)
+    WHERE kind = 'job' AND swept = 1;

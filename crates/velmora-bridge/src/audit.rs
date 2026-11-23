@@ -88,7 +88,7 @@ async fn recent(
                 past_end = true;
                 break;
             }
-            if minted >= from {
+            if minted >= from && object.size <= MAX_AUDIT_BYTES as u64 {
                 n += 1;
                 found.push((minted, object));
             }
@@ -111,8 +111,33 @@ async fn recent(
     found
 }
 
+async fn old_page(
+    source: &impl AuditSource,
+    now: UnixMs,
+    after: &str,
+    counts: &mut AuditCounts,
+) -> Vec<AuditEntry> {
+    match source.page(RECORD_PREFIX, after).await {
+        Ok(page) => page
+            .objects
+            .into_iter()
+            .filter(|entry| {
+                // The copier deliberately never sends even the name of a tenant key.
+                !entry.key.starts_with(TENANT_KEY_PREFIX)
+                    && entry.uploaded.0 < now.0 - 48 * HOUR
+                    && entry.size <= MAX_AUDIT_BYTES as u64
+            })
+            .collect(),
+        Err(_) => {
+            counts.source_errors += 1;
+            Vec::new()
+        }
+    }
+}
+
 /// Audit at most ten recent records and five old records from one random
-/// page. Only successful source reads spend a destination GET.
+/// page, with one fallback page if the probe produced no eligible keys.
+/// Only successful source reads spend a destination GET.
 pub async fn audit(
     source: &impl AuditSource,
     remote: &S3Remote<impl HttpSend>,
@@ -129,32 +154,18 @@ pub async fn audit(
         }
     }
     newest(&mut recent_records);
-    let old_records = match source.page(RECORD_PREFIX, random_after).await {
-        Ok(page) => page.objects,
-        Err(_) => {
-            counts.source_errors += 1;
-            Vec::new()
-        }
-    };
-    let within_size = |entry: &AuditEntry| entry.size <= MAX_AUDIT_BYTES as u64;
-    let mut old: Vec<_> = old_records
-        .into_iter()
-        .filter(|entry| {
-            // The copier deliberately never sends even the name of a tenant key.
-            !entry.key.starts_with(TENANT_KEY_PREFIX)
-                && entry.uploaded.0 < now.0 - 48 * HOUR
-                && within_size(entry)
-        })
-        .collect();
+    let mut old = old_page(source, now, random_after, &mut counts).await;
+    if old.is_empty() && random_after != RECORD_PREFIX {
+        // From the start of m/ an empty flat layout naturally falls through
+        // to the tenant layout; no second random anchor can skip both.
+        old = old_page(source, now, RECORD_PREFIX, &mut counts).await;
+    }
     // Select without replacement anywhere on the page, not just its first keys.
     for i in 0..old.len().min(OLD) {
         let remaining = old.len() - i;
         old.swap(i, i + pick_old(remaining) % remaining);
     }
-    let recent = recent_records
-        .into_iter()
-        .map(|(_, entry)| entry)
-        .filter(within_size);
+    let recent = recent_records.into_iter().map(|(_, entry)| entry);
     for entry in recent.chain(old.into_iter().take(OLD)) {
         let bytes = match source.get(&entry.key).await {
             Ok(Some(bytes)) if bytes.len() <= MAX_AUDIT_BYTES => bytes,

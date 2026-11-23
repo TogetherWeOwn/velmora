@@ -8,12 +8,16 @@ use velmora_bridge::{BridgeError, JobOutcome, Row};
 struct Db {
     fail: bool,
     rows: RefCell<Vec<Vec<SqlValue>>>,
+    prunes: RefCell<Vec<Vec<SqlValue>>>,
 }
 
 impl Sql for Db {
     async fn exec(&self, sql: &str, params: &[SqlValue]) -> Result<u64> {
-        assert_eq!(sql, INSERT);
-        self.rows.borrow_mut().push(params.to_vec());
+        match sql {
+            INSERT => self.rows.borrow_mut().push(params.to_vec()),
+            PRUNE => self.prunes.borrow_mut().push(params.to_vec()),
+            _ => panic!("unexpected statement"),
+        }
         if self.fail {
             Err(BridgeError::Sql("fixture error".into()))
         } else {
@@ -129,6 +133,25 @@ fn a_config_refusal_is_a_pass_problem_with_fixed_detail() {
     assert_eq!(
         detail["first"],
         serde_json::json!({"op":"config","kind":"config_error","status":null,"code":null})
+    );
+}
+
+#[test]
+fn prune_tick_needs_only_the_catalogue_and_runs_once_per_pass() {
+    use velmora_bridge::copy::{PASS_INTERVAL_MS, START_WINDOW_MS};
+    let db = Db::default();
+    let due = UnixMs(PASS_INTERVAL_MS * 1000);
+    for offset in [0, START_WINDOW_MS, 2 * START_WINDOW_MS] {
+        let now = UnixMs(due.0 + offset);
+        ready(prune_tick(&db, now, now)).unwrap();
+    }
+    assert_eq!(
+        *db.prunes.borrow(),
+        [vec![SqlValue::Int(due.0 - RETENTION_MS)]]
+    );
+    assert!(
+        db.rows.borrow().is_empty(),
+        "no copy or audit observation needed"
     );
 }
 
