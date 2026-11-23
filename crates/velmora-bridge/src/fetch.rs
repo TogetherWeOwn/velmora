@@ -1179,43 +1179,33 @@ enum Phase {
     Any,
 }
 
-/// Whether this phase counts the provider for the article, regardless
-/// of cooldown or slots. Retention is an estimate: when no enabled
-/// reader retains the article, every enabled reader may still hold it.
-fn can_answer(
-    provider: &ProviderConfig,
-    article: &ArticleRow,
-    now: UnixMs,
-    readers: &[&ProviderConfig],
-    phase: Phase,
-) -> bool {
-    let retains = |p: &ProviderConfig| p.enabled && p.retains(article.posted_at, now);
-    provider.enabled
-        && match phase {
-            Phase::Retained => retains(provider),
-            Phase::Orphan => !readers.iter().copied().any(retains),
-            Phase::Any => true,
-        }
-}
-
-/// Retention at the first data pass and at the current pass. Keep
-/// readers that qualified at the start even across waits and retries.
-#[derive(Clone, Copy)]
-struct Eligibility {
+/// Keep readers that qualified at the start even across waits and retries.
+struct Eligibility<'a, T> {
     first: UnixMs,
-    now: UnixMs,
+    clock: &'a T,
 }
 
-impl Eligibility {
+impl<T: Clock> Eligibility<'_, T> {
+    /// Whether this phase counts the provider, regardless of cooldown
+    /// or slots. When no enabled reader retains an article, every
+    /// enabled reader may still hold it. Check the clock at each decision.
     fn can_answer(
-        self,
+        &self,
         provider: &ProviderConfig,
         article: &ArticleRow,
         readers: &[&ProviderConfig],
         phase: Phase,
     ) -> bool {
-        can_answer(provider, article, self.now, readers, phase)
-            || (self.first != self.now && can_answer(provider, article, self.first, readers, phase))
+        let now = self.clock.now();
+        let at = |at| {
+            let retains = |p: &ProviderConfig| p.enabled && p.retains(article.posted_at, at);
+            match phase {
+                Phase::Retained => retains(provider),
+                Phase::Orphan => !readers.iter().copied().any(retains),
+                Phase::Any => true,
+            }
+        };
+        provider.enabled && (at(now) || (self.first != now && at(self.first)))
     }
 }
 
@@ -1234,8 +1224,6 @@ struct Lost<'p> {
     stored: &'p StoredPlan,
     /// The ciphertext and the answers from the data pass so far.
     data: &'p mut core::cell::RefCell<Board>,
-    /// The retention snapshot used by the data pass.
-    data_at: Eligibility,
     /// How the read ends without a rebuild. [`ColdFetch::Unavailable`] =
     /// every reader that may hold a lost article answered for it.
     end: ColdFetch,
@@ -1275,7 +1263,7 @@ impl Desk<'_> {
         readers: &[&ProviderConfig],
         rows: &[ArticleRow],
         board: &Board,
-        eligibility: Eligibility,
+        eligibility: &Eligibility<'_, impl Clock>,
     ) -> ColdFetch {
         let mut busy = false;
         let mut unasked = false;
@@ -1752,7 +1740,7 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ColdReader<'a, C, N, T> {
         &mut self,
         desk: &mut Desk<'a>,
         readers: &[&'a ProviderConfig],
-        eligibility: Eligibility,
+        eligibility: &Eligibility<'_, T>,
         plan: &[ArticleRow],
         chosen: &[bool],
         board: &core::cell::RefCell<Board>,
@@ -2034,19 +2022,15 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ColdReader<'a, C, N, T> {
         lost: Lost<'_>,
         desk: &mut Desk<'a>,
         readers: &[&'a ProviderConfig],
+        eligibility: &Eligibility<'_, T>,
         put: &mut Option<LocalBoxFuture<'_, ()>>,
     ) -> Result<Option<ColdFetch>> {
         let Lost {
             stored,
             data,
-            data_at,
             mut end,
         } = lost;
         let plan = &stored.rows[..];
-        let mut parity_at = Eligibility {
-            now: self.clock.now(),
-            ..data_at
-        };
         // Every reader answered: what parity cannot make up for is lost.
         let unrecoverable = |end, stats: &core::cell::RefCell<ColdStats>| {
             if end != ColdFetch::Unavailable {
@@ -2089,7 +2073,6 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ColdReader<'a, C, N, T> {
             // budget. Settle it and try once more without waiting for
             // room held by any other request.
             self.settle_prior_write(put, desk).await;
-            parity_at.now = self.clock.now();
             room = self.room.try_charge(need);
         }
         let Some(_room) = room else {
@@ -2101,7 +2084,7 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ColdReader<'a, C, N, T> {
         // places when it is asked for, and gives it up when no provider
         // had it intact.
         let board = core::cell::RefCell::new(Board::new(t * len, vec![0; m], desk.order.len()));
-        let before_parity = (parity_at.now != data_at.now).then(|| desk.out.clone());
+        let before_parity = desk.out.clone();
         let mut free: Vec<usize> = (0..t).rev().collect();
         let mut seat = vec![0usize; m];
         let (mut chosen, mut tried) = (vec![false; m], vec![false; m]);
@@ -2127,58 +2110,62 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ColdReader<'a, C, N, T> {
                 (tried[slot], chosen[slot], seat[slot]) = (true, true, place);
                 board.borrow_mut().starts[slot] = place * len;
             }
-            let read = self.read_rows(desk, readers, parity_at, &parity.articles, &chosen, &board);
+            let read = self.read_rows(
+                desk,
+                readers,
+                eligibility,
+                &parity.articles,
+                &chosen,
+                &board,
+            );
             beside(put, read).await?;
         }
         let board = board.into_inner();
         let usable: Vec<usize> = (0..m).filter(|&slot| board.have[slot]).collect();
-        if let Some(before_parity) = before_parity.filter(|_| usable.len() < t) {
-            // An article can pass the retention of its last reader
-            // while the read is in progress. Ask the newly eligible
-            // readers before calling it lost, keeping prior answers.
-            let newly_eligible = |reader: &ProviderConfig, a: usize| {
-                let eligible = |at: Eligibility| {
-                    at.can_answer(reader, &plan[a], readers, Phase::Retained)
-                        || at.can_answer(reader, &plan[a], readers, Phase::Orphan)
-                };
-                !eligible(data_at) && eligible(parity_at)
-            };
-            if readers
-                .iter()
-                .any(|reader| gaps.iter().any(|&a| newly_eligible(reader, a)))
-            {
-                // Busy from the parity pass says nothing about whether a
-                // slot can be taken now. Leave other refusals in place.
-                let data_board = data.get_mut();
-                desk.retry_slot = vec![SlotRetry::Normal; desk.order.len()];
-                for (i, &reader) in desk.order.iter().enumerate() {
-                    if before_parity[i].is_none()
-                        && desk.out[i] == Some(Out::Busy)
-                        && gaps
-                            .iter()
-                            .any(|&a| data_board.open(a, i) && newly_eligible(reader, a))
-                    {
+        if usable.len() < t {
+            // Readers that finished the data pass without going out
+            // can still have work if a cutoff passed since then. Keep
+            // the board's answers, and give a reader that went Busy
+            // only during parity one more slot attempt for new work.
+            let data_board = data.get_mut();
+            let mut retry_data = false;
+            for (i, &reader) in desk.order.iter().enumerate() {
+                if before_parity[i].is_some() || desk.out[i] == Some(Out::Broken) {
+                    continue;
+                }
+                if gaps.iter().any(|&a| {
+                    data_board.open(a, i)
+                        && (eligibility.can_answer(reader, &plan[a], readers, Phase::Retained)
+                            || eligibility.can_answer(reader, &plan[a], readers, Phase::Orphan))
+                }) {
+                    retry_data = true;
+                    if desk.out[i] == Some(Out::Busy) {
+                        if desk.retry_slot.is_empty() {
+                            desk.retry_slot = vec![SlotRetry::Normal; desk.order.len()];
+                        }
                         desk.out[i] = None;
                         desk.full[i] = false;
                         desk.retry_slot[i] = SlotRetry::Pending;
                     }
                 }
+            }
+            if retry_data {
                 let chosen = vec![true; plan.len()]; // The board skips verified data.
-                let read = self.read_rows(desk, readers, parity_at, plan, &chosen, data);
+                let read = self.read_rows(desk, readers, eligibility, plan, &chosen, data);
                 Box::pin(beside(put, read)).await?;
                 gaps.retain(|&a| !data.get_mut().have[a]);
             }
             if gaps.is_empty() {
                 return Ok(None);
             }
-            end = desk.short(readers, plan, data.get_mut(), parity_at);
+            end = desk.short(readers, plan, data.get_mut(), eligibility);
         }
         if usable.len() < gaps.len() {
             if end != ColdFetch::Unavailable {
                 return Ok(Some(end));
             }
             // A provider that could not be asked may have the rest.
-            return match desk.short(readers, &parity.articles, &board, parity_at) {
+            return match desk.short(readers, &parity.articles, &board, eligibility) {
                 ColdFetch::Unavailable => unrecoverable(end, &self.stats),
                 end => Ok(Some(end)),
             };
@@ -2342,14 +2329,14 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ColdReader<'a, C, N, T> {
         let all = vec![true; plan.len()];
         let eligibility = Eligibility {
             first: *first_eligible_at.get_or_insert(now),
-            now,
+            clock: self.clock,
         };
         // On the heap too: a body nests many futures above this one.
-        let read = self.read_rows(&mut desk, &readers, eligibility, plan, &all, &board);
+        let read = self.read_rows(&mut desk, &readers, &eligibility, plan, &all, &board);
         Box::pin(beside(put, read)).await?;
         let data = board.get_mut();
         if data.have.iter().any(|have| !have) {
-            let end = desk.short(&readers, plan, data, eligibility);
+            let end = desk.short(&readers, plan, data, &eligibility);
             // The extent's parity, if it has any, is read only for
             // articles that are lost where they were asked for: each by
             // a provider that said it has it not, or sent other bytes.
@@ -2362,12 +2349,11 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ColdReader<'a, C, N, T> {
             let lost = Lost {
                 stored: &stored,
                 data: &mut board,
-                data_at: eligibility,
                 end,
             };
             // On the heap: the rebuild is rare, and what it holds across
             // its awaits is not carried by every read that never needs it.
-            let rebuild = self.rebuild(extent, lost, &mut desk, &readers, put);
+            let rebuild = self.rebuild(extent, lost, &mut desk, &readers, &eligibility, put);
             if let Some(end) = Box::pin(rebuild).await? {
                 return Ok(end);
             }

@@ -601,6 +601,22 @@ async fn cold_get_combines_newly_eligible_data_with_parity_after_the_cache_write
 
 #[tokio::test]
 async fn cold_get_retries_newly_eligible_data_without_a_prior_cache_write() {
+    // One millisecond for the dial and one per BODY: the first data
+    // pass starts at the cutoff and crosses it on its first answer.
+    cold_get_across_cutoff_without_a_prior_cache_write(1, 4 + 1).await;
+}
+
+#[tokio::test]
+async fn cold_get_retries_newly_eligible_data_after_the_cutoff_crosses_during_parity() {
+    // The dial and four data BODY requests take 5 ms. The two missing
+    // parity BODY answers then take the clock past the cutoff.
+    cold_get_across_cutoff_without_a_prior_cache_write(6, 4 + 4 + 1).await;
+}
+
+async fn cold_get_across_cutoff_without_a_prior_cache_write(
+    ms_before_cutoff: i64,
+    expected_body_requests: usize,
+) {
     let body = marked_plaintext(THREE);
     let cold = posted_for_get(&body, true, true, None, |cfg| {
         cfg.cold_sockets = 1;
@@ -618,32 +634,108 @@ async fn cold_get_retries_newly_eligible_data_without_a_prior_cache_write() {
         .unwrap()
         .unwrap();
     let missing = &stored.rows[1];
-    let mut src = cold.nntp.raw_client(0).await;
-    let mut dst = cold.nntp.raw_client(1).await;
-    let mut article = Vec::new();
-    src.article_to(&missing.message_id, &mut article)
-        .await
-        .unwrap();
-    dst.post_article(&missing.message_id, &article)
-        .await
-        .unwrap();
-    src.quit().await;
-    dst.quit().await;
+    copy_to_second_reader(&cold.nntp, missing).await;
     cold.nntp.servers[0].hide(&missing.message_id).await;
     cold.nntp.servers[0]
         .hide(&parity.articles[0].message_id)
         .await;
 
-    // One millisecond for the dial and one per BODY: the first data
-    // pass starts at the cutoff and crosses it on its first answer.
     let cutoff = missing.posted_at.unwrap().plus_secs(2 * 86_400);
-    bridge.clock.set(cutoff.plus_ms(-1));
+    bridge.clock.set(cutoff.plus_ms(-ms_before_cutoff));
     bridge.nntp.slow(&bridge.clock, 1);
     let response = cold.get().await;
+    eprintln!("cold GET returned {} bytes", response.body.len());
     response.expect(200);
     assert!(response.body == body, "cold GET returned different bytes");
     assert_eq!(response.stream_error, None);
-    assert_eq!(body_requests(&bridge.nntp), 4 + 4 + 1); // Data, parity, then missing data.
+    assert_eq!(body_requests(&bridge.nntp), expected_body_requests);
+}
+
+#[tokio::test]
+async fn cold_get_drives_the_prior_cache_write_during_the_data_fallback() {
+    let first_len = THREE + 100_000;
+    let body = marked_plaintext(first_len + THREE);
+    let cold = posted_for_get(&body, true, true, None, |cfg| {
+        cfg.max_extent_bytes = first_len as u64;
+        cfg.slice_bytes = first_len as u64;
+        cfg.cold_sockets = 1;
+        cfg.providers[0].retention_days = Some(2);
+        cfg.providers[1].retention_days = Some(1);
+    })
+    .await;
+    let bridge = &cold.svc.bridge;
+    let [first, second] = cold.extents.as_slice() else {
+        panic!("expected two extents");
+    };
+    let stored = bridge.catalog.stored_plan(&second.id).await.unwrap();
+    let parity = stored
+        .parity_plan(&second.id, second.cipher_size)
+        .unwrap()
+        .unwrap();
+    let missing = &stored.rows[1];
+    let shard = &parity.articles[0];
+    copy_to_second_reader(&cold.nntp, missing).await;
+    cold.nntp.servers[0].hide(&missing.message_id).await;
+    cold.nntp.servers[0].hide(&shard.message_id).await;
+
+    // Leave enough budget for parity without settling the held write.
+    let cutoff = missing.posted_at.unwrap().plus_secs(2 * 86_400);
+    bridge.clock.set(cutoff);
+    let cache_key = first.id.cache_key();
+    bridge
+        .cache
+        .hold_put_prefix
+        .replace(Some(cache_key.clone()));
+    let observed = Rc::new(Cell::new(false));
+    before_body({
+        let bridge = Rc::downgrade(bridge);
+        let parity_id = shard.message_id.clone();
+        let missing_id = missing.message_id.clone();
+        let observed = Rc::clone(&observed);
+        move |provider, message_id| {
+            let bridge = bridge.upgrade().unwrap();
+            if provider == "p0" && message_id == parity_id && bridge.clock.now() == cutoff {
+                assert!(
+                    bridge.cache.held.get(),
+                    "parity must start beside the held write"
+                );
+                bridge.clock.advance_ms(1);
+            }
+            if provider != "p1" || message_id != missing_id {
+                return None;
+            }
+            assert!(bridge.cache.hold_put_prefix.replace(None).is_some());
+            let key = cache_key.clone();
+            let observed = Rc::clone(&observed);
+            Some(Box::pin(async move {
+                while bridge.cache.head(&key).await.unwrap().is_none() {
+                    tokio::task::yield_now().await;
+                }
+                observed.set(true);
+            }))
+        }
+    });
+    let response = tokio::time::timeout(std::time::Duration::from_secs(5), cold.get())
+        .await
+        .expect("the first cache write must complete while the fallback BODY is pending");
+    response.expect(200);
+    assert!(
+        observed.get(),
+        "the fallback must read the missing article from p1"
+    );
+    assert_eq!(response.stream_error, None);
+    assert!(response.body == body, "cold GET returned different bytes");
+    assert_eq!(bridge.budget.in_use(), 0);
+}
+
+async fn copy_to_second_reader(nntp: &Rig, row: &ArticleRow) {
+    let mut src = nntp.raw_client(0).await;
+    let mut dst = nntp.raw_client(1).await;
+    let mut article = Vec::new();
+    src.article_to(&row.message_id, &mut article).await.unwrap();
+    dst.post_article(&row.message_id, &article).await.unwrap();
+    src.quit().await;
+    dst.quit().await;
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
