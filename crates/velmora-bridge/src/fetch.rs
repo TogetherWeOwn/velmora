@@ -504,6 +504,9 @@ enum Checked {
     Sized,
     Missing,
     Corrupt,
+    /// Not asked: the connection stood, and the reader's gate said the
+    /// extent is not to be begun ([`read_one`]'s `begin`).
+    NotBegun,
 }
 
 /// How one article is asked of a provider.
@@ -625,6 +628,7 @@ async fn read_one<C: Catalog, N: NntpConnector, T: Clock>(
     ask: Ask,
     wire: &mut Vec<u8>,
     reconnects: &mut u32,
+    begin: Option<&dyn Fn() -> bool>,
 ) -> core::result::Result<Checked, Stop> {
     loop {
         wire.clear();
@@ -636,6 +640,11 @@ async fn read_one<C: Catalog, N: NntpConnector, T: Clock>(
         };
         if fresh && connected.is_ok() {
             session.keep(lease).await?;
+        }
+        // The last point before the command: a connection that was being
+        // opened stands now.
+        if connected.is_ok() && begin.is_some_and(|begin| !begin()) {
+            return Ok(Checked::NotBegun);
         }
         let result = match connected {
             Ok(()) => match session.session().await {
@@ -800,6 +809,8 @@ async fn ask_articles<C: Catalog, N: NntpConnector, T: Clock>(
                     Checked::Corrupt => tally.corrupt.push(row.idx),
                     Checked::Missing => retry.push(row),
                     Checked::Present | Checked::Wire | Checked::Good(_) => tally.ok += 1,
+                    // Never: `check_size` makes none.
+                    Checked::NotBegun => {}
                 }
             }
             first = later;
@@ -813,7 +824,7 @@ async fn ask_articles<C: Catalog, N: NntpConnector, T: Clock>(
         };
         for row in todo {
             session.keep(lease).await?;
-            match read_one(session, lease, row, ask, &mut wire, &mut reconnects).await? {
+            match read_one(session, lease, row, ask, &mut wire, &mut reconnects, None).await? {
                 Checked::Good(payload) => {
                     tally.ok += 1;
                     sink(row, payload);
@@ -826,6 +837,8 @@ async fn ask_articles<C: Catalog, N: NntpConnector, T: Clock>(
                 Checked::Corrupt => tally.corrupt.push(row.idx),
                 Checked::Missing if pass == 0 => retry.push(row),
                 Checked::Missing => tally.missing.push(row.idx),
+                // Never: no gate is given above.
+                Checked::NotBegun => {}
             }
         }
     }
@@ -980,6 +993,8 @@ const MISSING_ASKS: u8 = 2;
 pub struct ColdStats {
     /// Extents read whole and found equal to their digest.
     pub extents: u32,
+    /// Extents whose reading began: their first `BODY` was sent.
+    pub begun: u32,
     /// Slots taken (each is one connection) and sessions that ended on an
     /// error.
     pub opened: u32,
@@ -1013,8 +1028,14 @@ impl core::fmt::Display for ColdStats {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(
             f,
-            "extents={} opened={} open_ms={} broken={} slow={} refetched={}",
-            self.extents, self.opened, self.open_ms, self.broken, self.slow, self.refetched
+            "extents={} begun={} opened={} open_ms={} broken={} slow={} refetched={}",
+            self.extents,
+            self.begun,
+            self.opened,
+            self.open_ms,
+            self.broken,
+            self.slow,
+            self.refetched
         )?;
         for (id, articles, bytes) in &self.share {
             write!(f, " {id}={articles}/{bytes}")?;
@@ -1040,6 +1061,8 @@ struct Board {
     turn: u64,
     /// Sockets with nothing to read that wait for the next turn.
     waiting: Vec<core::task::Waker>,
+    /// A `BODY` of this extent was let go: its reading has begun.
+    begun: bool,
 }
 
 impl Board {
@@ -1134,6 +1157,10 @@ pub(crate) struct ColdReader<'a, C: Catalog, N: NntpConnector, T: Clock> {
     /// on the account's record, and a cooldown begins only after
     /// several. Always empty for a read.
     shunned: Vec<String>,
+    /// Once set, an extent whose first `BODY` was not sent yet is not
+    /// begun: [`Self::fetch`] answers `Busy`. One that was begun reads
+    /// on to its end. Set when the reader of a GET body went away.
+    stop: Option<std::rc::Rc<core::cell::Cell<bool>>>,
 }
 
 /// The tier a reader asks `p` in, lowest first. A read: its `priority`.
@@ -1478,6 +1505,13 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ColdReader<'a, C, N, T> {
         self.fetch_planned(extent, plan).await
     }
 
+    /// From now on, an extent is not begun once `stop` is set (see
+    /// `stop`); the slots and connections it took meanwhile stay with
+    /// the reader until it is closed.
+    pub(crate) fn stop_with(&mut self, stop: std::rc::Rc<core::cell::Cell<bool>>) {
+        self.stop = Some(stop);
+    }
+
     /// [`Self::fetch`] with the extent's article rows already read.
     pub(crate) async fn fetch_planned(
         &mut self,
@@ -1538,6 +1572,7 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ColdReader<'a, C, N, T> {
             providers: order.len(),
             turn: 0,
             waiting: Vec::new(),
+            begun: false,
         });
         let mut out: Vec<Option<Out>> = vec![None; order.len()];
         let mut full = vec![false; order.len()];
@@ -1548,6 +1583,7 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ColdReader<'a, C, N, T> {
         // Sessions of a provider that broke off in this read.
         let mut breaks = vec![0u32; order.len()];
         let mut failure = None;
+        let stop = self.stop.clone();
         // A drill has a third: its answer says whether Usenet has the
         // object, so before it says no, every reader is asked for what is
         // still missing, whatever retention it states. (A reader past its
@@ -1626,20 +1662,43 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ColdReader<'a, C, N, T> {
                     .partition(|s| index(s).is_some_and(|i| out[i].is_none()));
                 self.sessions = kept;
                 ProviderSession::close_all(other).await;
+                // An extent that was not begun is not begun once its
+                // reader is told to stop: neither here, nor by a socket
+                // whose connection stands only later.
+                let stopped = || stop.as_ref().is_some_and(|stop| stop.get());
+                if !board.borrow().begun && stopped() {
+                    return Ok(ColdFetch::Busy);
+                }
+                let begin = || {
+                    let mut b = board.borrow_mut();
+                    if !b.begun {
+                        if stopped() {
+                            return false;
+                        }
+                        b.begun = true;
+                        stats.borrow_mut().begun += 1;
+                    }
+                    true
+                };
                 let ended = join_all(self.sessions.iter_mut().map(|session| {
-                    let (board, plan, wanted, out) = (&board, &plan, &wanted, &out);
+                    let (board, plan, wanted, out, begin) = (&board, &plan, &wanted, &out, &begin);
                     let provider = index(session);
                     async move {
                         let Some(provider) = provider.filter(|&i| out[i].is_none()) else {
                             return Ok(Pace::default());
                         };
-                        read_shared(session, provider, plan, board, stats, |a| {
+                        read_shared(session, provider, plan, board, stats, begin, |a| {
                             wanted(provider, a)
                         })
                         .await
                     }
                 }))
                 .await;
+                if !board.borrow().begun && stopped() {
+                    // The slots and connections stay with the reader
+                    // until it is closed.
+                    return Ok(ColdFetch::Busy);
+                }
                 // A session that stopped is closed; its provider is out
                 // once it has no session left, or once more of its
                 // sessions broke off than one session may reconnect.
@@ -1839,6 +1898,7 @@ async fn read_shared<C: Catalog, N: NntpConnector, T: Clock>(
     plan: &[ArticleRow],
     board: &core::cell::RefCell<Board>,
     stats: &core::cell::RefCell<ColdStats>,
+    begin: &dyn Fn() -> bool,
     wanted: impl Fn(usize) -> bool,
 ) -> core::result::Result<Pace, Stop> {
     let mut wire = Vec::new();
@@ -1881,8 +1941,16 @@ async fn read_shared<C: Catalog, N: NntpConnector, T: Clock>(
                 // article that was not delivered.
                 let stands = session.session.is_some();
                 let began = session.clock.now();
-                let read =
-                    read_one(session, None, row, Ask::Wire, &mut wire, &mut reconnects).await;
+                let read = read_one(
+                    session,
+                    None,
+                    row,
+                    Ask::Wire,
+                    &mut wire,
+                    &mut reconnects,
+                    Some(begin),
+                )
+                .await;
                 if stands && matches!(read, Ok(Checked::Wire)) {
                     pace.articles += 1;
                     pace.ms += session.clock.now().0 - began.0;
@@ -1928,6 +1996,8 @@ async fn read_shared<C: Catalog, N: NntpConnector, T: Clock>(
             }
             // Not asked for.
             Checked::Good(_) | Checked::Present | Checked::Sized => b.asks[slot] = MISSING_ASKS,
+            // The extent is not begun: this socket reads nothing more.
+            Checked::NotBegun => return Ok(pace),
         }
     }
 }
@@ -1957,6 +2027,7 @@ where
             stats: Default::default(),
             drill: false,
             shunned: Vec::new(),
+            stop: None,
         })
     }
 

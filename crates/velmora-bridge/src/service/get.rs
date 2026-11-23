@@ -27,7 +27,7 @@ use crate::fetch::{
     cold_fetch_bytes, cold_poll_ms, cold_read_bytes, cold_step_bytes, ColdFetch, ColdReader,
     COLD_WAIT_MS,
 };
-use crate::ingress::{ByteBudget, Charge, Spawner, CHARGE_WAIT_MS};
+use crate::ingress::{ByteBudget, Charge, Sleeper, Spawner, CHARGE_WAIT_MS};
 use crate::ports::{BlobStore, Bridge, Catalog, Clock, JobSink, Kek, NntpConnector};
 use crate::types::{
     BridgeError, Bucket, ByteSpan, ExtentId, ExtentRow, RespBody, Result, S3Request, S3Response,
@@ -457,9 +457,11 @@ async fn body<
     // sees a body shorter than Content-Length.
     let bridge = Rc::clone(bridge);
     let spawner = bridge.budget.spawner().cloned();
+    let sleeper = bridge.budget.sleeper().cloned();
     let mut items = driven(spawner.as_ref(), move |out| {
         relay(bridge, bucket, todo, out)
-    });
+    })
+    .cut_off_with(sleeper);
     // The first piece is produced before the status line goes out, so an
     // object that cannot be read is an error response, not a cut-off 200.
     let first = match items.next().await {
@@ -500,7 +502,21 @@ struct Shared<T> {
     /// Counts the future in [`detached_bodies`] from the drop of its
     /// stream until it returns.
     detached: RefCell<Option<Detached>>,
+    /// The timer of [`DETACHED_BODY_MS`], if the host has one.
+    sleeper: RefCell<Option<Sleeper>>,
+    /// Runs from the drop of the stream: when it ends, a future still
+    /// running is dropped.
+    cutoff: RefCell<Option<LocalBoxFuture<'static, ()>>>,
 }
+
+/// How long a body future may run on after its stream was dropped
+/// ([`Driven`]) before it is dropped with all it holds: its connections,
+/// slots and budget charges. Under the 30 s a host waits for detached
+/// work after a response, so the drop runs while the invocation is still
+/// alive; a future the runtime stopped polling later would keep its
+/// charges for the life of the isolate. A read of one extent and its
+/// cache write take a few seconds.
+pub const DETACHED_BODY_MS: u32 = 25_000;
 
 thread_local! {
     static DETACHED_BODIES: Cell<usize> = const { Cell::new(0) };
@@ -676,6 +692,8 @@ fn driven<T: 'static, F: Future<Output = ()> + 'static>(
         wanted: Cell::new(false),
         gone: Rc::new(Cell::new(false)),
         detached: RefCell::new(None),
+        sleeper: RefCell::new(None),
+        cutoff: RefCell::new(None),
     });
     let work = make(Out {
         shared: Rc::downgrade(&shared),
@@ -688,6 +706,19 @@ fn driven<T: 'static, F: Future<Output = ()> + 'static>(
         spawn(
             poll_fn(move |cx| {
                 *shared.task.borrow_mut() = Some(cx.waker().clone());
+                let cut = {
+                    let mut cutoff = shared.cutoff.borrow_mut();
+                    cutoff
+                        .as_mut()
+                        .is_some_and(|timer| timer.as_mut().poll(cx).is_ready())
+                };
+                if cut {
+                    // Ran on too long without its reader: dropped, after
+                    // the borrows ended.
+                    drop(shared.cutoff.borrow_mut().take());
+                    let work = shared.work.borrow_mut().take();
+                    drop(work);
+                }
                 shared.run(cx);
                 let over = shared.work.borrow().is_none();
                 if over {
@@ -710,6 +741,16 @@ fn driven<T: 'static, F: Future<Output = ()> + 'static>(
     Driven {
         shared,
         spawned: spawner.is_some(),
+    }
+}
+
+impl<T> Driven<T> {
+    /// A future that runs on without its reader is dropped
+    /// [`DETACHED_BODY_MS`] after the stream, on this timer. Without one
+    /// it runs to its end.
+    fn cut_off_with(self, sleeper: Option<Sleeper>) -> Self {
+        *self.shared.sleeper.borrow_mut() = sleeper;
+        self
     }
 }
 
@@ -759,6 +800,12 @@ impl<T> Drop for Driven<T> {
             // for detached work checks right after the stream is gone.
             *shared.detached.borrow_mut() = Some(Detached::start());
             shared.gone.set(true);
+            let cutoff = shared
+                .sleeper
+                .borrow()
+                .as_ref()
+                .map(|sleep| sleep(DETACHED_BODY_MS));
+            *shared.cutoff.borrow_mut() = cutoff;
         } else {
             // Taken out first: what the future holds is dropped after
             // the borrow ended.
@@ -978,6 +1025,33 @@ fn open<K: Kek>(kek: &K, bucket: &Bucket, piece: &Piece, base: u64, src: &[u8]) 
     )
     .ok()?;
     (n == plain.len()).then_some(plain)
+}
+
+/// Bytes of plaintext a piece is authenticated in at a time when nobody
+/// takes it ([`authentic`]).
+const CHECK_WINDOW: usize = 64 * 1024;
+
+/// Whether every chunk of `piece` in the whole extent's ciphertext `src`
+/// authenticates, as [`open`] would find, without holding its plaintext:
+/// it is opened one window at a time into one small buffer.
+fn authentic<K: Kek>(kek: &K, bucket: &Bucket, piece: &Piece, src: &[u8]) -> bool {
+    let Ok(bdk) = unwrap_bdk(kek, bucket.kek_version, &bucket.id, &bucket.bdk_wrapped) else {
+        return false;
+    };
+    let Ok(len) = usize::try_from(piece.len) else {
+        return false;
+    };
+    let mut buf = vec![0u8; len.min(CHECK_WINDOW)];
+    let mut done = 0usize;
+    while done < len {
+        let n = (len - done).min(CHECK_WINDOW);
+        let off = piece.off + done as u64;
+        match open_range(&bdk, &bucket.id, &piece.extent, 0, src, off, &mut buf[..n]) {
+            Ok(got) if got == n => done += n,
+            _ => return false,
+        }
+    }
+    true
 }
 
 /// A blob-store read of exactly `span`. A missing, short or failing read
@@ -1209,17 +1283,30 @@ where
     }
 
     /// Lets the cache write end, with the connections watched as in
-    /// [`Self::wait`].
+    /// [`Self::wait`]. Once the reader of the body is gone, the
+    /// connections are ended as soon as it goes, not when the write ends.
     async fn settle(&mut self) {
         if let (Some(limit), Some(put)) = (self.limit(), self.put.as_mut()) {
-            if matches!(select(put, limit).await, Either::Left(_)) {
+            let gone = Rc::clone(&self.gone);
+            let stop = async move {
+                let left = core::pin::pin!(poll_fn(|_| match gone.get() {
+                    true => Poll::Ready(()),
+                    false => Poll::Pending,
+                }));
+                let _ = select(limit, left).await;
+            };
+            if matches!(select(put, core::pin::pin!(stop)).await, Either::Left(_)) {
                 self.put = None;
                 return;
             }
             self.hang_up().await;
         }
-        if let Some(writing) = self.put.take() {
+        // Awaited where it is: a caller that is cancelled meanwhile (a
+        // wait that ends when the reader goes) leaves the write in place,
+        // for `end` to finish.
+        if let Some(writing) = self.put.as_mut() {
             writing.await;
+            self.put = None;
         }
     }
 
@@ -1345,6 +1432,22 @@ where
         Err(ReadFail::Unavailable)
     }
 
+    /// Starts the cache write of verified ciphertext, under `copy`, its
+    /// charge, which ends with the write. One write at a time: the one
+    /// before has settled.
+    fn write(&mut self, extent: &ExtentRow, cipher: Vec<u8>, copy: Charge) {
+        let bridge = self.bridge;
+        let (extent, spent) = (extent.clone(), Rc::clone(&self.spent));
+        let write = async move {
+            // Verified already: a cache that does not take the copy does
+            // not fail the read.
+            let fill = bridge.cache_fill(&extent, cipher);
+            let _ = Spent::time(&bridge.clock, &spent.put, fill).await;
+            drop(copy);
+        };
+        self.put = Some(write.boxed_local());
+    }
+
     async fn piece(&mut self, bucket: &Bucket, piece: &Piece) -> Item {
         let bridge = self.bridge;
         let extent = &piece.extent;
@@ -1400,7 +1503,13 @@ where
             }
             let reader = match &mut self.reader {
                 Some(reader) => reader,
-                none => none.insert(bridge.cold_reader().map_err(|_| ReadFail::Internal)?),
+                none => {
+                    let mut reader = bridge.cold_reader().map_err(|_| ReadFail::Internal)?;
+                    // An extent whose first BODY was not sent when the
+                    // reader of the body went away is not begun.
+                    reader.stop_with(Rc::clone(&gone));
+                    none.insert(reader)
+                }
             };
             let fetched = Spent::time(&bridge.clock, &self.spent.read, reader.fetch(extent));
             let read = beside(&mut self.put, fetched).await;
@@ -1411,6 +1520,22 @@ where
                     self.settle().await;
                     let waited = bridge.clock.now().0 - began.0;
                     self.spent.wait.set(self.spent.wait.get() + waited);
+                    if gone.get() {
+                        // Nobody takes the piece: no plaintext is made,
+                        // so the read needs no more room than it holds,
+                        // which covers the ciphertext. Its chunks of the
+                        // piece are authenticated all the same, in a
+                        // small buffer inside that charge, before the
+                        // extent is written to the cache.
+                        if !authentic(&bridge.kek, bucket, piece, &cipher) {
+                            return Err(ReadFail::Unavailable);
+                        }
+                        drop(work);
+                        if let Some(copy) = room.try_charge(cipher.len() as u64) {
+                            self.write(extent, cipher, copy);
+                        }
+                        return Err(ReadFail::Busy);
+                    }
                     // What a read beside that write left uncharged. The
                     // write has released as much, but another request
                     // may have taken it. Then the extent is given up
@@ -1441,15 +1566,7 @@ where
                         .try_charge(plain.len() as u64)
                         .ok_or(ReadFail::Internal)?;
                     if let Some(copy) = room.try_charge(cipher.len() as u64) {
-                        let (extent, spent) = (extent.clone(), Rc::clone(&self.spent));
-                        let write = async move {
-                            // Verified already: a cache that does not
-                            // take the copy does not fail the read.
-                            let fill = bridge.cache_fill(&extent, cipher);
-                            let _ = Spent::time(&bridge.clock, &spent.put, fill).await;
-                            drop(copy);
-                        };
-                        self.put = Some(write.boxed_local());
+                        self.write(extent, cipher, copy);
                     }
                     return Ok((plain, held));
                 }
@@ -1855,6 +1972,52 @@ mod tests {
         assert_eq!(dropped.get(), 0);
         host.tasks.borrow_mut().clear();
         assert_eq!(dropped.get(), 1, "the future is gone with its task");
+        assert_eq!(detached_bodies(), 0);
+    }
+
+    /// A future that runs on without its reader for longer than
+    /// [`DETACHED_BODY_MS`] is dropped then, with what it holds, and its
+    /// count goes: nothing is held past the host's wait for it.
+    #[test]
+    fn a_detached_future_is_dropped_at_its_cutoff() {
+        let host = Host::default();
+        let asked = Rc::new(RefCell::new(Vec::new()));
+        let over = Rc::new(Cell::new(false));
+        let (log, fire) = (Rc::clone(&asked), Rc::clone(&over));
+        let sleeper: Sleeper = Rc::new(move |ms| {
+            log.borrow_mut().push(ms);
+            let fire = Rc::clone(&fire);
+            poll_fn(move |_| match fire.get() {
+                true => Poll::Ready(()),
+                false => Poll::Pending,
+            })
+            .boxed_local()
+        });
+        let dropped = Rc::new(Cell::new(0u32));
+        let in_future = Held(Rc::clone(&dropped));
+        let items = Box::pin(
+            driven(Some(&host.spawner()), move |out: Out<u32>| async move {
+                let _held = in_future;
+                out.send(1).await;
+                core::future::pending::<()>().await;
+            })
+            .cut_off_with(Some(sleeper)),
+        );
+        host.turn();
+        assert!(
+            asked.borrow().is_empty(),
+            "no timer while the reader is there"
+        );
+        drop(items);
+        assert_eq!(*asked.borrow(), [DETACHED_BODY_MS]);
+        host.turn();
+        assert_eq!(host.running(), 1);
+        assert_eq!(detached_bodies(), 1);
+        assert_eq!(dropped.get(), 0);
+        over.set(true);
+        host.turn();
+        assert_eq!(dropped.get(), 1, "dropped at the cutoff");
+        assert_eq!(host.running(), 0);
         assert_eq!(detached_bodies(), 0);
     }
 

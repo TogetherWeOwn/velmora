@@ -1348,7 +1348,7 @@ async fn a_disconnect_lets_the_usenet_read_under_way_finish_and_starts_no_other(
         );
         let lines = cold_lines();
         assert_eq!(lines.len(), 1, "{lines:?}");
-        assert!(lines[0].starts_with("extents=1 "), "{lines:?}");
+        assert!(lines[0].starts_with("extents=1 begun=1 "), "{lines:?}");
         assert!(lines[0].ends_with(" reader_gone=1"), "{lines:?}");
     };
     local.run_until(test).await;
@@ -1395,6 +1395,210 @@ async fn a_disconnect_ends_a_wait_for_a_slot_without_a_read() {
         all_given_back(rig).await;
         assert!(!cached(rig, &extents[1]));
         assert!(counted_as_cached(rig, &extents[1]));
+    };
+    local.run_until(test).await;
+}
+
+/// A client that goes away while its body opens the connections for the
+/// next extent: the extent is not begun, no BODY is sent, and the
+/// connections it opened are ended.
+#[tokio::test(flavor = "current_thread")]
+async fn a_disconnect_before_the_first_body_of_an_extent_begins_no_read() {
+    let local = tokio::task::LocalSet::new();
+    let test = async {
+        let cold = cold_rig_on(2, Some(real_sleeper()), Some(local_spawner())).await;
+        let rig = &cold.rig;
+        let parts = [pattern(161, 300_000), pattern(162, 300_000)];
+        // The first piece comes from the cache: the second extent's read
+        // opens its connections first.
+        let extents = cold_parts(&cold, "multi", &parts, &[0], &[]).await;
+        let server = &cold.server;
+        server.set_hold_logins(true).await;
+        let asked = server.bodies_asked().await;
+
+        let mut body = open_body(&cold, "multi").await;
+        assert!(body.next().await.unwrap().unwrap() == parts[0]);
+        for _ in 0..400 {
+            if server.logins_held().await > 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(
+            server.logins_held().await > 0,
+            "a connection is being opened"
+        );
+        drop(body);
+        assert_eq!(detached_bodies(), 1);
+        server.set_hold_logins(false).await;
+        all_given_back(rig).await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(server.bodies_asked().await, asked, "no BODY was sent");
+        assert!(!cached(rig, &extents[1]));
+        assert!(counted_as_cached(rig, &extents[1]));
+    };
+    local.run_until(test).await;
+}
+
+/// A client that goes away while an extent is read beside the cache
+/// write of the one before, under the part of its charge that reading
+/// needs: when the write ends, another request takes the room it gave
+/// back. The read still finishes and lands in the cache, since nobody
+/// takes its plaintext: it is authenticated without making it.
+#[tokio::test(flavor = "current_thread")]
+async fn a_disconnect_keeps_the_fill_when_the_room_to_open_it_is_taken() {
+    let local = tokio::task::LocalSet::new();
+    let test = async {
+        let cold = cold_rig_on(2, Some(real_sleeper()), Some(local_spawner())).await;
+        let rig = &cold.rig;
+        // The second extent is larger than the wire text of the sockets
+        // after the first: beside a write it is read under the lean
+        // charge only.
+        let parts = [
+            pattern(171, 300_000),
+            pattern(172, 5_000_000),
+            pattern(173, 300_000),
+        ];
+        let extents = cold_parts(&cold, "multi", &parts, &[], &[]).await;
+        let (server, cache, budget) = (&cold.server, &rig.bridge.cache, &rig.bridge.budget);
+        *cache.hold_put_prefix.borrow_mut() = Some(extents[0].id.cache_key());
+        let first = rig
+            .bridge
+            .catalog
+            .articles(&extents[0].id)
+            .await
+            .unwrap()
+            .len();
+        let asked = server.bodies_asked().await;
+        server.set_hold_bodies_after(Some(asked + first)).await;
+
+        let mut body = open_body(&cold, "multi").await;
+        assert!(body.next().await.unwrap().unwrap() == parts[0]);
+        for _ in 0..400 {
+            if server.bodies_asked().await > asked + first {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(
+            server.bodies_asked().await > asked + first,
+            "the second extent is read"
+        );
+        assert!(cache.held.get(), "beside the first extent's write");
+        drop(body);
+        *cache.hold_put_prefix.borrow_mut() = None;
+        eventually("the first write ends", || cached(rig, &extents[0])).await;
+        // Another request takes every byte of room that is left.
+        let hog = budget
+            .try_charge(budget.capacity() - budget.in_use())
+            .expect("the room that is left");
+        server.set_hold_bodies_after(None).await;
+        eventually("the detached body ends", || detached_bodies() == 0).await;
+        assert!(cached(rig, &extents[1]), "the read under way was cached");
+        assert!(!cached(rig, &extents[2]));
+        drop(hog);
+        all_given_back(rig).await;
+        for extent in &extents {
+            assert!(counted_as_cached(rig, extent));
+        }
+    };
+    local.run_until(test).await;
+}
+
+/// A client that goes away while an extent is read, and the provider
+/// then breaks off every BODY: the read is not tried again for nobody,
+/// nothing is cached, and everything is given back once.
+#[tokio::test(flavor = "current_thread")]
+async fn a_disconnect_racing_a_provider_error_gives_everything_back_once() {
+    let local = tokio::task::LocalSet::new();
+    let test = async {
+        let cold = cold_rig_on(2, Some(real_sleeper()), Some(local_spawner())).await;
+        let rig = &cold.rig;
+        let parts = [
+            pattern(181, 300_000),
+            pattern(182, 300_000),
+            pattern(183, 300_000),
+        ];
+        let extents = cold_parts(&cold, "multi", &parts, &[0], &[]).await;
+        let server = &cold.server;
+        server.set_hold_bodies(true).await;
+        let asked = server.bodies_asked().await;
+
+        let mut body = open_body(&cold, "multi").await;
+        assert!(body.next().await.unwrap().unwrap() == parts[0]);
+        for _ in 0..400 {
+            if server.bodies_asked().await > asked {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(server.bodies_asked().await > asked);
+        // The provider error and the disconnect land together.
+        server.drop_next_bodies(1_000).await;
+        drop(body);
+        server.set_hold_bodies(false).await;
+        all_given_back(rig).await;
+        server.drop_next_bodies(0).await;
+        let read = server.bodies_asked().await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(server.bodies_asked().await, read, "not tried again");
+        assert!(!cached(rig, &extents[1]) && !cached(rig, &extents[2]));
+        for extent in &extents {
+            assert!(counted_as_cached(rig, extent));
+        }
+    };
+    local.run_until(test).await;
+}
+
+/// A client that goes away while a piece waits for room behind the cache
+/// write of an extent read earlier, with no connection open: the wait
+/// ends, and the write it waited for still completes and is counted.
+#[tokio::test(flavor = "current_thread")]
+async fn a_disconnect_during_a_wait_for_room_keeps_the_write_it_waited_for() {
+    let local = tokio::task::LocalSet::new();
+    let test = async {
+        let cold = cold_rig_on(2, Some(real_sleeper()), Some(local_spawner())).await;
+        let rig = &cold.rig;
+        let parts = [
+            pattern(191, 300_000),
+            pattern(192, 300_000),
+            pattern(193, 300_000),
+            pattern(194, 300_000),
+        ];
+        // The third is in the cache: serving it ends the connections.
+        let extents = cold_parts(&cold, "multi", &parts, &[2], &[]).await;
+        let (cache, budget) = (&rig.bridge.cache, &rig.bridge.budget);
+        *cache.hold_put_prefix.borrow_mut() = Some(extents[1].id.cache_key());
+
+        let mut body = open_body(&cold, "multi").await;
+        assert!(body.next().await.unwrap().unwrap() == parts[0]);
+        assert!(body.next().await.unwrap().unwrap() == parts[1]);
+        eventually("the third piece waits, beside the held write", || {
+            cache.held.get()
+                && rig.bridge.nntp.live() == 0
+                && budget.in_use() == parts[2].len() as u64 + extents[1].cipher_size
+        })
+        .await;
+        // Every byte of room that is left goes to another request: the
+        // fourth piece waits for the held write to give its room back.
+        let hog = budget
+            .try_charge(budget.capacity() - budget.in_use())
+            .expect("the room that is left");
+        assert!(body.next().await.unwrap().unwrap() == parts[2]);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(!cached(rig, &extents[1]));
+        drop(body);
+        assert_eq!(detached_bodies(), 1);
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        *cache.hold_put_prefix.borrow_mut() = None;
+        eventually("the detached body ends", || detached_bodies() == 0).await;
+        assert!(cached(rig, &extents[1]), "the write waited for completed");
+        assert!(!cached(rig, &extents[3]));
+        drop(hog);
+        all_given_back(rig).await;
+        for extent in &extents {
+            assert!(counted_as_cached(rig, extent));
+        }
     };
     local.run_until(test).await;
 }

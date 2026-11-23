@@ -11,7 +11,9 @@ mod common;
 mod copy;
 mod delete;
 mod get;
-pub use get::{detached_bodies, INTERRUPTED_RETRIES, PIECE_WAIT_MS, READ_STAMP_MS};
+pub use get::{
+    detached_bodies, DETACHED_BODY_MS, INTERRUPTED_RETRIES, PIECE_WAIT_MS, READ_STAMP_MS,
+};
 mod list;
 mod multipart;
 mod multipart_list;

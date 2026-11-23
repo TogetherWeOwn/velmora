@@ -1029,15 +1029,20 @@ if [[ $MODE == local && ${E2E_SLOT_WAIT:-} == push ]]; then
       fail "disconnect a cold GET" 'stream: client went away, body dropped within 10 s' 'line not found'
     log 'cold GET disconnect: stream: client went away, body dropped'
     # The GET's connections end: one cold-read line each time a reader
-    # closes, with how many extents it read from Usenet.
-    read_lines() { log_since_abort | grep -o 'cold read: extents=[0-9]*' || true; }
+    # closes, with the extents it read whole from Usenet and the extents
+    # whose first BODY it sent.
+    read_lines() { log_since_abort | grep -o 'cold read: extents=[0-9]* begun=[0-9]*' || true; }
     reader_closed() { [[ -n $(read_lines) ]]; }
     poll 40 0.5 reader_closed ||
-      fail "disconnect a cold GET" "a 'cold read: extents=N' line within 40 s" 'line not found'
-    read=$(read_lines | awk -F= '{ n += $2 } END { print n + 0 }')
-    log "cold GET disconnect: $(read_lines | tr '\n' ' ')($read extents read from Usenet)"
+      fail "disconnect a cold GET" "a 'cold read: extents=N begun=M' line within 40 s" 'line not found'
+    read=$(read_lines | sed 's/.*extents=\([0-9]*\).*/\1/' | awk '{ n += $1 } END { print n + 0 }')
+    begun=$(read_lines | sed 's/.*begun=\([0-9]*\).*/\1/' | awk '{ n += $1 } END { print n + 0 }')
+    log "cold GET disconnect: $(read_lines | tr '\n' ' ')($read of $begun begun extents read from Usenet)"
     [[ $read == 1 || $read == 2 ]] ||
       fail "disconnect a cold GET" "1 or 2 extents read from Usenet for a two-extent range" "$read"
+    # A read under way when the client left reads on to its end.
+    [[ $read == "$begun" ]] ||
+      fail "disconnect a cold GET" "every begun extent read whole ($begun)" "$read"
     # Every extent read from Usenet, also the one under way when the client
     # left, is verified and lands in the cache (the fill survives).
     filled() {
@@ -1052,26 +1057,30 @@ if [[ $MODE == local && ${E2E_SLOT_WAIT:-} == push ]]; then
     fi
     log "cold GET disconnect: the $read extent(s) read from Usenet are in the cache"
     # No slot of the provider stays held for the GET that was cut off
-    # (local status: a throwaway D1 with a handful of outbox rows).
+    # (local status: a throwaway D1 with a handful of outbox rows). 20 s
+    # is under the 35 s a read slot lasts unrenewed, so only a release
+    # passes.
     no_slot_held() {
       local j
       j=$(adm_try "$BASE/_admin/status") || return 1
       jq -e 'all(.providers[]; .held == 0)' >/dev/null 2>&1 <<<"$j"
     }
-    if ! poll 40 0.5 no_slot_held; then
+    if ! poll 20 0.5 no_slot_held; then
       json=$(adm "GET /_admin/status" "$BASE/_admin/status")
-      fail "disconnect a cold GET" "no provider slot held within 40 s" "$(jq -c '[.providers[] | {id, held, holders}]' <<<"$json")"
+      fail "disconnect a cold GET" "no provider slot held within 20 s" "$(jq -c '[.providers[] | {id, held, holders}]' <<<"$json")"
     fi
     log 'cold GET disconnect: no provider slot is held'
-    # No read from Usenet starts after the disconnect: no further reader
-    # closes, and no other extent of the object fills.
+    # Nothing more is read once the fill ended: no further reader closes,
+    # and no other extent of the object fills. Whether an extent the GET
+    # had not begun is begun after the disconnect needs a held read to
+    # tell apart; the native disconnect tests hold one.
     after_fill=$(stat -c '%s' "$T/wrangler.log")
     sleep 3
     more=$(tail -c "+$((after_fill + 1))" "$T/wrangler.log" | grep -c 'cold read: ' || true)
     [[ $more == 0 ]] || fail "disconnect a cold GET" "no cold read for 3 s after the fill" "$more line(s)"
     json=$(adm "GET /_admin/objects/$SB/a/big.bin" "$BASE/_admin/objects/$SB/a/big.bin")
     jcheck "no other extent read after the disconnect" '.extents[2:] | all(.cache == "absent")' "$json"
-    log 'cold GET disconnect: no read from Usenet started after it'
+    log 'cold GET disconnect: nothing more read from Usenet after the fill'
     adm 're-evict a/big.bin after disconnect' -XPOST "$BASE/_admin/evict/$SB/a/big.bin?include_safety=1" >/dev/null
   elif [[ ${CI:-} == true ]]; then
     # On CI this leg exists to run the check: a skip would pass unseen.

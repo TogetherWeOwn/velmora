@@ -464,7 +464,15 @@ async fn wait_for_detached_opens<F: Future<Output = ()>>(
     wait_for_detached(body_done, delay, detached_work).await;
 }
 
-/// Waits for `body_done`, then while `busy`, for 30 s at most.
+/// How long an invocation waits for detached work after its response
+/// body ended (the runtime's `waitUntil` bound).
+const DRAIN_MS: u64 = 30_000;
+
+// A body future that runs on after its client left is dropped, with its
+// charges, while the invocation still waits for it.
+const _: () = assert!((velmora_bridge::service::DETACHED_BODY_MS as u64) < DRAIN_MS);
+
+/// Waits for `body_done`, then while `busy`, for [`DRAIN_MS`] at most.
 async fn wait_for_detached<F: Future<Output = ()>>(
     body_done: impl Future<Output = ()>,
     delay: impl Fn(Duration) -> F,
@@ -476,7 +484,7 @@ async fn wait_for_detached<F: Future<Output = ()>>(
             delay(Duration::from_millis(50)).await;
         }
     };
-    let timeout = delay(Duration::from_secs(30));
+    let timeout = delay(Duration::from_millis(DRAIN_MS));
     let _ = futures_util::future::select(std::pin::pin!(drain), std::pin::pin!(timeout)).await;
 }
 
