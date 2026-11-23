@@ -954,6 +954,26 @@ async fn a_job_in_the_line_asks_again_when_a_cooldown_ends() {
 }
 
 #[tokio::test]
+async fn a_job_refreshes_its_providers_when_cooldown_cuts_short_a_restart_wait() {
+    let mut rig = rig(&[spec("bb0", 5), spec("bb1", 5)]).await;
+    rig.with_timer();
+    let s = rig.seed(1, &[7; 1000]).await;
+    let now = rig.bridge.clock.now();
+    let back = 140_000;
+    let catalog = &rig.bridge.catalog;
+    catalog.cool_from("p0", now, now.plus_ms(back));
+    rig.take_slots(1, now.plus_secs(40)).await;
+    catalog.line.set(Some(SlotWait::Elapsed));
+    catalog.line_restart_ms.set(155_000);
+
+    assert_eq!(rig.run_post(&s).await, JobOutcome::Ack);
+    assert_eq!(catalog.line_waits.borrow().len(), 1);
+    assert_eq!(catalog.line_hard_ms.get(), back);
+    assert!(all_posted_by(&rig.plan(&s).await, "p0"));
+    assert_eq!(rig.servers[1].posted_count().await, 0);
+}
+
+#[tokio::test]
 async fn a_backup_leaving_cooldown_does_not_end_the_first_tiers_wait() {
     let mut rig = rig(&[spec("bb0", 5), spec("bb1", 5)]).await;
     rig.bridge.cfg.providers[1].priority = 1;

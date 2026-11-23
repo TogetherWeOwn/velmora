@@ -2664,14 +2664,20 @@ impl<T: GateTransport> GateClient<T> {
                 // too early, use the gate's remaining delay, not a spin.
                 let now = (self.clock)().0;
                 let left = end.0.saturating_sub(now).max(0);
-                let ms = if seen_restart == Some(end) && left == 0 {
+                let first_hint = seen_restart != Some(end);
+                let ms = if !first_hint && left == 0 {
                     delay
                 } else {
                     delay.min(left)
                 };
-                seen_restart = Some(end);
+                if first_hint {
+                    // The absolute end can make the probe early, but
+                    // not the deadline: the gate may be behind us.
+                    // Budget its reported delay once, within the cap.
+                    extend(now.saturating_add(delay));
+                    seen_restart = Some(end);
+                }
                 wake = Some(ms);
-                extend(now.saturating_add(ms));
             }
             if let Some(link) = self.links.borrow_mut().get_mut(&queued.key) {
                 link.used = (self.clock)().0;

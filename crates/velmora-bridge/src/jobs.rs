@@ -455,10 +455,9 @@ where
         let poll = slot_poll_ms(providers.len());
         // Never shorter than the sleep between two asks without a line,
         // except at the job's hard limit.
-        let hard_left = SLOT_WAIT_HARD_MS - age;
-        let limit = back.map_or(hard_left, |at| {
-            hard_left.min((at.0 - now).max(i64::from(poll)))
-        });
+        let hard_at = lease.claimed_at.0 + SLOT_WAIT_HARD_MS;
+        let back_at = back.map(|at| at.0.max(now + i64::from(poll)));
+        let limit = back_at.map_or(hard_at, |at| at.min(hard_at)) - now;
         let window = SlotWaitWindow {
             normal_ms: left.min(limit),
             hard_ms: limit,
@@ -466,16 +465,19 @@ where
         let line = self.catalog.await_permit(providers, &holder, window, sleep);
         match line.await {
             Ok(SlotWait::Granted) => true,
-            // Cut short for a provider that is back: asked again.
-            Ok(SlotWait::Elapsed) => window.normal_ms < left,
+            // A cooldown can end during either the ordinary wait or
+            // a restart extension. Refresh the pool if time remains.
+            Ok(SlotWait::Elapsed) => {
+                let now = self.clock.now().0;
+                now < hard_at && back_at.is_some_and(|at| at <= now)
+            }
             // No line here, or it could not be stood in: as before.
             Ok(SlotWait::Unsupported) | Err(_) => {
-                let left = lease.claimed_at.0 + SLOT_WAIT_HARD_MS - self.clock.now().0;
-                if left < i64::from(poll) {
+                if hard_at - self.clock.now().0 < i64::from(poll) {
                     return false;
                 }
                 sleep(poll).await;
-                true
+                self.clock.now().0 < hard_at
             }
         }
     }
