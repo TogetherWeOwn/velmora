@@ -566,19 +566,51 @@ async fn cold_get_with_held_cache_write(finish: WriteFinish) {
 
 #[tokio::test]
 async fn cold_get_reads_newly_eligible_parity_after_the_cache_write() {
-    cold_get_across_retention_cutoff(true).await;
+    cold_get_across_retention_cutoff(Cutoff::NewParity).await;
 }
 
 #[tokio::test]
 async fn cold_get_retries_newly_eligible_data_after_the_cache_write() {
-    cold_get_across_retention_cutoff(false).await;
+    cold_get_across_retention_cutoff(Cutoff::NewData).await;
 }
 
-/// The last reader in retention loses eligibility while the rebuild
-/// waits for the cache write. The other reader now counts for orphans.
-async fn cold_get_across_retention_cutoff(keep_parity: bool) {
-    const FIRST: usize = THREE + 100_000;
-    const DATA_REQUESTS: usize = 3 + 4;
+#[tokio::test]
+async fn cold_get_reads_previously_eligible_parity_after_the_cache_write() {
+    cold_get_across_retention_cutoff(Cutoff::PreviousParity).await;
+}
+
+#[tokio::test]
+async fn cold_get_retries_a_new_reader_busy_during_parity_in_the_data_pass() {
+    cold_get_across_retention_cutoff(Cutoff::BusyDuringParity).await;
+}
+
+#[tokio::test]
+async fn cold_get_combines_newly_eligible_data_with_parity_after_the_cache_write() {
+    cold_get_across_retention_cutoff(Cutoff::Mixed).await;
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Cutoff {
+    NewParity,
+    NewData,
+    PreviousParity,
+    BusyDuringParity,
+    Mixed,
+}
+
+/// A reader crosses its retention cutoff while the rebuild waits for
+/// the previous extent's cache write.
+async fn cold_get_across_retention_cutoff(cutoff: Cutoff) {
+    let short_reader_lapses = cutoff == Cutoff::PreviousParity;
+    let mixed = cutoff == Cutoff::Mixed;
+    let (second_len, expected_len) = if mixed {
+        (4_500_000, 9_100_000) // Seven data articles and two parity articles.
+    } else {
+        (THREE, 3_100_000)
+    };
+    let first_len = second_len + 100_000;
+    let data_requests = Rc::new(Cell::new(0));
+    let backoffs = Rc::new(Cell::new(0));
     let target = Rc::new(RefCell::new(Weak::<
         service_support::TestBridge<TcpConnector>,
     >::new()));
@@ -586,12 +618,14 @@ async fn cold_get_across_retention_cutoff(keep_parity: bool) {
     let sleeper: Sleeper = {
         let target = Rc::clone(&target);
         let released = Rc::clone(&released);
+        let data_requests = Rc::clone(&data_requests);
+        let backoffs = Rc::clone(&backoffs);
         Rc::new(move |ms| {
             let retry = (COLD_POLL_MS..=COLD_POLL_MS + COLD_JITTER_MS).contains(&ms);
             let idle = ms == (READ_PERMIT_SECS - QUIT_SECS - READ_SLACK_SECS) * 1000;
             if retry || idle {
                 if let Some(bridge) = target.borrow().upgrade() {
-                    if body_requests(&bridge.nntp) == DATA_REQUESTS && !released.get() {
+                    if body_requests(&bridge.nntp) == data_requests.get() && !released.get() {
                         assert!(bridge.cache.held.get());
                         assert!(bridge.cache.hold_put_prefix.replace(None).is_some());
                         bridge.clock.advance_ms(1);
@@ -600,19 +634,24 @@ async fn cold_get_across_retention_cutoff(keep_parity: bool) {
                 }
             }
             if retry {
+                backoffs.set(backoffs.get() + 1);
                 Box::pin(std::future::ready(()))
             } else {
                 Box::pin(std::future::pending())
             }
         })
     };
-    let body = marked_plaintext(FIRST + THREE);
+    let body = marked_plaintext(first_len + second_len);
     let cold = posted_for_get(&body, true, true, Some(sleeper), |cfg| {
-        cfg.max_extent_bytes = FIRST as u64;
-        cfg.slice_bytes = FIRST as u64;
+        cfg.max_extent_bytes = first_len as u64;
+        cfg.slice_bytes = first_len as u64;
         cfg.cold_sockets = 1;
         cfg.providers[0].retention_days = Some(2);
         cfg.providers[1].retention_days = Some(1);
+        if short_reader_lapses {
+            cfg.providers[0].priority = 0;
+            cfg.providers[1].priority = 1;
+        }
     })
     .await;
     let bridge = &cold.svc.bridge;
@@ -625,12 +664,22 @@ async fn cold_get_across_retention_cutoff(keep_parity: bool) {
         .parity_plan(&second.id, second.cipher_size)
         .unwrap()
         .unwrap();
-    let missing = &stored.rows[1];
+    let gaps = if mixed { 2 } else { 1 };
+    let missing = &stored.rows[1..1 + gaps];
     let shard = &parity.articles[0];
-    let at_cutoff = missing.posted_at.unwrap().plus_secs(2 * 86_400);
-    assert_eq!(missing.posted_at, shard.posted_at);
+    assert_eq!(parity.articles.len(), gaps);
+    let first_plan = bridge.catalog.stored_plan(&first.id).await.unwrap();
+    // Each lost article needs two missing answers from each eligible reader.
+    let missing_retries = if short_reader_lapses { 3 } else { gaps };
+    data_requests.set(first_plan.rows.len() + stored.rows.len() + missing_retries);
+    let days = if short_reader_lapses { 1 } else { 2 };
+    let at_cutoff = missing[0].posted_at.unwrap().plus_secs(days * 86_400);
+    assert_eq!(missing[0].posted_at, shard.posted_at);
     bridge.clock.set(at_cutoff);
-    let on_second = if keep_parity { shard } else { missing };
+    let on_second = match cutoff {
+        Cutoff::NewParity | Cutoff::PreviousParity => shard,
+        _ => &missing[0],
+    };
     let mut src = cold.nntp.raw_client(0).await;
     let mut dst = cold.nntp.raw_client(1).await;
     let mut article = Vec::new();
@@ -642,11 +691,32 @@ async fn cold_get_across_retention_cutoff(keep_parity: bool) {
         .unwrap();
     src.quit().await;
     dst.quit().await;
-    cold.nntp.servers[0].hide(&missing.message_id).await;
-    cold.nntp.servers[0].hide(&shard.message_id).await;
+    for row in missing {
+        cold.nntp.servers[0].hide(&row.message_id).await;
+    }
+    // For mixed recovery only one of the two parity articles survives.
+    let lost_parity = if mixed { &parity.articles[1] } else { shard };
+    cold.nntp.servers[0].hide(&lost_parity.message_id).await;
+
+    if cutoff == Cutoff::BusyDuringParity {
+        // Provider p1 is first asked for a slot in the parity pass.
+        // Return no slot once, as if a competing read just released it.
+        bridge.catalog.sql.with_conn(|c| {
+            c.execute_batch(
+                "CREATE TEMP TABLE parity_refusals(n INTEGER);
+                 CREATE TEMP TRIGGER refuse_parity_slot BEFORE UPDATE OF token ON provider_permits
+                 WHEN OLD.provider_id = 'p1' AND NOT EXISTS (SELECT 1 FROM parity_refusals)
+                 BEGIN
+                     INSERT INTO parity_refusals VALUES (1);
+                     SELECT RAISE(IGNORE);
+                 END;",
+            )
+            .unwrap();
+        });
+    }
 
     let lean = cold_fetch_bytes(second.cipher_size, 1);
-    let rebuild = cold_rebuild_bytes(shard.cipher_len, 1);
+    let rebuild = cold_rebuild_bytes(shard.cipher_len, gaps as u64);
     let available = cold_step_bytes(second.cipher_size, 1) + rebuild;
     assert!(first.cipher_size + lean <= available);
     assert!(first.cipher_size + lean + rebuild > available);
@@ -666,12 +736,26 @@ async fn cold_get_across_retention_cutoff(keep_parity: bool) {
     assert!(released.get(), "the write must cross the retention cutoff");
     assert_eq!(
         response.body.len(),
-        3_100_000,
+        expected_len,
         "cold GET stream error: {:?}",
         response.stream_error
     );
     assert!(response.body == body, "cold GET returned different bytes");
     assert_eq!(response.stream_error, None);
+    if cutoff == Cutoff::BusyDuringParity {
+        bridge.catalog.sql.with_conn(|c| {
+            let refusals: u32 = c
+                .query_row("SELECT COUNT(*) FROM parity_refusals", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(refusals, 1, "the parity pass must be refused a slot");
+        });
+    }
+    assert_eq!(
+        backoffs.get(),
+        0,
+        "the data fallback must finish without an outer retry ({} bytes read)",
+        response.body.len()
+    );
     drop(held);
     assert_eq!(bridge.budget.in_use(), 0);
 }
