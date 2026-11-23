@@ -2273,7 +2273,15 @@ async fn a_wait_for_a_slot_that_is_over_does_not_go_on_as_a_wait_for_room() {
         renew(poll, bridge)
     }));
 
-    let resp = get(rig, &cold.signer, "cold.bin", &[]).await;
+    let req = cold.signer.sign(
+        rig.now(),
+        Method::Get,
+        &path(BUCKET, "cold.bin"),
+        &[],
+        &[],
+        Vec::new(),
+    );
+    let resp = observed_get(rig, req.into_request(), "budget", "le_1gib").await;
     resp.expect_error(503, "SlowDown");
     assert!(taken.borrow().is_some(), "the budget was not taken");
     assert!(asked.get() < u64::from(COLD_WAIT_MS + COLD_POLL_MS + COLD_JITTER_MS));

@@ -1413,9 +1413,10 @@ where
             // With a rebuild to come, room for both: the two are held
             // together.
             let both = need.saturating_add(rebuild);
+            let mut stage = wait_stage;
             loop {
                 if bridge.clock.now() >= deadline || slept >= COLD_WAIT_MS {
-                    return Err(ReadFail::Busy(wait_stage));
+                    return Err(ReadFail::Busy(stage));
                 }
                 attempt += 1;
                 let seed = (bridge.clock.now().0 as u64) ^ waiter.rotate_left(32) ^ attempt;
@@ -1427,8 +1428,11 @@ where
                 if room.try_charge_in_turn(both).is_some() {
                     break;
                 }
+                // Until room becomes available, the byte budget is
+                // what prevents the next attempt, not the last result.
+                stage = Stage::Budget;
                 let Ok(left @ 1..) = u32::try_from(remaining(slept)) else {
-                    return Err(ReadFail::Busy(wait_stage));
+                    return Err(ReadFail::Busy(stage));
                 };
                 let listed = async {
                     let listed = core::pin::pin!(room.charge_in_turn(both));
