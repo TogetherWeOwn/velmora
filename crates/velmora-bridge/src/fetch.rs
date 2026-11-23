@@ -1584,6 +1584,7 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ColdReader<'a, C, N, T> {
         let mut breaks = vec![0u32; order.len()];
         let mut failure = None;
         let stop = self.stop.clone();
+        let stopped = || stop.as_ref().is_some_and(|stop| stop.get());
         // A drill has a third: its answer says whether Usenet has the
         // object, so before it says no, every reader is asked for what is
         // still missing, whatever retention it states. (A reader past its
@@ -1634,6 +1635,10 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ColdReader<'a, C, N, T> {
                     });
                 self.sessions = kept;
                 ProviderSession::close_all(other).await;
+                // No slot is taken for an extent that will not be begun.
+                if !board.borrow().begun && stopped() {
+                    return Ok(ColdFetch::Busy);
+                }
                 if let Err(e) = self.staff(&order, &work, &mut out, &mut full).await {
                     failure = Some(e);
                     break 'phases;
@@ -1665,7 +1670,6 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ColdReader<'a, C, N, T> {
                 // An extent that was not begun is not begun once its
                 // reader is told to stop: neither here, nor by a socket
                 // whose connection stands only later.
-                let stopped = || stop.as_ref().is_some_and(|stop| stop.get());
                 if !board.borrow().begun && stopped() {
                     return Ok(ColdFetch::Busy);
                 }

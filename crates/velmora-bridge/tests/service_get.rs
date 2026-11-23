@@ -1603,6 +1603,57 @@ async fn a_disconnect_during_a_wait_for_room_keeps_the_write_it_waited_for() {
     local.run_until(test).await;
 }
 
+/// A client that goes away while a finished read waits for the cache
+/// write before it, its connections open: they end as soon as it goes,
+/// not when the write ends.
+#[tokio::test(flavor = "current_thread")]
+async fn a_disconnect_ends_the_connections_while_a_write_settles() {
+    let local = tokio::task::LocalSet::new();
+    let test = async {
+        let cold = cold_rig_on(2, Some(real_sleeper()), Some(local_spawner())).await;
+        let rig = &cold.rig;
+        let parts = [pattern(201, 300_000), pattern(202, 300_000)];
+        let extents = cold_parts(&cold, "multi", &parts, &[], &[]).await;
+        let (server, cache) = (&cold.server, &rig.bridge.cache);
+        *cache.hold_put_prefix.borrow_mut() = Some(extents[0].id.cache_key());
+        let mut articles = 0;
+        for extent in &extents {
+            articles += rig.bridge.catalog.articles(&extent.id).await.unwrap().len();
+        }
+        let asked = server.bodies_asked().await;
+
+        let mut body = open_body(&cold, "multi").await;
+        assert!(body.next().await.unwrap().unwrap() == parts[0]);
+        // The second extent is read whole and waits for the first write,
+        // its connections open.
+        for _ in 0..400 {
+            if server.bodies_asked().await >= asked + articles {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        assert!(
+            rig.bridge.nntp.live() > 0,
+            "connections open beside the write"
+        );
+        assert!(cache.held.get());
+        drop(body);
+        eventually("the connections end before the write", || {
+            rig.bridge.nntp.live() == 0
+        })
+        .await;
+        assert!(cache.held.get() && detached_bodies() == 1);
+        assert_eq!(free_slots(rig).await, 2);
+        *cache.hold_put_prefix.borrow_mut() = None;
+        all_given_back(rig).await;
+        for extent in &extents {
+            assert!(cached(rig, extent) && counted_as_cached(rig, extent));
+        }
+    };
+    local.run_until(test).await;
+}
+
 /// A client that goes away just as its body has ended, with only the last
 /// piece left to take: nothing is left to do, and everything is given
 /// back once.

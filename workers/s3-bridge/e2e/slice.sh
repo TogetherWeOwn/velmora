@@ -1023,6 +1023,7 @@ if [[ $MODE == local && ${E2E_SLOT_WAIT:-} == push ]]; then
     got=$(python3 -I "$WORKER_DIR/e2e/sigv4_get.py" "$BASE" "$SB/a/big.bin" \
       gzip gzip /dev/null bytes=7340032-15728639 2>&1) ||
       fail "disconnect a cold GET" "HTTP 206 and the first body byte" "$got"
+    aborted_at=$SECONDS
     log "cold GET disconnect: $got"
     abort_logged() { log_since_abort | grep -F 'stream: client went away, body dropped' >/dev/null; }
     poll 10 0.2 abort_logged ||
@@ -1057,17 +1058,20 @@ if [[ $MODE == local && ${E2E_SLOT_WAIT:-} == push ]]; then
     fi
     log "cold GET disconnect: the $read extent(s) read from Usenet are in the cache"
     # No slot of the provider stays held for the GET that was cut off
-    # (local status: a throwaway D1 with a handful of outbox rows). 20 s
-    # is under the 35 s a read slot lasts unrenewed, so only a release
+    # (local status: a throwaway D1 with a handful of outbox rows). Seen
+    # free within 30 s of the disconnect: a read slot lasts 35 s from its
+    # last renewal, which came before the disconnect, so only a release
     # passes.
     no_slot_held() {
       local j
       j=$(adm_try "$BASE/_admin/status") || return 1
       jq -e 'all(.providers[]; .held == 0)' >/dev/null 2>&1 <<<"$j"
     }
-    if ! poll 20 0.5 no_slot_held; then
+    left=$((aborted_at + 30 - SECONDS))
+    if ((left < 1)) || ! poll "$left" 0.5 no_slot_held; then
       json=$(adm "GET /_admin/status" "$BASE/_admin/status")
-      fail "disconnect a cold GET" "no provider slot held within 20 s" "$(jq -c '[.providers[] | {id, held, holders}]' <<<"$json")"
+      fail "disconnect a cold GET" "no provider slot held within 30 s of the disconnect" \
+        "$(jq -c '[.providers[] | {id, held, holders}]' <<<"$json")"
     fi
     log 'cold GET disconnect: no provider slot is held'
     # Nothing more is read once the fill ended: no further reader closes,

@@ -511,12 +511,13 @@ struct Shared<T> {
 
 /// How long a body future may run on after its stream was dropped
 /// ([`Driven`]) before it is dropped with all it holds: its connections,
-/// slots and budget charges. Under the 30 s a host waits for detached
-/// work after a response, so the drop runs while the invocation is still
-/// alive; a future the runtime stopped polling later would keep its
-/// charges for the life of the isolate. A read of one extent and its
-/// cache write take a few seconds.
-pub const DETACHED_BODY_MS: u32 = 25_000;
+/// slots and budget charges. Just under the 30 s a host waits for
+/// detached work after a response: work under way gets all of that
+/// wait, and the drop still runs while the invocation is alive. A future
+/// the runtime stopped polling later would keep its charges for the life
+/// of the isolate. A read of one extent and its cache write take a few
+/// seconds.
+pub const DETACHED_BODY_MS: u32 = 29_000;
 
 thread_local! {
     static DETACHED_BODIES: Cell<usize> = const { Cell::new(0) };
