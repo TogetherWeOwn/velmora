@@ -155,7 +155,7 @@ use crate::config::Maintenance;
 use crate::crypto::scheme2::{Scheme, TenantId};
 use crate::ports::{past_dir, BlobEntry, BlobMeta, BlobStore, Clock, JobSink, Kek, TenantRings};
 use crate::recovery::check::{
-    check_record, family, open_failed, record_open, Family, JobRings, RecordCheck,
+    check_record, family, open_failed, record_open, Family, JobRings, Miss, RecordCheck,
 };
 use crate::recovery::{
     article_key, other_plan_key, plan_keys, record_name, record_version, segment_plan_keys,
@@ -991,11 +991,16 @@ fn asked_store(copied: Copied) -> bool {
 /// slot: a version the chain does not name at once, one it names (a
 /// partial ring) once it was missing in the slots of
 /// [`KEY_MISS_PASSES`] passes, whatever the time within each.
-fn page_miss(mark: &mut [i64; 3], slot: i64, named: bool, tenant: &TenantId, version: u32) {
-    let due = !named || slot - mark[0] >= KEY_MISS_PASSES * PASS_INTERVAL_MS;
+/// A ring that could not be read (version 0) pages like a partial one.
+fn page_miss(mark: &mut [i64; 3], slot: i64, miss: Miss, tenant: &TenantId, version: u32) {
+    // Saturating: the mark is bytes of the safety bucket, which anything
+    // with its binding can write; a garbled time must not wrap and keep a
+    // page off.
+    let missing = slot.saturating_sub(mark[0]);
+    let due = miss == Miss::Unknown || missing >= KEY_MISS_PASSES * PASS_INTERVAL_MS;
     if due && mark[2] != slot {
         mark[2] = slot;
-        let kind = if named { "partial" } else { "unknown" };
+        let kind = miss.code();
         crate::trace::alert(|| {
             format!("recovery copy ({KEY_MISS_PAGE}) tenant={tenant} version={version} ring={kind}")
         });
@@ -1331,7 +1336,7 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend, R: TenantRings> Copier<'_, B, 
                 // After the flat layout: each managed tenant's directory,
                 // then tenant 0's (AM-80 item 4).
                 Phase::Generations => {
-                    let tenant = self.next_tenant("", &mut dirs).await?;
+                    let tenant = self.next_tenant("", &mut dirs, &mut budget).await?;
                     Some(Place::tenant(tenant, pass))
                 }
                 Phase::TenantTombstones => {
@@ -1341,7 +1346,9 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend, R: TenantRings> Copier<'_, B, 
                     Some(next)
                 }
                 Phase::TenantGenerations if !place.tenant.is_empty() => {
-                    let tenant = self.next_tenant(&place.tenant, &mut dirs).await?;
+                    let tenant = self
+                        .next_tenant(&place.tenant, &mut dirs, &mut budget)
+                        .await?;
                     Some(Place::tenant(tenant, pass))
                 }
                 // The last phase of the sweep: tenant 0's.
@@ -1416,8 +1423,15 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend, R: TenantRings> Copier<'_, B, 
             Ok(None) => BTreeMap::new(),
             Err(_) => return None,
         };
-        marks.retain(|_, [first, last, _]| {
-            now - *last < KEY_MISS_KEEP_MS && *first <= now && *last <= now + PASS_INTERVAL_MS
+        // Only times a job could have written: anything else is
+        // forgotten, which can only start a count again, never hold a page
+        // off.
+        let kept = now.saturating_sub(KEY_MISS_KEEP_MS);
+        marks.retain(|_, [first, last, paged]| {
+            *last > kept
+                && *last <= now + PASS_INTERVAL_MS
+                && (kept..=now).contains(first)
+                && *paged <= now
         });
         Some(marks)
     }
@@ -1466,13 +1480,23 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend, R: TenantRings> Copier<'_, B, 
                 }
                 tenants.insert(tenant.clone());
             }
+            if version == 0 {
+                // A ring that could not be read.
+                if self.rings.ring_reads(self.clock, &tenant).await {
+                    marks.remove(&key);
+                } else if let Some(mark) = marks.get_mut(&key) {
+                    page_miss(mark, slot, Miss::Ring, &tenant, 0);
+                }
+                continue;
+            }
             match self.rings.key_for(self.clock, &tenant, version).await {
                 Ok(_) | Err(RecordCheck::Shredded) | Err(RecordCheck::VersionDestroyed) => {
                     marks.remove(&key);
                 }
                 Err(RecordCheck::KeyMissing { named }) => {
+                    let miss = if named { Miss::Partial } else { Miss::Unknown };
                     if let Some(mark) = marks.get_mut(&key) {
-                        page_miss(mark, slot, named, &tenant, version);
+                        page_miss(mark, slot, miss, &tenant, version);
                     }
                 }
                 // Not read now: kept as it is.
@@ -1502,12 +1526,12 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend, R: TenantRings> Copier<'_, B, 
         let read = self.read_misses(now).await;
         let readable = read.is_some();
         let mut marks = read.unwrap_or_default();
-        for (tenant, version, named) in misses {
+        for (tenant, version, miss) in misses {
             let mark = marks
                 .entry(format!("{tenant}/{version}"))
                 .or_insert([slot, now, i64::MIN]);
             mark[1] = mark[1].max(now);
-            page_miss(mark, slot, named, &tenant, version);
+            page_miss(mark, slot, miss, &tenant, version);
         }
         if !readable {
             return false;
@@ -1525,6 +1549,7 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend, R: TenantRings> Copier<'_, B, 
         &self,
         after: &str,
         dirs: &mut Vec<String>,
+        budget: &mut Budget,
     ) -> std::result::Result<String, StepError> {
         dirs.retain(|t| t.as_str() > after);
         if let Some(next) = dirs.first().cloned() {
@@ -1536,6 +1561,8 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend, R: TenantRings> Copier<'_, B, 
             t => past_dir(&format!("{TENANT_DIR}{t}/")),
         };
         for _ in 0..LIST_PAGES {
+            // A request of the job's like a page of the source.
+            budget.pages += 1;
             let listed = self
                 .safety
                 .list_dirs(TENANT_DIR, &start, PAGE)

@@ -273,6 +273,33 @@ struct Held {
     reloaded: bool,
 }
 
+/// What a copy job lacked of a tenant's keys, for its pages
+/// ([`JobRings::take_misses`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Miss {
+    /// A version the reloaded chain does not name: pages at once.
+    Unknown,
+    /// A version the reloaded chain names whose blob did not load (a
+    /// partial ring): pages after `copy::KEY_MISS_PASSES` passes.
+    Partial,
+    /// The whole ring could not be read (version 0): pages after
+    /// `copy::KEY_MISS_PASSES` passes, like a partial ring, so that a
+    /// cause that stays (a damaged chain, a marker in a key location, no
+    /// key locations) is not left at `failed` for good.
+    Ring,
+}
+
+impl Miss {
+    /// The code of its page.
+    pub fn code(self) -> &'static str {
+        match self {
+            Miss::Unknown => "unknown",
+            Miss::Partial => "partial",
+            Miss::Ring => "unreadable",
+        }
+    }
+}
+
 /// The tenant rings of one copy job (AM-80 item 2): each read once per
 /// job and tenant, and once more after a record named a version it
 /// lacked. Every miss after the reload is kept for the job's pages
@@ -280,7 +307,7 @@ struct Held {
 pub struct JobRings<R> {
     source: R,
     held: RefCell<BTreeMap<TenantId, Held>>,
-    misses: RefCell<BTreeMap<(TenantId, u32), bool>>,
+    misses: RefCell<BTreeMap<(TenantId, u32), Miss>>,
     loads: Cell<u64>,
     load_ms: Cell<u64>,
     /// Held while a ring is read: the copy checks records concurrently,
@@ -306,13 +333,19 @@ impl<R: TenantRings> JobRings<R> {
         (self.loads.get(), self.load_ms.get())
     }
 
-    /// The versions that the reloaded rings lacked in this job, each
-    /// once: tenant, version, and whether the chain names it.
-    pub fn take_misses(&self) -> Vec<(TenantId, u32, bool)> {
+    /// What this job lacked, each once: the versions the reloaded rings
+    /// lacked, and the rings that could not be read (version 0).
+    pub fn take_misses(&self) -> Vec<(TenantId, u32, Miss)> {
         std::mem::take(&mut *self.misses.borrow_mut())
             .into_iter()
-            .map(|((t, v), named)| (t, v, named))
+            .map(|((t, v), miss)| (t, v, miss))
             .collect()
+    }
+
+    /// Whether the job's ring of `tenant` reads (read now if the job has
+    /// none), whatever it holds.
+    pub async fn ring_reads<T: Clock>(&self, clock: &T, tenant: &TenantId) -> bool {
+        self.ring(clock, tenant, false).await.is_ok()
     }
 
     async fn load<T: Clock>(
@@ -379,7 +412,12 @@ impl<R: TenantRings> JobRings<R> {
         let mut again = false;
         loop {
             match self.ring(clock, tenant, again).await {
-                Err(()) => return Err(RecordCheck::RingFailed),
+                Err(()) => {
+                    self.misses
+                        .borrow_mut()
+                        .insert((tenant.clone(), 0), Miss::Ring);
+                    return Err(RecordCheck::RingFailed);
+                }
                 Ok(TenantRingState::Shredded) => return Err(RecordCheck::Shredded),
                 Ok(TenantRingState::Ring(ring)) if ring.key(version).is_some() => return Ok(ring),
                 // After the one reload, as AM-80b orders it.
@@ -388,9 +426,10 @@ impl<R: TenantRings> JobRings<R> {
                 }
                 Ok(state) if again => {
                     let named = matches!(&state, TenantRingState::Ring(r) if r.named(version));
+                    let miss = if named { Miss::Partial } else { Miss::Unknown };
                     self.misses
                         .borrow_mut()
-                        .insert((tenant.clone(), version), named);
+                        .insert((tenant.clone(), version), miss);
                     return Err(RecordCheck::KeyMissing { named });
                 }
                 Ok(_) => again = true,
