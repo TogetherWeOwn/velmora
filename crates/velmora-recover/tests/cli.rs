@@ -199,3 +199,91 @@ fn single_restore_does_not_require_packs_but_full_verification_does() {
     assert!(String::from_utf8_lossy(&verify.stderr).contains("kit file is missing or unreadable"));
     assert!(kit.run("key", DECRYPT).status.success());
 }
+
+#[test]
+fn verify_kit_rejects_an_undeclared_record_pack() {
+    let kit = Fixture::new();
+    kit.fixture();
+    fs::create_dir(kit.0.join("records")).unwrap();
+    fs::write(
+        kit.0.join("records/records-999.tar.zst"),
+        b"undeclared pack",
+    )
+    .unwrap();
+    let verify = kit.run("key", &["verify-kit"]);
+    assert!(!verify.status.success());
+    assert!(String::from_utf8_lossy(&verify.stderr).contains("undeclared record pack"));
+    assert!(kit.run("key", DECRYPT).status.success());
+}
+
+#[test]
+fn decrypt_continues_after_a_whole_object_md5_mismatch() {
+    let fixture = Fixture::new();
+    let index = fixture.fixture();
+    let kek = TestKey(KekBytes::new([19; 32]));
+    let mut entries = kit::read_index(Cursor::new(index), "fixture", &kek).unwrap();
+    let mut corrupt = entries
+        .iter()
+        .find_map(|e| match e {
+            kit::Entry::Object(o) => Some(o.clone()),
+            _ => None,
+        })
+        .unwrap();
+    corrupt.key = "a-bad-md5".into();
+    corrupt.generation_id = "g_bad".into();
+    corrupt.etag = "00000000000000000000000000000000".into();
+    entries.push(kit::Entry::Object(corrupt));
+    let mut index = Vec::new();
+    kit::write_index(&mut index, "fixture", &kek, &entries).unwrap();
+    fixture.write_index(&index);
+    let result = fixture.run("key", DECRYPT);
+    assert!(!result.status.success());
+    assert!(!fixture.0.join("output/example/a-bad-md5").exists());
+    assert_eq!(
+        fs::read(fixture.0.join("output/example/nested/example.bin")).unwrap(),
+        b"recoverable sealed-kit fixture"
+    );
+    assert!(String::from_utf8(result.stdout)
+        .unwrap()
+        .contains("\"failed\":1,\"recovered\":1"));
+}
+
+#[test]
+fn keyring_recovers_an_older_bucket_from_a_newer_index() {
+    use velmora_bridge::config::KekRing;
+    let fixture = Fixture::new();
+    let index = fixture.fixture();
+    let entries = kit::read_index(
+        Cursor::new(index),
+        "fixture",
+        &TestKey(KekBytes::new([19; 32])),
+    )
+    .unwrap();
+    let ring = KekRing::from_keys(
+        2,
+        [(1, KekBytes::new([19; 32])), (2, KekBytes::new([20; 32]))].into(),
+    )
+    .unwrap();
+    let mut index = Vec::new();
+    kit::write_index(&mut index, "fixture", &ring, &entries).unwrap();
+    fixture.write_index(&index);
+    fs::write(
+        fixture.0.join("ring"),
+        format!(
+            "export VELMORA_KEK_1='{}ExM='\nVELMORA_KEK_2=\"{}FBQ=\"\n",
+            "ExMT".repeat(10),
+            "FBQU".repeat(10)
+        ),
+    )
+    .unwrap();
+    let result = fixture.run("ring", DECRYPT);
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert_eq!(
+        fs::read(fixture.0.join("output/example/nested/example.bin")).unwrap(),
+        b"recoverable sealed-kit fixture"
+    );
+}

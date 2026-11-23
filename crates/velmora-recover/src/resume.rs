@@ -14,7 +14,9 @@ use zeroize::Zeroizing;
 const PARTS: &str = ".velmora-recover-parts";
 const JOURNAL: &str = ".velmora-recover.jsonl";
 const UNMAPPED: &str = "_unmapped";
+const REPORT_DIR: &str = "_report";
 const REPORT: &str = "INDEX.tsv";
+const MAX_COMPONENT_BYTES: usize = 240;
 
 pub struct ObjectCheck<'a> {
     pub bucket: &'a str,
@@ -98,28 +100,116 @@ fn metadata(path: &Path) -> io::Result<Option<fs::Metadata>> {
     }
 }
 
-fn private_file(path: &Path) -> io::Result<File> {
+fn state_options() -> OpenOptions {
     let mut opts = OpenOptions::new();
     opts.read(true).write(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
+        opts.mode(0o600).custom_flags(libc::O_NOFOLLOW);
     }
-    let mut create = opts.clone();
-    match create.create_new(true).open(path) {
-        Ok(file) => {
-            sync_parent(path)?;
-            Ok(file)
-        }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+        opts.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    opts
+}
+
+fn create_state_file(path: &Path) -> io::Result<File> {
+    let file = state_options().create_new(true).open(path)?;
+    sync_parent(path)?;
+    Ok(file)
+}
+
+fn open_state_file(path: &Path) -> io::Result<File> {
+    match create_state_file(path) {
+        Ok(file) => Ok(file),
         Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
             if !metadata(path)?.is_some_and(|m| m.is_file()) {
                 return Err(invalid("recovery state path is not a regular file"));
             }
-            opts.open(path)
+            let file = state_options().open(path)?;
+            if !file.metadata()?.is_file() {
+                return Err(invalid("recovery state handle is not a regular file"));
+            }
+            Ok(file)
         }
         Err(e) => Err(e),
     }
+}
+
+fn single_link(file: &File) -> io::Result<bool> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Ok(file.metadata()?.nlink() == 1)
+    }
+    #[cfg(windows)]
+    {
+        use std::{mem::MaybeUninit, os::windows::io::AsRawHandle};
+        use windows_sys::Win32::Storage::FileSystem::GetFileInformationByHandle;
+        let mut info = MaybeUninit::uninit();
+        // The file owns a live handle, and the API initializes the output on success.
+        let ok = unsafe { GetFileInformationByHandle(file.as_raw_handle(), info.as_mut_ptr()) };
+        if ok == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(unsafe { info.assume_init() }.nNumberOfLinks == 1)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = file;
+        Err(io::Error::other(
+            "cannot inspect link count on this platform",
+        ))
+    }
+}
+
+fn require_single_link(file: &File) -> io::Result<()> {
+    if single_link(file)? {
+        Ok(())
+    } else {
+        Err(invalid("recovery state file has multiple links"))
+    }
+}
+
+fn private_file(path: &Path) -> io::Result<File> {
+    let file = open_state_file(path)?;
+    require_single_link(&file)?;
+    Ok(file)
+}
+
+fn open_part(path: &Path) -> io::Result<File> {
+    let file = open_state_file(path)?;
+    if single_link(&file)? {
+        return Ok(file);
+    }
+    // A previous process can die after publication links the inode, but
+    // before it unlinks the stage name. Never write through that inode.
+    drop(file);
+    fs::remove_file(path)?;
+    create_state_file(path)
+}
+
+fn check_stage(path: &Path) -> io::Result<()> {
+    if !private_dir(path)? {
+        return Err(invalid("recovery stage is not a directory"));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let m = fs::symlink_metadata(path)?;
+        // geteuid does not access memory, and returns the process's effective UID.
+        let uid = unsafe { libc::geteuid() };
+        if !m.is_dir() || m.uid() != uid || m.mode() & 0o022 != 0 {
+            return Err(invalid(
+                "recovery stage must be owned by this user and not group- or world-writable",
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Replay only newline-terminated records. A SIGKILL can leave the final
@@ -168,13 +258,11 @@ impl OutputRoot {
             return Err(invalid("output root is not a directory"));
         }
         let root = root.canonicalize()?;
+        check_stage(&root.join(PARTS))?;
         let mut journal = private_file(&root.join(JOURNAL))?;
         journal.try_lock().map_err(|_| {
             io::Error::other("recovery output is already locked or does not support locking")
         })?;
-        if !private_dir(&root.join(PARTS))? {
-            return Err(invalid("recovery stage is not a directory"));
-        }
         let mut marks = BTreeSet::new();
         read_lines(&mut journal, 1024, |line| {
             marks.insert(
@@ -224,7 +312,7 @@ impl OutputRoot {
             None => self.fallback(&check)?,
         };
         let file = if done.is_none() {
-            Some(private_file(&part_path)?)
+            Some(open_part(&part_path)?)
         } else {
             None
         };
@@ -246,7 +334,7 @@ impl OutputRoot {
             return Err(invalid("unmapped output root is not a directory"));
         }
         dest.push(
-            if normal_component(check.bucket) && check.bucket != REPORT {
+            if normal_component(check.bucket) && !check.bucket.eq_ignore_ascii_case(REPORT_DIR) {
                 check.bucket.to_owned()
             } else {
                 format!("b-{}", escaped(check.bucket))
@@ -255,23 +343,18 @@ impl OutputRoot {
         if !private_dir(&dest)? {
             return Err(invalid("unmapped bucket path is not a directory"));
         }
-        // All input bytes are percent-encoded. Prefixes distinguish leaves
-        // from directory chunks, including when one key prefixes another.
+        // Percent-encode every byte so case-insensitive filesystems do not
+        // collapse distinct keys. Long leaves keep a full SHA-256 suffix;
+        // the report retains the original key for lookup in either direction.
         let escaped = escaped(check.key);
-        let mut chunks = escaped.as_bytes().chunks(240).peekable();
-        while let Some(chunk) = chunks.next() {
-            let chunk = std::str::from_utf8(chunk).expect("ASCII percent encoding");
-            if chunks.peek().is_none() {
-                dest.push(format!("k-{chunk}"));
-            } else {
-                dest.push(format!("d-{chunk}"));
-                if !private_dir(&dest)? {
-                    return Err(invalid("unmapped key path is not a directory"));
-                }
-            }
-        }
         if escaped.is_empty() {
-            dest.push("k-");
+            dest.push("%"); // not a complete escape sequence
+        } else if escaped.len() <= MAX_COMPONENT_BYTES {
+            dest.push(escaped);
+        } else {
+            const PREFIX: usize = ((MAX_COMPONENT_BYTES - 1 - 64) / 3) * 3;
+            let digest = sha_hex(&crate::extent::sha256(check.key.as_bytes()));
+            dest.push(format!("{}~{digest}", &escaped[..PREFIX]));
         }
         let done = match existing(&dest, check)? {
             Existing::Absent => None,
@@ -287,7 +370,11 @@ impl OutputRoot {
 
     fn write_report(&mut self, bucket: &str, key: &str, dest: &Path) -> io::Result<()> {
         if self.report.is_none() {
-            let mut report = private_file(&self.root.join(UNMAPPED).join(REPORT))?;
+            let dir = self.root.join(UNMAPPED).join(REPORT_DIR);
+            if !private_dir(&dir)? {
+                return Err(invalid("unmapped report path is not a directory"));
+            }
+            let mut report = private_file(&dir.join(REPORT))?;
             read_lines(&mut report, 16384, |line| {
                 self.report_rows.insert(line.to_vec());
                 Ok(())
@@ -306,6 +393,7 @@ impl OutputRoot {
         .into_bytes();
         if !self.report_rows.contains(&row) {
             let report = self.report.as_mut().expect("report opened above");
+            require_single_link(report)?;
             report.write_all(&row)?;
             report.sync_data()?;
             self.report_rows.insert(row);
@@ -440,6 +528,17 @@ fn extent_hash(
     Ok(Some(sha.finalize().into()))
 }
 
+#[derive(Debug)]
+struct ObjectIntegrity;
+
+impl std::fmt::Display for ObjectIntegrity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("whole-object integrity check failed")
+    }
+}
+
+impl std::error::Error for ObjectIntegrity {}
+
 pub struct Output<'s, 'a> {
     session: &'s mut OutputRoot,
     check: ObjectCheck<'a>,
@@ -485,6 +584,7 @@ impl Output<'_, '_> {
         let Some(file) = &mut self.file else {
             return Ok(());
         };
+        require_single_link(file)?;
         file.seek(SeekFrom::Start(extent.offset))?;
         file.write_all(bytes)?;
         file.sync_data()?;
@@ -492,6 +592,7 @@ impl Output<'_, '_> {
         if !self.session.marks.contains(&mark) {
             let mut line = serde_json::to_vec(&mark).map_err(io::Error::other)?;
             line.push(b'\n');
+            require_single_link(&self.session.journal)?;
             self.session.journal.write_all(&line)?;
             self.session.journal.sync_data()?;
             self.session.marks.insert(mark);
@@ -499,7 +600,7 @@ impl Output<'_, '_> {
         Ok(())
     }
 
-    pub fn finish(mut self) -> io::Result<[u8; 16]> {
+    pub fn finish(mut self) -> Result<[u8; 16], Box<dyn std::error::Error>> {
         let md5 = match self.done {
             Some(md5) => md5,
             None => {
@@ -509,16 +610,17 @@ impl Output<'_, '_> {
                     if !self.session.marks.contains(&mark) {
                         return Err(invalid(
                             "cannot promote an object before every extent was verified",
-                        ));
+                        )
+                        .into());
                     }
                 }
                 let mut file = self
                     .file
                     .take()
                     .ok_or_else(|| invalid("missing staged object"))?;
+                require_single_link(&file)?;
                 file.set_len(self.check.size)?;
-                let md5 = verify_file(&mut file, &self.check)?
-                    .ok_or_else(|| invalid("whole-object integrity check failed"))?;
+                let md5 = verify_file(&mut file, &self.check)?.ok_or(ObjectIntegrity)?;
                 file.sync_all()?;
                 drop(file);
                 // Atomic no-clobber publication on the same filesystem. An
@@ -529,13 +631,13 @@ impl Output<'_, '_> {
             }
         };
         sync_parent(&self.dest)?;
-        if self.unmapped {
-            self.session
-                .write_report(self.check.bucket, self.check.key, &self.dest)?;
-        }
         if metadata(&self.part_path)?.is_some_and(|m| m.is_file()) {
             fs::remove_file(&self.part_path)?;
             sync_parent(&self.part_path)?;
+        }
+        if self.unmapped {
+            self.session
+                .write_report(self.check.bucket, self.check.key, &self.dest)?;
         }
         Ok(md5)
     }

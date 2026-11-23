@@ -2150,6 +2150,7 @@ name = "velmora-recover"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "libc",
  "md5",
  "quick-xml",
  "reqwest",
@@ -2161,6 +2162,7 @@ dependencies = [
  "velmora",
  "velmora-bridge",
  "velmora-kit",
+ "windows-sys 0.61.2",
  "zeroize",
 ]
 

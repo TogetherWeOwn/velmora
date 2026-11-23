@@ -241,7 +241,78 @@ impl BodySource for RelaySource {
             }
             out.extend_from_slice(&chunk);
         }
+        // The relay returns exactly NntpClient::body_to bytes: the server's
+        // already de-stuffed BODY, without the status line or terminator.
+        // In particular, a line containing only '.' is now a payload byte.
         Ok(out)
+    }
+}
+
+#[cfg(all(test, feature = "recovery-cli"))]
+mod relay_tests {
+    use super::*;
+    use tokio::{
+        io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
+        net::TcpListener,
+    };
+
+    #[tokio::test]
+    async fn relay_preserves_a_single_dot_in_the_yenc_payload() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut stream = BufReader::new(stream);
+            let mut line = String::new();
+            let mut len = None;
+            loop {
+                line.clear();
+                assert_ne!(stream.read_line(&mut line).await.unwrap(), 0);
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some((name, value)) = line.split_once(':') {
+                    if name.eq_ignore_ascii_case("content-length") {
+                        len = Some(value.trim().parse::<usize>().unwrap());
+                    }
+                }
+            }
+            let mut command = vec![0; len.unwrap()];
+            stream.read_exact(&mut command).await.unwrap();
+            assert_eq!(command, b"BODY <leading-dot@example.invalid>\r\n");
+            let body = b"=ybegin line=128 size=1 name=opaque.bin\r\n.\r\n=yend size=1\r\n";
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(header.as_bytes()).await.unwrap();
+            stream.write_all(body).await.unwrap();
+        });
+        // Local fixture only; the real constructor always requires HTTPS.
+        let mut relay = RelaySource {
+            client: reqwest::Client::builder()
+                .no_proxy()
+                .timeout(TIMEOUT)
+                .build()
+                .unwrap(),
+            url: reqwest::Url::parse(&format!("http://{addr}/")).unwrap(),
+            token: reqwest::header::HeaderValue::from_static("Bearer fixture"),
+        };
+        let article = Article {
+            message_id: "leading-dot@example.invalid".into(),
+            sha256: sha256(&[4]),
+            yenc_name: Some("opaque.bin".into()),
+            newsgroup: "alt.test".into(),
+        };
+        let place = Placement {
+            offset: 0,
+            len: 1,
+            total: 1,
+            number: 1,
+            parity: false,
+        };
+        assert_eq!(relay.candidate(&article, place).await.unwrap(), [4]);
+        server.await.unwrap();
     }
 }
 

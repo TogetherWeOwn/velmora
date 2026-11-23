@@ -1,15 +1,16 @@
 use std::{
     fs::File,
-    io::{self, BufWriter, Read, Write},
+    io::{self, BufWriter, Write},
     path::{Path, PathBuf},
 };
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use velmora::rng::{uniform_below, SystemRng};
-use velmora_bridge::{ports::Kek, types::KekBytes};
+use velmora_bridge::config::KekRing;
 use velmora_recover::{
-    catalogue::{decode_hex, Catalogue, CatalogueReader, Selection},
+    catalogue::{Catalogue, CatalogueReader, Selection},
     extent::BodySource,
+    keys::{read_keyring, read_secret},
     kit::Kit,
     nzb::write_nzb,
     resume::OutputRoot,
@@ -25,11 +26,12 @@ use zeroize::Zeroizing;
 struct Cli {
     #[arg(long, global = true, value_name = "DIR")]
     kit: Option<PathBuf>,
-    /// Path to a 32-byte raw/64-digit hex KEK file, or - for stdin.
+    /// Path to a raw/hex KEK or versioned KEK ring, or - for stdin.
     #[arg(long, global = true, value_name = "FILE|-", allow_hyphen_values = true)]
     kek_file: Option<PathBuf>,
-    #[arg(long, global = true, default_value_t = 1)]
-    kek_version: u32,
+    /// Active KEK version override. Defaults to 1 for a single raw/hex key.
+    #[arg(long, global = true)]
+    kek_version: Option<u32>,
     #[command(subcommand)]
     command: Command,
 }
@@ -144,57 +146,16 @@ impl Network {
     }
 }
 
-struct LocalKek {
-    version: u32,
-    key: KekBytes,
-}
-impl Kek for LocalKek {
-    fn active(&self) -> (u32, &KekBytes) {
-        (self.version, &self.key)
-    }
-    fn version(&self, version: u32) -> Option<&KekBytes> {
-        (version == self.version).then_some(&self.key)
-    }
-}
-
-fn read_secret(reader: impl Read, limit: u64) -> io::Result<Zeroizing<Vec<u8>>> {
-    let mut bytes = Zeroizing::new(Vec::new());
-    reader.take(limit + 1).read_to_end(&mut bytes)?;
-    if bytes.len() as u64 > limit {
-        return Err(io::Error::other("input exceeds size limit"));
-    }
-    Ok(bytes)
-}
-
-fn read_file(path: &Path, limit: u64) -> io::Result<Zeroizing<Vec<u8>>> {
+fn read_file(path: &Path, limit: usize) -> io::Result<Zeroizing<Vec<u8>>> {
     read_secret(File::open(path)?, limit)
 }
 
-fn load_kek(path: &Path, version: u32) -> Result<LocalKek, &'static str> {
-    if version == 0 {
-        return Err("KEK version must be positive");
-    }
-    let bytes = if path == Path::new("-") {
-        read_secret(io::stdin().lock(), 66)
+fn load_kek(path: &Path, version: Option<u32>) -> Result<KekRing, &'static str> {
+    if path == Path::new("-") {
+        read_keyring(io::stdin().lock(), version)
     } else {
-        read_file(path, 66)
+        read_keyring(File::open(path).map_err(|_| "could not read KEK")?, version)
     }
-    .map_err(|_| "could not read KEK")?;
-    let value = if bytes.len() == 32 {
-        Some(<[u8; 32]>::try_from(bytes.as_slice()).expect("length checked"))
-    } else {
-        let hex = bytes
-            .strip_suffix(b"\r\n")
-            .or_else(|| bytes.strip_suffix(b"\n"))
-            .unwrap_or(&bytes);
-        decode_hex(hex)
-    }
-    .ok_or("invalid KEK file: expected a 32-byte raw or 64-digit hex key")?;
-    let value = Zeroizing::new(value);
-    Ok(LocalKek {
-        version,
-        key: KekBytes::new(*value),
-    })
 }
 
 fn emit(data: serde_json::Value) -> io::Result<()> {
@@ -207,7 +168,7 @@ fn emit(data: serde_json::Value) -> io::Result<()> {
 async fn restore(
     catalogue: &Catalogue,
     objects: &[Selection<'_>],
-    kek: &LocalKek,
+    kek: &KekRing,
     source: &mut impl BodySource,
     path: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -249,7 +210,7 @@ async fn restore(
 async fn check(
     catalogue: &Catalogue,
     items: &[Selection<'_>],
-    kek: &LocalKek,
+    kek: &KekRing,
     source: &mut impl BodySource,
 ) -> Result<(), Box<dyn std::error::Error>> {
     for item in items {

@@ -175,6 +175,10 @@ fn maps_traversal_and_a_different_existing_file_without_losing_data() {
         })
         .unwrap();
     assert!(unsafe_key.is_unmapped());
+    assert_eq!(
+        unsafe_key.path().file_name().unwrap(),
+        "%2E%2E%2F%65%73%63%61%70%65"
+    );
     unsafe_key.finish().unwrap();
     assert!(!root.0.join("escape").exists());
     fs::create_dir_all(root.0.join("bucket/prefix")).unwrap();
@@ -188,9 +192,34 @@ fn maps_traversal_and_a_different_existing_file_without_losing_data() {
     output.finish().unwrap();
     assert_eq!(fs::read(final_path).unwrap(), b"unrelated");
     assert_eq!(fs::read(recovered).unwrap(), [FIRST, SECOND].concat());
-    let report = fs::read_to_string(root.0.join("_unmapped/INDEX.tsv")).unwrap();
+    let report = fs::read_to_string(root.0.join("_unmapped/_report/INDEX.tsv")).unwrap();
     assert!(report.contains("bucket\t../escape\t_unmapped/"));
     assert!(report.contains("bucket\tprefix/file\t_unmapped/"));
+}
+
+#[test]
+fn unmapped_report_does_not_collide_with_bucket_names() {
+    let root = Scratch::new();
+    let mut session = new_session(&root.0);
+    for bucket in ["index.tsv", "_RePoRt"] {
+        let output = session
+            .object(ObjectCheck {
+                bucket,
+                key: "..",
+                generation: "g_test",
+                size: 0,
+                md5: None,
+                extents: &[],
+            })
+            .unwrap();
+        let path = output.path().to_owned();
+        assert_eq!(path.file_name().unwrap(), "%2E%2E");
+        output.finish().unwrap();
+        assert!(path.is_file());
+    }
+    let report = fs::read_to_string(root.0.join("_unmapped/_report/INDEX.tsv")).unwrap();
+    assert!(report.contains("index.tsv\t..\t"));
+    assert!(report.contains("_RePoRt\t..\t"));
 }
 
 #[test]
@@ -200,6 +229,49 @@ fn refuses_second_writer_until_lock_is_released() {
     assert!(OutputRoot::open(&root.0).is_err());
     drop(first);
     assert!(OutputRoot::open(&root.0).is_ok());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_part_hard_linked_to_an_edited_file_is_recreated_without_overwriting_it() {
+    let root = Scratch::new();
+    let (checks, expected) = checks();
+    {
+        let mut session = new_session(&root.0);
+        let mut output = open(&mut session, &checks, expected);
+        output.write_verified(0, FIRST).unwrap();
+        output.write_verified(1, SECOND).unwrap();
+    }
+    let stage = fs::read_dir(root.0.join(".velmora-recover-parts"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let user_file = root.0.join("bucket/prefix/file");
+    // Reproduce a crash after publication linked the part but before removal.
+    fs::hard_link(stage, &user_file).unwrap();
+    fs::write(&user_file, b"independent user edit").unwrap();
+    let mut session = new_session(&root.0);
+    let mut output = open(&mut session, &checks, expected);
+    assert!(output.is_unmapped());
+    let recovered = output.path().to_owned();
+    output.write_verified(0, FIRST).unwrap();
+    output.write_verified(1, SECOND).unwrap();
+    output.finish().unwrap();
+    assert_eq!(fs::read(user_file).unwrap(), b"independent user edit");
+    assert_eq!(fs::read(recovered).unwrap(), [FIRST, SECOND].concat());
+}
+
+#[cfg(unix)]
+#[test]
+fn rejects_group_writable_staging_directory() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = Scratch::new();
+    let dir = root.0.join(".velmora-recover-parts");
+    fs::create_dir(&dir).unwrap();
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o770)).unwrap();
+    assert!(OutputRoot::open(&root.0).is_err());
 }
 
 #[cfg(unix)]
@@ -226,11 +298,23 @@ fn symlink_ancestor_is_never_followed_and_long_key_is_preserved() {
         assert!(output.is_unmapped());
         output.write_verified(0, FIRST).unwrap();
         let path = output.path().to_owned();
+        if key == long {
+            let leaf = path.file_name().unwrap().to_str().unwrap();
+            let (prefix, digest) = leaf.split_once('~').unwrap();
+            assert_eq!(prefix, "%78".repeat(58));
+            assert_eq!(
+                digest,
+                velmora_recover::catalogue::hex(&Sha256::digest(long.as_bytes()))
+            );
+            assert!(leaf.len() <= 240);
+        }
         output.finish().unwrap();
         assert_eq!(fs::read(path).unwrap(), FIRST);
     }
     assert!(fs::read_dir(&external.0).unwrap().next().is_none());
-    assert!(fs::read_to_string(root.0.join("_unmapped/INDEX.tsv"))
-        .unwrap()
-        .contains(&long));
+    assert!(
+        fs::read_to_string(root.0.join("_unmapped/_report/INDEX.tsv"))
+            .unwrap()
+            .contains(&long)
+    );
 }

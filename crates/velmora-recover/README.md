@@ -6,7 +6,7 @@
 cargo build --release --locked -p velmora-recover --features recovery-cli
 ```
 
-Use a trusted copy of the tool and a separately held KEK. `--kek-file` accepts a 32-byte raw key or a 64-digit hex key (an optional final newline is permitted), or `-` for standard input. Set `--kek-version` if the key is not version 1. The key itself is never a command-line argument.
+Use a trusted copy of the tool and separately held KEKs. `--kek-file` accepts a 32-byte raw key, a 64-digit hex key, or a key-ring file with one `VELMORA_KEK_<version>=<padded-base64-key>` line per version. Pass `-` to read the same formats from standard input. The active version defaults to 1 for a single raw/hex key. A ring uses `VELMORA_KEK_ACTIVE` if specified, otherwise its highest version; `--kek-version` can specify the active version explicitly. Keep the older keys to open data written before rotation. Keys themselves are never command-line arguments.
 
 ```sh
 velmora-recover --kit ./kit --kek-file ./key verify-kit
@@ -33,8 +33,10 @@ max_conns = 1
 
 The current CLI uses one simultaneous connection total and rotates providers after a failed or corrupt article. A plaintext provider configuration is accepted only without credentials. For a separately provisioned recovery relay, substitute `--transport relay --relay-url HTTPS_URL --relay-token-file FILE` for `--providers`. The CLI otherwise uses direct NNTP; it does not silently fall back between transport types.
 
+The HTTPS relay accepts a POST body of `BODY <message-id>` followed by CRLF. An HTTP 200 response contains exactly the **de-stuffed NNTP BODY payload**, with its CRLF line endings but no NNTP status line and no terminating dot line. The client passes those bytes directly to the yEnc decoder; it never removes leading dots from the response.
+
 An NZB exposes message-IDs and groups, not object keys or plaintext. Let the downloader keep the decoded ciphertext files (no unpacking is needed) and point `decrypt` at their directory. The tool matches those files by authenticated payload digest, not by directory order.
 
 Restore into a directory you control, on one filesystem that supports hard links and file locks. A restore uses one writer lock and a private staging directory; do not edit recovered files, journal, or staging data while it runs. Re-run into the same output directory to resume. Previously written extents are re-hashed before reuse. Final files are published only after the ordered extents, total length and applicable whole-object MD5 have been verified. Without an independent whole-object checksum (for example a multipart object with no source MD5), the reported MD5 is `computed`, not `verified`.
 
-Recovered files are normally placed at `<out>/<bucket>/<key>`. Keys that cannot be represented as safe paths (or conflict with a file already there) go under `<out>/_unmapped`, with original keys and paths in `INDEX.tsv`. The report escapes backslashes, tabs, NULs and newlines. No differing existing file is overwritten. If an unmapped destination already holds different data, use a fresh output directory.
+Recovered files are normally placed at `<out>/<bucket>/<key>`. Keys that cannot be represented as safe paths (or conflict with a file already there) go under `<out>/_unmapped/<bucket>/` with every key byte percent-encoded. An overlong name uses a shortened encoded prefix followed by `~` and its SHA-256; `<out>/_unmapped/_report/INDEX.tsv` records the full original key and its path. The report escapes backslashes, tabs, NULs and newlines. No differing existing file is overwritten. If an unmapped destination already holds different data, use a fresh output directory.

@@ -132,15 +132,37 @@ impl Kit {
         Ok(file)
     }
 
+    fn check_records_directory(&self) -> Result<(), &'static str> {
+        const UNREADABLE: &str = "kit records directory is not readable";
+        let records = self.root.join("records");
+        match fs::symlink_metadata(&records) {
+            Ok(metadata) if metadata.is_dir() => (),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            _ => return Err(UNREADABLE),
+        }
+        for item in fs::read_dir(records).map_err(|_| UNREADABLE)? {
+            let name = item.map_err(|_| UNREADABLE)?.file_name();
+            let name = name
+                .to_str()
+                .ok_or("undeclared record pack in kit directory")?;
+            let path = format!("records/{name}");
+            if !record_pack_path(&path) || !self.files.contains_key(&path) {
+                return Err("undeclared record pack in kit directory");
+            }
+        }
+        Ok(())
+    }
+
     pub fn verify(&self, kek: &impl Kek) -> Result<(), &'static str> {
         let entries = self.entries(kek)?;
+        self.check_records_directory()?;
         let mut pack_paths = Vec::new();
         for (name, item) in &self.files {
             if name == INDEX {
                 continue;
             }
             self.open_verified(item)?;
-            if name.starts_with("records/records-") && name.ends_with(".tar.zst") {
+            if record_pack_path(name) {
                 pack_paths.push(name.as_str());
             }
         }
@@ -153,6 +175,11 @@ impl Kit {
             .map_err(|_| "kit record pack does not match authenticated index")?;
         Ok(())
     }
+}
+
+fn record_pack_path(path: &str) -> bool {
+    path.strip_prefix("records/records-")
+        .is_some_and(|name| !name.contains('/') && name.ends_with(".tar.zst"))
 }
 
 struct LazyPack<'a> {
