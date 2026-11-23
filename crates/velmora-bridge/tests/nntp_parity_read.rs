@@ -6,6 +6,7 @@
 mod nntp_support;
 mod service_support;
 
+use futures_util::StreamExt;
 use nntp_support::*;
 use std::cell::{Cell, RefCell};
 use std::rc::{Rc, Weak};
@@ -15,8 +16,10 @@ use velmora_bridge::fetch::{
     cold_fetch_bytes, cold_rebuild_bytes, cold_step_bytes, ColdFetch, ColdStats, COLD_JITTER_MS,
     COLD_POLL_MS, COLD_WAIT_MS,
 };
-use velmora_bridge::ingress::{ByteBudget, Sleeper, CHARGE_POLL_MS};
+use velmora_bridge::ingress::{ByteBudget, Sleeper, Spawner, CHARGE_POLL_MS};
+use velmora_bridge::metrics::{GetFailureStage, GetObservation};
 use velmora_bridge::parity;
+use velmora_bridge::service::PIECE_WAIT_MS;
 use velmora_bridge::*;
 
 /// Three data articles and one parity article.
@@ -153,6 +156,30 @@ fn body_requests(nntp: &TcpConnector) -> usize {
 }
 
 impl ColdGet {
+    fn request(&self, headers: &[(&str, &str)]) -> S3Request {
+        self.signer
+            .sign(
+                self.svc.now(),
+                Method::Get,
+                &service_support::path(&self.bucket.name, GET_KEY),
+                &[],
+                headers,
+                Vec::new(),
+            )
+            .into_request()
+    }
+
+    async fn observed_get(
+        &self,
+        headers: &[(&str, &str)],
+    ) -> (service_support::Resp, GetObservation) {
+        let mut observation = GetObservation::default();
+        let response = Rc::clone(&self.svc.bridge)
+            .handle_observed(self.request(headers), &mut observation)
+            .await;
+        (service_support::Resp::collect(response).await, observation)
+    }
+
     async fn get(&self) -> service_support::Resp {
         self.svc
             .call(
@@ -185,6 +212,17 @@ async fn posted_for_get(
     sleeper: Option<Sleeper>,
     tune: impl FnOnce(&mut BridgeConfig),
 ) -> ColdGet {
+    posted_for_get_on(body, with_parity, pooled, sleeper, None, tune).await
+}
+
+async fn posted_for_get_on(
+    body: &[u8],
+    with_parity: bool,
+    pooled: bool,
+    sleeper: Option<Sleeper>,
+    spawner: Option<Spawner>,
+    tune: impl FnOnce(&mut BridgeConfig),
+) -> ColdGet {
     let specs = [
         Spec {
             backbone: "bb0",
@@ -213,6 +251,9 @@ async fn posted_for_get(
     let mut budget = ByteBudget::new(cfg.inflight_budget_bytes);
     if let Some(sleeper) = sleeper {
         budget = budget.with_sleeper(sleeper);
+    }
+    if let Some(spawner) = spawner {
+        budget = budget.with_spawner(spawner);
     }
     let svc = service_support::rig_with_budget(TcpConnector::default(), cfg, budget);
     let bridge = &svc.bridge;
@@ -565,6 +606,152 @@ async fn cold_get_with_held_cache_write(finish: WriteFinish) {
 }
 
 #[tokio::test]
+async fn cold_get_keeps_previously_eligible_parity_after_a_client_stall() {
+    cold_get_after_a_client_stall(false).await;
+}
+
+#[tokio::test]
+async fn cold_get_does_not_count_idle_time_before_an_unread_piece() {
+    cold_get_after_a_client_stall(true).await;
+}
+
+async fn cold_get_after_a_client_stall(has_unstarted_piece: bool) {
+    let test = async {
+        const FIRST: usize = 1_600_000;
+        let body = marked_plaintext(FIRST + THREE + if has_unstarted_piece { FIRST } else { 0 });
+        let expire = Rc::new(Cell::new(false));
+        let expired = Rc::new(Cell::new(0));
+        let sleeper: Sleeper = {
+            let expire = Rc::clone(&expire);
+            let expired = Rc::clone(&expired);
+            Rc::new(move |ms| {
+                if ms != PIECE_WAIT_MS {
+                    return Box::pin(std::future::pending());
+                }
+                let expire = Rc::clone(&expire);
+                let expired = Rc::clone(&expired);
+                Box::pin(async move {
+                    while !expire.get() {
+                        tokio::task::yield_now().await;
+                    }
+                    expired.set(expired.get() + 1);
+                })
+            })
+        };
+        let spawner: Spawner = Rc::new(|task| {
+            tokio::task::spawn_local(task);
+        });
+        let cold = posted_for_get_on(&body, true, true, Some(sleeper), Some(spawner), |cfg| {
+            cfg.max_extent_bytes = FIRST as u64;
+            cfg.slice_bytes = FIRST as u64;
+            cfg.cold_sockets = 1;
+            cfg.providers[0].priority = 0;
+            cfg.providers[1].priority = 1;
+            cfg.providers[0].retention_days = Some(2);
+            cfg.providers[1].retention_days = Some(1);
+        })
+        .await;
+        let bridge = &cold.svc.bridge;
+        let rebuild = cold.extents.last().unwrap();
+        let stored = bridge.catalog.stored_plan(&rebuild.id).await.unwrap();
+        let parity = stored
+            .parity_plan(&rebuild.id, rebuild.cipher_size)
+            .unwrap()
+            .unwrap();
+        let shard = &parity.articles[0];
+        let missing = &stored.rows[1];
+        copy_to_second_reader(&cold.nntp, shard).await;
+        cold.nntp.server().hide(&shard.message_id).await;
+        cold.nntp.server().hide(&missing.message_id).await;
+        bridge.clock.set(shard.posted_at.unwrap().plus_secs(86_400));
+        let key = cold.extents[1].id.cache_key();
+        if !has_unstarted_piece {
+            bridge.cache.fail_put_prefix.replace(Some(key.clone()));
+        }
+
+        let response = Rc::clone(bridge).handle(cold.request(&[])).await;
+        assert_eq!(response.status, 200);
+        let RespBody::Stream(mut stream) = response.body else {
+            panic!("a GET body is a stream");
+        };
+        // Allow the second piece to prefetch, then let it expire unread.
+        while !bridge.cache.puts.borrow().iter().any(|(k, _)| *k == key) {
+            tokio::task::yield_now().await;
+        }
+        let first_dials = bridge.nntp.connects_to("p1");
+        if !has_unstarted_piece {
+            // The prefetched rebuild succeeded, but its cache write failed.
+            assert!(first_dials > 0, "the prefetch must ask the parity holder");
+            bridge.clock.advance_ms(1);
+        }
+        expire.set(true);
+        while expired.get() == 0
+            || bridge.budget.in_use() != FIRST as u64
+            || bridge.nntp.live() != 0
+        {
+            tokio::task::yield_now().await;
+        }
+        expire.set(false);
+        let mut bytes = Vec::new();
+        if has_unstarted_piece {
+            for _ in 0..2 {
+                bytes.extend(stream.next().await.unwrap().unwrap());
+            }
+            // Wait past the eager-mode window. Only then advance the
+            // clock, while the relay is waiting before the third piece.
+            expire.set(true);
+            while expired.get() < 2 {
+                tokio::task::yield_now().await;
+            }
+            expire.set(false);
+            assert_eq!(bridge.nntp.connects_to("p1"), 0);
+            assert_eq!(bridge.budget.in_use(), 0);
+            bridge.clock.advance_ms(1);
+        }
+        let mut error = None;
+        while let Some(part) = stream.next().await {
+            match part {
+                Ok(part) => bytes.extend(part),
+                Err(failed) => {
+                    error = Some(failed);
+                    break;
+                }
+            }
+        }
+        eprintln!(
+            "cold GET returned {} bytes; stream error: {error:?}",
+            bytes.len()
+        );
+        if has_unstarted_piece {
+            assert_eq!(
+                bridge.nntp.connects_to("p1"),
+                0,
+                "p1 expired before the first read"
+            );
+            assert_eq!(bytes.len(), 3_200_000);
+            assert!(bytes == body[..2 * FIRST]);
+            assert!(matches!(
+                error,
+                Some(BridgeError::Invalid("read interrupted: extent unavailable"))
+            ));
+        } else {
+            assert_eq!(bytes.len(), 3_100_000);
+            assert!(bytes == body);
+            assert!(error.is_none());
+            assert!(bridge.nntp.connects_to("p1") > first_dials);
+        }
+        assert_eq!(bridge.budget.in_use(), 0);
+    };
+    tokio::task::LocalSet::new()
+        .run_until(tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            test,
+        ))
+        .await
+        .expect("the prefetched piece is dropped and read again");
+}
+
+#[tokio::test]
 async fn cold_get_reads_newly_eligible_parity_after_the_cache_write() {
     cold_get_across_retention_cutoff(Cutoff::NewParity).await;
 }
@@ -592,6 +779,126 @@ async fn cold_get_retries_previously_eligible_parity_after_a_refused_slot() {
 #[tokio::test]
 async fn cold_get_retries_a_new_reader_busy_in_both_recovery_passes() {
     cold_get_across_retention_cutoff(Cutoff::BusyInFallbackToo).await;
+}
+
+#[tokio::test]
+async fn cold_get_reports_slot_wait_when_the_orphan_holder_is_busy_in_both_passes() {
+    cold_get_with_failed_fallback(FallbackFailure::BusyInFallbackToo).await;
+}
+
+#[tokio::test]
+async fn cold_get_does_not_restaff_a_fallback_reader_after_its_session_breaks() {
+    cold_get_with_failed_fallback(FallbackFailure::Broken).await;
+}
+
+#[derive(Clone, Copy)]
+enum FallbackFailure {
+    BusyInFallbackToo,
+    Broken,
+}
+
+async fn cold_get_with_failed_fallback(failure: FallbackFailure) {
+    let broken = matches!(failure, FallbackFailure::Broken);
+    let (len, gaps, refusals, expected_bodies, stage) = match failure {
+        FallbackFailure::BusyInFallbackToo => (THREE, 1, 2, 0, GetFailureStage::SlotWait),
+        // Two gaps and two slots would let staffing give p1 another
+        // session unless the Pending allowance is spent after one.
+        FallbackFailure::Broken => (4_500_000, 2, 2, 3, GetFailureStage::Nntp),
+    };
+    let body = marked_plaintext(len);
+    // No sleeper: expose the outcome of the first attempt without
+    // obscuring it with an outer retry. This extent is first in the GET
+    // so its failure is visible in both the status and the observation.
+    let cold = posted_for_get(&body, true, true, None, |cfg| {
+        cfg.cold_sockets = if broken { 2 } else { 1 };
+        if broken {
+            for provider in &mut cfg.providers {
+                provider.pool = None;
+                provider.pool_max_conns = None;
+            }
+        }
+        cfg.providers[0].priority = 0;
+        cfg.providers[1].priority = 1;
+        cfg.providers[0].retention_days = Some(2);
+        cfg.providers[1].retention_days = Some(1);
+    })
+    .await;
+    let bridge = &cold.svc.bridge;
+    let extent = &cold.extents[0];
+    let stored = bridge.catalog.stored_plan(&extent.id).await.unwrap();
+    let parity = stored
+        .parity_plan(&extent.id, extent.cipher_size)
+        .unwrap()
+        .unwrap();
+    let missing = &stored.rows[1..1 + gaps];
+    for row in missing {
+        copy_to_second_reader(&cold.nntp, row).await;
+        cold.nntp.server().hide(&row.message_id).await;
+    }
+    for row in &parity.articles {
+        cold.nntp.server().hide(&row.message_id).await;
+    }
+    // p0 is the last reader in retention. The gaps become orphans
+    // during the parity pass; only the newly eligible p1 holds them.
+    let cutoff = missing[0].posted_at.unwrap().plus_secs(2 * 86_400);
+    bridge.clock.set(cutoff);
+    refuse_p1_slots(bridge, refusals);
+    let p1_bodies = Rc::new(Cell::new(0));
+    before_body({
+        let p1_bodies = Rc::clone(&p1_bodies);
+        let clock = bridge.clock.clone();
+        let shards: Vec<_> = parity
+            .articles
+            .into_iter()
+            .map(|row| row.message_id)
+            .collect();
+        let missing: Vec<_> = missing.iter().map(|row| row.message_id.clone()).collect();
+        move |provider, message_id| {
+            if provider == "p0" && shards.iter().any(|id| id == message_id) {
+                clock.set(cutoff.plus_ms(1));
+            }
+            if provider == "p1" {
+                assert!(
+                    missing.iter().any(|id| id == message_id),
+                    "p1 is only staffed in the data fallback"
+                );
+                p1_bodies.set(p1_bodies.get() + 1);
+            }
+            None
+        }
+    });
+    if broken {
+        // Break the original connection and both reconnects under its
+        // one permit. A newly staffed session would issue a fourth BODY.
+        cold.nntp.servers[1].drop_next_bodies(3).await;
+    }
+    let held = || async {
+        bridge
+            .catalog
+            .provider_load(bridge.clock.now())
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|p| p.held)
+            .collect::<Vec<_>>()
+    };
+    let held_before = held().await;
+    let dials = bridge.nntp.dials_to("p1");
+    let (response, observation) = cold.observed_get(&[]).await;
+    assert_eq!(
+        (response.status, response.code().as_str()),
+        (503, "SlowDown")
+    );
+    let mut expected = GetObservation::default();
+    expected.record_size(body.len() as u64);
+    expected.mark_stage(stage);
+    assert_eq!(observation, expected);
+    assert_eq!(p1_refusals(bridge), refusals);
+    assert_eq!(p1_bodies.get(), expected_bodies);
+    assert_eq!(bridge.nntp.dials_to("p1") - dials, expected_bodies);
+    assert_eq!(held().await, held_before);
+    assert_eq!(bridge.nntp.live(), 0);
+    assert_eq!(bridge.budget.in_use(), 0);
 }
 
 #[tokio::test]
@@ -778,29 +1085,12 @@ async fn cold_get_across_cutoff_without_a_prior_cache_write(
     bridge.clock.set(cutoff.plus_ms(-ms_before_cutoff));
     bridge.nntp.slow(&bridge.clock, 1);
     if refusals > 0 {
-        bridge.catalog.sql.with_conn(|c| {
-            c.execute_batch(&format!(
-                "CREATE TEMP TABLE data_refusals(n INTEGER);
-                 CREATE TEMP TRIGGER refuse_data_slot BEFORE UPDATE OF token ON provider_permits
-                 WHEN OLD.provider_id = 'p1'
-                   AND (SELECT COUNT(*) FROM data_refusals) < {refusals}
-                 BEGIN
-                     INSERT INTO data_refusals VALUES (1);
-                     SELECT RAISE(IGNORE);
-                 END;",
-            ))
-            .unwrap();
-        });
+        refuse_p1_slots(bridge, refusals);
     }
     let response = cold.get().await;
     eprintln!("cold GET returned {} bytes", response.body.len());
     if refusals > 0 {
-        bridge.catalog.sql.with_conn(|c| {
-            let actual: u32 = c
-                .query_row("SELECT COUNT(*) FROM data_refusals", [], |r| r.get(0))
-                .unwrap();
-            assert_eq!(actual, refusals);
-        });
+        assert_eq!(p1_refusals(bridge), refusals);
     }
     response.expect(200);
     assert!(response.body == body, "cold GET returned different bytes");
@@ -886,6 +1176,29 @@ async fn cold_get_drives_the_prior_cache_write_during_the_data_fallback() {
     assert_eq!(response.stream_error, None);
     assert!(response.body == body, "cold GET returned different bytes");
     assert_eq!(bridge.budget.in_use(), 0);
+}
+
+fn refuse_p1_slots(bridge: &service_support::TestBridge<TcpConnector>, refusals: u32) {
+    bridge.catalog.sql.with_conn(|c| {
+        c.execute_batch(&format!(
+            "CREATE TEMP TABLE data_refusals(n INTEGER);
+             CREATE TEMP TRIGGER refuse_data_slot BEFORE UPDATE OF token ON provider_permits
+             WHEN OLD.provider_id = 'p1'
+               AND (SELECT COUNT(*) FROM data_refusals) < {refusals}
+             BEGIN
+                 INSERT INTO data_refusals VALUES (1);
+                 SELECT RAISE(IGNORE);
+             END;",
+        ))
+        .unwrap();
+    });
+}
+
+fn p1_refusals(bridge: &service_support::TestBridge<TcpConnector>) -> u32 {
+    bridge.catalog.sql.with_conn(|c| {
+        c.query_row("SELECT COUNT(*) FROM data_refusals", [], |r| r.get(0))
+            .unwrap()
+    })
 }
 
 async fn copy_to_second_reader(nntp: &Rig, row: &ArticleRow) {
@@ -1115,15 +1428,29 @@ async fn cold_get_across_retention_cutoff(cutoff: Cutoff) {
 /// rebuild's room rather than downloading data without it.
 #[tokio::test]
 async fn cold_get_keeps_the_rebuild_shortfall_after_a_busy_slot_retry() {
-    retry_keeps_the_rebuild_shortfall(false).await;
+    retry_keeps_the_rebuild_shortfall(ShortfallRetry::Get).await;
 }
 
 #[tokio::test]
 async fn drill_keeps_the_rebuild_shortfall_after_a_busy_slot_retry() {
-    retry_keeps_the_rebuild_shortfall(true).await;
+    retry_keeps_the_rebuild_shortfall(ShortfallRetry::Drill).await;
 }
 
-async fn retry_keeps_the_rebuild_shortfall(drill: bool) {
+#[tokio::test]
+async fn cold_get_records_budget_when_the_retained_rebuild_charge_arrives_at_the_deadline() {
+    retry_keeps_the_rebuild_shortfall(ShortfallRetry::ChargeAtDeadline).await;
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ShortfallRetry {
+    Get,
+    Drill,
+    ChargeAtDeadline,
+}
+
+async fn retry_keeps_the_rebuild_shortfall(retry: ShortfallRetry) {
+    let drill = retry == ShortfallRetry::Drill;
+    let charge_at_deadline = retry == ShortfallRetry::ChargeAtDeadline;
     let backoffs = Rc::new(Cell::new(0));
     let released = Rc::new(Cell::new(0));
     let budget_wait = Rc::new(Cell::new(false));
@@ -1188,32 +1515,61 @@ async fn retry_keeps_the_rebuild_shortfall(drill: bool) {
             tokio::task::yield_now().await;
         }
         assert_eq!(body_requests(&bridge.nntp), 4, "the second try had no slot");
-        let short_after_busy = bridge.budget.try_charge(1).unwrap();
         for permit in permits {
             bridge.catalog.release_permit(&permit).await.unwrap();
         }
+        let trip = &bridge.cache.trip;
+        if charge_at_deadline {
+            // Let the retry's room probe succeed, then take room during
+            // the cache recheck so the retained rebuild charge must wait.
+            trip.arm(0, service_support::Trip::Stall);
+            released.set(2);
+            while !trip.tripped() {
+                tokio::task::yield_now().await;
+            }
+        }
+        let short_after_busy = bridge.budget.try_charge(1).unwrap();
+        trip.release();
         released.set(2);
         // The correct path waits for budget. With the old code, a data
         // pass has already taken place when the third backoff starts.
         while !budget_wait.get() && backoffs.get() < 3 {
             tokio::task::yield_now().await;
         }
+        if charge_at_deadline {
+            assert!(budget_wait.get(), "the retained rebuild charge must wait");
+            bridge.clock.advance_ms(i64::from(COLD_WAIT_MS));
+        }
         drop(short_after_busy);
         released.set(u32::MAX);
     };
     let read = async {
         if drill {
-            cold.drill().await
+            (cold.drill().await, GetObservation::default())
         } else {
-            cold.get().await
+            cold.observed_get(&[]).await
         }
     };
-    let (response, ()) = tokio::time::timeout(
+    let ((response, observation), ()) = tokio::time::timeout(
         std::time::Duration::from_secs(5),
         futures_util::future::join(read, competitor),
     )
     .await
     .expect("the cold read and competitor finish");
+    if charge_at_deadline {
+        assert_eq!(
+            (response.status, response.code().as_str()),
+            (503, "SlowDown")
+        );
+        let mut expected = GetObservation::default();
+        expected.record_size(body.len() as u64);
+        expected.mark_stage(GetFailureStage::Budget);
+        assert_eq!(observation, expected);
+        assert_eq!(body_requests(&bridge.nntp), 4, "no read after the deadline");
+        drop(base);
+        assert_eq!(bridge.budget.in_use(), 0);
+        return;
+    }
     response.expect(200);
     if drill {
         let result: serde_json::Value = serde_json::from_slice(&response.body).unwrap();

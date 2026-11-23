@@ -2308,18 +2308,18 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ColdReader<'a, C, N, T> {
     /// from the extent's parity articles, when it has any ([`Self::rebuild`]);
     /// an extent that lost none reads no parity.
     pub(crate) async fn fetch(&mut self, extent: &ExtentRow) -> Result<ColdFetch> {
-        self.fetch_beside(extent, &mut None, &mut None).await
+        self.fetch_beside(extent, &mut None, self.clock.now()).await
     }
 
     /// [`Self::fetch`] beside this request's previous cache write. Only
     /// if a rebuild cannot charge its room does the read wait for it.
-    /// `first_eligible_at` starts empty and is kept across retries of
-    /// the same extent, not across different extents.
+    /// `first_eligible_at` is kept across retries of the same extent,
+    /// not across different extents.
     pub(crate) async fn fetch_beside(
         &mut self,
         extent: &ExtentRow,
         put: &mut Option<LocalBoxFuture<'_, ()>>,
-        first_eligible_at: &mut Option<UnixMs>,
+        first_eligible_at: UnixMs,
     ) -> Result<ColdFetch> {
         // The plan and the parity addendum beside it come with one
         // read of the catalogue. The addendum is looked at only when an
@@ -2334,7 +2334,7 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ColdReader<'a, C, N, T> {
         &mut self,
         extent: &ExtentRow,
         stored: StoredPlan,
-        first_eligible_at: &mut Option<UnixMs>,
+        first_eligible_at: UnixMs,
     ) -> Result<ColdFetch> {
         self.fetch_planned_beside(extent, stored, &mut None, first_eligible_at)
             .await
@@ -2345,7 +2345,7 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ColdReader<'a, C, N, T> {
         extent: &ExtentRow,
         stored: StoredPlan,
         put: &mut Option<LocalBoxFuture<'_, ()>>,
-        first_eligible_at: &mut Option<UnixMs>,
+        first_eligible_at: UnixMs,
     ) -> Result<ColdFetch> {
         let drill = self.drill;
         let plan = &stored.rows[..];
@@ -2399,7 +2399,7 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ColdReader<'a, C, N, T> {
         let mut board = core::cell::RefCell::new(Board::new(size, starts, desk.order.len()));
         let all = vec![true; plan.len()];
         let eligibility = Eligibility {
-            first: *first_eligible_at.get_or_insert(now),
+            first: first_eligible_at,
             clock: self.clock,
         };
         // On the heap too: a body nests many futures above this one.
@@ -2758,6 +2758,83 @@ mod tests {
     use super::*;
     use velmora::nntp::{REDACTED_LIMIT, REDACTED_REPLY};
     use velmora::Error as E;
+
+    #[cfg(feature = "testkit")]
+    #[tokio::test]
+    async fn a_spent_fallback_is_busy_even_with_a_live_pool_sibling() {
+        use crate::sql::SqlCatalog;
+        use crate::testkit::{FixedClock, RusqliteSql};
+
+        struct NoDial;
+        impl NntpConnector for NoDial {
+            type Session = velmora::nntp::NntpClient<velmora::transports::NativeTlsTransport>;
+
+            async fn connect(&self, _: &ProviderConfig, _: &Permit) -> Result<Self::Session> {
+                panic!("staffing only takes permits");
+            }
+        }
+
+        let provider = |id| {
+            serde_json::from_value::<ProviderConfig>(serde_json::json!({
+                "id": id, "host": "fixture.invalid", "port": 563, "tls": true,
+                "user": "fixture", "pass": "fixture", "backbone": "fixture",
+                "post": false, "read": true, "max_conns": 1,
+                "pool": "shared", "pool_max_conns": 1,
+            }))
+            .unwrap()
+        };
+        let providers = [provider("late"), provider("sibling")];
+        let order = [&providers[0], &providers[1]];
+        let catalog = SqlCatalog::new(RusqliteSql::with_schema().unwrap());
+        catalog.seed_permits(&providers).await.unwrap();
+        let clock = FixedClock::new(UnixMs(1_800_000_000_000));
+        let sibling = ProviderSession::open(
+            &catalog,
+            &NoDial,
+            &clock,
+            order[1],
+            PermitClass::Read,
+            "get",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let mut reader = ColdReader {
+            catalog: &catalog,
+            nntp: &NoDial,
+            clock: &clock,
+            providers: &providers,
+            timer: None,
+            sockets: 2,
+            holder: "get".into(),
+            sessions: vec![sibling],
+            replacements: 0,
+            stats: Default::default(),
+            drill: false,
+            shunned: Vec::new(),
+            room: std::rc::Rc::new(ByteBudget::new(0)),
+            reserve: None,
+            lacked: 0,
+        };
+        let mut out = [None, None];
+        let mut full = [false, false];
+        let mut retry = [SlotRetry::Pending, SlotRetry::Normal];
+        reader
+            .staff(&order, &[1, 1], &mut out, &mut full, &mut retry)
+            .await
+            .unwrap();
+        assert_eq!(
+            reader.held(order[1]),
+            1,
+            "the sibling still holds the pool slot"
+        );
+        reader.close().await;
+        assert!(retry[0] == SlotRetry::Spent);
+        assert!(
+            out == [Some(Out::Busy), None],
+            "the exhausted fallback must be Busy before read_rows can staff again"
+        );
+    }
 
     fn plain(code: u16, text: &str) -> BridgeError {
         BridgeError::Nntp(E::NntpReply {

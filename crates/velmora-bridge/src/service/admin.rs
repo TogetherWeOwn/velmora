@@ -1497,7 +1497,8 @@ async fn drill_extent<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K:
     (charge, bytes): (&mut Option<ingress::Charge>, u64),
     (articles, retries): (&mut u64, &mut u32),
 ) -> Admin<Option<Vec<u8>>> {
-    let deadline = bridge.clock.now().plus_ms(i64::from(COLD_WAIT_MS));
+    let first_eligible_at = bridge.clock.now();
+    let deadline = first_eligible_at.plus_ms(i64::from(COLD_WAIT_MS));
     let mut slept = 0u32;
     let mut interrupted = 0u32;
     let mut last: Option<BridgeError>;
@@ -1505,7 +1506,6 @@ async fn drill_extent<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K:
     // across this extent's retries even if the last try ended for
     // another reason. The next try waits for both the read and rebuild.
     let mut rebuild = 0u64;
-    let mut first_eligible_at = None;
     loop {
         if charge.is_none() {
             // A try after a wait starts only inside the allowance, and
@@ -1552,7 +1552,7 @@ async fn drill_extent<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K:
             Ok(plan) => {
                 let count = plan.rows.len() as u64;
                 reader
-                    .fetch_planned(extent, plan, &mut first_eligible_at)
+                    .fetch_planned(extent, plan, first_eligible_at)
                     .await
                     .map(|read| (read, count))
             }

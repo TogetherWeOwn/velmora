@@ -753,6 +753,8 @@ async fn relay<C, B, N, J, K, T>(
     // the reader asks for a piece soon after it took the one before.
     let mut eager = can_run_ahead;
     for (at, piece) in todo.iter().enumerate() {
+        // A piece taken back after a client stall is still the same read.
+        let mut first_eligible_at = None;
         loop {
             if out.ahead() && !eager && !out.is_wanted() {
                 // Nothing is held while the reader is busy: neither a
@@ -761,7 +763,8 @@ async fn relay<C, B, N, J, K, T>(
                 out.wanted().await;
             }
             cold.mid = at > 0;
-            let item = cold.piece(&bucket, piece).await;
+            let first = *first_eligible_at.get_or_insert_with(|| bridge.clock.now());
+            let item = cold.piece(&bucket, piece, first).await;
             let failed = item.is_err();
             // Before the last item and before an error: the reader of
             // the body may never ask again after either, and the last
@@ -856,7 +859,8 @@ where
     // once on its own first: that leaves it in the cache, and the read
     // below then needs room for its piece only.
     let mut held = 0u64;
-    for piece in &todo {
+    let mut prewarmed_at = vec![None; todo.len()];
+    for (piece, first_eligible_at) in todo.iter().zip(&mut prewarmed_at) {
         let (size, sockets) = (piece.extent.cipher_size, bridge.cfg.cold_sockets);
         // Whether the extent has parity, and lost anything, is not
         // known before it is read: the most a rebuild of it may hold.
@@ -864,17 +868,23 @@ where
         let cold = cold_read_bytes(size, sockets).max(rebuilt);
         if held > 0 && held.saturating_add(cold) > bridge.budget.capacity() {
             drop(
-                read_piece(bridge, bucket, piece)
-                    .await
-                    .map_err(|fail| fail.response())?,
+                read_piece(
+                    bridge,
+                    bucket,
+                    piece,
+                    *first_eligible_at.insert(bridge.clock.now()),
+                )
+                .await
+                .map_err(|fail| fail.response())?,
             );
         }
         held = held.saturating_add(piece.len);
     }
     let mut parts = Vec::with_capacity(todo.len());
-    for piece in &todo {
+    for (piece, prewarmed) in todo.iter().zip(prewarmed_at) {
+        let first_eligible_at = prewarmed.unwrap_or_else(|| bridge.clock.now());
         parts.push(
-            read_piece(bridge, bucket, piece)
+            read_piece(bridge, bucket, piece, first_eligible_at)
                 .await
                 .map_err(|fail| fail.response())?,
         );
@@ -948,6 +958,7 @@ async fn read_piece<C, B, N, J, K, T>(
     bridge: &Bridge<C, B, N, J, K, T>,
     bucket: &Bucket,
     piece: &Piece,
+    first_eligible_at: UnixMs,
 ) -> Item
 where
     C: Catalog,
@@ -958,7 +969,7 @@ where
     T: Clock,
 {
     let mut cold = Cold::new(bridge);
-    let item = cold.piece(bucket, piece).await;
+    let item = cold.piece(bucket, piece, first_eligible_at).await;
     cold.end().await;
     item
 }
@@ -1243,7 +1254,7 @@ where
         Err(ReadFail::Unavailable(Stage::R2))
     }
 
-    async fn piece(&mut self, bucket: &Bucket, piece: &Piece) -> Item {
+    async fn piece(&mut self, bucket: &Bucket, piece: &Piece, first_eligible_at: UnixMs) -> Item {
         let bridge = self.bridge;
         let extent = &piece.extent;
         self.until = None;
@@ -1295,7 +1306,6 @@ where
         // how much room the rebuild still needs.
         let mut rebuild = 0u64;
         let mut spare: Option<Charge> = None;
-        let mut first_eligible_at = None;
         loop {
             let reader = match &mut self.reader {
                 Some(reader) => reader,
@@ -1310,7 +1320,7 @@ where
             if let Some(spare) = spare.take() {
                 reader.fund(spare);
             }
-            let fetched = reader.fetch_beside(extent, &mut self.put, &mut first_eligible_at);
+            let fetched = reader.fetch_beside(extent, &mut self.put, first_eligible_at);
             let read = Spent::time(&bridge.clock, &self.spent.read, fetched).await;
             let shortfall = reader.settle();
             rebuild = rebuild.max(shortfall);
@@ -1445,7 +1455,7 @@ where
                 found => return found,
             }
             if bridge.clock.now() >= deadline {
-                return Err(ReadFail::Busy(wait_stage));
+                return Err(ReadFail::Busy(stage));
             }
             if rebuild == 0 {
                 work = self.step(need, lean).await?;
@@ -1454,7 +1464,7 @@ where
             // Another request may have taken the room while the cache
             // was checked. Bound this wait by the same retry allowance.
             let Ok(left @ 1..) = u32::try_from(remaining(slept)) else {
-                return Err(ReadFail::Busy(wait_stage));
+                return Err(ReadFail::Busy(stage));
             };
             {
                 let charge = core::pin::pin!(self.step(both, lean.saturating_add(rebuild)));
@@ -1465,7 +1475,7 @@ where
                 };
             }
             if bridge.clock.now() >= deadline {
-                return Err(ReadFail::Busy(wait_stage));
+                return Err(ReadFail::Busy(Stage::Budget));
             }
             spare = Some(work.split_off(rebuild));
         }
