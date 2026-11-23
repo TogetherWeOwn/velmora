@@ -567,11 +567,10 @@ where
                 }) else {
                     continue;
                 };
-                let started = crate::trace::job_note(|t| {
+                crate::trace::job_note(|t| {
                     t.articles = t
                         .articles
                         .max(u32::try_from(plan.len()).unwrap_or(u32::MAX));
-                    (self.clock.now(), t.connect_ms)
                 });
                 let tally = match kind {
                     VerifyKind::Body | VerifyKind::Sampled => {
@@ -588,12 +587,6 @@ where
                         ask_articles_together(&mut session, Some(lease), &rows, how).await
                     }
                 };
-                if let Some((started, connected_before)) = started {
-                    crate::trace::job_note(|t| {
-                        let elapsed = crate::trace::elapsed(started, self.clock.now());
-                        t.wire_ms += elapsed.saturating_sub(t.connect_ms - connected_before);
-                    });
-                }
                 session.close().await;
                 match tally {
                     // The provider refused the account: the next one of the

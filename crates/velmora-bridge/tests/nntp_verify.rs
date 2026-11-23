@@ -9,6 +9,41 @@ use velmora_bridge::verify::{MISSING_BACKOFF_SECS, REVERIFY_SECS};
 use velmora_bridge::*;
 
 const PLAIN_LEN: usize = 1_500_000;
+
+#[tokio::test]
+async fn job_verify_wire_time_excludes_permit_renewal() {
+    use velmora_bridge::{metrics::job_point, trace::observe_job};
+
+    let rig = rig(&[Spec {
+        backbone: "bb0",
+        post: true,
+        max_conns: 2,
+    }])
+    .await;
+    let s = rig.seed(1, &[7; 1000]).await;
+    rig.post(&s).await;
+    let b = &rig.bridge;
+    b.catalog
+        .slow_next_acquire
+        .replace(Some((b.clock.clone(), 20_000)));
+    b.catalog.renew_takes.replace(Some((b.clock.clone(), 2000)));
+    b.nntp.slow(&b.clock, 7);
+    let job = Job::Extent {
+        v: JOB_VERSION,
+        extent: s.extent.clone(),
+        generation: s.generation.clone(),
+        stage: OutboxStage::Verify,
+    };
+    let (outcome, trace) = observe_job(&b.clock, b.run_job(&job)).await;
+    assert_eq!(outcome, JobOutcome::Ack);
+    let point = job_point(&trace, "velmora-verify", 1).expect("sampled verify");
+    assert_eq!(point.doubles[6], 7.0, "one dial");
+    assert!(
+        point.doubles[2] >= 22_000.0,
+        "acquire and renewal were timed"
+    );
+    assert_eq!(point.doubles[7], 7.0, "one wire command, not the renewal");
+}
 /// A propagation grace longer than all the waits for a missing article
 /// together: nothing is ever posted again.
 const LONG_GRACE_SECS: u32 = 86_400;

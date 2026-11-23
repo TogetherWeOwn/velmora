@@ -32,6 +32,7 @@ class R2Bucket {}
 class WorkerQueue {
   async send() { throw Error('local queue is unavailable'); }
 }
+let writes = 0;
 const env = {
   ENVIRONMENT: 'dev', S3_HOST: 'localhost', S3_REGION: 'auto',
   MAX_EXTENT_BYTES: '16777216', REQUIRED_BACKBONES: '1', SAFETY_MIN_AGE_SECS: '0',
@@ -42,7 +43,7 @@ const env = {
   NNTP_PROVIDERS: JSON.stringify([{ id: 'p1', host: '127.0.0.1', port: 1, user: 'test', pass: 'test', tls: false, backbone: 'test', post: true, read: true, max_conns: 2 }]),
   CATALOG: new D1Database(), SAFETY: new R2Bucket(), CACHE: new R2Bucket(),
   POST_Q: new WorkerQueue(), VERIFY_Q: new WorkerQueue(),
-  METRICS: { writeDataPoint() { assert.fail('early or invalid jobs must not emit points'); } },
+  METRICS: { writeDataPoint() { writes++; } },
 };
 const entry = new Worker({}, env);
 
@@ -61,6 +62,7 @@ async function settle(queue, expectedMetadataReads) {
   await entry.queue({ messages, get queue() { reads++; return queue(); } });
   assert.deepEqual(actions, ['ack', 'retry']);
   assert.equal(reads, expectedMetadataReads);
+  assert.equal(writes, 0, 'early or invalid jobs must not emit points');
 }
 
 env.JOB_METRICS_SAMPLE = '1';

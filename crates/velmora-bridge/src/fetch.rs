@@ -663,20 +663,28 @@ async fn read_one<C: Catalog, N: NntpConnector, T: Clock>(
         if fresh && connected.is_ok() {
             session.keep(lease).await?;
         }
+        let clock = session.clock;
         let result = match connected {
             Ok(()) => match session.session().await {
-                Ok(s) => match ask {
-                    Ask::Body | Ask::Wire => s.body(&row.message_id, wire).await.map(Got::Body),
-                    Ask::Stat => s.stat(&row.message_id).await.map(|there| match there {
-                        true => Got::Present,
-                        false => Got::Body(BodyOutcome::Missing),
-                    }),
-                    Ask::Size(how) => s.size(&row.message_id, how).await.map(|o| match o {
-                        SizeOutcome::Present(size) => Got::Size(size),
-                        SizeOutcome::Carried(size) => Got::Carried(size),
-                        SizeOutcome::Missing => Got::Body(BodyOutcome::Missing),
-                    }),
-                },
+                Ok(s) => {
+                    crate::trace::observe_wire(clock, async {
+                        match ask {
+                            Ask::Body | Ask::Wire => {
+                                s.body(&row.message_id, wire).await.map(Got::Body)
+                            }
+                            Ask::Stat => s.stat(&row.message_id).await.map(|there| match there {
+                                true => Got::Present,
+                                false => Got::Body(BodyOutcome::Missing),
+                            }),
+                            Ask::Size(how) => s.size(&row.message_id, how).await.map(|o| match o {
+                                SizeOutcome::Present(size) => Got::Size(size),
+                                SizeOutcome::Carried(size) => Got::Carried(size),
+                                SizeOutcome::Missing => Got::Body(BodyOutcome::Missing),
+                            }),
+                        }
+                    })
+                    .await
+                }
                 Err(Stop::Session(e)) => Err(e),
                 Err(stop) => return Err(stop),
             },
@@ -885,8 +893,9 @@ async fn ask_together<C: Catalog, N: NntpConnector, T: Clock>(
         session.keep(lease).await?;
     }
     let ids: Vec<&str> = rows.iter().map(|r| r.message_id.as_str()).collect();
+    let clock = session.clock;
     let answers = match session.session().await {
-        Ok(s) => s.ask_many(&ids, how).await,
+        Ok(s) => crate::trace::observe_wire(clock, s.ask_many(&ids, how)).await,
         Err(Stop::Session(_)) => {
             session.discard();
             return Ok(None);
