@@ -1332,24 +1332,30 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend, R: TenantRings> Copier<'_, B, 
             if walked != Walked::End {
                 break (Some(place.cursor()), walked == Walked::Outage);
             }
-            turn = match place.phase {
-                // After the flat layout: each managed tenant's directory,
-                // then tenant 0's (AM-80 item 4).
-                Phase::Generations => {
-                    let tenant = self.next_tenant("", &mut dirs, &mut budget).await?;
-                    Some(Place::tenant(tenant, pass))
+            // After the flat layout and after each managed tenant's
+            // directory: the next one, then tenant 0's (AM-80 item 4). With
+            // no request of the job left to find it, the next job does,
+            // from the end of this phase.
+            let after = match place.phase {
+                Phase::Generations => Some(String::new()),
+                Phase::TenantGenerations if !place.tenant.is_empty() => Some(place.tenant.clone()),
+                _ => None,
+            };
+            if let Some(after) = after {
+                match self.next_tenant(&after, &mut dirs, &mut budget).await? {
+                    Some(tenant) => {
+                        turn = Some(Place::tenant(tenant, pass));
+                        continue;
+                    }
+                    None => break (Some(place.cursor()), false),
                 }
+            }
+            turn = match place.phase {
                 Phase::TenantTombstones => {
                     let then = Phase::TenantGenerations;
                     let mut next = Place::at(then, then.first(&place.tenant, pass));
                     next.tenant = place.tenant;
                     Some(next)
-                }
-                Phase::TenantGenerations if !place.tenant.is_empty() => {
-                    let tenant = self
-                        .next_tenant(&place.tenant, &mut dirs, &mut budget)
-                        .await?;
-                    Some(Place::tenant(tenant, pass))
                 }
                 // The last phase of the sweep: tenant 0's.
                 Phase::TenantGenerations => {
@@ -1541,7 +1547,8 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend, R: TenantRings> Copier<'_, B, 
 
     /// The managed tenant whose directory the sweep goes through after
     /// that of `after` (empty: the first), or empty when none is left and
-    /// tenant 0's comes. `dirs` keeps what the job listed: one listing
+    /// tenant 0's comes; `None` when the job has no request left to list
+    /// with ([`JOB_PAGES`]). `dirs` keeps what the job listed: one listing
     /// with the delimiter `/` per [`PAGE`] tenant directories. A name
     /// below `m/x/` that is no managed tenant's id is passed over (the
     /// walk reaches its keys).
@@ -1550,18 +1557,22 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend, R: TenantRings> Copier<'_, B, 
         after: &str,
         dirs: &mut Vec<String>,
         budget: &mut Budget,
-    ) -> std::result::Result<String, StepError> {
+    ) -> std::result::Result<Option<String>, StepError> {
         dirs.retain(|t| t.as_str() > after);
         if let Some(next) = dirs.first().cloned() {
             dirs.remove(0);
-            return Ok(next);
+            return Ok(Some(next));
         }
         let mut start = match after {
             "" => String::new(),
             t => past_dir(&format!("{TENANT_DIR}{t}/")),
         };
         for _ in 0..LIST_PAGES {
-            // A request of the job's like a page of the source.
+            // A request of the job's like a page of the source; none left:
+            // `None`, the next job looks.
+            if budget.pages >= JOB_PAGES {
+                return Ok(None);
+            }
             budget.pages += 1;
             let listed = self
                 .safety
@@ -1580,10 +1591,10 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend, R: TenantRings> Copier<'_, B, 
                 break;
             }
         }
-        Ok(match dirs.is_empty() {
+        Ok(Some(match dirs.is_empty() {
             true => String::new(),
             false => dirs.remove(0),
-        })
+        }))
     }
 
     /// Where the walk of the pass that started at `pass` goes on, or
