@@ -1229,6 +1229,54 @@ async fn a_folder_delete_drops_the_state_of_a_file_s3_deleted_before() {
 }
 
 #[tokio::test]
+async fn the_stateful_folder_bound_applies_to_each_tree() {
+    use velmora_dav::handler::StatePort;
+    use velmora_dav::state::{DeadProp, Op, Patch};
+    // Each tree within max_tree keys and stateful folders, both together
+    // over it: the plan fits the call budget and goes ahead.
+    let w = World::with(Config {
+        max_tree: 10,
+        ..Config::default()
+    })
+    .await;
+    let mut files = Vec::new();
+    for i in 0..6 {
+        files.push(format!("src/f{i}/x"));
+    }
+    for i in 0..5 {
+        files.push(format!("dst/g{i}/y"));
+    }
+    for key in &files {
+        assert_eq!(w.s3_put(key, b"bytes").await, 200);
+    }
+    let etag = w.s3_get(&files[0]).await.2.unwrap();
+    w.req("PROPFIND", "/dav/src/", &[("depth", "0")], b"")
+        .await
+        .expect(207);
+    let name = w.dav.state.dbs.borrow().keys().next().unwrap().clone();
+    let ops = files
+        .iter()
+        .map(|key| Op::PropPatch {
+            path: key.clone(),
+            etag: Some(etag.clone()),
+            patches: vec![Patch::Set(DeadProp {
+                ns: "urn:x".into(),
+                name: "x".into(),
+                xml: "<x xmlns=\"urn:x\">1</x>".into(),
+            })],
+        })
+        .collect();
+    w.dav.state.call(&name, ops).await.unwrap();
+    w.req("MOVE", "/dav/src/", &[("destination", "/dav/dst/")], b"")
+        .await
+        .expect(204);
+    assert!(w.s3_list("src/").await.is_empty());
+    assert!(has_x(&w, "/dav/dst/f0/x").await);
+    assert_eq!(w.s3_put("dst/g0/y", b"bytes").await, 200);
+    assert!(!has_x(&w, "/dav/dst/g0/y").await);
+}
+
+#[tokio::test]
 async fn depth_zero_overwrite_does_not_list_removed_subfolders() {
     let w = World::new().await;
     assert_eq!(w.s3_put("src/", b"").await, 200);
@@ -1807,6 +1855,43 @@ async fn a_storage_call_without_an_answer_stops_the_batch_and_dispatches_nothing
     again().await.expect(503);
     w.advance_secs(4);
     again().await.expect(204);
+}
+
+#[tokio::test]
+async fn a_late_commit_of_an_unanswered_delete_cannot_hit_a_later_move() {
+    // Devin's schedule: a DELETE stops waiting for a batch that storage
+    // still commits; a MOVE must not land dst/b in between.
+    let w = World::with(Config {
+        lease_secs: 4,
+        delete_keys: 2,
+        ..Config::default()
+    })
+    .await;
+    for (key, body) in [
+        ("dst/a", &b"a"[..]),
+        ("dst/b", b"old b"),
+        ("src/b", b"moved b"),
+    ] {
+        assert_eq!(w.s3_put(key, body).await, 200);
+    }
+    w.storage_fault_target("POST", "/dav?delete=", StorageFault::Hold);
+    let r = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        w.req("DELETE", "/dav/dst/", &[], b""),
+    )
+    .await
+    .expect("an unanswered batch held the DELETE");
+    r.expect(207);
+    assert!(r.text().contains("HTTP/1.1 504 Gateway Timeout"));
+    let moving = || w.req("MOVE", "/dav/src/", &[("destination", "/dav/dst/")], b"");
+    moving().await.expect(503);
+    assert_eq!(w.s3_get("src/b").await.1, b"moved b");
+    // Storage commits the batch the gateway stopped waiting for.
+    assert_eq!(w.commit_held().await, 200);
+    w.advance_secs(4);
+    moving().await.expect(201);
+    assert_eq!(w.s3_get("dst/b").await.1, b"moved b");
+    assert_eq!(w.s3_get("src/b").await.0, 404);
 }
 
 #[tokio::test]

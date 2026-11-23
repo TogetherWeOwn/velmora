@@ -70,6 +70,10 @@ pub enum StorageFault {
         reached: tokio::sync::oneshot::Sender<()>,
         resume: tokio::sync::oneshot::Receiver<()>,
     },
+    /// The request reaches storage but is not committed and never
+    /// answered; [`World::commit_held`] commits it later, as storage
+    /// does with a call the gateway stopped waiting for.
+    Hold,
 }
 
 /// The storage Worker in process, reached as through `DavEntry`.
@@ -79,6 +83,7 @@ pub struct Up {
     /// Every request sent: method and target.
     pub sent: RefCell<Vec<(String, String)>>,
     fault: RefCell<Option<(&'static str, String, StorageFault)>>,
+    held: RefCell<Option<S3Request>>,
     /// Requests sent with no entry marker (as the default entrypoint
     /// would): an app password must then be refused.
     pub unmarked: Cell<bool>,
@@ -143,6 +148,10 @@ impl Upstream for Up {
         } else {
             None
         };
+        if matches!(fault, Some(StorageFault::Hold)) {
+            assert!(self.held.replace(Some(req)).is_none());
+            return Box::pin(std::future::pending());
+        }
         Box::pin(async move {
             if matches!(fault, Some(StorageFault::Fail)) {
                 return Err(S3Error {
@@ -378,6 +387,7 @@ impl World {
                     uuids: Cell::new(0),
                     sent: RefCell::new(Vec::new()),
                     fault: RefCell::new(None),
+                    held: RefCell::new(None),
                     unmarked: Cell::new(false),
                     most_slots: Cell::new(0),
                 },
@@ -471,6 +481,14 @@ impl World {
             .fault
             .replace(Some((method, target.to_owned(), fault)))
             .is_none());
+    }
+
+    /// Commits the request a [`StorageFault::Hold`] kept; its status.
+    pub async fn commit_held(&self) -> u16 {
+        let req = self.dav.up.held.take().expect("no held request");
+        Resp::collect(Rc::clone(&self.rig.bridge).handle(req).await)
+            .await
+            .status
     }
 
     /// The object as the S3 entry point sees it: status, body, ETag.

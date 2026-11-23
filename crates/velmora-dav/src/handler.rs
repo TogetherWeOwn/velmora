@@ -1567,8 +1567,10 @@ impl<U: Upstream, S: StatePort> Ctx<'_, U, S> {
     }
 
     /// The collections at or under `roots` that carry DAV state (see
-    /// [`Op::FoldersWithState`]); more than `max_tree` of them is refused
-    /// with `507` before any change.
+    /// [`Op::FoldersWithState`]); more than `max_tree` of them under one
+    /// root (each tree holds at most `max_tree` keys) is refused with `507`
+    /// before any change. The probes they need count against
+    /// `max_mutation_calls`.
     async fn folders_with_state(
         &self,
         bucket: &str,

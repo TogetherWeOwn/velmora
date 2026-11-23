@@ -276,7 +276,7 @@ pub enum Op {
     },
     /// Every collection at or under one of `roots` that holds DAV state:
     /// a lock rooted at it or at a file directly in it, or a dead property
-    /// on either. `Full` when there are more than `limit`.
+    /// on either. `Full` when one root has more than `limit`.
     FoldersWithState {
         roots: Vec<String>,
         limit: usize,
@@ -946,6 +946,7 @@ impl<S: Sql> Engine<'_, S> {
                 let mut stateful = std::collections::BTreeSet::new();
                 let cap = i64::try_from(limit.saturating_add(1)).unwrap_or(i64::MAX);
                 for root in roots {
+                    let mut under_root = std::collections::BTreeSet::new();
                     // Indexed range lookups. `rtrim(p, replace(p, '/', ''))`
                     // is `p` up to its last '/': a collection itself, or the
                     // collection a file is in.
@@ -957,11 +958,12 @@ impl<S: Sql> Engine<'_, S> {
                          WHERE path >= ?1 AND path < ?2 LIMIT ?3",
                     ] {
                         let rows = self.sql.exec(query, &[t(&root), t(&end), Val::Int(cap)])?;
-                        stateful.extend(rows.into_iter().map(|row| row[0].text()));
-                        if stateful.len() > limit {
+                        under_root.extend(rows.into_iter().map(|row| row[0].text()));
+                        if under_root.len() > limit {
                             return Ok(Reply::Full);
                         }
                     }
+                    stateful.extend(under_root);
                 }
                 Ok(Reply::StatefulFolders(stateful.into_iter().collect()))
             }
