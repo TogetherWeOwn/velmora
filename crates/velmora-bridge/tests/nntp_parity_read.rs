@@ -564,6 +564,118 @@ async fn cold_get_with_held_cache_write(finish: WriteFinish) {
     assert_eq!(bridge.budget.in_use(), 0);
 }
 
+#[tokio::test]
+async fn cold_get_reads_newly_eligible_parity_after_the_cache_write() {
+    cold_get_across_retention_cutoff(true).await;
+}
+
+#[tokio::test]
+async fn cold_get_retries_newly_eligible_data_after_the_cache_write() {
+    cold_get_across_retention_cutoff(false).await;
+}
+
+/// The last reader in retention loses eligibility while the rebuild
+/// waits for the cache write. The other reader now counts for orphans.
+async fn cold_get_across_retention_cutoff(keep_parity: bool) {
+    const FIRST: usize = THREE + 100_000;
+    const DATA_REQUESTS: usize = 3 + 4;
+    let target = Rc::new(RefCell::new(Weak::<
+        service_support::TestBridge<TcpConnector>,
+    >::new()));
+    let released = Rc::new(Cell::new(false));
+    let sleeper: Sleeper = {
+        let target = Rc::clone(&target);
+        let released = Rc::clone(&released);
+        Rc::new(move |ms| {
+            let retry = (COLD_POLL_MS..=COLD_POLL_MS + COLD_JITTER_MS).contains(&ms);
+            let idle = ms == (READ_PERMIT_SECS - QUIT_SECS - READ_SLACK_SECS) * 1000;
+            if retry || idle {
+                if let Some(bridge) = target.borrow().upgrade() {
+                    if body_requests(&bridge.nntp) == DATA_REQUESTS && !released.get() {
+                        assert!(bridge.cache.held.get());
+                        assert!(bridge.cache.hold_put_prefix.replace(None).is_some());
+                        bridge.clock.advance_ms(1);
+                        released.set(true);
+                    }
+                }
+            }
+            if retry {
+                Box::pin(std::future::ready(()))
+            } else {
+                Box::pin(std::future::pending())
+            }
+        })
+    };
+    let body = marked_plaintext(FIRST + THREE);
+    let cold = posted_for_get(&body, true, true, Some(sleeper), |cfg| {
+        cfg.max_extent_bytes = FIRST as u64;
+        cfg.slice_bytes = FIRST as u64;
+        cfg.cold_sockets = 1;
+        cfg.providers[0].retention_days = Some(2);
+        cfg.providers[1].retention_days = Some(1);
+    })
+    .await;
+    let bridge = &cold.svc.bridge;
+    target.replace(Rc::downgrade(bridge));
+    let [first, second] = cold.extents.as_slice() else {
+        panic!("expected two extents");
+    };
+    let stored = bridge.catalog.stored_plan(&second.id).await.unwrap();
+    let parity = stored
+        .parity_plan(&second.id, second.cipher_size)
+        .unwrap()
+        .unwrap();
+    let missing = &stored.rows[1];
+    let shard = &parity.articles[0];
+    let at_cutoff = missing.posted_at.unwrap().plus_secs(2 * 86_400);
+    assert_eq!(missing.posted_at, shard.posted_at);
+    bridge.clock.set(at_cutoff);
+    let on_second = if keep_parity { shard } else { missing };
+    let mut src = cold.nntp.raw_client(0).await;
+    let mut dst = cold.nntp.raw_client(1).await;
+    let mut article = Vec::new();
+    src.article_to(&on_second.message_id, &mut article)
+        .await
+        .unwrap();
+    dst.post_article(&on_second.message_id, &article)
+        .await
+        .unwrap();
+    src.quit().await;
+    dst.quit().await;
+    cold.nntp.servers[0].hide(&missing.message_id).await;
+    cold.nntp.servers[0].hide(&shard.message_id).await;
+
+    let lean = cold_fetch_bytes(second.cipher_size, 1);
+    let rebuild = cold_rebuild_bytes(shard.cipher_len, 1);
+    let available = cold_step_bytes(second.cipher_size, 1) + rebuild;
+    assert!(first.cipher_size + lean <= available);
+    assert!(first.cipher_size + lean + rebuild > available);
+    let held = bridge
+        .budget
+        .try_charge(bridge.budget.capacity() - available)
+        .unwrap();
+    bridge
+        .cache
+        .hold_put_prefix
+        .replace(Some(first.id.cache_key()));
+
+    let response = tokio::time::timeout(std::time::Duration::from_secs(5), cold.get())
+        .await
+        .expect("the cold GET finishes");
+    response.expect(200);
+    assert!(released.get(), "the write must cross the retention cutoff");
+    assert_eq!(
+        response.body.len(),
+        3_100_000,
+        "cold GET stream error: {:?}",
+        response.stream_error
+    );
+    assert!(response.body == body, "cold GET returned different bytes");
+    assert_eq!(response.stream_error, None);
+    drop(held);
+    assert_eq!(bridge.budget.in_use(), 0);
+}
+
 /// A first data pass finds that the rebuild is short of room. The next
 /// try gets no slot, and the one after that must still wait for the
 /// rebuild's room rather than downloading data without it.

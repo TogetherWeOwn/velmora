@@ -1211,11 +1211,13 @@ enum Out {
 struct Lost<'p> {
     /// The plan as the catalogue holds it, with its parity addendum.
     stored: &'p StoredPlan,
-    /// Per data article: its verified bytes are in the ciphertext.
-    have: &'p [bool],
+    /// The ciphertext and the answers from the data pass so far.
+    data: &'p mut core::cell::RefCell<Board>,
+    /// The retention timestamp used by the data pass.
+    data_at: UnixMs,
     /// How the read ends without a rebuild. [`ColdFetch::Unavailable`] =
     /// every reader that may hold a lost article answered for it.
-    end: &'p ColdFetch,
+    end: ColdFetch,
 }
 
 /// What the passes over one extent know of the providers they read from.
@@ -1954,8 +1956,8 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ColdReader<'a, C, N, T> {
 
     /// Rebuilds the lost data articles of `extent` from its parity
     /// articles. `None` = every lost article is in its place and equal to
-    /// the SHA-256 of its plan row; otherwise how the read ends, with
-    /// `cipher` as it was.
+    /// the SHA-256 of its plan row; otherwise how the read ends. Only
+    /// verified articles are written to the data board.
     ///
     /// The parity articles are read like the data articles: each with one
     /// `BODY` from the providers of the desk, accepted only when it is
@@ -1979,30 +1981,40 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ColdReader<'a, C, N, T> {
         &mut self,
         extent: &ExtentRow,
         lost: Lost<'_>,
-        cipher: &mut [u8],
         desk: &mut Desk<'a>,
         readers: &[&'a ProviderConfig],
         put: &mut Option<LocalBoxFuture<'_, ()>>,
     ) -> Result<Option<ColdFetch>> {
-        let Lost { stored, have, end } = lost;
+        let Lost {
+            stored,
+            data,
+            data_at,
+            mut end,
+        } = lost;
         let plan = &stored.rows[..];
-        let now = self.clock.now();
+        let mut now = self.clock.now();
+        let mut waited = false;
         // Every reader answered: what parity cannot make up for is lost.
-        let sure = *end == ColdFetch::Unavailable;
-        let unrecoverable = |stats: &core::cell::RefCell<ColdStats>| {
-            if !sure {
-                return Ok(Some(end.clone()));
+        let unrecoverable = |end, stats: &core::cell::RefCell<ColdStats>| {
+            if end != ColdFetch::Unavailable {
+                return Ok(Some(end));
             }
             stats.borrow_mut().unrecoverable += 1;
             Ok(Some(ColdFetch::Unrecoverable))
         };
         let parity = match stored.parity_plan(&extent.id, extent.cipher_size) {
             // No parity: the read ends as it always did.
-            Ok(None) => return Ok(Some(end.clone())),
+            Ok(None) => return Ok(Some(end)),
             Ok(Some(parity)) => parity,
-            Err(_) => return unrecoverable(&self.stats),
+            Err(_) => return unrecoverable(end, &self.stats),
         };
-        let gaps: Vec<usize> = (0..plan.len()).filter(|&a| !have[a]).collect();
+        let mut gaps: Vec<usize> = data
+            .get_mut()
+            .have
+            .iter()
+            .enumerate()
+            .filter_map(|(a, have)| (!have).then_some(a))
+            .collect();
         let (m, t) = (parity.articles.len(), gaps.len());
         let len = parity.shard_len as usize;
         let laid_out = parity.rows.len() == m
@@ -2011,7 +2023,7 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ColdReader<'a, C, N, T> {
                 .iter()
                 .all(|a| a.cipher_len == u64::from(parity.shard_len));
         if !laid_out || t > m {
-            return unrecoverable(&self.stats);
+            return unrecoverable(end, &self.stats);
         }
         // The rebuild is held beside the extent. Without room for it the
         // read is tried again later, like one that got no connection;
@@ -2024,6 +2036,8 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ColdReader<'a, C, N, T> {
             // budget. Settle it and try once more without waiting for
             // room held by any other request.
             self.settle_prior_write(put, desk).await;
+            now = self.clock.now();
+            waited = true;
             room = self.room.try_charge(need);
         }
         let Some(_room) = room else {
@@ -2065,17 +2079,41 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ColdReader<'a, C, N, T> {
         }
         let board = board.into_inner();
         let usable: Vec<usize> = (0..m).filter(|&slot| board.have[slot]).collect();
-        if usable.len() < t {
-            if !sure {
-                return Ok(Some(end.clone()));
+        if usable.len() < t && waited {
+            // The write can take a missing article past the retention of
+            // its last reader. Ask the newly eligible readers before
+            // calling it lost. Keep the answers from both passes.
+            let newly_eligible = gaps.iter().any(|&a| {
+                readers.iter().copied().any(|reader| {
+                    let eligible = |at| {
+                        can_answer(reader, &plan[a], at, readers, Phase::Retained)
+                            || can_answer(reader, &plan[a], at, readers, Phase::Orphan)
+                    };
+                    !eligible(data_at) && eligible(now)
+                })
+            });
+            if newly_eligible {
+                let chosen = vec![true; plan.len()]; // The board skips verified data.
+                Box::pin(self.read_rows(desk, readers, now, plan, &chosen, data)).await?;
+                gaps.retain(|&a| !data.get_mut().have[a]);
+            }
+            if gaps.is_empty() {
+                return Ok(None);
+            }
+            end = desk.short(readers, plan, data.get_mut(), now);
+        }
+        if usable.len() < gaps.len() {
+            if end != ColdFetch::Unavailable {
+                return Ok(Some(end));
             }
             // A provider that could not be asked may have the rest.
             return match desk.short(readers, &parity.articles, &board, now) {
-                ColdFetch::Unavailable => unrecoverable(&self.stats),
+                ColdFetch::Unavailable => unrecoverable(end, &self.stats),
                 end => Ok(Some(end)),
             };
         }
         let shards = board.cipher;
+        let Board { cipher, have, .. } = data.get_mut();
         let rebuilt = {
             // Every shard passed in was compared with its SHA-256 when it
             // was read: the present data articles with their plan rows,
@@ -2103,17 +2141,17 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ColdReader<'a, C, N, T> {
             reconstruct(&data, &parity)
         };
         let Ok(rebuilt) = rebuilt else {
-            return unrecoverable(&self.stats);
+            return unrecoverable(end, &self.stats);
         };
         // Nothing of a rebuild is used unless all of it is what the plan
         // says: one article that differs means the stripe is not the one
         // the parity was made of.
-        let whole = rebuilt.len() == t
+        let whole = rebuilt.len() == gaps.len()
             && gaps.iter().zip(&rebuilt).all(|(&a, bytes)| {
                 bytes.len() as u64 == plan[a].cipher_len && sha256(bytes) == plan[a].payload_sha256
             });
         if !whole {
-            return unrecoverable(&self.stats);
+            return unrecoverable(end, &self.stats);
         }
         for (&a, bytes) in gaps.iter().zip(&rebuilt) {
             let start = plan[a].cipher_offset as usize;
@@ -2221,45 +2259,45 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ColdReader<'a, C, N, T> {
             order,
         };
         let starts = spans.iter().map(|span| span.start as usize).collect();
-        let board = core::cell::RefCell::new(Board::new(size, starts, desk.order.len()));
+        let mut board = core::cell::RefCell::new(Board::new(size, starts, desk.order.len()));
         let all = vec![true; plan.len()];
         // On the heap too: a body nests many futures above this one.
         let read = self.read_rows(&mut desk, &readers, now, plan, &all, &board);
         Box::pin(beside(put, read)).await?;
-        let mut board = board.into_inner();
-        let lost = board.have.iter().filter(|have| !**have).count();
-        if lost > 0 {
-            let end = desk.short(&readers, plan, &board, now);
+        let data = board.get_mut();
+        if data.have.iter().any(|have| !have) {
+            let end = desk.short(&readers, plan, data, now);
             // The extent's parity, if it has any, is read only for
             // articles that are lost where they were asked for: each by
             // a provider that said it has it not, or sent other bytes.
             // An article nobody answered for (no reader, or none that
             // could be asked) is not known to be lost.
-            let answered =
-                |article: usize| (0..board.providers).any(|i| board.asks(article, i) > 0);
-            if !(0..plan.len()).all(|a| board.have[a] || answered(a)) {
+            let answered = |article: usize| (0..data.providers).any(|i| data.asks(article, i) > 0);
+            if !(0..plan.len()).all(|a| data.have[a] || answered(a)) {
                 return Ok(end);
             }
             let lost = Lost {
                 stored: &stored,
-                have: &board.have,
-                end: &end,
+                data: &mut board,
+                data_at: now,
+                end,
             };
             // On the heap: the rebuild is rare, and what it holds across
             // its awaits is not carried by every read that never needs it.
-            let rebuild = self.rebuild(extent, lost, &mut board.cipher, &mut desk, &readers, put);
-            let rebuilt = Box::pin(rebuild).await?;
-            if let Some(end) = rebuilt {
+            let rebuild = self.rebuild(extent, lost, &mut desk, &readers, put);
+            if let Some(end) = Box::pin(rebuild).await? {
                 return Ok(end);
             }
         }
+        let board = board.into_inner();
         let cipher = board.cipher;
         if sha256(&cipher) != extent.cipher_sha256 {
             return Ok(ColdFetch::Unavailable);
         }
         let mut stats = self.stats.borrow_mut();
-        // Counted once the whole extent is what its digest says.
-        stats.rebuilt += lost as u32;
+        // Count only articles reconstructed rather than fetched, and
+        // only once the whole extent is what its digest says.
+        stats.rebuilt += board.have.iter().filter(|have| !**have).count() as u32;
         stats.extents += 1;
         drop(stats);
         Ok(ColdFetch::Filled(cipher))
