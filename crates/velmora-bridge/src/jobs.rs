@@ -34,7 +34,7 @@ use crate::config::{GcMode, Maintenance, ORPHAN_GRACE_MS};
 use crate::fetch::job_holder;
 use crate::ports::{
     BlobStore, Bridge, Catalog, Clock, JobSink, Kek, Lease, NntpConnector, SlotWait,
-    MAX_QUEUE_DELAY_SECS, PERMIT_SECS,
+    SlotWaitWindow, LEASE_SECS, MAX_QUEUE_DELAY_SECS, PERMIT_SECS,
 };
 use crate::post::{settle, Stop, POST_SOCKET_BYTES};
 use crate::recovery::delete_blob;
@@ -203,22 +203,18 @@ pub fn low_watermark(cap: u64) -> u64 {
     cap - cap / 10
 }
 
-/// How long after its claim a job that finds no provider slot still
-/// waits for one, where it used to give its row back at once and be
-/// delivered again 15 to 60 s later (a claim, a put-off and a queue
-/// delivery each time).
-///
-/// One permit lifetime, plus the gate's restart clock-skew allowance
-/// and one minimum polling interval. A restarted gate can wait out the
-/// full lifetime plus skew before handing out a slot; the job needs
-/// time to ask again once that hold ends. Counted from the claim, so it
-/// bounds the waits of one job together, whatever the number of
-/// backbones it asks. With the longest invocation that succeeded in a
-/// day of production (393 s), the job still ends well before its
-/// invocation gives it up ([`JOB_WAIT_MS`](crate::jobtable::JOB_WAIT_MS)).
+/// Ordinary slot-wait budget, counted from the job's claim across all
+/// the backbones it asks. One permit lifetime, the gate's restart skew
+/// allowance, and one polling interval. A gate that starts later than
+/// the claim can report a hold that ends later than this budget.
 pub const SLOT_WAIT_MS: i64 =
     PERMIT_SECS as i64 * 1000 + crate::gate::SKEW_MS + SLOT_POLL_MS as i64;
-const _: () = assert!(SLOT_WAIT_MS + 393_000 < crate::jobtable::JOB_WAIT_MS);
+/// Leave the longest successful production run measured (393 s) for
+/// the stage, within both the initial claim lease and the invocation's
+/// longer deadline ([`JOB_WAIT_MS`](crate::jobtable::JOB_WAIT_MS)).
+const SLOT_WAIT_HARD_MS: i64 = LEASE_SECS as i64 * 1000 - 393_000;
+const _: () = assert!(SLOT_WAIT_MS < SLOT_WAIT_HARD_MS);
+const _: () = assert!(LEASE_SECS as i64 * 1000 < crate::jobtable::JOB_WAIT_MS);
 /// How long a job that waits for a slot sleeps at least before it asks
 /// again. A slot is held for a second or more by the shortest job there
 /// is (a connect, a login and one pass of a light check), so asking
@@ -435,11 +431,12 @@ where
     /// Where the slots have a line ([`Catalog::await_permit`]) the job
     /// stands in it for the rest of that time, with no call and no
     /// sleep of its own, and asks again when a slot is its own; the
-    /// time over, it is put off. The line knows only the providers the
-    /// job asked: `back`, when one that was cooling can be asked again,
-    /// ends the stand there, and the job asks with the pool as it is
-    /// then. Elsewhere it sleeps [`slot_poll_ms`]: longer the more
-    /// providers it asks.
+    /// time over, it is put off. A reported restart hold can extend
+    /// the stand, but the stage still has time left on the claim. The
+    /// line knows only the providers the job asked: `back`, when one
+    /// that was cooling can be asked again, ends the stand there, and
+    /// the job asks with the pool as it is then. Elsewhere it sleeps
+    /// [`slot_poll_ms`]: longer the more providers it asks.
     /// The lease is not renewed here: a job that connects after a wait
     /// renews it first, as after any wait ([`Lease::fresh_at`]).
     pub(crate) async fn slot_wait(
@@ -456,15 +453,27 @@ where
         };
         let (holder, left) = (job_holder(lease), SLOT_WAIT_MS - age);
         let poll = slot_poll_ms(providers.len());
-        // Never shorter than the sleep between two asks without a line.
-        let stand = back.map_or(left, |at| left.min((at.0 - now).max(i64::from(poll))));
-        let line = self.catalog.await_permit(providers, &holder, stand, sleep);
+        // Never shorter than the sleep between two asks without a line,
+        // except at the job's hard limit.
+        let hard_left = SLOT_WAIT_HARD_MS - age;
+        let limit = back.map_or(hard_left, |at| {
+            hard_left.min((at.0 - now).max(i64::from(poll)))
+        });
+        let window = SlotWaitWindow {
+            normal_ms: left.min(limit),
+            hard_ms: limit,
+        };
+        let line = self.catalog.await_permit(providers, &holder, window, sleep);
         match line.await {
             Ok(SlotWait::Granted) => true,
             // Cut short for a provider that is back: asked again.
-            Ok(SlotWait::Elapsed) => stand < left,
+            Ok(SlotWait::Elapsed) => window.normal_ms < left,
             // No line here, or it could not be stood in: as before.
             Ok(SlotWait::Unsupported) | Err(_) => {
+                let left = lease.claimed_at.0 + SLOT_WAIT_HARD_MS - self.clock.now().0;
+                if left < i64::from(poll) {
+                    return false;
+                }
                 sleep(poll).await;
                 true
             }

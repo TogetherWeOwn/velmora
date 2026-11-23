@@ -90,8 +90,8 @@ use std::rc::Rc;
 use crate::gate::PermitGate;
 use crate::plan::{PackReport, StoredPlan};
 use crate::ports::{
-    Catalog, GrantPut, Guard, KeyHead, Lease, Permit, PermitClass, PublishOutcome, SlotWait, Sql,
-    SqlValue, UploadTarget,
+    Catalog, GrantPut, Guard, KeyHead, Lease, Permit, PermitClass, PublishOutcome, SlotWait,
+    SlotWaitWindow, Sql, SqlValue, UploadTarget,
 };
 use crate::recovery::Recorded;
 use crate::replay::{ReplayExtent, ReplayMark, ReplayProbe, ReplayPublish, RestoreProgress};
@@ -858,11 +858,11 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
         &self,
         providers: &[&ProviderConfig],
         holder: &str,
-        ms: i64,
+        window: SlotWaitWindow,
         sleep: &crate::ingress::Sleeper,
     ) -> Result<SlotWait> {
         match self.gate_of(PermitClass::Background) {
-            Some(gate) => gate.wait(providers, holder, ms, sleep).await,
+            Some(gate) => gate.wait(providers, holder, window, sleep).await,
             None => Ok(SlotWait::Unsupported),
         }
     }

@@ -902,6 +902,12 @@ async fn a_job_in_the_line_asks_again_when_a_slot_is_its_own() {
         (jobs::SLOT_WAIT_MS - 1_000..=jobs::SLOT_WAIT_MS).contains(ms),
         "{ms}"
     );
+    let claim_age = jobs::SLOT_WAIT_MS - ms;
+    assert_eq!(
+        catalog.line_hard_ms.get() + claim_age,
+        i64::from(LEASE_SECS) * 1000 - 393_000,
+        "the hard limit leaves the stage time to run under its claim"
+    );
     // One refusal for each socket it asked for, in the one round
     // before the wait: nothing was asked while it waited.
     let asked = catalog.permit_refusals.get() - refused;
@@ -939,6 +945,7 @@ async fn a_job_in_the_line_asks_again_when_a_cooldown_ends() {
     let (_, providers, ms) = &waits[0];
     assert_eq!(providers, &["p1".to_string()], "the one that was asked");
     assert!((9_000..=10_000).contains(ms), "{ms}");
+    assert_eq!(rig.bridge.catalog.line_hard_ms.get(), *ms);
     let waited = rig.bridge.clock.now().0 - now.0;
     assert!((9_000..12_000).contains(&waited), "{waited}");
     assert!(all_posted_by(&rig.plan(&s).await, "p0"));
