@@ -2389,15 +2389,20 @@ async fn cache_repair_does_not_leave_a_copy_after_gc_collects_the_extent() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn cache_repair_after_gc_blob_delete_leaves_a_fresh_gc_obligation() {
-    cache_repair_during_gc(None).await;
+    cache_repair_during_gc(None, 1).await;
 }
 
 #[tokio::test(flavor = "current_thread")]
 async fn refused_cache_repair_retries_a_failed_gc_enqueue() {
-    cache_repair_during_gc(Some(Trip::Fail)).await;
+    cache_repair_during_gc(Some(Trip::Fail), 1).await;
 }
 
-async fn cache_repair_during_gc(enqueue_fault: Option<Trip>) {
+#[tokio::test(flavor = "current_thread")]
+async fn refused_cache_repair_gc_drains_both_rows_after_an_enqueue_reply_is_lost() {
+    cache_repair_during_gc(Some(Trip::Lost), 2).await;
+}
+
+async fn cache_repair_during_gc(enqueue_fault: Option<Trip>, expected_obligations: usize) {
     let w = world_with(|cfg| cfg.gc_mode = velmora_bridge::config::GcMode::Disposable).await;
     let o = w.released("a", 233).await;
     let bridge = w.bridge();
@@ -2449,8 +2454,8 @@ async fn cache_repair_during_gc(enqueue_fault: Option<Trip>) {
         ));
         safety.delete(&key).await.unwrap();
         if let Some(fault) = enqueue_fault {
-            // Let the R2 PUT and the guarded re-pin batch run, then
-            // fail just the first insert of the new GC obligation.
+            // Let the R2 PUT and guarded re-pin batch run; trip the
+            // first enqueue either before it commits or on its reply.
             w.rig.trip().arm(2, fault);
         }
         safety.hold_put_prefix.replace(None);
@@ -2478,10 +2483,12 @@ async fn cache_repair_during_gc(enqueue_fault: Option<Trip>) {
     );
     let due = bridge.catalog.gc_due(now, 10, true).await.unwrap();
     assert!(!due.iter().any(|row| row.id == old.id), "old row is closed");
-    assert!(
+    assert_eq!(
         due.iter()
-            .any(|row| row.extent_id == o.extent && row.action == GcAction::DeleteSafety),
-        "the old completion must not close the replacement's GC obligation"
+            .filter(|row| row.extent_id == o.extent && row.action == GcAction::DeleteSafety)
+            .count(),
+        expected_obligations,
+        "the old completion must not close the replacement's GC obligation(s)"
     );
     assert_eq!(
         bridge.run_job(&Job::Gc { v: JOB_VERSION }).await,
@@ -2490,6 +2497,12 @@ async fn cache_repair_during_gc(enqueue_fault: Option<Trip>) {
     assert!(
         !w.has_safety(&o),
         "a later GC pass collects the replacement"
+    );
+    assert_eq!(
+        w.rig
+            .count("gc WHERE action = 'delete_safety' AND done_at IS NULL"),
+        0,
+        "GC completes every safety obligation, including a duplicate"
     );
 }
 
