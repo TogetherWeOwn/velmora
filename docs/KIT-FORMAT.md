@@ -1,5 +1,7 @@
 # Velmora recovery kit, format 1
 
+2026-11-23 — Named the drill sample evidence sources and assigned exactly 1 GiB to the middle bin.
+
 2026-11-23 — Defined index and pack decoding bounds, required explicit plan states, preserved object headers and checksums, and kept sample plan revisions fixed.
 
 2026-11-23 — Clarified that an article plan is not release evidence; added the authenticated archive check API.
@@ -61,6 +63,10 @@ The stream is a CBOR sequence (RFC 8742; no outer array). Each item is one defin
 - `record_ref`: `name` and `sha256` (32 bytes) of the original sealed record bytes. Match by exact name. Each included pack member has one reference.
 
 Each kit is a self-contained full build. There are no deltas or predecessor metadata. `manifest.json` has `format_version:1`, `kit_id`, `built_at` (RFC 3339 UTC), `source_counts` (map of source to counts), `tool_version`, and `files` (array of `{path, bytes, sha256}`; digests are lowercase hex). The manifest's own lowercase hex SHA-256 is detached in `manifest.json.sha256`, not self-referential. Upload immutable files first and the manifest last; copy only completed builds. Retention targets seven daily and four distinct weekly copies; this format defines no remote deletion operation.
+
+### Drill sample inputs
+
+The local sampler requires an independent evidence list. Each JSON row includes `bucket_name`, `key`, `size` in bytes, `md5` as 16 byte values, and `source` (`run48-released` for already release-checked Usenet reads through 1 GiB inclusive, or `full-verify` for a completed whole-object Usenet read above 1 GiB). Match all identity fields to the authenticated index; plan presence alone never qualifies an object. Historical evidence does not guarantee current provider availability. A sample copies the full index's exact selected extent plan revisions.
 
 ### Rust reader integration
 

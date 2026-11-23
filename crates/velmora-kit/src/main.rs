@@ -12,6 +12,7 @@ use velmora_kit::{
 };
 use zeroize::Zeroizing;
 
+mod output;
 mod sample;
 
 fn staged_record(staging: &Path, name: &str) -> Result<Option<Vec<u8>>, Error> {
@@ -99,21 +100,13 @@ fn run() -> Result<(), Error> {
             let live_count = objects.len();
             let projection = sample::Projection::new(&objects, &selected.names);
             let entries = projection.apply(all)?;
-            let index = File::options()
-                .write(true)
-                .create_new(true)
-                .open(index)
-                .map_err(|_| Error::Io)?;
-            write_index(BufWriter::new(&index), sample_id, &kek, &entries)?;
-            index.sync_all().map_err(|_| Error::Io)?;
-            let file = File::options()
-                .write(true)
-                .create_new(true)
-                .open(listing)
-                .map_err(|_| Error::Io)?;
-            let mut out = BufWriter::new(file);
+            let index = output::Staged::new(Path::new(index))?;
+            let listing = output::Staged::new(Path::new(listing))?;
+            write_index(BufWriter::new(&index.file), sample_id, &kek, &entries)?;
+            let mut out = BufWriter::new(&listing.file);
             serde_json::to_writer(&mut out, &selected.names).map_err(|_| Error::Io)?;
             out.flush().map_err(|_| Error::Io)?;
+            output::publish(&[&listing, &index])?;
             println!(
                 "{}",
                 serde_json::json!({ "live_objects": live_count, "record_refs": selected.names.len(), "overwritten_objects": selected.overwritten, "deleted_key_included": selected.deleted })
@@ -168,13 +161,8 @@ fn run() -> Result<(), Error> {
     .map_err(|_| Error::Format)?;
     let (entries, build_stats) =
         build_entries_with_stats(names, |name| staged_record(staging, name), &kek, &ann)?;
-    let file = File::options()
-        .write(true)
-        .create_new(true)
-        .open(index)
-        .map_err(|_| Error::Io)?;
-    write_index(BufWriter::new(&file), kit_id, &kek, &entries)?;
-    file.sync_all().map_err(|_| Error::Io)?;
+    let index = output::Staged::new(Path::new(index))?;
+    write_index(BufWriter::new(&index.file), kit_id, &kek, &entries)?;
     let mut counts = BTreeMap::from([("parity_omitted", build_stats.parity_omitted)]);
     for entry in &entries {
         let key = match entry {
@@ -193,17 +181,11 @@ fn run() -> Result<(), Error> {
             _ => None,
         })
         .collect();
-    let mut detail = coverage
+    let cover = coverage
         .first()
-        .map(|path| {
-            File::options()
-                .write(true)
-                .create_new(true)
-                .open(path)
-                .map(BufWriter::new)
-        })
-        .transpose()
-        .map_err(|_| Error::Io)?;
+        .map(|path| output::Staged::new(Path::new(path)))
+        .transpose()?;
+    let mut detail = cover.as_ref().map(|out| BufWriter::new(&out.file));
     for entry in &entries {
         let row = match entry {
             Entry::Object(o) => {
@@ -245,7 +227,7 @@ fn run() -> Result<(), Error> {
     drop(plans);
     drop(entries);
     // Read our own sealed output before handing it to the packager.
-    let verified = read_index(File::open(index).map_err(|_| Error::Io)?, kit_id, &kek)?;
+    let verified = read_index(index.reopen()?, kit_id, &kek)?;
     if counts.get("record_refs").copied().unwrap_or(0)
         != verified
             .iter()
@@ -254,10 +236,10 @@ fn run() -> Result<(), Error> {
     {
         return Err(Error::Format);
     }
-    println!(
-        "{}",
-        serde_json::to_string(&counts).map_err(|_| Error::Format)?
-    );
+    let summary = serde_json::to_string(&counts).map_err(|_| Error::Format)?;
+    let outputs: Vec<_> = cover.iter().chain([&index]).collect();
+    output::publish(&outputs)?;
+    println!("{summary}");
     Ok(())
 }
 
@@ -265,7 +247,12 @@ fn main() {
     if let Err(error) = run() {
         eprintln!("velmora-kit: {error}");
         if error == Error::Format {
-            eprintln!("usage: velmora-kit build <kit-id> <active-kek-version> <canonical-staging-directory> <record-list-json> <annotations-json> <new-index-path> (KEK on stdin)");
+            eprintln!(concat!(
+                "usage (KEK on stdin for all verbs):\n",
+                "  velmora-kit build <kit-id> <active-kek-version> <canonical-staging-dir> <record-list-json> <annotations-json> <new-index> [new-coverage-jsonl]\n",
+                "  velmora-kit sample <full-id> <sample-id> <active-kek-version> <full-index> <canonical-staging-dir> <evidence-json> <new-record-list-json> <new-index>\n",
+                "  velmora-kit verify-packs <kit-id> <active-kek-version> <index> [pack.tar.zst ...]",
+            ));
         }
         std::process::exit(1);
     }

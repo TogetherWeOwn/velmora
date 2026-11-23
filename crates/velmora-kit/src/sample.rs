@@ -36,7 +36,7 @@ pub fn choose<'a>(
         }
         let bin = match o.size {
             1..=1_048_575 => 0,
-            1_048_576..=1_073_741_823 => 1,
+            1_048_576..=1_073_741_824 => 1,
             size if size > 1_073_741_824 && o.extents.len() > 1 => 2,
             _ => continue,
         };
@@ -198,6 +198,13 @@ pub fn match_candidates(entries: &[Entry], evidence: &[Evidence]) -> Vec<String>
         .collect();
     let want: BTreeSet<_> = evidence
         .iter()
+        .filter(|e| {
+            e.md5.len() == 16
+                && match e.source {
+                    EvidenceSource::Run48Released => (1..=1_073_741_824).contains(&e.size),
+                    EvidenceSource::FullVerify => e.size > 1_073_741_824,
+                }
+        })
         .map(|e| {
             (
                 (e.bucket_name.as_str(), e.key.as_str(), e.size),
@@ -223,6 +230,14 @@ pub struct Evidence {
     key: String,
     size: u64,
     md5: Vec<u8>,
+    source: EvidenceSource,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum EvidenceSource {
+    Run48Released,
+    FullVerify,
 }
 
 /// A sample is a projection of an authenticated full index, never a new
@@ -300,14 +315,24 @@ mod tests {
             verified: None,
         })];
         let mut evidence = vec![];
-        for (size, count) in [(1, 10), (1 << 20, 9), ((1 << 30) + 1, 1)] {
+        for (size, count) in [(1, 10), (1 << 30, 9), ((1 << 30) + 1, 1)] {
             for i in 0..count {
                 let id = format!("{size}_{i}");
-                evidence.push(id.clone());
+                evidence.push(Evidence {
+                    bucket_name: "name".into(),
+                    key: id.clone(),
+                    size,
+                    md5: vec![0; 16],
+                    source: if size > (1 << 30) {
+                        EvidenceSource::FullVerify
+                    } else {
+                        EvidenceSource::Run48Released
+                    },
+                });
                 entries.push(Entry::Object(Object {
                     bucket_id: "bucket".into(),
-                    generation_id: id,
-                    key: "key".into(),
+                    generation_id: id.clone(),
+                    key: id,
                     size,
                     etag: "etag".into(),
                     content_type: None,
@@ -338,8 +363,10 @@ mod tests {
                 sha256: vec![0; 32],
             }));
         }
-        let objects = choose(&entries, &evidence, "seed").unwrap();
+        let matched = match_candidates(&entries, &evidence);
+        let objects = choose(&entries, &matched, "seed").unwrap();
         assert_eq!(objects.len(), 20);
+        assert_eq!(objects.iter().filter(|o| o.size == 1 << 30).count(), 9);
         let projection = Projection::new(
             &objects,
             &["m/art/extent".into(), "m/x/t_1/art/extent".into()],
@@ -358,11 +385,33 @@ mod tests {
                 .count(),
             2
         );
-        assert!(choose(&entries, &evidence[1..], "seed").is_err());
+        assert!(choose(
+            &entries,
+            &match_candidates(&entries, &evidence[1..]),
+            "seed"
+        )
+        .is_err());
+        assert!(choose(&entries, &match_candidates(&entries, &[]), "seed").is_err());
+        evidence.last_mut().unwrap().source = EvidenceSource::Run48Released;
+        assert!(choose(&entries, &match_candidates(&entries, &evidence), "seed").is_err());
         let Entry::Extent(e) = &mut entries[0] else {
             unreachable!()
         };
         e.plan_rev = None;
-        assert!(choose(&entries, &evidence, "seed").is_err());
+        assert!(choose(&entries, &matched, "seed").is_err());
+    }
+
+    #[test]
+    fn evidence_file_requires_a_recognized_source() {
+        for json in [
+            r#"{"bucket_name":"b","key":"k","size":1,"md5":[]}"#,
+            r#"{"bucket_name":"b","key":"k","size":1,"md5":[],"source":"article-plan"}"#,
+        ] {
+            assert!(serde_json::from_str::<Evidence>(json).is_err());
+        }
+        assert!(serde_json::from_str::<Evidence>(
+            r#"{"bucket_name":"b","key":"k","size":1,"md5":[],"source":"run48-released"}"#
+        )
+        .is_ok());
     }
 }

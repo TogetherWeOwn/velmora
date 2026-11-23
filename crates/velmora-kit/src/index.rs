@@ -264,6 +264,38 @@ fn read_bounded(
     Ok(entries)
 }
 
+fn zstd_window(frame: &[u8]) -> Result<u64, Error> {
+    if !frame.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]) {
+        return Err(Error::Compression);
+    }
+    // RFC 8878: single-segment frames use their content size as the
+    // window; other frames carry a window descriptor after the flags.
+    let flags = *frame.get(4).ok_or(Error::Compression)?;
+    if flags & 0x20 != 0 {
+        return zstd::zstd_safe::get_frame_content_size(frame)
+            .map_err(|_| Error::Compression)?
+            .ok_or(Error::Compression);
+    }
+    let descriptor = *frame.get(5).ok_or(Error::Compression)?;
+    let base = 1u64 << (10 + (descriptor >> 3));
+    Ok(base + (base / 8) * u64::from(descriptor & 7))
+}
+
+fn decode_frame(compressed: &[u8]) -> Result<Zeroizing<Vec<u8>>, Error> {
+    // The bulk zstd API can accept larger windows despite windowLogMax.
+    // Enforce the wire limit before passing frames to that API.
+    if zstd_window(compressed)? > PLAIN_MAX as u64
+        || zstd::zstd_safe::find_frame_compressed_size(compressed)
+            .map_err(|_| Error::Compression)?
+            != compressed.len()
+    {
+        return Err(Error::Compression);
+    }
+    zstd::bulk::decompress(compressed, PLAIN_MAX)
+        .map(Zeroizing::new)
+        .map_err(|_| Error::Compression)
+}
+
 struct PlainFrames<'a, R, K> {
     reader: R,
     kit_id: &'a str,
@@ -285,19 +317,7 @@ impl<R: Read, K: Kek> PlainFrames<'_, R, K> {
             return Err(Error::Authentication);
         }
         let compressed = open_frame(&mut body, header, self.kit_id, self.number as u64, self.kek)?;
-        if zstd::zstd_safe::find_frame_compressed_size(compressed)
-            .map_err(|_| Error::Compression)?
-            != compressed.len()
-        {
-            return Err(Error::Compression);
-        }
-        let mut decoder = zstd::bulk::Decompressor::new().map_err(|_| Error::Compression)?;
-        decoder.window_log_max(22).map_err(|_| Error::Compression)?;
-        self.slice = Zeroizing::new(
-            decoder
-                .decompress(compressed, PLAIN_MAX)
-                .map_err(|_| Error::Compression)?,
-        );
+        self.slice = decode_frame(compressed)?;
         self.remaining = self
             .remaining
             .checked_sub(self.slice.len() as u64)
@@ -355,6 +375,27 @@ mod tests {
             Cursor::new([&[1], &((ENCODED_MAX + 1) as u32).to_be_bytes()[..], &[0]].concat());
         assert!(matches!(next_frame(&mut oversized), Err(Error::Format)));
         assert_eq!(oversized.position(), 5);
+    }
+
+    #[test]
+    fn bulk_decompression_rejects_an_eight_mib_window() {
+        fn encode(log: u32) -> Vec<u8> {
+            let mut encoder = zstd::stream::Encoder::new(Vec::new(), 3).unwrap();
+            encoder.window_log(log).unwrap();
+            encoder.include_contentsize(false).unwrap();
+            encoder.write_all(b"synthetic").unwrap();
+            encoder.finish().unwrap()
+        }
+        let large = encode(23);
+        assert_eq!(zstd_window(&large).unwrap(), 8 * 1024 * 1024);
+        assert_eq!(
+            zstd::bulk::decompress(&large, PLAIN_MAX).unwrap(),
+            b"synthetic"
+        );
+        assert!(matches!(decode_frame(&large), Err(Error::Compression)));
+        let exact = encode(22);
+        assert_eq!(zstd_window(&exact).unwrap(), PLAIN_MAX as u64);
+        assert_eq!(&*decode_frame(&exact).unwrap(), b"synthetic");
     }
 
     #[test]
