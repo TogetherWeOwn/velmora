@@ -603,22 +603,41 @@ async fn cold_get_combines_newly_eligible_data_with_parity_after_the_cache_write
 async fn cold_get_retries_newly_eligible_data_without_a_prior_cache_write() {
     // One millisecond for the dial and one per BODY: the first data
     // pass starts at the cutoff and crosses it on its first answer.
-    cold_get_across_cutoff_without_a_prior_cache_write(1, 4 + 1).await;
+    cold_get_across_cutoff_without_a_prior_cache_write(1, Some(4 + 1), 0).await;
 }
 
 #[tokio::test]
 async fn cold_get_retries_newly_eligible_data_after_the_cutoff_crosses_during_parity() {
     // The dial and four data BODY requests take 5 ms. The two missing
     // parity BODY answers then take the clock past the cutoff.
-    cold_get_across_cutoff_without_a_prior_cache_write(6, 4 + 4 + 1).await;
+    cold_get_across_cutoff_without_a_prior_cache_write(6, Some(4 + 4 + 1), 0).await;
+}
+
+#[tokio::test]
+async fn cold_get_waits_for_a_reader_that_became_eligible_during_data() {
+    cold_get_across_cutoff_without_a_prior_cache_write(1, None, 3).await;
 }
 
 async fn cold_get_across_cutoff_without_a_prior_cache_write(
     ms_before_cutoff: i64,
-    expected_body_requests: usize,
+    expected_body_requests: Option<usize>,
+    refusals: u32,
 ) {
     let body = marked_plaintext(THREE);
-    let cold = posted_for_get(&body, true, true, None, |cfg| {
+    let backoffs = Rc::new(Cell::new(0));
+    let sleeper = (refusals > 0).then(|| {
+        let backoffs = Rc::clone(&backoffs);
+        let sleep: Sleeper = Rc::new(move |ms| {
+            if (COLD_POLL_MS..=COLD_POLL_MS + COLD_JITTER_MS).contains(&ms) {
+                backoffs.set(backoffs.get() + 1);
+                Box::pin(std::future::ready(()))
+            } else {
+                Box::pin(std::future::pending())
+            }
+        });
+        sleep
+    });
+    let cold = posted_for_get(&body, true, true, sleeper, |cfg| {
         cfg.cold_sockets = 1;
         cfg.providers[0].retention_days = Some(2);
         cfg.providers[1].retention_days = Some(1);
@@ -643,12 +662,38 @@ async fn cold_get_across_cutoff_without_a_prior_cache_write(
     let cutoff = missing.posted_at.unwrap().plus_secs(2 * 86_400);
     bridge.clock.set(cutoff.plus_ms(-ms_before_cutoff));
     bridge.nntp.slow(&bridge.clock, 1);
+    if refusals > 0 {
+        bridge.catalog.sql.with_conn(|c| {
+            c.execute_batch(&format!(
+                "CREATE TEMP TABLE data_refusals(n INTEGER);
+                 CREATE TEMP TRIGGER refuse_data_slot BEFORE UPDATE OF token ON provider_permits
+                 WHEN OLD.provider_id = 'p1'
+                   AND (SELECT COUNT(*) FROM data_refusals) < {refusals}
+                 BEGIN
+                     INSERT INTO data_refusals VALUES (1);
+                     SELECT RAISE(IGNORE);
+                 END;",
+            ))
+            .unwrap();
+        });
+    }
     let response = cold.get().await;
     eprintln!("cold GET returned {} bytes", response.body.len());
+    if refusals > 0 {
+        bridge.catalog.sql.with_conn(|c| {
+            let actual: u32 = c
+                .query_row("SELECT COUNT(*) FROM data_refusals", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(actual, refusals);
+        });
+    }
     response.expect(200);
     assert!(response.body == body, "cold GET returned different bytes");
     assert_eq!(response.stream_error, None);
-    assert_eq!(body_requests(&bridge.nntp), expected_body_requests);
+    if let Some(expected) = expected_body_requests {
+        assert_eq!(body_requests(&bridge.nntp), expected);
+    }
+    assert_eq!(backoffs.get(), u32::from(refusals > 0));
 }
 
 #[tokio::test]

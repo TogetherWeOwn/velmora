@@ -1175,8 +1175,16 @@ enum Phase {
     Retained,
     /// Those past the stated retention of every enabled reader.
     Orphan,
+    /// Either ordinary phase, when checking for work in the data fallback.
+    RetainedOrOrphan,
     /// All that are still missing.
     Any,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EligibleSince {
+    First,
+    Now,
 }
 
 /// Keep readers that qualified at the start even across waits and retries.
@@ -1186,26 +1194,38 @@ struct Eligibility<'a, T> {
 }
 
 impl<T: Clock> Eligibility<'_, T> {
-    /// Whether this phase counts the provider, regardless of cooldown
-    /// or slots. When no enabled reader retains an article, every
-    /// enabled reader may still hold it. Check the clock at each decision.
-    fn can_answer(
+    /// Whether this phase counts the provider and when it qualified,
+    /// regardless of cooldown or slots. When no enabled reader retains
+    /// an article, every enabled reader may still hold it. Check the
+    /// clock at each decision.
+    fn qualifies(
         &self,
         provider: &ProviderConfig,
         article: &ArticleRow,
         readers: &[&ProviderConfig],
         phase: Phase,
-    ) -> bool {
+    ) -> Option<EligibleSince> {
         let now = self.clock.now();
+        if !provider.enabled {
+            return None;
+        }
         let at = |at| {
             let retains = |p: &ProviderConfig| p.enabled && p.retains(article.posted_at, at);
+            let orphan = || !readers.iter().copied().any(retains);
             match phase {
                 Phase::Retained => retains(provider),
-                Phase::Orphan => !readers.iter().copied().any(retains),
+                Phase::Orphan => orphan(),
+                Phase::RetainedOrOrphan => retains(provider) || orphan(),
                 Phase::Any => true,
             }
         };
-        provider.enabled && (at(now) || (self.first != now && at(self.first)))
+        if at(self.first) {
+            Some(EligibleSince::First)
+        } else if self.first != now && at(now) {
+            Some(EligibleSince::Now)
+        } else {
+            None
+        }
     }
 }
 
@@ -1245,8 +1265,8 @@ struct Desk<'a> {
     out: Vec<Option<Out>>,
     /// Per provider: it gave no further slot.
     full: Vec<bool>,
-    /// Newly eligible data readers allowed one slot attempt after a
-    /// parity-pass refusal. Empty outside the data fallback.
+    /// Data readers allowed one more slot attempt after parity falls
+    /// short. Empty outside the data fallback.
     retry_slot: Vec<SlotRetry>,
     /// Per provider: sessions that broke off in this read.
     breaks: Vec<u32>,
@@ -1273,7 +1293,11 @@ impl Desk<'_> {
                 if board.have[a] || index.is_some_and(|i| !board.open(a, i)) {
                     continue;
                 }
-                let can = |phase| eligibility.can_answer(provider, row, readers, phase);
+                let can = |phase| {
+                    eligibility
+                        .qualifies(provider, row, readers, phase)
+                        .is_some()
+                };
                 let retained = can(Phase::Retained);
                 let orphan = !retained && can(Phase::Orphan);
                 if !(retained || orphan || self.drill && can(Phase::Any)) {
@@ -1770,7 +1794,9 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ColdReader<'a, C, N, T> {
         'phases: for &phase in phases {
             let wanted = |provider: usize, article: usize| {
                 chosen[article]
-                    && eligibility.can_answer(order[provider], &plan[article], readers, phase)
+                    && eligibility
+                        .qualifies(order[provider], &plan[article], readers, phase)
+                        .is_some()
             };
             loop {
                 let work: Vec<usize> = (0..order.len())
@@ -2123,20 +2149,27 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ColdReader<'a, C, N, T> {
         let board = board.into_inner();
         let usable: Vec<usize> = (0..m).filter(|&slot| board.have[slot]).collect();
         if usable.len() < t {
-            // Readers that finished the data pass without going out
-            // can still have work if a cutoff passed since then. Keep
-            // the board's answers, and give a reader that went Busy
-            // only during parity one more slot attempt for new work.
+            // Keep the board's answers. A cutoff can expose new data
+            // work while either pass is running. Give a reader one more
+            // slot attempt if it went Busy during parity, or went Busy
+            // in data and has work it didn't qualify for at the start.
             let data_board = data.get_mut();
             let mut retry_data = false;
             for (i, &reader) in desk.order.iter().enumerate() {
-                if before_parity[i].is_some() || desk.out[i] == Some(Out::Broken) {
+                if desk.out[i] == Some(Out::Broken) {
                     continue;
                 }
                 if gaps.iter().any(|&a| {
-                    data_board.open(a, i)
-                        && (eligibility.can_answer(reader, &plan[a], readers, Phase::Retained)
-                            || eligibility.can_answer(reader, &plan[a], readers, Phase::Orphan))
+                    if !data_board.open(a, i) {
+                        return false;
+                    }
+                    let since =
+                        eligibility.qualifies(reader, &plan[a], readers, Phase::RetainedOrOrphan);
+                    match before_parity[i] {
+                        None => since.is_some(),
+                        Some(Out::Busy) => since == Some(EligibleSince::Now),
+                        Some(Out::Broken) => false,
+                    }
                 }) {
                     retry_data = true;
                     if desk.out[i] == Some(Out::Busy) {
