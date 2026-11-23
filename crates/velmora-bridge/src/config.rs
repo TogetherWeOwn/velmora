@@ -1224,6 +1224,28 @@ pub struct KekRing {
 }
 
 impl KekRing {
+    /// Decode a standard padded base64 KEK without allocating a decoded
+    /// vector. The caller owns and must protect the input text.
+    pub fn decode_key(encoded: &str) -> Option<KekBytes> {
+        let mut decoded = zeroize::Zeroizing::new([0u8; 32]);
+        let count = base64::engine::general_purpose::STANDARD
+            .decode_slice(encoded, decoded.as_mut())
+            .ok()?;
+        (count == decoded.len()).then(|| KekBytes::new(*decoded))
+    }
+
+    /// Construct a key ring from owned, already decoded keys. Both this
+    /// constructor and `from_vars` require the active key to be present.
+    pub fn from_keys(active: u32, keys: BTreeMap<u32, KekBytes>) -> Result<Self, ConfigError> {
+        if active == 0 || active > MAX_KEK_VERSION || keys.keys().any(|&v| v == 0 || v > active) {
+            return Err(ConfigError::Invalid("VELMORA_KEK_ACTIVE".into()));
+        }
+        if !keys.contains_key(&active) {
+            return Err(ConfigError::Missing(format!("VELMORA_KEK_{active}")));
+        }
+        Ok(Self { active, keys })
+    }
+
     /// Loads every `VELMORA_KEK_<v>` for `v` in `1..=active`, so data
     /// wrapped under an older version stays readable after a rotation.
     /// Fails closed when the active version is absent, or when any present
@@ -1246,13 +1268,13 @@ impl KekRing {
                 Err(e) => return Err(e),
             }
         }
-        Ok(KekRing { active, keys })
+        Ok(Self { active, keys })
     }
 }
 
 impl Kek for KekRing {
     fn active(&self) -> (u32, &KekBytes) {
-        // `from_vars` always inserts the active version.
+        // The constructors require the active version.
         let key = &self.keys[&self.active];
         (self.active, key)
     }
