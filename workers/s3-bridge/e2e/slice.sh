@@ -10,8 +10,9 @@
 # aws-cli runs with its default checksum settings (CRC64NVME; over HTTPS the
 # bodies are aws-chunked with a trailing checksum, over HTTP the checksum is
 # a header). Step 0b repeats uploads with `when_required` (no checksum, no
-# aws-chunked), so both client settings are covered in every run. Step 7 restarts it with DEV_DROP_NOTIFY_N=1 so the next
-# queue send is refused, then calls the scheduled handler. Step 7b restarts it
+# aws-chunked), so both client settings are covered in every run. Step 7
+# restarts it with DEV_DROP_NOTIFY_N=2 so both PUT wake-ups are refused,
+# then calls the scheduled handler. Step 7b restarts it
 # with DEV_TOMBSTONE_PUT_DELAY_MS so a DeleteObjects outlasts aws-cli's read
 # timeout. Everything it started or wrote is removed on exit.
 #
@@ -1109,7 +1110,7 @@ expect_err "HEAD $SMALL_KEY after delete" '\(404\)' \
 STEP=7-dispatcher-recovery
 log "step $STEP"
 if [[ $MODE == local ]]; then
-  # Let earlier work settle, so the refused send is this PUT's notification.
+  # Let earlier work settle, so the refused sends are both for this PUT.
   settled() {
     local j
     j=$(adm_try "$BASE/_admin/status") || return 1
@@ -1119,11 +1120,11 @@ if [[ $MODE == local ]]; then
     json=$(adm "GET /_admin/status" "$BASE/_admin/status")
     fail "earlier objects settled within 180 s" "no outbox row in post or verify" "$json"
   fi
-  # Restart with the first queue send of the new isolate refused: the PUT
-  # leaves its outbox row unmarked, so the next dispatcher run sends the job.
-  log "restarting wrangler dev with DEV_DROP_NOTIFY_N=1"
+  # Refuse both the early and fallback sends: the PUT leaves its outbox
+  # row unmarked, so the next dispatcher run sends the job.
+  log "restarting wrangler dev with DEV_DROP_NOTIFY_N=2"
   stop_wrangler
-  write_dev_vars 1
+  write_dev_vars 2
   start_wrangler
   run_aws "PUT a/lost.bin" "${S3[@]}" cp "$T/small.bin" "s3://$SB/a/lost.bin" >/dev/null
   json=$(adm "GET /_admin/objects/$SB/a/lost.bin" "$BASE/_admin/objects/$SB/a/lost.bin")
@@ -1145,8 +1146,8 @@ if [[ $MODE == local ]]; then
   # 125 s; when that outlasts the re-driven post job's 120 s slot wait,
   # the job is put off for 15 to 60 s, then posts and verifies. On CI that
   # took 150 to 192 s after the restart, past the old 180 s window more
-  # than once. The check is unchanged: the PUT's own wake-up was refused,
-  # so the cron must send a replacement job, which the queue consumers
+  # than once. Both of the PUT's wake-ups were refused, so the cron
+  # must send a replacement job, which the queue consumers
   # then post and verify, bringing the object to release or done with a
   # counted backbone.
   if ! poll 300 2 cron_then_check; then

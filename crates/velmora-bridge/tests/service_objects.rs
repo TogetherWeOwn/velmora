@@ -201,7 +201,13 @@ async fn put_is_not_acked_when_the_commit_fails() {
     assert_eq!(rig.count("generations"), 0);
     assert_eq!(rig.count("extents"), 0);
     assert_eq!(rig.count("outbox"), 0);
-    assert!(rig.bridge.jobs.inner.sent().is_empty());
+    // The wake-up names a generation that did not commit.
+    let sent = rig.bridge.jobs.inner.sent();
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0].delay_secs, 1);
+    rig.bridge.clock.advance_secs(sent[0].delay_secs);
+    assert_eq!(rig.bridge.run_job(&sent[0].job).await, JobOutcome::Ack);
+    assert_eq!(rig.count("outbox"), 0);
     rig.head(&signer, BUCKET, "k").await.expect(404);
 }
 
