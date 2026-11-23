@@ -30,6 +30,97 @@ pub struct Point {
     /// letters or digits, or `-`. It is `blob5` of a request point.
     pub colo: String,
     pub doubles: Vec<f64>,
+    get_error: Option<GetObservation>,
+}
+
+impl Point {
+    /// The exact blobs sent to Analytics Engine. Colo stays in blob5
+    /// for request points; GET failures may append blob6 and blob7.
+    pub fn analytics_blobs(&self) -> impl Iterator<Item = &str> {
+        self.blobs
+            .iter()
+            .copied()
+            .chain(core::iter::once(self.colo.as_str()))
+            .chain(self.get_error.into_iter().flat_map(|get| {
+                [
+                    get.stage.unwrap_or(GetFailureStage::Other).code(),
+                    get.size.code(),
+                ]
+            }))
+    }
+}
+
+/// The last unrecovered stage before an object GET's error response.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GetFailureStage {
+    Lookup,
+    Plan,
+    Grant,
+    SubrangeTransport,
+    SubrangeLength,
+    SubrangeStatus,
+    R2,
+    Nntp,
+    Budget,
+    Other,
+}
+
+impl GetFailureStage {
+    fn code(self) -> &'static str {
+        match self {
+            Self::Lookup => "lookup",
+            Self::Plan => "plan",
+            Self::Grant => "grant",
+            Self::SubrangeTransport => "subrange_transport",
+            Self::SubrangeLength => "subrange_length",
+            Self::SubrangeStatus => "subrange_status",
+            Self::R2 => "r2",
+            Self::Nntp => "nntp",
+            Self::Budget => "budget",
+            Self::Other => "other",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum GetSize {
+    #[default]
+    Unknown,
+    AtMost1GiB,
+    Over1GiB,
+}
+
+impl GetSize {
+    fn code(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::AtMost1GiB => "le_1gib",
+            Self::Over1GiB => "gt_1gib",
+        }
+    }
+}
+
+/// Redacted per-request observations; not part of the S3 response.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GetObservation {
+    stage: Option<GetFailureStage>,
+    size: GetSize,
+}
+
+impl GetObservation {
+    /// Classify the full object size, even for a range GET. Do not retain
+    /// the exact size or try to guess it before the generation is known.
+    pub fn record_size(&mut self, bytes: u64) {
+        self.size = if bytes <= 1 << 30 {
+            GetSize::AtMost1GiB
+        } else {
+            GetSize::Over1GiB
+        };
+    }
+
+    pub fn mark_stage(&mut self, stage: GetFailureStage) {
+        self.stage = Some(stage);
+    }
 }
 
 /// What the Worker knows of one answered request.
@@ -49,6 +140,7 @@ pub struct Request<'a> {
     pub bytes_out: u64,
     /// The Cloudflare data centre that answered (`cf.colo`).
     pub colo: &'a str,
+    pub get: GetObservation,
 }
 
 fn method(m: &str) -> &'static str {
@@ -115,6 +207,7 @@ pub fn request_point(r: &Request<'_>, weight: u32) -> Point {
             },
         ],
         colo: colo(r.colo),
+        get_error: (r.method == "GET" && !r.admin && r.status >= 400).then_some(r.get),
         doubles: vec![
             f64::from(r.status),
             r.latency_ms as f64,
@@ -132,6 +225,7 @@ pub fn cold_read_point() -> Point {
         index: "cold",
         blobs: vec!["cold"],
         colo: "-".to_string(),
+        get_error: None,
         doubles: vec![1.0],
     }
 }
@@ -150,6 +244,7 @@ mod tests {
             bytes_in: 3,
             bytes_out: 4096,
             colo,
+            get: GetObservation::default(),
         }
     }
 
@@ -195,6 +290,43 @@ mod tests {
         assert_eq!(request_point(&admin, 10).blobs[3], "admin");
         let sub = Request { sub: true, ..admin };
         assert_eq!(request_point(&sub, 1).blobs[3], "sub");
+    }
+
+    #[test]
+    fn get_failure_dimensions_are_allowlisted_and_follow_colo() {
+        let mut r = req(
+            "GET",
+            500,
+            "/private-bucket/private-key?X-Amz-Signature=redacted",
+        );
+        r.get.record_size(1_073_741_825);
+        r.get.mark_stage(GetFailureStage::Plan);
+        let p = request_point(&r, 1);
+        assert_eq!(p.index, "req");
+        assert_eq!(
+            p.analytics_blobs().collect::<Vec<_>>(),
+            ["req", "GET", "5xx", "s3", "-", "plan", "gt_1gib"]
+        );
+        assert_eq!(p.doubles, [500.0, 12.0, 3.0, 4096.0, 1.0]);
+
+        r.status = 200;
+        assert_eq!(request_point(&r, 1).analytics_blobs().count(), 5);
+        r.status = 500;
+        r.method = "HEAD";
+        assert_eq!(request_point(&r, 1).analytics_blobs().count(), 5);
+        r.method = "GET";
+        r.admin = true;
+        assert_eq!(request_point(&r, 1).analytics_blobs().count(), 5);
+    }
+
+    #[test]
+    fn get_failure_without_read_context_is_other_and_unknown() {
+        let r = req("GET", 500, "iad");
+        let p = request_point(&r, 1);
+        assert_eq!(
+            p.analytics_blobs().collect::<Vec<_>>(),
+            ["req", "GET", "5xx", "s3", "IAD", "other", "unknown"]
+        );
     }
 
     #[test]

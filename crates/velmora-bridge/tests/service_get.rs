@@ -17,6 +17,7 @@ use velmora_bridge::fetch::{COLD_JITTER_MS, COLD_POLL_MS, COLD_WAIT_MS};
 use velmora_bridge::ingress::{
     ByteBudget, Charge, Sleeper, Spawner, CHARGE_POLL_MS, CHARGE_WAIT_MS,
 };
+use velmora_bridge::metrics::{request_point, GetObservation, Request};
 use velmora_bridge::service::PIECE_WAIT_MS;
 use velmora_bridge::testkit::PublishUnrecorded;
 use velmora_bridge::*;
@@ -45,6 +46,81 @@ async fn get_range<N: NntpConnector + 'static>(
     range: &str,
 ) -> Resp {
     get(rig, signer, key, &[("range", range)]).await
+}
+
+async fn observed_get<N: NntpConnector + 'static>(
+    rig: &Rig<N>,
+    req: S3Request,
+    stage: &str,
+    size: &str,
+) -> Resp {
+    let mut get = GetObservation::default();
+    let resp = Rc::clone(&rig.bridge).handle_observed(req, &mut get).await;
+    let point = request_point(
+        &Request {
+            method: "GET",
+            admin: false,
+            sub: false,
+            status: resp.status,
+            latency_ms: 0,
+            bytes_in: 0,
+            bytes_out: 0,
+            colo: "IAD",
+            get,
+        },
+        1,
+    );
+    assert_eq!(
+        point.analytics_blobs().skip(5).collect::<Vec<_>>(),
+        [stage, size]
+    );
+    Resp::collect(resp).await
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn get_catalogue_and_range_planning_failures_keep_their_error_responses() {
+    let rig = rig();
+    let (bucket, signer) = rig.standard(BUCKET).await;
+    let key = "object-lookup-fixture";
+    rig.put(&signer, BUCKET, key, b"payload").await.expect(200);
+    let (generation, _) = rig.live(&bucket, key).await.unwrap();
+    let req = || {
+        signer.sign(
+            rig.now(),
+            Method::Get,
+            &path(BUCKET, key),
+            &[],
+            &[("range", "bytes=0-1")],
+            Vec::new(),
+        )
+    };
+    let sql = &rig.bridge.catalog.sql;
+    *sql.fail_matching.borrow_mut() = Some(("FROM objects o JOIN generations g", 0));
+    observed_get(&rig, req().into_request(), "lookup", "unknown")
+        .await
+        .expect_error(500, "InternalError");
+    sql.fail_matching.borrow_mut().take();
+
+    // A two-byte range of a large object is classed by the object, not
+    // by the Range header or the XML response's length.
+    sql.with_conn(|conn| {
+        conn.execute(
+            "UPDATE generations SET size = ?1, content_json = 'null' WHERE id = ?2",
+            rusqlite::params![(1_i64 << 30) + 1, generation.id.as_str()],
+        )
+    })
+    .unwrap();
+    observed_get(&rig, req().into_request(), "plan", "gt_1gib")
+        .await
+        .expect_error(500, "InternalError");
+
+    let mut unsigned = req().into_request();
+    unsigned
+        .headers
+        .retain(|(name, _)| !name.eq_ignore_ascii_case("authorization"));
+    observed_get(&rig, unsigned, "other", "unknown")
+        .await
+        .expect(403);
 }
 
 /// Commits `parts` as one object of several extents, the way a completed
@@ -2385,9 +2461,38 @@ async fn never_posted_object_without_copies_is_unavailable() {
     let (bucket, signer) = rig.standard(BUCKET).await;
     rig.put(&signer, BUCKET, "k", b"payload").await.expect(200);
     let (_, extents) = rig.live(&bucket, "k").await.unwrap();
+    let req = || {
+        signer.sign(
+            rig.now(),
+            Method::Get,
+            &path(BUCKET, "k"),
+            &[],
+            &[],
+            Vec::new(),
+        )
+    };
+    let held = rig
+        .bridge
+        .budget
+        .try_charge(rig.bridge.budget.capacity())
+        .unwrap();
+    observed_get(&rig, req().into_request(), "budget", "le_1gib")
+        .await
+        .expect_error(503, "SlowDown");
+    drop(held);
+
     evict(&rig, &extents[0]).await;
-    let resp = get(&rig, &signer, "k", &[]).await;
-    resp.expect_error(503, "ServiceUnavailable");
+    observed_get(&rig, req().into_request(), "r2", "le_1gib")
+        .await
+        .expect_error(503, "ServiceUnavailable");
+
+    // A failure while looking for the articles is still a 500.
+    let sql = &rig.bridge.catalog.sql;
+    *sql.fail_matching.borrow_mut() = Some(("plan AS headers", 0));
+    observed_get(&rig, req().into_request(), "nntp", "le_1gib")
+        .await
+        .expect_error(500, "InternalError");
+    sql.fail_matching.borrow_mut().take();
     // The catalogue still knows the object.
     rig.head(&signer, BUCKET, "k").await.expect(200);
 }

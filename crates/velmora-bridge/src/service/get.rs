@@ -28,6 +28,7 @@ use crate::fetch::{
     ColdReader, COLD_WAIT_MS,
 };
 use crate::ingress::{ByteBudget, Charge, Spawner, CHARGE_WAIT_MS};
+use crate::metrics::{GetFailureStage as Stage, GetObservation};
 use crate::ports::{BlobStore, Bridge, Catalog, Clock, JobSink, Kek, NntpConnector};
 use crate::types::{
     BridgeError, Bucket, ByteSpan, ExtentId, ExtentRow, RespBody, Result, S3Request, S3Response,
@@ -109,16 +110,23 @@ enum ReadFail {
     /// Out of byte budget or provider slots: `503 SlowDown`.
     Busy,
     /// No source holds the extent intact: `503 ServiceUnavailable`.
-    Unavailable,
-    Internal,
+    Unavailable(Stage),
+    Internal(Stage),
 }
 
 impl ReadFail {
+    fn stage(&self) -> Stage {
+        match *self {
+            Self::Busy => Stage::Budget,
+            Self::Unavailable(stage) | Self::Internal(stage) => stage,
+        }
+    }
+
     fn response(&self) -> S3Response {
         match self {
             ReadFail::Busy => s3_error(ErrorCode::SlowDown),
-            ReadFail::Unavailable => unavailable(),
-            ReadFail::Internal => internal(),
+            ReadFail::Unavailable(_) => unavailable(),
+            ReadFail::Internal(_) => internal(),
         }
     }
 
@@ -126,8 +134,10 @@ impl ReadFail {
     fn stream_error(&self) -> BridgeError {
         match self {
             ReadFail::Busy => BridgeError::Invalid("read interrupted: busy"),
-            ReadFail::Unavailable => BridgeError::Invalid("read interrupted: extent unavailable"),
-            ReadFail::Internal => BridgeError::Invalid("read interrupted"),
+            ReadFail::Unavailable(_) => {
+                BridgeError::Invalid("read interrupted: extent unavailable")
+            }
+            ReadFail::Internal(_) => BridgeError::Invalid("read interrupted"),
         }
     }
 }
@@ -142,10 +152,9 @@ pub(super) async fn get_object<
 >(
     bridge: &Rc<Bridge<C, B, N, J, K, T>>,
     req: S3Request,
-    _bucket: &str,
-    _key: &str,
+    observed: &mut GetObservation,
 ) -> S3Response {
-    match read(bridge, req, false).await {
+    match read(bridge, req, false, observed).await {
         Ok(resp) | Err(resp) => resp,
     }
 }
@@ -163,7 +172,7 @@ pub(super) async fn head_object<
     _bucket: &str,
     _key: &str,
 ) -> S3Response {
-    match read(bridge, req, true).await {
+    match read(bridge, req, true, &mut GetObservation::default()).await {
         Ok(resp) => resp,
         // A HEAD response has no body, errors included.
         Err(mut resp) => {
@@ -283,9 +292,11 @@ async fn read<
     bridge: &Rc<Bridge<C, B, N, J, K, T>>,
     req: S3Request,
     head: bool,
+    observed: &mut GetObservation,
 ) -> core::result::Result<S3Response, S3Response> {
     let authed = authenticate(bridge, &req).await?;
     let (bucket, key) = authed.object()?;
+    observed.mark_stage(Stage::Lookup);
     let Some(generation) = bridge
         .catalog
         .live_generation(&bucket.id, key)
@@ -295,6 +306,8 @@ async fn read<
         return Err(s3_error(ErrorCode::NoSuchKey));
     };
 
+    observed.record_size(generation.size);
+    observed.mark_stage(Stage::Plan);
     let metadata = ObjectMetadata::new(
         generation.id.as_str().to_owned(),
         generation.size,
@@ -359,12 +372,21 @@ async fn read<
         .start
         .checked_add(range.length())
         .ok_or_else(internal)?;
+    observed.mark_stage(Stage::Lookup);
     let extents = bridge
         .catalog
         .extents_in(&generation.id, range.start, end)
         .await
         .map_err(|_| internal())?;
-    resp.body = body(bridge, bucket.clone(), extents, range.start, range.length()).await?;
+    resp.body = body(
+        bridge,
+        bucket.clone(),
+        extents,
+        range.start,
+        range.length(),
+        observed,
+    )
+    .await?;
     Ok(resp)
 }
 
@@ -382,11 +404,13 @@ pub(super) async fn fanout_piece<
 >(
     bridge: &Rc<Bridge<C, B, N, J, K, T>>,
     req: S3Request,
+    observed: &mut GetObservation,
 ) -> S3Response {
     let Ok(grant) = admit(&bridge.kek, &req, bridge.clock.now()) else {
+        observed.mark_stage(Stage::Grant);
         return s3_error(ErrorCode::AccessDenied);
     };
-    match granted(bridge, &grant).await {
+    match granted(bridge, &grant, observed).await {
         Ok(resp) | Err(resp) => resp,
     }
 }
@@ -401,20 +425,25 @@ async fn granted<
 >(
     bridge: &Rc<Bridge<C, B, N, J, K, T>>,
     grant: &Grant,
+    observed: &mut GetObservation,
 ) -> core::result::Result<S3Response, S3Response> {
     // The grant was minted for a generation that existed and a range
     // inside it; anything else here is a fault, not a client error.
-    let (bucket, generation) = bridge
+    observed.mark_stage(Stage::Lookup);
+    let generation = bridge
         .catalog
         .generation_by_id(&grant.bucket, &grant.generation)
         .await
-        .map_err(|_| internal())?
-        .ok_or_else(internal)?;
+        .map_err(|_| internal())?;
+    observed.mark_stage(Stage::Grant);
+    let (bucket, generation) = generation.ok_or_else(internal)?;
+    observed.record_size(generation.size);
     let end = grant
         .start
         .checked_add(grant.len)
         .filter(|&end| end <= generation.size)
         .ok_or_else(internal)?;
+    observed.mark_stage(Stage::Lookup);
     let extents = bridge
         .catalog
         .extents_in(&generation.id, grant.start, end)
@@ -426,7 +455,7 @@ async fn granted<
             ("content-length".into(), grant.len.to_string()),
             ("content-type".into(), "application/octet-stream".into()),
         ],
-        body: body(bridge, bucket, extents, grant.start, grant.len).await?,
+        body: body(bridge, bucket, extents, grant.start, grant.len, observed).await?,
     })
 }
 
@@ -445,7 +474,9 @@ async fn body<
     extents: Vec<ExtentRow>,
     start: u64,
     len: u64,
+    observed: &mut GetObservation,
 ) -> core::result::Result<RespBody, S3Response> {
+    observed.mark_stage(Stage::Plan);
     let todo = pieces(extents, start, len).ok_or_else(internal)?;
     if todo.is_empty() {
         return Err(internal());
@@ -464,8 +495,14 @@ async fn body<
     // object that cannot be read is an error response, not a cut-off 200.
     let first = match items.next().await {
         Some(Ok(held)) => held,
-        Some(Err(fail)) => return Err(fail.response()),
-        None => return Err(internal()),
+        Some(Err(fail)) => {
+            observed.mark_stage(fail.stage());
+            return Err(fail.response());
+        }
+        None => {
+            observed.mark_stage(Stage::Other);
+            return Err(internal());
+        }
     };
     Ok(RespBody::Stream(
         stream::once(async move { Ok(first) })
@@ -1201,22 +1238,22 @@ where
                     break;
                 };
                 drop(src);
-                let held = retain(&room, work, plain).ok_or(ReadFail::Internal)?;
+                let held = retain(&room, work, plain).ok_or(ReadFail::Internal(Stage::Budget))?;
                 self.wait(stamp_read(bridge, &extent.id, from_cache)).await;
                 return Ok(held);
             }
         }
-        Err(ReadFail::Unavailable)
+        Err(ReadFail::Unavailable(Stage::R2))
     }
 
     async fn piece(&mut self, bucket: &Bucket, piece: &Piece) -> Item {
         let bridge = self.bridge;
         let extent = &piece.extent;
         self.until = None;
-        let span =
-            cipher_span(extent.plain_size, piece.off, piece.len).ok_or(ReadFail::Internal)?;
+        let span = cipher_span(extent.plain_size, piece.off, piece.len)
+            .ok_or(ReadFail::Internal(Stage::Plan))?;
         match self.warm(bucket, piece, span).await {
-            Err(ReadFail::Unavailable) => {}
+            Err(ReadFail::Unavailable(_)) => {}
             found => {
                 // Idle connections would outlive their slots.
                 self.hang_up().await;
@@ -1268,7 +1305,7 @@ where
                 none => none.insert(
                     bridge
                         .cold_reader()
-                        .map_err(|_| ReadFail::Internal)?
+                        .map_err(|_| ReadFail::Internal(Stage::Nntp))?
                         .charged_to(Rc::clone(&room)),
                 ),
             };
@@ -1306,7 +1343,7 @@ where
                         }
                     }
                     let plain = open(&bridge.kek, bucket, piece, 0, &cipher)
-                        .ok_or(ReadFail::Unavailable)?;
+                        .ok_or(ReadFail::Unavailable(Stage::Nntp))?;
                     // The charge is split between the plaintext, which
                     // leaves with the piece, and the ciphertext, which
                     // stays until it is written. Nothing runs between the
@@ -1315,7 +1352,7 @@ where
                     drop(work);
                     let held = room
                         .try_charge(plain.len() as u64)
-                        .ok_or(ReadFail::Internal)?;
+                        .ok_or(ReadFail::Internal(Stage::Budget))?;
                     if let Some(copy) = room.try_charge(cipher.len() as u64) {
                         let (extent, spent) = (extent.clone(), Rc::clone(&self.spent));
                         let write = async move {
@@ -1341,10 +1378,19 @@ where
                     crate::trace::cold_read(|| {
                         format!("extent-unrecoverable extent={}", extent.id)
                     });
-                    return Err(ReadFail::Unavailable);
+                    return Err(ReadFail::Unavailable(Stage::Nntp));
                 }
-                Ok(ColdFetch::Unavailable) => return Err(ReadFail::Unavailable),
-                Err(_) => return Err(ReadFail::Internal),
+                Ok(ColdFetch::Unavailable) => {
+                    // If nothing was published to Usenet yet, the lost
+                    // warm copies are the reason the extent is unavailable.
+                    let stage = if extent.article_count.is_none() {
+                        Stage::R2
+                    } else {
+                        Stage::Nntp
+                    };
+                    return Err(ReadFail::Unavailable(stage));
+                }
+                Err(_) => return Err(ReadFail::Internal(Stage::Nntp)),
             }
             // Nothing is held while waiting: neither slots nor budget.
             self.hang_up().await;
@@ -1387,7 +1433,7 @@ where
             }
             // Another reader may have filled the cache in the meantime.
             match self.warm(bucket, piece, span).await {
-                Err(ReadFail::Unavailable) => {}
+                Err(ReadFail::Unavailable(_)) => {}
                 found => return found,
             }
             if bridge.clock.now() >= deadline {

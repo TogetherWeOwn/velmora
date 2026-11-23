@@ -1705,7 +1705,49 @@ sampling weight as numbers; sum the weight to estimate request counts.
 A run of reads from Usenet (cache misses) is a point of kind `cold`,
 never sampled. One GET can have several such runs and a copy reads
 too, so these points show how much is read from Usenet over time; they
-are not a hit rate and are not to be subtracted from the GET count. No bucket, key, query, header or request id is written.
+are not a hit rate and are not to be subtracted from the GET count. No
+bucket, key, query, header, ID, IP address or token is written.
+
+### GET failure stages
+
+Workers Analytics (GraphQL) can show HTTP status counts, including
+responses from the runtime. Use the [Analytics Engine SQL API][ae-sql]
+to break down Worker-answered GET errors, including range GETs. This
+uses the existing request point, with colo still in `blob5`:
+
+- `blob6`: `lookup` (catalogue), `plan` (metadata, range or extent
+  planning), `grant` (fan-out grant creation, admission or scope),
+  `subrange_transport` (binding/stream setup or opening the first
+  sub-request), `subrange_length` (first sub-range's declared length),
+  `subrange_status` (other non-200 first sub-range response), `r2`
+  (warm copies unavailable without a cold plan), `nntp` (cold read),
+  `budget` (reader budget or capacity), or `other` (unclassified).
+- `blob7`: `le_1gib` or `gt_1gib` for the full object size, including
+  for range GETs; `unknown` if it was not available. This does not
+  disclose the exact object size or indicate that a range fanned out.
+
+For example, group public S3 GET 500s over the last hour by stage and
+size class (`velmora_requests_dev` for dev):
+
+```sql
+SELECT blob6 AS stage, blob7 AS size_class,
+       SUM(_sample_interval * double5) AS requests
+FROM velmora_requests
+WHERE timestamp >= NOW() - INTERVAL '1' HOUR
+  AND index1 = 'req' AND blob2 = 'GET' AND blob4 = 's3'
+  AND double1 = 500 AND blob6 != ''
+GROUP BY stage, size_class
+ORDER BY requests DESC
+```
+
+The empty-stage filter omits older points. To inspect failures inside
+sub-requests, query `blob4 = 'sub'` separately (use `blob3 = '5xx'` to
+include 503s); do not add these to public counts. The Worker reports
+one response point before streaming the body. Failures after that
+point, including later sub-range failures on the front request, do
+not change its HTTP status or that point.
+
+[ae-sql]: https://developers.cloudflare.com/analytics/analytics-engine/sql-api/
 
 ## KEK
 

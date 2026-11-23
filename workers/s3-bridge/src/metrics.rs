@@ -46,11 +46,9 @@ pub fn write(point: &Point) {
         let Some(dataset) = d.as_ref() else {
             return;
         };
-        let mut blobs: Vec<&str> = point.blobs.clone();
-        blobs.push(&point.colo);
         let _ = AnalyticsEngineDataPointBuilder::new()
             .indexes([point.index])
-            .blobs(blobs)
+            .blobs(point.analytics_blobs())
             .doubles(point.doubles.iter().copied())
             .write_to(dataset);
     });

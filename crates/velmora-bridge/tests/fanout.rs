@@ -15,6 +15,7 @@ use velmora_bridge::fanout::{
     self, Fanout, FanoutError, Grant, Refused, SubPipe, SubRequest, SubResponse, INTERNAL_TARGET,
     MAX_SUBRANGES, TOKEN_HEADER, TOKEN_TTL_MS,
 };
+use velmora_bridge::metrics::{request_point, GetObservation, Request};
 use velmora_bridge::testkit::TestKek;
 use velmora_bridge::*;
 
@@ -46,6 +47,9 @@ struct Faults {
     forge: RefCell<Option<Forge>>,
     /// Extra headers on every sub-request.
     headers: RefCell<Vec<(String, String)>>,
+    transport: bool,
+    wrong_length: bool,
+    status: Option<u16>,
 }
 
 /// The service binding and the client's stream, in memory: a sub-request
@@ -99,6 +103,9 @@ impl SubPipe for Loopback<'_> {
             before(n);
         }
         self.sent.borrow_mut().push(sub.clone());
+        if self.faults.transport {
+            return Err(FanoutError::Transport);
+        }
         let token = match self.faults.forge.borrow().as_ref() {
             Some(forge) => forge(sub),
             None => sub.token.clone(),
@@ -111,8 +118,12 @@ impl SubPipe for Loopback<'_> {
             .find(|(n, _)| n == "content-length")
             .and_then(|(_, v)| v.parse().ok());
         Ok(SubResponse {
-            status: resp.status,
-            length,
+            status: self.faults.status.unwrap_or(resp.status),
+            length: if self.faults.wrong_length {
+                Some(1)
+            } else {
+                length
+            },
             body: (resp.body, length),
         })
     }
@@ -505,6 +516,69 @@ async fn an_unreadable_first_sub_range_is_an_error_response() {
     };
     assert_eq!(resp.status, 500);
     assert_eq!(pipe.sent.borrow().len(), 1, "a 403 is not retried");
+}
+
+#[tokio::test]
+async fn first_subrange_500s_carry_distinct_stages_without_changing_the_xml() {
+    let (rig, _, signer, _) = seeded(Some(CHUNK)).await;
+    let req = signer.sign(
+        rig.now(),
+        Method::Get,
+        &path(BUCKET, "big"),
+        &[],
+        &[],
+        Vec::new(),
+    );
+    let mut get = GetObservation::default();
+    let resp = Rc::clone(&rig.bridge)
+        .handle_observed(req.into_request(), &mut get)
+        .await;
+    let (_, _, fan) = fanout_of(resp);
+    let no_mint = Fanout::new(0, SIZE as u64, CHUNK, Rc::new(|_, _| None)).unwrap();
+    let fallback = || S3Response::error(500, "InternalError", "fixture");
+
+    for (failure, expected) in [
+        ("transport", "subrange_transport"),
+        ("length", "subrange_length"),
+        ("admit", "grant"),
+        ("mint", "grant"),
+        ("status", "subrange_status"),
+    ] {
+        let mut pipe = Loopback::new(&rig);
+        pipe.faults.transport = failure == "transport";
+        pipe.faults.wrong_length = failure == "length";
+        pipe.faults.status = (failure == "status").then_some(500);
+        if failure == "admit" {
+            *pipe.faults.forge.borrow_mut() = Some(Box::new(|_| "invalid-grant-fixture".into()));
+        }
+        let fan = if failure == "mint" { &no_mint } else { &fan };
+        let Err(resp) = fan.open_first_observed(&pipe, fallback, &mut get).await else {
+            panic!("the first subrange must fail: {failure}");
+        };
+        let point = request_point(
+            &Request {
+                method: "GET",
+                admin: false,
+                sub: false,
+                status: resp.status,
+                latency_ms: 0,
+                bytes_in: 0,
+                bytes_out: 0,
+                colo: "IAD",
+                get,
+            },
+            1,
+        );
+        assert_eq!(
+            point.analytics_blobs().skip(5).collect::<Vec<_>>(),
+            [expected, "le_1gib"]
+        );
+        let (actual, fallback) = (Resp::collect(resp).await, Resp::collect(fallback()).await);
+        assert_eq!(
+            (actual.status, actual.headers, actual.body),
+            (fallback.status, fallback.headers, fallback.body)
+        );
+    }
 }
 
 #[tokio::test]
