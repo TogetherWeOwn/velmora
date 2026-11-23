@@ -739,7 +739,9 @@ impl<U: Upstream, S: StatePort> Ctx<'_, U, S> {
     /// Runs `work` while renewing the lease every third of its life.
     /// `None` when a renewal fails or finds the reservation lost: `work`
     /// is dropped at its next wait, so nothing after that point changes
-    /// storage or state.
+    /// storage or state. A storage call it had dispatched may still
+    /// commit, so the holder's rows are then left to expire with their
+    /// lease (see [`Ctx::end_write`]) instead of being released.
     async fn under_lease<T>(
         &self,
         bucket: &str,
@@ -768,7 +770,10 @@ impl<U: Upstream, S: StatePort> Ctx<'_, U, S> {
         let renew = std::pin::pin!(renew);
         match select(work, renew).await {
             Either::Left((out, _)) => Some(out),
-            Either::Right(((), _)) => None,
+            Either::Right(((), _)) => {
+                self.unsettled.set(true);
+                None
+            }
         }
     }
 
@@ -1661,7 +1666,8 @@ impl<U: Upstream, S: StatePort> Ctx<'_, U, S> {
     /// Deletes the preflighted keys of a collection, markers last, in
     /// batches: each renews the reservation first ([`Ctx::fence`]), each
     /// call is bounded ([`Ctx::bounded`]), and nothing is dispatched after
-    /// a call that did not answer in time.
+    /// a call that did not answer in time: its keys are reported as `504`,
+    /// the keys never dispatched as `424 Failed Dependency`.
     async fn delete_tree(
         &self,
         bucket: &str,
@@ -1693,9 +1699,11 @@ impl<U: Upstream, S: StatePort> Ctx<'_, U, S> {
                     failed.extend(batch.iter().map(|k| (k.clone(), code)));
                 }
                 None => {
-                    let undone = batches.flatten().chain(batch).map(|k| (k.clone(), 504));
-                    failed.extend(undone);
-                    failed.extend(markers.into_iter().map(|e| (e.key, 504)));
+                    // Only this call's keys have an unknown outcome; the
+                    // keys never dispatched failed because of it.
+                    failed.extend(batch.iter().map(|k| (k.clone(), 504)));
+                    failed.extend(batches.flatten().map(|k| (k.clone(), 424)));
+                    failed.extend(markers.into_iter().map(|e| (e.key, 424)));
                     return Ok((deleted, failed));
                 }
             }
@@ -2049,6 +2057,8 @@ impl<U: Upstream, S: StatePort> Ctx<'_, U, S> {
             let mut plan = Plan::default();
             plan.batches(if src_coll { members.len() } else { 1 }, fan);
             plan.batches(usize::from(claim_root), 1);
+            // The listing that checks the claimed root holds nothing else.
+            plan.calls += usize::from(claim_root);
             plan.batches(markers.len(), fan);
             for group in split_markers(obsolete.iter().map(|(k, _)| k.as_str())) {
                 plan.batches(group, fan);
@@ -2122,6 +2132,29 @@ impl<U: Upstream, S: StatePort> Ctx<'_, U, S> {
                     .await;
                 match claim {
                     Some(Ok(etag)) => {
+                        // An S3 writer may have created a key under the
+                        // destination since the check above: a folder with
+                        // no marker. It exists, so the claim is taken back
+                        // and nothing else is written.
+                        let others = self
+                            .s3
+                            .list_page(bucket, &dst_path, false, None, 2)
+                            .await
+                            .map(|page| {
+                                !page.prefixes.is_empty()
+                                    || page.entries.iter().any(|e| e.key != dst_path)
+                            });
+                        if !matches!(others, Ok(false)) {
+                            self.fence(bucket, &holder).await?;
+                            let claimed = Cond::Is(etag);
+                            let _ = self
+                                .bounded(self.s3.delete(bucket, &dst_path, Some(&claimed)))
+                                .await;
+                            return Err(match others {
+                                Err(e) => from_s3(&e),
+                                Ok(_) => status(412),
+                            });
+                        }
                         // The source's own root marker replaces exactly
                         // the claimed one.
                         destination_markers.insert(dst_path.clone(), etag);
@@ -2414,7 +2447,7 @@ impl<U: Upstream, S: StatePort> Ctx<'_, U, S> {
     /// Delete only the listed or copied versions, files before markers,
     /// in batches: each renews the reservation first, each call is
     /// bounded, and nothing is dispatched after a call that did not answer
-    /// in time (it and every undispatched key are reported as `504`).
+    /// in time (it is reported as `504`, every undispatched key as `424`).
     async fn delete_matching_members(
         &self,
         bucket: &str,
@@ -2472,7 +2505,7 @@ impl<U: Upstream, S: StatePort> Ctx<'_, U, S> {
                 }
             }
             if timed_out {
-                failed.extend(rest.flatten().map(|(key, _)| (key, 504)));
+                failed.extend(rest.flatten().map(|(key, _)| (key, 424)));
                 return Ok((deleted, failed));
             }
         }

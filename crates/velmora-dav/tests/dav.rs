@@ -1932,6 +1932,159 @@ async fn a_late_commit_of_an_unanswered_delete_cannot_hit_a_later_move() {
 }
 
 #[tokio::test]
+async fn a_renewal_error_leaves_an_unanswered_delete_to_expire_with_its_reservation() {
+    // The security review's schedule. A lease of 12 s is renewed every
+    // 4 s and gives each storage call 3 s.
+    let w = World::with(Config {
+        lease_secs: 12,
+        delete_keys: 2,
+        ..Config::default()
+    })
+    .await;
+    for (key, body) in [
+        ("dst/a", &b"a"[..]),
+        ("dst/b", b"old b"),
+        ("src/b", b"moved b"),
+    ] {
+        assert_eq!(w.s3_put(key, body).await, 200);
+    }
+    let (reached, waiting) = tokio::sync::oneshot::channel();
+    let (release, resume) = tokio::sync::oneshot::channel();
+    w.storage_fault_target(
+        "GET",
+        "/dav?encoding-type=url&list-type=2&max-keys=1000&prefix=dst%2F",
+        StorageFault::Pause { reached, resume },
+    );
+    let mut deleting = std::pin::pin!(w.req("DELETE", "/dav/dst/", &[], b""));
+    tokio::select! {
+        r = deleting.as_mut() => panic!("DELETE finished before its listing paused: {}", r.status),
+        r = waiting => r.unwrap(),
+    }
+    // The batch goes out 2 s into the lease, so the renewal at 4 s comes
+    // while storage holds it, a second before its bound.
+    w.storage_fault_target("POST", "/dav?delete=", StorageFault::Hold);
+    let held = w.on_hold();
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    release.send(()).unwrap();
+    tokio::select! {
+        r = deleting.as_mut() => panic!("DELETE finished before its batch was held: {}", r.status),
+        r = held => r.unwrap(),
+    }
+    w.dav.state.fail_renewals.set(true);
+    let r = tokio::time::timeout(std::time::Duration::from_secs(5), deleting)
+        .await
+        .expect("a failed renewal did not stop the DELETE");
+    r.expect(503);
+    w.dav.state.fail_renewals.set(false);
+    // Storage may still commit the batch, so the reservation holds until
+    // its lease runs out.
+    let moving = || w.req("MOVE", "/dav/src/", &[("destination", "/dav/dst/")], b"");
+    moving().await.expect(503);
+    assert_eq!(w.commit_held().await, 200);
+    assert_eq!(
+        w.s3_get("src/b").await.1,
+        b"moved b",
+        "a MOVE ran while the DELETE's batch could still commit"
+    );
+    w.advance_secs(12);
+    moving().await.expect(201);
+    assert_eq!(w.s3_get("dst/b").await.1, b"moved b");
+}
+
+#[tokio::test]
+async fn a_renewal_error_during_an_upload_leaves_the_reservation_to_expire() {
+    // Renewed every second.
+    let w = World::with(Config {
+        lease_secs: 3,
+        ..Config::default()
+    })
+    .await;
+    w.storage_fault("PUT", "f", StorageFault::Hold);
+    let held = w.on_hold();
+    let mut putting = std::pin::pin!(w.req("PUT", "/dav/f", &[], b"first"));
+    tokio::select! {
+        r = putting.as_mut() => panic!("PUT finished before its upload was held: {}", r.status),
+        r = held => r.unwrap(),
+    }
+    w.dav.state.fail_renewals.set(true);
+    let r = tokio::time::timeout(std::time::Duration::from_secs(5), putting)
+        .await
+        .expect("a failed renewal did not stop the PUT");
+    r.expect(503);
+    w.dav.state.fail_renewals.set(false);
+    let competing = || w.req("PUT", "/dav/f", &[], b"second");
+    competing().await.expect(503);
+    w.advance_secs(3);
+    competing().await.expect(201);
+    assert_eq!(w.s3_get("f").await.1, b"second");
+}
+
+/// `(href, status line)` of every response of a multistatus.
+fn member_statuses(r: &Got) -> Vec<(String, String)> {
+    r.hrefs()
+        .into_iter()
+        .zip(values(&r.text(), "D:status"))
+        .collect()
+}
+
+#[tokio::test]
+async fn only_the_unanswered_call_is_a_timeout_and_undispatched_keys_failed_dependencies() {
+    // A quarter lease is one second.
+    let w = World::with(Config {
+        lease_secs: 4,
+        delete_keys: 1,
+        fan_out: 1,
+        ..Config::default()
+    })
+    .await;
+    for key in ["dst/", "dst/a", "dst/b", "dst/c"] {
+        assert_eq!(w.s3_put(key, b"").await, 200);
+    }
+    w.storage_fault_target("POST", "/dav?delete=", StorageFault::Hold);
+    let r = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        w.req("DELETE", "/dav/dst/", &[], b""),
+    )
+    .await
+    .expect("an unanswered batch held the DELETE");
+    r.expect(207);
+    let timeout = "HTTP/1.1 504 Gateway Timeout".to_owned();
+    let dependency = "HTTP/1.1 424 Failed Dependency".to_owned();
+    let mut got = member_statuses(&r);
+    got.sort();
+    assert_eq!(
+        got,
+        vec![
+            ("/dav/dst/".to_owned(), dependency.clone()),
+            ("/dav/dst/a".to_owned(), timeout.clone()),
+            ("/dav/dst/b".to_owned(), dependency.clone()),
+            ("/dav/dst/c".to_owned(), dependency.clone()),
+        ]
+    );
+    // The same for the versioned deletes of an overwrite.
+    w.advance_secs(4);
+    assert_eq!(w.commit_held().await, 200);
+    for (key, body) in [("other/c", &b"c"[..]), ("dst/0", b"0"), ("dst/b", b"b")] {
+        assert_eq!(w.s3_put(key, body).await, 200);
+    }
+    w.storage_fault("DELETE", "dst/0", StorageFault::Hold);
+    let r = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        w.req("COPY", "/dav/other/", &[("destination", "/dav/dst/")], b""),
+    )
+    .await
+    .expect("an unanswered delete held the COPY");
+    r.expect(207);
+    let got = member_statuses(&r);
+    assert!(got.contains(&("/dav/dst/0".to_owned(), timeout)), "{got:?}");
+    assert!(
+        got.contains(&("/dav/dst/b".to_owned(), dependency)),
+        "{got:?}"
+    );
+    assert_eq!(w.s3_get("dst/b").await.1, b"b");
+}
+
+#[tokio::test]
 async fn a_move_cannot_delete_its_source_after_its_reservation_expires() {
     let w = World::new().await;
     assert_eq!(w.s3_put("src/a", b"only copy").await, 200);
@@ -2221,6 +2374,40 @@ async fn depth_zero_copy_without_overwrite_returns_412_if_the_root_appears() {
 }
 
 #[tokio::test]
+async fn depth_zero_copy_without_overwrite_returns_412_if_an_implied_root_appears() {
+    let w = World::new().await;
+    assert_eq!(w.s3_put("src/", b"").await, 200);
+    w.req("PROPPATCH", "/dav/src/", &[], SET_X)
+        .await
+        .expect(207);
+    // An S3 writer creates dst/x, and with it the folder dst/, after the
+    // destination was found absent.
+    w.storage_fault_target(
+        "GET",
+        "/dav?encoding-type=url&list-type=2&max-keys=1&prefix=dst%2F",
+        StorageFault::Replace {
+            key: "dst/x".into(),
+            body: b"x".to_vec(),
+        },
+    );
+    w.req(
+        "COPY",
+        "/dav/src/",
+        &[
+            ("destination", "/dav/dst/"),
+            ("depth", "0"),
+            ("overwrite", "F"),
+        ],
+        b"",
+    )
+    .await
+    .expect(412);
+    assert_eq!(w.s3_get("dst/x").await.1, b"x");
+    assert_eq!(w.s3_get("dst/").await.0, 404, "the claim marker was left");
+    assert!(!has_x(&w, "/dav/dst/").await);
+}
+
+#[tokio::test]
 async fn read_only_mutations_are_denied_before_evaluating_preconditions() {
     let w = World::new().await;
     assert_eq!(w.s3_put("src/file", b"original").await, 200);
@@ -2285,9 +2472,11 @@ async fn absolute_destination_must_match_request_origin() {
 async fn tree_copy_without_overwrite_does_not_replace_a_concurrent_destination_file() {
     let w = World::new().await;
     assert_eq!(w.s3_put("src/x", b"source").await, 200);
+    // dst/x appears after the claimed root was found to hold nothing else
+    // (before that, the whole COPY answers 412).
     w.storage_fault_target(
         "GET",
-        "/dav?encoding-type=url&list-type=2&max-keys=1000&prefix=src%2F",
+        "/dav?encoding-type=url&list-type=2&max-keys=2&prefix=dst%2F",
         StorageFault::Replace {
             key: "dst/x".into(),
             body: b"concurrent".to_vec(),

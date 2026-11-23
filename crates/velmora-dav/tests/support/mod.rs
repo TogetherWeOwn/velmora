@@ -84,6 +84,8 @@ pub struct Up {
     pub sent: RefCell<Vec<(String, String)>>,
     fault: RefCell<Option<(&'static str, String, StorageFault)>>,
     held: RefCell<Option<S3Request>>,
+    /// Told when a [`StorageFault::Hold`] keeps its request.
+    held_reached: RefCell<Option<tokio::sync::oneshot::Sender<()>>>,
     /// Requests sent with no entry marker (as the default entrypoint
     /// would): an app password must then be refused.
     pub unmarked: Cell<bool>,
@@ -150,6 +152,9 @@ impl Upstream for Up {
         };
         if matches!(fault, Some(StorageFault::Hold)) {
             assert!(self.held.replace(Some(req)).is_none());
+            if let Some(reached) = self.held_reached.take() {
+                let _ = reached.send(());
+            }
             return Box::pin(std::future::pending());
         }
         Box::pin(async move {
@@ -263,6 +268,9 @@ pub struct States {
     /// Unix seconds the objects see.
     pub now: Cell<i64>,
     pub calls: Cell<u32>,
+    /// While set, every batch that renews a reservation fails, as a state
+    /// call that errors does.
+    pub fail_renewals: Cell<bool>,
 }
 
 impl StatePort for States {
@@ -272,6 +280,9 @@ impl StatePort for States {
         ops: Vec<Op>,
     ) -> LocalBoxFuture<'a, Result<Vec<Reply>, String>> {
         self.calls.set(self.calls.get() + 1);
+        if self.fail_renewals.get() && ops.iter().any(|op| matches!(op, Op::RenewWrite { .. })) {
+            return Box::pin(async { Err("injected renewal failure".to_owned()) });
+        }
         let db = Rc::clone(
             self.dbs
                 .borrow_mut()
@@ -388,6 +399,7 @@ impl World {
                     sent: RefCell::new(Vec::new()),
                     fault: RefCell::new(None),
                     held: RefCell::new(None),
+                    held_reached: RefCell::new(None),
                     unmarked: Cell::new(false),
                     most_slots: Cell::new(0),
                 },
@@ -481,6 +493,13 @@ impl World {
             .fault
             .replace(Some((method, target.to_owned(), fault)))
             .is_none());
+    }
+
+    /// Answers once a [`StorageFault::Hold`] keeps its request.
+    pub fn on_hold(&self) -> tokio::sync::oneshot::Receiver<()> {
+        let (reached, waiting) = tokio::sync::oneshot::channel();
+        assert!(self.dav.up.held_reached.replace(Some(reached)).is_none());
+        waiting
     }
 
     /// Commits the request a [`StorageFault::Hold`] kept; its status.
