@@ -884,12 +884,12 @@ fn byte_budget_above_three_halves_bounds_every_mix() {
         }
         // Jobs can use the remaining request share, rounded down to whole bytes.
         let expected = (request_capacity - requests) * job_capacity / request_capacity;
-        assert!(
-            lo >= expected,
-            "{requests} B of requests left room for {lo} B of jobs, expected at least {expected} B"
+        assert_eq!(
+            lo, expected,
+            "{requests} B of requests left room for the wrong number of job bytes"
         );
         assert!(
-            requests / 2 * 3 + lo <= job_capacity,
+            requests * 3 + lo * 2 <= job_capacity * 2,
             "{requests} B of requests and {lo} B of jobs"
         );
         drop(held);
