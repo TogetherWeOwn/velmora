@@ -433,15 +433,27 @@ async fn cold_get_with_retry_rebuild_room_taken(expired: bool) {
 /// without another pass for the next extent's data.
 #[tokio::test]
 async fn cold_get_waits_for_its_own_cache_write_before_giving_up_a_rebuild() {
-    cold_get_with_held_cache_write(false).await;
+    cold_get_with_held_cache_write(WriteFinish::WriteFirst).await;
 }
 
 #[tokio::test]
 async fn cold_get_reopens_a_slot_if_the_cache_write_outlasts_it() {
-    cold_get_with_held_cache_write(true).await;
+    cold_get_with_held_cache_write(WriteFinish::BothReady).await;
 }
 
-async fn cold_get_with_held_cache_write(expired: bool) {
+#[tokio::test]
+async fn cold_get_releases_its_slot_while_the_cache_write_is_still_pending() {
+    cold_get_with_held_cache_write(WriteFinish::TimerFirst).await;
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WriteFinish {
+    WriteFirst,
+    BothReady,
+    TimerFirst,
+}
+
+async fn cold_get_with_held_cache_write(finish: WriteFinish) {
     const FIRST: usize = THREE + 100_000;
     const DATA_REQUESTS: usize = 3 + 4;
     let target = Rc::new(RefCell::new(Weak::<
@@ -459,8 +471,13 @@ async fn cold_get_with_held_cache_write(expired: bool) {
                 if let Some(bridge) = target.borrow().upgrade() {
                     if body_requests(&bridge.nntp) == DATA_REQUESTS {
                         assert!(bridge.cache.held.get());
+                        if idle && finish == WriteFinish::TimerFirst {
+                            assert_eq!(bridge.nntp.live(), 1);
+                            bridge.clock.advance_ms(i64::from(ms));
+                            return Box::pin(std::future::ready(()));
+                        }
                         bridge.cache.hold_put_prefix.replace(None);
-                        if idle && expired {
+                        if idle && finish == WriteFinish::BothReady {
                             // The task resumes after the slot expired;
                             // both the write and the timer can finish now.
                             bridge
@@ -511,9 +528,31 @@ async fn cold_get_with_held_cache_write(expired: bool) {
         .hold_put_prefix
         .replace(Some(first.id.cache_key()));
 
-    let response = tokio::time::timeout(std::time::Duration::from_secs(5), cold.get())
-        .await
-        .expect("the cold GET finishes");
+    let now = bridge.clock.now();
+    let release = async {
+        if finish != WriteFinish::TimerFirst {
+            return;
+        }
+        // Only the idle timer moves the test clock. Keep the write held
+        // until the socket closed and its still-live permit was freed.
+        while bridge.clock.now() == now || bridge.nntp.live() != 0 {
+            tokio::task::yield_now().await;
+        }
+        let load = bridge
+            .catalog
+            .provider_load(bridge.clock.now())
+            .await
+            .unwrap();
+        assert_eq!(load[0].held, 0, "idle permit was not released");
+        assert_eq!(body_requests(&bridge.nntp), DATA_REQUESTS);
+        assert!(bridge.cache.hold_put_prefix.replace(None).is_some());
+    };
+    let (response, ()) = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        futures_util::future::join(cold.get(), release),
+    )
+    .await
+    .expect("the cold GET finishes");
     response.expect(200);
     assert!(response.body == body);
     assert_eq!(
