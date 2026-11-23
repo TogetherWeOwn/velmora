@@ -197,9 +197,9 @@ pub enum Op {
         roots: Vec<(String, bool)>,
         ttl_secs: u32,
     },
-    CheckReserve {
-        holder: String,
-    },
+    /// Extends the holder's lease, reservation and capacity claim.
+    /// `Lost` when its reservation or its lease rows are gone (expired
+    /// and purged, or ended): the request must stop.
     RenewWrite {
         holder: String,
         ttl_secs: u32,
@@ -274,10 +274,21 @@ pub enum Op {
         listed: Vec<(String, String)>,
         exact: Option<(String, String)>,
     },
-    /// Collection candidates that still carry rooted state, including descendants.
-    FoldersWithState(Vec<String>),
+    /// Every collection at or under one of `roots` with a lock rooted at
+    /// it or a dead property on it. `Full` when there are more than
+    /// `limit`.
+    FoldersWithState {
+        roots: Vec<String>,
+        limit: usize,
+    },
     /// Remove the matching ledger rows after all source deletes succeeded.
     FinishMove(Vec<MovedMember>),
+    /// A tree MOVE completed: earlier partial attempts of the same move
+    /// (source under `src_root`, destination under `dst_root`) are done.
+    FinishMoveTree {
+        src_root: String,
+        dst_root: String,
+    },
     /// A successful WebDAV write or delete superseded these exact keys.
     ClearMoved(Vec<String>),
 }
@@ -301,7 +312,13 @@ pub enum Reply {
     Props(Vec<Vec<DeadProp>>),
     /// One status per patch, in order (`200`, `403`, `424`, `507`).
     Patched(Vec<u16>),
-    Moved(Vec<String>),
+    /// Protected ledger rows: `(destination, source)`.
+    Moved(Vec<(String, String)>),
+    /// The new expiry, Unix seconds.
+    Renewed {
+        expires_at: i64,
+    },
+    Lost,
     StatefulFolders(Vec<String>),
     Busy,
 }
@@ -689,20 +706,26 @@ impl<S: Sql> Engine<'_, S> {
                 }
                 Ok(Reply::Granted)
             }
-            Op::CheckReserve { holder } => Ok(if self.live_reservation(&holder)? {
-                Reply::Granted
-            } else {
-                Reply::Busy
-            }),
             Op::RenewWrite { holder, ttl_secs } => {
-                let params = [t(&holder), Val::Int(self.now + i64::from(ttl_secs))];
+                let leased = !self
+                    .sql
+                    .exec(
+                        "SELECT 1 FROM write_leases WHERE holder = ?1 LIMIT 1",
+                        &[t(&holder)],
+                    )?
+                    .is_empty();
+                if !leased || !self.live_reservation(&holder)? {
+                    return Ok(Reply::Lost);
+                }
+                let expires_at = self.now + i64::from(ttl_secs);
+                let params = [t(&holder), Val::Int(expires_at)];
                 for table in ["write_leases", "mutation_reservations", "moved_capacity"] {
                     self.sql.exec(
                         &format!("UPDATE {table} SET expires_at = ?2 WHERE holder = ?1"),
                         &params,
                     )?;
                 }
-                Ok(Reply::Done)
+                Ok(Reply::Renewed { expires_at })
             }
             Op::EndWrite { holder } => {
                 for table in ["write_leases", "mutation_reservations", "moved_capacity"] {
@@ -893,13 +916,13 @@ impl<S: Sql> Engine<'_, S> {
                 if let Some(root) = root {
                     let end = range_end(&root).ok_or("not a collection")?;
                     rows.extend(self.sql.exec(
-                        "SELECT destination, etag FROM moved_members WHERE destination >= ?1 AND destination < ?2",
+                        "SELECT destination, etag, source FROM moved_members WHERE destination >= ?1 AND destination < ?2",
                         &[t(&root), t(&end)],
                     )?);
                 }
                 if let Some((key, _)) = &exact {
                     rows.extend(self.sql.exec(
-                        "SELECT destination, etag FROM moved_members WHERE destination = ?1",
+                        "SELECT destination, etag, source FROM moved_members WHERE destination = ?1",
                         &[t(key)],
                     )?);
                 }
@@ -910,7 +933,7 @@ impl<S: Sql> Engine<'_, S> {
                 for row in rows {
                     let key = row[0].text();
                     if listed.get(&key).is_some_and(|etag| *etag == row[1].text()) {
-                        kept.push(key);
+                        kept.push((key, row[2].text()));
                     } else {
                         stale.push(key);
                     }
@@ -918,20 +941,26 @@ impl<S: Sql> Engine<'_, S> {
                 self.one(Op::ClearMoved(stale))?;
                 Ok(Reply::Moved(kept))
             }
-            Op::FoldersWithState(folders) => {
-                let mut stateful = Vec::new();
-                for folder in folders {
-                    let end = range_end(&folder).ok_or("not a collection")?;
-                    let rows = self.sql.exec(
-                        "SELECT 1 WHERE EXISTS (SELECT 1 FROM locks WHERE root >= ?1 AND root < ?2) \
-                           OR EXISTS (SELECT 1 FROM dav_props WHERE path >= ?1 AND path < ?2)",
-                        &[t(&folder), t(&end)],
-                    )?;
-                    if !rows.is_empty() {
-                        stateful.push(folder);
+            Op::FoldersWithState { roots, limit } => {
+                let mut stateful = std::collections::BTreeSet::new();
+                let cap = i64::try_from(limit.saturating_add(1)).unwrap_or(i64::MAX);
+                for root in roots {
+                    // Indexed range lookups; only collection paths end in '/'.
+                    let end = range_end(&root).ok_or("not a collection")?;
+                    for query in [
+                        "SELECT DISTINCT root FROM locks WHERE root >= ?1 AND root < ?2 \
+                         AND substr(root, -1) = '/' LIMIT ?3",
+                        "SELECT DISTINCT path FROM dav_props WHERE path >= ?1 AND path < ?2 \
+                         AND substr(path, -1) = '/' LIMIT ?3",
+                    ] {
+                        let rows = self.sql.exec(query, &[t(&root), t(&end), Val::Int(cap)])?;
+                        stateful.extend(rows.into_iter().map(|row| row[0].text()));
+                        if stateful.len() > limit {
+                            return Ok(Reply::Full);
+                        }
                     }
                 }
-                Ok(Reply::StatefulFolders(stateful))
+                Ok(Reply::StatefulFolders(stateful.into_iter().collect()))
             }
             Op::FinishMove(members) => {
                 for chunk in members.chunks(MOVED_MEMBER_SQL_BATCH) {
@@ -945,6 +974,16 @@ impl<S: Sql> Engine<'_, S> {
                         &[Val::Text(json)],
                     )?;
                 }
+                Ok(Reply::Done)
+            }
+            Op::FinishMoveTree { src_root, dst_root } => {
+                let src_end = range_end(&src_root).ok_or("not a source collection")?;
+                let dst_end = range_end(&dst_root).ok_or("not a destination collection")?;
+                self.sql.exec(
+                    "DELETE FROM moved_members WHERE destination >= ?1 AND destination < ?2 \
+                     AND source >= ?3 AND source < ?4",
+                    &[t(&dst_root), t(&dst_end), t(&src_root), t(&src_end)],
+                )?;
                 Ok(Reply::Done)
             }
             Op::ClearMoved(paths) => {

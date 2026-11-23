@@ -112,6 +112,7 @@ pub fn reason(status: u16) -> &'static str {
         501 => "Not Implemented",
         502 => "Bad Gateway",
         503 => "Service Unavailable",
+        504 => "Gateway Timeout",
         507 => "Insufficient Storage",
         _ => "Unknown",
     }

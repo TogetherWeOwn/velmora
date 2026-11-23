@@ -1084,6 +1084,119 @@ async fn overwrite_preserves_state_when_a_direct_s3_child_keeps_a_folder_alive()
 }
 
 #[tokio::test]
+async fn removed_child_state_is_cleaned_even_when_a_new_sibling_keeps_the_parent_alive() {
+    let w = World::new().await;
+    assert_eq!(w.s3_put("src", b"source").await, 200);
+    assert_eq!(w.s3_put("dst/x/", b"").await, 200);
+    w.req("PROPPATCH", "/dav/dst/", &[], SET_X)
+        .await
+        .expect(207);
+    w.req("PROPPATCH", "/dav/dst/x/", &[], SET_X)
+        .await
+        .expect(207);
+    let old_lock = w
+        .req("LOCK", "/dav/dst/x/", &[], &lockinfo("exclusive", "old"))
+        .await;
+    let ifh = format!(
+        "</dav/dst/x/> ({})",
+        old_lock.expect(200).header("lock-token").unwrap()
+    );
+    w.storage_fault(
+        "PUT",
+        "dst",
+        StorageFault::Replace {
+            key: "dst/new".into(),
+            body: b"new".to_vec(),
+        },
+    );
+    w.req(
+        "COPY",
+        "/dav/src",
+        &[("destination", "/dav/dst"), ("if", &ifh)],
+        b"",
+    )
+    .await
+    .expect(204);
+    assert_eq!(w.s3_get("dst/x/").await.0, 404);
+    assert_eq!(w.s3_get("dst/new").await.1, b"new");
+    assert!(has_x(&w, "/dav/dst/").await);
+    assert_eq!(w.s3_put("dst/x/", b"").await, 200);
+    assert!(!has_x(&w, "/dav/dst/x/").await);
+    w.req("LOCK", "/dav/dst/x/", &[], &lockinfo("exclusive", "new"))
+        .await
+        .expect(200);
+}
+
+#[tokio::test]
+async fn large_stateful_overwrite_cleans_all_removed_folders() {
+    // The general review's case (Depth 0 over 101 folders with
+    // properties), and a source with a member over 150.
+    for (depth, count) in [("0", 101), ("infinity", 150)] {
+        let w = World::new().await;
+        assert_eq!(w.s3_put("src/", b"").await, 200);
+        if depth != "0" {
+            assert_eq!(w.s3_put("src/new", b"source").await, 200);
+        }
+        for i in 0..count {
+            let key = format!("dst/{i:03}/");
+            assert_eq!(w.s3_put(&key, b"").await, 200);
+            w.req("PROPPATCH", &format!("/dav/{key}"), &[], SET_X)
+                .await
+                .expect(207);
+        }
+        let r = w
+            .req(
+                "COPY",
+                "/dav/src/",
+                &[("destination", "/dav/dst/"), ("depth", depth)],
+                b"",
+            )
+            .await;
+        r.expect(204);
+        let key = format!("dst/{:03}/", count - 1);
+        assert_eq!(w.s3_get(&key).await.0, 404);
+        assert_eq!(w.s3_put(&key, b"").await, 200);
+        assert!(
+            !has_x(&w, &format!("/dav/{key}")).await,
+            "success left a deleted folder's properties behind"
+        );
+        let dbs = w.dav.state.dbs.borrow();
+        let rows: i64 = dbs
+            .values()
+            .next()
+            .unwrap()
+            .0
+            .query_row(
+                "SELECT count(*) FROM dav_props WHERE path LIKE 'dst/%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 0, "all {count} removed folders must be cleaned");
+    }
+}
+
+#[tokio::test]
+async fn mutation_budget_refuses_the_entire_overwrite_before_copies_or_deletes() {
+    let w = World::with(Config {
+        max_mutation_calls: 4,
+        ..Config::default()
+    })
+    .await;
+    assert_eq!(w.s3_put("src/new", b"source").await, 200);
+    assert_eq!(w.s3_put("dst/x/", b"").await, 200);
+    w.req("PROPPATCH", "/dav/dst/x/", &[], SET_X)
+        .await
+        .expect(207);
+    w.req("COPY", "/dav/src/", &[("destination", "/dav/dst/")], b"")
+        .await
+        .expect(507);
+    assert!(has_x(&w, "/dav/dst/x/").await);
+    assert_eq!(w.s3_get("dst/new").await.0, 404);
+    assert_eq!(w.s3_get("src/new").await.1, b"source");
+}
+
+#[tokio::test]
 async fn depth_zero_overwrite_does_not_list_removed_subfolders() {
     let w = World::new().await;
     assert_eq!(w.s3_put("src/", b"").await, 200);
@@ -1177,10 +1290,53 @@ async fn overwrite_retry_of_partial_move_keeps_the_only_copy() {
     assert_eq!(w.s3_get("dst/b").await.1, b"old b");
     assert_eq!(w.s3_get("dst/a").await.1, b"new a");
     assert_eq!(w.s3_get("src/a").await.0, 404);
+    // The retry completed the move: the earlier attempt's member is
+    // released, not reported as kept.
+    r.expect(204);
+    let rows: i64 = w
+        .dav
+        .state
+        .dbs
+        .borrow()
+        .values()
+        .next()
+        .unwrap()
+        .0
+        .query_row("SELECT count(*) FROM moved_members", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(rows, 0, "a completed retry left ledger rows");
+    assert_eq!(w.s3_put("fresh/c", b"fresh").await, 200);
+    w.req("COPY", "/dav/fresh/", &[("destination", "/dav/dst/")], b"")
+        .await
+        .expect(204);
+    assert_eq!(w.s3_get("dst/b").await.0, 404);
+}
+
+#[tokio::test]
+async fn a_completed_move_of_another_source_keeps_a_partial_moves_rows() {
+    let w = World::new().await;
+    move_with_changed_source(&w).await;
+    assert_eq!(w.s3_put("other/c", b"other").await, 200);
+    let r = w
+        .req("MOVE", "/dav/other/", &[("destination", "/dav/dst/")], b"")
+        .await;
     r.expect(207);
-    assert_eq!(r.hrefs(), ["/dav/dst/b"]);
-    assert!(r.text().contains("HTTP/1.1 409 Conflict"));
     assert!(r.text().contains("kept after a partial MOVE"));
+    assert_eq!(w.s3_get("dst/b").await.1, b"old b");
+    let dbs = w.dav.state.dbs.borrow();
+    let db = &dbs.values().next().unwrap().0;
+    let rows = |sql: &str| -> i64 { db.query_row(sql, [], |row| row.get(0)).unwrap() };
+    // The partial MOVE's rows (dst/a and dst/b, from src/) stay; the
+    // completed MOVE released its own.
+    assert_eq!(
+        rows("SELECT count(*) FROM moved_members WHERE source LIKE 'src/%'"),
+        2
+    );
+    assert_eq!(
+        rows("SELECT count(*) FROM moved_members"),
+        2,
+        "only the other source's own rows are released"
+    );
 }
 
 #[tokio::test]
@@ -1369,6 +1525,191 @@ async fn an_abandoned_reservation_stops_blocking_after_its_lease_expires() {
 }
 
 #[tokio::test]
+async fn an_expired_prune_stops_before_dispatching_the_next_delete() {
+    let w = World::with(Config {
+        fan_out: 1,
+        ..Config::default()
+    })
+    .await;
+    for (key, body) in [
+        ("other/c", &b"replacement"[..]),
+        ("dst/0", b"obsolete"),
+        ("dst/b", b"identical b"),
+        ("src/b", b"identical b"),
+        ("src/a", b"old a"),
+    ] {
+        assert_eq!(w.s3_put(key, body).await, 200);
+    }
+    let (reached, waiting) = tokio::sync::oneshot::channel();
+    let (release, resume) = tokio::sync::oneshot::channel();
+    w.storage_fault("DELETE", "dst/0", StorageFault::Pause { reached, resume });
+    let mut pruning =
+        std::pin::pin!(w.req("COPY", "/dav/other/", &[("destination", "/dav/dst/")], b""));
+    tokio::select! {
+        r = pruning.as_mut() => panic!("COPY finished before its prune was paused: {}", r.status),
+        r = waiting => r.unwrap(),
+    }
+    w.advance_secs(Config::default().lease_secs);
+    w.storage_fault(
+        "PUT",
+        "dst/a",
+        StorageFault::Replace {
+            key: "src/a".into(),
+            body: b"new a".to_vec(),
+        },
+    );
+    w.req("MOVE", "/dav/src/", &[("destination", "/dav/dst/")], b"")
+        .await
+        .expect(207);
+    assert_eq!(w.s3_get("src/b").await.0, 404);
+    assert_eq!(w.s3_get("dst/b").await.1, b"identical b");
+    release.send(()).unwrap();
+    pruning.await.expect(503);
+    assert_eq!(
+        w.s3_get("dst/b").await.0,
+        200,
+        "an expired prune deleted a later MOVE's only copy"
+    );
+}
+
+#[tokio::test]
+async fn recursive_delete_does_not_dispatch_the_next_batch_after_expiry() {
+    let w = World::new().await;
+    assert_eq!(w.s3_put("dst/", b"").await, 200);
+    assert_eq!(w.s3_put("dst/file", b"first batch").await, 200);
+    let (reached, waiting) = tokio::sync::oneshot::channel();
+    let (release, resume) = tokio::sync::oneshot::channel();
+    w.storage_fault_target(
+        "POST",
+        "/dav?delete=",
+        StorageFault::Pause { reached, resume },
+    );
+    let mut deleting = std::pin::pin!(w.req("DELETE", "/dav/dst/", &[], b""));
+    tokio::select! {
+        r = deleting.as_mut() => panic!("DELETE finished before the first batch paused: {}", r.status),
+        r = waiting => r.unwrap(),
+    }
+    w.advance_secs(Config::default().lease_secs);
+    release.send(()).unwrap();
+    deleting.await.expect(503);
+    assert_eq!(w.s3_get("dst/").await.0, 200);
+}
+
+#[tokio::test]
+async fn recursive_delete_stops_before_a_batch_that_would_remove_a_later_move() {
+    // The security review's schedule: the DELETE lists dst/b, stalls past
+    // its reservation, a MOVE lands src/b on dst/b and deletes its
+    // source, and the DELETE's next batch must not remove dst/b.
+    let w = World::with(Config {
+        delete_keys: 1,
+        ..Config::default()
+    })
+    .await;
+    for (key, body) in [
+        ("dst/a", &b"a"[..]),
+        ("dst/b", b"old b"),
+        ("src/b", b"moved b"),
+    ] {
+        assert_eq!(w.s3_put(key, body).await, 200);
+    }
+    let (reached, waiting) = tokio::sync::oneshot::channel();
+    let (release, resume) = tokio::sync::oneshot::channel();
+    w.storage_fault_target(
+        "POST",
+        "/dav?delete=",
+        StorageFault::Pause { reached, resume },
+    );
+    let mut deleting = std::pin::pin!(w.req("DELETE", "/dav/dst/", &[], b""));
+    tokio::select! {
+        r = deleting.as_mut() => panic!("DELETE finished before its first batch paused: {}", r.status),
+        r = waiting => r.unwrap(),
+    }
+    assert_eq!(w.s3_get("dst/a").await.0, 404);
+    w.advance_secs(Config::default().lease_secs);
+    w.req("MOVE", "/dav/src/", &[("destination", "/dav/dst/")], b"")
+        .await
+        .expect(204);
+    assert_eq!(w.s3_get("src/b").await.0, 404);
+    release.send(()).unwrap();
+    deleting.await.expect(503);
+    assert_eq!(
+        w.s3_get("dst/b").await.1,
+        b"moved b",
+        "a lapsed DELETE removed the only copy a later MOVE made"
+    );
+}
+
+#[tokio::test]
+async fn a_renewal_that_finds_the_reservation_lost_stops_the_work() {
+    // Renewed every second; the listing below never answers.
+    let w = World::with(Config {
+        lease_secs: 3,
+        ..Config::default()
+    })
+    .await;
+    assert_eq!(w.s3_put("src/a", b"a").await, 200);
+    let (reached, waiting) = tokio::sync::oneshot::channel();
+    let (_release, resume) = tokio::sync::oneshot::channel();
+    w.storage_fault_target(
+        "GET",
+        "/dav?encoding-type=url&list-type=2&max-keys=1000&prefix=src%2F",
+        StorageFault::Pause { reached, resume },
+    );
+    let mut copying =
+        std::pin::pin!(w.req("COPY", "/dav/src/", &[("destination", "/dav/dst/")], b""));
+    tokio::select! {
+        r = copying.as_mut() => panic!("COPY finished before its listing paused: {}", r.status),
+        r = waiting => r.unwrap(),
+    }
+    w.advance_secs(3);
+    let r = tokio::time::timeout(std::time::Duration::from_secs(5), copying)
+        .await
+        .expect("a lost reservation did not stop the COPY");
+    r.expect(503);
+    assert!(w.s3_list("dst/").await.is_empty());
+    // The holder's rows are gone: another COPY onto dst/ goes ahead.
+    w.req("COPY", "/dav/src/", &[("destination", "/dav/dst/")], b"")
+        .await
+        .expect(201);
+}
+
+#[tokio::test]
+async fn a_storage_call_without_an_answer_stops_the_batch_and_dispatches_nothing_more() {
+    // A quarter lease is one second.
+    let w = World::with(Config {
+        lease_secs: 4,
+        fan_out: 1,
+        ..Config::default()
+    })
+    .await;
+    for (key, body) in [("other/c", &b"c"[..]), ("dst/0", b"0"), ("dst/b", b"b")] {
+        assert_eq!(w.s3_put(key, body).await, 200);
+    }
+    let (reached, _waiting) = tokio::sync::oneshot::channel();
+    let (_release, resume) = tokio::sync::oneshot::channel();
+    w.storage_fault("DELETE", "dst/0", StorageFault::Pause { reached, resume });
+    let r = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        w.req("COPY", "/dav/other/", &[("destination", "/dav/dst/")], b""),
+    )
+    .await
+    .expect("a storage call without an answer held the COPY");
+    r.expect(207);
+    assert!(r.text().contains("HTTP/1.1 504 Gateway Timeout"));
+    let deletes = w
+        .dav
+        .up
+        .sent
+        .borrow()
+        .iter()
+        // The write-grant probe is a DELETE of an upload id.
+        .filter(|(method, target)| method == "DELETE" && !target.contains("uploadId"))
+        .count();
+    assert_eq!(deletes, 1, "a delete was dispatched after the timeout");
+    assert_eq!(w.s3_get("dst/b").await.1, b"b");
+}
+
+#[tokio::test]
 async fn a_move_cannot_delete_its_source_after_its_reservation_expires() {
     let w = World::new().await;
     assert_eq!(w.s3_put("src/a", b"only copy").await, 200);
@@ -1408,7 +1749,7 @@ async fn move_retry_with_kept_members_preserves_the_source_parent() {
     let moving = || w.req("MOVE", "/dav/p/src/", &[("destination", "/dav/dst/")], b"");
     moving().await.expect(207);
     assert_eq!(w.s3_get("p/").await.0, 404, "p is still implicit");
-    moving().await.expect(207);
+    moving().await.expect(204);
     assert!(w.s3_list("p/src/").await.is_empty());
     assert_eq!(w.s3_get("p/").await.0, 200);
     assert_eq!(w.s3_get("dst/b").await.1, b"old b");
@@ -1597,6 +1938,98 @@ async fn file_copy_and_move_guard_the_conditionally_selected_source_version() {
         assert_eq!(w.s3_get("src").await.1, b"replacement");
         assert_eq!(w.s3_get("dst").await.1, b"destination");
     }
+}
+
+#[tokio::test]
+async fn dav_if_header_guards_the_file_version_moved() {
+    let w = World::new().await;
+    assert_eq!(w.s3_put("src", b"original").await, 200);
+    assert_eq!(w.s3_put("dst", b"destination").await, 200);
+    let etag = w.s3_get("src").await.2.unwrap();
+    let ifh = format!("([{etag}])");
+    w.storage_fault(
+        "HEAD",
+        "src",
+        StorageFault::Replace {
+            key: "src".into(),
+            body: b"replacement".to_vec(),
+        },
+    );
+    w.req(
+        "MOVE",
+        "/dav/src",
+        &[("destination", "/dav/dst"), ("if", &ifh)],
+        b"",
+    )
+    .await
+    .expect(412);
+    assert_eq!(w.s3_get("src").await.1, b"replacement");
+    assert_eq!(w.s3_get("dst").await.1, b"destination");
+}
+
+#[tokio::test]
+async fn depth_zero_copy_without_overwrite_returns_412_if_the_root_appears() {
+    let w = World::new().await;
+    assert_eq!(w.s3_put("src/", b"").await, 200);
+    w.req("PROPPATCH", "/dav/src/", &[], SET_X)
+        .await
+        .expect(207);
+    w.storage_fault_target(
+        "GET",
+        "/dav?encoding-type=url&list-type=2&max-keys=1&prefix=dst%2F",
+        StorageFault::Replace {
+            key: "dst/".into(),
+            body: Vec::new(),
+        },
+    );
+    w.req(
+        "COPY",
+        "/dav/src/",
+        &[
+            ("destination", "/dav/dst/"),
+            ("depth", "0"),
+            ("overwrite", "F"),
+        ],
+        b"",
+    )
+    .await
+    .expect(412);
+    assert_eq!(w.s3_get("dst/").await.0, 200);
+    assert!(!has_x(&w, "/dav/dst/").await);
+}
+
+#[tokio::test]
+async fn read_only_mutations_are_denied_before_evaluating_preconditions() {
+    let w = World::new().await;
+    assert_eq!(w.s3_put("src/file", b"original").await, 200);
+    assert_eq!(w.s3_put("dst", b"unchanged").await, 200);
+    let wrong = ("if-match", "\"wrong\"");
+    for (method, target, headers) in [
+        ("PUT", "/dav/src/file", vec![wrong]),
+        ("DELETE", "/dav/src/file", vec![wrong]),
+        ("DELETE", "/dav/src/", vec![wrong]),
+        (
+            "COPY",
+            "/dav/src/file",
+            vec![wrong, ("destination", "/dav/dst")],
+        ),
+        (
+            "MOVE",
+            "/dav/src/file",
+            vec![wrong, ("destination", "/dav/dst")],
+        ),
+        (
+            "COPY",
+            "/dav/src/file",
+            vec![("overwrite", "F"), ("destination", "/dav/dst")],
+        ),
+    ] {
+        w.req_as(RO, RO_SECRET, method, target, &headers, b"")
+            .await
+            .expect(403);
+    }
+    assert_eq!(w.s3_get("src/file").await.1, b"original");
+    assert_eq!(w.s3_get("dst").await.1, b"unchanged");
 }
 
 #[tokio::test]
