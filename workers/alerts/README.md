@@ -19,8 +19,8 @@ condition below emails when it holds:
 | `outbox-dead` | outbox rows are in stage `dead` | at once |
 | `provider-cooldown:<id>` | a provider is cooling (skipped) | 15 min |
 | `catalog-export-stale` | the newest export manifest in the export bucket is over 26 h old (listed hourly) | at once |
-| `recovery-copy-refused` | both of the last two completed scheduled recovery-copy passes had a remote refusal | at once |
-| `recovery-copy-stale` | no completed recovery-copy pass in more than three 15-minute intervals | at once |
+| `recovery-copy-refused` | a scheduled copy job saw a remote refusal and no later write has been verified | after two 15-minute intervals |
+| `recovery-copy-stale` | no scheduled copy job recorded in more than three 15-minute intervals | at once |
 | `check-error` | a reading failed (its check did not run) | 15 min |
 
 It also takes reports on `POST /v1/alert` (bearer `INGEST_TOKEN`) from:
@@ -72,18 +72,18 @@ until the next automated bridge deploy, which replaces dashboard-only
 variables. Turning it off on the bridge alone does not disable the stale
 alert.
 
-A zero-copy pass is not a refusal. Hints, retries and incomplete chains
-do not count as completed passes. A copy walk can continue while no pass
-completes: a stale page reports missing **completed-pass telemetry**, not
-a claim that no copy work ran. Each pass records at most 256 steps; going
-past that bound has the same effect on monitoring but does not stop copying.
-The bridge prunes telemetry after seven days, retaining one last verified
-copy timestamp for the age reported in the email. Recovery notices use the
-same email cap and cooldown as the other conditions.
+A zero-copy job does not start or clear a refusal incident. Scheduled jobs
+can run without trying a write, so only a later successful PUT with a
+matching verification HEAD clears the incident. The verified timestamp is
+recorded even when the job cannot enqueue its continuation. Hints are
+excluded, and queue redelivery does not add another diagnostic row.
 
-Rolling the bridge back to a version without the optional queue sequence
-can drop in-flight sequenced copy messages. The next scheduled pass resumes
-normal copy work. Leave the additive telemetry table in place on rollback.
+The bridge keeps up to 256 diagnostic rows per pass for seven days and
+retains one aggregate row for the latest job, refusal, and verified-write
+times. The stale signal watches jobs, not pass completion or storage
+success. Recovery notices use the same email cap and cooldown as the other
+conditions. Rollback does not change the queue message format; leave the
+additive telemetry tables in place.
 
 ## Cost
 
@@ -94,8 +94,8 @@ domain. The rest:
 - 8,640 cron runs a month;
 - under 100,000 baseline catalogue rows read a month before recovery-copy
   monitoring;
-- recovery-copy reads scale with the number of jobs in the last two complete
-  passes, bounded by four indexed pass reads of up to 256 jobs each per tick;
+- recovery-copy reads one state row and, during an open refusal incident,
+  up to 256 diagnostic rows for the last pass that recorded a refusal;
 - a few thousand writes to the Worker's own D1;
 - about 720 R2 list calls a month.
 

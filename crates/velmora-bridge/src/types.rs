@@ -1410,10 +1410,6 @@ pub enum Job {
         v: u8,
         pass: UnixMs,
         cursor: String,
-        /// Telemetry sequence. Jobs from older Workers and hints have
-        /// none but still run the same copy operations.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        sequence: Option<u16>,
     },
 }
 

@@ -1399,10 +1399,7 @@ async fn pass_resumes_from_cursor_after_job_death() {
         w.record(&format!("m/art/x_{i:04}"), b"plan").await;
     }
     w.e2.page.set(100);
-    let (outcome, counts, why, progress) = w
-        .copier()
-        .run_job_with_sequence(&w.jobs, UnixMs(NOW), "", Some(0))
-        .await;
+    let (outcome, counts, why) = w.copier().run_job(&w.jobs, UnixMs(NOW), "").await;
     assert_eq!(why, None);
     assert_eq!(outcome, JobOutcome::Ack);
     assert_eq!(counts.unwrap().copied as usize, JOB_COPIES);
@@ -1411,20 +1408,9 @@ async fn pass_resumes_from_cursor_after_job_death() {
     // The chain: the job sent the next one, with its cursor.
     let sent = w.jobs.take();
     assert_eq!(sent.len(), 1);
-    let Job::RecoveryCopy {
-        pass,
-        cursor,
-        sequence,
-        ..
-    } = &sent[0].job
-    else {
+    let Job::RecoveryCopy { pass, cursor, .. } = &sent[0].job else {
         panic!("{:?}", sent[0].job);
     };
-    assert_eq!(*sequence, Some(1));
-    assert_eq!(
-        progress.unwrap().next,
-        Some(velmora_bridge::copy::cursor_tag(cursor))
-    );
     let last = format!("m/art/x_{:04}", JOB_COPIES - 1);
     assert_eq!((*pass, cursor), (UnixMs(NOW), &walk(&last)));
 
@@ -1432,11 +1418,7 @@ async fn pass_resumes_from_cursor_after_job_death() {
     // finds everything done. The last job of a pass sends none.
     let died = w.copier().step(UnixMs(NOW), cursor).await.unwrap();
     assert_eq!((died.counts.copied, died.next), (30, None));
-    let (outcome, counts, why, progress) = w
-        .copier()
-        .run_job_with_sequence(&w.jobs, *pass, cursor, *sequence)
-        .await;
-    assert_eq!(progress.unwrap().next, None);
+    let (outcome, counts, why) = w.copier().run_job(&w.jobs, *pass, cursor).await;
     assert_eq!(why, None);
     assert_eq!(outcome, JobOutcome::Ack);
     let counts = counts.unwrap();
@@ -1450,46 +1432,49 @@ async fn pass_resumes_from_cursor_after_job_death() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn walk_verification_after_skipped_sweep_is_retained_without_completion() {
+async fn verification_observation_survives_failed_continuation_enqueue() {
     let w = World::new();
-    w.record("m/art/x_1", b"a plan encountered in the walk")
-        .await;
-    w.clock.set(UnixMs(NOW + SWEEP_MS + 1));
-    let (outcome, counts, why, progress) = w
-        .copier()
-        .run_job_with_sequence(&w.jobs, UnixMs(NOW), "", Some(0))
-        .await;
-    assert_eq!((outcome, why), (JobOutcome::Ack, Some(StepError::Expired)));
-    assert_eq!(counts.unwrap().copied, 1);
-    assert!(
-        progress
-            .expect("a skipped sweep must not hide a verified copy")
-            .skipped_sweep
-    );
+    for i in 0..=JOB_COPIES {
+        w.record(&format!("m/art/x_{i:04}"), b"plan").await;
+    }
+    w.jobs.fail_after(Some(0));
+    let (outcome, counts, why) = w.copier().run_job(&w.jobs, UnixMs(NOW), "").await;
+    assert!(matches!(outcome, JobOutcome::Retry { .. }));
+    assert_eq!(why, Some(StepError::Queue));
+    let counts = counts.unwrap();
+    assert_eq!(counts.copied as usize, JOB_COPIES);
+    assert_eq!(counts.last_verified_write_at, Some(UnixMs(NOW)));
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn legacy_copy_job_without_sequence_still_copies() {
+async fn recovery_jobs_are_wire_compatible_with_the_strict_previous_decoder() {
+    #[derive(Debug, PartialEq, serde::Deserialize)]
+    #[serde(tag = "t", rename_all = "snake_case", deny_unknown_fields)]
+    enum PreviousJob {
+        RecoveryCopy { v: u8, pass: UnixMs, cursor: String },
+    }
+
     let w = World::new();
+    let slot = UnixMs(NOW - NOW % PASS_INTERVAL_MS);
+    assert!(w.copier().start_pass(&w.jobs, slot).await.unwrap());
+    let new = w.jobs.take().pop().unwrap().job;
+    assert_eq!(
+        serde_json::from_str::<PreviousJob>(&new.to_json()).unwrap(),
+        PreviousJob::RecoveryCopy {
+            v: JOB_VERSION,
+            pass: slot,
+            cursor: String::new()
+        }
+    );
+
     w.record("m/art/x_1", b"legacy copy").await;
     let raw = format!(r#"{{"t":"recovery_copy","v":{JOB_VERSION},"pass":{NOW},"cursor":""}}"#);
-    let Job::RecoveryCopy {
-        pass,
-        cursor,
-        sequence,
-        ..
-    } = Job::from_json(&raw).unwrap()
-    else {
+    let Job::RecoveryCopy { pass, cursor, .. } = Job::from_json(&raw).unwrap() else {
         panic!("not a recovery-copy job");
     };
-    assert_eq!(sequence, None);
-    let (outcome, counts, why, progress) = w
-        .copier()
-        .run_job_with_sequence(&w.jobs, pass, &cursor, sequence)
-        .await;
+    let (outcome, counts, why) = w.copier().run_job(&w.jobs, pass, &cursor).await;
     assert_eq!((outcome, why), (JobOutcome::Ack, None));
     assert_eq!(counts.unwrap().copied, 1);
-    assert!(progress.is_none());
 }
 
 /// The copier holds no catalogue port at all (see its fields), so no
@@ -3803,18 +3788,12 @@ async fn an_article_plan_written_between_walks_is_over_there_by_its_hint() {
     assert!(w.copier().hint(&w.jobs, &post, &JobOutcome::Ack).await);
     let sent = w.jobs.take();
     assert_eq!((sent.len(), sent[0].delay_secs), (1, 0));
-    let Job::RecoveryCopy {
-        v,
-        pass,
-        cursor,
-        sequence,
-    } = &sent[0].job
-    else {
+    let Job::RecoveryCopy { v, pass, cursor } = &sent[0].job else {
         panic!("another job");
     };
     // Pass 0: a version that knows no hints takes it for a job of a
     // pass that ended long ago, and does nothing.
-    assert_eq!((*v, *pass, *sequence), (JOB_VERSION, UnixMs(0), None));
+    assert_eq!((*v, *pass), (JOB_VERSION, UnixMs(0)));
     assert!(!pass_due(*pass) || w.clock.now().0 - pass.0 >= PASS_INTERVAL_MS);
     let wanted = time_at(&w, WANT_KEY).await;
     let (outcome, counts, why) = w.copier().run_job(&w.jobs, *pass, cursor).await;

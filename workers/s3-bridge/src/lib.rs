@@ -297,14 +297,9 @@ async fn queue(batch: MessageBatch<serde_json::Value>, env: Env, _ctx: Context) 
         let outcome = match &job {
             // Never through `run_job`, which reads the catalogue. A job
             // of another version is dropped: the next pass does the work.
-            Job::RecoveryCopy {
-                v,
-                pass,
-                cursor,
-                sequence,
-            } => {
+            Job::RecoveryCopy { v, pass, cursor } => {
                 if *v == JOB_VERSION {
-                    recovery_copy(&env, &bridge, *pass, cursor, *sequence).await
+                    recovery_copy(&env, &bridge, *pass, cursor, &msg.id()).await
                 } else {
                     console_error!("recovery copy: a job of another version was dropped");
                     JobOutcome::Ack
@@ -414,7 +409,7 @@ async fn recovery_copy(
     bridge: &env::WorkerBridge,
     pass: UnixMs,
     cursor: &str,
-    sequence: Option<u16>,
+    message_id: &str,
 ) -> JobOutcome {
     let remote = match env::recovery_store(env) {
         Ok(Some(remote)) => remote,
@@ -428,17 +423,15 @@ async fn recovery_copy(
             return JobOutcome::Ack;
         }
     };
-    let sequence = if recovery_alarm::enabled(env, bridge.cfg.environment) {
-        recovery_alarm::sequence_for(pass, cursor, sequence)
-    } else {
-        None
-    };
-    let (outcome, counts, why, progress) = copier(bridge, &remote)
-        .run_job_with_sequence(&bridge.jobs, pass, cursor, sequence)
+    let (outcome, counts, why) = copier(bridge, &remote)
+        .run_job(&bridge.jobs, pass, cursor)
         .await;
-    if let (Some(seq), Some(counts), Some(progress)) = (sequence, counts.as_ref(), progress) {
+    if pass.0 > 0
+        && bridge.cfg.maintenance != velmora_bridge::config::Maintenance::Restore
+        && recovery_alarm::enabled(env, bridge.cfg.environment)
+    {
         let now = velmora_bridge::ports::Clock::now(&bridge.clock);
-        recovery_alarm::record(env, pass, seq, cursor, now, counts, progress).await;
+        recovery_alarm::record(env, pass, message_id, now, counts.as_ref()).await;
     }
     let retry = matches!(outcome, JobOutcome::Retry { .. });
     // The reason is a class and a status at most. It is logged whether
@@ -467,7 +460,7 @@ async fn recovery_copy(
             c.foreign
         ),
         Some(c) => console_error!(
-            "recovery copy: pass={} retry={retry} records={} copied={} failed={} refused={} source_unreadable={} pending={} extra={} foreign={}",
+            "recovery copy: pass={} retry={retry} records={} copied={} failed={} refused={} source_unreadable={} pending={} extra={} foreign={} refused_put={:?} refused_verify={:?} refused_plan={:?} unsignable={}",
             pass.0,
             c.records,
             c.copied,
@@ -476,7 +469,11 @@ async fn recovery_copy(
             c.source_unreadable,
             c.pending,
             c.extra,
-            c.foreign
+            c.foreign,
+            c.refused_put,
+            c.refused_verify,
+            c.refused_plan,
+            c.unsignable.count
         ),
         None => {}
     }

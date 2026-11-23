@@ -111,8 +111,8 @@ pub trait HttpSend {
     async fn pause(&self, ms: u64);
 }
 
-/// Why a request to the store did not do what was asked. Carries a
-/// status at most, never text from the store.
+/// Why a request to the store did not do what was asked. Refusals can
+/// carry a status and a recognized code, never arbitrary response text.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RemoteError {
     /// The request itself is refused (key, quota, permission): a 4xx,
