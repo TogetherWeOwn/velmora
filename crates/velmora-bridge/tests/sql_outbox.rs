@@ -4713,8 +4713,6 @@ async fn the_parity_migration_applies_to_a_catalogue_with_plans() {
         MIGRATION_0019,
         MIGRATION_0020,
         MIGRATION_0021,
-        // The current publisher uses this column even with recording off.
-        MIGRATION_0026,
     ] {
         db.apply(script).unwrap();
     }
@@ -4732,22 +4730,9 @@ async fn the_parity_migration_applies_to_a_catalogue_with_plans() {
     let before = fx.cat.sql.0.query(&extents, &[]).await.unwrap();
     assert_eq!(before.len(), 3);
 
-    // Restore the pre-0022 schema after seeding, then apply both
-    // additive migrations to a catalogue that already holds extents.
-    fx.cat
-        .sql
-        .0
-        .apply("ALTER TABLE extents DROP COLUMN plain_crc64")
-        .unwrap();
     fx.cat.sql.0.apply(MIGRATION_0022).unwrap();
-    fx.cat.sql.0.apply(MIGRATION_0026).unwrap();
 
     assert_eq!(fx.cat.sql.0.query(&extents, &[]).await.unwrap(), before);
-    assert_eq!(
-        fx.count("SELECT COUNT(*) FROM extents WHERE plain_crc64 IS NOT NULL")
-            .await,
-        0
-    );
     let with = "SELECT COUNT(*) FROM extents WHERE parity IS NOT NULL OR parity_count IS NOT NULL";
     assert_eq!(fx.count(with).await, 0);
     let stored = fx.cat.stored_plan(&packed.extent).await.unwrap();

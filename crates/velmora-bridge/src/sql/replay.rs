@@ -125,8 +125,8 @@ fn extent_stmts(x: &ReplayExtent, now: UnixMs, out: &mut Vec<Stmt>) -> Result<()
     out.push((
         "INSERT OR IGNORE INTO extents(id, bucket_id, generation_id, state, seq, plain_offset, \
            plain_size, cipher_size, media_header, key_mode, wrapped_file_key, plain_md5, \
-           plain_sha256, cipher_sha256, safety_state, article_count, plan_rev, created_at, plain_crc64) \
-         VALUES (?1,?2,NULL,'staged',NULL,NULL,?3,?4,?5,?6,?7,?8,?9,?10,?11,NULL,?12,?13,?14)",
+           plain_sha256, cipher_sha256, safety_state, article_count, plan_rev, created_at) \
+         VALUES (?1,?2,NULL,'staged',NULL,NULL,?3,?4,?5,?6,?7,?8,?9,?10,?11,NULL,?12,?13)",
         vec![
             id(),
             text(e.bucket_id.as_str()),
@@ -141,7 +141,6 @@ fn extent_stmts(x: &ReplayExtent, now: UnixMs, out: &mut Vec<Stmt>) -> Result<()
             text(safety.as_str()),
             SqlValue::Int(i64::from(e.plan_rev)),
             ms(e.created_at),
-            opt(e.plain_crc64, |crc| SqlValue::Blob(crc.to_vec())),
         ],
     ));
     match (&x.plan, &x.packed) {

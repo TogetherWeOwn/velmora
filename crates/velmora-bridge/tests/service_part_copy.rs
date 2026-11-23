@@ -116,9 +116,7 @@ async fn sources(rig: &Rig, signer: &Signer) -> (Vec<u8>, Vec<u8>) {
 
 #[tokio::test(flavor = "current_thread")]
 async fn parts_copied_by_range_read_back_and_outlive_the_source() {
-    let mut cfg = config(Vec::new());
-    cfg.record_plain_crc64 = true;
-    let rig = rig_with(NoNntp, cfg);
+    let rig = rig();
     let (bucket, signer) = rig.standard(BUCKET).await;
     let (big, one) = sources(&rig, &signer).await;
     let (_, big_extents) = rig.live(&bucket, "big").await.unwrap();
@@ -176,12 +174,6 @@ async fn parts_copied_by_range_read_back_and_outlive_the_source() {
     assert_eq!(get(&rig, &signer, "dst").await.body, whole);
     let (generation, extents) = rig.live(&bucket, "dst").await.unwrap();
     assert_eq!(generation.size, whole.len() as u64);
-    assert_eq!(extents.len(), expected.len());
-    for (extent, plain) in extents.iter().zip(expected) {
-        let mut direct = velmora_s3_proto::Crc64Nvme::default();
-        direct.update(plain);
-        assert_eq!(extent.plain_crc64, Some(direct.finish()));
-    }
     assert!(extents
         .iter()
         .all(|e| big_extents.iter().all(|s| s.id != e.id)));

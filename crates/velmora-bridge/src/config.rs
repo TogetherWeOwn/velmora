@@ -294,8 +294,8 @@ pub struct BridgeConfig {
     /// addendum, so a rollback past it posts and releases extents
     /// without their parity.
     pub parity: bool,
-    /// Record CRC64NVME on newly sealed extents (`RECORD_PLAIN_CRC64`).
-    /// Off by default. Reading stored fingerprints does not depend on it.
+    /// Record CRC64NVME in sealed records for PutObject extents
+    /// (`RECORD_PLAIN_CRC64`). Off by default; reading is independent.
     pub record_plain_crc64: bool,
     /// The layout of new recovery records (`RECORD_LAYOUT`,
     /// [`crate::recovery::Layout`]): `flat`, or `tenant` for the

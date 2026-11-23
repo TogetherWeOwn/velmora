@@ -151,7 +151,7 @@ async fn put<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: 
         .inspect_err(observed.on_error(Stage::Budget))
         .map_err(|e| e.response())?;
     let SealedUpload { decoded, sealed } = store_streamed(
-        bridge,
+        &bridge.safety,
         req.body,
         lengths,
         validator,
@@ -161,6 +161,7 @@ async fn put<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: 
             extent: &extent_id,
         },
         &charge,
+        bridge.cfg.record_plain_crc64,
         observed,
     )
     .await
