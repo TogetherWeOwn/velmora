@@ -1,0 +1,33 @@
+[package]
+name = "velmora-dav"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.89"
+description = "Runtime-agnostic core of the WebDAV gateway: RFC 4918 over the velmora S3 API, with locks and dead properties"
+license = "MIT"
+repository = "https://github.com/TogetherWeOwn/velmora"
+publish = false
+
+[lib]
+name = "velmora_dav"
+path = "src/lib.rs"
+
+[dependencies]
+quick-xml = "=0.42.0"
+hmac = "=0.13.0"
+sha2 = "=0.11.1"
+base64 = "=0.22.1"
+httpdate = "=1.0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+velmora-s3-proto = { version = "0.1.0", path = "../velmora-s3-proto" }
+
+[dev-dependencies]
+# The real storage Worker core, in process, under the S3 handler test
+# harness: every WebDAV test goes through its SigV4 check, grants,
+# conditional writes, copies and multipart uploads.
+velmora-bridge = { version = "0.1.0", path = "../velmora-bridge", features = ["testkit"] }
+velmora = { version = "0.1.0", path = "../velmora", default-features = false }
+tokio = { version = "1", features = ["rt", "macros", "time", "net", "io-util", "sync", "test-util"] }
+rusqlite = { version = "0.42", features = ["bundled"] }

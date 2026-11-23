@@ -1585,6 +1585,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "velmora-dav"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "futures-util",
+ "hmac",
+ "httpdate",
+ "quick-xml",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
+ "velmora",
+ "velmora-bridge",
+ "velmora-s3-proto",
+]
+
+[[package]]
 name = "velmora-parity-bench"
 version = "0.1.0"
 dependencies = [
@@ -1632,6 +1651,16 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "velmora",
+]
+
+[[package]]
+name = "velmora-webdav"
+version = "0.1.0"
+dependencies = [
+ "futures-util",
+ "serde_json",
+ "velmora-dav",
+ "worker",
 ]
 
 [[package]]
