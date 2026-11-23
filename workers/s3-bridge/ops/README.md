@@ -204,9 +204,23 @@ and its record may already be stored (a later restore then deletes the
 key): send the call again until it answers `204` or `404`. Revocation is accepted
 under maintenance and during a replay.
 
-`GET /_admin/keys` lists every key: id, status, created time and its
-grants (bucket and permission), never a secret, 500 per page in id
+`GET /_admin/keys` lists every key: id, kind, status, created time and
+its grants (bucket and permission), never a secret, 500 per page in id
 order; follow `next` with `?after=<next>`.
+
+An **app password** is a key pair for the WebDAV gateway only: mint it
+with `"kind":"app_password"` in the `POST /_admin/keys` body. Its id
+starts with `APVL`. The S3 endpoint refuses it (`403
+InvalidAccessKeyId`), and the WebDAV entry point refuses every other
+key; nothing else about it differs (grants, revocation).
+
+Its secret is wrapped under its own domain (`velmora/app-password/v1`,
+not the S3 keys' `velmora/ak/v1`). A Worker built before key kinds
+cannot open it, so after a rollback below that build every request
+signed with an app password fails (`500 InternalError`) instead of
+being accepted as an S3 key on the public endpoint. Rolling forward again
+gives WebDAV users their access back. Revoking an app password instead
+deletes it for good: its holder needs a new one.
 
 ## Granting a key on another bucket
 

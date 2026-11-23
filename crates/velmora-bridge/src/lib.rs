@@ -11,6 +11,7 @@ pub mod articles;
 pub mod config;
 pub mod copy;
 pub mod crypto;
+pub mod entry;
 pub mod fanout;
 pub mod fetch;
 pub mod gate;

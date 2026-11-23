@@ -412,6 +412,9 @@ jobs:
       - name: Test the wasm section stripper
         working-directory: workers/s3-bridge
         run: python3 -I tools/test_strip_wasm.py
+      - name: Test the entry module (entry.mjs)
+        working-directory: workers/s3-bridge
+        run: node --test test/*.test.mjs
       - name: Test the registry path remap of bundle.sh
         working-directory: workers/s3-bridge
         run: python3 -I tools/test_registry_src_dirs.py
@@ -736,12 +739,14 @@ jobs:
           bash bundle.sh
           python3 -I tools/strip_wasm.py check build/index_bg.wasm
           # The digest of every file wrangler uploads or bundles (the wasm,
-          # the JS glue and the shim entry point), and the compiler that
-          # built them. Wrangler itself is pinned by package-lock.json. The
-          # merge runbook compares these with the live version's run to
+          # the JS glue, and the entry modules entry.mjs and entry-marker.mjs,
+          # which wrangler bundles with build/index.js), and the compiler
+          # that built them. Wrangler itself is pinned by package-lock.json.
+          # The merge runbook compares these with the live version's run to
           # tell a deploy of the same bytes from a changed one.
           rustc --version
           (cd build && find . -type f | sort | xargs sha256sum) | tee -a "$GITHUB_STEP_SUMMARY"
+          sha256sum entry.mjs entry-marker.mjs | tee -a "$GITHUB_STEP_SUMMARY"
       - name: Install pinned wrangler (npm ci)
         if: steps.fresh.outputs.fresh == 'true'
         working-directory: workers/s3-bridge

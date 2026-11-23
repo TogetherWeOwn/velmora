@@ -17,6 +17,7 @@ use velmora_s3_proto::UploadValidator;
 
 use crate::config::{BridgeConfig, Maintenance, REAL_DATA_READY};
 use crate::crypto::{unwrap_secret, DataKey, ExtentSealer};
+use crate::entry::Entry;
 use crate::ingress::{
     seal_upload, Charge, IngressError, SealedUpload, UploadLengths, UploadReadError,
 };
@@ -394,15 +395,6 @@ fn claimed_key(headers: &Headers, target: &Target) -> Option<String> {
     (!akid.is_empty()).then(|| akid.to_owned())
 }
 
-/// Headers the edge adds. They are never signed and their values are not
-/// always printable ASCII, so they are dropped before header validation.
-/// Dropping a header can only fail a signature, never satisfy one.
-pub(super) fn edge_header(name: &str) -> bool {
-    name.starts_with("cf-")
-        || name.starts_with("x-forwarded-")
-        || matches!(name, "cdn-loop" | "x-real-ip" | "true-client-ip")
-}
-
 /// Authenticates and authorizes from the request line and headers only.
 /// The body is never touched. A key with no usable row is
 /// `InvalidAccessKeyId` for every bucket.
@@ -432,7 +424,7 @@ where
     let fields: Vec<(&str, &str)> = req
         .headers
         .iter()
-        .filter(|(n, _)| !edge_header(n))
+        .filter(|(n, _)| !crate::entry::dropped_header(n))
         .map(|(n, v)| (n.as_str(), v.as_str()))
         .collect();
     let headers = Headers::new(&fields, &policy).map_err(s3_error);
@@ -451,8 +443,13 @@ where
         .check_features()
         .map_err(|refusal| header_refused(&refusal))?;
 
+    // The entry point admits one kind of key (`crate::entry`): a key of
+    // the other kind is looked up as if it did not exist.
+    let entry = Entry::of(&req.headers);
     let mut authority = OneKey {
-        akid: claimed_key(&headers, &target).unwrap_or_default(),
+        akid: claimed_key(&headers, &target)
+            .filter(|akid| entry.admits(akid))
+            .unwrap_or_default(),
         principal: String::new(),
         secret: None,
         perm: None,
