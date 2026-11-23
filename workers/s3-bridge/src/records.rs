@@ -65,7 +65,7 @@ fn js_err(class: &'static str) -> impl Fn(JsValue) -> BridgeError {
 
 /// The options of a put that stores only where nothing is stored:
 /// `{ onlyIf: Headers { "If-None-Match": "*" } }`.
-fn only_if_absent() -> Result<JsValue> {
+pub(crate) fn only_if_absent() -> Result<JsValue> {
     let headers = Headers::new();
     headers
         .set("If-None-Match", "*")

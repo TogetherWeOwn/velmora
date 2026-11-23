@@ -452,8 +452,13 @@ pub async fn record_open<'k, K: Kek, R: TenantRings, T: Clock>(
         Family::DataV1 if scheme_two(sealed) => Err(RecordCheck::CrossScheme),
         Family::DataV1 => Ok(RecordOpen::Kek(kek)),
         Family::DataV2(tenant) => {
-            let Some((named, version)) = v2_header(sealed) else {
+            // `VMR2` cut short, also inside its header, is damage; only
+            // bytes of another scheme are another scheme's.
+            if !sealed.starts_with(RECORD_V2_MAGIC) {
                 return Err(RecordCheck::CrossScheme);
+            }
+            let Some((named, version)) = v2_header(sealed) else {
+                return Err(RecordCheck::Unreadable);
             };
             // A header with no sealed body after it is damage, decided
             // before any key is looked for: never a key miss.

@@ -250,13 +250,13 @@ pub const HEAD_SEGMENTS: usize = JOB_COPIES - 2 * CONCURRENCY;
 const _: () = assert!(MAX_SEGMENTS <= HEAD_SEGMENTS);
 /// Source keys read per page.
 pub const PAGE: u32 = 1000;
-/// Which `VMR2` key versions the reloaded rings lacked, and since when:
-/// a JSON object, `<tenant>/<version>` to `[first, last, paged]`: the
-/// pass slot a job first found it missing in, the last time one did, and
-/// the pass slot it was last paged in (a slot is the start of its
-/// [`PASS_INTERVAL_MS`]). A hint like the others: lost, it delays the page of a
-/// partial ring by [`KEY_MISS_PASSES`] passes at most, and never stops
-/// one for a version the chain does not name.
+/// Which `VMR2` key versions the reloaded rings lacked, and which rings
+/// could not be read, since when: a JSON object, `<tenant>/<version>` or
+/// `<tenant>/ring` to `[first, last, kind]` (`MissMark`). A hint like the
+/// others: lost or garbled, it starts the [`KEY_MISS_PASSES`] count of a
+/// partial or unreadable ring again, and never stops a page for a version
+/// the chain does not name. Written only by the jobs of a pass, never by
+/// a hint.
 pub const KEY_MISS_KEY: &str = "rc/key-miss";
 /// A version the reloaded chain names but whose blob did not load (a
 /// partial ring) pages once it was missing this many passes (AM-80b,
@@ -269,6 +269,10 @@ pub const KEY_MISS_PAGE: &str = "copy_key_version_missing";
 const KEY_MISS_KEEP_MS: i64 = WALK_INTERVAL_MS;
 const KEY_MISS_ENTRIES: usize = 1000;
 const KEY_MISS_BYTES: usize = 128 * 1024;
+/// Where the pages of [`KEY_MISS_KEY`] are claimed, one key per pass slot
+/// and entry: `rc/key-page/<slot>/<entry>`. Removed by the first job of a
+/// later pass.
+pub const KEY_PAGE_PREFIX: &str = "rc/key-page/";
 /// Tenants whose missing key versions the first job of a pass looks at
 /// again ([`KEY_MISS_KEY`]; dial, est): each costs one ring read and one
 /// reload at most.
@@ -987,24 +991,67 @@ fn asked_store(copied: Copied) -> bool {
     !matches!(copied, Copied::Gone | Copied::Not(_) | Copied::Same)
 }
 
-/// Pages a key version a job lacked, by AM-80b, at most once per pass
-/// slot: a version the chain does not name at once, one it names (a
-/// partial ring) once it was missing in the slots of
+/// An entry of [`KEY_MISS_KEY`]: `[first, last, kind]`, the pass slot a
+/// job first found it missing in, the last time a job found it while
+/// copying a record, and its kind ([`miss_kind`]).
+type MissMark = [i64; 3];
+
+/// The kind of a [`Miss`] in [`KEY_MISS_KEY`].
+fn miss_code(miss: Miss) -> i64 {
+    match miss {
+        Miss::Unknown => 0,
+        Miss::Partial => 1,
+        Miss::Ring => 2,
+    }
+}
+
+fn miss_kind(code: i64) -> Option<Miss> {
+    match code {
+        0 => Some(Miss::Unknown),
+        1 => Some(Miss::Partial),
+        2 => Some(Miss::Ring),
+        _ => None,
+    }
+}
+
+/// The name of an entry: `<tenant>/<version>` for a key version,
+/// `<tenant>/ring` for a ring that could not be read, which no version
+/// number can be taken for.
+fn miss_name(tenant: &TenantId, version: u32, miss: Miss) -> String {
+    match miss {
+        Miss::Ring => format!("{tenant}/ring"),
+        _ => format!("{tenant}/{version}"),
+    }
+}
+
+/// The tenant and the version (`None`: the ring) of an entry's name.
+fn miss_of(name: &str) -> Option<(TenantId, Option<u32>)> {
+    let (tenant, what) = name.rsplit_once('/')?;
+    let tenant = TenantId::parse(tenant).ok()?;
+    match what {
+        "ring" => Some((tenant, None)),
+        v => Some((tenant, Some(v.parse().ok()?))),
+    }
+}
+
+/// Whether an entry pages in the pass of `slot` (AM-80b): a version the
+/// chain does not name at once; one it names whose blob did not load,
+/// and a ring that could not be read, once missing in the slots of
 /// [`KEY_MISS_PASSES`] passes, whatever the time within each.
-/// A ring that could not be read (version 0) pages like a partial one.
-fn page_miss(mark: &mut [i64; 3], slot: i64, miss: Miss, tenant: &TenantId, version: u32) {
+fn miss_due(mark: &MissMark, slot: i64) -> bool {
     // Saturating: the mark is bytes of the safety bucket, which anything
     // with its binding can write; a garbled time must not wrap and keep a
-    // page off.
-    let missing = slot.saturating_sub(mark[0]);
-    let due = miss == Miss::Unknown || missing >= KEY_MISS_PASSES * PASS_INTERVAL_MS;
-    if due && mark[2] != slot {
-        mark[2] = slot;
-        let kind = miss.code();
-        crate::trace::alert(|| {
-            format!("recovery copy ({KEY_MISS_PAGE}) tenant={tenant} version={version} ring={kind}")
-        });
+    // page off. A small `first` only makes it page sooner.
+    match miss_kind(mark[2]) {
+        Some(Miss::Unknown) => true,
+        Some(_) => slot.saturating_sub(mark[0]) >= KEY_MISS_PASSES * PASS_INTERVAL_MS,
+        None => false,
     }
+}
+
+/// The pass slot of `now`: the start of its [`PASS_INTERVAL_MS`].
+fn pass_slot(now: i64) -> i64 {
+    now - now.rem_euclid(PASS_INTERVAL_MS)
 }
 
 /// True on the cron run that starts a pass.
@@ -1203,7 +1250,6 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend, R: TenantRings> Copier<'_, B, 
         // for. The time is before this pass, so that a walk that
         // begins in it answers.
         if place.is_none() {
-            self.recheck_misses().await;
             let last = self.read_time(SWEPT_KEY).await;
             if !matches!(last, Ok(Some(at)) if (0..=PASS_INTERVAL_MS).contains(&(pass.0 - at))) {
                 // Not over a later time that has come: a job that
@@ -1303,7 +1349,13 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend, R: TenantRings> Copier<'_, B, 
         };
         let mut counts = CopyCounts::default();
         let mut known = Known::default();
-        let place = Place::parse(cursor).unwrap_or_else(|| Place::start(pass));
+        let parsed = Place::parse(cursor);
+        // The first job of a pass: the keys still missing, within its
+        // time (AM-80b).
+        if parsed.is_none() {
+            self.recheck_misses(&mut budget).await;
+        }
+        let place = parsed.unwrap_or_else(|| Place::start(pass));
         // The time of the sweep is up: the walk has the rest of the pass.
         // A hint is no part of a pass ([`Copier::run_job`] does it).
         let hint = place.phase == Phase::Plan;
@@ -1418,35 +1470,38 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend, R: TenantRings> Copier<'_, B, 
         self.page_misses().await
     }
 
-    /// [`KEY_MISS_KEY`], without what is forgotten: an entry not seen for
-    /// [`KEY_MISS_KEEP_MS`], or with a time that has not come. `None`
-    /// when it could not be read: it is then not written over.
-    async fn read_misses(&self, now: i64) -> Option<BTreeMap<String, [i64; 3]>> {
+    /// [`KEY_MISS_KEY`], without what is forgotten: an entry no job found
+    /// while copying a record for [`KEY_MISS_KEEP_MS`], or that is not
+    /// what a job writes. `None` when it could not be read: it is then not
+    /// written over.
+    async fn read_misses(&self, now: i64) -> Option<BTreeMap<String, MissMark>> {
         let mut marks = match self.read_mark(KEY_MISS_KEY, KEY_MISS_BYTES).await {
             Ok(Some(bytes)) => {
-                serde_json::from_slice::<BTreeMap<String, [i64; 3]>>(&bytes).unwrap_or_default()
+                serde_json::from_slice::<BTreeMap<String, MissMark>>(&bytes).unwrap_or_default()
             }
             Ok(None) => BTreeMap::new(),
             Err(_) => return None,
         };
-        // Only times a job could have written: anything else is
-        // forgotten, which can only start a count again, never hold a page
-        // off.
+        // Forgetting can only start a count again, never hold a page off:
+        // `first` is kept whatever its age (it only ever makes a page
+        // come sooner), and an entry goes only when no record named it
+        // for a day.
         let kept = now.saturating_sub(KEY_MISS_KEEP_MS);
-        marks.retain(|_, [first, last, paged]| {
+        marks.retain(|name, [first, last, kind]| {
             *last > kept
-                && *last <= now + PASS_INTERVAL_MS
-                && (kept..=now).contains(first)
-                && *paged <= now
+                && *last <= now.saturating_add(PASS_INTERVAL_MS)
+                && *first <= now
+                && miss_kind(*kind).is_some()
+                && miss_of(name).is_some()
         });
         Some(marks)
     }
 
-    async fn save_misses(&self, marks: BTreeMap<String, [i64; 3]>) -> bool {
+    async fn save_misses(&self, marks: BTreeMap<String, MissMark>) -> bool {
         let mut marks = marks;
         if marks.len() > KEY_MISS_ENTRIES {
             // The ones seen last stay.
-            let mut by_last: Vec<(String, [i64; 3])> = marks.into_iter().collect();
+            let mut by_last: Vec<(String, MissMark)> = marks.into_iter().collect();
             by_last.sort_by_key(|(_, m)| std::cmp::Reverse(m[1]));
             by_last.truncate(KEY_MISS_ENTRIES);
             marks = by_last.into_iter().collect();
@@ -1456,89 +1511,159 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend, R: TenantRings> Copier<'_, B, 
         put_mark(self.safety, KEY_MISS_KEY, body).await.is_ok()
     }
 
-    /// The first job of a pass looks again at the versions of
-    /// [`KEY_MISS_KEY`], for at most [`RECHECK_TENANTS`] tenants, so that
-    /// one still missing pages in every pass, also when only the walk,
-    /// which rests for hours, comes to the records under it (AM-80b). A
-    /// version that loads now, or whose tenant is shredded or whose
-    /// version is destroyed, is forgotten. It does not make an entry seen
-    /// (its last time stays): an entry no record named for
-    /// [`KEY_MISS_KEEP_MS`] is forgotten.
-    async fn recheck_misses(&self) {
-        let now = self.clock.now().0;
-        let slot = now - now.rem_euclid(PASS_INTERVAL_MS);
-        let Some(mut marks) = self.read_misses(now).await else {
-            return;
-        };
-        let mut tenants = BTreeSet::new();
-        let keys: Vec<String> = marks.keys().cloned().collect();
-        for key in keys {
-            let parsed = key
-                .rsplit_once('/')
-                .and_then(|(t, v)| Some((TenantId::parse(t).ok()?, v.parse::<u32>().ok()?)));
-            let Some((tenant, version)) = parsed else {
-                marks.remove(&key);
+    /// Pages each entry of `names` that is due in the pass of `slot`, once
+    /// per pass: a page is sent only by the job that claims it
+    /// ([`KEY_PAGE_PREFIX`], a conditional put), so jobs of one pass that
+    /// overlap (a delivery made again) page it once. A claim that cannot
+    /// be made pages all the same.
+    async fn page_due<'n>(
+        &self,
+        marks: &BTreeMap<String, MissMark>,
+        names: impl Iterator<Item = &'n String>,
+        slot: i64,
+    ) {
+        for name in names {
+            let Some(mark) = marks.get(name).filter(|m| miss_due(m, slot)) else {
                 continue;
             };
-            if !tenants.contains(&tenant) {
-                if tenants.len() >= RECHECK_TENANTS {
-                    continue;
-                }
-                tenants.insert(tenant.clone());
-            }
-            if version == 0 {
-                // A ring that could not be read.
-                if self.rings.ring_reads(self.clock, &tenant).await {
-                    marks.remove(&key);
-                } else if let Some(mark) = marks.get_mut(&key) {
-                    page_miss(mark, slot, Miss::Ring, &tenant, 0);
-                }
+            let Some((tenant, version)) = miss_of(name) else {
+                continue;
+            };
+            let claim = format!("{KEY_PAGE_PREFIX}{slot:016}/{name}");
+            if matches!(
+                self.safety.put_if_absent(&claim, Vec::new()).await,
+                Ok(false)
+            ) {
                 continue;
             }
-            match self.rings.key_for(self.clock, &tenant, version).await {
-                Ok(_) | Err(RecordCheck::Shredded) | Err(RecordCheck::VersionDestroyed) => {
-                    marks.remove(&key);
-                }
-                Err(RecordCheck::KeyMissing { named }) => {
-                    let miss = if named { Miss::Partial } else { Miss::Unknown };
-                    if let Some(mark) = marks.get_mut(&key) {
-                        page_miss(mark, slot, miss, &tenant, version);
-                    }
-                }
-                // Not read now: kept as it is.
-                Err(_) => {}
-            }
+            let kind = miss_kind(mark[2]).map_or("unknown", Miss::code);
+            let version = version.unwrap_or(0);
+            crate::trace::alert(|| {
+                format!(
+                    "recovery copy ({KEY_MISS_PAGE}) tenant={tenant} version={version} ring={kind}"
+                )
+            });
         }
-        // Handled here: the misses of the recheck do not make an entry
-        // seen.
-        let _ = self.rings.take_misses();
-        let _ = self.save_misses(marks).await;
     }
 
-    /// Pages each key version the reloaded rings of this job lacked, by
-    /// the rules of AM-80b, at most once per pass ([`KEY_MISS_KEY`]): a
-    /// version the chain does not name at once, one it names (a partial
-    /// ring) once it was missing [`KEY_MISS_PASSES`] passes. False when
-    /// the mark could not be read or saved. One that cannot be read is
-    /// not written over: it pages every version the chain does not name,
-    /// and no partial one, for this job.
+    /// The first job of a pass: pages every entry of [`KEY_MISS_KEY`]
+    /// that is due, so that a key still missing pages in every pass, also
+    /// when only the walk, which rests for hours, comes to the records
+    /// under it (AM-80b). Before that it looks again, within the job's
+    /// time, at the entries of up to [`RECHECK_TENANTS`] tenants, from a
+    /// tenant that moves on each pass, so every tenant comes round: an
+    /// entry whose version loads now (or whose ring reads), or whose
+    /// tenant is shredded or version destroyed, is forgotten; one that is
+    /// still missing keeps its first time and takes what is missing now.
+    /// It does not make an entry seen (its last time stays). Last, it
+    /// removes the claims of earlier passes.
+    async fn recheck_misses(&self, budget: &mut Budget) {
+        let now = self.clock.now().0;
+        let slot = pass_slot(now);
+        // Nothing missing: nothing to page, and no claim of an earlier
+        // pass is left but those of the pass that emptied the mark.
+        let Some(mut marks) = self.read_misses(now).await.filter(|m| !m.is_empty()) else {
+            return;
+        };
+        let tenants: Vec<TenantId> = marks
+            .keys()
+            .filter_map(|name| miss_of(name).map(|(t, _)| t))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let turn = usize::try_from(slot / PASS_INTERVAL_MS).unwrap_or(0);
+        let from = match tenants.len() {
+            0 => 0,
+            n => turn.wrapping_mul(RECHECK_TENANTS) % n,
+        };
+        let names: Vec<String> = marks.keys().cloned().collect();
+        for tenant in tenants
+            .iter()
+            .cycle()
+            .skip(from)
+            .take(RECHECK_TENANTS.min(tenants.len()))
+        {
+            if self.spent(budget.started) {
+                break;
+            }
+            for name in names
+                .iter()
+                .filter(|n| miss_of(n).is_some_and(|(t, _)| &t == tenant))
+            {
+                let Some((_, version)) = miss_of(name) else {
+                    continue;
+                };
+                let now_missing = match version {
+                    None => match self.rings.ring_reads(self.clock, tenant).await {
+                        true => None,
+                        false => Some(Miss::Ring),
+                    },
+                    Some(version) => match self.rings.key_for(self.clock, tenant, version).await {
+                        Ok(_) | Err(RecordCheck::Shredded) | Err(RecordCheck::VersionDestroyed) => {
+                            None
+                        }
+                        Err(RecordCheck::KeyMissing { named: true }) => Some(Miss::Partial),
+                        Err(RecordCheck::KeyMissing { named: false }) => Some(Miss::Unknown),
+                        // Not read now (the ring): kept as it is, and
+                        // paging as it did.
+                        Err(_) => marks.get(name).and_then(|m| miss_kind(m[2])),
+                    },
+                };
+                match now_missing {
+                    None => {
+                        marks.remove(name);
+                    }
+                    Some(miss) => {
+                        if let Some(mark) = marks.get_mut(name) {
+                            mark[2] = miss_code(miss);
+                        }
+                    }
+                }
+            }
+        }
+        // Handled here: what the recheck found does not make an entry
+        // seen.
+        let _ = self.rings.take_misses();
+        let names: Vec<String> = marks.keys().cloned().collect();
+        self.page_due(&marks, names.iter(), slot).await;
+        let _ = self.save_misses(marks).await;
+        // The claims of earlier passes; best effort, a page of keys.
+        budget.pages += 1;
+        if let Ok(claims) = self.safety.list(KEY_PAGE_PREFIX, "", PAGE).await {
+            let current = format!("{KEY_PAGE_PREFIX}{slot:016}/");
+            for claim in claims.iter().filter(|c| c.as_str() < current.as_str()) {
+                let _ = self.safety.delete(claim).await;
+            }
+        }
+    }
+
+    /// Notes what the reloaded rings of this job lacked in
+    /// [`KEY_MISS_KEY`], and pages each of those entries that is due
+    /// ([`Copier::page_due`]). False when the mark could not be read or
+    /// saved. One that cannot be read is not written over: what this job
+    /// lacked then pages if it is a version the chain does not name, and
+    /// a partial ring waits for a job that can read it.
     async fn page_misses(&self) -> bool {
         let misses = self.rings.take_misses();
         if misses.is_empty() {
             return true;
         }
         let now = self.clock.now().0;
-        let slot = now - now.rem_euclid(PASS_INTERVAL_MS);
+        let slot = pass_slot(now);
         let read = self.read_misses(now).await;
         let readable = read.is_some();
         let mut marks = read.unwrap_or_default();
+        let mut names = Vec::new();
         for (tenant, version, miss) in misses {
+            let name = miss_name(&tenant, version, miss);
             let mark = marks
-                .entry(format!("{tenant}/{version}"))
-                .or_insert([slot, now, i64::MIN]);
+                .entry(name.clone())
+                .or_insert([slot, now, miss_code(miss)]);
             mark[1] = mark[1].max(now);
-            page_miss(mark, slot, miss, &tenant, version);
+            mark[2] = miss_code(miss);
+            names.push(name);
         }
+        self.page_due(&marks, names.iter(), slot).await;
         if !readable {
             return false;
         }
@@ -1574,21 +1699,21 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend, R: TenantRings> Copier<'_, B, 
                 return Ok(None);
             }
             budget.pages += 1;
-            let listed = self
+            let page = self
                 .safety
                 .list_dirs(TENANT_DIR, &start, PAGE)
                 .await
                 .map_err(|_| StepError::Source)?;
-            let full = listed.len() >= PAGE as usize;
-            if let Some(last) = listed.last() {
-                start = past_dir(last);
-            }
-            dirs.extend(listed.iter().filter_map(|dir| {
+            dirs.extend(page.dirs.iter().filter_map(|dir| {
                 let tenant = dir.strip_prefix(TENANT_DIR)?.strip_suffix('/')?;
                 (tenant > after && TenantId::parse(tenant).is_ok()).then(|| tenant.to_string())
             }));
-            if !dirs.is_empty() || !full {
-                break;
+            match page.next {
+                Some(next) if dirs.is_empty() => start = next,
+                // Found one, or the end. (Past `LIST_PAGES` requests of
+                // names that are no managed tenant's, the rest of `m/x/`
+                // is the walk's.)
+                _ => break,
             }
         }
         Ok(Some(match dirs.is_empty() {

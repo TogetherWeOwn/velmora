@@ -233,10 +233,10 @@ impl BlobStore for CountingSafety {
         self.inner.list_entries(prefix, after, limit).await
     }
 
-    async fn list_dirs(&self, prefix: &str, after: &str, limit: u32) -> Result<Vec<String>> {
-        let dirs = self.inner.list_dirs(prefix, after, limit).await?;
-        self.dir_pages.borrow_mut().push(dirs.clone());
-        Ok(dirs)
+    async fn list_dirs(&self, prefix: &str, after: &str, limit: u32) -> Result<DirPage> {
+        let page = self.inner.list_dirs(prefix, after, limit).await?;
+        self.dir_pages.borrow_mut().push(page.dirs.clone());
+        Ok(page)
     }
 }
 
@@ -930,7 +930,8 @@ async fn am80b_first_job_bounds_rechecks_by_tenant_not_version() {
         w.source
             .answer(tenant, [ring(tenant, &[1], &[1, 2, 3], &[])]);
         for version in [2, 3] {
-            marks.insert(format!("{tenant}/{version}"), [NOW.0, NOW.0, i64::MIN]);
+            // `[first, last, kind]`, kind 1: a partial ring.
+            marks.insert(format!("{tenant}/{version}"), [NOW.0, NOW.0, 1]);
         }
     }
     w.raw(KEY_MISS_KEY, &serde_json::to_vec(&marks).unwrap())
@@ -1045,7 +1046,7 @@ async fn am80b_unreadable_ring_pages_on_pass_five_and_clears_when_readable() {
         .answer(A, [Err(BridgeError::Invalid("test ring load unavailable"))]);
     assert_eq!(w.first_job().await.failed, 1);
     assert!(alerts().is_empty());
-    let miss = format!("{A}/0");
+    let miss = format!("{A}/ring");
     assert!(w.miss_marks().await.contains_key(&miss));
     for pass in 2..=6 {
         w.clock.advance_ms(PASS_INTERVAL_MS);

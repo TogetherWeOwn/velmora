@@ -218,36 +218,63 @@ pub trait BlobStore {
         }
         Ok(entries)
     }
-    /// Up to `limit` directories directly below `prefix` (which ends with
-    /// `/`) that sort after `start_after`, in key order, each as
-    /// `prefix` + its name + `/`: the common prefixes of a listing with
-    /// the delimiter `/`. Keys directly at `prefix` + a name with no `/`
-    /// are no directory. Fewer than `limit` = no more.
+    /// One listing request of the directories directly below `prefix`
+    /// (which ends with `/`) that sort after `start_after`, in key order,
+    /// each as `prefix` + its name + `/`: the common prefixes of a listing
+    /// with the delimiter `/`. Keys directly at `prefix` + a name with no
+    /// `/` are no directory. Exactly one request, so that a caller counts
+    /// each ([`DirPage::next`] goes on).
     ///
-    /// This default lists one key per directory, starting after each
-    /// directory it found; an adapter whose listing takes a delimiter
-    /// overrides it (one request per 1,000 directories).
-    async fn list_dirs(&self, prefix: &str, start_after: &str, limit: u32) -> Result<Vec<String>> {
-        let mut dirs: Vec<String> = Vec::new();
-        let mut after = start_after.to_string();
-        while dirs.len() < limit as usize {
-            let Some(key) = self.list(prefix, &after, 1).await?.pop() else {
-                break;
-            };
+    /// This default lists up to `limit` keys and takes their directories;
+    /// an adapter whose listing takes a delimiter overrides it (up to
+    /// 1,000 directories per request).
+    async fn list_dirs(&self, prefix: &str, start_after: &str, limit: u32) -> Result<DirPage> {
+        let keys = self.list(prefix, start_after, limit.max(1)).await?;
+        let full = keys.len() >= limit.max(1) as usize;
+        let mut page = DirPage::default();
+        let mut after = None;
+        for key in keys {
             let rest = key.strip_prefix(prefix).unwrap_or_default();
             match rest.split_once('/') {
                 Some((name, _)) => {
                     let dir = format!("{prefix}{name}/");
-                    after = past_dir(&dir);
-                    if dir.as_str() > start_after {
-                        dirs.push(dir);
+                    after = Some(past_dir(&dir));
+                    if dir.as_str() > start_after && page.dirs.last() != Some(&dir) {
+                        page.dirs.push(dir);
                     }
                 }
-                None => after = key,
+                None => after = Some(key),
             }
         }
-        Ok(dirs)
+        page.next = after.filter(|_| full);
+        Ok(page)
     }
+
+    /// Stores `bytes` at `key` only when nothing is stored there: `true`
+    /// when this call stored it. This default looks first and is not
+    /// atomic; an adapter with a conditional put overrides it.
+    async fn put_if_absent(&self, key: &str, bytes: Vec<u8>) -> Result<bool> {
+        if self.head(key).await?.is_some() {
+            return Ok(false);
+        }
+        let sha: [u8; 32] =
+            sha2::Digest::finalize(<sha2::Sha256 as sha2::Digest>::new_with_prefix(&bytes)).into();
+        let meta = BlobMeta {
+            bucket: &BucketId::new("-"),
+            extent: &ExtentId::new("claim"),
+            cipher_sha256: &sha,
+        };
+        self.put(key, bytes, &meta).await?;
+        Ok(true)
+    }
+}
+
+/// One request of [`BlobStore::list_dirs`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DirPage {
+    pub dirs: Vec<String>,
+    /// Where the next request starts after; `None` at the end.
+    pub next: Option<String>,
 }
 
 /// A key that sorts after every key below `dir` (which ends with `/`)
