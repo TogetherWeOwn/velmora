@@ -882,6 +882,9 @@ jobs:
       # VELMORA_S3_HOSTS adds S3 endpoint hosts as comma separated
       # hostname=class entries. Attach each host as a Custom Domain
       # before setting the variable. The smoke test checks every host.
+      # VELMORA_RELEASE_AT_VERIFY accepts only "off" (also the default
+      # when unset or empty) or "on". Replace exactly one shipped
+      # RELEASE_AT_VERIFY = "off" line in the prod [vars] table.
       - name: Generate the production wrangler config
         if: steps.fresh.outputs.fresh == 'true'
         working-directory: workers/s3-bridge
@@ -893,6 +896,7 @@ jobs:
           VELMORA_RECOVERY_PREFIX: ${{ vars.VELMORA_RECOVERY_PREFIX }}
           VELMORA_VERIFY_MODE: ${{ vars.VELMORA_VERIFY_MODE }}
           VELMORA_RECORD_LAYOUT: ${{ vars.VELMORA_RECORD_LAYOUT }}
+          VELMORA_RELEASE_AT_VERIFY: ${{ vars.VELMORA_RELEASE_AT_VERIFY }}
         run: |
           set -euo pipefail
           python3 -I - wrangler.toml wrangler.deploy.toml <<'PY'
@@ -924,6 +928,9 @@ jobs:
           layout = os.environ.get("VELMORA_RECORD_LAYOUT", "") or "flat"
           if layout not in ("flat", "tenant"):
               sys.exit("VELMORA_RECORD_LAYOUT must be unset, flat or tenant")
+          release = os.environ.get("VELMORA_RELEASE_AT_VERIFY", "") or "off"
+          if release not in ("off", "on"):
+              sys.exit("VELMORA_RELEASE_AT_VERIFY must be unset, off or on")
 
           with open(src, encoding="utf-8") as f:
               lines = f.read().split("\n")
@@ -939,8 +946,9 @@ jobs:
                   return "S3_HOSTS" in value or any(map(sets_s3_hosts, value.values()))
               return isinstance(value, list) and any(map(sets_s3_hosts, value))
 
+          prod_lines = lines[:end]
           try:
-              shipped_prod = tomllib.loads("\n".join(lines[:end]))
+              shipped_prod = tomllib.loads("\n".join(prod_lines))
           except tomllib.TOMLDecodeError:
               shipped_prod = {}  # The generated config is checked below.
           if sets_s3_hosts(shipped_prod):
@@ -991,12 +999,30 @@ jobs:
               sys.exit("the prod section sets VERIFY_MODE a second time")
           if any(re.match(r"\s*RECORD_LAYOUT\b", lines[i]) for i in range(end)):
               sys.exit("the prod section of the shipped file sets RECORD_LAYOUT")
+          shipped_release = 'RELEASE_AT_VERIFY = "off"'
+          subs.append((shipped_release, f'RELEASE_AT_VERIFY = "{release}"'))
           for placeholder, value in subs:
               hits = [i for i in range(end) if lines[i].strip() == placeholder]
               if len(hits) != 1:
                   sys.exit(f"expected exactly one prod line {placeholder!r}, found {len(hits)}")
               i = hits[0]
               indent = lines[i][: len(lines[i]) - len(lines[i].lstrip())]
+              if placeholder == shipped_release:
+                  # Probe the original text: a matching line inside a string
+                  # must not pass, even if a different line sets the real key.
+                  marker = "__VELMORA_RELEASE_AT_VERIFY_PROBE__"
+                  error = "the shipped RELEASE_AT_VERIFY line is not the prod [vars] assignment"
+                  prod_lines[i] = indent + f'RELEASE_AT_VERIFY = "{marker}"'
+                  try:
+                      probed = tomllib.loads("\n".join(prod_lines))
+                      probed_vars = probed["vars"]
+                      if probed_vars.get("RELEASE_AT_VERIFY") != marker:
+                          sys.exit(error)
+                  except (tomllib.TOMLDecodeError, KeyError, AttributeError):
+                      sys.exit(error)
+                  probed_vars["RELEASE_AT_VERIFY"] = "off"
+                  if probed != shipped_prod:
+                      sys.exit(error)
               lines[i] = indent + value
               if hosts and placeholder.startswith("S3_HOST "):
                   lines[i] += f'\n{indent}S3_HOSTS = "{hosts}"'
@@ -1018,6 +1044,8 @@ jobs:
               sys.exit("the generated config is not valid TOML with a prod [vars] table")
           if found != ("tenant" if layout == "tenant" else None):
               sys.exit("the generated config does not carry the record layout that was asked for")
+          if prod_vars.get("RELEASE_AT_VERIFY") != release:
+              sys.exit("the generated config does not carry the release-at-verify setting that was asked for")
           # The segment writer is on when one object may have more
           # extents than one record holds. Its records must not get
           # flat names. Absent or empty is the Worker's default, which
@@ -1034,7 +1062,7 @@ jobs:
               sys.exit("the generated config does not carry the S3 hosts that were asked for")
           with open(dst, "w", encoding="utf-8") as f:
               f.write(text)
-          print(f"wrangler.deploy.toml: prod placeholders substituted, prod [build] removed, recovery copy {copy}, verify mode {mode}")
+          print(f"wrangler.deploy.toml: prod placeholders substituted, prod [build] removed, recovery copy {copy}, verify mode {mode}, release-at-verify {release}")
           print(f"record layout in the generated config: {layout}")
           class_list = f" ({','.join(classes)})" if classes else ""
           print(f"extra S3 hosts in the generated config: {len(classes)}{class_list}")
