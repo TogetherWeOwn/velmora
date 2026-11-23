@@ -70,6 +70,8 @@ await settle(() => 42, 1);
 await settle(() => 'velmora-post', 1);
 env.JOB_METRICS_SAMPLE = 0;
 await settle(() => 'velmora-post', 0);
+env.JOB_METRICS_SAMPLE = undefined;
+await settle(() => 'velmora-post', 0);
 delete env.JOB_METRICS_SAMPLE;
 await settle(() => 'velmora-post', 1);
 console.log('queue metadata Wasm smoke test passed');

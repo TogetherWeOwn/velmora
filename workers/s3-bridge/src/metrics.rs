@@ -49,8 +49,15 @@ pub fn queue_name<E>(read: impl FnOnce() -> Result<Option<String>, E>) -> String
 }
 
 pub fn sample_binding(env: &Env) -> u32 {
-    let value = Reflect::get(env, &JsValue::from_str("JOB_METRICS_SAMPLE"));
-    read_sample(value.map(|v| (!v.is_undefined()).then(|| v.as_string())))
+    let key = JsValue::from_str("JOB_METRICS_SAMPLE");
+    let value = Reflect::get(env, &key).and_then(|value| {
+        if value.is_undefined() {
+            Reflect::has(env, &key).map(|present| present.then_some(None))
+        } else {
+            Ok(Some(value.as_string()))
+        }
+    });
+    read_sample(value)
 }
 
 /// Absent defaults; readonly argument inspection failures, non-string
