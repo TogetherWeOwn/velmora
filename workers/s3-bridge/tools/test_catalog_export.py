@@ -1050,6 +1050,18 @@ class CatalogueScripts(unittest.TestCase):
         self.assert_loaded(result, ms)
         self.assertIn("WARNING verification skipped", result.stderr)
 
+    def test_integer_cursor_is_text_even_on_older_sqlite_json(self):
+        make_query = runpy.run_path(str(ROOT / "ops" / "sql_longest_statement.py"))["verification_query"]
+        with sqlite3.connect(":memory:") as target:
+            # Emulate SQLite 3.37.2's numeric quote() output inside JSON.
+            target.create_function("quote", 1, lambda value: value)
+            target.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+            target.execute("INSERT INTO t VALUES (9007199254740993)")
+            n, raw = target.execute(make_query({"name": "t", "keys": ["rowid"]}, None)).fetchone()
+            self.assertEqual((n, json.loads(raw)), (1, [["integer", "9007199254740993"]]))
+            self.assertEqual(target.execute(make_query({"name": "t", "keys": ["rowid"]}, json.loads(raw))).fetchone(),
+                             (0, None))
+
     def test_composite_text_cursor_seeks_on_every_primary_key_column(self):
         make_query = runpy.run_path(str(ROOT / "ops" / "sql_longest_statement.py"))["verification_query"]
         plan_row = {"name": "objects", "keys": ["bucket_id", "key"]}

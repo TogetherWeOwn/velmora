@@ -265,9 +265,11 @@ def verification_query(plan, cursor):
             page = f"SELECT * FROM ({union}) ORDER BY {', '.join(aliases)} LIMIT {VERIFY_PAGE_SIZE}"
     ctes.append(f"page AS MATERIALIZED ({page})")
     desc = ", ".join(f"{alias} DESC" for alias in aliases)
+    # Older SQLite can serialize quote(integer) as a JSON number. Force
+    # strings so the wire cursor keeps every digit of a 64-bit rowid.
     encode = ", ".join(
-        f"json_array(typeof({alias}), CASE WHEN typeof({alias}) IN ('text','blob') "
-        f"THEN hex({alias}) ELSE quote({alias}) END)" for alias in aliases)
+        f"json_array(typeof({alias}), CAST(CASE WHEN typeof({alias}) IN ('text','blob') "
+        f"THEN hex({alias}) ELSE quote({alias}) END AS TEXT))" for alias in aliases)
     return (f"WITH {', '.join(ctes)} SELECT COUNT(1) AS n, "
             f"(SELECT json_array({encode}) FROM page ORDER BY {desc} LIMIT 1) AS cursor FROM page")
 
