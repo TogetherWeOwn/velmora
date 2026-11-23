@@ -288,46 +288,49 @@ impl BodyReads for ByobReads {
     }
 }
 
-/// Check the returned object's size before opening its stream or growing `out`.
-async fn read_object_body(
-    required: Option<u64>,
-    actual: u64,
+/// Check the returned object's size before opening its body or growing `out`.
+async fn read_extent_into<T, R: BodyReads>(
+    expected: u64,
     out: &mut Vec<u8>,
-    fill: impl AsyncFnOnce(u64, &mut Vec<u8>) -> Result<()>,
-) -> Result<()> {
-    if required.is_some_and(|size| size != actual) {
-        out.clear();
-        return Err(BridgeError::BlobSizeMismatch);
-    }
-    fill(actual, out).await
-}
-
-// The SDK supplies the size and a body opener; obtaining the size does not open the body.
-struct ReadObject<F> {
-    size: u64,
-    fill: F,
-}
-
-async fn read_into<F: AsyncFnOnce(u64, &mut Vec<u8>) -> Result<()>>(
-    required: Option<u64>,
-    out: &mut Vec<u8>,
-    get: impl std::future::Future<Output = Result<Option<ReadObject<F>>>>,
+    get: impl std::future::Future<Output = Result<Option<(u64, T)>>>,
+    open: impl FnOnce(T, u64) -> Result<R>,
 ) -> Result<bool> {
     // Missing objects and failures before the first read leave no old bytes.
     out.clear();
-    let Some(object) = get.await? else {
+    let Some((size, object)) = get.await? else {
         return Ok(false);
     };
-    read_object_body(required, object.size, out, object.fill).await?;
+    if size != expected {
+        return Err(BridgeError::BlobSizeMismatch);
+    }
+    let mut reads = open(object, size)?;
+    fill_into(&mut reads, size, out)
+        .await
+        .map_err(|e| body_err(e, None))?;
     Ok(true)
 }
 
-async fn read_extent_into<F: AsyncFnOnce(u64, &mut Vec<u8>) -> Result<()>>(
-    expected: u64,
-    out: &mut Vec<u8>,
-    get: impl std::future::Future<Output = Result<Option<ReadObject<F>>>>,
-) -> Result<bool> {
-    read_into(Some(expected), out, get).await
+fn body_err(error: BodyError, span: Option<ByteSpan>) -> BridgeError {
+    BridgeError::Blob(
+        match (error, span) {
+            (BodyError::Short, Some(_)) => "r2: short range",
+            (BodyError::Short, None) => "r2: short body",
+            (BodyError::Long, _) => "r2: long body",
+            (BodyError::Read, _) => "r2: get body failed",
+        }
+        .into(),
+    )
+}
+
+fn open_r2_body(object: worker::Object, size: u64) -> Result<ByobReads> {
+    let body = object
+        .body()
+        .ok_or_else(|| BridgeError::Blob("r2: get returned no body".into()))?;
+    let stream = match body.response_body().map_err(blob_err("get body"))? {
+        worker::ResponseBody::Stream(stream) => stream,
+        _ => return Err(BridgeError::Blob("r2: get returned no body".into())),
+    };
+    ByobReads::new(&stream, size).ok_or_else(|| BridgeError::Blob("r2: get body failed".into()))
 }
 
 impl R2Blobs {
@@ -335,7 +338,7 @@ impl R2Blobs {
         &self,
         key: &str,
         span: Option<ByteSpan>,
-    ) -> Result<Option<ReadObject<impl AsyncFnOnce(u64, &mut Vec<u8>) -> Result<()>>>> {
+    ) -> Result<Option<(u64, worker::Object)>> {
         let mut req = self.bucket.get(key);
         if let Some(s) = span {
             req = req.range(r2_range(s)?);
@@ -344,30 +347,7 @@ impl R2Blobs {
             return Ok(None);
         };
         let size = span.map_or_else(|| object.size(), |s| s.len);
-        let fill = async move |expected, out: &mut Vec<u8>| {
-            let body = object
-                .body()
-                .ok_or_else(|| BridgeError::Blob("r2: get returned no body".into()))?;
-            let stream = match body.response_body().map_err(blob_err("get body"))? {
-                worker::ResponseBody::Stream(stream) => stream,
-                _ => return Err(BridgeError::Blob("r2: get returned no body".into())),
-            };
-            let Some(mut reads) = ByobReads::new(&stream, expected) else {
-                return Err(BridgeError::Blob("r2: get body failed".into()));
-            };
-            fill_into(&mut reads, expected, out).await.map_err(|e| {
-                BridgeError::Blob(
-                    match (e, span) {
-                        (BodyError::Short, Some(_)) => "r2: short range",
-                        (BodyError::Short, None) => "r2: short body",
-                        (BodyError::Long, _) => "r2: long body",
-                        (BodyError::Read, _) => "r2: get body failed",
-                    }
-                    .into(),
-                )
-            })
-        };
-        Ok(Some(ReadObject { size, fill }))
+        Ok(Some((size, object)))
     }
 }
 
@@ -425,14 +405,20 @@ impl BlobStore for R2Blobs {
                 .map(|size| empty_span(s, size))
                 .transpose();
         }
+        let Some((size, object)) = self.get_object(key, span).await? else {
+            return Ok(None);
+        };
         let mut out = Vec::new();
-        Ok(read_into(None, &mut out, self.get_object(key, span))
-            .await?
-            .then_some(out))
+        let mut reads = open_r2_body(object, size)?;
+        fill_into(&mut reads, size, &mut out)
+            .await
+            .map_err(|e| body_err(e, span))?;
+        Ok(Some(out))
     }
 
     async fn get_into(&self, key: &str, expected: u64, out: &mut Vec<u8>) -> Result<bool> {
-        read_extent_into(expected, out, self.get_object(key, None)).await
+        // Pass expected through unchanged; this helper owns the check and fill.
+        read_extent_into(expected, out, self.get_object(key, None), open_r2_body).await
     }
 
     async fn head(&self, key: &str) -> Result<Option<u64>> {
@@ -630,55 +616,54 @@ mod tests {
     }
 
     #[test]
-    fn a_reported_size_mismatch_never_opens_or_fills_the_body() {
+    fn an_extent_get_rejects_mismatched_r2_metadata_before_opening_the_body() {
         for (expected, reported) in [(64, 65), (65, 64)] {
             let mut out = vec![0xaa; 16];
             let capacity = out.capacity();
             let mut opens = 0;
-            let mut reader = scripted(reported as usize, vec![]);
-            let result = run(read_object_body(
-                Some(expected),
-                reported,
+
+            let result = run(read_extent_into(
+                expected,
                 &mut out,
-                async |size, out| {
+                async { Ok(Some((reported, ()))) },
+                |(), _| {
                     opens += 1;
-                    fill_into(&mut reader, size, out).await.unwrap();
-                    Ok(())
+                    Ok(scripted(reported as usize, vec![]))
                 },
             ));
+
+            assert!(
+                matches!(result, Err(BridgeError::BlobSizeMismatch)),
+                "expected BlobSizeMismatch, got {result:?}"
+            );
             assert_eq!(opens, 0, "no body reader opened");
-            assert!(reader.asked.is_empty(), "no body bytes read");
-            assert!(matches!(result, Err(BridgeError::BlobSizeMismatch)));
             assert!(out.is_empty());
-            assert_eq!(out.capacity(), capacity);
+            assert_eq!(out.capacity(), capacity, "the buffer did not grow");
         }
     }
 
     #[test]
-    fn an_extent_get_checks_r2_metadata_before_opening_the_body() {
-        let mut out = vec![0xaa; 64];
-        let capacity = out.capacity();
+    fn an_extent_get_with_matching_r2_metadata_opens_and_fills_the_body() {
+        let mut out = vec![0xaa; 16];
         let mut opens = 0;
-        let mut reader = scripted(65, vec![]);
+        let reader = scripted(64, vec![Some(5)]);
+        let body = reader.body.clone();
 
-        let result = run(read_extent_into(64, &mut out, async {
-            Ok(Some(ReadObject {
-                size: 65,
-                fill: async |size, out: &mut Vec<u8>| {
-                    opens += 1;
-                    fill_into(&mut reader, size, out).await.unwrap();
-                    Ok(())
-                },
-            }))
-        }));
+        let found = run(read_extent_into(
+            64,
+            &mut out,
+            async { Ok(Some((64, ()))) },
+            |(), size| {
+                opens += 1;
+                assert_eq!(size, 64);
+                Ok(reader)
+            },
+        ))
+        .unwrap();
 
-        assert!(
-            matches!(result, Err(BridgeError::BlobSizeMismatch)),
-            "expected BlobSizeMismatch, got {result:?}"
-        );
-        assert_eq!(opens, 0, "no body reader opened");
-        assert!(out.is_empty());
-        assert_eq!(out.capacity(), capacity, "the buffer did not grow");
+        assert!(found);
+        assert_eq!(opens, 1);
+        assert_eq!(out, body);
     }
 
     #[test]
