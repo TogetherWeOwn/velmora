@@ -1017,8 +1017,8 @@ impl ByteBudget {
     }
 
     /// `extent`: the job holds an extent of that many bytes, which
-    /// `bytes` count, in a buffer of [`Charge::lend`]. A spare buffer
-    /// that fits it is taken over, and what it holds beyond the extent
+    /// `bytes` count, in a buffer of [`Charge::lend_charged`]. A spare
+    /// buffer that fits it is taken over, and what it holds beyond the extent
     /// is charged too. Spares are let go, oldest first, only as far as
     /// that makes room for this charge.
     fn try_charge_as(&self, bytes: u64, job: bool, extent: Option<u64>) -> Option<Charge> {
@@ -1347,7 +1347,7 @@ impl Charge {
         part
     }
 
-    /// An empty buffer for `len` bytes of the job's extent: the spare
+    /// Test-only unchecked loan for `len` bytes: the spare
     /// that [`ByteBudget::charge_job_extent`] took over, or a new one. It
     /// comes back to this charge when the [`Lent`] is dropped, and may
     /// become a spare when the charge is dropped.
@@ -1365,6 +1365,7 @@ impl Charge {
     ///     drop((first, second));
     /// }
     /// ```
+    #[cfg(any(test, feature = "testkit"))]
     pub fn lend(&mut self, len: usize) -> Lent<'_> {
         let mut buffer = self.lend_buffer();
         if buffer.capacity() < len {

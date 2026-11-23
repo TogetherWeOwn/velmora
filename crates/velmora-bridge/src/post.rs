@@ -601,7 +601,7 @@ where
     }
 
     /// [`Self::post_stage`] under the job's budget charge, whose extent
-    /// buffer ([`Charge::lend`]) the extent is read into.
+    /// buffer ([`Charge::lend_charged`]) the extent is read into.
     pub(crate) async fn post_stage_in(
         &self,
         lease: &Lease,

@@ -302,33 +302,49 @@ async fn read_object_body(
     fill(actual, out).await
 }
 
+// The SDK supplies the size and a body opener; obtaining the size does not open the body.
+struct ReadObject<F> {
+    size: u64,
+    fill: F,
+}
+
+async fn read_into<F: AsyncFnOnce(u64, &mut Vec<u8>) -> Result<()>>(
+    required: Option<u64>,
+    out: &mut Vec<u8>,
+    get: impl std::future::Future<Output = Result<Option<ReadObject<F>>>>,
+) -> Result<bool> {
+    // Missing objects and failures before the first read leave no old bytes.
+    out.clear();
+    let Some(object) = get.await? else {
+        return Ok(false);
+    };
+    read_object_body(required, object.size, out, object.fill).await?;
+    Ok(true)
+}
+
+async fn read_extent_into<F: AsyncFnOnce(u64, &mut Vec<u8>) -> Result<()>>(
+    expected: u64,
+    out: &mut Vec<u8>,
+    get: impl std::future::Future<Output = Result<Option<ReadObject<F>>>>,
+) -> Result<bool> {
+    read_into(Some(expected), out, get).await
+}
+
 impl R2Blobs {
-    async fn read_into(
+    async fn get_object(
         &self,
         key: &str,
         span: Option<ByteSpan>,
-        required: Option<u64>,
-        out: &mut Vec<u8>,
-    ) -> Result<bool> {
-        // Missing objects and failures before the first read leave no old bytes.
-        out.clear();
+    ) -> Result<Option<ReadObject<impl AsyncFnOnce(u64, &mut Vec<u8>) -> Result<()>>>> {
         let mut req = self.bucket.get(key);
-        match span {
-            // R2 has no empty range: answer from a head.
-            Some(s) if s.len == 0 => {
-                return match self.head(key).await? {
-                    None => Ok(false),
-                    Some(size) => empty_span(s, size).map(|_| true),
-                };
-            }
-            Some(s) => req = req.range(r2_range(s)?),
-            None => {}
+        if let Some(s) = span {
+            req = req.range(r2_range(s)?);
         }
         let Some(object) = req.execute().await.map_err(blob_err("get"))? else {
-            return Ok(false);
+            return Ok(None);
         };
-        let actual = span.map_or_else(|| object.size(), |s| s.len);
-        read_object_body(required, actual, out, async |expected, out| {
+        let size = span.map_or_else(|| object.size(), |s| s.len);
+        let fill = async move |expected, out: &mut Vec<u8>| {
             let body = object
                 .body()
                 .ok_or_else(|| BridgeError::Blob("r2: get returned no body".into()))?;
@@ -350,9 +366,8 @@ impl R2Blobs {
                     .into(),
                 )
             })
-        })
-        .await?;
-        Ok(true)
+        };
+        Ok(Some(ReadObject { size, fill }))
     }
 }
 
@@ -402,15 +417,22 @@ impl BlobStore for R2Blobs {
     }
 
     async fn get(&self, key: &str, span: Option<ByteSpan>) -> Result<Option<Vec<u8>>> {
+        // R2 has no empty range: answer from a head.
+        if let Some(s) = span.filter(|s| s.len == 0) {
+            return self
+                .head(key)
+                .await?
+                .map(|size| empty_span(s, size))
+                .transpose();
+        }
         let mut out = Vec::new();
-        Ok(self
-            .read_into(key, span, None, &mut out)
+        Ok(read_into(None, &mut out, self.get_object(key, span))
             .await?
             .then_some(out))
     }
 
     async fn get_into(&self, key: &str, expected: u64, out: &mut Vec<u8>) -> Result<bool> {
-        self.read_into(key, None, Some(expected), out).await
+        read_extent_into(expected, out, self.get_object(key, None)).await
     }
 
     async fn head(&self, key: &str) -> Result<Option<u64>> {
@@ -630,6 +652,33 @@ mod tests {
             assert!(out.is_empty());
             assert_eq!(out.capacity(), capacity);
         }
+    }
+
+    #[test]
+    fn an_extent_get_checks_r2_metadata_before_opening_the_body() {
+        let mut out = vec![0xaa; 64];
+        let capacity = out.capacity();
+        let mut opens = 0;
+        let mut reader = scripted(65, vec![]);
+
+        let result = run(read_extent_into(64, &mut out, async {
+            Ok(Some(ReadObject {
+                size: 65,
+                fill: async |size, out: &mut Vec<u8>| {
+                    opens += 1;
+                    fill_into(&mut reader, size, out).await.unwrap();
+                    Ok(())
+                },
+            }))
+        }));
+
+        assert!(
+            matches!(result, Err(BridgeError::BlobSizeMismatch)),
+            "expected BlobSizeMismatch, got {result:?}"
+        );
+        assert_eq!(opens, 0, "no body reader opened");
+        assert!(out.is_empty());
+        assert_eq!(out.capacity(), capacity, "the buffer did not grow");
     }
 
     #[test]
