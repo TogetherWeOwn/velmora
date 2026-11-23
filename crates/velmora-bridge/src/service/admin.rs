@@ -1501,10 +1501,9 @@ async fn drill_extent<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K:
     let mut slept = 0u32;
     let mut interrupted = 0u32;
     let mut last: Option<BridgeError>;
-    // What a rebuild from the extent's parity found no room for on the
-    // try before ([`ColdReader::settle`]). The next try waits for the
-    // read and for these: with room for the read alone it would read
-    // the extent again in full and be refused its rebuild again.
+    // The largest rebuild shortfall ([`ColdReader::settle`]), kept
+    // across this extent's retries even if the last try ended for
+    // another reason. The next try waits for both the read and rebuild.
     let mut rebuild = 0u64;
     loop {
         if charge.is_none() {
@@ -1558,7 +1557,7 @@ async fn drill_extent<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K:
             }
             Err(e) => Err(e),
         };
-        rebuild = reader.settle();
+        rebuild = rebuild.max(reader.settle());
         match read {
             Ok((ColdFetch::Filled(cipher), count)) => {
                 *articles += count;

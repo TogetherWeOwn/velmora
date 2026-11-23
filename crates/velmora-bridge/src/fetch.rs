@@ -6,6 +6,7 @@
 //! decoded, and compared with the SHA-256 stored in its plan row before
 //! anything uses its bytes.
 
+use core::future::{poll_fn, Future};
 use futures_util::future::{join_all, select, Either, LocalBoxFuture};
 use velmora::rng::{FillRandom, SystemRng};
 use velmora::rs::{reconstruct, DataShard, ParityShard};
@@ -26,6 +27,20 @@ use crate::types::{
     ArticleRow, BridgeError, ExtentRow, FailClass, ProviderConfig, ProviderFault, Result,
     SizeCommand, UnixMs,
 };
+
+/// Runs `f` and, beside it, the cache write that is under way, if any.
+pub(crate) async fn beside<F: Future>(put: &mut Option<LocalBoxFuture<'_, ()>>, f: F) -> F::Output {
+    let mut f = core::pin::pin!(f);
+    poll_fn(|cx| {
+        if let Some(writing) = put.as_mut() {
+            if writing.as_mut().poll(cx).is_ready() {
+                *put = None;
+            }
+        }
+        f.as_mut().poll(cx)
+    })
+    .await
+}
 
 /// One provider connection slot and the session opened under it.
 ///
@@ -1903,6 +1918,40 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ColdReader<'a, C, N, T> {
         }
     }
 
+    /// Waits only for the caller's own previous cache write. While it
+    /// settles, end any sessions that cannot safely stay idle, making
+    /// their slots eligible for staffing the parity pass again.
+    async fn settle_prior_write(
+        &mut self,
+        put: &mut Option<LocalBoxFuture<'_, ()>>,
+        desk: &mut Desk<'a>,
+    ) {
+        if let Some((idle, sleep)) = self.idle_ms().zip(self.timer.as_ref()) {
+            if let Some(writing) = put.as_mut() {
+                if matches!(select(writing, sleep(idle)).await, Either::Left(_)) {
+                    *put = None;
+                    // The write wins if both are ready on the same
+                    // poll. Still close sessions past the idle limit.
+                    if self.idle_ms() != Some(0) {
+                        return;
+                    }
+                }
+            }
+        }
+        let sessions = core::mem::take(&mut self.sessions);
+        for session in &sessions {
+            let provider = session.provider;
+            if let Some(i) = desk.order.iter().position(|p| p.id == provider.id) {
+                desk.full[i] = false;
+            }
+            free_pool_slot(provider, &desk.order, &mut desk.full);
+        }
+        beside(put, ProviderSession::close_all(sessions)).await;
+        if let Some(writing) = put.take() {
+            writing.await;
+        }
+    }
+
     /// Rebuilds the lost data articles of `extent` from its parity
     /// articles. `None` = every lost article is in its place and equal to
     /// the SHA-256 of its plan row; otherwise how the read ends, with
@@ -1925,7 +1974,7 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ColdReader<'a, C, N, T> {
     /// [`ColdFetch::Unrecoverable`]: the reader that was not asked may
     /// have the articles.
     ///
-    /// Nothing is written and nothing is posted here.
+    /// Nothing is written or posted for the extent being rebuilt.
     async fn rebuild(
         &mut self,
         extent: &ExtentRow,
@@ -1933,6 +1982,7 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ColdReader<'a, C, N, T> {
         cipher: &mut [u8],
         desk: &mut Desk<'a>,
         readers: &[&'a ProviderConfig],
+        put: &mut Option<LocalBoxFuture<'_, ()>>,
     ) -> Result<Option<ColdFetch>> {
         let Lost { stored, have, end } = lost;
         let plan = &stored.rows[..];
@@ -1968,7 +2018,15 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ColdReader<'a, C, N, T> {
         // the caller is told how much was lacking ([`Self::settle`]).
         let need = cold_rebuild_bytes(u64::from(parity.shard_len), t as u64);
         let funded = self.reserve.take().filter(|room| room.bytes() >= need);
-        let Some(_room) = funded.or_else(|| self.room.try_charge(need)) else {
+        let mut room = funded.or_else(|| self.room.try_charge(need));
+        if room.is_none() && put.is_some() {
+            // That write already holds its room; it does not wait for
+            // budget. Settle it and try once more without waiting for
+            // room held by any other request.
+            self.settle_prior_write(put, desk).await;
+            room = self.room.try_charge(need);
+        }
+        let Some(_room) = room else {
             self.lacked = need;
             return Ok(Some(ColdFetch::Busy));
         };
@@ -2002,8 +2060,8 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ColdReader<'a, C, N, T> {
                 (tried[slot], chosen[slot], seat[slot]) = (true, true, place);
                 board.borrow_mut().starts[slot] = place * len;
             }
-            self.read_rows(desk, readers, now, &parity.articles, &chosen, &board)
-                .await?;
+            let read = self.read_rows(desk, readers, now, &parity.articles, &chosen, &board);
+            beside(put, read).await?;
         }
         let board = board.into_inner();
         let usable: Vec<usize> = (0..m).filter(|&slot| board.have[slot]).collect();
@@ -2083,11 +2141,21 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ColdReader<'a, C, N, T> {
     /// from the extent's parity articles, when it has any ([`Self::rebuild`]);
     /// an extent that lost none reads no parity.
     pub(crate) async fn fetch(&mut self, extent: &ExtentRow) -> Result<ColdFetch> {
+        self.fetch_beside(extent, &mut None).await
+    }
+
+    /// [`Self::fetch`] beside this request's previous cache write. Only
+    /// if a rebuild cannot charge its room does the read wait for it.
+    pub(crate) async fn fetch_beside(
+        &mut self,
+        extent: &ExtentRow,
+        put: &mut Option<LocalBoxFuture<'_, ()>>,
+    ) -> Result<ColdFetch> {
         // The plan and the parity addendum beside it come with one
         // read of the catalogue. The addendum is looked at only when an
         // article is lost.
-        let stored = self.catalog.stored_plan(&extent.id).await?;
-        self.fetch_planned(extent, stored).await
+        let stored = beside(put, self.catalog.stored_plan(&extent.id)).await?;
+        self.fetch_planned_beside(extent, stored, put).await
     }
 
     /// [`Self::fetch`] with the extent's plan already read.
@@ -2095,6 +2163,15 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ColdReader<'a, C, N, T> {
         &mut self,
         extent: &ExtentRow,
         stored: StoredPlan,
+    ) -> Result<ColdFetch> {
+        self.fetch_planned_beside(extent, stored, &mut None).await
+    }
+
+    async fn fetch_planned_beside(
+        &mut self,
+        extent: &ExtentRow,
+        stored: StoredPlan,
+        put: &mut Option<LocalBoxFuture<'_, ()>>,
     ) -> Result<ColdFetch> {
         let drill = self.drill;
         let plan = &stored.rows[..];
@@ -2110,7 +2187,7 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ColdReader<'a, C, N, T> {
         }
 
         let now = self.clock.now();
-        let pool = Pool::load(self.catalog, self.providers, now).await?;
+        let pool = beside(put, Pool::load(self.catalog, self.providers, now)).await?;
         let readers: Vec<&'a ProviderConfig> = self.providers.iter().filter(|p| p.read).collect();
         // A provider that refused this drill's login is not asked again
         // by it, and is not the one a fallback below is spent on.
@@ -2134,7 +2211,7 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ColdReader<'a, C, N, T> {
             .into_iter()
             .partition(|s| order.iter().any(|p| p.id == s.provider.id));
         self.sessions = kept;
-        ProviderSession::close_all(gone).await;
+        beside(put, ProviderSession::close_all(gone)).await;
 
         let mut desk = Desk {
             drill,
@@ -2147,7 +2224,8 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ColdReader<'a, C, N, T> {
         let board = core::cell::RefCell::new(Board::new(size, starts, desk.order.len()));
         let all = vec![true; plan.len()];
         // On the heap too: a body nests many futures above this one.
-        Box::pin(self.read_rows(&mut desk, &readers, now, plan, &all, &board)).await?;
+        let read = self.read_rows(&mut desk, &readers, now, plan, &all, &board);
+        Box::pin(beside(put, read)).await?;
         let mut board = board.into_inner();
         let lost = board.have.iter().filter(|have| !**have).count();
         if lost > 0 {
@@ -2169,7 +2247,7 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ColdReader<'a, C, N, T> {
             };
             // On the heap: the rebuild is rare, and what it holds across
             // its awaits is not carried by every read that never needs it.
-            let rebuild = self.rebuild(extent, lost, &mut board.cipher, &mut desk, &readers);
+            let rebuild = self.rebuild(extent, lost, &mut board.cipher, &mut desk, &readers, put);
             let rebuilt = Box::pin(rebuild).await?;
             if let Some(end) = rebuilt {
                 return Ok(end);

@@ -24,8 +24,8 @@ use super::common::{
 use crate::crypto::{cipher_span, open_range, unwrap_bdk};
 use crate::fanout::{admit, Fanout, Grant, TOKEN_TTL_MS};
 use crate::fetch::{
-    cold_fetch_bytes, cold_poll_ms, cold_read_bytes, cold_rebuild_most, cold_step_bytes, ColdFetch,
-    ColdReader, COLD_WAIT_MS,
+    beside, cold_fetch_bytes, cold_poll_ms, cold_read_bytes, cold_rebuild_most, cold_step_bytes,
+    ColdFetch, ColdReader, COLD_WAIT_MS,
 };
 use crate::ingress::{ByteBudget, Charge, Spawner, CHARGE_WAIT_MS};
 use crate::metrics::{GetFailureStage as Stage, GetObservation};
@@ -726,20 +726,6 @@ impl<T> Drop for Driven<T> {
     }
 }
 
-/// Runs `f` and, beside it, the cache write that is under way, if any.
-async fn beside<F: Future>(put: &mut Option<LocalBoxFuture<'_, ()>>, f: F) -> F::Output {
-    let mut f = core::pin::pin!(f);
-    poll_fn(|cx| {
-        if let Some(writing) = put.as_mut() {
-            if writing.as_mut().poll(cx).is_ready() {
-                *put = None;
-            }
-        }
-        f.as_mut().poll(cx)
-    })
-    .await
-}
-
 /// Produces the pieces of one body in order. The connections to Usenet
 /// stay open from one cold extent to the next, and the cache write of an
 /// extent runs while the next one is read (see [`Cold`]).
@@ -1028,7 +1014,8 @@ const MID_BODY_WAITS: u32 = 3;
 struct Spent {
     /// Asking the cache and the safety copy first.
     warm: Cell<i64>,
-    /// Reading extents from Usenet.
+    /// Reading extents from Usenet, including a rebuild's wait for
+    /// the previous cache write when it holds the room the rebuild needs.
     read: Cell<i64>,
     /// Waiting for the cache write before, or for room in the budget.
     wait: Cell<i64>,
@@ -1303,10 +1290,10 @@ where
         let mut slept = 0u32;
         let mut attempt = 0u64;
         let mut interrupted = 0u32;
-        // Room for a rebuild from the extent's parity, taken for the
-        // next try after a read that found none for it. Without it a
-        // read that lost articles would be made again in full as soon
-        // as the extent alone fits, and refused its rebuild again.
+        // The largest known rebuild shortfall, kept across this
+        // piece's retries. A later Busy for slots says nothing about
+        // how much room the rebuild still needs.
+        let mut rebuild = 0u64;
         let mut spare: Option<Charge> = None;
         loop {
             let reader = match &mut self.reader {
@@ -1322,11 +1309,10 @@ where
             if let Some(spare) = spare.take() {
                 reader.fund(spare);
             }
-            let fetched = Spent::time(&bridge.clock, &self.spent.read, reader.fetch(extent));
-            let read = beside(&mut self.put, fetched).await;
-            // What a rebuild lacked, if the read ended for that: the
-            // next try waits for room for the read and for these.
-            let rebuild = reader.settle();
+            let fetched = reader.fetch_beside(extent, &mut self.put);
+            let read = Spent::time(&bridge.clock, &self.spent.read, fetched).await;
+            let shortfall = reader.settle();
+            rebuild = rebuild.max(shortfall);
             let wait_stage = match read {
                 Ok(ColdFetch::Filled(cipher)) => {
                     // One cache write at a time.
@@ -1347,7 +1333,10 @@ where
                             None => {
                                 drop(cipher);
                                 drop(work);
-                                work = self.charge(need).await?;
+                                work = self.charge(need.saturating_add(rebuild)).await?;
+                                if rebuild > 0 {
+                                    spare = Some(work.split_off(rebuild));
+                                }
                                 continue;
                             }
                         }
@@ -1376,7 +1365,7 @@ where
                     }
                     return Ok((plain, held));
                 }
-                Ok(ColdFetch::Busy) if rebuild > 0 => Stage::Budget,
+                Ok(ColdFetch::Busy) if shortfall > 0 => Stage::Budget,
                 Ok(ColdFetch::Busy) => Stage::SlotWait,
                 // Every provider that was asked broke off (a proxy that
                 // went away, a provider that hung up): the read is tried
