@@ -51,7 +51,8 @@ const WRITERS: &[(&str, [usize; 5])] = &[
     ("keys/escrow.rs", [0, 0, 0, 0, 1]), // restore_escrow
     ("keys/tk.rs", [0, 0, 0, 0, 2]),     // create_key_version (arbiter, copy_to)
     // Adapters, non-recovery puts, or consumers that forward existing names.
-    ("copy.rs", [0, 0, 0, 2, 0]), // rc/ marks and already-proved copies to the remote
+    ("copy.rs", [0, 0, 0, 2, 1]), // rc/ marks, rc/key-page/ claims, and already-proved copies to the remote
+    ("ports.rs", [0, 0, 0, 1, 0]), // BlobStore::put_if_absent's default, forwarding to put
     ("directory/fence.rs", [0, 0, 0, 1, 0]), // legacy stamp
     ("fetch.rs", [0, 0, 0, 1, 0]), // cache fill
     ("records.rs", [0, 0, 0, 0, 1]), // RecordStore forwarding impl
