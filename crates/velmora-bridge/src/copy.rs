@@ -1574,7 +1574,11 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend, R: TenantRings> Copier<'_, B, 
         // A group of claims at a time, as the copies go.
         // Each page right after its own claim, with nothing awaited in
         // between: a claim made is a page sent, also when the job ends
-        // before the others are.
+        // before the others are. Claim puts that hang until the job is
+        // cancelled (the safety bucket not answering, when no copy is made
+        // either) leave the entries that were not claimed to the next
+        // pass's first job, whose claims have other names: a page comes a
+        // pass later at worst.
         stream::iter(due)
             .map(|(name, claim, kind)| async move {
                 let claimed = self.safety.put_if_absent(&claim, Vec::new()).await;

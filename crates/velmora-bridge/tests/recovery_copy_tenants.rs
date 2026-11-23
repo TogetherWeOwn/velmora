@@ -1058,6 +1058,11 @@ async fn am80b_future_claim_guesses_are_pruned_and_cannot_suppress_pages() {
         .iter()
         .filter(|c| !this.contains(c))
         .all(|c| c.starts_with(&format!("{KEY_PAGE_PREFIX}{next:016}/"))));
+    // The next pass's claims planted above are all still there.
+    assert!(
+        guesses.iter().all(|g| claims.contains(g)),
+        "next-pass claims must be kept: {claims:?}"
+    );
 
     // Plant the guesses again as this slot starts, so future-claim cleanup
     // cannot hide a regression to plaintext or otherwise unkeyed claims.
