@@ -40,12 +40,14 @@ pub async fn run(env: Env, pass: UnixMs, remote: S3Remote<FetchHttp>) {
     let now = WorkerClock.now();
     let counts = match env.bucket("SAFETY") {
         Ok(bucket) => {
+            let slot = (Math::random() * 8.0) as usize;
             audit(
                 &R2Blobs::new(bucket),
                 &remote,
                 &WorkerClock,
                 now,
-                &random_start(now, (Math::random() * 8.0) as usize, Math::random()),
+                &random_start(now, slot, Math::random()),
+                &random_start(now, slot % 4, Math::random()),
                 |remaining| (Math::random() * remaining as f64) as usize,
             )
             .await

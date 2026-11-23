@@ -298,7 +298,7 @@ async fn independent_audit_classifies_equal_missing_different_refused_and_unavai
         if status == Some(0) {
             w.e2.drop_next.set(1);
         }
-        let counts = audit(&source, &w.remote, &w.clock, UnixMs(NOW), "m/", |_| 0).await;
+        let counts = audit(&source, &w.remote, &w.clock, UnixMs(NOW), "m/", "m/", |_| 0).await;
         assert_eq!(
             (counts.checked, counts.problems(), counts.unavailable),
             (1, problems, unavailable)
@@ -326,7 +326,7 @@ async fn audit_slowdown_header_is_unavailable_even_with_another_4xx_status() {
         headers: vec![("x-amz-error-code".into(), "SlowDown".into())],
         body: vec![],
     });
-    let counts = audit(&source, &w.remote, &w.clock, UnixMs(NOW), "m/", |_| 0).await;
+    let counts = audit(&source, &w.remote, &w.clock, UnixMs(NOW), "m/", "m/", |_| 0).await;
     assert_eq!(
         (counts.checked, counts.problems(), counts.unavailable),
         (1, 0, 1)
@@ -342,7 +342,7 @@ async fn audit_never_sends_tenant_key_names_to_the_destination() {
         "m/tk/local-only".into(),
         (2, NOW - 49 * 3_600_000, Some(b"ok".to_vec())),
     );
-    let counts = audit(&source, &w.remote, &w.clock, UnixMs(NOW), "m/", |_| 0).await;
+    let counts = audit(&source, &w.remote, &w.clock, UnixMs(NOW), "m/", "m/", |_| 0).await;
     assert_eq!(counts.checked, 0);
     assert!(source.gets.borrow().is_empty());
     assert!(w.e2.log.borrow().is_empty());
@@ -368,6 +368,7 @@ async fn random_old_sample_can_compare_a_segment_beyond_the_first_five() {
         &w.clock,
         UnixMs(NOW),
         "m/seg/s_",
+        "m/",
         |remaining| {
             if remaining == 8 {
                 5
@@ -389,6 +390,10 @@ async fn old_audit_tries_one_fallback_page_after_an_empty_tenant_probe() {
         "m/art/x_1".into(),
         (2, NOW - 49 * 3_600_000, Some(b"ok".to_vec())),
     );
+    source.rows.insert(
+        "m/art/x_0".into(),
+        (2, NOW - 49 * 3_600_000, Some(b"ok".to_vec())),
+    );
     w.e2.status.set(Some(503));
     let counts = audit(
         &source,
@@ -396,6 +401,7 @@ async fn old_audit_tries_one_fallback_page_after_an_empty_tenant_probe() {
         &w.clock,
         UnixMs(NOW),
         "m/x/t_0000000000000000/",
+        "m/art/x_0",
         |_| 0,
     )
     .await;
@@ -427,8 +433,29 @@ async fn oversized_recent_record_does_not_displace_an_eligible_sample() {
         format!("m/g_{:013x}_large", at + 10),
         (large, at + 10, None),
     );
-    let counts = audit(&source, &w.remote, &w.clock, UnixMs(NOW), "m/", |_| 0).await;
+    let counts = audit(&source, &w.remote, &w.clock, UnixMs(NOW), "m/", "m/", |_| 0).await;
     assert_eq!((counts.checked, counts.missing), (10, 1));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn audit_continues_past_a_full_recent_page_of_oversized_records() {
+    use velmora_bridge::audit::{audit, PAGE_SIZE};
+    let w = World::new();
+    let mut source = AuditShelf::default();
+    let at = NOW - 2 * 3_600_000;
+    let size = velmora_bridge::remote::MAX_AUDIT_BYTES + 1;
+    for n in 0..PAGE_SIZE {
+        source
+            .rows
+            .insert(format!("m/g_{at:013x}_{n:05}"), (size, at, None));
+    }
+    source.rows.insert(
+        format!("m/g_{at:013x}_small"),
+        (2, at, Some(b"ok".to_vec())),
+    );
+    let counts = audit(&source, &w.remote, &w.clock, UnixMs(NOW), "m/", "m/", |_| 0).await;
+    assert_eq!((counts.checked, counts.missing), (1, 1));
+    assert_eq!(source.lists.get(), 6, "exactly one continuation page");
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -475,7 +502,16 @@ async fn audit_samples_newest_settled_records_and_old_keys_with_bounded_requests
         );
         w.e2.set(&key, b"ok");
     }
-    let counts = audit(&source, &w.remote, &w.clock, UnixMs(NOW), "m/art/", |_| 0).await;
+    let counts = audit(
+        &source,
+        &w.remote,
+        &w.clock,
+        UnixMs(NOW),
+        "m/art/",
+        "m/",
+        |_| 0,
+    )
+    .await;
     assert_eq!((counts.checked, counts.problems()), (14, 0));
     assert_eq!(source.lists.get(), 5);
     let keys = source.gets.borrow();

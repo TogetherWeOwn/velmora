@@ -156,7 +156,8 @@ impl Operation {
 /// Cap an independent audit GET at 1 MiB.
 pub const MAX_AUDIT_BYTES: usize = 1 << 20;
 
-fn error_code(response: &HttpResponse) -> Option<&'static str> {
+/// A known S3 code from a header or bounded XML; never provider text.
+pub fn s3_error_code(response: &HttpResponse) -> Option<&'static str> {
     // HEAD commonly has no body. Never retain provider-controlled text.
     let known = |value: &str| {
         [
@@ -403,7 +404,12 @@ impl<H: HttpSend> S3Remote<H> {
     }
 
     fn refused(&self, op: Operation, response: &HttpResponse) -> RemoteError {
-        self.problem(op, "refused", Some(response.status), error_code(response));
+        self.problem(
+            op,
+            "refused",
+            Some(response.status),
+            s3_error_code(response),
+        );
         RemoteError::Refused(response.status)
     }
 
@@ -470,7 +476,7 @@ impl<H: HttpSend> S3Remote<H> {
                 Ok(r)
                     if op == Operation::Get
                         && (400..500).contains(&r.status)
-                        && error_code(&r) == Some("SlowDown") =>
+                        && s3_error_code(&r) == Some("SlowDown") =>
                 {
                     Some(r)
                 }
@@ -483,7 +489,7 @@ impl<H: HttpSend> S3Remote<H> {
                 self.http.pause(pause + jitter).await;
                 pause *= 4;
             } else if let Some(r) = exhausted {
-                self.problem(op, "retry_exhausted", Some(r.status), error_code(&r));
+                self.problem(op, "retry_exhausted", Some(r.status), s3_error_code(&r));
             } else {
                 self.problem(op, "no_answer", None, None);
             }
@@ -566,7 +572,7 @@ impl<H: HttpSend> S3Remote<H> {
         match r.status {
             200 => Ok(Some(r.body)),
             404 => {
-                self.problem(op, "missing", Some(404), error_code(&r));
+                self.problem(op, "missing", Some(404), s3_error_code(&r));
                 Ok(None)
             }
             status => {

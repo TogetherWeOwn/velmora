@@ -67,12 +67,20 @@ async fn recent(
     let end = high;
     let mut from = low;
     let mut found = Vec::new();
-    while low <= high {
-        let after = start_after(prefix, UnixMs(from));
+    let mut continuation = None;
+    // Bisection and any continuations share the same per-prefix budget.
+    for _ in 0..25 {
+        if low > high {
+            break;
+        }
+        let after = continuation
+            .take()
+            .unwrap_or_else(|| start_after(prefix, UnixMs(from)));
         let Ok(page) = source.page(prefix, &after).await else {
             counts.source_errors += 1;
             break;
         };
+        let last = page.objects.last().map(|object| object.key.clone());
         let mut n = 0;
         let mut past_end = false;
         for object in page.objects {
@@ -94,13 +102,20 @@ async fn recent(
             }
         }
         newest(&mut found);
-        if (!page.truncated || past_end) && (from == low || n >= RECENT) {
+        let complete = !page.truncated || past_end;
+        if complete && (from == low || n >= RECENT) {
             break;
         }
-        // Normally one LIST per prefix. If a page fills before the end
-        // of the time range, bisect by minted millisecond instead of
-        // following an unbounded cursor. Each probe halves the range
-        // (at most 25 LISTs per prefix including the first probe).
+        if !complete && n < RECENT {
+            if let Some(last) = last.filter(|last| *last > after) {
+                // A large or short first page can have too few eligible
+                // keys even though more follow, including at the same ms.
+                continuation = Some(last);
+                continue;
+            }
+        }
+        // Dense eligible pages can seek toward the latest minted ms
+        // without following all the intervening pages.
         if n >= RECENT {
             low = from + 1;
         } else {
@@ -144,6 +159,7 @@ pub async fn audit(
     clock: &impl Clock,
     now: UnixMs,
     random_after: &str,
+    fallback_after: &str,
     mut pick_old: impl FnMut(usize) -> usize,
 ) -> AuditCounts {
     let mut counts = AuditCounts::default();
@@ -155,10 +171,8 @@ pub async fn audit(
     }
     newest(&mut recent_records);
     let mut old = old_page(source, now, random_after, &mut counts).await;
-    if old.is_empty() && random_after != RECORD_PREFIX {
-        // From the start of m/ an empty flat layout naturally falls through
-        // to the tenant layout; no second random anchor can skip both.
-        old = old_page(source, now, RECORD_PREFIX, &mut counts).await;
+    if old.is_empty() && fallback_after != random_after {
+        old = old_page(source, now, fallback_after, &mut counts).await;
     }
     // Select without replacement anywhere on the page, not just its first keys.
     for i in 0..old.len().min(OLD) {
