@@ -228,6 +228,39 @@ async fn verify_release_records_presence_of_every_parity_article() {
         .all(|entry| entry["total"] == ALL && entry["parity"] == PARITY));
 }
 
+/// A verify job that resumes at the second backbone asks the first one,
+/// read in full by an earlier job, with `STAT` before it releases. That
+/// question covers the parity articles: one gone since releases nothing,
+/// records nothing for that backbone, and starts verify again.
+#[tokio::test]
+async fn a_resumed_release_asks_the_earlier_backbone_for_its_parity() {
+    let mut rig = parity_rig(false).await;
+    rig.bridge.cfg.release_at_verify = true;
+    rig.bridge.cfg.propagation_grace_secs = LONG_GRACE_SECS;
+    let (s, parity) = rig.posted(9).await;
+    rig.propagate(&s, 0, 1).await;
+    rig.propagate_one(&parity.articles[0]).await;
+    // The first job reads the first backbone in full and waits for the
+    // second, which lacks a parity article.
+    let wait = retry_delay(&rig.run(&s, OutboxStage::Verify).await);
+    assert_eq!(rig.rows(&s).len(), 1);
+    // The article reaches the second backbone; another parity article
+    // leaves the first.
+    rig.propagate_one(&parity.articles[1]).await;
+    rig.servers[0].hide(&parity.articles[0].message_id).await;
+    rig.bridge.clock.advance_secs(wait);
+    assert_eq!(rig.run(&s, OutboxStage::Verify).await, JobOutcome::Ack);
+
+    assert!(rig.safety_held(&s));
+    let ok = VerifyResult::Ok;
+    let rows = rig.rows(&s);
+    assert_eq!(rows.len(), 2);
+    assert_eq!(summary(&rows[0]), ("bb0", VerifyKind::Body, ok, ALL, ALL));
+    assert_eq!(summary(&rows[1]), ("bb1", VerifyKind::Stat, ok, ALL, ALL));
+    let outbox = rig.outbox(&s);
+    assert_eq!((outbox.stage, outbox.cursor), (OutboxStage::Verify, 0));
+}
+
 /// The evidence of an extent without parity is what it was: no entry
 /// has a parity count.
 #[tokio::test]
