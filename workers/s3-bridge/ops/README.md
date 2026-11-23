@@ -1724,8 +1724,9 @@ colo still in `blob5`:
 - `blob6`: `auth` (authentication, including the key and bucket
   lookups), `lookup` (catalogue reads, including write-path restore and
   upload state checks), `commit` (catalogue writes or publication that
-  could not complete), `plan` (GET metadata, range or extent planning),
-  `grant` (fan-out grant creation,
+  could not complete), `stamp` (rollback-stamp check or update failure
+  not attributed to the blob store), `plan` (GET metadata, range or
+  extent planning), `grant` (fan-out grant creation,
   admission, scope, or a granted generation that no longer exists),
   `subrange_transport` (binding/stream setup or opening the first
   sub-request), `subrange_length` (first sub-range's declared length),

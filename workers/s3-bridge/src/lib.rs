@@ -31,7 +31,7 @@ use std::task::{Poll, Waker};
 use velmora_bridge::copy::Copier;
 use velmora_bridge::ingress;
 use velmora_bridge::keepalive;
-use velmora_bridge::metrics::{FailureStage, RequestObservation};
+use velmora_bridge::metrics::RequestObservation;
 use velmora_bridge::{
     BridgeError, Job, JobOutcome, OutboxStage, RespBody, S3Response, UnixMs, JOB_VERSION,
 };
@@ -224,13 +224,9 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
                 ingress::log_line(&method, "-", e.status(), &request_id)
             );
             let out = early(e.response());
-            let initial = initial();
-            let status = if initial.records_failure(&method, admin, out.status_code()) {
-                out.status_code()
-            } else {
-                e.status()
-            };
-            count(status, bridge.cfg.metrics_sample, 0, initial);
+            let mut observed = initial();
+            let status = observed.response_status(&method, admin, e.status(), out.status_code());
+            count(status, bridge.cfg.metrics_sample, 0, observed);
             return Ok(out);
         }
     };
@@ -266,13 +262,7 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
     }
     // HTTP conversion can itself turn a response into a 500. Keep the
     // existing response and log, but count the actual observed outcome.
-    let metrics_status =
-        if status != out.status_code() && get.records_failure(&method, admin, out.status_code()) {
-            get.mark_stage(FailureStage::Other);
-            out.status_code()
-        } else {
-            status
-        };
+    let metrics_status = get.response_status(&method, admin, status, out.status_code());
     count(
         metrics_status,
         bridge.cfg.metrics_sample,

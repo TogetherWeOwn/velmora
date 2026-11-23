@@ -554,7 +554,7 @@ async fn put_sliced<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: K
             restore_gate(bridge)
                 .await
                 .map_err(|resp| restore_failure(observed, resp))?;
-            observed.mark_stage(Stage::storage(&error));
+            observed.mark_stage(Stage::stamp(&error));
             return Err(s3_error(ErrorCode::SlowDown));
         }
         // A conditional PUT whose condition does not hold ends here. No

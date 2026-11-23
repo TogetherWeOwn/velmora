@@ -66,6 +66,7 @@ pub enum FailureStage {
     Budget,
     Decrypt,
     Commit,
+    Stamp,
     Other,
 }
 
@@ -78,6 +79,15 @@ impl FailureStage {
             BridgeError::Sql(_) | BridgeError::GuardFailed => Self::Commit,
             BridgeError::Blob(_) => Self::R2,
             _ => Self::Other,
+        }
+    }
+
+    /// Stamp checks and updates share a result; a SQL error does not say
+    /// whether a write ran. Keep those failures out of publication commits.
+    pub(crate) fn stamp(error: &crate::types::BridgeError) -> Self {
+        match error {
+            crate::types::BridgeError::Blob(_) => Self::R2,
+            _ => Self::Stamp,
         }
     }
 
@@ -96,6 +106,7 @@ impl FailureStage {
             Self::Budget => "budget",
             Self::Decrypt => "decrypt",
             Self::Commit => "commit",
+            Self::Stamp => "stamp",
             Self::Other => "other",
         }
     }
@@ -155,7 +166,19 @@ impl RequestObservation {
         self.complete_multipart = true;
     }
 
-    pub fn records_failure(self, method: &str, admin: bool, status: u16) -> bool {
+    /// The response conversion can replace the intended response with
+    /// a 500. For observed failures, count the wire status and attribute
+    /// that 500 to conversion, not to a stage of the original response.
+    pub fn response_status(&mut self, method: &str, admin: bool, intended: u16, wire: u16) -> u16 {
+        if intended != wire && self.records_failure(method, admin, wire) {
+            self.mark_stage(FailureStage::Other);
+            wire
+        } else {
+            intended
+        }
+    }
+
+    fn records_failure(self, method: &str, admin: bool, status: u16) -> bool {
         !admin
             && match method {
                 "GET" => status >= 400,
@@ -382,6 +405,31 @@ mod tests {
         let mut r = req("POST", 500, "iad");
         r.get = crate::service::initial_observation("POST", "/bucket/key?uploads");
         assert_eq!(request_point(&r, 1).analytics_blobs().count(), 5);
+    }
+
+    #[test]
+    fn conversion_fallback_uses_wire_status_and_other_for_observed_routes() {
+        for (method, target) in [
+            ("GET", "/bucket/key"),
+            ("PUT", "/bucket/key"),
+            ("HEAD", "/bucket/key"),
+            ("POST", "/bucket/key?uploadId=opaque-id"),
+        ] {
+            let mut r = req(method, 200, "IAD");
+            r.get = crate::service::initial_observation(method, target);
+            r.get.mark_stage(FailureStage::Auth);
+            r.get.record_size(1 << 30);
+            r.status = r.get.response_status(method, r.admin, r.status, 500);
+            let point = request_point(&r, 1);
+            assert_eq!(point.doubles[0], 500.0);
+            assert_eq!(
+                point.analytics_blobs().collect::<Vec<_>>(),
+                ["req", method, "5xx", "s3", "IAD", "other", "le_1gib"]
+            );
+        }
+        let mut r = req("POST", 200, "iad");
+        r.get = crate::service::initial_observation("POST", "/bucket/key?uploads");
+        assert_eq!(r.get.response_status(r.method, r.admin, r.status, 500), 200);
     }
 
     #[test]

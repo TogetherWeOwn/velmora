@@ -1100,7 +1100,7 @@ where
         restore_gate(bridge)
             .await
             .map_err(|resp| restore_failure(observed, resp))?;
-        observed.mark_stage(Stage::storage(&error));
+        observed.mark_stage(Stage::stamp(&error));
         return Err(ErrorCode::SlowDown.into());
     }
     Ok(S3Response {
@@ -1527,7 +1527,7 @@ where
                 restore_gate(bridge)
                     .await
                     .map_err(|resp| restore_failure(observed, resp))?;
-                observed.mark_stage(Stage::storage(&error));
+                observed.mark_stage(Stage::stamp(&error));
                 return Err(ErrorCode::SlowDown.into());
             }
         }

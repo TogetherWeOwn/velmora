@@ -101,6 +101,31 @@ async fn put_failures_report_auth_lookup_r2_budget_and_commit() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn a_sliced_put_reports_a_failed_rollback_stamp_separately_from_commit() {
+    let mut cfg = config(Vec::new());
+    cfg.max_extent_bytes = 4 * 1024;
+    cfg.slice_bytes = 2 * 1024;
+    let rig = rig_with(NoNntp, cfg);
+    let (_, signer) = rig.standard(BUCKET).await;
+    let req = signer.sign(
+        rig.now(),
+        Method::Put,
+        &path(BUCKET, KEY),
+        &[],
+        &[],
+        vec![1; 5 * 1024],
+    );
+    // Refuse only the stamp counter read; the follow-up restore-state
+    // check still succeeds and the caller gets its ordinary SlowDown.
+    *rig.bridge.catalog.sql.fail_matching.borrow_mut() =
+        Some(("SELECT counter, rolled_back_at IS NOT NULL", 0));
+    observed(&rig, req, "PUT", 503, &["stamp", "le_1gib"])
+        .await
+        .expect_error(503, "SlowDown");
+    assert_eq!(rig.count("generations"), 0);
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn head_failures_stay_bodyless_and_report_stage_and_size() {
     let rig = rig();
     let (_, signer) = rig.standard(BUCKET).await;
