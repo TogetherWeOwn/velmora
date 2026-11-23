@@ -29,6 +29,7 @@ use velmora_bridge::jobmsg::{JobTenant, Units};
 use velmora_bridge::sql::SqlCatalog;
 use velmora_bridge::tenant_catalog::{TenantCatalog, UnitPort};
 use velmora_bridge::unit::{Seqs, TenantId, UnitAnswer, UnitCall, UnitName, UnitReply};
+use velmora_bridge::unit_lease::client::UnitReplies;
 use velmora_bridge::{Bridge, BridgeError, Result};
 use worker::wasm_bindgen::JsValue;
 use worker::{Env, Method, ObjectNamespace, Request, RequestInit, Stub};
@@ -78,8 +79,9 @@ impl UnitStub {
     }
 }
 
-impl UnitPort for UnitStub {
-    async fn call(&self, call: &UnitCall) -> Result<UnitAnswer> {
+impl UnitStub {
+    /// One `POST` of `call` as JSON; the object's answer as text.
+    async fn send(&self, call: &UnitCall) -> Result<String> {
         let body = serde_json::to_string(call).map_err(|_| failed("call encode failed"))?;
         let mut init = RequestInit::new();
         init.with_method(Method::Post)
@@ -91,13 +93,27 @@ impl UnitPort for UnitStub {
             .fetch_with_request(req)
             .await
             .map_err(|_| failed("call failed"))?;
-        // The object answers every call with 200 and a `UnitAnswer`; any
+        // The object answers every call with 200 and a `UnitReply`; any
         // other status is a body it could not read or a method it refuses.
         if resp.status_code() != 200 {
             return Err(failed("call refused"));
         }
-        let raw = resp.text().await.map_err(|_| failed("answer unreadable"))?;
-        decode_answer(&raw)
+        resp.text().await.map_err(|_| failed("answer unreadable"))
+    }
+}
+
+impl UnitPort for UnitStub {
+    async fn call(&self, call: &UnitCall) -> Result<UnitAnswer> {
+        decode_answer(&self.send(call).await?)
+    }
+}
+
+/// The unit client's port (`unit_lease::client`): the whole reply, with
+/// the lease's `lease_left_ms` and `revoked`.
+impl UnitReplies for UnitStub {
+    async fn reply(&self, call: &UnitCall) -> Result<UnitReply> {
+        let raw = self.send(call).await?;
+        serde_json::from_str(&raw).map_err(|_| failed("answer unreadable"))
     }
 }
 

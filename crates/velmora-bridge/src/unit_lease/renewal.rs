@@ -10,7 +10,8 @@
 //!    `m/k/<t>/<keys_seq + 1>` answers `404` (both chains have no gaps,
 //!    §8.5, so the next name absent means the unit's seq is the head);
 //! 3. is not behind its rollback stamp: one list after the unit's stamp
-//!    counter is empty (§8.5);
+//!    counter (§8.5); the newest object it finds, if any, becomes the
+//!    counter the unit must hold at `renew`;
 //! 4. holds every revocation: the count of `m/rk/<t>/` (one list page
 //!    per 1,000 objects) equals the number of revoked keys the unit
 //!    reports. This is done at the renewal of **every** unit of a
@@ -29,7 +30,7 @@
 //! | Finding | The Worker then |
 //! |---|---|
 //! | a newer tenant or key record | `sync` first, then proves again |
-//! | a stamp object after the unit's counter | confirms it through the unit's stamp counter ([`crate::stamp::Stamp::checked`]): a raise that ran after the unit answered moves the counter and is not a rollback; with the counter unchanged the rollback is recorded, the unit is closed and the restore gate is needed (§8.6) |
+//! | stamp objects after the unit's counter | proves on at the newest one's counter: the unit renews only if its own counter has reached it, so a raise that ran after the unit answered passes. A unit refused `not_proven` is confirmed through its stamp counter ([`crate::stamp::Stamp::checked`]): with the counter unchanged the rollback is recorded, the unit is closed and the restore gate is needed (§8.6). A full page of objects ([`STAMP_PAGE`]) is confirmed first ([`Proof::StampAhead`]) |
 //! | a name under `m/rk/<t>/` that is not an access key id | skips it and pages (`stray` in the proof): it cannot match a key, so skipping it un-revokes nothing, and `m/` is put-only, so failing on it would close the tenant for good |
 //! | more revocations listed than the unit holds | applies every listed id to that unit (setting `revoked` twice changes nothing), sends an `apply_control` message for the key chain so the finisher appends a missing record, then calls `renew` with the same `proof_start`, the proven state and the listed ids |
 //! | fewer revocations listed than the unit holds | does not renew, and pages: `m/rk/` is put-only, so the unit holds a revocation the bucket does not, which no correct history gives |
@@ -42,7 +43,7 @@
 
 use crate::ports::{BlobStore, Clock};
 use crate::recovery::valid_key_id;
-use crate::stamp::{stamp_key, STAMP_PREFIX};
+use crate::stamp::{counter_of, stamp_key, STAMP_PREFIX};
 use crate::types::{BridgeError, Result, UnixMs};
 
 use super::lease::Proven;
@@ -50,6 +51,10 @@ use super::stamp_id::UnitStampId;
 
 /// Keys per list call of the revocations.
 pub const REVOCATION_PAGE: u32 = 1000;
+
+/// Stamp objects one list call reads after the unit's counter. A full
+/// page is a unit far behind its stamp ([`Proof::StampAhead`]).
+pub const STAMP_PAGE: u32 = 1000;
 
 const ERR_SEQ: BridgeError = BridgeError::Invalid("a chain seq is at its largest value");
 const ERR_NAMES: BridgeError =
@@ -95,9 +100,11 @@ pub enum Proof {
     /// A newer record exists in the named chain(s): `sync`, then prove
     /// again.
     SyncNeeded { tenant_chain: bool, key_chain: bool },
-    /// A stamp object exists after the counter the unit reported. Not yet
-    /// a rollback: a raise that ran after the unit answered gives the same
-    /// listing. The caller confirms with [`crate::stamp::Stamp::checked`]
+    /// A full page ([`STAMP_PAGE`]) of stamp objects after the counter the
+    /// unit reported: a unit far behind its stamp, confirmed before
+    /// anything else. (Fewer objects make a [`Proof::Fresh`] at the newest
+    /// one's counter.) Not yet a rollback: a run of raises after the unit
+    /// answered gives the same listing. The caller confirms with [`crate::stamp::Stamp::checked`]
     /// over the unit's counter, which records a rollback only while the
     /// counter is still `seen`, and otherwise proves again.
     StampAhead { seen: Option<u64> },
@@ -122,8 +129,8 @@ pub struct Listed {
 
 /// Runs the proof for `unit`. Reads only; writes nothing anywhere.
 ///
-/// The precedence of the findings is: a stamp ahead, then a newer record,
-/// then the revocations. The revocation list is read only when the rest
+/// The precedence of the findings is: a unit far behind its stamp, then a
+/// newer record, then the revocations. The revocation list is read only when the rest
 /// passed, so a unit that must sync first is not charged for it.
 pub async fn prove<B, T, N>(safety: &B, clock: &T, names: &N, unit: &UnitView<'_>) -> Result<Proof>
 where
@@ -151,13 +158,24 @@ where
         Some(c) => stamp_key(unit.stamp_id.as_str(), c),
         None => dir.clone(),
     };
-    let stamp_ahead = !safety.list(&dir, &after, 1).await?.is_empty();
-
-    if stamp_ahead {
-        return Ok(Proof::StampAhead {
-            seen: unit.stamp_counter,
-        });
-    }
+    // Stamp objects after the counter the unit reported: a raise that ran
+    // after the unit answered, or a unit behind its stamp. The proof goes
+    // on at the newest object's counter: the unit renews only if its own
+    // counter has reached it (`covers`, in its renew transaction), so a
+    // raise in between passes and a unit behind its stamp is refused
+    // `not_proven`, and its rollback is confirmed through its own counter
+    // ([`crate::stamp::Stamp::checked`]). A full page of them is a unit
+    // far behind: confirmed first.
+    let ahead = safety.list(&dir, &after, STAMP_PAGE).await?;
+    let stamp_counter = match ahead.last() {
+        None => unit.stamp_counter,
+        Some(_) if ahead.len() >= STAMP_PAGE as usize => {
+            return Ok(Proof::StampAhead {
+                seen: unit.stamp_counter,
+            })
+        }
+        Some(last) => Some(counter_of(&dir, last)?),
+    };
     if tenant_chain || key_chain {
         return Ok(Proof::SyncNeeded {
             tenant_chain,
@@ -170,7 +188,7 @@ where
     let proven = Proven {
         state_seq: unit.state_seq,
         keys_seq: unit.keys_seq,
-        stamp_counter: unit.stamp_counter,
+        stamp_counter,
         revoked: listed,
     };
     match listed.cmp(&unit.revoked) {

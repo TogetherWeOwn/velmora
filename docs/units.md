@@ -146,6 +146,61 @@ to the directory are not built here, and the Worker's cron runs a unit's
 jobs through `TenantCatalog`. Rules 9 and 10 (jobs that name their tenant,
 the unit's outbox to the directory) are not built yet.
 
+**What makes the alarm's raise due** (ADR §8.5, AM-48). Every committed S3
+or job call that changed a row, and every reservation call that changed one
+(a reservation, its drop, a release, a binding, a grant's fence), makes the
+raise due: a call that wrote nothing leaves nothing for a rollback to lose.
+(AM-48 says "every reservation call"; this narrowing, as built, is with the
+design lane.) These do not: the stamp's own calls (`stamp`, `stamp_advance`,
+`stamp_rolled_back`), the dispatcher's run time (`record_dispatch`) and the
+scan cursors (`set_cursor`). Nor do the Worker's own calls: `renew`, `sync`,
+the key-chain apply, `import`, `ImportSeal`, `Recount`, `Export`, the gate
+calls and `provision`. A rollback that loses one of these shows as
+`SyncNeeded` or an expired lease, or the tool runs it again, and a raise
+must not make the next one due. Read stamps (`touch_read`) count. The alarm
+sends a raise only while at least T/2 of the lease is left; with less, it
+sends `renew` and sends the raise after that renewal.
+
+**The unit client** (`unit_lease::client`, the Worker's side of rules 5 and
+12; AM-50, AM-51). A unit does no I/O, so the Worker reads for it:
+
+- **`renew`.** The unit's numbers, stamp counter and revoked count come
+  from one stamp read through the job path (allowed with an expired lease),
+  then the proof (`unit_lease::renewal`) and `renew(proof_start, proven,
+  revocations)`. A newer record means `sync` first. Stamp objects after
+  the counter: the proof holds the newest one's counter, and the unit
+  renews only if its own counter has reached it, so a raise in between
+  passes; a unit refused `not_proven` (or with a full page of objects
+  ahead) is confirmed through its own counter, and with the counter
+  unchanged the rollback is recorded, the unit closes and the client pages
+  (again at every look while it stays closed). Revocations the unit did not
+  hold are applied with the renewal, and the key chain's finisher is told
+  once, before the call (SEC-6). More revocations held than listed renews
+  nothing and pages. The pages come back with an error too.
+- **`sync`.** The tenant chain's verified head and the key-chain records
+  after the unit's `keys_seq`: first the key apply (AM-12, in pages of at
+  most 100 records, each from the unit's own `keys_seq`), then `sync` at
+  both heads, with the head's state, mode and this unit's `restoring` entry.
+  A head that clears the entry is not sent as a lift: only the restore
+  tool's `sync` carries the lift proof (AM-45); the client reports it and
+  changes nothing. A unit the head does not list is not called.
+- **The request path** (rule 5): `renew_needed` renews, `sync_needed`
+  syncs, a lower request number takes the unit's numbers; each fix runs once
+  and the call runs once more. An answer with less than half of T left asks
+  for a background renewal (`waitUntil`). Unsigned calls and background
+  renewals go through the isolate's spacing: none while one runs, and after
+  a failed attempt a backoff from 60 s doubling up to T, cleared by a
+  success (rule 11). Signed calls go through the same spacing with the
+  backoff capped at 1 s.
+- **The `renew` and `stamp_raise` jobs**, which the queue consumer hands to
+  the client: a renewal as above; a raise moves the unit's counter, then puts
+  its object, renewing first when the lease ran out. A failed call, or a
+  unit's `Failed` answer, is handed back with the queue's retry delay; a
+  call that is stale twice is acknowledged; `unborn` goes to the consumer's
+  `Unborn` rule; a refusal no AM-50 row names goes to the dead-letter queue
+  with a page (AM-50). Under `MAINTENANCE = restore` the consumer acknowledges both
+  without a call.
+
 **The calls are JSON** (`UnitCall` and `UnitAnswer`, `unit::call`; an
 answer leaves the unit as `UnitReply`, rule 12). Until the class is bound
 (stage C(b)) the format may change. After it, these types only gain
