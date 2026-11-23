@@ -115,10 +115,12 @@ fn wasm_memory_bytes() -> u64 {
 pub fn memory_line(bridge: &WorkerBridge) -> Option<String> {
     let isolate = MEMORY_LOG.with(Cell::get)?;
     Some(format!(
-        "memory: isolate={isolate} wasm_bytes={} budget_in_use={} budget_peak={}",
+        "memory: isolate={isolate} wasm_bytes={} budget_in_use={} budget_peak={} spare_bytes={} spares={}",
         wasm_memory_bytes(),
         bridge.budget.in_use(),
         bridge.budget.peak(),
+        bridge.budget.spare_bytes(),
+        bridge.budget.spares(),
     ))
 }
 
@@ -202,6 +204,12 @@ fn build(env: &Env) -> Result<WorkerBridge, String> {
         clock: WorkerClock,
         budget: ByteBudget::new(cfg.inflight_budget_bytes)
             .with_job_capacity(cfg.job_budget_bytes)
+            .with_extent_pool(velmora_bridge::jobs::extent_pool_buffers(
+                cfg.job_budget_bytes,
+                cfg.max_extent_bytes,
+                cfg.post_sockets,
+                cfg.parity,
+            ))
             .with_sleeper(sleeper())
             .with_spawner(Rc::new(worker::wasm_bindgen_futures::spawn_local)),
         cfg,

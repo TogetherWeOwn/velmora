@@ -251,6 +251,41 @@ fn load(vars: &BTreeMap<String, String>) -> std::result::Result<BridgeConfig, Co
 }
 
 #[test]
+fn request_budget_must_still_fund_a_hard_limit_extent_after_the_upload_limit_drops() {
+    let (_, dev) = wrangler_vars();
+    let mut vars = with_secrets(dev, PROVIDER_PLAIN);
+    vars.insert("MAX_EXTENT_BYTES".into(), "4194304".into());
+    vars.remove("MAX_PUT_BYTES");
+    vars.insert("INFLIGHT_BUDGET_BYTES".into(), "16777216".into());
+    vars.insert("JOB_BUDGET_BYTES".into(), "50331648".into());
+    vars.insert("PARITY".into(), "off".into());
+    assert_eq!(
+        load(&vars).err(),
+        Some(ConfigError::Invalid("INFLIGHT_BUDGET_BYTES".into()))
+    );
+}
+
+#[test]
+fn job_budget_accepts_the_request_floor_but_not_one_byte_less() {
+    let (_, dev) = wrangler_vars();
+    let mut vars = with_secrets(dev, PROVIDER_PLAIN);
+    vars.insert("MAX_EXTENT_BYTES".into(), "4194304".into());
+    vars.remove("MAX_PUT_BYTES");
+    // The request floor is higher than the hard-limit repost + verify
+    // floor (35,788,144 bytes even with eight post sockets).
+    let floor = 43_658_464;
+    vars.insert("INFLIGHT_BUDGET_BYTES".into(), floor.to_string());
+    vars.insert("POST_SOCKETS".into(), "8".into());
+    vars.insert("JOB_BUDGET_BYTES".into(), (floor - 1).to_string());
+    assert_eq!(
+        load(&vars).err(),
+        Some(ConfigError::Invalid("JOB_BUDGET_BYTES".into()))
+    );
+    vars.insert("JOB_BUDGET_BYTES".into(), floor.to_string());
+    assert_eq!(load(&vars).unwrap().job_budget_bytes, floor);
+}
+
+#[test]
 fn config_loads_from_documented_vars() {
     let (prod, dev) = wrangler_vars();
     // The file sets no GC_ORPHANS, in either environment: the collector
@@ -428,9 +463,13 @@ fn stored_parity_needs_rebuild_room_even_with_parity_off() {
     assert_eq!((k, most), (24, 4));
     let read = cold_read_bytes(cipher, 1);
     let both = cold_step_bytes(cipher, 1) + cold_rebuild_bytes(u64::from(shard), most);
-    assert!(read < both && both <= cfg.inflight_budget_bytes);
+    assert_eq!((read, both), (33_562_720, 43_658_464));
+    assert!(both <= cfg.inflight_budget_bytes);
 
-    // The job budget follows the request budget.
+    // Lower the upload limit after the extent has been written. The job
+    // budget follows the request budget.
+    vars.insert("MAX_EXTENT_BYTES".into(), "4194304".into());
+    vars.remove("MAX_PUT_BYTES");
     vars.remove("JOB_BUDGET_BYTES");
     vars.insert("PACKED_PLANS".into(), "on".into());
     vars.insert("COLD_SOCKETS".into(), "1".into());

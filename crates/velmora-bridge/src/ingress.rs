@@ -29,6 +29,7 @@
 //! trusted transport and the handler passes `https = true` to SigV4.
 
 use std::cell::{Cell, RefCell};
+use std::collections::VecDeque;
 use std::fmt;
 use std::rc::Rc;
 
@@ -661,6 +662,14 @@ struct BudgetState {
     /// The charges that wait for room now: the lowest number came
     /// first.
     waiting: RefCell<Vec<Listed>>,
+    /// Extent buffers that post jobs gave back, oldest first, kept for
+    /// the next job ([`ByteBudget::with_extent_pool`]). Charged as job
+    /// bytes while they wait, so the budget still counts every byte.
+    spare: RefCell<VecDeque<Vec<u8>>>,
+    /// The capacity of the buffers in `spare`, all together.
+    spare_bytes: Cell<u64>,
+    /// The most buffers `spare` keeps; 0 keeps none.
+    max_spare: Cell<usize>,
 }
 
 /// What the shared budget has cost the work of one isolate since it
@@ -735,6 +744,39 @@ impl BudgetState {
             return requests == 0 && jobs == 0;
         }
         u128::from(requests) * job_cap + u128::from(jobs) * cap <= cap * job_cap
+    }
+
+    /// The spare buffer an extent of `len` bytes is read into: the
+    /// smallest that holds it with at most a quarter of `len` over.
+    fn spare_for(&self, len: u64) -> Option<(usize, u64)> {
+        self.spare
+            .borrow()
+            .iter()
+            .map(|b| b.capacity() as u64)
+            .enumerate()
+            .filter(|(_, cap)| *cap >= len && *cap - len <= len / 4)
+            .min_by_key(|(_, cap)| *cap)
+    }
+
+    /// Takes the spare at `lent` out for a charge, and lets go of the
+    /// `evict` oldest of the others.
+    fn take_spares(&self, lent: Option<usize>, mut evict: usize) -> Option<Vec<u8>> {
+        let mut spare = self.spare.borrow_mut();
+        let mut taken = None;
+        let mut kept = VecDeque::with_capacity(spare.len());
+        for (at, b) in spare.drain(..).enumerate() {
+            if Some(at) == lent {
+                taken = Some(b);
+            } else if evict > 0 {
+                evict -= 1;
+            } else {
+                kept.push_back(b);
+            }
+        }
+        *spare = kept;
+        self.spare_bytes
+            .set(spare.iter().map(|b| b.capacity() as u64).sum());
+        taken
     }
 
     /// Whether a charge of `requests` and `jobs` bytes, of a request
@@ -813,6 +855,9 @@ impl ByteBudget {
                 pressure: Cell::new(Pressure::default()),
                 next_wait: Cell::new(0),
                 waiting: RefCell::new(Vec::new()),
+                spare: RefCell::new(VecDeque::new()),
+                spare_bytes: Cell::new(0),
+                max_spare: Cell::new(0),
             }),
             sleeper: None,
             spawner: None,
@@ -836,11 +881,27 @@ impl ByteBudget {
                 pressure: Cell::new(Pressure::default()),
                 next_wait: Cell::new(0),
                 waiting: RefCell::new(Vec::new()),
+                spare: RefCell::new(VecDeque::new()),
+                spare_bytes: Cell::new(0),
+                max_spare: Cell::new(s.max_spare.get()),
             }),
             sleeper: self.sleeper,
             spawner: self.spawner,
             held: None,
         }
+    }
+
+    /// Keeps up to `buffers` extent buffers of post jobs between jobs
+    /// ([`ByteBudget::charge_job_extent`]). A posting isolate otherwise
+    /// asks the allocator for a new extent-sized block for every job,
+    /// and the free space of the last one has been split by smaller
+    /// allocations meanwhile: its memory grows in whole-extent steps and
+    /// never shrinks. A spare is charged as job bytes while it waits, and
+    /// is let go when a charge needs its room. 0 (the default) keeps
+    /// none. Call it while building the budget, before any charge.
+    pub fn with_extent_pool(self, buffers: usize) -> Self {
+        self.state.max_spare.set(buffers);
+        self
     }
 
     /// The same budget for one request: what is charged through the
@@ -894,17 +955,30 @@ impl ByteBudget {
         self.spawner.as_ref()
     }
 
-    /// Bytes charged right now, by requests and jobs together.
+    /// Bytes charged right now, by requests and jobs together, with the
+    /// spare extent buffers.
     pub fn in_use(&self) -> u64 {
-        self.state
-            .requests
-            .get()
-            .saturating_add(self.state.jobs.get())
+        self.state.requests.get().saturating_add(self.jobs_in_use())
     }
 
-    /// Bytes charged right now by background jobs.
+    /// Bytes charged right now by background jobs, with the spare
+    /// extent buffers they gave back.
     pub fn jobs_in_use(&self) -> u64 {
-        self.state.jobs.get()
+        self.state
+            .jobs
+            .get()
+            .saturating_add(self.state.spare_bytes.get())
+    }
+
+    /// The capacity of the spare extent buffers kept now
+    /// ([`ByteBudget::with_extent_pool`]), in [`Self::in_use`] too.
+    pub fn spare_bytes(&self) -> u64 {
+        self.state.spare_bytes.get()
+    }
+
+    /// The spare extent buffers kept now.
+    pub fn spares(&self) -> usize {
+        self.state.spare.borrow().len()
     }
 
     /// Charges that waited [`CHARGE_WAIT_MS`] and found no room, since
@@ -934,36 +1008,92 @@ impl ByteBudget {
 
     /// Charges `bytes` for a request if they fit now.
     pub fn try_charge(&self, bytes: u64) -> Option<Charge> {
-        self.try_charge_as(bytes, false)
+        self.try_charge_as(bytes, false, None)
     }
 
     /// Charges `bytes` for a background job if they fit now.
     pub fn try_charge_job(&self, bytes: u64) -> Option<Charge> {
-        self.try_charge_as(bytes, true)
+        self.try_charge_as(bytes, true, None)
     }
 
-    fn try_charge_as(&self, bytes: u64, job: bool) -> Option<Charge> {
+    /// `extent`: the job holds an extent of that many bytes, which
+    /// `bytes` count, in a buffer of [`Charge::lend_charged`]. A spare
+    /// buffer that fits it is taken over, and what it holds beyond the extent
+    /// is charged too. Spares are let go, oldest first, only as far as
+    /// that makes room for this charge.
+    fn try_charge_as(&self, bytes: u64, job: bool, extent: Option<u64>) -> Option<Charge> {
         let s = &self.state;
+        let limit = if job { s.job_capacity } else { s.capacity };
+        let extent_len = extent.filter(|len| job && *len <= bytes);
+        let extent = extent_len.filter(|len| *len >= EXTENT_POOL_MIN_BYTES);
+        let given = bytes;
+        // With `lend` (the spare taken over: its place, its capacity):
+        // the bytes charged, and how many of the other spares, oldest
+        // first, are let go to make room. `None`: no room even with
+        // every other spare let go.
+        let plan = |lend: Option<(usize, u64)>| -> Option<(u64, u64, u64, usize)> {
+            let bytes = match (lend, extent) {
+                (Some((_, cap)), Some(len)) => given.checked_add(cap - len)?,
+                _ => given,
+            };
+            if bytes > limit {
+                return None;
+            }
+            let (requests, jobs) = if job { (0, bytes) } else { (bytes, 0) };
+            let next_requests = s.requests.get().checked_add(requests)?;
+            let next_jobs = s.jobs.get().checked_add(jobs)?;
+            let mut spare_left = s.spare_bytes.get() - lend.map_or(0, |(_, cap)| cap);
+            let mut evict = 0usize;
+            let spare = s.spare.borrow();
+            let mut others = (0..spare.len())
+                .filter(|at| lend.is_none_or(|(lent, _)| lent != *at))
+                .map(|at| spare[at].capacity() as u64);
+            while !s.fits(next_requests, next_jobs.saturating_add(spare_left)) {
+                spare_left -= others.next()?;
+                evict += 1;
+            }
+            Some((bytes, next_requests, next_jobs, evict))
+        };
+        // Taking a spare over charges what it holds beyond the extent; when
+        // that is what keeps the charge out, the spare is let go instead,
+        // like any other, and the extent gets a buffer of its own.
+        let candidate = extent.and_then(|len| s.spare_for(len));
+        let (lend, (bytes, next_requests, next_jobs, evict)) =
+            match candidate.and_then(|c| plan(Some(c)).map(|p| (Some(c), p))) {
+                Some(planned) => planned,
+                None => (None, plan(None)?),
+            };
         let (requests, jobs) = if job { (0, bytes) } else { (bytes, 0) };
-        let next_requests = s.requests.get().checked_add(requests)?;
-        let next_jobs = s.jobs.get().checked_add(jobs)?;
-        if !s.fits(next_requests, next_jobs) {
-            return None;
-        }
+        let lent = match (lend, evict) {
+            (None, 0) => None,
+            (lend, evict) => s.take_spares(lend.map(|(at, _)| at), evict),
+        };
         s.requests.set(next_requests);
         s.jobs.set(next_jobs);
-        let in_use = next_requests.saturating_add(next_jobs);
+        let in_use = next_requests
+            .saturating_add(next_jobs)
+            .saturating_add(s.spare_bytes.get());
         if in_use > s.peak.get() {
             s.peak.set(in_use);
         }
         if let Some(held) = &self.held {
             held.set(held.get().saturating_add(bytes));
         }
+        // The buffer these bytes stand for: the spare taken over, or one
+        // of the extent's own size.
+        let pooled = match (lend, extent) {
+            (Some((_, cap)), _) => cap,
+            (None, Some(len)) => len,
+            (None, None) => 0,
+        };
         Some(Charge {
             state: Rc::clone(&self.state),
             requests,
             jobs,
             held: self.held.clone(),
+            buffer: lent,
+            extent_len,
+            pooled,
         })
     }
 
@@ -994,7 +1124,7 @@ impl ByteBudget {
     /// [`TURN_WAIT_MS`] at most, then this charge takes what is free
     /// like any other.
     pub async fn charge_in_turn(&self, bytes: u64) -> Result<Charge, IngressError> {
-        self.charge_as(bytes, false, true).await
+        self.charge_as(bytes, false, true, None).await
     }
 
     /// Charges `bytes` for a request, waiting up to [`CHARGE_WAIT_MS`] for
@@ -1002,13 +1132,28 @@ impl ByteBudget {
     /// the whole capacity can never fit and fails at once. The caller has
     /// not read the body.
     pub async fn charge(&self, bytes: u64) -> Result<Charge, IngressError> {
-        self.charge_as(bytes, false, false).await
+        self.charge_as(bytes, false, false, None).await
     }
 
     /// [`ByteBudget::charge`] for a background job: the same wait, against
     /// the job limit.
     pub async fn charge_job(&self, bytes: u64) -> Result<Charge, IngressError> {
-        self.charge_as(bytes, true, false).await
+        self.charge_as(bytes, true, false, None).await
+    }
+
+    /// [`ByteBudget::charge_job`] for a job that holds an extent of
+    /// `extent_len` bytes, included in `bytes`, in a charged extent buffer.
+    /// With an extent pool ([`ByteBudget::with_extent_pool`]), the buffer
+    /// is a spare one when one fits. When the charge is dropped, the
+    /// buffer can stay as a spare if the budget has room, so the next
+    /// job can reuse the same memory. A spare larger than the extent
+    /// is charged at its size.
+    pub async fn charge_job_extent(
+        &self,
+        bytes: u64,
+        extent_len: u64,
+    ) -> Result<Charge, IngressError> {
+        self.charge_as(bytes, true, false, Some(extent_len)).await
     }
 
     async fn charge_as(
@@ -1016,6 +1161,7 @@ impl ByteBudget {
         bytes: u64,
         job: bool,
         in_turn: bool,
+        extent: Option<u64>,
     ) -> Result<Charge, IngressError> {
         let limit = if job {
             self.state.job_capacity
@@ -1040,7 +1186,7 @@ impl ByteBudget {
                 self.state.in_the_way(requests, jobs, self.held(), mine)
             };
             if !behind {
-                if let Some(c) = self.try_charge_as(bytes, job) {
+                if let Some(c) = self.try_charge_as(bytes, job, extent) {
                     return Ok(c);
                 }
             }
@@ -1120,6 +1266,13 @@ pub struct Charge {
     jobs: u64,
     /// The count of what its request holds, which these bytes are in.
     held: Option<Rc<Cell<u64>>>,
+    /// The extent buffer of the job, while no [`Lent`] has it out.
+    buffer: Option<Vec<u8>>,
+    /// The ciphertext length this job was charged for, not the spare's capacity.
+    extent_len: Option<u64>,
+    /// The capacity of the extent buffer that `jobs` count: the most a
+    /// buffer kept as a spare may hold.
+    pooled: u64,
 }
 
 impl Charge {
@@ -1146,6 +1299,9 @@ impl Charge {
             requests: 0,
             jobs: 0,
             held: self.held.clone(),
+            buffer: None,
+            extent_len: None,
+            pooled: 0,
         }
     }
 
@@ -1160,9 +1316,25 @@ impl Charge {
         s.requests.set(others.saturating_add(bytes));
         self.requests = bytes;
         self.count(bytes, true);
-        let in_use = s.requests.get().saturating_add(s.jobs.get());
+        let requests = s.requests.get();
+        let jobs = s.jobs.get();
+        let mut spare_left = s.spare_bytes.get();
+        let in_use = requests.saturating_add(jobs).saturating_add(spare_left);
         if in_use > s.peak.get() {
             s.peak.set(in_use);
+        }
+        // The bytes held are already resident and must always be charged.
+        // Free idle spares oldest first until it fits or none are left.
+        if spare_left != 0 && !s.fits(requests, jobs.saturating_add(spare_left)) {
+            let mut evict = 0;
+            for spare in s.spare.borrow().iter() {
+                spare_left -= spare.capacity() as u64;
+                evict += 1;
+                if s.fits(requests, jobs.saturating_add(spare_left)) {
+                    break;
+                }
+            }
+            drop(s.take_spares(None, evict));
         }
     }
 
@@ -1175,6 +1347,74 @@ impl Charge {
         part
     }
 
+    /// Test-only unchecked loan for `len` bytes: the spare
+    /// that [`ByteBudget::charge_job_extent`] took over, or a new one. It
+    /// comes back to this charge when the [`Lent`] is dropped, and may
+    /// become a spare when the charge is dropped.
+    ///
+    /// A charge cannot lend a second buffer while the first is in use.
+    ///
+    /// ```compile_fail,E0499
+    /// use velmora_bridge::ingress::ByteBudget;
+    ///
+    /// async fn overlapping_loans() {
+    ///     let budget = ByteBudget::new(1024);
+    ///     let mut charge = budget.charge_job_extent(1024, 1024).await.unwrap();
+    ///     let first = charge.lend(1024);
+    ///     let second = charge.lend(1024);
+    ///     drop((first, second));
+    /// }
+    /// ```
+    #[cfg(any(test, feature = "testkit"))]
+    pub fn lend(&mut self, len: usize) -> Lent<'_> {
+        let mut buffer = self.lend_buffer();
+        if buffer.capacity() < len {
+            buffer.bytes = Vec::with_capacity(len);
+        }
+        buffer
+    }
+
+    /// Take the spare (or an empty vector) only for the extent this job
+    /// was charged for. The store grows it only after confirming the size.
+    pub(crate) fn lend_charged(&mut self, len: u64) -> Option<Lent<'_>> {
+        (self.extent_len == Some(len) && len <= self.jobs).then(|| self.lend_buffer())
+    }
+
+    fn lend_buffer(&mut self) -> Lent<'_> {
+        let mut bytes = self.buffer.take().unwrap_or_default();
+        bytes.clear();
+        Lent {
+            bytes,
+            home: Some(self),
+        }
+    }
+
+    /// Keeps the extent buffer only if it fits after this charge is released.
+    fn keep_buffer(&mut self) {
+        let Some(mut buffer) = self.buffer.take() else {
+            return;
+        };
+        let s = &self.state;
+        let cap = buffer.capacity() as u64;
+        let max = s.max_spare.get();
+        if max == 0 || cap < EXTENT_POOL_MIN_BYTES || cap > self.pooled.min(self.jobs) {
+            return;
+        }
+        let mut bytes = s.spare_bytes.get().saturating_add(cap);
+        if !s.fits(s.requests.get(), s.jobs.get().saturating_add(bytes)) {
+            return;
+        }
+        buffer.clear();
+        let mut spare = s.spare.borrow_mut();
+        spare.push_back(buffer);
+        while spare.len() > max {
+            if let Some(old) = spare.pop_front() {
+                bytes = bytes.saturating_sub(old.capacity() as u64);
+            }
+        }
+        s.spare_bytes.set(bytes);
+    }
+
     /// Takes over what `other` holds, so that one charge stands for both.
     /// A charge against another budget is released instead.
     pub fn absorb(&mut self, mut other: Charge) {
@@ -1185,6 +1425,8 @@ impl Charge {
             self.jobs = self.jobs.saturating_add(other.jobs);
             other.requests = 0;
             other.jobs = 0;
+            // Its buffer is let go: what it held stays counted here.
+            drop(other.buffer.take());
         }
     }
 }
@@ -1204,6 +1446,7 @@ impl Drop for Charge {
         s.requests
             .set(s.requests.get().saturating_sub(self.requests));
         s.jobs.set(s.jobs.get().saturating_sub(self.jobs));
+        self.keep_buffer();
     }
 }
 
@@ -1231,6 +1474,100 @@ mod charge_tests {
         assert_eq!((budget.in_use(), request.held()), (35, 35));
         drop(all);
         assert_eq!((budget.in_use(), request.held()), (0, 0));
+    }
+
+    #[test]
+    fn dropping_a_beside_charge_releases_held_bytes_without_keeping_a_spare() {
+        let len = EXTENT_POOL_MIN_BYTES;
+        let budget = ByteBudget::new(len).with_extent_pool(1);
+        let request = budget.for_request();
+        let original = request.try_charge(len).unwrap();
+        let mut extra = original.beside();
+        // Already resident: hold still counts the bytes even above the limit.
+        extra.hold(len);
+        assert_eq!((budget.in_use(), request.held()), (2 * len, 2 * len));
+        drop(extra);
+        assert_eq!((budget.in_use(), request.held()), (len, len));
+        assert_eq!((budget.spares(), budget.spare_bytes()), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn a_loan_requires_the_charged_length_and_does_not_allocate() {
+        let len = EXTENT_POOL_MIN_BYTES;
+        let budget = ByteBudget::new(3 * len).with_extent_pool(1);
+        let mut job = budget.charge_job_extent(2 * len, len).await.unwrap();
+        assert!(job.lend_charged(2 << 30).is_none());
+        assert!(job.lend_charged(len - 1).is_none());
+        assert_eq!(job.lend_charged(len).unwrap().capacity(), 0);
+        drop(job);
+        assert_eq!(budget.spare_bytes(), 0);
+    }
+
+    #[tokio::test]
+    async fn the_same_charge_reuses_its_buffer_after_a_loan_drops() {
+        let budget = ByteBudget::new(1024);
+        let mut job = budget.charge_job_extent(1024, 1024).await.unwrap();
+        let address = {
+            let mut loan = job.lend(1024);
+            loan.resize(1024, 7);
+            loan.as_ptr()
+        };
+        let loan = job.lend_charged(1024).unwrap();
+        assert_eq!(loan.as_ptr(), address);
+        assert!(loan.is_empty());
+        assert_eq!(budget.in_use(), 1024);
+    }
+
+    #[tokio::test]
+    async fn held_request_bytes_and_idle_spares_both_count_toward_peak() {
+        let len = EXTENT_POOL_MIN_BYTES;
+        let budget = ByteBudget::new(2 * len).with_extent_pool(1);
+        let request = budget.for_request();
+        let original = request.try_charge(len).unwrap();
+        let mut job = budget.charge_job_extent(len, len).await.unwrap();
+        drop(job.lend(len as usize));
+        drop(job);
+        assert_eq!((budget.spare_bytes(), budget.peak()), (len, 2 * len));
+
+        let mut extra = original.beside();
+        extra.hold(len);
+        assert_eq!(budget.peak(), 3 * len);
+        assert_eq!(budget.in_use(), 2 * len);
+        assert_eq!(request.held(), 2 * len);
+        assert_eq!((budget.spares(), budget.spare_bytes()), (0, 0));
+    }
+}
+
+/// Extent buffers smaller than this are not kept as spares: one cannot
+/// leave a gap in the heap that matters.
+pub const EXTENT_POOL_MIN_BYTES: u64 = 4 * 1024 * 1024;
+
+/// A job's extent buffer on loan, returned to its [`Charge`] when
+/// dropped. An uncharged default buffer is freed instead.
+#[derive(Default)]
+pub struct Lent<'c> {
+    bytes: Vec<u8>,
+    home: Option<&'c mut Charge>,
+}
+
+impl std::ops::Deref for Lent<'_> {
+    type Target = Vec<u8>;
+    fn deref(&self) -> &Vec<u8> {
+        &self.bytes
+    }
+}
+
+impl std::ops::DerefMut for Lent<'_> {
+    fn deref_mut(&mut self) -> &mut Vec<u8> {
+        &mut self.bytes
+    }
+}
+
+impl Drop for Lent<'_> {
+    fn drop(&mut self) {
+        if let Some(home) = self.home.take() {
+            home.buffer = Some(std::mem::take(&mut self.bytes));
+        }
     }
 }
 

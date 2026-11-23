@@ -257,6 +257,30 @@ pub trait BlobStore {
     }
     /// `None` = absent. With a span, exactly that range.
     async fn get(&self, key: &str, span: Option<ByteSpan>) -> Result<Option<Vec<u8>>>;
+    /// The whole object into `out`, which is emptied first: `false` =
+    /// absent. Reject any reported size other than `expected` with
+    /// [`BridgeError::BlobSizeMismatch`] before reading the body. An
+    /// adapter that can open the body and inspect its size together does
+    /// so; this default checks `head`, then copies what `get` returns only
+    /// if its length still matches. Reuse `out` without growing it past
+    /// `expected` when it needs more room.
+    async fn get_into(&self, key: &str, expected: u64, out: &mut Vec<u8>) -> Result<bool> {
+        out.clear();
+        match self.head(key).await? {
+            None => return Ok(false),
+            Some(size) if size != expected => return Err(BridgeError::BlobSizeMismatch),
+            Some(_) => {}
+        }
+        match self.get(key, None).await? {
+            Some(bytes) if bytes.len() as u64 == expected => {
+                out.reserve_exact(bytes.len());
+                out.extend_from_slice(&bytes);
+                Ok(true)
+            }
+            Some(_) => Err(BridgeError::BlobSizeMismatch),
+            None => Ok(false),
+        }
+    }
     /// Object size, `None` = absent.
     async fn head(&self, key: &str) -> Result<Option<u64>>;
     /// Idempotent. Refuses a recovery record (any key under `m/`, which
