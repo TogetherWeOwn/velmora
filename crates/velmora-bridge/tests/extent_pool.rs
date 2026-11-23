@@ -189,10 +189,9 @@ async fn a_spare_is_charged_while_it_waits_and_taken_over_by_the_next_job() {
     assert_eq!(budget.jobs_in_use(), 16 * MIB);
 
     let charge = budget.charge_job_extent(25 * MIB, 16 * MIB).await.unwrap();
-    // The job's charge counts the buffer it took over once, not twice.
+    // The job counts the buffer it took over once, not twice.
     assert_eq!(charge.bytes(), 25 * MIB);
-    assert_eq!(budget.in_use(), 25 * MIB);
-    assert_eq!(budget.spares(), 0);
+    assert_eq!((budget.spares(), budget.in_use()), (0, 25 * MIB));
     {
         let buffer = charge.lend(16 * MIB as usize);
         assert_eq!(buffer.as_ptr() as usize, at, "the same memory");
@@ -201,6 +200,116 @@ async fn a_spare_is_charged_while_it_waits_and_taken_over_by_the_next_job() {
     drop(charge);
     assert_eq!((budget.spares(), budget.in_use()), (1, 16 * MIB));
     assert_eq!(budget.peak(), 25 * MIB);
+    // Evict the spare and check neither charge left bytes behind.
+    let whole = budget.try_charge_job(90 * MIB).unwrap();
+    assert_eq!(budget.in_use(), 90 * MIB);
+    drop(whole);
+    assert_eq!(budget.in_use(), 0);
+}
+
+#[tokio::test]
+async fn three_post_reservations_take_three_spares_without_evicting_them() {
+    let budget = budget(3);
+    let len = velmora::media::ciphertext_size(16 * MIB).unwrap();
+    let bytes = jobs::job_bytes(OutboxStage::Post, len, 6);
+    let mut warmers = Vec::new();
+    for _ in 0..3 {
+        let job = budget.charge_job_extent(bytes, len).await.unwrap();
+        job.lend(len as usize);
+        warmers.push(job);
+    }
+    drop(warmers);
+    assert_eq!((budget.spares(), budget.spare_bytes()), (3, 3 * len));
+
+    let mut waiting = Vec::new();
+    for i in 1..=3 {
+        let charge = budget.charge_job_extent(bytes, len).await.unwrap();
+        assert_eq!(charge.bytes(), bytes);
+        waiting.push(charge);
+        let idle = (3 - i) * len;
+        assert_eq!(
+            (budget.spares(), budget.spare_bytes()),
+            ((3 - i) as usize, idle),
+            "reservation {i} must take one spare before any read"
+        );
+        assert_eq!(budget.in_use(), i * bytes + idle);
+    }
+    assert_eq!(budget.in_use(), 3 * bytes);
+    // None of the waiting jobs lent a buffer; only the original spares can return.
+    drop(waiting);
+    assert_eq!((budget.spares(), budget.in_use()), (3, 3 * len));
+}
+
+#[tokio::test]
+async fn a_post_that_times_out_of_the_slot_wait_returns_its_spare() {
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    let mut rig = rig(&[Spec {
+        backbone: "bb0",
+        post: true,
+        max_conns: 1,
+    }])
+    .await;
+    let s = rig.seed(1, &marked_plaintext(4 << 20)).await;
+    let len = s.cipher.len() as u64;
+    let resume = Rc::new(Cell::new(false));
+    let clock = rig.bridge.clock.clone();
+    let wake = Rc::clone(&resume);
+    rig.bridge.budget = budget(2).with_sleeper(Rc::new(move |ms| {
+        let wake = Rc::clone(&wake);
+        let clock = clock.clone();
+        Box::pin(std::future::poll_fn(move |_| {
+            if wake.get() {
+                clock.advance_ms(i64::from(ms));
+                std::task::Poll::Ready(())
+            } else {
+                std::task::Poll::Pending
+            }
+        }))
+    }));
+    let budget = &rig.bridge.budget;
+    let spare = one_job(budget, len, len).await;
+    assert_eq!((budget.spares(), budget.in_use()), (1, len));
+    let reads = rig.bridge.safety.gets();
+    let now = rig.bridge.clock.now();
+    rig.take_slots(0, now.plus_secs(30)).await;
+    let catalog = &rig.bridge.catalog;
+    // The same catalogue line interface as SLOT_WAIT=push. The slot is
+    // occupied beyond the wait deadline.
+    catalog.line.set(Some(SlotWait::Elapsed));
+    let job = Job::Extent {
+        v: JOB_VERSION,
+        extent: s.extent.clone(),
+        generation: s.generation.clone(),
+        stage: OutboxStage::Post,
+    };
+    let mut post = std::pin::pin!(rig.bridge.run_job(&job));
+    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+    assert!(std::future::Future::poll(post.as_mut(), &mut cx).is_pending());
+    assert_eq!(catalog.line_waits.borrow().len(), 1);
+    let holder = catalog.line_waits.borrow()[0].0.clone();
+    assert_eq!(rig.bridge.safety.gets(), reads);
+    assert_eq!(
+        (budget.spares(), budget.spare_bytes()),
+        (0, 0),
+        "the waiting job holds the spare in its charge"
+    );
+    assert!(budget.in_use() > len, "the job still holds its charge");
+
+    resume.set(true);
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), post)
+        .await
+        .expect("the post wait should finish");
+    assert!(matches!(outcome, JobOutcome::Retry { .. }));
+    assert_eq!(*catalog.line_left.borrow(), [holder]);
+    assert_eq!(rig.bridge.safety.gets(), reads);
+    assert_eq!(catalog.outbox(&s.extent).attempts, 0);
+    // Only the returned idle spare is charged now, not the post reservation.
+    assert_eq!((budget.spares(), budget.in_use()), (1, len));
+    assert_eq!(one_job(budget, len, len).await, spare);
+    drop(budget.try_charge_job(budget.job_capacity()).unwrap());
+    assert_eq!((budget.spares(), budget.in_use()), (0, 0));
 }
 
 #[tokio::test]
@@ -226,10 +335,10 @@ async fn a_larger_spare_is_charged_at_its_size_and_a_much_larger_one_is_not_take
     let budget = budget(3);
     let at = one_job(&budget, 25 * MIB, 16 * MIB).await;
 
-    // 14 MiB fit 16 with less than a quarter over: taken, at 16.
+    // 14 MiB fit 16 with less than a quarter over: taken at 16.
     let charge = budget.charge_job_extent(23 * MIB, 14 * MIB).await.unwrap();
     assert_eq!(charge.bytes(), 25 * MIB);
-    assert_eq!(budget.in_use(), 25 * MIB);
+    assert_eq!((budget.spares(), budget.in_use()), (0, 25 * MIB));
     assert_eq!(charge.lend(14 * MIB as usize).as_ptr() as usize, at);
     drop(charge);
     assert_eq!(budget.spare_bytes(), 16 * MIB);
@@ -244,9 +353,9 @@ async fn a_larger_spare_is_charged_at_its_size_and_a_much_larger_one_is_not_take
     assert_eq!((budget.spares(), budget.spare_bytes()), (2, 24 * MIB));
 }
 
-/// When what a larger spare holds beyond the extent is all that keeps a
-/// charge out, the spare is let go instead and the job gets a buffer of
-/// its own: the pool never refuses a charge that fits without it.
+/// When the reserved charge plus an idle spare would not fit, let the
+/// spare go rather than prevent the job from running. The pool never
+/// refuses a charge that fits without it.
 #[tokio::test]
 async fn a_spare_too_large_to_fit_is_let_go_rather_than_keep_the_job_out() {
     let budget = budget(3);
