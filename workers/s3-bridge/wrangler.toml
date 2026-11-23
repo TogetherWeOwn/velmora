@@ -97,29 +97,21 @@ VELMORA_KEK_ACTIVE = "1"
 INFLIGHT_BUDGET_BYTES = "50331648"   # 48 MiB per isolate: what requests may charge
 # What requests and background jobs may charge together, per isolate. A
 # job charges under this limit, a request under INFLIGHT_BUDGET_BYTES. It
-# may be up to 1.5 times INFLIGHT_BUDGET_BYTES or 90 MiB, whichever is
-# more: a request holds up to 1.5 bytes per byte it charges (the upload's
-# ciphertext is copied once more on its way to R2), a job holds about
-# what it charges. An upload of at most MAX_EXTENT_BYTES is sealed and
-# stored while it arrives and charges a window of 512 KiB whatever its
-# length; a slice, a copied part and a download charge what they hold.
-# 90 MiB holds three post jobs with parity (29.13 MiB each) and a verify
-# job. Measured with three post jobs at once in one isolate: wasm memory
-# up to 92 MiB without parity and 103 MiB with it, of the isolate's
-# 128 MiB; four with parity (4 sockets each, 104.5 MiB charged) reached
-# 119 MiB and none ran out of memory
-# (MAX_JOB_BUDGET_BYTES in config.rs).
-JOB_BUDGET_BYTES = "94371840"        # 90 MiB per isolate
+# may be up to 1.5 times INFLIGHT_BUDGET_BYTES: a request holds up to 1.5
+# bytes per byte it charges (the upload's ciphertext is copied once more
+# on its way to R2), a job holds about what it charges. An upload of at
+# most MAX_EXTENT_BYTES is sealed and stored while it arrives and charges
+# a window of 512 KiB whatever its length; a slice, a copied part and a
+# download charge what they hold.
+JOB_BUDGET_BYTES = "75497472"        # 72 MiB per isolate
 GC_MODE = "off"                      # off | disposable
 HOT_CAP_BYTES = "107374182400"       # 100 GiB of evictable R2 bytes; pinned (unverified) bytes are never counted or evicted
 MAINTENANCE = "off"                  # off | restore
 # Sockets per post job, spread over the posting tier. A post job charges
-# its extent (16 MiB) plus 1.5 MiB per socket to the isolate's byte budget
-# (and 4.13 MiB more for its parity with PARITY on), and the invocations
-# of one queue share an isolate. At 6, three post jobs and a verify job
-# fit the 90 MiB job budget at once, with parity or without, and a fourth
-# post job waits; at 8 only two post jobs with parity fit beside a verify
-# job and the third waits.
+# its extent (16 MiB) plus 1 MiB per socket to the isolate's byte budget,
+# and the invocations of one queue share an isolate. At 6, three post
+# jobs and a verify job fit the 72 MiB job budget at once; at 8 only two
+# post jobs fit beside a verify job and the third waits for them.
 POST_SOCKETS = "6"
 # Connections one GET reads extents from Usenet over, 1 to 8. They leave
 # from one address and each is one provider permit; a read that gets
@@ -198,7 +190,7 @@ PERMITS = "do"
 #     A job is one source address to a provider, however many connections it holds there.
 #   COLD_SOCKETS (4; production sets 8 above): connections one GET reads from Usenet over, 1 to 8, each on its own
 #     provider permit. Fewer are used when INFLIGHT_BUDGET_BYTES has no room for that many beside an extent and its cache write.
-#   JOB_BUDGET_BYTES (the value of INFLIGHT_BUDGET_BYTES): see above; from that value to 1.5 times it or 90 MiB, whichever is more.
+#   JOB_BUDGET_BYTES (the value of INFLIGHT_BUDGET_BYTES): see above; from that value to 1.5 times it.
 #   RECORD_LAYOUT (flat): flat | tenant. Where NEW recovery records are written: flat is m/<id>, m/del/<id> and m/art/<extent>;
 #     tenant is the same names under m/x/<tenant id>/. Every reader reads both, always, and no record is ever renamed.
 #     A Worker from before this switch does not read the tenant names (its replay would pass over them): set tenant in a
