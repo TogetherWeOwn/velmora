@@ -137,6 +137,28 @@ test("a skipped sweep updates verified age without recovering or completing its 
   assert.match(e.ALERT_EMAIL.sent[1].text, /last verified copy: 15 min ago/i);
 });
 
+test("an active refusal alarm keeps reminding while newer passes are incomplete", async () => {
+  const e = env();
+  recoveryJob(e, T0 - INTERVAL, { refused: 1 });
+  recoveryJob(e, T0, { refused: 1 });
+  await tick(e, T0);
+  for (const i of [1, 2, 3, 4]) recoveryJob(e, T0 + i * INTERVAL, { skipped: 1 });
+  await tick(e, T0 + 3 * INTERVAL);
+  assert.equal(e.ALERT_EMAIL.sent.length, 1, "still inside the cooldown");
+  const reminder = await tick(e, T0 + HOUR);
+  assert.equal(reminder.conditions.includes(REFUSED), true);
+  assert.equal(e.ALERT_EMAIL.sent.filter((email) => /refused in consecutive passes/i.test(email.subject)).length, 2);
+});
+
+test("a stale page includes the latest verified age even without a completed pass", async () => {
+  const e = env();
+  await tick(e, T0);
+  recoveryJob(e, T0 + INTERVAL, { copied: 1, skipped: 1 });
+  await tick(e, T0 + 4 * INTERVAL);
+  assert.equal(e.ALERT_EMAIL.sent.length, 1);
+  assert.match(e.ALERT_EMAIL.sent[0].text, /last verified copy: 45 min ago/i);
+});
+
 test("an old verified timestamp does not revive a pruned refusal pass", async () => {
   const e = env();
   // Pruning preserves this one job for the age of the last verified copy,

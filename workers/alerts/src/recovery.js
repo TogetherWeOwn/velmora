@@ -40,6 +40,10 @@ function minutes(ms) {
   return `${Math.max(0, Math.floor(ms / MINUTE))} min`;
 }
 
+function verifiedAge(verified, now) {
+  return `Last verified copy: ${verified == null ? "not recorded" : minutes(now - verified) + " ago"}.`;
+}
+
 function detail(pass, verified, now) {
   const counts = ["copied", "pending", "source_unreadable"].map((k) => `${k}=${pass[k]}`);
   for (const op of OPERATIONS) {
@@ -48,8 +52,7 @@ function detail(pass, verified, now) {
     counts.push(`${key}=${count} (status=${status ?? "—"}, code=${code ?? "—"})`);
   }
   counts.push(`unsignable=${pass.unsignable} (no HTTP request sent)`);
-  const age = verified == null ? "not recorded" : minutes(now - verified) + " ago";
-  return `${counts.join(" ")}. Last verified copy: ${age}.`;
+  return `${counts.join(" ")}. ${verifiedAge(verified, now)}`;
 }
 
 const anyRefusal = (pass) => pass && OPERATIONS.some((op) => pass[`refused_${op}`].count > 0);
@@ -85,22 +88,29 @@ export async function readRecovery(env, now) {
   }
   const lastAt = last ? Math.max(last.at, previous?.at ?? last.at) : started;
   const stale = now - lastAt > STALE_MS;
+  const clean = last && !anyRefusal(last) && last.unsignable === 0 && last.failed === 0;
   const conditions = [];
+  const newest = last ? `Pass ${last.id}: ${detail(last, verified, now)}` : verifiedAge(verified, now);
+  const heldRefusal = (detail) => ({
+    key: REFUSED, title: "Recovery copy refused in consecutive passes", forMs: 0, detail,
+  });
   if (anyRefusal(last) && anyRefusal(previous)) {
-    conditions.push({
-      key: REFUSED, title: "Recovery copy refused in consecutive passes", forMs: 0,
-      detail: `Pass ${last.id}: ${detail(last, verified, now)} Previous pass ${previous.id}: ${detail(previous, verified, now)}`,
-    });
+    conditions.push(heldRefusal(`${newest} Previous pass ${previous.id}: ${detail(previous, verified, now)}`));
+  } else if (!clean) {
+    // Candidate reads are bounded. Losing an older pass from this window
+    // is not a recovery, and must not halt an already active reminder.
+    const active = await env.STATE.prepare("SELECT key FROM alerts WHERE key = ?1 AND active = 1").bind(REFUSED).first();
+    if (active) conditions.push(heldRefusal(`No completed clean pass since the refusal alarm. ${newest}`));
   }
   if (stale) {
     conditions.push({
       key: STALE, title: "Recovery copy pass telemetry is stale", forMs: 0,
       detail: last
         ? `No completed pass in ${minutes(now - lastAt)}. ${detail(last, verified, now)}`
-        : `No completed pass recorded in ${minutes(now - lastAt)}.`,
+        : `No completed pass recorded in ${minutes(now - lastAt)}. ${verifiedAge(verified, now)}`,
     });
   }
-  return { conditions, last, verified, clean: last && !anyRefusal(last) && last.unsignable === 0 && last.failed === 0, stale };
+  return { conditions, last, verified, clean, stale };
 }
 
 /** A recovery notice is due only if the matching incident actually paged. */
