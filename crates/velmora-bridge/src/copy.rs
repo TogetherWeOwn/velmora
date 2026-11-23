@@ -1702,8 +1702,10 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend, R: TenantRings> Copier<'_, B, 
         let _ = self.rings.take_misses();
         let names: Vec<String> = marks.keys().cloned().collect();
         self.page_due(&marks, names.iter(), slot).await;
-        let _ = self.save_misses(marks).await;
-        if let Some(tenant) = came_to {
+        let saved = self.save_misses(marks).await;
+        // The cursor moves on only past what was saved: otherwise the
+        // same tenants are looked at again.
+        if let Some(tenant) = came_to.filter(|_| saved) {
             let _ = put_mark(
                 self.safety,
                 RECHECK_KEY,
