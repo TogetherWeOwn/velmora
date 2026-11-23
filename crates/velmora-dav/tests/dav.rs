@@ -2172,6 +2172,43 @@ async fn a_failed_folder_marker_reports_the_markers_it_did_not_schedule() {
 }
 
 #[tokio::test]
+async fn a_later_failed_folder_marker_leaves_out_a_folder_a_created_marker_represents() {
+    let w = World::with(Config {
+        fan_out: 1,
+        ..Config::default()
+    })
+    .await;
+    // The gateway creates dst/e/, dst/f/, dst/g/ and dst/ as markers, in
+    // that order; dst/e/ is created before dst/f/ fails.
+    for key in ["src/e//h", "src/f//h", "src/g//h"] {
+        assert_eq!(w.s3_put(key, b"hidden").await, 200);
+    }
+    w.storage_fault("PUT", "dst/f/", StorageFault::Fail);
+    let r = w
+        .req("COPY", "/dav/src/", &[("destination", "/dav/dst/")], b"")
+        .await;
+    r.expect(207);
+    let mut got = member_statuses(&r);
+    got.sort();
+    // dst/ is represented by the created dst/e/; dst/g/ was never tried.
+    assert_eq!(
+        got,
+        vec![
+            (
+                "/dav/dst/f/".to_owned(),
+                "HTTP/1.1 502 Bad Gateway".to_owned()
+            ),
+            (
+                "/dav/dst/g/".to_owned(),
+                "HTTP/1.1 424 Failed Dependency".to_owned()
+            ),
+        ]
+    );
+    assert_eq!(w.s3_get("dst/e/").await.0, 200);
+    assert_eq!(w.s3_get("dst/g/").await.0, 404);
+}
+
+#[tokio::test]
 async fn a_failed_listing_of_the_claimed_root_answers_its_error_and_takes_the_claim_back() {
     let w = World::new().await;
     assert_eq!(w.s3_put("src/x", b"source").await, 200);
