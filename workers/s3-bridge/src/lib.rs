@@ -20,6 +20,7 @@ mod http;
 mod jobs;
 mod metrics;
 mod nntp;
+mod queue_attempt;
 mod queues;
 mod r2;
 
@@ -307,19 +308,14 @@ async fn handle_queue(event: worker::worker_sys::MessageBatch, env: Env) -> Resu
             return Err(worker::Error::RustError("config refused".into()));
         }
     };
-    use velmora_bridge::metrics::{job_sample, job_weight};
+    use velmora_bridge::metrics::job_weight;
     let sample = if metrics::bind(&env) {
-        job_sample(
-            env.var("JOB_METRICS_SAMPLE")
-                .ok()
-                .map(|v| v.to_string())
-                .as_deref(),
-        )
+        metrics::sample_binding(&env)
     } else {
         0
     };
     let queue = if sample > 0 {
-        metrics::queue_name(|| event.queue().map(Into::into))
+        metrics::queue_name(|| event.queue().map(|name| name.as_string()))
     } else {
         String::new()
     };
@@ -348,7 +344,21 @@ async fn handle_queue(event: worker::worker_sys::MessageBatch, env: Env) -> Resu
                     .extent()
                     .and_then(|_| job_weight(sample))
                     .map(|weight| (queue.clone(), weight));
-                run_in_table(&bridge, &job, observation).await
+                let post = matches!(
+                    job,
+                    Job::Extent {
+                        stage: OutboxStage::Post,
+                        ..
+                    } | Job::Wake {
+                        stage: OutboxStage::Post,
+                        ..
+                    }
+                );
+                let (b, j) = (Rc::clone(&bridge), job.clone());
+                queue_attempt::run_in_table(env::WorkerClock, post, observation, async move {
+                    b.run_job(&j).await
+                })
+                .await
             }
         };
         log_post_trace(&job, &outcome);
@@ -367,45 +377,6 @@ async fn handle_queue(event: worker::worker_sys::MessageBatch, env: Env) -> Resu
         console_log!("{line}");
     }
     Ok(())
-}
-
-/// Runs a job in the isolate's job table, where a later invocation can
-/// drop it should this one be cancelled: a cancelled invocation is not
-/// dropped, and the job would keep its bytes of the budget (`jobs`).
-async fn run_in_table(
-    bridge: &Rc<env::WorkerBridge>,
-    job: &Job,
-    observation: Option<(String, u32)>,
-) -> JobOutcome {
-    let now = velmora_bridge::ports::Clock::now(&bridge.clock);
-    // A wake that is due runs its stage too.
-    let post = matches!(
-        job,
-        Job::Extent {
-            stage: OutboxStage::Post,
-            ..
-        } | Job::Wake {
-            stage: OutboxStage::Post,
-            ..
-        }
-    );
-    let (b, j) = (Rc::clone(bridge), job.clone());
-    let attempt = metrics::emit_job(async move {
-        let run = b.run_job(&j);
-        let Some((queue, weight)) = observation else {
-            return (run.await, None);
-        };
-        let (outcome, trace) = velmora_bridge::trace::observe_job(&b.clock, run).await;
-        let point = velmora_bridge::metrics::job_point(&trace, &queue, weight);
-        (outcome, point)
-    });
-    match jobs::run(now, post, attempt).await {
-        Some(outcome) => outcome,
-        // `jobs::run` has logged it.
-        None => JobOutcome::Retry {
-            delay_secs: velmora_bridge::jobs::INFRA_RETRY_SECS,
-        },
-    }
 }
 
 /// Drops the jobs of invocations that are gone, and says when the byte

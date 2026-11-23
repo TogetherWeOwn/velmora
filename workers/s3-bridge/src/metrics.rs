@@ -6,9 +6,10 @@
 //! request is answered as before and nothing is logged per request.
 
 use std::cell::RefCell;
-use std::future::Future;
 
-use velmora_bridge::{metrics::Point, JobOutcome};
+use velmora_bridge::metrics::{job_sample, Point};
+use worker::js_sys::Reflect;
+use worker::wasm_bindgen::JsValue;
 use worker::{AnalyticsEngineDataPointBuilder, AnalyticsEngineDataset, Env};
 
 /// The dataset binding.
@@ -43,28 +44,28 @@ pub fn bind(env: &Env) -> bool {
 
 /// Queue metadata may be absent or throw. An unrecognized/empty name is
 /// mapped to `aux` by the point encoder; it cannot interrupt the job.
-pub fn queue_name<E>(read: impl FnOnce() -> Result<String, E>) -> String {
-    read().unwrap_or_default()
+pub fn queue_name<E>(read: impl FnOnce() -> Result<Option<String>, E>) -> String {
+    read().ok().flatten().unwrap_or_default()
 }
 
-pub async fn emit_job(run: impl Future<Output = (JobOutcome, Option<Point>)>) -> JobOutcome {
-    let (outcome, point) = run.await;
-    if let Some(point) = point {
-        write(&point);
+pub fn sample_binding(env: &Env) -> u32 {
+    let value = Reflect::get(env, &JsValue::from_str("JOB_METRICS_SAMPLE"));
+    read_sample(value.map(|v| (!v.is_undefined()).then(|| v.as_string())))
+}
+
+/// Absent defaults; readonly argument inspection failures, non-string
+/// values (including numbers), and invalid strings all turn sampling off.
+fn read_sample<E>(value: Result<Option<Option<String>>, E>) -> u32 {
+    match value {
+        Ok(None) => job_sample(None),
+        Ok(Some(Some(value))) => job_sample(Some(&value)),
+        Ok(Some(None)) | Err(_) => 0,
     }
-    outcome
-}
-
-#[cfg(test)]
-thread_local! {
-    static WRITTEN: RefCell<Vec<Point>> = const { RefCell::new(Vec::new()) };
 }
 
 /// Writes one point. A write is buffered by the runtime and never
 /// awaited; its failure is not the request's.
 pub fn write(point: &Point) {
-    #[cfg(test)]
-    WRITTEN.with(|points| points.borrow_mut().push(point.clone()));
     DATASET.with(|d| {
         let d = d.borrow();
         let Some(dataset) = d.as_ref() else {
@@ -81,25 +82,27 @@ pub fn write(point: &Point) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use futures_util::FutureExt;
-    use velmora_bridge::JobOutcome;
+    #[test]
+    fn queue_name_ignores_throwing_undefined_and_numeric_getters() {
+        // `JsValue::as_string()` is None for undefined and numbers. These
+        // fixtures are its converted result; native Rust cannot call JS.
+        let throwing = queue_name(|| Err(()));
+        let undefined = queue_name(|| Ok::<_, ()>(None));
+        let number = queue_name(|| Ok::<_, ()>(None));
+        assert_eq!([throwing, undefined, number], [""; 3]);
+        assert_eq!(
+            queue_name(|| Ok::<_, ()>(Some("velmora-post".into()))),
+            "velmora-post"
+        );
+    }
 
     #[test]
-    fn queue_job_emit_keeps_ack_and_retry_even_without_queue_metadata() {
-        let missing = queue_name(|| Err(()));
-        assert!(missing.is_empty());
-        for outcome in [JobOutcome::Ack, JobOutcome::Retry { delay_secs: 123 }] {
-            // No typed SDK getter is required to execute and settle the job.
-            assert_eq!(
-                emit_job(async { (outcome, None) }).now_or_never(),
-                Some(outcome)
-            );
-            let point = velmora_bridge::metrics::cold_read_point();
-            assert_eq!(
-                emit_job(async { (outcome, Some(point.clone())) }).now_or_never(),
-                Some(outcome)
-            );
-            assert_eq!(WRITTEN.with(|points| points.take()), [point]);
+    fn job_sample_binding_distinguishes_absence_from_non_strings() {
+        assert_eq!(read_sample(Ok::<_, ()>(None)), 8); // absent/undefined
+        assert_eq!(read_sample(Ok::<_, ()>(Some(None))), 0); // present numeric 0
+        assert_eq!(read_sample(Err(())), 0); // getter threw
+        for (raw, rate) in [("1", 1), ("0", 0), ("malformed", 0)] {
+            assert_eq!(read_sample(Ok::<_, ()>(Some(Some(raw.into())))), rate);
         }
     }
 }
