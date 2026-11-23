@@ -333,6 +333,25 @@ pub enum StepError {
     Hint,
 }
 
+/// Best-effort telemetry from one job, not a checkpoint or a coverage proof.
+#[derive(Debug, Default)]
+pub struct JobReport {
+    pub counts: Option<CopyCounts>,
+    pub error: Option<StepError>,
+    pub swept: bool,
+    pub walk_ended: bool,
+    pub outage: bool,
+}
+
+impl JobReport {
+    pub fn problems(&self) -> u64 {
+        self.counts.as_ref().map_or(0, |c| c.refused)
+            + u64::from(
+                self.outage || matches!(self.error, Some(StepError::Source | StepError::Store(_))),
+            )
+    }
+}
+
 /// The parts of a pass, in the order they are done.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Phase {
@@ -884,8 +903,8 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
     }
 
     /// One queue job of a pass: a step from `cursor`, then the message
-    /// for the next step. No counts = no step was done (maintenance, a
-    /// newer pass has started, or the step failed). The third value is
+    /// for the next step. No counts = no work was counted (maintenance,
+    /// a newer pass has started, or the step failed first). The third value is
     /// why the job did not do all of its work, when it did not; the
     /// job may be acknowledged all the same, so it has to be reported.
     ///
@@ -897,14 +916,28 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
         pass: UnixMs,
         cursor: &str,
     ) -> (JobOutcome, Option<CopyCounts>, Option<StepError>) {
+        let (outcome, report) = self.run_job_report(jobs, pass, cursor).await;
+        (outcome, report.counts, report.error)
+    }
+
+    pub async fn run_job_report<J: JobSink>(
+        &self,
+        jobs: &J,
+        pass: UnixMs,
+        cursor: &str,
+    ) -> (JobOutcome, JobReport) {
+        let mut report = JobReport::default();
         if self.maintenance == Maintenance::Restore {
-            return (JobOutcome::Ack, None, None);
+            return (JobOutcome::Ack, report);
         }
         let place = Place::parse(cursor);
         if let Some(hint) = place.as_ref().filter(|p| p.phase == Phase::Plan) {
-            return self.run_hint(hint).await;
+            let (outcome, counts, error) = self.run_hint(hint).await;
+            report.counts = counts;
+            report.error = error;
+            return (outcome, report);
         }
-        let (outcome, counts, why) = self.run_step(jobs, pass, cursor, place).await;
+        let (outcome, counts, why) = self.run_step(jobs, pass, cursor, place, &mut report).await;
         // Something was left undone, and the job does not come again
         // for it. The sweep of the next pass may mend it; if it does
         // not, only the walk does, so the walk is asked to come soon.
@@ -912,7 +945,9 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
         if undone && outcome == JobOutcome::Ack {
             self.want_walk().await;
         }
-        (outcome, counts, why)
+        report.counts = counts;
+        report.error = why;
+        (outcome, report)
     }
 
     async fn run_step<J: JobSink>(
@@ -921,6 +956,7 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
         pass: UnixMs,
         cursor: &str,
         place: Option<Place>,
+        report: &mut JobReport,
     ) -> (JobOutcome, Option<CopyCounts>, Option<StepError>) {
         // A pass ends when the next one starts. The walk loses nothing
         // by it: the newer pass goes on from the place that was saved.
@@ -957,10 +993,18 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
                 }
             }
         }
-        let step = match self.step(pass, cursor).await {
+        let mut counts = CopyCounts::default();
+        let step = match self.step_counted(pass, cursor, &mut counts).await {
             Ok(step) => step,
-            Err(e) => return (again, None, Some(e)),
+            Err(e) => {
+                return (
+                    again,
+                    (counts != CopyCounts::default()).then_some(counts),
+                    Some(e),
+                )
+            }
         };
+        report.outage = step.outage;
         // The store is down: the cursor does not move while the job may
         // be retried. After that the pass goes on past the records that
         // failed, so that no record can hold back those behind it. A
@@ -988,7 +1032,7 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
         // left near the end, every pass would walk that end only.
         // Best effort: without it the next pass asks for the walk.
         if step.swept {
-            let _ = self.save_time(SWEPT_KEY, pass).await;
+            report.swept = self.save_time(SWEPT_KEY, pass).await.is_ok();
         }
         let mut saved = true;
         if step.began {
@@ -1002,7 +1046,8 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
         }
         let started = saved;
         if step.ended {
-            saved &= self.save_time(WALKED_KEY, pass).await.is_ok();
+            report.walk_ended = self.save_time(WALKED_KEY, pass).await.is_ok();
+            saved &= report.walk_ended;
         }
         if let Some(at) = step.walk.as_ref().filter(|_| started) {
             saved &= self.save_walk(at).await.is_ok();
@@ -1038,12 +1083,21 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
         pass: UnixMs,
         cursor: &str,
     ) -> std::result::Result<CopyStep, StepError> {
+        self.step_counted(pass, cursor, &mut CopyCounts::default())
+            .await
+    }
+
+    async fn step_counted(
+        &self,
+        pass: UnixMs,
+        cursor: &str,
+        counts: &mut CopyCounts,
+    ) -> std::result::Result<CopyStep, StepError> {
         let mut budget = Budget {
             started: self.clock.now(),
             copies: 0,
             pages: 0,
         };
-        let mut counts = CopyCounts::default();
         let mut known = Known::default();
         let place = Place::parse(cursor).unwrap_or_else(|| Place::start(pass));
         // The time of the sweep is up: the walk has the rest of the pass.
@@ -1063,7 +1117,7 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
             };
             let phase = span(place.phase, pass);
             let walked = self
-                .walk(&phase, &mut place, &mut budget, &mut counts, &mut known)
+                .walk(&phase, &mut place, &mut budget, counts, &mut known)
                 .await?;
             if place.walking() {
                 walk = Some(place.key.clone());
@@ -1088,7 +1142,7 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
             };
         };
         Ok(CopyStep {
-            counts,
+            counts: std::mem::take(counts),
             walk,
             began,
             ended,

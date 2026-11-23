@@ -88,7 +88,11 @@ export async function tick(env, now) {
   // The export bucket is listed once an hour; between, the last reading holds.
   const lastExport = await store.getMeta(db, "export_check");
   const checkExport = !lastExport || now - lastExport.at >= store.HOUR;
-  const snap = await readSnapshot(env, now, { checkExport });
+  const recoveryFirstSeen = env.CATALOG ? await store.getMeta(db, "recovery_copy_first_seen") : null;
+  const snap = await readSnapshot(env, now, { checkExport, recoveryFirstSeen: recoveryFirstSeen ?? now });
+  if (recoveryFirstSeen == null && snap.recovery !== undefined) {
+    await store.setMetaIfAbsent(db, "recovery_copy_first_seen", now);
+  }
   if (env.EXPORTS) {
     if (checkExport && snap.exportNewestAt !== undefined) {
       await store.setMeta(db, "export_check", { at: now, newest: snap.exportNewestAt });
