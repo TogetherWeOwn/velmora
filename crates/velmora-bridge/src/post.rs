@@ -52,7 +52,7 @@ use crate::ports::{
     NntpSession, Permit, PermitClass, SizeOutcome, LEASE_SECS, MAX_QUEUE_DELAY_SECS,
     NNTP_CALL_SECS, PERMIT_SECS,
 };
-use crate::recovery::write_stored_plan;
+use crate::recovery::{write_stored_plan, ScopeSealer};
 use crate::tenant::TenantScope;
 use crate::types::{
     valid_yenc_name, ArticleRow, ArticleState, BridgeError, ExtentRow, FailClass, JobExtent,
@@ -868,9 +868,15 @@ where
         // The message-ids exist nowhere but the catalogue until this
         // record is stored: without it, a lost catalogue could not find
         // the extent on Usenet. Nothing is posted before it is durable.
+        // A managed tenant's plan is VMR2 under its tenant key (ADR §3.2).
+        let sealer = ScopeSealer {
+            scope,
+            catalog: &self.catalog,
+            kek: &self.kek,
+        };
         write_stored_plan(
             &self.safety,
-            &self.kek,
+            &sealer,
             &self.cfg.records.in_scope(scope),
             extent,
             &plan,

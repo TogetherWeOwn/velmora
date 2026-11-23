@@ -39,6 +39,22 @@ fn tenant() -> TenantId {
     TenantId::parse("t_00000000000000a7").unwrap()
 }
 
+/// The tenant's key ring: its records on the job path (the post job's
+/// article plan) are VMR2 under it.
+fn ring() -> velmora_bridge::tenant_catalog::RingLoader {
+    let id = velmora_bridge::TenantId::parse(tenant().as_str()).unwrap();
+    let key =
+        Rc::new(velmora_bridge::crypto::scheme2::TenantKey::from_bytes(&id, 1, [7u8; 32]).unwrap());
+    Rc::new(move || {
+        let key = Rc::clone(&key);
+        Box::pin(async move {
+            Ok(Rc::new(
+                velmora_bridge::keys::tk::LoadedRing::new(key, Vec::new()).unwrap(),
+            ))
+        })
+    })
+}
+
 fn own() -> UnitName {
     UnitName::new(tenant(), 0)
 }
@@ -336,7 +352,8 @@ impl Fx {
                 state_seq: job_seq,
                 keys_seq: 0,
             },
-        );
+        )
+        .with_ring(ring());
         let bridge = Bridge {
             catalog,
             safety: MemBlobStore::new(),

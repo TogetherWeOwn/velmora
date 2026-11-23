@@ -268,7 +268,9 @@ pub async fn anchored_epoch<S: RecordStore>(store: &S) -> Result<(u64, u64)> {
     }
 }
 
-fn anchor_epoch(key: &str) -> Option<u64> {
+/// The epoch an anchor's name `key` names; `None` for a name that is no
+/// anchor's (a stray, or an epoch above [`MAX_EPOCH`]).
+pub fn anchor_epoch(key: &str) -> Option<u64> {
     key.strip_prefix(GATE_ANCHOR_PREFIX)
         .filter(|d| d.len() == 20 && d.bytes().all(|b| b.is_ascii_digit()))
         .and_then(|d| d.parse::<u64>().ok())

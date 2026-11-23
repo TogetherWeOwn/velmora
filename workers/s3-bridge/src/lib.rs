@@ -378,10 +378,13 @@ async fn queue(batch: MessageBatch<serde_json::Value>, env: Env, _ctx: Context) 
                 }
             }
             (_, Some(tenant)) => {
-                // No plan hint: it names tenant 0's layouts
-                // (`copy::plan_hint`). Each run logs its post trace.
+                // Each run logs its post trace. A post job that is done
+                // hints at its plan under the tenant's name (AM-80 item 3).
                 match run_on_unit(&env, &bridge, &scope, tenant, &job).await {
-                    Delivery::Ack => msg.ack(),
+                    Delivery::Ack => {
+                        plan_hint(&env, &bridge, &job, &JobOutcome::Ack, &scope).await;
+                        msg.ack()
+                    }
                     Delivery::Retry { delay_secs } => msg.retry_with_options(
                         &QueueRetryOptionsBuilder::new()
                             .with_delay_seconds(delay_secs)
@@ -404,9 +407,8 @@ async fn queue(batch: MessageBatch<serde_json::Value>, env: Env, _ctx: Context) 
             (_, None) => run_in_table(&bridge, &scope, &job).await,
         };
         log_post_trace(&job, &outcome);
-        // The hint names a plan in tenant 0's layouts (`copy::plan_hint`).
         if unit.is_none() {
-            plan_hint(&env, &bridge, &job, &outcome).await;
+            plan_hint(&env, &bridge, &job, &outcome, &scope).await;
         }
         match outcome {
             JobOutcome::Ack => msg.ack(),
@@ -611,23 +613,71 @@ fn log_budget(bridge: &env::WorkerBridge) {
     }
 }
 
+/// The recovery copy's tenant rings (AM-80 item 2): the root's parts, or
+/// none when `SAFETY` is not bound for the root (every managed tenant's
+/// ring then fails, and its `VMR2` records count `failed`).
+enum CopyRings {
+    Root(Box<root::WorkerPorts>, Rc<velmora_bridge::root::RootCache>),
+    None,
+}
+
+impl velmora_bridge::ports::TenantRings for CopyRings {
+    async fn ring(
+        &self,
+        tenant: &velmora_bridge::TenantId,
+    ) -> velmora_bridge::Result<velmora_bridge::ports::TenantRingState> {
+        match self {
+            CopyRings::Root(ports, cache) => {
+                velmora_bridge::root::RootRings {
+                    ports: &**ports,
+                    cache,
+                }
+                .ring(tenant)
+                .await
+            }
+            CopyRings::None => Err(velmora_bridge::BridgeError::Crypto(
+                "recovery copy: no tenant rings",
+            )),
+        }
+    }
+}
+
+type JobRings = velmora_bridge::recovery::check::JobRings<CopyRings>;
+
+/// The rings of one copy job, read through the isolate's root cache.
+fn copy_rings(env: &Env, bridge: &Rc<env::WorkerBridge>) -> JobRings {
+    let rings = match root::WorkerPorts::from_env(env, bridge) {
+        Ok(ports) => CopyRings::Root(Box::new(ports), root::cache()),
+        Err(_) => CopyRings::None,
+    };
+    JobRings::new(rings)
+}
+
 fn copier<'a>(
     bridge: &'a env::WorkerBridge,
     remote: &'a velmora_bridge::remote::S3Remote<e2::FetchHttp>,
-) -> Copier<'a, r2::R2Blobs, velmora_bridge::KekRing, env::WorkerClock, e2::FetchHttp> {
+    rings: &'a JobRings,
+) -> Copier<'a, r2::R2Blobs, velmora_bridge::KekRing, env::WorkerClock, e2::FetchHttp, CopyRings> {
     Copier {
         safety: &bridge.safety,
         kek: &bridge.kek,
         clock: &bridge.clock,
         remote,
         maintenance: bridge.cfg.maintenance,
+        rings,
     }
 }
 
 /// After a post job that is done: the hint that brings the article
 /// plan of its extent over to the recovery store now. Without it the
 /// plan waits for the walk (`velmora_bridge::copy`).
-async fn plan_hint(env: &Env, bridge: &env::WorkerBridge, job: &Job, outcome: &JobOutcome) {
+async fn plan_hint(
+    env: &Env,
+    bridge: &env::WorkerBridge,
+    job: &Job,
+    outcome: &JobOutcome,
+    scope: &velmora_bridge::TenantScope,
+) {
     use velmora_bridge::copy::{posted, send_hint};
     // Nothing to hint at, or no copy. A configuration that is refused
     // is found by the job of the hint, which says nothing: the cron
@@ -639,7 +689,7 @@ async fn plan_hint(env: &Env, bridge: &env::WorkerBridge, job: &Job, outcome: &J
         return;
     }
     let now = velmora_bridge::ports::Clock::now(&bridge.clock);
-    if !send_hint(&bridge.safety, &bridge.jobs, job, outcome, now).await {
+    if !send_hint(&bridge.safety, &bridge.jobs, job, outcome, scope, now).await {
         console_error!("recovery copy: a hint was not sent");
     }
 }
@@ -649,7 +699,7 @@ async fn plan_hint(env: &Env, bridge: &env::WorkerBridge, job: &Job, outcome: &J
 /// `retry=true`: a sum over a pass takes the other lines only.
 async fn recovery_copy(
     env: &Env,
-    bridge: &env::WorkerBridge,
+    bridge: &Rc<env::WorkerBridge>,
     pass: UnixMs,
     cursor: &str,
 ) -> JobOutcome {
@@ -665,7 +715,8 @@ async fn recovery_copy(
             return JobOutcome::Ack;
         }
     };
-    let (outcome, counts, why) = copier(bridge, &remote)
+    let rings = copy_rings(env, bridge);
+    let (outcome, counts, why) = copier(bridge, &remote, &rings)
         .run_job(&bridge.jobs, pass, cursor)
         .await;
     let retry = matches!(outcome, JobOutcome::Retry { .. });
@@ -682,8 +733,8 @@ async fn recovery_copy(
         );
     }
     match counts {
-        Some(c) if c.clean() && c.source_unreadable == 0 && !retry => console_log!(
-            "recovery copy: pass={} records={} bytes={} same={} copied={} young={} pending={} extra={} foreign={}",
+        Some(c) if c.clean() && c.damaged() == 0 && !retry => console_log!(
+            "recovery copy: pass={} records={} bytes={} same={} copied={} young={} pending={} extra={} foreign={} source_unreadable=0 shredded={} version_destroyed={} ring_loads={} ring_ms={}",
             pass.0,
             c.records,
             c.bytes,
@@ -692,10 +743,14 @@ async fn recovery_copy(
             c.young,
             c.pending,
             c.extra,
-            c.foreign
+            c.foreign,
+            c.shredded,
+            c.version_destroyed,
+            c.ring_loads,
+            c.ring_ms
         ),
         Some(c) => console_error!(
-            "recovery copy: pass={} retry={retry} records={} copied={} failed={} refused={} source_unreadable={} pending={} extra={} foreign={}",
+            "recovery copy: pass={} retry={retry} records={} copied={} failed={} refused={} source_unreadable={} pending={} extra={} foreign={} cross_scheme={} cross_tenant={} unknown_family={} shredded={} version_destroyed={} ring_loads={} ring_ms={}",
             pass.0,
             c.records,
             c.copied,
@@ -704,7 +759,14 @@ async fn recovery_copy(
             c.source_unreadable,
             c.pending,
             c.extra,
-            c.foreign
+            c.foreign,
+            c.cross_scheme,
+            c.cross_tenant,
+            c.unknown_family,
+            c.shredded,
+            c.version_destroyed,
+            c.ring_loads,
+            c.ring_ms
         ),
         None => {}
     }
@@ -766,7 +828,9 @@ async fn scheduled(event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
     match env::recovery_store(&env) {
         Ok(None) => {}
         Ok(Some(remote)) => {
-            if copier(&bridge, &remote)
+            // Starting a pass reads no ring.
+            let rings = JobRings::new(CopyRings::None);
+            if copier(&bridge, &remote, &rings)
                 .start_pass(&bridge.jobs, UnixMs(event.schedule() as i64))
                 .await
                 .is_err()

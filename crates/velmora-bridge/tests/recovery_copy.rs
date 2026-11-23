@@ -25,7 +25,7 @@ use velmora_bridge::remote::{
     md5_hex, HttpRequest, HttpResponse, HttpSend, NoAnswer, RemoteConfig, RemoteError, S3Remote,
     MAX_ANSWER_BYTES, MAX_LIST_BYTES,
 };
-use velmora_bridge::testkit::{FakeJobs, FixedClock, MemBlobStore, TestKek};
+use velmora_bridge::testkit::{no_rings, FakeJobs, FixedClock, MemBlobStore, NoRings, TestKek};
 use velmora_bridge::*;
 use velmora_s3_proto::{verify, Authority, Credential, ErrorCode, Headers, Limits, Policy, Target};
 
@@ -397,13 +397,14 @@ impl World {
         }
     }
 
-    fn copier(&self) -> Copier<'_, MemBlobStore, TestKek, FixedClock, &'static FakeE2> {
+    fn copier(&self) -> Copier<'_, MemBlobStore, TestKek, FixedClock, &'static FakeE2, NoRings> {
         Copier {
             safety: &self.safety,
             kek: &self.kek,
             clock: &self.clock,
             remote: &self.remote,
             maintenance: Maintenance::Off,
+            rings: no_rings(),
         }
     }
 
@@ -441,18 +442,7 @@ impl World {
         let mut cursor = Some(String::new());
         while let Some(at) = cursor {
             let step = self.copier().step(pass, &at).await.unwrap();
-            let c = step.counts;
-            total.records += c.records;
-            total.bytes += c.bytes;
-            total.same += c.same;
-            total.copied += c.copied;
-            total.failed += c.failed;
-            total.refused += c.refused;
-            total.source_unreadable += c.source_unreadable;
-            total.young += c.young;
-            total.pending += c.pending;
-            total.extra += c.extra;
-            total.foreign += c.foreign;
+            total.add(&step.counts);
             cursor = step.next;
         }
         total
@@ -1630,6 +1620,7 @@ async fn a_job_stops_at_its_time_bound_and_the_next_goes_on() {
         clock: &clock,
         remote: &w.remote,
         maintenance: Maintenance::Off,
+        rings: no_rings(),
     };
     // Every request reads the clock, so a few groups of copies take
     // the job past its 20 seconds: it stops after a whole group, with
@@ -1788,6 +1779,7 @@ async fn a_pass_goes_on_from_a_key_that_something_else_wrote() {
         clock: &clock,
         remote: &w.remote,
         maintenance: Maintenance::Off,
+        rings: no_rings(),
     };
     // Ten list requests take the job to its cut and past half of its
     // time; the second cut ends it.
@@ -1836,6 +1828,7 @@ async fn a_job_that_ends_at_tenant_keys_sends_no_name_of_one() {
         clock: &clock,
         remote: &w.remote,
         maintenance: Maintenance::Off,
+        rings: no_rings(),
     };
     let (outcome, counts, why) = copier.run_job(&w.jobs, UnixMs(NOW), "").await;
     assert_eq!((outcome, why), (JobOutcome::Ack, None));
@@ -1987,6 +1980,7 @@ async fn a_record_removed_after_it_was_listed_is_not_counted() {
         clock: &w.clock,
         remote: &w.remote,
         maintenance: Maintenance::Off,
+        rings: no_rings(),
     };
     let step = copier.step(UnixMs(NOW), &walk("")).await.unwrap();
     let c = step.counts;
@@ -2017,6 +2011,7 @@ async fn an_equal_copy_is_not_sent_again_when_the_listing_names_another_digest()
         clock: &w.clock,
         remote: &w.remote,
         maintenance: Maintenance::Off,
+        rings: no_rings(),
     };
     let first = copier.step(UnixMs(NOW), &walk("")).await.unwrap().counts;
     assert_eq!((first.copied, first.same), (3, 0));
@@ -2100,6 +2095,7 @@ async fn a_backfill_longer_than_a_pass_reaches_every_key_and_new_ones_first() {
         clock: &clock,
         remote: &w.remote,
         maintenance: Maintenance::Off,
+        rings: no_rings(),
     };
     let old: Vec<String> = w.safety.keys();
     assert_eq!(old.len(), OLD_RECORDS);
@@ -2526,6 +2522,7 @@ async fn a_place_that_cannot_be_saved_is_reported_and_the_pass_goes_on() {
         clock: &w.clock,
         remote: &w.remote,
         maintenance: Maintenance::Off,
+        rings: no_rings(),
     };
     let (outcome, counts, why) = copier.run_job(&w.jobs, UnixMs(NOW), "").await;
     assert_eq!(outcome, JobOutcome::Ack);
@@ -2673,7 +2670,7 @@ fn asked_for(e2: &FakeE2, method: &str, key: &str) -> usize {
 /// A pass through the queue, job after job: why its jobs fell short.
 async fn queued_pass<B: BlobStore, T: Clock>(
     w: &World,
-    copier: &Copier<'_, B, TestKek, T, &'static FakeE2>,
+    copier: &Copier<'_, B, TestKek, T, &'static FakeE2, NoRings>,
     start: UnixMs,
 ) -> Vec<StepError> {
     assert!(copier.start_pass(&w.jobs, start).await.unwrap());
@@ -2722,6 +2719,7 @@ async fn a_record_larger_than_a_sweep_is_finished_over_passes_and_the_walk_goes_
         clock: &clock,
         remote: &w.remote,
         maintenance: Maintenance::Off,
+        rings: no_rings(),
     };
     let there = |prefix: &str| {
         let objects = w.e2.objects.borrow();
@@ -2934,6 +2932,7 @@ async fn a_large_record_is_finished_when_the_sweep_cannot_be_saved() {
         clock: &w.clock,
         remote: &w.remote,
         maintenance: Maintenance::Off,
+        rings: no_rings(),
     };
     let mut cursor = Some(String::new());
     let mut jobs = 0;
@@ -3000,6 +2999,7 @@ async fn a_sweep_that_cannot_be_saved_is_reported_and_the_pass_goes_on() {
         clock: &w.clock,
         remote: &w.remote,
         maintenance: Maintenance::Off,
+        rings: no_rings(),
     };
     let (outcome, counts, why) = copier.run_job(&w.jobs, UnixMs(NOW), "").await;
     assert_eq!((outcome, why), (JobOutcome::Ack, Some(StepError::Mark)));
@@ -3016,6 +3016,7 @@ async fn a_sweep_that_cannot_be_saved_is_reported_and_the_pass_goes_on() {
         clock: &w.clock,
         remote: &w.remote,
         maintenance: Maintenance::Off,
+        rings: no_rings(),
     };
     let (_, _, why) = copier.run_job(&w.jobs, UnixMs(NOW), "").await;
     assert_eq!(why, None);
@@ -3101,6 +3102,7 @@ async fn the_plans_of_a_record_stop_at_the_bounds_of_a_job() {
         clock: &clock,
         remote: &w.remote,
         maintenance: Maintenance::Off,
+        rings: no_rings(),
     };
     let began = w.clock.now().0;
     let step = copier.step(UnixMs(NOW), "").await.unwrap();
@@ -3417,6 +3419,7 @@ async fn a_sweep_that_cannot_be_read_is_not_written_over() {
             clock: &w.clock,
             remote: &w.remote,
             maintenance: Maintenance::Off,
+            rings: no_rings(),
         };
         let step = copier.step(UnixMs(NOW), "").await.unwrap();
         assert_eq!((step.counts.copied, step.counts.pending), (1, 1));
@@ -3500,7 +3503,12 @@ fn post_job(extent: &str) -> Job {
 
 /// The hint for the article plan of `extent`, made now: pass and cursor.
 fn hint_for(w: &World, extent: &str) -> (UnixMs, String) {
-    match plan_hint(&post_job(extent), &JobOutcome::Ack, w.clock.now()) {
+    match plan_hint(
+        &post_job(extent),
+        &JobOutcome::Ack,
+        &TenantScope::tenant_zero(),
+        w.clock.now(),
+    ) {
         Some(Job::RecoveryCopy { pass, cursor, .. }) => (pass, cursor),
         other => panic!("{other:?}"),
     }
@@ -3528,6 +3536,7 @@ async fn lists_of_a_day(plans: usize, every_pass: bool) -> (u64, usize, u64) {
         clock: &w.clock,
         remote: &w.remote,
         maintenance: Maintenance::Off,
+        rings: no_rings(),
     };
     // The first pass fills the store and ends the walk.
     assert!(queued_pass(&w, &copier, UnixMs(NOW)).await.is_empty());
@@ -3590,21 +3599,26 @@ async fn a_day_of_passes_lists_what_is_new_and_walks_once() {
     // Before: with the records. What a pass lists of the fresh records
     // (at most six pages of each side: two for each kind of record of
     // the flat layout, which has them, and one for each kind of the
-    // tenant layout, which has none) is the same in both.
-    let walked = |day: (u64, usize, u64)| (day.0 - 96 * 6, day.1 as u64 - 96 * 6);
+    // tenant layout, which has none) is the same in both; the safety
+    // bucket also takes the listing of the managed tenants' directories.
+    let walked = |day: (u64, usize, u64)| (day.0 - 96 * 7, day.1 as u64 - 96 * 6);
     assert!(walked(large.0).0 > 2 * walked(small.0).0, "{days:?}");
     assert!(walked(large.0).1 > 2 * walked(small.0).1, "{days:?}");
     // After: a pass at rest asks the same of both sizes, and little.
     assert_eq!(small.1 .2, large.1 .2, "{days:?}");
-    assert!(small.1 .2 <= 12, "{days:?}");
+    // One more than before AM-80: the listing of the managed tenants'
+    // directories (`m/x/` with the delimiter `/`), which finds none here.
+    assert!(small.1 .2 <= 13, "{days:?}");
     // A day is 95 such passes and one walk.
     // The walk has five parts; three of them hold no record here.
     let pages = |records: u64| records.div_ceil(1000) + 4 + 3;
     for ((_, after), records) in days.iter().zip([2_400, 12_000]) {
-        assert!(after.0 <= 96 * 6 + pages(records), "{days:?}");
+        assert!(after.0 <= 96 * 7 + pages(records), "{days:?}");
         assert!(after.1 as u64 <= 96 * 6 + pages(records), "{days:?}");
     }
-    assert!(large.1 .0 * 4 < large.0 .0, "{days:?}");
+    // Without the 96 listings of the tenants' directories, which both
+    // take alike.
+    assert!((large.1 .0 - 96) * 4 < large.0 .0 - 96, "{days:?}");
 }
 
 /// An article plan written long after its generation record, between
@@ -3654,18 +3668,45 @@ async fn an_article_plan_written_between_walks_is_over_there_by_its_hint() {
             generation: generation.clone(),
             stage,
         };
-        assert!(!w.copier().hint(&w.jobs, &other, &JobOutcome::Ack).await);
+        assert!(
+            !w.copier()
+                .hint(
+                    &w.jobs,
+                    &other,
+                    &JobOutcome::Ack,
+                    &TenantScope::tenant_zero()
+                )
+                .await
+        );
     }
     let retried = JobOutcome::Retry { delay_secs: 30 };
-    assert!(!w.copier().hint(&w.jobs, &post, &retried).await);
     assert!(
         !w.copier()
-            .hint(&w.jobs, &Job::Gc { v: JOB_VERSION }, &JobOutcome::Ack)
+            .hint(&w.jobs, &post, &retried, &TenantScope::tenant_zero())
+            .await
+    );
+    assert!(
+        !w.copier()
+            .hint(
+                &w.jobs,
+                &Job::Gc { v: JOB_VERSION },
+                &JobOutcome::Ack,
+                &TenantScope::tenant_zero()
+            )
             .await
     );
     assert!(w.jobs.take().is_empty());
 
-    assert!(w.copier().hint(&w.jobs, &post, &JobOutcome::Ack).await);
+    assert!(
+        w.copier()
+            .hint(
+                &w.jobs,
+                &post,
+                &JobOutcome::Ack,
+                &TenantScope::tenant_zero()
+            )
+            .await
+    );
     let sent = w.jobs.take();
     assert_eq!((sent.len(), sent[0].delay_secs), (1, 0));
     let Job::RecoveryCopy { v, pass, cursor } = &sent[0].job else {
@@ -3745,7 +3786,12 @@ async fn a_hint_names_one_article_plan_and_nothing_else() {
     restoring.maintenance = Maintenance::Restore;
     assert!(
         !restoring
-            .hint(&w.jobs, &post_job("x_1"), &JobOutcome::Ack)
+            .hint(
+                &w.jobs,
+                &post_job("x_1"),
+                &JobOutcome::Ack,
+                &TenantScope::tenant_zero()
+            )
             .await
     );
     let (outcome, counts, why) = restoring
@@ -3757,7 +3803,12 @@ async fn a_hint_names_one_article_plan_and_nothing_else() {
     // A hint that cannot be sent asks for the walk.
     assert!(
         !w.copier()
-            .hint(&NoQueue, &post_job("x_1"), &JobOutcome::Ack)
+            .hint(
+                &NoQueue,
+                &post_job("x_1"),
+                &JobOutcome::Ack,
+                &TenantScope::tenant_zero()
+            )
             .await
     );
     assert_eq!(time_at(&w, WANT_KEY).await, ms(NOW));
@@ -3965,6 +4016,7 @@ async fn the_walk_goes_on_across_passes_then_rests_for_a_day() {
         clock: &clock,
         remote: &w.remote,
         maintenance: Maintenance::Off,
+        rings: no_rings(),
     };
     let behind = |e2: &FakeE2| RECORDS - e2.objects.borrow().len();
     let mut places: Vec<String> = Vec::new();
@@ -4297,6 +4349,7 @@ async fn a_start_saved_over_an_old_place_does_not_go_on_from_it() {
         clock: &w.clock,
         remote: &w.remote,
         maintenance: Maintenance::Off,
+        rings: no_rings(),
     };
     let (_, _, why) = copier.run_job(&w.jobs, UnixMs(NOW), "").await;
     assert_eq!(why, Some(StepError::Mark));
@@ -4333,6 +4386,7 @@ async fn an_end_that_cannot_be_saved_does_not_leave_the_walk_at_its_end() {
         clock: &w.clock,
         remote: &w.remote,
         maintenance: Maintenance::Off,
+        rings: no_rings(),
     };
     for n in 0..3 {
         let pass = UnixMs(NOW + n * PASS_INTERVAL_MS);
@@ -4470,6 +4524,7 @@ async fn a_walk_under_way_begins_again_at_another_store() {
         clock: &w.clock,
         remote: &w.remote,
         maintenance: Maintenance::Off,
+        rings: no_rings(),
     };
     for n in 0..3 {
         let pass = UnixMs(NOW + n * PASS_INTERVAL_MS);
@@ -4509,6 +4564,7 @@ async fn a_mark_of_the_walk_that_cannot_be_read_stops_the_job() {
                 clock: &w.clock,
                 remote: &w.remote,
                 maintenance: Maintenance::Off,
+                rings: no_rings(),
             };
             let (outcome, counts, why) = copier.run_job(&w.jobs, UnixMs(NOW), "").await;
             assert!(
@@ -4828,6 +4884,7 @@ async fn the_cursors_of_a_pass_keep_their_names() {
         clock: &clock,
         remote: &w.remote,
         maintenance: Maintenance::Off,
+        rings: no_rings(),
     };
     let mut parts = Vec::new();
     let mut cursor = Some(String::new());
@@ -5181,6 +5238,7 @@ async fn a_segmented_record_that_takes_several_jobs_is_sent_once() {
         clock: &clock,
         remote: &w.remote,
         maintenance: Maintenance::Off,
+        rings: no_rings(),
     };
     let mut jobs = 0;
     let mut cursor = Some(walk(""));

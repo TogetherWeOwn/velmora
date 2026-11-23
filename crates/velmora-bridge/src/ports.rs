@@ -218,6 +218,45 @@ pub trait BlobStore {
         }
         Ok(entries)
     }
+    /// Up to `limit` directories directly below `prefix` (which ends with
+    /// `/`) that sort after `start_after`, in key order, each as
+    /// `prefix` + its name + `/`: the common prefixes of a listing with
+    /// the delimiter `/`. Keys directly at `prefix` + a name with no `/`
+    /// are no directory. Fewer than `limit` = no more.
+    ///
+    /// This default lists one key per directory, starting after each
+    /// directory it found; an adapter whose listing takes a delimiter
+    /// overrides it (one request per 1,000 directories).
+    async fn list_dirs(&self, prefix: &str, start_after: &str, limit: u32) -> Result<Vec<String>> {
+        let mut dirs: Vec<String> = Vec::new();
+        let mut after = start_after.to_string();
+        while dirs.len() < limit as usize {
+            let Some(key) = self.list(prefix, &after, 1).await?.pop() else {
+                break;
+            };
+            let rest = key.strip_prefix(prefix).unwrap_or_default();
+            match rest.split_once('/') {
+                Some((name, _)) => {
+                    let dir = format!("{prefix}{name}/");
+                    after = past_dir(&dir);
+                    if dir.as_str() > start_after {
+                        dirs.push(dir);
+                    }
+                }
+                None => after = key,
+            }
+        }
+        Ok(dirs)
+    }
+}
+
+/// A key that sorts after every key below `dir` (which ends with `/`)
+/// and before the next directory beside it: `/` is followed by `0`.
+pub fn past_dir(dir: &str) -> String {
+    match dir.strip_suffix('/') {
+        Some(stem) => format!("{stem}0"),
+        None => dir.to_string(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -366,6 +405,105 @@ pub trait Kek {
     /// `(VELMORA_KEK_ACTIVE, its key)`.
     fn active(&self) -> (u32, &KekBytes);
     fn version(&self, v: u32) -> Option<&KekBytes>;
+}
+
+/// The keys of one managed tenant that the recovery copy proves its
+/// `VMR2` records with (AM-80 item 2, AM-80b), read from the tenant's
+/// own records in R2 and never from a catalogue.
+///
+/// **Its contract:** every version that the verified head of the tenant
+/// chain names, committed (`key_checks`) or claimed (`rotating_to`), and
+/// that no record marks destroyed. It may be **partial**: a named version
+/// whose blob did not load is missing from it, and the others still serve
+/// ([`CopyRing::named`] without [`CopyRing::key`]).
+pub struct CopyRing {
+    tenant: crate::crypto::scheme2::TenantId,
+    keys: std::collections::BTreeMap<u32, std::rc::Rc<crate::crypto::scheme2::TenantKey>>,
+    named: std::collections::BTreeSet<u32>,
+    destroyed: std::collections::BTreeSet<u32>,
+}
+
+impl CopyRing {
+    /// `keys`: the versions that loaded, each a key of `tenant` and of a
+    /// version in `named`. `named`: every committed or claimed version.
+    /// `destroyed`: the versions a record of the chain marks destroyed;
+    /// none of them is named or has a key.
+    pub fn new(
+        tenant: crate::crypto::scheme2::TenantId,
+        keys: Vec<std::rc::Rc<crate::crypto::scheme2::TenantKey>>,
+        named: std::collections::BTreeSet<u32>,
+        destroyed: std::collections::BTreeSet<u32>,
+    ) -> Result<CopyRing> {
+        const ERR_RING: crate::types::BridgeError =
+            crate::types::BridgeError::Crypto("copy ring: a key of another tenant or version");
+        let mut by_version = std::collections::BTreeMap::new();
+        for key in keys {
+            let version = key.version();
+            if key.tenant() != &tenant
+                || !named.contains(&version)
+                || by_version.insert(version, key).is_some()
+            {
+                return Err(ERR_RING);
+            }
+        }
+        if destroyed.iter().any(|v| named.contains(v)) {
+            return Err(ERR_RING);
+        }
+        Ok(CopyRing {
+            tenant,
+            keys: by_version,
+            named,
+            destroyed,
+        })
+    }
+
+    pub fn tenant(&self) -> &crate::crypto::scheme2::TenantId {
+        &self.tenant
+    }
+
+    /// The key of `version`, when it loaded.
+    pub fn key(&self, version: u32) -> Option<&crate::crypto::scheme2::TenantKey> {
+        self.keys.get(&version).map(|k| &**k)
+    }
+
+    /// Whether the chain names `version`, committed or claimed.
+    pub fn named(&self, version: u32) -> bool {
+        self.named.contains(&version)
+    }
+
+    /// Whether a record of the chain marks `version` destroyed.
+    pub fn destroyed(&self, version: u32) -> bool {
+        self.destroyed.contains(&version)
+    }
+
+    /// Whether a named version did not load.
+    pub fn partial(&self) -> bool {
+        self.named.len() > self.keys.len()
+    }
+}
+
+/// What [`TenantRings::ring`] answers for one managed tenant.
+#[derive(Clone)]
+pub enum TenantRingState {
+    /// Its ring, maybe partial.
+    Ring(std::rc::Rc<CopyRing>),
+    /// The head is `shredding` or `shredded`: its keys are destroyed, or
+    /// about to be. Applies to `VMR2` records only.
+    Shredded,
+    /// The head names no key version yet (or the tenant has no chain).
+    NoKeyYet,
+}
+
+/// The port of the recovery copy's tenant keys (AM-80 item 2): the
+/// Worker implements it from the root's parts (`root::RootRings`). Each
+/// call loads again; [`crate::recovery::check::JobRings`] keeps one answer
+/// per job and tenant.
+///
+/// `Err`: the ring could not be read now (the head, the key locations or
+/// the current version failed for a store or KEK error). The record then
+/// counts `failed`, never `source_unreadable`.
+pub trait TenantRings {
+    async fn ring(&self, tenant: &crate::crypto::scheme2::TenantId) -> Result<TenantRingState>;
 }
 
 // ---------------------------------------------------------------------------
