@@ -54,6 +54,7 @@ fn open<'a, 's>(
         generation: "generation",
         size: (FIRST.len() + SECOND.len()) as u64,
         md5: Some(md5),
+        checksum: None,
         extents,
     })
     .unwrap()
@@ -171,6 +172,7 @@ fn maps_traversal_and_a_different_existing_file_without_losing_data() {
             generation: "other",
             size: 0,
             md5: None,
+            checksum: None,
             extents: &[],
         })
         .unwrap();
@@ -209,6 +211,7 @@ fn unmapped_report_does_not_collide_with_bucket_names() {
                 generation: "g_test",
                 size: 0,
                 md5: None,
+                checksum: None,
                 extents: &[],
             })
             .unwrap();
@@ -233,6 +236,7 @@ fn case_variants_with_equal_bytes_keep_distinct_recovery_paths() {
         generation,
         size: FIRST.len() as u64,
         md5: None,
+        checksum: None,
         extents: &checks,
     };
     let mut first = session.object(check("Photo.jpg", "a")).unwrap();
@@ -302,6 +306,37 @@ fn a_part_hard_linked_to_an_edited_file_is_recreated_without_overwriting_it() {
 
 #[cfg(unix)]
 #[test]
+fn unreadable_same_size_existing_file_is_preserved_and_maps_out() {
+    use std::os::unix::fs::PermissionsExt;
+    // Root bypasses file read permissions; the native CI user is non-root.
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    let root = Scratch::new();
+    fs::create_dir_all(root.0.join("bucket/prefix")).unwrap();
+    let original = root.0.join("bucket/prefix/file");
+    let prior = vec![7; FIRST.len() + SECOND.len()];
+    fs::write(&original, &prior).unwrap();
+    fs::set_permissions(&original, fs::Permissions::from_mode(0o000)).unwrap();
+    assert_eq!(
+        fs::File::open(&original).unwrap_err().kind(),
+        std::io::ErrorKind::PermissionDenied
+    );
+    let (checks, expected) = checks();
+    let mut session = new_session(&root.0);
+    let mut output = open(&mut session, &checks, expected);
+    assert!(output.is_unmapped());
+    let recovered = output.path().to_owned();
+    output.write_verified(0, FIRST).unwrap();
+    output.write_verified(1, SECOND).unwrap();
+    output.finish().unwrap();
+    fs::set_permissions(&original, fs::Permissions::from_mode(0o600)).unwrap();
+    assert_eq!(fs::read(original).unwrap(), prior);
+    assert_eq!(fs::read(recovered).unwrap(), [FIRST, SECOND].concat());
+}
+
+#[cfg(unix)]
+#[test]
 fn rejects_group_writable_staging_directory() {
     use std::os::unix::fs::PermissionsExt;
     let root = Scratch::new();
@@ -329,6 +364,7 @@ fn symlink_ancestor_is_never_followed_and_long_key_is_preserved() {
                 generation,
                 size: FIRST.len() as u64,
                 md5: None,
+                checksum: None,
                 extents: &extent,
             })
             .unwrap();

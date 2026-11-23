@@ -3,6 +3,7 @@
 
 use crate::{
     extent::{open_extent, BodySource, Extent, ExtentError},
+    object_hash::ObjectHashes,
     resume::{ExtentCheck, ObjectCheck, OutputRoot},
 };
 use std::collections::{BTreeMap, BTreeSet};
@@ -11,6 +12,8 @@ use velmora_bridge::{
     ports::Kek,
     types::{BucketId, ExtentId},
 };
+
+use velmora_s3_proto::StoredChecksum;
 
 pub struct Bucket {
     pub id: BucketId,
@@ -24,7 +27,11 @@ pub struct Object {
     pub key: String,
     pub generation: String,
     pub size: u64,
+    /// Whole-object MD5 from the authenticated generation's single-PUT ETag.
     pub md5: Option<[u8; 16]>,
+    pub checksum: Option<StoredChecksum>,
+    /// Annotation from an external source inventory; not bound to this generation.
+    pub source_md5: Option<[u8; 16]>,
     pub extents: Vec<Reference>,
 }
 
@@ -53,6 +60,8 @@ pub struct Selection<'a> {
 pub struct ObjectResult {
     pub md5: String,
     pub md5_status: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub warning: Option<&'static str>,
     pub unmapped: bool,
     pub extents: usize,
 }
@@ -194,6 +203,7 @@ impl Catalogue {
             generation: &object.generation,
             size: object.size,
             md5: object.md5,
+            checksum: object.checksum.as_ref(),
             extents: &checks,
         })?;
         for (ordinal, reference) in object.extents.iter().enumerate() {
@@ -214,15 +224,14 @@ impl Catalogue {
     ) -> Result<ObjectResult, Box<dyn std::error::Error>> {
         let bdk = self.open_bucket(kek, selected)?;
         let object = selected.object;
-        let mut hash = md5::Context::new();
+        let mut hash = ObjectHashes::new(object.checksum.as_ref());
         for reference in &object.extents {
             let plaintext = open_extent(source, &bdk, self.extent(&reference.id)).await?;
-            hash.consume(plaintext.as_slice());
+            hash.update(plaintext.as_slice());
         }
-        let md5 = hash.finalize().0;
-        if object.md5.is_some_and(|expected| expected != md5) {
-            return Err("whole-object MD5 mismatch".into());
-        }
+        let md5 = hash
+            .finish(object.md5)
+            .ok_or("whole-object integrity check failed")?;
         Ok(result(object, md5, false))
     }
 }
@@ -235,6 +244,10 @@ fn result(object: &Object, md5: [u8; 16], unmapped: bool) -> ObjectResult {
         } else {
             "computed"
         },
+        warning: object
+            .source_md5
+            .filter(|expected| *expected != md5)
+            .map(|_| "source MD5 differs; object may have been overwritten since the annotation"),
         unmapped,
         extents: object.extents.len(),
     }
@@ -267,13 +280,7 @@ pub fn decode_hex<const N: usize>(input: &[u8]) -> Option<[u8; N]> {
     Some(out)
 }
 
-pub fn expected_md5(
-    source: Option<[u8; 16]>,
-    etag: &str,
-) -> Result<Option<[u8; 16]>, &'static str> {
-    if source.is_some() {
-        return Ok(source);
-    }
+pub fn expected_md5(etag: &str) -> Result<Option<[u8; 16]>, &'static str> {
     let etag = etag
         .strip_prefix('"')
         .and_then(|s| s.strip_suffix('"'))

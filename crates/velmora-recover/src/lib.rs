@@ -7,5 +7,6 @@ pub mod keys;
 #[cfg(feature = "recovery-cli")]
 pub mod kit;
 pub mod nzb;
+mod object_hash;
 pub mod resume;
 pub mod source;

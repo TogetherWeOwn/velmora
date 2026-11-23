@@ -18,6 +18,7 @@ use velmora_bridge::{
     types::{BucketId, ExtentId},
 };
 use velmora_kit::Entry;
+use velmora_s3_proto::{ChecksumAlgorithm, StoredChecksum};
 
 const MAX_MANIFEST: u64 = 4 * 1024 * 1024;
 const INVALID: &str = "invalid recovery kit manifest";
@@ -218,7 +219,13 @@ impl CatalogueReader for Kit {
                         key: o.key,
                         generation: o.generation_id,
                         size: o.size,
-                        md5: expected_md5(source, &o.etag)?,
+                        md5: expected_md5(&o.etag)?,
+                        checksum: o
+                            .checksum
+                            .as_deref()
+                            .map(full_object_checksum)
+                            .transpose()?,
+                        source_md5: source,
                         extents: o
                             .extents
                             .into_iter()
@@ -278,6 +285,23 @@ impl CatalogueReader for Kit {
         }
         Catalogue::new(buckets, objects, extents)
     }
+}
+
+fn full_object_checksum(input: &str) -> Result<StoredChecksum, &'static str> {
+    #[derive(Deserialize)]
+    struct Checksum {
+        #[serde(rename = "type")]
+        kind: String,
+        algorithm: String,
+        value: String,
+    }
+    let invalid = "invalid full-object checksum in authenticated index";
+    let parsed: Checksum = serde_json::from_str(input).map_err(|_| invalid)?;
+    if parsed.kind != "FULL_OBJECT" {
+        return Err(invalid);
+    }
+    let algorithm = ChecksumAlgorithm::from_name(&parsed.algorithm).ok_or(invalid)?;
+    StoredChecksum::full(algorithm, parsed.value).map_err(|_| invalid)
 }
 
 fn bytes<const N: usize>(bytes: &[u8]) -> Result<[u8; N], &'static str> {

@@ -6,20 +6,16 @@ use velmora_recover::{
 };
 
 #[test]
-fn distinguishes_plain_md5_from_multipart_and_prefers_drive() {
+fn plain_etag_is_an_object_md5_but_multipart_etag_is_not() {
     assert_eq!(
-        expected_md5(None, "\"01010101010101010101010101010101\"").unwrap(),
+        expected_md5("\"01010101010101010101010101010101\"").unwrap(),
         Some([1; 16])
     );
     assert_eq!(
-        expected_md5(None, "01010101010101010101010101010101-2").unwrap(),
+        expected_md5("01010101010101010101010101010101-2").unwrap(),
         None
     );
-    assert_eq!(
-        expected_md5(Some([6; 16]), "01010101010101010101010101010101-2").unwrap(),
-        Some([6; 16])
-    );
-    assert!(expected_md5(None, "corrupt-etag").is_err());
+    assert!(expected_md5("corrupt-etag").is_err());
 }
 
 #[test]
@@ -71,6 +67,8 @@ fn nzb_uses_recorded_groups_and_never_object_names() {
         generation: "g_test".into(),
         size: plain_size,
         md5: None,
+        checksum: None,
+        source_md5: None,
         extents: vec![velmora_recover::catalogue::Reference {
             id: extent.id.clone(),
             offset: 0,

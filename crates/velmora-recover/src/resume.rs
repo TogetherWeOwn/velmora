@@ -8,6 +8,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use crate::object_hash::ObjectHashes;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
@@ -27,6 +28,7 @@ pub struct ObjectCheck<'a> {
     pub generation: &'a str,
     pub size: u64,
     pub md5: Option<[u8; 16]>,
+    pub checksum: Option<&'a velmora_s3_proto::StoredChecksum>,
     pub extents: &'a [ExtentCheck],
 }
 
@@ -522,9 +524,11 @@ fn existing(path: &Path, check: &ObjectCheck<'_>) -> io::Result<Existing> {
     match metadata(path)? {
         None => Ok(Existing::Absent),
         Some(m) if m.is_file() && m.len() == check.size => {
-            match verify_file(&mut File::open(path)?, check)? {
-                Some(md5) => Ok(Existing::Same(md5)),
-                None => Ok(Existing::Different),
+            match File::open(path).and_then(|mut file| verify_file(&mut file, check)) {
+                Ok(Some(md5)) => Ok(Existing::Same(md5)),
+                Ok(None) => Ok(Existing::Different),
+                Err(e) if e.kind() == io::ErrorKind::PermissionDenied => Ok(Existing::Different),
+                Err(e) => Err(e),
             }
         }
         Some(_) => Ok(Existing::Different),
@@ -535,23 +539,19 @@ fn verify_file(file: &mut File, check: &ObjectCheck<'_>) -> io::Result<Option<[u
     if file.metadata()?.len() != check.size {
         return Ok(None);
     }
-    let mut md5 = md5::Context::new();
+    let mut object_hash = ObjectHashes::new(check.checksum);
     for extent in check.extents {
-        if extent_hash(file, extent, Some(&mut md5))? != Some(extent.sha256) {
+        if extent_hash(file, extent, Some(&mut object_hash))? != Some(extent.sha256) {
             return Ok(None);
         }
     }
-    let md5 = md5.finalize().0;
-    Ok(check
-        .md5
-        .is_none_or(|expected| expected == md5)
-        .then_some(md5))
+    Ok(object_hash.finish(check.md5))
 }
 
 fn extent_hash(
     file: &mut File,
     extent: &ExtentCheck,
-    mut md5: Option<&mut md5::Context>,
+    mut whole: Option<&mut ObjectHashes<'_>>,
 ) -> io::Result<Option<[u8; 32]>> {
     file.seek(SeekFrom::Start(extent.offset))?;
     let mut sha = Sha256::new();
@@ -565,8 +565,8 @@ fn extent_hash(
             Err(e) => return Err(e),
         }
         sha.update(&buf[..n]);
-        if let Some(hash) = &mut md5 {
-            hash.consume(&buf[..n]);
+        if let Some(hash) = &mut whole {
+            hash.update(&buf[..n]);
         }
         left -= n as u64;
     }

@@ -393,6 +393,63 @@ fn unmapped_conflict_and_unposted_object_do_not_abort_later_objects() {
 }
 
 #[test]
+fn same_size_overwrite_recovers_current_bytes_despite_stale_source_md5() {
+    let fixture = Fixture::new();
+    let index = fixture.fixture();
+    let kek = TestKey(KekBytes::new([19; 32]));
+    let mut entries = kit::read_index(Cursor::new(index), "fixture", &kek).unwrap();
+    let live = entries
+        .iter_mut()
+        .find_map(|entry| match entry {
+            kit::Entry::Object(o) => Some(o),
+            _ => None,
+        })
+        .unwrap();
+    live.source_md5 = Some(md5::compute(vec![42; live.size as usize]).0.to_vec().into());
+    let mut index = Vec::new();
+    kit::write_index(&mut index, "fixture", &kek, &entries).unwrap();
+    fixture.write_index(&index);
+    let result = fixture.run("key", DECRYPT);
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(String::from_utf8(result.stdout)
+        .unwrap()
+        .contains("source MD5 differs; object may have been overwritten since the annotation"));
+    assert_eq!(
+        fs::read(fixture.0.join("output/example/nested/example.bin")).unwrap(),
+        b"recoverable sealed-kit fixture"
+    );
+}
+
+#[test]
+fn authenticated_full_object_checksum_mismatch_blocks_promotion() {
+    let fixture = Fixture::new();
+    let index = fixture.fixture();
+    let kek = TestKey(KekBytes::new([19; 32]));
+    let mut entries = kit::read_index(Cursor::new(index), "fixture", &kek).unwrap();
+    let live = entries
+        .iter_mut()
+        .find_map(|entry| match entry {
+            kit::Entry::Object(o) => Some(o),
+            _ => None,
+        })
+        .unwrap();
+    live.checksum = Some(serde_json::json!({"algorithm": "SHA256", "type": "FULL_OBJECT", "value": format!("{}=", "A".repeat(43))}).to_string());
+    let mut index = Vec::new();
+    kit::write_index(&mut index, "fixture", &kek, &entries).unwrap();
+    fixture.write_index(&index);
+    let result = fixture.run("key", DECRYPT);
+    assert!(!result.status.success());
+    assert!(String::from_utf8(result.stdout)
+        .unwrap()
+        .contains("whole-object integrity check failed"));
+    assert!(!fixture.0.join("output/example/nested/example.bin").exists());
+}
+
+#[test]
 fn malformed_keyring_assignment_is_not_silently_ignored() {
     let fixture = Fixture::new();
     fixture.fixture();
