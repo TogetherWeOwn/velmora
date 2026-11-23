@@ -1011,6 +1011,29 @@ if [[ $MODE == remote ]]; then
   json=$(adm "GET /_admin/objects/$SB/a/big.bin" "$BASE/_admin/objects/$SB/a/big.bin")
   jcheck "no extent in the cache before the cold GET" '.extents | length > 0 and all(.cache == "absent")' "$json"
 fi
+if [[ $MODE == local && ${E2E_SLOT_WAIT:-} == push ]]; then
+  # Read across two 8 MiB extents, without going over dev's 8 MiB fanout
+  # threshold. A cold second extent leaves a future to drop on disconnect.
+  json=$(adm "GET /_admin/objects/$SB/a/big.bin" "$BASE/_admin/objects/$SB/a/big.bin")
+  if jq -e '.extents | length >= 2 and all(.[0:2][]; .cache == "absent" and
+    (.safety_state == "released" or .safety_state == "deleted"))' >/dev/null <<<"$json"; then
+    before_abort=$(stat -c '%s' "$T/wrangler.log")
+    got=$(python3 -I "$WORKER_DIR/e2e/sigv4_get.py" "$BASE" "$SB/a/big.bin" \
+      gzip gzip /dev/null bytes=7340032-15728639 2>&1) ||
+      fail "disconnect a cold GET" "HTTP 206 and the first body byte" "$got"
+    log "cold GET disconnect: $got"
+    abort_logged() {
+      tail -c "+$((before_abort + 1))" "$T/wrangler.log" |
+        grep -F 'stream: client went away, body dropped' >/dev/null
+    }
+    poll 10 0.2 abort_logged ||
+      fail "disconnect a cold GET" 'stream: client went away, body dropped within 10 s' 'line not found'
+    log 'cold GET disconnect: stream: client went away, body dropped'
+    adm 're-evict a/big.bin after disconnect' -XPOST "$BASE/_admin/evict/$SB/a/big.bin?include_safety=1" >/dev/null
+  else
+    log 'cold GET disconnect: skipped (both range extents are not confirmed cold)'
+  fi
+fi
 # NNTP BODY -> yEnc -> sha256 -> R2 refill -> decrypt
 t0=$(now_ms)
 run_aws "cold GET a/big.bin" "${S3[@]}" cp "s3://$SB/a/big.bin" "$T/cold-big.bin" >/dev/null

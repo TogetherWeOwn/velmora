@@ -134,6 +134,7 @@ async fn handle_fetch(req: Request, env: Env, ctx: &Context) -> (Response, Optio
     }
     let started = worker::Date::now().as_millis();
     let method = req.inner().method();
+    let signal = req.inner().signal();
     let colo = req.cf().map(|cf| cf.colo()).unwrap_or_default();
     let length = |headers: &worker::Headers| {
         headers
@@ -174,7 +175,7 @@ async fn handle_fetch(req: Request, env: Env, ctx: &Context) -> (Response, Optio
         if admin {
             ingress::no_store(&mut resp);
         }
-        http::to_response(resp.with_request_id(&request_id))
+        http::to_response(resp.with_request_id(&request_id), None)
     };
     // The point of this request, if it gets one. A sub-request of a
     // large GET gets none unless it failed: a 5xx is never left out,
@@ -245,7 +246,7 @@ async fn handle_fetch(req: Request, env: Env, ctx: &Context) -> (Response, Optio
     .with_request_id(&request_id);
     // A body in sub-ranges: the first one is opened before the status is
     // known to the client.
-    let (status, out, body_done) = fanout::respond(&env, ctx, resp, &request_id).await;
+    let (status, out, body_done) = fanout::respond(&env, ctx, resp, &request_id, &signal).await;
     console_log!(
         "{}",
         ingress::log_line(&method, &target, status, &request_id)

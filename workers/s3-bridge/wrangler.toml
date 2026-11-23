@@ -1,6 +1,8 @@
 name = "velmora-s3"
 main = "build/worker/shim.mjs"
 compatibility_date = "2026-11-01"
+# Let streamed bodies stop a pending cold read when the client disconnects.
+compatibility_flags = ["enable_request_signal"]
 
 # The account id comes from the deploy environment (CLOUDFLARE_ACCOUNT_ID),
 # never from this file. Binding ids below are placeholders until the

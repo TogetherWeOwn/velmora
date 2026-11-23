@@ -732,6 +732,58 @@ mod tests {
     }
 
     #[test]
+    fn disconnect_drops_the_pending_pull_before_draining_its_open() {
+        use futures_util::Stream;
+
+        let clock = TestClock::default();
+        let done = BodyDone::default();
+        let tasks = Rc::new(RefCell::new(Vec::new()));
+        let queued = Rc::clone(&tasks);
+        let spawn = tracked_open_spawner(Rc::new(move |task| queued.borrow_mut().push(task)));
+        let closed = Rc::new(Cell::new(0));
+        let session = Session(Rc::clone(&closed));
+        let pull_lifetime = Rc::new(());
+        let pull_guard = Rc::clone(&pull_lifetime);
+        let pull = futures_util::stream::once(async move {
+            let _pull_guard = pull_guard;
+            let _session = open_detached(&spawn, Box::pin(async { Ok(session) })).await?;
+            Ok(vec![1])
+        });
+        let mut body = std::pin::pin!(done.track(Box::pin(pull)));
+        let mut wait =
+            std::pin::pin!(wait_for_detached_opens(done.clone().wait(), |d| clock.delay(d)));
+        let mut cx = std::task::Context::from_waker(futures_util::task::noop_waker_ref());
+
+        assert!(wait.as_mut().poll(&mut cx).is_pending());
+        assert!(body.as_mut().poll_next(&mut cx).is_pending());
+        assert_eq!(DETACHED_OPENS.get(), 1);
+        assert_eq!(Rc::strong_count(&pull_lifetime), 2);
+        done.abort();
+        assert_eq!(
+            Rc::strong_count(&pull_lifetime),
+            1,
+            "pending pull was not dropped on abort"
+        );
+        assert!(std::pin::pin!(done.wait())
+            .as_mut()
+            .poll(&mut cx)
+            .is_ready());
+        assert!(wait.as_mut().poll(&mut cx).is_pending());
+        assert!(matches!(
+            body.as_mut().poll_next(&mut cx),
+            Poll::Ready(None)
+        ));
+        assert_eq!(tasks.borrow().len(), 1, "no further open was started");
+
+        let mut task = tasks.borrow_mut().pop().unwrap();
+        assert!(task.as_mut().poll(&mut cx).is_ready());
+        assert_eq!(closed.get(), 1);
+        assert_eq!(DETACHED_OPENS.get(), 0);
+        clock.advance(50);
+        assert!(wait.as_mut().poll(&mut cx).is_ready());
+    }
+
+    #[test]
     fn stream_drain_times_out_thirty_seconds_after_the_body_ends() {
         let clock = TestClock::default();
         let done = BodyDone::default();

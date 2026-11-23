@@ -187,23 +187,27 @@ pub async fn respond(
     ctx: &Context,
     resp: S3Response,
     request_id: &str,
+    signal: &worker::web_sys::AbortSignal,
 ) -> (u16, Response, Option<crate::http::BodyDone>) {
     let (status, headers) = (resp.status, resp.headers);
     let fan = match resp.body {
         RespBody::Fanout(fan) => fan,
         body => {
-            let (out, done) = crate::http::to_response(S3Response {
-                status,
-                headers,
-                body,
-            });
+            let (out, done) = crate::http::to_response(
+                S3Response {
+                    status,
+                    headers,
+                    body,
+                },
+                Some(signal),
+            );
             return (status, out, done);
         }
     };
     // `resp` came with its request ID; a refusal made here gets it too.
     let refuse = |resp: S3Response| {
         let status = resp.status;
-        let (out, done) = crate::http::to_response(resp.with_request_id(request_id));
+        let (out, done) = crate::http::to_response(resp.with_request_id(request_id), None);
         (status, out, done)
     };
     let Some((pipe, readable)) = SelfPipe::new(env, fan.len()) else {
