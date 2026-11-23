@@ -912,7 +912,10 @@ async fn recursive_copy_failure_keeps_obsolete_destination_members() {
         ),
         (207, 200, 404)
     );
-    assert_eq!(r.hrefs().len(), 1);
+    // The failed member, and what was never scheduled after it.
+    let mut hrefs = r.hrefs();
+    hrefs.sort();
+    assert_eq!(hrefs, ["/dav/dst/", "/dav/src/b", "/dav/src/c"]);
     assert_eq!(w.s3_get("dst/old").await.1, b"dst/old");
     assert_eq!(w.s3_get("dst/a").await.1, b"src/a");
     assert!(
@@ -2030,7 +2033,7 @@ fn member_statuses(r: &Got) -> Vec<(String, String)> {
 }
 
 #[tokio::test]
-async fn only_the_unanswered_call_is_a_timeout_and_undispatched_keys_failed_dependencies() {
+async fn only_the_unanswered_call_is_a_timeout_and_undispatched_keys_are_reported() {
     // A quarter lease is one second.
     let w = World::with(Config {
         lease_secs: 4,
@@ -2039,7 +2042,9 @@ async fn only_the_unanswered_call_is_a_timeout_and_undispatched_keys_failed_depe
         ..Config::default()
     })
     .await;
-    for key in ["dst/", "dst/a", "dst/b", "dst/c"] {
+    for key in [
+        "dst/", "dst/a", "dst/b", "dst/c", "dst/e/", "dst/s/", "dst/s/f",
+    ] {
         assert_eq!(w.s3_put(key, b"").await, 200);
     }
     w.storage_fault_target("POST", "/dav?delete=", StorageFault::Hold);
@@ -2051,16 +2056,21 @@ async fn only_the_unanswered_call_is_a_timeout_and_undispatched_keys_failed_depe
     .expect("an unanswered batch held the DELETE");
     r.expect(207);
     let timeout = "HTTP/1.1 504 Gateway Timeout".to_owned();
+    let stopped = "HTTP/1.1 503 Service Unavailable".to_owned();
     let dependency = "HTTP/1.1 424 Failed Dependency".to_owned();
     let mut got = member_statuses(&r);
     got.sort();
+    // RFC 4918 section 9.6.1: no entry for an ancestor of a reported key
+    // (dst/ and dst/s/), and no 424 in a DELETE answer: the keys never
+    // dispatched were not deleted because the request stopped.
     assert_eq!(
         got,
         vec![
-            ("/dav/dst/".to_owned(), dependency.clone()),
             ("/dav/dst/a".to_owned(), timeout.clone()),
-            ("/dav/dst/b".to_owned(), dependency.clone()),
-            ("/dav/dst/c".to_owned(), dependency.clone()),
+            ("/dav/dst/b".to_owned(), stopped.clone()),
+            ("/dav/dst/c".to_owned(), stopped.clone()),
+            ("/dav/dst/e/".to_owned(), stopped.clone()),
+            ("/dav/dst/s/f".to_owned(), stopped.clone()),
         ]
     );
     // The same for the versioned deletes of an overwrite.
@@ -2084,6 +2094,98 @@ async fn only_the_unanswered_call_is_a_timeout_and_undispatched_keys_failed_depe
         "{got:?}"
     );
     assert_eq!(w.s3_get("dst/b").await.1, b"b");
+}
+
+#[tokio::test]
+async fn a_failed_copy_batch_reports_every_member_it_did_not_schedule() {
+    let w = World::with(Config {
+        fan_out: 1,
+        ..Config::default()
+    })
+    .await;
+    for key in ["src/a", "src/b", "src/c", "src/e/"] {
+        assert_eq!(w.s3_put(key, b"").await, 200);
+    }
+    w.storage_fault("PUT", "dst/a", StorageFault::Fail);
+    let r = w
+        .req("COPY", "/dav/src/", &[("destination", "/dav/dst/")], b"")
+        .await;
+    r.expect(207);
+    let dependency = "HTTP/1.1 424 Failed Dependency".to_owned();
+    let mut got = member_statuses(&r);
+    got.sort();
+    // The members after the failed batch, and the root marker that would
+    // have been created after them, were not copied.
+    assert_eq!(
+        got,
+        vec![
+            ("/dav/dst/".to_owned(), dependency.clone()),
+            (
+                "/dav/src/a".to_owned(),
+                "HTTP/1.1 502 Bad Gateway".to_owned()
+            ),
+            ("/dav/src/b".to_owned(), dependency.clone()),
+            ("/dav/src/c".to_owned(), dependency.clone()),
+            ("/dav/src/e/".to_owned(), dependency.clone()),
+        ]
+    );
+    assert_eq!(w.s3_get("dst/b").await.0, 404);
+}
+
+#[tokio::test]
+async fn a_failed_folder_marker_reports_the_markers_it_did_not_schedule() {
+    let w = World::with(Config {
+        fan_out: 1,
+        ..Config::default()
+    })
+    .await;
+    // Only hidden keys: the gateway creates the folders dst/e/, dst/g/
+    // and dst/ as markers.
+    for key in ["src/e//h", "src/g//h"] {
+        assert_eq!(w.s3_put(key, b"hidden").await, 200);
+    }
+    w.storage_fault("PUT", "dst/e/", StorageFault::Fail);
+    let r = w
+        .req("COPY", "/dav/src/", &[("destination", "/dav/dst/")], b"")
+        .await;
+    r.expect(207);
+    let dependency = "HTTP/1.1 424 Failed Dependency".to_owned();
+    let mut got = member_statuses(&r);
+    got.sort();
+    assert_eq!(
+        got,
+        vec![
+            ("/dav/dst/".to_owned(), dependency.clone()),
+            (
+                "/dav/dst/e/".to_owned(),
+                "HTTP/1.1 502 Bad Gateway".to_owned()
+            ),
+            ("/dav/dst/g/".to_owned(), dependency.clone()),
+        ]
+    );
+    assert_eq!(w.s3_get("dst/g/").await.0, 404);
+}
+
+#[tokio::test]
+async fn a_failed_listing_of_the_claimed_root_answers_its_error_and_takes_the_claim_back() {
+    let w = World::new().await;
+    assert_eq!(w.s3_put("src/x", b"source").await, 200);
+    w.storage_fault_target(
+        "GET",
+        "/dav?encoding-type=url&list-type=2&max-keys=2&prefix=dst%2F",
+        StorageFault::Fail,
+    );
+    let r = w
+        .req(
+            "COPY",
+            "/dav/src/",
+            &[("destination", "/dav/dst/"), ("overwrite", "F")],
+            b"",
+        )
+        .await;
+    assert!(r.status >= 500, "{}", r.status);
+    assert_eq!(w.s3_get("dst/").await.0, 404, "the claim marker was left");
+    assert_eq!(w.s3_get("dst/x").await.0, 404);
 }
 
 #[tokio::test]

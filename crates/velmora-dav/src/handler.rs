@@ -1563,7 +1563,7 @@ impl<U: Upstream, S: StatePort> Ctx<'_, U, S> {
                 self.end_write(bucket, &holder, Vec::new()).await;
                 let failed = out.ok_or_else(reservation_busy)??;
                 if !failed.is_empty() {
-                    return Ok(failed_members(bucket, &failed));
+                    return Ok(failed_members(bucket, &delete_report(failed)));
                 }
                 self.keep_folder(bucket, &parent(coll)).await;
                 Ok(status(204))
@@ -1667,7 +1667,8 @@ impl<U: Upstream, S: StatePort> Ctx<'_, U, S> {
     /// batches: each renews the reservation first ([`Ctx::fence`]), each
     /// call is bounded ([`Ctx::bounded`]), and nothing is dispatched after
     /// a call that did not answer in time: its keys are reported as `504`,
-    /// the keys never dispatched as `424 Failed Dependency`.
+    /// the keys never dispatched as `424 Failed Dependency` (a DELETE
+    /// answer reports them as `503`, see [`delete_report`]).
     async fn delete_tree(
         &self,
         bucket: &str,
@@ -2203,7 +2204,8 @@ impl<U: Upstream, S: StatePort> Ctx<'_, U, S> {
             // Materialize empty collections before deleting anything. Only
             // folders represented by a successful copy or marker get props.
             if failed.is_empty() {
-                for chunk in markers.chunks(fan) {
+                let mut chunks = markers.chunks(fan);
+                while let Some(chunk) = chunks.next() {
                     self.fence(bucket, &holder).await?;
                     let results = join_all(chunk.iter().map(|marker| {
                         self.bounded(self.s3.put(
@@ -2234,9 +2236,13 @@ impl<U: Upstream, S: StatePort> Ctx<'_, U, S> {
                         copied_keys.push(marker.clone());
                     }
                     if !failed.is_empty() {
+                        failed.extend(chunks.flatten().map(|marker| (marker.clone(), 424)));
                         break;
                     }
                 }
+            } else {
+                // No folder is created after a failed copy.
+                failed.extend(markers.iter().map(|marker| (marker.clone(), 424)));
             }
             if src_coll && !copied_keys.is_empty() {
                 properties.push(Op::PropCopyFolders {
@@ -2387,7 +2393,7 @@ impl<U: Upstream, S: StatePort> Ctx<'_, U, S> {
 
     /// Copy the preflighted members in batches: each renews the
     /// reservation first, each call is bounded, and no further batch is
-    /// scheduled after a failed one.
+    /// scheduled after a failed one (its members are reported as `424`).
     async fn copy_tree(
         &self,
         bucket: &str,
@@ -2397,7 +2403,8 @@ impl<U: Upstream, S: StatePort> Ctx<'_, U, S> {
         overwrite: bool,
     ) -> Result<TreeCopy, Resp<U::Body>> {
         let mut copied = TreeCopy::default();
-        for batch in members.chunks(self.cfg().fan_out.max(1)) {
+        let mut batches = members.chunks(self.cfg().fan_out.max(1));
+        while let Some(batch) = batches.next() {
             self.fence(bucket, holder).await?;
             let outcomes = join_all(batch.iter().map(|(src, dst)| async move {
                 let marker_etag = src.key.ends_with('/').then_some(src.etag.as_str());
@@ -2438,6 +2445,11 @@ impl<U: Upstream, S: StatePort> Ctx<'_, U, S> {
                 }
             }
             if !copied.failed.is_empty() {
+                // A member never scheduled was not copied (RFC 4918
+                // section 11.4).
+                copied
+                    .failed
+                    .extend(batches.flatten().map(|(src, _)| (src.key.clone(), 424)));
                 break;
             }
         }
@@ -3055,6 +3067,25 @@ fn too_many<B>(cap: usize) -> Resp<B> {
 /// `207` naming the members that failed.
 fn reservation_busy<B>() -> Resp<B> {
     status(503).with_header("retry-after", "2")
+}
+
+/// The members of a DELETE `207` (RFC 4918 section 9.6.1): no entry for
+/// a marker that is an ancestor of another reported key (the Request-URI's
+/// own marker among them), since a client infers it from the descendant,
+/// and no `424`: a key never dispatched is reported as `503`, as the
+/// request stopped and can be retried.
+fn delete_report(failed: Vec<(String, u16)>) -> Vec<(String, u16)> {
+    let ancestor = |key: &str| {
+        key.ends_with('/')
+            && failed
+                .iter()
+                .any(|(other, _)| other.len() > key.len() && other.starts_with(key))
+    };
+    failed
+        .iter()
+        .filter(|(key, _)| !ancestor(key))
+        .map(|(key, code)| (key.clone(), if *code == 424 { 503 } else { *code }))
+        .collect()
 }
 
 fn failed_members<B>(bucket: &str, failed: &[(String, u16)]) -> Resp<B> {
