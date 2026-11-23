@@ -734,6 +734,17 @@ mod tests {
     #[test]
     fn disconnect_drops_the_pending_pull_before_draining_its_open() {
         use futures_util::Stream;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        use std::task::{Wake, Waker};
+
+        #[derive(Default)]
+        struct PullWake(AtomicBool);
+        impl Wake for PullWake {
+            fn wake(self: Arc<Self>) {
+                self.0.store(true, Ordering::Relaxed);
+            }
+        }
 
         let clock = TestClock::default();
         let done = BodyDone::default();
@@ -753,12 +764,20 @@ mod tests {
         let mut wait =
             std::pin::pin!(wait_for_detached_opens(done.clone().wait(), |d| clock.delay(d)));
         let mut cx = std::task::Context::from_waker(futures_util::task::noop_waker_ref());
+        let pull_woke = Arc::new(PullWake::default());
+        let pull_waker = Waker::from(Arc::clone(&pull_woke));
+        let mut pull_cx = std::task::Context::from_waker(&pull_waker);
 
         assert!(wait.as_mut().poll(&mut cx).is_pending());
-        assert!(body.as_mut().poll_next(&mut cx).is_pending());
+        assert!(body.as_mut().poll_next(&mut pull_cx).is_pending());
         assert_eq!(DETACHED_OPENS.get(), 1);
         assert_eq!(Rc::strong_count(&pull_lifetime), 2);
+        assert!(!pull_woke.0.load(Ordering::Relaxed));
         done.abort();
+        assert!(
+            pull_woke.0.load(Ordering::Relaxed),
+            "abort did not wake the pending body pull"
+        );
         assert_eq!(
             Rc::strong_count(&pull_lifetime),
             1,
