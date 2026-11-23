@@ -135,6 +135,19 @@ struct Spool {
     size_carried: bool,
     /// `OVER <message-id>` answers `224` with no line.
     over_empty: bool,
+    /// While true, a `BODY` of an article that exists waits before it is
+    /// answered (a read that is under way).
+    hold_bodies: bool,
+    /// `BODY` commands for an article that exists, since the start.
+    bodies_asked: usize,
+    /// While set, a `BODY` that is counted past this many waits as with
+    /// `hold_bodies`.
+    hold_bodies_after: Option<usize>,
+    /// While true, an `AUTHINFO PASS` waits before it is answered (a
+    /// connection that is being opened).
+    hold_logins: bool,
+    /// `AUTHINFO PASS` commands that are waiting now.
+    logins_held: usize,
 }
 
 struct Shared {
@@ -171,6 +184,11 @@ impl Shared {
             reported_size: None,
             size_carried: false,
             over_empty: false,
+            hold_bodies: false,
+            bodies_asked: 0,
+            hold_bodies_after: None,
+            hold_logins: false,
+            logins_held: 0,
         };
         Self {
             config,
@@ -390,6 +408,35 @@ impl TestNntpServer {
         self.shared.spool.lock().await.late_bodies = n;
     }
 
+    /// While set, a `BODY` of an article that exists is counted and then
+    /// waits, unanswered, until this is cleared: a read that is under way.
+    pub async fn set_hold_bodies(&self, hold: bool) {
+        self.shared.spool.lock().await.hold_bodies = hold;
+    }
+
+    /// While set, an `AUTHINFO PASS` waits, unanswered, until this is
+    /// cleared: a connection that is being opened.
+    pub async fn set_hold_logins(&self, hold: bool) {
+        self.shared.spool.lock().await.hold_logins = hold;
+    }
+
+    /// How many `AUTHINFO PASS` commands are waiting now.
+    pub async fn logins_held(&self) -> usize {
+        self.shared.spool.lock().await.logins_held
+    }
+
+    /// While set to `Some(n)`, a `BODY` that is counted past the first
+    /// `n` (see [`Self::bodies_asked`]) waits as with
+    /// [`Self::set_hold_bodies`] until this is cleared.
+    pub async fn set_hold_bodies_after(&self, n: Option<usize>) {
+        self.shared.spool.lock().await.hold_bodies_after = n;
+    }
+
+    /// How many `BODY` commands asked for an article that exists.
+    pub async fn bodies_asked(&self) -> usize {
+        self.shared.spool.lock().await.bodies_asked
+    }
+
     /// While set, `BODY` answers `430` for posted articles although `STAT`
     /// answers `223` for them (a provider that still lists an article it
     /// no longer serves).
@@ -520,6 +567,16 @@ async fn handle_connection(
                     pending_user = Some(user);
                     let _ = writer.write_all(b"381 Password required\r\n").await;
                 } else if upper.starts_with("PASS ") {
+                    if shared.spool.lock().await.hold_logins {
+                        shared.spool.lock().await.logins_held += 1;
+                        while shared.spool.lock().await.hold_logins && !*shutdown.borrow() {
+                            tokio::time::sleep(Duration::from_millis(2)).await;
+                        }
+                        shared.spool.lock().await.logins_held -= 1;
+                        if *shutdown.borrow() {
+                            break;
+                        }
+                    }
                     let pass = arg[5..].trim();
                     // RFC 4643 s2.3.2: PASS with no preceding USER is out
                     // of sequence (482), not a credential failure (481).
@@ -738,6 +795,28 @@ async fn handle_connection(
                     let _ = writer.write_all(b"430 No such article\r\n").await;
                     continue;
                 };
+                if cmd.as_str() == "BODY" {
+                    let ordinal = {
+                        let mut spool = shared.spool.lock().await;
+                        spool.bodies_asked += 1;
+                        spool.bodies_asked
+                    };
+                    let held = |spool: &Spool| {
+                        spool.hold_bodies || spool.hold_bodies_after.is_some_and(|n| ordinal > n)
+                    };
+                    while held(&*shared.spool.lock().await) {
+                        let aborted = tokio::select! {
+                            _ = shutdown.changed() => true,
+                            _ = tokio::time::sleep(Duration::from_millis(2)) => false,
+                        };
+                        if aborted || *shutdown.borrow() {
+                            break;
+                        }
+                    }
+                    if *shutdown.borrow() {
+                        break;
+                    }
+                }
                 if shared.config.latency_ms > 0 {
                     let aborted = tokio::select! {
                         _ = shutdown.changed() => true,

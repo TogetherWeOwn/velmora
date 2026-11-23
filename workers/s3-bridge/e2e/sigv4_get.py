@@ -1,7 +1,9 @@
 """SigV4 GET with a signed Accept-Encoding (what rclone sends by default).
 
 aws-cli never signs Accept-Encoding, so slice.sh uses this for the one case.
-Usage: sigv4_get.py <base-url> <bucket/key> <signed-ae> <sent-ae> <out-file>
+Usage: sigv4_get.py <base-url> <bucket/key> <signed-ae> <sent-ae> <out-file> [<abort-range>]
+With an abort range (e.g. bytes=0-99), it resets the connection after reading
+one byte of the partial response instead of writing to <out-file>.
 Credentials: the [default] profile of AWS_SHARED_CREDENTIALS_FILE, read here
 and never printed. TLS trust: AWS_CA_BUNDLE when set. Prints only
 "<status> <error code or ->"; the body goes to <out-file>.
@@ -14,13 +16,16 @@ import hashlib
 import hmac
 import http.client
 import os
+import socket
 import ssl
+import struct
 import sys
 import urllib.parse
 
 
 def main():
     base, path, signed_ae, sent_ae, out = sys.argv[1:6]
+    abort_range = sys.argv[6] if len(sys.argv) == 7 else None
     # No interpolation (a `%` in a secret is literal), and no exception text:
     # a parse error could quote part of the file, and slice.sh prints stderr.
     try:
@@ -44,6 +49,8 @@ def main():
         "x-amz-content-sha256": payload,
         "x-amz-date": stamp,
     }
+    if abort_range is not None:
+        signed["range"] = abort_range
     names = sorted(signed)
     canonical = "\n".join(
         ["GET", raw_path, "", "".join(f"{n}:{signed[n]}\n" for n in names), ";".join(names), payload]
@@ -65,6 +72,8 @@ def main():
     conn.putrequest("GET", raw_path, skip_host=True, skip_accept_encoding=True)
     conn.putheader("host", host)
     conn.putheader("accept-encoding", sent_ae)
+    if abort_range is not None:
+        conn.putheader("range", abort_range)
     conn.putheader("x-amz-content-sha256", payload)
     conn.putheader("x-amz-date", stamp)
     conn.putheader(
@@ -72,7 +81,18 @@ def main():
         f"AWS4-HMAC-SHA256 Credential={akid}/{scope}, SignedHeaders={';'.join(names)}, Signature={signature}",
     )
     conn.endheaders()
+    if abort_range is not None:
+        # A reset tells the server immediately that we will not receive more.
+        # Set this before getresponse(), which can hand the socket to resp.
+        conn.sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
     resp = conn.getresponse()
+    if abort_range is not None:
+        if resp.status != 206 or not resp.read(1):
+            sys.exit(f"expected a partial response with at least one byte, got HTTP {resp.status}")
+        resp.close()
+        conn.close()
+        print("206: received the first body byte and disconnected")
+        return
     body = resp.read()
     with open(out, "wb") as f:
         f.write(body)

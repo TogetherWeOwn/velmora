@@ -11,7 +11,7 @@ use core::pin::Pin;
 use core::task::{Context, Poll, Waker};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use futures_util::future::{poll_fn, select, Either, FutureExt, LocalBoxFuture};
@@ -27,7 +27,7 @@ use crate::fetch::{
     cold_fetch_bytes, cold_poll_ms, cold_read_bytes, cold_step_bytes, ColdFetch, ColdReader,
     COLD_WAIT_MS,
 };
-use crate::ingress::{ByteBudget, Charge, Spawner, CHARGE_WAIT_MS};
+use crate::ingress::{ByteBudget, Charge, Sleeper, Spawner, CHARGE_WAIT_MS};
 use crate::ports::{BlobStore, Bridge, Catalog, Clock, JobSink, Kek, NntpConnector};
 use crate::types::{
     BridgeError, Bucket, ByteSpan, ExtentId, ExtentRow, RespBody, Result, S3Request, S3Response,
@@ -457,9 +457,11 @@ async fn body<
     // sees a body shorter than Content-Length.
     let bridge = Rc::clone(bridge);
     let spawner = bridge.budget.spawner().cloned();
+    let sleeper = bridge.budget.sleeper().cloned();
     let mut items = driven(spawner.as_ref(), move |out| {
         relay(bridge, bucket, todo, out)
-    });
+    })
+    .cut_off_with(sleeper);
     // The first piece is produced before the status line goes out, so an
     // object that cannot be read is an error response, not a cut-off 200.
     let first = match items.next().await {
@@ -494,8 +496,58 @@ struct Shared<T> {
     task: RefCell<Option<Waker>>,
     /// The reader asked for an item and found none: it is waiting.
     wanted: Cell<bool>,
-    /// The future runs as a task of the host.
-    spawned: bool,
+    /// The stream was dropped while its spawned future still ran: nobody
+    /// takes an item any more ([`Out::gone`]).
+    gone: Rc<Cell<bool>>,
+    /// Counts the future in [`detached_bodies`] from the drop of its
+    /// stream until it returns.
+    detached: RefCell<Option<Detached>>,
+    /// The timer of [`DETACHED_BODY_MS`], if the host has one.
+    sleeper: RefCell<Option<Sleeper>>,
+    /// Runs from the drop of the stream: when it ends, a future still
+    /// running is dropped.
+    cutoff: RefCell<Option<LocalBoxFuture<'static, ()>>>,
+}
+
+/// How long a body future may run on after its stream was dropped
+/// ([`Driven`]) before it is dropped with all it holds: its connections,
+/// slots and budget charges. Just under the 30 s a host waits for
+/// detached work after a response: work under way gets all of that
+/// wait, and the drop still runs while the invocation is alive. A future
+/// the runtime stopped polling later would keep its charges for the life
+/// of the isolate. A read of one extent and its cache write take a few
+/// seconds.
+pub const DETACHED_BODY_MS: u32 = 29_000;
+
+thread_local! {
+    static DETACHED_BODIES: Cell<usize> = const { Cell::new(0) };
+}
+
+/// How many body futures of this isolate run on after their stream was
+/// dropped (a client that went away): each finishes the extent it was
+/// reading from Usenet and its cache write, and starts no other read.
+/// A host that ends an invocation once its response is done waits while
+/// this is not zero (bounded by its own cleanup timeout), or the runtime
+/// would cancel a cache write of verified bytes halfway.
+pub fn detached_bodies() -> usize {
+    DETACHED_BODIES.with(Cell::get)
+}
+
+/// One count in [`detached_bodies`], given back exactly once, when it is
+/// dropped.
+struct Detached;
+
+impl Detached {
+    fn start() -> Self {
+        DETACHED_BODIES.with(|n| n.set(n.get() + 1));
+        Self
+    }
+}
+
+impl Drop for Detached {
+    fn drop(&mut self) {
+        DETACHED_BODIES.with(|n| n.set(n.get() - 1));
+    }
 }
 
 impl<T> Shared<T> {
@@ -522,19 +574,32 @@ impl<T> Shared<T> {
 /// The hand-over from the future that produces a body to the stream that
 /// carries it: one item at a time.
 struct Out<T> {
-    shared: Rc<Shared<T>>,
+    /// Weak: the future that holds this lives in `Shared::work`, and a
+    /// strong count would keep a future whose task the host dropped, and
+    /// its count in [`detached_bodies`], for the life of the isolate.
+    /// Gone means the stream and the task are both gone.
+    shared: Weak<Shared<T>>,
+    gone: Rc<Cell<bool>>,
+    spawned: bool,
 }
 
 impl<T> Out<T> {
     /// Hands `item` to the stream and returns once it was taken. The
     /// future is polled again after that: by the stream when it is asked
-    /// for the next item, or by its task, which the stream wakes.
+    /// for the next item, or by its task, which the stream wakes. Once the
+    /// stream is [`gone`](Self::gone) the item is dropped at once.
     async fn send(&self, item: T) {
-        self.shared.wanted.set(false);
-        *self.shared.slot.borrow_mut() = Some(item);
-        poll_fn(|_| match self.shared.slot.borrow().is_some() {
-            true => Poll::Pending,
-            false => Poll::Ready(()),
+        match self.shared.upgrade() {
+            Some(shared) if !self.gone() => {
+                shared.wanted.set(false);
+                *shared.slot.borrow_mut() = Some(item);
+            }
+            _ => return,
+        }
+        // Not held across the wait: see `shared`.
+        poll_fn(|_| match self.shared.upgrade() {
+            Some(shared) if shared.slot.borrow().is_some() => Poll::Pending,
+            _ => Poll::Ready(()),
         })
         .await;
     }
@@ -549,19 +614,40 @@ impl<T> Out<T> {
         if let Either::Left(_) = select(sent, patience).await {
             return true;
         }
-        let back = self.shared.slot.borrow_mut().take();
+        let back = self
+            .shared
+            .upgrade()
+            .and_then(|shared| shared.slot.borrow_mut().take());
         back.is_none()
     }
 
     /// Whether the future runs ahead of its reader, as a task of the
     /// host. Otherwise it runs only while the reader asks.
     fn ahead(&self) -> bool {
-        self.shared.spawned
+        self.spawned
     }
 
-    /// Whether the reader is waiting for an item now.
+    /// Whether the reader is waiting for an item now. A reader that is
+    /// gone waits for nothing, so nothing waits for it either.
     fn is_wanted(&self) -> bool {
-        self.shared.wanted.get()
+        self.gone()
+            || self
+                .shared
+                .upgrade()
+                .is_none_or(|shared| shared.wanted.get())
+    }
+
+    /// Whether the stream was dropped while this future still ran: what
+    /// it sends is dropped, and it should end the work under way and
+    /// start nothing new.
+    fn gone(&self) -> bool {
+        self.gone.get()
+    }
+
+    /// The flag behind [`Self::gone`], for work that outlives a borrow
+    /// of this.
+    fn gone_flag(&self) -> Rc<Cell<bool>> {
+        Rc::clone(&self.gone)
     }
 
     /// Returns once the reader is waiting for an item.
@@ -583,8 +669,13 @@ impl<T> Out<T> {
 /// while the reader is busy with the one it took (a client takes about as
 /// long to receive an extent as Usenet takes to deliver the next).
 ///
-/// Dropping the stream drops the future and the waiting item right then,
-/// spawned or not: nothing they hold outlives the body.
+/// Dropping the stream drops the waiting item right then. Without a
+/// spawner it drops the future too: nothing it holds outlives the body.
+/// A spawned future that has not returned is told its reader is
+/// [`gone`](Out::gone) and runs on as its task, counted in
+/// [`detached_bodies`] until it returns: the body of a GET finishes the
+/// Usenet read and the cache write under way that way, and starts no
+/// other read (owner decision: a fill survives a client that goes away).
 struct Driven<T> {
     shared: Rc<Shared<T>>,
     spawned: bool,
@@ -600,10 +691,15 @@ fn driven<T: 'static, F: Future<Output = ()> + 'static>(
         reader: RefCell::new(None),
         task: RefCell::new(None),
         wanted: Cell::new(false),
-        spawned: spawner.is_some(),
+        gone: Rc::new(Cell::new(false)),
+        detached: RefCell::new(None),
+        sleeper: RefCell::new(None),
+        cutoff: RefCell::new(None),
     });
     let work = make(Out {
-        shared: Rc::clone(&shared),
+        shared: Rc::downgrade(&shared),
+        gone: Rc::clone(&shared.gone),
+        spawned: spawner.is_some(),
     });
     *shared.work.borrow_mut() = Some(work.boxed_local());
     if let Some(spawn) = spawner {
@@ -611,8 +707,27 @@ fn driven<T: 'static, F: Future<Output = ()> + 'static>(
         spawn(
             poll_fn(move |cx| {
                 *shared.task.borrow_mut() = Some(cx.waker().clone());
+                let cut = {
+                    let mut cutoff = shared.cutoff.borrow_mut();
+                    cutoff
+                        .as_mut()
+                        .is_some_and(|timer| timer.as_mut().poll(cx).is_ready())
+                };
+                if cut {
+                    // Ran on too long without its reader: dropped, after
+                    // the borrows ended.
+                    drop(shared.cutoff.borrow_mut().take());
+                    let work = shared.work.borrow_mut().take();
+                    drop(work);
+                }
                 shared.run(cx);
                 let over = shared.work.borrow().is_none();
+                if over {
+                    // A future that ran on without its reader is done:
+                    // its count goes, once.
+                    let detached = shared.detached.borrow_mut().take();
+                    drop(detached);
+                }
                 if over || shared.slot.borrow().is_some() {
                     Shared::<T>::wake(&shared.reader);
                 }
@@ -627,6 +742,16 @@ fn driven<T: 'static, F: Future<Output = ()> + 'static>(
     Driven {
         shared,
         spawned: spawner.is_some(),
+    }
+}
+
+impl<T> Driven<T> {
+    /// A future that runs on without its reader is dropped
+    /// [`DETACHED_BODY_MS`] after the stream, on this timer. Without one
+    /// it runs to its end.
+    fn cut_off_with(self, sleeper: Option<Sleeper>) -> Self {
+        *self.shared.sleeper.borrow_mut() = sleeper;
+        self
     }
 }
 
@@ -668,14 +793,33 @@ impl<T> Stream for Driven<T> {
 
 impl<T> Drop for Driven<T> {
     fn drop(&mut self) {
-        // Taken out first: what the future holds is dropped after the
-        // borrow ended.
-        let work = self.shared.work.borrow_mut().take();
-        drop(work);
-        let item = self.shared.slot.borrow_mut().take();
+        let shared = &self.shared;
+        // Nobody wakes for an item any more.
+        drop(shared.reader.borrow_mut().take());
+        if self.spawned && shared.work.borrow().is_some() {
+            // Counted before anything else can run: a host that waits
+            // for detached work checks right after the stream is gone.
+            *shared.detached.borrow_mut() = Some(Detached::start());
+            shared.gone.set(true);
+            let cutoff = shared
+                .sleeper
+                .borrow()
+                .as_ref()
+                .map(|sleep| sleep(DETACHED_BODY_MS));
+            *shared.cutoff.borrow_mut() = cutoff;
+        } else {
+            // Taken out first: what the future holds is dropped after
+            // the borrow ended.
+            let work = shared.work.borrow_mut().take();
+            drop(work);
+        }
+        // Nobody takes it: what it holds goes now. A future that waits
+        // in `send` for it to be taken goes on.
+        let item = shared.slot.borrow_mut().take();
         drop(item);
-        // The task finds its future gone and ends.
-        Shared::<T>::wake(&self.shared.task);
+        // The task runs its future on without a reader, or finds it gone
+        // and ends.
+        Shared::<T>::wake(&shared.task);
     }
 }
 
@@ -710,6 +854,7 @@ async fn relay<C, B, N, J, K, T>(
     T: Clock,
 {
     let mut cold = Cold::new(&bridge);
+    cold.gone = out.gone_flag();
     let last = todo.len() - 1;
     let timer = bridge.budget.sleeper();
     // Whether pieces are produced ahead of the reader: on a host that
@@ -726,6 +871,14 @@ async fn relay<C, B, N, J, K, T>(
                 // piece nor a provider slot.
                 cold.end().await;
                 out.wanted().await;
+            }
+            if out.gone() {
+                // The reader went away: no other extent is read for it.
+                // What was under way when it went (a read from Usenet and
+                // its cache write, or the cache write of the piece it did
+                // not take) has ended, or ends here.
+                cold.end().await;
+                return;
             }
             cold.mid = at > 0;
             let item = cold.piece(&bucket, piece).await;
@@ -875,6 +1028,33 @@ fn open<K: Kek>(kek: &K, bucket: &Bucket, piece: &Piece, base: u64, src: &[u8]) 
     (n == plain.len()).then_some(plain)
 }
 
+/// Bytes of plaintext a piece is authenticated in at a time when nobody
+/// takes it ([`authentic`]).
+const CHECK_WINDOW: usize = 64 * 1024;
+
+/// Whether every chunk of `piece` in the whole extent's ciphertext `src`
+/// authenticates, as [`open`] would find, without holding its plaintext:
+/// it is opened one window at a time into one small buffer.
+fn authentic<K: Kek>(kek: &K, bucket: &Bucket, piece: &Piece, src: &[u8]) -> bool {
+    let Ok(bdk) = unwrap_bdk(kek, bucket.kek_version, &bucket.id, &bucket.bdk_wrapped) else {
+        return false;
+    };
+    let Ok(len) = usize::try_from(piece.len) else {
+        return false;
+    };
+    let mut buf = vec![0u8; len.min(CHECK_WINDOW)];
+    let mut done = 0usize;
+    while done < len {
+        let n = (len - done).min(CHECK_WINDOW);
+        let off = piece.off + done as u64;
+        match open_range(&bdk, &bucket.id, &piece.extent, 0, src, off, &mut buf[..n]) {
+            Ok(got) if got == n => done += n,
+            _ => return false,
+        }
+    }
+    true
+}
+
 /// A blob-store read of exactly `span`. A missing, short or failing read
 /// is a miss.
 async fn warm<B: BlobStore>(store: &B, key: &str, span: ByteSpan) -> Option<Vec<u8>> {
@@ -960,6 +1140,24 @@ where
     /// When the wait of the piece being made for a provider ends, once
     /// it has begun: no wait for room is begun after it.
     until: Option<UnixMs>,
+    /// The reader of the body went away ([`Out::gone`]): no read from
+    /// Usenet is begun any more, and a wait for room or for a slot ends.
+    /// A read that is under way and the cache write of what it read are
+    /// let finish.
+    gone: Rc<Cell<bool>>,
+}
+
+/// `f`, or `None` once `gone` is set. Only for waits a reader that went
+/// away has no use for: never a read from Usenet or a cache write. The
+/// task that runs the body is woken when `gone` is set, and this is
+/// polled again then.
+async fn unless_gone<F: Future>(gone: &Cell<bool>, f: F) -> Option<F::Output> {
+    let mut f = core::pin::pin!(f);
+    poll_fn(|cx| match gone.get() {
+        true => Poll::Ready(None),
+        false => f.as_mut().poll(cx).map(Some),
+    })
+    .await
 }
 
 /// How many times a body that has begun waits
@@ -1014,6 +1212,7 @@ where
             room: Rc::new(bridge.budget.for_request()),
             mid: false,
             until: None,
+            gone: Rc::default(),
         }
     }
 
@@ -1026,12 +1225,18 @@ where
             let ms = &self.spent;
             crate::trace::cold_read(|| {
                 format!(
-                    "{stats} warm_ms={} read_ms={} wait_ms={} send_ms={} put_ms={}",
+                    "{stats} warm_ms={} read_ms={} wait_ms={} send_ms={} put_ms={}{}",
                     ms.warm.get(),
                     ms.read.get(),
                     ms.wait.get(),
                     ms.send.get(),
-                    ms.put.get()
+                    ms.put.get(),
+                    // Ended after its reader went away.
+                    if self.gone.get() {
+                        " reader_gone=1"
+                    } else {
+                        ""
+                    }
                 )
             });
         }
@@ -1039,8 +1244,12 @@ where
 
     /// Lets the cache write end, then the connections (or the
     /// connections first, if the write takes longer than their slots
-    /// allow).
+    /// allow). Once the reader of the body is gone, the connections are
+    /// ended first: no further extent is read on them.
     async fn end(&mut self) {
+        if self.gone.get() {
+            self.hang_up().await;
+        }
         self.settle().await;
         self.hang_up().await;
     }
@@ -1075,17 +1284,30 @@ where
     }
 
     /// Lets the cache write end, with the connections watched as in
-    /// [`Self::wait`].
+    /// [`Self::wait`]. Once the reader of the body is gone, the
+    /// connections are ended as soon as it goes, not when the write ends.
     async fn settle(&mut self) {
         if let (Some(limit), Some(put)) = (self.limit(), self.put.as_mut()) {
-            if matches!(select(put, limit).await, Either::Left(_)) {
+            let gone = Rc::clone(&self.gone);
+            let stop = async move {
+                let left = core::pin::pin!(poll_fn(|_| match gone.get() {
+                    true => Poll::Ready(()),
+                    false => Poll::Pending,
+                }));
+                let _ = select(limit, left).await;
+            };
+            if matches!(select(put, core::pin::pin!(stop)).await, Either::Left(_)) {
                 self.put = None;
                 return;
             }
             self.hang_up().await;
         }
-        if let Some(writing) = self.put.take() {
+        // Awaited where it is: a caller that is cancelled meanwhile (a
+        // wait that ends when the reader goes) leaves the write in place,
+        // for `end` to finish.
+        if let Some(writing) = self.put.as_mut() {
             writing.await;
+            self.put = None;
         }
     }
 
@@ -1104,21 +1326,31 @@ where
             return Ok(charge);
         }
         let spent = Rc::clone(&self.spent);
+        let gone = Rc::clone(&self.gone);
         let began = bridge.clock.now();
         self.settle().await;
-        let mut room = self.wait(budget.charge_in_turn(need)).await;
+        let mut room = self
+            .wait(unless_gone(&gone, budget.charge_in_turn(need)))
+            .await;
         let mut waits = 1;
-        while room.is_err() && self.mid && waits < MID_BODY_WAITS {
+        while matches!(room, Some(Err(_))) && self.mid && waits < MID_BODY_WAITS {
             if self.until.is_some_and(|end| bridge.clock.now() >= end) {
                 break;
             }
-            room = self.wait(budget.charge_in_turn(need)).await;
+            room = self
+                .wait(unless_gone(&gone, budget.charge_in_turn(need)))
+                .await;
             waits += 1;
         }
         spent
             .wait
             .set(spent.wait.get() + bridge.clock.now().0 - began.0);
-        room.map_err(|_| ReadFail::Busy)
+        // A reader that went away needs no room: as busy, which nobody
+        // sees.
+        match room {
+            Some(Ok(charge)) => Ok(charge),
+            Some(Err(_)) | None => Err(ReadFail::Busy),
+        }
     }
 
     /// Room for reading one extent: all of `need` when no cache write
@@ -1201,19 +1433,37 @@ where
         Err(ReadFail::Unavailable)
     }
 
+    /// Starts the cache write of verified ciphertext, under `copy`, its
+    /// charge, which ends with the write. One write at a time: the one
+    /// before has settled.
+    fn write(&mut self, extent: &ExtentRow, cipher: Vec<u8>, copy: Charge) {
+        let bridge = self.bridge;
+        let (extent, spent) = (extent.clone(), Rc::clone(&self.spent));
+        let write = async move {
+            // Verified already: a cache that does not take the copy does
+            // not fail the read.
+            let fill = bridge.cache_fill(&extent, cipher);
+            let _ = Spent::time(&bridge.clock, &spent.put, fill).await;
+            drop(copy);
+        };
+        self.put = Some(write.boxed_local());
+    }
+
     async fn piece(&mut self, bucket: &Bucket, piece: &Piece) -> Item {
         let bridge = self.bridge;
         let extent = &piece.extent;
         self.until = None;
         let span =
             cipher_span(extent.plain_size, piece.off, piece.len).ok_or(ReadFail::Internal)?;
-        match self.warm(bucket, piece, span).await {
-            Err(ReadFail::Unavailable) => {}
-            found => {
+        let gone = Rc::clone(&self.gone);
+        match unless_gone(&gone, self.warm(bucket, piece, span)).await {
+            Some(Err(ReadFail::Unavailable)) => {}
+            Some(found) => {
                 // Idle connections would outlive their slots.
                 self.hang_up().await;
                 return found;
             }
+            None => return Err(ReadFail::Busy),
         }
 
         // Cold: the whole extent comes back verified against the
@@ -1246,9 +1496,21 @@ where
         let mut attempt = 0u64;
         let mut interrupted = 0u32;
         loop {
+            // A read from Usenet is begun only for a reader that is
+            // there. One that was begun before it went away is let
+            // finish below, verified and written to the cache.
+            if gone.get() {
+                return Err(ReadFail::Busy);
+            }
             let reader = match &mut self.reader {
                 Some(reader) => reader,
-                none => none.insert(bridge.cold_reader().map_err(|_| ReadFail::Internal)?),
+                none => {
+                    let mut reader = bridge.cold_reader().map_err(|_| ReadFail::Internal)?;
+                    // An extent whose first BODY was not sent when the
+                    // reader of the body went away is not begun.
+                    reader.stop_with(Rc::clone(&gone));
+                    none.insert(reader)
+                }
             };
             let fetched = Spent::time(&bridge.clock, &self.spent.read, reader.fetch(extent));
             let read = beside(&mut self.put, fetched).await;
@@ -1259,6 +1521,22 @@ where
                     self.settle().await;
                     let waited = bridge.clock.now().0 - began.0;
                     self.spent.wait.set(self.spent.wait.get() + waited);
+                    if gone.get() {
+                        // Nobody takes the piece: no plaintext is made,
+                        // so the read needs no more room than it holds,
+                        // which covers the ciphertext. Its chunks of the
+                        // piece are authenticated all the same, in a
+                        // small buffer inside that charge, before the
+                        // extent is written to the cache.
+                        if !authentic(&bridge.kek, bucket, piece, &cipher) {
+                            return Err(ReadFail::Unavailable);
+                        }
+                        drop(work);
+                        if let Some(copy) = room.try_charge(cipher.len() as u64) {
+                            self.write(extent, cipher, copy);
+                        }
+                        return Err(ReadFail::Busy);
+                    }
                     // What a read beside that write left uncharged. The
                     // write has released as much, but another request
                     // may have taken it. Then the extent is given up
@@ -1289,15 +1567,7 @@ where
                         .try_charge(plain.len() as u64)
                         .ok_or(ReadFail::Internal)?;
                     if let Some(copy) = room.try_charge(cipher.len() as u64) {
-                        let (extent, spent) = (extent.clone(), Rc::clone(&self.spent));
-                        let write = async move {
-                            // Verified already: a cache that does not
-                            // take the copy does not fail the read.
-                            let fill = bridge.cache_fill(&extent, cipher);
-                            let _ = Spent::time(&bridge.clock, &spent.put, fill).await;
-                            drop(copy);
-                        };
-                        self.put = Some(write.boxed_local());
+                        self.write(extent, cipher, copy);
                     }
                     return Ok((plain, held));
                 }
@@ -1310,6 +1580,10 @@ where
                 Ok(ColdFetch::Unavailable) => return Err(ReadFail::Unavailable),
                 Err(_) => return Err(ReadFail::Internal),
             }
+            // A reader that went away is not read for again.
+            if gone.get() {
+                return Err(ReadFail::Busy);
+            }
             // Nothing is held while waiting: neither slots nor budget.
             self.hang_up().await;
             drop(work);
@@ -1321,7 +1595,12 @@ where
                 attempt += 1;
                 let seed = (bridge.clock.now().0 as u64) ^ waiter.rotate_left(32) ^ attempt;
                 let ms = cold_poll_ms(seed);
-                beside(&mut self.put, sleep(ms)).await;
+                if beside(&mut self.put, unless_gone(&gone, sleep(ms)))
+                    .await
+                    .is_none()
+                {
+                    return Err(ReadFail::Busy);
+                }
                 slept = slept.saturating_add(ms);
                 // Until there is room for the read, which is released
                 // again here: what follows takes what it needs.
@@ -1340,18 +1619,19 @@ where
                         Either::Right(_) => None,
                     }
                 };
-                match beside(&mut self.put, listed).await {
-                    Some(true) => break,
-                    Some(false) => {}
-                    None => return Err(ReadFail::Busy),
+                match beside(&mut self.put, unless_gone(&gone, listed)).await {
+                    Some(Some(true)) => break,
+                    Some(Some(false)) => {}
+                    Some(None) | None => return Err(ReadFail::Busy),
                 }
                 // The clock may stand still: the wait is counted too.
                 slept = slept.saturating_add(CHARGE_WAIT_MS);
             }
             // Another reader may have filled the cache in the meantime.
-            match self.warm(bucket, piece, span).await {
-                Err(ReadFail::Unavailable) => {}
-                found => return found,
+            match unless_gone(&gone, self.warm(bucket, piece, span)).await {
+                Some(Err(ReadFail::Unavailable)) => {}
+                Some(found) => return found,
+                None => return Err(ReadFail::Busy),
             }
             if bridge.clock.now() >= deadline {
                 return Err(ReadFail::Busy);
@@ -1601,59 +1881,162 @@ mod tests {
         assert_eq!(pull_with(&mut items, &reader), Poll::Ready(None));
     }
 
-    /// Dropping the stream drops the spawned future and the item that
-    /// waits right then, not when the host next runs the task.
-    #[test]
-    fn a_spawned_stream_that_is_dropped_takes_its_future_along() {
-        /// Says when it was dropped.
-        struct Held(Rc<Cell<u32>>);
-        impl Drop for Held {
-            fn drop(&mut self) {
-                self.0.set(self.0.get() + 1);
-            }
+    /// Says when it was dropped.
+    struct Held(Rc<Cell<u32>>);
+    impl Drop for Held {
+        fn drop(&mut self) {
+            self.0.set(self.0.get() + 1);
         }
+    }
+
+    /// Dropping the stream drops the item that waits right then. The
+    /// spawned future is told its reader is gone and runs on as its task,
+    /// counted as detached until it returns; what it sends after that is
+    /// dropped at once.
+    #[test]
+    fn a_spawned_stream_that_is_dropped_lets_its_future_finish() {
         let host = Host::default();
         let dropped = Rc::new(Cell::new(0u32));
-        let done = Rc::new(Cell::new(false));
-        let (in_item, in_future) = (Held(Rc::clone(&dropped)), Held(Rc::clone(&dropped)));
-        let ended = Rc::clone(&done);
+        let saw_gone = Rc::new(Cell::new(false));
+        let (first, second) = (Held(Rc::clone(&dropped)), Held(Rc::clone(&dropped)));
+        let in_future = Held(Rc::clone(&dropped));
+        let saw = Rc::clone(&saw_gone);
         let items = Box::pin(driven(
             Some(&host.spawner()),
             move |out: Out<Held>| async move {
                 let _held = in_future;
-                out.send(in_item).await;
-                ended.set(true);
+                out.send(first).await;
+                saw.set(out.gone() && out.is_wanted());
+                out.send(second).await;
             },
         ));
         host.turn();
         assert_eq!(dropped.get(), 0);
-        assert_eq!(host.running(), 1);
+        assert_eq!(detached_bodies(), 0);
         drop(items);
-        assert_eq!(dropped.get(), 2, "the item and what the future held");
-        assert_eq!(host.woken.times(), 1, "the task is woken to end");
+        assert_eq!(dropped.get(), 1, "the item that waited");
+        assert_eq!(detached_bodies(), 1, "counted before the task runs");
+        assert_eq!(host.woken.times(), 1, "the task is woken to go on");
         host.turn();
+        assert!(saw_gone.get(), "the future learns its reader is gone");
+        assert_eq!(dropped.get(), 3, "the second item and what it held");
         assert_eq!(host.running(), 0);
-        assert!(!done.get(), "the future ran no further");
+        assert_eq!(detached_bodies(), 0, "given back when it returned");
     }
 
-    /// The same for a stream that is dropped before the host ever ran
-    /// its task.
+    /// A stream dropped before the host ever ran its task: the future
+    /// runs once, finds its reader gone and sends nothing.
     #[test]
-    fn a_spawned_stream_dropped_before_it_ran_never_runs() {
+    fn a_spawned_stream_dropped_before_it_ran_finds_its_reader_gone() {
         let host = Host::default();
-        let ran = Rc::new(Cell::new(false));
+        let ran = Rc::new(Cell::new(None));
         let run = Rc::clone(&ran);
         let items = Box::pin(driven(
             Some(&host.spawner()),
             move |out: Out<u32>| async move {
-                run.set(true);
-                out.send(1).await;
+                run.set(Some(out.gone()));
+                if !out.gone() {
+                    out.send(1).await;
+                }
             },
         ));
         drop(items);
+        assert_eq!(detached_bodies(), 1);
         host.turn();
-        assert!(!ran.get());
+        assert_eq!(ran.get(), Some(true));
         assert_eq!(host.running(), 0);
+        assert_eq!(detached_bodies(), 0);
+    }
+
+    /// A host that drops the task of a future that runs on without its
+    /// reader (an invocation the runtime ended) drops the future and its
+    /// count with it: the future does not keep itself alive.
+    #[test]
+    fn a_detached_future_whose_task_is_dropped_gives_its_count_back() {
+        let host = Host::default();
+        let dropped = Rc::new(Cell::new(0u32));
+        let in_future = Held(Rc::clone(&dropped));
+        let items = Box::pin(driven(
+            Some(&host.spawner()),
+            move |out: Out<u32>| async move {
+                let _held = in_future;
+                out.send(1).await;
+                // Never ends on its own.
+                core::future::pending::<()>().await;
+            },
+        ));
+        host.turn();
+        drop(items);
+        host.turn();
+        assert_eq!(host.running(), 1);
+        assert_eq!(detached_bodies(), 1);
+        assert_eq!(dropped.get(), 0);
+        host.tasks.borrow_mut().clear();
+        assert_eq!(dropped.get(), 1, "the future is gone with its task");
+        assert_eq!(detached_bodies(), 0);
+    }
+
+    /// A future that runs on without its reader for longer than
+    /// [`DETACHED_BODY_MS`] is dropped then, with what it holds, and its
+    /// count goes: nothing is held past the host's wait for it.
+    #[test]
+    fn a_detached_future_is_dropped_at_its_cutoff() {
+        let host = Host::default();
+        let asked = Rc::new(RefCell::new(Vec::new()));
+        let over = Rc::new(Cell::new(false));
+        let (log, fire) = (Rc::clone(&asked), Rc::clone(&over));
+        let sleeper: Sleeper = Rc::new(move |ms| {
+            log.borrow_mut().push(ms);
+            let fire = Rc::clone(&fire);
+            poll_fn(move |_| match fire.get() {
+                true => Poll::Ready(()),
+                false => Poll::Pending,
+            })
+            .boxed_local()
+        });
+        let dropped = Rc::new(Cell::new(0u32));
+        let in_future = Held(Rc::clone(&dropped));
+        let items = Box::pin(
+            driven(Some(&host.spawner()), move |out: Out<u32>| async move {
+                let _held = in_future;
+                out.send(1).await;
+                core::future::pending::<()>().await;
+            })
+            .cut_off_with(Some(sleeper)),
+        );
+        host.turn();
+        assert!(
+            asked.borrow().is_empty(),
+            "no timer while the reader is there"
+        );
+        drop(items);
+        assert_eq!(*asked.borrow(), [DETACHED_BODY_MS]);
+        host.turn();
+        assert_eq!(host.running(), 1);
+        assert_eq!(detached_bodies(), 1);
+        assert_eq!(dropped.get(), 0);
+        over.set(true);
+        host.turn();
+        assert_eq!(dropped.get(), 1, "dropped at the cutoff");
+        assert_eq!(host.running(), 0);
+        assert_eq!(detached_bodies(), 0);
+    }
+
+    /// Without a spawner nothing runs after the stream is dropped: the
+    /// future goes with it and nothing is counted.
+    #[test]
+    fn a_stream_without_a_spawner_takes_its_future_along() {
+        let dropped = Rc::new(Cell::new(0u32));
+        let in_future = Held(Rc::clone(&dropped));
+        let mut items = Box::pin(driven(None, move |out: Out<u32>| async move {
+            let _held = in_future;
+            out.send(1).await;
+            out.send(2).await;
+        }));
+        assert_eq!(pull(&mut items), Poll::Ready(Some(1)));
+        drop(items);
+        assert_eq!(dropped.get(), 1);
+        assert_eq!(detached_bodies(), 0);
     }
 
     /// The cache write runs beside the other work and is not polled
