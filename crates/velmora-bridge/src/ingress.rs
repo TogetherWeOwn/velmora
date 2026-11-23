@@ -1142,12 +1142,12 @@ impl ByteBudget {
     }
 
     /// [`ByteBudget::charge_job`] for a job that holds an extent of
-    /// `extent_len` bytes, which `bytes` count, in the buffer that
-    /// [`Charge::lend`] gives it. With an extent pool
-    /// ([`ByteBudget::with_extent_pool`]) the buffer is a spare one when
-    /// one fits. When the charge is dropped, the buffer can stay as a
-    /// spare if the budget has room, so the next job can reuse the same
-    /// memory. A spare larger than the extent is charged at its size.
+    /// `extent_len` bytes, included in `bytes`, in a charged extent buffer.
+    /// With an extent pool ([`ByteBudget::with_extent_pool`]), the buffer
+    /// is a spare one when one fits. When the charge is dropped, the
+    /// buffer can stay as a spare if the budget has room, so the next
+    /// job can reuse the same memory. A spare larger than the extent
+    /// is charged at its size.
     pub async fn charge_job_extent(
         &self,
         bytes: u64,
@@ -1542,7 +1542,7 @@ mod charge_tests {
 /// leave a gap in the heap that matters.
 pub const EXTENT_POOL_MIN_BYTES: u64 = 4 * 1024 * 1024;
 
-/// A job's extent buffer ([`Charge::lend`]), back with its charge when
+/// A job's extent buffer on loan, returned to its [`Charge`] when
 /// dropped. An uncharged default buffer is freed instead.
 #[derive(Default)]
 pub struct Lent<'c> {
