@@ -423,6 +423,8 @@ pub struct MemCatalog {
     pub line_waits: RefCell<Vec<(String, Vec<String>, i64)>>,
     /// The hard limit of the last wait in the line.
     pub line_hard_ms: Cell<i64>,
+    /// How long the gate's restart extends the fake line's wait to.
+    pub line_restart_ms: Cell<i64>,
     /// The holders whose jobs said they stopped (`leave_line`).
     pub line_left: RefCell<Vec<String>>,
     /// Each slot request waits for the runtime once before it is
@@ -1409,7 +1411,10 @@ impl Catalog for MemCatalog {
                     sleep(LINE_MS).await;
                 }
             }
-            SlotWait::Elapsed => sleep(u32::try_from(ms).expect("a wait in ms")).await,
+            SlotWait::Elapsed => {
+                let elapsed = ms.max(self.line_restart_ms.get()).min(window.hard_ms);
+                sleep(u32::try_from(elapsed).expect("a wait in ms")).await;
+            }
             SlotWait::Unsupported => {}
         }
         Ok(end)

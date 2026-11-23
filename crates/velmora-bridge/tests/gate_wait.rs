@@ -1417,6 +1417,32 @@ async fn a_client_clock_ahead_does_not_spin_at_the_restart_wake() {
     assert_eq!(w.msgs.get(), 2);
 }
 
+#[tokio::test]
+async fn an_ahead_clock_with_a_slow_probe_honors_the_restart_hold() {
+    let Full { w, p, .. } = full().await;
+    let claimed = w.now();
+    w.restart();
+    w.pass(80_000);
+    let (sleep, on) = (w.sleeper(), [&p]);
+    let (a, behind) = w.behind(core::slice::from_ref(&p));
+    behind.set(-SKEW_MS);
+    let window = job_slot_window(claimed, w.now());
+    w.wake_delayed_until.set(Some(w.now().0 + JOB_MS + 3_000));
+    let mut waiting: Waiting<'_> = Box::pin(a.await_permit(&on, "job-a", window, &sleep));
+    assert_eq!(turn(&mut waiting), None);
+
+    w.pass(JOB_MS);
+    assert_eq!(turn(&mut waiting), None);
+    w.pass(i64::from(jobs::SLOT_POLL_MS) + 1);
+    assert_eq!(
+        turn(&mut waiting),
+        None,
+        "the early probe is still in flight"
+    );
+    w.pass(SKEW_MS - i64::from(jobs::SLOT_POLL_MS) - 1);
+    assert_eq!(turn(&mut waiting), Some(SlotWait::Granted));
+}
+
 fn job_slot_window(claimed: UnixMs, now: UnixMs) -> SlotWaitWindow {
     let age = now.0 - claimed.0;
     SlotWaitWindow {
