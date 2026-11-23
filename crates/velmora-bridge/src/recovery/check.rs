@@ -455,6 +455,10 @@ pub async fn record_open<'k, K: Kek, R: TenantRings, T: Clock>(
             // `VMR2` cut short, also inside its header, is damage; only
             // bytes of another scheme are another scheme's.
             if !sealed.starts_with(RECORD_V2_MAGIC) {
+                // Cut inside its magic (or empty): damage, not a scheme.
+                if sealed.len() < RECORD_V2_MAGIC.len() && RECORD_V2_MAGIC.starts_with(sealed) {
+                    return Err(RecordCheck::Unreadable);
+                }
                 return Err(RecordCheck::CrossScheme);
             }
             let Some((named, version)) = v2_header(sealed) else {

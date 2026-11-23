@@ -273,6 +273,12 @@ const KEY_MISS_BYTES: usize = 128 * 1024;
 /// and entry: `rc/key-page/<slot>/<entry>`. Removed by the first job of a
 /// later pass.
 pub const KEY_PAGE_PREFIX: &str = "rc/key-page/";
+/// Where the recheck of [`KEY_MISS_KEY`] came to: the last tenant id it
+/// looked at. A hint like the others: any value only changes which tenant
+/// is looked at first.
+pub const RECHECK_KEY: &str = "rc/key-recheck";
+/// The bytes read of [`RECHECK_KEY`].
+const TENANT_ID_BYTES: usize = 64;
 /// Tenants whose missing key versions the first job of a pass looks at
 /// again ([`KEY_MISS_KEY`]; dial, est): each costs one ring read and one
 /// reload at most.
@@ -856,6 +862,17 @@ fn page_end(last: &str) -> String {
     }
 }
 
+/// Which tenant directory the sweep goes through next.
+enum Next {
+    /// This managed tenant's; empty: tenant 0's, which comes last.
+    Tenant(String),
+    /// The job has no request left to list with: the next job looks.
+    Later,
+    /// `LIST_PAGES` requests found only names that are no managed
+    /// tenant's, and the listing goes on: the walk reaches the rest.
+    GaveUp,
+}
+
 /// What the listings say of a source record.
 enum What<'a> {
     Young,
@@ -1359,7 +1376,7 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend, R: TenantRings> Copier<'_, B, 
         // The time of the sweep is up: the walk has the rest of the pass.
         // A hint is no part of a pass ([`Copier::run_job`] does it).
         let hint = place.phase == Phase::Plan;
-        let late = !hint && !place.walking() && budget.started.0 - pass.0 >= SWEEP_MS;
+        let mut late = !hint && !place.walking() && budget.started.0 - pass.0 >= SWEEP_MS;
         let (mut began, mut ended, mut swept) = (false, false, false);
         // `None` = the pass is over: the walk rests.
         let mut turn = (!hint).then_some(place);
@@ -1395,11 +1412,19 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend, R: TenantRings> Copier<'_, B, 
             };
             if let Some(after) = after {
                 match self.next_tenant(&after, &mut dirs, &mut budget).await? {
-                    Some(tenant) => {
+                    Next::Tenant(tenant) => {
                         turn = Some(Place::tenant(tenant, pass));
                         continue;
                     }
-                    None => break (Some(place.cursor()), false),
+                    Next::Later => break (Some(place.cursor()), false),
+                    // The rest of `m/x/` is the walk's: tenant 0's phases,
+                    // and the sweep is reported unfinished, which asks for
+                    // the walk.
+                    Next::GaveUp => {
+                        late = true;
+                        turn = Some(Place::tenant(String::new(), pass));
+                        continue;
+                    }
                 }
             }
             turn = match place.phase {
@@ -1522,21 +1547,29 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend, R: TenantRings> Copier<'_, B, 
         names: impl Iterator<Item = &'n String>,
         slot: i64,
     ) {
-        for name in names {
-            let Some(mark) = marks.get(name).filter(|m| miss_due(m, slot)) else {
+        let due: Vec<(String, String, &str)> = names
+            .filter_map(|name| {
+                let mark = marks.get(name).filter(|m| miss_due(m, slot))?;
+                let kind = miss_kind(mark[2]).map_or("unknown", Miss::code);
+                Some((name.clone(), self.claim_name(slot, name), kind))
+            })
+            .collect();
+        // A group of claims at a time, as the copies go.
+        let claimed: Vec<(String, &str, bool)> = stream::iter(due)
+            .map(|(name, claim, kind)| async move {
+                let mine = !matches!(
+                    self.safety.put_if_absent(&claim, Vec::new()).await,
+                    Ok(false)
+                );
+                (name, kind, mine)
+            })
+            .buffer_unordered(CONCURRENCY)
+            .collect()
+            .await;
+        for (name, kind, mine) in claimed {
+            let Some((tenant, version)) = miss_of(&name).filter(|_| mine) else {
                 continue;
             };
-            let Some((tenant, version)) = miss_of(name) else {
-                continue;
-            };
-            let claim = format!("{KEY_PAGE_PREFIX}{slot:016}/{name}");
-            if matches!(
-                self.safety.put_if_absent(&claim, Vec::new()).await,
-                Ok(false)
-            ) {
-                continue;
-            }
-            let kind = miss_kind(mark[2]).map_or("unknown", Miss::code);
             let version = version.unwrap_or(0);
             crate::trace::alert(|| {
                 format!(
@@ -1544,6 +1577,21 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend, R: TenantRings> Copier<'_, B, 
                 )
             });
         }
+    }
+
+    /// The claim of the page of the entry `name` in the pass of `slot`:
+    /// `rc/key-page/<slot>/<tag>`, the tag keyed under the active KEK, so
+    /// that nothing without it can make a claim ahead of time that would
+    /// keep a page off.
+    fn claim_name(&self, slot: i64, name: &str) -> String {
+        let (_, kek) = self.kek.active();
+        let tag = hkdf::Hkdf::<Sha256>::new(None, kek.expose());
+        let mut out = [0u8; 16];
+        let info = format!("velmora/copy-page-claim/v1|{slot}|{name}");
+        // 16 bytes are far below HKDF's limit: this cannot fail.
+        let _ = tag.expand(info.as_bytes(), &mut out);
+        let hex: String = out.iter().map(|b| format!("{b:02x}")).collect();
+        format!("{KEY_PAGE_PREFIX}{slot:016}/{hex}")
     }
 
     /// The first job of a pass: pages every entry of [`KEY_MISS_KEY`]
@@ -1571,12 +1619,22 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend, R: TenantRings> Copier<'_, B, 
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect();
-        let turn = usize::try_from(slot / PASS_INTERVAL_MS).unwrap_or(0);
-        let from = match tenants.len() {
-            0 => 0,
-            n => turn.wrapping_mul(RECHECK_TENANTS) % n,
-        };
+        // From the tenant after the one the last recheck came to
+        // ([`RECHECK_KEY`]), so that every tenant comes round also when
+        // the job's time stops a recheck early.
+        let after = self
+            .read_mark(RECHECK_KEY, TENANT_ID_BYTES)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|b| String::from_utf8(b).ok())
+            .unwrap_or_default();
+        let from = tenants
+            .iter()
+            .position(|t| t.as_str() > after.as_str())
+            .unwrap_or(0);
         let names: Vec<String> = marks.keys().cloned().collect();
+        let mut came_to = None;
         for tenant in tenants
             .iter()
             .cycle()
@@ -1586,6 +1644,7 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend, R: TenantRings> Copier<'_, B, 
             if self.spent(budget.started) {
                 break;
             }
+            came_to = Some(tenant.clone());
             for name in names
                 .iter()
                 .filter(|n| miss_of(n).is_some_and(|(t, _)| &t == tenant))
@@ -1627,14 +1686,40 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend, R: TenantRings> Copier<'_, B, 
         let names: Vec<String> = marks.keys().cloned().collect();
         self.page_due(&marks, names.iter(), slot).await;
         let _ = self.save_misses(marks).await;
-        // The claims of earlier passes; best effort, a page of keys.
-        budget.pages += 1;
-        if let Ok(claims) = self.safety.list(KEY_PAGE_PREFIX, "", PAGE).await {
-            let current = format!("{KEY_PAGE_PREFIX}{slot:016}/");
-            for claim in claims.iter().filter(|c| c.as_str() < current.as_str()) {
-                let _ = self.safety.delete(claim).await;
+        if let Some(tenant) = came_to {
+            let _ = put_mark(
+                self.safety,
+                RECHECK_KEY,
+                tenant.as_str().as_bytes().to_vec(),
+            )
+            .await;
+        }
+        // The claims of passes before the last one, and any of a pass to
+        // come (no job makes one): best effort, a page of keys from each
+        // end. The last pass's stay, for a delivery of it still running
+        // (a queue invocation ends within 15 minutes, one pass).
+        let keep_from = format!("{KEY_PAGE_PREFIX}{:016}/", slot - PASS_INTERVAL_MS);
+        let ahead = format!("{KEY_PAGE_PREFIX}{:016}0", slot);
+        let mut stale = Vec::new();
+        for start in ["", ahead.as_str()] {
+            budget.pages += 1;
+            if let Ok(claims) = self.safety.list(KEY_PAGE_PREFIX, start, PAGE).await {
+                stale.extend(
+                    claims
+                        .into_iter()
+                        .filter(|c| c.as_str() < keep_from.as_str() || c.as_str() > ahead.as_str()),
+                );
             }
         }
+        stale.sort();
+        stale.dedup();
+        stream::iter(stale)
+            .map(|claim| async move {
+                let _ = self.safety.delete(&claim).await;
+            })
+            .buffer_unordered(CONCURRENCY)
+            .collect::<Vec<()>>()
+            .await;
     }
 
     /// Notes what the reloaded rings of this job lacked in
@@ -1672,8 +1757,8 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend, R: TenantRings> Copier<'_, B, 
 
     /// The managed tenant whose directory the sweep goes through after
     /// that of `after` (empty: the first), or empty when none is left and
-    /// tenant 0's comes; `None` when the job has no request left to list
-    /// with ([`JOB_PAGES`]). `dirs` keeps what the job listed: one listing
+    /// tenant 0's comes ([`Next`]); [`Next::Later`] when the job has no
+    /// request left to list with ([`JOB_PAGES`]). `dirs` keeps what the job listed: one listing
     /// with the delimiter `/` per [`PAGE`] tenant directories. A name
     /// below `m/x/` that is no managed tenant's id is passed over (the
     /// walk reaches its keys).
@@ -1682,11 +1767,11 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend, R: TenantRings> Copier<'_, B, 
         after: &str,
         dirs: &mut Vec<String>,
         budget: &mut Budget,
-    ) -> std::result::Result<Option<String>, StepError> {
+    ) -> std::result::Result<Next, StepError> {
         dirs.retain(|t| t.as_str() > after);
         if let Some(next) = dirs.first().cloned() {
             dirs.remove(0);
-            return Ok(Some(next));
+            return Ok(Next::Tenant(next));
         }
         let mut start = match after {
             "" => String::new(),
@@ -1696,7 +1781,7 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend, R: TenantRings> Copier<'_, B, 
             // A request of the job's like a page of the source; none left:
             // `None`, the next job looks.
             if budget.pages >= JOB_PAGES {
-                return Ok(None);
+                return Ok(Next::Later);
             }
             budget.pages += 1;
             let page = self
@@ -1710,16 +1795,14 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend, R: TenantRings> Copier<'_, B, 
             }));
             match page.next {
                 Some(next) if dirs.is_empty() => start = next,
-                // Found one, or the end. (Past `LIST_PAGES` requests of
-                // names that are no managed tenant's, the rest of `m/x/`
-                // is the walk's.)
-                _ => break,
+                _ if !dirs.is_empty() => return Ok(Next::Tenant(dirs.remove(0))),
+                // The end of the listing: tenant 0's phases come.
+                _ => return Ok(Next::Tenant(String::new())),
             }
         }
-        Ok(Some(match dirs.is_empty() {
-            true => String::new(),
-            false => dirs.remove(0),
-        }))
+        // `LIST_PAGES` requests of names that are no managed tenant's,
+        // and more to come.
+        Ok(Next::GaveUp)
     }
 
     /// Where the walk of the pass that started at `pass` goes on, or

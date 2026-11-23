@@ -956,19 +956,32 @@ async fn am80b_overlapping_jobs_claim_one_page_and_next_pass_prunes_it() {
         "all three jobs found the due miss"
     );
     assert_eq!(alerts(), [missing_key_page(2, "partial")]);
-    let claim = |at: UnixMs| format!("{KEY_PAGE_PREFIX}{:016}/{A}/2", at.0);
+    // Claim names are keyed (no name to make ahead of time): one per
+    // pass slot and entry, under the slot.
+    let slots = |claims: Vec<String>| -> Vec<String> {
+        claims
+            .iter()
+            .map(|c| c[KEY_PAGE_PREFIX.len()..KEY_PAGE_PREFIX.len() + 16].to_string())
+            .collect()
+    };
+    let slot = |at: UnixMs| format!("{:016}", at.0);
     assert_eq!(
-        w.safety.list(KEY_PAGE_PREFIX, "", PAGE).await.unwrap(),
-        [claim(pass)]
+        slots(w.safety.list(KEY_PAGE_PREFIX, "", PAGE).await.unwrap()),
+        [slot(pass)]
     );
 
     w.safety.yield_before_claim.set(false);
-    w.clock.advance_ms(PASS_INTERVAL_MS);
-    assert_eq!(w.first_job().await.failed, 0);
-    assert_eq!(alerts(), [missing_key_page(2, "partial")]);
+    for _ in 0..2 {
+        w.clock.advance_ms(PASS_INTERVAL_MS);
+        assert_eq!(w.first_job().await.failed, 0);
+        assert_eq!(alerts(), [missing_key_page(2, "partial")]);
+    }
+    // The last pass's claim stays (a delivery of it may still run); the
+    // ones before are removed by the first job.
+    let now = w.clock.now();
     assert_eq!(
-        w.safety.list(KEY_PAGE_PREFIX, "", PAGE).await.unwrap(),
-        [claim(w.clock.now())],
+        slots(w.safety.list(KEY_PAGE_PREFIX, "", PAGE).await.unwrap()),
+        [slot(UnixMs(now.0 - PASS_INTERVAL_MS)), slot(now)],
         "earlier claims must be removed by the first job"
     );
     assert_eq!(w.step(WALK).await.failed, 1);
