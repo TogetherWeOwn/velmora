@@ -20,6 +20,7 @@ use crate::crypto::{unwrap_secret, DataKey, ExtentSealer};
 use crate::ingress::{
     seal_upload, Charge, IngressError, SealedUpload, UploadLengths, UploadReadError,
 };
+use crate::metrics::{FailureStage as Stage, RequestObservation};
 use crate::ports::{BlobStore, Bridge, Catalog, Clock, JobSink, Kek, NntpConnector, StreamMeta};
 use crate::recovery::{discard_generation, revocation_recorded, Unpublished};
 use crate::replay::ReplayProbe;
@@ -638,6 +639,7 @@ pub(super) async fn hold_precondition<
     key: &str,
     id: &GenerationId,
     condition: Option<&Precondition>,
+    observed: &mut RequestObservation,
 ) -> Result<(), S3Response> {
     let Some(condition) = condition else {
         return Ok(());
@@ -648,8 +650,11 @@ pub(super) async fn hold_precondition<
         .catalog
         .raise_floor(bucket, key, id, false)
         .await
+        .inspect_err(observed.on_error(Stage::Commit))
         .map_err(|_| internal())?;
-    check_precondition(bridge, bucket, key, condition).await
+    check_precondition(bridge, bucket, key, condition)
+        .await
+        .inspect_err(observed.on_error(Stage::Lookup))
 }
 
 /// [`mutation_gate`] for the requests that can be conditional
@@ -816,11 +821,23 @@ pub(super) async fn discard_before_retry<
     generation: &GenerationRow,
     refused: Unpublished,
     conditional: bool,
+    observed: &mut RequestObservation,
 ) -> Result<(), S3Response> {
     match discard_unless_present(bridge, generation, refused).await {
         Ok(true) => Ok(()),
         Ok(false) if !conditional => Ok(()),
-        _ => Err(internal()),
+        Ok(false) => Err(internal()),
+        Err(error) => {
+            observed.mark_stage(discard_failure(&error));
+            Err(internal())
+        }
+    }
+}
+
+pub(super) fn discard_failure(error: &crate::types::BridgeError) -> Stage {
+    match error {
+        crate::types::BridgeError::Sql(_) => Stage::Lookup,
+        _ => Stage::storage(error),
     }
 }
 
@@ -846,6 +863,18 @@ pub(super) async fn restore_gate<
         Ok(true) => Err(writes_refused()),
         Err(_) => Err(internal()),
     }
+}
+
+/// An unsuccessful restore-state read is a lookup failure; a successful
+/// read that found an ongoing restore is a write refusal instead.
+pub(super) fn restore_failure(
+    observed: &mut RequestObservation,
+    response: S3Response,
+) -> S3Response {
+    if response.status == 500 {
+        observed.mark_stage(Stage::Lookup);
+    }
+    response
 }
 
 /// Queue messages of one `send_many`.
@@ -921,6 +950,7 @@ pub(super) async fn send_post_jobs<C, B, N, J, K, T>(
 ///
 /// The extent `blob` names must be newly minted (see [`ExtentSealer`]).
 /// `charge` is the one taken for this body.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn store_streamed<B: BlobStore>(
     safety: &B,
     body: Body,
@@ -929,6 +959,7 @@ pub(super) async fn store_streamed<B: BlobStore>(
     bdk: &DataKey,
     blob: StreamMeta<'_>,
     charge: &Charge,
+    observed: &mut RequestObservation,
 ) -> Result<SealedUpload, UploadReadError> {
     let sealer = ExtentSealer::begin(
         bdk,
@@ -955,6 +986,9 @@ pub(super) async fn store_streamed<B: BlobStore>(
         }
         // The store failed, stopped reading, or holds other bytes than
         // were sealed.
-        _ => Err(IngressError::Internal.into()),
+        _ => {
+            observed.mark_stage(Stage::R2);
+            Err(IngressError::Internal.into())
+        }
     }
 }

@@ -29,8 +29,10 @@ pub(super) enum SliceError {
     Ingress(IngressError),
     /// The validator refused the body (framing, signature, digest).
     Proto(ErrorCode),
-    /// Sealing or the store failed. Slices stored so far stay.
+    /// The blob store failed. Slices stored so far stay.
     Store,
+    /// A seal or local invariant failed.
+    Internal,
 }
 
 impl From<IngressError> for SliceError {
@@ -137,12 +139,12 @@ impl<B: BlobStore, R: FillRandom> SliceSink<'_, B, R> {
         plain: &[u8],
         stored: &mut Vec<StoredSlice>,
     ) -> Result<(), SliceError> {
-        let id = self.ids.get(stored.len()).ok_or(SliceError::Store)?;
+        let id = self.ids.get(stored.len()).ok_or(SliceError::Internal)?;
         let mut rng = Replay::new(&mut *self.rng);
         for _ in 0..PUT_ATTEMPTS {
             rng.at = 0;
             let mut sealed = seal_extent(self.bdk, self.bucket, id, plain, &mut rng)
-                .map_err(|_| SliceError::Store)?;
+                .map_err(|_| SliceError::Internal)?;
             let ciphertext = std::mem::take(&mut sealed.ciphertext);
             let cipher_size = ciphertext.len() as u64;
             let put = self
@@ -184,14 +186,14 @@ pub(super) async fn store_slices<B: BlobStore, R: FillRandom>(
     charge: &Charge,
     validator: &mut UploadValidator,
 ) -> Result<Vec<StoredSlice>, SliceError> {
-    let slice = usize::try_from(sink.slice_bytes).map_err(|_| SliceError::Store)?;
+    let slice = usize::try_from(sink.slice_bytes).map_err(|_| SliceError::Internal)?;
     let count = lengths.decoded.div_ceil(sink.slice_bytes.max(1));
     if slice == 0
         || charge.bytes() < sink.slice_bytes.saturating_mul(2)
         || validator.decoded_length() != lengths.decoded
         || count != sink.ids.len() as u64
     {
-        return Err(SliceError::Store);
+        return Err(SliceError::Internal);
     }
     let piece = PIECE_BYTES.min(slice);
     let mut stored = Vec::with_capacity(sink.ids.len());

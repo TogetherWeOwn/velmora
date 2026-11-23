@@ -1712,16 +1712,20 @@ too, so these points show how much is read from Usenet over time; they
 are not a hit rate and are not to be subtracted from the GET count. No
 bucket, key, query, header, ID, IP address or token is written.
 
-### GET failure stages
+### S3 failure stages
 
 Workers Analytics (GraphQL) can show HTTP status counts, including
 responses from the runtime. Use the [Analytics Engine SQL API][ae-sql]
-to break down Worker-answered GET errors, including range GETs. This
-uses the existing request point, with colo still in `blob5`:
+to break down Worker-answered GET errors (including range GETs) and
+5xx responses to HEAD, PUT (including UploadPart), and the POST for
+CompleteMultipartUpload. This uses the existing request point, with
+colo still in `blob5`:
 
 - `blob6`: `auth` (authentication, including the key and bucket
-  lookups), `lookup` (object, extent or cold-read catalogue), `plan`
-  (metadata, range or extent planning), `grant` (fan-out grant creation,
+  lookups), `lookup` (catalogue reads, including write-path restore and
+  upload state checks), `commit` (catalogue writes or publication that
+  could not complete), `plan` (GET metadata, range or extent planning),
+  `grant` (fan-out grant creation,
   admission, scope, or a granted generation that no longer exists),
   `subrange_transport` (binding/stream setup or opening the first
   sub-request), `subrange_length` (first sub-range's declared length),
@@ -1731,9 +1735,15 @@ uses the existing request point, with colo still in `blob5`:
   out waiting for a provider connection slot), `budget` (byte-budget
   exhaustion), `decrypt` (could not open verified cold bytes), or
   `other` (unclassified, including an HTTP response-conversion fallback).
-- `blob7`: `le_1gib` or `gt_1gib` for the full object size, including
-  for range GETs; `unknown` if it was not available. This does not
-  disclose the exact object size or indicate that a range fanned out.
+- `blob7`: `le_1gib` or `gt_1gib` for the full object size when known
+  (for PUT, the accepted decoded length; for CompleteMultipartUpload,
+  the assembled size once planned); `unknown` if it was not available,
+  including UploadPart, which does not know the whole object size. This does not disclose the exact object size or indicate that a
+  range fanned out.
+
+A failed queue wake-up does not produce an `outbox` response stage. The
+write has already committed, and the dispatcher can resend from the
+outbox. The response and its count remain those of a successful write.
 
 For example, group public S3 GET 500s over the last hour by stage and
 size class (`velmora_requests_dev` for dev):
@@ -1749,9 +1759,24 @@ GROUP BY stage, size_class
 ORDER BY requests DESC
 ```
 
-The empty-stage filter omits older points. To inspect failures inside
-sub-requests, query `blob4 = 'sub'` separately (use `blob3 = '5xx'` to
-include 503s); do not add these to public counts. The Worker reports
+For short clusters, group public S3 PUT and HEAD 500s by UTC minute,
+method and stage:
+
+```sql
+SELECT toStartOfMinute(timestamp) AS minute, blob2 AS method,
+       blob6 AS stage, SUM(_sample_interval * double5) AS requests
+FROM velmora_requests
+WHERE timestamp >= NOW() - INTERVAL '1' HOUR
+  AND index1 = 'req' AND blob2 IN ('PUT', 'HEAD') AND blob4 = 's3'
+  AND double1 = 500 AND blob6 != ''
+GROUP BY minute, method, stage
+ORDER BY minute DESC, method, stage
+```
+
+The empty-stage filter omits older points. To include 503s (for example,
+byte-budget exhaustion), use `blob3 = '5xx'` instead of `double1 = 500`.
+To inspect failures inside sub-requests, query `blob4 = 'sub'` separately;
+do not add these to public counts. The Worker reports
 one response point before streaming the body. Failures after that
 point, including later sub-range failures on the front request, do
 not change its HTTP status or that point.
