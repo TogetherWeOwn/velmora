@@ -897,9 +897,9 @@ async fn recursive_copy_failure_keeps_obsolete_destination_members() {
     for k in ["src/a", "src/b", "src/c", "dst/a", "dst/old"] {
         assert_eq!(w.s3_put(k, k.as_bytes()).await, 200);
     }
-    w.req("PROPPATCH", "/dav/src/a", &[], SET_X)
-        .await
-        .expect(207);
+    for target in ["/dav/src/a", "/dav/src/"] {
+        w.req("PROPPATCH", target, &[], SET_X).await.expect(207);
+    }
     w.storage_fault("PUT", "dst/b", support::StorageFault::Fail);
     let r = w
         .req("COPY", "/dav/src/", &[("destination", "/dav/dst/")], b"")
@@ -912,10 +912,15 @@ async fn recursive_copy_failure_keeps_obsolete_destination_members() {
         ),
         (207, 200, 404)
     );
-    // The failed member, and what was never scheduled after it.
+    // The failed member, and what was never scheduled after it; dst/ is
+    // represented by the copied dst/a, so it is not a failure.
     let mut hrefs = r.hrefs();
     hrefs.sort();
-    assert_eq!(hrefs, ["/dav/dst/", "/dav/src/b", "/dav/src/c"]);
+    assert_eq!(hrefs, ["/dav/src/b", "/dav/src/c"]);
+    assert!(
+        has_x(&w, "/dav/dst/").await,
+        "the represented folder lost its property"
+    );
     assert_eq!(w.s3_get("dst/old").await.1, b"dst/old");
     assert_eq!(w.s3_get("dst/a").await.1, b"src/a");
     assert!(

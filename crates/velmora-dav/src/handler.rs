@@ -2203,6 +2203,7 @@ impl<U: Upstream, S: StatePort> Ctx<'_, U, S> {
             let mut copied_keys = written.clone();
             // Materialize empty collections before deleting anything. Only
             // folders represented by a successful copy or marker get props.
+            let mut unscheduled: Vec<&String> = Vec::new();
             if failed.is_empty() {
                 let mut chunks = markers.chunks(fan);
                 while let Some(chunk) = chunks.next() {
@@ -2236,14 +2237,25 @@ impl<U: Upstream, S: StatePort> Ctx<'_, U, S> {
                         copied_keys.push(marker.clone());
                     }
                     if !failed.is_empty() {
-                        failed.extend(chunks.flatten().map(|marker| (marker.clone(), 424)));
+                        unscheduled.extend(chunks.flatten());
                         break;
                     }
                 }
             } else {
                 // No folder is created after a failed copy.
-                failed.extend(markers.iter().map(|marker| (marker.clone(), 424)));
+                unscheduled.extend(markers.iter());
             }
+            // A folder a successful write already represents was copied.
+            failed.extend(
+                unscheduled
+                    .into_iter()
+                    .filter(|marker| {
+                        !copied_keys
+                            .iter()
+                            .any(|key| key.starts_with(marker.as_str()))
+                    })
+                    .map(|marker| (marker.clone(), 424)),
+            );
             if src_coll && !copied_keys.is_empty() {
                 properties.push(Op::PropCopyFolders {
                     from: src_path.clone(),
