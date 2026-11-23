@@ -249,7 +249,11 @@ async fn a_resumed_release_asks_the_earlier_backbone_for_its_parity() {
     rig.propagate_one(&parity.articles[1]).await;
     rig.servers[0].hide(&parity.articles[0].message_id).await;
     rig.bridge.clock.advance_secs(wait);
+    rig.bridge.nntp.slow(&rig.bridge.clock, 0);
     assert_eq!(rig.run(&s, OutboxStage::Verify).await, JobOutcome::Ack);
+    // Presence only: the resumed job reads no article in full.
+    let calls = rig.bridge.nntp.calls();
+    assert!(calls.iter().any(|c| c.0 == "stat") && !calls.iter().any(|c| c.0 == "body"));
 
     assert!(rig.safety_held(&s));
     let ok = VerifyResult::Ok;
