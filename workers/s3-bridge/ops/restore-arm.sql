@@ -8,6 +8,12 @@
 -- may start from any restore point. The restore point of a replay that
 -- had not ended on this database is kept: the next one must start
 -- there or earlier.
+-- json() on this deliberately invalid input aborts the file before any
+-- restore state is changed if an import did not finish.
+SELECT CASE WHEN EXISTS(
+  SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = '_velmora_import_incomplete'
+) THEN json('catalogue import incomplete') END;
+
 INSERT INTO restore_state(id, state, since_ms, started_at)
 VALUES (1, 'replaying', -1, 0)
 ON CONFLICT(id) DO UPDATE SET

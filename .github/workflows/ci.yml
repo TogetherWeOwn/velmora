@@ -424,6 +424,12 @@ jobs:
       - name: Test the production config generator
         working-directory: workers/s3-bridge
         run: python3 -I tools/test_deploy_config.py
+      - name: Install pinned wrangler (npm ci)
+        working-directory: workers/s3-bridge
+        run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: Test the catalogue export and import scripts
+        working-directory: workers/s3-bridge
+        run: python3 -I tools/test_catalog_export.py
       # bundle.sh: worker-build, then the `name` section is dropped. The
       # same script builds the deploy artifact and the wrangler dev bundle.
       - name: Build the Worker bundle
@@ -443,9 +449,6 @@ jobs:
             echo "index_bg.wasm still names a registry source path"
             exit 1
           fi
-      - name: Install pinned wrangler (npm ci)
-        working-directory: workers/s3-bridge
-        run: npm ci --ignore-scripts --no-audit --no-fund
       # The only blocking size check is Cloudflare's own limit: 64 MiB
       # uncompressed on every plan, no compressed limit
       # (developers.cloudflare.com/workers/platform/limits/#worker-size),

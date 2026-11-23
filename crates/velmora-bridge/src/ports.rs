@@ -1298,6 +1298,8 @@ pub trait Catalog {
     /// has not ended, or a rollback of the catalogue was found and no
     /// replay has ended since.
     async fn restore_pending(&self) -> Result<bool>;
+    /// Whether an operator's batched catalogue import has not completed.
+    async fn restore_import_incomplete(&self) -> Result<bool>;
     /// The rollback stamp row ([`crate::stamp`]). `catalogue` is the id
     /// this Worker keys the stamp objects by; the row keeps the id it
     /// was created with. [`crate::stamp::ERR_CATALOGUE_ID`] = the two

@@ -253,11 +253,46 @@ new key does not get the id of a revoked one.
 
 ## Routine: export
 
-`ops/catalog-export.sh` runs `wrangler d1 export` and stores the SQL file
-in the bucket `velmora-catalog-export` (create it once with
-`npx wrangler r2 bucket create velmora-catalog-export`). Run it from cron,
-for example daily. It prints the **restore point**, which is also the
-object's name. D1 does not answer queries while an export runs.
+`ops/catalog-export.sh` runs `wrangler d1 export`, compresses the SQL with
+zstd, and uploads the parts to `velmora-catalog-export` (create it once
+with `npx wrangler r2 bucket create velmora-catalog-export`). Run it from
+cron, for example daily. D1 does not answer queries while an export runs.
+
+The script prints the **restore point** in milliseconds. Under `d1/<db>/`,
+the parts are named `<restore point>.<attempt>.part-000`, `-001`, and so on.
+The script uploads `<restore point>.manifest.json` last. The format 2
+manifest lists the attempt, its parts and their checksums. Concurrent
+exports at the same restore point do not overwrite each other's parts.
+The importer also reads format 1 manifests with `.sql.zst.part-NNN` keys.
+
+Install the pinned Wrangler with `npm ci` in `workers/s3-bridge` before
+running either script. They require the local Wrangler version from
+`package-lock.json`, Python 3.10 or later with SQLite support, and `flock`.
+The importer requires SQLite 3.37 or later. On the same host, run these
+scripts as the same user with the same `TMPDIR` so they share
+locks: exports lock by source database name, imports by resolved target UUID.
+
+The exporter requires a full remote dump with schema and data. Its Wrangler
+arguments are limited to configuration options (`--config`/`-c`, `--env`/`-e`,
+`--cwd`, `--env-file`, and `--profile`). It has no single-file SQL size limit,
+but refuses an export with any SQL statement over 100,000 bytes,
+which D1 cannot import. Its summary gives the longest statement and the D1 file
+size along with the snapshot sizes. Set `VELMORA_EXPORT_SIZES_LOG` to append
+those measurements as JSON lines. The export warns at 60% of either the
+statement limit or the paid plan's 10 GB
+[database limit](https://developers.cloudflare.com/d1/platform/limits/).
+If the D1 size is unavailable, the export warns, records `database_size_bytes`
+as `null` in that log, and still publishes the snapshot.
+
+Wrangler uploads each part by default. Splitting keeps each upload under
+Wrangler's 300 MiB limit. `VELMORA_EXPORT_PART_BYTES` defaults to 268435456
+(256 MiB) and accepts positive integers up to 300000000. At the default, the
+1,000-part limit holds over 268 GB of compressed SQL. To use rclone for
+uploads and restores, set `VELMORA_EXPORT_RCLONE_REMOTE` to the name of a
+configured remote for the R2 S3 endpoint. On failure, the scripts report
+where they kept private transfer logs. URL query strings are removed before
+logging, and Wrangler's own disk logging is disabled. Staged SQL and parts
+are removed locally even on failure.
 
 Take a fresh export after every deploy that applied a migration. An
 export carries the schema of its day and the list of the migrations
@@ -270,15 +305,69 @@ exists: restore it to a timestamp, then replay from that timestamp.
 
 ## Restore
 
+Deploy a Worker revision with the incomplete-import replay guard before
+using the batched importer. The arming SQL also checks the marker, but an
+older Worker cannot enforce it on a direct replay call.
+
 1. Set `MAINTENANCE = "restore"` and deploy. Every write now answers 503,
    and the jobs and the cron do nothing.
 2. Bring the database back, one of:
    - Time Travel: `npx wrangler d1 time-travel restore <db> --timestamp <T>`.
      The restore point is `T` in milliseconds.
-   - Export: create an empty database (do not apply the migrations
-     first: the export carries the schema and the list of applied
-     migrations), download the newest `d1/<db>/<restore point>.sql` and
-     load it with `npx wrangler d1 execute <db> --remote --file <file>`.
+   - Export: find the newest complete export with
+     `rclone lsf <remote>:velmora-catalog-export/d1/<db>/ --include '*.manifest.json' | sort | tail -n 1`.
+     An export from before the manifests is one `<restore point>.sql` object
+     (`--include '*.sql'`); it loads too, without checksums.
+     The number before `.manifest.json` is the restore point. Set
+     `VELMORA_D1` to the source database of the export. Create an empty
+     database and set `VELMORA_IMPORT_DATABASE_ID` to its UUID from
+     `wrangler d1 info <new db> --json` (use the same Wrangler config and
+     environment as the import). Export `CLOUDFLARE_ACCOUNT_ID` for the target
+     account. Run `ops/catalog-import.sh <new db> <restore point>`.
+     The script resolves the supplied name or binding with the operator's
+     config and checks the UUID. It then confirms the same UUID and name in
+     `CLOUDFLARE_ACCOUNT_ID` and pins every subsequent D1 call to that account
+     and UUID with a private config containing no database names or bindings.
+     The pinned calls retain the shell credentials and explicit `--profile`
+     and `--env-file` (use absolute paths with `--cwd`), not `--env`.
+     A production catalogue also requires `VELMORA_IMPORT_PRODUCTION=yes`.
+     The export carries the schema and the list of applied migrations, so
+     apply migrations after loading it. Do not run against production without
+     these confirmations. The script refuses a non-empty database. It caps
+     the manifest at 1 MiB, legacy SQL at 5,000,000,000 bytes, and each part at
+     its declared size. It stages at most one extra byte to detect overflow
+     (which does not limit bytes already in flight). It also bounds
+     decompression by the manifest's SQL size and checks every checksum
+     before splitting. Legacy single-file exports have no checksums.
+
+     Restore always uses statement-safe batches, even for small exports:
+     table schemas first, INSERTs in foreign-key order, then the remaining
+     statements (including indexes and triggers). A dependency cycle is
+     refused, as are rows for a self-referencing table that cannot fit in
+     one batch. `VELMORA_IMPORT_BATCH_BYTES` defaults to 1,000,000,000 bytes
+     and cannot exceed D1's 5,000,000,000-byte file import limit. The script
+     proves that every original statement is accounted for and rechecks each
+     batch's checksum before loading it.
+
+     Reserve local disk for the download and spool (about another SQL dump).
+     The importer checks available space before fetching manifest parts (or
+     before splitting a legacy download), using about 2.1 times the SQL size
+     or the larger decompression/assembly requirement. It discards compressed
+     bytes after verification, the SQL after spooling, and spools as used.
+
+     Before batch 0, a single D1 import checks that the target is still
+     empty and marks it incomplete. The marker blocks arming and replay.
+     If loading stops before all batches are recorded as loaded, delete and
+     recreate the target before retrying. The script never deletes databases.
+
+     Verification counts the idle target in indexed pages of at most 5,000
+     rows per query. If a verification query fails or is interrupted, rerun
+     the same command with the same source, restore point, and target UUID.
+     It verifies the counts saved from the dump without downloading or
+     reloading any batches. If the counts differ, delete and recreate the
+     target; never skip verification of a known mismatch. The opt-out
+     (`VELMORA_IMPORT_SKIP_ROW_COUNTS=yes`) is accepted only on a fresh load
+     and prints a warning. A retry cannot clear the marker by skipping.
    - Nothing: create a database. The restore point is `0`.
 
    Then, in every case, bring the schema up to date and close the
