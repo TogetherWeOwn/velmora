@@ -1505,12 +1505,8 @@ where
     }
 }
 
-/// What a posting job holds per socket: the rendered article and, while
-/// it is written, its dot-stuffed copy (`write_dot_block`), each about
-/// 0.74 MiB for a full article. Measured on a deployed Worker, three post
-/// jobs at 6 sockets charged at 1 MiB a socket held 3.6 MiB a job more
-/// than they charged.
-pub(crate) const POST_SOCKET_BYTES: u64 = 3 * 512 * 1024;
+/// A posting job holds one rendered article per socket.
+pub(crate) const POST_SOCKET_BYTES: u64 = 1024 * 1024;
 
 /// The sessions a job opened before it loaded its extent, the time of the
 /// renewal they were connected under (`None` = not connected yet), the

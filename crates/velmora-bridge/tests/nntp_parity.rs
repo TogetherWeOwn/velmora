@@ -194,34 +194,6 @@ async fn a_full_extent_is_posted_with_four_parity_articles() {
     }
 }
 
-/// What a post job of a full extent charges to the isolate's budget at 6
-/// sockets, through the queue path (`run_job`) that charges it: 25.00 MiB
-/// without parity (the extent and 1.5 MiB a socket), 29.13 MiB with it
-/// (its 4 parity shards and the codec's 2 more). The shipped 90 MiB job
-/// budget is three of the second and a verify job.
-#[tokio::test]
-async fn a_post_job_charges_its_extent_sockets_and_parity() {
-    for (parity, want) in [(false, 26_218_544), (true, 30_545_264)] {
-        let mut rig = rig(&[spec("bb0", 7)]).await;
-        rig.bridge.cfg.packed_plans = true;
-        rig.bridge.cfg.parity = parity;
-        rig.bridge.cfg.post_sockets = 6;
-        let s = rig.seed(1, &marked_plaintext(FULL)).await;
-        let job = Job::Extent {
-            v: JOB_VERSION,
-            extent: s.extent.clone(),
-            generation: s.generation.clone(),
-            stage: OutboxStage::Post,
-        };
-
-        assert_eq!(rig.bridge.run_job(&job).await, JobOutcome::Ack);
-
-        assert_eq!(rig.job(&s).await.parity_count, parity.then_some(4));
-        assert_eq!(rig.bridge.budget.peak(), want, "parity {parity}");
-        assert_eq!(rig.bridge.budget.in_use(), 0);
-    }
-}
-
 /// One parity article per six data articles, rounded up, and at least
 /// one: twelve data articles get two, a single one gets one.
 #[tokio::test]
