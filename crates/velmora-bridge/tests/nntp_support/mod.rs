@@ -421,6 +421,8 @@ pub struct MemCatalog {
     /// Each wait in the line: the holder, its providers and the time
     /// it had.
     pub line_waits: RefCell<Vec<(String, Vec<String>, i64)>>,
+    /// The hard limit of the last wait in the line.
+    pub line_hard_ms: Cell<i64>,
     /// The holders whose jobs said they stopped (`leave_line`).
     pub line_left: RefCell<Vec<String>>,
     /// Each slot request waits for the runtime once before it is
@@ -1370,13 +1372,15 @@ impl Catalog for MemCatalog {
         &self,
         providers: &[&ProviderConfig],
         holder: &str,
-        ms: i64,
+        window: SlotWaitWindow,
         sleep: &velmora_bridge::ingress::Sleeper,
     ) -> Result<SlotWait> {
+        let ms = window.normal_ms;
         let Some(end) = self.line.get() else {
             return Ok(SlotWait::Unsupported);
         };
         let ids = providers.iter().map(|p| p.id.clone()).collect();
+        self.line_hard_ms.set(window.hard_ms);
         self.line_waits
             .borrow_mut()
             .push((holder.to_string(), ids, ms));

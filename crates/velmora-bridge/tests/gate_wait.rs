@@ -133,6 +133,8 @@ struct World {
     grant_sequence: Cell<u64>,
     /// A wake sent by the caller cannot reach the gate until this time.
     wake_delayed_until: Cell<Option<i64>>,
+    /// The caller cannot receive the opening wait reply until this time.
+    wait_reply_delayed_until: Cell<Option<i64>>,
     /// The gate runs code from before the line: it cannot read a
     /// request to wait.
     old_code: Cell<bool>,
@@ -173,6 +175,7 @@ impl World {
             grants: RefCell::default(),
             grant_sequence: Cell::new(0),
             wake_delayed_until: Cell::new(None),
+            wait_reply_delayed_until: Cell::new(None),
             old_code: Cell::new(false),
             fail_release: Cell::new(false),
         })
@@ -616,6 +619,18 @@ impl GateTransport for Wire {
         };
         self.0.sockets.borrow_mut().insert(line.id, socket);
         self.0.deliver(&gate).await;
+        if let Some(until) = self
+            .0
+            .wait_reply_delayed_until
+            .get()
+            .filter(|_| reply.waiting)
+        {
+            core::future::poll_fn(|_| match self.0.now.get() >= until {
+                true => Poll::Ready(()),
+                false => Poll::Pending,
+            })
+            .await;
+        }
         Ok((line, on_the_wire(&reply)))
     }
 
@@ -740,7 +755,11 @@ fn wait<'a>(
     ms: i64,
     sleep: &'a Sleeper,
 ) -> Waiting<'a> {
-    Box::pin(c.await_permit(providers, holder, ms, sleep))
+    let window = SlotWaitWindow {
+        normal_ms: ms,
+        hard_ms: ms,
+    };
+    Box::pin(c.await_permit(providers, holder, window, sleep))
 }
 
 /// Runs a wait as far as it goes with what has arrived.
@@ -913,6 +932,83 @@ async fn a_slot_that_ran_out_is_found_with_one_question() {
     assert_eq!(turn(&mut wait_a), Some(SlotWait::Granted));
     assert_eq!((w.opens.get(), w.msgs.get()), (asked.0, asked.1 + 1));
     assert!(take(&a, &w, &p, JOB, "job-a").await.is_some());
+}
+
+#[tokio::test]
+async fn a_waiter_retries_when_the_horizon_save_at_expiry_fails() {
+    retry_after_failed_horizon_save(false).await;
+}
+
+#[tokio::test]
+async fn a_failed_save_overrides_the_next_slots_later_expiry() {
+    retry_after_failed_horizon_save(true).await;
+}
+
+async fn retry_after_failed_horizon_save(two_jobs: bool) {
+    let w = World::new();
+    let p = provider("p", 2 + u32::from(two_jobs)); // one slot stays for reads
+    let c = w.pushing("holder", core::slice::from_ref(&p));
+    let first_expiry = w.now().0 + JOB_MS;
+    assert!(take(&c, &w, &p, JOB, "holder").await.is_some());
+    if two_jobs {
+        w.pass(JOB_MS / 2);
+        assert!(take(&c, &w, &p, JOB, "other-holder").await.is_some());
+    }
+    // The stored horizon barely covers the held slots. Giving out the
+    // next slot requires a save, which fails on the first wake.
+    w.store.record.borrow_mut().as_mut().unwrap().jobs_until = w.now().0 + JOB_MS;
+    w.hibernate();
+    let (sleep, on) = (w.sleeper(), [&p]);
+    let a = w.pushing("a", core::slice::from_ref(&p));
+    let mut waiting = wait(&a, &on, "job-a", jobs::SLOT_WAIT_MS, &sleep);
+    assert_eq!(turn(&mut waiting), None);
+    let traffic = (w.opens.get(), w.msgs.get());
+
+    w.store.down.set(true);
+    w.pass(first_expiry + 1 - w.now().0);
+    assert_eq!(turn(&mut waiting), None);
+    assert_eq!((w.opens.get(), w.msgs.get()), (traffic.0, traffic.1 + 1));
+    w.store.down.set(false);
+    w.pass(i64::from(jobs::SLOT_POLL_MS) - 1);
+    assert_eq!(turn(&mut waiting), None);
+    w.pass(1);
+    assert_eq!(turn(&mut waiting), Some(SlotWait::Granted));
+    assert_eq!((w.opens.get(), w.msgs.get()), (traffic.0, traffic.1 + 2));
+    assert!(take(&a, &w, &p, JOB, "job-a").await.is_some());
+}
+
+#[tokio::test]
+async fn a_waiting_reply_without_a_known_next_event_has_a_retry_wake() {
+    // The other shard seizes the slot for jobs. Once both shards
+    // have seized their rows, this one has only the idle read slot.
+    let first = World::new();
+    let w = World::beside(&first, "permits:all:1");
+    let p = GateProvider::from(&provider("p", 2));
+    let activate = GateRequest {
+        id: 0,
+        gate: first.name.clone(),
+        ops: vec![GateOp::Activate {
+            providers: vec![p.part(0, 2)],
+        }],
+    };
+    Wire(first, "a".into()).call(activate).await.unwrap();
+    let request = GateRequest {
+        id: 1,
+        gate: w.name.clone(),
+        ops: vec![GateOp::Wait {
+            wants: vec![GateWant {
+                provider: p.part(1, 2),
+                peers: vec![],
+            }],
+            holder: "job-a".into(),
+            ms: jobs::SLOT_WAIT_MS,
+        }],
+    };
+    let wire = Wire(w, "a".into());
+    let (_session, reply) = wire.open(request).await.unwrap();
+    assert!(reply.waiting);
+    assert_eq!(reply.wake, Some(i64::from(jobs::SLOT_POLL_MS)));
+    assert_eq!(reply.restart_until, None);
 }
 
 /// Jobs that wait for different providers do not wait for each other,
@@ -1252,6 +1348,154 @@ async fn the_default_job_wait_outlasts_the_restart_hold() {
     assert_eq!(turn(&mut waiting), Some(SlotWait::Granted));
 }
 
+#[tokio::test]
+async fn a_job_wait_outlasts_a_restart_hold_that_starts_after_claim() {
+    let Full { w, p, .. } = full().await;
+    let claimed = w.now();
+    w.restart();
+    w.pass(3_000);
+    let (sleep, on) = (w.sleeper(), [&p]);
+    let a = w.pushing("a", core::slice::from_ref(&p));
+    let margin = i64::from(jobs::SLOT_POLL_MS) - 1;
+    w.wake_delayed_until
+        .set(Some(w.now().0 + JOB_MS + SKEW_MS + margin));
+    let window = job_slot_window(claimed, w.now());
+    let left = window.normal_ms;
+    let mut waiting: Waiting<'_> = Box::pin(a.await_permit(&on, "job-a", window, &sleep));
+    assert_eq!(turn(&mut waiting), None);
+
+    w.pass(left);
+    assert_eq!(turn(&mut waiting), None, "the restart hold is still active");
+    w.pass(JOB_MS + SKEW_MS + margin - left);
+    assert_eq!(turn(&mut waiting), Some(SlotWait::Granted));
+    let opened = w.opens.get();
+    assert!(take(&a, &w, &p, JOB, "job-a").await.is_some());
+    assert_eq!(w.opens.get(), opened, "uses the slot from the wait");
+}
+
+#[tokio::test]
+async fn a_delayed_reply_does_not_postpone_the_restart_wake() {
+    let Full { w, p, .. } = full().await;
+    let claimed = w.now();
+    w.restart();
+    w.pass(80_000);
+    let (sleep, on) = (w.sleeper(), [&p]);
+    let a = w.pushing("a", core::slice::from_ref(&p));
+    let window = job_slot_window(claimed, w.now());
+    w.wait_reply_delayed_until.set(Some(w.now().0 + 3_000));
+    let mut waiting: Waiting<'_> = Box::pin(a.await_permit(&on, "job-a", window, &sleep));
+    assert_eq!(turn(&mut waiting), None);
+    w.pass(3_000);
+    assert_eq!(turn(&mut waiting), None);
+
+    w.pass(JOB_MS + SKEW_MS - 3_000);
+    assert_eq!(turn(&mut waiting), Some(SlotWait::Granted));
+    assert_eq!(w.msgs.get(), 1, "one wake, with no other traffic");
+}
+
+#[tokio::test]
+async fn a_client_clock_ahead_does_not_spin_at_the_restart_wake() {
+    let Full { w, p, .. } = full().await;
+    let claimed = w.now();
+    w.restart();
+    w.pass(3_000);
+    let (sleep, on) = (w.sleeper(), [&p]);
+    let (a, behind) = w.behind(core::slice::from_ref(&p));
+    behind.set(-SKEW_MS);
+    let window = job_slot_window(claimed, w.now());
+    let mut waiting: Waiting<'_> = Box::pin(a.await_permit(&on, "job-a", window, &sleep));
+    assert_eq!(turn(&mut waiting), None);
+
+    w.pass(JOB_MS);
+    assert_eq!(turn(&mut waiting), None, "the gate is still warm");
+    assert_eq!(w.msgs.get(), 1, "one early wake on the ahead clock");
+    w.pass(SKEW_MS - 1);
+    assert_eq!(turn(&mut waiting), None);
+    assert_eq!(w.msgs.get(), 1, "no spin on the same restart hold");
+    w.pass(1);
+    assert_eq!(turn(&mut waiting), Some(SlotWait::Granted));
+    assert_eq!(w.msgs.get(), 2);
+}
+
+fn job_slot_window(claimed: UnixMs, now: UnixMs) -> SlotWaitWindow {
+    let age = now.0 - claimed.0;
+    SlotWaitWindow {
+        normal_ms: jobs::SLOT_WAIT_MS - age,
+        hard_ms: i64::from(LEASE_SECS) * 1000 - 393_000 - age,
+    }
+}
+
+#[tokio::test]
+async fn a_restart_hold_cannot_extend_the_wait_past_the_hard_limit() {
+    let Full { w, p, .. } = full().await;
+    let claimed = w.now();
+    w.restart();
+    w.pass(90_000);
+    let (sleep, on) = (w.sleeper(), [&p]);
+    let a = w.pushing("a", core::slice::from_ref(&p));
+    let window = job_slot_window(claimed, w.now());
+    let mut waiting: Waiting<'_> = Box::pin(a.await_permit(&on, "job-a", window, &sleep));
+    assert_eq!(turn(&mut waiting), None);
+
+    w.pass(window.hard_ms - 1);
+    assert_eq!(turn(&mut waiting), None);
+    w.pass(1);
+    assert_eq!(turn(&mut waiting), Some(SlotWait::Elapsed));
+    assert_eq!(w.msgs.get(), 0, "the restart hold has not ended");
+    assert_eq!(w.sessions(), 0, "the job leaves its line");
+}
+
+#[tokio::test]
+async fn a_job_does_not_use_a_restart_grant_after_its_hard_limit() {
+    let Full { w, p, .. } = full().await;
+    let claimed = w.now();
+    w.restart();
+    w.pass(80_000);
+    let (sleep, on) = (w.sleeper(), [&p]);
+    let a = w.pushing("a", core::slice::from_ref(&p));
+    let window = job_slot_window(claimed, w.now());
+    let mut waiting: Waiting<'_> = Box::pin(a.await_permit(&on, "job-a", window, &sleep));
+    assert_eq!(turn(&mut waiting), None);
+
+    let hold = JOB_MS + SKEW_MS;
+    w.pass(hold);
+    assert_eq!(w.held("p").await, 1, "the gate pushed a slot");
+    w.pass(window.hard_ms - hold + 1);
+    // The job was not polled while both the grant and the timer became ready.
+    assert_eq!(turn(&mut waiting), Some(SlotWait::Elapsed));
+    assert_eq!(w.sessions(), 0);
+}
+
+#[tokio::test]
+async fn an_ordinary_expiry_does_not_extend_the_normal_wait() {
+    let Full { w, p, .. } = full().await;
+    let (sleep, on) = (w.sleeper(), [&p]);
+    let a = w.pushing("a", core::slice::from_ref(&p));
+    let window = job_slot_window(w.now().plus_ms(-10_000), w.now());
+    assert!(window.normal_ms < JOB_MS - 1_000 && window.hard_ms > JOB_MS);
+    let mut waiting: Waiting<'_> = Box::pin(a.await_permit(&on, "job-a", window, &sleep));
+    assert_eq!(turn(&mut waiting), None);
+    w.pass(window.normal_ms);
+    assert_eq!(turn(&mut waiting), Some(SlotWait::Elapsed));
+    assert_eq!(w.msgs.get(), 0, "the ordinary expiry is still ahead");
+}
+
+#[tokio::test]
+async fn a_grant_after_the_ordinary_deadline_does_not_extend_it() {
+    let Full { w, p, c, first, .. } = full().await;
+    let (sleep, on) = (w.sleeper(), [&p]);
+    let a = w.pushing("a", core::slice::from_ref(&p));
+    let window = job_slot_window(w.now().plus_ms(-10_000), w.now());
+    let mut waiting: Waiting<'_> = Box::pin(a.await_permit(&on, "job-a", window, &sleep));
+    assert_eq!(turn(&mut waiting), None);
+
+    w.pass(window.normal_ms + 1);
+    c.release_permit(&first).await.unwrap();
+    assert_eq!(w.pushed.get(), 1, "the grant and the timer are both ready");
+    assert_eq!(turn(&mut waiting), Some(SlotWait::Elapsed));
+    assert_eq!(w.held("p").await, 1, "the late grant went back");
+}
+
 /// After a restart no job gets a slot while a read of the old object
 /// may still hold one, which can be later than the last of its jobs.
 /// The job in the line is told that time, not the earlier one: it asks
@@ -1467,7 +1711,11 @@ async fn a_losing_pending_open_does_not_hold_a_slot() {
                 &both,
             )
             .with_push(true);
-            let mut waiting = a.wait(&on, "job-a", 60_000, &sleep);
+            let window = SlotWaitWindow {
+                normal_ms: 60_000,
+                hard_ms: 60_000,
+            };
+            let mut waiting = a.wait(&on, "job-a", window, &sleep);
             assert_eq!(turn(&mut waiting), None);
             let id = pending.await.unwrap();
             let gate = wq.gate().await;

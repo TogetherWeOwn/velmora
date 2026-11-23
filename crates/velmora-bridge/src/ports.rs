@@ -549,6 +549,15 @@ pub struct Permit {
     pub class: PermitClass,
 }
 
+/// The time left to wait for a job slot ([`Catalog::await_permit`]).
+#[derive(Clone, Copy, Debug)]
+pub struct SlotWaitWindow {
+    /// The ordinary wait budget in milliseconds.
+    pub normal_ms: i64,
+    /// The hard limit in milliseconds, even if a gate reports a restart hold.
+    pub hard_ms: i64,
+}
+
 /// How a job's wait for a slot ended ([`Catalog::await_permit`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SlotWait {
@@ -1379,10 +1388,12 @@ pub trait Catalog {
     ) -> Result<Option<Permit>>;
     async fn renew_permit(&self, p: &Permit, now: UnixMs) -> Result<bool>;
     async fn release_permit(&self, p: &Permit) -> Result<()>;
-    /// Waits up to `ms` for a job slot on one of `providers` to be
-    /// `holder`'s, where the slots are handed out by something that
-    /// keeps a line (a permit gate with `SLOT_WAIT = "push"`). The
-    /// slot goes to the caller that waited longest. If there is no
+    /// Waits within `window` for a job slot on one of `providers` to
+    /// be `holder`'s, where the slots are handed out by something that
+    /// keeps a line (a permit gate with `SLOT_WAIT = "push"`). Only a
+    /// reported restart hold can extend the ordinary wait, never past
+    /// the hard limit. The slot goes to the caller that waited longest.
+    /// If there is no
     /// event, the client asks again at the wake time the gate gave,
     /// with an empty request under the same id: a slot can expire
     /// unrenewed without an event. A zero wake means ask immediately
@@ -1395,7 +1406,7 @@ pub trait Catalog {
         &self,
         _providers: &[&ProviderConfig],
         _holder: &str,
-        _ms: i64,
+        _window: SlotWaitWindow,
         _sleep: &crate::ingress::Sleeper,
     ) -> Result<SlotWait> {
         Ok(SlotWait::Unsupported)
