@@ -22,8 +22,8 @@ use velmora_bridge::copy::{
 };
 use velmora_bridge::crypto::seal_manifest;
 use velmora_bridge::remote::{
-    md5_hex, HttpRequest, HttpResponse, HttpSend, NoAnswer, RemoteConfig, RemoteError, S3Remote,
-    MAX_ANSWER_BYTES, MAX_LIST_BYTES,
+    md5_hex, HttpRequest, HttpResponse, HttpSend, NoAnswer, Observation, Problem, RemoteConfig,
+    RemoteError, S3Remote, MAX_ANSWER_BYTES, MAX_LIST_BYTES,
 };
 use velmora_bridge::testkit::{FakeJobs, FixedClock, MemBlobStore, TestKek};
 use velmora_bridge::*;
@@ -42,6 +42,7 @@ type Sent = std::result::Result<HttpResponse, NoAnswer>;
 
 #[derive(Default)]
 struct FakeE2 {
+    observation: Cell<Option<(UnixMs, Observation)>>,
     /// The store's own time: a pause moves it, and a request signed for
     /// a time more than one second from it is refused.
     clock: Option<FixedClock>,
@@ -351,6 +352,11 @@ impl HttpSend for &FakeE2 {
             return;
         }
         self.clock.as_ref().expect("a clock").advance_ms(ms as i64);
+    }
+
+    fn observe(&self, observation: Observation) {
+        let at = self.clock.as_ref().map_or(UnixMs(0), Clock::now);
+        self.observation.set(Some((at, observation)));
     }
 }
 
@@ -1438,12 +1444,147 @@ async fn verification_observation_survives_failed_continuation_enqueue() {
         w.record(&format!("m/art/x_{i:04}"), b"plan").await;
     }
     w.jobs.fail_after(Some(0));
-    let (outcome, counts, why) = w.copier().run_job(&w.jobs, UnixMs(NOW), "").await;
+    let observed = Cell::new(None);
+    let (outcome, counts, why) = w
+        .copier()
+        .run_job_observed(&w.jobs, UnixMs(NOW), "", true, |_| {
+            assert_eq!(w.jobs.calls(), 0);
+            observed.set(w.e2.observation.get());
+            std::future::ready(())
+        })
+        .await;
     assert!(matches!(outcome, JobOutcome::Retry { .. }));
     assert_eq!(why, Some(StepError::Queue));
-    let counts = counts.unwrap();
-    assert_eq!(counts.copied as usize, JOB_COPIES);
-    assert_eq!(counts.last_verified_write_at, Some(UnixMs(NOW)));
+    assert_eq!(counts.unwrap().copied as usize, JOB_COPIES);
+    assert_eq!(
+        observed.get(),
+        Some((UnixMs(NOW), Observation::VerifiedWrite))
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn list_refusal_and_exhausted_retries_reach_the_job_observer() {
+    for (status, kind) in [
+        (403, "refused"),
+        (503, "retry_exhausted"),
+        (429, "retry_exhausted"),
+    ] {
+        let w = World::new();
+        w.e2.status.set(Some(status));
+        let seen = Cell::new(None);
+        let (_, counts, why) = w
+            .copier()
+            .run_job_observed(&w.jobs, UnixMs(NOW), "", true, |_| {
+                seen.set(w.e2.observation.get());
+                std::future::ready(())
+            })
+            .await;
+        assert!(counts.is_none());
+        assert!(matches!(why, Some(StepError::Store(_))));
+        assert_eq!(
+            seen.get().map(|(_, p)| p),
+            Some(Observation::Problem(Problem {
+                operation: "list",
+                kind,
+                status: Some(status),
+                code: None,
+            }))
+        );
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn verification_mismatch_unsignable_and_no_answer_are_observed() {
+    let w = World::new();
+    let seen = || w.e2.observation.get().map(|(_, event)| event);
+    w.e2.damage_puts.set(true);
+    assert_eq!(
+        w.remote.put(&w.clock, "m/x", b"copy").await,
+        Err(RemoteError::Mismatch)
+    );
+    assert_eq!(
+        seen(),
+        Some(Observation::Problem(Problem {
+            operation: "verify",
+            kind: "mismatch",
+            status: Some(200),
+            code: None,
+        }))
+    );
+    assert_eq!(
+        w.remote.put(&w.clock, "../x", b"copy").await,
+        Err(RemoteError::Unsignable)
+    );
+    assert_eq!(
+        seen(),
+        Some(Observation::Problem(Problem {
+            operation: "put",
+            kind: "unsignable",
+            status: None,
+            code: None,
+        }))
+    );
+    w.e2.drop_next.set(4);
+    assert_eq!(
+        w.remote.list(&w.clock, "m/", "").await,
+        Err(RemoteError::Unavailable)
+    );
+    assert_eq!(
+        seen(),
+        Some(Observation::Problem(Problem {
+            operation: "list",
+            kind: "no_answer",
+            status: None,
+            code: None,
+        }))
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_multi_job_walk_reports_matching_coverage_frontiers() {
+    for later_pass in [false, true] {
+        let w = World::new();
+        for i in 0..=JOB_COPIES {
+            w.record(&format!("m/art/x_{i:04}"), b"plan").await;
+        }
+        let start = RefCell::new(None);
+        let (_, _, why) = w
+            .copier()
+            .run_job_observed(&w.jobs, UnixMs(NOW), "", true, |report| {
+                assert!(report.fresh_swept);
+                start.replace(report.walk);
+                std::future::ready(())
+            })
+            .await;
+        assert_eq!(why, None);
+        let start = start.into_inner().unwrap();
+        assert!(start.starts);
+        let next = w.jobs.take().pop().unwrap().job;
+        let Job::RecoveryCopy { pass, cursor, .. } = next else {
+            panic!("not a copy job")
+        };
+        let (pass, cursor) = if later_pass {
+            let pass = UnixMs(pass.0 + PASS_INTERVAL_MS);
+            w.clock.set(pass);
+            (pass, String::new())
+        } else {
+            (pass, cursor)
+        };
+        let end = RefCell::new(None);
+        let (_, _, why) = w
+            .copier()
+            .run_job_observed(&w.jobs, pass, &cursor, true, |report| {
+                end.replace(report.walk);
+                std::future::ready(())
+            })
+            .await;
+        assert_eq!(why, None);
+        let end = end.into_inner().unwrap();
+        assert!(!end.starts);
+        assert_eq!(start.began_at, end.began_at);
+        assert_eq!(start.next.as_deref(), Some(end.from.as_str()));
+        assert!(end.next.is_none());
+    }
 }
 
 #[tokio::test(flavor = "current_thread")]

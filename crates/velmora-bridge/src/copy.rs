@@ -122,7 +122,6 @@
 //!   last one at the latest. One of the fresh sweep is tried again by
 //!   the next pass.
 
-use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 
@@ -270,10 +269,6 @@ pub struct CopyCounts {
     pub refused_verify: RefusalCounts,
     pub refused_plan: RefusalCounts,
     pub unsignable: RefusalCounts,
-    #[serde(skip)]
-    pub last_refused_at: Option<UnixMs>,
-    #[serde(skip)]
-    pub last_verified_write_at: Option<UnixMs>,
     /// Does not open here; not copied.
     pub source_unreadable: u64,
     /// Generation records too young to copy.
@@ -295,24 +290,8 @@ impl CopyCounts {
         self.failed == 0 && self.refused == 0
     }
 
-    fn note_verified(&mut self, at: UnixMs) {
-        self.last_verified_write_at = self.last_verified_write_at.max(Some(at));
-    }
-
-    fn record_verified(&mut self, at: UnixMs) {
-        self.copied += 1;
-        self.note_verified(at);
-    }
-
-    fn note_refusal(&mut self, refusal: Refusal, at: UnixMs) {
-        if refusal != Refusal::Unsignable {
-            self.last_refused_at = self.last_refused_at.max(Some(at));
-        }
-    }
-
-    fn record_refusal(&mut self, refusal: Refusal, at: UnixMs) {
+    fn record_refusal(&mut self, refusal: Refusal) {
         self.refused += 1;
-        self.note_refusal(refusal, at);
         let (counts, answer) = match refusal {
             Refusal::Put(status, code) => (&mut self.refused_put, Some((status, code))),
             Refusal::Verify(status, code) => (&mut self.refused_verify, Some((status, code))),
@@ -320,11 +299,8 @@ impl CopyCounts {
             Refusal::Unsignable => (&mut self.unsignable, None),
         };
         counts.count += 1;
-        if counts.last_at.is_none_or(|last| at >= last) {
-            counts.last_at = Some(at);
-            counts.status = answer.map(|(status, _)| status);
-            counts.code = answer.and_then(|(_, code)| code);
-        }
+        counts.status = answer.map(|(status, _)| status);
+        counts.code = answer.and_then(|(_, code)| code);
     }
 }
 
@@ -334,8 +310,6 @@ pub struct RefusalCounts {
     pub count: u64,
     pub status: Option<u16>,
     pub code: Option<&'static str>,
-    #[serde(skip)]
-    last_at: Option<UnixMs>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -367,6 +341,31 @@ pub struct CopyStep {
     pub late: bool,
     /// What the sweep learned could not be saved ([`SWEEP_KEY`]).
     pub unsaved: bool,
+    /// Telemetry-only proof of what part of the walk this step covered.
+    walk_coverage: Option<WalkCoverage>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WalkCoverage {
+    pub began_at: UnixMs,
+    pub from: String,
+    pub next: Option<String>,
+    pub starts: bool,
+}
+
+#[derive(Default)]
+pub struct JobObservation {
+    pub counts: Option<CopyCounts>,
+    pub fresh_swept: bool,
+    pub walk: Option<WalkCoverage>,
+}
+
+fn coverage_tag(destination: &str, cursor: &str) -> String {
+    let mut hash = Sha256::new();
+    hash.update(destination.as_bytes());
+    hash.update([0]);
+    hash.update(cursor.as_bytes());
+    hash.finalize().iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// Why a job did not do its step: a class, and a status at most. Never
@@ -743,31 +742,9 @@ struct Item<'a> {
     what: What<'a>,
 }
 
-/// Reuses the signed request time for telemetry without taking another
-/// sample from the budget clock. For a verified PUT this is its HEAD time.
-struct RequestClock<'a, T>(&'a T, Cell<UnixMs>);
-
-impl<'a, T: Clock> RequestClock<'a, T> {
-    fn new(clock: &'a T) -> Self {
-        Self(clock, Cell::new(UnixMs(0)))
-    }
-
-    fn last(&self) -> UnixMs {
-        self.1.get()
-    }
-}
-
-impl<T: Clock> Clock for RequestClock<'_, T> {
-    fn now(&self) -> UnixMs {
-        let at = self.0.now();
-        self.1.set(at);
-        at
-    }
-}
-
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Copied {
-    Done(UnixMs),
+    Done,
     Same,
     Gone,
     Unreadable,
@@ -775,7 +752,7 @@ enum Copied {
     Failed,
     /// Not copied; the store gave no answer.
     Down,
-    Refused(Refusal, UnixMs),
+    Refused(Refusal),
     /// A generation record held back for an article plan.
     Held,
 }
@@ -784,17 +761,16 @@ impl Copied {
     fn from_remote_error(
         e: RemoteError,
         operation: fn(u16, Option<&'static str>) -> Refusal,
-        at: UnixMs,
     ) -> Self {
         match e {
-            RemoteError::Refused(status) => Self::Refused(operation(status, None), at),
+            RemoteError::Refused(status) => Self::Refused(operation(status, None)),
             RemoteError::RefusedWithCode(status, code) => {
-                Self::Refused(operation(status, Some(code)), at)
+                Self::Refused(operation(status, Some(code)))
             }
             RemoteError::VerifyRefused(status, code) => {
-                Self::Refused(Refusal::Verify(status, code), at)
+                Self::Refused(Refusal::Verify(status, code))
             }
-            RemoteError::Unsignable => Self::Refused(Refusal::Unsignable, at),
+            RemoteError::Unsignable => Self::Refused(Refusal::Unsignable),
             RemoteError::Unavailable => Self::Down,
             RemoteError::Mismatch => Self::Failed,
         }
@@ -802,8 +778,8 @@ impl Copied {
 
     fn as_plan(self) -> Plan {
         match self {
-            Self::Done(at) => Plan::Sent(at),
-            Self::Refused(refusal, at) => Plan::Refused(refusal, at),
+            Self::Done => Plan::Sent,
+            Self::Refused(refusal) => Plan::Refused(refusal),
             Self::Down => Plan::Down,
             _ => Plan::Failed,
         }
@@ -844,13 +820,13 @@ impl Named {
 enum Plan {
     /// Equal over there already.
     There,
-    Sent(UnixMs),
+    Sent,
     /// Not written yet: the extent is not posted.
     Absent,
     Unreadable,
     Failed,
     Down,
-    Refused(Refusal, UnixMs),
+    Refused(Refusal),
 }
 
 /// What became of the records of a chunk.
@@ -1008,6 +984,25 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
         pass: UnixMs,
         cursor: &str,
     ) -> (JobOutcome, Option<CopyCounts>, Option<StepError>) {
+        self.run_job_observed(jobs, pass, cursor, false, |_| std::future::ready(()))
+            .await
+    }
+
+    /// Reports destination outcomes before enqueuing a successor so it
+    /// cannot race ahead of this observation. Reports never change a
+    /// copy decision, and hints do not report.
+    pub async fn run_job_observed<J: JobSink, F, Fut>(
+        &self,
+        jobs: &J,
+        pass: UnixMs,
+        cursor: &str,
+        monitor: bool,
+        observe: F,
+    ) -> (JobOutcome, Option<CopyCounts>, Option<StepError>)
+    where
+        F: FnOnce(JobObservation) -> Fut,
+        Fut: Future<Output = ()>,
+    {
         if self.maintenance == Maintenance::Restore {
             return (JobOutcome::Ack, None, None);
         }
@@ -1015,7 +1010,10 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
         if let Some(hint) = place.as_ref().filter(|p| p.phase == Phase::Plan) {
             return self.run_hint(hint).await;
         }
-        let (outcome, counts, why) = self.run_step(jobs, pass, cursor, place).await;
+        let monitor = monitor && pass.0 > 0;
+        let (outcome, counts, why) = self
+            .run_step(jobs, pass, cursor, place, monitor, observe)
+            .await;
         // Something was left undone, and the job does not come again
         // for it. The sweep of the next pass may mend it; if it does
         // not, only the walk does, so the walk is asked to come soon.
@@ -1026,13 +1024,19 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
         (outcome, counts, why)
     }
 
-    async fn run_step<J: JobSink>(
+    async fn run_step<J: JobSink, F, Fut>(
         &self,
         jobs: &J,
         pass: UnixMs,
         cursor: &str,
         place: Option<Place>,
-    ) -> (JobOutcome, Option<CopyCounts>, Option<StepError>) {
+        monitor: bool,
+        observe: F,
+    ) -> (JobOutcome, Option<CopyCounts>, Option<StepError>)
+    where
+        F: FnOnce(JobObservation) -> Fut,
+        Fut: Future<Output = ()>,
+    {
         // A pass ends when the next one starts. The walk loses nothing
         // by it: the newer pass goes on from the place that was saved.
         // A fresh sweep that is cut short is late, and says so.
@@ -1040,6 +1044,9 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
         if age >= PASS_INTERVAL_MS {
             let walking = place.as_ref().is_some_and(|p| p.walking());
             let why = (!walking).then_some(StepError::Expired);
+            if monitor {
+                observe(JobObservation::default()).await;
+            }
             return (JobOutcome::Ack, None, why);
         }
         // Every step is idempotent, so a failed job simply runs again,
@@ -1068,13 +1075,13 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
                 }
             }
         }
-        let mut partial = CopyCounts::default();
-        let step = match self.step_with_counts(pass, cursor, &mut partial).await {
+        let step = match self.step_with_coverage(pass, cursor, monitor).await {
             Ok(step) => step,
             Err(e) => {
-                let observed =
-                    partial.last_verified_write_at.is_some() || partial.last_refused_at.is_some();
-                return (again, observed.then_some(partial), Some(e));
+                if monitor {
+                    observe(JobObservation::default()).await;
+                }
+                return (again, None, Some(e));
             }
         };
         // The store is down: the cursor does not move while the job may
@@ -1090,6 +1097,13 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
         };
         if step.outage && age < hold {
             let down = StepError::Store(RemoteError::Unavailable);
+            if monitor {
+                observe(JobObservation {
+                    counts: Some(step.counts.clone()),
+                    ..JobObservation::default()
+                })
+                .await;
+            }
             return (again, Some(step.counts), Some(down));
         }
         let mut why = step.late.then_some(StepError::Expired);
@@ -1103,9 +1117,7 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
         // walk under way, goes through every key again: with the place
         // left near the end, every pass would walk that end only.
         // Best effort: without it the next pass asks for the walk.
-        if step.swept {
-            let _ = self.save_time(SWEPT_KEY, pass).await;
-        }
+        let swept_saved = step.swept && self.save_time(SWEPT_KEY, pass).await.is_ok();
         let mut saved = true;
         if step.began {
             // The place of an earlier walk goes first: a start with
@@ -1125,6 +1137,19 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
         }
         if !saved {
             why = why.or(Some(StepError::Mark));
+        }
+        if monitor {
+            let complete =
+                step.counts.clean() && step.counts.source_unreadable == 0 && !step.unsaved;
+            let walk = (complete && saved && step.counts.pending == 0)
+                .then_some(step.walk_coverage)
+                .flatten();
+            observe(JobObservation {
+                counts: Some(step.counts.clone()),
+                fresh_swept: swept_saved && complete,
+                walk,
+            })
+            .await;
         }
         if let Some(cursor) = step.next {
             let next = Job::RecoveryCopy {
@@ -1154,23 +1179,30 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
         pass: UnixMs,
         cursor: &str,
     ) -> std::result::Result<CopyStep, StepError> {
-        self.step_with_counts(pass, cursor, &mut CopyCounts::default())
-            .await
+        self.step_with_coverage(pass, cursor, false).await
     }
 
-    async fn step_with_counts(
+    async fn step_with_coverage(
         &self,
         pass: UnixMs,
         cursor: &str,
-        counts: &mut CopyCounts,
+        monitor: bool,
     ) -> std::result::Result<CopyStep, StepError> {
         let mut budget = Budget {
             started: self.clock.now(),
             copies: 0,
             pages: 0,
         };
+        let mut counts = CopyCounts::default();
         let mut known = Known::default();
         let place = Place::parse(cursor).unwrap_or_else(|| Place::start(pass));
+        let mut walk_origin = if monitor && place.walking() {
+            self.continued_walk_origin(pass).await
+        } else {
+            None
+        };
+        let destination = monitor.then(|| self.remote.place());
+        let mut walk_from = None;
         // The time of the sweep is up: the walk has the rest of the pass.
         // A hint is no part of a pass ([`Copier::run_job`] does it).
         let hint = place.phase == Phase::Plan;
@@ -1179,16 +1211,21 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
         // `None` = the pass is over: the walk rests.
         let mut turn = (!hint).then_some(place);
         if late {
-            turn = self.enter_walk(pass, &mut began).await?;
+            turn = self.enter_walk(pass, &mut began, &mut walk_origin).await?;
         }
         let mut walk = None;
         let (next, outage) = loop {
             let Some(mut place) = turn.take() else {
                 break (None, false);
             };
+            if walk_from.is_none() && place.walking() {
+                walk_from = destination
+                    .as_deref()
+                    .map(|id| coverage_tag(id, &place.cursor()));
+            }
             let phase = span(place.phase, pass);
             let walked = self
-                .walk(&phase, &mut place, &mut budget, counts, &mut known)
+                .walk(&phase, &mut place, &mut budget, &mut counts, &mut known)
                 .await?;
             if place.walking() {
                 walk = Some(place.key.clone());
@@ -1201,7 +1238,7 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
                 // The last phase of the sweep.
                 (Phase::TenantGenerations, None) => {
                     swept = true;
-                    self.enter_walk(pass, &mut began).await?
+                    self.enter_walk(pass, &mut began, &mut walk_origin).await?
                 }
                 // The last phase of the walk.
                 (Phase::Tail, None) => {
@@ -1212,8 +1249,18 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
                 (_, None) => None,
             };
         };
+        let walk_coverage =
+            walk_origin
+                .zip(walk_from)
+                .zip(destination)
+                .map(|((began_at, from), id)| WalkCoverage {
+                    began_at,
+                    from,
+                    next: next.as_deref().map(|cursor| coverage_tag(&id, cursor)),
+                    starts: began,
+                });
         Ok(CopyStep {
-            counts: std::mem::take(counts),
+            counts,
             walk,
             began,
             ended,
@@ -1222,7 +1269,28 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
             outage,
             late,
             unsaved: !self.save_known(known).await,
+            walk_coverage,
         })
+    }
+
+    async fn continued_walk_origin(&self, pass: UnixMs) -> Option<UnixMs> {
+        let store = self.remote.place();
+        if self
+            .read_mark(STORE_KEY, store.len())
+            .await
+            .ok()
+            .flatten()
+            .as_deref()
+            != Some(store.as_bytes())
+        {
+            return None;
+        }
+        self.read_time(BEGAN_KEY)
+            .await
+            .ok()
+            .flatten()
+            .filter(|began| (1..=pass.0).contains(began))
+            .map(UnixMs)
     }
 
     /// Where the walk of the pass that started at `pass` goes on, or
@@ -1232,6 +1300,7 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
         &self,
         pass: UnixMs,
         began: &mut bool,
+        origin: &mut Option<UnixMs>,
     ) -> std::result::Result<Option<Place>, StepError> {
         // What is saved of the walk, read in one place of the code (the
         // Worker has a size budget): its place, its end, its start,
@@ -1269,6 +1338,9 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
         // that began in the middle of the keys end, and rest.
         let under_way = start.is_some_and(|at| ended.is_none_or(|ended| at > ended));
         if under_way && (place.phase != Phase::Low || !place.key.is_empty()) {
+            *origin = start
+                .filter(|began| (1..=pass.0).contains(began))
+                .map(UnixMs);
             return Ok(Some(place));
         }
         // Under way without a place (the job that began it died before
@@ -1284,6 +1356,7 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
             return Ok(None);
         }
         *began = true;
+        *origin = Some(pass);
         Ok(Some(Place::at(Phase::Low, String::new())))
     }
 
@@ -1388,8 +1461,8 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
                     counts.same = 1;
                     None
                 }
-                Plan::Sent(at) => {
-                    counts.record_verified(at);
+                Plan::Sent => {
+                    counts.copied += 1;
                     None
                 }
                 // Not written, or removed: nothing to send.
@@ -1398,8 +1471,8 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
                     counts.source_unreadable = 1;
                     None
                 }
-                Plan::Refused(refusal, at) => {
-                    counts.record_refusal(refusal, at);
+                Plan::Refused(refusal) => {
+                    counts.record_refusal(refusal);
                     None
                 }
                 Plan::Failed => {
@@ -1739,7 +1812,7 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
                     asked += usize::from(!matches!(plan, Plan::Absent | Plan::Unreadable));
                     match plan {
                         Plan::There => {}
-                        Plan::Sent(at) => counts.record_verified(at),
+                        Plan::Sent => counts.copied += 1,
                         Plan::Absent => continue,
                         Plan::Unreadable => {
                             counts.source_unreadable += 1;
@@ -1754,8 +1827,8 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
                             down += 1;
                             continue;
                         }
-                        Plan::Refused(refusal, at) => {
-                            counts.record_refusal(refusal, at);
+                        Plan::Refused(refusal) => {
+                            counts.record_refusal(refusal);
                             continue;
                         }
                     }
@@ -1790,7 +1863,7 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
                             .await
                         {
                             Some(copied) => {
-                                if matches!(copied, Copied::Done(_)) {
+                                if copied == Copied::Done {
                                     known.forget(key);
                                 }
                                 if copied == Copied::Down {
@@ -1835,23 +1908,13 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
         let (asked, mut down) = (sent.len(), 0);
         for (i, copied) in sent {
             down += usize::from(copied == Copied::Down);
-            if matches!(copied, Copied::Done(_)) {
+            if copied == Copied::Done {
                 known.forget(&chunk[i].entry.key);
             }
             result[i] = Some(copied);
         }
         outage |= all_down(asked, down);
 
-        // A buffered request can finish past the cursor's accounted
-        // prefix. Keep its write/refusal time without changing counts
-        // or how the copy cursor advances.
-        for copied in result.iter().skip(finished).flatten() {
-            match *copied {
-                Copied::Done(at) => counts.note_verified(at),
-                Copied::Refused(refusal, at) => counts.note_refusal(refusal, at),
-                _ => {}
-            }
-        }
         for (item, copied) in chunk.iter().zip(result).take(finished) {
             let copied = match item.what {
                 What::Young => {
@@ -1864,11 +1927,11 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
             match copied {
                 // Removed since it was listed: not a record any more.
                 Some(Copied::Gone) => continue,
-                Some(Copied::Done(at)) => counts.record_verified(at),
+                Some(Copied::Done) => counts.copied += 1,
                 Some(Copied::Same) => counts.same += 1,
                 Some(Copied::Unreadable) => counts.source_unreadable += 1,
                 Some(Copied::Failed | Copied::Down) => counts.failed += 1,
-                Some(Copied::Refused(refusal, at)) => counts.record_refusal(refusal, at),
+                Some(Copied::Refused(refusal)) => counts.record_refusal(refusal),
                 Some(Copied::Held) => counts.pending += 1,
                 None => {}
             }
@@ -2012,21 +2075,20 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
             if head.open_segment(self.kek, layout, index, &sealed).is_err() {
                 return Some(Copied::Unreadable);
             }
-            let clock = RequestClock::new(self.clock);
-            match self.remote.head(&clock, &name).await {
+            match self.remote.head(self.clock, &name).await {
                 Ok(copy) if equal(copy.as_ref(), sealed.len() as u64, &md5_hex(&sealed)) => {
                     continue
                 }
                 Ok(_) => {}
-                Err(e) => return Some(Copied::from_remote_error(e, Refusal::Plan, clock.last())),
+                Err(e) => return Some(Copied::from_remote_error(e, Refusal::Plan)),
             }
             if sent > 0 && self.spent(budget.started) {
                 return None;
             }
             match self.send(&name, &sealed).await {
-                Copied::Done(at) => {
+                Copied::Done => {
                     sent += 1;
-                    counts.record_verified(at);
+                    counts.copied += 1;
                 }
                 other => return Some(other),
             }
@@ -2062,13 +2124,12 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
         if open_manifest(self.kek, key, &bytes).is_err() {
             return Plan::Unreadable;
         }
-        let clock = RequestClock::new(self.clock);
-        match self.remote.head(&clock, key).await {
+        match self.remote.head(self.clock, key).await {
             Ok(copy) if equal(copy.as_ref(), bytes.len() as u64, &md5_hex(&bytes)) => {
                 return Plan::There
             }
             Ok(_) => {}
-            Err(e) => return Copied::from_remote_error(e, Refusal::Plan, clock.last()).as_plan(),
+            Err(e) => return Copied::from_remote_error(e, Refusal::Plan).as_plan(),
         }
         self.send(key, &bytes).await.as_plan()
     }
@@ -2091,10 +2152,9 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
     }
 
     async fn send(&self, key: &str, bytes: &[u8]) -> Copied {
-        let clock = RequestClock::new(self.clock);
-        match self.remote.put(&clock, key, bytes).await {
-            Ok(()) => Copied::Done(clock.last()),
-            Err(e) => Copied::from_remote_error(e, Refusal::Put, clock.last()),
+        match self.remote.put(self.clock, key, bytes).await {
+            Ok(()) => Copied::Done,
+            Err(e) => Copied::from_remote_error(e, Refusal::Put),
         }
     }
 }

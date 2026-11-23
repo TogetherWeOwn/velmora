@@ -109,6 +109,50 @@ pub struct NoAnswer;
 pub trait HttpSend {
     async fn send(&self, request: &HttpRequest) -> Result<HttpResponse, NoAnswer>;
     async fn pause(&self, ms: u64);
+    /// Called when the outcome is known, never at signing time.
+    fn observe(&self, _: Observation) {}
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Observation {
+    Problem(Problem),
+    VerifiedWrite,
+}
+
+/// Safe diagnostic fields only, never a key, URL, or provider text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Problem {
+    pub operation: &'static str,
+    pub kind: &'static str,
+    pub status: Option<u16>,
+    pub code: Option<&'static str>,
+}
+
+#[derive(Clone, Copy)]
+enum Operation {
+    Put,
+    Verify,
+    Plan,
+    List,
+}
+
+impl Operation {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Put => "put",
+            Self::Verify => "verify",
+            Self::Plan => "plan",
+            Self::List => "list",
+        }
+    }
+
+    fn method(self) -> &'static str {
+        match self {
+            Self::Put => "PUT",
+            Self::Verify | Self::Plan => "HEAD",
+            Self::List => "GET",
+        }
+    }
 }
 
 /// Why a request to the store did not do what was asked. Refusals can
@@ -134,7 +178,7 @@ pub enum RemoteError {
     Unsignable,
 }
 
-fn refused(response: &HttpResponse) -> RemoteError {
+fn error_code(response: &HttpResponse) -> Option<&'static str> {
     // HEAD commonly has no body; prefer the error-code header when present.
     // Do not log provider-controlled strings, even if they look like codes.
     let known = |value: &str| {
@@ -156,14 +200,16 @@ fn refused(response: &HttpResponse) -> RemoteError {
             "NotImplemented",
             "QuotaExceeded",
             "RequestTimeTooSkewed",
+            "ServiceUnavailable",
             "SignatureDoesNotMatch",
+            "SlowDown",
             "StorageQuotaExceeded",
             "SubscriptionExpired",
         ]
         .into_iter()
         .find(|code| *code == value)
     };
-    let code = response
+    response
         .header("x-amz-error-code")
         .and_then(known)
         .or_else(|| {
@@ -173,11 +219,7 @@ fn refused(response: &HttpResponse) -> RemoteError {
             let (_, code) = error.split_once("<Code>")?;
             let (code, _) = code.split_once("</Code>")?;
             known(code.trim())
-        });
-    match code {
-        Some(code) => RemoteError::RefusedWithCode(response.status, code),
-        None => RemoteError::Refused(response.status),
-    }
+        })
 }
 
 /// One page of what the store holds under the prefix, in key order.
@@ -342,13 +384,46 @@ impl<H: HttpSend> S3Remote<H> {
         hex(&Sha256::digest(named.as_bytes())[..8])
     }
 
+    pub fn transport(&self) -> &H {
+        &self.http
+    }
+
+    fn problem(
+        &self,
+        op: Operation,
+        kind: &'static str,
+        status: Option<u16>,
+        code: Option<&'static str>,
+    ) {
+        self.http.observe(Observation::Problem(Problem {
+            operation: op.name(),
+            kind,
+            status,
+            code,
+        }));
+    }
+
+    fn mismatch(&self, op: Operation, status: u16) -> RemoteError {
+        self.problem(op, "mismatch", Some(status), None);
+        RemoteError::Mismatch
+    }
+
+    fn refused(&self, op: Operation, response: &HttpResponse) -> RemoteError {
+        let code = error_code(response);
+        self.problem(op, "refused", Some(response.status), code);
+        match code {
+            Some(code) => RemoteError::RefusedWithCode(response.status, code),
+            None => RemoteError::Refused(response.status),
+        }
+    }
+
     /// Signs and sends, with the retries of the module doc. A 2xx or a
     /// 404 is returned; every other status is an error.
     #[allow(clippy::too_many_arguments)]
     async fn call<T: Clock>(
         &self,
         clock: &T,
-        method: &'static str,
+        op: Operation,
         path: &str,
         query: &[(&str, &str)],
         headers: &[(&str, &str)],
@@ -365,6 +440,7 @@ impl<H: HttpSend> S3Remote<H> {
             secret: self.cfg.secret_key.expose().as_bytes(),
             region: &self.cfg.region,
         };
+        let method = op.method();
         let unsigned = Unsigned {
             method,
             path,
@@ -373,11 +449,15 @@ impl<H: HttpSend> S3Remote<H> {
             payload_sha256: &payload_sha256,
         };
         let mut pause = FIRST_PAUSE_MS;
+        let mut exhausted = None;
         for attempt in 1..=TRIES {
             // Signed anew for each try: the date is part of the signature.
             let now = clock.now().0;
             let signed = sign_request(&key, &self.cfg.host, now.div_euclid(1000), &unsigned)
-                .map_err(|_| RemoteError::Unsignable)?;
+                .map_err(|_| {
+                    self.problem(op, "unsignable", None, None);
+                    RemoteError::Unsignable
+                })?;
             let request = HttpRequest {
                 method,
                 url: format!("https://{}{}", self.cfg.host, signed.target),
@@ -388,11 +468,13 @@ impl<H: HttpSend> S3Remote<H> {
             match self.http.send(&request).await {
                 // No answer, an answer longer than was asked for, a 5xx
                 // or a 429: tried again.
-                Err(NoAnswer) => {}
-                Ok(r) if r.body.len() > max_answer => {}
-                Ok(r) if (500..600).contains(&r.status) || r.status == 429 => {}
+                Err(NoAnswer) => exhausted = None,
+                Ok(r) if r.body.len() > max_answer => exhausted = None,
+                Ok(r) if (500..600).contains(&r.status) || r.status == 429 => {
+                    exhausted = Some((r.status, error_code(&r)));
+                }
                 Ok(r) if (200..300).contains(&r.status) || r.status == 404 => return Ok(r),
-                Ok(r) => return Err(refused(&r)),
+                Ok(r) => return Err(self.refused(op, &r)),
             }
             if attempt < TRIES {
                 // Up to half as long again, so that jobs do not retry in step.
@@ -401,12 +483,17 @@ impl<H: HttpSend> S3Remote<H> {
                 pause *= 4;
             }
         }
+        match exhausted {
+            Some((status, code)) => self.problem(op, "retry_exhausted", Some(status), code),
+            None => self.problem(op, "no_answer", None, None),
+        }
         Err(RemoteError::Unavailable)
     }
 
     /// The path of `key` in the store, under the bucket and the prefix.
-    fn path(&self, key: &str) -> Result<String, RemoteError> {
+    fn path(&self, op: Operation, key: &str) -> Result<String, RemoteError> {
         if !key_ok(key) {
+            self.problem(op, "unsignable", None, None);
             return Err(RemoteError::Unsignable);
         }
         Ok(format!("/{}/{}{key}", self.cfg.bucket, self.cfg.prefix))
@@ -418,11 +505,20 @@ impl<H: HttpSend> S3Remote<H> {
         clock: &T,
         key: &str,
     ) -> Result<Option<Listed>, RemoteError> {
+        Ok(self.head_for(clock, key, Operation::Plan).await?.0)
+    }
+
+    async fn head_for<T: Clock>(
+        &self,
+        clock: &T,
+        key: &str,
+        op: Operation,
+    ) -> Result<(Option<Listed>, u16), RemoteError> {
         let r = self
             .call(
                 clock,
-                "HEAD",
-                &self.path(key)?,
+                op,
+                &self.path(op, key)?,
                 &[],
                 &[],
                 &[],
@@ -430,17 +526,20 @@ impl<H: HttpSend> S3Remote<H> {
             )
             .await?;
         if r.status == 404 {
-            return Ok(None);
+            return Ok((None, r.status));
         }
         let size = r.header("content-length").and_then(|v| v.parse().ok());
         let etag = r.header("etag").map(|v| v.trim_matches('"').to_string());
         match (size, etag) {
-            (Some(size), Some(etag)) => Ok(Some(Listed {
-                key: key.to_string(),
-                size,
-                etag,
-            })),
-            _ => Err(RemoteError::Mismatch),
+            (Some(size), Some(etag)) => Ok((
+                Some(Listed {
+                    key: key.to_string(),
+                    size,
+                    etag,
+                }),
+                r.status,
+            )),
+            _ => Err(self.mismatch(op, r.status)),
         }
     }
 
@@ -460,29 +559,41 @@ impl<H: HttpSend> S3Remote<H> {
             ("content-md5", content_md5.as_str()),
             ("x-amz-meta-sha256", sha256.as_str()),
         ];
-        let path = self.path(key)?;
+        let path = self.path(Operation::Put, key)?;
         let r = self
-            .call(clock, "PUT", &path, &[], &headers, bytes, MAX_ANSWER_BYTES)
+            .call(
+                clock,
+                Operation::Put,
+                &path,
+                &[],
+                &headers,
+                bytes,
+                MAX_ANSWER_BYTES,
+            )
             .await?;
         if r.status == 404 {
             // The bucket is not there.
-            return Err(refused(&r));
+            return Err(self.refused(Operation::Put, &r));
         }
-        let stored = self.head(clock, key).await.map_err(|error| match error {
-            RemoteError::Refused(status) => RemoteError::VerifyRefused(status, None),
-            RemoteError::RefusedWithCode(status, code) => {
-                RemoteError::VerifyRefused(status, Some(code))
-            }
-            other => other,
-        })?;
+        let (stored, status) =
+            self.head_for(clock, key, Operation::Verify)
+                .await
+                .map_err(|error| match error {
+                    RemoteError::Refused(status) => RemoteError::VerifyRefused(status, None),
+                    RemoteError::RefusedWithCode(status, code) => {
+                        RemoteError::VerifyRefused(status, Some(code))
+                    }
+                    other => other,
+                })?;
         match stored {
             Some(stored)
                 if stored.size == bytes.len() as u64
                     && stored.etag.eq_ignore_ascii_case(&hex(&md5)) =>
             {
+                self.http.observe(Observation::VerifiedWrite);
                 Ok(())
             }
-            _ => Err(RemoteError::Mismatch),
+            _ => Err(self.mismatch(Operation::Verify, status)),
         }
     }
 
@@ -514,12 +625,20 @@ impl<H: HttpSend> S3Remote<H> {
         }
         let path = format!("/{}", self.cfg.bucket);
         let r = self
-            .call(clock, "GET", &path, &query, &[], &[], MAX_LIST_BYTES)
+            .call(
+                clock,
+                Operation::List,
+                &path,
+                &query,
+                &[],
+                &[],
+                MAX_LIST_BYTES,
+            )
             .await?;
         if r.status == 404 {
-            return Err(refused(&r));
+            return Err(self.refused(Operation::List, &r));
         }
-        let listed = parse_list(&r.body).map_err(|_| RemoteError::Mismatch)?;
+        let listed = parse_list(&r.body).map_err(|_| self.mismatch(Operation::List, r.status))?;
         let mut page = CopyPage {
             truncated: listed.truncated,
             ..CopyPage::default()
@@ -533,7 +652,7 @@ impl<H: HttpSend> S3Remote<H> {
                 .filter(|k| k.len() <= MAX_KEY_BYTES)
                 .and_then(|k| k.strip_prefix(own.as_str()))
                 .filter(|k| k.starts_with(prefix) && *k > last.as_str())
-                .ok_or(RemoteError::Mismatch)?
+                .ok_or_else(|| self.mismatch(Operation::List, r.status))?
                 .to_string();
             last.clone_from(&key);
             if key_ok(&key) {
@@ -546,7 +665,7 @@ impl<H: HttpSend> S3Remote<H> {
         // The caller goes on from the last key, so a page that says
         // "more" must name one.
         if page.truncated && page.last.is_none() {
-            return Err(RemoteError::Mismatch);
+            return Err(self.mismatch(Operation::List, r.status));
         }
         Ok(page)
     }

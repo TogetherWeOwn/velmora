@@ -423,15 +423,24 @@ async fn recovery_copy(
             return JobOutcome::Ack;
         }
     };
+    let transport = remote.transport();
+    let monitor = recovery_alarm::enabled(env, bridge.cfg.environment);
     let (outcome, counts, why) = copier(bridge, &remote)
-        .run_job(&bridge.jobs, pass, cursor)
+        .run_job_observed(
+            &bridge.jobs,
+            pass,
+            cursor,
+            monitor,
+            |observation| async move {
+                let now = velmora_bridge::ports::Clock::now(&bridge.clock);
+                recovery_alarm::record(env, pass, message_id, now, observation, transport).await;
+            },
+        )
         .await;
-    if pass.0 > 0
-        && bridge.cfg.maintenance != velmora_bridge::config::Maintenance::Restore
-        && recovery_alarm::enabled(env, bridge.cfg.environment)
-    {
-        let now = velmora_bridge::ports::Clock::now(&bridge.clock);
-        recovery_alarm::record(env, pass, message_id, now, counts.as_ref()).await;
+    if pass.0 > 0 {
+        if let Some((_, problem)) = transport.last_problem.get() {
+            console_error!("recovery copy: pass={} latest_problem={problem:?}", pass.0);
+        }
     }
     let retry = matches!(outcome, JobOutcome::Retry { .. });
     // The reason is a class and a status at most. It is logged whether

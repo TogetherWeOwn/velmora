@@ -9,11 +9,13 @@
 //!
 //! Nothing of a request or an answer is logged.
 
+use std::cell::Cell;
 use std::time::Duration;
 
 use futures_util::future::{select, Either};
 use futures_util::StreamExt;
-use velmora_bridge::remote::{HttpRequest, HttpResponse, HttpSend, NoAnswer};
+use velmora_bridge::remote::{HttpRequest, HttpResponse, HttpSend, NoAnswer, Observation, Problem};
+use velmora_bridge::UnixMs;
 
 use worker::{
     js_sys::Uint8Array, AbortController, Delay, Fetch, Headers, Method, Request, RequestInit,
@@ -25,7 +27,11 @@ const TIMEOUT: Duration = Duration::from_secs(15);
 /// Answer headers the bridge reads.
 const KEPT: [&str; 3] = ["content-length", "etag", "x-amz-error-code"];
 
-pub struct FetchHttp;
+#[derive(Default)]
+pub struct FetchHttp {
+    pub last_problem: Cell<Option<(UnixMs, Problem)>>,
+    pub last_verified_write: Cell<Option<UnixMs>>,
+}
 
 /// True while `have` bytes and `more` to come are within `most`.
 fn fits(have: usize, more: usize, most: usize) -> bool {
@@ -104,6 +110,24 @@ impl HttpSend for FetchHttp {
 
     async fn pause(&self, ms: u64) {
         Delay::from(Duration::from_millis(ms)).await;
+    }
+
+    fn observe(&self, outcome: Observation) {
+        let at = UnixMs(worker::Date::now().as_millis() as i64);
+        match outcome {
+            Observation::Problem(problem) => {
+                if self
+                    .last_problem
+                    .get()
+                    .is_none_or(|(previous, _)| at >= previous)
+                {
+                    self.last_problem.set(Some((at, problem)));
+                }
+            }
+            Observation::VerifiedWrite => self
+                .last_verified_write
+                .set(self.last_verified_write.get().max(Some(at))),
+        }
     }
 }
 

@@ -19,8 +19,8 @@ condition below emails when it holds:
 | `outbox-dead` | outbox rows are in stage `dead` | at once |
 | `provider-cooldown:<id>` | a provider is cooling (skipped) | 15 min |
 | `catalog-export-stale` | the newest export manifest in the export bucket is over 26 h old (listed hourly) | at once |
-| `recovery-copy-refused` | a scheduled copy job saw a remote refusal and no later write has been verified | after two 15-minute intervals |
-| `recovery-copy-stale` | no scheduled copy job recorded in more than three 15-minute intervals | at once |
+| `recovery-copy-problem` | an offsite destination problem has not been cleared by a proved clean full walk | after 30 min |
+| `recovery-copy-stale` | no clean sweep has been recorded for more than two hours | at once |
 | `check-error` | a reading failed (its check did not run) | 15 min |
 
 It also takes reports on `POST /v1/alert` (bearer `INGEST_TOKEN`) from:
@@ -72,18 +72,22 @@ until the next automated bridge deploy, which replaces dashboard-only
 variables. Turning it off on the bridge alone does not disable the stale
 alert.
 
-A zero-copy job does not start or clear a refusal incident. Scheduled jobs
-can run without trying a write, so only a later successful PUT with a
-matching verification HEAD clears the incident. The verified timestamp is
-recorded even when the job cannot enqueue its continuation. Hints are
-excluded, and queue redelivery does not add another diagnostic row.
+The destination alarm covers LIST, planning HEAD, PUT and verification
+HEAD failures, including refusals, exhausted retries, and mismatches. A
+zero-copy job or a successful PUT of another record does not clear it.
+Only a full walk that began after the latest problem and has uninterrupted,
+problem-free coverage clears it. Records gone from the source or already
+matching their expected checksum do not need another PUT. A completed
+fresh sweep, including an idle one, refreshes the stale clock while healthy.
+Hints are excluded.
 
 The bridge keeps up to 256 diagnostic rows per pass for seven days and
-retains one aggregate row for the latest job, refusal, and verified-write
-times. The stale signal watches jobs, not pass completion or storage
-success. Recovery notices use the same email cap and cooldown as the other
-conditions. Rollback does not change the queue message format; leave the
-additive telemetry tables in place.
+one state row with the latest problem, clean sweep and verified-write
+times. A separate single-row frontier checks walk coverage. Replays update
+one diagnostic row per queue message. Missing telemetry can block an
+all-clear but never blocks the copy. Recovery notices use the same email
+cap and cooldown as other conditions. Rollback does not change the queue
+message format; leave the additive telemetry tables in place.
 
 ## Cost
 
@@ -94,8 +98,7 @@ domain. The rest:
 - 8,640 cron runs a month;
 - under 100,000 baseline catalogue rows read a month before recovery-copy
   monitoring;
-- recovery-copy reads one state row and, during an open refusal incident,
-  up to 256 diagnostic rows for the last pass that recorded a refusal;
+- recovery-copy alert reads look up one state row by primary key;
 - a few thousand writes to the Worker's own D1;
 - about 720 R2 list calls a month.
 

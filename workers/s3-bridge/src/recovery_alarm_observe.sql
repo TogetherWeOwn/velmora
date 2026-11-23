@@ -1,19 +1,21 @@
--- Values are event times, not delivery times. An out-of-order delivery
--- cannot replace a newer event or reopen an already verified incident.
+-- Destination outcome time, not signing or delivery time. A delayed
+-- observation inside the most recent proved walk invalidates the proof.
 INSERT INTO recovery_alarm_state (
-    id, last_job_at, last_refused_at, last_verified_write_at, opened_at, last_refused_pass
+    id, last_problem_at, problem_operation, problem_kind, problem_status, problem_code,
+    problem_counts, opened_at, last_clean_sweep_at, last_clean_walk_start, last_verified_write_at
 )
-VALUES (1, ?1, ?2, ?3, CASE WHEN ?2 > ?3 THEN ?2 ELSE 0 END, CASE WHEN ?2 > 0 THEN ?4 ELSE 0 END)
+VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?1, 0, 0, ?7)
 ON CONFLICT (id) DO UPDATE SET
-    last_job_at = max(last_job_at, excluded.last_job_at),
-    last_refused_pass = CASE WHEN excluded.last_refused_at > last_refused_at
-        THEN excluded.last_refused_pass ELSE last_refused_pass END,
     opened_at = CASE
-        WHEN max(last_refused_at, excluded.last_refused_at) <= max(last_verified_write_at, excluded.last_verified_write_at) THEN 0
-        WHEN opened_at > max(last_verified_write_at, excluded.last_verified_write_at) THEN
-            CASE WHEN excluded.last_refused_at > max(last_verified_write_at, excluded.last_verified_write_at)
-                THEN min(opened_at, excluded.last_refused_at) ELSE opened_at END
-        ELSE max(last_refused_at, excluded.last_refused_at)
+        WHEN max(last_problem_at, excluded.last_problem_at) < last_clean_walk_start THEN 0
+        WHEN opened_at = 0 THEN max(last_problem_at, excluded.last_problem_at)
+        WHEN excluded.last_problem_at >= max(1, last_clean_walk_start) THEN min(opened_at, excluded.last_problem_at)
+        ELSE opened_at
     END,
-    last_refused_at = max(last_refused_at, excluded.last_refused_at),
+    problem_operation = CASE WHEN excluded.last_problem_at >= max(1, last_problem_at) THEN excluded.problem_operation ELSE problem_operation END,
+    problem_kind = CASE WHEN excluded.last_problem_at >= max(1, last_problem_at) THEN excluded.problem_kind ELSE problem_kind END,
+    problem_status = CASE WHEN excluded.last_problem_at >= max(1, last_problem_at) THEN excluded.problem_status ELSE problem_status END,
+    problem_code = CASE WHEN excluded.last_problem_at >= max(1, last_problem_at) THEN excluded.problem_code ELSE problem_code END,
+    problem_counts = CASE WHEN excluded.last_problem_at >= max(1, last_problem_at) THEN excluded.problem_counts ELSE problem_counts END,
+    last_problem_at = max(last_problem_at, excluded.last_problem_at),
     last_verified_write_at = max(last_verified_write_at, excluded.last_verified_write_at)

@@ -21,12 +21,25 @@ CREATE TABLE recovery_pass_job (
 ) WITHOUT ROWID;
 CREATE INDEX recovery_pass_age ON recovery_pass_job (at);
 
--- Written even if a job verified a PUT but failed to enqueue its successor.
 CREATE TABLE recovery_alarm_state (
     id                      INTEGER PRIMARY KEY CHECK (id = 1),
-    last_job_at             INTEGER NOT NULL,
-    last_refused_at         INTEGER NOT NULL,
-    last_verified_write_at  INTEGER NOT NULL,
+    last_problem_at         INTEGER NOT NULL,
+    problem_operation       TEXT,
+    problem_kind            TEXT,
+    problem_status          INTEGER,
+    problem_code            TEXT,
+    problem_counts          TEXT,
     opened_at               INTEGER NOT NULL,
-    last_refused_pass       INTEGER NOT NULL
+    last_clean_sweep_at     INTEGER NOT NULL,
+    last_clean_walk_start   INTEGER NOT NULL,
+    last_verified_write_at  INTEGER NOT NULL
+);
+
+-- One telemetry frontier, independent of the copy cursor and queue wire.
+-- Missing observations leave a gap, which cannot certify a clean walk.
+CREATE TABLE recovery_walk_frontier (
+    id           INTEGER PRIMARY KEY CHECK (id = 1),
+    began_at     INTEGER NOT NULL,
+    next_tag     TEXT,
+    completed_by TEXT
 );

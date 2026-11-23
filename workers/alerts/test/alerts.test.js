@@ -48,20 +48,48 @@ function env(over = {}) {
 const BRIDGE_SRC = join(here, "..", "..", "s3-bridge", "src");
 const RECORD_COPY = readFileSync(join(BRIDGE_SRC, "recovery_alarm_insert.sql"), "utf8");
 const OBSERVE_COPY = readFileSync(join(BRIDGE_SRC, "recovery_alarm_observe.sql"), "utf8");
+const FRONTIER_COPY = readFileSync(join(BRIDGE_SRC, "recovery_alarm_frontier.sql"), "utf8");
+const CLEAN_COPY = readFileSync(join(BRIDGE_SRC, "recovery_alarm_clean.sql"), "utf8");
 
 function recoveryJob(e, pass, { id = "job", refused = 0, copied = 0, at = pass,
-  refusedAt = refused ? at : 0, verifiedAt = copied ? at : 0 } = {}) {
+  problem = refused ? ["put", "refused", 403, "AccessDenied"] : null,
+  problemAt = problem ? at : 0, verifiedAt = copied ? at : 0, sweep = true, walk = null } = {}) {
   const db = e.CATALOG.db;
-  const bindings = [pass, id, copied, 7, 11, refused, refused ? 403 : null,
-    refused ? "AccessDenied" : null, 0, null, null, 0, null, null, 0, Number(verifiedAt > 0), at];
-  const args = (values) => Object.fromEntries(values.map((val, index) => [`?${index + 1}`, val]));
-  db.prepare(RECORD_COPY).run(args(bindings));
-  db.prepare(OBSERVE_COPY).run(args([at, refusedAt, verifiedAt, pass]));
+  const run = (sql, ...params) => db.prepare(sql).run(Object.fromEntries(
+    params.map((val, index) => [`?${index + 1}`, val]),
+  ));
+  const pending = problem ? 7 : 0;
+  const source_unreadable = problem ? 11 : 0;
+  run(RECORD_COPY, pass, id, copied, pending, source_unreadable, refused, refused ? 403 : null,
+    refused ? "AccessDenied" : null, 0, null, null, 0, null, null, 0, Number(verifiedAt > 0), at);
+  const counts = JSON.stringify({ copied, pending, source_unreadable,
+    refused_put: { count: refused }, refused_verify: { count: 0 }, refused_plan: { count: 0 }, unsignable: { count: 0 } });
+  run(OBSERVE_COPY, problemAt, ...(problem ?? [null, null, null, null]), problem ? counts : null, verifiedAt);
+  if (!problem) {
+    if (walk) run(FRONTIER_COPY, walk.began, walk.from, walk.next, Number(walk.starts), id);
+    const finished = walk && walk.next === null ? walk.began : 0;
+    if (sweep || finished) run(CLEAN_COPY, at, Number(sweep), finished, id);
+  }
 }
 
-const REFUSED = "recovery-copy-refused";
+function cleanWalk(at) {
+  return { began: at, from: "root", next: null, starts: true };
+}
+
+const REFUSED = "recovery-copy-problem";
 const STALE = "recovery-copy-stale";
 const INTERVAL = 15 * MIN;
+
+test("four passes copying other keys cannot hide one persistent 403", async () => {
+  const e = env();
+  for (let i = 0; i < 4; i++) {
+    const at = T0 + i * INTERVAL;
+    recoveryJob(e, at, { refused: 1, copied: 2, problemAt: at, verifiedAt: at + 1 });
+    await tick(e, at + 1);
+  }
+  assert.ok(e.ALERT_EMAIL.sent.some((m) => /recovery copy (refused|problems)/i.test(m.subject)),
+    "a verified write to a different key must not clear a 403");
+});
 
 test("a 62-hour outage with writes only on walks pages", async () => {
   const e = env();
@@ -70,13 +98,13 @@ test("a 62-hour outage with writes only on walks pages", async () => {
     recoveryJob(e, pass, { refused: i % 12 === 0 ? 1 : 0 });
     await tick(e, pass);
   }
-  const pages = e.ALERT_EMAIL.sent.filter((mail) => /recovery copy refused/i.test(mail.subject));
+  const pages = e.ALERT_EMAIL.sent.filter((mail) => /recovery copy problems/i.test(mail.subject));
   assert.ok(pages.length > 0, "intervening idle sweeps must not hide an outage");
-  assert.match(pages[0].text, /without a subsequent verified write for 45 min/);
-  assert.equal(e.ALERT_EMAIL.sent.length, pages.length, "scheduled idle jobs are not stale");
+  assert.match(pages[0].text, /Open for 45 min/);
+  assert.ok(e.ALERT_EMAIL.sent.some((mail) => /clean sweep is stale/i.test(mail.subject)));
 });
 
-test("page after two intervals without verification; only a subsequent verified write recovers it", async () => {
+test("page after two intervals; only a subsequent proved clean walk recovers it", async () => {
   const e = env();
   recoveryJob(e, T0 - INTERVAL, { copied: 1 });
   recoveryJob(e, T0, { refused: 2 });
@@ -84,22 +112,26 @@ test("page after two intervals without verification; only a subsequent verified 
   assert.equal((await tick(e, T0 + 2 * INTERVAL)).conditions.includes(REFUSED), false);
   assert.equal((await tick(e, T0 + 2 * INTERVAL + 1)).conditions.includes(REFUSED), true);
   assert.equal(e.ALERT_EMAIL.sent.length, 1);
-  assert.match(e.ALERT_EMAIL.sent[0].text, /refused_put=3.*403.*AccessDenied/);
-  assert.match(e.ALERT_EMAIL.sent[0].text, /copied=0.*pending=7.*source_unreadable=11/);
+  assert.match(e.ALERT_EMAIL.sent[0].text, /put refused.*403.*AccessDenied/);
+  assert.match(e.ALERT_EMAIL.sent[0].text, /copied=0.*pending=7.*source_unreadable=11.*refused_put=3/);
   assert.match(e.ALERT_EMAIL.sent[0].text, /last verified copy.+45 min/i);
   recoveryJob(e, T0 + 2 * INTERVAL);
   await tick(e, T0 + 2 * INTERVAL + 5 * MIN);
   assert.equal(e.ALERT_EMAIL.sent.length, 1, "idle jobs cannot prove recovery");
-  recoveryJob(e, T0 + 3 * INTERVAL, { copied: 1 });
-  await tick(e, T0 + 3 * INTERVAL);
-  await tick(e, T0 + 3 * INTERVAL + 5 * MIN);
+  const verified = T0 + 3 * INTERVAL;
+  recoveryJob(e, verified, { copied: 1 });
+  assert.equal((await tick(e, verified)).conditions.includes(REFUSED), true, "another key's PUT cannot recover it");
+  const clean = verified + 5 * MIN;
+  recoveryJob(e, clean, { sweep: false, walk: cleanWalk(clean) });
+  await tick(e, clean);
+  await tick(e, clean + 5 * MIN);
   assert.equal(e.ALERT_EMAIL.sent.length, 2);
   assert.match(e.ALERT_EMAIL.sent[1].subject, /recovery copy.*recovered/i);
 });
 
 test("idle copy jobs alone never trigger the refusal alarm", async () => {
   const e = env();
-  for (let i = 0; i < 6; i++) {
+  for (let i = 0; i < 10; i++) {
     const at = T0 + i * INTERVAL;
     recoveryJob(e, at);
     assert.equal((await tick(e, at)).conditions.includes(REFUSED), false);
@@ -107,28 +139,40 @@ test("idle copy jobs alone never trigger the refusal alarm", async () => {
   assert.equal(e.ALERT_EMAIL.sent.length, 0);
 });
 
-test("redelivery does not double count and verification on retry advances the watermark", async () => {
+test("redelivery upserts later diagnostics without adding another job", async () => {
   const e = env();
-  recoveryJob(e, T0, { id: "first", refused: 3 });
-  recoveryJob(e, T0, { id: "first", refused: 3 });
-  recoveryJob(e, T0, { id: "second", refused: 2 });
-  const pagedAt = T0 + 2 * INTERVAL + 1;
-  await tick(e, pagedAt);
-  assert.match(e.ALERT_EMAIL.sent[0].text, /refused_put=5\b/);
-  // The successful verification reached storage after the email, but
-  // happened after the refusal and before the alerts tick.
-  const verified = T0 + INTERVAL;
-  recoveryJob(e, T0, { id: "first", copied: 1, at: pagedAt + 1, verifiedAt: verified });
-  // An observation that reached storage late must not revive an old refusal.
-  recoveryJob(e, T0, { id: "first", refused: 3, refusedAt: T0, at: pagedAt + 2 });
-  const state = e.CATALOG.db.prepare("SELECT * FROM recovery_alarm_state WHERE id = 1").get();
-  assert.equal(state.last_refused_at, T0);
-  assert.equal(state.last_verified_write_at, verified);
-  assert.equal(state.opened_at, 0);
-  assert.equal(e.CATALOG.db.prepare("SELECT count(*) AS n FROM recovery_pass_job WHERE pass_id = ?").get(T0).n, 2);
-  await tick(e, pagedAt + 2);
-  assert.equal(e.ALERT_EMAIL.sent.length, 2);
+  recoveryJob(e, T0, { id: "retry", refused: 3 });
+  recoveryJob(e, T0, { id: "retry", refused: 3 });
+  recoveryJob(e, T0, { id: "retry", refused: 4, at: T0 + 1 });
+  recoveryJob(e, T0, { id: "retry", refused: 99, at: T0 });
+  assert.deepEqual([...e.CATALOG.db.prepare("SELECT refused_put FROM recovery_pass_job WHERE pass_id = ?").all(T0)]
+    .map((row) => row.refused_put), [4]);
+  await tick(e, T0 + 2 * INTERVAL + 1);
+  assert.match(e.ALERT_EMAIL.sent[0].text, /refused_put=4\b/);
+});
+
+test("a missing frontier cannot certify a clean walk; a later complete walk can", async () => {
+  const e = env();
+  recoveryJob(e, T0, { refused: 1 });
+  await tick(e, T0 + 2 * INTERVAL + 1);
+  const began = T0 + 3 * INTERVAL;
+  recoveryJob(e, began, { id: "start", sweep: false,
+    walk: { began, from: "root", next: "expected", starts: true } });
+  recoveryJob(e, began, { id: "wrong-tail", at: began + 1, sweep: false,
+    walk: { began, from: "missing", next: null, starts: false } });
+  assert.equal((await tick(e, began + 1)).conditions.includes(REFUSED), true);
+  recoveryJob(e, began, { id: "correct-tail", at: began + 2, sweep: false,
+    walk: { began, from: "expected", next: null, starts: false } });
+  assert.equal((await tick(e, began + 2)).conditions.includes(REFUSED), false);
   assert.match(e.ALERT_EMAIL.sent[1].subject, /recovery copy recovered/i);
+});
+
+test("a late problem observed inside a completed walk invalidates its clean proof", async () => {
+  const e = env();
+  const began = T0 + INTERVAL;
+  recoveryJob(e, began, { id: "clean", at: began + 5 * MIN, walk: cleanWalk(began) });
+  recoveryJob(e, T0, { refused: 1, at: began + 6 * MIN, problemAt: began + 1 });
+  assert.equal((await tick(e, began + 2 * INTERVAL + 2)).conditions.includes(REFUSED), true);
 });
 
 test("refusal reminders respect cooldown even when newer jobs are idle", async () => {
@@ -149,11 +193,11 @@ test("a cooldown-held recovery cannot restart refusal reminders without a new re
   const at = (minutes) => T0 + minutes * MIN;
   recoveryJob(e, at(0), { refused: 1 });
   await tick(e, at(31));
-  recoveryJob(e, at(61), { copied: 1 });
+  recoveryJob(e, at(61), { copied: 1, walk: cleanWalk(at(61)) });
   await tick(e, at(61));
   recoveryJob(e, at(62), { refused: 1 });
   await tick(e, at(93));
-  recoveryJob(e, at(94), { copied: 1 });
+  recoveryJob(e, at(94), { copied: 1, walk: cleanWalk(at(94)) });
   await tick(e, at(94));
   assert.equal(e.ALERT_EMAIL.sent.length, 3, "the second recovery notice is still on cooldown");
   recoveryJob(e, at(121));
@@ -164,26 +208,43 @@ test("a cooldown-held recovery cannot restart refusal reminders without a new re
   assert.match(e.ALERT_EMAIL.sent[3].subject, /recovery copy recovered/i);
 });
 
-test("stale starts strictly after three intervals with no scheduled job", async () => {
+test("stale starts strictly after two hours without a clean sweep", async () => {
   const e = env();
-  await tick(e, T0);
-  const at = T0 + INTERVAL;
-  recoveryJob(e, at, { copied: 1 });
-  assert.equal((await tick(e, at + 3 * INTERVAL)).conditions.includes(STALE), false);
-  assert.equal((await tick(e, at + 3 * INTERVAL + 1)).conditions.includes(STALE), true);
+  recoveryJob(e, T0, { copied: 1 });
+  const late = T0 + 2 * HOUR + 1;
+  assert.equal((await tick(e, late - 1)).conditions.includes(STALE), false);
+  assert.equal((await tick(e, late)).conditions.includes(STALE), true);
   assert.match(e.ALERT_EMAIL.sent[0].subject, /recovery copy.*stale/i);
-  assert.match(e.ALERT_EMAIL.sent[0].text, /last verified copy: 45 min ago/i);
-  recoveryJob(e, at + 4 * INTERVAL);
-  assert.equal((await tick(e, at + 4 * INTERVAL)).conditions.includes(STALE), false);
+  assert.match(e.ALERT_EMAIL.sent[0].text, /last verified copy: 120 min ago/i);
+  recoveryJob(e, late + 1);
+  assert.equal((await tick(e, late + 1)).conditions.includes(STALE), false);
   assert.match(e.ALERT_EMAIL.sent[1].subject, /recovery copy.*resumed/i);
 });
 
-test("job diagnostics cap does not cap the verification watermark", () => {
+for (const [op, kind, status] of [["put", "retry_exhausted", 503], ["list", "refused", 403]]) {
+  test(`${op} ${status} for three days pages and goes stale despite scheduled jobs`, async () => {
+    const e = env();
+    recoveryJob(e, T0 - INTERVAL);
+    for (let i = 0; i <= 3 * 24 * 4; i++) {
+      const at = T0 + i * INTERVAL;
+      recoveryJob(e, at, { sweep: false, problem: [op, kind, status, null] });
+      await tick(e, at);
+    }
+    const page = e.ALERT_EMAIL.sent.find((mail) => /recovery copy problems/i.test(mail.subject));
+    assert.ok(page);
+    assert.match(page.text, new RegExp(`${op} ${kind}.*status=${status}`));
+    assert.ok(e.ALERT_EMAIL.sent.some((mail) => /clean sweep is stale/i.test(mail.subject)));
+  });
+}
+
+test("diagnostic cap cannot hide the newest problem or verified-write watermark", async () => {
   const e = env();
   for (let id = 0; id < 256; id++) recoveryJob(e, T0, { id: `${id}` });
-  recoveryJob(e, T0, { id: "overflow", copied: 1, at: T0 + 1 });
+  recoveryJob(e, T0, { id: "overflow", refused: 1, copied: 1, at: T0 + 1 });
   assert.equal(e.CATALOG.db.prepare("SELECT count(*) AS n FROM recovery_pass_job WHERE pass_id = ?").get(T0).n, 256);
   assert.equal(e.CATALOG.db.prepare("SELECT last_verified_write_at FROM recovery_alarm_state WHERE id = 1").get().last_verified_write_at, T0 + 1);
+  await tick(e, T0 + 2 * INTERVAL + 2);
+  assert.match(e.ALERT_EMAIL.sent[0].text, /put refused.*403.*AccessDenied/);
 });
 
 // ---- checks.js (pure) ----
