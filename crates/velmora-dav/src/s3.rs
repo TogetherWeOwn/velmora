@@ -532,48 +532,6 @@ impl<'a, U: Upstream> S3<'a, U> {
         }
     }
 
-    /// DeleteObjects of up to 1,000 keys. Answers the keys that failed.
-    pub async fn delete_many(
-        &self,
-        bucket: &str,
-        keys: &[String],
-    ) -> Result<Vec<(String, String)>, S3Error> {
-        let mut body = String::from("<Delete><Quiet>true</Quiet>");
-        for key in keys {
-            body.push_str("<Object><Key>");
-            body.push_str(&xml::escape_text(key));
-            body.push_str("</Key></Object>");
-        }
-        body.push_str("</Delete>");
-        let bytes = body.into_bytes();
-        let md5 = base64_md5(&bytes);
-        let len = bytes.len() as u64;
-        let resp = self
-            .call(
-                "POST",
-                &format!("/{bucket}"),
-                &[("delete", "")],
-                vec![
-                    ("content-md5".into(), md5),
-                    ("content-type".into(), "application/xml".into()),
-                ],
-                Body::Bytes(bytes),
-                Some(len),
-            )
-            .await?;
-        let doc = self.ok_xml(resp).await?;
-        Ok(doc
-            .elements()
-            .filter(|e| e.name == "Error")
-            .map(|e| {
-                (
-                    text_of(e, "Key").unwrap_or_default(),
-                    text_of(e, "Code").unwrap_or_default(),
-                )
-            })
-            .collect())
-    }
-
     pub async fn create_upload(
         &self,
         bucket: &str,
@@ -715,12 +673,6 @@ impl<'a, U: Upstream> S3<'a, U> {
             )
             .await;
     }
-}
-
-/// Base64 of the MD5 of `bytes`: a `Content-MD5` value.
-fn base64_md5(bytes: &[u8]) -> String {
-    use base64::Engine;
-    base64::engine::general_purpose::STANDARD.encode(md5::compute(bytes).0)
 }
 
 /// What a HEAD or GET answer says about the object.

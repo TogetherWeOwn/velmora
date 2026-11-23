@@ -1592,7 +1592,6 @@ dependencies = [
  "futures-util",
  "hmac",
  "httpdate",
- "md5",
  "quick-xml",
  "rusqlite",
  "serde",

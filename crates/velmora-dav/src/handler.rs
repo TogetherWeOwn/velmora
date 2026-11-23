@@ -68,11 +68,6 @@ pub struct Config {
     /// allows 10,000 subrequests an invocation; this leaves room for
     /// the calls around the plan.
     pub max_mutation_calls: usize,
-    /// Keys of one DeleteObjects call in a collection DELETE. Each call
-    /// must settle within a quarter lease (see `lease_secs`); the
-    /// storage Worker works on four chunks of 50 keys at a time, so 200
-    /// keys are one round of its work rather than five.
-    pub delete_keys: usize,
     /// Most entries a Depth 1 PROPFIND lists: its multistatus is built in
     /// memory, about 400 bytes an entry, and 50,000 is 20 MB of the
     /// isolate's 128 MB.
@@ -103,7 +98,6 @@ impl Default for Config {
             fan_out: 6,
             max_tree: 2_000,
             max_mutation_calls: 9_000,
-            delete_keys: 200,
             max_listing: 50_000,
             max_xml_body: 1024 * 1024,
             lock_default_secs: 600,
@@ -312,6 +306,26 @@ fn origin_authority(authority: &str, default_port: u16) -> Option<(String, u16)>
     Some((host, port))
 }
 
+/// Whether credentials may cross this origin: HTTPS, or plain HTTP to
+/// a loopback host.
+fn secure_origin(origin: &str) -> bool {
+    let Some((scheme, authority)) = origin.split_once("://") else {
+        return false;
+    };
+    if scheme.eq_ignore_ascii_case("https") {
+        return true;
+    }
+    if !scheme.eq_ignore_ascii_case("http") {
+        return false;
+    }
+    origin_authority(authority, 80).is_some_and(|(host, _)| {
+        host == "localhost"
+            || host
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|ip| ip.is_loopback())
+    })
+}
+
 fn timeout_secs(value: Option<&str>, cfg: &Config) -> u32 {
     let Some(value) = value else {
         return cfg.lock_default_secs;
@@ -377,6 +391,15 @@ impl<U: Upstream, S: StatePort> Dav<U, S> {
             Err(PathError::Bad) => return Err(status(400)),
             Err(PathError::Hidden) => return Err(status(404)),
         };
+        // Basic credentials are a password in the clear: never ask for
+        // them, or take them, over plain HTTP, except on loopback (a
+        // local run of the gateway).
+        if !secure_origin(&req.origin) {
+            return Err(Response::new(403).with_bytes(
+                "text/plain; charset=utf-8",
+                b"WebDAV is served over HTTPS only".to_vec(),
+            ));
+        }
         let creds = req
             .header("authorization")
             .and_then(basic_credentials)
@@ -543,8 +566,10 @@ impl<U: Upstream, S: StatePort> Ctx<'_, U, S> {
                 }],
             )
             .await?;
-        let Some(Reply::Locks(locks)) = replies.into_iter().next() else {
-            return Err(status(500));
+        let locks = match replies.into_iter().next() {
+            Some(Reply::Locks(locks)) => locks,
+            Some(Reply::Full) => return Err(status(507)),
+            _ => return Err(status(500)),
         };
         let states: Vec<_> = targets
             .into_iter()
@@ -805,7 +830,7 @@ impl<U: Upstream, S: StatePort> Ctx<'_, U, S> {
                 .into_iter()
                 .map(|(b, _)| (path::href(&b, ""), format!("{b}/")))
                 .collect();
-            return Ok(self.index(method, "/", &rows));
+            return Ok(self.index(method, "/", &rows, false));
         };
         if !key.is_empty() && !key.ends_with('/') {
             let mut headers = Vec::new();
@@ -866,7 +891,7 @@ impl<U: Upstream, S: StatePort> Ctx<'_, U, S> {
                 {
                     rows.push((path::href(bucket, &e.key), path::leaf(&e.key).to_owned()));
                 }
-                Ok(self.index(method, &path::href(bucket, &coll), &rows))
+                Ok(self.index(method, &path::href(bucket, &coll), &rows, listing.capped))
             }
             Res::File(_) => Err(status(409)),
             Res::Missing => Err(status(404)),
@@ -917,8 +942,15 @@ impl<U: Upstream, S: StatePort> Ctx<'_, U, S> {
         out
     }
 
-    /// A minimal HTML index of a collection.
-    fn index(&self, method: &str, title: &str, rows: &[(String, String)]) -> Resp<U::Body> {
+    /// A minimal HTML index of a collection. `capped`: the listing stopped
+    /// at `max_listing`, and the page says so rather than look complete.
+    fn index(
+        &self,
+        method: &str,
+        title: &str,
+        rows: &[(String, String)],
+        capped: bool,
+    ) -> Resp<U::Body> {
         let mut html = format!(
             "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>{0}</title></head>\
 <body><h1>{0}</h1><ul>",
@@ -931,7 +963,15 @@ impl<U: Upstream, S: StatePort> Ctx<'_, U, S> {
                 xml::escape_text(name)
             ));
         }
-        html.push_str("</ul></body></html>");
+        html.push_str("</ul>");
+        if capped {
+            html.push_str(&format!(
+                "<p>Not every item is shown: this folder holds more than {} items. \
+Use an S3 tool to list them all.</p>",
+                self.cfg().max_listing
+            ));
+        }
+        html.push_str("</body></html>");
         let bytes = html.into_bytes();
         let len = bytes.len();
         let mut r = Response::new(200).with_bytes("text/html; charset=utf-8", bytes);
@@ -1531,8 +1571,6 @@ impl<U: Upstream, S: StatePort> Ctx<'_, U, S> {
                     let entries = self.list_tree(bucket, coll).await?;
                     require_visible_tree(&entries)?;
                     let stateful = self.folders_with_state(bucket, &[coll.as_str()]).await?;
-                    let files = entries.iter().filter(|e| !e.key.ends_with('/')).count();
-                    let markers = entries.len() - files;
                     let gone = gone_folders(
                         Some(coll),
                         &stateful,
@@ -1540,8 +1578,9 @@ impl<U: Upstream, S: StatePort> Ctx<'_, U, S> {
                         std::iter::empty(),
                     );
                     let mut plan = Plan::default();
-                    plan.batches(files.div_ceil(self.cfg().delete_keys.max(1)), 1);
-                    plan.batches(markers, self.cfg().fan_out);
+                    for group in split_markers(entries.iter().map(|e| e.key.as_str())) {
+                        plan.batches(group, self.cfg().fan_out);
+                    }
                     plan.calls += gone.len();
                     self.within_budget(&plan)?;
                     let (deleted, failed) = self.delete_tree(bucket, &holder, entries).await?;
@@ -1663,65 +1702,26 @@ impl<U: Upstream, S: StatePort> Ctx<'_, U, S> {
         Ok(listing.entries)
     }
 
-    /// Deletes the preflighted keys of a collection, markers last, in
-    /// batches: each renews the reservation first ([`Ctx::fence`]), each
-    /// call is bounded ([`Ctx::bounded`]), and nothing is dispatched after
-    /// a call that did not answer in time: its keys are reported as `504`,
-    /// the keys never dispatched as `424 Failed Dependency` (a DELETE
-    /// answer reports them as `503`, see [`delete_report`]).
+    /// Deletes the preflighted keys of a collection, files before markers,
+    /// each only at the version the listing saw: an S3 writer does not go
+    /// through the DAV reservation, and a file or marker it replaced since
+    /// is kept and reported as `409`. DeleteObjects takes no condition, so
+    /// each key is one conditional DeleteObject ([`Ctx::delete_matching_members`]:
+    /// batches that renew the reservation first, bounded calls, nothing
+    /// dispatched after one that did not answer in time).
     async fn delete_tree(
         &self,
         bucket: &str,
         holder: &str,
         entries: Vec<Entry>,
     ) -> Result<(Vec<String>, Vec<(String, u16)>), Resp<U::Body>> {
-        let (markers, files): (Vec<_>, Vec<_>) =
-            entries.into_iter().partition(|e| e.key.ends_with('/'));
-        let files: Vec<_> = files.into_iter().map(|e| e.key).collect();
-        let mut failed = Vec::new();
-        let mut deleted = Vec::new();
-        let mut batches = files.chunks(self.cfg().delete_keys.max(1));
-        while let Some(batch) = batches.next() {
-            self.fence(bucket, holder).await?;
-            match self.bounded(self.s3.delete_many(bucket, batch)).await {
-                Some(Ok(errors)) => {
-                    for k in batch {
-                        if !errors.iter().any(|(e, _)| e == k) {
-                            deleted.push(k.clone());
-                        }
-                    }
-                    failed.extend(errors.into_iter().map(|(k, _)| (k, 500)));
-                }
-                Some(Err(e)) => {
-                    let code = from_s3::<U::Body>(&e).status;
-                    if code == 401 {
-                        return Err(unauthorized());
-                    }
-                    failed.extend(batch.iter().map(|k| (k.clone(), code)));
-                }
-                None => {
-                    // Only this call's keys have an unknown outcome; the
-                    // keys never dispatched failed because of it.
-                    failed.extend(batch.iter().map(|k| (k.clone(), 504)));
-                    failed.extend(batches.flatten().map(|k| (k.clone(), 424)));
-                    failed.extend(markers.into_iter().map(|e| (e.key, 424)));
-                    return Ok((deleted, failed));
-                }
-            }
-        }
-        // Another S3 writer can replace a visible zero-byte marker with
-        // a hidden nonempty object without going through the DAV lease.
-        let (removed, conflicts) = self
-            .delete_matching_members(
-                bucket,
-                holder,
-                markers.into_iter().map(|e| (e.key, e.etag)).collect(),
-                409,
-            )
-            .await?;
-        deleted.extend(removed);
-        failed.extend(conflicts);
-        Ok((deleted, failed))
+        self.delete_matching_members(
+            bucket,
+            holder,
+            entries.into_iter().map(|e| (e.key, e.etag)).collect(),
+            409,
+        )
+        .await
     }
 
     // -----------------------------------------------------------------
@@ -1876,7 +1876,14 @@ impl<U: Upstream, S: StatePort> Ctx<'_, U, S> {
             Some(Cond::Is(etag)) => Some(etag),
             _ => None,
         };
-        let dst = self.resolve(bucket, as_file(dkey)).await?;
+        // A slash-terminated destination of a collection names the
+        // collection, never a same-named file beside it: that file is a
+        // separate resource and is not replaced or pruned.
+        let dst = if src_coll && dkey.ends_with('/') {
+            self.resolve(bucket, dkey).await?
+        } else {
+            self.resolve(bucket, as_file(dkey)).await?
+        };
         // A destination that holds the source (its own folder, or one
         // above it) is not a valid replacement target.
         if path::within(&as_collection(&dst_path), &src_path)
@@ -2025,7 +2032,7 @@ impl<U: Upstream, S: StatePort> Ctx<'_, U, S> {
                         vec![Op::FindMoved {
                             holder: holder.clone(),
                             root: dest_collection.map(str::to_owned),
-                            listed,
+                            listed: listed.clone(),
                             exact,
                         }],
                     )
@@ -2036,6 +2043,25 @@ impl<U: Upstream, S: StatePort> Ctx<'_, U, S> {
                     _ => return Err(status(500)),
                 };
                 let protected: HashMap<_, _> = protected.into_iter().collect();
+                // A kept member may hold the only copy of a partially moved
+                // file: no member of another folder replaces it. Refused
+                // before any change, so nothing is copied. The same mapping
+                // (a retry of the move, or its source copied again) and
+                // identical bytes lose nothing.
+                let listed: HashMap<_, _> = listed.into_iter().collect();
+                let replaced: Vec<(String, String)> = members
+                    .iter()
+                    .filter_map(|(entry, dest)| {
+                        let source = protected.get(dest)?;
+                        let retry = same_mapping(&src_path, &dst_path, source, dest);
+                        let same_bytes = listed.get(dest) == Some(&entry.etag);
+                        (!dest.ends_with('/') && !retry && !same_bytes)
+                            .then(|| (dest.clone(), source.clone()))
+                    })
+                    .collect();
+                if !replaced.is_empty() {
+                    return Ok(failed_members_with_kept(bucket, &[], &replaced));
+                }
                 obsolete.retain(|(key, _)| match protected.get(key) {
                     Some(source) => {
                         kept.push((key.clone(), source.clone()));
@@ -2517,7 +2543,9 @@ impl<U: Upstream, S: StatePort> Ctx<'_, U, S> {
             let mut timed_out = false;
             for ((key, _), result) in batch.into_iter().zip(results) {
                 match result {
+                    // Gone already: nothing is left to delete.
                     Some(Ok(())) => deleted.push(key),
+                    Some(Err(e)) if e.is("NoSuchKey") => deleted.push(key),
                     Some(Err(e)) => {
                         let code = from_s3::<U::Body>(&e).status;
                         failed.push((key, if code == 412 { changed_status } else { code }));
@@ -2802,6 +2830,11 @@ impl<U: Upstream, S: StatePort> Ctx<'_, U, S> {
         }
         // Dead properties are writes: a read-only key may not change them.
         self.require_write(bucket, &path).await?;
+        let meta = match &res {
+            Res::File(m) => Some(m),
+            _ => None,
+        };
+        http_conditions(&req, meta, true)?;
         let statuses: Vec<u16> = if protected.iter().any(|p| *p) {
             protected
                 .iter()
@@ -2819,23 +2852,22 @@ impl<U: Upstream, S: StatePort> Ctx<'_, U, S> {
                     (&path, &res),
                 )
                 .await?;
-            let replies = self
-                .state(
+            let patched = self
+                .patch_reserved(
                     bucket,
-                    vec![
-                        Op::PropPatch {
-                            path: path.clone(),
-                            etag,
-                            patches,
-                        },
-                        Op::EndWrite { holder },
-                    ],
+                    key,
+                    &path,
+                    &holder,
+                    &req,
+                    ifh.as_ref(),
+                    etag,
+                    patches,
                 )
-                .await?;
-            match replies.into_iter().next() {
-                Some(Reply::Patched(s)) => s,
-                _ => return Err(status(500)),
+                .await;
+            if patched.is_err() {
+                self.end_write(bucket, &holder, Vec::new()).await;
             }
+            patched?
         };
         let mut groups: Vec<(u16, Vec<String>)> = Vec::new();
         for ((ns, name), code) in names.iter().zip(statuses) {
@@ -2857,6 +2889,70 @@ impl<U: Upstream, S: StatePort> Ctx<'_, U, S> {
             );
         }
         Ok(xml_resp(207, props::multistatus(&body)))
+    }
+
+    /// The patch of a PROPPATCH under the path's mutation reservation, as
+    /// a PUT or COPY of it takes: a save cannot restamp the properties
+    /// between the version read here and the patch. The resource is read
+    /// again once reserved and its conditions judged against that
+    /// version; the patch is committed only while the reservation holds,
+    /// in the batch that ends it. An error leaves the lease to the caller.
+    #[allow(clippy::too_many_arguments)]
+    async fn patch_reserved(
+        &self,
+        bucket: &str,
+        key: &str,
+        path: &str,
+        holder: &str,
+        req: &Request<U::Body>,
+        ifh: Option<&IfHeader>,
+        read_etag: Option<String>,
+        patches: Vec<Patch>,
+    ) -> Result<Vec<u16>, Resp<U::Body>> {
+        self.reserve(bucket, holder, vec![(path.to_owned(), false)])
+            .await?;
+        let res = self.resolve(bucket, key).await?;
+        if !res.exists() {
+            return Err(status(404));
+        }
+        if state_path(&res, key) != path {
+            return Err(status(409));
+        }
+        let etag = match &res {
+            Res::File(m) => Some(m.etag.clone()),
+            _ => None,
+        };
+        if etag != read_etag {
+            let meta = match &res {
+                Res::File(m) => Some(m),
+                _ => None,
+            };
+            http_conditions(req, meta, true)?;
+            if let Some(h) = ifh {
+                self.check_if(bucket, path, &res, h).await?;
+            }
+        }
+        let replies = self
+            .state(
+                bucket,
+                vec![
+                    Op::PropPatch {
+                        path: path.to_owned(),
+                        etag,
+                        patches,
+                        holder: Some(holder.to_owned()),
+                    },
+                    Op::EndWrite {
+                        holder: holder.to_owned(),
+                    },
+                ],
+            )
+            .await?;
+        match replies.into_iter().next() {
+            Some(Reply::Patched(s)) => Ok(s),
+            Some(Reply::Busy) => Err(reservation_busy()),
+            _ => Err(status(500)),
+        }
     }
 }
 

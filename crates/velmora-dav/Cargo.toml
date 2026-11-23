@@ -16,7 +16,6 @@ path = "src/lib.rs"
 quick-xml = "=0.42.0"
 hmac = "=0.13.0"
 sha2 = "=0.11.1"
-md5 = "=0.8.1"
 base64 = "=0.22.1"
 httpdate = "=1.0.3"
 serde = { version = "1", features = ["derive"] }

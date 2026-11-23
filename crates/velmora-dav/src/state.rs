@@ -92,6 +92,9 @@ const MOVED_MEMBER_SQL_BATCH: usize = 32;
 pub const MAX_PROP_BYTES: usize = 64 * 1024;
 pub const MAX_PROPS_PER_RESOURCE: usize = 256 * 1024;
 const MAX_PROPFIND_PROP_BYTES: usize = 16 * 1024 * 1024;
+/// Most bytes of lock discovery one batch answers, as rendered (see
+/// [`rendered_lock_bytes`]); over it the batch replies `Full` (`507`).
+const MAX_DISCOVER_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_LOCKS_PER_BUCKET: i64 = 5_000;
 pub const MAX_MOVED_MEMBERS_PER_BUCKET: i64 = 10_000;
 pub const MAX_LOCKS_PER_KEY: i64 = 500;
@@ -222,10 +225,14 @@ pub enum Op {
         #[serde(default)]
         names_only: bool,
     },
+    /// Replaces properties of `path` at `etag`. With `holder`, only while
+    /// that holder's mutation reservation is live (`Busy` otherwise).
     PropPatch {
         path: String,
         etag: Option<String>,
         patches: Vec<Patch>,
+        #[serde(default)]
+        holder: Option<String>,
     },
     /// Replaces the destination properties with rows for `from_etag`
     /// stamped with `to_etag`. With `tree`, also copies descendant
@@ -371,6 +378,17 @@ fn blocking_lock<'a>(
         }
     }
     missing_shared.filter(|_| !held_shared && !inherited_shared())
+}
+
+/// An upper bound on one `activelock` element as the gateway renders it:
+/// the owner XML as stored, the token, the root as an escaped href (at
+/// most three bytes a byte), the principal, and the fixed markup.
+fn rendered_lock_bytes(lock: &Lock) -> usize {
+    lock.owner_xml.as_ref().map_or(0, String::len)
+        + lock.token.len()
+        + 3 * lock.root.len()
+        + lock.principal.len()
+        + 512
 }
 
 const LOCK_COLS: &str =
@@ -528,9 +546,21 @@ impl<S: Sql> Engine<'_, S> {
     fn one(&self, op: Op) -> Result<Reply, String> {
         match op {
             Op::Discover { paths } => {
+                // A lock above a listing is repeated for every member it
+                // covers: shared locks with large owners over a large
+                // folder would outgrow the isolate. Bounded by what the
+                // gateway renders, before the reply is built further.
                 let mut out = Vec::with_capacity(paths.len());
+                let mut remaining = MAX_DISCOVER_BYTES;
                 for p in &paths {
-                    out.push(self.covering(p)?);
+                    let locks = self.covering(p)?;
+                    for lock in &locks {
+                        let Some(left) = remaining.checked_sub(rendered_lock_bytes(lock)) else {
+                            return Ok(Reply::Full);
+                        };
+                        remaining = left;
+                    }
+                    out.push(locks);
                 }
                 Ok(Reply::Locks(out))
             }
@@ -798,7 +828,15 @@ impl<S: Sql> Engine<'_, S> {
                 path,
                 etag,
                 patches,
-            } => self.patch(&path, etag.as_deref(), &patches),
+                holder,
+            } => {
+                if let Some(holder) = &holder {
+                    if !self.live_reservation(holder)? {
+                        return Ok(Reply::Busy);
+                    }
+                }
+                self.patch(&path, etag.as_deref(), &patches)
+            }
             Op::PropCopy {
                 from,
                 to,
@@ -1127,7 +1165,7 @@ impl<S: Sql> Engine<'_, S> {
     fn patch(&self, path: &str, etag: Option<&str>, patches: &[Patch]) -> Result<Reply, String> {
         self.drop_stale(path, etag)?;
         let rows = self.sql.exec(
-            "SELECT ns, name, length(value_xml) FROM dav_props WHERE path = ?1",
+            "SELECT ns, name, length(CAST(value_xml AS BLOB)) FROM dav_props WHERE path = ?1",
             &[t(path)],
         )?;
         let mut sizes: Vec<((String, String), usize)> = rows

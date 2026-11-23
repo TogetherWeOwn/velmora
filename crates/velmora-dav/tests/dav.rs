@@ -81,6 +81,7 @@ async fn state_batch_rolls_back_on_second_op_sql_error() {
     let patch = |path: &str| Op::PropPatch {
         path: path.into(),
         etag: None,
+        holder: None,
         patches: vec![Patch::Set(DeadProp {
             ns: "urn:test".into(),
             name: "label".into(),
@@ -1267,6 +1268,7 @@ async fn the_stateful_folder_bound_applies_to_each_tree() {
         .map(|key| Op::PropPatch {
             path: key.clone(),
             etag: Some(etag.clone()),
+            holder: None,
             patches: vec![Patch::Set(DeadProp {
                 ns: "urn:x".into(),
                 name: "x".into(),
@@ -1305,6 +1307,7 @@ async fn one_tree_over_the_stateful_folder_bound_is_refused_before_any_change() 
         .map(|i| Op::PropPatch {
             path: format!("dst/stale{i}/"),
             etag: None,
+            holder: None,
             patches: vec![Patch::Set(DeadProp {
                 ns: "urn:x".into(),
                 name: "x".into(),
@@ -1766,9 +1769,9 @@ async fn recursive_delete_does_not_dispatch_the_next_batch_after_expiry() {
     assert_eq!(w.s3_put("dst/file", b"first batch").await, 200);
     let (reached, waiting) = tokio::sync::oneshot::channel();
     let (release, resume) = tokio::sync::oneshot::channel();
-    w.storage_fault_target(
-        "POST",
-        "/dav?delete=",
+    w.storage_fault(
+        "DELETE",
+        "dst/file",
         StorageFault::Pause { reached, resume },
     );
     let mut deleting = std::pin::pin!(w.req("DELETE", "/dav/dst/", &[], b""));
@@ -1788,7 +1791,7 @@ async fn recursive_delete_stops_before_a_batch_that_would_remove_a_later_move() 
     // its reservation, a MOVE lands src/b on dst/b and deletes its
     // source, and the DELETE's next batch must not remove dst/b.
     let w = World::with(Config {
-        delete_keys: 1,
+        fan_out: 1,
         ..Config::default()
     })
     .await;
@@ -1801,11 +1804,7 @@ async fn recursive_delete_stops_before_a_batch_that_would_remove_a_later_move() 
     }
     let (reached, waiting) = tokio::sync::oneshot::channel();
     let (release, resume) = tokio::sync::oneshot::channel();
-    w.storage_fault_target(
-        "POST",
-        "/dav?delete=",
-        StorageFault::Pause { reached, resume },
-    );
+    w.storage_fault("DELETE", "dst/a", StorageFault::Pause { reached, resume });
     let mut deleting = std::pin::pin!(w.req("DELETE", "/dav/dst/", &[], b""));
     tokio::select! {
         r = deleting.as_mut() => panic!("DELETE finished before its first batch paused: {}", r.status),
@@ -1908,7 +1907,6 @@ async fn a_late_commit_of_an_unanswered_delete_cannot_hit_a_later_move() {
     // still commits; a MOVE must not land dst/b in between.
     let w = World::with(Config {
         lease_secs: 4,
-        delete_keys: 2,
         ..Config::default()
     })
     .await;
@@ -1919,7 +1917,7 @@ async fn a_late_commit_of_an_unanswered_delete_cannot_hit_a_later_move() {
     ] {
         assert_eq!(w.s3_put(key, body).await, 200);
     }
-    w.storage_fault_target("POST", "/dav?delete=", StorageFault::Hold);
+    w.storage_fault("DELETE", "dst/b", StorageFault::Hold);
     let r = tokio::time::timeout(
         std::time::Duration::from_secs(5),
         w.req("DELETE", "/dav/dst/", &[], b""),
@@ -1931,8 +1929,8 @@ async fn a_late_commit_of_an_unanswered_delete_cannot_hit_a_later_move() {
     let moving = || w.req("MOVE", "/dav/src/", &[("destination", "/dav/dst/")], b"");
     moving().await.expect(503);
     assert_eq!(w.s3_get("src/b").await.1, b"moved b");
-    // Storage commits the batch the gateway stopped waiting for.
-    assert_eq!(w.commit_held().await, 200);
+    // Storage commits the delete the gateway stopped waiting for.
+    assert_eq!(w.commit_held().await, 204);
     w.advance_secs(4);
     moving().await.expect(201);
     assert_eq!(w.s3_get("dst/b").await.1, b"moved b");
@@ -1947,7 +1945,6 @@ async fn a_renewal_error_leaves_an_unanswered_delete_to_expire_with_its_reservat
     // 4 s and gives each storage call 3 s.
     let w = World::with(Config {
         lease_secs: 12,
-        delete_keys: 2,
         ..Config::default()
     })
     .await;
@@ -1972,7 +1969,7 @@ async fn a_renewal_error_leaves_an_unanswered_delete_to_expire_with_its_reservat
     }
     // The batch goes out 2 s into the lease, so the renewal at 4 s comes
     // while storage holds it, a second before its bound.
-    w.storage_fault_target("POST", "/dav?delete=", StorageFault::Hold);
+    w.storage_fault("DELETE", "dst/b", StorageFault::Hold);
     let held = w.on_hold();
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     release.send(()).unwrap();
@@ -1990,7 +1987,7 @@ async fn a_renewal_error_leaves_an_unanswered_delete_to_expire_with_its_reservat
     // its lease runs out.
     let moving = || w.req("MOVE", "/dav/src/", &[("destination", "/dav/dst/")], b"");
     moving().await.expect(503);
-    assert_eq!(w.commit_held().await, 200);
+    assert_eq!(w.commit_held().await, 204);
     assert_eq!(
         w.s3_get("src/b").await.1,
         b"moved b",
@@ -2042,7 +2039,6 @@ async fn only_the_unanswered_call_is_a_timeout_and_undispatched_keys_are_reporte
     // A quarter lease is one second.
     let w = World::with(Config {
         lease_secs: 4,
-        delete_keys: 1,
         fan_out: 1,
         ..Config::default()
     })
@@ -2052,7 +2048,7 @@ async fn only_the_unanswered_call_is_a_timeout_and_undispatched_keys_are_reporte
     ] {
         assert_eq!(w.s3_put(key, b"").await, 200);
     }
-    w.storage_fault_target("POST", "/dav?delete=", StorageFault::Hold);
+    w.storage_fault("DELETE", "dst/a", StorageFault::Hold);
     let r = tokio::time::timeout(
         std::time::Duration::from_secs(5),
         w.req("DELETE", "/dav/dst/", &[], b""),
@@ -2080,7 +2076,7 @@ async fn only_the_unanswered_call_is_a_timeout_and_undispatched_keys_are_reporte
     );
     // The same for the versioned deletes of an overwrite.
     w.advance_secs(4);
-    assert_eq!(w.commit_held().await, 200);
+    assert_eq!(w.commit_held().await, 204);
     for (key, body) in [("other/c", &b"c"[..]), ("dst/0", b"0"), ("dst/b", b"b")] {
         assert_eq!(w.s3_put(key, body).await, 200);
     }
