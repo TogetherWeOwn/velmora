@@ -66,7 +66,7 @@ fn nzb_uses_recorded_groups_and_never_object_names() {
         key: "private-object-name&".into(),
         generation: "g_test".into(),
         size: plain_size,
-        md5: None,
+        etag: "01010101010101010101010101010101-2".into(),
         checksum: None,
         source_md5: None,
         extents: vec![velmora_recover::catalogue::Reference {

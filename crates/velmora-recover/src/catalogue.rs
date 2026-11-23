@@ -13,7 +13,7 @@ use velmora_bridge::{
     types::{BucketId, ExtentId},
 };
 
-use velmora_s3_proto::StoredChecksum;
+use velmora_s3_proto::{ChecksumAlgorithm, StoredChecksum};
 
 pub struct Bucket {
     pub id: BucketId,
@@ -27,11 +27,11 @@ pub struct Object {
     pub key: String,
     pub generation: String,
     pub size: u64,
-    /// Whole-object MD5 from the authenticated generation's single-PUT ETag.
-    pub md5: Option<[u8; 16]>,
-    pub checksum: Option<StoredChecksum>,
+    /// Keep authenticated metadata raw until the object is selected.
+    pub etag: String,
+    pub checksum: Option<String>,
     /// Annotation from an external source inventory; not bound to this generation.
-    pub source_md5: Option<[u8; 16]>,
+    pub source_md5: Option<Vec<u8>>,
     pub extents: Vec<Reference>,
 }
 
@@ -62,6 +62,8 @@ pub struct ObjectResult {
     pub md5_status: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub warning: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub checksum_warning: Option<&'static str>,
     pub unmapped: bool,
     pub extents: usize,
 }
@@ -187,6 +189,7 @@ impl Catalogue {
     ) -> Result<ObjectResult, Box<dyn std::error::Error>> {
         let bdk = self.open_bucket(kek, selected)?;
         let object = selected.object;
+        let checksums = SelectedChecksums::read(object)?;
         let checks: Vec<_> = object
             .extents
             .iter()
@@ -202,8 +205,8 @@ impl Catalogue {
             key: &object.key,
             generation: &object.generation,
             size: object.size,
-            md5: object.md5,
-            checksum: object.checksum.as_ref(),
+            md5: checksums.md5,
+            checksum: checksums.full.as_ref(),
             extents: &checks,
         })?;
         for (ordinal, reference) in object.extents.iter().enumerate() {
@@ -213,7 +216,7 @@ impl Catalogue {
             }
         }
         let unmapped = out.is_unmapped();
-        Ok(result(object, out.finish()?, unmapped))
+        Ok(result(object, &checksums, out.finish()?, unmapped))
     }
 
     pub async fn check(
@@ -224,30 +227,81 @@ impl Catalogue {
     ) -> Result<ObjectResult, Box<dyn std::error::Error>> {
         let bdk = self.open_bucket(kek, selected)?;
         let object = selected.object;
-        let mut hash = ObjectHashes::new(object.checksum.as_ref());
+        let checksums = SelectedChecksums::read(object)?;
+        let mut hash = ObjectHashes::new(checksums.full.as_ref());
         for reference in &object.extents {
             let plaintext = open_extent(source, &bdk, self.extent(&reference.id)).await?;
             hash.update(plaintext.as_slice());
         }
         let md5 = hash
-            .finish(object.md5)
+            .finish(checksums.md5)
             .ok_or("whole-object integrity check failed")?;
-        Ok(result(object, md5, false))
+        Ok(result(object, &checksums, md5, false))
     }
 }
 
-fn result(object: &Object, md5: [u8; 16], unmapped: bool) -> ObjectResult {
+struct SelectedChecksums {
+    md5: Option<[u8; 16]>,
+    full: Option<StoredChecksum>,
+    source_md5: Option<[u8; 16]>,
+    warning: Option<&'static str>,
+}
+
+impl SelectedChecksums {
+    fn read(object: &Object) -> Result<Self, &'static str> {
+        let full = object.checksum.as_deref().and_then(full_object_checksum);
+        let warning = (object.checksum.is_some() && full.is_none())
+            .then_some("stored checksum is not a valid FULL_OBJECT checksum; using authenticated extent hashes");
+        Ok(Self {
+            md5: expected_md5(&object.etag)?,
+            full,
+            source_md5: object
+                .source_md5
+                .as_deref()
+                .map(<[u8; 16]>::try_from)
+                .transpose()
+                .map_err(|_| "invalid source MD5 in authenticated index")?,
+            warning,
+        })
+    }
+}
+
+// Match the bridge's stored-checksum interpretation: composite, unknown, or
+// malformed records do not describe a usable full-object checksum.
+fn full_object_checksum(input: &str) -> Option<StoredChecksum> {
+    #[derive(serde::Deserialize)]
+    struct Checksum {
+        #[serde(rename = "type")]
+        kind: String,
+        algorithm: String,
+        value: String,
+    }
+    let parsed: Checksum = serde_json::from_str(input).ok()?;
+    if parsed.kind != "FULL_OBJECT" {
+        return None;
+    }
+    let algorithm = ChecksumAlgorithm::from_name(&parsed.algorithm)?;
+    StoredChecksum::full(algorithm, parsed.value).ok()
+}
+
+fn result(
+    object: &Object,
+    checksums: &SelectedChecksums,
+    md5: [u8; 16],
+    unmapped: bool,
+) -> ObjectResult {
     ObjectResult {
         md5: hex(&md5),
-        md5_status: if object.md5.is_some() {
+        md5_status: if checksums.md5.is_some() {
             "verified"
         } else {
             "computed"
         },
-        warning: object
+        warning: checksums
             .source_md5
             .filter(|expected| *expected != md5)
             .map(|_| "source MD5 differs; object may have been overwritten since the annotation"),
+        checksum_warning: checksums.warning,
         unmapped,
         extents: object.extents.len(),
     }

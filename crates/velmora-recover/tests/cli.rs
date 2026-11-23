@@ -424,29 +424,119 @@ fn same_size_overwrite_recovers_current_bytes_despite_stale_source_md5() {
     );
 }
 
-#[test]
-fn authenticated_full_object_checksum_mismatch_blocks_promotion() {
+const COMPOSITE_CHECKSUM: &str = r#"{"algorithm":"SHA256","type":"COMPOSITE","value":"unused-2"}"#;
+const CHECKSUM_WARNING: &str = "stored checksum is not a valid FULL_OBJECT checksum";
+
+fn with_fixture_index(edit: impl FnOnce(&mut Vec<kit::Entry>)) -> Fixture {
     let fixture = Fixture::new();
     let index = fixture.fixture();
     let kek = TestKey(KekBytes::new([19; 32]));
     let mut entries = kit::read_index(Cursor::new(index), "fixture", &kek).unwrap();
-    let live = entries
+    edit(&mut entries);
+    let mut index = Vec::new();
+    kit::write_index(&mut index, "fixture", &kek, &entries).unwrap();
+    fixture.write_index(&index);
+    fixture
+}
+
+fn fixture_object(entries: &mut [kit::Entry]) -> &mut kit::Object {
+    entries
         .iter_mut()
         .find_map(|entry| match entry {
             kit::Entry::Object(o) => Some(o),
             _ => None,
         })
-        .unwrap();
-    live.checksum = Some(serde_json::json!({"algorithm": "SHA256", "type": "FULL_OBJECT", "value": format!("{}=", "A".repeat(43))}).to_string());
-    let mut index = Vec::new();
-    kit::write_index(&mut index, "fixture", &kek, &entries).unwrap();
-    fixture.write_index(&index);
+        .unwrap()
+}
+
+#[test]
+fn unrelated_composite_checksum_does_not_block_targeted_restore() {
+    let fixture = with_fixture_index(|entries| {
+        let mut unrelated = fixture_object(entries).clone();
+        unrelated.key = "unselected".into();
+        unrelated.generation_id = "g_unselected".into();
+        unrelated.checksum = Some(COMPOSITE_CHECKSUM.into());
+        let mut bad_metadata = unrelated.clone();
+        bad_metadata.key = "unselected-metadata".into();
+        bad_metadata.generation_id = "g_unselected_metadata".into();
+        bad_metadata.etag = "invalid-etag".into();
+        bad_metadata.source_md5 = Some(vec![0].into());
+        entries.push(kit::Entry::Object(unrelated));
+        entries.push(kit::Entry::Object(bad_metadata));
+    });
+    let result = fixture.run(
+        "key",
+        &[
+            DECRYPT,
+            &["--bucket", "example", "--key", "nested/example.bin"],
+        ]
+        .concat(),
+    );
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(!String::from_utf8(result.stdout)
+        .unwrap()
+        .contains(CHECKSUM_WARNING));
+    assert!(!fixture.0.join("output/example/unselected").exists());
+    assert_eq!(
+        fs::read(fixture.0.join("output/example/nested/example.bin")).unwrap(),
+        b"recoverable sealed-kit fixture"
+    );
+}
+
+#[test]
+fn selected_composite_or_malformed_checksum_restores_with_warning() {
+    for checksum in [COMPOSITE_CHECKSUM, "not valid JSON"] {
+        let fixture = with_fixture_index(|entries| {
+            let object = fixture_object(entries);
+            object.checksum = Some(checksum.into());
+            object.etag.push_str("-2");
+        });
+        let result = fixture.run(
+            "key",
+            &[
+                DECRYPT,
+                &["--bucket", "example", "--key", "nested/example.bin"],
+            ]
+            .concat(),
+        );
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let stdout = String::from_utf8(result.stdout).unwrap();
+        assert!(stdout.contains(CHECKSUM_WARNING));
+        assert!(stdout.contains("\"md5_status\":\"computed\""));
+        assert_eq!(
+            fs::read(fixture.0.join("output/example/nested/example.bin")).unwrap(),
+            b"recoverable sealed-kit fixture"
+        );
+    }
+}
+
+#[test]
+fn authenticated_full_object_checksum_mismatch_blocks_only_its_object() {
+    let fixture = with_fixture_index(|entries| {
+        let mut bad = fixture_object(entries).clone();
+        bad.key = "bad-checksum".into();
+        bad.generation_id = "g_bad_checksum".into();
+        bad.checksum = Some(serde_json::json!({"algorithm": "SHA256", "type": "FULL_OBJECT", "value": format!("{}=", "A".repeat(43))}).to_string());
+        entries.push(kit::Entry::Object(bad));
+    });
     let result = fixture.run("key", DECRYPT);
     assert!(!result.status.success());
-    assert!(String::from_utf8(result.stdout)
-        .unwrap()
-        .contains("whole-object integrity check failed"));
-    assert!(!fixture.0.join("output/example/nested/example.bin").exists());
+    let stdout = String::from_utf8(result.stdout).unwrap();
+    assert!(stdout.contains("whole-object integrity check failed"));
+    assert!(stdout.contains("\"failed\":1,\"recovered\":1"));
+    assert!(!fixture.0.join("output/example/bad-checksum").exists());
+    assert_eq!(
+        fs::read(fixture.0.join("output/example/nested/example.bin")).unwrap(),
+        b"recoverable sealed-kit fixture"
+    );
 }
 
 #[test]
