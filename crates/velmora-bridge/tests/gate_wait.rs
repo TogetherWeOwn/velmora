@@ -135,6 +135,8 @@ struct World {
     wake_delayed_until: Cell<Option<i64>>,
     /// The caller cannot receive the opening wait reply until this time.
     wait_reply_delayed_until: Cell<Option<i64>>,
+    /// The first warm wake reply is delivered after the gate computes it.
+    wake_reply_delayed_until: Cell<Option<i64>>,
     /// The gate runs code from before the line: it cannot read a
     /// request to wait.
     old_code: Cell<bool>,
@@ -176,6 +178,7 @@ impl World {
             grant_sequence: Cell::new(0),
             wake_delayed_until: Cell::new(None),
             wait_reply_delayed_until: Cell::new(None),
+            wake_reply_delayed_until: Cell::new(None),
             old_code: Cell::new(false),
             fail_release: Cell::new(false),
         })
@@ -485,6 +488,15 @@ impl GateSession for Line {
             socket.inbox.push_back(on_the_wire(&reply));
         }
         self.world.deliver(&gate).await;
+        if wake && reply.restart_until.is_some() {
+            if let Some(until) = self.world.wake_reply_delayed_until.take() {
+                core::future::poll_fn(|_| match self.world.now.get() >= until {
+                    true => Poll::Ready(()),
+                    false => Poll::Pending,
+                })
+                .await;
+            }
+        }
         // Read in the order sent: a slot that was on its way when the
         // question left comes first, under the same id.
         match self.world.sockets.borrow_mut().get_mut(&self.id) {
@@ -1441,6 +1453,35 @@ async fn an_ahead_clock_with_a_slow_probe_honors_the_restart_hold() {
     );
     w.pass(SKEW_MS - i64::from(jobs::SLOT_POLL_MS) - 1);
     assert_eq!(turn(&mut waiting), Some(SlotWait::Granted));
+}
+
+#[tokio::test]
+async fn a_late_reply_to_an_early_probe_does_not_postpone_the_restart_wake() {
+    let Full { w, p, .. } = full().await;
+    let claimed = w.now();
+    w.restart();
+    w.pass(3_000);
+    let (sleep, on) = (w.sleeper(), [&p]);
+    let (a, behind) = w.behind(core::slice::from_ref(&p));
+    behind.set(-SKEW_MS);
+    let window = job_slot_window(claimed, w.now());
+    w.wake_reply_delayed_until
+        .set(Some(w.now().0 + JOB_MS + 4_000));
+    let mut waiting: Waiting<'_> = Box::pin(a.await_permit(&on, "job-a", window, &sleep));
+    assert_eq!(turn(&mut waiting), None);
+
+    w.pass(JOB_MS);
+    assert_eq!(turn(&mut waiting), None);
+    assert_eq!(w.msgs.get(), 1, "the early probe reached the gate");
+    w.pass(4_000);
+    assert_eq!(
+        turn(&mut waiting),
+        None,
+        "the delayed reply was warm when sent"
+    );
+    w.pass(SKEW_MS - 4_000);
+    assert_eq!(turn(&mut waiting), Some(SlotWait::Granted));
+    assert_eq!(w.msgs.get(), 2, "no other gate traffic");
 }
 
 fn job_slot_window(claimed: UnixMs, now: UnixMs) -> SlotWaitWindow {

@@ -2626,7 +2626,7 @@ impl<T: GateTransport> GateClient<T> {
         let (session, mut reply) = self.transport.open(request).await?;
         let session = Rc::new(session);
         queued.session = Some(Rc::clone(&session));
-        let mut seen_restart = None;
+        let mut seen_restart: Option<(UnixMs, i64)> = None;
         loop {
             if reply.failed {
                 return Ok(false);
@@ -2659,25 +2659,29 @@ impl<T: GateTransport> GateClient<T> {
             }
             let mut wake = reply.wake;
             if let (Some(end), Some(delay)) = (reply.restart_until, wake) {
-                // The absolute end avoids charging the reply's travel
-                // time to the hold. If our clock is ahead and we asked
-                // too early, use the gate's remaining delay, not a spin.
                 let now = (self.clock)().0;
-                let left = end.0.saturating_sub(now).max(0);
-                let first_hint = seen_restart != Some(end);
-                let ms = if !first_hint && left == 0 {
-                    delay
-                } else {
-                    delay.min(left)
+                let until_probe = match seen_restart {
+                    Some((seen, local_end)) if seen == end => {
+                        // A delayed reply must not restart the whole
+                        // relative delay. If the estimate is already
+                        // past and the gate is still warm, avoid a spin.
+                        let left = local_end.saturating_sub(now);
+                        if left > 0 {
+                            left
+                        } else {
+                            i64::from(SLOT_POLL_MS)
+                        }
+                    }
+                    _ => {
+                        // Use the absolute end for the first probe, but
+                        // budget the relative delay in case we are ahead.
+                        let local_end = now.saturating_add(delay);
+                        extend(local_end);
+                        seen_restart = Some((end, local_end));
+                        end.0.saturating_sub(now).max(0)
+                    }
                 };
-                if first_hint {
-                    // The absolute end can make the probe early, but
-                    // not the deadline: the gate may be behind us.
-                    // Budget its reported delay once, within the cap.
-                    extend(now.saturating_add(delay));
-                    seen_restart = Some(end);
-                }
-                wake = Some(ms);
+                wake = Some(delay.min(until_probe));
             }
             if let Some(link) = self.links.borrow_mut().get_mut(&queued.key) {
                 link.used = (self.clock)().0;
