@@ -6,7 +6,8 @@ mod index;
 mod packs;
 
 pub use builder::{
-    build_entries, cross_check, eligible_record, BuildAnnotations, Comparison, Release,
+    build_entries, build_entries_with_stats, cross_check, eligible_record, BuildAnnotations,
+    BuildStats, Comparison, Release,
 };
 pub use packs::verify_packs;
 
@@ -79,6 +80,9 @@ pub struct Object {
     pub size: u64,
     pub etag: String,
     pub content_type: Option<String>,
+    pub headers: BTreeMap<String, String>,
+    #[serde(deserialize_with = "required_option")]
+    pub checksum: Option<String>,
     pub user_meta: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_md5: Option<serde_bytes::ByteBuf>,
@@ -108,12 +112,22 @@ pub struct Extent {
     pub plain_sha256: Vec<u8>,
     #[serde(with = "serde_bytes")]
     pub cipher_sha256: Vec<u8>,
+    #[serde(deserialize_with = "required_option")]
     pub plan_rev: Option<u32>,
     pub articles: Vec<Article>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parity: Option<Parity>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verified: Option<Vec<Verified>>,
+}
+
+// Treat absence differently from an explicit null on the wire.
+fn required_option<'de, D, T>(d: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(d)
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]

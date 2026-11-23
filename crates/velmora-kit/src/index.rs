@@ -11,6 +11,10 @@ use zeroize::{Zeroize, Zeroizing};
 const MAGIC: &[u8; 4] = b"VKI1";
 const DOMAIN: &str = "velmora/kit/v1";
 const PLAIN_MAX: usize = 4 * 1024 * 1024;
+const ENCODED_MAX: usize = 8 * 1024 * 1024;
+const ITEM_MAX: usize = 16 * 1024 * 1024;
+const INDEX_MAX: u64 = 8 * 1024 * 1024 * 1024;
+const FRAMES_MAX: usize = 16_384;
 const PREFIX: usize = 29; // KEK version, wrap version, nonce
 const TAG: usize = 16;
 
@@ -27,6 +31,14 @@ fn check_id(id: &str) -> Result<(), Error> {
 
 fn aad(id: &str, number: u64, flags: u8) -> String {
     format!("{DOMAIN}|{id}|{number}|{flags}")
+}
+
+fn validate_entry(entry: &Entry) -> Result<(), Error> {
+    if matches!(entry, Entry::Extent(e) if e.plan_rev.is_none() && (!e.articles.is_empty() || e.parity.is_some()))
+    {
+        return Err(Error::Format);
+    }
+    Ok(())
 }
 
 fn cipher(key: &KekBytes) -> XChaCha20Poly1305 {
@@ -55,10 +67,14 @@ pub fn write_index<'a>(
         version,
         number: 0,
         slice: Zeroizing::new(Vec::with_capacity(PLAIN_MAX)),
+        remaining: INDEX_MAX,
+        item_remaining: ITEM_MAX,
     };
     for entry in entries {
+        validate_entry(entry)?;
+        framer.item_remaining = ITEM_MAX;
         ciborium::into_writer(entry, &mut framer).map_err(|e| match e {
-            ciborium::ser::Error::Io(_) => Error::Io,
+            ciborium::ser::Error::Io(e) if e.kind() != io::ErrorKind::InvalidData => Error::Io,
             _ => Error::Format,
         })?;
     }
@@ -73,6 +89,8 @@ struct Framer<'a, W> {
     version: u32,
     number: u64,
     slice: Zeroizing<Vec<u8>>,
+    remaining: u64,
+    item_remaining: usize,
 }
 
 impl<W: Write> Framer<'_, W> {
@@ -89,7 +107,11 @@ impl<W: Write> Framer<'_, W> {
                 body.as_mut_slice().into(),
             )
             .map_err(|_| Error::Authentication)?;
-        let len = u32::try_from(body.len() + PREFIX + TAG).map_err(|_| Error::Format)?;
+        let len = body.len() + PREFIX + TAG;
+        if len > ENCODED_MAX || self.number >= FRAMES_MAX as u64 {
+            return Err(Error::Format);
+        }
+        let len = len as u32;
         self.writer
             .write_all(&[flags])
             .and_then(|_| self.writer.write_all(&len.to_be_bytes()))
@@ -108,6 +130,11 @@ impl<W: Write> Framer<'_, W> {
 
 impl<W: Write> Write for Framer<'_, W> {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if bytes.len() > self.item_remaining || bytes.len() as u64 > self.remaining {
+            return Err(io::Error::from(io::ErrorKind::InvalidData));
+        }
+        self.item_remaining -= bytes.len();
+        self.remaining -= bytes.len() as u64;
         let mut rest = bytes;
         while !rest.is_empty() {
             if self.slice.len() == PLAIN_MAX {
@@ -129,10 +156,7 @@ fn next_frame(reader: &mut impl Read) -> Result<([u8; 5], Zeroizing<Vec<u8>>), E
     let mut header = [0; 5];
     reader.read_exact(&mut header).map_err(|_| Error::Format)?;
     let len = u32::from_be_bytes(header[1..].try_into().expect("length field")) as usize;
-    if header[0] > 1
-        || !(PREFIX + TAG..=PREFIX + TAG + zstd::zstd_safe::compress_bound(PLAIN_MAX))
-            .contains(&len)
-    {
+    if header[0] > 1 || !(PREFIX + TAG..=ENCODED_MAX).contains(&len) {
         return Err(Error::Format);
     }
     let mut body = Zeroizing::new(vec![0; len]);
@@ -179,9 +203,19 @@ fn open_frame<'a>(
 /// first pass even if the underlying seekable source changes between reads.
 /// No plaintext is persisted by the reader.
 pub fn read_index(
+    reader: impl Read + Seek,
+    kit_id: &str,
+    kek: &impl Kek,
+) -> Result<Vec<Entry>, Error> {
+    read_bounded(reader, kit_id, kek, ITEM_MAX as u64, INDEX_MAX)
+}
+
+fn read_bounded(
     mut reader: impl Read + Seek,
     kit_id: &str,
     kek: &impl Kek,
+    item_max: u64,
+    index_max: u64,
 ) -> Result<Vec<Entry>, Error> {
     check_id(kit_id)?;
     let mut magic = [0; 4];
@@ -192,6 +226,9 @@ pub fn read_index(
     let start = reader.stream_position().map_err(|_| Error::Io)?;
     let mut frames = Vec::new();
     loop {
+        if frames.len() >= FRAMES_MAX {
+            return Err(Error::Format);
+        }
         let (header, mut body) = next_frame(&mut reader)?;
         let number = u64::try_from(frames.len()).map_err(|_| Error::Format)?;
         let digest = fingerprint(&header, &body);
@@ -215,10 +252,14 @@ pub fn read_index(
         number: 0,
         slice: Zeroizing::new(vec![]),
         offset: 0,
+        remaining: index_max,
     });
     let mut entries = Vec::new();
     while !plain.fill_buf().map_err(|_| Error::Format)?.is_empty() {
-        entries.push(ciborium::from_reader(&mut plain).map_err(|_| Error::Format)?);
+        let entry =
+            ciborium::from_reader((&mut plain).take(item_max)).map_err(|_| Error::Format)?;
+        validate_entry(&entry)?;
+        entries.push(entry);
     }
     Ok(entries)
 }
@@ -231,6 +272,7 @@ struct PlainFrames<'a, R, K> {
     number: usize,
     slice: Zeroizing<Vec<u8>>,
     offset: usize,
+    remaining: u64,
 }
 
 impl<R: Read, K: Kek> PlainFrames<'_, R, K> {
@@ -256,6 +298,10 @@ impl<R: Read, K: Kek> PlainFrames<'_, R, K> {
                 .decompress(compressed, PLAIN_MAX)
                 .map_err(|_| Error::Compression)?,
         );
+        self.remaining = self
+            .remaining
+            .checked_sub(self.slice.len() as u64)
+            .ok_or(Error::Format)?;
         self.offset = 0;
         self.number += 1;
         Ok(true)
@@ -276,5 +322,136 @@ impl<R: Read, K: Kek> Read for PlainFrames<'_, R, K> {
         out[..n].copy_from_slice(&self.slice[self.offset..self.offset + n]);
         self.offset += n;
         Ok(n)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Article, Extent, Parity, RecordRef};
+    use ciborium::value::Value;
+    use std::io::Cursor;
+
+    struct Key(KekBytes);
+    impl Kek for Key {
+        fn active(&self) -> (u32, &KekBytes) {
+            (1, &self.0)
+        }
+        fn version(&self, v: u32) -> Option<&KekBytes> {
+            (v == 1).then_some(&self.0)
+        }
+    }
+
+    #[test]
+    fn frame_reader_enforces_format_length_inclusive() {
+        let mut exact = vec![0; 5 + ENCODED_MAX];
+        exact[0] = 1;
+        exact[1..5].copy_from_slice(&(ENCODED_MAX as u32).to_be_bytes());
+        assert_eq!(
+            next_frame(&mut exact.as_slice()).unwrap().1.len(),
+            ENCODED_MAX
+        );
+        let mut oversized =
+            Cursor::new([&[1], &((ENCODED_MAX + 1) as u32).to_be_bytes()[..], &[0]].concat());
+        assert!(matches!(next_frame(&mut oversized), Err(Error::Format)));
+        assert_eq!(oversized.position(), 5);
+    }
+
+    #[test]
+    fn per_item_and_total_budgets_count_actual_cbor_bytes() {
+        let key = Key(KekBytes::new([7; 32]));
+        let item = Entry::RecordRef(RecordRef {
+            name: "m/example".into(),
+            sha256: vec![1; 32],
+        });
+        let mut raw = vec![];
+        ciborium::into_writer(&item, &mut raw).unwrap();
+        let bound = raw.len() as u64;
+        let mut sealed = vec![];
+        write_index(&mut sealed, "budgets", &key, [&item, &item]).unwrap();
+        let open = |item_max, index_max| {
+            read_bounded(Cursor::new(&sealed), "budgets", &key, item_max, index_max)
+        };
+        assert_eq!(open(bound, bound * 2).unwrap().len(), 2);
+        assert_eq!(open(bound - 1, bound * 2).unwrap_err(), Error::Format);
+        assert_eq!(open(bound, bound * 2 - 1).unwrap_err(), Error::Format);
+    }
+
+    fn null_extent() -> Extent {
+        Extent {
+            id: "x_test".into(),
+            bucket_id: "b_test".into(),
+            plain_size: 1,
+            cipher_size: 65,
+            media_header: vec![0; 48],
+            wrapped_file_key: vec![0; 73],
+            plain_md5: vec![0; 16],
+            plain_sha256: vec![0; 32],
+            cipher_sha256: vec![0; 32],
+            plan_rev: None,
+            articles: vec![],
+            parity: None,
+            verified: None,
+        }
+    }
+
+    // Use the framing layer directly so all invalid CBOR fixtures are
+    // nevertheless authenticated, without bypassing the reader's validation.
+    fn read_raw(value: &Value) -> Result<Vec<Entry>, Error> {
+        let key = Key(KekBytes::new([4; 32]));
+        let mut output = MAGIC.to_vec();
+        let mut framer = Framer {
+            writer: &mut output,
+            kit_id: "fixture",
+            cipher: cipher(key.active().1),
+            version: 1,
+            number: 0,
+            slice: Zeroizing::new(vec![]),
+            remaining: INDEX_MAX,
+            item_remaining: ITEM_MAX,
+        };
+        ciborium::into_writer(value, &mut framer).unwrap();
+        framer.emit(1).unwrap();
+        read_index(Cursor::new(output), "fixture", &key)
+    }
+
+    #[test]
+    fn explicit_null_plan_is_valid_but_omitted_plan_is_not() {
+        let mut value = Value::serialized(&Entry::Extent(null_extent())).unwrap();
+        assert_eq!(read_raw(&value).unwrap().len(), 1);
+        value
+            .as_map_mut()
+            .unwrap()
+            .retain(|(k, _)| k.as_text() != Some("plan_rev"));
+        assert_eq!(read_raw(&value).unwrap_err(), Error::Format);
+    }
+
+    #[test]
+    fn null_plan_rejects_articles_or_parity_independently() {
+        let mut articles = null_extent();
+        articles.articles.push(Article {
+            message_id: "article".into(),
+            newsgroup: "alt.binaries.test".into(),
+            payload_sha256: vec![0; 32],
+            yenc_name: None,
+        });
+        let mut parity = null_extent();
+        parity.parity = Some(Parity {
+            k: 1,
+            shard_len: 66,
+            rows: vec![],
+        });
+        for e in [articles, parity] {
+            let entry = Entry::Extent(e);
+            assert_eq!(
+                read_raw(&Value::serialized(&entry).unwrap()).unwrap_err(),
+                Error::Format
+            );
+            let key = Key(KekBytes::new([4; 32]));
+            assert_eq!(
+                write_index(vec![], "fixture", &key, [&entry]).unwrap_err(),
+                Error::Format
+            );
+        }
     }
 }

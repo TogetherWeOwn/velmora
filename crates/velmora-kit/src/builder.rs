@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use velmora_bridge::{
     articles::article_spans,
     crypto::open_manifest,
-    parity,
+    parity, plan,
     ports::Kek,
     recovery::{
         self, ArticleManifest, ExtentRecord, GenerationHead, GenerationManifest, RecordKind,
@@ -145,10 +145,26 @@ fn load_checked(
 /// packing and building. Records are opened with their exact original names.
 pub fn build_entries(
     names: impl IntoIterator<Item = String>,
-    mut get: impl FnMut(&str) -> Result<Option<Vec<u8>>, Error>,
+    get: impl FnMut(&str) -> Result<Option<Vec<u8>>, Error>,
     kek: &impl Kek,
     annotations: &BuildAnnotations,
 ) -> Result<Vec<Entry>, Error> {
+    build_entries_with_stats(names, get, kek, annotations).map(|(entries, _)| entries)
+}
+
+#[derive(Default)]
+pub struct BuildStats {
+    /// Number of selected plans whose parity addendum could not be used.
+    pub parity_omitted: u64,
+}
+
+pub fn build_entries_with_stats(
+    names: impl IntoIterator<Item = String>,
+    mut get: impl FnMut(&str) -> Result<Option<Vec<u8>>, Error>,
+    kek: &impl Kek,
+    annotations: &BuildAnnotations,
+) -> Result<(Vec<Entry>, BuildStats), Error> {
+    let mut stats = BuildStats::default();
     let mut records = BTreeMap::new();
     let mut winners: BTreeMap<(String, String), Winner> = BTreeMap::new();
     let mut plans: BTreeMap<String, Vec<String>> = BTreeMap::new();
@@ -261,6 +277,9 @@ pub fn build_entries(
         if bucket_record.bdk_wrapped.len() != 73 || bucket_record.bdk_wrapped[0] != 1 {
             return Err(Error::Record);
         }
+        if kek.version(bucket_record.kek_version).is_none() {
+            return Err(Error::Authentication);
+        }
         let bucket = Bucket {
             id: bucket_record.id,
             name: bucket_record.name,
@@ -327,7 +346,7 @@ pub fn build_entries(
                             {
                                 return Err(Error::Record);
                             }
-                            attach_plan(&mut extent, plan)?;
+                            stats.parity_omitted += u64::from(attach_plan(&mut extent, plan)?);
                             extent.verified = released.and_then(|r| r.verified.clone());
                         }
                     }
@@ -362,12 +381,14 @@ pub fn build_entries(
                 .get("content-type")
                 .or_else(|| content.get("content_type"))
                 .cloned(),
+            headers: content,
+            checksum: g.checksum_json,
             user_meta: serde_json::from_str(&g.user_meta_json).map_err(|_| Error::Record)?,
             source_md5,
             extents: refs,
         }));
     }
-    Ok(buckets
+    let entries = buckets
         .into_values()
         .map(Entry::Bucket)
         .chain(objects)
@@ -378,7 +399,8 @@ pub fn build_entries(
                 sha256: sha256.to_vec(),
             })
         }))
-        .collect())
+        .collect();
+    Ok((entries, stats))
 }
 
 fn extent_base(bucket_id: &str, e: ExtentRecord) -> Result<Extent, Error> {
@@ -411,7 +433,7 @@ fn extent_base(bucket_id: &str, e: ExtentRecord) -> Result<Extent, Error> {
     })
 }
 
-fn attach_plan(e: &mut Extent, plan: ArticleManifest) -> Result<(), Error> {
+fn attach_plan(e: &mut Extent, plan: ArticleManifest) -> Result<bool, Error> {
     // Check count before expanding spans; a malformed gigantic size cannot
     // drive an allocation based only on the supplied numeric size.
     let subsequent = e
@@ -425,7 +447,7 @@ fn attach_plan(e: &mut Extent, plan: ArticleManifest) -> Result<(), Error> {
     let rows = plan
         .rows(ArticleState::Planned)
         .map_err(|_| Error::Record)?;
-    for (i, (row, span)) in rows.into_iter().zip(spans).enumerate() {
+    for (i, (row, span)) in rows.iter().zip(spans).enumerate() {
         if usize::try_from(row.idx).ok() != Some(i)
             || row.cipher_offset != span.start
             || row.cipher_len != span.len
@@ -434,19 +456,13 @@ fn attach_plan(e: &mut Extent, plan: ArticleManifest) -> Result<(), Error> {
         {
             return Err(Error::Record);
         }
-        e.articles.push(Article {
-            message_id: row.message_id,
-            newsgroup: row.newsgroup,
-            payload_sha256: row.payload_sha256.to_vec(),
-            yenc_name: row.yenc_name,
-        });
     }
-    if let Some(blob) = plan.parity {
-        let packed = plan.packed.ok_or(Error::Record)?;
-        let p = parity::expand(&ExtentId::new(e.id.clone()), e.cipher_size, &packed, &blob)
-            .map_err(|_| Error::Record)?;
-        e.parity = Some(Parity {
-            k: u16::try_from(count).map_err(|_| Error::Record)?,
+    e.parity = plan.parity.as_ref().and_then(|blob| {
+        let id = ExtentId::new(e.id.clone());
+        let packed = plan::repack(&id, e.cipher_size, &rows, plan.packed.as_deref())?;
+        let p = parity::expand(&id, e.cipher_size, &packed, blob).ok()?;
+        Some(Parity {
+            k: u16::try_from(count).ok()?,
             shard_len: p.shard_len,
             rows: p
                 .rows
@@ -459,8 +475,17 @@ fn attach_plan(e: &mut Extent, plan: ArticleManifest) -> Result<(), Error> {
                     payload_sha256: a.payload_sha256.to_vec(),
                 })
                 .collect(),
-        });
-    }
+        })
+    });
+    e.articles = rows
+        .into_iter()
+        .map(|row| Article {
+            message_id: row.message_id,
+            newsgroup: row.newsgroup,
+            payload_sha256: row.payload_sha256.to_vec(),
+            yenc_name: row.yenc_name,
+        })
+        .collect();
     e.plan_rev = Some(plan.plan_rev);
-    Ok(())
+    Ok(plan.parity.is_some() && e.parity.is_none())
 }

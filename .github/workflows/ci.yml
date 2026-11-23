@@ -256,6 +256,7 @@ jobs:
       - run: cargo check --locked -p velmora-s3-proto -p velmora-bridge
       - run: cargo check --locked -p velmora-parity-bench
       - run: cargo check --locked -p velmora-cpu-bench
+      - run: cargo check --locked -p velmora-kit
       - name: Install Rust 1.91 (Worker SDK minimum)
         run: |
           rustup toolchain install 1.91 --profile minimal --no-self-update

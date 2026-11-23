@@ -225,6 +225,53 @@ pub struct Evidence {
     md5: Vec<u8>,
 }
 
+/// A sample is a projection of an authenticated full index, never a new
+/// interpretation of the raw packs (which may have other plan revisions).
+pub struct Projection {
+    buckets: BTreeSet<String>,
+    generations: BTreeSet<String>,
+    extents: BTreeSet<String>,
+    records: BTreeSet<String>,
+}
+
+impl Projection {
+    pub fn new(objects: &[&Object], records: &[String]) -> Self {
+        Self {
+            buckets: objects.iter().map(|o| o.bucket_id.clone()).collect(),
+            generations: objects.iter().map(|o| o.generation_id.clone()).collect(),
+            extents: objects
+                .iter()
+                .flat_map(|o| &o.extents)
+                .map(|e| e.id.clone())
+                .collect(),
+            records: records.iter().cloned().collect(),
+        }
+    }
+
+    pub fn apply(mut self, entries: Vec<Entry>) -> Result<Vec<Entry>, Error> {
+        let mut result = Vec::new();
+        for entry in entries {
+            let keep = match &entry {
+                Entry::Bucket(b) => self.buckets.remove(&b.id),
+                Entry::Object(o) => self.generations.remove(&o.generation_id),
+                Entry::Extent(e) => self.extents.remove(&e.id),
+                Entry::RecordRef(r) => self.records.remove(&r.name),
+            };
+            if keep {
+                result.push(entry);
+            }
+        }
+        if !self.buckets.is_empty()
+            || !self.generations.is_empty()
+            || !self.extents.is_empty()
+            || !self.records.is_empty()
+        {
+            return Err(Error::Coverage);
+        }
+        Ok(result)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -264,6 +311,8 @@ mod tests {
                     size,
                     etag: "etag".into(),
                     content_type: None,
+                    headers: BTreeMap::new(),
+                    checksum: None,
                     user_meta: BTreeMap::new(),
                     source_md5: Some(serde_bytes::ByteBuf::from(vec![0; 16])),
                     extents: vec![
@@ -277,7 +326,38 @@ mod tests {
                 }));
             }
         }
-        assert_eq!(choose(&entries, &evidence, "seed").unwrap().len(), 20);
+        entries.push(Entry::Bucket(velmora_kit::Bucket {
+            id: "bucket".into(),
+            name: "name".into(),
+            bdk_wrapped: vec![0; 73],
+            kek_version: 1,
+        }));
+        for name in ["m/art/extent", "m/x/t_1/art/extent"] {
+            entries.push(Entry::RecordRef(velmora_kit::RecordRef {
+                name: name.into(),
+                sha256: vec![0; 32],
+            }));
+        }
+        let objects = choose(&entries, &evidence, "seed").unwrap();
+        assert_eq!(objects.len(), 20);
+        let projection = Projection::new(
+            &objects,
+            &["m/art/extent".into(), "m/x/t_1/art/extent".into()],
+        );
+        let projected = projection.apply(entries.clone()).unwrap();
+        // Both archived record names remain, but the sample's extent is an
+        // exact copy of the full index plan, not re-selected from the pack.
+        assert_eq!(projected[0], entries[0]);
+        assert!(projected
+            .iter()
+            .any(|e| matches!(e, Entry::Extent(e) if e.plan_rev == Some(1))));
+        assert_eq!(
+            projected
+                .iter()
+                .filter(|e| matches!(e, Entry::RecordRef(_)))
+                .count(),
+            2
+        );
         assert!(choose(&entries, &evidence[1..], "seed").is_err());
         let Entry::Extent(e) = &mut entries[0] else {
             unreachable!()

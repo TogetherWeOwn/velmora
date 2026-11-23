@@ -33,9 +33,14 @@ pub fn verify_packs<R: Read>(
         // Walk past end padding so trailing malicious members cannot hide
         // behind an early zero block. Every non-padding member must match.
         archive.set_ignore_zeros(true);
-        for member in archive.entries().map_err(|_| Error::Format)? {
+        // Raw entries expose GNU/PAX extension headers without buffering
+        // their bodies. Only standalone regular USTAR headers are allowed.
+        for member in archive.entries().map_err(|_| Error::Format)?.raw(true) {
             let mut member = member.map_err(|_| Error::Format)?;
-            if !member.header().entry_type().is_file() || member.size() > MAX_RECORD {
+            if member.header().as_ustar().is_none()
+                || !member.header().entry_type().is_file()
+                || member.size() > MAX_RECORD
+            {
                 return Err(Error::Format);
             }
             let name = member.path_bytes();

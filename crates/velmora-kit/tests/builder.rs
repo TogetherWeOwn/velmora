@@ -125,3 +125,122 @@ fn catches_missing_mirror_record_but_excludes_non_kit_keys() {
     assert_eq!(comparison.missing_count, 1);
     assert_eq!(comparison.missing_examples, ["m/art/x_1"]);
 }
+
+fn parity_case(stale_hint: bool) -> (Vec<Entry>, velmora_kit::BuildStats) {
+    use velmora_bridge::{parity, plan, types::ExtentId};
+    let key = Key(KekBytes::new([8; 32]));
+    let gid = "g_00000000000000000000000000001";
+    let mut g = generation(gid, "object");
+    g.generation.size = 2 * velmora::article::ARTICLE_PLAINTEXT_BYTES;
+    g.generation.content_json =
+        r#"{"content-type":"example/type","cache-control":"max-age=30"}"#.into();
+    g.generation.checksum_json = Some(r#"{"algorithm":"SHA256","value":"synthetic"}"#.into());
+    let size = velmora::media::ciphertext_size(g.generation.size).unwrap();
+    g.extents[0].plain_size = g.generation.size;
+    g.extents[0].cipher_size = size;
+    let extent = ExtentId::new(&g.extents[0].id);
+    let groups = ["alt.binaries.test"];
+    let (seeded, rows) = plan::plan_seeded(
+        &mut SystemRng,
+        1_700_000_000,
+        &groups,
+        &extent,
+        size,
+        |_| Some([4; 32]),
+    )
+    .unwrap();
+    let packed = if stale_hint {
+        seeded.clone()
+    } else {
+        plan::pack_explicit(&extent, size, &rows).unwrap()
+    };
+    let parity = parity::build(
+        &mut SystemRng,
+        1_700_000_000,
+        &groups,
+        &extent,
+        size,
+        &packed,
+        &[(0, [6; 32])],
+    )
+    .unwrap();
+    let mut rows: Vec<_> = rows
+        .into_iter()
+        .map(|r| recovery::ArticleRecord {
+            idx: r.idx,
+            message_id: r.message_id,
+            newsgroup: r.newsgroup,
+            headers: r.headers,
+            cipher_offset: r.cipher_offset,
+            cipher_len: r.cipher_len,
+            payload_sha256: r.payload_sha256.to_vec(),
+            yenc_name: r.yenc_name,
+        })
+        .collect();
+    if stale_hint {
+        rows[0].payload_sha256[0] ^= 1;
+    }
+    let a = recovery::ArticleManifest {
+        v: 1,
+        extent_id: extent.as_str().into(),
+        plan_rev: 1,
+        articles: rows,
+        packed: stale_hint.then_some(seeded),
+        parity: Some(parity),
+    };
+    let records: BTreeMap<_, _> = [
+        (format!("m/{gid}"), serde_json::to_vec(&g).unwrap()),
+        (format!("m/art/{extent}"), serde_json::to_vec(&a).unwrap()),
+    ]
+    .into_iter()
+    .map(|(name, json)| {
+        let sealed = seal_manifest(&key, &name, &json, &mut SystemRng).unwrap();
+        (name, sealed)
+    })
+    .collect();
+    velmora_kit::build_entries_with_stats(
+        records.keys().cloned(),
+        |n| Ok(records.get(n).cloned()),
+        &key,
+        &BuildAnnotations::default(),
+    )
+    .unwrap()
+}
+
+#[test]
+fn explicit_plan_recovers_matching_parity_without_a_packed_hint() {
+    let (entries, stats) = parity_case(false);
+    assert_eq!(stats.parity_omitted, 0);
+    assert!(entries
+        .iter()
+        .any(|e| matches!(e, Entry::Extent(e) if e.articles.len() == 2 && e.parity.is_some())));
+    assert!(entries.iter().any(|e| matches!(e, Entry::Object(o) if o.headers.get("cache-control").map(String::as_str) == Some("max-age=30") && o.checksum.as_deref() == Some(r#"{"algorithm":"SHA256","value":"synthetic"}"#))));
+}
+
+#[test]
+fn parity_for_stale_packed_hint_is_omitted_without_losing_explicit_plan() {
+    let (entries, stats) = parity_case(true);
+    assert_eq!(stats.parity_omitted, 1);
+    assert!(entries.iter().any(|e| matches!(e, Entry::Extent(e) if e.plan_rev == Some(1) && e.articles[0].payload_sha256[0] == 5 && e.parity.is_none())));
+}
+
+#[test]
+fn authenticated_live_generation_needs_its_bucket_escrow_version() {
+    let key = Key(KekBytes::new([2; 32]));
+    let gid = "g_00000000000000000000000000002";
+    let name = format!("m/{gid}");
+    let mut g = generation(gid, "escrow-check");
+    g.bucket.kek_version = 2;
+    let json = serde_json::to_vec(&g).unwrap();
+    let sealed = seal_manifest(&key, &name, &json, &mut SystemRng).unwrap();
+    assert_eq!(
+        build_entries(
+            [name],
+            |_| Ok(Some(sealed.clone())),
+            &key,
+            &BuildAnnotations::default()
+        )
+        .unwrap_err(),
+        velmora_kit::Error::Authentication
+    );
+}

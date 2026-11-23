@@ -4,11 +4,11 @@
 use std::collections::BTreeMap;
 use std::env;
 use std::fs::{self, File};
-use std::io::{self, BufRead, BufReader, BufWriter, Write};
+use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::Path;
 use velmora_bridge::config::KekRing;
 use velmora_kit::{
-    build_entries, read_index, verify_packs, write_index, BuildAnnotations, Entry, Error,
+    build_entries_with_stats, read_index, verify_packs, write_index, BuildAnnotations, Entry, Error,
 };
 use zeroize::Zeroizing;
 
@@ -27,37 +27,48 @@ fn staged_record(staging: &Path, name: &str) -> Result<Option<Vec<u8>>, Error> {
 }
 
 fn read_keys(active: u32) -> Result<KekRing, Error> {
+    const INPUT_MAX: usize = 1024 * 1024;
+    let mut input = Zeroizing::new(Vec::with_capacity(INPUT_MAX + 2));
+    io::stdin()
+        .lock()
+        .take(INPUT_MAX as u64 + 1)
+        .read_to_end(&mut input)
+        .map_err(|_| Error::Io)?;
+    if input.len() > INPUT_MAX {
+        return Err(Error::Authentication);
+    }
+    parse_key_input(active, &input)
+}
+
+fn parse_key_input(active: u32, input: &[u8]) -> Result<KekRing, Error> {
+    let text = std::str::from_utf8(input).map_err(|_| Error::Authentication)?;
     let mut keys = BTreeMap::new();
-    let mut input = io::stdin().lock();
-    loop {
-        let mut line = Zeroizing::new(String::new());
-        if input.read_line(&mut line).map_err(|_| Error::Io)? == 0 {
-            break;
-        }
-        let line = line.trim().strip_prefix("export ").unwrap_or(line.trim());
+    for line in text.lines().map(str::trim) {
+        let line = line.strip_prefix("export ").unwrap_or(line);
         let Some((name, value)) = line.split_once('=') else {
             continue;
         };
-        if name
+        let Some(version) = name
             .strip_prefix("VELMORA_KEK_")
-            .is_some_and(|v| v.parse::<u32>().is_ok())
-        {
-            let value = value.trim();
-            let value = value
-                .strip_prefix('"')
-                .and_then(|s| s.strip_suffix('"'))
-                .or_else(|| value.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')))
-                .unwrap_or(value);
-            if keys
-                .insert(name.to_owned(), Zeroizing::new(value.to_owned()))
-                .is_some()
-            {
-                return Err(Error::Authentication);
-            }
+            .and_then(|v| v.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if version == 0 || version > active {
+            continue;
+        }
+        let value = value.trim();
+        let value = value
+            .strip_prefix('"')
+            .and_then(|s| s.strip_suffix('"'))
+            .or_else(|| value.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')))
+            .unwrap_or(value);
+        let key = KekRing::decode_key(value).ok_or(Error::Authentication)?;
+        if keys.insert(version, key).is_some() {
+            return Err(Error::Authentication);
         }
     }
-    KekRing::from_vars(active, |key| keys.get(key).map(|s| s.as_str().to_owned()))
-        .map_err(|_| Error::Authentication)
+    KekRing::from_keys(active, keys).map_err(|_| Error::Authentication)
 }
 
 fn run() -> Result<(), Error> {
@@ -85,36 +96,9 @@ fn run() -> Result<(), Error> {
             let objects = sample::choose(&all, &candidates, sample_id)?;
             let staging = Path::new(staging);
             let selected = sample::records(&all, &objects, |n| staged_record(staging, n), &kek)?;
-            let source_md5 = objects
-                .iter()
-                .map(|o| {
-                    (
-                        o.generation_id.clone(),
-                        o.source_md5.as_ref().unwrap().to_vec(),
-                    )
-                })
-                .collect::<BTreeMap<_, _>>();
-            drop(all);
-            let ann = BuildAnnotations {
-                source_md5,
-                ..BuildAnnotations::default()
-            };
-            let entries = build_entries(
-                selected.names.iter().cloned(),
-                |n| staged_record(staging, n),
-                &kek,
-                &ann,
-            )?;
-            let live: std::collections::BTreeSet<_> = entries
-                .iter()
-                .filter_map(|e| match e {
-                    Entry::Object(o) => Some(o.generation_id.as_str()),
-                    _ => None,
-                })
-                .collect();
-            if live != ann.source_md5.keys().map(String::as_str).collect() {
-                return Err(Error::Coverage);
-            }
+            let live_count = objects.len();
+            let projection = sample::Projection::new(&objects, &selected.names);
+            let entries = projection.apply(all)?;
             let index = File::options()
                 .write(true)
                 .create_new(true)
@@ -132,7 +116,7 @@ fn run() -> Result<(), Error> {
             out.flush().map_err(|_| Error::Io)?;
             println!(
                 "{}",
-                serde_json::json!({ "live_objects": live.len(), "record_refs": selected.names.len(), "overwritten_objects": selected.overwritten, "deleted_key_included": selected.deleted })
+                serde_json::json!({ "live_objects": live_count, "record_refs": selected.names.len(), "overwritten_objects": selected.overwritten, "deleted_key_included": selected.deleted })
             );
             return Ok(());
         }
@@ -182,7 +166,8 @@ fn run() -> Result<(), Error> {
         File::open(annotations).map_err(|_| Error::Io)?,
     ))
     .map_err(|_| Error::Format)?;
-    let entries = build_entries(names, |name| staged_record(staging, name), &kek, &ann)?;
+    let (entries, build_stats) =
+        build_entries_with_stats(names, |name| staged_record(staging, name), &kek, &ann)?;
     let file = File::options()
         .write(true)
         .create_new(true)
@@ -190,7 +175,7 @@ fn run() -> Result<(), Error> {
         .map_err(|_| Error::Io)?;
     write_index(BufWriter::new(&file), kit_id, &kek, &entries)?;
     file.sync_all().map_err(|_| Error::Io)?;
-    let mut counts = BTreeMap::new();
+    let mut counts = BTreeMap::from([("parity_omitted", build_stats.parity_omitted)]);
     for entry in &entries {
         let key = match entry {
             Entry::Bucket(_) => "buckets",
@@ -283,5 +268,26 @@ fn main() {
             eprintln!("usage: velmora-kit build <kit-id> <active-kek-version> <canonical-staging-directory> <record-list-json> <annotations-json> <new-index-path> (KEK on stdin)");
         }
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use velmora_bridge::ports::Kek;
+
+    #[test]
+    fn stdin_parser_accepts_owned_versioned_keys_and_rejects_duplicate_or_invalid_keys() {
+        const SYNTHETIC: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+        let input = format!("unrelated=ignored\nexport VELMORA_KEK_1='{SYNTHETIC}'\nVELMORA_KEK_3=\"{SYNTHETIC}\"\n");
+        let ring = parse_key_input(3, input.as_bytes()).unwrap();
+        assert_eq!(ring.active().0, 3);
+        assert!(ring.version(1).is_some());
+        assert!(ring.version(2).is_none());
+        assert!(parse_key_input(4, input.as_bytes()).is_err());
+        assert!(
+            parse_key_input(3, format!("{input}VELMORA_KEK_3={SYNTHETIC}").as_bytes()).is_err()
+        );
+        assert!(parse_key_input(3, b"VELMORA_KEK_3=AA==\n").is_err());
     }
 }

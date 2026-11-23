@@ -9,8 +9,8 @@ repository = "https://github.com/TogetherWeOwn/velmora"
 publish = false
 
 [dependencies]
-velmora = { path = "../velmora", default-features = false }
-velmora-bridge = { path = "../velmora-bridge" }
+velmora = { version = "0.1.0", path = "../velmora", default-features = false }
+velmora-bridge = { version = "0.1.0", path = "../velmora-bridge" }
 chacha20poly1305 = { version = "0.11", default-features = false, features = ["zeroize"] }
 ciborium = "0.2"
 hkdf = "0.13"
