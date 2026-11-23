@@ -53,6 +53,7 @@ impl Point {
 /// The last unrecovered stage before an object GET's error response.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GetFailureStage {
+    Auth,
     Lookup,
     Plan,
     Grant,
@@ -61,13 +62,16 @@ pub enum GetFailureStage {
     SubrangeStatus,
     R2,
     Nntp,
+    SlotWait,
     Budget,
+    Decrypt,
     Other,
 }
 
 impl GetFailureStage {
     fn code(self) -> &'static str {
         match self {
+            Self::Auth => "auth",
             Self::Lookup => "lookup",
             Self::Plan => "plan",
             Self::Grant => "grant",
@@ -76,7 +80,9 @@ impl GetFailureStage {
             Self::SubrangeStatus => "subrange_status",
             Self::R2 => "r2",
             Self::Nntp => "nntp",
+            Self::SlotWait => "slot_wait",
             Self::Budget => "budget",
+            Self::Decrypt => "decrypt",
             Self::Other => "other",
         }
     }

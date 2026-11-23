@@ -1715,13 +1715,18 @@ responses from the runtime. Use the [Analytics Engine SQL API][ae-sql]
 to break down Worker-answered GET errors, including range GETs. This
 uses the existing request point, with colo still in `blob5`:
 
-- `blob6`: `lookup` (catalogue), `plan` (metadata, range or extent
-  planning), `grant` (fan-out grant creation, admission or scope),
+- `blob6`: `auth` (authentication, including the key and bucket
+  lookups), `lookup` (object, extent or cold-read catalogue), `plan`
+  (metadata, range or extent planning), `grant` (fan-out grant creation,
+  admission, scope, or a granted generation that no longer exists),
   `subrange_transport` (binding/stream setup or opening the first
   sub-request), `subrange_length` (first sub-range's declared length),
   `subrange_status` (other non-200 first sub-range response), `r2`
-  (warm copies unavailable without a cold plan), `nntp` (cold read),
-  `budget` (reader budget or capacity), or `other` (unclassified).
+  (blob-store failure or warm copies unavailable without a cold plan),
+  `nntp` (provider read failed or was interrupted), `slot_wait` (timed
+  out waiting for a provider connection slot), `budget` (byte-budget
+  exhaustion), `decrypt` (could not open verified cold bytes), or
+  `other` (unclassified, including an HTTP response-conversion fallback).
 - `blob7`: `le_1gib` or `gt_1gib` for the full object size, including
   for range GETs; `unknown` if it was not available. This does not
   disclose the exact object size or indicate that a range fanned out.

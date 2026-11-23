@@ -95,6 +95,10 @@ async fn get_catalogue_and_range_planning_failures_keep_their_error_responses() 
         )
     };
     let sql = &rig.bridge.catalog.sql;
+    *sql.fail_matching.borrow_mut() = Some(("FROM access_keys WHERE access_key_id", 0));
+    observed_get(&rig, req().into_request(), "auth", "unknown")
+        .await
+        .expect_error(500, "InternalError");
     *sql.fail_matching.borrow_mut() = Some(("FROM objects o JOIN generations g", 0));
     observed_get(&rig, req().into_request(), "lookup", "unknown")
         .await
@@ -118,7 +122,7 @@ async fn get_catalogue_and_range_planning_failures_keep_their_error_responses() 
     unsigned
         .headers
         .retain(|(name, _)| !name.eq_ignore_ascii_case("authorization"));
-    observed_get(&rig, unsigned, "other", "unknown")
+    observed_get(&rig, unsigned, "auth", "unknown")
         .await
         .expect(403);
 }
@@ -2153,7 +2157,19 @@ async fn an_interrupted_cold_read_is_begun_again() {
             }));
         }
 
-        let resp = get(&rig, &signer, "cold.bin", &[]).await;
+        let resp = if heals {
+            get(&rig, &signer, "cold.bin", &[]).await
+        } else {
+            let req = signer.sign(
+                rig.now(),
+                Method::Get,
+                &path(BUCKET, "cold.bin"),
+                &[],
+                &[],
+                Vec::new(),
+            );
+            observed_get(&rig, req.into_request(), "nntp", "le_1gib").await
+        };
         match heals {
             true => {
                 resp.expect(200);
@@ -2194,7 +2210,15 @@ async fn cold_read_waits_for_a_slot_then_slows_down() {
     *hook.borrow_mut() = Some(renewing(held.clone()));
     let connects = rig.bridge.nntp.connects();
 
-    let resp = get(rig, &cold.signer, "cold.bin", &[]).await;
+    let req = cold.signer.sign(
+        rig.now(),
+        Method::Get,
+        &path(BUCKET, "cold.bin"),
+        &[],
+        &[],
+        Vec::new(),
+    );
+    let resp = observed_get(rig, req.into_request(), "slot_wait", "le_1gib").await;
     resp.expect_error(503, "SlowDown");
     assert!(resp.header("retry-after").is_some());
     let bound = u64::from(COLD_WAIT_MS);
@@ -2489,12 +2513,38 @@ async fn never_posted_object_without_copies_is_unavailable() {
     // A failure while looking for the articles is still a 500.
     let sql = &rig.bridge.catalog.sql;
     *sql.fail_matching.borrow_mut() = Some(("plan AS headers", 0));
-    observed_get(&rig, req().into_request(), "nntp", "le_1gib")
+    observed_get(&rig, req().into_request(), "lookup", "le_1gib")
         .await
         .expect_error(500, "InternalError");
     sql.fail_matching.borrow_mut().take();
     // The catalogue still knows the object.
     rig.head(&signer, BUCKET, "k").await.expect(200);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_verified_cold_extent_that_cannot_be_opened_reports_decrypt() {
+    let cold = cold_rig().await;
+    let rig = &cold.rig;
+    let extent = cold.put_and_post("cold.bin", &pattern(29, 300_000)).await;
+    evict(rig, &extent).await;
+    rig.bridge.catalog.sql.with_conn(|conn| {
+        conn.execute(
+            "UPDATE extents SET wrapped_file_key = zeroblob(length(wrapped_file_key)) WHERE id = ?1",
+            [extent.id.as_str()],
+        )
+        .unwrap();
+    });
+    let req = cold.signer.sign(
+        rig.now(),
+        Method::Get,
+        &path(BUCKET, "cold.bin"),
+        &[],
+        &[],
+        Vec::new(),
+    );
+    observed_get(rig, req.into_request(), "decrypt", "le_1gib")
+        .await
+        .expect_error(503, "ServiceUnavailable");
 }
 
 #[tokio::test(flavor = "current_thread")]

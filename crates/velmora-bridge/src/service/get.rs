@@ -107,24 +107,33 @@ struct Piece {
 
 /// Why a piece could not be produced.
 enum ReadFail {
-    /// Out of byte budget or provider slots: `503 SlowDown`.
-    Busy,
+    /// Out of byte budget or provider slots, or interrupted: `503 SlowDown`.
+    Busy(Stage),
     /// No source holds the extent intact: `503 ServiceUnavailable`.
     Unavailable(Stage),
     Internal(Stage),
 }
 
 impl ReadFail {
+    fn cold_error(error: BridgeError) -> Self {
+        Self::Internal(match error {
+            BridgeError::Sql(_) | BridgeError::GuardFailed => Stage::Lookup,
+            BridgeError::Blob(_) => Stage::R2,
+            BridgeError::Nntp(_) => Stage::Nntp,
+            BridgeError::Crypto(_) => Stage::Decrypt,
+            _ => Stage::Other,
+        })
+    }
+
     fn stage(&self) -> Stage {
         match *self {
-            Self::Busy => Stage::Budget,
-            Self::Unavailable(stage) | Self::Internal(stage) => stage,
+            Self::Busy(stage) | Self::Unavailable(stage) | Self::Internal(stage) => stage,
         }
     }
 
     fn response(&self) -> S3Response {
         match self {
-            ReadFail::Busy => s3_error(ErrorCode::SlowDown),
+            ReadFail::Busy(_) => s3_error(ErrorCode::SlowDown),
             ReadFail::Unavailable(_) => unavailable(),
             ReadFail::Internal(_) => internal(),
         }
@@ -133,7 +142,7 @@ impl ReadFail {
     /// The error that ends a body stream already in flight.
     fn stream_error(&self) -> BridgeError {
         match self {
-            ReadFail::Busy => BridgeError::Invalid("read interrupted: busy"),
+            ReadFail::Busy(_) => BridgeError::Invalid("read interrupted: busy"),
             ReadFail::Unavailable(_) => {
                 BridgeError::Invalid("read interrupted: extent unavailable")
             }
@@ -294,6 +303,7 @@ async fn read<
     head: bool,
     observed: &mut GetObservation,
 ) -> core::result::Result<S3Response, S3Response> {
+    observed.mark_stage(Stage::Auth);
     let authed = authenticate(bridge, &req).await?;
     let (bucket, key) = authed.object()?;
     observed.mark_stage(Stage::Lookup);
@@ -891,7 +901,7 @@ where
         .budget
         .charge(len)
         .await
-        .map_err(|_| ReadFail::Busy.response())?;
+        .map_err(|_| ReadFail::Busy(Stage::Budget).response())?;
     let mut out = Vec::with_capacity(usize::try_from(len).map_err(|_| internal())?);
     for (bytes, _) in &parts {
         out.extend_from_slice(bytes);
@@ -1163,7 +1173,7 @@ where
         spent
             .wait
             .set(spent.wait.get() + bridge.clock.now().0 - began.0);
-        room.map_err(|_| ReadFail::Busy)
+        room.map_err(|_| ReadFail::Busy(Stage::Budget))
     }
 
     /// Room for reading one extent: all of `need` when no cache write
@@ -1305,7 +1315,7 @@ where
                 none => none.insert(
                     bridge
                         .cold_reader()
-                        .map_err(|_| ReadFail::Internal(Stage::Nntp))?
+                        .map_err(ReadFail::cold_error)?
                         .charged_to(Rc::clone(&room)),
                 ),
             };
@@ -1317,7 +1327,7 @@ where
             // What a rebuild lacked, if the read ended for that: the
             // next try waits for room for the read and for these.
             let rebuild = reader.settle();
-            match read {
+            let wait_stage = match read {
                 Ok(ColdFetch::Filled(cipher)) => {
                     // One cache write at a time.
                     let began = bridge.clock.now();
@@ -1343,7 +1353,7 @@ where
                         }
                     }
                     let plain = open(&bridge.kek, bucket, piece, 0, &cipher)
-                        .ok_or(ReadFail::Unavailable(Stage::Nntp))?;
+                        .ok_or(ReadFail::Unavailable(Stage::Decrypt))?;
                     // The charge is split between the plaintext, which
                     // leaves with the piece, and the ciphertext, which
                     // stays until it is written. Nothing runs between the
@@ -1366,12 +1376,16 @@ where
                     }
                     return Ok((plain, held));
                 }
-                Ok(ColdFetch::Busy) => {}
+                Ok(ColdFetch::Busy) if rebuild > 0 => Stage::Budget,
+                Ok(ColdFetch::Busy) => Stage::SlotWait,
                 // Every provider that was asked broke off (a proxy that
                 // went away, a provider that hung up): the read is tried
                 // again after a wait, on new connections, a few times.
-                Ok(ColdFetch::Interrupted) if interrupted < INTERRUPTED_RETRIES => interrupted += 1,
-                Ok(ColdFetch::Interrupted) => return Err(ReadFail::Busy),
+                Ok(ColdFetch::Interrupted) if interrupted < INTERRUPTED_RETRIES => {
+                    interrupted += 1;
+                    Stage::Nntp
+                }
+                Ok(ColdFetch::Interrupted) => return Err(ReadFail::Busy(Stage::Nntp)),
                 // An extent that lost more than its parity rebuilds is
                 // as unavailable as one without parity.
                 Ok(ColdFetch::Unrecoverable) => {
@@ -1390,18 +1404,18 @@ where
                     };
                     return Err(ReadFail::Unavailable(stage));
                 }
-                Err(_) => return Err(ReadFail::Internal(Stage::Nntp)),
-            }
+                Err(error) => return Err(ReadFail::cold_error(error)),
+            };
             // Nothing is held while waiting: neither slots nor budget.
             self.hang_up().await;
             drop(work);
-            let sleep = bridge.budget.sleeper().ok_or(ReadFail::Busy)?;
+            let sleep = bridge.budget.sleeper().ok_or(ReadFail::Busy(wait_stage))?;
             // With a rebuild to come, room for both: the two are held
             // together.
             let both = need.saturating_add(rebuild);
             loop {
                 if bridge.clock.now() >= deadline || slept >= COLD_WAIT_MS {
-                    return Err(ReadFail::Busy);
+                    return Err(ReadFail::Busy(wait_stage));
                 }
                 attempt += 1;
                 let seed = (bridge.clock.now().0 as u64) ^ waiter.rotate_left(32) ^ attempt;
@@ -1414,7 +1428,7 @@ where
                     break;
                 }
                 let Ok(left @ 1..) = u32::try_from(remaining(slept)) else {
-                    return Err(ReadFail::Busy);
+                    return Err(ReadFail::Busy(wait_stage));
                 };
                 let listed = async {
                     let listed = core::pin::pin!(room.charge_in_turn(both));
@@ -1426,7 +1440,7 @@ where
                 match beside(&mut self.put, listed).await {
                     Some(true) => break,
                     Some(false) => {}
-                    None => return Err(ReadFail::Busy),
+                    None => return Err(ReadFail::Busy(Stage::Budget)),
                 }
                 // The clock may stand still: the wait is counted too.
                 slept = slept.saturating_add(CHARGE_WAIT_MS);
@@ -1437,7 +1451,7 @@ where
                 found => return found,
             }
             if bridge.clock.now() >= deadline {
-                return Err(ReadFail::Busy);
+                return Err(ReadFail::Busy(wait_stage));
             }
             if rebuild == 0 {
                 work = self.step(need, lean).await?;
@@ -1446,18 +1460,18 @@ where
             // Another request may have taken the room while the cache
             // was checked. Bound this wait by the same retry allowance.
             let Ok(left @ 1..) = u32::try_from(remaining(slept)) else {
-                return Err(ReadFail::Busy);
+                return Err(ReadFail::Busy(wait_stage));
             };
             {
                 let charge = core::pin::pin!(self.step(both, lean.saturating_add(rebuild)));
                 let timeout = core::pin::pin!(async { sleep(left).await });
                 work = match select(charge, timeout).await {
                     Either::Left((found, _)) => found?,
-                    Either::Right(_) => return Err(ReadFail::Busy),
+                    Either::Right(_) => return Err(ReadFail::Busy(Stage::Budget)),
                 };
             }
             if bridge.clock.now() >= deadline {
-                return Err(ReadFail::Busy);
+                return Err(ReadFail::Busy(wait_stage));
             }
             spare = Some(work.split_off(rebuild));
         }
@@ -1472,6 +1486,25 @@ mod tests {
     use std::sync::Arc;
 
     use futures_util::task::{noop_waker, waker, ArcWake};
+
+    #[test]
+    fn cold_read_port_errors_keep_their_dependency_stage() {
+        for (error, expected) in [
+            (BridgeError::Sql("fixture".into()), Stage::Lookup),
+            (BridgeError::GuardFailed, Stage::Lookup),
+            (BridgeError::Blob("fixture".into()), Stage::R2),
+            (
+                BridgeError::Nntp(velmora::Error::Io(std::io::ErrorKind::TimedOut.into())),
+                Stage::Nntp,
+            ),
+            (BridgeError::Crypto("fixture"), Stage::Decrypt),
+            (BridgeError::Invalid("fixture"), Stage::Other),
+        ] {
+            let fail = ReadFail::cold_error(error);
+            assert_eq!(fail.stage(), expected);
+            assert_eq!(fail.response().status, 500);
+        }
+    }
 
     /// The stamp the catalogue holds may come from a clock a moment
     /// ahead of this one: it is recent, and the read is not stamped
