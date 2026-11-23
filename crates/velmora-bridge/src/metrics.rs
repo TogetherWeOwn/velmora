@@ -287,6 +287,102 @@ pub fn request_point(r: &Request<'_>, weight: u32) -> Point {
     }
 }
 
+/// An absent setting defaults to one point per eight claimed attempts.
+/// Zero or a malformed setting disables points, not the consumer.
+pub fn job_sample(raw: Option<&str>) -> u32 {
+    raw.map_or(8, |s| s.trim().parse().unwrap_or(0))
+}
+
+/// Sample each attempt independently, with no queue message ID lookup.
+/// Missing entropy only skips the observation. Rejection sampling keeps
+/// arbitrary positive divisors unbiased.
+pub fn job_weight(sample: u32) -> Option<u32> {
+    job_weight_with(sample, &mut velmora::rng::SystemRng)
+}
+
+fn job_weight_with(sample: u32, rng: &mut impl velmora::rng::FillRandom) -> Option<u32> {
+    match sample {
+        0 => None,
+        1 => Some(1),
+        n => (velmora::rng::uniform_below(rng, u64::from(n)).ok()? == 0).then_some(n),
+    }
+}
+
+/// Normalize the actual consumer queue, not the route a new message would
+/// take with the current shard count. Never copy queue names into a point.
+fn job_queue(queue: &str) -> &'static str {
+    match queue {
+        "velmora-post" | "velmora-post-dev" => "post1",
+        "velmora-post2" => "post2",
+        "velmora-post3" => "post3",
+        "velmora-post4" => "post4",
+        "velmora-post5" => "post5",
+        "velmora-post6" => "post6",
+        "velmora-post7" => "post7",
+        "velmora-post8" => "post8",
+        "velmora-verify" | "velmora-verify-dev" => "verify1",
+        "velmora-verify2" => "verify2",
+        "velmora-verify3" => "verify3",
+        "velmora-verify4" => "verify4",
+        "velmora-verify5" => "verify5",
+        "velmora-verify6" => "verify6",
+        "velmora-verify7" => "verify7",
+        "velmora-verify8" => "verify8",
+        _ => "aux",
+    }
+}
+
+/// One sampled post, verify or release attempt that claimed its outbox
+/// row. A repair within verify is classified as `repost`, not a second
+/// point. Queue events do not expose a trusted colo.
+pub fn job_point(trace: &crate::trace::JobTrace, queue: &str, weight: u32) -> Option<Point> {
+    use crate::trace::{JobKind, JobResult};
+    let kind = match trace.kind? {
+        JobKind::Post => "post",
+        JobKind::Verify => "verify",
+        JobKind::Release => "release",
+        JobKind::Repost => "repost",
+    };
+    let outcome = match trace.result {
+        JobResult::Ok => "ok",
+        JobResult::NoPermit => "no_permit",
+        JobResult::Cooling => "cooling",
+        JobResult::Fenced => "fenced",
+        JobResult::Refused => "refused",
+        JobResult::Budget => "budget",
+        JobResult::Failed => "failed",
+    };
+    let size = match trace.payload_bytes {
+        None => SizeClass::Unknown,
+        Some(bytes) if bytes <= 1 << 30 => SizeClass::AtMost1GiB,
+        Some(_) => SizeClass::Over1GiB,
+    };
+    let mut doubles = Vec::with_capacity(20);
+    doubles.extend([
+        f64::from(weight),
+        trace.payload_bytes.unwrap_or(0) as f64,
+        trace.total_ms as f64,
+        trace.permit_ms() as f64,
+        trace.slot_wait_ms as f64,
+        trace.load_ms as f64,
+        trace.connect_ms as f64,
+        trace.wire_ms as f64,
+        trace.advance_ms as f64,
+        f64::from(trace.granted),
+        f64::from(trace.wanted),
+        f64::from(trace.articles),
+        trace.held_ms() as f64,
+    ]);
+    doubles.extend(trace.provider_bytes.map(|n| n as f64));
+    Some(Point {
+        index: "job",
+        blobs: vec!["job.v1", kind, outcome, size.code(), job_queue(queue)],
+        colo: "-".to_string(),
+        failure: None,
+        doubles,
+    })
+}
+
 /// The point of one read from Usenet (a cache miss). blobs: kind
 /// (`cold`). doubles: weight, always 1.
 pub fn cold_read_point() -> Point {
@@ -440,6 +536,97 @@ mod tests {
             p.analytics_blobs().collect::<Vec<_>>(),
             ["req", "GET", "5xx", "s3", "IAD", "other", "unknown"]
         );
+    }
+
+    #[test]
+    fn job_point_all_fields_are_allowlisted_and_numeric_columns_stay_in_order() {
+        use crate::trace::{JobKind, JobResult, JobTrace};
+        use crate::types::UnixMs;
+
+        let odd = "private-bucket/private-key news.private.test auth-token";
+        let mut trace = JobTrace::default();
+        trace.kind = Some(JobKind::Post);
+        trace.result = JobResult::Refused;
+        trace.payload_bytes = Some(2);
+        trace.total_ms = 3;
+        trace.ask(UnixMs(0), 11);
+        for _ in 0..10 {
+            trace.permit(UnixMs(4), true);
+        }
+        trace.released(UnixMs(17));
+        trace.slot_wait_ms = 5;
+        trace.load_ms = 6;
+        trace.connect_ms = 7;
+        trace.wire_ms = 8;
+        trace.advance_ms = 9;
+        trace.articles = 12;
+        trace.sent(odd, u64::MAX);
+        trace.sent("p01", u64::MAX);
+        for (id, n) in ["p1", "p2", "p3", "p4", "p5", "p6", "p7"]
+            .into_iter()
+            .zip(14..=20)
+        {
+            trace.sent(id, n);
+        }
+        let p = job_point(&trace, odd, 1).expect("claimed attempt");
+        assert_eq!(p.index, "job");
+        assert_eq!(
+            p.analytics_blobs().collect::<Vec<_>>(),
+            ["job.v1", "post", "refused", "le_1gib", "aux", "-"]
+        );
+        assert_eq!(p.doubles, (1..=20).map(f64::from).collect::<Vec<_>>());
+        for (queue, label) in [
+            ("velmora-post", "post1"),
+            ("velmora-post8", "post8"),
+            ("velmora-verify-dev", "verify1"),
+            ("velmora-verify7", "verify7"),
+        ] {
+            assert_eq!(
+                job_point(&trace, queue, 1)
+                    .unwrap()
+                    .analytics_blobs()
+                    .nth(4),
+                Some(label)
+            );
+        }
+        assert!(job_point(&JobTrace::default(), odd, 1).is_none());
+    }
+
+    #[test]
+    fn job_sampling_weights_every_retained_attempt_even_failures() {
+        assert_eq!(job_sample(None), 8);
+        assert_eq!(job_sample(Some(" 1 ")), 1);
+        struct Draws<I>(I);
+        impl<I: Iterator<Item = u64>> velmora::rng::FillRandom for Draws<I> {
+            fn fill_bytes(&mut self, out: &mut [u8]) -> velmora::Result<()> {
+                out.copy_from_slice(&self.0.next().expect("draw").to_le_bytes());
+                Ok(())
+            }
+        }
+        assert_eq!(job_weight(0), None);
+        assert_eq!(job_weight(1), Some(1));
+        let mut draws = Draws(0..8192);
+        let kept: Vec<_> = (0..8192)
+            .filter_map(|_| job_weight_with(8, &mut draws))
+            .collect();
+        assert_eq!(kept, vec![8; 1024]);
+        // MAX would select a biased extra bucket for divisor 3; redraw.
+        assert_eq!(
+            job_weight_with(3, &mut Draws([u64::MAX, 1].into_iter())),
+            None
+        );
+        assert_eq!(
+            job_weight_with(3, &mut Draws([u64::MAX, 0].into_iter())),
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn malformed_job_sample_disables_writes() {
+        for raw in ["invalid", "", "  ", "-1", "4294967296"] {
+            assert_eq!(job_sample(Some(raw)), 0, "{raw:?}");
+        }
+        assert_eq!(job_weight(job_sample(Some("0"))), None);
     }
 
     #[test]

@@ -17,6 +17,9 @@ use std::collections::BTreeMap;
 
 use crate::types::{ExtentId, UnixMs};
 
+mod job;
+pub use job::*;
+
 /// Records kept at most. A job whose record is never taken (a test, a
 /// Worker that crashed between the job and the log) must not grow the map
 /// for the life of the isolate.

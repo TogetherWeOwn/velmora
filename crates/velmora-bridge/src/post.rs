@@ -256,6 +256,17 @@ impl<T: Transport> NntpSession for NntpClient<T> {
         Ok(self.post_article(message_id, article).await?)
     }
 
+    async fn post_observed(
+        &mut self,
+        message_id: &str,
+        article: &[u8],
+        written: impl FnOnce(),
+    ) -> Result<PostOutcome> {
+        Ok(self
+            .post_article_observed(message_id, article, written)
+            .await?)
+    }
+
     async fn stat(&mut self, message_id: &str) -> Result<bool> {
         match NntpClient::stat(self, message_id).await {
             Ok(_) => Ok(true),
@@ -390,6 +401,17 @@ pub(crate) async fn settle_at<C: Catalog, T: Clock>(
         Stop::Session(e) => e.into(),
         stop => stop,
     };
+    crate::trace::job_note(|t| {
+        use crate::trace::JobResult;
+        t.result = match &stop {
+            Stop::Fenced => JobResult::Fenced,
+            Stop::NoPermit if t.result == JobResult::Budget => JobResult::Budget,
+            Stop::NoPermit => JobResult::NoPermit,
+            Stop::Refused | Stop::Fail(FailClass::PostRefused, _) => JobResult::Refused,
+            Stop::Cooling(_) => JobResult::Cooling,
+            _ => JobResult::Failed,
+        };
+    });
     match stop {
         Stop::Fenced | Stop::Session(_) => JobOutcome::Ack,
         Stop::Catalog => JobOutcome::Retry {
@@ -622,6 +644,7 @@ where
             }
         };
         let asked = self.clock.now();
+        crate::trace::job_note(|t| t.articles = u32::try_from(todo).unwrap_or(u32::MAX));
         let mut waited = false;
         // The slots first. Loading and hashing the extent is the expensive
         // part of the job: one that would only find every slot of its
@@ -846,11 +869,9 @@ where
         stored: StoredPlan,
     ) -> core::result::Result<Loaded, Stop> {
         let started = self.clock.now();
-        let cipher = self
-            .safety
-            .get(&extent.id.safety_key(), None)
-            .await?
-            .ok_or(Stop::fail(FailClass::BlobError))?;
+        let loaded = self.safety.get(&extent.id.safety_key(), None).await;
+        crate::trace::job_note(|t| t.load_ms += crate::trace::elapsed(started, self.clock.now()));
+        let cipher = loaded?.ok_or(Stop::fail(FailClass::BlobError))?;
         // Only the exact sealed ciphertext is ever posted.
         if cipher.len() as u64 != extent.cipher_size || sha256(&cipher) != extent.cipher_sha256 {
             return Err(Stop::fail(FailClass::Corrupt));
@@ -1243,6 +1264,7 @@ where
         let wanted = usize::try_from(self.cfg.post_sockets)
             .unwrap_or(1)
             .clamp(1, articles.max(1));
+        crate::trace::job_note(|t| t.ask(self.clock.now(), wanted as u32));
         let mut busy = false;
         let mut open: Vec<&ProviderConfig> = providers.to_vec();
         let mut turn = 0;
@@ -1398,9 +1420,20 @@ where
             .saturating_add(shard_bytes)
             .min(room);
         let Ok(_charge) = self.budget.charge_job(bytes).await else {
+            crate::trace::job_note(|t| t.result = crate::trace::JobResult::Budget);
             return Err(Stop::NoPermit);
         };
-        let cipher = match self.safety.get(&extent.id.safety_key(), None).await {
+        let started = crate::trace::job_note(|t| {
+            t.kind = Some(crate::trace::JobKind::Repost);
+            self.clock.now()
+        });
+        let copy = self.safety.get(&extent.id.safety_key(), None).await;
+        if let Some(started) = started {
+            crate::trace::job_note(|t| {
+                t.load_ms += crate::trace::elapsed(started, self.clock.now())
+            });
+        }
+        let cipher = match copy {
             Ok(Some(cipher)) => cipher,
             _ => return Ok(false),
         };
@@ -1455,6 +1488,7 @@ where
         let round =
             Round::new(&self.catalog, &self.clock, lease, extent, &cipher, plan).parity(&shards);
         // `true`: each article is looked up before it is sent.
+        crate::trace::job_note(|t| t.articles = u32::try_from(todo.len()).unwrap_or(u32::MAX));
         let todo = todo.into_iter().map(|at| (at, true));
         let ended = round.run(sessions, todo, Record::Reposted).await;
         match ended.stop {
@@ -2109,18 +2143,20 @@ async fn exchange<'a, C: Catalog, N: NntpConnector, T: Clock>(
     round.state.borrow_mut().sockets[slot].logged_in = true;
     round.keep(slot, session).await?;
     if unknown {
-        match session.session().await?.stat(&row.message_id).await {
+        let call = session.session().await?.stat(&row.message_id);
+        match crate::trace::observe_wire(round.clock, call).await {
             Ok(true) => return Ok(Ok(())),
             Ok(false) => {}
             Err(e) => return Ok(Err(e)),
         }
         round.keep(slot, session).await?;
     }
-    let posted = session
-        .session()
-        .await?
-        .post(&row.message_id, article)
-        .await;
+    let provider = session.provider.id.as_str();
+    let connected = session.session().await?;
+    let call = connected.post_observed(&row.message_id, article, || {
+        crate::trace::job_note(|t| t.sent(provider, row.cipher_len));
+    });
+    let posted = crate::trace::observe_wire(round.clock, call).await;
     Ok(posted.map(|_| ()))
 }
 

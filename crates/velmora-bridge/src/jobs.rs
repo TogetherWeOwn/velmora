@@ -368,6 +368,15 @@ where
             Ok(None) => return JobOutcome::Ack,
             Err(_) => return RETRY,
         };
+        crate::trace::job_note(|t| {
+            use crate::trace::JobKind;
+            t.kind = match stage {
+                OutboxStage::Post => Some(JobKind::Post),
+                OutboxStage::Verify => Some(JobKind::Verify),
+                OutboxStage::Release => Some(JobKind::Release),
+                _ => None,
+            };
+        });
         if stage != OutboxStage::Post {
             return self.run_leased(&lease, extent, generation, stage).await;
         }
@@ -393,6 +402,7 @@ where
             }
             Err(e) => return settle(&self.catalog, &self.clock, lease, e.into()).await,
         };
+        crate::trace::job_note(|t| t.payload_bytes = Some(row.extent.plain_size));
         let bytes = job_bytes(stage, row.extent.cipher_size, self.cfg.post_sockets);
         // A post job computes the parity shards of its extent and holds
         // them next to it: those of the stored plan, or of the plan it
@@ -416,6 +426,7 @@ where
         let Ok(_charge) = charged else {
             // No memory right now is not a failure of the extent: give the
             // lease back without spending an attempt.
+            crate::trace::job_note(|t| t.result = crate::trace::JobResult::Budget);
             return settle(&self.catalog, &self.clock, lease, Stop::NoPermit).await;
         };
         match stage {
@@ -436,7 +447,11 @@ where
         let age = self.clock.now().0 - lease.claimed_at.0;
         match self.budget.sleeper() {
             Some(sleep) if (0..SLOT_WAIT_MS).contains(&age) => {
+                let started = self.clock.now();
                 sleep(slot_poll_ms(providers)).await;
+                crate::trace::job_note(|t| {
+                    t.slot_wait_ms += crate::trace::elapsed(started, self.clock.now());
+                });
                 true
             }
             _ => false,

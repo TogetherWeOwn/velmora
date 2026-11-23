@@ -37,6 +37,37 @@ async fn light_rig(ppm: u32, sizes: &[(&str, SizeCommand)]) -> Rig {
     rig
 }
 
+#[tokio::test]
+async fn light_verify_and_release_job_metrics_time_pipelined_commands() {
+    use velmora_bridge::{metrics::job_point, trace::observe_job};
+
+    let rig = light_rig(0, &[("p1", SizeCommand::Head)]).await;
+    let (s, _) = rig.on_two(1).await;
+    let b = &rig.bridge;
+    for stage in [OutboxStage::Verify, OutboxStage::Release] {
+        if stage == OutboxStage::Release {
+            b.clock.advance_secs(1);
+        }
+        b.nntp.slow(&b.clock, 7);
+        let job = Job::Extent {
+            v: JOB_VERSION,
+            extent: s.extent.clone(),
+            generation: s.generation.clone(),
+            stage,
+        };
+        let (outcome, trace) = observe_job(&b.clock, b.run_job(&job)).await;
+        assert_eq!(outcome, JobOutcome::Ack);
+        let point = job_point(&trace, "velmora-verify", 1).expect("sampled stage");
+        let (body, stat, size) = rig.calls();
+        if stage == OutboxStage::Verify {
+            assert!(size > 0, "light verify did not use its size command");
+        } else {
+            assert!(stat > 0, "release did not use STAT");
+        }
+        assert_eq!(point.doubles[7], (7 * (body + stat + size)) as f64);
+    }
+}
+
 impl Rig {
     /// Posts an extent of three articles and copies it to the second
     /// backbone.

@@ -7,7 +7,9 @@
 
 use std::cell::RefCell;
 
-use velmora_bridge::metrics::Point;
+use velmora_bridge::metrics::{job_sample, Point};
+use worker::js_sys::Reflect;
+use worker::wasm_bindgen::JsValue;
 use worker::{AnalyticsEngineDataPointBuilder, AnalyticsEngineDataset, Env};
 
 /// The dataset binding.
@@ -33,9 +35,39 @@ pub fn next() -> u64 {
 }
 
 /// Looks the binding up, once per request: it costs no I/O.
-pub fn bind(env: &Env) {
+pub fn bind(env: &Env) -> bool {
     let dataset = env.analytics_engine(BINDING).ok();
+    let bound = dataset.is_some();
     DATASET.with(|d| *d.borrow_mut() = dataset);
+    bound
+}
+
+/// Queue metadata may be absent or throw. An unrecognized/empty name is
+/// mapped to `aux` by the point encoder; it cannot interrupt the job.
+pub fn queue_name<E>(read: impl FnOnce() -> Result<Option<String>, E>) -> String {
+    read().ok().flatten().unwrap_or_default()
+}
+
+pub fn sample_binding(env: &Env) -> u32 {
+    let key = JsValue::from_str("JOB_METRICS_SAMPLE");
+    let value = Reflect::get(env, &key).and_then(|value| {
+        if value.is_undefined() {
+            Reflect::has(env, &key).map(|present| present.then_some(None))
+        } else {
+            Ok(Some(value.as_string()))
+        }
+    });
+    read_sample(value)
+}
+
+/// Absent defaults; readonly argument inspection failures, non-string
+/// values (including numbers), and invalid strings all turn sampling off.
+fn read_sample<E>(value: Result<Option<Option<String>>, E>) -> u32 {
+    match value {
+        Ok(None) => job_sample(None),
+        Ok(Some(Some(value))) => job_sample(Some(&value)),
+        Ok(Some(None)) | Err(_) => 0,
+    }
 }
 
 /// Writes one point. A write is buffered by the runtime and never
@@ -52,4 +84,32 @@ pub fn write(point: &Point) {
             .doubles(point.doubles.iter().copied())
             .write_to(dataset);
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn queue_name_ignores_throwing_undefined_and_numeric_getters() {
+        // `JsValue::as_string()` is None for undefined and numbers. These
+        // fixtures are its converted result; native Rust cannot call JS.
+        let throwing = queue_name(|| Err(()));
+        let undefined = queue_name(|| Ok::<_, ()>(None));
+        let number = queue_name(|| Ok::<_, ()>(None));
+        assert_eq!([throwing, undefined, number], [""; 3]);
+        assert_eq!(
+            queue_name(|| Ok::<_, ()>(Some("velmora-post".into()))),
+            "velmora-post"
+        );
+    }
+
+    #[test]
+    fn job_sample_binding_distinguishes_absence_from_non_strings() {
+        assert_eq!(read_sample(Ok::<_, ()>(None)), 8); // absent/undefined
+        assert_eq!(read_sample(Ok::<_, ()>(Some(None))), 0); // present numeric 0
+        assert_eq!(read_sample(Err(())), 0); // getter threw
+        for (raw, rate) in [("1", 1), ("0", 0), ("malformed", 0)] {
+            assert_eq!(read_sample(Ok::<_, ()>(Some(Some(raw.into())))), rate);
+        }
+    }
 }

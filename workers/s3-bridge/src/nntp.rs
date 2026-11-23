@@ -121,6 +121,21 @@ impl NntpSession for WorkerSession {
         within_call(self.1.call_secs(), call).await
     }
 
+    async fn post_observed(
+        &mut self,
+        message_id: &str,
+        article: &[u8],
+        written: impl FnOnce(),
+    ) -> Result<PostOutcome> {
+        let call = async {
+            Ok(self
+                .0
+                .post_article_observed(message_id, article, written)
+                .await?)
+        };
+        within_call(self.1.call_secs(), call).await
+    }
+
     async fn stat(&mut self, message_id: &str) -> Result<bool> {
         within_call(self.1.call_secs(), async {
             match self.0.stat(message_id).await {

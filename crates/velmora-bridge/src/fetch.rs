@@ -205,6 +205,9 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ProviderSession<'a, C, N, T> {
         let permit = catalog
             .acquire_permit(provider, class, holder, asked)
             .await?;
+        if permit.is_some() {
+            crate::trace::job_note(|t| t.permit(clock.now(), true));
+        }
         Ok(permit.map(|permit| ProviderSession {
             catalog,
             nntp,
@@ -339,7 +342,10 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ProviderSession<'a, C, N, T> {
     /// so the caller does not reconnect and goes on to another provider.
     pub(crate) async fn session(&mut self) -> core::result::Result<&mut N::Session, Stop> {
         if self.session.is_none() {
-            let session = match self.nntp.connect(self.provider, &self.permit).await {
+            crate::trace::job_note(|t| t.connecting(self.clock.now()));
+            let connected = self.nntp.connect(self.provider, &self.permit).await;
+            crate::trace::job_note(|t| t.connect_finished(self.clock.now()));
+            let session = match connected {
                 Ok(session) => session,
                 Err(e) => {
                     return Err(match refusal(&e) {
@@ -458,6 +464,9 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ProviderSession<'a, C, N, T> {
         }
         // A failed release is safe: the permit expires on its own.
         self.freed = self.catalog.release_permit(&self.permit).await.is_ok();
+        if self.freed {
+            crate::trace::job_note(|t| t.released(self.clock.now()));
+        }
         self.health
     }
 }
@@ -654,20 +663,28 @@ async fn read_one<C: Catalog, N: NntpConnector, T: Clock>(
         if fresh && connected.is_ok() {
             session.keep(lease).await?;
         }
+        let clock = session.clock;
         let result = match connected {
             Ok(()) => match session.session().await {
-                Ok(s) => match ask {
-                    Ask::Body | Ask::Wire => s.body(&row.message_id, wire).await.map(Got::Body),
-                    Ask::Stat => s.stat(&row.message_id).await.map(|there| match there {
-                        true => Got::Present,
-                        false => Got::Body(BodyOutcome::Missing),
-                    }),
-                    Ask::Size(how) => s.size(&row.message_id, how).await.map(|o| match o {
-                        SizeOutcome::Present(size) => Got::Size(size),
-                        SizeOutcome::Carried(size) => Got::Carried(size),
-                        SizeOutcome::Missing => Got::Body(BodyOutcome::Missing),
-                    }),
-                },
+                Ok(s) => {
+                    crate::trace::observe_wire(clock, async {
+                        match ask {
+                            Ask::Body | Ask::Wire => {
+                                s.body(&row.message_id, wire).await.map(Got::Body)
+                            }
+                            Ask::Stat => s.stat(&row.message_id).await.map(|there| match there {
+                                true => Got::Present,
+                                false => Got::Body(BodyOutcome::Missing),
+                            }),
+                            Ask::Size(how) => s.size(&row.message_id, how).await.map(|o| match o {
+                                SizeOutcome::Present(size) => Got::Size(size),
+                                SizeOutcome::Carried(size) => Got::Carried(size),
+                                SizeOutcome::Missing => Got::Body(BodyOutcome::Missing),
+                            }),
+                        }
+                    })
+                    .await
+                }
                 Err(Stop::Session(e)) => Err(e),
                 Err(stop) => return Err(stop),
             },
@@ -876,8 +893,9 @@ async fn ask_together<C: Catalog, N: NntpConnector, T: Clock>(
         session.keep(lease).await?;
     }
     let ids: Vec<&str> = rows.iter().map(|r| r.message_id.as_str()).collect();
+    let clock = session.clock;
     let answers = match session.session().await {
-        Ok(s) => s.ask_many(&ids, how).await,
+        Ok(s) => crate::trace::observe_wire(clock, s.ask_many(&ids, how)).await,
         Err(Stop::Session(_)) => {
             session.discard();
             return Ok(None);

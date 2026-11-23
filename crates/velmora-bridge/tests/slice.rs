@@ -1058,6 +1058,115 @@ fn bare(id: &str) -> String {
 // The slice
 // ---------------------------------------------------------------------------
 
+// Compile the Worker runner itself with a local table and recording sink.
+// The Worker and its tests do not need any new bindings or dependencies.
+#[path = "../../../workers/s3-bridge/src/queue_attempt.rs"]
+mod worker_queue_attempt;
+
+mod jobs {
+    use super::{JobOutcome, UnixMs};
+    use std::future::Future;
+
+    pub(crate) async fn run(
+        _now: UnixMs,
+        _post: bool,
+        job: impl Future<Output = JobOutcome> + 'static,
+    ) -> Option<JobOutcome> {
+        Some(job.await)
+    }
+}
+
+mod metrics {
+    use std::cell::RefCell;
+    use velmora_bridge::metrics::Point;
+
+    thread_local! {
+        static POINTS: RefCell<Vec<Point>> = const { RefCell::new(Vec::new()) };
+    }
+
+    pub(crate) fn write(point: &Point) {
+        POINTS.with(|points| points.borrow_mut().push(point.clone()));
+    }
+
+    pub(crate) fn take() -> Vec<Point> {
+        POINTS.with(RefCell::take)
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn sampled_job_points_follow_the_fake_nntp_post_verify_release() {
+    use std::rc::Rc;
+
+    async fn run(rig: Rc<Rig>, job: Job, queue: &str, post: bool) -> JobOutcome {
+        worker_queue_attempt::run_in_table(
+            rig.bridge.clock.clone(),
+            post,
+            Some((queue.to_string(), 1)),
+            async move { rig.bridge.run_job(&job).await },
+        )
+        .await
+    }
+
+    let rig = Rc::new(Rig::new().await);
+    let step = "sampled queue attempts";
+    rig.setup_buckets_and_key(step).await;
+    let body = test_bytes(31, MIB);
+    expect_status(
+        step,
+        "PUT",
+        200,
+        &rig.put("/slice/private-key", &body).await,
+    );
+    let bridge = &rig.bridge;
+    bridge.safety.advance_reads_on(&bridge.clock, 3);
+    for (kind, queue, lane) in [
+        ("post", "velmora-post-dev", "post1"),
+        ("verify", "velmora-verify-dev", "verify1"),
+        ("release", "velmora-verify-dev", "verify1"),
+    ] {
+        let mut sent = bridge.jobs.take();
+        assert_eq!(sent.len(), 1, "{kind} should have one delivery");
+        let sent = sent.remove(0);
+        bridge.clock.advance_secs(sent.delay_secs);
+        let post = kind == "post";
+        assert_eq!(
+            run(Rc::clone(&rig), sent.job.clone(), queue, post).await,
+            JobOutcome::Ack
+        );
+        let points = metrics::take();
+        assert_eq!(
+            points.len(),
+            1,
+            "{kind}: one emitted point for a claimed job"
+        );
+        let point = &points[0];
+        if post {
+            assert_eq!(point.doubles[5], 3.0, "observable R2 wait");
+            assert!(point.doubles[2] >= 3.0, "elapsed attempt time");
+        }
+        assert_eq!(
+            point.analytics_blobs().collect::<Vec<_>>(),
+            ["job.v1", kind, "ok", "le_1gib", lane, "-"]
+        );
+        assert_eq!(point.doubles[1], body.len() as f64);
+        assert!(point.doubles[9] >= 1.0 && point.doubles[9] <= point.doubles[10]);
+        assert!(point.doubles[11] >= 1.0);
+        assert_eq!(
+            &point.doubles[13..],
+            &[0.0; 7],
+            "fake provider ids must not appear"
+        );
+        assert_eq!(
+            run(Rc::clone(&rig), sent.job, queue, post).await,
+            JobOutcome::Ack
+        );
+        assert!(
+            metrics::take().is_empty(),
+            "duplicate delivery emitted a point"
+        );
+    }
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn slice_acceptance() {
     let rig = Rig::new().await;
