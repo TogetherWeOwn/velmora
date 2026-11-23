@@ -10,11 +10,11 @@ use sha2::{Digest, Sha256};
 use velmora::rng::SystemRng;
 use velmora_bridge::config::Maintenance;
 use velmora_bridge::copy::{
-    plan_hint, Copier, CopyCounts, BEGAN_KEY, JOB_COPIES, KEY_MISS_KEY, PASS_INTERVAL_MS,
-    STORE_KEY, SWEPT_KEY, WALKED_KEY, WANT_KEY,
+    plan_hint, Copier, CopyCounts, BEGAN_KEY, FRESH_MS, JOB_COPIES, JOB_PAGES, KEY_MISS_KEY,
+    PASS_INTERVAL_MS, RECHECK_TENANTS, STORE_KEY, SWEPT_KEY, WALKED_KEY, WANT_KEY,
 };
-use velmora_bridge::crypto::scheme2::{seal_record_v2, CONTROL_HEADER_LEN};
-use velmora_bridge::crypto::seal_manifest;
+use velmora_bridge::crypto::scheme2::{seal_record_v2, CONTROL_HEADER_LEN, RECORD_V2_HEADER_LEN};
+use velmora_bridge::crypto::{seal_manifest, WRAP_OVERHEAD};
 use velmora_bridge::directory::chain::record_key;
 use velmora_bridge::directory::record::Tenant;
 use velmora_bridge::records::MemRecords;
@@ -192,8 +192,56 @@ fn ring(tenant: &str, loaded: &[u32], named: &[u32], destroyed: &[u32]) -> RingR
     )))
 }
 
+#[derive(Default)]
+struct CountingSafety {
+    inner: MemBlobStore,
+    entry_pages: Cell<u32>,
+    dir_pages: RefCell<Vec<Vec<String>>>,
+    miss_writes: Cell<usize>,
+}
+
+impl BlobStore for CountingSafety {
+    async fn put(&self, key: &str, bytes: Vec<u8>, meta: &BlobMeta<'_>) -> Result<()> {
+        if key == KEY_MISS_KEY {
+            self.miss_writes.set(self.miss_writes.get() + 1);
+        }
+        self.inner.put(key, bytes, meta).await
+    }
+
+    async fn get(&self, key: &str, span: Option<ByteSpan>) -> Result<Option<Vec<u8>>> {
+        self.inner.get(key, span).await
+    }
+
+    async fn head(&self, key: &str) -> Result<Option<u64>> {
+        self.inner.head(key).await
+    }
+
+    async fn delete(&self, key: &str) -> Result<()> {
+        self.inner.delete(key).await
+    }
+
+    async fn delete_record(&self, refused: &recovery::Unpublished) -> Result<()> {
+        self.inner.delete_record(refused).await
+    }
+
+    async fn list(&self, prefix: &str, after: &str, limit: u32) -> Result<Vec<String>> {
+        self.inner.list(prefix, after, limit).await
+    }
+
+    async fn list_entries(&self, prefix: &str, after: &str, limit: u32) -> Result<Vec<BlobEntry>> {
+        self.entry_pages.set(self.entry_pages.get() + 1);
+        self.inner.list_entries(prefix, after, limit).await
+    }
+
+    async fn list_dirs(&self, prefix: &str, after: &str, limit: u32) -> Result<Vec<String>> {
+        let dirs = self.inner.list_dirs(prefix, after, limit).await?;
+        self.dir_pages.borrow_mut().push(dirs.clone());
+        Ok(dirs)
+    }
+}
+
 struct World {
-    safety: MemBlobStore,
+    safety: CountingSafety,
     kek: TestKek,
     clock: FixedClock,
     jobs: FakeJobs,
@@ -228,7 +276,7 @@ impl World {
         }
         source.answer(SHREDDED, [Ok(TenantRingState::Shredded)]);
         Self {
-            safety: MemBlobStore::new(),
+            safety: CountingSafety::default(),
             kek: TestKek::new(),
             clock: FixedClock::new(NOW),
             jobs: FakeJobs::new(),
@@ -241,7 +289,7 @@ impl World {
     fn copier<'a>(
         &'a self,
         rings: &'a JobRings<RingSource>,
-    ) -> Copier<'a, MemBlobStore, TestKek, FixedClock, RemoteStore, RingSource> {
+    ) -> Copier<'a, CountingSafety, TestKek, FixedClock, RemoteStore, RingSource> {
         Copier {
             safety: &self.safety,
             kek: &self.kek,
@@ -340,6 +388,18 @@ impl World {
             }
         }
         panic!("fixture did not finish in 16 jobs");
+    }
+
+    async fn first_job(&self) -> CopyCounts {
+        let (outcome, counts) = self.job(self.clock.now(), "").await;
+        assert_eq!(outcome, JobOutcome::Ack);
+        assert!(self.jobs.take().is_empty(), "fixture should fit one job");
+        counts
+    }
+
+    async fn miss_marks(&self) -> BTreeMap<String, [i64; 3]> {
+        let bytes = self.safety.get(KEY_MISS_KEY, None).await.unwrap().unwrap();
+        serde_json::from_slice(&bytes).unwrap()
     }
 
     async fn rest_walk(&self) {
@@ -657,16 +717,25 @@ async fn am80b_unknown_future_version_pages_once_each_pass_across_jobs() {
 async fn am80b_destroyed_version_counts_without_paging() {
     capture_alerts();
     let w = World::new();
+    // Even a first read that says destroyed must be confirmed by the reload.
     w.source.answer(A, [ring(A, &[2], &[2], &[1])]);
     let name = article(A, "x_destroyed");
     w.data(A, 1, &name, b"plan").await;
     let c = w.step(WALK).await;
     assert_eq!(
-        (c.version_destroyed, c.failed, c.damaged(), c.copied),
-        (1, 0, 0, 0)
+        (
+            c.version_destroyed,
+            c.failed,
+            c.damaged(),
+            c.copied,
+            c.ring_loads
+        ),
+        (1, 0, 0, 0, 2)
     );
+    assert_eq!(w.source.calls(A), 2);
     assert!(w.there(&name).is_none());
     assert!(alerts().is_empty());
+    assert_eq!(w.safety.miss_writes.get(), 0);
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -774,6 +843,313 @@ async fn t4_managed_post_hint_copies_the_scoped_plan() {
     assert_eq!((c.copied, c.failed, c.damaged()), (1, 0, 0));
     assert_eq!(w.there(&name), Some(bytes));
     assert!(w.there("m/art/x_hinted").is_none());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn am80b_hint_does_not_page_or_write_the_key_miss_mark() {
+    capture_alerts();
+    let w = World::new();
+    let extent = "x_hint_missing";
+    let name = article(A, extent);
+    // An unknown version would page immediately in a pass job.
+    w.data(A, 2, &name, b"plan").await;
+    let (pass, cursor) = w.hint(A, extent);
+    let (_, c) = w.job(pass, &cursor).await;
+    assert_eq!((c.failed, c.ring_loads, c.copied), (1, 2, 0), "{c:?}");
+    assert!(alerts().is_empty());
+    assert_eq!(w.safety.miss_writes.get(), 0);
+    assert!(w.safety.get(KEY_MISS_KEY, None).await.unwrap().is_none());
+    assert!(w.there(&name).is_none());
+
+    let c = w.step(WALK).await;
+    assert_eq!(c.failed, 1);
+    assert_eq!(alerts(), [missing_key_page(2, "unknown")]);
+    let writes = w.safety.miss_writes.get();
+    assert!(writes > 0);
+    let (_, c) = w.job(pass, &cursor).await;
+    assert_eq!(c.failed, 1);
+    assert!(alerts().is_empty());
+    assert_eq!(w.safety.miss_writes.get(), writes, "hint rewrote the mark");
+}
+
+fn missing_key_page(version: u32, kind: &str) -> String {
+    format!("recovery copy (copy_key_version_missing) tenant={A} version={version} ring={kind}")
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn am80b_first_job_rechecks_partial_ring_while_walk_rests() {
+    capture_alerts();
+    let w = World::new();
+    w.source.answer(A, [ring(A, &[1], &[1, 2], &[])]);
+    let name = generation(A, FRESH_MS + PASS_INTERVAL_MS, "old_missing");
+    w.data(A, 2, &name, br#"{"v":1,"extents":[]}"#).await;
+    assert_eq!(w.first_job().await.failed, 1);
+    assert!(alerts().is_empty());
+    let ended = w.safety.get(WALKED_KEY, None).await.unwrap().unwrap();
+    let miss = format!("{A}/2");
+    let first_seen = w.miss_marks().await[&miss][1];
+
+    for pass in 2..=7 {
+        w.clock.advance_ms(PASS_INTERVAL_MS);
+        let c = w.first_job().await;
+        assert_eq!((c.failed, c.ring_loads), (0, 2), "pass {pass}: {c:?}");
+        if pass < 5 {
+            assert!(alerts().is_empty(), "page before pass 5 (pass {pass})");
+        } else {
+            assert_eq!(alerts(), [missing_key_page(2, "partial")], "pass {pass}");
+            // A redelivered first job must not page again in the same slot.
+            assert_eq!(w.first_job().await.failed, 0);
+            assert!(alerts().is_empty(), "duplicate page in pass {pass}");
+        }
+        assert_eq!(w.miss_marks().await[&miss][1], first_seen);
+        assert_eq!(
+            w.safety.get(WALKED_KEY, None).await.unwrap(),
+            Some(ended.clone())
+        );
+    }
+
+    w.clock.advance_ms(PASS_INTERVAL_MS);
+    w.source.answer(A, [ring(A, &[1, 2], &[1, 2], &[])]);
+    let c = w.first_job().await;
+    assert_eq!((c.failed, c.ring_loads), (0, 1));
+    assert!(!w.miss_marks().await.contains_key(&miss));
+    assert!(alerts().is_empty());
+    assert!(w.there(&name).is_none(), "the old record was not rewalked");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn am80b_first_job_bounds_rechecks_by_tenant_not_version() {
+    capture_alerts();
+    let w = World::new();
+    w.rest_walk().await;
+    let tenants: Vec<_> = (1..=RECHECK_TENANTS + 3)
+        .map(|i| format!("t_{i:016x}"))
+        .collect();
+    let mut marks = BTreeMap::new();
+    for tenant in &tenants {
+        w.source
+            .answer(tenant, [ring(tenant, &[1], &[1, 2, 3], &[])]);
+        for version in [2, 3] {
+            marks.insert(format!("{tenant}/{version}"), [NOW.0, NOW.0, i64::MIN]);
+        }
+    }
+    w.raw(KEY_MISS_KEY, &serde_json::to_vec(&marks).unwrap())
+        .await;
+    for _ in 0..2 {
+        let before: Vec<_> = tenants.iter().map(|t| w.source.calls(t)).collect();
+        let c = w.first_job().await;
+        let loads: Vec<_> = tenants
+            .iter()
+            .zip(before)
+            .map(|(t, old)| w.source.calls(t) - old)
+            .filter(|&loads| loads != 0)
+            .collect();
+        assert_eq!(loads, vec![2; RECHECK_TENANTS]);
+        assert_eq!(c.ring_loads as usize, loads.iter().sum::<usize>());
+
+        // A continuation on an empty range must not recheck the mark.
+        let (outcome, continuation) = w.job(w.clock.now(), WALK).await;
+        assert_eq!((outcome, continuation.ring_loads), (JobOutcome::Ack, 0));
+        assert_eq!(w.miss_marks().await, marks);
+        assert!(alerts().is_empty());
+        w.clock.advance_ms(PASS_INTERVAL_MS);
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn am80b_truncated_vmr2_is_unreadable_without_a_ring_load_or_page() {
+    capture_alerts();
+    let w = World::new();
+    for version in [1, 2] {
+        for body in [0, WRAP_OVERHEAD - 1] {
+            let name = article(A, &format!("x_truncated_{version}_{body}"));
+            let mut bytes =
+                seal_record_v2(&key(A, version), &name, b"plan", &mut SystemRng).unwrap();
+            bytes.truncate(RECORD_V2_HEADER_LEN + body);
+            w.raw(&name, &bytes).await;
+        }
+    }
+    let c = w.step(WALK).await;
+    assert_eq!(
+        (c.source_unreadable, c.failed, c.ring_loads, c.copied),
+        (4, 0, 0, 0),
+        "{c:?}"
+    );
+    assert_eq!(w.source.calls(A), 0);
+    assert_eq!(w.safety.miss_writes.get(), 0);
+    assert!(alerts().is_empty());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn am80b_garbled_key_miss_marks_do_not_suppress_partial_ring_pages() {
+    capture_alerts();
+    let miss = format!("{A}/2");
+    let future = NOW.0 + 10 * PASS_INTERVAL_MS;
+    let mut oversized =
+        serde_json::to_vec(&BTreeMap::from([(&miss, [future, NOW.0, future])])).unwrap();
+    oversized.resize(256 * 1024, b' ');
+    let marks = [
+        (
+            "minimum first",
+            serde_json::json!([i64::MIN, NOW.0, i64::MIN]),
+        ),
+        (
+            "maximum first",
+            serde_json::json!([i64::MAX, NOW.0, i64::MIN]),
+        ),
+        (
+            "minimum last",
+            serde_json::json!([NOW.0, i64::MIN, i64::MIN]),
+        ),
+        (
+            "maximum last",
+            serde_json::json!([NOW.0, i64::MAX, i64::MIN]),
+        ),
+        ("future first", serde_json::json!([future, NOW.0, i64::MIN])),
+        ("future paged", serde_json::json!([NOW.0, NOW.0, future])),
+        ("maximum paged", serde_json::json!([NOW.0, NOW.0, i64::MAX])),
+        ("non-numeric", serde_json::json!(["bad", NOW.0, i64::MIN])),
+    ];
+    let cases = marks.into_iter().map(|(label, mark)| {
+        let bytes = serde_json::to_vec(&BTreeMap::from([(&miss, mark)])).unwrap();
+        (label, bytes)
+    });
+    for (label, bytes) in cases.chain([("oversized", oversized)]) {
+        let w = World::new();
+        w.source.answer(A, [ring(A, &[1], &[1, 2], &[])]);
+        w.data(A, 2, &article(A, "x_garbled_miss"), b"plan").await;
+        w.raw(KEY_MISS_KEY, &bytes).await;
+        for pass in 1..=5 {
+            let c = w.step(WALK).await;
+            assert_eq!((c.failed, c.ring_loads), (1, 2), "{label}, pass {pass}");
+            let pages = alerts();
+            if !pages.is_empty() || pass == 5 {
+                assert_eq!(
+                    pages,
+                    [missing_key_page(2, "partial")],
+                    "{label}, pass {pass}"
+                );
+            }
+            w.clock.advance_ms(PASS_INTERVAL_MS);
+        }
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn am80b_unreadable_ring_pages_on_pass_five_and_clears_when_readable() {
+    capture_alerts();
+    let w = World::new();
+    let name = article(A, "x_unreadable_ring");
+    w.data(A, 1, &name, b"plan").await;
+    w.source
+        .answer(A, [Err(BridgeError::Invalid("test ring load unavailable"))]);
+    assert_eq!(w.first_job().await.failed, 1);
+    assert!(alerts().is_empty());
+    let miss = format!("{A}/0");
+    assert!(w.miss_marks().await.contains_key(&miss));
+    for pass in 2..=6 {
+        w.clock.advance_ms(PASS_INTERVAL_MS);
+        let c = w.first_job().await;
+        assert_eq!((c.failed, c.ring_loads), (0, 1), "pass {pass}");
+        if pass < 5 {
+            assert!(alerts().is_empty(), "page before pass 5 (pass {pass})");
+        } else {
+            assert_eq!(alerts(), [missing_key_page(0, "unreadable")], "pass {pass}");
+            // A second job finds the same unavailable ring in this slot.
+            assert_eq!(w.step(WALK).await.failed, 1);
+            assert!(alerts().is_empty(), "duplicate page in pass {pass}");
+        }
+    }
+    w.source.answer(A, [ring(A, &[1], &[1], &[])]);
+    for pass in 7..=8 {
+        w.clock.advance_ms(PASS_INTERVAL_MS);
+        let c = w.first_job().await;
+        assert_eq!((c.failed, c.ring_loads), (0, u64::from(pass == 7)));
+        assert!(!w.miss_marks().await.contains_key(&miss));
+        assert!(alerts().is_empty());
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn t5_managed_directory_requests_share_the_job_page_budget() {
+    check_managed_directory_budget(30).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn t5_managed_directory_listing_defers_when_the_last_page_is_spent() {
+    // End the last tenant's generation phase at the budget boundary,
+    // before the final list_dirs call to find the end of the tenant list.
+    check_managed_directory_budget(16).await;
+}
+
+async fn check_managed_directory_budget(fresh_dirs: usize) {
+    let w = World::new();
+    w.rest_walk().await;
+    let mut records = Vec::new();
+    let mut dir_visits = BTreeMap::new();
+    for i in 1..=30 {
+        let tenant = format!("t_{i:016x}");
+        w.source.answer(&tenant, [ring(&tenant, &[1], &[1], &[])]);
+        dir_visits.insert(format!("m/x/{tenant}/"), 0);
+        let fresh = i <= fresh_dirs;
+        let age = if fresh {
+            FRESH
+        } else {
+            FRESH_MS + PASS_INTERVAL_MS
+        };
+        let name = generation(&tenant, age, "many_dirs");
+        let bytes = w.data(&tenant, 1, &name, br#"{"v":1,"extents":[]}"#).await;
+        records.push((name, fresh.then_some(bytes)));
+    }
+    let pass = w.clock.now();
+    let mut cursor = String::new();
+    let mut finished = false;
+    let mut dir_requests = 0;
+    for job in 1..=4 {
+        let (outcome, c) = w.job(pass, &cursor).await;
+        assert_eq!(outcome, JobOutcome::Ack);
+        assert_eq!((c.failed, c.damaged()), (0, 0));
+        let pages = w.safety.entry_pages.replace(0);
+        let dirs = w.safety.dir_pages.take();
+        let requests = pages as usize + dirs.len();
+        assert!(
+            requests <= JOB_PAGES as usize,
+            "job {job}: {pages} entry pages + {} directory pages exceeds budget {JOB_PAGES}",
+            dirs.len()
+        );
+        dir_requests += dirs.len();
+        for dir in dirs.into_iter().flatten() {
+            *dir_visits.get_mut(&dir).expect("unknown tenant directory") += 1;
+        }
+        let sent = w.jobs.take();
+        if sent.is_empty() {
+            assert!(job >= 3, "fixture should span several jobs");
+            assert!(
+                dir_requests <= job + 1,
+                "too many directory listings: {dir_requests}"
+            );
+            finished = true;
+            break;
+        }
+        assert_eq!(sent.len(), 1);
+        let Job::RecoveryCopy {
+            pass: next_pass,
+            cursor: next,
+            ..
+        } = &sent[0].job
+        else {
+            panic!("expected recovery copy continuation");
+        };
+        assert_eq!(*next_pass, pass);
+        cursor.clone_from(next);
+    }
+    assert!(finished, "sweep did not finish within four jobs");
+    for (dir, visits) in dir_visits {
+        assert!((1..=3).contains(&visits), "{dir} was listed {visits} times");
+    }
+    for (name, bytes) in records {
+        assert_eq!(w.there(&name), bytes, "{name}");
+    }
 }
 
 #[tokio::test(flavor = "current_thread")]

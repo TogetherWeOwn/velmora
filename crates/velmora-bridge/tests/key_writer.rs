@@ -37,6 +37,7 @@ use velmora_bridge::keys::revocations::{put_tenant_revocation, tenant_revocation
 use velmora_bridge::keys::routes::{put_route, read_route, RoutePut};
 use velmora_bridge::keys::writer::{finish_keys, KeyAnswer, KeyEnv, KeyRequest, Limits};
 use velmora_bridge::records::{bucket_id, MemRecords, RecordStore};
+use velmora_bridge::recovery::check::{family, Family, Owner};
 use velmora_bridge::testkit::{FixedClock, TestKek};
 use velmora_bridge::{BridgeError, BucketId, Result, UnixMs};
 
@@ -3051,6 +3052,8 @@ async fn a_bucket_create_writes_the_creator_grant_first_with_the_derived_id() {
     let units = w.units();
     let env = env!(w, &adm, &units);
     let buckets = FakeBuckets::default();
+    let before = w.store.names_under("m/");
+    let puts = w.store.puts();
     let answer = env
         .create_bucket(
             &buckets,
@@ -3068,6 +3071,25 @@ async fn a_bucket_create_writes_the_creator_grant_first_with_the_derived_id() {
             bucket: id3.clone(),
             grant_seq: 3,
         }
+    );
+    let written: Vec<_> = w
+        .store
+        .names_under("m/")
+        .into_iter()
+        .filter(|name| !before.contains(name))
+        .collect();
+    for name in &written {
+        assert_eq!(
+            family(name),
+            Family::Control(Owner::Managed(w.t.clone())),
+            "{name}"
+        );
+    }
+    assert_eq!(written, [key_chain(&w.t).name(3)]);
+    assert_eq!(
+        w.store.puts() - puts,
+        1,
+        "an attempted write went unclassified"
     );
     assert_eq!(w.head(), 3);
     let bytes = key_chain(&w.t).get(&w.store, 3).await.unwrap();

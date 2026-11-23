@@ -22,6 +22,7 @@ use velmora_bridge::keys::record::{
 use velmora_bridge::keys::reserved::{Carried, Finished, Reserved, ReservedAnswer};
 use velmora_bridge::keys::writer::{KeyAnswer, KeyEnv, KeyRequest, Limits};
 use velmora_bridge::records::{MemRecords, RecordStore};
+use velmora_bridge::recovery::check::{family, Family, Owner};
 use velmora_bridge::testkit::{FixedClock, TestKek};
 use velmora_bridge::{BridgeError, Result, UnixMs};
 
@@ -493,11 +494,32 @@ async fn a_reserved_create_records_exactly_keys_seq_plus_one_with_its_rid() {
         answer: &answer,
     };
     let subject = principal(NEW, Some("p_0000000000000001"));
+    let before = w.store.names_under("m/");
+    let puts = w.store.puts();
     assert_eq!(
         env.create_reserved(&mut table, &subject, reserved, &mut TestRng(2))
             .await
             .unwrap(),
         ReservedAnswer::Done { seq: 2 }
+    );
+    let written: Vec<_> = w
+        .store
+        .names_under("m/")
+        .into_iter()
+        .filter(|name| !before.contains(name))
+        .collect();
+    for name in &written {
+        assert_eq!(
+            family(name),
+            Family::Control(Owner::Managed(w.t.clone())),
+            "{name}"
+        );
+    }
+    assert_eq!(written, [key_chain(&w.t).name(2)]);
+    assert_eq!(
+        w.store.puts() - puts,
+        1,
+        "an attempted write went unclassified"
     );
     assert_eq!(w.head(), 2);
     let bytes = w.store.raw(&key_chain(&w.t).name(2)).unwrap();

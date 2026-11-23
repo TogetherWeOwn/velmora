@@ -28,6 +28,8 @@ use velmora_bridge::{Result, TenantId, UnixMs};
 // can start with m/. This registers the indirections through Chain and BlobStore
 // and fails closed on a new raw writer even if its name is built in another file.
 // The last group are explicitly not producers of SAFETY recovery records.
+// The reserved-subject and creator-grant writers are exercised against
+// MemRecords in key_reserved.rs and key_writer.rs, which check their families.
 const WRITERS: &[(&str, [usize; 5])] = &[
     ("directory/chain.rs", [0, 0, 0, 0, 1]), // TenantChain::write
     ("directory/gate.rs", [0, 0, 0, 0, 2]),  // close, run_gate_if_closed
