@@ -25,19 +25,23 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
+use std::future::Future;
 use std::rc::Rc;
 use std::task::{Poll, Waker};
+use std::time::Duration;
 
 use velmora_bridge::gate::{
-    Gate, GateRecord, GateReply, GateRequest, GateSession, GateStore, GateTransport, SessionState,
+    open_detached, Gate, GateAnswer, GateRecord, GateReply, GateRequest, GateSession, GateStore,
+    GateTransport, SessionState,
 };
+use velmora_bridge::ingress::Spawner;
 use velmora_bridge::{BridgeError, Clock, Result};
 use worker::wasm_bindgen::closure::Closure;
 use worker::wasm_bindgen::{self, JsCast, JsValue};
 use worker::web_sys;
 use worker::{
     console_log, durable_object, DurableObject, Env, Method, ObjectNamespace, Request, RequestInit,
-    Response, State, Storage, WebSocket, WebSocketIncomingMessage, WebSocketPair,
+    Response, State, Storage, Stub, WebSocket, WebSocketIncomingMessage, WebSocketPair,
     WorkerVersionMetadata,
 };
 
@@ -119,6 +123,9 @@ pub struct PermitGate {
     state: State,
     /// `Err`: a binding is missing; every request fails with its name.
     gate: core::result::Result<Rc<Gate<D1Sql, DoStore>>, &'static str>,
+    /// A slot went to a job in the line since the object came into
+    /// memory: said once in the log.
+    handed: core::cell::Cell<bool>,
 }
 
 impl PermitGate {
@@ -177,13 +184,56 @@ impl PermitGate {
         }
     }
 
-    /// The end of a session's socket, however it came.
+    /// The end of a session's socket, however it came. What it held
+    /// goes to the line.
     async fn ended(&self, ws: &WebSocket) {
         let Some(session) = attached(ws) else {
             return;
         };
         if let Ok(gate) = self.ready(Some(session.id)).await {
             gate.close(session.id);
+            gate.settle(WorkerClock.now()).await;
+            self.deliver(gate).await;
+        }
+    }
+
+    /// Sends the sessions that waited in the line the slots they were
+    /// handed, each kept with its socket first. A session that cannot
+    /// be sent to has ended: its slot goes to the next in the line.
+    async fn deliver(&self, gate: &Gate<D1Sql, DoStore>) {
+        loop {
+            let pushes = gate.pushes();
+            if pushes.is_empty() {
+                return;
+            }
+            let sockets = self.state.get_websockets();
+            let (mut lost, mut slot) = (false, false);
+            for (id, reply) in pushes {
+                let ws = sockets
+                    .iter()
+                    .find(|ws| attached(ws).is_some_and(|s| s.id == id));
+                let sent = ws.is_some_and(|ws| {
+                    attach(ws, &gate.session(id, WorkerClock.now()))
+                        && serde_json::to_string(&reply)
+                            .is_ok_and(|raw| ws.send_with_str(&raw).is_ok())
+                });
+                // A reply without a slot tells a job to ask elsewhere.
+                slot |= sent && matches!(reply.answers[..], [GateAnswer::Acquired(Some(_))]);
+                if !sent {
+                    gate.close(id);
+                    if let Some(ws) = ws {
+                        let _ = ws.close(Some(1011), Some("gate: session not kept"));
+                    }
+                    lost = true;
+                }
+            }
+            if slot && !self.handed.replace(true) {
+                console_log!("permit gate line: a slot went to a job that waited");
+            }
+            if !lost {
+                return;
+            }
+            gate.settle(WorkerClock.now()).await;
         }
     }
 }
@@ -202,7 +252,11 @@ impl DurableObject for PermitGate {
                 version.id(),
             ))),
         };
-        PermitGate { state, gate }
+        PermitGate {
+            state,
+            gate,
+            handed: core::cell::Cell::new(false),
+        }
     }
 
     async fn fetch(&self, mut req: Request) -> worker::Result<Response> {
@@ -228,7 +282,9 @@ impl DurableObject for PermitGate {
         let refused = |e: BridgeError| Response::error(format!("gate: {e}"), 500);
         let now = WorkerClock.now();
         if !upgrade {
-            return match gate.handle(None, request, now).await {
+            let reply = gate.handle(None, request, now).await;
+            self.deliver(gate).await;
+            return match reply {
                 Ok(reply) => match serde_json::to_string(&reply) {
                     Ok(raw) => Response::ok(raw),
                     Err(_) => Response::error("gate: reply encode failed", 500),
@@ -244,6 +300,8 @@ impl DurableObject for PermitGate {
             Ok(reply) => reply,
             Err(e) => {
                 gate.close(id);
+                gate.settle(WorkerClock.now()).await;
+                self.deliver(gate).await;
                 return refused(e);
             }
         };
@@ -263,12 +321,15 @@ impl DurableObject for PermitGate {
             }
             Response::from_websocket(pair.client).ok()
         })();
+        if accepted.is_none() {
+            gate.close(id);
+            gate.settle(WorkerClock.now()).await;
+        }
+        // What this request freed for the line, or found run out.
+        self.deliver(gate).await;
         match accepted {
             Some(response) => Ok(response),
-            None => {
-                gate.close(id);
-                Response::error("gate: session not opened", 500)
-            }
+            None => Response::error("gate: session not opened", 500),
         }
     }
 
@@ -298,6 +359,9 @@ impl DurableObject for PermitGate {
         let Some(request) = request else {
             gate.close(session.id);
             end(1008, "gate: bad request");
+            // What the session held is free: for the line, now.
+            gate.settle(WorkerClock.now()).await;
+            self.deliver(gate).await;
             return Ok(());
         };
         // A request the gate could not answer is told so: the session
@@ -315,7 +379,9 @@ impl DurableObject for PermitGate {
         if !sent {
             gate.close(session.id);
             end(1011, "gate: session not kept");
+            gate.settle(WorkerClock.now()).await;
         }
+        self.deliver(gate).await;
         Ok(())
     }
 
@@ -339,22 +405,71 @@ impl DurableObject for PermitGate {
     }
 }
 
+thread_local! {
+    static DETACHED_OPENS: Cell<usize> = const { Cell::new(0) };
+}
+
+struct DetachedOpen;
+
+impl DetachedOpen {
+    fn start() -> Self {
+        DETACHED_OPENS.with(|n| n.set(n.get() + 1));
+        Self
+    }
+}
+
+impl Drop for DetachedOpen {
+    fn drop(&mut self) {
+        DETACHED_OPENS.with(|n| n.set(n.get() - 1));
+    }
+}
+
+fn tracked_open_spawner(spawn: Spawner) -> Spawner {
+    Rc::new(move |task| {
+        let in_flight = DetachedOpen::start();
+        spawn(Box::pin(async move {
+            let _in_flight = in_flight;
+            task.await;
+        }));
+    })
+}
+
+/// Used with the current invocation's `wait_until`. The cached transport
+/// does not own a Context, and `spawn_local` alone does not keep it alive.
+pub fn drain_detached_opens() -> Option<impl Future<Output = ()>> {
+    (DETACHED_OPENS.get() != 0).then_some(async {
+        let drain = async {
+            while DETACHED_OPENS.get() != 0 {
+                worker::Delay::from(Duration::from_millis(50)).await;
+            }
+        };
+        let timeout = worker::Delay::from(Duration::from_secs(30));
+        let _ = futures_util::future::select(std::pin::pin!(drain), std::pin::pin!(timeout)).await;
+    })
+}
+
 /// Asks the gate objects of one namespace.
 pub struct DoTransport {
     namespace: ObjectNamespace,
+    spawn: Spawner,
 }
 
 impl DoTransport {
-    pub fn new(namespace: ObjectNamespace) -> Self {
-        DoTransport { namespace }
+    pub fn new(namespace: ObjectNamespace, spawn: Spawner) -> Self {
+        DoTransport {
+            namespace,
+            spawn: tracked_open_spawner(spawn),
+        }
     }
 
-    async fn fetch(&self, gate: &str, req: Request) -> Result<Response> {
-        let stub = self
-            .namespace
+    fn stub(&self, gate: &str) -> Result<Stub> {
+        self.namespace
             .id_from_name(gate)
             .and_then(|id| id.get_stub())
-            .map_err(|_| failed("no object"))?;
+            .map_err(|_| failed("no object"))
+    }
+
+    async fn fetch(stub: Stub, req: Request) -> Result<Response> {
         stub.fetch_with_request(req)
             .await
             .map_err(|_| failed("call failed"))
@@ -465,6 +580,10 @@ impl DoSession {
 }
 
 impl GateSession for DoSession {
+    async fn pushed(&self, id: u64) -> Result<GateReply> {
+        self.reply(id).await
+    }
+
     async fn call(&self, request: GateRequest) -> Result<GateReply> {
         if self.closed.get() || self.inbox.borrow().closed {
             return Err(failed("session ended"));
@@ -517,9 +636,16 @@ impl GateTransport for DoTransport {
             headers.set(REQUEST_HEADER, &header)
         });
         set.map_err(|_| failed("request refused"))?;
-        let resp = self.fetch(&request.gate, req).await?;
-        let ws = resp.websocket().ok_or_else(|| failed("call refused"))?;
-        let session = DoSession::new(ws)?;
+        let stub = self.stub(&request.gate)?;
+        let session = open_detached(
+            &self.spawn,
+            Box::pin(async move {
+                let resp = Self::fetch(stub, req).await?;
+                let ws = resp.websocket().ok_or_else(|| failed("call refused"))?;
+                DoSession::new(ws)
+            }),
+        )
+        .await?;
         match session.reply(request.id).await {
             Ok(reply) => Ok((session, reply)),
             Err(e) => {
@@ -536,11 +662,85 @@ impl GateTransport for DoTransport {
             .with_body(Some(JsValue::from_str(&body)));
         let req = Request::new_with_init("https://permit-gate/", &init)
             .map_err(|_| failed("request refused"))?;
-        let mut resp = self.fetch(&request.gate, req).await?;
+        let mut resp = Self::fetch(self.stub(&request.gate)?, req).await?;
         if resp.status_code() != 200 {
             return Err(failed("call refused"));
         }
         let raw = resp.text().await.map_err(|_| failed("reply unreadable"))?;
         serde_json::from_str(&raw).map_err(|_| failed("reply unreadable"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::future::Future;
+
+    struct Session(Rc<Cell<u32>>);
+
+    impl GateSession for Session {
+        async fn call(&self, _: GateRequest) -> Result<GateReply> {
+            unreachable!("the detached receiver never used the session")
+        }
+
+        fn close(&self) {
+            assert_eq!(DETACHED_OPENS.get(), 1, "still in flight during cleanup");
+            self.0.set(self.0.get() + 1);
+        }
+    }
+
+    #[test]
+    fn detached_opens_are_counted_through_completion_and_late_close() {
+        let tasks = Rc::new(RefCell::new(Vec::new()));
+        let queued = Rc::clone(&tasks);
+        let spawn = tracked_open_spawner(Rc::new(move |task| queued.borrow_mut().push(task)));
+        let mut cx = std::task::Context::from_waker(futures_util::task::noop_waker_ref());
+        assert!(drain_detached_opens().is_none());
+
+        let error = open_detached::<Session>(&spawn, Box::pin(async { Err(failed("test open")) }));
+        let mut error = std::pin::pin!(error);
+        assert_eq!(DETACHED_OPENS.get(), 1);
+        assert!(drain_detached_opens().is_some());
+        let mut task = tasks.borrow_mut().pop().unwrap();
+        assert!(task.as_mut().poll(&mut cx).is_ready());
+        assert!(matches!(error.as_mut().poll(&mut cx), Poll::Ready(Err(_))));
+        assert!(drain_detached_opens().is_none());
+
+        let closed = Rc::new(Cell::new(0));
+        let session = Session(Rc::clone(&closed));
+        let receiving = open_detached(&spawn, Box::pin(async { Ok(session) }));
+        let mut receiving = std::pin::pin!(receiving);
+        assert_eq!(DETACHED_OPENS.get(), 1);
+        let mut task = tasks.borrow_mut().pop().unwrap();
+        assert!(task.as_mut().poll(&mut cx).is_ready());
+        assert!(drain_detached_opens().is_none());
+        assert!(matches!(
+            receiving.as_mut().poll(&mut cx),
+            Poll::Ready(Ok(_))
+        ));
+        assert_eq!(closed.get(), 0);
+
+        let ready = Rc::new(Cell::new(false));
+        let (finish, count) = (Rc::clone(&ready), Rc::clone(&closed));
+        let receiving = open_detached(
+            &spawn,
+            Box::pin(std::future::poll_fn(move |_| {
+                if finish.get() {
+                    Poll::Ready(Ok(Session(Rc::clone(&count))))
+                } else {
+                    Poll::Pending
+                }
+            })),
+        );
+        assert_eq!(DETACHED_OPENS.get(), 1);
+        let mut task = tasks.borrow_mut().pop().unwrap();
+        assert!(task.as_mut().poll(&mut cx).is_pending());
+        drop(receiving);
+        assert_eq!(DETACHED_OPENS.get(), 1);
+        assert_eq!(closed.get(), 0);
+        ready.set(true);
+        assert!(task.as_mut().poll(&mut cx).is_ready());
+        assert_eq!(closed.get(), 1);
+        assert!(drain_detached_opens().is_none());
     }
 }

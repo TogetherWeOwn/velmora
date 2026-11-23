@@ -14,7 +14,9 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use velmora_bridge::config::{BridgeConfig, KekRing};
-use velmora_bridge::gate::{shards_from_var, GateClient, GateSharding, PermitMode};
+use velmora_bridge::gate::{
+    shards_from_var, slot_wait_from_var, GateClient, GateSharding, PermitMode,
+};
 use velmora_bridge::ingress::{ByteBudget, Sleeper};
 use velmora_bridge::sql::SqlCatalog;
 use velmora_bridge::{Bridge, Clock, UnixMs};
@@ -72,6 +74,10 @@ pub const PERMITS: &str = "PERMITS";
 pub const PERMIT_GATES: &str = "PERMIT_GATES";
 /// How many gates share one account or pool (default 1).
 pub const PERMIT_SHARDS: &str = "PERMIT_SHARDS";
+/// `poll` (default): a job that finds no slot asks again every two
+/// seconds. `push`: with `PERMITS = "do"` it waits in the line of its
+/// gates, and the gate sends it the slot when it is its turn.
+pub const SLOT_WAIT: &str = "SLOT_WAIT";
 
 /// Name of the dev-only memory log variable.
 pub const DEV_MEMORY_LOG: &str = "DEV_MEMORY_LOG";
@@ -156,17 +162,22 @@ fn build(env: &Env) -> Result<WorkerBridge, String> {
     let permits = PermitMode::from_var(get(PERMITS).as_deref())?;
     let sharding = GateSharding::from_var(get(PERMIT_GATES).as_deref())?;
     let shards = shards_from_var(get(PERMIT_SHARDS).as_deref())?;
+    let push = slot_wait_from_var(get(SLOT_WAIT).as_deref())?;
     let catalog = match env.durable_object(GATE_BINDING) {
         Ok(namespace) => SqlCatalog::with_gate(
             catalog,
             GateClient::new(
-                DoTransport::new(namespace),
+                DoTransport::new(
+                    namespace,
+                    Rc::new(worker::wasm_bindgen_futures::spawn_local),
+                ),
                 || WorkerClock.now(),
                 permits,
                 sharding,
                 shards,
                 &cfg.providers,
             )
+            .with_push(push)
             .into_gate(),
         ),
         Err(_) if permits == PermitMode::Gate => {

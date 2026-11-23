@@ -534,12 +534,16 @@ jobs:
         include:
           - leg: http
             url: http://127.0.0.1:8787
-            # Provider permits from the catalogue's slot rows.
+            # Provider permits from the catalogue's slot rows; a job
+            # without one asks again.
             permits: ""
+            slot_wait: ""
           - leg: https-aws-chunked
             url: https://127.0.0.1:8787
-            # This run takes provider permits from the gate object.
+            # This run takes provider permits from the gate object, and a
+            # job without one waits in the gate's line.
             permits: do
+            slot_wait: push
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -590,11 +594,15 @@ jobs:
           WRANGLER_SEND_METRICS: "false"
           SLICE_URL: ${{ matrix.url }}
           SLICE_PERMITS: ${{ matrix.permits }}
+          SLICE_SLOT_WAIT: ${{ matrix.slot_wait }}
         run: |
           set -euo pipefail
           # The HTTP leg leaves E2E_PERMITS unset, as before the split.
           if [ -n "$SLICE_PERMITS" ]; then
             export E2E_PERMITS="$SLICE_PERMITS"
+          fi
+          if [ -n "$SLICE_SLOT_WAIT" ]; then
+            export E2E_SLOT_WAIT="$SLICE_SLOT_WAIT"
           fi
           bash e2e/slice.sh "$SLICE_URL"
 

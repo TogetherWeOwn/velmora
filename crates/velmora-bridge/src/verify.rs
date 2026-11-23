@@ -397,7 +397,11 @@ where
     /// the resume point goes with the write that gives the lease back.
     pub async fn verify_stage(&self, lease: &Lease, job: &JobExtent) -> JobOutcome {
         let mut reached = None;
-        match self.verify_extent(lease, job, &mut reached).await {
+        let done = self.verify_extent(lease, job, &mut reached).await;
+        // A slot that came to the job while it waited and that it did
+        // not take: it stopped first.
+        self.catalog.leave_line(&job_holder(lease));
+        match done {
             Ok(()) => JobOutcome::Ack,
             Err(stop) => settle_at(&self.catalog, &self.clock, lease, stop, reached).await,
         }
@@ -407,7 +411,9 @@ where
     /// that counts for every article now (`STAT`), require the full check
     /// on record from verify, then mark the safety copy evictable.
     pub async fn release_stage(&self, lease: &Lease, job: &JobExtent) -> JobOutcome {
-        match self.release_extent(lease, job).await {
+        let done = self.release_extent(lease, job).await;
+        self.catalog.leave_line(&job_holder(lease));
+        match done {
             Ok(()) => JobOutcome::Ack,
             Err(stop) => settle(&self.catalog, &self.clock, lease, stop).await,
         }
@@ -521,20 +527,16 @@ where
         let holder = job_holder(lease);
         let rows: Vec<&ArticleRow> = plan.iter().collect();
         let together = self.cfg.verify.mode == VerifyMode::Light;
-        let now = self.clock.now();
         let oldest = plan.iter().filter_map(|a| a.posted_at).min();
-        let (mut fresh, expired): (Vec<_>, Vec<_>) = providers
-            .iter()
-            .copied()
-            .partition(|p| p.retains(oldest, now));
-        if fresh.is_empty() {
-            fresh = expired;
-        }
         let mut waited = false;
         loop {
-            // The pool as it is now: a wait may have outlasted a cooldown,
-            // or seen one begin.
+            // A wait can outlast a cooldown or a provider's retention.
             let at = self.clock.now();
+            let (fresh, expired): (Vec<_>, Vec<_>) = providers
+                .iter()
+                .copied()
+                .partition(|p| p.retains(oldest, at));
+            let fresh = if fresh.is_empty() { expired } else { fresh };
             let pool = match Pool::load(&self.catalog, &self.cfg.providers, at).await {
                 // A later ask that cannot read the pool ends the wait as
                 // a put-off: the attempt of the claim is handed back.
@@ -548,8 +550,8 @@ where
                     None => Stop::NoPermit,
                 });
             }
-            let asked = usable.len();
             let mut refused = false;
+            let asked = usable.clone();
             for provider in usable {
                 let opened = ProviderSession::open(
                     &self.catalog,
@@ -595,8 +597,14 @@ where
             // No slot on this backbone. It is waited for under the claim
             // for a bounded time ([`crate::jobs::SLOT_WAIT_MS`]): the
             // row is not given back and delivered again for a slot
-            // that comes free in seconds.
-            if !self.slot_wait(lease, asked).await {
+            // that comes free in seconds. All still-usable providers
+            // were tried; give back any unclaimed grant before joining,
+            // including ones left over from an earlier backbone.
+            self.catalog.leave_line(&holder);
+            if !self
+                .slot_wait(lease, &asked, pool.cooling_until(&fresh))
+                .await
+            {
                 return Err(Stop::NoPermit);
             }
             waited = true;

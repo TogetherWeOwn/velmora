@@ -29,6 +29,9 @@ use velmora_test_nntp::{ServerConfig, TestNntpServer, UserConfig};
 pub const T0: UnixMs = UnixMs(1_800_000_000_000);
 pub use velmora_bridge::LEASE_SECS;
 
+/// How long a job waits in a [`MemCatalog`] line before its slot comes.
+pub const LINE_MS: u32 = 7_300;
+
 thread_local! {
     /// What the job did, in the order it began: `connect`, `post`,
     /// `plan` (the plan stored in the catalogue) and `acquire` (a slot
@@ -404,6 +407,26 @@ pub struct MemCatalog {
     pub permit_refusals: Cell<u32>,
     /// Permits another holder gives back right after the next refusal.
     pub free_after_refusal: RefCell<Vec<Permit>>,
+    /// How a wait in the line for a slot ends (`await_permit`), where
+    /// the catalogue keeps one: a slot comes after [`LINE_MS`]
+    /// (`line_frees` are given back then), or the time runs out.
+    /// `None`: no line is kept.
+    pub line: Cell<Option<SlotWait>>,
+    /// Permits another holder gives back to the job that waits in the
+    /// line.
+    pub line_frees: RefCell<Vec<Permit>>,
+    /// When set, the next grant takes and pockets a real fake-catalogue slot.
+    line_grant_clock: RefCell<Option<FixedClock>>,
+    line_pocket: RefCell<Option<(String, Permit)>>,
+    /// Each wait in the line: the holder, its providers and the time
+    /// it had.
+    pub line_waits: RefCell<Vec<(String, Vec<String>, i64)>>,
+    /// The hard limit of the last wait in the line.
+    pub line_hard_ms: Cell<i64>,
+    /// How long the gate's restart extends the fake line's wait to.
+    pub line_restart_ms: Cell<i64>,
+    /// The holders whose jobs said they stopped (`leave_line`).
+    pub line_left: RefCell<Vec<String>>,
     /// Each slot request waits for the runtime once before it is
     /// answered, as a catalogue round trip does, so that requests made
     /// together are seen in flight together (`acquire_peak`).
@@ -452,6 +475,14 @@ impl MemCatalog {
                 verifications: Vec::new(),
             },
         );
+    }
+
+    fn free_slot(&self, p: &Permit) {
+        let mut slots = self.slots.borrow_mut();
+        let slot = &mut slots.get_mut(&slot_key(p)).expect("seeded")[p.slot as usize];
+        if slot.token == p.token {
+            slot.until = 0;
+        }
     }
 
     pub fn outbox(&self, extent: &ExtentId) -> OutboxRow {
@@ -1335,12 +1366,67 @@ impl Catalog for MemCatalog {
     }
 
     async fn release_permit(&self, p: &Permit) -> Result<()> {
-        let mut slots = self.slots.borrow_mut();
-        let slot = &mut slots.get_mut(&slot_key(p)).expect("seeded")[p.slot as usize];
-        if slot.token == p.token {
-            slot.until = 0;
-        }
+        self.free_slot(p);
         Ok(())
+    }
+
+    async fn await_permit(
+        &self,
+        providers: &[&ProviderConfig],
+        holder: &str,
+        window: SlotWaitWindow,
+        sleep: &velmora_bridge::ingress::Sleeper,
+    ) -> Result<SlotWait> {
+        let ms = window.normal_ms;
+        let Some(end) = self.line.get() else {
+            return Ok(SlotWait::Unsupported);
+        };
+        let ids = providers.iter().map(|p| p.id.clone()).collect();
+        self.line_hard_ms.set(window.hard_ms);
+        self.line_waits
+            .borrow_mut()
+            .push((holder.to_string(), ids, ms));
+        match end {
+            SlotWait::Granted if ms < i64::from(LINE_MS) => {
+                sleep(u32::try_from(ms).expect("a wait in ms")).await;
+                return Ok(SlotWait::Elapsed);
+            }
+            SlotWait::Granted => {
+                let clock = self.line_grant_clock.borrow_mut().take();
+                if clock.is_none() {
+                    sleep(LINE_MS).await;
+                }
+                let freed: Vec<Permit> = self.line_frees.borrow_mut().drain(..).collect();
+                for permit in freed {
+                    self.release_permit(&permit).await?;
+                }
+                if let Some(clock) = clock {
+                    let permit = self
+                        .acquire_permit(providers[0], PermitClass::Background, holder, clock.now())
+                        .await?
+                        .expect("the first provider has just freed a slot");
+                    self.line_pocket.replace(Some((holder.to_string(), permit)));
+                    self.line.set(Some(SlotWait::Elapsed));
+                    // The slot is held while the grant travels to the job.
+                    sleep(LINE_MS).await;
+                }
+            }
+            SlotWait::Elapsed => {
+                let elapsed = ms.max(self.line_restart_ms.get()).min(window.hard_ms);
+                sleep(u32::try_from(elapsed).expect("a wait in ms")).await;
+            }
+            SlotWait::Unsupported => {}
+        }
+        Ok(end)
+    }
+
+    fn leave_line(&self, holder: &str) {
+        self.line_left.borrow_mut().push(holder.to_string());
+        let mut pocket = self.line_pocket.borrow_mut();
+        if pocket.as_ref().is_some_and(|(owner, _)| owner == holder) {
+            let (_, permit) = pocket.take().unwrap();
+            self.free_slot(&permit);
+        }
     }
 
     // Not used by the post, verify, release or cold-read paths.
@@ -1983,6 +2069,25 @@ impl Rig {
         self.bridge.budget = ByteBudget::new(48 * 1024 * 1024).with_sleeper(Rc::new(move |ms| {
             clock.advance_ms(i64::from(ms));
             Box::pin(async {})
+        }));
+    }
+
+    /// The first wait pockets a slot; the second stays pending so the
+    /// test can inspect the slots before the job's stage cleanup.
+    pub fn with_pocketed_grant(&mut self, released: Vec<Permit>) {
+        let clock = self.bridge.clock.clone();
+        let catalog = &self.bridge.catalog;
+        catalog.line.set(Some(SlotWait::Granted));
+        catalog.line_frees.borrow_mut().extend(released);
+        catalog.line_grant_clock.replace(Some(clock.clone()));
+        let first = Cell::new(true);
+        self.bridge.budget = ByteBudget::new(48 * 1024 * 1024).with_sleeper(Rc::new(move |ms| {
+            if first.replace(false) {
+                clock.advance_ms(i64::from(ms));
+                Box::pin(core::future::ready(()))
+            } else {
+                Box::pin(core::future::pending())
+            }
         }));
     }
 

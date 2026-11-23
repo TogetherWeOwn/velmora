@@ -700,8 +700,8 @@ async fn a_job_without_a_slot_does_not_load_the_extent() {
 /// The same with a timer on the host: the job waits under its claim.
 /// The slots free when their permits expire, half a permit lifetime
 /// after the claim; the job then loads the extent and posts it, in the
-/// run that claimed it. Slots that stay taken put it off after one
-/// permit lifetime, with no attempt spent and nothing loaded.
+/// run that claimed it. Slots that stay taken put it off after the
+/// claim's slot-wait window, with no attempt spent and nothing loaded.
 #[tokio::test]
 async fn a_job_without_a_slot_waits_for_one_under_its_claim() {
     let mut rig = rig(&[spec("bb0", 5), spec("bb1", 5)]).await;
@@ -840,6 +840,200 @@ async fn a_cooldown_that_begins_during_the_wait_puts_the_job_off() {
     assert_eq!(rig.bridge.safety.gets(), reads);
     let row = rig.bridge.catalog.outbox(&s.extent);
     assert_eq!((row.attempts, row.next_at), (0, until));
+}
+
+#[tokio::test]
+async fn a_grant_for_a_cooling_poster_is_returned_before_waiting_again() {
+    let mut rig = rig(&[spec("bb0", 2), spec("bb1", 2)]).await;
+    rig.bridge.cfg.providers[1].priority = 1;
+    let s = rig.seed(1, b"a job waiting to post").await;
+    let now = rig.bridge.clock.now();
+    let released = rig.take_slots(0, now.plus_secs(30)).await;
+    rig.take_slots(1, now.plus_secs(30)).await;
+    rig.with_pocketed_grant(released);
+    let catalog = &rig.bridge.catalog;
+    catalog.cool_from("p0", now.plus_ms(1), now.plus_secs(600));
+
+    let mut posting = Box::pin(rig.run_post(&s));
+    let mut cx = core::task::Context::from_waker(futures_util::task::noop_waker_ref());
+    assert!(std::future::Future::poll(posting.as_mut(), &mut cx).is_pending());
+    {
+        let waits = catalog.line_waits.borrow();
+        assert_eq!(waits.len(), 2);
+        assert_eq!(waits[0].1, ["p0"]);
+        assert_eq!(waits[1].1, ["p1"]);
+    }
+    let load = catalog.provider_load(rig.bridge.clock.now()).await.unwrap();
+    assert_eq!(load[0].held, 0, "cooling poster still holds a slot");
+    assert_eq!(load[1].held, 1);
+}
+
+/// Where the slots have a line the job stands in it and does not ask
+/// while it waits: it is refused once, waits for the first tier only
+/// and for what is left of the slot-wait window from its claim. It
+/// asks again when a slot is its own and posts in the run that claimed
+/// it.
+#[tokio::test]
+async fn a_job_in_the_line_asks_again_when_a_slot_is_its_own() {
+    let mut rig = rig(&[spec("bb0", 5), spec("bb1", 5)]).await;
+    rig.bridge.cfg.providers[1].priority = 1;
+    rig.with_timer();
+    let s = rig.seed(1, &marked_plaintext(PLAIN_LEN)).await;
+    let now = rig.bridge.clock.now();
+    // Held past the end of the wait: only the line frees them.
+    let held = rig.take_slots(0, now.plus_secs(30)).await;
+    let catalog = &rig.bridge.catalog;
+    catalog.line.set(Some(SlotWait::Granted));
+    catalog.line_frees.borrow_mut().extend(held);
+    let refused = catalog.permit_refusals.get();
+
+    assert_eq!(rig.run_post(&s).await, JobOutcome::Ack);
+
+    let catalog = &rig.bridge.catalog;
+    let waits = catalog.line_waits.borrow().clone();
+    assert_eq!(waits.len(), 1, "{waits:?}");
+    let (holder, providers, ms) = &waits[0];
+    assert!(
+        holder.starts_with("job:") && holder.contains(":post:"),
+        "{holder}"
+    );
+    assert_eq!(providers, &["p0".to_string()], "the first tier only");
+    assert!(
+        (jobs::SLOT_WAIT_MS - 1_000..=jobs::SLOT_WAIT_MS).contains(ms),
+        "{ms}"
+    );
+    let claim_age = jobs::SLOT_WAIT_MS - ms;
+    assert_eq!(
+        catalog.line_hard_ms.get() + claim_age,
+        i64::from(LEASE_SECS) * 1000 - 393_000,
+        "the hard limit leaves the stage time to run under its claim"
+    );
+    // One refusal for each socket it asked for, in the one round
+    // before the wait: nothing was asked while it waited.
+    let asked = catalog.permit_refusals.get() - refused;
+    assert!(
+        (1..=rig.bridge.cfg.post_sockets).contains(&asked),
+        "{asked}"
+    );
+    let waited = rig.bridge.clock.now().0 - now.0;
+    assert!(waited < i64::from(LINE_MS) + 1_000, "{waited}");
+    assert!(all_posted_by(&rig.plan(&s).await, "p0"));
+    assert_eq!(rig.servers[1].posted_count().await, 0);
+    assert_eq!(rig.bridge.nntp.live(), 0);
+}
+
+/// The line is for the providers the job asked. One that was cooling
+/// then is not among them, so the job leaves the line when its cooldown
+/// ends and asks with the pool as it is then: it posts there in the
+/// run that claimed it, and does not stand out its time behind the
+/// taken slots of the other.
+#[tokio::test]
+async fn a_job_in_the_line_asks_again_when_a_cooldown_ends() {
+    let mut rig = rig(&[spec("bb0", 5), spec("bb1", 5)]).await;
+    rig.with_timer();
+    let s = rig.seed(1, &marked_plaintext(PLAIN_LEN)).await;
+    let now = rig.bridge.clock.now();
+    rig.bridge.catalog.cool_from("p0", now, now.plus_secs(10));
+    // Held past the end of the wait, and the line never frees them.
+    rig.take_slots(1, now.plus_secs(30)).await;
+    rig.bridge.catalog.line.set(Some(SlotWait::Elapsed));
+
+    assert_eq!(rig.run_post(&s).await, JobOutcome::Ack);
+
+    let waits = rig.bridge.catalog.line_waits.borrow().clone();
+    assert_eq!(waits.len(), 1, "{waits:?}");
+    let (_, providers, ms) = &waits[0];
+    assert_eq!(providers, &["p1".to_string()], "the one that was asked");
+    assert!((9_000..=10_000).contains(ms), "{ms}");
+    assert_eq!(rig.bridge.catalog.line_hard_ms.get(), *ms);
+    let waited = rig.bridge.clock.now().0 - now.0;
+    assert!((9_000..12_000).contains(&waited), "{waited}");
+    assert!(all_posted_by(&rig.plan(&s).await, "p0"));
+    assert_eq!(rig.servers[1].posted_count().await, 0);
+    assert_eq!(rig.bridge.nntp.live(), 0);
+}
+
+#[tokio::test]
+async fn a_job_refreshes_its_providers_when_cooldown_cuts_short_a_restart_wait() {
+    let mut rig = rig(&[spec("bb0", 5), spec("bb1", 5)]).await;
+    rig.with_timer();
+    let s = rig.seed(1, &[7; 1000]).await;
+    let now = rig.bridge.clock.now();
+    let back = 140_000;
+    let catalog = &rig.bridge.catalog;
+    catalog.cool_from("p0", now, now.plus_ms(back));
+    rig.take_slots(1, now.plus_secs(40)).await;
+    catalog.line.set(Some(SlotWait::Elapsed));
+    catalog.line_restart_ms.set(155_000);
+
+    assert_eq!(rig.run_post(&s).await, JobOutcome::Ack);
+    assert_eq!(catalog.line_waits.borrow().len(), 1);
+    assert_eq!(catalog.line_hard_ms.get(), back);
+    assert!(all_posted_by(&rig.plan(&s).await, "p0"));
+    assert_eq!(rig.servers[1].posted_count().await, 0);
+}
+
+#[tokio::test]
+async fn a_backup_leaving_cooldown_does_not_end_the_first_tiers_wait() {
+    let mut rig = rig(&[spec("bb0", 5), spec("bb1", 5)]).await;
+    rig.bridge.cfg.providers[1].priority = 1;
+    rig.with_timer();
+    let s = rig.seed(1, &marked_plaintext(PLAIN_LEN)).await;
+    let now = rig.bridge.clock.now();
+    rig.bridge.catalog.cool_from("p1", now, now.plus_secs(4));
+    let held = rig.take_slots(0, now.plus_secs(30)).await;
+    let catalog = &rig.bridge.catalog;
+    catalog.line.set(Some(SlotWait::Granted));
+    catalog.line_frees.borrow_mut().extend(held);
+
+    assert_eq!(rig.run_post(&s).await, JobOutcome::Ack);
+
+    {
+        let waits = catalog.line_waits.borrow();
+        assert_eq!(waits.len(), 1, "the backup must not cut the stand short");
+        assert_eq!(waits[0].1, ["p0"]);
+    }
+    assert_eq!(rig.bridge.clock.now().0 - now.0, i64::from(LINE_MS));
+    assert!(all_posted_by(&rig.plan(&s).await, "p0"));
+}
+
+/// The line did not come to the job in the time it had: it is put off
+/// as a job that polled in vain is, without having asked again, with
+/// no attempt spent and nothing loaded.
+#[tokio::test]
+async fn a_job_whose_time_in_the_line_ran_out_is_put_off() {
+    let mut rig = rig(&[spec("bb0", 5), spec("bb1", 5)]).await;
+    rig.bridge.cfg.providers[1].priority = 1;
+    rig.with_timer();
+    let s = rig.seed(1, &marked_plaintext(PLAIN_LEN)).await;
+    let now = rig.bridge.clock.now();
+    rig.take_slots(0, now.plus_secs(30)).await;
+    rig.bridge.catalog.line.set(Some(SlotWait::Elapsed));
+    let refused = rig.bridge.catalog.permit_refusals.get();
+    let reads = rig.bridge.safety.gets();
+
+    assert!(matches!(rig.run_post(&s).await, JobOutcome::Retry { .. }));
+
+    let catalog = &rig.bridge.catalog;
+    assert_eq!(catalog.line_waits.borrow().len(), 1);
+    // The job says that it stopped, under the name it waited with: a
+    // slot on its way to it is not kept.
+    let waited_as = catalog.line_waits.borrow()[0].0.clone();
+    assert_eq!(*catalog.line_left.borrow(), [waited_as]);
+    let asked = catalog.permit_refusals.get() - refused;
+    assert!(
+        (1..=rig.bridge.cfg.post_sockets).contains(&asked),
+        "{asked}"
+    );
+    let waited = rig.bridge.clock.now().0 - now.0;
+    assert!(
+        (jobs::SLOT_WAIT_MS - 1_000..=jobs::SLOT_WAIT_MS).contains(&waited),
+        "{waited}"
+    );
+    assert_eq!(rig.bridge.safety.gets(), reads);
+    assert!(rig.plan(&s).await.is_empty());
+    assert_eq!(catalog.outbox(&s.extent).attempts, 0);
+    assert_eq!(rig.servers[1].posted_count().await, 0);
 }
 
 /// Two sockets. While one has a POST in flight, the permits are taken

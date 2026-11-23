@@ -1908,9 +1908,150 @@ async fn a_job_waits_under_its_claim_for_a_slot_that_comes_free() {
     assert_eq!(rig.bridge.nntp.live(), 0);
 }
 
+/// Where the slots have a line the job stands in it for the backbone
+/// that had no slot: it asks nothing while it waits, and goes on in
+/// the same run when a slot there is its own.
+#[tokio::test]
+async fn a_job_in_the_line_goes_on_when_a_slot_is_its_own() {
+    let mut rig = two_backbone_rig().await;
+    rig.with_timer();
+    let (s, _) = rig.posted(50).await;
+    rig.propagate(&s, 0, 1).await;
+    let now = rig.bridge.clock.now();
+    let held = rig.take_slots(1, now.plus_secs(30)).await;
+    let catalog = &rig.bridge.catalog;
+    catalog.line.set(Some(SlotWait::Granted));
+    catalog.line_frees.borrow_mut().extend(held);
+    let refused = catalog.permit_refusals.get();
+
+    assert_eq!(rig.run(&s, OutboxStage::Verify).await, JobOutcome::Ack);
+
+    let catalog = &rig.bridge.catalog;
+    let waits = catalog.line_waits.borrow().clone();
+    assert_eq!(waits.len(), 1, "{waits:?}");
+    let (holder, providers, ms) = &waits[0];
+    assert!(holder.contains(":verify:"), "{holder}");
+    assert_eq!(
+        providers,
+        &["p1".to_string()],
+        "the backbone without a slot"
+    );
+    assert!((1..=jobs::SLOT_WAIT_MS).contains(ms), "{ms}");
+    assert_eq!(catalog.permit_refusals.get() - refused, 1, "asked once");
+    let waited = rig.bridge.clock.now().0 - now.0;
+    assert!(waited < i64::from(LINE_MS) + 2_000, "{waited}");
+    assert_eq!(
+        checks(&rig, &s),
+        [ok("bb0", VerifyKind::Body), ok("bb1", VerifyKind::Stat)]
+    );
+    assert_eq!(rig.bridge.nntp.live(), 0);
+}
+
+#[tokio::test]
+async fn a_provider_whose_retention_ends_during_the_wait_is_not_asked_again() {
+    let mut rig = shared_backbone_rig().await;
+    rig.bridge.cfg.required_backbones = 1;
+    rig.bridge.cfg.providers[0].retention_days = Some(1);
+    rig.bridge.cfg.providers[1].retention_days = Some(2);
+    rig.bridge.cfg.providers[1].priority = 1;
+    rig.with_timer();
+    let (s, plan) = rig.posted(52).await;
+    rig.propagate(&s, 0, 1).await;
+    let oldest = plan.iter().filter_map(|row| row.posted_at).min().unwrap();
+    let clock = &rig.bridge.clock;
+    let until = oldest.plus_secs(86_400);
+    clock.advance_secs(u32::try_from((until.0 - clock.now().0) / 1_000 - 4).unwrap());
+    let now = clock.now();
+    let catalog = &rig.bridge.catalog;
+    catalog.line.set(Some(SlotWait::Granted));
+    for index in 0..2 {
+        let held = rig.take_slots(index, now.plus_secs(30)).await;
+        catalog.line_frees.borrow_mut().extend(held);
+    }
+    let p0_connects = rig.bridge.nntp.connects_to("p0");
+
+    assert_eq!(rig.run(&s, OutboxStage::Verify).await, JobOutcome::Ack);
+
+    let waits = catalog.line_waits.borrow();
+    assert_eq!(waits.len(), 1);
+    assert_eq!(waits[0].1, ["p0", "p1"], "both retained before the wait");
+    assert_eq!(rig.bridge.nntp.connects_to("p0"), p0_connects);
+    let rows = rig.rows(&s);
+    assert_eq!(rows[0].provider_id, "p1");
+    assert_eq!(rows[0].result, VerifyResult::Ok);
+}
+
+#[tokio::test]
+async fn a_grant_for_a_provider_past_retention_is_returned_before_waiting_again() {
+    let mut rig = shared_backbone_rig().await;
+    rig.bridge.cfg.required_backbones = 1;
+    rig.bridge.cfg.providers[0].retention_days = Some(1);
+    rig.bridge.cfg.providers[1].retention_days = Some(2);
+    rig.bridge.cfg.providers[1].priority = 1;
+    let (s, plan) = rig.posted(53).await;
+    let oldest = plan.iter().filter_map(|row| row.posted_at).min().unwrap();
+    let clock = &rig.bridge.clock;
+    let until = oldest.plus_secs(86_400);
+    clock.advance_secs(u32::try_from((until.0 - clock.now().0) / 1_000 - 4).unwrap());
+    let now = clock.now();
+    let released = rig.take_slots(0, now.plus_secs(30)).await;
+    let busy = rig.take_slots(1, now.plus_secs(30)).await.len();
+    rig.with_pocketed_grant(released);
+    let catalog = &rig.bridge.catalog;
+
+    let mut verifying = Box::pin(rig.run(&s, OutboxStage::Verify));
+    let mut cx = core::task::Context::from_waker(futures_util::task::noop_waker_ref());
+    assert!(std::future::Future::poll(verifying.as_mut(), &mut cx).is_pending());
+    {
+        let waits = catalog.line_waits.borrow();
+        assert_eq!(waits.len(), 2);
+        assert_eq!(waits[0].1, ["p0", "p1"]);
+        assert_eq!(waits[1].1, ["p1"]);
+    }
+    let load = catalog.provider_load(rig.bridge.clock.now()).await.unwrap();
+    assert_eq!(
+        load[0].held, 0,
+        "expired-retention provider still holds a slot"
+    );
+    assert_eq!(load[1].held as usize, busy);
+}
+
+/// The line did not come to the job in the time it had: it is put off
+/// without having asked again and without an attempt.
+#[tokio::test]
+async fn a_job_whose_time_in_the_line_ran_out_is_put_off_without_an_attempt() {
+    let mut rig = two_backbone_rig().await;
+    rig.with_timer();
+    let (s, _) = rig.posted(51).await;
+    rig.propagate(&s, 0, 1).await;
+    let now = rig.bridge.clock.now();
+    rig.take_slots(1, now.plus_secs(30)).await;
+    rig.bridge.catalog.line.set(Some(SlotWait::Elapsed));
+    let refused = rig.bridge.catalog.permit_refusals.get();
+    let attempts = rig.outbox(&s).attempts;
+
+    let delay = retry_delay(&rig.run(&s, OutboxStage::Verify).await);
+
+    assert!((15..=60).contains(&delay), "delay {delay}");
+    let catalog = &rig.bridge.catalog;
+    assert_eq!(catalog.line_waits.borrow().len(), 1);
+    // The job says that it stopped, under the name it waited with: a
+    // slot on its way to it is not kept.
+    let waited_as = catalog.line_waits.borrow()[0].0.clone();
+    assert_eq!(catalog.line_left.borrow().last(), Some(&waited_as));
+    assert_eq!(catalog.permit_refusals.get() - refused, 1, "asked once");
+    let waited = rig.bridge.clock.now().0 - now.0;
+    assert!(
+        (jobs::SLOT_WAIT_MS - 2_000..=jobs::SLOT_WAIT_MS).contains(&waited),
+        "{waited}"
+    );
+    assert_eq!(checks(&rig, &s), [ok("bb0", VerifyKind::Body)]);
+    assert_eq!(rig.outbox(&s).attempts, attempts);
+}
+
 /// The slots stay taken (their holder is at work and renews them): the
-/// job waits one permit lifetime from its claim and no longer, then is
-/// put off as a job without a timer is at once. The row's attempts are
+/// job waits out the slot-wait window from its claim, then is put off
+/// as a job without a timer is at once. The row's attempts are
 /// what they were before the claim, and the row says where the job got
 /// to.
 #[tokio::test]

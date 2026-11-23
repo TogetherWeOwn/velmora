@@ -584,7 +584,11 @@ where
     /// Runs the post stage for a claimed extent: plan, POST every planned
     /// article, then hand over to the verify stage.
     pub async fn post_stage(&self, lease: &Lease, job: &JobExtent) -> JobOutcome {
-        match self.post_extent(lease, job).await {
+        let done = self.post_extent(lease, job).await;
+        // A slot that came to the job while it waited and that it did
+        // not take: it stopped first.
+        self.catalog.leave_line(&job_holder(lease));
+        match done {
             Ok(()) => JobOutcome::Ack,
             Err(stop) => settle(&self.catalog, &self.clock, lease, stop).await,
         }
@@ -648,7 +652,6 @@ where
                     None => Stop::fail(FailClass::Internal),
                 });
             };
-            let tier = first_tier.len();
             let held = match self
                 .open_sessions(first_tier, &holder, todo, &probing)
                 .await
@@ -656,7 +659,24 @@ where
                 Err(_) if waited => return Err(Stop::NoPermit),
                 opened => opened?.0,
             };
-            if !held.is_empty() || !self.slot_wait(lease, tier).await {
+            if !held.is_empty() {
+                break (cooling, probing, order, held);
+            }
+            // Only a poster in this tier or a preferred one can change
+            // the next ask. Keep the full cooldown for stage settlement.
+            let relevant: Vec<_> = self
+                .cfg
+                .providers
+                .iter()
+                .filter(|p| p.post && p.priority <= first_tier[0].priority)
+                .collect();
+            let back = pool.cooling_until(&relevant);
+            // The first tier can change while a grant is on its way.
+            // None of the refreshed tier's providers yielded a session.
+            if waited {
+                self.catalog.leave_line(&holder);
+            }
+            if !self.slot_wait(lease, first_tier, back).await {
                 break (cooling, probing, order, held);
             }
             waited = true;
