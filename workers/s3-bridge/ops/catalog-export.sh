@@ -41,20 +41,32 @@ readonly D1_PAID_MAX_DB_BYTES=10000000000
 
 # Keep export mode, format, and scope under this script's control. Wrangler
 # accepts alternate boolean spellings (e.g. --data=0), so fail closed.
-needs_value=
-for arg in "$@"; do
-  if [[ -n $needs_value ]]; then
-    [[ -n $arg && $arg != -* ]] || catalog_error "$needs_value requires a value"
-    needs_value=
-    continue
-  fi
+wrangler_args=()
+while (( $# )); do
+  arg=$1
+  shift
   case "$arg" in
-    --config|-c|--cwd|--env|-e|--env-file|--profile) needs_value=$arg ;;
-    --config=?*|-c=?*|--cwd=?*|--env=?*|-e=?*|--env-file=?*|--profile=?*) ;;
+    --env-file|--env-file=?*)
+      if [[ $arg == *=* ]]; then
+        wrangler_args+=("$arg")
+      else
+        [[ -n ${1-} && $1 != -* ]] || catalog_error '--env-file requires a value'
+      fi
+      # Pass array elements explicitly and leave the next flag for validation.
+      while [[ -n ${1-} && $1 != -* ]]; do
+        wrangler_args+=("--env-file=$1")
+        shift
+      done ;;
+    -c/*) wrangler_args+=("--config=${arg:2}") ;;
+    --config|-c|--cwd|--env|-e|--profile)
+      [[ -n ${1-} && $1 != -* ]] || catalog_error "$arg requires a value"
+      wrangler_args+=("$arg" "$1")
+      shift ;;
+    --config=?*|-c=?*|--cwd=?*|--env=?*|-e=?*|--profile=?*) wrangler_args+=("$arg") ;;
     *) catalog_error 'catalogue backups must include schema and data for every table from remote D1; only Wrangler configuration options are allowed' ;;
   esac
 done
-[[ -z $needs_value ]] || catalog_error "$needs_value requires a value"
+set -- "${wrangler_args[@]}"
 
 for tool in zstd jq split sha256sum python3 od flock; do
   command -v "$tool" >/dev/null || { echo "catalog-export: missing tool: $tool" >&2; exit 1; }

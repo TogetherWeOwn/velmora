@@ -291,17 +291,17 @@ class CatalogueScripts(unittest.TestCase):
             "VELMORA_IMPORT_DATABASE_ID": DATABASE_ID,
         }
 
-    def call_script(self, action, *args, **overrides):
+    def call_script(self, action, *args, wrangler_args=ARGS, **overrides):
         return subprocess.run(
-            [str(self.root / "ops" / f"catalog-{action}.sh"), *args, *ARGS],
+            [str(self.root / "ops" / f"catalog-{action}.sh"), *args, *wrangler_args],
             cwd=self.root, env={**self.env, **overrides}, text=True, input="unexpected stdin\n",
             capture_output=True, timeout=40,
         )
 
-    def run_script(self, action, *args):
+    def run_script(self, action, *args, wrangler_args=ARGS):
         work = Path(self.env["TMPDIR"])
         preexisting_logs = set(work.glob("velmora-catalog-*-logs.*"))
-        result = self.call_script(action, *args)
+        result = self.call_script(action, *args, wrangler_args=wrangler_args)
         if result.returncode == 0:
             self.assertEqual(set(work.glob("velmora-catalog-*-logs.*")), preexisting_logs)
         for pattern in ("velmora-export.*", "velmora-import.*"):
@@ -635,10 +635,24 @@ class CatalogueScripts(unittest.TestCase):
                 self.assertIn("catalogue backups must include schema and data", result.stderr)
                 self.assertEqual(self.calls(), [])
 
+    def test_export_forwards_each_env_file_in_order(self):
+        result = self.run_script("export", wrangler_args=["--env-file", "base.env", "override.env"])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(self.calls())
+        self.assertTrue(all(call[-2:] == ["--env-file=base.env", "--env-file=override.env"]
+                            for call in self.calls()), self.calls())
+
+    def test_export_forwards_attached_absolute_config_path(self):
+        result = self.run_script("export", wrangler_args=["-c/fixture/wrangler.toml"])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(self.calls())
+        self.assertTrue(all(call[-1] == "--config=/fixture/wrangler.toml" for call in self.calls()), self.calls())
+
     def test_rclone_export_refuses_wrangler_mode_and_dump_overrides(self):
         self.env["VELMORA_EXPORT_RCLONE_REMOTE"] = "r2x"
         for i, flags in enumerate((["--data=0"], ["--schema=0"], ["--remote=false"], ["--local"],
-                                   ["--compatibility", "sqlite3_cli_only"])):
+                                   ["--compatibility", "sqlite3_cli_only"],
+                                   ["--env-file", "base.env", "override.env", "--remote=false"])):
             with self.subTest(flags=flags):
                 self.env["FAKE_DATE"] = str(int(MS) + i)
                 result = self.run_script("export", *flags)
