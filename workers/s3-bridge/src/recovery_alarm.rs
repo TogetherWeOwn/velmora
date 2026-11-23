@@ -12,8 +12,8 @@ const RETENTION_MS: i64 = 7 * 24 * 60 * 60 * 1000;
 const INSERT: &str = "INSERT OR IGNORE INTO recovery_pass_job (
     pass_id, job_seq, cursor_tag, next_tag, copied, failed, pending, source_unreadable,
     refused_put, put_status, put_code, refused_verify, verify_status, verify_code,
-    refused_plan, plan_status, plan_code, unsignable, final, at
-) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)";
+    refused_plan, plan_status, plan_code, unsignable, skipped_sweep, final, at
+) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)";
 
 // At most 256 new rows per pass, so this can drain steady-state expiry
 // faster than it grows. Keep just the latest verified copy beyond the
@@ -71,6 +71,7 @@ pub async fn record(
         status(counts.refused_plan.status),
         text(counts.refused_plan.code),
         int(counts.unsignable.count),
+        SqlValue::Int(progress.skipped_sweep.into()),
         SqlValue::Int(progress.next.is_none().into()),
         SqlValue::Int(at.0),
     ];

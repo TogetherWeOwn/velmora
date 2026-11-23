@@ -45,14 +45,14 @@ function env(over = {}) {
 }
 
 function recoveryJob(e, pass, { seq = 0, final = 1, refused = 0, copied = 0, failed = 0,
-  at = pass, cursor = `cursor-${seq}` } = {}) {
+  at = pass, cursor = `cursor-${seq}`, skipped = 0 } = {}) {
   e.CATALOG.db.prepare(
     `INSERT OR IGNORE INTO recovery_pass_job
       (pass_id, job_seq, cursor_tag, next_tag, copied, failed, pending, source_unreadable,
-       refused_put, put_status, put_code, refused_verify, refused_plan, unsignable, final, at)
-     VALUES (?, ?, ?, ?, ?, ?, 7, 11, ?, ?, ?, 0, 0, 0, ?, ?)`,
+       refused_put, put_status, put_code, refused_verify, refused_plan, unsignable, skipped_sweep, final, at)
+     VALUES (?, ?, ?, ?, ?, ?, 7, 11, ?, ?, ?, 0, 0, 0, ?, ?, ?)`,
   ).run(pass, seq, cursor, final ? null : `cursor-${seq + 1}`, copied, failed,
-    refused, refused ? 403 : null, refused ? "AccessDenied" : null, final, at);
+    refused, refused ? 403 : null, refused ? "AccessDenied" : null, skipped, final, at);
 }
 
 const REFUSED = "recovery-copy-refused";
@@ -121,6 +121,20 @@ test("a failed pass is not reported as a recovery", async () => {
   recoveryJob(e, T0 + INTERVAL, { failed: 2 });
   await tick(e, T0 + INTERVAL);
   assert.equal(e.ALERT_EMAIL.sent.length, 1);
+});
+
+test("a skipped sweep updates verified age without recovering or completing its pass", async () => {
+  const e = env();
+  recoveryJob(e, T0 - INTERVAL, { refused: 1 });
+  recoveryJob(e, T0, { refused: 1 });
+  await tick(e, T0);
+  recoveryJob(e, T0 + INTERVAL, { copied: 1, skipped: 1 });
+  await tick(e, T0 + INTERVAL);
+  assert.equal(e.ALERT_EMAIL.sent.length, 1, "a partial pass cannot clear the incident");
+  recoveryJob(e, T0 + 2 * INTERVAL);
+  await tick(e, T0 + 2 * INTERVAL);
+  assert.match(e.ALERT_EMAIL.sent[1].subject, /recovery copy.*recovered/i);
+  assert.match(e.ALERT_EMAIL.sent[1].text, /last verified copy: 15 min ago/i);
 });
 
 test("an old verified timestamp does not revive a pruned refusal pass", async () => {

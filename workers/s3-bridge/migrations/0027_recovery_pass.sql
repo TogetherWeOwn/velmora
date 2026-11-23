@@ -19,6 +19,7 @@ CREATE TABLE recovery_pass_job (
     plan_status       INTEGER,
     plan_code         TEXT,
     unsignable        INTEGER NOT NULL,
+    skipped_sweep     INTEGER NOT NULL CHECK (skipped_sweep IN (0, 1)),
     final             INTEGER NOT NULL CHECK (final IN (0, 1)),
     at                INTEGER NOT NULL,
     PRIMARY KEY (pass_id, job_seq)

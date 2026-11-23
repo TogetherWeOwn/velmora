@@ -1450,17 +1450,21 @@ async fn pass_resumes_from_cursor_after_job_death() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn a_pass_that_skipped_the_fresh_sweep_is_not_complete() {
+async fn walk_verification_after_skipped_sweep_is_retained_without_completion() {
     let w = World::new();
+    w.record("m/art/x_1", b"a plan encountered in the walk")
+        .await;
     w.clock.set(UnixMs(NOW + SWEEP_MS + 1));
-    let (outcome, _, why, progress) = w
+    let (outcome, counts, why, progress) = w
         .copier()
         .run_job_with_sequence(&w.jobs, UnixMs(NOW), "", Some(0))
         .await;
     assert_eq!((outcome, why), (JobOutcome::Ack, Some(StepError::Expired)));
+    assert_eq!(counts.unwrap().copied, 1);
     assert!(
-        progress.is_none(),
-        "missing a sweep must not look like a clean pass"
+        progress
+            .expect("a skipped sweep must not hide a verified copy")
+            .skipped_sweep
     );
 }
 
