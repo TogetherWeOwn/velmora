@@ -34,6 +34,7 @@ export function readingOf(key) {
   if (key === "outbox-dead") return "dead rows";
   if (key.startsWith("provider-cooldown:")) return "provider health";
   if (key === "catalog-export-stale") return "export list";
+  if (key.startsWith("recovery-copy-")) return "recovery copy";
   return null;
 }
 

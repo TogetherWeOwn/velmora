@@ -22,6 +22,7 @@ mod metrics;
 mod nntp;
 mod queues;
 mod r2;
+mod recovery_alarm;
 
 use std::cell::RefCell;
 use std::future::poll_fn;
@@ -296,9 +297,14 @@ async fn queue(batch: MessageBatch<serde_json::Value>, env: Env, _ctx: Context) 
         let outcome = match &job {
             // Never through `run_job`, which reads the catalogue. A job
             // of another version is dropped: the next pass does the work.
-            Job::RecoveryCopy { v, pass, cursor } => {
+            Job::RecoveryCopy {
+                v,
+                pass,
+                cursor,
+                sequence,
+            } => {
                 if *v == JOB_VERSION {
-                    recovery_copy(&env, &bridge, *pass, cursor).await
+                    recovery_copy(&env, &bridge, *pass, cursor, *sequence).await
                 } else {
                     console_error!("recovery copy: a job of another version was dropped");
                     JobOutcome::Ack
@@ -408,6 +414,7 @@ async fn recovery_copy(
     bridge: &env::WorkerBridge,
     pass: UnixMs,
     cursor: &str,
+    sequence: Option<u16>,
 ) -> JobOutcome {
     let remote = match env::recovery_store(env) {
         Ok(Some(remote)) => remote,
@@ -421,9 +428,18 @@ async fn recovery_copy(
             return JobOutcome::Ack;
         }
     };
-    let (outcome, counts, why) = copier(bridge, &remote)
-        .run_job(&bridge.jobs, pass, cursor)
+    let sequence = if recovery_alarm::enabled(env, bridge.cfg.environment) {
+        recovery_alarm::sequence_for(pass, cursor, sequence)
+    } else {
+        None
+    };
+    let (outcome, counts, why, progress) = copier(bridge, &remote)
+        .run_job_with_sequence(&bridge.jobs, pass, cursor, sequence)
         .await;
+    if let (Some(seq), Some(counts), Some(progress)) = (sequence, counts.as_ref(), progress) {
+        let now = velmora_bridge::ports::Clock::now(&bridge.clock);
+        recovery_alarm::record(env, pass, seq, cursor, now, counts, progress).await;
+    }
     let retry = matches!(outcome, JobOutcome::Retry { .. });
     // The reason is a class and a status at most. It is logged whether
     // the job is retried or not: past the retry window a job that did
@@ -488,7 +504,7 @@ fn log_post_trace(job: &Job, outcome: &JobOutcome) {
 }
 
 #[event(scheduled)]
-async fn scheduled(event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
+async fn scheduled(event: ScheduledEvent, env: Env, ctx: ScheduleContext) {
     let bridge = match env::bridge(&env) {
         Ok(bridge) => bridge,
         Err(class) => {
@@ -502,12 +518,17 @@ async fn scheduled(event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
     match env::recovery_store(&env) {
         Ok(None) => {}
         Ok(Some(remote)) => {
-            if copier(&bridge, &remote)
-                .start_pass(&bridge.jobs, UnixMs(event.schedule() as i64))
+            let pass = UnixMs(event.schedule() as i64);
+            match copier(&bridge, &remote)
+                .start_pass(&bridge.jobs, pass)
                 .await
-                .is_err()
             {
-                console_error!("recovery copy: the pass was not started");
+                Ok(true) if recovery_alarm::enabled(&env, bridge.cfg.environment) => {
+                    let env = env.clone();
+                    ctx.wait_until(async move { recovery_alarm::prune(&env, pass).await });
+                }
+                Err(_) => console_error!("recovery copy: the pass was not started"),
+                _ => {}
             }
         }
         Err(class) => console_error!("recovery copy: config refused: {class}"),

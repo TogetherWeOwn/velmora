@@ -58,6 +58,7 @@ struct FakeE2 {
     put_500_keys: RefCell<Vec<String>>,
     /// Every PUT answers this status.
     put_status: Cell<Option<u16>>,
+    put_answer: RefCell<Option<HttpResponse>>,
     /// A PUT stores other bytes than it was sent.
     damage_puts: Cell<bool>,
     /// Keys per list answer (0 = as asked).
@@ -311,6 +312,9 @@ impl HttpSend for &FakeE2 {
                     body: vec![],
                 }),
             };
+        }
+        if let Some(forced) = self.put_answer.borrow().as_ref() {
+            return Ok(forced.clone());
         }
         if let Some(status) = self.put_status.get() {
             return answer(status);
@@ -1315,6 +1319,76 @@ async fn head_mismatch_after_put_counts_as_failed() {
     assert!(!counts.clean());
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn refusal_telemetry_distinguishes_put_from_verification_head() {
+    for (field, is_put, code) in [
+        ("refused_put", true, Some("AccessDenied")),
+        ("refused_verify", false, Some("AccessDenied")),
+        ("refused_put", true, None),
+    ] {
+        let w = World::new();
+        w.record("m/art/x_1", b"a plan").await;
+        let mut refusal = HttpResponse {
+            status: 403,
+            headers: vec![],
+            body: vec![],
+        };
+        if is_put {
+            let claimed = code.unwrap_or("PrivateCustomerName");
+            refusal.body =
+                format!("<Error><Code>{claimed}</Code><Message>untrusted</Message></Error>")
+                    .into_bytes();
+            *w.e2.put_answer.borrow_mut() = Some(refusal);
+        } else {
+            refusal
+                .headers
+                .push(("x-amz-error-code".into(), "AccessDenied".into()));
+            *w.e2.head_answer.borrow_mut() = Some(refusal);
+        }
+        let counts = w.copier().step(w.clock.now(), "").await.unwrap().counts;
+        assert_eq!((counts.copied, counts.refused, counts.failed), (0, 1, 0));
+        let report = serde_json::to_value(counts).unwrap();
+        assert_eq!(
+            report[field],
+            serde_json::json!({ "count": 1, "status": 403, "code": code })
+        );
+        assert_eq!(report["refused_plan"]["count"], 0);
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn planning_head_refusal_is_counted_before_put() {
+    let w = World::new();
+    w.record("m/art/x_1", b"a plan").await;
+    *w.e2.head_answer.borrow_mut() = Some(HttpResponse {
+        status: 403,
+        headers: vec![("x-amz-error-code".into(), "AccessDenied".into())],
+        body: vec![],
+    });
+    let hint = plan_hint(
+        &Job::Extent {
+            v: JOB_VERSION,
+            extent: ExtentId::new("x_1"),
+            generation: velmora_bridge::GenerationId::new("g_1"),
+            stage: OutboxStage::Post,
+        },
+        &JobOutcome::Ack,
+        w.clock.now(),
+    )
+    .unwrap();
+    let Job::RecoveryCopy { pass, cursor, .. } = hint else {
+        unreachable!()
+    };
+    let (_, counts, _) = w.copier().run_job(&w.jobs, pass, &cursor).await;
+    assert_eq!(w.e2.puts(), 0);
+    let report = serde_json::to_value(counts.unwrap()).unwrap();
+    assert_eq!(
+        report["refused_plan"],
+        serde_json::json!({ "count": 1, "status": 403, "code": "AccessDenied" })
+    );
+    assert_eq!(report["refused_verify"]["count"], 0);
+}
+
 /// A job stops at its bound and names where the next one goes on; a job
 /// that died is simply run again from the cursor it was sent with.
 #[tokio::test(flavor = "current_thread")]
@@ -1325,7 +1399,10 @@ async fn pass_resumes_from_cursor_after_job_death() {
         w.record(&format!("m/art/x_{i:04}"), b"plan").await;
     }
     w.e2.page.set(100);
-    let (outcome, counts, why) = w.copier().run_job(&w.jobs, UnixMs(NOW), "").await;
+    let (outcome, counts, why, progress) = w
+        .copier()
+        .run_job_with_sequence(&w.jobs, UnixMs(NOW), "", Some(0))
+        .await;
     assert_eq!(why, None);
     assert_eq!(outcome, JobOutcome::Ack);
     assert_eq!(counts.unwrap().copied as usize, JOB_COPIES);
@@ -1334,9 +1411,20 @@ async fn pass_resumes_from_cursor_after_job_death() {
     // The chain: the job sent the next one, with its cursor.
     let sent = w.jobs.take();
     assert_eq!(sent.len(), 1);
-    let Job::RecoveryCopy { pass, cursor, .. } = &sent[0].job else {
+    let Job::RecoveryCopy {
+        pass,
+        cursor,
+        sequence,
+        ..
+    } = &sent[0].job
+    else {
         panic!("{:?}", sent[0].job);
     };
+    assert_eq!(*sequence, Some(1));
+    assert_eq!(
+        progress.unwrap().next,
+        Some(velmora_bridge::copy::cursor_tag(cursor))
+    );
     let last = format!("m/art/x_{:04}", JOB_COPIES - 1);
     assert_eq!((*pass, cursor), (UnixMs(NOW), &walk(&last)));
 
@@ -1344,7 +1432,11 @@ async fn pass_resumes_from_cursor_after_job_death() {
     // finds everything done. The last job of a pass sends none.
     let died = w.copier().step(UnixMs(NOW), cursor).await.unwrap();
     assert_eq!((died.counts.copied, died.next), (30, None));
-    let (outcome, counts, why) = w.copier().run_job(&w.jobs, *pass, cursor).await;
+    let (outcome, counts, why, progress) = w
+        .copier()
+        .run_job_with_sequence(&w.jobs, *pass, cursor, *sequence)
+        .await;
+    assert_eq!(progress.unwrap().next, None);
     assert_eq!(why, None);
     assert_eq!(outcome, JobOutcome::Ack);
     let counts = counts.unwrap();
@@ -1355,6 +1447,30 @@ async fn pass_resumes_from_cursor_after_job_death() {
     // The message survives its queue: it is plain JSON.
     let job = Job::from_json(&sent[0].job.to_json()).unwrap();
     assert_eq!(job, sent[0].job);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn legacy_copy_job_without_sequence_still_copies() {
+    let w = World::new();
+    w.record("m/art/x_1", b"legacy copy").await;
+    let raw = format!(r#"{{"t":"recovery_copy","v":{JOB_VERSION},"pass":{NOW},"cursor":""}}"#);
+    let Job::RecoveryCopy {
+        pass,
+        cursor,
+        sequence,
+        ..
+    } = Job::from_json(&raw).unwrap()
+    else {
+        panic!("not a recovery-copy job");
+    };
+    assert_eq!(sequence, None);
+    let (outcome, counts, why, progress) = w
+        .copier()
+        .run_job_with_sequence(&w.jobs, pass, &cursor, sequence)
+        .await;
+    assert_eq!((outcome, why), (JobOutcome::Ack, None));
+    assert_eq!(counts.unwrap().copied, 1);
+    assert!(progress.is_none());
 }
 
 /// The copier holds no catalogue port at all (see its fields), so no
@@ -3668,12 +3784,18 @@ async fn an_article_plan_written_between_walks_is_over_there_by_its_hint() {
     assert!(w.copier().hint(&w.jobs, &post, &JobOutcome::Ack).await);
     let sent = w.jobs.take();
     assert_eq!((sent.len(), sent[0].delay_secs), (1, 0));
-    let Job::RecoveryCopy { v, pass, cursor } = &sent[0].job else {
+    let Job::RecoveryCopy {
+        v,
+        pass,
+        cursor,
+        sequence,
+    } = &sent[0].job
+    else {
         panic!("another job");
     };
     // Pass 0: a version that knows no hints takes it for a job of a
     // pass that ended long ago, and does nothing.
-    assert_eq!((*v, *pass), (JOB_VERSION, UnixMs(0)));
+    assert_eq!((*v, *pass, *sequence), (JOB_VERSION, UnixMs(0), None));
     assert!(!pass_due(*pass) || w.clock.now().0 - pass.0 >= PASS_INTERVAL_MS);
     let wanted = time_at(&w, WANT_KEY).await;
     let (outcome, counts, why) = w.copier().run_job(&w.jobs, *pass, cursor).await;

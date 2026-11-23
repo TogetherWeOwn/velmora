@@ -545,6 +545,7 @@ mod tests {
                 v: JOB_VERSION,
                 pass: velmora_bridge::UnixMs(1),
                 cursor: String::new(),
+                sequence: Some(0),
             },
         ];
         for remaining in [0, 4096] {

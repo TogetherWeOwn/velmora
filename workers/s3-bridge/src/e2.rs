@@ -23,7 +23,7 @@ use worker::{
 /// Bound of one request, the answer's body included.
 const TIMEOUT: Duration = Duration::from_secs(15);
 /// Answer headers the bridge reads.
-const KEPT: [&str; 2] = ["content-length", "etag"];
+const KEPT: [&str; 3] = ["content-length", "etag", "x-amz-error-code"];
 
 pub struct FetchHttp;
 

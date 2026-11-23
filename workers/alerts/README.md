@@ -6,9 +6,9 @@ and changing it never redeploys the S3 Worker.
 
 ## What it watches
 
-Every 5 minutes it takes a few index-only readings of the S3 Worker's
-catalogue. Each statement reads at most 20 rows (measured), and nothing is
-ever written there. Each condition below emails when it holds:
+Every 5 minutes it takes bounded, indexed readings of the S3 Worker's
+catalogue. The alerts Worker never writes to the catalogue. Each
+condition below emails when it holds:
 
 | Key | Holds when | Emails after |
 |---|---|---|
@@ -19,6 +19,8 @@ ever written there. Each condition below emails when it holds:
 | `outbox-dead` | outbox rows are in stage `dead` | at once |
 | `provider-cooldown:<id>` | a provider is cooling (skipped) | 15 min |
 | `catalog-export-stale` | the newest export manifest in the export bucket is over 26 h old (listed hourly) | at once |
+| `recovery-copy-refused` | both of the last two completed scheduled recovery-copy passes had a remote refusal | at once |
+| `recovery-copy-stale` | no completed recovery-copy pass in more than three 15-minute intervals | at once |
 | `check-error` | a reading failed (its check did not run) | 15 min |
 
 It also takes reports on `POST /v1/alert` (bearer `INGEST_TOKEN`) from:
@@ -60,6 +62,27 @@ operator host's own feeder is private to that host, as are its paths.
   pings it (`<url>/fail` if the run threw or an email could not be sent). If the pings stop, the outside
   monitor emails you.
 
+## Recovery-copy monitoring
+
+Apply the bridge catalogue migrations before updating either Worker.
+Monitoring is on by default. Set `RECOVERY_ALARM=off` on the alerts
+Worker if recovery copy is intentionally off or the bridge is in restore
+maintenance. The same var on the bridge Worker stops telemetry writes;
+turning it off there alone does not disable the stale alert.
+
+A zero-copy pass is not a refusal. Hints, retries and incomplete chains
+do not count as completed passes. A copy walk can continue while no pass
+completes: a stale page reports missing **completed-pass telemetry**, not
+a claim that no copy work ran. Each pass records at most 256 steps; going
+past that bound has the same effect on monitoring but does not stop copying.
+The bridge prunes telemetry after seven days, retaining one last verified
+copy timestamp for the age reported in the email. Recovery notices use the
+same email cap and cooldown as the other conditions.
+
+Rolling the bridge back to a version without the optional queue sequence
+can drop in-flight sequenced copy messages. The next scheduled pass resumes
+normal copy work. Leave the additive telemetry table in place on rollback.
+
 ## Cost
 
 Email goes through the `send_email` binding to a verified Email Routing
@@ -67,11 +90,12 @@ destination address. That is free on every plan, and needs no sending
 domain. The rest:
 
 - 8,640 cron runs a month;
-- under 100,000 catalogue rows read a month;
+- under 100,000 baseline catalogue rows read a month before recovery-copy
+  monitoring;
+- recovery-copy reads scale with the number of jobs in the last two complete
+  passes, bounded by four indexed pass reads of up to 256 jobs each per tick;
 - a few thousand writes to the Worker's own D1;
 - about 720 R2 list calls a month.
-
-All of it is well inside the included usage.
 
 ## Setup
 

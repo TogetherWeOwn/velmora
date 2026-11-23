@@ -119,6 +119,12 @@ pub enum RemoteError {
     /// or any other status that is neither a 2xx nor worth another try,
     /// such as a redirect.
     Refused(u16),
+    /// A refusal with a recognized S3 code. The code is a fixed string,
+    /// never arbitrary response text.
+    RefusedWithCode(u16, &'static str),
+    /// The PUT answered successfully, but the required verification HEAD
+    /// was refused.
+    VerifyRefused(u16, Option<&'static str>),
     /// No usable answer after every try.
     Unavailable,
     /// The store answered, and what it holds is not what was sent.
@@ -126,6 +132,52 @@ pub enum RemoteError {
     /// The request cannot be signed: a key outside the safe alphabet, or
     /// with an empty, `.` or `..` segment. Nothing was sent.
     Unsignable,
+}
+
+fn refused(response: &HttpResponse) -> RemoteError {
+    // HEAD commonly has no body; prefer the error-code header when present.
+    // Do not log provider-controlled strings, even if they look like codes.
+    let known = |value: &str| {
+        [
+            "AccessDenied",
+            "AccountProblem",
+            "AllAccessDisabled",
+            "AuthorizationHeaderMalformed",
+            "BucketNotFound",
+            "ExpiredToken",
+            "InvalidAccessKeyId",
+            "InvalidArgument",
+            "InvalidBucketName",
+            "InvalidRequest",
+            "InvalidToken",
+            "MethodNotAllowed",
+            "NoSuchBucket",
+            "NoSuchKey",
+            "NotImplemented",
+            "QuotaExceeded",
+            "RequestTimeTooSkewed",
+            "SignatureDoesNotMatch",
+            "StorageQuotaExceeded",
+            "SubscriptionExpired",
+        ]
+        .into_iter()
+        .find(|code| *code == value)
+    };
+    let code = response
+        .header("x-amz-error-code")
+        .and_then(known)
+        .or_else(|| {
+            let body = std::str::from_utf8(&response.body).ok()?;
+            let (_, error) = body.split_once("<Error>")?;
+            let (error, _) = error.split_once("</Error>")?;
+            let (_, code) = error.split_once("<Code>")?;
+            let (code, _) = code.split_once("</Code>")?;
+            known(code.trim())
+        });
+    match code {
+        Some(code) => RemoteError::RefusedWithCode(response.status, code),
+        None => RemoteError::Refused(response.status),
+    }
 }
 
 /// One page of what the store holds under the prefix, in key order.
@@ -340,7 +392,7 @@ impl<H: HttpSend> S3Remote<H> {
                 Ok(r) if r.body.len() > max_answer => {}
                 Ok(r) if (500..600).contains(&r.status) || r.status == 429 => {}
                 Ok(r) if (200..300).contains(&r.status) || r.status == 404 => return Ok(r),
-                Ok(r) => return Err(RemoteError::Refused(r.status)),
+                Ok(r) => return Err(refused(&r)),
             }
             if attempt < TRIES {
                 // Up to half as long again, so that jobs do not retry in step.
@@ -414,9 +466,16 @@ impl<H: HttpSend> S3Remote<H> {
             .await?;
         if r.status == 404 {
             // The bucket is not there.
-            return Err(RemoteError::Refused(404));
+            return Err(refused(&r));
         }
-        match self.head(clock, key).await? {
+        let stored = self.head(clock, key).await.map_err(|error| match error {
+            RemoteError::Refused(status) => RemoteError::VerifyRefused(status, None),
+            RemoteError::RefusedWithCode(status, code) => {
+                RemoteError::VerifyRefused(status, Some(code))
+            }
+            other => other,
+        })?;
+        match stored {
             Some(stored)
                 if stored.size == bytes.len() as u64
                     && stored.etag.eq_ignore_ascii_case(&hex(&md5)) =>
@@ -458,7 +517,7 @@ impl<H: HttpSend> S3Remote<H> {
             .call(clock, "GET", &path, &query, &[], &[], MAX_LIST_BYTES)
             .await?;
         if r.status == 404 {
-            return Err(RemoteError::Refused(404));
+            return Err(refused(&r));
         }
         let listed = parse_list(&r.body).map_err(|_| RemoteError::Mismatch)?;
         let mut page = CopyPage {

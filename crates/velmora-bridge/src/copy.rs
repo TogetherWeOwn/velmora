@@ -263,8 +263,12 @@ pub struct CopyCounts {
     pub copied: u64,
     /// Not copied, and worth another try (a later pass makes it).
     pub failed: u64,
-    /// Refused by the store with a 4xx: needs the operator.
+    /// Total refusals, including requests rejected before being sent.
     pub refused: u64,
+    pub refused_put: RefusalCounts,
+    pub refused_verify: RefusalCounts,
+    pub refused_plan: RefusalCounts,
+    pub unsignable: RefusalCounts,
     /// Does not open here; not copied.
     pub source_unreadable: u64,
     /// Generation records too young to copy.
@@ -285,6 +289,35 @@ impl CopyCounts {
     pub fn clean(&self) -> bool {
         self.failed == 0 && self.refused == 0
     }
+
+    fn record_refusal(&mut self, refusal: Refusal) {
+        self.refused += 1;
+        let (counts, answer) = match refusal {
+            Refusal::Put(status, code) => (&mut self.refused_put, Some((status, code))),
+            Refusal::Verify(status, code) => (&mut self.refused_verify, Some((status, code))),
+            Refusal::Plan(status, code) => (&mut self.refused_plan, Some((status, code))),
+            Refusal::Unsignable => (&mut self.unsignable, None),
+        };
+        counts.count += 1;
+        counts.status = answer.map(|(status, _)| status);
+        counts.code = answer.and_then(|(_, code)| code);
+    }
+}
+
+/// Number of refusals and the last answer for that operation.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct RefusalCounts {
+    pub count: u64,
+    pub status: Option<u16>,
+    pub code: Option<&'static str>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Refusal {
+    Put(u16, Option<&'static str>),
+    Verify(u16, Option<&'static str>),
+    Plan(u16, Option<&'static str>),
+    Unsignable,
 }
 
 /// Result of one job: what it did, and where the next one goes on
@@ -308,6 +341,19 @@ pub struct CopyStep {
     pub late: bool,
     /// What the sweep learned could not be saved ([`SWEEP_KEY`]).
     pub unsaved: bool,
+}
+
+/// A counted step. Its successor is identified by a digest, not its
+/// object-bearing cursor. `None` for `next` marks the end of a pass.
+pub struct CopyProgress {
+    pub next: Option<String>,
+}
+
+pub fn cursor_tag(cursor: &str) -> String {
+    Sha256::digest(cursor.as_bytes())[..16]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 /// Why a job did not do its step: a class, and a status at most. Never
@@ -694,9 +740,38 @@ enum Copied {
     Failed,
     /// Not copied; the store gave no answer.
     Down,
-    Refused,
+    Refused(Refusal),
     /// A generation record held back for an article plan.
     Held,
+}
+
+impl Copied {
+    fn from_remote_error(
+        e: RemoteError,
+        operation: fn(u16, Option<&'static str>) -> Refusal,
+    ) -> Self {
+        match e {
+            RemoteError::Refused(status) => Self::Refused(operation(status, None)),
+            RemoteError::RefusedWithCode(status, code) => {
+                Self::Refused(operation(status, Some(code)))
+            }
+            RemoteError::VerifyRefused(status, code) => {
+                Self::Refused(Refusal::Verify(status, code))
+            }
+            RemoteError::Unsignable => Self::Refused(Refusal::Unsignable),
+            RemoteError::Unavailable => Self::Down,
+            RemoteError::Mismatch => Self::Failed,
+        }
+    }
+
+    fn as_plan(self) -> Plan {
+        match self {
+            Self::Done => Plan::Sent,
+            Self::Refused(refusal) => Plan::Refused(refusal),
+            Self::Down => Plan::Down,
+            _ => Plan::Failed,
+        }
+    }
 }
 
 /// A record to copy, after the first look at it.
@@ -739,7 +814,7 @@ enum Plan {
     Unreadable,
     Failed,
     Down,
-    Refused,
+    Refused(Refusal),
 }
 
 /// What became of the records of a chunk.
@@ -779,6 +854,7 @@ pub fn plan_hint(job: &Job, outcome: &JobOutcome, now: UnixMs) -> Option<Job> {
         v: JOB_VERSION,
         pass: UnixMs(0),
         cursor: place.cursor(),
+        sequence: None,
     })
 }
 
@@ -878,6 +954,7 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
             v: JOB_VERSION,
             pass: scheduled,
             cursor: String::new(),
+            sequence: Some(0),
         };
         jobs.send(&first, 0).await?;
         Ok(true)
@@ -897,14 +974,34 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
         pass: UnixMs,
         cursor: &str,
     ) -> (JobOutcome, Option<CopyCounts>, Option<StepError>) {
+        let (outcome, counts, why, _) = self.run_job_with_sequence(jobs, pass, cursor, None).await;
+        (outcome, counts, why)
+    }
+
+    /// Also reports whether this step can be counted, and whether it was
+    /// the last in the pass. Telemetry cannot change a copy job's outcome.
+    pub async fn run_job_with_sequence<J: JobSink>(
+        &self,
+        jobs: &J,
+        pass: UnixMs,
+        cursor: &str,
+        sequence: Option<u16>,
+    ) -> (
+        JobOutcome,
+        Option<CopyCounts>,
+        Option<StepError>,
+        Option<CopyProgress>,
+    ) {
         if self.maintenance == Maintenance::Restore {
-            return (JobOutcome::Ack, None, None);
+            return (JobOutcome::Ack, None, None, None);
         }
         let place = Place::parse(cursor);
         if let Some(hint) = place.as_ref().filter(|p| p.phase == Phase::Plan) {
-            return self.run_hint(hint).await;
+            let (outcome, counts, why) = self.run_hint(hint).await;
+            return (outcome, counts, why, None);
         }
-        let (outcome, counts, why) = self.run_step(jobs, pass, cursor, place).await;
+        let (outcome, counts, why, final_step) =
+            self.run_step(jobs, pass, cursor, place, sequence).await;
         // Something was left undone, and the job does not come again
         // for it. The sweep of the next pass may mend it; if it does
         // not, only the walk does, so the walk is asked to come soon.
@@ -912,7 +1009,7 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
         if undone && outcome == JobOutcome::Ack {
             self.want_walk().await;
         }
-        (outcome, counts, why)
+        (outcome, counts, why, final_step)
     }
 
     async fn run_step<J: JobSink>(
@@ -921,7 +1018,13 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
         pass: UnixMs,
         cursor: &str,
         place: Option<Place>,
-    ) -> (JobOutcome, Option<CopyCounts>, Option<StepError>) {
+        sequence: Option<u16>,
+    ) -> (
+        JobOutcome,
+        Option<CopyCounts>,
+        Option<StepError>,
+        Option<CopyProgress>,
+    ) {
         // A pass ends when the next one starts. The walk loses nothing
         // by it: the newer pass goes on from the place that was saved.
         // A fresh sweep that is cut short is late, and says so.
@@ -929,7 +1032,7 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
         if age >= PASS_INTERVAL_MS {
             let walking = place.as_ref().is_some_and(|p| p.walking());
             let why = (!walking).then_some(StepError::Expired);
-            return (JobOutcome::Ack, None, why);
+            return (JobOutcome::Ack, None, why, None);
         }
         // Every step is idempotent, so a failed job simply runs again,
         // but not for ever: a later pass takes over.
@@ -959,7 +1062,7 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
         }
         let step = match self.step(pass, cursor).await {
             Ok(step) => step,
-            Err(e) => return (again, None, Some(e)),
+            Err(e) => return (again, None, Some(e), None),
         };
         // The store is down: the cursor does not move while the job may
         // be retried. After that the pass goes on past the records that
@@ -974,7 +1077,7 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
         };
         if step.outage && age < hold {
             let down = StepError::Store(RemoteError::Unavailable);
-            return (again, Some(step.counts), Some(down));
+            return (again, Some(step.counts), Some(down), None);
         }
         let mut why = step.late.then_some(StepError::Expired);
         if step.unsaved {
@@ -1010,20 +1113,24 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
         if !saved {
             why = why.or(Some(StepError::Mark));
         }
+        let progress = sequence.map(|_| CopyProgress {
+            next: step.next.as_deref().map(cursor_tag),
+        });
         if let Some(cursor) = step.next {
             let next = Job::RecoveryCopy {
                 v: JOB_VERSION,
                 pass,
                 cursor,
+                sequence: sequence.and_then(|n| n.checked_add(1)),
             };
             // Past records that got no answer the pass goes on slowly:
             // a store that comes back finds most of them still ahead.
             let delay = if step.outage { RETRY_SECS } else { 0 };
             if jobs.send(&next, delay).await.is_err() {
-                return (again, Some(step.counts), Some(StepError::Queue));
+                return (again, Some(step.counts), Some(StepError::Queue), None);
             }
         }
-        (JobOutcome::Ack, Some(step.counts), why)
+        (JobOutcome::Ack, Some(step.counts), why, progress)
     }
 
     fn spent(&self, started: UnixMs) -> bool {
@@ -1273,8 +1380,8 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
                     counts.source_unreadable = 1;
                     None
                 }
-                Plan::Refused => {
-                    counts.refused = 1;
+                Plan::Refused(refusal) => {
+                    counts.record_refusal(refusal);
                     None
                 }
                 Plan::Failed => {
@@ -1629,8 +1736,8 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
                             down += 1;
                             continue;
                         }
-                        Plan::Refused => {
-                            counts.refused += 1;
+                        Plan::Refused(refusal) => {
+                            counts.record_refusal(refusal);
                             continue;
                         }
                     }
@@ -1733,7 +1840,7 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
                 Some(Copied::Same) => counts.same += 1,
                 Some(Copied::Unreadable) => counts.source_unreadable += 1,
                 Some(Copied::Failed | Copied::Down) => counts.failed += 1,
-                Some(Copied::Refused) => counts.refused += 1,
+                Some(Copied::Refused(refusal)) => counts.record_refusal(refusal),
                 Some(Copied::Held) => counts.pending += 1,
                 None => {}
             }
@@ -1882,11 +1989,7 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
                     continue
                 }
                 Ok(_) => {}
-                Err(RemoteError::Refused(_) | RemoteError::Unsignable) => {
-                    return Some(Copied::Refused)
-                }
-                Err(RemoteError::Unavailable) => return Some(Copied::Down),
-                Err(_) => return Some(Copied::Failed),
+                Err(e) => return Some(Copied::from_remote_error(e, Refusal::Plan)),
             }
             if sent > 0 && self.spent(budget.started) {
                 return None;
@@ -1935,16 +2038,9 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
                 return Plan::There
             }
             Ok(_) => {}
-            Err(RemoteError::Refused(_) | RemoteError::Unsignable) => return Plan::Refused,
-            Err(RemoteError::Unavailable) => return Plan::Down,
-            Err(_) => return Plan::Failed,
+            Err(e) => return Copied::from_remote_error(e, Refusal::Plan).as_plan(),
         }
-        match self.send(key, &bytes).await {
-            Copied::Done => Plan::Sent,
-            Copied::Refused => Plan::Refused,
-            Copied::Down => Plan::Down,
-            _ => Plan::Failed,
-        }
+        self.send(key, &bytes).await.as_plan()
     }
 
     async fn copy_one(&self, key: &str, copy: Option<&Listed>) -> Copied {
@@ -1967,9 +2063,7 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
     async fn send(&self, key: &str, bytes: &[u8]) -> Copied {
         match self.remote.put(self.clock, key, bytes).await {
             Ok(()) => Copied::Done,
-            Err(RemoteError::Refused(_) | RemoteError::Unsignable) => Copied::Refused,
-            Err(RemoteError::Unavailable) => Copied::Down,
-            Err(_) => Copied::Failed,
+            Err(e) => Copied::from_remote_error(e, Refusal::Put),
         }
     }
 }

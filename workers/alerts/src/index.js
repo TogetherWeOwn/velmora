@@ -15,6 +15,7 @@ import { evaluate, figures, readingOf } from "./checks.js";
 import { readSnapshot } from "./catalog.js";
 import * as store from "./store.js";
 import { alertMessage, digestMessage, send } from "./email.js";
+import { READING as RECOVERY_READING, readRecovery, recoveryNotices } from "./recovery.js";
 
 const KEY_RE = /^[a-z0-9][a-z0-9._:-]{0,99}$/;
 const MAX_BODY = 16 * 1024;
@@ -102,18 +103,30 @@ export async function tick(env, now) {
     await store.setMeta(db, "post_head", snap.postHead);
   }
 
-  const conds = evaluate(snap, env);
+  let recovery;
+  try {
+    recovery = await readRecovery(env, now);
+  } catch {
+    snap.errors.push(`${RECOVERY_READING}: read failed`);
+  }
+  const conds = [...evaluate(snap, env), ...(recovery?.conditions ?? [])];
   const results = [];
   for (const c of conds) {
     const row = await store.observe(db, { ...c, source: "cron", severity: "page" }, now);
     results.push(await maybeSend(env, row, now, c.forMs));
   }
+  const notices = await recoveryNotices(env, recovery, now, async (notice) => {
+    const row = await store.observe(db, { ...notice, source: "cron", severity: "page" }, now);
+    return maybeSend(env, row, now, 0);
+  });
+  results.push(...notices.results);
   // Reports that came in while their key waited out its hour.
   for (const row of await store.unsentEvents(db)) results.push(await maybeSend(env, row, now, 0));
   results.push(await capNotice(env, now));
   // A reading that failed hides its condition: its keys are not cleared.
   const failed = new Set(snap.errors.map((e) => e.split(":")[0]));
-  await store.resolveCron(db, conds.map((c) => c.key), now, (k) => failed.has(readingOf(k)));
+  await store.resolveCron(db, conds.map((c) => c.key), now, (k) =>
+    notices.keep.has(k) || failed.has(readingOf(k)));
   await store.expireEvents(db, now);
   await store.prune(db, now);
   return {
