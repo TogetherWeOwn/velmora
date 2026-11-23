@@ -166,15 +166,19 @@ class BatchWriter:
             self.start()
 
 
-def split_dump(path, directory, cap, limit):
-    # Private spools add about one SQL dump's worth of disk, in addition to
-    # the verified SQL and the reassembled batch files.
+def split_dump(path, directory, cap, limit, discard_staged_sql=False):
+    # Private spools add about one SQL dump's worth of disk. Free the
+    # verified SQL before batch creation, then free each spool as used.
     dir_path = Path(directory)
+    sql_path = Path(path)
+    if discard_staged_sql and (sql_path.name != "catalog.sql" or sql_path.parent.resolve() != dir_path.resolve()):
+        raise ValueError("only the catalog.sql staged in the work directory can be discarded")
     paths = {}
     sources = defaultdict(Proof)
     copied = defaultdict(Proof)
     table_names = {}
     conn = sqlite3.connect(":memory:")
+    conn.set_authorizer(ddl_only)
     header, schema, final = ("header", "schema", "final")
     leading = True
     total = Proof()
@@ -183,35 +187,42 @@ def split_dump(path, directory, cap, limit):
         for group in (header, schema, final):
             paths[group] = dir_path / f"spool-{group}"
             files[group] = stack.enter_context(paths[group].open("xb"))
-        for statement in dump_statements(Path(path), limit):
+        for statement in dump_statements(sql_path, limit):
             total.add(statement)
             if leading and PRAGMA.match(statement):
                 group = header
             else:
                 leading = False
                 if CREATE_TABLE.match(statement):
-                    conn.set_authorizer(ddl_only)
-                    try:
-                        conn.execute(statement.decode("utf-8"))
-                    finally:
-                        conn.set_authorizer(None)
+                    conn.execute(statement.decode("utf-8"))
                     group = schema
                 elif INSERT.match(statement):
                     match = INSERT_TABLE.match(statement)
                     if not match:
                         raise ValueError("unsupported INSERT syntax in the dump")
-                    group = ("table", table_name(match[1]).lower())
-                    if group not in files:
-                        paths[group] = dir_path / f"spool-table-{len(paths)}"
-                        files[group] = stack.enter_context(paths[group].open("xb"))
+                    name = table_name(match[1]).lower()
+                    if name == "sqlite_sequence":
+                        # Keep the saved high-water marks after SQLite's
+                        # automatic updates and the dump's sequence reset.
+                        group = final
+                    else:
+                        group = ("table", name)
+                        if group not in files:
+                            paths[group] = dir_path / f"spool-table-{len(paths)}"
+                            files[group] = stack.enter_context(paths[group].open("xb"))
                 else:
                     group = final
             proof = sources[group]
             proof.add(statement)
             files[group].write(RECORD.pack(len(statement)))
             files[group].write(statement)
+    if discard_staged_sql:
+        sql_path.unlink()
 
-    for (name,) in conn.execute("SELECT name FROM sqlite_schema WHERE type='table'"):
+    # No untrusted SQL is executed below this point. Use a callback rather
+    # than None to support Python 3.10's sqlite3 set_authorizer API.
+    conn.set_authorizer(lambda *_: sqlite3.SQLITE_OK)
+    for (name,) in conn.execute("SELECT name FROM sqlite_schema WHERE type='table' AND name NOT GLOB 'sqlite_*'"):
         table_names[name.lower()] = name
     if not table_names:
         raise ValueError("the dump has no schema")
@@ -238,6 +249,8 @@ def split_dump(path, directory, cap, limit):
             for statement in records(paths[group]):
                 copied[group].add(statement)
                 yield statement
+            if group != header:
+                paths[group].unlink()
 
     # The leading PRAGMAs are counted in batch 0; repeat them as overhead
     # in all other batches, without counting them again in the split proof.
@@ -272,6 +285,8 @@ def split_dump(path, directory, cap, limit):
     rows = [dict(name=table_names[key], expected=sources[("table", key)].count,
                  query='SELECT count(*) AS n FROM "' + table_names[key].replace('"', '""') + '"')
             for key in order]
+    paths[header].unlink()
+    paths[final].unlink(missing_ok=True)
     (dir_path / "split.json").write_text(json.dumps(dict(batches=writer.batches, tables=rows), ensure_ascii=True))
     print(f"split verified: {total.count} statements, {total.size} bytes in {len(writer.batches)} batches")
 
@@ -279,7 +294,8 @@ def split_dump(path, directory, cap, limit):
 if __name__ == "__main__":
     if sys.argv[1] == "split":
         try:
-            split_dump(sys.argv[2], sys.argv[3], int(sys.argv[4]), int(sys.argv[5]))
+            split_dump(sys.argv[2], sys.argv[3], int(sys.argv[4]), int(sys.argv[5]),
+                       discard_staged_sql=sys.argv[6:] == ["--discard-staged-sql"])
         except CycleError as exc:
             raise SystemExit(f"foreign key cycle: {' -> '.join(exc.args[1])}") from None
         except (OSError, ValueError, sqlite3.Error) as exc:

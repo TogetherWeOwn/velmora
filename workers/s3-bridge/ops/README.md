@@ -267,7 +267,7 @@ The importer also reads format 1 manifests with `.sql.zst.part-NNN` keys.
 
 Install the pinned Wrangler with `npm ci` in `workers/s3-bridge` before
 running either script. They require the local Wrangler version from
-`package-lock.json`, Python 3 with SQLite support, and `flock`. On the same
+`package-lock.json`, Python 3.10 or later with SQLite support, and `flock`. On the same
 host, run these scripts as the same user with the same `TMPDIR` so they share
 locks: exports lock by source database name, imports by resolved target UUID.
 
@@ -330,13 +330,19 @@ exists: restore it to a timestamp, then replay from that timestamp.
      proves that every original statement is accounted for and rechecks each
      batch's checksum before loading it.
 
-     Reserve local disk for the compressed download, the uncompressed SQL,
-     the spool (about another SQL dump), and the batches (about one more
-     SQL dump plus repeated leading PRAGMAs). If a batch fails, delete and
-     recreate the partial restore target before retrying; the script never
-     deletes databases. After loading, row-count checks read every row of the
-     idle restore target once. Use `VELMORA_IMPORT_SKIP_ROW_COUNTS=yes` only
-     to skip that scan explicitly; the script prints a warning.
+     Reserve local disk for the download and spool (about another SQL dump).
+     The importer checks available space before fetching manifest parts (or
+     before splitting a legacy download), using about 2.1 times the SQL size
+     or the larger decompression/assembly requirement. It discards compressed
+     bytes after verification, the SQL after spooling, and spools as used.
+
+     The target is marked incomplete before the first batch. If a batch
+     fails or the process stops, do not arm or replay into it. The import
+     marker blocks both; delete and recreate the partial restore target before
+     retrying. The script never deletes databases. After loading, row counts
+     read the rows of the idle restore target once. The marker is cleared
+     only after those checks pass or when you deliberately opt out with
+     `VELMORA_IMPORT_SKIP_ROW_COUNTS=yes` (the script prints a warning).
    - Nothing: create a database. The restore point is `0`.
 
    Then, in every case, bring the schema up to date and close the

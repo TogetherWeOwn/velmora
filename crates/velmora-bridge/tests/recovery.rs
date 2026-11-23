@@ -1607,6 +1607,29 @@ async fn admin(rig: &Rig, path: &str, body: Value) -> Resp {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn restore_route_refuses_to_replay_an_incomplete_import() {
+    let mut cfg = config(Vec::new());
+    cfg.maintenance = Maintenance::Restore;
+    let restoring = rig_with(NoNntp, cfg);
+    restoring.bridge.catalog.sql.with_conn(|c| {
+        c.execute_batch("CREATE TABLE _velmora_import_incomplete (restore_point INTEGER NOT NULL)")
+            .unwrap();
+    });
+    let before = restore_state(&restoring);
+    let body = json!({ "since_ms": 0 });
+    let refused = admin(&restoring, "/restore", body.clone()).await;
+    refused.expect(409);
+    assert!(refused.text().contains("CatalogueImportIncomplete"));
+    assert_eq!(restore_state(&restoring), before);
+
+    restoring.bridge.catalog.sql.with_conn(|c| {
+        c.execute_batch("DROP TABLE _velmora_import_incomplete")
+            .unwrap();
+    });
+    admin(&restoring, "/restore", body).await.expect(200);
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn restore_route_runs_only_in_maintenance() {
     // A serving bridge writes two objects and deletes one.
     let serving = rig();

@@ -1,12 +1,15 @@
 """Exercise the catalogue scripts against local Wrangler and rclone stubs."""
 
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import redirect_stdout
 import fcntl
 import hashlib
+from io import StringIO
 import json
 import os
 from pathlib import Path
 import random
+import runpy
 import select
 import shutil
 import sqlite3
@@ -14,6 +17,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -133,6 +137,7 @@ elif args[:3] == ["wrangler", "d1", "execute"]:
     db = Path(os.environ["FAKE_DB"])
     target_file = db / args[3]
     batches = db / "batches"
+    sqlite_file = db / "sqlite" / (args[3] + ".sqlite")
     if "--command" in args:
         assert "--json" in args
         query = args[args.index("--command") + 1]
@@ -140,12 +145,16 @@ elif args[:3] == ["wrangler", "d1", "execute"]:
             n = int(os.environ.get("FAKE_TABLES", 0))
             if n == 0:
                 target_file.unlink(missing_ok=True)
+                sqlite_file.unlink(missing_ok=True)
                 if batches.exists():
                     shutil.rmtree(batches)
+        elif query.startswith(("CREATE TABLE _velmora_import_incomplete ", "DROP TABLE _velmora_import_incomplete")):
+            sqlite_file.parent.mkdir(exist_ok=True)
+            with sqlite3.connect(sqlite_file) as conn:
+                conn.executescript(query)
+            n = 0
         else:
-            with sqlite3.connect(":memory:") as conn:
-                if target_file.exists():
-                    conn.executescript(target_file.read_text())
+            with sqlite3.connect(sqlite_file) as conn:
                 n, = conn.execute(query).fetchone()
             if query.endswith('"' + os.environ.get("FAKE_MISMATCH_TABLE", '\\0') + '"'):
                 n += 1
@@ -154,8 +163,15 @@ elif args[:3] == ["wrangler", "d1", "execute"]:
         assert "--yes" in args
         source = Path(args[args.index("--file") + 1])
         assert source.name.startswith("batch-")
+        assert not list(source.parent.glob("spool-*"))
+        assert not any((source.parent / name).exists() for name in ("catalog.sql", "catalog.sql.zst", "part"))
         if "FAKE_FAIL_BATCH" in os.environ and int(source.stem.split("-")[-1]) == int(os.environ["FAKE_FAIL_BATCH"]):
             sys.exit("stub batch failure")
+        sqlite_file.parent.mkdir(exist_ok=True)
+        with sqlite3.connect(sqlite_file) as conn:
+            conn.execute("PRAGMA foreign_keys=ON")
+            # Simulate one D1 file import and commit boundary per batch.
+            conn.executescript("BEGIN;\\n" + source.read_text() + "\\nCOMMIT;")
         batches.mkdir(exist_ok=True)
         shutil.copyfile(source, batches / source.name)
         with target_file.open("ab") as loaded:
@@ -592,6 +608,8 @@ class CatalogueScripts(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         loaded = (self.db / "scratch-db").read_bytes()
         self.assertEqual(loaded, self.fixture.read_bytes())
+        with sqlite3.connect(self.db / "sqlite" / "scratch-db.sqlite") as target:
+            self.assertEqual(target.execute("SELECT 1 FROM sqlite_master WHERE name='_velmora_import_incomplete'").fetchall(), [])
         lines = result.stdout.splitlines()
         self.assertEqual(lines[:len(leading_lines)], list(leading_lines))
         self.assertRegex(lines[len(leading_lines)], r"^split verified: \d+ statements, \d+ bytes in \d+ batches$")
@@ -722,7 +740,8 @@ class CatalogueScripts(unittest.TestCase):
     def test_import_rejects_inconsistent_manifest_sizes_before_part_downloads(self):
         ms, prefix, manifest, _ = self.export()
         key = f"{prefix}.manifest.json"
-        for changes in ({"parts": [manifest["parts"][0]] * 1001},
+        first = manifest["parts"][0]
+        for changes in ({"parts": [first] * 1001, "zst_bytes": first["bytes"] * 1001},
                         {"zst_bytes": manifest["zst_bytes"] + 1},
                         {"parts": [{**manifest["parts"][0], "bytes": 300000001}],
                          "zst_bytes": 300000001}):
@@ -732,6 +751,18 @@ class CatalogueScripts(unittest.TestCase):
                 self.assert_refused(self.run_script("import", "scratch-db", ms), f"invalid manifest {key}")
                 self.assertEqual([call[5] for call in self.calls()[before:]
                                   if call[2:5] == ["r2", "object", "get"]], [f"{BUCKET}/{key}"])
+
+    def test_import_checks_disk_before_fetching_any_parts(self):
+        ms, prefix, _, _ = self.export()
+        df = Path(self.env["TMPDIR"]) / "df"
+        df.write_text('#!/bin/sh\nprintf "Filesystem Blocks Used Available Capacity Mounted on\\n"\n'
+                      'printf "fixture 10000 9900 100 99%% /tmp\\n"\n')
+        df.chmod(0o755)
+        before = len(self.calls())
+        self.assert_refused(self.run_script("import", "scratch-db", ms),
+                            "insufficient local disk space")
+        self.assertEqual([call[5] for call in self.calls()[before:]
+                          if call[2:5] == ["r2", "object", "get"]], [f"{BUCKET}/{prefix}.manifest.json"])
 
     def test_export_records_sizes_and_warns_at_sixty_percent(self):
         sizes = Path(self.env["TMPDIR"]) / "sizes.log"
@@ -803,6 +834,18 @@ class CatalogueScripts(unittest.TestCase):
         self.assertIn("deleted and recreated", result.stderr)
         self.assertEqual(len([call for call in self.calls() if "--file" in call and
                               call[2:4] == ["d1", "execute"]]), 4)
+        with sqlite3.connect(self.db / "sqlite" / "scratch-db.sqlite") as target:
+            self.assertEqual(target.execute("SELECT restore_point FROM _velmora_import_incomplete").fetchall(),
+                             [(int(ms),)])
+            target.execute("CREATE TABLE restore_state (id PRIMARY KEY, state, since_ms, started_at, "
+                           "finished_at, reached_phase, reached_after, reached_extent)")
+            arm = (ROOT / "ops" / "restore-arm.sql").read_text()
+            with self.assertRaisesRegex(sqlite3.OperationalError, "malformed JSON"):
+                target.executescript(arm)
+            self.assertEqual(target.execute("SELECT count(*) FROM restore_state").fetchone(), (0,))
+            target.execute("DROP TABLE _velmora_import_incomplete")
+            target.executescript(arm)
+            self.assertEqual(target.execute("SELECT state FROM restore_state").fetchall(), [("replaying",)])
 
     def test_import_rechecks_each_batch_immediately_before_loading(self):
         self.batched_fixture()
@@ -821,6 +864,9 @@ class CatalogueScripts(unittest.TestCase):
         result = self.run_script("import", "scratch-db", ms)
         self.assertEqual(result.returncode, 1, result.stderr)
         self.assertIn("row count for child: expected 3, found 4", result.stderr)
+        with sqlite3.connect(self.db / "sqlite" / "scratch-db.sqlite") as target:
+            self.assertEqual(target.execute("SELECT restore_point FROM _velmora_import_incomplete").fetchall(),
+                             [(int(ms),)])
 
     def test_batched_import_accepts_current_migration_schema(self):
         with sqlite3.connect(":memory:") as db:
@@ -833,8 +879,57 @@ class CatalogueScripts(unittest.TestCase):
         result = self.run_script("import", "scratch-db", ms)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("WARNING skipping restored table row counts", result.stderr)
-        self.assertFalse(any("--command" in call and "FROM sqlite_master" not in call[call.index("--command") + 1]
+        self.assertFalse(any("--command" in call and call[call.index("--command") + 1].startswith('SELECT count(*) AS n FROM "')
                              for call in self.calls()))
+
+    def test_restore_preserves_wrangler_migration_autoincrement_footer(self):
+        with sqlite3.connect(":memory:") as source:
+            source.executescript("CREATE TABLE d1_migrations (id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                                 "name TEXT UNIQUE, applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL);"
+                                 "INSERT INTO d1_migrations (id, name) VALUES (1, 'first'), (20, 'removed');"
+                                 "DELETE FROM d1_migrations WHERE id = 20;")
+            dump = [stmt for stmt in source.iterdump() if stmt not in ("BEGIN TRANSACTION;", "COMMIT;")]
+        self.fixture.write_text("PRAGMA defer_foreign_keys=TRUE;\n" + "\n".join(dump) + "\n")
+        ms, _, _, _ = self.export()
+        result = self.run_script("import", "scratch-db", ms)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("row count for d1_migrations: expected 1, found 1", result.stdout)
+        self.assertNotIn("row count for sqlite_sequence:", result.stdout)
+        with sqlite3.connect(self.db / "sqlite" / "scratch-db.sqlite") as restored:
+            self.assertEqual(restored.execute("SELECT seq FROM sqlite_sequence WHERE name='d1_migrations'").fetchone(), (20,))
+            next_id = restored.execute("INSERT INTO d1_migrations (name) VALUES ('next')").lastrowid
+            self.assertEqual(next_id, 21)
+
+    def test_split_works_without_python311_authorizer_clearing(self):
+        # Python 3.10's sqlite binding registers None as the callback instead
+        # of removing it; any authorized operation then gets SQLITE_DENY.
+        connect = sqlite3.connect
+
+        class Python310Connection:
+            def __init__(self, *args, **kwargs):
+                self.inner = connect(*args, **kwargs)
+
+            def set_authorizer(self, callback):
+                self.inner.set_authorizer(callback if callback is not None else lambda *_: sqlite3.SQLITE_DENY)
+
+            def __getattr__(self, key):
+                return getattr(self.inner, key)
+
+        tool = self.root / "ops" / "sql_longest_statement.py"
+        self.fixture.write_text("CREATE TABLE t (x);\nINSERT INTO t VALUES (1);\n")
+        output = StringIO()
+        with patch.object(sqlite3, "connect", Python310Connection), redirect_stdout(output):
+            runpy.run_path(str(tool))["split_dump"](self.fixture, self.env["TMPDIR"], 1000, 100000)
+        self.assertIn("split verified: 2 statements", output.getvalue())
+
+    def test_split_authorizer_denies_ddl_that_can_execute_non_schema_sql(self):
+        for statement in ("CREATE TABLE t AS SELECT 1;", "CREATE TABLE t (x CHECK(abs(x)>0));"):
+            with self.subTest(statement=statement):
+                self.fixture.write_text(statement + "\n")
+                self.env["FAKE_DATE"] = str(int(self.env.get("FAKE_DATE", MS)) + 1)
+                ms, _, _, _ = self.export()
+                self.assert_refused(self.run_script("import", "scratch-db", ms), "could not split catalogue dump")
+                self.assertFalse(any(call[2:4] == ["d1", "execute"] for call in self.calls()))
 
     def test_batched_import_refuses_cycles_before_loading(self):
         self.fixture.write_text("CREATE TABLE a (id INTEGER PRIMARY KEY, bid REFERENCES b(id));\n"
@@ -845,7 +940,8 @@ class CatalogueScripts(unittest.TestCase):
         self.assertFalse(any(call[2:4] == ["d1", "execute"] for call in self.calls()))
 
     def test_self_referencing_table_must_fit_in_one_data_batch(self):
-        self.fixture.write_text("CREATE TABLE t (id INTEGER PRIMARY KEY, pid REFERENCES t(id), label TEXT);\n"
+        self.fixture.write_text("PRAGMA defer_foreign_keys=TRUE;\n"
+                                "CREATE TABLE t (id INTEGER PRIMARY KEY, pid REFERENCES t(id), label TEXT);\n"
                                 "INSERT INTO t VALUES (1, 2, '" + "a" * 50 + "');\n"
                                 "INSERT INTO t VALUES (2, 1, '" + "b" * 50 + "');\n")
         ms, _, _, _ = self.export()
@@ -853,8 +949,11 @@ class CatalogueScripts(unittest.TestCase):
         self.assert_refused(self.run_script("import", "scratch-db", ms),
                             "rows for self-referencing table t do not fit in one batch")
         self.assertFalse(any(call[2:4] == ["d1", "execute"] for call in self.calls()))
-        self.env["VELMORA_IMPORT_BATCH_BYTES"] = "180"
-        self.assert_loaded(self.run_script("import", "scratch-db", ms), ms)
+        self.env["VELMORA_IMPORT_BATCH_BYTES"] = "220"
+        result = self.run_script("import", "scratch-db", ms)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("row count for t: expected 2, found 2", result.stdout)
+        self.assertEqual(len(list((self.db / "batches").glob("*.sql"))), 2)
 
     def test_corrupted_part(self):
         ms, _, manifest, _ = self.export()

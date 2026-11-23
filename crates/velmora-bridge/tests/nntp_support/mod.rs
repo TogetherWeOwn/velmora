@@ -1553,6 +1553,9 @@ impl Catalog for MemCatalog {
     async fn restore_pending(&self) -> Result<bool> {
         Ok(false)
     }
+    async fn restore_import_incomplete(&self) -> Result<bool> {
+        Ok(false)
+    }
     async fn restore_progress(
         &self,
         _: UnixMs,

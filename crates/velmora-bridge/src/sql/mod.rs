@@ -774,6 +774,16 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
     async fn restore_pending(&self) -> Result<bool> {
         replay::restore_pending(self).await
     }
+    async fn restore_import_incomplete(&self) -> Result<bool> {
+        let rows = self
+            .sql
+            .query(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='_velmora_import_incomplete'",
+                &[],
+            )
+            .await?;
+        Ok(!rows.is_empty())
+    }
     async fn restore_progress(&self, run: UnixMs) -> Result<Option<RestoreProgress>> {
         replay::restore_progress(self, run).await
     }

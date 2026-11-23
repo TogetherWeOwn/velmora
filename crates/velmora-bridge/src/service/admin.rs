@@ -416,6 +416,20 @@ async fn route<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T
                 ));
             }
             let body: RestoreBody = read_json(bridge, req).await?;
+            // Check the bound catalogue before replay can revoke any keys
+            // or move its cursor, including when resuming a prior replay.
+            if bridge
+                .catalog
+                .restore_import_incomplete()
+                .await
+                .or_internal()?
+            {
+                return Err(fail(
+                    409,
+                    "CatalogueImportIncomplete",
+                    "The catalogue has an incomplete batched import. Do not replay into this database.",
+                ));
+            }
             restore(bridge, body).await
         }
         "/ops-snapshot" if get => ops_snapshot(bridge, &req.raw_target).await,

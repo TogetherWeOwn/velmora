@@ -37,7 +37,7 @@ remote=${VELMORA_EXPORT_RCLONE_REMOTE-}
 if [[ ${VELMORA_EXPORT_RCLONE_REMOTE+x} && ! $remote =~ ^[A-Za-z0-9_-]+$ ]]; then
   die 'invalid VELMORA_EXPORT_RCLONE_REMOTE'
 fi
-for tool in zstd jq sha256sum python3 head flock; do
+for tool in zstd jq sha256sum python3 head flock df; do
   command -v "$tool" >/dev/null || die "missing tool: $tool"
 done
 catalog_require_sqlite
@@ -91,6 +91,15 @@ verify() {
   [[ ${sha256%% *} == "$expected_sha256" ]] || die "sha256 mismatch for $key"
 }
 
+require_disk() {
+  local needed=$1 available
+  available=$(LC_ALL=C df -P -B1 -- "$WORK" | awk 'NR == 2 {print $4}') ||
+    die 'could not check available local disk space'
+  [[ $available =~ ^[0-9]{1,18}$ ]] || die 'could not read available local disk space'
+  (( 10#$available >= needed )) ||
+    die "insufficient local disk space: needs at least $needed bytes, $available available in $WORK"
+}
+
 # Resolve the target first; contending processes stop here after metadata only.
 info_log="$LOG_DIR/d1-info.log"
 "$wrangler" d1 info "$target" --json "$@" </dev/null >"$WORK/info.json" 2>"$info_log" ||
@@ -139,6 +148,15 @@ if get_restore_object "$manifest" "$WORK/manifest.json" "$manifest_log" "$@"; th
   ' "$WORK/manifest.json" >/dev/null 2>&1 || die "invalid manifest $manifest, see $manifest_log"
   manifest_sql_bytes=$(jq -er '.sql_bytes + 0' "$WORK/manifest.json")
   catalog_check_sql_size "$manifest_sql_bytes"
+  IFS=$'\t' read -r zst_bytes zst_sha256 sql_sha256 < <(
+    jq -r '[.zst_bytes, .zst_sha256, .sql_sha256] | @tsv' "$WORK/manifest.json"
+  )
+  largest_part=$(jq -er '[.parts[].bytes] | max' "$WORK/manifest.json")
+  # Check both peaks: assembling/downloading, and spooling before the SQL
+  # is released. Use 2.1x the SQL size to allow for spool framing.
+  sql_spool_peak=$((2 * manifest_sql_bytes + (manifest_sql_bytes + 9) / 10))
+  transfer_peak=$((zst_bytes + (manifest_sql_bytes > largest_part ? manifest_sql_bytes : largest_part)))
+  require_disk "$((sql_spool_peak > transfer_peak ? sql_spool_peak : transfer_peak))"
 
   jq -r '.parts[] | [.key, .bytes, .sha256] | @tsv' "$WORK/manifest.json" >"$WORK/parts.tsv"
   part_index=0
@@ -150,9 +168,7 @@ if get_restore_object "$manifest" "$WORK/manifest.json" "$manifest_log" "$@"; th
     part_index=$((part_index + 1))
   done <"$WORK/parts.tsv" >"$sql.zst"
 
-  IFS=$'\t' read -r zst_bytes zst_sha256 sql_sha256 < <(
-    jq -r '[.zst_bytes, .zst_sha256, .sql_sha256] | @tsv' "$WORK/manifest.json"
-  )
+  rm -- "$WORK/part"
   verify "$sql.zst" "$prefix.sql.zst (from $manifest)" "$zst_bytes" "$zst_sha256"
   # The manifest declares the verified SQL size even for multi-batch dumps.
   bound=$manifest_sql_bytes
@@ -166,6 +182,7 @@ if get_restore_object "$manifest" "$WORK/manifest.json" "$manifest_log" "$@"; th
   fi
   (( decompress_status == 0 )) || die "decompression failed for $prefix.sql.zst (from $manifest), see $decompress_log"
   verify "$sql" "$prefix.sql (from $manifest)" "$manifest_sql_bytes" "$sql_sha256"
+  rm -- "$sql.zst"
 else
   [[ $? == 2 ]] || die "could not read $manifest, see $manifest_log"
   legacy="$prefix.sql"
@@ -182,8 +199,10 @@ fi
 
 loaded_bytes=$(( $(wc -c <"$sql") ))
 catalog_check_sql_size "$loaded_bytes"
+# The SQL is already on disk; this is the additional spool space.
+require_disk "$((loaded_bytes + (loaded_bytes + 9) / 10))"
 catalog_check_sql_statements "$sql" >/dev/null
-python3 -I "$HERE/sql_longest_statement.py" split "$sql" "$WORK" "$batch_bytes" "$catalog_sql_statement_limit"
+python3 -I "$HERE/sql_longest_statement.py" split "$sql" "$WORK" "$batch_bytes" "$catalog_sql_statement_limit" --discard-staged-sql
 
 count_log="$LOG_DIR/d1-count.log"
 "$wrangler" d1 execute "$target" --remote --json \
@@ -195,6 +214,12 @@ count=$(jq -er '.[0].results[0].n | select(type == "number" and . >= 0 and floor
 [[ $count == 0 ]] || die "$target is not empty, see $count_log"
 
 jq -er '.batches[] | [.file, .bytes, .sha256] | @tsv' "$WORK/split.json" >"$WORK/batches.tsv"
+marker_log="$LOG_DIR/d1-import-marker.log"
+# The table itself is the guard, even if the connection is lost before
+# the restore point is written. Never clear it on a failed or killed run.
+"$wrangler" d1 execute "$target" --remote --json --command \
+  "CREATE TABLE _velmora_import_incomplete (restore_point INTEGER NOT NULL); INSERT INTO _velmora_import_incomplete VALUES ($since_ms);" \
+  "$@" </dev/null >"$marker_log" 2>&1 || die "could not mark the target as incomplete, see $marker_log"
 batch=0
 while IFS=$'\t' read -r file bytes sha256; do
   [[ $file =~ ^batch-[0-9]{8}\.sql$ ]] || die 'invalid batch file name in split manifest'
@@ -228,5 +253,8 @@ else
     count_index=$((count_index + 1))
   done <"$WORK/rows.jsonl"
 fi
+clear_log="$LOG_DIR/d1-clear-import-marker.log"
+"$wrangler" d1 execute "$target" --remote --json --command 'DROP TABLE _velmora_import_incomplete' \
+  "$@" </dev/null >"$clear_log" 2>&1 || die "could not clear the import marker, see $clear_log"
 printf 'catalog-import: loaded %s bytes into %s from restore point %s\n' "$loaded_bytes" "$target" "$since_ms"
 echo 'catalog-import: next: migrations apply, then ops/restore-arm.sql (README, Restore step 2)'
