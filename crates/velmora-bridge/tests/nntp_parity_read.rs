@@ -599,6 +599,53 @@ async fn cold_get_combines_newly_eligible_data_with_parity_after_the_cache_write
     cold_get_across_retention_cutoff(Cutoff::Mixed).await;
 }
 
+#[tokio::test]
+async fn cold_get_retries_newly_eligible_data_without_a_prior_cache_write() {
+    let body = marked_plaintext(THREE);
+    let cold = posted_for_get(&body, true, true, None, |cfg| {
+        cfg.cold_sockets = 1;
+        cfg.providers[0].retention_days = Some(2);
+        cfg.providers[1].retention_days = Some(1);
+    })
+    .await;
+    let bridge = &cold.svc.bridge;
+    let [extent] = cold.extents.as_slice() else {
+        panic!("a single extent cannot wait for a previous extent's cache write");
+    };
+    let stored = bridge.catalog.stored_plan(&extent.id).await.unwrap();
+    let parity = stored
+        .parity_plan(&extent.id, extent.cipher_size)
+        .unwrap()
+        .unwrap();
+    let missing = &stored.rows[1];
+    let mut src = cold.nntp.raw_client(0).await;
+    let mut dst = cold.nntp.raw_client(1).await;
+    let mut article = Vec::new();
+    src.article_to(&missing.message_id, &mut article)
+        .await
+        .unwrap();
+    dst.post_article(&missing.message_id, &article)
+        .await
+        .unwrap();
+    src.quit().await;
+    dst.quit().await;
+    cold.nntp.servers[0].hide(&missing.message_id).await;
+    cold.nntp.servers[0]
+        .hide(&parity.articles[0].message_id)
+        .await;
+
+    // One millisecond for the dial and one per BODY: the first data
+    // pass starts at the cutoff and crosses it on its first answer.
+    let cutoff = missing.posted_at.unwrap().plus_secs(2 * 86_400);
+    bridge.clock.set(cutoff.plus_ms(-1));
+    bridge.nntp.slow(&bridge.clock, 1);
+    let response = cold.get().await;
+    response.expect(200);
+    assert!(response.body == body, "cold GET returned different bytes");
+    assert_eq!(response.stream_error, None);
+    assert_eq!(body_requests(&bridge.nntp), 4 + 4 + 1); // Data, parity, then missing data.
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Cutoff {
     NewParity,
