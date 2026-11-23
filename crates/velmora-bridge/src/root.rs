@@ -60,7 +60,7 @@ pub use client::{
 pub use feed::{unit_item, RootKeyFeed};
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::rc::Rc;
 
 use velmora::rng::FillRandom;
@@ -73,7 +73,7 @@ use crate::directory::store::SqlDirectory;
 use crate::keys::locations::{read_locations, KeyLocations};
 use crate::keys::routes::read_route;
 use crate::keys::tk::{is_foreign, KeyBuckets, LoadedRing, TkCache, ERR_TK_MISSING};
-use crate::ports::{Clock, Kek, Sql};
+use crate::ports::{Clock, CopyRing, Kek, Sql, TenantRingState, TenantRings};
 use crate::records::RecordStore;
 use crate::types::{BridgeError, Result, UnixMs};
 use crate::unit::Seqs;
@@ -342,6 +342,58 @@ impl<'a, P: RootPorts, R: FillRandom> Root<'a, P, R> {
         LoadedRing::new(current, others)
     }
 
+    /// The recovery copy's ring of `tenant` (AM-80 item 2, AM-80b), from
+    /// the verified head of its chain (door part only), the key locations
+    /// and the key blobs, and never from a catalogue.
+    ///
+    /// - `shredding` or `shredded`: [`TenantRingState::Shredded`].
+    /// - No chain, or no committed or claimed version:
+    ///   [`TenantRingState::NoKeyYet`].
+    /// - Else every committed version (`key_checks`) and the claimed one
+    ///   (`rotating_to`) is named. Each committed version is loaded,
+    ///   pinned to its check value; one that does not load is left out
+    ///   and the ring is partial, unlike [`Root::tenant_keys`]. A claimed
+    ///   version has no check value to pin a load to, so it is named and
+    ///   has no key: no record is sealed under it before its commit.
+    /// - No record of the chain marks a version destroyed yet (the
+    ///   retirement of ADR §3.5 is not built): the destroyed set is empty.
+    ///
+    /// `Err`: the head or the key locations could not be read, or a
+    /// location holds a marker or a foreign name (the tenant is refused).
+    pub async fn copy_ring(&self, tenant: &TenantId) -> Result<TenantRingState> {
+        let t = Tenant::Managed(tenant.clone());
+        let Some(head) = self.heads().head(&t, 0).await.map_err(chain_error)? else {
+            return Ok(TenantRingState::NoKeyYet);
+        };
+        let door = head.door;
+        if matches!(door.lifecycle, Lifecycle::Shredding | Lifecycle::Shredded) {
+            return Ok(TenantRingState::Shredded);
+        }
+        let mut named: BTreeSet<u32> = door.key_checks.keys().copied().collect();
+        named.extend(door.rotating_to);
+        named.remove(&0);
+        if named.is_empty() {
+            return Ok(TenantRingState::NoKeyYet);
+        }
+        // A store failure here is the whole ring's, not one version's.
+        self.locations().await?;
+        let mut keys = Vec::new();
+        for &v in door.key_checks.keys().filter(|&&v| v != 0) {
+            // A check value not in its form pins nothing: the version is
+            // named and has no key.
+            let Some(kcv) = committed_check(&door, v) else {
+                continue;
+            };
+            match self.load_key(tenant, v, kcv).await {
+                Ok(key) => keys.push(key),
+                Err(e) if is_foreign(&e) => return Err(e),
+                Err(_) => {}
+            }
+        }
+        let ring = CopyRing::new(tenant.clone(), keys, named, BTreeSet::new())?;
+        Ok(TenantRingState::Ring(Rc::new(ring)))
+    }
+
     /// The key locations, read from `m/kl/` at most once per
     /// [`HEAD_MAX_AGE_MS`] per isolate. None recorded: no tenant key can
     /// be loaded (fail closed).
@@ -362,6 +414,21 @@ impl<'a, P: RootPorts, R: FillRandom> Root<'a, P, R> {
     /// Access key ids to tenants (ADR §8.4 step 2).
     pub fn key_routes(&self) -> RootRoutes<'_, 'a, P, R> {
         RootRoutes { root: self }
+    }
+}
+
+/// The recovery copy's tenant rings ([`TenantRings`]) over the root's
+/// parts: one [`Root`] per load, over the isolate's cache.
+pub struct RootRings<'a, P: RootPorts> {
+    pub ports: &'a P,
+    pub cache: &'a RootCache,
+}
+
+impl<P: RootPorts> TenantRings for RootRings<'_, P> {
+    async fn ring(&self, tenant: &TenantId) -> Result<TenantRingState> {
+        Root::new(self.ports, self.cache, velmora::rng::SystemRng)
+            .copy_ring(tenant)
+            .await
     }
 }
 

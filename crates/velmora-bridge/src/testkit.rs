@@ -751,6 +751,21 @@ impl BlobStore for MemBlobStore {
 // FixedClock
 // ---------------------------------------------------------------------------
 
+/// Tenant rings for the recovery copy that never load: every managed
+/// tenant's `VMR2` record counts `failed` (tests of tenant 0's records).
+pub struct NoRings;
+
+impl crate::ports::TenantRings for NoRings {
+    async fn ring(&self, _tenant: &crate::TenantId) -> Result<crate::ports::TenantRingState> {
+        Err(BridgeError::Crypto("test: no tenant rings"))
+    }
+}
+
+/// A [`NoRings`] for one copier, kept for the rest of the test process.
+pub fn no_rings() -> &'static crate::recovery::check::JobRings<NoRings> {
+    Box::leak(Box::new(crate::recovery::check::JobRings::new(NoRings)))
+}
+
 /// A clock that moves only when told to. A clone shows the same time.
 #[derive(Clone)]
 pub struct FixedClock {

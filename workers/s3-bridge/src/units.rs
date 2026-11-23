@@ -160,7 +160,7 @@ fn failed(what: &'static str) -> BridgeError {
 /// tenant with a unit. Class-only reasons.
 pub fn unit_bridge(
     env: &Env,
-    base: &WorkerBridge,
+    base: &Rc<WorkerBridge>,
     tenant: &JobTenant,
 ) -> std::result::Result<UnitBridge, String> {
     let unit = tenant.unit().ok_or("no unit")?;
@@ -183,8 +183,23 @@ pub fn unit_bridge(
     };
     let latest = LatestSeqs::new(seqs);
     let jobs = jobs.with_latest(latest.clone());
+    // The tenant's ring seals its records on the job path (the post
+    // job's plan, VMR2): the root's tenant keys, over the isolate's cache.
+    let ports = Rc::new(WorkerPorts::from_env(env, base)?);
+    let keys = velmora_bridge::TenantId::parse(tenant.tenant())
+        .map_err(|_| "not a unit's tenant".to_string())?;
+    let ring: velmora_bridge::tenant_catalog::RingLoader = Rc::new(move || {
+        let (ports, keys) = (Rc::clone(&ports), keys.clone());
+        Box::pin(async move {
+            let cache = crate::root::cache();
+            Root::new(&*ports, &cache, SystemRng)
+                .tenant_keys(&keys)
+                .await
+                .map(Rc::new)
+        })
+    });
     Ok(Bridge {
-        catalog: TenantCatalog::with_latest(port, shared, name, seqs, latest),
+        catalog: TenantCatalog::with_latest(port, shared, name, seqs, latest).with_ring(ring),
         safety,
         cache,
         nntp: WorkerConnector::new(),

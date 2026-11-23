@@ -15,12 +15,13 @@ use std::collections::HashMap;
 use velmora_bridge::recovery::{
     is_protected_key, record_name, RecordKind, Unpublished, ERR_RECORD_DELETE,
 };
-use velmora_bridge::{BlobEntry, BlobMeta, BlobStore, BridgeError, ByteSpan, Result};
+use velmora_bridge::{BlobEntry, BlobMeta, BlobStore, BridgeError, ByteSpan, DirPage, Result};
 use worker::js_sys::{ArrayBuffer, Object, Promise, Reflect, Uint8Array};
 use worker::wasm_bindgen::prelude::wasm_bindgen;
 use worker::wasm_bindgen::{JsCast, JsValue};
 use worker::wasm_bindgen_futures::JsFuture;
 use worker::web_sys::ReadableStream;
+use worker::worker_sys::R2Bucket as EdgeBucket;
 use worker::{Bucket, Range};
 
 /// R2 range offsets travel as JS numbers (workers-rs panics above this).
@@ -344,6 +345,57 @@ impl BlobStore for R2Blobs {
             };
         }
         Ok(keys)
+    }
+
+    /// One R2 request of a listing with the delimiter `/`: its common
+    /// prefixes (up to 1,000 directories; the recovery copy's tenant
+    /// directories, AM-80 item 4). A truncated answer goes on after the
+    /// last directory or key it named, so each request is the caller's to
+    /// count.
+    async fn list_dirs(&self, prefix: &str, start_after: &str, limit: u32) -> Result<DirPage> {
+        let page = self
+            .bucket
+            .list()
+            .prefix(prefix)
+            .delimiter("/")
+            .limit(limit.clamp(1, 1000))
+            .start_after(start_after)
+            .execute()
+            .await
+            .map_err(blob_err("list"))?;
+        let dirs: Vec<String> = page
+            .delimited_prefixes()
+            .into_iter()
+            .filter(|d| d.as_str() > start_after)
+            .collect();
+        // The last thing named: a directory (passed as a whole) or a key.
+        let last_dir = dirs.last().map(|d| velmora_bridge::ports::past_dir(d));
+        let last_key = page.objects().last().map(worker::Object::key);
+        let next = match page.truncated() {
+            true => last_dir.max(last_key),
+            false => None,
+        };
+        if page.truncated() && next.is_none() {
+            return Err(BridgeError::Blob(
+                "list: more to come and nothing named".into(),
+            ));
+        }
+        Ok(DirPage { dirs, next })
+    }
+
+    /// R2's conditional put (`If-None-Match: *`): atomic.
+    async fn put_if_absent(&self, key: &str, bytes: Vec<u8>) -> Result<bool> {
+        let edge: &EdgeBucket = self.bucket.as_ref().unchecked_ref();
+        let body: JsValue = Uint8Array::from(bytes.as_slice()).into();
+        let options = crate::records::only_if_absent()?;
+        let put = edge
+            .put(key.to_owned(), body, options)
+            .map_err(|_| BridgeError::Blob("r2: conditional put refused".into()))?;
+        let stored = JsFuture::from(put)
+            .await
+            .map_err(|_| BridgeError::Blob("r2: conditional put failed".into()))?;
+        // `null`: the condition failed, so an object is there already.
+        Ok(!stored.is_null() && !stored.is_undefined())
     }
 
     /// Sizes and MD5s from the listing itself, with no read per key:

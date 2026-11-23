@@ -5,8 +5,10 @@
 //! this order:
 //!
 //! 1. **The fresh sweep.** The tombstones, then the generation records,
-//!    minted in the last [`FRESH_MS`], of the flat layout and then of
-//!    the tenant layout ([`Layout`]). Their keys start with the time,
+//!    minted in the last [`FRESH_MS`], of the flat layout, then of each
+//!    managed tenant's directory (`m/x/<t>/`, found by one listing with
+//!    the delimiter `/` per 1,000 tenant directories), then of tenant 0's
+//!    tenant layout ([`Layout`]). Their keys start with the time,
 //!    so each is a short range of the listing however many records the
 //!    bucket holds. A new write or delete is over there one pass later.
 //!    The sweep has the first [`SWEEP_MS`] of a pass; what it did not
@@ -68,9 +70,21 @@
 //!   bucket" cannot be told from "the safety bucket was lost", which is
 //!   the event the copy exists for. A copy without a source is counted
 //!   (`extra`) and left alone.
-//! - **A record is copied only if it opens** under the KEK and its own
-//!   name. One that does not is counted (`source_unreadable`) and never
-//!   replaces a copy.
+//! - **A record is copied only if it is what its name requires**
+//!   ([`crate::recovery::check`], AM-80): a v1 manifest under the KEK, a
+//!   managed tenant's `VMR2` record under its key ring, a `VCR1` control
+//!   record by its door under the KEK, a gate anchor by its shape. One
+//!   that is another scheme's or another tenant's is counted
+//!   (`cross_scheme`, `cross_tenant`) and alarms; one that fails its
+//!   proof is counted (`source_unreadable`); neither ever replaces a
+//!   copy. A name of no known family is counted (`unknown_family`) and
+//!   alarms, and is copied only if it opens as a v1 manifest. A managed
+//!   tenant's ring is read once per job ([`JobRings`]); a `VMR2` version
+//!   it lacks reads it once more, then counts as AM-80b says
+//!   (`version_destroyed`, `shredded`, or `failed`, which pages
+//!   [`KEY_MISS_PAGE`]: at once for a version the chain does not name,
+//!   after [`KEY_MISS_PASSES`] passes for one it names whose blob did
+//!   not load).
 //! - **A generation record is copied once its id is two minutes old.**
 //!   The record of a refused publication is removed in the request that
 //!   wrote it ([`crate::recovery::discard_generation`]); the wait keeps
@@ -81,10 +95,14 @@
 //! - **Both layouts are copied, under the names they have.** The walk
 //!   goes through every key under `m/`, so it reaches the records of
 //!   any layout and any tenant, also of one this version does not
-//!   know. The sweep knows the flat layout and the one of the default
-//!   tenant. The article plan of an extent is looked for under the
-//!   name of either layout: a plan can be in the other one than the
-//!   generation record that names it, or than its hint says.
+//!   know. The sweep knows the flat layout, every managed tenant's
+//!   directory and tenant 0's. A managed tenant's fresh records are the
+//!   sweep's only: the walk passes over them, so that its generation
+//!   records go after their plans as tenant 0's do. The article plan of
+//!   a tenant-0 extent is looked for under the name of either layout: a
+//!   plan can be in the other one than the generation record that names
+//!   it, or than its hint says. A managed tenant's plan has one name, in
+//!   its directory, and its hint names it there.
 //! - **Tenant keys (`m/tk/`) never leave**, and neither do their names.
 //! - **What something else wrote over there is counted (`foreign`) and
 //!   passed.** It is never a copy, and it does not stop the pass. (One
@@ -131,19 +149,22 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use velmora_s3_proto::sign::Listed;
 
+use zeroize::Zeroizing;
+
 use crate::config::Maintenance;
-use crate::crypto::open_manifest;
-use crate::ports::{BlobEntry, BlobMeta, BlobStore, Clock, JobSink, Kek};
+use crate::crypto::scheme2::{Scheme, TenantId};
+use crate::ports::{past_dir, BlobEntry, BlobMeta, BlobStore, Clock, JobSink, Kek, TenantRings};
+use crate::recovery::check::{
+    check_record, family, open_failed, record_open, Family, JobRings, Miss, RecordCheck,
+};
 use crate::recovery::{
-    article_key, other_plan_key, plan_keys, read_segment, record_name, record_version,
-    segment_plan_keys, start_after, GenerationHead, Layout, RecordKind, MAX_SEGMENTS,
-    RECORD_PREFIX, SEGMENTED_VERSION, TENANT_DIR, TENANT_KEY_PREFIX,
+    article_key, other_plan_key, plan_keys, record_name, record_version, segment_plan_keys,
+    start_after, ExtentRecord, GenerationHead, Layout, RecordKind, MAX_SEGMENTS, RECORD_PREFIX,
+    SEGMENTED_VERSION, TENANT_DIR, TENANT_KEY_PREFIX,
 };
 use crate::remote::{md5_hex, HttpSend, RemoteError, S3Remote, MAX_KEY_BYTES};
 use crate::tenant::TenantScope;
-use crate::types::{
-    BridgeError, BucketId, ExtentId, Job, JobOutcome, OutboxStage, Result, UnixMs, JOB_VERSION,
-};
+use crate::types::{BucketId, ExtentId, Job, JobOutcome, OutboxStage, Result, UnixMs, JOB_VERSION};
 
 /// A pass starts on the cron run that falls in the first
 /// [`START_WINDOW_MS`] of each interval of this length.
@@ -229,6 +250,39 @@ pub const HEAD_SEGMENTS: usize = JOB_COPIES - 2 * CONCURRENCY;
 const _: () = assert!(MAX_SEGMENTS <= HEAD_SEGMENTS);
 /// Source keys read per page.
 pub const PAGE: u32 = 1000;
+/// Which `VMR2` key versions the reloaded rings lacked, and which rings
+/// could not be read, since when: a JSON object, `<tenant>/<version>` or
+/// `<tenant>/ring` to `[first, last, kind]` (`MissMark`). A hint like the
+/// others: lost or garbled, it starts the [`KEY_MISS_PASSES`] count of a
+/// partial or unreadable ring again, and never stops a page for a version
+/// the chain does not name. Written only by the jobs of a pass, never by
+/// a hint.
+pub const KEY_MISS_KEY: &str = "rc/key-miss";
+/// A version the reloaded chain names but whose blob did not load (a
+/// partial ring) pages once it was missing this many passes (AM-80b,
+/// dial, est: an hour).
+pub const KEY_MISS_PASSES: i64 = 4;
+/// The page of a key version a copy job lacked (AM-80b).
+pub const KEY_MISS_PAGE: &str = "copy_key_version_missing";
+/// An entry of [`KEY_MISS_KEY`] not seen again for this long is dropped:
+/// longer than the walk rests while a job left a record undone.
+const KEY_MISS_KEEP_MS: i64 = WALK_INTERVAL_MS;
+const KEY_MISS_ENTRIES: usize = 1000;
+const KEY_MISS_BYTES: usize = 128 * 1024;
+/// Where the pages of [`KEY_MISS_KEY`] are claimed, one key per pass slot
+/// and entry: `rc/key-page/<slot>/<entry>`. Removed by the first job of a
+/// later pass.
+pub const KEY_PAGE_PREFIX: &str = "rc/key-page/";
+/// Where the recheck of [`KEY_MISS_KEY`] came to: the last tenant id it
+/// looked at. A hint like the others: any value only changes which tenant
+/// is looked at first.
+pub const RECHECK_KEY: &str = "rc/key-recheck";
+/// The bytes read of [`RECHECK_KEY`].
+const TENANT_ID_BYTES: usize = 64;
+/// Tenants whose missing key versions the first job of a pass looks at
+/// again ([`KEY_MISS_KEY`]; dial, est): each costs one ring read and one
+/// reload at most.
+pub const RECHECK_TENANTS: usize = 16;
 /// A job that failed is retried while its pass is younger than this.
 /// A pass ends when it is [`PASS_INTERVAL_MS`] old: the next one has
 /// started.
@@ -279,12 +333,75 @@ pub struct CopyCounts {
     /// Keys over there that this service would not write: something
     /// else did. Never a copy, never deleted.
     pub foreign: u64,
+    /// `VMR2` records of a shredded tenant: not sent, no page.
+    pub shredded: u64,
+    /// `VMR2` records under a key version the chain marks destroyed: not
+    /// sent, no page.
+    pub version_destroyed: u64,
+    /// Not the scheme their name requires: not sent; an alarm.
+    pub cross_scheme: u64,
+    /// Naming another tenant than their name: not sent; an alarm.
+    pub cross_tenant: u64,
+    /// Names of no known family: an alarm; copied only if they open as a
+    /// v1 manifest.
+    pub unknown_family: u64,
+    /// Tenant rings the job read, and the milliseconds they took.
+    pub ring_loads: u64,
+    pub ring_ms: u64,
 }
 
 impl CopyCounts {
     /// Nothing is left for a later pass to mend.
     pub fn clean(&self) -> bool {
         self.failed == 0 && self.refused == 0
+    }
+
+    /// Adds the counts of another job: a sum over a pass.
+    pub fn add(&mut self, other: &CopyCounts) {
+        let CopyCounts {
+            records,
+            bytes,
+            same,
+            copied,
+            failed,
+            refused,
+            source_unreadable,
+            young,
+            pending,
+            extra,
+            foreign,
+            shredded,
+            version_destroyed,
+            cross_scheme,
+            cross_tenant,
+            unknown_family,
+            ring_loads,
+            ring_ms,
+        } = other;
+        self.records += records;
+        self.bytes += bytes;
+        self.same += same;
+        self.copied += copied;
+        self.failed += failed;
+        self.refused += refused;
+        self.source_unreadable += source_unreadable;
+        self.young += young;
+        self.pending += pending;
+        self.extra += extra;
+        self.foreign += foreign;
+        self.shredded += shredded;
+        self.version_destroyed += version_destroyed;
+        self.cross_scheme += cross_scheme;
+        self.cross_tenant += cross_tenant;
+        self.unknown_family += unknown_family;
+        self.ring_loads += ring_loads;
+        self.ring_ms += ring_ms;
+    }
+
+    /// Records that a pass cannot copy as they are, which an operator
+    /// looks at: a pass with any is not clean.
+    pub fn damaged(&self) -> u64 {
+        self.source_unreadable + self.cross_scheme + self.cross_tenant + self.unknown_family
     }
 }
 
@@ -342,9 +459,11 @@ enum Phase {
     /// Fresh generation records of the flat layout, and whatever sorts
     /// after them and before the tenant layout (`g`).
     Generations,
-    /// Fresh tombstones of the tenant layout (`e`).
+    /// Fresh tombstones of the tenant layout (`e`): of each managed
+    /// tenant's directory in turn ([`Place::tenant`]), then of tenant 0's.
     TenantTombstones,
-    /// Fresh generation records of the tenant layout (`h`).
+    /// Fresh generation records of the tenant layout (`h`), as
+    /// [`Phase::TenantTombstones`].
     TenantGenerations,
     /// The walk below the fresh tombstones (`a`).
     Low,
@@ -385,24 +504,25 @@ impl Phase {
         matches!(self, Low | High | TenantLow | TenantHigh | Tail)
     }
 
-    /// The layout whose keys the phase goes through.
-    fn layout(self) -> Layout {
+    /// The layout whose keys the phase goes through: of the managed
+    /// tenant `tenant` in its fresh phases, else tenant 0's (`tenant`
+    /// empty). The walk goes through every tenant's keys, by tenant 0's
+    /// bounds.
+    fn layout(self, tenant: &str) -> Layout {
         use Phase::*;
-        match self {
-            // The copy goes through the records of the whole store, and
-            // tenant 0 is the one tenant that has any.
-            TenantTombstones | TenantGenerations | TenantLow | TenantHigh | Tail => {
-                Layout::of(&TenantScope::tenant_zero())
-            }
-            Tombstones | Generations | Low | High | Plan => Layout::flat(),
-        }
+        let managed = match self {
+            TenantTombstones | TenantGenerations if !tenant.is_empty() => Layout::tenant(tenant),
+            TenantTombstones | TenantGenerations | TenantLow | TenantHigh | Tail => None,
+            Tombstones | Generations | Low | High | Plan => return Layout::flat(),
+        };
+        managed.unwrap_or_else(|| Layout::of(&TenantScope::tenant_zero()))
     }
 
     /// The key the phase starts after, in the pass that started at
-    /// `pass`.
-    fn first(self, pass: UnixMs) -> String {
+    /// `pass`, for `tenant` (see [`Phase::layout`]).
+    fn first(self, tenant: &str, pass: UnixMs) -> String {
         use Phase::*;
-        let layout = self.layout();
+        let layout = self.layout(tenant);
         match self {
             Tombstones | TenantTombstones => fresh(&layout.tombstone_prefix(), pass),
             Generations | TenantGenerations => fresh(&layout.generation_prefix(), pass),
@@ -450,6 +570,12 @@ struct Place {
     plans: u32,
     /// When a hint was made ([`Phase::Plan`]; `t`).
     made: i64,
+    /// The managed tenant whose directory a fresh phase of the tenant
+    /// layout goes through; empty for tenant 0's (`m`).
+    tenant: String,
+    /// The sweep gave up a part of the tenant directories (`i`): its end
+    /// is not recorded ([`SWEPT_KEY`]).
+    incomplete: bool,
 }
 
 /// A string as JSON. Serializing a string cannot fail.
@@ -465,6 +591,8 @@ impl Place {
             generation: String::new(),
             plans: 0,
             made: 0,
+            tenant: String::new(),
+            incomplete: false,
         }
     }
 
@@ -488,12 +616,31 @@ impl Place {
             Some(made) => made.as_i64()?,
             None => 0,
         };
+        // Only a fresh phase of the tenant layout names a tenant, and only
+        // a managed one.
+        let tenant = match object.get("m") {
+            Some(tenant) => {
+                let tenant = tenant.as_str()?;
+                let fresh = matches!(phase, Phase::TenantTombstones | Phase::TenantGenerations);
+                if !fresh || TenantId::parse(tenant).is_err() {
+                    return None;
+                }
+                tenant.to_string()
+            }
+            None => String::new(),
+        };
+        let incomplete = match object.get("i") {
+            Some(flag) => flag.as_bool()?,
+            None => false,
+        };
         Some(Place {
             phase,
             key,
             generation,
             plans,
             made,
+            tenant,
+            incomplete,
         })
     }
 
@@ -504,6 +651,13 @@ impl Place {
         if !self.generation.is_empty() {
             out.push_str(",\"g\":");
             out.push_str(&quoted(&self.generation));
+        }
+        if !self.tenant.is_empty() {
+            out.push_str(",\"m\":");
+            out.push_str(&quoted(&self.tenant));
+        }
+        if self.incomplete {
+            out.push_str(",\"i\":true");
         }
         for (name, number) in [("n", i64::from(self.plans)), ("t", self.made)] {
             if number != 0 {
@@ -525,7 +679,21 @@ impl Place {
 
     /// The start of `phase` in the pass that started at `pass`.
     fn first(phase: Phase, pass: UnixMs) -> Place {
-        Place::at(phase, phase.first(pass))
+        Place::at(phase, phase.first("", pass))
+    }
+
+    /// The start of the fresh tombstones of `tenant`'s directory (empty:
+    /// tenant 0's) in the pass that started at `pass`.
+    fn tenant(tenant: String, pass: UnixMs) -> Place {
+        let phase = Phase::TenantTombstones;
+        let mut place = Place::at(phase, phase.first(&tenant, pass));
+        place.tenant = tenant;
+        place
+    }
+
+    /// The span of keys of the phase it is at.
+    fn span(&self, pass: UnixMs) -> Span {
+        span_of(self.phase, &self.tenant, pass)
     }
 }
 
@@ -541,6 +709,9 @@ struct Span {
     /// A generation record up to this key is not fresh any more when
     /// the next pass starts: it is not held back.
     last: String,
+    /// A part of the walk: the fresh records of managed tenants, which
+    /// are the sweep's, are passed over. The pass that started then.
+    walk: Option<UnixMs>,
 }
 
 /// The first key of the fresh generation records (or tombstones) of the
@@ -569,7 +740,13 @@ fn fresh(prefix: &str, pass: UnixMs) -> String {
 /// flat layout (`m/seg/`) are in the sweep, so every pass lists them
 /// all; those of the tenant layout are in the `Tail` of the walk.
 fn span(phase: Phase, pass: UnixMs) -> Span {
-    let layout = phase.layout();
+    span_of(phase, "", pass)
+}
+
+/// [`span`] of the fresh phases of `tenant`'s directory (empty: tenant
+/// 0's), or of any other phase.
+fn span_of(phase: Phase, tenant: &str, pass: UnixMs) -> Span {
+    let layout = phase.layout(tenant);
     let until = match phase {
         Phase::Tombstones | Phase::TenantTombstones => Some(layout.of_flat(TOMBSTONES_END)),
         Phase::Generations => Some(TENANT_DIR.to_string()),
@@ -588,7 +765,30 @@ fn span(phase: Phase, pass: UnixMs) -> Span {
             &layout.generation_prefix(),
             UnixMs(pass.0 - FRESH_MS + PASS_INTERVAL_MS),
         ),
+        walk: phase.walking().then_some(pass),
     }
+}
+
+/// Whether `key` is a fresh tombstone or generation record of a managed
+/// tenant's directory in the pass that started at `pass`: in the span of
+/// that tenant's fresh phases. The walk passes over it.
+fn fresh_managed(key: &str, pass: UnixMs) -> bool {
+    let Some((tenant, _)) = key
+        .strip_prefix(TENANT_DIR)
+        .and_then(|rest| rest.split_once('/'))
+    else {
+        return false;
+    };
+    if TenantId::parse(tenant).is_err() {
+        return false;
+    }
+    [Phase::TenantTombstones, Phase::TenantGenerations]
+        .into_iter()
+        .any(|phase| {
+            let from = phase.first(tenant, pass);
+            let span = span_of(phase, tenant, pass);
+            key > from.as_str() && span.until.is_some_and(|until| key <= until.as_str())
+        })
 }
 
 /// Where the walk of a pass starts, from the place that was saved. A
@@ -599,7 +799,7 @@ fn walk_from(saved: String, pass: UnixMs) -> Place {
     // the place is in it when it is also before its end.
     let part = [Tail, TenantHigh, TenantLow, High, Low]
         .into_iter()
-        .find(|part| saved >= part.first(pass));
+        .find(|part| saved >= part.first("", pass));
     match part {
         Some(part) if span(part, pass).until.is_none_or(|until| saved < until) => {
             Place::at(part, saved)
@@ -674,6 +874,17 @@ fn page_end(last: &str) -> String {
     }
 }
 
+/// Which tenant directory the sweep goes through next.
+enum Next {
+    /// This managed tenant's; empty: tenant 0's, which comes last.
+    Tenant(String),
+    /// The job has no request left to list with: the next job looks.
+    Later,
+    /// `LIST_PAGES` requests found only names that are no managed
+    /// tenant's, and the listing goes on: the walk reaches the rest.
+    GaveUp,
+}
+
 /// What the listings say of a source record.
 enum What<'a> {
     Young,
@@ -687,12 +898,57 @@ struct Item<'a> {
     what: What<'a>,
 }
 
+/// Why a record was not sent, the store not asked: what it counts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Why {
+    /// `source_unreadable`.
+    Unreadable,
+    CrossScheme,
+    CrossTenant,
+    /// Counted by its name wherever it is finished (`unknown_family`).
+    Unknown,
+    Shredded,
+    Destroyed,
+    /// The tenant's ring or a key version of it: `failed`.
+    KeyFailed,
+}
+
+/// What a record of the check counts as ([`check_record`]); `None` when it
+/// is to be sent (`Proved`, or an unknown name that opens as v1).
+fn why(check: &RecordCheck) -> Option<Copied> {
+    Some(Copied::Not(match check {
+        RecordCheck::Proved(_) | RecordCheck::Unknown(Some(_)) => return None,
+        // Never listed for a copy (`m/tk/`): as if it were gone.
+        RecordCheck::Never => return Some(Copied::Gone),
+        RecordCheck::Shredded => Why::Shredded,
+        RecordCheck::VersionDestroyed => Why::Destroyed,
+        RecordCheck::RingFailed | RecordCheck::KeyMissing { .. } => Why::KeyFailed,
+        RecordCheck::CrossScheme => Why::CrossScheme,
+        RecordCheck::CrossTenant => Why::CrossTenant,
+        RecordCheck::Unreadable => Why::Unreadable,
+        RecordCheck::Unknown(None) => Why::Unknown,
+    }))
+}
+
+fn count_why(counts: &mut CopyCounts, why: Why) {
+    match why {
+        Why::Unreadable => counts.source_unreadable += 1,
+        Why::CrossScheme => counts.cross_scheme += 1,
+        Why::CrossTenant => counts.cross_tenant += 1,
+        Why::Unknown => {}
+        Why::Shredded => counts.shredded += 1,
+        Why::Destroyed => counts.version_destroyed += 1,
+        Why::KeyFailed => counts.failed += 1,
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Copied {
     Done,
     Same,
     Gone,
-    Unreadable,
+    /// Not sent, for a reason of the record or its keys.
+    Not(Why),
     /// Not copied; the store answered.
     Failed,
     /// Not copied; the store gave no answer.
@@ -739,7 +995,8 @@ enum Plan {
     Sent,
     /// Not written yet: the extent is not posted.
     Absent,
-    Unreadable,
+    /// Not sent, for a reason of the record or its keys.
+    Not(Why),
     Failed,
     Down,
     Refused,
@@ -760,7 +1017,70 @@ fn all_down(asked: usize, down: usize) -> bool {
 
 /// The store was asked for this record.
 fn asked_store(copied: Copied) -> bool {
-    !matches!(copied, Copied::Gone | Copied::Unreadable | Copied::Same)
+    !matches!(copied, Copied::Gone | Copied::Not(_) | Copied::Same)
+}
+
+/// An entry of [`KEY_MISS_KEY`]: `[first, last, kind]`, the pass slot a
+/// job first found it missing in, the last time a job found it while
+/// copying a record, and its kind ([`miss_kind`]).
+type MissMark = [i64; 3];
+
+/// The kind of a [`Miss`] in [`KEY_MISS_KEY`].
+fn miss_code(miss: Miss) -> i64 {
+    match miss {
+        Miss::Unknown => 0,
+        Miss::Partial => 1,
+        Miss::Ring => 2,
+    }
+}
+
+fn miss_kind(code: i64) -> Option<Miss> {
+    match code {
+        0 => Some(Miss::Unknown),
+        1 => Some(Miss::Partial),
+        2 => Some(Miss::Ring),
+        _ => None,
+    }
+}
+
+/// The name of an entry: `<tenant>/<version>` for a key version,
+/// `<tenant>/ring` for a ring that could not be read, which no version
+/// number can be taken for.
+fn miss_name(tenant: &TenantId, version: u32, miss: Miss) -> String {
+    match miss {
+        Miss::Ring => format!("{tenant}/ring"),
+        _ => format!("{tenant}/{version}"),
+    }
+}
+
+/// The tenant and the version (`None`: the ring) of an entry's name.
+fn miss_of(name: &str) -> Option<(TenantId, Option<u32>)> {
+    let (tenant, what) = name.rsplit_once('/')?;
+    let tenant = TenantId::parse(tenant).ok()?;
+    match what {
+        "ring" => Some((tenant, None)),
+        v => Some((tenant, Some(v.parse().ok()?))),
+    }
+}
+
+/// Whether an entry pages in the pass of `slot` (AM-80b): a version the
+/// chain does not name at once; one it names whose blob did not load,
+/// and a ring that could not be read, once missing in the slots of
+/// [`KEY_MISS_PASSES`] passes, whatever the time within each.
+fn miss_due(mark: &MissMark, slot: i64) -> bool {
+    // Saturating: the mark is bytes of the safety bucket, which anything
+    // with its binding can write; a garbled time must not wrap and keep a
+    // page off. A small `first` only makes it page sooner.
+    match miss_kind(mark[2]) {
+        Some(Miss::Unknown) => true,
+        Some(_) => slot.saturating_sub(mark[0]) >= KEY_MISS_PASSES * PASS_INTERVAL_MS,
+        None => false,
+    }
+}
+
+/// The pass slot of `now`: the start of its [`PASS_INTERVAL_MS`].
+fn pass_slot(now: i64) -> i64 {
+    now - now.rem_euclid(PASS_INTERVAL_MS)
 }
 
 /// True on the cron run that starts a pass.
@@ -774,9 +1094,16 @@ pub fn pass_due(now: UnixMs) -> bool {
 ///
 /// The hint carries pass 0, a pass that ended long ago: a Worker of a
 /// version that knows no hints acknowledges it and starts no pass.
-pub fn plan_hint(job: &Job, outcome: &JobOutcome, now: UnixMs) -> Option<Job> {
+pub fn plan_hint(job: &Job, outcome: &JobOutcome, scope: &TenantScope, now: UnixMs) -> Option<Job> {
     let extent = posted(job, outcome)?;
-    let mut place = Place::at(Phase::Plan, article_key(extent));
+    // Tenant 0's plan under its flat name (the job looks under the other
+    // too); a managed tenant's under its one name, in its directory
+    // (AM-80 item 3).
+    let key = match Scheme::of(scope.tenant_id()) {
+        Ok(Scheme::Two(_)) => Layout::of(scope).article_key(extent),
+        _ => article_key(extent),
+    };
+    let mut place = Place::at(Phase::Plan, key);
     place.made = now.0;
     Some(Job::RecoveryCopy {
         v: JOB_VERSION,
@@ -807,9 +1134,10 @@ pub async fn send_hint<B: BlobStore, J: JobSink>(
     jobs: &J,
     job: &Job,
     outcome: &JobOutcome,
+    scope: &TenantScope,
     now: UnixMs,
 ) -> bool {
-    let Some(hint) = plan_hint(job, outcome, now) else {
+    let Some(hint) = plan_hint(job, outcome, scope, now) else {
         return false;
     };
     let sent = jobs.send(&hint, 0).await.is_ok();
@@ -861,15 +1189,17 @@ fn equal(copy: Option<&Listed>, size: u64, md5: &str) -> bool {
 }
 
 /// Everything a pass touches.
-pub struct Copier<'a, B: BlobStore, K: Kek, T: Clock, H: HttpSend> {
+pub struct Copier<'a, B: BlobStore, K: Kek, T: Clock, H: HttpSend, R: TenantRings> {
     pub safety: &'a B,
     pub kek: &'a K,
     pub clock: &'a T,
     pub remote: &'a S3Remote<H>,
     pub maintenance: Maintenance,
+    /// Managed tenants' key rings, for this job (AM-80 item 2).
+    pub rings: &'a JobRings<R>,
 }
 
-impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
+impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend, R: TenantRings> Copier<'_, B, K, T, H, R> {
     /// The cron hook: sends the first job of a pass when one is due at
     /// `scheduled`, the time the cron run was set for. A run that
     /// starts late still starts its pass.
@@ -1048,11 +1378,17 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
         };
         let mut counts = CopyCounts::default();
         let mut known = Known::default();
-        let place = Place::parse(cursor).unwrap_or_else(|| Place::start(pass));
+        let parsed = Place::parse(cursor);
+        // The first job of a pass: the keys still missing, within its
+        // time (AM-80b).
+        if parsed.is_none() {
+            self.recheck_misses(&mut budget).await;
+        }
+        let place = parsed.unwrap_or_else(|| Place::start(pass));
         // The time of the sweep is up: the walk has the rest of the pass.
         // A hint is no part of a pass ([`Copier::run_job`] does it).
         let hint = place.phase == Phase::Plan;
-        let late = !hint && !place.walking() && budget.started.0 - pass.0 >= SWEEP_MS;
+        let mut late = !hint && !place.walking() && budget.started.0 - pass.0 >= SWEEP_MS;
         let (mut began, mut ended, mut swept) = (false, false, false);
         // `None` = the pass is over: the walk rests.
         let mut turn = (!hint).then_some(place);
@@ -1060,11 +1396,14 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
             turn = self.enter_walk(pass, &mut began).await?;
         }
         let mut walk = None;
+        // Managed tenant directories listed in this job, after the one the
+        // sweep is at.
+        let mut dirs = Vec::new();
         let (next, outage) = loop {
             let Some(mut place) = turn.take() else {
                 break (None, false);
             };
-            let phase = span(place.phase, pass);
+            let phase = place.span(pass);
             let walked = self
                 .walk(&phase, &mut place, &mut budget, &mut counts, &mut known)
                 .await?;
@@ -1074,22 +1413,60 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
             if walked != Walked::End {
                 break (Some(place.cursor()), walked == Walked::Outage);
             }
-            turn = match (place.phase, place.phase.then()) {
-                (_, Some(then)) => Some(Place::first(then, pass)),
-                // The last phase of the sweep.
-                (Phase::TenantGenerations, None) => {
-                    swept = true;
+            // After the flat layout and after each managed tenant's
+            // directory: the next one, then tenant 0's (AM-80 item 4). With
+            // no request of the job left to find it, the next job does,
+            // from the end of this phase.
+            let after = match place.phase {
+                Phase::Generations => Some(String::new()),
+                Phase::TenantGenerations if !place.tenant.is_empty() => Some(place.tenant.clone()),
+                _ => None,
+            };
+            if let Some(after) = after {
+                match self.next_tenant(&after, &mut dirs, &mut budget).await? {
+                    Next::Tenant(tenant) => {
+                        turn = Some(Place::tenant(tenant, pass));
+                        continue;
+                    }
+                    Next::Later => break (Some(place.cursor()), false),
+                    // The rest of `m/x/` is the walk's: tenant 0's phases,
+                    // and the sweep is reported unfinished, which asks for
+                    // the walk.
+                    Next::GaveUp => {
+                        late = true;
+                        let mut next = Place::tenant(String::new(), pass);
+                        next.incomplete = true;
+                        turn = Some(next);
+                        continue;
+                    }
+                }
+            }
+            turn = match place.phase {
+                Phase::TenantTombstones => {
+                    let then = Phase::TenantGenerations;
+                    let mut next = Place::at(then, then.first(&place.tenant, pass));
+                    next.tenant = place.tenant;
+                    next.incomplete = place.incomplete;
+                    Some(next)
+                }
+                // The last phase of the sweep: tenant 0's. A sweep that
+                // gave up a part is not recorded as come to its end, so the
+                // next pass asks for the walk.
+                Phase::TenantGenerations => {
+                    swept = !place.incomplete;
                     self.enter_walk(pass, &mut began).await?
                 }
                 // The last phase of the walk.
-                (Phase::Tail, None) => {
+                Phase::Tail => {
                     walk = Some(String::new());
                     ended = true;
                     None
                 }
-                (_, None) => None,
+                phase => phase.then().map(|then| Place::first(then, pass)),
             };
         };
+        let known_saved = self.save_known(known).await;
+        let misses_saved = self.settle(&mut counts, true).await;
         Ok(CopyStep {
             counts,
             walk,
@@ -1099,8 +1476,359 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
             next,
             outage,
             late,
-            unsaved: !self.save_known(known).await,
+            unsaved: !(known_saved && misses_saved),
         })
+    }
+
+    /// At the end of a job: the ring loads into `counts`, the alarms of
+    /// what it found, and, for a job of a pass (`page`), the pages of the
+    /// key versions it lacked ([`KEY_MISS_KEY`]). False when what it
+    /// learned of those could not be saved.
+    ///
+    /// A hint does not page: it runs beside the jobs of a pass, which run
+    /// one after another, and two writers of the mark could each page in
+    /// one pass or lose what the other wrote. The record it could not
+    /// copy counts `failed`, which asks for the walk, and the walk's job
+    /// pages.
+    async fn settle(&self, counts: &mut CopyCounts, page: bool) -> bool {
+        let (loads, ms) = self.rings.loaded();
+        counts.ring_loads = loads;
+        counts.ring_ms = ms;
+        // Codes and counts only: no record name reaches an alarm.
+        if counts.cross_scheme + counts.cross_tenant > 0 {
+            let (scheme, tenant) = (counts.cross_scheme, counts.cross_tenant);
+            crate::trace::alert(|| {
+                format!("recovery copy (cross_record) cross_scheme={scheme} cross_tenant={tenant}")
+            });
+        }
+        if counts.unknown_family > 0 {
+            let n = counts.unknown_family;
+            crate::trace::alert(|| format!("recovery copy (unknown_family) records={n}"));
+        }
+        if !page {
+            let _ = self.rings.take_misses();
+            return true;
+        }
+        self.page_misses().await
+    }
+
+    /// [`KEY_MISS_KEY`], without what is forgotten: an entry no job found
+    /// while copying a record for [`KEY_MISS_KEEP_MS`], or that is not
+    /// what a job writes. `None` when it could not be read: it is then not
+    /// written over.
+    async fn read_misses(&self, now: i64) -> Option<BTreeMap<String, MissMark>> {
+        let mut marks = match self.read_mark(KEY_MISS_KEY, KEY_MISS_BYTES).await {
+            Ok(Some(bytes)) => {
+                serde_json::from_slice::<BTreeMap<String, MissMark>>(&bytes).unwrap_or_default()
+            }
+            Ok(None) => BTreeMap::new(),
+            Err(_) => return None,
+        };
+        // Forgetting can only start a count again, never hold a page off:
+        // `first` is kept whatever its age (it only ever makes a page
+        // come sooner), and an entry goes only when no record named it
+        // for a day.
+        let kept = now.saturating_sub(KEY_MISS_KEEP_MS);
+        marks.retain(|name, [first, last, kind]| {
+            *last > kept
+                && *last <= now.saturating_add(PASS_INTERVAL_MS)
+                && *first <= now
+                && miss_kind(*kind).is_some()
+                && miss_of(name).is_some()
+        });
+        Some(marks)
+    }
+
+    async fn save_misses(&self, marks: BTreeMap<String, MissMark>) -> bool {
+        let mut marks = marks;
+        if marks.len() > KEY_MISS_ENTRIES {
+            // The ones seen last stay.
+            let mut by_last: Vec<(String, MissMark)> = marks.into_iter().collect();
+            by_last.sort_by_key(|(_, m)| std::cmp::Reverse(m[1]));
+            by_last.truncate(KEY_MISS_ENTRIES);
+            marks = by_last.into_iter().collect();
+        }
+        // Serializing strings and integers cannot fail.
+        let body = serde_json::to_vec(&marks).unwrap_or_default();
+        put_mark(self.safety, KEY_MISS_KEY, body).await.is_ok()
+    }
+
+    /// Pages each entry of `names` that is due in the pass of `slot`, once
+    /// per pass: a page is sent only by the job that claims it
+    /// ([`KEY_PAGE_PREFIX`], a conditional put), so jobs of one pass that
+    /// overlap (a delivery made again) page it once. A claim that cannot
+    /// be made pages all the same.
+    async fn page_due<'n>(
+        &self,
+        marks: &BTreeMap<String, MissMark>,
+        names: impl Iterator<Item = &'n String>,
+        slot: i64,
+    ) {
+        let due: Vec<(String, String, &str)> = names
+            .filter_map(|name| {
+                let mark = marks.get(name).filter(|m| miss_due(m, slot))?;
+                let kind = miss_kind(mark[2]).map_or("unknown", Miss::code);
+                Some((name.clone(), self.claim_name(slot, name), kind))
+            })
+            .collect();
+        // A group of claims at a time, as the copies go.
+        // Each page right after its own claim, with nothing awaited in
+        // between: a claim made is a page sent, also when the job ends
+        // before the others are. Claim puts that hang until the job is
+        // cancelled (the safety bucket not answering, when no copy is made
+        // either) leave the entries that were not claimed to the next
+        // pass's first job, whose claims have other names: a page comes a
+        // pass later at worst.
+        stream::iter(due)
+            .map(|(name, claim, kind)| async move {
+                let claimed = self.safety.put_if_absent(&claim, Vec::new()).await;
+                if matches!(claimed, Ok(false)) {
+                    return;
+                }
+                let Some((tenant, version)) = miss_of(&name) else {
+                    return;
+                };
+                let version = version.unwrap_or(0);
+                crate::trace::alert(|| {
+                    format!(
+                        "recovery copy ({KEY_MISS_PAGE}) tenant={tenant} version={version} ring={kind}"
+                    )
+                });
+            })
+            .buffer_unordered(CONCURRENCY)
+            .collect::<Vec<()>>()
+            .await;
+    }
+
+    /// The claim of the page of the entry `name` in the pass of `slot`:
+    /// `rc/key-page/<slot>/<tag>`, the tag keyed under the active KEK, so
+    /// that nothing without it can make a claim ahead of time that would
+    /// keep a page off.
+    fn claim_name(&self, slot: i64, name: &str) -> String {
+        let (_, kek) = self.kek.active();
+        let tag = hkdf::Hkdf::<Sha256>::new(None, kek.expose());
+        let mut out = [0u8; 16];
+        let info = format!("velmora/copy-page-claim/v1|{slot}|{name}");
+        // 16 bytes are far below HKDF's limit: this cannot fail.
+        let _ = tag.expand(info.as_bytes(), &mut out);
+        let hex: String = out.iter().map(|b| format!("{b:02x}")).collect();
+        format!("{KEY_PAGE_PREFIX}{slot:016}/{hex}")
+    }
+
+    /// The first job of a pass: pages every entry of [`KEY_MISS_KEY`]
+    /// that is due, so that a key still missing pages in every pass, also
+    /// when only the walk, which rests for hours, comes to the records
+    /// under it (AM-80b). Before that it looks again, within the job's
+    /// time, at the entries of up to [`RECHECK_TENANTS`] tenants, from a
+    /// tenant that moves on each pass, so every tenant comes round: an
+    /// entry whose version loads now (or whose ring reads), or whose
+    /// tenant is shredded or version destroyed, is forgotten; one that is
+    /// still missing keeps its first time and takes what is missing now.
+    /// It does not make an entry seen (its last time stays). Last, it
+    /// removes the claims of earlier passes.
+    async fn recheck_misses(&self, budget: &mut Budget) {
+        let now = self.clock.now().0;
+        let slot = pass_slot(now);
+        // Nothing missing: nothing to page, and no claim of an earlier
+        // pass is left but those of the pass that emptied the mark.
+        let Some(mut marks) = self.read_misses(now).await.filter(|m| !m.is_empty()) else {
+            return;
+        };
+        let tenants: Vec<TenantId> = marks
+            .keys()
+            .filter_map(|name| miss_of(name).map(|(t, _)| t))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        // From the tenant after the one the last recheck came to
+        // ([`RECHECK_KEY`]), so that every tenant comes round also when
+        // the job's time stops a recheck early.
+        let after = self
+            .read_mark(RECHECK_KEY, TENANT_ID_BYTES)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|b| String::from_utf8(b).ok())
+            .unwrap_or_default();
+        let from = tenants
+            .iter()
+            .position(|t| t.as_str() > after.as_str())
+            .unwrap_or(0);
+        let names: Vec<String> = marks.keys().cloned().collect();
+        let mut came_to = None;
+        for tenant in tenants
+            .iter()
+            .cycle()
+            .skip(from)
+            .take(RECHECK_TENANTS.min(tenants.len()))
+        {
+            if self.spent(budget.started) {
+                break;
+            }
+            came_to = Some(tenant.clone());
+            for name in names
+                .iter()
+                .filter(|n| miss_of(n).is_some_and(|(t, _)| &t == tenant))
+            {
+                let Some((_, version)) = miss_of(name) else {
+                    continue;
+                };
+                let now_missing = match version {
+                    None => match self.rings.ring_reads(self.clock, tenant).await {
+                        true => None,
+                        false => Some(Miss::Ring),
+                    },
+                    Some(version) => match self.rings.key_for(self.clock, tenant, version).await {
+                        Ok(_) | Err(RecordCheck::Shredded) | Err(RecordCheck::VersionDestroyed) => {
+                            None
+                        }
+                        Err(RecordCheck::KeyMissing { named: true }) => Some(Miss::Partial),
+                        Err(RecordCheck::KeyMissing { named: false }) => Some(Miss::Unknown),
+                        // Not read now (the ring): kept as it is, and
+                        // paging as it did.
+                        Err(_) => marks.get(name).and_then(|m| miss_kind(m[2])),
+                    },
+                };
+                match now_missing {
+                    None => {
+                        marks.remove(name);
+                    }
+                    Some(miss) => {
+                        if let Some(mark) = marks.get_mut(name) {
+                            mark[2] = miss_code(miss);
+                        }
+                    }
+                }
+            }
+        }
+        // Handled here: what the recheck found does not make an entry
+        // seen.
+        let _ = self.rings.take_misses();
+        let names: Vec<String> = marks.keys().cloned().collect();
+        // Saved before any claim is asked for: a claim that hangs keeps
+        // nothing the recheck learned from the mark.
+        let saved = self.save_misses(marks.clone()).await;
+        self.page_due(&marks, names.iter(), slot).await;
+        // The cursor moves on only past what was saved: otherwise the
+        // same tenants are looked at again.
+        if let Some(tenant) = came_to.filter(|_| saved) {
+            let _ = put_mark(
+                self.safety,
+                RECHECK_KEY,
+                tenant.as_str().as_bytes().to_vec(),
+            )
+            .await;
+        }
+        // The claims of passes before the last one, and any more than one
+        // pass ahead (no job makes one: a job's slot is its own clock's):
+        // best effort, a page of keys from each end. The last pass's and
+        // the next one's stay, for a delivery of either still running (a
+        // queue invocation ends within 15 minutes, one pass).
+        let keep_from = format!("{KEY_PAGE_PREFIX}{:016}/", slot - PASS_INTERVAL_MS);
+        let ahead = format!("{KEY_PAGE_PREFIX}{:016}0", slot + PASS_INTERVAL_MS);
+        let mut stale = Vec::new();
+        for start in ["", ahead.as_str()] {
+            budget.pages += 1;
+            if let Ok(claims) = self.safety.list(KEY_PAGE_PREFIX, start, PAGE).await {
+                stale.extend(
+                    claims
+                        .into_iter()
+                        .filter(|c| c.as_str() < keep_from.as_str() || c.as_str() > ahead.as_str()),
+                );
+            }
+        }
+        stale.sort();
+        stale.dedup();
+        stream::iter(stale)
+            .map(|claim| async move {
+                let _ = self.safety.delete(&claim).await;
+            })
+            .buffer_unordered(CONCURRENCY)
+            .collect::<Vec<()>>()
+            .await;
+    }
+
+    /// Notes what the reloaded rings of this job lacked in
+    /// [`KEY_MISS_KEY`], and pages each of those entries that is due
+    /// ([`Copier::page_due`]). False when the mark could not be read or
+    /// saved. One that cannot be read is not written over: what this job
+    /// lacked then pages if it is a version the chain does not name, and
+    /// a partial ring waits for a job that can read it.
+    async fn page_misses(&self) -> bool {
+        let misses = self.rings.take_misses();
+        if misses.is_empty() {
+            return true;
+        }
+        let now = self.clock.now().0;
+        let slot = pass_slot(now);
+        let read = self.read_misses(now).await;
+        let readable = read.is_some();
+        let mut marks = read.unwrap_or_default();
+        let mut names = Vec::new();
+        for (tenant, version, miss) in misses {
+            let name = miss_name(&tenant, version, miss);
+            let mark = marks
+                .entry(name.clone())
+                .or_insert([slot, now, miss_code(miss)]);
+            mark[1] = mark[1].max(now);
+            mark[2] = miss_code(miss);
+            names.push(name);
+        }
+        // Saved first: a claim that hangs must not keep a new entry from
+        // the mark, which the next pass's first job pages from.
+        let saved = readable && self.save_misses(marks.clone()).await;
+        self.page_due(&marks, names.iter(), slot).await;
+        saved
+    }
+
+    /// The managed tenant whose directory the sweep goes through after
+    /// that of `after` (empty: the first), or empty when none is left and
+    /// tenant 0's comes ([`Next`]); [`Next::Later`] when the job has no
+    /// request left to list with ([`JOB_PAGES`]). `dirs` keeps what the job listed: one listing
+    /// with the delimiter `/` per [`PAGE`] tenant directories. A name
+    /// below `m/x/` that is no managed tenant's id is passed over (the
+    /// walk reaches its keys).
+    async fn next_tenant(
+        &self,
+        after: &str,
+        dirs: &mut Vec<String>,
+        budget: &mut Budget,
+    ) -> std::result::Result<Next, StepError> {
+        dirs.retain(|t| t.as_str() > after);
+        if let Some(next) = dirs.first().cloned() {
+            dirs.remove(0);
+            return Ok(Next::Tenant(next));
+        }
+        let mut start = match after {
+            "" => String::new(),
+            t => past_dir(&format!("{TENANT_DIR}{t}/")),
+        };
+        for _ in 0..LIST_PAGES {
+            // A request of the job's like a page of the source; none left:
+            // `None`, the next job looks.
+            if budget.pages >= JOB_PAGES {
+                return Ok(Next::Later);
+            }
+            budget.pages += 1;
+            let page = self
+                .safety
+                .list_dirs(TENANT_DIR, &start, PAGE)
+                .await
+                .map_err(|_| StepError::Source)?;
+            dirs.extend(page.dirs.iter().filter_map(|dir| {
+                let tenant = dir.strip_prefix(TENANT_DIR)?.strip_suffix('/')?;
+                (tenant > after && TenantId::parse(tenant).is_ok()).then(|| tenant.to_string())
+            }));
+            match page.next {
+                Some(next) if dirs.is_empty() => start = next,
+                _ if !dirs.is_empty() => return Ok(Next::Tenant(dirs.remove(0))),
+                // The end of the listing: tenant 0's phases come.
+                _ => return Ok(Next::Tenant(String::new())),
+            }
+        }
+        // `LIST_PAGES` requests of names that are no managed tenant's,
+        // and more to come.
+        Ok(Next::GaveUp)
     }
 
     /// Where the walk of the pass that started at `pass` goes on, or
@@ -1230,11 +1958,17 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
     /// Sends the hint for the article plan of a post job that is done
     /// ([`plan_hint`]). True when one was sent. One that cannot be sent
     /// leaves the plan to the walk, and asks for it.
-    pub async fn hint<J: JobSink>(&self, jobs: &J, job: &Job, outcome: &JobOutcome) -> bool {
+    pub async fn hint<J: JobSink>(
+        &self,
+        jobs: &J,
+        job: &Job,
+        outcome: &JobOutcome,
+        scope: &TenantScope,
+    ) -> bool {
         if self.maintenance == Maintenance::Restore {
             return false;
         }
-        send_hint(self.safety, jobs, job, outcome, self.clock.now()).await
+        send_hint(self.safety, jobs, job, outcome, scope, self.clock.now()).await
     }
 
     /// The job of a hint: makes one article plan equal over there.
@@ -1272,9 +2006,10 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
                 }
                 // Not written, or removed: nothing to send.
                 Plan::Absent => None,
-                Plan::Unreadable => {
-                    counts.source_unreadable = 1;
-                    None
+                Plan::Not(why) => {
+                    count_why(&mut counts, why);
+                    // A key that did not load now may load later.
+                    (why == Why::KeyFailed).then_some(StepError::Hint)
                 }
                 Plan::Refused => {
                     counts.refused = 1;
@@ -1293,7 +2028,10 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
                 }
             }
         };
-        let counts = (!paused).then_some(counts);
+        let mut counts = (!paused).then_some(counts);
+        if let Some(counts) = counts.as_mut() {
+            let _ = self.settle(counts, false).await;
+        }
         if why.is_some() && young {
             let again = JobOutcome::Retry {
                 delay_secs: HINT_RETRY_SECS,
@@ -1410,6 +2148,7 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
             let items: Vec<Item> = source
                 .iter()
                 .filter(|e| !e.key.starts_with(TENANT_KEY_PREFIX))
+                .filter(|e| span.walk.is_none_or(|pass| !fresh_managed(&e.key, pass)))
                 .map(|entry| {
                     let copy = there.get(entry.key.as_str()).copied();
                     let what = if young(&entry.key, now) {
@@ -1584,7 +2323,7 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
                     Named::Plans(keys) => &keys[n..],
                     Named::Segments(head) => {
                         let Some(at) = head.segment_of(n as u32) else {
-                            unread = Some(Copied::Unreadable);
+                            unread = Some(Copied::Not(Why::Unreadable));
                             break;
                         };
                         if held.as_ref().map(|(index, _)| *index) != Some(at) {
@@ -1614,13 +2353,13 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
                     .await;
                 let (mut asked, mut down, mut lead) = (0, 0, 0);
                 for (at, plan) in looked.into_iter().enumerate() {
-                    asked += usize::from(!matches!(plan, Plan::Absent | Plan::Unreadable));
+                    asked += usize::from(!matches!(plan, Plan::Absent | Plan::Not(_)));
                     match plan {
                         Plan::There => {}
                         Plan::Sent => counts.copied += 1,
                         Plan::Absent => continue,
-                        Plan::Unreadable => {
-                            counts.source_unreadable += 1;
+                        Plan::Not(why) => {
+                            count_why(counts, why);
                             continue;
                         }
                         Plan::Failed => {
@@ -1729,12 +2468,20 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
                 What::Same => Some(Copied::Same),
                 What::Copy(_) => copied,
             };
-            match copied {
+            if copied == Some(Copied::Gone) {
                 // Removed since it was listed: not a record any more.
-                Some(Copied::Gone) => continue,
+                continue;
+            }
+            // A name of no known family alarms in every pass that comes
+            // to it, sent or not (AM-80).
+            if family(&item.entry.key) == Family::Unknown {
+                counts.unknown_family += 1;
+            }
+            match copied {
+                Some(Copied::Gone) => {}
                 Some(Copied::Done) => counts.copied += 1,
                 Some(Copied::Same) => counts.same += 1,
-                Some(Copied::Unreadable) => counts.source_unreadable += 1,
+                Some(Copied::Not(why)) => count_why(counts, why),
                 Some(Copied::Failed | Copied::Down) => counts.failed += 1,
                 Some(Copied::Refused) => counts.refused += 1,
                 Some(Copied::Held) => counts.pending += 1,
@@ -1790,8 +2537,10 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
             Ok(None) => return Read::Is(Copied::Gone),
             Err(_) => return Read::Is(Copied::Failed),
         };
-        let Ok(plain) = open_manifest(self.kek, key, &bytes) else {
-            return Read::Is(Copied::Unreadable);
+        let plain = match self.check(key, &bytes).await {
+            Ok(Some(plain)) => plain,
+            Ok(None) => return Read::Is(Copied::Not(Why::Unreadable)),
+            Err(copied) => return Read::Is(copied),
         };
         // The listing may name another digest than the MD5 of the bytes;
         // an equal copy is not sent again.
@@ -1806,7 +2555,7 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
                     bytes,
                     named: Named::Segments(Box::new(head)),
                 },
-                Err(_) => Read::Is(Copied::Unreadable),
+                Err(_) => Read::Is(Copied::Not(Why::Unreadable)),
             };
         }
         if !plans {
@@ -1821,7 +2570,52 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
                 bytes,
                 named: Named::Plans(plans),
             },
-            None => Read::Is(Copied::Unreadable),
+            None => Read::Is(Copied::Not(Why::Unreadable)),
+        }
+    }
+
+    /// The one check of the record at `key` ([`check_record`]): its
+    /// plaintext when it is to be sent (`None` for a control record or an
+    /// anchor; that of a v1 manifest for a name of no known family), or
+    /// what it counts as.
+    async fn check(
+        &self,
+        key: &str,
+        bytes: &[u8],
+    ) -> std::result::Result<Option<Zeroizing<Vec<u8>>>, Copied> {
+        let check = check_record(key, bytes, self.kek, self.rings, self.clock).await;
+        if let Some(copied) = why(&check) {
+            return Err(copied);
+        }
+        Ok(match check {
+            RecordCheck::Proved(plain) | RecordCheck::Unknown(plain) => plain,
+            _ => None,
+        })
+    }
+
+    /// Reads segment `index` of `head`, a head stored in `layout`, and
+    /// opens it as the head names it, with the key the head's tenant
+    /// holds for it ([`record_open`]): its sealed bytes and its extents,
+    /// or what the record of the head counts as.
+    async fn open_segment(
+        &self,
+        head: &GenerationHead,
+        layout: &Layout,
+        index: usize,
+    ) -> std::result::Result<(Vec<u8>, Vec<ExtentRecord>), Copied> {
+        let name = head.segment_key(layout, index);
+        let sealed = match self.safety.get(&name, None).await {
+            Ok(Some(sealed)) => sealed,
+            Ok(None) => return Err(Copied::Not(Why::Unreadable)),
+            Err(_) => return Err(Copied::Failed),
+        };
+        let opener = match record_open(&name, &sealed, self.kek, self.rings, self.clock).await {
+            Ok(opener) => opener,
+            Err(check) => return Err(why(&check).unwrap_or(Copied::Not(Why::Unreadable))),
+        };
+        match head.open_segment(&opener, layout, index, &sealed) {
+            Ok(extents) => Ok((sealed, extents)),
+            Err(e) => Err(why(&open_failed(&e)).unwrap_or(Copied::Not(Why::Unreadable))),
         }
     }
 
@@ -1835,11 +2629,8 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
         layout: &Layout,
         index: usize,
     ) -> std::result::Result<Vec<String>, Copied> {
-        match read_segment(self.safety, self.kek, layout, head, index).await {
-            Ok(extents) => segment_plan_keys(&extents, layout).ok_or(Copied::Unreadable),
-            Err(BridgeError::Blob(_)) => Err(Copied::Failed),
-            Err(_) => Err(Copied::Unreadable),
-        }
+        let (_, extents) = self.open_segment(head, layout, index).await?;
+        segment_plan_keys(&extents, layout).ok_or(Copied::Not(Why::Unreadable))
     }
 
     /// Makes every segment of `head` equal over there, in order and
@@ -1872,14 +2663,10 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
         let mut sent = 0;
         for index in 0..segments {
             let name = head.segment_key(layout, index);
-            let sealed = match self.safety.get(&name, None).await {
-                Ok(Some(sealed)) => sealed,
-                Ok(None) => return Some(Copied::Unreadable),
-                Err(_) => return Some(Copied::Failed),
+            let sealed = match self.open_segment(head, layout, index).await {
+                Ok((sealed, _)) => sealed,
+                Err(copied) => return Some(copied),
             };
-            if head.open_segment(self.kek, layout, index, &sealed).is_err() {
-                return Some(Copied::Unreadable);
-            }
             match self.remote.head(self.clock, &name).await {
                 Ok(copy) if equal(copy.as_ref(), sealed.len() as u64, &md5_hex(&sealed)) => {
                     continue
@@ -1911,7 +2698,7 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
     /// whichever name it was written under.
     async fn plan(&self, key: &str) -> Plan {
         let plan = self.plan_at(key).await;
-        if !matches!(plan, Plan::Absent | Plan::Unreadable) {
+        if !matches!(plan, Plan::Absent | Plan::Not(_)) {
             return plan;
         }
         match other_plan_key(&TenantScope::tenant_zero(), key) {
@@ -1930,8 +2717,11 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
             Ok(None) => return Plan::Absent,
             Err(_) => return Plan::Failed,
         };
-        if open_manifest(self.kek, key, &bytes).is_err() {
-            return Plan::Unreadable;
+        match self.check(key, &bytes).await {
+            Ok(_) => {}
+            Err(Copied::Not(why)) => return Plan::Not(why),
+            Err(Copied::Gone) => return Plan::Absent,
+            Err(_) => return Plan::Failed,
         }
         match self.remote.head(self.clock, key).await {
             Ok(copy) if equal(copy.as_ref(), bytes.len() as u64, &md5_hex(&bytes)) => {
@@ -1956,8 +2746,8 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
             Ok(None) => return Copied::Gone,
             Err(_) => return Copied::Failed,
         };
-        if open_manifest(self.kek, key, &bytes).is_err() {
-            return Copied::Unreadable;
+        if let Err(copied) = self.check(key, &bytes).await {
+            return copied;
         }
         // The listing may name another digest than the MD5 of the bytes;
         // an equal copy is not sent again.

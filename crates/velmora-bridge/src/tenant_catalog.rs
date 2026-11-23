@@ -119,6 +119,16 @@ pub trait UnitPort {
     async fn call(&self, call: &UnitCall) -> Result<UnitAnswer>;
 }
 
+/// Loads the tenant key ring that seals a managed tenant's recovery
+/// records on the job path (the post job's article plan, ADR §3.2):
+/// `Root::tenant_keys` in the Worker.
+pub type RingLoader = std::rc::Rc<
+    dyn Fn() -> futures_util::future::LocalBoxFuture<
+        'static,
+        Result<std::rc::Rc<crate::keys::tk::LoadedRing>>,
+    >,
+>;
+
 /// The catalogue of one managed tenant's unit, for its jobs.
 pub struct TenantCatalog<P: UnitPort, S: Catalog> {
     port: P,
@@ -133,9 +143,19 @@ pub struct TenantCatalog<P: UnitPort, S: Catalog> {
     /// The outbox leases this run claimed: given back before the job runs
     /// once more ([`TenantCatalog::give_back`]).
     claimed: std::cell::RefCell<Vec<Lease>>,
+    /// The ring of the tenant's records ([`TenantCatalog::with_ring`]).
+    /// Without one, a record of the tenant is not sealed: the job fails.
+    ring: Option<RingLoader>,
 }
 
 impl<P: UnitPort, S: Catalog> TenantCatalog<P, S> {
+    /// The catalogue with the loader of the tenant's key ring, which
+    /// seals its recovery records (VMR2, [`Catalog::record_ring`]).
+    pub fn with_ring(mut self, ring: RingLoader) -> Self {
+        self.ring = Some(ring);
+        self
+    }
+
     /// `seqs`: the job's numbers (its message names them, ADR §2.4 rule 9).
     pub fn new(port: P, shared: S, name: UnitName, seqs: Seqs) -> Self {
         Self::with_latest(port, shared, name, seqs, LatestSeqs::new(seqs))
@@ -153,6 +173,7 @@ impl<P: UnitPort, S: Catalog> TenantCatalog<P, S> {
             refusal: std::cell::Cell::new(None),
             latest,
             claimed: std::cell::RefCell::default(),
+            ring: None,
         }
     }
 
@@ -285,6 +306,17 @@ fn answer_seqs(answer: &UnitAnswer) -> Option<Seqs> {
 // The methods off the job path keep the trait's argument names.
 #[allow(unused_variables)]
 impl<P: UnitPort, S: Catalog> Catalog for TenantCatalog<P, S> {
+    /// The tenant's ring, or a refusal: a unit's tenant is a managed
+    /// tenant, whose records are never sealed under the KEK.
+    async fn record_ring(&self) -> Option<Result<std::rc::Rc<crate::keys::tk::LoadedRing>>> {
+        const ERR_NO_RING: BridgeError =
+            BridgeError::Crypto("unit job: no tenant key ring for the tenant's records");
+        Some(match &self.ring {
+            Some(load) => load().await,
+            None => Err(ERR_NO_RING),
+        })
+    }
+
     async fn advance(
         &self,
         l: &Lease,

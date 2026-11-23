@@ -39,6 +39,22 @@ fn tenant() -> TenantId {
     TenantId::parse("t_00000000000000a7").unwrap()
 }
 
+/// The tenant's key ring: its records on the job path (the post job's
+/// article plan) are VMR2 under it.
+fn ring() -> velmora_bridge::tenant_catalog::RingLoader {
+    let id = velmora_bridge::TenantId::parse(tenant().as_str()).unwrap();
+    let key =
+        Rc::new(velmora_bridge::crypto::scheme2::TenantKey::from_bytes(&id, 1, [7u8; 32]).unwrap());
+    Rc::new(move || {
+        let key = Rc::clone(&key);
+        Box::pin(async move {
+            Ok(Rc::new(
+                velmora_bridge::keys::tk::LoadedRing::new(key, Vec::new()).unwrap(),
+            ))
+        })
+    })
+}
+
 fn own() -> UnitName {
     UnitName::new(tenant(), 0)
 }
@@ -336,7 +352,8 @@ impl Fx {
                 state_seq: job_seq,
                 keys_seq: 0,
             },
-        );
+        )
+        .with_ring(ring());
         let bridge = Bridge {
             catalog,
             safety: MemBlobStore::new(),
@@ -1061,4 +1078,74 @@ async fn the_lease_of_a_refused_run_is_given_back_before_the_run_once_more() {
     // A second give-back finds nothing of its own to free but the new
     // claim, which it gives back too: the runs are sequential.
     cat.give_back(now).await.unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn managed_post_writes_a_vmr2_plan_under_its_tenant() {
+    use velmora_bridge::crypto::scheme2::open_record_v2;
+    use velmora_bridge::keys::record::TkRing;
+    use velmora_bridge::recovery::ArticleManifest;
+
+    let fx = Fx::new().await;
+    let bucket = fx.bucket("scratch").await;
+    let object = fx.put(&bucket, "object", b"managed article").await;
+    let outcome = fx
+        .bridge
+        .run_job(&scope(), &object.job(OutboxStage::Post))
+        .await;
+    assert!(matches!(outcome, JobOutcome::Ack), "{outcome:?}");
+    assert_eq!(fx.outbox(&object, "stage").await, "verify");
+    let flat = format!("m/art/{}", object.extent);
+    let name = format!("m/x/{}/art/{}", tenant(), object.extent);
+    assert!(fx.bridge.safety.get(&flat, None).await.unwrap().is_none());
+    let bytes = fx
+        .bridge
+        .safety
+        .get(&name, None)
+        .await
+        .unwrap()
+        .expect("managed plan");
+    assert!(bytes.starts_with(b"VMR2"));
+    let loaded = fx.bridge.catalog.record_ring().await.unwrap().unwrap();
+    let key = loaded.current().unwrap();
+    let plain = open_record_v2(key, key.tenant(), &name, &bytes).unwrap();
+    let plan: ArticleManifest = serde_json::from_slice(&plain).unwrap();
+    assert_eq!(plan.extent_id, object.extent.as_str());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn managed_post_without_a_ring_fails_without_writing_any_plan() {
+    let mut fx = Fx::new().await;
+    let bucket = fx.bucket("scratch").await;
+    let object = fx.put(&bucket, "object", b"must not be posted").await;
+    fx.bridge.catalog = TenantCatalog::new(
+        Local {
+            unit: Rc::clone(&fx.unit),
+            clock: Rc::clone(&fx.clock),
+            calls: Rc::clone(&fx.calls),
+        },
+        SqlCatalog::new(RusqliteSql::with_schema().unwrap()),
+        own(),
+        Seqs {
+            state_seq: 3,
+            keys_seq: 0,
+        },
+    );
+    assert!(matches!(
+        fx.bridge.catalog.record_ring().await,
+        Some(Err(_))
+    ));
+    fx.bridge
+        .run_job(&scope(), &object.job(OutboxStage::Post))
+        .await;
+    assert_eq!(fx.outbox(&object, "stage").await, "post");
+    assert_eq!(fx.outbox(&object, "last_error").await, "blob-error");
+    assert_eq!(fx.server.posted_count().await, 0);
+    for prefix in ["m/art/".to_string(), format!("m/x/{}/art/", tenant())] {
+        let name = format!("{prefix}{}", object.extent);
+        assert!(
+            fx.bridge.safety.get(&name, None).await.unwrap().is_none(),
+            "{name}"
+        );
+    }
 }

@@ -73,6 +73,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use velmora::rng::SystemRng;
 
+use zeroize::Zeroizing;
+
 use crate::crypto::{open_manifest, seal_manifest};
 use crate::plan::StoredPlan;
 use crate::ports::{BlobMeta, BlobStore, Catalog, Kek};
@@ -81,6 +83,22 @@ use crate::types::{
     valid_yenc_name, ArticleRow, ArticleState, BridgeError, Bucket, BucketId, ExtentId, ExtentRow,
     ExtentState, GenerationId, GenerationRow, GenerationState, Result, SafetyState, UnixMs,
 };
+
+pub mod check;
+
+/// What opens a sealed data record stored at a name: the KEK (a v1
+/// manifest, tenant 0), or [`check::RecordOpen`] of the recovery copy,
+/// which opens a managed tenant's `VMR2` records with its ring.
+pub trait RecordOpener {
+    fn open_record(&self, name: &str, sealed: &[u8]) -> Result<Zeroizing<Vec<u8>>>;
+}
+
+/// Tenant 0's records: v1 manifests under the KEK.
+impl<K: Kek> RecordOpener for K {
+    fn open_record(&self, name: &str, sealed: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
+        open_manifest(self, name, sealed)
+    }
+}
 
 /// Every recovery record lives under this prefix.
 pub const RECORD_PREFIX: &str = "m/";
@@ -1017,9 +1035,9 @@ impl GenerationHead {
     /// under the name, say the set and the index, and hold the count of
     /// extents the head says, from its `seq` and offset on without a
     /// gap, of its size together.
-    pub fn open_segment<K: Kek>(
+    pub fn open_segment<O: RecordOpener + ?Sized>(
         &self,
-        kek: &K,
+        opener: &O,
         layout: &Layout,
         index: usize,
         sealed: &[u8],
@@ -1029,7 +1047,7 @@ impl GenerationHead {
         if sha[..] != entry.sha256[..] {
             return Err(ERR_SEGMENT_OTHER);
         }
-        let plain = open_manifest(kek, &self.segment_key(layout, index), sealed)?;
+        let plain = opener.open_record(&self.segment_key(layout, index), sealed)?;
         if record_version(&plain) != Some(SEGMENTED_VERSION) {
             return Err(ERR_VERSION);
         }
@@ -1183,6 +1201,34 @@ impl<C: Catalog, K: Kek> RecordSeal for Sealer<'_, C, K> {
                 crate::crypto::scheme2::seal_record_v2(tk, name, plaintext, &mut SystemRng)
             }
         }
+    }
+}
+
+/// A managed tenant's record with no tenant key to seal it under.
+const ERR_NO_RING: BridgeError =
+    BridgeError::Crypto("a managed tenant's record needs its tenant key");
+
+/// The job path's [`RecordSeal`] (the post job's article plan): tenant
+/// 0's records under the KEK, a managed tenant's as VMR2 under its
+/// current tenant key from the catalogue's ring ([`Catalog::record_ring`],
+/// ADR §3.2). Without a ring a managed tenant's record is refused, never
+/// sealed under the KEK: a v1 body under a managed tenant's name is
+/// another scheme's to every reader, and the recovery copy refuses it.
+pub struct ScopeSealer<'a, C, K> {
+    pub scope: &'a TenantScope,
+    pub catalog: &'a C,
+    pub kek: &'a K,
+}
+
+impl<C: Catalog, K: Kek> RecordSeal for ScopeSealer<'_, C, K> {
+    async fn seal_record(&self, name: &str, plaintext: &[u8]) -> Result<Vec<u8>> {
+        use crate::crypto::scheme2::Scheme;
+        if Scheme::of(self.scope.tenant_id())? == Scheme::One {
+            return seal_manifest(self.kek, name, plaintext, &mut SystemRng);
+        }
+        let ring = self.catalog.record_ring().await.ok_or(ERR_NO_RING)??;
+        let tk = crate::keys::record::TkRing::current(&*ring).ok_or(ERR_NO_RING)?;
+        crate::crypto::scheme2::seal_record_v2(tk, name, plaintext, &mut SystemRng)
     }
 }
 
@@ -1419,7 +1465,7 @@ pub async fn read_key_revocation<B: BlobStore, K: Kek>(
 /// extent's plan never changes, so a second write stores the same plan
 /// again; it also replaces a record that no longer opens. The caller
 /// posts only after this returned `Ok`.
-pub async fn write_article_plan<B: BlobStore, K: Kek>(
+pub async fn write_article_plan<B: BlobStore, K: RecordSeal>(
     safety: &B,
     kek: &K,
     layout: &Layout,
@@ -1442,7 +1488,7 @@ pub async fn write_article_plan<B: BlobStore, K: Kek>(
 
 /// [`write_article_plan`] for a plan as the catalogue holds it: the
 /// record also carries its seeded packed form and its parity addendum.
-pub async fn write_stored_plan<B: BlobStore, K: Kek>(
+pub async fn write_stored_plan<B: BlobStore, K: RecordSeal>(
     safety: &B,
     kek: &K,
     layout: &Layout,
@@ -1538,7 +1584,7 @@ pub async fn read_stored_generation<B: BlobStore, K: Kek>(
 /// `Err(BridgeError::Blob)` = the store could not be asked. Every other
 /// error says the record is unreadable: the segment is not stored, or
 /// is not the one the head names.
-pub async fn read_segment<B: BlobStore, K: Kek>(
+pub async fn read_segment<B: BlobStore, K: RecordOpener + ?Sized>(
     safety: &B,
     kek: &K,
     layout: &Layout,

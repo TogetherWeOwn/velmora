@@ -584,6 +584,12 @@ fn check_record_name(name: &str, tenant: &TenantId) -> Result<()> {
     }
 }
 
+/// Whether `e` is the error a reader alarms on: a record whose name or
+/// envelope names another tenant ([`open_record_v2`], [`record_v2_header`]).
+pub fn is_cross_tenant(e: &BridgeError) -> bool {
+    matches!((e, &ERR_RECORD_TENANT), (BridgeError::Crypto(a), BridgeError::Crypto(b)) if a == b)
+}
+
 /// Whether `sealed` starts like a VMR2 record. Says nothing about
 /// whether it opens.
 pub fn is_record_v2(sealed: &[u8]) -> bool {
