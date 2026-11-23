@@ -4714,7 +4714,7 @@ async fn the_parity_migration_applies_to_a_catalogue_with_plans() {
         MIGRATION_0020,
         MIGRATION_0021,
         // The current publisher uses this column even with recording off.
-        MIGRATION_0024,
+        MIGRATION_0026,
     ] {
         db.apply(script).unwrap();
     }
@@ -4740,7 +4740,7 @@ async fn the_parity_migration_applies_to_a_catalogue_with_plans() {
         .apply("ALTER TABLE extents DROP COLUMN plain_crc64")
         .unwrap();
     fx.cat.sql.0.apply(MIGRATION_0022).unwrap();
-    fx.cat.sql.0.apply(MIGRATION_0024).unwrap();
+    fx.cat.sql.0.apply(MIGRATION_0026).unwrap();
 
     assert_eq!(fx.cat.sql.0.query(&extents, &[]).await.unwrap(), before);
     assert_eq!(
