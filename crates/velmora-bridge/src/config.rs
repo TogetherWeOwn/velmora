@@ -911,19 +911,18 @@ impl BridgeConfig {
         if inflight_budget_bytes < max_extent_bytes.saturating_mul(2) {
             return Err(ConfigError::Invalid("INFLIGHT_BUDGET_BYTES".into()));
         }
-        // Only as many sockets as the budget has room for: what a cold
-        // read of the largest extent charges is counted from the
-        // ciphertext, which is a little larger than the plaintext. A
-        // read that could never be charged would fail every time.
-        let cipher = velmora::media::ciphertext_size(max_extent_bytes)
+        // Lowering the upload limit must not strand larger extents that
+        // were already written. Size the cold read and its socket count
+        // from the hard limit's ciphertext, not this config's limit.
+        let max_cipher = velmora::media::ciphertext_size(MAX_EXTENT_BYTES_LIMIT)
             .ok_or_else(|| ConfigError::Invalid("MAX_EXTENT_BYTES".into()))?;
         // A read that lost articles holds the rebuild beside the
         // extent. Count it even with PARITY=off: that rolls back parity
         // for new plans, but reads still rebuild from stored parity.
-        let rebuild = crate::fetch::cold_rebuild_most(cipher);
+        let rebuild = crate::fetch::cold_rebuild_most(max_cipher);
         let fits = |sockets: &u32| {
-            let step = crate::fetch::cold_step_bytes(cipher, *sockets);
-            crate::fetch::cold_read_bytes(cipher, *sockets) <= inflight_budget_bytes
+            let step = crate::fetch::cold_step_bytes(max_cipher, *sockets);
+            crate::fetch::cold_read_bytes(max_cipher, *sockets) <= inflight_budget_bytes
                 && step.saturating_add(rebuild) <= inflight_budget_bytes
         };
         // Not even one socket: the budget is under twice the ciphertext,
@@ -947,8 +946,6 @@ impl BridgeConfig {
         // Lowering the upload limit must not strand an extent written
         // under a previous config. Jobs use their own budget, not the
         // request budget; allow for one such post or a verify with a repost.
-        let max_cipher = velmora::media::ciphertext_size(MAX_EXTENT_BYTES_LIMIT)
-            .ok_or_else(|| ConfigError::Invalid("MAX_EXTENT_BYTES".into()))?;
         let job_budget_min = inflight_budget_bytes.max(crate::jobs::extent_job_budget_floor(
             max_cipher,
             post_sockets,

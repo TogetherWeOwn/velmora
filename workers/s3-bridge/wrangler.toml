@@ -207,8 +207,10 @@ SLOT_WAIT = "poll"
 #   CATALOGUE_ID (main): names this catalogue in its rollback stamp keys in SAFETY (rs/<id>/<counter>). Never change it for a catalogue in use.
 #   POST_SOCKETS (4): connections one post job opens, 1 to 8, each on its own provider permit.
 #     A job is one source address to a provider, however many connections it holds there.
+#   INFLIGHT_BUDGET_BYTES: at least 43,658,464 bytes for a cold read of a 16 MiB extent with a full parity rebuild.
+#     The floor still applies with a smaller MAX_EXTENT_BYTES or PARITY off: existing extents can be that large and have parity.
 #   COLD_SOCKETS (4; production sets 8 above): connections one GET reads from Usenet over, 1 to 8, each on its own
-#     provider permit. Fewer are used when INFLIGHT_BUDGET_BYTES has no room for that many beside an extent and its cache write.
+#     provider permit. Fewer are used if INFLIGHT_BUDGET_BYTES cannot fit that many for a cold read of a 16 MiB extent.
 #   JOB_BUDGET_BYTES: at least INFLIGHT_BUDGET_BYTES and enough to post a 16 MiB extent with parity or repost it beside a verify job.
 #     The floor includes the configured post sockets and applies even with a smaller MAX_EXTENT_BYTES or PARITY off.
 #     If unset, INFLIGHT_BUDGET_BYTES must meet that floor. The upper bound is 1.5 times INFLIGHT_BUDGET_BYTES or 90 MiB, whichever is more.

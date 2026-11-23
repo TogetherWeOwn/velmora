@@ -240,6 +240,75 @@ async fn posted_for_get(
     }
 }
 
+async fn cold_get_at_request_floor(lose_articles: bool) {
+    let body = marked_plaintext(16 * 1024 * 1024);
+    let mut cold = posted_for_get(&body, lose_articles, false, None).await;
+    assert_eq!(cold.extent.cipher_size, 16_781_360);
+    if lose_articles {
+        let stored = cold
+            .svc
+            .bridge
+            .catalog
+            .stored_plan(&cold.extent.id)
+            .await
+            .unwrap();
+        let parity = stored
+            .parity_plan(&cold.extent.id, cold.extent.cipher_size)
+            .unwrap()
+            .unwrap();
+        assert_eq!(parity.articles.len(), 4);
+        for row in &stored.rows[..4] {
+            cold.nntp.servers[0].hide(&row.message_id).await;
+        }
+    }
+
+    // Restart with the lower upload limit and no new parity plans.
+    let mut cfg = config::BridgeConfig::from_vars(|name| {
+        Some(match name {
+            "ENVIRONMENT" => "dev",
+            "S3_HOST" => service_support::HOST,
+            "S3_REGION" => service_support::REGION,
+            "MAX_EXTENT_BYTES" => "4194304",
+            "REQUIRED_BACKBONES" | "VERIFY_DELAY_SECS" | "VELMORA_KEK_ACTIVE" => "1",
+            "SAFETY_MIN_AGE_SECS" => "0",
+            "NEWSGROUPS" => "alt.binaries.test",
+            "INFLIGHT_BUDGET_BYTES" => "43658464",
+            "COLD_SOCKETS" => "8",
+            "GC_MODE" | "MAINTENANCE" | "PARITY" | "SERVER_SIDE_COPY" => "off",
+            "VELMORA_KEK_1" => "ERERERERERERERERERERERERERERERERERERERERERE=",
+            "ADMIN_TOKEN" => "admin-token-fixture-admin-token-fixture",
+            "NNTP_PROVIDERS" => r#"[{"id":"p0","host":"127.0.0.1","port":11119,"tls":false,"user":"fixture","pass":"fixture","backbone":"bb0","post":true,"read":true,"max_conns":2}]"#,
+            _ => return None,
+        }.into())
+    })
+    .unwrap();
+    assert_eq!(
+        cfg.cold_sockets, 7,
+        "sockets at the hard-limit request floor"
+    );
+    let bridge = Rc::get_mut(&mut cold.svc.bridge).unwrap();
+    cfg.providers.clone_from(&bridge.cfg.providers);
+    bridge.budget = ByteBudget::new(cfg.inflight_budget_bytes);
+    bridge.cfg = cfg;
+
+    let response = cold.get().await;
+    response.expect(200);
+    assert!(
+        response.body == body,
+        "cold GET did not return the original bytes"
+    );
+}
+
+#[tokio::test]
+async fn cold_get_at_request_floor_reads_a_preexisting_hard_limit_extent() {
+    cold_get_at_request_floor(false).await;
+}
+
+#[tokio::test]
+async fn cold_get_at_request_floor_rebuilds_a_preexisting_hard_limit_extent() {
+    cold_get_at_request_floor(true).await;
+}
+
 /// Exercise the S3 GET with one permit shared by two same-tier read
 /// providers. The second provider has either one required parity article
 /// or one required data article.
