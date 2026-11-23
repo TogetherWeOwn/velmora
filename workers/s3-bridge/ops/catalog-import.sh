@@ -71,6 +71,26 @@ get() {
   [[ -s $out ]] || die "empty download for $key, see $log"
 }
 
+get_part() {
+  local key=$1 out=$2 log=$3 expected_bytes=$4 limit status=0
+  shift 4
+  limit=$((expected_bytes + 1))
+  local -a download
+  if [[ -n $remote ]]; then
+    download=(rclone cat "$remote:$BUCKET/$key" --head "$limit")
+  else
+    download=("$wrangler" r2 object get "$BUCKET/$key" --pipe --remote "$@")
+  fi
+  # Keep data out of the diagnostic log and cap disk use even if the
+  # object is bigger than declared. Closing the pipe can stop the sender.
+  { "${download[@]}" </dev/null 2>&1 >&3 | catalog_redact_log >>"$log"; } 3>&1 |
+    head -c "$limit" >"$out" || status=$?
+  if (( status != 0 )) && [[ $(wc -c <"$out") != "$limit" ]]; then
+    return 1
+  fi
+  [[ -s $out ]] || die "empty download for $key, see $log"
+}
+
 # Return 2 only when the exact listing is empty or Wrangler reports R2 HTTP 404.
 get_restore_object() {
   local key=$1 out=$2 log=$3 listing
@@ -124,7 +144,7 @@ verify_target() {
       while :; do
         query=$(python3 -I "$HERE/sql_longest_statement.py" page "$table_row" "$cursor")
         verify_log="$LOG_DIR/d1-row-count-$index-$page.log"
-        catalog_capture "$WORK/rows.json" "$verify_log" "$wrangler" d1 execute "$target" \
+        catalog_capture "$WORK/rows.json" "$verify_log" "$wrangler" d1 execute "$resolved_id" \
           --remote --json --command "$query" "$@" || die "could not count rows in $table, see $verify_log; retry to resume verification"
         n=$(jq -er '.[0].results | select(length == 1) | .[0].n |
           select(type == "number" and . >= 0 and . <= 5000 and floor == .)' \
@@ -141,7 +161,7 @@ verify_target() {
       if [[ $found != "$expected" ]]; then
         local mismatch="row count for $table: expected $expected, found $found; restore not verified"
         local mismatch_log="$LOG_DIR/d1-mismatch.log"
-        catalog_logged "$mismatch_log" "$wrangler" d1 execute "$target" --remote --json \
+        catalog_logged "$mismatch_log" "$wrangler" d1 execute "$resolved_id" --remote --json \
           --command "UPDATE _velmora_import_incomplete SET phase='mismatch' WHERE phase='verify'" "$@" ||
           die "$mismatch; could not record the mismatch, see $mismatch_log"
         die "$mismatch; delete and recreate the partial target before retry"
@@ -150,7 +170,7 @@ verify_target() {
     done <"$WORK/rows.jsonl"
   fi
   local clear_log="$LOG_DIR/d1-clear-import-marker.log"
-  catalog_logged "$clear_log" "$wrangler" d1 execute "$target" --remote --json \
+  catalog_logged "$clear_log" "$wrangler" d1 execute "$resolved_id" --remote --json \
     --command 'DROP TABLE _velmora_import_incomplete' "$@" || die "could not clear the import marker, see $clear_log"
 }
 
@@ -169,6 +189,8 @@ IFS=$'\t' read -r resolved_id resolved_name <<<"$resolved"
 expected_id=${VELMORA_IMPORT_DATABASE_ID:-<unset>}
 [[ $expected_id == "$resolved_id" ]] ||
   die "refusing to load into $resolved_name: resolved UUID $resolved_id, VELMORA_IMPORT_DATABASE_ID=$expected_id"
+# All subsequent D1 commands use the confirmed UUID. Wrangler would
+# otherwise resolve the supplied name or binding again for every command.
 catalog_lock import "$resolved_id" "${resolved_id,,}"
 if [[ ${VELMORA_IMPORT_PRODUCTION:-} != yes &&
       ( $resolved_name == velmora-catalog || $resolved_name == CATALOG || $resolved_name == "$DB" ) ]]; then
@@ -180,7 +202,7 @@ snapshot_ref="$BUCKET/$prefix"
 verification_plan="$WORK/verification.json"
 preflight_log="$LOG_DIR/d1-preflight.log"
 user_table_select="SELECT 1 FROM sqlite_master WHERE type='table' AND substr(name,1,4) <> '_cf_' AND substr(name,1,7) <> 'sqlite_' LIMIT 1"
-catalog_capture "$WORK/preflight.json" "$preflight_log" "$wrangler" d1 execute "$target" --remote --json --command \
+catalog_capture "$WORK/preflight.json" "$preflight_log" "$wrangler" d1 execute "$resolved_id" --remote --json --command \
   "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='_velmora_import_incomplete' LIMIT 1) AS incomplete,
           EXISTS($user_table_select) AS nonempty" \
   "$@" || die "could not inspect $target, see $preflight_log"
@@ -190,7 +212,7 @@ preflight=$(jq -er '.[0].results | select(length == 1) | .[0] |
 IFS=$'\t' read -r incomplete nonempty <<<"$preflight"
 if [[ $incomplete == 1 ]]; then
   resume_log="$LOG_DIR/d1-read-import-marker.log"
-  catalog_capture "$WORK/marker.json" "$resume_log" "$wrangler" d1 execute "$target" --remote --json --command \
+  catalog_capture "$WORK/marker.json" "$resume_log" "$wrangler" d1 execute "$resolved_id" --remote --json --command \
     'SELECT snapshot, phase, verification FROM _velmora_import_incomplete LIMIT 2' "$@" ||
     die "could not read the incomplete import marker; see $resume_log"
   marker=$(jq -cer '.[0].results | select(length == 1) | .[0]' "$WORK/marker.json" 2>>"$resume_log") ||
@@ -240,7 +262,7 @@ if get_restore_object "$manifest" "$WORK/manifest.json" "$manifest_log" "$@"; th
   IFS=$'\t' read -r zst_bytes zst_sha256 sql_sha256 < <(
     jq -r '[.zst_bytes, .zst_sha256, .sql_sha256] | @tsv' "$WORK/manifest.json"
   )
-  largest_part=$(jq -er '[.parts[].bytes] | max' "$WORK/manifest.json")
+  largest_part=$(jq -er '([.parts[].bytes] | max) + 1' "$WORK/manifest.json")
   # Check both peaks: assembling/downloading, and spooling before the SQL
   # is released. Use 2.1x the SQL size to allow for spool framing.
   sql_spool_peak=$((2 * manifest_sql_bytes + (manifest_sql_bytes + 9) / 10))
@@ -251,7 +273,7 @@ if get_restore_object "$manifest" "$WORK/manifest.json" "$manifest_log" "$@"; th
   part_index=0
   while IFS=$'\t' read -r key bytes sha256; do
     part_log="$LOG_DIR/part-$part_index.get.log"
-    get "$key" "$WORK/part" "$part_log" "$@" || die "could not read $key, see $part_log"
+    get_part "$key" "$WORK/part" "$part_log" "$bytes" "$@" || die "could not read $key, see $part_log"
     verify "$WORK/part" "$key" "$bytes" "$sha256"
     cat "$WORK/part"
     part_index=$((part_index + 1))
@@ -314,7 +336,7 @@ CREATE TABLE _velmora_import_incomplete (restore_point INTEGER NOT NULL, snapsho
 INSERT INTO _velmora_import_incomplete VALUES ($since_ms, '$snapshot_sql', 'loading', '$plan_sql');
 SQL
 marker_log="$LOG_DIR/d1-import-marker.log"
-catalog_logged "$marker_log" "$wrangler" d1 execute "$target" --remote --yes --file "$WORK/claim.sql" \
+catalog_logged "$marker_log" "$wrangler" d1 execute "$resolved_id" --remote --yes --file "$WORK/claim.sql" \
   "$@" || die "could not claim an empty target $target, see $marker_log"
 batch=0
 while IFS=$'\t' read -r file bytes sha256; do
@@ -325,14 +347,14 @@ while IFS=$'\t' read -r file bytes sha256; do
   if [[ ${actual_sha%% *} != "$sha256" || $(( $(wc -c <"$path") )) != "$bytes" ]]; then
     die "batch $batch failed its pre-load checksum; if any batch was loaded, the target holds a partial load and must be deleted and recreated before retry"
   fi
-  catalog_logged "$load_log" "$wrangler" d1 execute "$target" --remote --yes --file "$path" "$@" ||
+  catalog_logged "$load_log" "$wrangler" d1 execute "$resolved_id" --remote --yes --file "$path" "$@" ||
     die "batch $batch failed, see $load_log; the target may hold a partial load and must be deleted and recreated before retry"
   batch=$((batch + 1))
 done <"$WORK/batches.tsv"
 
 if [[ ${VELMORA_IMPORT_SKIP_ROW_COUNTS:-} != yes ]]; then
   phase_log="$LOG_DIR/d1-verification-phase.log"
-  catalog_logged "$phase_log" "$wrangler" d1 execute "$target" --remote --json --command \
+  catalog_logged "$phase_log" "$wrangler" d1 execute "$resolved_id" --remote --json --command \
     "UPDATE _velmora_import_incomplete SET phase='verify' WHERE phase='loading'" \
     "$@" || die "could not record that all batches loaded, see $phase_log"
 fi

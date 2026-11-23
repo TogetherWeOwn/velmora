@@ -39,6 +39,18 @@ part_bytes=${VELMORA_EXPORT_PART_BYTES-268435456}
 part_limit=$(catalog_part_max_bytes)
 readonly D1_PAID_MAX_DB_BYTES=10000000000
 
+previous_arg=
+for arg in "$@"; do
+  case "$arg" in
+    --no-schema|--no-schema=*|--no-data|--no-data=*|--schema=false|--data=false|--table|--table=*)
+      catalog_error 'catalogue backups must include schema and data for every table' ;;
+  esac
+  if [[ $arg == false && ( $previous_arg == --schema || $previous_arg == --data ) ]]; then
+    catalog_error 'catalogue backups must include schema and data for every table'
+  fi
+  previous_arg=$arg
+done
+
 for tool in zstd jq split sha256sum python3 od flock; do
   command -v "$tool" >/dev/null || { echo "catalog-export: missing tool: $tool" >&2; exit 1; }
 done
@@ -111,16 +123,24 @@ catalog_logged "$export_log" "$wrangler" d1 export "$DB" --remote --output "$fil
   catalog_error "wrangler d1 export failed, see $export_log"
 [[ -s $file ]] || catalog_error "the export is empty, see $export_log"
 sql_bytes=$(( $(wc -c <"$file") ))
-grep -q 'CREATE TABLE' "$file" || { echo "catalog-export: the export has no schema" >&2; exit 1; }
-catalog_longest_statement_bytes=$(catalog_check_sql_statements "$file")
+catalog_longest_statement_bytes=$(catalog_check_sql_statements "$file" --require-schema)
 info_log="$LOG_DIR/d1-info.log"
-catalog_capture "$WORK/info.json" "$info_log" "$wrangler" d1 info "$DB" --json "$@" ||
-  catalog_error "could not read D1 database size for $DB, see $info_log"
-database_size=$(jq -er '(.database_size // .file_size) |
-  select(type == "number" and . >= 0 and . < 1000000000000 and floor == .)' \
-  "$WORK/info.json" 2>>"$info_log") || catalog_error "invalid D1 database size for $DB, see $info_log"
+size_unavailable=
+if ! catalog_capture "$WORK/info.json" "$info_log" "$wrangler" d1 info "$DB" --json "$@"; then
+  size_unavailable='wrangler d1 info failed'
+elif ! database_size=$(jq -ers 'select(length == 1) | .[0] | (.database_size // .file_size) |
+    select(type == "number" and . >= 0 and . < 1000000000000 and floor == .)' "$WORK/info.json" 2>>"$info_log"); then
+  size_unavailable='missing or invalid size in d1 info'
+fi
 catalog_warn_at_sixty_percent sql_statement_bytes "$catalog_longest_statement_bytes" "$D1_SQL_STATEMENT_MAX_BYTES"
-catalog_warn_at_sixty_percent database_size_bytes "$database_size" "$D1_PAID_MAX_DB_BYTES"
+if [[ -n $size_unavailable ]]; then
+  printf 'catalog-export: WARNING database size unavailable (%s)\n' "$size_unavailable" >&2
+  database_size=null
+  database_size_summary='size unavailable'
+else
+  catalog_warn_at_sixty_percent database_size_bytes "$database_size" "$D1_PAID_MAX_DB_BYTES"
+  database_size_summary="$database_size bytes"
+fi
 
 put() {
   local key=$1 path=$2 type=$3 log="$LOG_DIR/${2##*/}.put.log"
@@ -185,6 +205,6 @@ if [[ -n ${VELMORA_EXPORT_SIZES_LOG:-} ]]; then
     '{$restore_point_ms, $sql_bytes, $zst_bytes, $parts, $longest_statement_bytes, $database_size_bytes}')
   printf '%s\n' "$size_entry" >>"$VELMORA_EXPORT_SIZES_LOG"
 fi
-printf 'catalog-export: sql %s bytes, sha256 %s, zst %s bytes in %s part(s), manifest %s/%s, longest statement %s bytes, database %s bytes\n' \
-  "$sql_bytes" "$sql_sha256" "$zst_bytes" "${#parts[@]}" "$BUCKET" "$manifest" "$catalog_longest_statement_bytes" "$database_size"
+printf 'catalog-export: sql %s bytes, sha256 %s, zst %s bytes in %s part(s), manifest %s/%s, longest statement %s bytes, database %s\n' \
+  "$sql_bytes" "$sql_sha256" "$zst_bytes" "${#parts[@]}" "$BUCKET" "$manifest" "$catalog_longest_statement_bytes" "$database_size_summary"
 printf 'restore point: %s\n' "$since_ms"

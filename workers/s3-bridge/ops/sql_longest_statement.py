@@ -12,10 +12,11 @@ import struct
 import sys
 
 
-def longest_statement(path, limit):
+def longest_statement(path, limit, require_schema=False):
     buffer = bytearray()
     whitespace = b" \t\r\n\v\f"
     longest = (0, 1)
+    has_schema = not require_schema
     # D1 starts each statement on its own line, but a quoted SQL value or
     # schema definition can span lines. Preserve the raw UTF-8 byte count,
     # and use SQLite's tokenizer to find the end without executing SQL.
@@ -40,9 +41,14 @@ def longest_statement(path, limit):
             if complete:
                 if size > longest[0]:
                     longest = (size, start_line)
+                # Match only at the beginning of a complete statement.
+                if not has_schema and CREATE_TABLE.match(buffer):
+                    has_schema = True
                 buffer.clear()
     if buffer:
         raise SystemExit("the dump ends inside a statement")
+    if not has_schema:
+        raise SystemExit("catalog-export: the export has no schema")
     return longest
 
 
@@ -422,6 +428,6 @@ if __name__ == "__main__":
             raise SystemExit(f"could not split catalogue dump: {exc}") from None
     else:
         try:
-            print(*longest_statement(sys.argv[1], int(sys.argv[2])))
+            print(*longest_statement(sys.argv[1], int(sys.argv[2]), require_schema="--require-schema" in sys.argv[3:]))
         except (OSError, ValueError):
             raise SystemExit("could not measure SQL statements in the dump") from None

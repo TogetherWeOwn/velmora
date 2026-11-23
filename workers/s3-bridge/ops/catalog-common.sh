@@ -132,8 +132,9 @@ catalog_check_sql_size() {
 }
 
 catalog_check_sql_statements() {
-  local measurement longest line more observed
-  measurement=$(python3 -I "$HERE/sql_longest_statement.py" "$1" "$catalog_sql_statement_limit") || return 1
+  local file=$1 measurement longest line more observed
+  shift
+  measurement=$(python3 -I "$HERE/sql_longest_statement.py" "$file" "$catalog_sql_statement_limit" "$@") || return 1
   read -r longest line more <<<"$measurement"
   if (( longest > catalog_sql_statement_limit )); then
     observed=$longest

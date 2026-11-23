@@ -272,12 +272,15 @@ The importer requires SQLite 3.37 or later. On the same host, run these
 scripts as the same user with the same `TMPDIR` so they share
 locks: exports lock by source database name, imports by resolved target UUID.
 
-The exporter has no single-file SQL size limit. It refuses an export with any
-SQL statement over 100,000 bytes, which D1 cannot import. Its summary gives the
-longest statement and the D1 file size along with the snapshot sizes. Set
-`VELMORA_EXPORT_SIZES_LOG` to append those measurements as JSON lines. The
-export warns at 60% of either the statement limit or the paid plan's 10 GB
+The exporter requires a full dump with schema and data. It has no single-file
+SQL size limit, but refuses an export with any SQL statement over 100,000 bytes,
+which D1 cannot import. Its summary gives the longest statement and the D1 file
+size along with the snapshot sizes. Set `VELMORA_EXPORT_SIZES_LOG` to append
+those measurements as JSON lines. The export warns at 60% of either the
+statement limit or the paid plan's 10 GB
 [database limit](https://developers.cloudflare.com/d1/platform/limits/).
+If the D1 size is unavailable, the export warns, records `database_size_bytes`
+as `null` in that log, and still publishes the snapshot.
 
 Wrangler uploads each part by default. Splitting keeps each upload under
 Wrangler's 300 MiB limit. `VELMORA_EXPORT_PART_BYTES` defaults to 268435456
@@ -319,13 +322,14 @@ older Worker cannot enforce it on a direct replay call.
      `wrangler d1 info <new db> --json` (use the same Wrangler config and
      environment as the import). Run `ops/catalog-import.sh <new db> <restore point>`.
      The script checks the resolved database name and UUID, even if the
-     target is a Wrangler binding. A production catalogue also requires
-     `VELMORA_IMPORT_PRODUCTION=yes`. The export carries the schema and
-     the list of applied migrations, so apply migrations after loading it.
-     Do not run against production without these confirmations. The script
-     refuses a non-empty database. It bounds decompression by the manifest's
-     SQL size and checks every checksum before splitting. Legacy single-file
-     exports have no checksums.
+     target is a Wrangler binding, then uses only that UUID for D1 commands.
+     A production catalogue also requires `VELMORA_IMPORT_PRODUCTION=yes`.
+     The export carries the schema and the list of applied migrations, so
+     apply migrations after loading it. Do not run against production without
+     these confirmations. The script refuses a non-empty database. It bounds
+     each part download to its declared size plus one byte, bounds decompression
+     by the manifest's SQL size, and checks every checksum before splitting.
+     Legacy single-file exports have no checksums.
 
      Restore always uses statement-safe batches, even for small exports:
      table schemas first, INSERTs in foreign-key order, then the remaining

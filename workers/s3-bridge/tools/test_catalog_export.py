@@ -27,6 +27,7 @@ PART_BYTES = 4096
 ARGS = ["--config", "fixture.toml", "--env", "dev"]
 MS = "1760000000123"
 DATABASE_ID = "11111111-2222-4333-8444-555555555555"
+OTHER_DATABASE_ID = "22222222-3333-4444-8555-666666666666"
 MISSING = "✘ [ERROR] The specified key does not exist."
 COLOURED_MISSING = "\x1b[31m✘ \x1b[1;41m[ERROR]\x1b[0m\x1b[31m The specified key does not exist.\x1b[0m"
 
@@ -97,7 +98,20 @@ def download(source, dest):
     else:
         shutil.copyfile(source, dest)
 
+def stream(source, limit=-1):
+    if not source.exists():
+        sys.exit(os.environ.get("FAKE_MISSING", "✘ [ERROR] The specified key does not exist."))
+    signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+    with source.open("rb") as incoming:
+        if limit < 0:
+            shutil.copyfileobj(incoming, sys.stdout.buffer)
+        else:
+            sys.stdout.buffer.write(incoming.read(limit))
+
 if Path(sys.argv[0]).name == "rclone":
+    if args[0] == "cat":
+        stream(bucket / args[1].removeprefix("r2x:"), int(args[args.index("--head") + 1]))
+        sys.exit(0)
     if args[0] == "lsf":
         if os.environ.get("FAKE_FAIL_LISTING"):
             sys.exit(os.environ["FAKE_FAIL_LISTING"])
@@ -134,11 +148,17 @@ elif args[:3] == ["wrangler", "d1", "export"]:
 elif args[:3] == ["wrangler", "d1", "info"]:
     assert "--json" in args
     assert "--remote" not in args
-    print(json.dumps({"uuid": os.environ["FAKE_DATABASE_ID"],
-                      "name": os.environ.get("FAKE_DATABASE_NAME", args[3]),
-                      "database_size": int(os.environ.get("FAKE_DATABASE_SIZE", 32768))}))
+    if os.environ.get("FAKE_FAIL_INFO"):
+        sys.exit("stub D1 info unavailable")
+    info = {"uuid": os.environ["FAKE_DATABASE_ID"], "name": os.environ.get("FAKE_DATABASE_NAME", args[3])}
+    if not os.environ.get("FAKE_OMIT_SIZE"):
+        info["database_size"] = int(os.environ.get("FAKE_DATABASE_SIZE", 32768))
+    print(json.dumps(info))
 elif args[:3] == ["wrangler", "r2", "object"]:
     obj = bucket / args[4]
+    if args[3] == "get" and "--pipe" in args:
+        stream(obj)
+        sys.exit(0)
     path = Path(args[args.index("--file") + 1])
     if args[3] == "put":
         if os.environ.get("FAKE_MISSING_BUCKET"):
@@ -152,9 +172,16 @@ elif args[:3] == ["wrangler", "r2", "object"]:
         download(obj, path)
 elif args[:3] == ["wrangler", "d1", "execute"]:
     db = Path(os.environ["FAKE_DB"])
-    target_file = db / args[3]
+    remapped = db / "binding-remapped"
+    if args[3] == os.environ["FAKE_DATABASE_ID"]:
+        database = "scratch-db"
+    elif remapped.exists():
+        database = os.environ["FAKE_REMAP_TARGET"]
+    else:
+        database = args[3]
+    target_file = db / database
     batches = db / "batches"
-    sqlite_file = db / "sqlite" / (args[3] + ".sqlite")
+    sqlite_file = db / "sqlite" / (database + ".sqlite")
     if "--command" in args:
         assert "--json" in args
         query = args[args.index("--command") + 1]
@@ -166,6 +193,8 @@ elif args[:3] == ["wrangler", "d1", "execute"]:
                 # the committed catalogue that another host left behind.
                 incomplete, nonempty = 0, 0
             rows = [{"incomplete": incomplete, "nonempty": nonempty}]
+            if os.environ.get("FAKE_REMAP_TARGET"):
+                remapped.touch()
         elif query.startswith(("CREATE TABLE _velmora_import_incomplete", "DROP TABLE _velmora_import_incomplete",
                                "UPDATE _velmora_import_incomplete")):
             sqlite_file.parent.mkdir(exist_ok=True)
@@ -175,9 +204,17 @@ elif args[:3] == ["wrangler", "d1", "execute"]:
         else:
             if query.startswith("WITH ") and os.environ.get("FAKE_FAIL_VERIFY"):
                 sys.exit("stub verification unavailable")
-            with sqlite3.connect(sqlite_file) as conn:
-                conn.row_factory = sqlite3.Row
-                rows = [dict(row) for row in conn.execute(query)]
+            if query.startswith("WITH ") and os.environ.get("FAKE_STALLED_CURSOR"):
+                pages = db / "stalled-cursor-pages"
+                n = int(pages.read_text()) if pages.exists() else 0
+                if n == 2:
+                    sys.exit("stub received a third query for the stalled cursor")
+                pages.write_text(str(n + 1))
+                rows = [{"n": 5000, "cursor": json.dumps([["integer", "5000"]])}]
+            else:
+                with sqlite3.connect(sqlite_file) as conn:
+                    conn.row_factory = sqlite3.Row
+                    rows = [dict(row) for row in conn.execute(query)]
             if 'FROM "' + os.environ.get("FAKE_MISMATCH_TABLE", '\\0') + '"' in query:
                 rows[0]["n"] += 1
         print(json.dumps([{"results": rows}]))
@@ -580,6 +617,24 @@ class CatalogueScripts(unittest.TestCase):
         self.assert_refused(self.run_script("export"), "the export has no schema")
         self.assertEqual(list(self.bucket.rglob("*")), [])
 
+    def test_export_rejects_create_table_inside_data_before_any_upload(self):
+        self.fixture.write_text("INSERT INTO fixture VALUES ('CREATE TABLE fake (id INTEGER);');\n")
+        result = self.run_script("export")
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("the export has no schema", result.stderr)
+        self.assertFalse(self.bucket.exists())
+
+    def test_export_refuses_options_that_omit_schema_or_data(self):
+        for i, flags in enumerate((["--no-schema"], ["--no-data"], ["--schema=false"], ["--data=false"],
+                                   ["--schema", "false"], ["--data", "false"],
+                                   ["--table", "fixture"], ["--table=fixture"])):
+            with self.subTest(flags=flags):
+                self.env["FAKE_DATE"] = str(int(MS) + i)
+                result = self.run_script("export", *flags)
+                self.assertEqual(result.returncode, 1, result.stdout)
+                self.assertIn("catalogue backups must include schema and data", result.stderr)
+                self.assertEqual(self.calls(), [])
+
     def test_export_rejects_incomplete_sql_before_any_upload(self):
         self.fixture.write_text("CREATE TABLE fixture (value TEXT);\n"
                                 "INSERT INTO fixture VALUES ('unclosed;\n", encoding="utf-8")
@@ -686,6 +741,20 @@ class CatalogueScripts(unittest.TestCase):
         self.assertIn(message, result.stderr)
         self.assertEqual([path for path in self.db.iterdir() if path.is_file()], [])
 
+    def test_import_uses_confirmed_uuid_even_if_binding_is_remapped_after_preflight(self):
+        ms, _, _, _ = self.export()
+        before = len(self.calls())
+        self.env["FAKE_REMAP_TARGET"] = OTHER_DATABASE_ID
+        result = self.run_script("import", "scratch-db", ms)
+        self.assertTrue((self.db / "binding-remapped").exists())
+        self.assertFalse((self.db / "sqlite" / f"{OTHER_DATABASE_ID}.sqlite").exists(),
+                         "a later D1 call wrote to the remapped database")
+        self.assert_loaded(result, ms)
+        calls = [call for call in self.calls()[before:] if call[2:3] == ["d1"]]
+        self.assertEqual(calls[0][3:5], ["info", "scratch-db"])
+        self.assertGreater(len(calls), 1)
+        self.assertTrue(all(call[3:5] == ["execute", DATABASE_ID] for call in calls[1:]), calls)
+
     def test_import_round_trip(self):
         ms, _, _, _ = self.export()
         self.assert_loaded(self.run_script("import", "scratch-db", ms), ms)
@@ -720,6 +789,30 @@ class CatalogueScripts(unittest.TestCase):
                 self.assertEqual(int((work / "size").read_text()), declared + 1)
                 self.assert_refused(result, f"decompressed SQL exceeds {declared} bytes")
                 self.assertFalse(any(map(is_d1_write, self.calls())))
+
+    def test_import_bounds_oversized_part_downloads_for_both_transports(self):
+        ms, _, manifest, _ = self.export()
+        part = manifest["parts"][0]
+        self.assertEqual(part["bytes"], 4096)
+        self.object_path(part["key"]).write_bytes(b"x" * 1_000_000)
+        work = Path(self.env["TMPDIR"])
+        fake_rm = work / "rm"
+        fake_rm.write_text('#!/bin/sh\n'
+                           'case "${3-}" in\n'
+                           '  */velmora-import.*)\n'
+                           '    [ ! -f "$3/part" ] || wc -c <"$3/part" >"$TMPDIR/part-size";;\n'
+                           'esac\nexec /bin/rm "$@"\n')
+        fake_rm.chmod(0o755)
+        for transport in ("wrangler", "rclone"):
+            with self.subTest(transport=transport):
+                if transport == "rclone":
+                    self.env["VELMORA_EXPORT_RCLONE_REMOTE"] = "r2x"
+                size = work / "part-size"
+                size.unlink(missing_ok=True)
+                result = self.run_script("import", "scratch-db", ms)
+                self.assert_refused(result, f"size mismatch for {part['key']}")
+                self.assertFalse(any(map(is_d1_write, self.calls())))
+                self.assertEqual(int(size.read_text()), 4097)
 
     def test_import_rejects_whole_file_checksum_mismatches(self):
         ms, prefix, manifest, _ = self.export()
@@ -856,6 +949,25 @@ class CatalogueScripts(unittest.TestCase):
         self.assertEqual(entry["database_size_bytes"], 6_000_000_000)
         self.assertRegex(result.stderr, r"WARNING .*60000 is 60% of 100000")
         self.assertRegex(result.stderr, r"WARNING .*6000000000 is 60% of 10000000000")
+
+    def test_export_publishes_when_database_size_is_unavailable(self):
+        sizes = Path(self.env["TMPDIR"]) / "sizes.jsonl"
+        self.env["VELMORA_EXPORT_SIZES_LOG"] = str(sizes)
+        for i, (setting, reason) in enumerate((
+                ("FAKE_FAIL_INFO", "wrangler d1 info failed"),
+                ("FAKE_OMIT_SIZE", "missing or invalid size in d1 info"))):
+            with self.subTest(reason=reason):
+                self.env["FAKE_DATE"] = str(int(MS) + i)
+                self.env[setting] = "yes"
+                try:
+                    result = self.run_script("export")
+                finally:
+                    del self.env[setting]
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn(f"catalog-export: WARNING database size unavailable ({reason}", result.stderr)
+                self.assertNotIn("WARNING database_size_bytes", result.stderr)
+                self.assertTrue(self.object_path(f"d1/{SOURCE}/{self.env['FAKE_DATE']}.manifest.json").is_file())
+                self.assertIsNone(json.loads(sizes.read_text().splitlines()[-1])["database_size_bytes"])
 
     def batched_fixture(self):
         header = b"PRAGMA defer_foreign_keys=TRUE;\n"
@@ -1082,6 +1194,18 @@ class CatalogueScripts(unittest.TestCase):
                 work.append(len(steps))
             self.assertLessEqual(abs(work[1] - work[0]), 2, work)
 
+    def test_verification_refuses_stalled_cursor_and_leaves_marker(self):
+        self.fixture.write_text("CREATE TABLE fixture (id INTEGER PRIMARY KEY);\n"
+                                "INSERT INTO fixture VALUES (1);\n")
+        ms, _, _, _ = self.export()
+        self.env["FAKE_STALLED_CURSOR"] = "yes"
+        result = self.run_script("import", "scratch-db", ms)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("verification cursor did not advance for fixture", result.stderr)
+        self.assertEqual((self.db / "stalled-cursor-pages").read_text(), "2")
+        with sqlite3.connect(self.db / "sqlite" / "scratch-db.sqlite") as target:
+            self.assertEqual(target.execute("SELECT phase FROM _velmora_import_incomplete").fetchall(), [("verify",)])
+
     def test_verification_uses_bounded_keyset_pages_for_rowid_and_composite_pk(self):
         with self.fixture.open("w") as dump:
             dump.write("CREATE TABLE r (id INTEGER PRIMARY KEY);\n"
@@ -1174,6 +1298,26 @@ class CatalogueScripts(unittest.TestCase):
         result = self.run_script("import", "scratch-db", ms)
         self.assert_refused(result, "foreign key cycle")
         self.assertFalse(any(map(is_d1_write, self.calls())))
+
+    def test_self_referencing_rows_are_loaded_together_when_parent_used_batch_space(self):
+        parent = "INSERT INTO a VALUES (1, '" + "x" * 30 + "');\n"
+        self.assertEqual(len(parent.encode()), 60)
+        first = "INSERT INTO t VALUES (1,2,1,'123456789');\n"
+        second = "INSERT INTO t VALUES (2,1,1,'123456789');\n"
+        self.fixture.write_text(
+            "PRAGMA defer_foreign_keys=TRUE;\n"
+            "CREATE TABLE a(id INTEGER PRIMARY KEY,v TEXT);\n"
+            "CREATE TABLE t(id INTEGER PRIMARY KEY,p REFERENCES t(id),a REFERENCES a(id),v TEXT);\n"
+            + parent + first + second
+        )
+        ms, _, _, _ = self.export()
+        self.env["VELMORA_IMPORT_BATCH_BYTES"] = "160"
+        result = self.run_script("import", "scratch-db", ms)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("row count for t: expected 2, found 2", result.stdout)
+        batches = [path.read_text() for path in (self.db / "batches").glob("batch-*.sql")]
+        self.assertEqual(sum(first in batch or second in batch for batch in batches), 1)
+        self.assertTrue(any(first in batch and second in batch for batch in batches))
 
     def test_self_referencing_table_must_fit_in_one_data_batch(self):
         self.fixture.write_text("PRAGMA defer_foreign_keys=TRUE;\n"
