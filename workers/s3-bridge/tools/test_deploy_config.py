@@ -449,14 +449,19 @@ class RecordLayoutTest(GeneratorCase):
         for name, source in step.env.items():
             self.assertEqual(source, f"vars.{name}")
         self.assertIn(SWITCH, read_by_script)
-        # A refusal ends the job before anything reaches production: the
-        # step comes before the migrations and before the deploy.
+        # A refusal ends the job before any Wrangler command, including
+        # the deployment status read before migrations and deployment.
         lines = self.ci.split("\n")
-        place = {}
-        for later in ("- name: Apply D1 migrations (remote)", "name: Deploy the Worker"):
+        deploy = lines.index("  deploy:")
+        first_wrangler = next(
+            i for i, line in enumerate(lines[deploy:], deploy)
+            if "./node_modules/.bin/wrangler " in line and not line.lstrip().startswith("#")
+        )
+        self.assertLessEqual(step.stop, first_wrangler, lines[first_wrangler])
+        for later in ("name: Record the active Worker version", "- name: Apply D1 migrations (remote)",
+                      "name: Deploy the Worker"):
             hits = [i for i, line in enumerate(lines) if line.strip() == later]
             self.assertEqual(len(hits), 1, later)
-            place[later] = hits[0]
             self.assertLess(step.line, hits[0], later)
         # Nothing outside the step chooses a layout.
         outside = [
@@ -687,11 +692,13 @@ class ReleaseAtVerifyTest(GeneratorCase):
         self.assertEqual(tomllib.loads(self.shipped)["vars"]["RELEASE_AT_VERIFY"], "off")
         for value in (None, "", "off"):
             with self.subTest(value=value):
-                _, written = self.ok({self.switch: value})
+                out, written = self.ok({self.switch: value})
+                self.assertIn("release-at-verify off", out.splitlines()[0])
                 self.assertEqual(written, without_switches(self.shipped))
 
     def test_on_changes_only_the_prod_vars_line(self):
-        _, written = self.ok({self.switch: "on"})
+        out, written = self.ok({self.switch: "on"})
+        self.assertIn("release-at-verify on", out.splitlines()[0])
         before = without_switches(self.shipped)
         line = f"\n{self.shipped_line}\n".encode("utf-8")
         self.assertEqual(before.count(line), 1)
@@ -703,14 +710,24 @@ class ReleaseAtVerifyTest(GeneratorCase):
             with self.subTest(value=value):
                 self.refused({self.switch: value}, "VELMORA_RELEASE_AT_VERIFY must be unset, off or on")
 
+    def test_a_multiline_value_cannot_masquerade_as_the_shipped_line(self):
+        for value in ("off", "on"):
+            with self.subTest(value=value):
+                alternate = self.shipped.replace(self.shipped_line, f'RELEASE_AT_VERIFY="{value}"', 1)
+                doctored = add_after(alternate, "[vars]", f"note = '''\n{self.shipped_line}\n'''")
+                self.refused(
+                    {self.switch: value},
+                    "the shipped RELEASE_AT_VERIFY line is not the prod [vars] assignment",
+                    doctored,
+                )
+
     def test_shipped_line_must_appear_once_in_prod_vars(self):
         missing = self.shipped.replace(self.shipped_line + "\n", "", 1)
         for doctored, message in (
             (missing, "expected exactly one prod line"),
             (add_after(self.shipped, self.shipped_line, self.shipped_line), "expected exactly one prod line"),
-            (add_after(missing, "[build]", self.shipped_line), "the prod RELEASE_AT_VERIFY line is not in the [vars] table"),
-            (add_after(missing, "[vars]", f"note = '''\n{self.shipped_line}\n'''"),
-             "the generated config does not carry the release-at-verify setting that was asked for"),
+            (add_after(missing, "[build]", self.shipped_line),
+             "the shipped RELEASE_AT_VERIFY line is not the prod [vars] assignment"),
         ):
             for value in (None, "on"):
                 with self.subTest(message=message, value=value):
@@ -725,7 +742,7 @@ class BaselineTest(GeneratorCase):
     """Beside the generator of another ci.yml (the one in production, for
     a change of the generator): with the layout not asked for, the same
     bytes for every setting of the older switches, and the same first
-    log line."""
+    log line apart from the release-at-verify summary suffix."""
 
     def test_same_bytes_as_the_baseline_when_the_layout_is_not_asked_for(self):
         baseline = Step(read(os.environ["DEPLOY_CONFIG_BASELINE"]))
@@ -737,7 +754,8 @@ class BaselineTest(GeneratorCase):
             for value in NOT_ASKED:
                 got_out, got = self.ok({**older, SWITCH: value})
                 self.assertEqual(got, want, f"{older!r} {value!r}")
-                self.assertEqual(got_out.splitlines()[0], out.splitlines()[0], f"{older!r} {value!r}")
+                summary = got_out.splitlines()[0].removesuffix(", release-at-verify off")
+                self.assertEqual(summary, out.splitlines()[0], f"{older!r} {value!r}")
                 compared += 1
         self.assertEqual(compared, len(OLDER) * len(NOT_ASKED))
         for bad in (
