@@ -1501,6 +1501,11 @@ async fn drill_extent<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K:
     let mut slept = 0u32;
     let mut interrupted = 0u32;
     let mut last: Option<BridgeError>;
+    // What a rebuild from the extent's parity found no room for on the
+    // try before ([`ColdReader::settle`]). The next try waits for the
+    // read and for these: with room for the read alone it would read
+    // the extent again in full and be refused its rebuild again.
+    let mut rebuild = 0u64;
     loop {
         if charge.is_none() {
             // A try after a wait starts only inside the allowance, and
@@ -1511,8 +1516,9 @@ async fn drill_extent<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K:
             };
             let sleep = bridge.budget.sleeper().ok_or_else(busy)?;
             // After a request that waited for this room before.
-            let taken = core::pin::pin!(bridge.budget.charge_in_turn(bytes));
-            let taken = match select(taken, sleep(left)).await {
+            let both = bytes.saturating_add(rebuild);
+            let taken = core::pin::pin!(bridge.budget.charge_in_turn(both));
+            let mut taken = match select(taken, sleep(left)).await {
                 Either::Left((taken, _)) => taken.map_err(|_| busy())?,
                 Either::Right(_) => return Err(busy()),
             };
@@ -1520,14 +1526,31 @@ async fn drill_extent<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K:
             if bridge.clock.now() >= deadline {
                 return Err(busy());
             }
+            if rebuild > 0 {
+                // Waited for as one charge, so that the drill never
+                // waits for room while it holds some; held as two, the
+                // rebuild's with the reader. Nothing runs in between.
+                drop(taken);
+                taken = bridge.budget.try_charge(bytes).ok_or_else(busy)?;
+                if let Some(spare) = bridge.budget.try_charge(rebuild) {
+                    reader.fund(spare);
+                }
+            }
             *charge = Some(taken);
         }
-        let read = match bridge.catalog.articles(&extent.id).await {
+        // The plan with its parity addendum: a drill rebuilds a lost
+        // article as a read does.
+        let read = match bridge.catalog.stored_plan(&extent.id).await {
             // An extent that is not posted in full is not on Usenet:
             // nothing is asked for.
-            Ok(plan) if plan.iter().any(|a| a.state != ArticleState::Posted) => return Ok(None),
+            Ok(plan) if plan.rows.iter().any(|a| a.state != ArticleState::Posted) => {
+                // The room this try was given for a rebuild goes back
+                // now, not when the drill has closed its sessions.
+                reader.settle();
+                return Ok(None);
+            }
             Ok(plan) => {
-                let count = plan.len() as u64;
+                let count = plan.rows.len() as u64;
                 reader
                     .fetch_planned(extent, plan)
                     .await
@@ -1535,12 +1558,13 @@ async fn drill_extent<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K:
             }
             Err(e) => Err(e),
         };
+        rebuild = reader.settle();
         match read {
             Ok((ColdFetch::Filled(cipher), count)) => {
                 *articles += count;
                 return Ok(Some(cipher));
             }
-            Ok((ColdFetch::Unavailable, _)) => return Ok(None),
+            Ok((ColdFetch::Unavailable | ColdFetch::Unrecoverable, _)) => return Ok(None),
             // `last` is why the last try failed: the answer says the
             // class of that one, not of an earlier one.
             Ok((ColdFetch::Busy, _)) => last = None,
@@ -1837,6 +1861,10 @@ async fn drill<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T
         // Slots taken, each at most one login: a connection is kept
         // from one extent to the next.
         "sessions": stats.opened,
+        // Articles no provider had intact, rebuilt from the extents'
+        // parity articles: the object is whole, with that much of its
+        // parity used.
+        "rebuilt": stats.rebuilt,
     })))
 }
 

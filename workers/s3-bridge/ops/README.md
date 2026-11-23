@@ -1538,6 +1538,12 @@ copy) goes extent by extent, over `COLD_SOCKETS` connections at once:
   the client and holds one cache write, all within
   `INFLIGHT_BUDGET_BYTES`. A client that stops reading stops the Worker
   after that extent, and a client that goes away ends the read.
+- **Before deploying with a custom request budget.** Check that it fits
+  a cold read and a rebuild from stored parity. With 16 MiB extents,
+  `INFLIGHT_BUDGET_BYTES` must be at least 43,658,464 bytes even for one
+  cold socket. Raise a lower budget before deploying. `PARITY=off`
+  stops writing new parity but does not remove this requirement. The
+  shipped 48 MiB budget already fits.
 - **A failed article.** An article a provider lacks, or sends wrong, is
   asked for from the next provider that has a connection or a permit. A
   connection that breaks is opened again a bounded number of times,
