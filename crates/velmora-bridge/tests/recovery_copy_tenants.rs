@@ -10,9 +10,9 @@ use sha2::{Digest, Sha256};
 use velmora::rng::SystemRng;
 use velmora_bridge::config::Maintenance;
 use velmora_bridge::copy::{
-    plan_hint, Copier, CopyCounts, BEGAN_KEY, FRESH_MS, JOB_COPIES, JOB_MS, JOB_PAGES,
-    KEY_MISS_KEY, KEY_PAGE_PREFIX, PAGE, PASS_INTERVAL_MS, RECHECK_TENANTS, STORE_KEY, SWEPT_KEY,
-    WALKED_KEY, WANT_KEY,
+    plan_hint, Copier, CopyCounts, StepError, BEGAN_KEY, FRESH_MS, JOB_COPIES, JOB_MS, JOB_PAGES,
+    KEY_MISS_KEY, KEY_PAGE_PREFIX, LIST_PAGES, PAGE, PASS_INTERVAL_MS, RECHECK_KEY,
+    RECHECK_TENANTS, STORE_KEY, SWEPT_KEY, WALKED_KEY, WANT_KEY,
 };
 use velmora_bridge::crypto::scheme2::{seal_record_v2, CONTROL_HEADER_LEN, RECORD_V2_HEADER_LEN};
 use velmora_bridge::crypto::{seal_manifest, WRAP_OVERHEAD};
@@ -989,6 +989,95 @@ async fn am80b_overlapping_jobs_claim_one_page_and_next_pass_prunes_it() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn am80b_future_claim_guesses_are_pruned_and_cannot_suppress_pages() {
+    capture_alerts();
+    let w = World::new();
+    let other_key = World {
+        kek: TestKek::with_versions(1, &[(1, [0x22; 32])]),
+        ..World::new()
+    };
+    let slot = NOW.0;
+    let next = slot + PASS_INTERVAL_MS;
+    let later = next + PASS_INTERVAL_MS;
+    let entry = format!("{A}/2");
+    let marks = serde_json::to_vec(&BTreeMap::from([(
+        &entry,
+        [slot - 4 * PASS_INTERVAL_MS, slot, 1],
+    )]))
+    .unwrap();
+    other_key.clock.advance_ms(PASS_INTERVAL_MS);
+    for world in [&w, &other_key] {
+        world.rest_walk().await;
+        world.source.answer(A, [ring(A, &[1], &[1, 2], &[])]);
+        world.raw(KEY_MISS_KEY, &marks).await;
+    }
+
+    // Same slot and entry, even the same KEK version number, but different
+    // key bytes. Reusing this claim must not silence a page in `w`.
+    other_key.first_job().await;
+    assert_eq!(alerts(), [missing_key_page(2, "partial")]);
+    let other_claims = other_key
+        .safety
+        .list(KEY_PAGE_PREFIX, "", PAGE)
+        .await
+        .unwrap();
+    let [other_claim] = other_claims.as_slice() else {
+        panic!("expected one claim, got {other_claims:?}");
+    };
+    assert!(other_claim.starts_with(&format!("{KEY_PAGE_PREFIX}{next:016}/")));
+    let guesses = [
+        format!("{KEY_PAGE_PREFIX}{next:016}/{entry}"),
+        format!("{KEY_PAGE_PREFIX}{next:016}/{:032x}", 0),
+        other_claim.clone(),
+    ];
+    for claim in &guesses {
+        w.raw(claim, b"").await;
+    }
+    w.raw(&format!("{KEY_PAGE_PREFIX}{later:016}/{entry}"), b"")
+        .await;
+
+    w.first_job().await;
+    assert_eq!(alerts(), [missing_key_page(2, "partial")]);
+    let claims = w.safety.list(KEY_PAGE_PREFIX, "", PAGE).await.unwrap();
+    let [first] = claims.as_slice() else {
+        panic!("the first job should prune all future claims: {claims:?}");
+    };
+    assert!(first.starts_with(&format!("{KEY_PAGE_PREFIX}{slot:016}/")));
+
+    // Plant the guesses again as this slot starts, so future-claim cleanup
+    // cannot hide a regression to plaintext or otherwise unkeyed claims.
+    w.clock.advance_ms(PASS_INTERVAL_MS);
+    for claim in &guesses {
+        w.raw(claim, b"").await;
+    }
+    w.first_job().await;
+    assert_eq!(alerts(), [missing_key_page(2, "partial")]);
+    let claims = w.safety.list(KEY_PAGE_PREFIX, "", PAGE).await.unwrap();
+    assert!(claims.contains(first), "last pass's claim should stay");
+    let next_claims: Vec<_> = claims.iter().filter(|claim| *claim != first).collect();
+    assert_eq!(next_claims.len(), guesses.len() + 1, "{claims:?}");
+    assert!(guesses.iter().all(|claim| next_claims.contains(&claim)));
+    assert!(next_claims
+        .iter()
+        .all(|claim| claim.starts_with(&format!("{KEY_PAGE_PREFIX}{next:016}/"))));
+
+    w.clock.advance_ms(PASS_INTERVAL_MS);
+    w.first_job().await;
+    assert_eq!(alerts(), [missing_key_page(2, "partial")]);
+    let claims = w.safety.list(KEY_PAGE_PREFIX, "", PAGE).await.unwrap();
+    assert!(
+        !claims.contains(first),
+        "claims older than last pass should go"
+    );
+    assert!(next_claims.iter().all(|claim| claims.contains(claim)));
+    assert_eq!(claims.len(), next_claims.len() + 1, "{claims:?}");
+    assert!(claims
+        .last()
+        .unwrap()
+        .starts_with(&format!("{KEY_PAGE_PREFIX}{later:016}/")));
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn am80b_walk_only_misses_all_page_while_tenant_rechecks_rotate() {
     capture_alerts();
     let w = World::new();
@@ -1267,6 +1356,108 @@ async fn am80b_recheck_stops_when_ring_loads_spend_the_job_time() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn am80b_time_limited_recheck_rotates_at_the_tenant_cap() {
+    check_time_limited_recheck_rotation(RECHECK_TENANTS, false).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn am80b_time_limited_recheck_rotates_above_the_tenant_cap() {
+    check_time_limited_recheck_rotation(RECHECK_TENANTS + 3, false).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn am80b_garbled_recheck_cursor_only_changes_the_start() {
+    check_time_limited_recheck_rotation(RECHECK_TENANTS + 3, true).await;
+}
+
+async fn check_time_limited_recheck_rotation(tenant_count: usize, garbled_cursor: bool) {
+    capture_alerts();
+    let w = World::new();
+    w.rest_walk().await;
+    let tenants: Vec<_> = (1..=tenant_count).map(|i| format!("t_{i:016x}")).collect();
+    let mut marks: BTreeMap<_, _> = tenants
+        .iter()
+        .map(|t| {
+            w.source.answer(t, [ring(t, &[1], &[1, 2], &[])]);
+            (format!("{t}/2"), [NOW.0 - 4 * PASS_INTERVAL_MS, NOW.0, 1])
+        })
+        .collect();
+    w.raw(KEY_MISS_KEY, &serde_json::to_vec(&marks).unwrap())
+        .await;
+    let start = if garbled_cursor {
+        // Not a tenant ID, but sorts between two IDs instead of at an end.
+        w.raw(RECHECK_KEY, format!("{}!", tenants[2]).as_bytes())
+            .await;
+        3
+    } else {
+        0
+    };
+    let target = tenants.last().unwrap();
+    let recovered_entry = format!("{target}/2");
+    // This tenant's missing key is back on reload. It still costs two
+    // loads, so every first job runs out of time after exactly two tenants.
+    w.source.answer(
+        target,
+        [
+            ring(target, &[1], &[1, 2], &[]),
+            ring(target, &[1, 2], &[1, 2], &[]),
+        ],
+    );
+    w.source
+        .0
+        .load_cost
+        .replace(Some((w.clock.clone(), JOB_MS / 4)));
+
+    let mut seen = BTreeSet::new();
+    for pass in 0..tenant_count.div_ceil(2) {
+        let at = UnixMs(NOW.0 + pass as i64 * PASS_INTERVAL_MS);
+        w.clock.advance_ms(at.0 - w.clock.now().0);
+        let before: Vec<_> = tenants.iter().map(|t| w.source.calls(t)).collect();
+        let (outcome, c) = w.job(at, "").await;
+        assert_eq!(
+            (outcome, c.ring_loads, c.ring_ms),
+            (JobOutcome::Ack, 4, JOB_MS as u64),
+            "pass {pass}: {c:?}"
+        );
+        let checked: Vec<_> = tenants
+            .iter()
+            .zip(before)
+            .filter_map(|(t, old)| {
+                let loads = w.source.calls(t) - old;
+                if loads == 0 {
+                    return None;
+                }
+                assert_eq!(loads, 2, "{t} in pass {pass}");
+                Some(t)
+            })
+            .collect();
+        assert_eq!(checked.len(), 2, "pass {pass}: {checked:?}");
+        if pass == 0 {
+            assert_eq!(checked, [&tenants[start], &tenants[start + 1]]);
+        }
+        if checked.contains(&target) {
+            marks.remove(&recovered_entry);
+        }
+        seen.extend(checked);
+        assert_eq!(w.miss_marks().await, marks, "pass {pass}");
+        assert_eq!(
+            alerts(),
+            tenants
+                .iter()
+                .filter(|t| marks.contains_key(&format!("{t}/2")))
+                .map(|t| tenant_key_page(t, 2, "partial"))
+                .collect::<Vec<_>>(),
+            "pass {pass}: only still-missing keys should page"
+        );
+        assert_eq!(w.finish_pass(at).await.ring_loads, 0);
+        assert!(alerts().is_empty());
+    }
+    let skipped: Vec<_> = tenants.iter().filter(|t| !seen.contains(t)).collect();
+    assert!(skipped.is_empty(), "tenants never rechecked: {skipped:?}");
+    assert!(!w.miss_marks().await.contains_key(&recovered_entry));
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn am80b_first_job_rechecks_partial_ring_while_walk_rests() {
     capture_alerts();
     let w = World::new();
@@ -1390,6 +1581,61 @@ async fn am80b_vmr2_cut_inside_its_header_is_unreadable_not_cross_scheme() {
     assert_eq!((c.ring_loads, w.source.calls(A)), (0, 0));
     assert!(w.safety.get(KEY_MISS_KEY, None).await.unwrap().is_none());
     assert!(alerts().is_empty());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn am80b_vmr2_cut_inside_its_magic_is_unreadable_not_cross_scheme() {
+    capture_alerts();
+    let w = World::new();
+    let rings = JobRings::new(w.source.clone());
+    for (len, bytes) in [b"".as_slice(), b"V", b"VM", b"VMR"]
+        .into_iter()
+        .enumerate()
+    {
+        let name = article(A, &format!("x_short_magic_{len}"));
+        let found = check_record(&name, bytes, &w.kek, &rings, &w.clock).await;
+        assert!(
+            matches!(found, RecordCheck::Unreadable),
+            "{name}: {found:?}"
+        );
+        w.raw(&name, bytes).await;
+    }
+
+    let v1_name = article(A, "x_wrong_v1_scheme");
+    let v1 = seal_manifest(&w.kek, &v1_name, b"plan", &mut SystemRng).unwrap();
+    let records = MemRecords::new();
+    record_registry_support::tenant_control(&w.kek, &records, A, false).await;
+    let vcr1 = records
+        .raw(&record_key(
+            &Tenant::Managed(TenantId::parse(A).unwrap()),
+            4,
+        ))
+        .unwrap();
+    assert!(vcr1.starts_with(b"VCR1"));
+    for (name, bytes) in [(v1_name, v1), (article(A, "x_wrong_control_scheme"), vcr1)] {
+        let found = check_record(&name, &bytes, &w.kek, &rings, &w.clock).await;
+        assert!(
+            matches!(found, RecordCheck::CrossScheme),
+            "{name}: {found:?}"
+        );
+        w.raw(&name, &bytes).await;
+    }
+
+    let c = w.step(WALK).await;
+    assert_eq!(
+        (c.source_unreadable, c.cross_scheme, c.copied, c.failed),
+        (4, 2, 0, 0),
+        "{c:?}"
+    );
+    assert_eq!((c.ring_loads, w.source.calls(A)), (0, 0));
+    assert_eq!(
+        (w.safety.miss_writes.get(), w.safety.claim_attempts.get()),
+        (0, 0)
+    );
+    assert_eq!(
+        alerts(),
+        ["recovery copy (cross_record) cross_scheme=2 cross_tenant=0"]
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -1645,6 +1891,39 @@ async fn check_managed_directory_budget(fresh_dirs: usize) {
     for (name, bytes) in records {
         assert_eq!(w.there(&name), bytes, "{name}");
     }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn t5_stray_directory_pages_make_sweep_late_but_tenant_zero_still_copies() {
+    let w = World::new();
+    w.rest_walk().await;
+    assert!(w.safety.get(WANT_KEY, None).await.unwrap().is_none());
+    for i in 0..=LIST_PAGES * PAGE {
+        // Direct children, not directories. All sort before the first tenant.
+        w.raw(&format!("m/x/stray_{i:05}"), b"stray").await;
+    }
+    let managed = generation(A, FRESH, "after_strays");
+    w.data(A, 1, &managed, br#"{"v":1,"extents":[]}"#).await;
+    let zero = generation(ZERO, FRESH, "after_strays");
+    let id = zero.rsplit('/').next().unwrap();
+    let tombstone = format!("m/x/{ZERO}/del/{id}");
+    let gone = w.data(ZERO, 1, &tombstone, b"tombstone").await;
+    let bytes = w.data(ZERO, 1, &zero, br#"{"v":1,"extents":[]}"#).await;
+
+    let rings = JobRings::new(w.source.clone());
+    let (outcome, counts, why) = w.copier(&rings).run_job(&w.jobs, NOW, "").await;
+    assert_eq!((outcome, why), (JobOutcome::Ack, Some(StepError::Expired)));
+    let c = counts.expect("the sweep ran");
+    assert_eq!((c.copied, c.failed, c.damaged()), (2, 0, 0), "{c:?}");
+    assert_eq!(w.safety.dir_pages.borrow().len(), LIST_PAGES as usize);
+    assert_eq!(
+        w.safety.get(WANT_KEY, None).await.unwrap(),
+        Some(NOW.0.to_string().into_bytes())
+    );
+    assert!(w.jobs.take().is_empty());
+    assert!(w.there(&managed).is_none());
+    assert_eq!(w.there(&tombstone), Some(gone));
+    assert_eq!(w.there(&zero), Some(bytes));
 }
 
 #[tokio::test(flavor = "current_thread")]
