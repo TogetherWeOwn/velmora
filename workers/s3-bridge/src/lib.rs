@@ -425,6 +425,11 @@ async fn recovery_copy(
     };
     let transport = remote.transport();
     let monitor = recovery_alarm::enabled(env, bridge.cfg.environment);
+    let destination = if monitor {
+        remote.place()
+    } else {
+        String::new()
+    };
     let (outcome, counts, why) = copier(bridge, &remote)
         .run_job_observed(
             &bridge.jobs,
@@ -433,7 +438,16 @@ async fn recovery_copy(
             monitor,
             |observation| async move {
                 let now = velmora_bridge::ports::Clock::now(&bridge.clock);
-                recovery_alarm::record(env, pass, message_id, now, observation, transport).await;
+                recovery_alarm::record(
+                    env,
+                    pass,
+                    message_id,
+                    now,
+                    observation,
+                    transport,
+                    &destination,
+                )
+                .await
             },
         )
         .await;

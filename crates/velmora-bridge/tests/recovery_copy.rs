@@ -1450,7 +1450,7 @@ async fn verification_observation_survives_failed_continuation_enqueue() {
         .run_job_observed(&w.jobs, UnixMs(NOW), "", true, |_| {
             assert_eq!(w.jobs.calls(), 0);
             observed.set(w.e2.observation.get());
-            std::future::ready(())
+            std::future::ready(true)
         })
         .await;
     assert!(matches!(outcome, JobOutcome::Retry { .. }));
@@ -1476,7 +1476,7 @@ async fn list_refusal_and_exhausted_retries_reach_the_job_observer() {
             .copier()
             .run_job_observed(&w.jobs, UnixMs(NOW), "", true, |_| {
                 seen.set(w.e2.observation.get());
-                std::future::ready(())
+                std::future::ready(true)
             })
             .await;
         assert!(counts.is_none());
@@ -1541,6 +1541,44 @@ async fn verification_mismatch_unsignable_and_no_answer_are_observed() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn a_failed_problem_observation_retries_instead_of_acknowledging() {
+    let w = World::new();
+    w.clock.set(UnixMs(NOW + RETRY_WINDOW_MS));
+    w.e2.status.set(Some(403));
+    let (outcome, _, why) = w
+        .copier()
+        .run_job_observed(&w.jobs, UnixMs(NOW), "", true, |_| {
+            assert!(matches!(
+                w.e2.observation.get(),
+                Some((_, Observation::Problem(_)))
+            ));
+            std::future::ready(false)
+        })
+        .await;
+    assert!(matches!(
+        why,
+        Some(StepError::Store(RemoteError::Refused(403)))
+    ));
+    assert!(matches!(outcome, JobOutcome::Retry { .. }));
+    assert!(w.jobs.take().is_empty());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_walk_start_after_skipping_the_fresh_sweep_is_not_a_proof_anchor() {
+    let w = World::new();
+    w.clock.set(UnixMs(NOW + SWEEP_MS));
+    let (_, _, why) = w
+        .copier()
+        .run_job_observed(&w.jobs, UnixMs(NOW), "", true, |report| {
+            assert!(!report.fresh_swept);
+            assert!(!report.walk.expect("the older walk ran").starts);
+            std::future::ready(true)
+        })
+        .await;
+    assert_eq!(why, Some(StepError::Expired));
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn a_multi_job_walk_reports_matching_coverage_frontiers() {
     for later_pass in [false, true] {
         let w = World::new();
@@ -1553,7 +1591,7 @@ async fn a_multi_job_walk_reports_matching_coverage_frontiers() {
             .run_job_observed(&w.jobs, UnixMs(NOW), "", true, |report| {
                 assert!(report.fresh_swept);
                 start.replace(report.walk);
-                std::future::ready(())
+                std::future::ready(true)
             })
             .await;
         assert_eq!(why, None);
@@ -1575,7 +1613,7 @@ async fn a_multi_job_walk_reports_matching_coverage_frontiers() {
             .copier()
             .run_job_observed(&w.jobs, pass, &cursor, true, |report| {
                 end.replace(report.walk);
-                std::future::ready(())
+                std::future::ready(true)
             })
             .await;
         assert_eq!(why, None);

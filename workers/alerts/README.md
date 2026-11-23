@@ -19,7 +19,7 @@ condition below emails when it holds:
 | `outbox-dead` | outbox rows are in stage `dead` | at once |
 | `provider-cooldown:<id>` | a provider is cooling (skipped) | 15 min |
 | `catalog-export-stale` | the newest export manifest in the export bucket is over 26 h old (listed hourly) | at once |
-| `recovery-copy-problem` | an offsite destination problem has not been cleared by a proved clean full walk | after 30 min |
+| `recovery-copy-problem` | a recovery-copy problem has not been cleared by a proved clean full walk | after 30 min |
 | `recovery-copy-stale` | no clean sweep has been recorded for more than two hours | at once |
 | `check-error` | a reading failed (its check did not run) | 15 min |
 
@@ -72,20 +72,22 @@ until the next automated bridge deploy, which replaces dashboard-only
 variables. Turning it off on the bridge alone does not disable the stale
 alert.
 
-The destination alarm covers LIST, planning HEAD, PUT and verification
-HEAD failures, including refusals, exhausted retries, and mismatches. A
-zero-copy job or a successful PUT of another record does not clear it.
-Only a full walk that began after the latest problem and has uninterrupted,
-problem-free coverage clears it. Records gone from the source or already
-matching their expected checksum do not need another PUT. A completed
-fresh sweep, including an idle one, refreshes the stale clock while healthy.
-Hints are excluded.
+The alarm covers source LIST failures and destination LIST, planning HEAD,
+PUT and verification HEAD failures, including refusals, exhausted retries,
+and mismatches. A zero-copy job or a successful PUT of another record does
+not clear it. Only an uninterrupted, problem-free full walk that began
+after the latest problem on the same destination can clear it. Its opening
+and terminal passes must also have completed clean fresh sweeps. Records
+gone from the source or already matching their expected checksum do not
+need another PUT. A completed fresh sweep, including an idle one, refreshes
+the stale clock while healthy. Hints are excluded.
 
 The bridge keeps up to 256 diagnostic rows per pass for seven days and
 one state row with the latest problem, clean sweep and verified-write
 times. A separate single-row frontier checks walk coverage. Replays update
-one diagnostic row per queue message. Missing telemetry can block an
-all-clear but never blocks the copy. Recovery notices use the same email
+one diagnostic row per queue message. Missing clean telemetry prevents an
+all-clear without blocking copying. A known problem that cannot be written
+asks the queue to redeliver the job. Recovery notices use the same email
 cap and cooldown as other conditions. Rollback does not change the queue
 message format; leave the additive telemetry tables in place.
 

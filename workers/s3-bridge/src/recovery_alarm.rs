@@ -1,6 +1,7 @@
 //! Best-effort observations only: never a dependency of the copier.
 use velmora_bridge::config::Environment;
-use velmora_bridge::copy::JobObservation;
+use velmora_bridge::copy::{JobObservation, PASS_INTERVAL_MS};
+use velmora_bridge::remote::Problem;
 use velmora_bridge::{Sql, SqlValue, UnixMs};
 use worker::{console_error, Env};
 
@@ -10,6 +11,7 @@ use crate::e2::FetchHttp;
 const RETENTION_MS: i64 = 7 * 24 * 60 * 60 * 1000;
 const INSERT: &str = include_str!("recovery_alarm_insert.sql");
 const OBSERVE: &str = include_str!("recovery_alarm_observe.sql");
+const FRESH: &str = include_str!("recovery_alarm_fresh.sql");
 const FRONTIER: &str = include_str!("recovery_alarm_frontier.sql");
 const CLEAN: &str = include_str!("recovery_alarm_clean.sql");
 // A pass retains at most 256 diagnostics; expiry removes twice as many.
@@ -31,10 +33,24 @@ pub async fn record(
     at: UnixMs,
     observation: JobObservation,
     transport: &FetchHttp,
-) {
+    destination: &str,
+) -> bool {
+    let problem = if observation.source_list_failed {
+        Some((
+            at,
+            Problem {
+                operation: "source_list",
+                kind: "source_error",
+                status: None,
+                code: None,
+            },
+        ))
+    } else {
+        transport.last_problem.get()
+    };
     let Ok(db) = env.d1("CATALOG") else {
         console_error!("recovery copy alarm: telemetry database unavailable");
-        return;
+        return problem.is_none();
     };
     let counts = observation.counts.unwrap_or_default();
     let int = |n: u64| SqlValue::Int(n as i64);
@@ -44,7 +60,8 @@ pub async fn record(
     let mark = |yes: bool| SqlValue::Int(yes.into());
     let message = || SqlValue::Text(message_id.into());
     let verified = transport.last_verified_write.get();
-    let problem = transport.last_problem.get();
+    let deadline = SqlValue::Int(pass.0.saturating_add(PASS_INTERVAL_MS));
+    let destination = SqlValue::Text(destination.into());
     let mut statements = vec![
         (
             INSERT,
@@ -80,10 +97,22 @@ pub async fn record(
                     .and_then(|_| serde_json::to_string(&counts).ok())
                     .map_or(SqlValue::Null, SqlValue::Text),
                 stamp(verified),
+                destination.clone(),
             ],
         ),
     ];
     if problem.is_none() {
+        if observation.fresh_swept {
+            statements.push((
+                FRESH,
+                vec![
+                    SqlValue::Int(pass.0),
+                    SqlValue::Int(at.0),
+                    deadline.clone(),
+                    destination.clone(),
+                ],
+            ));
+        }
         let mut finished = None;
         if let Some(walk) = observation.walk {
             finished = walk.next.is_none().then_some(walk.began_at);
@@ -95,10 +124,13 @@ pub async fn record(
                     walk.next.map_or(SqlValue::Null, SqlValue::Text),
                     mark(walk.starts),
                     message(),
+                    destination.clone(),
+                    SqlValue::Int(at.0),
+                    deadline.clone(),
                 ],
             ));
         }
-        if observation.fresh_swept || finished.is_some() {
+        if finished.is_some() {
             statements.push((
                 CLEAN,
                 vec![
@@ -106,18 +138,23 @@ pub async fn record(
                     mark(observation.fresh_swept),
                     stamp(finished),
                     message(),
+                    SqlValue::Int(pass.0),
+                    deadline,
+                    destination,
                 ],
             ));
         }
     }
-    // A failed write only leaves the walk's proof incomplete. The copier
-    // still sends its successor and reports its own outcome unchanged.
     if D1Sql::new(db).batch(statements).await.is_err() {
         console_error!(
             "recovery copy alarm: pass={} telemetry write failed",
             pass.0
         );
+        // A harmless telemetry gap only withholds the clean stamp. A
+        // known problem that could not be recorded needs redelivery.
+        return problem.is_none();
     }
+    true
 }
 
 pub async fn prune(env: &Env, now: UnixMs) {

@@ -358,6 +358,7 @@ pub struct JobObservation {
     pub counts: Option<CopyCounts>,
     pub fresh_swept: bool,
     pub walk: Option<WalkCoverage>,
+    pub source_list_failed: bool,
 }
 
 fn coverage_tag(destination: &str, cursor: &str) -> String {
@@ -374,6 +375,8 @@ fn coverage_tag(destination: &str, cursor: &str) -> String {
 pub enum StepError {
     /// The safety bucket could not be read.
     Source,
+    /// A source listing failed before the step could cover its range.
+    SourceList,
     /// The recovery store could not be listed.
     Store(RemoteError),
     /// The job for the next step could not be sent.
@@ -984,13 +987,14 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
         pass: UnixMs,
         cursor: &str,
     ) -> (JobOutcome, Option<CopyCounts>, Option<StepError>) {
-        self.run_job_observed(jobs, pass, cursor, false, |_| std::future::ready(()))
+        self.run_job_observed(jobs, pass, cursor, false, |_| std::future::ready(true))
             .await
     }
 
     /// Reports destination outcomes before enqueuing a successor so it
-    /// cannot race ahead of this observation. Reports never change a
-    /// copy decision, and hints do not report.
+    /// cannot race ahead of this observation. A false return asks to
+    /// redeliver the job because a known problem could not be recorded.
+    /// Hints do not report.
     pub async fn run_job_observed<J: JobSink, F, Fut>(
         &self,
         jobs: &J,
@@ -1001,7 +1005,7 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
     ) -> (JobOutcome, Option<CopyCounts>, Option<StepError>)
     where
         F: FnOnce(JobObservation) -> Fut,
-        Fut: Future<Output = ()>,
+        Fut: Future<Output = bool>,
     {
         if self.maintenance == Maintenance::Restore {
             return (JobOutcome::Ack, None, None);
@@ -1035,7 +1039,7 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
     ) -> (JobOutcome, Option<CopyCounts>, Option<StepError>)
     where
         F: FnOnce(JobObservation) -> Fut,
-        Fut: Future<Output = ()>,
+        Fut: Future<Output = bool>,
     {
         // A pass ends when the next one starts. The walk loses nothing
         // by it: the newer pass goes on from the place that was saved.
@@ -1051,10 +1055,11 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
         }
         // Every step is idempotent, so a failed job simply runs again,
         // but not for ever: a later pass takes over.
+        let retry = JobOutcome::Retry {
+            delay_secs: RETRY_SECS,
+        };
         let again = if age < RETRY_WINDOW_MS {
-            JobOutcome::Retry {
-                delay_secs: RETRY_SECS,
-            }
+            retry
         } else {
             JobOutcome::Ack
         };
@@ -1078,10 +1083,13 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
         let step = match self.step_with_coverage(pass, cursor, monitor).await {
             Ok(step) => step,
             Err(e) => {
-                if monitor {
-                    observe(JobObservation::default()).await;
-                }
-                return (again, None, Some(e));
+                let recorded = !monitor
+                    || observe(JobObservation {
+                        source_list_failed: e == StepError::SourceList,
+                        ..JobObservation::default()
+                    })
+                    .await;
+                return (if recorded { again } else { retry }, None, Some(e));
             }
         };
         // The store is down: the cursor does not move while the job may
@@ -1144,12 +1152,16 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
             let walk = (complete && saved && step.counts.pending == 0)
                 .then_some(step.walk_coverage)
                 .flatten();
-            observe(JobObservation {
+            if !observe(JobObservation {
                 counts: Some(step.counts.clone()),
                 fresh_swept: swept_saved && complete,
                 walk,
+                source_list_failed: false,
             })
-            .await;
+            .await
+            {
+                return (retry, Some(step.counts), why);
+            }
         }
         if let Some(cursor) = step.next {
             let next = Job::RecoveryCopy {
@@ -1257,7 +1269,7 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
                     began_at,
                     from,
                     next: next.as_deref().map(|cursor| coverage_tag(&id, cursor)),
-                    starts: began,
+                    starts: began && swept,
                 });
         Ok(CopyStep {
             counts,
@@ -1577,7 +1589,7 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
                 .safety
                 .list_entries(RECORD_PREFIX, &place.key, PAGE)
                 .await
-                .map_err(|_| StepError::Source)?;
+                .map_err(|_| StepError::SourceList)?;
             source.retain(|e| inside(&e.key));
             let Some(last) = source.last().map(|e| page_end(&e.key)) else {
                 // The keys have ended; what the store still lists in the

@@ -48,12 +48,13 @@ function env(over = {}) {
 const BRIDGE_SRC = join(here, "..", "..", "s3-bridge", "src");
 const RECORD_COPY = readFileSync(join(BRIDGE_SRC, "recovery_alarm_insert.sql"), "utf8");
 const OBSERVE_COPY = readFileSync(join(BRIDGE_SRC, "recovery_alarm_observe.sql"), "utf8");
+const FRESH_COPY = readFileSync(join(BRIDGE_SRC, "recovery_alarm_fresh.sql"), "utf8");
 const FRONTIER_COPY = readFileSync(join(BRIDGE_SRC, "recovery_alarm_frontier.sql"), "utf8");
 const CLEAN_COPY = readFileSync(join(BRIDGE_SRC, "recovery_alarm_clean.sql"), "utf8");
 
 function recoveryJob(e, pass, { id = "job", refused = 0, copied = 0, at = pass,
   problem = refused ? ["put", "refused", 403, "AccessDenied"] : null,
-  problemAt = problem ? at : 0, verifiedAt = copied ? at : 0, sweep = true, walk = null } = {}) {
+  problemAt = problem ? at : 0, verifiedAt = copied ? at : 0, sweep = true, walk = null, destination = "a" } = {}) {
   const db = e.CATALOG.db;
   const run = (sql, ...params) => db.prepare(sql).run(Object.fromEntries(
     params.map((val, index) => [`?${index + 1}`, val]),
@@ -64,11 +65,12 @@ function recoveryJob(e, pass, { id = "job", refused = 0, copied = 0, at = pass,
     refused ? "AccessDenied" : null, 0, null, null, 0, null, null, 0, Number(verifiedAt > 0), at);
   const counts = JSON.stringify({ copied, pending, source_unreadable,
     refused_put: { count: refused }, refused_verify: { count: 0 }, refused_plan: { count: 0 }, unsignable: { count: 0 } });
-  run(OBSERVE_COPY, problemAt, ...(problem ?? [null, null, null, null]), problem ? counts : null, verifiedAt);
+  run(OBSERVE_COPY, problemAt, ...(problem ?? [null, null, null, null]), problem ? counts : null, verifiedAt, destination);
   if (!problem) {
-    if (walk) run(FRONTIER_COPY, walk.began, walk.from, walk.next, Number(walk.starts), id);
-    const finished = walk && walk.next === null ? walk.began : 0;
-    if (sweep || finished) run(CLEAN_COPY, at, Number(sweep), finished, id);
+    const deadline = pass + INTERVAL;
+    if (sweep) run(FRESH_COPY, pass, at, deadline, destination);
+    if (walk) run(FRONTIER_COPY, walk.began, walk.from, walk.next, Number(walk.starts), id, destination, at, deadline);
+    if (walk?.next === null) run(CLEAN_COPY, at, Number(sweep), walk.began, id, pass, deadline, destination);
   }
 }
 
@@ -122,7 +124,7 @@ test("page after two intervals; only a subsequent proved clean walk recovers it"
   recoveryJob(e, verified, { copied: 1 });
   assert.equal((await tick(e, verified)).conditions.includes(REFUSED), true, "another key's PUT cannot recover it");
   const clean = verified + 5 * MIN;
-  recoveryJob(e, clean, { sweep: false, walk: cleanWalk(clean) });
+  recoveryJob(e, clean, { walk: cleanWalk(clean) });
   await tick(e, clean);
   await tick(e, clean + 5 * MIN);
   assert.equal(e.ALERT_EMAIL.sent.length, 2);
@@ -156,7 +158,7 @@ test("a missing frontier cannot certify a clean walk; a later complete walk can"
   recoveryJob(e, T0, { refused: 1 });
   await tick(e, T0 + 2 * INTERVAL + 1);
   const began = T0 + 3 * INTERVAL;
-  recoveryJob(e, began, { id: "start", sweep: false,
+  recoveryJob(e, began, { id: "start",
     walk: { began, from: "root", next: "expected", starts: true } });
   recoveryJob(e, began, { id: "wrong-tail", at: began + 1, sweep: false,
     walk: { began, from: "missing", next: null, starts: false } });
@@ -167,12 +169,92 @@ test("a missing frontier cannot certify a clean walk; a later complete walk can"
   assert.match(e.ALERT_EMAIL.sent[1].subject, /recovery copy recovered/i);
 });
 
+test("after a failed enqueue the same job can replace its last frontier link", async () => {
+  const e = env();
+  recoveryJob(e, T0, { refused: 1 });
+  const began = T0 + 3 * INTERVAL;
+  recoveryJob(e, began, { id: "retry", walk: { began, from: "root", next: "unsent", starts: true } });
+  recoveryJob(e, began, { id: "retry", at: began + 1,
+    walk: { began, from: "root", next: "new", starts: true } });
+  recoveryJob(e, began, { id: "tail", at: began + 2, sweep: false,
+    walk: { began, from: "new", next: null, starts: false } });
+  assert.equal((await tick(e, began + 2)).conditions.includes(REFUSED), false);
+  assert.equal(e.CATALOG.db.prepare("SELECT opened_at FROM recovery_alarm_state WHERE id = 1").get().opened_at, 0);
+});
+
+test("a walk without its companion fresh sweep cannot clear a problem", async () => {
+  const e = env();
+  recoveryJob(e, T0, { refused: 1 });
+  const began = T0 + 3 * INTERVAL;
+  recoveryJob(e, began, { sweep: false, walk: cleanWalk(began) });
+  assert.equal((await tick(e, began)).conditions.includes(REFUSED), true);
+});
+
+test("another destination cannot certify a clean walk for an open incident", async () => {
+  const e = env();
+  recoveryJob(e, T0, { refused: 1, destination: "a" });
+  const began = T0 + 3 * INTERVAL;
+  recoveryJob(e, began, { walk: cleanWalk(began), destination: "b" });
+  assert.equal((await tick(e, began)).conditions.includes(REFUSED), true);
+});
+
+test("a retried LIST finishing after pass expiry cannot publish coverage", async () => {
+  const e = env();
+  recoveryJob(e, T0, { problem: ["list", "retry_exhausted", 503, null] });
+  const began = T0 + 3 * INTERVAL;
+  const afterRetry = began + INTERVAL + 1;
+  recoveryJob(e, began, { at: afterRetry, walk: cleanWalk(began) });
+  assert.equal((await tick(e, afterRetry)).conditions.includes(REFUSED), true);
+  assert.equal(e.CATALOG.db.prepare("SELECT count(*) AS n FROM recovery_walk_frontier").get().n, 0);
+});
+
+test("nine skipped sweeps and a walk without a sweep do not reset stale", async () => {
+  const e = env();
+  recoveryJob(e, T0);
+  for (let i = 1; i <= 9; i++) {
+    const pass = T0 + i * INTERVAL;
+    recoveryJob(e, pass, { sweep: false });
+    await tick(e, pass);
+  }
+  const began = T0 + 10 * INTERVAL;
+  recoveryJob(e, began, { sweep: false, walk: cleanWalk(began) });
+  assert.equal((await tick(e, began)).conditions.includes(STALE), true);
+  assert.equal(e.CATALOG.db.prepare("SELECT last_clean_sweep_at FROM recovery_alarm_state WHERE id = 1").get().last_clean_sweep_at, T0);
+  assert.equal(e.ALERT_EMAIL.sent.length, 1);
+});
+
+test("a walk cannot close during a terminal pass that skipped its sweep", async () => {
+  const e = env();
+  recoveryJob(e, T0, { refused: 1 });
+  const began = T0 + 3 * INTERVAL;
+  recoveryJob(e, began, { id: "start", walk: { began, from: "root", next: "tail", starts: true } });
+  const end = began + INTERVAL;
+  recoveryJob(e, end, { id: "end", sweep: false, walk: { began, from: "tail", next: null, starts: false } });
+  assert.equal((await tick(e, end)).conditions.includes(REFUSED), true);
+});
+
 test("a late problem observed inside a completed walk invalidates its clean proof", async () => {
   const e = env();
+  recoveryJob(e, T0, { refused: 1 });
   const began = T0 + INTERVAL;
   recoveryJob(e, began, { id: "clean", at: began + 5 * MIN, walk: cleanWalk(began) });
+  assert.equal(e.CATALOG.db.prepare("SELECT opened_at FROM recovery_alarm_state WHERE id = 1").get().opened_at, 0);
   recoveryJob(e, T0, { refused: 1, at: began + 6 * MIN, problemAt: began + 1 });
   assert.equal((await tick(e, began + 2 * INTERVAL + 2)).conditions.includes(REFUSED), true);
+});
+
+test("a source LIST failure in a walk stays open through successful fresh sweeps", async () => {
+  const e = env();
+  recoveryJob(e, T0, { id: "sweep", walk: { began: T0, from: "root", next: "more", starts: true } });
+  recoveryJob(e, T0, { id: "continuation", at: T0 + 1, sweep: false,
+    problem: ["source_list", "source_error", null, null] });
+  for (let i = 1; i <= 3; i++) recoveryJob(e, T0 + i * INTERVAL);
+  assert.equal((await tick(e, T0 + 3 * INTERVAL)).conditions.includes(REFUSED), true);
+  assert.match(e.ALERT_EMAIL.sent[0].text, /source_list source_error/);
+  const clean = T0 + 4 * INTERVAL;
+  recoveryJob(e, clean, { walk: cleanWalk(clean) });
+  assert.equal((await tick(e, clean)).conditions.includes(REFUSED), false);
+  assert.match(e.ALERT_EMAIL.sent[1].subject, /recovery copy recovered/i);
 });
 
 test("refusal reminders respect cooldown even when newer jobs are idle", async () => {
