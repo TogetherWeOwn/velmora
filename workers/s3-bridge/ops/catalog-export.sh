@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Snapshots the D1 catalogue into an R2 bucket that is separate from the
-# data buckets: ops/catalog-export.sh [wrangler args, e.g. --env dev]
+# data buckets: ops/catalog-export.sh [wrangler configuration args, e.g. --env dev]
 #
 # Compressed SQL parts and their manifest are stored under d1/<database>/.
 # The restore point is taken before the export starts, so every commit the
@@ -39,17 +39,22 @@ part_bytes=${VELMORA_EXPORT_PART_BYTES-268435456}
 part_limit=$(catalog_part_max_bytes)
 readonly D1_PAID_MAX_DB_BYTES=10000000000
 
-previous_arg=
+# Keep export mode, format, and scope under this script's control. Wrangler
+# accepts alternate boolean spellings (e.g. --data=0), so fail closed.
+needs_value=
 for arg in "$@"; do
-  case "$arg" in
-    --no-schema|--no-schema=*|--no-data|--no-data=*|--schema=false|--data=false|--table|--table=*)
-      catalog_error 'catalogue backups must include schema and data for every table' ;;
-  esac
-  if [[ $arg == false && ( $previous_arg == --schema || $previous_arg == --data ) ]]; then
-    catalog_error 'catalogue backups must include schema and data for every table'
+  if [[ -n $needs_value ]]; then
+    [[ -n $arg && $arg != -* ]] || catalog_error "$needs_value requires a value"
+    needs_value=
+    continue
   fi
-  previous_arg=$arg
+  case "$arg" in
+    --config|-c|--cwd|--env|-e|--env-file|--profile) needs_value=$arg ;;
+    --config=?*|-c=?*|--cwd=?*|--env=?*|-e=?*|--env-file=?*|--profile=?*) ;;
+    *) catalog_error 'catalogue backups must include schema and data for every table from remote D1; only Wrangler configuration options are allowed' ;;
+  esac
 done
+[[ -z $needs_value ]] || catalog_error "$needs_value requires a value"
 
 for tool in zstd jq split sha256sum python3 od flock; do
   command -v "$tool" >/dev/null || { echo "catalog-export: missing tool: $tool" >&2; exit 1; }

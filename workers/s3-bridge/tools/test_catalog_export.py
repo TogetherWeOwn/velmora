@@ -635,6 +635,17 @@ class CatalogueScripts(unittest.TestCase):
                 self.assertIn("catalogue backups must include schema and data", result.stderr)
                 self.assertEqual(self.calls(), [])
 
+    def test_rclone_export_refuses_wrangler_mode_and_dump_overrides(self):
+        self.env["VELMORA_EXPORT_RCLONE_REMOTE"] = "r2x"
+        for i, flags in enumerate((["--data=0"], ["--schema=0"], ["--remote=false"], ["--local"],
+                                   ["--compatibility", "sqlite3_cli_only"])):
+            with self.subTest(flags=flags):
+                self.env["FAKE_DATE"] = str(int(MS) + i)
+                result = self.run_script("export", *flags)
+                self.assertEqual(result.returncode, 1, result.stdout)
+                self.assertIn("only Wrangler configuration options are allowed", result.stderr)
+                self.assertEqual(self.calls(), [])
+
     def test_export_rejects_incomplete_sql_before_any_upload(self):
         self.fixture.write_text("CREATE TABLE fixture (value TEXT);\n"
                                 "INSERT INTO fixture VALUES ('unclosed;\n", encoding="utf-8")

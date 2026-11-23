@@ -272,8 +272,10 @@ The importer requires SQLite 3.37 or later. On the same host, run these
 scripts as the same user with the same `TMPDIR` so they share
 locks: exports lock by source database name, imports by resolved target UUID.
 
-The exporter requires a full dump with schema and data. It has no single-file
-SQL size limit, but refuses an export with any SQL statement over 100,000 bytes,
+The exporter requires a full remote dump with schema and data. Its Wrangler
+arguments are limited to configuration options (`--config`/`-c`, `--env`/`-e`,
+`--cwd`, `--env-file`, and `--profile`). It has no single-file SQL size limit,
+but refuses an export with any SQL statement over 100,000 bytes,
 which D1 cannot import. Its summary gives the longest statement and the D1 file
 size along with the snapshot sizes. Set `VELMORA_EXPORT_SIZES_LOG` to append
 those measurements as JSON lines. The export warns at 60% of either the
@@ -326,10 +328,11 @@ older Worker cannot enforce it on a direct replay call.
      A production catalogue also requires `VELMORA_IMPORT_PRODUCTION=yes`.
      The export carries the schema and the list of applied migrations, so
      apply migrations after loading it. Do not run against production without
-     these confirmations. The script refuses a non-empty database. It bounds
-     each part download to its declared size plus one byte, bounds decompression
-     by the manifest's SQL size, and checks every checksum before splitting.
-     Legacy single-file exports have no checksums.
+     these confirmations. The script refuses a non-empty database. It stages
+     at most the declared size plus one byte per part and closes the Wrangler
+     stream at that cap (which does not limit bytes already in flight). It also
+     bounds decompression by the manifest's SQL size and checks every checksum
+     before splitting. Legacy single-file exports have no checksums.
 
      Restore always uses statement-safe batches, even for small exports:
      table schemas first, INSERTs in foreign-key order, then the remaining
