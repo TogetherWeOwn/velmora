@@ -43,9 +43,12 @@ thread_local! {
     /// Asked before a POST is sent, with its provider and Message-ID: a
     /// flag returned here holds the POST back until it is set.
     static BEFORE_POST: RefCell<Option<BeforePost>> = const { RefCell::new(None) };
+    static BEFORE_BODY: RefCell<Option<BeforeBody>> = const { RefCell::new(None) };
 }
 
 type BeforePost = Box<dyn FnMut(&str, &str) -> Option<Rc<Cell<bool>>>>;
+type BodyWait = futures_util::future::LocalBoxFuture<'static, ()>;
+type BeforeBody = Box<dyn FnMut(&str, &str) -> Option<BodyWait>>;
 
 /// The POSTs sent so far in this test: provider and `<Message-ID>`.
 pub fn post_starts() -> Vec<(String, String)> {
@@ -56,6 +59,11 @@ pub fn post_starts() -> Vec<(String, String)> {
 /// holds that POST back until the flag is set.
 pub fn before_post(gate: impl FnMut(&str, &str) -> Option<Rc<Cell<bool>>> + 'static) {
     BEFORE_POST.with(|g| *g.borrow_mut() = Some(Box::new(gate)));
+}
+
+/// Runs `gate` before each BODY of this test; awaits any future it returns.
+pub fn before_body(gate: impl FnMut(&str, &str) -> Option<BodyWait> + 'static) {
+    BEFORE_BODY.with(|g| *g.borrow_mut() = Some(Box::new(gate)));
 }
 
 fn bracketed(message_id: &str) -> String {
@@ -233,6 +241,14 @@ impl NntpSession for CountedSession {
     }
     async fn body(&mut self, message_id: &str, out: &mut Vec<u8>) -> Result<BodyOutcome> {
         begin(&self.slow, "body");
+        let wait = BEFORE_BODY.with(|g| {
+            g.borrow_mut()
+                .as_mut()
+                .and_then(|f| f(&self.provider, message_id))
+        });
+        if let Some(wait) = wait {
+            wait.await;
+        }
         let found = NntpSession::body(self.client(), message_id, out).await;
         end(&self.slow);
         found

@@ -1531,9 +1531,11 @@ copy) goes extent by extent, over `COLD_SOCKETS` connections at once:
 - **Verified, then sent.** The articles of an extent arrive on whichever
   connection is free, each is checked against its hash, the extent
   against its own, and only then is it decrypted and sent. The cache
-  write of an extent runs beside the read of the next one and is not
-  waited for by the client; a cache write that fails does not fail the
-  read.
+  write of an extent normally runs beside the read of the next one. If
+  the next extent cannot charge the bytes for a rebuild, the GET waits
+  for its own previous cache write, then tries that charge once more
+  before giving up on that rebuild attempt. A cache write that fails
+  does not fail the read.
 - **One step ahead, no further.** The Worker reads one extent ahead of
   the client and holds one cache write, all within
   `INFLIGHT_BUDGET_BYTES`. A client that stops reading stops the Worker
@@ -1587,7 +1589,9 @@ copy) goes extent by extent, over `COLD_SOCKETS` connections at once:
   being slow, articles asked for a second time, articles and bytes per
   provider id, and the milliseconds spent asking the cache, reading,
   waiting for room in the byte budget, waiting for the client, and
-  writing to the cache. It names no key, bucket, message-id or host.
+  writing to the cache. Time a rebuild spends waiting for this GET's
+  previous cache write counts in `read_ms`. The log names no key, bucket,
+  message-id or host.
 
 Measured on a deployed Worker with an object of 6 GiB (384 extents of
 16 MiB) that was in neither bucket, one provider reached through a
