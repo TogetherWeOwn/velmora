@@ -216,6 +216,71 @@ async fn copy_across(src: &Source) {
     assert!(read.body == [&halves[0][1..], &halves[1][..1]].concat());
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn copy_part_without_a_provider_slot_reports_slot_wait() {
+    use std::rc::Rc;
+    use velmora_bridge::metrics::{request_point, Request, RequestObservation};
+
+    let src = cold_source(3 * CAP as u64, false).await;
+    let rig = &src.rig;
+    let id = create(rig, &src.signer, "dst").await;
+    let provider = &rig.bridge.cfg.providers[0];
+    let mut held = Vec::new();
+    for n in 0..provider.max_conns {
+        held.push(
+            rig.bridge
+                .catalog
+                .acquire_permit(
+                    provider,
+                    PermitClass::Read,
+                    &format!("reader-{n}"),
+                    rig.now(),
+                )
+                .await
+                .unwrap()
+                .unwrap(),
+        );
+    }
+    let request = src.signer.sign(
+        rig.now(),
+        Method::Put,
+        &path(BUCKET, "dst"),
+        &[("partNumber", "1"), ("uploadId", &id)],
+        &[
+            ("x-amz-copy-source", &format!("/{BUCKET}/src")),
+            ("x-amz-copy-source-range", "bytes=0-0"),
+        ],
+        vec![],
+    );
+    let mut get = RequestObservation::default();
+    let raw = Rc::clone(&rig.bridge)
+        .handle_observed(request.into_request(), &mut get)
+        .await;
+    let resp = Resp::collect(raw).await;
+    resp.expect_error(503, "SlowDown");
+    for permit in &held {
+        rig.bridge.catalog.release_permit(permit).await.unwrap();
+    }
+    let point = request_point(
+        &Request {
+            method: "PUT",
+            admin: false,
+            sub: false,
+            status: resp.status,
+            latency_ms: 0,
+            bytes_in: 0,
+            bytes_out: 0,
+            colo: "IAD",
+            get,
+        },
+        1,
+    );
+    assert_eq!(
+        point.analytics_blobs().collect::<Vec<_>>(),
+        ["req", "PUT", "5xx", "s3", "IAD", "slot_wait", "unknown"]
+    );
+}
+
 /// A range that takes all but one byte of a part from one cold extent and
 /// its last byte from the next, which is cold and full-size. Reading that
 /// extent back needs twice its size; beside the piece already held that

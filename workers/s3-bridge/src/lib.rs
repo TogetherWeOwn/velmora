@@ -31,7 +31,7 @@ use std::task::{Poll, Waker};
 use velmora_bridge::copy::Copier;
 use velmora_bridge::ingress;
 use velmora_bridge::keepalive;
-use velmora_bridge::metrics::{GetFailureStage, GetObservation};
+use velmora_bridge::metrics::RequestObservation;
 use velmora_bridge::{
     BridgeError, Job, JobOutcome, OutboxStage, RespBody, S3Response, UnixMs, JOB_VERSION,
 };
@@ -59,7 +59,7 @@ fn error_class(e: &BridgeError) -> &'static str {
 /// One-shot hand-off of the handler's response to the fetch future.
 #[derive(Default)]
 struct Slot {
-    resp: Option<(S3Response, GetObservation)>,
+    resp: Option<(S3Response, RequestObservation)>,
     waker: Option<Waker>,
 }
 
@@ -74,11 +74,11 @@ async fn handle_detached(
     ctx: &Context,
     bridge: Rc<env::WorkerBridge>,
     req: velmora_bridge::S3Request,
-) -> (S3Response, GetObservation) {
+) -> (S3Response, RequestObservation) {
     let slot = Rc::new(RefCell::new(Slot::default()));
     let tx = Rc::clone(&slot);
     ctx.wait_until(async move {
-        let mut get = GetObservation::default();
+        let mut get = RequestObservation::default();
         let mut resp = bridge.handle_observed(req, &mut get).await;
         let work = match &mut resp.body {
             RespBody::Deferred(d) => d.take_work(),
@@ -139,7 +139,19 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
     let internal = std::cell::Cell::new(false);
     // Every answer for an admin route carries `no-store`, the early
     // refusals below too.
-    let admin = ingress::is_admin_url(&req.inner().url());
+    let url = req.inner().url();
+    let admin = ingress::is_admin_url(&url);
+    // Only identify CompleteMultipartUpload here if the router did not run.
+    let initial = || {
+        if method == "POST" && !admin {
+            velmora_bridge::service::initial_observation(
+                &method,
+                ingress::origin_form(&url).unwrap_or(""),
+            )
+        } else {
+            RequestObservation::default()
+        }
+    };
     // The ray ID: what the request is logged under, and what every
     // answer carries as `x-amz-request-id` (`S3Response::with_request_id`).
     // A request that did not come through the edge (a service binding)
@@ -167,7 +179,7 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
     // The point of this request, if it gets one. A sub-request of a
     // large GET gets none unless it failed: a 5xx is never left out,
     // whatever headers the request carried.
-    let count = |status: u16, sample: u32, bytes_out: u64, get: GetObservation| {
+    let count = |status: u16, sample: u32, bytes_out: u64, get: RequestObservation| {
         if internal.get() && status < 500 {
             return;
         }
@@ -200,7 +212,7 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
         Err(class) => {
             console_error!("config refused: {class}");
             let resp = ingress::IngressError::Internal.response();
-            count(resp.status, 1, 0, GetObservation::default());
+            count(resp.status, 1, 0, initial());
             return Ok(early(resp));
         }
     };
@@ -211,13 +223,11 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
                 "{}",
                 ingress::log_line(&method, "-", e.status(), &request_id)
             );
-            count(
-                e.status(),
-                bridge.cfg.metrics_sample,
-                0,
-                GetObservation::default(),
-            );
-            return Ok(early(e.response()));
+            let out = early(e.response());
+            let mut observed = initial();
+            let status = observed.response_status(&method, admin, e.status(), out.status_code());
+            count(status, bridge.cfg.metrics_sample, 0, observed);
+            return Ok(out);
         }
     };
     let target = incoming.req.raw_target.clone();
@@ -229,10 +239,10 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
         )
         .is_ok(),
     );
-    let got = std::cell::Cell::new(GetObservation::default());
+    let got = std::cell::Cell::new(None);
     let resp = ingress::front(incoming.req, &bridge.cfg, incoming.https, |req| async {
         let (resp, get) = handle_detached(&ctx, Rc::clone(&bridge), req).await;
-        got.set(get);
+        got.set(Some(get));
         // A deferred document: buffered when it is done soon, else
         // streamed with keepalive whitespace.
         keepalive::settle_response(resp, env::sleeper()).await
@@ -241,7 +251,7 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
     .with_request_id(&request_id);
     // A body in sub-ranges: the first one is opened before the status is
     // known to the client.
-    let mut get = got.into_inner();
+    let mut get = got.into_inner().unwrap_or_else(initial);
     let (status, out) = fanout::respond(&env, &ctx, resp, &request_id, &mut get).await;
     console_log!(
         "{}",
@@ -251,13 +261,8 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
         console_log!("{line}");
     }
     // HTTP conversion can itself turn a response into a 500. Keep the
-    // existing response and log, but count the actual GET outcome.
-    let metrics_status = if method == "GET" && !admin && status != out.status_code() {
-        get.mark_stage(GetFailureStage::Other);
-        out.status_code()
-    } else {
-        status
-    };
+    // existing response and log, but count the actual observed outcome.
+    let metrics_status = get.response_status(&method, admin, status, out.status_code());
     count(
         metrics_status,
         bridge.cfg.metrics_sample,

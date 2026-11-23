@@ -178,10 +178,9 @@ pub(super) async fn head_object<
 >(
     bridge: &Rc<Bridge<C, B, N, J, K, T>>,
     req: S3Request,
-    _bucket: &str,
-    _key: &str,
+    observed: &mut GetObservation,
 ) -> S3Response {
-    match read(bridge, req, true, &mut GetObservation::default()).await {
+    match read(bridge, req, true, observed).await {
         Ok(resp) => resp,
         // A HEAD response has no body, errors included.
         Err(mut resp) => {
@@ -317,7 +316,7 @@ async fn read<
     };
 
     observed.record_size(generation.size);
-    observed.mark_stage(Stage::Plan);
+    observed.mark_stage(if head { Stage::Other } else { Stage::Plan });
     let metadata = ObjectMetadata::new(
         generation.id.as_str().to_owned(),
         generation.size,
@@ -842,6 +841,7 @@ pub(super) async fn read_range<C, B, N, J, K, T>(
     extents: Vec<ExtentRow>,
     start: u64,
     len: u64,
+    observed: &mut GetObservation,
 ) -> core::result::Result<(Vec<u8>, Charge), S3Response>
 where
     C: Catalog,
@@ -875,7 +875,10 @@ where
                     *first_eligible_at.insert(bridge.clock.now()),
                 )
                 .await
-                .map_err(|fail| fail.response())?,
+                .map_err(|fail| {
+                    observed.mark_stage(fail.stage());
+                    fail.response()
+                })?,
             );
         }
         held = held.saturating_add(piece.len);
@@ -886,18 +889,20 @@ where
         parts.push(
             read_piece(bridge, bucket, piece, first_eligible_at)
                 .await
-                .map_err(|fail| fail.response())?,
+                .map_err(|fail| {
+                    observed.mark_stage(fail.stage());
+                    fail.response()
+                })?,
         );
     }
     if parts.len() == 1 {
         return parts.pop().ok_or_else(internal);
     }
     // Several pieces: they and the joined copy are live together.
-    let held = bridge
-        .budget
-        .charge(len)
-        .await
-        .map_err(|_| ReadFail::Busy(Stage::Budget).response())?;
+    let held = bridge.budget.charge(len).await.map_err(|_| {
+        observed.mark_stage(Stage::Budget);
+        ReadFail::Busy(Stage::Budget).response()
+    })?;
     let mut out = Vec::with_capacity(usize::try_from(len).map_err(|_| internal())?);
     for (bytes, _) in &parts {
         out.extend_from_slice(bytes);

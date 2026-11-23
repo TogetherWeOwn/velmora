@@ -1142,13 +1142,24 @@ async fn a_complete_sent_twice_at_once_is_answered_twice() {
 /// not publish a second time. It says `500`, and the record stays.
 #[tokio::test(flavor = "current_thread")]
 async fn a_refused_write_that_is_published_after_all_does_not_answer_412() {
+    use std::rc::Rc;
+    use velmora_bridge::metrics::{request_point, Request, RequestObservation};
+
     for writer in WRITERS {
         let s = scene().await;
         let rig = &s.rig;
         delete_if(rig, &s.signer, "k", &[]).await.expect(204);
         tick(rig);
         let kept = records(rig);
-        let write = start(rig, s.write(writer, &[("if-none-match", "*")]));
+        let req = s.write(writer, &[("if-none-match", "*")]);
+        let method = req.method.clone();
+        let write = async {
+            let mut observed = RequestObservation::default();
+            let resp = Rc::clone(&rig.bridge)
+                .handle_observed(req.into_request(), &mut observed)
+                .await;
+            (Resp::collect(resp).await, observed)
+        };
         let write = step_to(rig, write, |rig| records(rig).len() > kept.len())
             .await
             .stalled();
@@ -1172,8 +1183,27 @@ async fn a_refused_write_that_is_published_after_all_does_not_answer_412() {
             ),
         );
         let generations = rig.count("generations");
-        let answer = write.await;
+        let (answer, observed) = write.await;
         assert_eq!(answer.status, 500, "{writer:?}: {}", answer.text());
+        let point = request_point(
+            &Request {
+                method: method.as_str(),
+                admin: false,
+                sub: false,
+                status: answer.status,
+                latency_ms: 0,
+                bytes_in: 0,
+                bytes_out: 0,
+                colo: "IAD",
+                get: observed,
+            },
+            1,
+        );
+        assert_eq!(
+            point.analytics_blobs().skip(5).collect::<Vec<_>>(),
+            ["commit", "le_1gib"],
+            "{writer:?}"
+        );
         assert!(records(rig).contains(&mine[0]), "{writer:?}: the record");
         assert_eq!(rig.count("generations"), generations, "{writer:?}");
         assert_eq!(get(rig, &s.signer, "k").await.expect(200).body, small(9));

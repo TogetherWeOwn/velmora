@@ -26,9 +26,10 @@ use velmora_s3_proto::{
 
 use super::common::{
     check_precondition, discard_before_retry, hold_precondition, internal, metadata_json,
-    restore_gate, s3_error, stored_checksum, stored_headers, unavailable, Authed,
+    restore_failure, restore_gate, s3_error, stored_checksum, stored_headers, unavailable, Authed,
 };
 use crate::config::SINGLE_RECORD_EXTENTS;
+use crate::metrics::{FailureStage as Stage, RequestObservation};
 use crate::ports::{
     BlobStore, Bridge, Catalog, Clock, JobSink, Kek, NntpConnector, PublishOutcome,
 };
@@ -198,6 +199,7 @@ pub(super) async fn copy_object<C, B, N, J, K, T>(
     declared: Option<u64>,
     body: Body,
     condition: Option<Precondition>,
+    observed: &mut RequestObservation,
 ) -> Result<S3Response, S3Response>
 where
     C: Catalog,
@@ -260,9 +262,14 @@ where
         // answered before anything is written for the copy, the floor of
         // the key included.
         if let Some(condition) = &condition {
-            check_precondition(bridge, &bucket.id, key, condition).await?;
+            check_precondition(bridge, &bucket.id, key, condition)
+                .await
+                .inspect_err(observed.on_error(Stage::Lookup))?;
         }
-        let (from, extents) = source_object(bridge, &authed.headers, bucket, &source).await?;
+        let (from, extents) = source_object(bridge, &authed.headers, bucket, &source)
+            .await
+            .inspect_err(observed.on_error(Stage::Lookup))?;
+        observed.record_size(from.size);
         // The copy keeps the checksum stored with the source. Computing
         // another one would mean reading every byte.
         if wanted.is_some_and(|a| stored_checksum(&from).map(|c| c.algorithm()) != Some(a)) {
@@ -283,6 +290,7 @@ where
             .catalog
             .newest_id(&bucket.id, key)
             .await
+            .inspect_err(observed.on_error(Stage::Lookup))
             .map_err(|_| internal())?;
         let now = bridge.clock.now();
         let mut rand = [0u8; 8];
@@ -316,7 +324,15 @@ where
         };
         // A condition on the destination that does not hold ends the
         // copy here, before a record exists under this id.
-        hold_precondition(bridge, &bucket.id, key, &generation.id, condition.as_ref()).await?;
+        hold_precondition(
+            bridge,
+            &bucket.id,
+            key,
+            &generation.id,
+            condition.as_ref(),
+            observed,
+        )
+        .await?;
         // The recovery record is durable before the catalogue batch, as
         // for a PUT. It describes every extent in full, so a replay can
         // rebuild the copy when the source it shares them with is gone.
@@ -331,7 +347,10 @@ where
             &extents,
         )
         .await
-        .map_err(|_| internal())?;
+        .map_err(|error| {
+            observed.mark_stage(Stage::storage(&error));
+            internal()
+        })?;
         drop(extents);
         let copy = CopyGeneration {
             generation,
@@ -343,6 +362,7 @@ where
             .catalog
             .copy_generation(&copy, condition.as_ref(), record)
             .await
+            .inspect_err(observed.on_error(Stage::Commit))
             .map_err(|_| internal())?
         {
             PublishOutcome::Applied => {
@@ -359,11 +379,21 @@ where
         // Nothing was published under this id, so its record must not
         // publish it in a replay either. A record that cannot be removed
         // ends the request: no copy was made, and the caller is told so.
-        discard_before_retry(bridge, &copy.generation, refused, condition.is_some()).await?;
+        discard_before_retry(
+            bridge,
+            &copy.generation,
+            refused,
+            condition.is_some(),
+            observed,
+        )
+        .await?;
         // Refused as well when a replay started after this request
         // passed the gate.
-        restore_gate(bridge).await?;
+        restore_gate(bridge)
+            .await
+            .map_err(|resp| restore_failure(observed, resp))?;
         // Plan again against what is live now.
     }
+    observed.mark_stage(Stage::Commit);
     Err(unavailable())
 }

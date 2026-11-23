@@ -30,29 +30,29 @@ pub struct Point {
     /// letters or digits, or `-`. It is `blob5` of a request point.
     pub colo: String,
     pub doubles: Vec<f64>,
-    get_error: Option<GetObservation>,
+    failure: Option<RequestObservation>,
 }
 
 impl Point {
     /// The exact blobs sent to Analytics Engine. Colo stays in blob5
-    /// for request points; GET failures may append blob6 and blob7.
+    /// for request points; observed failures may append blob6 and blob7.
     pub fn analytics_blobs(&self) -> impl Iterator<Item = &str> {
         self.blobs
             .iter()
             .copied()
             .chain(core::iter::once(self.colo.as_str()))
-            .chain(self.get_error.into_iter().flat_map(|get| {
+            .chain(self.failure.into_iter().flat_map(|observed| {
                 [
-                    get.stage.unwrap_or(GetFailureStage::Other).code(),
-                    get.size.code(),
+                    observed.stage.unwrap_or(FailureStage::Other).code(),
+                    observed.size.code(),
                 ]
             }))
     }
 }
 
-/// The last unrecovered stage before an object GET's error response.
+/// The last unrecovered stage before an observed S3 error response.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum GetFailureStage {
+pub enum FailureStage {
     Auth,
     Lookup,
     Plan,
@@ -65,10 +65,32 @@ pub enum GetFailureStage {
     SlotWait,
     Budget,
     Decrypt,
+    Commit,
+    Stamp,
     Other,
 }
 
-impl GetFailureStage {
+impl FailureStage {
+    /// Where an operation spanning both the catalogue and blob store failed.
+    /// Use the port error's variant, never its payload.
+    pub(crate) fn storage(error: &crate::types::BridgeError) -> Self {
+        use crate::types::BridgeError;
+        match error {
+            BridgeError::Sql(_) | BridgeError::GuardFailed => Self::Commit,
+            BridgeError::Blob(_) => Self::R2,
+            _ => Self::Other,
+        }
+    }
+
+    /// Stamp checks and updates share a result; a SQL error does not say
+    /// whether a write ran. Keep those failures out of publication commits.
+    pub(crate) fn stamp(error: &crate::types::BridgeError) -> Self {
+        match error {
+            crate::types::BridgeError::Blob(_) => Self::R2,
+            _ => Self::Stamp,
+        }
+    }
+
     fn code(self) -> &'static str {
         match self {
             Self::Auth => "auth",
@@ -83,20 +105,22 @@ impl GetFailureStage {
             Self::SlotWait => "slot_wait",
             Self::Budget => "budget",
             Self::Decrypt => "decrypt",
+            Self::Commit => "commit",
+            Self::Stamp => "stamp",
             Self::Other => "other",
         }
     }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-enum GetSize {
+enum SizeClass {
     #[default]
     Unknown,
     AtMost1GiB,
     Over1GiB,
 }
 
-impl GetSize {
+impl SizeClass {
     fn code(self) -> &'static str {
         match self {
             Self::Unknown => "unknown",
@@ -108,24 +132,60 @@ impl GetSize {
 
 /// Redacted per-request observations; not part of the S3 response.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct GetObservation {
-    stage: Option<GetFailureStage>,
-    size: GetSize,
+pub struct RequestObservation {
+    stage: Option<FailureStage>,
+    size: SizeClass,
+    complete_multipart: bool,
 }
 
-impl GetObservation {
+// The GET and fan-out paths use this same observation and stage vocabulary.
+pub use FailureStage as GetFailureStage;
+pub use RequestObservation as GetObservation;
+
+impl RequestObservation {
     /// Classify the full object size, even for a range GET. Do not retain
     /// the exact size or try to guess it before the generation is known.
     pub fn record_size(&mut self, bytes: u64) {
         self.size = if bytes <= 1 << 30 {
-            GetSize::AtMost1GiB
+            SizeClass::AtMost1GiB
         } else {
-            GetSize::Over1GiB
+            SizeClass::Over1GiB
         };
     }
 
-    pub fn mark_stage(&mut self, stage: GetFailureStage) {
+    pub fn mark_stage(&mut self, stage: FailureStage) {
         self.stage = Some(stage);
+    }
+
+    /// Annotate an unrecovered error without reading or replacing it.
+    pub(crate) fn on_error<E>(&mut self, stage: FailureStage) -> impl FnOnce(&E) + '_ {
+        move |_| self.mark_stage(stage)
+    }
+
+    pub(crate) fn mark_complete_multipart(&mut self) {
+        self.complete_multipart = true;
+    }
+
+    /// The response conversion can replace the intended response with
+    /// a 500. For observed failures, count the wire status and attribute
+    /// that 500 to conversion, not to a stage of the original response.
+    pub fn response_status(&mut self, method: &str, admin: bool, intended: u16, wire: u16) -> u16 {
+        if intended != wire && self.records_failure(method, admin, wire) {
+            self.mark_stage(FailureStage::Other);
+            wire
+        } else {
+            intended
+        }
+    }
+
+    fn records_failure(self, method: &str, admin: bool, status: u16) -> bool {
+        !admin
+            && match method {
+                "GET" => status >= 400,
+                "PUT" | "HEAD" => status >= 500,
+                "POST" => self.complete_multipart && status >= 500,
+                _ => false,
+            }
     }
 }
 
@@ -146,7 +206,7 @@ pub struct Request<'a> {
     pub bytes_out: u64,
     /// The Cloudflare data centre that answered (`cf.colo`).
     pub colo: &'a str,
-    pub get: GetObservation,
+    pub get: RequestObservation,
 }
 
 fn method(m: &str) -> &'static str {
@@ -213,7 +273,10 @@ pub fn request_point(r: &Request<'_>, weight: u32) -> Point {
             },
         ],
         colo: colo(r.colo),
-        get_error: (r.method == "GET" && !r.admin && r.status >= 400).then_some(r.get),
+        failure: r
+            .get
+            .records_failure(r.method, r.admin, r.status)
+            .then_some(r.get),
         doubles: vec![
             f64::from(r.status),
             r.latency_ms as f64,
@@ -231,7 +294,7 @@ pub fn cold_read_point() -> Point {
         index: "cold",
         blobs: vec!["cold"],
         colo: "-".to_string(),
-        get_error: None,
+        failure: None,
         doubles: vec![1.0],
     }
 }
@@ -318,11 +381,55 @@ mod tests {
         r.status = 200;
         assert_eq!(request_point(&r, 1).analytics_blobs().count(), 5);
         r.status = 500;
-        r.method = "HEAD";
+        r.method = "POST";
         assert_eq!(request_point(&r, 1).analytics_blobs().count(), 5);
         r.method = "GET";
         r.admin = true;
         assert_eq!(request_point(&r, 1).analytics_blobs().count(), 5);
+    }
+
+    #[test]
+    fn observed_early_failures_default_to_other_and_unknown() {
+        for (method, target) in [
+            ("PUT", "/bucket/key"),
+            ("HEAD", "/bucket/key"),
+            ("POST", "/bucket/key?uploadId=opaque-id"),
+        ] {
+            let mut r = req(method, 500, "iad");
+            r.get = crate::service::initial_observation(method, target);
+            assert_eq!(
+                request_point(&r, 1).analytics_blobs().collect::<Vec<_>>(),
+                ["req", method, "5xx", "s3", "IAD", "other", "unknown"]
+            );
+        }
+        let mut r = req("POST", 500, "iad");
+        r.get = crate::service::initial_observation("POST", "/bucket/key?uploads");
+        assert_eq!(request_point(&r, 1).analytics_blobs().count(), 5);
+    }
+
+    #[test]
+    fn conversion_fallback_uses_wire_status_and_other_for_observed_routes() {
+        for (method, target) in [
+            ("GET", "/bucket/key"),
+            ("PUT", "/bucket/key"),
+            ("HEAD", "/bucket/key"),
+            ("POST", "/bucket/key?uploadId=opaque-id"),
+        ] {
+            let mut r = req(method, 200, "IAD");
+            r.get = crate::service::initial_observation(method, target);
+            r.get.mark_stage(FailureStage::Auth);
+            r.get.record_size(1 << 30);
+            r.status = r.get.response_status(method, r.admin, r.status, 500);
+            let point = request_point(&r, 1);
+            assert_eq!(point.doubles[0], 500.0);
+            assert_eq!(
+                point.analytics_blobs().collect::<Vec<_>>(),
+                ["req", method, "5xx", "s3", "IAD", "other", "le_1gib"]
+            );
+        }
+        let mut r = req("POST", 200, "iad");
+        r.get = crate::service::initial_observation("POST", "/bucket/key?uploads");
+        assert_eq!(r.get.response_status(r.method, r.admin, r.status, 500), 200);
     }
 
     #[test]
