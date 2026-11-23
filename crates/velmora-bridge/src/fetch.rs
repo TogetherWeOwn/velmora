@@ -2170,6 +2170,12 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ColdReader<'a, C, N, T> {
                 end => Ok(Some(end)),
             };
         }
+        let failed_rebuild = |data: &Board| {
+            // Parity did not recover the data. A cutoff during the parity
+            // reads may still have exposed a reader the data pass never asked.
+            let end = desk.short(readers, plan, data, eligibility);
+            unrecoverable(end, &self.stats)
+        };
         let shards = board.cipher;
         let Board { cipher, have, .. } = data.get_mut();
         let rebuilt = {
@@ -2199,7 +2205,7 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ColdReader<'a, C, N, T> {
             reconstruct(&data, &parity)
         };
         let Ok(rebuilt) = rebuilt else {
-            return unrecoverable(end, &self.stats);
+            return failed_rebuild(data.get_mut());
         };
         // Nothing of a rebuild is used unless all of it is what the plan
         // says: one article that differs means the stripe is not the one
@@ -2209,7 +2215,7 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ColdReader<'a, C, N, T> {
                 bytes.len() as u64 == plan[a].cipher_len && sha256(bytes) == plan[a].payload_sha256
             });
         if !whole {
-            return unrecoverable(end, &self.stats);
+            return failed_rebuild(data.get_mut());
         }
         for (&a, bytes) in gaps.iter().zip(&rebuilt) {
             let start = plan[a].cipher_offset as usize;

@@ -1345,7 +1345,20 @@ async fn a_parity_article_that_is_lost_leaves_its_place_to_the_next() {
 /// rebuilds is not the lost article. Nothing of it is used.
 #[tokio::test]
 async fn a_rebuilt_article_that_is_not_the_planned_one_is_not_used() {
-    let st = posted(11, THREE, 1).await;
+    read_with_inconsistent_parity(false).await;
+}
+
+#[tokio::test]
+async fn a_bad_rebuild_is_retryable_when_a_reader_became_eligible_during_parity() {
+    read_with_inconsistent_parity(true).await;
+}
+
+async fn read_with_inconsistent_parity(late_reader: bool) {
+    let mut st = posted(11, THREE, if late_reader { 2 } else { 1 }).await;
+    if late_reader {
+        st.rig.bridge.cfg.providers[0].retention_days = Some(2);
+        st.rig.bridge.cfg.providers[1].retention_days = Some(1);
+    }
     let rig = &st.rig;
     let old = &st.parity[0];
     // The shard as it was posted, for row 0.
@@ -1394,10 +1407,31 @@ async fn a_rebuilt_article_that_is_not_the_planned_one_is_not_used() {
     assert_eq!(read, ColdFetch::Filled(st.s.cipher.clone()));
 
     rig.servers[0].hide(&st.data[1].message_id).await;
+    if late_reader {
+        let clock = rig.bridge.clock.clone();
+        let cutoff = st.data[1].posted_at.unwrap().plus_secs(2 * 86_400);
+        let parity_id = row.message_id.clone();
+        clock.set(cutoff);
+        before_body(move |provider, message_id| {
+            if provider == "p0" && message_id == parity_id {
+                clock.set(cutoff.plus_ms(1));
+            }
+            None
+        });
+    }
     let (read, stats) = st.read().await;
 
-    assert_eq!(read, ColdFetch::Unrecoverable);
-    assert_eq!((stats.rebuilt, stats.unrecoverable), (0, 1));
+    if late_reader {
+        // p1 has the original article but did not qualify in the data
+        // pass. Reject the rebuilt bytes and let the existing retry ask p1.
+        assert_eq!(read, ColdFetch::Interrupted);
+        assert_eq!((stats.rebuilt, stats.unrecoverable), (0, 0));
+        let (retried, _) = st.read().await;
+        assert_eq!(retried, ColdFetch::Filled(st.s.cipher.clone()));
+    } else {
+        assert_eq!(read, ColdFetch::Unrecoverable);
+        assert_eq!((stats.rebuilt, stats.unrecoverable), (0, 1));
+    }
     // The parity article was read and passed its own SHA-256.
     assert_eq!(verified(&stats), 3);
     assert_eq!(rig.bridge.budget.in_use(), 0);
