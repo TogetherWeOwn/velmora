@@ -122,8 +122,10 @@ impl BodyDone {
         let Some(stream) = self.0.borrow_mut().stream.take() else {
             return false;
         };
-        // Drop the in-flight read before any waiter checks for opens
-        // whose callers have gone away.
+        // Drop the stream before any waiter checks for detached work: a
+        // GET body stops reading for it here, and the Usenet read and
+        // cache write it had under way are counted as detached
+        // (`velmora_bridge::service::detached_bodies`) until they end.
         drop(stream);
         let (done_waker, pull_waker) = {
             let mut state = self.0.borrow_mut();

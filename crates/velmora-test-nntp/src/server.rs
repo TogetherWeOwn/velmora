@@ -135,6 +135,11 @@ struct Spool {
     size_carried: bool,
     /// `OVER <message-id>` answers `224` with no line.
     over_empty: bool,
+    /// While true, a `BODY` of an article that exists waits before it is
+    /// answered (a read that is under way).
+    hold_bodies: bool,
+    /// `BODY` commands for an article that exists, since the start.
+    bodies_asked: usize,
 }
 
 struct Shared {
@@ -171,6 +176,8 @@ impl Shared {
             reported_size: None,
             size_carried: false,
             over_empty: false,
+            hold_bodies: false,
+            bodies_asked: 0,
         };
         Self {
             config,
@@ -388,6 +395,17 @@ impl TestNntpServer {
     /// for.
     pub async fn late_for_next_bodies(&self, n: usize) {
         self.shared.spool.lock().await.late_bodies = n;
+    }
+
+    /// While set, a `BODY` of an article that exists is counted and then
+    /// waits, unanswered, until this is cleared: a read that is under way.
+    pub async fn set_hold_bodies(&self, hold: bool) {
+        self.shared.spool.lock().await.hold_bodies = hold;
+    }
+
+    /// How many `BODY` commands asked for an article that exists.
+    pub async fn bodies_asked(&self) -> usize {
+        self.shared.spool.lock().await.bodies_asked
     }
 
     /// While set, `BODY` answers `430` for posted articles although `STAT`
@@ -738,6 +756,21 @@ async fn handle_connection(
                     let _ = writer.write_all(b"430 No such article\r\n").await;
                     continue;
                 };
+                if cmd.as_str() == "BODY" {
+                    shared.spool.lock().await.bodies_asked += 1;
+                    while shared.spool.lock().await.hold_bodies {
+                        let aborted = tokio::select! {
+                            _ = shutdown.changed() => true,
+                            _ = tokio::time::sleep(Duration::from_millis(2)) => false,
+                        };
+                        if aborted || *shutdown.borrow() {
+                            break;
+                        }
+                    }
+                    if *shutdown.borrow() {
+                        break;
+                    }
+                }
                 if shared.config.latency_ms > 0 {
                     let aborted = tokio::select! {
                         _ = shutdown.changed() => true,

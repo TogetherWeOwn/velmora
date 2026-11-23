@@ -434,16 +434,25 @@ fn tracked_open_spawner(spawn: Spawner) -> Spawner {
     })
 }
 
+/// Detached work of this isolate that the runtime must not cut off: gate
+/// opens in flight, and GET bodies whose client went away that finish
+/// the Usenet read and cache write they had under way
+/// ([`velmora_bridge::service::detached_bodies`]).
+fn detached_work() -> bool {
+    DETACHED_OPENS.get() != 0 || velmora_bridge::service::detached_bodies() != 0
+}
+
 /// Used with the current invocation's `wait_until` once no more work can
 /// start an open. The cached transport does not own a Context, and
 /// `spawn_local` alone does not keep it alive.
 pub fn drain_detached_opens() -> Option<impl Future<Output = ()>> {
-    (DETACHED_OPENS.get() != 0).then(|| drain_detached_opens_after(std::future::ready(())))
+    detached_work().then(|| drain_detached_opens_after(std::future::ready(())))
 }
 
 /// A streamed body can start an open after the response is returned, so
 /// wait for the body to finish before checking the count or starting the
-/// cleanup timeout.
+/// cleanup timeout. A body whose client went away is counted as detached
+/// before its end is signalled, so it is waited for as well.
 pub async fn drain_detached_opens_after(body_done: impl Future<Output = ()>) {
     wait_for_detached_opens(body_done, worker::Delay::from).await;
 }
@@ -452,9 +461,18 @@ async fn wait_for_detached_opens<F: Future<Output = ()>>(
     body_done: impl Future<Output = ()>,
     delay: impl Fn(Duration) -> F,
 ) {
+    wait_for_detached(body_done, delay, detached_work).await;
+}
+
+/// Waits for `body_done`, then while `busy`, for 30 s at most.
+async fn wait_for_detached<F: Future<Output = ()>>(
+    body_done: impl Future<Output = ()>,
+    delay: impl Fn(Duration) -> F,
+    busy: impl Fn() -> bool,
+) {
     body_done.await;
     let drain = async {
-        while DETACHED_OPENS.get() != 0 {
+        while busy() {
             delay(Duration::from_millis(50)).await;
         }
     };
@@ -800,6 +818,66 @@ mod tests {
         assert_eq!(DETACHED_OPENS.get(), 0);
         clock.advance(50);
         assert!(wait.as_mut().poll(&mut cx).is_ready());
+    }
+
+    /// A body whose client went away is counted as detached work before
+    /// its end is signalled: the drain waits for the Usenet read and
+    /// cache write it finishes, within the same 30 s.
+    #[test]
+    fn stream_drain_waits_for_a_body_that_finishes_after_its_client_left() {
+        let clock = TestClock::default();
+        let done = BodyDone::default();
+        let filling = Rc::new(Cell::new(false));
+        // A body's stream that counts itself detached when it is dropped,
+        // as a GET body with a Usenet read under way does.
+        struct Detaches(Rc<Cell<bool>>);
+        impl futures_util::Stream for Detaches {
+            type Item = core::result::Result<Vec<u8>, velmora_bridge::BridgeError>;
+            fn poll_next(
+                self: std::pin::Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+            ) -> Poll<Option<Self::Item>> {
+                Poll::Pending
+            }
+        }
+        impl Drop for Detaches {
+            fn drop(&mut self) {
+                self.0.set(true);
+            }
+        }
+        let tracked = done.track(Box::pin(Detaches(Rc::clone(&filling))));
+        let busy = || DETACHED_OPENS.get() != 0 || filling.get();
+        let mut wait = std::pin::pin!(wait_for_detached(
+            done.clone().wait(),
+            |d| clock.delay(d),
+            busy
+        ));
+        let mut cx = std::task::Context::from_waker(futures_util::task::noop_waker_ref());
+
+        assert!(wait.as_mut().poll(&mut cx).is_pending());
+        assert!(done.abort(), "the client went away");
+        assert!(filling.get(), "counted before the waiter looks");
+        drop(tracked);
+        clock.advance(50);
+        assert!(
+            wait.as_mut().poll(&mut cx).is_pending(),
+            "waits for the fill"
+        );
+        clock.advance(10_000);
+        assert!(wait.as_mut().poll(&mut cx).is_pending());
+        filling.set(false);
+        clock.advance(50);
+        assert!(wait.as_mut().poll(&mut cx).is_ready());
+    }
+
+    #[test]
+    fn detached_work_counts_detached_bodies() {
+        assert_eq!(velmora_bridge::service::detached_bodies(), 0);
+        assert_eq!(DETACHED_OPENS.get(), 0);
+        assert!(!detached_work());
+        let opening = DetachedOpen::start();
+        assert!(detached_work());
+        drop(opening);
     }
 
     #[test]

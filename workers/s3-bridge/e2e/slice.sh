@@ -1013,25 +1013,72 @@ if [[ $MODE == remote ]]; then
 fi
 if [[ $MODE == local && ${E2E_SLOT_WAIT:-} == push ]]; then
   # Read across two 8 MiB extents, without going over dev's 8 MiB fanout
-  # threshold. A cold second extent leaves a future to drop on disconnect.
+  # threshold. The second extent is read ahead while the client takes the
+  # first byte, so the disconnect lands on work under way.
   json=$(adm "GET /_admin/objects/$SB/a/big.bin" "$BASE/_admin/objects/$SB/a/big.bin")
-  if jq -e '.extents | length >= 2 and all(.[0:2][]; .cache == "absent" and
-    (.safety_state == "released" or .safety_state == "deleted"))' >/dev/null <<<"$json"; then
+  if jq -e '.extents | length >= 3 and all(.[]; .cache == "absent") and
+    all(.[0:2][]; .safety_state == "released" or .safety_state == "deleted")' >/dev/null <<<"$json"; then
     before_abort=$(stat -c '%s' "$T/wrangler.log")
+    log_since_abort() { tail -c "+$((before_abort + 1))" "$T/wrangler.log"; }
     got=$(python3 -I "$WORKER_DIR/e2e/sigv4_get.py" "$BASE" "$SB/a/big.bin" \
       gzip gzip /dev/null bytes=7340032-15728639 2>&1) ||
       fail "disconnect a cold GET" "HTTP 206 and the first body byte" "$got"
     log "cold GET disconnect: $got"
-    abort_logged() {
-      tail -c "+$((before_abort + 1))" "$T/wrangler.log" |
-        grep -F 'stream: client went away, body dropped' >/dev/null
-    }
+    abort_logged() { log_since_abort | grep -F 'stream: client went away, body dropped' >/dev/null; }
     poll 10 0.2 abort_logged ||
       fail "disconnect a cold GET" 'stream: client went away, body dropped within 10 s' 'line not found'
     log 'cold GET disconnect: stream: client went away, body dropped'
+    # The GET's connections end: one cold-read line each time a reader
+    # closes, with how many extents it read from Usenet.
+    read_lines() { log_since_abort | grep -o 'cold read: extents=[0-9]*' || true; }
+    reader_closed() { [[ -n $(read_lines) ]]; }
+    poll 40 0.5 reader_closed ||
+      fail "disconnect a cold GET" "a 'cold read: extents=N' line within 40 s" 'line not found'
+    read=$(read_lines | awk -F= '{ n += $2 } END { print n + 0 }')
+    log "cold GET disconnect: $(read_lines | tr '\n' ' ')($read extents read from Usenet)"
+    [[ $read == 1 || $read == 2 ]] ||
+      fail "disconnect a cold GET" "1 or 2 extents read from Usenet for a two-extent range" "$read"
+    # Every extent read from Usenet, also the one under way when the client
+    # left, is verified and lands in the cache (the fill survives).
+    filled() {
+      local j
+      j=$(adm_try "$BASE/_admin/objects/$SB/a/big.bin") || return 1
+      jq -e --argjson n "$read" 'all(.extents[0:$n][]; .cache == "present")' >/dev/null 2>&1 <<<"$j"
+    }
+    if ! poll 40 0.5 filled; then
+      json=$(adm "GET /_admin/objects/$SB/a/big.bin" "$BASE/_admin/objects/$SB/a/big.bin")
+      fail "disconnect a cold GET" "the $read extent(s) read from Usenet in the cache within 40 s" \
+        "$(jq -c '[.extents[0:2][] | .cache]' <<<"$json")"
+    fi
+    log "cold GET disconnect: the $read extent(s) read from Usenet are in the cache"
+    # No slot of the provider stays held for the GET that was cut off
+    # (local status: a throwaway D1 with a handful of outbox rows).
+    no_slot_held() {
+      local j
+      j=$(adm_try "$BASE/_admin/status") || return 1
+      jq -e 'all(.providers[]; .held == 0)' >/dev/null 2>&1 <<<"$j"
+    }
+    if ! poll 40 0.5 no_slot_held; then
+      json=$(adm "GET /_admin/status" "$BASE/_admin/status")
+      fail "disconnect a cold GET" "no provider slot held within 40 s" "$(jq -c '[.providers[] | {id, held, holders}]' <<<"$json")"
+    fi
+    log 'cold GET disconnect: no provider slot is held'
+    # No read from Usenet starts after the disconnect: no further reader
+    # closes, and no other extent of the object fills.
+    after_fill=$(stat -c '%s' "$T/wrangler.log")
+    sleep 3
+    more=$(tail -c "+$((after_fill + 1))" "$T/wrangler.log" | grep -c 'cold read: ' || true)
+    [[ $more == 0 ]] || fail "disconnect a cold GET" "no cold read for 3 s after the fill" "$more line(s)"
+    json=$(adm "GET /_admin/objects/$SB/a/big.bin" "$BASE/_admin/objects/$SB/a/big.bin")
+    jcheck "no other extent read after the disconnect" '.extents[2:] | all(.cache == "absent")' "$json"
+    log 'cold GET disconnect: no read from Usenet started after it'
     adm 're-evict a/big.bin after disconnect' -XPOST "$BASE/_admin/evict/$SB/a/big.bin?include_safety=1" >/dev/null
+  elif [[ ${CI:-} == true ]]; then
+    # On CI this leg exists to run the check: a skip would pass unseen.
+    fail "disconnect a cold GET" "3 or more extents out of the cache, the first 2 cold, before the disconnect" \
+      "$(jq -c '[.extents[] | {cache, safety_state}]' <<<"$json")"
   else
-    log 'cold GET disconnect: skipped (both range extents are not confirmed cold)'
+    log 'cold GET disconnect: skipped (the extents are not confirmed cold)'
   fi
 fi
 # NNTP BODY -> yEnc -> sha256 -> R2 refill -> decrypt
