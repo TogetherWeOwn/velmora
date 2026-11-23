@@ -283,6 +283,10 @@ pub struct JobRings<R> {
     misses: RefCell<BTreeMap<(TenantId, u32), bool>>,
     loads: Cell<u64>,
     load_ms: Cell<u64>,
+    /// Held while a ring is read: the copy checks records concurrently,
+    /// and a check that finds no ring waits for one in flight instead of
+    /// reading it again.
+    loading: futures_util::lock::Mutex<()>,
 }
 
 impl<R: TenantRings> JobRings<R> {
@@ -293,6 +297,7 @@ impl<R: TenantRings> JobRings<R> {
             misses: RefCell::new(BTreeMap::new()),
             loads: Cell::new(0),
             load_ms: Cell::new(0),
+            loading: futures_util::lock::Mutex::new(()),
         }
     }
 
@@ -331,12 +336,23 @@ impl<R: TenantRings> JobRings<R> {
         tenant: &TenantId,
         again: bool,
     ) -> std::result::Result<TenantRingState, ()> {
-        let held = self
-            .held
-            .borrow()
-            .get(tenant)
-            .map(|h| (h.state.clone(), h.reloaded));
-        let reloaded = match held {
+        let held = |rings: &Self| {
+            rings
+                .held
+                .borrow()
+                .get(tenant)
+                .map(|h| (h.state.clone(), h.reloaded))
+        };
+        if let Some((state, reloaded)) = held(self) {
+            if !again || reloaded {
+                return state;
+            }
+        }
+        // One read at a time; what a read in flight brought is looked at
+        // again before reading: at most one load and one reload per
+        // tenant and job, however many checks ask at once.
+        let _loading = self.loading.lock().await;
+        let reloaded = match held(self) {
             Some((state, reloaded)) if !again || reloaded => return state,
             Some(_) => true,
             None => false,
