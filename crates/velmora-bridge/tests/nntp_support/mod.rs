@@ -212,6 +212,15 @@ impl CountedSession {
 
 impl NntpSession for CountedSession {
     async fn post(&mut self, message_id: &str, article: &[u8]) -> Result<PostOutcome> {
+        self.post_observed(message_id, article, || {}).await
+    }
+
+    async fn post_observed(
+        &mut self,
+        message_id: &str,
+        article: &[u8],
+        written: impl FnOnce(),
+    ) -> Result<PostOutcome> {
         note_event("post");
         let id = bracketed(message_id);
         let hold =
@@ -223,7 +232,7 @@ impl NntpSession for CountedSession {
         }
         POST_STARTS.with(|s| s.borrow_mut().push((self.provider.clone(), id)));
         begin(&self.slow, "post");
-        let posted = NntpSession::post(self.client(), message_id, article).await;
+        let posted = NntpSession::post_observed(self.client(), message_id, article, written).await;
         let parked = self.park.borrow_mut().take();
         if let Some(release) = parked {
             while !release.get() {
@@ -427,6 +436,8 @@ pub struct MemCatalog {
     acquire_in_flight: Cell<u32>,
     /// Most slot requests ever in flight at once.
     pub acquire_peak: Cell<u32>,
+    /// The next acquire takes this long on this clock.
+    pub slow_next_acquire: RefCell<Option<(FixedClock, i64)>>,
     /// The next `renew_all` takes this long on this clock.
     pub slow_next_renewal: RefCell<Option<(FixedClock, i64)>>,
     /// `provider_failed` calls so far (strikes reported).
@@ -1096,6 +1107,9 @@ impl Catalog for MemCatalog {
         now: UnixMs,
     ) -> Result<Option<Permit>> {
         note_event("acquire");
+        if let Some((clock, ms)) = self.slow_next_acquire.take() {
+            clock.advance_ms(ms);
+        }
         self.acquires.set(self.acquires.get() + 1);
         if matches!(self.fail_asks.get(), Some((n, true)) if self.loads.get() >= n) {
             return Err(BridgeError::Sql("injected acquire_permit failure".into()));

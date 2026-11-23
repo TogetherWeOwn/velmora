@@ -256,6 +256,17 @@ impl<T: Transport> NntpSession for NntpClient<T> {
         Ok(self.post_article(message_id, article).await?)
     }
 
+    async fn post_observed(
+        &mut self,
+        message_id: &str,
+        article: &[u8],
+        written: impl FnOnce(),
+    ) -> Result<PostOutcome> {
+        Ok(self
+            .post_article_observed(message_id, article, written)
+            .await?)
+    }
+
     async fn stat(&mut self, message_id: &str) -> Result<bool> {
         match NntpClient::stat(self, message_id).await {
             Ok(_) => Ok(true),
@@ -730,7 +741,6 @@ where
                 .await;
             let post_ms = self.clock.now().0 - started.0;
             crate::trace::note(&lease.extent, |t| t.post_ms = post_ms);
-            crate::trace::job_note(|t| t.wire_ms = post_ms.max(0) as u64);
             posted?;
         } else {
             close_all(held).await;
@@ -1478,17 +1488,9 @@ where
         let round =
             Round::new(&self.catalog, &self.clock, lease, extent, &cipher, plan).parity(&shards);
         // `true`: each article is looked up before it is sent.
-        let started = crate::trace::job_note(|t| {
-            t.articles = u32::try_from(todo.len()).unwrap_or(u32::MAX);
-            self.clock.now()
-        });
+        crate::trace::job_note(|t| t.articles = u32::try_from(todo.len()).unwrap_or(u32::MAX));
         let todo = todo.into_iter().map(|at| (at, true));
         let ended = round.run(sessions, todo, Record::Reposted).await;
-        if let Some(started) = started {
-            crate::trace::job_note(|t| {
-                t.wire_ms += crate::trace::elapsed(started, self.clock.now())
-            });
-        }
         match ended.stop {
             None => Ok(true),
             Some(stop @ (Stop::Fenced | Stop::Catalog | Stop::NoPermit)) => Err(stop),
@@ -2141,7 +2143,8 @@ async fn exchange<'a, C: Catalog, N: NntpConnector, T: Clock>(
     round.state.borrow_mut().sockets[slot].logged_in = true;
     round.keep(slot, session).await?;
     if unknown {
-        match session.session().await?.stat(&row.message_id).await {
+        let call = session.session().await?.stat(&row.message_id);
+        match crate::trace::observe_wire(round.clock, call).await {
             Ok(true) => return Ok(Ok(())),
             Ok(false) => {}
             Err(e) => return Ok(Err(e)),
@@ -2150,8 +2153,10 @@ async fn exchange<'a, C: Catalog, N: NntpConnector, T: Clock>(
     }
     let provider = session.provider.id.as_str();
     let connected = session.session().await?;
-    crate::trace::job_note(|t| t.sent(provider, row.cipher_len));
-    let posted = connected.post(&row.message_id, article).await;
+    let call = connected.post_observed(&row.message_id, article, || {
+        crate::trace::job_note(|t| t.sent(provider, row.cipher_len));
+    });
+    let posted = crate::trace::observe_wire(round.clock, call).await;
     Ok(posted.map(|_| ()))
 }
 

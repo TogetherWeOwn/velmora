@@ -272,8 +272,30 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
     Ok(out)
 }
 
-#[event(queue)]
-async fn queue(batch: MessageBatch<serde_json::Value>, env: Env, _ctx: Context) -> Result<()> {
+// Match the SDK queue export, but keep the raw batch long enough to read
+// optional telemetry metadata without the typed SDK getter's unwrap.
+mod queue_export {
+    use worker::wasm_bindgen::{prelude::wasm_bindgen, JsValue};
+    use worker::{worker_sys, Env};
+
+    #[wasm_bindgen(wasm_bindgen = ::worker::wasm_bindgen, wasm_bindgen_futures = ::worker::wasm_bindgen_futures, js_sys = ::worker::js_sys)]
+    pub async fn queue(
+        event: worker_sys::MessageBatch,
+        env: Env,
+        _ctx: worker_sys::Context,
+    ) -> std::result::Result<JsValue, JsValue> {
+        std::panic::AssertUnwindSafe(async move {
+            if let Err(e) = super::handle_queue(event, env).await {
+                worker::console_log!("{}", &e);
+                panic!("{e}");
+            }
+            Ok(JsValue::UNDEFINED)
+        })
+        .await
+    }
+}
+
+async fn handle_queue(event: worker::worker_sys::MessageBatch, env: Env) -> Result<()> {
     // What an operator has to see of a job: a failed full read of a
     // sampled extent, for one.
     velmora_bridge::trace::log_alerts(|line| console_error!("alert: {line}"));
@@ -297,10 +319,11 @@ async fn queue(batch: MessageBatch<serde_json::Value>, env: Env, _ctx: Context) 
         0
     };
     let queue = if sample > 0 {
-        batch.queue()
+        metrics::queue_name(|| event.queue().map(Into::into))
     } else {
         String::new()
     };
+    let batch = MessageBatch::<serde_json::Value>::from(event);
     log_budget(&bridge);
     for msg in batch.messages()? {
         let Ok(job) = serde_json::from_value::<Job>(msg.body().clone()) else {
@@ -321,11 +344,10 @@ async fn queue(batch: MessageBatch<serde_json::Value>, env: Env, _ctx: Context) 
                 }
             }
             _ => {
-                let observation = match (job.extent(), sample) {
-                    (None, _) | (_, 0) => None,
-                    (Some(_), 1) => Some((queue.clone(), 1)),
-                    (Some(_), n) => job_weight(n, &msg.id()).map(|w| (queue.clone(), w)),
-                };
+                let observation = job
+                    .extent()
+                    .and_then(|_| job_weight(sample))
+                    .map(|weight| (queue.clone(), weight));
                 run_in_table(&bridge, &job, observation).await
             }
         };
@@ -368,17 +390,15 @@ async fn run_in_table(
         }
     );
     let (b, j) = (Rc::clone(bridge), job.clone());
-    let attempt = async move {
+    let attempt = metrics::emit_job(async move {
         let run = b.run_job(&j);
         let Some((queue, weight)) = observation else {
-            return run.await;
+            return (run.await, None);
         };
         let (outcome, trace) = velmora_bridge::trace::observe_job(&b.clock, run).await;
-        if let Some(point) = velmora_bridge::metrics::job_point(&trace, &queue, weight) {
-            metrics::write(&point);
-        }
-        outcome
-    };
+        let point = velmora_bridge::metrics::job_point(&trace, &queue, weight);
+        (outcome, point)
+    });
     match jobs::run(now, post, attempt).await {
         Some(outcome) => outcome,
         // `jobs::run` has logged it.

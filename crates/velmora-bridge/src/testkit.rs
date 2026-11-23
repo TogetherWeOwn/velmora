@@ -481,6 +481,7 @@ pub struct MemBlobStore {
     gets: Cell<u64>,
     got: RefCell<Vec<String>>,
     refuse_puts: Cell<bool>,
+    read_time: RefCell<Option<(FixedClock, i64)>>,
 }
 
 impl MemBlobStore {
@@ -495,6 +496,11 @@ impl MemBlobStore {
     /// While set, every `put` fails and stores nothing.
     pub fn refuse_puts(&self, refuse: bool) {
         self.refuse_puts.set(refuse);
+    }
+
+    /// Advance the fake clock on each read, to model an R2 wait.
+    pub fn advance_reads_on(&self, clock: &FixedClock, ms: i64) {
+        self.read_time.replace(Some((clock.clone(), ms)));
     }
 
     /// `get` calls so far.
@@ -556,6 +562,9 @@ impl BlobStore for MemBlobStore {
     }
 
     async fn get(&self, key: &str, span: Option<ByteSpan>) -> Result<Option<Vec<u8>>> {
+        if let Some((clock, ms)) = self.read_time.borrow().as_ref() {
+            clock.advance_ms(*ms);
+        }
         self.gets.set(self.gets.get() + 1);
         self.got.borrow_mut().push(key.to_owned());
         let blobs = self.blobs.borrow();

@@ -1833,9 +1833,10 @@ or permit admission.
   These phases need not be disjoint. A phase not reached is zero.
 - `double10`–`double13`: peak permits held at once, sockets wanted, articles,
   and ms from the first grant to the last observed release.
-- `double14`–`double20`: decoded payload bytes offered in `POST` calls to
-  configured IDs `p1`–`p7`, including repeat sends. No provider ID is written
-  as text, and nothing is attributed to other IDs.
+- `double14`–`double20`: decoded payload bytes in fully written `POST`
+  bodies to IDs `p1`–`p7`, including repeats and even if the final reply
+  is lost. Refusal before the body or a partial write does not count. No
+  provider ID is written as text, and nothing is attributed to other IDs.
 
 To estimate claimed attempts, filter `index1 = 'job'` and sum
 `_sample_interval * double1`; for byte totals, also multiply by `double2`.

@@ -380,6 +380,66 @@ async fn a_lower_tier_is_only_a_backup() {
     assert_eq!(rig.servers[1].posted_count().await, 10);
 }
 
+#[tokio::test]
+async fn job_metrics_separate_dials_from_wire_and_count_only_sent_bodies() {
+    use velmora_bridge::{metrics::job_point, trace::observe_job};
+
+    for deferred in [false, true] {
+        let mut rig = spread_rig().await;
+        let b = &mut rig.bridge;
+        b.cfg.post_sockets = 1;
+        b.cfg.providers[0].id = "p1".into();
+        b.cfg.providers[1].id = "p2".into();
+        b.cfg.providers[1].priority = 1;
+        rig.servers[0].set_posting_allowed(false).await;
+        let s = rig.seed(1, &[7; 1000]).await;
+        let b = &rig.bridge;
+        b.nntp.slow(&b.clock, 7);
+        b.safety.advance_reads_on(&b.clock, 3);
+        if deferred {
+            b.catalog
+                .slow_next_acquire
+                .replace(Some((b.clock.clone(), 20_000)));
+            b.catalog
+                .slow_next_renewal
+                .replace(Some((b.clock.clone(), 25_000)));
+        }
+        let job = Job::Extent {
+            v: JOB_VERSION,
+            extent: s.extent.clone(),
+            generation: s.generation.clone(),
+            stage: OutboxStage::Post,
+        };
+        let prior = events().len();
+        let (outcome, trace) = observe_job(&b.clock, b.run_job(&job)).await;
+        assert_eq!(outcome, JobOutcome::Ack);
+        let point = job_point(&trace, "velmora-post", 1).expect("sampled post");
+        let calls = b.nntp.calls();
+        let wire_calls = calls
+            .iter()
+            .filter(|(kind, _)| matches!(*kind, "post" | "stat"))
+            .count();
+        assert_eq!(b.nntp.connects(), 2);
+        // The fake progresses the shared clock by 3 ms during R2 load.
+        // That time is also inside the initial dial when it overlaps load.
+        let connect_ms = if deferred { 14.0 } else { 17.0 };
+        assert_eq!((point.doubles[5], point.doubles[6]), (3.0, connect_ms));
+        assert_eq!(point.doubles[7], (7 * wire_calls) as f64);
+        assert_eq!(point.doubles[13], 0.0, "initial 440 was before the body");
+        let plan = rig.plan(&s).await;
+        assert!(all_posted_by(&plan, "p2"));
+        assert_eq!(point.doubles[14], plan[0].cipher_len as f64);
+        if deferred {
+            let events = events();
+            let events = &events[prior..];
+            assert!(
+                events.iter().position(|e| *e == "plan").unwrap()
+                    < events.iter().position(|e| *e == "connect").unwrap()
+            );
+        }
+    }
+}
+
 /// The lease is lost while two providers are being posted to: nothing is
 /// recorded for either.
 #[tokio::test]

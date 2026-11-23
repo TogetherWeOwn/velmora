@@ -47,8 +47,31 @@ pub struct JobTrace {
     first_grant: Option<UnixMs>,
     last_release: Option<UnixMs>,
     held: u32,
-    connect_from: Option<UnixMs>,
-    dials_in_flight: u32,
+    dials: Activity,
+    commands: Activity,
+}
+
+/// Wall-clock union of concurrent operations of the same kind.
+#[derive(Default)]
+struct Activity {
+    since: Option<UnixMs>,
+    active: u32,
+}
+
+impl Activity {
+    fn start(&mut self, now: UnixMs) {
+        self.since.get_or_insert(now);
+        self.active += 1;
+    }
+
+    fn finish(&mut self, now: UnixMs) -> u64 {
+        self.active = self.active.saturating_sub(1);
+        if self.active == 0 {
+            self.since.take().map_or(0, |start| elapsed(start, now))
+        } else {
+            0
+        }
+    }
 }
 
 pub(crate) fn elapsed(start: UnixMs, end: UnixMs) -> u64 {
@@ -89,17 +112,11 @@ impl JobTrace {
     /// Integrate the union of dial intervals: a parallel batch, its
     /// failover dials and its reconnects all contribute wall time once.
     pub(crate) fn connecting(&mut self, now: UnixMs) {
-        self.connect_from.get_or_insert(now);
-        self.dials_in_flight += 1;
+        self.dials.start(now);
     }
 
     pub(crate) fn connect_finished(&mut self, now: UnixMs) {
-        self.dials_in_flight = self.dials_in_flight.saturating_sub(1);
-        if self.dials_in_flight == 0 {
-            if let Some(started) = self.connect_from.take() {
-                self.connect_ms += elapsed(started, now);
-            }
-        }
+        self.connect_ms += self.dials.finish(now);
     }
 
     pub(crate) fn sent(&mut self, provider: &str, bytes: u64) {
@@ -116,6 +133,15 @@ thread_local! {
 
 pub(crate) fn job_note<R>(f: impl FnOnce(&mut JobTrace) -> R) -> Option<R> {
     JOB.with(|slot| slot.borrow_mut().as_mut().map(f))
+}
+
+/// Measure the wire command itself, excluding the dial and permit renewal
+/// before it. Concurrent POST commands contribute wall time only once.
+pub(crate) async fn observe_wire<T>(clock: &impl Clock, command: impl Future<Output = T>) -> T {
+    job_note(|t| t.commands.start(clock.now()));
+    let outcome = command.await;
+    job_note(|t| t.wire_ms += t.commands.finish(clock.now()));
+    outcome
 }
 
 /// Install the attempt only while its future is on the stack. Another job
@@ -205,7 +231,6 @@ mod tests {
     #[test]
     fn connect_time_includes_redials_without_counting_overlap_twice() {
         let mut t = JobTrace::default();
-        t.kind = Some(JobKind::Post);
         t.connecting(UnixMs(4));
         t.connecting(UnixMs(6));
         t.connect_finished(UnixMs(8));

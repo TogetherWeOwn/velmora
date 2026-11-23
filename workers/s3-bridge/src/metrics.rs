@@ -6,8 +6,9 @@
 //! request is answered as before and nothing is logged per request.
 
 use std::cell::RefCell;
+use std::future::Future;
 
-use velmora_bridge::metrics::Point;
+use velmora_bridge::{metrics::Point, JobOutcome};
 use worker::{AnalyticsEngineDataPointBuilder, AnalyticsEngineDataset, Env};
 
 /// The dataset binding.
@@ -40,9 +41,30 @@ pub fn bind(env: &Env) -> bool {
     bound
 }
 
+/// Queue metadata may be absent or throw. An unrecognized/empty name is
+/// mapped to `aux` by the point encoder; it cannot interrupt the job.
+pub fn queue_name<E>(read: impl FnOnce() -> Result<String, E>) -> String {
+    read().unwrap_or_default()
+}
+
+pub async fn emit_job(run: impl Future<Output = (JobOutcome, Option<Point>)>) -> JobOutcome {
+    let (outcome, point) = run.await;
+    if let Some(point) = point {
+        write(&point);
+    }
+    outcome
+}
+
+#[cfg(test)]
+thread_local! {
+    static WRITTEN: RefCell<Vec<Point>> = const { RefCell::new(Vec::new()) };
+}
+
 /// Writes one point. A write is buffered by the runtime and never
 /// awaited; its failure is not the request's.
 pub fn write(point: &Point) {
+    #[cfg(test)]
+    WRITTEN.with(|points| points.borrow_mut().push(point.clone()));
     DATASET.with(|d| {
         let d = d.borrow();
         let Some(dataset) = d.as_ref() else {
@@ -54,4 +76,30 @@ pub fn write(point: &Point) {
             .doubles(point.doubles.iter().copied())
             .write_to(dataset);
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures_util::FutureExt;
+    use velmora_bridge::JobOutcome;
+
+    #[test]
+    fn queue_job_emit_keeps_ack_and_retry_even_without_queue_metadata() {
+        let missing = queue_name(|| Err(()));
+        assert!(missing.is_empty());
+        for outcome in [JobOutcome::Ack, JobOutcome::Retry { delay_secs: 123 }] {
+            // No typed SDK getter is required to execute and settle the job.
+            assert_eq!(
+                emit_job(async { (outcome, None) }).now_or_never(),
+                Some(outcome)
+            );
+            let point = velmora_bridge::metrics::cold_read_point();
+            assert_eq!(
+                emit_job(async { (outcome, Some(point.clone())) }).now_or_never(),
+                Some(outcome)
+            );
+            assert_eq!(WRITTEN.with(|points| points.take()), [point]);
+        }
+    }
 }

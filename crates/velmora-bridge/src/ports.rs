@@ -351,6 +351,20 @@ pub trait NntpSession {
         message_id: &str,
         article: &[u8],
     ) -> Result<velmora::nntp::PostOutcome>;
+    /// Observe a complete article-body write. Adapters that cannot
+    /// observe that boundary count only an accepted (240) article.
+    async fn post_observed(
+        &mut self,
+        message_id: &str,
+        article: &[u8],
+        written: impl FnOnce(),
+    ) -> Result<velmora::nntp::PostOutcome> {
+        let outcome = self.post(message_id, article).await?;
+        if outcome == velmora::nntp::PostOutcome::Posted {
+            written();
+        }
+        Ok(outcome)
+    }
     /// `false` = 430.
     async fn stat(&mut self, message_id: &str) -> Result<bool>;
     /// Asks whether the article is there and for the size the provider

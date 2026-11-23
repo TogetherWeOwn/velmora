@@ -468,6 +468,18 @@ impl<T: Transport> NntpClient<T> {
     /// well-formed replies (`240`/`435`/`441`/`440`/…) leave the connection
     /// usable — the reply is only sent after the terminator is consumed.
     pub async fn post_article(&mut self, message_id: &str, article: &[u8]) -> Result<PostOutcome> {
+        self.post_article_observed(message_id, article, || {}).await
+    }
+
+    /// Like [`Self::post_article`], with a synchronous observation when the
+    /// entire dot block has been written, before reading the server's reply.
+    /// No observation for a refusal before the body or a partial write.
+    pub async fn post_article_observed(
+        &mut self,
+        message_id: &str,
+        article: &[u8],
+        written: impl FnOnce(),
+    ) -> Result<PostOutcome> {
         validate_argument(message_id)?;
         if article.is_empty() {
             return Err(Error::Malformed("POST article is empty".into()));
@@ -508,6 +520,7 @@ impl<T: Transport> NntpClient<T> {
                 return Err(err);
             }
         }
+        written();
         let reply = self.read_reply().await?;
         self.refusal_after_reply(reply, message_id).await
     }

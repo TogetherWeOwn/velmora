@@ -293,13 +293,18 @@ pub fn job_sample(raw: Option<&str>) -> u32 {
     raw.map_or(8, |s| s.trim().parse().unwrap_or(0))
 }
 
-/// Sample a queue message without retaining its ID. Unlike HTTP sampling,
-/// failure does not change the weight; a redelivery uses the same draw.
-pub fn job_weight(sample: u32, message_id: &str) -> Option<u32> {
+/// Sample each attempt independently, with no queue message ID lookup.
+/// Missing entropy only skips the observation. Rejection sampling keeps
+/// arbitrary positive divisors unbiased.
+pub fn job_weight(sample: u32) -> Option<u32> {
+    job_weight_with(sample, &mut velmora::rng::SystemRng)
+}
+
+fn job_weight_with(sample: u32, rng: &mut impl velmora::rng::FillRandom) -> Option<u32> {
     match sample {
         0 => None,
         1 => Some(1),
-        n => weight(200, n, message_id),
+        n => (velmora::rng::uniform_below(rng, u64::from(n)).ok()? == 0).then_some(n),
     }
 }
 
@@ -591,13 +596,29 @@ mod tests {
     fn job_sampling_weights_every_retained_attempt_even_failures() {
         assert_eq!(job_sample(None), 8);
         assert_eq!(job_sample(Some(" 1 ")), 1);
-        assert_eq!(job_weight(0, "sample-private-id"), None);
-        assert_eq!(job_weight(1, "sample-private-id"), Some(1));
+        struct Draws<I>(I);
+        impl<I: Iterator<Item = u64>> velmora::rng::FillRandom for Draws<I> {
+            fn fill_bytes(&mut self, out: &mut [u8]) -> velmora::Result<()> {
+                out.copy_from_slice(&self.0.next().expect("draw").to_le_bytes());
+                Ok(())
+            }
+        }
+        assert_eq!(job_weight(0), None);
+        assert_eq!(job_weight(1), Some(1));
+        let mut draws = Draws(0..8192);
         let kept: Vec<_> = (0..8192)
-            .filter_map(|n| job_weight(8, &format!("attempt-{n}")))
+            .filter_map(|_| job_weight_with(8, &mut draws))
             .collect();
-        assert!((900..1150).contains(&kept.len()));
-        assert!(kept.iter().all(|w| *w == 8));
+        assert_eq!(kept, vec![8; 1024]);
+        // MAX would select a biased extra bucket for divisor 3; redraw.
+        assert_eq!(
+            job_weight_with(3, &mut Draws([u64::MAX, 1].into_iter())),
+            None
+        );
+        assert_eq!(
+            job_weight_with(3, &mut Draws([u64::MAX, 0].into_iter())),
+            Some(3)
+        );
     }
 
     #[test]
@@ -605,7 +626,7 @@ mod tests {
         for raw in ["invalid", "", "  ", "-1", "4294967296"] {
             assert_eq!(job_sample(Some(raw)), 0, "{raw:?}");
         }
-        assert_eq!(job_weight(job_sample(Some("0")), "attempt"), None);
+        assert_eq!(job_weight(job_sample(Some("0"))), None);
     }
 
     #[test]
