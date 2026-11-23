@@ -35,37 +35,42 @@ async fn an_oversized_catalogue_extent_settles_as_corrupt_before_taking_a_buffer
     }])
     .await;
     rig.bridge.budget = budget(1);
-    let s = rig.seed(1, b"sealed extent").await;
-    rig.bridge
-        .catalog
-        .entries
-        .borrow_mut()
-        .get_mut(&s.extent)
-        .unwrap()
-        .job
-        .extent
-        .cipher_size = 2 << 30;
-    let job = Job::Extent {
-        v: JOB_VERSION,
-        extent: s.extent.clone(),
-        generation: s.generation,
-        stage: OutboxStage::Post,
-    };
-    assert!(matches!(
-        rig.bridge.run_job(&job).await,
-        JobOutcome::Retry { .. }
-    ));
-    assert_eq!(
-        rig.bridge.catalog.outbox(&s.extent).last_error,
-        Some(FailClass::Corrupt)
-    );
-    assert_eq!(rig.bridge.safety.gets(), 0, "no safety body read");
-    assert_eq!(rig.bridge.budget.peak(), 0, "no extent buffer charge");
-    assert_eq!(
-        rig.bridge.budget.spare_bytes(),
-        0,
-        "no spare capacity retained"
-    );
+    rig.bridge.cfg.max_extent_bytes = 4 * MIB;
+    // The first size is one byte over the supported ciphertext ceiling,
+    // but still fits the budget. The second is an unbounded catalogue size.
+    for (id, size) in [(1, 16 * MIB + 4_145), (2, 2 << 30)] {
+        let s = rig.seed(id, b"sealed extent").await;
+        rig.bridge
+            .catalog
+            .entries
+            .borrow_mut()
+            .get_mut(&s.extent)
+            .unwrap()
+            .job
+            .extent
+            .cipher_size = size;
+        let job = Job::Extent {
+            v: JOB_VERSION,
+            extent: s.extent.clone(),
+            generation: s.generation,
+            stage: OutboxStage::Post,
+        };
+        assert!(matches!(
+            rig.bridge.run_job(&job).await,
+            JobOutcome::Retry { .. }
+        ));
+        assert_eq!(
+            rig.bridge.catalog.outbox(&s.extent).last_error,
+            Some(FailClass::Corrupt)
+        );
+        assert_eq!(rig.bridge.safety.gets(), 0, "no safety body read");
+        assert_eq!(rig.bridge.budget.peak(), 0, "no extent buffer charge");
+        assert_eq!(
+            rig.bridge.budget.spare_bytes(),
+            0,
+            "no spare capacity retained"
+        );
+    }
 }
 
 #[tokio::test]
@@ -76,13 +81,24 @@ async fn lowering_the_upload_limit_does_not_strand_an_existing_extent() {
         max_conns: 1,
     }])
     .await;
-    rig.bridge.budget = budget(1);
-    let s = rig.seed(1, &marked_plaintext(5 * MIB as usize)).await;
+    // 16,781,360 ciphertext + 8 × 1.5 MiB socket bytes + 6 × 721,120
+    // shard bytes + 2 MiB for the verify job that could run a repost.
+    const FLOOR: u64 = 35_788_144;
+    rig.bridge.cfg.job_budget_bytes = FLOOR;
+    rig.bridge.cfg.inflight_budget_bytes = 16 * MIB;
+    rig.bridge.cfg.post_sockets = 8;
+    rig.bridge.cfg.packed_plans = true;
+    rig.bridge.cfg.parity = true;
+    rig.bridge.budget = ByteBudget::new(16 * MIB)
+        .with_job_capacity(FLOOR)
+        .with_extent_pool(1);
+    let s = rig.seed(1, &marked_plaintext(16 * MIB as usize)).await;
+    assert_eq!(s.cipher.len(), 16 * MIB as usize + 4_144);
     rig.bridge.cfg.max_extent_bytes = 4 * MIB;
     let job = Job::Extent {
         v: JOB_VERSION,
         extent: s.extent.clone(),
-        generation: s.generation,
+        generation: s.generation.clone(),
         stage: OutboxStage::Post,
     };
     assert_eq!(rig.bridge.run_job(&job).await, JobOutcome::Ack);
@@ -90,7 +106,35 @@ async fn lowering_the_upload_limit_does_not_strand_an_existing_extent() {
         rig.bridge.catalog.outbox(&s.extent).stage,
         OutboxStage::Verify
     );
-    assert!(rig.server().posted_count().await > 0);
+    assert_eq!(rig.server().posted_count().await, 28);
+    assert_eq!(rig.bridge.budget.peak(), FLOOR - 2 * MIB);
+
+    // Disabling new parity does not stop a verify job from reposting
+    // a missing shard from the stored plan at the same budget floor.
+    rig.bridge.cfg.parity = false;
+    let parity = rig
+        .bridge
+        .catalog
+        .stored_plan(&s.extent)
+        .await
+        .unwrap()
+        .parity_plan(&s.extent, s.cipher.len() as u64)
+        .unwrap()
+        .unwrap();
+    let missing = &parity.articles[0];
+    rig.server().hide(&missing.message_id).await;
+    rig.bridge
+        .clock
+        .advance_secs(rig.bridge.cfg.verify_delay_secs);
+    let lease = rig.claim(&s, OutboxStage::Verify).await;
+    let row = rig.job(&s).await;
+    let _verify = rig.bridge.budget.try_charge_job(2 * MIB).unwrap();
+    assert_eq!(
+        rig.bridge.repost_run(&lease, &row, &[missing.idx]).await,
+        Ok(true)
+    );
+    assert!(!rig.server().is_hidden(&missing.message_id).await);
+    assert_eq!(rig.bridge.budget.peak(), FLOOR);
 }
 
 #[tokio::test]
@@ -218,6 +262,37 @@ async fn a_spare_too_large_to_fit_is_let_go_rather_than_keep_the_job_out() {
     drop((held, charge));
     // Its own buffer is the spare now, charged at its size.
     assert_eq!((budget.spares(), budget.in_use()), (1, 14 * MIB));
+}
+
+#[tokio::test]
+async fn a_hold_over_budget_evicts_all_idle_spares_but_the_next_charge_waits() {
+    let budget = budget(2).with_sleeper(std::rc::Rc::new(|_| Box::pin(std::future::pending())));
+    one_job(&budget, 25 * MIB, 16 * MIB).await;
+    one_job(&budget, 17 * MIB, 8 * MIB).await;
+    assert_eq!((budget.spares(), budget.spare_bytes()), (2, 24 * MIB));
+
+    let mut held = budget.try_charge(MIB).unwrap();
+    held.hold(49 * MIB);
+    assert_eq!((budget.spares(), budget.spare_bytes()), (0, 0));
+    assert_eq!(budget.in_use(), 49 * MIB);
+    let mut next = std::pin::pin!(budget.charge(MIB));
+    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+    assert!(std::future::Future::poll(next.as_mut(), &mut cx).is_pending());
+    assert_eq!(budget.waiting(), 1);
+}
+
+#[tokio::test]
+async fn a_hold_evicts_only_the_oldest_spare_when_one_is_enough() {
+    let budget = budget(2);
+    one_job(&budget, 25 * MIB, 16 * MIB).await;
+    let newest = one_job(&budget, 17 * MIB, 8 * MIB).await;
+    assert_eq!((budget.spares(), budget.spare_bytes()), (2, 24 * MIB));
+
+    let mut held = budget.try_charge(MIB).unwrap();
+    held.hold(40 * MIB);
+    assert_eq!((budget.spares(), budget.spare_bytes()), (1, 8 * MIB));
+    drop(held);
+    assert_eq!(one_job(&budget, 17 * MIB, 8 * MIB).await, newest);
 }
 
 #[tokio::test]

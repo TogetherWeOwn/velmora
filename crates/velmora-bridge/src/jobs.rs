@@ -206,8 +206,24 @@ fn post_job_bytes(cipher_size: u64, post_sockets: u32, parity: usize) -> u64 {
         .saturating_add(parity_job_bytes(cipher_size, parity))
 }
 
+pub(crate) fn repost_job_bytes(cipher_size: u64, post_sockets: u32, parity: usize) -> u64 {
+    cipher_size
+        .saturating_add(u64::from(post_sockets) * POST_SOCKET_BYTES)
+        .saturating_add(parity_job_bytes(cipher_size, parity))
+}
+
 fn new_plan_parity_count(cipher_size: u64) -> usize {
     crate::parity::parity_count(crate::articles::article_spans(cipher_size).len())
+}
+
+/// Room for either a post or a repost beside its verify job. Count parity
+/// even with PARITY off: existing extents can still have parity shards.
+pub(crate) fn extent_job_budget_floor(cipher_size: u64, post_sockets: u32) -> u64 {
+    let parity = new_plan_parity_count(cipher_size);
+    let post = post_job_bytes(cipher_size, post_sockets, parity);
+    let verify = job_bytes(OutboxStage::Verify, cipher_size, post_sockets);
+    let repost = repost_job_bytes(cipher_size, post_sockets, parity);
+    post.max(verify.saturating_add(repost))
 }
 
 /// The extent buffers an isolate keeps between post jobs

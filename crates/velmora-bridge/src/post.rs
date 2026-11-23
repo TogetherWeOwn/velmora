@@ -44,7 +44,7 @@ use velmora::yenc::{encode_segment_vec, SegmentParams};
 use crate::articles::article_spans;
 use crate::fetch::{forgiven, job_holder, report_health, Health, ProviderSession};
 use crate::ingress::{Charge, Lent};
-use crate::jobs::{parity_job_bytes, JOB_OVERHEAD_BYTES};
+use crate::jobs::{repost_job_bytes, JOB_OVERHEAD_BYTES};
 use crate::parity::{self, ParityPlan};
 use crate::plan::{draw, pack_seeded, StoredPlan};
 use crate::pool::Pool;
@@ -1444,9 +1444,7 @@ where
             }
             None => plan,
         };
-        let shard_bytes = parity.map_or(0, |p| {
-            parity_job_bytes(extent.cipher_size, p.articles.len())
-        });
+        let parity_count = parity.map_or(0, |p| p.articles.len());
         // Unlike the rest of its stage, a repost holds the whole extent. A
         // repost larger than the budget still has to run, alone: next to
         // what its own stage already holds.
@@ -1457,11 +1455,8 @@ where
         if extent.cipher_size > room {
             return Ok(false);
         }
-        let bytes = extent
-            .cipher_size
-            .saturating_add(u64::from(self.cfg.post_sockets) * POST_SOCKET_BYTES)
-            .saturating_add(shard_bytes)
-            .min(room);
+        let bytes =
+            repost_job_bytes(extent.cipher_size, self.cfg.post_sockets, parity_count).min(room);
         let Ok(charge) = self
             .budget
             .charge_job_extent(bytes, extent.cipher_size)

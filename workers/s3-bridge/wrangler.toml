@@ -209,7 +209,9 @@ SLOT_WAIT = "poll"
 #     A job is one source address to a provider, however many connections it holds there.
 #   COLD_SOCKETS (4; production sets 8 above): connections one GET reads from Usenet over, 1 to 8, each on its own
 #     provider permit. Fewer are used when INFLIGHT_BUDGET_BYTES has no room for that many beside an extent and its cache write.
-#   JOB_BUDGET_BYTES (the value of INFLIGHT_BUDGET_BYTES): see above; from that value to 1.5 times it or 90 MiB, whichever is more.
+#   JOB_BUDGET_BYTES: at least INFLIGHT_BUDGET_BYTES and enough to post a 16 MiB extent with parity or repost it beside a verify job.
+#     The floor includes the configured post sockets and applies even with a smaller MAX_EXTENT_BYTES or PARITY off.
+#     If unset, INFLIGHT_BUDGET_BYTES must meet that floor. The upper bound is 1.5 times INFLIGHT_BUDGET_BYTES or 90 MiB, whichever is more.
 #   RECORD_LAYOUT (flat): flat | tenant. Where NEW recovery records are written: flat is m/<id>, m/del/<id> and m/art/<extent>;
 #     tenant is the same names under m/x/<tenant id>/. Every reader reads both, always, and no record is ever renamed.
 #     A Worker from before this switch does not read the tenant names (its replay would pass over them): set tenant in a

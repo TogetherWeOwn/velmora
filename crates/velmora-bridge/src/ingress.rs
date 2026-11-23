@@ -1325,8 +1325,8 @@ impl Charge {
             s.peak.set(in_use);
         }
         // The bytes held are already resident and must always be charged.
-        // If idle spares alone put them over budget, give back just enough room.
-        if !s.fits(requests, jobs.saturating_add(spare_left)) && s.fits(requests, jobs) {
+        // Free idle spares oldest first until it fits or none are left.
+        if spare_left != 0 && !s.fits(requests, jobs.saturating_add(spare_left)) {
             let mut evict = 0;
             for spare in s.spare.borrow().iter() {
                 spare_left -= spare.capacity() as u64;

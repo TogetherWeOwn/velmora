@@ -323,8 +323,8 @@ pub struct BridgeConfig {
     pub inflight_budget_bytes: u64,
     /// What the isolate's background jobs and requests may charge to the
     /// byte budget together (`JOB_BUDGET_BYTES`); a job charges under
-    /// this limit, a request under `inflight_budget_bytes`. Unset = the
-    /// same as `inflight_budget_bytes`.
+    /// this limit, a request under `inflight_budget_bytes`. Defaults to
+    /// `inflight_budget_bytes` if it meets the hard-maximum extent job floor.
     pub job_budget_bytes: u64,
     pub gc_mode: GcMode,
     /// Cap on evictable bytes in R2 (released safety copies and cache
@@ -932,9 +932,9 @@ impl BridgeConfig {
             .rev()
             .find(fits)
             .ok_or_else(|| ConfigError::Invalid("INFLIGHT_BUDGET_BYTES".into()))?;
-        // Never under the request limit, and never more than half as much
-        // again (see `MAX_JOB_BUDGET_NUM`) or `MAX_JOB_BUDGET_BYTES`,
-        // whichever is more.
+        // Defaults to the request limit. The range is bounded below by
+        // that limit and the hard-maximum extent job floor, and above by
+        // 1.5 times the request limit or MAX_JOB_BUDGET_BYTES, whichever is more.
         let job_budget_bytes: u64 = match get("JOB_BUDGET_BYTES") {
             Some(v) if !v.trim().is_empty() => v
                 .trim()
@@ -944,7 +944,16 @@ impl BridgeConfig {
         };
         let job_budget_max = (inflight_budget_bytes / MAX_JOB_BUDGET_DEN * MAX_JOB_BUDGET_NUM)
             .max(MAX_JOB_BUDGET_BYTES);
-        if job_budget_bytes < inflight_budget_bytes || job_budget_bytes > job_budget_max {
+        // Lowering the upload limit must not strand an extent written
+        // under a previous config. Jobs use their own budget, not the
+        // request budget; allow for one such post or a verify with a repost.
+        let max_cipher = velmora::media::ciphertext_size(MAX_EXTENT_BYTES_LIMIT)
+            .ok_or_else(|| ConfigError::Invalid("MAX_EXTENT_BYTES".into()))?;
+        let job_budget_min = inflight_budget_bytes.max(crate::jobs::extent_job_budget_floor(
+            max_cipher,
+            post_sockets,
+        ));
+        if !(job_budget_min..=job_budget_max).contains(&job_budget_bytes) {
             return Err(ConfigError::Invalid("JOB_BUDGET_BYTES".into()));
         }
 

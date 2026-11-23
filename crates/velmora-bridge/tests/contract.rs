@@ -251,6 +251,43 @@ fn load(vars: &BTreeMap<String, String>) -> std::result::Result<BridgeConfig, Co
 }
 
 #[test]
+fn job_budget_funds_a_hard_limit_extent_even_after_the_upload_limit_drops() {
+    let (_, dev) = wrangler_vars();
+    let mut vars = with_secrets(dev, PROVIDER_PLAIN);
+    vars.insert("MAX_EXTENT_BYTES".into(), "4194304".into());
+    vars.remove("MAX_PUT_BYTES");
+    vars.insert("INFLIGHT_BUDGET_BYTES".into(), "16777216".into());
+    vars.insert("JOB_BUDGET_BYTES".into(), "16777216".into());
+    assert_eq!(
+        load(&vars).err(),
+        Some(ConfigError::Invalid("JOB_BUDGET_BYTES".into()))
+    );
+}
+
+#[test]
+fn job_budget_accepts_the_repost_and_verify_floor_but_not_one_byte_less() {
+    let (_, dev) = wrangler_vars();
+    let mut vars = with_secrets(dev, PROVIDER_PLAIN);
+    vars.insert("MAX_EXTENT_BYTES".into(), "4194304".into());
+    vars.remove("MAX_PUT_BYTES");
+    vars.insert("INFLIGHT_BUDGET_BYTES".into(), "16777216".into());
+    // Ciphertext (16,781,360) + parity (6 × 721,120) + 1.5 MiB per
+    // socket + 2 MiB for verify. Stored parity still counts with PARITY off.
+    for (sockets, parity, floor) in [("1", "off", 24_778_096), ("8", "on", 35_788_144)] {
+        vars.insert("POST_SOCKETS".into(), sockets.into());
+        vars.insert("PARITY".into(), parity.into());
+        vars.insert("JOB_BUDGET_BYTES".into(), (floor - 1).to_string());
+        assert_eq!(
+            load(&vars).err(),
+            Some(ConfigError::Invalid("JOB_BUDGET_BYTES".into())),
+            "{sockets} post sockets, PARITY={parity}"
+        );
+        vars.insert("JOB_BUDGET_BYTES".into(), floor.to_string());
+        assert_eq!(load(&vars).unwrap().job_budget_bytes, floor);
+    }
+}
+
+#[test]
 fn config_loads_from_documented_vars() {
     let (prod, dev) = wrangler_vars();
     // The file sets no GC_ORPHANS, in either environment: the collector
