@@ -924,6 +924,8 @@ pub struct ExtentRow {
     pub wrapped_file_key: Option<Vec<u8>>,
     pub plain_md5: [u8; 16],
     pub plain_sha256: [u8; 32],
+    /// CRC64NVME in network byte order, if recorded at seal time.
+    pub plain_crc64: Option<[u8; 8]>,
     pub cipher_sha256: [u8; 32],
     pub safety_state: SafetyState,
     /// Set by `plan_articles`; a verification counts only if it matches.

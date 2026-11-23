@@ -2365,6 +2365,87 @@ async fn rebuild_from_usenet(packed_plans: &str) {
     expect_eq(s, "dead outbox rows", 0, rig.outbox_dead());
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn new_streamed_extents_record_crc64_only_when_enabled() {
+    for (vars, expected) in [
+        (&[][..], [None, None]),
+        (
+            &[("RECORD_PLAIN_CRC64", "on")][..],
+            [
+                Some(vec![0; 8]),
+                Some(0xae8b14860a799888_u64.to_be_bytes().to_vec()),
+            ],
+        ),
+    ] {
+        let rig = Rig::with_vars(vars).await;
+        let step = "CRC64 at seal";
+        rig.setup_buckets_and_key(step).await;
+        for (key, body) in [("empty", &b""[..]), ("check", &b"123456789"[..])] {
+            let extra = if body.is_empty() {
+                &[("content-length", "0")][..]
+            } else {
+                &[]
+            };
+            let r = rig
+                .s3(
+                    Method::Put,
+                    &format!("/slice/a/{key}"),
+                    &[],
+                    extra,
+                    body.to_vec(),
+                )
+                .await;
+            expect_status(step, key, 200, &r);
+        }
+        let actual = rig.bridge.catalog.sql.with_conn(|c| {
+            c.prepare("SELECT plain_crc64 FROM extents ORDER BY plain_size")
+                .unwrap()
+                .query_map([], |r| r.get::<_, Option<Vec<u8>>>(0))
+                .unwrap()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap()
+        });
+        assert_eq!(actual, expected);
+    }
+}
+
+fn stored_extent_crcs(rig: &Rig) -> Vec<Option<Vec<u8>>> {
+    rig.bridge.catalog.sql.with_conn(|c| {
+        c.prepare("SELECT plain_crc64 FROM extents ORDER BY seq")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap()
+    })
+}
+
+fn direct_extent_crcs<'a>(parts: impl IntoIterator<Item = &'a [u8]>) -> Vec<Option<Vec<u8>>> {
+    parts
+        .into_iter()
+        .map(|plain| {
+            let mut crc = velmora_s3_proto::Crc64Nvme::default();
+            crc.update(plain);
+            Some(crc.finish().to_vec())
+        })
+        .collect()
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn multipart_records_each_extent_crc64_across_sliced_and_streamed_parts() {
+    let rig = Rig::with_vars(&[("MAX_PUT_BYTES", "103809024"), ("RECORD_PLAIN_CRC64", "on")]).await;
+    let step = "multipart extent CRC64";
+    rig.setup_buckets_and_key(step).await;
+    let part_size = 17 * MIB + 11;
+    let body = test_bytes(2, part_size + 127);
+    let r = rig
+        .multipart_put(step, "/slice/a/multipart-crc", &body, part_size)
+        .await;
+    expect_status(step, "CompleteMultipartUpload", 200, &r);
+    let expected = direct_extent_crcs(body.chunks(part_size).flat_map(|part| part.chunks(8 * MIB)));
+    assert_eq!(stored_extent_crcs(&rig), expected);
+}
+
 /// A PutObject above one extent is stored in slices. Each slice is an
 /// extent like any other: it is posted and verified, and the object is
 /// rebuilt from its recovery record and read from Usenet.
@@ -2372,7 +2453,7 @@ async fn rebuild_from_usenet(packed_plans: &str) {
 async fn a_sliced_put_posts_verifies_and_reads_back_from_usenet() {
     use velmora_bridge::replay::ReplayCursor;
 
-    let rig = Rig::with_vars(&[("MAX_PUT_BYTES", "103809024")]).await;
+    let rig = Rig::with_vars(&[("MAX_PUT_BYTES", "103809024"), ("RECORD_PLAIN_CRC64", "on")]).await;
     let s = "sliced setup";
     rig.setup_buckets_and_key(s).await;
     // Three slices of the default 8 MiB: two full ones and 4 MiB + 1 B.
@@ -2408,6 +2489,9 @@ async fn a_sliced_put_posts_verifies_and_reads_back_from_usenet() {
         0,
         rig.sql_count("SELECT COUNT(*) FROM write_intents"),
     );
+
+    let expected_crcs = direct_extent_crcs(body.chunks(8 * MIB));
+    assert_eq!(stored_extent_crcs(&rig), expected_crcs, "before replay");
 
     let s = "sliced post-and-verify";
     rig.pump(s).await;
@@ -2493,6 +2577,7 @@ async fn a_sliced_put_posts_verifies_and_reads_back_from_usenet() {
     expect_eq(s, "generations published", 1, published);
     expect_eq(s, "slices with an article plan record", 3, plans);
     expect_eq(s, "damaged generations", 0, damaged);
+    assert_eq!(stored_extent_crcs(&rig), expected_crcs, "after replay");
 
     let s = "sliced read-back";
     let key = rig

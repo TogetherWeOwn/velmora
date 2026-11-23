@@ -120,6 +120,12 @@ impl Cols {
         <[u8; N]>::try_from(self.blob()?).map_err(|_| bad("digest length"))
     }
 
+    pub(super) fn opt_array<const N: usize>(&mut self) -> Result<Option<[u8; N]>> {
+        self.opt_blob()?
+            .map(|b| <[u8; N]>::try_from(b).map_err(|_| bad("digest length")))
+            .transpose()
+    }
+
     /// A `CHECK (… IN (…))` column through the enum's `parse`.
     pub(super) fn parsed<T>(&mut self, parse: fn(&str) -> Option<T>) -> Result<T> {
         parse(&self.text()?).ok_or_else(|| bad("unknown enum value"))
@@ -155,7 +161,7 @@ pub(super) const EXTENT_COLS: &str =
     "id, bucket_id, generation_id, state, seq, plain_offset, plain_size, cipher_size, \
      media_header, key_mode, wrapped_file_key, plain_md5, plain_sha256, cipher_sha256, \
      safety_state, article_count, plan_rev, last_verified_at, release_evidence, released_at, \
-     created_at";
+     created_at, plain_crc64";
 
 /// One extent row: the `extents` columns in schema order.
 pub(super) fn extent_row(row: Row) -> Result<ExtentRow> {
@@ -182,6 +188,7 @@ pub(super) fn extent_row(row: Row) -> Result<ExtentRow> {
         release_evidence: c.opt_text()?,
         released_at: c.opt_ms()?,
         created_at: c.ms()?,
+        plain_crc64: c.opt_array()?,
     })
 }
 
@@ -254,7 +261,7 @@ const PLACED_EXTENT_COLS: &str =
     "e.id, e.bucket_id, e.generation_id, e.state, ge.seq, ge.plain_offset, \
      e.plain_size, e.cipher_size, e.media_header, e.key_mode, e.wrapped_file_key, \
      e.plain_md5, e.plain_sha256, e.cipher_sha256, e.safety_state, e.article_count, \
-     e.plan_rev, e.last_verified_at, e.release_evidence, e.released_at, e.created_at";
+     e.plan_rev, e.last_verified_at, e.release_evidence, e.released_at, e.created_at, e.plain_crc64";
 
 /// The last `seq` of generation `?1` whose reference begins at or
 /// before (`$cmp` is `<=`) or before (`<`) the offset `$at`, as a
@@ -363,12 +370,11 @@ pub(super) async fn live_object<S: Sql>(
     let rows = c
         .sql
         .query(
-            "SELECT e.id, e.bucket_id, e.generation_id, e.state, ge.seq, ge.plain_offset, \
-               e.plain_size, e.cipher_size, e.media_header, e.key_mode, e.wrapped_file_key, \
-               e.plain_md5, e.plain_sha256, e.cipher_sha256, e.safety_state, e.article_count, \
-               e.plan_rev, e.last_verified_at, e.release_evidence, e.released_at, e.created_at \
-             FROM generation_extents ge JOIN extents e ON e.id = ge.extent_id \
-             WHERE ge.generation_id = ?1 ORDER BY ge.seq",
+            &format!(
+                "SELECT {PLACED_EXTENT_COLS} \
+                 FROM generation_extents ge JOIN extents e ON e.id = ge.extent_id \
+                 WHERE ge.generation_id = ?1 ORDER BY ge.seq"
+            ),
             &[text(generation.id.as_str())],
         )
         .await?;
@@ -482,8 +488,8 @@ fn extent_insert(e: &ExtentRow, generation: &GenerationId) -> Result<Stmt> {
         "INSERT INTO extents(id, bucket_id, generation_id, state, seq, plain_offset, plain_size, \
            cipher_size, media_header, key_mode, wrapped_file_key, plain_md5, plain_sha256, \
            cipher_sha256, safety_state, article_count, plan_rev, last_verified_at, \
-           release_evidence, released_at, created_at) \
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21)",
+           release_evidence, released_at, created_at, plain_crc64) \
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22)",
         vec![
             text(e.id.as_str()),
             text(e.bucket_id.as_str()),
@@ -506,6 +512,7 @@ fn extent_insert(e: &ExtentRow, generation: &GenerationId) -> Result<Stmt> {
             opt(e.release_evidence.as_deref(), text),
             opt(e.released_at, ms),
             ms(e.created_at),
+            opt(e.plain_crc64, |crc| SqlValue::Blob(crc.to_vec())),
         ],
     ))
 }

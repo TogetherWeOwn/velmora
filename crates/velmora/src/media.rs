@@ -815,7 +815,17 @@ impl Sealer {
     }
 
     /// Seals a whole in-memory plaintext: `header ‖ chunk 0 … chunk L-1`.
-    pub fn seal_to_vec(mut self, plaintext: &[u8]) -> Result<Vec<u8>> {
+    pub fn seal_to_vec(self, plaintext: &[u8]) -> Result<Vec<u8>> {
+        self.seal_to_vec_observing(plaintext, |_| {})
+    }
+
+    /// As [`Self::seal_to_vec`], calling `observe` on each plaintext
+    /// chunk as it is successfully sealed. Discard observations on error.
+    pub fn seal_to_vec_observing(
+        mut self,
+        plaintext: &[u8],
+        mut observe: impl FnMut(&[u8]),
+    ) -> Result<Vec<u8>> {
         let total = ciphertext_size(plaintext.len() as u64)
             .and_then(|n| usize::try_from(n).ok())
             .ok_or_else(|| media_error("plaintext too large"))?;
@@ -823,12 +833,14 @@ impl Sealer {
         out.extend_from_slice(&self.header.to_bytes());
         if plaintext.is_empty() {
             out.extend_from_slice(&self.seal_chunk(&[], true)?);
+            observe(&[]);
             return Ok(out);
         }
         let mut chunks = plaintext.chunks(PLAIN_CHUNK_SIZE as usize).peekable();
         while let Some(chunk) = chunks.next() {
             let last = chunks.peek().is_none();
             out.extend_from_slice(&self.seal_chunk(chunk, last)?);
+            observe(chunk);
         }
         Ok(out)
     }

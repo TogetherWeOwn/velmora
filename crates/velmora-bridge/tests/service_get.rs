@@ -166,6 +166,7 @@ async fn commit_parts<N: NntpConnector + 'static>(
             wrapped_file_key: Some(sealed.wrapped_file_key.to_vec()),
             plain_md5: sealed.plain_md5,
             plain_sha256: sealed.plain_sha256,
+            plain_crc64: sealed.plain_crc64,
             cipher_sha256: sealed.cipher_sha256,
             ..template_extents[0].clone()
         };

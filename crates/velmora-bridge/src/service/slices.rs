@@ -12,7 +12,7 @@ use velmora::rng::FillRandom;
 use velmora_s3_proto::{ErrorCode, UploadValidator};
 use zeroize::Zeroize;
 
-use crate::crypto::{seal_extent, DataKey, SealedExtent};
+use crate::crypto::{seal_extent_with_crc64, DataKey, SealedExtent};
 use crate::ingress::{Charge, IngressError, UploadLengths};
 use crate::ports::{BlobMeta, BlobStore};
 use crate::types::{Body, BucketId, ExtentId};
@@ -64,6 +64,7 @@ pub(super) struct SliceSink<'a, B: BlobStore, R: FillRandom> {
     pub(super) ids: &'a [ExtentId],
     /// Plaintext bytes of every slice but the last.
     pub(super) slice_bytes: u64,
+    pub(super) record_crc64: bool,
     pub(super) rng: &'a mut R,
 }
 
@@ -143,8 +144,15 @@ impl<B: BlobStore, R: FillRandom> SliceSink<'_, B, R> {
         let mut rng = Replay::new(&mut *self.rng);
         for _ in 0..PUT_ATTEMPTS {
             rng.at = 0;
-            let mut sealed = seal_extent(self.bdk, self.bucket, id, plain, &mut rng)
-                .map_err(|_| SliceError::Internal)?;
+            let mut sealed = seal_extent_with_crc64(
+                self.bdk,
+                self.bucket,
+                id,
+                plain,
+                &mut rng,
+                self.record_crc64,
+            )
+            .map_err(|_| SliceError::Internal)?;
             let ciphertext = std::mem::take(&mut sealed.ciphertext);
             let cipher_size = ciphertext.len() as u64;
             let put = self
@@ -257,14 +265,15 @@ mod tests {
         let at_first = place(&rng);
         assert!(at_first.1 >= REPLAY_CAP);
 
-        let first = seal_extent(&bdk, &bucket, &id, b"slice", &mut rng).unwrap();
+        let first = seal_extent_with_crc64(&bdk, &bucket, &id, b"slice", &mut rng, true).unwrap();
         // A file key, a stream nonce and a wrap nonce.
         assert_eq!(rng.drawn.len(), 32 + 16 + 24);
         assert_eq!(place(&rng), at_first);
 
         // The second seal draws the same bytes and nothing new.
         rng.at = 0;
-        let second = seal_extent(&bdk, &bucket, &id, b"slice", &mut rng).unwrap();
+        let second = seal_extent_with_crc64(&bdk, &bucket, &id, b"slice", &mut rng, false).unwrap();
+        assert!(first.plain_crc64.is_some() && second.plain_crc64.is_none());
         assert!(first.ciphertext == second.ciphertext);
         assert!(first.wrapped_file_key == second.wrapped_file_key);
         assert_eq!(rng.drawn.len(), 32 + 16 + 24);

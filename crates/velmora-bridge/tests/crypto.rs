@@ -109,6 +109,7 @@ fn row(bucket: &BucketId, id: &ExtentId, plain_size: usize, sealed: &SealedExten
         wrapped_file_key: Some(sealed.wrapped_file_key.to_vec()),
         plain_md5: sealed.plain_md5,
         plain_sha256: sealed.plain_sha256,
+        plain_crc64: sealed.plain_crc64,
         cipher_sha256: sealed.cipher_sha256,
         safety_state: SafetyState::Held,
         article_count: None,
@@ -1209,6 +1210,79 @@ fn extent_sealer_gives_the_stream_seal_extent_gives() {
         let mut dst = vec![0u8; len];
         open_range(&k, &b, &r, 0, &stream, 0, &mut dst).unwrap();
         assert_eq!(dst, plain);
+    }
+}
+
+#[test]
+fn extent_crc64_matches_direct_plaintext_for_random_sizes_and_part_splits() {
+    use velmora_bridge::crypto::seal_extent_with_crc64;
+    use velmora_s3_proto::Crc64Nvme;
+
+    let mut state = 0x9dbb_3571_a240_e8f7_u64;
+    let mut draw = || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    let bytes: Vec<u8> = (0..8 * MIB).flat_map(|_| draw().to_le_bytes()).collect();
+    let k = bdk("crc test");
+    let b = bucket(1);
+    let e = extent(1);
+    let check = |plain: &[u8], case: usize, part: usize| {
+        let mut direct = Crc64Nvme::default();
+        direct.update(plain);
+        let expected = Some(direct.finish());
+        let mut rng = TestRng::new("crc extent");
+        let buffered = seal_extent_with_crc64(&k, &b, &e, plain, &mut rng, true).unwrap();
+        assert_eq!(buffered.plain_crc64, expected, "buffered {case}/{part}");
+        // Drop the big ciphertext before exercising the streamed sealer.
+        drop(buffered);
+        let mut stream = ExtentSealer::begin_with_crc64(
+            &k,
+            &b,
+            &e,
+            plain.len() as u64,
+            &mut TestRng::new("crc stream"),
+            true,
+        )
+        .unwrap();
+        if plain.is_empty() {
+            stream.seal_next(&[]).unwrap();
+        }
+        for chunk in plain.chunks(CHUNK) {
+            stream.seal_next(chunk).unwrap();
+        }
+        assert_eq!(
+            stream.finish().unwrap().plain_crc64,
+            expected,
+            "streamed {case}/{part}"
+        );
+    };
+
+    // Exhaust every two-part split (including either empty part) of
+    // short random bodies. For large bodies check every extent of each
+    // sampled split, and the same plaintext as an unsplit extent.
+    for len in [0, 1, 9, 31, 64] {
+        for split in 0..=len {
+            check(&bytes[..split], len, split);
+            check(&bytes[split..len], len, split);
+        }
+    }
+    let lens = [CHUNK - 1, CHUNK, CHUNK + 1, 5 * MIB, 64 * MIB]
+        .into_iter()
+        .chain((0..4).map(|band| band * 16 * MIB + (draw() as usize % (16 * MIB))))
+        .collect::<Vec<_>>();
+    for len in lens {
+        check(&bytes[..len], len, 0);
+        let mut start = 0;
+        let mut part = 1;
+        while start < len {
+            let end = (start + 1 + draw() as usize % (8 * MIB)).min(len);
+            check(&bytes[start..end], len, part);
+            start = end;
+            part += 1;
+        }
     }
 }
 

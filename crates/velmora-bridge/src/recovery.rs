@@ -623,6 +623,10 @@ pub struct ExtentRecord {
     pub plain_md5: Vec<u8>,
     #[serde(with = "b64")]
     pub plain_sha256: Vec<u8>,
+    /// ExtentRecord v2 adds this optional digest without changing the
+    /// enclosing record's version. V1 readers skip it; v1 records omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "opt_b64")]
+    pub plain_crc64: Option<Vec<u8>>,
     #[serde(with = "b64")]
     pub cipher_sha256: Vec<u8>,
     pub created_at: i64,
@@ -775,6 +779,7 @@ impl GenerationManifest {
                     wrapped_file_key: e.wrapped_file_key.clone().ok_or(ERR_RECORD)?,
                     plain_md5: e.plain_md5.to_vec(),
                     plain_sha256: e.plain_sha256.to_vec(),
+                    plain_crc64: e.plain_crc64.map(|crc| crc.to_vec()),
                     cipher_sha256: e.cipher_sha256.to_vec(),
                     created_at: e.created_at.0,
                 })
@@ -869,6 +874,7 @@ impl ExtentRecord {
     fn has_digests(&self) -> bool {
         digest::<16>(&self.plain_md5).is_ok()
             && digest::<32>(&self.plain_sha256).is_ok()
+            && self.plain_crc64.as_deref().is_none_or(|crc| crc.len() == 8)
             && digest::<32>(&self.cipher_sha256).is_ok()
     }
 
@@ -889,6 +895,7 @@ impl ExtentRecord {
             wrapped_file_key: Some(self.wrapped_file_key.clone()),
             plain_md5: digest(&self.plain_md5)?,
             plain_sha256: digest(&self.plain_sha256)?,
+            plain_crc64: self.plain_crc64.as_deref().map(digest).transpose()?,
             cipher_sha256: digest(&self.cipher_sha256)?,
             safety_state: SafetyState::Held,
             article_count: None,

@@ -151,7 +151,7 @@ async fn put<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: 
         .inspect_err(observed.on_error(Stage::Budget))
         .map_err(|e| e.response())?;
     let SealedUpload { decoded, sealed } = store_streamed(
-        &bridge.safety,
+        bridge,
         req.body,
         lengths,
         validator,
@@ -194,6 +194,7 @@ async fn put<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: 
         wrapped_file_key: Some(sealed.wrapped_file_key.to_vec()),
         plain_md5: *decoded.md5(),
         plain_sha256: *decoded.sha256(),
+        plain_crc64: sealed.plain_crc64,
         cipher_sha256: sealed.cipher_sha256,
         safety_state: SafetyState::Held,
         article_count: None,
@@ -415,6 +416,7 @@ async fn put_sliced<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: K
         bucket: &bucket.id,
         ids: &ids,
         slice_bytes,
+        record_crc64: bridge.cfg.record_plain_crc64,
         rng: &mut rng,
     };
     let stored = match store_slices(sink, body, lengths, &charge, &mut validator).await {
@@ -477,6 +479,7 @@ async fn put_sliced<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: K
             wrapped_file_key: Some(slice.sealed.wrapped_file_key.to_vec()),
             plain_md5: slice.sealed.plain_md5,
             plain_sha256: slice.sealed.plain_sha256,
+            plain_crc64: slice.sealed.plain_crc64,
             cipher_sha256: slice.sealed.cipher_sha256,
             safety_state: SafetyState::Held,
             article_count: None,

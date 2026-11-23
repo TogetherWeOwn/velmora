@@ -24,7 +24,9 @@ use std::time::Duration;
 use velmora::nntp::{NntpClient, NntpConfig, PostOutcome};
 use velmora::rng::FillRandom;
 use velmora::transport::Transport;
-use velmora_bridge::crypto::{open_range, seal_extent, DataKey, SealedExtent};
+use velmora_bridge::crypto::{
+    open_range, seal_extent, seal_extent_with_crc64, DataKey, SealedExtent,
+};
 use velmora_bridge::fetch::{bench_check_payload, bench_place_payload};
 use velmora_bridge::plan::plan_seeded;
 use velmora_bridge::post::bench_render_article;
@@ -211,6 +213,7 @@ impl Bench {
             wrapped_file_key: Some(sealed.wrapped_file_key.to_vec()),
             plain_md5: sealed.plain_md5,
             plain_sha256: sealed.plain_sha256,
+            plain_crc64: sealed.plain_crc64,
             cipher_sha256: sealed.cipher_sha256,
             safety_state: SafetyState::Held,
             article_count: Some(rows.len() as u32),
@@ -274,6 +277,17 @@ impl Bench {
         let id = ExtentId::mint([3; 13]);
         let sealed = seal_extent(&self.bdk, &self.bucket, &id, &self.plain, &mut rng).unwrap();
         sealed.cipher_sha256[0] ^ sealed.plain_md5[0] ^ sealed.plain_sha256[0]
+    }
+
+    /// The same buffered ingest path with extent CRC64NVME recording on.
+    pub fn ingest_crc64(&self) -> u64 {
+        let mut rng = FixedRng(1);
+        let id = ExtentId::mint([3; 13]);
+        let sealed =
+            seal_extent_with_crc64(&self.bdk, &self.bucket, &id, &self.plain, &mut rng, true)
+                .unwrap();
+        let crc = u64::from_be_bytes(sealed.plain_crc64.unwrap());
+        crc ^ u64::from(sealed.cipher_sha256[0] ^ sealed.plain_md5[0] ^ sealed.plain_sha256[0])
     }
 
     // -- post --------------------------------------------------------------
@@ -805,6 +819,11 @@ mod exports {
     #[no_mangle]
     pub extern "C" fn ingest() -> u32 {
         with(|b| b.ingest() as u32)
+    }
+
+    #[no_mangle]
+    pub extern "C" fn ingest_crc64() -> u64 {
+        with(|b| b.ingest_crc64())
     }
 
     #[no_mangle]

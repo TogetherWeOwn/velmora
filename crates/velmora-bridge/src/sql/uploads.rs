@@ -111,6 +111,12 @@ impl Cols {
         <[u8; N]>::try_from(self.blob()?).map_err(|_| bad("digest length"))
     }
 
+    pub(super) fn opt_array<const N: usize>(&mut self) -> Result<Option<[u8; N]>> {
+        self.opt_blob()?
+            .map(|b| <[u8; N]>::try_from(b).map_err(|_| bad("digest length")))
+            .transpose()
+    }
+
     /// A `CHECK (… IN (…))` column through the enum's `parse`.
     pub(super) fn parsed<T>(&mut self, parse: fn(&str) -> Option<T>) -> Result<T> {
         parse(&self.text()?).ok_or_else(|| bad("unknown enum value"))
@@ -391,8 +397,8 @@ fn staged_extent(e: &ExtentRow) -> Result<Stmt> {
     Ok((
         "INSERT INTO extents(id, bucket_id, generation_id, state, seq, plain_offset, \
            plain_size, cipher_size, media_header, key_mode, wrapped_file_key, plain_md5, \
-           plain_sha256, cipher_sha256, safety_state, article_count, plan_rev, created_at) \
-         VALUES (?1,?2,NULL,'staged',NULL,NULL,?3,?4,?5,?6,?7,?8,?9,?10,?11,NULL,?12,?13)",
+           plain_sha256, cipher_sha256, safety_state, article_count, plan_rev, created_at, plain_crc64) \
+         VALUES (?1,?2,NULL,'staged',NULL,NULL,?3,?4,?5,?6,?7,?8,?9,?10,?11,NULL,?12,?13,?14)",
         vec![
             text(e.id.as_str()),
             text(e.bucket_id.as_str()),
@@ -407,6 +413,7 @@ fn staged_extent(e: &ExtentRow) -> Result<Stmt> {
             text(e.safety_state.as_str()),
             SqlValue::Int(i64::from(e.plan_rev)),
             ms(e.created_at),
+            opt(e.plain_crc64, |crc| SqlValue::Blob(crc.to_vec())),
         ],
     ))
 }

@@ -954,8 +954,15 @@ pub(super) async fn send_post_jobs<C, B, N, J, K, T>(
 /// The extent `blob` names must be newly minted (see [`ExtentSealer`]).
 /// `charge` is the one taken for this body.
 #[allow(clippy::too_many_arguments)]
-pub(super) async fn store_streamed<B: BlobStore>(
-    safety: &B,
+pub(super) async fn store_streamed<
+    C: Catalog,
+    B: BlobStore,
+    N: NntpConnector,
+    J: JobSink,
+    K: Kek,
+    T: Clock,
+>(
+    bridge: &Bridge<C, B, N, J, K, T>,
     body: Body,
     lengths: UploadLengths,
     validator: UploadValidator,
@@ -964,17 +971,19 @@ pub(super) async fn store_streamed<B: BlobStore>(
     charge: &Charge,
     observed: &mut RequestObservation,
 ) -> Result<SealedUpload, UploadReadError> {
-    let sealer = ExtentSealer::begin(
+    let sealer = ExtentSealer::begin_with_crc64(
         bdk,
         blob.bucket,
         blob.extent,
         lengths.decoded,
         &mut SystemRng,
+        bridge.cfg.record_plain_crc64,
     )
     .map_err(|_| IngressError::Internal)?;
     let cipher_size = sealer.cipher_size();
     let (stream, seal) = seal_upload(body, lengths, validator, sealer, charge)?;
-    let receipt = safety
+    let receipt = bridge
+        .safety
         .put_stream(&blob.extent.safety_key(), cipher_size, stream, &blob)
         .await;
     match (receipt, seal.outcome()) {

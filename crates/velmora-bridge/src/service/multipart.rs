@@ -53,7 +53,7 @@ use zeroize::Zeroizing;
 use crate::config::{BridgeConfig, Maintenance};
 use velmora::media::HEADER_SIZE;
 
-use crate::crypto::{seal_extent, unwrap_bdk, unwrap_secret, WrappedKey};
+use crate::crypto::{seal_extent_with_crc64, unwrap_bdk, unwrap_secret, WrappedKey};
 use crate::ingress::{
     body_is_empty, declared_length, read_upload, upload_lengths, Charge, IngressError,
     SealedUpload, UploadLengths, UploadReadError,
@@ -692,6 +692,7 @@ struct StoredPart {
     wrapped_file_key: WrappedKey,
     plain_md5: [u8; 16],
     plain_sha256: [u8; 32],
+    plain_crc64: Option<[u8; 8]>,
     cipher_sha256: [u8; 32],
 }
 
@@ -752,7 +753,14 @@ where
         // charge covers both and is held until the ciphertext has been
         // handed over.
         let (body, charge) = copied_part(bridge, &a, &req.headers, req.body, observed).await?;
-        let sealed = seal_extent(&bdk()?, &a.bucket.id, &extent_id, &body, &mut SystemRng)?;
+        let sealed = seal_extent_with_crc64(
+            &bdk()?,
+            &a.bucket.id,
+            &extent_id,
+            &body,
+            &mut SystemRng,
+            bridge.cfg.record_plain_crc64,
+        )?;
         let plain_size = body.len() as u64;
         drop(body);
         let cipher_size = sealed.ciphertext.len() as u64;
@@ -777,6 +785,7 @@ where
             wrapped_file_key: sealed.wrapped_file_key,
             plain_md5: sealed.plain_md5,
             plain_sha256: sealed.plain_sha256,
+            plain_crc64: sealed.plain_crc64,
             cipher_sha256: sealed.cipher_sha256,
         }
     } else {
@@ -797,7 +806,7 @@ where
             .await
             .inspect_err(observed.on_error(Stage::Budget))?;
         let SealedUpload { decoded, sealed } = store_streamed(
-            &bridge.safety,
+            bridge,
             req.body,
             lengths,
             validator,
@@ -818,6 +827,7 @@ where
             wrapped_file_key: sealed.wrapped_file_key,
             plain_md5: *decoded.md5(),
             plain_sha256: *decoded.sha256(),
+            plain_crc64: sealed.plain_crc64,
             cipher_sha256: sealed.cipher_sha256,
         }
     };
@@ -838,6 +848,7 @@ where
         wrapped_file_key: Some(stored.wrapped_file_key.to_vec()),
         plain_md5: stored.plain_md5,
         plain_sha256: stored.plain_sha256,
+        plain_crc64: stored.plain_crc64,
         cipher_sha256: stored.cipher_sha256,
         safety_state: SafetyState::Held,
         article_count: None,
@@ -974,6 +985,7 @@ where
         bucket: &a.bucket.id,
         ids: &ids,
         slice_bytes,
+        record_crc64: bridge.cfg.record_plain_crc64,
         rng: &mut rng,
     };
     let stored = match store_slices(sink, body, lengths, &charge, &mut validator).await {
@@ -1028,6 +1040,7 @@ where
             wrapped_file_key: Some(slice.sealed.wrapped_file_key.to_vec()),
             plain_md5: slice.sealed.plain_md5,
             plain_sha256: slice.sealed.plain_sha256,
+            plain_crc64: slice.sealed.plain_crc64,
             cipher_sha256: slice.sealed.cipher_sha256,
             safety_state: SafetyState::Held,
             article_count: None,

@@ -387,7 +387,7 @@ pub(super) async fn job_extent<S: Sql>(
            e.plain_size, e.cipher_size, e.media_header, e.key_mode, e.wrapped_file_key, \
            e.plain_md5, e.plain_sha256, e.cipher_sha256, e.safety_state, e.article_count, \
            e.plan_rev, e.last_verified_at, e.release_evidence, e.released_at, e.created_at, \
-           b.id, b.name, b.owner, b.bdk_wrapped, b.kek_version, b.disposable, b.created_at, \
+           e.plain_crc64, b.id, b.name, b.owner, b.bdk_wrapped, b.kek_version, b.disposable, b.created_at, \
            CASE WHEN ",
         live_ref!("e.id"),
         " THEN 'live' ELSE g.state END, e.parity_count \
@@ -425,6 +425,7 @@ pub(super) async fn job_extent<S: Sql>(
         release_evidence: r.opt_text()?,
         released_at: r.opt_num()?.map(UnixMs),
         created_at: UnixMs(r.num()?),
+        plain_crc64: r.opt_array()?,
     };
     let bucket = Bucket {
         id: BucketId::new(r.text()?),

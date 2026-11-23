@@ -137,6 +137,7 @@ impl Fx {
                     wrapped_file_key: Some(vec![seed; 73]),
                     plain_md5: [seed; 16],
                     plain_sha256: [seed; 32],
+                    plain_crc64: None,
                     cipher_sha256: [seq as u8; 32],
                     safety_state: SafetyState::Held,
                     article_count: None,

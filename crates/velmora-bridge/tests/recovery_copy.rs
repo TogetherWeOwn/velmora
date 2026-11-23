@@ -4907,6 +4907,7 @@ fn manifest(id: &str, tail: &str, extents: usize) -> GenerationManifest {
                 wrapped_file_key: vec![7; 40],
                 plain_md5: vec![1; 16],
                 plain_sha256: vec![2; 32],
+                plain_crc64: None,
                 cipher_sha256: vec![3; 32],
                 created_at: NOW,
             })

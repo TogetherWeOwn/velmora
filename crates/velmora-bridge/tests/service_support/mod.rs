@@ -645,6 +645,7 @@ pub fn config(providers: Vec<ProviderConfig>) -> BridgeConfig {
         records: velmora_bridge::recovery::Layout::flat(),
         packed_plans: false,
         parity: false,
+        record_plain_crc64: false,
         required_backbones: 1,
         safety_min_age_secs: 0,
         verify_delay_secs: 30,
