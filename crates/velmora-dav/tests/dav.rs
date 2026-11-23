@@ -1277,6 +1277,43 @@ async fn the_stateful_folder_bound_applies_to_each_tree() {
 }
 
 #[tokio::test]
+async fn one_tree_over_the_stateful_folder_bound_is_refused_before_any_change() {
+    use velmora_dav::handler::StatePort;
+    use velmora_dav::state::{DeadProp, Op, Patch};
+    // Stale properties on folders S3 no longer holds push dst/ over the
+    // bound although it has one key.
+    let w = World::with(Config {
+        max_tree: 3,
+        ..Config::default()
+    })
+    .await;
+    assert_eq!(w.s3_put("src/new", b"new").await, 200);
+    assert_eq!(w.s3_put("dst/old", b"old").await, 200);
+    w.req("PROPFIND", "/dav/dst/", &[("depth", "0")], b"")
+        .await
+        .expect(207);
+    let name = w.dav.state.dbs.borrow().keys().next().unwrap().clone();
+    let ops = (0..4)
+        .map(|i| Op::PropPatch {
+            path: format!("dst/stale{i}/"),
+            etag: None,
+            patches: vec![Patch::Set(DeadProp {
+                ns: "urn:x".into(),
+                name: "x".into(),
+                xml: "<x xmlns=\"urn:x\">1</x>".into(),
+            })],
+        })
+        .collect();
+    w.dav.state.call(&name, ops).await.unwrap();
+    w.req("COPY", "/dav/src/", &[("destination", "/dav/dst/")], b"")
+        .await
+        .expect(507);
+    assert_eq!(w.s3_get("dst/old").await.1, b"old");
+    assert_eq!(w.s3_get("dst/new").await.0, 404);
+    assert_eq!(w.s3_get("src/new").await.1, b"new");
+}
+
+#[tokio::test]
 async fn depth_zero_overwrite_does_not_list_removed_subfolders() {
     let w = World::new().await;
     assert_eq!(w.s3_put("src/", b"").await, 200);
