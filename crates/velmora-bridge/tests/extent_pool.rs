@@ -242,6 +242,16 @@ async fn three_post_reservations_take_three_spares_without_evicting_them() {
 
 #[tokio::test]
 async fn a_post_that_times_out_of_the_slot_wait_returns_its_spare() {
+    // The spare exceeds 3 MiB, but it fits in the weighted budget.
+    check_spare_on_post_timeout(45 * MIB, true).await;
+}
+
+#[tokio::test]
+async fn a_post_that_times_out_of_the_slot_wait_frees_its_spare_when_requests_fill_the_budget() {
+    check_spare_on_post_timeout(48 * MIB, false).await;
+}
+
+async fn check_spare_on_post_timeout(request_bytes: u64, keep_spare: bool) {
     use std::cell::Cell;
     use std::rc::Rc;
 
@@ -297,6 +307,11 @@ async fn a_post_that_times_out_of_the_slot_wait_returns_its_spare() {
     );
     assert!(budget.in_use() > len, "the job still holds its charge");
 
+    let mut request = budget.try_charge(MIB).unwrap();
+    // The request must account for bytes already resident, even while
+    // the waiting job still has its reservation.
+    request.hold(request_bytes);
+
     resume.set(true);
     let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), post)
         .await
@@ -305,10 +320,21 @@ async fn a_post_that_times_out_of_the_slot_wait_returns_its_spare() {
     assert_eq!(*catalog.line_left.borrow(), [holder]);
     assert_eq!(rig.bridge.safety.gets(), reads);
     assert_eq!(catalog.outbox(&s.extent).attempts, 0);
-    // Only the returned idle spare is charged now, not the post reservation.
-    assert_eq!((budget.spares(), budget.in_use()), (1, len));
-    assert_eq!(one_job(budget, len, len).await, spare);
-    drop(budget.try_charge_job(budget.job_capacity()).unwrap());
+    // The post reservation is gone. Only the request and any kept spare count.
+    let expected_spare_bytes = if keep_spare { len } else { 0 };
+    assert_eq!(
+        (budget.spares(), budget.spare_bytes(), budget.in_use()),
+        (
+            usize::from(keep_spare),
+            expected_spare_bytes,
+            request_bytes + expected_spare_bytes,
+        ),
+    );
+    drop(request);
+    if keep_spare {
+        assert_eq!(one_job(budget, len, len).await, spare);
+        drop(budget.try_charge_job(budget.job_capacity()).unwrap());
+    }
     assert_eq!((budget.spares(), budget.in_use()), (0, 0));
 }
 

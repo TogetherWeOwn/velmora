@@ -1145,10 +1145,9 @@ impl ByteBudget {
     /// `extent_len` bytes, which `bytes` count, in the buffer that
     /// [`Charge::lend`] gives it. With an extent pool
     /// ([`ByteBudget::with_extent_pool`]) the buffer is a spare one when
-    /// one fits, and it is kept as a spare when the charge is dropped:
-    /// the next job of the isolate reads its extent into the same memory
-    /// instead of asking the allocator for a new one. A spare larger
-    /// than the extent is charged at its size.
+    /// one fits. When the charge is dropped, the buffer can stay as a
+    /// spare if the budget has room, so the next job can reuse the same
+    /// memory. A spare larger than the extent is charged at its size.
     pub async fn charge_job_extent(
         &self,
         bytes: u64,
@@ -1350,8 +1349,8 @@ impl Charge {
 
     /// An empty buffer for `len` bytes of the job's extent: the spare
     /// that [`ByteBudget::charge_job_extent`] took over, or a new one. It
-    /// comes back to this charge when the [`Lent`] is dropped, and goes
-    /// to the spares with the charge.
+    /// comes back to this charge when the [`Lent`] is dropped, and may
+    /// become a spare when the charge is dropped.
     pub fn lend(&self, len: usize) -> Lent<'_> {
         let mut buffer = self.lend_buffer();
         if buffer.capacity() < len {
@@ -1375,9 +1374,8 @@ impl Charge {
         }
     }
 
-    /// Moves the extent buffer, when it is one the budget keeps, from
-    /// this charge to the spares: the bytes counted stay the same.
-    fn keep_buffer(&mut self) {
+    /// Keeps the extent buffer only if it fits after this charge is released.
+    fn keep_buffer(&self) {
         let Some(mut buffer) = self.buffer.take() else {
             return;
         };
@@ -1387,13 +1385,13 @@ impl Charge {
         if max == 0 || cap < EXTENT_POOL_MIN_BYTES || cap > self.pooled.min(self.jobs) {
             return;
         }
+        let mut bytes = s.spare_bytes.get().saturating_add(cap);
+        if !s.fits(s.requests.get(), s.jobs.get().saturating_add(bytes)) {
+            return;
+        }
         buffer.clear();
-        self.count(cap, false);
-        self.jobs -= cap;
-        s.jobs.set(s.jobs.get().saturating_sub(cap));
         let mut spare = s.spare.borrow_mut();
         spare.push_back(buffer);
-        let mut bytes = s.spare_bytes.get().saturating_add(cap);
         while spare.len() > max {
             if let Some(old) = spare.pop_front() {
                 bytes = bytes.saturating_sub(old.capacity() as u64);
@@ -1428,12 +1426,12 @@ impl fmt::Debug for Charge {
 
 impl Drop for Charge {
     fn drop(&mut self) {
-        self.keep_buffer();
         self.count(self.bytes(), false);
         let s = &self.state;
         s.requests
             .set(s.requests.get().saturating_sub(self.requests));
         s.jobs.set(s.jobs.get().saturating_sub(self.jobs));
+        self.keep_buffer();
     }
 }
 
