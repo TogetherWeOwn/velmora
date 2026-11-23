@@ -596,6 +596,27 @@ impl PermitClass {
     }
 }
 
+/// Outcome of [`Catalog::record_verification`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VerifyRecord {
+    /// The row is on record as written, under the lease's claim.
+    Stored,
+    /// The lease holds, but a row of the same backbone and millisecond
+    /// stays in its place (a failure, or a `body` pass where this is a
+    /// `stat` pass): this result is not on record and may be listed as
+    /// evidence of nothing.
+    Kept,
+    /// The lease no longer holds its row; nothing was written.
+    Fenced,
+}
+
+impl VerifyRecord {
+    /// Whether the lease held: [`Self::Stored`] or [`Self::Kept`].
+    pub fn held(self) -> bool {
+        self != VerifyRecord::Fenced
+    }
+}
+
 /// Outcome of a guarded batch.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Guard<T> {
@@ -1095,7 +1116,10 @@ pub trait Catalog {
         permits: &[Permit],
         now: UnixMs,
     ) -> Result<(bool, Vec<bool>)>;
-    async fn record_verification(&self, l: &Lease, v: &VerificationRow) -> Result<bool>;
+    /// Appends a verification result under the claim of `l`
+    /// (`verifications.lease_token`): only the claim that recorded a
+    /// pass can count it as presence for a release.
+    async fn record_verification(&self, l: &Lease, v: &VerificationRow) -> Result<VerifyRecord>;
     /// Latest row per backbone for the current `plan_rev`, with `counts`.
     async fn backbone_status(&self, extent: &ExtentId) -> Result<Vec<BackboneStatus>>;
     /// The last full read per backbone: its latest `body` row for the

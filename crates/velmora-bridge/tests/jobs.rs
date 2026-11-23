@@ -568,8 +568,12 @@ async fn post_verify_release_over_fake_nntp() {
         .unwrap();
     let runs = fx.pump().await;
 
-    // One delivery per stage; one backbone, so one verify job.
-    assert_eq!(runs, 3);
+    // One delivery per stage; one backbone, so one verify job. The clock
+    // stands still here, so the release job's `STAT` falls in the
+    // millisecond of the verify job's full read, which stays on record
+    // in its place: that release job asks again from a later instant,
+    // and only a pass of its own claim counts.
+    assert_eq!(runs, 4);
     assert_eq!(fx.outbox(&o, "stage").await, "done");
     assert_eq!(fx.outbox(&o, "last_error").await, "NULL");
     assert_eq!(fx.extent(&o, "safety_state").await, "released");
@@ -1530,11 +1534,12 @@ async fn dispatch_redrives_done_extents_when_a_backbone_is_added() {
         .map(|s| (s.backbone.as_str(), s.kind))
         .collect();
     assert!(kinds.contains(&("bb1", VerifyKind::Stat)), "{kinds:?}");
-    assert_eq!(
-        kinds.iter().filter(|k| k.1 == VerifyKind::Body).count(),
-        1,
-        "{kinds:?}"
-    );
+    // The release asked both with `STAT`, later than the full read, which
+    // stays on record.
+    let full = fx.bridge.catalog.body_checks(&o.extent).await.unwrap();
+    let full: Vec<_> = full.iter().filter(|b| b.counts).collect();
+    assert_eq!(full.len(), 1, "{kinds:?}");
+    assert_eq!(full[0].kind, VerifyKind::Body);
     // Nothing was posted twice.
     assert_eq!(fx.server.posted_count().await, 3);
 
@@ -2620,6 +2625,9 @@ async fn a_refused_hand_over_is_sent_by_the_next_dispatcher_run() {
         .set(UnixMs(fx.outbox(&o, "next_at").await.parse().unwrap()));
     let release = o.job(OutboxStage::Release);
     assert_eq!(fx.tick().await.0, std::slice::from_ref(&release));
+    // A millisecond after verify's checks: a `STAT` in their millisecond
+    // is not on record beside the full read, and asks again.
+    fx.clock.set(fx.clock.now().plus_ms(1));
     assert_eq!(fx.bridge.run_job(&release).await, JobOutcome::Ack);
     assert_eq!(fx.outbox(&o, "stage").await, "done");
     assert_eq!(fx.server.posted_count().await, 1);

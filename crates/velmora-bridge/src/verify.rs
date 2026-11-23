@@ -155,7 +155,7 @@ use crate::parity::ParityPlan;
 use crate::pool::Pool;
 use crate::ports::{
     BlobStore, Bridge, Catalog, Clock, Guard, JobSink, Kek, Lease, NntpConnector, PermitClass,
-    MAX_QUEUE_DELAY_SECS,
+    VerifyRecord, MAX_QUEUE_DELAY_SECS,
 };
 use crate::post::{settle, settle_at, Stop};
 use crate::types::{
@@ -620,6 +620,10 @@ where
         }
     }
 
+    /// Records one result under the claim of `lease`. `true` with the
+    /// row: it is on record as written. `false`: a row of the backbone at
+    /// the same millisecond stays in its place ([`VerifyRecord::Kept`]),
+    /// so this result is evidence of nothing.
     async fn record(
         &self,
         lease: &Lease,
@@ -628,7 +632,7 @@ where
         tally: &ReadTally,
         kind: VerifyKind,
         total: u32,
-    ) -> Staged<VerificationRow> {
+    ) -> Staged<(VerificationRow, bool)> {
         let row = VerificationRow {
             extent_id: extent.id.clone(),
             backbone: label(&provider.backbone),
@@ -640,10 +644,11 @@ where
             result: result_of(tally),
             kind,
         };
-        if !self.catalog.record_verification(lease, &row).await? {
-            return Err(Stop::Fenced);
+        match self.catalog.record_verification(lease, &row).await? {
+            VerifyRecord::Stored => Ok((row, true)),
+            VerifyRecord::Kept => Ok((row, false)),
+            VerifyRecord::Fenced => Err(Stop::Fenced),
         }
-        Ok(row)
     }
 
     async fn cursor(&self, lease: &Lease, cursor: u32) -> Staged<()> {
@@ -1030,10 +1035,14 @@ where
                 *reached = stored;
             }
             let kind = Self::recorded_kind(kind, &tally);
-            let row = self
+            let (row, stored) = self
                 .record(lease, extent, provider, &tally, kind, plan.total())
                 .await?;
-            seen.push((began, row.clone()));
+            // A check that is not on record as made is no check of this
+            // job for the release: that backbone is asked again.
+            if stored {
+                seen.push((began, row.clone()));
+            }
             if watched && !asked && row.result != VerifyResult::Ok {
                 // Recorded first: the failure stands whatever comes of
                 // this. A raise that is not stored is made by the next
@@ -1374,7 +1383,7 @@ where
                 // is recorded: it counts for nothing and cancels nothing.
                 continue;
             }
-            let row = self
+            let (row, stored) = self
                 .record(
                     lease,
                     extent,
@@ -1384,6 +1393,15 @@ where
                     plan.total(),
                 )
                 .await?;
+            if !stored {
+                // A row of this backbone at the same millisecond stays,
+                // so this answer is not on record and the guard would
+                // count that row in its place: a check of this job that
+                // began before the minimum age was over, or one of an
+                // earlier claim. Nothing is released on it. The release
+                // stage asks again, from a later millisecond.
+                return self.to_release(lease, row.verified_at.plus_ms(1)).await;
+            }
             if row.result == VerifyResult::Ok && !failed.contains(&label(&row.backbone)) {
                 rows.push(row);
             }

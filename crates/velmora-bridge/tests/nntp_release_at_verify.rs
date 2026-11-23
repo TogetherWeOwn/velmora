@@ -181,7 +181,11 @@ impl Rig {
             kind: VerifyKind::Body,
         };
         let catalog = &self.bridge.catalog;
-        assert!(catalog.record_verification(&lease, &pass).await.unwrap());
+        assert!(catalog
+            .record_verification(&lease, &pass)
+            .await
+            .unwrap()
+            .held());
         assert!(catalog.defer_at(&lease, SECOND, now, now).await.unwrap());
         assert_eq!(self.outbox(s).cursor, SECOND);
         self.bridge.clock.advance_secs(1);
@@ -495,6 +499,64 @@ async fn a_check_that_began_once_the_minimum_age_was_over_is_presence() {
             ("bb0".into(), "stat".into(), rows[2].verified_at, None),
             ("bb1".into(), "stat".into(), rows[1].verified_at, None),
             ("bb0".into(), "body".into(), rows[0].verified_at, None),
+        ]
+    );
+}
+
+/// Review regression: a `STAT` that is asked again because the full read
+/// of its backbone began before the minimum age was over, and that ends
+/// in the millisecond that full read ended. The catalogue keeps the
+/// `body` pass at that instant in its place, so the answer is not on
+/// record. The job must not release on it, nor list it as evidence: the
+/// release stage asks again from a later millisecond, and releases on
+/// passes it has on record under its own claim.
+#[tokio::test]
+async fn a_stat_in_the_millisecond_of_the_full_read_is_asked_again_later() {
+    let mut rig = rig_on().await;
+    let (s, plan) = rig.on_two(8).await;
+    let n = plan.len();
+    let posted = plan.iter().filter_map(|a| a.posted_at).max().unwrap();
+    // The full read of the first backbone (connect and three `BODY`s,
+    // 300 ms each) ends 1200 ms into the job; the age is over at 1000.
+    // Every call after it takes no time.
+    let start = rig.bridge.clock.now();
+    let age_ms = start.0 + 1000 - posted.0;
+    assert_eq!(age_ms % 1000, 0);
+    rig.bridge.cfg.safety_min_age_secs = u32::try_from(age_ms / 1000).unwrap();
+    let ready = UnixMs(start.0 + 1000);
+    let read_ends = UnixMs(start.0 + 1200);
+    rig.bridge.nntp.slow_for(&rig.bridge.clock, 300, n + 1);
+    assert_eq!(rig.run(&s, OutboxStage::Verify).await, JobOutcome::Ack);
+
+    // The `STAT` of the first backbone was asked, after the age, and
+    // ended at `read_ends`: the full read stays on record there.
+    let log = rig.bridge.nntp.calls();
+    let asked: Vec<UnixMs> = log.iter().filter(|c| c.0 == "stat").map(|c| c.1).collect();
+    assert_eq!(asked.len(), 2 * n);
+    assert!(asked.iter().all(|at| *at == read_ends && *at >= ready));
+    assert_eq!(
+        rig.checks(&s),
+        [ok("bb0", VerifyKind::Body), ok("bb1", VerifyKind::Stat)]
+    );
+    assert!(rig.rows(&s).iter().all(|r| r.verified_at == read_ends));
+    // Nothing released, no evidence written; the release stage is due
+    // a millisecond later.
+    assert!(rig.held(&s));
+    assert_eq!(rig.outbox(&s).stage, OutboxStage::Release);
+    assert_eq!(rig.outbox(&s).next_at, read_ends.plus_ms(1));
+    assert_eq!(rig.sent(), [(OutboxStage::Release, 1)]);
+
+    // The release job asks both backbones under its own claim.
+    rig.bridge.clock.advance_secs(1);
+    let at = rig.bridge.clock.now();
+    assert_eq!(rig.run(&s, OutboxStage::Release).await, JobOutcome::Ack);
+    assert!(rig.released(&s));
+    assert_eq!(
+        rig.evidence(&s),
+        [
+            ("bb0".into(), "stat".into(), at, None),
+            ("bb1".into(), "stat".into(), at, None),
+            ("bb0".into(), "body".into(), read_ends, None),
         ]
     );
 }
@@ -948,14 +1010,22 @@ async fn the_guard_counts_only_passes_of_the_claim_that_releases() {
 
     // The second backbone under this claim, the first only before it.
     let second = stat("bb1", "p1");
-    assert!(catalog.record_verification(&lease, &second).await.unwrap());
+    assert!(catalog
+        .record_verification(&lease, &second)
+        .await
+        .unwrap()
+        .held());
     let released = catalog.release_at_verify(&lease, 2, &labels, "[]", now, None);
     assert_eq!(released.await.unwrap(), Guard::Lost);
     assert!(rig.held(&s));
 
     // Both under this claim, and the full check on record.
     let first = stat("bb0", "p0");
-    assert!(catalog.record_verification(&lease, &first).await.unwrap());
+    assert!(catalog
+        .record_verification(&lease, &first)
+        .await
+        .unwrap()
+        .held());
     let begun = catalog.begin_release(&lease, 2, &labels, "[]", now).await;
     assert!(matches!(begun, Err(BridgeError::Invalid(_))));
     assert!(rig.held(&s));
@@ -1120,7 +1190,11 @@ async fn the_light_check_asks_a_backbone_it_did_not_ask_itself() {
         kind: VerifyKind::Stat,
     };
     let catalog = &rig.bridge.catalog;
-    assert!(catalog.record_verification(&lease, &pass).await.unwrap());
+    assert!(catalog
+        .record_verification(&lease, &pass)
+        .await
+        .unwrap()
+        .held());
     assert!(catalog.defer_at(&lease, SECOND, now, now).await.unwrap());
     rig.bridge.clock.advance_secs(1);
     rig.servers[0].hide(&plan[0].message_id).await;

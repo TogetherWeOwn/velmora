@@ -114,6 +114,10 @@ pub const MIGRATION_0022: &str =
 /// The usage trigger that counts a release by a verify job as one.
 pub const MIGRATION_0025: &str =
     include_str!("../../../workers/s3-bridge/migrations/0025_usage_release_at_verify.sql");
+/// The claim a verification row was recorded under
+/// (`verifications.lease_token`).
+pub const MIGRATION_0026: &str =
+    include_str!("../../../workers/s3-bridge/migrations/0026_verification_claim.sql");
 
 /// Switches the usage counters on over an empty catalogue: zero is the
 /// right count of nothing, so no recount is needed first.
@@ -341,6 +345,7 @@ impl RusqliteSql {
         db.apply(MIGRATION_0021)?;
         db.apply(MIGRATION_0022)?;
         db.apply(MIGRATION_0025)?;
+        db.apply(MIGRATION_0026)?;
         Ok(db)
     }
 

@@ -91,7 +91,7 @@ use crate::gate::PermitGate;
 use crate::plan::{PackReport, StoredPlan};
 use crate::ports::{
     Catalog, GrantPut, Guard, KeyHead, Lease, Permit, PermitClass, PublishOutcome, Sql, SqlValue,
-    UploadTarget,
+    UploadTarget, VerifyRecord,
 };
 use crate::recovery::Recorded;
 use crate::replay::{ReplayExtent, ReplayMark, ReplayProbe, ReplayPublish, RestoreProgress};
@@ -584,7 +584,7 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
             None => outbox::renew_all(self, l, permits, now).await,
         }
     }
-    async fn record_verification(&self, l: &Lease, v: &VerificationRow) -> Result<bool> {
+    async fn record_verification(&self, l: &Lease, v: &VerificationRow) -> Result<VerifyRecord> {
         outbox::record_verification(self, l, v).await
     }
     async fn backbone_status(&self, extent: &ExtentId) -> Result<Vec<BackboneStatus>> {

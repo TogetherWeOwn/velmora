@@ -1277,6 +1277,15 @@ second round of `STAT`, its job and its writes are not made.
   `REQUIRED_BACKBONES` backbones that count, by checks recorded under the
   claim of the job that releases, and the full read on record. The
   catalogue refuses anything less, whichever job asks.
+- "Recorded under the claim" is told by the lease token each
+  verification row carries (migration `0026_verification_claim.sql`;
+  apply it before the Worker that writes the column), not by its time:
+  a claim made in the millisecond an earlier one recorded a pass does
+  not count that pass. A row from before the column is never presence
+  for a release, though a full read stays on record. A check that ends
+  in the millisecond of another row of its backbone, and that the
+  catalogue does not keep beside it, is no evidence: the job hands the
+  release to the release stage, which asks again a millisecond later.
 - A backbone the releasing verify job did not ask itself is asked with
   `STAT` in that job first: one a job before it checked (a round that
   waited for propagation or made a repost), and one whose check began

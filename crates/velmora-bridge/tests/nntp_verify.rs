@@ -315,7 +315,11 @@ async fn verify_resumes_at_the_backbone_the_row_names() {
         kind: VerifyKind::Body,
     };
     let catalog = &rig.bridge.catalog;
-    assert!(catalog.record_verification(&lease, &pass).await.unwrap());
+    assert!(catalog
+        .record_verification(&lease, &pass)
+        .await
+        .unwrap()
+        .held());
     assert!(catalog.defer_at(&lease, 8, now, now).await.unwrap());
     assert_eq!(rig.outbox(&s).cursor, 8);
     rig.bridge.nntp.slow(&rig.bridge.clock, 0);
@@ -1148,7 +1152,8 @@ async fn stat_passes_alone_never_release() {
             .catalog
             .record_verification(&lease, &row)
             .await
-            .unwrap());
+            .unwrap()
+            .held());
     }
     let counting = ["bb0".to_string(), "bb1".to_string()];
     let guard = rig
@@ -1202,7 +1207,11 @@ async fn the_guard_takes_fresh_stat_passes_with_the_full_check_on_record() {
             kind: VerifyKind::Stat,
         };
         let catalog = &rig.bridge.catalog;
-        assert!(catalog.record_verification(&lease, &row).await.unwrap());
+        assert!(catalog
+            .record_verification(&lease, &row)
+            .await
+            .unwrap()
+            .held());
         assert_eq!(begin().await, expected, "after {backbone}");
     }
 }

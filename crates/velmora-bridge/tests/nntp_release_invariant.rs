@@ -451,7 +451,13 @@ async fn the_guard_refuses_a_full_read_of_the_data_alone() {
         let all = DATA + PARITY;
         let record = |row: VerificationRow| {
             let lease = &lease;
-            async move { assert!(catalog.record_verification(lease, &row).await.unwrap()) }
+            async move {
+                assert!(catalog
+                    .record_verification(lease, &row)
+                    .await
+                    .unwrap()
+                    .held())
+            }
         };
         let release = |ms: i64| {
             let lease = &lease;
