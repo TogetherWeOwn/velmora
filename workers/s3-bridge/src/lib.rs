@@ -31,6 +31,7 @@ use std::task::{Poll, Waker};
 use velmora_bridge::copy::Copier;
 use velmora_bridge::ingress;
 use velmora_bridge::keepalive;
+use velmora_bridge::metrics::{GetFailureStage, GetObservation};
 use velmora_bridge::{
     BridgeError, Job, JobOutcome, OutboxStage, RespBody, S3Response, UnixMs, JOB_VERSION,
 };
@@ -58,7 +59,7 @@ fn error_class(e: &BridgeError) -> &'static str {
 /// One-shot hand-off of the handler's response to the fetch future.
 #[derive(Default)]
 struct Slot {
-    resp: Option<S3Response>,
+    resp: Option<(S3Response, GetObservation)>,
     waker: Option<Waker>,
 }
 
@@ -73,18 +74,19 @@ async fn handle_detached(
     ctx: &Context,
     bridge: Rc<env::WorkerBridge>,
     req: velmora_bridge::S3Request,
-) -> S3Response {
+) -> (S3Response, GetObservation) {
     let slot = Rc::new(RefCell::new(Slot::default()));
     let tx = Rc::clone(&slot);
     ctx.wait_until(async move {
-        let mut resp = bridge.handle(req).await;
+        let mut get = GetObservation::default();
+        let mut resp = bridge.handle_observed(req, &mut get).await;
         let work = match &mut resp.body {
             RespBody::Deferred(d) => d.take_work(),
             _ => None,
         };
         {
             let mut s = tx.borrow_mut();
-            s.resp = Some(resp);
+            s.resp = Some((resp, get));
             if let Some(w) = s.waker.take() {
                 w.wake();
             }
@@ -165,7 +167,7 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
     // The point of this request, if it gets one. A sub-request of a
     // large GET gets none unless it failed: a 5xx is never left out,
     // whatever headers the request carried.
-    let count = |status: u16, sample: u32, bytes_out: u64| {
+    let count = |status: u16, sample: u32, bytes_out: u64, get: GetObservation| {
         if internal.get() && status < 500 {
             return;
         }
@@ -188,6 +190,7 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
                 bytes_in,
                 bytes_out,
                 colo: &colo,
+                get,
             };
             metrics::write(&velmora_bridge::metrics::request_point(&seen, weight));
         }
@@ -197,7 +200,7 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
         Err(class) => {
             console_error!("config refused: {class}");
             let resp = ingress::IngressError::Internal.response();
-            count(resp.status, 1, 0);
+            count(resp.status, 1, 0, GetObservation::default());
             return Ok(early(resp));
         }
     };
@@ -208,7 +211,12 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
                 "{}",
                 ingress::log_line(&method, "-", e.status(), &request_id)
             );
-            count(e.status(), bridge.cfg.metrics_sample, 0);
+            count(
+                e.status(),
+                bridge.cfg.metrics_sample,
+                0,
+                GetObservation::default(),
+            );
             return Ok(early(e.response()));
         }
     };
@@ -221,8 +229,10 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
         )
         .is_ok(),
     );
+    let got = std::cell::Cell::new(GetObservation::default());
     let resp = ingress::front(incoming.req, &bridge.cfg, incoming.https, |req| async {
-        let resp = handle_detached(&ctx, Rc::clone(&bridge), req).await;
+        let (resp, get) = handle_detached(&ctx, Rc::clone(&bridge), req).await;
+        got.set(get);
         // A deferred document: buffered when it is done soon, else
         // streamed with keepalive whitespace.
         keepalive::settle_response(resp, env::sleeper()).await
@@ -231,7 +241,8 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
     .with_request_id(&request_id);
     // A body in sub-ranges: the first one is opened before the status is
     // known to the client.
-    let (status, out) = fanout::respond(&env, &ctx, resp, &request_id).await;
+    let mut get = got.into_inner();
+    let (status, out) = fanout::respond(&env, &ctx, resp, &request_id, &mut get).await;
     console_log!(
         "{}",
         ingress::log_line(&method, &target, status, &request_id)
@@ -239,7 +250,20 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
     if let Some(line) = env::memory_line(&bridge) {
         console_log!("{line}");
     }
-    count(status, bridge.cfg.metrics_sample, length(out.headers()));
+    // HTTP conversion can itself turn a response into a 500. Keep the
+    // existing response and log, but count the actual GET outcome.
+    let metrics_status = if method == "GET" && !admin && status != out.status_code() {
+        get.mark_stage(GetFailureStage::Other);
+        out.status_code()
+    } else {
+        status
+    };
+    count(
+        metrics_status,
+        bridge.cfg.metrics_sample,
+        length(out.headers()),
+        get,
+    );
     Ok(out)
 }
 

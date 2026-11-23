@@ -245,12 +245,25 @@ where
     where
         Self: 'static,
     {
+        self.handle_observed(req, &mut crate::metrics::GetObservation::default())
+            .await
+    }
+
+    /// As `handle`, with redacted GET diagnostics for the request datapoint.
+    pub async fn handle_observed(
+        self: Rc<Self>,
+        req: S3Request,
+        get_metrics: &mut crate::metrics::GetObservation,
+    ) -> S3Response
+    where
+        Self: 'static,
+    {
         let target = req.raw_target.clone();
         // A sub-range of a large GET, asked for by another invocation of
         // this Worker. It is told apart by its target alone and admitted
         // by its token alone, before any S3 routing.
         if crate::fanout::is_internal_target(&target) {
-            return get::fanout_piece(&self, req).await;
+            return get::fanout_piece(&self, req, get_metrics).await;
         }
         match classify(&req.method, &target) {
             Route::Admin { rest } => admin::handle(&self, req, rest).await,
@@ -280,7 +293,7 @@ where
             Route::GetBucketLocation { .. } => bucket::get_bucket_location(&self, req).await,
             Route::ListObjects { bucket } => list::list_objects(&self, req, bucket).await,
             Route::PutObject { bucket, key } => put::put_object(&self, req, bucket, key).await,
-            Route::GetObject { bucket, key } => get::get_object(&self, req, bucket, key).await,
+            Route::GetObject { .. } => get::get_object(&self, req, get_metrics).await,
             Route::HeadObject { bucket, key } => get::head_object(&self, req, bucket, key).await,
             Route::DeleteObject { bucket, key } => {
                 delete::delete_object(&self, req, bucket, key).await
