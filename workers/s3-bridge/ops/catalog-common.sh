@@ -33,8 +33,28 @@ readonly D1_SQL_STATEMENT_MAX_BYTES=100000
 
 catalog_part_max_bytes() { printf '300000000\n'; }
 
+# Wrangler can print a presigned URL even on a successful transfer. Strip
+# query strings in the pipe, before bytes reach a persistent diagnostic.
+catalog_redact_log() {
+  LC_ALL=C sed -E 's@(https?://[^?[:space:]"<>]+)\?[^[:space:]"<>]*@\1@g'
+}
+
+catalog_logged() {
+  local log=$1
+  shift
+  "$@" </dev/null 2>&1 | catalog_redact_log >>"$log"
+}
+
+catalog_capture() {
+  local output=$1 log=$2
+  shift 2
+  "$@" </dev/null 2>&1 >"$output" | catalog_redact_log >>"$log"
+}
+
 catalog_init_wrangler() {
   local pin version
+  # The pinned CLI checks this independently of its console log level.
+  export WRANGLER_WRITE_LOGS=false
   pin=$(jq -er '.packages["node_modules/wrangler"].version | strings | select(length > 0)' package-lock.json) ||
     { catalog_error 'could not read the Wrangler pin from package-lock.json'; return 1; }
   wrangler=./node_modules/.bin/wrangler

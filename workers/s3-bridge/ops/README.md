@@ -284,8 +284,9 @@ Wrangler's 300 MiB limit. `VELMORA_EXPORT_PART_BYTES` defaults to 268435456
 1,000-part limit holds over 268 GB of compressed SQL. To use rclone for
 uploads and restores, set `VELMORA_EXPORT_RCLONE_REMOTE` to the name of a
 configured remote for the R2 S3 endpoint. On failure, the scripts report
-where they kept private transfer logs. Staged SQL and parts are removed
-locally even on failure.
+where they kept private transfer logs. URL query strings are removed before
+logging, and Wrangler's own disk logging is disabled. Staged SQL and parts
+are removed locally even on failure.
 
 Take a fresh export after every deploy that applied a migration. An
 export carries the schema of its day and the list of the migrations
@@ -297,6 +298,10 @@ D1 Time Travel (30 days) is the faster tool when the database still
 exists: restore it to a timestamp, then replay from that timestamp.
 
 ## Restore
+
+Deploy a Worker revision with the incomplete-import replay guard before
+using the batched importer. The arming SQL also checks the marker, but an
+older Worker cannot enforce it on a direct replay call.
 
 1. Set `MAINTENANCE = "restore"` and deploy. Every write now answers 503,
    and the jobs and the cron do nothing.
@@ -336,12 +341,17 @@ exists: restore it to a timestamp, then replay from that timestamp.
      or the larger decompression/assembly requirement. It discards compressed
      bytes after verification, the SQL after spooling, and spools as used.
 
-     The target is marked incomplete before the first batch. If a batch
-     fails or the process stops, do not arm or replay into it. The import
-     marker blocks both; delete and recreate the partial restore target before
-     retrying. The script never deletes databases. After loading, row counts
-     read the rows of the idle restore target once. The marker is cleared
-     only after those checks pass or when you deliberately opt out with
+     The target is marked incomplete before the first batch. The marker
+     blocks arming and replay until the import finishes. If loading stops
+     before all batches are recorded as loaded, delete and recreate the
+     partial restore target before retrying. The script never deletes databases.
+
+     After all batches load, verification counts the idle target in indexed
+     pages of at most 5,000 rows per query. If verification fails, run the
+     same command with the same source, restore point, and target UUID. It
+     uses the expected row counts saved from the dump and retries verification
+     without downloading or loading any batches. The marker is cleared only
+     when verification passes or you explicitly skip it with
      `VELMORA_IMPORT_SKIP_ROW_COUNTS=yes` (the script prints a warning).
    - Nothing: create a database. The restore point is `0`.
 

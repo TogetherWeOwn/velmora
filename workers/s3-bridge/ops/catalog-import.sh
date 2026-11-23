@@ -62,7 +62,7 @@ get() {
     rclone copyto "$remote:$BUCKET/$key" "$out" --ignore-times </dev/null
   else
     "$wrangler" r2 object get "$BUCKET/$key" --file "$out" --remote "$@" </dev/null
-  fi >>"$log" 2>&1 || return 1
+  fi 2>&1 | catalog_redact_log >>"$log" || return 1
   [[ -s $out ]] || die "empty download for $key, see $log"
 }
 
@@ -71,7 +71,8 @@ get_restore_object() {
   local key=$1 out=$2 log=$3 listing
   shift 3
   if [[ -n $remote ]]; then
-    listing=$(rclone lsf "$remote:$BUCKET/$key" </dev/null 2>"$log") || return 1
+    catalog_capture "$WORK/listing" "$log" rclone lsf "$remote:$BUCKET/$key" || return 1
+    listing=$(<"$WORK/listing")
     [[ -n $listing ]] || return 2
   fi
   if get "$key" "$out" "$log" "$@"; then
@@ -93,16 +94,56 @@ verify() {
 
 require_disk() {
   local needed=$1 available
-  available=$(LC_ALL=C df -P -B1 -- "$WORK" | awk 'NR == 2 {print $4}') ||
+  available=$(LC_ALL=C df -Pk "$WORK" | awk 'NR == 2 {print $4}') ||
     die 'could not check available local disk space'
-  [[ $available =~ ^[0-9]{1,18}$ ]] || die 'could not read available local disk space'
-  (( 10#$available >= needed )) ||
+  [[ $available =~ ^[0-9]{1,15}$ ]] || die 'could not read available local disk space'
+  available=$((10#$available * 1024))
+  (( available >= needed )) ||
     die "insufficient local disk space: needs at least $needed bytes, $available available in $WORK"
+}
+
+verify_target() {
+  local plan=$1 table_row table expected found query page cursor next n index=0 verify_log
+  shift
+  if [[ ${VELMORA_IMPORT_SKIP_ROW_COUNTS:-} == yes ]]; then
+    echo 'catalog-import: WARNING verification skipped (VELMORA_IMPORT_SKIP_ROW_COUNTS=yes)' >&2
+  else
+    jq -cer '.[]' "$plan" >"$WORK/rows.jsonl" || die 'could not read verification plan'
+    while IFS= read -r table_row; do
+      table=$(jq -er '.name | strings | select(length > 0)' <<<"$table_row")
+      expected=$(jq -er '.expected | select(type == "number" and . >= 0 and floor == .)' <<<"$table_row")
+      cursor=null
+      found=0
+      page=0
+      while :; do
+        query=$(python3 -I "$HERE/sql_longest_statement.py" page "$table_row" "$cursor")
+        verify_log="$LOG_DIR/d1-row-count-$index-$page.log"
+        catalog_capture "$WORK/rows.json" "$verify_log" "$wrangler" d1 execute "$target" \
+          --remote --json --command "$query" "$@" || die "could not count rows in $table, see $verify_log; retry to resume verification"
+        n=$(jq -er '.[0].results | select(length == 1) | .[0].n |
+          select(type == "number" and . >= 0 and . <= 5000 and floor == .)' \
+          "$WORK/rows.json" 2>>"$verify_log") || die "invalid row count for $table, see $verify_log"
+        found=$((found + n))
+        (( n == 5000 )) || break
+        next=$(jq -cer '.[0].results[0].cursor | select(type == "string") | fromjson | select(type == "array")' \
+          "$WORK/rows.json" 2>>"$verify_log") || die "invalid verification cursor for $table, see $verify_log"
+        [[ $cursor != "$next" ]] || die "verification cursor did not advance for $table"
+        cursor=$next
+        page=$((page + 1))
+      done
+      printf 'catalog-import: row count for %s: expected %s, found %s\n' "$table" "$expected" "$found"
+      [[ $found == "$expected" ]] || die "row count for $table: expected $expected, found $found; restore not verified"
+      index=$((index + 1))
+    done <"$WORK/rows.jsonl"
+  fi
+  local clear_log="$LOG_DIR/d1-clear-import-marker.log"
+  catalog_logged "$clear_log" "$wrangler" d1 execute "$target" --remote --json \
+    --command 'DROP TABLE _velmora_import_incomplete' "$@" || die "could not clear the import marker, see $clear_log"
 }
 
 # Resolve the target first; contending processes stop here after metadata only.
 info_log="$LOG_DIR/d1-info.log"
-"$wrangler" d1 info "$target" --json "$@" </dev/null >"$WORK/info.json" 2>"$info_log" ||
+catalog_capture "$WORK/info.json" "$info_log" "$wrangler" d1 info "$target" --json "$@" ||
   die "could not resolve $target, see $info_log"
 resolved=$(jq -ers '
   select(length == 1) | .[0] | select(
@@ -122,6 +163,36 @@ if [[ ${VELMORA_IMPORT_PRODUCTION:-} != yes &&
 fi
 
 prefix="d1/$DB/$since_ms"
+snapshot_ref="$BUCKET/$prefix"
+verification_plan="$WORK/verification.json"
+preflight_log="$LOG_DIR/d1-preflight.log"
+catalog_capture "$WORK/preflight.json" "$preflight_log" "$wrangler" d1 execute "$target" --remote --json --command \
+  "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='_velmora_import_incomplete' LIMIT 1) AS incomplete,
+          EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND substr(name,1,4) <> '_cf_' AND substr(name,1,7) <> 'sqlite_' LIMIT 1) AS nonempty" \
+  "$@" || die "could not inspect $target, see $preflight_log"
+preflight=$(jq -er '.[0].results | select(length == 1) | .[0] |
+  [.incomplete,.nonempty] | select(all(.[]; . == 0 or . == 1)) | @tsv' \
+  "$WORK/preflight.json" 2>>"$preflight_log") || die "could not read table state for $target, see $preflight_log"
+IFS=$'\t' read -r incomplete nonempty <<<"$preflight"
+if [[ $incomplete == 1 ]]; then
+  resume_log="$LOG_DIR/d1-read-import-marker.log"
+  catalog_capture "$WORK/marker.json" "$resume_log" "$wrangler" d1 execute "$target" --remote --json --command \
+    'SELECT snapshot, phase, verification FROM _velmora_import_incomplete LIMIT 2' "$@" ||
+    die "could not read the incomplete import marker; see $resume_log"
+  marker=$(jq -cer '.[0].results | select(length == 1) | .[0]' "$WORK/marker.json" 2>>"$resume_log") ||
+    die "invalid incomplete import marker, see $resume_log"
+  [[ $(jq -er '.snapshot' <<<"$marker") == "$snapshot_ref" ]] ||
+    die 'the incomplete import marker belongs to a different restore point or source'
+  [[ $(jq -er '.phase' <<<"$marker") == verify ]] ||
+    die "the import into $target did not finish loading; delete and recreate the partial target before retry"
+  jq -er '.verification | fromjson | select(type == "array" and length > 0)' <<<"$marker" >"$verification_plan" ||
+    die 'could not read the saved verification plan'
+  printf 'catalog-import: resuming verification of %s at restore point %s\n' "$target" "$since_ms"
+  verify_target "$verification_plan" "$@"
+  echo 'catalog-import: next: migrations apply, then ops/restore-arm.sql (README, Restore step 2)'
+  exit 0
+fi
+[[ $nonempty == 0 ]] || die "$target is not empty, see $preflight_log"
 manifest="$prefix.manifest.json"
 sql="$WORK/catalog.sql"
 manifest_log="$LOG_DIR/manifest.get.log"
@@ -204,22 +275,19 @@ require_disk "$((loaded_bytes + (loaded_bytes + 9) / 10))"
 catalog_check_sql_statements "$sql" >/dev/null
 python3 -I "$HERE/sql_longest_statement.py" split "$sql" "$WORK" "$batch_bytes" "$catalog_sql_statement_limit" --discard-staged-sql
 
-count_log="$LOG_DIR/d1-count.log"
-"$wrangler" d1 execute "$target" --remote --json \
-  --command "SELECT count(*) AS n FROM sqlite_master WHERE type='table' AND substr(name, 1, 4) <> '_cf_' AND substr(name, 1, 7) <> 'sqlite_'" \
-  "$@" </dev/null >"$WORK/count.json" 2>"$count_log" ||
-  die "could not check whether $target is empty, see $count_log"
-count=$(jq -er '.[0].results[0].n | select(type == "number" and . >= 0 and floor == .)' "$WORK/count.json" 2>>"$count_log") ||
-  die "could not read table count for $target, see $count_log"
-[[ $count == 0 ]] || die "$target is not empty, see $count_log"
-
 jq -er '.batches[] | [.file, .bytes, .sha256] | @tsv' "$WORK/split.json" >"$WORK/batches.tsv"
+plan=$(jq -acer '.tables | select(type == "array" and length > 0)' "$WORK/split.json")
+(( ${#plan} <= 60000 )) || die 'the dump verification plan is too large for a D1 marker'
+printf '%s\n' "$plan" >"$verification_plan"
+# Escape SQL text literals. This plan was derived solely from the checksum-
+# verified dump, and is captured before the first schema or data batch runs.
+snapshot_sql=${snapshot_ref//\'/\'\'}
+plan_sql=${plan//\'/\'\'}
 marker_log="$LOG_DIR/d1-import-marker.log"
-# The table itself is the guard, even if the connection is lost before
-# the restore point is written. Never clear it on a failed or killed run.
-"$wrangler" d1 execute "$target" --remote --json --command \
-  "CREATE TABLE _velmora_import_incomplete (restore_point INTEGER NOT NULL); INSERT INTO _velmora_import_incomplete VALUES ($since_ms);" \
-  "$@" </dev/null >"$marker_log" 2>&1 || die "could not mark the target as incomplete, see $marker_log"
+catalog_logged "$marker_log" "$wrangler" d1 execute "$target" --remote --json --command \
+  "CREATE TABLE _velmora_import_incomplete (restore_point INTEGER NOT NULL, snapshot TEXT NOT NULL, phase TEXT NOT NULL CHECK(phase IN ('loading','verify')), verification TEXT NOT NULL);
+   INSERT INTO _velmora_import_incomplete VALUES ($since_ms, '$snapshot_sql', 'loading', '$plan_sql');" \
+  "$@" || die "could not mark the target as incomplete, see $marker_log"
 batch=0
 while IFS=$'\t' read -r file bytes sha256; do
   [[ $file =~ ^batch-[0-9]{8}\.sql$ ]] || die 'invalid batch file name in split manifest'
@@ -229,32 +297,15 @@ while IFS=$'\t' read -r file bytes sha256; do
   if [[ ${actual_sha%% *} != "$sha256" || $(( $(wc -c <"$path") )) != "$bytes" ]]; then
     die "batch $batch failed its pre-load checksum; if any batch was loaded, the target holds a partial load and must be deleted and recreated before retry"
   fi
-  "$wrangler" d1 execute "$target" --remote --yes --file "$path" "$@" </dev/null >"$load_log" 2>&1 ||
+  catalog_logged "$load_log" "$wrangler" d1 execute "$target" --remote --yes --file "$path" "$@" ||
     die "batch $batch failed, see $load_log; the target may hold a partial load and must be deleted and recreated before retry"
   batch=$((batch + 1))
 done <"$WORK/batches.tsv"
 
-if [[ ${VELMORA_IMPORT_SKIP_ROW_COUNTS:-} == yes ]]; then
-  echo 'catalog-import: WARNING skipping restored table row counts (VELMORA_IMPORT_SKIP_ROW_COUNTS=yes)' >&2
-else
-  jq -c '.tables[]' "$WORK/split.json" >"$WORK/rows.jsonl"
-  count_index=0
-  while IFS= read -r table_row; do
-    table=$(jq -er '.name' <<<"$table_row")
-    expected=$(jq -er '.expected' <<<"$table_row")
-    query=$(jq -er '.query' <<<"$table_row")
-    row_log="$LOG_DIR/d1-row-count-$count_index.log"
-    "$wrangler" d1 execute "$target" --remote --json --command "$query" "$@" \
-      </dev/null >"$WORK/rows.json" 2>"$row_log" || die "could not count rows in $table, see $row_log"
-    found=$(jq -er '.[0].results[0].n | select(type == "number" and . >= 0 and floor == .)' \
-      "$WORK/rows.json" 2>>"$row_log") || die "invalid row count for $table, see $row_log"
-    printf 'catalog-import: row count for %s: expected %s, found %s\n' "$table" "$expected" "$found"
-    [[ $found == "$expected" ]] || die "row count for $table: expected $expected, found $found; restore not verified"
-    count_index=$((count_index + 1))
-  done <"$WORK/rows.jsonl"
-fi
-clear_log="$LOG_DIR/d1-clear-import-marker.log"
-"$wrangler" d1 execute "$target" --remote --json --command 'DROP TABLE _velmora_import_incomplete' \
-  "$@" </dev/null >"$clear_log" 2>&1 || die "could not clear the import marker, see $clear_log"
+phase_log="$LOG_DIR/d1-verification-phase.log"
+catalog_logged "$phase_log" "$wrangler" d1 execute "$target" --remote --json --command \
+  "UPDATE _velmora_import_incomplete SET phase='verify' WHERE phase='loading'" \
+  "$@" || die "could not record that all batches loaded, see $phase_log"
+verify_target "$verification_plan" "$@"
 printf 'catalog-import: loaded %s bytes into %s from restore point %s\n' "$loaded_bytes" "$target" "$since_ms"
 echo 'catalog-import: next: migrations apply, then ops/restore-arm.sql (README, Restore step 2)'

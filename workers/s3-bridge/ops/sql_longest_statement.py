@@ -158,12 +158,76 @@ class BatchWriter:
         self.batch["bytes"] = size
         self.batch["statement_count"] += 1
 
-    def data_room(self, needed):
+    def room(self, needed):
         if needed + self.header_size > self.cap:
-            raise ValueError("a data statement exceeds VELMORA_IMPORT_BATCH_BYTES with the PRAGMA header")
+            raise ValueError("a statement exceeds VELMORA_IMPORT_BATCH_BYTES with the PRAGMA header")
         if self.file is None or self.batch["bytes"] + needed > self.cap:
             self.finish()
             self.start()
+
+
+def sql_identifier(name):
+    if not isinstance(name, str) or not name or "\0" in name:
+        raise ValueError("invalid verification identifier")
+    return '"' + name.replace('"', '""') + '"'
+
+
+def verification_keys(conn, name, without_rowid):
+    if without_rowid:
+        index, = conn.execute("SELECT name FROM pragma_index_list(?) WHERE origin='pk'", (name,)).fetchone()
+        keys = conn.execute('SELECT name, "desc", coll FROM pragma_index_xinfo(?) WHERE key=1 ORDER BY seqno',
+                            (index,)).fetchall()
+        if keys and all(desc == 0 and coll.upper() == "BINARY" for _, desc, coll in keys):
+            return [key for key, _, _ in keys]
+    else:
+        columns = {column.lower() for (column,) in conn.execute("SELECT name FROM pragma_table_xinfo(?)", (name,))}
+        for alias in ("rowid", "_rowid_", "oid"):
+            if alias not in columns:
+                return [alias]
+    raise ValueError(f"cannot verify {name} with an indexed rowid or ascending binary primary key")
+
+
+VERIFY_PAGE_SIZE = 5000
+
+
+def cursor_literal(value):
+    if not isinstance(value, list) or len(value) != 2 or not all(isinstance(part, str) for part in value):
+        raise ValueError("invalid verification cursor")
+    kind, raw = value
+    if kind in ("text", "blob") and re.fullmatch(r"(?:[A-F0-9]{2})*", raw):
+        encoded = f"X'{raw}'"
+        return f"CAST({encoded} AS TEXT)" if kind == "text" else encoded
+    if kind == "integer" and re.fullmatch(r"-?[0-9]{1,19}", raw):
+        return raw
+    if kind == "real" and re.fullmatch(r"-?[0-9]+(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?", raw):
+        return raw
+    raise ValueError("invalid verification cursor value")
+
+
+def verification_query(plan, cursor):
+    table = sql_identifier(plan["name"])
+    names = plan["keys"]
+    if not isinstance(names, list) or not names:
+        raise ValueError("missing verification keys")
+    keys = [sql_identifier(key) for key in names]
+    aliases = [f"key_{idx}" for idx in range(len(keys))]
+    order = ", ".join(keys)
+    select = ", ".join(f"{key} AS {alias}" for key, alias in zip(keys, aliases))
+    where = ""
+    if cursor is not None:
+        if not isinstance(cursor, list) or len(cursor) != len(keys):
+            raise ValueError("verification cursor does not match key columns")
+        literals = ", ".join(map(cursor_literal, cursor))
+        where = f" WHERE ({order}) > ({literals})"
+    # materialized bounds all reads from the source table, including the
+    # lookup of the last key. Keep below the per-query 10k-row budget.
+    desc = ", ".join(f"{alias} DESC" for alias in aliases)
+    encode = ", ".join(
+        f"json_array(typeof({alias}), CASE WHEN typeof({alias}) IN ('text','blob') "
+        f"THEN hex({alias}) ELSE quote({alias}) END)" for alias in aliases)
+    return (f"WITH page AS MATERIALIZED (SELECT {select} FROM {table}{where} "
+            f"ORDER BY {order} LIMIT {VERIFY_PAGE_SIZE}) "
+            f"SELECT COUNT(1) AS n, (SELECT json_array({encode}) FROM page ORDER BY {desc} LIMIT 1) AS cursor FROM page")
 
 
 def split_dump(path, directory, cap, limit, discard_staged_sql=False):
@@ -235,6 +299,8 @@ def split_dump(path, directory, cap, limit, discard_staged_sql=False):
         unknown = foreign[key] - table_names.keys()
         if unknown:
             raise ValueError(f"foreign key in {name} names an unknown table: {', '.join(sorted(unknown))}")
+    rowidless = {row[1] for row in conn.execute("PRAGMA table_list") if row[0] == "main" and row[4]}
+    verify_keys = {key: verification_keys(conn, name, name in rowidless) for key, name in table_names.items()}
     conn.close()
     order = tuple(TopologicalSorter({k: sorted(v - {k}) for k, v in foreign.items()}).static_order())
     for key in order:
@@ -256,8 +322,8 @@ def split_dump(path, directory, cap, limit, discard_staged_sql=False):
     # in all other batches, without counting them again in the split proof.
     for _ in replay(header):
         pass
-    writer.start()
     for statement in replay(schema):
+        writer.room(len(statement))
         writer.write(statement)
     writer.finish()
     for key in order:
@@ -265,16 +331,15 @@ def split_dump(path, directory, cap, limit, discard_staged_sql=False):
         if group not in paths:
             continue
         if key in foreign[key]:
-            writer.data_room(sources[group].size)
+            writer.room(sources[group].size)
         for statement in replay(group):
-            writer.data_room(len(statement))
+            writer.room(len(statement))
             writer.write(statement)
     writer.finish()
-    if sources[final].count:
-        writer.start()
-        for statement in replay(final):
-            writer.write(statement)
-        writer.finish()
+    for statement in replay(final):
+        writer.room(len(statement))
+        writer.write(statement)
+    writer.finish()
 
     if any(source.signature() != copied[group].signature() for group, source in sources.items()):
         raise ValueError("split proof failed: statement count, byte count or digest mismatch")
@@ -282,8 +347,7 @@ def split_dump(path, directory, cap, limit, discard_staged_sql=False):
     if (sum(b["statement_count"] for b in writer.batches) != total.count + headers_repeated * sources[header].count
         or sum(b["bytes"] for b in writer.batches) != total.size + headers_repeated * sources[header].size):
         raise ValueError("split proof failed: batch totals did not match the dump")
-    rows = [dict(name=table_names[key], expected=sources[("table", key)].count,
-                 query='SELECT count(*) AS n FROM "' + table_names[key].replace('"', '""') + '"')
+    rows = [dict(name=table_names[key], expected=sources[("table", key)].count, keys=verify_keys[key])
             for key in order]
     paths[header].unlink()
     paths[final].unlink(missing_ok=True)
@@ -292,7 +356,12 @@ def split_dump(path, directory, cap, limit, discard_staged_sql=False):
 
 
 if __name__ == "__main__":
-    if sys.argv[1] == "split":
+    if sys.argv[1] == "page":
+        try:
+            print(verification_query(json.loads(sys.argv[2]), json.loads(sys.argv[3])))
+        except (ValueError, KeyError, TypeError):
+            raise SystemExit("could not construct bounded verification query") from None
+    elif sys.argv[1] == "split":
         try:
             split_dump(sys.argv[2], sys.argv[3], int(sys.argv[4]), int(sys.argv[5]),
                        discard_staged_sql=sys.argv[6:] == ["--discard-staged-sql"])

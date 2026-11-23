@@ -82,13 +82,14 @@ get() {
     rclone copyto "$remote:$BUCKET/$key" "$out" --ignore-times </dev/null
   else
     "$wrangler" r2 object get "$BUCKET/$key" --file "$out" --remote "$@" </dev/null
-  fi >"$log" 2>&1
+  fi 2>&1 | catalog_redact_log >"$log"
 }
 
 check_log="$LOG_DIR/manifest.check.log"
 if [[ -n $remote ]]; then
-  listing=$(rclone lsf "$remote:$BUCKET/$manifest" </dev/null 2>"$check_log") ||
+  catalog_capture "$WORK/listing" "$check_log" rclone lsf "$remote:$BUCKET/$manifest" ||
     catalog_error "could not check $BUCKET/$manifest, see $check_log"
+  listing=$(<"$WORK/listing")
 elif get "$manifest" "$WORK/existing.json" "$check_log" "$@"; then
   listing=$manifest
 # Any 404 means there is no readable manifest at this key with these
@@ -106,14 +107,14 @@ fi
 
 file="$WORK/catalog.sql"
 export_log="$LOG_DIR/d1-export.log"
-"$wrangler" d1 export "$DB" --remote --output "$file" "$@" </dev/null >"$export_log" 2>&1 ||
+catalog_logged "$export_log" "$wrangler" d1 export "$DB" --remote --output "$file" "$@" ||
   catalog_error "wrangler d1 export failed, see $export_log"
 [[ -s $file ]] || catalog_error "the export is empty, see $export_log"
 sql_bytes=$(( $(wc -c <"$file") ))
 grep -q 'CREATE TABLE' "$file" || { echo "catalog-export: the export has no schema" >&2; exit 1; }
 catalog_longest_statement_bytes=$(catalog_check_sql_statements "$file")
 info_log="$LOG_DIR/d1-info.log"
-"$wrangler" d1 info "$DB" --json "$@" </dev/null >"$WORK/info.json" 2>"$info_log" ||
+catalog_capture "$WORK/info.json" "$info_log" "$wrangler" d1 info "$DB" --json "$@" ||
   catalog_error "could not read D1 database size for $DB, see $info_log"
 database_size=$(jq -er '(.database_size // .file_size) |
   select(type == "number" and . >= 0 and . < 1000000000000 and floor == .)' \
@@ -130,7 +131,7 @@ put() {
   else
     "$wrangler" r2 object put "$BUCKET/$key" --file "$path" --remote \
       --content-type "$type" "$@" </dev/null
-  fi >"$log" 2>&1 || catalog_error "put of $key failed, see $log"
+  fi 2>&1 | catalog_redact_log >"$log" || catalog_error "put of $key failed, see $log"
 }
 
 zstd -q -T0 -10 "$file" -o "$file.zst"

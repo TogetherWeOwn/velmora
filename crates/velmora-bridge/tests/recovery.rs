@@ -1612,15 +1612,23 @@ async fn restore_route_refuses_to_replay_an_incomplete_import() {
     cfg.maintenance = Maintenance::Restore;
     let restoring = rig_with(NoNntp, cfg);
     restoring.bridge.catalog.sql.with_conn(|c| {
-        c.execute_batch("CREATE TABLE _velmora_import_incomplete (restore_point INTEGER NOT NULL)")
-            .unwrap();
+        c.execute_batch(
+            "CREATE TABLE _velmora_import_incomplete (phase TEXT NOT NULL);\n             INSERT INTO _velmora_import_incomplete VALUES ('loading')",
+        )
+        .unwrap();
     });
     let before = restore_state(&restoring);
     let body = json!({ "since_ms": 0 });
-    let refused = admin(&restoring, "/restore", body.clone()).await;
-    refused.expect(409);
-    assert!(refused.text().contains("CatalogueImportIncomplete"));
-    assert_eq!(restore_state(&restoring), before);
+    for phase in ["loading", "verify"] {
+        restoring.bridge.catalog.sql.with_conn(|c| {
+            c.execute("UPDATE _velmora_import_incomplete SET phase = ?1", [phase])
+                .unwrap();
+        });
+        let refused = admin(&restoring, "/restore", body.clone()).await;
+        refused.expect(409);
+        assert!(refused.text().contains("CatalogueImportIncomplete"));
+        assert_eq!(restore_state(&restoring), before);
+    }
 
     restoring.bridge.catalog.sql.with_conn(|c| {
         c.execute_batch("DROP TABLE _velmora_import_incomplete")
