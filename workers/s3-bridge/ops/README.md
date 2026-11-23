@@ -1815,6 +1815,30 @@ too, so these points show how much is read from Usenet over time; they
 are not a hit rate and are not to be subtracted from the GET count. No
 bucket, key, query, header, ID, IP address or token is written.
 
+### Sampled queue attempts
+
+`JOB_METRICS_SAMPLE` controls `job` points on `METRICS`: `8` by default,
+`1` for every claimed attempt, or `0` to turn them off. Early wakes,
+duplicate deliveries that claim nothing, and abandoned attempts emit no
+point. A verify attempt that reaches the repair read is labeled `repost`
+instead of emitting a second point. This does not change queue decisions
+or permit admission.
+
+- `blob1`–`blob6`: `job.v1`, job kind, outcome, extent size class, queue lane,
+  and `-` (queue events do not supply a trusted colo). All are fixed labels.
+- `double1`–`double3`: sampling weight, logical extent bytes, total attempt ms.
+- `double4`–`double9`: ms to first permit, total sleep ms while polling for a
+  slot, R2 load ms, connect ms, wire-phase ms, and catalogue advance ms.
+  These phases need not be disjoint. A phase not reached is zero.
+- `double10`–`double13`: peak permits held at once, sockets wanted, articles,
+  and ms from the first grant to the last observed release.
+- `double14`–`double20`: decoded payload bytes offered in `POST` calls to
+  configured IDs `p1`–`p7`, including repeat sends. No provider ID is written
+  as text, and nothing is attributed to other IDs.
+
+To estimate claimed attempts, filter `index1 = 'job'` and sum
+`_sample_interval * double1`; for byte totals, also multiply by `double2`.
+
 ### S3 failure stages
 
 Workers Analytics (GraphQL) can show HTTP status counts, including

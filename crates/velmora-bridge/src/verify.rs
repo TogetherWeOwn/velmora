@@ -551,6 +551,7 @@ where
             let asked = usable.len();
             let mut refused = false;
             for provider in usable {
+                crate::trace::job_note(|t| t.ask(self.clock.now(), 1));
                 let opened = ProviderSession::open(
                     &self.catalog,
                     &self.nntp,
@@ -566,6 +567,12 @@ where
                 }) else {
                     continue;
                 };
+                let started = crate::trace::job_note(|t| {
+                    t.articles = t
+                        .articles
+                        .max(u32::try_from(plan.len()).unwrap_or(u32::MAX));
+                    (self.clock.now(), t.connect_ms)
+                });
                 let tally = match kind {
                     VerifyKind::Body | VerifyKind::Sampled => {
                         read_articles(&mut session, Some(lease), &rows, |_, _| {}).await
@@ -581,6 +588,12 @@ where
                         ask_articles_together(&mut session, Some(lease), &rows, how).await
                     }
                 };
+                if let Some((started, connected_before)) = started {
+                    crate::trace::job_note(|t| {
+                        let elapsed = crate::trace::elapsed(started, self.clock.now());
+                        t.wire_ms += elapsed.saturating_sub(t.connect_ms - connected_before);
+                    });
+                }
                 session.close().await;
                 match tally {
                     // The provider refused the account: the next one of the
@@ -650,11 +663,10 @@ where
     }
 
     async fn advance(&self, lease: &Lease, to: OutboxStage, next_at: UnixMs) -> Staged<()> {
-        match self
-            .catalog
-            .advance(lease, to, next_at, self.clock.now())
-            .await?
-        {
+        let now = self.clock.now();
+        let advanced = self.catalog.advance(lease, to, next_at, now).await;
+        crate::trace::job_note(|t| t.advance_ms += crate::trace::elapsed(now, self.clock.now()));
+        match advanced? {
             true => Ok(()),
             false => Err(Stop::Fenced),
         }
@@ -1319,15 +1331,16 @@ where
             None => {
                 self.catalog
                     .begin_release(lease, required, &labels, &evidence, at)
-                    .await?
+                    .await
             }
             Some(_) => {
                 self.catalog
                     .begin_release_light(lease, required, &labels, &evidence, at, need_full)
-                    .await?
+                    .await
             }
         };
-        match begun {
+        crate::trace::job_note(|t| t.advance_ms += crate::trace::elapsed(at, self.clock.now()));
+        match begun? {
             Guard::Applied(()) => self.finish_release(lease, extent).await,
             // The lease is gone or a newer result cancelled a pass. If the
             // lease still holds, the job comes back and reads again.
@@ -1347,7 +1360,10 @@ where
     /// ([`Catalog::begin_release`] applied under `lease`): the safety
     /// copy becomes evictable. Nothing is deleted here.
     async fn finish_release(&self, lease: &Lease, _extent: &ExtentRow) -> Staged<()> {
-        match self.catalog.finish_release(lease, self.clock.now()).await? {
+        let at = self.clock.now();
+        let finished = self.catalog.finish_release(lease, at).await;
+        crate::trace::job_note(|t| t.advance_ms += crate::trace::elapsed(at, self.clock.now()));
+        match finished? {
             true => Ok(()),
             false => Err(Stop::Fenced),
         }

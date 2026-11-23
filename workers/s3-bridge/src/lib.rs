@@ -285,6 +285,22 @@ async fn queue(batch: MessageBatch<serde_json::Value>, env: Env, _ctx: Context) 
             return Err(worker::Error::RustError("config refused".into()));
         }
     };
+    use velmora_bridge::metrics::{job_sample, job_weight};
+    let sample = if metrics::bind(&env) {
+        job_sample(
+            env.var("JOB_METRICS_SAMPLE")
+                .ok()
+                .map(|v| v.to_string())
+                .as_deref(),
+        )
+    } else {
+        0
+    };
+    let queue = if sample > 0 {
+        batch.queue()
+    } else {
+        String::new()
+    };
     log_budget(&bridge);
     for msg in batch.messages()? {
         let Ok(job) = serde_json::from_value::<Job>(msg.body().clone()) else {
@@ -304,7 +320,14 @@ async fn queue(batch: MessageBatch<serde_json::Value>, env: Env, _ctx: Context) 
                     JobOutcome::Ack
                 }
             }
-            _ => run_in_table(&bridge, &job).await,
+            _ => {
+                let observation = match (job.extent(), sample) {
+                    (None, _) | (_, 0) => None,
+                    (Some(_), 1) => Some((queue.clone(), 1)),
+                    (Some(_), n) => job_weight(n, &msg.id()).map(|w| (queue.clone(), w)),
+                };
+                run_in_table(&bridge, &job, observation).await
+            }
         };
         log_post_trace(&job, &outcome);
         plan_hint(&env, &bridge, &job, &outcome).await;
@@ -327,7 +350,11 @@ async fn queue(batch: MessageBatch<serde_json::Value>, env: Env, _ctx: Context) 
 /// Runs a job in the isolate's job table, where a later invocation can
 /// drop it should this one be cancelled: a cancelled invocation is not
 /// dropped, and the job would keep its bytes of the budget (`jobs`).
-async fn run_in_table(bridge: &Rc<env::WorkerBridge>, job: &Job) -> JobOutcome {
+async fn run_in_table(
+    bridge: &Rc<env::WorkerBridge>,
+    job: &Job,
+    observation: Option<(String, u32)>,
+) -> JobOutcome {
     let now = velmora_bridge::ports::Clock::now(&bridge.clock);
     // A wake that is due runs its stage too.
     let post = matches!(
@@ -341,7 +368,18 @@ async fn run_in_table(bridge: &Rc<env::WorkerBridge>, job: &Job) -> JobOutcome {
         }
     );
     let (b, j) = (Rc::clone(bridge), job.clone());
-    match jobs::run(now, post, async move { b.run_job(&j).await }).await {
+    let attempt = async move {
+        let run = b.run_job(&j);
+        let Some((queue, weight)) = observation else {
+            return run.await;
+        };
+        let (outcome, trace) = velmora_bridge::trace::observe_job(&b.clock, run).await;
+        if let Some(point) = velmora_bridge::metrics::job_point(&trace, &queue, weight) {
+            metrics::write(&point);
+        }
+        outcome
+    };
+    match jobs::run(now, post, attempt).await {
         Some(outcome) => outcome,
         // `jobs::run` has logged it.
         None => JobOutcome::Retry {

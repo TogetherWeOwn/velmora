@@ -33,9 +33,11 @@ pub fn next() -> u64 {
 }
 
 /// Looks the binding up, once per request: it costs no I/O.
-pub fn bind(env: &Env) {
+pub fn bind(env: &Env) -> bool {
     let dataset = env.analytics_engine(BINDING).ok();
+    let bound = dataset.is_some();
     DATASET.with(|d| *d.borrow_mut() = dataset);
+    bound
 }
 
 /// Writes one point. A write is buffered by the runtime and never

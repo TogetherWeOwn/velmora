@@ -1059,6 +1059,51 @@ fn bare(id: &str) -> String {
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "current_thread")]
+async fn sampled_job_points_follow_the_fake_nntp_post_verify_release() {
+    use velmora_bridge::{metrics::job_point, trace::observe_job};
+
+    let rig = Rig::new().await;
+    let step = "sampled queue attempts";
+    rig.setup_buckets_and_key(step).await;
+    let body = test_bytes(31, MIB);
+    expect_status(
+        step,
+        "PUT",
+        200,
+        &rig.put("/slice/private-key", &body).await,
+    );
+    let bridge = &rig.bridge;
+    for (kind, queue, lane) in [
+        ("post", "velmora-post-dev", "post1"),
+        ("verify", "velmora-verify-dev", "verify1"),
+        ("release", "velmora-verify-dev", "verify1"),
+    ] {
+        let mut sent = bridge.jobs.take();
+        assert_eq!(sent.len(), 1, "{kind} should have one delivery");
+        let sent = sent.remove(0);
+        bridge.clock.advance_secs(sent.delay_secs);
+        let (outcome, trace) = observe_job(&bridge.clock, bridge.run_job(&sent.job)).await;
+        assert_eq!(outcome, JobOutcome::Ack);
+        let point = job_point(&trace, queue, 1).expect("finished claim");
+        assert_eq!(
+            point.analytics_blobs().collect::<Vec<_>>(),
+            ["job.v1", kind, "ok", "le_1gib", lane, "-"]
+        );
+        assert_eq!(point.doubles[1], body.len() as f64);
+        assert!(point.doubles[9] >= 1.0 && point.doubles[9] <= point.doubles[10]);
+        assert!(point.doubles[11] >= 1.0);
+        assert_eq!(
+            &point.doubles[13..],
+            &[0.0; 7],
+            "fake provider ids must not appear"
+        );
+        let (duplicate, trace) = observe_job(&bridge.clock, bridge.run_job(&sent.job)).await;
+        assert_eq!(duplicate, JobOutcome::Ack);
+        assert!(job_point(&trace, queue, 1).is_none());
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn slice_acceptance() {
     let rig = Rig::new().await;
     let small = test_bytes(1, MIB);

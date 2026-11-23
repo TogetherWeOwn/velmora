@@ -205,6 +205,9 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ProviderSession<'a, C, N, T> {
         let permit = catalog
             .acquire_permit(provider, class, holder, asked)
             .await?;
+        if permit.is_some() {
+            crate::trace::job_note(|t| t.permit(clock.now(), true));
+        }
         Ok(permit.map(|permit| ProviderSession {
             catalog,
             nntp,
@@ -339,7 +342,18 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ProviderSession<'a, C, N, T> {
     /// so the caller does not reconnect and goes on to another provider.
     pub(crate) async fn session(&mut self) -> core::result::Result<&mut N::Session, Stop> {
         if self.session.is_none() {
-            let session = match self.nntp.connect(self.provider, &self.permit).await {
+            // Initial post connects already have a wall-clock batch timer.
+            let started = crate::trace::job_note(|t| {
+                (t.kind != Some(crate::trace::JobKind::Post)).then(|| self.clock.now())
+            })
+            .flatten();
+            let connected = self.nntp.connect(self.provider, &self.permit).await;
+            if let Some(started) = started {
+                crate::trace::job_note(|t| {
+                    t.connect_ms += crate::trace::elapsed(started, self.clock.now());
+                });
+            }
+            let session = match connected {
                 Ok(session) => session,
                 Err(e) => {
                     return Err(match refusal(&e) {
@@ -458,6 +472,9 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ProviderSession<'a, C, N, T> {
         }
         // A failed release is safe: the permit expires on its own.
         self.freed = self.catalog.release_permit(&self.permit).await.is_ok();
+        if self.freed {
+            crate::trace::job_note(|t| t.released(self.clock.now()));
+        }
         self.health
     }
 }
