@@ -1,7 +1,8 @@
 //! Recover into a caller-controlled directory with one writer and no clobber.
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
+    ffi::OsString,
     fs::{self, File, OpenOptions},
     io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
@@ -250,6 +251,7 @@ pub struct OutputRoot {
     marks: BTreeSet<Mark>,
     report: Option<File>,
     report_rows: BTreeSet<Vec<u8>>,
+    directory_names: BTreeMap<PathBuf, BTreeSet<OsString>>,
 }
 
 impl OutputRoot {
@@ -277,7 +279,56 @@ impl OutputRoot {
             marks,
             report: None,
             report_rows: BTreeSet::new(),
+            directory_names: BTreeMap::new(),
         })
+    }
+
+    /// Metadata can resolve a differently spelled entry on a case-folding
+    /// or Unicode-normalizing filesystem. Accept only its exact stored name.
+    fn exact_name(&mut self, path: &Path) -> io::Result<bool> {
+        let parent = path
+            .parent()
+            .ok_or_else(|| invalid("missing output parent"))?;
+        let leaf = path
+            .file_name()
+            .ok_or_else(|| invalid("missing output name"))?;
+        if !self.directory_names.contains_key(parent) {
+            let entries: BTreeSet<_> = fs::read_dir(parent)?
+                .map(|r| r.map(|e| e.file_name()))
+                .collect::<io::Result<_>>()?;
+            self.directory_names.insert(parent.to_path_buf(), entries);
+        }
+        Ok(self.directory_names[parent].contains(leaf))
+    }
+
+    fn remember_name(&mut self, path: &Path) {
+        if let (Some(parent), Some(name)) = (path.parent(), path.file_name()) {
+            if let Some(entries) = self.directory_names.get_mut(parent) {
+                entries.insert(name.to_owned());
+            }
+        }
+    }
+
+    fn direct_path(&mut self, bucket: &str, key: &str) -> io::Result<Option<PathBuf>> {
+        if !normal_component(bucket)
+            || [PARTS, JOURNAL, UNMAPPED]
+                .iter()
+                .any(|s| bucket.eq_ignore_ascii_case(s))
+            || !key.split('/').all(normal_component)
+        {
+            return Ok(None);
+        }
+        let mut path = self.root.join(bucket);
+        for component in key.split('/') {
+            match metadata(&path)? {
+                Some(m) if m.is_dir() && self.exact_name(&path)? => (),
+                Some(_) => return Ok(None),
+                None if private_dir(&path)? => self.remember_name(&path),
+                None => return Ok(None),
+            }
+            path.push(component);
+        }
+        Ok(Some(path))
     }
 
     pub fn object<'s, 'a>(&'s mut self, check: ObjectCheck<'a>) -> io::Result<Output<'s, 'a>> {
@@ -303,11 +354,11 @@ impl OutputRoot {
             .root
             .join(PARTS)
             .join(format!("{}.part", sha_hex(&generation)));
-        let (dest, done, unmapped) = match direct_path(&self.root, check.bucket, check.key)? {
+        let (dest, done, unmapped) = match self.direct_path(check.bucket, check.key)? {
             Some(dest) => match existing(&dest, &check)? {
-                Existing::Same(md5) => (dest, Some(md5), false),
+                Existing::Same(md5) if self.exact_name(&dest)? => (dest, Some(md5), false),
                 Existing::Absent => (dest, None, false),
-                Existing::Different => self.fallback(&check)?,
+                Existing::Same(_) | Existing::Different => self.fallback(&check)?,
             },
             None => self.fallback(&check)?,
         };
@@ -446,25 +497,6 @@ fn normal_component(s: &str) -> bool {
         }
     }
     true
-}
-
-fn direct_path(root: &Path, bucket: &str, key: &str) -> io::Result<Option<PathBuf>> {
-    if !normal_component(bucket)
-        || [PARTS, JOURNAL, UNMAPPED]
-            .iter()
-            .any(|s| bucket.eq_ignore_ascii_case(s))
-        || !key.split('/').all(normal_component)
-    {
-        return Ok(None);
-    }
-    let mut path = root.join(bucket);
-    for component in key.split('/') {
-        if !private_dir(&path)? {
-            return Ok(None);
-        }
-        path.push(component);
-    }
-    Ok(Some(path))
 }
 
 enum Existing {
@@ -627,6 +659,7 @@ impl Output<'_, '_> {
                 // interruption after the link is safe: reopen verifies the
                 // final file and then removes the leftover staging name.
                 fs::hard_link(&self.part_path, &self.dest)?;
+                self.session.remember_name(&self.dest);
                 md5
             }
         };

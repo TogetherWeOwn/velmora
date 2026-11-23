@@ -2,6 +2,7 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
+    ffi::{OsStr, OsString},
     fs::{self, File},
     io::{self, Read, Seek, SeekFrom},
     path::{Path, PathBuf},
@@ -323,8 +324,14 @@ struct Span {
     len: usize,
 }
 
+#[derive(Default)]
+struct FileGroup {
+    paths: Vec<PathBuf>,
+    names: BTreeMap<OsString, Vec<usize>>,
+}
+
 pub struct Downloads {
-    files: BTreeMap<u64, Vec<PathBuf>>,
+    files: BTreeMap<u64, FileGroup>,
     scanned: BTreeSet<Span>,
     indices: BTreeMap<(Span, [u8; 32]), PathBuf>,
 }
@@ -337,7 +344,7 @@ impl Downloads {
                 "download input is not a directory",
             ));
         }
-        let mut files: BTreeMap<u64, Vec<PathBuf>> = BTreeMap::new();
+        let mut files: BTreeMap<u64, FileGroup> = BTreeMap::new();
         let mut entries = 0;
         let mut todo = vec![(root.to_path_buf(), 0)];
         while let Some((dir, depth)) = todo.pop() {
@@ -352,10 +359,13 @@ impl Downloads {
                     todo.push((entry.path(), depth + 1));
                 }
                 if kind.is_file() {
-                    files
-                        .entry(entry.metadata()?.len())
+                    let group = files.entry(entry.metadata()?.len()).or_default();
+                    group
+                        .names
+                        .entry(entry.file_name())
                         .or_default()
-                        .push(entry.path());
+                        .push(group.paths.len());
+                    group.paths.push(entry.path());
                 }
             }
         }
@@ -381,13 +391,14 @@ impl Downloads {
     }
 
     fn find(&mut self, span: Span, article: &Article) -> Option<Vec<u8>> {
-        let paths = self.files.get(&span.size)?;
-        if let Some(name) = &article.yenc_name {
-            for path in paths
-                .iter()
-                .filter(|path| path.file_name().is_some_and(|f| f == name.as_str()))
-            {
-                if let Ok(bytes) = Self::read(path, span) {
+        let group = self.files.get(&span.size)?;
+        if let Some(names) = article
+            .yenc_name
+            .as_ref()
+            .and_then(|name| group.names.get(OsStr::new(name)))
+        {
+            for &index in names {
+                if let Ok(bytes) = Self::read(&group.paths[index], span) {
                     if sha256(&bytes) == article.sha256 {
                         return Some(bytes);
                     }
@@ -395,7 +406,7 @@ impl Downloads {
             }
         }
         if self.scanned.insert(span) {
-            for path in paths {
+            for path in &group.paths {
                 if let Ok(bytes) = Self::read(path, span) {
                     self.indices
                         .entry((span, sha256(&bytes)))

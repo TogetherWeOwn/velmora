@@ -76,6 +76,33 @@ async fn offline_payload_via_renamed_legacy_file_hash_not_iteration_order() {
     assert_eq!(result.unwrap(), b"def");
 }
 
+#[tokio::test]
+async fn equal_length_duplicates_with_the_same_download_name_use_the_digest() {
+    let root = std::env::temp_dir().join(format!("velmora-download-names-{}", std::process::id()));
+    std::fs::create_dir(&root).unwrap();
+    for (dir, bytes) in [("decoy", b"aaa"), ("correct", b"bbb")] {
+        std::fs::create_dir(root.join(dir)).unwrap();
+        std::fs::write(root.join(dir).join("opaque.bin"), bytes).unwrap();
+    }
+    let mut downloads = Downloads::open(&root).unwrap();
+    let article = Article {
+        message_id: "part@example.invalid".into(),
+        sha256: Sha256::digest(b"bbb").into(),
+        yenc_name: Some("opaque.bin".into()),
+        newsgroup: "alt.test".into(),
+    };
+    let place = Placement {
+        offset: 0,
+        len: 3,
+        total: 3,
+        number: 1,
+        parity: false,
+    };
+    let result = downloads.candidate(&article, place).await;
+    std::fs::remove_dir_all(root).unwrap();
+    assert_eq!(result.unwrap(), b"bbb");
+}
+
 #[test]
 fn refuses_config_errors_without_echoing_credential() {
     let config = b"[[providers]]\nhost='example.invalid'\ntls=false\nmax_conns=1\nuser='credential-canary'\npass='not-a-secret'";

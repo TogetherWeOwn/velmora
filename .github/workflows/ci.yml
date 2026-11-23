@@ -78,7 +78,8 @@ jobs:
           prefix-key: v1-rust
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo fmt --all -- --check
-      - run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      # Exercise the opt-in standalone CLI here without enabling it in deployment builds.
+      - run: cargo clippy --locked --workspace --all-targets --features velmora-recover/recovery-cli -- -D warnings
       # Reference PAR2 binary for the creator interop test
       # (`interop_repair_with_reference_binary_when_available`, which repairs
       # a creator-emitted set through the repair path and skips when no
@@ -100,8 +101,8 @@ jobs:
       # Every test of the workspace (what `cargo test --workspace` ran but
       # its doc-tests), then the doc-tests. --no-tests=fail: a run that
       # finds no test fails.
-      - run: cargo nextest run --locked --workspace --no-fail-fast --no-tests=fail
-      - run: cargo test --locked --workspace --doc
+      - run: cargo nextest run --locked --workspace --features velmora-recover/recovery-cli --no-fail-fast --no-tests=fail
+      - run: cargo test --locked --workspace --features velmora-recover/recovery-cli --doc
       # The local benchmark's report: its native-vs-replay rows-written check.
       - run: python3 -I -m unittest discover -s bench -p 'test_*.py'
 

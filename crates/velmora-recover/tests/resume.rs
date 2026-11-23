@@ -223,6 +223,43 @@ fn unmapped_report_does_not_collide_with_bucket_names() {
 }
 
 #[test]
+fn case_variants_with_equal_bytes_keep_distinct_recovery_paths() {
+    let root = Scratch::new();
+    let mut session = new_session(&root.0);
+    let checks = [extent(0, FIRST)];
+    let check = |key, generation| ObjectCheck {
+        bucket: "bucket",
+        key,
+        generation,
+        size: FIRST.len() as u64,
+        md5: None,
+        extents: &checks,
+    };
+    let mut first = session.object(check("Photo.jpg", "a")).unwrap();
+    first.write_verified(0, FIRST).unwrap();
+    let first_path = first.path().to_owned();
+    first.finish().unwrap();
+    let aliases = root.0.join("bucket/photo.jpg").exists();
+    let mut second = session.object(check("photo.jpg", "b")).unwrap();
+    assert_eq!(second.is_unmapped(), aliases);
+    let second_path = second.path().to_owned();
+    second.write_verified(0, FIRST).unwrap();
+    second.finish().unwrap();
+    assert_ne!(first_path, second_path);
+    if aliases {
+        assert!(
+            fs::read_to_string(root.0.join("_unmapped/_report/INDEX.tsv"))
+                .unwrap()
+                .contains("\tphoto.jpg\t")
+        );
+    }
+    let first_again = session.object(check("Photo.jpg", "a")).unwrap();
+    assert!(!first_again.is_unmapped());
+    assert_eq!(first_again.path(), first_path);
+    first_again.finish().unwrap();
+}
+
+#[test]
 fn refuses_second_writer_until_lock_is_released() {
     let root = Scratch::new();
     let first = OutputRoot::open(&root.0).unwrap();
