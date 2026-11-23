@@ -323,12 +323,13 @@ older Worker cannot enforce it on a direct replay call.
      database and set `VELMORA_IMPORT_DATABASE_ID` to its UUID from
      `wrangler d1 info <new db> --json` (use the same Wrangler config and
      environment as the import). Export `CLOUDFLARE_ACCOUNT_ID` for the target
-     account and supply Wrangler credentials in the shell environment if
-     needed. Run `ops/catalog-import.sh <new db> <restore point>`.
+     account. Run `ops/catalog-import.sh <new db> <restore point>`.
      The script resolves the supplied name or binding with the operator's
      config and checks the UUID. It then confirms the same UUID and name in
      `CLOUDFLARE_ACCOUNT_ID` and pins every subsequent D1 call to that account
      and UUID with a private config containing no database names or bindings.
+     The pinned calls retain the shell credentials and explicit `--profile`
+     and `--env-file` (use absolute paths with `--cwd`), not `--env`.
      A production catalogue also requires `VELMORA_IMPORT_PRODUCTION=yes`.
      The export carries the schema and the list of applied migrations, so
      apply migrations after loading it. Do not run against production without

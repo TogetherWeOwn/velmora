@@ -118,10 +118,36 @@ require_disk() {
     die "insufficient local disk space: needs at least $needed bytes, $available available in $WORK"
 }
 
-# No operator config, env selector, or bindings are forwarded to D1 after
-# confirmation. The UUID must be resolved as an ID in the checked account.
+# Preserve explicitly selected credentials, not the operator's routing flags.
+select_d1_auth_args() {
+  d1_auth_args=()
+  while (( $# )); do
+    local arg=$1
+    shift
+    case $arg in
+      --) break ;;
+      --profile|--profile=*)
+        if [[ $arg == --profile ]]; then
+          [[ -n ${1-} && $1 != -* ]] || die '--profile requires a value'
+          arg="--profile=$1"
+          shift
+        fi
+        d1_auth_args+=("$arg") ;;
+      --env-file|--env-file=*)
+        if [[ $arg == *=* ]]; then
+          d1_auth_args+=("$arg")
+        fi
+        # Wrangler's env-file option accepts multiple values in order.
+        while [[ -n ${1-} && $1 != -* ]]; do
+          d1_auth_args+=("--env-file=$1")
+          shift
+        done ;;
+    esac
+  done
+}
+
 execute_on_target() {
-  "$wrangler" d1 execute "$resolved_id" --remote --config "$execution_config" "$@"
+  "$wrangler" d1 execute "$resolved_id" --remote --config "$execution_config" "${d1_auth_args[@]}" "$@"
 }
 
 verify_target() {
@@ -196,9 +222,10 @@ catalog_lock import "$resolved_id" "${resolved_id,,}"
 # confirm the target via the same account-scoped path used for every load.
 execution_config="$WORK/execution.json"
 printf '{"account_id":"%s"}\n' "$account_id" >"$execution_config"
+select_d1_auth_args "$@"
 account_log="$LOG_DIR/d1-confirm-account.log"
 if ! catalog_capture "$WORK/info.json" "$account_log" "$wrangler" d1 info "$resolved_id" \
-     --json --config "$execution_config" ||
+     --json --config "$execution_config" "${d1_auth_args[@]}" ||
    ! confirmed=$(read_target_info "$account_log") || [[ $confirmed != "$resolved" ]]; then
   die "the confirmed database is not in account $account_id, see $account_log"
 fi

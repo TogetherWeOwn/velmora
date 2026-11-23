@@ -264,8 +264,8 @@ else:
 """
 
 
-class D1Loopback(BaseHTTPRequestHandler):
-    """Only the D1 and analytics endpoints used by the pinned Wrangler."""
+class CatalogueLoopback(BaseHTTPRequestHandler):
+    """Only the D1, R2 and analytics endpoints used by the pinned Wrangler."""
 
     def log_message(self, *_):
         pass
@@ -281,6 +281,20 @@ class D1Loopback(BaseHTTPRequestHandler):
     def handle_d1(self):
         body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))) or b"{}")
         path = self.path.split("?", 1)[0]
+        if self.headers.get("Authorization") != "Bearer loopback-test-token":
+            return self.reply({"success": False, "errors": [{"code": 10000, "message": "authentication required"}]}, 401)
+        r2_prefix = f"/client/v4/accounts/{ACCOUNT_ID}/r2/buckets/{BUCKET}/objects/"
+        if path.startswith(r2_prefix):
+            self.server.r2_requests.append(path)
+            data = self.server.r2_objects.get(path.removeprefix(r2_prefix))
+            if data is None:
+                return self.reply({"success": False, "errors": [{"code": 10007, "message": "object not found"}]}, 404)
+            assert self.command == "GET"
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+            return
         if path == "/client/v4/graphql":
             return self.reply({"data": {"viewer": {"accounts": []}}})
         self.server.requests.append((self.command, path, body))
@@ -849,7 +863,7 @@ class CatalogueScripts(unittest.TestCase):
         self.assertGreater(len(calls), 2)
         self.assertTrue(all(call[3:5] == ["execute", DATABASE_ID] for call in calls[2:]), calls)
 
-    def loopback_import(self, operator_account):
+    def loopback_import(self, operator_account, *, token_from_env_file=False):
         wrangler = ROOT / "node_modules" / ".bin" / "wrangler"
         self.assertTrue(wrangler.is_file(), "install pinned Wrangler with npm ci before running this suite")
         self.wrangler.unlink()
@@ -860,30 +874,48 @@ class CatalogueScripts(unittest.TestCase):
             {"binding": "TARGET", "database_name": "scratch-db", "database_id": DATABASE_ID},
             {"binding": "OTHER", "database_name": DATABASE_ID, "database_id": OTHER_DATABASE_ID},
         ]}))
-        path = self.object_path(f"d1/{SOURCE}/{MS}.sql")
-        path.parent.mkdir(parents=True)
-        path.write_text("CREATE TABLE fixture (value TEXT);\nINSERT INTO fixture VALUES ('one');\n")
-        with ThreadingHTTPServer(("127.0.0.1", 0), D1Loopback) as api:
+        args = ["--config", str(config)]
+        credentials = {}
+        if token_from_env_file:
+            auth_dir = work / "auth"
+            auth_dir.mkdir()
+            (auth_dir / "default.env").write_text("CLOUDFLARE_API_TOKEN=not-the-token\n")
+            (auth_dir / "selected.env").write_text("CLOUDFLARE_API_TOKEN=loopback-test-token\n")
+            args += [f"--env-file={auth_dir / 'default.env'}", "--env-file", str(auth_dir / "selected.env")]
+        else:
+            credentials["CLOUDFLARE_API_TOKEN"] = "loopback-test-token"
+        with ThreadingHTTPServer(("127.0.0.1", 0), CatalogueLoopback) as api:
             api.requests = []
             api.catalogue_accounts = {operator_account}
+            api.r2_requests = []
+            api.r2_objects = {f"d1/{SOURCE}/{MS}.sql": b"CREATE TABLE fixture (value TEXT);\n"
+                              b"INSERT INTO fixture VALUES ('one');\n"}
             thread = threading.Thread(target=api.serve_forever, daemon=True)
             thread.start()
             try:
                 # Isolate Wrangler from host credentials, profiles, proxies and metrics.
-                result = self.call_script("import", "TARGET", MS, wrangler_args=["--config", str(config)],
+                result = self.call_script("import", "TARGET", MS, wrangler_args=args,
                                           PATH=f"{work}{os.pathsep}{os.environ['PATH']}", HOME=str(work),
                                           CI="true", WRANGLER_SEND_METRICS="false", NO_PROXY="127.0.0.1",
-                                          CLOUDFLARE_API_TOKEN="loopback-test-token",
                                           CLOUDFLARE_API_BASE_URL=f"http://127.0.0.1:{api.server_port}/client/v4",
-                                          VELMORA_EXPORT_RCLONE_REMOTE="r2x")
+                                          **credentials)
             finally:
                 api.shutdown()
                 thread.join()
-            return result, api.requests
+            if result.returncode:
+                for log in sorted(work.glob("velmora-catalog-import-logs.*/*.log")):
+                    if log.stat().st_size:
+                        result.stderr += f"{log.name}: {log.read_text()}"
+            return result, api.requests, api.r2_requests
 
     def test_real_wrangler_uuid_name_collision_cannot_redirect_import(self):
-        result, requests = self.loopback_import(ACCOUNT_ID)
+        result, requests, r2_requests = self.loopback_import(ACCOUNT_ID)
         self.assertEqual(result.returncode, 0, result.stderr)
+        # Real Wrangler: the missing manifest's --pipe diagnostic permits the
+        # legacy fallback, and the SQL stream contains data rather than CLI logs.
+        prefix = f"/client/v4/accounts/{ACCOUNT_ID}/r2/buckets/{BUCKET}/objects/d1/{SOURCE}/{MS}"
+        self.assertEqual(r2_requests, [f"{prefix}.manifest.json", f"{prefix}.sql"])
+        self.assertIn("legacy export without a manifest", result.stdout)
         path = f"/client/v4/accounts/{ACCOUNT_ID}/d1/database/{DATABASE_ID}"
         self.assertEqual(requests[0][:2], ("GET", path))  # operator's TARGET binding
         self.assertTrue(all(url in (path, f"{path}/query", f"{path}/import") for _, url, _ in requests[1:]),
@@ -893,15 +925,20 @@ class CatalogueScripts(unittest.TestCase):
         self.assertTrue(any(sql.startswith("WITH ") for sql in queries), queries)
         self.assertEqual(queries[-1], "DROP TABLE _velmora_import_incomplete")
 
+    def test_real_wrangler_preserves_explicit_env_file_credentials(self):
+        result, requests, _ = self.loopback_import(ACCOUNT_ID, token_from_env_file=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(requests[-1][2]["sql"], "DROP TABLE _velmora_import_incomplete")
+
     def test_real_wrangler_refuses_when_uuid_is_not_in_confirmed_account(self):
-        result, requests = self.loopback_import(OTHER_ACCOUNT_ID)
+        result, requests, r2_requests = self.loopback_import(OTHER_ACCOUNT_ID)
         self.assertEqual(result.returncode, 1, result.stderr)
         self.assertIn(f"the confirmed database is not in account {ACCOUNT_ID}", result.stderr)
         self.assertEqual([(method, url) for method, url, _ in requests], [
             ("GET", f"/client/v4/accounts/{OTHER_ACCOUNT_ID}/d1/database/{DATABASE_ID}"),
             ("GET", f"/client/v4/accounts/{ACCOUNT_ID}/d1/database/{DATABASE_ID}"),
         ])
-        self.assertEqual(self.calls(), [])
+        self.assertEqual(r2_requests, [])
 
     def test_import_requires_explicit_cloudflare_account_before_api_calls(self):
         del self.env["CLOUDFLARE_ACCOUNT_ID"]
@@ -910,13 +947,16 @@ class CatalogueScripts(unittest.TestCase):
 
     def test_import_round_trip(self):
         ms, _, _, _ = self.export()
-        self.assert_loaded(self.run_script("import", "scratch-db", ms), ms)
-        for call in self.calls():
+        before = len(self.calls())
+        args = [*ARGS, "--profile", "ops"]
+        self.assert_loaded(self.run_script("import", "scratch-db", ms, wrangler_args=args), ms)
+        for call in self.calls()[before:]:
             if call[2:4] == ["d1", "execute"] or call[2:5] == ["d1", "info", DATABASE_ID]:
                 self.assertNotIn("--env", call)
+                self.assertIn("--profile=ops", call)
                 self.assertEqual(Path(call[call.index("--config") + 1]).name, "execution.json")
             else:
-                self.assertEqual(call[-len(ARGS):], ARGS)
+                self.assertEqual(call[-len(args):], args)
 
     def test_import_rejects_manifest_file_size_before_fetching_parts(self):
         ms, _, manifest, _ = self.export()
