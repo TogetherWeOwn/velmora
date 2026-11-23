@@ -4,6 +4,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import redirect_stdout
 import fcntl
 import hashlib
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import StringIO
 import json
 import os
@@ -16,6 +17,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from unittest.mock import patch
 
@@ -28,6 +30,8 @@ ARGS = ["--config", "fixture.toml", "--env", "dev"]
 MS = "1760000000123"
 DATABASE_ID = "11111111-2222-4333-8444-555555555555"
 OTHER_DATABASE_ID = "22222222-3333-4444-8555-666666666666"
+ACCOUNT_ID = "0" * 32
+OTHER_ACCOUNT_ID = "1" * 32
 MISSING = "✘ [ERROR] The specified key does not exist."
 COLOURED_MISSING = "\x1b[31m✘ \x1b[1;41m[ERROR]\x1b[0m\x1b[31m The specified key does not exist.\x1b[0m"
 
@@ -65,6 +69,12 @@ with open(os.environ["FAKE_LOG"], "a") as log:
 if os.fstat(0).st_rdev != os.stat("/dev/null").st_rdev or os.read(0, 1) != b"":
     Path(os.environ["FAKE_LOG"] + ".stdin").touch()
     sys.exit("stub stdin was not /dev/null")
+if args[:2] == ["wrangler", "d1"] and "--config" in args:
+    config = Path(args[args.index("--config") + 1])
+    if config.name == "execution.json":
+        assert json.loads(config.read_text()) == {"account_id": os.environ["CLOUDFLARE_ACCOUNT_ID"]}
+        assert config.stat().st_mode & 0o777 == 0o600
+        assert config.parent.stat().st_mode & 0o777 == 0o700
 
 def rendezvous(name, mode):
     # FIFO handshakes order the concurrent PUT and GET without timing assumptions.
@@ -85,12 +95,7 @@ def download(source, dest):
             shutil.copyfile(source, dest)
             rendezvous("winner-readback", "w")
             return
-    fail_get = os.environ.get("FAKE_FAIL_GET")
-    if source.name.endswith(".manifest.json") and (
-            fail_get == "yes" or (fail_get == "readback" and source.exists())):
-        for line in range(25):
-            print(f"stub manifest error line {line:02d}", file=sys.stderr)
-        sys.exit(1)
+    check_download_failure(source)
     if not source.exists():
         sys.exit(os.environ.get("FAKE_MISSING", "✘ [ERROR] The specified key does not exist."))
     if source.name.endswith(".manifest.json") and os.environ.get("FAKE_BAD_READBACK"):
@@ -98,7 +103,16 @@ def download(source, dest):
     else:
         shutil.copyfile(source, dest)
 
+def check_download_failure(source):
+    fail_get = os.environ.get("FAKE_FAIL_GET")
+    if source.name.endswith(".manifest.json") and (
+            fail_get == "yes" or (fail_get == "readback" and source.exists())):
+        for line in range(25):
+            print(f"stub manifest error line {line:02d}", file=sys.stderr)
+        sys.exit(1)
+
 def stream(source, limit=-1):
+    check_download_failure(source)
     if not source.exists():
         sys.exit(os.environ.get("FAKE_MISSING", "✘ [ERROR] The specified key does not exist."))
     signal.signal(signal.SIGPIPE, signal.SIG_DFL)
@@ -150,7 +164,7 @@ elif args[:3] == ["wrangler", "d1", "info"]:
     assert "--remote" not in args
     if os.environ.get("FAKE_FAIL_INFO"):
         sys.exit("stub D1 info unavailable")
-    info = {"uuid": os.environ["FAKE_DATABASE_ID"], "name": os.environ.get("FAKE_DATABASE_NAME", args[3])}
+    info = {"uuid": os.environ["FAKE_DATABASE_ID"], "name": os.environ.get("FAKE_DATABASE_NAME", "scratch-db")}
     if not os.environ.get("FAKE_OMIT_SIZE"):
         info["database_size"] = int(os.environ.get("FAKE_DATABASE_SIZE", 32768))
     print(json.dumps(info))
@@ -250,6 +264,52 @@ else:
 """
 
 
+class D1Loopback(BaseHTTPRequestHandler):
+    """Only the D1 and analytics endpoints used by the pinned Wrangler."""
+
+    def log_message(self, *_):
+        pass
+
+    def reply(self, data, status=200):
+        body = json.dumps(data).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def handle_d1(self):
+        body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))) or b"{}")
+        path = self.path.split("?", 1)[0]
+        if path == "/client/v4/graphql":
+            return self.reply({"data": {"viewer": {"accounts": []}}})
+        self.server.requests.append((self.command, path, body))
+        _, api, version, accounts, account, d1, database, uuid, *rest = path.split("/")
+        assert (api, version, accounts, d1, database) == ("client", "v4", "accounts", "d1", "database")
+        if uuid not in (DATABASE_ID, OTHER_DATABASE_ID) or account not in self.server.catalogue_accounts:
+            return self.reply({"success": False, "errors": [{"code": 7404, "message": "database not found"}]}, 404)
+        if self.command == "GET" and not rest:
+            result = {"uuid": uuid, "name": "scratch-db" if uuid == DATABASE_ID else DATABASE_ID}
+        elif self.command == "POST" and rest == ["query"]:
+            sql = body["sql"]
+            if sql.startswith("SELECT EXISTS("):
+                rows = [{"incomplete": 0, "nonempty": 0}]
+            elif sql.startswith("WITH "):
+                rows = [{"n": 1}]
+            else:
+                assert sql.startswith(("UPDATE _velmora_import_incomplete", "DROP TABLE _velmora_import_incomplete")), sql
+                rows = []
+            result = [{"success": True, "results": rows, "meta": {}}]
+        else:
+            assert self.command == "POST" and rest == ["import"] and body["action"] == "init"
+            # D1 can skip uploading a file it already has for this hash.
+            result = {"success": True, "status": "complete", "messages": [], "result": {
+                "num_queries": 1, "final_bookmark": "loopback", "meta": {"duration": 0, "rows_read": 0, "rows_written": 1}}}
+        self.reply({"success": True, "result": result, "errors": [], "messages": []})
+
+    do_GET = do_POST = handle_d1
+
+
 class CatalogueScripts(unittest.TestCase):
     def setUp(self):
         work = Path(self.enterContext(tempfile.TemporaryDirectory()))
@@ -289,6 +349,7 @@ class CatalogueScripts(unittest.TestCase):
             "FAKE_FIXTURE": str(self.fixture),
             "FAKE_DATABASE_ID": DATABASE_ID,
             "VELMORA_IMPORT_DATABASE_ID": DATABASE_ID,
+            "CLOUDFLARE_ACCOUNT_ID": ACCOUNT_ID,
         }
 
     def call_script(self, action, *args, wrangler_args=ARGS, **overrides):
@@ -624,6 +685,13 @@ class CatalogueScripts(unittest.TestCase):
         self.assertIn("the export has no schema", result.stderr)
         self.assertFalse(self.bucket.exists())
 
+    def test_export_does_not_extend_block_comment_into_insert_value(self):
+        self.fixture.write_text("/* dump header */ INSERT INTO fixture VALUES ('*/ CREATE TABLE hidden (id);');\n")
+        result = self.run_script("export")
+        self.assertEqual(result.returncode, 1, f"export exited {result.returncode}; {result.stdout}{result.stderr}")
+        self.assertIn("the export has no schema", result.stderr)
+        self.assertFalse(any(call[2:5] == ["r2", "object", "put"] for call in self.calls()))
+
     def test_export_refuses_options_that_omit_schema_or_data(self):
         for i, flags in enumerate((["--no-schema"], ["--no-data"], ["--schema=false"], ["--data=false"],
                                    ["--schema", "false"], ["--data", "false"],
@@ -777,13 +845,78 @@ class CatalogueScripts(unittest.TestCase):
         self.assert_loaded(result, ms)
         calls = [call for call in self.calls()[before:] if call[2:3] == ["d1"]]
         self.assertEqual(calls[0][3:5], ["info", "scratch-db"])
-        self.assertGreater(len(calls), 1)
-        self.assertTrue(all(call[3:5] == ["execute", DATABASE_ID] for call in calls[1:]), calls)
+        self.assertEqual(calls[1][3:5], ["info", DATABASE_ID])
+        self.assertGreater(len(calls), 2)
+        self.assertTrue(all(call[3:5] == ["execute", DATABASE_ID] for call in calls[2:]), calls)
+
+    def loopback_import(self, operator_account):
+        wrangler = ROOT / "node_modules" / ".bin" / "wrangler"
+        self.assertTrue(wrangler.is_file(), "install pinned Wrangler with npm ci before running this suite")
+        self.wrangler.unlink()
+        self.wrangler.symlink_to(wrangler)
+        work = Path(self.env["TMPDIR"])
+        config = work / "operator.json"
+        config.write_text(json.dumps({"account_id": operator_account, "d1_databases": [
+            {"binding": "TARGET", "database_name": "scratch-db", "database_id": DATABASE_ID},
+            {"binding": "OTHER", "database_name": DATABASE_ID, "database_id": OTHER_DATABASE_ID},
+        ]}))
+        path = self.object_path(f"d1/{SOURCE}/{MS}.sql")
+        path.parent.mkdir(parents=True)
+        path.write_text("CREATE TABLE fixture (value TEXT);\nINSERT INTO fixture VALUES ('one');\n")
+        with ThreadingHTTPServer(("127.0.0.1", 0), D1Loopback) as api:
+            api.requests = []
+            api.catalogue_accounts = {operator_account}
+            thread = threading.Thread(target=api.serve_forever, daemon=True)
+            thread.start()
+            try:
+                # Isolate Wrangler from host credentials, profiles, proxies and metrics.
+                result = self.call_script("import", "TARGET", MS, wrangler_args=["--config", str(config)],
+                                          PATH=f"{work}{os.pathsep}{os.environ['PATH']}", HOME=str(work),
+                                          CI="true", WRANGLER_SEND_METRICS="false", NO_PROXY="127.0.0.1",
+                                          CLOUDFLARE_API_TOKEN="loopback-test-token",
+                                          CLOUDFLARE_API_BASE_URL=f"http://127.0.0.1:{api.server_port}/client/v4",
+                                          VELMORA_EXPORT_RCLONE_REMOTE="r2x")
+            finally:
+                api.shutdown()
+                thread.join()
+            return result, api.requests
+
+    def test_real_wrangler_uuid_name_collision_cannot_redirect_import(self):
+        result, requests = self.loopback_import(ACCOUNT_ID)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        path = f"/client/v4/accounts/{ACCOUNT_ID}/d1/database/{DATABASE_ID}"
+        self.assertEqual(requests[0][:2], ("GET", path))  # operator's TARGET binding
+        self.assertTrue(all(url in (path, f"{path}/query", f"{path}/import") for _, url, _ in requests[1:]),
+                        [url for _, url, _ in requests])
+        self.assertEqual(sum(url == f"{path}/import" for _, url, _ in requests), 3)  # claim and two batches
+        queries = [body["sql"] for _, url, body in requests if url == f"{path}/query"]
+        self.assertTrue(any(sql.startswith("WITH ") for sql in queries), queries)
+        self.assertEqual(queries[-1], "DROP TABLE _velmora_import_incomplete")
+
+    def test_real_wrangler_refuses_when_uuid_is_not_in_confirmed_account(self):
+        result, requests = self.loopback_import(OTHER_ACCOUNT_ID)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn(f"the confirmed database is not in account {ACCOUNT_ID}", result.stderr)
+        self.assertEqual([(method, url) for method, url, _ in requests], [
+            ("GET", f"/client/v4/accounts/{OTHER_ACCOUNT_ID}/d1/database/{DATABASE_ID}"),
+            ("GET", f"/client/v4/accounts/{ACCOUNT_ID}/d1/database/{DATABASE_ID}"),
+        ])
+        self.assertEqual(self.calls(), [])
+
+    def test_import_requires_explicit_cloudflare_account_before_api_calls(self):
+        del self.env["CLOUDFLARE_ACCOUNT_ID"]
+        self.assert_refused(self.run_script("import", "scratch-db", MS), "set CLOUDFLARE_ACCOUNT_ID")
+        self.assertEqual(self.calls(), [])
 
     def test_import_round_trip(self):
         ms, _, _, _ = self.export()
         self.assert_loaded(self.run_script("import", "scratch-db", ms), ms)
-        self.assertTrue(all(call[-len(ARGS):] == ARGS for call in self.calls()))
+        for call in self.calls():
+            if call[2:4] == ["d1", "execute"] or call[2:5] == ["d1", "info", DATABASE_ID]:
+                self.assertNotIn("--env", call)
+                self.assertEqual(Path(call[call.index("--config") + 1]).name, "execution.json")
+            else:
+                self.assertEqual(call[-len(ARGS):], ARGS)
 
     def test_import_rejects_manifest_file_size_before_fetching_parts(self):
         ms, _, manifest, _ = self.export()
@@ -793,7 +926,7 @@ class CatalogueScripts(unittest.TestCase):
         self.assert_refused(result, f"the SQL export is {manifest['sql_bytes']} bytes, "
                                     "over the 100 bytes allowed for this test; "
                                     "this export could not be restored by catalog-import.sh")
-        self.assertEqual(len(self.calls()) - before, 3)  # d1 info, bounded preflight, then manifest GET
+        self.assertEqual(len(self.calls()) - before, 4)  # resolve, confirm account, preflight, GET
 
     def test_import_stops_decompression_one_byte_past_the_bound(self):
         ms, prefix, manifest, _ = self.export()
@@ -896,8 +1029,9 @@ class CatalogueScripts(unittest.TestCase):
         self.env["FAKE_DATABASE_NAME"] = "velmora-catalog"
         self.assert_refused(self.run_script("import", "scratch-db", ms),
                             "velmora-catalog without VELMORA_IMPORT_PRODUCTION=yes")
-        self.assertEqual(self.calls()[-1],
+        self.assertEqual(self.calls()[-2],
                          ["local", "wrangler", "d1", "info", "scratch-db", "--json", *ARGS])
+        self.assertEqual(self.calls()[-1][2:5], ["d1", "info", DATABASE_ID])
         self.env["VELMORA_IMPORT_PRODUCTION"] = "yes"
         self.assert_loaded(self.run_script("import", "scratch-db", ms), ms)
 
@@ -1427,7 +1561,7 @@ class CatalogueScripts(unittest.TestCase):
         self.object_path(key).write_text(json.dumps(manifest))
         before = len(self.calls())
         self.assert_refused(self.run_script("import", "scratch-db", ms), f"invalid manifest {key}")
-        self.assertEqual(len(self.calls()) - before, 3)  # d1 info, bounded preflight, then manifest GET
+        self.assertEqual(len(self.calls()) - before, 4)  # resolve, confirm account, preflight, GET
 
     def test_nonempty_target(self):
         ms, _, _, _ = self.export()
@@ -1436,9 +1570,10 @@ class CatalogueScripts(unittest.TestCase):
         result = self.run_script("import", "scratch-db", ms)
         self.assertEqual(result.returncode, 1, result.stderr)
         self.assertIn("catalog-import: scratch-db is not empty", result.stderr)
-        resolve, probe = self.calls()[before:]
-        self.assertEqual(resolve[2:4], ["d1", "info"])
-        self.assertEqual(probe[2:4], ["d1", "execute"])
+        resolve, confirm, probe = self.calls()[before:]
+        self.assertEqual(resolve[2:5], ["d1", "info", "scratch-db"])
+        self.assertEqual(confirm[2:5], ["d1", "info", DATABASE_ID])
+        self.assertEqual(probe[2:5], ["d1", "execute", DATABASE_ID])
         self.assertFalse(is_d1_write(probe))
         sql = probe[probe.index("--command") + 1]
         self.assertNotIn("COUNT(", sql.upper())
@@ -1488,7 +1623,7 @@ class CatalogueScripts(unittest.TestCase):
         result = self.run_script("import", "scratch-db", MS)
         log = self.assert_kept_log(result, f"catalog-import: could not read {prefix}.manifest.json, see ")
         self.assertEqual(log.read_text().strip(), self.env["FAKE_MISSING"])
-        self.assertEqual(len(self.calls()), 3)  # d1 info, bounded preflight, then manifest GET
+        self.assertEqual(len(self.calls()), 4)  # resolve, confirm account, preflight, GET
 
     def test_manifest_get_failure_does_not_load_legacy(self):
         prefix = f"d1/{SOURCE}/{MS}"
@@ -1507,7 +1642,7 @@ class CatalogueScripts(unittest.TestCase):
                 self.assertEqual(log.read_text().splitlines(),
                                  [f"stub manifest error line {line:02d}" for line in range(25)])
                 self.assertNotIn("stub manifest error", result.stderr)
-                self.assertEqual(len(self.calls()) - before, 4 if remote else 3)  # includes d1 info and preflight
+                self.assertEqual(len(self.calls()) - before, 5 if remote else 4)  # rclone also lists
 
     def test_empty_downloads(self):
         ms, prefix, manifest, _ = self.export()
@@ -1522,15 +1657,42 @@ class CatalogueScripts(unittest.TestCase):
         self.assert_refused(self.run_script("import", "scratch-db", ms),
                             f"empty download for {prefix}.sql")
 
-    def test_import_rejects_legacy_sql_over_test_cap_before_executing(self):
+    def assert_bounded_restore_get(self, staged_name, cap, failure):
+        work = Path(self.env["TMPDIR"])
+        fake_rm = work / "rm"
+        size = work / "restore-size"
+        fake_rm.write_text('#!/bin/sh\n'
+                           'case "${3-}" in\n'
+                           f'  */velmora-import.*) [ ! -f "$3/{staged_name}" ] || '
+                           f'wc -c <"$3/{staged_name}" >"$TMPDIR/{size.name}";;\n'
+                           'esac\nexec /bin/rm "$@"\n')
+        fake_rm.chmod(0o755)
+        for transport in ("wrangler", "rclone"):
+            with self.subTest(transport=transport):
+                if transport == "rclone":
+                    self.env["VELMORA_EXPORT_RCLONE_REMOTE"] = "r2x"
+                size.unlink(missing_ok=True)
+                result = self.run_script("import", "scratch-db", MS)
+                self.assertEqual(int(size.read_text()), cap + 1)
+                self.assert_refused(result, failure)
+                self.assertFalse(any(map(is_d1_write, self.calls())))
+
+    def test_import_bounds_oversized_manifest_download_for_both_transports(self):
+        cap = 1024 * 1024
+        key = f"d1/{SOURCE}/{MS}.manifest.json"
+        path = self.object_path(key)
+        path.parent.mkdir(parents=True)
+        path.write_bytes(b"{}" + b" " * (cap + 4096))
+        self.assert_bounded_restore_get("manifest.json", cap, f"manifest {key} exceeds {cap} bytes")
+        self.assertFalse(any(f"{key.removesuffix('.manifest.json')}.sql" in arg for call in self.calls() for arg in call))
+
+    def test_import_bounds_oversized_legacy_sql_download_for_both_transports(self):
         key = f"d1/{SOURCE}/{MS}.sql"
         path = self.object_path(key)
         path.parent.mkdir(parents=True)
         path.write_bytes(self.fixture.read_bytes())
         self.env["VELMORA_TEST_SQL_FILE_BYTES"] = "100"
-        self.assert_refused(self.run_script("import", "scratch-db", MS),
-                            f"the SQL export is {self.fixture.stat().st_size} bytes, over the 100 bytes")
-        self.assertFalse(any(map(is_d1_write, self.calls())))
+        self.assert_bounded_restore_get("catalog.sql", 100, f"legacy SQL {key} exceeds 100 bytes")
 
     def test_legacy_export_without_schema(self):
         key = f"d1/{SOURCE}/{MS}.sql"

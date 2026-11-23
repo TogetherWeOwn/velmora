@@ -73,7 +73,9 @@ def dump_statements(path, limit):
         raise ValueError("the dump ends inside a statement")
 
 
-LEADING = rb"(?:\s|--[^\n]*\n|/\*.*?\*/)*"
+# A block comment cannot contain its first terminator. In particular, the
+# leading-token match must never backtrack into a later SQL string for `*/`.
+LEADING = rb"(?:\s|--[^\n]*\n|/\*(?:[^*]|\*(?!/))*\*/)*"
 PRAGMA = re.compile(LEADING + rb"PRAGMA\b", re.I | re.S)
 CREATE_TABLE = re.compile(LEADING + rb"CREATE\s+TABLE\b", re.I | re.S)
 INSERT = re.compile(LEADING + rb"INSERT\b", re.I | re.S)

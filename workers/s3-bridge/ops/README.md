@@ -322,16 +322,21 @@ older Worker cannot enforce it on a direct replay call.
      `VELMORA_D1` to the source database of the export. Create an empty
      database and set `VELMORA_IMPORT_DATABASE_ID` to its UUID from
      `wrangler d1 info <new db> --json` (use the same Wrangler config and
-     environment as the import). Run `ops/catalog-import.sh <new db> <restore point>`.
-     The script checks the resolved database name and UUID, even if the
-     target is a Wrangler binding, then uses only that UUID for D1 commands.
+     environment as the import). Export `CLOUDFLARE_ACCOUNT_ID` for the target
+     account and supply Wrangler credentials in the shell environment if
+     needed. Run `ops/catalog-import.sh <new db> <restore point>`.
+     The script resolves the supplied name or binding with the operator's
+     config and checks the UUID. It then confirms the same UUID and name in
+     `CLOUDFLARE_ACCOUNT_ID` and pins every subsequent D1 call to that account
+     and UUID with a private config containing no database names or bindings.
      A production catalogue also requires `VELMORA_IMPORT_PRODUCTION=yes`.
      The export carries the schema and the list of applied migrations, so
      apply migrations after loading it. Do not run against production without
-     these confirmations. The script refuses a non-empty database. It stages
-     at most the declared size plus one byte per part and closes the Wrangler
-     stream at that cap (which does not limit bytes already in flight). It also
-     bounds decompression by the manifest's SQL size and checks every checksum
+     these confirmations. The script refuses a non-empty database. It caps
+     the manifest at 1 MiB, legacy SQL at 5,000,000,000 bytes, and each part at
+     its declared size. It stages at most one extra byte to detect overflow
+     (which does not limit bytes already in flight). It also bounds
+     decompression by the manifest's SQL size and checks every checksum
      before splitting. Legacy single-file exports have no checksums.
 
      Restore always uses statement-safe batches, even for small exports:
