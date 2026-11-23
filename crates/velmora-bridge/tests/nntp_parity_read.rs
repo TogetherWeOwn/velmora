@@ -585,6 +585,16 @@ async fn cold_get_retries_a_new_reader_busy_during_parity_in_the_data_pass() {
 }
 
 #[tokio::test]
+async fn cold_get_retries_previously_eligible_parity_after_a_refused_slot() {
+    cold_get_across_retention_cutoff(Cutoff::PreviousParityBusy).await;
+}
+
+#[tokio::test]
+async fn cold_get_retries_a_new_reader_busy_in_both_recovery_passes() {
+    cold_get_across_retention_cutoff(Cutoff::BusyInFallbackToo).await;
+}
+
+#[tokio::test]
 async fn cold_get_combines_newly_eligible_data_with_parity_after_the_cache_write() {
     cold_get_across_retention_cutoff(Cutoff::Mixed).await;
 }
@@ -594,14 +604,25 @@ enum Cutoff {
     NewParity,
     NewData,
     PreviousParity,
+    PreviousParityBusy,
     BusyDuringParity,
+    BusyInFallbackToo,
     Mixed,
 }
 
 /// A reader crosses its retention cutoff while the rebuild waits for
 /// the previous extent's cache write.
 async fn cold_get_across_retention_cutoff(cutoff: Cutoff) {
-    let short_reader_lapses = cutoff == Cutoff::PreviousParity;
+    let short_reader_lapses = matches!(cutoff, Cutoff::PreviousParity | Cutoff::PreviousParityBusy);
+    let refusals = match cutoff {
+        Cutoff::PreviousParityBusy | Cutoff::BusyDuringParity => 1,
+        Cutoff::BusyInFallbackToo => 2,
+        _ => 0,
+    };
+    let expected_backoffs = u32::from(matches!(
+        cutoff,
+        Cutoff::PreviousParityBusy | Cutoff::BusyInFallbackToo
+    ));
     let mixed = cutoff == Cutoff::Mixed;
     let (second_len, expected_len) = if mixed {
         (4_500_000, 9_100_000) // Seven data articles and two parity articles.
@@ -628,8 +649,28 @@ async fn cold_get_across_retention_cutoff(cutoff: Cutoff) {
                     if body_requests(&bridge.nntp) == data_requests.get() && !released.get() {
                         assert!(bridge.cache.held.get());
                         assert!(bridge.cache.hold_put_prefix.replace(None).is_some());
-                        bridge.clock.advance_ms(1);
+                        // Force the still-open short-retention session
+                        // to close at the wait so parity has to take a slot.
+                        let elapsed = if cutoff == Cutoff::PreviousParityBusy {
+                            i64::from((READ_PERMIT_SECS - QUIT_SECS - READ_SLACK_SECS) * 1000)
+                        } else {
+                            1
+                        };
+                        bridge.clock.advance_ms(elapsed);
                         released.set(true);
+                    }
+                    if retry && cutoff == Cutoff::BusyInFallbackToo {
+                        bridge.catalog.sql.with_conn(|c| {
+                            let count: u32 = c
+                                .query_row("SELECT COUNT(*) FROM parity_refusals", [], |r| r.get(0))
+                                .unwrap();
+                            assert_eq!(count, 2, "both passes must be refused before the backoff");
+                        });
+                        assert_eq!(
+                            body_requests(&bridge.nntp),
+                            data_requests.get() + 2,
+                            "the fallback must not re-ask articles already answered in this attempt"
+                        );
                     }
                 }
             }
@@ -648,7 +689,7 @@ async fn cold_get_across_retention_cutoff(cutoff: Cutoff) {
         cfg.cold_sockets = 1;
         cfg.providers[0].retention_days = Some(2);
         cfg.providers[1].retention_days = Some(1);
-        if short_reader_lapses {
+        if short_reader_lapses || cutoff == Cutoff::BusyInFallbackToo {
             cfg.providers[0].priority = 0;
             cfg.providers[1].priority = 1;
         }
@@ -677,7 +718,7 @@ async fn cold_get_across_retention_cutoff(cutoff: Cutoff) {
     assert_eq!(missing[0].posted_at, shard.posted_at);
     bridge.clock.set(at_cutoff);
     let on_second = match cutoff {
-        Cutoff::NewParity | Cutoff::PreviousParity => shard,
+        Cutoff::NewParity | Cutoff::PreviousParity | Cutoff::PreviousParityBusy => shard,
         _ => &missing[0],
     };
     let mut src = cold.nntp.raw_client(0).await;
@@ -698,19 +739,21 @@ async fn cold_get_across_retention_cutoff(cutoff: Cutoff) {
     let lost_parity = if mixed { &parity.articles[1] } else { shard };
     cold.nntp.servers[0].hide(&lost_parity.message_id).await;
 
-    if cutoff == Cutoff::BusyDuringParity {
-        // Provider p1 is first asked for a slot in the parity pass.
-        // Return no slot once, as if a competing read just released it.
+    if refusals > 0 {
+        // Refuse p1 only after the cache write crosses the cutoff. It
+        // had a slot in the first data pass when it was still retained.
+        let lease_at_cutoff = at_cutoff.plus_secs(READ_PERMIT_SECS).0;
         bridge.catalog.sql.with_conn(|c| {
-            c.execute_batch(
+            c.execute_batch(&format!(
                 "CREATE TEMP TABLE parity_refusals(n INTEGER);
                  CREATE TEMP TRIGGER refuse_parity_slot BEFORE UPDATE OF token ON provider_permits
-                 WHEN OLD.provider_id = 'p1' AND NOT EXISTS (SELECT 1 FROM parity_refusals)
+                 WHEN OLD.provider_id = 'p1' AND NEW.lease_until > {lease_at_cutoff}
+                   AND (SELECT COUNT(*) FROM parity_refusals) < {refusals}
                  BEGIN
                      INSERT INTO parity_refusals VALUES (1);
                      SELECT RAISE(IGNORE);
                  END;",
-            )
+            ))
             .unwrap();
         });
     }
@@ -742,20 +785,28 @@ async fn cold_get_across_retention_cutoff(cutoff: Cutoff) {
     );
     assert!(response.body == body, "cold GET returned different bytes");
     assert_eq!(response.stream_error, None);
-    if cutoff == Cutoff::BusyDuringParity {
+    if refusals > 0 {
         bridge.catalog.sql.with_conn(|c| {
-            let refusals: u32 = c
+            let actual: u32 = c
                 .query_row("SELECT COUNT(*) FROM parity_refusals", [], |r| r.get(0))
                 .unwrap();
-            assert_eq!(refusals, 1, "the parity pass must be refused a slot");
+            assert_eq!(
+                actual, refusals,
+                "the recovery passes must be refused slots"
+            );
         });
     }
-    assert_eq!(
-        backoffs.get(),
-        0,
-        "the data fallback must finish without an outer retry ({} bytes read)",
-        response.body.len()
-    );
+    assert_eq!(backoffs.get(), expected_backoffs, "outer slot backoffs");
+    if cutoff == Cutoff::BusyInFallbackToo {
+        let load = bridge
+            .catalog
+            .provider_load(bridge.clock.now())
+            .await
+            .unwrap();
+        assert_eq!(load.iter().map(|p| p.held).collect::<Vec<_>>(), [0, 0]);
+        assert_eq!(bridge.nntp.live(), 0);
+    }
+    eprintln!("cold GET returned {} bytes", response.body.len());
     drop(held);
     assert_eq!(bridge.budget.in_use(), 0);
 }

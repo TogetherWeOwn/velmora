@@ -1295,6 +1295,7 @@ where
         // how much room the rebuild still needs.
         let mut rebuild = 0u64;
         let mut spare: Option<Charge> = None;
+        let mut first_eligible_at = None;
         loop {
             let reader = match &mut self.reader {
                 Some(reader) => reader,
@@ -1309,7 +1310,7 @@ where
             if let Some(spare) = spare.take() {
                 reader.fund(spare);
             }
-            let fetched = reader.fetch_beside(extent, &mut self.put);
+            let fetched = reader.fetch_beside(extent, &mut self.put, &mut first_eligible_at);
             let read = Spent::time(&bridge.clock, &self.spent.read, fetched).await;
             let shortfall = reader.settle();
             rebuild = rebuild.max(shortfall);
