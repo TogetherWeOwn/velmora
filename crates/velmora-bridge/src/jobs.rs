@@ -169,7 +169,8 @@ pub(crate) const JOB_OVERHEAD_BYTES: u64 = 2 * 1024 * 1024;
 
 /// What a job of `stage` charges to the isolate's byte budget for an
 /// extent of `cipher_size` bytes. Only the post stage holds the whole
-/// extent, and one rendered article per socket; verify and release hold
+/// extent, and a rendered article and its copy on the wire per socket
+/// ([`POST_SOCKET_BYTES`]); verify and release hold
 /// one article at a time (a repost charges for itself).
 pub fn job_bytes(stage: OutboxStage, cipher_size: u64, post_sockets: u32) -> u64 {
     match stage {
@@ -180,18 +181,18 @@ pub fn job_bytes(stage: OutboxStage, cipher_size: u64, post_sockets: u32) -> u64
 }
 
 /// What a job that holds the parity shards of an extent charges on top:
-/// the `parity` shards themselves, and what the codec works in while it
-/// computes them (as many again, and two more). Each is as long as the
-/// extent's longest article. Nothing for an extent without parity.
+/// the `parity` shards themselves, and two more that the codec works in
+/// while it computes them (`velmora::rs::encode` builds the shards in
+/// place, beside one data shard and the shard it is converting). Each is
+/// as long as the extent's longest article. Nothing for an extent without
+/// parity. Measured on a deployed Worker, a post job with parity held
+/// 2.8 MiB more than one without: its 4 shards.
 pub fn parity_job_bytes(cipher_size: u64, parity: usize) -> u64 {
     let shard = match (parity, crate::parity::stripe_of(cipher_size)) {
         (0, _) | (_, None) => return 0,
         (_, Some((_, shard))) => u64::from(shard),
     };
-    (parity as u64)
-        .saturating_mul(2)
-        .saturating_add(2)
-        .saturating_mul(shard)
+    (parity as u64).saturating_add(2).saturating_mul(shard)
 }
 
 /// Where a drain stops: 90 % of the cap, so that a tier sitting at the

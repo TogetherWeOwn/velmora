@@ -216,16 +216,35 @@ pub const DEFAULT_COLD_SOCKETS: u32 = 4;
 /// reads over as many as fit ([`crate::fetch::cold_read_bytes`]).
 pub const MAX_COLD_SOCKETS: u32 = 8;
 /// `JOB_BUDGET_BYTES` may be at most `INFLIGHT_BUDGET_BYTES` times this
-/// ratio (3/2).
+/// ratio (3/2), or [`MAX_JOB_BUDGET_BYTES`] where that is more.
 ///
 /// A request holds up to 1.5 bytes for each byte it charges: an upload
 /// charges plaintext plus ciphertext and the ciphertext is copied once
 /// more when it is handed to the blob store. A job holds about what it
 /// charges. The budget weighs a request byte at `JOB_BUDGET_BYTES /
-/// INFLIGHT_BUDGET_BYTES` job bytes, so a ratio above 3/2 would only let
-/// jobs charge memory that requests alone could never reach.
+/// INFLIGHT_BUDGET_BYTES` job bytes. Up to 3/2 that weight is what a
+/// request holds; above it, jobs may charge more than requests alone
+/// could reach, which only [`MAX_JOB_BUDGET_BYTES`] allows.
 pub const MAX_JOB_BUDGET_NUM: u64 = 3;
 pub const MAX_JOB_BUDGET_DEN: u64 = 2;
+/// `JOB_BUDGET_BYTES` may be up to this much (90 MiB) whatever
+/// `INFLIGHT_BUDGET_BYTES` is, when 3/2 of that is less.
+///
+/// It is what three post jobs of a full extent with parity (29.13 MiB
+/// each at 6 sockets) and a verify job charge at once, so that one post
+/// queue's three invocations run together in their isolate with parity
+/// as they do without it; at 6 sockets a fourth post job, with parity or
+/// without, waits.
+///
+/// The charges bound what the jobs and requests of an isolate hold at
+/// once, not the wasm memory the allocator keeps: that only grows, a
+/// whole extent at a time once its free space is split. Measured on a
+/// deployed Worker (2026-11-22, one post queue, about 60 jobs per run): with
+/// three post jobs at once the wasm memory reached 78 to 92 MiB without
+/// parity and 85 to 103 MiB with it; with four jobs with parity at once
+/// (4 sockets each, 104.5 MiB charged), 119 MiB, and no invocation ran out
+/// of memory. Raise this limit only after measuring again.
+pub const MAX_JOB_BUDGET_BYTES: u64 = 90 * 1024 * 1024;
 
 /// Propagation grace when `PROPAGATION_GRACE_SECS` is unset: six hours.
 pub const DEFAULT_PROPAGATION_GRACE_SECS: u32 = 21_600;
@@ -914,7 +933,8 @@ impl BridgeConfig {
             .find(fits)
             .ok_or_else(|| ConfigError::Invalid("INFLIGHT_BUDGET_BYTES".into()))?;
         // Never under the request limit, and never more than half as much
-        // again (see `MAX_JOB_BUDGET_NUM`).
+        // again (see `MAX_JOB_BUDGET_NUM`) or `MAX_JOB_BUDGET_BYTES`,
+        // whichever is more.
         let job_budget_bytes: u64 = match get("JOB_BUDGET_BYTES") {
             Some(v) if !v.trim().is_empty() => v
                 .trim()
@@ -922,7 +942,8 @@ impl BridgeConfig {
                 .map_err(|_| ConfigError::Invalid("JOB_BUDGET_BYTES".into()))?,
             _ => inflight_budget_bytes,
         };
-        let job_budget_max = inflight_budget_bytes / MAX_JOB_BUDGET_DEN * MAX_JOB_BUDGET_NUM;
+        let job_budget_max = (inflight_budget_bytes / MAX_JOB_BUDGET_DEN * MAX_JOB_BUDGET_NUM)
+            .max(MAX_JOB_BUDGET_BYTES);
         if job_budget_bytes < inflight_budget_bytes || job_budget_bytes > job_budget_max {
             return Err(ConfigError::Invalid("JOB_BUDGET_BYTES".into()));
         }

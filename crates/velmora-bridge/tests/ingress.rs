@@ -776,8 +776,8 @@ async fn byte_budget_weighs_requests_and_jobs() {
         (48 * MIB, 72 * MIB)
     );
 
-    // Jobs alone: three 22 MiB post jobs and a 2 MiB job fit, a fourth
-    // post job does not; the limit is 72 MiB exactly.
+    // Jobs alone: three 22 MiB jobs and a 2 MiB job fit, a fourth 22 MiB
+    // job does not; the limit is 72 MiB exactly.
     let jobs: Vec<_> = (0..3)
         .map(|_| budget.try_charge_job(22 * MIB).unwrap())
         .collect();
@@ -848,6 +848,43 @@ async fn byte_budget_weighs_requests_and_jobs() {
         assert!(budget.try_charge(1).is_none());
         assert!(budget.try_charge_job(1).is_none());
         drop((job, request));
+    }
+}
+
+/// With the job limit above 1.5 times the request limit (90 MiB beside
+/// 48 MiB, as shipped), a request byte weighs more than the 1.5 bytes a
+/// request holds, so whatever the mix, 1.5 times what requests charge
+/// plus what jobs charge stays within the job limit, and requests alone
+/// still stop at their own limit.
+#[test]
+fn byte_budget_above_three_halves_bounds_every_mix() {
+    const MIB: u64 = 1024 * 1024;
+    let budget = ByteBudget::new(48 * MIB).with_job_capacity(90 * MIB);
+    // Requests alone: 48 MiB.
+    let all = budget.try_charge(48 * MIB).unwrap();
+    assert!(budget.try_charge(1).is_none());
+    drop(all);
+    // Jobs alone: 90 MiB.
+    let all = budget.try_charge_job(90 * MIB).unwrap();
+    assert!(budget.try_charge_job(1).is_none());
+    drop(all);
+    for requests in (0..=48 * MIB).step_by(MIB as usize / 2) {
+        let held = (requests > 0).then(|| budget.try_charge(requests).unwrap());
+        // The most a job may charge beside them.
+        let (mut lo, mut hi) = (0, 90 * MIB + 1);
+        while hi - lo > 1 {
+            let mid = (lo + hi) / 2;
+            match budget.try_charge_job(mid) {
+                Some(_) => lo = mid,
+                None => hi = mid,
+            }
+        }
+        assert!(
+            requests / 2 * 3 + lo <= 90 * MIB,
+            "{requests} B of requests and {lo} B of jobs"
+        );
+        drop(held);
+        assert_eq!(budget.in_use(), 0);
     }
 }
 
