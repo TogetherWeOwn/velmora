@@ -1447,55 +1447,6 @@ At the list prices of late 2026 that is $3.2 to $3.4 per TB posted in
 gate mode against $3.3 with slot rows: about the same bill, with the
 slot rows out of the catalogue's write path.
 
-### The line (`SLOT_WAIT`)
-
-`SLOT_WAIT = "poll"` (the default): a post, verify or release job that
-finds every slot it could use taken keeps its claim and asks again
-every two seconds or more, for a little over two minutes from its claim,
-and is then put off and delivered again.
-
-`SLOT_WAIT = "push"` with `PERMITS = "do"`: the job asks once to wait.
-The gate keeps a line of the sessions that wait, first come first, and
-at every event that can free a slot (a release, the end of a session,
-a slot that ran out) it gives the slot to the first in the line that
-can use it and sends that session the reply. The job then takes its
-slot with its next question and goes on in the same run.
-
-- A job that waits holds no slot. Its wait is one session (one billed
-  request) and the reply. The gate has no timer of its own: it tells
-  each waiter when the first held slot can run out with no event, and
-  each waiter sends one message then (a twentieth of a request):
-  about every 30 s while a read holds a slot (a read slot lives 35 s
-  and is renewed every 5 s), and about once in a wait where only jobs
-  do.
-- The line is for the providers the job asked. One that was cooling
-  is not among them: the job leaves the line when that cooldown ends
-  and asks again with the pool as it is then.
-- A job that was handed a slot and stops before it takes it gives the
-  slot up when it stops; a slot it did not need because it found one
-  elsewhere goes back with the first slot it releases.
-- The line lives with the sessions, not in the gate's storage: it is
-  there when the gate leaves memory and comes back. A waiter whose
-  invocation died leaves the line when its connection ends, and a slot
-  that was sent to it comes back the same way.
-- After a deploy of the Worker the gate starts again without sessions:
-  every waiter is told its session ended and asks the old way.
-- Reads never wait in the line, and the slot kept for reads is never
-  given to it.
-- A job that cannot stand in the line (`PERMITS = "d1"`, a gate from
-  before the line, a gate that is not in charge of the account, a
-  session that failed) asks again as with `poll`.
-- So does a job whose wait does not fit in what a session can keep
-  (12,000 bytes of the 16,384 the platform keeps per connection). A
-  wait names every account asked with the accounts of its pool: 2,100
-  to 2,700 bytes for a pool of four accounts, 7,400 to 9,500 for eight
-  (account ids of 2 to 31 bytes), and over the limit from about ten.
-- A job that waits holds one of its queue's consumers for the time of
-  the wait, as it does with `poll`.
-
-Change it in a deploy of its own. Going back to `poll` needs nothing
-else: the waits in flight end with their invocations.
-
 ## The route
 
 `POST /_admin/restore` (admin bearer; 409 unless `MAINTENANCE=restore`)

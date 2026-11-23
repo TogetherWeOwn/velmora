@@ -110,14 +110,6 @@ async fn handle_detached(
 
 #[event(fetch)]
 async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
-    let result = handle_fetch(req, env, &ctx).await;
-    if let Some(drain) = gate::drain_detached_opens() {
-        ctx.wait_until(drain);
-    }
-    result
-}
-
-async fn handle_fetch(req: Request, env: Env, ctx: &Context) -> Result<Response> {
     // What a GET read from Usenet, one line per run of cold extents.
     velmora_bridge::trace::log_cold_reads(|line| {
         console_log!("cold read: {line}");
@@ -239,7 +231,7 @@ async fn handle_fetch(req: Request, env: Env, ctx: &Context) -> Result<Response>
     );
     let got = std::cell::Cell::new(GetObservation::default());
     let resp = ingress::front(incoming.req, &bridge.cfg, incoming.https, |req| async {
-        let (resp, get) = handle_detached(ctx, Rc::clone(&bridge), req).await;
+        let (resp, get) = handle_detached(&ctx, Rc::clone(&bridge), req).await;
         got.set(get);
         // A deferred document: buffered when it is done soon, else
         // streamed with keepalive whitespace.
@@ -250,7 +242,7 @@ async fn handle_fetch(req: Request, env: Env, ctx: &Context) -> Result<Response>
     // A body in sub-ranges: the first one is opened before the status is
     // known to the client.
     let mut get = got.into_inner();
-    let (status, out) = fanout::respond(&env, ctx, resp, &request_id, &mut get).await;
+    let (status, out) = fanout::respond(&env, &ctx, resp, &request_id, &mut get).await;
     console_log!(
         "{}",
         ingress::log_line(&method, &target, status, &request_id)
@@ -276,15 +268,7 @@ async fn handle_fetch(req: Request, env: Env, ctx: &Context) -> Result<Response>
 }
 
 #[event(queue)]
-async fn queue(batch: MessageBatch<serde_json::Value>, env: Env, ctx: Context) -> Result<()> {
-    let result = handle_queue(batch, env).await;
-    if let Some(drain) = gate::drain_detached_opens() {
-        ctx.wait_until(drain);
-    }
-    result
-}
-
-async fn handle_queue(batch: MessageBatch<serde_json::Value>, env: Env) -> Result<()> {
+async fn queue(batch: MessageBatch<serde_json::Value>, env: Env, _ctx: Context) -> Result<()> {
     // What an operator has to see of a job: a failed full read of a
     // sampled extent, for one.
     velmora_bridge::trace::log_alerts(|line| console_error!("alert: {line}"));
@@ -499,14 +483,7 @@ fn log_post_trace(job: &Job, outcome: &JobOutcome) {
 }
 
 #[event(scheduled)]
-async fn scheduled(event: ScheduledEvent, env: Env, ctx: ScheduleContext) {
-    handle_scheduled(event, env).await;
-    if let Some(drain) = gate::drain_detached_opens() {
-        ctx.wait_until(drain);
-    }
-}
-
-async fn handle_scheduled(event: ScheduledEvent, env: Env) {
+async fn scheduled(event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
     let bridge = match env::bridge(&env) {
         Ok(bridge) => bridge,
         Err(class) => {
