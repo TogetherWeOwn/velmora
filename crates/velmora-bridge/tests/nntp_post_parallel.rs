@@ -197,6 +197,31 @@ async fn lost_reply_on_one_socket_is_looked_up() {
     assert_eq!(rig.bridge.nntp.live(), 0);
 }
 
+#[tokio::test]
+async fn job_metrics_count_written_bytes_even_when_the_reply_is_lost() {
+    use velmora_bridge::{metrics::job_point, trace::observe_job};
+
+    let mut rig = rig(&[spec("bb0", 5)]).await;
+    rig.bridge.cfg.providers[0].id = "p1".into();
+    let s = rig.seed(1, &marked_plaintext(PLAIN_LEN)).await;
+    rig.servers[0].drop_next_posts(1).await;
+    let b = &rig.bridge;
+    let job = Job::Extent {
+        v: JOB_VERSION,
+        extent: s.extent.clone(),
+        generation: s.generation.clone(),
+        stage: OutboxStage::Post,
+    };
+    let (outcome, trace) = observe_job(&b.clock, b.run_job(&job)).await;
+    assert_eq!(outcome, JobOutcome::Ack);
+    let plan = rig.plan(&s).await;
+    assert_eq!(stored(&rig, 0).await, id_set(&plan));
+    assert_eq!(b.nntp.connects(), 5, "the dropped reply forced a redial");
+    let point = job_point(&trace, "velmora-post", 1).expect("sampled post");
+    let written: u64 = plan.iter().map(|row| row.cipher_len).sum();
+    assert_eq!(point.doubles[13], written as f64);
+}
+
 /// One socket of the job is refused by the provider's own connection
 /// limit: the others finish the work and the job succeeds.
 #[tokio::test]
