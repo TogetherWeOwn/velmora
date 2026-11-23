@@ -58,9 +58,12 @@ async fn attach_audit_code(
         };
         let take = chunk.len().min(AUDIT_ERROR_LIMIT - response.body.len());
         response.body.extend_from_slice(&chunk[..take]);
-    }
-    if let Some(code) = s3_error_code(&response) {
-        response.headers.push((CODE_HEADER.into(), code.into()));
+        if let Some(code) = s3_error_code(&response) {
+            // Once a known code is available, a stall in the rest of
+            // the body must not discard it at the exchange timeout.
+            response.headers.push((CODE_HEADER.into(), code.into()));
+            break;
+        }
     }
     response.body = Vec::new();
     response
@@ -219,6 +222,30 @@ mod tests {
                 want
             );
         }
+    }
+
+    #[test]
+    fn audit_code_does_not_wait_for_eof_after_complete_xml() {
+        use futures_util::StreamExt;
+        let xml = b"<Error><Code>SlowDown</Code></Error>".to_vec();
+        let chunks = futures_util::stream::iter([Ok(xml)]).chain(futures_util::stream::pending());
+        let response = HttpResponse {
+            status: 400,
+            headers: vec![],
+            body: vec![],
+        };
+        let future = attach_audit_code(response, chunks);
+        let Poll::Ready(answer) =
+            std::pin::pin!(future).poll(&mut Context::from_waker(Waker::noop()))
+        else {
+            panic!("a known code must not wait for EOF");
+        };
+        assert_eq!(answer.status, 400);
+        assert_eq!(
+            answer.headers,
+            [("x-amz-error-code".into(), "SlowDown".into())]
+        );
+        assert!(answer.body.is_empty());
     }
 
     #[test]
