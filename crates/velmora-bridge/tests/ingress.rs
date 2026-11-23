@@ -859,19 +859,22 @@ async fn byte_budget_weighs_requests_and_jobs() {
 #[test]
 fn byte_budget_above_three_halves_bounds_every_mix() {
     const MIB: u64 = 1024 * 1024;
-    let budget = ByteBudget::new(48 * MIB).with_job_capacity(90 * MIB);
+    let request_capacity = 48 * MIB;
+    let job_capacity = 90 * MIB;
+    let budget = ByteBudget::new(request_capacity).with_job_capacity(job_capacity);
     // Requests alone: 48 MiB.
-    let all = budget.try_charge(48 * MIB).unwrap();
+    let all = budget.try_charge(request_capacity).unwrap();
     assert!(budget.try_charge(1).is_none());
     drop(all);
     // Jobs alone: 90 MiB.
-    let all = budget.try_charge_job(90 * MIB).unwrap();
+    let all = budget.try_charge_job(job_capacity).unwrap();
     assert!(budget.try_charge_job(1).is_none());
     drop(all);
-    for requests in (0..=48 * MIB).step_by(MIB as usize / 2) {
+    // Include a one-byte request to exercise rounding down job room.
+    for requests in (0..=request_capacity).step_by(MIB as usize / 2).chain([1]) {
         let held = (requests > 0).then(|| budget.try_charge(requests).unwrap());
         // The most a job may charge beside them.
-        let (mut lo, mut hi) = (0, 90 * MIB + 1);
+        let (mut lo, mut hi) = (0, job_capacity + 1);
         while hi - lo > 1 {
             let mid = (lo + hi) / 2;
             match budget.try_charge_job(mid) {
@@ -879,13 +882,22 @@ fn byte_budget_above_three_halves_bounds_every_mix() {
                 None => hi = mid,
             }
         }
+        // Jobs can use the remaining request share, rounded down to whole bytes.
+        let expected = (request_capacity - requests) * job_capacity / request_capacity;
         assert!(
-            requests / 2 * 3 + lo <= 90 * MIB,
+            lo >= expected,
+            "{requests} B of requests left room for {lo} B of jobs, expected at least {expected} B"
+        );
+        assert!(
+            requests / 2 * 3 + lo <= job_capacity,
             "{requests} B of requests and {lo} B of jobs"
         );
         drop(held);
         assert_eq!(budget.in_use(), 0);
     }
+
+    let _requests = budget.try_charge(24 * MIB).unwrap();
+    assert!(budget.try_charge_job(45 * MIB).is_some());
 }
 
 #[tokio::test]
