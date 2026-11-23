@@ -1265,6 +1265,53 @@ replaces it: for each extent of a record it reads the stored plan, and
 one that cannot be read gives way to the plan in the extent's record.
 A plan that reads is left as it is.
 
+## Release by the verify job
+
+`RELEASE_AT_VERIFY = "on"` lets the verify job whose round passed release
+the pinned copy itself when `SAFETY_MIN_AGE_SECS` is already over at that
+moment (always, when it is `0`). The release job would ask the same
+backbones the same question a moment later; with the switch on that
+second round of `STAT`, its job and its writes are not made.
+
+- What a release needs is the same: every article present on
+  `REQUIRED_BACKBONES` backbones that count, by checks recorded under the
+  claim of the job that releases, and the full read on record. The
+  catalogue refuses anything less, whichever job asks.
+- "Recorded under the claim" is told by the lease token each
+  verification row carries (migration `0026_verification_claim.sql`;
+  apply it before the Worker that writes the column), not by its time:
+  a claim made in the millisecond an earlier one recorded a pass does
+  not count that pass. A row from before the column is never presence
+  for a release, though a full read stays on record. A check that ends
+  in the millisecond of another row of its backbone, and that the
+  catalogue does not keep beside it, is no evidence: the job hands the
+  release to the release stage, which asks again a millisecond later.
+- A backbone the releasing verify job did not ask itself is asked with
+  `STAT` in that job first: one a job before it checked (a round that
+  waited for propagation or made a repost), and one whose check began
+  before the minimum age was over. If there is no provider slot or
+  the extra check runs out of reconnects, the row goes to the release
+  stage, which asks every backbone.
+- Production ships with the switch off and a minimum age of `0`: a
+  passing verify round can schedule the release job without an added
+  wait. With the switch on and a positive minimum age, a passing round
+  that finishes before `SAFETY_MIN_AGE_SECS` has elapsed since the newest
+  post hands off to the release job. A repost restarts that minimum age.
+- The release by a verify job is one write to the catalogue: the copy
+  goes from `held` to `released` and the row from `verify` to `done`
+  together, or nothing changes. A job that dies leaves the copy held and
+  the row at `verify` for the next verify job. No copy is `releasing`
+  under a row at `verify`.
+- The switch can be turned on and off at any time, and Workers of both
+  values, and Workers from before the switch, may run side by side:
+  none of them meets a state it does not know.
+- `outbox` rows of such an extent go from `verify` to `done`, so the
+  `release` count of `/_admin/status` stays near 0. The release counters
+  (`releases_total` and the hourly `releases`) count these releases from
+  migration `0025_usage_release_at_verify.sql` on. Apply it before the
+  Worker that has the switch on: without it such a release is counted as
+  a verify only.
+
 ## Permit gate
 
 A provider permit is the right to hold one connection to one provider

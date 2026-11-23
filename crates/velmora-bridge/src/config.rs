@@ -304,6 +304,15 @@ pub struct BridgeConfig {
     pub records: crate::recovery::Layout,
     pub required_backbones: u32,
     pub safety_min_age_secs: u32,
+    /// Let the verify job release the extent itself
+    /// (`RELEASE_AT_VERIFY`), where the checks it has just made are the
+    /// presence a release needs: made under its own claim, and not
+    /// before the minimum age was over. The release rule and the guard
+    /// of the catalogue are the same as for a release job; a backbone
+    /// this job did not ask is asked with `STAT` first. Off, or before
+    /// the minimum age is over: the release is a job of its own, which
+    /// asks every backbone again ([`crate::verify`]).
+    pub release_at_verify: bool,
     pub verify_delay_secs: u32,
     /// How the verify stage checks an extent (`VERIFY_MODE` and its
     /// companions).
@@ -869,6 +878,11 @@ impl BridgeConfig {
         }
 
         let safety_min_age_secs: u32 = number(&get, "SAFETY_MIN_AGE_SECS")?;
+        let release_at_verify = match get("RELEASE_AT_VERIFY").as_deref().map(str::trim) {
+            None | Some("") | Some("off") => false,
+            Some("on") => true,
+            Some(_) => return Err(ConfigError::Invalid("RELEASE_AT_VERIFY".into())),
+        };
         let verify_delay_secs: u32 = number(&get, "VERIFY_DELAY_SECS")?;
 
         let post_sockets = number_or(&get, "POST_SOCKETS", DEFAULT_POST_SOCKETS, (1, 8))?;
@@ -1080,6 +1094,7 @@ impl BridgeConfig {
             records,
             required_backbones,
             safety_min_age_secs,
+            release_at_verify,
             verify_delay_secs,
             verify,
             post_sockets,

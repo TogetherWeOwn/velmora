@@ -647,6 +647,7 @@ pub fn config(providers: Vec<ProviderConfig>) -> BridgeConfig {
         parity: false,
         required_backbones: 1,
         safety_min_age_secs: 0,
+        release_at_verify: false,
         verify_delay_secs: 30,
         post_sockets: 4,
         cold_sockets: 4,

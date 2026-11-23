@@ -844,6 +844,9 @@ async fn a_release_racing_an_eviction_never_loses_the_pinned_copy() {
     // claimed about the extent.
     let stale = hot.as_candidate(&x, cipher);
     hot.discard_jobs();
+    // After the instant of verify's checks, so the release job's own
+    // `STAT` answers are on record beside them.
+    hot.bridge().clock.advance_secs(1);
     hot.run(&job(OutboxStage::Release)).await;
     assert_eq!(hot.text(&x, "safety_state"), "released");
     assert!(hot.has_safety(&x));

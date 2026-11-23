@@ -111,6 +111,9 @@ struct Slow {
     clock: FixedClock,
     ms: i64,
     calls: Vec<(&'static str, UnixMs)>,
+    /// Only this many calls take `ms`; the ones after take no time.
+    /// `None` = all of them.
+    budget: Option<usize>,
 }
 
 fn begin(slow: &RefCell<Option<Slow>>, what: &'static str) {
@@ -121,7 +124,9 @@ fn begin(slow: &RefCell<Option<Slow>>, what: &'static str) {
 
 fn end(slow: &RefCell<Option<Slow>>) {
     if let Some(slow) = slow.borrow().as_ref() {
-        slow.clock.advance_ms(slow.ms);
+        if slow.budget.is_none_or(|n| slow.calls.len() <= n) {
+            slow.clock.advance_ms(slow.ms);
+        }
     }
 }
 
@@ -133,7 +138,17 @@ impl TcpConnector {
             clock: clock.clone(),
             ms,
             calls: Vec::new(),
+            budget: None,
         });
+    }
+    /// As [`Self::slow`] for the next `calls` calls only: the ones after
+    /// them take no time, so they end in the millisecond the last slow
+    /// one ended.
+    pub fn slow_for(&self, clock: &FixedClock, ms: i64, calls: usize) {
+        self.slow(clock, ms);
+        if let Some(slow) = self.slow.borrow_mut().as_mut() {
+            slow.budget = Some(calls);
+        }
     }
     /// The next POST to be answered does not return to the job until the
     /// flag is set: the call stays in flight for as long as a test wants.
@@ -356,6 +371,10 @@ pub struct Entry {
     /// The `idx` of every parity article stamped as posted again.
     pub parity_reposted: Vec<u32>,
     pub verifications: Vec<VerificationRow>,
+    /// The lease token each row was recorded under, by backbone and
+    /// time (`verifications.lease_token`). A row pushed by a test has
+    /// none: it is from no claim.
+    pub recorded_under: BTreeMap<(String, UnixMs), u64>,
 }
 
 #[derive(Clone, Default)]
@@ -451,6 +470,13 @@ pub struct MemCatalog {
     pub raises: RefCell<Vec<(ExtentId, String, u32)>>,
     /// The next this many `escalate_verify` calls fail and store nothing.
     pub fail_escalations: Cell<u32>,
+    /// Another job takes the row over just before the next release is
+    /// asked for: the lease of the job that asks is stale by then.
+    pub take_over_at_release: Cell<bool>,
+    /// The copy is found `releasing` when the next release is asked
+    /// for, the lease intact: a state the job did not see when it
+    /// loaded the extent.
+    pub releasing_at_release: Cell<bool>,
 }
 
 impl MemCatalog {
@@ -477,6 +503,7 @@ impl MemCatalog {
                 parity_posted: BTreeMap::new(),
                 parity_reposted: Vec::new(),
                 verifications: Vec::new(),
+                recorded_under: BTreeMap::new(),
             },
         );
     }
@@ -580,6 +607,9 @@ impl MemCatalog {
     }
 
     /// The release guard, with the full check on record asked for or not.
+    /// `whole` = the time of a release by a verify job, which is over in
+    /// this one step; `None` = a release job, which marks the copy.
+    #[allow(clippy::too_many_arguments)]
     fn release(
         &self,
         l: &Lease,
@@ -588,7 +618,27 @@ impl MemCatalog {
         evidence_json: &str,
         need_full: bool,
         light: bool,
-    ) -> Guard<()> {
+        whole: Option<UnixMs>,
+    ) -> Result<Guard<()>> {
+        // As the SQL: each of the two ways takes the lease of its own
+        // stage and no other.
+        let stage = match whole {
+            None => OutboxStage::Release,
+            Some(_) => OutboxStage::Verify,
+        };
+        if l.stage != stage || required == 0 {
+            return Err(BridgeError::Invalid(
+                "release under a lease of another stage",
+            ));
+        }
+        if self.take_over_at_release.take() {
+            self.take_over(&l.extent);
+        }
+        if self.releasing_at_release.take() {
+            let mut entries = self.entries.borrow_mut();
+            let e = entries.get_mut(&l.extent).expect("seeded");
+            e.job.extent.safety_state = SafetyState::Releasing;
+        }
         let raised = self.escalations.borrow().clone();
         let applied = self.fenced(l, |e| {
             // As the SQL guard: under the light check, the escalations
@@ -601,8 +651,13 @@ impl MemCatalog {
                         .any(|r| r.backbone == backbone && r.until > stored)
             };
             let need_full = need_full || counting.iter().any(|name| escalated(name));
-            // As the SQL guard: only rows recorded under this claim.
-            let claimed = e.outbox.claimed_at;
+            // As the SQL guard: only rows recorded under this claim,
+            // told by the token and not by the time.
+            let token = |s: &BackboneStatus| {
+                e.recorded_under
+                    .get(&(s.backbone.clone(), s.verified_at))
+                    .copied()
+            };
             let statuses = Self::statuses(e);
             // A fresh pass is the full check only where a full read
             // is on record, and counts for nothing where the last check
@@ -627,7 +682,7 @@ impl MemCatalog {
             };
             let passes = statuses
                 .iter()
-                .filter(|s| s.counts && s.verified_at >= claimed && !failed(s))
+                .filter(|s| s.counts && token(s) == Some(l.token) && !failed(s))
                 .filter(|s| !escalated(&s.backbone) || full(s))
                 .map(|s| match full(s) {
                     true => (s.backbone.as_str(), VerifyKind::Body),
@@ -636,15 +691,36 @@ impl MemCatalog {
             if !velmora_bridge::verify::release_rule(passes, counting, required, need_full) {
                 return false;
             }
-            e.job.extent.safety_state = SafetyState::Releasing;
+            // As the SQL guard: a release job takes a copy that is held
+            // or that a job before it left `releasing`, the one write
+            // of a verify job a held copy only.
+            let takes = matches!(
+                (whole, e.job.extent.safety_state),
+                (_, SafetyState::Held) | (None, SafetyState::Releasing)
+            );
+            if !takes {
+                return false;
+            }
             e.job.extent.release_evidence = Some(evidence_json.to_string());
+            match whole {
+                None => e.job.extent.safety_state = SafetyState::Releasing,
+                // As `finish_release`, in the same step.
+                Some(now) => {
+                    e.job.extent.safety_state = SafetyState::Released;
+                    e.job.extent.released_at = Some(now);
+                    e.outbox.stage = OutboxStage::Done;
+                    e.outbox.lease_until = None;
+                    e.outbox.cursor = 0;
+                    e.outbox.last_error = None;
+                }
+            }
             true
         });
-        if applied == Some(true) {
+        Ok(if applied == Some(true) {
             Guard::Applied(())
         } else {
             Guard::Lost
-        }
+        })
     }
 
     /// The latest row per backbone for the current plan among `rows`.
@@ -891,15 +967,34 @@ impl Catalog for MemCatalog {
         Ok(written)
     }
 
-    async fn record_verification(&self, l: &Lease, v: &VerificationRow) -> Result<bool> {
-        // One row per extent, backbone and instant, as in the real table.
+    async fn record_verification(&self, l: &Lease, v: &VerificationRow) -> Result<VerifyRecord> {
+        // One row per extent, backbone and instant, as in the real table,
+        // and the same rule for a second result at that instant: it
+        // replaces a pass, but a `stat` pass never replaces a `body`
+        // pass, and nothing replaces a failure.
         let stored = self.fenced(l, |e| {
             let taken =
                 |o: &VerificationRow| o.backbone == v.backbone && o.verified_at == v.verified_at;
-            if e.verifications.iter().any(taken) {
-                return false;
+            let stored = match e.verifications.iter_mut().find(|o| taken(o)) {
+                Some(old) => {
+                    let stays = old.result != VerifyResult::Ok
+                        || (old.kind.column() == "body"
+                            && v.kind.column() == "stat"
+                            && v.result == VerifyResult::Ok);
+                    if !stays {
+                        *old = v.clone();
+                    }
+                    !stays
+                }
+                None => {
+                    e.verifications.push(v.clone());
+                    true
+                }
+            };
+            if stored {
+                let at = (v.backbone.clone(), v.verified_at);
+                e.recorded_under.insert(at, l.token);
             }
-            e.verifications.push(v.clone());
             // As the SQL catalogue: a full read of every article of
             // this plan, the parity articles included, and a later one.
             let extent = &mut e.job.extent;
@@ -914,12 +1009,13 @@ impl Catalog for MemCatalog {
             {
                 extent.last_verified_at = Some(v.verified_at);
             }
-            true
+            stored
         });
-        match stored {
-            Some(false) => Err(BridgeError::Sql("duplicate verification row".into())),
-            other => Ok(other.is_some()),
-        }
+        Ok(match stored {
+            Some(true) => VerifyRecord::Stored,
+            Some(false) => VerifyRecord::Kept,
+            None => VerifyRecord::Fenced,
+        })
     }
 
     async fn backbone_status(&self, extent: &ExtentId) -> Result<Vec<BackboneStatus>> {
@@ -941,7 +1037,7 @@ impl Catalog for MemCatalog {
         evidence_json: &str,
         _: UnixMs,
     ) -> Result<Guard<()>> {
-        Ok(self.release(l, required, counting, evidence_json, true, false))
+        self.release(l, required, counting, evidence_json, true, false, None)
     }
 
     async fn begin_release_light(
@@ -953,7 +1049,29 @@ impl Catalog for MemCatalog {
         _: UnixMs,
         need_full: bool,
     ) -> Result<Guard<()>> {
-        Ok(self.release(l, required, counting, evidence_json, need_full, true))
+        self.release(l, required, counting, evidence_json, need_full, true, None)
+    }
+
+    async fn release_at_verify(
+        &self,
+        l: &Lease,
+        required: u32,
+        counting: &[String],
+        evidence_json: &str,
+        now: UnixMs,
+        light: Option<bool>,
+    ) -> Result<Guard<()>> {
+        let need_full = light.unwrap_or(true);
+        let light = light.is_some();
+        self.release(
+            l,
+            required,
+            counting,
+            evidence_json,
+            need_full,
+            light,
+            Some(now),
+        )
     }
 
     async fn escalate_verify(&self, e: &VerifyEscalation, plan_rev: u32) -> Result<()> {
@@ -1966,6 +2084,7 @@ pub async fn rig(specs: &[Spec]) -> Rig {
         parity: false,
         required_backbones: 1,
         safety_min_age_secs: 0,
+        release_at_verify: false,
         verify_delay_secs: 30,
         post_sockets: 4,
         // One socket: the tests of the read path count connections and

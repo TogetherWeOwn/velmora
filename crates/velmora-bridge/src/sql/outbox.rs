@@ -13,7 +13,7 @@ use core::fmt::Write as _;
 use super::uploads::{int, ms, text, Cols, Stmt};
 use super::SqlCatalog;
 use crate::plan::{PackReport, StoredPlan};
-use crate::ports::{Guard, Lease, Permit, Sql, SqlValue, LEASE_SECS};
+use crate::ports::{Guard, Lease, Permit, Sql, SqlValue, VerifyRecord, LEASE_SECS};
 use crate::types::{
     ArticleRow, ArticleState, BackboneStatus, BridgeError, Bucket, BucketId, DueRow, ExtentId,
     ExtentRow, ExtentState, FailClass, GenerationId, GenerationState, JobExtent, OutboxStage,
@@ -26,8 +26,11 @@ const LEASE_MS: i64 = LEASE_SECS as i64 * 1000;
 
 // `outbox.updated_at` is the time of the row's last lease transition
 // (claim, advance, fail, defer, done, cancel). `renew` and `set_cursor`
-// leave it alone, so under a held lease it is the claim time; the release
-// guard uses it to tell this job's verifications from older ones.
+// leave it alone, so under a held lease it is the claim time. The release
+// guard does not tell this job's verifications from older ones by it: two
+// claims can fall in one millisecond. Each row carries the token of the
+// lease it was recorded under (`verifications.lease_token`), and the
+// guard counts those of the token that releases.
 
 /// The row a lease names; parameters `?1..?4` are [`lease_params`].
 macro_rules! held {
@@ -137,12 +140,17 @@ macro_rules! body_failed {
 
 /// A row that is evidence for the release of extent `?1` at `?6`: the one
 /// that speaks for a backbone in the list `?7`, a complete pass, recorded
-/// under the current claim of the outbox row, on a backbone whose last
-/// full read did not fail ([`body_failed`]).
+/// under the claim of lease token `?4` (the guard checks that the lease
+/// holds the outbox row), on a backbone whose last full read did not fail
+/// ([`body_failed`]). The token, not the time, names the claim: a claim
+/// made in the millisecond an earlier one recorded a pass and gave the
+/// row up would count that pass by its time. The claim time only bounds
+/// the range of the key that is read: the job that holds the claim stamps
+/// its rows after it.
 macro_rules! fresh_pass {
     () => {
         concat!(
-            "v.extent_id = ?1 AND v.verified_at <= ?6 \
+            "v.extent_id = ?1 AND v.verified_at <= ?6 AND v.lease_token = ?4 \
                AND v.verified_at >= (SELECT updated_at FROM outbox WHERE extent_id = ?1) \
                AND v.backbone IN (SELECT value FROM json_each(?7)) AND ",
             counts!(),
@@ -783,14 +791,19 @@ async fn renew_check<S: Sql>(c: &SqlCatalog<S>, l: &Lease) -> Result<bool> {
 // Verification and release
 // ---------------------------------------------------------------------------
 
-/// Appends one verification result under the lease; a full `body` pass of
-/// the current plan also moves `extents.last_verified_at` forward. A
-/// `stat` pass does not: nothing was read.
+/// Appends one verification result under the lease, with its token; a
+/// full `body` pass of the current plan also moves
+/// `extents.last_verified_at` forward. A `stat` pass does not: nothing
+/// was read.
+///
+/// [`VerifyRecord::Kept`]: the lease holds, but a row of the backbone at
+/// the same millisecond stays, as the rule below has it. Its count of
+/// changed rows says so (0); no time is compared to find it out.
 pub(super) async fn record_verification<S: Sql>(
     c: &SqlCatalog<S>,
     l: &Lease,
     v: &VerificationRow,
-) -> Result<bool> {
+) -> Result<VerifyRecord> {
     if v.extent_id != l.extent {
         return Err(BridgeError::Invalid(
             "verification is not for the leased extent",
@@ -807,6 +820,7 @@ pub(super) async fn record_verification<S: Sql>(
         text(v.result.as_str()),
         text(v.kind.column()),
         v.kind.mode_column().map_or(SqlValue::Null, text),
+        int(l.token)?,
     ];
     let stmts = vec![
         (held_guard!(), lease_params(l, [])?),
@@ -817,17 +831,21 @@ pub(super) async fn record_verification<S: Sql>(
             // `stat` pass never replaces a `body` pass: the row is the
             // full check on record, which a release needs, and the
             // `body` pass says all the `stat` pass would. The tally of a
-            // `STAT` goes to `articles_present` (see `tally!`).
+            // `STAT` goes to `articles_present` (see `tally!`). A row
+            // that is replaced takes the claim of the result that
+            // replaces it; one that stays keeps its own.
             "INSERT INTO verifications(extent_id, backbone, provider_id, verified_at, \
-               plan_rev, articles_ok, articles_present, articles_total, result, kind, mode) \
+               plan_rev, articles_ok, articles_present, articles_total, result, kind, mode, \
+               lease_token) \
              VALUES (?1, ?2, ?3, ?4, ?5, CASE ?9 WHEN 'stat' THEN 0 ELSE ?6 END, \
-               CASE ?9 WHEN 'stat' THEN ?6 ELSE 0 END, ?7, ?8, ?9, ?10) \
+               CASE ?9 WHEN 'stat' THEN ?6 ELSE 0 END, ?7, ?8, ?9, ?10, ?11) \
              ON CONFLICT(extent_id, backbone, verified_at) DO UPDATE SET \
                provider_id = excluded.provider_id, plan_rev = excluded.plan_rev, \
                articles_ok = excluded.articles_ok, \
                articles_present = excluded.articles_present, \
                articles_total = excluded.articles_total, \
-               result = excluded.result, kind = excluded.kind, mode = excluded.mode \
+               result = excluded.result, kind = excluded.kind, mode = excluded.mode, \
+               lease_token = excluded.lease_token \
              WHERE verifications.result = 'ok' \
                AND NOT (verifications.kind = 'body' AND excluded.kind = 'stat' \
                  AND excluded.result = 'ok')",
@@ -850,7 +868,16 @@ pub(super) async fn record_verification<S: Sql>(
             ],
         ),
     ];
-    fenced_batch(c, stmts).await
+    match c.sql.batch(stmts).await {
+        // One row changed: inserted, or put in the place of the row at
+        // that instant. None: that row stays.
+        Ok(changed) => Ok(match changed.get(1) {
+            Some(n) if *n > 0 => VerifyRecord::Stored,
+            _ => VerifyRecord::Kept,
+        }),
+        Err(BridgeError::GuardFailed) => Ok(VerifyRecord::Fenced),
+        Err(e) => Err(e),
+    }
 }
 
 /// Reads the columns `kind`, `mode` of a verification row.
@@ -972,6 +999,16 @@ pub(super) async fn body_checks<S: Sql>(
 /// reads the second point holds whatever `need_full` says. They are
 /// read in the guard, so one raised after the job read them is not
 /// missed.
+///
+/// `whole` is false for a release job: the copy becomes `releasing`,
+/// and [`finish_release`] is the last step. With `whole` the lease is
+/// that of the verify job that releases what it has just checked
+/// ([`crate::ports::Catalog::release_at_verify`]): the same guard over
+/// the claim of that lease, then the last step in the same batch. The
+/// copy goes from `held` to `released` and the row from `verify` to
+/// `done` together or not at all, so no copy is left `releasing` under
+/// a row in `verify`.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn begin_release<S: Sql>(
     c: &SqlCatalog<S>,
     l: &Lease,
@@ -980,47 +1017,84 @@ pub(super) async fn begin_release<S: Sql>(
     evidence_json: &str,
     now: UnixMs,
     light: Option<bool>,
+    whole: bool,
 ) -> Result<Guard<()>> {
     let need_full = light.unwrap_or(true);
     let light = light.is_some();
-    if l.stage != OutboxStage::Release || required == 0 {
-        return Err(BridgeError::Invalid(
-            "release needs a release lease and at least one required backbone",
-        ));
+    let stage = match whole {
+        false => OutboxStage::Release,
+        true => OutboxStage::Verify,
+    };
+    if l.stage != stage || required == 0 {
+        return Err(BridgeError::Invalid(match whole {
+            false => "release needs a release lease and at least one required backbone",
+            true => "release at verify needs a verify lease and at least one required backbone",
+        }));
     }
     let labels =
         serde_json::to_string(counting).map_err(|_| BridgeError::Invalid("backbone labels"))?;
-    let guard = concat!(
-        "INSERT INTO tx_guard(ok) SELECT 0 WHERE NOT EXISTS (SELECT 1 FROM outbox WHERE ",
-        held!(),
-        " AND lease_until >= ?6) \
+    macro_rules! release_guard {
+        ($states:literal) => {
+            concat!(
+                "INSERT INTO tx_guard(ok) SELECT 0 WHERE NOT EXISTS (SELECT 1 FROM outbox WHERE ",
+                held!(),
+                " AND lease_until >= ?6) \
          OR NOT ",
-        live_ref!("?1"),
-        " OR NOT EXISTS (SELECT 1 FROM extents WHERE id = ?1 \
-              AND safety_state IN ('held', 'releasing')) \
+                live_ref!("?1"),
+                " OR NOT EXISTS (SELECT 1 FROM extents WHERE id = ?1 \
+              AND safety_state ",
+                $states,
+                ") \
          OR (SELECT COUNT(*) FROM verifications v JOIN extents e ON e.id = v.extent_id \
               WHERE ",
-        fresh_pass!(),
-        " AND NOT (?9 = 1 \
+                fresh_pass!(),
+                " AND NOT (?9 = 1 \
                 AND EXISTS (SELECT 1 FROM verify_escalations z \
                   WHERE z.backbone = v.backbone AND z.until > e.created_at) \
                 AND NOT EXISTS (SELECT 1 FROM verifications b \
                   WHERE b.extent_id = v.extent_id AND b.backbone = v.backbone AND ",
-        body_on_record!(),
-        "))) < ?5 \
+                body_on_record!(),
+                "))) < ?5 \
          OR ((?8 = 1 OR (?9 = 1 AND EXISTS (SELECT 1 FROM verify_escalations z \
                 JOIN extents o ON o.id = ?1 \
                 WHERE z.until > o.created_at \
                   AND z.backbone IN (SELECT value FROM json_each(?7))))) \
              AND NOT EXISTS (SELECT 1 FROM verifications v \
               JOIN extents e ON e.id = v.extent_id WHERE ",
-        fresh_pass!(),
-        " AND EXISTS (SELECT 1 FROM verifications b \
+                fresh_pass!(),
+                " AND EXISTS (SELECT 1 FROM verifications b \
                 WHERE b.extent_id = v.extent_id AND b.backbone = v.backbone AND ",
-        body_on_record!(),
-        ")))"
-    );
-    let stmts = vec![
+                body_on_record!(),
+                ")))"
+            )
+        };
+    }
+    // The release-stage guard still accepts `releasing`; the job
+    // reopens an interrupted decision before it checks again. The
+    // verify-stage batch never takes a copy unless it is `held`.
+    let guard = match whole {
+        false => release_guard!("IN ('held', 'releasing')"),
+        true => release_guard!("= 'held'"),
+    };
+    let mark = match whole {
+        false => (
+            "UPDATE extents SET safety_state = 'releasing', release_evidence = ?2, \
+               evict_seq = evict_seq + 1 WHERE id = ?1",
+            vec![text(l.extent.as_str()), text(evidence_json)],
+        ),
+        // The mark and the write of [`finish_release`] as one: the row
+        // ends as the two steps of a release job leave it, but for the
+        // fence, which moves once for the one change of state.
+        true => (
+            "UPDATE extents SET safety_state = 'released', release_evidence = ?2, \
+               released_at = ?3, hot_safety_bytes = cipher_size, \
+               last_read_at = COALESCE(last_read_at, created_at), \
+               evict_seq = evict_seq + 1 \
+             WHERE id = ?1",
+            vec![text(l.extent.as_str()), text(evidence_json), ms(now)],
+        ),
+    };
+    let mut stmts = vec![
         (
             guard,
             lease_params(
@@ -1034,12 +1108,21 @@ pub(super) async fn begin_release<S: Sql>(
                 ],
             )?,
         ),
-        (
-            "UPDATE extents SET safety_state = 'releasing', release_evidence = ?2, \
-               evict_seq = evict_seq + 1 WHERE id = ?1",
-            vec![text(l.extent.as_str()), text(evidence_json)],
-        ),
+        mark,
     ];
+    if whole {
+        // The row as the move to the release stage and then
+        // [`finish_release`] leave it: nothing of the verify rounds (the
+        // resume point, the last error) stays on a row that is done.
+        // Last: after this the lease no longer holds.
+        let done = concat!(
+            "UPDATE outbox SET stage = 'done', updated_at = ?5, cursor = 0, last_error = NULL, ",
+            unlease!(),
+            " WHERE ",
+            held!()
+        );
+        stmts.push((done, lease_params(l, [ms(now)])?));
+    }
     super::uploads::guarded(c, stmts).await
 }
 
