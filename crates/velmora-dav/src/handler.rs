@@ -229,6 +229,9 @@ struct Ctx<'a, U: Upstream, S: StatePort> {
     s3: S3<'a, U>,
     principal: String,
     origin: String,
+    /// A bounded storage call went unanswered: storage may still be
+    /// working on it, so the reservation is not released early.
+    unsettled: std::cell::Cell<bool>,
 }
 
 fn depth(req_headers: &[(String, String)]) -> Result<Option<u8>, ()> {
@@ -392,6 +395,7 @@ impl<U: Upstream, S: StatePort> Dav<U, S> {
             },
             principal: creds.access_key.clone(),
             origin,
+            unsettled: std::cell::Cell::new(false),
         };
         match method.as_str() {
             "GET" | "HEAD" => ctx.get(&method, &loc, req).await,
@@ -642,12 +646,20 @@ impl<U: Upstream, S: StatePort> Ctx<'_, U, S> {
         Ok((holder, guard))
     }
 
+    /// Runs `more` and ends the lease and reservation. After a storage
+    /// call that did not answer in time its outcome is unknown and storage
+    /// may still commit it, so the holder's rows are left to expire with
+    /// their lease instead (at most `lease_secs` after the last renewal).
     async fn end_write(&self, bucket: &str, holder: &str, more: Vec<Op>) {
         let mut ops = more;
-        ops.push(Op::EndWrite {
-            holder: holder.to_owned(),
-        });
-        let _ = self.state(bucket, ops).await;
+        if !self.unsettled.get() {
+            ops.push(Op::EndWrite {
+                holder: holder.to_owned(),
+            });
+        }
+        if !ops.is_empty() {
+            let _ = self.state(bucket, ops).await;
+        }
     }
 
     /// Fence other DAV mutations while the request plans and changes storage.
@@ -717,7 +729,10 @@ impl<U: Upstream, S: StatePort> Ctx<'_, U, S> {
         let ms = u64::from(self.cfg().lease_secs) * 250;
         match select(std::pin::pin!(call), self.dav.up.sleep(ms)).await {
             Either::Left((out, _)) => Some(out),
-            Either::Right(((), _)) => None,
+            Either::Right(((), _)) => {
+                self.unsettled.set(true);
+                None
+            }
         }
     }
 
@@ -2310,8 +2325,7 @@ impl<U: Upstream, S: StatePort> Ctx<'_, U, S> {
                             dst_root: dst_path.clone(),
                         });
                         kept.retain(|(destination, source)| {
-                            !(path::within(&src_path, source)
-                                && path::within(&dst_path, destination))
+                            !same_mapping(&src_path, &dst_path, source, destination)
                         });
                     }
                     if !ops.is_empty() {
@@ -2844,10 +2858,12 @@ fn removal_plan(deleted: &[String]) -> Vec<Op> {
     ops
 }
 
-/// The stateful collections a plan removes: each at or under `tree`, with
-/// a deleted key under it and no remaining one. Each is judged on its own,
-/// so a parent that survives does not keep a removed child's state, and
-/// each is then probed on its own ([`Ctx::forget_removed`]).
+/// The stateful collections a plan leaves empty: each at or under `tree`
+/// with no remaining key under it, when the plan deleted anything. The
+/// listing of `tree` was complete, so such a collection was removed now or
+/// held only stale state (a file S3 deleted directly). Each is judged on
+/// its own, so a parent that survives does not keep a removed child's
+/// state, and each is then probed on its own ([`Ctx::forget_removed`]).
 fn gone_folders<'d, 'r>(
     tree: Option<&str>,
     stateful: &[String],
@@ -2857,8 +2873,9 @@ fn gone_folders<'d, 'r>(
     let Some(root) = tree else {
         return Vec::new();
     };
-    let mut deleted: Vec<_> = deleted.collect();
-    deleted.sort_unstable();
+    if deleted.count() == 0 {
+        return Vec::new();
+    }
     let mut remaining: Vec<_> = remaining.collect();
     remaining.sort_unstable();
     stateful
@@ -2866,11 +2883,23 @@ fn gone_folders<'d, 'r>(
         .filter(|folder| {
             folder.ends_with('/')
                 && path::within(root, folder)
-                && path::has_prefix_member(&deleted, folder)
                 && !path::has_prefix_member(&remaining, folder)
         })
         .cloned()
         .collect()
+}
+
+/// Whether a ledger row (`source` moved to `destination`) is a member
+/// of the move `src_root` -> `dst_root`: the same path below each root.
+/// Kept in step with `Op::FinishMoveTree`.
+fn same_mapping(src_root: &str, dst_root: &str, source: &str, destination: &str) -> bool {
+    match (
+        source.strip_prefix(src_root),
+        destination.strip_prefix(dst_root),
+    ) {
+        (Some(from), Some(to)) => from == to,
+        _ => false,
+    }
 }
 
 /// Files and markers among `keys`: deletes run in these two groups.

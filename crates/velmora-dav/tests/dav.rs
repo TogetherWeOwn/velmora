@@ -1197,6 +1197,38 @@ async fn mutation_budget_refuses_the_entire_overwrite_before_copies_or_deletes()
 }
 
 #[tokio::test]
+async fn a_folder_delete_drops_the_state_of_a_file_s3_deleted_before() {
+    let w = World::new().await;
+    assert_eq!(w.s3_put("photos/", b"").await, 200);
+    assert_eq!(w.s3_put("photos/a.jpg", b"same bytes").await, 200);
+    w.req("PROPPATCH", "/dav/photos/a.jpg", &[], SET_X)
+        .await
+        .expect(207);
+    assert_eq!(w.s3_list("photos/a.jpg").await.len(), 1);
+    let r = w
+        .rig
+        .call(
+            &w.s3,
+            velmora_bridge::Method::Delete,
+            "/dav/photos/a.jpg",
+            &[],
+            &[],
+            b"",
+        )
+        .await;
+    assert_eq!(r.status, 204);
+    w.req("DELETE", "/dav/photos/", &[], b"").await.expect(204);
+    w.req("MKCOL", "/dav/photos/", &[], b"").await.expect(201);
+    w.req("PUT", "/dav/photos/a.jpg", &[], b"same bytes")
+        .await
+        .expect(201);
+    assert!(
+        !has_x(&w, "/dav/photos/a.jpg").await,
+        "a deleted folder's file kept its old property"
+    );
+}
+
+#[tokio::test]
 async fn depth_zero_overwrite_does_not_list_removed_subfolders() {
     let w = World::new().await;
     assert_eq!(w.s3_put("src/", b"").await, 200);
@@ -1337,6 +1369,68 @@ async fn a_completed_move_of_another_source_keeps_a_partial_moves_rows() {
         2,
         "only the other source's own rows are released"
     );
+}
+
+#[tokio::test]
+async fn a_completed_move_with_another_mapping_keeps_a_partial_moves_rows() {
+    let w = World::new().await;
+    assert_eq!(w.s3_put("staging/photos/a", b"old a").await, 200);
+    assert_eq!(w.s3_put("staging/photos/b", b"old b").await, 200);
+    w.storage_fault(
+        "PUT",
+        "archive/a",
+        StorageFault::Replace {
+            key: "staging/photos/a".into(),
+            body: b"new a".to_vec(),
+        },
+    );
+    w.req(
+        "MOVE",
+        "/dav/staging/photos/",
+        &[("destination", "/dav/archive/")],
+        b"",
+    )
+    .await
+    .expect(207);
+    assert_eq!(w.s3_get("staging/photos/b").await.0, 404);
+    // staging/ -> archive/ maps photos/b to archive/photos/b, so it is not
+    // a retry of the move that left archive/b as the only copy.
+    let r = w
+        .req(
+            "MOVE",
+            "/dav/staging/",
+            &[("destination", "/dav/archive/")],
+            b"",
+        )
+        .await;
+    r.expect(207);
+    assert!(r.text().contains("kept after a partial MOVE"));
+    let rows: i64 = w
+        .dav
+        .state
+        .dbs
+        .borrow()
+        .values()
+        .next()
+        .unwrap()
+        .0
+        .query_row(
+            "SELECT count(*) FROM moved_members WHERE destination = 'archive/b'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(rows, 1, "another move released a partial move's only copy");
+    assert_eq!(w.s3_put("other/c", b"c").await, 200);
+    w.req(
+        "COPY",
+        "/dav/other/",
+        &[("destination", "/dav/archive/")],
+        b"",
+    )
+    .await
+    .expect(207);
+    assert_eq!(w.s3_get("archive/b").await.1, b"old b");
 }
 
 #[tokio::test]
@@ -1707,6 +1801,12 @@ async fn a_storage_call_without_an_answer_stops_the_batch_and_dispatches_nothing
         .count();
     assert_eq!(deletes, 1, "a delete was dispatched after the timeout");
     assert_eq!(w.s3_get("dst/b").await.1, b"b");
+    // Storage may still commit the unanswered call, so the reservation is
+    // held until its lease runs out, not released at once.
+    let again = || w.req("COPY", "/dav/other/", &[("destination", "/dav/dst/")], b"");
+    again().await.expect(503);
+    w.advance_secs(4);
+    again().await.expect(204);
 }
 
 #[tokio::test]

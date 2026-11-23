@@ -274,9 +274,9 @@ pub enum Op {
         listed: Vec<(String, String)>,
         exact: Option<(String, String)>,
     },
-    /// Every collection at or under one of `roots` with a lock rooted at
-    /// it or a dead property on it. `Full` when there are more than
-    /// `limit`.
+    /// Every collection at or under one of `roots` that holds DAV state:
+    /// a lock rooted at it or at a file directly in it, or a dead property
+    /// on either. `Full` when there are more than `limit`.
     FoldersWithState {
         roots: Vec<String>,
         limit: usize,
@@ -284,7 +284,8 @@ pub enum Op {
     /// Remove the matching ledger rows after all source deletes succeeded.
     FinishMove(Vec<MovedMember>),
     /// A tree MOVE completed: earlier partial attempts of the same move
-    /// (source under `src_root`, destination under `dst_root`) are done.
+    /// (source under `src_root`, destination under `dst_root`, the same
+    /// path below each) are done.
     FinishMoveTree {
         src_root: String,
         dst_root: String,
@@ -945,13 +946,15 @@ impl<S: Sql> Engine<'_, S> {
                 let mut stateful = std::collections::BTreeSet::new();
                 let cap = i64::try_from(limit.saturating_add(1)).unwrap_or(i64::MAX);
                 for root in roots {
-                    // Indexed range lookups; only collection paths end in '/'.
+                    // Indexed range lookups. `rtrim(p, replace(p, '/', ''))`
+                    // is `p` up to its last '/': a collection itself, or the
+                    // collection a file is in.
                     let end = range_end(&root).ok_or("not a collection")?;
                     for query in [
-                        "SELECT DISTINCT root FROM locks WHERE root >= ?1 AND root < ?2 \
-                         AND substr(root, -1) = '/' LIMIT ?3",
-                        "SELECT DISTINCT path FROM dav_props WHERE path >= ?1 AND path < ?2 \
-                         AND substr(path, -1) = '/' LIMIT ?3",
+                        "SELECT DISTINCT rtrim(root, replace(root, '/', '')) FROM locks \
+                         WHERE root >= ?1 AND root < ?2 LIMIT ?3",
+                        "SELECT DISTINCT rtrim(path, replace(path, '/', '')) FROM dav_props \
+                         WHERE path >= ?1 AND path < ?2 LIMIT ?3",
                     ] {
                         let rows = self.sql.exec(query, &[t(&root), t(&end), Val::Int(cap)])?;
                         stateful.extend(rows.into_iter().map(|row| row[0].text()));
@@ -979,9 +982,12 @@ impl<S: Sql> Engine<'_, S> {
             Op::FinishMoveTree { src_root, dst_root } => {
                 let src_end = range_end(&src_root).ok_or("not a source collection")?;
                 let dst_end = range_end(&dst_root).ok_or("not a destination collection")?;
+                // Only the same move: the same path below each root, so a
+                // row from a move with another mapping stays protected.
                 self.sql.exec(
                     "DELETE FROM moved_members WHERE destination >= ?1 AND destination < ?2 \
-                     AND source >= ?3 AND source < ?4",
+                     AND source >= ?3 AND source < ?4 \
+                     AND substr(destination, length(?1) + 1) = substr(source, length(?3) + 1)",
                     &[t(&dst_root), t(&dst_end), t(&src_root), t(&src_end)],
                 )?;
                 Ok(Reply::Done)
