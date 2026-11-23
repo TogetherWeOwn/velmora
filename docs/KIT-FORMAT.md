@@ -1,5 +1,7 @@
 # Velmora recovery kit, format 1
 
+2026-11-23 — Bound drill sample evidence to the generation and exact selected plan recording times.
+
 2026-11-23 — Named the drill sample evidence sources and assigned exactly 1 GiB to the middle bin.
 
 2026-11-23 — Defined index and pack decoding bounds, required explicit plan states, preserved object headers and checksums, and kept sample plan revisions fixed.
@@ -66,7 +68,7 @@ Each kit is a self-contained full build. There are no deltas or predecessor meta
 
 ### Drill sample inputs
 
-The local sampler requires an independent evidence list. Each JSON row includes `bucket_name`, `key`, `size` in bytes, `md5` as 16 byte values, and `source` (`run48-released` for already release-checked Usenet reads through 1 GiB inclusive, or `full-verify` for a completed whole-object Usenet read above 1 GiB). Match all identity fields to the authenticated index; plan presence alone never qualifies an object. Historical evidence does not guarantee current provider availability. A sample copies the full index's exact selected extent plan revisions.
+The local sampler requires JSON with an `objects` list and an `article_recorded_at` map. Each object row includes `bucket_name`, `key`, `size` in bytes, `md5` as 16 byte values, `source` (`run48-released` for already release-checked Usenet reads through 1 GiB inclusive, or `full-verify` for a completed whole-object Usenet read above 1 GiB), and `evidence_at`, the read time in UTC epoch milliseconds. The map associates exact article record names from the frozen source listing with their UTC epoch-millisecond recording time or a conservative upper bound (such as the mirror's LastModified). Match the object identity to the authenticated index and authenticate the relevant sealed records. Exclude the object unless its generation creation time and every selected plan's recording bound are known and not later than `evidence_at`. Historical evidence does not guarantee current provider availability. A sample copies the full index's exact selected extent plan revisions.
 
 ### Rust reader integration
 

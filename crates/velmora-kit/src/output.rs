@@ -56,16 +56,29 @@ pub fn publish(outputs: &[&Staged]) -> Result<(), Error> {
         output.file.sync_all().map_err(|_| Error::Io)?;
     }
     let mut linked = Vec::new();
-    for output in outputs {
-        if fs::hard_link(&output.temporary, &output.destination).is_err() {
-            for link in linked {
-                let _ = fs::remove_file(link);
-            }
-            return Err(Error::Io);
+    let result = (|| {
+        for output in outputs {
+            fs::hard_link(&output.temporary, &output.destination).map_err(|_| Error::Io)?;
+            linked.push(&output.destination);
         }
-        linked.push(&output.destination);
+        #[cfg(unix)]
+        for path in &linked {
+            let parent = path
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or(Path::new("."));
+            File::open(parent)
+                .and_then(|dir| dir.sync_all())
+                .map_err(|_| Error::Io)?;
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        for link in linked {
+            let _ = fs::remove_file(link);
+        }
     }
-    Ok(())
+    result
 }
 
 #[cfg(test)]

@@ -88,14 +88,15 @@ fn run() -> Result<(), Error> {
                 full_id.to_str().ok_or(Error::Format)?,
                 &kek,
             )?;
-            let evidence: Vec<sample::Evidence> = serde_json::from_reader(BufReader::new(
+            let evidence: sample::EvidenceFile = serde_json::from_reader(BufReader::new(
                 File::open(evidence).map_err(|_| Error::Io)?,
             ))
             .map_err(|_| Error::Format)?;
             let sample_id = sample_id.to_str().ok_or(Error::Format)?;
-            let candidates = sample::match_candidates(&all, &evidence);
-            let objects = sample::choose(&all, &candidates, sample_id)?;
             let staging = Path::new(staging);
+            let candidates =
+                sample::temporal_candidates(&all, &evidence, |n| staged_record(staging, n), &kek)?;
+            let objects = sample::choose(&all, &candidates, sample_id)?;
             let selected = sample::records(&all, &objects, |n| staged_record(staging, n), &kek)?;
             let live_count = objects.len();
             let projection = sample::Projection::new(&objects, &selected.names);

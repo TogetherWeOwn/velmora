@@ -188,7 +188,7 @@ pub fn records(
 
 /// Translate independent evidence identities to generation IDs using a
 /// bucket/key/size join plus an equal source MD5 in the authenticated index.
-pub fn match_candidates(entries: &[Entry], evidence: &[Evidence]) -> Vec<String> {
+fn match_candidates(entries: &[Entry], evidence: &[Evidence]) -> BTreeMap<String, i64> {
     let names: BTreeMap<_, _> = entries
         .iter()
         .filter_map(|e| match e {
@@ -196,30 +196,30 @@ pub fn match_candidates(entries: &[Entry], evidence: &[Evidence]) -> Vec<String>
             _ => None,
         })
         .collect();
-    let want: BTreeSet<_> = evidence
-        .iter()
-        .filter(|e| {
-            e.md5.len() == 16
-                && match e.source {
-                    EvidenceSource::Run48Released => (1..=1_073_741_824).contains(&e.size),
-                    EvidenceSource::FullVerify => e.size > 1_073_741_824,
-                }
-        })
-        .map(|e| {
-            (
-                (e.bucket_name.as_str(), e.key.as_str(), e.size),
-                e.md5.as_slice(),
-            )
-        })
-        .collect();
+    let mut want = BTreeMap::new();
+    for e in evidence.iter().filter(|e| {
+        e.md5.len() == 16
+            && e.evidence_at > 0
+            && match e.source {
+                EvidenceSource::Run48Released => (1..=1_073_741_824).contains(&e.size),
+                EvidenceSource::FullVerify => e.size > 1_073_741_824,
+            }
+    }) {
+        let identity = (
+            (e.bucket_name.as_str(), e.key.as_str(), e.size),
+            e.md5.as_slice(),
+        );
+        let cutoff = want.entry(identity).or_insert(e.evidence_at);
+        *cutoff = (*cutoff).max(e.evidence_at);
+    }
     entries
         .iter()
         .filter_map(|e| {
             let Entry::Object(o) = e else { return None };
             let name = names.get(o.bucket_id.as_str())?;
             let md5 = o.source_md5.as_ref()?;
-            want.contains(&((*name, o.key.as_str(), o.size), md5.as_slice()))
-                .then(|| o.generation_id.clone())
+            want.get(&((*name, o.key.as_str(), o.size), md5.as_slice()))
+                .map(|&at| (o.generation_id.clone(), at))
         })
         .collect()
 }
@@ -231,6 +231,15 @@ pub struct Evidence {
     size: u64,
     md5: Vec<u8>,
     source: EvidenceSource,
+    evidence_at: i64,
+}
+
+#[derive(serde::Deserialize)]
+pub struct EvidenceFile {
+    objects: Vec<Evidence>,
+    /// Upper bound on original recording time, from the same e2 listing
+    /// whose byte-exact sealed records were authenticated into the index.
+    article_recorded_at: BTreeMap<String, i64>,
 }
 
 #[derive(serde::Deserialize)]
@@ -238,6 +247,141 @@ pub struct Evidence {
 enum EvidenceSource {
     Run48Released,
     FullVerify,
+}
+
+#[derive(Default)]
+struct RecordedTimes {
+    generations: BTreeMap<String, i64>,
+    plans: BTreeMap<(String, u32), Option<i64>>,
+}
+
+impl RecordedTimes {
+    fn permits(&self, object: &Object, evidence_at: i64, revisions: &BTreeMap<&str, u32>) -> bool {
+        self.generations
+            .get(&object.generation_id)
+            .is_some_and(|&at| at >= 0 && at <= evidence_at)
+            && object.extents.iter().all(|r| {
+                let Some(rev) = revisions.get(r.id.as_str()) else {
+                    return false;
+                };
+                self.plans
+                    .get(&(r.id.clone(), *rev))
+                    .copied()
+                    .flatten()
+                    .is_some_and(|at| at > 0 && at <= evidence_at)
+            })
+    }
+}
+
+pub fn temporal_candidates(
+    entries: &[Entry],
+    evidence: &EvidenceFile,
+    mut get: impl FnMut(&str) -> Result<Option<Vec<u8>>, Error>,
+    kek: &impl Kek,
+) -> Result<Vec<String>, Error> {
+    let joined = match_candidates(entries, &evidence.objects);
+    let objects: BTreeMap<_, _> = entries
+        .iter()
+        .filter_map(|e| match e {
+            Entry::Object(o) if joined.contains_key(&o.generation_id) => {
+                Some((o.generation_id.as_str(), o))
+            }
+            _ => None,
+        })
+        .collect();
+    let requested: BTreeSet<_> = objects
+        .values()
+        .flat_map(|o| &o.extents)
+        .map(|r| r.id.as_str())
+        .collect();
+    let extents: BTreeMap<_, _> = entries
+        .iter()
+        .filter_map(|e| match e {
+            Entry::Extent(e) if e.plan_rev.is_some() && requested.contains(e.id.as_str()) => {
+                Some((e.id.as_str(), e))
+            }
+            _ => None,
+        })
+        .collect();
+    let revisions = extents
+        .iter()
+        .filter_map(|(&id, e)| e.plan_rev.map(|rev| (id, rev)))
+        .collect();
+    let mut times = RecordedTimes::default();
+    for entry in entries {
+        let Entry::RecordRef(reference) = entry else {
+            continue;
+        };
+        let Some(r) = record_name(&reference.name) else {
+            continue;
+        };
+        match r.kind {
+            RecordKind::Generation if objects.contains_key(r.id) => {}
+            RecordKind::ArticlePlan if extents.contains_key(r.id) => {}
+            _ => continue,
+        }
+        let sealed = get(&reference.name)?.ok_or(Error::Record)?;
+        if Sha256::digest(&sealed).as_slice() != reference.sha256 {
+            return Err(Error::Coverage);
+        }
+        let plain =
+            open_manifest(kek, &reference.name, &sealed).map_err(|_| Error::Authentication)?;
+        match r.kind {
+            RecordKind::Generation => {
+                let g: GenerationIdentity =
+                    serde_json::from_slice(&plain).map_err(|_| Error::Record)?;
+                let o = objects[r.id];
+                if g.generation.id != o.generation_id
+                    || g.bucket.id != o.bucket_id
+                    || g.generation.key != o.key
+                {
+                    return Err(Error::Record);
+                }
+                let at = times
+                    .generations
+                    .entry(g.generation.id)
+                    .or_insert(g.generation.created_at);
+                *at = (*at).max(g.generation.created_at);
+            }
+            RecordKind::ArticlePlan => {
+                let p: velmora_bridge::recovery::ArticleManifest =
+                    serde_json::from_slice(&plain).map_err(|_| Error::Record)?;
+                let e = extents[r.id];
+                if p.extent_id != e.id {
+                    return Err(Error::Record);
+                }
+                if Some(p.plan_rev) != e.plan_rev {
+                    continue;
+                }
+                if p.articles.len() != e.articles.len()
+                    || !p.articles.iter().zip(&e.articles).all(|(a, b)| {
+                        a.message_id == b.message_id
+                            && a.newsgroup == b.newsgroup
+                            && a.payload_sha256 == b.payload_sha256
+                            && a.yenc_name == b.yenc_name
+                    })
+                {
+                    return Err(Error::Coverage);
+                }
+                let observed = evidence.article_recorded_at.get(&reference.name).copied();
+                times
+                    .plans
+                    .entry((p.extent_id, p.plan_rev))
+                    .and_modify(|at| {
+                        // Multiple layouts can contain the same plan. Use the
+                        // latest observed copy time; an unknown never votes yes.
+                        *at = (*at).zip(observed).map(|(a, b)| a.max(b));
+                    })
+                    .or_insert(observed);
+            }
+            RecordKind::Tombstone => unreachable!(),
+        }
+    }
+    Ok(objects
+        .into_values()
+        .filter(|o| times.permits(o, joined[&o.generation_id], &revisions))
+        .map(|o| o.generation_id.clone())
+        .collect())
 }
 
 /// A sample is a projection of an authenticated full index, never a new
@@ -323,6 +467,7 @@ mod tests {
                     key: id.clone(),
                     size,
                     md5: vec![0; 16],
+                    evidence_at: 100,
                     source: if size > (1 << 30) {
                         EvidenceSource::FullVerify
                     } else {
@@ -363,7 +508,7 @@ mod tests {
                 sha256: vec![0; 32],
             }));
         }
-        let matched = match_candidates(&entries, &evidence);
+        let matched: Vec<_> = match_candidates(&entries, &evidence).into_keys().collect();
         let objects = choose(&entries, &matched, "seed").unwrap();
         assert_eq!(objects.len(), 20);
         assert_eq!(objects.iter().filter(|o| o.size == 1 << 30).count(), 9);
@@ -385,15 +530,14 @@ mod tests {
                 .count(),
             2
         );
-        assert!(choose(
-            &entries,
-            &match_candidates(&entries, &evidence[1..]),
-            "seed"
-        )
-        .is_err());
-        assert!(choose(&entries, &match_candidates(&entries, &[]), "seed").is_err());
+        let eligible = |evidence: &[Evidence]| {
+            let candidates: Vec<_> = match_candidates(&entries, evidence).into_keys().collect();
+            choose(&entries, &candidates, "seed").is_ok()
+        };
+        assert!(!eligible(&evidence[1..]));
+        assert!(!eligible(&[]));
         evidence.last_mut().unwrap().source = EvidenceSource::Run48Released;
-        assert!(choose(&entries, &match_candidates(&entries, &evidence), "seed").is_err());
+        assert!(!eligible(&evidence));
         let Entry::Extent(e) = &mut entries[0] else {
             unreachable!()
         };
@@ -405,13 +549,136 @@ mod tests {
     fn evidence_file_requires_a_recognized_source() {
         for json in [
             r#"{"bucket_name":"b","key":"k","size":1,"md5":[]}"#,
-            r#"{"bucket_name":"b","key":"k","size":1,"md5":[],"source":"article-plan"}"#,
+            r#"{"bucket_name":"b","key":"k","size":1,"md5":[],"source":"article-plan","evidence_at":100}"#,
+            r#"{"bucket_name":"b","key":"k","size":1,"md5":[],"source":"run48-released"}"#,
         ] {
             assert!(serde_json::from_str::<Evidence>(json).is_err());
         }
         assert!(serde_json::from_str::<Evidence>(
-            r#"{"bucket_name":"b","key":"k","size":1,"md5":[],"source":"run48-released"}"#
+            r#"{"bucket_name":"b","key":"k","size":1,"md5":[],"source":"run48-released","evidence_at":100}"#
         )
         .is_ok());
+    }
+
+    fn timeline_case(created_at: i64, plan_rev: u32, recorded: Option<i64>) -> Vec<String> {
+        use velmora::rng::SystemRng;
+        use velmora_bridge::{crypto::seal_manifest, recovery, types::KekBytes};
+        struct Key(KekBytes);
+        impl Kek for Key {
+            fn active(&self) -> (u32, &KekBytes) {
+                (1, &self.0)
+            }
+            fn version(&self, v: u32) -> Option<&KekBytes> {
+                (v == 1).then_some(&self.0)
+            }
+        }
+        let key = Key(KekBytes::new([3; 32]));
+        let gid = "g_00000000000000000000000000042";
+        let gen = recovery::GenerationManifest {
+            v: 1,
+            bucket: recovery::BucketRecord {
+                id: "b_test".into(),
+                name: "bucket".into(),
+                owner: "owner".into(),
+                bdk_wrapped: vec![1; 73],
+                kek_version: 1,
+                disposable: false,
+                created_at: 1,
+            },
+            generation: recovery::GenerationRecord {
+                id: gid.into(),
+                key: "same-bytes".into(),
+                size: 1,
+                etag: "unchanged-digest".into(),
+                content_json: "{}".into(),
+                user_meta_json: "{}".into(),
+                checksum_json: None,
+                created_at,
+            },
+            extents: vec![recovery::ExtentRecord {
+                id: "x_test".into(),
+                seq: 0,
+                plain_offset: 0,
+                plain_size: 1,
+                cipher_size: 65,
+                media_header: vec![0; 48],
+                key_mode: 1,
+                wrapped_file_key: vec![1; 73],
+                plain_md5: vec![0; 16],
+                plain_sha256: vec![0; 32],
+                cipher_sha256: vec![0; 32],
+                created_at: 1,
+            }],
+        };
+        let article = |rev| recovery::ArticleManifest {
+            v: 1,
+            extent_id: "x_test".into(),
+            plan_rev: rev,
+            articles: vec![recovery::ArticleRecord {
+                idx: 0,
+                message_id: format!("article-{rev}"),
+                newsgroup: "alt.binaries.test".into(),
+                headers: vec![],
+                cipher_offset: 0,
+                cipher_len: 65,
+                payload_sha256: vec![0; 32],
+                yenc_name: None,
+            }],
+            packed: None,
+            parity: None,
+        };
+        let new_plan = "m/x/t_1/art/x_test";
+        let mut records = BTreeMap::new();
+        for (name, body) in [
+            (format!("m/{gid}"), serde_json::to_vec(&gen).unwrap()),
+            (
+                "m/art/x_test".into(),
+                serde_json::to_vec(&article(1)).unwrap(),
+            ),
+            (
+                new_plan.into(),
+                serde_json::to_vec(&article(plan_rev)).unwrap(),
+            ),
+        ] {
+            let sealed = seal_manifest(&key, &name, &body, &mut SystemRng).unwrap();
+            records.insert(name, sealed);
+        }
+        let mut ann = velmora_kit::BuildAnnotations::default();
+        ann.source_md5.insert(gid.into(), vec![0; 16]);
+        let entries = velmora_kit::build_entries(
+            records.keys().cloned(),
+            |n| Ok(records.get(n).cloned()),
+            &key,
+            &ann,
+        )
+        .unwrap();
+        let mut evidence = EvidenceFile {
+            objects: vec![Evidence {
+                bucket_name: "bucket".into(),
+                key: "same-bytes".into(),
+                size: 1,
+                md5: vec![0; 16],
+                source: EvidenceSource::Run48Released,
+                evidence_at: 100,
+            }],
+            article_recorded_at: BTreeMap::from([("m/art/x_test".into(), 80)]),
+        };
+        if let Some(at) = recorded {
+            evidence.article_recorded_at.insert(new_plan.into(), at);
+        }
+        temporal_candidates(&entries, &evidence, |n| Ok(records.get(n).cloned()), &key).unwrap()
+    }
+
+    #[test]
+    fn identical_bytes_overwritten_after_evidence_do_not_match() {
+        assert_eq!(timeline_case(100, 1, Some(90)).len(), 1);
+        assert!(timeline_case(101, 1, Some(90)).is_empty());
+    }
+
+    #[test]
+    fn sample_never_falls_back_to_old_revision_to_pass_time_check() {
+        assert_eq!(timeline_case(90, 2, Some(100)).len(), 1);
+        assert!(timeline_case(90, 2, Some(101)).is_empty());
+        assert!(timeline_case(90, 2, None).is_empty());
     }
 }
