@@ -251,9 +251,10 @@ const _: () = assert!(MAX_SEGMENTS <= HEAD_SEGMENTS);
 /// Source keys read per page.
 pub const PAGE: u32 = 1000;
 /// Which `VMR2` key versions the reloaded rings lacked, and since when:
-/// a JSON object, `<tenant>/<version>` to `[first, last, paged]`, the
-/// first and last time a job found it missing and the pass slot it was
-/// last paged in. A hint like the others: lost, it delays the page of a
+/// a JSON object, `<tenant>/<version>` to `[first, last, paged]`: the
+/// pass slot a job first found it missing in, the last time one did, and
+/// the pass slot it was last paged in (a slot is the start of its
+/// [`PASS_INTERVAL_MS`]). A hint like the others: lost, it delays the page of a
 /// partial ring by [`KEY_MISS_PASSES`] passes at most, and never stops
 /// one for a version the chain does not name.
 pub const KEY_MISS_KEY: &str = "rc/key-miss";
@@ -1403,9 +1404,11 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend, R: TenantRings> Copier<'_, B, 
         for (tenant, version, named) in misses {
             let mark = marks
                 .entry(format!("{tenant}/{version}"))
-                .or_insert([now, now, i64::MIN]);
+                .or_insert([slot, now, i64::MIN]);
             mark[1] = mark[1].max(now);
-            let due = !named || now - mark[0] >= KEY_MISS_PASSES * PASS_INTERVAL_MS;
+            // By pass slots: missing in the slots of 4 passes, it pages in
+            // the fifth, whatever the time within each.
+            let due = !named || slot - mark[0] >= KEY_MISS_PASSES * PASS_INTERVAL_MS;
             if due && mark[2] != slot {
                 mark[2] = slot;
                 let kind = if named { "partial" } else { "unknown" };
