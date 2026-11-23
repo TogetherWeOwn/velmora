@@ -1705,8 +1705,10 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend, R: TenantRings> Copier<'_, B, 
         // seen.
         let _ = self.rings.take_misses();
         let names: Vec<String> = marks.keys().cloned().collect();
+        // Saved before any claim is asked for: a claim that hangs keeps
+        // nothing the recheck learned from the mark.
+        let saved = self.save_misses(marks.clone()).await;
         self.page_due(&marks, names.iter(), slot).await;
-        let saved = self.save_misses(marks).await;
         // The cursor moves on only past what was saved: otherwise the
         // same tenants are looked at again.
         if let Some(tenant) = came_to.filter(|_| saved) {
@@ -1772,11 +1774,11 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend, R: TenantRings> Copier<'_, B, 
             mark[2] = miss_code(miss);
             names.push(name);
         }
+        // Saved first: a claim that hangs must not keep a new entry from
+        // the mark, which the next pass's first job pages from.
+        let saved = readable && self.save_misses(marks.clone()).await;
         self.page_due(&marks, names.iter(), slot).await;
-        if !readable {
-            return false;
-        }
-        self.save_misses(marks).await
+        saved
     }
 
     /// The managed tenant whose directory the sweep goes through after
