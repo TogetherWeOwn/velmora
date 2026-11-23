@@ -66,10 +66,6 @@ pub enum StorageFault {
         key: String,
         body: Vec<u8>,
     },
-    /// An S3 delete of `key` after the response, before the gateway has it.
-    Remove {
-        key: String,
-    },
     Pause {
         reached: tokio::sync::oneshot::Sender<()>,
         resume: tokio::sync::oneshot::Receiver<()>,
@@ -174,16 +170,6 @@ impl Upstream for Up {
                     assert_eq!(resp.status, 200);
                     let signer = Signer::new(S3KEY, S3KEY_SECRET);
                     assert_eq!(self.rig.put(&signer, BUCKET, &key, &body).await.status, 200);
-                }
-                Some(StorageFault::Remove { key }) => {
-                    assert_eq!(resp.status, 200);
-                    let signer = Signer::new(S3KEY, S3KEY_SECRET);
-                    let path = service_support::path(BUCKET, &key);
-                    let r = self
-                        .rig
-                        .call(&signer, Method::Delete, &path, &[], &[], b"")
-                        .await;
-                    assert_eq!(r.status, 204);
                 }
                 Some(StorageFault::Pause { reached, resume }) => {
                     reached.send(()).unwrap();
@@ -539,6 +525,21 @@ impl World {
             .await;
         let etag = r.header("etag").map(str::to_owned);
         (r.status, r.body, etag)
+    }
+
+    /// DeleteObject through the S3 entry point; its status.
+    pub async fn s3_delete(&self, key: &str) -> u16 {
+        self.rig
+            .call(
+                &self.s3,
+                Method::Delete,
+                &service_support::path(BUCKET, key),
+                &[],
+                &[],
+                b"",
+            )
+            .await
+            .status
     }
 
     pub async fn s3_put(&self, key: &str, body: &[u8]) -> u16 {

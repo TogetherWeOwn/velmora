@@ -1078,10 +1078,15 @@ Use an S3 tool to list them all.</p>",
         let mut locks: Vec<Vec<Lock>> = vec![Vec::new(); resources.len()];
         let now = self.dav.up.now_ms() / 1000;
         if let (Some(bucket), true) = (&bucket, want.needs_state()) {
-            let paths: Vec<String> = resources.iter().map(|r| r.key.clone()).collect();
-            let mut ops = vec![Op::Discover {
-                paths: paths.clone(),
-            }];
+            // Locks only for an answer that shows them: their discovery is
+            // bounded, and a request for other properties is not refused
+            // for it.
+            let mut ops = Vec::new();
+            if want.needs_locks() {
+                ops.push(Op::Discover {
+                    paths: resources.iter().map(|r| r.key.clone()).collect(),
+                });
+            }
             if want.needs_dead() {
                 ops.push(Op::PropGet {
                     paths: resources
@@ -2032,7 +2037,7 @@ Use an S3 tool to list them all.</p>",
                         vec![Op::FindMoved {
                             holder: holder.clone(),
                             root: dest_collection.map(str::to_owned),
-                            listed: listed.clone(),
+                            listed,
                             exact,
                         }],
                     )
@@ -2044,18 +2049,16 @@ Use an S3 tool to list them all.</p>",
                 };
                 let protected: HashMap<_, _> = protected.into_iter().collect();
                 // A kept member may hold the only copy of a partially moved
-                // file: no member of another folder replaces it. Refused
-                // before any change, so nothing is copied. The same mapping
-                // (a retry of the move, or its source copied again) and
-                // identical bytes lose nothing.
-                let listed: HashMap<_, _> = listed.into_iter().collect();
+                // file: no member of another folder replaces it, not even
+                // with the same bytes, since a replacement clears the record
+                // that keeps it from a later prune. Refused before any
+                // change, so nothing is copied. The same mapping (a retry of
+                // the move, or its source copied again) proceeds.
                 let replaced: Vec<(String, String)> = members
                     .iter()
-                    .filter_map(|(entry, dest)| {
+                    .filter_map(|(_, dest)| {
                         let source = protected.get(dest)?;
-                        let retry = same_mapping(&src_path, &dst_path, source, dest);
-                        let same_bytes = listed.get(dest) == Some(&entry.etag);
-                        (!dest.ends_with('/') && !retry && !same_bytes)
+                        (!dest.ends_with('/') && !same_mapping(&src_path, &dst_path, source, dest))
                             .then(|| (dest.clone(), source.clone()))
                     })
                     .collect();
@@ -3368,6 +3371,18 @@ impl Want {
             Want::Props(names) => names
                 .iter()
                 .any(|(ns, n)| ns != DAV || !LIVE.contains(&n.as_str()) || n == "lockdiscovery"),
+        }
+    }
+
+    /// Whether the answer shows `lockdiscovery` values: `allprop`, or a
+    /// request that names it. `propname` names it without a value.
+    fn needs_locks(&self) -> bool {
+        match self {
+            Want::AllProp => true,
+            Want::PropName => false,
+            Want::Props(names) => names
+                .iter()
+                .any(|(ns, n)| ns == DAV && n == "lockdiscovery"),
         }
     }
 

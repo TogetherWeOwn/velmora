@@ -80,14 +80,18 @@ async fn a_folder_delete_counts_a_member_deleted_meanwhile_as_deleted() {
     for (key, body) in [("docs/report.txt", &b"A"[..]), ("docs/other.txt", b"x")] {
         assert_eq!(w.s3_put(key, body).await, 200);
     }
-    w.storage_fault_target(
-        "GET",
-        LIST_DOCS,
-        StorageFault::Remove {
-            key: "docs/report.txt".into(),
-        },
-    );
-    w.req("DELETE", "/dav/docs/", &[], b"").await.expect(204);
+    let (reached, waiting) = tokio::sync::oneshot::channel();
+    let (release, resume) = tokio::sync::oneshot::channel();
+    w.storage_fault_target("GET", LIST_DOCS, StorageFault::Pause { reached, resume });
+    let mut deleting = std::pin::pin!(w.req("DELETE", "/dav/docs/", &[], b""));
+    tokio::select! {
+        r = deleting.as_mut() => panic!("DELETE finished before its listing paused: {}", r.status),
+        r = waiting => r.unwrap(),
+    }
+    // An S3 client deletes a listed file before the DELETE reaches it.
+    assert_eq!(w.s3_delete("docs/report.txt").await, 204);
+    release.send(()).unwrap();
+    deleting.await.expect(204);
     assert!(w.s3_list("docs/").await.is_empty());
 }
 
@@ -158,14 +162,12 @@ async fn a_property_edit_waits_for_a_save_in_progress() {
     assert!(all_props(&w, "/dav/f").await.contains("rating-value"));
 }
 
-#[tokio::test]
-async fn a_folder_overwrite_refuses_to_replace_a_member_kept_after_a_partial_move() {
-    let w = World::new().await;
+/// A partial MOVE of src/ to dst/: src/a changes while the copies
+/// settle, so only src/b goes, and dst/b holds its only copy.
+async fn partial_move(w: &World) {
     for (key, body) in [("src/a", &b"old a"[..]), ("src/b", b"old b")] {
         assert_eq!(w.s3_put(key, body).await, 200);
     }
-    // A partial MOVE: src/a changes while the copies settle, so only
-    // src/b goes, and dst/b holds its only copy.
     let (reached, waiting) = tokio::sync::oneshot::channel();
     let (release, resume) = tokio::sync::oneshot::channel();
     w.storage_fault("PUT", "dst/", StorageFault::Pause { reached, resume });
@@ -180,7 +182,12 @@ async fn a_folder_overwrite_refuses_to_replace_a_member_kept_after_a_partial_mov
     moving.await.expect(207);
     assert_eq!(w.s3_get("src/b").await.0, 404);
     assert_eq!(w.s3_get("dst/b").await.1, b"old b");
+}
 
+#[tokio::test]
+async fn a_folder_overwrite_refuses_to_replace_a_member_kept_after_a_partial_move() {
+    let w = World::new().await;
+    partial_move(&w).await;
     assert_eq!(w.s3_put("other/b", b"other b").await, 200);
     let before = w.s3_list("").await;
     let r = w
@@ -195,6 +202,26 @@ async fn a_folder_overwrite_refuses_to_replace_a_member_kept_after_a_partial_mov
     assert!(r.text().contains("/dav/dst/b"), "{}", r.text());
     assert_eq!(w.s3_get("dst/b").await.1, b"old b");
     assert_eq!(w.s3_list("").await, before);
+}
+
+#[tokio::test]
+async fn an_identical_copy_keeps_the_partial_move_record() {
+    let w = World::new().await;
+    partial_move(&w).await;
+    // The same bytes from another folder: refused, so the record that
+    // keeps dst/b from a prune stays.
+    assert_eq!(w.s3_put("other/b", b"old b").await, 200);
+    let r = w
+        .req("COPY", "/dav/other/", &[("destination", "/dav/dst/")], b"")
+        .await;
+    r.expect(207);
+    assert!(r.text().contains("/dav/dst/b"), "{}", r.text());
+    // A later overwrite that leaves dst/b out keeps it.
+    assert_eq!(w.s3_put("third/c", b"c").await, 200);
+    w.req("COPY", "/dav/third/", &[("destination", "/dav/dst/")], b"")
+        .await
+        .expect(207);
+    assert_eq!(w.s3_get("dst/b").await.1, b"old b");
 }
 
 #[tokio::test]
@@ -247,6 +274,17 @@ async fn lock_discovery_of_a_large_listing_is_bounded() {
     w.req("PROPFIND", "/dav/big/", &[("depth", "1")], &discovery)
         .await
         .expect(507);
+    // A request that does not show lock discovery is not refused for it.
+    let custom =
+        br#"<D:propfind xmlns:D="DAV:"><D:prop><Z:title xmlns:Z="urn:z"/></D:prop></D:propfind>"#;
+    let propname = br#"<D:propfind xmlns:D="DAV:"><D:propname/></D:propfind>"#;
+    for body in [&custom[..], &propname[..]] {
+        let r = w
+            .req("PROPFIND", "/dav/big/", &[("depth", "1")], body)
+            .await;
+        r.expect(207);
+        assert_eq!(r.hrefs().len(), 2001);
+    }
     // A single resource still answers.
     let r = w
         .req("PROPFIND", "/dav/big/0001", &[("depth", "0")], &discovery)
