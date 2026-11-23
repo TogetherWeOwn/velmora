@@ -9,11 +9,14 @@
 //!
 //! Nothing of a request or an answer is logged.
 
+use std::cell::Cell;
 use std::time::Duration;
 
 use futures_util::future::{select, Either};
 use futures_util::StreamExt;
-use velmora_bridge::remote::{HttpRequest, HttpResponse, HttpSend, NoAnswer};
+use velmora_bridge::remote::{
+    HttpRequest, HttpResponse, HttpSend, Problem, TransportError, MAX_AUDIT_BYTES,
+};
 
 use worker::{
     js_sys::Uint8Array, AbortController, Delay, Fetch, Headers, Method, Request, RequestInit,
@@ -23,9 +26,18 @@ use worker::{
 /// Bound of one request, the answer's body included.
 const TIMEOUT: Duration = Duration::from_secs(15);
 /// Answer headers the bridge reads.
-const KEPT: [&str; 2] = ["content-length", "etag"];
+const KEPT: [&str; 3] = ["content-length", "etag", "x-amz-error-code"];
 
-pub struct FetchHttp;
+#[derive(Default)]
+pub struct FetchHttp {
+    pub first_problem: Cell<Option<Problem>>,
+}
+
+fn status_only(request: &HttpRequest, status: u16) -> bool {
+    // The audit only needs the status of non-200 replies. A long or
+    // stalled error body must not turn a known 4xx into an unavailable GET.
+    request.method == "GET" && request.max_answer == MAX_AUDIT_BYTES && status != 200
+}
 
 /// True while `have` bytes and `more` to come are within `most`.
 fn fits(have: usize, more: usize, most: usize) -> bool {
@@ -35,7 +47,7 @@ fn fits(have: usize, more: usize, most: usize) -> bool {
 async fn exchange(
     request: &HttpRequest,
     signal: &worker::AbortSignal,
-) -> worker::Result<HttpResponse> {
+) -> worker::Result<Option<HttpResponse>> {
     let headers = Headers::new();
     for (name, value) in &request.headers {
         headers.set(name, value)?;
@@ -59,51 +71,64 @@ async fn exchange(
         .iter()
         .filter_map(|name| Some(((*name).to_string(), answer.headers().get(name).ok()??)))
         .collect();
-    // The body is read to its end or to the bound the request names,
-    // whichever comes first: a longer one is dropped where it is cut and
-    // is no answer. The answer to a HEAD has no body, and an answer
-    // without one (a 204, a 304) has no stream: its body is empty.
+    // None means the body exceeded the bound; keep that distinct from
+    // a failed exchange so the audit can count a proved size mismatch.
+    // A HEAD (and an audit error response) needs only status and headers.
     let mut body = Vec::new();
-    let chunks = match request.method {
-        "HEAD" => None,
-        _ => answer.stream().ok(),
+    let chunks = if request.method == "HEAD" || status_only(request, answer.status_code()) {
+        None
+    } else {
+        answer.stream().ok()
     };
     if let Some(mut chunks) = chunks {
         while let Some(chunk) = chunks.next().await {
             let chunk = chunk?;
             if !fits(body.len(), chunk.len(), request.max_answer) {
-                return Err(worker::Error::RustError("answer too long".into()));
+                return Ok(None);
             }
             body.extend_from_slice(&chunk);
         }
     }
-    Ok(HttpResponse {
+    Ok(Some(HttpResponse {
         status: answer.status_code(),
         headers,
         body,
-    })
+    }))
 }
 
 impl HttpSend for FetchHttp {
-    async fn send(&self, request: &HttpRequest) -> Result<HttpResponse, NoAnswer> {
+    async fn send(&self, request: &HttpRequest) -> Result<HttpResponse, TransportError> {
         let controller = AbortController::default();
         let signal = controller.signal();
         let work = std::pin::pin!(exchange(request, &signal));
         let limit = std::pin::pin!(Delay::from(TIMEOUT));
         match select(work, limit).await {
-            Either::Left((Ok(answer), _)) => Ok(answer),
-            // The timeout, a network error or a body that is too long:
-            // what is left of the exchange is cancelled, so that an
-            // unread body does not hold a connection.
-            _ => {
+            Either::Left((Ok(Some(answer)), _)) => {
+                if status_only(request, answer.status) {
+                    controller.abort();
+                }
+                Ok(answer)
+            }
+            Either::Left((Ok(None), _)) => {
                 controller.abort();
-                Err(NoAnswer)
+                Err(TransportError::BodyTooLong)
+            }
+            _ => {
+                // Cancel what is left of a timed-out or failed exchange.
+                controller.abort();
+                Err(TransportError::NoAnswer)
             }
         }
     }
 
     async fn pause(&self, ms: u64) {
         Delay::from(Duration::from_millis(ms)).await;
+    }
+
+    fn observe(&self, problem: Problem) {
+        if self.first_problem.get().is_none() {
+            self.first_problem.set(Some(problem));
+        }
     }
 }
 

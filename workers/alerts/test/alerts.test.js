@@ -18,11 +18,17 @@ const MIN = 60_000;
 const HOUR = 60 * MIN;
 const T0 = Date.UTC(2026, 10, 19, 12, 0, 0);
 
+function healthyRecovery(cat, at) {
+  cat.db.prepare(`INSERT INTO recovery_copy_log (at, kind, pass, swept, checked)
+    VALUES (?1, 'job', ?1, 1, 0), (?1, 'walk', ?1, 0, 0), (?1, 'audit', ?1, 0, 1)`).run(at);
+}
+
 function catalog() {
-  const d = new FakeD1();
-  d.applyDir(CATALOG_MIG);
+  const d = new FakeD1().applyDir(CATALOG_MIG);
   // Outbox rows here stand alone, without their extents.
   d.db.exec("PRAGMA foreign_keys = OFF");
+  healthyRecovery(d, T0);
+  healthyRecovery(d, T0 + store.DAY);
   return d;
 }
 
@@ -240,7 +246,9 @@ test("tick: dead-letter batches raise the DLQ alert; the queue handler acks", as
   let acked = false;
   await worker.queue({ queue: "velmora-dlq", messages: [{ body: { extent: "x1" } }, { body: "b" }], ackAll: () => (acked = true) }, e);
   assert.ok(acked);
-  const r = await tick(e, Date.now());
+  const now = Date.now();
+  healthyRecovery(e.CATALOG, now);
+  const r = await tick(e, now);
   assert.ok(r.conditions.includes("dlq"));
   assert.match(e.ALERT_EMAIL.sent[0].text, /2 job message/);
 });

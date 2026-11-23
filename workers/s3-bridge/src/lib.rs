@@ -23,6 +23,8 @@ mod nntp;
 mod queue_attempt;
 mod queues;
 mod r2;
+mod recovery_audit;
+mod recovery_log;
 
 use std::cell::RefCell;
 use std::future::poll_fn;
@@ -283,10 +285,10 @@ mod queue_export {
     pub async fn queue(
         event: worker_sys::MessageBatch,
         env: Env,
-        _ctx: worker_sys::Context,
+        ctx: worker_sys::Context,
     ) -> std::result::Result<JsValue, JsValue> {
         std::panic::AssertUnwindSafe(async move {
-            if let Err(e) = super::handle_queue(event, env).await {
+            if let Err(e) = super::handle_queue(event, env, worker::Context::new(ctx)).await {
                 worker::console_log!("{}", &e);
                 panic!("{e}");
             }
@@ -296,7 +298,11 @@ mod queue_export {
     }
 }
 
-async fn handle_queue(event: worker::worker_sys::MessageBatch, env: Env) -> Result<()> {
+async fn handle_queue(
+    event: worker::worker_sys::MessageBatch,
+    env: Env,
+    ctx: Context,
+) -> Result<()> {
     // What an operator has to see of a job: a failed full read of a
     // sampled extent, for one.
     velmora_bridge::trace::log_alerts(|line| console_error!("alert: {line}"));
@@ -333,7 +339,7 @@ async fn handle_queue(event: worker::worker_sys::MessageBatch, env: Env) -> Resu
             // of another version is dropped: the next pass does the work.
             Job::RecoveryCopy { v, pass, cursor } => {
                 if *v == JOB_VERSION {
-                    recovery_copy(&env, &bridge, *pass, cursor).await
+                    recovery_copy(&env, &ctx, &bridge, *pass, cursor).await
                 } else {
                     console_error!("recovery copy: a job of another version was dropped");
                     JobOutcome::Ack
@@ -434,6 +440,7 @@ async fn plan_hint(env: &Env, bridge: &env::WorkerBridge, job: &Job, outcome: &J
 /// `retry=true`: a sum over a pass takes the other lines only.
 async fn recovery_copy(
     env: &Env,
+    ctx: &Context,
     bridge: &env::WorkerBridge,
     pass: UnixMs,
     cursor: &str,
@@ -447,12 +454,18 @@ async fn recovery_copy(
         Err(_) if pass.0 == 0 => return JobOutcome::Ack,
         Err(class) => {
             console_error!("recovery copy: config refused: {class}");
-            return JobOutcome::Ack;
+            let log = recovery_log::Log::config_refused(
+                pass,
+                velmora_bridge::ports::Clock::now(&bridge.clock),
+            );
+            return record_copy_job(ctx, env, log, Default::default(), 1, JobOutcome::Ack);
         }
     };
-    let (outcome, counts, why) = copier(bridge, &remote)
-        .run_job(&bridge.jobs, pass, cursor)
+    let (outcome, report) = copier(bridge, &remote)
+        .run_job_report(&bridge.jobs, pass, cursor)
         .await;
+    let at = velmora_bridge::ports::Clock::now(&bridge.clock);
+    let (counts, why) = (report.counts.as_ref(), report.error);
     let retry = matches!(outcome, JobOutcome::Retry { .. });
     // The reason is a class and a status at most. It is logged whether
     // the job is retried or not: past the retry window a job that did
@@ -493,7 +506,52 @@ async fn recovery_copy(
         ),
         None => {}
     }
-    outcome
+    if pass.0 == 0 {
+        return outcome;
+    }
+    let log = recovery_log::Log {
+        at,
+        pass,
+        destination: Some(remote.place()),
+        first: remote
+            .transport()
+            .first_problem
+            .get()
+            .or_else(|| recovery_log::source_problem(&report)),
+    };
+    let problems = report.problems();
+    record_copy_job(ctx, env, log, report, problems, outcome)
+}
+
+fn record_copy_job(
+    ctx: &Context,
+    env: &Env,
+    log: recovery_log::Log,
+    report: velmora_bridge::copy::JobReport,
+    problems: u64,
+    outcome: JobOutcome,
+) -> JobOutcome {
+    recovery_log::complete_job(outcome, || {
+        ctx.wait_until(persist_copy_job(env.clone(), log, report, problems));
+    })
+}
+
+async fn persist_copy_job(
+    env: Env,
+    log: recovery_log::Log,
+    report: velmora_bridge::copy::JobReport,
+    problems: u64,
+) {
+    let wrote = match env.d1("CATALOG") {
+        Ok(db) => log
+            .job(&d1::D1Sql::new(db), &report, problems)
+            .await
+            .is_ok(),
+        Err(_) => false,
+    };
+    if !wrote {
+        console_error!("recovery copy: job telemetry write failed");
+    }
 }
 
 /// One line per post job: its outcome and phase timings, milliseconds
@@ -517,7 +575,7 @@ fn log_post_trace(job: &Job, outcome: &JobOutcome) {
 }
 
 #[event(scheduled)]
-async fn scheduled(event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
+async fn scheduled(event: ScheduledEvent, env: Env, ctx: ScheduleContext) {
     let bridge = match env::bridge(&env) {
         Ok(bridge) => bridge,
         Err(class) => {
@@ -528,18 +586,37 @@ async fn scheduled(event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
     // Before the dispatcher and apart from it: the copy reads no
     // catalogue, so a dispatcher that fails or does not return cannot
     // keep a pass from starting.
+    let scheduled = UnixMs(event.schedule() as i64);
+    let copy_allowed = bridge.cfg.maintenance != velmora_bridge::config::Maintenance::Restore;
     match env::recovery_store(&env) {
         Ok(None) => {}
         Ok(Some(remote)) => {
             if copier(&bridge, &remote)
-                .start_pass(&bridge.jobs, UnixMs(event.schedule() as i64))
+                .start_pass(&bridge.jobs, scheduled)
                 .await
                 .is_err()
             {
                 console_error!("recovery copy: the pass was not started");
             }
+            if copy_allowed {
+                if let Some(pass) = recovery_audit::pass_at(scheduled) {
+                    ctx.wait_until(recovery_audit::run(env.clone(), pass, remote));
+                }
+            }
         }
-        Err(class) => console_error!("recovery copy: config refused: {class}"),
+        Err(class) => {
+            console_error!("recovery copy: config refused: {class}");
+            if copy_allowed && velmora_bridge::copy::pass_due(scheduled) {
+                // Configuration was refused before a job could be sent.
+                let log = recovery_log::Log::config_refused(
+                    scheduled,
+                    velmora_bridge::ports::Clock::now(&bridge.clock),
+                );
+                ctx.wait_until(persist_copy_job(env.clone(), log, Default::default(), 1));
+            } else if copy_allowed && recovery_audit::pass_at(scheduled).is_some() {
+                ctx.wait_until(recovery_audit::prune_after_refused_pass(env.clone()));
+            }
+        }
     }
     match bridge.dispatch().await {
         Ok(report) => {

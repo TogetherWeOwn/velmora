@@ -34,6 +34,7 @@ export function readingOf(key) {
   if (key === "outbox-dead") return "dead rows";
   if (key.startsWith("provider-cooldown:")) return "provider health";
   if (key === "catalog-export-stale") return "export list";
+  if (key.startsWith("recovery-copy-")) return "recovery copy";
   return null;
 }
 
@@ -69,7 +70,7 @@ function ageText(ms) {
  */
 export function evaluate(snap, env = {}) {
   const now = snap.now;
-  const out = [];
+  const out = [...(snap.recovery ?? [])];
 
   // Posting stalled: posts are due, and the oldest due post row has been
   // due for POST_STALL_SECS and has not changed since the last tick. A

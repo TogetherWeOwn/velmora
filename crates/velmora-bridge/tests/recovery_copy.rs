@@ -22,8 +22,8 @@ use velmora_bridge::copy::{
 };
 use velmora_bridge::crypto::seal_manifest;
 use velmora_bridge::remote::{
-    md5_hex, HttpRequest, HttpResponse, HttpSend, NoAnswer, RemoteConfig, RemoteError, S3Remote,
-    MAX_ANSWER_BYTES, MAX_LIST_BYTES,
+    md5_hex, HttpRequest, HttpResponse, HttpSend, RemoteConfig, RemoteError, S3Remote,
+    TransportError, MAX_ANSWER_BYTES, MAX_LIST_BYTES,
 };
 use velmora_bridge::testkit::{FakeJobs, FixedClock, MemBlobStore, TestKek};
 use velmora_bridge::*;
@@ -34,7 +34,387 @@ const ACCESS_KEY: &str = "AKTESTTESTTESTTEST00";
 const SECRET_KEY: &str = "test-secret-that-must-never-be-formatted";
 const ROOT: &str = "/records/drill-1/";
 
-type Sent = std::result::Result<HttpResponse, NoAnswer>;
+type Sent = std::result::Result<HttpResponse, TransportError>;
+
+#[tokio::test(flavor = "current_thread")]
+async fn refusal_telemetry_distinguishes_put_from_verification_head() {
+    for (op, code) in [
+        ("put", Some("AccessDenied")),
+        ("verify", Some("AccessDenied")),
+        ("put", None),
+    ] {
+        let w = World::new();
+        w.record("m/art/x_1", b"a plan").await;
+        if op == "put" {
+            let claimed = code.unwrap_or("PrivateCustomerName");
+            *w.e2.put_answer.borrow_mut() = Some(HttpResponse {
+                status: 403,
+                headers: vec![],
+                body: format!("<Error><Code>{claimed}</Code><Message>untrusted</Message></Error>")
+                    .into_bytes(),
+            });
+        } else {
+            *w.e2.head_answer.borrow_mut() = Some(HttpResponse {
+                status: 403,
+                headers: vec![("x-amz-error-code".into(), "AccessDenied".into())],
+                body: vec![],
+            });
+        }
+        let (outcome, report) = w.copier().run_job_report(&w.jobs, UnixMs(NOW), "").await;
+        assert_eq!(outcome, JobOutcome::Ack);
+        assert_eq!(report.problems(), 1);
+        assert_eq!(report.counts.unwrap().refused, 1);
+        let p = w.e2.problems.borrow()[0];
+        assert_eq!((p.operation, p.status, p.code), (op, Some(403), code));
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn planning_head_refusal_is_counted_before_put() {
+    let w = World::new();
+    w.record("m/art/x_1", b"a plan").await;
+    *w.e2.head_answer.borrow_mut() = Some(HttpResponse {
+        status: 403,
+        headers: vec![("x-amz-error-code".into(), "AccessDenied".into())],
+        body: vec![],
+    });
+    let hint = plan_hint(
+        &Job::Extent {
+            v: JOB_VERSION,
+            extent: ExtentId::new("x_1"),
+            generation: GenerationId::new("g_1"),
+            stage: OutboxStage::Post,
+        },
+        &JobOutcome::Ack,
+        w.clock.now(),
+    )
+    .unwrap();
+    let Job::RecoveryCopy { pass, cursor, .. } = hint else {
+        unreachable!()
+    };
+    let (_, counts, _) = w.copier().run_job(&w.jobs, pass, &cursor).await;
+    assert_eq!(w.e2.puts(), 0);
+    assert_eq!(counts.unwrap().refused, 1);
+    let p = w.e2.problems.borrow()[0];
+    assert_eq!(
+        (p.operation, p.status, p.code),
+        ("plan", Some(403), Some("AccessDenied"))
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn list_refusal_and_exhausted_retries_reach_the_job_observer() {
+    for (status, kind) in [(403, "refused"), (503, "retry_exhausted")] {
+        let w = World::new();
+        w.e2.status.set(Some(status));
+        let (outcome, report) = w.copier().run_job_report(&w.jobs, UnixMs(NOW), "").await;
+        assert!(matches!(outcome, JobOutcome::Retry { .. }));
+        assert!(matches!(report.error, Some(StepError::Store(_))));
+        assert_eq!(report.problems(), 1);
+        let p = w.e2.problems.borrow()[0];
+        assert_eq!(
+            (p.operation, p.kind, p.status),
+            ("list", kind, Some(status))
+        );
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn verification_mismatch_unsignable_and_no_answer_are_observed() {
+    let w = World::new();
+    w.e2.damage_puts.set(true);
+    assert_eq!(
+        w.remote.put(&w.clock, "m/art/x_1", b"a").await,
+        Err(RemoteError::Mismatch)
+    );
+    assert_eq!(
+        w.remote.put(&w.clock, "m/../bad", b"a").await,
+        Err(RemoteError::Unsignable)
+    );
+    w.e2.drop_next.set(4);
+    assert_eq!(
+        w.remote.head(&w.clock, "m/art/x_2").await,
+        Err(RemoteError::Unavailable)
+    );
+    let seen: Vec<_> =
+        w.e2.problems
+            .borrow()
+            .iter()
+            .map(|p| (p.operation, p.kind))
+            .collect();
+    assert_eq!(
+        seen,
+        [
+            ("verify", "mismatch"),
+            ("put", "unsignable"),
+            ("plan", "no_answer")
+        ]
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn job_reports_source_list_error_and_outage_without_changing_retry() {
+    let w = World::new();
+    let source = NoRead(&w.safety, "m/", false);
+    let c = Copier {
+        safety: &source,
+        kek: &w.kek,
+        clock: &w.clock,
+        remote: &w.remote,
+        maintenance: Maintenance::Off,
+    };
+    let (outcome, report) = c.run_job_report(&w.jobs, UnixMs(NOW), "").await;
+    assert!(matches!(outcome, JobOutcome::Retry { .. }));
+    assert_eq!(report.error, Some(StepError::Source));
+    assert_eq!(report.problems(), 1);
+    for i in 0..3 {
+        let key = format!("m/art/x_{i}");
+        w.record(&key, b"plan").await;
+        w.e2.put_500_keys.borrow_mut().push(key);
+    }
+    let (outcome, report) = w.copier().run_job_report(&w.jobs, UnixMs(NOW), "").await;
+    assert!(matches!(outcome, JobOutcome::Retry { .. }));
+    assert!(report.outage);
+    assert_eq!(
+        report.problems(),
+        1,
+        "outage counts once even when it is also a store error"
+    );
+    assert_eq!(report.counts.unwrap().failed, 3);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn only_jobs_that_write_sweep_and_walk_end_markers_report_them() {
+    let w = World::new();
+    for i in 0..=JOB_COPIES {
+        w.record(&format!("m/art/x_{i:04}"), b"a plan").await;
+    }
+    let (_, first) = w.copier().run_job_report(&w.jobs, UnixMs(NOW), "").await;
+    assert!(first.swept);
+    assert!(!first.walk_ended);
+    let sent = w.jobs.take();
+    let Job::RecoveryCopy { cursor, .. } = &sent[0].job else {
+        unreachable!()
+    };
+    let (_, end) = w
+        .copier()
+        .run_job_report(&w.jobs, UnixMs(NOW), cursor)
+        .await;
+    assert!(!end.swept);
+    assert!(end.walk_ended);
+    assert!(time_at(&w, WALKED_KEY).await.is_some());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn recovery_jobs_are_wire_compatible_with_the_strict_previous_decoder() {
+    #[derive(Debug, PartialEq, serde::Deserialize)]
+    #[serde(tag = "t", rename_all = "snake_case", deny_unknown_fields)]
+    enum PreviousJob {
+        RecoveryCopy { v: u8, pass: UnixMs, cursor: String },
+    }
+    let w = World::new();
+    let slot = UnixMs(NOW - NOW % PASS_INTERVAL_MS);
+    assert!(w.copier().start_pass(&w.jobs, slot).await.unwrap());
+    let new = w.jobs.take().pop().unwrap().job;
+    assert_eq!(
+        serde_json::from_str::<PreviousJob>(&new.to_json()).unwrap(),
+        PreviousJob::RecoveryCopy {
+            v: JOB_VERSION,
+            pass: slot,
+            cursor: String::new()
+        }
+    );
+    w.record("m/art/x_1", b"legacy copy").await;
+    let raw = format!(r#"{{"t":"recovery_copy","v":{JOB_VERSION},"pass":{NOW},"cursor":""}}"#);
+    let Job::RecoveryCopy { pass, cursor, .. } = Job::from_json(&raw).unwrap() else {
+        unreachable!()
+    };
+    let (outcome, counts, why) = w.copier().run_job(&w.jobs, pass, &cursor).await;
+    assert_eq!((outcome, why), (JobOutcome::Ack, None));
+    assert_eq!(counts.unwrap().copied, 1);
+}
+
+#[derive(Default)]
+struct AuditShelf {
+    /// Listing and GET are separate so a listed object can disappear.
+    rows: BTreeMap<String, (usize, i64, Option<Vec<u8>>)>,
+    lists: Cell<usize>,
+    gets: RefCell<Vec<String>>,
+}
+
+impl velmora_bridge::audit::AuditSource for AuditShelf {
+    async fn page(&self, prefix: &str, after: &str) -> Result<velmora_bridge::audit::AuditPage> {
+        use velmora_bridge::audit::{AuditEntry, AuditPage, PAGE_SIZE};
+        self.lists.set(self.lists.get() + 1);
+        let mut entries = self
+            .rows
+            .iter()
+            .filter(|(k, _)| k.starts_with(prefix) && k.as_str() > after);
+        let objects = entries
+            .by_ref()
+            .take(PAGE_SIZE as usize)
+            .map(|(key, (size, uploaded, _))| AuditEntry {
+                key: key.clone(),
+                size: *size as u64,
+                uploaded: UnixMs(*uploaded),
+            })
+            .collect();
+        Ok(AuditPage {
+            objects,
+            truncated: entries.next().is_some(),
+        })
+    }
+
+    async fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
+        self.gets.borrow_mut().push(key.into());
+        Ok(self.rows[key].2.clone())
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn independent_audit_classifies_equal_missing_different_refused_and_unavailable() {
+    use velmora_bridge::audit::audit;
+    let oversized = vec![0; velmora_bridge::remote::MAX_AUDIT_BYTES + 1];
+    for (status, contents, problems, unavailable) in [
+        (None, Some(b"ok".as_slice()), 0, 0),
+        (None, None, 1, 0),
+        (None, Some(b"no".as_slice()), 1, 0),
+        (None, Some(oversized.as_slice()), 1, 0),
+        (Some(403), None, 1, 0),
+        (Some(429), None, 1, 0),
+        (Some(503), None, 0, 1),
+        (Some(0), None, 0, 1),
+    ] {
+        let w = World::new();
+        let mut source = AuditShelf::default();
+        let key = format!("m/g_{:013x}_sample", NOW - 2 * 3_600_000);
+        source
+            .rows
+            .insert(key.clone(), (2, NOW - 2 * 3_600_000, Some(b"ok".to_vec())));
+        if let Some(bytes) = contents {
+            w.e2.set(&key, bytes);
+        }
+        w.e2.status.set(status.filter(|s| *s != 0));
+        if status == Some(0) {
+            w.e2.drop_next.set(1);
+        }
+        let counts = audit(&source, &w.remote, &w.clock, UnixMs(NOW), "m/", |_| 0).await;
+        assert_eq!(
+            (counts.checked, counts.problems(), counts.unavailable),
+            (1, problems, unavailable)
+        );
+        assert_eq!(
+            w.e2.log.borrow().len(),
+            1,
+            "one bounded GET per source record"
+        );
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn audit_never_sends_tenant_key_names_to_the_destination() {
+    use velmora_bridge::audit::audit;
+    let w = World::new();
+    let mut source = AuditShelf::default();
+    source.rows.insert(
+        "m/tk/local-only".into(),
+        (2, NOW - 49 * 3_600_000, Some(b"ok".to_vec())),
+    );
+    let counts = audit(&source, &w.remote, &w.clock, UnixMs(NOW), "m/", |_| 0).await;
+    assert_eq!(counts.checked, 0);
+    assert!(source.gets.borrow().is_empty());
+    assert!(w.e2.log.borrow().is_empty());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn random_old_sample_can_compare_a_segment_beyond_the_first_five() {
+    use velmora_bridge::audit::audit;
+    let w = World::new();
+    let mut source = AuditShelf::default();
+    for i in 0..8 {
+        let key = format!("m/seg/s_01a00000000000000000000000000/{i:05}");
+        source
+            .rows
+            .insert(key.clone(), (2, NOW - 49 * 3_600_000, Some(b"ok".to_vec())));
+        if i != 5 {
+            w.e2.set(&key, b"ok");
+        }
+    }
+    let result = audit(
+        &source,
+        &w.remote,
+        &w.clock,
+        UnixMs(NOW),
+        "m/seg/s_",
+        |remaining| {
+            if remaining == 8 {
+                5
+            } else {
+                0
+            }
+        },
+    )
+    .await;
+    assert_eq!((result.checked, result.missing), (5, 1));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn audit_samples_newest_settled_records_and_old_keys_with_bounded_requests() {
+    use velmora_bridge::audit::audit;
+    use velmora_bridge::remote::MAX_AUDIT_BYTES;
+    let w = World::new();
+    let mut source = AuditShelf::default();
+    let mut eligible = Vec::new();
+    let min = 60_000;
+    for (n, prefix) in [
+        "m/g_",
+        "m/del/g_",
+        "m/x/t_0000000000000000/g_",
+        "m/x/t_0000000000000000/del/g_",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        for age in [89, 90, 100, 120, 170, 220, 241] {
+            let at = NOW - age * min + n as i64 * (if age == 90 { 0 } else { 1 });
+            let key = format!("{prefix}{at:013x}_sample");
+            source
+                .rows
+                .insert(key.clone(), (2, at, Some(b"ok".to_vec())));
+            w.e2.set(&key, b"ok");
+            if (90..=240).contains(&age) {
+                eligible.push((at, key));
+            }
+        }
+    }
+    eligible.sort_unstable_by(|a, b| b.cmp(a));
+    for i in 0..8 {
+        let key = format!("m/art/x_{i:02}");
+        let uploaded = if i == 0 {
+            NOW - 3_600_000
+        } else {
+            NOW - 49 * 3_600_000
+        };
+        let size = if i == 1 { MAX_AUDIT_BYTES + 1 } else { 2 };
+        source.rows.insert(
+            key.clone(),
+            (size, uploaded, (i != 2).then(|| b"ok".to_vec())),
+        );
+        w.e2.set(&key, b"ok");
+    }
+    let counts = audit(&source, &w.remote, &w.clock, UnixMs(NOW), "m/art/", |_| 0).await;
+    assert_eq!((counts.checked, counts.problems()), (14, 0));
+    assert_eq!(source.lists.get(), 5);
+    let keys = source.gets.borrow();
+    assert!(eligible
+        .into_iter()
+        .take(10)
+        .all(|(_, key)| keys.contains(&key)));
+    assert!(!keys.iter().any(|k| k == "m/art/x_00" || k == "m/art/x_01"));
+    assert!(keys.iter().any(|k| k == "m/art/x_02"));
+    assert_eq!(keys.len(), 15);
+    assert_eq!(w.e2.log.borrow().len(), 14);
+}
 
 // ---------------------------------------------------------------------------
 // The fake store
@@ -74,6 +454,8 @@ struct FakeE2 {
     still: Cell<bool>,
     /// `start-after` of every list request, without the store's prefix.
     asked: RefCell<Vec<String>>,
+    put_answer: RefCell<Option<HttpResponse>>,
+    problems: RefCell<Vec<velmora_bridge::remote::Problem>>,
 }
 
 fn unescape(s: &str) -> String {
@@ -266,20 +648,24 @@ impl HttpSend for &FakeE2 {
             Ok(()),
             "{method} {target}"
         );
-        let most = if method == "GET" {
+        let list = method == "GET" && target.starts_with("/records?");
+        let most = if list {
             MAX_LIST_BYTES
+        } else if method == "GET" {
+            velmora_bridge::remote::MAX_AUDIT_BYTES
         } else {
             MAX_ANSWER_BYTES
         };
         assert_eq!(request.max_answer, most, "{method} {target}");
-        let key = match method {
-            "GET" => "list",
-            _ => target.strip_prefix(ROOT).expect("bucket and prefix"),
+        let key = if list {
+            "list"
+        } else {
+            target.strip_prefix(ROOT).expect("bucket and prefix")
         };
         self.log.borrow_mut().push(format!("{method} {key}"));
         if self.drop_next.get() > 0 {
             self.drop_next.set(self.drop_next.get() - 1);
-            return Err(NoAnswer);
+            return Err(TransportError::NoAnswer);
         }
         if self.long_next.get() > 0 {
             self.long_next.set(self.long_next.get() - 1);
@@ -292,9 +678,20 @@ impl HttpSend for &FakeE2 {
         if let Some(status) = self.status.get() {
             return answer(status);
         }
-        if method == "GET" {
+        if list {
             let query = target.strip_prefix("/records?").expect("bucket list");
             return self.list(query);
+        }
+        if method == "GET" {
+            return match self.get(key) {
+                None => answer(404),
+                Some(body) if body.len() > request.max_answer => Err(TransportError::BodyTooLong),
+                Some(body) => Ok(HttpResponse {
+                    status: 200,
+                    headers: vec![],
+                    body,
+                }),
+            };
         }
         if method == "HEAD" {
             if let Some(forced) = self.head_answer.borrow().as_ref() {
@@ -311,6 +708,9 @@ impl HttpSend for &FakeE2 {
                     body: vec![],
                 }),
             };
+        }
+        if let Some(forced) = self.put_answer.borrow().as_ref() {
+            return Ok(forced.clone());
         }
         if let Some(status) = self.put_status.get() {
             return answer(status);
@@ -347,6 +747,10 @@ impl HttpSend for &FakeE2 {
             return;
         }
         self.clock.as_ref().expect("a clock").advance_ms(ms as i64);
+    }
+
+    fn observe(&self, problem: velmora_bridge::remote::Problem) {
+        self.problems.borrow_mut().push(problem);
     }
 }
 
@@ -579,7 +983,7 @@ async fn e2_authorization_never_logged() {
         async fn send(&self, request: &HttpRequest) -> Sent {
             assert!(request.headers.iter().any(|(n, _)| n == "authorization"));
             self.0.borrow_mut().push(format!("{request:?}"));
-            Err(NoAnswer)
+            Err(TransportError::NoAnswer)
         }
         async fn pause(&self, _: u64) {}
     }
@@ -3365,6 +3769,7 @@ async fn plans_that_asked_nothing_do_not_hide_an_outage() {
 }
 
 /// Refuses to read the named key: its size (`true`), or its bytes.
+/// Also refuses a LIST of the named prefix.
 struct NoRead<'a>(&'a MemBlobStore, &'static str, bool);
 
 impl BlobStore for NoRead<'_> {
@@ -3390,6 +3795,9 @@ impl BlobStore for NoRead<'_> {
         self.0.delete_record(refused).await
     }
     async fn list(&self, prefix: &str, start_after: &str, limit: u32) -> Result<Vec<String>> {
+        if prefix == self.1 {
+            return Err(BridgeError::Blob("down".into()));
+        }
         self.0.list(prefix, start_after, limit).await
     }
 }
