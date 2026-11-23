@@ -1194,10 +1194,14 @@ struct Eligibility<'a, T> {
 }
 
 impl<T: Clock> Eligibility<'_, T> {
-    /// Whether this phase counts the provider and when it qualified,
-    /// regardless of cooldown or slots. When no enabled reader retains
-    /// an article, every enabled reader may still hold it. Check the
-    /// clock at each decision.
+    /// Compare every candidate for one decision at the same instant.
+    fn decision(&self) -> EligibilityDecision {
+        EligibilityDecision {
+            first: self.first,
+            now: self.clock.now(),
+        }
+    }
+
     fn qualifies(
         &self,
         provider: &ProviderConfig,
@@ -1205,7 +1209,26 @@ impl<T: Clock> Eligibility<'_, T> {
         readers: &[&ProviderConfig],
         phase: Phase,
     ) -> Option<EligibleSince> {
-        let now = self.clock.now();
+        self.decision().qualifies(provider, article, readers, phase)
+    }
+}
+
+struct EligibilityDecision {
+    first: UnixMs,
+    now: UnixMs,
+}
+
+impl EligibilityDecision {
+    /// Whether this phase counts the provider and when it qualified,
+    /// regardless of cooldown or slots. When no enabled reader retains
+    /// an article, every enabled reader may still hold it.
+    fn qualifies(
+        &self,
+        provider: &ProviderConfig,
+        article: &ArticleRow,
+        readers: &[&ProviderConfig],
+        phase: Phase,
+    ) -> Option<EligibleSince> {
         if !provider.enabled {
             return None;
         }
@@ -1221,7 +1244,7 @@ impl<T: Clock> Eligibility<'_, T> {
         };
         if at(self.first) {
             Some(EligibleSince::First)
-        } else if self.first != now && at(now) {
+        } else if self.first != self.now && at(self.now) {
             Some(EligibleSince::Now)
         } else {
             None
@@ -1791,22 +1814,31 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ColdReader<'a, C, N, T> {
             true => &[Phase::Retained, Phase::Orphan, Phase::Any],
             false => &[Phase::Retained, Phase::Orphan],
         };
+        let mut offered = vec![false; order.len() * plan.len()];
         'phases: for &phase in phases {
-            let wanted = |provider: usize, article: usize| {
-                chosen[article]
-                    && eligibility
-                        .qualifies(order[provider], &plan[article], readers, phase)
-                        .is_some()
-            };
             loop {
-                let work: Vec<usize> = (0..order.len())
-                    .map(|i| {
-                        let b = board.borrow();
-                        (0..plan.len())
-                            .filter(|&a| b.open(a, i) && wanted(i, a))
-                            .count()
-                    })
-                    .collect();
+                // A socket may only take work offered at staffing. If a
+                // cutoff exposes more during I/O, the next turn offers
+                // it to the best tier first.
+                let work: Vec<usize> = {
+                    let decision = eligibility.decision();
+                    let b = board.borrow();
+                    (0..order.len())
+                        .map(|i| {
+                            let mut count = 0;
+                            for a in 0..plan.len() {
+                                let offer = chosen[a]
+                                    && b.open(a, i)
+                                    && decision
+                                        .qualifies(order[i], &plan[a], readers, phase)
+                                        .is_some();
+                                offered[i * plan.len() + a] = offer;
+                                count += usize::from(offer);
+                            }
+                            count
+                        })
+                        .collect()
+                };
                 if !(0..order.len()).any(|i| work[i] > 0 && out[i].is_none()) {
                     break;
                 }
@@ -1900,14 +1932,14 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ColdReader<'a, C, N, T> {
                 }
                 ProviderSession::close_all(other).await;
                 let ended = join_all(self.sessions.iter_mut().map(|session| {
-                    let (plan, wanted, out) = (plan, &wanted, &*out);
+                    let (offered, out) = (&offered, &*out);
                     let provider = index(session);
                     async move {
                         let Some(provider) = provider.filter(|&i| out[i].is_none()) else {
                             return Ok(Pace::default());
                         };
                         read_shared(session, provider, plan, board, stats, |a| {
-                            wanted(provider, a)
+                            offered[provider * plan.len() + a]
                         })
                         .await
                     }

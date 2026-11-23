@@ -36,7 +36,7 @@ struct Stripe {
 /// provider after it has all of it by peering, and the safety copy is
 /// gone. Every call to a provider is noted from here on.
 async fn posted(n: u8, len: usize, providers: usize) -> Stripe {
-    let specs: Vec<Spec> = ["bb0", "bb1"][..providers]
+    let specs: Vec<Spec> = ["bb0", "bb1", "bb2"][..providers]
         .iter()
         .enumerate()
         .map(|(i, backbone)| Spec {
@@ -611,6 +611,121 @@ async fn cold_get_retries_newly_eligible_data_after_the_cutoff_crosses_during_pa
     // The dial and four data BODY requests take 5 ms. The two missing
     // parity BODY answers then take the clock past the cutoff.
     cold_get_across_cutoff_without_a_prior_cache_write(6, Some(4 + 4 + 1), 0).await;
+}
+
+#[tokio::test]
+async fn newly_eligible_work_goes_to_the_higher_priority_reader() {
+    let mut st = posted(12, THREE, 3).await;
+    st.rig.bridge.cfg.cold_sockets = 1;
+    for (i, reader) in st.rig.bridge.cfg.providers.iter_mut().enumerate() {
+        reader.priority = i as u8;
+        reader.retention_days = Some(if i == 0 { 2 } else { 1 });
+    }
+    let older = &st.data[0];
+    let newer = &st.data[1];
+    let posted_at = newer.posted_at.unwrap();
+    st.rig.bridge.catalog.edit(&st.s.extent, |e| {
+        e.articles[0].posted_at = Some(posted_at.plus_ms(-1_000));
+    });
+    st.rig.servers[0].hide(&older.message_id).await;
+    st.rig.servers[1].hide(&older.message_id).await;
+    st.rig.servers[0].hide(&newer.message_id).await;
+
+    let clock = &st.rig.bridge.clock;
+    let cutoff = posted_at.plus_secs(2 * 86_400);
+    clock.set(cutoff);
+    let asked = Rc::new(RefCell::new(Vec::new()));
+    before_body({
+        let clock = clock.clone();
+        let older = older.message_id.clone();
+        let newer = newer.message_id.clone();
+        let asked = Rc::clone(&asked);
+        move |provider, message_id| {
+            if provider == "p2" && message_id == older {
+                clock.set(cutoff.plus_ms(1));
+            }
+            if message_id == newer && provider != "p0" {
+                asked.borrow_mut().push(provider.to_owned());
+            }
+            None
+        }
+    });
+
+    let (result, _) = st.read().await;
+    assert_eq!(result, ColdFetch::Filled(st.s.cipher.clone()));
+    // Both p1 and p2 hold the newly orphaned article and have room. The
+    // lower-priority p2 socket is already reading the older article.
+    assert_eq!(&*asked.borrow(), &["p1"]);
+}
+
+#[tokio::test]
+async fn cold_get_retries_when_final_parity_check_finds_an_unasked_reader() {
+    let body = marked_plaintext(TEN);
+    let backoffs = Rc::new(Cell::new(0));
+    let sleeper: Sleeper = {
+        let backoffs = Rc::clone(&backoffs);
+        Rc::new(move |ms| {
+            if (COLD_POLL_MS..=COLD_POLL_MS + COLD_JITTER_MS).contains(&ms) {
+                backoffs.set(backoffs.get() + 1);
+                Box::pin(std::future::ready(()))
+            } else {
+                Box::pin(std::future::pending())
+            }
+        })
+    };
+    let cold = posted_for_get(&body, true, true, Some(sleeper), |cfg| {
+        cfg.cold_sockets = 1;
+        cfg.providers[0].retention_days = Some(2);
+        cfg.providers[1].retention_days = Some(1);
+    })
+    .await;
+    let bridge = &cold.svc.bridge;
+    let [extent] = cold.extents.as_slice() else {
+        panic!("expected one extent");
+    };
+    let stored = bridge.catalog.stored_plan(&extent.id).await.unwrap();
+    let parity = stored
+        .parity_plan(&extent.id, extent.cipher_size)
+        .unwrap()
+        .unwrap();
+    let [first, second] = parity.articles.as_slice() else {
+        panic!("expected two parity shards");
+    };
+    copy_to_second_reader(&cold.nntp, first).await;
+    for row in [&stored.rows[1], first, second] {
+        cold.nntp.servers[0].hide(&row.message_id).await;
+    }
+
+    // Neither provider has the missing data. The first shard has already
+    // been tried and its seat reused when the second shard's BODY crosses
+    // the cutoff. Only the final parity check can send this GET around again.
+    let cutoff = first.posted_at.unwrap().plus_secs(2 * 86_400);
+    bridge.clock.set(cutoff);
+    let recovered_with_parity = Rc::new(Cell::new(false));
+    before_body({
+        let clock = bridge.clock.clone();
+        let first_id = first.message_id.clone();
+        let second_id = second.message_id.clone();
+        let backoffs = Rc::clone(&backoffs);
+        let recovered_with_parity = Rc::clone(&recovered_with_parity);
+        move |provider, message_id| {
+            if provider == "p0" && message_id == second_id {
+                clock.set(cutoff.plus_ms(1));
+            }
+            if provider == "p1" && message_id == first_id {
+                assert_eq!(backoffs.get(), 1, "parity must be read on the retry");
+                recovered_with_parity.set(true);
+            }
+            None
+        }
+    });
+
+    let response = cold.get().await;
+    response.expect(200);
+    assert_eq!(response.stream_error, None);
+    assert!(response.body == body, "cold GET returned different bytes");
+    assert!(recovered_with_parity.get());
+    assert_eq!(backoffs.get(), 1);
 }
 
 #[tokio::test]
