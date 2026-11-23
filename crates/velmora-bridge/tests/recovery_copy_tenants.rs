@@ -3,15 +3,16 @@
 mod record_registry_support;
 
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::rc::Rc;
 
 use sha2::{Digest, Sha256};
 use velmora::rng::SystemRng;
 use velmora_bridge::config::Maintenance;
 use velmora_bridge::copy::{
-    plan_hint, Copier, CopyCounts, BEGAN_KEY, FRESH_MS, JOB_COPIES, JOB_PAGES, KEY_MISS_KEY,
-    PASS_INTERVAL_MS, RECHECK_TENANTS, STORE_KEY, SWEPT_KEY, WALKED_KEY, WANT_KEY,
+    plan_hint, Copier, CopyCounts, BEGAN_KEY, FRESH_MS, JOB_COPIES, JOB_MS, JOB_PAGES,
+    KEY_MISS_KEY, KEY_PAGE_PREFIX, PAGE, PASS_INTERVAL_MS, RECHECK_TENANTS, STORE_KEY, SWEPT_KEY,
+    WALKED_KEY, WANT_KEY,
 };
 use velmora_bridge::crypto::scheme2::{seal_record_v2, CONTROL_HEADER_LEN, RECORD_V2_HEADER_LEN};
 use velmora_bridge::crypto::{seal_manifest, WRAP_OVERHEAD};
@@ -134,6 +135,7 @@ struct Rings {
     answers: RefCell<BTreeMap<TenantId, VecDeque<RingResult>>>,
     loads: RefCell<Vec<TenantId>>,
     yield_before_load: Cell<bool>,
+    load_cost: RefCell<Option<(FixedClock, i64)>>,
 }
 
 #[derive(Clone, Default)]
@@ -164,6 +166,9 @@ impl TenantRings for RingSource {
             // A real ring depends on I/O. Let other record checks reach the
             // same tenant while this job's ring load is in flight.
             tokio::task::yield_now().await;
+        }
+        if let Some((clock, ms)) = self.0.load_cost.borrow().as_ref() {
+            clock.advance_ms(*ms);
         }
         let mut answers = self.0.answers.borrow_mut();
         let q = answers
@@ -198,6 +203,8 @@ struct CountingSafety {
     entry_pages: Cell<u32>,
     dir_pages: RefCell<Vec<Vec<String>>>,
     miss_writes: Cell<usize>,
+    claim_attempts: Cell<usize>,
+    yield_before_claim: Cell<bool>,
 }
 
 impl BlobStore for CountingSafety {
@@ -225,7 +232,11 @@ impl BlobStore for CountingSafety {
     }
 
     async fn list(&self, prefix: &str, after: &str, limit: u32) -> Result<Vec<String>> {
-        self.inner.list(prefix, after, limit).await
+        let keys = self.inner.list(prefix, after, limit).await?;
+        if prefix == "m/x/" {
+            self.dir_pages.borrow_mut().push(keys.clone());
+        }
+        Ok(keys)
     }
 
     async fn list_entries(&self, prefix: &str, after: &str, limit: u32) -> Result<Vec<BlobEntry>> {
@@ -233,10 +244,16 @@ impl BlobStore for CountingSafety {
         self.inner.list_entries(prefix, after, limit).await
     }
 
-    async fn list_dirs(&self, prefix: &str, after: &str, limit: u32) -> Result<DirPage> {
-        let page = self.inner.list_dirs(prefix, after, limit).await?;
-        self.dir_pages.borrow_mut().push(page.dirs.clone());
-        Ok(page)
+    async fn put_if_absent(&self, key: &str, bytes: Vec<u8>) -> Result<bool> {
+        if key.starts_with(KEY_PAGE_PREFIX) {
+            self.claim_attempts.set(self.claim_attempts.get() + 1);
+            if self.yield_before_claim.get() {
+                tokio::task::yield_now().await;
+            }
+        }
+        // The inner store's head and put do not suspend. Once the claimed
+        // operation starts, another job cannot interleave with it.
+        self.inner.put_if_absent(key, bytes).await
     }
 }
 
@@ -395,6 +412,30 @@ impl World {
         assert_eq!(outcome, JobOutcome::Ack);
         assert!(self.jobs.take().is_empty(), "fixture should fit one job");
         counts
+    }
+
+    async fn finish_pass(&self, pass: UnixMs) -> CopyCounts {
+        let mut counts = CopyCounts::default();
+        for _ in 0..16 {
+            let sent = self.jobs.take();
+            if sent.is_empty() {
+                return counts;
+            }
+            assert_eq!(sent.len(), 1);
+            let Job::RecoveryCopy {
+                pass: next_pass,
+                cursor,
+                ..
+            } = &sent[0].job
+            else {
+                panic!("expected recovery copy continuation");
+            };
+            assert_eq!(*next_pass, pass);
+            let (outcome, next) = self.job(pass, cursor).await;
+            assert_eq!(outcome, JobOutcome::Ack);
+            counts.add(&next);
+        }
+        panic!("pass did not finish within 16 continuations");
     }
 
     async fn miss_marks(&self) -> BTreeMap<String, [i64; 3]> {
@@ -873,7 +914,343 @@ async fn am80b_hint_does_not_page_or_write_the_key_miss_mark() {
 }
 
 fn missing_key_page(version: u32, kind: &str) -> String {
-    format!("recovery copy (copy_key_version_missing) tenant={A} version={version} ring={kind}")
+    tenant_key_page(A, version, kind)
+}
+
+fn tenant_key_page(tenant: &str, version: u32, kind: &str) -> String {
+    format!(
+        "recovery copy (copy_key_version_missing) tenant={tenant} version={version} ring={kind}"
+    )
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn am80b_overlapping_jobs_claim_one_page_and_next_pass_prunes_it() {
+    capture_alerts();
+    let w = World::new();
+    w.source.answer(A, [ring(A, &[1], &[1, 2], &[])]);
+    let name = generation(A, FRESH_MS + PASS_INTERVAL_MS, "overlapping_miss");
+    w.data(A, 2, &name, br#"{"v":1,"extents":[]}"#).await;
+    assert_eq!(w.first_job().await.failed, 1);
+    for _ in 2..5 {
+        w.clock.advance_ms(PASS_INTERVAL_MS);
+        assert_eq!(w.first_job().await.failed, 0);
+    }
+    assert!(alerts().is_empty());
+
+    w.clock.advance_ms(PASS_INTERVAL_MS);
+    let pass = w.clock.now();
+    w.safety.yield_before_claim.set(true);
+    let (first, redelivery, walk) =
+        tokio::join!(w.job(pass, ""), w.job(pass, ""), w.job(pass, WALK));
+    for (outcome, counts) in [first, redelivery] {
+        assert_eq!(
+            (outcome, counts.failed, counts.ring_loads),
+            (JobOutcome::Ack, 0, 2)
+        );
+    }
+    assert_eq!((walk.0, walk.1.failed), (JobOutcome::Ack, 1));
+    assert!(w.jobs.take().is_empty());
+    assert_eq!(
+        w.safety.claim_attempts.get(),
+        3,
+        "all three jobs found the due miss"
+    );
+    assert_eq!(alerts(), [missing_key_page(2, "partial")]);
+    let claim = |at: UnixMs| format!("{KEY_PAGE_PREFIX}{:016}/{A}/2", at.0);
+    assert_eq!(
+        w.safety.list(KEY_PAGE_PREFIX, "", PAGE).await.unwrap(),
+        [claim(pass)]
+    );
+
+    w.safety.yield_before_claim.set(false);
+    w.clock.advance_ms(PASS_INTERVAL_MS);
+    assert_eq!(w.first_job().await.failed, 0);
+    assert_eq!(alerts(), [missing_key_page(2, "partial")]);
+    assert_eq!(
+        w.safety.list(KEY_PAGE_PREFIX, "", PAGE).await.unwrap(),
+        [claim(w.clock.now())],
+        "earlier claims must be removed by the first job"
+    );
+    assert_eq!(w.step(WALK).await.failed, 1);
+    assert!(alerts().is_empty(), "the next pass also claims only once");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn am80b_walk_only_misses_all_page_while_tenant_rechecks_rotate() {
+    capture_alerts();
+    let w = World::new();
+    let tenants: Vec<_> = (1..=RECHECK_TENANTS + 5)
+        .map(|i| format!("t_{i:016x}"))
+        .collect();
+    for t in &tenants {
+        w.source.answer(t, [ring(t, &[1], &[1, 2], &[])]);
+        let name = generation(t, FRESH_MS + PASS_INTERVAL_MS, "rotation_miss");
+        w.data(t, 2, &name, br#"{"v":1,"extents":[]}"#).await;
+    }
+    let start = w.clock.now();
+    let (outcome, first) = w.job(start, "").await;
+    assert_eq!(outcome, JobOutcome::Ack);
+    assert_eq!(
+        first.failed + w.finish_pass(start).await.failed,
+        tenants.len() as u64
+    );
+    let ended = w.safety.get(WALKED_KEY, None).await.unwrap().unwrap();
+    assert!(alerts().is_empty());
+
+    let full_rotation = tenants.len().div_ceil(RECHECK_TENANTS);
+    let mut history = VecDeque::new();
+    let mut recovered = false;
+    let target = &tenants[0];
+    let recovery_pass = 9;
+    for pass in 2..recovery_pass + full_rotation {
+        if pass == recovery_pass {
+            w.source
+                .answer(target, [ring(target, &[1, 2], &[1, 2], &[])]);
+        }
+        let before: Vec<_> = tenants.iter().map(|t| w.source.calls(t)).collect();
+        w.clock.advance_ms(PASS_INTERVAL_MS);
+        let at = w.clock.now();
+        let (outcome, first) = w.job(at, "").await;
+        assert_eq!((outcome, first.failed), (JobOutcome::Ack, 0), "pass {pass}");
+        let mut checked = BTreeSet::new();
+        for (t, old) in tenants.iter().zip(before) {
+            let loads = w.source.calls(t) - old;
+            if loads != 0 {
+                let resolved = t == target && pass >= recovery_pass;
+                assert_eq!(loads, if resolved { 1 } else { 2 }, "{t} in pass {pass}");
+                checked.insert(t);
+                recovered |= resolved;
+            }
+        }
+        if pass < recovery_pass {
+            assert_eq!(checked.len(), RECHECK_TENANTS, "pass {pass}");
+            history.push_back(checked);
+            if history.len() == full_rotation {
+                let seen: BTreeSet<_> = history.iter().flatten().copied().collect();
+                let skipped: Vec<_> = tenants.iter().filter(|t| !seen.contains(t)).collect();
+                assert!(
+                    skipped.is_empty(),
+                    "tenants not rechecked by pass {pass}: {skipped:?}"
+                );
+                history.pop_front();
+            }
+        }
+        let expected: Vec<_> = tenants
+            .iter()
+            .filter(|t| pass >= 5 && !(recovered && *t == target))
+            .map(|t| tenant_key_page(t, 2, "partial"))
+            .collect();
+        assert_eq!(alerts(), expected, "first job of pass {pass}");
+        assert_eq!(
+            w.miss_marks().await.contains_key(&format!("{target}/2")),
+            !recovered,
+            "pass {pass}"
+        );
+        let continuation = w.finish_pass(at).await;
+        assert_eq!(
+            (continuation.failed, continuation.ring_loads),
+            (0, 0),
+            "pass {pass}"
+        );
+        assert!(alerts().is_empty(), "continuation paged in pass {pass}");
+        assert_eq!(
+            w.safety.get(WALKED_KEY, None).await.unwrap().as_ref(),
+            Some(&ended),
+            "pass {pass}"
+        );
+    }
+    assert!(recovered, "loaded key was not rechecked in one rotation");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn am80b_partial_miss_keeps_paging_when_the_ring_becomes_unreadable() {
+    capture_alerts();
+    let w = World::new();
+    let miss = format!("{A}/2");
+    w.source.answer(A, [ring(A, &[1], &[1, 2], &[])]);
+    let name = generation(A, FRESH_MS + PASS_INTERVAL_MS, "partial_then_unreadable");
+    w.data(A, 2, &name, br#"{"v":1,"extents":[]}"#).await;
+    assert_eq!(w.first_job().await.failed, 1);
+    assert!(alerts().is_empty());
+    let ended = w.safety.get(WALKED_KEY, None).await.unwrap().unwrap();
+    let mark = w.miss_marks().await[&miss];
+    assert_eq!(mark[2], 1);
+    for pass in 2..=8 {
+        if pass == 6 {
+            w.source
+                .answer(A, [Err(BridgeError::Invalid("test ring load unavailable"))]);
+        }
+        w.clock.advance_ms(PASS_INTERVAL_MS);
+        let c = w.first_job().await;
+        assert_eq!(
+            (c.failed, c.ring_loads),
+            (0, if pass < 6 { 2 } else { 1 }),
+            "pass {pass}: {c:?}"
+        );
+        if pass < 5 {
+            assert!(alerts().is_empty(), "pass {pass}");
+        } else {
+            assert_eq!(alerts(), [missing_key_page(2, "partial")], "pass {pass}");
+        }
+        assert_eq!(w.miss_marks().await, BTreeMap::from([(miss.clone(), mark)]));
+        assert_eq!(
+            w.safety.get(WALKED_KEY, None).await.unwrap().as_ref(),
+            Some(&ended)
+        );
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn am80b_vmr2_version_zero_and_unreadable_ring_are_distinct_misses() {
+    capture_alerts();
+    let w = World::new();
+    let name = generation(A, FRESH_MS + PASS_INTERVAL_MS, "version_zero");
+    let mut bytes = seal_record_v2(
+        &key(A, 1),
+        &name,
+        br#"{"v":1,"extents":[]}"#,
+        &mut SystemRng,
+    )
+    .unwrap();
+    bytes[RECORD_V2_HEADER_LEN - 4..RECORD_V2_HEADER_LEN].copy_from_slice(&0u32.to_be_bytes());
+    w.raw(&name, &bytes).await;
+    let version = format!("{A}/0");
+    let unreadable = format!("{A}/ring");
+    assert_eq!(w.first_job().await.failed, 1);
+    assert_eq!(alerts(), [missing_key_page(0, "unknown")]);
+    let unknown_mark = [NOW.0, NOW.0, 0];
+    assert_eq!(
+        w.miss_marks().await,
+        BTreeMap::from([(version.clone(), unknown_mark)])
+    );
+
+    w.source
+        .answer(A, [Err(BridgeError::Invalid("test ring load unavailable"))]);
+    // A separate walk job observes the outage before its recheck is due.
+    assert_eq!(w.step(WALK).await.failed, 1);
+    assert!(alerts().is_empty());
+    let both = BTreeMap::from([
+        (version.clone(), unknown_mark),
+        (unreadable, [NOW.0, NOW.0, 2]),
+    ]);
+    assert_eq!(w.miss_marks().await, both);
+    for pass in 2..=6 {
+        if pass == 6 {
+            w.source.answer(A, [ring(A, &[1], &[1], &[])]);
+        }
+        w.clock.advance_ms(PASS_INTERVAL_MS);
+        assert_eq!(w.first_job().await.failed, 0, "pass {pass} should not walk");
+        let mut expected = vec![missing_key_page(0, "unknown")];
+        if pass == 5 {
+            expected.push(missing_key_page(0, "unreadable"));
+        }
+        assert_eq!(alerts(), expected, "pass {pass}");
+        let marks = w.miss_marks().await;
+        if pass == 6 {
+            assert_eq!(marks, BTreeMap::from([(version.clone(), unknown_mark)]));
+        } else {
+            assert_eq!(marks, both, "pass {pass}");
+        }
+    }
+    assert!(w.there(&name).is_none());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn am80b_walk_only_partial_miss_pages_for_thirty_hours_without_gaps() {
+    capture_alerts();
+    let w = World::new();
+    w.source.answer(A, [ring(A, &[1], &[1, 2], &[])]);
+    let name = generation(A, FRESH_MS + PASS_INTERVAL_MS, "persistent_partial");
+    w.data(A, 2, &name, br#"{"v":1,"extents":[]}"#).await;
+    assert_eq!(w.first_job().await.failed, 1);
+    assert!(alerts().is_empty());
+    let miss = format!("{A}/2");
+    let mut last_seen = NOW.0;
+    let mut walks = 1;
+    let mut rests = 0;
+    let duration = 30 * 60 * 60 * 1000;
+    for pass in 2..=5 + duration / PASS_INTERVAL_MS {
+        w.clock.advance_ms(PASS_INTERVAL_MS);
+        let c = w.first_job().await;
+        // Leave the walk's persisted schedule alone. Only its visits,
+        // not the first-job recheck, should refresh last_seen.
+        match c.failed {
+            0 => rests += 1,
+            1 => {
+                walks += 1;
+                last_seen = w.clock.now().0;
+            }
+            _ => panic!("pass {pass}: expected at most one failed record, got {c:?}"),
+        }
+        let pages = alerts();
+        if pass < 5 {
+            assert!(pages.is_empty(), "pass {pass}: {pages:?}");
+        } else {
+            assert_eq!(pages, [missing_key_page(2, "partial")], "pass {pass}");
+        }
+        assert_eq!(
+            w.miss_marks().await[&miss],
+            [NOW.0, last_seen, 1],
+            "pass {pass}"
+        );
+    }
+    assert!(walks > 1 && rests > 0, "walks={walks}, rests={rests}");
+    assert!(w.there(&name).is_none());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn am80b_recheck_stops_when_ring_loads_spend_the_job_time() {
+    capture_alerts();
+    let w = World::new();
+    w.rest_walk().await;
+    let tenants: Vec<_> = (1..=RECHECK_TENANTS)
+        .map(|i| format!("t_{i:016x}"))
+        .collect();
+    let marks: BTreeMap<_, _> = tenants
+        .iter()
+        .map(|t| {
+            w.source.answer(t, [ring(t, &[1], &[1, 2], &[])]);
+            (format!("{t}/2"), [NOW.0 - 4 * PASS_INTERVAL_MS, NOW.0, 1])
+        })
+        .collect();
+    w.raw(KEY_MISS_KEY, &serde_json::to_vec(&marks).unwrap())
+        .await;
+    // A partial ring needs one load and one reload; two tenants use the
+    // full budget, with no operation already in flight at the deadline.
+    w.source
+        .0
+        .load_cost
+        .replace(Some((w.clock.clone(), JOB_MS / 4)));
+    let (outcome, c) = w.job(NOW, "").await;
+    assert_eq!(outcome, JobOutcome::Ack);
+    let checked: Vec<_> = tenants
+        .iter()
+        .map(|t| w.source.calls(t))
+        .filter(|&n| n != 0)
+        .collect();
+    assert_eq!(
+        checked,
+        [2, 2],
+        "time budget should stop the recheck before the tenant cap"
+    );
+    assert_eq!((c.ring_loads, c.ring_ms), (4, JOB_MS as u64));
+    assert_eq!(w.clock.now().0 - NOW.0, JOB_MS);
+    assert_eq!(
+        w.safety.entry_pages.get(),
+        0,
+        "started the sweep after spending the job time"
+    );
+    assert_eq!(
+        alerts(),
+        tenants
+            .iter()
+            .map(|t| tenant_key_page(t, 2, "partial"))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(w.miss_marks().await, marks);
+    let continuation = w.finish_pass(NOW).await;
+    assert_eq!(continuation.ring_loads, 0);
+    assert!(alerts().is_empty());
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -982,6 +1359,27 @@ async fn am80b_truncated_vmr2_is_unreadable_without_a_ring_load_or_page() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn am80b_vmr2_cut_inside_its_header_is_unreadable_not_cross_scheme() {
+    capture_alerts();
+    let w = World::new();
+    for len in [4, RECORD_V2_HEADER_LEN - 1] {
+        let name = article(A, &format!("x_short_header_{len}"));
+        let mut bytes = seal_record_v2(&key(A, 1), &name, b"plan", &mut SystemRng).unwrap();
+        bytes.truncate(len);
+        w.raw(&name, &bytes).await;
+    }
+    let c = w.step(WALK).await;
+    assert_eq!(
+        (c.source_unreadable, c.cross_scheme, c.failed, c.copied),
+        (2, 0, 0, 0),
+        "{c:?}"
+    );
+    assert_eq!((c.ring_loads, w.source.calls(A)), (0, 0));
+    assert!(w.safety.get(KEY_MISS_KEY, None).await.unwrap().is_none());
+    assert!(alerts().is_empty());
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn am80b_garbled_key_miss_marks_do_not_suppress_partial_ring_pages() {
     capture_alerts();
     let miss = format!("{A}/2");
@@ -1072,6 +1470,85 @@ async fn am80b_unreadable_ring_pages_on_pass_five_and_clears_when_readable() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn t5_default_directory_page_uses_one_list_and_advances_past_strays() {
+    let w = World::new();
+    for key in ["01", "02", "b01", "b02", "z01"] {
+        w.raw(&format!("m/x/{key}"), b"stray").await;
+    }
+    for dir in ["a", "c"] {
+        for i in 0..32 {
+            w.raw(&format!("m/x/{dir}/k{i:02}"), b"record").await;
+        }
+    }
+    let mut after = String::new();
+    for (dirs, next) in [
+        (None, Some("m/x/02")),
+        (Some("m/x/a/"), Some("m/x/a0")),
+        (None, Some("m/x/b02")),
+        (Some("m/x/c/"), Some("m/x/c0")),
+        (None, None),
+    ] {
+        let page = w.safety.list_dirs("m/x/", &after, 2).await.unwrap();
+        assert_eq!(w.safety.dir_pages.take().len(), 1, "start_after={after:?}");
+        assert_eq!(
+            page.dirs,
+            dirs.into_iter().collect::<Vec<_>>(),
+            "start_after={after:?}"
+        );
+        assert_eq!(page.next.as_deref(), next, "start_after={after:?}");
+        after = page.next.unwrap_or_default();
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn t5_sweep_finds_thirty_tenants_across_raw_directory_pages_in_one_pass() {
+    let w = World::new();
+    w.rest_walk().await;
+    let ended = w.safety.get(WALKED_KEY, None).await.unwrap().unwrap();
+    for name in ["m/x/00_stray", "m/x/t_000000000000000a", "m/x/z_stray"] {
+        w.raw(name, b"stray").await;
+    }
+    let mut expected = Vec::new();
+    for i in 1..=30 {
+        let t = format!("t_{i:016x}");
+        w.source.answer(&t, [ring(&t, &[1], &[1], &[])]);
+        // More than PAGE raw keys overall, but only these three fresh
+        // generations per tenant are in the sweep's time range.
+        for extra in 0..35 {
+            w.raw(
+                &article(&t, &format!("x_walk_only_{extra:02}")),
+                b"not swept",
+            )
+            .await;
+        }
+        for fresh in 0..3 {
+            let name = generation(&t, FRESH, &format!("paged_{fresh}"));
+            let bytes = w.data(&t, 1, &name, br#"{"v":1,"extents":[]}"#).await;
+            expected.push((name, bytes));
+        }
+    }
+    let pass = w.clock.now();
+    let (outcome, mut counts) = w.job(pass, "").await;
+    assert_eq!(outcome, JobOutcome::Ack);
+    counts.add(&w.finish_pass(pass).await);
+    assert_eq!(
+        (counts.copied, counts.failed, counts.damaged()),
+        (90, 0, 0),
+        "{counts:?}"
+    );
+    assert!(w
+        .safety
+        .dir_pages
+        .borrow()
+        .iter()
+        .any(|keys| keys.len() == PAGE as usize));
+    assert_eq!(w.safety.get(WALKED_KEY, None).await.unwrap(), Some(ended));
+    for (name, bytes) in expected {
+        assert_eq!(w.there(&name), Some(bytes), "{name}");
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn t5_managed_directory_requests_share_the_job_page_budget() {
     check_managed_directory_budget(30).await;
 }
@@ -1119,8 +1596,12 @@ async fn check_managed_directory_budget(fresh_dirs: usize) {
             dirs.len()
         );
         dir_requests += dirs.len();
-        for dir in dirs.into_iter().flatten() {
-            *dir_visits.get_mut(&dir).expect("unknown tenant directory") += 1;
+        for key in dirs.into_iter().flatten() {
+            // This fixture has exactly one record per directory.
+            let (dir, _) = key.rsplit_once('/').unwrap();
+            *dir_visits
+                .get_mut(&format!("{dir}/"))
+                .expect("unknown tenant directory") += 1;
         }
         let sent = w.jobs.take();
         if sent.is_empty() {
