@@ -27,7 +27,7 @@ md5 = "0.8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.11"
-velmora = { path = "../velmora" }
-velmora-bridge = { path = "../velmora-bridge" }
-velmora-kit = { path = "../velmora-kit", optional = true }
+velmora = { version = "0.1.0", path = "../velmora" }
+velmora-bridge = { version = "0.1.0", path = "../velmora-bridge" }
+velmora-kit = { version = "0.1.0", path = "../velmora-kit", optional = true }
 zeroize = "1"
