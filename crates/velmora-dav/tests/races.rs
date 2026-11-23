@@ -223,18 +223,27 @@ async fn a_property_edit_with_a_stale_if_match_is_refused() {
 #[tokio::test]
 async fn lock_discovery_of_a_large_listing_is_bounded() {
     let w = World::new().await;
-    for i in 0..1000 {
+    for i in 0..2000 {
         assert_eq!(w.s3_put(&format!("big/{i:04}"), b"x").await, 200);
     }
     // Eight shared depth-infinity locks, each with an owner near the cap:
     // every child inherits all eight.
     let owner = "o".repeat(900);
-    for _ in 0..8 {
+    let discovery = propfind_body(&["lockdiscovery"]);
+    w.req("LOCK", "/dav/big/", &[], &lockinfo("shared", &owner))
+        .await
+        .expect(200);
+    // One such lock over the listing is answered.
+    let r = w
+        .req("PROPFIND", "/dav/big/", &[("depth", "1")], &discovery)
+        .await;
+    r.expect(207);
+    assert_eq!(r.text().matches("<D:activelock>").count(), 2001);
+    for _ in 1..8 {
         w.req("LOCK", "/dav/big/", &[], &lockinfo("shared", &owner))
             .await
             .expect(200);
     }
-    let discovery = propfind_body(&["lockdiscovery"]);
     w.req("PROPFIND", "/dav/big/", &[("depth", "1")], &discovery)
         .await
         .expect(507);

@@ -94,7 +94,9 @@ pub const MAX_PROPS_PER_RESOURCE: usize = 256 * 1024;
 const MAX_PROPFIND_PROP_BYTES: usize = 16 * 1024 * 1024;
 /// Most bytes of lock discovery one batch answers, as rendered (see
 /// [`rendered_lock_bytes`]); over it the batch replies `Full` (`507`).
-const MAX_DISCOVER_BYTES: usize = 8 * 1024 * 1024;
+/// The same budget as the dead properties of a PROPFIND: one lock without
+/// an owner above every entry of a 40,000-entry listing fits.
+const MAX_DISCOVER_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_LOCKS_PER_BUCKET: i64 = 5_000;
 pub const MAX_MOVED_MEMBERS_PER_BUCKET: i64 = 10_000;
 pub const MAX_LOCKS_PER_KEY: i64 = 500;
@@ -380,15 +382,16 @@ fn blocking_lock<'a>(
     missing_shared.filter(|_| !held_shared && !inherited_shared())
 }
 
-/// An upper bound on one `activelock` element as the gateway renders it:
-/// the owner XML as stored, the token, the root as an escaped href (at
-/// most three bytes a byte), the principal, and the fixed markup.
+/// An upper bound on one lock in a discovery: as the gateway renders it
+/// (the owner XML as stored, the token, the root as an escaped href, at
+/// most three bytes a byte, and about 240 bytes of fixed markup), and as
+/// it crosses the wire (the principal and the JSON field names).
 fn rendered_lock_bytes(lock: &Lock) -> usize {
     lock.owner_xml.as_ref().map_or(0, String::len)
         + lock.token.len()
         + 3 * lock.root.len()
         + lock.principal.len()
-        + 512
+        + 256
 }
 
 const LOCK_COLS: &str =
