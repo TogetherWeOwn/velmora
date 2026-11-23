@@ -8,7 +8,6 @@
 //! are frozen; every other module belongs to one build lane.
 
 pub mod articles;
-pub mod audit;
 pub mod config;
 pub mod copy;
 pub mod crypto;
