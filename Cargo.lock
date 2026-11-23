@@ -1585,6 +1585,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "velmora-mgmt-types"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
 name = "velmora-parity-bench"
 version = "0.1.0"
 dependencies = [
