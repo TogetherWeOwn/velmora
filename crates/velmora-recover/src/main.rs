@@ -6,11 +6,10 @@ use std::{
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use velmora::rng::{uniform_below, SystemRng};
-use velmora_bridge::config::KekRing;
 use velmora_recover::{
     catalogue::{Catalogue, CatalogueReader, Selection},
     extent::BodySource,
-    keys::{read_keyring, read_secret},
+    keys::{read_keyring, read_secret, RecoveryKeys},
     kit::Kit,
     nzb::write_nzb,
     resume::OutputRoot,
@@ -150,7 +149,7 @@ fn read_file(path: &Path, limit: usize) -> io::Result<Zeroizing<Vec<u8>>> {
     read_secret(File::open(path)?, limit)
 }
 
-fn load_kek(path: &Path, version: Option<u32>) -> Result<KekRing, &'static str> {
+fn load_kek(path: &Path, version: Option<u32>) -> Result<RecoveryKeys, &'static str> {
     if path == Path::new("-") {
         read_keyring(io::stdin().lock(), version)
     } else {
@@ -168,7 +167,7 @@ fn emit(data: serde_json::Value) -> io::Result<()> {
 async fn restore(
     catalogue: &Catalogue,
     objects: &[Selection<'_>],
-    kek: &KekRing,
+    kek: &RecoveryKeys,
     source: &mut impl BodySource,
     path: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -210,7 +209,7 @@ async fn restore(
 async fn check(
     catalogue: &Catalogue,
     items: &[Selection<'_>],
-    kek: &KekRing,
+    kek: &RecoveryKeys,
     source: &mut impl BodySource,
 ) -> Result<(), Box<dyn std::error::Error>> {
     for item in items {

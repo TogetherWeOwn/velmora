@@ -270,7 +270,7 @@ fn keyring_recovers_an_older_bucket_from_a_newer_index() {
     fs::write(
         fixture.0.join("ring"),
         format!(
-            "export VELMORA_KEK_1='{}ExM='\nVELMORA_KEK_2=\"{}FBQ=\"\n",
+            "export VELMORA_KEK_1='{}ExM='\nVELMORA_KEK_2 = \"{}FBQ=\"\n",
             "ExMT".repeat(10),
             "FBQU".repeat(10)
         ),
@@ -286,4 +286,131 @@ fn keyring_recovers_an_older_bucket_from_a_newer_index() {
         fs::read(fixture.0.join("output/example/nested/example.bin")).unwrap(),
         b"recoverable sealed-kit fixture"
     );
+}
+
+#[test]
+fn selecting_active_version_one_keeps_a_version_two_bucket_key_available() {
+    let fixture = Fixture::new();
+    let index = fixture.fixture();
+    let v1 = TestKey(KekBytes::new([19; 32]));
+    let v2 = velmora_bridge::config::KekRing::from_keys(2, [(2, KekBytes::new([20; 32]))].into())
+        .unwrap();
+    let mut entries = kit::read_index(Cursor::new(index), "fixture", &v1).unwrap();
+    let bucket = entries
+        .iter_mut()
+        .find_map(|entry| match entry {
+            kit::Entry::Bucket(b) => Some(b),
+            _ => None,
+        })
+        .unwrap();
+    let id = BucketId::new(&bucket.id);
+    let bdk = crypto::unwrap_bdk(&v1, bucket.kek_version, &id, &bucket.bdk_wrapped).unwrap();
+    let (version, wrapped) = crypto::wrap_bdk(&v2, &id, &bdk, &mut SystemRng).unwrap();
+    bucket.kek_version = version;
+    bucket.bdk_wrapped = wrapped.to_vec();
+    let mut index = Vec::new();
+    kit::write_index(&mut index, "fixture", &v1, &entries).unwrap();
+    fixture.write_index(&index);
+    fs::write(
+        fixture.0.join("ring"),
+        format!(
+            "VELMORA_KEK_1={}ExM=\nVELMORA_KEK_2={}FBQ=\n",
+            "ExMT".repeat(10),
+            "FBQU".repeat(10)
+        ),
+    )
+    .unwrap();
+    let result = fixture.run(
+        "ring",
+        &[["--kek-version", "1"].as_slice(), DECRYPT].concat(),
+    );
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert_eq!(
+        fs::read(fixture.0.join("output/example/nested/example.bin")).unwrap(),
+        b"recoverable sealed-kit fixture"
+    );
+}
+
+#[test]
+fn unmapped_conflict_and_unposted_object_do_not_abort_later_objects() {
+    let fixture = Fixture::new();
+    let index = fixture.fixture();
+    let kek = TestKey(KekBytes::new([19; 32]));
+    let mut entries = kit::read_index(Cursor::new(index), "fixture", &kek).unwrap();
+    let mut conflict = entries
+        .iter()
+        .find_map(|e| match e {
+            kit::Entry::Object(o) => Some(o.clone()),
+            _ => None,
+        })
+        .unwrap();
+    conflict.key = "a/../blocked".into();
+    conflict.generation_id = "g_conflict".into();
+    let mut unposted = conflict.clone();
+    unposted.key = "b-unposted".into();
+    unposted.generation_id = "g_unposted".into();
+    unposted.extents[0].id = "x_unposted".into();
+    let mut missing = entries
+        .iter()
+        .find_map(|e| match e {
+            kit::Entry::Extent(x) => Some(x.clone()),
+            _ => None,
+        })
+        .unwrap();
+    missing.id = "x_unposted".into();
+    missing.plan_rev = None;
+    missing.articles.clear();
+    entries.extend([
+        kit::Entry::Object(conflict),
+        kit::Entry::Object(unposted),
+        kit::Entry::Extent(missing),
+    ]);
+    let mut index = Vec::new();
+    kit::write_index(&mut index, "fixture", &kek, &entries).unwrap();
+    fixture.write_index(&index);
+    let dir = fixture.0.join("output/_unmapped/example");
+    fs::create_dir_all(&dir).unwrap();
+    let existing = dir.join("%61%2F%2E%2E%2F%62%6C%6F%63%6B%65%64");
+    fs::write(&existing, b"keep this file").unwrap();
+    let result = fixture.run("key", DECRYPT);
+    assert!(!result.status.success());
+    assert_eq!(fs::read(existing).unwrap(), b"keep this file");
+    assert!(!fixture.0.join("output/example/b-unposted").exists());
+    assert_eq!(
+        fs::read(fixture.0.join("output/example/nested/example.bin")).unwrap(),
+        b"recoverable sealed-kit fixture"
+    );
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(stderr.contains("one or more objects could not be recovered"));
+    let stdout = String::from_utf8(result.stdout).unwrap();
+    assert!(stdout.contains("unmapped destination already contains different data"));
+    assert!(stdout.contains("extent has no usable Usenet plan"));
+    assert!(stdout.contains("\"failed\":2,\"recovered\":1"));
+}
+
+#[test]
+fn malformed_keyring_assignment_is_not_silently_ignored() {
+    let fixture = Fixture::new();
+    fixture.fixture();
+    for malformed in [
+        "VELMORA_KEK_typo=ignored",
+        "VELMORA_KEK_+2=ignored",
+        "VELMORA_KEK_0=ignored",
+        "VELMORA_KEK_4294967296=ignored",
+        "VELMORA_KEK_2",
+    ] {
+        fs::write(
+            fixture.0.join("ring"),
+            format!("VELMORA_KEK_1={}ExM=\n{malformed}\n", "ExMT".repeat(10)),
+        )
+        .unwrap();
+        let result = fixture.run("ring", DECRYPT);
+        assert!(!result.status.success());
+        assert!(String::from_utf8_lossy(&result.stderr).contains("invalid KEK input"));
+        assert!(!fixture.0.join("output").exists());
+    }
 }

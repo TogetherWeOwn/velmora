@@ -4,7 +4,7 @@ use std::{
     collections::BTreeMap,
     io::{self, Read},
 };
-use velmora_bridge::{config::KekRing, types::KekBytes};
+use velmora_bridge::{config::KekRing, ports::Kek, types::KekBytes};
 use zeroize::Zeroizing;
 
 const KEY_INPUT_MAX: usize = 1024 * 1024;
@@ -22,9 +22,44 @@ pub fn read_secret(reader: impl Read, limit: usize) -> io::Result<Zeroizing<Vec<
     Ok(bytes)
 }
 
+pub struct RecoveryKeys {
+    inner: KekRing,
+    active: u32,
+}
+
+impl RecoveryKeys {
+    fn new(active: u32, keys: BTreeMap<u32, KekBytes>) -> Result<Self, &'static str> {
+        if !keys.contains_key(&active) {
+            return Err(INVALID);
+        }
+        // The bridge ring uses the production active key as an upper bound.
+        // Recovery exposes every held version, even if the caller prefers an older one.
+        let newest = *keys.last_key_value().ok_or(INVALID)?.0;
+        let inner = KekRing::from_keys(newest, keys).map_err(|_| INVALID)?;
+        Ok(Self { inner, active })
+    }
+}
+
+impl Kek for RecoveryKeys {
+    fn active(&self) -> (u32, &KekBytes) {
+        (
+            self.active,
+            self.inner
+                .version(self.active)
+                .expect("required at construction"),
+        )
+    }
+    fn version(&self, version: u32) -> Option<&KekBytes> {
+        self.inner.version(version)
+    }
+}
+
 /// Single-key input defaults to version 1. A ring defaults to its declared
 /// active version or, if absent, its highest present version.
-pub fn read_keyring(reader: impl Read, requested: Option<u32>) -> Result<KekRing, &'static str> {
+pub fn read_keyring(
+    reader: impl Read,
+    requested: Option<u32>,
+) -> Result<RecoveryKeys, &'static str> {
     let bytes = read_secret(reader, KEY_INPUT_MAX).map_err(|_| "could not read KEK")?;
     let text = bytes
         .strip_suffix(b"\r\n")
@@ -48,18 +83,22 @@ pub fn read_keyring(reader: impl Read, requested: Option<u32>) -> Result<KekRing
         return parse_ring(text, requested);
     }
     let active = requested.unwrap_or(1);
-    KekRing::from_keys(active, [(active, KekBytes::new(*decoded))].into()).map_err(|_| INVALID)
+    RecoveryKeys::new(active, [(active, KekBytes::new(*decoded))].into())
 }
 
-fn parse_ring(bytes: &[u8], requested: Option<u32>) -> Result<KekRing, &'static str> {
+fn parse_ring(bytes: &[u8], requested: Option<u32>) -> Result<RecoveryKeys, &'static str> {
     let text = std::str::from_utf8(bytes).map_err(|_| INVALID)?;
     let mut keys = BTreeMap::new();
     let mut declared = None;
     for line in text.lines().map(str::trim) {
-        let line = line.strip_prefix("export ").unwrap_or(line);
+        let line = line.strip_prefix("export ").unwrap_or(line).trim();
         let Some((name, value)) = line.split_once('=') else {
+            if line.starts_with("VELMORA_KEK_") {
+                return Err(INVALID);
+            }
             continue;
         };
+        let name = name.trim();
         let value = value.trim();
         let value = value
             .strip_prefix('"')
@@ -75,12 +114,17 @@ fn parse_ring(bytes: &[u8], requested: Option<u32>) -> Result<KekRing, &'static 
             }
             continue;
         }
-        let Some(version) = name
-            .strip_prefix("VELMORA_KEK_")
-            .and_then(|v| v.parse::<u32>().ok())
-        else {
+        let Some(suffix) = name.strip_prefix("VELMORA_KEK_") else {
             continue;
         };
+        if suffix.is_empty() || !suffix.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(INVALID);
+        }
+        let version = suffix
+            .parse::<u32>()
+            .ok()
+            .filter(|&v| v > 0)
+            .ok_or(INVALID)?;
         let key = KekRing::decode_key(value).ok_or(INVALID)?;
         if keys.insert(version, key).is_some() {
             return Err(INVALID);
@@ -90,5 +134,5 @@ fn parse_ring(bytes: &[u8], requested: Option<u32>) -> Result<KekRing, &'static 
         .or(declared)
         .or_else(|| keys.last_key_value().map(|(version, _)| *version))
         .ok_or(INVALID)?;
-    KekRing::from_keys(active, keys).map_err(|_| INVALID)
+    RecoveryKeys::new(active, keys)
 }

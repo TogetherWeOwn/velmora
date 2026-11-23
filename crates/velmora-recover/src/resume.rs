@@ -19,6 +19,8 @@ const REPORT_DIR: &str = "_report";
 const REPORT: &str = "INDEX.tsv";
 const MAX_COMPONENT_BYTES: usize = 240;
 
+type MappedDestination = (PathBuf, Option<[u8; 16]>, bool);
+
 pub struct ObjectCheck<'a> {
     pub bucket: &'a str,
     pub key: &'a str,
@@ -331,18 +333,21 @@ impl OutputRoot {
         Ok(Some(path))
     }
 
-    pub fn object<'s, 'a>(&'s mut self, check: ObjectCheck<'a>) -> io::Result<Output<'s, 'a>> {
+    pub fn object<'s, 'a>(
+        &'s mut self,
+        check: ObjectCheck<'a>,
+    ) -> Result<Output<'s, 'a>, Box<dyn std::error::Error>> {
         let mut offset = 0u64;
         for extent in check.extents {
             if extent.offset != offset {
-                return Err(invalid("object extent placement is not contiguous"));
+                return Err(invalid("object extent placement is not contiguous").into());
             }
             offset = offset
                 .checked_add(extent.len)
                 .ok_or_else(|| invalid("object size overflow"))?;
         }
         if offset != check.size {
-            return Err(invalid("object extent placement does not cover its size"));
+            return Err(invalid("object extent placement does not cover its size").into());
         }
         let mut hash = Sha256::new();
         for field in [check.generation, check.bucket, check.key] {
@@ -379,10 +384,13 @@ impl OutputRoot {
         })
     }
 
-    fn fallback(&self, check: &ObjectCheck<'_>) -> io::Result<(PathBuf, Option<[u8; 16]>, bool)> {
+    fn fallback(
+        &self,
+        check: &ObjectCheck<'_>,
+    ) -> Result<MappedDestination, Box<dyn std::error::Error>> {
         let mut dest = self.root.join(UNMAPPED);
         if !private_dir(&dest)? {
-            return Err(invalid("unmapped output root is not a directory"));
+            return Err(invalid("unmapped output root is not a directory").into());
         }
         dest.push(
             if normal_component(check.bucket) && !check.bucket.eq_ignore_ascii_case(REPORT_DIR) {
@@ -392,7 +400,7 @@ impl OutputRoot {
             },
         );
         if !private_dir(&dest)? {
-            return Err(invalid("unmapped bucket path is not a directory"));
+            return Err(invalid("unmapped bucket path is not a directory").into());
         }
         // Percent-encode every byte so case-insensitive filesystems do not
         // collapse distinct keys. Long leaves keep a full SHA-256 suffix;
@@ -411,9 +419,9 @@ impl OutputRoot {
             Existing::Absent => None,
             Existing::Same(md5) => Some(md5),
             Existing::Different => {
-                return Err(invalid(
-                    "unmapped destination already contains different data",
-                ))
+                return Err(
+                    ObjectFailure("unmapped destination already contains different data").into(),
+                )
             }
         };
         Ok((dest, done, true))
@@ -481,21 +489,26 @@ fn tsv(text: &str) -> String {
 }
 
 fn normal_component(s: &str) -> bool {
-    if s.is_empty() || s == "." || s == ".." || s.len() > 240 || s.contains(['/', '\\', '\0']) {
-        return false;
-    }
-    #[cfg(windows)]
-    {
-        let base = s.split('.').next().unwrap_or_default().to_ascii_uppercase();
-        if s.ends_with(['.', ' '])
-            || s.chars()
-                .any(|c| c.is_ascii_control() || "<>:\"|?*".contains(c))
-            || matches!(base.as_str(), "CON" | "PRN" | "AUX" | "NUL")
-            || ((base.starts_with("COM") || base.starts_with("LPT")) && base.chars().count() == 4)
-        {
-            return false;
-        }
-    }
+    !(s.is_empty()
+        || s == "."
+        || s == ".."
+        || s.len() > MAX_COMPONENT_BYTES
+        || s.contains(['/', '\\', '\0']))
+        && platform_component(s)
+}
+
+#[cfg(windows)]
+fn platform_component(s: &str) -> bool {
+    let base = s.split('.').next().unwrap_or_default().to_ascii_uppercase();
+    !(s.ends_with(['.', ' '])
+        || s.chars()
+            .any(|c| c.is_ascii_control() || "<>:\"|?*".contains(c))
+        || matches!(base.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || ((base.starts_with("COM") || base.starts_with("LPT")) && base.chars().count() == 4))
+}
+
+#[cfg(not(windows))]
+fn platform_component(_: &str) -> bool {
     true
 }
 
@@ -561,15 +574,15 @@ fn extent_hash(
 }
 
 #[derive(Debug)]
-struct ObjectIntegrity;
+struct ObjectFailure(&'static str);
 
-impl std::fmt::Display for ObjectIntegrity {
+impl std::fmt::Display for ObjectFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("whole-object integrity check failed")
+        f.write_str(self.0)
     }
 }
 
-impl std::error::Error for ObjectIntegrity {}
+impl std::error::Error for ObjectFailure {}
 
 pub struct Output<'s, 'a> {
     session: &'s mut OutputRoot,
@@ -652,7 +665,8 @@ impl Output<'_, '_> {
                     .ok_or_else(|| invalid("missing staged object"))?;
                 require_single_link(&file)?;
                 file.set_len(self.check.size)?;
-                let md5 = verify_file(&mut file, &self.check)?.ok_or(ObjectIntegrity)?;
+                let md5 = verify_file(&mut file, &self.check)?
+                    .ok_or(ObjectFailure("whole-object integrity check failed"))?;
                 file.sync_all()?;
                 drop(file);
                 // Atomic no-clobber publication on the same filesystem. An

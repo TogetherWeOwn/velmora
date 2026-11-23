@@ -6,7 +6,7 @@
 cargo build --release --locked -p velmora-recover --features recovery-cli
 ```
 
-Use a trusted copy of the tool and separately held KEKs. `--kek-file` accepts a 32-byte raw key, a 64-digit hex key, or a key-ring file with one `VELMORA_KEK_<version>=<padded-base64-key>` line per version. Pass `-` to read the same formats from standard input. The active version defaults to 1 for a single raw/hex key. A ring uses `VELMORA_KEK_ACTIVE` if specified, otherwise its highest version; `--kek-version` can specify the active version explicitly. Keep the older keys to open data written before rotation. Keys themselves are never command-line arguments.
+Use a trusted copy of the tool and separately held KEKs. `--kek-file` accepts a 32-byte raw key, a 64-digit hex key, or a key-ring file with one `VELMORA_KEK_<version>=<padded-base64-key>` line per version. Pass `-` to read the same formats from standard input. The active version defaults to 1 for a single raw/hex key. A ring uses `VELMORA_KEK_ACTIVE` if specified, otherwise its highest version; `--kek-version` selects the active version without excluding any supplied key. Keep the older keys to open data written before rotation. Keys themselves are never command-line arguments.
 
 ```sh
 velmora-recover --kit ./kit --kek-file ./key verify-kit
