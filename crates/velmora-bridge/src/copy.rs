@@ -573,6 +573,9 @@ struct Place {
     /// The managed tenant whose directory a fresh phase of the tenant
     /// layout goes through; empty for tenant 0's (`m`).
     tenant: String,
+    /// The sweep gave up a part of the tenant directories (`i`): its end
+    /// is not recorded ([`SWEPT_KEY`]).
+    incomplete: bool,
 }
 
 /// A string as JSON. Serializing a string cannot fail.
@@ -589,6 +592,7 @@ impl Place {
             plans: 0,
             made: 0,
             tenant: String::new(),
+            incomplete: false,
         }
     }
 
@@ -625,6 +629,10 @@ impl Place {
             }
             None => String::new(),
         };
+        let incomplete = match object.get("i") {
+            Some(flag) => flag.as_bool()?,
+            None => false,
+        };
         Some(Place {
             phase,
             key,
@@ -632,6 +640,7 @@ impl Place {
             plans,
             made,
             tenant,
+            incomplete,
         })
     }
 
@@ -646,6 +655,9 @@ impl Place {
         if !self.tenant.is_empty() {
             out.push_str(",\"m\":");
             out.push_str(&quoted(&self.tenant));
+        }
+        if self.incomplete {
+            out.push_str(",\"i\":true");
         }
         for (name, number) in [("n", i64::from(self.plans)), ("t", self.made)] {
             if number != 0 {
@@ -1422,7 +1434,9 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend, R: TenantRings> Copier<'_, B, 
                     // the walk.
                     Next::GaveUp => {
                         late = true;
-                        turn = Some(Place::tenant(String::new(), pass));
+                        let mut next = Place::tenant(String::new(), pass);
+                        next.incomplete = true;
+                        turn = Some(next);
                         continue;
                     }
                 }
@@ -1432,11 +1446,14 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend, R: TenantRings> Copier<'_, B, 
                     let then = Phase::TenantGenerations;
                     let mut next = Place::at(then, then.first(&place.tenant, pass));
                     next.tenant = place.tenant;
+                    next.incomplete = place.incomplete;
                     Some(next)
                 }
-                // The last phase of the sweep: tenant 0's.
+                // The last phase of the sweep: tenant 0's. A sweep that
+                // gave up a part is not recorded as come to its end, so the
+                // next pass asks for the walk.
                 Phase::TenantGenerations => {
-                    swept = true;
+                    swept = !place.incomplete;
                     self.enter_walk(pass, &mut began).await?
                 }
                 // The last phase of the walk.
@@ -1555,28 +1572,28 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend, R: TenantRings> Copier<'_, B, 
             })
             .collect();
         // A group of claims at a time, as the copies go.
-        let claimed: Vec<(String, &str, bool)> = stream::iter(due)
+        // Each page right after its own claim, with nothing awaited in
+        // between: a claim made is a page sent, also when the job ends
+        // before the others are.
+        stream::iter(due)
             .map(|(name, claim, kind)| async move {
-                let mine = !matches!(
-                    self.safety.put_if_absent(&claim, Vec::new()).await,
-                    Ok(false)
-                );
-                (name, kind, mine)
+                let claimed = self.safety.put_if_absent(&claim, Vec::new()).await;
+                if matches!(claimed, Ok(false)) {
+                    return;
+                }
+                let Some((tenant, version)) = miss_of(&name) else {
+                    return;
+                };
+                let version = version.unwrap_or(0);
+                crate::trace::alert(|| {
+                    format!(
+                        "recovery copy ({KEY_MISS_PAGE}) tenant={tenant} version={version} ring={kind}"
+                    )
+                });
             })
             .buffer_unordered(CONCURRENCY)
-            .collect()
+            .collect::<Vec<()>>()
             .await;
-        for (name, kind, mine) in claimed {
-            let Some((tenant, version)) = miss_of(&name).filter(|_| mine) else {
-                continue;
-            };
-            let version = version.unwrap_or(0);
-            crate::trace::alert(|| {
-                format!(
-                    "recovery copy ({KEY_MISS_PAGE}) tenant={tenant} version={version} ring={kind}"
-                )
-            });
-        }
     }
 
     /// The claim of the page of the entry `name` in the pass of `slot`:
@@ -1694,12 +1711,13 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend, R: TenantRings> Copier<'_, B, 
             )
             .await;
         }
-        // The claims of passes before the last one, and any of a pass to
-        // come (no job makes one): best effort, a page of keys from each
-        // end. The last pass's stay, for a delivery of it still running
-        // (a queue invocation ends within 15 minutes, one pass).
+        // The claims of passes before the last one, and any more than one
+        // pass ahead (no job makes one: a job's slot is its own clock's):
+        // best effort, a page of keys from each end. The last pass's and
+        // the next one's stay, for a delivery of either still running (a
+        // queue invocation ends within 15 minutes, one pass).
         let keep_from = format!("{KEY_PAGE_PREFIX}{:016}/", slot - PASS_INTERVAL_MS);
-        let ahead = format!("{KEY_PAGE_PREFIX}{:016}0", slot);
+        let ahead = format!("{KEY_PAGE_PREFIX}{:016}0", slot + PASS_INTERVAL_MS);
         let mut stale = Vec::new();
         for start in ["", ahead.as_str()] {
             budget.pages += 1;

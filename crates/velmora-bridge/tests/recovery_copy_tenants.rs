@@ -1038,11 +1038,26 @@ async fn am80b_future_claim_guesses_are_pruned_and_cannot_suppress_pages() {
 
     w.first_job().await;
     assert_eq!(alerts(), [missing_key_page(2, "partial")]);
+    // Claims more than one pass ahead are removed; the next pass's stay
+    // (a delivery of it may already run), and cannot match a keyed name.
     let claims = w.safety.list(KEY_PAGE_PREFIX, "", PAGE).await.unwrap();
-    let [first] = claims.as_slice() else {
-        panic!("the first job should prune all future claims: {claims:?}");
-    };
-    assert!(first.starts_with(&format!("{KEY_PAGE_PREFIX}{slot:016}/")));
+    let this: Vec<_> = claims
+        .iter()
+        .filter(|c| c.starts_with(&format!("{KEY_PAGE_PREFIX}{slot:016}/")))
+        .collect();
+    assert_eq!(this.len(), 1, "{claims:?}");
+    let first = this[0].clone();
+    let first = &first;
+    assert!(
+        !claims
+            .iter()
+            .any(|c| c.starts_with(&format!("{KEY_PAGE_PREFIX}{later:016}/"))),
+        "claims more than one pass ahead must be pruned: {claims:?}"
+    );
+    assert!(claims
+        .iter()
+        .filter(|c| !this.contains(c))
+        .all(|c| c.starts_with(&format!("{KEY_PAGE_PREFIX}{next:016}/"))));
 
     // Plant the guesses again as this slot starts, so future-claim cleanup
     // cannot hide a regression to plaintext or otherwise unkeyed claims.
@@ -1924,6 +1939,11 @@ async fn t5_stray_directory_pages_make_sweep_late_but_tenant_zero_still_copies()
     assert!(w.there(&managed).is_none());
     assert_eq!(w.there(&tombstone), Some(gone));
     assert_eq!(w.there(&zero), Some(bytes));
+    // A sweep that gave up a part is not recorded as come to its end.
+    assert_ne!(
+        w.safety.get(SWEPT_KEY, None).await.unwrap(),
+        Some(NOW.0.to_string().into_bytes())
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]
