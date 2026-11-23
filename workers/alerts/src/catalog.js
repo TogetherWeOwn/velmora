@@ -8,8 +8,6 @@
 //   - the attempts of the 20 soonest rows of a stage: outbox_due, 20 rows.
 // Measured against production: 0 to 20 rows read per statement.
 
-import { recoveryConditions } from "./recovery.js";
-
 export const DEAD_CAP = 1000;
 
 export const SQL = Object.freeze({
@@ -74,7 +72,6 @@ export async function readSnapshot(env, now, opts = {}) {
   const db = env.CATALOG;
   if (db) {
     const tries = [
-      ["recovery copy", async () => (snap.recovery = await recoveryConditions(db, now, opts.recoveryFirstSeen))],
       ["post head", async () => (snap.postHead = await head(db, "post", now))],
       ["verify head", async () => (snap.verifyHead = await head(db, "verify", now))],
       ["release head", async () => (snap.releaseHead = await head(db, "release", now))],

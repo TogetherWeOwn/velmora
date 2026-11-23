@@ -19,11 +19,6 @@ export async function setMeta(db, k, v) {
     .run();
 }
 
-export async function setMetaIfAbsent(db, k, v) {
-  await db.prepare("INSERT INTO meta(k, v) VALUES (?1, ?2) ON CONFLICT(k) DO NOTHING")
-    .bind(k, JSON.stringify(v)).run();
-}
-
 /**
  * Records that `a` holds now. A key that was not active starts a new
  * active run (active_since = now). Returns the row after the update.
@@ -111,7 +106,6 @@ export function reminderGap(sentInRun) {
  * cron conditions; one hour for reports (host, ci), each a new event.
  */
 export function gapFor(row, sentInRun) {
-  if (row.source === "cron" && row.key.startsWith("recovery-copy-")) return sentInRun <= 0 ? HOUR : DAY;
   return row.source === "cron" ? reminderGap(sentInRun) : HOUR;
 }
 

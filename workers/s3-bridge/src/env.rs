@@ -202,7 +202,7 @@ fn build(env: &Env) -> Result<WorkerBridge, String> {
 /// only the copy.
 pub fn recovery_store(env: &Env) -> Result<Option<S3Remote<FetchHttp>>, String> {
     let cfg = RemoteConfig::from_vars(|name| lookup(env, name)).map_err(|e| e.to_string())?;
-    Ok(cfg.map(|cfg| S3Remote::new(cfg, FetchHttp::default())))
+    Ok(cfg.map(|cfg| S3Remote::new(cfg, FetchHttp)))
 }
 
 /// True when `RECOVERY_COPY` is `on`, whatever the rest of its
