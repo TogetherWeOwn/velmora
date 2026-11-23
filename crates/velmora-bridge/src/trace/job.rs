@@ -47,6 +47,8 @@ pub struct JobTrace {
     first_grant: Option<UnixMs>,
     last_release: Option<UnixMs>,
     held: u32,
+    connect_from: Option<UnixMs>,
+    dials_in_flight: u32,
 }
 
 pub(crate) fn elapsed(start: UnixMs, end: UnixMs) -> u64 {
@@ -82,6 +84,22 @@ impl JobTrace {
         self.first_grant
             .zip(self.last_release)
             .map_or(0, |(a, b)| elapsed(a, b))
+    }
+
+    /// Integrate the union of dial intervals: a parallel batch, its
+    /// failover dials and its reconnects all contribute wall time once.
+    pub(crate) fn connecting(&mut self, now: UnixMs) {
+        self.connect_from.get_or_insert(now);
+        self.dials_in_flight += 1;
+    }
+
+    pub(crate) fn connect_finished(&mut self, now: UnixMs) {
+        self.dials_in_flight = self.dials_in_flight.saturating_sub(1);
+        if self.dials_in_flight == 0 {
+            if let Some(started) = self.connect_from.take() {
+                self.connect_ms += elapsed(started, now);
+            }
+        }
     }
 
     pub(crate) fn sent(&mut self, provider: &str, bytes: u64) {
@@ -182,6 +200,22 @@ mod tests {
         assert_eq!((verify.total_ms, verify.held_ms()), (3, 1));
         assert_eq!(post.kind, Some(JobKind::Post));
         assert_eq!((post.total_ms, post.held_ms()), (50, 37));
+    }
+
+    #[test]
+    fn connect_time_includes_redials_without_counting_overlap_twice() {
+        let mut t = JobTrace::default();
+        t.kind = Some(JobKind::Post);
+        t.connecting(UnixMs(4));
+        t.connecting(UnixMs(6));
+        t.connect_finished(UnixMs(8));
+        t.connect_finished(UnixMs(9));
+        // A failover dial followed by a reconnect after the initial batch.
+        t.connecting(UnixMs(12));
+        t.connect_finished(UnixMs(14));
+        t.connecting(UnixMs(18));
+        t.connect_finished(UnixMs(22));
+        assert_eq!(t.connect_ms, 11);
     }
 
     #[test]

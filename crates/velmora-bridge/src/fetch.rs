@@ -342,17 +342,9 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ProviderSession<'a, C, N, T> {
     /// so the caller does not reconnect and goes on to another provider.
     pub(crate) async fn session(&mut self) -> core::result::Result<&mut N::Session, Stop> {
         if self.session.is_none() {
-            // Initial post connects already have a wall-clock batch timer.
-            let started = crate::trace::job_note(|t| {
-                (t.kind != Some(crate::trace::JobKind::Post)).then(|| self.clock.now())
-            })
-            .flatten();
+            crate::trace::job_note(|t| t.connecting(self.clock.now()));
             let connected = self.nntp.connect(self.provider, &self.permit).await;
-            if let Some(started) = started {
-                crate::trace::job_note(|t| {
-                    t.connect_ms += crate::trace::elapsed(started, self.clock.now());
-                });
-            }
+            crate::trace::job_note(|t| t.connect_finished(self.clock.now()));
             let session = match connected {
                 Ok(session) => session,
                 Err(e) => {

@@ -805,7 +805,6 @@ where
         .await;
         let connect_ms = self.clock.now().0 - now.0;
         crate::trace::note(&lease.extent, |t| t.connect_ms = connect_ms);
-        crate::trace::job_note(|t| t.connect_ms = connect_ms.max(0) as u64);
         let logged_in: Vec<&'a str> = sessions
             .iter()
             .filter(|s| s.connected())

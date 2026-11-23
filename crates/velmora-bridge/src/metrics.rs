@@ -287,10 +287,10 @@ pub fn request_point(r: &Request<'_>, weight: u32) -> Point {
     }
 }
 
-/// Default to one point per eight claimed attempts. Zero disables job
-/// observations; invalid configuration cannot keep a consumer from running.
+/// An absent setting defaults to one point per eight claimed attempts.
+/// Zero or a malformed setting disables points, not the consumer.
 pub fn job_sample(raw: Option<&str>) -> u32 {
-    raw.and_then(|s| s.trim().parse().ok()).unwrap_or(8)
+    raw.map_or(8, |s| s.trim().parse().unwrap_or(0))
 }
 
 /// Sample a queue message without retaining its ID. Unlike HTTP sampling,
@@ -590,7 +590,6 @@ mod tests {
     #[test]
     fn job_sampling_weights_every_retained_attempt_even_failures() {
         assert_eq!(job_sample(None), 8);
-        assert_eq!(job_sample(Some("invalid")), 8);
         assert_eq!(job_sample(Some(" 1 ")), 1);
         assert_eq!(job_weight(0, "sample-private-id"), None);
         assert_eq!(job_weight(1, "sample-private-id"), Some(1));
@@ -599,6 +598,14 @@ mod tests {
             .collect();
         assert!((900..1150).contains(&kept.len()));
         assert!(kept.iter().all(|w| *w == 8));
+    }
+
+    #[test]
+    fn malformed_job_sample_disables_writes() {
+        for raw in ["invalid", "", "  ", "-1", "4294967296"] {
+            assert_eq!(job_sample(Some(raw)), 0, "{raw:?}");
+        }
+        assert_eq!(job_weight(job_sample(Some("0")), "attempt"), None);
     }
 
     #[test]

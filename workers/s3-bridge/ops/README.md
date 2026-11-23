@@ -1817,10 +1817,11 @@ bucket, key, query, header, ID, IP address or token is written.
 
 ### Sampled queue attempts
 
-`JOB_METRICS_SAMPLE` controls `job` points on `METRICS`: `8` by default,
-`1` for every claimed attempt, or `0` to turn them off. Early wakes,
-duplicate deliveries that claim nothing, and abandoned attempts emit no
-point. A verify attempt that reaches the repair read is labeled `repost`
+`JOB_METRICS_SAMPLE` controls `job` points on `METRICS`: `8` when unset.
+For local tests set `1` to sample every claimed attempt. `0` or a malformed
+value disables points. The managed production deploy does not carry
+dashboard-only variable overrides into a new deployment. Early wakes,
+duplicate deliveries that claim nothing, and abandoned attempts emit no point. A verify attempt that reaches the repair read is labeled `repost`
 instead of emitting a second point. This does not change queue decisions
 or permit admission.
 
