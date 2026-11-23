@@ -748,14 +748,16 @@ class BaselineTest(GeneratorCase):
         baseline = Step(read(os.environ["DEPLOY_CONFIG_BASELINE"]))
         self.assertNotEqual(baseline.script, self.step.script, "the baseline is this very generator")
         compared = 0
+        suffix = ", release-at-verify off"
         for older in OLDER:
             code, out, err, want = baseline.run(self.shipped, older)
             self.assertEqual(code, 0, f"{older!r}: {err}")
+            baseline_summary = out.splitlines()[0].removesuffix(suffix)
             for value in NOT_ASKED:
                 got_out, got = self.ok({**older, SWITCH: value})
                 self.assertEqual(got, want, f"{older!r} {value!r}")
-                summary = got_out.splitlines()[0].removesuffix(", release-at-verify off")
-                self.assertEqual(summary, out.splitlines()[0], f"{older!r} {value!r}")
+                summary = got_out.splitlines()[0].removesuffix(suffix)
+                self.assertEqual(summary, baseline_summary, f"{older!r} {value!r}")
                 compared += 1
         self.assertEqual(compared, len(OLDER) * len(NOT_ASKED))
         for bad in (
