@@ -1450,6 +1450,21 @@ async fn pass_resumes_from_cursor_after_job_death() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn a_pass_that_skipped_the_fresh_sweep_is_not_complete() {
+    let w = World::new();
+    w.clock.set(UnixMs(NOW + SWEEP_MS + 1));
+    let (outcome, _, why, progress) = w
+        .copier()
+        .run_job_with_sequence(&w.jobs, UnixMs(NOW), "", Some(0))
+        .await;
+    assert_eq!((outcome, why), (JobOutcome::Ack, Some(StepError::Expired)));
+    assert!(
+        progress.is_none(),
+        "missing a sweep must not look like a clean pass"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn legacy_copy_job_without_sequence_still_copies() {
     let w = World::new();
     w.record("m/art/x_1", b"legacy copy").await;

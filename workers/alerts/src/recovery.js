@@ -1,9 +1,10 @@
 // Recovery-copy telemetry lives in CATALOG; the independently scheduled
 // alerts Worker can see a stale pass even if the copy Worker stops running.
-import { getMeta, setMeta } from "./store.js";
+import { DAY, getMeta, setMeta } from "./store.js";
 
 const MINUTE = 60_000;
 const STALE_MS = 3 * 15 * MINUTE; // Three copy::PASS_INTERVAL_MS intervals.
+const HISTORY_MS = 7 * DAY; // Bridge retention, excluding the last-verified marker.
 const REFUSED = "recovery-copy-refused";
 const STALE = "recovery-copy-stale";
 export const READING = "recovery copy";
@@ -12,7 +13,7 @@ const COUNTS = ["copied", "pending", "source_unreadable", "failed", "unsignable"
 
 export const SQL = {
   finals: `SELECT pass_id, job_seq, at FROM recovery_pass_job
-    WHERE final = 1 AND pass_id <= ?1 ORDER BY pass_id DESC LIMIT 4`,
+    WHERE final = 1 AND pass_id BETWEEN ?1 AND ?2 ORDER BY pass_id DESC LIMIT 4`,
   jobs: `SELECT cursor_tag, next_tag, copied, pending, source_unreadable, failed, unsignable,
     refused_put, put_status, put_code, refused_verify, verify_status, verify_code,
     refused_plan, plan_status, plan_code
@@ -56,7 +57,7 @@ const anyRefusal = (pass) => pass && OPERATIONS.some((op) => pass[`refused_${op}
 export async function readRecovery(env, now) {
   if (!env.CATALOG || env.RECOVERY_ALARM === "off") return null;
   const db = env.CATALOG;
-  const finals = (await db.prepare(SQL.finals).bind(now).all()).results;
+  const finals = (await db.prepare(SQL.finals).bind(now - HISTORY_MS, now).all()).results;
   const passes = [];
   for (const final of finals) {
     const { results } = await db.prepare(SQL.jobs).bind(final.pass_id, final.job_seq).all();

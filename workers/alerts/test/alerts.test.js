@@ -123,6 +123,19 @@ test("a failed pass is not reported as a recovery", async () => {
   assert.equal(e.ALERT_EMAIL.sent.length, 1);
 });
 
+test("an old verified timestamp does not revive a pruned refusal pass", async () => {
+  const e = env();
+  // Pruning preserves this one job for the age of the last verified copy,
+  // but may have removed more recent clean pass rows.
+  recoveryJob(e, T0 - 8 * store.DAY, { copied: 1, refused: 1 });
+  recoveryJob(e, T0, { refused: 1 });
+  assert.equal((await tick(e, T0)).conditions.includes(REFUSED), false);
+  assert.equal(e.ALERT_EMAIL.sent.length, 0);
+  recoveryJob(e, T0 + INTERVAL, { refused: 1 });
+  await tick(e, T0 + INTERVAL);
+  assert.match(e.ALERT_EMAIL.sent[0].text, /last verified copy: 11535 min ago/i);
+});
+
 test("stale starts strictly after three intervals without a completed pass", async () => {
   const e = env();
   await tick(e, T0);

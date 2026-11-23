@@ -1113,7 +1113,9 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
         if !saved {
             why = why.or(Some(StepError::Mark));
         }
-        let progress = sequence.map(|_| CopyProgress {
+        // A step that skipped the remainder of the fresh sweep is not
+        // proof the pass was clean, even if its walk ran to the end.
+        let progress = sequence.filter(|_| !step.late).map(|_| CopyProgress {
             next: step.next.as_deref().map(cursor_tag),
         });
         if let Some(cursor) = step.next {

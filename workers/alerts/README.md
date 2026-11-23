@@ -67,8 +67,10 @@ operator host's own feeder is private to that host, as are its paths.
 Apply the bridge catalogue migrations before updating either Worker.
 Monitoring is on by default. Set `RECOVERY_ALARM=off` on the alerts
 Worker if recovery copy is intentionally off or the bridge is in restore
-maintenance. The same var on the bridge Worker stops telemetry writes;
-turning it off there alone does not disable the stale alert.
+maintenance. The same var on the bridge Worker stops telemetry writes
+until the next automated bridge deploy, which replaces dashboard-only
+variables. Turning it off on the bridge alone does not disable the stale
+alert.
 
 A zero-copy pass is not a refusal. Hints, retries and incomplete chains
 do not count as completed passes. A copy walk can continue while no pass
