@@ -16,7 +16,7 @@ use sha2::{Digest, Sha256};
 use velmora_bridge::config::{
     BridgeConfig, ConfigError, Environment, GcMode, KekRing, Maintenance, DEFAULT_COLD_SOCKETS,
     DEFAULT_HOT_CAP_BYTES, DEFAULT_POST_SOCKETS, DEFAULT_SLICE_BYTES, MAX_EXTENT_BYTES_LIMIT,
-    MAX_PUT_BYTES_LIMIT,
+    MAX_JOB_BUDGET_BYTES, MAX_PUT_BYTES_LIMIT,
 };
 use velmora_bridge::ingress::ByteBudget;
 use velmora_bridge::jobs::RESEND_SECS;
@@ -253,6 +253,9 @@ fn load(vars: &BTreeMap<String, String>) -> std::result::Result<BridgeConfig, Co
 #[test]
 fn config_loads_from_documented_vars() {
     let (prod, dev) = wrangler_vars();
+    // The file sets no GC_ORPHANS, in either environment: the collector
+    // of orphaned upload parts is turned on by the operator alone.
+    assert!(!prod.contains_key("GC_ORPHANS") && !dev.contains_key("GC_ORPHANS"));
 
     // Until deploy fills in the account subdomain, prod refuses to start.
     let mut shipped = with_secrets(prod.clone(), &prod_providers());
@@ -268,14 +271,13 @@ fn config_loads_from_documented_vars() {
     assert_eq!(cfg.required_backbones, 2);
     assert_eq!(cfg.max_extent_bytes, 16 * 1024 * 1024);
     assert_eq!(cfg.inflight_budget_bytes, 48 * 1024 * 1024);
-    assert_eq!(cfg.job_budget_bytes, 72 * 1024 * 1024);
+    assert_eq!(cfg.job_budget_bytes, 90 * 1024 * 1024);
     // No wait after the two-backbone verify: the release job's own STAT
     // of every backbone that counts is the last check.
     assert_eq!(cfg.safety_min_age_secs, 0);
     assert_eq!(cfg.verify_delay_secs, 120);
-    // Shipped on: a verify round that passes once the minimum age is
-    // over releases the extent itself.
-    assert!(cfg.release_at_verify);
+    // Production keeps the two-stage release; the dev fixture opts in.
+    assert!(!cfg.release_at_verify);
     assert_eq!(
         cfg.newsgroups,
         [
@@ -308,6 +310,8 @@ fn config_loads_from_documented_vars() {
     assert_eq!(cfg.max_put_bytes, MAX_PUT_BYTES_LIMIT);
     assert_eq!(cfg.slice_bytes, DEFAULT_SLICE_BYTES);
     assert!(!cfg.intent_sweep);
+    // Upload parts that left their upload are not collected.
+    assert!(!cfg.gc_orphans);
     // One object holds at most 10 000 extents unless the variable says
     // fewer.
     assert_eq!(cfg.max_object_extents, 10_000);
@@ -326,6 +330,7 @@ fn config_loads_from_documented_vars() {
         (cfg.max_put_bytes, cfg.slice_bytes, cfg.intent_sweep),
         (MAX_PUT_BYTES_LIMIT, DEFAULT_SLICE_BYTES, true)
     );
+    assert!(!cfg.gc_orphans);
     // Dev sets no job budget: jobs and requests share the one limit.
     assert_eq!(cfg.job_budget_bytes, cfg.inflight_budget_bytes);
     // Absent or empty is the default; any other size is taken as given.
@@ -384,17 +389,11 @@ fn config_loads_from_documented_vars() {
             ),
         }
     }
-    // A budget with room for the ciphertext of one extent, its copy and
-    // two more sockets lowers the count instead of refusing every cold
-    // read. The room is counted from the ciphertext: two plaintext
-    // extents and two sockets are 8288 bytes short of it.
+    // A budget that fits the rebuild but not all eight sockets lowers
+    // the count. The eighth socket's limit is counted from the
+    // ciphertext: two plaintext extents and seven buffers fall short.
     sized.insert("COLD_SOCKETS".to_string(), "8".to_string());
-    for (budget, want) in [
-        ("36708448", 3),
-        ("36708447", 2),
-        ("36700160", 2),
-        ("33562720", 1),
-    ] {
+    for (budget, want) in [("44572768", 8), ("44572767", 7), ("44564480", 7)] {
         sized.insert("INFLIGHT_BUDGET_BYTES".to_string(), budget.to_string());
         let cfg = load(&sized).unwrap();
         assert_eq!(cfg.cold_sockets, want, "{budget}");
@@ -415,6 +414,40 @@ fn config_loads_from_documented_vars() {
     }
     assert!(cfg.dev_trust_http);
     assert!(!cfg.providers[0].tls);
+}
+
+/// Turning parity off for new plans does not remove the room needed to
+/// rebuild extents whose parity is already stored.
+#[test]
+fn stored_parity_needs_rebuild_room_even_with_parity_off() {
+    use velmora_bridge::fetch::{cold_read_bytes, cold_rebuild_bytes, cold_step_bytes};
+
+    let (prod, _) = wrangler_vars();
+    let mut vars = with_secrets(prod, &prod_providers());
+    let cfg = load(&vars).unwrap();
+    let cipher = velmora::media::ciphertext_size(cfg.max_extent_bytes).unwrap();
+    let (k, shard) = velmora_bridge::parity::stripe_of(cipher).unwrap();
+    let most = velmora_bridge::parity::parity_count(usize::from(k)) as u64;
+    assert_eq!((k, most), (24, 4));
+    let read = cold_read_bytes(cipher, 1);
+    let both = cold_step_bytes(cipher, 1) + cold_rebuild_bytes(u64::from(shard), most);
+    assert!(read < both && both <= cfg.inflight_budget_bytes);
+
+    // The job budget follows the request budget.
+    vars.remove("JOB_BUDGET_BYTES");
+    vars.insert("PACKED_PLANS".into(), "on".into());
+    vars.insert("COLD_SOCKETS".into(), "1".into());
+    for parity in ["on", "off"] {
+        vars.insert("PARITY".into(), parity.into());
+        vars.insert("INFLIGHT_BUDGET_BYTES".into(), (both - 1).to_string());
+        assert_eq!(
+            load(&vars).map(|cfg| cfg.cold_sockets),
+            Err(ConfigError::Invalid("INFLIGHT_BUDGET_BYTES".into())),
+            "PARITY={parity}"
+        );
+        vars.insert("INFLIGHT_BUDGET_BYTES".into(), both.to_string());
+        assert_eq!(load(&vars).unwrap().cold_sockets, 1, "PARITY={parity}");
+    }
 }
 
 /// The recovery copy is no part of the service's configuration: off
@@ -784,6 +817,10 @@ fn config_rejects_invalid_and_unsafe_values() {
         ("INTENT_SWEEP", "1"),
         ("INTENT_SWEEP", "ON"),
         ("INTENT_SWEEP", "disposable"),
+        ("GC_ORPHANS", "1"),
+        ("GC_ORPHANS", "ON"),
+        ("GC_ORPHANS", "true"),
+        ("GC_ORPHANS", "disposable"),
         ("PARITY", "1"),
         ("PARITY", "ON"),
         ("PARITY", "true"),
@@ -870,6 +907,24 @@ fn config_rejects_invalid_and_unsafe_values() {
         assert_eq!(cfg.slice_bytes.to_string(), slice);
         assert_eq!(cfg.intent_sweep, sweep.trim() == "on");
     }
+    // The collector of orphaned upload parts: its own switch, whatever
+    // GC_MODE says.
+    for (orphans, on) in [
+        ("off", false),
+        ("", false),
+        ("  ", false),
+        ("on", true),
+        (" on ", true),
+    ] {
+        for mode in ["off", "disposable"] {
+            let mut tuned = prod.clone();
+            tuned.insert("GC_ORPHANS".into(), orphans.into());
+            tuned.insert("GC_MODE".into(), mode.into());
+            let cfg = load(&tuned).unwrap();
+            assert_eq!(cfg.gc_orphans, on, "{orphans:?}");
+            assert_eq!(cfg.gc_mode == GcMode::Disposable, mode == "disposable");
+        }
+    }
     for n in ["1", "10000"] {
         let mut capped = prod.clone();
         capped.insert("MAX_OBJECT_EXTENTS".into(), n.into());
@@ -943,8 +998,11 @@ fn config_rejects_invalid_and_unsafe_values() {
             "{short}"
         );
     }
-    // The job budget: from the request budget to 1.5 times it.
-    for bad in ["50331647", "75497473", "72MiB", "-1"] {
+    // The job budget: from the request budget to 1.5 times it or
+    // MAX_JOB_BUDGET_BYTES (90 MiB), whichever is more. At the shipped
+    // 48 MiB request budget that is 90 MiB, not 72.
+    assert_eq!(MAX_JOB_BUDGET_BYTES, 94_371_840);
+    for bad in ["50331647", "94371841", "72MiB", "-1"] {
         assert_eq!(
             set(&prod, "JOB_BUDGET_BYTES", bad),
             invalid("JOB_BUDGET_BYTES"),
@@ -954,11 +1012,24 @@ fn config_rejects_invalid_and_unsafe_values() {
     for (good, want) in [
         ("50331648", 50_331_648),
         ("75497472", 75_497_472),
+        ("75497473", 75_497_473),
+        ("94371840", 94_371_840),
         ("", 50_331_648),
     ] {
         let mut vars = with_secrets(prod.clone(), PROVIDER_TLS);
         vars.insert("JOB_BUDGET_BYTES".into(), good.into());
         assert_eq!(load(&vars).unwrap().job_budget_bytes, want, "{good:?}");
+    }
+    // A request budget whose 1.5 times is above 90 MiB keeps that bound:
+    // 64 MiB allows 96 MiB and not a byte more.
+    for (job, ok) in [("100663296", true), ("100663297", false)] {
+        let mut vars = with_secrets(prod.clone(), PROVIDER_TLS);
+        vars.insert("INFLIGHT_BUDGET_BYTES".into(), "67108864".into());
+        vars.insert("JOB_BUDGET_BYTES".into(), job.into());
+        match ok {
+            true => assert_eq!(load(&vars).unwrap().job_budget_bytes, 100_663_296),
+            false => assert_eq!(load(&vars).unwrap_err(), invalid("JOB_BUDGET_BYTES")),
+        }
     }
     assert_eq!(
         set(&prod, "SAFETY_MIN_AGE_SECS", "-1"),
@@ -1047,6 +1118,9 @@ fn admin_read_token_host_and_metrics_sample() {
         Some(read)
     );
     assert_eq!(set.admin_host.as_deref(), Some("admin.internal"));
+    // The root's dot is the same name: kept as a request is compared.
+    let dotted = with(&[("ADMIN_HOST", "admin.internal.")]).unwrap();
+    assert_eq!(dotted.admin_host.as_deref(), Some("admin.internal"));
     assert_eq!(set.metrics_sample, 1);
     assert!(
         !format!("{set:?}").contains(read),
@@ -1061,7 +1135,15 @@ fn admin_read_token_host_and_metrics_sample() {
             invalid("ADMIN_READ_TOKEN")
         );
     }
-    for bad in ["Admin.Internal", "admin internal", "admin/x", "admin:443"] {
+    for bad in [
+        "Admin.Internal",
+        "admin internal",
+        "admin/x",
+        "admin:443",
+        "admin.internal..",
+        "admin..internal",
+        ".admin.internal",
+    ] {
         assert_eq!(
             with(&[("ADMIN_HOST", bad)]).unwrap_err(),
             invalid("ADMIN_HOST")
@@ -1890,6 +1972,38 @@ async fn sql_rejects_more_than_100_params_like_d1() {
         0,
         "an over-limit statement rolls back its batch"
     );
+
+    // An integer crosses to D1 as a JS number: one that a number does
+    // not hold exactly is refused, by the fixture as by the adapter.
+    for ok in [MAX_SQL_INT, -MAX_SQL_INT, 0] {
+        db.query("SELECT ?1", &[SqlValue::Int(ok)]).await.unwrap();
+    }
+    for bad in [MAX_SQL_INT + 1, -MAX_SQL_INT - 1, i64::MAX, i64::MIN] {
+        for err in [
+            db.query("SELECT ?1", &[SqlValue::Int(bad)])
+                .await
+                .unwrap_err(),
+            db.exec(INSERT_GC_MARKER, &[text("x_a"), SqlValue::Int(bad)])
+                .await
+                .unwrap_err(),
+            db.batch(vec![
+                (INSERT_GC_MARKER, vec![text("x_a"), SqlValue::Int(T0.0)]),
+                (INSERT_GC_MARKER, vec![text("x_b"), SqlValue::Int(bad)]),
+            ])
+            .await
+            .unwrap_err(),
+        ] {
+            assert!(
+                matches!(&err, BridgeError::Sql(m) if m.contains("outside JS safe range")),
+                "{bad}: {err:?}"
+            );
+        }
+    }
+    assert_eq!(
+        count(&db, "gc"),
+        0,
+        "an out-of-range integer rolls back its batch"
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -1994,6 +2108,106 @@ fn s3_host_allows_only_hostname_and_port() {
         assert_eq!(
             host(bad).unwrap_err(),
             ConfigError::Invalid("S3_HOST".into()),
+            "{bad}"
+        );
+    }
+}
+
+#[test]
+fn s3_hosts_lists_more_hosts_with_a_class() {
+    use velmora_bridge::config::{HostClass, S3Host};
+
+    let (_, dev) = wrangler_vars();
+    let base = with_secrets(dev, PROVIDER_PLAIN);
+    let primary = base["S3_HOST"].as_str();
+    let hosts = |value: Option<&str>| {
+        let mut m = base.clone();
+        if let Some(value) = value {
+            m.insert("S3_HOSTS".into(), value.into());
+        }
+        load(&m)
+    };
+
+    for value in [None, Some(""), Some(" \t ")] {
+        let cfg = hosts(value).unwrap();
+        assert!(cfg.s3_hosts.is_empty(), "{value:?}");
+        assert_eq!(cfg.s3_host_for(primary), Some((primary, HostClass::Legacy)));
+    }
+
+    let cfg = hosts(Some("s3.customer.example=customer")).unwrap();
+    assert_eq!(
+        cfg.s3_hosts,
+        [S3Host {
+            name: "s3.customer.example".into(),
+            class: HostClass::Customer,
+        }]
+    );
+    assert_eq!(
+        cfg.s3_host_for("S3.Customer.Example"),
+        Some(("s3.customer.example", HostClass::Customer))
+    );
+    assert_eq!(cfg.s3_host_for("other.example"), None);
+    assert_eq!(cfg.s3_host_for("s3.customer.example:443"), None);
+
+    let cfg = hosts(Some(" a.example=legacy , b.example:8443=customer ")).unwrap();
+    assert_eq!(
+        cfg.s3_hosts,
+        [
+            S3Host {
+                name: "a.example".into(),
+                class: HostClass::Legacy,
+            },
+            S3Host {
+                name: "b.example:8443".into(),
+                class: HostClass::Customer,
+            },
+        ]
+    );
+    assert_eq!(
+        cfg.all_s3_hosts().collect::<Vec<_>>(),
+        [primary, "a.example", "b.example:8443"]
+    );
+
+    let cfg = hosts(Some("a.example=legacy,b-a.example=customer")).unwrap();
+    assert_eq!(
+        cfg.all_s3_hosts().collect::<Vec<_>>(),
+        [primary, "a.example", "b-a.example"]
+    );
+
+    let eight = (1..=8)
+        .map(|i| format!("s3-{i}.example=legacy"))
+        .collect::<Vec<_>>()
+        .join(",");
+    assert_eq!(hosts(Some(&eight)).unwrap().s3_hosts.len(), 8);
+
+    for bad in [
+        "a.example",
+        "a.example=",
+        "=customer",
+        "a.example=Customer",
+        "a.example=public",
+        "A.example=customer",
+        "a.example=customer,",
+        ",a.example=customer",
+        "a.example=customer,a.example=legacy",
+        &format!("{}=customer", primary.to_ascii_uppercase()),
+        &format!("{primary}=customer"),
+        &format!("eu.{primary}=customer"),
+        "a.example=legacy,x.a.example=customer",
+        "x.a.example=customer,a.example=legacy",
+        "a.example:8443=legacy,x.a.example=customer",
+        "a b.example=customer",
+        "a.example:0=customer",
+        "a.example.=customer",
+        "a.example.:8443=customer",
+        "a..example=customer",
+        ".a.example=legacy",
+        "a.example=customer=legacy",
+        &format!("{eight},s3-9.example=legacy"),
+    ] {
+        assert_eq!(
+            hosts(Some(bad)).unwrap_err(),
+            ConfigError::Invalid("S3_HOSTS".into()),
             "{bad}"
         );
     }
@@ -2709,14 +2923,20 @@ fn provider_pool_settings_fail_closed() {
 }
 
 /// The shipped `POST_SOCKETS` and `JOB_BUDGET_BYTES` let three post jobs
-/// of full-size extents and a verify job share one isolate's byte budget.
-/// The queue's invocations share isolates, so with a larger socket count
-/// or a smaller job budget a post job waits for another.
+/// of full-size extents and a verify job share one isolate's byte budget,
+/// with parity (`PARITY`) and without, and never a fourth post job of
+/// either kind. The queue's invocations share isolates (and so do the
+/// post queues), so with a larger socket count or a smaller job budget a
+/// post job waits for another: with parity at 72 MiB only two fitted, and
+/// posting was 20% slower than without. Three post jobs with parity at
+/// once is what the shipped limit was measured with.
 #[test]
 fn three_post_jobs_and_a_verify_job_fit_the_shipped_budget() {
     use velmora::media::{FileKey, Profile, Sealer};
     use velmora::rng::SystemRng;
-    use velmora_bridge::jobs::job_bytes;
+    use velmora_bridge::articles::article_spans;
+    use velmora_bridge::jobs::{job_bytes, parity_job_bytes};
+    use velmora_bridge::parity::parity_count;
 
     let (prod, _) = wrangler_vars();
     let budget: u64 = prod["JOB_BUDGET_BYTES"].parse().unwrap();
@@ -2726,20 +2946,53 @@ fn three_post_jobs_and_a_verify_job_fit_the_shipped_budget() {
     let sealer = Sealer::random(&Profile::drive(), &key, &mut SystemRng).unwrap();
     let cipher_size = sealer.seal_to_vec(&vec![0u8; max_extent]).unwrap().len() as u64;
 
-    let post = job_bytes(OutboxStage::Post, cipher_size, sockets);
+    // What `run_leased` charges a post job of a new plan with the switch
+    // on: the job, and the parity of its articles.
+    let plain = job_bytes(OutboxStage::Post, cipher_size, sockets);
+    let parity = parity_count(article_spans(cipher_size).len());
+    let with_parity = plain + parity_job_bytes(cipher_size, parity);
     let verify = job_bytes(OutboxStage::Verify, cipher_size, sockets);
-    assert!(
-        3 * post + verify <= budget,
-        "three post jobs ({post} B each) and a verify job ({verify} B) exceed {budget} B"
+    assert_eq!(
+        (parity, plain),
+        (4, 26_218_544),
+        "a 16 MiB extent at 6 sockets: 25.00 MiB"
     );
-    let jobs =
-        ByteBudget::new(prod["INFLIGHT_BUDGET_BYTES"].parse().unwrap()).with_job_capacity(budget);
-    let held: Vec<_> = [post, post, post, verify]
-        .into_iter()
-        .map(|bytes| jobs.try_charge_job(bytes).expect("fits"))
-        .collect();
-    assert!(jobs.try_charge_job(post).is_none());
-    drop(held);
+    assert_eq!(
+        with_parity, 30_545_264,
+        "29.13 MiB with its 4 parity shards and the codec's 2"
+    );
+    let budget_of = || {
+        ByteBudget::new(prod["INFLIGHT_BUDGET_BYTES"].parse().unwrap()).with_job_capacity(budget)
+    };
+    for post in [plain, with_parity] {
+        assert!(
+            3 * post + verify <= budget,
+            "three post jobs ({post} B each) and a verify job ({verify} B) exceed {budget} B"
+        );
+        let jobs = budget_of();
+        let held: Vec<_> = [post, post, post, verify]
+            .into_iter()
+            .map(|bytes| jobs.try_charge_job(bytes).expect("fits"))
+            .collect();
+        assert!(jobs.try_charge_job(post).is_none());
+        drop(held);
+    }
+    // No fourth post job, of any kind and in any mix, even with nothing
+    // else charged.
+    for fourth in [plain, with_parity] {
+        let jobs = budget_of();
+        let held: Vec<_> = [plain, plain, plain]
+            .into_iter()
+            .map(|bytes| jobs.try_charge_job(bytes).expect("fits"))
+            .collect();
+        assert!(jobs.try_charge_job(fourth).is_none(), "{fourth}");
+        drop(held);
+    }
+    // The shipped budget is the most a deployment may set, and no more
+    // than the three jobs with parity and the verify job need, rounded
+    // up to a MiB.
+    assert_eq!(budget, MAX_JOB_BUDGET_BYTES);
+    assert_eq!(budget, (3 * with_parity + verify).div_ceil(1 << 20) << 20);
 }
 
 /// The queue tables of the shipped `wrangler.toml`: producers as
@@ -2913,12 +3166,13 @@ fn wrangler_tables() -> (Vec<String>, Vec<String>, Vec<String>) {
 /// declares and binds the permit gate in deploys of their own, after the
 /// code that knows `PERMITS` has run ("Shipping the gate" in
 /// ops/README.md). Deploy 2 declared the class `PermitGate`; deploy 3
-/// adds the `PERMIT_GATE` binding and `[version_metadata]`, and
-/// `PERMITS` stays `"d1"` until a deploy of its own. The legacy
+/// added the `PERMIT_GATE` binding and `[version_metadata]`; deploy 4,
+/// a deploy of its own, set production's `PERMITS` to `"do"` (dev keeps
+/// `"d1"`; its end-to-end run sets `do` itself). The legacy
 /// `[[migrations]]` array is never used: once a class is declared by
 /// `exports`, a deploy that declares one by `[[migrations]]` is refused.
 #[test]
-fn production_declares_and_binds_the_gate_with_permits_d1() {
+fn production_declares_and_binds_the_gate_and_takes_permits_from_it() {
     let (prod, env, root) = wrangler_tables();
     let gate = |key: &str| {
         let first = key.split('.').next().unwrap_or_default();
@@ -2959,7 +3213,7 @@ fn production_declares_and_binds_the_gate_with_permits_d1() {
         );
     }
     let (vars, dev) = wrangler_vars();
-    assert_eq!(vars.get("PERMITS").map(String::as_str), Some("d1"));
+    assert_eq!(vars.get("PERMITS").map(String::as_str), Some("do"));
     assert_eq!(dev.get("PERMITS").map(String::as_str), Some("d1"));
     assert!(
         !env.iter().any(|t| t.ends_with(".migrations")),

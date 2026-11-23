@@ -1529,10 +1529,11 @@ async fn removed_backbone_does_not_count() {
     assert!(rig.safety_held(&s));
 }
 
-/// A job died between the release decision and its last step: the next job
-/// finishes the release without reading anything.
+/// A job died between the release decision and its last step: the next
+/// job does not take that decision over. It decides again, asking every
+/// backbone for every article, and then finishes the release.
 #[tokio::test]
-async fn interrupted_release_is_finished() {
+async fn interrupted_release_is_decided_again_and_finished() {
     let rig = two_backbone_rig().await;
     let (s, _) = rig.verified_on_two(13).await;
     rig.bridge.catalog.edit(&s.extent, |e| {
@@ -1541,7 +1542,7 @@ async fn interrupted_release_is_finished() {
     let connects = rig.bridge.nntp.connects();
 
     assert_eq!(rig.run(&s, OutboxStage::Release).await, JobOutcome::Ack);
-    assert_eq!(rig.bridge.nntp.connects(), connects);
+    assert!(rig.bridge.nntp.connects() > connects);
     assert!(rig.bridge.safety.contains(&s.extent.safety_key()));
     assert_eq!(
         rig.bridge.catalog.extent(&s.extent).safety_state,
@@ -1877,6 +1878,114 @@ async fn a_put_off_job_resumes_at_the_backbone_it_reached() {
     );
     let outbox = rig.outbox(&s);
     assert_eq!((outbox.stage, outbox.cursor), (OutboxStage::Release, 0));
+}
+
+/// A backbone has no free slot, and the host has a timer: the job waits
+/// for one under its claim. The slots here are those of a holder that
+/// is gone: they free when their permits expire, half a permit lifetime
+/// after the claim, and the job goes on in the same run. Nothing is put
+/// off, and the queue delivers the job once.
+#[tokio::test]
+async fn a_job_waits_under_its_claim_for_a_slot_that_comes_free() {
+    let mut rig = two_backbone_rig().await;
+    rig.with_timer();
+    let (s, _) = rig.posted(48).await;
+    rig.propagate(&s, 0, 1).await;
+    let now = rig.bridge.clock.now();
+    let half = i64::from(PERMIT_SECS) * 500;
+    rig.take_slots(1, now.plus_ms(-half)).await;
+
+    assert_eq!(rig.run(&s, OutboxStage::Verify).await, JobOutcome::Ack);
+
+    let waited = rig.bridge.clock.now().0 - now.0;
+    assert!((half..jobs::SLOT_WAIT_MS).contains(&waited), "{waited}");
+    assert_eq!(
+        checks(&rig, &s),
+        [ok("bb0", VerifyKind::Body), ok("bb1", VerifyKind::Stat)]
+    );
+    let outbox = rig.outbox(&s);
+    assert_eq!((outbox.stage, outbox.cursor), (OutboxStage::Release, 0));
+    assert_eq!(rig.bridge.nntp.live(), 0);
+}
+
+/// The slots stay taken (their holder is at work and renews them): the
+/// job waits one permit lifetime from its claim and no longer, then is
+/// put off as a job without a timer is at once. The row's attempts are
+/// what they were before the claim, and the row says where the job got
+/// to.
+#[tokio::test]
+async fn a_job_that_waited_in_vain_is_put_off_without_an_attempt() {
+    let mut rig = two_backbone_rig().await;
+    rig.with_timer();
+    let (s, _) = rig.posted(49).await;
+    rig.propagate(&s, 0, 1).await;
+    let now = rig.bridge.clock.now();
+    // Held past the end of the wait, as after a renewal.
+    let held = rig.take_slots(1, now.plus_secs(30)).await;
+    let attempts = rig.outbox(&s).attempts;
+
+    let delay = retry_delay(&rig.run(&s, OutboxStage::Verify).await);
+
+    assert!((15..=60).contains(&delay), "delay {delay}");
+    let ended = rig.bridge.clock.now();
+    let poll = i64::from(jobs::SLOT_POLL_MS);
+    let waited = ended.0 - now.0;
+    assert!(
+        (jobs::SLOT_WAIT_MS..jobs::SLOT_WAIT_MS + poll).contains(&waited),
+        "{waited}"
+    );
+    assert_eq!(checks(&rig, &s), [ok("bb0", VerifyKind::Body)]);
+    let outbox = rig.outbox(&s);
+    assert_eq!(
+        (outbox.stage, outbox.cursor, outbox.attempts),
+        (OutboxStage::Verify, 8, attempts)
+    );
+    assert_eq!(outbox.next_at, ended.plus_secs(delay));
+    assert_eq!(rig.bridge.nntp.live(), 0);
+
+    // The job that comes back finds the slot and asks that backbone only.
+    for permit in held {
+        rig.bridge.catalog.release_permit(&permit).await.unwrap();
+    }
+    rig.bridge.clock.advance_secs(60);
+    assert_eq!(rig.run(&s, OutboxStage::Verify).await, JobOutcome::Ack);
+    assert_eq!(
+        checks(&rig, &s),
+        [ok("bb0", VerifyKind::Body), ok("bb1", VerifyKind::Stat)]
+    );
+}
+
+/// The catalogue fails at a later ask of a wait, at the read of the pool
+/// or at the take of a slot: the job is put off as one that found no
+/// slot. Its attempt is handed back and the row keeps where it got to.
+#[tokio::test]
+async fn a_catalogue_error_at_a_later_ask_ends_the_wait_as_a_put_off() {
+    for acquire in [false, true] {
+        let mut rig = two_backbone_rig().await;
+        rig.with_timer();
+        let (s, _) = rig.posted(49).await;
+        rig.propagate(&s, 0, 1).await;
+        let now = rig.bridge.clock.now();
+        rig.take_slots(1, now.plus_secs(30)).await;
+        let attempts = rig.outbox(&s).attempts;
+
+        // The first backbone is read; the wait is for the second. Its
+        // third ask fails.
+        rig.bridge
+            .catalog
+            .fail_slot_asks(rig.bridge.catalog.slot_asks().0 + 4, acquire);
+        let delay = retry_delay(&rig.run(&s, OutboxStage::Verify).await);
+
+        assert!((15..=60).contains(&delay), "{acquire}: delay {delay}");
+        let ended = rig.bridge.clock.now();
+        assert_eq!(ended.0 - now.0, 2 * i64::from(jobs::SLOT_POLL_MS));
+        assert_eq!(checks(&rig, &s), [ok("bb0", VerifyKind::Body)]);
+        let outbox = rig.outbox(&s);
+        assert_eq!(
+            (outbox.stage, outbox.cursor, outbox.attempts, outbox.next_at),
+            (OutboxStage::Verify, 8, attempts, ended.plus_secs(delay))
+        );
+    }
 }
 
 /// A lease lost while a later backbone is read: the first backbone's

@@ -1530,8 +1530,9 @@ async fn aws_chunked_put_and_upload_part_round_trip() {
     let r = rig.send_in(with_body(r, body, true), 100_003).await;
     assert_eq!(r.outcome(), "200", "{}", r.body);
     assert_eq!(rig.object(&rig.alpha, "full.bin").await.unwrap().1, full);
-    // Charged by the decoded length (2 x 16 MiB), not the encoded one.
-    assert_eq!(rig.bridge.budget.peak(), 32 * MIB as u64);
+    // Sealed and stored while it arrives: charged for a window of the
+    // body, whatever its length.
+    assert_eq!(rig.bridge.budget.peak(), ingress::STREAM_CHARGE_BYTES);
 
     // Multipart, as s3transfer sends it: Create names an algorithm.
     let r = rig

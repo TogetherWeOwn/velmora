@@ -26,6 +26,17 @@ concurrency:
 env:
   CARGO_INCREMENTAL: "0"
   CARGO_TERM_COLOR: always
+  # The test runner of the native test jobs. cargo test runs one test
+  # binary after another, and most of the native jobs' time was the few
+  # slow binaries running alone on 4 cores; nextest runs every test of
+  # every binary side by side, each in its own process, the same tests
+  # (counts below each run). Doc-tests, which nextest does not run, run
+  # with `cargo test --doc` beside it. The release digest is recorded
+  # here so a replaced artifact fails closed; re-pin deliberately, with
+  # the digest checked out of band (the release's .sha256 file and the
+  # GitHub asset digest agreed on 2026-11-21).
+  NEXTEST_VERSION: "0.9.152"
+  NEXTEST_SHA256: "521c5f790ed07ee69d0a88403d9d86a8c8ab27977f12fc73f22aa4e7e14a0f71"
 
 jobs:
   public-pr-security:
@@ -42,7 +53,10 @@ jobs:
   rust-test:
     name: rust test (native)
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # 30, not 20: after a Cargo.lock change main restores only a partial
+    # cache, so `cargo test --workspace` alone takes about 16 min, and
+    # the job ran out at 20 min twice on main 7eff9bf.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -72,7 +86,46 @@ jobs:
       # the emitted bytes.
       - name: Install reference par2 binary for creator interop test
         run: sudo apt-get update && sudo apt-get install -y par2
-      - run: cargo test --locked --workspace
+      - name: Install pinned cargo-nextest
+        run: |
+          set -euo pipefail
+          asset="cargo-nextest-${NEXTEST_VERSION}-x86_64-unknown-linux-musl.tar.gz"
+          curl -fsSL --connect-timeout 10 --max-time 60 --retry 3 -o "${RUNNER_TEMP}/${asset}" \
+            "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-${NEXTEST_VERSION}/${asset}"
+          echo "${NEXTEST_SHA256}  ${RUNNER_TEMP}/${asset}" | sha256sum -c -
+          mkdir -p "${RUNNER_TEMP}/nextest-bin"
+          tar -xzf "${RUNNER_TEMP}/${asset}" -C "${RUNNER_TEMP}/nextest-bin"
+          echo "${RUNNER_TEMP}/nextest-bin" >> "$GITHUB_PATH"
+          "${RUNNER_TEMP}/nextest-bin/cargo-nextest" nextest --version
+      # Every test of the workspace (what `cargo test --workspace` ran but
+      # its doc-tests), then the doc-tests. --no-tests=fail: a run that
+      # finds no test fails.
+      - run: cargo nextest run --locked --workspace --no-fail-fast --no-tests=fail
+      - run: cargo test --locked --workspace --doc
+      # The local benchmark's report: its native-vs-replay rows-written check.
+      - run: python3 -I -m unittest discover -s bench -p 'test_*.py'
+
+  # The same native runner with other feature sets of the engine crate,
+  # beside the workspace tests instead of after them.
+  rust-test-features:
+    name: rust test (native, engine feature sets)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust stable
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update --component clippy
+          rustup default stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          prefix-key: v1-rust
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      # As in rust-test: these runs had the binary too.
+      - name: Install reference par2 binary for creator interop test
+        run: sudo apt-get update && sudo apt-get install -y par2
       # Transport-free portable core on the same native runner: executes
       # velmora without default TLS features. This is native portable
       # behavior, not a wasm-runtime check (see rust-wasm).
@@ -310,7 +363,19 @@ jobs:
           # were built before. Change the prefix again with that profile.
           prefix-key: v1-rust
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - run: cargo test --locked -p velmora-s3-proto -p velmora-bridge
+      - name: Install pinned cargo-nextest
+        run: |
+          set -euo pipefail
+          asset="cargo-nextest-${NEXTEST_VERSION}-x86_64-unknown-linux-musl.tar.gz"
+          curl -fsSL --connect-timeout 10 --max-time 60 --retry 3 -o "${RUNNER_TEMP}/${asset}" \
+            "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-${NEXTEST_VERSION}/${asset}"
+          echo "${NEXTEST_SHA256}  ${RUNNER_TEMP}/${asset}" | sha256sum -c -
+          mkdir -p "${RUNNER_TEMP}/nextest-bin"
+          tar -xzf "${RUNNER_TEMP}/${asset}" -C "${RUNNER_TEMP}/nextest-bin"
+          echo "${RUNNER_TEMP}/nextest-bin" >> "$GITHUB_PATH"
+          "${RUNNER_TEMP}/nextest-bin/cargo-nextest" nextest --version
+      - run: cargo nextest run --locked -p velmora-s3-proto -p velmora-bridge --no-fail-fast --no-tests=fail
+      - run: cargo test --locked -p velmora-s3-proto -p velmora-bridge --doc
       - run: cargo clippy --locked -p velmora-s3-proto -p velmora-bridge --all-targets --features velmora-bridge/testkit -- -D warnings
       - run: cargo build --locked -p velmora-test-nntp --bin fakesrv
 
@@ -347,6 +412,9 @@ jobs:
       - name: Test the wasm section stripper
         working-directory: workers/s3-bridge
         run: python3 -I tools/test_strip_wasm.py
+      - name: Test the entry module (entry.mjs)
+        working-directory: workers/s3-bridge
+        run: node --test test/*.test.mjs
       - name: Test the registry path remap of bundle.sh
         working-directory: workers/s3-bridge
         run: python3 -I tools/test_registry_src_dirs.py
@@ -359,6 +427,12 @@ jobs:
       - name: Test the production config generator
         working-directory: workers/s3-bridge
         run: python3 -I tools/test_deploy_config.py
+      - name: Install pinned wrangler (npm ci)
+        working-directory: workers/s3-bridge
+        run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: Test the catalogue export and import scripts
+        working-directory: workers/s3-bridge
+        run: python3 -I tools/test_catalog_export.py
       # bundle.sh: worker-build, then the `name` section is dropped. The
       # same script builds the deploy artifact and the wrangler dev bundle.
       - name: Build the Worker bundle
@@ -378,9 +452,6 @@ jobs:
             echo "index_bg.wasm still names a registry source path"
             exit 1
           fi
-      - name: Install pinned wrangler (npm ci)
-        working-directory: workers/s3-bridge
-        run: npm ci --ignore-scripts --no-audit --no-fund
       # The only blocking size check is Cloudflare's own limit: 64 MiB
       # uncompressed on every plan, no compressed limit
       # (developers.cloudflare.com/workers/platform/limits/#worker-size),
@@ -454,12 +525,27 @@ jobs:
   # It runs twice with aws-cli's default checksum settings: over HTTP (a
   # CRC64NVME header) and over local HTTPS (aws-chunked bodies with a
   # trailing checksum). Each run also covers `when_required` (step 0b).
+  # The two runs are independent (each starts from its own throwaway local
+  # state), so they run as two legs side by side; ci-ok reads the result
+  # of the job, which is a success only when both legs succeed.
   worker-e2e:
-    name: worker e2e (wrangler dev)
+    name: worker e2e (wrangler dev, ${{ matrix.leg }})
     needs: changes
     if: needs.changes.outputs.bridge == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - leg: http
+            url: http://127.0.0.1:8787
+            # Provider permits from the catalogue's slot rows.
+            permits: ""
+          - leg: https-aws-chunked
+            url: https://127.0.0.1:8787
+            # This run takes provider permits from the gate object.
+            permits: do
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -502,23 +588,21 @@ jobs:
       - name: Build fakesrv
         if: steps.script.outputs.present == 'true'
         run: cargo build --locked -p velmora-test-nntp --bin fakesrv
-      - name: Run the local slice (HTTP)
+      - name: Run the local slice (${{ matrix.leg }})
         if: steps.script.outputs.present == 'true'
         working-directory: workers/s3-bridge
         env:
           FAKESRV_BIN: ${{ github.workspace }}/target/debug/fakesrv
           WRANGLER_SEND_METRICS: "false"
-        run: bash e2e/slice.sh http://127.0.0.1:8787
-      - name: Run the local slice (HTTPS, aws-chunked)
-        if: steps.script.outputs.present == 'true'
-        working-directory: workers/s3-bridge
-        env:
-          FAKESRV_BIN: ${{ github.workspace }}/target/debug/fakesrv
-          WRANGLER_SEND_METRICS: "false"
-          # This run takes provider permits from the gate object; the
-          # HTTP run above takes them from the catalogue's slot rows.
-          E2E_PERMITS: "do"
-        run: bash e2e/slice.sh https://127.0.0.1:8787
+          SLICE_URL: ${{ matrix.url }}
+          SLICE_PERMITS: ${{ matrix.permits }}
+        run: |
+          set -euo pipefail
+          # The HTTP leg leaves E2E_PERMITS unset, as before the split.
+          if [ -n "$SLICE_PERMITS" ]; then
+            export E2E_PERMITS="$SLICE_PERMITS"
+          fi
+          bash e2e/slice.sh "$SLICE_URL"
 
   # The console Worker (apps/console): plain JavaScript, no dependencies,
   # tested with the Node test runner. Cheap, so it runs on every event.
@@ -554,7 +638,7 @@ jobs:
 
   ci-ok:
     name: ci-ok
-    needs: [rust-test, rust-wasm, rust-worker-pinned-tls, rust-msrv, cargo-deny, public-pr-security, changes, bridge-native, worker-build, worker-e2e, console-test, alerts-test]
+    needs: [rust-test, rust-test-features, rust-wasm, rust-worker-pinned-tls, rust-msrv, cargo-deny, public-pr-security, changes, bridge-native, worker-build, worker-e2e, console-test, alerts-test]
     if: ${{ always() }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -585,13 +669,16 @@ jobs:
           BRIDGE: ${{ needs.changes.outputs.bridge }}
 
   # Production deploy of the S3 Worker after ci-ok on a push to main, in two
-  # jobs. They depend on ci-ok, never the reverse, and are not part of
-  # ci-ok. `!cancelled()` is needed because the PR-only public-pr-security
-  # job is a skipped ancestor, which would make the implicit success()
-  # skip these jobs.
+  # jobs. They are not part of ci-ok, and ci-ok never depends on them.
+  # `!cancelled()` is needed because the PR-only public-pr-security job is
+  # a skipped ancestor, which would make the implicit success() skip these
+  # jobs.
   #
   # deploy-build compiles the Worker with no environment and no secrets,
-  # and hands the bundle to deploy as an artifact. deploy runs in the
+  # and hands the bundle to deploy as an artifact. It runs beside the test
+  # jobs instead of after ci-ok (it took about 4 minutes of every merge):
+  # it ships nothing, and deploy, the only job that uses its bundle, still
+  # starts only after ci-ok succeeded. deploy runs in the
   # protected `production` environment (main only) and executes no cargo,
   # build.rs or worker-build code. Wrangler comes from the committed
   # workers/s3-bridge/package-lock.json, installed with `npm ci
@@ -604,8 +691,8 @@ jobs:
   # restores the previous Worker version but never reverts a migration.
   deploy-build:
     name: deploy build (s3-bridge bundle)
-    needs: [ci-ok, changes]
-    if: ${{ !cancelled() && github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.changes.outputs.bridge == 'true' && needs.changes.result == 'success' && needs.ci-ok.result == 'success' }}
+    needs: [changes]
+    if: ${{ !cancelled() && github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.changes.outputs.bridge == 'true' && needs.changes.result == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
@@ -651,6 +738,15 @@ jobs:
           set -euo pipefail
           bash bundle.sh
           python3 -I tools/strip_wasm.py check build/index_bg.wasm
+          # The digest of every file wrangler uploads or bundles (the wasm,
+          # the JS glue, and the entry modules entry.mjs and entry-marker.mjs,
+          # which wrangler bundles with build/index.js), and the compiler
+          # that built them. Wrangler itself is pinned by package-lock.json.
+          # The merge runbook compares these with the live version's run to
+          # tell a deploy of the same bytes from a changed one.
+          rustc --version
+          (cd build && find . -type f | sort | xargs sha256sum) | tee -a "$GITHUB_STEP_SUMMARY"
+          sha256sum entry.mjs entry-marker.mjs | tee -a "$GITHUB_STEP_SUMMARY"
       - name: Install pinned wrangler (npm ci)
         if: steps.fresh.outputs.fresh == 'true'
         working-directory: workers/s3-bridge
@@ -665,7 +761,9 @@ jobs:
           name: s3-bridge-bundle
           path: workers/s3-bridge/build/
           if-no-files-found: error
-          retention-days: 1
+          # 7 days, not 1: deploy-build no longer re-runs with ci-ok, so a
+          # "re-run failed jobs" of a flaky test job reuses this bundle.
+          retention-days: 7
       # The unstripped wasm of this release: it names the functions in a
       # production trace frame `wasm-function[N]:0xOFF` (same indices and
       # code offsets). Not deployed. See workers/s3-bridge/ops/README.md,
@@ -680,8 +778,8 @@ jobs:
 
   deploy:
     name: deploy (production)
-    needs: [deploy-build]
-    if: ${{ !cancelled() && needs.deploy-build.result == 'success' && needs.deploy-build.outputs.fresh == 'true' }}
+    needs: [ci-ok, deploy-build]
+    if: ${{ !cancelled() && needs.ci-ok.result == 'success' && needs.deploy-build.result == 'success' && needs.deploy-build.outputs.fresh == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     environment: production
@@ -764,17 +862,31 @@ jobs:
       # the Worker has no secret named RECORD_LAYOUT: the Worker reads
       # a secret where the variable is absent, and a deploy keeps
       # secrets. This job cannot see secrets; no such secret may exist.
+      # The layout is also held against the segment writer: a prod
+      # [vars] table whose MAX_OBJECT_EXTENTS is above 10000 (an object
+      # of more extents has its recovery record written in segments)
+      # is refused unless the layout is "tenant", so no deploy of this
+      # job writes a segment under a flat name, and "flat" cannot be
+      # set again while the writer is on. A value that is not a plain
+      # number is refused the same way. With the writer off, set "flat"
+      # only when no segmented upload is open: this job cannot see the
+      # catalogue. The same holds for a secret of that name.
       # Set "tenant" only in a deploy after the one that brought this
       # switch, and read "Record layout" and "Rollback floor" in
       # workers/s3-bridge/ops/README.md first. The test of this step is
       # workers/s3-bridge/tools/test_deploy_config.py: it runs the
       # script below as it stands in this file, and it holds that the
       # step is that script and nothing else.
+      #
+      # VELMORA_S3_HOSTS adds S3 endpoint hosts as comma separated
+      # hostname=class entries. Attach each host as a Custom Domain
+      # before setting the variable. The smoke test checks every host.
       - name: Generate the production wrangler config
         if: steps.fresh.outputs.fresh == 'true'
         working-directory: workers/s3-bridge
         env:
           VELMORA_S3_HOST: ${{ vars.VELMORA_S3_HOST }}
+          VELMORA_S3_HOSTS: ${{ vars.VELMORA_S3_HOSTS }}
           VELMORA_D1_DATABASE_ID: ${{ vars.VELMORA_D1_DATABASE_ID }}
           VELMORA_RECOVERY_COPY: ${{ vars.VELMORA_RECOVERY_COPY }}
           VELMORA_RECOVERY_PREFIX: ${{ vars.VELMORA_RECOVERY_PREFIX }}
@@ -787,9 +899,11 @@ jobs:
 
           src, dst = sys.argv[1], sys.argv[2]
           host = os.environ.get("VELMORA_S3_HOST", "")
+          hosts = os.environ.get("VELMORA_S3_HOSTS", "")
           dbid = os.environ.get("VELMORA_D1_DATABASE_ID", "")
           label = r"[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?"
-          if len(host) > 253 or not re.fullmatch(rf"{label}(\.{label})+", host):
+          hostname = re.compile(rf"{label}(\.{label})+")
+          if len(host) > 253 or not hostname.fullmatch(host):
               sys.exit("VELMORA_S3_HOST is missing or not a plain lowercase hostname")
           if not re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", dbid):
               sys.exit("VELMORA_D1_DATABASE_ID is missing or not a lowercase UUID")
@@ -816,6 +930,32 @@ jobs:
           # The prod section ends at the first [env.*] table header.
           end = next((i for i, l in enumerate(lines)
                       if re.match(r"\s*\[\[?env\.", l)), len(lines))
+          host_key = re.compile(r"""\s*(?:S3_HOSTS|"S3_HOSTS"|'S3_HOSTS')\s*[.=]""")
+          if any(host_key.match(line) for line in lines[:end]):
+              sys.exit("the prod section of the shipped file sets S3_HOSTS")
+          def sets_s3_hosts(value):
+              if isinstance(value, dict):
+                  return "S3_HOSTS" in value or any(map(sets_s3_hosts, value.values()))
+              return isinstance(value, list) and any(map(sets_s3_hosts, value))
+
+          try:
+              shipped_prod = tomllib.loads("\n".join(lines[:end]))
+          except tomllib.TOMLDecodeError:
+              shipped_prod = {}  # The generated config is checked below.
+          if sets_s3_hosts(shipped_prod):
+              sys.exit("the prod section of the shipped file sets S3_HOSTS")
+          entries = hosts.split(",") if hosts else []
+          seen = {host}
+          classes = []
+          for entry in entries:
+              name, _, host_class = entry.partition("=")
+              if (len(entries) > 8 or len(name) > 253 or not hostname.fullmatch(name)
+                      or host_class not in ("legacy", "customer") or name in seen
+                      or any(name.endswith("." + other) or other.endswith("." + name)
+                             for other in seen)):
+                  sys.exit("VELMORA_S3_HOSTS must be a comma separated list of <lowercase host>=legacy|customer, at most 8, without S3_HOST, a repeat or a subdomain of another host")
+              seen.add(name)
+              classes.append(host_class)
           subs = [
               ('S3_HOST = "velmora-s3.<account>.workers.dev"', f'S3_HOST = "{host}"'),
               ('database_id = "<from wrangler d1 create>"', f'database_id = "{dbid}"'),
@@ -855,7 +995,10 @@ jobs:
               if len(hits) != 1:
                   sys.exit(f"expected exactly one prod line {placeholder!r}, found {len(hits)}")
               i = hits[0]
-              lines[i] = lines[i][: len(lines[i]) - len(lines[i].lstrip())] + value
+              indent = lines[i][: len(lines[i]) - len(lines[i].lstrip())]
+              lines[i] = indent + value
+              if hosts and placeholder.startswith("S3_HOST "):
+                  lines[i] += f'\n{indent}S3_HOSTS = "{hosts}"'
           builds = [i for i in range(end) if lines[i].strip() == "[build]"]
           if len(builds) != 1:
               sys.exit(f"expected exactly one prod [build] table, found {len(builds)}")
@@ -867,15 +1010,33 @@ jobs:
           # written, before the file exists: a refusal leaves no file.
           # No RECORD_LAYOUT at all is "flat" to the Worker.
           try:
-              found = tomllib.loads(text)["vars"].get("RECORD_LAYOUT")
+              prod_vars = tomllib.loads(text)["vars"]
+              found = prod_vars.get("RECORD_LAYOUT")
+              extents = prod_vars.get("MAX_OBJECT_EXTENTS")
           except (tomllib.TOMLDecodeError, KeyError, AttributeError):
               sys.exit("the generated config is not valid TOML with a prod [vars] table")
           if found != ("tenant" if layout == "tenant" else None):
               sys.exit("the generated config does not carry the record layout that was asked for")
+          # The segment writer is on when one object may have more
+          # extents than one record holds. Its records must not get
+          # flat names. Absent or empty is the Worker's default, which
+          # is off; any other value that is not a plain number up to
+          # that count is taken as on.
+          single = 10000
+          word = extents.strip() if isinstance(extents, str) else None
+          writer_off = extents is None or word == "" or (
+              word is not None and re.fullmatch(r"[0-9]{1,5}", word) is not None
+              and int(word) <= single)
+          if layout != "tenant" and not writer_off:
+              sys.exit(f"the generated config sets MAX_OBJECT_EXTENTS above {single} (segmented records) while the record layout is flat")
+          if prod_vars.get("S3_HOSTS") != (hosts or None):
+              sys.exit("the generated config does not carry the S3 hosts that were asked for")
           with open(dst, "w", encoding="utf-8") as f:
               f.write(text)
           print(f"wrangler.deploy.toml: prod placeholders substituted, prod [build] removed, recovery copy {copy}, verify mode {mode}")
           print(f"record layout in the generated config: {layout}")
+          class_list = f" ({','.join(classes)})" if classes else ""
+          print(f"extra S3 hosts in the generated config: {len(classes)}{class_list}")
           PY
       # The version serving 100% of traffic now, the rollback target. A
       # Worker that does not exist yet (first deploy) has none; any other
@@ -931,21 +1092,40 @@ jobs:
         if: steps.fresh.outputs.fresh == 'true'
         env:
           VELMORA_S3_HOST: ${{ vars.VELMORA_S3_HOST }}
+          VELMORA_S3_HOSTS: ${{ vars.VELMORA_S3_HOSTS }}
         run: |
           set -euo pipefail
           body="${RUNNER_TEMP}/smoke-body"
-          code=none
-          for attempt in 1 2 3 4 5 6; do
-            code=$(curl -sS -o "$body" -w '%{http_code}' --connect-timeout 10 --max-time 30 \
-              "https://${VELMORA_S3_HOST}/" || true)
-            echo "attempt ${attempt}: HTTP ${code}"
-            if [ "$code" = "403" ] && grep -q '<Code>AccessDenied</Code>' "$body"; then
-              exit 0
+          hosts=("$VELMORA_S3_HOST")
+          if [ -n "$VELMORA_S3_HOSTS" ]; then
+            IFS=, read -r -a entries <<< "$VELMORA_S3_HOSTS"
+            for entry in "${entries[@]}"; do
+              hosts+=("${entry%%=*}")
+            done
+          fi
+          for i in "${!hosts[@]}"; do
+            host="${hosts[i]}"
+            index=$((i + 1))
+            if ! [[ "$host" =~ ^[a-z0-9]([a-z0-9.-]{0,251}[a-z0-9])?$ ]]; then
+              echo "smoke: invalid host at index ${index}"
+              exit 1
             fi
-            sleep 10
+            if [ "${#hosts[@]}" -gt 1 ]; then
+              echo "smoke: checking host ${index}"
+            fi
+            code=none
+            for attempt in 1 2 3 4 5 6; do
+              code=$(curl -sS -o "$body" -w '%{http_code}' --connect-timeout 10 --max-time 30 \
+                "https://${host}/" || true)
+              echo "attempt ${attempt}: HTTP ${code}"
+              if [ "$code" = "403" ] && grep -q '<Code>AccessDenied</Code>' "$body"; then
+                continue 2
+              fi
+              sleep 10
+            done
+            echo "smoke: expected HTTP 403 AccessDenied for an unsigned GET, last got ${code} (host index ${index})"
+            exit 1
           done
-          echo "smoke: expected HTTP 403 AccessDenied for an unsigned GET, last got ${code}"
-          exit 1
       # On any failure or cancellation after the rollback target was
       # recorded: roll back to that exact version, but only when the active
       # version is the one this run deployed (from the wrangler output), so
@@ -1036,8 +1216,12 @@ jobs:
   # would name the host) stay out of the public log.
   deploy-alert:
     name: deploy alert
-    needs: [deploy-build, deploy]
-    if: ${{ always() && github.event_name == 'push' && github.ref == 'refs/heads/main' && (needs.deploy-build.result == 'failure' || needs.deploy.result == 'failure' || needs.deploy.result == 'cancelled') }}
+    # deploy-build runs beside the tests, so it also fails on a commit
+    # whose tests fail (a compile error fails both). That commit could
+    # never deploy, and ci-ok already shows it; as before the build moved
+    # beside the tests, a build failure is reported only when ci-ok passed.
+    needs: [ci-ok, deploy-build, deploy]
+    if: ${{ always() && github.event_name == 'push' && github.ref == 'refs/heads/main' && ((needs.deploy-build.result == 'failure' && needs.ci-ok.result == 'success') || needs.deploy.result == 'failure' || needs.deploy.result == 'cancelled') }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     environment: production

@@ -7,7 +7,7 @@
 //!   replaces the counters only when asked to.
 //! - The migration: additive, reads no table, and leaves a Worker from
 //!   before it with the row counts it had.
-//! - Migration 0023: a release by the verify job is counted as a verify
+//! - Migration 0025: a release by the verify job is counted as a verify
 //!   and a release, and nothing else is counted differently.
 
 use velmora_bridge::sql::usage::{
@@ -882,8 +882,8 @@ fn the_migration_adds_tables_and_triggers_and_reads_nothing() {
     assert!(!armed(&db));
 }
 
-/// The catalogue as it is before migration 0023, counters on.
-fn before_0023() -> RusqliteSql {
+/// The catalogue as it is before migration 0025, counters on.
+fn before_0025() -> RusqliteSql {
     let db = RusqliteSql::open_in_memory().unwrap();
     for script in before_0020() {
         db.apply(script).unwrap();
@@ -943,7 +943,7 @@ fn stage_changes(db: &RusqliteSql) {
     batch("x_f", T0 + 2 * 3_600_000, true, "done");
 }
 
-/// Migration 0023. A row that goes from `verify` to `done` in the batch
+/// Migration 0025. A row that goes from `verify` to `done` in the batch
 /// that releases its copy is a verify and a release, in the totals and
 /// in the hours. Every other change counts as it did.
 #[test]
@@ -964,7 +964,7 @@ fn a_release_by_the_verify_job_counts_as_a_verify_and_a_release() {
 
     // Before the migration the two releases by a verify job were
     // verifies only: that is all it changes.
-    let old = before_0023();
+    let old = before_0025();
     stage_changes(&old);
     let before = Totals {
         releases: 1,
@@ -974,14 +974,14 @@ fn a_release_by_the_verify_job_counts_as_a_verify_and_a_release() {
     assert_eq!(levels(&old, 1), levels(&db, 1));
 }
 
-/// Migration 0023 replaces one trigger: the text of 0020 but for the
+/// Migration 0025 replaces one trigger: the text of 0020 but for the
 /// two places that count a release. It reads and writes no row, so it
 /// takes the same time on any catalogue, and the counters stay as they
 /// are and switched on.
 #[test]
-fn migration_0023_replaces_the_stage_trigger_and_nothing_else() {
+fn migration_0025_replaces_the_stage_trigger_and_nothing_else() {
     assert_eq!(
-        top_level(MIGRATION_0023),
+        top_level(MIGRATION_0025),
         ["DROP TRIGGER usage_outbox_stage"]
     );
     let trigger = |script: &str| {
@@ -992,7 +992,7 @@ fn migration_0023_replaces_the_stage_trigger_and_nothing_else() {
             .collect::<Vec<_>>()
             .join(" ")
     };
-    assert_eq!(MIGRATION_0023.matches("CREATE TRIGGER").count(), 1);
+    assert_eq!(MIGRATION_0025.matches("CREATE TRIGGER").count(), 1);
     let was = "(OLD.stage = 'release' AND NEW.stage = 'done')";
     let is = "((OLD.stage = 'release' AND NEW.stage = 'done') \
                OR (OLD.stage = 'verify' AND NEW.stage = 'done' \
@@ -1000,9 +1000,9 @@ fn migration_0023_replaces_the_stage_trigger_and_nothing_else() {
                AND e.safety_state = 'released' AND e.released_at = NEW.updated_at)))";
     let old = trigger(MIGRATION_0020);
     assert_eq!(old.matches(was).count(), 2);
-    assert_eq!(trigger(MIGRATION_0023), old.replace(was, is));
+    assert_eq!(trigger(MIGRATION_0025), old.replace(was, is));
 
-    let db = before_0023();
+    let db = before_0025();
     fill(&db, 30);
     let other = "SELECT type, name, sql FROM sqlite_master \
                   WHERE name <> 'usage_outbox_stage' ORDER BY 1, 2";
@@ -1011,7 +1011,7 @@ fn migration_0023_replaces_the_stage_trigger_and_nothing_else() {
     let state = |db: &RusqliteSql| (schema(db), levels(db, 1), totals(db), armed(db));
     let (before, global) = (state(&db), pairs_of(&db, counters));
     db.meter_writes().unwrap();
-    db.apply(MIGRATION_0023).unwrap();
+    db.apply(MIGRATION_0025).unwrap();
     assert_eq!(db.writes().billed(), 0);
     assert_eq!(state(&db), before);
     assert_eq!(pairs_of(&db, counters), global);

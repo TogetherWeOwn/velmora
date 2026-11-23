@@ -109,6 +109,64 @@ pub enum GcMode {
     Disposable,
 }
 
+/// How long an upload part stays after it stopped being part of its
+/// upload (replaced, aborted, or left out of the part list at
+/// completion) before `GC_ORPHANS` deletes its safety copy: 31 days.
+///
+/// Requests and jobs never bring such a part back: its extent id is
+/// never issued again and only an open upload that lists an extent can
+/// publish it. A catalogue from before the drop does list it, and its
+/// upload is open there. The database can be taken back at most 30 days
+/// (D1 Time Travel), so once a part has been dropped for longer, no
+/// state the database can return to lists it. The 31st day is the
+/// margin between the clocks compared: the Worker's, which dated the
+/// drop and runs the collector, and the database's.
+///
+/// The same wait makes a deletion safe to lose: a catalogue taken back
+/// to before a part was collected still has the part dropped, with its
+/// row open, and the collector deletes the absent copy once more.
+/// And it ends every request that could still name the part: a
+/// completion that read the part list before the drop has stored its
+/// recovery record, or never will, long before the wait is over.
+///
+/// What it assumes: the database stayed on one history for that long.
+/// A restore that is undone leaves a second history that Time Travel
+/// can still return to for 30 days, with states of before the restore
+/// point in it. So the collector waits the same time once more after
+/// every replay: no claim is granted until this long after the last
+/// one ended (`sql/gc.rs`, "After a replay"). A restore that was undone
+/// before a replay ended on it, or within the minutes before the
+/// rollback stamp was next raised, leaves nothing in the catalogue to
+/// tell by: for that one the ops notes keep the rule that the switch
+/// stays off for this long ("After a restore").
+pub const ORPHAN_GRACE_MS: i64 = 31 * 24 * 60 * 60 * 1000;
+
+/// What a host name the service answers on is for. `S3_HOST` is always
+/// [`HostClass::Legacy`]; the hosts of `S3_HOSTS` name their class.
+///
+/// For now both classes admit every key: there is one tenant, so the
+/// class changes no answer yet. It is parsed, validated and resolved
+/// per request now, so that binding tenants to classes later is a
+/// change to one rule and not to the configuration.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HostClass {
+    /// The endpoint the existing keys were given.
+    Legacy,
+    /// The endpoint for customer tenants.
+    Customer,
+}
+
+/// One more host the S3 surface answers on, besides `S3_HOST`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct S3Host {
+    /// As configured: lowercase, with an optional `:port`.
+    pub name: String,
+    pub class: HostClass,
+}
+
+/// Most hosts `S3_HOSTS` may list.
+pub const MAX_EXTRA_S3_HOSTS: usize = 8;
+
 /// `MAINTENANCE`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Maintenance {
@@ -158,16 +216,35 @@ pub const DEFAULT_COLD_SOCKETS: u32 = 4;
 /// reads over as many as fit ([`crate::fetch::cold_read_bytes`]).
 pub const MAX_COLD_SOCKETS: u32 = 8;
 /// `JOB_BUDGET_BYTES` may be at most `INFLIGHT_BUDGET_BYTES` times this
-/// ratio (3/2).
+/// ratio (3/2), or [`MAX_JOB_BUDGET_BYTES`] where that is more.
 ///
 /// A request holds up to 1.5 bytes for each byte it charges: an upload
 /// charges plaintext plus ciphertext and the ciphertext is copied once
 /// more when it is handed to the blob store. A job holds about what it
 /// charges. The budget weighs a request byte at `JOB_BUDGET_BYTES /
-/// INFLIGHT_BUDGET_BYTES` job bytes, so a ratio above 3/2 would only let
-/// jobs charge memory that requests alone could never reach.
+/// INFLIGHT_BUDGET_BYTES` job bytes. Up to 3/2 that weight is what a
+/// request holds; above it, jobs may charge more than requests alone
+/// could reach, which only [`MAX_JOB_BUDGET_BYTES`] allows.
 pub const MAX_JOB_BUDGET_NUM: u64 = 3;
 pub const MAX_JOB_BUDGET_DEN: u64 = 2;
+/// `JOB_BUDGET_BYTES` may be up to this much (90 MiB) whatever
+/// `INFLIGHT_BUDGET_BYTES` is, when 3/2 of that is less.
+///
+/// It is what three post jobs of a full extent with parity (29.13 MiB
+/// each at 6 sockets) and a verify job charge at once, so that one post
+/// queue's three invocations run together in their isolate with parity
+/// as they do without it; at 6 sockets a fourth post job, with parity or
+/// without, waits.
+///
+/// The charges bound what the jobs and requests of an isolate hold at
+/// once, not the wasm memory the allocator keeps: that only grows, a
+/// whole extent at a time once its free space is split. Measured on a
+/// deployed Worker (2026-11-22, one post queue, about 60 jobs per run): with
+/// three post jobs at once the wasm memory reached 78 to 92 MiB without
+/// parity and 85 to 103 MiB with it; with four jobs with parity at once
+/// (4 sockets each, 104.5 MiB charged), 119 MiB, and no invocation ran out
+/// of memory. Raise this limit only after measuring again.
+pub const MAX_JOB_BUDGET_BYTES: u64 = 90 * 1024 * 1024;
 
 /// Propagation grace when `PROPAGATION_GRACE_SECS` is unset: six hours.
 pub const DEFAULT_PROPAGATION_GRACE_SECS: u32 = 21_600;
@@ -176,8 +253,13 @@ pub const DEFAULT_PROPAGATION_GRACE_SECS: u32 = 21_600;
 #[derive(Clone, Debug)]
 pub struct BridgeConfig {
     pub environment: Environment,
-    /// The host clients sign (`policy.host`).
+    /// The host clients sign (`policy.host`), class
+    /// [`HostClass::Legacy`].
     pub s3_host: String,
+    /// More hosts clients may sign for (`S3_HOSTS`), each with its
+    /// class. Empty when the variable is unset: the service answers on
+    /// `s3_host` alone, as before the variable existed.
+    pub s3_hosts: Vec<S3Host>,
     pub region: String,
     pub max_extent_bytes: u64,
     /// Largest PutObject body. A body above `max_extent_bytes` is cut
@@ -192,6 +274,11 @@ pub struct BridgeConfig {
     /// published. Off: their `write_intents` rows stay and can be swept
     /// later.
     pub intent_sweep: bool,
+    /// Delete the safety copies of upload parts that no upload and no
+    /// object refers to, [`ORPHAN_GRACE_MS`] after they were dropped
+    /// (`GC_ORPHANS`). Independent of `gc_mode`. Off: they stay, and a
+    /// later run with the switch on takes them.
+    pub gc_orphans: bool,
     /// Store the article plan of a new extent packed on its row
     /// (`PACKED_PLANS`, [`crate::plan`]) instead of as one row per
     /// article. Every Worker from the one that knows this switch reads
@@ -607,6 +694,68 @@ fn valid_newsgroup(g: &str) -> bool {
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"._+-".contains(&b))
 }
 
+/// `S3_HOSTS`: absent or empty is no extra host. Otherwise a comma
+/// separated list of `<host>=<class>`, class `legacy` or `customer`,
+/// at most [`MAX_EXTRA_S3_HOSTS`] entries. Each host is a valid
+/// `S3_HOST` value in lowercase, without a trailing dot or an empty
+/// label, and no host is listed twice or equals
+/// `S3_HOST` (compared without case), and no host is a subdomain of
+/// another (ports aside). Anything else refuses the whole
+/// configuration: a host typed wrong must not leave a second endpoint
+/// half-configured.
+fn parse_s3_hosts(raw: Option<&str>, primary: &str) -> Result<Vec<S3Host>, ConfigError> {
+    let invalid = || ConfigError::Invalid("S3_HOSTS".into());
+    let raw = match raw.map(str::trim) {
+        None | Some("") => return Ok(Vec::new()),
+        Some(raw) => raw,
+    };
+    let mut out: Vec<S3Host> = Vec::new();
+    for entry in raw.split(',') {
+        let (name, class) = entry.trim().split_once('=').ok_or_else(invalid)?;
+        let (name, class) = (name.trim(), class.trim());
+        let class = match class {
+            "legacy" => HostClass::Legacy,
+            "customer" => HostClass::Customer,
+            _ => return Err(invalid()),
+        };
+        // Requests are put on a host by its normalised name
+        // (`ingress::host_name`); a name it would change (a trailing
+        // dot, an empty label) would never be matched, and the class it
+        // names would not apply.
+        let bare = name.split(':').next().unwrap_or(name);
+        if !valid_s3_host(name)
+            || crate::ingress::host_name(bare).as_deref() != Some(bare)
+            || name.bytes().any(|b| b.is_ascii_uppercase())
+            || name.eq_ignore_ascii_case(primary)
+            || out.iter().any(|h| h.name == name)
+        {
+            return Err(invalid());
+        }
+        out.push(S3Host {
+            name: name.to_owned(),
+            class,
+        });
+    }
+    if out.len() > MAX_EXTRA_S3_HOSTS {
+        return Err(invalid());
+    }
+    // No host may be a subdomain of another: `<bucket>.<host>` is how a
+    // virtual-hosted request names its bucket, and it must stay refused
+    // as such, not be taken as a path-style request on a second host.
+    let names: Vec<String> = core::iter::once(primary.to_ascii_lowercase())
+        .chain(out.iter().map(|h| h.name.clone()))
+        .collect();
+    let bare = |n: &str| n.split(':').next().unwrap_or(n).to_owned();
+    for a in &names {
+        for b in &names {
+            if a != b && bare(a).ends_with(&format!(".{}", bare(b))) {
+                return Err(invalid());
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// `VELMORA_KEK_<v>`: base64 (standard, padded) of exactly 32 bytes.
 fn parse_kek(get: &impl Fn(&str) -> Option<String>, v: u32) -> Result<KekBytes, ConfigError> {
     let name = format!("VELMORA_KEK_{v}");
@@ -620,6 +769,24 @@ fn parse_kek(get: &impl Fn(&str) -> Option<String>, v: u32) -> Result<KekBytes, 
 }
 
 impl BridgeConfig {
+    /// The configured host a request's `Host` names, as configured, and
+    /// its class; `None` when it names none of them. Compared without
+    /// case, port included: `s3.example` does not match `s3.example:443`.
+    pub fn s3_host_for(&self, host: &str) -> Option<(&str, HostClass)> {
+        if host.eq_ignore_ascii_case(&self.s3_host) {
+            return Some((self.s3_host.as_str(), HostClass::Legacy));
+        }
+        self.s3_hosts
+            .iter()
+            .find(|h| host.eq_ignore_ascii_case(&h.name))
+            .map(|h| (h.name.as_str(), h.class))
+    }
+
+    /// Every host the S3 surface answers on: `S3_HOST` first.
+    pub fn all_s3_hosts(&self) -> impl Iterator<Item = &str> {
+        core::iter::once(self.s3_host.as_str()).chain(self.s3_hosts.iter().map(|h| h.name.as_str()))
+    }
+
     /// Builds and validates the configuration from vars and secrets.
     /// `get` returns a var or secret by name (`None` = absent).
     pub fn from_vars(get: impl Fn(&str) -> Option<String>) -> Result<BridgeConfig, ConfigError> {
@@ -634,6 +801,7 @@ impl BridgeConfig {
         if !valid_s3_host(&s3_host) {
             return Err(ConfigError::Invalid("S3_HOST".into()));
         }
+        let s3_hosts = parse_s3_hosts(get("S3_HOSTS").as_deref(), &s3_host)?;
         let region = required(&get, "S3_REGION")?;
 
         let max_extent_bytes: u64 = number(&get, "MAX_EXTENT_BYTES")?;
@@ -674,6 +842,11 @@ impl BridgeConfig {
             None | Some("") | Some("off") => false,
             Some("on") => true,
             Some(_) => return Err(ConfigError::Invalid("INTENT_SWEEP".into())),
+        };
+        let gc_orphans = match get("GC_ORPHANS").as_deref().map(str::trim) {
+            None | Some("") | Some("off") => false,
+            Some("on") => true,
+            Some(_) => return Err(ConfigError::Invalid("GC_ORPHANS".into())),
         };
         let packed_plans = match get("PACKED_PLANS").as_deref().map(str::trim) {
             None | Some("") | Some("off") => false,
@@ -758,16 +931,24 @@ impl BridgeConfig {
         // read that could never be charged would fail every time.
         let cipher = velmora::media::ciphertext_size(max_extent_bytes)
             .ok_or_else(|| ConfigError::Invalid("MAX_EXTENT_BYTES".into()))?;
+        // A read that lost articles holds the rebuild beside the
+        // extent. Count it even with PARITY=off: that rolls back parity
+        // for new plans, but reads still rebuild from stored parity.
+        let rebuild = crate::fetch::cold_rebuild_most(cipher);
         let fits = |sockets: &u32| {
+            let step = crate::fetch::cold_step_bytes(cipher, *sockets);
             crate::fetch::cold_read_bytes(cipher, *sockets) <= inflight_budget_bytes
+                && step.saturating_add(rebuild) <= inflight_budget_bytes
         };
-        // Not even one socket: the budget is under twice the ciphertext.
+        // Not even one socket: the budget is under twice the ciphertext,
+        // or has no room for a rebuild beside the read.
         let cold_sockets = (1..=cold_sockets)
             .rev()
             .find(fits)
             .ok_or_else(|| ConfigError::Invalid("INFLIGHT_BUDGET_BYTES".into()))?;
         // Never under the request limit, and never more than half as much
-        // again (see `MAX_JOB_BUDGET_NUM`).
+        // again (see `MAX_JOB_BUDGET_NUM`) or `MAX_JOB_BUDGET_BYTES`,
+        // whichever is more.
         let job_budget_bytes: u64 = match get("JOB_BUDGET_BYTES") {
             Some(v) if !v.trim().is_empty() => v
                 .trim()
@@ -775,7 +956,8 @@ impl BridgeConfig {
                 .map_err(|_| ConfigError::Invalid("JOB_BUDGET_BYTES".into()))?,
             _ => inflight_budget_bytes,
         };
-        let job_budget_max = inflight_budget_bytes / MAX_JOB_BUDGET_DEN * MAX_JOB_BUDGET_NUM;
+        let job_budget_max = (inflight_budget_bytes / MAX_JOB_BUDGET_DEN * MAX_JOB_BUDGET_NUM)
+            .max(MAX_JOB_BUDGET_BYTES);
         if job_budget_bytes < inflight_budget_bytes || job_budget_bytes > job_budget_max {
             return Err(ConfigError::Invalid("JOB_BUDGET_BYTES".into()));
         }
@@ -872,13 +1054,19 @@ impl BridgeConfig {
         };
         let admin_host = match get("ADMIN_HOST").as_deref().map(str::trim) {
             None | Some("") => None,
+            // Kept as `ingress::host_name` makes it (one root dot
+            // removed), the name a request is compared by. An empty label
+            // is refused: no request could name it.
             Some(h)
                 if h.len() <= 253
                     && h.bytes().all(|b| {
                         b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'.' || b == b'-'
                     }) =>
             {
-                Some(h.to_string())
+                match crate::ingress::host_name(h) {
+                    Some(name) => Some(name),
+                    None => return Err(ConfigError::Invalid("ADMIN_HOST".into())),
+                }
             }
             Some(_) => return Err(ConfigError::Invalid("ADMIN_HOST".into())),
         };
@@ -893,12 +1081,14 @@ impl BridgeConfig {
         Ok(BridgeConfig {
             environment,
             s3_host,
+            s3_hosts,
             region,
             max_extent_bytes,
             max_put_bytes,
             slice_bytes,
             max_object_extents,
             intent_sweep,
+            gc_orphans,
             packed_plans,
             parity,
             records,

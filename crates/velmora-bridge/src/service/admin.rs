@@ -7,8 +7,8 @@
 //! | Route | Answer |
 //! |---|---|
 //! | `POST /_admin/buckets` `{name, disposable}` | `200` (a non-disposable bucket only with `"disposable": false`; `403` for one if `REAL_DATA_READY` is unset); `409` name taken |
-//! | `POST /_admin/keys` `{buckets, perm}` | `200` with the secret, once |
-//! | `GET /_admin/keys[?after=<id>]` | `200`: ids, status, created time and grants, never a secret; `next` while more follow |
+//! | `POST /_admin/keys` `{buckets, perm[, kind]}` | `200` with the secret, once. `kind` is `s3` (default) or `app_password`: a key pair for the WebDAV entry point only (`crate::entry`) |
+//! | `GET /_admin/keys[?after=<id>]` | `200`: ids, kind, status, created time and grants, never a secret; `next` while more follow |
 //! | `POST /_admin/keys/<access_key_id>/grants` `{bucket, perm}` | `200` `{access_key_id, bucket, perm}`, widening (`ro` to `rw`) or repeating an earlier grant on that bucket; `409` `GrantNarrowingRefused` for `rw` to `ro`; `404` unknown key or bucket; `400` bad `perm` |
 //! | `DELETE /_admin/keys/<access_key_id>` | `204` revoked; `404` unknown (so a second call is `404`) |
 //! | `DELETE /_admin/keys/<access_key_id>/grants` | `405`: grants are not removed one by one |
@@ -62,6 +62,7 @@ use zeroize::Zeroizing;
 
 use crate::config::{Maintenance, REAL_DATA_READY};
 use crate::crypto::{open_range, unwrap_bdk, wrap_bdk, wrap_secret, DataKey};
+use crate::entry::KeyKind;
 use crate::fetch::{cold_poll_ms, cold_step_bytes, ColdFetch, ColdReader, COLD_WAIT_MS};
 use crate::hashstate::Running;
 use crate::ingress::{self, check_admin_bearer, IngressError};
@@ -91,7 +92,6 @@ const REVOCATION_PAGE: u32 = 500;
 /// `owner` and `principal` of everything the admin API creates.
 const ADMIN_PRINCIPAL: &str = "admin";
 
-const KEY_ID_PREFIX: &str = "AKVL";
 const KEY_ID_RANDOM_LEN: usize = 16;
 const KEY_ID_ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
 const SECRET_LEN: usize = 40;
@@ -416,6 +416,20 @@ async fn route<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T
                 ));
             }
             let body: RestoreBody = read_json(bridge, req).await?;
+            // Check the bound catalogue before replay can revoke any keys
+            // or move its cursor, including when resuming a prior replay.
+            if bridge
+                .catalog
+                .restore_import_incomplete()
+                .await
+                .or_internal()?
+            {
+                return Err(fail(
+                    409,
+                    "CatalogueImportIncomplete",
+                    "The catalogue has an incomplete batched import. Do not replay into this database.",
+                ));
+            }
             restore(bridge, body).await
         }
         "/ops-snapshot" if get => ops_snapshot(bridge, &req.raw_target).await,
@@ -868,7 +882,9 @@ pub(super) async fn create_bucket_s3<
     req: S3Request,
     bucket: &str,
 ) -> S3Response {
-    if check_admin_bearer(&req, bridge.cfg.admin_token.expose()).is_err() {
+    if ingress::on_customer_host(&req, &bridge.cfg)
+        || check_admin_bearer(&req, bridge.cfg.admin_token.expose()).is_err()
+    {
         return IngressError::AccessDenied.response();
     }
     if mutable(bridge).await.is_err() {
@@ -916,7 +932,9 @@ pub(super) async fn delete_bucket_s3<
     req: S3Request,
     bucket: &str,
 ) -> S3Response {
-    if check_admin_bearer(&req, bridge.cfg.admin_token.expose()).is_err() {
+    if ingress::on_customer_host(&req, &bridge.cfg)
+        || check_admin_bearer(&req, bridge.cfg.admin_token.expose()).is_err()
+    {
         return IngressError::AccessDenied.response();
     }
     let failed = || S3Response::error(500, "InternalError", "The request failed.");
@@ -960,6 +978,19 @@ pub(super) async fn delete_bucket_s3<
 struct CreateKeyBody {
     buckets: Vec<String>,
     perm: String,
+    /// `s3` (the default when the field is absent) or `app_password` (see
+    /// `crate::entry`). Kept as raw JSON so that an explicit `null` or a
+    /// non-string is a `400`, not an S3 key.
+    #[serde(default, deserialize_with = "present")]
+    kind: Option<serde_json::Value>,
+}
+
+/// `Some` for a field that is present, `null` included (`Option`'s own
+/// deserializer reads `null` as absent).
+fn present<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<serde_json::Value>, D::Error> {
+    serde::Deserialize::deserialize(deserializer).map(Some)
 }
 
 async fn create_key<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>(
@@ -968,6 +999,13 @@ async fn create_key<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: K
 ) -> Admin<S3Response> {
     let perm =
         Perm::parse(&body.perm).ok_or_else(|| fail(400, "InvalidArgument", "perm is rw or ro."))?;
+    let kind = match &body.kind {
+        None => KeyKind::S3,
+        Some(kind) => kind
+            .as_str()
+            .and_then(KeyKind::parse)
+            .ok_or_else(|| fail(400, "InvalidArgument", "kind is s3 or app_password."))?,
+    };
     if body.buckets.is_empty() || body.buckets.len() > MAX_GRANTS {
         return Err(fail(400, "InvalidArgument", "Name 1 to 32 buckets."));
     }
@@ -985,7 +1023,7 @@ async fn create_key<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: K
     let mut rng = SystemRng;
     let mut id_tail = [0u8; KEY_ID_RANDOM_LEN];
     fill_alphabet(&mut rng, &mut id_tail, KEY_ID_ALPHABET).map_err(rng_failed)?;
-    let mut access_key_id = String::from(KEY_ID_PREFIX);
+    let mut access_key_id = String::from(kind.prefix());
     access_key_id.extend(id_tail.iter().map(|b| char::from(*b)));
 
     // The only plaintext copies of the secret: this buffer (wiped on
@@ -1025,6 +1063,8 @@ async fn create_key<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: K
     out.extend_from_slice(&secret[..]);
     out.extend_from_slice(b"\",\"perm\":\"");
     out.extend_from_slice(perm.as_str().as_bytes());
+    out.extend_from_slice(b"\",\"kind\":\"");
+    out.extend_from_slice(kind.as_str().as_bytes());
     out.extend_from_slice(b"\"}");
     Ok(S3Response {
         status: 200,
@@ -1064,6 +1104,7 @@ async fn list_keys<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Ke
         .map(|k| {
             json!({
                 "access_key_id": k.access_key_id,
+                "kind": KeyKind::of(&k.access_key_id).as_str(),
                 "status": k.status.as_str(),
                 "created_at": k.created_at.0,
                 "grants": k.grants.iter().map(|(bucket, perm)| json!({
@@ -1493,10 +1534,15 @@ async fn drill_extent<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K:
     (charge, bytes): (&mut Option<ingress::Charge>, u64),
     (articles, retries): (&mut u64, &mut u32),
 ) -> Admin<Option<Vec<u8>>> {
-    let deadline = bridge.clock.now().plus_ms(i64::from(COLD_WAIT_MS));
+    let first_eligible_at = bridge.clock.now();
+    let deadline = first_eligible_at.plus_ms(i64::from(COLD_WAIT_MS));
     let mut slept = 0u32;
     let mut interrupted = 0u32;
     let mut last: Option<BridgeError>;
+    // The largest rebuild shortfall ([`ColdReader::settle`]), kept
+    // across this extent's retries even if the last try ended for
+    // another reason. The next try waits for both the read and rebuild.
+    let mut rebuild = 0u64;
     loop {
         if charge.is_none() {
             // A try after a wait starts only inside the allowance, and
@@ -1507,8 +1553,9 @@ async fn drill_extent<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K:
             };
             let sleep = bridge.budget.sleeper().ok_or_else(busy)?;
             // After a request that waited for this room before.
-            let taken = core::pin::pin!(bridge.budget.charge_in_turn(bytes));
-            let taken = match select(taken, sleep(left)).await {
+            let both = bytes.saturating_add(rebuild);
+            let taken = core::pin::pin!(bridge.budget.charge_in_turn(both));
+            let mut taken = match select(taken, sleep(left)).await {
                 Either::Left((taken, _)) => taken.map_err(|_| busy())?,
                 Either::Right(_) => return Err(busy()),
             };
@@ -1516,27 +1563,45 @@ async fn drill_extent<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K:
             if bridge.clock.now() >= deadline {
                 return Err(busy());
             }
+            if rebuild > 0 {
+                // Waited for as one charge, so that the drill never
+                // waits for room while it holds some; held as two, the
+                // rebuild's with the reader. Nothing runs in between.
+                drop(taken);
+                taken = bridge.budget.try_charge(bytes).ok_or_else(busy)?;
+                if let Some(spare) = bridge.budget.try_charge(rebuild) {
+                    reader.fund(spare);
+                }
+            }
             *charge = Some(taken);
         }
-        let read = match bridge.catalog.articles(&extent.id).await {
+        // The plan with its parity addendum: a drill rebuilds a lost
+        // article as a read does.
+        let read = match bridge.catalog.stored_plan(&extent.id).await {
             // An extent that is not posted in full is not on Usenet:
             // nothing is asked for.
-            Ok(plan) if plan.iter().any(|a| a.state != ArticleState::Posted) => return Ok(None),
+            Ok(plan) if plan.rows.iter().any(|a| a.state != ArticleState::Posted) => {
+                // The room this try was given for a rebuild goes back
+                // now, not when the drill has closed its sessions.
+                reader.settle();
+                return Ok(None);
+            }
             Ok(plan) => {
-                let count = plan.len() as u64;
+                let count = plan.rows.len() as u64;
                 reader
-                    .fetch_planned(extent, plan)
+                    .fetch_planned(extent, plan, first_eligible_at)
                     .await
                     .map(|read| (read, count))
             }
             Err(e) => Err(e),
         };
+        rebuild = rebuild.max(reader.settle());
         match read {
             Ok((ColdFetch::Filled(cipher), count)) => {
                 *articles += count;
                 return Ok(Some(cipher));
             }
-            Ok((ColdFetch::Unavailable, _)) => return Ok(None),
+            Ok((ColdFetch::Unavailable | ColdFetch::Unrecoverable, _)) => return Ok(None),
             // `last` is why the last try failed: the answer says the
             // class of that one, not of an earlier one.
             Ok((ColdFetch::Busy, _)) => last = None,
@@ -1833,6 +1898,10 @@ async fn drill<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T
         // Slots taken, each at most one login: a connection is kept
         // from one extent to the next.
         "sessions": stats.opened,
+        // Articles no provider had intact, rebuilt from the extents'
+        // parity articles: the object is whole, with that much of its
+        // parity used.
+        "rebuilt": stats.rebuilt,
     })))
 }
 

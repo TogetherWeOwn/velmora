@@ -8,6 +8,9 @@
 // No `Send` bound is intended (see module docs).
 #![allow(async_fn_in_trait)]
 
+use futures_util::StreamExt;
+use sha2::{Digest, Sha256};
+
 use crate::config::BridgeConfig;
 use crate::ingress::ByteBudget;
 use crate::plan::{PackReport, StoredPlan};
@@ -25,7 +28,8 @@ use crate::types::{
     VerifyEscalation, WriteId,
 };
 use crate::types::{
-    BucketUsage, RecountState, RecountStep, UsageCounters, UsageRecount, UsageSnapshot,
+    BridgeError, BucketUsage, ByteStream, RecountState, RecountStep, UsageCounters, UsageRecount,
+    UsageSnapshot,
 };
 
 // ---------------------------------------------------------------------------
@@ -82,7 +86,8 @@ pub trait Sql {
 }
 
 // The limits of the database behind [`Sql`] live here and nowhere else:
-// [`MAX_SQL_PARAMS`], [`MAX_SQL_VALUE_BYTES`] and [`SqlLimits`]. They are
+// [`MAX_SQL_PARAMS`], [`MAX_SQL_VALUE_BYTES`], [`MAX_SQL_INT`] and
+// [`SqlLimits`]. They are
 // D1's. The statements themselves are plain SQLite and run unchanged on
 // any SQLite behind the port.
 
@@ -91,6 +96,12 @@ pub const MAX_SQL_PARAMS: usize = 100;
 
 /// D1's limit on one bound text or blob value, in bytes. More is an error.
 pub const MAX_SQL_VALUE_BYTES: usize = 2_000_000;
+
+/// The largest integer D1 takes or returns, and the negative of the
+/// smallest: a value crosses to D1 as a JS number, which is exact up to
+/// `Number.MAX_SAFE_INTEGER` only. A bound integer outside
+/// `-MAX_SQL_INT..=MAX_SQL_INT` is an error, before the statement runs.
+pub const MAX_SQL_INT: i64 = (1 << 53) - 1;
 
 /// How much a set-based statement may carry: one that takes its rows from
 /// a single JSON parameter (the publish of a generation).
@@ -144,6 +155,29 @@ pub struct BlobMeta<'a> {
     pub cipher_sha256: &'a [u8; 32],
 }
 
+/// Custom metadata of a blob whose bytes are not known when its put
+/// begins ([`BlobStore::put_stream`]): what [`BlobMeta`] names, without
+/// the digest.
+#[derive(Clone, Copy, Debug)]
+pub struct StreamMeta<'a> {
+    pub bucket: &'a BucketId,
+    pub extent: &'a ExtentId,
+}
+
+/// What the store holds after [`BlobStore::put_stream`], as the store
+/// itself reports it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PutReceipt {
+    pub size: u64,
+    /// MD5 of the stored bytes.
+    pub md5: [u8; 16],
+}
+
+/// A streamed body that did not give exactly the bytes it declared.
+fn stream_length() -> BridgeError {
+    BridgeError::Blob("stream length differs from the declared one".into())
+}
+
 /// One key of a listing with what identifies its bytes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BlobEntry {
@@ -154,10 +188,73 @@ pub struct BlobEntry {
     pub md5: String,
 }
 
+/// [`BlobStore::put_stream`] for a store that takes whole blobs only:
+/// reads `body` to its end, refuses one that fails or does not give
+/// exactly `len` bytes, and only then calls [`BlobStore::put`].
+pub async fn put_stream_whole<B: BlobStore + ?Sized>(
+    store: &B,
+    key: &str,
+    len: u64,
+    mut body: ByteStream,
+    meta: &StreamMeta<'_>,
+) -> Result<PutReceipt> {
+    let cap = usize::try_from(len).map_err(|_| stream_length())?;
+    let mut bytes = Vec::with_capacity(cap);
+    while let Some(piece) = body.next().await {
+        let piece = piece?;
+        if piece.len() > cap - bytes.len() {
+            return Err(stream_length());
+        }
+        bytes.extend_from_slice(&piece);
+    }
+    if bytes.len() != cap {
+        return Err(stream_length());
+    }
+    drop(body);
+    let stored = PutReceipt {
+        size: len,
+        md5: md5::compute(&bytes).0,
+    };
+    let cipher_sha256: [u8; 32] = Sha256::digest(&bytes).into();
+    let meta = BlobMeta {
+        bucket: meta.bucket,
+        extent: meta.extent,
+        cipher_sha256: &cipher_sha256,
+    };
+    store.put(key, bytes, &meta).await?;
+    Ok(stored)
+}
+
 /// R2 `SAFETY`/`CACHE` now; any S3-compatible store later.
 pub trait BlobStore {
-    /// H2 adds `put_stream(len)`.
     async fn put(&self, key: &str, bytes: Vec<u8>, meta: &BlobMeta<'_>) -> Result<()>;
+    /// Stores the `len` bytes that `body` gives, piece by piece, without
+    /// holding them all. The contract every adapter keeps:
+    ///
+    /// - **All or nothing.** If `body` gives an error, ends before `len`
+    ///   bytes or gives more than `len`, the call fails and no object
+    ///   exists under `key` because of it. A body may therefore be
+    ///   refused after its first bytes were handed over: the writer
+    ///   withholds its last piece until it accepts the whole.
+    /// - **The answer is the store's own account** of what it holds
+    ///   (size and MD5). The store cannot be given a digest to check the
+    ///   bytes against before it has them, so the caller compares the
+    ///   answer with what it sent and does not name the blob anywhere
+    ///   unless they agree.
+    /// - One attempt: a stream cannot be read twice.
+    ///
+    /// This default holds the whole body and hands it to
+    /// [`BlobStore::put`] ([`put_stream_whole`]); an adapter that can
+    /// store a stream overrides it.
+    async fn put_stream(
+        &self,
+        key: &str,
+        len: u64,
+        body: ByteStream,
+        meta: &StreamMeta<'_>,
+    ) -> Result<PutReceipt> {
+        put_stream_whole(self, key, len, body, meta).await
+    }
     /// `None` = absent. With a span, exactly that range.
     async fn get(&self, key: &str, span: Option<ByteSpan>) -> Result<Option<Vec<u8>>>;
     /// Object size, `None` = absent.
@@ -1081,7 +1178,21 @@ pub trait Catalog {
     /// backbones of those that had not ended when it was stored (`at` =
     /// its `created_at`), whenever its job runs.
     async fn verify_escalations(&self, at: UnixMs) -> Result<Vec<VerifyEscalation>>;
+    /// The last step of a release, by the job whose
+    /// [`Catalog::begin_release`] was applied, under the same lease:
+    /// `releasing` becomes `released` and the row is done.
     async fn finish_release(&self, l: &Lease, now: UnixMs) -> Result<bool>;
+    /// Withdraws a release decision that was not finished: a
+    /// `releasing` extent is `held` again and its evidence is dropped.
+    /// The lease is kept. `false`: the lease no longer holds the row,
+    /// or has run out.
+    ///
+    /// A job that finds an extent `releasing` did not take that
+    /// decision and cannot tell what it was taken on (a version from
+    /// before parity decides on the data articles alone). It withdraws
+    /// it and decides again: `releasing` on a row is never a reason to
+    /// release.
+    async fn reopen_release(&self, l: &Lease, now: UnixMs) -> Result<bool>;
     /// Up to `limit` rows in `post`, `verify` or `release` that are due
     /// and held by no job, oldest due time first. Each stage has a third
     /// of `limit` to itself, so these are not always the oldest `limit`
@@ -1119,6 +1230,40 @@ pub trait Catalog {
     async fn gc_begin(&self, row: &GcRow, now: UnixMs) -> Result<GcStep>;
     /// After the blob delete that `GcStep::DeleteBlob` asked for.
     async fn gc_done(&self, id: i64, now: UnixMs) -> Result<()>;
+
+    // orphaned upload parts (`GC_ORPHANS`)
+    /// False while the scan for orphaned parts rests after a full pass:
+    /// the dispatcher sends no job for it.
+    async fn gc_orphans_due(&self, now: UnixMs) -> Result<bool>;
+    /// Reads the next `scan` open `gc` rows due at or before `cutoff`
+    /// and moves the scan past them. Returns the `delete_safety` rows
+    /// among them whose extent is an orphaned upload part, at most
+    /// `limit` (the scan then stops at the last one returned).
+    async fn gc_orphans(
+        &self,
+        now: UnixMs,
+        cutoff: UnixMs,
+        scan: u32,
+        limit: u32,
+    ) -> Result<Vec<GcRow>>;
+    /// Records that the safety copies of the rows' extents are gone,
+    /// each in one batch with the proof that it may go: the row is open
+    /// and was due at or before `cutoff`, the extent is still an
+    /// orphaned upload part, no replay or rollback is being handled,
+    /// and none ended after `cutoff`. One answer per row, in order;
+    /// `false`: nothing was written for it and its blob must stay.
+    /// The second value is the first error that left rows undecided
+    /// (answered `false`): every answer stands all the same, and the
+    /// blobs they grant must go.
+    async fn gc_orphan_claim(
+        &self,
+        rows: &[GcRow],
+        now: UnixMs,
+        cutoff: UnixMs,
+    ) -> (Vec<bool>, Result<()>);
+    /// Closes the row after the blob delete that a claim allowed. A row
+    /// whose extent the catalogue does not say is deleted stays open.
+    async fn gc_orphan_done(&self, id: i64, now: UnixMs) -> Result<()>;
 
     // recovery replay (DESIGN §A.8); every call is idempotent
     /// Where a manifest's generation stands in this catalogue.
@@ -1174,6 +1319,8 @@ pub trait Catalog {
     /// has not ended, or a rollback of the catalogue was found and no
     /// replay has ended since.
     async fn restore_pending(&self) -> Result<bool>;
+    /// Whether an operator's batched catalogue import has not completed.
+    async fn restore_import_incomplete(&self) -> Result<bool>;
     /// The rollback stamp row ([`crate::stamp`]). `catalogue` is the id
     /// this Worker keys the stamp objects by; the row keeps the id it
     /// was created with. [`crate::stamp::ERR_CATALOGUE_ID`] = the two

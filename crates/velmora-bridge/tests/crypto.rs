@@ -10,8 +10,8 @@ use velmora::media::{self, FileKey, ReadAt, CIPHER_CHUNK_SIZE, HEADER_SIZE, PLAI
 use velmora::rng::{FillRandom, SystemRng};
 use velmora_bridge::crypto::{
     cipher_span, list_token_key, open_range, profile, seal_extent, unwrap_bdk, unwrap_file_key,
-    unwrap_secret, wrap_bdk, wrap_file_key, wrap_secret, DataKey, OffsetBuf, SealedExtent,
-    WrappedKey, MAX_SECRET_LEN, WRAPPED_KEY_LEN, WRAP_OVERHEAD,
+    unwrap_secret, wrap_bdk, wrap_file_key, wrap_secret, DataKey, ExtentSealer, OffsetBuf,
+    SealedExtent, WrappedKey, MAX_SECRET_LEN, WRAPPED_KEY_LEN, WRAP_OVERHEAD,
 };
 use velmora_bridge::testkit::TestKek;
 use velmora_bridge::{
@@ -522,6 +522,57 @@ fn secret_wrap_roundtrips_and_matches_the_documented_format() {
     assert_eq!(opened, secret.as_bytes());
     assert_eq!(
         &unwrap_secret(&kek, 1, "AKIDEXAMPLE", &wrapped).unwrap()[..],
+        secret.as_bytes()
+    );
+}
+
+/// An app password's secret is wrapped under its own domain. A Worker
+/// built before key kinds opens every secret with the `velmora/ak/v1`
+/// AAD; that AAD must not open an app password, so a rollback below the
+/// kinds leaves app passwords unusable (fail closed) rather than turning
+/// them into S3 keys on the public endpoint. S3 keys keep their AAD.
+#[test]
+fn app_password_secret_does_not_open_under_the_s3_key_aad() {
+    let kek = kek_v1();
+    let secret = hex(&derived("an app password"));
+    let id = "APVLEXAMPLE0000000001";
+    let (version, wrapped) =
+        wrap_secret(&kek, id, secret.as_bytes(), &mut TestRng::new("n")).unwrap();
+    assert_eq!(version, 1);
+
+    // What a Worker without key kinds would try: refused.
+    assert!(independent_open(
+        &derived("kek v1"),
+        &format!("velmora/ak/v1|{id}|1"),
+        &wrapped
+    )
+    .is_none());
+    // The documented app-password AAD opens it, and so does this build.
+    assert_eq!(
+        independent_open(
+            &derived("kek v1"),
+            &format!("velmora/app-password/v1|{id}|1"),
+            &wrapped
+        )
+        .unwrap(),
+        secret.as_bytes()
+    );
+    assert_eq!(
+        &unwrap_secret(&kek, 1, id, &wrapped).unwrap()[..],
+        secret.as_bytes()
+    );
+
+    // An S3 key minted by the admin API keeps the AAD every stored key
+    // was wrapped under.
+    let s3 = "AKVLEXAMPLE0000000001";
+    let (_, wrapped) = wrap_secret(&kek, s3, secret.as_bytes(), &mut TestRng::new("m")).unwrap();
+    assert_eq!(
+        independent_open(
+            &derived("kek v1"),
+            &format!("velmora/ak/v1|{s3}|1"),
+            &wrapped
+        )
+        .unwrap(),
         secret.as_bytes()
     );
 }
@@ -1135,6 +1186,213 @@ fn sealing_twice_never_reuses_a_key_or_nonce() {
     assert!(open_range(&k, &b, &r1, 0, &s1.ciphertext, 0, &mut dst).is_ok());
     assert_eq!(dst, plain);
     assert!(open_range(&k, &b, &r1, 0, &s2.ciphertext, 0, &mut dst).is_err());
+}
+
+// ---------------------------------------------------------------------------
+// ExtentSealer: the same stream, sealed piece by piece
+// ---------------------------------------------------------------------------
+
+/// Seals `plain` through an [`ExtentSealer`] in chunks, as a body that
+/// arrives would be.
+fn seal_in_pieces(
+    k: &DataKey,
+    b: &BucketId,
+    e: &ExtentId,
+    plain: &[u8],
+    rng: &mut TestRng,
+) -> (Vec<Vec<u8>>, velmora_bridge::crypto::SealedStream) {
+    let mut sealer = ExtentSealer::begin(k, b, e, plain.len() as u64, rng).unwrap();
+    assert_eq!(
+        sealer.cipher_size(),
+        media::ciphertext_size(plain.len() as u64).unwrap()
+    );
+    let mut pieces = Vec::new();
+    // New until the first piece is asked for, also for an empty extent,
+    // and never again afterwards.
+    assert!(sealer.is_new());
+    if plain.is_empty() {
+        pieces.push(sealer.seal_next(&[]).unwrap());
+    }
+    for chunk in plain.chunks(CHUNK) {
+        assert!(!sealer.is_complete());
+        pieces.push(sealer.seal_next(chunk).unwrap());
+        assert!(!sealer.is_new());
+    }
+    assert!(sealer.is_complete() && !sealer.is_new());
+    assert_eq!(sealer.remaining(), 0);
+    (pieces, sealer.finish().unwrap())
+}
+
+#[test]
+fn extent_sealer_gives_the_stream_seal_extent_gives() {
+    let k = bdk("bdk");
+    let b = bucket(1);
+    let e = extent(1);
+    for len in [
+        0,
+        1,
+        CHUNK - 1,
+        CHUNK,
+        CHUNK + 1,
+        2 * CHUNK,
+        3 * CHUNK + 17,
+        MIB,
+        MIB + 1,
+    ] {
+        let plain = pattern(len);
+        // The same draws for both: the two must agree byte for byte.
+        let whole = seal_extent(&k, &b, &e, &plain, &mut TestRng::new("stream")).unwrap();
+        let (pieces, sealed) = seal_in_pieces(&k, &b, &e, &plain, &mut TestRng::new("stream"));
+
+        assert_eq!(pieces.len(), len.div_ceil(CHUNK).max(1), "len {len}");
+        assert!(pieces.iter().skip(1).all(|p| p.len() <= SEALED_CHUNK));
+        assert!(pieces[0].len() <= HEADER + SEALED_CHUNK);
+        let stream = pieces.concat();
+        assert_eq!(stream, whole.ciphertext, "len {len}");
+        assert_eq!(sealed.media_header, whole.media_header);
+        assert_eq!(sealed.wrapped_file_key, whole.wrapped_file_key);
+        assert_eq!(sealed.cipher_size, stream.len() as u64);
+        assert_eq!(sealed.cipher_sha256, whole.cipher_sha256);
+        assert_eq!(sealed.cipher_md5, md5::compute(&stream).0);
+
+        // And it opens under the record a handler would write for it.
+        let r = row(&b, &e, len, &whole);
+        let mut dst = vec![0u8; len];
+        open_range(&k, &b, &r, 0, &stream, 0, &mut dst).unwrap();
+        assert_eq!(dst, plain);
+    }
+}
+
+#[test]
+fn extent_sealer_refuses_a_chunk_of_the_wrong_length_and_then_everything() {
+    let k = bdk("bdk");
+    let b = bucket(1);
+    let plain = pattern(2 * CHUNK + 100);
+    let begin = |len: usize| {
+        ExtentSealer::begin(&k, &b, &extent(1), len as u64, &mut TestRng::new("r")).unwrap()
+    };
+
+    // A short chunk that is not the final one. The sealer still lacks
+    // the whole extent afterwards, and it is not a new one any more:
+    // nothing may make a stream of it.
+    let mut s = begin(plain.len());
+    assert!(s.is_new());
+    assert!(is_crypto(&s.seal_next(&plain[..CHUNK - 1]).unwrap_err()));
+    assert_eq!(s.remaining(), plain.len() as u64);
+    assert!(!s.is_new() && !s.is_complete());
+    assert!(
+        s.seal_next(&plain[..CHUNK]).is_err(),
+        "nothing after a refusal"
+    );
+    assert!(s.finish().is_err());
+
+    // More than one chunk at once, even when it is exactly the rest.
+    let mut s = begin(plain.len());
+    assert!(s.seal_next(&plain).is_err());
+    let mut s = begin(CHUNK + 1);
+    assert!(s.seal_next(&plain[..CHUNK + 1]).is_err());
+
+    // More than the declared length.
+    let mut s = begin(CHUNK + 100);
+    s.seal_next(&plain[..CHUNK]).unwrap();
+    assert!(s.seal_next(&plain[..101]).is_err());
+    assert!(s.finish().is_err());
+
+    // An empty chunk where bytes are due.
+    let mut s = begin(100);
+    assert!(s.seal_next(&[]).is_err());
+    assert!(s.remaining() == 100 && !s.is_new());
+    assert!(
+        s.seal_next(&plain[..100]).is_err(),
+        "nothing after a refusal"
+    );
+
+    // Anything after the final chunk, and an empty extent sealed twice.
+    let mut s = begin(100);
+    s.seal_next(&plain[..100]).unwrap();
+    assert!(s.seal_next(&[]).is_err());
+    assert!(s.seal_next(&plain[..1]).is_err());
+    let mut s = begin(0);
+    s.seal_next(&[]).unwrap();
+    assert!(s.seal_next(&[]).is_err());
+}
+
+#[test]
+fn extent_sealer_does_not_finish_a_stream_that_lacks_its_final_chunk() {
+    let k = bdk("bdk");
+    let b = bucket(1);
+    let plain = pattern(2 * CHUNK + 100);
+    let mut rng = TestRng::new("r");
+
+    // Nothing sealed.
+    let s = ExtentSealer::begin(&k, &b, &extent(1), plain.len() as u64, &mut rng).unwrap();
+    assert!(!s.is_complete());
+    assert!(is_crypto(&s.finish().unwrap_err()));
+
+    // Every chunk but the final one. With the same draws, a stream of
+    // just those two chunks has the same key, header and first chunk;
+    // it opens, and the pieces given so far do not: their second chunk
+    // is not sealed as a final one. A cut stream is no shorter stream.
+    let mut s = ExtentSealer::begin(
+        &k,
+        &b,
+        &extent(1),
+        plain.len() as u64,
+        &mut TestRng::new("cut"),
+    )
+    .unwrap();
+    let mut given = s.seal_next(&plain[..CHUNK]).unwrap();
+    given.extend_from_slice(&s.seal_next(&plain[CHUNK..2 * CHUNK]).unwrap());
+    assert_eq!(s.remaining(), 100);
+    assert!(!s.is_complete());
+    assert!(s.finish().is_err());
+
+    let two = &plain[..2 * CHUNK];
+    let whole = seal_extent(&k, &b, &extent(1), two, &mut TestRng::new("cut")).unwrap();
+    let short = row(&b, &extent(1), two.len(), &whole);
+    assert_eq!(given.len(), whole.ciphertext.len());
+    assert_eq!(
+        given[..HEADER + SEALED_CHUNK],
+        whole.ciphertext[..HEADER + SEALED_CHUNK]
+    );
+    let mut dst = vec![0u8; two.len()];
+    open_range(&k, &b, &short, 0, &whole.ciphertext, 0, &mut dst).unwrap();
+    assert!(open_range(&k, &b, &short, 0, &given, 0, &mut dst).is_err());
+}
+
+#[test]
+fn extent_sealer_fails_closed_and_binds_like_seal_extent() {
+    let k = bdk("bdk");
+    let b = bucket(1);
+    assert!(ExtentSealer::begin(&k, &b, &extent(1), 10, &mut BrokenRng).is_err());
+    assert!(
+        ExtentSealer::begin(&k, &b, &extent(1), u64::MAX, &mut SystemRng).is_err(),
+        "a length whose stream length overflows"
+    );
+
+    // Two streams for the same plaintext share no key, nonce or chunk.
+    let plain = pattern(CHUNK + 5);
+    let mut rng = SystemRng;
+    let seal = |rng: &mut SystemRng| {
+        let mut s = ExtentSealer::begin(&k, &b, &extent(1), plain.len() as u64, rng).unwrap();
+        let mut ct = s.seal_next(&plain[..CHUNK]).unwrap();
+        ct.extend_from_slice(&s.seal_next(&plain[CHUNK..]).unwrap());
+        (ct, s.finish().unwrap())
+    };
+    let (c1, s1) = seal(&mut rng);
+    let (c2, s2) = seal(&mut rng);
+    assert_ne!(s1.media_header, s2.media_header);
+    assert_ne!(s1.wrapped_file_key, s2.wrapped_file_key);
+    assert_ne!(c1[HEADER..HEADER + 64], c2[HEADER..HEADER + 64]);
+
+    // The wrapped key opens for this bucket and extent only.
+    assert!(unwrap_file_key(&k, &b, &extent(1), s1.wrapped_file_key.as_bytes()).is_ok());
+    assert!(unwrap_file_key(&k, &b, &extent(2), s1.wrapped_file_key.as_bytes()).is_err());
+    assert!(unwrap_file_key(&k, &bucket(2), &extent(1), s1.wrapped_file_key.as_bytes()).is_err());
+
+    // Debug output names sizes only.
+    let text = format!("{s1:?}");
+    assert!(!leaks(&text, s1.wrapped_file_key.as_bytes()));
 }
 
 #[test]

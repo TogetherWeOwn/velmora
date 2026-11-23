@@ -56,6 +56,16 @@ LOG = "record layout in the generated config: "
 REFUSED_READ_BACK = "the generated config does not carry the record layout that was asked for"
 REFUSED_TOML = "the generated config is not valid TOML with a prod [vars] table"
 
+# The segment writer: on when MAX_OBJECT_EXTENTS is above what one
+# recovery record holds.
+WRITER = "MAX_OBJECT_EXTENTS"
+SINGLE_RECORD_EXTENTS = 10000
+REFUSED_WRITER = (
+    f"the generated config sets MAX_OBJECT_EXTENTS above {SINGLE_RECORD_EXTENTS} "
+    "(segmented records) while the record layout is flat"
+)
+BRIDGE_SRC = os.path.join(_ROOT, "crates", "velmora-bridge", "src")
+
 
 def read(path):
     with open(path, encoding="utf-8", newline="") as f:
@@ -275,6 +285,76 @@ OLDER = [
 ]
 
 
+class S3HostsTest(GeneratorCase):
+    switch = "VELMORA_S3_HOSTS"
+    log = "extra S3 hosts in the generated config: "
+    first = "s3.customer.example"
+    second = "s3.legacy.example"
+
+    def test_unset_or_empty_preserves_the_baseline(self):
+        _, baseline = self.ok({})
+        for value in (None, ""):
+            out, written = self.ok({self.switch: value})
+            self.assertEqual(written, baseline)
+            self.assertNotIn(b"\nS3_HOSTS", written)
+            self.assertNotIn("S3_HOSTS", tomllib.loads(written.decode("utf-8"))["vars"])
+            self.assertEqual(out.splitlines()[-1], self.log + "0")
+            self.assertNotIn(HOST, out)
+
+    def test_set_adds_one_line_after_the_primary_host_and_logs_only_classes(self):
+        shipped_host = 'S3_HOST = "velmora-s3.<account>.workers.dev"'
+        indented = self.shipped.replace(shipped_host, "  " + shipped_host, 1)
+        _, baseline = self.ok({}, indented)
+        for value, summary in (
+            (f"{self.first}=customer", "1 (customer)"),
+            (f"{self.first}=customer,{self.second}=legacy", "2 (customer,legacy)"),
+        ):
+            with self.subTest(value=value):
+                out, written = self.ok({self.switch: value}, indented)
+                line = f'  S3_HOSTS = "{value}"'
+                expected = add_after(baseline.decode("utf-8"), f'S3_HOST = "{HOST}"', line)
+                self.assertEqual(written, expected.encode("utf-8"))
+                self.assertEqual(written.count(b"S3_HOSTS ="), 1)
+                self.assertEqual(tomllib.loads(written.decode("utf-8"))["vars"]["S3_HOSTS"], value)
+                self.assertEqual(out.splitlines()[-1], self.log + summary)
+                for host in (HOST, self.first, self.second):
+                    self.assertNotIn(host, out)
+
+    def test_invalid_lists_are_refused_before_writing(self):
+        message = (
+            "VELMORA_S3_HOSTS must be a comma separated list of <lowercase host>=legacy|customer, "
+            "at most 8, without S3_HOST, a repeat or a subdomain of another host"
+        )
+        for value in (
+            "A.example=customer", "a.example:443=customer", " a.example=customer",
+            "a.example =customer", "a.example=customer\n", "a.example=Customer",
+            "a.example=public", "a.example", "a.example=", "=legacy",
+            ",a.example=customer", "a.example=customer,", "a.example=customer,,b.example=legacy",
+            "a.example=customer,a.example=legacy", f"{HOST}=customer",
+            f"eu.{HOST}=customer", f"{HOST.split('.', 1)[1]}=customer",
+            "a.example=legacy,x.a.example=customer",
+            "x.a.example=customer,a.example=legacy",
+            ",".join(f"s3-{i}.example=legacy" for i in range(9)),
+        ):
+            with self.subTest(value=value):
+                self.refused({self.switch: value}, message)
+
+    def test_a_shipped_prod_host_list_is_refused_whatever_is_asked(self):
+        for anchor, line in (
+            ('VERIFY_MODE = "body"', 'S3_HOSTS = ""'),
+            ('VERIFY_MODE = "body"', '  "S3_HOSTS" = "extra.example=legacy"'),
+            ("[build]", 'S3_HOSTS = "extra.example=legacy"'),
+            ("[vars]", 'nested = { S3_HOSTS = "extra.example=legacy" }'),
+        ):
+            doctored = add_after(self.shipped, anchor, line)
+            for value in (None, "", f"{self.first}=customer", "invalid"):
+                with self.subTest(line=line, value=value):
+                    self.refused(
+                        {self.switch: value}, "the prod section of the shipped file sets S3_HOSTS",
+                        doctored,
+                    )
+
+
 class RecordLayoutTest(GeneratorCase):
     def test_the_shipped_file_names_no_layout(self):
         doc = tomllib.loads(self.shipped)
@@ -287,7 +367,7 @@ class RecordLayoutTest(GeneratorCase):
         for value in NOT_ASKED:
             out, written = self.ok({SWITCH: value})
             self.assertEqual(written, before, repr(value))
-            self.assertEqual(out.splitlines()[-1], LOG + "flat", repr(value))
+            self.assertEqual(out.splitlines()[-2], LOG + "flat", repr(value))
             self.assertNotIn(b"\nRECORD_LAYOUT", written, repr(value))
             self.assertNotIn("RECORD_LAYOUT", tomllib.loads(written.decode("utf-8"))["vars"])
 
@@ -306,7 +386,7 @@ class RecordLayoutTest(GeneratorCase):
         for older in OLDER:
             _, flat = self.ok({**older, SWITCH: "flat"})
             out, tenant = self.ok({**older, SWITCH: "tenant"})
-            self.assertEqual(out.splitlines()[-1], LOG + "tenant", older)
+            self.assertEqual(out.splitlines()[-2], LOG + "tenant", older)
             lines = flat.decode("utf-8").split("\n")
             mode = older["VELMORA_VERIFY_MODE"] or "body"
             at = [i for i, line in enumerate(lines) if line == f'VERIFY_MODE = "{mode}"']
@@ -440,6 +520,128 @@ class RecordLayoutTest(GeneratorCase):
             self.assertNotEqual(text, self.ci, name)
             with self.assertRaises(AssertionError, msg=name):
                 Step(text)
+
+
+class SegmentWriterTest(GeneratorCase):
+    """The record layout against the segment writer: a config that lets
+    an object have more extents than one record holds is generated only
+    with the tenant layout."""
+
+    ANCHOR = 'VERIFY_MODE = "body"'
+
+    def with_extents(self, value_toml):
+        return add_after(self.shipped, self.ANCHOR, f"{WRITER} = {value_toml}")
+
+    def test_the_shipped_file_leaves_the_writer_off(self):
+        doc = tomllib.loads(self.shipped)
+        self.assertNotIn(WRITER, doc["vars"])
+
+    def bridge_const(self, name):
+        """The value of `pub const <name>: u32` in the bridge: a number,
+        or the value of the one other constant it is set to."""
+        found = []
+        for file in sorted(os.listdir(BRIDGE_SRC)):
+            if file.endswith(".rs"):
+                found += re.findall(
+                    rf"^pub const {name}: u32 = ([^;]+);$", read(os.path.join(BRIDGE_SRC, file)), re.M)
+        self.assertEqual(len(found), 1, name)
+        if re.fullmatch(r"[0-9_]+", found[0]):
+            return int(found[0].replace("_", ""))
+        other = re.fullmatch(r"(?:[a-z_]+::)*([A-Z_]+)", found[0])
+        self.assertIsNotNone(other, f"{name} = {found[0]}")
+        return self.bridge_const(other.group(1))
+
+    def test_the_number_is_the_one_of_the_bridge(self):
+        self.assertEqual(self.bridge_const("SINGLE_RECORD_EXTENTS"), SINGLE_RECORD_EXTENTS)
+        self.assertIn(f"single = {SINGLE_RECORD_EXTENTS}\n", self.step.script)
+
+    def test_absent_is_off_in_the_worker_too(self):
+        # The generator takes an absent or empty MAX_OBJECT_EXTENTS as
+        # the writer off. That is true only while the value the Worker
+        # takes then is no more than one record holds. A build that
+        # raises it must make the generator take absent as on.
+        config = read(os.path.join(BRIDGE_SRC, "config.rs"))
+        arm = re.findall(
+            r'match optional_u64\(&get, "MAX_OBJECT_EXTENTS"\)\? \{\n\s*None => ([A-Z_]+),\n', config)
+        self.assertEqual(len(arm), 1, "the Worker's read of MAX_OBJECT_EXTENTS has another shape")
+        self.assertLessEqual(self.bridge_const(arm[0]), SINGLE_RECORD_EXTENTS, arm[0])
+        # Unset and empty are one case there, as they are here: the
+        # function gives `None` for everything but a value that is not
+        # empty after a trim.
+        body = re.findall(r"\nfn optional_u64\([^{]*\{\n(.*?)\n\}\n", config, re.S)
+        self.assertEqual(len(body), 1)
+        arms = [line.strip() for line in body[0].split("\n")]
+        self.assertEqual(arms[0], "match get(name) {")
+        self.assertEqual(arms[1], "Some(v) if !v.trim().is_empty() => v")
+        self.assertEqual(arms[-2:], ["_ => Ok(None),", "}"])
+
+    def test_the_writer_on_is_refused_with_the_flat_layout(self):
+        for value in (
+            '"10001"', '"131072"', '" 10001 "', '"99999"', '"100000"', '"18446744073709551615"',
+            # Not a plain number: the Worker reads some of these as a
+            # number, the generator takes every one as on.
+            '"+10001"', '"+1"', '"10k"', '"0x2711"', '"1e5"', '"١٠٠٠١"', '"on"', '"-1"',
+            # Not a string at all.
+            "10001", "20000", "1", "true", '["10001"]',
+        ):
+            doctored = self.with_extents(value)
+            for older in (OLDER[0], OLDER[-1]):
+                for layout in NOT_ASKED:
+                    self.refused({**older, SWITCH: layout}, REFUSED_WRITER, doctored)
+
+    def one_line_more(self, flat, tenant, what):
+        """`tenant` is `flat` with the layout line after the VERIFY_MODE
+        line and no other byte changed."""
+        lines = flat.decode("utf-8").split("\n")
+        at = [i for i, line in enumerate(lines) if line == self.ANCHOR]
+        self.assertEqual(len(at), 1, what)
+        want = lines[: at[0] + 1] + [TENANT_LINE] + lines[at[0] + 1:]
+        self.assertEqual(tenant.decode("utf-8").split("\n"), want, what)
+
+    def test_the_writer_on_is_generated_with_the_tenant_layout(self):
+        for value in ('"10001"', '"131072"', '" 10001 "'):
+            doctored = self.with_extents(value)
+            out, written = self.ok({SWITCH: "tenant"}, doctored)
+            doc = tomllib.loads(written.decode("utf-8"))
+            self.assertEqual(doc["vars"]["RECORD_LAYOUT"], "tenant", value)
+            self.assertEqual(doc["vars"][WRITER], tomllib.loads(f"v = {value}")["v"], value)
+            self.assertEqual(out.splitlines()[-2], LOG + "tenant", value)
+            # The bytes: what the step wrote for this file before the
+            # rule, and the one line.
+            self.one_line_more(without_switches(doctored), written, value)
+
+    def test_the_writer_off_is_generated_with_either_layout(self):
+        for value in ('"10000"', '"1"', '"0"', '" 10000 "', '"09999"', '""', '"  "'):
+            doctored = self.with_extents(value)
+            for older in (OLDER[0], OLDER[-1]):
+                # The bytes the step wrote for this file before the
+                # rule, worked out here.
+                want = with_older(doctored, older)
+                self.assertIn(f"\n{WRITER} = {value}\n".encode("utf-8"), want, value)
+                for layout in NOT_ASKED:
+                    _, written = self.ok({**older, SWITCH: layout}, doctored)
+                    self.assertEqual(written, want, f"{value} {layout!r} {older!r}")
+            _, written = self.ok({SWITCH: "tenant"}, doctored)
+            self.one_line_more(without_switches(doctored), written, value)
+
+    def test_a_writer_line_the_eye_does_not_see_is_still_read(self):
+        # A quoted key, and a key set in a later line of the prod [vars]
+        # table: the check reads the document, not the lines.
+        for line in (f'"{WRITER}" = "10001"', f"'{WRITER}' = \"131072\""):
+            doctored = add_after(self.shipped, self.ANCHOR, line)
+            self.refused({SWITCH: "flat"}, REFUSED_WRITER, doctored)
+            self.ok({SWITCH: "tenant"}, doctored)
+
+    def test_another_environment_does_not_count(self):
+        # The writer on in [env.dev] only: the prod table decides.
+        lines = self.shipped.split("\n")
+        at = [i for i, line in enumerate(lines) if line.startswith("vars = {") and i > prod_end(lines) - 1]
+        self.assertEqual(len(at), 1)
+        lines[at[0]] = lines[at[0]].replace("vars = { ", f'vars = {{ {WRITER} = "131072", ', 1)
+        doctored = "\n".join(lines)
+        self.assertEqual(tomllib.loads(doctored)["env"]["dev"]["vars"][WRITER], "131072")
+        for layout in (*NOT_ASKED, "tenant"):
+            self.ok({SWITCH: layout}, doctored)
 
 
 class OlderSwitchesTest(GeneratorCase):

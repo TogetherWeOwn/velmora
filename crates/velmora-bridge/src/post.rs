@@ -601,20 +601,6 @@ where
             return self.to_verify(lease).await;
         }
         let holder = job_holder(lease);
-        let pool = Pool::load(&self.catalog, &self.cfg.providers, self.clock.now()).await?;
-        let posters: Vec<&ProviderConfig> = self.cfg.providers.iter().filter(|p| p.post).collect();
-        let cooling = pool.cooling_until(&posters);
-        let probing = pool.refusing(&posters);
-        let order = pool.order(posters, PermitClass::Background);
-        // The slots first. Loading and hashing the extent is the expensive
-        // part of the job: one that would only find every slot of its
-        // first tier taken gives its lease back before it, not after.
-        let Some(first_tier) = order.chunk_by(|a, b| a.priority == b.priority).next() else {
-            return Err(match cooling {
-                Some(until) => Stop::Cooling(until),
-                None => Stop::fail(FailClass::Internal),
-            });
-        };
         // The articles left to post are known before the extent is read:
         // every one of a new plan, the planned ones of a stored plan.
         // The parity articles of a plan are posted with it.
@@ -636,9 +622,45 @@ where
             }
         };
         let asked = self.clock.now();
-        let (mut held, _) = self
-            .open_sessions(first_tier, &holder, todo, &probing)
-            .await?;
+        let mut waited = false;
+        // The slots first. Loading and hashing the extent is the expensive
+        // part of the job: one that would only find every slot of its
+        // first tier taken gives its lease back before it, not after.
+        // Before that it waits for one under the claim for a bounded time
+        // ([`crate::jobs::SLOT_WAIT_MS`]). Each ask reads the pool again,
+        // so a cooldown or a login refusal that begins during the wait is
+        // met as a job claimed then meets it. A catalogue error of a
+        // later ask ends the wait as a put-off, not as a spent attempt.
+        let (cooling, probing, order, mut held) = loop {
+            let pool = match Pool::load(&self.catalog, &self.cfg.providers, self.clock.now()).await
+            {
+                Err(_) if waited => return Err(Stop::NoPermit),
+                pool => pool?,
+            };
+            let posters: Vec<&ProviderConfig> =
+                self.cfg.providers.iter().filter(|p| p.post).collect();
+            let cooling = pool.cooling_until(&posters);
+            let probing = pool.refusing(&posters);
+            let order = pool.order(posters, PermitClass::Background);
+            let Some(first_tier) = order.chunk_by(|a, b| a.priority == b.priority).next() else {
+                return Err(match cooling {
+                    Some(until) => Stop::Cooling(until),
+                    None => Stop::fail(FailClass::Internal),
+                });
+            };
+            let tier = first_tier.len();
+            let held = match self
+                .open_sessions(first_tier, &holder, todo, &probing)
+                .await
+            {
+                Err(_) if waited => return Err(Stop::NoPermit),
+                opened => opened?.0,
+            };
+            if !held.is_empty() || !self.slot_wait(lease, tier).await {
+                break (cooling, probing, order, held);
+            }
+            waited = true;
+        };
         let permits_ms = self.clock.now().0 - asked.0;
         crate::trace::note(&lease.extent, |t| {
             t.permits_ms = permits_ms;
@@ -1295,7 +1317,9 @@ where
     /// parity articles of it (their `idx` follows the data articles').
     /// A parity article is posted again from its shard, computed again
     /// from the safety copy; every shard must be the one the addendum
-    /// describes, or the job fails and nothing is sent.
+    /// describes. If one is not, no parity article is sent and the job
+    /// fails, after the data articles among `missing` were posted: they
+    /// do not depend on the addendum.
     ///
     /// `Ok(false)` = it cannot be done now (no provider that posts, no
     /// intact safety copy, or the providers refused): the caller carries
@@ -1309,9 +1333,44 @@ where
         providers: &[&ProviderConfig],
         parity: Option<&ParityPlan>,
     ) -> core::result::Result<bool, Stop> {
+        let mut other_shards = false;
+        let done = self
+            .repost_from_copy(
+                lease,
+                extent,
+                plan,
+                missing,
+                providers,
+                parity,
+                &mut other_shards,
+            )
+            .await;
+        match (other_shards, done) {
+            // The data articles are dealt with; the addendum is not
+            // one of this ciphertext.
+            (true, Ok(_)) => Err(Stop::fail(FailClass::Corrupt)),
+            (_, done) => done,
+        }
+    }
+
+    /// [`Self::repost`]. `other_shards` is set when the shards of the
+    /// safety copy are not the ones the addendum describes: then only
+    /// the data articles are posted.
+    #[allow(clippy::too_many_arguments)] // `repost` and its one flag
+    async fn repost_from_copy(
+        &self,
+        lease: &Lease,
+        extent: &ExtentRow,
+        plan: &[ArticleRow],
+        missing: &[u32],
+        providers: &[&ProviderConfig],
+        parity: Option<&ParityPlan>,
+        other_shards: &mut bool,
+    ) -> core::result::Result<bool, Stop> {
         if providers.is_empty() || extent.safety_state != SafetyState::Held {
             return Ok(false);
         }
+        let data = plan.len();
         // The parity plan counts only when one of its articles is asked
         // for: the shards are computed for nothing else.
         let parity = parity.filter(|p| p.articles.iter().any(|a| missing.contains(&a.idx)));
@@ -1348,8 +1407,12 @@ where
         if cipher.len() as u64 != extent.cipher_size || sha256(&cipher) != extent.cipher_sha256 {
             return Ok(false);
         }
-        let shards = match parity {
-            Some(parity) => stored_shards(&cipher, parity).ok_or(Stop::fail(FailClass::Corrupt))?,
+        let shards = match parity.map(|parity| stored_shards(&cipher, parity)) {
+            Some(Some(shards)) => shards,
+            Some(None) => {
+                *other_shards = true;
+                Vec::new()
+            }
             None => Vec::new(),
         };
         let pool = Pool::load(&self.catalog, &self.cfg.providers, self.clock.now()).await?;
@@ -1362,7 +1425,11 @@ where
         }
         let todo: Vec<usize> = (0..plan.len())
             .filter(|at| missing.contains(&plan[*at].idx))
+            .filter(|at| *at < data || !*other_shards)
             .collect();
+        if todo.is_empty() {
+            return Ok(false);
+        }
         let holder = job_holder(lease);
         let probing = pool.refusing(&order);
         let (sessions, _) = self
@@ -1438,8 +1505,12 @@ where
     }
 }
 
-/// A posting job holds one rendered article per socket.
-pub(crate) const POST_SOCKET_BYTES: u64 = 1024 * 1024;
+/// What a posting job holds per socket: the rendered article and, while
+/// it is written, its dot-stuffed copy (`write_dot_block`), each about
+/// 0.74 MiB for a full article. Measured on a deployed Worker, three post
+/// jobs at 6 sockets charged at 1 MiB a socket held 3.6 MiB a job more
+/// than they charged.
+pub(crate) const POST_SOCKET_BYTES: u64 = 3 * 512 * 1024;
 
 /// The sessions a job opened before it loaded its extent, the time of the
 /// renewal they were connected under (`None` = not connected yet), the

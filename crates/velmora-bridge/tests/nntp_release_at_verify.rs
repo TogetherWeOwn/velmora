@@ -588,6 +588,24 @@ async fn without_a_slot_for_its_last_question_the_release_stage_asks() {
     assert!(rig.released(&s));
 }
 
+#[tokio::test]
+async fn failed_extra_stat_hands_off_to_release_after_reconnects() {
+    let rig = rig_on().await;
+    let (s, _) = rig.on_two(8).await;
+    rig.first_backbone_verified(&s).await;
+    rig.servers[0].drop_next_stats(3).await;
+
+    assert_eq!(rig.run(&s, OutboxStage::Verify).await, JobOutcome::Ack);
+    assert_eq!(rig.rows(&s).len(), 2, "only the verify round was recorded");
+    assert!(rig.held(&s));
+    assert_eq!(rig.outbox(&s).stage, OutboxStage::Release);
+    assert_eq!(rig.sent(), [(OutboxStage::Release, 0)]);
+
+    rig.bridge.clock.advance_secs(1);
+    assert_eq!(rig.run(&s, OutboxStage::Release).await, JobOutcome::Ack);
+    assert!(rig.released(&s));
+}
+
 /// The catalogue has the last word: a row taken over between the last
 /// check and the release is not released by the job that lost it, and
 /// the copy stays held for the job that has it now.
@@ -815,8 +833,8 @@ async fn a_backbone_that_lacks_the_extent_is_no_part_of_the_release() {
 /// The release by a verify job is one write to the catalogue: the copy
 /// is never `releasing` under its row, so there is no step for another
 /// job to finish. A copy found `releasing` all the same is none of the
-/// verify job's: it reads as it always did and leaves the row to the
-/// release stage, which finishes it.
+/// verify job's: it leaves the row to the release stage, which reopens
+/// the interrupted decision and checks both backbones before releasing.
 #[tokio::test]
 async fn a_copy_found_releasing_is_left_to_the_release_stage() {
     let rig = rig_on().await;
@@ -835,11 +853,12 @@ async fn a_copy_found_releasing_is_left_to_the_release_stage() {
     assert_eq!(rig.outbox(&s).stage, OutboxStage::Release);
     assert_eq!(rig.sent(), [(OutboxStage::Release, 0)]);
 
+    rig.bridge.clock.advance_secs(1);
     assert_eq!(
         rig.logged(&s, OutboxStage::Release, 0).await,
         JobOutcome::Ack
     );
-    assert_eq!(rig.calls(), (0, 0, 0));
+    assert_eq!(rig.calls(), (0, 2 * n, 0));
     assert!(rig.released(&s));
 }
 

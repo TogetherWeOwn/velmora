@@ -362,7 +362,8 @@ async fn the_limit_of_a_part_is_that_of_a_put_and_one_extent_is_stored_as_before
     assert_eq!(staged(&rig).len(), 1);
     assert_eq!(rig.count("upload_part_extents"), 0);
     assert!(stamps(&rig).is_empty());
-    assert_eq!(rig.bridge.budget.peak(), 2 * 16 * MIB as u64);
+    // Sealed and stored while it arrives: charged for a window of it.
+    assert_eq!(rig.bridge.budget.peak(), ingress::STREAM_CHARGE_BYTES);
 
     // Where no body is sliced, a part stays at one extent.
     let mut cfg = config(Vec::new());

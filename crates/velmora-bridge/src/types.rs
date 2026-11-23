@@ -112,6 +112,20 @@ impl UnixMs {
     pub fn plus_ms(self, ms: i64) -> UnixMs {
         UnixMs(self.0.saturating_add(ms))
     }
+
+    /// Whether a time `at` stamped by another invocation of this isolate
+    /// (or by another isolate) is less than `window` ms from `self`, on
+    /// either side.
+    ///
+    /// The invocations of one isolate each read a clock of their own,
+    /// which stands still between that invocation's events, so `self`
+    /// can be a few milliseconds less than an `at` written a moment
+    /// before: a negative age is recent, not old. An `at` a whole
+    /// `window` or more ahead is no such reading order but a clock that
+    /// jumped, and counts as old, so it cannot be kept forever.
+    pub fn within(self, at: UnixMs, window: i64) -> bool {
+        self.0.saturating_sub(at.0).saturating_abs() < window
+    }
 }
 
 impl UnixSecs {
@@ -1024,8 +1038,9 @@ pub struct BackboneStatus {
     pub result: VerifyResult,
     /// How the articles were checked. Only a `Body` pass is a full check.
     pub kind: VerifyKind,
-    /// `result = ok` and `articles_ok = articles_total = article_count`:
-    /// a complete pass of its `kind`. Whether that is enough for a
+    /// `result = ok` and `articles_ok = articles_total` = every article
+    /// of the plan (`article_count`, and `parity_count` when the plan has
+    /// parity articles): a complete pass of its `kind`. Whether that is enough for a
     /// release is `verify::releasable`'s decision, never this flag's.
     pub counts: bool,
 }
@@ -1941,4 +1956,34 @@ pub struct BucketUsage {
     pub name: String,
     pub live_objects: i64,
     pub live_bytes: i64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::UnixMs;
+
+    /// Two invocations of one isolate read their clocks out of order by a
+    /// few milliseconds: a stamp a little ahead of `now` is recent.
+    #[test]
+    fn a_stamp_a_moment_ahead_is_within_the_window() {
+        let now = UnixMs(1_000_000);
+        for ahead in [1, 2, 24, 5_000] {
+            assert!(now.within(now.plus_ms(ahead), 10_000), "{ahead} ms ahead");
+        }
+        assert!(now.within(now, 10_000));
+        assert!(now.within(now.plus_ms(-9_999), 10_000));
+        assert!(!now.within(now.plus_ms(-10_000), 10_000), "old");
+    }
+
+    /// A stamp a whole window or more ahead is a clock that jumped, not a
+    /// reading order, and counts as old: it is bounded, never kept forever.
+    #[test]
+    fn a_stamp_far_ahead_is_bounded() {
+        let now = UnixMs(1_000_000);
+        assert!(now.within(now.plus_ms(9_999), 10_000));
+        assert!(!now.within(now.plus_ms(10_000), 10_000));
+        assert!(!now.within(UnixMs(i64::MAX), 10_000));
+        assert!(!UnixMs(i64::MIN).within(UnixMs(i64::MAX), 10_000));
+        assert!(!UnixMs(i64::MAX).within(UnixMs(i64::MIN), 10_000));
+    }
 }

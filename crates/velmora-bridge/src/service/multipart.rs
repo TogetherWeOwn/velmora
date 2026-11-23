@@ -10,8 +10,10 @@
 //! - **Create** stores the upload row (state `open`, revision 0) with the
 //!   object metadata of the request.
 //! - **UploadPart** seals the body like a single PUT into a fresh extent,
-//!   stores the ciphertext in the safety store and records it as a staged
-//!   part. A body above one extent is stored as slices, like a PutObject
+//!   stores the ciphertext in the safety store while the body arrives
+//!   and records it as a staged part once the store holds all of it. A
+//!   refused body leaves no blob and no part. A body above one extent is
+//!   stored as slices, like a PutObject
 //!   of that length, and the part is the list of their extents. Nothing
 //!   is posted before Complete.
 //! - **Complete** validates the listed parts against the upload as read at
@@ -49,21 +51,24 @@ use velmora_s3_proto::{
 use zeroize::Zeroizing;
 
 use crate::config::{BridgeConfig, Maintenance};
-use crate::crypto::{seal_extent, unwrap_bdk, unwrap_secret};
+use velmora::media::HEADER_SIZE;
+
+use crate::crypto::{seal_extent, unwrap_bdk, unwrap_secret, WrappedKey};
 use crate::ingress::{
     body_is_empty, declared_length, read_upload, upload_lengths, Charge, IngressError,
-    UploadLengths, UploadReadError,
+    SealedUpload, UploadLengths, UploadReadError,
 };
 use crate::intents::WRITER_MAX_AGE_MS;
+use crate::metrics::{FailureStage as Stage, RequestObservation};
 use crate::ports::{
     BlobMeta, BlobStore, Bridge, Catalog, Clock, Guard, JobSink, Kek, NntpConnector,
-    PublishOutcome, UploadTarget,
+    PublishOutcome, StreamMeta, UploadTarget,
 };
 use crate::recovery::{id_after, write_generation};
 use crate::service::common::{
-    auth_refused, check_precondition, discard_refused, discard_unless_present, header_refused,
-    hold_precondition, host_refused, precondition, restore_gate, send_post_jobs, writes_refused,
-    REGION_ALIASES,
+    auth_refused, check_precondition, discard_failure, discard_refused, discard_unless_present,
+    header_refused, hold_precondition, host_refused, precondition, restore_failure, restore_gate,
+    send_post_jobs, signed_host, store_streamed, writes_refused, REGION_ALIASES,
 };
 use crate::service::slices::{store_slices, SliceError, SliceSink};
 use crate::types::{
@@ -83,15 +88,6 @@ pub const MAX_COMPLETE_BODY_BYTES: u64 = 2 * 1024 * 1024;
 const COMPLETE_ATTEMPTS: u32 = 3;
 /// `KeyMode::Random`.
 const KEY_MODE_RANDOM: u8 = 1;
-
-/// Headers the edge adds. They are never signed and their values are not
-/// always printable ASCII, so they are dropped before header validation.
-/// Dropping a header can only fail a signature, never satisfy one.
-fn edge_header(name: &str) -> bool {
-    name.starts_with("cf-")
-        || name.starts_with("x-forwarded-")
-        || matches!(name, "cdn-loop" | "x-real-ip" | "true-client-ip")
-}
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -282,9 +278,10 @@ fn from_proto(resp: velmora_s3_proto::Response) -> S3Response {
     }
 }
 
-fn policy(cfg: &BridgeConfig) -> Outcome<Policy> {
+/// The policy for requests signed for `host` (see `common::signed_host`).
+fn policy(cfg: &BridgeConfig, host: &str) -> Outcome<Policy> {
     Policy::new(
-        cfg.s3_host.clone(),
+        host.to_owned(),
         cfg.region.clone(),
         Limits {
             target_bytes: 8 * 1024,
@@ -396,6 +393,7 @@ struct Authed {
 async fn authenticate<C, B, N, J, K, T>(
     bridge: &Bridge<C, B, N, J, K, T>,
     req: &S3Request,
+    observed: &mut RequestObservation,
 ) -> Outcome<Authed>
 where
     C: Catalog,
@@ -408,12 +406,13 @@ where
     if bridge.cfg.maintenance == Maintenance::Restore {
         return Err(ErrorCode::SlowDown.into());
     }
-    let policy = policy(&bridge.cfg)?;
+    observed.mark_stage(Stage::Auth);
+    let policy = policy(&bridge.cfg, signed_host(&bridge.cfg, req))?;
     let target = Target::parse(&req.raw_target, &policy);
     let fields: Vec<(&str, &str)> = req
         .headers
         .iter()
-        .filter(|(n, _)| !edge_header(n))
+        .filter(|(n, _)| !crate::entry::dropped_header(n))
         .map(|(n, v)| (n.as_str(), v.as_str()))
         .collect();
     let headers = Headers::new(&fields, &policy);
@@ -432,7 +431,10 @@ where
 
     let mut authority = OneKey::default();
     let mut bucket = None;
-    if let Some(akid) = presented_access_key(&target, &headers) {
+    // The entry point admits one kind of key (`crate::entry`): a key of
+    // the other kind is looked up as if it did not exist.
+    let entry = crate::entry::Entry::of(&req.headers);
+    if let Some(akid) = presented_access_key(&target, &headers).filter(|akid| entry.admits(akid)) {
         // Unknown and disabled keys look the same: no credential.
         let row = bridge.catalog.access_key(&akid).await?;
         if let Some(row) = row.filter(|r| r.status == KeyStatus::Active) {
@@ -478,7 +480,13 @@ where
     // `authorize` passed, so the bucket exists and the grant is `rw`.
     let bucket = bucket.ok_or(ErrorCode::NoSuchBucket)?;
     // A replay that was started and did not end: see `restore_gate`.
-    if bridge.catalog.restore_pending().await? {
+    observed.mark_stage(Stage::Other);
+    if bridge
+        .catalog
+        .restore_pending()
+        .await
+        .inspect_err(observed.on_error(Stage::Lookup))?
+    {
         return Err(ErrorCode::SlowDown.into());
     }
     let key = target
@@ -543,6 +551,7 @@ async fn read_verified_body<C, B, N, J, K, T>(
     a: &Authed,
     req: S3Request,
     max: u64,
+    observed: &mut RequestObservation,
 ) -> Outcome<Vec<u8>>
 where
     C: Catalog,
@@ -554,7 +563,11 @@ where
 {
     let lengths = upload_lengths(&req.headers, max)?;
     let mut validator = UploadValidator::new(&a.headers, &a.verified, &a.policy)?;
-    let charge = bridge.budget.charge_body(lengths.decoded).await?;
+    let charge = bridge
+        .budget
+        .charge_body(lengths.decoded)
+        .await
+        .inspect_err(observed.on_error(Stage::Budget))?;
     let body = read_upload(req.body, lengths, &charge, &mut validator).await?;
     validator.finish()?;
     // Only the small, validated control document outlives the charge.
@@ -594,7 +607,7 @@ where
     K: Kek,
     T: Clock,
 {
-    let a = authenticate(bridge, &req).await?;
+    let a = authenticate(bridge, &req, &mut RequestObservation::default()).await?;
     refuse_conditional(&a.headers)?;
     // Parts are verified against their own checksums; a whole-object
     // checksum is never computed, so only the FULL_OBJECT shape (whose
@@ -659,15 +672,27 @@ pub(super) async fn upload_part<
 >(
     bridge: &Rc<Bridge<C, B, N, J, K, T>>,
     req: S3Request,
-    _bucket: &str,
-    _key: &str,
+    observed: &mut RequestObservation,
 ) -> S3Response {
-    respond(upload_part_inner(bridge, req).await)
+    respond(upload_part_inner(bridge, req, observed).await)
+}
+
+/// One part body stored as one extent in the safety store: what its
+/// catalogue row records.
+struct StoredPart {
+    plain_size: u64,
+    cipher_size: u64,
+    media_header: [u8; HEADER_SIZE as usize],
+    wrapped_file_key: WrappedKey,
+    plain_md5: [u8; 16],
+    plain_sha256: [u8; 32],
+    cipher_sha256: [u8; 32],
 }
 
 async fn upload_part_inner<C, B, N, J, K, T>(
     bridge: &Bridge<C, B, N, J, K, T>,
     req: S3Request,
+    observed: &mut RequestObservation,
 ) -> Outcome<S3Response>
 where
     C: Catalog,
@@ -677,7 +702,7 @@ where
     K: Kek,
     T: Clock,
 {
-    let a = authenticate(bridge, &req).await?;
+    let a = authenticate(bridge, &req, observed).await?;
     refuse_conditional(&a.headers)?;
     // UploadPartCopy is this request with a source header and no body.
     let copy = a.headers.get("x-amz-copy-source").is_some();
@@ -695,42 +720,104 @@ where
     // anything is stored. The guarded batch below decides for real.
     // The state alone: reading the parts here would cost a row per part
     // already uploaded, on every part.
-    if bridge.catalog.upload_state(&target).await? != Some(UploadState::Open) {
+    if bridge
+        .catalog
+        .upload_state(&target)
+        .await
+        .inspect_err(observed.on_error(Stage::Lookup))?
+        != Some(UploadState::Open)
+    {
         return Err(ErrorCode::NoSuchUpload.into());
     }
 
-    // Plaintext and ciphertext live together while sealing: the charge
-    // covers both and is held until the ciphertext has been handed over.
+    // A fresh id per seal: the key wrap binds the id, never a version.
+    let extent_id = ExtentId::mint(random()?);
+    let bdk = || {
+        unwrap_bdk(
+            &bridge.kek,
+            a.bucket.kek_version,
+            &a.bucket.id,
+            &a.bucket.bdk_wrapped,
+        )
+    };
     // For aws-chunked bodies every length below is the decoded one.
-    let (body, charge) = if copy {
-        copied_part(bridge, &a, &req.headers, req.body).await?
+    let stored = if copy {
+        // Plaintext and ciphertext live together while sealing: the
+        // charge covers both and is held until the ciphertext has been
+        // handed over.
+        let (body, charge) = copied_part(bridge, &a, &req.headers, req.body, observed).await?;
+        let sealed = seal_extent(&bdk()?, &a.bucket.id, &extent_id, &body, &mut SystemRng)?;
+        let plain_size = body.len() as u64;
+        drop(body);
+        let cipher_size = sealed.ciphertext.len() as u64;
+        bridge
+            .safety
+            .put(
+                &extent_id.safety_key(),
+                sealed.ciphertext,
+                &BlobMeta {
+                    bucket: &a.bucket.id,
+                    extent: &extent_id,
+                    cipher_sha256: &sealed.cipher_sha256,
+                },
+            )
+            .await
+            .inspect_err(observed.on_error(Stage::R2))?;
+        drop(charge);
+        StoredPart {
+            plain_size,
+            cipher_size,
+            media_header: sealed.media_header,
+            wrapped_file_key: sealed.wrapped_file_key,
+            plain_md5: sealed.plain_md5,
+            plain_sha256: sealed.plain_sha256,
+            cipher_sha256: sealed.cipher_sha256,
+        }
     } else {
         // A part may be as long as a PutObject. Above one extent it is
         // stored as slices, never read whole.
         let lengths = upload_lengths(&req.headers, bridge.cfg.max_put_bytes)?;
         if lengths.decoded > bridge.cfg.max_extent_bytes {
-            return sliced_part(bridge, &a, &target, number, req.body, lengths).await;
+            return sliced_part(bridge, &a, &target, number, req.body, lengths, observed).await;
         }
-        let mut validator = UploadValidator::new(&a.headers, &a.verified, &a.policy)?;
-        let charge = bridge.budget.charge_body(lengths.decoded).await?;
-        let body = read_upload(req.body, lengths, &charge, &mut validator).await?;
-        validator.finish()?;
-        (body, charge)
+        let validator = UploadValidator::new(&a.headers, &a.verified, &a.policy)?;
+        let bdk = bdk()?;
+        // Nothing of the body is read before this charge is held. The
+        // body is sealed and stored while it arrives, and the stored
+        // copy is whole only if the validator accepted the body.
+        let charge = bridge
+            .budget
+            .charge_stream(lengths.decoded)
+            .await
+            .inspect_err(observed.on_error(Stage::Budget))?;
+        let SealedUpload { decoded, sealed } = store_streamed(
+            &bridge.safety,
+            req.body,
+            lengths,
+            validator,
+            &bdk,
+            StreamMeta {
+                bucket: &a.bucket.id,
+                extent: &extent_id,
+            },
+            &charge,
+            observed,
+        )
+        .await?;
+        drop(charge);
+        StoredPart {
+            plain_size: decoded.length(),
+            cipher_size: sealed.cipher_size,
+            media_header: sealed.media_header,
+            wrapped_file_key: sealed.wrapped_file_key,
+            plain_md5: *decoded.md5(),
+            plain_sha256: *decoded.sha256(),
+            cipher_sha256: sealed.cipher_sha256,
+        }
     };
-    let declared = body.len() as u64;
-
-    let bdk = unwrap_bdk(
-        &bridge.kek,
-        a.bucket.kek_version,
-        &a.bucket.id,
-        &a.bucket.bdk_wrapped,
-    )?;
-    // A fresh id per seal: the key wrap binds the id, never a version.
-    let extent_id = ExtentId::mint(random()?);
-    let sealed = seal_extent(&bdk, &a.bucket.id, &extent_id, &body, &mut SystemRng)?;
-    drop(body);
+    let declared = stored.plain_size;
     let now = bridge.clock.now();
-    let etag = format!("\"{}\"", hex(&sealed.plain_md5));
+    let etag = format!("\"{}\"", hex(&stored.plain_md5));
     let extent = ExtentRow {
         id: extent_id.clone(),
         bucket_id: a.bucket.id.clone(),
@@ -739,13 +826,13 @@ where
         seq: None,
         plain_offset: None,
         plain_size: declared,
-        cipher_size: sealed.ciphertext.len() as u64,
-        media_header: sealed.media_header.to_vec(),
+        cipher_size: stored.cipher_size,
+        media_header: stored.media_header.to_vec(),
         key_mode: KEY_MODE_RANDOM,
-        wrapped_file_key: Some(sealed.wrapped_file_key.to_vec()),
-        plain_md5: sealed.plain_md5,
-        plain_sha256: sealed.plain_sha256,
-        cipher_sha256: sealed.cipher_sha256,
+        wrapped_file_key: Some(stored.wrapped_file_key.to_vec()),
+        plain_md5: stored.plain_md5,
+        plain_sha256: stored.plain_sha256,
+        cipher_sha256: stored.cipher_sha256,
         safety_state: SafetyState::Held,
         article_count: None,
         plan_rev: 0,
@@ -754,20 +841,6 @@ where
         released_at: None,
         created_at: now,
     };
-    let safety_key = extent_id.safety_key();
-    bridge
-        .safety
-        .put(
-            &safety_key,
-            sealed.ciphertext,
-            &BlobMeta {
-                bucket: &a.bucket.id,
-                extent: &extent_id,
-                cipher_sha256: &extent.cipher_sha256,
-            },
-        )
-        .await?;
-    drop(charge);
 
     let part = UploadPartRow {
         upload_id: id.clone(),
@@ -780,7 +853,8 @@ where
     match bridge
         .catalog
         .put_upload_part(&target, &part, &extent, now)
-        .await?
+        .await
+        .inspect_err(observed.on_error(Stage::Commit))?
     {
         Guard::Applied(()) if copy => Ok(from_proto(copy_part_response(&etag, now.0)?)),
         Guard::Applied(()) => Ok(S3Response {
@@ -815,6 +889,7 @@ async fn sliced_part<C, B, N, J, K, T>(
     number: u16,
     body: Body,
     lengths: UploadLengths,
+    observed: &mut RequestObservation,
 ) -> Outcome<S3Response>
 where
     C: Catalog,
@@ -835,14 +910,19 @@ where
     let held = bridge
         .catalog
         .upload_extents_held(target.id, number)
-        .await?;
+        .await
+        .inspect_err(observed.on_error(Stage::Lookup))?;
     if held.saturating_add(count as u64) > u64::from(limit) {
         return Err(too_many_extents(limit).into());
     }
     let mut validator = UploadValidator::new(&a.headers, &a.verified, &a.policy)?;
     // One slice of plaintext and one of ciphertext are held at a time,
     // whatever the length of the part. Nothing is read before this.
-    let charge = bridge.budget.charge_body(slice_bytes).await?;
+    let charge = bridge
+        .budget
+        .charge_body(slice_bytes)
+        .await
+        .inspect_err(observed.on_error(Stage::Budget))?;
 
     let started = bridge.clock.now();
     let write = WriteId::mint(random()?);
@@ -858,11 +938,18 @@ where
     )?;
     // Every slice has its row before its blob exists: whatever happens
     // to this request from here on, the catalogue names what it stored.
-    match bridge.catalog.open_intents(&write, &ids, started).await? {
+    match bridge
+        .catalog
+        .open_intents(&write, &ids, started)
+        .await
+        .inspect_err(observed.on_error(Stage::Commit))?
+    {
         Guard::Applied(()) => {}
         // A replay started after this request passed the gate.
         Guard::Lost => {
-            restore_gate(bridge).await?;
+            restore_gate(bridge)
+                .await
+                .map_err(|resp| restore_failure(observed, resp))?;
             return Err(writes_refused().into());
         }
     }
@@ -890,7 +977,11 @@ where
             return Err(match e {
                 SliceError::Ingress(e) => Fail::Ingress(e),
                 SliceError::Proto(e) => Fail::S3(e),
-                SliceError::Store => Fail::Internal,
+                SliceError::Internal => Fail::Internal,
+                SliceError::Store => {
+                    observed.mark_stage(Stage::R2);
+                    Fail::Internal
+                }
             });
         }
     };
@@ -970,9 +1061,19 @@ where
             // aborted meanwhile, a replay began, or the rows are no
             // longer this request's. The slices are left to the sweep.
             give_up().await;
-            restore_gate(bridge).await?;
-            return Err(match bridge.catalog.upload_state(target).await? {
-                Some(UploadState::Open) => ErrorCode::SlowDown,
+            restore_gate(bridge)
+                .await
+                .map_err(|resp| restore_failure(observed, resp))?;
+            let state = bridge
+                .catalog
+                .upload_state(target)
+                .await
+                .inspect_err(observed.on_error(Stage::Lookup))?;
+            return Err(match state {
+                Some(UploadState::Open) => {
+                    observed.mark_stage(Stage::Commit);
+                    ErrorCode::SlowDown
+                }
                 _ => ErrorCode::NoSuchUpload,
             }
             .into());
@@ -982,14 +1083,18 @@ where
             // are gone and this changes nothing; if not, it cannot
             // apply any more.
             give_up().await;
+            observed.mark_stage(Stage::Commit);
             return Err(Fail::Internal);
         }
     }
     // Before the answer: a catalogue restored to a point before this
     // commit is then behind its stamp, the sweep refuses there, and the
     // slices stay. Without the raise the part is not acknowledged.
-    if bridge.raise_stamp().await.is_err() {
-        restore_gate(bridge).await?;
+    if let Err(error) = bridge.raise_stamp().await {
+        restore_gate(bridge)
+            .await
+            .map_err(|resp| restore_failure(observed, resp))?;
+        observed.mark_stage(Stage::stamp(&error));
         return Err(ErrorCode::SlowDown.into());
     }
     Ok(S3Response {
@@ -1030,6 +1135,7 @@ async fn copied_part<C, B, N, J, K, T>(
     a: &Authed,
     raw: &[(String, String)],
     sent: crate::types::Body,
+    observed: &mut RequestObservation,
 ) -> Outcome<(Vec<u8>, Charge)>
 where
     C: Catalog,
@@ -1052,7 +1158,9 @@ where
         return Err(ErrorCode::InvalidRequest.into());
     }
     let key = super::copy::source_key(&a.headers, &a.policy, &a.bucket)?;
-    let source = super::copy::source_generation(bridge, &a.headers, &a.bucket, &key).await?;
+    let source = super::copy::source_generation(bridge, &a.headers, &a.bucket, &key)
+        .await
+        .inspect_err(observed.on_error(Stage::Lookup))?;
     let (start, len) = match a.headers.get("x-amz-copy-source-range") {
         Some(range) => copy_range(range, source.size)?,
         None => (0, source.size),
@@ -1065,13 +1173,24 @@ where
     // An empty source has no byte to ask for; its one empty extent
     // begins at 0, where a range of one byte looks.
     let end = start.checked_add(len.max(1)).ok_or(Fail::Internal)?;
-    let extents = bridge.catalog.extents_in(&source.id, start, end).await?;
+    let extents = bridge
+        .catalog
+        .extents_in(&source.id, start, end)
+        .await
+        .inspect_err(observed.on_error(Stage::Lookup))?;
     // The read holds what it needs piece by piece and hands back the
     // charge for the plaintext. Charging for the seal before the read
     // would leave a full-size extent no room to be read in.
-    let (body, mut charge) = super::get::read_range(bridge, &a.bucket, extents, start, len).await?;
+    let (body, mut charge) =
+        super::get::read_range(bridge, &a.bucket, extents, start, len, observed).await?;
     // Plaintext and ciphertext live together while sealing.
-    charge.absorb(bridge.budget.charge(len).await?);
+    charge.absorb(
+        bridge
+            .budget
+            .charge(len)
+            .await
+            .inspect_err(observed.on_error(Stage::Budget))?,
+    );
     Ok((body, charge))
 }
 
@@ -1191,10 +1310,9 @@ pub(super) async fn complete<
 >(
     bridge: &Rc<Bridge<C, B, N, J, K, T>>,
     req: S3Request,
-    _bucket: &str,
-    _key: &str,
+    observed: &mut RequestObservation,
 ) -> S3Response {
-    respond(complete_inner(bridge, req).await)
+    respond(complete_inner(bridge, req, observed).await)
 }
 
 /// The answer to a Complete of an upload that holds more than `limit`
@@ -1221,6 +1339,7 @@ async fn refused_unless_completed<C, B, N, J, K, T>(
     digest: &[u8; 32],
     a: &Authed,
     refusal: S3Response,
+    observed: &mut RequestObservation,
 ) -> Outcome<S3Response>
 where
     C: Catalog,
@@ -1230,8 +1349,14 @@ where
     K: Kek,
     T: Clock,
 {
-    if let Some((upload, _)) = bridge.catalog.upload(target).await? {
+    if let Some((upload, _)) = bridge
+        .catalog
+        .upload(target)
+        .await
+        .inspect_err(observed.on_error(Stage::Lookup))?
+    {
         if upload.state == UploadState::Completed && upload.complete_digest == Some(*digest) {
+            observed.mark_stage(Stage::Other);
             let etag = upload.result_etag.ok_or(Fail::Internal)?;
             return complete_response(a, etag, bridge.clock.now().0);
         }
@@ -1253,6 +1378,7 @@ fn complete_response(a: &Authed, etag: String, modified_ms: i64) -> Outcome<S3Re
 async fn complete_inner<C, B, N, J, K, T>(
     bridge: &Bridge<C, B, N, J, K, T>,
     req: S3Request,
+    observed: &mut RequestObservation,
 ) -> Outcome<S3Response>
 where
     C: Catalog,
@@ -1262,7 +1388,7 @@ where
     K: Kek,
     T: Clock,
 {
-    let a = authenticate(bridge, &req).await?;
+    let a = authenticate(bridge, &req, observed).await?;
     // Before the body is read or anything is published: `If-None-Match:
     // *` or `If-Match` is a condition on the key, held to by the batch
     // that publishes. Any other conditional header is refused.
@@ -1282,7 +1408,7 @@ where
         id: &id,
     };
     let max = MAX_COMPLETE_BODY_BYTES.min(bridge.cfg.max_extent_bytes);
-    let body = read_verified_body(bridge, &a, req, max).await?;
+    let body = read_verified_body(bridge, &a, req, max, observed).await?;
     let listed = parse_complete(&body, &a.policy, MAX_PARTS, MultipartChecksum::None).map_err(
         |e| match e {
             // A document that lists no part at all is not a part list,
@@ -1301,7 +1427,12 @@ where
     // Revision of the previous attempt, if its batch lost the guard.
     let mut lost_at: Option<u64> = None;
     for _ in 0..COMPLETE_ATTEMPTS {
-        let Some((upload, parts)) = bridge.catalog.upload(&target).await? else {
+        let Some((upload, parts)) = bridge
+            .catalog
+            .upload(&target)
+            .await
+            .inspect_err(observed.on_error(Stage::Lookup))?
+        else {
             return Err(ErrorCode::NoSuchUpload.into());
         };
         match upload.state {
@@ -1328,12 +1459,16 @@ where
         // A condition that does not hold now is answered before anything
         // is written for this attempt, the floor of the key included.
         if let Some(condition) = &condition {
-            if let Err(refusal) = check_precondition(bridge, &a.bucket.id, &a.key, condition).await
+            if let Err(refusal) = check_precondition(bridge, &a.bucket.id, &a.key, condition)
+                .await
+                .inspect_err(observed.on_error(Stage::Lookup))
             {
-                return refused_unless_completed(bridge, &target, &digest, &a, refusal).await;
+                return refused_unless_completed(bridge, &target, &digest, &a, refusal, observed)
+                    .await;
             }
         }
         let publication = plan(&listed, &parts)?;
+        observed.record_size(publication.size);
         drop(parts);
         // The size the client says the object has is its guard against a
         // part that went missing: an object of another size is not
@@ -1363,7 +1498,8 @@ where
         let staged = bridge
             .catalog
             .upload_extents(&target, limit.saturating_add(1))
-            .await?;
+            .await
+            .inspect_err(observed.on_error(Stage::Lookup))?;
         if u32::try_from(staged.len()).map_or(true, |n| n > limit) {
             return Err(too_many_extents(limit).into());
         }
@@ -1380,9 +1516,14 @@ where
         // it was stored, and in one restored from there the sweep would
         // take the slices of this object. So the stamp is raised before
         // the record exists, and without it nothing is published.
-        if sliced && bridge.raise_stamp().await.is_err() {
-            restore_gate(bridge).await?;
-            return Err(ErrorCode::SlowDown.into());
+        if sliced {
+            if let Err(error) = bridge.raise_stamp().await {
+                restore_gate(bridge)
+                    .await
+                    .map_err(|resp| restore_failure(observed, resp))?;
+                observed.mark_stage(Stage::stamp(&error));
+                return Err(ErrorCode::SlowDown.into());
+            }
         }
         let mut placements = Vec::with_capacity(extents.len());
         for e in &extents {
@@ -1396,7 +1537,11 @@ where
         // The id sorts after everything already on the key, so the order
         // of ids on a key is the order of its commits; the batch checks
         // it again, against whatever commits in between.
-        let newest = bridge.catalog.newest_id(&a.bucket.id, &a.key).await?;
+        let newest = bridge
+            .catalog
+            .newest_id(&a.bucket.id, &a.key)
+            .await
+            .inspect_err(observed.on_error(Stage::Lookup))?;
         let generation = GenerationRow {
             id: id_after(now, newest.as_ref(), random()?),
             bucket_id: a.bucket.id.clone(),
@@ -1429,10 +1574,11 @@ where
             &a.key,
             &commit.generation.id,
             condition.as_ref(),
+            observed,
         )
         .await
         {
-            return refused_unless_completed(bridge, &target, &digest, &a, refusal).await;
+            return refused_unless_completed(bridge, &target, &digest, &a, refusal, observed).await;
         }
         let record = write_generation(
             &bridge.catalog,
@@ -1443,7 +1589,8 @@ where
             &commit.generation,
             &extents,
         )
-        .await?;
+        .await
+        .inspect_err(|error| observed.mark_stage(Stage::storage(error)))?;
         drop(extents);
         match bridge
             .catalog
@@ -1455,7 +1602,8 @@ where
                 condition.as_ref(),
                 record,
             )
-            .await?
+            .await
+            .inspect_err(observed.on_error(Stage::Commit))?
         {
             PublishOutcome::Applied => {
                 let rows = commit
@@ -1475,7 +1623,12 @@ where
                 let discarded = discard_unless_present(bridge, &commit.generation, record).await;
                 // Refused as well when a replay started after this
                 // request passed the gate.
-                if bridge.catalog.restore_pending().await? {
+                if bridge
+                    .catalog
+                    .restore_pending()
+                    .await
+                    .inspect_err(observed.on_error(Stage::Lookup))?
+                {
                     return Err(ErrorCode::SlowDown.into());
                 }
                 if let Some(condition) = &condition {
@@ -1484,7 +1637,10 @@ where
                     // could publish what the answer says was refused.
                     // The same for a record that was kept because a row
                     // exists under its id: a replay may have published it.
-                    if !discarded? {
+                    if !discarded
+                        .inspect_err(|error| observed.mark_stage(discard_failure(error)))?
+                    {
+                        observed.mark_stage(Stage::Commit);
                         return Err(Fail::Internal);
                     }
                     // The batch does not say which guard refused it. If
@@ -1492,16 +1648,24 @@ where
                     // the upload is not blamed below for what the key
                     // did.
                     if let Err(refusal) =
-                        check_precondition(bridge, &a.bucket.id, &a.key, condition).await
+                        check_precondition(bridge, &a.bucket.id, &a.key, condition)
+                            .await
+                            .inspect_err(observed.on_error(Stage::Lookup))
                     {
-                        return refused_unless_completed(bridge, &target, &digest, &a, refusal)
-                            .await;
+                        return refused_unless_completed(
+                            bridge, &target, &digest, &a, refusal, observed,
+                        )
+                        .await;
                     }
                 }
                 // Otherwise refused for the id (the key took a newer one
                 // since it was read) or for the upload. Only the second
                 // is judged by the revision on the next turn.
-                let newest = bridge.catalog.newest_id(&a.bucket.id, &a.key).await?;
+                let newest = bridge
+                    .catalog
+                    .newest_id(&a.bucket.id, &a.key)
+                    .await
+                    .inspect_err(observed.on_error(Stage::Lookup))?;
                 // The floor is this id itself unless something newer
                 // came: only a higher one outran it.
                 let outrun = newest.is_some_and(|n| n > commit.generation.id);
@@ -1512,10 +1676,12 @@ where
                 // published. Without its record this attempt cannot come
                 // back in a replay, also after the client aborts.
                 let _ = discard_refused(bridge, &commit.generation, record).await;
+                observed.mark_stage(Stage::Commit);
                 return Err(Fail::Internal);
             }
         }
     }
+    observed.mark_stage(Stage::Commit);
     Err(ErrorCode::SlowDown.into())
 }
 
@@ -1551,7 +1717,7 @@ where
     K: Kek,
     T: Clock,
 {
-    let a = authenticate(bridge, &req).await?;
+    let a = authenticate(bridge, &req, &mut RequestObservation::default()).await?;
     refuse_conditional(&a.headers)?;
     let id = upload_id(&a.target)?;
     let target = UploadTarget {

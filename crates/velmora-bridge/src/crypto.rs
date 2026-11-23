@@ -7,6 +7,7 @@
 //!   ├─ wraps BDK (per bucket, 32 random bytes)   AAD "velmora/bdk/v1|<bucket_id>|<v>"
 //!   │    └─ wraps FileKey (per extent, random)   AAD "velmora/fk/v1|<bucket_id>|<extent_id>"
 //!   ├─ wraps S3 secret access keys               AAD "velmora/ak/v1|<access_key_id>|<v>"
+//!   ├─ wraps app password secrets (APVL… ids)    AAD "velmora/app-password/v1|<access_key_id>|<v>"
 //!   └─ HKDF-SHA256(info "velmora/list-token/v1") → HMAC key for list tokens
 //! ```
 //!
@@ -30,9 +31,12 @@
 //!    and a fresh 16-byte stream nonce; the payload key is
 //!    `HKDF(file key, nonce)`. Chunk nonces are a counter plus a final-chunk
 //!    flag under that one-use payload key. [`seal_extent`] builds the
-//!    sealer, consumes it and drops it in one call, so a sealer is never
-//!    resumed, shared or rewound, and re-sealing the same plaintext (a
-//!    client retry) yields an unrelated key and ciphertext. Wraps use
+//!    sealer, consumes it and drops it in one call. [`ExtentSealer`]
+//!    seals the same stream chunk by chunk while a body arrives: it
+//!    draws its key and nonce once, only moves forward, and is consumed
+//!    when the stream ends. So a sealer is never resumed, shared or
+//!    rewound, and re-sealing the same plaintext (a client retry) yields
+//!    an unrelated key and ciphertext. Wraps use
 //!    random 192-bit nonces, far below any collision bound for the number
 //!    of keys a deployment can hold.
 //! 2. **Truncation and reordering inside an extent** are caught by the
@@ -126,6 +130,13 @@ pub const MAX_SECRET_LEN: usize = 1024;
 const BDK_DOMAIN: &str = "velmora/bdk/v1";
 const FILE_KEY_DOMAIN: &str = "velmora/fk/v1";
 const ACCESS_KEY_DOMAIN: &str = "velmora/ak/v1";
+/// The domain of an app password's secret ([`crate::entry::KeyKind`]).
+/// It differs from [`ACCESS_KEY_DOMAIN`] so that a Worker built before
+/// key kinds existed, which wraps and opens every secret under
+/// `velmora/ak/v1`, cannot open an app password's secret: after a
+/// rollback below the kinds, an app password fails closed instead of
+/// becoming an S3 key on the public endpoint.
+const APP_PASSWORD_DOMAIN: &str = "velmora/app-password/v1";
 const LIST_TOKEN_INFO: &[u8] = b"velmora/list-token/v1";
 const MANIFEST_DOMAIN: &str = "velmora/manifest/v1";
 /// A sealed recovery record starts with the KEK version, big-endian.
@@ -243,9 +254,17 @@ fn file_key_aad(bucket: &BucketId, extent: &ExtentId) -> Result<String> {
     ))
 }
 
+/// The secret's AAD. The domain follows the kind the id names
+/// ([`crate::entry::KeyKind::of`]), so a secret can only be opened as the
+/// kind it was minted as, and every S3 key keeps the AAD it was wrapped
+/// under.
 fn access_key_aad(access_key_id: &str, kek_version: u32) -> Result<String> {
+    let domain = match crate::entry::KeyKind::of(access_key_id) {
+        crate::entry::KeyKind::S3 => ACCESS_KEY_DOMAIN,
+        crate::entry::KeyKind::AppPassword => APP_PASSWORD_DOMAIN,
+    };
     Ok(format!(
-        "{ACCESS_KEY_DOMAIN}|{}|{kek_version}",
+        "{domain}|{}|{kek_version}",
         binding_id(access_key_id)?
     ))
 }
@@ -589,6 +608,178 @@ pub fn seal_extent<R: FillRandom>(
         ciphertext,
         wrapped_file_key,
     })
+}
+
+/// What [`ExtentSealer::finish`] returns: everything about the sealed
+/// stream the catalogue records, except the plaintext digests (those are
+/// the caller's, taken where it read the plaintext).
+pub struct SealedStream {
+    /// The 48-byte stream header (also the first 48 bytes of the stream).
+    pub media_header: [u8; HEADER_SIZE as usize],
+    /// Length of the whole stream: header and every sealed chunk.
+    pub cipher_size: u64,
+    /// SHA-256 of the whole stream.
+    pub cipher_sha256: [u8; 32],
+    /// MD5 of the whole stream: what a blob store reports for an object
+    /// written by one put, so the stored copy can be checked against it.
+    pub cipher_md5: [u8; 16],
+    /// The extent's file key, wrapped for this bucket and extent.
+    pub wrapped_file_key: WrappedKey,
+}
+
+impl fmt::Debug for SealedStream {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SealedStream")
+            .field("cipher_size", &self.cipher_size)
+            .finish_non_exhaustive()
+    }
+}
+
+/// [`seal_extent`] for a body that is sealed while it arrives: the same
+/// stream, one piece per call, for a plaintext whose length is known
+/// before its bytes are.
+///
+/// The pieces in order are the stream [`seal_extent`] would build from
+/// the same plaintext and the same random draws: the first piece starts
+/// with the 48-byte header, and every piece ends with one sealed chunk.
+/// The sealer decides which chunk is the final one from the declared
+/// length alone, so a caller cannot end the stream early or late: a
+/// chunk of the wrong length for its place is refused and nothing more
+/// is sealed.
+///
+/// `extent` must be a newly minted id, as for [`seal_extent`]. The value
+/// is not `Clone`, only moves forward and is consumed by
+/// [`ExtentSealer::finish`]: no stream is resumed, shared or rewound.
+pub struct ExtentSealer {
+    sealer: Sealer,
+    media_header: [u8; HEADER_SIZE as usize],
+    wrapped_file_key: WrappedKey,
+    /// Declared plaintext length.
+    plain_size: u64,
+    /// Plaintext sealed so far.
+    sealed: u64,
+    /// Length of the whole stream for `plain_size`.
+    cipher_size: u64,
+    /// Bytes of the stream given out so far.
+    given: u64,
+    cipher_sha256: Sha256,
+    cipher_md5: md5::Context,
+}
+
+impl fmt::Debug for ExtentSealer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ExtentSealer")
+            .field("plain_size", &self.plain_size)
+            .field("sealed", &self.sealed)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ExtentSealer {
+    /// Draws the file key and the stream nonce, and wraps the key for
+    /// `(bucket, extent)`. Nothing is sealed yet.
+    pub fn begin<R: FillRandom>(
+        bdk: &DataKey,
+        bucket: &BucketId,
+        extent: &ExtentId,
+        plain_size: u64,
+        rng: &mut R,
+    ) -> Result<Self> {
+        // Refuse a bad binding before any key exists.
+        file_key_aad(bucket, extent)?;
+        let cipher_size = media::ciphertext_size(plain_size).ok_or(ERR_SEAL)?;
+
+        let file_key = FileKey::generate(rng).map_err(|_| ERR_RNG)?;
+        let sealer = Sealer::random(&profile(), &file_key, rng).map_err(|_| ERR_RNG)?;
+        let media_header = sealer.header().to_bytes();
+        let wrapped_file_key = wrap_file_key(bdk, bucket, extent, &file_key, rng)?;
+        Ok(ExtentSealer {
+            sealer,
+            media_header,
+            wrapped_file_key,
+            plain_size,
+            sealed: 0,
+            cipher_size,
+            given: 0,
+            cipher_sha256: Sha256::new(),
+            cipher_md5: md5::Context::new(),
+        })
+    }
+
+    /// Length of the whole stream: what the pieces add up to.
+    pub fn cipher_size(&self) -> u64 {
+        self.cipher_size
+    }
+
+    /// Plaintext the stream still lacks. The chunk that brings this to 0
+    /// is the final one.
+    pub fn remaining(&self) -> u64 {
+        self.plain_size.saturating_sub(self.sealed)
+    }
+
+    /// Whether nothing of the stream has been asked for yet: the sealer
+    /// is as [`ExtentSealer::begin`] made it.
+    pub fn is_new(&self) -> bool {
+        self.given == 0 && self.sealed == 0 && !self.sealer.is_finished()
+    }
+
+    /// Whether the final chunk has been sealed.
+    pub fn is_complete(&self) -> bool {
+        self.sealer.is_finished() && self.given == self.cipher_size
+    }
+
+    /// Seals the next chunk and returns the next piece of the stream (the
+    /// header first, before chunk 0). `plaintext` is exactly one chunk
+    /// (64 KiB) while more than that remains, and exactly the rest
+    /// otherwise (the final chunk; empty only for an empty extent).
+    /// Anything else is refused, and so is every call after a refusal or
+    /// after the final chunk.
+    pub fn seal_next(&mut self, plaintext: &[u8]) -> Result<Vec<u8>> {
+        let len = plaintext.len() as u64;
+        let remaining = self.remaining();
+        let last = len == remaining;
+        if self.sealer.is_finished()
+            || len > remaining
+            || (!last && len != PLAIN_CHUNK_SIZE)
+            || (last && len > PLAIN_CHUNK_SIZE)
+        {
+            // Burn the sealer: a refused stream gets no final chunk.
+            let _ = self.sealer.seal_chunk(&[], false);
+            return Err(ERR_SEAL);
+        }
+        let chunk = self
+            .sealer
+            .seal_chunk(plaintext, last)
+            .map_err(|_| ERR_SEAL)?;
+        let piece = if self.given == 0 {
+            let mut piece = Vec::with_capacity(self.media_header.len() + chunk.len());
+            piece.extend_from_slice(&self.media_header);
+            piece.extend_from_slice(&chunk);
+            piece
+        } else {
+            chunk
+        };
+        self.cipher_sha256.update(&piece);
+        self.cipher_md5.consume(&piece);
+        self.sealed = self.sealed.saturating_add(len);
+        self.given = self.given.saturating_add(piece.len() as u64);
+        Ok(piece)
+    }
+
+    /// Ends the stream. Refused unless the final chunk was sealed and the
+    /// pieces add up to the declared stream length.
+    pub fn finish(self) -> Result<SealedStream> {
+        if !self.is_complete() || self.sealed != self.plain_size {
+            return Err(ERR_SEAL);
+        }
+        Ok(SealedStream {
+            media_header: self.media_header,
+            cipher_size: self.cipher_size,
+            cipher_sha256: self.cipher_sha256.finalize().into(),
+            cipher_md5: self.cipher_md5.finalize().0,
+            wrapped_file_key: self.wrapped_file_key,
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------

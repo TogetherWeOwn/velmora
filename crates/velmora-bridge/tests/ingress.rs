@@ -776,8 +776,8 @@ async fn byte_budget_weighs_requests_and_jobs() {
         (48 * MIB, 72 * MIB)
     );
 
-    // Jobs alone: three 22 MiB post jobs and a 2 MiB job fit, a fourth
-    // post job does not; the limit is 72 MiB exactly.
+    // Jobs alone: three 22 MiB jobs and a 2 MiB job fit, a fourth 22 MiB
+    // job does not; the limit is 72 MiB exactly.
     let jobs: Vec<_> = (0..3)
         .map(|_| budget.try_charge_job(22 * MIB).unwrap())
         .collect();
@@ -849,6 +849,55 @@ async fn byte_budget_weighs_requests_and_jobs() {
         assert!(budget.try_charge_job(1).is_none());
         drop((job, request));
     }
+}
+
+/// With the job limit above 1.5 times the request limit (90 MiB beside
+/// 48 MiB, as shipped), a request byte weighs more than the 1.5 bytes a
+/// request holds, so whatever the mix, 1.5 times what requests charge
+/// plus what jobs charge stays within the job limit, and requests alone
+/// still stop at their own limit.
+#[test]
+fn byte_budget_above_three_halves_bounds_every_mix() {
+    const MIB: u64 = 1024 * 1024;
+    let request_capacity = 48 * MIB;
+    let job_capacity = 90 * MIB;
+    let budget = ByteBudget::new(request_capacity).with_job_capacity(job_capacity);
+    // Requests alone: 48 MiB.
+    let all = budget.try_charge(request_capacity).unwrap();
+    assert!(budget.try_charge(1).is_none());
+    drop(all);
+    // Jobs alone: 90 MiB.
+    let all = budget.try_charge_job(job_capacity).unwrap();
+    assert!(budget.try_charge_job(1).is_none());
+    drop(all);
+    // Include a one-byte request to exercise rounding down job room.
+    for requests in (0..=request_capacity).step_by(MIB as usize / 2).chain([1]) {
+        let held = (requests > 0).then(|| budget.try_charge(requests).unwrap());
+        // The most a job may charge beside them.
+        let (mut lo, mut hi) = (0, job_capacity + 1);
+        while hi - lo > 1 {
+            let mid = (lo + hi) / 2;
+            match budget.try_charge_job(mid) {
+                Some(_) => lo = mid,
+                None => hi = mid,
+            }
+        }
+        // Jobs can use the remaining request share, rounded down to whole bytes.
+        let expected = (request_capacity - requests) * job_capacity / request_capacity;
+        assert_eq!(
+            lo, expected,
+            "{requests} B of requests left room for the wrong number of job bytes"
+        );
+        assert!(
+            requests * 3 + lo * 2 <= job_capacity * 2,
+            "{requests} B of requests and {lo} B of jobs"
+        );
+        drop(held);
+        assert_eq!(budget.in_use(), 0);
+    }
+
+    let _requests = budget.try_charge(24 * MIB).unwrap();
+    assert!(budget.try_charge_job(45 * MIB).is_some());
 }
 
 #[tokio::test]

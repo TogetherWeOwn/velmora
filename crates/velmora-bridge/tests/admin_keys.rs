@@ -8,10 +8,8 @@
 
 mod service_support;
 
-use hmac::{Hmac, KeyInit, Mac};
 use serde_json::{json, Value};
 use service_support::*;
-use sha2::Sha256;
 use velmora_bridge::config::Maintenance;
 use velmora_bridge::recovery::{read_key_revocation, REVOKED_KEY_PREFIX};
 use velmora_bridge::*;
@@ -71,46 +69,6 @@ async fn revoke<N: NntpConnector + 'static>(rig: &Rig<N>, akid: &str) -> Resp {
 
 async fn list<N: NntpConnector + 'static>(rig: &Rig<N>, query: &str) -> Resp {
     admin(rig, Method::Get, &format!("/_admin/keys{query}"), None).await
-}
-
-fn hmac(key: &[u8], data: &[u8]) -> Vec<u8> {
-    let mut mac = Hmac::<Sha256>::new_from_slice(key).unwrap();
-    mac.update(data);
-    mac.finalize().into_bytes().to_vec()
-}
-
-/// A presigned GET of `raw_path`, signed at `now` and valid for an hour.
-fn presign(signer: &Signer, now: UnixMs, raw_path: &str) -> Req {
-    let (stamp, scope, key) = signer.scope(now);
-    let credential = format!("{}/{scope}", signer.akid);
-    let mut q: Vec<(String, String)> = [
-        ("X-Amz-Algorithm", "AWS4-HMAC-SHA256"),
-        ("X-Amz-Credential", credential.as_str()),
-        ("X-Amz-Date", stamp.as_str()),
-        ("X-Amz-Expires", "3600"),
-        ("X-Amz-SignedHeaders", "host"),
-    ]
-    .iter()
-    .map(|(k, v)| (uri_encode(k, false), uri_encode(v, false)))
-    .collect();
-    q.sort();
-    let query = q
-        .iter()
-        .map(|(k, v)| format!("{k}={v}"))
-        .collect::<Vec<_>>()
-        .join("&");
-    let canonical = format!("GET\n{raw_path}\n{query}\nhost:{HOST}\n\nhost\nUNSIGNED-PAYLOAD");
-    let to_sign = format!(
-        "AWS4-HMAC-SHA256\n{stamp}\n{scope}\n{}",
-        hex(&sha256(canonical.as_bytes()))
-    );
-    let signature = hex(&hmac(&key, to_sign.as_bytes()));
-    Req {
-        method: Method::Get,
-        target: format!("{raw_path}?{query}&X-Amz-Signature={signature}"),
-        headers: vec![("host".to_string(), HOST.to_string())],
-        body: Vec::new(),
-    }
 }
 
 /// No response may carry a secret or the name of a secret column.
@@ -315,6 +273,7 @@ async fn list_shows_ids_grants_and_times_never_secrets() {
         find(&a.akid),
         &json!({
             "access_key_id": a.akid,
+            "kind": "s3",
             "status": "active",
             "created_at": rig.now().0,
             "grants": [
@@ -331,7 +290,10 @@ async fn list_shows_ids_grants_and_times_never_secrets() {
     for k in keys {
         let mut fields: Vec<&String> = k.as_object().unwrap().keys().collect();
         fields.sort();
-        assert_eq!(fields, ["access_key_id", "created_at", "grants", "status"]);
+        assert_eq!(
+            fields,
+            ["access_key_id", "created_at", "grants", "kind", "status"]
+        );
     }
 
     // `after` pages by id.
@@ -1038,4 +1000,75 @@ async fn admin_refusals_of_the_precheck_are_no_store() {
     ] {
         assert_eq!(ingress::url_authority(url), host, "{url}");
     }
+}
+
+/// `kind: app_password` mints an `APVL` key pair that the S3 entry point
+/// refuses; a bad kind is refused before anything is written.
+#[tokio::test]
+async fn app_passwords_are_minted_with_their_own_prefix() {
+    let rig = rig();
+    rig.bucket(BUCKET, true).await;
+    let r = admin(
+        &rig,
+        Method::Post,
+        "/_admin/keys",
+        Some(json!({ "buckets": [BUCKET], "perm": "rw", "kind": "app_password" })),
+    )
+    .await;
+    assert_eq!(r.status, 200, "{}", r.text());
+    let v: Value = serde_json::from_slice(&r.body).unwrap();
+    assert_eq!(v["kind"], "app_password");
+    let app = Signer::new(
+        v["access_key_id"].as_str().unwrap(),
+        v["secret"].as_str().unwrap(),
+    );
+    assert!(
+        app.akid.starts_with("APVL") && app.akid.len() == 20,
+        "{}",
+        app.akid
+    );
+    let s3 = mint(&rig, &[BUCKET], "rw").await;
+    assert!(s3.akid.starts_with("AKVL"), "{}", s3.akid);
+
+    let r = rig.put(&app, BUCKET, "k", b"x").await;
+    assert_eq!(r.status, 403, "{}", r.text());
+    assert!(r.text().contains("InvalidAccessKeyId"));
+    assert_eq!(rig.put(&s3, BUCKET, "k", b"x").await.status, 200);
+
+    let v: Value = serde_json::from_slice(&list(&rig, "").await.body).unwrap();
+    let kinds: Vec<(String, String)> = v["keys"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|k| {
+            (
+                k["access_key_id"].as_str().unwrap().to_string(),
+                k["kind"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect();
+    assert!(kinds.contains(&(app.akid.clone(), "app_password".into())));
+    assert!(kinds.contains(&(s3.akid.clone(), "s3".into())));
+
+    let keys_before = rig.count("access_keys");
+    // An explicit null or a non-string is no kind either: never a default
+    // S3 key.
+    for bad in [
+        json!("internal"),
+        json!("S3"),
+        json!(""),
+        json!(null),
+        json!(1),
+        json!(["app_password"]),
+    ] {
+        let r = admin(
+            &rig,
+            Method::Post,
+            "/_admin/keys",
+            Some(json!({ "buckets": [BUCKET], "perm": "ro", "kind": bad })),
+        )
+        .await;
+        assert_eq!(r.status, 400, "{bad}: {}", r.text());
+    }
+    assert_eq!(rig.count("access_keys"), keys_before);
 }

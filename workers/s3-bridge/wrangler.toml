@@ -1,5 +1,10 @@
 name = "velmora-s3"
-main = "build/worker/shim.mjs"
+# entry.mjs wraps the Rust Worker (build/index.js): the default
+# entrypoint deletes the entry marker a client may send, and the named
+# entrypoint `DavEntry` (no route; reached only through a service binding
+# that names it) marks a request as the WebDAV gateway's. See entry.mjs
+# and crates/velmora-bridge/src/entry.rs.
+main = "entry.mjs"
 compatibility_date = "2026-11-01"
 
 # The account id comes from the deploy environment (CLOUDFLARE_ACCOUNT_ID),
@@ -62,8 +67,8 @@ VERIFY_DELAY_SECS = "120"
 # whatever this says. The release by a verify job is one
 # write (copy released and row done together), so Workers of both values
 # and older Workers may run side by side. Its count in the release
-# totals needs migration 0023.
-RELEASE_AT_VERIFY = "on"
+# totals needs migration 0025.
+RELEASE_AT_VERIFY = "off"
 # How the verify stage checks an extent: body | light.
 # body: every article is read in full (BODY) on one backbone that counts
 # and asked for (STAT) on the others.
@@ -115,18 +120,29 @@ VELMORA_KEK_ACTIVE = "1"
 INFLIGHT_BUDGET_BYTES = "50331648"   # 48 MiB per isolate: what requests may charge
 # What requests and background jobs may charge together, per isolate. A
 # job charges under this limit, a request under INFLIGHT_BUDGET_BYTES. It
-# may be up to 1.5 times INFLIGHT_BUDGET_BYTES: a request holds up to 1.5
-# bytes per byte it charges (the upload's ciphertext is copied once more
-# on its way to R2), a job holds about what it charges.
-JOB_BUDGET_BYTES = "75497472"        # 72 MiB per isolate
+# may be up to 1.5 times INFLIGHT_BUDGET_BYTES or 90 MiB, whichever is
+# more: a request holds up to 1.5 bytes per byte it charges (the upload's
+# ciphertext is copied once more on its way to R2), a job holds about
+# what it charges. An upload of at most MAX_EXTENT_BYTES is sealed and
+# stored while it arrives and charges a window of 512 KiB whatever its
+# length; a slice, a copied part and a download charge what they hold.
+# 90 MiB holds three post jobs with parity (29.13 MiB each) and a verify
+# job. Measured with three post jobs at once in one isolate: wasm memory
+# up to 92 MiB without parity and 103 MiB with it, of the isolate's
+# 128 MiB; four with parity (4 sockets each, 104.5 MiB charged) reached
+# 119 MiB and none ran out of memory
+# (MAX_JOB_BUDGET_BYTES in config.rs).
+JOB_BUDGET_BYTES = "94371840"        # 90 MiB per isolate
 GC_MODE = "off"                      # off | disposable
 HOT_CAP_BYTES = "107374182400"       # 100 GiB of evictable R2 bytes; pinned (unverified) bytes are never counted or evicted
 MAINTENANCE = "off"                  # off | restore
 # Sockets per post job, spread over the posting tier. A post job charges
-# its extent (16 MiB) plus 1 MiB per socket to the isolate's byte budget,
-# and the invocations of one queue share an isolate. At 6, three post
-# jobs and a verify job fit the 72 MiB job budget at once; at 8 only two
-# post jobs fit beside a verify job and the third waits for them.
+# its extent (16 MiB) plus 1.5 MiB per socket to the isolate's byte budget
+# (and 4.13 MiB more for its parity with PARITY on), and the invocations
+# of one queue share an isolate. At 6, three post jobs and a verify job
+# fit the 90 MiB job budget at once, with parity or without, and a fourth
+# post job waits; at 8 only two post jobs with parity fit beside a verify
+# job and the third waits.
 POST_SOCKETS = "6"
 # Connections one GET reads extents from Usenet over, 1 to 8. They leave
 # from one address and each is one provider permit; a read that gets
@@ -180,24 +196,38 @@ RECOVERY_COPY = "off"
 # slot row of it, and gives the rows back only once nothing it handed out
 # is live. Change it in a deploy of its own, with the provider limits and
 # pools unchanged in that deploy. See "Permit gate" in ops/README.md.
-PERMITS = "d1"
+# Production: "do" since deploy 4 of "Shipping the gate"; to undo it,
+# set "d1" again (the gates hand their slot rows back).
+PERMITS = "do"
 # Optional vars and their defaults (production sets POST_SOCKETS and COLD_SOCKETS explicitly):
+#   S3_HOSTS (empty): up to eight comma-separated entries. Join each hostname and class with an equals sign.
+#     Classes are legacy and customer.
+#     S3_HOST is always legacy. Production takes its extra hosts from VELMORA_S3_HOSTS.
+#     Attach each host to the Worker as a Custom Domain before naming it in the variable,
+#     or the smoke test fails and the deploy rolls back.
 #   SLICE_BYTES (8388608, 8 MiB): the slice of a PutObject or UploadPart body above MAX_EXTENT_BYTES; at most MAX_EXTENT_BYTES.
 #   MAX_OBJECT_EXTENTS (10000): most extents one object is made of, 1 to 10000. CompleteMultipartUpload, and an UploadPart
 #     above MAX_EXTENT_BYTES, answer 400 EntityTooLarge for an upload that would hold more. With slices of 8 MiB that is 78 GiB in parts above
 #     MAX_EXTENT_BYTES, and 156 GiB in parts of exactly MAX_EXTENT_BYTES.
 #   MAX_PUT_BYTES (MAX_EXTENT_BYTES): see above. INTENT_SWEEP (off): see above.
+#   GC_ORPHANS (off): off | on. On: the cron deletes the pinned copy of an upload part that left its upload (uploaded again under
+#     its number, aborted, or left out of the part list of a completion) 31 days after it left, in every bucket and whatever
+#     GC_MODE says. It takes nothing an object, a server-side copy or an open upload refers to, nothing of a key that has a
+#     write whose outcome is not known, and nothing while a replay is under way, for 31 days after one ended, or while the
+#     catalogue is behind its rollback stamp.
+#     Not set here: read "Upload parts that left their upload" in ops/README.md before turning it on.
 #   CATALOGUE_ID (main): names this catalogue in its rollback stamp keys in SAFETY (rs/<id>/<counter>). Never change it for a catalogue in use.
 #   POST_SOCKETS (4): connections one post job opens, 1 to 8, each on its own provider permit.
 #     A job is one source address to a provider, however many connections it holds there.
 #   COLD_SOCKETS (4; production sets 8 above): connections one GET reads from Usenet over, 1 to 8, each on its own
 #     provider permit. Fewer are used when INFLIGHT_BUDGET_BYTES has no room for that many beside an extent and its cache write.
-#   JOB_BUDGET_BYTES (the value of INFLIGHT_BUDGET_BYTES): see above; from that value to 1.5 times it.
+#   JOB_BUDGET_BYTES (the value of INFLIGHT_BUDGET_BYTES): see above; from that value to 1.5 times it or 90 MiB, whichever is more.
 #   RECORD_LAYOUT (flat): flat | tenant. Where NEW recovery records are written: flat is m/<id>, m/del/<id> and m/art/<extent>;
 #     tenant is the same names under m/x/<tenant id>/. Every reader reads both, always, and no record is ever renamed.
 #     A Worker from before this switch does not read the tenant names (its replay would pass over them): set tenant in a
 #     deploy AFTER the one that brought the switch, and from then on never roll back past that one (see "Rollback floor"
-#     and "Record layout" in ops/README.md). Not set here: production writes the flat names.
+#     and "Record layout" in ops/README.md). Not set here, and never to be set here: the deploy job writes it into the
+#     production config from the variable VELMORA_RECORD_LAYOUT of the production environment, and refuses a prod section that sets it.
 #   PROPAGATION_GRACE_SECS (21600, 6 h): after it, an article a backbone still lacks is posted to that backbone.
 #   PACKED_PLANS (off; production sets it on below): off | on. On: the article plan of a new extent is one value on its row
 #     (extents.plan) instead of one row per article, a replay stores plans that way, and each
@@ -248,8 +278,8 @@ binding = "SELF"
 service = "velmora-s3"
 
 # The permit gate (src/gate.rs, class PermitGate) is declared and bound
-# here, but this Worker still takes its permits from the catalogue
-# (PERMITS = "d1" above) until PERMITS = "do" ships in a deploy of its own.
+# here, and this Worker takes its permits from it (PERMITS = "do" above,
+# deploy 4 below, shipped in a deploy of its own).
 # Declaring a Durable Object class is a deploy that can never be rolled
 # back past, so the class, its binding and PERMITS = "do" each come in a
 # deploy of their own, in this order (see "Shipping the gate" in

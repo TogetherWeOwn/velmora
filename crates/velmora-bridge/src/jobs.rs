@@ -19,16 +19,21 @@
 //!   on until its time has come. So a release does not wait for the
 //!   dispatcher, whose run is bounded.
 //! - The GC job deletes a blob only when the catalogue hands it the key
-//!   (`gc_begin`), and only in the mode `GC_MODE` allows.
+//!   (`gc_begin`), and only in the mode `GC_MODE` allows. With
+//!   `GC_ORPHANS` it also deletes the safety copies of upload parts
+//!   that left their upload and never became part of an object, in
+//!   every bucket and only after the catalogue recorded the delete
+//!   against its proof (`gc_orphan_claim`).
 //! - The eviction job keeps R2 a bounded hot tier. It deletes R2 copies
 //!   of extents that Usenet is proven to hold, never a catalogue row and
 //!   never a pinned copy, so it is not data deletion and `GC_MODE` does
 //!   not apply to it. The only keys it can name are an extent's
 //!   `x/<extent>` and `c/<extent>`.
 
-use crate::config::{GcMode, Maintenance};
+use crate::config::{GcMode, Maintenance, ORPHAN_GRACE_MS};
 use crate::ports::{
     BlobStore, Bridge, Catalog, Clock, JobSink, Kek, Lease, NntpConnector, MAX_QUEUE_DELAY_SECS,
+    PERMIT_SECS,
 };
 use crate::post::{settle, Stop, POST_SOCKET_BYTES};
 use crate::recovery::delete_blob;
@@ -141,6 +146,13 @@ pub const PACK_LIMIT: u32 = 50;
 pub const MAX_ATTEMPTS: u32 = 50;
 /// GC rows one GC job handles before it re-enqueues itself.
 pub const GC_BATCH: u32 = 50;
+/// Open `gc` rows one run of the scan for orphaned upload parts reads.
+/// Most of them are rows of deleted objects, which it steps over.
+pub const ORPHAN_SCAN: u32 = 500;
+/// Orphaned parts one GC job deletes: the claims of all of them in a
+/// few batches, then a blob delete and a close each, which keeps a job
+/// well inside its subrequests.
+pub const ORPHAN_BATCH: u32 = 100;
 /// Extents one eviction job handles before it re-enqueues itself.
 pub const EVICT_BATCH: u32 = 50;
 /// Least time between two totals of the evictable bytes by the
@@ -157,7 +169,8 @@ pub(crate) const JOB_OVERHEAD_BYTES: u64 = 2 * 1024 * 1024;
 
 /// What a job of `stage` charges to the isolate's byte budget for an
 /// extent of `cipher_size` bytes. Only the post stage holds the whole
-/// extent, and one rendered article per socket; verify and release hold
+/// extent, and a rendered article and its copy on the wire per socket
+/// ([`POST_SOCKET_BYTES`]); verify and release hold
 /// one article at a time (a repost charges for itself).
 pub fn job_bytes(stage: OutboxStage, cipher_size: u64, post_sockets: u32) -> u64 {
     match stage {
@@ -168,24 +181,66 @@ pub fn job_bytes(stage: OutboxStage, cipher_size: u64, post_sockets: u32) -> u64
 }
 
 /// What a job that holds the parity shards of an extent charges on top:
-/// the `parity` shards themselves, and what the codec works in while it
-/// computes them (as many again, and two more). Each is as long as the
-/// extent's longest article. Nothing for an extent without parity.
+/// the `parity` shards themselves, and two more that the codec works in
+/// while it computes them (`velmora::rs::encode` builds the shards in
+/// place, beside one data shard and the shard it is converting). Each is
+/// as long as the extent's longest article. Nothing for an extent without
+/// parity. Measured on a deployed Worker, a post job with parity held
+/// 2.8 MiB more than one without: its 4 shards.
 pub fn parity_job_bytes(cipher_size: u64, parity: usize) -> u64 {
     let shard = match (parity, crate::parity::stripe_of(cipher_size)) {
         (0, _) | (_, None) => return 0,
         (_, Some((_, shard))) => u64::from(shard),
     };
-    (parity as u64)
-        .saturating_mul(2)
-        .saturating_add(2)
-        .saturating_mul(shard)
+    (parity as u64).saturating_add(2).saturating_mul(shard)
 }
 
 /// Where a drain stops: 90 % of the cap, so that a tier sitting at the
 /// cap is not evicted a little on every run.
 pub fn low_watermark(cap: u64) -> u64 {
     cap - cap / 10
+}
+
+/// How long after its claim a job that finds no provider slot still
+/// waits for one, where it used to give its row back at once and be
+/// delivered again 15 to 60 s later (a claim, a put-off and a queue
+/// delivery each time).
+///
+/// One permit lifetime: a slot whose holder is gone without releasing
+/// it frees when its permit expires, so by then every slot has been
+/// released, renewed by a job that is still at work, or freed. A job
+/// that has seen none come free in that time gives its row back as
+/// before. Counted from the claim, so it bounds the waits of one job
+/// together, whatever the number of backbones it asks: with the
+/// longest invocation that succeeded in a day of production (393 s) the
+/// job still ends well before its invocation gives it up
+/// ([`JOB_WAIT_MS`](crate::jobtable::JOB_WAIT_MS)).
+pub const SLOT_WAIT_MS: i64 = PERMIT_SECS as i64 * 1000;
+const _: () = assert!(SLOT_WAIT_MS + 393_000 < crate::jobtable::JOB_WAIT_MS);
+/// How long a job that waits for a slot sleeps at least before it asks
+/// again. A slot is held for a second or more by the shortest job there
+/// is (a connect, a login and one pass of a light check), so asking
+/// more often than this finds little.
+pub const SLOT_POLL_MS: u32 = 2_000;
+/// Catalogue calls the asks of one wait may make together, after the
+/// first ask (the one a job always made). D1 allows 1,000 queries per
+/// invocation, and a job that ran out of them could not even hand its
+/// claim back: the wait gets half, the job's own work the rest (a drill
+/// job made 13 calls on average). One ask is a read of the pool and at
+/// most three calls per provider (the sweep of expired permits, the
+/// take, the seeding of missing slots), so a job that asks many
+/// providers sleeps longer between asks ([`slot_poll_ms`]).
+pub const SLOT_WAIT_CALLS: i64 = 500;
+
+/// The sleep before the next ask of `providers` providers: at least
+/// [`SLOT_POLL_MS`], and long enough that the asks that follow such
+/// sleeps make no more than [`SLOT_WAIT_CALLS`] calls in
+/// [`SLOT_WAIT_MS`]: as many asks as fit in the calls, spread over the
+/// wait.
+pub fn slot_poll_ms(providers: usize) -> u32 {
+    let asks = (SLOT_WAIT_CALLS / (1 + 3 * providers as i64)).max(1);
+    let ms = (SLOT_WAIT_MS + asks - 1) / asks;
+    u32::try_from(ms).unwrap_or(u32::MAX).max(SLOT_POLL_MS)
 }
 
 pub(crate) const RETRY: JobOutcome = JobOutcome::Retry {
@@ -225,7 +280,16 @@ where
         match self.catalog.restore_pending().await {
             Ok(false) => {}
             Ok(true) => return JobOutcome::Ack,
-            Err(_) => return RETRY,
+            Err(e) => {
+                // The other kinds of job show in the outbox figures; a
+                // sweep that never gets past this check shows nowhere.
+                // With the switch off a sweep job does nothing, so
+                // nothing of it failed.
+                if self.cfg.intent_sweep && matches!(job, Job::Sweep { .. }) {
+                    crate::intents::job_failed(&e);
+                }
+                return RETRY;
+            }
         }
         match job {
             Job::Extent {
@@ -361,17 +425,41 @@ where
         }
     }
 
-    /// Handles up to [`GC_BATCH`] due `gc` rows.
-    async fn run_gc(&self) -> JobOutcome {
-        let disposable_only = match self.cfg.gc_mode {
-            GcMode::Off => return JobOutcome::Ack,
-            GcMode::Disposable => true,
-        };
-        match self.gc_batch(disposable_only).await {
-            Ok(()) => JobOutcome::Ack,
-            // Every step is idempotent, so the batch simply runs again.
-            Err(_) => RETRY,
+    /// For a job that just found no slot on `providers` providers:
+    /// sleeps [`slot_poll_ms`] and says the job may ask again, while its
+    /// claim is younger than [`SLOT_WAIT_MS`]. `false`, with nothing
+    /// awaited, once it is not, and on a host without a timer: the job
+    /// is put off as before. The lease is not renewed here: a job that
+    /// connects after a wait renews it first, as after any wait
+    /// ([`Lease::fresh_at`]).
+    pub(crate) async fn slot_wait(&self, lease: &Lease, providers: usize) -> bool {
+        let age = self.clock.now().0 - lease.claimed_at.0;
+        match self.budget.sleeper() {
+            Some(sleep) if (0..SLOT_WAIT_MS).contains(&age) => {
+                sleep(slot_poll_ms(providers)).await;
+                true
+            }
+            _ => false,
         }
+    }
+
+    /// Handles up to [`GC_BATCH`] due `gc` rows in the mode `GC_MODE`
+    /// allows, and one window of orphaned upload parts with `GC_ORPHANS`.
+    async fn run_gc(&self) -> JobOutcome {
+        // Every step of both is idempotent, so a failed job simply runs
+        // again.
+        let mut outcome = JobOutcome::Ack;
+        let rows = match self.cfg.gc_mode {
+            GcMode::Off => Ok(()),
+            GcMode::Disposable => self.gc_batch(true).await,
+        };
+        if rows.is_err() {
+            outcome = RETRY;
+        }
+        if self.cfg.gc_orphans && self.orphan_batch().await.is_err() {
+            outcome = RETRY;
+        }
+        outcome
     }
 
     async fn gc_batch(&self, disposable_only: bool) -> Result<()> {
@@ -412,6 +500,44 @@ where
             }
             GcStep::Done | GcStep::Skipped => Ok(()),
         }
+    }
+
+    /// One window of the scan for orphaned upload parts: deletes the
+    /// safety copies of the parts it finds (the rule is in `sql/gc.rs`).
+    /// The scan has already moved past the window, so a job that runs
+    /// again after an error reads the next one, and the rows that failed
+    /// wait for the next pass.
+    async fn orphan_batch(&self) -> Result<()> {
+        // As in `gc_batch`: nothing is deleted on a catalogue that is
+        // behind its stamp.
+        if self.catalogue_rolled_back().await? {
+            return Ok(());
+        }
+        let now = self.clock.now();
+        let cutoff = now.plus_ms(-ORPHAN_GRACE_MS);
+        let rows = self
+            .catalog
+            .gc_orphans(now, cutoff, ORPHAN_SCAN, ORPHAN_BATCH)
+            .await?;
+        // The scan read the rows a moment ago; the claim proves each
+        // again in the batch that records its delete, and only then
+        // does a blob go. Claims that an error cut short still granted
+        // what they granted: those blobs go now, and the job fails
+        // after.
+        let (granted, claimed) = self.catalog.gc_orphan_claim(&rows, now, cutoff).await;
+        let mut failed = claimed.err();
+        for (row, _) in rows.iter().zip(granted).filter(|(_, granted)| *granted) {
+            if let Err(e) = self.orphan_row(row).await {
+                failed.get_or_insert(e);
+            }
+        }
+        failed.map_or(Ok(()), Err)
+    }
+
+    /// One orphaned part whose claim was granted.
+    async fn orphan_row(&self, row: &GcRow) -> Result<()> {
+        delete_blob(&self.safety, &row.extent_id.safety_key()).await?;
+        self.catalog.gc_orphan_done(row.id, self.clock.now()).await
     }
 
     /// One bounded step of the hot-tier drain; returns the bytes it freed.
@@ -669,7 +795,9 @@ where
             GcMode::Off => false,
             GcMode::Disposable => !self.catalog.gc_due(now, 1, true).await?.is_empty(),
         };
-        if gc_due {
+        // One window of orphaned parts per run, until a pass is through.
+        let orphans_due = self.cfg.gc_orphans && self.catalog.gc_orphans_due(now).await?;
+        if gc_due || orphans_due {
             self.jobs.send(&Job::Gc { v: JOB_VERSION }, 0).await?;
             report.gc_enqueued = true;
         }

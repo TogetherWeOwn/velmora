@@ -43,9 +43,12 @@ thread_local! {
     /// Asked before a POST is sent, with its provider and Message-ID: a
     /// flag returned here holds the POST back until it is set.
     static BEFORE_POST: RefCell<Option<BeforePost>> = const { RefCell::new(None) };
+    static BEFORE_BODY: RefCell<Option<BeforeBody>> = const { RefCell::new(None) };
 }
 
 type BeforePost = Box<dyn FnMut(&str, &str) -> Option<Rc<Cell<bool>>>>;
+type BodyWait = futures_util::future::LocalBoxFuture<'static, ()>;
+type BeforeBody = Box<dyn FnMut(&str, &str) -> Option<BodyWait>>;
 
 /// The POSTs sent so far in this test: provider and `<Message-ID>`.
 pub fn post_starts() -> Vec<(String, String)> {
@@ -56,6 +59,11 @@ pub fn post_starts() -> Vec<(String, String)> {
 /// holds that POST back until the flag is set.
 pub fn before_post(gate: impl FnMut(&str, &str) -> Option<Rc<Cell<bool>>> + 'static) {
     BEFORE_POST.with(|g| *g.borrow_mut() = Some(Box::new(gate)));
+}
+
+/// Runs `gate` before each BODY of this test; awaits any future it returns.
+pub fn before_body(gate: impl FnMut(&str, &str) -> Option<BodyWait> + 'static) {
+    BEFORE_BODY.with(|g| *g.borrow_mut() = Some(Box::new(gate)));
 }
 
 fn bracketed(message_id: &str) -> String {
@@ -233,6 +241,14 @@ impl NntpSession for CountedSession {
     }
     async fn body(&mut self, message_id: &str, out: &mut Vec<u8>) -> Result<BodyOutcome> {
         begin(&self.slow, "body");
+        let wait = BEFORE_BODY.with(|g| {
+            g.borrow_mut()
+                .as_mut()
+                .and_then(|f| f(&self.provider, message_id))
+        });
+        if let Some(wait) = wait {
+            wait.await;
+        }
         let found = NntpSession::body(self.client(), message_id, out).await;
         end(&self.slow);
         found
@@ -373,6 +389,8 @@ pub struct MemCatalog {
     pub entries: RefCell<BTreeMap<ExtentId, Entry>>,
     slots: RefCell<BTreeMap<String, Vec<Slot>>>,
     health: RefCell<BTreeMap<String, Health>>,
+    /// A cooldown that begins by itself: `(provider, from, until)`.
+    later_cooldown: RefCell<Option<(String, i64, i64)>>,
     /// The next `n` `mark_posted` calls fail before writing (a job that
     /// dies between the POST and the catalogue write).
     pub fail_mark_posted: Cell<u32>,
@@ -413,6 +431,9 @@ pub struct MemCatalog {
     pub slow_next_renewal: RefCell<Option<(FixedClock, i64)>>,
     /// `provider_failed` calls so far (strikes reported).
     pub failures_reported: Cell<u32>,
+    loads: Cell<u32>,
+    acquires: Cell<u32>,
+    fail_asks: Cell<Option<(u32, bool)>>,
     /// The backbones read in full for a while, as `verify_escalations`.
     pub escalations: RefCell<Vec<VerifyEscalation>>,
     /// Extent, backbone and plan of each raise, as `verify_raises`.
@@ -466,6 +487,24 @@ impl MemCatalog {
 
     pub fn verifications(&self, extent: &ExtentId) -> Vec<VerificationRow> {
         self.entries.borrow()[extent].verifications.clone()
+    }
+
+    /// How often the load of the providers was read, and how often a
+    /// slot was asked for.
+    pub fn slot_asks(&self) -> (u32, u32) {
+        (self.loads.get(), self.acquires.get())
+    }
+
+    /// From the `n`th read of the providers' load on, that read fails
+    /// (`acquire` false) or every ask for a slot after it does.
+    pub fn fail_slot_asks(&self, n: u32, acquire: bool) {
+        self.fail_asks.set(Some((n, acquire)));
+    }
+
+    /// Provider `id` reads as cooling until `until` from `from` on, as
+    /// when another job's failures begin a cooldown at `from`.
+    pub fn cool_from(&self, id: &str, from: UnixMs, until: UnixMs) {
+        *self.later_cooldown.borrow_mut() = Some((id.to_string(), from.0, until.0));
     }
 
     /// Every held slot passes to someone else: its holder's permit is dead.
@@ -588,10 +627,16 @@ impl MemCatalog {
             // is on record, and counts for nothing where the last check
             // of the bytes failed.
             let checks = Self::body_checks(e);
+            // A full read of fewer articles than the plan has (the data
+            // alone, as a version from before parity reads) failed too.
+            let total = e.job.extent.article_count;
+            let total = total.map(|data| data + e.job.parity_count.unwrap_or(0));
             let failed = |s: &BackboneStatus| {
                 checks.iter().any(|b| {
                     b.backbone == s.backbone
-                        && (b.result != VerifyResult::Ok || b.articles_ok != b.articles_total)
+                        && (b.result != VerifyResult::Ok
+                            || b.articles_ok != b.articles_total
+                            || Some(b.articles_total) != total)
                 })
             };
             let full = |s: &BackboneStatus| {
@@ -669,9 +714,14 @@ impl MemCatalog {
                 articles_total: v.articles_total,
                 result: v.result,
                 kind: v.kind,
+                // A complete pass is one of every article of the plan,
+                // the parity articles of its addendum included.
                 counts: v.result == VerifyResult::Ok
                     && v.articles_ok == v.articles_total
-                    && Some(v.articles_total) == extent.article_count,
+                    && Some(v.articles_total)
+                        == extent
+                            .article_count
+                            .map(|data| data + e.job.parity_count.unwrap_or(0)),
             })
             .collect()
     }
@@ -890,8 +940,19 @@ impl Catalog for MemCatalog {
                 return false;
             }
             e.verifications.push(v.clone());
-            if v.result == VerifyResult::Ok && v.kind.is_full() {
-                e.job.extent.last_verified_at = Some(v.verified_at);
+            // As the SQL catalogue: a full read of every article of
+            // this plan, the parity articles included, and a later one.
+            let extent = &mut e.job.extent;
+            let total = extent.article_count;
+            let total = total.map(|data| data + e.job.parity_count.unwrap_or(0));
+            if v.result == VerifyResult::Ok
+                && v.kind.is_full()
+                && v.articles_ok == v.articles_total
+                && Some(v.articles_total) == total
+                && v.plan_rev == extent.plan_rev
+                && extent.last_verified_at.is_none_or(|at| at < v.verified_at)
+            {
+                extent.last_verified_at = Some(v.verified_at);
             }
             true
         });
@@ -1003,6 +1064,17 @@ impl Catalog for MemCatalog {
             .is_some())
     }
 
+    async fn reopen_release(&self, l: &Lease, _: UnixMs) -> Result<bool> {
+        Ok(self
+            .fenced(l, |e| {
+                if e.job.extent.safety_state == SafetyState::Releasing {
+                    e.job.extent.safety_state = SafetyState::Held;
+                    e.job.extent.release_evidence = None;
+                }
+            })
+            .is_some())
+    }
+
     // The hot tier is tested on the SQL catalogue; here nothing is ever
     // evictable.
     async fn usage_counters(&self) -> Result<velmora_bridge::types::UsageCounters> {
@@ -1097,6 +1169,10 @@ impl Catalog for MemCatalog {
         now: UnixMs,
     ) -> Result<Option<Permit>> {
         note_event("acquire");
+        self.acquires.set(self.acquires.get() + 1);
+        if matches!(self.fail_asks.get(), Some((n, true)) if self.loads.get() >= n) {
+            return Err(BridgeError::Sql("injected acquire_permit failure".into()));
+        }
         if self.acquire_takes_a_turn.get() {
             let in_flight = self.acquire_in_flight.get() + 1;
             self.acquire_in_flight.set(in_flight);
@@ -1223,8 +1299,9 @@ impl Catalog for MemCatalog {
                     None => e.parity_reposted.push(*idx),
                 }
             }
-            // Like the SQL: a packed plan has one stamp, on its extent, so
-            // a repost of any of its articles (parity too) stamps them all.
+            // A packed plan has one stamp for all its articles, on the
+            // extent's row: a repost of any of them is a repost of the
+            // plan, as in the real catalogue.
             if e.packed.is_some() && !idxs.is_empty() {
                 for a in &mut e.articles {
                     a.reposted_at = a.reposted_at.max(Some(now));
@@ -1565,6 +1642,9 @@ impl Catalog for MemCatalog {
     async fn restore_pending(&self) -> Result<bool> {
         Ok(false)
     }
+    async fn restore_import_incomplete(&self) -> Result<bool> {
+        Ok(false)
+    }
     async fn restore_progress(
         &self,
         _: UnixMs,
@@ -1672,14 +1752,29 @@ impl Catalog for MemCatalog {
         unused()
     }
     async fn provider_load(&self, now: UnixMs) -> Result<Vec<ProviderLoad>> {
+        self.loads.set(self.loads.get() + 1);
+        if matches!(self.fail_asks.get(), Some((n, false)) if self.loads.get() >= n) {
+            return Err(BridgeError::Sql("injected provider_load failure".into()));
+        }
         let slots = self.slots.borrow();
         let health = self.health.borrow();
-        let ids: std::collections::BTreeSet<&String> = slots.keys().chain(health.keys()).collect();
+        let later = self.later_cooldown.borrow();
+        let ids: std::collections::BTreeSet<&String> = slots
+            .keys()
+            .chain(health.keys())
+            .chain(later.as_ref().map(|l| &l.0))
+            .collect();
         Ok(ids
             .into_iter()
             .map(|id| {
                 let s = slots.get(id).map(Vec::as_slice).unwrap_or_default();
-                let h = health.get(id).copied().unwrap_or_default();
+                let mut h = health.get(id).copied().unwrap_or_default();
+                if let Some((_, _, until)) = later
+                    .as_ref()
+                    .filter(|(p, from, _)| p == id.as_str() && *from <= now.0)
+                {
+                    h.until = *until;
+                }
                 ProviderLoad {
                     provider_id: id.clone(),
                     held: s.iter().filter(|s| s.until >= now.0).count() as u32,
@@ -1802,6 +1897,18 @@ impl Catalog for MemCatalog {
     async fn gc_done(&self, _: i64, _: UnixMs) -> Result<()> {
         unused()
     }
+    async fn gc_orphans_due(&self, _: UnixMs) -> Result<bool> {
+        unused()
+    }
+    async fn gc_orphans(&self, _: UnixMs, _: UnixMs, _: u32, _: u32) -> Result<Vec<GcRow>> {
+        unused()
+    }
+    async fn gc_orphan_claim(&self, _: &[GcRow], _: UnixMs, _: UnixMs) -> (Vec<bool>, Result<()>) {
+        (Vec::new(), unused())
+    }
+    async fn gc_orphan_done(&self, _: i64, _: UnixMs) -> Result<()> {
+        unused()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1905,12 +2012,14 @@ pub async fn rig(specs: &[Spec]) -> Rig {
     let cfg = BridgeConfig {
         environment: Environment::Dev,
         s3_host: "s3.test".to_string(),
+        s3_hosts: Vec::new(),
         region: "auto".to_string(),
         max_extent_bytes: 16 * 1024 * 1024,
         max_put_bytes: 16 * 1024 * 1024,
         slice_bytes: 8 * 1024 * 1024,
         max_object_extents: 10_000,
         intent_sweep: false,
+        gc_orphans: false,
         records: velmora_bridge::recovery::Layout::flat(),
         packed_plans: false,
         parity: false,
@@ -1956,6 +2065,37 @@ pub async fn rig(specs: &[Spec]) -> Rig {
         servers,
         bridge,
         dead_ports: Vec::new(),
+    }
+}
+
+impl Rig {
+    /// The host has a timer from here on, as the Worker has: a job may
+    /// wait, and each wait moves the rig's clock by its length.
+    pub fn with_timer(&mut self) {
+        let clock = self.bridge.clock.clone();
+        self.bridge.budget = ByteBudget::new(48 * 1024 * 1024).with_sleeper(Rc::new(move |ms| {
+            clock.advance_ms(i64::from(ms));
+            Box::pin(async {})
+        }));
+    }
+
+    /// Takes every background slot of provider `index` for another
+    /// holder, as of `at`: they expire one permit lifetime after it.
+    pub async fn take_slots(&self, index: usize, at: UnixMs) -> Vec<Permit> {
+        let provider = &self.bridge.cfg.providers[index];
+        let class = PermitClass::Background;
+        let mut held = Vec::new();
+        while let Some(permit) = self
+            .bridge
+            .catalog
+            .acquire_permit(provider, class, "other", at)
+            .await
+            .unwrap()
+        {
+            held.push(permit);
+        }
+        assert!(!held.is_empty());
+        held
     }
 }
 

@@ -184,5 +184,6 @@ rm -rf "$D1_WORK"
 log "D1 replay done in $(($(date +%s) - t)) s: $(tail -n 1 "$OUT/replay.log")"
 gzip -f "$OUT/d1-trace.jsonl"
 
-python3 -I "$HERE/report.py" "$OUT" --name "$NAME" ${CPU:+--cpu "$CPU"} >&2
+python3 -I "$HERE/report.py" "$OUT" --name "$NAME" ${CPU:+--cpu "$CPU"} >&2 \
+  || { log "FAILED: the report (native and replay rows written differ beyond the noise, or a bad input): $OUT/results.md"; exit 1; }
 echo "$OUT/results.md"

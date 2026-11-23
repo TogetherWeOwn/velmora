@@ -346,7 +346,7 @@ impl Fx {
     }
 
     /// A complete full read of an extent of `n` articles.
-    async fn pass_of(&self, l: &Lease, backbone: &str, at: UnixMs, n: u32) -> bool {
+    async fn body_pass_of(&self, l: &Lease, backbone: &str, at: UnixMs, n: u32) -> bool {
         self.verify(l, backbone, "p1", at, n, n, VerifyResult::Ok)
             .await
     }
@@ -2177,19 +2177,19 @@ async fn a_release_by_a_verify_job_leaves_the_rows_of_a_release_job() {
     let l = fx.posted(&two, 1, T0).await;
     let l = again(&fx, &two, l).await;
     assert_eq!(l.cursor, 8);
-    assert!(fx.pass_of(&l, "bb-a", T0, 1).await);
+    assert!(fx.body_pass_of(&l, "bb-a", T0, 1).await);
     assert!(fx
         .cat
         .advance(&l, OutboxStage::Release, T0, T0)
         .await
         .unwrap());
     let r = fx.claim(&two, OutboxStage::Release, T0).await.unwrap();
-    assert!(fx.pass_of(&r, "bb-a", at, 1).await);
+    assert!(fx.body_pass_of(&r, "bb-a", at, 1).await);
     // By a verify job, in one.
     let one = fx.publish(&fx.bucket, "one").await;
     let v = fx.posted(&one, 1, T0).await;
     let v = again(&fx, &one, v).await;
-    assert!(fx.pass_of(&v, "bb-a", at, 1).await);
+    assert!(fx.body_pass_of(&v, "bb-a", at, 1).await);
 
     // All but the fence, which counts writes: one here, two there.
     let extent_columns = "safety_state, released_at, release_evidence, hot_safety_bytes, \
@@ -2237,7 +2237,7 @@ async fn a_release_by_a_verify_job_leaves_the_rows_of_a_release_job() {
     // extents taken before either release is refused after it.
     assert_ne!(fx.extent(&one, "evict_seq").await, seq_one);
     assert_ne!(fx.extent(&two, "evict_seq").await, seq_two);
-    // And both are counted as a release (migration 0023).
+    // And both are counted as a release (migration 0025).
     let counted = "SELECT releases_total FROM usage_global WHERE id = 1";
     assert_eq!(fx.count(counted).await, 2);
 }
@@ -4685,7 +4685,9 @@ async fn gc_drops_the_parity_addendum_with_its_plan() {
 /// A replay that replaces a packed plan that cannot be read leaves no
 /// addendum of another plan beside the new one: the record's addendum
 /// goes in when it is one of the new plan, else the row's own when that
-/// is one, else none.
+/// is one, else none. Where the addendum is not the one the row had,
+/// the passes on record go and the claim in flight ends; where it is,
+/// both stay.
 #[tokio::test]
 async fn a_replay_keeps_no_addendum_of_another_plan() {
     use velmora_bridge::replay::ReplayExtent;
@@ -4709,6 +4711,9 @@ async fn a_replay_keeps_no_addendum_of_another_plan() {
                         parity_count = 1 WHERE id = ?1";
         let params = [text(o.extent.as_str()), SqlValue::Blob(on_row.clone())];
         assert_eq!(fx.run(set_plan, &params).await, 1);
+        // A job holds the row, and a pass of three articles is on record.
+        let l = fx.claim(&o, OutboxStage::Post, T0).await.unwrap();
+        fx.pass_of(&l, "bb-a", T0, VerifyKind::Body, 3).await;
         replay.push(ReplayExtent {
             row: extent_rows.remove(0),
             packed: Some(blob.clone()),
@@ -4716,7 +4721,7 @@ async fn a_replay_keeps_no_addendum_of_another_plan() {
             parity: (key == "record").then(|| addendum.clone()),
             safety_present: true,
         });
-        made.push((o, blob, addendum, on_row));
+        made.push((o, blob, addendum, on_row, l));
     }
     let stranded = fx
         .cat
@@ -4724,9 +4729,22 @@ async fn a_replay_keeps_no_addendum_of_another_plan() {
         .await
         .unwrap();
     assert!(stranded.is_empty(), "{stranded:?}");
-    for ((o, blob, addendum, on_row), key) in made.iter().zip(keys) {
+    for ((o, blob, addendum, on_row, l), key) in made.iter().zip(keys) {
         let stored = fx.cat.stored_plan(&o.extent).await.unwrap();
         assert_eq!(stored.packed.as_deref(), Some(&blob[..]), "{key}");
+        let kept = key == "own";
+        let sql = "SELECT COUNT(*) FROM verifications WHERE extent_id = ?1";
+        let passes = fx.cat.sql.0.query(sql, &[text(o.extent.as_str())]).await;
+        assert_eq!(
+            passes.unwrap()[0][0],
+            SqlValue::Int(i64::from(kept)),
+            "{key}"
+        );
+        assert_eq!(
+            fx.cat.renew(l, T0.plus_secs(10)).await.unwrap(),
+            kept,
+            "{key}"
+        );
         let want = match key {
             "stale" => None,
             "own" => Some(&on_row[..]),
@@ -4950,4 +4968,723 @@ async fn the_parity_migration_applies_to_a_catalogue_with_plans() {
     let t = T0.plus_secs(1);
     assert!(fx.cat.mark_posted_many(&post, &all, t).await.unwrap());
     assert_eq!(fx.extent(&packed, "posted_at").await, t.0.to_string());
+}
+
+impl Fx {
+    /// A `TWO_ARTICLES` extent whose packed plan is posted, with one
+    /// parity article when `parity`, claimed for verify at `T0`.
+    async fn posted_packed(&self, key: &str, parity: bool) -> (Obj, Lease) {
+        let o = self.two_articles(key).await;
+        let post = self.claim(&o, OutboxStage::Post, T0).await.unwrap();
+        let (blob, _) = self.seeded(&o, 1);
+        let addendum = parity.then(|| self.addendum(&o, &blob, 7));
+        let all: &[(u32, &str)] = match parity {
+            true => &[(0, "p1"), (1, "p1"), (2, "p1")],
+            false => &[(0, "p1"), (1, "p1")],
+        };
+        self.cat
+            .plan_packed(&post, TWO_ARTICLES, &blob, addendum.as_deref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(self.cat.mark_posted_many(&post, all, T0).await.unwrap());
+        assert!(self
+            .cat
+            .advance(&post, OutboxStage::Verify, T0, T0)
+            .await
+            .unwrap());
+        let l = self.claim(&o, OutboxStage::Verify, T0).await.unwrap();
+        (o, l)
+    }
+
+    /// A pass of `kind` that found `n` articles of `n`.
+    async fn pass_of(&self, l: &Lease, backbone: &str, at: UnixMs, kind: VerifyKind, n: u32) {
+        let v = VerificationRow {
+            extent_id: l.extent.clone(),
+            backbone: backbone.into(),
+            provider_id: format!("p-{backbone}"),
+            verified_at: at,
+            plan_rev: 1,
+            articles_ok: n,
+            articles_total: n,
+            result: VerifyResult::Ok,
+            kind,
+        };
+        assert!(self.cat.record_verification(l, &v).await.unwrap());
+    }
+}
+
+/// A plan with a parity addendum is its data articles and its parity
+/// articles. A pass over the data articles alone, as a version from
+/// before parity records it, is not a complete pass: it counts for no
+/// backbone, is no full check on record, and does not stamp the extent.
+#[tokio::test]
+async fn a_pass_without_the_parity_articles_is_not_a_complete_pass() {
+    let fx = Fx::new().await;
+    let (o, l) = fx.posted_packed("k", true).await;
+    let verified = "SELECT COUNT(*) FROM extents WHERE last_verified_at IS NOT NULL";
+    let counts_for_the_object = || async {
+        let status = fx
+            .cat
+            .object_status(&fx.bucket, "k")
+            .await
+            .unwrap()
+            .unwrap();
+        let backbones = &status.extents[0].backbones;
+        backbones.iter().filter(|b| b.counts).count()
+    };
+
+    fx.pass_of(&l, "bb-a", T0, VerifyKind::Body, 2).await;
+    assert!(fx.counting(&o).await.is_empty());
+    assert!(fx.cat.body_checks(&o.extent).await.unwrap()[0]
+        .counts
+        .eq(&false));
+    assert_eq!(fx.count(verified).await, 0);
+    assert_eq!(counts_for_the_object().await, 0);
+    fx.pass_of(&l, "bb-b", T0, VerifyKind::Stat, 2).await;
+    assert!(fx.counting(&o).await.is_empty());
+
+    fx.pass_of(&l, "bb-a", T0.plus_ms(1), VerifyKind::Body, 3)
+        .await;
+    assert_eq!(fx.counting(&o).await, vec!["bb-a"]);
+    assert!(fx.cat.body_checks(&o.extent).await.unwrap()[0].counts);
+    assert_eq!(fx.count(verified).await, 1);
+    assert_eq!(counts_for_the_object().await, 1);
+    fx.pass_of(&l, "bb-b", T0.plus_ms(1), VerifyKind::Stat, 3)
+        .await;
+    assert_eq!(fx.counting(&o).await, vec!["bb-a", "bb-b"]);
+}
+
+/// The guard of the release counts the parity articles: neither the full
+/// check on record nor a fresh pass is one when it left them out.
+#[tokio::test]
+async fn release_refuses_passes_without_the_parity_articles() {
+    let fx = Fx::new().await;
+    let (o, l) = fx.posted_packed("k", true).await;
+    let counting = labels(&["bb-a", "bb-b"]);
+    // Verified by a version from before parity: the data articles only.
+    fx.pass_of(&l, "bb-a", T0, VerifyKind::Body, 2).await;
+    fx.pass_of(&l, "bb-b", T0, VerifyKind::Stat, 2).await;
+    let later = T0.plus_ms(HOUR_MS);
+    assert!(fx
+        .cat
+        .advance(&l, OutboxStage::Release, later, T0)
+        .await
+        .unwrap());
+    let r = fx.claim(&o, OutboxStage::Release, later).await.unwrap();
+    let lost = |at: UnixMs| {
+        let (cat, r, counting) = (&fx.cat, &r, &counting);
+        async move { cat.begin_release(r, 2, counting, "[]", at).await.unwrap() == Guard::Lost }
+    };
+
+    // Fresh passes over the data articles only.
+    fx.pass_of(&r, "bb-a", later.plus_ms(1), VerifyKind::Stat, 2)
+        .await;
+    fx.pass_of(&r, "bb-b", later.plus_ms(1), VerifyKind::Stat, 2)
+        .await;
+    assert!(lost(later.plus_ms(2)).await, "nothing counted the parity");
+    // Fresh passes over every article, on a full check of the data only.
+    fx.pass_of(&r, "bb-a", later.plus_ms(3), VerifyKind::Stat, 3)
+        .await;
+    fx.pass_of(&r, "bb-b", later.plus_ms(3), VerifyKind::Stat, 3)
+        .await;
+    assert!(lost(later.plus_ms(4)).await, "no full check of the parity");
+    // The full check of every article, and one backbone asked for less.
+    fx.pass_of(&r, "bb-a", later.plus_ms(5), VerifyKind::Body, 3)
+        .await;
+    fx.pass_of(&r, "bb-b", later.plus_ms(5), VerifyKind::Stat, 2)
+        .await;
+    assert!(lost(later.plus_ms(6)).await, "one backbone without parity");
+    assert_eq!(fx.extent(&o, "safety_state").await, "held");
+    assert_eq!(fx.extent(&o, "release_evidence").await, "NULL");
+
+    fx.pass_of(&r, "bb-b", later.plus_ms(7), VerifyKind::Stat, 3)
+        .await;
+    assert!(!lost(later.plus_ms(8)).await);
+    assert_eq!(fx.extent(&o, "safety_state").await, "releasing");
+}
+
+/// Verify and release of a plan with parity run the same statements and
+/// write the same number of rows as of a plan without: a parity article
+/// costs no row.
+#[tokio::test]
+async fn parity_costs_no_row_at_verify_and_release() {
+    let fx = Fx::new().await;
+    // The first release of an hour also opens the hour's row of the usage
+    // counters, once. `first` pays for that, and is not compared.
+    let first = fx.posted_packed("first", false).await;
+    let plain = fx.posted_packed("plain", false).await;
+    let with = fx.posted_packed("with", true).await;
+    let counting = labels(&["bb-a", "bb-b"]);
+    fx.cat.sql.0.meter_writes().unwrap();
+    let mut cost = Vec::new();
+    let mut texts = Vec::new();
+    for ((o, l), n) in [(&first, 2), (&plain, 2), (&with, 3)] {
+        let (rows, at) = (fx.cat.sql.0.writes(), fx.statements());
+        fx.pass_of(l, "bb-a", T0, VerifyKind::Body, n).await;
+        fx.pass_of(l, "bb-b", T0, VerifyKind::Stat, n).await;
+        fx.cat.backbone_status(&o.extent).await.unwrap();
+        fx.cat.body_checks(&o.extent).await.unwrap();
+        let later = T0.plus_ms(HOUR_MS);
+        assert!(fx
+            .cat
+            .advance(l, OutboxStage::Release, later, T0)
+            .await
+            .unwrap());
+        let r = fx.claim(o, OutboxStage::Release, later).await.unwrap();
+        fx.pass_of(&r, "bb-a", later.plus_ms(1), VerifyKind::Stat, n)
+            .await;
+        fx.pass_of(&r, "bb-b", later.plus_ms(1), VerifyKind::Stat, n)
+            .await;
+        let begun = fx
+            .cat
+            .begin_release(&r, 2, &counting, "[]", later.plus_ms(2));
+        assert_eq!(begun.await.unwrap(), Guard::Applied(()));
+        assert!(fx.cat.finish_release(&r, later.plus_ms(2)).await.unwrap());
+        assert_eq!(fx.extent(o, "safety_state").await, "released");
+        let wrote = fx.cat.sql.0.writes().since(&rows);
+        cost.push((wrote.billed(), wrote.writing_statements));
+        let ran = &fx.cat.sql.1.borrow()[at..];
+        texts.push(ran.iter().map(|(sql, _)| sql.clone()).collect::<Vec<_>>());
+    }
+    assert_eq!(cost[1], cost[2], "{cost:?}");
+    assert!(cost[1].0 > 0);
+    assert_eq!(texts[1], texts[2]);
+    assert_eq!(fx.count("SELECT COUNT(*) FROM articles").await, 0);
+}
+
+/// A `done` extent with parity whose passes left the parity articles
+/// out counts on no backbone: it goes back to verify.
+#[tokio::test]
+async fn redrive_requeues_an_extent_verified_without_its_parity() {
+    let fx = Fx::new().await;
+    let mut made = Vec::new();
+    for (key, n) in [("whole", 3), ("data", 2)] {
+        let (o, l) = fx.posted_packed(key, true).await;
+        fx.pass_of(&l, "bb1", T0, VerifyKind::Body, n).await;
+        fx.pass_of(&l, "bb2", T0, VerifyKind::Stat, n).await;
+        assert!(fx.cat.advance(&l, OutboxStage::Done, T0, T0).await.unwrap());
+        made.push(o);
+    }
+    let later = T0.plus_ms(HOUR_MS);
+    assert_eq!(fx.redrive(&["bb1", "bb2"], 2, 100, later).await, 1);
+    assert_eq!(fx.outbox(&made[0], "stage").await, "done");
+    assert_eq!(fx.outbox(&made[1], "stage").await, "verify");
+    assert_eq!(fx.redrive(&["bb1", "bb2"], 2, 100, later).await, 0);
+}
+
+/// A replay puts the addendum of the record back where the one on the
+/// row cannot be read beside its plan, or is not the one the row
+/// counts, and drops the passes on record with it. Where the record has
+/// none that reads, the row stays as it is: its jobs fail, and it is
+/// never taken for an extent without parity.
+#[tokio::test]
+async fn a_replay_restores_an_addendum_that_cannot_be_read() {
+    use velmora_bridge::replay::ReplayExtent;
+    let fx = Fx::new().await;
+    let bucket = fx.cat.bucket_by_name("scratch").await.unwrap().unwrap();
+    let keys = [
+        "sound",
+        "damaged",
+        "miscounted",
+        "gone",
+        "no record",
+        "bad record",
+    ];
+    let mut replay = Vec::new();
+    let mut made = Vec::new();
+    for key in keys {
+        let (o, l) = fx.posted_packed(key, true).await;
+        fx.pass_of(&l, "bb-a", T0, VerifyKind::Body, 3).await;
+        let (_, mut extent_rows) = fx.cat.live_object(&fx.bucket, key).await.unwrap().unwrap();
+        let stored = fx.cat.stored_plan(&o.extent).await.unwrap();
+        let (blob, addendum) = (stored.packed.unwrap(), stored.parity.unwrap());
+        let mut cut = addendum.clone();
+        cut.truncate(40);
+        let id = text(o.extent.as_str());
+        let changed = match key {
+            "sound" => 1,
+            "miscounted" => {
+                let sql = "UPDATE extents SET parity_count = 5 WHERE id = ?1";
+                fx.run(sql, &[id]).await
+            }
+            "gone" => {
+                let sql = "UPDATE extents SET parity = NULL WHERE id = ?1";
+                fx.run(sql, &[id]).await
+            }
+            _ => {
+                let sql = "UPDATE extents SET parity = ?2 WHERE id = ?1";
+                fx.run(sql, &[id, SqlValue::Blob(cut.clone())]).await
+            }
+        };
+        assert_eq!(changed, 1);
+        replay.push(ReplayExtent {
+            row: extent_rows.remove(0),
+            packed: Some(blob),
+            plan: Some(stored.rows),
+            parity: match key {
+                "no record" => None,
+                "bad record" => Some(cut),
+                _ => Some(addendum.clone()),
+            },
+            safety_present: true,
+        });
+        made.push((o, addendum));
+    }
+    for (o, _) in &made[1..] {
+        let stored = fx.cat.stored_plan(&o.extent).await.unwrap();
+        let read = stored.parity_plan(&o.extent, TWO_ARTICLES);
+        let count = fx.extent(o, "parity_count").await;
+        assert!(read.is_err() || count != "1" || stored.parity.is_none());
+    }
+    let left = async |o: &Obj| {
+        (
+            fx.extent(o, "hex(parity)").await,
+            fx.extent(o, "parity_count").await,
+        )
+    };
+    let unrestored = [left(&made[4].0).await, left(&made[5].0).await];
+
+    let stranded = fx
+        .cat
+        .replay_extents(&bucket, &replay, T0.plus_secs(9))
+        .await
+        .unwrap();
+    assert!(stranded.is_empty(), "{stranded:?}");
+    let passes = async |o: &Obj| {
+        let sql = "SELECT COUNT(*) FROM verifications WHERE extent_id = ?1";
+        let rows = fx.cat.sql.0.query(sql, &[text(o.extent.as_str())]).await;
+        rows.unwrap()[0][0].clone()
+    };
+    for ((o, addendum), key) in made.iter().zip(keys) {
+        let stored = fx.cat.stored_plan(&o.extent).await.unwrap();
+        match key {
+            "no record" | "bad record" => {
+                // As it was, and no job takes it.
+                assert!(stored.parity_plan(&o.extent, TWO_ARTICLES).is_err());
+                assert!(unrestored.contains(&left(o).await), "{key}");
+                assert_eq!(passes(o).await, SqlValue::Int(1), "{key}");
+            }
+            _ => {
+                assert_eq!(stored.parity.as_deref(), Some(&addendum[..]), "{key}");
+                assert_eq!(fx.extent(o, "parity_count").await, "1", "{key}");
+                let parity = stored.parity_plan(&o.extent, TWO_ARTICLES).unwrap();
+                assert_eq!(parity.unwrap().articles.len(), 1, "{key}");
+                // A sound row is not written, and keeps its passes.
+                let kept = i64::from(key == "sound");
+                assert_eq!(passes(o).await, SqlValue::Int(kept), "{key}");
+            }
+        }
+        assert_eq!(fx.extent(o, "posted_at IS NOT NULL").await, "1", "{key}");
+    }
+    // Again: nothing changes.
+    let before = fx.dump().await;
+    fx.cat
+        .replay_extents(&bucket, &replay, T0.plus_secs(10))
+        .await
+        .unwrap();
+    assert_eq!(fx.dump().await, before);
+}
+
+/// A backbone whose full read of every article failed is not cleared by
+/// a later full read of the data articles alone, as a version from
+/// before parity records it: that read saw no parity article. `STAT`
+/// answers release nothing there until every article is read in full.
+#[tokio::test]
+async fn a_read_of_the_data_alone_does_not_clear_a_failed_full_read() {
+    let fx = Fx::new().await;
+    let (o, l) = fx.posted_packed("k", true).await;
+    let counting = labels(&["bb-a", "bb-b"]);
+    fx.pass_of(&l, "bb-a", T0, VerifyKind::Body, 3).await;
+    let failed = VerificationRow {
+        extent_id: l.extent.clone(),
+        backbone: "bb-b".into(),
+        provider_id: "p-bb-b".into(),
+        verified_at: T0,
+        plan_rev: 1,
+        articles_ok: 2,
+        articles_total: 3,
+        result: VerifyResult::Corrupt,
+        kind: VerifyKind::Body,
+    };
+    assert!(fx.cat.record_verification(&l, &failed).await.unwrap());
+    fx.pass_of(&l, "bb-b", T0.plus_ms(1), VerifyKind::Body, 2)
+        .await;
+    let later = T0.plus_ms(HOUR_MS);
+    assert!(fx
+        .cat
+        .advance(&l, OutboxStage::Release, later, T0)
+        .await
+        .unwrap());
+    let r = fx.claim(&o, OutboxStage::Release, later).await.unwrap();
+    for backbone in ["bb-a", "bb-b"] {
+        fx.pass_of(&r, backbone, later.plus_ms(1), VerifyKind::Stat, 3)
+            .await;
+    }
+    let at = later.plus_ms(2);
+    let guard = fx.cat.begin_release(&r, 2, &counting, "[]", at).await;
+    assert_eq!(guard.unwrap(), Guard::Lost);
+    assert_eq!(fx.extent(&o, "safety_state").await, "held");
+
+    // Read in full, parity included: the backbone holds a copy again.
+    fx.pass_of(&r, "bb-b", later.plus_ms(3), VerifyKind::Body, 3)
+        .await;
+    let at = later.plus_ms(4);
+    let guard = fx.cat.begin_release(&r, 2, &counting, "[]", at).await;
+    assert_eq!(guard.unwrap(), Guard::Applied(()));
+}
+
+/// The light guard counts a pass only over every article, the parity
+/// articles included: `STAT` answers for the data articles alone release
+/// nothing, with or without the full check asked for. A full check is on
+/// record, so the short answer is all that stands in the way.
+#[tokio::test]
+async fn the_light_guard_refuses_passes_over_the_data_alone() {
+    let fx = Fx::new().await;
+    let (o, l) = fx.posted_packed("k", true).await;
+    let counting = labels(&["bb-a", "bb-b"]);
+    fx.pass_of(&l, "bb-a", T0, VerifyKind::Body, 3).await;
+    let later = T0.plus_ms(HOUR_MS);
+    assert!(fx
+        .cat
+        .advance(&l, OutboxStage::Release, later, T0)
+        .await
+        .unwrap());
+    let r = fx.claim(&o, OutboxStage::Release, later).await.unwrap();
+    // Two data articles and one parity article; `bb-b` answers for two.
+    fx.pass_of(&r, "bb-a", later.plus_ms(1), VerifyKind::Stat, 3)
+        .await;
+    fx.pass_of(&r, "bb-b", later.plus_ms(1), VerifyKind::Stat, 2)
+        .await;
+    let before = fx.dump().await;
+    for need_full in [false, true] {
+        let guard = fx
+            .cat
+            .begin_release_light(&r, 2, &counting, "[]", later.plus_ms(2), need_full);
+        assert_eq!(guard.await.unwrap(), Guard::Lost, "{need_full}");
+    }
+    assert_eq!(fx.dump().await, before, "a refused release wrote something");
+
+    // Every article on both: released, the full check asked for too.
+    fx.pass_of(&r, "bb-b", later.plus_ms(3), VerifyKind::Stat, 3)
+        .await;
+    let guard = fx
+        .cat
+        .begin_release_light(&r, 2, &counting, "[]", later.plus_ms(4), true);
+    assert_eq!(guard.await.unwrap(), Guard::Applied(()));
+}
+
+/// Under the light guard too, a backbone whose latest full read saw the
+/// data articles alone (a pass, as a version from before parity records
+/// it) holds no copy: fresh `STAT` answers for every article release
+/// nothing there until every article is read in full.
+#[tokio::test]
+async fn the_light_guard_refuses_a_full_read_of_the_data_alone() {
+    let fx = Fx::new().await;
+    let (o, l) = fx.posted_packed("k", true).await;
+    let counting = labels(&["bb-a", "bb-b"]);
+    fx.pass_of(&l, "bb-a", T0, VerifyKind::Body, 3).await;
+    fx.pass_of(&l, "bb-b", T0, VerifyKind::Body, 2).await;
+    let later = T0.plus_ms(HOUR_MS);
+    assert!(fx
+        .cat
+        .advance(&l, OutboxStage::Release, later, T0)
+        .await
+        .unwrap());
+    let r = fx.claim(&o, OutboxStage::Release, later).await.unwrap();
+    for backbone in ["bb-a", "bb-b"] {
+        fx.pass_of(&r, backbone, later.plus_ms(1), VerifyKind::Stat, 3)
+            .await;
+    }
+    let before = fx.dump().await;
+    for need_full in [false, true] {
+        let guard = fx
+            .cat
+            .begin_release_light(&r, 2, &counting, "[]", later.plus_ms(2), need_full);
+        assert_eq!(guard.await.unwrap(), Guard::Lost, "{need_full}");
+    }
+    assert_eq!(fx.dump().await, before, "a refused release wrote something");
+    assert_eq!(fx.extent(&o, "safety_state").await, "held");
+
+    // Read in full, parity included: the backbone holds a copy again.
+    fx.pass_of(&r, "bb-b", later.plus_ms(3), VerifyKind::Body, 3)
+        .await;
+    fx.pass_of(&r, "bb-b", later.plus_ms(4), VerifyKind::Stat, 3)
+        .await;
+    let guard = fx
+        .cat
+        .begin_release_light(&r, 2, &counting, "[]", later.plus_ms(5), false);
+    assert_eq!(guard.await.unwrap(), Guard::Applied(()));
+}
+
+/// A parity count that is no number is damage of one row: the replay
+/// goes on, and puts the addendum of the record back with its count.
+#[tokio::test]
+async fn a_replay_survives_a_parity_count_that_is_no_number() {
+    use velmora_bridge::replay::ReplayExtent;
+    let fx = Fx::new().await;
+    let bucket = fx.cat.bucket_by_name("scratch").await.unwrap().unwrap();
+    let mut replay = Vec::new();
+    let mut made = Vec::new();
+    for key in ["damaged", "fraction", "tiny", "huge", "none", "sound"] {
+        let (o, l) = fx.posted_packed(key, true).await;
+        // A full read on record: it speaks for the addendum of now.
+        fx.pass_of(&l, "bb-a", T0, VerifyKind::Body, 3).await;
+        let (_, mut extent_rows) = fx.cat.live_object(&fx.bucket, key).await.unwrap().unwrap();
+        let stored = fx.cat.stored_plan(&o.extent).await.unwrap();
+        replay.push(ReplayExtent {
+            row: extent_rows.remove(0),
+            packed: stored.packed,
+            plan: Some(stored.rows),
+            parity: stored.parity,
+            safety_present: true,
+        });
+        made.push(o);
+    }
+    let sql = "UPDATE extents SET parity_count = 'x' WHERE id = ?1";
+    assert_eq!(fx.run(sql, &[text(made[0].extent.as_str())]).await, 1);
+    assert_eq!(fx.extent(&made[0], "typeof(parity_count)").await, "text");
+    // Nor is a fraction a count: the column takes one as it is.
+    let sql = "UPDATE extents SET parity_count = 1.5 WHERE id = ?1";
+    assert_eq!(fx.run(sql, &[text(made[1].extent.as_str())]).await, 1);
+    assert_eq!(fx.extent(&made[1], "typeof(parity_count)").await, "real");
+    // A fraction at the edge of what a number is.
+    let sql = "UPDATE extents SET parity_count = 5e-324 WHERE id = ?1";
+    assert_eq!(fx.run(sql, &[text(made[2].extent.as_str())]).await, 1);
+    assert_eq!(fx.extent(&made[2], "typeof(parity_count)").await, "real");
+    // A whole number that is no count, and that not every catalogue
+    // connection can carry as a number.
+    let sql = "UPDATE extents SET parity_count = 9007199254740993 WHERE id = ?1";
+    assert_eq!(fx.run(sql, &[text(made[3].extent.as_str())]).await, 1);
+    assert_eq!(fx.extent(&made[3], "typeof(parity_count)").await, "integer");
+    // No count beside an addendum.
+    let sql = "UPDATE extents SET parity_count = NULL WHERE id = ?1";
+    assert_eq!(fx.run(sql, &[text(made[4].extent.as_str())]).await, 1);
+
+    let stranded = fx
+        .cat
+        .replay_extents(&bucket, &replay, T0.plus_secs(9))
+        .await
+        .unwrap();
+    assert!(stranded.is_empty(), "{stranded:?}");
+    for (i, o) in made.iter().enumerate() {
+        assert_eq!(fx.extent(o, "typeof(parity_count)").await, "integer");
+        assert_eq!(fx.extent(o, "parity_count").await, "1");
+        let stored = fx.cat.stored_plan(&o.extent).await.unwrap();
+        let parity = stored.parity_plan(&o.extent, TWO_ARTICLES).unwrap();
+        assert_eq!(parity.unwrap().articles.len(), 1);
+        // A row whose addendum was written again lost its passes: none
+        // speaks for parity articles it did not read. The sound row,
+        // the last, keeps its own.
+        let sql = "SELECT COUNT(*) FROM verifications WHERE extent_id = ?1";
+        let passes = fx
+            .cat
+            .sql
+            .0
+            .query(sql, &[text(o.extent.as_str())])
+            .await
+            .unwrap();
+        let kept = i64::from(i + 1 == made.len());
+        assert_eq!(passes[0][0], SqlValue::Int(kept), "row {i}");
+    }
+}
+
+/// A replay that writes another addendum on an extent ends every claim
+/// on it in the same batch. A job that read the plan before the replay
+/// asked the backbones for the articles of the old addendum: what it
+/// found is not recorded, and it releases nothing. The row is free at
+/// once for a job that reads the plan as it is now.
+#[tokio::test]
+async fn a_replay_that_replaces_an_addendum_ends_the_claims_in_flight() {
+    use velmora_bridge::replay::ReplayExtent;
+    let fx = Fx::new().await;
+    let bucket = fx.cat.bucket_by_name("scratch").await.unwrap().unwrap();
+    let counting = labels(&["bb-a", "bb-b"]);
+    let later = T0.plus_ms(HOUR_MS);
+    // The addendum on the row is damaged, the record has the sound one.
+    let replace = async |o: &Obj, key: &str, at: UnixMs| {
+        let (_, mut extent_rows) = fx.cat.live_object(&fx.bucket, key).await.unwrap().unwrap();
+        let stored = fx.cat.stored_plan(&o.extent).await.unwrap();
+        let (blob, addendum) = (stored.packed.unwrap(), stored.parity.unwrap());
+        let mut cut = addendum.clone();
+        cut.truncate(40);
+        let sql = "UPDATE extents SET parity = ?2 WHERE id = ?1";
+        let id = text(o.extent.as_str());
+        assert_eq!(fx.run(sql, &[id, SqlValue::Blob(cut)]).await, 1);
+        let replay = [ReplayExtent {
+            row: extent_rows.remove(0),
+            packed: Some(blob),
+            plan: Some(stored.rows),
+            parity: Some(addendum.clone()),
+            safety_present: true,
+        }];
+        let stranded = fx.cat.replay_extents(&bucket, &replay, at).await.unwrap();
+        assert!(stranded.is_empty());
+        let stored = fx.cat.stored_plan(&o.extent).await.unwrap();
+        assert_eq!(stored.parity, Some(addendum));
+        // Again: the claim taken since is not ended a second time.
+        replay
+    };
+    let passes = async |o: &Obj| {
+        let sql = "SELECT COUNT(*) FROM verifications WHERE extent_id = ?1";
+        let rows = fx.cat.sql.0.query(sql, &[text(o.extent.as_str())]).await;
+        rows.unwrap()[0][0].clone()
+    };
+    let pass = |l: &Lease, backbone: &str, at: UnixMs, kind: VerifyKind| VerificationRow {
+        extent_id: l.extent.clone(),
+        backbone: backbone.into(),
+        provider_id: format!("p-{backbone}"),
+        verified_at: at,
+        plan_rev: 1,
+        articles_ok: 3,
+        articles_total: 3,
+        result: VerifyResult::Ok,
+        kind,
+    };
+
+    // A verify job in flight: its full read is of the old addendum.
+    let (o, l) = fx.posted_packed("verify", true).await;
+    // It had passed the first backbone: its resume point says so.
+    assert!(fx.cat.set_cursor(&l, 8, T0).await.unwrap());
+    let replay = replace(&o, "verify", T0.plus_secs(1)).await;
+    let read = pass(&l, "bb-a", T0.plus_secs(2), VerifyKind::Body);
+    assert!(!fx.cat.record_verification(&l, &read).await.unwrap());
+    assert!(!fx
+        .cat
+        .advance(&l, OutboxStage::Release, later, T0)
+        .await
+        .unwrap());
+    assert_eq!(passes(&o).await, SqlValue::Int(0));
+    assert_eq!(fx.extent(&o, "last_verified_at").await, "NULL");
+    // The row is where it was and free: the next job has it at once.
+    let again = fx.claim(&o, OutboxStage::Verify, T0.plus_secs(2)).await;
+    let again = again.expect("the row is free");
+    assert_ne!(again.token, l.token);
+    // It starts at the first backbone: the pass it had there is gone.
+    assert_eq!(again.cursor, 0);
+    // A second replay of the same record changes nothing: the claim
+    // taken since stands.
+    let at = T0.plus_secs(3);
+    fx.cat.replay_extents(&bucket, &replay, at).await.unwrap();
+    let read = pass(&again, "bb-a", at, VerifyKind::Body);
+    assert!(fx.cat.record_verification(&again, &read).await.unwrap());
+
+    // A release job in flight, under the light check and outside the
+    // sample: its `STAT` answers are for the old addendum.
+    let (o, l) = fx.posted_packed("release", true).await;
+    fx.pass_of(&l, "bb-a", T0, VerifyKind::Stat, 3).await;
+    fx.pass_of(&l, "bb-b", T0, VerifyKind::Stat, 3).await;
+    assert!(fx
+        .cat
+        .advance(&l, OutboxStage::Release, later, T0)
+        .await
+        .unwrap());
+    let r = fx.claim(&o, OutboxStage::Release, later).await.unwrap();
+    replace(&o, "release", later.plus_ms(1)).await;
+    for backbone in ["bb-a", "bb-b"] {
+        let found = pass(&r, backbone, later.plus_ms(2), VerifyKind::Stat);
+        assert!(!fx.cat.record_verification(&r, &found).await.unwrap());
+    }
+    let begun = fx
+        .cat
+        .begin_release_light(&r, 2, &counting, "[]", later.plus_ms(3), false)
+        .await
+        .unwrap();
+    assert_eq!(begun, Guard::Lost);
+    assert_eq!(passes(&o).await, SqlValue::Int(0));
+    assert_eq!(fx.extent(&o, "safety_state").await, "held");
+    assert_eq!(fx.extent(&o, "release_evidence").await, "NULL");
+
+    // A release decided and not yet finished: the last step is refused.
+    let (o, l) = fx.posted_packed("finish", true).await;
+    fx.pass_of(&l, "bb-a", T0, VerifyKind::Body, 3).await;
+    fx.pass_of(&l, "bb-b", T0, VerifyKind::Stat, 3).await;
+    assert!(fx
+        .cat
+        .advance(&l, OutboxStage::Release, later, T0)
+        .await
+        .unwrap());
+    let r = fx.claim(&o, OutboxStage::Release, later).await.unwrap();
+    fx.pass_of(&r, "bb-a", later.plus_ms(1), VerifyKind::Stat, 3)
+        .await;
+    fx.pass_of(&r, "bb-b", later.plus_ms(1), VerifyKind::Stat, 3)
+        .await;
+    let at = later.plus_ms(2);
+    let begun = fx
+        .cat
+        .begin_release(&r, 2, &counting, "[]", at)
+        .await
+        .unwrap();
+    assert_eq!(begun, Guard::Applied(()));
+    replace(&o, "finish", later.plus_ms(3)).await;
+    assert!(!fx.cat.finish_release(&r, later.plus_ms(4)).await.unwrap());
+    assert_eq!(fx.extent(&o, "safety_state").await, "releasing");
+    assert_eq!(fx.extent(&o, "released_at").await, "NULL");
+}
+
+/// A release that was decided and not finished is withdrawn under the
+/// release lease, which is kept: the extent is `held` again without
+/// evidence, and the same job decides again. A lease that no longer
+/// holds the row, or has run out, withdraws nothing.
+#[tokio::test]
+async fn a_release_decision_is_withdrawn_only_under_its_lease() {
+    let fx = Fx::new().await;
+    let (o, l) = fx.posted_packed("k", true).await;
+    let counting = labels(&["bb-a", "bb-b"]);
+    fx.pass_of(&l, "bb-a", T0, VerifyKind::Body, 3).await;
+    fx.pass_of(&l, "bb-b", T0, VerifyKind::Stat, 3).await;
+    let later = T0.plus_ms(HOUR_MS);
+    assert!(fx
+        .cat
+        .advance(&l, OutboxStage::Release, later, T0)
+        .await
+        .unwrap());
+    let died = fx.claim(&o, OutboxStage::Release, later).await.unwrap();
+    for backbone in ["bb-a", "bb-b"] {
+        let at = later.plus_ms(1);
+        fx.pass_of(&died, backbone, at, VerifyKind::Stat, 3).await;
+    }
+    let at = later.plus_ms(2);
+    let begun = fx.cat.begin_release(&died, 2, &counting, "[1]", at).await;
+    assert_eq!(begun.unwrap(), Guard::Applied(()));
+    assert_eq!(fx.extent(&o, "safety_state").await, "releasing");
+    let seq = fx.extent(&o, "evict_seq").await;
+
+    // The next job takes the row over once the lease has run out.
+    let next = later.plus_ms(LEASE_MS + 1);
+    let r = fx.claim(&o, OutboxStage::Release, next).await.unwrap();
+    let before = fx.dump().await;
+    assert!(!fx.cat.reopen_release(&died, next).await.unwrap());
+    let expired = next.plus_ms(LEASE_MS + 1);
+    assert!(!fx.cat.reopen_release(&r, expired).await.unwrap());
+    assert_eq!(fx.dump().await, before);
+
+    assert!(fx.cat.reopen_release(&r, next).await.unwrap());
+    assert_eq!(fx.extent(&o, "safety_state").await, "held");
+    assert_eq!(fx.extent(&o, "release_evidence").await, "NULL");
+    assert_eq!(fx.extent(&o, "released_at").await, "NULL");
+    assert_ne!(fx.extent(&o, "evict_seq").await, seq);
+    // Again: nothing to withdraw, and nothing changes.
+    let before = fx.dump().await;
+    assert!(fx.cat.reopen_release(&r, next).await.unwrap());
+    assert_eq!(fx.dump().await, before);
+
+    // The passes of the job that died are from before this claim: they
+    // release nothing. The lease was kept, so this job records its own.
+    let lost = fx
+        .cat
+        .begin_release(&r, 2, &counting, "[2]", next.plus_ms(1));
+    assert_eq!(lost.await.unwrap(), Guard::Lost);
+    assert_eq!(fx.extent(&o, "safety_state").await, "held");
+    for backbone in ["bb-a", "bb-b"] {
+        let at = next.plus_ms(2);
+        fx.pass_of(&r, backbone, at, VerifyKind::Stat, 3).await;
+    }
+    let begun = fx
+        .cat
+        .begin_release(&r, 2, &counting, "[2]", next.plus_ms(3));
+    assert_eq!(begun.await.unwrap(), Guard::Applied(()));
+    assert_eq!(fx.extent(&o, "release_evidence").await, "[2]");
+    assert!(fx.cat.finish_release(&r, next.plus_ms(4)).await.unwrap());
+    assert_eq!(fx.extent(&o, "safety_state").await, "released");
 }

@@ -231,6 +231,21 @@ pub fn classify<'a>(method: &Method, raw_target: &'a str) -> Route<'a> {
     }
 }
 
+/// Seed diagnostics before ingress or Worker configuration can fail.
+/// The target only selects the route; it is never stored in the observation.
+pub fn initial_observation(method: &str, target: &str) -> crate::metrics::RequestObservation {
+    let mut observed = crate::metrics::RequestObservation::default();
+    if method == "POST"
+        && matches!(
+            classify(&Method::Post, target),
+            Route::CompleteMultipartUpload { .. }
+        )
+    {
+        observed.mark_complete_multipart();
+    }
+    observed
+}
+
 impl<C, B, N, J, K, T> Bridge<C, B, N, J, K, T>
 where
     C: Catalog,
@@ -245,19 +260,32 @@ where
     where
         Self: 'static,
     {
+        self.handle_observed(req, &mut crate::metrics::RequestObservation::default())
+            .await
+    }
+
+    /// As `handle`, with redacted failure diagnostics for the request datapoint.
+    pub async fn handle_observed(
+        self: Rc<Self>,
+        req: S3Request,
+        observed: &mut crate::metrics::RequestObservation,
+    ) -> S3Response
+    where
+        Self: 'static,
+    {
         let target = req.raw_target.clone();
         // A sub-range of a large GET, asked for by another invocation of
         // this Worker. It is told apart by its target alone and admitted
         // by its token alone, before any S3 routing.
         if crate::fanout::is_internal_target(&target) {
-            return get::fanout_piece(&self, req).await;
+            return get::fanout_piece(&self, req, observed).await;
         }
         match classify(&req.method, &target) {
             Route::Admin { rest } => admin::handle(&self, req, rest).await,
             Route::ListBuckets => list::list_buckets(&self, req).await,
             Route::CreateBucket { bucket } => {
                 if bucket::is_sigv4(&req) {
-                    bucket::create_bucket_signed(&self, req).await
+                    bucket::create_bucket_signed(&self, req, observed).await
                 } else {
                     admin::create_bucket_s3(&self, req, bucket).await
                 }
@@ -276,23 +304,22 @@ where
             Route::ListParts { bucket, key } => {
                 multipart_list::list_parts(&self, req, bucket, key).await
             }
-            Route::HeadBucket { .. } => bucket::head_bucket(&self, req).await,
+            Route::HeadBucket { .. } => bucket::head_bucket(&self, req, observed).await,
             Route::GetBucketLocation { .. } => bucket::get_bucket_location(&self, req).await,
             Route::ListObjects { bucket } => list::list_objects(&self, req, bucket).await,
-            Route::PutObject { bucket, key } => put::put_object(&self, req, bucket, key).await,
-            Route::GetObject { bucket, key } => get::get_object(&self, req, bucket, key).await,
-            Route::HeadObject { bucket, key } => get::head_object(&self, req, bucket, key).await,
+            Route::PutObject { .. } => put::put_object(&self, req, observed).await,
+            Route::GetObject { .. } => get::get_object(&self, req, observed).await,
+            Route::HeadObject { .. } => get::head_object(&self, req, observed).await,
             Route::DeleteObject { bucket, key } => {
                 delete::delete_object(&self, req, bucket, key).await
             }
             Route::CreateMultipartUpload { bucket, key } => {
                 multipart::create(&self, req, bucket, key).await
             }
-            Route::UploadPart { bucket, key } => {
-                multipart::upload_part(&self, req, bucket, key).await
-            }
-            Route::CompleteMultipartUpload { bucket, key } => {
-                multipart::complete(&self, req, bucket, key).await
+            Route::UploadPart { .. } => multipart::upload_part(&self, req, observed).await,
+            Route::CompleteMultipartUpload { .. } => {
+                observed.mark_complete_multipart();
+                multipart::complete(&self, req, observed).await
             }
             Route::AbortMultipartUpload { bucket, key } => {
                 multipart::abort(&self, req, bucket, key).await

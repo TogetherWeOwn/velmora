@@ -24,10 +24,11 @@ use super::common::{
 use crate::crypto::{cipher_span, open_range, unwrap_bdk};
 use crate::fanout::{admit, Fanout, Grant, TOKEN_TTL_MS};
 use crate::fetch::{
-    cold_fetch_bytes, cold_poll_ms, cold_read_bytes, cold_step_bytes, ColdFetch, ColdReader,
-    COLD_WAIT_MS,
+    beside, cold_fetch_bytes, cold_poll_ms, cold_read_bytes, cold_rebuild_most, cold_step_bytes,
+    ColdFetch, ColdReader, COLD_WAIT_MS,
 };
 use crate::ingress::{ByteBudget, Charge, Spawner, CHARGE_WAIT_MS};
+use crate::metrics::{GetFailureStage as Stage, GetObservation};
 use crate::ports::{BlobStore, Bridge, Catalog, Clock, JobSink, Kek, NntpConnector};
 use crate::types::{
     BridgeError, Bucket, ByteSpan, ExtentId, ExtentRow, RespBody, Result, S3Request, S3Response,
@@ -45,6 +46,14 @@ thread_local! {
     /// extent costs one catalogue statement an hour instead of one per
     /// read. The catalogue applies the same gap across isolates.
     static STAMPED: RefCell<HashMap<String, i64>> = RefCell::new(HashMap::new());
+}
+
+/// Whether a stamp `at` this isolate remembers is recent enough at `now`
+/// to skip the catalogue. The stamp is the catalogue's, written by any
+/// invocation or isolate, so it can be a moment ahead of this clock: that
+/// is recent, not a reason to stamp again (see [`UnixMs::within`]).
+fn stamped_recently(now: UnixMs, at: i64) -> bool {
+    now.within(UnixMs(at), READ_STAMP_MS)
 }
 
 /// Records that `extent` served a read, for the eviction order. Best
@@ -67,7 +76,7 @@ async fn stamp_read<C, B, N, J, K, T>(
     let recent = STAMPED.with(|memo| {
         memo.borrow()
             .get(extent.as_str())
-            .is_some_and(|&at| (0..READ_STAMP_MS).contains(&(now.0 - at)))
+            .is_some_and(|&at| stamped_recently(now, at))
     });
     if recent {
         return;
@@ -98,28 +107,46 @@ struct Piece {
 
 /// Why a piece could not be produced.
 enum ReadFail {
-    /// Out of byte budget or provider slots: `503 SlowDown`.
-    Busy,
+    /// Out of byte budget or provider slots, or interrupted: `503 SlowDown`.
+    Busy(Stage),
     /// No source holds the extent intact: `503 ServiceUnavailable`.
-    Unavailable,
-    Internal,
+    Unavailable(Stage),
+    Internal(Stage),
 }
 
 impl ReadFail {
+    fn cold_error(error: BridgeError) -> Self {
+        Self::Internal(match error {
+            BridgeError::Sql(_) | BridgeError::GuardFailed => Stage::Lookup,
+            BridgeError::Blob(_) => Stage::R2,
+            BridgeError::Nntp(_) => Stage::Nntp,
+            BridgeError::Crypto(_) => Stage::Decrypt,
+            _ => Stage::Other,
+        })
+    }
+
+    fn stage(&self) -> Stage {
+        match *self {
+            Self::Busy(stage) | Self::Unavailable(stage) | Self::Internal(stage) => stage,
+        }
+    }
+
     fn response(&self) -> S3Response {
         match self {
-            ReadFail::Busy => s3_error(ErrorCode::SlowDown),
-            ReadFail::Unavailable => unavailable(),
-            ReadFail::Internal => internal(),
+            ReadFail::Busy(_) => s3_error(ErrorCode::SlowDown),
+            ReadFail::Unavailable(_) => unavailable(),
+            ReadFail::Internal(_) => internal(),
         }
     }
 
     /// The error that ends a body stream already in flight.
     fn stream_error(&self) -> BridgeError {
         match self {
-            ReadFail::Busy => BridgeError::Invalid("read interrupted: busy"),
-            ReadFail::Unavailable => BridgeError::Invalid("read interrupted: extent unavailable"),
-            ReadFail::Internal => BridgeError::Invalid("read interrupted"),
+            ReadFail::Busy(_) => BridgeError::Invalid("read interrupted: busy"),
+            ReadFail::Unavailable(_) => {
+                BridgeError::Invalid("read interrupted: extent unavailable")
+            }
+            ReadFail::Internal(_) => BridgeError::Invalid("read interrupted"),
         }
     }
 }
@@ -134,10 +161,9 @@ pub(super) async fn get_object<
 >(
     bridge: &Rc<Bridge<C, B, N, J, K, T>>,
     req: S3Request,
-    _bucket: &str,
-    _key: &str,
+    observed: &mut GetObservation,
 ) -> S3Response {
-    match read(bridge, req, false).await {
+    match read(bridge, req, false, observed).await {
         Ok(resp) | Err(resp) => resp,
     }
 }
@@ -152,10 +178,9 @@ pub(super) async fn head_object<
 >(
     bridge: &Rc<Bridge<C, B, N, J, K, T>>,
     req: S3Request,
-    _bucket: &str,
-    _key: &str,
+    observed: &mut GetObservation,
 ) -> S3Response {
-    match read(bridge, req, true).await {
+    match read(bridge, req, true, observed).await {
         Ok(resp) => resp,
         // A HEAD response has no body, errors included.
         Err(mut resp) => {
@@ -275,9 +300,12 @@ async fn read<
     bridge: &Rc<Bridge<C, B, N, J, K, T>>,
     req: S3Request,
     head: bool,
+    observed: &mut GetObservation,
 ) -> core::result::Result<S3Response, S3Response> {
+    observed.mark_stage(Stage::Auth);
     let authed = authenticate(bridge, &req).await?;
     let (bucket, key) = authed.object()?;
+    observed.mark_stage(Stage::Lookup);
     let Some(generation) = bridge
         .catalog
         .live_generation(&bucket.id, key)
@@ -287,6 +315,8 @@ async fn read<
         return Err(s3_error(ErrorCode::NoSuchKey));
     };
 
+    observed.record_size(generation.size);
+    observed.mark_stage(if head { Stage::Other } else { Stage::Plan });
     let metadata = ObjectMetadata::new(
         generation.id.as_str().to_owned(),
         generation.size,
@@ -351,12 +381,21 @@ async fn read<
         .start
         .checked_add(range.length())
         .ok_or_else(internal)?;
+    observed.mark_stage(Stage::Lookup);
     let extents = bridge
         .catalog
         .extents_in(&generation.id, range.start, end)
         .await
         .map_err(|_| internal())?;
-    resp.body = body(bridge, bucket.clone(), extents, range.start, range.length()).await?;
+    resp.body = body(
+        bridge,
+        bucket.clone(),
+        extents,
+        range.start,
+        range.length(),
+        observed,
+    )
+    .await?;
     Ok(resp)
 }
 
@@ -374,11 +413,13 @@ pub(super) async fn fanout_piece<
 >(
     bridge: &Rc<Bridge<C, B, N, J, K, T>>,
     req: S3Request,
+    observed: &mut GetObservation,
 ) -> S3Response {
     let Ok(grant) = admit(&bridge.kek, &req, bridge.clock.now()) else {
+        observed.mark_stage(Stage::Grant);
         return s3_error(ErrorCode::AccessDenied);
     };
-    match granted(bridge, &grant).await {
+    match granted(bridge, &grant, observed).await {
         Ok(resp) | Err(resp) => resp,
     }
 }
@@ -393,20 +434,25 @@ async fn granted<
 >(
     bridge: &Rc<Bridge<C, B, N, J, K, T>>,
     grant: &Grant,
+    observed: &mut GetObservation,
 ) -> core::result::Result<S3Response, S3Response> {
     // The grant was minted for a generation that existed and a range
     // inside it; anything else here is a fault, not a client error.
-    let (bucket, generation) = bridge
+    observed.mark_stage(Stage::Lookup);
+    let generation = bridge
         .catalog
         .generation_by_id(&grant.bucket, &grant.generation)
         .await
-        .map_err(|_| internal())?
-        .ok_or_else(internal)?;
+        .map_err(|_| internal())?;
+    observed.mark_stage(Stage::Grant);
+    let (bucket, generation) = generation.ok_or_else(internal)?;
+    observed.record_size(generation.size);
     let end = grant
         .start
         .checked_add(grant.len)
         .filter(|&end| end <= generation.size)
         .ok_or_else(internal)?;
+    observed.mark_stage(Stage::Lookup);
     let extents = bridge
         .catalog
         .extents_in(&generation.id, grant.start, end)
@@ -418,7 +464,7 @@ async fn granted<
             ("content-length".into(), grant.len.to_string()),
             ("content-type".into(), "application/octet-stream".into()),
         ],
-        body: body(bridge, bucket, extents, grant.start, grant.len).await?,
+        body: body(bridge, bucket, extents, grant.start, grant.len, observed).await?,
     })
 }
 
@@ -437,7 +483,9 @@ async fn body<
     extents: Vec<ExtentRow>,
     start: u64,
     len: u64,
+    observed: &mut GetObservation,
 ) -> core::result::Result<RespBody, S3Response> {
+    observed.mark_stage(Stage::Plan);
     let todo = pieces(extents, start, len).ok_or_else(internal)?;
     if todo.is_empty() {
         return Err(internal());
@@ -456,8 +504,14 @@ async fn body<
     // object that cannot be read is an error response, not a cut-off 200.
     let first = match items.next().await {
         Some(Ok(held)) => held,
-        Some(Err(fail)) => return Err(fail.response()),
-        None => return Err(internal()),
+        Some(Err(fail)) => {
+            observed.mark_stage(fail.stage());
+            return Err(fail.response());
+        }
+        None => {
+            observed.mark_stage(Stage::Other);
+            return Err(internal());
+        }
     };
     Ok(RespBody::Stream(
         stream::once(async move { Ok(first) })
@@ -671,20 +725,6 @@ impl<T> Drop for Driven<T> {
     }
 }
 
-/// Runs `f` and, beside it, the cache write that is under way, if any.
-async fn beside<F: Future>(put: &mut Option<LocalBoxFuture<'_, ()>>, f: F) -> F::Output {
-    let mut f = core::pin::pin!(f);
-    poll_fn(|cx| {
-        if let Some(writing) = put.as_mut() {
-            if writing.as_mut().poll(cx).is_ready() {
-                *put = None;
-            }
-        }
-        f.as_mut().poll(cx)
-    })
-    .await
-}
-
 /// Produces the pieces of one body in order. The connections to Usenet
 /// stay open from one cold extent to the next, and the cache write of an
 /// extent runs while the next one is read (see [`Cold`]).
@@ -712,6 +752,8 @@ async fn relay<C, B, N, J, K, T>(
     // the reader asks for a piece soon after it took the one before.
     let mut eager = can_run_ahead;
     for (at, piece) in todo.iter().enumerate() {
+        // A piece taken back after a client stall is still the same read.
+        let mut first_eligible_at = None;
         loop {
             if out.ahead() && !eager && !out.is_wanted() {
                 // Nothing is held while the reader is busy: neither a
@@ -720,7 +762,8 @@ async fn relay<C, B, N, J, K, T>(
                 out.wanted().await;
             }
             cold.mid = at > 0;
-            let item = cold.piece(&bucket, piece).await;
+            let first = *first_eligible_at.get_or_insert_with(|| bridge.clock.now());
+            let item = cold.piece(&bucket, piece, first).await;
             let failed = item.is_err();
             // Before the last item and before an error: the reader of
             // the body may never ask again after either, and the last
@@ -798,6 +841,7 @@ pub(super) async fn read_range<C, B, N, J, K, T>(
     extents: Vec<ExtentRow>,
     start: u64,
     len: u64,
+    observed: &mut GetObservation,
 ) -> core::result::Result<(Vec<u8>, Charge), S3Response>
 where
     C: Catalog,
@@ -809,39 +853,56 @@ where
 {
     let todo = pieces(extents, start, len).ok_or_else(internal)?;
     // A cold extent comes back whole and needs twice its size while it
-    // does. Beside the pieces already held that can be more than the
+    // does, and more if articles of it are lost and rebuilt from its
+    // parity. Beside the pieces already held that can be more than the
     // budget has, however long the read waits. Such an extent is read
     // once on its own first: that leaves it in the cache, and the read
     // below then needs room for its piece only.
     let mut held = 0u64;
-    for piece in &todo {
-        let cold = cold_read_bytes(piece.extent.cipher_size, bridge.cfg.cold_sockets);
+    let mut prewarmed_at = vec![None; todo.len()];
+    for (piece, first_eligible_at) in todo.iter().zip(&mut prewarmed_at) {
+        let (size, sockets) = (piece.extent.cipher_size, bridge.cfg.cold_sockets);
+        // Whether the extent has parity, and lost anything, is not
+        // known before it is read: the most a rebuild of it may hold.
+        let rebuilt = cold_step_bytes(size, sockets).saturating_add(cold_rebuild_most(size));
+        let cold = cold_read_bytes(size, sockets).max(rebuilt);
         if held > 0 && held.saturating_add(cold) > bridge.budget.capacity() {
             drop(
-                read_piece(bridge, bucket, piece)
-                    .await
-                    .map_err(|fail| fail.response())?,
+                read_piece(
+                    bridge,
+                    bucket,
+                    piece,
+                    *first_eligible_at.insert(bridge.clock.now()),
+                )
+                .await
+                .map_err(|fail| {
+                    observed.mark_stage(fail.stage());
+                    fail.response()
+                })?,
             );
         }
         held = held.saturating_add(piece.len);
     }
     let mut parts = Vec::with_capacity(todo.len());
-    for piece in &todo {
+    for (piece, prewarmed) in todo.iter().zip(prewarmed_at) {
+        let first_eligible_at = prewarmed.unwrap_or_else(|| bridge.clock.now());
         parts.push(
-            read_piece(bridge, bucket, piece)
+            read_piece(bridge, bucket, piece, first_eligible_at)
                 .await
-                .map_err(|fail| fail.response())?,
+                .map_err(|fail| {
+                    observed.mark_stage(fail.stage());
+                    fail.response()
+                })?,
         );
     }
     if parts.len() == 1 {
         return parts.pop().ok_or_else(internal);
     }
     // Several pieces: they and the joined copy are live together.
-    let held = bridge
-        .budget
-        .charge(len)
-        .await
-        .map_err(|_| ReadFail::Busy.response())?;
+    let held = bridge.budget.charge(len).await.map_err(|_| {
+        observed.mark_stage(Stage::Budget);
+        ReadFail::Busy(Stage::Budget).response()
+    })?;
     let mut out = Vec::with_capacity(usize::try_from(len).map_err(|_| internal())?);
     for (bytes, _) in &parts {
         out.extend_from_slice(bytes);
@@ -902,6 +963,7 @@ async fn read_piece<C, B, N, J, K, T>(
     bridge: &Bridge<C, B, N, J, K, T>,
     bucket: &Bucket,
     piece: &Piece,
+    first_eligible_at: UnixMs,
 ) -> Item
 where
     C: Catalog,
@@ -912,7 +974,7 @@ where
     T: Clock,
 {
     let mut cold = Cold::new(bridge);
-    let item = cold.piece(bucket, piece).await;
+    let item = cold.piece(bucket, piece, first_eligible_at).await;
     cold.end().await;
     item
 }
@@ -968,7 +1030,8 @@ const MID_BODY_WAITS: u32 = 3;
 struct Spent {
     /// Asking the cache and the safety copy first.
     warm: Cell<i64>,
-    /// Reading extents from Usenet.
+    /// Reading extents from Usenet, including a rebuild's wait for
+    /// the previous cache write when it holds the room the rebuild needs.
     read: Cell<i64>,
     /// Waiting for the cache write before, or for room in the budget.
     wait: Cell<i64>,
@@ -1076,8 +1139,11 @@ where
             }
             self.hang_up().await;
         }
-        if let Some(writing) = self.put.take() {
+        // A timed charge can stop waiting here; leave the write in
+        // place for the reader's cleanup unless it has finished.
+        if let Some(writing) = self.put.as_mut() {
             writing.await;
+            self.put = None;
         }
     }
 
@@ -1110,7 +1176,7 @@ where
         spent
             .wait
             .set(spent.wait.get() + bridge.clock.now().0 - began.0);
-        room.map_err(|_| ReadFail::Busy)
+        room.map_err(|_| ReadFail::Busy(Stage::Budget))
     }
 
     /// Room for reading one extent: all of `need` when no cache write
@@ -1185,22 +1251,22 @@ where
                     break;
                 };
                 drop(src);
-                let held = retain(&room, work, plain).ok_or(ReadFail::Internal)?;
+                let held = retain(&room, work, plain).ok_or(ReadFail::Internal(Stage::Budget))?;
                 self.wait(stamp_read(bridge, &extent.id, from_cache)).await;
                 return Ok(held);
             }
         }
-        Err(ReadFail::Unavailable)
+        Err(ReadFail::Unavailable(Stage::R2))
     }
 
-    async fn piece(&mut self, bucket: &Bucket, piece: &Piece) -> Item {
+    async fn piece(&mut self, bucket: &Bucket, piece: &Piece, first_eligible_at: UnixMs) -> Item {
         let bridge = self.bridge;
         let extent = &piece.extent;
         self.until = None;
-        let span =
-            cipher_span(extent.plain_size, piece.off, piece.len).ok_or(ReadFail::Internal)?;
+        let span = cipher_span(extent.plain_size, piece.off, piece.len)
+            .ok_or(ReadFail::Internal(Stage::Plan))?;
         match self.warm(bucket, piece, span).await {
-            Err(ReadFail::Unavailable) => {}
+            Err(ReadFail::Unavailable(_)) => {}
             found => {
                 // Idle connections would outlive their slots.
                 self.hang_up().await;
@@ -1233,18 +1299,37 @@ where
         // filled it in the meantime.
         let waiter = WAITERS.fetch_add(1, Ordering::Relaxed);
         let deadline = bridge.clock.now().plus_ms(i64::from(COLD_WAIT_MS));
+        let remaining = |slept| {
+            (deadline.0 - bridge.clock.now().0).min(i64::from(COLD_WAIT_MS.saturating_sub(slept)))
+        };
         self.until = Some(deadline);
         let mut slept = 0u32;
         let mut attempt = 0u64;
         let mut interrupted = 0u32;
+        // The largest known rebuild shortfall, kept across this
+        // piece's retries. A later Busy for slots says nothing about
+        // how much room the rebuild still needs.
+        let mut rebuild = 0u64;
+        let mut spare: Option<Charge> = None;
         loop {
             let reader = match &mut self.reader {
                 Some(reader) => reader,
-                none => none.insert(bridge.cold_reader().map_err(|_| ReadFail::Internal)?),
+                // A rebuild from parity is charged to this request.
+                none => none.insert(
+                    bridge
+                        .cold_reader()
+                        .map_err(ReadFail::cold_error)?
+                        .charged_to(Rc::clone(&room)),
+                ),
             };
-            let fetched = Spent::time(&bridge.clock, &self.spent.read, reader.fetch(extent));
-            let read = beside(&mut self.put, fetched).await;
-            match read {
+            if let Some(spare) = spare.take() {
+                reader.fund(spare);
+            }
+            let fetched = reader.fetch_beside(extent, &mut self.put, first_eligible_at);
+            let read = Spent::time(&bridge.clock, &self.spent.read, fetched).await;
+            let shortfall = reader.settle();
+            rebuild = rebuild.max(shortfall);
+            let wait_stage = match read {
                 Ok(ColdFetch::Filled(cipher)) => {
                     // One cache write at a time.
                     let began = bridge.clock.now();
@@ -1264,13 +1349,16 @@ where
                             None => {
                                 drop(cipher);
                                 drop(work);
-                                work = self.charge(need).await?;
+                                work = self.charge(need.saturating_add(rebuild)).await?;
+                                if rebuild > 0 {
+                                    spare = Some(work.split_off(rebuild));
+                                }
                                 continue;
                             }
                         }
                     }
                     let plain = open(&bridge.kek, bucket, piece, 0, &cipher)
-                        .ok_or(ReadFail::Unavailable)?;
+                        .ok_or(ReadFail::Unavailable(Stage::Decrypt))?;
                     // The charge is split between the plaintext, which
                     // leaves with the piece, and the ciphertext, which
                     // stays until it is written. Nothing runs between the
@@ -1279,7 +1367,7 @@ where
                     drop(work);
                     let held = room
                         .try_charge(plain.len() as u64)
-                        .ok_or(ReadFail::Internal)?;
+                        .ok_or(ReadFail::Internal(Stage::Budget))?;
                     if let Some(copy) = room.try_charge(cipher.len() as u64) {
                         let (extent, spent) = (extent.clone(), Rc::clone(&self.spent));
                         let write = async move {
@@ -1293,22 +1381,47 @@ where
                     }
                     return Ok((plain, held));
                 }
-                Ok(ColdFetch::Busy) => {}
+                Ok(ColdFetch::Busy) if shortfall > 0 => Stage::Budget,
+                Ok(ColdFetch::Busy) => Stage::SlotWait,
                 // Every provider that was asked broke off (a proxy that
                 // went away, a provider that hung up): the read is tried
                 // again after a wait, on new connections, a few times.
-                Ok(ColdFetch::Interrupted) if interrupted < INTERRUPTED_RETRIES => interrupted += 1,
-                Ok(ColdFetch::Interrupted) => return Err(ReadFail::Busy),
-                Ok(ColdFetch::Unavailable) => return Err(ReadFail::Unavailable),
-                Err(_) => return Err(ReadFail::Internal),
-            }
+                Ok(ColdFetch::Interrupted) if interrupted < INTERRUPTED_RETRIES => {
+                    interrupted += 1;
+                    Stage::Nntp
+                }
+                Ok(ColdFetch::Interrupted) => return Err(ReadFail::Busy(Stage::Nntp)),
+                // An extent that lost more than its parity rebuilds is
+                // as unavailable as one without parity.
+                Ok(ColdFetch::Unrecoverable) => {
+                    crate::trace::cold_read(|| {
+                        format!("extent-unrecoverable extent={}", extent.id)
+                    });
+                    return Err(ReadFail::Unavailable(Stage::Nntp));
+                }
+                Ok(ColdFetch::Unavailable) => {
+                    // If nothing was published to Usenet yet, the lost
+                    // warm copies are the reason the extent is unavailable.
+                    let stage = if extent.article_count.is_none() {
+                        Stage::R2
+                    } else {
+                        Stage::Nntp
+                    };
+                    return Err(ReadFail::Unavailable(stage));
+                }
+                Err(error) => return Err(ReadFail::cold_error(error)),
+            };
             // Nothing is held while waiting: neither slots nor budget.
             self.hang_up().await;
             drop(work);
-            let sleep = bridge.budget.sleeper().ok_or(ReadFail::Busy)?;
+            let sleep = bridge.budget.sleeper().ok_or(ReadFail::Busy(wait_stage))?;
+            // With a rebuild to come, room for both: the two are held
+            // together.
+            let both = need.saturating_add(rebuild);
+            let mut stage = wait_stage;
             loop {
                 if bridge.clock.now() >= deadline || slept >= COLD_WAIT_MS {
-                    return Err(ReadFail::Busy);
+                    return Err(ReadFail::Busy(stage));
                 }
                 attempt += 1;
                 let seed = (bridge.clock.now().0 as u64) ^ waiter.rotate_left(32) ^ attempt;
@@ -1317,16 +1430,17 @@ where
                 slept = slept.saturating_add(ms);
                 // Until there is room for the read, which is released
                 // again here: what follows takes what it needs.
-                if room.try_charge_in_turn(need).is_some() {
+                if room.try_charge_in_turn(both).is_some() {
                     break;
                 }
-                let now = bridge.clock.now();
-                let left = (deadline.0 - now.0).min(i64::from(COLD_WAIT_MS.saturating_sub(slept)));
-                let Ok(left @ 1..) = u32::try_from(left) else {
-                    return Err(ReadFail::Busy);
+                // Until room becomes available, the byte budget is
+                // what prevents the next attempt, not the last result.
+                stage = Stage::Budget;
+                let Ok(left @ 1..) = u32::try_from(remaining(slept)) else {
+                    return Err(ReadFail::Busy(stage));
                 };
                 let listed = async {
-                    let listed = core::pin::pin!(room.charge_in_turn(need));
+                    let listed = core::pin::pin!(room.charge_in_turn(both));
                     match select(listed, sleep(left)).await {
                         Either::Left((found, _)) => Some(found.is_ok()),
                         Either::Right(_) => None,
@@ -1335,21 +1449,40 @@ where
                 match beside(&mut self.put, listed).await {
                     Some(true) => break,
                     Some(false) => {}
-                    None => return Err(ReadFail::Busy),
+                    None => return Err(ReadFail::Busy(Stage::Budget)),
                 }
                 // The clock may stand still: the wait is counted too.
                 slept = slept.saturating_add(CHARGE_WAIT_MS);
             }
             // Another reader may have filled the cache in the meantime.
             match self.warm(bucket, piece, span).await {
-                Err(ReadFail::Unavailable) => {}
+                Err(ReadFail::Unavailable(_)) => {}
                 found => return found,
             }
             if bridge.clock.now() >= deadline {
-                return Err(ReadFail::Busy);
+                return Err(ReadFail::Busy(stage));
             }
-            // Not in the cache: read it, under a charge taken as above.
-            work = self.step(need, lean).await?;
+            if rebuild == 0 {
+                work = self.step(need, lean).await?;
+                continue;
+            }
+            // Another request may have taken the room while the cache
+            // was checked. Bound this wait by the same retry allowance.
+            let Ok(left @ 1..) = u32::try_from(remaining(slept)) else {
+                return Err(ReadFail::Busy(stage));
+            };
+            {
+                let charge = core::pin::pin!(self.step(both, lean.saturating_add(rebuild)));
+                let timeout = core::pin::pin!(async { sleep(left).await });
+                work = match select(charge, timeout).await {
+                    Either::Left((found, _)) => found?,
+                    Either::Right(_) => return Err(ReadFail::Busy(Stage::Budget)),
+                };
+            }
+            if bridge.clock.now() >= deadline {
+                return Err(ReadFail::Busy(Stage::Budget));
+            }
+            spare = Some(work.split_off(rebuild));
         }
     }
 }
@@ -1362,6 +1495,40 @@ mod tests {
     use std::sync::Arc;
 
     use futures_util::task::{noop_waker, waker, ArcWake};
+
+    #[test]
+    fn cold_read_port_errors_keep_their_dependency_stage() {
+        for (error, expected) in [
+            (BridgeError::Sql("fixture".into()), Stage::Lookup),
+            (BridgeError::GuardFailed, Stage::Lookup),
+            (BridgeError::Blob("fixture".into()), Stage::R2),
+            (
+                BridgeError::Nntp(velmora::Error::Io(std::io::ErrorKind::TimedOut.into())),
+                Stage::Nntp,
+            ),
+            (BridgeError::Crypto("fixture"), Stage::Decrypt),
+            (BridgeError::Invalid("fixture"), Stage::Other),
+        ] {
+            let fail = ReadFail::cold_error(error);
+            assert_eq!(fail.stage(), expected);
+            assert_eq!(fail.response().status, 500);
+        }
+    }
+
+    /// The stamp the catalogue holds may come from a clock a moment
+    /// ahead of this one: it is recent, and the read is not stamped
+    /// again. One a whole gap ahead is old, so a clock that jumped cannot
+    /// keep an extent from being stamped.
+    #[test]
+    fn a_stamp_a_moment_ahead_is_recent_and_one_far_ahead_is_not() {
+        let now = UnixMs(10_000_000);
+        for ahead in [1, 24, 5_000] {
+            assert!(stamped_recently(now, now.0 + ahead), "{ahead} ms ahead");
+        }
+        assert!(stamped_recently(now, now.0 - (READ_STAMP_MS - 1)));
+        assert!(!stamped_recently(now, now.0 - READ_STAMP_MS));
+        assert!(!stamped_recently(now, now.0 + READ_STAMP_MS));
+    }
 
     /// Polls `stream` once for its next item.
     fn pull<S: Stream + Unpin>(stream: &mut S) -> Poll<Option<S::Item>> {

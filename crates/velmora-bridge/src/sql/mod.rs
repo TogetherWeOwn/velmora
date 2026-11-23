@@ -652,6 +652,9 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
     async fn finish_release(&self, l: &Lease, now: UnixMs) -> Result<bool> {
         outbox::finish_release(self, l, now).await
     }
+    async fn reopen_release(&self, l: &Lease, now: UnixMs) -> Result<bool> {
+        outbox::reopen_release(self, l, now).await
+    }
     async fn due(&self, now: UnixMs, resend: Resend, limit: u32) -> Result<Vec<DueRow>> {
         outbox::due(self, now, resend, limit).await
     }
@@ -710,6 +713,29 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
     async fn gc_done(&self, id: i64, now: UnixMs) -> Result<()> {
         gc::gc_done(self, id, now).await
     }
+    async fn gc_orphans_due(&self, now: UnixMs) -> Result<bool> {
+        gc::gc_orphans_due(self, now).await
+    }
+    async fn gc_orphans(
+        &self,
+        now: UnixMs,
+        cutoff: UnixMs,
+        scan: u32,
+        limit: u32,
+    ) -> Result<Vec<GcRow>> {
+        gc::gc_orphans(self, now, cutoff, scan, limit).await
+    }
+    async fn gc_orphan_claim(
+        &self,
+        rows: &[GcRow],
+        now: UnixMs,
+        cutoff: UnixMs,
+    ) -> (Vec<bool>, Result<()>) {
+        gc::gc_orphan_claim(self, rows, now, cutoff).await
+    }
+    async fn gc_orphan_done(&self, id: i64, now: UnixMs) -> Result<()> {
+        gc::gc_orphan_done(self, id, now).await
+    }
 
     // recovery replay
     async fn replay_probe(&self, g: &GenerationRow) -> Result<ReplayProbe> {
@@ -759,6 +785,16 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
     }
     async fn restore_pending(&self) -> Result<bool> {
         replay::restore_pending(self).await
+    }
+    async fn restore_import_incomplete(&self) -> Result<bool> {
+        let rows = self
+            .sql
+            .query(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='_velmora_import_incomplete'",
+                &[],
+            )
+            .await?;
+        Ok(!rows.is_empty())
     }
     async fn restore_progress(&self, run: UnixMs) -> Result<Option<RestoreProgress>> {
         replay::restore_progress(self, run).await

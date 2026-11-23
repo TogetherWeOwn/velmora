@@ -204,9 +204,23 @@ and its record may already be stored (a later restore then deletes the
 key): send the call again until it answers `204` or `404`. Revocation is accepted
 under maintenance and during a replay.
 
-`GET /_admin/keys` lists every key: id, status, created time and its
-grants (bucket and permission), never a secret, 500 per page in id
+`GET /_admin/keys` lists every key: id, kind, status, created time and
+its grants (bucket and permission), never a secret, 500 per page in id
 order; follow `next` with `?after=<next>`.
+
+An **app password** is a key pair for the WebDAV gateway only: mint it
+with `"kind":"app_password"` in the `POST /_admin/keys` body. Its id
+starts with `APVL`. The S3 endpoint refuses it (`403
+InvalidAccessKeyId`), and the WebDAV entry point refuses every other
+key; nothing else about it differs (grants, revocation).
+
+Its secret is wrapped under its own domain (`velmora/app-password/v1`,
+not the S3 keys' `velmora/ak/v1`). A Worker built before key kinds
+cannot open it, so after a rollback below that build every request
+signed with an app password fails (`500 InternalError`) instead of
+being accepted as an S3 key on the public endpoint. Rolling forward again
+gives WebDAV users their access back. Revoking an app password instead
+deletes it for good: its holder needs a new one.
 
 ## Granting a key on another bucket
 
@@ -253,11 +267,46 @@ new key does not get the id of a revoked one.
 
 ## Routine: export
 
-`ops/catalog-export.sh` runs `wrangler d1 export` and stores the SQL file
-in the bucket `velmora-catalog-export` (create it once with
-`npx wrangler r2 bucket create velmora-catalog-export`). Run it from cron,
-for example daily. It prints the **restore point**, which is also the
-object's name. D1 does not answer queries while an export runs.
+`ops/catalog-export.sh` runs `wrangler d1 export`, compresses the SQL with
+zstd, and uploads the parts to `velmora-catalog-export` (create it once
+with `npx wrangler r2 bucket create velmora-catalog-export`). Run it from
+cron, for example daily. D1 does not answer queries while an export runs.
+
+The script prints the **restore point** in milliseconds. Under `d1/<db>/`,
+the parts are named `<restore point>.<attempt>.part-000`, `-001`, and so on.
+The script uploads `<restore point>.manifest.json` last. The format 2
+manifest lists the attempt, its parts and their checksums. Concurrent
+exports at the same restore point do not overwrite each other's parts.
+The importer also reads format 1 manifests with `.sql.zst.part-NNN` keys.
+
+Install the pinned Wrangler with `npm ci` in `workers/s3-bridge` before
+running either script. They require the local Wrangler version from
+`package-lock.json`, Python 3.10 or later with SQLite support, and `flock`.
+The importer requires SQLite 3.37 or later. On the same host, run these
+scripts as the same user with the same `TMPDIR` so they share
+locks: exports lock by source database name, imports by resolved target UUID.
+
+The exporter requires a full remote dump with schema and data. Its Wrangler
+arguments are limited to configuration options (`--config`/`-c`, `--env`/`-e`,
+`--cwd`, `--env-file`, and `--profile`). It has no single-file SQL size limit,
+but refuses an export with any SQL statement over 100,000 bytes,
+which D1 cannot import. Its summary gives the longest statement and the D1 file
+size along with the snapshot sizes. Set `VELMORA_EXPORT_SIZES_LOG` to append
+those measurements as JSON lines. The export warns at 60% of either the
+statement limit or the paid plan's 10 GB
+[database limit](https://developers.cloudflare.com/d1/platform/limits/).
+If the D1 size is unavailable, the export warns, records `database_size_bytes`
+as `null` in that log, and still publishes the snapshot.
+
+Wrangler uploads each part by default. Splitting keeps each upload under
+Wrangler's 300 MiB limit. `VELMORA_EXPORT_PART_BYTES` defaults to 268435456
+(256 MiB) and accepts positive integers up to 300000000. At the default, the
+1,000-part limit holds over 268 GB of compressed SQL. To use rclone for
+uploads and restores, set `VELMORA_EXPORT_RCLONE_REMOTE` to the name of a
+configured remote for the R2 S3 endpoint. On failure, the scripts report
+where they kept private transfer logs. URL query strings are removed before
+logging, and Wrangler's own disk logging is disabled. Staged SQL and parts
+are removed locally even on failure.
 
 Take a fresh export after every deploy that applied a migration. An
 export carries the schema of its day and the list of the migrations
@@ -270,15 +319,69 @@ exists: restore it to a timestamp, then replay from that timestamp.
 
 ## Restore
 
+Deploy a Worker revision with the incomplete-import replay guard before
+using the batched importer. The arming SQL also checks the marker, but an
+older Worker cannot enforce it on a direct replay call.
+
 1. Set `MAINTENANCE = "restore"` and deploy. Every write now answers 503,
    and the jobs and the cron do nothing.
 2. Bring the database back, one of:
    - Time Travel: `npx wrangler d1 time-travel restore <db> --timestamp <T>`.
      The restore point is `T` in milliseconds.
-   - Export: create an empty database (do not apply the migrations
-     first: the export carries the schema and the list of applied
-     migrations), download the newest `d1/<db>/<restore point>.sql` and
-     load it with `npx wrangler d1 execute <db> --remote --file <file>`.
+   - Export: find the newest complete export with
+     `rclone lsf <remote>:velmora-catalog-export/d1/<db>/ --include '*.manifest.json' | sort | tail -n 1`.
+     An export from before the manifests is one `<restore point>.sql` object
+     (`--include '*.sql'`); it loads too, without checksums.
+     The number before `.manifest.json` is the restore point. Set
+     `VELMORA_D1` to the source database of the export. Create an empty
+     database and set `VELMORA_IMPORT_DATABASE_ID` to its UUID from
+     `wrangler d1 info <new db> --json` (use the same Wrangler config and
+     environment as the import). Export `CLOUDFLARE_ACCOUNT_ID` for the target
+     account. Run `ops/catalog-import.sh <new db> <restore point>`.
+     The script resolves the supplied name or binding with the operator's
+     config and checks the UUID. It then confirms the same UUID and name in
+     `CLOUDFLARE_ACCOUNT_ID` and pins every subsequent D1 call to that account
+     and UUID with a private config containing no database names or bindings.
+     The pinned calls retain the shell credentials and explicit `--profile`
+     and `--env-file` (use absolute paths with `--cwd`), not `--env`.
+     A production catalogue also requires `VELMORA_IMPORT_PRODUCTION=yes`.
+     The export carries the schema and the list of applied migrations, so
+     apply migrations after loading it. Do not run against production without
+     these confirmations. The script refuses a non-empty database. It caps
+     the manifest at 1 MiB, legacy SQL at 5,000,000,000 bytes, and each part at
+     its declared size. It stages at most one extra byte to detect overflow
+     (which does not limit bytes already in flight). It also bounds
+     decompression by the manifest's SQL size and checks every checksum
+     before splitting. Legacy single-file exports have no checksums.
+
+     Restore always uses statement-safe batches, even for small exports:
+     table schemas first, INSERTs in foreign-key order, then the remaining
+     statements (including indexes and triggers). A dependency cycle is
+     refused, as are rows for a self-referencing table that cannot fit in
+     one batch. `VELMORA_IMPORT_BATCH_BYTES` defaults to 1,000,000,000 bytes
+     and cannot exceed D1's 5,000,000,000-byte file import limit. The script
+     proves that every original statement is accounted for and rechecks each
+     batch's checksum before loading it.
+
+     Reserve local disk for the download and spool (about another SQL dump).
+     The importer checks available space before fetching manifest parts (or
+     before splitting a legacy download), using about 2.1 times the SQL size
+     or the larger decompression/assembly requirement. It discards compressed
+     bytes after verification, the SQL after spooling, and spools as used.
+
+     Before batch 0, a single D1 import checks that the target is still
+     empty and marks it incomplete. The marker blocks arming and replay.
+     If loading stops before all batches are recorded as loaded, delete and
+     recreate the target before retrying. The script never deletes databases.
+
+     Verification counts the idle target in indexed pages of at most 5,000
+     rows per query. If a verification query fails or is interrupted, rerun
+     the same command with the same source, restore point, and target UUID.
+     It verifies the counts saved from the dump without downloading or
+     reloading any batches. If the counts differ, delete and recreate the
+     target; never skip verification of a known mismatch. The opt-out
+     (`VELMORA_IMPORT_SKIP_ROW_COUNTS=yes`) is accepted only on a fresh load
+     and prints a warning. A retry cannot clear the marker by skipping.
    - Nothing: create a database. The restore point is `0`.
 
    Then, in every case, bring the schema up to date and close the
@@ -363,8 +466,10 @@ it. No build writes them yet. Any other value of the variable refuses to start.
 
 - A record is never renamed, moved or rewritten: it is sealed under its
   whole name and would not open under another. Changing the setting
-  changes where the next record goes, nothing else, and it can be
-  changed in either direction at any time.
+  changes where the next record goes, nothing else. It can be changed
+  in either direction until a build has written segments (below); from
+  then on `flat` is set only under the conditions of "Turning it off
+  again" at the end of this section.
 - Every reader reads both layouts whatever the setting says: the
   replay, the recovery copy, the intent sweep, and the lookup of an
   article plan (in the layout of
@@ -397,11 +502,83 @@ Turning it on, in two deploys:
 1. Deploy a version that knows `RECORD_LAYOUT`, with the variable unset
    or `flat`. Let it serve until a rollback to an earlier version is no
    longer wanted.
-2. Set `RECORD_LAYOUT = "tenant"` and deploy. From this deploy on the
-   rollback floor below applies.
+2. Set `RECORD_LAYOUT = "tenant"` and deploy, alone in its deploy.
+   From this deploy on the rollback floor below applies.
 
-Turning it off again (`flat`) is safe at any time and does not lower
-the floor: the tenant records that were written stay.
+In production the variable is not set in `wrangler.toml`, and a value
+set by hand in the dashboard or with `wrangler deploy --var` is gone
+at the next CI deploy. The deploy job writes it from the variable
+`VELMORA_RECORD_LAYOUT` of the `production` environment of the
+repository (unset, empty or `flat`: flat; `tenant`; any other value
+fails the job before the deploy). Step 2 in production:
+
+1. Let nothing else merge to `main` until step 6 has passed.
+2. Check that the version that serves production was deployed by the
+   push run of the tip of `main`: its message is `ci <run>.<attempt>
+   <commit>`, and the commit is the tip. If the tip was not deployed
+   (its deploy failed or was rolled back), stop: the switch would then
+   deploy other code together with the variable.
+3. Check that this push run is younger than 1 day: the job `deploy
+   (production)` takes the bundle the run built, and it is kept for 1
+   day. If it is older, wait for the day of the next deploy.
+4. Check the other variables of the `production` environment that the
+   deploy job writes into the config (every `VELMORA_*` one the step
+   "Generate the production wrangler config" reads, among them
+   `VELMORA_S3_HOST`, `VELMORA_D1_DATABASE_ID`, `VELMORA_RECOVERY_COPY`,
+   `VELMORA_RECOVERY_PREFIX` and `VELMORA_VERIFY_MODE`): the run in
+   step 5 deploys their values of now, not those of the serving deploy.
+   Compare them with what the serving version carries:
+   `wrangler versions view <id> --json` lists its variables and
+   bindings in full (without `--json` long values are cut). Put
+   any difference right, or confirm it is meant, before going on. Then
+   set `VELMORA_RECORD_LAYOUT` to `tenant` in the `production`
+   environment.
+5. Run the job `deploy (production)` of that push run again, and that
+   job only. Running `deploy-build` again builds a new bundle from the
+   same commit with the toolchain of that day, which is not the bundle
+   that serves. (`workflow_dispatch` does not deploy.)
+6. Read the deploy log: the step "Generate the production wrangler
+   config" names the layout the generated config carries, `tenant`,
+   and the deploy message carries the same commit as the version that
+   served before. Then check that the job ended green and that the
+   version that serves production carries this run's message. A job
+   that fails after the deploy rolls back to the version before it,
+   but not always: with no version recorded before the deploy, the
+   rollback is skipped; when this run's version is not known and the
+   serving one is not the one before, or when a third version serves,
+   the step stops with an error and rolls nothing back; and the
+   rollback command itself can fail. When this run's version is known
+   but the serving one could not be read, it rolls back without that
+   check. A failed job sends the deploy alert only where its settings
+   are present, and a failed send is only a warning in the log. So
+   after a failed job, read which version serves before taking
+   production as restored.
+   Nothing else changed.
+
+`wrangler secret list` must show no secret named `RECORD_LAYOUT`,
+before and after: the Worker reads a secret where the variable is
+absent, a deploy keeps secrets, and the deploy job cannot see them.
+
+What to watch after the switch, in the Worker log:
+
+| Line | Meaning |
+|---|---|
+| `recovery copy: pass=… retry=… records=… copied=… failed=… refused=… source_unreadable=… pending=… extra=… foreign=…` | a copy pass that did not copy everything: `failed`, `refused` and `source_unreadable` count records. A pass without an error logs the line without those three fields |
+| `recovery copy: pass=… retry=… stopped: …` | a copy pass that stopped before its end |
+| `dispatch: the sweep of unpublished writes was not sent` | the cron could not send the sweep jobs |
+
+and in `GET /_admin/status`: `write_intents.anomalies`, which must not
+go up.
+
+Turning it off again (`flat`) is done the same way, with
+`VELMORA_RECORD_LAYOUT` set to `flat` or removed. It does not lower the
+floor: the tenant records that were written stay. It is safe until a
+build has written segments. A segmented upload of a large object writes
+segment records for as long as it runs, which can be days, and no
+segment may be written under a flat name. So once a build that writes
+segments has been deployed with its writer on, the layout is not set
+back to `flat`: the writer is turned off first, and `flat` is set only
+when no segmented upload is open.
 
 With the recovery copy on, a pass that finds nothing to send costs 6
 list calls here and 6 at the other provider (4 and 4 before), in either
@@ -410,6 +587,15 @@ tombstones and the generations of each layout) costs one more call on
 each side while it holds records of the last hour, so a pass in the
 hour after the setting changed, with fresh records in both layouts, can
 cost 8 and 8.
+
+The deploy job holds one rule between the layout and segments. A
+generation record above 10,000 extents is a segmented one, so a prod
+`MAX_OBJECT_EXTENTS` above 10,000 means segments can be written. With
+that in the generated config and the layout `flat` (or
+`VELMORA_RECORD_LAYOUT` unset), the step "Generate the production
+wrangler config" fails and nothing is deployed: no segment is written
+under a flat name. A value that is not a plain number
+counts as above. `tenant` with any value passes.
 
 ## The rollback stamp
 
@@ -536,7 +722,9 @@ the code real data relies on. Never roll back past the floor:
   rolls back like any other. See "Permit gate".
 
 - **Once `RECORD_LAYOUT=tenant` has been deployed:** never to a version
-  older than the first one that knows `RECORD_LAYOUT`. From then on a
+  older than the first one that knows `RECORD_LAYOUT`: the first one
+  built from a commit that contains #133 (`tenant-prefixed names for
+  new recovery records, behind RECORD_LAYOUT`). From then on a
   recovery record can be stored under `m/x/<tenant id>/`. An older
   Worker reads the flat names only:
   - its replay lists `m/g_` and `m/del/g_` and so passes over every
@@ -594,13 +782,39 @@ here):
 2. A CI deploy carries the message `ci <run>.<attempt> <commit>`. A
    version made by a secret change (`workers/triggered_by` = `secret`)
    runs the code of the version before it.
-3. Take the latest floor that applies: the merge commit of #121 (the
-   one that brought `PACKED_PLANS`) once the switch has been deployed
-   on, else the merge commit of #71. For each version, oldest first,
+3. Take the latest floor that applies: the merge commit of #133 (the
+   one that brought `RECORD_LAYOUT`) once `tenant` has been deployed,
+   else the merge commit of #121 (the one that brought `PACKED_PLANS`)
+   once that switch has been deployed on, else the merge commit of
+   #71. For each version, oldest first,
    check the commit: `git merge-base --is-ancestor <that merge commit>
    <commit>`. The first version for which it succeeds is the floor. A secret-change
    version takes the answer of the version before it. Treat any other
    version without a CI message (an upload by hand) as below the floor.
+
+## More than one S3 host
+
+`S3_HOST` is always in the `legacy` class. Extra hosts can be `legacy` or
+`customer`. Both classes admit every key for now, because there is one
+tenant; a later change binds tenants to classes. A request is checked
+against the host it was sent to: a signature made for one host is refused
+on another, and `CompleteMultipartUpload` names the host it was sent to
+in `Location`.
+A configured host may not be a subdomain of another configured host so
+virtual-hosted requests remain refused.
+Customer-class hosts return HTTP 404 for `/_admin` routes and HTTP 403
+for bearer-token CreateBucket and DeleteBucket requests.
+
+1. Attach the new host to the Worker as a Custom Domain.
+2. Set the GitHub Actions variable `VELMORA_S3_HOSTS` to the full list of
+   extra hosts, for example `s3.example.io=customer,archive.example.io=legacy`.
+   Use up to eight lowercase hostnames without ports or spaces.
+3. Let CI deploy. Check the smoke lines for an HTTP 403 with
+   `AccessDenied` for each host. Index 1 is the primary host, followed
+   by the extra hosts in list order.
+
+To remove a host, remove its entry from `VELMORA_S3_HOSTS`, let CI deploy
+successfully, then detach the Custom Domain.
 
 ## Client settings
 
@@ -662,9 +876,9 @@ Why these values:
   At 95 MiB rclone reaches its cutoff and goes multipart, so that row
   is six parts of 16 MiB, not twelve slices.
 
-- **Concurrency.** One UploadPart of 16 MiB takes 2.4 to 3.6 s through
-  the Worker at 4 at once: it is received whole, encrypted, then
-  stored. A small PutObject takes about 1.4 s, most of it round trips.
+- **Concurrency.** One UploadPart of 16 MiB takes 2.0 to 2.3 s through
+  the Worker at 4 at once: it is encrypted and stored while it
+  arrives. A small PutObject takes about 1.1 s, most of it round trips.
   Both gain from more requests at once. Measured on a test deployment
   from one client host, 256 MiB in 16 MiB parts and 40 PutObjects of
   1 MiB (MiB/s; three deployments for the first and last columns, two
@@ -676,14 +890,21 @@ Why these values:
   | 8 | 20.5 to 27.1 | | | 10.7, 16.4 | 4.5 to 5.3 |
   | 16 | 19.6 to 27.8 | 24.0, 28.7 | 32.1, 27.8 | 7.5 to 15.0 | 8.1 to 9.3 |
 
-  No answer was a 5xx, and no client retried.
+  No answer was a 5xx, and no client retried. The table is from
+  before uploads were stored while they arrive. With that, the S3 test
+  client measured on one deployment (three runs each; the other
+  columns were not measured again): 24.2 to 29.2 MiB/s at 4 at once
+  (1 GiB, five runs), 30.5 to 39.4 at 8, 39.0 to 43.3 at 16, and 3.3
+  to 3.7 and 10.2 to 11.3 MiB/s for the 1 MiB PutObjects at 4 and 16.
   - Big parts gain less than small files: the parts in one Worker
-    isolate share its CPU and its in-flight byte budget, so one part
-    takes about 5.3 s at 16 at once. A 16 MiB part counts 32 MiB
-    (plaintext and ciphertext) against an isolate's 48 MiB
-    `INFLIGHT_BUDGET_BYTES`, so one isolate stores one such part at a
-    time; another waits up to 20 s for budget, then gets 503
-    `SlowDown`, which clients retry. None was refused in these runs.
+    isolate share its CPU, so one part takes about 4.3 s at 16 at
+    once. An upload of at most one extent holds a window of a few
+    chunks and counts 512 KiB against an isolate's 48 MiB
+    `INFLIGHT_BUDGET_BYTES` whatever its length, so the budget does
+    not hold such parts back. A slice of a longer upload, a copied
+    part and a download count what they hold; one that finds no
+    budget waits up to 20 s, then gets 503 `SlowDown`, which clients
+    retry. None was refused in these runs.
   - rclone sends all its requests to one host over a single HTTP/2
     connection, and that one connection carries 7 to 16 MiB/s at any
     concurrency. `--disable-http2` gives each request its own
@@ -789,7 +1010,7 @@ deployed Worker has passed.
 | Field | Meaning | If it stays above 0 |
 |---|---|---|
 | `open_writes` | requests under way, and dead ones younger than a day | nothing to do |
-| `waiting_writes`, `oldest_waiting_at` | writes that are due for the sweep: bytes in `SAFETY` that no object uses | the sweep is off, a replay is unfinished, the catalogue is rolled back, or the cron could not send the jobs (it logs `dispatch: the sweep of unpublished writes was not sent`) |
+| `waiting_writes`, `oldest_waiting_at` | writes that are due for the sweep: bytes in `SAFETY` that no object uses | the sweep is off, a replay is unfinished, the catalogue is rolled back, the cron could not send the jobs (it logs `dispatch: the sweep of unpublished writes was not sent`), or the jobs fail (each failed job logs `alert: intent sweep: a job failed and is tried again: class=…`, with the class `catalog`, `blob`, `crypto` or `internal`, and is tried again; a job of any kind that did not end or was dropped logs `job table: a job did not end and was given up` or `job table: a running job was dropped`, which does not name the sweep) |
 | `kept_writes`, `kept_slices`, `oldest_kept_at` | writes with a recovery record and without an object in the catalogue: the request died between the two, its publication was refused and the record could not be removed, or the database was restored to a point before the commit and the restore was not noticed | run the restore steps above with a `since_ms` no later than `oldest_kept_at`. The replay reads only the records from `since_ms` (less the margin) on: it publishes those, and its first step removes their rows. A `kept` row whose record is older than that stays, and so does the figure |
 | `anomalies` | how often a write was marked `kept`, ever; it does not go down | see `kept_writes` |
 
@@ -825,6 +1046,179 @@ Going back to a Worker version from before this table needs nothing
 else: the objects are ordinary generations, which it reads, posts,
 verifies and replays. It answers `EntityTooLarge` to a new PutObject
 above one extent.
+
+## Upload parts that left their upload
+
+Three things take a part out of a multipart upload for good: the part
+is uploaded again under its number, the upload is aborted, or
+CompleteMultipartUpload leaves the part out of its list. Such a part
+was never posted. Its ciphertext stays in `SAFETY` (`x/<extent id>`),
+and `GC_MODE` takes it only in a disposable bucket.
+
+`GC_ORPHANS = "on"` (its own switch, in every bucket, whatever
+`GC_MODE` says) deletes these copies and nothing else. The copy of an
+extent goes when all of this holds in one batch of the catalogue:
+
+1. the extent has an open `delete_safety` row in `gc`. For an extent
+   that is still `staged`, only the three writes above queue one, in
+   the batch that takes the part out of the upload, dated with that
+   moment;
+2. that moment is 31 days ago or more;
+3. the extent is `staged` and has no generation: no object was ever
+   made of it;
+4. no `generation_extents` row names it: no object and no server-side
+   copy reads it;
+5. no part of an open upload names it. An upload in progress keeps
+   every part it lists, however old it is;
+6. no replay is under way, the catalogue is not behind its rollback
+   stamp, and the last replay ended 31 days ago or more ("After a
+   restore" below);
+7. no key that could still get an object made of the part has a write
+   whose outcome is not known (below).
+
+**Why 31 days.** Nothing a request or a job does brings a dropped part
+back: its extent id is never issued again, and only an open upload
+that lists an extent can publish it. A database taken back to before
+the drop does list it. Time Travel reaches 30 days, so a part that was
+dropped longer ago is dropped in every state the database can return
+to, as long as it was not restored in that time ("After a restore"
+below); the 31st day is the margin between the clocks. A database taken
+back to before a part was collected still has the part dropped with
+its row open, and the collector deletes the absent copy once more.
+
+**A write whose outcome is not known.** CompleteMultipartUpload stores
+its recovery record, which names the parts it was given, before its
+batch runs. If the batch does not run and the record cannot be removed
+either, the request answers 5xx, the upload stays open, and the record
+stays: a replay would publish it. The catalogue marks the key before
+any such record is stored (`key_floors.unpublished`), and only a write
+or a delete of the key that was acknowledged takes the mark away. While
+the key of an upload is marked, the collector leaves the parts of that
+upload. For a part that was uploaded again, and for the slices after
+the first of a part above one extent, the catalogue no longer knows
+the upload: those wait until no key of their bucket that an upload was
+ever begun on is marked. The catalogue asks that of a bucket once a
+day at most and keeps the answer for that day (`scan_cursors`, key
+`orphans:bucket:<bucket id>`, value `clean:<time>` or `marked:<time>`
+in milliseconds). A key that is marked after a bucket was found clean
+holds nothing back that day, and need not: its record was stored then,
+from a part list that a part dropped 31 days earlier is not in. The
+marked keys:
+
+```
+npx wrangler d1 execute <db> --remote --command \
+  "SELECT b.name, f.key, f.floor_id FROM key_floors f JOIN buckets b ON b.id = f.bucket_id WHERE f.unpublished <> 0"
+```
+
+To let the parts go, settle the key: PUT the object again, or DELETE
+the key (a delete of a marked key stores a tombstone also when the key
+has no object). The parts of that key's upload go with the pass after
+that. The others go with the first pass after the answer about their
+bucket is a day old. What holds a bucket's parts back now:
+
+```
+npx wrangler d1 execute <db> --remote --command \
+  "SELECT k, v FROM scan_cursors WHERE k LIKE 'orphans%'"
+```
+
+`orphans:bucket:<bucket id>` = `marked:<time>` means the parts of
+unknown uploads in that bucket wait for a marked key, as found at that
+time. `orphans` is the position of the scan (`rest:<time>`: the next
+pass starts then).
+
+**Before turning it on.**
+
+1. A record stored before the catalogue had `key_floors` (migration
+   0007) set no mark. Such a record names only parts that were stored
+   before it. This must print 0:
+
+   ```
+   npx wrangler d1 execute <db> --remote --command \
+     "SELECT COUNT(*) FROM extents WHERE state = 'staged' AND created_at < COALESCE((SELECT CAST(strftime('%s', applied_at) AS INTEGER) * 1000 FROM d1_migrations WHERE name = '0007_key_floors.sql'), 9007199254740991)"
+   ```
+
+   A database with no row for that migration in `d1_migrations` (it
+   was applied by hand, or the database was imported) counts every
+   staged extent: put the time the migration was applied in place of
+   the subquery.
+
+   The Worker version that came with that migration is the first one
+   that sets the mark. A version from before it may have served for a
+   while after the migration was applied, and serves again after a
+   Worker rollback: put the time from which only versions with the
+   mark have served in place of `applied_at` when it is the later one.
+
+   If it does not, leave the switch off until every key that had an
+   upload before that time has been written again: PUT an object
+   to it, and DELETE that object after if the key should hold none. A
+   DELETE alone is not enough there: such a key carries no mark, and
+   on a key with no object and no mark a delete stores nothing, so the
+   old record would stay the newest one of the key.
+2. Run it on a deployed test environment, with `GC_ORPHANS = "on"`
+   and `GC_MODE` off there: with `GC_MODE=disposable` the older
+   collector deletes a dropped part in a bucket flagged disposable as
+   soon as it is dropped, and the run would show nothing about this
+   one. Abort an upload, upload a part twice and keep one upload open.
+   Then delete the row `orphans` of `scan_cursors` on that environment
+   (the scan rests a day after a pass, and a database used before may
+   hold a row from then) and wait until the row is back and reads
+   `rest:<ms>`: the collector has then made a pass since the parts
+   were dropped (the first cron run of a new deployment can be a
+   quarter of an hour away). The copies of the dropped parts are still
+   in `SAFETY` (`x/<extent id>`): the grace period holds them. Then
+   date the `gc` rows of the dropped parts 31 days back, delete the
+   row `orphans` again, and wait for a cron run. Then see both: the
+   copies of the dropped parts are gone from `SAFETY` and their
+   extents say `deleted` with the `gc` row closed, so the collector
+   did run; and the open upload completes and reads back.
+
+**What it costs.** While nothing is due, one row read per cron run. A
+pass reads the open `gc` rows in windows of 500, oldest first, and a
+job takes at most 100 parts; each part is one delete in `SAFETY` and
+three rows written (the extent, the usage counter, the `gc` row), plus
+one row per job for the position of the scan. After a pass over every
+due row the next one starts a day later. With `GC_MODE` off the rows
+of deleted and replaced objects stay open, and every pass reads them
+again: one row read for each, plus one for its extent, once a day. The
+parts whose upload is no longer known (point 7) need one statement per
+bucket that reads every row of `uploads`, about two rows read per
+upload ever begun. It runs once a day per bucket, whatever the number
+of parts and jobs, and also while a marked key holds such parts back:
+those are then refused for the rest of the day without another read of
+the uploads. Two jobs that run at the same moment on an answer that is
+a day old both ask: the read is then done once for each of them.
+
+**After a restore.** Time Travel cannot reach back past the 31 days on
+the history the database is on. It can return to a state of a history
+that an earlier restore left, for 30 days after that restore, and such
+a state may list in an open upload a part that was dropped, and since
+collected, on the history that was kept. So the collector deletes
+nothing until 31 days after the last replay ended
+(`SELECT state, finished_at FROM restore_state`): a catalogue that was
+taken back takes no write before a replay has run to its end, and by
+then every state of a history left before it is out of reach.
+
+It cannot see a restore that was undone before the replay after it
+ended, or in the minutes after it ended and before the next cron run
+raised the rollback stamp: the catalogue that is brought back holds no
+trace of the time it was away. So two rules stay as well, for every
+Time Travel restore, also one that undoes another, and also one that
+the rollback check did not report:
+
+1. set `GC_ORPHANS` to off and leave it off for 31 days;
+2. run the replay to its end before the switch goes back on. A restore
+   can take away the mark of a write whose outcome is not known while
+   its record stays; the replay publishes such a record and takes its
+   parts into the object, so they are not collected.
+
+A database loaded from an export file that is older than 31 days can
+list, in an open upload, a part whose copy was collected since. The
+replay counts such rows in `held_missing_total`; abort the uploads they
+belong to. A catalogue rebuilt from the records alone does not know the
+parts that were not collected yet: their copies stay in `SAFETY`.
+
+With the switch off nothing is deleted, and the rows stay for a later
+run with the switch on.
 
 ## Packed article plans
 
@@ -886,16 +1280,14 @@ second round of `STAT`, its job and its writes are not made.
 - A backbone the releasing verify job did not ask itself is asked with
   `STAT` in that job first: one a job before it checked (a round that
   waited for propagation or made a repost), and one whose check began
-  before the minimum age was over. If there is no provider slot for
-  that question, the row goes to the release stage, which asks every
-  backbone.
-- With a minimum age above the time a verify round takes (the shipped
-  24 h), the round ends before it is over and the release job does the
-  release as before. The verify job releases only where its round passes
-  at least `SAFETY_MIN_AGE_SECS` after the newest post: a backlog of
-  that length, the waits for a missing article, a row a release job sent
-  back to verify. A repost starts the minimum age again, so the round
-  after one goes to the release job.
+  before the minimum age was over. If there is no provider slot or
+  the extra check runs out of reconnects, the row goes to the release
+  stage, which asks every backbone.
+- Production ships with the switch off and a minimum age of `0`: a
+  passing verify round can schedule the release job without an added
+  wait. With the switch on and a positive minimum age, a passing round
+  that finishes before `SAFETY_MIN_AGE_SECS` has elapsed since the newest
+  post hands off to the release job. A repost restarts that minimum age.
 - The release by a verify job is one write to the catalogue: the copy
   goes from `held` to `released` and the row from `verify` to `done`
   together, or nothing changes. A job that dies leaves the copy held and
@@ -907,7 +1299,7 @@ second round of `STAT`, its job and its writes are not made.
 - `outbox` rows of such an extent go from `verify` to `done`, so the
   `release` count of `/_admin/status` stays near 0. The release counters
   (`releases_total` and the hourly `releases`) count these releases from
-  migration `0023_usage_release_at_verify.sql` on. Apply it before the
+  migration `0025_usage_release_at_verify.sql` on. Apply it before the
   Worker that has the switch on: without it such a release is counted as
   a verify only.
 
@@ -1086,8 +1478,9 @@ array). So the class goes out on its own, with the same code that has
 already run, and nothing that uses it comes in the same deploy. The
 production tables change in three pull requests after the code, each a
 deploy of its own, in this order. Production now declares the class
-(deploy 2), so the rollback floor it sets is in force, and binds it
-(deploy 3) with `PERMITS = "d1"`:
+(deploy 2), so the rollback floor it sets is in force, binds it
+(deploy 3), and takes its permits from the gate with `PERMITS = "do"`
+(deploy 4):
 
 | # | change to the production tables | rollback | merge the next one when |
 | - | ------------------------------- | -------- | ----------------------- |
@@ -1279,13 +1672,21 @@ copy) goes extent by extent, over `COLD_SOCKETS` connections at once:
 - **Verified, then sent.** The articles of an extent arrive on whichever
   connection is free, each is checked against its hash, the extent
   against its own, and only then is it decrypted and sent. The cache
-  write of an extent runs beside the read of the next one and is not
-  waited for by the client; a cache write that fails does not fail the
-  read.
+  write of an extent normally runs beside the read of the next one. If
+  the next extent cannot charge the bytes for a rebuild, the GET waits
+  for its own previous cache write, then tries that charge once more
+  before giving up on that rebuild attempt. A cache write that fails
+  does not fail the read.
 - **One step ahead, no further.** The Worker reads one extent ahead of
   the client and holds one cache write, all within
   `INFLIGHT_BUDGET_BYTES`. A client that stops reading stops the Worker
   after that extent, and a client that goes away ends the read.
+- **Before deploying with a custom request budget.** Check that it fits
+  a cold read and a rebuild from stored parity. With 16 MiB extents,
+  `INFLIGHT_BUDGET_BYTES` must be at least 43,658,464 bytes even for one
+  cold socket. Raise a lower budget before deploying. `PARITY=off`
+  stops writing new parity but does not remove this requirement. The
+  shipped 48 MiB budget already fits.
 - **A failed article.** An article a provider lacks, or sends wrong, is
   asked for from the next provider that has a connection or a permit. A
   connection that breaks is opened again a bounded number of times,
@@ -1329,7 +1730,9 @@ copy) goes extent by extent, over `COLD_SOCKETS` connections at once:
   being slow, articles asked for a second time, articles and bytes per
   provider id, and the milliseconds spent asking the cache, reading,
   waiting for room in the byte budget, waiting for the client, and
-  writing to the cache. It names no key, bucket, message-id or host.
+  writing to the cache. Time a rebuild spends waiting for this GET's
+  previous cache write counts in `read_ms`. The log names no key, bucket,
+  message-id or host.
 
 Measured on a deployed Worker with an object of 6 GiB (384 extents of
 16 MiB) that was in neither bucket, one provider reached through a
@@ -1447,7 +1850,80 @@ sampling weight as numbers; sum the weight to estimate request counts.
 A run of reads from Usenet (cache misses) is a point of kind `cold`,
 never sampled. One GET can have several such runs and a copy reads
 too, so these points show how much is read from Usenet over time; they
-are not a hit rate and are not to be subtracted from the GET count. No bucket, key, query, header or request id is written.
+are not a hit rate and are not to be subtracted from the GET count. No
+bucket, key, query, header, ID, IP address or token is written.
+
+### S3 failure stages
+
+Workers Analytics (GraphQL) can show HTTP status counts, including
+responses from the runtime. Use the [Analytics Engine SQL API][ae-sql]
+to break down Worker-answered GET errors (including range GETs) and
+5xx responses to HEAD, PUT (including UploadPart), and the POST for
+CompleteMultipartUpload. This uses the existing request point, with
+colo still in `blob5`:
+
+- `blob6`: `auth` (authentication, including the key and bucket
+  lookups), `lookup` (catalogue reads, including write-path restore and
+  upload state checks), `commit` (catalogue writes or publication that
+  could not complete), `stamp` (rollback-stamp check or update failure
+  not attributed to the blob store), `plan` (GET metadata, range or
+  extent planning), `grant` (fan-out grant creation,
+  admission, scope, or a granted generation that no longer exists),
+  `subrange_transport` (binding/stream setup or opening the first
+  sub-request), `subrange_length` (first sub-range's declared length),
+  `subrange_status` (other non-200 first sub-range response), `r2`
+  (blob-store failure or warm copies unavailable without a cold plan),
+  `nntp` (provider read failed or was interrupted), `slot_wait` (timed
+  out waiting for a provider connection slot), `budget` (byte-budget
+  exhaustion), `decrypt` (could not open verified cold bytes), or
+  `other` (unclassified, including an HTTP response-conversion fallback).
+- `blob7`: `le_1gib` or `gt_1gib` for the full object size when known
+  (for PUT, the accepted decoded length; for CompleteMultipartUpload,
+  the assembled size once planned); `unknown` if it was not available,
+  including UploadPart, which does not know the whole object size. This does not disclose the exact object size or indicate that a
+  range fanned out.
+
+A failed queue wake-up does not produce an `outbox` response stage. The
+write has already committed, and the dispatcher can resend from the
+outbox. The response and its count remain those of a successful write.
+
+For example, group public S3 GET 500s over the last hour by stage and
+size class (`velmora_requests_dev` for dev):
+
+```sql
+SELECT blob6 AS stage, blob7 AS size_class,
+       SUM(_sample_interval * double5) AS requests
+FROM velmora_requests
+WHERE timestamp >= NOW() - INTERVAL '1' HOUR
+  AND index1 = 'req' AND blob2 = 'GET' AND blob4 = 's3'
+  AND double1 = 500 AND blob6 != ''
+GROUP BY stage, size_class
+ORDER BY requests DESC
+```
+
+For short clusters, group public S3 PUT and HEAD 500s by UTC minute,
+method and stage:
+
+```sql
+SELECT toStartOfMinute(timestamp) AS minute, blob2 AS method,
+       blob6 AS stage, SUM(_sample_interval * double5) AS requests
+FROM velmora_requests
+WHERE timestamp >= NOW() - INTERVAL '1' HOUR
+  AND index1 = 'req' AND blob2 IN ('PUT', 'HEAD') AND blob4 = 's3'
+  AND double1 = 500 AND blob6 != ''
+GROUP BY minute, method, stage
+ORDER BY minute DESC, method, stage
+```
+
+The empty-stage filter omits older points. To include 503s (for example,
+byte-budget exhaustion), use `blob3 = '5xx'` instead of `double1 = 500`.
+To inspect failures inside sub-requests, query `blob4 = 'sub'` separately;
+do not add these to public counts. The Worker reports
+one response point before streaming the body. Failures after that
+point, including later sub-range failures on the front request, do
+not change its HTTP status or that point.
+
+[ae-sql]: https://developers.cloudflare.com/analytics/analytics-engine/sql-api/
 
 ## KEK
 

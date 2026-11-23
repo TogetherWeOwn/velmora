@@ -12,15 +12,22 @@ use velmora_s3_proto::{
 };
 use zeroize::Zeroizing;
 
+use velmora::rng::SystemRng;
+use velmora_s3_proto::UploadValidator;
+
 use crate::config::{BridgeConfig, Maintenance, REAL_DATA_READY};
-use crate::crypto::unwrap_secret;
-use crate::ingress::IngressError;
-use crate::ports::{BlobStore, Bridge, Catalog, Clock, JobSink, Kek, NntpConnector};
+use crate::crypto::{unwrap_secret, DataKey, ExtentSealer};
+use crate::entry::Entry;
+use crate::ingress::{
+    seal_upload, Charge, IngressError, SealedUpload, UploadLengths, UploadReadError,
+};
+use crate::metrics::{FailureStage as Stage, RequestObservation};
+use crate::ports::{BlobStore, Bridge, Catalog, Clock, JobSink, Kek, NntpConnector, StreamMeta};
 use crate::recovery::{discard_generation, revocation_recorded, Unpublished};
 use crate::replay::ReplayProbe;
 use crate::types::{
-    Bucket, BucketId, ExtentId, GenerationId, GenerationRow, Job, KeyStatus, OutboxStage, Perm,
-    Precondition, PreconditionError, RespBody, S3Request, S3Response, UnixMs, JOB_VERSION,
+    Body, Bucket, BucketId, ExtentId, GenerationId, GenerationRow, Job, KeyStatus, OutboxStage,
+    Perm, Precondition, PreconditionError, RespBody, S3Request, S3Response, UnixMs, JOB_VERSION,
 };
 
 /// Longest accepted origin-form target: a 1024-byte key with every byte
@@ -136,11 +143,25 @@ pub(super) fn from_proto(r: velmora_s3_proto::Response) -> S3Response {
     }
 }
 
-/// The protocol policy for this deployment. An upload is capped at the
-/// largest PutObject body; UploadPart has its own policy, capped at one
-/// extent.
-pub(super) fn policy(cfg: &BridgeConfig) -> Result<Policy, S3Response> {
-    policy_with(cfg, CONTROL_XML_BYTES, cfg.max_put_bytes)
+/// The protocol policy for this deployment, for requests signed for
+/// `host` (one of the configured hosts, see [`signed_host`]). An upload
+/// is capped at the largest PutObject body; UploadPart has its own
+/// policy, capped at one extent.
+pub(super) fn policy(cfg: &BridgeConfig, host: &str) -> Result<Policy, S3Response> {
+    policy_with(cfg, host, CONTROL_XML_BYTES, cfg.max_put_bytes)
+}
+
+/// The configured host a request is checked against: the one its `Host`
+/// names, or `S3_HOST` when it names none. In that case
+/// [`host_refused`] answers before the signature is judged, so the
+/// fallback is never what a request is accepted for. The value is the
+/// configured name, never the request's text.
+pub(super) fn signed_host<'a>(cfg: &'a BridgeConfig, req: &S3Request) -> &'a str {
+    req.headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("host"))
+        .and_then(|(_, value)| cfg.s3_host_for(value))
+        .map_or(cfg.s3_host.as_str(), |(name, _)| name)
 }
 
 /// [`policy`] with other caps on a control document and on a validated
@@ -148,11 +169,12 @@ pub(super) fn policy(cfg: &BridgeConfig) -> Result<Policy, S3Response> {
 /// the limits on an object body are).
 pub(super) fn policy_with(
     cfg: &BridgeConfig,
+    host: &str,
     control_xml_bytes: usize,
     upload_bytes: u64,
 ) -> Result<Policy, S3Response> {
     Policy::new(
-        cfg.s3_host.clone(),
+        host.to_owned(),
         cfg.region.clone(),
         Limits {
             target_bytes: TARGET_BYTES,
@@ -203,8 +225,8 @@ pub(super) fn header_refused(refusal: &HeaderRefusal) -> S3Response {
     )
 }
 
-/// The answer to a `Host` that is not the configured endpoint, or
-/// `None` when it is. The verifier refuses such a request whatever its
+/// The answer to a `Host` that is none of the configured endpoints
+/// (`S3_HOST` and `S3_HOSTS`), or `None` when it is one. The verifier refuses such a request whatever its
 /// signature (a request is only good for the endpoint it was signed
 /// for); this says why, before any key is looked up. The usual cause is
 /// virtual-hosted-style addressing (`<bucket>.<endpoint>`), so that case
@@ -216,11 +238,14 @@ pub(super) fn host_refused(headers: &Headers, cfg: &BridgeConfig) -> Option<S3Re
 /// [`host_refused`] for a `Host` value read off the raw request, as on a
 /// route that parses no headers.
 pub(super) fn host_value_refused(host: &str, cfg: &BridgeConfig) -> Option<S3Response> {
-    if host.eq_ignore_ascii_case(&cfg.s3_host) {
+    if cfg.s3_host_for(host).is_some() {
         return None;
     }
-    let suffix = format!(".{}", cfg.s3_host.to_ascii_lowercase());
-    let message = if host.to_ascii_lowercase().ends_with(&suffix) {
+    let lower = host.to_ascii_lowercase();
+    let virtual_hosted = cfg
+        .all_s3_hosts()
+        .any(|endpoint| lower.ends_with(&format!(".{}", endpoint.to_ascii_lowercase())));
+    let message = if virtual_hosted {
         "Virtual-hosted-style requests are not supported. Use path-style addressing: \
          the bucket goes in the path, not in the host name."
     } else {
@@ -370,15 +395,6 @@ fn claimed_key(headers: &Headers, target: &Target) -> Option<String> {
     (!akid.is_empty()).then(|| akid.to_owned())
 }
 
-/// Headers the edge adds. They are never signed and their values are not
-/// always printable ASCII, so they are dropped before header validation.
-/// Dropping a header can only fail a signature, never satisfy one.
-pub(super) fn edge_header(name: &str) -> bool {
-    name.starts_with("cf-")
-        || name.starts_with("x-forwarded-")
-        || matches!(name, "cdn-loop" | "x-real-ip" | "true-client-ip")
-}
-
 /// Authenticates and authorizes from the request line and headers only.
 /// The body is never touched. A key with no usable row is
 /// `InvalidAccessKeyId` for every bucket.
@@ -403,12 +419,12 @@ where
     K: Kek,
     T: Clock,
 {
-    let policy = policy(&bridge.cfg)?;
+    let policy = policy(&bridge.cfg, signed_host(&bridge.cfg, req))?;
     let target = Target::parse(&req.raw_target, &policy).map_err(s3_error);
     let fields: Vec<(&str, &str)> = req
         .headers
         .iter()
-        .filter(|(n, _)| !edge_header(n))
+        .filter(|(n, _)| !crate::entry::dropped_header(n))
         .map(|(n, v)| (n.as_str(), v.as_str()))
         .collect();
     let headers = Headers::new(&fields, &policy).map_err(s3_error);
@@ -427,8 +443,13 @@ where
         .check_features()
         .map_err(|refusal| header_refused(&refusal))?;
 
+    // The entry point admits one kind of key (`crate::entry`): a key of
+    // the other kind is looked up as if it did not exist.
+    let entry = Entry::of(&req.headers);
     let mut authority = OneKey {
-        akid: claimed_key(&headers, &target).unwrap_or_default(),
+        akid: claimed_key(&headers, &target)
+            .filter(|akid| entry.admits(akid))
+            .unwrap_or_default(),
         principal: String::new(),
         secret: None,
         perm: None,
@@ -615,6 +636,7 @@ pub(super) async fn hold_precondition<
     key: &str,
     id: &GenerationId,
     condition: Option<&Precondition>,
+    observed: &mut RequestObservation,
 ) -> Result<(), S3Response> {
     let Some(condition) = condition else {
         return Ok(());
@@ -625,8 +647,11 @@ pub(super) async fn hold_precondition<
         .catalog
         .raise_floor(bucket, key, id, false)
         .await
+        .inspect_err(observed.on_error(Stage::Commit))
         .map_err(|_| internal())?;
-    check_precondition(bridge, bucket, key, condition).await
+    check_precondition(bridge, bucket, key, condition)
+        .await
+        .inspect_err(observed.on_error(Stage::Lookup))
 }
 
 /// [`mutation_gate`] for the requests that can be conditional
@@ -793,11 +818,26 @@ pub(super) async fn discard_before_retry<
     generation: &GenerationRow,
     refused: Unpublished,
     conditional: bool,
+    observed: &mut RequestObservation,
 ) -> Result<(), S3Response> {
     match discard_unless_present(bridge, generation, refused).await {
         Ok(true) => Ok(()),
         Ok(false) if !conditional => Ok(()),
-        _ => Err(internal()),
+        Ok(false) => {
+            observed.mark_stage(Stage::Commit);
+            Err(internal())
+        }
+        Err(error) => {
+            observed.mark_stage(discard_failure(&error));
+            Err(internal())
+        }
+    }
+}
+
+pub(super) fn discard_failure(error: &crate::types::BridgeError) -> Stage {
+    match error {
+        crate::types::BridgeError::Sql(_) => Stage::Lookup,
+        _ => Stage::storage(error),
     }
 }
 
@@ -823,6 +863,18 @@ pub(super) async fn restore_gate<
         Ok(true) => Err(writes_refused()),
         Err(_) => Err(internal()),
     }
+}
+
+/// An unsuccessful restore-state read is a lookup failure; a successful
+/// read that found an ongoing restore is a write refusal instead.
+pub(super) fn restore_failure(
+    observed: &mut RequestObservation,
+    response: S3Response,
+) -> S3Response {
+    if response.status == 500 {
+        observed.mark_stage(Stage::Lookup);
+    }
+    response
 }
 
 /// Queue messages of one `send_many`.
@@ -871,5 +923,72 @@ pub(super) async fn send_post_jobs<C, B, N, J, K, T>(
     }
     if refused {
         let _ = bridge.catalog.unmark_sent(&jobs, now).await;
+    }
+}
+
+/// Stores one upload body as one extent in the safety store **while the
+/// body arrives**: each chunk is decoded, sealed and handed to the store
+/// as it comes, so sealing runs beside the store's write instead of
+/// before it, and only a window of the body is in memory (charge
+/// [`crate::ingress::ByteBudget::charge_stream`] first).
+///
+/// What holds, as for a body that is read whole and then stored:
+///
+/// - **No blob for a refused body.** The stream's final chunk leaves
+///   only after the validator accepted the whole body
+///   ([`seal_upload`]), and the store keeps nothing of a stream that did
+///   not end whole ([`BlobStore::put_stream`]). The refusal is answered
+///   as it would be before any byte was stored.
+/// - **The stored copy is checked before anything names it.** The store
+///   cannot be told the digest up front, so its own size and MD5 of what
+///   it holds are compared with what was sealed. If they differ the
+///   answer is `500` and the blob stays an unreferenced orphan, as after
+///   a failed catalogue write: a handler never deletes from the safety
+///   store.
+/// - **One attempt.** A store that fails ends the request with `500`
+///   and the client sends the body again.
+///
+/// The extent `blob` names must be newly minted (see [`ExtentSealer`]).
+/// `charge` is the one taken for this body.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn store_streamed<B: BlobStore>(
+    safety: &B,
+    body: Body,
+    lengths: UploadLengths,
+    validator: UploadValidator,
+    bdk: &DataKey,
+    blob: StreamMeta<'_>,
+    charge: &Charge,
+    observed: &mut RequestObservation,
+) -> Result<SealedUpload, UploadReadError> {
+    let sealer = ExtentSealer::begin(
+        bdk,
+        blob.bucket,
+        blob.extent,
+        lengths.decoded,
+        &mut SystemRng,
+    )
+    .map_err(|_| IngressError::Internal)?;
+    let cipher_size = sealer.cipher_size();
+    let (stream, seal) = seal_upload(body, lengths, validator, sealer, charge)?;
+    let receipt = safety
+        .put_stream(&blob.extent.safety_key(), cipher_size, stream, &blob)
+        .await;
+    match (receipt, seal.outcome()) {
+        // The body was refused: that is the answer, whatever the store
+        // made of the stream that ended in an error.
+        (_, Err(Some(refused))) => Err(refused),
+        (Ok(receipt), Ok(upload))
+            if receipt.size == upload.sealed.cipher_size
+                && receipt.md5 == upload.sealed.cipher_md5 =>
+        {
+            Ok(upload)
+        }
+        // The store failed, stopped reading, or holds other bytes than
+        // were sealed.
+        _ => {
+            observed.mark_stage(Stage::R2);
+            Err(IngressError::Internal.into())
+        }
     }
 }

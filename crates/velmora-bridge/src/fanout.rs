@@ -54,6 +54,7 @@ use sha2::Sha256;
 use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
+use crate::metrics::{GetFailureStage as Stage, GetObservation};
 use crate::ports::Kek;
 use crate::types::{BucketId, GenerationId, KekBytes, RespBody, S3Request, S3Response, UnixMs};
 
@@ -467,9 +468,21 @@ impl Fanout {
         pipe: &P,
         fallback: impl FnOnce() -> S3Response,
     ) -> Result<P::Body, S3Response> {
+        self.open_first_observed(pipe, fallback, &mut GetObservation::default())
+            .await
+    }
+
+    /// As `open_first`, with redacted diagnostics for the request datapoint.
+    pub async fn open_first_observed<P: SubPipe>(
+        &self,
+        pipe: &P,
+        fallback: impl FnOnce() -> S3Response,
+        observed: &mut GetObservation,
+    ) -> Result<P::Body, S3Response> {
         match self.open(pipe, 0).await {
             Ok(body) => Ok(body),
             Err((FanoutError::Status(503), Some(body))) => {
+                observed.mark_stage(Stage::SubrangeStatus);
                 let bytes = pipe.refusal(body, MAX_REFUSAL_BYTES).await;
                 let mut resp = S3Response {
                     status: 503,
@@ -479,10 +492,17 @@ impl Fanout {
                 resp.headers.push(("retry-after".into(), "30".into()));
                 Err(resp)
             }
-            Err((_, body)) => {
+            Err((cause, body)) => {
                 if let Some(body) = body {
                     pipe.discard(body).await;
                 }
+                observed.mark_stage(match cause {
+                    FanoutError::Mint | FanoutError::Status(403) => Stage::Grant,
+                    FanoutError::Transport => Stage::SubrangeTransport,
+                    FanoutError::Length => Stage::SubrangeLength,
+                    FanoutError::Status(_) => Stage::SubrangeStatus,
+                    FanoutError::Pipe => Stage::Other,
+                });
                 Err(fallback())
             }
         }

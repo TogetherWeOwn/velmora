@@ -184,6 +184,146 @@ pub fn declared_req_at(
     req
 }
 
+/// A request whose body is refused: what is wrong with it, the request,
+/// and the status and code S3 answers.
+pub type RefusedBody = (&'static str, Req, u16, &'static str);
+
+/// PutObjects whose body is refused. Each of them fails at or after the
+/// last [`CHUNK`] of the body.
+pub fn refused_bodies(rig: &Rig, signer: &Signer, key: &str, body: &[u8]) -> Vec<RefusedBody> {
+    refused_bodies_at(rig, signer, key, &[], body)
+}
+
+/// The same bodies on `PUT key?query`: an UploadPart.
+pub fn refused_bodies_at(
+    rig: &Rig,
+    signer: &Signer,
+    key: &str,
+    query: &[(&str, &str)],
+    body: &[u8],
+) -> Vec<RefusedBody> {
+    use base64::Engine as _;
+    let now = rig.now();
+    let p = path(BUCKET, key);
+    let mut other = body.to_vec();
+    *other.last_mut().unwrap() ^= 1;
+    let mut out = Vec::new();
+
+    let md5 = base64::engine::general_purpose::STANDARD.encode(md5::compute(&other).0);
+    let req = signer.sign(
+        now,
+        Method::Put,
+        &p,
+        query,
+        &[("content-md5", &md5)],
+        body.to_vec(),
+    );
+    out.push(("a wrong Content-MD5", req, 400, "BadDigest"));
+
+    let mut req = signer.sign(now, Method::Put, &p, query, &[], other.clone());
+    req.body = body.to_vec();
+    out.push(("a wrong payload hash", req, 400, "BadDigest"));
+
+    let sum = base64::engine::general_purpose::STANDARD.encode(sha256(&other));
+    let req = signer.sign(
+        now,
+        Method::Put,
+        &p,
+        query,
+        &[("x-amz-checksum-sha256", &sum)],
+        body.to_vec(),
+    );
+    out.push(("a wrong checksum header", req, 400, "BadDigest"));
+
+    let mut req = mode_req_at(rig, signer, key, query, &other, Mode::UnsignedTrailer);
+    let trailer = format!("{CRC32C}:{}", crc32c_b64(&other));
+    req.body = unsigned_chunks(body, 64 * 1024, &trailer);
+    out.push(("a wrong unsigned trailer checksum", req, 400, "BadDigest"));
+
+    let decoded = body.len().to_string();
+    let chunked = [
+        ("content-encoding", "aws-chunked"),
+        ("x-amz-decoded-content-length", decoded.as_str()),
+    ];
+    let with_trailer = [chunked[0], chunked[1], ("x-amz-trailer", CRC32C)];
+    let sized = |mut req: Req, body: Vec<u8>| {
+        req.set_header("content-length", &body.len().to_string());
+        req.body = body;
+        req
+    };
+
+    let (req, seed) = signer.sign_as(
+        now,
+        Method::Put,
+        &p,
+        query,
+        &with_trailer,
+        Vec::new(),
+        Some(SIGNED_TRAILER),
+    );
+    let wire = signer.signed_chunks(now, &seed, body, CHUNK, Some((CRC32C, crc32c_b64(&other))));
+    out.push((
+        "a wrong signed trailer checksum",
+        sized(req, wire),
+        400,
+        "BadDigest",
+    ));
+
+    // The signature of the last chunk that carries data.
+    let (req, seed) = signer.sign_as(
+        now,
+        Method::Put,
+        &p,
+        query,
+        &chunked,
+        Vec::new(),
+        Some(SIGNED),
+    );
+    let mut wire = signer.signed_chunks(now, &seed, body, CHUNK, None);
+    let last_data = body.len() - (body.len() - 1) % CHUNK - 1;
+    let good = signer.signed_chunks(now, &seed, &body[..last_data], CHUNK, None);
+    // `good` and `wire` agree up to the header of that chunk.
+    let header_at = good.len() - "0;chunk-signature=".len() - 64 - 4;
+    let sig_at = header_at + wire[header_at..].iter().position(|b| *b == b'=').unwrap() + 1;
+    wire[sig_at] = if wire[sig_at] == b'0' { b'1' } else { b'0' };
+    out.push((
+        "a bad signature on the last data chunk",
+        sized(req, wire),
+        403,
+        "SignatureDoesNotMatch",
+    ));
+
+    // The signature of the empty chunk that ends the body.
+    let (req, seed) = signer.sign_as(
+        now,
+        Method::Put,
+        &p,
+        query,
+        &chunked,
+        Vec::new(),
+        Some(SIGNED),
+    );
+    let mut wire = signer.signed_chunks(now, &seed, body, CHUNK, None);
+    let sig_at = wire.len() - 64 - 4;
+    wire[sig_at] = if wire[sig_at] == b'0' { b'1' } else { b'0' };
+    out.push((
+        "a bad signature on the final chunk",
+        sized(req, wire),
+        403,
+        "SignatureDoesNotMatch",
+    ));
+
+    let mut req = mode_req_at(rig, signer, key, query, body, Mode::Unsigned);
+    req.body.pop();
+    out.push(("a body one byte short", req, 400, "IncompleteBody"));
+
+    let mut req = mode_req_at(rig, signer, key, query, body, Mode::Unsigned);
+    req.body.push(0);
+    out.push(("a body one byte long", req, 400, "EntityTooLarge"));
+
+    out
+}
+
 /// The ETag S3 gives a PutObject: the MD5 of its body, quoted.
 pub fn md5_etag(body: &[u8]) -> String {
     format!("\"{:x}\"", md5::compute(body))
