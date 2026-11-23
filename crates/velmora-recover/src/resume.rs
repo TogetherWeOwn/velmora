@@ -1,0 +1,542 @@
+//! Recover into a caller-controlled directory with one writer and no clobber.
+
+use std::{
+    collections::BTreeSet,
+    fs::{self, File, OpenOptions},
+    io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write},
+    path::{Path, PathBuf},
+};
+
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use zeroize::Zeroizing;
+
+const PARTS: &str = ".velmora-recover-parts";
+const JOURNAL: &str = ".velmora-recover.jsonl";
+const UNMAPPED: &str = "_unmapped";
+const REPORT: &str = "INDEX.tsv";
+
+pub struct ObjectCheck<'a> {
+    pub bucket: &'a str,
+    pub key: &'a str,
+    pub generation: &'a str,
+    pub size: u64,
+    pub md5: Option<[u8; 16]>,
+    pub extents: &'a [ExtentCheck],
+}
+
+pub struct ExtentCheck {
+    pub id: String,
+    pub offset: u64,
+    pub len: u64,
+    pub sha256: [u8; 32],
+}
+
+#[derive(Deserialize, Serialize, Ord, PartialOrd, Eq, PartialEq)]
+struct Mark {
+    generation: [u8; 32],
+    ordinal: usize,
+    extent_id: String,
+    sha256: [u8; 32],
+}
+
+impl Mark {
+    fn new(generation: [u8; 32], ordinal: usize, extent: &ExtentCheck) -> Self {
+        Self {
+            generation,
+            ordinal,
+            extent_id: extent.id.clone(),
+            sha256: extent.sha256,
+        }
+    }
+}
+
+fn invalid(message: &'static str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, message)
+}
+
+fn private_dir(path: &Path) -> io::Result<bool> {
+    let mut builder = fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    match builder.create(path) {
+        Ok(()) => {
+            sync_parent(path)?;
+            Ok(true)
+        }
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+            Ok(fs::symlink_metadata(path)?.is_dir())
+        }
+        Err(e) => Err(e),
+    }
+}
+
+fn sync_parent(path: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    if let Some(parent) = path.parent() {
+        File::open(if parent.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            parent
+        })?
+        .sync_all()?;
+    }
+    let _ = path;
+    Ok(())
+}
+
+/// No symlinks, devices or pipes. As with any local restore, the caller
+/// must control the output root and not let another program mutate it.
+fn metadata(path: &Path) -> io::Result<Option<fs::Metadata>> {
+    match fs::symlink_metadata(path) {
+        Ok(m) => Ok(Some(m)),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+fn private_file(path: &Path) -> io::Result<File> {
+    let mut opts = OpenOptions::new();
+    opts.read(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut create = opts.clone();
+    match create.create_new(true).open(path) {
+        Ok(file) => {
+            sync_parent(path)?;
+            Ok(file)
+        }
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+            if !metadata(path)?.is_some_and(|m| m.is_file()) {
+                return Err(invalid("recovery state path is not a regular file"));
+            }
+            opts.open(path)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Replay only newline-terminated records. A SIGKILL can leave the final
+/// record torn; truncate that incomplete tail under the writer lock.
+fn read_lines(
+    file: &mut File,
+    max_line: u64,
+    mut each: impl FnMut(&[u8]) -> io::Result<()>,
+) -> io::Result<()> {
+    let mut complete = 0;
+    let mut reader = BufReader::new(&mut *file);
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        let len = (&mut reader)
+            .take(max_line + 1)
+            .read_until(b'\n', &mut line)? as u64;
+        if len > max_line {
+            return Err(invalid("recovery state line too large"));
+        }
+        if line.last() != Some(&b'\n') {
+            break;
+        }
+        each(&line)?;
+        complete += len;
+    }
+    if complete < file.metadata()?.len() {
+        file.set_len(complete)?;
+        file.sync_data()?;
+    }
+    file.seek(SeekFrom::End(0))?;
+    Ok(())
+}
+
+pub struct OutputRoot {
+    root: PathBuf,
+    journal: File,
+    marks: BTreeSet<Mark>,
+    report: Option<File>,
+    report_rows: BTreeSet<Vec<u8>>,
+}
+
+impl OutputRoot {
+    pub fn open(root: &Path) -> io::Result<Self> {
+        if !private_dir(root)? {
+            return Err(invalid("output root is not a directory"));
+        }
+        let root = root.canonicalize()?;
+        let mut journal = private_file(&root.join(JOURNAL))?;
+        journal.try_lock().map_err(|_| {
+            io::Error::other("recovery output is already locked or does not support locking")
+        })?;
+        if !private_dir(&root.join(PARTS))? {
+            return Err(invalid("recovery stage is not a directory"));
+        }
+        let mut marks = BTreeSet::new();
+        read_lines(&mut journal, 1024, |line| {
+            marks.insert(
+                serde_json::from_slice(line)
+                    .map_err(|_| invalid("invalid recovery journal line"))?,
+            );
+            Ok(())
+        })?;
+        Ok(Self {
+            root,
+            journal,
+            marks,
+            report: None,
+            report_rows: BTreeSet::new(),
+        })
+    }
+
+    pub fn object<'s, 'a>(&'s mut self, check: ObjectCheck<'a>) -> io::Result<Output<'s, 'a>> {
+        let mut offset = 0u64;
+        for extent in check.extents {
+            if extent.offset != offset {
+                return Err(invalid("object extent placement is not contiguous"));
+            }
+            offset = offset
+                .checked_add(extent.len)
+                .ok_or_else(|| invalid("object size overflow"))?;
+        }
+        if offset != check.size {
+            return Err(invalid("object extent placement does not cover its size"));
+        }
+        let mut hash = Sha256::new();
+        for field in [check.generation, check.bucket, check.key] {
+            hash.update((field.len() as u64).to_be_bytes());
+            hash.update(field.as_bytes());
+        }
+        let generation: [u8; 32] = hash.finalize().into();
+        let part_path = self
+            .root
+            .join(PARTS)
+            .join(format!("{}.part", sha_hex(&generation)));
+        let (dest, done, unmapped) = match direct_path(&self.root, check.bucket, check.key)? {
+            Some(dest) => match existing(&dest, &check)? {
+                Existing::Same(md5) => (dest, Some(md5), false),
+                Existing::Absent => (dest, None, false),
+                Existing::Different => self.fallback(&check)?,
+            },
+            None => self.fallback(&check)?,
+        };
+        let file = if done.is_none() {
+            Some(private_file(&part_path)?)
+        } else {
+            None
+        };
+        Ok(Output {
+            session: self,
+            check,
+            generation,
+            dest,
+            done,
+            unmapped,
+            part_path,
+            file,
+        })
+    }
+
+    fn fallback(&self, check: &ObjectCheck<'_>) -> io::Result<(PathBuf, Option<[u8; 16]>, bool)> {
+        let mut dest = self.root.join(UNMAPPED);
+        if !private_dir(&dest)? {
+            return Err(invalid("unmapped output root is not a directory"));
+        }
+        dest.push(
+            if normal_component(check.bucket) && check.bucket != REPORT {
+                check.bucket.to_owned()
+            } else {
+                format!("b-{}", escaped(check.bucket))
+            },
+        );
+        if !private_dir(&dest)? {
+            return Err(invalid("unmapped bucket path is not a directory"));
+        }
+        // All input bytes are percent-encoded. Prefixes distinguish leaves
+        // from directory chunks, including when one key prefixes another.
+        let escaped = escaped(check.key);
+        let mut chunks = escaped.as_bytes().chunks(240).peekable();
+        while let Some(chunk) = chunks.next() {
+            let chunk = std::str::from_utf8(chunk).expect("ASCII percent encoding");
+            if chunks.peek().is_none() {
+                dest.push(format!("k-{chunk}"));
+            } else {
+                dest.push(format!("d-{chunk}"));
+                if !private_dir(&dest)? {
+                    return Err(invalid("unmapped key path is not a directory"));
+                }
+            }
+        }
+        if escaped.is_empty() {
+            dest.push("k-");
+        }
+        let done = match existing(&dest, check)? {
+            Existing::Absent => None,
+            Existing::Same(md5) => Some(md5),
+            Existing::Different => {
+                return Err(invalid(
+                    "unmapped destination already contains different data",
+                ))
+            }
+        };
+        Ok((dest, done, true))
+    }
+
+    fn write_report(&mut self, bucket: &str, key: &str, dest: &Path) -> io::Result<()> {
+        if self.report.is_none() {
+            let mut report = private_file(&self.root.join(UNMAPPED).join(REPORT))?;
+            read_lines(&mut report, 16384, |line| {
+                self.report_rows.insert(line.to_vec());
+                Ok(())
+            })?;
+            self.report = Some(report);
+        }
+        let relative = dest
+            .strip_prefix(&self.root)
+            .map_err(|_| invalid("unmapped path outside output"))?;
+        let row = format!(
+            "{}\t{}\t{}\n",
+            tsv(bucket),
+            tsv(key),
+            tsv(&relative.to_string_lossy())
+        )
+        .into_bytes();
+        if !self.report_rows.contains(&row) {
+            let report = self.report.as_mut().expect("report opened above");
+            report.write_all(&row)?;
+            report.sync_data()?;
+            self.report_rows.insert(row);
+        }
+        Ok(())
+    }
+}
+
+fn sha_hex(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+    bytes
+        .iter()
+        .fold(String::with_capacity(bytes.len() * 2), |mut out, b| {
+            write!(out, "{b:02x}").expect("String is writable");
+            out
+        })
+}
+
+fn escaped(s: &str) -> String {
+    use std::fmt::Write;
+    s.bytes()
+        .fold(String::with_capacity(s.len() * 3), |mut out, b| {
+            write!(out, "%{b:02X}").expect("String is writable");
+            out
+        })
+}
+
+fn tsv(text: &str) -> String {
+    text.replace('\\', "\\\\")
+        .replace('\t', "\\t")
+        .replace('\r', "\\r")
+        .replace('\n', "\\n")
+        .replace('\0', "\\0")
+}
+
+fn normal_component(s: &str) -> bool {
+    if s.is_empty() || s == "." || s == ".." || s.len() > 240 || s.contains(['/', '\\', '\0']) {
+        return false;
+    }
+    #[cfg(windows)]
+    {
+        let base = s.split('.').next().unwrap_or_default().to_ascii_uppercase();
+        if s.ends_with(['.', ' '])
+            || s.chars()
+                .any(|c| c.is_ascii_control() || "<>:\"|?*".contains(c))
+            || matches!(base.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+            || ((base.starts_with("COM") || base.starts_with("LPT")) && base.chars().count() == 4)
+        {
+            return false;
+        }
+    }
+    true
+}
+
+fn direct_path(root: &Path, bucket: &str, key: &str) -> io::Result<Option<PathBuf>> {
+    if !normal_component(bucket)
+        || [PARTS, JOURNAL, UNMAPPED]
+            .iter()
+            .any(|s| bucket.eq_ignore_ascii_case(s))
+        || !key.split('/').all(normal_component)
+    {
+        return Ok(None);
+    }
+    let mut path = root.join(bucket);
+    for component in key.split('/') {
+        if !private_dir(&path)? {
+            return Ok(None);
+        }
+        path.push(component);
+    }
+    Ok(Some(path))
+}
+
+enum Existing {
+    Absent,
+    Same([u8; 16]),
+    Different,
+}
+
+fn existing(path: &Path, check: &ObjectCheck<'_>) -> io::Result<Existing> {
+    match metadata(path)? {
+        None => Ok(Existing::Absent),
+        Some(m) if m.is_file() && m.len() == check.size => {
+            match verify_file(&mut File::open(path)?, check)? {
+                Some(md5) => Ok(Existing::Same(md5)),
+                None => Ok(Existing::Different),
+            }
+        }
+        Some(_) => Ok(Existing::Different),
+    }
+}
+
+fn verify_file(file: &mut File, check: &ObjectCheck<'_>) -> io::Result<Option<[u8; 16]>> {
+    if file.metadata()?.len() != check.size {
+        return Ok(None);
+    }
+    let mut md5 = md5::Context::new();
+    for extent in check.extents {
+        if extent_hash(file, extent, Some(&mut md5))? != Some(extent.sha256) {
+            return Ok(None);
+        }
+    }
+    let md5 = md5.finalize().0;
+    Ok(check
+        .md5
+        .is_none_or(|expected| expected == md5)
+        .then_some(md5))
+}
+
+fn extent_hash(
+    file: &mut File,
+    extent: &ExtentCheck,
+    mut md5: Option<&mut md5::Context>,
+) -> io::Result<Option<[u8; 32]>> {
+    file.seek(SeekFrom::Start(extent.offset))?;
+    let mut sha = Sha256::new();
+    let mut left = extent.len;
+    let mut buf = Zeroizing::new([0u8; 64 * 1024]);
+    while left > 0 {
+        let n = left.min(buf.len() as u64) as usize;
+        match file.read_exact(&mut buf[..n]) {
+            Ok(()) => (),
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
+            Err(e) => return Err(e),
+        }
+        sha.update(&buf[..n]);
+        if let Some(hash) = &mut md5 {
+            hash.consume(&buf[..n]);
+        }
+        left -= n as u64;
+    }
+    Ok(Some(sha.finalize().into()))
+}
+
+pub struct Output<'s, 'a> {
+    session: &'s mut OutputRoot,
+    check: ObjectCheck<'a>,
+    generation: [u8; 32],
+    dest: PathBuf,
+    done: Option<[u8; 16]>,
+    unmapped: bool,
+    part_path: PathBuf,
+    file: Option<File>,
+}
+
+impl Output<'_, '_> {
+    pub fn is_unmapped(&self) -> bool {
+        self.unmapped
+    }
+    pub fn path(&self) -> &Path {
+        &self.dest
+    }
+
+    pub fn verified(&mut self, ordinal: usize) -> io::Result<bool> {
+        let extent = self
+            .check
+            .extents
+            .get(ordinal)
+            .ok_or_else(|| invalid("unknown extent ordinal"))?;
+        let Some(file) = &mut self.file else {
+            return Ok(true);
+        };
+        let mark = Mark::new(self.generation, ordinal, extent);
+        Ok(self.session.marks.contains(&mark)
+            && extent_hash(file, extent, None)? == Some(extent.sha256))
+    }
+
+    pub fn write_verified(&mut self, ordinal: usize, bytes: &[u8]) -> io::Result<()> {
+        let extent = self
+            .check
+            .extents
+            .get(ordinal)
+            .ok_or_else(|| invalid("unknown extent ordinal"))?;
+        if extent.len != bytes.len() as u64 || extent.sha256 != crate::extent::sha256(bytes) {
+            return Err(invalid("extent is not verified; not written"));
+        }
+        let Some(file) = &mut self.file else {
+            return Ok(());
+        };
+        file.seek(SeekFrom::Start(extent.offset))?;
+        file.write_all(bytes)?;
+        file.sync_data()?;
+        let mark = Mark::new(self.generation, ordinal, extent);
+        if !self.session.marks.contains(&mark) {
+            let mut line = serde_json::to_vec(&mark).map_err(io::Error::other)?;
+            line.push(b'\n');
+            self.session.journal.write_all(&line)?;
+            self.session.journal.sync_data()?;
+            self.session.marks.insert(mark);
+        }
+        Ok(())
+    }
+
+    pub fn finish(mut self) -> io::Result<[u8; 16]> {
+        let md5 = match self.done {
+            Some(md5) => md5,
+            None => {
+                for i in 0..self.check.extents.len() {
+                    let extent = &self.check.extents[i];
+                    let mark = Mark::new(self.generation, i, extent);
+                    if !self.session.marks.contains(&mark) {
+                        return Err(invalid(
+                            "cannot promote an object before every extent was verified",
+                        ));
+                    }
+                }
+                let mut file = self
+                    .file
+                    .take()
+                    .ok_or_else(|| invalid("missing staged object"))?;
+                file.set_len(self.check.size)?;
+                let md5 = verify_file(&mut file, &self.check)?
+                    .ok_or_else(|| invalid("whole-object integrity check failed"))?;
+                file.sync_all()?;
+                drop(file);
+                // Atomic no-clobber publication on the same filesystem. An
+                // interruption after the link is safe: reopen verifies the
+                // final file and then removes the leftover staging name.
+                fs::hard_link(&self.part_path, &self.dest)?;
+                md5
+            }
+        };
+        sync_parent(&self.dest)?;
+        if self.unmapped {
+            self.session
+                .write_report(self.check.bucket, self.check.key, &self.dest)?;
+        }
+        if metadata(&self.part_path)?.is_some_and(|m| m.is_file()) {
+            fs::remove_file(&self.part_path)?;
+            sync_parent(&self.part_path)?;
+        }
+        Ok(md5)
+    }
+}

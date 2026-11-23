@@ -1,0 +1,33 @@
+[package]
+name = "velmora-recover"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.89"
+license = "MIT"
+repository = "https://github.com/TogetherWeOwn/velmora"
+publish = false
+autobins = false
+
+[[bin]]
+name = "velmora-recover"
+path = "src/main.rs"
+required-features = ["recovery-cli"]
+
+[features]
+default = []
+recovery-cli = ["dep:clap", "dep:reqwest", "dep:velmora-kit"]
+
+[dependencies]
+clap = { version = "4", features = ["derive"], optional = true }
+quick-xml = "0.42"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots"], optional = true }
+tokio = { version = "1", features = ["macros", "rt", "time"] }
+toml = "0.9"
+md5 = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.11"
+velmora = { path = "../velmora" }
+velmora-bridge = { path = "../velmora-bridge" }
+velmora-kit = { path = "../velmora-kit", optional = true }
+zeroize = "1"
