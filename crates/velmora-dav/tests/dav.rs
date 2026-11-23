@@ -1931,7 +1931,9 @@ async fn a_late_commit_of_an_unanswered_delete_cannot_hit_a_later_move() {
     assert_eq!(w.s3_get("src/b").await.0, 404);
 }
 
-#[tokio::test]
+// The clock moves only when every task waits, so the schedule below does
+// not depend on how fast the runner is.
+#[tokio::test(start_paused = true)]
 async fn a_renewal_error_leaves_an_unanswered_delete_to_expire_with_its_reservation() {
     // The security review's schedule. A lease of 12 s is renewed every
     // 4 s and gives each storage call 3 s.
@@ -1991,7 +1993,7 @@ async fn a_renewal_error_leaves_an_unanswered_delete_to_expire_with_its_reservat
     assert_eq!(w.s3_get("dst/b").await.1, b"moved b");
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_renewal_error_during_an_upload_leaves_the_reservation_to_expire() {
     // Renewed every second.
     let w = World::with(Config {
