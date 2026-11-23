@@ -676,6 +676,47 @@ class OlderSwitchesTest(GeneratorCase):
         self.refused({"VELMORA_D1_DATABASE_ID": "not-a-uuid"}, "VELMORA_D1_DATABASE_ID is missing")
 
 
+class ReleaseAtVerifyTest(GeneratorCase):
+    switch = "VELMORA_RELEASE_AT_VERIFY"
+    shipped_line = 'RELEASE_AT_VERIFY = "off"'
+
+    def test_the_step_uses_the_production_variable(self):
+        self.assertEqual(self.step.env.get(self.switch), f"vars.{self.switch}")
+
+    def test_unset_empty_and_off_preserve_the_shipped_default(self):
+        self.assertEqual(tomllib.loads(self.shipped)["vars"]["RELEASE_AT_VERIFY"], "off")
+        for value in (None, "", "off"):
+            with self.subTest(value=value):
+                _, written = self.ok({self.switch: value})
+                self.assertEqual(written, without_switches(self.shipped))
+
+    def test_on_changes_only_the_prod_vars_line(self):
+        _, written = self.ok({self.switch: "on"})
+        before = without_switches(self.shipped)
+        line = f"\n{self.shipped_line}\n".encode("utf-8")
+        self.assertEqual(before.count(line), 1)
+        self.assertEqual(tomllib.loads(written.decode("utf-8"))["vars"]["RELEASE_AT_VERIFY"], "on")
+        self.assertEqual(written, before.replace(line, b'\nRELEASE_AT_VERIFY = "on"\n'))
+
+    def test_other_values_are_refused_without_writing(self):
+        for value in ("ON", "Off", "yes", "1", " on", "off ", "on\n"):
+            with self.subTest(value=value):
+                self.refused({self.switch: value}, "VELMORA_RELEASE_AT_VERIFY must be unset, off or on")
+
+    def test_shipped_line_must_appear_once_in_prod_vars(self):
+        missing = self.shipped.replace(self.shipped_line + "\n", "", 1)
+        for doctored, message in (
+            (missing, "expected exactly one prod line"),
+            (add_after(self.shipped, self.shipped_line, self.shipped_line), "expected exactly one prod line"),
+            (add_after(missing, "[build]", self.shipped_line), "the prod RELEASE_AT_VERIFY line is not in the [vars] table"),
+            (add_after(missing, "[vars]", f"note = '''\n{self.shipped_line}\n'''"),
+             "the generated config does not carry the release-at-verify setting that was asked for"),
+        ):
+            for value in (None, "on"):
+                with self.subTest(message=message, value=value):
+                    self.refused({self.switch: value}, message, doctored)
+
+
 @unittest.skipUnless(
     os.environ.get("DEPLOY_CONFIG_BASELINE"),
     "set DEPLOY_CONFIG_BASELINE to the ci.yml of the commit to compare with",
