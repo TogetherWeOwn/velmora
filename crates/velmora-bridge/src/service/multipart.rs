@@ -1646,6 +1646,7 @@ where
                     if !discarded
                         .inspect_err(|error| observed.mark_stage(discard_failure(error)))?
                     {
+                        observed.mark_stage(Stage::Commit);
                         return Err(Fail::Internal);
                     }
                     // The batch does not say which guard refused it. If

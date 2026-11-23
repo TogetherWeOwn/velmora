@@ -826,7 +826,10 @@ pub(super) async fn discard_before_retry<
     match discard_unless_present(bridge, generation, refused).await {
         Ok(true) => Ok(()),
         Ok(false) if !conditional => Ok(()),
-        Ok(false) => Err(internal()),
+        Ok(false) => {
+            observed.mark_stage(Stage::Commit);
+            Err(internal())
+        }
         Err(error) => {
             observed.mark_stage(discard_failure(&error));
             Err(internal())
