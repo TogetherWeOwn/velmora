@@ -324,6 +324,31 @@ impl<S: RecordStore, C: ControlSeal> TenantChain<'_, S, C> {
         now: UnixMs,
         known: u64,
     ) -> Result<Written, ChainError> {
+        self.write_keyed(tenant, change, actor, now, known, None)
+            .await
+    }
+
+    /// [`Self::write`] for a management call: the record it writes names
+    /// `call_key_hash`, the SHA-256 of the call's `Idempotency-Key` in
+    /// lowercase hex (AM-79), in its door part and in no later record. A
+    /// hash of any other form is refused (`400 invalid_change`) before
+    /// any read. A change the head already carries writes nothing, and the
+    /// head keeps the hash of the call that wrote it.
+    pub async fn write_keyed(
+        &self,
+        tenant: &Tenant,
+        change: &Change,
+        actor: Actor,
+        now: UnixMs,
+        known: u64,
+        call_key_hash: Option<&str>,
+    ) -> Result<Written, ChainError> {
+        if call_key_hash.is_some_and(|h| !super::transition::valid_key_hash(h)) {
+            return Err(ChainError::Refused(Refusal {
+                status: 400,
+                code: "invalid_change",
+            }));
+        }
         if matches!(
             change,
             Change::PlaceMovedBuckets { .. } | Change::SetMoveFloor { .. }
@@ -335,7 +360,10 @@ impl<S: RecordStore, C: ControlSeal> TenantChain<'_, S, C> {
         }
         let mut known = known;
         for _ in 0..MAX_PUT_TRIES {
-            match self.try_write(tenant, change, actor, now, known).await? {
+            match self
+                .try_write(tenant, change, actor, now, known, call_key_hash)
+                .await?
+            {
                 Try::Done(written) => return Ok(written),
                 Try::Lost(seq) => known = seq,
             }
@@ -370,7 +398,7 @@ impl<S: RecordStore, C: ControlSeal> TenantChain<'_, S, C> {
                 zero: Box::new(zero.door),
             };
             match self
-                .try_write(tenant, &change, Actor::MoveTool, now, known)
+                .try_write(tenant, &change, Actor::MoveTool, now, known, None)
                 .await?
             {
                 Try::Done(written) => return Ok(written),
@@ -407,7 +435,10 @@ impl<S: RecordStore, C: ControlSeal> TenantChain<'_, S, C> {
                 floor,
                 zero: Box::new(zero.door),
             };
-            match self.try_write(tenant, &change, actor, now, known).await? {
+            match self
+                .try_write(tenant, &change, actor, now, known, None)
+                .await?
+            {
                 Try::Done(written) => return Ok(written),
                 Try::Lost(seq) => known = seq,
             }
@@ -423,6 +454,7 @@ impl<S: RecordStore, C: ControlSeal> TenantChain<'_, S, C> {
         actor: Actor,
         now: UnixMs,
         known: u64,
+        call_key_hash: Option<&str>,
     ) -> Result<Try, ChainError> {
         let head = self.head(tenant, known).await?;
         let current = match &head {
@@ -435,7 +467,10 @@ impl<S: RecordStore, C: ControlSeal> TenantChain<'_, S, C> {
                 let head = head.expect("a change is unchanged only against a head");
                 return Ok(Try::Done(Written::Unchanged(head)));
             }
-            Ok(Outcome::Next(record)) => record,
+            Ok(Outcome::Next(mut record)) => {
+                record.door.call_key_hash = call_key_hash.map(str::to_owned);
+                record
+            }
         };
         let name = record_key(tenant, record.door.seq);
         let door = serde_json::to_vec(&record.door).map_err(|_| ChainError::Damaged("encode"))?;

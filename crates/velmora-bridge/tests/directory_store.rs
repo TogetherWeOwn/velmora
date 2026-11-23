@@ -1439,8 +1439,18 @@ fn the_tests_apply_every_directory_migration() {
 /// What the D1 run guards against: D1 refuses a GLOB pattern over 50
 /// bytes, which a stock SQLite takes. Under `VELMORA_D1_PROBE` this shows
 /// that the run is on D1's engine; natively, that the engine differs.
+///
+/// Under the unit suite's workerd twin (`VELMORA_SQL_SHADOW`) every native
+/// database is also a Durable Object SQLite database, which refuses the
+/// pattern as D1 does: the test compares engines, so it is expected to
+/// diverge there and does not run its statement (D1 itself is covered by
+/// the `VELMORA_D1_PROBE` run, unchanged).
 #[test]
 fn d1_refuses_the_pattern_that_sqlite_takes() {
+    if directory_support::under_twin() && !directory_support::on_d1() {
+        println!("skipped under the workerd twin: DO SQLite refuses the pattern as D1 does");
+        return;
+    }
     block_on(async {
         let db = database();
         let pattern = format!("t_{}", "[0-9a-f]".repeat(16));

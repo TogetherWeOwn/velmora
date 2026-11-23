@@ -555,6 +555,13 @@ pub struct TenantDoor {
     /// Tenant 0 only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tenant_zero: Option<TenantZero>,
+    /// The SHA-256 of the `Idempotency-Key` of the management call that
+    /// wrote this record, lowercase hex (AM-79): this record only, never
+    /// carried. The event built from the record names it as
+    /// `data.key_hash`, so `kofra-api` finds its confirmation id. A record
+    /// that no management call wrote (a job, a tool) has none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub call_key_hash: Option<String>,
 }
 
 /// The private part of a tenant record.
@@ -703,6 +710,7 @@ mod tests {
             jurisdiction: "us".into(),
             location_hint: None,
             tenant_zero: None,
+            call_key_hash: None,
         }
     }
 
