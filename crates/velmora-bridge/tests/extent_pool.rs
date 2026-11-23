@@ -169,7 +169,7 @@ fn budget(spares: usize) -> ByteBudget {
 /// Charges a post job of `bytes` for an extent of `len` bytes, fills its
 /// buffer with `len` bytes and drops the charge. The buffer's address.
 async fn one_job(budget: &ByteBudget, bytes: u64, len: u64) -> usize {
-    let charge = budget.charge_job_extent(bytes, len).await.unwrap();
+    let mut charge = budget.charge_job_extent(bytes, len).await.unwrap();
     let at = {
         let mut buffer = charge.lend(len as usize);
         buffer.resize(len as usize, 7);
@@ -188,7 +188,7 @@ async fn a_spare_is_charged_while_it_waits_and_taken_over_by_the_next_job() {
     assert_eq!(budget.in_use(), 16 * MIB);
     assert_eq!(budget.jobs_in_use(), 16 * MIB);
 
-    let charge = budget.charge_job_extent(25 * MIB, 16 * MIB).await.unwrap();
+    let mut charge = budget.charge_job_extent(25 * MIB, 16 * MIB).await.unwrap();
     // The job counts the buffer it took over once, not twice.
     assert_eq!(charge.bytes(), 25 * MIB);
     assert_eq!((budget.spares(), budget.in_use()), (0, 25 * MIB));
@@ -214,7 +214,7 @@ async fn three_post_reservations_take_three_spares_without_evicting_them() {
     let bytes = jobs::job_bytes(OutboxStage::Post, len, 6);
     let mut warmers = Vec::new();
     for _ in 0..3 {
-        let job = budget.charge_job_extent(bytes, len).await.unwrap();
+        let mut job = budget.charge_job_extent(bytes, len).await.unwrap();
         job.lend(len as usize);
         warmers.push(job);
     }
@@ -362,7 +362,7 @@ async fn a_larger_spare_is_charged_at_its_size_and_a_much_larger_one_is_not_take
     let at = one_job(&budget, 25 * MIB, 16 * MIB).await;
 
     // 14 MiB fit 16 with less than a quarter over: taken at 16.
-    let charge = budget.charge_job_extent(23 * MIB, 14 * MIB).await.unwrap();
+    let mut charge = budget.charge_job_extent(23 * MIB, 14 * MIB).await.unwrap();
     assert_eq!(charge.bytes(), 25 * MIB);
     assert_eq!((budget.spares(), budget.in_use()), (0, 25 * MIB));
     assert_eq!(charge.lend(14 * MIB as usize).as_ptr() as usize, at);
@@ -370,7 +370,7 @@ async fn a_larger_spare_is_charged_at_its_size_and_a_much_larger_one_is_not_take
     assert_eq!(budget.spare_bytes(), 16 * MIB);
 
     // 8 MiB would leave half of it unused: a buffer of its own.
-    let charge = budget.charge_job_extent(17 * MIB, 8 * MIB).await.unwrap();
+    let mut charge = budget.charge_job_extent(17 * MIB, 8 * MIB).await.unwrap();
     assert_eq!(charge.bytes(), 17 * MIB);
     assert_eq!(budget.in_use(), 33 * MIB);
     assert_ne!(charge.lend(8 * MIB as usize).as_ptr() as usize, at);
@@ -390,7 +390,7 @@ async fn a_spare_too_large_to_fit_is_let_go_rather_than_keep_the_job_out() {
     assert_eq!(budget.in_use(), 82 * MIB);
     // 14 MiB in the 16 MiB spare would charge 25 MiB: 91 of 90. Without
     // it, 23 MiB fit (89).
-    let charge = budget.charge_job_extent(23 * MIB, 14 * MIB).await.unwrap();
+    let mut charge = budget.charge_job_extent(23 * MIB, 14 * MIB).await.unwrap();
     assert_eq!(charge.bytes(), 23 * MIB);
     assert_eq!((budget.spares(), budget.in_use()), (0, 89 * MIB));
     charge.lend(14 * MIB as usize);
@@ -434,14 +434,14 @@ async fn a_hold_evicts_only_the_oldest_spare_when_one_is_enough() {
 async fn the_pool_keeps_its_newest_buffers_up_to_its_size() {
     let budget = budget(1);
     // Two jobs at once, so each has a buffer of its own.
-    let first = budget.charge_job_extent(25 * MIB, 16 * MIB).await.unwrap();
-    let second = budget.charge_job_extent(25 * MIB, 16 * MIB).await.unwrap();
+    let mut first = budget.charge_job_extent(25 * MIB, 16 * MIB).await.unwrap();
+    let mut second = budget.charge_job_extent(25 * MIB, 16 * MIB).await.unwrap();
     first.lend(16 * MIB as usize);
     let newest = second.lend(16 * MIB as usize).as_ptr() as usize;
     drop(first);
     drop(second);
     assert_eq!((budget.spares(), budget.in_use()), (1, 16 * MIB));
-    let charge = budget.charge_job_extent(25 * MIB, 16 * MIB).await.unwrap();
+    let mut charge = budget.charge_job_extent(25 * MIB, 16 * MIB).await.unwrap();
     assert_eq!(charge.lend(16 * MIB as usize).as_ptr() as usize, newest);
 }
 
@@ -458,12 +458,12 @@ async fn nothing_is_kept_without_a_pool_below_its_least_size_or_past_its_charge(
     one_job(&budget, small + 9 * MIB, small).await;
     assert_eq!((budget.spares(), budget.in_use()), (0, 0));
     // A job charge that does not count an extent keeps nothing.
-    let charge = budget.try_charge_job(25 * MIB).unwrap();
+    let mut charge = budget.try_charge_job(25 * MIB).unwrap();
     charge.lend(16 * MIB as usize);
     drop(charge);
     assert_eq!((budget.spares(), budget.in_use()), (0, 0));
     // A buffer that grew past what was charged for it is not kept.
-    let charge = budget.charge_job_extent(25 * MIB, 16 * MIB).await.unwrap();
+    let mut charge = budget.charge_job_extent(25 * MIB, 16 * MIB).await.unwrap();
     charge.lend(16 * MIB as usize).resize(17 * MIB as usize, 0);
     drop(charge);
     assert_eq!((budget.spares(), budget.in_use()), (0, 0));

@@ -606,7 +606,7 @@ where
         &self,
         lease: &Lease,
         job: &JobExtent,
-        charge: Option<&Charge>,
+        charge: Option<&mut Charge>,
     ) -> JobOutcome {
         let done = self.post_extent(lease, job, charge).await;
         // A slot that came to the job while it waited and that it did
@@ -622,7 +622,7 @@ where
         &self,
         lease: &Lease,
         job: &JobExtent,
-        charge: Option<&Charge>,
+        charge: Option<&mut Charge>,
     ) -> core::result::Result<(), Stop> {
         let extent = &job.extent;
         check_extent_size(extent.cipher_size)?;
@@ -894,7 +894,7 @@ where
         lease: &Lease,
         extent: &ExtentRow,
         stored: StoredPlan,
-        charge: Option<&'c Charge>,
+        charge: Option<&'c mut Charge>,
     ) -> core::result::Result<Loaded<'c>, Stop> {
         let started = self.clock.now();
         let mut cipher = match charge {
@@ -1457,7 +1457,7 @@ where
         }
         let bytes =
             repost_job_bytes(extent.cipher_size, self.cfg.post_sockets, parity_count).min(room);
-        let Ok(charge) = self
+        let Ok(mut charge) = self
             .budget
             .charge_job_extent(bytes, extent.cipher_size)
             .await

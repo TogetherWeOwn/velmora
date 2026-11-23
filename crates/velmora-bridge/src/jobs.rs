@@ -480,13 +480,13 @@ where
         };
         let wait_ms = self.clock.now().0 - waited_from.0;
         crate::trace::note(extent, |t| t.wait_ms = wait_ms);
-        let Ok(charge) = charged else {
+        let Ok(mut charge) = charged else {
             // No memory right now is not a failure of the extent: give the
             // lease back without spending an attempt.
             return settle(&self.catalog, &self.clock, lease, Stop::NoPermit).await;
         };
         match stage {
-            OutboxStage::Post => self.post_stage_in(lease, &row, Some(&charge)).await,
+            OutboxStage::Post => self.post_stage_in(lease, &row, Some(&mut charge)).await,
             OutboxStage::Verify => self.verify_stage(lease, &row).await,
             _ => self.release_stage(lease, &row).await,
         }
