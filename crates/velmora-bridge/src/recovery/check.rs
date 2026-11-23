@@ -52,11 +52,11 @@ use super::{
     record_name, valid_key_id, valid_set_id, RecordOpener, RECORD_PREFIX, REVOKED_KEY_PREFIX,
     TENANT_DIR, TENANT_KEY_PREFIX,
 };
-use crate::crypto::open_manifest;
 use crate::crypto::scheme2::{
     is_cross_tenant, open_record_v2, parse_control, ControlOwner, Scheme, TenantId, CONTROL_MAGIC,
     GLOBAL_CONTROL_DIRS, RECORD_V2_HEADER_LEN, RECORD_V2_MAGIC, TENANT_ID_LEN,
 };
+use crate::crypto::{open_manifest, WRAP_OVERHEAD};
 use crate::directory::gate::{anchor_epoch, GATE_ANCHOR_PREFIX};
 use crate::ports::{Clock, CopyRing, Kek, TenantRingState, TenantRings};
 use crate::types::{BridgeError, Result};
@@ -382,7 +382,8 @@ impl<R: TenantRings> JobRings<R> {
                 Err(()) => return Err(RecordCheck::RingFailed),
                 Ok(TenantRingState::Shredded) => return Err(RecordCheck::Shredded),
                 Ok(TenantRingState::Ring(ring)) if ring.key(version).is_some() => return Ok(ring),
-                Ok(TenantRingState::Ring(ring)) if ring.destroyed(version) => {
+                // After the one reload, as AM-80b orders it.
+                Ok(TenantRingState::Ring(ring)) if again && ring.destroyed(version) => {
                     return Err(RecordCheck::VersionDestroyed)
                 }
                 Ok(state) if again => {
@@ -415,6 +416,11 @@ pub async fn record_open<'k, K: Kek, R: TenantRings, T: Clock>(
             let Some((named, version)) = v2_header(sealed) else {
                 return Err(RecordCheck::CrossScheme);
             };
+            // A header with no sealed body after it is damage, decided
+            // before any key is looked for: never a key miss.
+            if sealed.len() < RECORD_V2_HEADER_LEN + WRAP_OVERHEAD {
+                return Err(RecordCheck::Unreadable);
+            }
             // The raw bytes, before any parse: an envelope that names
             // tenant 0, or no tenant at all, is another tenant's too.
             if named != tenant.as_str().as_bytes() {

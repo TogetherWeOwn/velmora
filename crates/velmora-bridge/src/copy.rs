@@ -269,6 +269,10 @@ pub const KEY_MISS_PAGE: &str = "copy_key_version_missing";
 const KEY_MISS_KEEP_MS: i64 = WALK_INTERVAL_MS;
 const KEY_MISS_ENTRIES: usize = 1000;
 const KEY_MISS_BYTES: usize = 128 * 1024;
+/// Tenants whose missing key versions the first job of a pass looks at
+/// again ([`KEY_MISS_KEY`]; dial, est): each costs one ring read and one
+/// reload at most.
+pub const RECHECK_TENANTS: usize = 16;
 /// A job that failed is retried while its pass is younger than this.
 /// A pass ends when it is [`PASS_INTERVAL_MS`] old: the next one has
 /// started.
@@ -983,6 +987,21 @@ fn asked_store(copied: Copied) -> bool {
     !matches!(copied, Copied::Gone | Copied::Not(_) | Copied::Same)
 }
 
+/// Pages a key version a job lacked, by AM-80b, at most once per pass
+/// slot: a version the chain does not name at once, one it names (a
+/// partial ring) once it was missing in the slots of
+/// [`KEY_MISS_PASSES`] passes, whatever the time within each.
+fn page_miss(mark: &mut [i64; 3], slot: i64, named: bool, tenant: &TenantId, version: u32) {
+    let due = !named || slot - mark[0] >= KEY_MISS_PASSES * PASS_INTERVAL_MS;
+    if due && mark[2] != slot {
+        mark[2] = slot;
+        let kind = if named { "partial" } else { "unknown" };
+        crate::trace::alert(|| {
+            format!("recovery copy ({KEY_MISS_PAGE}) tenant={tenant} version={version} ring={kind}")
+        });
+    }
+}
+
 /// True on the cron run that starts a pass.
 pub fn pass_due(now: UnixMs) -> bool {
     now.0.rem_euclid(PASS_INTERVAL_MS) < START_WINDOW_MS
@@ -1179,6 +1198,7 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend, R: TenantRings> Copier<'_, B, 
         // for. The time is before this pass, so that a walk that
         // begins in it answers.
         if place.is_none() {
+            self.recheck_misses().await;
             let last = self.read_time(SWEPT_KEY).await;
             if !matches!(last, Ok(Some(at)) if (0..=PASS_INTERVAL_MS).contains(&(pass.0 - at))) {
                 // Not over a later time that has come: a job that
@@ -1339,7 +1359,7 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend, R: TenantRings> Copier<'_, B, 
             };
         };
         let known_saved = self.save_known(known).await;
-        let misses_saved = self.settle(&mut counts).await;
+        let misses_saved = self.settle(&mut counts, true).await;
         Ok(CopyStep {
             counts,
             walk,
@@ -1354,10 +1374,16 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend, R: TenantRings> Copier<'_, B, 
     }
 
     /// At the end of a job: the ring loads into `counts`, the alarms of
-    /// what it found, and the pages of the key versions it lacked
-    /// ([`KEY_MISS_KEY`]). False when what it learned of those could not
-    /// be saved.
-    async fn settle(&self, counts: &mut CopyCounts) -> bool {
+    /// what it found, and, for a job of a pass (`page`), the pages of the
+    /// key versions it lacked ([`KEY_MISS_KEY`]). False when what it
+    /// learned of those could not be saved.
+    ///
+    /// A hint does not page: it runs beside the jobs of a pass, which run
+    /// one after another, and two writers of the mark could each page in
+    /// one pass or lose what the other wrote. The record it could not
+    /// copy counts `failed`, which asks for the walk, and the walk's job
+    /// pages.
+    async fn settle(&self, counts: &mut CopyCounts, page: bool) -> bool {
         let (loads, ms) = self.rings.loaded();
         counts.ring_loads = loads;
         counts.ring_ms = ms;
@@ -1372,7 +1398,91 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend, R: TenantRings> Copier<'_, B, 
             let n = counts.unknown_family;
             crate::trace::alert(|| format!("recovery copy (unknown_family) records={n}"));
         }
+        if !page {
+            let _ = self.rings.take_misses();
+            return true;
+        }
         self.page_misses().await
+    }
+
+    /// [`KEY_MISS_KEY`], without what is forgotten: an entry not seen for
+    /// [`KEY_MISS_KEEP_MS`], or with a time that has not come. `None`
+    /// when it could not be read: it is then not written over.
+    async fn read_misses(&self, now: i64) -> Option<BTreeMap<String, [i64; 3]>> {
+        let mut marks = match self.read_mark(KEY_MISS_KEY, KEY_MISS_BYTES).await {
+            Ok(Some(bytes)) => {
+                serde_json::from_slice::<BTreeMap<String, [i64; 3]>>(&bytes).unwrap_or_default()
+            }
+            Ok(None) => BTreeMap::new(),
+            Err(_) => return None,
+        };
+        marks.retain(|_, [first, last, _]| {
+            now - *last < KEY_MISS_KEEP_MS && *first <= now && *last <= now + PASS_INTERVAL_MS
+        });
+        Some(marks)
+    }
+
+    async fn save_misses(&self, marks: BTreeMap<String, [i64; 3]>) -> bool {
+        let mut marks = marks;
+        if marks.len() > KEY_MISS_ENTRIES {
+            // The ones seen last stay.
+            let mut by_last: Vec<(String, [i64; 3])> = marks.into_iter().collect();
+            by_last.sort_by_key(|(_, m)| std::cmp::Reverse(m[1]));
+            by_last.truncate(KEY_MISS_ENTRIES);
+            marks = by_last.into_iter().collect();
+        }
+        // Serializing strings and integers cannot fail.
+        let body = serde_json::to_vec(&marks).unwrap_or_default();
+        put_mark(self.safety, KEY_MISS_KEY, body).await.is_ok()
+    }
+
+    /// The first job of a pass looks again at the versions of
+    /// [`KEY_MISS_KEY`], for at most [`RECHECK_TENANTS`] tenants, so that
+    /// one still missing pages in every pass, also when only the walk,
+    /// which rests for hours, comes to the records under it (AM-80b). A
+    /// version that loads now, or whose tenant is shredded or whose
+    /// version is destroyed, is forgotten. It does not make an entry seen
+    /// (its last time stays): an entry no record named for
+    /// [`KEY_MISS_KEEP_MS`] is forgotten.
+    async fn recheck_misses(&self) {
+        let now = self.clock.now().0;
+        let slot = now - now.rem_euclid(PASS_INTERVAL_MS);
+        let Some(mut marks) = self.read_misses(now).await else {
+            return;
+        };
+        let mut tenants = BTreeSet::new();
+        let keys: Vec<String> = marks.keys().cloned().collect();
+        for key in keys {
+            let parsed = key
+                .rsplit_once('/')
+                .and_then(|(t, v)| Some((TenantId::parse(t).ok()?, v.parse::<u32>().ok()?)));
+            let Some((tenant, version)) = parsed else {
+                marks.remove(&key);
+                continue;
+            };
+            if !tenants.contains(&tenant) {
+                if tenants.len() >= RECHECK_TENANTS {
+                    continue;
+                }
+                tenants.insert(tenant.clone());
+            }
+            match self.rings.key_for(self.clock, &tenant, version).await {
+                Ok(_) | Err(RecordCheck::Shredded) | Err(RecordCheck::VersionDestroyed) => {
+                    marks.remove(&key);
+                }
+                Err(RecordCheck::KeyMissing { named }) => {
+                    if let Some(mark) = marks.get_mut(&key) {
+                        page_miss(mark, slot, named, &tenant, version);
+                    }
+                }
+                // Not read now: kept as it is.
+                Err(_) => {}
+            }
+        }
+        // Handled here: the misses of the recheck do not make an entry
+        // seen.
+        let _ = self.rings.take_misses();
+        let _ = self.save_misses(marks).await;
     }
 
     /// Pages each key version the reloaded rings of this job lacked, by
@@ -1389,49 +1499,20 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend, R: TenantRings> Copier<'_, B, 
         }
         let now = self.clock.now().0;
         let slot = now - now.rem_euclid(PASS_INTERVAL_MS);
-        let (mut marks, readable) = match self.read_mark(KEY_MISS_KEY, KEY_MISS_BYTES).await {
-            Ok(Some(bytes)) => (
-                serde_json::from_slice::<BTreeMap<String, [i64; 3]>>(&bytes).unwrap_or_default(),
-                true,
-            ),
-            Ok(None) => (BTreeMap::new(), true),
-            Err(_) => (BTreeMap::new(), false),
-        };
-        // Not seen for long, or a time that has not come: forgotten.
-        marks.retain(|_, [first, last, _]| {
-            now - *last < KEY_MISS_KEEP_MS && *first <= now && *last <= now + PASS_INTERVAL_MS
-        });
+        let read = self.read_misses(now).await;
+        let readable = read.is_some();
+        let mut marks = read.unwrap_or_default();
         for (tenant, version, named) in misses {
             let mark = marks
                 .entry(format!("{tenant}/{version}"))
                 .or_insert([slot, now, i64::MIN]);
             mark[1] = mark[1].max(now);
-            // By pass slots: missing in the slots of 4 passes, it pages in
-            // the fifth, whatever the time within each.
-            let due = !named || slot - mark[0] >= KEY_MISS_PASSES * PASS_INTERVAL_MS;
-            if due && mark[2] != slot {
-                mark[2] = slot;
-                let kind = if named { "partial" } else { "unknown" };
-                crate::trace::alert(|| {
-                    format!(
-                        "recovery copy ({KEY_MISS_PAGE}) tenant={tenant} version={version} ring={kind}"
-                    )
-                });
-            }
+            page_miss(mark, slot, named, &tenant, version);
         }
         if !readable {
             return false;
         }
-        if marks.len() > KEY_MISS_ENTRIES {
-            // The ones seen last stay.
-            let mut by_last: Vec<(String, [i64; 3])> = marks.into_iter().collect();
-            by_last.sort_by_key(|(_, m)| std::cmp::Reverse(m[1]));
-            by_last.truncate(KEY_MISS_ENTRIES);
-            marks = by_last.into_iter().collect();
-        }
-        // Serializing strings and integers cannot fail.
-        let body = serde_json::to_vec(&marks).unwrap_or_default();
-        put_mark(self.safety, KEY_MISS_KEY, body).await.is_ok()
+        self.save_misses(marks).await
     }
 
     /// The managed tenant whose directory the sweep goes through after
@@ -1677,8 +1758,7 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend, R: TenantRings> Copier<'_, B, 
         };
         let mut counts = (!paused).then_some(counts);
         if let Some(counts) = counts.as_mut() {
-            // What it could not save is left for later jobs to learn.
-            let _ = self.settle(counts).await;
+            let _ = self.settle(counts, false).await;
         }
         if why.is_some() && young {
             let again = JobOutcome::Retry {

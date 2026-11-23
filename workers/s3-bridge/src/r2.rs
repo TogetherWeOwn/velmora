@@ -346,6 +346,42 @@ impl BlobStore for R2Blobs {
         Ok(keys)
     }
 
+    /// The common prefixes of a listing with the delimiter `/`: one
+    /// request per 1,000 directories (the recovery copy's tenant
+    /// directories, AM-80 item 4).
+    async fn list_dirs(&self, prefix: &str, start_after: &str, limit: u32) -> Result<Vec<String>> {
+        let mut dirs: Vec<String> = Vec::new();
+        let mut cursor: Option<String> = None;
+        while (dirs.len() as u64) < u64::from(limit) {
+            let want = limit - dirs.len() as u32;
+            let mut req = self
+                .bucket
+                .list()
+                .prefix(prefix)
+                .delimiter("/")
+                .limit(want.min(1000));
+            req = match &cursor {
+                Some(c) => req.cursor(c.clone()),
+                None => req.start_after(start_after),
+            };
+            let page = req.execute().await.map_err(blob_err("list"))?;
+            dirs.extend(
+                page.delimited_prefixes()
+                    .into_iter()
+                    .filter(|d| d.as_str() > start_after),
+            );
+            cursor = match (page.truncated(), page.cursor()) {
+                (true, Some(c)) => Some(c),
+                (true, None) => {
+                    return Err(BridgeError::Blob("list: more to come and no cursor".into()))
+                }
+                (false, _) => break,
+            };
+        }
+        dirs.truncate(limit as usize);
+        Ok(dirs)
+    }
+
     /// Sizes and MD5s from the listing itself, with no read per key:
     /// R2's etag of an object written by one put is the MD5 of its
     /// bytes. As in the default, only an empty answer is the end: a
