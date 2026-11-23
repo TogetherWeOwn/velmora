@@ -50,8 +50,6 @@
 #   CRON_RUNS                 cron runs step 7 waits for (remote; default 2)
 #   E2E_PERMITS               local: d1 or do, the PERMITS the Worker runs
 #                             with (default: the dev var in wrangler.toml)
-#   E2E_SLOT_WAIT             local: poll or push, the SLOT_WAIT the Worker
-#                             runs with (default: unset, which is poll)
 #   E2E_SLICED                0 skips step 0c (a 99 MiB PutObject) against a
 #                             remote that runs without MAX_PUT_BYTES
 #
@@ -230,12 +228,6 @@ if [[ $MODE == local ]]; then
         '') ;;
         d1 | do) printf 'PERMITS=%s\n' "$E2E_PERMITS" ;;
         *) fail "E2E_PERMITS" "d1 or do" "$E2E_PERMITS" ;;
-      esac
-      # How a job without a slot waits for one; unset is poll.
-      case ${E2E_SLOT_WAIT:-} in
-        '') ;;
-        poll | push) printf 'SLOT_WAIT=%s\n' "$E2E_SLOT_WAIT" ;;
-        *) fail "E2E_SLOT_WAIT" "poll or push" "$E2E_SLOT_WAIT" ;;
       esac
     } >"$WORKER_DIR/.dev.vars"
     chmod 600 "$WORKER_DIR/.dev.vars"
@@ -1263,16 +1255,6 @@ if [[ $MODE == local && ${E2E_PERMITS:-} == do ]]; then
   n=$(grep -c 'permit gate started' "$T/wrangler.log" || true)
   [[ $n -ge 1 ]] || fail "the permit gate served this run" "a 'permit gate started' line in the Worker's log" "$n lines"
   log "permit gate: started $n time(s)"
-fi
-
-# With E2E_SLOT_WAIT=push as well, jobs that found no slot waited in the
-# gate's line: the one job slot of this run's provider went from one job
-# to the next there at least once, which the gate says in the log.
-if [[ $MODE == local && ${E2E_PERMITS:-} == do && ${E2E_SLOT_WAIT:-} == push ]]; then
-  STEP=line
-  n=$(grep -c 'permit gate line: a slot went to a job that waited' "$T/wrangler.log" || true)
-  [[ $n -ge 1 ]] || fail "a job was handed a slot in the gate's line" "a 'permit gate line' line in the Worker's log" "$n lines"
-  log "permit gate line: said $n time(s)"
 fi
 
 STEP=finished
