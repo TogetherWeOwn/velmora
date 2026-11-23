@@ -41,6 +41,11 @@ for tool in zstd jq sha256sum python3 head flock df; do
   command -v "$tool" >/dev/null || die "missing tool: $tool"
 done
 catalog_require_sqlite
+sqlite_version=$(python3 -I -c 'import sqlite3; print(sqlite3.sqlite_version)')
+if [[ ! $sqlite_version =~ ^([0-9]{1,3})\.([0-9]{1,3})\.[0-9]{1,3}$ ]] ||
+   (( 10#${BASH_REMATCH[1]} < 3 || (10#${BASH_REMATCH[1]} == 3 && 10#${BASH_REMATCH[2]} < 37) )); then
+  die "SQLite 3.37 or later is required (found $sqlite_version)"
+fi
 catalog_init_sql_limits
 catalog_init_wrangler
 batch_bytes=${VELMORA_IMPORT_BATCH_BYTES-1000000000}
@@ -108,7 +113,8 @@ verify_target() {
   if [[ ${VELMORA_IMPORT_SKIP_ROW_COUNTS:-} == yes ]]; then
     echo 'catalog-import: WARNING verification skipped (VELMORA_IMPORT_SKIP_ROW_COUNTS=yes)' >&2
   else
-    jq -cer '.[]' "$plan" >"$WORK/rows.jsonl" || die 'could not read verification plan'
+    python3 -I "$HERE/sql_longest_statement.py" validate-plan "$plan" || die 'invalid saved verification plan'
+    jq -cer '.tables[]' "$plan" >"$WORK/rows.jsonl" || die 'could not read verification plan'
     while IFS= read -r table_row; do
       table=$(jq -er '.name | strings | select(length > 0)' <<<"$table_row")
       expected=$(jq -er '.expected | select(type == "number" and . >= 0 and floor == .)' <<<"$table_row")
@@ -132,7 +138,14 @@ verify_target() {
         page=$((page + 1))
       done
       printf 'catalog-import: row count for %s: expected %s, found %s\n' "$table" "$expected" "$found"
-      [[ $found == "$expected" ]] || die "row count for $table: expected $expected, found $found; restore not verified"
+      if [[ $found != "$expected" ]]; then
+        local mismatch="row count for $table: expected $expected, found $found; restore not verified"
+        local mismatch_log="$LOG_DIR/d1-mismatch.log"
+        catalog_logged "$mismatch_log" "$wrangler" d1 execute "$target" --remote --json \
+          --command "UPDATE _velmora_import_incomplete SET phase='mismatch' WHERE phase='verify'" "$@" ||
+          die "$mismatch; could not record the mismatch, see $mismatch_log"
+        die "$mismatch; delete and recreate the partial target before retry"
+      fi
       index=$((index + 1))
     done <"$WORK/rows.jsonl"
   fi
@@ -166,9 +179,10 @@ prefix="d1/$DB/$since_ms"
 snapshot_ref="$BUCKET/$prefix"
 verification_plan="$WORK/verification.json"
 preflight_log="$LOG_DIR/d1-preflight.log"
+user_table_select="SELECT 1 FROM sqlite_master WHERE type='table' AND substr(name,1,4) <> '_cf_' AND substr(name,1,7) <> 'sqlite_' LIMIT 1"
 catalog_capture "$WORK/preflight.json" "$preflight_log" "$wrangler" d1 execute "$target" --remote --json --command \
   "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='_velmora_import_incomplete' LIMIT 1) AS incomplete,
-          EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND substr(name,1,4) <> '_cf_' AND substr(name,1,7) <> 'sqlite_' LIMIT 1) AS nonempty" \
+          EXISTS($user_table_select) AS nonempty" \
   "$@" || die "could not inspect $target, see $preflight_log"
 preflight=$(jq -er '.[0].results | select(length == 1) | .[0] |
   [.incomplete,.nonempty] | select(all(.[]; . == 0 or . == 1)) | @tsv' \
@@ -183,10 +197,14 @@ if [[ $incomplete == 1 ]]; then
     die "invalid incomplete import marker, see $resume_log"
   [[ $(jq -er '.snapshot' <<<"$marker") == "$snapshot_ref" ]] ||
     die 'the incomplete import marker belongs to a different restore point or source'
-  [[ $(jq -er '.phase' <<<"$marker") == verify ]] ||
-    die "the import into $target did not finish loading; delete and recreate the partial target before retry"
-  jq -er '.verification | fromjson | select(type == "array" and length > 0)' <<<"$marker" >"$verification_plan" ||
-    die 'could not read the saved verification plan'
+  [[ ${VELMORA_IMPORT_SKIP_ROW_COUNTS:-} != yes ]] ||
+    die 'verification cannot be skipped on a retry; delete and recreate the partial target before retry'
+  case $(jq -er '.phase' <<<"$marker") in
+    mismatch) die 'previous verification found a row-count mismatch; delete and recreate the partial target before retry' ;;
+    verify) ;;
+    *) die "the import into $target did not finish loading; delete and recreate the partial target before retry" ;;
+  esac
+  jq -er '.verification | fromjson' <<<"$marker" >"$verification_plan" || die 'invalid saved verification plan'
   printf 'catalog-import: resuming verification of %s at restore point %s\n' "$target" "$since_ms"
   verify_target "$verification_plan" "$@"
   echo 'catalog-import: next: migrations apply, then ops/restore-arm.sql (README, Restore step 2)'
@@ -273,21 +291,31 @@ catalog_check_sql_size "$loaded_bytes"
 # The SQL is already on disk; this is the additional spool space.
 require_disk "$((loaded_bytes + (loaded_bytes + 9) / 10))"
 catalog_check_sql_statements "$sql" >/dev/null
-python3 -I "$HERE/sql_longest_statement.py" split "$sql" "$WORK" "$batch_bytes" "$catalog_sql_statement_limit" --discard-staged-sql
+verify_flags=()
+if [[ ${VELMORA_IMPORT_SKIP_ROW_COUNTS:-} == yes ]]; then verify_flags+=(--skip-verification); fi
+python3 -I "$HERE/sql_longest_statement.py" split "$sql" "$WORK" "$batch_bytes" "$catalog_sql_statement_limit" \
+  --discard-staged-sql "${verify_flags[@]}"
 
 jq -er '.batches[] | [.file, .bytes, .sha256] | @tsv' "$WORK/split.json" >"$WORK/batches.tsv"
-plan=$(jq -acer '.tables | select(type == "array" and length > 0)' "$WORK/split.json")
-(( ${#plan} <= 60000 )) || die 'the dump verification plan is too large for a D1 marker'
+plan=$(jq -acer '{format: 1, tables}' "$WORK/split.json")
 printf '%s\n' "$plan" >"$verification_plan"
+python3 -I "$HERE/sql_longest_statement.py" validate-plan "$verification_plan" "${verify_flags[@]}" ||
+  die 'invalid dump verification plan'
 # Escape SQL text literals. This plan was derived solely from the checksum-
 # verified dump, and is captured before the first schema or data batch runs.
 snapshot_sql=${snapshot_ref//\'/\'\'}
 plan_sql=${plan//\'/\'\'}
+(( ${#plan_sql} + ${#snapshot_sql} <= 60000 )) || die 'the dump verification plan is too large for a D1 marker'
+# Claim the empty database atomically. A second host may have completed
+# its load during staging, even if the earlier probe found no tables.
+cat >"$WORK/claim.sql" <<SQL
+SELECT CASE WHEN EXISTS($user_table_select) THEN json('catalogue target is no longer empty') END;
+CREATE TABLE _velmora_import_incomplete (restore_point INTEGER NOT NULL, snapshot TEXT NOT NULL, phase TEXT NOT NULL CHECK(phase IN ('loading','verify','mismatch')), verification TEXT NOT NULL);
+INSERT INTO _velmora_import_incomplete VALUES ($since_ms, '$snapshot_sql', 'loading', '$plan_sql');
+SQL
 marker_log="$LOG_DIR/d1-import-marker.log"
-catalog_logged "$marker_log" "$wrangler" d1 execute "$target" --remote --json --command \
-  "CREATE TABLE _velmora_import_incomplete (restore_point INTEGER NOT NULL, snapshot TEXT NOT NULL, phase TEXT NOT NULL CHECK(phase IN ('loading','verify')), verification TEXT NOT NULL);
-   INSERT INTO _velmora_import_incomplete VALUES ($since_ms, '$snapshot_sql', 'loading', '$plan_sql');" \
-  "$@" || die "could not mark the target as incomplete, see $marker_log"
+catalog_logged "$marker_log" "$wrangler" d1 execute "$target" --remote --yes --file "$WORK/claim.sql" \
+  "$@" || die "could not claim an empty target $target, see $marker_log"
 batch=0
 while IFS=$'\t' read -r file bytes sha256; do
   [[ $file =~ ^batch-[0-9]{8}\.sql$ ]] || die 'invalid batch file name in split manifest'
@@ -302,10 +330,12 @@ while IFS=$'\t' read -r file bytes sha256; do
   batch=$((batch + 1))
 done <"$WORK/batches.tsv"
 
-phase_log="$LOG_DIR/d1-verification-phase.log"
-catalog_logged "$phase_log" "$wrangler" d1 execute "$target" --remote --json --command \
-  "UPDATE _velmora_import_incomplete SET phase='verify' WHERE phase='loading'" \
-  "$@" || die "could not record that all batches loaded, see $phase_log"
+if [[ ${VELMORA_IMPORT_SKIP_ROW_COUNTS:-} != yes ]]; then
+  phase_log="$LOG_DIR/d1-verification-phase.log"
+  catalog_logged "$phase_log" "$wrangler" d1 execute "$target" --remote --json --command \
+    "UPDATE _velmora_import_incomplete SET phase='verify' WHERE phase='loading'" \
+    "$@" || die "could not record that all batches loaded, see $phase_log"
+fi
 verify_target "$verification_plan" "$@"
 printf 'catalog-import: loaded %s bytes into %s from restore point %s\n' "$loaded_bytes" "$target" "$since_ms"
 echo 'catalog-import: next: migrations apply, then ops/restore-arm.sql (README, Restore step 2)'

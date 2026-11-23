@@ -1619,7 +1619,7 @@ async fn restore_route_refuses_to_replay_an_incomplete_import() {
     });
     let before = restore_state(&restoring);
     let body = json!({ "since_ms": 0 });
-    for phase in ["loading", "verify"] {
+    for phase in ["loading", "verify", "mismatch"] {
         restoring.bridge.catalog.sql.with_conn(|c| {
             c.execute("UPDATE _velmora_import_incomplete SET phase = ?1", [phase])
                 .unwrap();

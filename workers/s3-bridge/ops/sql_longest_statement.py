@@ -172,7 +172,7 @@ def sql_identifier(name):
     return '"' + name.replace('"', '""') + '"'
 
 
-def verification_keys(conn, name, without_rowid):
+def verification_keys(conn, name, without_rowid, allow_unpaged=False):
     if without_rowid:
         index, = conn.execute("SELECT name FROM pragma_index_list(?) WHERE origin='pk'", (name,)).fetchone()
         keys = conn.execute('SELECT name, "desc", coll FROM pragma_index_xinfo(?) WHERE key=1 ORDER BY seqno',
@@ -184,7 +184,30 @@ def verification_keys(conn, name, without_rowid):
         for alias in ("rowid", "_rowid_", "oid"):
             if alias not in columns:
                 return [alias]
+    if allow_unpaged:
+        return None
     raise ValueError(f"cannot verify {name} with an indexed rowid or ascending binary primary key")
+
+
+def validate_plan(plan, allow_unpaged=False):
+    if (not isinstance(plan, dict) or set(plan) != {"format", "tables"} or type(plan["format"]) is not int
+        or plan["format"] != 1 or not isinstance(plan["tables"], list) or not plan["tables"]):
+        raise ValueError("unknown verification plan format")
+    seen = set()
+    for row in plan["tables"]:
+        if not isinstance(row, dict) or set(row) != {"name", "expected", "keys"}:
+            raise ValueError("invalid verification table")
+        name = sql_identifier(row["name"]).lower()
+        if name in seen or type(row["expected"]) is not int or not 0 <= row["expected"] < 10**15:
+            raise ValueError("invalid expected row count or duplicate table")
+        seen.add(name)
+        keys = row["keys"]
+        if keys is None and allow_unpaged:
+            continue
+        if not isinstance(keys, list) or not 1 <= len(keys) <= 100:
+            raise ValueError("invalid verification keys")
+        if len({sql_identifier(key).lower() for key in keys}) != len(keys):
+            raise ValueError("duplicate verification keys")
 
 
 VERIFY_PAGE_SIZE = 5000
@@ -213,24 +236,43 @@ def verification_query(plan, cursor):
     aliases = [f"key_{idx}" for idx in range(len(keys))]
     order = ", ".join(keys)
     select = ", ".join(f"{key} AS {alias}" for key, alias in zip(keys, aliases))
-    where = ""
-    if cursor is not None:
+    def select_rows(where="", limit=str(VERIFY_PAGE_SIZE)):
+        return f"SELECT {select} FROM {table}{where} ORDER BY {order} LIMIT {limit}"
+
+    ctes = []
+    if cursor is None:
+        page = select_rows()
+    else:
         if not isinstance(cursor, list) or len(cursor) != len(keys):
             raise ValueError("verification cursor does not match key columns")
-        literals = ", ".join(map(cursor_literal, cursor))
-        where = f" WHERE ({order}) > ({literals})"
-    # materialized bounds all reads from the source table, including the
-    # lookup of the last key. Keep below the per-query 10k-row budget.
+        literals = list(map(cursor_literal, cursor))
+        if len(keys) == 1:
+            page = select_rows(f" WHERE {keys[0]} > {literals[0]}")
+        else:
+            # The stock row-value comparison may seek only on the first
+            # column and rescan an entire equal-prefix group. Seek each
+            # disjoint range separately, nearest prefix first. Share a
+            # single 5,000-row budget, rather than 5,000 for every branch.
+            ranges = []
+            for k in range(len(keys) - 1, -1, -1):
+                where = [f"{keys[i]} = {literals[i]}" for i in range(k)]
+                where.append(f"{keys[k]} > {literals[k]}")
+                limit = str(VERIFY_PAGE_SIZE) + "".join(f" - (SELECT COUNT(1) FROM {prior})" for prior in ranges)
+                branch = f"key_range_{k}"
+                ctes.append(f"{branch} AS MATERIALIZED ({select_rows(' WHERE ' + ' AND '.join(where), limit)})")
+                ranges.append(branch)
+            union = " UNION ALL ".join(f"SELECT * FROM {branch}" for branch in ranges)
+            page = f"SELECT * FROM ({union}) ORDER BY {', '.join(aliases)} LIMIT {VERIFY_PAGE_SIZE}"
+    ctes.append(f"page AS MATERIALIZED ({page})")
     desc = ", ".join(f"{alias} DESC" for alias in aliases)
     encode = ", ".join(
         f"json_array(typeof({alias}), CASE WHEN typeof({alias}) IN ('text','blob') "
         f"THEN hex({alias}) ELSE quote({alias}) END)" for alias in aliases)
-    return (f"WITH page AS MATERIALIZED (SELECT {select} FROM {table}{where} "
-            f"ORDER BY {order} LIMIT {VERIFY_PAGE_SIZE}) "
-            f"SELECT COUNT(1) AS n, (SELECT json_array({encode}) FROM page ORDER BY {desc} LIMIT 1) AS cursor FROM page")
+    return (f"WITH {', '.join(ctes)} SELECT COUNT(1) AS n, "
+            f"(SELECT json_array({encode}) FROM page ORDER BY {desc} LIMIT 1) AS cursor FROM page")
 
 
-def split_dump(path, directory, cap, limit, discard_staged_sql=False):
+def split_dump(path, directory, cap, limit, discard_staged_sql=False, allow_unpaged=False):
     # Private spools add about one SQL dump's worth of disk. Free the
     # verified SQL before batch creation, then free each spool as used.
     dir_path = Path(directory)
@@ -300,7 +342,8 @@ def split_dump(path, directory, cap, limit, discard_staged_sql=False):
         if unknown:
             raise ValueError(f"foreign key in {name} names an unknown table: {', '.join(sorted(unknown))}")
     rowidless = {row[1] for row in conn.execute("PRAGMA table_list") if row[0] == "main" and row[4]}
-    verify_keys = {key: verification_keys(conn, name, name in rowidless) for key, name in table_names.items()}
+    verify_keys = {key: verification_keys(conn, name, name in rowidless, allow_unpaged)
+                   for key, name in table_names.items()}
     conn.close()
     order = tuple(TopologicalSorter({k: sorted(v - {k}) for k, v in foreign.items()}).static_order())
     for key in order:
@@ -356,7 +399,12 @@ def split_dump(path, directory, cap, limit, discard_staged_sql=False):
 
 
 if __name__ == "__main__":
-    if sys.argv[1] == "page":
+    if sys.argv[1] == "validate-plan":
+        try:
+            validate_plan(json.loads(Path(sys.argv[2]).read_text()), allow_unpaged="--skip-verification" in sys.argv[3:])
+        except (OSError, ValueError) as exc:
+            raise SystemExit(f"invalid verification plan: {exc}") from None
+    elif sys.argv[1] == "page":
         try:
             print(verification_query(json.loads(sys.argv[2]), json.loads(sys.argv[3])))
         except (ValueError, KeyError, TypeError):
@@ -364,7 +412,8 @@ if __name__ == "__main__":
     elif sys.argv[1] == "split":
         try:
             split_dump(sys.argv[2], sys.argv[3], int(sys.argv[4]), int(sys.argv[5]),
-                       discard_staged_sql=sys.argv[6:] == ["--discard-staged-sql"])
+                       discard_staged_sql="--discard-staged-sql" in sys.argv[6:],
+                       allow_unpaged="--skip-verification" in sys.argv[6:])
         except CycleError as exc:
             raise SystemExit(f"foreign key cycle: {' -> '.join(exc.args[1])}") from None
         except (OSError, ValueError, sqlite3.Error) as exc:

@@ -31,9 +31,14 @@ MISSING = "✘ [ERROR] The specified key does not exist."
 COLOURED_MISSING = "\x1b[31m✘ \x1b[1;41m[ERROR]\x1b[0m\x1b[31m The specified key does not exist.\x1b[0m"
 
 
+def is_batch_load(call):
+    return (call[2:4] == ["d1", "execute"] and "--file" in call and
+            Path(call[call.index("--file") + 1]).name.startswith("batch-"))
+
+
 def is_d1_write(call):
     return (call[2:4] == ["d1", "execute"] and
-            ("--file" in call or not call[call.index("--command") + 1].startswith(("SELECT ", "WITH page "))))
+            ("--file" in call or not call[call.index("--command") + 1].startswith(("SELECT ", "WITH "))))
 
 
 STUB = """#!/usr/bin/env python3
@@ -156,14 +161,11 @@ elif args[:3] == ["wrangler", "d1", "execute"]:
         if query.startswith("SELECT EXISTS(SELECT 1 FROM sqlite_master"):
             with sqlite3.connect(sqlite_file if sqlite_file.exists() else ":memory:") as conn:
                 incomplete, nonempty = conn.execute(query).fetchone()
-            if not incomplete:
-                nonempty = bool(int(os.environ.get("FAKE_TABLES", 0)))
-                if not nonempty:
-                    target_file.unlink(missing_ok=True)
-                    sqlite_file.unlink(missing_ok=True)
-                    if batches.exists():
-                        shutil.rmtree(batches)
-            rows = [{"incomplete": incomplete, "nonempty": int(nonempty)}]
+            if os.environ.get("FAKE_STALE_EMPTY_PREFLIGHT"):
+                # Simulate an earlier 'empty' observation without deleting
+                # the committed catalogue that another host left behind.
+                incomplete, nonempty = 0, 0
+            rows = [{"incomplete": incomplete, "nonempty": nonempty}]
         elif query.startswith(("CREATE TABLE _velmora_import_incomplete", "DROP TABLE _velmora_import_incomplete",
                                "UPDATE _velmora_import_incomplete")):
             sqlite_file.parent.mkdir(exist_ok=True)
@@ -171,6 +173,8 @@ elif args[:3] == ["wrangler", "d1", "execute"]:
                 conn.executescript(query)
             rows = []
         else:
+            if query.startswith("WITH ") and os.environ.get("FAKE_FAIL_VERIFY"):
+                sys.exit("stub verification unavailable")
             with sqlite3.connect(sqlite_file) as conn:
                 conn.row_factory = sqlite3.Row
                 rows = [dict(row) for row in conn.execute(query)]
@@ -180,10 +184,17 @@ elif args[:3] == ["wrangler", "d1", "execute"]:
     else:
         assert "--yes" in args
         source = Path(args[args.index("--file") + 1])
+        if source.name == "claim.sql":
+            sqlite_file.parent.mkdir(exist_ok=True)
+            with sqlite3.connect(sqlite_file) as conn:
+                conn.executescript("BEGIN IMMEDIATE;\\n" + source.read_text() + "\\nCOMMIT;")
+            sys.exit(0)
         assert source.name.startswith("batch-")
         assert not list(source.parent.glob("spool-*"))
         assert not any((source.parent / name).exists() for name in ("catalog.sql", "catalog.sql.zst", "part"))
-        if "FAKE_FAIL_BATCH" in os.environ and int(source.stem.split("-")[-1]) == int(os.environ["FAKE_FAIL_BATCH"]):
+        fail_batch = os.environ.get("FAKE_FAIL_BATCH")
+        if ((fail_batch == "footer" and b"CREATE INDEX child_idx" in source.read_bytes())
+                or (fail_batch and fail_batch.isdigit() and int(source.stem.split("-")[-1]) == int(fail_batch))):
             sys.exit("stub batch failure")
         sqlite_file.parent.mkdir(exist_ok=True)
         with sqlite3.connect(sqlite_file) as conn:
@@ -313,6 +324,16 @@ class CatalogueScripts(unittest.TestCase):
             "longest statement 97 bytes, database 32768 bytes",
         )
         return ms, prefix, manifest
+
+    def test_import_refuses_host_sqlite_before_337_before_remote_calls(self):
+        self.env["FAKE_PYTHON_EXE"] = sys.executable
+        python = Path(self.env["TMPDIR"]) / "python3"
+        python.write_text('#!/bin/sh\n'
+                          'case "${3-}" in *sqlite3.sqlite_version*) printf "%s\\n" 3.36.0; exit 0;; esac\n'
+                          'exec "$FAKE_PYTHON_EXE" "$@"\n')
+        python.chmod(0o755)
+        self.assert_refused(self.run_script("import", "scratch-db", MS), "SQLite 3.37 or later is required (found 3.36.0)")
+        self.assertEqual(self.calls(), [])
 
     def test_missing_or_wrong_wrangler_pin_makes_no_remote_calls(self):
         for version in ("4.166.0", None):
@@ -634,7 +655,15 @@ class CatalogueScripts(unittest.TestCase):
                 self.assertEqual(manifest["zst_bytes"] % size, 0)
                 self.assertEqual(len(manifest["parts"]), manifest["zst_bytes"] // size)
                 self.assertTrue(all(part["bytes"] == size for part in manifest["parts"]))
+                self.reset_scratch_target()
                 self.assert_loaded(self.run_script("import", "scratch-db", ms), ms)
+
+    def reset_scratch_target(self):
+        (self.db / "scratch-db").unlink(missing_ok=True)
+        (self.db / "sqlite" / "scratch-db.sqlite").unlink(missing_ok=True)
+        batches = self.db / "batches"
+        if batches.exists():
+            shutil.rmtree(batches)
 
     def assert_loaded(self, result, ms, leading_lines=()):
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -880,6 +909,7 @@ class CatalogueScripts(unittest.TestCase):
                 self.env.update(FAKE_DATE=str(int(MS) + offset), VELMORA_IMPORT_BATCH_BYTES=str(cap))
                 self.fixture.write_bytes(header + b"".join(statements))
                 ms, _, _, _ = self.export()
+                self.reset_scratch_target()
                 result = self.run_script("import", "scratch-db", ms)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 batches = sorted((self.db / "batches").glob("*.sql"))
@@ -895,8 +925,7 @@ class CatalogueScripts(unittest.TestCase):
         self.assertIn("batch 3 failed", result.stderr)
         self.assertIn("partial load", result.stderr)
         self.assertIn("deleted and recreated", result.stderr)
-        self.assertEqual(len([call for call in self.calls() if "--file" in call and
-                              call[2:4] == ["d1", "execute"]]), 4)
+        self.assertEqual(sum(map(is_batch_load, self.calls())), 4)
         with sqlite3.connect(self.db / "sqlite" / "scratch-db.sqlite") as target:
             self.assertEqual(target.execute("SELECT restore_point FROM _velmora_import_incomplete").fetchall(),
                              [(int(ms),)])
@@ -910,6 +939,24 @@ class CatalogueScripts(unittest.TestCase):
             target.executescript(arm)
             self.assertEqual(target.execute("SELECT state FROM restore_state").fetchall(), [("replaying",)])
 
+    def test_failure_in_last_batch_cannot_resume_verification(self):
+        self.batched_fixture()
+        ms, _, _, _ = self.export()
+        self.env["FAKE_FAIL_BATCH"] = "footer"
+        result = self.run_script("import", "scratch-db", ms)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("partial load", result.stderr)
+        del self.env["FAKE_FAIL_BATCH"]
+        before = len(self.calls())
+        retry = self.run_script("import", "scratch-db", ms)
+        self.assertEqual(retry.returncode, 1, retry.stderr)
+        self.assertIn("did not finish loading", retry.stderr)
+        self.assertFalse(any("--file" in call for call in self.calls()[before:]))
+        with sqlite3.connect(self.db / "sqlite" / "scratch-db.sqlite") as target:
+            self.assertEqual(target.execute("SELECT phase FROM _velmora_import_incomplete").fetchall(), [("loading",)])
+            self.assertEqual(target.execute("SELECT COUNT(1) FROM child").fetchone(), (3,))
+            self.assertEqual(target.execute("SELECT 1 FROM sqlite_master WHERE name='child_idx'").fetchall(), [])
+
     def test_import_rechecks_each_batch_immediately_before_loading(self):
         self.batched_fixture()
         ms, _, _, _ = self.export()
@@ -917,8 +964,7 @@ class CatalogueScripts(unittest.TestCase):
         result = self.run_script("import", "scratch-db", ms)
         self.assertEqual(result.returncode, 1, result.stderr)
         self.assertIn("batch 1 failed its pre-load checksum", result.stderr)
-        self.assertEqual(len([call for call in self.calls() if "--file" in call and
-                              call[2:4] == ["d1", "execute"]]), 1)
+        self.assertEqual(sum(map(is_batch_load, self.calls())), 1)
 
     def test_batched_import_reports_incorrect_row_count(self):
         self.batched_fixture()
@@ -927,22 +973,36 @@ class CatalogueScripts(unittest.TestCase):
         result = self.run_script("import", "scratch-db", ms)
         self.assertEqual(result.returncode, 1, result.stderr)
         self.assertIn("row count for child: expected 3, found 4", result.stderr)
+        marker = "SELECT phase FROM _velmora_import_incomplete"
         with sqlite3.connect(self.db / "sqlite" / "scratch-db.sqlite") as target:
-            self.assertEqual(target.execute("SELECT restore_point FROM _velmora_import_incomplete").fetchall(),
-                             [(int(ms),)])
+            self.assertEqual(target.execute(marker).fetchall(), [("mismatch",)])
+        before = len(self.calls())
+        self.env["VELMORA_IMPORT_SKIP_ROW_COUNTS"] = "yes"
+        skip = self.run_script("import", "scratch-db", ms)
+        self.assertEqual(skip.returncode, 1, skip.stderr)
+        self.assertIn("verification cannot be skipped on a retry", skip.stderr)
+        del self.env["VELMORA_IMPORT_SKIP_ROW_COUNTS"]
+        retry = self.run_script("import", "scratch-db", ms)
+        self.assertEqual(retry.returncode, 1, retry.stderr)
+        self.assertIn("previous verification found a row-count mismatch", retry.stderr)
+        self.assertFalse(any(map(is_d1_write, self.calls()[before:])))
+        with sqlite3.connect(self.db / "sqlite" / "scratch-db.sqlite") as target:
+            self.assertEqual(target.execute(marker).fetchall(), [("mismatch",)])
 
     def test_verified_retry_uses_dump_counts_without_downloading_or_loading_batches(self):
         self.batched_fixture()
         ms, _, _, _ = self.export()
-        self.env["FAKE_MISMATCH_TABLE"] = "child"
+        self.env["FAKE_FAIL_VERIFY"] = "yes"
         result = self.run_script("import", "scratch-db", ms)
         self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("retry to resume verification", result.stderr)
         target_path = self.db / "sqlite" / "scratch-db.sqlite"
         marker = "SELECT phase FROM _velmora_import_incomplete"
         with sqlite3.connect(target_path) as target:
             self.assertEqual(target.execute(marker).fetchall(), [("verify",)])
-            target.execute("INSERT INTO child VALUES (1, 'added after the dump')")
-        del self.env["FAKE_MISMATCH_TABLE"]
+            verification, = target.execute("SELECT verification FROM _velmora_import_incomplete").fetchone()
+            self.assertIn({"name": "child", "expected": 3, "keys": ["rowid"]}, json.loads(verification)["tables"])
+        del self.env["FAKE_FAIL_VERIFY"]
 
         self.env["VELMORA_IMPORT_DATABASE_ID"] = "22222222-3333-4444-8555-666666666666"
         wrong_id = self.run_script("import", "scratch-db", ms)
@@ -954,18 +1014,61 @@ class CatalogueScripts(unittest.TestCase):
         self.assertEqual(wrong_point.returncode, 1)
 
         before = len(self.calls())
-        mismatch = self.run_script("import", "scratch-db", ms)
-        self.assertEqual(mismatch.returncode, 1, mismatch.stderr)
-        self.assertIn("row count for child: expected 3, found 4", mismatch.stderr)
-        with sqlite3.connect(target_path) as target:
-            self.assertEqual(target.execute(marker).fetchall(), [("verify",)])
-            target.execute("DELETE FROM child WHERE label='added after the dump'")
         resumed = self.run_script("import", "scratch-db", ms)
         self.assertEqual(resumed.returncode, 0, resumed.stderr)
         self.assertIn("resuming verification", resumed.stdout)
         self.assertTrue(all(call[2] == "d1" and "--file" not in call for call in self.calls()[before:]))
         with sqlite3.connect(target_path) as target:
             self.assertEqual(target.execute("SELECT 1 FROM sqlite_master WHERE name='_velmora_import_incomplete'").fetchall(), [])
+
+    def test_retry_rejects_invalid_saved_verification_plan_without_clearing_marker(self):
+        self.batched_fixture()
+        ms, _, _, _ = self.export()
+        self.env["FAKE_FAIL_VERIFY"] = "yes"
+        self.assertEqual(self.run_script("import", "scratch-db", ms).returncode, 1)
+        del self.env["FAKE_FAIL_VERIFY"]
+        target_path = self.db / "sqlite" / "scratch-db.sqlite"
+        with sqlite3.connect(target_path) as target:
+            target.execute("UPDATE _velmora_import_incomplete SET verification=?",
+                           (json.dumps({"format": 1, "tables": [{"name": "child", "expected": 3, "keys": []}]}),))
+        before = len(self.calls())
+        result = self.run_script("import", "scratch-db", ms)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("invalid saved verification plan", result.stderr)
+        self.assertFalse(any(map(is_d1_write, self.calls()[before:])))
+        with sqlite3.connect(target_path) as target:
+            self.assertEqual(target.execute("SELECT phase FROM _velmora_import_incomplete").fetchall(), [("verify",)])
+
+    def test_explicit_verification_skip_allows_nocase_primary_key(self):
+        self.fixture.write_text("CREATE TABLE t (k TEXT PRIMARY KEY COLLATE NOCASE) WITHOUT ROWID;\n"
+                                "INSERT INTO t VALUES ('a');\n")
+        ms, _, _, _ = self.export()
+        self.assert_refused(self.run_script("import", "scratch-db", ms), "cannot verify t with an indexed")
+        self.assertFalse(any(map(is_d1_write, self.calls())))
+        self.env["VELMORA_IMPORT_SKIP_ROW_COUNTS"] = "yes"
+        result = self.run_script("import", "scratch-db", ms)
+        self.assert_loaded(result, ms)
+        self.assertIn("WARNING verification skipped", result.stderr)
+
+    def test_composite_text_cursor_seeks_on_every_primary_key_column(self):
+        make_query = runpy.run_path(str(ROOT / "ops" / "sql_longest_statement.py"))["verification_query"]
+        plan_row = {"name": "objects", "keys": ["bucket_id", "key"]}
+        with sqlite3.connect(":memory:") as target:
+            target.execute("CREATE TABLE objects(bucket_id TEXT, key TEXT, PRIMARY KEY(bucket_id,key)) WITHOUT ROWID")
+            target.executemany("INSERT INTO objects VALUES ('B',?)", ((f"{n:05}",) for n in range(50_000)))
+            work = []
+            for suffix in (b"00010", b"44000"):
+                query = make_query(plan_row, [["text", "42"], ["text", suffix.hex().upper()]])
+                plan = [row[3] for row in target.execute("EXPLAIN QUERY PLAN " + query)]
+                self.assertTrue(any("SEARCH objects USING PRIMARY KEY (bucket_id=? AND key>?)" in step
+                                    for step in plan), plan)
+                self.assertTrue(any("SEARCH objects USING PRIMARY KEY (bucket_id>?)" in step for step in plan), plan)
+                steps = []
+                target.set_progress_handler(lambda: steps.append(None) or 0, 1000)
+                self.assertEqual(target.execute(query).fetchone()[0], 5000)
+                target.set_progress_handler(None, 0)
+                work.append(len(steps))
+            self.assertLessEqual(abs(work[1] - work[0]), 2, work)
 
     def test_verification_uses_bounded_keyset_pages_for_rowid_and_composite_pk(self):
         with self.fixture.open("w") as dump:
@@ -1115,10 +1218,11 @@ class CatalogueScripts(unittest.TestCase):
         self.assert_loaded(self.run_script("import", "scratch-db", ms), ms)
         manifest["format"] = 1
         self.object_path(key).write_text(json.dumps(manifest))
+        self.reset_scratch_target()
         self.assert_loaded(self.run_script("import", "scratch-db", ms), ms)
         manifest["format"] = 3
         self.object_path(key).write_text(json.dumps(manifest))
-        (self.db / "scratch-db").unlink()
+        self.reset_scratch_target()
         self.assert_refused(self.run_script("import", "scratch-db", ms), f"invalid manifest {key}")
 
     def test_import_refuses_manifest_naming_another_database(self):
@@ -1146,10 +1250,11 @@ class CatalogueScripts(unittest.TestCase):
 
     def test_nonempty_target(self):
         ms, _, _, _ = self.export()
-        self.env["FAKE_TABLES"] = "3"
+        self.assert_loaded(self.run_script("import", "scratch-db", ms), ms)
         before = len(self.calls())
-        self.assert_refused(self.run_script("import", "scratch-db", ms),
-                            "catalog-import: scratch-db is not empty")
+        result = self.run_script("import", "scratch-db", ms)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("catalog-import: scratch-db is not empty", result.stderr)
         resolve, probe = self.calls()[before:]
         self.assertEqual(resolve[2:4], ["d1", "info"])
         self.assertEqual(probe[2:4], ["d1", "execute"])
@@ -1157,6 +1262,21 @@ class CatalogueScripts(unittest.TestCase):
         sql = probe[probe.index("--command") + 1]
         self.assertNotIn("COUNT(", sql.upper())
         self.assertEqual(sql.upper().count("LIMIT 1"), 2)
+
+    def test_stale_preflight_cannot_mark_a_completed_restore(self):
+        ms, _, _, _ = self.export()
+        self.assert_loaded(self.run_script("import", "scratch-db", ms), ms)
+        target_path = self.db / "sqlite" / "scratch-db.sqlite"
+        before_db = target_path.read_bytes()
+        before = len(self.calls())
+        self.env["FAKE_STALE_EMPTY_PREFLIGHT"] = "yes"
+        result = self.run_script("import", "scratch-db", ms)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("could not claim an empty target", result.stderr)
+        self.assertFalse(any(map(is_batch_load, self.calls()[before:])))
+        self.assertEqual(target_path.read_bytes(), before_db)
+        with sqlite3.connect(target_path) as target:
+            self.assertEqual(target.execute("SELECT 1 FROM sqlite_master WHERE name='_velmora_import_incomplete'").fetchall(), [])
 
     def test_legacy_export(self):
         ms = "123"
@@ -1168,6 +1288,7 @@ class CatalogueScripts(unittest.TestCase):
                 self.env["FAKE_MISSING"] = missing
                 if not missing:
                     self.env["VELMORA_EXPORT_RCLONE_REMOTE"] = "r2x"
+                self.reset_scratch_target()
                 self.assert_loaded(self.run_script("import", "scratch-db", ms), ms, [
                     "catalog-import: legacy export without a manifest; no checksum to check",
                 ])

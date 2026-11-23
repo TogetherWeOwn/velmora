@@ -267,8 +267,9 @@ The importer also reads format 1 manifests with `.sql.zst.part-NNN` keys.
 
 Install the pinned Wrangler with `npm ci` in `workers/s3-bridge` before
 running either script. They require the local Wrangler version from
-`package-lock.json`, Python 3.10 or later with SQLite support, and `flock`. On the same
-host, run these scripts as the same user with the same `TMPDIR` so they share
+`package-lock.json`, Python 3.10 or later with SQLite support, and `flock`.
+The importer requires SQLite 3.37 or later. On the same host, run these
+scripts as the same user with the same `TMPDIR` so they share
 locks: exports lock by source database name, imports by resolved target UUID.
 
 The exporter has no single-file SQL size limit. It refuses an export with any
@@ -341,18 +342,19 @@ older Worker cannot enforce it on a direct replay call.
      or the larger decompression/assembly requirement. It discards compressed
      bytes after verification, the SQL after spooling, and spools as used.
 
-     The target is marked incomplete before the first batch. The marker
-     blocks arming and replay until the import finishes. If loading stops
-     before all batches are recorded as loaded, delete and recreate the
-     partial restore target before retrying. The script never deletes databases.
+     Before batch 0, a single D1 import checks that the target is still
+     empty and marks it incomplete. The marker blocks arming and replay.
+     If loading stops before all batches are recorded as loaded, delete and
+     recreate the target before retrying. The script never deletes databases.
 
-     After all batches load, verification counts the idle target in indexed
-     pages of at most 5,000 rows per query. If verification fails, run the
-     same command with the same source, restore point, and target UUID. It
-     uses the expected row counts saved from the dump and retries verification
-     without downloading or loading any batches. The marker is cleared only
-     when verification passes or you explicitly skip it with
-     `VELMORA_IMPORT_SKIP_ROW_COUNTS=yes` (the script prints a warning).
+     Verification counts the idle target in indexed pages of at most 5,000
+     rows per query. If a verification query fails or is interrupted, rerun
+     the same command with the same source, restore point, and target UUID.
+     It verifies the counts saved from the dump without downloading or
+     reloading any batches. If the counts differ, delete and recreate the
+     target; never skip verification of a known mismatch. The opt-out
+     (`VELMORA_IMPORT_SKIP_ROW_COUNTS=yes`) is accepted only on a fresh load
+     and prints a warning. A retry cannot clear the marker by skipping.
    - Nothing: create a database. The restore point is `0`.
 
    Then, in every case, bring the schema up to date and close the
