@@ -266,15 +266,22 @@ exports at the same restore point do not overwrite each other's parts.
 The importer also reads format 1 manifests with `.sql.zst.part-NNN` keys.
 
 Install the pinned Wrangler with `npm ci` in `workers/s3-bridge` before
-running either script. Both scripts also require Python 3 with SQLite support
-to check statement lengths without executing the SQL. The export refuses to
-upload any parts if the uncompressed dump exceeds 5,000,000,000 bytes or a SQL
-statement exceeds 100,000 bytes. The importer checks the same limits before
-loading SQL with Wrangler's single-file D1 import.
+running either script. They require the local Wrangler version from
+`package-lock.json`, Python 3 with SQLite support, and `flock`. On the same
+host, run these scripts as the same user with the same `TMPDIR` so they share
+locks: exports lock by source database name, imports by resolved target UUID.
+
+The exporter has no single-file SQL size limit. It refuses an export with any
+SQL statement over 100,000 bytes, which D1 cannot import. Its summary gives the
+longest statement and the D1 file size along with the snapshot sizes. Set
+`VELMORA_EXPORT_SIZES_LOG` to append those measurements as JSON lines. The
+export warns at 60% of either the statement limit or the paid plan's 10 GB
+[database limit](https://developers.cloudflare.com/d1/platform/limits/).
 
 Wrangler uploads each part by default. Splitting keeps each upload under
 Wrangler's 300 MiB limit. `VELMORA_EXPORT_PART_BYTES` defaults to 268435456
-(256 MiB) and accepts positive integers up to 300000000. To use rclone for
+(256 MiB) and accepts positive integers up to 300000000. At the default, the
+1,000-part limit holds over 268 GB of compressed SQL. To use rclone for
 uploads and restores, set `VELMORA_EXPORT_RCLONE_REMOTE` to the name of a
 configured remote for the R2 S3 endpoint. On failure, the scripts report
 where they kept private transfer logs. Staged SQL and parts are removed
@@ -309,9 +316,27 @@ exists: restore it to a timestamp, then replay from that timestamp.
      target is a Wrangler binding. A production catalogue also requires
      `VELMORA_IMPORT_PRODUCTION=yes`. The export carries the schema and
      the list of applied migrations, so apply migrations after loading it.
-     The script bounds decompression by the declared SQL size and the import
-     limit, checks every manifest checksum, and refuses a non-empty database.
-     Legacy single-file exports have no checksums.
+     Do not run against production without these confirmations. The script
+     refuses a non-empty database. It bounds decompression by the manifest's
+     SQL size and checks every checksum before splitting. Legacy single-file
+     exports have no checksums.
+
+     Restore always uses statement-safe batches, even for small exports:
+     table schemas first, INSERTs in foreign-key order, then the remaining
+     statements (including indexes and triggers). A dependency cycle is
+     refused, as are rows for a self-referencing table that cannot fit in
+     one batch. `VELMORA_IMPORT_BATCH_BYTES` defaults to 1,000,000,000 bytes
+     and cannot exceed D1's 5,000,000,000-byte file import limit. The script
+     proves that every original statement is accounted for and rechecks each
+     batch's checksum before loading it.
+
+     Reserve local disk for the compressed download, the uncompressed SQL,
+     the spool (about another SQL dump), and the batches (about one more
+     SQL dump plus repeated leading PRAGMAs). If a batch fails, delete and
+     recreate the partial restore target before retrying; the script never
+     deletes databases. After loading, row-count checks read every row of the
+     idle restore target once. Use `VELMORA_IMPORT_SKIP_ROW_COUNTS=yes` only
+     to skip that scan explicitly; the script prints a warning.
    - Nothing: create a database. The restore point is `0`.
 
    Then, in every case, bring the schema up to date and close the

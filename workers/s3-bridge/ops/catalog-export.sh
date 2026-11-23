@@ -18,6 +18,7 @@
 #   VELMORA_EXPORT_BUCKET  R2 bucket (default velmora-catalog-export)
 #   VELMORA_EXPORT_PART_BYTES     maximum part size (default 268435456)
 #   VELMORA_EXPORT_RCLONE_REMOTE  optional configured rclone remote
+#   VELMORA_EXPORT_SIZES_LOG      optional file for JSON lines of export sizes
 #   CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID  for wrangler
 #
 # The manifest is uploaded last. Without it the parts are incomplete.
@@ -33,9 +34,12 @@ cd "$HERE/.."
 DB=${VELMORA_D1:-velmora-catalog}
 BUCKET=${VELMORA_EXPORT_BUCKET:-velmora-catalog-export}
 remote=${VELMORA_EXPORT_RCLONE_REMOTE-}
+# 1000 parts at the default hold over 268 GB of compressed SQL.
 part_bytes=${VELMORA_EXPORT_PART_BYTES-268435456}
+part_limit=$(catalog_part_max_bytes)
+readonly D1_PAID_MAX_DB_BYTES=10000000000
 
-for tool in zstd jq split sha256sum python3 od; do
+for tool in zstd jq split sha256sum python3 od flock; do
   command -v "$tool" >/dev/null || { echo "catalog-export: missing tool: $tool" >&2; exit 1; }
 done
 catalog_require_sqlite
@@ -44,12 +48,15 @@ if [[ ${VELMORA_EXPORT_RCLONE_REMOTE+x} && ! $remote =~ ^[A-Za-z0-9_-]+$ ]]; the
   echo "catalog-export: invalid VELMORA_EXPORT_RCLONE_REMOTE" >&2
   exit 1
 fi
-if [[ $part_bytes =~ ^0*([1-9][0-9]{0,8})$ ]] && (( BASH_REMATCH[1] <= 300000000 )); then
+if [[ $part_bytes =~ ^0*([1-9][0-9]{0,8})$ ]] && (( BASH_REMATCH[1] <= part_limit )); then
   part_bytes=${BASH_REMATCH[1]}
 else
-  echo "catalog-export: VELMORA_EXPORT_PART_BYTES must be an integer from 1 to 300000000" >&2
+  echo "catalog-export: VELMORA_EXPORT_PART_BYTES must be an integer from 1 to $part_limit" >&2
   exit 1
 fi
+catalog_init_wrangler
+lock_key=$(printf '%s' "$DB" | sha256sum)
+catalog_lock export "$DB" "${lock_key%% *}"
 
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/velmora-export.XXXXXX")
 trap 'catalog_cleanup "$?"' EXIT
@@ -74,7 +81,7 @@ get() {
     if [[ -e $out ]]; then rm -- "$out" || return 1; fi
     rclone copyto "$remote:$BUCKET/$key" "$out" --ignore-times </dev/null
   else
-    npx wrangler r2 object get "$BUCKET/$key" --file "$out" --remote "$@" </dev/null
+    "$wrangler" r2 object get "$BUCKET/$key" --file "$out" --remote "$@" </dev/null
   fi >"$log" 2>&1
 }
 
@@ -99,13 +106,20 @@ fi
 
 file="$WORK/catalog.sql"
 export_log="$LOG_DIR/d1-export.log"
-npx wrangler d1 export "$DB" --remote --output "$file" "$@" </dev/null >"$export_log" 2>&1 ||
+"$wrangler" d1 export "$DB" --remote --output "$file" "$@" </dev/null >"$export_log" 2>&1 ||
   catalog_error "wrangler d1 export failed, see $export_log"
 [[ -s $file ]] || catalog_error "the export is empty, see $export_log"
 sql_bytes=$(( $(wc -c <"$file") ))
-catalog_check_sql_size "$sql_bytes"
 grep -q 'CREATE TABLE' "$file" || { echo "catalog-export: the export has no schema" >&2; exit 1; }
-catalog_check_sql_statements "$file"
+catalog_longest_statement_bytes=$(catalog_check_sql_statements "$file")
+info_log="$LOG_DIR/d1-info.log"
+"$wrangler" d1 info "$DB" --json "$@" </dev/null >"$WORK/info.json" 2>"$info_log" ||
+  catalog_error "could not read D1 database size for $DB, see $info_log"
+database_size=$(jq -er '(.database_size // .file_size) |
+  select(type == "number" and . >= 0 and . < 1000000000000 and floor == .)' \
+  "$WORK/info.json" 2>>"$info_log") || catalog_error "invalid D1 database size for $DB, see $info_log"
+catalog_warn_at_sixty_percent sql_statement_bytes "$catalog_longest_statement_bytes" "$D1_SQL_STATEMENT_MAX_BYTES"
+catalog_warn_at_sixty_percent database_size_bytes "$database_size" "$D1_PAID_MAX_DB_BYTES"
 
 put() {
   local key=$1 path=$2 type=$3 log="$LOG_DIR/${2##*/}.put.log"
@@ -114,7 +128,7 @@ put() {
     rclone copyto "$path" "$remote:$BUCKET/$key" --s3-upload-cutoff 64M \
       --header-upload "Content-Type: $type" </dev/null
   else
-    npx wrangler r2 object put "$BUCKET/$key" --file "$path" --remote \
+    "$wrangler" r2 object put "$BUCKET/$key" --file "$path" --remote \
       --content-type "$type" "$@" </dev/null
   fi >"$log" 2>&1 || catalog_error "put of $key failed, see $log"
 }
@@ -163,6 +177,13 @@ if ! cmp -s "$WORK/manifest.json" "$WORK/readback.json"; then
   catalog_error "the manifest read back from $BUCKET/$manifest differs, see $readback_log"
 fi
 
-printf 'catalog-export: sql %s bytes, sha256 %s, zst %s bytes in %s part(s), manifest %s/%s\n' \
-  "$sql_bytes" "$sql_sha256" "$zst_bytes" "${#parts[@]}" "$BUCKET" "$manifest"
+if [[ -n ${VELMORA_EXPORT_SIZES_LOG:-} ]]; then
+  size_entry=$(jq -cn --argjson restore_point_ms "$since_ms" --argjson sql_bytes "$sql_bytes" \
+    --argjson zst_bytes "$zst_bytes" --argjson parts "${#parts[@]}" \
+    --argjson longest_statement_bytes "$catalog_longest_statement_bytes" --argjson database_size_bytes "$database_size" \
+    '{$restore_point_ms, $sql_bytes, $zst_bytes, $parts, $longest_statement_bytes, $database_size_bytes}')
+  printf '%s\n' "$size_entry" >>"$VELMORA_EXPORT_SIZES_LOG"
+fi
+printf 'catalog-export: sql %s bytes, sha256 %s, zst %s bytes in %s part(s), manifest %s/%s, longest statement %s bytes, database %s bytes\n' \
+  "$sql_bytes" "$sql_sha256" "$zst_bytes" "${#parts[@]}" "$BUCKET" "$manifest" "$catalog_longest_statement_bytes" "$database_size"
 printf 'restore point: %s\n' "$since_ms"

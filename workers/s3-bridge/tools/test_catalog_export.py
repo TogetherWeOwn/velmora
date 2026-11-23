@@ -1,12 +1,15 @@
 """Exercise the catalogue scripts against local Wrangler and rclone stubs."""
 
 from concurrent.futures import ThreadPoolExecutor
+import fcntl
 import hashlib
 import json
 import os
 from pathlib import Path
 import random
 import select
+import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -29,12 +32,20 @@ import os
 from pathlib import Path
 import shutil
 import signal
+import sqlite3
 import sys
 
 args = sys.argv[1:]
+tool = Path(sys.argv[0]).name
+if tool == "wrangler" and args == ["--version"]:
+    print(os.environ.get("FAKE_WRANGLER_VERSION", "4.161.0"))
+    sys.exit(0)
+if tool == "wrangler":
+    args.insert(0, "wrangler")
+    tool = "local"
 bucket = Path(os.environ["FAKE_BUCKET"])
 with open(os.environ["FAKE_LOG"], "a") as log:
-    print(json.dumps([Path(sys.argv[0]).name, *args]), file=log)
+    print(json.dumps([tool, *args]), file=log)
 if os.fstat(0).st_rdev != os.stat("/dev/null").st_rdev or os.read(0, 1) != b"":
     Path(os.environ["FAKE_LOG"] + ".stdin").touch()
     sys.exit("stub stdin was not /dev/null")
@@ -42,7 +53,7 @@ if os.fstat(0).st_rdev != os.stat("/dev/null").st_rdev or os.read(0, 1) != b"":
 def rendezvous(name, mode):
     # FIFO handshakes order the concurrent PUT and GET without timing assumptions.
     signal.alarm(15)
-    with (Path(os.environ["TMPDIR"]) / name).open(mode) as gate:
+    with (Path(os.environ.get("FAKE_RACE_DIR", os.environ["TMPDIR"])) / name).open(mode) as gate:
         if mode == "w":
             gate.write("go")
         else:
@@ -103,7 +114,8 @@ elif args[:3] == ["wrangler", "d1", "info"]:
     assert "--json" in args
     assert "--remote" not in args
     print(json.dumps({"uuid": os.environ["FAKE_DATABASE_ID"],
-                      "name": os.environ.get("FAKE_DATABASE_NAME", args[3])}))
+                      "name": os.environ.get("FAKE_DATABASE_NAME", args[3]),
+                      "database_size": int(os.environ.get("FAKE_DATABASE_SIZE", 32768))}))
 elif args[:3] == ["wrangler", "r2", "object"]:
     obj = bucket / args[4]
     path = Path(args[args.index("--file") + 1])
@@ -118,12 +130,39 @@ elif args[:3] == ["wrangler", "r2", "object"]:
         assert args[3] == "get"
         download(obj, path)
 elif args[:3] == ["wrangler", "d1", "execute"]:
+    db = Path(os.environ["FAKE_DB"])
+    target_file = db / args[3]
+    batches = db / "batches"
     if "--command" in args:
         assert "--json" in args
-        print(json.dumps([{"results": [{"n": int(os.environ.get("FAKE_TABLES", 0))}]}]))
+        query = args[args.index("--command") + 1]
+        if "FROM sqlite_master" in query:
+            n = int(os.environ.get("FAKE_TABLES", 0))
+            if n == 0:
+                target_file.unlink(missing_ok=True)
+                if batches.exists():
+                    shutil.rmtree(batches)
+        else:
+            with sqlite3.connect(":memory:") as conn:
+                if target_file.exists():
+                    conn.executescript(target_file.read_text())
+                n, = conn.execute(query).fetchone()
+            if query.endswith('"' + os.environ.get("FAKE_MISMATCH_TABLE", '\\0') + '"'):
+                n += 1
+        print(json.dumps([{"results": [{"n": n}]}]))
     else:
         assert "--yes" in args
-        shutil.copyfile(args[args.index("--file") + 1], Path(os.environ["FAKE_DB"]) / args[3])
+        source = Path(args[args.index("--file") + 1])
+        assert source.name.startswith("batch-")
+        if "FAKE_FAIL_BATCH" in os.environ and int(source.stem.split("-")[-1]) == int(os.environ["FAKE_FAIL_BATCH"]):
+            sys.exit("stub batch failure")
+        batches.mkdir(exist_ok=True)
+        shutil.copyfile(source, batches / source.name)
+        with target_file.open("ab") as loaded:
+            loaded.write(source.read_bytes())
+        if os.environ.get("FAKE_MUTATE_NEXT_BATCH") and source.name == "batch-00000000.sql":
+            with source.with_name("batch-00000001.sql").open("ab") as next_batch:
+                next_batch.write(b"-- changed after splitting\\n")
 else:
     sys.exit("unexpected stub command")
 """
@@ -142,8 +181,13 @@ class CatalogueScripts(unittest.TestCase):
             sql.write("CREATE TABLE fixture (value TEXT);\n")
             for _ in range(800):
                 sql.write(f"INSERT INTO fixture VALUES ('{rng.getrandbits(256):064x}');\n")
-        for name in ("npx", "rclone"):
-            stub = work / name
+        self.root = work / "bridge"
+        self.root.mkdir()
+        shutil.copytree(ROOT / "ops", self.root / "ops")
+        shutil.copyfile(ROOT / "package-lock.json", self.root / "package-lock.json")
+        self.wrangler = self.root / "node_modules" / ".bin" / "wrangler"
+        self.wrangler.parent.mkdir(parents=True)
+        for stub in (self.wrangler, work / "rclone", work / "npx"):
             stub.write_text(STUB)
             stub.chmod(0o755)
         date = work / "date"
@@ -167,8 +211,8 @@ class CatalogueScripts(unittest.TestCase):
 
     def call_script(self, action, *args, **overrides):
         return subprocess.run(
-            [str(ROOT / "ops" / f"catalog-{action}.sh"), *args, *ARGS],
-            cwd=ROOT, env={**self.env, **overrides}, text=True, input="unexpected stdin\n",
+            [str(self.root / "ops" / f"catalog-{action}.sh"), *args, *ARGS],
+            cwd=self.root, env={**self.env, **overrides}, text=True, input="unexpected stdin\n",
             capture_output=True, timeout=40,
         )
 
@@ -182,7 +226,7 @@ class CatalogueScripts(unittest.TestCase):
             self.assertEqual(list(Path(self.env["TMPDIR"]).glob(pattern)), [])
         self.assertFalse(self.log.with_suffix(".jsonl.stdin").exists())
         for call in self.calls():
-            if call[:2] == ["npx", "wrangler"] and call[2] in ("d1", "r2") and call[3] != "info":
+            if call[:2] == ["local", "wrangler"] and call[2] in ("d1", "r2") and call[3] != "info":
                 self.assertIn("--remote", call)
         return result
 
@@ -231,16 +275,48 @@ class CatalogueScripts(unittest.TestCase):
             summary,
             f"catalog-export: sql {len(sql)} bytes, sha256 {manifest['sql_sha256']}, "
             f"zst {len(compressed)} bytes in {len(manifest['parts'])} part(s), "
-            f"manifest {BUCKET}/{prefix}.manifest.json",
+            f"manifest {BUCKET}/{prefix}.manifest.json, "
+            "longest statement 97 bytes, database 32768 bytes",
         )
         return ms, prefix, manifest
+
+    def test_missing_or_wrong_wrangler_pin_makes_no_remote_calls(self):
+        for version in ("4.166.0", None):
+            with self.subTest(version=version):
+                if version is None:
+                    self.wrangler.unlink()
+                else:
+                    self.env["FAKE_WRANGLER_VERSION"] = version
+                for action, args in (("export", ()), ("import", ("scratch-db", MS))):
+                    result = self.run_script(action, *args)
+                    self.assert_refused(result, "Wrangler 4.161.0")
+                    self.assertEqual(self.calls(), [])
+
+    def test_export_contention_refuses_before_api_calls(self):
+        lock_dir = Path(self.env["TMPDIR"]) / f"velmora-catalog-locks-{os.getuid()}"
+        lock_dir.mkdir(mode=0o700)
+        lock = lock_dir / f"export-{hashlib.sha256(SOURCE.encode()).hexdigest()}.lock"
+        with lock.open("w") as held:
+            fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.assert_refused(self.run_script("export"), f"another export of {SOURCE} is running")
+        self.assertEqual(self.calls(), [])
+
+    def test_import_contention_only_resolves_target(self):
+        lock_dir = Path(self.env["TMPDIR"]) / f"velmora-catalog-locks-{os.getuid()}"
+        lock_dir.mkdir(mode=0o700)
+        self.env["FAKE_DATABASE_NAME"] = "scratch-db"
+        with (lock_dir / f"import-{DATABASE_ID}.lock").open("w") as held:
+            fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.assert_refused(self.run_script("import", "another-binding", MS),
+                                f"another import of {DATABASE_ID} is running")
+        self.assertEqual(self.calls(), [["local", "wrangler", "d1", "info", "another-binding", "--json", *ARGS]])
 
     def test_export(self):
         ms, prefix, manifest = self.check_export()
         self.assertEqual(ms, MS)
         calls = self.calls()
         self.assertTrue(all(call[-len(ARGS):] == ARGS for call in calls))
-        puts = [call for call in calls if call[:5] == ["npx", "wrangler", "r2", "object", "put"]]
+        puts = [call for call in calls if call[:5] == ["local", "wrangler", "r2", "object", "put"]]
         keys = [part["key"] for part in manifest["parts"]] + [f"{prefix}.manifest.json"]
         self.assertEqual([call[5] for call in puts], [f"{BUCKET}/{key}" for key in keys])
         self.assertEqual([call[call.index("--content-type") + 1] for call in puts],
@@ -253,7 +329,7 @@ class CatalogueScripts(unittest.TestCase):
         result = self.run_script("import", "scratch-db", ms)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual((self.db / "scratch-db").read_bytes(), self.fixture.read_bytes())
-        self.assertFalse(any(call[:3] == ["npx", "wrangler", "r2"] for call in self.calls()))
+        self.assertFalse(any(call[:3] == ["local", "wrangler", "r2"] for call in self.calls()))
 
     def test_invalid_export_settings(self):
         for name, value in [
@@ -360,7 +436,7 @@ class CatalogueScripts(unittest.TestCase):
         self.env["FAKE_MISSING_BUCKET"] = "yes"
         result = self.run_script("export")
         puts = [call[5] for call in self.calls() if call[:5] ==
-                ["npx", "wrangler", "r2", "object", "put"]]
+                ["local", "wrangler", "r2", "object", "put"]]
         self.assertEqual(len(puts), 1)
         self.assertRegex(puts[0], rf"^{BUCKET}/d1/{SOURCE}/{MS}\.[0-9a-f]{{16}}\.part-000$")
         key = puts[0].removeprefix(f"{BUCKET}/")
@@ -368,13 +444,10 @@ class CatalogueScripts(unittest.TestCase):
         self.assertEqual(log.read_text().strip(), "HTTP 404: NoSuchBucket")
         self.assertEqual(list(self.bucket.rglob("*")), [])
 
-    def test_export_rejects_file_over_limit_before_any_upload(self):
+    def test_export_has_no_single_file_size_limit(self):
         self.env["VELMORA_TEST_SQL_FILE_BYTES"] = "100"
-        result = self.run_script("export")
-        self.assert_refused(result, f"the SQL export is {self.fixture.stat().st_size} bytes, "
-                                    "over the 100 bytes one D1 import takes; "
-                                    "this export could not be restored by catalog-import.sh")
-        self.assertEqual(list(self.bucket.rglob("*")), [])
+        _, _, manifest, _ = self.export()
+        self.assertEqual(manifest["sql_bytes"], self.fixture.stat().st_size)
 
     def oversized_multiline_dump(self):
         # Neither physical line is over the 100,000-byte limit; together
@@ -433,6 +506,11 @@ class CatalogueScripts(unittest.TestCase):
                 self.assert_refused(result, f"catalog-{action}: python3 requires sqlite3 support")
                 self.assertEqual(self.calls(), [])
 
+    def test_export_rejects_dump_without_schema_before_any_upload(self):
+        self.fixture.write_text("SELECT 1;\n")
+        self.assert_refused(self.run_script("export"), "the export has no schema")
+        self.assertEqual(list(self.bucket.rglob("*")), [])
+
     def test_export_rejects_incomplete_sql_before_any_upload(self):
         self.fixture.write_text("CREATE TABLE fixture (value TEXT);\n"
                                 "INSERT INTO fixture VALUES ('unclosed;\n", encoding="utf-8")
@@ -467,11 +545,15 @@ class CatalogueScripts(unittest.TestCase):
             with os.fdopen(os.open(work / "winner-checked", os.O_RDWR), "rb") as gate:
                 self.assertTrue(select.select([gate], [], [], 10)[0], "winner did not check manifest")
                 self.assertEqual(gate.read(2), b"go")
-            loser = self.call_script("export", FAKE_RACE="loser", FAKE_FIXTURE=str(loser_sql))
+            # Simulate another host (different lock directory, same R2 store).
+            other_host = work / "other-host"
+            other_host.mkdir()
+            loser = self.call_script("export", FAKE_RACE="loser", FAKE_FIXTURE=str(loser_sql),
+                                     TMPDIR=str(other_host), FAKE_RACE_DIR=str(work))
             won = winner.result()
         self.assertEqual(won.returncode, 0, won.stderr)
         puts = [call[5].removeprefix(f"{BUCKET}/") for call in self.calls()
-                if call[:5] == ["npx", "wrangler", "r2", "object", "put"]]
+                if call[:5] == ["local", "wrangler", "r2", "object", "put"]]
         manifest_key = f"d1/{SOURCE}/{MS}.manifest.json"
         loser_parts = puts[:puts.index(manifest_key)]
         manifest = json.loads(self.object_path(manifest_key).read_text())
@@ -510,8 +592,12 @@ class CatalogueScripts(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         loaded = (self.db / "scratch-db").read_bytes()
         self.assertEqual(loaded, self.fixture.read_bytes())
-        self.assertEqual(result.stdout.splitlines(), [
-            *leading_lines,
+        lines = result.stdout.splitlines()
+        self.assertEqual(lines[:len(leading_lines)], list(leading_lines))
+        self.assertRegex(lines[len(leading_lines)], r"^split verified: \d+ statements, \d+ bytes in \d+ batches$")
+        for line in lines[len(leading_lines) + 1:-2]:
+            self.assertRegex(line, r"^catalog-import: row count for .+: expected (\d+), found \1$")
+        self.assertEqual(lines[-2:], [
             f"catalog-import: loaded {len(loaded)} bytes into scratch-db from restore point {ms}",
             "catalog-import: next: migrations apply, then ops/restore-arm.sql (README, Restore step 2)",
         ])
@@ -519,7 +605,7 @@ class CatalogueScripts(unittest.TestCase):
     def assert_refused(self, result, message):
         self.assertEqual(result.returncode, 1, result.stderr)
         self.assertIn(message, result.stderr)
-        self.assertEqual(list(self.db.iterdir()), [])
+        self.assertEqual([path for path in self.db.iterdir() if path.is_file()], [])
 
     def test_import_round_trip(self):
         ms, _, _, _ = self.export()
@@ -532,9 +618,9 @@ class CatalogueScripts(unittest.TestCase):
         before = len(self.calls())
         result = self.run_script("import", "scratch-db", ms)
         self.assert_refused(result, f"the SQL export is {manifest['sql_bytes']} bytes, "
-                                    "over the 100 bytes one D1 import takes; "
+                                    "over the 100 bytes allowed for this test; "
                                     "this export could not be restored by catalog-import.sh")
-        self.assertEqual(len(self.calls()) - before, 1)
+        self.assertEqual(len(self.calls()) - before, 2)  # d1 info, then manifest GET
 
     def test_import_stops_decompression_one_byte_past_the_bound(self):
         ms, prefix, manifest, _ = self.export()
@@ -554,8 +640,30 @@ class CatalogueScripts(unittest.TestCase):
                 result = self.run_script("import", "scratch-db", ms)
                 self.assertEqual(int((work / "size").read_text()), declared + 1)
                 self.assert_refused(result, f"decompressed SQL exceeds {declared} bytes")
-                self.assertFalse(any(call[:4] == ["npx", "wrangler", "d1", "execute"]
+                self.assertFalse(any(call[:4] == ["local", "wrangler", "d1", "execute"]
                                      for call in self.calls()))
+
+    def test_import_rejects_whole_file_checksum_mismatches(self):
+        ms, prefix, manifest, _ = self.export()
+        manifest_path = self.object_path(f"{prefix}.manifest.json")
+        for field, suffix in (("zst_sha256", ".sql.zst"), ("sql_sha256", ".sql")):
+            with self.subTest(field=field):
+                manifest_path.write_text(json.dumps({**manifest, field: "0" * 64}))
+                self.assert_refused(self.run_script("import", "scratch-db", ms),
+                                    f"sha256 mismatch for {prefix}{suffix} (from {prefix}.manifest.json)")
+
+    def test_import_rejects_truncated_zstd_after_part_and_stream_checksums_pass(self):
+        self.fixture.write_text("CREATE TABLE fixture (value INTEGER);\n")
+        ms, prefix, manifest, _ = self.export()
+        part, = manifest["parts"]
+        path = self.object_path(part["key"])
+        truncated = path.read_bytes()[:-1]
+        path.write_bytes(truncated)
+        manifest["zst_bytes"] = part["bytes"] = len(truncated)
+        manifest["zst_sha256"] = part["sha256"] = hashlib.sha256(truncated).hexdigest()
+        self.object_path(f"{prefix}.manifest.json").write_text(json.dumps(manifest))
+        self.assert_refused(self.run_script("import", "scratch-db", ms),
+                            f"decompression failed for {prefix}.sql.zst")
 
     def test_import_rejects_oversized_reassembled_statement_before_loading(self):
         # Simulate a manifest made by an exporter that had no statement cap.
@@ -579,9 +687,9 @@ class CatalogueScripts(unittest.TestCase):
         self.assert_refused(result, "statement starting at line 2 is 111024 bytes, "
                                     "over the D1 statement limit of 100000 bytes; "
                                     "this export could not be restored by catalog-import.sh")
-        self.assertTrue(any(call[:5] == ["npx", "wrangler", "r2", "object", "get"]
+        self.assertTrue(any(call[:5] == ["local", "wrangler", "r2", "object", "get"]
                             and call[5] == f"{BUCKET}/{key}" for call in self.calls()))
-        self.assertFalse(any(call[:3] == ["npx", "wrangler", "d1"] for call in self.calls()))
+        self.assertFalse(any(call[:4] == ["local", "wrangler", "d1", "execute"] for call in self.calls()))
 
     def test_import_refuses_non_digit_restore_point(self):
         self.assert_refused(self.run_script("import", "scratch-db", "12x"), "only digits")
@@ -593,7 +701,7 @@ class CatalogueScripts(unittest.TestCase):
         self.assert_refused(self.run_script("import", "scratch-db", ms),
                             "velmora-catalog without VELMORA_IMPORT_PRODUCTION=yes")
         self.assertEqual(self.calls()[-1],
-                         ["npx", "wrangler", "d1", "info", "scratch-db", "--json", *ARGS])
+                         ["local", "wrangler", "d1", "info", "scratch-db", "--json", *ARGS])
         self.env["VELMORA_IMPORT_PRODUCTION"] = "yes"
         self.assert_loaded(self.run_script("import", "scratch-db", ms), ms)
 
@@ -608,8 +716,145 @@ class CatalogueScripts(unittest.TestCase):
                 before = len(self.calls())
                 self.assert_refused(self.run_script("import", "scratch-db", ms),
                                     f"resolved UUID {DATABASE_ID}, VELMORA_IMPORT_DATABASE_ID={expected or '<unset>'}")
-                self.assertFalse(any(call[:4] == ["npx", "wrangler", "d1", "execute"]
+                self.assertFalse(any(call[:4] == ["local", "wrangler", "d1", "execute"]
                                      for call in self.calls()[before:]))
+
+    def test_import_rejects_inconsistent_manifest_sizes_before_part_downloads(self):
+        ms, prefix, manifest, _ = self.export()
+        key = f"{prefix}.manifest.json"
+        for changes in ({"parts": [manifest["parts"][0]] * 1001},
+                        {"zst_bytes": manifest["zst_bytes"] + 1},
+                        {"parts": [{**manifest["parts"][0], "bytes": 300000001}],
+                         "zst_bytes": 300000001}):
+            with self.subTest(fields=list(changes)):
+                self.object_path(key).write_text(json.dumps({**manifest, **changes}))
+                before = len(self.calls())
+                self.assert_refused(self.run_script("import", "scratch-db", ms), f"invalid manifest {key}")
+                self.assertEqual([call[5] for call in self.calls()[before:]
+                                  if call[2:5] == ["r2", "object", "get"]], [f"{BUCKET}/{key}"])
+
+    def test_export_records_sizes_and_warns_at_sixty_percent(self):
+        sizes = Path(self.env["TMPDIR"]) / "sizes.log"
+        sizes.write_text('{}\n')
+        self.fixture.write_bytes(b"CREATE TABLE t (x);\nINSERT INTO t VALUES ('" +
+                                 b"x" * (60_000 - len("INSERT INTO t VALUES ('');\n")) + b"');\n")
+        self.env.update(VELMORA_EXPORT_SIZES_LOG=str(sizes), FAKE_DATABASE_SIZE="6000000000")
+        result = self.run_script("export")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        lines = sizes.read_text().splitlines()
+        self.assertEqual(len(lines), 2)
+        entry = json.loads(lines[1])
+        self.assertEqual(entry["restore_point_ms"], int(MS))
+        self.assertEqual(entry["sql_bytes"], self.fixture.stat().st_size)
+        self.assertEqual(entry["longest_statement_bytes"], 60_000)
+        self.assertEqual(entry["database_size_bytes"], 6_000_000_000)
+        self.assertRegex(result.stderr, r"WARNING .*60000 is 60% of 100000")
+        self.assertRegex(result.stderr, r"WARNING .*6000000000 is 60% of 10000000000")
+
+    def batched_fixture(self):
+        header = b"PRAGMA defer_foreign_keys=TRUE;\n"
+        schema = [b"CREATE TABLE parent (id INTEGER PRIMARY KEY, label TEXT);\n",
+                  b"CREATE TABLE child (pid INTEGER REFERENCES parent(id), label TEXT);\n",
+                  b"CREATE TABLE other (label TEXT);\n"]
+        children = [f"INSERT INTO child VALUES (1, '{i};\n{'x' * 45}');\n".encode()
+                    for i in range(3)]
+        parents = [b"INSERT INTO parent VALUES (1, 'parent');\n"]
+        others = [b"INSERT INTO other VALUES ('" + b"z" * 65 + b"');\n"] * 3
+        final = [b"CREATE INDEX child_idx ON child (pid);\n"]
+        self.fixture.write_bytes(header + b"".join(schema + children + parents + others + final))
+        self.env["VELMORA_IMPORT_BATCH_BYTES"] = "215"
+        return header, schema, children, parents, others, final
+
+    def test_batched_import_orders_foreign_keys_and_preserves_statements(self):
+        header, schema, children, parents, others, final = self.batched_fixture()
+        ms, _, _, _ = self.export()
+        result = self.run_script("import", "scratch-db", ms)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        batches = sorted((self.db / "batches").glob("*.sql"))
+        self.assertGreaterEqual(len(batches), 4)
+        statements = []
+        for batch in batches:
+            body = batch.read_bytes()
+            self.assertTrue(body.startswith(header))
+            self.assertLessEqual(len(body), 215)
+            statements.append(body.removeprefix(header))
+        self.assertEqual(statements[0], b"".join(schema))
+        self.assertEqual(statements[-1], b"".join(final))
+        data = b"".join(statements[1:-1])
+        expected = parents + children + others
+        for statement in set(expected):
+            self.assertEqual(data.count(statement), expected.count(statement))
+        self.assertEqual(len(data), sum(map(len, expected)))
+        original_order = schema + children + parents + others + final
+        self.assertEqual(header + b"".join(original_order), self.fixture.read_bytes())
+        self.assertEqual(len(b"".join(statements)), sum(map(len, original_order)))
+        self.assertLess(data.index(parents[0]), data.index(children[0]))
+        self.assertIn("split verified", result.stdout)
+        self.assertIn("row count for child: expected 3, found 3", result.stdout)
+
+    def test_batch_failure_stops_before_later_batches_and_requires_recreation(self):
+        self.batched_fixture()
+        ms, _, _, _ = self.export()
+        self.env["FAKE_FAIL_BATCH"] = "3"
+        result = self.run_script("import", "scratch-db", ms)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("batch 3 failed", result.stderr)
+        self.assertIn("partial load", result.stderr)
+        self.assertIn("deleted and recreated", result.stderr)
+        self.assertEqual(len([call for call in self.calls() if "--file" in call and
+                              call[2:4] == ["d1", "execute"]]), 4)
+
+    def test_import_rechecks_each_batch_immediately_before_loading(self):
+        self.batched_fixture()
+        ms, _, _, _ = self.export()
+        self.env["FAKE_MUTATE_NEXT_BATCH"] = "yes"
+        result = self.run_script("import", "scratch-db", ms)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("batch 1 failed its pre-load checksum", result.stderr)
+        self.assertEqual(len([call for call in self.calls() if "--file" in call and
+                              call[2:4] == ["d1", "execute"]]), 1)
+
+    def test_batched_import_reports_incorrect_row_count(self):
+        self.batched_fixture()
+        ms, _, _, _ = self.export()
+        self.env["FAKE_MISMATCH_TABLE"] = "child"
+        result = self.run_script("import", "scratch-db", ms)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("row count for child: expected 3, found 4", result.stderr)
+
+    def test_batched_import_accepts_current_migration_schema(self):
+        with sqlite3.connect(":memory:") as db:
+            for migration in sorted((ROOT / "migrations").glob("*.sql")):
+                db.executescript(migration.read_text())
+            dump = [stmt for stmt in db.iterdump() if stmt not in ("BEGIN TRANSACTION;", "COMMIT;")]
+        self.fixture.write_text("PRAGMA defer_foreign_keys=TRUE;\n" + "\n".join(dump) + "\n")
+        ms, _, _, _ = self.export()
+        self.env["VELMORA_IMPORT_SKIP_ROW_COUNTS"] = "yes"
+        result = self.run_script("import", "scratch-db", ms)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("WARNING skipping restored table row counts", result.stderr)
+        self.assertFalse(any("--command" in call and "FROM sqlite_master" not in call[call.index("--command") + 1]
+                             for call in self.calls()))
+
+    def test_batched_import_refuses_cycles_before_loading(self):
+        self.fixture.write_text("CREATE TABLE a (id INTEGER PRIMARY KEY, bid REFERENCES b(id));\n"
+                                "CREATE TABLE b (id INTEGER PRIMARY KEY, aid REFERENCES a(id));\n")
+        ms, _, _, _ = self.export()
+        result = self.run_script("import", "scratch-db", ms)
+        self.assert_refused(result, "foreign key cycle")
+        self.assertFalse(any(call[2:4] == ["d1", "execute"] for call in self.calls()))
+
+    def test_self_referencing_table_must_fit_in_one_data_batch(self):
+        self.fixture.write_text("CREATE TABLE t (id INTEGER PRIMARY KEY, pid REFERENCES t(id), label TEXT);\n"
+                                "INSERT INTO t VALUES (1, 2, '" + "a" * 50 + "');\n"
+                                "INSERT INTO t VALUES (2, 1, '" + "b" * 50 + "');\n")
+        ms, _, _, _ = self.export()
+        self.env["VELMORA_IMPORT_BATCH_BYTES"] = "140"
+        self.assert_refused(self.run_script("import", "scratch-db", ms),
+                            "rows for self-referencing table t do not fit in one batch")
+        self.assertFalse(any(call[2:4] == ["d1", "execute"] for call in self.calls()))
+        self.env["VELMORA_IMPORT_BATCH_BYTES"] = "180"
+        self.assert_loaded(self.run_script("import", "scratch-db", ms), ms)
 
     def test_corrupted_part(self):
         ms, _, manifest, _ = self.export()
@@ -656,6 +901,16 @@ class CatalogueScripts(unittest.TestCase):
         (self.db / "scratch-db").unlink()
         self.assert_refused(self.run_script("import", "scratch-db", ms), f"invalid manifest {key}")
 
+    def test_import_refuses_manifest_naming_another_database(self):
+        ms, prefix, manifest, _ = self.export()
+        key = f"{prefix}.manifest.json"
+        manifest["database"] = "other-catalog"
+        self.object_path(key).write_text(json.dumps(manifest))
+        before = len(self.calls())
+        self.assert_refused(self.run_script("import", "scratch-db", ms), f"invalid manifest {key}")
+        self.assertEqual(sum(call[2:5] == ["r2", "object", "get"]
+                             for call in self.calls()[before:]), 1)
+
     def test_import_refuses_parts_from_another_attempt(self):
         ms, prefix, manifest, _ = self.export()
         key = f"{prefix}.manifest.json"
@@ -667,7 +922,7 @@ class CatalogueScripts(unittest.TestCase):
         self.object_path(key).write_text(json.dumps(manifest))
         before = len(self.calls())
         self.assert_refused(self.run_script("import", "scratch-db", ms), f"invalid manifest {key}")
-        self.assertEqual(len(self.calls()) - before, 1)
+        self.assertEqual(len(self.calls()) - before, 2)  # d1 info, then manifest GET
 
     def test_nonempty_target(self):
         ms, _, _, _ = self.export()
@@ -703,7 +958,7 @@ class CatalogueScripts(unittest.TestCase):
         result = self.run_script("import", "scratch-db", MS)
         log = self.assert_kept_log(result, f"catalog-import: could not read {prefix}.manifest.json, see ")
         self.assertEqual(log.read_text().strip(), self.env["FAKE_MISSING"])
-        self.assertEqual(len(self.calls()), 1)
+        self.assertEqual(len(self.calls()), 2)  # d1 info, then manifest GET
 
     def test_manifest_get_failure_does_not_load_legacy(self):
         prefix = f"d1/{SOURCE}/{MS}"
@@ -722,7 +977,7 @@ class CatalogueScripts(unittest.TestCase):
                 self.assertEqual(log.read_text().splitlines(),
                                  [f"stub manifest error line {line:02d}" for line in range(25)])
                 self.assertNotIn("stub manifest error", result.stderr)
-                self.assertEqual(len(self.calls()) - before, 2 if remote else 1)
+                self.assertEqual(len(self.calls()) - before, 3 if remote else 2)  # includes d1 info
 
     def test_empty_downloads(self):
         ms, prefix, manifest, _ = self.export()
@@ -736,6 +991,16 @@ class CatalogueScripts(unittest.TestCase):
         self.object_path(f"{prefix}.sql").write_bytes(b"")
         self.assert_refused(self.run_script("import", "scratch-db", ms),
                             f"empty download for {prefix}.sql")
+
+    def test_import_rejects_legacy_sql_over_test_cap_before_executing(self):
+        key = f"d1/{SOURCE}/{MS}.sql"
+        path = self.object_path(key)
+        path.parent.mkdir(parents=True)
+        path.write_bytes(self.fixture.read_bytes())
+        self.env["VELMORA_TEST_SQL_FILE_BYTES"] = "100"
+        self.assert_refused(self.run_script("import", "scratch-db", MS),
+                            f"the SQL export is {self.fixture.stat().st_size} bytes, over the 100 bytes")
+        self.assertFalse(any(call[2:4] == ["d1", "execute"] for call in self.calls()))
 
     def test_legacy_export_without_schema(self):
         key = f"d1/{SOURCE}/{MS}.sql"
