@@ -504,6 +504,13 @@ pub fn fingerprint() -> u32 {
     );
     // Three articles, the last one short.
     let bench = Bench::new(1_700_000);
+    // Independent CRC64NVME of this fixture's plaintext. Undo the
+    // XOR of the other digests to check the timed stage's CRC on Wasm.
+    assert_eq!(
+        bench.ingest_crc64() ^ u64::from(bench.ingest()),
+        0xd846_f40d_c80b_2bdd,
+        "CRC64NVME known answer"
+    );
     let mut all = Vec::new();
     all.extend_from_slice(bench.cipher());
     all.extend_from_slice(&bench.sealed.cipher_sha256);
