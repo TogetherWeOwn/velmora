@@ -5,13 +5,14 @@ use std::future::{ready, Ready};
 use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 use futures_channel::oneshot;
 use futures_util::future::abortable;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio_postgres::tls::{ChannelBinding, TlsConnect, TlsStream};
 use tokio_postgres::Config;
-use velmora_bridge::pg::{classify_connect_error, PgConnect, PgConnection};
+use velmora_bridge::pg::{classify_connect_error, PgConnect, PgConnection, SHUTDOWN_LIMIT_MS};
 use velmora_bridge::{BridgeError, Result};
 use worker::js_sys::{Object, Reflect};
 use worker::wasm_bindgen::JsValue;
@@ -36,16 +37,20 @@ impl PgConnect for HyperdriveConnect {
             .map_err(classify_connect_error)?;
         let (closed, done) = oneshot::channel();
         let (driver, stop) = abortable(connection);
-        // A graceful end drains the driver. On cancellation the abort drops
-        // the actual transport, whose Drop closes the underlying socket.
+        // A graceful end drains the driver, for at most SHUTDOWN_LIMIT_MS.
+        // On cancellation or past that limit the abort drops the actual
+        // transport, whose Drop requests the socket close without awaiting it.
         spawn_local(async move {
             let _ = driver.await;
             let _ = closed.send(());
         });
         Ok(
-            PgConnection::new(client, move || stop.abort()).with_shutdown(async move {
-                let _ = done.await;
-            }),
+            PgConnection::new(client, move || stop.abort()).with_shutdown(
+                async move {
+                    let _ = done.await;
+                },
+                || worker::Delay::from(Duration::from_millis(u64::from(SHUTDOWN_LIMIT_MS))),
+            ),
         )
     }
 }
