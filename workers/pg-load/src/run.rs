@@ -1,5 +1,5 @@
 use crate::fixture::{self, OpError, Read};
-use crate::{percentile, Config, Family, Job};
+use crate::{percentile, probe, Config, DrillConnect, Family, Job};
 use futures_util::{
     future::{join3, select, Either},
     pin_mut,
@@ -21,6 +21,9 @@ use velmora_bridge::{
 const WRITE_POOL_SLOTS: usize = 5;
 const MAX_LOGICAL_WRITES: usize = 64;
 const SAMPLE_MS: u64 = 250;
+const READ_SLOTS: usize = 3;
+const MIN_READ_SAMPLES: usize = 200;
+const READ_TIMEOUT_MS: f64 = 20_000.0;
 const ARM_KEY: &str = "pg_load_fixture_v1";
 
 #[allow(async_fn_in_trait)]
@@ -69,8 +72,21 @@ struct FamilyResult {
 
 #[derive(Serialize)]
 struct Latency {
+    scheduled: usize,
     samples: usize,
-    p95_ms: Option<f64>,
+    late_completions: usize,
+    timed_out: usize,
+    statement_p95_ms: Option<f64>,
+    end_to_end_p95_ms: Option<f64>,
+}
+
+#[derive(Serialize)]
+struct Coverage {
+    status: &'static str,
+    minimum_samples_per_read_and_phase: usize,
+    at_least_ninety_percent_advisory_ticks: bool,
+    unloaded_read_coverage: bool,
+    loaded_read_coverage: bool,
 }
 
 #[derive(Serialize)]
@@ -94,28 +110,22 @@ pub struct Report {
     advisory_sampling_period_ms: u64,
     advisory_sampling_ticks: u64,
     advisory_expected_ticks: u64,
+    advisory_missed_ticks: u64,
     advisory_wait_samples: usize,
     sampled_lock_wait_p99_ms: Option<f64>,
     advisory_error: Option<String>,
+    r3a_coverage: Coverage,
     unloaded_reads: Reads,
     loaded_reads: Reads,
 }
 
 impl Report {
     pub fn usable(&self) -> bool {
-        self.family
-            .values()
-            .all(|f| f.failures.refused + f.failures.other == 0)
-            && [&self.unloaded_reads, &self.loaded_reads]
-                .into_iter()
-                .all(|r| {
-                    r.failures.overloaded + r.failures.refused + r.failures.other == 0
-                        && r.get.samples > 0
-                        && r.head.samples > 0
-                        && r.list.samples > 0
-                })
-            && self.advisory_sampling_ticks > 0
-            && self.advisory_error.is_none()
+        self.r3a_coverage.status == "SUFFICIENT"
+            && self
+                .family
+                .values()
+                .all(|f| f.failures.refused + f.failures.other == 0)
     }
 
     pub fn meets_local_rate(&self) -> bool {
@@ -127,45 +137,136 @@ impl Report {
 
 type Cat<C> = SqlCatalog<PgSql<C>>;
 
-async fn reads<C: PgConnect>(
-    cat: &Cat<C>,
-    runtime: &impl Runtime,
+#[derive(Default)]
+struct ReadSamples {
+    statement: Vec<f64>,
+    end_to_end: Vec<f64>,
+    late: usize,
+    timed_out: usize,
+    scheduled: usize,
+}
+
+impl ReadSamples {
+    fn success(&mut self, statement_ms: f64, end_to_end_ms: f64, late: bool) {
+        self.statement.push(statement_ms);
+        self.end_to_end.push(end_to_end_ms);
+        self.late += usize::from(late);
+    }
+
+    fn timeout(&mut self, elapsed_ms: f64) {
+        self.timed_out += 1;
+        self.end_to_end.push(elapsed_ms);
+    }
+
+    fn finish(mut self) -> Latency {
+        Latency {
+            scheduled: self.scheduled,
+            samples: self.statement.len(),
+            late_completions: self.late,
+            timed_out: self.timed_out,
+            statement_p95_ms: percentile(&mut self.statement, 95),
+            end_to_end_p95_ms: percentile(&mut self.end_to_end, 95),
+        }
+    }
+}
+
+impl Reads {
+    fn covered(&self) -> bool {
+        self.failures.overloaded + self.failures.refused + self.failures.other == 0
+            && [&self.get, &self.head, &self.list].into_iter().all(|r| {
+                r.samples >= MIN_READ_SAMPLES && r.samples == r.scheduled && r.timed_out == 0
+            })
+    }
+}
+
+async fn reads<C: DrillConnect, R: Runtime>(
+    reader: &C,
+    statements: &[Vec<probe::Statement>; 3],
+    runtime: &R,
     start: f64,
     ms: u64,
     rate: u32,
 ) -> Reads {
-    let mut samples: [Vec<f64>; 3] = Default::default();
+    let mut samples: [ReadSamples; 3] = Default::default();
     let mut failures = Failures::default();
     let deadline = start + ms as f64;
-    for i in 0..(ms * u64::from(rate) / 60_000) {
-        until(runtime, start + (i * 60_000 / u64::from(rate)) as f64).await;
-        let t = runtime.monotonic_ms();
-        if t >= deadline {
-            break;
-        }
-        let operation = (i % 3) as usize;
-        match fixture::read(
-            cat,
-            [Read::Get, Read::Head, Read::List][operation],
-            i as usize / 3,
-        )
-        .await
-        {
-            Ok(()) => {
-                let done = runtime.monotonic_ms();
-                if done <= deadline {
-                    samples[operation].push((done - t).max(0.0));
-                }
+    let total = ms * u64::from(rate) / 60_000;
+    let at = |i: u64| start + (i * 60_000 / u64::from(rate)) as f64;
+    let mut next = 0;
+    let mut active = FuturesUnordered::new();
+    // The timetable is fixed. When slots fill the next due probe waits in
+    // the timetable (bounded by the phase's request count) instead of shed.
+    while next < total || !active.is_empty() {
+        let now = runtime.monotonic_ms();
+        if now >= deadline {
+            for i in next..total {
+                let stat = &mut samples[(i % 3) as usize];
+                stat.scheduled += 1;
+                stat.timeout((deadline - at(i)).clamp(0.0, READ_TIMEOUT_MS));
             }
-            Err(error) => failures.add(error),
+            next = total;
+        } else if next < total && active.len() < READ_SLOTS && at(next) <= now {
+            let scheduled = at(next);
+            let op = (next % 3) as usize;
+            let choices = &statements[op];
+            let selected = &choices[(next as usize / 3) % choices.len()];
+            samples[op].scheduled += 1;
+            next += 1;
+            active.push(async move {
+                let cutoff = scheduled + READ_TIMEOUT_MS;
+                if runtime.monotonic_ms() >= cutoff {
+                    return (op, scheduled, None);
+                }
+                let query = probe::execute(reader, runtime, selected);
+                let timeout = until(runtime, cutoff);
+                pin_mut!(query, timeout);
+                let outcome = match select(timeout, query).await {
+                    Either::Right((r, _)) => Some(r),
+                    Either::Left(_) => None,
+                };
+                (op, scheduled, outcome)
+            });
+            continue;
+        }
+        let wake = if next < total && active.len() < READ_SLOTS {
+            at(next)
+        } else {
+            deadline
+        };
+        let result = if active.is_empty() {
+            if next >= total {
+                break;
+            }
+            until(runtime, wake).await;
+            None
+        } else if now >= deadline {
+            active.next().await // retain late in-flight results (or explicit timeout)
+        } else {
+            let timer = until(runtime, wake);
+            pin_mut!(timer);
+            match select(active.next(), timer).await {
+                Either::Left((r, _)) => r,
+                Either::Right(_) => None,
+            }
+        };
+        if let Some((op, scheduled, result)) = result {
+            let stat = &mut samples[op];
+            match result {
+                Some(Ok(latency)) => {
+                    let completed = runtime.monotonic_ms();
+                    stat.success(
+                        latency,
+                        (completed - scheduled).max(0.0),
+                        completed > deadline,
+                    );
+                }
+                Some(Err(error)) => failures.add(error),
+                None => stat.timeout(READ_TIMEOUT_MS),
+            }
         }
     }
-    // Do not begin the loaded phase early, even if all unloaded probes finished early.
     until(runtime, deadline).await;
-    let [get, head, list] = samples.map(|mut values| Latency {
-        samples: values.len(),
-        p95_ms: percentile(&mut values, 95),
-    });
+    let [get, head, list] = samples.map(ReadSamples::finish);
     Reads {
         get,
         head,
@@ -384,7 +485,7 @@ async fn target(client: &Client) -> Result<(String, String, String), String> {
 
 /// Admits at most five writer calls, separate from the read probe and sampler.
 /// The two connectors must point at the same explicitly armed drill copy.
-pub async fn run<C: PgConnect, R: Runtime>(
+pub async fn run<C: DrillConnect + Clone, R: Runtime>(
     writer: C,
     reader: C,
     runtime: &R,
@@ -422,6 +523,10 @@ pub async fn run<C: PgConnect, R: Runtime>(
             return Err("read role cannot see writer wait events".into());
         }
     }
+    wr.client()
+        .batch_execute("BEGIN READ WRITE")
+        .await
+        .map_err(|e| fixture::sql_error("begin marker claim", e))?;
     let claimed = wr
         .client()
         .execute_typed(
@@ -433,6 +538,10 @@ pub async fn run<C: PgConnect, R: Runtime>(
     if claimed != 1 {
         return Err("drill was already claimed".into());
     }
+    wr.client()
+        .batch_execute("COMMIT")
+        .await
+        .map_err(|e| fixture::sql_error("commit marker claim", e))?;
     // The read origin must see the same one-shot claim, not a separately armed DB.
     let sees_claim: bool = rd
         .client()
@@ -448,13 +557,15 @@ pub async fn run<C: PgConnect, R: Runtime>(
     }
     fixture::seed(wr.client(), &jobs).await?;
     drop(wr);
-    let cat = SqlCatalog::new(PgSql::new(writer, reader, pg));
+    let cat = SqlCatalog::new(PgSql::new(writer, reader.clone(), pg));
     fixture::read(&cat, Read::Head, 0)
         .await
         .map_err(|_| "read pool cannot see seeded fixture")?;
+    let probes = probe::statements().await?;
     let start = runtime.monotonic_ms();
     let unloaded = reads(
-        &cat,
+        &reader,
+        &probes,
         runtime,
         start,
         u64::from(config.unloaded_seconds) * 1000,
@@ -471,7 +582,14 @@ pub async fn run<C: PgConnect, R: Runtime>(
             minutes: config.minutes as usize,
             jobs: &jobs,
         }),
-        reads(&cat, runtime, start, duration, config.reads_per_minute),
+        reads(
+            &reader,
+            &probes,
+            runtime,
+            start,
+            duration,
+            config.reads_per_minute,
+        ),
         advisory(rd.client(), runtime, start, duration, pg.lock_key),
     )
     .await;
@@ -483,6 +601,20 @@ pub async fn run<C: PgConnect, R: Runtime>(
         pool: write_pool,
     } = write_result;
     let target = config.batches_per_minute;
+    let expected_ticks = duration / SAMPLE_MS;
+    let enough_ticks = ticks * 10 >= expected_ticks * 9 && advisory_error.is_none();
+    let (unloaded_covered, loaded_covered) = (unloaded.covered(), loaded.covered());
+    let r3a_coverage = Coverage {
+        status: if enough_ticks && unloaded_covered && loaded_covered {
+            "SUFFICIENT"
+        } else {
+            "INCONCLUSIVE"
+        },
+        minimum_samples_per_read_and_phase: MIN_READ_SAMPLES,
+        at_least_ninety_percent_advisory_ticks: enough_ticks,
+        unloaded_read_coverage: unloaded_covered,
+        loaded_read_coverage: loaded_covered,
+    };
     let overloaded = family.values().map(|f| f.failures.overloaded).sum::<u64>()
         + unloaded.failures.overloaded
         + loaded.failures.overloaded;
@@ -496,11 +628,61 @@ pub async fn run<C: PgConnect, R: Runtime>(
         overloaded_upper_bound_on_55p03: overloaded,
         advisory_sampling_period_ms: SAMPLE_MS,
         advisory_sampling_ticks: ticks,
-        advisory_expected_ticks: duration / SAMPLE_MS,
+        advisory_expected_ticks: expected_ticks,
+        advisory_missed_ticks: expected_ticks.saturating_sub(ticks),
         advisory_wait_samples: waits.len(),
         sampled_lock_wait_p99_ms: percentile(&mut waits, 99),
         advisory_error,
+        r3a_coverage,
         unloaded_reads: unloaded,
         loaded_reads: loaded,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn late_results_contribute_to_both_percentiles() {
+        let mut stats = ReadSamples::default();
+        for _ in 0..199 {
+            stats.success(1.0, 2.0, false);
+        }
+        for _ in 0..11 {
+            stats.success(5.0, 23.0, true);
+        }
+        let measured = stats.finish();
+        assert_eq!(measured.late_completions, 11);
+        assert_eq!(measured.statement_p95_ms, Some(5.0));
+        assert_eq!(measured.end_to_end_p95_ms, Some(23.0));
+    }
+
+    #[test]
+    fn missing_reads_or_timeouts_fail_coverage() {
+        let reads = |n, timeout| {
+            let stat = || {
+                let mut s = ReadSamples {
+                    scheduled: n + usize::from(timeout),
+                    ..ReadSamples::default()
+                };
+                for _ in 0..n {
+                    s.success(1.0, 2.0, false);
+                }
+                if timeout {
+                    s.timeout(READ_TIMEOUT_MS);
+                }
+                s.finish()
+            };
+            Reads {
+                get: stat(),
+                head: stat(),
+                list: stat(),
+                failures: Failures::default(),
+            }
+        };
+        assert!(reads(200, false).covered());
+        assert!(!reads(199, false).covered());
+        assert!(!reads(200, true).covered());
+    }
 }

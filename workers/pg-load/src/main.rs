@@ -1,17 +1,22 @@
 #[cfg(not(target_arch = "wasm32"))]
 mod local {
     use futures_channel::oneshot;
-    use std::env;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+    use std::{env, path::PathBuf};
     use tokio_postgres::{Config, NoTls};
     use velmora_bridge::pg::{classify_connect_error, PgConnect, PgConnection};
     use velmora_bridge::Result;
-    use velmora_pg_load::{parse_config, run, Runtime};
+    use velmora_pg_load::{parse_config, run, DrillConnect, DrillSession, Runtime};
 
     #[derive(Clone)]
     struct Local(Config);
     impl PgConnect for Local {
         async fn connect(&self) -> Result<PgConnection> {
+            Ok(self.open().await?.into_pg())
+        }
+    }
+    impl DrillConnect for Local {
+        async fn open(&self) -> Result<DrillSession> {
             let (client, connection) = self
                 .0
                 .connect(NoTls)
@@ -22,11 +27,7 @@ mod local {
                 let _ = connection.await;
                 let _ = closed.send(());
             });
-            Ok(
-                PgConnection::new(client, move || driver.abort()).with_shutdown(async move {
-                    let _ = done.await;
-                }),
-            )
+            Ok(DrillSession::new(client, move || driver.abort(), done))
         }
     }
 
@@ -64,9 +65,14 @@ mod local {
             );
         }
         let cfg = parse_config(&env::var("PG_LOAD_CONFIG").map_err(|_| "set PG_LOAD_CONFIG")?)?;
+        let socket = env::var_os("PG_LOAD_SOCKET_DIR")
+            .map_or_else(|| PathBuf::from("/var/run/postgresql"), PathBuf::from);
+        if !socket.is_absolute() {
+            return Err("PG_LOAD_SOCKET_DIR must be an absolute Unix socket directory".into());
+        }
         let mut writer = Config::new();
         writer
-            .host_path("/var/run/postgresql")
+            .host_path(socket)
             .dbname("postgres")
             .user(&env::var("USER").map_err(|_| "USER required for local peer auth")?)
             .connect_timeout(Duration::from_secs(5))

@@ -1,9 +1,9 @@
 -- Only used after the target is explicitly armed for one synthetic run.
 INSERT INTO generations (id,bucket_id,key,state,size,etag,content_json,user_meta_json,extent_count,created_at)
 SELECT gen, 'b_70676c6f61640001', key, 'live', 1, '"pg-load"', '{}', '{}', 1, 1
-FROM load_seed WHERE family IN ('read','delete','outbox','gc');
+FROM load_seed WHERE family IN ('read','delete','outbox','post_mark','gc');
 INSERT INTO objects (bucket_id,key,generation_id)
-SELECT 'b_70676c6f61640001', key, gen FROM load_seed WHERE family IN ('read','delete','outbox');
+SELECT 'b_70676c6f61640001', key, gen FROM load_seed WHERE family IN ('read','delete','outbox','post_mark');
 UPDATE generations SET state='deleted',retired_at=1
 WHERE bucket_id='b_70676c6f61640001' AND id IN (SELECT gen FROM load_seed WHERE family='gc');
 
@@ -19,7 +19,7 @@ SELECT extent,'b_70676c6f61640001', CASE WHEN family<>'complete' THEN gen END,
        CASE WHEN family<>'complete' THEN 0 END, CASE WHEN family<>'complete' THEN 0 END,
        1,65,decode(repeat('00',48),'hex'),decode(repeat('00',73),'hex'),
        decode(repeat('00',16),'hex'),decode(repeat('00',32),'hex'),decode(repeat('00',32),'hex'),'held',1
-FROM load_seed WHERE family IN ('read','delete','outbox','gc','complete');
+FROM load_seed WHERE family IN ('read','delete','outbox','post_mark','gc','complete');
 
 INSERT INTO upload_parts (upload_id,part_number,extent_id,size,etag,uploaded_at)
 SELECT upload,1,extent,1,'"pg-load"',1 FROM load_seed WHERE family='complete';
@@ -29,7 +29,11 @@ SELECT upload,1,extent,1,'"pg-load"',1 FROM load_seed WHERE family='complete';
 INSERT INTO outbox (extent_id,generation_id,stage,next_at,lease_token,lease_owner,lease_until,updated_at)
 SELECT extent,gen,CASE WHEN family='read' THEN 'post' ELSE stage END,1,CASE WHEN held THEN 1 ELSE 0 END,
        CASE WHEN held THEN 'pg-load' END, CASE WHEN held THEN 8000000000000000 END,1
-FROM load_seed WHERE family IN ('outbox','read');
+FROM load_seed WHERE family IN ('outbox','post_mark','read');
+
+INSERT INTO articles (extent_id,idx,message_id,newsgroup,headers,cipher_offset,cipher_len,payload_sha256,state)
+SELECT extent,0,extent||'@pg-load.invalid','pg-load',''::bytea,0,65,decode(repeat('00',32),'hex'),'planned'
+FROM load_seed WHERE family='post_mark';
 
 INSERT INTO gc (id,extent_id,action,due_at)
 SELECT -n-1,extent,'delete_safety',1 FROM load_seed WHERE family='gc';

@@ -1,4 +1,5 @@
-use crate::{parse_config, run, Runtime};
+use crate::worker_socket::{ManagedSocket, UpgradeTls};
+use crate::{parse_config, run, DrillConnect, DrillSession, Runtime};
 use futures_channel::oneshot;
 use futures_util::future::abortable;
 use std::time::Duration;
@@ -7,8 +8,8 @@ use tokio_postgres::Config;
 use velmora_bridge::pg::{classify_connect_error, PgConnect, PgConnection};
 use velmora_bridge::{BridgeError, Result as BridgeResult};
 use worker::{
-    event, postgres_tls::PassthroughTls, wasm_bindgen_futures::spawn_local, Context, Delay, Env,
-    Hyperdrive, Method, Request, Response, Result, SecureTransport, Socket,
+    event, wasm_bindgen_futures::spawn_local, Context, Delay, Env, Hyperdrive, Method, Request,
+    Response, Result,
 };
 
 // Store the binding name, not a socket, connection string, or client. Each
@@ -17,17 +18,19 @@ use worker::{
 struct Connector(Env, &'static str);
 impl PgConnect for Connector {
     async fn connect(&self) -> BridgeResult<PgConnection> {
+        Ok(self.open().await?.into_pg())
+    }
+}
+impl DrillConnect for Connector {
+    async fn open(&self) -> BridgeResult<DrillSession> {
         let binding: Hyperdrive = self.0.hyperdrive(self.1).map_err(|_| connect_failed())?;
         let config: Config = binding
             .connection_string()
             .parse()
             .map_err(|_| connect_failed())?;
-        let socket = Socket::builder()
-            .secure_transport(SecureTransport::StartTls)
-            .connect(binding.host(), binding.port())
-            .map_err(|_| connect_failed())?;
+        let socket = ManagedSocket::connect(&binding.host(), binding.port())?;
         let (client, connection) = config
-            .connect_raw(socket, PassthroughTls)
+            .connect_raw(socket, UpgradeTls)
             .await
             .map_err(classify_connect_error)?;
         let (closed, done) = oneshot::channel();
@@ -36,11 +39,7 @@ impl PgConnect for Connector {
             let _ = driver.await;
             let _ = closed.send(());
         });
-        Ok(
-            PgConnection::new(client, move || stop.abort()).with_shutdown(async move {
-                let _ = done.await;
-            }),
-        )
+        Ok(DrillSession::new(client, move || stop.abort(), done))
     }
 }
 

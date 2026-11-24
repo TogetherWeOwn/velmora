@@ -3,7 +3,7 @@ use std::cell::RefCell;
 use tokio_postgres::{types::Type, Client};
 use velmora_bridge::pg::{PgConnect, PgSql};
 use velmora_bridge::ports::{
-    BlobMeta, BlobStore, Catalog, Guard, Kek, Lease, Permit, PermitClass, PublishOutcome,
+    BlobMeta, BlobStore, Catalog, Guard, Kek, Lease, Permit, PermitClass, PublishOutcome, Sql,
     UploadTarget,
 };
 use velmora_bridge::recovery::{write_generation, Layout, Unpublished};
@@ -41,6 +41,10 @@ pub(crate) fn sql_error(step: &str, error: tokio_postgres::Error) -> String {
 
 pub(crate) async fn seed(client: &Client, jobs: &[Job]) -> std::result::Result<(), String> {
     client
+        .batch_execute("BEGIN READ WRITE")
+        .await
+        .map_err(|e| sql_error("begin fixture seed", e))?;
+    client
         .execute_typed(
             "INSERT INTO buckets (id,name,owner,bdk_wrapped,kek_version,disposable,created_at) \
         VALUES ($1,'pg-load-fixture','pg-load',decode(repeat('00',73),'hex'),1,1,1)",
@@ -57,6 +61,10 @@ pub(crate) async fn seed(client: &Client, jobs: &[Job]) -> std::result::Result<(
              FROM generate_series(0,$2::bigint) AS n", &[(&BUCKET, Type::TEXT), (&i64::from(USAGE_CHUNK), Type::INT8)])
             .await.map_err(|e| sql_error("seed recount extents", e))?;
     }
+    client
+        .batch_execute("COMMIT")
+        .await
+        .map_err(|e| sql_error("commit fixture seed", e))?;
     // Bound each setup transaction separately from the measured write load.
     const CHUNK: usize = 4096;
     for (offset, group) in jobs.chunks(CHUNK).enumerate() {
@@ -71,7 +79,7 @@ async fn seed_group(
     jobs: &[Job],
 ) -> std::result::Result<(), String> {
     // This dedicated setup connection is dropped on failure, rolling back its transaction.
-    client.batch_execute("BEGIN; CREATE TEMP TABLE load_seed (n bigint, family text, stage text, held boolean, key text, gen text, extent text, upload text) ON COMMIT DROP")
+    client.batch_execute("BEGIN READ WRITE; CREATE TEMP TABLE load_seed (n bigint, family text, stage text, held boolean, key text, gen text, extent text, upload text) ON COMMIT DROP")
         .await.map_err(|e| sql_error("create seed table", e))?;
     let mut n = Vec::new();
     let mut families = Vec::new();
@@ -92,6 +100,7 @@ async fn seed_group(
             Some(Family::Gc) => ("gc", "", false),
             Some(Family::PermitsAcquire) => ("permit_acquire", "", false),
             Some(Family::PermitsRelease) => ("permit_release", "", false),
+            Some(Family::OutboxPostMark) => ("post_mark", "post", true),
             Some(f) => match outbox_operation(f) {
                 Some((stage, next)) => ("outbox", stage.as_str(), next.is_some()),
                 None => continue,
@@ -137,9 +146,11 @@ fn outbox_operation(family: Family) -> Option<(OutboxStage, Option<OutboxStage>)
     use OutboxStage::{Done, Post, Release, Verify};
     Some(match family {
         Family::OutboxPostClaim => (Post, None),
-        Family::OutboxPostAdvance => (Post, Some(Verify)),
+        Family::OutboxPostPlan | Family::OutboxPostMark | Family::OutboxPostAdvance => {
+            (Post, Some(Verify))
+        }
         Family::OutboxVerifyClaim => (Verify, None),
-        Family::OutboxVerifyAdvance => (Verify, Some(Release)),
+        Family::OutboxVerifyRecord | Family::OutboxVerifyAdvance => (Verify, Some(Release)),
         Family::OutboxReleaseClaim => (Release, None),
         Family::OutboxReleaseAdvance => (Release, Some(Done)),
         _ => return None,
@@ -437,7 +448,52 @@ pub(crate) async fn write<C: PgConnect>(
                     cursor: 0,
                     claimed_at: now,
                 };
-                applied(cat.advance(&lease, next, now, now).await?)?;
+                match family {
+                    Family::OutboxPostPlan => applied(
+                        cat.plan_articles(
+                            &lease,
+                            &[ArticleRow {
+                                extent_id: lease.extent.clone(),
+                                idx: 0,
+                                message_id: format!("{}@pg-load.invalid", lease.extent),
+                                newsgroup: "pg-load".into(),
+                                headers: Vec::new(),
+                                cipher_offset: 0,
+                                cipher_len: 65,
+                                payload_sha256: [0; 32],
+                                yenc_name: None,
+                                state: ArticleState::Planned,
+                                provider_id: None,
+                                posted_at: None,
+                                reposted_at: None,
+                            }],
+                        )
+                        .await?
+                        .is_some(),
+                    )?,
+                    Family::OutboxPostMark => {
+                        applied(cat.mark_posted_many(&lease, &[(0, PROVIDER)], now).await?)?
+                    }
+                    Family::OutboxVerifyRecord => applied(
+                        cat.record_verification(
+                            &lease,
+                            &VerificationRow {
+                                extent_id: lease.extent.clone(),
+                                backbone: PROVIDER.into(),
+                                provider_id: PROVIDER.into(),
+                                verified_at: now,
+                                plan_rev: 0,
+                                articles_ok: 1,
+                                articles_total: 1,
+                                result: VerifyResult::Ok,
+                                kind: VerifyKind::Body,
+                            },
+                        )
+                        .await?
+                        .held(),
+                    )?,
+                    _ => applied(cat.advance(&lease, next, now, now).await?)?,
+                }
             } else {
                 applied(
                     cat.claim(&extent, &generation, stage, PROVIDER, now)
@@ -457,8 +513,8 @@ pub(crate) enum Read {
     Head,
     List,
 }
-pub(crate) async fn read<C: PgConnect>(
-    cat: &Cat<C>,
+pub(crate) async fn read<S: Sql>(
+    cat: &SqlCatalog<S>,
     operation: Read,
     index: usize,
 ) -> std::result::Result<(), OpError> {

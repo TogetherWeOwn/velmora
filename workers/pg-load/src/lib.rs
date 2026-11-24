@@ -1,10 +1,14 @@
 //! Catalogue load driver. No production Worker imports this crate.
 
 mod fixture;
+mod probe;
 mod run;
 #[cfg(target_arch = "wasm32")]
 mod wasm;
+#[cfg(target_arch = "wasm32")]
+mod worker_socket;
 
+pub use probe::{DrillConnect, DrillSession};
 pub use run::{run, Runtime};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -19,8 +23,11 @@ pub enum Family {
     MultipartAbort,
     Delete,
     OutboxPostClaim,
+    OutboxPostPlan,
+    OutboxPostMark,
     OutboxPostAdvance,
     OutboxVerifyClaim,
+    OutboxVerifyRecord,
     OutboxVerifyAdvance,
     OutboxReleaseClaim,
     OutboxReleaseAdvance,
@@ -55,7 +62,7 @@ pub struct Config {
 }
 
 fn read_rate() -> u32 {
-    600
+    1500
 }
 fn unloaded_seconds() -> u32 {
     30
