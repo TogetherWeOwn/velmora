@@ -163,6 +163,26 @@ async fn u1_lost_commit_acknowledgements_are_not_guard_refusals() {
 }
 
 #[tokio::test]
+async fn s1_stale_etag_refuses_a_higher_generation() {
+    let Some(c) = catalogue() else { return };
+    let b = bucket(&c, 1).await;
+    let initial = put(&b, "match", 1);
+    let winner = put(&b, "match", 2);
+    let later = put(&b, "match", 3);
+    assert!(later.generation.id > winner.generation.id);
+    assert!(publish(&c, &initial, None).await);
+    let condition = Precondition::Etag(initial.generation.etag.clone());
+    assert!(publish(&c, &winner, Some(&condition)).await);
+    // The generation ID is newer, so only the stale condition can refuse it.
+    assert!(
+        !publish(&c, &later, Some(&condition)).await,
+        "higher generation bypassed the stale ETag guard"
+    );
+    let (head, _) = c.live_object(&b.id, "match").await.unwrap().unwrap();
+    assert_eq!(head.id, winner.generation.id);
+}
+
+#[tokio::test]
 async fn s1_conditional_put_has_no_wrong_outcomes_at_eight_contenders() {
     let Some(c) = catalogue() else { return };
     let b = bucket(&c, 1).await;
@@ -177,9 +197,14 @@ async fn s1_conditional_put_has_no_wrong_outcomes_at_eight_contenders() {
         } else {
             Precondition::Etag(initial.generation.etag.clone())
         };
-        // Give the unconditional request the greatest generation ID, so it
-        // can still succeed if an ETag match runs first.
-        let writes: Vec<_> = (1..=C).rev().map(|i| put(&b, key, base + i)).collect();
+        let writes: Vec<_> = (1..=C)
+            .map(|i| {
+                // Only the mixed case needs a highest-ID first contender:
+                // that unconditional request must also work if a match wins first.
+                let offset = if key == "mixed" { C + 1 - i } else { i };
+                put(&b, key, base + offset)
+            })
+            .collect();
         let outcomes = join_all(writes.iter().enumerate().map(|(i, put)| {
             let cond = if key == "mixed" && i == 0 {
                 None
