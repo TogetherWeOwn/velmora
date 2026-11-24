@@ -1294,36 +1294,42 @@ pub(super) async fn redrive_underverified<S: Sql>(
         .map(|row| Cols::new(row).text())
         .transpose()?
         .unwrap_or_default();
-    let window = c
+    let dialect = c.sql.dialect();
+    let mut window = c
         .sql
         .query(
             // The condition is the index's own `WHERE`, word for word:
             // the planner takes a partial index only then.
-            c.sql.dialect().pick(REDRIVE_WINDOW, REDRIVE_WINDOW_PG),
+            dialect.pick(REDRIVE_WINDOW, REDRIVE_WINDOW_PG),
             &[text(&after), SqlValue::Int(i64::from(limit))],
         )
         .await?;
     let full = window.len() >= limit as usize;
-    let Some(last) = window.into_iter().next_back() else {
+    let Some(last) = window.pop() else {
         set_redrive_cursor(c, "").await?;
         return Ok(0);
     };
     let last = Cols::new(last).text()?;
-    let sql = c.sql.dialect().pick(REDRIVE, REDRIVE_PG);
+    let mut params = vec![ms(now), text(&labels), SqlValue::Int(i64::from(required))];
+    let sql = match dialect {
+        crate::ports::Dialect::Sqlite => {
+            params.extend([text(&after), text(&last)]);
+            REDRIVE
+        }
+        crate::ports::Dialect::Postgres => {
+            let mut ids = window
+                .into_iter()
+                .map(|row| Cols::new(row).text())
+                .collect::<Result<Vec<_>>>()?;
+            ids.push(last.clone());
+            let ids = serde_json::to_string(&ids)
+                .map_err(|_| BridgeError::Sql("redrive: encode window".into()))?;
+            params.push(SqlValue::Text(ids));
+            REDRIVE_PG
+        }
+    };
     // Counted by the rows returned: see `bury_exhausted`.
-    let moved = c
-        .sql
-        .query(
-            sql,
-            &[
-                ms(now),
-                text(&labels),
-                SqlValue::Int(i64::from(required)),
-                text(&after),
-                text(&last),
-            ],
-        )
-        .await?;
+    let moved = c.sql.query(sql, &params).await?;
     // A short window was the end of the index: start over next time.
     set_redrive_cursor(c, if full { &last } else { "" }).await?;
     Ok(moved.len() as u64)
@@ -1853,10 +1859,12 @@ const MARK_SENT: &str = "UPDATE outbox SET sent_at = ?1 \
                  AND +stage IN ('post', 'verify', 'release') AND +next_at <= ?1 \
                  AND (lease_until IS NULL OR lease_until < ?1)";
 
+// Keep eligibility a residual filter so a short ID list cannot turn
+// into a scan of every due row through outbox_due.
 const MARK_SENT_PG: &str = "UPDATE outbox SET sent_at = ?1 \
-               WHERE extent_id IN (SELECT value FROM jsonb_array_elements_text(?2::jsonb) AS j(value)) \
-                 AND stage IN ('post', 'verify', 'release') AND next_at <= ?1 \
-                 AND (lease_until IS NULL OR lease_until < ?1)";
+               WHERE extent_id = ANY (ARRAY(SELECT jsonb_array_elements_text(?2::jsonb))) \
+                 AND CASE WHEN stage IN ('post', 'verify', 'release') AND next_at <= ?1 \
+                   THEN lease_until IS NULL OR lease_until < ?1 ELSE FALSE END";
 
 const UNMARK_SENT: &str = "UPDATE outbox SET sent_at = NULL \
                WHERE extent_id IN (SELECT value FROM json_each(?2)) AND sent_at = ?1";
@@ -1908,23 +1916,22 @@ const REDRIVE_PG: &str = concat!(
         "UPDATE outbox SET stage = 'verify', next_at = ?1, cursor = 0, attempts = 0, \
            last_error = NULL, updated_at = ?1, sent_at = NULL, ",
         unlease!(),
-        // Driven from the window of the index, each outbox row found by
-        // its key: `CROSS JOIN` fixes the order and the unary `+` keeps
-        // the planner off `outbox_due`, which would walk every `done`
-        // row (every extent ever posted) once per run.
-        " WHERE stage = 'done' AND extent_id IN ( \
-           SELECT e.id FROM extents e \
-             JOIN outbox o ON o.extent_id = e.id \
-            WHERE e.safety_state IN ('held', 'releasing') AND e.safety_state = 'held' \
-              AND e.id > ?4 AND e.id <= ?5 AND o.stage = 'done' AND ",
-        live_ref!("e.id"),
-        " AND (SELECT COUNT(*) FROM verifications v \
+        // A sparse ID range can span much of the outbox. Probe only
+        // the selected IDs and keep the live-reference check correlated
+        // so it cannot become a join over the whole key span.
+        " WHERE extent_id = ANY (ARRAY(SELECT jsonb_array_elements_text(?4::jsonb))) \
+            AND CASE WHEN stage = 'done' THEN 1 = (SELECT 1 FROM extents e \
+              WHERE e.id = outbox.extent_id AND e.safety_state = 'held' \
+                AND 1 = (SELECT 1 FROM generation_extents lr \
+                  JOIN generations lg ON lg.id = lr.generation_id \
+                 WHERE lr.extent_id = e.id AND lg.state = 'live' LIMIT 1) \
+                AND (SELECT COUNT(*) FROM verifications v \
                     WHERE v.extent_id = e.id \
                       AND v.backbone IN (SELECT value FROM jsonb_array_elements_text(?2::jsonb) AS j(value)) AND ",
         latest!(),
         " AND ",
         counts!(),
-        ") < ?3) RETURNING 1"
+        ") < ?3) ELSE FALSE END RETURNING 1"
     );
 
 const REVIVE_WINDOW: &str = "SELECT rowid FROM outbox WHERE rowid > ?1 ORDER BY rowid LIMIT ?2";
@@ -2094,7 +2101,7 @@ pub(super) fn pg_statements() -> Vec<(String, Vec<SqlValue>)> {
         (MARK_SENT_PG.to_owned(), vec![I, T]),
         (UNMARK_SENT_PG.to_owned(), vec![I, T]),
         (REDRIVE_WINDOW_PG.to_owned(), vec![T, I]),
-        (REDRIVE_PG.to_owned(), vec![I, T, I, T, T]),
+        (REDRIVE_PG.to_owned(), vec![I, T, I, T]),
         (REVIVE_WINDOW_PG.to_owned(), vec![I, I]),
         (REVIVE_PG.to_owned(), vec![I, I, I]),
         (SET_SCAN_CURSOR_PG.to_owned(), vec![T, T]),
@@ -2110,4 +2117,172 @@ pub(super) fn pg_statements() -> Vec<(String, Vec<SqlValue>)> {
         (bury_sql(crate::ports::Dialect::Postgres, false), vec![I, I]),
         (bury_sql(crate::ports::Dialect::Postgres, true), vec![I, I]),
     ]
+}
+
+#[cfg(all(test, feature = "pg-test-record", not(target_arch = "wasm32")))]
+mod pg_plan_tests {
+    use super::super::gc::GC_ORPHAN_WINDOW_PG;
+    use super::{MARK_SENT_PG, REDRIVE_PG, REDRIVE_WINDOW_PG};
+    use serde_json::Value;
+    use std::path::{Path, PathBuf};
+    use tokio_postgres::{NoTls, SimpleQueryMessage, Transaction};
+
+    fn pg(sql: &str) -> String {
+        sql.replace('?', "$")
+    }
+
+    async fn explain(tx: &Transaction<'_>, statement: &str) -> Value {
+        let sql = format!("EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) EXECUTE {statement}");
+        let results = tx.simple_query(&sql).await.unwrap();
+        let plan = results.iter().find_map(|message| match message {
+            SimpleQueryMessage::Row(row) => row.get(0),
+            _ => None,
+        });
+        let json: Value =
+            serde_json::from_str(plan.expect("EXPLAIN did not return a plan")).unwrap();
+        json[0]["Plan"].clone()
+    }
+
+    fn bounded_plan(plan: &Value, name: &str, window: usize) {
+        let get = |key: &str| plan[key].as_f64().unwrap_or_default();
+        if let Some(table) = plan["Relation Name"].as_str() {
+            // Include rejected tuples, not just those emitted by the scan.
+            let visited = (get("Actual Rows")
+                + get("Rows Removed by Filter")
+                + get("Rows Removed by Index Recheck"))
+                * get("Actual Loops");
+            let cap = (window * 4) as f64;
+            assert!(
+                visited <= cap && get("Index Searches") <= cap,
+                "{name}: {table} visited {visited} tuples, {} index searches for {window} ids",
+                get("Index Searches")
+            );
+        }
+        if let Some(children) = plan["Plans"].as_array() {
+            for child in children {
+                bounded_plan(child, name, window);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn postgres_background_windows_keep_bounded_scans() {
+        let Ok(url) = std::env::var("VELMORA_TEST_PG_URL") else {
+            return;
+        };
+        let migrations = std::env::var_os("VELMORA_TEST_PG_BASELINE_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                Path::new(env!("CARGO_MANIFEST_DIR")).join("../../workers/s3-bridge/pg")
+            });
+        let (mut db, conn) = tokio_postgres::connect(&url, NoTls).await.unwrap();
+        let driver = tokio::spawn(conn);
+        let tx = db.transaction().await.unwrap();
+        let pid: i32 = tx
+            .query_one("SELECT pg_backend_pid()", &[])
+            .await
+            .unwrap()
+            .get(0);
+        let schema = format!("outbox_plan_{pid}");
+        tx.batch_execute(&format!(
+            "CREATE SCHEMA {schema}; SET LOCAL search_path TO {schema}, pg_temp"
+        ))
+        .await
+        .unwrap();
+        let migration = |name: &str| std::fs::read_to_string(migrations.join(name)).unwrap();
+        tx.batch_execute(&migration("0001_baseline_pre.sql"))
+            .await
+            .unwrap();
+        tx.batch_execute(
+            "INSERT INTO usage_global(id) VALUES (1), (2);
+             INSERT INTO buckets (id,name,owner,bdk_wrapped,kek_version,created_at)
+                 VALUES ('b','bucket','owner',''::bytea,1,0);
+             INSERT INTO generations (id,bucket_id,key,state,size,etag,content_json,user_meta_json,extent_count,created_at)
+                 SELECT 'g'||lpad(i::text,6,'0'),'b','key','live',1,'etag','{}','{}',1,0
+                   FROM generate_series(1,100000) i;
+             INSERT INTO extents (id,bucket_id,generation_id,state,seq,plain_offset,plain_size,cipher_size,
+                                  media_header,plain_md5,plain_sha256,cipher_sha256,safety_state,created_at)
+                 SELECT 'x'||lpad(i::text,6,'0'),'b','g'||lpad(i::text,6,'0'),'committed',i,i-1,1,1,
+                        ''::bytea,''::bytea,''::bytea,''::bytea,
+                        CASE WHEN i < 10000 OR i > 79000 OR i % 137 = 0 THEN 'held' ELSE 'released' END,0
+                   FROM generate_series(1,100000) i;
+             INSERT INTO generation_extents (generation_id,seq,extent_id,plain_offset)
+                 SELECT generation_id,seq,id,plain_offset FROM extents;
+             INSERT INTO outbox (extent_id,generation_id,stage,next_at,updated_at)
+                 SELECT id,generation_id,'done',0,0 FROM extents ORDER BY seq;
+             INSERT INTO extents (id,bucket_id,state,plain_size,cipher_size,media_header,
+                                  plain_md5,plain_sha256,cipher_sha256,safety_state,created_at)
+                 SELECT 'orphan'||i,'b','staged',1,1,''::bytea,''::bytea,''::bytea,''::bytea,'held',0
+                   FROM generate_series(1,500) i;
+             INSERT INTO gc(extent_id,action,due_at)
+                 SELECT id,'delete_safety',10 FROM extents WHERE id LIKE 'orphan%';
+             INSERT INTO uploads (id,bucket_id,key,content_json,user_meta_json,state,initiated_at)
+                 SELECT 'upload'||seq,'b','key','{}','{}','open',0 FROM extents WHERE seq IS NOT NULL;
+             INSERT INTO upload_parts (upload_id,part_number,extent_id,size,etag,uploaded_at)
+                 SELECT 'upload'||seq,1,id,1,'etag',0 FROM extents WHERE seq IS NOT NULL;",
+        ).await.unwrap();
+        tx.batch_execute(&migration("0002_baseline_post.sql"))
+            .await
+            .unwrap();
+        tx.batch_execute(
+            "ANALYZE extents; ANALYZE outbox; ANALYZE generation_extents; ANALYZE generations; \
+                          ANALYZE gc; ANALYZE uploads; ANALYZE upload_parts",
+        )
+        .await
+        .unwrap();
+
+        let ids = tx
+            .query(&pg(REDRIVE_WINDOW_PG), &[&"x010000", &500_i64])
+            .await
+            .unwrap();
+        assert_eq!(ids.len(), 500);
+        let selected: Vec<&str> = ids.iter().map(|row| row.get(0)).collect();
+        let first = serde_json::to_string(&selected[..1]).unwrap();
+        let selected = serde_json::to_string(&selected).unwrap();
+        tx.batch_execute(&format!(
+            "PREPARE redrive(bigint,text,bigint,text) AS {}",
+            pg(REDRIVE_PG)
+        ))
+        .await
+        .unwrap();
+        let plan = explain(&tx, &format!("redrive(1,'[]',1,'{selected}')")).await;
+        assert_eq!(plan["Actual Rows"].as_f64(), Some(ids.len() as f64));
+        bounded_plan(&plan, "redrive", ids.len());
+
+        tx.batch_execute(&format!(
+            "PREPARE mark_sent(bigint,text) AS {}",
+            pg(MARK_SENT_PG)
+        ))
+        .await
+        .unwrap();
+        let plan = explain(&tx, &format!("mark_sent(2,'{first}')")).await;
+        bounded_plan(&plan, "mark sent", 1);
+        let marked: i64 = tx
+            .query_one("SELECT count(*) FROM outbox WHERE sent_at = 2", &[])
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(marked, 1);
+
+        tx.batch_execute(&format!(
+            "PREPARE orphans(bigint,bigint,bigint,bigint) AS {}",
+            pg(GC_ORPHAN_WINDOW_PG)
+        ))
+        .await
+        .unwrap();
+        let plan = explain(&tx, "orphans(10,0,0,500)").await;
+        assert_eq!(plan["Actual Rows"].as_f64(), Some(500.));
+        bounded_plan(&plan, "orphan window", 500);
+        let candidates = tx
+            .query(
+                &pg(GC_ORPHAN_WINDOW_PG),
+                &[&10_i64, &0_i64, &0_i64, &500_i64],
+            )
+            .await
+            .unwrap();
+        assert!(candidates.iter().all(|row| row.get::<_, bool>(3)));
+        tx.rollback().await.unwrap();
+        drop(db);
+        driver.await.unwrap().unwrap();
+    }
 }

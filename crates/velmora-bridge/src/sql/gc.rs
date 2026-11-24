@@ -475,7 +475,7 @@ pub(super) async fn gc_orphans<S: Sql>(
     let rows = c
         .sql
         .query(
-            GC_ORPHAN_WINDOW,
+            c.sql.dialect().pick(GC_ORPHAN_WINDOW, GC_ORPHAN_WINDOW_PG),
             &[
                 ms(cutoff),
                 SqlValue::Int(due),
@@ -778,11 +778,13 @@ const MARK_SAFETY_GC_DONE: &str = "UPDATE gc SET done_at = ?2 WHERE id = ?1 AND 
 
 const GC_ORPHAN_CURSOR: &str = "SELECT v FROM scan_cursors WHERE k = 'orphans'";
 
-const GC_ORPHAN_WINDOW: &str = concat!(
-    "SELECT w.id, w.extent_id, w.due_at, \
+macro_rules! gc_orphan_window {
+    ($orphan:expr) => {
+        concat!(
+            "SELECT w.id, w.extent_id, w.due_at, \
                    (w.action = 'delete_safety' AND ",
-    orphan!("w.extent_id"),
-    ") FROM (SELECT id, extent_id, action, due_at FROM \
+            $orphan,
+            ") FROM (SELECT id, extent_id, action, due_at FROM \
                    (SELECT id, extent_id, action, due_at FROM gc \
                      WHERE done_at IS NULL AND due_at = ?2 AND id > ?3 AND due_at <= ?1 \
                      ORDER BY id LIMIT ?4) \
@@ -792,6 +794,24 @@ const GC_ORPHAN_WINDOW: &str = concat!(
                      ORDER BY due_at, id LIMIT ?4) \
                   ORDER BY due_at, id LIMIT ?4) w \
                  ORDER BY w.due_at, w.id"
+        )
+    };
+}
+
+const GC_ORPHAN_WINDOW: &str = gc_orphan_window!(orphan!("w.extent_id"));
+
+// Projected EXISTS checks can become hashed subplans over every reference
+// in the catalogue. Scalar, correlated one-row probes only consult the
+// current candidate. The claim batch still rechecks the original guards.
+pub(super) const GC_ORPHAN_WINDOW_PG: &str = gc_orphan_window!(
+    "((SELECT 1 FROM extents oe WHERE oe.id = w.extent_id \
+      AND oe.state = 'staged' AND oe.generation_id IS NULL \
+      AND oe.safety_state IN ('held', 'deleted')) IS NOT NULL \
+      AND (SELECT 1 FROM generation_extents og WHERE og.extent_id = w.extent_id LIMIT 1) IS NULL \
+      AND (SELECT 1 FROM upload_parts pr JOIN uploads pu ON pu.id = pr.upload_id \
+           WHERE pr.extent_id = w.extent_id AND pu.state = 'open' LIMIT 1) IS NULL \
+      AND (SELECT 1 FROM upload_part_extents px JOIN uploads pu ON pu.id = px.upload_id \
+           WHERE px.extent_id = w.extent_id AND pu.state = 'open' LIMIT 1) IS NULL)"
 );
 
 const SET_GC_ORPHAN_CURSOR: &str = "INSERT INTO scan_cursors(k, v) VALUES ('orphans', ?1) \
@@ -836,7 +856,7 @@ pub(super) fn pg_statements() -> Vec<(String, Vec<SqlValue>)> {
         (DELETE_GC_SAFETY.to_owned(), vec![I]),
         (MARK_SAFETY_GC_DONE.to_owned(), vec![I, I]),
         (GC_ORPHAN_CURSOR.to_owned(), vec![]),
-        (GC_ORPHAN_WINDOW.to_owned(), vec![I, I, I, I]),
+        (GC_ORPHAN_WINDOW_PG.to_owned(), vec![I, I, I, I]),
         (SET_GC_ORPHAN_CURSOR.to_owned(), vec![T]),
         (MARK_ORPHAN_DONE.to_owned(), vec![I, I]),
         (ORPHAN_CLAIM_INPUTS_PG.to_owned(), vec![T]),
