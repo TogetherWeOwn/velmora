@@ -24,13 +24,11 @@ fn word_byte(b: u8) -> bool {
     word_start(b) || b.is_ascii_digit()
 }
 
-fn quoted(bytes: &[u8], mut i: usize, escape: bool) -> Result<usize> {
+fn quoted(bytes: &[u8], mut i: usize) -> Result<usize> {
     let delim = bytes[i];
     i += 1;
     while i < bytes.len() {
-        if escape && bytes[i] == b'\\' {
-            i += 2;
-        } else if bytes[i] == delim {
+        if bytes[i] == delim {
             i += 1;
             if bytes.get(i) != Some(&delim) {
                 return Ok(i);
@@ -81,10 +79,8 @@ fn scan(sql: &str, postgres: bool) -> Result<Statement> {
     let mut writes = false;
     let mut ended = false;
     let mut previous = String::new();
-    let mut escape_quote = false;
     while i < bytes.len() {
         let start = i;
-        let escape = std::mem::take(&mut escape_quote);
         match bytes[i] {
             b if b.is_ascii_whitespace() => i += 1,
             b'-' if bytes.get(i + 1) == Some(&b'-') => {
@@ -113,11 +109,11 @@ fn scan(sql: &str, postgres: bool) -> Result<Statement> {
             }
             _ if ended => return Err(untranslated()),
             b'\'' => {
-                i = quoted(bytes, i, escape && postgres)?;
+                i = quoted(bytes, i)?;
                 previous.clear();
             }
             b'"' => {
-                i = quoted(bytes, i, false)?;
+                i = quoted(bytes, i)?;
                 let token = sql[start + 1..i - 1].to_ascii_uppercase();
                 writes |= writes_or_locks(&token);
                 previous = token;
@@ -199,7 +195,10 @@ fn scan(sql: &str, postgres: bool) -> Result<Statement> {
                 {
                     return Err(untranslated());
                 }
-                escape_quote = token == "E" && bytes.get(i) == Some(&b'\'');
+                // Catalogue statements do not use PostgreSQL escape literals.
+                if postgres && token == "E" && bytes.get(i) == Some(&b'\'') {
+                    return Err(untranslated());
+                }
                 let dml = matches!(token.as_str(), "INSERT" | "UPDATE" | "DELETE" | "MERGE");
                 writes |= writes_or_locks(&token);
                 if depth == 0 && command.is_none() {

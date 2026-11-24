@@ -248,12 +248,77 @@ async fn pipeline_commit_reply_loss_is_not_a_guard_failure() {
         let sent = &sent;
         async move {
             sent.set(commit);
-            Err(super::error::statement_failed())
+            Err(BridgeError::Sql("pg: overloaded".into()))
         }
     })
     .await;
     assert!(sent.get());
     assert!(matches!(result, Err(BridgeError::Sql(e)) if e=="pg: statement failed"));
+}
+
+#[test]
+fn escape_string_literals_are_not_catalogue_sql() {
+    for sql in [r"SELECT E'\n'", r"SELECT e'\t'", r"SELECT 'ordinary' e'\n'"] {
+        assert!(
+            matches!(statement(sql), Err(BridgeError::Sql(e)) if e=="pg: untranslated statement"),
+            "{sql}"
+        );
+    }
+    assert!(statement("SELECT 'E''ordinary', \"e\" /* E'comment' */").is_ok());
+}
+
+#[tokio::test]
+async fn a_wire_success_after_the_first_failure_is_never_a_known_refusal() {
+    use super::batch::pipeline;
+    use futures_util::future::poll_fn;
+    use std::task::Poll;
+    let step = |r| {
+        let mut first = true;
+        let mut answer = Some(r);
+        poll_fn(move |cx| {
+            if std::mem::take(&mut first) {
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            } else {
+                Poll::Ready(answer.take().unwrap())
+            }
+        })
+    };
+    let guard = step(Err(BridgeError::GuardFailed));
+    let successful_stmt = step(Ok(()));
+    let result = pipeline(async { Ok(()) }, vec![guard, successful_stmt], |_| async {
+        Ok(())
+    })
+    .await;
+    assert!(matches!(result, Err(BridgeError::Sql(e)) if e=="pg: statement failed"));
+}
+
+#[tokio::test]
+async fn drops_unread_prelude_before_attempting_rollback() {
+    use super::batch::pipeline;
+    use std::cell::Cell;
+    struct ReplyDropped<'a>(&'a Cell<bool>);
+    impl Drop for ReplyDropped<'_> {
+        fn drop(&mut self) {
+            self.0.set(true);
+        }
+    }
+    let dropped = &Cell::new(false);
+    let prelude = async {
+        let _rx = ReplyDropped(dropped);
+        std::future::pending::<crate::Result<()>>().await
+    };
+    let error = async { Err::<(), _>(super::error::statement_failed()) };
+    let result = pipeline(prelude, vec![error], |committing| async move {
+        assert!(!committing);
+        assert!(
+            dropped.get(),
+            "rollback queued while unread prelude reply still owned"
+        );
+        Ok(())
+    })
+    .await;
+    assert!(result.is_err());
 }
 
 #[tokio::test]

@@ -82,9 +82,12 @@ impl Reply {
 }
 
 fn prelude(lock_key: Option<i64>) -> String {
-    let mut start = "BEGIN ISOLATION LEVEL READ COMMITTED; SET LOCAL lock_timeout = '2s'; \
+    // The app role defaults to read-only. If a proxy drops this prelude,
+    // later extended requests must not autocommit writes on that role.
+    let mut start =
+        "BEGIN READ WRITE, ISOLATION LEVEL READ COMMITTED; SET LOCAL lock_timeout = '2s'; \
         SET LOCAL statement_timeout = '20s'; SET LOCAL idle_in_transaction_session_timeout = '5s'"
-        .to_owned();
+            .to_owned();
     if let Some(key) = lock_key {
         // This is the only variable in the prelude and is an i64, not SQL text.
         use std::fmt::Write;
@@ -132,7 +135,7 @@ pub(super) async fn transaction(
                 }
             }
         }
-        finish(true).await?;
+        finish(true).await.map_err(|_| error::statement_failed())?;
         Ok(replies)
     }
 }
@@ -153,11 +156,12 @@ where
     F: FnOnce(bool) -> End,
     End: Future<Output = Result<()>>,
 {
-    let mut begin = pin!(begin);
+    let mut begin = Box::pin(begin);
     let began = match first_poll(begin.as_mut()).await {
         Poll::Ready(Ok(())) => true,
         Poll::Pending => false,
         Poll::Ready(Err(err)) => {
+            drop(begin);
             let _ = finish(false).await;
             return Err(err);
         }
@@ -169,9 +173,12 @@ where
             Poll::Pending => None,
             Poll::Ready(Ok(reply)) => Some(reply),
             Poll::Ready(Err(err)) => {
-                // Dropping response receivers doesn't unsend requests. The
-                // driver keeps their wire order, then processes ROLLBACK.
+                // Dropping response receivers doesn't unsend requests. It
+                // lets the driver drain replies even if a prelude was split
+                // into multiple response chunks, then process ROLLBACK.
+                drop(s);
                 drop(sent);
+                drop(begin);
                 let _ = finish(false).await;
                 return Err(err);
             }
@@ -191,8 +198,23 @@ where
         }
     };
     let (commit, (start, replies)) = join(finish(true), join(begin, join_all(sent))).await;
-    start?;
-    let replies = replies.into_iter().collect::<Result<Vec<_>>>()?;
-    commit?;
-    Ok(replies)
+    let mut first_error = start.err();
+    let mut values = Vec::with_capacity(replies.len());
+    for reply in replies {
+        match reply {
+            // After a server error aborts a transaction, another statement
+            // can't succeed. A proxy may have omitted the prelude or changed
+            // transaction state; do not call this a known refusal or overload.
+            Ok(_) if first_error.is_some() => return Err(error::statement_failed()),
+            Ok(value) => values.push(value),
+            Err(err) => {
+                first_error.get_or_insert(err);
+            }
+        }
+    }
+    if let Some(err) = first_error {
+        return Err(err);
+    }
+    commit.map_err(|_| error::statement_failed())?;
+    Ok(values)
 }
