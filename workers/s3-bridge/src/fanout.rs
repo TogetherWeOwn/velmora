@@ -18,7 +18,7 @@ use velmora_bridge::fanout::{
     FanoutError, SubPipe, SubRequest, SubResponse, INTERNAL_TARGET, TOKEN_HEADER,
 };
 use velmora_bridge::ingress::IngressError;
-use velmora_bridge::metrics::{GetFailureStage as Stage, GetObservation};
+use velmora_bridge::metrics::{Fault, GetFailureStage as Stage, GetObservation};
 use velmora_bridge::{RespBody, S3Response};
 use worker::js_sys::{BigInt, Function, Object, Promise, Reflect, Uint8Array};
 use worker::wasm_bindgen::{JsCast, JsValue};
@@ -210,7 +210,7 @@ pub async fn respond(
         )
     };
     let Some((pipe, readable)) = SelfPipe::new(env, fan.len()) else {
-        observed.mark_stage(Stage::SubrangeTransport);
+        observed.mark_fault(Stage::SubrangeTransport, Fault::named("NoBinding"));
         console_error!("fanout: no service binding or stream");
         return refuse(IngressError::Internal.response());
     };
@@ -238,7 +238,7 @@ pub async fn respond(
             .with_encode_body(EncodeBody::Manual))
     })();
     let Ok(resp) = built else {
-        observed.mark_stage(Stage::Other);
+        observed.mark_fault(Stage::Other, Fault::named("ResponseBuild"));
         pipe.discard(first).await;
         pipe.abort().await;
         return refuse(IngressError::Internal.response());

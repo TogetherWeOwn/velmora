@@ -353,7 +353,13 @@ where
                 .iter()
                 .find(|(name, _)| name.eq_ignore_ascii_case("host"))
                 .and_then(|(_, host)| common::host_value_refused(host, &self.cfg))
-                .unwrap_or_else(S3Response::not_implemented),
+                .unwrap_or_else(|| {
+                    observed.mark_fault(
+                        crate::metrics::FailureStage::Other,
+                        crate::metrics::Fault::named("UnsupportedRoute"),
+                    );
+                    S3Response::not_implemented()
+                }),
         }
     }
 }

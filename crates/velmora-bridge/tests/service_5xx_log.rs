@@ -191,3 +191,78 @@ async fn a_get_that_fails_logs_its_stage_variant_and_code() {
     resp.expect(200);
     assert!(line.ends_with("status=200 id=ray-1"), "{line}");
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_sliced_put_logs_the_fault_of_its_failed_slice() {
+    let mut cfg = config(Vec::new());
+    cfg.max_extent_bytes = 4 * 1024;
+    cfg.slice_bytes = 2 * 1024;
+    let rig = rig_with(NoNntp, cfg);
+    let (_, signer) = rig.standard(BUCKET).await;
+    rig.bridge.safety.fail_put.set(true);
+    let req = signer.sign(
+        rig.now(),
+        Method::Put,
+        &path(BUCKET, KEY),
+        &[],
+        &[],
+        vec![7; 5 * 1024],
+    );
+    let (resp, line) = logged(&rig, req).await;
+    resp.expect_error(500, "InternalError");
+    assert_eq!(fields(&line), "stage=r2 err=Blob code=-");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_copy_whose_source_lookup_fails_logs_the_catalogue_error() {
+    let rig = rig();
+    let (_, signer) = rig.standard(BUCKET).await;
+    rig.put(&signer, BUCKET, "source", b"payload")
+        .await
+        .expect(200);
+    *rig.bridge.catalog.sql.fail_matching.borrow_mut() =
+        Some(("FROM objects o JOIN generations", 0));
+    let req = signer.sign(
+        rig.now(),
+        Method::Put,
+        &path(BUCKET, KEY),
+        &[],
+        &[("x-amz-copy-source", &format!("/{BUCKET}/source"))],
+        vec![],
+    );
+    let (resp, line) = logged(&rig, req).await;
+    rig.bridge.catalog.sql.fail_matching.borrow_mut().take();
+    resp.expect_error(500, "InternalError");
+    assert_eq!(fields(&line), "stage=lookup err=Sql code=sql_other");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_head_bucket_and_an_unsupported_route_log_their_reason() {
+    let rig = rig();
+    let (_, signer) = rig.standard(BUCKET).await;
+    *rig.bridge.catalog.sql.fail_matching.borrow_mut() = Some(("FROM access_keys", 0));
+    let head = signer.sign(
+        rig.now(),
+        Method::Head,
+        &format!("/{BUCKET}"),
+        &[],
+        &[],
+        vec![],
+    );
+    let (resp, line) = logged(&rig, head).await;
+    rig.bridge.catalog.sql.fail_matching.borrow_mut().take();
+    resp.expect(500);
+    assert_eq!(fields(&line), "stage=auth err=Sql code=sql_other");
+
+    let versions = signer.sign(
+        rig.now(),
+        Method::Get,
+        &format!("/{BUCKET}"),
+        &[("versions", "")],
+        &[],
+        vec![],
+    );
+    let (resp, line) = logged(&rig, versions).await;
+    resp.expect(501);
+    assert_eq!(fields(&line), "stage=other err=UnsupportedRoute code=-");
+}

@@ -1637,6 +1637,26 @@ pub fn log_line_with(
     format!("{line} {fields}")
 }
 
+/// The last step of every answered request: reconciles `observed` with
+/// the status the client got (`wire`; HTTP conversion can turn the
+/// `intended` answer into a 500, see
+/// [`crate::metrics::RequestObservation::response_status`]), then gives
+/// the status to count the request under and its log line, which has the
+/// wire status and, for a 5xx, the observed failure.
+pub fn settled_log_line(
+    method: &str,
+    raw_target: &str,
+    request_id: &str,
+    admin: bool,
+    intended: u16,
+    wire: u16,
+    observed: &mut crate::metrics::RequestObservation,
+) -> (u16, String) {
+    let counted = observed.response_status(method, admin, intended, wire);
+    let line = log_line_with(method, raw_target, wire, request_id, Some(observed));
+    (counted, line)
+}
+
 fn request_line(method: &str, raw_target: &str, status: u16, request_id: &str) -> String {
     let path = raw_target.split_once('?').map_or(raw_target, |(p, _)| p);
     let path = path.strip_prefix('/').unwrap_or(path);

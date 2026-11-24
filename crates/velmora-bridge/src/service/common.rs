@@ -475,8 +475,15 @@ where
         })
 }
 
-/// The answer to a port error during authentication, which is kept in
-/// `fault`.
+/// `500 InternalError` for a port error, which is kept in `fault` for
+/// the request log.
+pub(super) fn noted_internal(fault: &Cell<Option<Fault>>, error: &BridgeError) -> S3Response {
+    fault.set(Some(Fault::of(error)));
+    internal()
+}
+
+/// [`noted_internal`], answered as [`catalog_error`] answers a catalogue
+/// error.
 pub(super) fn noted(fault: &Cell<Option<Fault>>, error: BridgeError) -> S3Response {
     fault.set(Some(Fault::of(&error)));
     catalog_error(error)
@@ -559,7 +566,7 @@ where
             Some(row) if bridge.cfg.maintenance == Maintenance::Restore => {
                 let revoked = revocation_recorded(&bridge.safety, &row.access_key_id)
                     .await
-                    .map_err(|e| noted(fault, e))?;
+                    .map_err(|e| noted_internal(fault, &e))?;
                 (!revoked).then_some(row)
             }
             other => other,
@@ -571,7 +578,7 @@ where
                 &row.access_key_id,
                 &row.secret_wrapped,
             )
-            .map_err(|e| noted(fault, e))?;
+            .map_err(|e| noted_internal(fault, &e))?;
             authority.principal = row.principal;
             authority.secret = Some(secret);
             if !target.bucket.is_empty() {

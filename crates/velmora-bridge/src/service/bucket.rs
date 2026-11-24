@@ -13,7 +13,7 @@ use std::rc::Rc;
 
 use velmora_s3_proto::ErrorCode;
 
-use super::common::{authenticate, internal, s3_error};
+use super::common::{authenticate, authenticate_observed, internal, s3_error};
 use crate::metrics::{FailureStage, RequestObservation};
 use crate::ports::{BlobStore, Bridge, Catalog, Clock, JobSink, Kek, NntpConnector};
 use crate::types::{RespBody, S3Request, S3Response};
@@ -32,10 +32,7 @@ pub(super) async fn head_bucket<
     req: S3Request,
     observed: &mut RequestObservation,
 ) -> S3Response {
-    match authenticate(bridge, &req)
-        .await
-        .inspect_err(observed.on_error(FailureStage::Auth))
-    {
+    match authenticate_observed(bridge, &req, observed).await {
         Ok(_) => S3Response {
             status: 200,
             headers: vec![("x-amz-bucket-region".into(), bridge.cfg.region.clone())],

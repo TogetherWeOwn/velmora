@@ -336,3 +336,32 @@ async fn a_range_that_ends_in_a_cold_extent_to_rebuild_fits_the_budget() {
 
     copy_across(&src).await;
 }
+
+/// A GET whose cold read fails on the catalogue (the provider slot it
+/// takes) logs the stage, the variant and the class of that failure.
+#[tokio::test(flavor = "current_thread")]
+async fn a_failed_cold_read_logs_its_stage_variant_and_code() {
+    use std::rc::Rc;
+    use velmora_bridge::metrics::RequestObservation;
+
+    let src = cold_source(3 * CAP as u64, false).await;
+    let rig = &src.rig;
+    *rig.bridge.catalog.sql.fail_matching.borrow_mut() =
+        Some(("UPDATE provider_permits SET token = token + 1", 0));
+    let request = src.signer.sign(
+        rig.now(),
+        Method::Get,
+        &path(BUCKET, "src"),
+        &[],
+        &[("range", "bytes=0-0")],
+        vec![],
+    );
+    let mut observed = RequestObservation::default();
+    let raw = Rc::clone(&rig.bridge)
+        .handle_observed(request.into_request(), &mut observed)
+        .await;
+    let resp = Resp::collect(raw).await;
+    rig.bridge.catalog.sql.fail_matching.borrow_mut().take();
+    resp.expect_error(500, "InternalError");
+    assert_eq!(observed.log_fields(), "stage=lookup err=Sql code=sql_other");
+}

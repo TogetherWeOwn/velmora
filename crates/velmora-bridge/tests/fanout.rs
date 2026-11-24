@@ -769,12 +769,24 @@ async fn first_subrange_500s_carry_distinct_stages_without_changing_the_xml() {
     let no_mint = Fanout::new(0, SIZE as u64, CHUNK, Rc::new(|_, _| None)).unwrap();
     let fallback = || S3Response::error(500, "InternalError", "fixture");
 
-    for (failure, expected) in [
-        ("transport", "subrange_transport"),
-        ("length", "subrange_length"),
-        ("admit", "grant"),
-        ("mint", "grant"),
-        ("status", "subrange_status"),
+    for (failure, expected, fields) in [
+        (
+            "transport",
+            "subrange_transport",
+            "stage=subrange_transport err=Transport code=-",
+        ),
+        (
+            "length",
+            "subrange_length",
+            "stage=subrange_length err=Length code=-",
+        ),
+        ("admit", "grant", "stage=grant err=Status code=upstream_403"),
+        ("mint", "grant", "stage=grant err=Mint code=-"),
+        (
+            "status",
+            "subrange_status",
+            "stage=subrange_status err=Status code=upstream_500",
+        ),
     ] {
         let mut pipe = Loopback::new(&rig);
         pipe.faults.transport = failure == "transport";
@@ -787,6 +799,8 @@ async fn first_subrange_500s_carry_distinct_stages_without_changing_the_xml() {
         let Err(resp) = fan.open_first_observed(&pipe, fallback, &mut get).await else {
             panic!("the first subrange must fail: {failure}");
         };
+        // The request log line names the cause, the status included.
+        assert_eq!(get.log_fields(), fields, "{failure}");
         let point = request_point(
             &Request {
                 method: "GET",

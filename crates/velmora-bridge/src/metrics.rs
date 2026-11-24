@@ -157,6 +157,8 @@ pub enum ProviderCode {
     /// An NNTP reply code, or the kind of an I/O error.
     NntpReply(u16),
     NntpIo(&'static str),
+    /// The HTTP status a sub-request (or another upstream) answered.
+    Upstream(u16),
 }
 
 impl Fault {
@@ -165,6 +167,14 @@ impl Fault {
         Fault {
             variant,
             code: ProviderCode::None,
+        }
+    }
+
+    /// A failure that an upstream answered with `status`.
+    pub const fn upstream(variant: &'static str, status: u16) -> Fault {
+        Fault {
+            variant,
+            code: ProviderCode::Upstream(status),
         }
     }
 
@@ -207,6 +217,7 @@ impl Fault {
             }
             ProviderCode::NntpReply(code) => format!("nntp_{code}"),
             ProviderCode::NntpIo(kind) => format!("nntp_io_{kind}"),
+            ProviderCode::Upstream(status) => format!("upstream_{status}"),
         }
     }
 }
@@ -227,6 +238,7 @@ fn sql_class(class: &str) -> &'static str {
         "d1: unexpected result shape" => "d1_result_shape",
         "d1: integer outside JS safe range" | "d1: non-integer or unsafe number" => "d1_number",
         "pg: overloaded" => "pg_overloaded",
+        crate::fetch::CATALOGUE_FAILED => "cold_catalogue",
         c if c.starts_with("too many bound parameters") => "sql_too_many_params",
         c if c.starts_with("pg: ") => "pg_other",
         _ => "sql_other",

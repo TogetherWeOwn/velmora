@@ -59,7 +59,7 @@ use crate::ingress::{
     SealedUpload, UploadLengths, UploadReadError,
 };
 use crate::intents::WRITER_MAX_AGE_MS;
-use crate::metrics::{FailureStage as Stage, RequestObservation};
+use crate::metrics::{FailureStage as Stage, Fault, RequestObservation};
 use crate::ports::{
     BlobMeta, BlobStore, Bridge, Catalog, Clock, Guard, JobSink, Kek, NntpConnector,
     PublishOutcome, StreamMeta, UploadTarget,
@@ -1690,17 +1690,17 @@ where
                 // published. Without its record this attempt cannot come
                 // back in a replay, also after the client aborts.
                 let _ = discard_refused(bridge, &commit.generation, record).await;
-                observed.mark_stage(Stage::Commit);
+                observed.mark_fault(Stage::Commit, Fault::named("Fenced"));
                 return Err(Fail::Internal);
             }
             PublishOutcome::FencedOverloaded(record) => {
                 let _ = discard_refused(bridge, &commit.generation, record).await;
-                observed.mark_stage(Stage::Commit);
+                observed.mark_fault(Stage::Commit, Fault::named("FencedOverloaded"));
                 return Err(ErrorCode::SlowDown.into());
             }
         }
     }
-    observed.mark_stage(Stage::Commit);
+    observed.mark_fault(Stage::Commit, Fault::named("AttemptsExhausted"));
     Err(ErrorCode::SlowDown.into())
 }
 

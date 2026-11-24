@@ -616,30 +616,35 @@ async fn preflight<B: BlobStore>(
     todo: &[Piece],
     observed: &mut GetObservation,
 ) -> core::result::Result<(), S3Response> {
+    // A failed head counts as a miss, as before; its error is kept for
+    // the request log when the piece is missing from both tiers.
+    let fault = std::cell::Cell::new(None);
+    let fault = &fault;
     let missing = stream::iter(todo)
         .map(|piece| async move {
             let extent = &piece.extent;
             let size = Some(extent.cipher_size);
-            bridge
-                .cache
-                .head(&extent.id.cache_key())
-                .await
-                .ok()
-                .flatten()
-                != size
-                && bridge
-                    .safety
-                    .head(&extent.id.safety_key())
-                    .await
-                    .ok()
-                    .flatten()
-                    != size
+            let mut failed = None;
+            let mut seen = |head: Result<Option<u64>>| match head {
+                Ok(found) => found,
+                Err(error) => {
+                    failed = Some(Fault::of(&error));
+                    None
+                }
+            };
+            let missing = seen(bridge.cache.head(&extent.id.cache_key()).await) != size
+                && seen(bridge.safety.head(&extent.id.safety_key()).await) != size;
+            if missing {
+                fault.set(failed.or_else(|| fault.get()));
+            }
+            missing
         })
         .buffer_unordered(4)
         .any(futures_util::future::ready)
         .await;
     if missing {
-        observed.mark_stage(Stage::R2);
+        let fault = fault.get().unwrap_or(Fault::named("ExtentMissing"));
+        observed.mark_fault(Stage::R2, fault);
         return Err(unavailable());
     }
     Ok(())
@@ -1838,20 +1843,49 @@ mod tests {
 
     #[test]
     fn cold_read_port_errors_keep_their_dependency_stage() {
-        for (error, expected) in [
-            (BridgeError::Sql("fixture".into()), Stage::Lookup),
-            (BridgeError::GuardFailed, Stage::Lookup),
-            (BridgeError::Blob("fixture".into()), Stage::R2),
+        for (error, expected, fields) in [
+            (
+                BridgeError::Sql("d1: network lost: statement failed".into()),
+                Stage::Lookup,
+                "stage=lookup err=Sql code=d1_network_lost",
+            ),
+            (
+                BridgeError::Sql(crate::fetch::CATALOGUE_FAILED.into()),
+                Stage::Lookup,
+                "stage=lookup err=Sql code=cold_catalogue",
+            ),
+            (
+                BridgeError::GuardFailed,
+                Stage::Lookup,
+                "stage=lookup err=GuardFailed code=-",
+            ),
+            (
+                BridgeError::Blob("r2: get failed (10001)".into()),
+                Stage::R2,
+                "stage=r2 err=Blob code=r2_get_10001",
+            ),
             (
                 BridgeError::Nntp(velmora::Error::Io(std::io::ErrorKind::TimedOut.into())),
                 Stage::Nntp,
+                "stage=nntp err=Nntp code=nntp_io_timed_out",
             ),
-            (BridgeError::Crypto("fixture"), Stage::Decrypt),
-            (BridgeError::Invalid("fixture"), Stage::Other),
+            (
+                BridgeError::Crypto("fixture"),
+                Stage::Decrypt,
+                "stage=decrypt err=Crypto code=-",
+            ),
+            (
+                BridgeError::Invalid("fixture"),
+                Stage::Other,
+                "stage=other err=Invalid code=-",
+            ),
         ] {
             let fail = ReadFail::cold_error(error);
             assert_eq!(fail.stage(), expected);
             assert_eq!(fail.response().status, 500);
+            let mut observed = GetObservation::default();
+            fail.mark(&mut observed);
+            assert_eq!(observed.log_fields(), fields);
         }
     }
 
