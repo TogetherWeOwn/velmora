@@ -1988,3 +1988,85 @@ names. To name a frame:
 After 90 days, rebuild at `<sha>` with the same toolchain
 (`bash bundle.sh`) and use `symbols/index_bg.unstripped.wasm`; a
 different rustc may number the functions differently.
+
+## Catalogue cutover to Postgres
+
+These are opt-in operator tools; they do not deploy a Worker or switch its
+backend. Stop writers and arm the D1 restore fence before taking a **full**
+`wrangler d1 export`. Keep the frozen D1 and the original export. Never use a
+live export, a subset of exported tables, or a reverse PG-to-D1 copy to roll
+back. Run these host tools from a trusted checkout with Python 3, psycopg 3.2+
+(`psycopg[binary]`), `sqlite3` with `-safe`, `psql`, and `zstd` for a compressed
+export. Keep the inputs, working files and output receipts in a private
+operator-owned directory (`umask 077`).
+
+1. Record the freeze start and the exact `restore_state` rows before and after
+   the D1 arm. The F1 JSON contains `f1_started_at_ms` (integer),
+   `restore_state_before` (row object or `null`), `restore_state_armed` (row
+   object), and `f7_started` (boolean; set true durably **before** deploying the
+   first PG version that admits writes). Each row object has `id`, `state`,
+   `since_ms`, `started_at`, `finished_at`, `reached_phase`, `reached_after`,
+   and `reached_extent`. A fresh arm has `id=1`, `state="replaying"`,
+   `since_ms=-1`, a new `started_at` token, and null finish/progress fields.
+2. Load and census the exported data locally. `pg-copy` only opens Postgres
+   if `--apply` is supplied, and never queries D1. For a compressed export,
+   supply the verified, reassembled `.zst` file.
+
+   ```sh
+   python3 ops/pg-copy.py --export export.sql --sqlite frozen.sqlite --f1 f1.json > census.json
+   ```
+
+   The census reports storage classes, held/releasing count and oldest
+   `created_at` (`s_held_ms`), extent count and timings. Do not coerce violations
+   or ignore a mismatch in the arm record. An exported literal NUL is also a
+   failure, not a value to truncate.
+3. Provision the destination roles and a fresh schema with `kofra_app` schema
+   `USAGE` revoked. Use the migrate role and the literal, mode-0600 libpq file
+   described in [the Postgres schema guide](../pg/README.md). The script runs
+   the pre schema in import mode, creates a persistent claim marker under the
+   catalogue write lock, then does FK-ordered binary COPY and applies the post
+   schema. Interrupted or invalid copies remain fenced. Do not clear a marker
+   to reuse the target; inspect the failure, then rebuild a fresh target.
+
+   ```sh
+   python3 ops/pg-copy.py --sqlite frozen.sqlite --f1 f1.json --pg-env pg.env --apply > copy.json
+   python3 ops/pg-verify.py --sqlite frozen.sqlite --f1 f1.json --pg-env pg.env --activate > verify.json
+   ```
+
+   The imported `outbox.seq` follows the **exported** SQLite rowid order,
+   `scan_cursors` omits `revive`, and imported `restore_state` is the recorded
+   pre-arm row. Verification checks counts and length-prefixed content on both
+   sides; PK tables use keyset chunks and logs give a chunk ordinal and range
+   fingerprints, never raw keys. PK-less tables use a multiset hash, including
+   duplicates. `pg-verify` without `--activate` is read-only. Explicit
+   activation follows successful content and schema checks and atomically drops
+   the marker and grants `USAGE`. Keep maintenance on through the PG read canary.
+
+### Rollback
+
+- **R0, only before F7 starts:** use `python3 ops/pg-cutover-disarm.py --f1
+  f1.json --remote --confirm-r0 --database <D1-UUID>` with the scoped Cloudflare
+  credentials in the process environment. Local rehearsal uses `--local
+  --database <name> --config <wrangler.toml> [--persist-to <dir>]` instead.
+  It restores the previous row (or deletes the initial arm) with one guarded
+  statement. Only a one-row change authorizes the version rollback. On zero
+  rows, stop and use the R1b replay path on D1; on unknown outcome, inspect the
+  exact restore row and do not blindly retry.
+- **R1b, once F7 starts:** freeze and pause PG writers, apply
+  `pg-restore-arm.sql` with the migrate role and `ON_ERROR_STOP`, then drain.
+  This SQL takes the same catalogue lock and refuses an incomplete import. It
+  uses the public schema's fixed lock by default; tests set `search_path` and
+  `velmora.lock_key` for the isolated schema. Select D1 with maintenance still
+  on and apply the durable access revocations before replay. Compute the exact
+  replay start with `python3 ops/pg-cutover-disarm.py --f1 f1.json --r1b-census
+  census.json`. Pass the returned `since_ms` and `margin_ms` to `catalog-replay.sh`
+  (margin 0; the tool already subtracts ten minutes). If `held_missing_total`
+  is nonzero, replay again from zero. Keep maintenance on through clean replay
+  and read verification; do not reopen with unresolved damage or wrong-bucket
+  results. Restore the recorded queue/runner states after rollback and verify
+  their progress.
+
+Run the local copy tests with `python3 tools/test_pg_copy.py`. For the integration
+cases set `WP5_TEST_PG_SOCKET` and `WP5_TEST_PG_PORT` to a disposable local cluster
+and `WP5_TEST_WRANGLER` to a local Wrangler executable. Do not point the tests at
+an existing shared or production cluster.
