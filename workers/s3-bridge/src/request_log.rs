@@ -3,8 +3,9 @@
 //!
 //! [`Answered::finish`] reconciles the request's observation with the
 //! status the client got ([`ingress::settled_log_line`]), writes the
-//! line, and returns the status to count. A 5xx line ends with
-//! `stage=.. err=.. code=..`: names and numbers only.
+//! line, and returns the status to count. A 5xx line or an opted-in
+//! child grant refusal line ends with `stage=.. err=.. code=..`:
+//! names and numbers only.
 
 use velmora_bridge::ingress;
 use velmora_bridge::metrics::RequestObservation;

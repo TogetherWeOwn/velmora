@@ -118,6 +118,7 @@ pub fn from_edge(req: &S3Request) -> bool {
 const EDGE_HEADER_LABELS: &[(&str, &str)] = &[
     ("cf-connecting-ip", "cf_connecting_ip"),
     ("cf-connecting-ipv6", "cf_connecting_ipv6"),
+    ("cf-ew-via", "cf_ew_via"),
     ("cf-ipcountry", "cf_ipcountry"),
     ("cf-ray", "cf_ray"),
     ("cf-visitor", "cf_visitor"),

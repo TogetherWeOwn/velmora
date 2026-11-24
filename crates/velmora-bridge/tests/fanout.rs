@@ -1094,6 +1094,17 @@ async fn edge_header_grant_refusal_logs_allowlisted_names() {
 }
 
 #[tokio::test]
+async fn cf_ew_via_grant_refusal_logs_its_allowlisted_name() {
+    let rig = grant_log_rig();
+    let token = log_grant(rig.now()).seal(&rig.bridge.kek).unwrap();
+    let req = sub_request(
+        &token,
+        &[("cf-ew-via".into(), "fixture-header-value".into())],
+    );
+    assert_grant_refusal(&rig, req, "EdgeHeader", "cf_ew_via").await;
+}
+
+#[tokio::test]
 async fn wrong_method_grant_refusal_logs_method() {
     let rig = grant_log_rig();
     let token = log_grant(rig.now()).seal(&rig.bridge.kek).unwrap();
