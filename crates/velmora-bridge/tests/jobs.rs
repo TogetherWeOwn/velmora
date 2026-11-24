@@ -291,6 +291,7 @@ impl Fx {
             job_budget_bytes: BUDGET,
             gc_mode,
             hot_cap_bytes: velmora_bridge::config::DEFAULT_HOT_CAP_BYTES,
+            hot_ctl: Default::default(),
             maintenance,
             server_side_copy: false,
             get_fanout_bytes: None,

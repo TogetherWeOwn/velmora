@@ -1,0 +1,510 @@
+"""Shared catalogue migration contracts. No credentials or catalogue values in diagnostics."""
+
+from contextlib import closing, contextmanager
+from hashlib import file_digest, sha256
+import json
+import os
+from pathlib import Path
+import re
+import sqlite3
+import stat
+import subprocess
+import sys
+import urllib.error
+import urllib.request
+
+OPS = Path(__file__).resolve().parent
+SAFE_INT = 2**53 - 1
+MARKER = "_velmora_import_incomplete"
+RESTORE_COLUMNS = ("id", "state", "since_ms", "started_at", "finished_at",
+                   "reached_phase", "reached_after", "reached_extent")
+# Parents precede children; see the foreign-key declarations in the D1 baseline.
+TABLES = (
+    "tx_guard", "buckets", "access_keys", "grants", "generations", "objects", "extents",
+    "articles", "verifications", "outbox", "uploads", "upload_parts", "gc", "provider_permits",
+    "meta", "provider_health", "scan_cursors", "generation_extents", "key_floors", "restore_state",
+    "rollback_stamp", "write_intents", "upload_part_extents", "usage_global", "usage_buckets",
+    "usage_hours", "usage_recounts", "verify_raises", "verify_escalations", "recovery_copy_log",
+)
+UNKEYED = {"tx_guard", "recovery_copy_log"}
+SOURCE_KEYS = {
+    "buckets": ("id",), "access_keys": ("access_key_id",), "grants": ("access_key_id", "bucket_id"),
+    "generations": ("id",), "objects": ("bucket_id", "key"), "extents": ("id",),
+    "articles": ("extent_id", "idx"), "verifications": ("extent_id", "backbone", "verified_at"),
+    "outbox": ("extent_id",), "uploads": ("id",), "upload_parts": ("upload_id", "part_number"),
+    "gc": ("id",), "provider_permits": ("provider_id", "slot"), "meta": ("k",),
+    "provider_health": ("provider_id",), "scan_cursors": ("k",), "generation_extents": ("generation_id", "seq"),
+    "key_floors": ("bucket_id", "key"), "restore_state": ("id",), "rollback_stamp": ("id",),
+    "write_intents": ("extent_id",), "upload_part_extents": ("upload_id", "part_number", "piece"),
+    "usage_global": ("id",), "usage_buckets": ("kind", "bucket_id"), "usage_hours": ("hour",),
+    "usage_recounts": ("id",), "verify_raises": ("extent_id", "backbone", "plan_rev"),
+    "verify_escalations": ("backbone",),
+}
+INT_KEY = {"gc", "restore_state", "rollback_stamp", "usage_global", "usage_buckets", "usage_hours", "usage_recounts"}
+ROWID_TEXT_PK = {"access_keys", "buckets", "extents", "generations", "outbox", "uploads"}
+KEYLESS_COLUMNS = {"tx_guard": ("ok",), "recovery_copy_log": ("at", "kind", "pass", "swept", "problems", "checked", "detail")}
+D1_SYSTEM = {"_cf_KV", "_cf_METADATA", "d1_migrations"}
+PG_TYPES = {"INTEGER": "int8", "TEXT": "text", "BLOB": "bytea"}
+JSON_CAP = 1 << 20
+ATTEMPT_ID = re.compile(r"[0-9a-f]{32}\Z")
+D1_UUID = re.compile(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\Z")
+F7_PREFIX = "cutover_f7:"
+R1B_PREFIX = "cutover_r1b:"
+
+
+class Failure(Exception):
+    pass
+
+
+def require(condition, reason):
+    if not condition:
+        raise Failure(reason)
+
+
+def ident(name):
+    require(re.fullmatch(r"[a-z_][a-z0-9_]*", name), "invalid database identifier")
+    return f'"{name}"'
+
+
+def idents(names):
+    return ", ".join(map(ident, names))
+
+
+def diagnostic_main(action):
+    os.umask(0o077)
+    try:
+        return action() or 0
+    except Failure as error:
+        print(f"{Path(sys.argv[0]).stem}: {error}", file=sys.stderr)
+    except Exception as error:
+        # Driver errors may include secrets (e.g. constraint values or conninfo).
+        code = getattr(error, "sqlstate", None) or getattr(error, "sqlite_errorname", None)
+        suffix = f" [{code}]" if code and re.fullmatch(r"[A-Z0-9_]+", code) else ""
+        print(f"{Path(sys.argv[0]).stem}: {type(error).__name__}{suffix}", file=sys.stderr)
+    return 1
+
+
+def json_input(path):
+    if str(path) == "-":
+        raw = sys.stdin.buffer.read(JSON_CAP + 1)
+    else:
+        with Path(path).open("rb") as inp:
+            raw = inp.read(JSON_CAP + 1)
+    require(len(raw) <= JSON_CAP, "JSON input exceeds 1 MiB")
+
+    def unique(pairs):
+        result = dict(pairs)
+        require(len(result) == len(pairs), "JSON input has duplicate fields")
+        return result
+
+    obj = json.loads(raw, object_pairs_hook=unique)
+    require(isinstance(obj, dict), "expected a JSON object")
+    return obj
+
+
+def safe_int(value):
+    return type(value) is int and -SAFE_INT <= value <= SAFE_INT
+
+
+def f1_receipt(path):
+    return validate_f1(json_input(path))
+
+
+def validate_f1(receipt):
+    require(safe_int(receipt.get("f1_started_at_ms")) and receipt["f1_started_at_ms"] >= 0,
+            "invalid F1 start timestamp")
+    attempt, uuid = receipt.get("f1_attempt_id"), receipt.get("d1_uuid")
+    require(isinstance(attempt, str) and ATTEMPT_ID.fullmatch(attempt), "missing or invalid F1 attempt ID")
+    require(isinstance(uuid, str) and D1_UUID.fullmatch(uuid), "missing or invalid F1 D1 UUID")
+    worker = receipt.get("worker_name")
+    require(isinstance(worker, str) and re.fullmatch(r"[a-z0-9][a-z0-9-]{0,62}", worker), "invalid F1 Worker name")
+    for key, nullable in (("restore_state_before", True), ("restore_state_armed", False)):
+        require(key in receipt, "F1 receipt is missing restore_state")
+        row = receipt[key]
+        if row is None and nullable:
+            continue
+        require(isinstance(row, dict) and row.keys() == set(RESTORE_COLUMNS), "invalid F1 restore_state columns")
+        require(row["state"] in ("complete", "replaying") and safe_int(row["id"]) and row["id"] == 1,
+                "invalid F1 restore_state id or state")
+        require(all(safe_int(row[k]) for k in ("since_ms", "started_at")), "invalid F1 restore_state timestamps")
+        require(all(row[k] is None or safe_int(row[k]) for k in ("finished_at", "reached_phase", "reached_extent")),
+                "invalid F1 restore_state progress")
+        text = row["reached_after"]
+        require(text is None or (isinstance(text, str) and "\0" not in text), "invalid F1 restore_state cursor")
+        if text is not None:
+            text.encode("utf-8", "strict")
+    before = receipt["restore_state_before"]
+    expected = dict.fromkeys(RESTORE_COLUMNS)
+    expected.update(id=1, state="replaying", since_ms=-1, reached_after=attempt,
+                    started_at=0 if before is None else before["started_at"] + 1)
+    require(before is None or before["state"] == "complete" or before["since_ms"] == -1,
+            "F1 cannot replace an unfinished replay")
+    require(receipt["restore_state_armed"] == expected, "F1 restore_state does not match the expected arm")
+    return receipt
+
+
+def restore_values(record):
+    return tuple(record[column] for column in RESTORE_COLUMNS)
+
+
+def encode_row(digest, row):
+    for value in row:
+        if value is None:
+            digest.update(b"n")
+            continue
+        if type(value) is int:
+            prefix, body = b"i", str(value).encode("ascii")
+        elif type(value) is str:
+            prefix, body = b"t", value.encode("utf-8")
+        elif type(value) is bytes:
+            prefix, body = b"b", value
+        else:
+            raise Failure("unexpected value type while hashing catalogue")
+        digest.update(prefix + b":" + str(len(body)).encode("ascii") + b":")
+        digest.update(body)
+
+
+def row_hash(row):
+    digest = sha256()
+    encode_row(digest, row)
+    return digest.digest()
+
+
+def boundary_select(table, keys, descending):
+    cols = idents(keys)
+    lower = "-9223372036854775808" if table in INT_KEY else "''"
+    order = ", ".join(ident(k) + (" DESC" if descending else " ASC") for k in keys)
+    return f"SELECT {cols} FROM {ident(table)} WHERE {ident(keys[0])} >= {lower} ORDER BY {order} LIMIT 1"
+
+
+def boundary_data(read, receipt):
+    results = {}
+    for table, keys in SOURCE_KEYS.items():
+        fingerprints = []
+        for desc in (False, True):
+            rows = read(table, boundary_select(table, keys, desc), ())
+            require(len(rows) <= 1, f"{table}: source lookup returned extra rows")
+            fingerprints.append(row_hash(tuple(rows[0][k] for k in keys)).hex() if rows else None)
+        if table in ROWID_TEXT_PK:
+            # The export can be rowid-ordered instead of ordered by the text PK.
+            # Witness its ends as well; never compare raw rowid numbers.
+            for order in ("ASC", "DESC"):
+                sql = (f"SELECT {idents(keys)} FROM {ident(table)} WHERE rowid >= -9223372036854775808 "
+                       f"ORDER BY rowid {order} LIMIT 1")
+                rows = read(table, sql, ())
+                require(len(rows) <= 1, f"{table}: rowid boundary lookup returned extra rows")
+                fingerprints.append(row_hash(tuple(rows[0][k] for k in keys)).hex() if rows else None)
+        results[table] = fingerprints
+    # These small tables have no PK; rowid gaps do not survive SQL export and
+    # endpoint values could be identical duplicates. Read indexed rowid pages
+    # and produce the exact multiset here and on the later SQLite file.
+    for table, cols in KEYLESS_COLUMNS.items():
+        total, count, last = 0, 0, None
+        while True:
+            op, lower, params = (">=", "-9223372036854775808", ()) if last is None else (">", "?", (last,))
+            page = read(table, f"SELECT rowid, {idents(cols)} FROM {ident(table)} WHERE rowid {op} {lower} ORDER BY rowid LIMIT 250", params)
+            require(len(page) <= 250 and count + len(page) <= 10_000, f"{table}: source witness exceeds bounded row budget")
+            for r in page:
+                require(safe_int(r["rowid"]) and (last is None or r["rowid"] > last), f"{table}: invalid rowid order")
+                last = r["rowid"]
+                total += int.from_bytes(row_hash(tuple(r[col] for col in cols)), "big")
+                count += 1
+            if len(page) < 250:
+                break
+        results[table] = [count, f"{total % (1 << 256):064x}"]
+    return dict(format=1, f1_attempt_id=receipt["f1_attempt_id"], d1_uuid=receipt["d1_uuid"], tables=results)
+
+
+def sqlite_boundaries(db, receipt):
+    # sqlite3.Row preserves types and allows name lookup without copying BLOBs.
+    original = db.row_factory
+    try:
+        db.row_factory = sqlite3.Row
+        return boundary_data(lambda _t, sql, args: db.execute(sql, args).fetchall(), receipt)
+    finally:
+        db.row_factory = original
+
+
+def check_boundaries(db, expected, receipt):
+    actual = sqlite_boundaries(db, receipt)
+    require(actual["format"] == expected.get("format") and actual["f1_attempt_id"] == expected.get("f1_attempt_id")
+            and actual["d1_uuid"] == expected.get("d1_uuid") and isinstance(expected.get("tables"), dict)
+            and actual["tables"].keys() == expected["tables"].keys(), "source boundary manifest is missing, invalid, or for another F1")
+    for table, value in actual["tables"].items():
+        require(value == expected["tables"][table], f"{table}: frozen D1 source boundary mismatch; export is incomplete or changed")
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def cloudflare(path, payload=None):
+    account = os.environ.get("CLOUDFLARE_ACCOUNT_ID", "")
+    token = os.environ.get("CLOUDFLARE_API_TOKEN", "")
+    require(re.fullmatch(r"[0-9a-f]{32}", account) and token, "missing Cloudflare API credentials")
+    req = urllib.request.Request(
+        f"https://api.cloudflare.com/client/v4/accounts/{account}{path}",
+        data=json.dumps(payload).encode() if payload is not None else None,
+        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json", "User-Agent": "velmora-cutover"},
+    )
+    try:
+        with urllib.request.build_opener(NoRedirect()).open(req, timeout=30) as response:
+            body = response.read(JSON_CAP + 1)
+    except urllib.error.HTTPError as error:
+        raise Failure(f"Cloudflare HTTP {error.code}; stop") from None
+    except (OSError, ValueError):
+        raise Failure("Cloudflare network failure; stop") from None
+    require(len(body) <= JSON_CAP, "Cloudflare response exceeds limit; stop")
+    try:
+        data = json.loads(body)
+    except (ValueError, UnicodeError):
+        raise Failure("Cloudflare response is not JSON; stop") from None
+    require(isinstance(data, dict) and data.get("success") is True, "Cloudflare API refused the operation; stop")
+    return data
+
+
+def d1_query(uuid, sql, params):
+    require(D1_UUID.fullmatch(uuid or ""), "remote D1 operation requires a database UUID")
+    # Every caller supplies a fixed SQL template whose '?' occurrences are
+    # binds. The D1 REST API accepts only string params; preserve SQLite types
+    # explicitly instead of relying on column affinity or implicit conversion.
+    fragments = sql.split("?")
+    require(len(fragments) == len(params) + 1, "invalid D1 bind count")
+    wire_sql, wire_params = [fragments[0]], []
+    for value, following in zip(params, fragments[1:]):
+        if value is None:
+            wire_sql.append("NULL")
+        elif safe_int(value):
+            wire_sql.append("CAST(? AS INTEGER)")
+            wire_params.append(str(value))
+        elif type(value) is str:
+            wire_sql.append("?")
+            wire_params.append(value)
+        else:
+            raise Failure("unsupported D1 bind type")
+        wire_sql.append(following)
+    result = cloudflare(f"/d1/database/{uuid}/query", dict(sql="".join(wire_sql), params=wire_params)).get("result")
+    require(isinstance(result, list) and len(result) == 1 and isinstance(result[0], dict)
+            and result[0].get("success") is True and isinstance(result[0].get("results"), list)
+            and isinstance(result[0].get("meta"), dict), "D1 query response invalid; stop")
+    return result[0]
+
+
+def capture_boundaries(receipt, query=d1_query):
+    uuid = receipt["d1_uuid"]
+    proof = dict(indexed_lookups=0, max_data_rows_read=0)
+
+    def read(table, sql, params, maximum=250):
+        if table != "sqlite_schema":
+            plan = query(uuid, "EXPLAIN QUERY PLAN " + sql, params)["results"]
+            require(len(plan) == 1 and str(plan[0].get("detail", "")).startswith(f"SEARCH {table} USING "),
+                    f"{table}: bounded indexed D1 lookup not proven; stop")
+        answer = query(uuid, sql, params)
+        scanned = answer["meta"].get("rows_read")
+        require(type(scanned) is int and 0 <= scanned <= maximum and len(answer["results"]) <= maximum,
+                f"{table}: indexed D1 query exceeded its read bound; stop")
+        if table != "sqlite_schema":
+            proof["indexed_lookups"] += 1
+            proof["max_data_rows_read"] = max(proof["max_data_rows_read"], scanned)
+        return answer["results"]
+
+    arm_sql = f"SELECT {idents(RESTORE_COLUMNS)} FROM restore_state WHERE id=1"
+    require(read("restore_state", arm_sql, (), 1) == [receipt["restore_state_armed"]], "D1 does not match the recorded F1 arm")
+    names = read("sqlite_schema", "SELECT name FROM sqlite_schema WHERE rowid BETWEEN 1 AND 1024 AND type='table' ORDER BY rowid LIMIT 65", (), 1024)
+    require({r["name"] for r in names} - D1_SYSTEM - {"sqlite_sequence"} == set(TABLES), "frozen D1 table set differs from baseline")
+    result = boundary_data(lambda t, sql, args: read(t, sql, args, 1 if t in SOURCE_KEYS else 250), receipt)
+    require(read("restore_state", arm_sql, (), 1) == [receipt["restore_state_armed"]], "D1 arm changed during source capture")
+    result["proof"] = proof
+    return result
+
+
+def source_manifest(path, receipt):
+    manifest = json_input(path)
+    require(type(manifest.get("format")) is int and manifest["format"] == 2
+            and type(manifest.get("sql_bytes")) is int and manifest["sql_bytes"] > 0
+            and isinstance(manifest.get("sql_sha256"), str) and re.fullmatch(r"[0-9a-f]{64}", manifest["sql_sha256"])
+            and safe_int(manifest.get("restore_point_ms"))
+            and manifest["restore_point_ms"] >= receipt["f1_started_at_ms"], "invalid or stale catalogue export manifest")
+    return manifest
+
+
+def seal_path(sqlite):
+    return sqlite.with_name(sqlite.name + ".wp5-seal.json")
+
+
+def seal_content(sqlite, manifest, receipt, boundaries):
+    require(not any(sqlite.with_name(sqlite.name + suffix).exists() for suffix in ("-wal", "-journal")),
+            "SQLite source must not have a live journal")
+    with sqlite.open("rb") as src:
+        return dict(format=1, f1_attempt_id=receipt["f1_attempt_id"], d1_uuid=receipt["d1_uuid"],
+                    raw_sql_sha256=manifest["sql_sha256"], raw_sql_bytes=manifest["sql_bytes"],
+                    sqlite_sha256=file_digest(src, "sha256").hexdigest(),
+                    boundaries_sha256=sha256(json.dumps(boundaries, sort_keys=True).encode()).hexdigest())
+
+
+def write_seal(sqlite, manifest, receipt, boundaries):
+    with seal_path(sqlite).open("x", encoding="utf-8") as out:
+        json.dump(seal_content(sqlite, manifest, receipt, boundaries), out, sort_keys=True)
+        out.write("\n")
+
+
+def check_seal(sqlite, manifest, receipt, boundaries):
+    require(seal_path(sqlite).is_file(), "SQLite source seal is missing; reload the validated export")
+    require(json_input(seal_path(sqlite)) == seal_content(sqlite, manifest, receipt, boundaries),
+            "SQLite source, manifest, or F1 attempt does not match its seal")
+
+
+@contextmanager
+def sqlite_source(path):
+    with closing(sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)) as db:
+        db.execute("PRAGMA query_only=ON")
+        db.execute("PRAGMA trusted_schema=OFF")
+        db.execute("BEGIN")
+        yield db
+
+
+def source_schema(db):
+    objects = dict(db.execute("SELECT name,type FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%'"))
+    require(MARKER not in objects, "D1 export has an incomplete import marker")
+    actual = {name for name, kind in objects.items() if kind == "table"}
+    actual -= D1_SYSTEM
+    require(actual == set(TABLES), "D1 export catalogue table set differs from the baseline")
+    schema = {}
+    for table in TABLES:
+        rows = list(db.execute(f"PRAGMA table_xinfo({ident(table)})"))
+        require(all(row[2] in PG_TYPES and row[6] == 0 for row in rows), f"{table}: unsupported D1 column definition")
+        columns = {row[1]: row[2] for row in rows}
+        idents(columns)
+        keys = tuple(row[1] for row in sorted(rows, key=lambda row: row[5]) if row[5])
+        require(keys == SOURCE_KEYS.get(table, ()), f"{table}: unexpected D1 primary key")
+        schema[table] = (columns, keys)
+    require(tuple(schema["restore_state"][0]) == RESTORE_COLUMNS, "D1 restore_state schema differs from the baseline")
+    return schema
+
+
+def check_source_arm(db, receipt):
+    rows = db.execute(f"SELECT {idents(RESTORE_COLUMNS)} FROM restore_state LIMIT 2").fetchall()
+    require(rows == [restore_values(receipt["restore_state_armed"])],
+            "exported restore_state does not match the recorded armed row")
+
+
+def projection(table):
+    return " WHERE k <> 'revive'" if table == "scan_cursors" else ""
+
+
+def source_count(db, table, receipt):
+    if table == "restore_state":
+        return int(receipt["restore_state_before"] is not None)
+    return db.execute(f"SELECT count(*) FROM {ident(table)}{projection(table)}").fetchone()[0]
+
+
+def pg_settings(path, role):
+    allowed = {
+        "PGHOST": "host", "PGPORT": "port", "PGDATABASE": "dbname", "PGUSER": "user",
+        "PGPASSWORD": "password", "PGSSLMODE": "sslmode", "PGSSLROOTCERT": "sslrootcert",
+        "PGCONNECT_TIMEOUT": "connect_timeout", "PGSCHEMA": None, "PGLOCKKEY": None, "PGMIGRATELOCKKEY": None,
+        "PGBRANCHID": None,
+    }
+    fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+    with os.fdopen(fd, encoding="utf-8", newline="") as inp:
+        mode = os.fstat(inp.fileno())
+        require(stat.S_ISREG(mode.st_mode) and mode.st_uid == os.geteuid() and stat.S_IMODE(mode.st_mode) == 0o600,
+                "Postgres env file must be owned by the caller with mode 0600")
+        raw = inp.read(65_537)
+    require(len(raw) <= 65_536 and "\0" not in raw, "invalid Postgres env file size or encoding")
+    values = {}
+    for line in raw.split("\n"):
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        name, sep, value = line.partition("=")
+        require(sep and name in allowed and name not in values and "\r" not in value, "invalid Postgres env assignment")
+        values[name] = value
+    branch = values.get("PGBRANCHID")
+    require(branch is None or re.fullmatch(r"[a-z0-9]{1,63}", branch), "invalid PGBRANCHID")
+    user = values.get("PGUSER")
+    require(user == role or (branch is not None and user == f"{role}.{branch}"),
+            f"PGUSER must name {role} with no suffix or the configured PGBRANCHID")
+    require(values.get("PGHOST") and re.fullmatch(r"[A-Za-z0-9_.-]+", values.get("PGDATABASE", "")),
+            "literal PGHOST and PGDATABASE required")
+    schema = values.get("PGSCHEMA", "public")
+    require(re.fullmatch(r"[a-z][a-z0-9_]{0,62}", schema) and not schema.startswith("pg_")
+            and schema != "information_schema", "invalid PGSCHEMA")
+    lock = values.get("PGLOCKKEY", "7413000001" if schema == "public" else "")
+    require(re.fullmatch(r"-?[0-9]{1,19}", lock) and -(2**63) <= int(lock) < 2**63,
+            "invalid or missing Postgres lock key")
+    require((schema == "public") == (int(lock) == 7413000001), "public and test schemas must use different lock keys")
+    host = values["PGHOST"]
+    require("," not in host and (host.startswith("/") or host in ("localhost", "127.0.0.1", "::1")
+                                 or values.get("PGSSLMODE") == "verify-full"),
+            "one Postgres host required; remote connections require verify-full TLS")
+    config = {allowed[k]: value for k, value in values.items() if allowed[k] is not None}
+    config.setdefault("port", "5432")
+    config.setdefault("connect_timeout", "10")
+    return config, schema, int(lock)
+
+
+@contextmanager
+def postgres(path, role="kofra_migrate"):
+    import psycopg
+
+    config, schema, lock = pg_settings(path, role)
+    # Match pg-migrate: ambient libpq variables (e.g. PGHOSTADDR/PGSERVICE)
+    # must not select a different server or add connection credentials.
+    ambient = {k: os.environ.pop(k) for k in list(os.environ) if k.startswith("PG")}
+    try:
+        connection = psycopg.connect(**config, autocommit=True, options="-c client_encoding=UTF8")
+    finally:
+        os.environ.update(ambient)
+    with connection as db:
+        require(db.execute("SELECT session_user::text").fetchone() == (role,), "unexpected bare Postgres session role")
+        db.execute(f"SET search_path TO {ident(schema)}")
+        require(db.execute("SELECT current_schema(), current_setting('server_encoding')").fetchone() == (schema, "UTF8"),
+                "Postgres target schema must exist and use UTF8")
+        yield db, schema, lock
+
+
+def lock_w1(db, key):
+    db.execute("SET LOCAL lock_timeout = '3s'")
+    db.execute("SELECT pg_advisory_xact_lock(%s::bigint)", (key,))
+
+
+def marker_exists(db):
+    return db.execute("SELECT to_regclass(%s) IS NOT NULL", (MARKER,)).fetchone()[0]
+
+
+def app_has_usage(db, schema):
+    return db.execute("SELECT has_schema_privilege('kofra_app', %s, 'USAGE')", (schema,)).fetchone()[0]
+
+
+def pg_columns(db, schema, source):
+    rows = db.execute("""SELECT c.relname, a.attname, t.typname, co.collname
+        FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+        JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid
+        JOIN pg_catalog.pg_type t ON t.oid = a.atttypid
+        LEFT JOIN pg_catalog.pg_collation co ON co.oid = a.attcollation
+        WHERE n.nspname = %s AND c.relkind = 'r' AND a.attnum > 0 AND NOT a.attisdropped""", (schema,))
+    actual = {table: {} for table in TABLES}
+    for table, col, dtype, collation in rows:
+        if table in actual:
+            actual[table][col] = (dtype, collation)
+    for table, (columns, _) in source.items():
+        expected = {c: (PG_TYPES[d], "C" if d == "TEXT" else None) for c, d in columns.items()}
+        if table == "outbox":
+            expected["seq"] = ("int8", None)
+        require(actual[table] == expected, f"{table}: D1 and Postgres column definitions differ")
+
+
+def migrate(env, *args):
+    result = subprocess.run(["bash", str(OPS / "pg-migrate.sh"), str(env), *args],
+                            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                            text=True, check=False)
+    if result.returncode:
+        # pg-migrate emits fixed local diagnostics and SQLSTATE only, but do not
+        # forward stderr from bash/startup/other subprocesses verbatim.
+        refused = "pre-copy target must have no app access, import marker, post-copy migration or catalogue rows"
+        if result.stderr.rstrip().endswith(refused):
+            raise Failure("pre-COPY target is non-empty, active, already claimed, or past migration 0001")
+        state = re.search(r"\bSQLSTATE ([0-9A-Z]{5})\b", result.stderr)
+        detail = f" (SQLSTATE {state[1]})" if state else ""
+        raise Failure(f"pg-migrate {' '.join(args)} exited {result.returncode}{detail}; inspect migration separately")

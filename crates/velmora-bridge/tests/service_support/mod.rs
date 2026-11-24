@@ -477,6 +477,9 @@ pub struct FailSql {
     /// Fails every statement (read or write) whose text contains the
     /// string, after letting the given number of them through.
     pub fail_matching: RefCell<Option<(&'static str, u32)>>,
+    /// Stalls one matching write at the tripwire until the test releases it.
+    pub stall_exec_matching: Cell<Option<&'static str>>,
+    pub selected_exec: Tripwire,
     /// Runs the given SQL once, just before a read whose text contains
     /// the string, after letting the given number of such reads through:
     /// what another request commits between two reads of this one.
@@ -578,9 +581,17 @@ impl Sql for FailSql {
         if self.fail_writes.get() || self.refused(sql) {
             return Err(BridgeError::Sql("database down".into()));
         }
-        self.trip
-            .guard(sql_down, self.inner.exec(sql, params))
-            .await
+        let call = self.trip.guard(sql_down, self.inner.exec(sql, params));
+        if self
+            .stall_exec_matching
+            .get()
+            .is_some_and(|text| sql.contains(text))
+        {
+            self.stall_exec_matching.set(None);
+            self.selected_exec.arm(0, Trip::Stall);
+            return self.selected_exec.guard(sql_down, call).await;
+        }
+        call.await
     }
     async fn batch(&self, mut stmts: Vec<(&'static str, Vec<SqlValue>)>) -> Result<Vec<u64>> {
         self.over_budget()?;
@@ -658,6 +669,7 @@ pub fn config(providers: Vec<ProviderConfig>) -> BridgeConfig {
         job_budget_bytes: 48 * 1024 * 1024,
         gc_mode: GcMode::Disposable,
         hot_cap_bytes: velmora_bridge::config::DEFAULT_HOT_CAP_BYTES,
+        hot_ctl: Default::default(),
         maintenance: Maintenance::Off,
         server_side_copy: true,
         get_fanout_bytes: None,
@@ -703,6 +715,8 @@ pub fn rig_with_budget<N: NntpConnector + 'static>(
                 fail_publish: Cell::new(None),
                 fail_next_batch: Cell::new(false),
                 fail_matching: RefCell::new(None),
+                stall_exec_matching: Cell::new(None),
+                selected_exec: Tripwire::default(),
                 before_matching: RefCell::new(None),
                 fail_batches: Cell::new(0),
                 overloaded: Cell::new(0),

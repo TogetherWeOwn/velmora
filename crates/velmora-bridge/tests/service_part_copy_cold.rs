@@ -104,6 +104,7 @@ async fn cold_source(budget: u64, parity: bool) -> Source {
     cfg.inflight_budget_bytes = budget;
     cfg.packed_plans = parity;
     cfg.parity = parity;
+    cfg.hot_ctl.mode = velmora_bridge::config::HotCtlMode::Shadow;
     let budget = ByteBudget::new(cfg.inflight_budget_bytes);
     let rig = rig_with_budget(TcpConnector::default(), cfg, budget);
     rig.bridge
@@ -204,6 +205,15 @@ async fn copy_across(src: &Source) {
         )
         .await;
     copied.expect(200);
+    assert_eq!(
+        rig.bridge
+            .catalog
+            .hot_ctl_load(&velmora_bridge::hotctl::MISS_KEYS)
+            .await
+            .unwrap(),
+        vec![None; velmora_bridge::hotctl::MISS_BUCKETS],
+        "server-side copies are not customer misses"
+    );
     assert_eq!(rig.bridge.budget.in_use(), 0);
     assert!(rig.bridge.budget.peak() <= rig.bridge.budget.capacity());
     let etag = copied.values("ETag").remove(0).replace("&quot;", "\"");

@@ -1547,6 +1547,16 @@ pub trait Catalog {
     /// Bytes R2 holds that may be evicted: released safety copies and
     /// cache fills. One index scan over the evictable extents.
     async fn evictable_bytes(&self) -> Result<u64>;
+    /// Evictable bytes, never-read bytes and oldest read in one index pass.
+    async fn hot_shape(&self) -> Result<crate::types::HotShape>;
+    /// Adds one customer cold fill to its pre-fill reuse bucket.
+    async fn hot_ghost(&self, extent: &ExtentId, now: UnixMs) -> Result<()>;
+    /// Adds accumulated customer R2 hit bytes, without an extent write.
+    async fn hot_counters_add(&self, hit_bytes: u64) -> Result<()>;
+    /// Loads controller metadata and counters in the requested key order.
+    async fn hot_ctl_load(&self, keys: &[&str]) -> Result<Vec<Option<i64>>>;
+    /// Atomically replaces only controller state keys, not counters.
+    async fn hot_ctl_store(&self, entries: &[(&str, i64)]) -> Result<()>;
     /// Extents with evictable bytes, least recently read first.
     async fn evict_candidates(&self, limit: u32) -> Result<Vec<EvictCandidate>>;
     /// Starts an eviction in one statement that re-checks the extent:

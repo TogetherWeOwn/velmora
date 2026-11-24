@@ -8,6 +8,7 @@
 //! are frozen; every other module belongs to one build lane.
 
 pub mod articles;
+pub mod audit;
 pub mod config;
 pub mod copy;
 pub mod crypto;
@@ -17,6 +18,7 @@ pub mod fetch;
 pub mod gate;
 pub mod hashstate;
 pub mod hosts;
+pub mod hotctl;
 pub mod ingress;
 pub mod intents;
 pub mod jobs;

@@ -340,6 +340,49 @@ fn config_loads_from_documented_vars() {
         sized.insert("HOT_CAP_BYTES".to_string(), value.to_string());
         assert_eq!(load(&sized).unwrap().hot_cap_bytes, want, "{value:?}");
     }
+    assert_eq!(cfg.hot_ctl, velmora_bridge::config::HotCtlConfig::default());
+    assert_eq!(cfg.hot_ctl.min_bytes, 10 << 30);
+    assert_eq!(cfg.hot_ctl.max_bytes, Some(1 << 40));
+    assert_eq!(cfg.hot_ctl.hit_floor, 0.95);
+    assert_eq!(cfg.hot_ctl.hit_margin, 0.02);
+    assert_eq!(cfg.hot_ctl.horizon_h, 168);
+    assert_eq!(cfg.hot_ctl.min_reads, 200);
+    for (key, value) in [
+        ("HOT_CAP_MODE", "shadow"),
+        ("HOT_CAP_MIN_BYTES", "1073741824"),
+        ("HOT_CAP_MAX_BYTES", "none"),
+        ("HOT_HIT_FLOOR", "0.91"),
+        ("HOT_HIT_MARGIN", "0.04"),
+        ("HOT_CX_HORIZON_H", "24"),
+        ("MIN_READS", "400"),
+    ] {
+        sized.insert(key.into(), value.into());
+    }
+    let custom = load(&sized).unwrap().hot_ctl;
+    assert_eq!(custom.mode, velmora_bridge::config::HotCtlMode::Shadow);
+    assert_eq!(custom.min_bytes, 1 << 30);
+    assert_eq!(custom.max_bytes, None);
+    assert_eq!(custom.hit_floor, 0.91);
+    assert_eq!(custom.hit_margin, 0.04);
+    assert_eq!(custom.horizon_h, 24);
+    assert_eq!(custom.min_reads, 400);
+    sized.insert("HOT_CAP_MAX_BYTES".into(), "2147483648".into());
+    assert_eq!(load(&sized).unwrap().hot_ctl.max_bytes, Some(2 << 30));
+    for (key, value) in [
+        ("HOT_CAP_MODE", "on"),
+        ("HOT_CAP_MIN_BYTES", "0"),
+        ("HOT_CAP_MIN_BYTES", "2147483649"),
+        ("HOT_CAP_MAX_BYTES", "9223372036854775808"),
+        ("HOT_HIT_FLOOR", "NaN"),
+        ("HOT_HIT_FLOOR", "1.01"),
+        ("HOT_CX_HORIZON_H", "25"),
+        ("HOT_HIT_MARGIN", "-0.1"),
+        ("MIN_READS", "0"),
+    ] {
+        let mut bad = sized.clone();
+        bad.insert(key.into(), value.into());
+        assert_eq!(load(&bad).unwrap_err(), ConfigError::Invalid(key.into()));
+    }
     // Dev serves a GET above 8 MiB in sub-ranges. Absent, empty or 0:
     // never in sub-ranges; a size outside 1 MiB..=2 GiB is refused.
     assert_eq!(cfg.get_fanout_bytes, Some(8 << 20));

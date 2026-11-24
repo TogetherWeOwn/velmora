@@ -728,6 +728,254 @@ async fn an_evicted_extent_is_read_cold_and_the_cache_refill_is_evictable() {
     assert_eq!(hot.evictable().await, cipher);
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn hot_shape_counts_only_evictable_bytes_and_separates_never_read() {
+    let hot = hot().await;
+    let cat = &hot.bridge().catalog;
+    assert_eq!(cat.hot_shape().await.unwrap(), HotShape::default());
+    let stamped = hot.released("stamped").await;
+    let never_read = hot.released("never-read").await;
+    let pinned = hot.put("hold").await;
+    assert!(hot.has_safety(&pinned));
+    // Even a stale safety count must not include a held copy in the shape.
+    cat.sql
+        .exec(
+            "UPDATE extents SET hot_safety_bytes = cipher_size WHERE id = ?1",
+            &[SqlValue::Text(pinned.id.as_str().to_owned())],
+        )
+        .await
+        .unwrap();
+    cat.sql
+        .exec(
+            "UPDATE extents SET last_read_at = NULL WHERE id = ?1",
+            &[SqlValue::Text(never_read.id.as_str().to_owned())],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        cat.hot_shape().await.unwrap(),
+        HotShape {
+            evictable_bytes: stamped.cipher_size + never_read.cipher_size,
+            never_read_bytes: never_read.cipher_size,
+            oldest_read_at: hot.num(&stamped, "last_read_at").map(UnixMs),
+        }
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn customer_cold_fill_records_reuse_before_stamping_and_hot_hit_does_not_write_meta() {
+    let hot = hot_with(|cfg| cfg.hot_ctl.mode = velmora_bridge::config::HotCtlMode::Shadow).await;
+    let x = hot.released("signal").await;
+    hot.bridge().evict_batch(0).await.unwrap();
+    hot.bridge().clock.advance_secs(2 * 3600);
+    let cat = &hot.bridge().catalog;
+    cat.sql.meter_writes().unwrap();
+    hot.get_ok("signal").await;
+    assert_eq!(
+        cat.hot_ctl_load(&["hotg_3h", "hotg_1h"]).await.unwrap(),
+        vec![Some(x.cipher_size as i64), None]
+    );
+    assert_eq!(cat.sql.writes().table("meta"), 1);
+    cat.sql.reset_writes();
+    hot.get_ok("signal").await;
+    assert_eq!(cat.sql.writes().table("meta"), 0);
+    assert_eq!(
+        cat.hot_ctl_load(&["hotg_3h", "hotg_1h"]).await.unwrap(),
+        vec![Some(x.cipher_size as i64), None]
+    );
+
+    hot.bridge().evict_batch(0).await.unwrap();
+    cat.sql.reset_writes();
+    // Internal cold fetch uses the same cache fill, but is not a customer GET.
+    assert!(matches!(
+        hot.bridge().fetch_cold(&x).await.unwrap(),
+        velmora_bridge::fetch::ColdFetch::Filled(_)
+    ));
+    assert_eq!(cat.sql.writes().table("meta"), 0);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_stalled_ghost_write_keeps_the_refill_back_and_closes_idle_sockets() {
+    stalled_ghost_write(false).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_ghost_timeout_serves_verified_bytes_without_refilling_or_stamping() {
+    stalled_ghost_write(true).await;
+}
+
+async fn stalled_ghost_write(time_out: bool) {
+    use std::time::Duration;
+    use velmora_bridge::ingress::ByteBudget;
+    let mut hot = hot_with(|cfg| {
+        cfg.hot_ctl.mode = velmora_bridge::config::HotCtlMode::Shadow;
+        cfg.max_extent_bytes = LEN as u64 / 2;
+        cfg.slice_bytes = cfg.max_extent_bytes;
+    })
+    .await;
+    let bridge = Rc::get_mut(&mut hot.rig.bridge).unwrap();
+    let clock = bridge.clock.clone();
+    bridge.budget =
+        ByteBudget::new(bridge.cfg.inflight_budget_bytes).with_sleeper(Rc::new(move |ms| {
+            let clock = clock.clone();
+            let due = clock.now().0 + i64::from(ms);
+            Box::pin(std::future::poll_fn(move |_| {
+                if clock.now().0 >= due {
+                    Poll::Ready(())
+                } else {
+                    Poll::Pending
+                }
+            }))
+        }));
+    hot.rig
+        .put(&hot.signer, BUCKET, "cold-drop", &Hot::body("cold-drop"))
+        .await
+        .expect(200);
+    let (_, xs) = hot.rig.live(&hot.bucket, "cold-drop").await.unwrap();
+    assert_eq!(xs.len(), 2);
+    hot.pump().await;
+    hot.bridge().evict_batch(0).await.unwrap();
+    assert!(!hot.has_cache(&xs[0]) && !hot.has_safety(&xs[0]));
+    let cat = &hot.bridge().catalog;
+    cat.sql.trip.jitter(42);
+    cat.sql
+        .stall_exec_matching
+        .set(Some("INSERT INTO meta(k, v) SELECT CASE"));
+    let req = hot
+        .signer
+        .sign(
+            hot.rig.now(),
+            Method::Get,
+            &path(BUCKET, "cold-drop"),
+            &[],
+            &[],
+            Vec::new(),
+        )
+        .into_request();
+    let mut handle = pin!(Rc::clone(&hot.rig.bridge).handle(req));
+    let before = hot.num(&xs[0], "last_read_at");
+    let at_miss = tokio::time::timeout(
+        Duration::from_secs(5),
+        std::future::poll_fn(|cx| {
+            let response = handle.as_mut().poll(cx);
+            if response.is_ready() || cat.sql.stall_exec_matching.get().is_none() {
+                Poll::Ready(response)
+            } else {
+                Poll::Pending
+            }
+        }),
+    )
+    .await
+    .expect("GET reached the selected ghost write");
+    assert!(
+        at_miss.is_pending(),
+        "a served miss must not depend on the body continuing to drive its cache refill"
+    );
+    assert!(hot.bridge().nntp.live() > 0);
+    hot.bridge().clock.advance_secs(READ_PERMIT_SECS);
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        std::future::poll_fn(|cx| {
+            assert!(
+                handle.as_mut().poll(cx).is_pending(),
+                "miss write is still stalled"
+            );
+            if hot.bridge().nntp.live() == 0 {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        }),
+    )
+    .await
+    .expect("idle provider socket closes before the stalled miss write resumes");
+    assert!(
+        !hot.has_cache(&xs[0]),
+        "refill must not race the ghost write"
+    );
+    if time_out {
+        hot.bridge()
+            .clock
+            .advance_ms(i64::from(velmora_bridge::fetch::COLD_WAIT_MS));
+        let resp = tokio::time::timeout(Duration::from_secs(5), async {
+            Resp::collect(handle.await).await
+        })
+        .await
+        .expect("verified GET completes while ghost is still stalled");
+        resp.expect(200);
+        assert!(resp.body == Hot::body("cold-drop"));
+        assert!(!hot.has_cache(&xs[0]));
+        assert_eq!(hot.num(&xs[0], "last_read_at"), before);
+        assert_eq!(hot.bridge().nntp.live(), 0);
+    } else {
+        cat.sql.selected_exec.release();
+        // A caller can abandon the body as soon as its first piece has arrived.
+        assert_eq!(handle.await.status, 200);
+        assert_eq!(
+            cat.hot_ctl_load(&["hotg_1h"]).await.unwrap(),
+            vec![Some(xs[0].cipher_size as i64)]
+        );
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn served_r2_hits_flush_in_background_even_when_the_next_request_is_not_a_hit() {
+    use std::cell::RefCell;
+    use velmora_bridge::hotctl::HIT_KEY;
+    let hot = hot_with(|cfg| cfg.hot_ctl.mode = velmora_bridge::config::HotCtlMode::Shadow).await;
+    let x = hot.released("warm").await;
+    let tasks = Rc::new(RefCell::new(Vec::new()));
+    let spawner: velmora_bridge::ingress::Spawner = {
+        let tasks = Rc::clone(&tasks);
+        Rc::new(move |task| tasks.borrow_mut().push(task))
+    };
+    let cat = &hot.bridge().catalog;
+    cat.sql.meter_writes().unwrap();
+    let get = |key: &'static str| {
+        let (hot, spawner) = (&hot, &spawner);
+        async move {
+            let req = hot
+                .signer
+                .sign(
+                    hot.rig.now(),
+                    Method::Get,
+                    &path(BUCKET, key),
+                    &[],
+                    &[],
+                    Vec::new(),
+                )
+                .into_request();
+            Rc::clone(&hot.rig.bridge)
+                .handle_observed_with_hit_flush(
+                    req,
+                    &mut Default::default(),
+                    Some(Rc::clone(spawner)),
+                )
+                .await
+        }
+    };
+    // Merely building the response (including opening its first piece) is not a read.
+    drop(get("warm").await);
+    assert!(tasks.borrow().is_empty());
+    Resp::collect(get("warm").await).await.expect(200);
+    assert_eq!(cat.sql.writes().table("meta"), 0);
+    let task = tasks.borrow_mut().pop().expect("first flush queued");
+    task.await;
+    assert_eq!(cat.sql.writes().table("meta"), 1);
+    hot.bridge().clock.advance_secs(899);
+    Resp::collect(get("warm").await).await.expect(200);
+    assert!(tasks.borrow().is_empty());
+    hot.bridge().clock.advance_secs(1);
+    Resp::collect(get("not-found").await).await.expect(404);
+    let task = tasks.borrow_mut().pop().expect("next flush queued");
+    task.await;
+    assert_eq!(cat.sql.writes().table("meta"), 2);
+    assert_eq!(
+        cat.hot_ctl_load(&[HIT_KEY]).await.unwrap(),
+        vec![Some(2 * x.cipher_size as i64)]
+    );
+}
+
 /// One job handles a bounded number of extents and hands the rest on.
 #[tokio::test(flavor = "current_thread")]
 async fn a_large_drain_runs_in_bounded_steps() {

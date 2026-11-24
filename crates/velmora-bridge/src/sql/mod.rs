@@ -70,6 +70,7 @@ mod auth;
 mod gc;
 mod health;
 mod hot;
+mod hotctl;
 mod intents;
 mod objects;
 mod outbox;
@@ -81,7 +82,13 @@ mod uploads;
 pub mod usage;
 
 pub(crate) use health::LOGIN_REFUSED_COOLDOWN_MAX_MS;
-pub use hot::INDEX_ONLY as HOT_INDEX_ONLY;
+/// Hot-tier statements that must use covering partial indexes.
+pub const HOT_INDEX_ONLY: [(&str, &str); 4] = [
+    hot::INDEX_ONLY[0],
+    hot::INDEX_ONLY[1],
+    hot::INDEX_ONLY[2],
+    (hotctl::HOT_SHAPE, "extents_evictable"),
+];
 pub use outbox::{BURY_EXHAUSTED, EXHAUSTED_INDEX_ATTEMPTS};
 
 use std::cell::Cell;
@@ -971,6 +978,21 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
     }
     async fn evictable_bytes(&self) -> Result<u64> {
         hot::evictable_bytes(self).await
+    }
+    async fn hot_shape(&self) -> Result<crate::types::HotShape> {
+        hotctl::shape(self).await
+    }
+    async fn hot_ghost(&self, extent: &ExtentId, now: UnixMs) -> Result<()> {
+        hotctl::ghost(self, extent, now).await
+    }
+    async fn hot_counters_add(&self, hit_bytes: u64) -> Result<()> {
+        hotctl::add(self, hit_bytes).await
+    }
+    async fn hot_ctl_load(&self, keys: &[&str]) -> Result<Vec<Option<i64>>> {
+        hotctl::load(self, keys).await
+    }
+    async fn hot_ctl_store(&self, entries: &[(&str, i64)]) -> Result<()> {
+        hotctl::store(self, entries).await
     }
     async fn evict_candidates(&self, limit: u32) -> Result<Vec<EvictCandidate>> {
         hot::evict_candidates(self, limit).await

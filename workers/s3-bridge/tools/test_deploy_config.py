@@ -285,6 +285,29 @@ OLDER = [
 ]
 
 
+class PostQueuesTest(GeneratorCase):
+    def test_shipped_and_generated_production_configs_bind_eight_post_shards(self):
+        _, generated = self.ok({})
+        suffixes = ["", *(str(n) for n in range(2, 9))]
+        expected = [(f"POST_Q{s}", f"velmora-post{s}") for s in suffixes]
+        for name, config in (("shipped", self.shipped), ("generated", generated.decode("utf-8"))):
+            with self.subTest(config=name):
+                queues = tomllib.loads(config)["queues"]
+                self.assertEqual(
+                    [(q["binding"], q["queue"]) for q in queues["producers"]
+                     if q["binding"].startswith("POST_Q")],
+                    expected,
+                )
+                consumers = [q for q in queues["consumers"] if q["queue"].startswith("velmora-post")]
+                self.assertCountEqual([q["queue"] for q in consumers], [q for _, q in expected])
+                for q in consumers:
+                    self.assertEqual(q["max_batch_size"], 1, q["queue"])
+                    self.assertEqual(q["max_concurrency"], 3, q["queue"])
+                    self.assertEqual(q["max_retries"], 20, q["queue"])
+                    self.assertEqual(q["retry_delay"], 60, q["queue"])
+                    self.assertEqual(q["dead_letter_queue"], "velmora-dlq", q["queue"])
+
+
 class S3HostsTest(GeneratorCase):
     switch = "VELMORA_S3_HOSTS"
     log = "extra S3 hosts in the generated config: "
