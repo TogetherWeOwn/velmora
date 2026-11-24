@@ -91,16 +91,21 @@ pub fn parse_config(json: &str) -> Result<Config, &'static str> {
     {
         return Err("load configuration cannot schedule minimum reads per type in both phases");
     }
-    // The greedy planner stops only when the cheapest operation no longer
-    // fits. Inspect the actual plan only when that remainder could put the
-    // total below the sum of the per-minute minimums.
-    let min_batches = cfg.mix.keys().map(|f| f.batches()).min().unwrap();
-    let allowed_shortfall = (cfg.batches_per_minute / 20) * cfg.minutes;
-    if min_batches - 1 > allowed_shortfall {
-        let minimum = cfg.batches_per_minute * cfg.minutes - allowed_shortfall;
-        let planned: u32 = cfg.plan().iter().map(|job| job.family.batches()).sum();
-        if planned < minimum {
-            return Err("load configuration cannot schedule the minimum write volume");
+    // A job can shift at most size - 1 batch slots into the preceding
+    // minute, and the last minute can also lose up to size - 1 tail slots.
+    // Only low rates can exceed their tolerance under that bound.
+    let largest = cfg.mix.keys().map(|f| f.batches()).max().unwrap();
+    let tolerance = cfg.batches_per_minute / 20;
+    if 2 * (largest - 1) > tolerance {
+        let mut planned = vec![0_u32; cfg.minutes as usize];
+        for job in cfg.plan() {
+            planned[(job.at_ms / 60_000) as usize] += job.family.batches();
+        }
+        if planned
+            .iter()
+            .any(|n| n.abs_diff(cfg.batches_per_minute) > tolerance)
+        {
+            return Err("load configuration cannot schedule the requested write rate per minute");
         }
     }
     Ok(cfg)

@@ -72,6 +72,27 @@ fn rejects_a_write_plan_below_the_rate_tolerance() {
 }
 
 #[test]
+fn dispatch_plan_cannot_pass_validation_with_an_underfilled_minute() {
+    let input = r#"{"batches_per_minute":20,"minutes":3,"mix":{"dispatch":1}}"#;
+    match parse_config(input) {
+        Ok(config) => {
+            let mut batches = [0; 3];
+            for job in config.plan() {
+                batches[(job.at_ms / 60_000) as usize] += job.family.batches();
+            }
+            assert!(
+                batches.iter().all(|&n| n >= 19),
+                "planned per minute: {batches:?}"
+            );
+        }
+        Err(error) => assert_eq!(
+            error,
+            "load configuration cannot schedule the requested write rate per minute"
+        ),
+    }
+}
+
+#[test]
 fn nearest_rank_percentile_does_not_impute_missing_observations() {
     assert_eq!(percentile(&mut [], 99), None);
     assert_eq!(percentile(&mut [10., 5., 8., 1.], 95), Some(10.));
