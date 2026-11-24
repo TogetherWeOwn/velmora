@@ -1645,14 +1645,24 @@ own `cpu_ms`. A smaller GET is served as before.
   answers 503 before its first byte is asked for again, up to three
   times, before the download is given up; a 503 of the first sub-range
   is the answer to the client.
-- **Limits.** `GET_FANOUT_BYTES` is from 1 MiB to 2 GiB; a GET of more
-  than 8,192 sub-ranges (8 TiB at 1 GiB) is refused with 500 before any
-  byte. Sub-requests count against the subrequest limit of the first
-  invocation (10,000) and are not billed as requests; their CPU is.
+- **Limits.** `GET_FANOUT_BYTES` is from 1 MiB to 2 GiB. When the
+  catalogue is not frozen, a GET of more than 8,192 sub-ranges (8 TiB at
+  1 GiB) is refused with 500 before any byte. Sub-requests count against
+  the first invocation's subrequest limit (10,000) and are not billed
+  as requests; their CPU is.
   One download of 100 sub-ranges was read whole on a deployed Worker.
   If the platform ever stops a download at a fixed number of
   sub-requests, the log has `fanout: download aborted (transport)` at
   the same sub-range each time: raise `GET_FANOUT_BYTES`.
+- **Frozen catalogue.** The front checks every requested extent for a
+  cache or safety copy before sending object headers. It budgets up to
+  two HEADs per extent plus the sub-ranges and retry reserve in 9,500
+  subrequests. Each child also has a 9,500-call budget, counting both
+  tiers and possible re-reads. A missing extent or an over-budget plan
+  returns 503 with `Retry-After: 30`, even when the sub-range count by
+  itself fits. An over-budget download can use smaller client `Range`
+  requests during the freeze. Neither the front nor its children refill
+  the cache or update the catalogue.
 - **A sub-range that ends short.** A sub-response is refused unless it
   declares the length asked for. Should its body still end early, the
   download comes out shorter than its `Content-Length` and the close
