@@ -514,21 +514,21 @@ async fn sample_advisory<F: std::future::Future<Output = Result<Vec<f64>, String
         pin_mut!(query, timer);
         let result = match select(query, timer).await {
             Either::Left((result, _)) => result,
-            Either::Right(_) => {
-                error = Some("advisory sampling deadline exceeded".into());
-                break;
-            }
+            Either::Right(_) => break,
         };
+        // Both sides of the deadline race leave a missing sample. Coverage
+        // already checks the count and the gap through the phase end.
+        let received_ms = (runtime.monotonic_ms() - start).max(dispatched_ms);
+        if received_ms > duration as f64 {
+            break;
+        }
         match result {
             Ok(rows) => {
-                let received_ms = (runtime.monotonic_ms() - start).max(dispatched_ms);
-                if received_ms <= duration as f64 {
-                    samples.push(SampleWindow {
-                        dispatched_ms,
-                        received_ms,
-                    });
-                    waits.extend(rows);
-                }
+                samples.push(SampleWindow {
+                    dispatched_ms,
+                    received_ms,
+                });
+                waits.extend(rows);
             }
             Err(e) => {
                 error = Some(e);
@@ -843,10 +843,79 @@ mod tests {
             panic!("sampler remained pending past its phase deadline");
         };
         assert!(samples.is_empty() && waits.is_empty());
+        assert_eq!(sampler_coverage(&samples, 1_000), (false, 1_000.0));
+        assert!(error.is_none(), "the coverage gap records this timeout");
+    }
+
+    #[derive(Clone, Copy)]
+    enum FinalReply {
+        Never,
+        LateSuccess,
+        LateError,
+    }
+
+    fn assert_covered_without_final_sample(reply: FinalReply) {
+        let clock = SampleClock::default();
+        let Poll::Ready((samples, waits, error)) =
+            poll_once(sample_advisory(&clock, 0.0, 2_500, || async {
+                if clock.now.get() < 2_250.0 {
+                    return Ok(vec![1.0]);
+                }
+                match reply {
+                    FinalReply::Never => std::future::pending().await,
+                    FinalReply::LateSuccess => {
+                        clock.now.set(2_501.0);
+                        Ok(vec![99.0])
+                    }
+                    FinalReply::LateError => {
+                        clock.now.set(2_501.0);
+                        Err("late database response".into())
+                    }
+                }
+            }))
+        else {
+            panic!("the sampler must finish at the deadline");
+        };
+        assert_eq!(samples.len(), 9);
+        assert_eq!(waits, vec![1.0; 9]);
         assert_eq!(
-            error.as_deref(),
-            Some("advisory sampling deadline exceeded")
+            sampler_coverage(&samples, 2_500),
+            (true, MAX_SAMPLE_GAP_MS as f64)
         );
+        assert!(
+            error.is_none(),
+            "late final reply must not fail an otherwise covered phase: {error:?}"
+        );
+    }
+
+    #[test]
+    fn final_sampler_request_crossing_cutoff_can_keep_coverage() {
+        assert_covered_without_final_sample(FinalReply::Never);
+    }
+
+    #[test]
+    fn sampler_reply_winning_after_cutoff_is_not_counted() {
+        assert_covered_without_final_sample(FinalReply::LateSuccess);
+        assert_covered_without_final_sample(FinalReply::LateError);
+    }
+
+    #[test]
+    fn sampler_that_stalls_early_fails_coverage_by_tail_gap() {
+        let clock = SampleClock::default();
+        let Poll::Ready((samples, _, error)) =
+            poll_once(sample_advisory(&clock, 0.0, 10_000, || async {
+                if clock.now.get() >= 9_000.0 {
+                    std::future::pending().await
+                } else {
+                    Ok(Vec::new())
+                }
+            }))
+        else {
+            panic!("the stalled sampler must finish at the deadline");
+        };
+        assert_eq!(sampler_coverage(&samples, 10_000), (true, 1_250.0));
+        assert!(1_250 > MAX_SAMPLE_GAP_MS);
+        assert!(error.is_none(), "the tail gap records this timeout");
     }
 
     #[test]
@@ -898,7 +967,7 @@ mod tests {
             }
         }
 
-        for before_deadline in [1, 3] {
+        for (before_deadline, admissions) in [(1, 0), (3, 1)] {
             let clock = DeadlineClock(Cell::new(before_deadline));
             let calls = Rc::new(Cell::new(0));
             let conn = CountConnect(calls.clone());
@@ -919,6 +988,10 @@ mod tests {
             assert_eq!(
                 report.family[&Family::Gc].unstarted_at_deadline_batches,
                 1,
+                "clock budget {before_deadline}"
+            );
+            assert_eq!(
+                report.pool.queue_admissions, admissions,
                 "clock budget {before_deadline}"
             );
             assert_eq!(calls.get(), 0, "the late write reached the catalogue");
