@@ -824,16 +824,24 @@ class HyperdriveTest(GeneratorCase):
                     self.assertNotIn("not-an-id", out + err)
         self.refused({"VELMORA_HYPERDRIVE_READ_ID": HD_WRITE}, "must be different")
 
-    def test_refuses_missing_or_miswired_bindings_and_backend_override(self):
+    def test_refuses_missing_or_miswired_bindings(self):
         for changed, error in (
             (self.shipped.replace('id = "<write Hyperdrive config ID>"', '', 1),
              "expected exactly one prod line"),
             (self.shipped.replace('binding = "CATALOG_PG_W"', 'binding = "OTHER"', 1),
              "production writer and reader Hyperdrive bindings"),
-            (self.shipped.replace('[vars]\n', '[vars]\nCATALOG_BACKEND = "pg"\n', 1),
-             "CATALOG_BACKEND must be unset"),
         ):
             self.refused({}, error, changed)
+
+    def test_preserves_only_supported_explicit_backend_modes(self):
+        for mode in ("d1", "d1-frozen", "pg", "pg-frozen"):
+            with self.subTest(mode=mode):
+                changed = self.shipped.replace('[vars]\n', f'[vars]\nCATALOG_BACKEND = "{mode}"\n', 1)
+                _, written = self.ok({}, changed)
+                self.assertEqual(tomllib.loads(written.decode())["vars"]["CATALOG_BACKEND"], mode)
+        for value in ('"postgres"', '""', 'true'):
+            changed = self.shipped.replace('[vars]\n', f'[vars]\nCATALOG_BACKEND = {value}\n', 1)
+            self.refused({}, "invalid CATALOG_BACKEND", changed)
 
 
 @unittest.skipUnless(

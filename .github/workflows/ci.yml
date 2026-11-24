@@ -950,7 +950,8 @@ jobs:
       # RELEASE_AT_VERIFY = "off" line in the prod [vars] table.
       # Both production Hyperdrive IDs are required and must be distinct.
       # Check the rendered binding names and IDs without opening a database
-      # connection. CATALOG_BACKEND must be absent; D1 remains active.
+      # connection. The shipped CATALOG_BACKEND is unset, so D1 remains active.
+      # Preserve only explicit modes supported by the Worker for later cutover.
       - name: Generate the production wrangler config
         if: steps.fresh.outputs.fresh == 'true'
         working-directory: workers/s3-bridge
@@ -1132,8 +1133,8 @@ jobs:
               {"binding": "CATALOG_PG_R", "id": hd_read},
           ]:
               sys.exit("the generated config does not carry the production writer and reader Hyperdrive bindings")
-          if "CATALOG_BACKEND" in prod_vars:
-              sys.exit("CATALOG_BACKEND must be unset in the production config")
+          if prod_vars.get("CATALOG_BACKEND") not in (None, "d1", "d1-frozen", "pg", "pg-frozen"):
+              sys.exit("invalid CATALOG_BACKEND in the production config: expected d1, d1-frozen, pg or pg-frozen")
           if found != ("tenant" if layout == "tenant" else None):
               sys.exit("the generated config does not carry the record layout that was asked for")
           if prod_vars.get("RELEASE_AT_VERIFY") != release:
