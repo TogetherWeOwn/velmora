@@ -85,22 +85,16 @@ fn scan(sql: &str, postgres: bool) -> Result<Statement> {
             b if b.is_ascii_whitespace() => i += 1,
             b'-' if bytes.get(i + 1) == Some(&b'-') => {
                 i += 2;
-                // SQLite ends line comments at LF or EOF, not a bare CR.
-                while i < bytes.len() && bytes[i] != b'\n' && (!postgres || bytes[i] != b'\r') {
+                while i < bytes.len() && bytes[i] != b'\n' && bytes[i] != b'\r' {
                     i += 1;
                 }
             }
             b'/' if bytes.get(i + 1) == Some(&b'*') => {
                 i += 2;
-                // SQLite's tokenizer does not recognize a bare `/*` at EOF.
-                if !postgres && i == bytes.len() {
-                    return Err(untranslated());
-                }
-                // Only PostgreSQL nests block comments and requires a closer.
                 let mut nesting = 1;
                 while nesting != 0 {
                     match bytes.get(i..i + 2) {
-                        Some(b"/*") if postgres => {
+                        Some(b"/*") => {
                             nesting += 1;
                             i += 2;
                         }
@@ -109,7 +103,6 @@ fn scan(sql: &str, postgres: bool) -> Result<Statement> {
                             i += 2;
                         }
                         _ if i < bytes.len() => i += 1,
-                        _ if !postgres => break,
                         _ => return Err(untranslated()),
                     }
                 }
@@ -124,20 +117,6 @@ fn scan(sql: &str, postgres: bool) -> Result<Statement> {
                 let token = sql[start + 1..i - 1].to_ascii_uppercase();
                 writes |= writes_or_locks(&token);
                 previous = token;
-            }
-            b'`' if !postgres => {
-                i = quoted(bytes, i)?;
-                previous.clear();
-            }
-            b'[' if !postgres => {
-                // Unlike the other quotes, `]` is not escaped by doubling it.
-                i += sql[i + 1..].find(']').ok_or_else(untranslated)? + 2;
-                previous.clear();
-            }
-            b'$' | b':' | b'@' | b'#' if !postgres => {
-                // Catalogue SQL uses positional `?` binds. Refuse SQLite named
-                // binds: their parenthesized suffix can contain comment markers.
-                return Err(untranslated());
             }
             b';' => {
                 ended = true;
@@ -157,9 +136,6 @@ fn scan(sql: &str, postgres: bool) -> Result<Statement> {
                 i += 1;
             }
             b')' => {
-                if !postgres && depth == 0 {
-                    return Err(untranslated());
-                }
                 depth = depth.saturating_sub(1);
                 previous.clear();
                 i += 1;
@@ -202,15 +178,9 @@ fn scan(sql: &str, postgres: bool) -> Result<Statement> {
                 i += sql[i..].find(delimiter).ok_or_else(untranslated)? + delimiter.len();
                 previous.clear();
             }
-            // SQLite can treat a UTF-8 BOM as whitespace, not part of the
-            // next keyword. Refuse unquoted non-ASCII instead of guessing.
-            b if !postgres && !b.is_ascii() => return Err(untranslated()),
             b if word_start(b) => {
                 i += 1;
-                while bytes
-                    .get(i)
-                    .is_some_and(|&b| (postgres || b.is_ascii()) && (word_byte(b) || b == b'$'))
-                {
+                while bytes.get(i).is_some_and(|&b| word_byte(b) || b == b'$') {
                     i += 1;
                 }
                 let token = sql[start..i].to_ascii_uppercase();
@@ -249,9 +219,6 @@ fn scan(sql: &str, postgres: bool) -> Result<Statement> {
             }
         }
         text.push_str(&sql[start..i]);
-    }
-    if !postgres && depth != 0 {
-        return Err(untranslated());
     }
     let select = command.ok_or_else(untranslated)?;
     Ok(Statement {
