@@ -1169,6 +1169,31 @@ fn log_redacts_credentials() {
     assert!(admin.contains("bucket=_admin"), "{admin}");
 }
 
+#[test]
+fn a_server_error_line_names_what_failed_and_nothing_else() {
+    use velmora_bridge::metrics::{FailureStage, RequestObservation};
+    let mut observed = RequestObservation::default();
+    observed.mark_error(
+        FailureStage::Commit,
+        &BridgeError::Sql("d1: overloaded".into()),
+    );
+    let target = "/photos/holiday/secret.jpg?X-Amz-Signature=abc";
+    let line = ingress::log_line_with("PUT", target, 500, "ray-1", Some(&observed));
+    assert!(
+        line.ends_with(" status=500 id=ray-1 stage=commit err=Sql code=d1_overloaded"),
+        "{line}"
+    );
+    for leak in ["holiday", "secret", "Signature"] {
+        assert!(!line.contains(leak), "{leak} leaked: {line}");
+    }
+    // A 5xx with nothing observed says so; below 500 the line is as it was.
+    assert!(ingress::log_line("GET", "/b/k", 503, "-").ends_with(" stage=- err=- code=-"));
+    assert_eq!(
+        ingress::log_line_with("PUT", target, 404, "ray-1", Some(&observed)),
+        ingress::log_line("PUT", target, 404, "ray-1")
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Config bound
 // ---------------------------------------------------------------------------

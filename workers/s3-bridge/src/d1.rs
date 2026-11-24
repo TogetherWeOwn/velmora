@@ -273,17 +273,30 @@ fn map_err(e: JsValue) -> BridgeError {
     classify(&error_text(&e))
 }
 
-/// The shared guard rule, then a class-only error.
+/// The shared guard rule, then a class-only error. The classes after
+/// "overloaded" only name D1's transient failures apart for the request
+/// log (`velmora_bridge::metrics::Fault`); nothing branches on them.
 fn classify(text: &str) -> BridgeError {
-    if is_tx_guard_violation(text) {
-        BridgeError::GuardFailed
+    let class = if is_tx_guard_violation(text) {
+        return BridgeError::GuardFailed;
     } else if text.contains("constraint failed") {
-        BridgeError::Sql("d1: constraint violation".into())
+        "d1: constraint violation"
     } else if text.contains("D1 DB is overloaded") {
-        BridgeError::Sql(OVERLOADED.into())
+        OVERLOADED
+    } else if text.contains("Network connection lost") {
+        "d1: network lost"
+    } else if text.contains("client disconnected") {
+        "d1: client disconnected"
+    } else if text.contains("transient issue") {
+        "d1: transient"
+    } else if text.contains("was reset") || text.contains("to be reset") {
+        "d1: storage reset"
+    } else if text.contains("timed out") || text.contains("timeout") {
+        "d1: timeout"
     } else {
-        BridgeError::Sql("d1: statement failed".into())
-    }
+        "d1: statement failed"
+    };
+    BridgeError::Sql(class.into())
 }
 
 #[cfg(test)]
@@ -323,6 +336,25 @@ mod tests {
             (
                 "D1_ERROR: near \"SELEC\": syntax error | p=secret",
                 "d1: statement failed",
+            ),
+            // D1's transient failures, as its documentation lists them.
+            ("D1_ERROR: Network connection lost.", "d1: network lost"),
+            (
+                "D1_ERROR: D1 DB storage operation exceeded timeout which caused object \
+                 to be reset.",
+                "d1: storage reset",
+            ),
+            (
+                "D1_ERROR: D1 DB's isolate exceeded its memory limit and was reset.",
+                "d1: storage reset",
+            ),
+            (
+                "D1_ERROR: Cannot resolve D1 DB due to transient issue on remote node.",
+                "d1: transient",
+            ),
+            (
+                "D1_ERROR: Can't read from request stream because client disconnected.",
+                "d1: client disconnected",
             ),
             // As D1 answered the first read after a refused batch of
             // 65,536 extents.

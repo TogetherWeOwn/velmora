@@ -67,7 +67,7 @@ use crate::ports::{
 use crate::recovery::{id_after, write_generation};
 use crate::service::common::{
     auth_refused, check_precondition, discard_failure, discard_refused, discard_unless_present,
-    header_refused, hold_precondition, host_refused, precondition, restore_failure, restore_gate,
+    header_refused, hold_precondition, host_refused, precondition, restore_gate_observed,
     send_post_jobs, signed_host, store_streamed, writes_refused, REGION_ALIASES,
 };
 use crate::service::slices::{store_slices, SliceError, SliceSink};
@@ -440,17 +440,30 @@ where
     let entry = crate::entry::Entry::of(&req.headers);
     if let Some(akid) = presented_access_key(&target, &headers).filter(|akid| entry.admits(akid)) {
         // Unknown and disabled keys look the same: no credential.
-        let row = bridge.catalog.access_key(&akid).await?;
+        let row = bridge
+            .catalog
+            .access_key(&akid)
+            .await
+            .inspect_err(observed.on_error(Stage::Auth))?;
         if let Some(row) = row.filter(|r| r.status == KeyStatus::Active) {
             let secret = unwrap_secret(
                 &bridge.kek,
                 row.kek_version,
                 &row.access_key_id,
                 &row.secret_wrapped,
-            )?;
-            bucket = bridge.catalog.bucket_by_name(&target.bucket).await?;
+            )
+            .inspect_err(observed.on_error(Stage::Auth))?;
+            bucket = bridge
+                .catalog
+                .bucket_by_name(&target.bucket)
+                .await
+                .inspect_err(observed.on_error(Stage::Auth))?;
             let perm = match &bucket {
-                Some(b) => bridge.catalog.grant(&akid, &b.id).await?,
+                Some(b) => bridge
+                    .catalog
+                    .grant(&akid, &b.id)
+                    .await
+                    .inspect_err(observed.on_error(Stage::Auth))?,
                 None => None,
             };
             authority.granted = perm.is_some();
@@ -951,9 +964,7 @@ where
         Guard::Applied(()) => {}
         // A replay started after this request passed the gate.
         Guard::Lost => {
-            restore_gate(bridge)
-                .await
-                .map_err(|resp| restore_failure(observed, resp))?;
+            restore_gate_observed(bridge, observed).await?;
             return Err(writes_refused().into());
         }
     }
@@ -982,8 +993,8 @@ where
                 SliceError::Ingress(e) => Fail::Ingress(e),
                 SliceError::Proto(e) => Fail::S3(e),
                 SliceError::Internal => Fail::Internal,
-                SliceError::Store => {
-                    observed.mark_stage(Stage::R2);
+                SliceError::Store(fault) => {
+                    observed.mark_fault(Stage::R2, fault);
                     Fail::Internal
                 }
             });
@@ -1065,9 +1076,7 @@ where
             // aborted meanwhile, a replay began, or the rows are no
             // longer this request's. The slices are left to the sweep.
             give_up().await;
-            restore_gate(bridge)
-                .await
-                .map_err(|resp| restore_failure(observed, resp))?;
+            restore_gate_observed(bridge, observed).await?;
             let state = bridge
                 .catalog
                 .upload_state(target)
@@ -1095,10 +1104,8 @@ where
     // commit is then behind its stamp, the sweep refuses there, and the
     // slices stay. Without the raise the part is not acknowledged.
     if let Err(error) = bridge.raise_stamp().await {
-        restore_gate(bridge)
-            .await
-            .map_err(|resp| restore_failure(observed, resp))?;
-        observed.mark_stage(Stage::stamp(&error));
+        restore_gate_observed(bridge, observed).await?;
+        observed.mark_error(Stage::stamp(&error), &error);
         return Err(ErrorCode::SlowDown.into());
     }
     Ok(S3Response {
@@ -1522,10 +1529,8 @@ where
         // the record exists, and without it nothing is published.
         if sliced {
             if let Err(error) = bridge.raise_stamp().await {
-                restore_gate(bridge)
-                    .await
-                    .map_err(|resp| restore_failure(observed, resp))?;
-                observed.mark_stage(Stage::stamp(&error));
+                restore_gate_observed(bridge, observed).await?;
+                observed.mark_error(Stage::stamp(&error), &error);
                 return Err(ErrorCode::SlowDown.into());
             }
         }
@@ -1594,7 +1599,7 @@ where
             &extents,
         )
         .await
-        .inspect_err(|error| observed.mark_stage(Stage::storage(error)))?;
+        .inspect_err(|error| observed.mark_error(Stage::storage(error), error))?;
         drop(extents);
         match bridge
             .catalog
@@ -1642,7 +1647,7 @@ where
                     // The same for a record that was kept because a row
                     // exists under its id: a replay may have published it.
                     if !discarded
-                        .inspect_err(|error| observed.mark_stage(discard_failure(error)))?
+                        .inspect_err(|error| observed.mark_error(discard_failure(error), error))?
                     {
                         observed.mark_stage(Stage::Commit);
                         return Err(Fail::Internal);

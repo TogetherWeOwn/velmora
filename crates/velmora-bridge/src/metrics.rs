@@ -91,7 +91,7 @@ impl FailureStage {
         }
     }
 
-    fn code(self) -> &'static str {
+    pub fn code(self) -> &'static str {
         match self {
             Self::Auth => "auth",
             Self::Lookup => "lookup",
@@ -130,10 +130,213 @@ impl SizeClass {
     }
 }
 
+/// What failed at the stage of an observation: the error variant and,
+/// for a catalogue, blob store or NNTP error, the provider's class or
+/// code. Names from fixed lists and numbers only, never message text,
+/// which may hold a key, a provider reply or customer data.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Fault {
+    variant: &'static str,
+    code: ProviderCode,
+}
+
+/// The provider's own account of a failure, as far as it is safe to log.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ProviderCode {
+    #[default]
+    None,
+    /// A catalogue class: `d1_overloaded`, `d1_network_lost`, ...
+    Sql(&'static str),
+    /// An R2 operation, the class of its message and the code R2 put in
+    /// parentheses at its end (`put: ... (10001)`).
+    R2 {
+        op: &'static str,
+        class: Option<&'static str>,
+        code: Option<u32>,
+    },
+    /// An NNTP reply code, or the kind of an I/O error.
+    NntpReply(u16),
+    NntpIo(&'static str),
+}
+
+impl Fault {
+    /// A failure that is not a port error: `variant` names it.
+    pub const fn named(variant: &'static str) -> Fault {
+        Fault {
+            variant,
+            code: ProviderCode::None,
+        }
+    }
+
+    /// The fault of a port or core error.
+    pub fn of(error: &crate::types::BridgeError) -> Fault {
+        use crate::types::BridgeError;
+        let (variant, code) = match error {
+            BridgeError::GuardFailed => ("GuardFailed", ProviderCode::None),
+            BridgeError::NotImplemented(_) => ("NotImplemented", ProviderCode::None),
+            BridgeError::Sql(class) => ("Sql", ProviderCode::Sql(sql_class(class))),
+            BridgeError::Blob(text) => ("Blob", blob_code(text)),
+            BridgeError::Nntp(e) => ("Nntp", nntp_code(e)),
+            BridgeError::Queue(_) => ("Queue", ProviderCode::None),
+            BridgeError::Crypto(_) => ("Crypto", ProviderCode::None),
+            BridgeError::Config(_) => ("Config", ProviderCode::None),
+            BridgeError::Invalid(_) => ("Invalid", ProviderCode::None),
+        };
+        Fault { variant, code }
+    }
+
+    pub fn variant(&self) -> &'static str {
+        self.variant
+    }
+
+    /// `-` when the provider said nothing that can be logged.
+    pub fn code(&self) -> String {
+        match self.code {
+            ProviderCode::None => "-".to_string(),
+            ProviderCode::Sql(class) => class.to_string(),
+            ProviderCode::R2 { op, class, code } => {
+                let mut out = format!("r2_{op}");
+                if let Some(class) = class {
+                    out.push('_');
+                    out.push_str(class);
+                }
+                if let Some(code) = code {
+                    out.push_str(&format!("_{code}"));
+                }
+                out
+            }
+            ProviderCode::NntpReply(code) => format!("nntp_{code}"),
+            ProviderCode::NntpIo(kind) => format!("nntp_io_{kind}"),
+        }
+    }
+}
+
+/// The classes the catalogue adapters give (`workers/s3-bridge/src/d1.rs`,
+/// the PostgreSQL one): anything else is `sql_other`.
+fn sql_class(class: &str) -> &'static str {
+    match class {
+        "d1: overloaded" => "d1_overloaded",
+        "d1: network lost" => "d1_network_lost",
+        "d1: storage reset" => "d1_storage_reset",
+        "d1: timeout" => "d1_timeout",
+        "d1: transient" => "d1_transient",
+        "d1: client disconnected" => "d1_client_disconnected",
+        "d1: constraint violation" => "d1_constraint",
+        "d1: statement failed" => "d1_statement",
+        "d1: bind failed" => "d1_bind",
+        "d1: unexpected result shape" => "d1_result_shape",
+        "d1: integer outside JS safe range" | "d1: non-integer or unsafe number" => "d1_number",
+        "pg: overloaded" => "pg_overloaded",
+        c if c.starts_with("too many bound parameters") => "sql_too_many_params",
+        c if c.starts_with("pg: ") => "pg_other",
+        _ => "sql_other",
+    }
+}
+
+/// An R2 adapter error: `r2: <op> failed[: <class>][ (<code>)]`, or one
+/// of the adapter's own checks (`r2: short body`, ...).
+fn blob_code(text: &str) -> ProviderCode {
+    let Some(rest) = text.strip_prefix("r2: ") else {
+        return ProviderCode::None;
+    };
+    let (rest, code) = match rest.rsplit_once(" (") {
+        Some((head, tail)) => match tail.strip_suffix(')').map(str::parse::<u32>) {
+            Some(Ok(code)) => (head, Some(code)),
+            _ => (rest, None),
+        },
+        None => (rest, None),
+    };
+    let (op, class) = match rest.split_once(" failed") {
+        Some((op, class)) => (op, class.strip_prefix(": ")),
+        None => ("check", Some(rest)),
+    };
+    let op = match op {
+        "put" => "put",
+        "get" => "get",
+        "get body" => "get_body",
+        "head" => "head",
+        "delete" => "delete",
+        "list" => "list",
+        "check" => "check",
+        _ => "other",
+    };
+    let class = class.map(|c| match c {
+        "network lost" => "network_lost",
+        "timeout" => "timeout",
+        "stream" => "stream",
+        "internal" => "internal",
+        "short body" => "short_body",
+        "short range" => "short_range",
+        "long body" => "long_body",
+        "put returned no object" => "no_object",
+        "put returned no md5" => "no_md5",
+        _ => "other",
+    });
+    ProviderCode::R2 { op, class, code }
+}
+
+fn nntp_code(e: &velmora::Error) -> ProviderCode {
+    use std::io::ErrorKind;
+    match e {
+        velmora::Error::NntpReply { code, .. } => ProviderCode::NntpReply(*code),
+        velmora::Error::Io(io) => ProviderCode::NntpIo(match io.kind() {
+            ErrorKind::TimedOut => "timed_out",
+            ErrorKind::ConnectionReset => "connection_reset",
+            ErrorKind::ConnectionAborted => "connection_aborted",
+            ErrorKind::ConnectionRefused => "connection_refused",
+            ErrorKind::UnexpectedEof => "unexpected_eof",
+            ErrorKind::BrokenPipe => "broken_pipe",
+            _ => "other",
+        }),
+        _ => ProviderCode::None,
+    }
+}
+
+/// An error whose [`Fault`] an observation can keep.
+pub trait Faulty {
+    fn fault(&self) -> Option<Fault>;
+}
+
+impl Faulty for crate::types::BridgeError {
+    fn fault(&self) -> Option<Fault> {
+        Some(Fault::of(self))
+    }
+}
+
+impl Faulty for crate::ingress::IngressError {
+    fn fault(&self) -> Option<Fault> {
+        use crate::ingress::IngressError;
+        match self {
+            IngressError::SlowDown => Some(Fault::named("SlowDown")),
+            IngressError::Internal => Some(Fault::named("Internal")),
+            _ => None,
+        }
+    }
+}
+
+impl Faulty for crate::ingress::UploadReadError {
+    fn fault(&self) -> Option<Fault> {
+        match self {
+            crate::ingress::UploadReadError::Ingress(e) => e.fault(),
+            crate::ingress::UploadReadError::Proto(_) => None,
+        }
+    }
+}
+
+/// An answer a shared helper already rendered: the helper marked its own
+/// fault, if it had one.
+impl Faulty for crate::types::S3Response {
+    fn fault(&self) -> Option<Fault> {
+        None
+    }
+}
+
 /// Redacted per-request observations; not part of the S3 response.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct RequestObservation {
     stage: Option<FailureStage>,
+    /// What failed at `stage`, when it is known.
+    fault: Option<Fault>,
     size: SizeClass,
     complete_multipart: bool,
 }
@@ -153,13 +356,48 @@ impl RequestObservation {
         };
     }
 
+    /// The stage, with nothing known of what failed there.
     pub fn mark_stage(&mut self, stage: FailureStage) {
         self.stage = Some(stage);
+        self.fault = None;
+    }
+
+    /// The stage and what failed there.
+    pub fn mark_fault(&mut self, stage: FailureStage, fault: Fault) {
+        self.stage = Some(stage);
+        self.fault = Some(fault);
+    }
+
+    /// The stage and the port error that failed it.
+    pub fn mark_error(&mut self, stage: FailureStage, error: &crate::types::BridgeError) {
+        self.mark_fault(stage, Fault::of(error));
     }
 
     /// Annotate an unrecovered error without reading or replacing it.
-    pub(crate) fn on_error<E>(&mut self, stage: FailureStage) -> impl FnOnce(&E) + '_ {
-        move |_| self.mark_stage(stage)
+    pub(crate) fn on_error<E: Faulty>(&mut self, stage: FailureStage) -> impl FnOnce(&E) + '_ {
+        move |e| {
+            self.stage = Some(stage);
+            self.fault = e.fault();
+        }
+    }
+
+    pub fn stage(&self) -> Option<FailureStage> {
+        self.stage
+    }
+
+    pub fn fault(&self) -> Option<Fault> {
+        self.fault
+    }
+
+    /// `stage=<stage> err=<variant> code=<provider code>` for the request
+    /// log line of a `5xx`; `-` for what is not known.
+    pub fn log_fields(&self) -> String {
+        format!(
+            "stage={} err={} code={}",
+            self.stage.map_or("-", FailureStage::code),
+            self.fault.map_or("-", |f| f.variant),
+            self.fault.map_or_else(|| "-".to_string(), |f| f.code()),
+        )
     }
 
     pub(crate) fn mark_complete_multipart(&mut self) {
@@ -423,6 +661,111 @@ mod tests {
         assert!(kept.iter().all(|w| *w == 10));
         // The same request is always decided the same way.
         assert_eq!(weight(200, 10, "ray-7"), weight(200, 10, "ray-7"));
+    }
+
+    #[test]
+    fn every_error_variant_is_named_in_the_log_fields() {
+        use crate::types::BridgeError;
+        let io = std::io::Error::new(std::io::ErrorKind::TimedOut, "provider said user@host");
+        let reply = velmora::Error::NntpReply {
+            code: 502,
+            text: "reply text with a key".into(),
+        };
+        let cases: Vec<(BridgeError, &str)> = vec![
+            (BridgeError::GuardFailed, "err=GuardFailed code=-"),
+            (
+                BridgeError::NotImplemented("x"),
+                "err=NotImplemented code=-",
+            ),
+            (
+                BridgeError::Sql("d1: overloaded".into()),
+                "err=Sql code=d1_overloaded",
+            ),
+            (
+                BridgeError::Sql("d1: network lost".into()),
+                "err=Sql code=d1_network_lost",
+            ),
+            (
+                BridgeError::Sql("d1: storage reset".into()),
+                "err=Sql code=d1_storage_reset",
+            ),
+            (
+                BridgeError::Sql("d1: statement failed".into()),
+                "err=Sql code=d1_statement",
+            ),
+            (
+                BridgeError::Sql("too many bound parameters: 101 > 100".into()),
+                "err=Sql code=sql_too_many_params",
+            ),
+            (
+                BridgeError::Sql("pg: overloaded".into()),
+                "err=Sql code=pg_overloaded",
+            ),
+            // Anything that is not an adapter class says nothing more.
+            (
+                BridgeError::Sql("no such table: private-bucket".into()),
+                "err=Sql code=sql_other",
+            ),
+            (
+                BridgeError::Blob("r2: put failed: internal (10001)".into()),
+                "err=Blob code=r2_put_internal_10001",
+            ),
+            (
+                BridgeError::Blob("r2: put failed: network lost".into()),
+                "err=Blob code=r2_put_network_lost",
+            ),
+            (
+                BridgeError::Blob("r2: get body failed (10058)".into()),
+                "err=Blob code=r2_get_body_10058",
+            ),
+            (
+                BridgeError::Blob("r2: short body".into()),
+                "err=Blob code=r2_check_short_body",
+            ),
+            (
+                BridgeError::Blob("r2: photos/private failed: x/y".into()),
+                "err=Blob code=r2_other_other",
+            ),
+            (BridgeError::Blob("store down".into()), "err=Blob code=-"),
+            (
+                BridgeError::Nntp(velmora::Error::Io(io)),
+                "err=Nntp code=nntp_io_timed_out",
+            ),
+            (BridgeError::Nntp(reply), "err=Nntp code=nntp_502"),
+            (BridgeError::Queue("q private".into()), "err=Queue code=-"),
+            (BridgeError::Crypto("unwrap"), "err=Crypto code=-"),
+            (
+                BridgeError::Config(crate::config::ConfigError::Refused("x")),
+                "err=Config code=-",
+            ),
+            (BridgeError::Invalid("x"), "err=Invalid code=-"),
+        ];
+        for (error, want) in cases {
+            let mut o = RequestObservation::default();
+            o.mark_error(FailureStage::Commit, &error);
+            assert_eq!(o.log_fields(), format!("stage=commit {want}"), "{error:?}");
+            // The same through `on_error`, as the handlers mark it.
+            let mut o = RequestObservation::default();
+            let _ = Err::<(), _>(error).inspect_err(o.on_error(FailureStage::R2));
+            assert_eq!(o.log_fields(), format!("stage=r2 {want}"));
+        }
+    }
+
+    #[test]
+    fn a_stage_alone_clears_the_fault_of_the_stage_before() {
+        let mut o = RequestObservation::default();
+        assert_eq!(o.log_fields(), "stage=- err=- code=-");
+        o.mark_fault(FailureStage::R2, Fault::named("StoredSizeMismatch"));
+        assert_eq!(o.log_fields(), "stage=r2 err=StoredSizeMismatch code=-");
+        o.mark_stage(FailureStage::Lookup);
+        assert_eq!(o.log_fields(), "stage=lookup err=- code=-");
+        // An error with no fault of its own (a rendered answer) as well.
+        let resp = crate::types::S3Response::error(500, "InternalError", "x");
+        let _ = Err::<(), _>(resp).inspect_err(o.on_error(FailureStage::Auth));
+        assert_eq!(o.log_fields(), "stage=auth err=- code=-");
+        let _ = Err::<(), _>(crate::ingress::IngressError::SlowDown)
+            .inspect_err(o.on_error(FailureStage::Budget));
+        assert_eq!(o.log_fields(), "stage=budget err=SlowDown code=-");
     }
 
     #[test]

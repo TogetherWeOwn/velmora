@@ -30,15 +30,15 @@ use velmora_s3_proto::mutation::{CommitResult, UploadMetadata};
 use velmora_s3_proto::{ErrorCode, StoredChecksum, UploadValidator};
 
 use super::common::{
-    authenticate, catalog_error, check_precondition, checksum_json, conditional_gate,
-    discard_before_retry, from_proto, hold_precondition, internal, metadata_json, restore_failure,
-    restore_gate, s3_error, send_post_jobs, store_streamed, writes_refused,
+    authenticate_observed, catalog_error, check_precondition, checksum_json, conditional_gate,
+    discard_before_retry, from_proto, hold_precondition, internal, local_error, local_fault,
+    metadata_json, restore_gate_observed, s3_error, send_post_jobs, store_streamed, writes_refused,
 };
 use super::slices::{store_slices, SliceError, SliceSink};
 use crate::crypto::unwrap_bdk;
 use crate::ingress::{upload_lengths, SealedUpload, UploadLengths, UploadReadError};
 use crate::intents::WRITER_MAX_AGE_MS;
-use crate::metrics::{FailureStage as Stage, RequestObservation};
+use crate::metrics::{FailureStage as Stage, Fault, RequestObservation};
 use crate::ports::{
     BlobStore, Bridge, Catalog, Clock, Guard, JobSink, Kek, NntpConnector, PublishOutcome,
     StreamMeta,
@@ -83,16 +83,12 @@ async fn put<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: 
     req: S3Request,
     observed: &mut RequestObservation,
 ) -> Result<S3Response, S3Response> {
-    let authed = authenticate(bridge, &req)
-        .await
-        .inspect_err(observed.on_error(Stage::Auth))?;
+    let authed = authenticate_observed(bridge, &req, observed).await?;
     let (bucket, key) = authed.object()?;
     // `If-None-Match: *` or `If-Match`, held to by the batch that
     // publishes; any other conditional header is refused here.
     let condition = conditional_gate(&bridge.cfg, &authed.headers, bucket)?;
-    restore_gate(bridge)
-        .await
-        .map_err(|resp| restore_failure(observed, resp))?;
+    restore_gate_observed(bridge, observed).await?;
     // CopyObject is this request shape with a source header and no body.
     if authed.headers.get("x-amz-copy-source").is_some() {
         let declared = crate::ingress::declared_length(&req.headers).map_err(|e| e.response())?;
@@ -129,7 +125,8 @@ async fn put<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: 
 
     let mut rng = SystemRng;
     let mut extent_rand = [0u8; 13];
-    rng.fill_bytes(&mut extent_rand).map_err(|_| internal())?;
+    rng.fill_bytes(&mut extent_rand)
+        .map_err(|_| local_fault(observed, "Rng"))?;
     let extent_id = ExtentId::mint(extent_rand);
     let bdk = unwrap_bdk(
         &bridge.kek,
@@ -137,7 +134,7 @@ async fn put<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: 
         &bucket.id,
         &bucket.bdk_wrapped,
     )
-    .map_err(|_| internal())?;
+    .map_err(|e| local_error(observed, &e))?;
 
     // Nothing of the body is read before this charge is held. The body
     // is sealed and stored while it arrives: the safety copy is whole
@@ -174,7 +171,7 @@ async fn put<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: 
     let now = bridge.clock.now();
     let mut generation_rand = [0u8; 8];
     rng.fill_bytes(&mut generation_rand)
-        .map_err(|_| internal())?;
+        .map_err(|_| local_fault(observed, "Rng"))?;
     let generation_id = GenerationId::mint(now, generation_rand);
 
     let etag = format!("\"{}\"", hex(decoded.md5()));
@@ -253,7 +250,7 @@ async fn put<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: 
         )
         .await
         .map_err(|error| {
-            observed.mark_stage(Stage::storage(&error));
+            observed.mark_error(Stage::storage(&error), &error);
             catalog_error(error)
         })?;
         let refused = match bridge
@@ -265,7 +262,10 @@ async fn put<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: 
         {
             PublishOutcome::Applied => break commit.generation.id.clone(),
             PublishOutcome::Refused(record) | PublishOutcome::Fenced(record) => record,
-            PublishOutcome::FencedOverloaded(_) => return Err(s3_error(ErrorCode::SlowDown)),
+            PublishOutcome::FencedOverloaded(_) => {
+                observed.mark_fault(Stage::Commit, Fault::named("FencedOverloaded"));
+                return Err(s3_error(ErrorCode::SlowDown));
+            }
         };
         // The key already carries a newer id: a commit that landed after
         // this id was minted, or one minted by a clock ahead of this
@@ -284,12 +284,10 @@ async fn put<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: 
         .await?;
         // Refused as well when a replay started after this request
         // passed the gate.
-        restore_gate(bridge)
-            .await
-            .map_err(|resp| restore_failure(observed, resp))?;
+        restore_gate_observed(bridge, observed).await?;
         attempts += 1;
         if attempts == COMMIT_ATTEMPTS {
-            observed.mark_stage(Stage::Commit);
+            observed.mark_fault(Stage::Commit, Fault::named("AttemptsExhausted"));
             return Err(s3_error(ErrorCode::SlowDown));
         }
         let newest = bridge
@@ -299,7 +297,7 @@ async fn put<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: 
             .inspect_err(observed.on_error(Stage::Lookup))
             .map_err(catalog_error)?;
         rng.fill_bytes(&mut generation_rand)
-            .map_err(|_| internal())?;
+            .map_err(|_| local_fault(observed, "Rng"))?;
         let id = id_after(bridge.clock.now(), newest.as_ref(), generation_rand);
         for e in &mut commit.extents {
             e.generation_id = Some(id.clone());
@@ -310,9 +308,10 @@ async fn put<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: 
     send_post_jobs(bridge, &generation_id, vec![extent_id], commit.now).await;
 
     let checksum = match checksum {
-        Some((algorithm, value)) => {
-            Some(StoredChecksum::full(algorithm, value).map_err(|_| internal())?)
-        }
+        Some((algorithm, value)) => Some(
+            StoredChecksum::full(algorithm, value)
+                .map_err(|_| local_fault(observed, "Checksum"))?,
+        ),
         None => None,
     };
     Ok(from_proto(
@@ -363,7 +362,8 @@ async fn put_sliced<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: K
     } = upload;
     let len = lengths.decoded;
     let slice_bytes = bridge.cfg.slice_bytes;
-    let count = usize::try_from(len.div_ceil(slice_bytes)).map_err(|_| internal())?;
+    let count = usize::try_from(len.div_ceil(slice_bytes))
+        .map_err(|_| local_fault(observed, "Overflow"))?;
 
     // One slice of plaintext and one of ciphertext are held at a time,
     // whatever the length of the body. Nothing is read before this.
@@ -377,12 +377,14 @@ async fn put_sliced<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: K
     let started = bridge.clock.now();
     let mut rng = SystemRng;
     let mut write_rand = [0u8; 16];
-    rng.fill_bytes(&mut write_rand).map_err(|_| internal())?;
+    rng.fill_bytes(&mut write_rand)
+        .map_err(|_| local_fault(observed, "Rng"))?;
     let write = WriteId::mint(write_rand);
     let mut ids = Vec::with_capacity(count);
     for _ in 0..count {
         let mut extent_rand = [0u8; 13];
-        rng.fill_bytes(&mut extent_rand).map_err(|_| internal())?;
+        rng.fill_bytes(&mut extent_rand)
+            .map_err(|_| local_fault(observed, "Rng"))?;
         ids.push(ExtentId::mint(extent_rand));
     }
     let bdk = unwrap_bdk(
@@ -391,7 +393,7 @@ async fn put_sliced<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: K
         &bucket.id,
         &bucket.bdk_wrapped,
     )
-    .map_err(|_| internal())?;
+    .map_err(|e| local_error(observed, &e))?;
 
     // Every slice has its row before its blob exists: whatever happens
     // to this request from here on, the catalogue names what it stored.
@@ -399,13 +401,11 @@ async fn put_sliced<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: K
         Ok(Guard::Applied(())) => {}
         // A replay started after this request passed the gate.
         Ok(Guard::Lost) => {
-            restore_gate(bridge)
-                .await
-                .map_err(|resp| restore_failure(observed, resp))?;
+            restore_gate_observed(bridge, observed).await?;
             return Err(writes_refused());
         }
         Err(error) => {
-            observed.mark_stage(Stage::Commit);
+            observed.mark_error(Stage::Commit, &error);
             return Err(catalog_error(error));
         }
     }
@@ -425,9 +425,9 @@ async fn put_sliced<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: K
             return Err(match e {
                 SliceError::Ingress(e) => e.response(),
                 SliceError::Proto(e) => s3_error(e),
-                SliceError::Internal => internal(),
-                SliceError::Store => {
-                    observed.mark_stage(Stage::R2);
+                SliceError::Internal => local_fault(observed, "SliceInternal"),
+                SliceError::Store(fault) => {
+                    observed.mark_fault(Stage::R2, fault);
                     internal()
                 }
             });
@@ -445,14 +445,14 @@ async fn put_sliced<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: K
     };
     if stored.len() != count {
         give_up(bridge, &write).await;
-        return Err(internal());
+        return Err(local_fault(observed, "SliceCount"));
     }
 
     let now = bridge.clock.now();
     let mut generation_rand = [0u8; 8];
     if rng.fill_bytes(&mut generation_rand).is_err() {
         give_up(bridge, &write).await;
-        return Err(internal());
+        return Err(local_fault(observed, "Rng"));
     }
     let generation_id = GenerationId::mint(now, generation_rand);
     // The ETag of a PutObject is the MD5 of its whole body, whatever the
@@ -499,7 +499,7 @@ async fn put_sliced<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: K
         checksum_json: checksum.as_ref().map(|(a, v)| checksum_json(*a, v)),
         content_json,
         user_meta_json,
-        extent_count: u32::try_from(count).map_err(|_| internal())?,
+        extent_count: u32::try_from(count).map_err(|_| local_fault(observed, "Overflow"))?,
         created_at: now,
         retired_at: None,
     };
@@ -531,15 +531,13 @@ async fn put_sliced<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: K
             // under this id, and none is left of an earlier one.
             Ok(Guard::Lost) => {
                 give_up(bridge, &write).await;
-                restore_gate(bridge)
-                    .await
-                    .map_err(|resp| restore_failure(observed, resp))?;
-                observed.mark_stage(Stage::Commit);
+                restore_gate_observed(bridge, observed).await?;
+                observed.mark_fault(Stage::Commit, Fault::named("IntentsLost"));
                 return Err(internal());
             }
             Err(error) => {
                 give_up(bridge, &write).await;
-                observed.mark_stage(Stage::Commit);
+                observed.mark_error(Stage::Commit, &error);
                 return Err(catalog_error(error));
             }
         }
@@ -552,10 +550,8 @@ async fn put_sliced<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: K
         // failed: rows without an id, and no stamp that says so.
         if let Err(error) = bridge.raise_stamp().await {
             give_up(bridge, &write).await;
-            restore_gate(bridge)
-                .await
-                .map_err(|resp| restore_failure(observed, resp))?;
-            observed.mark_stage(Stage::stamp(&error));
+            restore_gate_observed(bridge, observed).await?;
+            observed.mark_error(Stage::stamp(&error), &error);
             return Err(s3_error(ErrorCode::SlowDown));
         }
         // A conditional PUT whose condition does not hold ends here. No
@@ -590,7 +586,7 @@ async fn put_sliced<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: K
         )
         .await
         .map_err(|error| {
-            observed.mark_stage(Stage::storage(&error));
+            observed.mark_error(Stage::storage(&error), &error);
             catalog_error(error)
         })?;
         let refused = match bridge
@@ -602,7 +598,10 @@ async fn put_sliced<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: K
         {
             PublishOutcome::Applied => break,
             PublishOutcome::Refused(record) | PublishOutcome::Fenced(record) => record,
-            PublishOutcome::FencedOverloaded(_) => return Err(s3_error(ErrorCode::SlowDown)),
+            PublishOutcome::FencedOverloaded(_) => {
+                observed.mark_fault(Stage::Commit, Fault::named("FencedOverloaded"));
+                return Err(s3_error(ErrorCode::SlowDown));
+            }
         };
         // A newer id on the key, a condition that no longer holds, a
         // replay, or rows the sweep took.
@@ -616,14 +615,14 @@ async fn put_sliced<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: K
             observed,
         )
         .await?;
-        if let Err(resp) = restore_gate(bridge).await {
+        if let Err(resp) = restore_gate_observed(bridge, observed).await {
             give_up(bridge, &write).await;
-            return Err(restore_failure(observed, resp));
+            return Err(resp);
         }
         attempts += 1;
         if attempts == COMMIT_ATTEMPTS {
             give_up(bridge, &write).await;
-            observed.mark_stage(Stage::Commit);
+            observed.mark_fault(Stage::Commit, Fault::named("AttemptsExhausted"));
             return Err(s3_error(ErrorCode::SlowDown));
         }
         // No record exists here, so a failure below gives the slices up.
@@ -635,7 +634,7 @@ async fn put_sliced<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: K
                 .inspect_err(observed.on_error(Stage::Lookup))
                 .map_err(catalog_error)?;
             rng.fill_bytes(&mut generation_rand)
-                .map_err(|_| internal())?;
+                .map_err(|_| local_fault(observed, "Rng"))?;
             Ok::<_, S3Response>(id_after(
                 bridge.clock.now(),
                 newest.as_ref(),
@@ -664,9 +663,10 @@ async fn put_sliced<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: K
     send_post_jobs(bridge, &commit.generation.id, rows, commit.now).await;
 
     let checksum = match checksum {
-        Some((algorithm, value)) => {
-            Some(StoredChecksum::full(algorithm, value).map_err(|_| internal())?)
-        }
+        Some((algorithm, value)) => Some(
+            StoredChecksum::full(algorithm, value)
+                .map_err(|_| local_fault(observed, "Checksum"))?,
+        ),
         None => None,
     };
     Ok(from_proto(

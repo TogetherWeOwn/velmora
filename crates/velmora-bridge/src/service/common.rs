@@ -21,7 +21,7 @@ use crate::entry::Entry;
 use crate::ingress::{
     seal_upload, Charge, IngressError, SealedUpload, UploadLengths, UploadReadError,
 };
-use crate::metrics::{FailureStage as Stage, RequestObservation};
+use crate::metrics::{FailureStage as Stage, Fault, RequestObservation};
 use crate::ports::{BlobStore, Bridge, Catalog, Clock, JobSink, Kek, NntpConnector, StreamMeta};
 use crate::recovery::{discard_generation, revocation_recorded, Unpublished};
 use crate::replay::ReplayProbe;
@@ -115,6 +115,20 @@ pub(super) fn catalog_error(error: BridgeError) -> S3Response {
     } else {
         internal()
     }
+}
+
+/// `500 InternalError` for a fault of this request's own code (`Rng`,
+/// `Overflow`, ...), marked on `observed`.
+pub(super) fn local_fault(observed: &mut RequestObservation, variant: &'static str) -> S3Response {
+    observed.mark_fault(Stage::Other, Fault::named(variant));
+    internal()
+}
+
+/// `500 InternalError` for a core error outside any port stage (a key
+/// unwrap, a seal), marked on `observed`.
+pub(super) fn local_error(observed: &mut RequestObservation, error: &BridgeError) -> S3Response {
+    observed.mark_error(Stage::Other, error);
+    internal()
 }
 
 /// `503 ServiceUnavailable` with `Retry-After`: the object exists but its
@@ -418,9 +432,60 @@ fn claimed_key(headers: &Headers, target: &Target) -> Option<String> {
 /// has no grant on does not exist, so no key can probe for the names of
 /// buckets that are not its own. A key that holds a grant too weak for
 /// the operation (read-only, on a write) is `AccessDenied`.
+///
+/// This form is for a request whose failure is not observed; see
+/// [`authenticate_observed`].
 pub(super) async fn authenticate<C, B, N, J, K, T>(
     bridge: &Bridge<C, B, N, J, K, T>,
     req: &S3Request,
+) -> Result<Authed, S3Response>
+where
+    C: Catalog,
+    B: BlobStore,
+    N: NntpConnector,
+    J: JobSink,
+    K: Kek,
+    T: Clock,
+{
+    authenticate_inner(bridge, req, &Cell::new(None)).await
+}
+
+/// Authenticates `req`. A refusal marks the auth stage on `observed`,
+/// with the port error behind it when there was one (a catalogue read,
+/// a revocation head, a key unwrap).
+pub(super) async fn authenticate_observed<C, B, N, J, K, T>(
+    bridge: &Bridge<C, B, N, J, K, T>,
+    req: &S3Request,
+    observed: &mut RequestObservation,
+) -> Result<Authed, S3Response>
+where
+    C: Catalog,
+    B: BlobStore,
+    N: NntpConnector,
+    J: JobSink,
+    K: Kek,
+    T: Clock,
+{
+    let fault = Cell::new(None);
+    authenticate_inner(bridge, req, &fault)
+        .await
+        .inspect_err(|_| match fault.get() {
+            Some(fault) => observed.mark_fault(Stage::Auth, fault),
+            None => observed.mark_stage(Stage::Auth),
+        })
+}
+
+/// The answer to a port error during authentication, which is kept in
+/// `fault`.
+fn noted(fault: &Cell<Option<Fault>>, error: BridgeError) -> S3Response {
+    fault.set(Some(Fault::of(&error)));
+    catalog_error(error)
+}
+
+async fn authenticate_inner<C, B, N, J, K, T>(
+    bridge: &Bridge<C, B, N, J, K, T>,
+    req: &S3Request,
+    fault: &Cell<Option<Fault>>,
 ) -> Result<Authed, S3Response>
 where
     C: Catalog,
@@ -483,7 +548,7 @@ where
             .catalog
             .access_key(&authority.akid)
             .await
-            .map_err(catalog_error)?
+            .map_err(|e| noted(fault, e))?
             .filter(|row| row.status == KeyStatus::Active);
         // Under maintenance the catalogue may be a restored copy that
         // still holds a key revoked after it was taken, until the first
@@ -494,7 +559,7 @@ where
             Some(row) if bridge.cfg.maintenance == Maintenance::Restore => {
                 let revoked = revocation_recorded(&bridge.safety, &row.access_key_id)
                     .await
-                    .map_err(|_| internal())?;
+                    .map_err(|e| noted(fault, e))?;
                 (!revoked).then_some(row)
             }
             other => other,
@@ -506,7 +571,7 @@ where
                 &row.access_key_id,
                 &row.secret_wrapped,
             )
-            .map_err(|_| internal())?;
+            .map_err(|e| noted(fault, e))?;
             authority.principal = row.principal;
             authority.secret = Some(secret);
             if !target.bucket.is_empty() {
@@ -514,14 +579,14 @@ where
                     .catalog
                     .bucket_by_name(&target.bucket)
                     .await
-                    .map_err(catalog_error)?;
+                    .map_err(|e| noted(fault, e))?;
             }
             if let Some(b) = &bucket {
                 authority.perm = bridge
                     .catalog
                     .grant(&authority.akid, &b.id)
                     .await
-                    .map_err(catalog_error)?;
+                    .map_err(|e| noted(fault, e))?;
             }
         }
     }
@@ -846,11 +911,11 @@ pub(super) async fn discard_before_retry<
         Ok(true) => Ok(()),
         Ok(false) if !conditional => Ok(()),
         Ok(false) => {
-            observed.mark_stage(Stage::Commit);
+            observed.mark_fault(Stage::Commit, Fault::named("RecordKept"));
             Err(internal())
         }
         Err(error) => {
-            observed.mark_stage(discard_failure(&error));
+            observed.mark_error(discard_failure(&error), &error);
             Err(internal())
         }
     }
@@ -887,16 +952,28 @@ pub(super) async fn restore_gate<
     }
 }
 
-/// An unsuccessful restore-state read is a lookup failure; a successful
+/// [`restore_gate`] for a request that is observed: an unsuccessful
+/// restore-state read is a lookup failure, with its error; a successful
 /// read that found an ongoing restore is a write refusal instead.
-pub(super) fn restore_failure(
+pub(super) async fn restore_gate_observed<
+    C: Catalog,
+    B: BlobStore,
+    N: NntpConnector,
+    J: JobSink,
+    K: Kek,
+    T: Clock,
+>(
+    bridge: &Bridge<C, B, N, J, K, T>,
     observed: &mut RequestObservation,
-    response: S3Response,
-) -> S3Response {
-    if response.status == 500 {
-        observed.mark_stage(Stage::Lookup);
+) -> Result<(), S3Response> {
+    match bridge.catalog.restore_pending().await {
+        Ok(false) => Ok(()),
+        Ok(true) => Err(writes_refused()),
+        Err(error) => {
+            observed.mark_error(Stage::Lookup, &error);
+            Err(catalog_error(error))
+        }
     }
-    response
 }
 
 /// Queue messages of one `send_many`.
@@ -996,21 +1073,32 @@ pub(super) async fn store_streamed<B: BlobStore>(
     let receipt = safety
         .put_stream(&blob.extent.safety_key(), cipher_size, stream, &blob)
         .await;
-    match (receipt, seal.outcome()) {
+    let fault = match (receipt, seal.outcome()) {
         // The body was refused: that is the answer, whatever the store
         // made of the stream that ended in an error.
-        (_, Err(Some(refused))) => Err(refused),
+        (_, Err(Some(refused))) => {
+            // A fault of the sealing stream itself, not of the body.
+            if refused == UploadReadError::Ingress(IngressError::Internal) {
+                observed.mark_fault(Stage::Other, Fault::named("SealInternal"));
+            }
+            return Err(refused);
+        }
         (Ok(receipt), Ok(upload))
             if receipt.size == upload.sealed.cipher_size
                 && receipt.md5 == upload.sealed.cipher_md5 =>
         {
-            Ok(upload)
+            return Ok(upload);
         }
-        // The store failed, stopped reading, or holds other bytes than
-        // were sealed.
-        _ => {
-            observed.mark_stage(Stage::R2);
-            Err(IngressError::Internal.into())
+        // The store failed.
+        (Err(error), _) => Fault::of(&error),
+        // The store answered without reading the stream to its end.
+        (Ok(_), Err(None)) => Fault::named("StoreStoppedReading"),
+        // The store holds other bytes than were sealed.
+        (Ok(receipt), Ok(upload)) if receipt.size != upload.sealed.cipher_size => {
+            Fault::named("StoredSizeMismatch")
         }
-    }
+        (Ok(_), Ok(_)) => Fault::named("StoredMd5Mismatch"),
+    };
+    observed.mark_fault(Stage::R2, fault);
+    Err(IngressError::Internal.into())
 }

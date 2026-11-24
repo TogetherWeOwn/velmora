@@ -1612,6 +1612,32 @@ pub fn seal_upload(
 /// request ID. Never the query (presigned credentials), headers
 /// (`Authorization`, tokens) or bodies.
 pub fn log_line(method: &str, raw_target: &str, status: u16, request_id: &str) -> String {
+    log_line_with(method, raw_target, status, request_id, None)
+}
+
+/// [`log_line`]; for a `5xx` it ends with what the request observed of
+/// its failure ([`crate::metrics::RequestObservation::log_fields`]):
+/// `stage=.. err=.. code=..`, each `-` where nothing is known. Those are
+/// names from fixed lists and numbers, never message text.
+pub fn log_line_with(
+    method: &str,
+    raw_target: &str,
+    status: u16,
+    request_id: &str,
+    observed: Option<&crate::metrics::RequestObservation>,
+) -> String {
+    let line = request_line(method, raw_target, status, request_id);
+    if status < 500 {
+        return line;
+    }
+    let fields = observed.map_or_else(
+        || crate::metrics::RequestObservation::default().log_fields(),
+        |o| o.log_fields(),
+    );
+    format!("{line} {fields}")
+}
+
+fn request_line(method: &str, raw_target: &str, status: u16, request_id: &str) -> String {
     let path = raw_target.split_once('?').map_or(raw_target, |(p, _)| p);
     let path = path.strip_prefix('/').unwrap_or(path);
     let (bucket, key) = path

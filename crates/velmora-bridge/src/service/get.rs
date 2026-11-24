@@ -19,7 +19,7 @@ use futures_util::stream::{self, Stream, StreamExt};
 use velmora_s3_proto::{plan_read, Conditions, ErrorCode, ObjectMetadata};
 
 use super::common::{
-    authenticate, internal, s3_error, stored_checksum, stored_headers, unavailable,
+    authenticate_observed, internal, s3_error, stored_checksum, stored_headers, unavailable,
 };
 use crate::config::MAX_EXTENT_BYTES_LIMIT;
 use crate::crypto::{cipher_span, open_range, unwrap_bdk};
@@ -371,14 +371,14 @@ async fn read<
     hit_flush: Option<Spawner>,
 ) -> core::result::Result<S3Response, S3Response> {
     observed.mark_stage(Stage::Auth);
-    let authed = authenticate(bridge, &req).await?;
+    let authed = authenticate_observed(bridge, &req, observed).await?;
     let (bucket, key) = authed.object()?;
     observed.mark_stage(Stage::Lookup);
     let Some(generation) = bridge
         .catalog
         .live_generation(&bucket.id, key)
         .await
-        .map_err(|_| internal())?
+        .map_err(|e| lookup_failed(observed, &e))?
     else {
         return Err(s3_error(ErrorCode::NoSuchKey));
     };
@@ -523,7 +523,7 @@ async fn plan_pieces(
     let extents = catalog
         .extents_in(generation, start, end)
         .await
-        .map_err(|_| internal())?;
+        .map_err(|e| lookup_failed(observed, &e))?;
     observed.mark_stage(Stage::Plan);
     pieces(extents, start, end - start)
         .filter(|todo| !todo.is_empty())
@@ -576,7 +576,7 @@ async fn granted<
         .catalog
         .generation_by_id(&grant.bucket, &grant.generation)
         .await
-        .map_err(|_| internal())?;
+        .map_err(|e| lookup_failed(observed, &e))?;
     observed.mark_stage(Stage::Grant);
     let (bucket, generation) = generation.ok_or_else(internal)?;
     observed.record_size(generation.size);
@@ -633,6 +633,12 @@ async fn preflight<B: BlobStore>(
         return Err(unavailable());
     }
     Ok(())
+}
+
+/// `500` for a catalogue read of the GET path, marked with its error.
+fn lookup_failed(observed: &mut GetObservation, error: &BridgeError) -> S3Response {
+    observed.mark_error(Stage::Lookup, error);
+    internal()
 }
 
 /// Streams plaintext from the validated pieces in order.

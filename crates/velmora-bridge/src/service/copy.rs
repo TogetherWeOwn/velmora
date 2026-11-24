@@ -26,11 +26,11 @@ use velmora_s3_proto::{
 
 use super::common::{
     catalog_error, check_precondition, discard_before_retry, hold_precondition, internal,
-    metadata_json, restore_failure, restore_gate, s3_error, stored_checksum, stored_headers,
-    unavailable, Authed,
+    metadata_json, restore_gate_observed, s3_error, stored_checksum, stored_headers, unavailable,
+    Authed,
 };
 use crate::config::SINGLE_RECORD_EXTENTS;
-use crate::metrics::{FailureStage as Stage, RequestObservation};
+use crate::metrics::{FailureStage as Stage, Fault, RequestObservation};
 use crate::ports::{
     BlobStore, Bridge, Catalog, Clock, JobSink, Kek, NntpConnector, PublishOutcome,
 };
@@ -349,7 +349,7 @@ where
         )
         .await
         .map_err(|error| {
-            observed.mark_stage(Stage::storage(&error));
+            observed.mark_error(Stage::storage(&error), &error);
             catalog_error(error)
         })?;
         drop(extents);
@@ -373,7 +373,10 @@ where
                     .map_err(|_| internal());
             }
             PublishOutcome::Refused(record) | PublishOutcome::Fenced(record) => record,
-            PublishOutcome::FencedOverloaded(_) => return Err(s3_error(ErrorCode::SlowDown)),
+            PublishOutcome::FencedOverloaded(_) => {
+                observed.mark_fault(Stage::Commit, Fault::named("FencedOverloaded"));
+                return Err(s3_error(ErrorCode::SlowDown));
+            }
         };
         // The source was overwritten or deleted since it was read, the
         // destination got a generation this id does not sort after, or
@@ -391,11 +394,9 @@ where
         .await?;
         // Refused as well when a replay started after this request
         // passed the gate.
-        restore_gate(bridge)
-            .await
-            .map_err(|resp| restore_failure(observed, resp))?;
+        restore_gate_observed(bridge, observed).await?;
         // Plan again against what is live now.
     }
-    observed.mark_stage(Stage::Commit);
+    observed.mark_fault(Stage::Commit, Fault::named("AttemptsExhausted"));
     Err(unavailable())
 }
