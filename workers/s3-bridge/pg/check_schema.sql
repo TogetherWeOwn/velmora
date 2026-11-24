@@ -55,8 +55,10 @@ SELECT json_build_object(
         ) s),
     'triggers', (SELECT json_agg(json_build_array(r.relname, t.tgname, t.tgenabled,
         t.tgtype, ARRAY(SELECT a.attname FROM unnest(t.tgattr) WITH ORDINALITY k(attnum, ord)
-                        JOIN pg_attribute a ON a.attrelid = r.oid AND a.attnum = k.attnum ORDER BY k.ord)))
-        FROM tbl r JOIN pg_trigger t ON t.tgrelid = r.oid AND NOT t.tgisinternal),
+                        JOIN pg_attribute a ON a.attrelid = r.oid AND a.attnum = k.attnum ORDER BY k.ord),
+        p.proname, encode(sha256(convert_to(p.prosrc, 'UTF8')), 'hex'), pg_get_triggerdef(t.oid)))
+        FROM tbl r JOIN pg_trigger t ON t.tgrelid = r.oid AND NOT t.tgisinternal
+        JOIN pg_proc p ON p.oid = t.tgfoid AND p.pronamespace = r.relnamespace),
     'tx_guard', EXISTS (SELECT FROM tbl t JOIN pg_constraint c ON c.conrelid = t.oid
         WHERE t.relname = 'tx_guard' AND c.conname = 'tx_guard_ok'
           AND c.contype = 'c' AND c.convalidated AND pg_get_expr(c.conbin, c.conrelid) = '(ok = 1)'),
@@ -95,6 +97,7 @@ SELECT json_build_object(
         'app-only trigger function EXECUTE', NOT EXISTS (SELECT FROM pg_proc p JOIN ns ON ns.oid = p.pronamespace
             WHERE p.prorettype = 'trigger'::regtype AND (p.proowner <> 'kofra_migrate'::regrole
               OR p.prosecdef OR NOT has_function_privilege('kofra_app', p.oid, 'EXECUTE')
+              OR p.proconfig IS DISTINCT FROM ARRAY[format('search_path=%s, pg_temp', current_schema())]
               OR EXISTS (SELECT FROM aclexplode(coalesce(p.proacl, acldefault('f', p.proowner))) a
                          WHERE a.grantee = 0))),
         'explicit default privileges', (SELECT array_agg(DISTINCT privilege_type ORDER BY privilege_type) FROM defaults

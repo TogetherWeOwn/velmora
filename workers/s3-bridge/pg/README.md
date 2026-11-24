@@ -86,8 +86,10 @@ migrations are not subject to the 3 s execution budget.
 A file whose first line is `-- velmora: no-transaction` may contain only
 idempotent `CREATE [UNIQUE] INDEX CONCURRENTLY IF NOT EXISTS` statements.
 Only the migrator session lock is held through the index statements; short
-precheck and ledger transactions use W1. A failed concurrent index build
-can leave an invalid index (including after a lock timeout). The tool refuses
+precheck and ledger transactions use W1. A competing migrator retries the
+session lock without waiting in PostgreSQL with a snapshot. A failed
+concurrent index build can leave an invalid index (including after a lock
+timeout). The tool refuses
 to record the file or skip the invalid index on retry. Inspect and repair the
 index before rerunning.
 
