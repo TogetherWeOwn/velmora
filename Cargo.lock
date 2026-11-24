@@ -2515,6 +2515,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "velmora-pg-load"
+version = "0.1.0"
+dependencies = [
+ "futures-channel",
+ "futures-util",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-postgres",
+ "velmora",
+ "velmora-bridge",
+ "worker",
+]
+
+[[package]]
 name = "velmora-recover"
 version = "0.1.0"
 dependencies = [
