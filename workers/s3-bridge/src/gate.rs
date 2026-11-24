@@ -41,7 +41,7 @@ use worker::{
     WorkerVersionMetadata,
 };
 
-use crate::d1::D1Sql;
+use crate::catalog_sql::CatalogSql;
 use crate::env::WorkerClock;
 
 /// Name of the Durable Object namespace binding.
@@ -118,7 +118,7 @@ fn attach(ws: &WebSocket, session: &SessionState) -> bool {
 pub struct PermitGate {
     state: State,
     /// `Err`: a binding is missing; every request fails with its name.
-    gate: core::result::Result<Rc<Gate<D1Sql, DoStore>>, &'static str>,
+    gate: core::result::Result<Rc<Gate<CatalogSql, DoStore>>, &'static str>,
 }
 
 impl PermitGate {
@@ -128,7 +128,7 @@ impl PermitGate {
     async fn ready(
         &self,
         ending: Option<u64>,
-    ) -> core::result::Result<&Rc<Gate<D1Sql, DoStore>>, String> {
+    ) -> core::result::Result<&Rc<Gate<CatalogSql, DoStore>>, String> {
         let gate = self.gate.as_ref().map_err(|name| format!("gate: {name}"))?;
         if gate.started() {
             return Ok(gate);
@@ -167,7 +167,7 @@ impl PermitGate {
     /// slots have run out and it has not asked since. The socket of
     /// such a session may be all that keeps the holder's invocation
     /// from ending.
-    fn reap(&self, gate: &Gate<D1Sql, DoStore>) {
+    fn reap(&self, gate: &Gate<CatalogSql, DoStore>) {
         let now = WorkerClock.now();
         for ws in self.state.get_websockets() {
             if let Some(session) = attached(&ws).filter(|s| s.stale(now)) {
@@ -191,13 +191,13 @@ impl PermitGate {
 impl DurableObject for PermitGate {
     fn new(state: State, env: Env) -> Self {
         let gate = match (
-            env.d1("CATALOG"),
+            CatalogSql::from_env(&env),
             env.get_binding::<WorkerVersionMetadata>(VERSION_BINDING),
         ) {
-            (Err(_), _) => Err("missing binding CATALOG"),
+            (Err(reason), _) => Err(reason),
             (_, Err(_)) => Err("missing binding CF_VERSION_METADATA"),
             (Ok(db), Ok(version)) => Ok(Rc::new(Gate::new(
-                D1Sql::new(db),
+                db,
                 DoStore(state.storage()),
                 version.id(),
             ))),

@@ -25,6 +25,8 @@ pub mod jobs;
 pub mod jobtable;
 pub mod keepalive;
 pub mod parity;
+#[cfg(feature = "pg")]
+pub mod pg;
 pub mod plan;
 mod pool;
 pub mod ports;

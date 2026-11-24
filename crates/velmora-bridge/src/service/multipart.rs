@@ -131,8 +131,12 @@ impl From<UploadReadError> for Fail {
 }
 
 impl From<BridgeError> for Fail {
-    fn from(_: BridgeError) -> Self {
-        Fail::Internal
+    fn from(error: BridgeError) -> Self {
+        if error.is_pg_overloaded() {
+            Fail::S3(ErrorCode::SlowDown)
+        } else {
+            Fail::Internal
+        }
     }
 }
 
@@ -1678,6 +1682,11 @@ where
                 let _ = discard_refused(bridge, &commit.generation, record).await;
                 observed.mark_stage(Stage::Commit);
                 return Err(Fail::Internal);
+            }
+            PublishOutcome::FencedOverloaded(record) => {
+                let _ = discard_refused(bridge, &commit.generation, record).await;
+                observed.mark_stage(Stage::Commit);
+                return Err(ErrorCode::SlowDown.into());
             }
         }
     }

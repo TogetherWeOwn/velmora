@@ -54,9 +54,25 @@ struct Probe {
     yield_before_batch: Cell<bool>,
     /// When set, every statement is kept here with its parameters.
     recorded: RefCell<Option<Vec<Recorded>>>,
+    /// One synthetic PostgreSQL overload at a selected SQL boundary.
+    overload: Cell<Option<(&'static str, Option<&'static str>)>>,
 }
 
 impl Probe {
+    fn fault(&self, sql: &str, args: &[SqlValue]) -> Result<()> {
+        if self.overload.get().is_some_and(|(needle, key)| {
+            sql.contains(needle)
+                && key.is_none_or(|key| {
+                    args.iter()
+                        .any(|arg| matches!(arg,SqlValue::Text(s) if s==key))
+                })
+        }) {
+            self.overload.set(None);
+            Err(BridgeError::Sql("pg: overloaded".into()))
+        } else {
+            Ok(())
+        }
+    }
     fn record(&self, sql: &str, params: &[SqlValue]) {
         if let Some(log) = self.recorded.borrow_mut().as_mut() {
             log.push((sql.to_string(), params.to_vec()));
@@ -67,14 +83,19 @@ impl Probe {
 impl Sql for Probe {
     async fn query(&self, sql: &str, params: &[SqlValue]) -> Result<Vec<Row>> {
         self.record(sql, params);
+        self.fault(sql, params)?;
         self.db.query(sql, params).await
     }
     async fn exec(&self, sql: &str, params: &[SqlValue]) -> Result<u64> {
         self.record(sql, params);
+        self.fault(sql, params)?;
         self.db.exec(sql, params).await
     }
     async fn batch(&self, stmts: Vec<(&'static str, Vec<SqlValue>)>) -> Result<Vec<u64>> {
-        stmts.iter().for_each(|(q, p)| self.record(q, p));
+        for (q, p) in &stmts {
+            self.record(q, p);
+            self.fault(q, p)?;
+        }
         if self.yield_before_batch.get() {
             tokio::task::yield_now().await;
         }
@@ -383,6 +404,7 @@ impl Rig {
             db: RusqliteSql::with_schema().expect("schema applies"),
             yield_before_batch: Cell::new(false),
             recorded: RefCell::new(None),
+            overload: Cell::new(None),
         });
         let mut buckets = Vec::new();
         for (name, seed) in [("alpha", 0xa1u8), ("beta", 0xb2)] {
@@ -474,9 +496,11 @@ impl Rig {
         let body = match resp.body {
             RespBody::Empty => Vec::new(),
             RespBody::Bytes(b) => b,
-            RespBody::Stream(_) | RespBody::Deferred(_) | RespBody::Fanout(_) => {
-                panic!("multipart responses are never streamed")
-            }
+            RespBody::Deferred(body) => match body.settle(Box::pin(std::future::pending())).await {
+                Ok(doc) => doc,
+                Err(_) => unreachable!("the test window does not expire"),
+            },
+            RespBody::Stream(_) | RespBody::Fanout(_) => panic!("unexpected streamed response"),
         };
         Resp {
             status: resp.status,
@@ -1758,5 +1782,248 @@ async fn upload_part_reads_no_other_part_of_the_upload() {
             }
         }
         assert!(by_part >= 3, "part {n}: the GC select and the piece delete");
+    }
+}
+
+#[tokio::test]
+async fn nul_upload_id_is_unknown_on_all_multipart_paths() {
+    let rig = Rig::new().await;
+    // Use an otherwise-valid length so this exercises the character check.
+    let id = concat!("0000000000000000", "\0", "000000000000000");
+    assert_eq!(id.len(), 32);
+    let path = object_path("alpha", KEY);
+    let requests = [
+        ("UploadPart", part_req(RW_KEY, "alpha", KEY, id, 1, b"part")),
+        (
+            "UploadPartCopy",
+            sign(
+                RW_KEY,
+                Method::Put,
+                &path,
+                &[("partNumber", "1"), ("uploadId", id)],
+                &[("x-amz-copy-source", "/alpha/src")],
+                Vec::new(),
+            ),
+        ),
+        (
+            "CompleteMultipartUpload",
+            complete_req(RW_KEY, "alpha", KEY, id, &[(1, "part")], &[]),
+        ),
+        ("AbortMultipartUpload", abort_req(RW_KEY, "alpha", KEY, id)),
+        (
+            "ListParts",
+            sign(
+                RW_KEY,
+                Method::Get,
+                &path,
+                &[("uploadId", id)],
+                &[],
+                Vec::new(),
+            ),
+        ),
+    ];
+    let sql = &rig.bridge.catalog.sql;
+    for (operation, request) in requests {
+        *sql.recorded.borrow_mut() = Some(Vec::new());
+        let response = rig.send(request).await;
+        assert_eq!(response.outcome(), "404 NoSuchUpload", "{operation}");
+        let statements = sql.recorded.borrow_mut().take().unwrap();
+        assert!(
+            statements
+                .iter()
+                .flat_map(|(_, args)| args)
+                .all(|p| !matches!(p,SqlValue::Text(s) if s.contains('\0'))),
+            "{operation}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn nul_in_presigned_access_key_is_rejected_before_lookup() {
+    let rig = Rig::new().await;
+    let sql = &rig.bridge.catalog.sql;
+    *sql.recorded.borrow_mut() = Some(Vec::new());
+    let sig = "0".repeat(64);
+    let response = rig.send(Req {
+        method: Method::Get,
+        target: format!("/alpha/key?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKID%00B%2F20260412%2Fauto%2Fs3%2Faws4_request&X-Amz-Date=20260412T000000Z&X-Amz-Expires=30&X-Amz-SignedHeaders=host&X-Amz-Signature={sig}"),
+        headers: vec![("host".into(), S3_HOST.into())],
+        body: Vec::new(),
+    }).await;
+    assert_eq!(response.outcome(), "400 AuthorizationQueryParametersError");
+    assert!(sql.recorded.borrow_mut().take().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_well_formed_signature_with_an_unknown_access_key_is_forbidden() {
+    let rig = Rig::new().await;
+    for id in ["UnknownKey", "Unknown-Key"] {
+        let response = rig
+            .send(sign(id, Method::Get, "/alpha/key", &[], &[], Vec::new()))
+            .await;
+        assert_eq!(response.outcome(), "403 InvalidAccessKeyId", "{id}");
+    }
+}
+
+fn plain_put(key: &str) -> Req {
+    sign(
+        RW_KEY,
+        Method::Put,
+        &object_path("alpha", key),
+        &[],
+        &[],
+        b"bytes".to_vec(),
+    )
+}
+
+#[tokio::test]
+async fn pg_overload_reaches_each_single_write_as_slow_down() {
+    let rig = Rig::new().await;
+    let sql = &rig.bridge.catalog.sql;
+    assert_eq!(rig.send(plain_put("source")).await.outcome(), "200");
+    let id = rig.create("alpha", KEY).await;
+    let cases = [
+        ("put", "INSERT INTO generations", plain_put("put")),
+        (
+            "copy",
+            "INSERT INTO generations",
+            sign(
+                RW_KEY,
+                Method::Put,
+                "/alpha/copy",
+                &[],
+                &[("x-amz-copy-source", "/alpha/source")],
+                Vec::new(),
+            ),
+        ),
+        (
+            "part",
+            "INSERT INTO upload_parts",
+            part_req(RW_KEY, "alpha", KEY, &id, 1, b"part"),
+        ),
+        (
+            "delete",
+            "DELETE FROM objects",
+            sign(
+                RW_KEY,
+                Method::Delete,
+                "/alpha/source",
+                &[],
+                &[],
+                Vec::new(),
+            ),
+        ),
+    ];
+    let mut codes = Vec::new();
+    for (op, needle, request) in cases {
+        sql.overload.set(Some((needle, None)));
+        codes.push((op, rig.send(request).await.outcome()));
+        assert!(sql.overload.get().is_none(), "fault not reached for {op}");
+    }
+    for (op, code) in codes {
+        assert_eq!(code, "503 SlowDown", "{op}");
+    }
+}
+
+fn delete_many_req(keys: &[String]) -> Req {
+    let mut xml = String::from("<Delete>");
+    for key in keys {
+        xml.push_str(&format!("<Object><Key>{key}</Key></Object>"));
+    }
+    xml.push_str("</Delete>");
+    let digest = base64::engine::general_purpose::STANDARD.encode(md5::compute(xml.as_bytes()).0);
+    sign(
+        RW_KEY,
+        Method::Post,
+        "/alpha",
+        &[("delete", "")],
+        &[("content-md5", &digest)],
+        xml.into_bytes(),
+    )
+}
+
+#[tokio::test]
+async fn pg_overload_before_delete_many_work_is_a_request_failure() {
+    let rig = Rig::new().await;
+    let sql = &rig.bridge.catalog.sql;
+    sql.overload
+        .set(Some(("FROM restore_state WHERE state <> 'complete'", None)));
+    let resp = rig.send(delete_many_req(&["first".into()])).await;
+    assert!(sql.overload.get().is_none());
+    assert_eq!(resp.outcome(), "503 SlowDown");
+    let retry_after = resp
+        .headers
+        .iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case("retry-after"))
+        .map(|(_, value)| value.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(retry_after, ["1"]);
+}
+
+#[tokio::test]
+async fn pg_overload_during_delete_many_preserves_other_key_results() {
+    let rig = Rig::new().await;
+    assert_eq!(rig.send(plain_put("first")).await.outcome(), "200");
+    assert_eq!(rig.send(plain_put("second")).await.outcome(), "200");
+    // Two chunks. Only the second chunk's delete mutator is overloaded.
+    let keys = std::iter::once("first".to_owned())
+        .chain((1..50).map(|i| format!("missing-{i}")))
+        .chain(std::iter::once("second".to_owned()))
+        .collect::<Vec<_>>();
+    let sql = &rig.bridge.catalog.sql;
+    sql.overload
+        .set(Some(("DELETE FROM objects", Some("second"))));
+    let resp = rig.send(delete_many_req(&keys)).await;
+    assert!(sql.overload.get().is_none());
+    assert_eq!(resp.status, 200);
+    assert!(
+        resp.body.contains("<Deleted><Key>first</Key></Deleted>"),
+        "{}",
+        resp.body
+    );
+    assert!(
+        resp.body
+            .contains("<Error><Key>second</Key><Code>SlowDown</Code>"),
+        "{}",
+        resp.body
+    );
+}
+
+#[tokio::test]
+async fn pg_overload_during_write_preflight_is_consistent() {
+    let rig = Rig::new().await;
+    assert_eq!(rig.send(plain_put("source")).await.outcome(), "200");
+    let sql = &rig.bridge.catalog.sql;
+    let preflight = [
+        (
+            "FROM access_keys WHERE access_key_id",
+            plain_put("preflight"),
+        ),
+        ("FROM buckets WHERE name", plain_put("preflight")),
+        ("SELECT g.perm FROM grants", plain_put("preflight")),
+        (
+            "SELECT max(id) FROM",
+            sign(
+                RW_KEY,
+                Method::Put,
+                "/alpha/dest",
+                &[],
+                &[("x-amz-copy-source", "/alpha/source")],
+                Vec::new(),
+            ),
+        ),
+    ];
+    for (needle, request) in preflight {
+        sql.overload.set(Some((needle, None)));
+        let response = rig.send(request).await;
+        assert!(sql.overload.get().is_none(), "fault not reached: {needle}");
+        assert_eq!(response.outcome(), "503 SlowDown", "{needle}");
+        let retry: Vec<_> = response
+            .headers
+            .iter()
+            .filter(|(n, _)| n.eq_ignore_ascii_case("retry-after"))
+            .map(|(_, v)| v.as_str())
+            .collect();
+        assert_eq!(retry, ["1"], "{needle}");
     }
 }

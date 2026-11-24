@@ -1196,6 +1196,11 @@ async fn revoke_key<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: K
     if !bridge.catalog.access_key_exists(akid).await.or_internal()? {
         return Err(no_access_key());
     }
+    // The record is permanent and restore-mode auth already consults it.
+    // Do not create it when the adapter will refuse the catalogue delete.
+    if bridge.catalog.is_frozen() {
+        return Err(busy());
+    }
     write_key_revocation(&bridge.safety, &bridge.kek, akid, bridge.clock.now())
         .await
         .or_internal()?;

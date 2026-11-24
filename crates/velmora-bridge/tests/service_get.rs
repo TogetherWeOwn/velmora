@@ -753,12 +753,16 @@ struct Cold {
 }
 
 fn provider(server: &TestNntpServer) -> ProviderConfig {
+    provider_at(server.addr())
+}
+
+fn provider_at(addr: std::net::SocketAddr) -> ProviderConfig {
     ProviderConfig {
         id: "p0".to_string(),
-        host: server.addr().ip().to_string(),
+        host: addr.ip().to_string(),
         hosts: Vec::new(),
         host_select: Default::default(),
-        port: server.addr().port(),
+        port: addr.port(),
         tls: false,
         user: USER.to_string(),
         pass: PASS.to_string(),
@@ -776,6 +780,168 @@ fn provider(server: &TestNntpServer) -> ProviderConfig {
         enabled: true,
         release: true,
     }
+}
+
+#[tokio::test]
+async fn frozen_get_refuses_cold_extents_before_headers_or_writes() {
+    use velmora_bridge::gate::{
+        GateClient, GateReply, GateRequest, GateSession, GateSharding, GateTransport, PermitMode,
+    };
+    use velmora_bridge::sql::SqlCatalog;
+
+    struct FrozenGate(Rc<Cell<u32>>);
+    enum NoGateSession {}
+    impl GateSession for NoGateSession {
+        async fn call(&self, _: GateRequest) -> Result<GateReply> {
+            match *self {}
+        }
+        fn close(&self) {
+            match *self {}
+        }
+    }
+    impl GateTransport for FrozenGate {
+        type Session = NoGateSession;
+        async fn open(&self, _: GateRequest) -> Result<(NoGateSession, GateReply)> {
+            self.0.set(self.0.get() + 1);
+            Err(BridgeError::Sql("catalog: frozen".into()))
+        }
+        async fn call(&self, _: GateRequest) -> Result<GateReply> {
+            panic!("a frozen GET must not call the gate")
+        }
+    }
+
+    // A seeded plan and an active DO client are enough to exercise the
+    // permit failure. No fixture server or NNTP socket is needed.
+    let mut cfg = config(vec![provider_at("127.0.0.1:9".parse().unwrap())]);
+    // The mixed request would ordinarily fan out, the single cold one would not.
+    cfg.get_fanout_bytes = Some(4);
+    let rig = rig_with(NoNntp, cfg);
+    let bridge = Rc::try_unwrap(rig.bridge).ok().unwrap();
+    let gate_calls = Rc::new(Cell::new(0));
+    let gate = GateClient::new(
+        FrozenGate(gate_calls.clone()),
+        || T0,
+        PermitMode::Gate,
+        GateSharding::Account,
+        1,
+        &bridge.cfg.providers,
+    )
+    .into_gate();
+    let rig = Rig {
+        bridge: Rc::new(Bridge {
+            catalog: SqlCatalog::with_gate(bridge.catalog.sql, gate),
+            ..bridge
+        }),
+    };
+    let (bucket, signer) = rig.standard(BUCKET).await;
+    rig.put(&signer, BUCKET, "cold", b"cold").await.expect(200);
+    let (generation, extents) = rig.live(&bucket, "cold").await.unwrap();
+    let extent = &extents[0];
+    let lease = rig
+        .bridge
+        .catalog
+        .claim(
+            &extent.id,
+            &generation.id,
+            OutboxStage::Post,
+            "fixture",
+            rig.now(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    rig.bridge
+        .catalog
+        .plan_articles(
+            &lease,
+            &[ArticleRow {
+                extent_id: extent.id.clone(),
+                idx: 0,
+                message_id: "test@example.invalid".into(),
+                newsgroup: "alt.binaries.test".into(),
+                headers: vec![],
+                cipher_offset: 0,
+                cipher_len: extent.cipher_size,
+                payload_sha256: extent.cipher_sha256,
+                yenc_name: None,
+                state: ArticleState::Planned,
+                provider_id: None,
+                posted_at: None,
+                reposted_at: None,
+            }],
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    rig.bridge
+        .catalog
+        .mark_posted(&lease, 0, "p0", rig.now())
+        .await
+        .unwrap();
+    evict(&rig, extent).await;
+
+    let mixed = commit_parts(&rig, &signer, &bucket, "mixed", &[b"warm", b"missing"]).await;
+    warm_cache(&rig, &bucket, &mixed[0]).await;
+    evict(&rig, &mixed[1]).await;
+    let sql = &rig.bridge.catalog.sql;
+    sql.frozen.set(true);
+    let safety_puts = rig.bridge.safety.puts.borrow().len();
+    let cache_puts = rig.bridge.cache.puts.borrow().len();
+    for key in ["cold", "mixed"] {
+        let response = get(&rig, &signer, key, &[]).await;
+        assert_eq!(response.status, 503, "{key}: {}", response.text());
+        assert_eq!(response.code(), "ServiceUnavailable");
+        assert_eq!(
+            response
+                .headers
+                .iter()
+                .filter(|(name, _)| name.eq_ignore_ascii_case("retry-after"))
+                .count(),
+            1
+        );
+    }
+    let warm = get_range(&rig, &signer, "mixed", "bytes=0-3").await;
+    assert_eq!(warm.status, 206);
+    assert_eq!(warm.body, b"warm");
+    assert_eq!(gate_calls.get(), 0);
+    assert_eq!(sql.frozen_write_attempts.get(), 0);
+    assert_eq!(rig.bridge.safety.puts.borrow().len(), safety_puts);
+    assert_eq!(rig.bridge.cache.puts.borrow().len(), cache_puts);
+}
+
+#[tokio::test]
+async fn frozen_revocation_does_not_leave_a_durable_record() {
+    use velmora_bridge::config::Maintenance;
+    use velmora_bridge::recovery::revocation_recorded;
+    let mut rig = rig();
+    let _ = rig.standard(BUCKET).await;
+    Rc::get_mut(&mut rig.bridge).unwrap().cfg.maintenance = Maintenance::Restore;
+    let sql = &rig.bridge.catalog.sql;
+    sql.frozen.set(true);
+    let revoke = || S3Request {
+        method: Method::Delete,
+        raw_target: format!("/_admin/keys/{AKID}"),
+        headers: vec![(
+            "authorization".into(),
+            format!("Bearer {}", rig.bridge.cfg.admin_token.expose()),
+        )],
+        body: Body::Empty,
+    };
+    let response = Rc::clone(&rig.bridge).handle(revoke()).await;
+    assert!(
+        !revocation_recorded(&rig.bridge.safety, AKID).await.unwrap(),
+        "frozen revocation left its record (HTTP {})",
+        response.status
+    );
+    assert_eq!(response.status, 503);
+    assert_eq!(sql.frozen_write_attempts.get(), 0);
+    assert!(rig.bridge.catalog.access_key_exists(AKID).await.unwrap());
+
+    // Restore maintenance alone intentionally still permits revocation.
+    sql.frozen.set(false);
+    assert_eq!(Rc::clone(&rig.bridge).handle(revoke()).await.status, 204);
+    assert!(revocation_recorded(&rig.bridge.safety, AKID).await.unwrap());
+    assert!(!rig.bridge.catalog.access_key_exists(AKID).await.unwrap());
 }
 
 async fn cold_rig() -> Cold {

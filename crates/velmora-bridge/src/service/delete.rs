@@ -27,14 +27,16 @@ use velmora_s3_proto::mutation::{delete_result, parse_delete, DeleteOutcome};
 use velmora_s3_proto::{storable_key, ChecksumAlgorithm, ErrorCode, UploadValidator};
 
 use super::common::{
-    authenticate, check_precondition, conditional_gate, internal, mutation_gate, policy_with,
-    restore_gate, s3_error, signed_host, writes_refused,
+    authenticate, catalog_error, check_precondition, conditional_gate, internal, mutation_gate,
+    policy_with, restore_gate, s3_error, signed_host, writes_refused,
 };
 use crate::ingress::{read_upload, upload_lengths, UploadReadError};
 use crate::keepalive::Deferred;
 use crate::ports::{BlobStore, Bridge, Catalog, Clock, JobSink, Kek, NntpConnector};
 use crate::recovery::{tombstone_id, write_tombstone, write_tombstones, NewTombstone};
-use crate::types::{Bucket, GenerationId, Precondition, RespBody, S3Request, S3Response, UnixMs};
+use crate::types::{
+    BridgeError, Bucket, GenerationId, Precondition, RespBody, S3Request, S3Response, UnixMs,
+};
 
 /// Most keys one DeleteObjects request may name (the S3 limit).
 pub const MAX_DELETE_KEYS: usize = 1000;
@@ -64,8 +66,18 @@ enum DeleteError {
     /// A replay of the recovery records is under way, or started while
     /// the delete ran: nothing was deleted.
     Refused,
-    /// The key took a newer id every time the delete was tried.
+    /// The key kept taking newer ids, or the PostgreSQL catalogue is busy.
     Busy,
+}
+
+impl From<BridgeError> for DeleteError {
+    fn from(error: BridgeError) -> Self {
+        if error.is_pg_overloaded() {
+            Self::Busy
+        } else {
+            Self::Internal
+        }
+    }
 }
 
 impl DeleteError {
@@ -184,7 +196,7 @@ async fn delete_key_once<
     bucket: &Bucket,
     key: &str,
 ) -> Result<bool, DeleteError> {
-    let failed = |_| DeleteError::Internal;
+    let failed = DeleteError::from;
     if bridge.catalog.restore_pending().await.map_err(failed)? {
         return Err(DeleteError::Refused);
     }
@@ -260,7 +272,7 @@ async fn commit_delete<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K
     tombstone: &GenerationId,
     now: UnixMs,
 ) -> Result<bool, DeleteError> {
-    let failed = |_| DeleteError::Internal;
+    let failed = DeleteError::from;
     let deleted = bridge
         .catalog
         .delete_object_before(&bucket.id, key, tombstone, now)
@@ -322,10 +334,11 @@ async fn delete_chunk<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K:
     match bridge.catalog.restore_pending().await {
         Ok(false) => {}
         Ok(true) => return all(DeleteError::Refused),
-        Err(_) => return all(DeleteError::Internal),
+        Err(error) => return all(error.into()),
     }
-    let Ok(heads) = bridge.catalog.key_heads(&bucket.id, keys).await else {
-        return all(DeleteError::Internal);
+    let heads = match bridge.catalog.key_heads(&bucket.id, keys).await {
+        Ok(heads) => heads,
+        Err(error) => return all(error.into()),
     };
     if heads.len() != keys.len() {
         return all(DeleteError::Internal);
@@ -373,9 +386,13 @@ async fn delete_chunk<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K:
     .await
     {
         Ok(stored) if stored.len() == tombstones.len() => stored,
-        _ => {
+        failed => {
+            let error = match failed {
+                Err(error) => error.into(),
+                Ok(_) => DeleteError::Internal,
+            };
             for (place, _) in places {
-                done[place] = Err(DeleteError::Internal);
+                done[place] = Err(error);
             }
             return done;
         }
@@ -391,7 +408,7 @@ async fn delete_chunk<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K:
         match stored {
             Ok(()) if live => batch.push((place, tombstone)),
             Ok(()) => alone.push((place, tombstone, false)),
-            Err(_) => done[place] = Err(DeleteError::Internal),
+            Err(error) => done[place] = Err(error.into()),
         }
     }
     if !batch.is_empty() {
@@ -409,6 +426,11 @@ async fn delete_chunk<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K:
             // Nothing was deleted: one key is held up (a newer id,
             // another delete, a replay). Each on its own from here.
             Ok(false) => alone.extend(batch.into_iter().map(|(p, t)| (p, t, false))),
+            Err(error) if error.is_pg_overloaded() => {
+                for (place, _) in batch {
+                    done[place] = Err(DeleteError::Busy);
+                }
+            }
             // No answer: the batch failed, or it was applied. The
             // tombstones are on record, so each key still gets its own
             // try under the tombstone it has, but no later attempt (see
@@ -531,7 +553,7 @@ async fn delete_key_if<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K
             .catalog
             .newest_id(&bucket.id, key)
             .await
-            .map_err(|_| internal())?
+            .map_err(catalog_error)?
         else {
             continue;
         };
@@ -543,7 +565,7 @@ async fn delete_key_if<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K
             .catalog
             .raise_floor(&bucket.id, key, &tombstone, false)
             .await
-            .map_err(|_| internal())?;
+            .map_err(catalog_error)?;
         check_precondition(bridge, &bucket.id, key, condition).await?;
         write_tombstone(
             &bridge.catalog,
@@ -556,12 +578,12 @@ async fn delete_key_if<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K
             now,
         )
         .await
-        .map_err(|_| internal())?;
+        .map_err(catalog_error)?;
         if bridge
             .catalog
             .delete_object_if(&bucket.id, key, &tombstone, condition, now)
             .await
-            .map_err(|_| internal())?
+            .map_err(catalog_error)?
         {
             return Ok(());
         }

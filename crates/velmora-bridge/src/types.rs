@@ -49,6 +49,14 @@ pub enum BridgeError {
     Invalid(&'static str),
 }
 
+impl BridgeError {
+    /// A classified PostgreSQL overload, not a guard refusal or an unknown
+    /// COMMIT outcome. Existing D1 error handling is unchanged.
+    pub fn is_pg_overloaded(&self) -> bool {
+        matches!(self, Self::Sql(class) if class == "pg: overloaded")
+    }
+}
+
 impl fmt::Display for BridgeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {

@@ -471,6 +471,8 @@ impl BlobStore for Blobs {
 pub struct FailSql {
     pub inner: RusqliteSql,
     pub fail_writes: Cell<bool>,
+    pub frozen: Cell<bool>,
+    pub frozen_write_attempts: Cell<u32>,
     /// Fails the next batch that publishes a generation, once.
     pub fail_publish: Cell<Option<PublishFault>>,
     fail_next_batch: Cell<bool>,
@@ -569,6 +571,10 @@ impl std::ops::Deref for FailSql {
 }
 
 impl Sql for FailSql {
+    fn is_frozen(&self) -> bool {
+        self.frozen.get()
+    }
+
     async fn query(&self, sql: &str, params: &[SqlValue]) -> Result<Vec<Row>> {
         self.over_budget()?;
         if self.refused(sql) {
@@ -580,6 +586,11 @@ impl Sql for FailSql {
             .await
     }
     async fn exec(&self, sql: &str, params: &[SqlValue]) -> Result<u64> {
+        if self.frozen.get() {
+            self.frozen_write_attempts
+                .set(self.frozen_write_attempts.get() + 1);
+            return Err(BridgeError::Sql("catalog: frozen".into()));
+        }
         self.over_budget()?;
         if self.fail_writes.get() || self.refused(sql) {
             return Err(BridgeError::Sql("database down".into()));
@@ -597,6 +608,11 @@ impl Sql for FailSql {
         call.await
     }
     async fn batch(&self, mut stmts: Vec<(&'static str, Vec<SqlValue>)>) -> Result<Vec<u64>> {
+        if self.frozen.get() && !stmts.is_empty() {
+            self.frozen_write_attempts
+                .set(self.frozen_write_attempts.get() + 1);
+            return Err(BridgeError::Sql("catalog: frozen".into()));
+        }
         self.over_budget()?;
         if self.fail_writes.get() {
             return Err(BridgeError::Sql("database down".into()));
@@ -726,6 +742,8 @@ pub fn rig_with_budget<N: NntpConnector + 'static>(
                 trip: trip.clone(),
                 inner: RusqliteSql::with_schema().unwrap(),
                 fail_writes: Cell::new(false),
+                frozen: Cell::new(false),
+                frozen_write_attempts: Cell::new(0),
                 fail_publish: Cell::new(None),
                 fail_next_batch: Cell::new(false),
                 fail_matching: RefCell::new(None),

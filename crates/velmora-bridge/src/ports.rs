@@ -48,8 +48,25 @@ pub enum SqlValue {
 /// One result row, columns in statement order.
 pub type Row = Vec<SqlValue>;
 
+/// The SQL dialect used by a catalogue adapter.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Dialect {
+    Sqlite,
+    Postgres,
+}
+
+impl Dialect {
+    /// Select the engine-specific text where a statement is not portable.
+    pub const fn pick(self, sqlite: &'static str, pg: &'static str) -> &'static str {
+        match self {
+            Self::Sqlite => sqlite,
+            Self::Postgres => pg,
+        }
+    }
+}
+
 /// The catalogue database: D1 (`workers/s3-bridge/src/d1.rs`), rusqlite
-/// (`testkit`), later Hyperdrive.
+/// (`testkit`), or Postgres.
 ///
 /// `batch` is all-or-nothing. A `tx_guard` CHECK failure is
 /// `Err(BridgeError::GuardFailed)` (DESIGN §A.11); any other failing
@@ -82,6 +99,13 @@ pub trait Sql {
     /// writes such a figure down itself.
     fn limits(&self) -> SqlLimits {
         SqlLimits::D1
+    }
+    fn dialect(&self) -> Dialect {
+        Dialect::Sqlite
+    }
+    /// This backend refuses mutations for the duration of a cutover freeze.
+    fn is_frozen(&self) -> bool {
+        false
     }
 }
 
@@ -663,6 +687,9 @@ pub enum PublishOutcome {
     /// outcome and the upload was then moved to its next revision: the
     /// batch had not applied, and its guard can never pass again.
     Fenced(Unpublished),
+    /// CompleteMultipartUpload only. Fenced as above; the publication
+    /// failure was PostgreSQL overload and should be rendered as SlowDown.
+    FencedOverloaded(Unpublished),
 }
 
 // Fenced methods return Ok(false) (or None) when the lease token no longer
@@ -683,6 +710,12 @@ pub struct KeyHead {
 
 /// The catalogue, implemented once: `sql::SqlCatalog<S: Sql>`.
 pub trait Catalog {
+    /// This catalogue is frozen. Check before starting operations whose
+    /// side effects must not outlive a refused catalogue mutation.
+    fn is_frozen(&self) -> bool {
+        false
+    }
+
     // admin + auth
     /// `Lost` = name taken.
     async fn create_bucket(&self, b: &Bucket) -> Result<Guard<()>>;
