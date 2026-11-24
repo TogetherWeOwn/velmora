@@ -46,6 +46,20 @@ impl Prepared {
         client: &Client,
         collect_rows: bool,
     ) -> core::result::Result<Reply, tokio_postgres::Error> {
+        #[cfg(test)]
+        if self.statement.text == REJECT_BIND_SQL {
+            use tokio_postgres::types::{ToSql, Type};
+            let invalid = (&RejectBind as &(dyn ToSql + Sync), Type::INT8);
+            // Fail in the real driver's pre-enqueue encoder, not a mock
+            // future. All normally prepared catalogue values are infallible.
+            return client
+                .query_typed(&self.statement.text, &[invalid])
+                .await
+                .map(|_| Reply {
+                    rows: Vec::new(),
+                    changed: None,
+                });
+        }
         let mut stream = pin!(
             client
                 .query_typed_raw(&self.statement.text, self.values.typed())
@@ -63,6 +77,30 @@ impl Prepared {
             .map(|count| if self.statement.select { 0 } else { count });
         Ok(Reply { rows, changed })
     }
+}
+
+#[cfg(test)]
+pub(super) const REJECT_BIND_SQL: &str = "SELECT $1::bigint /* test: reject this bind */";
+
+#[cfg(test)]
+#[derive(Debug)]
+struct RejectBind;
+
+#[cfg(test)]
+impl tokio_postgres::types::ToSql for RejectBind {
+    fn to_sql(
+        &self,
+        _: &tokio_postgres::types::Type,
+        _: &mut bytes::BytesMut,
+    ) -> core::result::Result<tokio_postgres::types::IsNull, Box<dyn std::error::Error + Send + Sync>>
+    {
+        Err(std::io::Error::other("injected encode failure").into())
+    }
+
+    fn accepts(_: &tokio_postgres::types::Type) -> bool {
+        true
+    }
+    tokio_postgres::types::to_sql_checked!();
 }
 
 pub(super) struct Reply {

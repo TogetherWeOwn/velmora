@@ -8,6 +8,8 @@ mod registry;
 #[cfg(test)]
 mod tests;
 mod value;
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod wire_tests;
 
 use crate::{Dialect, Result, Row, Sql, SqlValue};
 use batch::Prepared;
