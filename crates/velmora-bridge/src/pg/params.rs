@@ -6,7 +6,6 @@ pub(crate) enum Kind {
     Write,
 }
 
-#[allow(dead_code)]
 pub(crate) struct Statement {
     pub text: String,
     pub kind: Kind,
@@ -44,11 +43,36 @@ fn quoted(bytes: &[u8], mut i: usize, escape: bool) -> Result<usize> {
     Err(untranslated())
 }
 
+fn writes_or_locks(token: &str) -> bool {
+    matches!(
+        token,
+        "INSERT"
+            | "UPDATE"
+            | "DELETE"
+            | "MERGE"
+            | "NEXTVAL"
+            | "SETVAL"
+            | "INTO"
+            | "SHARE"
+            | "SET_CONFIG"
+    ) || token.starts_with("PG_ADVISORY_")
+        || token.starts_with("PG_TRY_ADVISORY_")
+}
+
+pub(crate) fn statement(sql: &str) -> Result<Statement> {
+    scan(sql, true)
+}
+
+pub(crate) fn is_read_only(sql: &str) -> bool {
+    scan(sql, false).is_ok_and(|s| s.kind == Kind::Read)
+}
+
 /// Translate bind markers, not SQL semantics. Tokenize code separately from
 /// strings, identifiers and comments for both dialect refusal and routing.
-// Part of the first adapter milestone; consumed by PgSql in its next commit.
-#[allow(dead_code)]
-pub(crate) fn statement(sql: &str) -> Result<Statement> {
+fn scan(sql: &str, postgres: bool) -> Result<Statement> {
+    if sql.as_bytes().contains(&0) {
+        return Err(untranslated());
+    }
     let bytes = sql.as_bytes();
     let mut text = String::with_capacity(sql.len());
     let (mut i, mut depth, mut ordinal) = (0, 0_usize, 0_usize);
@@ -88,19 +112,27 @@ pub(crate) fn statement(sql: &str) -> Result<Statement> {
                 }
             }
             _ if ended => return Err(untranslated()),
-            b'\'' | b'"' => {
-                i = quoted(bytes, i, escape)?;
+            b'\'' => {
+                i = quoted(bytes, i, escape && postgres)?;
                 previous.clear();
+            }
+            b'"' => {
+                i = quoted(bytes, i, false)?;
+                let token = sql[start + 1..i - 1].to_ascii_uppercase();
+                writes |= writes_or_locks(&token);
+                previous = token;
             }
             b';' => {
                 ended = true;
                 i += 1;
             }
             b'(' => {
-                if matches!(
-                    previous.as_str(),
-                    "JSON_OBJECT" | "TYPEOF" | "QUOTE" | "INSTR" | "PRINTF" | "STRFTIME"
-                ) {
+                if postgres
+                    && matches!(
+                        previous.as_str(),
+                        "JSON_OBJECT" | "TYPEOF" | "QUOTE" | "INSTR" | "PRINTF" | "STRFTIME"
+                    )
+                {
                     return Err(untranslated());
                 }
                 depth += 1;
@@ -156,28 +188,20 @@ pub(crate) fn statement(sql: &str) -> Result<Statement> {
                     i += 1;
                 }
                 let token = sql[start..i].to_ascii_uppercase();
-                if matches!(
-                    token.as_str(),
-                    "JSON_EACH" | "JSON_EXTRACT" | "ROWID" | "GLOB" | "SQLITE_MASTER"
-                ) || matches!(
-                    (previous.as_str(), token.as_str()),
-                    ("OR", "IGNORE" | "REPLACE") | ("INDEXED", "BY")
-                ) {
+                if postgres
+                    && (matches!(
+                        token.as_str(),
+                        "JSON_EACH" | "JSON_EXTRACT" | "ROWID" | "GLOB" | "SQLITE_MASTER"
+                    ) || matches!(
+                        (previous.as_str(), token.as_str()),
+                        ("OR", "IGNORE" | "REPLACE") | ("INDEXED", "BY")
+                    ))
+                {
                     return Err(untranslated());
                 }
                 escape_quote = token == "E" && bytes.get(i) == Some(&b'\'');
                 let dml = matches!(token.as_str(), "INSERT" | "UPDATE" | "DELETE" | "MERGE");
-                writes |= dml
-                    || matches!(
-                        token.as_str(),
-                        "NEXTVAL"
-                            | "SETVAL"
-                            | "INTO"
-                            | "SHARE"
-                            | "SET_CONFIG"
-                            | "PG_ADVISORY_LOCK"
-                            | "PG_ADVISORY_XACT_LOCK"
-                    );
+                writes |= writes_or_locks(&token);
                 if depth == 0 && command.is_none() {
                     if dml || token == "SELECT" {
                         command = Some(token == "SELECT");
