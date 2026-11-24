@@ -49,22 +49,11 @@ pub struct Kit {
 
 impl Kit {
     pub fn open(root: &Path) -> Result<Self, &'static str> {
-        let read = |path, limit| -> Result<Vec<u8>, &'static str> {
-            let mut bytes = Vec::new();
-            open(root, path)?
-                .take(limit + 1)
-                .read_to_end(&mut bytes)
-                .map_err(|_| INVALID)?;
-            if bytes.len() as u64 > limit {
-                return Err(INVALID);
-            }
-            Ok(bytes)
-        };
         if !fs::symlink_metadata(root).map_err(|_| INVALID)?.is_dir() {
             return Err(INVALID);
         }
-        let bytes = read(MANIFEST, MAX_MANIFEST)?;
-        let digest = read("manifest.json.sha256", MAX_MANIFEST_CHECKSUM)?;
+        let bytes = read_bounded(open(root, MANIFEST)?, MAX_MANIFEST)?;
+        let digest = read_bounded(open(root, "manifest.json.sha256")?, MAX_MANIFEST_CHECKSUM)?;
         let expected = manifest_checksum(&digest).ok_or(INVALID)?;
         if <[u8; 32]>::from(Sha256::digest(&bytes)) != expected {
             return Err("kit manifest SHA-256 mismatch");
@@ -174,6 +163,18 @@ impl Kit {
             .map_err(|_| "kit record pack does not match authenticated index")?;
         Ok(())
     }
+}
+
+fn read_bounded(reader: impl Read, limit: u64) -> Result<Vec<u8>, &'static str> {
+    let mut bytes = Vec::new();
+    reader
+        .take(limit + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| INVALID)?;
+    if bytes.len() as u64 > limit {
+        return Err(INVALID);
+    }
+    Ok(bytes)
 }
 
 fn manifest_checksum(input: &[u8]) -> Option<[u8; 32]> {
@@ -350,4 +351,19 @@ fn open(root: &Path, name: &str) -> Result<File, &'static str> {
         }
     }
     File::open(path).map_err(|_| "kit file is missing or unreadable")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn oversized_manifest_checksum_read_stops_at_the_first_excess_byte() {
+        let mut input = io::Cursor::new([b' '; 4096]);
+        assert_eq!(
+            read_bounded(&mut input, MAX_MANIFEST_CHECKSUM),
+            Err(INVALID)
+        );
+        assert_eq!(input.position(), 81);
+    }
 }
