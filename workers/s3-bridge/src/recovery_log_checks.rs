@@ -84,8 +84,19 @@ fn refused_and_error_job_rows_append_without_a_deduplication_key() {
             refused: 5,
             failed: 9,
             records: 10,
+            plan_blocked: 2,
             ..Default::default()
         }),
+        timing: velmora_bridge::copy::JobTiming {
+            job_ms: 100,
+            plan_checks: 6,
+            plan_ms: 70,
+            generation_reads: 6,
+            generation_writes: 4,
+            generation_ms: 20,
+            queue_sends: 1,
+            queue_ms: 10,
+        },
         ..Default::default()
     };
     ready(log(10).job(&db, &report, report.problems())).unwrap();
@@ -112,6 +123,20 @@ fn refused_and_error_job_rows_append_without_a_deduplication_key() {
     };
     let detail: serde_json::Value = serde_json::from_str(detail).unwrap();
     assert_eq!(detail["counts"]["failed"], 9);
+    assert_eq!(detail["counts"]["plan_blocked"], 2);
+    assert_eq!(
+        detail["timing"],
+        serde_json::json!({
+            "job_ms": 100,
+            "plan_checks": 6,
+            "plan_ms": 70,
+            "generation_reads": 6,
+            "generation_writes": 4,
+            "generation_ms": 20,
+            "queue_sends": 1,
+            "queue_ms": 10,
+        })
+    );
     assert_eq!(detail["destination"], "0123456789abcdef");
     assert!(rows[1..]
         .iter()

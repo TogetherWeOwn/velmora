@@ -15,10 +15,10 @@ use sha2::{Digest, Sha256};
 use velmora::rng::SystemRng;
 use velmora_bridge::config::{ConfigError, Maintenance};
 use velmora_bridge::copy::{
-    pass_due, plan_hint, Copier, CopyCounts, StepError, BEGAN_KEY, DOWN_KEY, FRESH_MS,
-    HINT_PAUSE_MS, HINT_RETRY_MS, HINT_RETRY_SECS, JOB_COPIES, MIN_AGE_MS, PASS_INTERVAL_MS,
-    RETRY_WINDOW_MS, STORE_KEY, SWEEP_KEY, SWEEP_MS, SWEEP_RECORDS, SWEEP_RETRY_MS, SWEPT_KEY,
-    WALKED_KEY, WALK_INTERVAL_MS, WALK_KEY, WALK_SOON_MS, WANT_KEY,
+    pass_due, plan_hint, Copier, CopyCounts, StepError, BEGAN_KEY, CONCURRENCY, DOWN_KEY, FRESH_MS,
+    HINT_PAUSE_MS, HINT_RETRY_MS, HINT_RETRY_SECS, JOB_COPIES, JOB_MS, MIN_AGE_MS,
+    PASS_INTERVAL_MS, RETRY_WINDOW_MS, STORE_KEY, SWEEP_KEY, SWEEP_MS, SWEEP_RECORDS,
+    SWEEP_RETRY_MS, SWEPT_KEY, WALKED_KEY, WALK_INTERVAL_MS, WALK_KEY, WALK_SOON_MS, WANT_KEY,
 };
 use velmora_bridge::crypto::seal_manifest;
 use velmora_bridge::remote::{
@@ -626,6 +626,8 @@ async fn audit_samples_newest_settled_records_and_old_keys_with_bounded_requests
 // The fake store
 // ---------------------------------------------------------------------------
 
+type PlanContents = Vec<(String, Vec<u8>)>;
+
 #[derive(Default)]
 struct FakeE2 {
     /// The store's own time: a pause moves it, and a request signed for
@@ -663,6 +665,17 @@ struct FakeE2 {
     put_answer: RefCell<Option<HttpResponse>>,
     get_answer: RefCell<Option<HttpResponse>>,
     problems: RefCell<Vec<velmora_bridge::remote::Problem>>,
+    /// Virtual transport latency; overlapping requests share clock time.
+    timed: Cell<bool>,
+    /// For tests with a fixed time per request, independent of clock reads.
+    request_ms: Cell<i64>,
+    in_flight: Cell<usize>,
+    peak_in_flight: Cell<usize>,
+    plans_in_flight: Cell<usize>,
+    peak_plans_in_flight: Cell<usize>,
+    /// Required plan bytes at the instant a generation PUT arrives.
+    generation_plans: RefCell<BTreeMap<String, PlanContents>>,
+    confirmed_plans: RefCell<BTreeMap<String, Vec<u8>>>,
 }
 
 fn unescape(s: &str) -> String {
@@ -870,6 +883,51 @@ impl HttpSend for &FakeE2 {
             target.strip_prefix(ROOT).expect("bucket and prefix")
         };
         self.log.borrow_mut().push(format!("{method} {key}"));
+        if method == "PUT" {
+            if let Some(plans) = self.generation_plans.borrow().get(key) {
+                for (key, expected) in plans {
+                    assert!(
+                        self.get(key).as_ref() == Some(expected)
+                            && self.confirmed_plans.borrow().get(key) == Some(expected),
+                        "generation PUT before its plan was confirmed"
+                    );
+                }
+            }
+        }
+        if self.timed.get() {
+            let plan = key.starts_with("m/art/");
+            let ms = if list {
+                10
+            } else if plan {
+                360
+            } else {
+                40
+            };
+            let clock = self.clock.as_ref().unwrap();
+            let ready = clock.now().0 + ms;
+            self.in_flight.set(self.in_flight.get() + 1);
+            self.peak_in_flight
+                .set(self.peak_in_flight.get().max(self.in_flight.get()));
+            if plan {
+                self.plans_in_flight.set(self.plans_in_flight.get() + 1);
+                self.peak_plans_in_flight.set(
+                    self.peak_plans_in_flight
+                        .get()
+                        .max(self.plans_in_flight.get()),
+                );
+            }
+            tokio::task::yield_now().await;
+            clock.set(UnixMs(clock.now().0.max(ready)));
+            self.in_flight.set(self.in_flight.get() - 1);
+            if plan {
+                self.plans_in_flight.set(self.plans_in_flight.get() - 1);
+            }
+        } else if self.request_ms.get() != 0 {
+            self.clock
+                .as_ref()
+                .unwrap()
+                .advance_ms(self.request_ms.get());
+        }
         if self.drop_next.get() > 0 {
             self.drop_next.set(self.drop_next.get() - 1);
             return Err(TransportError::NoAnswer);
@@ -907,17 +965,23 @@ impl HttpSend for &FakeE2 {
             if let Some(forced) = self.head_answer.borrow().as_ref() {
                 return Ok(forced.clone());
             }
-            return match self.get(key) {
-                None => answer(404),
-                Some(bytes) => Ok(HttpResponse {
-                    status: 200,
-                    headers: vec![
-                        ("content-length".into(), bytes.len().to_string()),
-                        ("etag".into(), format!("\"{}\"", md5_hex(&bytes))),
-                    ],
-                    body: vec![],
-                }),
+            let Some(bytes) = self.get(key) else {
+                return answer(404);
             };
+            let response = HttpResponse {
+                status: 200,
+                headers: vec![
+                    ("content-length".into(), bytes.len().to_string()),
+                    ("etag".into(), format!("\"{}\"", md5_hex(&bytes))),
+                ],
+                body: vec![],
+            };
+            if key.starts_with("m/art/") && !self.generation_plans.borrow().is_empty() {
+                self.confirmed_plans
+                    .borrow_mut()
+                    .insert(key.to_owned(), bytes);
+            }
+            return Ok(response);
         }
         if let Some(forced) = self.put_answer.borrow().as_ref() {
             return Ok(forced.clone());
@@ -995,12 +1059,21 @@ struct World {
 
 impl World {
     fn new() -> World {
+        Self::with_parallel_fresh(false)
+    }
+
+    fn with_parallel_fresh(parallel: bool) -> World {
         let clock = FixedClock::new(UnixMs(NOW));
         let e2: &'static FakeE2 = Box::leak(Box::new(FakeE2 {
             clock: Some(clock.clone()),
             ..FakeE2::default()
         }));
-        let cfg = RemoteConfig::from_vars(vars).unwrap().unwrap();
+        let cfg = RemoteConfig::from_vars(|name| match name {
+            "RECOVERY_COPY_PARALLEL_FRESH" if parallel => Some("on".into()),
+            _ => vars(name),
+        })
+        .unwrap()
+        .unwrap();
         World {
             safety: MemBlobStore::new(),
             kek: TestKek::new(),
@@ -1096,6 +1169,149 @@ const FRESH: [&str; 4] = [
     "m/x/t_0000000000000000/del/g_",
     "m/x/t_0000000000000000/g_",
 ];
+
+struct TimedQueue<'a>(&'a World);
+
+impl JobSink for TimedQueue<'_> {
+    async fn send(&self, job: &Job, delay_secs: u32) -> Result<()> {
+        self.0.clock.advance_ms(80);
+        self.0.jobs.send(job, delay_secs).await
+    }
+
+    async fn send_many(&self, _: &[Job]) -> Result<()> {
+        unreachable!()
+    }
+}
+
+async fn fresh_job_fixture(parallel: bool) -> World {
+    let w = World::with_parallel_fresh(parallel);
+    w.e2.timed.set(true);
+    for i in 0..240 {
+        let id = format!("x_{i:04}");
+        let plan = format!("m/art/{id}");
+        let bytes = w.record(&plan, b"plan").await;
+        w.e2.set(&plan, &bytes);
+        w.generation(&generation(2 * MIN_AGE_MS, &format!("_{i:04}")), &[&id])
+            .await;
+    }
+    w
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn fresh_job_reports_where_its_budget_went() {
+    let w = fresh_job_fixture(false).await;
+    let (outcome, report) = w
+        .copier()
+        .run_job_report(&TimedQueue(&w), UnixMs(NOW), &sweep("m/g_"))
+        .await;
+    assert_eq!(outcome, JobOutcome::Ack);
+    assert_eq!(report.error, None);
+    assert_eq!(w.jobs.take().len(), 1, "one successor");
+    let timing = report.timing;
+    let copied = report.counts.unwrap().copied;
+    println!("serial fresh e2 fixture: {copied} generations; {timing:?}");
+    assert!(timing.plan_ms > timing.job_ms * 8 / 10, "{timing:?}");
+    assert_eq!(timing.generation_writes, copied);
+    assert_eq!(timing.plan_checks, copied);
+    assert!(timing.generation_ms > 0);
+    assert_eq!((timing.queue_sends, timing.queue_ms), (1, 80));
+    assert!((20_000..21_000).contains(&timing.job_ms), "{timing:?}");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn parallel_fresh_doubles_records_at_the_same_job_budget() {
+    let mut records = [0; 2];
+    for (i, parallel) in [false, true].into_iter().enumerate() {
+        let w = fresh_job_fixture(parallel).await;
+        let (outcome, report) = w
+            .copier()
+            .run_job_report(&TimedQueue(&w), UnixMs(NOW), &sweep("m/g_"))
+            .await;
+        assert_eq!((outcome, report.error), (JobOutcome::Ack, None));
+        assert_eq!(w.jobs.take().len(), 1);
+        records[i] = report.counts.unwrap().copied;
+        let t = report.timing;
+        println!("parallel={parallel}: {} generations; {t:?}", records[i]);
+        assert!(t.plan_checks + t.generation_reads <= JOB_COPIES as u64);
+        // The serial job finishes its in-flight batch and hands off at the bound.
+        assert!(t.job_ms <= JOB_MS as u64 + 300);
+        assert_eq!(
+            w.e2.peak_plans_in_flight.get(),
+            if parallel { CONCURRENCY } else { 1 }
+        );
+        assert!(w.e2.peak_in_flight.get() <= CONCURRENCY);
+    }
+    assert!(records[1] >= 2 * records[0], "before/after: {records:?}");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn parallel_fresh_never_publishes_before_plans_even_when_one_put_fails() {
+    let w = World::with_parallel_fresh(true);
+    w.e2.timed.set(true);
+    // Measure the sweep only, without the historical walk's independent retry.
+    w.raw(STORE_KEY, w.remote.place().into_bytes()).await;
+    w.raw(WALKED_KEY, NOW.to_string().into_bytes()).await;
+    let mut generations = Vec::new();
+    for i in 0..6 {
+        let key = generation(2 * MIN_AGE_MS, &format!("_{i:02}"));
+        let ids = [format!("x_{i}_0"), format!("x_{i}_1")];
+        let mut plans = Vec::new();
+        for id in &ids {
+            let plan_key = format!("m/art/{id}");
+            let sealed = w.record(&plan_key, b"plan").await;
+            plans.push((plan_key, sealed));
+        }
+        w.generation(&key, &[&ids[0], &ids[1]]).await;
+        w.e2.generation_plans
+            .borrow_mut()
+            .insert(key.clone(), plans);
+        generations.push(key);
+    }
+    w.e2.put_500_keys.borrow_mut().push("m/art/x_2_1".into());
+    let step = w.copier().step(UnixMs(NOW), &sweep("m/g_")).await.unwrap();
+    assert!(!step.outage);
+    assert_eq!(
+        (
+            step.counts.pending,
+            step.counts.plan_blocked,
+            step.counts.failed
+        ),
+        (1, 1, 1)
+    );
+    assert_eq!(w.e2.peak_plans_in_flight.get(), CONCURRENCY);
+    for (i, key) in generations.iter().enumerate() {
+        assert_eq!(w.e2.get(key).is_some(), i != 2);
+    }
+    assert!(w.e2.get("m/art/x_2_0").is_some());
+    assert!(w.e2.get("m/art/x_2_1").is_none());
+
+    w.e2.put_500_keys.borrow_mut().clear();
+    w.clock.set(UnixMs(NOW + PASS_INTERVAL_MS));
+    w.copier()
+        .step(w.clock.now(), &sweep("m/g_"))
+        .await
+        .unwrap();
+    assert!(
+        w.e2.get(&generations[2]).is_some(),
+        "a later pass retries the held generation"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn parallel_fresh_holds_last_pass_generation_without_a_plan() {
+    let w = World::with_parallel_fresh(true);
+    let key = generation(FRESH_MS - PASS_INTERVAL_MS + 1, "_last");
+    w.generation(&key, &["x_missing"]).await;
+    let next = generation(2 * MIN_AGE_MS, "_ready");
+    w.generation(&next, &[]).await;
+    let step = w.copier().step(UnixMs(NOW), &sweep("m/g_")).await.unwrap();
+    assert_eq!((step.counts.pending, step.counts.plan_blocked), (1, 1));
+    assert!(
+        w.e2.get(&key).is_none(),
+        "last fresh pass cannot bypass the plan gate"
+    );
+    assert!(w.e2.get(&next).is_some());
+}
 
 /// Older than the fresh sweep reaches: a record of the walk.
 const OLD: i64 = 2 * 3_600_000;
@@ -2707,14 +2923,8 @@ async fn a_backfill_longer_than_a_pass_reaches_every_key_and_new_ones_first() {
         w.record(&format!("m/g_{id}"), b"old").await;
     }
     w.e2.page.set(1);
-    let clock = TickClock(w.clock.clone());
-    let copier = Copier {
-        safety: &w.safety,
-        kek: &w.kek,
-        clock: &clock,
-        remote: &w.remote,
-        maintenance: Maintenance::Off,
-    };
+    w.e2.request_ms.set(1_000);
+    let copier = w.copier();
     let old: Vec<String> = w.safety.keys();
     assert_eq!(old.len(), OLD_RECORDS);
     let behind = |e2: &FakeE2| old.iter().filter(|k| e2.get(k).is_none()).count();
@@ -2751,7 +2961,11 @@ async fn a_backfill_longer_than_a_pass_reaches_every_key_and_new_ones_first() {
             assert_eq!((outcome, why), (JobOutcome::Ack, None), "pass {n}");
             jobs += 1;
         }
-        assert!(jobs > 1);
+        assert!(jobs > 0, "pass {n} did not run");
+        // Once the backfill is complete, only the sweep has work to do.
+        if left.last() != Some(&0) {
+            assert!(jobs > 1, "pass {n} had a backfill to continue");
+        }
         // The pass ended, or the next one is due: never much later.
         let now = w.clock.now().0;
         assert!(now < start.0 + PASS_INTERVAL_MS + 60_000, "pass {n}");
@@ -2852,7 +3066,16 @@ async fn a_generation_record_held_back_is_copied_by_the_walk_once_old() {
 /// there, no plan is sent twice, and the record goes last.
 #[tokio::test(flavor = "current_thread")]
 async fn a_generation_record_with_more_plans_than_a_job_takes_several() {
-    let w = World::new();
+    check_generation_plan_resume(false).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn parallel_fresh_retains_the_first_unfinished_generation_in_the_cursor() {
+    check_generation_plan_resume(true).await;
+}
+
+async fn check_generation_plan_resume(parallel: bool) {
+    let w = World::with_parallel_fresh(parallel);
     let ids: Vec<String> = (0..600).map(|i| format!("x_{i:04}")).collect();
     for id in &ids {
         w.record(&format!("m/art/{id}"), b"plan").await;
@@ -3329,14 +3552,8 @@ async fn a_record_larger_than_a_sweep_is_finished_over_passes_and_the_walk_goes_
     w.generation(&key, &names).await;
     let tombstone = format!("m/del/g_{:013x}_t", NOW - 180_000);
     w.record(&tombstone, b"gone").await;
-    let clock = TickClock(w.clock.clone());
-    let copier = Copier {
-        safety: &w.safety,
-        kek: &w.kek,
-        clock: &clock,
-        remote: &w.remote,
-        maintenance: Maintenance::Off,
-    };
+    w.e2.request_ms.set(1_000);
+    let copier = w.copier();
     let there = |prefix: &str| {
         let objects = w.e2.objects.borrow();
         objects.keys().filter(|k| k.starts_with(prefix)).count()
@@ -5824,7 +6041,16 @@ async fn a_segmented_record_that_takes_several_jobs_is_sent_once() {
 /// several jobs, no plan and no segment twice, and the head last.
 #[tokio::test(flavor = "current_thread")]
 async fn a_segmented_record_with_more_plans_than_a_job_takes_several() {
-    let w = World::new();
+    check_segmented_generation_plan_resume(false).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn parallel_fresh_resumes_segmented_plans_and_sends_the_head_last() {
+    check_segmented_generation_plan_resume(true).await;
+}
+
+async fn check_segmented_generation_plan_resume(parallel: bool) {
+    let w = World::with_parallel_fresh(parallel);
     let key = generation(600_000, "_a");
     let sealed = w.segmented(&key, 600, 64, true).await;
     assert_eq!(sealed.segments.len(), 10);

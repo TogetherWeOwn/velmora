@@ -32,6 +32,15 @@ impl Log {
         }
     }
 
+    fn detail(&self, counts: serde_json::Value) -> serde_json::Value {
+        let first = self.first.map(|p| {
+            serde_json::json!({
+                "op": p.operation, "kind": p.kind, "status": p.status, "code": p.code,
+            })
+        });
+        serde_json::json!({ "destination": self.destination, "counts": counts, "first": first })
+    }
+
     async fn insert(
         &self,
         db: &impl Sql,
@@ -39,14 +48,8 @@ impl Log {
         swept: bool,
         problems: u64,
         checked: u64,
-        counts: serde_json::Value,
+        detail: serde_json::Value,
     ) -> Result<()> {
-        let first = self.first.map(|p| {
-            serde_json::json!({
-                "op": p.operation, "kind": p.kind, "status": p.status, "code": p.code,
-            })
-        });
-        let detail = serde_json::json!({ "destination": self.destination, "counts": counts, "first": first });
         db.exec(
             INSERT,
             &[
@@ -68,19 +71,21 @@ impl Log {
             return Ok(());
         }
         let checked = report.counts.as_ref().map_or(0, |c| c.records);
+        let mut detail = self.detail(serde_json::json!(report.counts));
+        detail["timing"] = serde_json::json!(report.timing);
         let job = self
-            .insert(
-                db,
-                "job",
-                report.swept,
-                problems,
-                checked,
-                serde_json::json!(report.counts),
-            )
+            .insert(db, "job", report.swept, problems, checked, detail)
             .await;
         if report.walk_ended {
             let walk = self
-                .insert(db, "walk", false, 0, 0, serde_json::Value::Null)
+                .insert(
+                    db,
+                    "walk",
+                    false,
+                    0,
+                    0,
+                    self.detail(serde_json::Value::Null),
+                )
                 .await;
             return job.and(walk);
         }
@@ -94,7 +99,7 @@ impl Log {
             false,
             counts.problems(),
             counts.checked,
-            serde_json::json!(counts),
+            self.detail(serde_json::json!(counts)),
         )
         .await
     }
