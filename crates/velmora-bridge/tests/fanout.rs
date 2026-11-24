@@ -355,19 +355,27 @@ async fn frozen_parent_refuses_a_cold_extent_in_the_last_subrange() {
 }
 
 #[tokio::test]
-async fn frozen_child_refuses_a_cache_miss_after_parent_preflight() {
+async fn frozen_child_uses_safety_or_refuses_without_writes_after_parent_preflight() {
     for (chunk, evict) in [(SLICE, 0), (CHUNK, 2)] {
-        let (rig, signer, _, extents) = frozen_fixture(chunk).await;
+        let (rig, signer, data, extents) = frozen_fixture(chunk).await;
         let (_, _, fan) = fanout_of(front(&rig, &signer, "big", &[]).await);
         // R2 lifecycle expiry or an out-of-band delete can race the
         // parent's HEAD and the child's read, even while SQL is frozen.
-        // Leave the safety copy present to catch a fallback in either
-        // the one-extent read or the multi-extent child preflight.
         let id = &extents[evict].id;
         rig.bridge
             .cache
             .inner
             .delete(&id.cache_key())
+            .await
+            .unwrap();
+        let pipe = Loopback::new(&rig);
+        drive(&fan, &pipe).await.unwrap();
+        assert_eq!(*pipe.out.borrow(), data);
+
+        rig.bridge
+            .safety
+            .inner
+            .delete(&id.safety_key())
             .await
             .unwrap();
         let pipe = Loopback::new(&rig);
@@ -397,7 +405,68 @@ async fn frozen_parent_refuses_an_over_budget_plan_before_probing() {
 }
 
 #[tokio::test]
-async fn frozen_parent_requires_cache_but_only_for_requested_extents() {
+async fn frozen_parent_refuses_when_only_a_child_exceeds_its_budget() {
+    const EXTENT_BYTES: u64 = 16;
+    // Up to two HEADs and four GETs per extent (cache, safety and
+    // a possible re-read). 1,583 aligned extents fit; a one-byte
+    // shift touches 1,584, so that child could need 9,504 calls.
+    const CHILD_BYTES: u64 = 1_583 * EXTENT_BYTES;
+    let mut rig = fan_rig(Some(CHILD_BYTES));
+    let cfg = &mut Rc::get_mut(&mut rig.bridge).unwrap().cfg;
+    cfg.slice_bytes = EXTENT_BYTES;
+    cfg.max_put_bytes = CHILD_BYTES + 2 * EXTENT_BYTES;
+    let (bucket, signer) = rig.standard(BUCKET).await;
+    let data = pattern(7, (CHILD_BYTES + 2 * EXTENT_BYTES) as usize);
+    rig.put(&signer, BUCKET, "big", &data).await.expect(200);
+    // The front's 3,170 HEADs, two children and 1,024 retries fit.
+    let count = warm_and_freeze(&rig, &bucket).await.len();
+    assert_eq!(count, 1_585);
+    let cache_calls = rig.bridge.cache.trip.calls();
+    assert_frozen_refusal(front(&rig, &signer, "big", &[("range", "bytes=1-")]).await);
+    assert_eq!(rig.bridge.cache.trip.calls(), cache_calls);
+    assert_no_frozen_writes(&rig);
+
+    // The same extents fit when the range starts on a child boundary.
+    let (status, _, fan) = fanout_of(front(&rig, &signer, "big", &[]).await);
+    assert_eq!(status, 200);
+    assert_eq!(fan.count(), 2);
+}
+
+#[tokio::test]
+async fn frozen_parent_refuses_a_huge_range_before_looking_up_extents() {
+    let rig = fan_rig(Some(1 << 30));
+    let (bucket, signer) = rig.standard(BUCKET).await;
+    rig.put(&signer, BUCKET, "big", b"fixture")
+        .await
+        .expect(200);
+    let (generation, _) = rig.live(&bucket, "big").await.unwrap();
+    // A 1 TiB object would need at least 65,536 full 16 MiB extents.
+    // Only the generation metadata is needed to refuse it; do not
+    // allocate that many fixtures or give the catalogue that query.
+    let sql = &rig.bridge.catalog.sql;
+    sql.with_conn(|conn| {
+        conn.execute(
+            "UPDATE generations SET size = ?1 WHERE id = ?2",
+            rusqlite::params![1i64 << 40, generation.id.as_str()],
+        )
+        .unwrap();
+    });
+    sql.frozen.set(true);
+    rig.bridge.cache.frozen.set(true);
+    rig.bridge.safety.frozen.set(true);
+    let before = sql.read_stats().queries;
+    rig.head(&signer, BUCKET, "big").await.expect(200);
+    let metadata_queries = sql.read_stats().queries - before;
+    let before = sql.read_stats().queries;
+    let cache_calls = rig.bridge.cache.trip.calls();
+    assert_frozen_refusal(front(&rig, &signer, "big", &[]).await);
+    assert_eq!(sql.read_stats().queries - before, metadata_queries);
+    assert_eq!(rig.bridge.cache.trip.calls(), cache_calls);
+    assert_no_frozen_writes(&rig);
+}
+
+#[tokio::test]
+async fn frozen_parent_accepts_safety_and_checks_only_requested_extents() {
     let (rig, signer, data, extents) = frozen_fixture(CHUNK).await;
     let id = &extents.last().unwrap().id;
     rig.bridge
@@ -406,8 +475,19 @@ async fn frozen_parent_requires_cache_but_only_for_requested_extents() {
         .delete(&id.cache_key())
         .await
         .unwrap();
-    assert_frozen_refusal(front(&rig, &signer, "big", &[]).await);
+    let (status, _, fan) = fanout_of(front(&rig, &signer, "big", &[]).await);
+    assert_eq!(status, 200);
+    let pipe = Loopback::new(&rig);
+    drive(&fan, &pipe).await.unwrap();
+    assert_eq!(*pipe.out.borrow(), data);
 
+    rig.bridge
+        .safety
+        .inner
+        .delete(&id.safety_key())
+        .await
+        .unwrap();
+    assert_frozen_refusal(front(&rig, &signer, "big", &[]).await);
     let (status, _, fan) =
         fanout_of(front(&rig, &signer, "big", &[("range", "bytes=501-3500")]).await);
     assert_eq!(status, 206);

@@ -21,6 +21,7 @@ use velmora_s3_proto::{plan_read, Conditions, ErrorCode, ObjectMetadata};
 use super::common::{
     authenticate, internal, s3_error, stored_checksum, stored_headers, unavailable,
 };
+use crate::config::MAX_EXTENT_BYTES_LIMIT;
 use crate::crypto::{cipher_span, open_range, unwrap_bdk};
 use crate::fanout::{admit, Fanout, Grant, FRONT_SUBREQUEST_BUDGET, MAX_RETRIES, TOKEN_TTL_MS};
 use crate::fetch::{
@@ -450,16 +451,23 @@ async fn read<
             }
         })?;
         if frozen {
+            // No uploaded extent can exceed MAX_EXTENT_BYTES_LIMIT. If
+            // even the fewest possible rows cannot fit, don't ask for a
+            // potentially huge range from the frozen catalogue.
+            let least_extents = range.length().div_ceil(MAX_EXTENT_BYTES_LIMIT);
+            if !frozen_front_fits(least_extents, fanout.count()) {
+                return Err(unavailable());
+            }
             // One catalogue lookup for the whole range; no extent data is
-            // fetched or decrypted in the parent. Refuse before returning
-            // a body plan if any requested cache object is unavailable.
+            // fetched or decrypted in the parent. Both tiers are read-only.
             let todo =
                 plan_pieces(&bridge.catalog, &generation.id, range.start, end, observed).await?;
-            if todo.len() as u64 + fanout.count() + u64::from(MAX_RETRIES) > FRONT_SUBREQUEST_BUDGET
+            if !frozen_front_fits(todo.len() as u64, fanout.count())
+                || !frozen_children_fit(&todo, chunk)
             {
                 return Err(unavailable());
             }
-            preflight(bridge, &todo, true, observed).await?;
+            preflight(bridge, &todo, observed).await?;
         }
         resp.body = RespBody::Fanout(fanout);
         return Ok(resp);
@@ -467,6 +475,40 @@ async fn read<
     let todo = plan_pieces(&bridge.catalog, &generation.id, range.start, end, observed).await?;
     resp.body = body(bridge, bucket.clone(), todo, observed, hit_flush, false).await?;
     Ok(resp)
+}
+
+// A frozen extent may need a probe of both the cache and the safety copy.
+const FROZEN_HEADS_PER_EXTENT: u64 = 2;
+// A child can also GET from both tiers, then do so once more if relay
+// took back a piece while the client stalled. It makes no cold fills.
+const FROZEN_CHILD_CALLS_PER_EXTENT: u64 = FROZEN_HEADS_PER_EXTENT + 2 * 2;
+
+fn frozen_front_fits(extents: u64, children: u64) -> bool {
+    extents * FROZEN_HEADS_PER_EXTENT + children + u64::from(MAX_RETRIES) <= FRONT_SUBREQUEST_BUDGET
+}
+
+/// Count every piece overlapping each child, splitting at the same chunk
+/// boundaries as the fan-out plan. A boundary can cut an extent in two.
+fn frozen_children_fit(todo: &[Piece], chunk: u64) -> bool {
+    let mut child_room = chunk;
+    let mut child_extents = 0;
+    for piece in todo {
+        let mut left = piece.len;
+        while left != 0 {
+            child_extents += 1;
+            if child_extents * FROZEN_CHILD_CALLS_PER_EXTENT > FRONT_SUBREQUEST_BUDGET {
+                return false;
+            }
+            let taken = left.min(child_room);
+            left -= taken;
+            child_room -= taken;
+            if child_room == 0 {
+                child_room = chunk;
+                child_extents = 0;
+            }
+        }
+    }
+    true
 }
 
 /// One catalogue query, then validate that its extent rows tile the range.
@@ -544,16 +586,16 @@ async fn granted<
         .filter(|&end| end <= generation.size)
         .ok_or_else(internal)?;
     let todo = plan_pieces(&bridge.catalog, &generation.id, grant.start, end, observed).await?;
-    // A cache copy can disappear after the parent's HEAD. Frozen
-    // children refuse a miss and never try to refill it.
-    let cache_only = bridge.catalog.is_frozen();
+    // A local copy can disappear after the parent's HEAD. Frozen
+    // children try both read-only tiers but never try a cold fill.
+    let no_cold_fill = bridge.catalog.is_frozen();
     Ok(S3Response {
         status: 200,
         headers: vec![
             ("content-length".into(), grant.len.to_string()),
             ("content-type".into(), "application/octet-stream".into()),
         ],
-        body: body(bridge, bucket, todo, observed, hit_flush, cache_only).await?,
+        body: body(bridge, bucket, todo, observed, hit_flush, no_cold_fill).await?,
     })
 }
 
@@ -562,7 +604,6 @@ async fn granted<
 async fn preflight<B: BlobStore>(
     bridge: &Bridge<impl Catalog, B, impl NntpConnector, impl JobSink, impl Kek, impl Clock>,
     todo: &[Piece],
-    cache_only: bool,
     observed: &mut GetObservation,
 ) -> core::result::Result<(), S3Response> {
     let missing = stream::iter(todo)
@@ -576,14 +617,13 @@ async fn preflight<B: BlobStore>(
                 .ok()
                 .flatten()
                 != size
-                && (cache_only
-                    || bridge
-                        .safety
-                        .head(&extent.id.safety_key())
-                        .await
-                        .ok()
-                        .flatten()
-                        != size)
+                && bridge
+                    .safety
+                    .head(&extent.id.safety_key())
+                    .await
+                    .ok()
+                    .flatten()
+                    != size
         })
         .buffer_unordered(4)
         .any(futures_util::future::ready)
@@ -609,26 +649,26 @@ async fn body<
     todo: Vec<Piece>,
     observed: &mut GetObservation,
     hit_flush: Option<Spawner>,
-    cache_only: bool,
+    no_cold_fill: bool,
 ) -> core::result::Result<RespBody, S3Response> {
     // Check all pieces before headers when frozen. For a single piece,
     // its read below already does this without a separate probe.
-    if (cache_only || bridge.catalog.is_frozen()) && todo.len() > 1 {
-        preflight(bridge, &todo, cache_only, observed).await?;
+    if (no_cold_fill || bridge.catalog.is_frozen()) && todo.len() > 1 {
+        preflight(bridge, &todo, observed).await?;
     }
     // One item per extent, also for a single extent: the plaintext that
     // is waiting to be pulled stays charged to the byte budget, and the
     // charge is released when the item is handed over or the body is
     // dropped. A later failure ends the stream with an error; the client
     // sees a body shorter than Content-Length.
-    let measure = !cache_only && bridge.cfg.hot_ctl.mode != crate::config::HotCtlMode::Fixed;
+    let measure = !no_cold_fill && bridge.cfg.hot_ctl.mode != crate::config::HotCtlMode::Fixed;
     let hits = hit_flush
         .filter(|_| measure)
         .map(|spawner| (Rc::clone(bridge), spawner));
     let bridge = Rc::clone(bridge);
     let spawner = bridge.budget.spawner().cloned();
     let mut items = driven(spawner.as_ref(), move |out| {
-        relay(bridge, bucket, todo, out, measure, cache_only)
+        relay(bridge, bucket, todo, out, measure, no_cold_fill)
     });
     // The first piece is produced before the status line goes out, so an
     // object that cannot be read is an error response, not a cut-off 200.
@@ -870,7 +910,7 @@ async fn relay<C, B, N, J, K, T>(
     todo: Vec<Piece>,
     out: Out<(Item, u64)>,
     measure: bool,
-    cache_only: bool,
+    no_cold_fill: bool,
 ) where
     C: Catalog,
     B: BlobStore,
@@ -881,7 +921,7 @@ async fn relay<C, B, N, J, K, T>(
 {
     let mut cold = Cold::new(&bridge);
     cold.measure = measure;
-    cold.cache_only = cache_only;
+    cold.no_cold_fill = no_cold_fill;
     let last = todo.len() - 1;
     let timer = bridge.budget.sleeper();
     // Whether pieces are produced ahead of the reader: on a host that
@@ -1185,8 +1225,8 @@ where
     until: Option<UnixMs>,
     // Only customer GET (possibly a granted subrange), never a copy.
     measure: bool,
-    /// A frozen fan-out child may only read the preflighted cache tier.
-    cache_only: bool,
+    /// Frozen fan-out children never refill the cache or stamp reads.
+    no_cold_fill: bool,
     from_r2: bool,
 }
 
@@ -1244,7 +1284,7 @@ where
             mid: false,
             until: None,
             measure: false,
-            cache_only: false,
+            no_cold_fill: false,
             from_r2: false,
         }
     }
@@ -1425,9 +1465,6 @@ where
             }
         };
         for from_cache in [true, false] {
-            if !from_cache && self.cache_only {
-                break;
-            }
             loop {
                 let asked = async {
                     match from_cache {
@@ -1456,7 +1493,7 @@ where
                 };
                 drop(src);
                 let held = retain(&room, work, plain).ok_or(ReadFail::Internal(Stage::Budget))?;
-                if !self.cache_only {
+                if !self.no_cold_fill {
                     self.wait(stamp_read(bridge, &extent.id, from_cache)).await;
                 }
                 self.from_r2 = true;
@@ -1484,7 +1521,7 @@ where
 
         // A cold fill needs provider permits and catalogue writes, both
         // unavailable during the freeze. Refuse before opening a session.
-        if self.cache_only || bridge.catalog.is_frozen() {
+        if self.no_cold_fill || bridge.catalog.is_frozen() {
             return Err(ReadFail::Unavailable(Stage::R2));
         }
 
