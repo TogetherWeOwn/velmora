@@ -10,8 +10,9 @@ transaction pooler.
 Provision the login roles `kofra_migrate`, `kofra_app` and `kofra_ro` out of
 band. An administrator runs `psql -X -v ON_ERROR_STOP=1 -f pg/roles.sql`
 from `workers/s3-bridge` once for a new target. Use `-v schema=NAME` with an
-already created disposable schema. This bootstrap **closes app access**;
-do not rerun it on an activated schema. The migration login owns the schema
+already created disposable schema. This bootstrap removes default PUBLIC
+schema access and refuses to run after app access has been explicitly granted.
+The migration login owns the schema
 and its objects. The app role gets DML, sequence access, and trigger function
 access, but cannot reach the schema until activation. The read-only login has
 `pg_read_all_data` and is for trusted host tooling, not application traffic.

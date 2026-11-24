@@ -1,15 +1,27 @@
 -- Run as the database administrator after provisioning the three login roles.
 -- Roles/passwords are provisioned out of band; this file contains no credentials.
 -- Usage: psql -X -v ON_ERROR_STOP=1 [-v schema=public] -f roles.sql
+\set ON_ERROR_STOP on
 \if :{?schema}
 \else
     \set schema public
 \endif
 BEGIN;
+-- Refuse a role bootstrap after the explicit activation grant. Revoking
+-- that grant on a rerun would silently close access to a live catalogue.
+SELECT EXISTS (SELECT FROM pg_namespace n, LATERAL aclexplode(n.nspacl) a
+               WHERE n.nspname = :'schema' AND a.grantee = 'kofra_app'::regrole
+                 AND a.privilege_type = 'USAGE') AS app_activated \gset
+\if :app_activated
+    DO $$ BEGIN RAISE EXCEPTION 'role bootstrap refused: app schema USAGE already granted'; END $$;
+\endif
 ALTER SCHEMA :"schema" OWNER TO kofra_migrate;
 REVOKE ALL ON SCHEMA :"schema" FROM PUBLIC;
--- Bootstrapping never opens the app path. This file is for an unactivated schema.
 REVOKE ALL ON SCHEMA :"schema" FROM kofra_app;
+SELECT has_schema_privilege('kofra_app', :'schema', 'USAGE,CREATE') AS app_has_schema_access \gset
+\if :app_has_schema_access
+    DO $$ BEGIN RAISE EXCEPTION 'role bootstrap refused: app inherits schema privileges'; END $$;
+\endif
 GRANT pg_read_all_data TO kofra_ro;
 
 ALTER ROLE kofra_app SET idle_in_transaction_session_timeout = '5s';
