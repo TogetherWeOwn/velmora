@@ -2311,6 +2311,33 @@ async fn a_fill_racing_the_collection_of_its_cache_blob_stays_counted() {
 // The fence
 // ---------------------------------------------------------------------------
 
+fn sets_safety_state(clause: &str) -> bool {
+    clause.match_indices("safety_state").any(|(at, column)| {
+        let preceded_by_identifier = clause[..at]
+            .chars()
+            .next_back()
+            .is_some_and(|c| c.is_alphanumeric() || c == '_');
+        !preceded_by_identifier && clause[at + column.len()..].trim_start().starts_with('=')
+    })
+}
+
+#[test]
+fn safety_state_scanner_recognizes_assignment_with_or_without_whitespace() {
+    for clause in [
+        "UPDATE extents SET safety_state = 'held'",
+        "UPDATE extents SET safety_state='held'",
+        "UPDATE extents SET safety_state\t\n= 'held'",
+    ] {
+        assert!(sets_safety_state(clause), "missed assignment: {clause}");
+    }
+    assert!(!sets_safety_state(
+        "UPDATE extents SET old_safety_state = 'held'"
+    ));
+    assert!(!sets_safety_state(
+        "UPDATE extents SET state = safety_state"
+    ));
+}
+
 /// Every statement that sets an extent's `safety_state` must bump
 /// `evict_seq` in the same statement. Without that, an eviction that
 /// listed an extent as released could begin after the extent went back
@@ -2341,7 +2368,7 @@ fn every_safety_state_change_bumps_the_fence() {
         for (at, _) in flat.match_indices("UPDATE extents") {
             let rest = &flat[at..];
             let set = &rest[..rest.find(" WHERE ").unwrap_or(rest.len())];
-            if !set.contains("safety_state =") {
+            if !sets_safety_state(set) {
                 continue;
             }
             checked += 1;
