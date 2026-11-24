@@ -264,18 +264,19 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
     // known to the client.
     let mut get = got.into_inner().unwrap_or_else(initial);
     let (status, out) = fanout::respond(&env, &ctx, resp, &request_id, &mut get).await;
+    // HTTP conversion can itself turn a response into a 500. Reconcile
+    // before the log, so the line has the status that was counted and
+    // the stage it was put down to.
+    let metrics_status = get.response_status(&method, admin, status, out.status_code());
     // A 5xx ends with what the handler observed of it (stage, error
     // variant, provider code): names and numbers only.
     console_log!(
         "{}",
-        ingress::log_line_with(&method, &target, status, &request_id, Some(&get))
+        ingress::log_line_with(&method, &target, metrics_status, &request_id, Some(&get))
     );
     if let Some(line) = env::memory_line(&bridge) {
         console_log!("{line}");
     }
-    // HTTP conversion can itself turn a response into a 500. Keep the
-    // existing response and log, but count the actual observed outcome.
-    let metrics_status = get.response_status(&method, admin, status, out.status_code());
     count(
         metrics_status,
         bridge.cfg.metrics_sample,
