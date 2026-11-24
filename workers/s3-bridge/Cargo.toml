@@ -21,6 +21,7 @@ pg-test-unlocked = ["velmora-bridge/pg-test-unlocked"]
 [dependencies]
 velmora-bridge = { version = "0.1.0", path = "../../crates/velmora-bridge", features = ["pg"] }
 tokio-postgres = { version = "=0.7.18", default-features = false }
+tokio = { version = "1", default-features = false, features = ["io-util"] }
 velmora = { version = "0.1.0", path = "../../crates/velmora", default-features = false, features = ["worker-transport", "worker-socks5-tls"] }
 worker = { version = "0.8", features = ["d1", "queue", "tokio-postgres"] }
 serde = { version = "1", features = ["derive"] }

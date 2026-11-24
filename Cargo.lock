@@ -2547,6 +2547,7 @@ dependencies = [
  "futures-util",
  "serde",
  "serde_json",
+ "tokio",
  "tokio-postgres",
  "velmora",
  "velmora-bridge",
