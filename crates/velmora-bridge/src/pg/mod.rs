@@ -41,22 +41,22 @@ pub fn classify_connect_error(error: tokio_postgres::Error) -> crate::BridgeErro
 pub fn normalize_statement(sql: &str) -> Result<String> {
     params::statement(sql).map(|s| s.text)
 }
-
-/// One catalogue connection owned by the calling request. Dropping it stops
-/// the corresponding connection driver, even if the request was cancelled.
+/// Request-owned connection; dropping it stops the driver, even on cancellation.
 pub struct PgConnection {
     client: Option<tokio_postgres::Client>,
     close: Option<Box<dyn FnOnce()>>,
+    #[cfg(all(feature = "testkit-pg", not(target_arch = "wasm32")))]
+    recycle: Option<Box<dyn FnOnce(tokio_postgres::Client)>>,
 }
-
 impl PgConnection {
     pub fn new(client: tokio_postgres::Client, close: impl FnOnce() + 'static) -> Self {
         Self {
             client: Some(client),
             close: Some(Box::new(close)),
+            #[cfg(all(feature = "testkit-pg", not(target_arch = "wasm32")))]
+            recycle: None,
         }
     }
-
     pub fn client(&self) -> &tokio_postgres::Client {
         self.client.as_ref().expect("connection still open")
     }
@@ -165,7 +165,7 @@ impl<C: PgConnect> PgSql<C> {
             self.recording(),
         )
         .await;
-        conn.finish();
+        finish_connection!(conn, result);
         result
     }
 }
@@ -179,7 +179,7 @@ impl<C: PgConnect> Sql for PgSql<C> {
             if prepared.statement.kind == Kind::Read {
                 let conn = self.reader.connect().await.map_err(error::without_guard)?;
                 let result = prepared.run(conn.client(), true, self.recording()).await;
-                conn.finish();
+                finish_connection!(conn, result);
                 result.map_err(error::without_guard)?.rows()
             } else {
                 self.write(&[prepared], true)
@@ -224,5 +224,41 @@ impl<C: PgConnect> Sql for PgSql<C> {
 
     fn dialect(&self) -> Dialect {
         Dialect::Postgres
+    }
+}
+
+// Outside native PG tests this expands to the original finish call. Keeping
+// the call sites on one line also preserves the Worker's panic locations.
+macro_rules! finish_connection {
+    ($conn:ident, $result:ident) => {{
+        #[cfg(all(feature = "testkit-pg", not(target_arch = "wasm32")))]
+        let $conn = $conn.recycle_if_clean($result.is_ok());
+        $conn.finish()
+    }};
+}
+use finish_connection;
+
+#[cfg(all(feature = "testkit-pg", not(target_arch = "wasm32")))]
+impl PgConnection {
+    // The recycler owns the driver: dropping it without calling it aborts
+    // the driver, including when an operation is cancelled before finish.
+    pub(crate) fn recyclable(
+        client: tokio_postgres::Client,
+        recycle: impl FnOnce(tokio_postgres::Client) + 'static,
+    ) -> Self {
+        Self {
+            client: Some(client),
+            close: None,
+            recycle: Some(Box::new(recycle)),
+        }
+    }
+
+    fn recycle_if_clean(mut self, clean: bool) -> Self {
+        if clean {
+            if let Some(recycle) = self.recycle.take() {
+                recycle(self.client.take().expect("connection still open"));
+            }
+        }
+        self
     }
 }

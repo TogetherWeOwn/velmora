@@ -194,6 +194,62 @@ async fn prepare_rejects_an_omitted_parameter_postgres_can_infer() {
 }
 
 #[tokio::test]
+async fn postgres_testkit_reuses_a_session_without_its_state() {
+    if !TestSql::postgres_selected() {
+        return;
+    }
+    let db = TestSql::with_schema_unrecorded().unwrap();
+    let lock_key = db.postgres_lock_key().unwrap();
+    db.fixture_script(&format!(
+        "CREATE TABLE testkit_session_probe (id bigint PRIMARY KEY);
+         CREATE FUNCTION testkit_dirty_session() RETURNS bigint LANGUAGE plpgsql AS $$
+         BEGIN
+             PERFORM set_config('application_name', 'dirty testkit session', false);
+             PERFORM pg_advisory_lock({lock_key}::bigint);
+             RETURN pg_backend_pid();
+         END;
+         $$;"
+    ))
+    .unwrap();
+    let probe = "SELECT pg_backend_pid(), current_setting('application_name'),
+                 EXISTS (SELECT 1 FROM pg_locks
+                         WHERE locktype = 'advisory' AND pid = pg_backend_pid()),
+                 (SELECT count(*) FROM testkit_session_probe)";
+    let fresh = db.fixture_query(probe, &[]).await.unwrap();
+    let dirty = db
+        .fixture_query(
+            "INSERT INTO testkit_session_probe VALUES (1) RETURNING testkit_dirty_session()",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(dirty[0][0], fresh[0][0], "write should reuse the session");
+    let reset = db.fixture_query(probe, &[]).await.unwrap();
+    assert_eq!(reset[0][0], fresh[0][0], "read should reuse the session");
+    assert!(reset[0][1] == fresh[0][1], "application_name was not reset");
+    assert_eq!(reset[0][2], SqlValue::Int(0), "session lock was not reset");
+    assert_eq!(reset[0][3], SqlValue::Int(1), "write should be committed");
+}
+
+#[tokio::test]
+async fn postgres_testkit_does_not_reuse_a_failed_write_session() {
+    if !TestSql::postgres_selected() {
+        return;
+    }
+    let db = TestSql::with_schema_unrecorded().unwrap();
+    db.fixture_script("CREATE TABLE testkit_error_probe (id bigint PRIMARY KEY); INSERT INTO testkit_error_probe VALUES (1);")
+        .unwrap();
+    let pid = "SELECT pg_backend_pid()";
+    let before = db.fixture_query(pid, &[]).await.unwrap();
+    assert!(db
+        .fixture_exec("INSERT INTO testkit_error_probe VALUES (1)", &[])
+        .await
+        .is_err());
+    let after = db.fixture_query(pid, &[]).await.unwrap();
+    assert_ne!(before, after, "a failed write must retire the session");
+}
+
+#[tokio::test]
 async fn postgres_gc_clean_verdict_keeps_sqlite_decimal_and_saturation_rules() {
     if !TestSql::postgres_selected() {
         return;

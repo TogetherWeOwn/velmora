@@ -2,12 +2,13 @@
 
 use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use native_tls::TlsConnector;
 use postgres_native_tls::MakeTlsConnector;
 use sha2::{Digest, Sha256};
-use tokio::runtime::Builder;
+use tokio::runtime::{Builder, Handle, Id};
 use tokio::task::JoinHandle;
 use tokio_postgres::{config::SslMode, Client, Config, NoTls};
 
@@ -89,13 +90,79 @@ pub(crate) async fn connect(config: &Config) -> Result<(Client, JoinHandle<()>)>
     }
 }
 
+// Bound cached sessions, not concurrent operations: if every session is
+// leased, connect as before rather than serializing tests through the pool.
+const MAX_IDLE_SESSIONS: usize = 4;
+
+struct Driver(JoinHandle<()>);
+
+impl Drop for Driver {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+struct IdleSession {
+    client: Client,
+    driver: Driver,
+    runtime: Id,
+}
+
 #[derive(Clone)]
-pub struct NativePgConnect(Config);
+pub struct NativePgConnect {
+    config: Config,
+    idle: Arc<Mutex<Vec<IdleSession>>>,
+}
+
+impl NativePgConnect {
+    fn new(config: Config) -> Self {
+        Self {
+            config,
+            idle: Arc::default(),
+        }
+    }
+
+    fn take_idle(&self, runtime: Id) -> Option<IdleSession> {
+        let mut idle = self.idle.lock().unwrap();
+        idle.retain(|session| !session.client.is_closed());
+        // A current-thread runtime drives its sockets only while it runs.
+        // In particular, a synchronous fixture query uses its own runtime.
+        let index = idle
+            .iter()
+            .rposition(|session| session.runtime == runtime)?;
+        Some(idle.swap_remove(index))
+    }
+}
 
 impl PgConnect for NativePgConnect {
     async fn connect(&self) -> Result<PgConnection> {
-        let (client, task) = connect(&self.0).await?;
-        Ok(PgConnection::new(client, move || task.abort()))
+        let runtime = Handle::current().id();
+        let (client, driver) = if let Some(session) = self.take_idle(runtime) {
+            // Await a successful reset before handing out the session. A
+            // rejected or cancelled reset retires it via the driver guard.
+            if session.client.batch_execute("DISCARD ALL").await.is_ok() {
+                (session.client, session.driver)
+            } else {
+                drop(session);
+                let (client, task) = connect(&self.config).await?;
+                (client, Driver(task))
+            }
+        } else {
+            let (client, task) = connect(&self.config).await?;
+            (client, Driver(task))
+        };
+        let idle = Arc::clone(&self.idle);
+        Ok(PgConnection::recyclable(client, move |client| {
+            let session = IdleSession {
+                client,
+                driver,
+                runtime,
+            };
+            let mut idle = idle.lock().unwrap();
+            if idle.len() < MAX_IDLE_SESSIONS {
+                idle.push(session);
+            }
+        }))
     }
 }
 
@@ -129,7 +196,7 @@ impl TestPostgres {
         let lock_key = i64::from_be_bytes(hash[..8].try_into().unwrap());
         let mut scoped = base.clone();
         scoped.options(format!("-c search_path={schema},pg_temp"));
-        let connector = NativePgConnect(scoped);
+        let connector = NativePgConnect::new(scoped);
         let sql = || {
             PgSql::new(
                 connector.clone(),
@@ -175,7 +242,9 @@ impl TestPostgres {
     /// Open a session for typed PREPARE and fixture setup. The connection is
     /// closed when the current test runtime shuts down or the client is dropped.
     pub async fn client(&self) -> Result<Client> {
-        connect(&self.connector.0).await.map(|(client, _)| client)
+        connect(&self.connector.config)
+            .await
+            .map(|(client, _)| client)
     }
 
     pub(super) fn fixture_query_now(&self, sql: &str, params: &[SqlValue]) -> Result<Vec<Row>> {
@@ -197,7 +266,7 @@ impl TestPostgres {
     }
 
     pub(super) fn fixture_script(&self, script: &str) -> Result<()> {
-        let config = self.connector.0.clone();
+        let config = self.connector.config.clone();
         let script = script.to_owned();
         management(move || async move {
             let (client, _) = connect(&config).await?;
