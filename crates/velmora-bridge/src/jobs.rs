@@ -49,7 +49,9 @@ use crate::types::{
 use crate::verify::release_labels;
 
 const HOT_CTL_EVERY_MS: i64 = 3_600_000;
+const HOT_CTL_STALE_MS: i64 = 2 * HOT_CTL_EVERY_MS;
 const HOT_CAP_KEYS: [&str; 2] = ["hot_cap_target", "hot_ctl_applied_cap"];
+const HOT_EFFECTIVE_CAP_KEYS: [&str; 3] = [HOT_CAP_KEYS[0], HOT_CAP_KEYS[1], "hot_ctl_at"];
 const HOT_REPORT_KEYS: [&str; 9] = [
     "hot_ctl_at",
     "hot_ctl_reason",
@@ -860,15 +862,18 @@ where
         }
         // An unreadable cap is not a missing row: starting a drain at
         // the fixed cap could discard the active cache after a grow.
-        let rows = self.hot_ctl_rows(&HOT_CAP_KEYS).await?;
-        Ok(self.hot_ctl_cap(&rows).0)
+        let rows = self.hot_ctl_rows(&HOT_EFFECTIVE_CAP_KEYS).await?;
+        Ok(self.hot_ctl_cap(&rows, self.clock.now()).0)
     }
 
-    fn hot_ctl_cap(&self, rows: &HotRows) -> (u64, &'static str) {
+    fn hot_ctl_cap(&self, rows: &HotRows, now: UnixMs) -> (u64, &'static str) {
         let cfg = self.cfg.hot_ctl;
-        if cfg.mode == HotCtlMode::Adaptive && rows.get(HOT_CAP_KEYS[1]) == Some(&0) {
-            // Zero provenance marks a shadow decision, never an applied
-            // cap. Carry over the real threshold until adaptive steps it.
+        let stale = hot_time(rows, "hot_ctl_at")
+            .is_some_and(|at| now.0.saturating_sub(at.0) > HOT_CTL_STALE_MS);
+        if cfg.mode == HotCtlMode::Adaptive && (rows.get(HOT_CAP_KEYS[1]) == Some(&0) || stale) {
+            // Zero provenance marks shadow. A stale decision can also
+            // survive a period in fixed mode, which writes no state.
+            // Carry over the fixed threshold until adaptive steps it.
             return (
                 self.cfg
                     .hot_cap_bytes
@@ -913,7 +918,7 @@ where
     }
 
     fn hot_ctl_report(&self, rows: &HotRows, actual: u64) -> HotCtlReport {
-        let (target, cap_reason) = self.hot_ctl_cap(rows);
+        let (target, cap_reason) = self.hot_ctl_cap(rows, self.clock.now());
         let (mode, target, reason, cap_reason) = match self.cfg.hot_ctl.mode {
             HotCtlMode::Fixed => ("fixed", self.cfg.hot_cap_bytes, "fixed", "fixed"),
             mode => (
@@ -965,7 +970,7 @@ where
     async fn hot_ctl_diagnostics_unavailable(&self, actual: u64) -> Result<HotCtlReport> {
         // Diagnostic data is optional, but status must not invent a cap.
         let rows = if self.cfg.hot_ctl.mode == HotCtlMode::Adaptive {
-            self.hot_ctl_rows(&HOT_CAP_KEYS).await?
+            self.hot_ctl_rows(&HOT_EFFECTIVE_CAP_KEYS).await?
         } else {
             HotRows::new()
         };
@@ -1025,7 +1030,7 @@ where
         if recent(&rows) {
             return None;
         }
-        let (cap, cap_reason) = self.hot_ctl_cap(&rows);
+        let (cap, cap_reason) = self.hot_ctl_cap(&rows, now);
         let mode_switched = cap_reason == "mode_switch";
         let last_step = |key| {
             if mode_switched {

@@ -900,6 +900,37 @@ async fn switching_from_shadow_starts_at_the_real_fixed_threshold() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn resuming_adaptive_after_fixed_rate_limits_from_the_actual_fixed_cap() {
+    use velmora_bridge::config::HotCtlMode;
+    let mut hot = hot_with(|cfg| {
+        cfg.hot_ctl.mode = HotCtlMode::Adaptive;
+        cfg.hot_cap_bytes = 100 * GIB;
+    })
+    .await;
+    hot.dispatch_and_evict().await.0.hot_ctl.unwrap();
+    let mut applied = 100 * GIB;
+    for _ in 0..(22 * 6) {
+        hot.bridge().clock.advance_secs(3600);
+        applied = hot.dispatch_and_evict().await.0.hot_ctl.unwrap().cap_after;
+        if applied == 10 * GIB {
+            break;
+        }
+    }
+    assert_eq!(applied, 10 * GIB);
+
+    hot.cfg_mut().hot_ctl.mode = HotCtlMode::Fixed;
+    hot.bridge().clock.advance_secs(7201);
+    assert!(hot.dispatch_and_evict().await.0.hot_ctl.is_none());
+    assert_eq!(hot.admin_status().await["hot"]["cap_bytes"], 100 * GIB);
+
+    hot.cfg_mut().hot_ctl.mode = HotCtlMode::Adaptive;
+    assert_eq!(hot.admin_status().await["hot"]["cap_bytes"], 100 * GIB);
+    let ctl = hot.dispatch_and_evict().await.0.hot_ctl.unwrap();
+    assert_eq!((ctl.cap_before, ctl.cap_after), (100 * GIB, 90 * GIB));
+    assert_eq!(ctl.step, "shrink");
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn unavailable_diagnostics_leave_the_admin_cap_accurate() {
     use velmora_bridge::config::HotCtlMode;
     let hot = hot_with(|cfg| {
@@ -911,7 +942,7 @@ async fn unavailable_diagnostics_leave_the_admin_cap_accurate() {
     cat.hot_ctl_store(&[("hot_cap_target", (10 * GIB) as i64)])
         .await
         .unwrap();
-    *cat.sql.fail_matching.borrow_mut() = Some(("FROM meta WHERE k IN (?1,?2,?3", 0));
+    *cat.sql.fail_matching.borrow_mut() = Some(("FROM meta WHERE k IN (?1,?2,?3,?4", 0));
     let status = hot.admin_status().await;
     assert_eq!(status["hot"]["cap_bytes"], 10 * GIB);
     assert_eq!(status["hot"]["ctl"]["reason"], "diagnostics_unavailable");
