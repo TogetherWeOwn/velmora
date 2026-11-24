@@ -1,16 +1,25 @@
 use crate::fixture::{self, OpError, Read};
 use crate::{percentile, Config, Family, Job};
-use futures_util::{future::join3, stream::FuturesUnordered, StreamExt};
+use futures_util::{
+    future::{join3, select, Either},
+    pin_mut,
+    stream::FuturesUnordered,
+    StreamExt,
+};
 use serde::Serialize;
-use std::{collections::BTreeMap, time::Duration};
-use tokio_postgres::Client;
+use std::{
+    collections::{BTreeMap, VecDeque},
+    time::Duration,
+};
+use tokio_postgres::{types::Type, Client};
 use velmora_bridge::{
     pg::{PgConfig, PgConnect, PgSql},
     sql::SqlCatalog,
     types::UnixMs,
 };
 
-const WRITE_LANES: usize = 3;
+const WRITE_POOL_SLOTS: usize = 5;
+const MAX_LOGICAL_WRITES: usize = 64;
 const SAMPLE_MS: u64 = 250;
 const ARM_KEY: &str = "pg_load_fixture_v1";
 
@@ -18,6 +27,9 @@ const ARM_KEY: &str = "pg_load_fixture_v1";
 pub trait Runtime {
     fn monotonic_ms(&self) -> f64;
     fn wall_ms(&self) -> i64;
+    fn lock_key(&self) -> i64 {
+        PgConfig::default().lock_key
+    }
     async fn sleep(&self, duration: Duration);
 }
 
@@ -50,6 +62,8 @@ struct FamilyResult {
     planned_batches: u32,
     completed_batches: u32,
     late_batches: u32,
+    queue_full_batches: u32,
+    unstarted_at_deadline_batches: u32,
     failures: Failures,
 }
 
@@ -74,6 +88,7 @@ pub struct Report {
     completed_batches_each_minute: Vec<u32>,
     in_five_percent_each_minute: bool,
     family: BTreeMap<Family, FamilyResult>,
+    write_pool: PoolStats,
     // All six WP1 overload SQLSTATEs are mapped to the same public error.
     overloaded_upper_bound_on_55p03: u64,
     advisory_sampling_period_ms: u64,
@@ -81,6 +96,7 @@ pub struct Report {
     advisory_expected_ticks: u64,
     advisory_wait_samples: usize,
     sampled_lock_wait_p99_ms: Option<f64>,
+    advisory_error: Option<String>,
     unloaded_reads: Reads,
     loaded_reads: Reads,
 }
@@ -99,6 +115,7 @@ impl Report {
                         && r.list.samples > 0
                 })
             && self.advisory_sampling_ticks > 0
+            && self.advisory_error.is_none()
     }
 
     pub fn meets_local_rate(&self) -> bool {
@@ -165,65 +182,157 @@ struct Writes<'a, C: PgConnect, R> {
     jobs: &'a [Job],
 }
 
-async fn writes<C: PgConnect, R: Runtime>(
-    w: Writes<'_, C, R>,
-) -> (BTreeMap<Family, FamilyResult>, Vec<u32>) {
+#[derive(Serialize)]
+struct PoolStats {
+    admission_slots: usize,
+    max_logical_writes: usize,
+    peak_logical_writes: usize,
+    peak_admitted_writes: usize,
+    queue_admissions: usize,
+    queue_wait_p50_ms: Option<f64>,
+    queue_wait_p99_ms: Option<f64>,
+    arrival_schedule_lag_p99_ms: Option<f64>,
+}
+
+struct WritesResult {
+    family: BTreeMap<Family, FamilyResult>,
+    minutes: Vec<u32>,
+    pool: PoolStats,
+}
+
+struct Completed {
+    family: Family,
+    minutes: [Option<usize>; 3],
+    error: Option<OpError>,
+}
+
+async fn writes<C: PgConnect, R: Runtime>(w: Writes<'_, C, R>) -> WritesResult {
     let provider = fixture::provider();
-    let mut lanes = FuturesUnordered::new();
-    for lane in 0..WRITE_LANES {
-        let w = &w;
-        let provider = &provider;
-        lanes.push(async move {
-            let mut counts: BTreeMap<_, FamilyResult> = BTreeMap::new();
-            let mut minutes = vec![0; w.minutes];
-            for (i, job) in w.jobs.iter().enumerate().skip(lane).step_by(WRITE_LANES) {
-                let stats = counts.entry(job.family).or_default();
-                stats.planned_batches += job.family.batches();
-                until(w.rt, w.start + job.at_ms as f64).await;
-                if w.rt.monotonic_ms() >= w.start + (w.minutes * 60_000) as f64 {
-                    continue;
-                }
-                let result = fixture::write(
-                    w.cat,
-                    provider,
-                    job.family,
-                    i,
-                    UnixMs(w.rt.wall_ms()),
-                    || {
-                        let minute = ((w.rt.monotonic_ms() - w.start).max(0.0) as usize) / 60_000;
-                        if let Some(count) = minutes.get_mut(minute) {
-                            *count += 1;
-                            stats.completed_batches += 1;
-                        } else {
-                            stats.late_batches += 1;
-                        }
-                    },
-                )
-                .await;
-                if let Err(error) = result {
-                    stats.failures.add(error);
+    let mut active = FuturesUnordered::new();
+    let mut pending = VecDeque::with_capacity(MAX_LOGICAL_WRITES);
+    let mut queue_wait = Vec::new();
+    let mut lag = Vec::new();
+    let mut peak_logical = 0;
+    let mut peak_admitted = 0;
+    let mut family = BTreeMap::<Family, FamilyResult>::new();
+    let mut minutes = vec![0; w.minutes];
+    let deadline = w.start + (w.minutes * 60_000) as f64;
+    let mut arrivals = w.jobs.iter().enumerate().peekable();
+    for job in w.jobs {
+        family.entry(job.family).or_default().planned_batches += job.family.batches();
+    }
+    loop {
+        let now = w.rt.monotonic_ms();
+        // Arrivals advance even when all writer admission slots are busy.
+        if now < deadline {
+            while arrivals
+                .peek()
+                .is_some_and(|(_, job)| w.start + job.at_ms as f64 <= now)
+            {
+                let (i, job) = arrivals.next().expect("due arrival");
+                lag.push(now - (w.start + job.at_ms as f64));
+                if active.len() + pending.len() == MAX_LOGICAL_WRITES {
+                    family
+                        .get_mut(&job.family)
+                        .expect("planned family")
+                        .queue_full_batches += job.family.batches();
+                } else {
+                    pending.push_back((i, job, now));
+                    peak_logical = peak_logical.max(active.len() + pending.len());
                 }
             }
-            (counts, minutes)
-        });
-    }
-    let mut result: BTreeMap<Family, FamilyResult> = BTreeMap::new();
-    let mut minutes = vec![0; w.minutes];
-    while let Some((counts, buckets)) = lanes.next().await {
-        for (family, counts) in counts {
-            let stat = result.entry(family).or_default();
-            stat.planned_batches += counts.planned_batches;
-            stat.completed_batches += counts.completed_batches;
-            stat.late_batches += counts.late_batches;
-            stat.failures.overloaded += counts.failures.overloaded;
-            stat.failures.refused += counts.failures.refused;
-            stat.failures.other += counts.failures.other;
+            while active.len() < WRITE_POOL_SLOTS {
+                let Some((i, job, queued)) = pending.pop_front() else {
+                    break;
+                };
+                queue_wait.push((w.rt.monotonic_ms() - queued).max(0.0));
+                let w = &w;
+                let provider = &provider;
+                active.push(async move {
+                    let mut minutes = [None; 3];
+                    let mut n = 0;
+                    let error = fixture::write(
+                        w.cat,
+                        provider,
+                        job.family,
+                        i,
+                        UnixMs(w.rt.wall_ms()),
+                        || {
+                            minutes[n] =
+                                Some(((w.rt.monotonic_ms() - w.start).max(0.0) as usize) / 60_000);
+                            n += 1;
+                        },
+                    )
+                    .await
+                    .err();
+                    Completed {
+                        family: job.family,
+                        minutes,
+                        error,
+                    }
+                });
+                peak_admitted = peak_admitted.max(active.len());
+            }
+        } else {
+            for job in pending
+                .drain(..)
+                .map(|(_, job, _)| job)
+                .chain(arrivals.by_ref().map(|(_, job)| job))
+            {
+                family
+                    .get_mut(&job.family)
+                    .expect("planned family")
+                    .unstarted_at_deadline_batches += job.family.batches();
+            }
         }
-        for (total, done) in minutes.iter_mut().zip(buckets) {
-            *total += done;
+        if active.is_empty() && arrivals.peek().is_none() {
+            break;
+        }
+        let at = arrivals
+            .peek()
+            .map_or(deadline, |(_, job)| w.start + job.at_ms as f64);
+        let done = if now >= deadline {
+            active.next().await // drain; count late acknowledgements separately
+        } else if active.is_empty() {
+            until(w.rt, at).await;
+            None
+        } else {
+            let timer = until(w.rt, at);
+            pin_mut!(timer);
+            match select(active.next(), timer).await {
+                Either::Left((done, _)) => done,
+                Either::Right(_) => None,
+            }
+        };
+        if let Some(done) = done {
+            let stats = family.get_mut(&done.family).expect("planned family");
+            for minute in done.minutes.into_iter().flatten() {
+                if let Some(total) = minutes.get_mut(minute) {
+                    *total += 1;
+                    stats.completed_batches += 1;
+                } else {
+                    stats.late_batches += 1;
+                }
+            }
+            if let Some(error) = done.error {
+                stats.failures.add(error);
+            }
         }
     }
-    (result, minutes)
+    WritesResult {
+        family,
+        minutes,
+        pool: PoolStats {
+            admission_slots: WRITE_POOL_SLOTS,
+            max_logical_writes: MAX_LOGICAL_WRITES,
+            peak_logical_writes: peak_logical,
+            peak_admitted_writes: peak_admitted,
+            queue_admissions: queue_wait.len(),
+            queue_wait_p50_ms: percentile(&mut queue_wait, 50),
+            queue_wait_p99_ms: percentile(&mut queue_wait, 99),
+            arrival_schedule_lag_p99_ms: percentile(&mut lag, 99),
+        },
+    }
 }
 
 async fn advisory(
@@ -232,8 +341,9 @@ async fn advisory(
     start: f64,
     duration: u64,
     lock: i64,
-) -> Result<(u64, Vec<f64>), String> {
+) -> (u64, Vec<f64>, Option<String>) {
     let mut waits = Vec::new();
+    let mut error = None;
     let mut ticks = 0;
     let mut next_tick = 0;
     while next_tick < duration / SAMPLE_MS {
@@ -243,24 +353,28 @@ async fn advisory(
             break;
         }
         until(runtime, start + (tick * SAMPLE_MS) as f64).await;
-        let rows = client.query("SELECT EXTRACT(EPOCH FROM (clock_timestamp()-l.waitstart))::float8 * 1000 \
+        let result = client.query_typed("SELECT EXTRACT(EPOCH FROM (clock_timestamp()-l.waitstart))::float8 * 1000 \
              FROM pg_catalog.pg_stat_activity a JOIN pg_catalog.pg_locks l USING(pid) \
              WHERE a.datname=current_database() AND a.wait_event='advisory' \
              AND l.locktype='advisory' AND NOT l.granted AND l.waitstart IS NOT NULL AND l.objsubid=1 \
-             AND l.classid::bigint=($1::bigint >> 32) AND l.objid::bigint=($1::bigint & 4294967295)", &[&lock])
-            .await.map_err(|e| fixture::sql_error("sample advisory waits", e))?;
-        for row in rows {
-            waits.push(row.get::<_, f64>(0).max(0.0));
+             AND l.classid::bigint=($1::bigint >> 32) AND l.objid::bigint=($1::bigint & 4294967295)", &[(&lock, Type::INT8)])
+            .await;
+        match result {
+            Ok(rows) => waits.extend(rows.into_iter().map(|row| row.get::<_, f64>(0).max(0.0))),
+            Err(e) => {
+                error = Some(fixture::sql_error("sample advisory waits", e));
+                break;
+            }
         }
         ticks += 1;
         next_tick = tick + 1;
     }
-    Ok((ticks, waits))
+    (ticks, waits, error)
 }
 
 async fn target(client: &Client) -> Result<(String, String, String), String> {
-    let row = client.query_one("SELECT current_database()::text,current_schema()::text,current_user::text, \
-        EXISTS (SELECT FROM meta WHERE k=$1 AND v=1) AND NOT EXISTS (SELECT FROM rollback_stamp LIMIT 1)", &[&ARM_KEY])
+    let row = client.query_typed_one("SELECT current_database()::text,current_schema()::text,current_user::text, \
+        EXISTS (SELECT FROM meta WHERE k=$1 AND v=1) AND NOT EXISTS (SELECT FROM rollback_stamp LIMIT 1)", &[(&ARM_KEY, Type::TEXT)])
         .await.map_err(|e| fixture::sql_error("check drill target", e))?;
     if !row.get::<_, bool>(3) {
         return Err("target is not armed or has rollback stamps".into());
@@ -268,16 +382,19 @@ async fn target(client: &Client) -> Result<(String, String, String), String> {
     Ok((row.get(0), row.get(1), row.get(2)))
 }
 
-/// Uses at most three writers, one read probe, and one advisory sampler.
+/// Admits at most five writer calls, separate from the read probe and sampler.
 /// The two connectors must point at the same explicitly armed drill copy.
-pub async fn run<C: PgConnect + Clone, R: Runtime>(
+pub async fn run<C: PgConnect, R: Runtime>(
     writer: C,
     reader: C,
     runtime: &R,
     config: &Config,
 ) -> Result<Report, String> {
     let jobs = config.plan();
-    let pg = PgConfig::default();
+    let pg = PgConfig {
+        lock_key: runtime.lock_key(),
+        ..PgConfig::default()
+    };
     let rd = reader
         .connect()
         .await
@@ -294,7 +411,7 @@ pub async fn run<C: PgConnect + Clone, R: Runtime>(
     if wu != ru {
         let can_sample: bool = rd
             .client()
-            .query_one(
+            .query_typed_one(
                 "SELECT pg_has_role(current_user,'pg_read_all_stats','USAGE')",
                 &[],
             )
@@ -307,7 +424,10 @@ pub async fn run<C: PgConnect + Clone, R: Runtime>(
     }
     let claimed = wr
         .client()
-        .execute("UPDATE meta SET v=2 WHERE k=$1 AND v=1", &[&ARM_KEY])
+        .execute_typed(
+            "UPDATE meta SET v=2 WHERE k=$1 AND v=1",
+            &[(&ARM_KEY, Type::TEXT)],
+        )
         .await
         .map_err(|e| fixture::sql_error("claim drill marker", e))?;
     if claimed != 1 {
@@ -316,9 +436,9 @@ pub async fn run<C: PgConnect + Clone, R: Runtime>(
     // The read origin must see the same one-shot claim, not a separately armed DB.
     let sees_claim: bool = rd
         .client()
-        .query_one(
+        .query_typed_one(
             "SELECT EXISTS(SELECT FROM meta WHERE k=$1 AND v=2)",
-            &[&ARM_KEY],
+            &[(&ARM_KEY, Type::TEXT)],
         )
         .await
         .map_err(|e| fixture::sql_error("verify drill claim on read pool", e))?
@@ -356,8 +476,12 @@ pub async fn run<C: PgConnect + Clone, R: Runtime>(
     )
     .await;
     drop(rd);
-    let (ticks, mut waits) = sampled?;
-    let (family, completed) = write_result;
+    let (ticks, mut waits, advisory_error) = sampled;
+    let WritesResult {
+        family,
+        minutes: completed,
+        pool: write_pool,
+    } = write_result;
     let target = config.batches_per_minute;
     let overloaded = family.values().map(|f| f.failures.overloaded).sum::<u64>()
         + unloaded.failures.overloaded
@@ -368,12 +492,14 @@ pub async fn run<C: PgConnect + Clone, R: Runtime>(
         in_five_percent_each_minute: completed.iter().all(|&n| n.abs_diff(target) * 20 <= target),
         completed_batches_each_minute: completed,
         family,
+        write_pool,
         overloaded_upper_bound_on_55p03: overloaded,
         advisory_sampling_period_ms: SAMPLE_MS,
         advisory_sampling_ticks: ticks,
         advisory_expected_ticks: duration / SAMPLE_MS,
         advisory_wait_samples: waits.len(),
         sampled_lock_wait_p99_ms: percentile(&mut waits, 99),
+        advisory_error,
         unloaded_reads: unloaded,
         loaded_reads: loaded,
     })

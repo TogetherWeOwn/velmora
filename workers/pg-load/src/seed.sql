@@ -27,9 +27,9 @@ SELECT upload,1,extent,1,'"pg-load"',1 FROM load_seed WHERE family='complete';
 -- for additional pieces (seq = first piece's seq + piece).
 
 INSERT INTO outbox (extent_id,generation_id,stage,next_at,lease_token,lease_owner,lease_until,updated_at)
-SELECT extent,gen,stage,1,CASE WHEN held THEN 1 ELSE 0 END,
+SELECT extent,gen,CASE WHEN family='read' THEN 'post' ELSE stage END,1,CASE WHEN held THEN 1 ELSE 0 END,
        CASE WHEN held THEN 'pg-load' END, CASE WHEN held THEN 8000000000000000 END,1
-FROM load_seed WHERE family='outbox';
+FROM load_seed WHERE family IN ('outbox','read');
 
 INSERT INTO gc (id,extent_id,action,due_at)
 SELECT -n-1,extent,'delete_safety',1 FROM load_seed WHERE family='gc';

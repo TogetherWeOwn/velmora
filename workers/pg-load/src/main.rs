@@ -41,6 +41,10 @@ mod local {
                 .expect("system clock")
                 .as_millis() as i64
         }
+        fn lock_key(&self) -> i64 {
+            // Keep the local drill independent of other catalogue tests.
+            7_413_000_307
+        }
         async fn sleep(&self, duration: Duration) {
             tokio::time::sleep(duration).await;
         }

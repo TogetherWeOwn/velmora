@@ -2,6 +2,7 @@ use crate::{parse_config, run, Runtime};
 use futures_channel::oneshot;
 use futures_util::future::abortable;
 use std::time::Duration;
+use subtle::ConstantTimeEq;
 use tokio_postgres::Config;
 use velmora_bridge::pg::{classify_connect_error, PgConnect, PgConnection};
 use velmora_bridge::{BridgeError, Result as BridgeResult};
@@ -70,6 +71,20 @@ async fn fetch(req: Request, env: Env, _: Context) -> Result<Response> {
             .var("PG_LOAD_ENABLE")
             .ok()
             .is_none_or(|v| v.to_string() != "drill-only")
+    {
+        return Response::error("not found", 404);
+    }
+    let token = env.secret("PG_LOAD_TOKEN").ok().map(|s| s.to_string());
+    let authorization = req.headers().get("Authorization").ok().flatten();
+    let supplied = authorization
+        .as_deref()
+        .and_then(|s| s.strip_prefix("Bearer "));
+    if !token
+        .as_deref()
+        .zip(supplied)
+        .is_some_and(|(expected, supplied)| {
+            expected.len() >= 32 && bool::from(expected.as_bytes().ct_eq(supplied.as_bytes()))
+        })
     {
         return Response::error("not found", 404);
     }

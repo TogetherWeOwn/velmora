@@ -1,6 +1,6 @@
 use crate::{Family, Job};
 use std::cell::RefCell;
-use tokio_postgres::Client;
+use tokio_postgres::{types::Type, Client};
 use velmora_bridge::pg::{PgConnect, PgSql};
 use velmora_bridge::ports::{
     BlobMeta, BlobStore, Catalog, Guard, Kek, Lease, Permit, PermitClass, PublishOutcome,
@@ -11,6 +11,8 @@ use velmora_bridge::sql::SqlCatalog;
 use velmora_bridge::types::*;
 
 pub(crate) const READ_KEYS: usize = 128;
+const DISPATCH_KEYS: usize = 100;
+const USAGE_CHUNK: u32 = 4_000;
 const BUCKET: &str = "b_70676c6f61640001";
 const PROVIDER: &str = "pg-load";
 const ETAG: &str = "\"pg-load\"";
@@ -39,13 +41,22 @@ pub(crate) fn sql_error(step: &str, error: tokio_postgres::Error) -> String {
 
 pub(crate) async fn seed(client: &Client, jobs: &[Job]) -> std::result::Result<(), String> {
     client
-        .execute(
+        .execute_typed(
             "INSERT INTO buckets (id,name,owner,bdk_wrapped,kek_version,disposable,created_at) \
         VALUES ($1,'pg-load-fixture','pg-load',decode(repeat('00',73),'hex'),1,1,1)",
-            &[&BUCKET],
+            &[(&BUCKET, Type::TEXT)],
         )
         .await
         .map_err(|e| sql_error("create fixture bucket", e))?;
+    if jobs.iter().any(|job| job.family == Family::Usage) {
+        // A fresh local schema needs a full first recount chunk. A clone
+        // already has real extents beyond the seeded rows.
+        client.execute_typed("INSERT INTO extents (id,bucket_id,state,plain_size,cipher_size,media_header,plain_md5,plain_sha256,cipher_sha256,safety_state,created_at) \
+             SELECT 'x_ffffffffff'||lpad(to_hex(n),16,'0'),$1,'staged',1,65,decode(repeat('00',48),'hex'), \
+             decode(repeat('00',16),'hex'),decode(repeat('00',32),'hex'),decode(repeat('00',32),'hex'),'held',1 \
+             FROM generate_series(0,$2::bigint) AS n", &[(&BUCKET, Type::TEXT), (&i64::from(USAGE_CHUNK), Type::INT8)])
+            .await.map_err(|e| sql_error("seed recount extents", e))?;
+    }
     // Bound each setup transaction separately from the measured write load.
     const CHUNK: usize = 4096;
     for (offset, group) in jobs.chunks(CHUNK).enumerate() {
@@ -91,10 +102,11 @@ async fn seed_group(
         stages.push(stage);
         held.push(is_held);
     }
-    client.execute("INSERT INTO load_seed SELECT n, family, stage, held, 'pg-load/'||lpad(to_hex(n),16,'0'), \
+    client.execute_typed("INSERT INTO load_seed SELECT n, family, stage, held, 'pg-load/'||lpad(to_hex(n),16,'0'), \
          'g_0000000000001'||lpad(to_hex(n),16,'0'), 'x_'||lpad(to_hex(n),26,'0'), lpad(to_hex(n),32,'0') \
          FROM unnest($1::bigint[], $2::text[], $3::text[], $4::boolean[]) AS t(n,family,stage,held)",
-        &[&n, &families, &stages, &held]).await.map_err(|e| sql_error("populate seed table", e))?;
+        &[(&n, Type::INT8_ARRAY), (&families, Type::TEXT_ARRAY), (&stages, Type::TEXT_ARRAY), (&held, Type::BOOL_ARRAY)])
+        .await.map_err(|e| sql_error("populate seed table", e))?;
     client
         .batch_execute(include_str!("seed.sql"))
         .await
@@ -398,8 +410,19 @@ pub(crate) async fn write<C: PgConnect>(
             .await?
         }
         Family::Gc => cat.gc_done(-(row.i as i64) - 1, now).await?,
-        Family::Usage => applied(cat.usage_recount_start(now, false, true, false).await?)?,
-        Family::Dispatch => cat.record_dispatch(now).await?,
+        Family::Usage => {
+            applied(cat.usage_recount_start(now, false, true, false).await?)?;
+            count();
+            applied(!cat.usage_recount_step(USAGE_CHUNK, now).await?.idle)?;
+        }
+        Family::Dispatch => {
+            cat.bury_exhausted(50, now).await?;
+            count();
+            let due: Vec<_> = (0..DISPATCH_KEYS).map(extent_id).collect();
+            applied(cat.mark_sent(&due, now).await? >= DISPATCH_KEYS as u64)?;
+            count();
+            cat.record_dispatch(now).await?;
+        }
         family => {
             let (stage, next) = outbox_operation(family).expect("outbox family");
             let extent = extent_id(row.i);

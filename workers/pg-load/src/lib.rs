@@ -35,7 +35,8 @@ impl Family {
     pub fn batches(self) -> u32 {
         match self {
             Self::PutPublish | Self::MultipartComplete => 2, // floor, then publish
-            Self::Delete => 3,                               // floor, settle, then delete
+            Self::Delete | Self::Dispatch => 3,
+            Self::Usage => 2, // start, then a bounded recount step
             _ => 1,
         }
     }
