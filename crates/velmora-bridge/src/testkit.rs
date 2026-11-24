@@ -844,6 +844,9 @@ pub trait PublishUnrecorded: Catalog {
         Ok(match self.commit_generation(c, None, record).await? {
             PublishOutcome::Applied => Guard::Applied(()),
             PublishOutcome::Refused(_) | PublishOutcome::Fenced(_) => Guard::Lost,
+            PublishOutcome::FencedOverloaded(_) => {
+                return Err(BridgeError::Sql("pg: overloaded".into()))
+            }
         })
     }
 
@@ -862,6 +865,9 @@ pub trait PublishUnrecorded: Catalog {
                 Guard::Applied(())
             }
             PublishOutcome::Refused(_) | PublishOutcome::Fenced(_) => Guard::Lost,
+            PublishOutcome::FencedOverloaded(_) => {
+                return Err(BridgeError::Sql("pg: overloaded".into()))
+            }
         })
     }
 
@@ -878,6 +884,9 @@ pub trait PublishUnrecorded: Catalog {
         Ok(match self.copy_generation(c, condition, record).await? {
             PublishOutcome::Applied => Guard::Applied(()),
             PublishOutcome::Refused(_) | PublishOutcome::Fenced(_) => Guard::Lost,
+            PublishOutcome::FencedOverloaded(_) => {
+                return Err(BridgeError::Sql("pg: overloaded".into()))
+            }
         })
     }
 
@@ -912,6 +921,9 @@ pub trait PublishUnrecorded: Catalog {
                     Guard::Applied(())
                 }
                 PublishOutcome::Refused(_) | PublishOutcome::Fenced(_) => Guard::Lost,
+                PublishOutcome::FencedOverloaded(_) => {
+                    return Err(BridgeError::Sql("pg: overloaded".into()))
+                }
             },
         )
     }

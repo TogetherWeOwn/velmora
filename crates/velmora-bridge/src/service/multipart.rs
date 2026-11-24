@@ -1679,6 +1679,11 @@ where
                 observed.mark_stage(Stage::Commit);
                 return Err(Fail::Internal);
             }
+            PublishOutcome::FencedOverloaded(record) => {
+                let _ = discard_refused(bridge, &commit.generation, record).await;
+                observed.mark_stage(Stage::Commit);
+                return Err(ErrorCode::SlowDown.into());
+            }
         }
     }
     observed.mark_stage(Stage::Commit);

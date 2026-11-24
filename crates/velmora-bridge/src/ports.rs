@@ -683,6 +683,9 @@ pub enum PublishOutcome {
     /// outcome and the upload was then moved to its next revision: the
     /// batch had not applied, and its guard can never pass again.
     Fenced(Unpublished),
+    /// CompleteMultipartUpload only. Fenced as above; the publication
+    /// failure was PostgreSQL overload and should be rendered as SlowDown.
+    FencedOverloaded(Unpublished),
 }
 
 // Fenced methods return Ok(false) (or None) when the lease token no longer

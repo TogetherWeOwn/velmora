@@ -372,6 +372,7 @@ where
                     .map_err(|_| internal());
             }
             PublishOutcome::Refused(record) | PublishOutcome::Fenced(record) => record,
+            PublishOutcome::FencedOverloaded(_) => return Err(s3_error(ErrorCode::SlowDown)),
         };
         // The source was overwritten or deleted since it was read, the
         // destination got a generation this id does not sort after, or

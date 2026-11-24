@@ -265,6 +265,7 @@ async fn put<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: 
         {
             PublishOutcome::Applied => break commit.generation.id.clone(),
             PublishOutcome::Refused(record) | PublishOutcome::Fenced(record) => record,
+            PublishOutcome::FencedOverloaded(_) => return Err(s3_error(ErrorCode::SlowDown)),
         };
         // The key already carries a newer id: a commit that landed after
         // this id was minted, or one minted by a clock ahead of this
@@ -601,6 +602,7 @@ async fn put_sliced<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: K
         {
             PublishOutcome::Applied => break,
             PublishOutcome::Refused(record) | PublishOutcome::Fenced(record) => record,
+            PublishOutcome::FencedOverloaded(_) => return Err(s3_error(ErrorCode::SlowDown)),
         };
         // A newer id on the key, a condition that no longer holds, a
         // replay, or rows the sweep took.
