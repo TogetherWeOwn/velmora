@@ -377,7 +377,7 @@ jobs:
           echo "${RUNNER_TEMP}/nextest-bin" >> "$GITHUB_PATH"
           "${RUNNER_TEMP}/nextest-bin/cargo-nextest" nextest --version
       - run: cargo nextest run --locked -p velmora-s3-proto -p velmora-bridge --no-fail-fast --no-tests=fail
-      - run: cargo test --locked -p velmora-bridge --features pg-test-record
+      - run: cargo test --locked -p velmora-bridge --features pg-test-record --lib pg_manifest_tests
       - run: cargo test --locked -p velmora-s3-proto -p velmora-bridge --doc
       - run: cargo clippy --locked -p velmora-s3-proto -p velmora-bridge --all-targets --features velmora-bridge/testkit -- -D warnings
       - run: cargo build --locked -p velmora-test-nntp --bin fakesrv
