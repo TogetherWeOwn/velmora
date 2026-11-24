@@ -1,0 +1,108 @@
+use crate::worker_socket::{ManagedSocket, UpgradeTls};
+use crate::{parse_config, run, DrillConnect, DrillSession, Runtime};
+use futures_channel::oneshot;
+use futures_util::future::abortable;
+use std::time::Duration;
+use subtle::ConstantTimeEq;
+use tokio_postgres::Config;
+use velmora_bridge::pg::{classify_connect_error, PgConnect, PgConnection};
+use velmora_bridge::{BridgeError, Result as BridgeResult};
+use worker::{
+    event, wasm_bindgen_futures::spawn_local, Context, Delay, Env, Hyperdrive, Method, Request,
+    Response, Result,
+};
+
+// Store the binding name, not a socket, connection string, or client. Each
+// adapter call owns its Hyperdrive connection in this request's I/O context.
+#[derive(Clone)]
+struct Connector(Env, &'static str);
+impl PgConnect for Connector {
+    async fn connect(&self) -> BridgeResult<PgConnection> {
+        Ok(self.open().await?.into_pg())
+    }
+}
+impl DrillConnect for Connector {
+    async fn open(&self) -> BridgeResult<DrillSession> {
+        let binding: Hyperdrive = self.0.hyperdrive(self.1).map_err(|_| connect_failed())?;
+        let config: Config = binding
+            .connection_string()
+            .parse()
+            .map_err(|_| connect_failed())?;
+        let socket = ManagedSocket::connect(&binding.host(), binding.port())?;
+        let (client, connection) = config
+            .connect_raw(socket, UpgradeTls)
+            .await
+            .map_err(classify_connect_error)?;
+        let (closed, done) = oneshot::channel();
+        let (driver, stop) = abortable(connection);
+        spawn_local(async move {
+            let _ = driver.await;
+            let _ = closed.send(());
+        });
+        Ok(DrillSession::new(client, move || stop.abort(), done))
+    }
+}
+
+fn connect_failed() -> BridgeError {
+    BridgeError::Sql("pg: statement failed".into())
+}
+
+struct Clock;
+impl Runtime for Clock {
+    // Workers' clock advances at I/O boundaries. These timings include the
+    // per-call Hyperdrive round trips and have millisecond resolution.
+    fn monotonic_ms(&self) -> f64 {
+        worker::js_sys::Date::now()
+    }
+    fn wall_ms(&self) -> i64 {
+        worker::js_sys::Date::now() as i64
+    }
+    async fn sleep(&self, duration: Duration) {
+        Delay::from(duration).await;
+    }
+}
+
+#[event(fetch)]
+async fn fetch(req: Request, env: Env, _: Context) -> Result<Response> {
+    if req.method() != Method::Post
+        || req.path() != "/run"
+        || env
+            .var("PG_LOAD_ENABLE")
+            .ok()
+            .is_none_or(|v| v.to_string() != "drill-only")
+    {
+        return Response::error("not found", 404);
+    }
+    let token = env.secret("PG_LOAD_TOKEN").ok().map(|s| s.to_string());
+    let authorization = req.headers().get("Authorization").ok().flatten();
+    let supplied = authorization
+        .as_deref()
+        .and_then(|s| s.strip_prefix("Bearer "));
+    if !token
+        .as_deref()
+        .zip(supplied)
+        .is_some_and(|(expected, supplied)| {
+            expected.len() >= 32 && bool::from(expected.as_bytes().ct_eq(supplied.as_bytes()))
+        })
+    {
+        return Response::error("not found", 404);
+    }
+    let Ok(raw) = env.var("PG_LOAD_CONFIG") else {
+        return Response::error("missing drill configuration", 400);
+    };
+    let cfg = match parse_config(&raw.to_string()) {
+        Ok(cfg) => cfg,
+        Err(error) => return Response::error(error, 400),
+    };
+    match run(
+        Connector(env.clone(), "DRILL_PG_WRITE"),
+        Connector(env, "DRILL_PG_READ"),
+        &Clock,
+        &cfg,
+    )
+    .await
+    {
+        Ok(report) => Response::from_json(&report),
+        Err(error) => Response::error(error, 500),
+    }
+}
