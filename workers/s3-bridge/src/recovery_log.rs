@@ -10,6 +10,17 @@ const INSERT: &str =
 const PRUNE: &str = include_str!("recovery_log_prune.sql");
 const RETENTION_MS: i64 = 7 * 24 * 3_600_000;
 
+fn skip_frozen(db: &impl Sql, operation: &'static str) -> bool {
+    if !db.is_frozen() {
+        return false;
+    }
+    #[cfg(target_arch = "wasm32")]
+    worker::console_log!("recovery copy: {operation} telemetry skipped; catalogue is frozen");
+    #[cfg(not(target_arch = "wasm32"))]
+    let _ = operation;
+    true
+}
+
 pub struct Log {
     pub at: UnixMs,
     pub pass: UnixMs,
@@ -67,7 +78,7 @@ impl Log {
     }
 
     pub async fn job(&self, db: &impl Sql, report: &JobReport, problems: u64) -> Result<()> {
-        if self.pass.0 == 0 {
+        if self.pass.0 == 0 || skip_frozen(db, "job") {
             return Ok(());
         }
         let checked = report.counts.as_ref().map_or(0, |c| c.records);
@@ -93,6 +104,9 @@ impl Log {
     }
 
     pub async fn audit(&self, db: &impl Sql, counts: &AuditCounts) -> Result<()> {
+        if skip_frozen(db, "audit") {
+            return Ok(());
+        }
         self.insert(
             db,
             "audit",
@@ -116,7 +130,7 @@ pub fn source_problem(report: &JobReport) -> Option<Problem> {
 
 /// One cleanup attempt per pass interval even while copying is off or paused.
 pub async fn prune_tick(db: &impl Sql, scheduled: UnixMs, now: UnixMs) -> Result<()> {
-    if !velmora_bridge::copy::pass_due(scheduled) {
+    if !velmora_bridge::copy::pass_due(scheduled) || skip_frozen(db, "prune") {
         return Ok(());
     }
     db.exec(PRUNE, &[SqlValue::Int(now.0 - RETENTION_MS)])

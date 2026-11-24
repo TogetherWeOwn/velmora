@@ -6,7 +6,7 @@ use velmora_bridge::remote::S3Remote;
 use velmora_bridge::UnixMs;
 use worker::{console_error, js_sys::Math, Env};
 
-use crate::{d1::D1Sql, e2::FetchHttp, env::WorkerClock, r2::R2Blobs, recovery_log};
+use crate::{catalog_sql::CatalogSql, e2::FetchHttp, env::WorkerClock, r2::R2Blobs, recovery_log};
 
 pub fn pass_at(scheduled: UnixMs) -> Option<UnixMs> {
     let pass = UnixMs(scheduled.0 - START_WINDOW_MS);
@@ -33,7 +33,7 @@ fn random_start(now: UnixMs, slot: usize, fraction: f64) -> String {
 }
 
 pub async fn run(env: Env, pass: UnixMs, remote: S3Remote<FetchHttp>) {
-    let Ok(db) = env.d1("CATALOG").map(D1Sql::new) else {
+    let Ok(db) = CatalogSql::recovery_log_from_env(&env) else {
         console_error!("recovery copy: audit telemetry database unavailable");
         return;
     };

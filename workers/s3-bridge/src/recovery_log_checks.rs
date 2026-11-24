@@ -7,18 +7,23 @@ use velmora_bridge::{BridgeError, JobOutcome, Row};
 #[derive(Default)]
 struct Db {
     fail: bool,
+    frozen: bool,
     rows: RefCell<Vec<Vec<SqlValue>>>,
     prunes: RefCell<Vec<Vec<SqlValue>>>,
 }
 
 impl Sql for Db {
+    fn is_frozen(&self) -> bool {
+        self.frozen
+    }
+
     async fn exec(&self, sql: &str, params: &[SqlValue]) -> Result<u64> {
         match sql {
             INSERT => self.rows.borrow_mut().push(params.to_vec()),
             PRUNE => self.prunes.borrow_mut().push(params.to_vec()),
             _ => panic!("unexpected statement"),
         }
-        if self.fail {
+        if self.fail || self.frozen {
             Err(BridgeError::Sql("fixture error".into()))
         } else {
             Ok(1)
@@ -178,6 +183,54 @@ fn prune_tick_needs_only_the_catalogue_and_runs_once_per_pass() {
         db.rows.borrow().is_empty(),
         "no copy or audit observation needed"
     );
+}
+
+#[test]
+fn job_and_walk_writes_are_skipped_only_when_frozen() {
+    for (frozen, writes) in [(true, 0), (false, 2)] {
+        let db = Db {
+            frozen,
+            ..Db::default()
+        };
+        let report = JobReport {
+            walk_ended: true,
+            ..Default::default()
+        };
+        let result = ready(log(10).job(&db, &report, 0));
+        assert_eq!(db.rows.borrow().len(), writes);
+        assert!(result.is_ok());
+    }
+}
+
+#[test]
+fn prune_write_is_skipped_only_when_frozen() {
+    let due = UnixMs(velmora_bridge::copy::PASS_INTERVAL_MS * 1000);
+    for (frozen, writes) in [(true, 0), (false, 1)] {
+        let db = Db {
+            frozen,
+            ..Db::default()
+        };
+        let result = ready(prune_tick(&db, due, due));
+        assert_eq!(db.prunes.borrow().len(), writes);
+        assert!(result.is_ok());
+    }
+}
+
+#[test]
+fn audit_write_is_skipped_only_when_frozen() {
+    for (frozen, writes) in [(true, 0), (false, 1)] {
+        let db = Db {
+            frozen,
+            ..Db::default()
+        };
+        let result = ready(log(10).audit(&db, &AuditCounts::default()));
+        let rows = db.rows.borrow();
+        assert_eq!(rows.len(), writes);
+        assert!(result.is_ok());
+        if !frozen {
+            assert_eq!(rows[0][1], SqlValue::Text("audit".into()));
+        }
+    }
 }
 
 #[test]
