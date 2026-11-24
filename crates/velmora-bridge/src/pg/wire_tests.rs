@@ -18,6 +18,7 @@ const INSERT: &str = "INSERT INTO wp1_fault_marker VALUES (?1)";
 enum Fault {
     ChunkReplies,
     DropCommitReply,
+    RejectCommitReply,
     RejectStartup,
     RejectPrelude,
 }
@@ -146,6 +147,9 @@ async fn proxy(listener: TcpListener, port: u16, fault: Fault, trace: Trace) -> 
                 if matches!(fault, Fault::DropCommitReply) {
                     return Ok::<(), io::Error>(());
                 }
+                if matches!(fault, Fault::RejectCommitReply) {
+                    return fault_reply(&mut *writer.lock().await, "57014", true).await;
+                }
             }
             let mut downstream = writer.lock().await;
             if matches!(fault, Fault::ChunkReplies) {
@@ -184,6 +188,15 @@ async fn through_proxy(
     fault: Fault,
     stmts: Vec<(&'static str, Vec<SqlValue>)>,
 ) -> (Result<Vec<u64>>, Vec<Wire>) {
+    through_proxy_mode(port, fault, true, stmts).await
+}
+
+async fn through_proxy_mode(
+    port: u16,
+    fault: Fault,
+    pipeline: bool,
+    stmts: Vec<(&'static str, Vec<SqlValue>)>,
+) -> (Result<Vec<u64>>, Vec<Wire>) {
     let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
     let proxy_port = listener.local_addr().unwrap().port();
     let trace = Trace::default();
@@ -194,7 +207,7 @@ async fn through_proxy(
         c,
         PgConfig {
             lock_key: 7_413_000_011,
-            ..PgConfig::default()
+            pipeline,
         },
     );
     let result = tokio::time::timeout(Duration::from_secs(5), pg.batch(stmts))
@@ -299,9 +312,26 @@ async fn pg_sql_faults_preserve_transaction_outcomes_on_the_wire() {
     );
     assert_eq!(stored(&root).await, 1);
 
+    let (res, trace) =
+        through_proxy_mode(port, Fault::RejectCommitReply, false, vec![insert(13)]).await;
+    assert!(
+        matches!(res,Err(BridgeError::Sql(s)) if s=="pg: statement failed"),
+        "sequential COMMIT timeout must be unknown"
+    );
+    assert_eq!(
+        trace,
+        [
+            Wire::BeginReadWrite,
+            Wire::Parse,
+            Wire::Commit,
+            Wire::CommitApplied
+        ]
+    );
+    assert_eq!(stored(&root).await, 2);
+
     let (res, _) = through_proxy(port, Fault::ChunkReplies, vec![insert(6)]).await;
     assert_eq!(res.unwrap(), [1]);
-    assert_eq!(stored(&root).await, 2);
+    assert_eq!(stored(&root).await, 3);
     for pipelined in [false, true] {
         let c = Connector(config(port, "wp1_fault_writer"));
         let pg = PgSql::new(
@@ -319,7 +349,7 @@ async fn pg_sql_faults_preserve_transaction_outcomes_on_the_wire() {
             1
         );
     }
-    assert_eq!(stored(&root).await, 4);
+    assert_eq!(stored(&root).await, 5);
     root.batch_execute(
         "DROP FUNCTION wp1_fault_58000(); DROP TABLE wp1_fault_marker; DROP ROLE wp1_fault_writer;",
     )
