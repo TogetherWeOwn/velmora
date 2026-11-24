@@ -151,7 +151,10 @@ pub(super) async fn evict_candidates<S: Sql>(
 ) -> Result<Vec<EvictCandidate>> {
     let rows = c
         .sql
-        .query(CANDIDATES, &[SqlValue::Int(i64::from(limit))])
+        .query(
+            c.sql.dialect().pick(CANDIDATES, CANDIDATES_PG),
+            &[SqlValue::Int(i64::from(limit))],
+        )
         .await?;
     let mut out = Vec::with_capacity(rows.len());
     for row in rows {
@@ -177,23 +180,9 @@ pub(super) async fn evict_candidates<S: Sql>(
 ///   one. The caller must not touch the safety copy.
 pub(super) async fn begin_evict<S: Sql>(c: &SqlCatalog<S>, x: &EvictCandidate) -> Result<bool> {
     let sql = if x.pinned {
-        concat!(
-            "UPDATE extents SET evict_seq = evict_seq + 1 \
-             WHERE id = ?1 AND evict_seq = ?2 \
-               AND hot_safety_bytes = ?3 AND hot_cache_bytes = ?4 \
-               AND hot_cache_bytes > 0 AND ",
-            pinned!()
-        )
+        BEGIN_EVICT_PINNED
     } else {
-        concat!(
-            "UPDATE extents SET evict_seq = evict_seq + 1 \
-             WHERE id = ?1 AND evict_seq = ?2 \
-               AND hot_safety_bytes = ?3 AND hot_cache_bytes = ?4 \
-               AND NOT ",
-            pinned!(),
-            " AND ",
-            evictable!()
-        )
+        BEGIN_EVICT_UNPINNED
     };
     let changed = c
         .sql
@@ -215,12 +204,9 @@ pub(super) async fn begin_evict<S: Sql>(c: &SqlCatalog<S>, x: &EvictCandidate) -
 /// `begin_evict`; the counts then stand.
 pub(super) async fn finish_evict<S: Sql>(c: &SqlCatalog<S>, x: &EvictCandidate) -> Result<bool> {
     let sql = if x.pinned {
-        "UPDATE extents SET hot_cache_bytes = 0, evict_seq = evict_seq + 1 \
-         WHERE id = ?1 AND evict_seq = ?2"
+        FINISH_EVICT_PINNED
     } else {
-        "UPDATE extents SET hot_safety_bytes = 0, hot_cache_bytes = 0, \
-           evict_seq = evict_seq + 1 \
-         WHERE id = ?1 AND evict_seq = ?2"
+        FINISH_EVICT_UNPINNED
     };
     let changed = c
         .sql
@@ -242,12 +228,7 @@ pub(super) async fn record_cache_fill<S: Sql>(
     now: UnixMs,
 ) -> Result<()> {
     c.sql
-        .exec(
-            "UPDATE extents SET hot_cache_bytes = cipher_size, last_read_at = ?2, \
-               evict_seq = evict_seq + 1 \
-             WHERE id = ?1",
-            &[text(extent.as_str()), ms(now)],
-        )
+        .exec(RECORD_CACHE_FILL, &[text(extent.as_str()), ms(now)])
         .await?;
     Ok(())
 }
@@ -269,12 +250,7 @@ pub(super) async fn touch_read<S: Sql>(
     let changed = c
         .sql
         .exec(
-            "UPDATE extents SET last_read_at = ?2, \
-               evict_seq = evict_seq + \
-                 CASE WHEN ?4 = 1 AND hot_cache_bytes = 0 THEN 1 ELSE 0 END, \
-               hot_cache_bytes = CASE WHEN ?4 = 1 THEN cipher_size ELSE hot_cache_bytes END \
-             WHERE id = ?1 AND (last_read_at IS NULL OR last_read_at <= ?3 \
-                                OR (?4 = 1 AND hot_cache_bytes = 0))",
+            TOUCH_READ,
             &[
                 text(extent.as_str()),
                 ms(now),
@@ -286,13 +262,7 @@ pub(super) async fn touch_read<S: Sql>(
     if changed == 1 {
         return Ok(now);
     }
-    let rows = c
-        .sql
-        .query(
-            "SELECT last_read_at FROM extents WHERE id = ?1",
-            &[text(extent.as_str())],
-        )
-        .await?;
+    let rows = c.sql.query(LAST_READ_AT, &[text(extent.as_str())]).await?;
     let stored = match rows.into_iter().next() {
         Some(row) => Cols::new(row).opt_num()?.map(UnixMs),
         None => None,
@@ -310,7 +280,7 @@ pub(super) async fn hot_check_due<S: Sql>(
     let rows = c
         .sql
         .query(
-            "SELECT 1 FROM meta WHERE k = 'hot_checked_at' AND v > ?1 AND v <= ?2",
+            RECENT_SWEEP,
             &[SqlValue::Int(now.0.saturating_sub(every_ms)), ms(now)],
         )
         .await?;
@@ -321,7 +291,7 @@ pub(super) async fn hot_check_due<S: Sql>(
 pub(super) async fn hot_checked<S: Sql>(c: &SqlCatalog<S>, now: UnixMs) -> Result<()> {
     c.sql
         .exec(
-            "INSERT OR REPLACE INTO meta(k, v) VALUES ('hot_checked_at', ?1)",
+            c.sql.dialect().pick(RECORD_HOT_SWEEP, RECORD_HOT_SWEEP_PG),
             &[ms(now)],
         )
         .await?;
@@ -332,7 +302,7 @@ pub(super) async fn hot_checked<S: Sql>(c: &SqlCatalog<S>, now: UnixMs) -> Resul
 pub(super) async fn hot_drain_set<S: Sql>(c: &SqlCatalog<S>, left: u64) -> Result<()> {
     c.sql
         .exec(
-            "INSERT OR REPLACE INTO meta(k, v) VALUES ('hot_drain_left', ?1)",
+            c.sql.dialect().pick(SET_HOT_DRAIN, SET_HOT_DRAIN_PG),
             &[int(left)?],
         )
         .await?;
@@ -345,26 +315,14 @@ pub(super) async fn hot_drain_claim<S: Sql>(c: &SqlCatalog<S>, left: u64) -> Res
     if left == 0 {
         return Ok(false);
     }
-    let changed = c
-        .sql
-        .exec(
-            "UPDATE meta SET v = 0 WHERE k = 'hot_drain_left' AND v = ?1",
-            &[int(left)?],
-        )
-        .await?;
+    let changed = c.sql.exec(CLEAR_DRAIN, &[int(left)?]).await?;
     Ok(changed == 1)
 }
 
 /// The extent's fencing token now (0 for an unknown extent). Read it
 /// before deleting blobs outside an eviction, then pass it to `hot_forget`.
 pub(super) async fn hot_seq<S: Sql>(c: &SqlCatalog<S>, extent: &ExtentId) -> Result<u64> {
-    let rows = c
-        .sql
-        .query(
-            "SELECT evict_seq FROM extents WHERE id = ?1",
-            &[text(extent.as_str())],
-        )
-        .await?;
+    let rows = c.sql.query(EVICTION_SEQ, &[text(extent.as_str())]).await?;
     match rows.into_iter().next() {
         Some(row) => Cols::new(row).num(),
         None => Ok(0),
@@ -386,11 +344,7 @@ pub(super) async fn hot_forget<S: Sql>(
     let changed = c
         .sql
         .exec(
-            "UPDATE extents SET \
-               hot_safety_bytes = CASE WHEN ?2 = 1 THEN 0 ELSE hot_safety_bytes END, \
-               hot_cache_bytes = CASE WHEN ?3 = 1 THEN 0 ELSE hot_cache_bytes END, \
-               evict_seq = evict_seq + 1 \
-             WHERE id = ?1 AND evict_seq = ?4",
+            CLEAR_HOT_IF_SEQ,
             &[
                 text(extent.as_str()),
                 SqlValue::Int(i64::from(safety)),
@@ -400,4 +354,98 @@ pub(super) async fn hot_forget<S: Sql>(
         )
         .await?;
     Ok(changed == 1)
+}
+
+const CANDIDATES_PG: &str = concat!(
+    "SELECT id, hot_safety_bytes, hot_cache_bytes, evict_seq, ",
+    pinned!(),
+    " FROM extents WHERE ",
+    evictable!(),
+    " ORDER BY last_read_at ASC NULLS FIRST, id LIMIT ?1"
+);
+
+const BEGIN_EVICT_PINNED: &str = concat!(
+    "UPDATE extents SET evict_seq = evict_seq + 1 \
+             WHERE id = ?1 AND evict_seq = ?2 \
+               AND hot_safety_bytes = ?3 AND hot_cache_bytes = ?4 \
+               AND hot_cache_bytes > 0 AND ",
+    pinned!()
+);
+
+const BEGIN_EVICT_UNPINNED: &str = concat!(
+    "UPDATE extents SET evict_seq = evict_seq + 1 \
+             WHERE id = ?1 AND evict_seq = ?2 \
+               AND hot_safety_bytes = ?3 AND hot_cache_bytes = ?4 \
+               AND NOT ",
+    pinned!(),
+    " AND ",
+    evictable!()
+);
+
+const FINISH_EVICT_PINNED: &str =
+    "UPDATE extents SET hot_cache_bytes = 0, evict_seq = evict_seq + 1 \
+         WHERE id = ?1 AND evict_seq = ?2";
+
+const FINISH_EVICT_UNPINNED: &str =
+    "UPDATE extents SET hot_safety_bytes = 0, hot_cache_bytes = 0, \
+           evict_seq = evict_seq + 1 \
+         WHERE id = ?1 AND evict_seq = ?2";
+
+const RECORD_CACHE_FILL: &str =
+    "UPDATE extents SET hot_cache_bytes = cipher_size, last_read_at = ?2, \
+               evict_seq = evict_seq + 1 \
+             WHERE id = ?1";
+
+const TOUCH_READ: &str = "UPDATE extents SET last_read_at = ?2, \
+               evict_seq = evict_seq + \
+                 CASE WHEN ?4 = 1 AND hot_cache_bytes = 0 THEN 1 ELSE 0 END, \
+               hot_cache_bytes = CASE WHEN ?4 = 1 THEN cipher_size ELSE hot_cache_bytes END \
+             WHERE id = ?1 AND (last_read_at IS NULL OR last_read_at <= ?3 \
+                                OR (?4 = 1 AND hot_cache_bytes = 0))";
+
+const LAST_READ_AT: &str = "SELECT last_read_at FROM extents WHERE id = ?1";
+
+const RECENT_SWEEP: &str = "SELECT 1 FROM meta WHERE k = 'hot_checked_at' AND v > ?1 AND v <= ?2";
+
+const CLEAR_DRAIN: &str = "UPDATE meta SET v = 0 WHERE k = 'hot_drain_left' AND v = ?1";
+
+const EVICTION_SEQ: &str = "SELECT evict_seq FROM extents WHERE id = ?1";
+
+const CLEAR_HOT_IF_SEQ: &str = "UPDATE extents SET \
+               hot_safety_bytes = CASE WHEN ?2 = 1 THEN 0 ELSE hot_safety_bytes END, \
+               hot_cache_bytes = CASE WHEN ?3 = 1 THEN 0 ELSE hot_cache_bytes END, \
+               evict_seq = evict_seq + 1 \
+             WHERE id = ?1 AND evict_seq = ?4";
+
+const RECORD_HOT_SWEEP: &str = "INSERT OR REPLACE INTO meta(k, v) VALUES ('hot_checked_at', ?1)";
+
+const RECORD_HOT_SWEEP_PG: &str = "INSERT INTO meta(k, v) VALUES ('hot_checked_at', ?1) ON CONFLICT (k) DO UPDATE SET v = excluded.v";
+
+const SET_HOT_DRAIN: &str = "INSERT OR REPLACE INTO meta(k, v) VALUES ('hot_drain_left', ?1)";
+
+const SET_HOT_DRAIN_PG: &str = "INSERT INTO meta(k, v) VALUES ('hot_drain_left', ?1) ON CONFLICT (k) DO UPDATE SET v = excluded.v";
+
+/// Actual Postgres texts and representative wire types for typed PREPARE.
+#[cfg(all(feature = "pg-test-record", not(target_arch = "wasm32")))]
+pub(super) fn pg_statements() -> Vec<(String, Vec<SqlValue>)> {
+    const I: SqlValue = SqlValue::Int(0);
+    const T: SqlValue = SqlValue::Text(String::new());
+    vec![
+        (EVICTABLE_TOTAL.to_owned(), vec![]),
+        (PINNED_TOTAL.to_owned(), vec![]),
+        (CANDIDATES_PG.to_owned(), vec![I]),
+        (BEGIN_EVICT_PINNED.to_owned(), vec![T, I, I, I]),
+        (BEGIN_EVICT_UNPINNED.to_owned(), vec![T, I, I, I]),
+        (FINISH_EVICT_PINNED.to_owned(), vec![T, I]),
+        (FINISH_EVICT_UNPINNED.to_owned(), vec![T, I]),
+        (RECORD_CACHE_FILL.to_owned(), vec![T, I]),
+        (TOUCH_READ.to_owned(), vec![T, I, I, I]),
+        (LAST_READ_AT.to_owned(), vec![T]),
+        (RECENT_SWEEP.to_owned(), vec![I, I]),
+        (CLEAR_DRAIN.to_owned(), vec![I]),
+        (EVICTION_SEQ.to_owned(), vec![T]),
+        (CLEAR_HOT_IF_SEQ.to_owned(), vec![T, I, I, I]),
+        (RECORD_HOT_SWEEP_PG.to_owned(), vec![I]),
+        (SET_HOT_DRAIN_PG.to_owned(), vec![I]),
+    ]
 }
